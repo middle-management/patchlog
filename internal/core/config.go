@@ -13,25 +13,25 @@ import (
 // Limits are the configurable limits of §6.6. Sizes are bytes; rates are
 // tokens per second with a burst.
 type Limits struct {
-	PatchSetSize      int
-	OpsPerSet         int
-	DocumentSize      int
-	NestingDepth      int
-	RulesPerNS        int
-	RulesPerGrant     int
-	GrantSize         int
-	ItemsPerBatch     int
-	LogPageSize       int // deployment only
-	BatchSize         int
-	BranchDepth       int // deployment only
-	LiveBranches      int
-	RatePerResource   Rate
-	RatePerPrincipal  Rate
-	RatePerNamespace  Rate
-	RetryWindow       time.Duration
-	RetryWindowMin    time.Duration // deployment only
-	KeepPerResource   int
-	RemoteBranchLife  time.Duration
+	PatchSetSize     int
+	OpsPerSet        int
+	DocumentSize     int
+	NestingDepth     int
+	RulesPerNS       int
+	RulesPerGrant    int
+	GrantSize        int
+	ItemsPerBatch    int
+	LogPageSize      int // deployment only
+	BatchSize        int
+	BranchDepth      int // deployment only
+	LiveBranches     int
+	RatePerResource  Rate
+	RatePerPrincipal Rate
+	RatePerNamespace Rate
+	RetryWindow      time.Duration
+	RetryWindowMin   time.Duration // deployment only
+	KeepPerResource  int
+	RemoteBranchLife time.Duration
 }
 
 // Rate is a token bucket: Rate tokens per second, Burst the bucket size.
@@ -66,17 +66,17 @@ func DefaultLimits() Limits {
 // Integer limits can only be lowered; the retry window can be raised up to
 // the deployment maximum.
 var limitFields = map[string]func(*Limits) *int{
-	"patchSetSize":    func(l *Limits) *int { return &l.PatchSetSize },
-	"opsPerSet":       func(l *Limits) *int { return &l.OpsPerSet },
-	"documentSize":    func(l *Limits) *int { return &l.DocumentSize },
-	"nestingDepth":    func(l *Limits) *int { return &l.NestingDepth },
+	"patchSetSize":      func(l *Limits) *int { return &l.PatchSetSize },
+	"opsPerSet":         func(l *Limits) *int { return &l.OpsPerSet },
+	"documentSize":      func(l *Limits) *int { return &l.DocumentSize },
+	"nestingDepth":      func(l *Limits) *int { return &l.NestingDepth },
 	"rulesPerNamespace": func(l *Limits) *int { return &l.RulesPerNS },
-	"rulesPerGrant":   func(l *Limits) *int { return &l.RulesPerGrant },
-	"grantSize":       func(l *Limits) *int { return &l.GrantSize },
-	"itemsPerBatch":   func(l *Limits) *int { return &l.ItemsPerBatch },
-	"batchSize":       func(l *Limits) *int { return &l.BatchSize },
-	"liveBranches":    func(l *Limits) *int { return &l.LiveBranches },
-	"keepPerResource": func(l *Limits) *int { return &l.KeepPerResource },
+	"rulesPerGrant":     func(l *Limits) *int { return &l.RulesPerGrant },
+	"grantSize":         func(l *Limits) *int { return &l.GrantSize },
+	"itemsPerBatch":     func(l *Limits) *int { return &l.ItemsPerBatch },
+	"batchSize":         func(l *Limits) *int { return &l.BatchSize },
+	"liveBranches":      func(l *Limits) *int { return &l.LiveBranches },
+	"keepPerResource":   func(l *Limits) *int { return &l.KeepPerResource },
 }
 
 var rateFields = map[string]func(*Limits) *Rate{

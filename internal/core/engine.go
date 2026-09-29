@@ -132,11 +132,11 @@ func apiErr(status int, code string, kv ...any) *Error {
 	return &Error{Status: status, Body: b}
 }
 
-func badInput(msg string) *Error    { return apiErr(400, "bad_input", "message", msg) }
-func notFound() *Error              { return apiErr(404, "not_found") }
-func gone(kv ...any) *Error         { return apiErr(410, "gone", kv...) }
-func invalid(msg string) *Error     { return apiErr(422, "invalid", "message", msg) }
-func forbidden(msg string) *Error   { return apiErr(403, "forbidden", "message", msg) }
+func badInput(msg string) *Error  { return apiErr(400, "bad_input", "message", msg) }
+func notFound() *Error            { return apiErr(404, "not_found") }
+func gone(kv ...any) *Error       { return apiErr(410, "gone", kv...) }
+func invalid(msg string) *Error   { return apiErr(422, "invalid", "message", msg) }
+func forbidden(msg string) *Error { return apiErr(403, "forbidden", "message", msg) }
 func limitErr(status int, msg string) *Error {
 	return apiErr(status, "limit", "message", msg)
 }
@@ -144,32 +144,45 @@ func limitErr(status int, msg string) *Error {
 // tx is one database transaction with the engine's helpers.
 type tx struct {
 	*sql.Tx
-	e       *Engine
-	now     time.Time
-	write   bool
-	notify  map[string]bool // namespaces whose logs changed
-	tags    []string        // cache tags to purge after commit
+	e         *Engine
+	now       time.Time
+	write     bool
+	notify    map[string]bool // namespaces whose logs changed
+	tags      []string        // cache tags to purge after commit
 	flushDocs bool
 }
 
 // read runs f in a read transaction.
-func (e *Engine) read(ctx context.Context, f func(t *tx) error) error {
+func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 	sqlTx, err := e.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
 	}
 	defer sqlTx.Rollback()
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("internal error: %v", p)
+		}
+	}()
 	return f(&tx{Tx: sqlTx, e: e, now: e.now()})
 }
 
-// update runs f in a write transaction and commits if it returns nil.
-func (e *Engine) update(ctx context.Context, f func(t *tx) error) error {
+// update runs f in a write transaction and commits if it returns nil. A
+// panic (t.must) rolls back and is returned as an error, so a failed write
+// never leaves its transaction, and the connection, open.
+func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	sqlTx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
+	defer func() {
+		if p := recover(); p != nil {
+			sqlTx.Rollback()
+			err = fmt.Errorf("internal error: %v", p)
+		}
+	}()
 	t := &tx{Tx: sqlTx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
 	if err := f(t); err != nil {
 		sqlTx.Rollback()

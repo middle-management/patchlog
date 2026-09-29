@@ -43,12 +43,12 @@ type Request struct {
 
 // WriteResult is the outcome of a resource write or batch.
 type WriteResult struct {
-	Status    int // 200 (replayed or dry run) or 201
-	NSID      string
-	Items     []ItemResult
-	Entry     *LogEntry // single writes: the resulting entry
-	Replayed  bool
-	ConfigID  string
+	Status   int // 200 (replayed or dry run) or 201
+	NSID     string
+	Items    []ItemResult
+	Entry    *LogEntry // single writes: the resulting entry
+	Replayed bool
+	ConfigID string
 }
 
 // ItemResult lists the ids an item produced.
@@ -88,10 +88,15 @@ func batchError(fails []itemErr) *Error {
 	status := fails[0].err.Status
 	var items []any
 	for _, f := range fails {
-		m := map[string]any{"index": f.index, "status": f.err.Status}
+		m := map[string]any{}
 		for k, v := range f.err.Body {
 			m[k] = v
 		}
+		// "index" is the item's; a patch error's operation index moves to "op".
+		if i, has := m["index"]; has {
+			m["op"] = i
+		}
+		m["index"], m["status"] = f.index, f.err.Status
 		items = append(items, m)
 	}
 	e := apiErr(status, "batch", "items", items)
@@ -196,13 +201,45 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 
 	// The optional config change runs steps 1–6 first (§7.5).
+	st := make([]*itemState, len(items))
+	for i, it := range items {
+		st[i] = &itemState{Item: it, index: i}
+	}
+	fail := func(fs []itemErr) error {
+		if !isBatch {
+			return fs[0].err
+		}
+		return batchError(fs)
+	}
+	// Step 1 for the items: authorisation.
+	authorizeItems := func(a *actor) []itemErr {
+		var fs []itemErr
+		for _, s := range st {
+			for j := range s.Steps {
+				if err := t.authorize(a, staticVerb(s.Item, j), s.Resource); err != nil {
+					fs = append(fs, itemErr{s.index, err})
+					break
+				}
+			}
+		}
+		return fs
+	}
+
 	cfg := cur
 	var cplan *configPlan
 	if cc != nil {
 		p, err := t.planConfig(n, cur, a, cc, true)
 		if err != nil {
-			if p != nil && p.replay != nil {
-				return nil, err
+			// A retried batch finds its config precondition stale: look
+			// for the batch it would have produced first (§7.5, §7.2).
+			var ae *Error
+			if errors.As(err, &ae) && ae.Status == 412 && cc.IfMatch != "" {
+				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
+					exp := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
+					if r := t.replay(n, a, st, &configPlan{expected: &exp}, true); r != nil {
+						return r, nil
+					}
+				}
 			}
 			return nil, err
 		}
@@ -216,32 +253,8 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 
-	st := make([]*itemState, len(items))
-	for i, it := range items {
-		st[i] = &itemState{Item: it, index: i}
-	}
-	fail := func(fs []itemErr) error {
-		if !isBatch {
-			return fs[0].err
-		}
-		return batchError(fs)
-	}
-
 	// Step 1: authorisation.
-	var fs []itemErr
-	for _, s := range st {
-		for j, step := range s.Steps {
-			verb := staticVerb(s.Item, j)
-			if verb == "" {
-				continue // decided at step 3
-			}
-			if err := t.authorize(a, verb, s.Resource); err != nil {
-				fs = append(fs, itemErr{s.index, err})
-				break
-			}
-			_ = step
-		}
-	}
+	fs := authorizeItems(a)
 	if len(fs) > 0 {
 		return nil, fail(fs)
 	}
@@ -465,8 +478,8 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 			return nil
 		}
 		own := t.resource(n.id, s.Resource)
-		if own == nil {
-			return nil
+		if own == nil || own.state == statePurged {
+			return nil // a purged resource answers 410, never its content
 		}
 		last := want[len(want)-1]
 		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))

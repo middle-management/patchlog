@@ -199,7 +199,10 @@ func (t *tx) docAt(r *revRow) (any, error) {
 }
 
 func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
-	if b, ok := t.e.docs.get(r.id); ok && r.kind == kindRev {
+	// Cached documents are used only for rows that still have their patch
+	// set: an id shared with another resource must not revive a pruned or
+	// purged revision (§8.3, §8.6).
+	if b, ok := t.e.docs.get(r.id); ok && r.kind == kindRev && r.patches.Valid {
 		return b, nil
 	}
 	var stack []*revRow
@@ -207,7 +210,7 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 	cur := r
 	for {
 		if cur.kind == kindRev {
-			if b, ok := t.e.docs.get(cur.id); ok {
+			if b, ok := t.e.docs.get(cur.id); ok && cur.patches.Valid {
 				base = b
 				break
 			}
@@ -290,7 +293,7 @@ func (e LogEntry) value() map[string]any {
 	if e.Parent != "" {
 		m["parent"] = e.Parent
 	}
-	if e.Kind == "rev" {
+	if e.Kind == "rev" && e.Patches != nil {
 		m["patches"] = e.Patches
 	}
 	return m
@@ -305,7 +308,9 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 		e.Kind = "tombstone"
 	} else {
 		e.Kind = "rev"
-		e.Patches = jsonv.MustParse([]byte(r.patches.String))
+		if r.patches.Valid { // NULL below a horizon (§8.6)
+			e.Patches = jsonv.MustParse([]byte(r.patches.String))
+		}
 	}
 	if r.signature.Valid {
 		e.Signature = r.signature.String
@@ -317,6 +322,11 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 // first entry) up to to (inclusive), oldest first. ok is false if since is
 // not an ancestor of to. A pruned entry in the range is a prunedError.
 func (t *tx) logBetween(to *revRow, since *ids.ID) ([]LogEntry, error) {
+	// Ids and parent links survive pruning, so ancestry is decided first: a
+	// since that isn't an ancestor is 404 even across a horizon (§7.1).
+	if since != nil && t.findInAncestry(to, *since) == nil {
+		return nil, errNotAncestor
+	}
 	var rows []*revRow
 	cur := to
 	for {

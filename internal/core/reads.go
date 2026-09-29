@@ -50,11 +50,11 @@ func (t *tx) collectNames(n *nsRow, names map[string]bool) {
 
 // Head is the answer for GET /r/{ns}/{name}.
 type Head struct {
-	State     State
-	Head      string // head revision or tombstone id
-	Last      string // tombstoned: last live revision
-	Public    bool
-	Horizon   string
+	State   State
+	Head    string // head revision or tombstone id
+	Last    string // tombstoned: last live revision
+	Public  bool
+	Horizon string
 }
 
 // ResourceHead resolves the head pointer.
@@ -90,7 +90,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 type Rev struct {
 	Status  int // 200, 404, 410
 	Doc     []byte
-	Code    string // "pruned" or "" for 410s
+	Code    string // "pruned", "tombstone" or "" for 410s
 	Horizon string
 	Public  bool
 }
@@ -127,7 +127,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		if row.kind == kindTombstone {
-			out.Status = 410
+			out.Status, out.Code = 410, "tombstone"
 			return nil
 		}
 		b, err := t.docBytesAt(row)
@@ -229,11 +229,11 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 
 // NSInfo is the answer for GET /ns/{ns}.
 type NSInfo struct {
-	Head     string
-	Config   string
-	Public   bool
-	Purged   bool
-	Doc      []byte
+	Head   string
+	Config string
+	Public bool
+	Purged bool
+	Doc    []byte
 }
 
 // NamespaceHead returns the namespace head and config ids.

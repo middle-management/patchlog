@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS namespaces (
   ns         INTEGER PRIMARY KEY,
   name       TEXT    NOT NULL UNIQUE,
   base       INTEGER REFERENCES namespaces,  -- NULL unless a branch
-  base_at    INTEGER,                        -- ns_log.seq of `+"`at`"+` in the base
+  base_at    INTEGER,                        -- ns_log.seq of ` + "`at`" + ` in the base
   base_config_seq INTEGER,                   -- addition: base's ns_config row copied at creation (§C.4)
   frozen     INTEGER NOT NULL DEFAULT 0,
   purged     INTEGER NOT NULL DEFAULT 0,

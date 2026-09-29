@@ -228,6 +228,14 @@ func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) 
 		if n == nil {
 			return notFound()
 		}
+		if cc.IfNoneMatch {
+			// The name is taken, also by a purged namespace, whose name
+			// stays reserved (§8.5).
+			if err := t.authorizeTaken(n, req); err != nil {
+				return err
+			}
+			return apiErr(412, "stale", "config", t.configID(n.configSeq).String())
+		}
 		if n.purged {
 			return gone()
 		}
@@ -235,12 +243,6 @@ func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) 
 		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)
 		if aerr != nil {
 			return aerr
-		}
-		if cc.IfNoneMatch {
-			if err := t.authorize(a, "config", ""); err != nil {
-				return err
-			}
-			return apiErr(412, "stale", "config", t.configID(n.configSeq).String())
 		}
 		p, err := t.planConfig(n, cur, a, &cc, false)
 		if err != nil {
@@ -257,6 +259,22 @@ func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) 
 		return nil
 	})
 	return res, err
+}
+
+// authorizeTaken authorises a create of an existing namespace, before its
+// 412: an operator grant may create namespaces (§C.4), and otherwise the
+// caller needs config on the namespace itself.
+func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
+	if keys := t.e.opt.OperatorKeys; len(keys) > 0 {
+		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil && (a.verified == nil || a.star) {
+			return nil
+		}
+	}
+	a, err := t.authenticate(n.name, n, t.config(n.configSeq), req.Cred, nil)
+	if err != nil {
+		return err
+	}
+	return t.authorize(a, "config", "")
 }
 
 // createNamespace bootstraps a namespace with an operator key (§C.4).
@@ -469,9 +487,10 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
 }
 
-// Purge purges a resource (§8.3).
-func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, force bool) error {
-	return e.update(ctx, func(t *tx) error {
+// Purge purges a resource (§8.3). It returns the purge entry's ns_id.
+func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
+	var out string
+	err := e.update(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
 			return notFound()
@@ -518,9 +537,10 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if err := t.checkRules(cfg, a, env, false); err != nil {
 			return err
 		}
-		t.purgeResource(n, name, t.authorID(a.id()))
+		out = t.purgeResource(n, name, t.authorID(a.id())).String()
 		return nil
 	})
+	return out, err
 }
 
 func (t *tx) isBranchOf(b, base *nsRow) bool {
@@ -533,9 +553,18 @@ func (t *tx) isBranchOf(b, base *nsRow) bool {
 	return false
 }
 
-// purgeResource purges name in n and propagates to every branch (§8.3).
-func (t *tx) purgeResource(n *nsRow, name string, author int64) {
+// purgeResource purges name in n and propagates to every branch (§8.3). It
+// returns the id of n's purge entry.
+func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
+	// Branches first: a branch reading the resource through must still see
+	// it, so that it records its own purge entry.
+	for _, b := range t.branchesOf(n) {
+		if !b.purged {
+			t.purgeResource(b, name, author)
+		}
+	}
 	v := t.resolve(n, name, nil)
+	var nsID ids.ID
 	if v.state != NotFound && v.state != Purged {
 		own := v.own
 		var res int64
@@ -555,20 +584,18 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) {
 		_, err = t.Exec(`DELETE FROM snapshots WHERE res = ?`, res)
 		t.must(err)
 		target := v.head.seq
-		t.appendNS(n, map[string]any{"resource": name, "kind": "purge", "target": v.head.id.String()}, &res, &target, n.configSeq, author)
+		_, nsID = t.appendNS(n, map[string]any{"resource": name, "kind": "purge", "target": v.head.id.String()}, &res, &target, n.configSeq, author)
 		t.tags = append(t.tags, "r:"+n.name+"/"+name)
 		t.flushDocs = true
 	}
-	for _, b := range t.branchesOf(n) {
-		if !b.purged {
-			t.purgeResource(b, name, author)
-		}
-	}
+	return nsID
 }
 
-// PurgeNamespace purges a frozen namespace (§8.5).
-func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string) error {
-	return e.update(ctx, func(t *tx) error {
+// PurgeNamespace purges a frozen namespace (§8.5). It returns the purge-ns
+// entry's ns_id.
+func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string) (string, error) {
+	var out string
+	err := e.update(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
 			return notFound()
@@ -624,11 +651,13 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		t.must(err)
 		_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
 		t.must(err)
-		t.appendNS(n, map[string]any{"kind": "purge-ns"}, nil, nil, n.configSeq, t.authorID(a.id()))
+		_, nsID := t.appendNS(n, map[string]any{"kind": "purge-ns"}, nil, nil, n.configSeq, t.authorID(a.id()))
+		out = nsID.String()
 		t.tags = append(t.tags, "ns:"+n.name)
 		t.flushDocs = true
 		return nil
 	})
+	return out, err
 }
 
 // referencedPaths computes the referenced schema revisions of §6.1: those
@@ -638,7 +667,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 func (t *tx) referencedPaths(exclude func(ns *nsRow, res string) bool) map[string]bool {
 	out := map[string]bool{}
 	var queue []string
-	rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE purged = 0`)
+	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0`)
 	t.must(err)
 	var all []*nsRow
 	for rows.Next() {
@@ -689,9 +718,9 @@ type PruneRequest struct {
 }
 
 // Prune prunes a resource's history below a horizon. It returns the
-// effective horizon.
-func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (string, error) {
-	var out string
+// effective horizon and, if the horizon moved, the prune entry's ns_id.
+func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (string, string, error) {
+	var out, outNS string
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
@@ -769,6 +798,15 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			out = t.rev(cur.Int64).id.String()
 			return nil
 		}
+		// A horizon with nothing of its resource's chain below it (a first
+		// entry) prunes nothing, and a prune that changes nothing writes
+		// nothing (§8.6).
+		var below bool
+		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ? AND seq < ?)`, v.own.id, h.seq).Scan(&below))
+		if !below {
+			out = h.id.String()
+			return nil
+		}
 		// Documents that stay available: the horizon (and for a tombstone the
 		// last live document), kept revisions and referenced schemas.
 		refs := t.referencedPaths(func(*nsRow, string) bool { return false })
@@ -805,11 +843,11 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = ? WHERE res = ?`, h.seq, keepJSON, v.own.id)
 		t.must(err)
 		target := h.seq
-		t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &v.own.id, &target, n.configSeq, t.authorID(a.id()))
-		out = h.id.String()
+		_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &v.own.id, &target, n.configSeq, t.authorID(a.id()))
+		out, outNS = h.id.String(), nsID.String()
 		return nil
 	})
-	return out, err
+	return out, outNS, err
 }
 
 // allBranchesOf lists the direct branches of n that aren't purged.

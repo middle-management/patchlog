@@ -29,7 +29,9 @@ type SyntaxError struct {
 	Msg    string
 }
 
-func (e *SyntaxError) Error() string { return fmt.Sprintf("invalid JSON at byte %d: %s", e.Offset, e.Msg) }
+func (e *SyntaxError) Error() string {
+	return fmt.Sprintf("invalid JSON at byte %d: %s", e.Offset, e.Msg)
+}
 
 // Parse parses exactly one I-JSON value. It rejects duplicate object keys,
 // lone surrogates, invalid UTF-8, non-finite numbers and integer literals

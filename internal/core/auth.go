@@ -417,14 +417,17 @@ type draw struct {
 	key  string
 	rate Rate
 	cost float64
+	name string // the limit of §6.6, reported in a 429
 }
 
 // admit checks every bucket holds a token, then deducts each cost (§6.6).
-// It returns the wait until the first empty bucket refills.
-func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, bool) {
+// It returns the wait until the first empty bucket refills, and the limit
+// that has the longest wait.
+func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, string, bool) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	var wait time.Duration
+	var hit string
 	bs := make([]*bucket, len(draws))
 	for i, d := range draws {
 		b := rl.b[d.key]
@@ -438,17 +441,17 @@ func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, bool) 
 		if b.tokens < 1 {
 			w := time.Duration((1 - b.tokens) / d.rate.Rate * float64(time.Second))
 			if w > wait {
-				wait = w
+				wait, hit = w, d.name
 			}
 		}
 	}
 	if wait > 0 {
-		return wait, false
+		return wait, hit, false
 	}
 	for i, d := range draws {
 		bs[i].tokens -= d.cost
 	}
-	return 0, true
+	return 0, "", true
 }
 
 // rateLimit draws a request's tokens: one per resource from each
@@ -460,19 +463,19 @@ func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, item
 		pr = Rate{a.keyRate.Rate, math.Min(a.keyRate.Burst, pr.Burst)}
 	}
 	draws := []draw{
-		{"p\x00" + a.bucketKey, pr, float64(items)},
-		{"n\x00" + n.name, l.RatePerNamespace, float64(items)},
+		{"p\x00" + a.bucketKey, pr, float64(items), "ratePerPrincipal"},
+		{"n\x00" + n.name, l.RatePerNamespace, float64(items), "ratePerNamespace"},
 	}
 	for _, r := range resources {
-		draws = append(draws, draw{"r\x00" + n.name + "\x00" + r + "\x00" + a.bucketKey, l.RatePerResource, 1})
+		draws = append(draws, draw{"r\x00" + n.name + "\x00" + r + "\x00" + a.bucketKey, l.RatePerResource, 1, "ratePerResource"})
 	}
-	wait, ok := t.e.rate.admit(t.now, draws)
+	wait, hit, ok := t.e.rate.admit(t.now, draws)
 	if !ok {
 		secs := int(math.Ceil(wait.Seconds()))
 		if secs < 1 {
 			secs = 1
 		}
-		e := apiErr(429, "rate", "message", "rate limit exceeded", "retryAfter", secs)
+		e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", secs)
 		e.Header = map[string][]string{"Retry-After": {fmt.Sprint(secs)}}
 		return e
 	}

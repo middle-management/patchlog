@@ -322,8 +322,13 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 	case rev.Code == "pruned":
 		cache(w, ccPruned, rev.Public, resTags(ns, name)...)
 		writeJSON(w, 410, map[string]any{"code": "pruned", "horizon": rev.Horizon})
+	case rev.Code == "tombstone":
+		// A tombstone id is immutable (§7.1).
+		cache(w, ccImmutable, rev.Public, resTags(ns, name)...)
+		w.Header().Set("ETag", quote(id))
+		writeJSON(w, 410, map[string]any{"code": "gone"})
 	default:
-		// A tombstone id is immutable; a purge is "long".
+		// A purge is "long".
 		cache(w, ccLong, rev.Public)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
@@ -445,10 +450,12 @@ func (s *Server) resourcePurge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "1"
-	if err := s.e.Purge(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, p.ifMatch, force); err != nil {
+	nsID, err := s.e.Purge(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, p.ifMatch, force)
+	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	w.Header().Set("X-Namespace-Revision", nsID)
 	w.WriteHeader(204)
 }
 
@@ -490,10 +497,13 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, &core.Error{Status: 422, Body: map[string]any{"code": "invalid", "message": "snapshot is for E3 namespaces, which this server does not support"}})
 		return
 	}
-	eff, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, core.PruneRequest{Horizon: h, Keep: keep})
+	eff, nsID, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, core.PruneRequest{Horizon: h, Keep: keep})
 	if err != nil {
 		writeErr(w, err)
 		return
+	}
+	if nsID != "" {
+		w.Header().Set("X-Namespace-Revision", nsID)
 	}
 	writeJSON(w, 200, map[string]any{"horizon": eff})
 }
@@ -799,10 +809,12 @@ func (s *Server) nsPurge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if err := s.e.PurgeNamespace(r.Context(), core.Request{NS: ns, Cred: creds(r)}, p.ifMatch); err != nil {
+	nsID, err := s.e.PurgeNamespace(r.Context(), core.Request{NS: ns, Cred: creds(r)}, p.ifMatch)
+	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	w.Header().Set("X-Namespace-Revision", nsID)
 	w.WriteHeader(204)
 }
 
@@ -972,6 +984,20 @@ func sinceParam(r *http.Request) string {
 	return r.Header.Get("Last-Event-ID")
 }
 
+// sseLogErr answers an event stream request whose replay failed (404, 410
+// or 410 pruned). Like every SSE response it is no-store (§9).
+func sseLogErr(w http.ResponseWriter, lg *core.Log) {
+	noStore(w)
+	switch {
+	case lg.Status == 404:
+		writeJSON(w, 404, map[string]any{"code": "not_found"})
+	case lg.Horizon != "":
+		writeJSON(w, 410, map[string]any{"code": "pruned", "horizon": lg.Horizon})
+	default:
+		writeJSON(w, 410, map[string]any{"code": "gone"})
+	}
+}
+
 func startSSE(w http.ResponseWriter) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
@@ -989,19 +1015,19 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	since := sinceParam(r)
 	cred := creds(r)
+	// Wait before every fetch, so no entry committed in between is missed.
+	wait := s.e.Wait(ns)
 	lg, err := s.e.NamespaceLog(r.Context(), ns, "", since, 0, cred)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	if lg.Status != 200 {
-		noStore(w)
-		s.writeLog(w, lg, ns, nil)
+		sseLogErr(w, lg)
 		return
 	}
 	startSSE(w)
 	for {
-		wait := s.e.Wait(ns)
 		for _, e := range lg.Entries {
 			sse(w, e["kind"].(string), e["id"].(string), e)
 			since = e["id"].(string)
@@ -1016,6 +1042,7 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+		wait = s.e.Wait(ns)
 		lg, err = s.e.NamespaceLog(r.Context(), ns, "", since, 0, cred)
 		if err != nil || lg.Status != 200 {
 			return
@@ -1031,6 +1058,8 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	cred := creds(r)
 	since := sinceParam(r)
+	// Wait before every fetch, so no entry committed in between is missed.
+	wait := s.e.Wait(ns)
 	info, err := s.e.NamespaceHead(r.Context(), ns, cred)
 	if err != nil {
 		writeErr(w, err)
@@ -1043,8 +1072,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if lg.Status != 200 {
-		s.writeLog(w, lg, ns, nil)
-		noStore(w)
+		sseLogErr(w, lg)
 		return
 	}
 	startSSE(w)
@@ -1060,7 +1088,6 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	emit(lg)
 	for {
-		wait := s.e.Wait(ns)
 		select {
 		case <-wait:
 		case <-time.After(30 * time.Second):
@@ -1072,6 +1099,7 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		}
+		wait = s.e.Wait(ns)
 		nl, err := s.e.NamespaceLog(r.Context(), ns, "", nsSince, 0, cred)
 		if err != nil || nl.Status != 200 {
 			return
