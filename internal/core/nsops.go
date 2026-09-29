@@ -1,0 +1,824 @@
+package core
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+
+	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/patch"
+	"github.com/middle-management/patchlog/internal/schema"
+)
+
+// configPlan is a config change that passed steps 1–6.
+type configPlan struct {
+	cfg      *Config
+	doc      map[string]any
+	canon    []byte
+	id       ids.ID
+	expected *ids.ID
+	replay   *WriteResult
+}
+
+// planConfig runs steps 1–6 of a config write on an existing namespace.
+func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBatch bool) (*configPlan, error) {
+	// Step 1.
+	if err := t.authorize(a, "config", ""); err != nil {
+		return nil, err
+	}
+	p := &configPlan{}
+	curID := t.configID(n.configSeq)
+	if cc.IfMatch != "" {
+		if pid, err := ids.Parse(cc.IfMatch); err == nil {
+			e := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
+			p.expected = &e
+		}
+	}
+	// Speculative apply, to decide the rate-limit exemption (§6.6).
+	ops, perr := patch.Parse(cc.Patches)
+	var newDoc any
+	var writes []string
+	if perr == nil {
+		d, w, err := patch.Apply(cur.Doc, true, ops, patch.Options{})
+		if err == nil {
+			newDoc, writes = d, patch.WritesStrings(w)
+		}
+	}
+	if !inBatch && !a.star && !freezeOnly(writes, newDoc) {
+		if err := t.rateLimit(n, cur, a, nil, 1); err != nil {
+			return nil, err
+		}
+	}
+	// Step 2: idempotent retry, then the precondition. Config writes are
+	// allowed in frozen namespaces.
+	if !inBatch && p.expected != nil {
+		var seq int64
+		var author int64
+		err := t.QueryRow(`SELECT seq, author FROM ns_config WHERE ns = ? AND id = ?`, n.id, p.expected[:]).Scan(&seq, &author)
+		if err == nil && author == t.authorID(a.id()) {
+			var nsSeq int64
+			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, n.id, nsKindCode("config"), seq).Scan(&nsSeq)
+			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String()}
+			if nsSeq != 0 {
+				r.NSID = t.nsLogID(nsSeq).String()
+			}
+			p.replay = r
+			return p, nil
+		}
+	}
+	switch {
+	case cc.IfNoneMatch:
+		return nil, apiErr(412, "stale", "config", curID.String())
+	case cc.IfMatch == "":
+		return nil, apiErr(428, "precondition_required")
+	case cc.IfMatch != curID.String():
+		return nil, apiErr(412, "stale", "config", curID.String())
+	}
+	// Step 3.
+	if perr != nil {
+		return nil, patchErr(perr)
+	}
+	d, w, err := patch.Apply(cur.Doc, true, ops, patch.Options{})
+	if err != nil {
+		return nil, patchErr(err)
+	}
+	newDoc, writes = d, patch.WritesStrings(w)
+	p.canon = jsonv.Canonical(cc.Patches)
+	p.id = ids.Revision(&curID, p.canon)
+	// Step 4.
+	if len(p.canon) > cur.Limits.PatchSetSize {
+		return nil, limitErr(413, "patch set too large")
+	}
+	if len(jsonv.Canonical(newDoc)) > cur.Limits.DocumentSize {
+		return nil, limitErr(413, "document too large")
+	}
+	// Step 5: the built-in namespace-document schema and branch fields.
+	cfg, verr := t.validateConfig(n, cur, newDoc, writes, a)
+	if verr != nil {
+		return nil, verr
+	}
+	p.cfg, p.doc = cfg, newDoc.(map[string]any)
+	// Step 6.
+	env := t.basicEnvelope("config", "", a)
+	env["writes"] = anyStrings(writes)
+	env["doc"] = newDoc
+	env["patches"] = jsonv.MustParse(p.canon)
+	if err := t.checkRules(cur, a, env, true); err != nil {
+		return nil, err
+	}
+	return p, nil
+}
+
+func anyStrings(xs []string) []any {
+	out := make([]any, len(xs))
+	for i, x := range xs {
+		out[i] = x
+	}
+	return out
+}
+
+// freezeOnly: writes all at /frozen, /successor or /merged, resulting in
+// frozen: true (§6.6 exemption).
+func freezeOnly(writes []string, doc any) bool {
+	if len(writes) == 0 {
+		return false
+	}
+	for _, w := range writes {
+		if !(w == "/frozen" || w == "/successor" || w == "/merged") {
+			return false
+		}
+	}
+	m, _ := doc.(map[string]any)
+	return m != nil && m["frozen"] == true
+}
+
+// validateConfig is step 5 for a config write.
+func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, a *actor) (*Config, *Error) {
+	cfg, err := parseConfig(newDoc, t.e.opt.Limits)
+	if err != nil {
+		var le *limitError
+		if errors.As(err, &le) {
+			return nil, limitErr(422, le.msg)
+		}
+		return nil, invalid(err.Error())
+	}
+	if (touchesGuarded(writes) || (cur.Read != "public" && cfg.Read == "public")) && !a.star {
+		return nil, forbidden("this change needs a grant chained to a * key")
+	}
+	if !jsonv.Equal(cur.Doc["base"], cfg.Doc["base"]) {
+		return nil, invalid("/base cannot change")
+	}
+	if n.isBranch() {
+		for b := n; b.isBranch(); {
+			b = t.nsByID(b.base.Int64)
+			for kid, k := range t.config(b.configSeq).starKeys() {
+				nk, ok := findKey(cfg.Keys, kid)
+				if !ok || string(nk.Pub) != string(k.Pub) || !nk.IsStar() {
+					return nil, invalid(fmt.Sprintf("key %q is a * key of base %s and cannot be removed or changed", kid, b.name))
+				}
+			}
+		}
+		base := t.nsByID(n.base.Int64)
+		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
+			return nil, invalid("a branch of a non-public namespace cannot be public")
+		}
+	}
+	if cfg.Successor != "" {
+		s := t.nsByName(cfg.Successor)
+		if s == nil || s.base != n.base {
+			return nil, invalid("successor must be an existing namespace with the same base")
+		}
+	}
+	if cur.Read == "public" && cfg.Read != "public" {
+		if deps := t.publicDependents(n); len(deps) > 0 {
+			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps))
+		}
+	}
+	return cfg, nil
+}
+
+func (t *tx) publicDependents(n *nsRow) []string {
+	var out []string
+	for _, b := range t.branchesOf(n) {
+		if !b.purged && t.config(b.configSeq).Read == "public" {
+			out = append(out, b.name)
+		}
+	}
+	return out
+}
+
+func (t *tx) branchesOf(n *nsRow) []*nsRow {
+	rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE base = ? ORDER BY name`, n.id)
+	t.must(err)
+	defer rows.Close()
+	var out []*nsRow
+	for rows.Next() {
+		b, err := scanNS(rows)
+		t.must(err)
+		out = append(out, b)
+	}
+	return out
+}
+
+// insertConfig inserts a planned config revision and returns its seq.
+func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
+	r, err := t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,?,?,?,?,?)`,
+		n.id, p.id[:], n.configSeq, string(p.canon), string(jsonv.Canonical(p.doc)), author, t.now.UnixMilli())
+	t.must(err)
+	seq, _ := r.LastInsertId()
+	_, err = t.Exec(`UPDATE namespaces SET frozen = ?, config_seq = ? WHERE ns = ?`, p.cfg.Frozen, seq, n.id)
+	t.must(err)
+	n.frozen = p.cfg.Frozen
+	return seq
+}
+
+// WriteConfig creates a namespace (IfNoneMatch) or changes its document.
+func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
+	var res *WriteResult
+	err := e.update(ctx, func(t *tx) error {
+		n := t.nsByName(req.NS)
+		if cc.IfNoneMatch && n == nil {
+			r, err := t.createNamespace(req, cc)
+			res = r
+			return asErr(err)
+		}
+		if n == nil {
+			return notFound()
+		}
+		if n.purged {
+			return gone()
+		}
+		cur := t.config(n.configSeq)
+		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)
+		if aerr != nil {
+			return aerr
+		}
+		if cc.IfNoneMatch {
+			if err := t.authorize(a, "config", ""); err != nil {
+				return err
+			}
+			return apiErr(412, "stale", "config", t.configID(n.configSeq).String())
+		}
+		p, err := t.planConfig(n, cur, a, &cc, false)
+		if err != nil {
+			return err
+		}
+		if p.replay != nil {
+			res = p.replay
+			return nil
+		}
+		author := t.authorID(a.id())
+		seq := t.insertConfig(n, p, author)
+		_, nsID := t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, author)
+		res = &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: p.id.String()}
+		return nil
+	})
+	return res, err
+}
+
+// createNamespace bootstraps a namespace with an operator key (§C.4).
+func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error) {
+	if !ValidNSName(req.NS) {
+		return nil, badInput("invalid namespace name")
+	}
+	keys := t.e.opt.OperatorKeys
+	if keys == nil {
+		keys = []grant.Key{}
+	}
+	a, aerr := t.authenticate(req.NS, nil, nil, req.Cred, keys)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if a.verified != nil && !a.star {
+		return nil, forbidden("creating a namespace needs a deployment operator key")
+	}
+	ops, err := patch.Parse(cc.Patches)
+	if err != nil {
+		return nil, patchErr(err)
+	}
+	doc, _, err := patch.Apply(nil, false, ops, patch.Options{})
+	if err != nil {
+		return nil, patchErr(err)
+	}
+	cfg, perr := parseConfig(doc, t.e.opt.Limits)
+	if perr != nil {
+		return nil, invalid(perr.Error())
+	}
+	if cfg.Base != nil {
+		return nil, invalid("branches are created with POST /ns/{base}/branches")
+	}
+	if cfg.Successor != "" {
+		return nil, invalid("a new namespace cannot have a successor")
+	}
+	canon := jsonv.Canonical(cc.Patches)
+	id := ids.Revision(nil, canon)
+	author := t.authorID(a.id())
+	r, dberr := t.Exec(`INSERT INTO namespaces (name, frozen) VALUES (?, ?)`, req.NS, cfg.Frozen)
+	t.must(dberr)
+	nsid, _ := r.LastInsertId()
+	r, dberr = t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?)`,
+		nsid, id[:], string(canon), string(jsonv.Canonical(doc)), author, t.now.UnixMilli())
+	t.must(dberr)
+	cseq, _ := r.LastInsertId()
+	n := t.nsByID(nsid)
+	_, nsID := t.appendNS(n, map[string]any{"kind": "config", "target": id.String()}, nil, &cseq, cseq, author)
+	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: id.String()}, nil
+}
+
+// BranchRequest is POST /ns/{base}/branches (§7.6).
+type BranchRequest struct {
+	Name        string
+	At          string
+	Patches     any
+	IfNoneMatch bool
+}
+
+// CreateBranch creates a branch of a local base.
+func (e *Engine) CreateBranch(ctx context.Context, req Request, br BranchRequest) (*WriteResult, error) {
+	var res *WriteResult
+	err := e.update(ctx, func(t *tx) error {
+		r, err := t.createBranch(req, br)
+		res = r
+		return asErr(err)
+	})
+	return res, err
+}
+
+func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) {
+	base := t.nsByName(req.NS)
+	if base == nil {
+		return nil, notFound()
+	}
+	if base.purged {
+		return nil, gone()
+	}
+	bcfg := t.config(base.configSeq)
+	a, aerr := t.authenticate(base.name, base, bcfg, req.Cred, nil)
+	if aerr != nil {
+		return nil, aerr
+	}
+	// Step 1.
+	if !ValidNSName(br.Name) {
+		return nil, badInput("invalid branch name")
+	}
+	if err := t.authorize(a, "branch", br.Name); err != nil {
+		return nil, err
+	}
+	if !t.canRead(base, bcfg, a, "") || !a.unrestrictedRead() {
+		return nil, forbidden("branching needs unrestricted read on the base")
+	}
+	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
+		return nil, err
+	}
+	if br.Patches == nil {
+		br.Patches = []any{}
+	}
+	// Step 2.
+	atSeq := base.headSeq.Int64
+	if br.At != "" {
+		id, err := ids.Parse(br.At)
+		if err != nil {
+			return nil, invalid("at is not in the base's chain")
+		}
+		s, ok := t.nsLogSeq(base.id, id)
+		if !ok {
+			return nil, invalid("at is not in the base's chain")
+		}
+		atSeq = s
+	}
+	atID := t.nsLogID(atSeq)
+	// Build the branch's namespace document (step 3).
+	doc := cloneDoc(bcfg.Doc)
+	delete(doc, "frozen")
+	delete(doc, "successor")
+	doc["base"] = map[string]any{"ns": base.name, "at": atID.String()}
+	ops, err := patch.Parse(br.Patches)
+	if err != nil {
+		return nil, patchErr(err)
+	}
+	nd, w, err := patch.Apply(doc, true, ops, patch.Options{})
+	if err != nil {
+		return nil, patchErr(err)
+	}
+	writes := patch.WritesStrings(w)
+	genesis := []any{map[string]any{"op": "add", "path": "", "value": nd}}
+	gcanon := jsonv.Canonical(genesis)
+	cfgID := ids.Revision(nil, gcanon)
+	if ex := t.nsByName(br.Name); ex != nil {
+		// Idempotent retry: same principal, same at and patches.
+		var author int64
+		var gid []byte
+		qerr := t.QueryRow(`SELECT author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&author, &gid)
+		if qerr == nil && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
+			author == t.authorID(a.id()) && ids.FromBytes(gid) == cfgID {
+			var seq int64
+			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND body LIKE ?`, base.id, nsKindCode("branch"), `%"name":"`+br.Name+`"%`).Scan(&seq)
+			r := &WriteResult{Status: 200, Replayed: true, ConfigID: cfgID.String()}
+			if seq != 0 {
+				r.NSID = t.nsLogID(seq).String()
+			}
+			return r, nil
+		}
+		return nil, apiErr(412, "stale", "message", "the name is taken")
+	}
+	// Limits (step 4).
+	depth := 1
+	for b := base; b.isBranch(); b = t.nsByID(b.base.Int64) {
+		depth++
+	}
+	if depth > t.e.opt.Limits.BranchDepth {
+		return nil, limitErr(422, "branch depth exceeded")
+	}
+	live := 0
+	for _, b := range t.branchesOf(base) {
+		if !b.purged {
+			live++
+		}
+	}
+	if live >= bcfg.Limits.LiveBranches {
+		return nil, limitErr(422, "too many live branches")
+	}
+	// Step 5.
+	cfg, perr := parseConfig(nd, t.e.opt.Limits)
+	if perr != nil {
+		return nil, invalid(perr.Error())
+	}
+	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atID.String() {
+		return nil, invalid("/base cannot be changed")
+	}
+	if touchesGuarded(writes) && !a.star {
+		return nil, forbidden("these patches need a grant chained to a * key of the base")
+	}
+	for b := base; ; b = t.nsByID(b.base.Int64) {
+		for kid, k := range t.config(b.configSeq).starKeys() {
+			nk, ok := findKey(cfg.Keys, kid)
+			if !ok || string(nk.Pub) != string(k.Pub) || !nk.IsStar() {
+				return nil, invalid(fmt.Sprintf("key %q of %s must be kept", kid, b.name))
+			}
+		}
+		if !b.isBranch() {
+			break
+		}
+	}
+	if cfg.Read == "public" && bcfg.Read != "public" {
+		return nil, invalid("a branch of a non-public namespace cannot be public")
+	}
+	// Step 6: the base's rules evaluate a branch envelope.
+	env := t.basicEnvelope("branch", br.Name, a)
+	env["writes"] = anyStrings(writes)
+	env["doc"] = nd
+	env["patches"] = jsonv.MustParse(jsonv.Canonical(br.Patches))
+	if err := t.checkRules(bcfg, a, env, false); err != nil {
+		return nil, err
+	}
+	// Step 7.
+	author := t.authorID(a.id())
+	r, dberr := t.Exec(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?)`, br.Name, base.id, atSeq, base.configSeq)
+	t.must(dberr)
+	bid, _ := r.LastInsertId()
+	r, dberr = t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?)`,
+		bid, cfgID[:], string(gcanon), string(jsonv.Canonical(nd)), author, t.now.UnixMilli())
+	t.must(dberr)
+	cseq, _ := r.LastInsertId()
+	bn := t.nsByID(bid)
+	t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
+	_, nsID := t.appendNS(base, map[string]any{"kind": "branch", "name": br.Name, "at": atID.String(), "target": cfgID.String()}, nil, &cseq, base.configSeq, author)
+	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
+}
+
+// Purge purges a resource (§8.3).
+func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, force bool) error {
+	return e.update(ctx, func(t *tx) error {
+		n := t.nsByName(req.NS)
+		if n == nil {
+			return notFound()
+		}
+		if n.purged {
+			return gone()
+		}
+		cfg := t.config(n.configSeq)
+		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
+		if aerr != nil {
+			return aerr
+		}
+		if err := t.authorize(a, "purge", name); err != nil {
+			return err
+		}
+		if ifMatch == "" {
+			return apiErr(428, "precondition_required")
+		}
+		v := t.resolve(n, name, nil)
+		switch v.state {
+		case NotFound:
+			return notFound()
+		case Purged:
+			return gone()
+		}
+		if ifMatch != v.head.id.String() {
+			return apiErr(412, "stale", "head", v.head.id.String())
+		}
+		if force && !a.star {
+			return forbidden("a forced purge needs a * key")
+		}
+		if !force {
+			refs := t.referencedPaths(func(ns *nsRow, res string) bool {
+				return res == name && (ns.id == n.id || t.isBranchOf(ns, n))
+			})
+			for p := range refs {
+				if r, ok := schema.ParseRef(p); ok && r.NS == n.name && r.Name == name {
+					return apiErr(409, "in_use", "message", "a revision of this resource is a referenced schema")
+				}
+			}
+		}
+		env := t.basicEnvelope("purge", name, a)
+		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+		if err := t.checkRules(cfg, a, env, false); err != nil {
+			return err
+		}
+		t.purgeResource(n, name, t.authorID(a.id()))
+		return nil
+	})
+}
+
+func (t *tx) isBranchOf(b, base *nsRow) bool {
+	for b.isBranch() {
+		if b.base.Int64 == base.id {
+			return true
+		}
+		b = t.nsByID(b.base.Int64)
+	}
+	return false
+}
+
+// purgeResource purges name in n and propagates to every branch (§8.3).
+func (t *tx) purgeResource(n *nsRow, name string, author int64) {
+	v := t.resolve(n, name, nil)
+	if v.state != NotFound && v.state != Purged {
+		own := v.own
+		var res int64
+		if own == nil {
+			r, err := t.Exec(`INSERT INTO resources (ns, name, head_seq, state) VALUES (?,?,?,?)`, n.id, name, v.head.seq, statePurged)
+			t.must(err)
+			res, _ = r.LastInsertId()
+		} else {
+			res = own.id
+			_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ?`, res)
+			t.must(err)
+			_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE res = ?`, statePurged, res)
+			t.must(err)
+		}
+		_, err := t.Exec(`DELETE FROM heads WHERE res = ?`, res)
+		t.must(err)
+		_, err = t.Exec(`DELETE FROM snapshots WHERE res = ?`, res)
+		t.must(err)
+		target := v.head.seq
+		t.appendNS(n, map[string]any{"resource": name, "kind": "purge", "target": v.head.id.String()}, &res, &target, n.configSeq, author)
+		t.tags = append(t.tags, "r:"+n.name+"/"+name)
+		t.flushDocs = true
+	}
+	for _, b := range t.branchesOf(n) {
+		if !b.purged {
+			t.purgeResource(b, name, author)
+		}
+	}
+}
+
+// PurgeNamespace purges a frozen namespace (§8.5).
+func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string) error {
+	return e.update(ctx, func(t *tx) error {
+		n := t.nsByName(req.NS)
+		if n == nil {
+			return notFound()
+		}
+		if n.purged {
+			return gone()
+		}
+		cfg := t.config(n.configSeq)
+		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
+		if aerr != nil {
+			return aerr
+		}
+		if err := t.authorize(a, "purge-ns", ""); err != nil {
+			return err
+		}
+		if ifMatch == "" {
+			return apiErr(428, "precondition_required")
+		}
+		head := t.nsLogID(n.headSeq.Int64)
+		if ifMatch != head.String() {
+			return apiErr(412, "stale", "head", head.String())
+		}
+		if !cfg.Frozen {
+			return apiErr(409, "not_frozen")
+		}
+		var deps []string
+		for _, b := range t.branchesOf(n) {
+			if !b.purged {
+				deps = append(deps, b.name)
+			}
+		}
+		if len(deps) > 0 {
+			return apiErr(409, "in_use", "dependents", anyStrings(deps))
+		}
+		refs := t.referencedPaths(func(ns *nsRow, _ string) bool { return ns.id == n.id })
+		for p := range refs {
+			if r, ok := schema.ParseRef(p); ok && r.NS == n.name {
+				return apiErr(409, "in_use", "message", "a schema revision of this namespace is referenced elsewhere")
+			}
+		}
+		env := t.basicEnvelope("purge-ns", "", a)
+		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+		if err := t.checkRules(cfg, a, env, false); err != nil {
+			return err
+		}
+		_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+		t.must(err)
+		_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+		t.must(err)
+		_, err = t.Exec(`DELETE FROM snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+		t.must(err)
+		_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, n.id)
+		t.must(err)
+		_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
+		t.must(err)
+		t.appendNS(n, map[string]any{"kind": "purge-ns"}, nil, nil, n.configSeq, t.authorID(a.id()))
+		t.tags = append(t.tags, "ns:"+n.name)
+		t.flushDocs = true
+		return nil
+	})
+}
+
+// referencedPaths computes the referenced schema revisions of §6.1: those
+// named by $schema in the last live document of any unpurged resource
+// (including read-through ones), and everything reachable through $ref.
+// exclude skips referencing resources.
+func (t *tx) referencedPaths(exclude func(ns *nsRow, res string) bool) map[string]bool {
+	out := map[string]bool{}
+	var queue []string
+	rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE purged = 0`)
+	t.must(err)
+	var all []*nsRow
+	for rows.Next() {
+		n, err := scanNS(rows)
+		t.must(err)
+		all = append(all, n)
+	}
+	rows.Close()
+	for _, n := range all {
+		for _, h := range t.listHeads(n, nil) {
+			if h.state == Purged || h.row == nil || exclude(n, h.name) {
+				continue
+			}
+			var ref sql.NullString
+			ll := t.lastLive(h.row)
+			t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))
+			if ref.Valid && !out[ref.String] {
+				out[ref.String] = true
+				queue = append(queue, ref.String)
+			}
+		}
+	}
+	for len(queue) > 0 {
+		p := queue[0]
+		queue = queue[1:]
+		r, ok := schema.ParseRef(p)
+		if !ok {
+			continue
+		}
+		d, err := t.loadSchema(r, &actor{}, nil)
+		if err != nil {
+			continue
+		}
+		for _, x := range schema.Refs(d) {
+			if !out[x.Path()] {
+				out[x.Path()] = true
+				queue = append(queue, x.Path())
+			}
+		}
+	}
+	return out
+}
+
+// PruneRequest is POST /r/{ns}/{name}/prune (§8.6).
+type PruneRequest struct {
+	Horizon string
+	Keep    []string
+}
+
+// Prune prunes a resource's history below a horizon. It returns the
+// effective horizon.
+func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (string, error) {
+	var out string
+	err := e.update(ctx, func(t *tx) error {
+		n := t.nsByName(req.NS)
+		if n == nil {
+			return notFound()
+		}
+		if n.purged {
+			return gone()
+		}
+		cfg := t.config(n.configSeq)
+		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
+		if aerr != nil {
+			return aerr
+		}
+		if err := t.authorize(a, "prune", name); err != nil {
+			return err
+		}
+		if n.isBranch() {
+			return invalid("branches don't prune (§8.6)")
+		}
+		v := t.resolve(n, name, nil)
+		if v.state == NotFound {
+			return notFound()
+		}
+		if v.state == Purged {
+			return gone()
+		}
+		hid, err := ids.Parse(pr.Horizon)
+		if err != nil {
+			return invalid("horizon must be an ancestor of the head")
+		}
+		h := t.findInAncestry(v.head, hid)
+		if h == nil {
+			return invalid("horizon must be an ancestor of the head")
+		}
+		if len(pr.Keep) > cfg.Limits.KeepPerResource {
+			return limitErr(422, "too many kept revisions")
+		}
+		var keep []*revRow
+		for _, k := range pr.Keep {
+			kid, err := ids.Parse(k)
+			var row *revRow
+			if err == nil {
+				row = t.findInAncestry(v.head, kid)
+			}
+			if row == nil || row.kind != kindRev {
+				return invalid("keep lists a revision that is not in the resource's history")
+			}
+			keep = append(keep, row)
+		}
+		// No archive destination is supported, so pruning always needs a
+		// * key (§8.6).
+		if !a.star {
+			return forbidden("pruning without an archive needs a grant chained to a * key")
+		}
+		env := t.basicEnvelope("prune", name, a)
+		env["writes"], env["patches"] = []any{}, []any{}
+		env["doc"] = map[string]any{"horizon": pr.Horizon, "keep": anyStrings(pr.Keep)}
+		if err := t.checkRules(cfg, a, env, false); err != nil {
+			return err
+		}
+		// Protected revisions: the retry window and branch points.
+		var minSeq int64
+		cutoff := t.now.Add(-cfg.Limits.RetryWindow).UnixMilli()
+		if err := t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND created >= ?`, v.own.id, cutoff).Scan(&minSeq); err == nil && minSeq != 0 && minSeq < h.seq {
+			h = t.rev(minSeq)
+		}
+		for _, b := range t.allBranchesOf(n) {
+			var p int64
+			if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, v.own.id, b.baseAt.Int64).Scan(&p); err == nil && p < h.seq {
+				h = t.rev(p)
+			}
+		}
+		cur := v.own.horizonSeq
+		if cur.Valid && h.seq <= cur.Int64 {
+			out = t.rev(cur.Int64).id.String()
+			return nil
+		}
+		// Documents that stay available: the horizon (and for a tombstone the
+		// last live document), kept revisions and referenced schemas.
+		refs := t.referencedPaths(func(*nsRow, string) bool { return false })
+		keepSeqs := map[int64]*revRow{}
+		keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
+		for _, k := range keep {
+			keepSeqs[k.seq] = k
+		}
+		rrows, qerr := t.Query(`SELECT seq, id FROM revisions WHERE res = ? AND seq < ? AND kind = 0 AND patches IS NOT NULL`, v.own.id, h.seq)
+		t.must(qerr)
+		for rrows.Next() {
+			var seq int64
+			var id []byte
+			t.must(rrows.Scan(&seq, &id))
+			if refs["/r/"+n.name+"/"+name+"/rev/"+ids.FromBytes(id).String()] {
+				keepSeqs[seq] = nil
+			}
+		}
+		rrows.Close()
+		for seq, row := range keepSeqs {
+			if row == nil {
+				row = t.rev(seq)
+			}
+			doc, err := t.docBytesAt(row)
+			if err != nil {
+				return invalid("a kept revision was already pruned")
+			}
+			_, err = t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, v.own.id, string(doc))
+			t.must(err)
+		}
+		_, err = t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, v.own.id, h.seq)
+		t.must(err)
+		keepJSON := string(jsonv.Canonical(anyStrings(pr.Keep)))
+		_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = ? WHERE res = ?`, h.seq, keepJSON, v.own.id)
+		t.must(err)
+		target := h.seq
+		t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &v.own.id, &target, n.configSeq, t.authorID(a.id()))
+		out = h.id.String()
+		return nil
+	})
+	return out, err
+}
+
+// allBranchesOf lists the direct branches of n that aren't purged.
+func (t *tx) allBranchesOf(n *nsRow) []*nsRow {
+	var out []*nsRow
+	for _, b := range t.branchesOf(n) {
+		if !b.purged {
+			out = append(out, b)
+		}
+	}
+	return out
+}
