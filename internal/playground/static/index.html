@@ -1,0 +1,231 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Patch Log Playground</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%232456d6'/%3E%3Cpath d='M4 4h8M4 8h5M4 12h8' stroke='white' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+
+<header class="top">
+  <div class="brand">Patch Log <span>playground</span></div>
+  <div class="conn">
+    <label>Author <input id="author" class="mono" placeholder="alice  (X-Author, serve -dev)" autocomplete="off" spellcheck="false"></label>
+    <label>Bearer grant <input id="bearer" class="mono" type="password" placeholder="optional token" autocomplete="off" spellcheck="false"></label>
+    <span id="origin" title="GET / response"></span>
+  </div>
+  <div class="menu">
+    <button id="exBtn" aria-haspopup="true" aria-expanded="false">Examples &#9662;</button>
+    <div id="exMenu" class="menu-list" hidden></div>
+  </div>
+  <button id="inspToggle" title="Show or hide the request inspector">Inspector <span id="inspCount" class="badge">0</span></button>
+</header>
+
+<div class="ctx">
+  <div class="grp">
+    <label for="nsSel">Namespace</label>
+    <select id="nsSel"></select>
+    <input id="nsAdd" class="mono" placeholder="add namespace by name" autocomplete="off" spellcheck="false" aria-label="Add a namespace by name">
+    <button id="nsAddBtn" title="Add to the list of known namespaces (kept in this browser)">Add</button>
+    <button id="nsForget" title="Remove the selected namespace from the list (does not delete anything)">Forget</button>
+  </div>
+  <div class="grp">
+    <label for="resName">Resource</label>
+    <input id="resName" class="mono" list="headsList" placeholder="name" autocomplete="off" spellcheck="false">
+    <datalist id="headsList"></datalist>
+    <button id="resLoad">Load</button>
+  </div>
+</div>
+
+<div class="layout">
+<main class="main">
+  <section id="exPanel" class="example" hidden></section>
+
+  <div class="tabs" role="tablist">
+    <button class="tab" role="tab" data-tab="ns" aria-selected="true">Namespace</button>
+    <button class="tab" role="tab" data-tab="res" aria-selected="false">Resource</button>
+    <button class="tab" role="tab" data-tab="hist" aria-selected="false">History</button>
+    <button class="tab" role="tab" data-tab="batch" aria-selected="false">Batch</button>
+    <button class="tab" role="tab" data-tab="live" aria-selected="false">Live <span id="liveDot" class="dot" hidden></span></button>
+  </div>
+
+  <!-- ============ Namespace ============ -->
+  <section id="tab-ns" class="grid" role="tabpanel">
+    <div class="card">
+      <header><h2>Namespace</h2><button id="nsRefresh" class="tiny">Refresh</button></header>
+      <div id="nsStatus" class="muted">Select or add a namespace above.</div>
+    </div>
+
+    <div class="card">
+      <header><h2>Create namespace</h2><span class="muted small">PATCH /ns/{ns} &middot; If-None-Match: *</span></header>
+      <div class="row"><label for="nsNewName">Name</label><input id="nsNewName" class="mono" placeholder="matches" autocomplete="off" spellcheck="false"></div>
+      <textarea id="nsNewDoc" class="code" rows="4" spellcheck="false" data-json>{"read":"public"}</textarea>
+      <div class="row"><button id="nsCreate" class="primary">Create</button><span class="note">The document becomes the genesis patch set <code>[{"op":"add","path":"","value":&hellip;}]</code>. <code>read</code> is <code>public</code> or <code>grant</code>.</span></div>
+    </div>
+
+    <div class="card wide">
+      <header><h2>Namespace document</h2><span id="nsDocMeta" class="muted small"></span></header>
+      <div class="split">
+        <div><pre id="nsDoc" class="json empty">&mdash;</pre></div>
+        <div>
+          <div class="row"><label for="nsIfMatch">If-Match (config id)</label><input id="nsIfMatch" class="mono" placeholder="X-Config-Revision" spellcheck="false"><button id="nsUseCfg" class="tiny" title="Reset to the current config id">use current</button></div>
+          <textarea id="nsPatch" class="code" rows="6" spellcheck="false" data-json>[
+  {"op":"add","path":"/rules","value":[]}
+]</textarea>
+          <div class="chips" id="nsTpl"></div>
+          <div class="row">
+            <button id="nsApply" class="primary">Apply patch</button>
+            <button id="nsFreeze">Freeze</button>
+            <button id="nsUnfreeze">Unfreeze</button>
+          </div>
+          <p class="note">PATCH /ns/{ns}. If-Match takes the <b>config id</b>, not the namespace head. Freeze/unfreeze are config patches on <code>/frozen</code>.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card wide">
+      <header><h2>Namespace log</h2><span id="nsLogMeta" class="muted small"></span></header>
+      <div class="scroll"><table id="nsLog"><thead><tr><th>kind</th><th>resource</th><th>target</th><th>author</th><th>created</th><th>id</th></tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <div class="card wide">
+      <header><h2>Heads</h2><span id="headsMeta" class="muted small"></span><button id="headsMore" class="tiny" hidden>Load more</button></header>
+      <div class="scroll"><table id="headsTbl"><thead><tr><th>resource</th><th>kind</th><th>target</th></tr></thead><tbody></tbody></table></div>
+      <p class="note">GET /ns/{ns}/rev/{id}/heads &mdash; click a row to open the resource.</p>
+    </div>
+
+    <div class="card">
+      <header><h2>Branches</h2><span class="muted small">GET /ns/{ns}/branches</span></header>
+      <div class="scroll"><table id="brTbl"><thead><tr><th>name</th><th>at</th><th>frozen</th><th>purged</th><th>successor</th><th></th></tr></thead><tbody></tbody></table></div>
+    </div>
+
+    <div class="card">
+      <header><h2>Create branch</h2><span class="muted small">POST /ns/{base}/branches &middot; If-None-Match: *</span></header>
+      <div class="row"><label for="brName">Name</label><input id="brName" class="mono" placeholder="release-7" autocomplete="off" spellcheck="false"></div>
+      <div class="row"><label for="brAt">At</label><input id="brAt" class="mono" placeholder="namespace revision (default: current head)" spellcheck="false"><button id="brUseHead" class="tiny">use head</button></div>
+      <textarea id="brPatches" class="code" rows="3" spellcheck="false" data-json placeholder='optional patches for the branch document, e.g. [{"op":"add","path":"/rules","value":[]}]'></textarea>
+      <div class="row"><button id="brCreate" class="primary">Create branch</button></div>
+    </div>
+
+    <div class="card danger-zone">
+      <header><h2>Purge namespace</h2><span class="muted small">POST /ns/{ns}/purge</span></header>
+      <div class="row"><label for="nsPurgeIm">If-Match (ns_id)</label><input id="nsPurgeIm" class="mono" placeholder="namespace head" spellcheck="false"><button id="nsPurgeUse" class="tiny">use head</button></div>
+      <div class="row"><button id="nsPurge" class="danger">Purge namespace&hellip;</button></div>
+      <p class="note">Irreversible. Needs the namespace frozen (else <code>409 not_frozen</code>) and no live branches (<code>409 in_use</code>).</p>
+    </div>
+  </section>
+
+  <!-- ============ Resource ============ -->
+  <section id="tab-res" class="grid" role="tabpanel" hidden>
+    <div class="card">
+      <header><h2>Resource</h2><button id="resRefresh" class="tiny">Refresh</button></header>
+      <div id="resState" class="muted">Pick a resource from the heads table, or type a name above.</div>
+      <pre id="resDoc" class="json empty">&mdash;</pre>
+    </div>
+
+    <div class="card">
+      <header><h2>Patch</h2><span class="muted small">PATCH /r/{ns}/{name} &middot; application/json-patch+json</span></header>
+      <textarea id="patch" class="code" rows="7" spellcheck="false" data-json>[
+  {"op":"add","path":"","value":{"title":"Hello"}}
+]</textarea>
+      <div class="chips" id="patchTpl"></div>
+      <div class="row">
+        <label for="ifMatch">If-Match</label>
+        <input id="ifMatch" class="mono" placeholder="head id (auto-filled, editable; empty = no header)" spellcheck="false">
+        <button id="ifUseHead" class="tiny" title="Reset to the current head (or tombstone)">use head</button>
+      </div>
+      <div class="row">
+        <button id="btnCreate" class="primary" title="If-None-Match: *">Create</button>
+        <button id="btnAppend" class="primary" title="If-Match: head">Append</button>
+        <button id="btnDelete" title="DELETE, If-Match">Delete</button>
+        <button id="btnRestore" title="PATCH with If-Match: tombstone">Restore</button>
+        <label class="check"><input type="checkbox" id="restoreEditor"> restore with editor patches (else <code>[]</code>)</label>
+      </div>
+      <p class="note">Edit If-Match to test <code>412</code>; resend an identical request to see the idempotent-retry <code>200</code>. Blank If-Match sends none (<code>428</code>).</p>
+    </div>
+
+    <div class="card">
+      <header><h2>Purge</h2><span class="muted small">POST &hellip;/purge</span></header>
+      <div class="row"><button id="btnPurge" class="danger">Purge resource&hellip;</button><label class="check"><input type="checkbox" id="purgeForce"> force=1 (schema in use; needs * key)</label></div>
+      <p class="note">Uses the If-Match field (head or tombstone). Content is removed for good.</p>
+    </div>
+
+    <div class="card">
+      <header><h2>Prune</h2><span class="muted small">POST &hellip;/prune</span></header>
+      <div class="row"><label for="pruneH">Horizon</label><input id="pruneH" class="mono" placeholder="revision id" spellcheck="false"></div>
+      <div class="row"><label for="pruneKeep">Keep</label><input id="pruneKeep" class="mono" placeholder="comma-separated ids (optional)" spellcheck="false"></div>
+      <div class="row"><button id="btnPrune">Prune</button></div>
+      <p class="note">Drops patch sets before the horizon; ids stay. Pick a horizon in History. Pruning may need a <code>*</code> key.</p>
+    </div>
+  </section>
+
+  <!-- ============ History ============ -->
+  <section id="tab-hist" class="grid" role="tabpanel" hidden>
+    <div class="card wide">
+      <header><h2>History</h2><span id="histMeta" class="muted small"></span><button id="histRefresh" class="tiny">Refresh</button></header>
+      <div class="split">
+        <ul id="timeline" class="timeline"></ul>
+        <div id="revView"><p class="muted">Click a revision to see its document and patches.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============ Batch ============ -->
+  <section id="tab-batch" class="grid" role="tabpanel" hidden>
+    <div class="card wide">
+      <header><h2>Batch</h2><span class="muted small">POST /ns/{ns}/batch</span></header>
+      <textarea id="batchBody" class="code" rows="18" spellcheck="false" data-json></textarea>
+      <div class="chips" id="batchTpl"></div>
+      <div class="row">
+        <button id="batchDry">Dry run</button>
+        <button id="batchGo" class="primary">Submit</button>
+        <button id="batchExample">Reset example</button>
+      </div>
+      <div id="batchOut" hidden></div>
+      <p class="note">Items: <code>resource</code>, exactly one of <code>ifMatch</code> / <code>ifNoneMatch:"*"</code>, and <code>steps</code> (patch sets or <code>"delete"</code>). Optional <code>config</code> <code>{ifMatch, patches}</code> and <code>source</code> <code>{ns, at}</code>. Dry run is <code>?dry-run=1</code>: it reports the ids a submit would produce and writes nothing.</p>
+    </div>
+  </section>
+
+  <!-- ============ Live ============ -->
+  <section id="tab-live" class="grid" role="tabpanel" hidden>
+    <div class="card">
+      <header><h2>Subscriptions</h2></header>
+      <div class="stream"><label class="check"><input type="checkbox" id="liveNs"> Namespace events</label><span id="liveNsSt" class="badge">off</span></div>
+      <div class="stream"><code id="liveNsUrl" class="muted small"></code></div>
+      <div class="stream"><label class="check"><input type="checkbox" id="liveRes"> Resource events</label><span id="liveResSt" class="badge">off</span></div>
+      <div class="stream"><code id="liveResUrl" class="muted small"></code></div>
+      <div id="liveWarn" class="warn-box" hidden>EventSource cannot send custom headers, so <code>Authorization</code> and <code>X-Author</code> are <b>not</b> sent on these streams. That is fine for <code>serve -dev</code> and public namespaces; a namespace that needs a grant will answer 401/403/404 here.</div>
+      <p class="note">Streams start at <code>?since=</code> the current head, so only new entries arrive. Views refresh automatically on each event.</p>
+    </div>
+    <div class="card">
+      <header><h2>Live feed</h2><span id="feedCount" class="muted small"></span><button id="feedClear" class="tiny">Clear</button></header>
+      <ul id="feed" class="feed"><li class="muted">No events yet.</li></ul>
+    </div>
+  </section>
+</main>
+
+<aside class="inspector" id="inspector" aria-label="Request inspector">
+  <div class="insp-head">
+    <h2>Request inspector</h2>
+    <div class="seg" role="group" aria-label="Filter">
+      <button data-f="all" aria-pressed="true">All</button>
+      <button data-f="writes" aria-pressed="false">Writes</button>
+      <button data-f="errors" aria-pressed="false">Errors</button>
+    </div>
+    <label class="check" title="Reads the UI issues by itself to keep its views fresh"><input type="checkbox" id="inspAuto"> background reads <span id="inspHidden" class="muted"></span></label>
+    <input id="inspQ" type="search" placeholder="filter" aria-label="Filter requests">
+    <button id="inspExpand" class="tiny">Expand</button>
+    <button id="inspClear" class="tiny">Clear</button>
+  </div>
+  <div class="insp-note">Newest first. The browser follows redirects itself, so headers and body are those of the final response; the redirect target is shown when one happened. Authorization is masked here and included in the curl.</div>
+  <div id="inspList"></div>
+</aside>
+</div>
+
+<button id="inspFloat" class="floating-insp primary">Inspector</button>
+<script src="app.js"></script>
+</body>
+</html>

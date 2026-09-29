@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-operator-key PUB]...
+//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]...
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}'
@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/playground"
 	"github.com/middle-management/patchlog/internal/server"
 )
 
@@ -45,7 +47,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-operator-key PUB]...
+  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]...
   patchlog keygen
   patchlog grant mint -key SEED -block JSON
   patchlog grant narrow -grant TOKEN -block JSON`)
@@ -58,6 +60,7 @@ func serve(args []string) {
 	db := fs.String("db", "patchlog.db", "SQLite database path")
 	origin := fs.String("origin", "http://localhost:8080", "canonical origin (§G.1)")
 	dev := fs.Bool("dev", false, "disable authentication (development only); X-Author names the author")
+	pg := fs.Bool("playground", true, "serve the web playground at /playground/")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
 	fs.Parse(args)
@@ -82,9 +85,46 @@ func serve(args []string) {
 		log.Fatal(err)
 	}
 	defer e.Close()
-	srv := &http.Server{Addr: *addr, Handler: server.New(e), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: handler(server.New(e), *pg), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("patchlog listening on %s (origin %s, dev=%v)", *addr, *origin, *dev)
+	if *pg {
+		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
+	}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// handler routes /playground/ to the web UI and everything else to the API.
+// The playground has its own ServeMux, but the API is not put behind one:
+// http.ServeMux cleans paths and answers 301, where §3.6 requires the API's
+// own 400 for non-canonical URLs, so only playground paths reach the mux.
+func handler(api http.Handler, withPlayground bool) http.Handler {
+	if !withPlayground {
+		return api
+	}
+	mux := http.NewServeMux()
+	mux.Handle(playground.Prefix, playground.Handler())
+	mux.HandleFunc(strings.TrimSuffix(playground.Prefix, "/"), func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, playground.Prefix, http.StatusFound)
+	})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/playground" || strings.HasPrefix(r.URL.Path, playground.Prefix) {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		api.ServeHTTP(w, r)
+	})
+}
+
+// localURL turns a listen address into a URL a browser on this machine can open.
+func localURL(addr string) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "http://" + addr
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		host = "localhost"
+	}
+	return "http://" + net.JoinHostPort(host, port)
 }
 
 func grantCmd(args []string) {

@@ -51,6 +51,18 @@ go build -o patchlog ./cmd/patchlog
 ./patchlog serve -db prod.db -origin https://cms.example -operator-key <PUBLIC>
 ```
 
+### Playground
+
+`serve` also hosts a web playground at **`/playground/`** (turn it off with `-playground=false`).
+It is plain HTML/JS embedded in the binary and talks to the same-origin API. It has:
+
+- a request inspector with every request's preconditions, status, response headers and error body, plus "copy as curl";
+- namespace, resource, history, batch and branch editors;
+- live SSE feeds;
+- scripted examples: conflict and rebase, schema validation, rules, batch delete+restore, branch read-through.
+
+Run it with `./patchlog serve -dev` and open `http://localhost:8080/playground/`.
+
 ### A short tour (dev mode)
 
 ```sh
@@ -125,6 +137,7 @@ namespace's name, or `"*"`, in `ns`.
 
 ```
 cmd/patchlog        CLI: serve, keygen, grant mint/narrow
+internal/playground web UI served at /playground/
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
 internal/ids        content-addressed ids (§3.2–§3.5)
 internal/pointer    JSON Pointer
