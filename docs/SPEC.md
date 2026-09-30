@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.19 · 2026-09-29. See the change log at the end.
+Status: draft v0.20 · 2026-09-29. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -449,12 +449,17 @@ Without the `editor` role, a principal may only create, edit or restore document
 - **`x-ref`** marks a string that references another resource, so tools can follow it: exporters (§G.4.2), static publishers, and reverse-reference indexes that answer "who uses this?".
 ```
 "hero":    { "type": "string", "x-ref": { "pinned": true } },   // "/r/media/photo-12/rev/1q…": exactly that revision
-"related": { "type": "array", "items": { "type": "string", "x-ref": {} } }   // "/r/matches/cup": whatever is the head
+"related": { "type": "array", "items": { "type": "string", "x-ref": {} } },  // "/r/matches/cup": whatever is the head
+"trigger": { "type": "string", "x-ref": { "key": "/triggers" } }            // "/r/doors/layout-7#t-42": one entry of layout-7
 ```
 
-  - Its value is `{ "pinned"?: boolean }`. It applies wherever it appears in a subschema that validated successfully, like any JSON Schema 2020-12 annotation, so also through `$ref`, `items` and `oneOf`.
+  - Its value is `{ "pinned"?: boolean, "key"?: pointer }`.
 
   - A pinned reference is a revision path in the form of §6.1. A live reference is a resource path `/r/{ns}/{name}`.
+
+  - **Entries inside a document.** With `key`, a reference names one entry of the target document: `/r/{ns}/{name}#{id}`, or pinned `/r/{ns}/{name}/rev/{rev}#{id}`. `key` is a JSON Pointer into the target document, to either an array of objects with a string `id` member or an object whose member names are the ids. `{id}` is matched against those ids, never against array positions, so references survive reordering. It is percent-encoded as a URI fragment. A reference whose entry doesn't exist is dangling, like one to a missing resource.
+
+  - **Finding references** is a static walk, not annotation collection during validation, so any validator will do. Walk each document together with its schema, and at every instance location consider every subschema that could apply: through `$ref`, `properties`, `patternProperties`, `additionalProperties`, `items` and `prefixItems`, **every** branch of `allOf`, `anyOf`, `oneOf`, `if`, `then` and `else`, and any other keyword that applies a subschema. A string at a location where any of them carries `x-ref` is a reference if it has the form above. This over-approximates, since a branch that didn't validate still counts, which is harmless because the string must also look like a reference. Walking the document along with the schema handles recursive schemas without special cases.
 
   - Like every `x-*` keyword, the core doesn't check it. A schema can enforce the form with `pattern`.
 
@@ -503,6 +508,23 @@ Without the `editor` role, a principal may only create, edit or restore document
   - A key scope may lower the per-principal rate for the grants it signs (§C.4), e.g. to throttle a plug-in service without touching editors.
 
   - Clients stay under the limits by combining pending changes (§11).
+
+-
+**Allowances.** A namespace document may give a named principal (root `sub` and signing `kid`) its own budget:
+
+```
+"allowances": [ { "sub": "svc:importer", "kid": "ops-2026",
+                  "rate": 100, "burst": 20000,          // writes per second, and bucket size
+                  "itemsPerBatch": 20000, "batchSize": "64 MiB" } ]
+```
+
+  - That principal's writes draw on the allowance's own bucket instead of the principal and namespace buckets, and its batches may be as large as the allowance says, up to the deployment maximums. Per-resource buckets still apply.
+
+  - This is how a large import or release lands as **one** atomic batch without holding up the namespace's other writers. Splitting it into paced batches would make it non-atomic, so pacing suits backfills only (§G.4.4).
+
+  - A large batch still holds the namespace's sequencer while it inserts, so `itemsPerBatch` is chosen with that in mind.
+
+  - Changing `/allowances` requires a `*` key (§7.4). Growth stays an administrator's decision.
 
 -
 **Deployment maximums.** A deployment sets a maximum for every limit, and a namespace can only lower it. The retry window is the exception: the deployment sets a minimum and a maximum, and a namespace may raise it up to that maximum. Writes covering or overlapping `/limits` require a `*` key (§7.4), because batch size and item counts bound how long a write holds the namespace's sequencer.
@@ -612,7 +634,7 @@ If that entry was written by the **same principal**, respond `200` with it inste
 
 - **Envelope.** Config writes are checked with a `config` envelope (§6.4.1). Key-scope and grant rules apply to them.
 
-- **Keys, roles, revocations, limits and exposure.** Writes covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/retention` or `/encryption`, and writes that set `read` to `public`, additionally require a grant chained to a key with `can: ["*"]`. A role definition changes what every outstanding grant naming it can do (§C.1.1), so it is guarded like a key. Making a namespace public or changing its encryption exposes everything in it, so those are guarded too. Making `read` stricter needs no `*` key.
+- **Keys, roles, revocations, limits and exposure.** Writes covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/retention` or `/encryption`, and writes that set `read` to `public`, additionally require a grant chained to a key with `can: ["*"]`. A role definition changes what every outstanding grant naming it can do (§C.1.1), so it is guarded like a key. Making a namespace public or changing its encryption exposes everything in it, so those are guarded too. Making `read` stricter needs no `*` key.
 
 - **Validation.** The namespace document is validated against the built-in namespace-document schema. Rules and patterns must be well-formed and within limits.
 
@@ -722,7 +744,7 @@ If-None-Match: *
 
   - The caller needs **unrestricted** `read` on the base. No rule in the grant's blocks, its key's scope or its effective roles may refer to `/resource`, and the key may not have `readScope`. Otherwise a reader limited to some resources could branch the namespace and read the rest through the branch. Bases whose read access is decided per document (§C.5.1) should not grant `branch` at all.
 
-  - `patches` covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/retention` or `/encryption` need a grant chained to a `*` key **of the base**. Every `*` key of the base is kept in the branch and can't be removed from it, so the base's administrators can always freeze and purge its branches.
+  - `patches` covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/retention` or `/encryption` need a grant chained to a `*` key **of the base**. Every `*` key of the base is kept in the branch and can't be removed from it, so the base's administrators can always freeze and purge its branches.
 
   - The base's rules evaluate a `branch` envelope. Its `resource` is the new namespace's name, its `doc` is the new namespace document, and its `writes` come from `patches`. A base can therefore decide who may branch it, how branches are named (e.g. `^release-`), and what they may change.
 
@@ -1511,7 +1533,7 @@ The catalog decides **who has which role where**. Each content namespace decides
 
   - a path that reaches a **tombstoned, purged, dangling or cyclic** node ends there, and that node contributes nothing
 
-  - a dangling placement (item gone) grants nothing
+  - a dangling placement grants nothing, except `create` for an item that has never existed (§B.11.4)
 
   - deleting a folder or placement can therefore only narrow access, never widen it
 
@@ -1544,7 +1566,7 @@ The catalog decides **who has which role where**. Each content namespace decides
 ```
 { "keys": [
     { "kid": "catalog-01", "alg": "Ed25519", "pub": "…",
-      "can": ["read", "append"], "maxTtl": "PT15M", "readScope": "resource", "requireAt": "cat-season",
+      "can": ["read", "create", "append"], "maxTtl": "PT15M", "readScope": "resource", "requireAt": "cat-season",
       "groups": { "deny": ["ops"] }, "roles": { "allow": ["desk", "translator", "reader"] } } ],
   "roles": { "desk": { … }, "translator": { … }, "reader": { … } },
   "catalogs": { "cat-season": { "place": ["group:match-desk", "group:editors-in-chief"] } } }
@@ -1554,7 +1576,7 @@ The catalog decides **who has which role where**. Each content namespace decides
 
   - In the catalog it may create, move and delete nodes, but never change `$access`.
 
-  - In content namespaces it may only grant reading and appending, only for single resources, and only through the roles the content namespace allows it.
+  - In content namespaces it may only grant reading, creating and appending, only for single resources, and only through the roles the content namespace allows it.
 
   - It may never assert admin groups.
 
@@ -1604,6 +1626,17 @@ Placing is a deliberate act of publishing into a folder's audience, so these two
 
 -
 **Unplace** (`want: ["delete"]` on a placement) requires a role with `move` on every current parent.
+
+-
+**Create** (`{ "item": "/r/matches/final", "want": ["create"] }`) makes a new document in a folder:
+
+  - The caller first **places** the new item (above). The placement names a resource that doesn't exist yet, and is dangling until it does (§B.7).
+
+  - The catalog resolves the caller's effective roles from that placement, as for any item, and keeps those the content namespace defines with `create`.
+
+  - It signs a grant fixed to that name with `can: ["create"]`. Such a grant can only ever produce the genesis: a create needs `If-None-Match: *`, which fails once the resource exists. Later edits use ordinary `append` grants.
+
+A name that exists or existed in the content namespace is refused (`409`), so a create grant can never restore or overwrite anything. That reveals the name is taken, as any create would; names are not secrets (§E.4).
 
 -
 **Accountability.** Every revision records its grant (§C.3), including `at` and `via`, so catalog decisions are auditable afterwards.
@@ -1951,7 +1984,7 @@ Everything in this addendum is specific to the implementation in this repository
 
 - Bun and TypeScript (strict), `bun:sqlite`, `Bun.serve` and `Bun.CryptoHasher`.
 
-- Dependencies: `ajv`, `ajv-formats` and `fast-json-patch`. Two more are needed for the spec:
+- Dependencies: `ajv`, `ajv-formats` and `fast-json-patch`. ajv doesn't collect annotations, which is why §6.5 finds `x-ref` with a static walk instead. Two more are needed for the spec:
 
   - an RFC 8785 canonicaliser, or an in-house one
 
@@ -2007,7 +2040,7 @@ CREATE UNIQUE INDEX one_first ON revisions (res) WHERE first = 1;
 
 CREATE TABLE grants (id BLOB PRIMARY KEY, blocks TEXT NOT NULL);              -- non-bearer form (§C.3)
 
-CREATE TABLE heads (res INTEGER PRIMARY KEY REFERENCES resources, doc TEXT NOT NULL);
+CREATE TABLE heads (res INTEGER PRIMARY KEY REFERENCES resources, doc TEXT NOT NULL);   -- a cache, only for small documents (D.4)
 CREATE TABLE snapshots (res INTEGER NOT NULL REFERENCES resources, seq INTEGER NOT NULL REFERENCES revisions, doc TEXT NOT NULL, PRIMARY KEY (res, seq)) WITHOUT ROWID;  -- documents kept below a horizon (§8.6)
 
 CREATE TABLE ns_log (
@@ -2058,7 +2091,7 @@ CREATE UNIQUE INDEX one_config_genesis ON ns_config (ns) WHERE parent_seq IS NUL
 
 - **Insert:** `BEGIN IMMEDIATE`, then re-check that the resource head, namespace config id and `revoked` list are unchanged. In a branch, also re-check the keys and `revoked` lists of every base (§C.4).
 
-  - If they are, insert the revision, its `head_history` row, the namespace entry and the head snapshot, and commit.
+  - If they are, insert the revision, its `head_history` row, the namespace entry and, for small documents, the head snapshot (D.4), and commit.
 
   - If not, roll back and redo step 1, or return `412` if the resource head moved.
 
@@ -2066,7 +2099,7 @@ CREATE UNIQUE INDEX one_config_genesis ON ns_config (ns) WHERE parent_seq IS NUL
 
   - the batch's `ns_config` row, if it changes the configuration
 
-  - every revision, with its `head_history` row and head snapshot
+  - every revision, with its `head_history` row and, for small documents, its head snapshot
 
   - one `ns_log` row, with `entries` and `source`
 
@@ -2081,10 +2114,10 @@ CREATE UNIQUE INDEX one_config_genesis ON ns_config (ns) WHERE parent_seq IS NUL
 ## D.4 Snapshots and caches
 
 -
-**Head snapshots.** `heads` is updated in the write transaction, with an in-memory LRU in front of it.
+**Head snapshots are a cache for small documents.** `heads` is updated in the write transaction, with an in-memory LRU in front of it, but only for documents up to a threshold (default 16 KiB). Rewriting a large document on every save costs its whole size in writes each time: a 300 KB document edited a few times a second would write about 1 MB/s for one editor.
 
 -
-**Old revisions.** Serving `/rev/{id}` for old ids folds from genesis. Intermediate snapshots every N revisions are planned for long logs.
+**Intermediate snapshots** go into `snapshots` (D.2) whenever 64 KiB of patch sets or 100 revisions have accumulated since the last one, whichever comes first. A large head, or any old revision, is served by folding from the nearest snapshot at or before it, so a read never folds more than that. Folding from genesis is only for short logs.
 
 -
 **Pruning.** A pruned row keeps `id` and `parent_seq` and sets `patches` to NULL. The horizon's document, and any kept ones, go into a `snapshots (res, seq, doc)` table. `resources.horizon_seq` marks the horizon. A background pruner applies `retention`, writing the archive bundle before it drops anything.
@@ -2246,17 +2279,27 @@ CREATE TABLE snapshots (res bigint NOT NULL REFERENCES resources, seq bigint NOT
 -- grants, ns_log, head_history and ns_config as in D.2, with bytea ids, bigint keys and timestamptz
 ```
 
-- `heads` is the only table updated in place. The lower `fillfactor` keeps those updates on the same page (HOT updates), so they need little vacuuming.
+- `heads` is the only table updated in place, and holds only small documents (D.4). A value over about 2 KB is stored out of line (TOAST) and rewritten whole on every update, so larger documents are served by folding from `snapshots`. The lower `fillfactor` keeps the small updates on the same page (HOT updates), so they need little vacuuming.
 
 - The other tables are insert-only, which autovacuum handles cheaply. Purge and pruning delete from `patch_sets`, `snapshots` and `heads`, and vacuum reclaims the space.
 
-- **Waking live readers.** Each write transaction ends with `NOTIFY ns_changes, '<ns>'`, which Postgres delivers only on commit. Every instance `LISTEN`s on one dedicated connection that bypasses any transaction-pooling layer such as pgbouncer, where `LISTEN` doesn't work (transaction-scoped advisory locks do). It wakes its long-polls (§7.7) and SSE streams, which then read new entries by id. A notification is a hint, never data: after a lost connection, an instance re-reads from each waiter's `since`.
+- **Waking live readers: a tailer, not `NOTIFY`.** Postgres serialises the commit of every transaction that sent a `NOTIFY`, across the whole database, which would undo the parallelism above. Instead each instance runs one **tailer**:
+
+- It reads new `ns_log` rows by sequence every 50–100 ms (`WHERE seq > $last ORDER BY seq`, an index range scan), and wakes the long-polls (§7.7) and SSE streams waiting on those namespaces. They then read their entries by id.
+
+- Sequence numbers are assigned before commit, so they can commit out of order, and a large batch can take a while to commit. So the tailer follows transaction ids, not sequence numbers, as a transactional outbox does: `ns_log` gains `xid xid8 NOT NULL DEFAULT pg_current_xact_id()` (indexed), and each poll reads `WHERE xid >= $from AND xid < pg_snapshot_xmin(pg_current_snapshot()) ORDER BY xid`, then advances `$from` to that `xmin`. Everything below `xmin` has committed or aborted, so no transaction, however long, is skipped. (These functions exist from Postgres 13.)
+
+- A wake-up is a hint, never data: waiters always re-read from their own `since`, so a late wake-up delays and never loses anything.
+
+- Logical decoding can replace polling, at the cost of `wal_level = logical` and a replication slot per instance.
+
+- Transaction-scoped advisory locks work through a transaction-pooling layer such as pgbouncer, so the write path needs no dedicated connections.
 
 - **Per-instance state.** The validator cache and a head cache keyed by head id are safe on every instance, since what they cache is immutable. Rate buckets (§6.6) are per instance and approximate, each instance enforcing its share of the limits, unless a shared counter is available, e.g. in Redis.
 
 - **Replicas.** The CDN is the read tier, so replicas matter little. Serve head pointers from the primary, or from a replica that has replayed at least the revision a client presents (`X-Namespace-Revision`, §7.2). Immutable reads may use any replica. One that doesn't have the id yet asks the primary instead of answering `404`, because a cached `404` would hide a revision that exists.
 
-- **Throughput.** Each commit waits for a WAL flush, which bounds one namespace to a few thousand writes a second; group commit and batches (§7.5) raise that, and separate namespaces scale with the database.
+- **Throughput: one flush per write, per namespace.** A namespace's lock is held until commit, so each write's WAL flush happens inside it. At 0.5–2 ms per flush, that is about 500–2,000 single writes a second per namespace. The bound comes from the chain itself, since each entry names the one before it; releasing the lock earlier would only turn the waiting into `UNIQUE (ns, prev_seq)` retries. Group commit combines flushes of different namespaces, so the database as a whole scales further. Past the bound, use batches (§7.5), which put many entries under one flush. Don't turn off `synchronous_commit`: an acknowledged write could then vanish in a crash.
 
 - **Sizing (estimate, not measured).** Expect roughly 450–500 B per revision against D.5's 334 B: Postgres adds a 23-byte header plus alignment to every row, and only compresses values over about 2 KB, so small patch sets stay uncompressed. Port `bench/storage.ts` before relying on this.
 
@@ -2937,13 +2980,15 @@ Each document is exported in one of two modes:
 
 - **Then the target, as a merge from upstream.** The first time, the target fast-forwards and so shares the upstream ids. Later, the base is the upstream revision recorded in the previous import batch's `source.ids`, and the upstream revisions after it are replayed onto the target's head. They conflict where they overlap the target's own changes (the array rule of §F.3). A deletion conflicts if the target changed the document.
 
-- **Pinned references in snapshot documents** that point at other snapshot documents are rewritten to the matching upstream revision path, `/r/{ns}-upstream/{name}/rev/{id}`, which always exists and is exactly the imported snapshot. Pinned strings that aren't declared can't be found, so the dry run lists them.
+- **Pinned references in snapshot documents** that point at other snapshot documents are rewritten to the matching upstream revision path, `/r/{ns}-upstream/{name}/rev/{id}`, keeping any `#{id}` fragment (§6.5). That path always exists and is exactly the imported snapshot. Pinned strings that aren't declared can't be found, so the dry run lists them.
 
 - **Dry run, then resolve conflicts,** as in §F.3: skip the document, take the bundle's version, or replay.
 
 - **Submit batches in dependency order.**
 
-- **Order.** Dependencies go first: schemas, upstream namespaces, then the documents that reference them. Namespaces whose pinned references form a cycle go together as far as each batch allows. Batches are split to fit §6.6.
+- **Order.** Dependencies go first: schemas, upstream namespaces, then the documents that reference them. Namespaces whose pinned references form a cycle go together as far as each batch allows.
+
+- **Size.** Batches are split to fit §6.6, which makes the import non-atomic. A backfill can accept that, and its tool paces the batches at a fraction of the namespace rate so other writers aren't held up. An import that must land at once, such as a release, runs as one batch under an allowance (§6.6), typically as a merge from a branch it was first imported into (§F.3).
 
 - **Rewriting waits for its targets.** A document's references are rewritten only after the batches of its dependencies have committed, using the ids they returned.
 
@@ -3102,3 +3147,13 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Fixes:** `successor` needs the same base namespace, not the same `at`; pruning keeps grant references and creation times, and `keep` is limited per resource in total; at E3, path and document rules make resource writes fail; pruning is the one write without a precondition; log-range `410` is defined; invariants 3 and 5 reworded.
 
 - **v0.19:** live reads by long-poll with cursors (§7.7). Deterministic time-interval cursors make every waiting URL new each interval, with no jitter so waiters stay collapsed, the page size is fixed by the deployment, waits end at interval boundaries, and `200` and `204` answers are briefly cacheable, so the CDN collapses many followers of one log into one origin request. Addendum D gains D.8, a Postgres layout with a lock per namespace, content stored apart from the skeleton, and `LISTEN`/`NOTIFY` to wake live readers.
+
+- **v0.20:** feedback from mapping a signage product onto the spec.
+
+- **Allowances** (§6.6): an administrator can give a named principal its own rate and batch limits, so a large import or release lands as one atomic batch without holding up other writers. Paced splitting is for backfills only (§G.4.4).
+
+- **`x-ref`** gains `key`, for references to one entry inside a document, resolved by id (§6.5). References are found by a static walk of document and schema together, so no validator needs annotation output.
+
+- **Catalog:** a create flow: place the new item, then get a create grant fixed to its name, usable for the genesis only (§B.11.4).
+
+- **Addendum D:** head snapshots only for small documents, with intermediate snapshots bounding every fold (D.4). In D.8, a tailer replaces `NOTIFY`, which serialises commits across the database, and the throughput bound is stated honestly as one flush per write per namespace.
