@@ -97,8 +97,19 @@ func TestSchemas(t *testing.T) {
 	e.create("docs", "cup", map[string]any{"$schema": ref2, "score": "2-2"})
 	r = e.write("PATCH", "docs", "cup2", "", addRoot(map[string]any{"$schema": ref2, "score": "1234567"}))
 	expectCode(t, r, 422, "invalid")
-	// A revision path with a fragment is not one of the accepted $ref forms.
+	// v0.21: a revision path may carry a JSON Pointer fragment into it.
+	defs := e.create("schemas", "defs", map[string]any{"$schema": dialect,
+		"$defs": map[string]any{"short": map[string]any{"type": "string", "maxLength": 3.0}}})
+	s3 := e.create("schemas", "match3", map[string]any{"$schema": dialect, "type": "object",
+		"properties": map[string]any{"code": map[string]any{"$ref": "/r/schemas/defs/rev/" + defs + "#/$defs/short"}}})
+	ref3 := "/r/schemas/match3/rev/" + s3
+	e.create("docs", "coded", map[string]any{"$schema": ref3, "code": "abc"})
+	expectCode(t, e.write("PATCH", "docs", "coded2", "", addRoot(map[string]any{"$schema": ref3, "code": "abcd"})), 422, "invalid")
+	// A fragment that points at nothing makes the schema invalid; an anchor
+	// on another revision isn't an accepted form.
 	r = e.write("PATCH", "schemas", "frag", "", addRoot(map[string]any{"$schema": dialect, "$ref": baseRef + "#/x"}))
+	expectCode(t, r, 422, "invalid")
+	r = e.write("PATCH", "schemas", "anchor", "", addRoot(map[string]any{"$schema": dialect, "$ref": baseRef + "#name"}))
 	expectCode(t, r, 422, "schema_ref")
 	// A $ref to an unknown revision makes the schema unusable.
 	r = e.write("PATCH", "schemas", "dangling", "", addRoot(map[string]any{"$schema": dialect, "$ref": "/r/schemas/base/rev/" + unknownID}))
