@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -71,7 +71,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
   patchlog keygen
@@ -79,7 +79,7 @@ func usage() {
   patchlog grant narrow -grant TOKEN -block JSON [-seal]
   patchlog grant seal -grant TOKEN      (grants are Biscuit v3 tokens)
   patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false] [-purge-url URL]... [-edge-secret FILE]
-  patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing] [-purge-url URL]... [-edge-secret FILE]
+  patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing] [-purge-url URL]... [-edge-secret FILE]
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
@@ -97,7 +97,8 @@ func serve(args []string) {
 	origin := fs.String("origin", "http://localhost:8080", "canonical origin (§G.1)")
 	dev := fs.Bool("dev", false, "disable authentication (development only); X-Author names the author")
 	pg := fs.Bool("playground", true, "serve the web playground at /playground/")
-	treeURL := fs.String("tree-url", "", "tree service (Addendum B) the playground reads through a read-only proxy at "+server.TreeProxyPrefix+", e.g. http://tree:8082")
+	var treeURLs multi
+	fs.Var(&treeURLs, "tree-url", "tree service (Addendum B) the playground reads through a read-only proxy at "+server.TreeProxyPrefix+", e.g. http://tree:8082; CATALOG=URL maps one catalog to its own (repeatable)")
 	maxItems := fs.Int("max-items-per-batch", 0, "deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it (§6.6)")
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
 	var opKeys multi
@@ -177,11 +178,11 @@ func serve(args []string) {
 		log.Fatal("-master-key-create needs -master-key")
 	}
 	var treeProxy http.Handler
-	if *treeURL != "" {
+	if len(treeURLs) > 0 {
 		if !*pg {
 			log.Fatal("-tree-url needs the playground (it proxies under " + server.TreeProxyPrefix + ")")
 		}
-		if treeProxy, err = server.NewTreeProxy(*treeURL); err != nil {
+		if treeProxy, err = server.NewTreeProxy(treeURLs...); err != nil {
 			log.Fatal(err)
 		}
 	}
@@ -202,7 +203,7 @@ func serve(args []string) {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
 	}
 	if treeProxy != nil {
-		log.Printf("tree proxy: %s%s -> %s (GET/HEAD only)", localURL(*addr), server.TreeProxyPrefix, *treeURL)
+		log.Printf("tree proxy: %s%s -> %s (GET/HEAD only)", localURL(*addr), server.TreeProxyPrefix, treeURLs.String())
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

@@ -220,13 +220,15 @@
     <div class="card wide">
       <header><h2>Catalog</h2><span class="muted small">Addendum B &middot; folders and placements in a catalog namespace</span></header>
       <div class="row">
-        <label for="catNs">Catalog namespace</label>
+        <label for="catPick">Catalog</label>
+        <select id="catPick" class="mono" title="namespaces with a catalog config (§B.6): the tree service's catalogs, the proxy's mappings, and namespaces you have used"><option value="">&mdash;</option></select>
+        <label for="catNs">namespace</label>
         <input id="catNs" class="mono" list="catNsList" placeholder="cat" autocomplete="off" spellcheck="false">
         <datalist id="catNsList"></datalist>
         <button id="catLoad" class="primary">Load</button>
         <button id="catRefresh" class="tiny">Refresh</button>
       </div>
-      <div id="catStatus" class="muted">Load a catalog namespace (the demo stack seeds <code>cat</code>).</div>
+      <div id="catStatus" class="muted">Load a catalog namespace (the demo stack seeds <code>cat</code>, a tree, and <code>topics</code>, a DAG).</div>
     </div>
 
     <div class="card wide">

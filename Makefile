@@ -25,7 +25,7 @@ dev: ## run the core server natively in dev mode on :8080 (dev.db; dev.key enabl
 
 up: ## build and start the whole stack (core, seed, index, tree, janitor, cdn)
 	docker compose up --build -d
-	@echo "through the CDN: core http://localhost:8080  playground http://localhost:8080/playground/  index http://localhost:8081  tree http://localhost:8082 (and /playground/tree/)"
+	@echo "through the CDN: core http://localhost:8080  playground http://localhost:8080/playground/  index http://localhost:8081  tree http://localhost:8082 (/cat/roots, /topics/roots; and /playground/tree/)"
 	@echo "origins, bypassing it: core http://localhost:9080  index http://localhost:9081  tree http://localhost:9082"
 
 down: ## stop the stack (data is kept; `docker compose down -v` wipes it)

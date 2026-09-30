@@ -71,13 +71,28 @@ search index, the tree service and the branch janitor, all behind a local CDN (V
 | http://localhost:8080 | core API |
 | http://localhost:8080/playground/ | web playground |
 | http://localhost:8081/demo?q=derby | search index (Addendum A) |
-| http://localhost:8082/cat/roots | tree service (Addendum B) |
+| http://localhost:8082/cat/roots | tree service (Addendum B): the catalog `cat`, a tree |
+| http://localhost:8082/topics/roots | the same service: the catalog `topics`, a DAG |
 | http://localhost:8080/playground/tree/cat/roots | the same, through the core's read-only proxy (`-tree-url`) |
 | http://localhost:9080, :9081, :9082 | the core, search and tree origins directly, bypassing the CDN |
 
-The seed creates `schemas`, `demo` (a few matches, with catalog roles), `cat` (a catalog of
-`demo`: folders, placements, `$access`, one dangling placement), `private` (sealed, E2) and
-`vault` (end-to-end, E3: create its keyring from the playground's Keys tab).
+The seed creates `schemas`, `demo` (a few matches, with catalog roles), two catalogs of `demo`,
+`private` (sealed, E2) and `vault` (end-to-end, E3: create its keyring from the playground's Keys
+tab). The catalogs:
+
+- `cat`, `mode: tree` (one parent per node, §B.6): folders, placements, `$access`, an embargoed
+  folder with `inherit: false`, and one dangling placement.
+- `topics`, `mode: dag` (the §B.6 rules without `maxItems: 1`): a `derbies` folder under both
+  `stockholm` and `rivalries` (a diamond from the root), another diamond `competitions` →
+  `league` | `cup` → `big-games`, items placed under several folders, ordering keys, and
+  `$access` that differs by path, so an item's effective roles are the union over its paths
+  (§B.11.2). `/r/demo/derby` is under `derbies` and the embargoed `editorial` (`inherit: false`):
+  `group:catalog-admins`' desk on the root reaches it only around `editorial`. `loop-a` and
+  `loop-b` are each other's parents: the tree service flags that cycle under
+  `/topics/problems` and lists neither. [deploy/seed.sh](deploy/seed.sh) draws the whole DAG.
+
+One tree service serves both (`-catalog=cat -catalog=topics`), each at `/{catalog}/…` with its own
+database.
 
 - `make logs` follows the logs.
 - `make seed` re-runs the seed, which is safe to repeat.
@@ -233,7 +248,12 @@ It is plain HTML/JS embedded in the binary and talks to the same-origin API. It 
 - a **Catalog** tab (Addendum B): the folder tree of a catalog namespace with its placed items
   (linked to the Resource tab), effective roles per subject derived in the browser from `$access`
   (§B.11.2, `inherit: false`, tree powers, `includes` from the content namespace), the listing's
-  checkpoint (`at`) and problems (dangling items, orphans, cycles). It creates folders and places,
+  checkpoint (`at`) and problems (dangling items, orphans, cycles). A picker lists the namespaces
+  with a `catalog` config it finds (the tree service's catalogs, the proxy's mappings, namespaces
+  used before). In a DAG, a node is listed under each parent, marked shared with the others named
+  (a shared folder's children are expanded once and folded elsewhere), a selected node shows every
+  path to a root with the roles that path collects (and where `inherit: false` stops it), and
+  folders on a cycle are reported, not traversed. It creates folders and places,
   moves, reorders and removes nodes as ordinary writes to the catalog namespace (`If-None-Match`,
   `If-Match`, fresh `$nonce` on placements), then re-reads the tree with `?min=` (read-your-writes);
 - a **Keys** tab (Addendum E): an X25519 identity kept in localStorage (its public JWK goes in a
@@ -254,7 +274,10 @@ sets `pad`). All of it is WebCrypto only: HPKE (RFC 9180) is built on X25519, HK
 The tree service is another origin, and the playground's CSP allows `connect-src 'self'` only, so
 `serve -tree-url http://tree:8082` mounts a read-only reverse proxy at `/playground/tree/`: `GET`
 and `HEAD` only (other methods are `405`), `Authorization` forwarded, the service's redirects
-rewritten under the prefix, `502` while it is unreachable. compose passes it. Without it, the
+rewritten under the prefix, `502` while it is unreachable. compose passes it. `-tree-url` is
+repeatable: `CATALOG=URL` sends `/playground/tree/{CATALOG}/…` (and `_status?catalog=CATALOG`) to
+a tree service of its own, e.g. a catalog service (`-access`, one catalog each), and a plain URL
+takes every other catalog. Without it, the
 Catalog tab reads the catalog's documents straight from the core API and says that computed
 listings need the tree service. Sealed listings (§E.2.6), whole or per entry, are decrypted when
 keys are at hand and shown by name otherwise.
@@ -609,7 +632,9 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
 `patchlog tree -catalog cat` follows a catalog namespace and the content namespaces it trusts, and
 serves folder listings (`children`, `ancestors`, `subtree`, `roots`, `orphans`, `problems`,
 `where`, `manifest`) at URLs pinned to the catalog's `ns_id`. Cycles and depth over 64 show up
-under `problems`.
+under `problems`. `-catalog` is repeatable (or comma-separated): each catalog gets its own
+service and database (`-db` with `{catalog}` replaced, or `-{catalog}` added before the
+extension) behind one origin, and `/_status` covers them all (`?catalog=` for one).
 
 With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 - `POST /grants` for content verbs, `create` (genesis only; `409` for a taken name), `place`,

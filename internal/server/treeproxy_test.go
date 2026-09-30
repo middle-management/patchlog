@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -137,9 +138,85 @@ func TestTreeProxyUnreachable(t *testing.T) {
 }
 
 func TestTreeProxyBadURL(t *testing.T) {
-	for _, u := range []string{"", "tree:8082", "ftp://tree", "http://", "http://tree?x=1"} {
+	for _, u := range []string{"", "tree:8082", "ftp://tree", "http://", "http://tree?x=1", "cat=ftp://tree", "cat=", "Cat=http://tree"} {
 		if _, err := NewTreeProxy(u); err == nil {
 			t.Errorf("%q accepted", u)
 		}
+	}
+	for _, us := range [][]string{nil, {"http://a", "http://b"}, {"cat=http://a", "cat=http://b"}} {
+		if _, err := NewTreeProxy(us...); err == nil {
+			t.Errorf("%q accepted", us)
+		}
+	}
+}
+
+// Several tree services: catalogs mapped with CATALOG=URL go to their own,
+// everything else to the plain URL.
+func TestTreeProxyMapping(t *testing.T) {
+	echo := func(name string) *httptest.Server {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/"+name+"/roots") {
+				w.Header().Set("Location", strings.TrimSuffix(r.URL.Path, "roots")+"at/1ccc/roots")
+				w.WriteHeader(http.StatusFound)
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]any{"server": name, "path": r.URL.Path, "query": r.URL.RawQuery})
+		}))
+		t.Cleanup(srv.Close)
+		return srv
+	}
+	def, topics := echo("cat"), echo("topics")
+	h, err := NewTreeProxy(def.URL, "topics="+topics.URL+"/base/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := httptest.NewServer(h)
+	defer front.Close()
+	get := func(path string) (int, map[string]any, string) {
+		res, err := http.Get(front.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		var m map[string]any
+		json.NewDecoder(res.Body).Decode(&m)
+		return res.StatusCode, m, res.Request.URL.Path
+	}
+	for path, want := range map[string]string{
+		"/playground/tree/cat/roots":               "cat /cat/at/1ccc/roots",
+		"/playground/tree/topics/roots":            "topics /base/topics/at/1ccc/roots",
+		"/playground/tree/other/at/1x/roots":       "cat /other/at/1x/roots",
+		"/playground/tree/_status":                 "cat /_status",
+		"/playground/tree/_status?catalog=topics":  "topics /base/_status",
+		"/playground/tree/_status?catalog=unknown": "cat /_status",
+	} {
+		st, m, _ := get(path)
+		if got := fmt.Sprint(m["server"], " ", m["path"]); st != 200 || got != want {
+			t.Errorf("%s: %d %s, want %s", path, st, got, want)
+		}
+	}
+	// The redirect of a mapped catalog comes back under the prefix.
+	if _, _, final := get("/playground/tree/topics/roots"); final != "/playground/tree/topics/at/1ccc/roots" {
+		t.Errorf("mapped redirect: %s", final)
+	}
+	st, m, _ := get("/playground/tree/")
+	if st != 200 || fmt.Sprint(m["catalogs"]) != "[topics]" || m["default"] != true {
+		t.Errorf("probe: %d %v", st, m)
+	}
+
+	// Without a default, unmapped catalogs are 404 and reach nothing.
+	h, err = NewTreeProxy("topics=" + topics.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/playground/tree/cat/roots", nil))
+	if rec.Code != http.StatusNotFound || !strings.Contains(rec.Body.String(), "not_found") {
+		t.Fatalf("unmapped: %d %s", rec.Code, rec.Body)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("GET", "/playground/tree/", nil))
+	if !strings.Contains(rec.Body.String(), `"default":false`) {
+		t.Fatalf("probe without default: %s", rec.Body)
 	}
 }
