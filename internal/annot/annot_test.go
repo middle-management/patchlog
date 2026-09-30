@@ -294,3 +294,77 @@ func TestErrors(t *testing.T) {
 		t.Errorf("walk guard: %v %d", err, len(c.out))
 	}
 }
+
+var (
+	pathFragUser = "/r/s/fraguser/rev/" + rev('f')
+	pathFragLib  = "/r/s/fraglib/rev/" + rev('h')
+)
+
+func init() {
+	store[pathFragLib] = `{` + d2020 + `,
+		"$defs": {
+			"tag":  {"type": "string", "x-index": "facet"},
+			"a b":  {"type": "string", "x-index": "sort"},
+			"link": {"type": "string", "x-ref": {"pinned": true}}
+		}
+	}`
+	store[pathFragUser] = `{` + d2020 + `,
+		"type": "object",
+		"properties": {
+			"$schema": {"type": "string"},
+			"tag":  {"$ref": "` + pathFragLib + `#/$defs/tag"},
+			"sp":   {"$ref": "` + pathFragLib + `#/$defs/a%20b"},
+			"link": {"$ref": "` + pathFragLib + `#/$defs/link"}
+		}
+	}`
+}
+
+func TestCollectThroughRevisionFragment(t *testing.T) {
+	doc := j(`{"$schema":"` + pathFragUser + `","tag":"t","sp":"s","link":"/r/m/x/rev/` + rev('q') + `"}`)
+	got, err := Collect(doc, loader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g := strings.Join(short(got), "\n")
+	for _, w := range []string{`x-index /tag="facet"`, `x-index /sp="sort"`, `x-ref /link=`} {
+		if !strings.Contains(g, w) {
+			t.Errorf("missing %q in\n%s", w, g)
+		}
+	}
+	refs, err := FindRefs(doc, loader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(refs) != 1 || refs[0].Pointer != "/link" || !refs[0].Pinned || refs[0].Rev != rev('q') {
+		t.Errorf("FindRefs = %+v", refs)
+	}
+}
+
+func TestResolveRefFragmentErrors(t *testing.T) {
+	c := newCollector(loader, nil)
+	base := syntheticBase + pathFragUser
+	for _, ref := range []string{
+		pathFragLib + "#tag", pathFragLib + "#$defs/tag", pathFragLib + "#/$defs/%zz",
+		pathFragLib + "#/$defs/x~2", pathFragLib + "#/a b", "/r/s/x/../y/rev/" + rev('a') + "#/x",
+	} {
+		_, err := c.resolveRef(base, ref)
+		var re *schema.RefError
+		if !errors.As(err, &re) {
+			t.Errorf("%q: got %v, want RefError", ref, err)
+		}
+	}
+	l, err := c.resolveRef(base, pathFragLib+"#/$defs/a%20b")
+	if err != nil || l.base != syntheticBase+pathFragLib || l.ptr.String() != "/$defs/a b" {
+		t.Errorf("resolveRef = %+v, %v", l, err)
+	}
+	l, err = c.resolveRef(base, pathFragLib)
+	if err != nil || len(l.ptr) != 0 {
+		t.Errorf("bare = %+v, %v", l, err)
+	}
+	// Missing target surfaces as a schema error when walked.
+	doc := `{"$ref":"` + pathFragLib + `#/$defs/nope"}`
+	_, err = CollectWith(j(doc), "", j(`1`), loader)
+	if err == nil {
+		t.Error("missing fragment target accepted")
+	}
+}

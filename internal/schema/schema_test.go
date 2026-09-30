@@ -390,3 +390,126 @@ func TestCheckSchemaDocumentRegexp(t *testing.T) {
 		}
 	}
 }
+
+var pathFrag = "/r/schemas/frag/rev/" + rev('e')
+
+func fragStore() *store {
+	s := newStore()
+	s.docs[pathAddress].(map[string]any)["$defs"].(map[string]any)["a b"] = j(`{"type":"integer"}`)
+	s.docs[pathAddress].(map[string]any)["$defs"].(map[string]any)["x/y~z"] = j(`{"type":"boolean"}`)
+	s.docs[pathFrag] = j(`{"$schema":"https://json-schema.org/draft/2020-12/schema",
+		"type":"object","properties":{
+			"home":{"$ref":"` + pathAddress + `#/$defs/zip"},
+			"root":{"$ref":"` + pathAddress + `#"},
+			"sp":{"$ref":"` + pathAddress + `#/$defs/a%20b"},
+			"esc":{"$ref":"` + pathAddress + `#/$defs/x~1y~0z"},
+			"esc2":{"$ref":"` + pathAddress + `#/$defs/x%7E1y%7E0z"}
+		}}`)
+	return s
+}
+
+func TestRefThroughFragment(t *testing.T) {
+	v := NewValidator()
+	s := fragStore()
+	ok := j(`{"$schema":"` + pathFrag + `","home":"12345","root":{"city":"x"},"sp":3,"esc":true,"esc2":false}`)
+	if err := v.Validate(ok, s.load); err != nil {
+		t.Fatalf("valid: %v", err)
+	}
+	if s.calls[pathAddress] != 1 {
+		t.Errorf("address loaded %d times", s.calls[pathAddress])
+	}
+	bad := j(`{"$schema":"` + pathFrag + `","home":"abc","root":{},"sp":"s","esc":1}`)
+	err := v.Validate(bad, s.load)
+	var ve *ValidationError
+	if !errors.As(err, &ve) {
+		t.Fatalf("got %v, want ValidationError", err)
+	}
+	got := map[string]bool{}
+	for _, d := range ve.Errors {
+		got[d.Pointer] = true
+	}
+	for _, p := range []string{"/home", "/root", "/sp", "/esc"} {
+		if !got[p] {
+			t.Errorf("missing error at %q: %+v", p, ve.Errors)
+		}
+	}
+	if len(got) != 4 {
+		t.Errorf("extra errors: %+v", ve.Errors)
+	}
+}
+
+func TestRefsDropFragment(t *testing.T) {
+	doc := j(`{"$schema":"https://json-schema.org/draft/2020-12/schema",
+		"properties":{"a":{"$ref":"` + pathAddress + `#/$defs/zip"},"b":{"$ref":"` + pathAddress + `"},
+		"c":{"$ref":"` + pathPerson + `#"},"d":{"$ref":"` + pathMissing + `#nope"},"e":{"$ref":"#/$defs/x"}}}`)
+	got := Refs(doc)
+	if len(got) != 2 || got[0].Path() != pathAddress || got[1].Path() != pathPerson {
+		t.Fatalf("Refs = %+v", got)
+	}
+}
+
+func TestBadRefFragments(t *testing.T) {
+	v := NewValidator()
+	s := fragStore()
+	for _, frag := range []string{
+		"#foo",              // anchor on a foreign revision
+		"#$defs/zip",        // not a pointer
+		"#/$defs/zip#x",     // second '#'
+		"#/$defs/%zz",       // bad percent-encoding
+		"#/$defs/%",         // truncated percent-encoding
+		"#/$defs/%ff",       // invalid UTF-8
+		"#/$defs/a b",       // unencoded space
+		"#/$defs/x~2",       // bad pointer escape
+		"#/$defs/x~",        // dangling tilde
+		"#/$defs/\"q\"",     // unencoded quote
+		"#/$defs/é",         // unencoded non-ASCII
+		"?q=1#/$defs/zip",   // query
+		"/extra#/$defs/zip", // path suffix
+	} {
+		ref := pathAddress + frag
+		ref = strings.ReplaceAll(ref, `"`, `\"`)
+		err := CheckSchemaDocument(j(`{"$ref":"`+ref+`"}`), "")
+		var re *RefError
+		if !errors.As(err, &re) {
+			t.Errorf("check %q: got %v, want RefError", ref, err)
+		}
+		doc := j(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"` + ref + `"}`)
+		// Malformed percent-encodings are not valid uri-references, which the
+		// dialect meta-schema reports first (422 invalid).
+		var ve *ValidationError
+		if err := v.Validate(doc, s.load); !errors.As(err, &re) && !(strings.Contains(frag, "%") && errors.As(err, &ve)) {
+			t.Errorf("validate %q: got %v, want RefError", ref, err)
+		}
+	}
+	// Missing target: rejected at compile time as an invalid schema.
+	for _, ref := range []string{pathAddress + "#/nope", pathAddress + "#/$defs/zip/nope/deeper", pathAddress + "#/$defs/a%2520b"} {
+		doc := j(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"` + ref + `"}`)
+		err := v.Validate(doc, s.load)
+		var se *SchemaError
+		if !errors.As(err, &se) {
+			t.Errorf("%q: got %v, want SchemaError", ref, err)
+		}
+	}
+	// A stored schema with a missing target fails when a document uses it.
+	s.docs[pathFrag] = j(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"` + pathAddress + `#/nope"}`)
+	err := v.Validate(j(`{"$schema":"`+pathFrag+`"}`), s.load)
+	var se *SchemaError
+	if !errors.As(err, &se) {
+		t.Errorf("stored missing target: got %v", err)
+	}
+	// Unavailable revision behind a fragment.
+	doc := j(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$ref":"` + pathMissing + `#/$defs/x"}`)
+	var ue *UnavailableError
+	if err := v.Validate(doc, s.load); !errors.As(err, &ue) {
+		t.Errorf("unavailable: got %v", err)
+	}
+	// $schema itself stays strict.
+	err = v.Validate(map[string]any{"$schema": pathAddress + "#/$defs/zip"}, s.load)
+	var re *RefError
+	if !errors.As(err, &re) {
+		t.Errorf("$schema with fragment: got %v", err)
+	}
+	if _, ok := ParseRef(pathAddress + "#"); ok {
+		t.Error("ParseRef accepted a fragment")
+	}
+}

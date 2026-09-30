@@ -343,17 +343,19 @@ func (c *collector) lookup(l loc) (any, error) {
 	return v, nil
 }
 
-// resolveRef resolves a $ref / $dynamicRef value relative to base.
+// resolveRef resolves a $ref / $dynamicRef value relative to base. A $ref to
+// another revision is a revision path optionally followed by a JSON Pointer
+// fragment (§6.1); anchors are resolved only within the same document.
 func (c *collector) resolveRef(base, ref string) (loc, error) {
-	docPart, frag, _ := strings.Cut(ref, "#")
-	target := base
-	if docPart != "" {
-		if _, ok := schema.ParseRef(docPart); !ok {
-			return loc{}, &schema.RefError{Msg: fmt.Sprintf("$ref %q is not a fragment or schema revision path", ref)}
+	if !strings.HasPrefix(ref, "#") {
+		r, p, err := schema.SplitRef(ref)
+		if err != nil {
+			return loc{}, err
 		}
-		target = syntheticBase + docPart
+		return loc{syntheticBase + r.Path(), p}, nil
 	}
-	frag, err := url.PathUnescape(frag)
+	target := base
+	frag, err := url.PathUnescape(ref[1:])
 	if err != nil {
 		return loc{}, &schema.RefError{Msg: fmt.Sprintf("$ref %q: %v", ref, err)}
 	}

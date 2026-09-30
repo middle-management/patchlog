@@ -10,10 +10,12 @@ package schema
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pointer"
@@ -52,6 +54,60 @@ func ParseRef(s string) (Ref, bool) {
 
 // Path returns the revision path of r.
 func (r Ref) Path() string { return "/r/" + r.NS + "/" + r.Name + "/rev/" + r.Rev }
+
+// SplitRef parses a foreign $ref value: a schema revision path optionally
+// followed by "#" and a fragment (§6.1). The fragment must be empty or a JSON
+// Pointer (RFC 6901, so it starts with "/"), written as an RFC 3986 URI
+// fragment: only fragment characters, well-formed percent-encodings that decode
+// to valid UTF-8, and "~" only as "~0" or "~1". Anchors ("#foo") are not
+// resolved across revisions and are rejected. The returned Ref is the bare
+// revision; frag is the decoded pointer ("" for the whole revision).
+func SplitRef(s string) (ref Ref, frag pointer.Pointer, err error) {
+	docPart, rawFrag, _ := strings.Cut(s, "#")
+	ref, ok := ParseRef(docPart)
+	if !ok {
+		return Ref{}, nil, &RefError{Msg: fmt.Sprintf("$ref %q is neither a same-document fragment nor a schema revision path", s)}
+	}
+	if !strings.Contains(s, "#") {
+		return ref, nil, nil
+	}
+	if !validURIFragment(rawFrag) {
+		return Ref{}, nil, &RefError{Msg: fmt.Sprintf("$ref %q: fragment is not a valid URI fragment", s)}
+	}
+	dec, uerr := url.PathUnescape(rawFrag)
+	if uerr != nil || !utf8.ValidString(dec) {
+		return Ref{}, nil, &RefError{Msg: fmt.Sprintf("$ref %q: fragment is not valid percent-encoded UTF-8", s)}
+	}
+	frag, perr := pointer.Parse(dec)
+	if perr != nil {
+		return Ref{}, nil, &RefError{Msg: fmt.Sprintf("$ref %q: fragment of a schema revision must be a JSON Pointer", s)}
+	}
+	return ref, frag, nil
+}
+
+// validURIFragment reports whether s uses only RFC 3986 fragment characters
+// (pchar / "/" / "?") with well-formed percent-encodings.
+func validURIFragment(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("-._~!$&'()*+,;=:@/?", c) >= 0:
+		case c == '%':
+			if i+2 >= len(s) || !isHex(s[i+1]) || !isHex(s[i+2]) {
+				return false
+			}
+			i += 2
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
 
 // IsDialect reports whether s is an accepted dialect URL: a $schema value that
 // marks the document itself as a schema.

@@ -149,8 +149,10 @@ func checkCore(obj map[string]any, at pointer.Pointer, selfPath string) error {
 		if !ok {
 			return &RefError{Msg: fmt.Sprintf("$ref at %s must be a string", loc(at))}
 		}
-		if !strings.HasPrefix(s, "#") && !refRE.MatchString(s) {
-			return &RefError{Msg: fmt.Sprintf("$ref %q at %s must be a fragment or a schema revision path", s, loc(at))}
+		if !strings.HasPrefix(s, "#") {
+			if _, _, err := SplitRef(s); err != nil {
+				return &RefError{Msg: fmt.Sprintf("at %s: %s", loc(at), strings.TrimPrefix(err.Error(), "schema_ref: "))}
+			}
 		}
 	}
 	if v, ok := obj["$dynamicRef"]; ok {
@@ -182,7 +184,7 @@ func loc(p pointer.Pointer) string {
 }
 
 // Refs returns the revision paths directly referenced by a schema document via
-// $ref, deduplicated and sorted, for the referenced-schema index (§6.1).
+// $ref (fragments dropped), deduplicated and sorted, for the referenced-schema index (§6.1).
 func Refs(schemaDoc any) []Ref {
 	seen := map[string]bool{}
 	var out []Ref
@@ -193,8 +195,8 @@ func Refs(schemaDoc any) []Ref {
 			return
 		}
 		if r, ok := obj["$ref"].(string); ok {
-			if ref, ok := ParseRef(r); ok && !seen[r] {
-				seen[r] = true
+			if ref, _, err := SplitRef(r); err == nil && !seen[ref.Path()] {
+				seen[ref.Path()] = true
 				out = append(out, ref)
 			}
 		}
