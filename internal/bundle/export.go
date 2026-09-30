@@ -104,7 +104,7 @@ type ExportPlan struct {
 	heads   map[string]map[string]client.HeadItem
 	ext     map[string]bool
 	queue   []string
-	schemas map[string]any // schema revision path → document
+	schemas map[string]any                        // schema revision path → document
 	bases   map[string]map[string]client.HeadItem // branch ns → its base's heads as of at (nil: not a branch)
 }
 
