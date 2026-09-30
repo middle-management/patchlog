@@ -139,6 +139,7 @@ type Engine struct {
 	ekeys     epochKeyCache
 	cfgMu     sync.Mutex
 	cfgCache  map[int64]*Config
+	stmts     stmtCache
 	stop      chan struct{}
 	bg        sync.WaitGroup
 	closeOnce sync.Once
@@ -226,6 +227,7 @@ func Open(opt Options) (*Engine, error) {
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() { close(e.stop) })
 	e.bg.Wait()
+	e.stmts.close()
 	return e.db.Close()
 }
 
@@ -316,6 +318,7 @@ type docPut struct {
 
 // read runs f in a read transaction.
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
+	e.stmts.prepare(e.db)
 	sqlTx, err := e.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
 		return err
@@ -361,6 +364,7 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) error {
 }
 
 func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []string, err error) {
+	e.stmts.prepare(e.db)
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	sqlTx, err := e.db.BeginTx(ctx, nil)

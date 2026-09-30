@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"runtime"
 
 	_ "modernc.org/sqlite"
 )
@@ -230,6 +231,14 @@ func openDB(path string) (*sql.DB, error) {
 	if path == ":memory:" {
 		// One connection keeps the in-memory database alive and shared.
 		db.SetMaxOpenConns(1)
+	} else {
+		// Keep connections open: a new SQLite connection parses the whole
+		// schema and loses its prepared statements, and database/sql keeps
+		// only two idle ones by default, so under concurrent reads most of
+		// the time went to reopening connections.
+		n := 4 * runtime.GOMAXPROCS(0)
+		db.SetMaxOpenConns(n)
+		db.SetMaxIdleConns(n)
 	}
 	if _, err := db.ExecContext(context.Background(), schemaSQL); err != nil {
 		db.Close()
