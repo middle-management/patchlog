@@ -88,19 +88,19 @@ var rateFields = map[string]func(*Limits) *Rate{
 
 // Config is a parsed namespace document (§2, §7.4).
 type Config struct {
-	Doc       map[string]any
-	Read      string // "public" or "grant"
-	Rules     []*rules.Rule
-	Keys      []grant.Key
-	Roles     grant.Roles
-	Revoked   map[string]bool
-	Limits    Limits
-	Retention []any
-	MaxLag    *time.Duration // §C.4: how old a grant's `at` in this namespace may be
+	Doc        map[string]any
+	Read       string // "public" or "grant"
+	Rules      []*rules.Rule
+	Keys       []grant.Key
+	Roles      grant.Roles
+	Revoked    map[string]bool
+	Limits     Limits
+	Retention  []any
+	MaxLag     *time.Duration // §C.4: how old a grant's `at` in this namespace may be
 	Allowances []Allowance
-	Frozen    bool
-	Successor string
-	Base      *BaseRef
+	Frozen     bool
+	Successor  string
+	Base       *BaseRef
 }
 
 // Allowance gives a named principal its own rate and batch limits (§6.6).
