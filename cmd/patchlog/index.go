@@ -26,12 +26,13 @@ import (
 //
 //	patchlog index [-api http://localhost:8080] [-db index.db] [-addr :8081] -ns matches,docs
 //	               [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
-//	               [-enc-key B64URL | -enc-key-file PATH]
+//	               [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]...
 //
 // Results at /{ns}/at/{ns_id} are immutable and tagged idx:{ns} and
 // r:{ns}/{name} per hit; only the current checkpoint's results are kept.
 // Read-your-writes: ?min={ns_id} or ?min={ns}:{ns_id}, repeatable. Cache
-// purges are logged (no CDN purger is wired in here).
+// purges go to the CDN at -purge-url (repeatable), and are logged if it is
+// unset.
 //
 // Encrypted namespaces (Addendum E): sealed ones are read with keys from
 // POST /ns/{ns}/keys with -bearer's grant; -enc-key is the service's X25519
@@ -54,6 +55,8 @@ func indexCmd(args []string) {
 	sse := fs.Bool("sse", false, "follow by server-sent events instead of long-poll")
 	encKey := fs.String("enc-key", "", "the service's X25519 private key (base64url), for sealed and e2e namespaces (Addendum E)")
 	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
+	var purgeURLs multi
+	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	fs.Parse(args)
 
 	var nss []string
@@ -87,6 +90,10 @@ func indexCmd(args []string) {
 	if *sse {
 		opt.FollowOptions = append(opt.FollowOptions, followSSE())
 	}
+	purger := cdnPurger(purgeURLs)
+	if purger != nil {
+		opt.Purger = purger
+	}
 	// The core may still be starting: retry reading its origin.
 	var ix *index.Index
 	for {
@@ -100,6 +107,7 @@ func indexCmd(args []string) {
 		log.Printf("%v; retrying", err)
 		time.Sleep(time.Second)
 	}
+	defer closePurger(purger) // after ix.Close: its last purges are sent
 	defer ix.Close()
 	if !ix.FTS() {
 		log.Printf("index: FTS5 is not available; text search uses LIKE")

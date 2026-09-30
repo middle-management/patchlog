@@ -1,9 +1,9 @@
 # Common tasks. `make up` starts the whole stack in Docker; `make dev` runs
 # just the core server natively.
-.PHONY: help build test vet fmt check dev up down logs seed clean fixture
+.PHONY: help build test vet fmt check dev up down logs seed cdn-check cdn-restart clean fixture
 
 help: ## list targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-8s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-12s %s\n", $$1, $$2}'
 
 build: ## build ./patchlog
 	go build -o patchlog ./cmd/patchlog
@@ -23,9 +23,10 @@ check: vet test ## vet and test, and fail on unformatted files
 dev: ## run the core server natively in dev mode on :8080 (dev.db; dev.key enables sealed/e2e namespaces)
 	go run ./cmd/patchlog serve -dev -db dev.db -master-key dev.key -master-key-create
 
-up: ## build and start the whole stack (core, seed, index, tree, janitor)
+up: ## build and start the whole stack (core, seed, index, tree, janitor, cdn)
 	docker compose up --build -d
-	@echo "core http://localhost:8080  playground http://localhost:8080/playground/  index http://localhost:8081  tree http://localhost:8082 (and /playground/tree/)"
+	@echo "through the CDN: core http://localhost:8080  playground http://localhost:8080/playground/  index http://localhost:8081  tree http://localhost:8082 (and /playground/tree/)"
+	@echo "origins, bypassing it: core http://localhost:9080  index http://localhost:9081  tree http://localhost:9082"
 
 down: ## stop the stack (data is kept; `docker compose down -v` wipes it)
 	docker compose down
@@ -35,6 +36,12 @@ logs: ## follow the stack's logs
 
 seed: ## re-run the seed against the running stack
 	docker compose run --rm seed
+
+cdn-check: ## smoke-test the CDN of the running stack: HIT/MISS, head micro-caching, long-poll collapsing, tag purge
+	sh deploy/cdn-check.sh
+
+cdn-restart: ## restart the CDN (reloads deploy/varnish/default.vcl and empties the cache)
+	docker compose restart cdn
 
 clean: ## remove built binaries and local dev databases
 	rm -f patchlog dev.db dev.db-wal dev.db-shm dev.key

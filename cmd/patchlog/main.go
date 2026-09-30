@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]]
+//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]...
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -10,16 +10,20 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/bundle"
+	"github.com/middle-management/patchlog/internal/cdnpurge"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -68,13 +72,13 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
-                 [-master-key FILE [-master-key-create]]
+                 [-master-key FILE [-master-key-create]] [-purge-url URL]...
   patchlog keygen
   patchlog grant mint -key SEED -block JSON [-seal]
   patchlog grant narrow -grant TOKEN -block JSON [-seal]
   patchlog grant seal -grant TOKEN      (grants are Biscuit v3 tokens)
-  patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
-  patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing]
+  patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false] [-purge-url URL]...
+  patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing] [-purge-url URL]...
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
@@ -113,6 +117,8 @@ func serve(args []string) {
 	masterKeyCreate := fs.Bool("master-key-create", false, "create the -master-key file with a new random key if it doesn't exist")
 	rotateEpochs := fs.Duration("rotate-epochs", 0, "rotate every sealed namespace's epoch once it is this old, e.g. 24h (Addendum E.2; 0 disables)")
 	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
+	var purgeURLs multi
+	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	fs.Parse(args)
 	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
 	if err != nil {
@@ -175,13 +181,17 @@ func serve(args []string) {
 			log.Fatal(err)
 		}
 	}
-	e, err := core.Open(core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
+	opt := core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
 		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
-		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke})
+		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke}
+	purger := cdnPurger(purgeURLs)
+	if purger != nil {
+		opt.Purger = purger
+	}
+	e, err := core.Open(opt)
 	if err != nil {
 		log.Fatal(err)
 	}
-	defer e.Close()
 	srv := &http.Server{Addr: *addr, Handler: handler(server.New(e), *pg, treeProxy), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("patchlog listening on %s (origin %s, dev=%v)", *addr, *origin, *dev)
 	if *pg {
@@ -190,7 +200,48 @@ func serve(args []string) {
 	if treeProxy != nil {
 		log.Printf("tree proxy: %s%s -> %s (GET/HEAD only)", localURL(*addr), server.TreeProxyPrefix, *treeURL)
 	}
-	log.Fatal(srv.ListenAndServe())
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			log.Fatal(err)
+		}
+	}()
+	<-ctx.Done()
+	log.Print("patchlog: shutting down")
+	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	srv.Shutdown(shutdown)
+	e.Close()
+	closePurger(purger)
+}
+
+const purgeURLUsage = "CDN URL that cache-tag purges are sent to, as PURGE with X-Purge-Tags (repeatable; e.g. http://cdn:8080/ for deploy/varnish). Unset: purges are only logged"
+
+// cdnPurger returns the HTTP purger for -purge-url flags, or nil (the
+// services' default purger then logs).
+func cdnPurger(urls []string) *cdnpurge.Purger {
+	if len(urls) == 0 {
+		return nil
+	}
+	p, err := cdnpurge.New(cdnpurge.Options{URLs: urls})
+	if err != nil {
+		log.Fatalf("-purge-url: %v", err)
+	}
+	log.Printf("cdn purges go to %s", strings.Join(urls, ", "))
+	return p
+}
+
+// closePurger flushes queued purges on shutdown, for at most 5 seconds.
+func closePurger(p *cdnpurge.Purger) {
+	if p == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := p.Close(ctx); err != nil {
+		log.Printf("cdn purge: flush on shutdown: %v", err)
+	}
 }
 
 // remoteOptions builds the endpoints of remote bases from ORIGIN=VALUE flags.
