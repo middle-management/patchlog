@@ -27,8 +27,9 @@ and serves immutable, CDN-cacheable revisions.
 
 ### Not implemented
 
-- **Addendum B** (catalog/tree service) and **F** (merge tools): being built as separate
-  consumer services on the public API.
+- **Addendum B** (catalog/tree service): being built as a separate consumer service on the
+  public API. The optional merge *service* of §F.7 (scheduled merges, web status) is not built;
+  its logic is in `internal/merge` and the CLI.
 - **Addendum E** (encryption): a namespace document with `encryption` is rejected with `422`.
 - **Addendum G** (federation): remote branches, `export`, bundles and pruning archives.
   Because no archive destination exists, **pruning always needs a grant chained to a `*` key**
@@ -76,6 +77,26 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
 - `?min={ns_id}` waits for your own write to be indexed, and answers 503 if it isn't in time.
 - In private namespaces the reader's grant is checked locally. Results are routed under
   `/g/{subject-set}/…` and filtered to the resources the grant can read.
+
+### Merge, rebase and cleanup (Addendum F)
+
+```sh
+patchlog merge status -branch release-7          # per resource: ahead, behind, clean, conflicting
+patchlog merge plan   -branch release-7          # the batch, plus a dry run
+patchlog merge apply  -branch release-7 -freeze  # one batch into the base, then freeze with "merged"
+patchlog rebase -branch release-7 -new release-7-b -switch
+patchlog janitor -ns matches                     # purge merged/superseded branches after `cleanup`
+```
+
+- Resources are classified by ancestry, using ids only (§F.3). A fast-forward reproduces the
+  branch's ids exactly. A replay reports overlapping `writes` under the array rule, and the
+  delete-versus-change cases always go to a person.
+- `-resolve name=file.json` replaces a conflicting item's steps with a resolution.
+- Earlier merge batches from the same branch count as common ancestors, so a second merge only
+  picks up what is new.
+- The janitor checks `merged` and `successor` claims against both logs before purging (§F.6).
+  Cleanup is opt-in: a branch is purged only once a `cleanup` period, from the branch's or the
+  base's document, has passed.
 
 ### A short tour (dev mode)
 
@@ -163,6 +184,8 @@ internal/verify      id and chain verification (§G.2)
 internal/grantcheck  local grant checks for services
 internal/annot       x-* annotations and x-ref references
 internal/index       search index service (Addendum A)
+internal/merge       merge, rebase, status, diff (Addendum F)
+internal/janitor     branch cleanup with claim verification (§F.6)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
 internal/ids        content-addressed ids (§3.2–§3.5)
 internal/pointer    JSON Pointer
