@@ -38,8 +38,8 @@ and serves immutable, CDN-cacheable revisions.
   `internal/merge` and the CLI.
 - **Addendum E.3 gaps:** merging or rebasing e2e branches (§F.8: decrypt and re-encrypt in a
   client holding both keyrings) and snapshot bundles of e2e namespaces (§G.5.1: a sealed
-  genesis by a key holder) are refused; the client library can't yet fold a remote branch's
-  read-through ciphertext (bound to the base's namespace name, which B doesn't have); retention for e2e
+  genesis by a key holder) are refused; the client library folds a remote branch's
+  read-through ciphertext only when the remote base sealed it itself, not its own bases; retention for e2e
   namespaces needs a key-holding janitor, which isn't built (the server skips them); no
   size-bucket padding (§E.4).
 - **Addendum E.2 gaps:** consumers that re-publish (search index, tree and catalog services)
