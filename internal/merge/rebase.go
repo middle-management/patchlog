@@ -2,6 +2,7 @@ package merge
 
 import (
 	"context"
+	"crypto/ecdh"
 	"errors"
 	"fmt"
 
@@ -30,6 +31,7 @@ type RebaseOptions struct {
 	// policy (the successor otherwise starts as a copy of Onto's document).
 	CopyConfig []string
 	// Plan options for the replays (Squash is ignored: a rebase keeps ids).
+	// An e2e branch needs Plan.E2E.
 	Plan Options
 }
 
@@ -57,6 +59,13 @@ type RebaseResult struct {
 // On conflicts it stops before switching and returns the plan with
 // ErrConflicts; the successor exists and nobody uses it yet, so a person can
 // resolve (Plan.Resolve, Plan.Apply) and run Rebase again, which resumes.
+//
+// An e2e branch (§F.8) needs Plan.E2E. The successor gets its own keyring
+// first (successorKeyring), and the replays re-encrypt under it, so no id
+// is kept. Every merge batch of the branch in the successor counts as a
+// merge point, merge.authors or not (they are the rebase, as the janitor's
+// superseded check assumes, §F.6), so a resumed rebase and the catch-up
+// replay exactly what is new.
 func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseResult, error) {
 	opt.Plan.Squash = false
 	if opt.Branch == "" || opt.New == "" {
@@ -86,6 +95,14 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	}
 	if opt.Switch && onto != baseNS {
 		return nil, fmt.Errorf("merge: can't switch %s to a successor based on %s: a successor must have the same base (%s)", opt.Branch, onto, baseNS)
+	}
+	lv, err := c.EncryptionLevel(ctx, opt.Branch)
+	if err != nil {
+		return nil, err
+	}
+	e2e := lv == "e2e"
+	if e2e && opt.Plan.E2E == nil {
+		return nil, fmt.Errorf("merge: %s is an e2e namespace: rebasing it re-encrypts its changes under the successor's keys (§F.8) and needs a key-holding view (Plan.E2E)", opt.Branch)
 	}
 	keys := opt.CopyConfig
 	if keys == nil {
@@ -127,7 +144,15 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	default:
 		return nil, err
 	}
+	if e2e {
+		if err := successorKeyring(ctx, opt.Plan.E2E, opt.Branch, onto, opt.New); err != nil {
+			return out, err
+		}
+	}
 
+	// The successor's merge batches of the branch are this rebase's own
+	// replays (a resumed run's too): they count as merge points.
+	opt.Plan.successor = true
 	first, err := NewPlan(ctx, c, opt.New, opt.Branch, opt.Plan)
 	if err != nil {
 		return out, err
@@ -175,6 +200,37 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 	}
 	out.CatchUpResult, err = catch.Apply(ctx)
 	return out, err
+}
+
+// successorKeyring gives an e2e successor its own keyring (§F.8): its
+// sealed patch sets bind it, so it can't write under the keyring it reads
+// through from its base. The key is wrapped for the readers of the old
+// branch's current epoch (its own keyring's, or the one it reads through)
+// and for the view itself. A successor that has one already (a resumed
+// rebase) is left as it is.
+func successorKeyring(ctx context.Context, x *client.E2E, branch, onto, succ string) error {
+	if kr, _, err := x.Keyring(ctx, succ); err == nil && kr.NS == succ {
+		return nil
+	} else if err != nil && !client.IsNotFound(err) {
+		return err
+	}
+	kr, _, err := x.Keyring(ctx, branch)
+	if client.IsNotFound(err) {
+		kr, _, err = x.Keyring(ctx, onto)
+	}
+	if err != nil {
+		return fmt.Errorf("merge: reading the keyring of %s: %w", branch, err)
+	}
+	var readers []*ecdh.PublicKey
+	for _, rid := range kr.Readers(kr.Current) {
+		if pub := kr.Recipients[rid]; pub != nil {
+			readers = append(readers, pub)
+		}
+	}
+	if _, err := x.InitKeyring(ctx, succ, readers...); err != nil {
+		return fmt.Errorf("merge: keyring of %s: %w", succ, err)
+	}
+	return nil
 }
 
 // ResourceStatus is one line of Status.

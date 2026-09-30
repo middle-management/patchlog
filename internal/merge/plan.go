@@ -40,6 +40,27 @@
 // from (BranchAt), never a later one: re-classification after a 412 only
 // reads the target again, and a plan built later (NewPlan) reads the
 // branch's new head and uses that as its source.at.
+//
+// End-to-end namespaces (§F.8, §G.5). Sealed patch sets bind their
+// namespace (§E.3.1), so when the branch or the target is e2e the plan
+// needs a key-holding view (Options.E2E) that can read both: it opens
+// both sides' logs (client.E2E.OpenLog) and folds and classifies the
+// plaintext exactly as above, with the same conflicts, resolutions and
+// squash. The items are then sealed afresh under the target's current
+// keys (a new IV, pl.ns the target), each step bound to the id the one
+// before it produces, after validating every resulting document against
+// its $schema (§E.3.2): a document that doesn't validate is an "invalid"
+// conflict. Nothing fast-forwards: a resource the target didn't change
+// still classifies as FastForward (status "ahead"), but its item is the
+// re-sealed replay of §F.8.1, the branch's patch sets re-encrypted, with
+// new ids. So a second merge finds
+// the pair of the first only through merge points, which need
+// merge.authors; without them a resource the target already holds with
+// exactly the branch's document counts as merged (by content, since ids
+// can't tell), and anything the branch changed since conflicts, so rebase
+// first. The namespace's keyring resource is key administration, never
+// merged. Once merged, the target depends on none of the branch's keys, so
+// purging the branch loses nothing.
 package merge
 
 import (
@@ -50,6 +71,7 @@ import (
 	"sort"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -79,6 +101,7 @@ const (
 	ConflictNoCommonAncestor = "no_common_ancestor" // e.g. created independently on both sides
 	ConflictUnreadable       = "unreadable"         // writes could not be computed (patches don't fold)
 	ConflictStaleResolution  = "stale_resolution"   // the target moved after a resolution was given
+	ConflictInvalid          = "invalid"            // e2e target: a resulting document doesn't validate (§E.3.2)
 )
 
 // Conflict is a reason a resource needs a person.
@@ -131,6 +154,13 @@ type Resource struct {
 	branchPurged bool
 	resolution   []client.Step
 	resolvedAt   string // B the resolution was written against
+	baseLast     string // the last live revision when B is a tombstone
+
+	// e2e target: Steps sealed under the target's keys, and the item they
+	// were sealed for (sealedFor), so resubmitting the same item sends the
+	// same bytes (§E.3.1).
+	sealed    []client.Step
+	sealedFor string
 }
 
 // Status is the §F.7 status of the resource: "merged" (nothing to do),
@@ -206,6 +236,18 @@ type Options struct {
 	MaxRetries int
 	// Resources, if set, limits the plan to these resource names.
 	Resources []string
+	// E2E is a key-holding view that reads the branch and writes the
+	// target when either is an e2e namespace (§F.8); it must hold (or be
+	// able to fetch) both namespaces' keys.
+	E2E *client.E2E
+
+	// successor is set by Rebase: the target is the branch's successor,
+	// whose merge batches of the branch are the rebase itself, so all of
+	// them count as merge points without merge.authors (§F.6 accepts them
+	// for a superseded claim the same way). A resumed or catch-up replay
+	// then picks up exactly what is new, which matters most at E3, where
+	// nothing kept its id.
+	successor bool
 }
 
 // Plan is a classified merge of Branch into Target.
@@ -232,14 +274,20 @@ type Plan struct {
 	// Ignored lists the earlier merge batches of the branch in the target
 	// that don't count as merge points, with the reason.
 	Ignored []MergeBatch `json:"ignoredMerges,omitempty"`
-	// TargetLevel is the target's encryption level ("", "at-rest",
-	// "sealed").
+	// TargetLevel and BranchLevel are the encryption levels ("",
+	// "at-rest", "sealed", "e2e").
 	TargetLevel string `json:"targetLevel,omitempty"`
+	BranchLevel string `json:"branchLevel,omitempty"`
+	// Reencrypt is set when either side is e2e: branch changes are read
+	// as plaintext and every item is written anew, never fast-forwarded
+	// (§F.8).
+	Reencrypt bool `json:"reencrypt,omitempty"`
 
 	opt        Options
 	points     map[string]Pair         // per resource: the most recent trusted pair
 	ignoredFor map[string][]MergeBatch // per resource: untrusted batches with an entry for it
 	logs       map[string]ancestry     // cache: ns/name@head
+	flags      map[string]string       // e2e: ns/name@id -> why the revision can't be read
 }
 
 // Pair is a common ancestor from an earlier merge batch (§F.3): the branch
@@ -279,22 +327,23 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 	if opt.MaxRetries <= 0 {
 		opt.MaxRetries = 3
 	}
-	p := &Plan{c: c, Target: target, Branch: branch, opt: opt, logs: map[string]ancestry{}}
-	// Sealed patch sets bind their namespace (§E.3.1): merging an e2e
-	// branch means decrypting and re-encrypting under the target's keys,
-	// never a fast-forward (§F.8), which this tool doesn't do.
+	p := &Plan{c: c, Target: target, Branch: branch, opt: opt, logs: map[string]ancestry{}, flags: map[string]string{}}
+	// Sealed patch sets bind their namespace (§E.3.1): merging to or from
+	// an e2e namespace decrypts and re-encrypts under the target's keys,
+	// never a fast-forward (§F.8).
+	var err error
+	if p.BranchLevel, err = c.EncryptionLevel(ctx, branch); err != nil {
+		return nil, fmt.Errorf("merge: %s: %w", branch, err)
+	}
+	if p.TargetLevel, err = c.EncryptionLevel(ctx, target); err != nil {
+		return nil, fmt.Errorf("merge: %s: %w", target, err)
+	}
 	for _, ns := range []string{branch, target} {
-		lv, err := c.EncryptionLevel(ctx, ns)
-		if err != nil {
-			return nil, fmt.Errorf("merge: %s: %w", ns, err)
-		}
-		if ns == target {
-			p.TargetLevel = lv
-		}
-		if lv == "e2e" {
-			return nil, fmt.Errorf("merge: %s is an e2e namespace (Addendum E.3): its merges must decrypt and re-encrypt under the target's keys in a client holding both, never fast-forward (§F.8); this merge tool doesn't support that", ns)
+		if p.level(ns) == "e2e" && opt.E2E == nil {
+			return nil, fmt.Errorf("merge: %s is an e2e namespace (Addendum E.3): its merges decrypt and re-encrypt under the target's keys, never fast-forward (§F.8), and need a key-holding view (Options.E2E) that can read both %s and %s", ns, branch, target)
 		}
 	}
+	p.Reencrypt = p.BranchLevel == "e2e" || p.TargetLevel == "e2e"
 	bh, err := c.NSHead(ctx, branch)
 	if err != nil {
 		return nil, fmt.Errorf("merge: branch %s: %w", branch, err)
@@ -331,6 +380,10 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		if only != nil && !only[ch.Resource] {
 			continue
 		}
+		if p.Reencrypt && ch.Resource == client.KeyringName {
+			// Key administration of the branch: never merged (§E.3.2).
+			continue
+		}
 		r := &Resource{Name: ch.Resource, Branch: ch.Target, BranchDeleted: ch.Kind == "tombstone", branchPurged: ch.Purged}
 		p.Resources = append(p.Resources, r)
 	}
@@ -351,7 +404,23 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 			return nil, fmt.Errorf("merge: %s: %w", r.Name, err)
 		}
 	}
+	// An e2e target validates and seals now, so the plan reports invalid
+	// documents before anything is submitted.
+	if err := p.sealItems(ctx); err != nil {
+		return nil, err
+	}
 	return p, nil
+}
+
+// level returns the encryption level of the branch or the target.
+func (p *Plan) level(ns string) string {
+	switch ns {
+	case p.Branch:
+		return p.BranchLevel
+	case p.Target:
+		return p.TargetLevel
+	}
+	return ""
 }
 
 // Change is a resource's latest entry in a branch log.
@@ -448,6 +517,8 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 		}
 		mb := MergeBatch{Batch: e.ID, Author: e.Author, Kid: e.Kid}
 		switch {
+		case p.opt.successor:
+			// The rebase's own replays.
 		case !p.AuthorsDeclared:
 			mb.Reason = "the target declares no merge.authors"
 		case !Listed(p.MergeAuthors, e.Author, e.Kid):
@@ -539,8 +610,48 @@ func (p *Plan) ancestry(ctx context.Context, ns, name, head string) (ancestry, e
 	default:
 		return ancestry{}, err
 	}
+	if p.level(ns) == "e2e" {
+		es, flags, err := p.opt.E2E.OpenLog(ctx, ns, name, a.entries)
+		if err != nil {
+			return ancestry{}, err
+		}
+		for i, f := range flags {
+			if f != "" {
+				p.flags[ns+"/"+name+"@"+es[i].ID] = f
+			}
+		}
+		a.entries = es
+	}
 	p.logs[key] = a
 	return a, nil
+}
+
+// flagged returns why the first of entries of ns/name that couldn't be
+// opened (e2e, §E.3.2) was left out, or "".
+func (p *Plan) flagged(ns, name string, entries []client.LogEntry) string {
+	for _, e := range entries {
+		if f := p.flags[ns+"/"+name+"@"+e.ID]; f != "" {
+			return "revision " + e.ID + " in " + ns + ": " + f
+		}
+	}
+	return ""
+}
+
+// doc returns the document of ns/name at revision id, folded by the
+// key-holding view in an e2e namespace.
+func (p *Plan) doc(ctx context.Context, ns, name, id string) (any, error) {
+	if p.level(ns) == "e2e" {
+		d, err := p.opt.E2E.DocE2E(ctx, ns, name, id)
+		if err != nil {
+			return nil, err
+		}
+		return d.Value, nil
+	}
+	d, err := p.c.Doc(ctx, ns, name, id)
+	if err != nil {
+		return nil, err
+	}
+	return d.Value, nil
 }
 
 func indexOf(es []client.LogEntry, id string) int {
@@ -558,6 +669,7 @@ func (r *Resource) reset() {
 	r.IfMatch, r.IfNoneMatch, r.Steps, r.Expected = "", false, nil, nil
 	r.BranchWrites, r.BaseWrites, r.Conflicts = nil, nil, nil
 	r.Squashed, r.Note, r.Kept, r.Pair = false, "", false, nil
+	r.baseLast, r.sealed, r.sealedFor = "", nil, ""
 }
 
 func (r *Resource) conflict(kind, msg string, paths ...string) {
@@ -584,7 +696,7 @@ func (p *Plan) classify(ctx context.Context, r *Resource) error {
 		r.Class, r.Note = Purged, "purged in the target"
 		return nil
 	case client.Live, client.Tombstoned:
-		r.Base = h.ID
+		r.Base, r.baseLast = h.ID, h.Last
 	}
 	if err := p.classifyAncestry(ctx, r, h); err != nil {
 		return err
@@ -633,8 +745,19 @@ func (p *Plan) classifyAncestry(ctx context.Context, r *Resource, h *client.Head
 		} else {
 			r.IfMatch = parent
 		}
+		if f := p.flagged(p.Branch, r.Name, entries); f != "" {
+			r.conflict(ConflictUnreadable, f)
+			return nil
+		}
 		if hasPruned(r.Steps) {
 			r.conflict(ConflictPruned, "a patch set the fast-forward needs was pruned")
+			return nil
+		}
+		if p.Reencrypt {
+			// A re-sealed replay: sealed under the target's keys, so new
+			// ids (§F.8.1). The target didn't change the resource, so there
+			// is nothing to check for conflicts.
+			r.Note = "re-sealed replay for " + p.Target + ": new ids, never a fast-forward at E3 (§F.8.1)"
 			return nil
 		}
 		exp, err := expectedIDs(parent, r.Steps)
@@ -727,6 +850,14 @@ func (p *Plan) classifyAncestry(ctx context.Context, r *Resource, h *client.Head
 	}
 	r.Steps = stepsOf(hes[hi+1:])
 	baseSteps := stepsOf(bes[bi+1:])
+	if f := p.flagged(p.Branch, r.Name, hes[hi+1:]); f != "" {
+		r.conflict(ConflictUnreadable, "branch side: "+f)
+		return nil
+	}
+	if f := p.flagged(p.Target, r.Name, bes[bi+1:]); f != "" {
+		r.conflict(ConflictUnreadable, "target side: "+f)
+		return nil
+	}
 	if hasPruned(r.Steps) || hasPruned(baseSteps) {
 		r.conflict(ConflictPruned, "patch sets after the common ancestor were pruned")
 		return nil
@@ -761,6 +892,14 @@ func (p *Plan) classifyAncestry(ctx context.Context, r *Resource, h *client.Head
 	r.BaseWrites = stringsOf(tsc.writes)
 
 	targetDeleted := h.State == client.Tombstoned
+	if p.Reencrypt && sameOutcome(bsc.final, tsc.final) {
+		// Re-encrypted merges get new ids, so ids can't show that the
+		// target already has the branch's document; the content can.
+		r.Class, r.IfMatch, r.Steps = Merged, "", nil
+		r.BranchWrites, r.BaseWrites = nil, nil
+		r.Note = "the target already has the branch's document (a re-encrypted merge has new ids, §F.8)"
+		return nil
+	}
 	switch {
 	case targetDeleted && r.BranchDeleted:
 		// Deleted on both sides: the target already has the outcome.
@@ -776,6 +915,15 @@ func (p *Plan) classifyAncestry(ctx context.Context, r *Resource, h *client.Head
 		r.conflict(ConflictOverlap, "both sides wrote these paths since the common ancestor", ov...)
 	}
 	return nil
+}
+
+// sameOutcome reports whether two folded states are the same document:
+// both deleted, or both live and equal.
+func sameOutcome(a, b docState) bool {
+	if a.deleted || b.deleted {
+		return a.deleted && b.deleted
+	}
+	return a.exists && b.exists && jsonv.Equal(a.doc, b.doc)
 }
 
 // hintIgnored adds a note to a conflicting replay when an earlier merge
@@ -796,7 +944,8 @@ func (p *Plan) hintIgnored(r *Resource) {
 // keepStep is the step that records a resource kept at the target's live
 // head (§F.3): an empty patch set, which writes a revision with identical
 // content, or in a sealed namespace a patch set that only adds a fresh
-// $nonce, since every patch set there must refresh it (§E.2.5).
+// $nonce, since every patch set there must refresh it (§E.2.5). In an e2e
+// namespace the empty set is sealed like any other step (sealItems).
 func (p *Plan) keepStep() client.Step {
 	if p.TargetLevel == "sealed" {
 		return client.PatchStep([]any{map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()}})
@@ -816,12 +965,12 @@ func (p *Plan) docAt(ctx context.Context, ns, name string, es []client.LogEntry,
 	if j < 0 {
 		return nil, nil
 	}
-	d, err := p.c.Doc(ctx, ns, name, es[j].ID)
+	d, err := p.doc(ctx, ns, name, es[j].ID)
 	if err != nil {
 		if client.IsPruned(err) || client.IsGone(err) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	return &docState{doc: d.Value, exists: true, deleted: deleted}, nil
+	return &docState{doc: d, exists: true, deleted: deleted}, nil
 }

@@ -27,7 +27,19 @@ package client
 //
 // Epoch keys come from keys added with AddKey, else (with a recipient
 // private key) from POST /ns/{ns}/keys, which relays the keyring entries
-// wrapped for the grant's enc, else from the keyring resource itself.
+// wrapped for the grant's enc, else from the namespace's own keyring
+// resource (not one read through from a base: its keys are the base's).
+//
+// Padding (§E.2.2, §E.3.1). In a namespace with "encryption": { "pad":
+// true } writes pad the plaintext of every sealed patch set (and prune
+// snapshot) to its size bucket, uncompressed (seal.SealPatchSetPad). A
+// fold flags a patch set that isn't padded when the namespace that sealed
+// it padded at the time, like a failed validation. Turning pad on doesn't
+// flag what was sealed before: the namespace log tells which configuration
+// each revision was written under.
+//
+// Merge and rebase (§F.8) read a branch's changes as plaintext with
+// OpenLog and write them under the target's keys with SealPatches.
 
 import (
 	"context"
@@ -51,9 +63,24 @@ const KeyringName = "keyring"
 type E2E struct {
 	c          *Client
 	recipient  *ecdh.PrivateKey
+	extra      []*ecdh.PrivateKey // more recipients to unwrap with (WithRecipient)
 	keys       *e2eKeys
 	schemas    *e2eSchemas
+	pads       *e2ePads
 	noValidate bool
+}
+
+// e2ePads caches, per namespace, whether it padded when each of its
+// revisions was written (from its namespace log, as of head).
+type e2ePads struct {
+	mu sync.Mutex
+	m  map[string]*padHistory
+}
+
+type padHistory struct {
+	head string
+	now  bool            // the namespace pads as of head
+	at   map[string]bool // revision id -> pad in force when it was written
 }
 
 type e2eKeys struct {
@@ -72,7 +99,28 @@ type e2eSchemas struct {
 // added with AddKey.
 func (c *Client) E2E(recipient *ecdh.PrivateKey) *E2E {
 	return &E2E{c: c, recipient: recipient, keys: &e2eKeys{m: map[string][]byte{}},
-		schemas: &e2eSchemas{v: schema.NewValidator(), m: map[string]any{}}}
+		schemas: &e2eSchemas{v: schema.NewValidator(), m: map[string]any{}}, pads: &e2ePads{m: map[string]*padHistory{}}}
+}
+
+// WithRecipient returns a view that also unwraps keys with priv, sharing
+// the key cache. A merge between namespaces whose keyrings name different
+// keys of the merger (§F.8) needs both.
+func (x *E2E) WithRecipient(priv *ecdh.PrivateKey) *E2E {
+	cp := *x
+	if cp.recipient == nil {
+		cp.recipient = priv
+	} else {
+		cp.extra = append(append([]*ecdh.PrivateKey(nil), x.extra...), priv)
+	}
+	return &cp
+}
+
+// recipients lists the view's private keys, primary first.
+func (x *E2E) recipients() []*ecdh.PrivateKey {
+	if x.recipient == nil {
+		return x.extra
+	}
+	return append([]*ecdh.PrivateKey{x.recipient}, x.extra...)
 }
 
 // E2EKeys returns an e2e view of c that uses raw epoch keys, by kid
@@ -111,7 +159,8 @@ func (x *E2E) Key(ctx context.Context, kid string) ([]byte, error) {
 	if k != nil {
 		return k, nil
 	}
-	if x.recipient == nil {
+	privs := x.recipients()
+	if len(privs) == 0 {
 		return nil, fmt.Errorf("%w: %s", ErrNoKeys, kid)
 	}
 	ns, epoch, err := seal.ParseKid(kid)
@@ -126,20 +175,30 @@ func (x *E2E) Key(ctx context.Context, kid string) ([]byte, error) {
 			}
 			key := e.Key
 			if key == nil {
-				if key, err = seal.UnwrapKey(x.recipient, e.Wrapped); err != nil {
-					return nil, fmt.Errorf("client: unwrapping %s: %w", kid, err)
+				var uerr error
+				for _, priv := range privs {
+					if key, uerr = seal.UnwrapKey(priv, e.Wrapped); uerr == nil {
+						break
+					}
+				}
+				if uerr != nil {
+					return nil, fmt.Errorf("client: unwrapping %s: %w", kid, uerr)
 				}
 			}
 			x.AddKey(kid, key)
 			return key, nil
 		}
 	}
-	// Then the keyring itself (a key holder may read it directly).
+	// Then the keyring itself (a key holder may read it directly), if it
+	// is the namespace's own: a branch without one reads its base's
+	// through, and those are the base's keys, not "{branch}#{e}".
 	kr, _, err := x.Keyring(ctx, ns)
-	if err == nil {
-		if key, err := kr.EpochKey(x.recipient, epoch); err == nil {
-			x.AddKey(kid, key)
-			return key, nil
+	if err == nil && kr.NS == ns {
+		for _, priv := range privs {
+			if key, err := kr.EpochKey(priv, epoch); err == nil {
+				x.AddKey(kid, key)
+				return key, nil
+			}
 		}
 	}
 	return nil, fmt.Errorf("%w: %s", ErrNoKeys, kid)
@@ -173,6 +232,7 @@ type e2eConfig struct {
 	Config string // config revision id
 	Epoch  int
 	Base   string // the base namespace of a branch, "" otherwise
+	Pad    bool   // encryption.pad (§E.2.2)
 }
 
 func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
@@ -192,6 +252,7 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 	if f, ok := enc["epoch"].(float64); ok {
 		out.Epoch = int(f)
 	}
+	out.Pad, _ = enc["pad"].(bool)
 	if b, ok := d.Value["base"].(map[string]any); ok {
 		out.Base, _ = b["ns"].(string)
 	}
@@ -201,9 +262,10 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 // --- writes ---------------------------------------------------------------
 
 // SealPatches seals patches for a write to ns/name on parent ("" for
-// genesis) under the namespace's current epoch, and returns the patch set
-// to send: [{"op":"sealed","value":"<JWE>"}]. Keep the bytes until the
-// write is acknowledged: sealing again gives another id (§E.3.1).
+// genesis) under the namespace's current epoch, padded if the namespace
+// pads, and returns the patch set to send:
+// [{"op":"sealed","value":"<JWE>"}]. Keep the bytes until the write is
+// acknowledged: sealing again gives another id (§E.3.1).
 func (x *E2E) SealPatches(ctx context.Context, ns, name, parent string, patches any) ([]byte, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
@@ -221,7 +283,7 @@ func (x *E2E) SealPatches(ctx context.Context, ns, name, parent string, patches 
 	if err != nil {
 		return nil, err
 	}
-	return seal.SealPatchSet(key, kid, ns, name, parent, v)
+	return seal.SealPatchSetPad(key, kid, ns, name, parent, v, cfg.Pad)
 }
 
 // send sends a sealed patch set, resending the same bytes after a
@@ -444,12 +506,16 @@ func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, e
 	return arr, nil
 }
 
-// chain lists ns and its bases (a branch reads its base's ciphertext, whose
-// patch sets and snapshots are bound to the base, §F.8).
-func (x *E2E) chain(ctx context.Context, ns string) (map[string]bool, error) {
-	out := map[string]bool{}
-	for cur := ns; cur != "" && !out[cur]; {
-		out[cur] = true
+// chain maps ns and its bases to their depth: 0 for ns, 1 for its base,
+// and so on (a branch reads its base's ciphertext, whose patch sets and
+// snapshots are bound to the base, §F.8).
+func (x *E2E) chain(ctx context.Context, ns string) (map[string]int, error) {
+	out := map[string]int{}
+	for cur, d := ns, 0; cur != ""; d++ {
+		if _, seen := out[cur]; seen {
+			break
+		}
+		out[cur] = d
 		cfg, err := x.config(ctx, cur)
 		if err != nil {
 			return nil, err
@@ -459,22 +525,204 @@ func (x *E2E) chain(ctx context.Context, ns string) (map[string]bool, error) {
 	return out, nil
 }
 
+// inChain returns a check, for the entries of one resource log of ns in
+// order, whether each may be sealed under namespace kns: ns itself or one
+// of its bases (read through, §F.8.1), and never a base deeper than an
+// earlier entry's, since read-through content comes before a namespace's
+// own writes.
+func (x *E2E) inChain(ctx context.Context, ns string) func(kns string) (bool, error) {
+	var depth map[string]int
+	last := -1
+	return func(kns string) (bool, error) {
+		d := 0
+		if kns != ns {
+			if depth == nil {
+				var err error
+				if depth, err = x.chain(ctx, ns); err != nil {
+					return false, err
+				}
+			}
+			var ok bool
+			if d, ok = depth[kns]; !ok {
+				return false, nil
+			}
+		}
+		if last >= 0 && d > last {
+			return false, nil
+		}
+		last = d
+		return true, nil
+	}
+}
+
+// openSealed opens the sealed patch set of revision e of name. A non-empty
+// flag says why the revision must be left out instead: it isn't a sealed
+// patch set, is sealed under a namespace nsOK refuses, doesn't open or
+// verify, or isn't padded although the namespace that sealed it padded at
+// the time (§E.3.1). err is for failures that aren't the revision's fault
+// (keys, transport).
+func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK func(string) (bool, error)) (plain any, flag string, err error) {
+	jwe, ok := seal.SealedJWE(e.Patches)
+	if !ok {
+		return nil, "not a sealed patch set", nil
+	}
+	h, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return nil, "sealed patch set: " + err.Error(), nil
+	}
+	kns, _, err := seal.ParseKid(h.Kid)
+	if err != nil {
+		return nil, "sealed patch set: " + err.Error(), nil
+	}
+	if ok, err := nsOK(kns); err != nil {
+		return nil, "", err
+	} else if !ok {
+		return nil, "sealed under another namespace's key " + h.Kid, nil
+	}
+	key, err := x.Key(ctx, h.Kid)
+	if err != nil {
+		return nil, "", err
+	}
+	plain, padded, err := seal.OpenPatchSetPadded(e.Patches, key, h.Kid, kns, name, e.Parent)
+	if err != nil {
+		return nil, "sealed patch set: " + err.Error(), nil
+	}
+	if !padded {
+		if must, err := x.paddedAt(ctx, kns, e.ID); err != nil {
+			return nil, "", err
+		} else if must {
+			return nil, "the sealed patch set isn't padded to its size bucket, but " + kns + " pads (§E.2.2)", nil
+		}
+	}
+	return plain, "", nil
+}
+
+// paddedAt reports whether ns padded when revision id was written: the
+// pad of the configuration in force at its entry in ns's log. A namespace
+// that doesn't pad now is taken never to require it (nothing is flagged
+// after pad is turned off), and a revision the log doesn't list (yet) is
+// judged by the current configuration.
+func (x *E2E) paddedAt(ctx context.Context, ns, id string) (bool, error) {
+	x.pads.mu.Lock()
+	ph := x.pads.m[ns]
+	x.pads.mu.Unlock()
+	if ph != nil {
+		if p, ok := ph.at[id]; ok {
+			return p, nil
+		}
+	}
+	h, err := x.c.NSHead(ctx, ns)
+	if err != nil {
+		return false, err
+	}
+	if ph == nil || ph.head != h.ID {
+		if ph, err = x.padHistory(ctx, ns, h.ID); err != nil {
+			return false, err
+		}
+		x.pads.mu.Lock()
+		x.pads.m[ns] = ph
+		x.pads.mu.Unlock()
+	}
+	if p, ok := ph.at[id]; ok {
+		return p, nil
+	}
+	return ph.now, nil
+}
+
+func padOf(doc map[string]any) bool {
+	enc, _ := doc["encryption"].(map[string]any)
+	p, _ := enc["pad"].(bool)
+	return p
+}
+
+// padHistory reads ns's log up to head and records, for every revision it
+// names, whether the namespace padded when it was written. Items of a
+// batch that also changes the configuration were sealed under the one
+// before it.
+func (x *E2E) padHistory(ctx context.Context, ns, head string) (*padHistory, error) {
+	d, err := x.c.NSDoc(ctx, ns, head)
+	if err != nil {
+		return nil, err
+	}
+	ph := &padHistory{head: head, now: padOf(d.Value), at: map[string]bool{}}
+	if !ph.now {
+		return ph, nil
+	}
+	log, err := x.c.NSLog(ctx, ns, head, "")
+	if err != nil {
+		return nil, err
+	}
+	cur := false
+	var visit func(e NSEntry)
+	visit = func(e NSEntry) {
+		switch e.Kind {
+		case "head":
+			ph.at[e.Target] = cur
+		case "batch":
+			for _, s := range e.Entries {
+				visit(s)
+			}
+		}
+	}
+	for _, e := range log {
+		visit(e)
+		if e.Kind == "config" || (e.Kind == "batch" && len(e.Entries) > 0 && e.Entries[0].Kind == "config") {
+			d, err := x.c.NSDoc(ctx, ns, e.ID)
+			if err != nil {
+				return nil, err
+			}
+			cur = padOf(d.Value)
+		}
+	}
+	return ph, nil
+}
+
+// OpenLog opens the revisions of es, log entries of ns/name as Client.Log
+// returns them, and returns copies whose Patches are the plaintext patch
+// sets (a restore with [] stays []; tombstones and absent patch sets are
+// unchanged). A revision that would be flagged in a fold (see openSealed)
+// gets no patches (HasPatches false) and its reason in flags, at the same
+// index. The ids stay those over ciphertext. Merge and rebase (§F.8) read
+// branch changes this way.
+func (x *E2E) OpenLog(ctx context.Context, ns, name string, es []LogEntry) (out []LogEntry, flags []string, err error) {
+	nsOK := x.inChain(ctx, ns)
+	out = make([]LogEntry, len(es))
+	flags = make([]string, len(es))
+	for i, e := range es {
+		out[i] = e
+		if e.Kind == "tombstone" || !e.HasPatches {
+			continue
+		}
+		if a, ok := e.Patches.([]any); ok && len(a) == 0 {
+			continue
+		}
+		plain, msg, err := x.openSealed(ctx, name, e, nsOK)
+		if err != nil {
+			return nil, nil, err
+		}
+		if msg != "" {
+			out[i].Patches, out[i].HasPatches, flags[i] = nil, false, msg
+			continue
+		}
+		out[i].Patches = plain
+	}
+	return out, flags, nil
+}
+
+// Validate checks doc against its $schema as writes do (§E.3.2): "" if it
+// is valid or has none, else what is wrong. err is for a schema that
+// couldn't be fetched.
+func (x *E2E) Validate(ctx context.Context, doc any) (string, error) {
+	if x.noValidate {
+		return "", nil
+	}
+	return x.validate(ctx, doc)
+}
+
 // fold verifies and folds a log answer ending at id and starting after
 // since (with its snapshot first when since is set).
 func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (*E2EDoc, error) {
-	var allowed map[string]bool
-	nsOK := func(kns string) (bool, error) {
-		if kns == ns {
-			return true, nil
-		}
-		if allowed == nil {
-			var err error
-			if allowed, err = x.chain(ctx, ns); err != nil {
-				return false, err
-			}
-		}
-		return allowed[kns], nil
-	}
+	nsOK := x.inChain(ctx, ns)
 	out := &E2EDoc{ID: id}
 	var doc any
 	exists := false
@@ -545,34 +793,12 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 			continue
 		}
 		flag := func(msg string) { out.Flagged = append(out.Flagged, Flag{ID: e.ID, Author: e.Author, Message: msg}) }
-		jwe, ok := seal.SealedJWE(e.Patches)
-		if !ok {
-			flag("not a sealed patch set")
-			continue
-		}
-		h, err := seal.ParseHeader(jwe)
-		if err != nil {
-			flag("sealed patch set: " + err.Error())
-			continue
-		}
-		kns, _, err := seal.ParseKid(h.Kid)
-		if err != nil {
-			flag("sealed patch set: " + err.Error())
-			continue
-		}
-		if ok, err := nsOK(kns); err != nil {
-			return nil, err
-		} else if !ok {
-			flag("sealed under another namespace's key " + h.Kid)
-			continue
-		}
-		key, err := x.Key(ctx, h.Kid)
+		plain, msg, err := x.openSealed(ctx, name, e, nsOK)
 		if err != nil {
 			return nil, err
 		}
-		plain, err := seal.OpenPatchSet(e.Patches, key, h.Kid, kns, name, e.Parent)
-		if err != nil {
-			flag("sealed patch set: " + err.Error())
+		if msg != "" {
+			flag(msg)
 			continue
 		}
 		ops, err := patch.Parse(plain)
@@ -585,7 +811,7 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 			flag("patch set doesn't apply: " + err.Error())
 			continue
 		}
-		msg, err := x.validate(ctx, nd)
+		msg, err = x.validate(ctx, nd)
 		if err != nil {
 			return nil, err
 		}
@@ -703,7 +929,7 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	if err != nil {
 		return nil, err
 	}
-	snap, err := seal.SealSnapshot(key, kid, ns, name, horizon, d.Value)
+	snap, err := seal.SealSnapshotPad(key, kid, ns, name, horizon, d.Value, cfg.Pad)
 	if err != nil {
 		return nil, err
 	}

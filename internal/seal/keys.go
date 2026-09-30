@@ -89,6 +89,55 @@ func ParseRecipientJWK(v any) (*ecdh.PublicKey, error) {
 	return pub, nil
 }
 
+// ParseRecipientPrivate parses an X25519 private key: a private JWK
+// { "kty": "OKP", "crv": "X25519", "d": "<base64url>", "x"? } (x, if
+// present, must match), or the bare base64url of the 32 bytes of d. Used
+// for key holders' identity files.
+func ParseRecipientPrivate(b []byte) (*ecdh.PrivateKey, error) {
+	s := strings.TrimSpace(string(b))
+	var d []byte
+	var x string
+	if strings.HasPrefix(s, "{") {
+		v, err := jsonv.Parse([]byte(s))
+		if err != nil {
+			return nil, fmt.Errorf("%w: jwk: %v", ErrFormat, err)
+		}
+		m, _ := v.(map[string]any)
+		if m == nil || m["kty"] != "OKP" || m["crv"] != "X25519" {
+			return nil, fmt.Errorf("%w: jwk must be OKP/X25519", ErrFormat)
+		}
+		ds, _ := m["d"].(string)
+		if d, err = b64.DecodeString(ds); err != nil {
+			return nil, fmt.Errorf("%w: jwk d", ErrFormat)
+		}
+		x, _ = m["x"].(string)
+	} else {
+		var err error
+		if d, err = b64.DecodeString(s); err != nil {
+			return nil, fmt.Errorf("%w: private key: %v", ErrFormat, err)
+		}
+	}
+	if len(d) != 32 {
+		return nil, fmt.Errorf("%w: an X25519 private key has 32 bytes", ErrFormat)
+	}
+	priv, err := ecdh.X25519().NewPrivateKey(d)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrFormat, err)
+	}
+	if x != "" && x != b64.EncodeToString(priv.PublicKey().Bytes()) {
+		return nil, fmt.Errorf("%w: jwk x doesn't match d", ErrFormat)
+	}
+	return priv, nil
+}
+
+// RecipientPrivateJWK returns the private JWK model value {kty, crv, x, d}
+// of priv (keep it secret).
+func RecipientPrivateJWK(priv *ecdh.PrivateKey) map[string]any {
+	m := RecipientJWK(priv.PublicKey())
+	m["d"] = b64.EncodeToString(priv.Bytes())
+	return m
+}
+
 // RecipientJWK returns the JWK model value {kty, crv, x} of pub.
 func RecipientJWK(pub *ecdh.PublicKey) map[string]any {
 	return map[string]any{"kty": "OKP", "crv": "X25519", "x": b64.EncodeToString(pub.Bytes())}

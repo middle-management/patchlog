@@ -97,17 +97,17 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 	start := docState{}
 	switch h.State {
 	case client.Live:
-		d, err := p.c.Doc(ctx, p.Target, r.Name, h.ID)
+		d, err := p.doc(ctx, p.Target, r.Name, h.ID)
 		if err != nil {
 			return err
 		}
-		start = docState{doc: d.Value, exists: true}
+		start = docState{doc: d, exists: true}
 	case client.Tombstoned:
-		d, err := p.c.Doc(ctx, p.Target, r.Name, h.Last)
+		d, err := p.doc(ctx, p.Target, r.Name, h.Last)
 		if err != nil {
 			return err
 		}
-		start = docState{doc: d.Value, exists: true, deleted: true}
+		start = docState{doc: d, exists: true, deleted: true}
 	}
 	sc, err := foldWrites(docState{doc: jsonv.Clone(start.doc), exists: start.exists, deleted: start.deleted}, r.Steps)
 	if err != nil {
@@ -143,11 +143,17 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 
 // Batch builds the batch request: one item per resource with an item, the
 // explicit config change if any, and source { ns: branch, at: branchAt },
-// where branchAt is the branch revision the plan was classified from.
+// where branchAt is the branch revision the plan was classified from. For
+// an e2e target the steps are the sealed ones (see sealItems, which
+// DryRun and Apply run first); plaintext is never sent there.
 func (p *Plan) Batch() client.BatchRequest {
 	req := client.BatchRequest{Source: map[string]any{"ns": p.Branch, "at": p.BranchAt}}
 	for _, r := range p.Items() {
-		req.Items = append(req.Items, client.BatchItem{Resource: r.Name, IfMatch: r.IfMatch, IfNoneMatch: r.IfNoneMatch, Steps: r.Steps})
+		steps := r.Steps
+		if p.TargetLevel == "e2e" {
+			steps = r.sealed
+		}
+		req.Items = append(req.Items, client.BatchItem{Resource: r.Name, IfMatch: r.IfMatch, IfNoneMatch: r.IfNoneMatch, Steps: steps})
 	}
 	if p.opt.Config != nil {
 		req.Config = &client.BatchConfig{IfMatch: p.TargetConfig, Patches: p.opt.Config}
@@ -182,6 +188,12 @@ func (p *Plan) checkIDs(res *client.BatchResult) error {
 // report. A failing item is an *client.APIError with code "batch". An empty
 // plan returns (nil, nil).
 func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
+	if err := p.sealItems(ctx); err != nil {
+		return nil, err
+	}
+	if p.TargetLevel == "e2e" && !p.Clean() {
+		return nil, ErrConflicts
+	}
 	req := p.Batch()
 	if p.empty(req) {
 		return nil, nil
@@ -213,6 +225,9 @@ type Result struct {
 // resource needs a person, before or after re-classification.
 func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 	for attempt := 1; ; attempt++ {
+		if err := p.sealItems(ctx); err != nil {
+			return nil, err
+		}
 		if !p.Clean() {
 			return nil, ErrConflicts
 		}
