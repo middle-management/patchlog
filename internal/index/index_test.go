@@ -74,7 +74,14 @@ type svcOpts struct {
 	hc       *http.Client
 }
 
+type indexOpts = index.Options
+
 func startSvc(t *testing.T, core *client.Client, o svcOpts) *svc {
+	t.Helper()
+	return startSvcWith(t, core, o)
+}
+
+func startSvcWith(t *testing.T, core *client.Client, o svcOpts, mods ...func(*indexOpts)) *svc {
 	t.Helper()
 	s := &svc{t: t, core: core, done: make(chan struct{}), dbPath: o.db}
 	if o.hc != nil {
@@ -86,6 +93,9 @@ func startSvc(t *testing.T, core *client.Client, o svcOpts) *svc {
 		Logf:          func(f string, a ...any) { t.Logf(f, a...) },
 		OnApply:       func(b *follow.Batch) { s.mu.Lock(); s.batch = append(s.batch, b); s.mu.Unlock() },
 		FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
+	}
+	for _, m := range mods {
+		m(&opt)
 	}
 	s.ix = must(index.Open(context.Background(), opt))
 	s.http = httptest.NewServer(s.ix.Handler())

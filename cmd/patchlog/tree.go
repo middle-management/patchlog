@@ -24,6 +24,7 @@ import (
 //
 //	patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME]
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]]
+//	              [-enc-key B64URL | -enc-key-file PATH]
 //
 // The service follows the catalog namespace and every namespace in its
 // catalog.trust. -bearer is its own grant, which needs read on all of them.
@@ -35,6 +36,10 @@ import (
 // immutable and tagged r:{ns}/{name} and ns:{ns}. Read-your-writes:
 // ?min={ns}:{ns_id}, repeatable. Cache purges are logged (no CDN purger is
 // wired in here).
+//
+// Encrypted namespaces (Addendum E) work as for patchlog index: -enc-key is
+// the service's X25519 private key; listings of a sealed or e2e catalog are
+// served sealed, and /_status reports what is skipped.
 func treeCmd(args []string) {
 	fs := flag.NewFlagSet("tree", flag.ExitOnError)
 	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")
@@ -52,6 +57,8 @@ func treeCmd(args []string) {
 	rebuild := fs.Bool("rebuild", false, "drop the database and replay from the beginning")
 	minWait := fs.Duration("min-wait", 2*time.Second, "how long ?min= waits for the service to catch up")
 	sse := fs.Bool("sse", false, "follow by server-sent events instead of long-poll")
+	encKey := fs.String("enc-key", "", "the service's X25519 private key (base64url), for sealed and e2e namespaces (Addendum E)")
+	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
 	fs.Parse(args)
 
 	if *cat == "" {
@@ -64,11 +71,13 @@ func treeCmd(args []string) {
 	if *author != "" {
 		copts = append(copts, client.WithAuthor(*author))
 	}
+	recipient := recipientKey("tree", *encKey, *encKeyFile)
+	copts = append(copts, client.WithKeys(client.NewKeys(recipient)))
 	c, err := client.New(*api, copts...)
 	if err != nil {
 		log.Fatal(err)
 	}
-	topt := tree.Options{Client: c, Catalog: *cat, DB: *db, Rebuild: *rebuild, SelfPlacing: *selfPlacing, MinWait: *minWait}
+	topt := tree.Options{Client: c, Catalog: *cat, DB: *db, Rebuild: *rebuild, SelfPlacing: *selfPlacing, MinWait: *minWait, Recipient: recipient}
 	if *sse {
 		topt.FollowOptions = append(topt.FollowOptions, follow.WithSSE())
 	}

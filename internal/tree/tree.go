@@ -21,10 +21,31 @@
 //
 // A Hook (the catalog of §B.11) can keep more derived tables in the same
 // transactions, and a RoleView can widen what a reader may see.
+//
+// Encrypted namespaces (Addendum E, package derived). Sealed (E2)
+// namespaces are followed with keys from POST /ns/{ns}/keys (the Client
+// must be built WithKeys; Recipient unwraps keys wrapped to the grant's
+// enc). An e2e (E3) catalog is followed only with a keyring Recipient key,
+// otherwise it is skipped (listings answer 503 "skipped"); an e2e content
+// namespace without one is still followed for its items' heads (plaintext
+// ids), but its documents are not read, so it contributes no implicit
+// placements. GET /_status reports each namespace's state and why any is
+// skipped. Listings of a sealed or e2e catalog are served sealed (see
+// Handler); content namespaces contribute only names, heads and structure,
+// which stay in the clear (§E.2.6).
+//
+// Stored plaintext. The database holds what the service derives from its
+// namespaces in the clear (titles, $parents, $access, and the catalog's
+// acl/effective tables), as the origin does at E2: it is protected only by
+// the service's own storage, which must be encrypted at least like the
+// core at E1. A purge or purge-ns deletes the derived rows (with
+// secure_delete on, and the WAL truncated after a purge), and a purge-ns
+// also drops the namespace's epoch keys from memory.
 package tree
 
 import (
 	"context"
+	"crypto/ecdh"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -36,6 +57,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
@@ -60,8 +82,14 @@ type Hook interface {
 // Options configure a Service.
 type Options struct {
 	// Client reads the core API. It needs read on the catalog and on every
-	// trusted content namespace (§C.6).
+	// trusted content namespace (§C.6). For sealed namespaces build it
+	// WithKeys (client.NewKeys(Recipient)); for a sealed catalog its grant
+	// must get epoch keys (read on the whole catalog), which seal listings.
 	Client *client.Client
+	// Recipient is the service's X25519 private key: it unwraps keys
+	// POST /keys wraps to the grant's enc, and makes e2e namespaces
+	// readable when their keyring names its public key (§E.3.2).
+	Recipient *ecdh.PrivateKey
 	// Catalog is the catalog namespace.
 	Catalog string
 	// DB is the SQLite database path.
@@ -100,6 +128,8 @@ type Service struct {
 	cps     follow.SQLCheckpoints
 	origin  string
 	checker *grantcheck.Checker
+	keys    *derived.Keys  // encryption of followed namespaces
+	sealed  *derived.Cache // sealed listings
 
 	wmu sync.Mutex // serialises applies across followers
 
@@ -143,12 +173,15 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tree: reading the core's origin: %w", err)
 	}
-	dsn := "file:" + opt.DB + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)"
+	// secure_delete: rows deleted by a purge are overwritten, not left in
+	// free pages (see the package doc).
+	dsn := "file:" + opt.DB + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	s := &Service{
+		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		cur:     map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
@@ -351,7 +384,20 @@ func (s *Service) follow(ctx context.Context, ns string) {
 	opts = append(opts, s.opt.FollowOptions...)
 	pause := time.Second
 	for {
-		err := follow.New(s.c, ns, s.cps, s, opts...).Run(ctx)
+		var err error
+		// Addendum E: never consume what can't be decrypted (or, for the
+		// catalog, whose listings can't be sealed); skip it and say why. A
+		// content namespace is followed for heads even if its e2e
+		// documents can't be read.
+		if reason, permanent := s.keys.Check(ctx, ns, ns != s.opt.Catalog); reason != "" {
+			if permanent {
+				s.opt.Logf("tree: skipping %s: %s", ns, reason)
+				return
+			}
+			err = fmt.Errorf("skipped: %s", reason)
+		} else {
+			err = follow.New(s.c, ns, s.cps, s, opts...).Run(ctx)
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -392,16 +438,25 @@ func (s *Service) Apply(ctx context.Context, b *follow.Batch) error {
 	for _, u := range b.Units {
 		if u.Config != nil {
 			cfg = u.Config
+			s.keys.Observe(b.NS, u.Config.Value)
 		}
 	}
 	var preps []prep
 	for _, ch := range co.Changes {
 		p := prep{name: ch.Resource, kind: ch.Kind, head: ch.Target, purged: ch.Purged}
 		if ch.Kind == "head" && (isCat || s.opt.SelfPlacing) {
-			doc, err := follow.FetchDoc(ctx, s.c, b.NS, ch.Resource, ch.Target)
+			doc, err := s.keys.FetchDoc(ctx, b.NS, ch.Resource, ch.Target, func(f client.Flag) {
+				s.opt.Logf("tree: %s/%s: revision %s by %s is flagged and left out: %s", b.NS, ch.Resource, f.ID, f.Author, f.Message)
+			})
 			switch {
 			case err == nil:
 				p.head, p.doc = doc.ID, doc.Value
+			case errors.Is(err, derived.ErrSkip) && !isCat:
+				// A live item whose document isn't readable content (an
+				// e2e keyring, or e2e without keys): no implicit placement.
+			case errors.Is(err, derived.ErrSkip):
+				// Not a catalog node (the keyring of an e2e catalog).
+				p.kind, p.head = "tombstone", ""
 			case errors.Is(err, follow.ErrNotLive) || client.IsGone(err) || client.IsNotFound(err):
 				// Gone since: a later entry says so too.
 				p.kind, p.head = "tombstone", ""
@@ -436,6 +491,22 @@ func (s *Service) Apply(ctx context.Context, b *follow.Batch) error {
 
 	if len(res.tags) > 0 {
 		s.opt.Purger.PurgeTags(res.tags)
+	}
+	purging := co.PurgedNS
+	for _, p := range preps {
+		purging = purging || p.purged
+	}
+	if purging {
+		// Sealed listings showing purged content go, and so do the purged
+		// rows' traces in the WAL (secure_delete zeroes the freed pages of
+		// the database itself).
+		s.sealed.DropNS(b.NS)
+		if _, err := s.db.ExecContext(context.WithoutCancel(ctx), `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			s.opt.Logf("tree: checkpointing the WAL after a purge: %v", err)
+		}
+	}
+	if co.PurgedNS {
+		s.keys.Forget(b.NS)
 	}
 	s.mu.Lock()
 	close(s.changed)

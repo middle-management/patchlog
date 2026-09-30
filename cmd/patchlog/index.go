@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/ecdh"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log"
@@ -14,19 +16,29 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/index"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // indexCmd runs the indexing service of Addendum A:
 //
 //	patchlog index [-api http://localhost:8080] [-db index.db] [-addr :8081] -ns matches,docs
 //	               [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
+//	               [-enc-key B64URL | -enc-key-file PATH]
 //
 // Results at /{ns}/at/{ns_id} are immutable and tagged idx:{ns} and
 // r:{ns}/{name} per hit; only the current checkpoint's results are kept.
 // Read-your-writes: ?min={ns_id} or ?min={ns}:{ns_id}, repeatable. Cache
 // purges are logged (no CDN purger is wired in here).
+//
+// Encrypted namespaces (Addendum E): sealed ones are read with keys from
+// POST /ns/{ns}/keys with -bearer's grant; -enc-key is the service's X25519
+// private key (base64url scalar), which unwraps keys wrapped to the grant's
+// enc and reads e2e namespaces whose keyring names its public key (logged
+// at start). Results over them are served sealed; see /_status for skipped
+// namespaces.
 func indexCmd(args []string) {
 	fs := flag.NewFlagSet("index", flag.ExitOnError)
 	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")
@@ -40,6 +52,8 @@ func indexCmd(args []string) {
 	untyped := fs.Bool("untyped-listing", true, "list untyped documents in plain listings (never in text/facet/sort queries)")
 	minWait := fs.Duration("min-wait", 2*time.Second, "how long ?min= waits for the index to catch up (§A.5)")
 	sse := fs.Bool("sse", false, "follow by server-sent events instead of long-poll")
+	encKey := fs.String("enc-key", "", "the service's X25519 private key (base64url), for sealed and e2e namespaces (Addendum E)")
+	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
 	fs.Parse(args)
 
 	var nss []string
@@ -58,6 +72,8 @@ func indexCmd(args []string) {
 	if *author != "" {
 		copts = append(copts, client.WithAuthor(*author))
 	}
+	recipient := recipientKey("index", *encKey, *encKeyFile)
+	copts = append(copts, client.WithKeys(client.NewKeys(recipient)))
 	c, err := client.New(*api, copts...)
 	if err != nil {
 		log.Fatal(err)
@@ -67,7 +83,7 @@ func indexCmd(args []string) {
 	defer stop()
 
 	opt := index.Options{Client: c, DB: *db, Namespaces: nss, Branches: *branches, Rebuild: *rebuild,
-		UntypedListing: *untyped, MinWait: *minWait}
+		UntypedListing: *untyped, MinWait: *minWait, Recipient: recipient}
 	if *sse {
 		opt.FollowOptions = append(opt.FollowOptions, followSSE())
 	}
@@ -107,3 +123,29 @@ func indexCmd(args []string) {
 }
 
 func followSSE() follow.Option { return follow.WithSSE() }
+
+// recipientKey parses the service's X25519 private key from -enc-key or
+// -enc-key-file (nil if neither is set) and logs its public JWK, which
+// goes into the service grant's enc and e2e keyrings.
+func recipientKey(svc, value, file string) *ecdh.PrivateKey {
+	var (
+		k   *ecdh.PrivateKey
+		err error
+	)
+	switch {
+	case value != "" && file != "":
+		log.Fatalf("%s: -enc-key and -enc-key-file are exclusive", svc)
+	case value != "":
+		k, err = derived.ParseRecipientKey(value)
+	case file != "":
+		k, err = derived.LoadRecipientKey(file)
+	default:
+		return nil
+	}
+	if err != nil {
+		log.Fatalf("%s: %v", svc, err)
+	}
+	jwk, _ := json.Marshal(seal.RecipientJWK(k.PublicKey()))
+	log.Printf("%s: recipient key %s (enc of the service grant, keyring recipient)", svc, jwk)
+	return k
+}

@@ -16,10 +16,32 @@
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
 // than one position in one document.
+//
+// Encrypted namespaces (Addendum E, package derived). A sealed (E2)
+// namespace is followed with keys from POST /ns/{ns}/keys (the Client must
+// be built WithKeys, and Recipient unwraps keys wrapped to the grant's
+// enc); an e2e (E3) namespace only with a keyring Recipient key, its
+// documents folded client-side (the keyring itself is never indexed).
+// Without keys a namespace is skipped: not followed, answered 503
+// "skipped", and reported with the reason at GET /_status. Results over a
+// sealed or e2e namespace are sealed under its current epoch key
+// (§E.2.5): see Handler.
+//
+// Stored plaintext. Full-text, facet and sort queries need the indexed
+// values in the clear, so the database holds plaintext derived from
+// sealed and e2e namespaces, as the origin itself does at E2: it is
+// protected only by the service's own storage (run it on encrypted disks,
+// like the core at E1), and it is exactly as long-lived as the source's
+// readability: a purge or purge-ns deletes the rows (with secure_delete on,
+// so freed pages are zeroed, and the WAL is truncated after a purge), and a
+// purge-ns also drops the namespace's epoch keys from memory. An e2e
+// namespace's rows are rows the operator could not read at the core; an
+// indexer over it must be run by a key holder.
 package index
 
 import (
 	"context"
+	"crypto/ecdh"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -30,6 +52,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
@@ -41,8 +64,14 @@ type Purger interface{ PurgeTags(tags []string) }
 // Options configure an Index.
 type Options struct {
 	// Client reads the core API; with a private namespace it needs a grant
-	// with read on it (§C.6 least privilege).
+	// with read on it (§C.6 least privilege). For sealed namespaces build it
+	// WithKeys (client.NewKeys(Recipient)); its grant must get epoch keys
+	// (read on the whole namespace), which seal the results.
 	Client *client.Client
+	// Recipient is the service's X25519 private key: it unwraps keys
+	// POST /keys wraps to the grant's enc, and makes e2e namespaces
+	// readable when their keyring names its public key (§E.3.2).
+	Recipient *ecdh.PrivateKey
 	// DB is the SQLite database path.
 	DB string
 	// Namespaces are the namespaces to follow (roots).
@@ -89,6 +118,8 @@ type Index struct {
 	checker *grantcheck.Checker
 	schemas *SchemaCache
 	roots   map[string]bool
+	keys    *derived.Keys  // encryption of followed namespaces
+	sealed  *derived.Cache // sealed results
 
 	wmu sync.Mutex // serialises Apply across followers
 
@@ -123,12 +154,15 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 	if err != nil {
 		return nil, fmt.Errorf("index: reading the core's origin: %w", err)
 	}
-	dsn := "file:" + opt.DB + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)"
+	// secure_delete: rows deleted by a purge are overwritten, not left in
+	// free pages (see the package doc).
+	dsn := "file:" + opt.DB + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
 	ix := &Index{
+		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		schemas: NewSchemaCache(opt.Client),
@@ -317,7 +351,18 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 	opts = append(opts, ix.opt.FollowOptions...)
 	pause := time.Second
 	for {
-		err := follow.New(ix.c, ns, ix.cps, ix, opts...).Run(ctx)
+		var err error
+		// Addendum E: never consume what can't be decrypted (or whose
+		// results can't be sealed); skip it and say why.
+		if reason, permanent := ix.keys.Check(ctx, ns, false); reason != "" {
+			if permanent {
+				ix.opt.Logf("index: skipping %s: %s", ns, reason)
+				return
+			}
+			err = fmt.Errorf("skipped: %s", reason)
+		} else {
+			err = follow.New(ix.c, ns, ix.cps, ix, opts...).Run(ctx)
+		}
 		if ctx.Err() != nil {
 			return
 		}
@@ -355,6 +400,11 @@ type prepared struct {
 // transaction, so a batch entry is never half-applied (§10).
 func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	co := b.Coalesce()
+	for _, u := range b.Units {
+		if u.Config != nil {
+			ix.keys.Observe(b.NS, u.Config.Value)
+		}
+	}
 	var preps []prepared
 	for _, ch := range co.Changes {
 		p := prepared{resource: ch.Resource, purged: ch.Purged}
@@ -363,9 +413,11 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			preps = append(preps, p)
 			continue
 		}
-		doc, err := follow.FetchDoc(ctx, ix.c, b.NS, ch.Resource, ch.Target)
+		doc, err := ix.keys.FetchDoc(ctx, b.NS, ch.Resource, ch.Target, func(f client.Flag) {
+			ix.opt.Logf("index: %s/%s: revision %s by %s is flagged and left out: %s", b.NS, ch.Resource, f.ID, f.Author, f.Message)
+		})
 		if err != nil {
-			if errors.Is(err, follow.ErrNotLive) || client.IsGone(err) || client.IsNotFound(err) {
+			if errors.Is(err, derived.ErrSkip) || errors.Is(err, follow.ErrNotLive) || client.IsGone(err) || client.IsNotFound(err) {
 				// Gone since: a later entry of the log says so too.
 				p.remove = true
 				preps = append(preps, p)
@@ -420,6 +472,22 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	purging := co.PurgedNS
+	for _, p := range preps {
+		purging = purging || p.purged
+	}
+	if purging {
+		// Sealed results showing purged content go, and so do its
+		// plaintext rows' traces in the WAL (secure_delete zeroes the
+		// freed pages of the database itself).
+		ix.sealed.DropNS(b.NS)
+		if _, err := ix.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			ix.opt.Logf("index: checkpointing the WAL after a purge: %v", err)
+		}
+	}
+	if co.PurgedNS {
+		ix.keys.Forget(b.NS)
 	}
 
 	ix.mu.Lock()
