@@ -283,7 +283,6 @@ func (p *parser) str() (string, error) {
 
 func (p *parser) number() (any, error) {
 	start := p.i
-	integer := true
 	if p.b[p.i] == '-' {
 		p.i++
 	}
@@ -301,14 +300,12 @@ func (p *parser) number() (any, error) {
 		return nil, p.err("invalid number")
 	}
 	if p.i < len(p.b) && p.b[p.i] == '.' {
-		integer = false
 		p.i++
 		if digits() == 0 {
 			return nil, p.err("invalid number")
 		}
 	}
 	if p.i < len(p.b) && (p.b[p.i] == 'e' || p.b[p.i] == 'E') {
-		integer = false
 		p.i++
 		if p.i < len(p.b) && (p.b[p.i] == '+' || p.b[p.i] == '-') {
 			p.i++
@@ -322,10 +319,19 @@ func (p *parser) number() (any, error) {
 	if err != nil || math.IsInf(f, 0) || math.IsNaN(f) {
 		return nil, &SyntaxError{Offset: start, Msg: "number out of range"}
 	}
-	if integer && math.Abs(f) > MaxSafeInteger {
+	if UnsafeInteger(f) {
 		return nil, &SyntaxError{Offset: start, Msg: "integer outside ±(2^53−1)"}
 	}
 	return f, nil
+}
+
+// UnsafeInteger reports whether f's canonical form (JCS) is an integer
+// literal outside ±(2^53−1): an integral value with 2^53 ≤ |f| < 10^21,
+// however it was written (§3.1). Larger values serialise with an exponent
+// and are accepted, so a stored patch set is always accepted again.
+func UnsafeInteger(f float64) bool {
+	a := math.Abs(f)
+	return a > MaxSafeInteger && a < 1e21 && a == math.Trunc(a)
 }
 
 // Canonical returns the RFC 8785 (JCS) serialisation of v, UTF-8 encoded.

@@ -2,6 +2,7 @@ package jsonv
 
 import (
 	"math"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -61,6 +62,9 @@ func TestParseRejects(t *testing.T) {
 		`1e400`,
 		`9007199254740992`,
 		`-9007199254740992`,
+		`1e17`, // canonical form 100000000000000000
+		`9.007199254740992e15`,
+		`123456789012345678901e-1`, // 12345678901234567000 (integral)
 		`NaN`,
 		`[1,]`,
 		`01`,
@@ -73,7 +77,7 @@ func TestParseRejects(t *testing.T) {
 			t.Errorf("Parse(%q) accepted", s)
 		}
 	}
-	good := []string{`9007199254740991`, `1e300`, `-0`, `"😀"`, ` {"a":[1,{"b":null}]} `}
+	good := []string{`9007199254740991`, `1e300`, `1e21`, `1000000000000000000000`, `9007199254740993.5e-1`, `-0`, `"😀"`, ` {"a":[1,{"b":null}]} `}
 	for _, s := range good {
 		if _, err := Parse([]byte(s)); err != nil {
 			t.Errorf("Parse(%q): %v", s, err)
@@ -89,5 +93,25 @@ func TestEqual(t *testing.T) {
 	}
 	if Equal(MustParse([]byte(`[1,2]`)), MustParse([]byte(`[2,1]`))) {
 		t.Error("arrays are ordered")
+	}
+}
+
+// §3.1: whatever passes the range check round-trips through its canonical
+// form, so a stored patch set is always accepted again.
+func TestCanonicalRoundTripRange(t *testing.T) {
+	r := rand.New(rand.NewPCG(1, 2))
+	for i := 0; i < 200000; i++ {
+		f := math.Float64frombits(r.Uint64())
+		if math.IsNaN(f) || math.IsInf(f, 0) {
+			continue
+		}
+		if i%3 == 0 { // integral values near and beyond 2^53
+			f = math.Trunc(math.Ldexp(r.Float64(), 40+r.IntN(40)))
+		}
+		lit := FormatNumber(f)
+		_, err := Parse([]byte(lit))
+		if (err == nil) == UnsafeInteger(f) {
+			t.Fatalf("%v (%s): parse err %v, unsafe %v", f, lit, err, UnsafeInteger(f))
+		}
 	}
 }
