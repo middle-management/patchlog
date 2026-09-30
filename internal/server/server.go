@@ -784,8 +784,15 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	lim := s.e.Limits()
-	body, err := readJSON(r, lim.BatchSize+lim.BatchSize/4+(1<<20))
+	// Batch limits depend on the principal (§6.6): authenticate first, then
+	// stop reading a body larger than that principal's batchSize (§7.5).
+	req := core.Request{NS: ns, Cred: creds(r)}
+	max, err := s.e.BatchBodyLimit(r.Context(), req)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	body, err := readJSON(r, max)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -796,7 +803,7 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dry := r.URL.Query().Get("dry-run") == "1"
-	res, err := s.e.Batch(r.Context(), core.Request{NS: ns, Cred: creds(r)}, items, cc, source, dry)
+	res, err := s.e.Batch(r.Context(), req, items, cc, source, dry)
 	if err != nil {
 		writeErr(w, err)
 		return

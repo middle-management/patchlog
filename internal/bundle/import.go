@@ -228,7 +228,7 @@ type TooLargeError struct {
 func (e *TooLargeError) Error() string {
 	return fmt.Sprintf("import: the atomic batch into %s (%d items, %d bytes of patch sets) is over the namespace's batch limits (%v). "+
 		"An import that must land at once runs as one batch under an allowance (§6.6): an administrator adds "+
-		`{"sub", "kid", "rate", "burst", "itemsPerBatch", "batchSize"} for the importer's principal to /allowances of %s. `+
+		`{"sub", "kid", "bucket": {"rate", "burst"}, "itemsPerBatch", "batchSize"} for the importer's principal to /allowances of %s. `+
 		"Otherwise import in backfill mode (-pace), which splits the import into batches that fit and is not atomic.",
 		e.NS, e.Items, e.Size, e.Err, e.NS)
 }

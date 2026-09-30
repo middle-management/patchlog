@@ -42,7 +42,7 @@ func (a *actor) envelope() any {
 
 // authenticate verifies credentials against the configuration in force in
 // namespace n (§C.2 item 1). keysOverride replaces the namespace's keys, for
-// namespace creation with operator keys.
+// namespace creation with operator keys (then n and cfg may be nil).
 func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials, keysOverride []grant.Key) (*actor, *Error) {
 	if t.e.opt.AuthDisabled {
 		name := cred.Author
@@ -51,6 +51,18 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 		}
 		return &actor{principal: grant.Principal{ID: name}, star: true, bucketKey: name}, nil
 	}
+	g, err := t.decodeGrant(nsName, cred)
+	if err != nil {
+		return nil, err
+	}
+	return t.verifyGrant(g, nsName, n, cfg, keysOverride)
+}
+
+// decodeGrant decodes a bearer grant and checks, before anything is
+// verified or looked up, that every block carrying ns names the namespace
+// (§C.2, §7): 401 without a parseable grant, 403 when it doesn't name the
+// namespace, whether or not the namespace exists.
+func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error) {
 	if cred.Bearer == "" {
 		return nil, apiErr(401, "unauthenticated", "message", "missing grant")
 	}
@@ -61,21 +73,31 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 	if err != nil {
 		return nil, authErr(err)
 	}
+	if !g.NamesNS(nsName) {
+		return nil, nsNotNamed(nsName)
+	}
+	return g, nil
+}
+
+func nsNotNamed(ns string) *Error {
+	return forbidden(fmt.Sprintf("the grant does not apply to namespace %q", ns))
+}
+
+// verifyGrant verifies a decoded grant against namespace n's configuration
+// in force, or against keysOverride (operator keys).
+func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, keysOverride []grant.Key) (*actor, *Error) {
 	env := grant.Env{
 		Now:           t.now,
+		NS:            nsName,
 		ValidateAttrs: validateAttrs,
 	}
 	if keysOverride != nil {
-		// Operator grants (§C.4 bootstrapping) name the namespace they
-		// create, or "*".
-		env.NS = "*"
-		if contains(g.Blocks[0].NS, nsName) {
-			env.NS = nsName
-		}
+		// Operator grants (§C.4 bootstrapping) name the namespace, which
+		// may not exist yet, or "*".
 		env.Keys = keysOverride
+		env.Operator = true
 		env.Revoked = map[string]bool{}
 	} else {
-		env.NS = n.name
 		env.Keys = t.effectiveKeys(n, cfg)
 		env.Revoked = t.effectiveRevoked(n, cfg)
 		env.Roles = cfg.Roles
@@ -91,6 +113,29 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate}
 	a.bucketKey = v.Principal.ID + "\x00" + v.Key.Kid
 	return a, nil
+}
+
+// absentNS answers a request to a namespace that doesn't exist exactly as
+// one to an existing namespace whose read isn't public (§7), so existence
+// is not revealed: 401 without a usable grant, 403 for a grant that
+// doesn't name the namespace. A grant naming it can only be usable if an
+// operator key signed it (§C.4): then the answer is 404, otherwise 401,
+// since no key of the namespace can verify it.
+func (t *tx) absentNS(nsName string, cred Credentials) *Error {
+	if t.e.opt.AuthDisabled {
+		return notFound()
+	}
+	g, err := t.decodeGrant(nsName, cred)
+	if err != nil {
+		return err
+	}
+	if _, ok := findKey(t.e.opt.OperatorKeys, g.Blocks[0].Kid); !ok {
+		return apiErr(401, "unauthenticated", "message", "no key can verify the grant")
+	}
+	if _, err := t.verifyGrant(g, nsName, nil, nil, t.e.opt.OperatorKeys); err != nil {
+		return err
+	}
+	return notFound()
 }
 
 func authErr(err error) *Error {
@@ -186,15 +231,18 @@ func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
 	return out
 }
 
-// checkAt resolves a key's requireAt (§C.4): the grant's at must be an ns_id
-// in the named chain; the lag is how long it has not been the head.
-func (t *tx) checkAt(n *nsRow) func(requireAt any, at any) (time.Duration, error) {
-	return func(requireAt any, at any) (time.Duration, error) {
+// checkAt resolves a key's requireAt (§C.4): the grant's at must be an
+// ns_id in the named chain, and must have been that namespace's head at
+// some point within maxLag before the grant was issued (or later). maxLag
+// is the target namespace's (default 60 seconds), or the key's when that
+// is stricter.
+func (t *tx) checkAt(n *nsRow) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
+	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := n
 		if s, ok := requireAt.(string); ok {
 			target = t.nsByName(s)
 			if target == nil {
-				return 0, fmt.Errorf("unknown namespace %q", s)
+				return fmt.Errorf("unknown namespace %q", s)
 			}
 		}
 		var idText string
@@ -204,29 +252,28 @@ func (t *tx) checkAt(n *nsRow) func(requireAt any, at any) (time.Duration, error
 		case map[string]any:
 			ns, _ := x["ns"].(string)
 			if ns != target.name {
-				return 0, fmt.Errorf("at names another namespace")
+				return fmt.Errorf("at names another namespace")
 			}
 			idText, _ = x["id"].(string)
 		}
 		id, err := ids.Parse(idText)
 		if err != nil {
-			return 0, fmt.Errorf("malformed at")
+			return fmt.Errorf("malformed at")
 		}
 		seq, ok := t.nsLogSeq(target.id, id)
 		if !ok {
-			return 0, fmt.Errorf("at is not in the chain of %s", target.name)
+			return fmt.Errorf("at is not in the chain of %s", target.name)
 		}
-		var lag time.Duration
-		var next int64
-		if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&next); err == nil {
-			lag = t.now.Sub(time.UnixMilli(next)) // how long at has not been the head
+		var nextMs int64
+		if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&nextMs); err != nil {
+			return nil // at is still the head
 		}
-		// The namespace named by requireAt bounds the lag with its own
-		// maxLag (§C.4, §B.11.3). A key-level maxLag is a stricter override.
-		if ml := t.config(target.configSeq).MaxLag; ml != nil && lag > *ml {
-			return lag, fmt.Errorf("at is older than %s's maxLag", target.name)
+		next := time.UnixMilli(nextMs)
+		lag := grant.EffectiveMaxLag(t.config(target.configSeq).MaxLag, keyMaxLag)
+		if !grant.HeadWithin(&next, issued, lag) {
+			return fmt.Errorf("at was not the head of %s within maxLag (%s) before the grant was issued", target.name, lag)
 		}
-		return lag, nil
+		return nil
 	}
 }
 
@@ -370,18 +417,31 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 }
 
 // reader authenticates a read request, if it carries credentials, and
-// decides access. It answers 404 rather than 403 so existence is not
-// revealed (§7).
+// decides access. A grant that doesn't name the namespace is 403 (§7), as
+// for a namespace that doesn't exist, except that public namespaces ignore
+// it and answer as to an unauthenticated request; other refusals answer
+// 404 rather than 403 so existence is not revealed.
 func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
-	if cred.Bearer != "" || t.e.opt.AuthDisabled {
-		var err *Error
-		a, err = t.authenticate(n.name, n, cfg, cred, nil)
-		if err != nil && cfg.Read != "public" {
-			if err.Status == 401 {
-				return nil, err
-			}
+	if t.e.opt.AuthDisabled {
+		a, _ = t.authenticate(n.name, n, cfg, cred, nil)
+	} else if cred.Bearer != "" {
+		g, err := t.decodeGrant(n.name, cred)
+		if err == nil {
+			a, err = t.verifyGrant(g, n.name, n, cfg, nil)
+		}
+		switch {
+		case err == nil:
+		case cfg.Read == "public":
+			// Public content doesn't need the grant: one that is unusable,
+			// or doesn't name the namespace, is ignored.
+			a = nil
+		case g == nil && err.Status == 403:
+			return nil, err // not named
+		case err.Status == 401 || err.Status == 413:
+			return nil, err
+		default:
 			return nil, notFound()
 		}
 	}
@@ -517,7 +577,7 @@ func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
 }
 
 // guardedPaths need a grant chained to a * key (§7.4).
-var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/retention", "/encryption"}
+var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption"}
 
 func touchesGuarded(writes []string) bool {
 	for _, w := range writes {

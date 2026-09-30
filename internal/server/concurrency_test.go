@@ -210,7 +210,7 @@ func TestRaceRevocationAndKeys(t *testing.T) {
 		h.arm(func() {
 			expect(t, e.patchNS("sec", ops(op("add", "/revoked", []any{revocationID(t, victim, 0)})), f.adminG), 201)
 		})
-		expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/x", 1.0)), victim), 403, "forbidden")
+		expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/x", 1.0)), victim), 401, "unauthenticated")
 		if e.head("sec", "a", f.adminG) != a {
 			t.Fatal("a refused write moved the head")
 		}
@@ -221,7 +221,7 @@ func TestRaceRevocationAndKeys(t *testing.T) {
 		h.arm(func() {
 			expect(t, e.patchNS("sec", ops(op("add", "/revoked/-", revocationID(t, victim2, 0))), f.adminG), 201)
 		})
-		expectCode(t, e.write("PATCH", "sec-b", "a", a, ops(op("add", "/x", 1.0)), victim2), 403, "forbidden")
+		expectCode(t, e.write("PATCH", "sec-b", "a", a, ops(op("add", "/x", 1.0)), victim2), 401, "unauthenticated")
 
 		// Keys follow the base: the issuer key is removed from the base.
 		cfg := e.get("/ns/sec/rev/"+e.nsHead("sec", f.adminG), f.adminG).Obj()

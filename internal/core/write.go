@@ -145,6 +145,10 @@ type itemState struct {
 	view   *view
 	parent *revRow // the head the precondition matched; nil for a create
 	steps  []*stepState
+	// cands are the candidate verbs of an item whose first step is a patch
+	// set under If-Match: those of append and restore that passed step 1
+	// (§6.2). Nil for any other item, whose verbs are known from the request.
+	cands []string
 }
 
 // itemErr is a failure of one item at one step.
@@ -215,6 +219,49 @@ func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *Conf
 	return e.writeOptimistic(ctx, req, items, source, true)
 }
 
+// batchLimits are a principal's batch limits in a configuration: the
+// namespace's, or its allowance's (§6.6).
+func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
+	items, size = cfg.Limits.ItemsPerBatch, cfg.Limits.BatchSize
+	if al := t.allowanceOf(cfg, a); al != nil {
+		if al.ItemsPerBatch > 0 {
+			items = al.ItemsPerBatch
+		}
+		if al.BatchSize > 0 {
+			size = al.BatchSize
+		}
+	}
+	return items, size
+}
+
+// BatchBodyLimit authenticates a batch request and returns how many bytes
+// of body the server reads for it: the principal's batchSize (§6.6), plus
+// room for the batch's own JSON (items, preconditions, an optional config
+// change). A larger body is refused with 413 without reading the rest,
+// which reveals nothing about any item (§7.5). The batch itself
+// authenticates again.
+func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (int, error) {
+	var limit int
+	err := e.read(ctx, func(t *tx) error {
+		n := t.nsByName(req.NS)
+		if n == nil {
+			return t.absentNS(req.NS, req.Cred)
+		}
+		if n.purged {
+			return gone()
+		}
+		cur := t.config(n.configSeq)
+		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)
+		if aerr != nil {
+			return aerr
+		}
+		items, size := t.batchLimits(cur, a)
+		limit = size + size/4 + 512*items + cur.Limits.PatchSetSize + 64<<10
+		return nil
+	})
+	return limit, err
+}
+
 // asErr converts an *Error into error without the typed-nil trap.
 func asErr(e *Error) error {
 	if e == nil {
@@ -251,13 +298,12 @@ type writePlan struct {
 func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
 	n := t.nsByName(req.NS)
 	if n == nil {
-		return nil, nil, notFound()
+		return nil, nil, t.absentNS(req.NS, req.Cred)
 	}
 	if n.purged {
 		return nil, nil, gone()
 	}
 	cur := t.config(n.configSeq)
-	lim := cur.Limits
 	if isBatch {
 		seen := map[string]bool{}
 		for i, it := range items {
@@ -281,33 +327,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	if aerr != nil {
 		return nil, nil, aerr
 	}
-	if isBatch {
-		// The batch limits come from the current configuration, raised by
-		// the principal's allowance if it has one (§6.6).
-		maxItems, maxSize := lim.ItemsPerBatch, lim.BatchSize
-		if al := t.allowanceOf(cur, a); al != nil {
-			if al.ItemsPerBatch > 0 {
-				maxItems = al.ItemsPerBatch
-			}
-			if al.BatchSize > 0 {
-				maxSize = al.BatchSize
-			}
-		}
-		if len(items) > maxItems {
-			return nil, nil, limitErr(413, fmt.Sprintf("more than %d items", maxItems))
-		}
-		size := 0
-		for _, it := range items {
-			for _, s := range it.Steps {
-				if !s.Delete {
-					size += len(jsonv.Canonical(s.Patches))
-				}
-			}
-		}
-		if size > maxSize {
-			return nil, nil, limitErr(413, "batch too large")
-		}
-	}
+	// The batch limits come from the current configuration, raised by the
+	// principal's allowance if it has one (§6.6), and are checked at step 4
+	// (§7.5).
+	maxItems, maxSize := t.batchLimits(cur, a)
 
 	// The optional config change runs steps 1–6 first (§7.5).
 	st := make([]*itemState, len(items))
@@ -325,7 +348,27 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	authorizeItems := func(a *actor) []itemErr {
 		var fs []itemErr
 		for _, s := range st {
+			s.cands = nil
 			for j := range s.Steps {
+				if j == 0 && hasCandidates(s.Item) {
+					// Append or restore, which only the resource's state
+					// decides: both are tried, and step 2 settles it (§6.2).
+					var first *Error
+					for _, verb := range []string{"append", "restore"} {
+						if err := t.authorize(a, verb, s.Resource); err != nil {
+							if first == nil {
+								first = err
+							}
+							continue
+						}
+						s.cands = append(s.cands, verb)
+					}
+					if len(s.cands) == 0 {
+						fs = append(fs, itemErr{s.index, first})
+						break
+					}
+					continue
+				}
 				if err := t.authorize(a, staticVerb(s.Item, j), s.Resource); err != nil {
 					fs = append(fs, itemErr{s.index, err})
 					break
@@ -380,9 +423,32 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 
-	// Step 2: precondition — idempotent retry, frozen, the precondition.
+	// Step 2: precondition — idempotent retry, settling the verb, frozen,
+	// the precondition.
 	if r := t.replay(n, a, st, cplan, isBatch); r != nil {
 		return nil, r, nil
+	}
+	// Settling the verb completes authorisation: a 403 here is reported
+	// like one of step 1, and a dry run answers it as a submit would
+	// (§6.2, §7.5). It runs for every item before anything else of step 2.
+	var denied []itemErr
+	for _, s := range st {
+		if err := t.settle(n, s); err != nil {
+			if err.Status == 403 {
+				denied = append(denied, itemErr{s.index, err})
+			} else {
+				fs = append(fs, itemErr{s.index, err})
+			}
+		}
+	}
+	if len(denied) > 0 {
+		return nil, nil, fail(denied)
+	}
+	if len(fs) > 0 {
+		if !dryRun {
+			return nil, nil, fail(fs)
+		}
+		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 	if cur.Frozen && len(items) > 0 {
 		e := apiErr(409, "frozen")
@@ -432,7 +498,24 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
-	// Step 4: limits.
+	// Step 4: limits. The batch's item count and size first: they are the
+	// batch's, not an item's.
+	if isBatch {
+		if len(items) > maxItems {
+			return nil, nil, limitErr(413, fmt.Sprintf("more than %d items", maxItems))
+		}
+		size := 0
+		for _, it := range items {
+			for _, s := range it.Steps {
+				if !s.Delete {
+					size += len(jsonv.Canonical(s.Patches))
+				}
+			}
+		}
+		if size > maxSize {
+			return nil, nil, limitErr(413, "batch too large")
+		}
+	}
 	for _, s := range st {
 		if err := checkLimits(cfg.Limits, s); err != nil {
 			fs = append(fs, itemErr{s.index, err})
@@ -523,7 +606,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	n, a, st, cplan, src, isBatch, result := p.n, p.a, p.st, p.cplan, p.src, p.isBatch, p.result
 	// Step 7: insert atomically with the namespace entry.
-	author := t.authorID(a.id())
+	author := t.actorID(a)
 	configSeq := n.configSeq
 	var entries []any
 	if cplan != nil {
@@ -572,9 +655,44 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	return result
 }
 
-// staticVerb is the verb of step j known before looking at state. The
-// first patch step of an If-Match item is authorised as append; whether it
-// is a restore is checked at step 6 (§6.2).
+// hasCandidates reports whether an item's first step may be an append or a
+// restore, which only the resource's state decides (§6.2).
+func hasCandidates(it Item) bool {
+	return it.IfMatch != "" && !it.IfNoneMatch && len(it.Steps) > 0 && !it.Steps[0].Delete
+}
+
+// settle is the second sub-step of step 2 (§6.2): it settles the verb of
+// an item with candidate verbs from the resource's state as the writer sees
+// it (a branch's view, read-through included), and refuses one that isn't
+// a candidate with 403, before the precondition is compared.
+func (t *tx) settle(n *nsRow, s *itemState) *Error {
+	if s.cands == nil {
+		return nil
+	}
+	verb := "append"
+	switch t.resolve(n, s.Resource, nil).state {
+	case Purged:
+		return gone()
+	case Tombstoned:
+		verb = "restore"
+	}
+	if !contains(s.cands, verb) {
+		return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
+	}
+	return nil
+}
+
+// entryVerb is the verb an entry was written with: restore when its parent
+// is a tombstone, append otherwise (§6.2).
+func (t *tx) entryVerb(row *revRow) string {
+	if row.parentSeq.Valid && t.rev(row.parentSeq.Int64).kind == kindTombstone {
+		return "restore"
+	}
+	return "append"
+}
+
+// staticVerb is the verb of step j known from the request. The first patch
+// step of an If-Match item has candidate verbs instead (hasCandidates).
 func staticVerb(it Item, j int) string {
 	s := it.Steps[j]
 	if s.Delete {
@@ -625,7 +743,7 @@ func expectedIDs(it Item) ([]ids.ID, bool) {
 
 // replay implements the idempotent-retry lookup (§7.2, §7.5).
 func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
-	author := t.authorID(a.id())
+	author := t.actorID(a)
 	if !isBatch {
 		if len(st) != 1 {
 			return nil
@@ -643,6 +761,9 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
 		if err != nil || row.author != author {
 			return nil
+		}
+		if s.cands != nil && !contains(s.cands, t.entryVerb(row)) {
+			return nil // recorded with a verb this request may not use
 		}
 		var nsSeq int64
 		t.QueryRow(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, own.id, row.seq).Scan(&nsSeq)
@@ -688,6 +809,9 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		t.must(rows.Scan(&id, &body))
 		b := jsonv.MustParse([]byte(body)).(map[string]any)
 		if string(jsonv.Canonical(b["entries"])) == want {
+			if !t.candidateVerbsMatch(n, st) {
+				return nil
+			}
 			r := &WriteResult{Status: 200, Replayed: true, NSID: ids.FromBytes(id).String(), Items: items}
 			if cp != nil {
 				r.ConfigID = cp.expected.String()
@@ -696,6 +820,26 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		}
 	}
 	return nil
+}
+
+// candidateVerbsMatch reports whether every item with candidate verbs
+// recorded its first entry with one of them (§7.5 idempotent retry).
+func (t *tx) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
+	for _, s := range st {
+		if s.cands == nil {
+			continue
+		}
+		want, ok := expectedIDs(s.Item)
+		own := t.resource(n.id, s.Resource)
+		if !ok || own == nil {
+			return false
+		}
+		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, want[0][:]))
+		if err != nil || !contains(s.cands, t.entryVerb(row)) {
+			return false
+		}
+	}
+	return true
 }
 
 // precondition is step 2 for one item (§7.2, §7.6 first writes).
@@ -1001,6 +1145,21 @@ func (t *tx) checkSource(v any) (any, *Error) {
 		return nil, invalid("source.at is not in the chain of source.ns")
 	}
 	return m, nil
+}
+
+// actorID is authorID for an actor. Under a grant it also remembers the key
+// that signed the root block, which the namespace entries this transaction
+// writes for that author record (§F.3: merge tools and the janitor match
+// author and kid against merge.authors).
+func (t *tx) actorID(a *actor) int64 {
+	id := t.authorID(a.id())
+	if a.verified != nil && id >= 0 {
+		if t.kids == nil {
+			t.kids = map[int64]string{}
+		}
+		t.kids[id] = a.verified.Key.Kid
+	}
+	return id
 }
 
 // storeGrant records the non-bearer form of the actor's grant (§C.3).

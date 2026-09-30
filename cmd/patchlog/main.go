@@ -3,7 +3,10 @@
 //	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
-//	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}'
+//	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
+//	patchlog grant seal -grant TOKEN
+//
+// Grants are Biscuit v3 tokens (§C.8).
 package main
 
 import (
@@ -66,8 +69,9 @@ func usage() {
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]]
   patchlog keygen
-  patchlog grant mint -key SEED -block JSON
-  patchlog grant narrow -grant TOKEN -block JSON
+  patchlog grant mint -key SEED -block JSON [-seal]
+  patchlog grant narrow -grant TOKEN -block JSON [-seal]
+  patchlog grant seal -grant TOKEN      (grants are Biscuit v3 tokens)
   patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
   patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing]
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
@@ -242,15 +246,21 @@ func grantCmd(args []string) {
 	}
 	fs := flag.NewFlagSet("grant", flag.ExitOnError)
 	key := fs.String("key", "", "signing key seed (base64url)")
-	tok := fs.String("grant", "", "grant to narrow")
+	tok := fs.String("grant", "", "grant to narrow or seal (a Biscuit token)")
 	block := fs.String("block", "", "block JSON")
+	sealIt := fs.Bool("seal", false, "seal the result, so nobody can narrow it further (§C.8)")
 	fs.Parse(args[1:])
-	b, err := jsonv.Parse([]byte(*block))
-	m, ok := b.(map[string]any)
-	if err != nil || !ok {
-		log.Fatalf("-block must be a JSON object: %v", err)
+	var m map[string]any
+	if args[0] != "seal" {
+		b, err := jsonv.Parse([]byte(*block))
+		var ok bool
+		m, ok = b.(map[string]any)
+		if err != nil || !ok {
+			log.Fatalf("-block must be a JSON object: %v", err)
+		}
 	}
 	var g *grant.Grant
+	var err error
 	switch args[0] {
 	case "mint":
 		priv, err := grant.ParsePrivateKey(*key)
@@ -261,17 +271,25 @@ func grantCmd(args []string) {
 		if err != nil {
 			log.Fatal(err)
 		}
-	case "narrow":
-		parent, err := grant.Decode(*tok, 0)
+	case "narrow", "seal":
+		g, err = grant.Decode(*tok, 0)
 		if err != nil {
 			log.Fatal(err)
 		}
-		g, err = parent.Narrow(m)
-		if err != nil {
-			log.Fatal(err)
+		if args[0] == "narrow" {
+			if g, err = g.Narrow(m); err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			*sealIt = true
 		}
 	default:
 		usage()
+	}
+	if *sealIt {
+		if g, err = g.Seal(); err != nil {
+			log.Fatal(err)
+		}
 	}
 	fmt.Println(g.Encode())
 }

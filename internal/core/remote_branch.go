@@ -545,7 +545,7 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 		if err != nil {
 			return err
 		}
-		r, err := t.insertRemoteBranch(req, cc, cfg, doc, m, t.authorID(a.id()))
+		r, err := t.insertRemoteBranch(req, cc, cfg, doc, m, t.actorID(a))
 		res = r
 		return asErr(err)
 	})

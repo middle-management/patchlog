@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sort"
 	"sync"
@@ -63,7 +64,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
-			return notFound()
+			return t.absentNS(ns, cred)
 		}
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
@@ -113,7 +114,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
-			return notFound()
+			return t.absentNS(ns, cred)
 		}
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
@@ -212,7 +213,7 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
-			return notFound()
+			return t.absentNS(ns, cred)
 		}
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
@@ -318,7 +319,7 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
-			return notFound()
+			return t.absentNS(ns, cred)
 		}
 		if _, err := t.reader(n, cred, ""); err != nil {
 			return err
@@ -342,7 +343,7 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
-			return notFound()
+			return t.absentNS(ns, cred)
 		}
 		if _, err := t.reader(n, cred, ""); err != nil {
 			return err
@@ -394,7 +395,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
-			return notFound()
+			return t.absentNS(ns, cred)
 		}
 		if _, err := t.reader(n, cred, ""); err != nil {
 			return err
@@ -420,7 +421,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
-		q := `SELECT seq, id, prev_seq, body, author, created FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		q := `SELECT seq, id, prev_seq, body, author, created, kid FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {
 			q += ` LIMIT ?`
@@ -435,11 +436,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			body    string
 			author  int64
 			created int64
+			kid     sql.NullString
 		}
 		var rs []raw
 		for rows.Next() {
 			var r raw
-			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created))
+			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.kid))
 			rs = append(rs, r)
 		}
 		rows.Close()
@@ -453,6 +455,10 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			m["author"] = t.authorName(r.author)
 			m["created"] = formatTime(r.created)
+			if r.kid.Valid {
+				// Not part of the hashed entry, like author and created.
+				m["kid"] = r.kid.String
+			}
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)
 		}
@@ -508,7 +514,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
-			return notFound()
+			return t.absentNS(ns, cred)
 		}
 		if _, err := t.reader(n, cred, ""); err != nil {
 			return err
@@ -553,7 +559,7 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
-			return notFound()
+			return t.absentNS(ns, cred)
 		}
 		if _, err := t.reader(n, cred, ""); err != nil {
 			return err

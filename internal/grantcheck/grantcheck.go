@@ -8,8 +8,12 @@
 //     its base is accepted only while the base's current document still has
 //     it with the same pub, recursively;
 //   - revocations of the namespace and, for a branch, of every base;
+//   - the order of §C.2: a grant not naming the namespace is 403 before
+//     anything else; no usable grant (malformed, unknown key, bad
+//     signature, revoked, expired, not yet valid) is 401;
 //   - key scopes, including attrs (validated with internal/rules as the
-//     core does) and requireAt/maxLag (checked against the named chain);
+//     core does) and requireAt/maxLag (checked against the named chain,
+//     relative to the grant's issuance, default maxLag 60 seconds);
 //   - read decisions: the grant allows read and its key-scope, block and
 //     role rules pass against a read envelope
 //     { action: "read", resource?, principal, now } (§C.2 item 5).
@@ -319,9 +323,12 @@ func findKey(ks []grant.Key, kid string) (grant.Key, bool) {
 }
 
 // Verify decodes and verifies a bearer token for namespace ns against its
-// configuration at the head. Grant failures are *grant.AuthError (Status
-// 401 for a malformed token, unknown key or bad root signature; 403
-// otherwise); other errors are fetch failures.
+// configuration at the head, in the core's order (§C.2, §7): a grant that
+// doesn't name ns is 403 before the namespace is consulted; then 401 when
+// there is no usable grant (malformed, unknown key, bad signature, revoked,
+// expired or not yet valid, or a namespace that doesn't exist); 403 when a
+// valid grant's key scope refuses it. Grant failures are *grant.AuthError;
+// other errors are fetch failures.
 func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verified, error) {
 	if token == "" {
 		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
@@ -333,7 +340,13 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 	if err != nil {
 		return nil, err
 	}
+	if !g.NamesNS(ns) {
+		return nil, &grant.AuthError{Status: 403, Msg: fmt.Sprintf("the grant does not apply to namespace %q", ns)}
+	}
 	st, err := ch.state(ctx, ns)
+	if unreadable(err) {
+		return nil, &grant.AuthError{Status: 401, Msg: "no key can verify the grant"}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -345,10 +358,15 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 		Revoked:       st.revoked,
 		Roles:         st.cfg.Roles,
 		ValidateAttrs: ValidateAttrs,
-		CheckAt:       ch.checkAt(ctx, ns, now),
+		CheckAt:       ch.checkAt(ctx, ns),
 	}
 	return grant.Verify(g, env)
 }
+
+// unreadable reports a namespace document the checker can't fetch because
+// the namespace doesn't exist or the origin refuses the checker (§7 answers
+// both alike), so no key can verify a grant for it.
+func unreadable(err error) bool { return client.IsNotFound(err) || client.IsAuth(err) }
 
 // ValidateAttrs checks asserted attrs against a key scope's attrs schema,
 // as the core does: by evaluating a rule { op: test, path: /attrs, schema }.
@@ -367,11 +385,14 @@ func ValidateAttrs(schema any, attrs map[string]any) error {
 	return nil
 }
 
-// checkAt resolves a key's requireAt (§C.4) against the public API: at must
-// be an ns_id in the named chain (ns itself for requireAt true). The lag is
-// how long at has not been the head: the age of the entry after it.
-func (ch *Checker) checkAt(ctx context.Context, ns string, now time.Time) func(requireAt, at any) (time.Duration, error) {
-	return func(requireAt, at any) (time.Duration, error) {
+// checkAt resolves a key's requireAt (§C.4) against the public API, as the
+// core does: at must be an ns_id in the named chain (ns itself for
+// requireAt true), and must have been its head at some point within maxLag
+// before the grant was issued: its successor, if any, was written no
+// earlier than issued − maxLag. maxLag is the target namespace's (default
+// 60 seconds), or the key's when stricter.
+func (ch *Checker) checkAt(ctx context.Context, ns string) func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
+	return func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error {
 		target := ns
 		if s, ok := requireAt.(string); ok {
 			target = s
@@ -382,36 +403,39 @@ func (ch *Checker) checkAt(ctx context.Context, ns string, now time.Time) func(r
 			idText = x
 		case map[string]any:
 			if n, _ := x["ns"].(string); n != target {
-				return 0, fmt.Errorf("at names another namespace")
+				return fmt.Errorf("at names another namespace")
 			}
 			idText, _ = x["id"].(string)
 		}
 		if _, err := ids.Parse(idText); err != nil {
-			return 0, fmt.Errorf("malformed at")
+			return fmt.Errorf("malformed at")
 		}
 		tst, err := ch.state(ctx, target)
 		if err != nil {
-			return 0, fmt.Errorf("namespace %s: %v", target, err)
+			return fmt.Errorf("namespace %s: %v", target, err)
 		}
-		var lag time.Duration
-		if idText != tst.cfg.Head {
-			entries, err := ch.c.NSLog(ctx, target, tst.cfg.Head, idText)
-			if err != nil {
-				if client.IsNotFound(err) {
-					return 0, fmt.Errorf("at is not in the chain of %s", target)
-				}
-				return 0, err
+		if idText == tst.cfg.Head {
+			return nil
+		}
+		entries, err := ch.c.NSLog(ctx, target, tst.cfg.Head, idText)
+		if err != nil {
+			if client.IsNotFound(err) {
+				return fmt.Errorf("at is not in the chain of %s", target)
 			}
-			if len(entries) > 0 {
-				if t, err := time.Parse(time.RFC3339Nano, entries[0].Created); err == nil {
-					lag = now.Sub(t)
-				}
-			}
+			return err
 		}
-		if ml := tst.cfg.MaxLag; ml != nil && lag > *ml {
-			return lag, fmt.Errorf("at is older than %s's maxLag", target)
+		if len(entries) == 0 {
+			return nil
 		}
-		return lag, nil
+		next, err := time.Parse(time.RFC3339Nano, entries[0].Created)
+		if err != nil {
+			return fmt.Errorf("namespace %s: bad log entry time", target)
+		}
+		lag := grant.EffectiveMaxLag(tst.cfg.MaxLag, keyMaxLag)
+		if !grant.HeadWithin(&next, issued, lag) {
+			return fmt.Errorf("at was not the head of %s within maxLag (%s) before the grant was issued", target, lag)
+		}
+		return nil
 	}
 }
 
@@ -431,6 +455,21 @@ type Decision struct {
 // with Allowed false and the *grant.AuthError as the error.
 func (ch *Checker) CheckRead(ctx context.Context, ns, token, resource string) (*Decision, error) {
 	st, err := ch.state(ctx, ns)
+	if token != "" {
+		// A grant not naming ns is refused (§7), as the core does, unless
+		// ns is public: then it is ignored and the read is anonymous.
+		if g, derr := grant.Decode(token, ch.maxGrant); derr == nil && !g.NamesNS(ns) {
+			if err == nil && st.cfg.Read == "public" {
+				return &Decision{Allowed: true, Public: true}, nil
+			}
+			msg := fmt.Sprintf("the grant does not apply to namespace %q", ns)
+			return &Decision{Reason: msg}, &grant.AuthError{Status: 403, Msg: msg}
+		}
+	}
+	if unreadable(err) {
+		// An unknown namespace is like one that isn't public (§7).
+		return &Decision{Reason: "no usable grant"}, &grant.AuthError{Status: 401, Msg: "no usable grant"}
+	}
 	if err != nil {
 		return nil, err
 	}

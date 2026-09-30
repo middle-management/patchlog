@@ -138,6 +138,9 @@ type Engine struct {
 	stop      chan struct{}
 	bg        sync.WaitGroup
 	closeOnce sync.Once
+	// retentionSkipped remembers retention rules already logged as
+	// skipped for lack of an archive (§8.6), so each is logged once.
+	retentionSkipped sync.Map
 }
 
 // Open opens or creates the database.
@@ -157,11 +160,11 @@ func Open(opt Options) (*Engine, error) {
 	if opt.Maximums == (Limits{}) {
 		opt.Maximums = opt.Limits
 	}
-	if opt.Limits.RemoteBranchLife == 0 {
-		opt.Limits.RemoteBranchLife = DefaultLimits().RemoteBranchLife
+	if opt.Limits.RemoteRegistration == 0 {
+		opt.Limits.RemoteRegistration = DefaultLimits().RemoteRegistration
 	}
-	if opt.Maximums.RemoteBranchLife == 0 {
-		opt.Maximums.RemoteBranchLife = opt.Limits.RemoteBranchLife
+	if opt.Maximums.RemoteRegistration == 0 {
+		opt.Maximums.RemoteRegistration = opt.Limits.RemoteRegistration
 	}
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
@@ -283,6 +286,10 @@ type tx struct {
 	// deps, when set, records what a write's check phase read that a
 	// concurrent write could change (D.3 re-check).
 	deps *writeDeps
+	// kids maps an author written in this transaction to the key that
+	// signed its grant's root block (actorID), recorded with namespace
+	// entries (§F.3).
+	kids map[int64]string
 	// Encryption at rest (crypt.go): data keys created in this
 	// transaction (cached once committed), whether a purge destroyed keys,
 	// resources' levels, and the levels of shadows being created.
@@ -534,8 +541,12 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 	body := jsonv.Canonical(entry)
 	id := ids.Hash(prev, body)
 	kind := nsKindCode(entry["kind"].(string))
-	r, err := t.Exec(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created) VALUES (?,?,?,?,?,?,?,?,?,?)`,
-		n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli())
+	var kid any
+	if k, ok := t.kids[author]; ok {
+		kid = k
+	}
+	r, err := t.Exec(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+		n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), kid)
 	t.must(err)
 	seq, _ := r.LastInsertId()
 	_, err = t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, seq, configSeq, n.id)

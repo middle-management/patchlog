@@ -147,6 +147,7 @@ CREATE TABLE IF NOT EXISTS ns_log (
   config_seq INTEGER NOT NULL,               -- addition: ns_config row in force after this entry
   author     INTEGER NOT NULL REFERENCES authors,
   created    INTEGER NOT NULL,
+  kid        TEXT,                           -- addition: the key that signed the writer's root block (§F.3 merge.authors); NULL without a grant
   UNIQUE (ns, id),
   UNIQUE (ns, prev_seq)
 );
@@ -234,7 +235,26 @@ func openDB(path string) (*sql.DB, error) {
 		db.Close()
 		return nil, fmt.Errorf("creating schema: %w", err)
 	}
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("migrating schema: %w", err)
+	}
 	return db, nil
+}
+
+// migrate adds columns that databases created by earlier versions lack.
+func migrate(db *sql.DB) error {
+	ctx := context.Background()
+	var has bool
+	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info('ns_log') WHERE name = 'kid')`).Scan(&has); err != nil {
+		return err
+	}
+	if !has {
+		if _, err := db.ExecContext(ctx, `ALTER TABLE ns_log ADD COLUMN kid TEXT`); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Entry kinds, as stored.

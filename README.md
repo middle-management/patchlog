@@ -22,7 +22,7 @@ and serves immutable, CDN-cacheable revisions.
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Cache-Control classes and cache tags | §9 | ✅ (CDN purges go to a pluggable `Purger`, default: log) |
-| Grants, narrowing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
+| Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices | §G.3 | ✅ (mirrored up front) |
 | Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
 | Encryption at rest, cryptographic purge | Addendum E.1 | ✅ (local master key file; KMS adapters to come) |
@@ -39,8 +39,7 @@ and serves immutable, CDN-cacheable revisions.
   client holding both keyrings), bundles of e2e namespaces (§G.5: history over ciphertext,
   snapshots by a key holder) and remote branches of them are refused; retention for e2e
   namespaces needs a key-holding janitor, which isn't built (the server skips them); no
-  size-bucket padding (§E.4); `"archive": false` retention rules (v0.21) aren't implemented, so
-  their `422` in e2e namespaces isn't either.
+  size-bucket padding (§E.4).
 - **Addendum E.2 gaps:** consumers that re-publish (search index, tree and catalog services)
   don't seal what they serve yet (§E.2.5), so don't point them at sealed namespaces unless
   their own output is private; remote branches of sealed namespaces (§G.3, §G.5) are refused
@@ -153,15 +152,17 @@ patchlog archive restore -db patchlog.db [-from file:///moved/archive] [-ns NS] 
 - **410s link to the archive.** Revisions below the horizon answer `410 pruned`, with the
   archive's URL in the body.
 - **Who can prune.** With an archive configured, the `prune` verb is enough. Pruning without an
-  archive, or below what `retention` keeps, needs a `*` key.
+  archive, or below what `retention` keeps, needs a `*` key, except that applying a rule that
+  says `"archive": false`, within what it keeps, needs only `prune`.
 - **Destinations.** A `retention[].archive` destination must lie under an allowed root
   (`-archive` or `-archive-root`), otherwise the config write gets `422`.
 - **Purge reaches archives.** Purging deletes the resource's archives too.
 - **Retention runs in the background.** Every `-retention-interval`, as `system:retention`, it
   keeps the last `revisions` or everything newer than `age`, whichever keeps more. Protected
-  revisions always stay. A rule with no archive destination, when no `-archive` default exists
-  either, prunes irreversibly. `/retention` needs a `*` key, the same authority that may prune
-  without an archive.
+  revisions always stay. A rule without `archive` uses the `-archive` default; with no default,
+  it applies only if it says `"archive": false` (it prunes irreversibly, without an archive).
+  Otherwise the applier skips it and logs that once. `"archive": false` is `422` in an e2e
+  namespace. `/retention` needs a `*` key, the same authority that may prune without an archive.
 - **Restore is offline.** It re-inserts every archived patch set whose recomputed id matches the
   kept row, then clears the horizon.
 
@@ -181,7 +182,7 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   registers (`If-None-Match: *`) or renews (`If-Match` with the latest entry's `ns_id`, same
   `at`). It needs `read` and `export`, is checked as an `export` envelope, is rate-limited,
   appends a remote `branch` entry, is listed in `/branches` while unexpired, and protects the
-  head as of `at` from pruning for the registration lifetime (`limits.remoteBranchLife`,
+  head as of `at` from pruning for the registration lifetime (`limits.remoteRegistration`,
   default `P30D`).
 - **Branch side (B): mirrored up front.** Before the write transaction, B fetches A's
   namespace log up to `at`, `/heads` as of `at`, every resource's log and the `$schema`/`$ref`
@@ -421,7 +422,8 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 - `POST /read-grants` returns resource-scoped read grants.
 
 Callers authenticate with an ordinary grant for the catalog namespace, and their groups come only
-from that grant. Issued grants carry `at` and are refused once the catalog's `maxLag` is exceeded.
+from that grant. Issued grants carry `at`; the service refuses to issue from a checkpoint that
+lags the catalog by more than `maxLag`, since the core would refuse the grant.
 
 Note: the §B.11.3 example key rule `not writes overlaps /$access` refuses every create, since a
 genesis writes `""`. Scope it to non-create actions and require `/doc/$access` to be absent on
@@ -465,19 +467,50 @@ curl -L "$B/ns/matches/log"                 # the namespace log
 
 ## Grants
 
-The spec leaves the grant format open (§C.1). This server uses a Biscuit-like chain of
-Ed25519-signed JSON blocks:
+Grants are Biscuit v3 tokens (§C.8), implemented directly on Biscuit's protobuf schema and
+signature scheme in `internal/grant` (no Biscuit library dependency):
 
-```
-token = base64url( canonical({ "blocks": [ { "b": block, "next": pk, "sig": sig }, … ], "proof": seed }) )
-sig_0 = Ed25519(root key,  "patchlog-grant-v1\n" ‖ canonical(b_0) ‖ "\n" ‖ next_0)
-sig_i = Ed25519(sk(next_{i-1}), "patchlog-grant-v1\n" ‖ canonical(b_i) ‖ "\n" ‖ next_i ‖ "\n" ‖ sig_{i-1})
-```
+- The authority block carries the root block and each appended block one narrowing block. Every
+  block holds exactly one fact, `grant_block("<canonical JSON>")`; the string must be I-JSON and
+  equal to its canonical form. Anything else in a block (other facts, rules, checks, scopes,
+  public keys, a non-empty context), a third-party block, or a key that isn't Ed25519 makes the
+  token invalid (`401`). Biscuit's Datalog is never evaluated: the JSON blocks are checked as
+  §C.2 says, validity times come from their `nbf`/`exp`.
+- Signatures are Ed25519 throughout (the ephemeral next keys too), verified strictly (RFC 8032,
+  `S < L`, as Go's `crypto/ed25519` does). New blocks use Biscuit's signature payload version 1;
+  versions 0 and 1 are both verified. The root key is named by `kid` in the root block
+  (`rootKeyId` is ignored).
+- Sealed tokens are accepted, and `patchlog grant … -seal` / `patchlog grant seal` produces them:
+  a sealed grant can't be narrowed any further.
+- Transport: `Authorization: Bearer <token>`, Biscuit's URL-safe base64 (written padded, read with
+  or without padding and with or without the `biscuit:` prefix). The grant size limit applies to
+  the decoded bytes.
+- The grant id is `trunc160(sha256(canonical(root block)))`; a block's revocation id is
+  `text(trunc160(sha256(its Biscuit signature)))`, so revoking the authority block revokes every
+  grant narrowed from it.
+- The stored, non-bearer form (§C.3) is the same protobuf message without its proof: every block
+  signature still checks, but it isn't a token.
 
-`proof` is the private seed for the last `next` key: it lets the holder add a narrowing block,
-and its absence makes the stored, non-bearer form (§C.3) useless as a credential. The grant id is
-`trunc160(sha256(canonical(root block)))`; a block's revocation id is
-`text(trunc160(sha256(signature)))`.
+Compatibility is checked in `internal/grant/biscuit_vectors_test.go` against the Biscuit
+specification's sample tokens (made by the reference implementation, biscuit-rust: v0 and v1
+signatures, sealing, third-party and P-256 blocks, revocation ids; our payloads re-signed with
+the sample root key reproduce the reference signatures byte for byte) and against tokens built
+with the official Go library, biscuit-go v2.2.0, which decode, verify and narrow here.
+biscuit-go v2.2.0 parses our tokens but only knows signature version 0, so it can't verify them.
+
+Status codes (§C.2, §7): a grant not naming the namespace in every block that carries `ns` is
+`403` before anything is verified or looked up, whether or not the namespace exists; no usable
+grant (missing, malformed, badly signed, unknown key, revoked, expired, not yet valid) is `401`;
+a valid grant that doesn't allow the request is `403` (`404` on reads, which hide existence). A
+namespace that doesn't exist answers like an existing non-public one: `401` without a usable
+grant (a grant naming it can only be verified by an operator key; then `404`). Public namespaces
+ignore an unusable or unrelated grant on reads.
+
+`requireAt`: `at` must have been the head of its namespace at some point within `maxLag` before
+the grant was issued, issuance taken as `max(nbf, exp − maxTtl)` of the root block (`nbf` when
+the key sets no `maxTtl`, the time of the check when there is neither). `maxLag` is the
+namespace document's (default 60 seconds), or the key's when stricter. A grant issued in time
+stays valid after the head moves on, until it expires.
 
 ```sh
 # A root grant signed by a key listed in the namespace document (kid "ops-2026")…
@@ -491,7 +524,9 @@ and its absence makes the stored, non-bearer form (§C.3) useless as a credentia
 Namespace keys look like `{ "kid", "alg": "ed25519", "pub": <base64url>, "can": [...], … }`
 with the key-scope fields of §C.4. Operator keys (`-operator-key`) get kid `operator`
 (then `operator-2`, …) and may create namespaces; a creating grant lists the new
-namespace's name, or `"*"`, in `ns`.
+namespace's name, which need not exist yet, or `"*"`, in `ns`. Only operator grants may use
+`"*"`: a grant signed by a namespace key that names `"*"` is refused with `403` (it is valid, it
+just doesn't apply).
 
 ## Design notes
 
@@ -530,14 +565,34 @@ namespace's name, or `"*"`, in `ns`.
   (§3.3). Head snapshots are kept only for documents up to 16 KiB. An intermediate snapshot is
   written after every 100 revisions or 64 KiB of patch sets, so every read folds from the nearest
   snapshot and never folds more than that (D.4).
-- **Allowances** (§6.6): `allowances: [{ sub, kid, rate, burst, itemsPerBatch, batchSize }]` in a
-  namespace document gives one principal its own bucket and batch limits. They can go up to the
-  deployment maximums, set with `serve -max-items-per-batch` and `-max-batch-size`.
-- **Limit names** in a namespace document's `limits` object: `patchSetSize`, `opsPerSet`,
-  `documentSize`, `nestingDepth`, `rulesPerNamespace`, `rulesPerGrant`, `grantSize`,
-  `itemsPerBatch`, `batchSize`, `liveBranches`, `keepPerResource` (integers, lower only),
-  `ratePerResource`, `ratePerPrincipal`, `ratePerNamespace` (`{ rate, burst }`),
-  `retryWindow` and `remoteBranchLife` (ISO 8601 durations).
+- **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
+  batchSize }]` in a namespace document gives one principal its own bucket (replacing the
+  principal and namespace buckets, and a key scope's lower rate) and batch limits. They can go
+  up to the deployment maximums, set with `serve -max-items-per-batch` and `-max-batch-size`
+  (the flag accepts `64MiB`; the document takes bytes).
+- **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
+  `patchSetSize`, `opsPerSet`, `documentSize`, `nestingDepth`, `rulesPerNamespace`,
+  `rulesPerGrant`, `grantSize`, `itemsPerBatch`, `batchSize`, `branchesPerNamespace`,
+  `keepPerResource` (integers, sizes in bytes, lower only), `ratePerResource`,
+  `ratePerPrincipal`, `ratePerNamespace` (`{ rate, burst }`), `retryWindow` and
+  `remoteRegistration` (ISO 8601 durations). Sizes written with units (`"64 MiB"`), unknown or
+  v0.20 names (`liveBranches`, `remoteBranchLife`) and the deployment-only `logPageSize` and
+  `branchDepth` are `422`.
+- **Batch limits after authentication** (§7.5): the server authenticates a batch before
+  reading its body, and stops reading at the principal's `batchSize` (its allowance's, if any,
+  plus room for the batch's own JSON) with `413`. Item counts and the patch-set total are
+  checked at step 4.
+- **Candidate verbs** (§6.2): a `PATCH` with `If-Match` (in a batch, an item whose first step
+  is a patch set) passes step 1 with `append` or `restore`; step 2 settles the verb from the
+  resource's state (a branch's view, read-through included) after the idempotent-retry lookup
+  and before frozen and the precondition, so a grant that can't restore gets `403` on a
+  tombstoned resource, whatever `If-Match` says.
+- **Namespace log entries** are `{ …entry, id, prev?, author, created, kid? }`. `author` and
+  `created` are stored alongside the hashed entry; `kid` is the key that signed the writer's
+  root block, present for entries written under a grant (absent with authentication disabled
+  and for entries the server writes itself). Merge tools and the janitor match `author` and
+  `kid` against the base's `merge: { authors: [{ sub, kid }] }` (§F.3, §F.6), which the server
+  validates and guards with a `*` key like `/keys`.
 - **A forced schema purge** (`POST …/purge?force=1`, §6.1) needs a `*` key.
 
 ## Layout

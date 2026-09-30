@@ -235,7 +235,7 @@ func TestRemoteRegistration(t *testing.T) {
 	expect(t, a.register("main", "rel", at, "", "c"), 201)
 
 	// Rate-limited, and not counted as live branches.
-	a.mkNS("rl", map[string]any{"limits": map[string]any{"ratePerPrincipal": map[string]any{"rate": 0.001, "burst": 1.0}, "liveBranches": 0.0}})
+	a.mkNS("rl", map[string]any{"limits": map[string]any{"ratePerPrincipal": map[string]any{"rate": 0.001, "burst": 1.0}, "branchesPerNamespace": 0.0}})
 	rlAt := a.nsHead("rl")
 	expect(t, a.register("rl", "x", rlAt, "", "b"), 201)
 	expectCode(t, a.register("rl", "y", rlAt, "", "b"), 429, "rate")

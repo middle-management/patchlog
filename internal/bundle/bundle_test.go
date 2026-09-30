@@ -453,9 +453,9 @@ func bulkSource(t *testing.T) []byte {
 func bulkTarget(t *testing.T) *deployment {
 	dst := newDeployment(t, cmsOrigin)
 	dst.ns("bulk", map[string]any{
-		"limits": map[string]any{"itemsPerBatch": 3, "batchSize": "1 KiB"},
-		"allowances": []any{map[string]any{"sub": "svc:importer", "kid": "ops-2026", "rate": 1000, "burst": 1000,
-			"itemsPerBatch": 50, "batchSize": "1 MiB"}},
+		"limits": map[string]any{"itemsPerBatch": 3, "batchSize": 1 << 10},
+		"allowances": []any{map[string]any{"sub": "svc:importer", "kid": "ops-2026", "bucket": map[string]any{"rate": 1000, "burst": 1000},
+			"itemsPerBatch": 50, "batchSize": 1 << 20}},
 	})
 	return dst
 }

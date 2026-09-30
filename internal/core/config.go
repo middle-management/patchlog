@@ -16,25 +16,25 @@ import (
 // Limits are the configurable limits of §6.6. Sizes are bytes; rates are
 // tokens per second with a burst.
 type Limits struct {
-	PatchSetSize     int
-	OpsPerSet        int
-	DocumentSize     int
-	NestingDepth     int
-	RulesPerNS       int
-	RulesPerGrant    int
-	GrantSize        int
-	ItemsPerBatch    int
-	LogPageSize      int // deployment only
-	BatchSize        int
-	BranchDepth      int // deployment only
-	LiveBranches     int
-	RatePerResource  Rate
-	RatePerPrincipal Rate
-	RatePerNamespace Rate
-	RetryWindow      time.Duration
-	RetryWindowMin   time.Duration // deployment only
-	KeepPerResource  int
-	RemoteBranchLife time.Duration
+	PatchSetSize         int
+	OpsPerSet            int
+	DocumentSize         int
+	NestingDepth         int
+	RulesPerNS           int
+	RulesPerGrant        int
+	GrantSize            int
+	ItemsPerBatch        int
+	LogPageSize          int // deployment only
+	BatchSize            int
+	BranchDepth          int // deployment only
+	BranchesPerNamespace int
+	RatePerResource      Rate
+	RatePerPrincipal     Rate
+	RatePerNamespace     Rate
+	RetryWindow          time.Duration
+	RetryWindowMin       time.Duration // deployment only
+	KeepPerResource      int
+	RemoteRegistration   time.Duration
 }
 
 // Rate is a token bucket: Rate tokens per second, Burst the bucket size.
@@ -43,25 +43,25 @@ type Rate struct{ Rate, Burst float64 }
 // DefaultLimits are the defaults of §6.6, also used as deployment maximums.
 func DefaultLimits() Limits {
 	return Limits{
-		PatchSetSize:     256 << 10,
-		OpsPerSet:        1000,
-		DocumentSize:     4 << 20,
-		NestingDepth:     64,
-		RulesPerNS:       256,
-		RulesPerGrant:    32,
-		GrantSize:        8 << 10,
-		ItemsPerBatch:    1000,
-		LogPageSize:      1000,
-		BatchSize:        16 << 20,
-		BranchDepth:      8,
-		LiveBranches:     100,
-		RatePerResource:  Rate{10, 20},
-		RatePerPrincipal: Rate{50, 100},
-		RatePerNamespace: Rate{500, 1000},
-		RetryWindow:      5 * time.Minute,
-		RetryWindowMin:   5 * time.Minute,
-		KeepPerResource:  100,
-		RemoteBranchLife: 30 * 24 * time.Hour,
+		PatchSetSize:         256 << 10,
+		OpsPerSet:            1000,
+		DocumentSize:         4 << 20,
+		NestingDepth:         64,
+		RulesPerNS:           256,
+		RulesPerGrant:        32,
+		GrantSize:            8 << 10,
+		ItemsPerBatch:        1000,
+		LogPageSize:          1000,
+		BatchSize:            16 << 20,
+		BranchDepth:          8,
+		BranchesPerNamespace: 100,
+		RatePerResource:      Rate{10, 20},
+		RatePerPrincipal:     Rate{50, 100},
+		RatePerNamespace:     Rate{500, 1000},
+		RetryWindow:          5 * time.Minute,
+		RetryWindowMin:       5 * time.Minute,
+		KeepPerResource:      100,
+		RemoteRegistration:   30 * 24 * time.Hour,
 	}
 }
 
@@ -69,18 +69,21 @@ func DefaultLimits() Limits {
 // Integer limits can only be lowered; the retry window can be raised up to
 // the deployment maximum.
 var limitFields = map[string]func(*Limits) *int{
-	"patchSetSize":      func(l *Limits) *int { return &l.PatchSetSize },
-	"opsPerSet":         func(l *Limits) *int { return &l.OpsPerSet },
-	"documentSize":      func(l *Limits) *int { return &l.DocumentSize },
-	"nestingDepth":      func(l *Limits) *int { return &l.NestingDepth },
-	"rulesPerNamespace": func(l *Limits) *int { return &l.RulesPerNS },
-	"rulesPerGrant":     func(l *Limits) *int { return &l.RulesPerGrant },
-	"grantSize":         func(l *Limits) *int { return &l.GrantSize },
-	"itemsPerBatch":     func(l *Limits) *int { return &l.ItemsPerBatch },
-	"batchSize":         func(l *Limits) *int { return &l.BatchSize },
-	"liveBranches":      func(l *Limits) *int { return &l.LiveBranches },
-	"keepPerResource":   func(l *Limits) *int { return &l.KeepPerResource },
+	"patchSetSize":         func(l *Limits) *int { return &l.PatchSetSize },
+	"opsPerSet":            func(l *Limits) *int { return &l.OpsPerSet },
+	"documentSize":         func(l *Limits) *int { return &l.DocumentSize },
+	"nestingDepth":         func(l *Limits) *int { return &l.NestingDepth },
+	"rulesPerNamespace":    func(l *Limits) *int { return &l.RulesPerNS },
+	"rulesPerGrant":        func(l *Limits) *int { return &l.RulesPerGrant },
+	"grantSize":            func(l *Limits) *int { return &l.GrantSize },
+	"itemsPerBatch":        func(l *Limits) *int { return &l.ItemsPerBatch },
+	"batchSize":            func(l *Limits) *int { return &l.BatchSize },
+	"branchesPerNamespace": func(l *Limits) *int { return &l.BranchesPerNamespace },
+	"keepPerResource":      func(l *Limits) *int { return &l.KeepPerResource },
 }
+
+// deploymentOnlyLimits are limits of §6.6 that only a deployment sets.
+var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "branchDepth": true}
 
 var rateFields = map[string]func(*Limits) *Rate{
 	"ratePerResource":  func(l *Limits) *Rate { return &l.RatePerResource },
@@ -100,9 +103,12 @@ type Config struct {
 	Retention  []RetentionRule
 	MaxLag     *time.Duration // §C.4: how old a grant's `at` in this namespace may be
 	Allowances []Allowance
-	Frozen     bool
-	Successor  string
-	Base       *BaseRef
+	// MergeAuthors are merge.authors (§F.3): the principals (root sub and
+	// signing kid) whose merge batches merge tools and the janitor trust.
+	MergeAuthors []MergeAuthor
+	Frozen       bool
+	Successor    string
+	Base         *BaseRef
 	// Encryption is encryption.level (Addendum E), "" if none.
 	Encryption string
 	// Epoch is encryption.epoch of a sealed or e2e namespace (§E.2.1,
@@ -117,9 +123,40 @@ type Config struct {
 // Zero fields mean the namespace's own limit.
 type Allowance struct {
 	Sub, Kid      string
-	Rate          Rate
+	Rate          Rate // the allowance's "bucket"
 	ItemsPerBatch int
 	BatchSize     int
+}
+
+// MergeAuthor is one entry of merge.authors (§F.3).
+type MergeAuthor struct{ Sub, Kid string }
+
+func parseMerge(v any) ([]MergeAuthor, error) {
+	const shape = `/merge must be { "authors": [{ "sub", "kid" }, …] }`
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf(shape)
+	}
+	for k := range m {
+		if k != "authors" {
+			return nil, fmt.Errorf("/merge/%s is not a known field", k)
+		}
+	}
+	arr, ok := m["authors"].([]any)
+	if !ok {
+		return nil, fmt.Errorf(shape)
+	}
+	out := []MergeAuthor{}
+	for i, e := range arr {
+		o, ok := e.(map[string]any)
+		sub, _ := o["sub"].(string)
+		kid, _ := o["kid"].(string)
+		if !ok || len(o) != 2 || sub == "" || kid == "" {
+			return nil, fmt.Errorf("/merge/authors/%d must be { sub, kid } with non-empty strings", i)
+		}
+		out = append(out, MergeAuthor{sub, kid})
+	}
+	return out, nil
 }
 
 // allowance returns the allowance of a principal, or nil. With
@@ -250,6 +287,12 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				return nil, err
 			}
 			c.Allowances = as
+		case "merge":
+			ma, err := parseMerge(v)
+			if err != nil {
+				return nil, err
+			}
+			c.MergeAuthors = ma
 		case "maxLag":
 			str, ok := v.(string)
 			d, err := ParseDuration(str)
@@ -339,6 +382,13 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			c.Encryption, c.level = lv, levelOf(lv)
 		}
 	}
+	if c.level == levelE2E {
+		for i, r := range c.Retention {
+			if r.NoArchive {
+				return nil, fmt.Errorf(`/retention/%d/archive: "archive": false is not allowed in an e2e namespace, where pruning needs an archive (§8.6)`, i)
+			}
+		}
+	}
 	return c, nil
 }
 
@@ -355,13 +405,15 @@ func parseLimits(v any, l *Limits, max Limits) error {
 		return fmt.Errorf("/limits must be an object")
 	}
 	for k, x := range m {
+		if deploymentOnlyLimits[k] {
+			return fmt.Errorf("/limits/%s is set by the deployment only (§6.6)", k)
+		}
 		if f, ok := limitFields[k]; ok {
 			n, ok := x.(float64)
-			if s, isStr := x.(string); isStr && sizeFields[k] {
-				b, err := ParseSize(s)
-				n, ok = float64(b), err == nil
-			}
 			if !ok || n < 0 || n != float64(int(n)) {
+				if sizeFields[k] {
+					return fmt.Errorf("/limits/%s must be a non-negative integer, in bytes (§6.6)", k)
+				}
 				return fmt.Errorf("/limits/%s must be a non-negative integer", k)
 			}
 			if int(n) > *f(&max) {
@@ -383,16 +435,16 @@ func parseLimits(v any, l *Limits, max Limits) error {
 			*f(l) = Rate{r, b}
 			continue
 		}
-		if k == "remoteBranchLife" {
+		if k == "remoteRegistration" {
 			s, ok := x.(string)
 			d, err := ParseDuration(s)
 			if !ok || err != nil || d <= 0 {
-				return fmt.Errorf("/limits/remoteBranchLife must be a positive ISO 8601 duration")
+				return fmt.Errorf("/limits/remoteRegistration must be a positive ISO 8601 duration")
 			}
-			if d > max.RemoteBranchLife {
-				return &limitError{"/limits/remoteBranchLife exceeds the deployment maximum"}
+			if d > max.RemoteRegistration {
+				return &limitError{"/limits/remoteRegistration exceeds the deployment maximum"}
 			}
-			l.RemoteBranchLife = d
+			l.RemoteRegistration = d
 			continue
 		}
 		if k == "retryWindow" {
@@ -412,7 +464,8 @@ func parseLimits(v any, l *Limits, max Limits) error {
 	return nil
 }
 
-// sizeFields are limits in bytes, which may also be written as "64 MiB".
+// sizeFields are limits in bytes. A namespace document writes them as
+// integers (§6.6); ParseSize's "64 MiB" form is for deployment flags only.
 var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "grantSize": true, "batchSize": true}
 
 var sizeRe = regexp.MustCompile(`^(\d+)\s*(B|KiB|MiB|GiB)?$`)
@@ -462,16 +515,14 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 				} else {
 					a.Kid = s
 				}
-			case "rate", "burst":
-				n, ok := x.(float64)
-				if !ok || n <= 0 {
-					return nil, fmt.Errorf("/allowances/%d/%s must be a positive number", i, k)
+			case "bucket":
+				o, ok := x.(map[string]any)
+				r, rok := o["rate"].(float64)
+				b, bok := o["burst"].(float64)
+				if !ok || len(o) != 2 || !rok || !bok || r <= 0 || b < 1 {
+					return nil, fmt.Errorf("/allowances/%d/bucket must be { rate, burst }, rate positive and burst at least 1", i)
 				}
-				if k == "rate" {
-					a.Rate.Rate = n
-				} else {
-					a.Rate.Burst = n
-				}
+				a.Rate = Rate{r, b}
 			case "itemsPerBatch":
 				n, ok := x.(float64)
 				if !ok || n < 1 || n != float64(int(n)) {
@@ -482,20 +533,10 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 				}
 				a.ItemsPerBatch = int(n)
 			case "batchSize":
-				var n int
-				switch y := x.(type) {
-				case float64:
-					n = int(y)
-					if y != float64(n) || n < 1 {
-						return nil, fmt.Errorf("/allowances/%d/batchSize must be a size", i)
-					}
-				case string:
-					var err error
-					if n, err = ParseSize(y); err != nil {
-						return nil, fmt.Errorf("/allowances/%d/batchSize: %v", i, err)
-					}
-				default:
-					return nil, fmt.Errorf("/allowances/%d/batchSize must be a size", i)
+				y, ok := x.(float64)
+				n := int(y)
+				if !ok || y != float64(n) || n < 1 {
+					return nil, fmt.Errorf("/allowances/%d/batchSize must be a positive integer, in bytes (§6.6)", i)
 				}
 				if n > max.BatchSize {
 					return nil, &limitError{fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize)}
@@ -507,9 +548,6 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 		}
 		if a.Sub == "" || a.Kid == "" {
 			return nil, fmt.Errorf("/allowances/%d needs sub and kid", i)
-		}
-		if (a.Rate.Rate == 0) != (a.Rate.Burst == 0) || (a.Rate.Burst > 0 && a.Rate.Burst < 1) {
-			return nil, fmt.Errorf("/allowances/%d needs both rate and burst, burst at least 1", i)
 		}
 		if seen[a.Sub+"\x00"+a.Kid] {
 			return nil, fmt.Errorf("/allowances/%d duplicates an earlier sub and kid", i)

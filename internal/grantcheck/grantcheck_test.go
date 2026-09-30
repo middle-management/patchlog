@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
@@ -145,7 +146,7 @@ func TestCheckRead(t *testing.T) {
 	cfgID := must(f.adminC.NSHead(ctx, "sec")).Config
 	cr := must(f.adminC.PatchConfig(ctx, "sec", cfgID, []any{map[string]any{"op": "add", "path": "/revoked", "value": []any{g.RevocationIDs()[0]}}}))
 	f.ch.Observe("sec", cr.NSID)
-	if _, err := f.ch.Verify(ctx, "sec", tok); authStatus(err) != 403 {
+	if _, err := f.ch.Verify(ctx, "sec", tok); authStatus(err) != 401 {
 		t.Fatalf("revoked: %v", err)
 	}
 	if f.serverReads(t, "sec", "a", tok) {
@@ -196,7 +197,7 @@ func TestBranchKeysFollowBase(t *testing.T) {
 	cfgID = must(f.adminC.NSHead(ctx, "sec")).Config
 	must(f.adminC.PatchConfig(ctx, "sec", cfgID, []any{map[string]any{"op": "add", "path": "/revoked", "value": []any{g.RevocationIDs()[0]}}}))
 	// TTL 0: the moved head is noticed without Observe.
-	if _, err := f.ch.Verify(ctx, "rel", ownTok); authStatus(err) != 403 {
+	if _, err := f.ch.Verify(ctx, "rel", ownTok); authStatus(err) != 401 {
 		t.Fatalf("base revocation ignored: %v", err)
 	}
 	if f.serverReads(t, "rel", "a", ownTok) {
@@ -225,10 +226,47 @@ func TestRequireAt(t *testing.T) {
 			t.Fatalf("bad at accepted: %v", err)
 		}
 	}
-	// An older at is fine without maxLag.
+	// An older at is fine within the default maxLag (60 s) of issuance,
+	// however long ago the head moved on.
 	must(f.adminC.CreateDoc(ctx, "sec", "z", map[string]any{}))
 	if _, err := f.ch.Verify(ctx, "sec", ok); err != nil {
 		t.Fatalf("older at: %v", err)
+	}
+	// Issuance is nbf here (the key sets no maxTtl): a grant issued 61 s
+	// after its at stopped being the head is refused, one issued at 59 s
+	// isn't, and both stay so as the clock moves.
+	moved := f.s.Now()
+	late := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head, "nbf": moved.Add(61 * time.Second).Format(time.RFC3339)})
+	inTime := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head, "nbf": moved.Add(59 * time.Second).Format(time.RFC3339)})
+	f.s.Clock.Advance(2 * time.Minute)
+	if _, err := f.ch.Verify(ctx, "sec", late); authStatus(err) != 403 {
+		t.Fatalf("at older than maxLag at issuance: %v", err)
+	}
+	if _, err := f.ch.Verify(ctx, "sec", inTime); err != nil {
+		t.Fatalf("at within maxLag at issuance: %v", err)
+	}
+}
+
+// §7: a grant not naming a namespace is 403 before the namespace is
+// consulted, existing or not; an unknown namespace is otherwise 401.
+func TestNSNamedFirst(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	tok := f.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"})
+	for _, ns := range []string{"rel", "nope"} {
+		if _, err := f.ch.Verify(ctx, ns, tok); authStatus(err) != 403 {
+			t.Fatalf("%s: %v", ns, err)
+		}
+		if _, err := f.ch.CheckRead(ctx, ns, tok, ""); authStatus(err) != 403 {
+			t.Fatalf("%s: %v", ns, err)
+		}
+	}
+	named := f.grant(f.issuer, "user:bob", []string{"nope"}, []string{"read"})
+	if _, err := f.ch.Verify(ctx, "nope", named); authStatus(err) != 401 {
+		t.Fatalf("unknown namespace: %v", err)
+	}
+	if _, err := f.ch.CheckRead(ctx, "nope", "", ""); authStatus(err) != 401 {
+		t.Fatalf("unknown namespace, anonymous: %v", err)
 	}
 }
 

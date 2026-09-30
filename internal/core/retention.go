@@ -18,7 +18,7 @@ import (
 //
 //	{ "select"?: { "prefix": "telemetry-" } | { "names": ["a", "b"] },
 //	  "keep": { "revisions"?: 50, "age"?: "PT10M" },
-//	  "archive"?: "file:///var/archive/telemetry/" }
+//	  "archive"?: "file:///var/archive/telemetry/" | false }
 //
 // keep is required and needs at least one of revisions and age, so a rule
 // can't prune everything by accident.
@@ -30,6 +30,9 @@ type RetentionRule struct {
 	// KeepAge keeps everything newer than it; 0 if unset.
 	KeepAge time.Duration
 	Archive string // destination for this rule's archives; "" = the operator's default
+	// NoArchive is "archive": false: the rule prunes without an archive,
+	// irreversibly (§8.6).
+	NoArchive bool
 }
 
 // matches reports whether the rule selects a resource.
@@ -56,6 +59,16 @@ func (c *Config) retentionRule(name string) *RetentionRule {
 		}
 	}
 	return nil
+}
+
+// retentionIndex is the index of a rule of cfg.Retention.
+func (t *tx) retentionIndex(cfg *Config, r *RetentionRule) int {
+	for i := range cfg.Retention {
+		if &cfg.Retention[i] == r {
+			return i
+		}
+	}
+	return -1
 }
 
 func parseRetention(v any) ([]RetentionRule, error) {
@@ -126,10 +139,14 @@ func parseRetention(v any) ([]RetentionRule, error) {
 				}
 				hasKeep = true
 			case "archive":
+				if x == false {
+					r.NoArchive = true
+					continue
+				}
 				s, ok := x.(string)
 				u, err := url.Parse(s)
 				if !ok || err != nil || u.Scheme == "" {
-					return nil, fmt.Errorf("/retention/%d/archive must be a URL", i)
+					return nil, fmt.Errorf("/retention/%d/archive must be a URL or false", i)
 				}
 				r.Archive = s
 			default:
@@ -272,9 +289,22 @@ func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err erro
 	if own == nil || own.state == statePurged || !own.headSeq.Valid {
 		return false, false, nil
 	}
-	dest, hasArchive := t.archiveDest(rule)
-	if rule.Archive != "" && !hasArchive {
-		return true, false, fmt.Errorf("archive destination %q is not allowed by this deployment; not pruning", rule.Archive)
+	// A rule without archive uses the operator's destination; with none,
+	// it applies only if it says "archive": false (§8.6).
+	var dest string
+	var hasArchive bool
+	if !rule.NoArchive {
+		dest, hasArchive = t.archiveDest(rule)
+		if rule.Archive != "" && !hasArchive {
+			return true, false, fmt.Errorf("archive destination %q is not allowed by this deployment; not pruning", rule.Archive)
+		}
+		if !hasArchive {
+			key := fmt.Sprintf("%s\x00%d\x00%d", n.name, n.configSeq, t.retentionIndex(cfg, rule))
+			if _, logged := t.e.retentionSkipped.LoadOrStore(key, true); !logged {
+				log.Printf("retention: %s: a rule without archive applies only with an operator archive destination or \"archive\": false; skipping it (§8.6)", n.name)
+			}
+			return false, false, nil
+		}
 	}
 	h := t.rev(t.retentionBoundary(rule, own))
 	h = t.protect(n, cfg, own.id, h)

@@ -410,15 +410,13 @@ func TestGrantStalenessAndExpiry(t *testing.T) {
 	if _, _, err := ac.Load(ctx, "matches", "derby"); err != nil {
 		t.Fatalf("after 5 minutes: %v", err)
 	}
-	// A catalog write makes at older; after maxLag (60s) the core refuses it.
+	// A catalog write moves the head on. at is judged at issuance
+	// (§C.4: max(nbf, exp − maxTtl)), when it was the head, so the grant
+	// stays valid past maxLag (60s), until exp.
 	w.doc("cat", "later", map[string]any{"parents": parents("root")})
-	w.s.Clock.Advance(30 * time.Second)
+	w.s.Clock.Advance(2 * time.Minute)
 	if _, _, err := ac.Load(ctx, "matches", "derby"); err != nil {
-		t.Fatalf("within maxLag: %v", err)
-	}
-	w.s.Clock.Advance(31 * time.Second)
-	if live(ac, "matches", "derby") {
-		t.Fatal("the grant still reads beyond maxLag")
+		t.Fatalf("beyond maxLag after the head moved: %v", err)
 	}
 	// A fresh grant from the new checkpoint works, and expires after 15 minutes.
 	w.caughtUp()
@@ -782,15 +780,10 @@ func TestRePlaceRestoreOnly(t *testing.T) {
 	rootReplace := func(doc map[string]any) []any {
 		return []any{map[string]any{"op": "replace", "path": "", "value": doc}}
 	}
-	// The current core authorises every PATCH with If-Match as an append at
-	// step 1, so a restore-only grant can't restore at all until it has
-	// §6.2's v0.21 candidate verbs.
-	if _, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{"parents": parents("season"), "$nonce": "n2"})); err != nil && strings.Contains(err.Error(), "does not allow append") {
-		t.Skip("waiting on the core's §6.2 v0.21 candidate verbs: a restore-only grant must pass step 1 for a PATCH with If-Match (candidate verb restore); the current core authorises it as append only")
-	}
-	// A restore that brings $access is refused (only admins may, §B.11.3).
+	// A restore that brings $access is refused (only admins may, §B.11.3):
+	// by the namespace rule (422) or the key rule (403), as for creates.
 	if _, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{
-		"parents": parents("derbies"), "$access": acc("user:bob", "desk"), "$nonce": "n2"})); !isStatus(err, 403) {
+		"parents": parents("derbies"), "$access": acc("user:bob", "desk"), "$nonce": "n2"})); !isStatus(err, 403) && !isStatus(err, 422) {
 		t.Errorf("restore with $access: %v", err)
 	}
 	// Other parents than the grant fixes are refused.

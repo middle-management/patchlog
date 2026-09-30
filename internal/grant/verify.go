@@ -1,6 +1,7 @@
 package grant
 
 import (
+	"crypto/ed25519"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -41,13 +42,65 @@ func (p Principal) Envelope() map[string]any {
 
 // Env is the configuration in force for a verification.
 type Env struct {
-	Now           time.Time
-	NS            string
-	Keys          []Key
-	Revoked       map[string]bool
-	Roles         Roles
+	Now     time.Time
+	NS      string
+	Keys    []Key
+	Revoked map[string]bool
+	Roles   Roles
+	// Operator says Keys are the deployment's operator keys (§C.4
+	// bootstrapping). Only grants they sign may name "*" in ns.
+	Operator      bool
 	ValidateAttrs func(schema any, attrs map[string]any) error
-	CheckAt       func(requireAt any, at any) (lag time.Duration, err error)
+	// CheckAt checks a key's requireAt (§C.4): at must be an ns_id in the
+	// chain requireAt names (true: this namespace), and must have been that
+	// namespace's head at some point within maxLag before issued, the
+	// grant's issuance (see Issued). maxLag is the namespace document's
+	// (DefaultMaxLag when absent), or keyMaxLag when that is stricter (see
+	// EffectiveMaxLag). A non-nil error refuses the grant (403).
+	CheckAt func(requireAt, at any, issued time.Time, keyMaxLag *time.Duration) error
+}
+
+// DefaultMaxLag is a namespace's maxLag when its document sets none (§C.4).
+const DefaultMaxLag = 60 * time.Second
+
+// EffectiveMaxLag is the maxLag that applies to at: the namespace's
+// (DefaultMaxLag if nil) or the key's, whichever is smaller (§C.4).
+func EffectiveMaxLag(nsMaxLag, keyMaxLag *time.Duration) time.Duration {
+	lag := DefaultMaxLag
+	if nsMaxLag != nil {
+		lag = *nsMaxLag
+	}
+	if keyMaxLag != nil && *keyMaxLag < lag {
+		lag = *keyMaxLag
+	}
+	return lag
+}
+
+// Issued is when a grant counts as issued for requireAt (§C.4):
+// max(nbf, exp − maxTtl) of the root block, or nbf when the key sets no
+// maxTtl. Without either, it is now.
+func Issued(root Block, key *Key, now time.Time) time.Time {
+	var issued *time.Time
+	if root.Nbf != nil {
+		issued = root.Nbf
+	}
+	if key != nil && key.MaxTTL != nil && root.Exp != nil {
+		s := root.Exp.Add(-*key.MaxTTL)
+		if issued == nil || s.After(*issued) {
+			issued = &s
+		}
+	}
+	if issued == nil {
+		return now
+	}
+	return *issued
+}
+
+// HeadWithin reports whether a revision was its namespace's head at some
+// point within lag before issued, or later: next is when its successor was
+// written (nil while it is still the head).
+func HeadWithin(next *time.Time, issued time.Time, lag time.Duration) bool {
+	return next == nil || !next.Before(issued.Add(-lag))
 }
 
 // Verified is the result of a successful verification.
@@ -65,11 +118,15 @@ type Verified struct {
 }
 
 // Verify checks a decoded grant against the configuration in force (§C.2,
-// §C.4). Failures are *AuthError: 401 for an unknown kid or bad root
-// signature, 403 otherwise.
+// §C.4), in the order of §C.2: first that every block carrying ns names
+// env.NS (403, before anything is verified), then the signature chain,
+// times and revocation (401: no usable grant), then the key scope (403).
 func Verify(g *Grant, env Env) (*Verified, error) {
 	if g == nil || len(g.Blocks) == 0 {
 		return nil, unauth("missing grant")
+	}
+	if !g.NamesNS(env.NS) {
+		return nil, forbid("grant does not apply to namespace %q", env.NS)
 	}
 	root := g.Blocks[0]
 	var key *Key
@@ -82,8 +139,11 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 	if key == nil {
 		return nil, unauth("unknown key %q", root.Kid)
 	}
-	if len(key.Pub) != 32 || !g.verifyRoot(key.Pub) {
+	if len(key.Pub) != ed25519.PublicKeySize {
 		return nil, unauth("bad root signature")
+	}
+	if err := g.c.verify(key.Pub); err != nil {
+		return nil, unauth("%v", err)
 	}
 
 	// Time window: nbf <= now < exp for every block.
@@ -92,7 +152,7 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 	for i, b := range g.Blocks {
 		if b.Nbf != nil {
 			if now.Before(*b.Nbf) {
-				return nil, forbid("grant block %d not yet valid", i)
+				return nil, unauth("grant block %d not yet valid", i)
 			}
 			if effNbf == nil || b.Nbf.After(*effNbf) {
 				effNbf = b.Nbf
@@ -100,7 +160,7 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 		}
 		if b.Exp != nil {
 			if !now.Before(*b.Exp) {
-				return nil, forbid("grant block %d expired", i)
+				return nil, unauth("grant block %d expired", i)
 			}
 			if effExp == nil || b.Exp.Before(*effExp) {
 				effExp = b.Exp
@@ -111,15 +171,14 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 	// Revocation.
 	for i, r := range g.RevocationIDs() {
 		if env.Revoked[r] {
-			return nil, forbid("grant block %d revoked", i)
+			return nil, unauth("grant block %d revoked", i)
 		}
 	}
 
-	// Namespace.
-	for _, b := range g.Blocks {
-		if b.HasNS && !contains(b.NS, env.NS) {
-			return nil, forbid("grant does not apply to namespace %q", env.NS)
-		}
+	// "*" in ns: operator grants only (§C.4). The grant is valid, it just
+	// doesn't apply here.
+	if g.usesStar() && !env.Operator {
+		return nil, forbid(`only operator grants may name "*" in ns`)
 	}
 
 	// Key scope.
@@ -166,12 +225,8 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 		if env.CheckAt == nil {
 			return nil, forbid("cannot check at")
 		}
-		lag, err := env.CheckAt(key.RequireAt, root.At)
-		if err != nil {
+		if err := env.CheckAt(key.RequireAt, root.At, Issued(root, key, now), key.MaxLag); err != nil {
 			return nil, forbid("at rejected: %v", err)
-		}
-		if key.MaxLag != nil && lag > *key.MaxLag {
-			return nil, forbid("at is older than maxLag")
 		}
 	}
 

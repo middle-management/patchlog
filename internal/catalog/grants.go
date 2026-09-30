@@ -760,6 +760,9 @@ func (s *Service) checkLag(ctx context.Context, cp string, key *grant.Key) error
 	if cp == "" {
 		return errf(503, "behind", "the catalog service has not reached the catalog yet")
 	}
+	if key.RequireAt == nil {
+		return nil // the core doesn't check at for this key
+	}
 	h, err := s.t.Client().NSHead(ctx, cat)
 	if err != nil {
 		return upstream(err)
@@ -767,22 +770,17 @@ func (s *Service) checkLag(ctx context.Context, cp string, key *grant.Key) error
 	if h.ID == cp {
 		return nil
 	}
-	var limit *time.Duration
-	if cfg, err := s.t.Checker().Config(ctx, cat); err == nil && cfg.MaxLag != nil {
-		limit = cfg.MaxLag
+	var nsLag *time.Duration
+	if cfg, err := s.t.Checker().Config(ctx, cat); err == nil {
+		nsLag = cfg.MaxLag
 	}
-	if key.MaxLag != nil && (limit == nil || *key.MaxLag < *limit) {
-		limit = key.MaxLag
-	}
-	if limit == nil {
-		return nil
-	}
+	limit := grant.EffectiveMaxLag(nsLag, key.MaxLag) // default 60 s (§C.4)
 	entries, err := s.t.Client().NSLog(ctx, cat, h.ID, cp)
 	if err != nil || len(entries) == 0 {
 		return errf(503, "behind", "the catalog service's checkpoint is not in the catalog's chain")
 	}
 	t, err := time.Parse(time.RFC3339Nano, entries[0].Created)
-	if err == nil && s.now().Sub(t) > *limit {
+	if err == nil && s.now().Sub(t) > limit {
 		return errf(503, "behind", "the catalog service lags the catalog by more than maxLag")
 	}
 	return nil

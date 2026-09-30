@@ -1,28 +1,26 @@
-// Package grant implements capability grants (Addendum C): a Biscuit-like
-// chain of Ed25519-signed blocks, key scopes, roles and verification.
+// Package grant implements capability grants (Addendum C): a chain of
+// Ed25519-signed JSON blocks, key scopes, roles and verification.
 //
-// Token format (bearer) is base64url without padding of the canonical JSON
+// Grants are Biscuit v3 tokens (§C.8): the authority block carries the
+// root block and each appended block one narrowing block, every block
+// holding exactly one fact grant_block("<canonical JSON>"). Biscuit's
+// Datalog is not evaluated; the JSON blocks are checked as §C.2 says. The
+// wire format and signatures are in biscuit.go.
 //
-//	{ "blocks": [ { "b": {…}, "next": "<pub>", "sig": "<sig>" }, … ],
-//	  "proof": "<seed of the key matching the last block's next>" }
-//
-// with
-//
-//	sig_0 = Ed25519(root key, "patchlog-grant-v1\n" ‖ canonical(b_0) ‖ "\n" ‖ next_0)
-//	sig_i = Ed25519(sk(next_{i-1}), "patchlog-grant-v1\n" ‖ canonical(b_i) ‖ "\n" ‖ next_i ‖ "\n" ‖ sig_{i-1})
-//
-// The non-bearer stored form (§C.3) is the canonical JSON of {"blocks": […]}
-// without "proof".
+// The bearer form is Biscuit's URL-safe base64 (padded, accepted with or
+// without padding and with or without the "biscuit:" prefix). The
+// non-bearer stored form (§C.3) is the same protobuf message without its
+// proof, so every block signature can be checked but it is not a token.
 package grant
 
 import (
-	"bytes"
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
@@ -45,12 +43,14 @@ var verbSet = func() map[string]bool {
 // IsVerb reports whether s is a grant verb (not "*").
 func IsVerb(s string) bool { return verbSet[s] }
 
-const sigDomain = "patchlog-grant-v1\n"
-
 // maxBlocks bounds the chain length independently of the size limit.
 const maxBlocks = 64
 
+// b64 encodes keys and seeds (namespace documents, CLI).
 var b64 = base64.RawURLEncoding.Strict()
+
+// tokenPrefix is the optional text prefix of a Biscuit token.
+const tokenPrefix = "biscuit:"
 
 // ErrTooLarge reports a token over the grant size limit (§6.6).
 var ErrTooLarge = errors.New("grant exceeds size limit")
@@ -91,61 +91,45 @@ type Block struct {
 type Grant struct {
 	Blocks []Block
 
-	sigs  [][]byte
-	nexts []string           // b64url public keys
-	proof ed25519.PrivateKey // nil in the stored form
+	c       *container
+	symbols []string           // the token's own symbol table, for appending
+	proof   ed25519.PrivateKey // the next secret; nil when sealed or stored
 }
 
 // ID is the grant id of §C.3: trunc160(sha256(canonical(root block))).
 func (g *Grant) ID() ids.ID { return ids.Of(jsonv.Canonical(g.Blocks[0].Raw)) }
 
-// RevocationIDs returns the revocation id of every block, in order.
+// RevocationIDs returns the revocation id of every block, in order:
+// text(trunc160(sha256(its Biscuit signature))) (§C.4, §C.8).
 func (g *Grant) RevocationIDs() []string {
-	out := make([]string, len(g.sigs))
-	for i, s := range g.sigs {
-		out[i] = ids.Of(s).String()
+	out := make([]string, len(g.c.blocks))
+	for i, sb := range g.c.blocks {
+		out[i] = ids.Of(sb.sig).String()
 	}
 	return out
 }
 
-func (g *Grant) envelopes() []any {
-	bs := make([]any, len(g.Blocks))
-	for i, b := range g.Blocks {
-		bs[i] = map[string]any{"b": b.Raw, "next": g.nexts[i], "sig": b64.EncodeToString(g.sigs[i])}
-	}
-	return bs
-}
-
-// Stored is the non-bearer form: canonical JSON of {"blocks": […]}.
+// Stored is the non-bearer form (§C.3): the Biscuit without its proof.
 func (g *Grant) Stored() []byte {
-	return jsonv.Canonical(map[string]any{"blocks": g.envelopes()})
+	return (&container{blocks: g.c.blocks}).encode()
 }
 
-// Encode returns the bearer token. It panics if the grant has no proof
-// (a grant parsed from its stored form cannot be turned back into a bearer).
+// Encode returns the bearer token, Biscuit URL-safe base64 without the
+// "biscuit:" prefix. It panics on a grant parsed from its stored form,
+// which cannot be turned back into a bearer.
 func (g *Grant) Encode() string {
-	if g.proof == nil {
+	if g.c.nextSecret == nil && g.c.finalSig == nil {
 		panic("grant: Encode on a grant without proof")
 	}
-	v := map[string]any{"blocks": g.envelopes(), "proof": b64.EncodeToString(g.proof.Seed())}
-	return b64.EncodeToString(jsonv.Canonical(v))
+	return base64.URLEncoding.EncodeToString(g.c.encode())
 }
 
-// HasProof reports whether the grant carries its proof (bearer form).
+// HasProof reports whether the grant can be narrowed: it carries the next
+// secret (a bearer token that isn't sealed).
 func (g *Grant) HasProof() bool { return g.proof != nil }
 
-func signingInput(block map[string]any, next string, prevSig []byte) []byte {
-	var b bytes.Buffer
-	b.WriteString(sigDomain)
-	b.Write(jsonv.Canonical(block))
-	b.WriteByte('\n')
-	b.WriteString(next)
-	if prevSig != nil {
-		b.WriteByte('\n')
-		b.WriteString(b64.EncodeToString(prevSig))
-	}
-	return b.Bytes()
-}
+// Sealed reports whether the grant is a sealed token (§C.8).
+func (g *Grant) Sealed() bool { return g.c.finalSig != nil }
 
 // normalizeInput converts a caller-built block to the value model and back
 // through canonical JSON, so it is exactly what a verifier will parse.
@@ -187,8 +171,9 @@ func ParsePrivateKey(s string) (ed25519.PrivateKey, error) {
 // EncodePrivateKey is the inverse of ParsePrivateKey.
 func EncodePrivateKey(k ed25519.PrivateKey) string { return b64.EncodeToString(k.Seed()) }
 
-// Mint signs a root block with the key's private half. A fresh key pair is
-// generated for the next link; its private half is the grant's proof.
+// Mint signs a root block with the key's private half, as the authority
+// block of a new Biscuit. A fresh key pair is generated for the next
+// block; its private half is the grant's proof.
 func Mint(root map[string]any, signer ed25519.PrivateKey) (*Grant, error) {
 	if len(signer) != ed25519.PrivateKeySize {
 		return nil, errors.New("grant: invalid signer key")
@@ -201,15 +186,20 @@ func Mint(root map[string]any, signer ed25519.PrivateKey) (*Grant, error) {
 	if err != nil {
 		return nil, err
 	}
-	next, nextPriv := GenerateKey()
-	sig := ed25519.Sign(signer, signingInput(raw, next, nil))
-	return &Grant{Blocks: []Block{blk}, sigs: [][]byte{sig}, nexts: []string{next}, proof: nextPriv}, nil
+	data, symbols := encodeBlockData(string(jsonv.Canonical(raw)), nil)
+	sb, next := newBlock(signer, data, nil)
+	return &Grant{Blocks: []Block{blk}, symbols: symbols, proof: next,
+		c: &container{blocks: []signedBlock{sb}, nextSecret: next.Seed()}}, nil
 }
 
 // Narrow appends a narrowing block and returns the new grant. The receiver
-// is unchanged. It needs the proof.
+// is unchanged. It needs the proof, so a sealed or stored grant can't be
+// narrowed.
 func (g *Grant) Narrow(block map[string]any) (*Grant, error) {
 	if g.proof == nil {
+		if g.Sealed() {
+			return nil, errors.New("grant: the grant is sealed")
+		}
 		return nil, errors.New("grant: cannot narrow a grant without proof")
 	}
 	if len(g.Blocks) >= maxBlocks {
@@ -223,123 +213,126 @@ func (g *Grant) Narrow(block map[string]any) (*Grant, error) {
 	if err != nil {
 		return nil, err
 	}
-	next, nextPriv := GenerateKey()
-	sig := ed25519.Sign(g.proof, signingInput(raw, next, g.sigs[len(g.sigs)-1]))
-	n := &Grant{
-		Blocks: append(append([]Block(nil), g.Blocks...), blk),
-		sigs:   append(append([][]byte(nil), g.sigs...), sig),
-		nexts:  append(append([]string(nil), g.nexts...), next),
-		proof:  nextPriv,
-	}
-	return n, nil
+	data, added := encodeBlockData(string(jsonv.Canonical(raw)), g.symbols)
+	prev := g.c.blocks[len(g.c.blocks)-1]
+	sb, next := newBlock(g.proof, data, prev.sig)
+	return &Grant{
+		Blocks:  append(append([]Block(nil), g.Blocks...), blk),
+		symbols: append(append([]string(nil), g.symbols...), added...),
+		proof:   next,
+		c: &container{blocks: append(append([]signedBlock(nil), g.c.blocks...), sb),
+			nextSecret: next.Seed()},
+	}, nil
 }
 
-// Decode parses a bearer token and checks its structure, every signature in
-// the chain except the root's (which needs the namespace keys, see Verify)
-// and the proof. maxSize (bytes of the token text) is ignored when <= 0.
-// Errors are ErrTooLarge or *AuthError with status 401.
+// Seal returns the grant as a sealed token (§C.8): the proof becomes a
+// final signature, so nobody can narrow it further. The receiver is
+// unchanged.
+func (g *Grant) Seal() (*Grant, error) {
+	if g.proof == nil {
+		return nil, errors.New("grant: only an unsealed bearer grant can be sealed")
+	}
+	last := g.c.blocks[len(g.c.blocks)-1]
+	sig := ed25519.Sign(g.proof, last.sealPayload())
+	return &Grant{Blocks: g.Blocks, symbols: g.symbols,
+		c: &container{blocks: g.c.blocks, finalSig: sig}}, nil
+}
+
+// Decode parses a bearer token: Biscuit URL-safe base64, with or without
+// padding and the "biscuit:" prefix. It checks the structure and the JSON
+// blocks but no signature: Verify checks the chain, after the namespace
+// check of §C.2 (whose 403 comes first). maxSize bounds the decoded bytes
+// and is ignored when <= 0. Errors are ErrTooLarge or *AuthError with
+// status 401.
 func Decode(token string, maxSize int) (*Grant, error) {
-	if maxSize > 0 && len(token) > maxSize {
+	token = strings.TrimPrefix(token, tokenPrefix)
+	if maxSize > 0 && len(token) > base64.URLEncoding.EncodedLen(maxSize) {
 		return nil, ErrTooLarge
 	}
-	data, err := b64.DecodeString(token)
-	if err != nil {
-		return nil, unauth("grant is not base64url")
+	var data []byte
+	var err error
+	if strings.HasSuffix(token, "=") || len(token)%4 == 0 {
+		data, err = base64.URLEncoding.Strict().DecodeString(token)
+	} else {
+		data, err = base64.RawURLEncoding.Strict().DecodeString(token)
+	}
+	if err != nil || len(data) == 0 {
+		return nil, unauth("grant is not a Biscuit token in URL-safe base64")
+	}
+	if maxSize > 0 && len(data) > maxSize {
+		return nil, ErrTooLarge
 	}
 	return decode(data, true)
 }
 
-// ParseStored parses the non-bearer stored form and checks structure and
-// the chain signatures (not the root signature). The result has no proof.
-func ParseStored(data []byte) (*Grant, error) { return decode(data, false) }
+// ParseStored parses the non-bearer stored form and checks its structure
+// and the chain signatures (not the root signature, which needs the
+// namespace keys). The result has no proof.
+func ParseStored(data []byte) (*Grant, error) {
+	g, err := decode(data, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := g.c.verify(nil); err != nil {
+		return nil, unauth("%v", err)
+	}
+	return g, nil
+}
 
 func decode(data []byte, bearer bool) (*Grant, error) {
-	v, err := jsonv.Parse(data)
+	c, err := parseContainer(data, bearer)
 	if err != nil {
-		return nil, unauth("grant is not valid JSON")
+		return nil, unauth("malformed grant: %v", err)
 	}
-	top, ok := v.(map[string]any)
-	if !ok {
-		return nil, unauth("grant must be an object")
+	strs, symbols, err := c.blockStrings()
+	if err != nil {
+		return nil, unauth("malformed grant: %v", err)
 	}
-	for k := range top {
-		if k != "blocks" && !(bearer && k == "proof") {
-			return nil, unauth("unknown grant member %q", k)
+	g := &Grant{c: c, symbols: symbols}
+	for i, s := range strs {
+		v, err := jsonv.Parse([]byte(s))
+		if err != nil {
+			return nil, unauth("block %d is not I-JSON: %v", i, err)
 		}
-	}
-	arr, ok := top["blocks"].([]any)
-	if !ok || len(arr) == 0 {
-		return nil, unauth("grant blocks missing")
-	}
-	if len(arr) > maxBlocks {
-		return nil, unauth("too many blocks")
-	}
-	g := &Grant{}
-	for i, e := range arr {
-		env, ok := e.(map[string]any)
+		if string(jsonv.Canonical(v)) != s {
+			return nil, unauth("block %d is not in canonical form", i)
+		}
+		raw, ok := v.(map[string]any)
 		if !ok {
 			return nil, unauth("block %d must be an object", i)
-		}
-		for k := range env {
-			if k != "b" && k != "next" && k != "sig" {
-				return nil, unauth("unknown member %q in block %d", k, i)
-			}
-		}
-		raw, ok := env["b"].(map[string]any)
-		if !ok {
-			return nil, unauth("block %d: b must be an object", i)
-		}
-		next, ok := env["next"].(string)
-		if !ok {
-			return nil, unauth("block %d: next missing", i)
-		}
-		if pk, err := b64.DecodeString(next); err != nil || len(pk) != ed25519.PublicKeySize {
-			return nil, unauth("block %d: invalid next key", i)
-		}
-		sigText, ok := env["sig"].(string)
-		if !ok {
-			return nil, unauth("block %d: sig missing", i)
-		}
-		sig, err := b64.DecodeString(sigText)
-		if err != nil || len(sig) != ed25519.SignatureSize {
-			return nil, unauth("block %d: invalid signature", i)
 		}
 		blk, err := parseBlock(raw, i == 0)
 		if err != nil {
 			return nil, unauth("block %d: %v", i, err)
 		}
-		if i > 0 {
-			pk, _ := b64.DecodeString(g.nexts[i-1])
-			if !ed25519.Verify(pk, signingInput(raw, next, g.sigs[i-1]), sig) {
-				return nil, unauth("block %d: bad signature", i)
-			}
-		}
 		g.Blocks = append(g.Blocks, blk)
-		g.sigs = append(g.sigs, sig)
-		g.nexts = append(g.nexts, next)
 	}
-	if bearer {
-		ps, ok := top["proof"].(string)
-		if !ok {
-			return nil, unauth("grant proof missing")
-		}
-		seed, err := b64.DecodeString(ps)
-		if err != nil || len(seed) != ed25519.SeedSize {
-			return nil, unauth("invalid grant proof")
-		}
-		priv := ed25519.NewKeyFromSeed(seed)
-		want, _ := b64.DecodeString(g.nexts[len(g.nexts)-1])
-		if !bytes.Equal(priv.Public().(ed25519.PublicKey), want) {
-			return nil, unauth("grant proof does not match")
-		}
-		g.proof = priv
+	if c.nextSecret != nil {
+		g.proof = ed25519.NewKeyFromSeed(c.nextSecret)
 	}
 	return g, nil
 }
 
-// verifyRoot checks the root signature against pub.
-func (g *Grant) verifyRoot(pub ed25519.PublicKey) bool {
-	return ed25519.Verify(pub, signingInput(g.Blocks[0].Raw, g.nexts[0], nil), g.sigs[0])
+// NamesNS reports whether every block that carries ns names the namespace
+// (§C.2, §7). "*" names every namespace; only operator grants may use it,
+// which Verify checks once the key is known.
+func (g *Grant) NamesNS(ns string) bool {
+	for _, b := range g.Blocks {
+		if b.HasNS && !contains(b.NS, ns) && !contains(b.NS, "*") {
+			return false
+		}
+	}
+	return true
+}
+
+// usesStar reports whether any block names "*" in ns.
+func (g *Grant) usesStar() bool {
+	for _, b := range g.Blocks {
+		if contains(b.NS, "*") {
+			return true
+		}
+	}
+	return false
 }
 
 var rootFields = map[string]bool{"kid": true, "sub": true, "groups": true, "roles": true, "attrs": true, "ns": true, "can": true, "nbf": true, "exp": true, "at": true, "rules": true, "enc": true}

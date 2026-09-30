@@ -58,7 +58,7 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 		var seq int64
 		var author int64
 		err := t.QueryRow(`SELECT seq, author FROM ns_config WHERE ns = ? AND id = ?`, n.id, p.expected[:]).Scan(&seq, &author)
-		if err == nil && author == t.authorID(a.id()) {
+		if err == nil && author == t.actorID(a) {
 			var nsSeq int64
 			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, n.id, nsKindCode("config"), seq).Scan(&nsSeq)
 			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String()}
@@ -308,7 +308,7 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 			return asErr(err)
 		}
 		if n == nil {
-			return notFound()
+			return t.absentNS(req.NS, req.Cred)
 		}
 		if cc.IfNoneMatch {
 			// The name is taken, also by a purged namespace, whose name
@@ -334,7 +334,7 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 			res = p.replay
 			return nil
 		}
-		author := t.authorID(a.id())
+		author := t.actorID(a)
 		seq := t.insertConfig(n, p, author)
 		_, nsID := t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, author)
 		res = &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: p.id.String()}
@@ -399,7 +399,7 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if cfg.Successor != "" {
 		return nil, invalid("a new namespace cannot have a successor")
 	}
-	nn, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.authorID(a.id()))
+	nn, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.actorID(a))
 	t.sealedConfigWritten(nn, nil, cfg)
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: id.String()}, nil
 }
@@ -443,7 +443,7 @@ func (e *Engine) CreateBranch(ctx context.Context, req Request, br BranchRequest
 func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) {
 	base := t.nsByName(req.NS)
 	if base == nil {
-		return nil, notFound()
+		return nil, t.absentNS(req.NS, req.Cred)
 	}
 	if base.purged {
 		return nil, gone()
@@ -506,7 +506,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		var gid []byte
 		qerr := t.QueryRow(`SELECT seq, author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&gseq, &author, &gid)
 		if qerr == nil && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
-			author == t.authorID(a.id()) && ids.FromBytes(gid) == cfgID {
+			author == t.actorID(a) && ids.FromBytes(gid) == cfgID {
 			var seq int64
 			// The base's branch entry targets the branch's config genesis.
 			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, base.id, nsKindCode("branch"), gseq).Scan(&seq)
@@ -532,7 +532,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 			live++
 		}
 	}
-	if live >= bcfg.Limits.LiveBranches {
+	if live >= bcfg.Limits.BranchesPerNamespace {
 		return nil, limitErr(422, "too many live branches")
 	}
 	// Step 5.
@@ -577,7 +577,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		return nil, err
 	}
 	// Step 7.
-	author := t.authorID(a.id())
+	author := t.actorID(a)
 	r, dberr := t.Exec(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?)`, br.Name, base.id, atSeq, base.configSeq)
 	t.must(dberr)
 	bid, _ := r.LastInsertId()
@@ -599,7 +599,7 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
-			return notFound()
+			return t.absentNS(req.NS, req.Cred)
 		}
 		if n.purged {
 			return gone()
@@ -643,7 +643,7 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if err := t.checkRules(cfg, a, env, false); err != nil {
 			return err
 		}
-		out = t.purgeResource(n, name, t.authorID(a.id())).String()
+		out = t.purgeResource(n, name, t.actorID(a)).String()
 		return nil
 	})
 	return out, err
@@ -716,7 +716,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
-			return notFound()
+			return t.absentNS(req.NS, req.Cred)
 		}
 		if n.purged {
 			return gone()
@@ -781,7 +781,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if sh := t.remoteShadow(n); sh != nil {
 			t.purgeShadowNS(sh)
 		}
-		_, nsID := t.appendNS(n, map[string]any{"kind": "purge-ns"}, nil, nil, n.configSeq, t.authorID(a.id()))
+		_, nsID := t.appendNS(n, map[string]any{"kind": "purge-ns"}, nil, nil, n.configSeq, t.actorID(a))
 		out = nsID.String()
 		t.tags = append(t.tags, "ns:"+n.name)
 		t.flushDocs = true
@@ -871,7 +871,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
-			return notFound()
+			return t.absentNS(req.NS, req.Cred)
 		}
 		if n.purged {
 			return gone()
@@ -929,11 +929,18 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		h = t.protect(n, cfg, v.own.id, h)
 		rule := cfg.retentionRule(name)
 		dest, hasArchive := t.archiveDest(rule)
+		noArchive := rule != nil && rule.NoArchive
+		if noArchive {
+			// The rule prunes without an archive (§8.6).
+			dest, hasArchive = "", false
+		}
 		if e2e && !hasArchive {
 			return invalid("pruning an e2e resource needs an archive destination (§8.6)")
 		}
 		if !a.star {
-			if !hasArchive {
+			// Applying a rule that says "archive": false, within what it
+			// keeps, needs only prune: the * key was needed to write it.
+			if !hasArchive && !noArchive {
 				return forbidden("pruning where no archive is configured needs a grant chained to a * key")
 			}
 			if rule != nil && h.seq > t.retentionBoundary(rule, v.own) {
@@ -949,9 +956,9 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		var res *PruneResult
 		var perr error
 		if e2e {
-			res, perr = t.pruneToE2E(n, cfg, name, v.own, h, hid, pr.Snapshot, dest, t.authorID(a.id()))
+			res, perr = t.pruneToE2E(n, cfg, name, v.own, h, hid, pr.Snapshot, dest, t.actorID(a))
 		} else {
-			res, perr = t.pruneTo(n, name, v.own, h, keep, pr.Keep, dest, hasArchive, t.authorID(a.id()))
+			res, perr = t.pruneTo(n, name, v.own, h, keep, pr.Keep, dest, hasArchive, t.actorID(a))
 		}
 		if perr != nil {
 			return perr

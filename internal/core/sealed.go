@@ -427,7 +427,10 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 	var out []map[string]any
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
-		if n == nil || n.purged {
+		if n == nil {
+			return t.absentNS(ns, cred)
+		}
+		if n.purged {
 			return notFound()
 		}
 		cfg := t.config(n.configSeq)

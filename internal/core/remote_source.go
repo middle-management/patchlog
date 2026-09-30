@@ -79,7 +79,7 @@ func (e *Engine) RegisterRemoteBranch(ctx context.Context, req Request, rr Remot
 func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationResult, *Error) {
 	n := t.nsByName(req.NS)
 	if n == nil {
-		return nil, notFound()
+		return nil, t.absentNS(req.NS, req.Cred)
 	}
 	if n.purged {
 		return nil, gone()
@@ -123,7 +123,7 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 		return nil, invalid("at is not in the namespace's chain")
 	}
 	// Step 2: preconditions and idempotent retries.
-	author := t.authorID(a.id())
+	author := t.actorID(a)
 	now := t.now.UnixMilli()
 	row := t.registration(n.id, rr.Origin, rr.NS)
 	latest := func() *RegistrationResult {
@@ -187,7 +187,7 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	// Step 7.
 	entry := map[string]any{"kind": "branch", "remote": map[string]any{"origin": rr.Origin, "ns": rr.NS}, "at": atID.String()}
 	seq, nsID := t.appendNS(n, entry, nil, nil, n.configSeq, author)
-	expires := t.now.Add(cfg.Limits.RemoteBranchLife)
+	expires := t.now.Add(cfg.Limits.RemoteRegistration)
 	var prev any
 	if row != nil {
 		prev = row.nsSeq

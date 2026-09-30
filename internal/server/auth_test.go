@@ -116,16 +116,12 @@ func TestAuthChecks(t *testing.T) {
 	expectCode(t, e.write("PATCH", "sec", "a", tomb, []any{}, appendOnly), 403, "forbidden")
 	a = e.appendRev("sec", "a", tomb, []any{}, f.issuerG)
 
-	// Time: expired and not-yet-valid grants.
+	// Time: expired and not-yet-valid grants are no usable grant (§C.2).
 	short := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"append"}, map[string]any{"exp": e.clock.Now().Add(time.Minute).Format(time.RFC3339)})
 	future := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"append"}, map[string]any{"nbf": e.clock.Now().Add(30 * time.Minute).Format(time.RFC3339)})
-	if r := e.write("PATCH", "sec", "a", a, ops(op("add", "/nbf", 1.0)), future); r.Code != 401 && r.Code != 403 {
-		t.Fatalf("not-yet-valid grant: %d", r.Code)
-	}
+	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/nbf", 1.0)), future), 401, "unauthenticated")
 	e.clock.Advance(2 * time.Minute)
-	if r := e.write("PATCH", "sec", "a", a, ops(op("add", "/exp", 1.0)), short); r.Code != 401 && r.Code != 403 {
-		t.Fatalf("expired grant: %d", r.Code)
-	}
+	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/exp", 1.0)), short), 401, "unauthenticated")
 
 	// Author is the root sub; a re-minted grant for the same sub is the same principal.
 	g2 := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"append"})
@@ -239,10 +235,10 @@ func TestAuthNarrowingRolesRevocation(t *testing.T) {
 
 	// Revocation: a narrowing block, then a root block.
 	expect(t, e.patchNS("sec", ops(op("add", "/revoked", []any{revocationID(t, narrowed, 1)})), f.adminG), 201)
-	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/i18n/fi", "x")), narrowed), 403, "forbidden")
+	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/i18n/fi", "x")), narrowed), 401, "unauthenticated")
 	a = e.appendRev("sec", "a", a, ops(op("add", "/i18n/fi", "x")), root.Encode())
 	expect(t, e.patchNS("sec", ops(op("add", "/revoked/-", revocationID(t, root.Encode(), 0))), f.adminG), 201)
-	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/i18n/is", "x")), root.Encode()), 403, "forbidden")
+	expectCode(t, e.write("PATCH", "sec", "a", a, ops(op("add", "/i18n/is", "x")), root.Encode()), 401, "unauthenticated")
 	// Revocation is by block, however re-serialised; other grants of the key still work.
 	a = e.appendRev("sec", "a", a, ops(op("add", "/z", 1.0)), f.issuerG)
 	// Revoking needs a * key.
@@ -370,7 +366,7 @@ func TestAuthBranches(t *testing.T) {
 	victim := e.grant(f.issuer, "user:v", []string{"sec", "sec-b"}, []string{"read"})
 	expect(t, e.get("/r/sec-b/a", victim), 302)
 	expect(t, e.patchNS("sec", ops(op("add", "/revoked", []any{revocationID(t, victim, 0)})), f.adminG), 201)
-	expect(t, e.get("/r/sec-b/a", victim), 404) // a rejected grant has no read: 404
+	expect(t, e.get("/r/sec-b/a", victim), 401) // a revoked grant is no usable grant (§C.2)
 	// Keys follow the base: removing the issuer key from the base disables it in the branch.
 	cfg := e.get("/ns/sec/rev/"+e.nsHead("sec", f.adminG), f.adminG).Obj()
 	keys := cfg["keys"].([]any)
