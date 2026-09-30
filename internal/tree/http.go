@@ -13,10 +13,12 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Cache-Control values (§9). A listing's at is the service's combined
@@ -228,6 +230,25 @@ var ops = map[string]bool{
 // ?min= waits until the service has applied an ns_id (§A.5): {ns}:{ns_id}
 // for the catalog or a followed content namespace, repeatable, or a bare
 // {ns_id} of any of them.
+//
+// A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles are
+// the only values a listing takes from documents' content (names, heads,
+// hrefs, structure, order and cursors stay in the clear, and content
+// namespaces contribute nothing else), so a listing has one sealed source,
+// the catalog. A reader of the whole catalog gets the listing sealed as
+// one JWE under the catalog's current epoch key, Content-Type
+// application/jose, pl { ns, view } where view is the listing's request
+// target (/{catalog}/at/{at}[/g/{gs}]/{op}?{query}; an at URL whose query
+// isn't in the canonical form the redirects give is redirected to it). A
+// reader whose grant restricts catalog resources (or who sees nodes only
+// through roles) gets JSON in which every node with a title carries
+// "sealed": JWE of { title } under that catalog resource's K_r, pl { ns,
+// name, view }, instead of "title". Sealed listings are produced once per
+// view (a rotation moves at) and then served unchanged from memory.
+//
+//	GET /_status    each followed namespace's encryption level and epoch,
+//	                whether listings are sealed, and why a namespace is
+//	                skipped (or its documents not read)
 func (s *Service) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
 
 func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -241,6 +262,9 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	var at, gs, op string
 	isAt := false
 	switch {
+	case len(segs) == 1 && segs[0] == "_status":
+		s.serveStatus(w)
+		return
 	case len(segs) == 2 && segs[0] == cat:
 		op = segs[1]
 	case len(segs) == 4 && segs[0] == cat && segs[1] == "at":
@@ -292,6 +316,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	cat := s.opt.Catalog
 	if _, purged, _ := s.state(); purged {
 		WriteError(w, http.StatusGone, "gone", "catalog purged")
+		return
+	}
+	if reason := s.keys.Skipped(cat); reason != "" {
+		w.Header().Set("Retry-After", "60")
+		WriteError(w, http.StatusServiceUnavailable, "skipped", "the service does not consume the catalog: "+reason)
 		return
 	}
 	v, err := s.viewer(ctx, r)
@@ -354,6 +383,32 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 
+	info, key, err := s.keys.Current(ctx, cat)
+	if err != nil {
+		s.opt.Logf("tree: keys of %s: %v", cat, err)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals listings of the catalog")
+		return
+	}
+	var view derived.View
+	perEntry := false
+	if info.Protected() {
+		// view binds the listing to its URL (§E.2.6): only the canonical
+		// form is served.
+		view = derived.View{NS: cat, Target: target(at) + encodeQuery(vals, "min")}
+		if r.URL.RequestURI() != view.Target {
+			setPtr()
+			redirect(w, view.Target)
+			return
+		}
+		perEntry = !v.catAll
+		if b, ok := s.sealed.Get(view.Target); ok {
+			s.writeListing(w, v, at, "ns:"+cat+","+ManyTag(cat), b, perEntry)
+			return
+		}
+	}
+
 	var (
 		status = http.StatusOK
 		body   any
@@ -361,6 +416,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		errMsg string
 		got    string
 		nss    []string
+		serr   error
 	)
 	s.View(func(g *Graph, curMap map[string]string) {
 		got, nss = CombinedAt(g, curMap)
@@ -368,6 +424,15 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			return
 		}
 		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: at}
+		if perEntry {
+			q.sealTitle = func(name, title string) string {
+				jwe, err := derived.SealItem(key, view, name, map[string]any{"title": title})
+				if err != nil && serr == nil {
+					serr = err
+				}
+				return jwe
+			}
+		}
 		body, status, errMsg = q.run(op)
 		tags = q.tags
 	})
@@ -380,15 +445,59 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteError(w, status, codeFor(status), errMsg)
 		return
 	}
+	if info.Protected() {
+		var b []byte
+		if serr == nil {
+			if perEntry {
+				b, serr = derived.Marshal(body)
+			} else {
+				var jwe string
+				jwe, serr = derived.SealView(key, view, body)
+				b = []byte(jwe)
+			}
+		}
+		if serr != nil {
+			s.opt.Logf("tree: sealing a listing: %v", serr)
+			WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
+			return
+		}
+		s.writeListing(w, v, at, tags.header(cat, nss), s.sealed.Put(view.Target, nss, b), perEntry)
+		return
+	}
+	setListingHeaders(w, v, at, tags.header(cat, nss))
+	WriteJSON(w, http.StatusOK, body)
+}
+
+func setListingHeaders(w http.ResponseWriter, v *viewer, at, tags string) {
 	if v.anon {
 		w.Header().Set("Cache-Control", ccListing)
 	} else {
 		w.Header().Set("Cache-Control", ccPrivateList)
 		w.Header().Set("CDN-Cache-Control", cdnListing)
 	}
-	w.Header().Set("Cache-Tag", tags.header(cat, nss))
+	w.Header().Set("Cache-Tag", tags)
 	w.Header().Set("X-Namespace-Revision", at)
-	WriteJSON(w, http.StatusOK, body)
+}
+
+// writeListing writes a sealed listing: the JWE (application/jose), or the
+// JSON with per-node sealed titles. A listing served from memory is tagged
+// ns:{catalog} and rs:{catalog}: its r: tags were on the first response,
+// and every purge both drops it from memory and purges rs:{catalog}.
+func (s *Service) writeListing(w http.ResponseWriter, v *viewer, at, tags string, b []byte, isJSON bool) {
+	setListingHeaders(w, v, at, tags)
+	if isJSON {
+		w.Header().Set("Content-Type", "application/json")
+	} else {
+		w.Header().Set("Content-Type", seal.ContentType)
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(b)
+}
+
+// serveStatus answers GET /_status (Addendum E).
+func (s *Service) serveStatus(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	WriteJSON(w, http.StatusOK, map[string]any{"namespaces": s.keys.Status(s.followed())})
 }
 
 func codeFor(status int) string {
@@ -596,6 +705,20 @@ type query struct {
 	vals url.Values
 	tags tagSet
 	at   string
+	// sealTitle, if set, seals a catalog node's title for per-entry
+	// sealing (§E.2.6): the entry carries "sealed" instead of "title".
+	sealTitle func(name, title string) string
+}
+
+// title sets a node's title on an entry, in the clear or sealed.
+func (q *query) title(m map[string]any, n *Node) {
+	switch {
+	case n.Title == "":
+	case q.sealTitle != nil:
+		m["sealed"] = q.sealTitle(n.Name, n.Title)
+	default:
+		m["title"] = n.Title
+	}
 }
 
 func (q *query) run(op string) (any, int, string) {
@@ -656,9 +779,7 @@ func (q *query) node(param string) (*Node, int, string) {
 func (q *query) entry(n *Node) map[string]any {
 	q.tags.node(q.g, n.Name)
 	m := map[string]any{"href": q.g.Href(n.Name), "name": n.Name, "kind": "folder"}
-	if n.Title != "" {
-		m["title"] = n.Title
-	}
+	q.title(m, n)
 	if n.Kind == KindPlacement {
 		m["kind"] = "item"
 		if it := n.Item(); it != "" {
@@ -848,9 +969,7 @@ func (q *query) pathJSON(ps [][]*Node) (out []any, hidden int) {
 			}
 			q.tags.node(q.g, x.Name)
 			e := map[string]any{"href": q.g.Href(x.Name), "name": x.Name}
-			if x.Title != "" {
-				e["title"] = x.Title
-			}
+			q.title(e, x)
 			arr = append(arr, e)
 		}
 		if !ok {

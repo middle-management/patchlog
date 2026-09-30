@@ -12,10 +12,12 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Cache-Control values (§9).
@@ -46,6 +48,24 @@ var validNS = client.ValidNSName
 //
 // Private namespaces need Authorization: Bearer <grant>; a request without
 // the right gs is redirected to it.
+//
+// Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). A result
+// has one source, so a reader of the whole namespace gets it sealed as one
+// JWE under the namespace's current epoch key, Content-Type
+// application/jose, pl { ns, view } where view is the result's request
+// target (/[g/{gs}/]{ns}/at/{ns_id}?{query}; an at URL whose query isn't in
+// the canonical form the redirects give is redirected to it). A reader
+// whose grant restricts resources may hold only per-resource keys, so it
+// gets JSON { at, ns, hits, next? } in which each hit keeps resource, id
+// and url in the clear and carries its score, schema and facets as
+// "sealed": JWE under its resource's K_r, pl { ns, name, view }; counts,
+// which aggregate over resources, are refused (400) for such readers.
+// Sealed results are produced once per view (so per epoch: a rotation
+// moves the checkpoint) and then served unchanged from memory.
+//
+//	GET /_status                  each followed namespace's encryption level and
+//	                              epoch, whether results are sealed, and why a
+//	                              namespace is skipped
 func (ix *Index) Handler() http.Handler {
 	return http.HandlerFunc(ix.serveHTTP)
 }
@@ -60,6 +80,9 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	var gs, ns, at string
 	isAt := false
 	switch {
+	case len(segs) == 1 && segs[0] == "_status":
+		ix.serveStatus(w)
+		return
 	case len(segs) == 1 && segs[0] != "":
 		ns = segs[0]
 	case len(segs) == 3 && segs[1] == "at":
@@ -188,6 +211,11 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeErr(w, http.StatusGone, "gone", "namespace purged")
 		return
 	}
+	if reason := ix.keys.Skipped(ns); reason != "" {
+		w.Header().Set("Retry-After", "60")
+		writeErr(w, http.StatusServiceUnavailable, "skipped", "the index does not consume this namespace: "+reason)
+		return
+	}
 	vals := r.URL.Query()
 	q, err := ParseQuery(vals)
 	if err != nil {
@@ -261,6 +289,33 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return
 	}
 
+	info, key, err := ix.keys.Current(ctx, ns)
+	if err != nil {
+		ix.opt.Logf("index: keys of %s: %v", ns, err)
+		w.Header().Set("Retry-After", "5")
+		writeErr(w, http.StatusServiceUnavailable, "keys", "the index cannot obtain the key that seals results of this namespace")
+		return
+	}
+	var view derived.View
+	if info.Protected() {
+		// view binds the result to its URL (§E.2.6): only the canonical
+		// form is served.
+		view = derived.View{NS: ns, Target: base(a, ns) + "/at/" + at + encodeQuery(vals, "min")}
+		if r.URL.RequestURI() != view.Target {
+			setPtrHeaders()
+			redirect(w, view.Target)
+			return
+		}
+		if !a.all && len(q.Counts) > 0 {
+			writeErr(w, http.StatusBadRequest, "bad_input", "counts over a sealed namespace need a grant that reads the whole namespace")
+			return
+		}
+		if b, ok := ix.sealed.Get(view.Target); ok {
+			ix.writeSealed(w, a, ns, at, "", b, !a.all)
+			return
+		}
+	}
+
 	var allow func(string) bool
 	if !a.all {
 		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
@@ -291,6 +346,23 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		for p, vs := range h.Facets {
 			m[p] = vs
 		}
+		if info.Protected() && !a.all {
+			// Per-entry sealing: what the document gave (score, schema,
+			// facets) under its resource's key; names, ids and URLs stay.
+			values := map[string]any{}
+			for k, v := range m {
+				if k != "resource" && k != "id" && k != "url" {
+					values[k] = v
+				}
+			}
+			jwe, err := derived.SealItem(key, view, h.Resource, values)
+			if err != nil {
+				ix.opt.Logf("index: sealing a hit: %v", err)
+				writeErr(w, http.StatusInternalServerError, "internal", "sealing failed")
+				return
+			}
+			m = map[string]any{"resource": m["resource"], "id": m["id"], "url": m["url"], "sealed": jwe}
+		}
 		hits = append(hits, m)
 	}
 	body["hits"] = hits
@@ -305,12 +377,79 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if res.Counts != nil {
 		body["counts"] = res.Counts
 	}
+	tags := resultTags(ns, res)
+	if info.Protected() {
+		var b []byte
+		if a.all {
+			jwe, err := derived.SealView(key, view, body)
+			if err != nil {
+				ix.opt.Logf("index: sealing a result: %v", err)
+				writeErr(w, http.StatusInternalServerError, "internal", "sealing failed")
+				return
+			}
+			b = []byte(jwe)
+		} else if b, err = derived.Marshal(body); err != nil {
+			writeErr(w, http.StatusInternalServerError, "internal", "encoding failed")
+			return
+		}
+		ix.writeSealed(w, a, ns, at, tags, ix.sealed.Put(view.Target, []string{ns}, b), !a.all)
+		return
+	}
+	setResultHeaders(w, a, at, tags)
+	writeJSON(w, http.StatusOK, body)
+}
+
+func setResultHeaders(w http.ResponseWriter, a *access, at, tags string) {
 	if a.public {
 		w.Header().Set("Cache-Control", ccImmutable)
 	} else {
 		w.Header().Set("Cache-Control", ccPrivateImm)
 		w.Header().Set("CDN-Cache-Control", cdnImmutable)
 	}
+	w.Header().Set("Cache-Tag", tags)
+	w.Header().Set("X-Namespace-Revision", at)
+}
+
+// writeSealed writes a sealed result: the JWE (application/jose), or for a
+// resource-restricted reader the JSON with per-hit sealed values. A result
+// served from memory carries idx:{ns} and the counts tag only (tags ""):
+// its r: tags were on the first response, and a purge both drops it from
+// memory and purges cached copies through those tags and idx:{ns}.
+func (ix *Index) writeSealed(w http.ResponseWriter, a *access, ns, at, tags string, b []byte, isJSON bool) {
+	if tags == "" {
+		tags = "idx:" + ns + "," + countsTag(ns)
+	}
+	setResultHeaders(w, a, at, tags)
+	if isJSON {
+		w.Header().Set("Content-Type", "application/json")
+	} else {
+		w.Header().Set("Content-Type", seal.ContentType)
+	}
+	w.WriteHeader(http.StatusOK)
+	w.Write(b)
+}
+
+// serveStatus answers GET /_status (Addendum E): each followed namespace's
+// encryption level and epoch, whether its results are sealed, and why it is
+// skipped if it is.
+func (ix *Index) serveStatus(w http.ResponseWriter) {
+	ix.mu.Lock()
+	nss := make([]string, 0, len(ix.roots))
+	for ns := range ix.roots {
+		nss = append(nss, ns)
+	}
+	for ns := range ix.cur {
+		if !ix.roots[ns] {
+			nss = append(nss, ns)
+		}
+	}
+	ix.mu.Unlock()
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"namespaces": ix.keys.Status(nss)})
+}
+
+// resultTags is a result's Cache-Tag.
+func resultTags(ns string, res *Result) string {
 	// §A.4: idx:{ns} for the namespace, r:{ns}/{name} for every resource
 	// the result shows, so a purge of any of them removes it from caches
 	// (Apply purges these). Facet counts aggregate values of hits beyond
@@ -323,9 +462,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if res.Counts != nil {
 		tags = append(tags, countsTag(ns))
 	}
-	w.Header().Set("Cache-Tag", strings.Join(tags, ","))
-	w.Header().Set("X-Namespace-Revision", at)
-	writeJSON(w, http.StatusOK, body)
+	return strings.Join(tags, ",")
 }
 
 // query runs q in one read transaction and returns the checkpoint it read
