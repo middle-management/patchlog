@@ -35,6 +35,10 @@
 //     the successor is a branch too, and its batches are the rebase.
 //   - a branch with no head, tombstone or batch entry of its own counts as
 //     merged.
+//   - at E3, entries for the branch's keyring resource don't count in any
+//     of these, since the keyring is never merged (§F.8.1); a batch counts
+//     only if it has other items. Everything stays plaintext, so the
+//     janitor needs no keys.
 //
 // The janitor needs read on bases and branches and purge-ns on branches;
 // it never writes to a base.
@@ -177,15 +181,18 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 		return d, err
 	}
 
-	// Claims, verified.
+	// Claims, verified. At E3 the branch's keyring is never merged, so
+	// its entries don't count as document changes (§F.6, §F.8.1).
+	enc, _ := doc.Value["encryption"].(map[string]any)
+	e2e := enc["level"] == "e2e"
 	var why []string
-	if !hasDocEntries(log, -1) {
+	if !hasDocEntries(log, -1, e2e) {
 		d.Claim = "merged"
 	}
 	if d.Claim == "" {
 		if _, ok := doc.Value["merged"]; ok {
 			at, _ := bref["at"].(string)
-			ok, reason, err := j.verifyMerged(ctx, base, at, ns, log)
+			ok, reason, err := j.verifyMerged(ctx, base, at, ns, log, e2e)
 			if err != nil {
 				return d, err
 			}
@@ -198,7 +205,7 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 	}
 	if d.Claim == "" {
 		if s, _ := doc.Value["successor"].(string); s != "" {
-			ok, reason, err := j.verifySuperseded(ctx, base, ns, s, log)
+			ok, reason, err := j.verifySuperseded(ctx, base, ns, s, log, e2e)
 			if err != nil {
 				return d, err
 			}
@@ -297,19 +304,30 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 }
 
 // isDocEntry reports head, tombstone and batch entries: the ones that change
-// documents. Config, prune and (propagated) purge entries don't count.
-func isDocEntry(e client.NSEntry) bool {
+// documents. Config, prune and (propagated) purge entries don't count. In
+// an e2e branch (e2e) neither do entries for its keyring resource, which is
+// never merged (§F.8.1): a batch counts only if it has other items.
+func isDocEntry(e client.NSEntry, e2e bool) bool {
 	switch e.Kind {
-	case "head", "tombstone", "batch":
-		return true
+	case "head", "tombstone":
+		return !e2e || e.Resource != client.KeyringName
+	case "batch":
+		if !e2e {
+			return true
+		}
+		for _, s := range e.Entries {
+			if isDocEntry(s, e2e) {
+				return true
+			}
+		}
 	}
 	return false
 }
 
 // hasDocEntries reports a document entry in log after index i.
-func hasDocEntries(log []client.NSEntry, i int) bool {
+func hasDocEntries(log []client.NSEntry, i int, e2e bool) bool {
 	for _, e := range log[i+1:] {
-		if isDocEntry(e) {
+		if isDocEntry(e, e2e) {
 			return true
 		}
 	}
@@ -320,7 +338,7 @@ func hasDocEntries(log []client.NSEntry, i int) bool {
 // source.at is in the branch's chain, and checks that the branch changed no
 // document after it. If authors is non-nil, only batches by a principal
 // listed in *authors count.
-func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author) (bool, string) {
+func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author, e2e bool) (bool, string) {
 	pos := map[string]int{}
 	for i, e := range blog {
 		pos[e.ID] = i
@@ -359,13 +377,13 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, a
 		}
 		return false, "no batch without origin has source.ns = " + branch
 	}
-	if hasDocEntries(blog, best) {
+	if hasDocEntries(blog, best, e2e) {
 		return false, "the branch changed documents after " + blog[best].ID
 	}
 	return true, ""
 }
 
-func (j *Janitor) verifyMerged(ctx context.Context, base, at, ns string, blog []client.NSEntry) (bool, string, error) {
+func (j *Janitor) verifyMerged(ctx context.Context, base, at, ns string, blog []client.NSEntry, e2e bool) (bool, string, error) {
 	bh, err := j.c.NSHead(ctx, base)
 	if err != nil {
 		return false, "", err
@@ -385,11 +403,11 @@ func (j *Janitor) verifyMerged(ctx context.Context, base, at, ns string, blog []
 	if !declared {
 		return false, "the base " + base + " declares no merge.authors, so no merge batch can be trusted (§F.3)", nil
 	}
-	ok, why := coveredBy(entries, ns, blog, &authors)
+	ok, why := coveredBy(entries, ns, blog, &authors, e2e)
 	return ok, why, nil
 }
 
-func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, blog []client.NSEntry) (bool, string, error) {
+func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, blog []client.NSEntry, e2e bool) (bool, string, error) {
 	sh, err := j.c.NSHead(ctx, succ)
 	if client.IsNotFound(err) {
 		return false, "successor " + succ + " doesn't exist", nil
@@ -426,7 +444,7 @@ func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, b
 		return false, "", err
 	}
 	// §F.6 names no merge.authors check for the successor's batch.
-	ok, why := coveredBy(entries, ns, blog, nil)
+	ok, why := coveredBy(entries, ns, blog, nil, e2e)
 	return ok, why, nil
 }
 
