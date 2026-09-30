@@ -105,8 +105,8 @@ type Config struct {
 	Base       *BaseRef
 	// Encryption is encryption.level (Addendum E), "" if none.
 	Encryption string
-	// Epoch is encryption.epoch of a sealed namespace (E2, §E.2.1): 1 if
-	// absent, 0 unless sealed. HistoryEpochs is encryption.historyEpochs,
+	// Epoch is encryption.epoch of a sealed or e2e namespace (§E.2.1,
+	// §E.3.2): 1 if absent, 0 otherwise. HistoryEpochs is encryption.historyEpochs,
 	// 0 if absent (no cap).
 	Epoch         int
 	HistoryEpochs int
@@ -307,18 +307,16 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			}
 			lv, _ := e["level"].(string)
 			switch lv {
-			case "at-rest", "sealed":
-			case "e2e":
-				return nil, fmt.Errorf("/encryption/level %q (Addendum E.3) is not supported by this server; only \"at-rest\" and \"sealed\" are", lv)
+			case "at-rest", "sealed", "e2e":
 			default:
 				return nil, fmt.Errorf(`/encryption/level must be "at-rest", "sealed" or "e2e"`)
 			}
-			if lv != "sealed" {
+			if lv == "at-rest" {
 				if _, has := e["epoch"]; has {
-					return nil, fmt.Errorf("/encryption/epoch is only for sealed namespaces")
+					return nil, fmt.Errorf("/encryption/epoch is only for sealed and e2e namespaces")
 				}
 				if _, has := e["historyEpochs"]; has {
-					return nil, fmt.Errorf("/encryption/historyEpochs is only for sealed namespaces")
+					return nil, fmt.Errorf("/encryption/historyEpochs is only for sealed and e2e namespaces")
 				}
 			} else {
 				// Epochs count from 1; an absent epoch is 1 (§E.2.1).

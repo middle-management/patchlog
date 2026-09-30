@@ -505,7 +505,7 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 		return nil, nil, nil, err
 	}
 	if cfg.level >= levelSealed {
-		return nil, nil, nil, invalid("/encryption: remote branches cannot be sealed on this server (§G.5)")
+		return nil, nil, nil, invalid("/encryption: remote branches cannot be sealed or e2e on this server (§G.5)")
 	}
 	return cfg, doc.(map[string]any), a, nil
 }

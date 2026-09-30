@@ -97,6 +97,12 @@ type Rev struct {
 	Horizon string
 	Archive string // URL of the archive holding a pruned revision, if any (§8.6)
 	Public  bool
+	// Fold is set (Status 302) for a revision of an e2e resource (§E.3):
+	// the server has no document, and the client folds the log from
+	// FoldSince (the latest snapshot at or before the revision, "" for
+	// genesis) up to the revision.
+	Fold      bool
+	FoldSince string
 }
 
 // ResourceRev serves the document at a revision.
@@ -134,6 +140,21 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		if row.kind == kindTombstone {
 			out.Status, out.Code = 410, "tombstone"
+			return nil
+		}
+		if t.e2eContent(n, name) {
+			if !row.patches.Valid {
+				var state int
+				t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, row.res).Scan(&state))
+				if state == statePurged {
+					out.Status = 410
+					return nil
+				}
+				out.Status, out.Code = 410, "pruned"
+				out.Horizon, out.Archive = t.horizonID(row.res), t.archiveURL(row.res, row.seq)
+				return nil
+			}
+			out.Status, out.Fold, out.FoldSince = 302, true, t.e2eFoldSince(row)
 			return nil
 		}
 		b, err := t.docBytesAt(row)
@@ -247,6 +268,15 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		}
 		out.Status = 200
 		out.Last = since
+		if sinceID != nil && id != "" && t.e2eContent(n, name) {
+			// An e2e range starting at a snapshot (a pruning horizon)
+			// begins with it (§8.6): the client folds from there.
+			if srow := t.findInAncestry(to, *sinceID); srow != nil {
+				if jwe := t.e2eSnapshot(srow); jwe != "" {
+					out.Entries = append(out.Entries, map[string]any{"id": since, "kind": "snapshot", "snapshot": jwe})
+				}
+			}
+		}
 		sealed := t.isSealedNS(n)
 		for _, e := range entries {
 			v := e.value()

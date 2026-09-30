@@ -262,6 +262,13 @@ func (t *tx) authorize(a *actor, verb, resource string) *Error {
 // rules that refer solely to action, resource, principal and now are
 // evaluated.
 func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool) *Error {
+	return t.grantRulesMode(a, verb, roles, env, stepOne, false)
+}
+
+// grantRulesMode is grantRules; with blind, a rule reading writes or /doc
+// fails (sealed writes of e2e namespaces, §6.2): a key-scope or block rule
+// refuses the request, and a role with one doesn't allow it.
+func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne, blind bool) *Error {
 	if a.verified == nil {
 		return nil
 	}
@@ -273,6 +280,9 @@ func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]an
 			}
 			if stepOne && !r.OnlyRefs(stepOneRefs...) {
 				continue
+			}
+			if _, b := blindRule(r); blind && b {
+				return forbidden("a grant or key rule reads writes or /doc, which the server can't see in an e2e namespace (§6.2, §E.3.2)")
 			}
 			if !r.Eval(env) {
 				return forbidden("a grant or key rule refuses the request")
@@ -295,7 +305,7 @@ func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]an
 				if stepOne && !r.OnlyRefs(stepOneRefs...) {
 					continue
 				}
-				if !r.Eval(env) {
+				if _, b := blindRule(r); (blind && b) || !r.Eval(env) {
 					ok = false
 					break
 				}

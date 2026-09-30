@@ -318,6 +318,9 @@ func (c *Client) Purge(ctx context.Context, ns, name, head string, force bool) (
 type PruneRequest struct {
 	Horizon string
 	Keep    []string // replaces the resource's earlier keep set; nil = none
+	// Snapshot is the horizon's document sealed by a key holder, required
+	// for resources of e2e namespaces (§8.6; see E2E.Prune).
+	Snapshot string
 }
 
 // PruneResult is the outcome of a prune.
@@ -335,6 +338,9 @@ func (c *Client) Prune(ctx context.Context, ns, name string, p PruneRequest) (*P
 	body := map[string]any{"horizon": p.Horizon}
 	if p.Keep != nil {
 		body["keep"] = p.Keep
+	}
+	if p.Snapshot != "" {
+		body["snapshot"] = p.Snapshot
 	}
 	b, err := encodeJSON(body)
 	if err != nil {

@@ -215,6 +215,20 @@ func (p *ExportPlan) loadNS(ctx context.Context, ns string) error {
 	if err != nil {
 		return fmt.Errorf("export: namespace %s: %w", ns, err)
 	}
+	lv, err := p.c.EncryptionLevel(ctx, ns)
+	if err != nil {
+		return fmt.Errorf("export: namespace %s: %w", ns, err)
+	}
+	if lv == "e2e" {
+		// §G.5: a snapshot of an e2e namespace needs a client with keys,
+		// and a sealed genesis isn't deterministic; full histories would
+		// carry the ciphertext, but this exporter folds documents to find
+		// dependencies, which it can't do over ciphertext.
+		if p.opt.Mode == Snapshot {
+			return fmt.Errorf("export: namespace %s is e2e (Addendum E.3): a snapshot needs a client holding its keys, and a sealed genesis isn't deterministic (§G.5); not supported", ns)
+		}
+		return fmt.Errorf("export: namespace %s is e2e (Addendum E.3): this exporter can't fold its ciphertext to follow dependencies; not supported", ns)
+	}
 	items, err := p.c.Heads(ctx, ns, h.ID)
 	if err != nil {
 		return fmt.Errorf("export: namespace %s heads: %w", ns, err)

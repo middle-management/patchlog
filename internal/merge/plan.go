@@ -222,6 +222,18 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		opt.MaxRetries = 3
 	}
 	p := &Plan{c: c, Target: target, Branch: branch, opt: opt, logs: map[string]ancestry{}}
+	// Sealed patch sets bind their namespace (§E.3.1): merging an e2e
+	// branch means decrypting and re-encrypting under the target's keys,
+	// never a fast-forward (§F.8), which this tool doesn't do.
+	for _, ns := range []string{branch, target} {
+		lv, err := c.EncryptionLevel(ctx, ns)
+		if err != nil {
+			return nil, fmt.Errorf("merge: %s: %w", ns, err)
+		}
+		if lv == "e2e" {
+			return nil, fmt.Errorf("merge: %s is an e2e namespace (Addendum E.3): its merges must decrypt and re-encrypt under the target's keys in a client holding both, never fast-forward (§F.8); this merge tool doesn't support that", ns)
+		}
+	}
 	bh, err := c.NSHead(ctx, branch)
 	if err != nil {
 		return nil, fmt.Errorf("merge: branch %s: %w", branch, err)

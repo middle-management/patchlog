@@ -102,11 +102,11 @@ func epochAAD(ns int64, epoch int) []byte {
 }
 
 // cachePublic reports whether a namespace's responses use the public cache
-// classes of §9: public namespaces, and sealed ones whatever their read
-// mode (§E.2.5).
+// classes of §9: public namespaces, and sealed and e2e ones whatever their
+// read mode (§E.2.5): they only ever serve ciphertext.
 func (t *tx) cachePublic(n *nsRow) bool {
 	cfg := t.config(n.configSeq)
-	return cfg.Read == "public" || cfg.level == levelSealed
+	return cfg.Read == "public" || cfg.level >= levelSealed
 }
 
 // isSealedNS reports whether n serves sealed content.
@@ -119,6 +119,7 @@ func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == l
 // -rotate-on-revoke a change that revokes access (a new revocation, a key
 // removed or changed) queues a rotation.
 func (t *tx) sealedConfigWritten(n *nsRow, old, cfg *Config) {
+	t.e2eConfigWritten(n, old, cfg)
 	if cfg.level != levelSealed {
 		return
 	}
@@ -449,6 +450,16 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 				return notFound()
 			}
 		}
+		if cfg.level == levelE2E {
+			// The relay is a read of the keyring (§E.3.2); per-resource
+			// keys don't exist at E3.
+			if a.verified != nil && t.grantRules(a, "read", nil, t.basicEnvelope("read", KeyringName, a), false) != nil {
+				return notFound()
+			}
+			var err error
+			out, err = t.keysE2E(n, cfg, a, kr)
+			return err
+		}
 		perResource := !a.unrestrictedRead()
 		if !perResource && t.grantRules(a, "read", nil, t.basicEnvelope("read", "", a), false) != nil {
 			return notFound()
@@ -535,21 +546,34 @@ func recipientOf(a *actor) *ecdh.PublicKey {
 
 // grantEpochs lists the epochs a grant may have keys for, ascending.
 func (t *tx) grantEpochs(n *nsRow, cfg *Config, a *actor) []int {
-	type ep struct {
-		e       int
-		created time.Time
-	}
-	rows, err := t.Query(`SELECT epoch, created FROM epoch_keys WHERE ns = ? AND epoch <= ? ORDER BY epoch`, n.id, cfg.Epoch)
+	return t.grantEpochsOf(t.epochStarts(`epoch_keys`, n.id, cfg.Epoch), cfg, a)
+}
+
+// epochStart is an epoch and when it began.
+type epochStart struct {
+	e       int
+	created time.Time
+}
+
+// epochStarts lists the epochs of ns up to max from table (epoch_keys, or
+// e2e_epochs for e2e namespaces), ascending.
+func (t *tx) epochStarts(table string, ns int64, max int) []epochStart {
+	rows, err := t.Query(`SELECT epoch, created FROM `+table+` WHERE ns = ? AND epoch <= ? ORDER BY epoch`, ns, max)
 	t.must(err)
-	var all []ep
+	defer rows.Close()
+	var all []epochStart
 	for rows.Next() {
-		var x ep
+		var x epochStart
 		var ms int64
 		t.must(rows.Scan(&x.e, &ms))
 		x.created = time.UnixMilli(ms)
 		all = append(all, x)
 	}
-	rows.Close()
+	return all
+}
+
+// grantEpochsOf applies the §E.2.3 epoch range of a grant to all.
+func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 	if len(all) == 0 {
 		return nil
 	}

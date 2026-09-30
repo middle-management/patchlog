@@ -215,7 +215,9 @@ func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
 		}
 		rows.Close()
 		for _, n := range all {
-			if len(t.config(n.configSeq).Retention) == 0 {
+			// At E3 the server can't compute the snapshot a prune needs:
+			// a key-holding janitor applies retention (§8.6).
+			if c := t.config(n.configSeq); len(c.Retention) == 0 || c.level == levelE2E {
 				continue
 			}
 			rs, err := t.Query(`SELECT name FROM resources WHERE ns = ? AND state != ? AND head_seq IS NOT NULL ORDER BY name`, n.id, statePurged)
@@ -263,7 +265,7 @@ func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err erro
 	}
 	cfg := t.config(n.configSeq)
 	rule := cfg.retentionRule(name)
-	if rule == nil {
+	if rule == nil || cfg.level == levelE2E {
 		return false, false, nil
 	}
 	own := t.resource(n.id, name)

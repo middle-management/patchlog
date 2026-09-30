@@ -234,7 +234,7 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 // public even if its base isn't (a relaxation of §7.4): it only ever serves
 // ciphertext under its own keys (§E.2.5).
 func sealedPair(branchLevel, baseLevel int) bool {
-	return branchLevel == levelSealed && baseLevel == levelSealed
+	return branchLevel >= levelSealed && baseLevel >= levelSealed
 }
 
 func (t *tx) publicDependents(n *nsRow) []string {
@@ -693,6 +693,8 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 		t.must(err)
 		_, err = t.Exec(`DELETE FROM snapshots WHERE res = ?`, res)
 		t.must(err)
+		_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res = ?`, res)
+		t.must(err)
 		target := v.head.seq
 		_, nsID = t.appendNS(n, map[string]any{"resource": name, "kind": "purge", "target": v.head.id.String()}, &res, &target, n.configSeq, author)
 		t.tags = append(t.tags, "r:"+n.name+"/"+name)
@@ -767,6 +769,8 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
 		_, err = t.Exec(`DELETE FROM snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+		t.must(err)
+		_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
 		_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, n.id)
 		t.must(err)
@@ -843,6 +847,10 @@ func (t *tx) referencedPaths(exclude func(ns *nsRow, res string) bool) map[strin
 type PruneRequest struct {
 	Horizon string
 	Keep    []string
+	// Snapshot is the horizon's document sealed by a key-holding client
+	// (seal.SealSnapshot), required for e2e resources and refused
+	// elsewhere (§8.6).
+	Snapshot string
 }
 
 // PruneResult is the answer to a prune.
@@ -897,6 +905,15 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if len(pr.Keep) > cfg.Limits.KeepPerResource {
 			return limitErr(422, "too many kept revisions")
 		}
+		e2e := t.e2eContent(n, name)
+		switch {
+		case !e2e && pr.Snapshot != "":
+			return invalid("snapshot is only for e2e resources, whose documents the server can't compute (§8.6)")
+		case e2e && len(pr.Keep) > 0:
+			return invalid("keep is not supported for e2e resources: the server can't keep documents it can't compute (protect revisions with retention or a lower horizon)")
+		case e2e && pr.Snapshot == "":
+			return invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
+		}
 		var keep []*revRow
 		for _, k := range pr.Keep {
 			kid, err := ids.Parse(k)
@@ -912,6 +929,9 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		h = t.protect(n, cfg, v.own.id, h)
 		rule := cfg.retentionRule(name)
 		dest, hasArchive := t.archiveDest(rule)
+		if e2e && !hasArchive {
+			return invalid("pruning an e2e resource needs an archive destination (§8.6)")
+		}
 		if !a.star {
 			if !hasArchive {
 				return forbidden("pruning where no archive is configured needs a grant chained to a * key")
@@ -926,7 +946,13 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if err := t.checkRules(cfg, a, env, false); err != nil {
 			return err
 		}
-		res, perr := t.pruneTo(n, name, v.own, h, keep, pr.Keep, dest, hasArchive, t.authorID(a.id()))
+		var res *PruneResult
+		var perr error
+		if e2e {
+			res, perr = t.pruneToE2E(n, cfg, name, v.own, h, hid, pr.Snapshot, dest, t.authorID(a.id()))
+		} else {
+			res, perr = t.pruneTo(n, name, v.own, h, keep, pr.Keep, dest, hasArchive, t.authorID(a.id()))
+		}
 		if perr != nil {
 			return perr
 		}

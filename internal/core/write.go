@@ -134,6 +134,9 @@ type stepState struct {
 	// prevNonce is the $nonce of the document the step applied to, if
 	// any (sealed namespaces refuse a repeated nonce, §E.2.5).
 	prevNonce string
+	// sealed marks a create, append or restore of an e2e resource: its
+	// patch set is opaque and its document unknown (§6.2, §E.3).
+	sealed bool
 }
 
 type itemState struct {
@@ -401,14 +404,25 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 
 	// Step 3: apply. Sealed namespaces also need a fresh $nonce in every
-	// patch set (§C.7, §E.2.5).
+	// patch set (§C.7, §E.2.5). In an e2e namespace nothing is applied but
+	// the keyring: patch sets are sealed and checked by their header
+	// (§6.2, §E.3).
 	for _, s := range st {
-		if err := t.applySteps(s); err != nil {
-			fs = append(fs, itemErr{s.index, err})
-		} else if cfg.level == levelSealed {
-			if err := checkNonces(s); err != nil {
-				fs = append(fs, itemErr{s.index, err})
+		var err *Error
+		switch {
+		case cfg.level == levelE2E && s.Resource != KeyringName:
+			err = t.applyStepsE2E(n, cfg, s)
+		default:
+			err = t.applySteps(s)
+			if err == nil && cfg.level == levelSealed {
+				err = checkNonces(s)
 			}
+			if err == nil && cfg.level == levelE2E {
+				err = t.checkKeyring(n, cfg, s)
+			}
+		}
+		if err != nil {
+			fs = append(fs, itemErr{s.index, err})
 		}
 	}
 	if len(fs) > 0 {
@@ -436,8 +450,8 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	pending := map[string]any{}
 	for _, s := range st {
 		for _, step := range s.steps {
-			if step.del {
-				continue
+			if step.del || step.sealed {
+				continue // e2e: validation moves to clients (§E.3.2)
 			}
 			typed, err := t.validateDoc(step.doc, a, pending)
 			if err != nil {
@@ -460,7 +474,11 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// Step 6: rules.
 	for _, s := range st {
 		for _, step := range s.steps {
-			if err := t.checkRules(cfg, a, t.stepEnvelope(s, step, a), false); err != nil {
+			check := t.checkRules
+			if step.sealed {
+				check = func(cfg *Config, a *actor, env map[string]any, _ bool) *Error { return t.checkRulesE2E(cfg, a, env) }
+			}
+			if err := check(cfg, a, t.stepEnvelope(s, step, a), false); err != nil {
 				fs = append(fs, itemErr{s.index, err})
 				break
 			}
@@ -906,6 +924,10 @@ func (t *tx) loadSchema(ref schema.Ref, a *actor, pending map[string]any) (any, 
 	if n.isBranch() {
 		return nil, schema.ErrBranch
 	}
+	if t.e2eContent(n, ref.Name) {
+		// The server can't read schemas in an e2e namespace (§E.3.2).
+		return nil, schema.ErrUnavailable
+	}
 	if !t.canRead(n, t.config(n.configSeq), a, ref.Name) {
 		return nil, schema.ErrForbidden
 	}
@@ -1020,6 +1042,8 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 		ll := t.lastLive(s.parent)
 		lastLiveSeq = ll.seq
 	}
+	// E2e content has no documents on the server (§E.3).
+	e2e := t.config(n.configSeq).level == levelE2E && s.Resource != KeyringName
 	for i, step := range s.steps {
 		first := 0
 		if !hasRows && i == 0 {
@@ -1053,6 +1077,9 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 		if !step.del {
 			lastLive = step
 			lastLiveSeq = last
+			if e2e {
+				continue
+			}
 			canon := jsonv.Canonical(step.doc)
 			t.cacheDoc(step.id, canon)
 			t.maybeSnapshot(res, last, canon)
@@ -1074,7 +1101,7 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 	} else {
 		doc = jsonv.Canonical(final.doc)
 	}
-	if len(doc) <= t.e.opt.HeadSnapshotMax {
+	if !e2e && len(doc) <= t.e.opt.HeadSnapshotMax {
 		_, err = t.Exec(`INSERT INTO heads (res, seq, doc) VALUES (?,?,?) ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc`, res, lastLiveSeq, t.putDoc("heads", res, lastLiveSeq, doc))
 	} else {
 		_, err = t.Exec(`DELETE FROM heads WHERE res = ?`, res)

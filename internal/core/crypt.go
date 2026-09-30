@@ -476,6 +476,20 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 	if baseLevel >= 0 && cfg.level < baseLevel {
 		return invalid("/encryption: a branch cannot have a lower encryption level than its base")
 	}
+	// End-to-end (§E.3) only from the start: an existing namespace's ids,
+	// documents and log are over plaintext, and so is a base that isn't
+	// e2e, which a branch would read through.
+	if cfg.level == levelE2E {
+		if cur != nil && cur.level < levelE2E {
+			return invalid("/encryption: an existing namespace cannot become e2e; its content is already plaintext on the server (create a new e2e namespace)")
+		}
+		if baseLevel >= 0 && baseLevel < levelE2E {
+			return invalid("/encryption: a branch can be e2e only if its base is")
+		}
+	}
+	if cur != nil && cfg.level == levelE2E && cfg.Epoch != cur.Epoch && cfg.Epoch != cur.Epoch+1 {
+		return invalid(fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
+	}
 	// Epochs (§E.2.1): a sealed namespace's epoch only moves forward, one
 	// at a time; a namespace that becomes sealed starts at epoch 1. A new
 	// namespace or branch may start at any epoch.

@@ -371,7 +371,7 @@ func TestEncryptionConfigErrors(t *testing.T) {
 	expectCode(t, e.patchNS("p", ops(op("add", "/encryption", map[string]any{"level": "at-rest"})), ""), 422, "invalid")
 
 	k := newEnv(t, withKeyStore(newKeyStore(t)))
-	for _, bad := range []any{"at-rest", map[string]any{"level": "sealed", "epoch": 0.0}, map[string]any{"level": "at-rest", "epoch": 1.0}, map[string]any{"level": "sealed", "historyEpochs": 1.5}, map[string]any{"level": "e2e"}, map[string]any{"level": "x"}, map[string]any{"level": "at-rest", "keys": []any{}}} {
+	for _, bad := range []any{"at-rest", map[string]any{"level": "sealed", "epoch": 0.0}, map[string]any{"level": "at-rest", "epoch": 1.0}, map[string]any{"level": "sealed", "historyEpochs": 1.5}, map[string]any{"level": "e2e", "epoch": 0.0}, map[string]any{"level": "x"}, map[string]any{"level": "at-rest", "keys": []any{}}} {
 		r := k.do(req{method: "PATCH", path: "/ns/bad", ifNoneMatch: "*", body: addRoot(map[string]any{"read": "public", "encryption": bad}), author: "admin"})
 		expectCode(t, r, 422, "invalid")
 	}

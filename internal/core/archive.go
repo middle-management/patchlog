@@ -11,6 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Archiver stores pruning archives (§8.6). The core hands it the pruned
@@ -285,6 +286,7 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 		if own == nil {
 			return notFound()
 		}
+		e2e := t.e2eContent(n, name)
 		err := entries(func(en ArchiveEntry) error {
 			id, err := ids.Parse(en.ID)
 			if err != nil {
@@ -316,7 +318,13 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 				out.Skipped++
 				return nil
 			}
-			if _, err := patch.Parse(jsonv.MustParse(canon)); err != nil {
+			if e2e {
+				// Opaque at E3: one sealed op, as it was written.
+				if _, ok := seal.SealedJWE(canon); !ok && string(canon) != "[]" {
+					out.Skipped++
+					return nil
+				}
+			} else if _, err := patch.Parse(jsonv.MustParse(canon)); err != nil {
 				out.Skipped++
 				return nil
 			}
@@ -339,8 +347,10 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 		if missing {
 			return nil
 		}
-		if err := t.rebuildSnapshots(own.id, own.horizonSeq.Int64); err != nil {
-			return err
+		if !e2e {
+			if err := t.rebuildSnapshots(own.id, own.horizonSeq.Int64); err != nil {
+				return err
+			}
 		}
 		_, err = t.Exec(`UPDATE resources SET horizon_seq = NULL, keep = NULL WHERE res = ?`, own.id)
 		t.must(err)

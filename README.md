@@ -27,6 +27,7 @@ and serves immutable, CDN-cacheable revisions.
 | Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
 | Encryption at rest, cryptographic purge | Addendum E.1 | ✅ (local master key file; KMS adapters to come) |
 | Sealed for delivery: epoch keys, JWE responses, `POST /ns/{ns}/keys`, rotation, `$nonce` | Addendum E.2 | ✅ (client library decrypts; other consumers don't re-seal yet) |
+| End-to-end: sealed patch sets, header checks, blind rules, fold reads, keyring relay, sealed prune snapshots | Addendum E.3 | ✅ (client library seals, folds, validates and administers keyrings; merge, export and remote branches refuse) |
 
 ### Not implemented
 
@@ -34,7 +35,12 @@ and serves immutable, CDN-cacheable revisions.
   namespace, signed manifests and `x-tree-label` titles.
 - **§F.7 merge service** (scheduled merges, web status): not built. Its logic is in
   `internal/merge` and the CLI.
-- **Addendum E.3** (end-to-end): `encryption.level` `"e2e"` is rejected with `422`.
+- **Addendum E.3 gaps:** merging or rebasing e2e branches (§F.8: decrypt and re-encrypt in a
+  client holding both keyrings), bundles of e2e namespaces (§G.5: history over ciphertext,
+  snapshots by a key holder) and remote branches of them are refused; retention for e2e
+  namespaces needs a key-holding janitor, which isn't built (the server skips them); no
+  size-bucket padding (§E.4); `"archive": false` retention rules (v0.21) aren't implemented, so
+  their `422` in e2e namespaces isn't either.
 - **Addendum E.2 gaps:** consumers that re-publish (search index, tree and catalog services)
   don't seal what they serve yet (§E.2.5), so don't point them at sealed namespaces unless
   their own output is private; remote branches of sealed namespaces (§G.3, §G.5) are refused
@@ -317,6 +323,90 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
   reports whether a namespace is sealed; without keys, sealed content is `client.ErrNoKeys`.
   The follower, merge, bundle and other client-based tools thus work over sealed namespaces
   when their client has keys.
+
+### End-to-end namespaces (Addendum E.3)
+
+```sh
+curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Bearer $OPERATOR" \
+  -d '[{"op":"add","path":"","value":{"keys":[…],"encryption":{"level":"e2e"}}}]'
+```
+
+- **What it is.** The server never sees plaintext: it is an ordered, access-controlled log of
+  opaque entries. Clients seal patch sets and fold documents themselves (`client.E2E`). E2E
+  keeps E1 storage (rows are also encrypted at rest, needing a key store) and uses the public
+  cache classes; E2's response sealing doesn't apply (content is already ciphertext; namespace
+  documents and logs stay plaintext, §E.3.1). `encryption.level: "e2e"` is accepted only when a
+  namespace is created, or for a branch of an e2e base (which must be e2e); making an existing
+  namespace e2e is `422` (its ids and content are over plaintext), and levels are never lowered.
+- **Writes.** A create, append or restore carries exactly `[{"op":"sealed","value":"<JWE>"}]`
+  (or `[]` for a restore), else `422 invalid`. The JWE (`seal.SealPatchSet`: `alg dir`, `enc
+  A256GCM`) binds `kid: "{ns}#{e}"` and `pl: { ns, name, parent }` (`parent` `""` for genesis, the
+  `If-Match` id otherwise, the foreign parent for a branch's first write). The server checks the
+  header without a key: `pl` exactly this write's, `kid` an epoch the namespace has begun and not
+  after `encryption.epoch` (or `422`). That catches client bugs and cross-resource replays early;
+  it is a consistency check, not a security boundary (a writer can always seal garbage; readers
+  verify `pl` when they decrypt). Nothing is applied and schemas aren't validated; limits apply to
+  the patch set. Ids are over ciphertext, so an idempotent retry must resend the same bytes (the
+  client keeps them); no `$nonce` is needed (random IV, §C.7).
+- **Blind rules (§6.2).** The envelope of a sealed write has `writes: []` and `doc: null`. Any
+  namespace rule that reads `writes`, `/doc` or the whole envelope (`rules.Rule.Refs()`) fails
+  every such write as a whole with `422 rule`; such a grant, key or role rule with `403` (a role
+  with one doesn't allow it). Rules on `/action`, `/resource`, `/principal`, `/now` and
+  `/patches` work. Deletes, config, branch and prune writes are checked as usual.
+- **No documents on the server.** No head documents, intermediate snapshots or document cache
+  for e2e content; the `$schema` index (§6.1 `in_use`, prune protection) sees nothing, and a
+  `$schema` into an e2e namespace is `schema_unavailable`.
+- **Reads.** `GET /r/{ns}/{name}` redirects as usual. `GET /r/{ns}/{name}/rev/{id}` answers
+  `302` with `X-E2E: fold`, `ETag`/`X-Revision` and `Location:
+  /r/{ns}/{name}/rev/{id}/log?since={s}`, where `s` is the latest client-supplied snapshot at or
+  before `id` in its ancestry (omitted if none); cached with the long public class (a later
+  prune leaves the old target correct; clients restart from the horizon on a `410 pruned`).
+  Tombstones and purges answer `410` as usual. The log serves entries as stored (the patch sets
+  are the sealed ones). A range whose `since` has a snapshot starts with
+  `{ "id": s, "kind": "snapshot", "snapshot": "<JWE>" }`, the document at `s` sealed with `pl
+  { ns, name, id: s, kind: "snapshot" }` (for a tombstone horizon: the last live document).
+- **The keyring.** The reserved resource `keyring` holds `seal.Keyring` in plaintext (wrapped
+  epoch keys and public X25519 JWKs only). It is the only plaintext resource: written by key
+  holders with ordinary writes, checked like any document plus `seal.ParseKeyring`, `ns` equal
+  to the namespace and `current` not after `encryption.epoch`.
+- **`POST /ns/{ns}/keys`** relays only wrapped keys: it needs a verified grant that may read
+  the resource `keyring` and whose root block carries `enc` (else `422`; non-readers `404`), and
+  returns `{ "keys": [ { kid, suite, wrapped } ] }` — that recipient's keyring entries (by
+  `seal.RecipientID` of `enc`) for the epochs the grant is entitled to (the E2 rule: from the
+  epoch in force at `nbf`, capped by `historyEpochs`, none begun at or after `exp`). Per-resource
+  keys don't exist at E3 (`resources` is ignored). A branch without its own keyring relays its
+  base's.
+- **Epochs and rotation.** The server holds no key; `e2e_epochs` records when each epoch began.
+  A key holder rotates by re-wrapping the keyring for the remaining readers and incrementing
+  `encryption.epoch` (by exactly 1, a `*` key) in one batch; old revisions keep their epoch.
+  Server-side rotation (`-rotate-epochs`, `-rotate-on-revoke`) doesn't touch e2e namespaces.
+- **Prune (§8.6).** `POST /r/{ns}/{name}/prune` `{ horizon, snapshot }` needs `snapshot` (a JWE
+  with `pl { ns, name, id: horizon, kind: "snapshot" }` and a known epoch's `kid`) and an archive
+  destination, even with a `*` key (`422` otherwise). `keep` is refused (the server can't keep
+  documents it can't compute). If protected revisions move the horizon down, the answer is `422`
+  with the effective `horizon` to seal for. The snapshot is stored opaque as the horizon's kept
+  document; the pruned patch sets go to the archive as stored. The retention applier skips e2e
+  namespaces: a key-holding janitor must apply retention.
+- **Branches.** A branch of an e2e base is e2e with its own epochs starting at the copied one;
+  read-through content stays the base's ciphertext and keyring. Its writes bind the branch
+  (`pl.ns`, `kid`), so a key holder writes the branch's own keyring first.
+- **Client.** `c.E2E(recipientPriv)` (or `c.E2EKeys(map[kid]key)`): `CreateSealed`,
+  `CreateDocSealed`, `AppendSealed`, `RestoreSealed` (nil restores with `[]`) seal under the
+  current epoch with the right `pl` and resend identical bytes on retries (`SealPatches` exposes
+  them); they validate the resulting document against its `$schema` first unless
+  `WithoutValidation()`. `DocE2E`/`LoadE2E` follow the fold redirect, verify the chain, every id
+  and every `kid`/`pl` (the namespace or one of its bases), fold from the snapshot or genesis,
+  and validate each document with a `$schema`: a revision that doesn't open, apply or validate
+  is **flagged** (`E2EDoc.Flagged`, with its author) and left out, so `Value` is the document of
+  the last valid revision (`ValidID`). `PruneE2E` folds and seals the snapshot. `InitKeyring`,
+  `AddReader` and `RotateEpoch` administer the keyring (always including the admin's own key);
+  `RotateEpoch` writes the keyring and the epoch bump in one batch. Keys come from `/keys`,
+  falling back to the keyring resource. `client.EncryptionLevel(ns)` reports a namespace's level.
+- **Refusals.** The merge tool refuses e2e namespaces (§F.8: merges re-encrypt, never
+  fast-forward), `patchlog export` refuses them in both modes, and remote branches of them (and
+  registrations) are `422`.
+- **Metadata no level hides (§E.4):** names, ids and parent links, sizes, timing, authors and the
+  namespace log's shape.
 
 ### Tree and catalog (Addendum B)
 

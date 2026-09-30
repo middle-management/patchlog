@@ -305,6 +305,21 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case rev.Fold:
+		// An e2e revision (§E.3): the server has no document, so the
+		// client folds the log from the latest snapshot at or before it.
+		// The target only changes when a prune adds a newer snapshot,
+		// and the old target stays correct (§8.6), so it caches long.
+		loc := "/r/" + ns + "/" + name + "/rev/" + id + "/log"
+		if rev.FoldSince != "" {
+			loc += "?since=" + rev.FoldSince
+		}
+		cache(w, ccLong, rev.Public, resTags(ns, name)...)
+		w.Header().Set("ETag", quote(id))
+		w.Header().Set("X-Revision", id)
+		w.Header().Set("X-E2E", "fold")
+		w.Header().Set("Location", loc)
+		w.WriteHeader(302)
 	case rev.Status == 200:
 		cache(w, ccImmutable, rev.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", quote(id))
@@ -500,7 +515,7 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 	m, ok := body.(map[string]any)
 	h, _ := m["horizon"].(string)
 	if !ok || h == "" {
-		writeErr(w, badInput("body must be { horizon, keep? }"))
+		writeErr(w, badInput("body must be { horizon, keep?, snapshot? }"))
 		return
 	}
 	var keep []string
@@ -519,11 +534,14 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 			keep = append(keep, s)
 		}
 	}
-	if _, has := m["snapshot"]; has {
-		writeErr(w, &core.Error{Status: 422, Body: map[string]any{"code": "invalid", "message": "snapshot is for E3 namespaces, which this server does not support"}})
-		return
+	var snapshot string
+	if x, has := m["snapshot"]; has {
+		if snapshot, ok = x.(string); !ok || snapshot == "" {
+			writeErr(w, badInput("snapshot must be a JWE (compact serialization)"))
+			return
+		}
 	}
-	res, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, core.PruneRequest{Horizon: h, Keep: keep})
+	res, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, core.PruneRequest{Horizon: h, Keep: keep, Snapshot: snapshot})
 	if err != nil {
 		writeErr(w, err)
 		return

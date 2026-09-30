@@ -100,6 +100,22 @@ CREATE TABLE IF NOT EXISTS sealed (
 CREATE INDEX IF NOT EXISTS sealed_name ON sealed (ns, name);
 CREATE INDEX IF NOT EXISTS sealed_rev ON sealed (rev_seq);
 
+-- Addition: epochs of e2e namespaces (Addendum E.3, e2e.go). The server
+-- holds no key for them: a row records only that epoch e of ns began with
+-- the config write at created (the epoch range of POST /keys, and the kids
+-- a sealed patch set may name).
+CREATE TABLE IF NOT EXISTS e2e_epochs (
+  ns         INTEGER NOT NULL REFERENCES namespaces,
+  epoch      INTEGER NOT NULL,
+  created    INTEGER NOT NULL,
+  PRIMARY KEY (ns, epoch)
+) WITHOUT ROWID;
+-- Addition: client-supplied sealed snapshots of e2e resources (§8.6): the
+-- horizon's document as a JWE, opaque to the server. seq is the horizon
+-- revision.
+CREATE TABLE IF NOT EXISTS e2e_snapshots (seq INTEGER PRIMARY KEY REFERENCES revisions, res INTEGER NOT NULL, jwe TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS e2e_snapshots_res ON e2e_snapshots (res, seq);
+
 CREATE TABLE IF NOT EXISTS heads (res INTEGER PRIMARY KEY REFERENCES resources, seq INTEGER NOT NULL, doc TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS heads_seq ON heads (seq);
 -- Intermediate snapshots (D.4) and documents kept below a horizon (§8.6).
