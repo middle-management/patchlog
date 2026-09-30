@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.27 · 2026-09-30. See the change log at the end.
+Status: draft v0.28 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -1675,7 +1675,15 @@ A name that exists or existed in the content namespace is refused (`409`), so a 
 
 - **Listing URLs carry the subject set.** Listings are served at `/{catalog}/at/{at}/g/{gs}/…` (`at` as in §B.5), where `gs = text(trunc160(sha256(canonical(sorted subjects))))`. The subjects are the caller's `group:` entries, plus `user:{sub}` only if the catalog has direct entries for that user. The edge admits a request only if the caller's edge grant is bound to that exact `gs`. Listings are cached per (listing, subject set, `at`), so users without direct entries share caches with everyone in the same groups.
 
-- **Listings never embed signed URLs.** Readers obtain per-item edge grants from `POST /read-grants { items: [...] }` (`no-store`). It returns short-lived edge grants scoped to exactly `/r/{ns}/{name}` and `/r/{ns}/{name}/…`. For items in sealed namespaces, and for sealed catalog nodes, it also returns each item's per-resource keys `K_r` (§E.2.1), wrapped to the caller's public key in the §E.2.3 format. The catalog service derives them from the epoch keys it holds as a consumer. So a reader who sees items only through catalog roles, with no grant on the content namespace, can still read them and open their entries in listings (§E.2.6).
+- **Listings never embed signed URLs.** Readers obtain per-item edge grants from `POST /read-grants { items: [...] }` (`no-store`). It returns short-lived edge grants scoped to exactly `/r/{ns}/{name}` and `/r/{ns}/{name}/…`. For sealed items and sealed catalog nodes, it also returns per-resource keys `K_r` (§E.2.1), wrapped to the caller's public key in the §E.2.3 format. The catalog service derives them from the epoch keys it holds as a consumer. So a reader who sees items only through catalog roles, with no grant on the content namespace, can still read them and open their entries in listings (§E.2.6):
+
+  - **Which keys.** A content item in a sealed (E2) namespace gets its own `K_r`. An item in an E3 namespace gets none, since clients seal E3 revisions under the epoch key, which `K_r` doesn't open. When the catalog is sealed or E3, the item's placement node also gets its `K_r`, for its listing entry. `items` may also name catalog nodes (`/r/{catalog}/{name}`): a node the caller's roles make visible gets its `K_r` and no grant, so folder titles can be read.
+
+  - **Checked like grants.** Keys are returned only for items that pass the same role check as the grants. That includes items in **public** sealed namespaces: their ciphertext is public, so the keys are what control access.
+
+  - **Which epochs.** Catalog grants have no start time to bound history. So keys cover the current epoch and the `encryption.historyEpochs` before it, or every epoch the service holds if the namespace sets no cap. A namespace that shouldn't give role-only readers its whole history sets `historyEpochs`. As with `/keys`, losing a role takes effect at the next rotation (§E.2.4).
+
+  - A caller whose grant carries no public key still gets its grants, with `"keysWithheld"` and the reason in place of keys.
 
 - **Readers of a whole content namespace** use a namespace-wide edge grant instead (§C.5).
 
@@ -2988,7 +2996,7 @@ The ids prove the copies exact. If B already has a resource at one of those path
 
 - B verifies each listed head against A's namespace log up to `at`, and each revision through its log.
 
-- If A's namespace is itself a branch, its read-through heads aren't in its own log. B verifies each of them against the log of the base that wrote it, following A's `base` and `at` (from A's configuration chain) recursively. If B can't read those bases, it can't create the remote branch (`422`).
+- If A's namespace is itself a branch, its read-through heads aren't in its own log. B verifies each of them against the log of the base that wrote it, following A's `base` and `at` (from A's configuration chain) recursively. If B can't read those bases, it can't create the remote branch (`422`). B records the names it followed in the branch's `base` as `"chain"`: A's namespace first, then its base, and so on, as of `at`. Clients reading an E3 remote branch accept read-through ciphertext whose `pl.ns` is in `chain` (§G.5.2), since none of those namespaces exists on B.
 
 - B MAY fetch lazily, proxying and caching, or mirror everything up front. It serves the content under its own URLs.
 
@@ -3201,7 +3209,7 @@ A sealed bundle (`application/vnd.patchlog.sealed-bundle+jsonl`) encrypts a bund
 
 - **E2 sources.** B fetches keys from A with its own key pair and grant (§E.2.3), mirrors the plaintext, and seals what it serves under the branch's own epoch keys.
 
-- **E3 sources.** B mirrors ciphertext and the `keyring` verbatim, and verifies ids over the ciphertext. A remote branch of an E3 namespace keeps its source's namespace name in `pl.ns`, so its readers use the source's keys, which B relays from the mirrored keyring through `POST /ns/{branch}/keys` (§F.8.1). Writes to the branch are sealed under keys the branch's own key holders manage, and are merged back by re-encryption (§F.8).
+- **E3 sources.** B mirrors ciphertext and the `keyring` verbatim, and verifies ids over the ciphertext. A remote branch of an E3 namespace keeps its source's namespace name in `pl.ns`, so its readers use the source's keys, which B relays from the mirrored keyring through `POST /ns/{branch}/keys` (§F.8.1). Read-through content sealed further up, by A's own bases, carries their names and is accepted when they are in `base.chain` (§G.3). Their keys are in those namespaces' keyrings. B relays them when it mirrors those keyrings, and otherwise readers fetch them from A with grants of their own there. Writes to the branch are sealed under keys the branch's own key holders manage, and are merged back by re-encryption (§F.8).
 
 - **Epoch start times** decide which epochs B relays to a grant (§E.2.3). B takes them from the source's namespace documents, which B can't verify against the chain, so they are only as trustworthy as the channel. That limits the harm: relayed entries are wrapped to keyring recipients, so a wrong start time can only change which wrapped keys a grant receives, never who can unwrap them.
 
@@ -3380,3 +3388,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Padding (§E.2.2):** whether a revision should be padded follows the configuration at its namespace log entry.
 
 - **Bundles and remote branches (§G.4.4, §G.5):** upstream chains of sealed targets aren't deterministic. E3 imports into new targets need `config` to step through epochs. B refuses a remote branch whose source document it can't read. Epoch start times from the source are unverified but can't widen decryption.
+
+- **v0.28:** catalog `/read-grants` keys are defined (§B.11.5). There is no `K_r` for E3 items, and there are keys for placement and folder nodes of sealed catalogs. Keys are checked by role even in public sealed namespaces, and `historyEpochs` bounds the epochs, since catalog grants have no start time. Remote branches record the base chain they verified as `base.chain`, so clients can accept read-through ciphertext from a source that is itself a branch (§G.3, §G.5.2).
