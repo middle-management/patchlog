@@ -60,6 +60,16 @@ type ExportOptions struct {
 	// the target. Full documents then start right after it; a document
 	// whose required id is its head is left out.
 	Requires map[string]string
+	// ForeignParents changes how resources of a branch namespace (§7.6)
+	// are bundled. By default their chains include the base's entries back
+	// to genesis (§G.4.1), under the branch's name, so the bundle stands
+	// alone. With ForeignParents, a chain starts after its foreign parent
+	// (the base's head as of the branch's at), which goes in requires, and
+	// a read-through resource (no entries of its own) is not bundled but
+	// listed in external as "{branch}/{name}/rev/{head}": the target must
+	// already hold the base, e.g. by importing with the branch mapped onto
+	// the base namespace.
+	ForeignParents bool
 	// Now overrides the clock for the header's created.
 	Now func() time.Time
 }
@@ -95,6 +105,7 @@ type ExportPlan struct {
 	ext     map[string]bool
 	queue   []string
 	schemas map[string]any // schema revision path → document
+	bases   map[string]map[string]client.HeadItem // branch ns → its base's heads as of at (nil: not a branch)
 }
 
 func (p *ExportPlan) reason(d *PlannedDoc, format string, args ...any) {
@@ -123,7 +134,7 @@ func PlanExport(ctx context.Context, c *client.Client, opt ExportOptions) (*Expo
 		return nil, fmt.Errorf("export: origin: %w", err)
 	}
 	p := &ExportPlan{Origin: origin, At: map[string]string{}, Docs: map[string]*PlannedDoc{}, c: c, opt: opt,
-		heads: map[string]map[string]client.HeadItem{}, ext: map[string]bool{}, schemas: map[string]any{}}
+		heads: map[string]map[string]client.HeadItem{}, bases: map[string]map[string]client.HeadItem{}, ext: map[string]bool{}, schemas: map[string]any{}}
 
 	// Take the selected namespaces' at first (§G.4.1 consistency).
 	var sel []string
@@ -241,6 +252,23 @@ func (p *ExportPlan) add(ctx context.Context, ns, name string, selected bool, wh
 		// Purged content is never exported (§G.4.1).
 		return fmt.Errorf("export: %s is not in %s as of %s (never existed or purged); %s — leave it out with external", k, ns, p.At[ns], why)
 	}
+	if p.opt.ForeignParents && p.opt.Requires[k] == "" {
+		bh, err := p.baseHeads(ctx, ns)
+		if err != nil {
+			return err
+		}
+		if b, ok := bh[name]; ok && b.Kind != "purge" {
+			if b.Target == hi.Target {
+				// Read-through: the base's content as of at.
+				p.ext[External{NS: ns, Name: name, Rev: hi.Target}.String()] = true
+				return nil
+			}
+			if p.opt.Requires == nil {
+				p.opt.Requires = map[string]string{}
+			}
+			p.opt.Requires[k] = b.Target // the foreign parent
+		}
+	}
 	d := &PlannedDoc{Key: k, NS: ns, Name: name, Mode: p.opt.Mode, Head: hi.Target, Deleted: hi.Kind == "tombstone",
 		Selected: selected, needRevs: map[string]string{}}
 	if r := p.opt.Requires[k]; r != "" {
@@ -268,6 +296,14 @@ func (p *ExportPlan) need(ctx context.Context, from *PlannedDoc, t Target, force
 		return err
 	}
 	d := p.Docs[Key(t.NS, t.Name)]
+	if d == nil {
+		if t.Rev != "" {
+			// A read-through resource declared external: a pin must name
+			// the revision the target is checked for.
+			p.ext[External{NS: t.NS, Name: t.Name, Rev: t.Rev}.String()] = true
+		}
+		return nil
+	}
 	if t.Rev != "" {
 		d.needRevs[t.Rev] = from.Key
 		if t.Rev != d.Head {
@@ -281,6 +317,33 @@ func (p *ExportPlan) need(ctx context.Context, from *PlannedDoc, t Target, force
 		p.queue = append(p.queue, d.Key)
 	}
 	return nil
+}
+
+// baseHeads returns the heads of ns's base as of the branch's at, or nil
+// if ns isn't a branch.
+func (p *ExportPlan) baseHeads(ctx context.Context, ns string) (map[string]client.HeadItem, error) {
+	if m, ok := p.bases[ns]; ok {
+		return m, nil
+	}
+	doc, err := p.c.NSDoc(ctx, ns, p.At[ns])
+	if err != nil {
+		return nil, fmt.Errorf("export: namespace %s: %w", ns, err)
+	}
+	var m map[string]client.HeadItem
+	if b, ok := doc.Value["base"].(map[string]any); ok {
+		bns, _ := b["ns"].(string)
+		at, _ := b["at"].(string)
+		items, err := p.c.Heads(ctx, bns, at)
+		if err != nil {
+			return nil, fmt.Errorf("export: base %s of %s: %w", bns, ns, err)
+		}
+		m = map[string]client.HeadItem{}
+		for _, it := range items {
+			m[it.Resource] = it
+		}
+	}
+	p.bases[ns] = m
+	return m, nil
 }
 
 // loader loads schema documents from the source for x-ref walks.

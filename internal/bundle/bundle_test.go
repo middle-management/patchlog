@@ -617,3 +617,107 @@ func TestSnapshotDeletion(t *testing.T) {
 		t.Fatalf("upstream %+v, target %+v", up, tg)
 	}
 }
+
+// branchSource has a base "matches" and a branch "r7" of it with a
+// read-through resource (cup), a resource continuing from its foreign
+// parent (derby) and a resource the branch created (final).
+func branchSource(t *testing.T) (*deployment, map[string]string) {
+	src := newDeployment(t, stagingOrigin)
+	src.ns("matches", nil)
+	src.create("matches", "derby", map[string]any{"score": "0-0", "title": "Derby"})
+	base := map[string]string{"derby": src.append("matches", "derby", op("replace", "/score", "1-0"))}
+	base["cup"] = src.create("matches", "cup", map[string]any{"title": "Cup"})
+	must(src.c.CreateBranch(ctx, "matches", client.BranchRequest{Name: "r7"}))
+	src.append("r7", "derby", op("replace", "/score", "2-0"))
+	src.append("r7", "derby", op("add", "/note", "late goal"))
+	src.create("r7", "final", map[string]any{"title": "Final"})
+	return src, base
+}
+
+func exportFrom(t *testing.T, d *deployment, opt bundle.ExportOptions) ([]byte, *bundle.Summary) {
+	t.Helper()
+	var buf bytes.Buffer
+	_, s, err := bundle.Export(ctx, d.c, &buf, opt)
+	noErr(t, err)
+	must(bundle.Verify(bytes.NewReader(buf.Bytes())))
+	return buf.Bytes(), s
+}
+
+func sameHeads(t *testing.T, a *deployment, ans string, b *deployment, bns string, names ...string) {
+	t.Helper()
+	for _, n := range names {
+		if ha, hb := a.head(ans, n), b.head(bns, n); ha.ID != hb.ID || ha.State != hb.State {
+			t.Fatalf("%s: %s/%s %+v, %s/%s %+v", n, ans, n, ha, bns, n, hb)
+		}
+	}
+}
+
+func TestBranchExport(t *testing.T) {
+	src, base := branchSource(t)
+	baseBundle, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"matches"}})
+
+	// Default: chains include the base's entries back to genesis, under
+	// the branch's name (§G.4.1), so the bundle stands alone.
+	b, sum := exportFrom(t, src, bundle.ExportOptions{Select: []string{"r7"}})
+	if len(sum.Header.Docs) != 3 || len(sum.Header.Requires) != 0 || sum.Header.Docs["r7/cup"].Head != base["cup"] {
+		t.Fatalf("header %+v", sum.Header)
+	}
+	if bytes.Contains(b, []byte(`"ns":"matches"`)) {
+		t.Fatal("a line names the base namespace; ns is always the exporting namespace")
+	}
+
+	// Into an empty deployment: the branch becomes a plain namespace with
+	// the same ids, the base's history included.
+	empty := newDeployment(t, cmsOrigin)
+	importB(t, empty, b, bundle.ImportOptions{})
+	sameHeads(t, src, "r7", empty, "r7", "derby", "cup", "final")
+	if l := must(empty.c.Log(ctx, "r7", "derby", "", "")); len(l) != 4 {
+		t.Fatalf("derby chain %d entries", len(l))
+	}
+
+	// Into a deployment that has the base: mapped onto it, the branch's
+	// changes fast-forward.
+	withBase := newDeployment(t, cmsOrigin)
+	importB(t, withBase, baseBundle, bundle.ImportOptions{})
+	rep := importB(t, withBase, b, bundle.ImportOptions{NSMap: map[string]string{"r7": "matches"}})
+	if d := rep.Doc("r7/derby"); d.Class != "fast-forward" || d.Steps != 2 || d.TargetHead != base["derby"] {
+		t.Fatalf("derby %+v", d)
+	}
+	if rep.Doc("r7/cup").Class != "present" || rep.Doc("r7/final").Class != "create" {
+		t.Fatalf("report %+v %+v", rep.Doc("r7/cup"), rep.Doc("r7/final"))
+	}
+	sameHeads(t, src, "r7", withBase, "matches", "derby", "cup", "final")
+
+	// Into a branch of the base on the target: read-through resources are
+	// present, and derby fast-forwards from its foreign parent.
+	withBranch := newDeployment(t, cmsOrigin)
+	importB(t, withBranch, baseBundle, bundle.ImportOptions{})
+	must(withBranch.c.CreateBranch(ctx, "matches", client.BranchRequest{Name: "r7"}))
+	rep = importB(t, withBranch, b, bundle.ImportOptions{})
+	if rep.Doc("r7/derby").Class != "fast-forward" || rep.Doc("r7/cup").Class != "present" {
+		t.Fatalf("into a branch: %+v %+v", rep.Doc("r7/derby"), rep.Doc("r7/cup"))
+	}
+	sameHeads(t, src, "r7", withBranch, "r7", "derby", "cup", "final")
+	if withBranch.head("matches", "derby").ID != base["derby"] {
+		t.Fatal("the target's base changed")
+	}
+
+	// ForeignParents: chains start after the foreign parent, named in
+	// requires; the read-through resource is a pinned external.
+	fb, fsum := exportFrom(t, src, bundle.ExportOptions{Select: []string{"r7"}, ForeignParents: true})
+	if fsum.Header.Requires["r7/derby"] != base["derby"] || len(fsum.Header.Docs) != 2 ||
+		!slices.Equal(fsum.Header.External, []string{"r7/cup/rev/" + base["cup"]}) {
+		t.Fatalf("foreign-parent header %+v", fsum.Header)
+	}
+	var e *bundle.CheckError
+	if _, err := bundle.Import(ctx, newDeployment(t, cmsOrigin).c, bundle.BytesOpener(fb), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true}); !errors.As(err, &e) {
+		t.Fatalf("foreign-parent bundle into an empty deployment: %v", err)
+	}
+	withBase2 := newDeployment(t, cmsOrigin)
+	importB(t, withBase2, baseBundle, bundle.ImportOptions{})
+	rep = importB(t, withBase2, fb, bundle.ImportOptions{NSMap: map[string]string{"r7": "matches"}})
+	if d := rep.Doc("r7/derby"); d.Class != "fast-forward" || d.Steps != 2 {
+		t.Fatalf("derby %+v", d)
+	}
+	sameHeads(t, src, "r7", withBase2, "matches", "derby", "cup", "final")
+}

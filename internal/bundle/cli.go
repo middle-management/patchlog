@@ -18,7 +18,7 @@ import (
 
 // CLIUsage documents the bundle commands.
 const CLIUsage = `  patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T] [-author A]
-          [-external ns|ns/name,…] [-authors] [-untyped-refs] [-json]
+          [-external ns|ns/name,…] [-authors] [-untyped-refs] [-foreign-parents] [-json]
   patchlog import -api URL -ns TARGET[,src=dst] -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T] [-author A]
           [-resolve ns/name=skip|take|replay]... [-create=false] [-json]
   patchlog bundle verify -i file.jsonl [-json]`
@@ -101,6 +101,7 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	external := fs.String("external", "", "dependencies to leave out: ns or ns/name (comma-separated)")
 	authors := fs.Bool("authors", false, "include authors, creation times and signatures")
 	untyped := fs.Bool("untyped-refs", false, "treat /r/… strings in untyped documents as references")
+	foreign := fs.Bool("foreign-parents", false, "branch namespaces: start chains after their foreign parent (in requires) and list read-through resources as external, instead of including the base's history")
 	asJSON := fs.Bool("json", false, "print the export plan as JSON on stderr")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -109,7 +110,7 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if len(nss) == 0 {
 		return fmt.Errorf("export: -ns is required")
 	}
-	opt := ExportOptions{External: splitList(*external), Authors: *authors, UntypedRefs: *untyped}
+	opt := ExportOptions{External: splitList(*external), Authors: *authors, UntypedRefs: *untyped, ForeignParents: *foreign}
 	switch *mode {
 	case "history", "full":
 		opt.Mode = Full

@@ -157,7 +157,7 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
   documents are rewritten to them, keeping any `#id` fragment.
 - **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
   (§6.6). **`-pace`** splits batches to fit the limits and paces them for backfills.
-- **Known gap:** exporting a branch whose resources start with a foreign parent isn't supported yet.
+- **Branches** export with the base's history included, or with `-foreign-parents` naming the base revisions in `requires`.
 
 ### A short tour (dev mode)
 
