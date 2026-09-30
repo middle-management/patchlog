@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.29 · 2026-09-30. See the change log at the end.
+Status: draft v0.30 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -1314,7 +1314,7 @@ Namespace names contain no dot (§3.6), so a placement name splits unambiguously
     { "href": "/r/cat-season/derbies",     "order": "Zz" } ] }
 ```
 
-- **`parents`:** live links to folders **in the same catalog**.
+- **`parents`:** live links to folders **in the same catalog**. Each entry carries its own `order`, so a node with several parents has a position under each one, and a listing of a folder's children sorts them by the order on their edge to that folder.
 
   - One entry makes a tree node, several make a DAG node, and the catalog chooses by rule (§B.6).
 
@@ -1371,6 +1371,8 @@ A **manifest** is a document whose links are all pinned. Its own revision id the
 
 - **Creation:** the tree service generates a manifest for a subtree as of a catalog `ns_id` (§B.5), and the client creates it as an ordinary resource.
 
+- **Shared items.** In a DAG, an item reached along several paths has one entry per path, each with that path and the order of its last edge. So an `href` can appear more than once. Consumers that need each item once group entries by `href`.
+
 ## B.5 Tree service
 
 A consumer of a **catalog namespace**:
@@ -1389,7 +1391,7 @@ CREATE TABLE edges (child TEXT NOT NULL, parent TEXT NOT NULL, ord TEXT, PRIMARY
 CREATE INDEX edges_by_parent ON edges (parent, ord, child);
 ```
 
-**Query API.** Listings redirect (`302`, head-pointer caching) to `/{catalog}/at/{at}/…`. A listing depends on the catalog and on the content namespaces it follows (which items exist, their heads), so `at` is the service's **combined checkpoint**, `text(trunc160(sha256(canonical({ ns: ns_id, … }))))` over all of them. A listing at a given `at` never changes, so it uses the immutable class (§9), tagged with every item it shows (`r:{ns}/{name}`) and every namespace in the checkpoint (`ns:{ns}`), so a purge removes cached listings at every `at`. The service answers `200` at an `at` only if it is current or that exact result was stored, and `302` to the current one otherwise. `?min={ns}:{ns_id}`, repeatable, gives read-your-writes (§A.5). Catalog grants keep the catalog's own `ns_id` as `at` (§B.11.4): the combined checkpoint is in no chain, so `requireAt` can't check it.
+**Query API.** Listings redirect (`302`, head-pointer caching) to `/{catalog}/at/{at}/…`. A listing depends on the catalog and on the content namespaces it follows (which items exist, their heads), so `at` is the service's **combined checkpoint**, `text(trunc160(sha256(canonical({ ns: ns_id, … }))))` over all of them. A listing at a given `at` never changes, so it uses the immutable class (§9), tagged with every item it shows (`r:{ns}/{name}`) and every namespace in the checkpoint (`ns:{ns}`), so a purge removes cached listings at every `at`. The service answers `200` at an `at` only if it is current or that exact result was stored, and `302` to the current one otherwise. `?min={ns}:{ns_id}`, repeatable, gives read-your-writes (§A.5). A service that follows several catalogs keeps a combined checkpoint per catalog. `?min` is judged against the checkpoint of the catalog in the URL, even for a content namespace that other catalogs follow too. Catalog grants keep the catalog's own `ns_id` as `at` (§B.11.4): the combined checkpoint is in no chain, so `requireAt` can't check it.
 
 | Request | Returns |
 |---|---|
@@ -1404,7 +1406,19 @@ CREATE INDEX edges_by_parent ON edges (parent, ord, child);
 
 - **Items in listings** carry their content URL and current head. The document itself is always fetched from the core's CDN.
 
-- **Cycles.** The core can't prevent them. Edges that close a cycle are flagged, excluded from traversals and reported under `/problems`. Walks are bounded at depth 64, and deeper paths are flagged too.
+- **Cycles.** The core can't prevent them. In a DAG no single edge "closes" a cycle, so the unit is the node:
+
+  - every node on a cycle (a strongly connected set of more than one node, or a node that is its own parent) is **cyclic**;
+
+  - a cyclic node and all its edges, including edges to parents off the cycle, are left out of traversals, listings and access (§B.11.2: a cyclic node contributes nothing);
+
+  - `/problems` lists each cycle as its set of nodes. Nodes below a cyclic node that are reached only through it become orphans, and so do the cyclic nodes themselves.
+
+This is deliberately strict. Excluding just one edge would make the result depend on which edge was chosen. Walks are bounded at depth 64, and deeper paths are flagged too.
+
+- **Shared nodes in DAGs.** Listings are about paths, so `subtree`, `ancestors` and `where` show a node with several parents under each of them. A node reached through several paths, such as the bottom of a diamond, would repeat, and a DAG of repeated diamonds grows exponentially. Services MUST bound a response, by the depth limit and a per-response node limit, and report when a response was cut. They SHOULD expand a shared node only at its first occurrence in a `subtree` response and mark later occurrences `"repeat": true`, without children.
+
+- **`mode` is enforced by the catalog's rules** (§B.6), not by consumers. The tree service serves the edges it finds, so a `tree` catalog whose rules allow several parents is served as a DAG. A service MAY report nodes with several parents in a `tree` catalog under `/problems`.
 
 ## B.6 Catalog namespace document and rules
 
@@ -3400,3 +3414,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **v0.28:** catalog `/read-grants` keys are defined (§B.11.5). There is no `K_r` for E3 items, and there are keys for placement and folder nodes of sealed catalogs. Keys are checked by role even in public sealed namespaces, and `historyEpochs` bounds the epochs, since catalog grants have no start time. Remote branches record the base chain they verified as `base.chain`, so clients can accept read-through ciphertext from a source that is itself a branch (§G.3, §G.5.2).
 
 - **v0.29:** feedback from running a real CDN in front of the implementation (§9). Private content is cached at the edge only with a grant-verifying edge. Otherwise the origin marks it `CDN-Cache-Control: no-store`, and edge lifetimes go only to requests carrying the edge's verification. The origin purges `ns:{ns}` itself when a namespace becomes private. Stale serving is defined: immutable content MAY be served while the origin is unreachable, head pointers only within `stale-while-revalidate`, and long-poll answers never. Empty long-poll `204`s must be cached. The tag grammar and delimiters are defined, purges match whole tags, and `PURGE` with `X-Purge-Tags` is suggested for self-hosted CDNs.
+
+- **v0.30:** feedback from seeding a DAG catalog (Addendum B). Each parent edge carries its own `order`, and children sort by the edge to the listed folder (§B.2). Manifests have one entry per path (§B.4). Every node on a cycle is left out along with all its edges, and `/problems` lists cycles by node (§B.5). Listings show shared nodes under each parent, responses are bounded and SHOULD mark repeats (§B.5). `mode` is enforced by the catalog's rules, not consumers. `?min` applies per catalog in multi-catalog services.
