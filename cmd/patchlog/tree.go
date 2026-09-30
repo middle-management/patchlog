@@ -29,6 +29,12 @@ import (
 // catalog.trust. -bearer is its own grant, which needs read on all of them.
 // Callers of POST /grants and of private listings present an ordinary core
 // grant for the catalog namespace as their identity.
+//
+// Listings live at /{catalog}/at/{at}/… where at is the combined checkpoint
+// over the catalog and every followed content namespace (§B.5); they are
+// immutable and tagged r:{ns}/{name} and ns:{ns}. Read-your-writes:
+// ?min={ns}:{ns_id}, repeatable. Cache purges are logged (no CDN purger is
+// wired in here).
 func treeCmd(args []string) {
 	fs := flag.NewFlagSet("tree", flag.ExitOnError)
 	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")

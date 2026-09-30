@@ -22,6 +22,11 @@ import (
 //
 //	patchlog index [-api http://localhost:8080] [-db index.db] [-addr :8081] -ns matches,docs
 //	               [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
+//
+// Results at /{ns}/at/{ns_id} are immutable and tagged idx:{ns} and
+// r:{ns}/{name} per hit; only the current checkpoint's results are kept.
+// Read-your-writes: ?min={ns_id} or ?min={ns}:{ns_id}, repeatable. Cache
+// purges are logged (no CDN purger is wired in here).
 func indexCmd(args []string) {
 	fs := flag.NewFlagSet("index", flag.ExitOnError)
 	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")

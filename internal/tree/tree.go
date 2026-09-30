@@ -481,10 +481,8 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 				return nil, err
 			}
 		}
-		purge := co.PurgedNS
 		for _, p := range preps {
 			changed[p.name] = true
-			purge = purge || p.purged
 			if p.kind == "head" && p.doc != nil {
 				n := ParseNode(cat, p.name, p.head, p.doc)
 				g.setExplicit(n)
@@ -499,10 +497,6 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			} else {
 				g.removeExplicit(p.name)
 			}
-		}
-		if purge {
-			// Purged content may be in cached listings of older checkpoints.
-			res.tags = append(res.tags, "ns:"+cat)
 		}
 	} else {
 		ns := b.NS
@@ -592,6 +586,26 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		}
 	}
 
+	// Cache tags (§B.5). Every change a listing depends on moves the
+	// combined checkpoint, so cached listings never go stale and need no
+	// purge; purges remove content: a purged resource from every cached
+	// listing showing it (r:{ns}/{name}, and rs:{catalog} for listings too
+	// large to name all they show), a purged namespace from every cached
+	// listing whose checkpoint covers it (ns:{ns}).
+	if co.PurgedNS {
+		res.tags = append(res.tags, "ns:"+b.NS)
+	}
+	nr := 0
+	for _, p := range preps {
+		if p.purged {
+			res.tags = append(res.tags, "r:"+b.NS+"/"+p.name)
+			nr++
+		}
+	}
+	if nr > 0 || co.PurgedNS {
+		res.tags = append(res.tags, ManyTag(cat))
+	}
+
 	derived := g.analyze()
 	for name := range derived {
 		changed[name] = true
@@ -601,20 +615,10 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		names = append(names, name)
 	}
 	sort.Strings(names)
-	liveness := false
 	for _, name := range names {
-		if b.NS != cat {
-			res.tags = append(res.tags, "node:"+cat+"/"+name)
-		}
-		if sv, n := g.saved[name], g.nodes[name]; (sv == nil) != (n == nil) || (sv != nil && (sv.state != n.State || sv.cyclic != n.Cyclic)) {
-			liveness = true
-		}
 		if err := s.persistNode(ctx, tx, g, name); err != nil {
 			return nil, err
 		}
-	}
-	if liveness && b.NS != cat {
-		res.tags = append(res.tags, "all:"+cat)
 	}
 	if s.opt.Hook != nil {
 		if err := s.opt.Hook.Update(ctx, tx, g, changed); err != nil {

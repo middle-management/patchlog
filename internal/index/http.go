@@ -27,13 +27,22 @@ const (
 	cdnImmutable  = "max-age=31536000"
 )
 
+var validNS = client.ValidNSName
+
 // Handler returns the query API (§A.4):
 //
 //	GET /{ns}?…                   302 → /{ns}/at/{checkpoint}?…            (head pointer)
-//	GET /{ns}/at/{ns_id}?…        200 { at, ns, hits, next?, counts? }       (immutable)
+//	GET /{ns}/at/{ns_id}?…        200 { at, ns, hits, next?, counts? }       (immutable,
+//	                              tagged idx:{ns} and r:{ns}/{name} per hit)
 //	                              302 → current checkpoint if ns_id is not current
 //	GET /g/{gs}/{ns}?…            private namespaces: as above, keyed by the
 //	GET /g/{gs}/{ns}/at/{ns_id}?… reader's subject set gs (§B.11.5)
+//
+// Only the current checkpoint's results are kept: the index holds current
+// state only (§A.3), so every older ns_id is one "the service no longer
+// keeps results for" and is redirected (head-pointer class) to the current
+// one (§A.4). A result served at an ns_id never changes while it is served,
+// and a purge removes it from caches through its r: tags.
 //
 // Private namespaces need Authorization: Bearer <grant>; a request without
 // the right gs is redirected to it.
@@ -222,7 +231,16 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		redirect(w, target+encodeQuery(vals))
 		return
 	}
-	if q.Min != "" && !ix.waitMin(ctx, ns, q.Min) {
+	for i, m := range q.Mins {
+		if m.NS == "" {
+			q.Mins[i].NS = ns
+		} else if !ix.known(m.NS) {
+			w.Header().Set("Cache-Control", "no-store")
+			writeErr(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow")
+			return
+		}
+	}
+	if !ix.waitMins(ctx, q.Mins) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
@@ -293,7 +311,19 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		w.Header().Set("Cache-Control", ccPrivateImm)
 		w.Header().Set("CDN-Cache-Control", cdnImmutable)
 	}
-	w.Header().Set("Cache-Tag", "ns:"+ns)
+	// §A.4: idx:{ns} for the namespace, r:{ns}/{name} for every resource
+	// the result shows, so a purge of any of them removes it from caches
+	// (Apply purges these). Facet counts aggregate values of hits beyond
+	// the page too, so a result with counts also carries a counts tag
+	// that every resource purge in the namespace clears.
+	tags := []string{"idx:" + ns}
+	for _, h := range res.Hits {
+		tags = append(tags, "r:"+ns+"/"+h.Resource)
+	}
+	if res.Counts != nil {
+		tags = append(tags, countsTag(ns))
+	}
+	w.Header().Set("Cache-Tag", strings.Join(tags, ","))
 	w.Header().Set("X-Namespace-Revision", at)
 	writeJSON(w, http.StatusOK, body)
 }
@@ -317,14 +347,37 @@ func (ix *Index) query(ctx context.Context, ns, at string, q *Query, allow func(
 	return res, got, err
 }
 
+// countsTag tags results with facet counts, which can reflect any resource
+// of the namespace.
+func countsTag(ns string) string { return "idx:" + ns + ":counts" }
+
+// waitMins waits, within one MinWait budget, until every min is reached.
+func (ix *Index) waitMins(ctx context.Context, mins []MinRef) bool {
+	if len(mins) == 0 {
+		return true
+	}
+	ix.mu.Lock()
+	wait := ix.opt.MinWait
+	ix.mu.Unlock()
+	ctx, cancel := context.WithTimeout(ctx, wait+2*time.Second)
+	defer cancel()
+	deadline := time.Now().Add(wait)
+	for _, m := range mins {
+		if !ix.waitMin(ctx, m.NS, m.ID, time.Until(deadline)) {
+			return false
+		}
+	}
+	return true
+}
+
 // waitMin waits up to MinWait until the checkpoint of ns is at or past min
 // (§A.5): min is the checkpoint, or an ns_id the index has applied, or (for
 // ns_ids it never saw one by one, e.g. before a branch's snapshot) an ns_id
 // the core's log places at or before the checkpoint.
-func (ix *Index) waitMin(ctx context.Context, ns, min string) bool {
-	ix.mu.Lock()
-	wait := ix.opt.MinWait
-	ix.mu.Unlock()
+func (ix *Index) waitMin(ctx context.Context, ns, min string, wait time.Duration) bool {
+	if wait < 0 {
+		wait = 0
+	}
 	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	for {

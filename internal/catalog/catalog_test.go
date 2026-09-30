@@ -46,6 +46,7 @@ type world struct {
 	s        *clienttest.Server
 	ops      *client.Client // "*" key on both namespaces
 	idp, cat clienttest.Key
+	opsKey   clienttest.Key // "*" on both namespaces
 	svc      *catalog.Service
 	http     *httptest.Server
 	cancel   context.CancelFunc
@@ -71,17 +72,31 @@ func parents(ps ...string) []any {
 	return out
 }
 
-// noAccessWrites holds when a write doesn't set or change $access: an
-// append, delete or restore doesn't write it, and a create's document has
-// none.
-func noAccessWrites() []any {
-	isCreate := map[string]any{"op": "test", "path": "/action", "value": "create"}
-	return []any{
-		map[string]any{"if": []any{map[string]any{"not": isCreate}},
-			"then": []any{map[string]any{"not": map[string]any{"op": "writes", "overlaps": "/$access"}}}},
-		map[string]any{"if": []any{isCreate},
-			"then": []any{map[string]any{"op": "test", "path": "/doc/$access", "exists": false}}},
+// The $access rules of §B.11.3, verbatim. Creates and restores (with a
+// root replace) write "", which overlaps every path (§6.4.4), so they are
+// judged by the resulting document; every other write by whether it
+// overlaps /$access.
+const (
+	catalogKeyRules = `[
+        { "if":   [{ "op": "test", "path": "/action", "schema": { "enum": ["create", "restore"] } }],
+          "then": [{ "op": "test", "path": "/doc/$access", "exists": false }] },
+        { "if":   [{ "not": { "op": "test", "path": "/action", "schema": { "enum": ["create", "restore"] } } }],
+          "then": [{ "not": { "op": "writes", "overlaps": "/$access" } }] } ]`
+	catalogNSRules = `[
+    { "if":   [{ "any": [
+                { "all": [{ "op": "test", "path": "/action", "schema": { "enum": ["create", "restore"] } },
+                          { "op": "test", "path": "/doc/$access", "exists": true }] },
+                { "all": [{ "not": { "op": "test", "path": "/action", "schema": { "enum": ["create", "restore"] } } },
+                          { "op": "writes", "overlaps": "/$access" }] } ] }],
+      "then": [{ "op": "test", "path": "/principal/groups", "schema": { "contains": { "const": "catalog-admins" } } }] } ]`
+)
+
+func jsonRules(s string) []any {
+	var out []any
+	if err := json.Unmarshal([]byte(s), &out); err != nil {
+		panic(err)
 	}
+	return out
 }
 
 // live reports whether c can read the resource's head.
@@ -94,16 +109,13 @@ func setup(t *testing.T) *world {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
 	opsKey, idp, catKey := clienttest.NewKey("ops"), clienttest.NewKey("idp"), clienttest.NewKey("catalog-01")
-	w := &world{t: t, s: s, idp: idp, cat: catKey}
+	w := &world{t: t, s: s, idp: idp, cat: catKey, opsKey: opsKey}
 
-	catEntry := catKey.Entry("read", "create", "append", "delete")
+	catEntry := catKey.Entry("read", "create", "append", "delete", "restore")
 	catEntry["maxTtl"] = "PT15M"
 	catEntry["requireAt"] = true
 	catEntry["groups"] = map[string]any{"deny": toAny("catalog-admins", "ops")}
-	// §B.11.3's key rule { not: { writes overlaps /$access } } refuses every
-	// create (a genesis writes "", which overlaps everything, §6.4.4), so
-	// creates are judged by the resulting document instead.
-	catEntry["rules"] = noAccessWrites()
+	catEntry["rules"] = jsonRules(catalogKeyRules)
 	opc := s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat")))
 	must(opc.CreateNamespace(ctx, "cat", map[string]any{
 		"read":    "grant",
@@ -112,9 +124,7 @@ func setup(t *testing.T) *world {
 		"catalog": map[string]any{"trust": toAny("matches"), "mode": "dag"},
 		"roles": map[string]any{
 			"desk": map[string]any{"move": true, "place": true}, "translator": map[string]any{}, "reader": map[string]any{}},
-		"rules": []any{map[string]any{
-			"if":   []any{map[string]any{"not": map[string]any{"all": noAccessWrites()}}},
-			"then": []any{map[string]any{"op": "test", "path": "/principal/groups", "schema": map[string]any{"contains": map[string]any{"const": "catalog-admins"}}}}}},
+		"rules": jsonRules(catalogNSRules),
 	}))
 	contentEntry := catKey.Entry("read", "create", "append")
 	contentEntry["maxTtl"] = "PT15M"
@@ -616,7 +626,7 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 		if r.status != 200 {
 			t.Fatalf("GET %s: %d %v", loc, r.status, r.body)
 		}
-		if r.header.Get("Cache-Control") != "private, max-age=5" || r.header.Get("CDN-Cache-Control") == "" {
+		if r.header.Get("Cache-Control") != "private, max-age=300" || r.header.Get("CDN-Cache-Control") != "max-age=31536000" {
 			t.Errorf("listing cache headers %v", r.header)
 		}
 		return r.body, loc
@@ -635,10 +645,22 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 
 	fan := w.caller("user:fred", "fan-club")
 	b, loc := get("/cat/children?of=season", fan)
-	cp := w.svc.Tree().Checkpoint("cat")
-	if !strings.HasPrefix(loc, "/cat/at/"+cp+"/g/") {
+	// §B.11.5: /{catalog}/at/{at}/g/{gs}/…, at the combined checkpoint (§B.5).
+	cp := w.svc.Tree().At()
+	if !strings.HasPrefix(loc, "/cat/at/"+cp+"/g/") || cp == w.svc.Tree().Checkpoint("cat") {
 		t.Errorf("listing url %s", loc)
 	}
+	// A private listing at an at is immutable too, tagged per item and per namespace.
+	if r := w.do("GET", loc, fan, nil); !strings.Contains(r.header.Get("Cache-Tag"), "ns:matches") || !strings.Contains(r.header.Get("Cache-Tag"), "r:matches/derby") {
+		t.Errorf("private listing tags %s", r.header.Get("Cache-Tag"))
+	}
+	// A content change moves the private listing to a new at.
+	w.patch("matches", "derby", map[string]any{"op": "add", "path": "/x", "value": 1})
+	w.caughtUp()
+	if r := w.do("GET", loc, fan, nil); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/cat/at/"+w.svc.Tree().At()+"/g/") {
+		t.Errorf("private listing after a content change: %d %s", r.status, r.header.Get("Location"))
+	}
+	b, loc = get("/cat/children?of=season", fan)
 	// fan-club (reader) sees season's items but not the embargoed folder.
 	if got := names(b["children"]); got != "matches.derby,matches.shared" {
 		t.Errorf("fan sees %s", got)
@@ -725,4 +747,179 @@ func TestRestartKeepsEffective(t *testing.T) {
 		t.Errorf("effective rows %d then %d", before, after)
 	}
 	w.issue(w.caller("user:anna", "translators"), map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
+}
+
+// TestRePlaceRestoreOnly: re-placing an item whose placement was deleted
+// yields a grant carrying only restore, used with a root replace (§B.11.4),
+// judged by the resulting document under §B.11.3's rules.
+func TestRePlaceRestoreOnly(t *testing.T) {
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	bob := w.caller("user:bob", "match-desk")
+
+	// Place, then unplace.
+	w.doc("matches", "again", map[string]any{"title": "again"})
+	g := w.grantFor(bob, map[string]any{"item": "/r/matches/again", "want": toAny("place"), "to": toAny("season")})
+	must(w.core(g).CreateDoc(ctx, "cat", "matches.again", map[string]any{"parents": parents("season"), "$nonce": "n1"}))
+	w.caughtUp()
+	g = w.grantFor(bob, map[string]any{"node": "matches.again", "want": toAny("delete")})
+	must(w.core(g).Delete(ctx, "cat", "matches.again", must(w.ops.Head(ctx, "cat", "matches.again")).ID))
+	w.caughtUp()
+
+	// Re-place: restore only, never create or append.
+	b := w.issue(bob, map[string]any{"item": "/r/matches/again", "want": toAny("place"), "to": toAny("derbies")}, 200).body
+	if fmt.Sprint(b["can"]) != "[restore]" {
+		t.Fatalf("re-place grant can %v", b["can"])
+	}
+	rc := w.core(b["grant"].(string))
+	tomb := must(w.ops.Head(ctx, "cat", "matches.again"))
+	if tomb.State != client.Tombstoned {
+		t.Fatalf("placement state %v", tomb.State)
+	}
+	rootReplace := func(doc map[string]any) []any {
+		return []any{map[string]any{"op": "replace", "path": "", "value": doc}}
+	}
+	// The current core authorises every PATCH with If-Match as an append at
+	// step 1, so a restore-only grant can't restore at all until it has
+	// §6.2's v0.21 candidate verbs.
+	if _, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{"parents": parents("season"), "$nonce": "n2"})); err != nil && strings.Contains(err.Error(), "does not allow append") {
+		t.Skip("waiting on the core's §6.2 v0.21 candidate verbs: a restore-only grant must pass step 1 for a PATCH with If-Match (candidate verb restore); the current core authorises it as append only")
+	}
+	// A restore that brings $access is refused (only admins may, §B.11.3).
+	if _, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{
+		"parents": parents("derbies"), "$access": acc("user:bob", "desk"), "$nonce": "n2"})); !isStatus(err, 403) {
+		t.Errorf("restore with $access: %v", err)
+	}
+	// Other parents than the grant fixes are refused.
+	if _, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{"parents": parents("season"), "$nonce": "n2"})); !isStatus(err, 403) {
+		t.Errorf("restore with other parents: %v", err)
+	}
+	// The grant can't create another node.
+	if _, err := rc.CreateDoc(ctx, "cat", "matches.again2", map[string]any{"parents": parents("derbies")}); !isStatus(err, 403) {
+		t.Errorf("restore grant creating: %v", err)
+	}
+	// The restore with a root replace and a fresh $nonce (§B.11.4 note).
+	res, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{"parents": parents("derbies"), "$nonce": "n2"}))
+	if err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	// Once live, the restore-only grant can't act as a move: the write is
+	// an append, which the grant doesn't allow.
+	if _, err := rc.Append(ctx, "cat", "matches.again", res.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents("derbies")}}); !isStatus(err, 403) {
+		t.Errorf("restore-only grant appending to the live placement: %v", err)
+	}
+	w.caughtUp()
+	if got := w.svc.Tree().Checkpoint("cat"); got == "" {
+		t.Fatal("no checkpoint")
+	}
+	w.issue(w.caller("user:fred", "fan-club"), map[string]any{"item": "/r/matches/again", "want": toAny("append")}, 200)
+}
+
+// TestRestoreOnlyGrantOnRevivedPlacement: a restore-only grant used after
+// someone else restored the placement can't act as a move: the write
+// settles as an append, not a candidate verb, and is refused (§6.2 step 2
+// with v0.21 candidate verbs, before the If-Match comparison, whatever
+// head the writer presents; the current core refuses it at step 1).
+func TestRestoreOnlyGrantOnRevivedPlacement(t *testing.T) {
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	bob := w.caller("user:bob", "match-desk")
+	w.doc("matches", "again", map[string]any{"title": "again"})
+	w.doc("cat", "matches.again", map[string]any{"parents": parents("season")})
+	must(w.ops.Delete(ctx, "cat", "matches.again", must(w.ops.Head(ctx, "cat", "matches.again")).ID))
+	w.caughtUp()
+	tomb := must(w.ops.Head(ctx, "cat", "matches.again"))
+	g := w.grantFor(bob, map[string]any{"item": "/r/matches/again", "want": toAny("place"), "to": toAny("derbies")})
+	// Someone else restores it first.
+	must(w.ops.Restore(ctx, "cat", "matches.again", tomb.ID, []any{}))
+	// The stale tombstone as If-Match: 403 (not a candidate verb), not 412.
+	move := []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"parents": parents("derbies")}}}
+	if _, err := w.core(g).Restore(ctx, "cat", "matches.again", tomb.ID, move); !isStatus(err, 403) {
+		t.Errorf("restore-only grant on a revived placement, stale If-Match: %v", err)
+	}
+	if _, err := w.core(g).Append(ctx, "cat", "matches.again", must(w.ops.Head(ctx, "cat", "matches.again")).ID, move); !isStatus(err, 403) {
+		t.Errorf("restore-only grant on a revived placement, current If-Match: %v", err)
+	}
+}
+
+// TestNoWideningIncludes: no widening compares roles by name with the
+// content namespace's declared includes, transitively (§B.11.4).
+func TestNoWideningIncludes(t *testing.T) {
+	w := setup(t)
+	w.start()
+	ctx := context.Background()
+	// Content roles: chief ⊇ desk ⊇ reader, and a cycle loopa ⇄ loopb.
+	// Changing /roles needs a * key (§C.1.1).
+	opm := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"config"})))
+	cfg := must(w.ops.NSHead(ctx, "matches")).Config
+	must(opm.PatchConfig(ctx, "matches", cfg, []any{
+		map[string]any{"op": "add", "path": "/roles/desk/includes", "value": toAny("reader")},
+		map[string]any{"op": "add", "path": "/roles/chief", "value": map[string]any{"can": toAny("read", "append"), "includes": toAny("desk")}},
+		map[string]any{"op": "add", "path": "/roles/loopa", "value": map[string]any{"can": toAny("read"), "includes": toAny("loopb")}},
+		map[string]any{"op": "add", "path": "/roles/loopb", "value": map[string]any{"can": toAny("read"), "includes": toAny("loopa")}},
+	}))
+	// Folders: movers have desk (move) everywhere; group:g has a different role in each.
+	w.doc("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	folder := func(name, role string) {
+		w.doc("cat", name, map[string]any{"title": name, "parents": parents("root"),
+			"$access": acc("group:movers", "desk", "group:g", role)})
+	}
+	folder("f-desk", "desk")
+	folder("f-reader", "reader")
+	folder("f-chief", "chief")
+	folder("f-loopa", "loopa")
+	folder("f-loopb", "loopb")
+	for _, n := range []string{"i1", "i2", "i3"} {
+		w.doc("matches", n, map[string]any{"title": n})
+	}
+	w.doc("cat", "matches.i1", map[string]any{"parents": parents("f-desk")})
+	w.doc("cat", "matches.i2", map[string]any{"parents": parents("f-chief")})
+	w.doc("cat", "matches.i3", map[string]any{"parents": parents("f-loopa")})
+	// A sub-folder holding an item, to move as a whole.
+	w.doc("cat", "sub", map[string]any{"title": "sub", "parents": parents("f-desk")})
+	w.caughtUp()
+	mover := w.caller("user:mo", "movers")
+	move := func(node, to string, status int) {
+		t.Helper()
+		w.issue(mover, map[string]any{"node": node, "want": toAny("move"), "to": toAny(to)}, status)
+	}
+	apply := func(node, to string) {
+		t.Helper()
+		g := w.grantFor(mover, map[string]any{"node": node, "want": toAny("move"), "to": toAny(to)})
+		h := must(w.ops.Head(ctx, "cat", node))
+		must(w.core(g).Append(ctx, "cat", node, h.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents(to)}}))
+		w.caughtUp()
+	}
+	// desk → reader narrows; reader → desk widens.
+	apply("matches.i1", "f-reader")
+	move("matches.i1", "f-desk", 403)
+	// Transitive: chief includes desk includes reader.
+	move("matches.i2", "f-desk", 200)
+	move("matches.i2", "f-reader", 200)
+	// Cycles in includes are handled: loopa and loopb include each other,
+	// and neither includes reader or desk.
+	move("matches.i3", "f-loopb", 200)
+	r := w.issue(mover, map[string]any{"node": "matches.i3", "want": toAny("move"), "to": toAny("f-reader")}, 403)
+	if !strings.Contains(r.body["message"].(string), "group:g") || !strings.Contains(r.body["message"].(string), "reader") {
+		t.Errorf("widening message: %v", r.body)
+	}
+	move("matches.i3", "f-desk", 403)
+	// A folder (empty) moves under the same rule, with includes that hold
+	// in every trusted content namespace.
+	move("sub", "f-reader", 200)
+	move("sub", "f-chief", 403)
+	// Without the declaration, desk → reader widens.
+	cfg = must(w.ops.NSHead(ctx, "matches")).Config
+	must(opm.PatchConfig(ctx, "matches", cfg, []any{map[string]any{"op": "remove", "path": "/roles/desk/includes"}}))
+	w.caughtUp()
+	waitFor(t, "the includes change to be seen", func() bool {
+		return w.do("POST", "/grants", mover, map[string]any{"node": "matches.i2", "want": toAny("move"), "to": toAny("f-reader")}).status == 403
+	})
+	move("matches.i2", "f-desk", 200) // chief still includes desk
 }

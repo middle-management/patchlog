@@ -30,7 +30,9 @@ import (
 //	counts=/path        facet counts over all hits (repeatable)
 //	limit=n             page size, 1–100 (default 20)
 //	after=n             continue after the first n hits (from "next")
-//	min=ns_id           read-your-writes (§A.5)
+//	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, or
+//	min=ns:ns_id        ns:ns_id for any namespace the service follows; repeatable, and
+//	                    every one must be reached
 type Query struct {
 	Q      string
 	words  []string
@@ -41,7 +43,28 @@ type Query struct {
 	Counts []string
 	Limit  int
 	After  int
-	Min    string
+	// Mins are the ?min= values; NS is "" for a bare ns_id (the queried
+	// namespace).
+	Mins []MinRef
+}
+
+// MinRef is one ?min= value (§A.5).
+type MinRef struct{ NS, ID string }
+
+// ParseMin parses "{ns_id}" or "{ns}:{ns_id}" (§A.5, §B.5).
+func ParseMin(s string) (MinRef, error) {
+	var m MinRef
+	if i := strings.LastIndexByte(s, ':'); i >= 0 {
+		m.NS, s = s[:i], s[i+1:]
+		if !validNS(m.NS) {
+			return m, fmt.Errorf("min: %q is not a namespace name", m.NS)
+		}
+	}
+	if _, err := ids.Parse(s); err != nil {
+		return m, fmt.Errorf("min is not an ns_id or {ns}:{ns_id}")
+	}
+	m.ID = s
+	return m, nil
 }
 
 type rangeFilter struct {
@@ -87,9 +110,17 @@ func ParseQuery(v url.Values) (*Query, error) {
 	}
 	for k, vals := range v {
 		switch k {
-		case "q", "schema", "limit", "after", "min":
+		case "q", "schema", "limit", "after":
 			if _, err := one(k); err != nil {
 				return nil, err
+			}
+		case "min":
+			for _, s := range vals {
+				m, err := ParseMin(s)
+				if err != nil {
+					return nil, err
+				}
+				q.Mins = append(q.Mins, m)
 			}
 		case "sort":
 			for _, s := range vals {
@@ -164,12 +195,6 @@ func ParseQuery(v url.Values) (*Query, error) {
 			return nil, fmt.Errorf("after must be a non-negative integer")
 		}
 		q.After = n
-	}
-	if s := v.Get("min"); s != "" {
-		if _, err := ids.Parse(s); err != nil {
-			return nil, fmt.Errorf("min is not an ns_id")
-		}
-		q.Min = s
 	}
 	return q, nil
 }

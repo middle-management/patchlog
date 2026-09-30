@@ -2,6 +2,7 @@ package tree_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,8 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -259,23 +262,45 @@ func TestTreeListings(t *testing.T) {
 	x := startSvc(t, w.c, svcOpts{})
 	x.caughtUp("cat", "matches")
 
-	// The head pointer redirects to the checkpoint.
-	cp := x.s.Checkpoint("cat")
+	// The head pointer redirects to the combined checkpoint (§B.5).
+	cp := x.s.At()
+	if want := combined(map[string]any{"cat": x.s.Checkpoint("cat"), "matches": x.s.Checkpoint("matches")}); cp != want {
+		t.Fatalf("combined checkpoint %s, want %s", cp, want)
+	}
 	r := x.raw("/cat/children?of=season", "")
 	if r.status != 302 || r.header.Get("Location") != "/cat/at/"+cp+"/children?of=season" ||
 		!strings.Contains(r.header.Get("Cache-Control"), "s-maxage=1") {
 		t.Fatalf("pointer: %d %v", r.status, r.header)
 	}
 	r = x.raw("/cat/at/"+cp+"/children?of=season", "")
-	if r.status != 200 || r.header.Get("Cache-Control") != "public, max-age=5, s-maxage=31536000" ||
-		!strings.Contains(r.header.Get("Cache-Tag"), "node:cat/matches.derby") {
+	if r.status != 200 || !strings.Contains(r.header.Get("Cache-Control"), "immutable") || r.body["at"] != cp {
 		t.Fatalf("listing: %d %v", r.status, r.header)
+	}
+	// Tagged with every item shown and every namespace in the checkpoint.
+	tags := tagSet(r)
+	for _, want := range []string{"ns:cat", "ns:matches", "r:cat/season", "r:cat/matches.derby", "r:matches/derby", "r:matches/opener"} {
+		if !tags[want] {
+			t.Errorf("listing lacks tag %s: %s", want, r.header.Get("Cache-Tag"))
+		}
+	}
+	if tags["r:cat/derbies"] || tags["r:cat/root"] {
+		t.Errorf("listing tags nodes it doesn't show: %s", r.header.Get("Cache-Tag"))
 	}
 	// A stale checkpoint redirects to the current one.
 	w.folder(t, "extra", "Extra", "root@b0")
 	x.caughtUp("cat")
-	if r := x.raw("/cat/at/"+cp+"/children?of=season", ""); r.status != 302 || !strings.Contains(r.header.Get("Location"), x.s.Checkpoint("cat")) {
+	if r := x.raw("/cat/at/"+cp+"/children?of=season", ""); r.status != 302 || !strings.Contains(r.header.Get("Location"), x.s.At()) || x.s.At() == cp {
 		t.Errorf("stale at: %d %v", r.status, r.header)
+	}
+	// A content change alone moves the combined checkpoint too.
+	cp = x.s.At()
+	w.replace(t, "matches", "opener", "/title", "Opener!")
+	x.caughtUp("matches")
+	if x.s.At() == cp {
+		t.Error("content change did not change at")
+	}
+	if r := x.raw("/cat/at/"+cp+"/children?of=season", ""); r.status != 302 || r.header.Get("Location") != "/cat/at/"+x.s.At()+"/children?of=season" {
+		t.Errorf("at after content change: %d %v", r.status, r.header)
 	}
 
 	b := x.get("/cat/children?of=season", "")
@@ -294,9 +319,16 @@ func TestTreeListings(t *testing.T) {
 	// The dangling placement appears once its item exists (read-your-writes with min).
 	must(w.c.CreateDoc(context.Background(), "matches", "cup", map[string]any{"title": "cup"}))
 	nsHead := must(w.c.NSHead(context.Background(), "matches")).ID
-	b = x.get("/cat/children?of=season&min="+nsHead, "")
+	b = x.get("/cat/children?of=season&min=matches:"+nsHead+"&min=cat:"+x.s.Checkpoint("cat"), "")
 	if got := names(b["children"]); got != "matches.opener,matches.derby,matches.cup" {
 		t.Errorf("children after create: %s", got)
+	}
+	// A bare ns_id still works; unknown namespaces and malformed values are 400.
+	x.get("/cat/children?of=season&min="+nsHead, "")
+	for _, m := range []string{"docs:" + nsHead, "Bad:" + nsHead, "matches:nope"} {
+		if r := x.raw("/cat/children?of=season&min="+m, ""); r.status != 400 {
+			t.Errorf("min=%s: %d", m, r.status)
+		}
 	}
 	// Pagination with ?after and next links.
 	b = x.get("/cat/children?of=season&limit=1", "")
@@ -345,12 +377,27 @@ func TestTreeListings(t *testing.T) {
 	if b := x.get("/cat/where?item=/r/matches/nowhere", ""); b["placement"] != nil {
 		t.Errorf("where unplaced: %v", b)
 	}
-	if r := x.raw("/cat/at/"+x.s.Checkpoint("cat")+"/children?of=nope", ""); r.status != 404 {
+	if r := x.raw("/cat/at/"+x.s.At()+"/children?of=nope", ""); r.status != 404 {
 		t.Errorf("unknown folder: %d", r.status)
 	}
 	if r := x.raw("/other/children?of=x", ""); r.status != 404 {
 		t.Errorf("other catalog: %d", r.status)
 	}
+}
+
+func combined(m map[string]any) string {
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(m)))
+	return ids.FromBytes(sum[:ids.Size]).String()
+}
+
+func tagSet(r resp) map[string]bool {
+	out := map[string]bool{}
+	for _, t := range strings.Split(r.header.Get("Cache-Tag"), ",") {
+		if t != "" {
+			out[t] = true
+		}
+	}
+	return out
 }
 
 func TestMovesAndDeletes(t *testing.T) {
@@ -409,12 +456,22 @@ func TestMovesAndDeletes(t *testing.T) {
 	if !found {
 		t.Errorf("problems: %v", pr)
 	}
-	// The purge tags cover the placement and whole-catalog reports.
+	// A tombstone moves at; nothing cached needs purging.
 	x.mu.Lock()
 	all := fmt.Sprint(x.purges)
 	x.mu.Unlock()
-	if !strings.Contains(all, "node:cat/matches.derby") || !strings.Contains(all, "all:cat") {
+	if all != "[]" {
 		t.Errorf("purges: %s", all)
+	}
+	// A purge removes every cached listing showing the resource.
+	h0 := must(w.c.Head(context.Background(), "matches", "derby"))
+	must(w.c.Purge(context.Background(), "matches", "derby", h0.ID, false))
+	x.caughtUp("matches")
+	x.mu.Lock()
+	all = fmt.Sprint(x.purges)
+	x.mu.Unlock()
+	if all != "[[r:matches/derby rs:cat]]" {
+		t.Errorf("purges after purge: %s", all)
 	}
 
 	// Deleting a folder doesn't cascade: its children become orphans.
@@ -698,4 +755,33 @@ func TestPrivateCatalog(t *testing.T) {
 	if r := x.raw(x.raw("/cat/children?of=hidden", scoped).header.Get("Location"), scoped); r.status != 404 {
 		t.Errorf("scoped reader on a hidden folder: %d", r.status)
 	}
+}
+
+// TestManyTag: a listing showing more resources than fit in its tags
+// carries rs:{catalog}, which every purge of a resource purges (§B.5).
+func TestManyTag(t *testing.T) {
+	w := setup(t)
+	w.folder(t, "root", "Root")
+	var items []client.BatchItem
+	for i := 0; i < 210; i++ {
+		items = append(items, client.BatchItem{Resource: fmt.Sprintf("f%03d", i), IfNoneMatch: true,
+			Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"title": "x", "parents": parents("root")}))}})
+	}
+	must(w.c.Batch(context.Background(), "cat", client.BatchRequest{Items: items}, false))
+	x := startSvc(t, w.c, svcOpts{})
+	x.caughtUp("cat", "matches")
+	r := x.raw("/cat/at/"+x.s.At()+"/children?of=root&limit=1000", "")
+	if r.status != 200 || r.header.Get("Cache-Tag") != "ns:cat,ns:matches,rs:cat" {
+		t.Fatalf("large listing: %d %s", r.status, r.header.Get("Cache-Tag"))
+	}
+	// Purging a namespace purges ns:{ns} (every listing whose checkpoint covers it).
+	ctx := context.Background()
+	cfg := must(w.c.NSHead(ctx, "matches")).Config
+	must(w.c.PatchConfig(ctx, "matches", cfg, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	must(w.c.PurgeNamespace(ctx, "matches", must(w.c.NSHead(ctx, "matches")).ID))
+	waitFor(t, "purge-ns tags", func() bool {
+		x.mu.Lock()
+		defer x.mu.Unlock()
+		return strings.Contains(fmt.Sprint(x.purges), "ns:matches rs:cat")
+	})
 }

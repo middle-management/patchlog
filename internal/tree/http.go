@@ -19,18 +19,22 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// Cache-Control values (§9). Listings at a checkpoint are cached by the CDN
-// for as long as it is current (a catalog write moves every listing to a
-// new URL). A change in a content namespace (an item's head, or an item
-// appearing or going away) changes listings without changing the catalog
-// checkpoint, so browsers keep them only briefly and the CDN is purged by
-// tag: node:{catalog}/{node} for every node a response depends on, and
-// all:{catalog} for whole-catalog reports.
+// Cache-Control values (§9). A listing's at is the service's combined
+// checkpoint over the catalog and every content namespace it follows
+// (§B.5), so any change a listing depends on (a catalog write, an item's
+// head, an item appearing or going away) moves listings to a new URL, and a
+// listing at a given at never changes: the immutable class. Listings are
+// tagged r:{ns}/{name} for every resource they show (catalog nodes and
+// their items) and ns:{ns} for every namespace in the checkpoint, and the
+// service purges those tags on purge and purge-ns entries (Apply), so a
+// purge removes cached listings at every at. A listing showing more than
+// maxTags resources carries rs:{catalog} instead of its r: tags, which
+// every purge of a resource purges too.
 const (
 	ccHeadPointer = "public, max-age=0, s-maxage=1, stale-while-revalidate=5"
-	ccListing     = "public, max-age=5, s-maxage=31536000"
+	ccListing     = "public, max-age=86400, s-maxage=31536000, immutable"
 	ccPrivatePtr  = "private, no-cache"
-	ccPrivateList = "private, max-age=5"
+	ccPrivateList = "private, max-age=300"
 	cdnListing    = "max-age=31536000"
 )
 
@@ -209,14 +213,21 @@ var ops = map[string]bool{
 
 // Handler returns the query API (§B.5):
 //
-//	GET /{catalog}/{op}?…                      302 → /{catalog}/at/{checkpoint}[/g/{gs}]/{op}?…  (head pointer)
-//	GET /{catalog}/at/{ns_id}/{op}?…            200, public readers                            (cached while current)
-//	GET /{catalog}/at/{ns_id}/g/{gs}/{op}?…     200, readers with a grant, keyed by subject set (§B.11.5)
+//	GET /{catalog}/{op}?…                   302 → /{catalog}/at/{at}[/g/{gs}]/{op}?…  (head pointer)
+//	GET /{catalog}/at/{at}/{op}?…            200, public readers                     (immutable)
+//	GET /{catalog}/at/{at}/g/{gs}/{op}?…     200, readers with a grant, keyed by subject set (§B.11.5)
 //
-// op is one of children?of=&after=&limit=, ancestors?of=, subtree?of=&depth=,
-// roots, orphans, problems, where?item=, manifest?of=. An at URL that isn't
-// the current checkpoint redirects to it; ?min={ns_id} (of the catalog or
-// of a trusted namespace) waits until the service has applied it.
+// at is the combined checkpoint (CombinedAt). op is one of
+// children?of=&after=&limit=, ancestors?of=, subtree?of=&depth=, roots,
+// orphans, problems, where?item=, manifest?of=.
+//
+// The service keeps no results: it answers 200 only at the current at,
+// and redirects every other at to the current one (§B.5 "only if it is
+// current or that exact result was stored").
+//
+// ?min= waits until the service has applied an ns_id (§A.5): {ns}:{ns_id}
+// for the catalog or a followed content namespace, repeatable, or a bare
+// {ns_id} of any of them.
 func (s *Service) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
 
 func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -306,19 +317,37 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			w.Header().Set("Vary", "Authorization")
 		}
 	}
-	if min := vals.Get("min"); min != "" && !s.waitMin(ctx, min) {
+	mins, err := parseMins(vals["min"])
+	if err != nil {
+		w.Header().Set("Cache-Control", "no-store")
+		WriteError(w, http.StatusBadRequest, "bad_input", err.Error())
+		return
+	}
+	followed := map[string]bool{}
+	for _, ns := range s.followed() {
+		followed[ns] = true
+	}
+	for _, m := range mins {
+		if m.ns != "" && !followed[m.ns] {
+			w.Header().Set("Cache-Control", "no-store")
+			WriteError(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow")
+			return
+		}
+	}
+	if !s.waitMins(ctx, mins) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
 		WriteError(w, http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet")
 		return
 	}
-	cur, _, _ := s.state()
-	if cur == "" {
+	if c, _, _ := s.state(); c == "" {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
 		WriteError(w, http.StatusServiceUnavailable, "behind", "the tree service has not reached the catalog yet")
 		return
 	}
+	var cur string
+	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
 	if !isAt || at != cur || gs != v.gs || (v.anon && gs != "") {
 		setPtr()
 		redirect(w, target(cur)+encodeQuery(vals, "min"))
@@ -331,9 +360,10 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		tags   tagSet
 		errMsg string
 		got    string
+		nss    []string
 	)
 	s.View(func(g *Graph, curMap map[string]string) {
-		got = curMap[cat]
+		got, nss = CombinedAt(g, curMap)
 		if got != at {
 			return
 		}
@@ -356,7 +386,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		w.Header().Set("Cache-Control", ccPrivateList)
 		w.Header().Set("CDN-Cache-Control", cdnListing)
 	}
-	w.Header().Set("Cache-Tag", tags.header(cat))
+	w.Header().Set("Cache-Tag", tags.header(cat, nss))
 	w.Header().Set("X-Namespace-Revision", at)
 	WriteJSON(w, http.StatusOK, body)
 }
@@ -373,14 +403,58 @@ func codeFor(status int) string {
 	return "error"
 }
 
+// CombinedAt is the service's combined checkpoint (§B.5):
+// text(trunc160(sha256(canonical({ ns: ns_id, … })))) over the catalog and
+// every content namespace it follows (catalog.trust) that the service has
+// reached, with the namespaces it covers, sorted. Call it under the graph
+// lock (View).
+func CombinedAt(g *Graph, cur map[string]string) (string, []string) {
+	m := map[string]any{}
+	nss := []string{}
+	add := func(ns string) {
+		if id := cur[ns]; id != "" {
+			m[ns] = id
+			nss = append(nss, ns)
+		}
+	}
+	add(g.Catalog)
+	for ns := range g.Trust {
+		if ns != g.Catalog {
+			add(ns)
+		}
+	}
+	sort.Strings(nss)
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(m)))
+	return ids.FromBytes(sum[:ids.Size]).String(), nss
+}
+
+// At returns the current combined checkpoint (§B.5): the at of listings.
+func (s *Service) At() string {
+	var at string
+	s.View(func(g *Graph, cur map[string]string) { at, _ = CombinedAt(g, cur) })
+	return at
+}
+
+// tagSet collects the r:{ns}/{name} tags of the resources a listing shows.
 type tagSet map[string]bool
 
-func (t tagSet) node(cat, name string) { t["node:"+cat+"/"+name] = true }
+// node tags a catalog node and, for a placement, its item.
+func (t tagSet) node(g *Graph, name string) {
+	t["r:"+g.Catalog+"/"+name] = true
+	if n := g.Node(name); n != nil && n.ItemNS != "" {
+		t["r:"+n.ItemNS+"/"+n.ItemName] = true
+	}
+}
 
-func (t tagSet) header(cat string) string {
-	out := []string{"ns:" + cat}
+// header is ns:{ns} for every namespace in the checkpoint, then the r:
+// tags, or rs:{catalog} in their place if there are too many.
+func (t tagSet) header(cat string, nss []string) string {
+	out := make([]string, 0, len(nss)+len(t))
+	for _, ns := range nss {
+		out = append(out, "ns:"+ns)
+	}
 	if len(t) > maxTags {
-		return strings.Join(append(out, "all:"+cat), ",")
+		return strings.Join(append(out, ManyTag(cat)), ",")
 	}
 	keys := make([]string, 0, len(t))
 	for k := range t {
@@ -390,14 +464,65 @@ func (t tagSet) header(cat string) string {
 	return strings.Join(append(out, keys...), ",")
 }
 
-// waitMin waits up to MinWait until min is the catalog checkpoint or an
-// ns_id the service has applied (§A.5).
-func (s *Service) waitMin(ctx context.Context, min string) bool {
+// ManyTag tags listings that show more resources than they name; every
+// purge of a resource purges it.
+func ManyTag(cat string) string { return "rs:" + cat }
+
+// minRef is one ?min= value: {ns}:{ns_id}, or a bare {ns_id} (ns "").
+type minRef struct{ ns, id string }
+
+func parseMins(vals []string) ([]minRef, error) {
+	var out []minRef
+	for _, v := range vals {
+		var m minRef
+		if i := strings.LastIndexByte(v, ':'); i >= 0 {
+			m.ns, v = v[:i], v[i+1:]
+			if !client.ValidNSName(m.ns) {
+				return nil, errors.New("min: malformed namespace name")
+			}
+		}
+		if _, err := ids.Parse(v); err != nil {
+			return nil, errors.New("min must be {ns}:{ns_id} or an ns_id")
+		}
+		m.id = v
+		out = append(out, m)
+	}
+	return out, nil
+}
+
+// waitMins waits up to MinWait until every min is reached: the namespace's
+// checkpoint or an ns_id the service has applied in it (§A.5); a bare
+// ns_id may be of any followed namespace.
+func (s *Service) waitMins(ctx context.Context, mins []minRef) bool {
+	if len(mins) == 0 {
+		return true
+	}
 	timer := time.NewTimer(s.opt.MinWait)
 	defer timer.Stop()
 	for {
-		cur, _, changed := s.state()
-		if cur == min || s.Seen(ctx, min) {
+		s.mu.RLock()
+		cur, changed := s.cur, s.changed
+		ok := true
+		for _, m := range mins {
+			if m.ns != "" && cur[m.ns] == m.id {
+				continue
+			}
+			if m.ns == "" && cur[s.opt.Catalog] == m.id {
+				continue
+			}
+			ok = false
+		}
+		s.mu.RUnlock()
+		if !ok {
+			ok = true
+			for _, m := range mins {
+				if !s.reached(ctx, m) {
+					ok = false
+					break
+				}
+			}
+		}
+		if ok {
 			return true
 		}
 		select {
@@ -408,6 +533,17 @@ func (s *Service) waitMin(ctx context.Context, min string) bool {
 			return false
 		}
 	}
+}
+
+func (s *Service) reached(ctx context.Context, m minRef) bool {
+	if m.ns == "" {
+		return s.Checkpoint(s.opt.Catalog) == m.id || s.Seen(ctx, m.id)
+	}
+	if s.Checkpoint(m.ns) == m.id {
+		return true
+	}
+	var one int
+	return s.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns = ? AND ns_id = ?`, m.ns, m.id).Scan(&one) == nil
 }
 
 // encodeQuery encodes the query canonically (sorted keys) without drop.
@@ -509,7 +645,7 @@ func (q *query) node(param string) (*Node, int, string) {
 	if !ok {
 		return nil, http.StatusBadRequest, "malformed " + param
 	}
-	q.tags.node(q.g.Catalog, name)
+	q.tags.node(q.g, name)
 	n := q.g.Node(name)
 	if n == nil || !q.v.node(q.g, n) {
 		return nil, http.StatusNotFound, "no such node"
@@ -518,6 +654,7 @@ func (q *query) node(param string) (*Node, int, string) {
 }
 
 func (q *query) entry(n *Node) map[string]any {
+	q.tags.node(q.g, n.Name)
 	m := map[string]any{"href": q.g.Href(n.Name), "name": n.Name, "kind": "folder"}
 	if n.Title != "" {
 		m["title"] = n.Title
@@ -544,7 +681,6 @@ func (q *query) entry(n *Node) map[string]any {
 func (q *query) visibleChildren(parent string) []Child {
 	var out []Child
 	for _, c := range q.g.Children(parent) {
-		q.tags.node(q.g.Catalog, c.Node.Name)
 		if c.Node.Live() && q.v.node(q.g, c.Node) {
 			out = append(out, c)
 		}
@@ -706,11 +842,11 @@ func (q *query) pathJSON(ps [][]*Node) (out []any, hidden int) {
 		ok := true
 		arr := make([]any, 0, len(p))
 		for _, x := range p {
-			q.tags.node(q.g.Catalog, x.Name)
 			if !q.v.node(q.g, x) {
 				ok = false
 				break
 			}
+			q.tags.node(q.g, x.Name)
 			e := map[string]any{"href": q.g.Href(x.Name), "name": x.Name}
 			if x.Title != "" {
 				e["title"] = x.Title
@@ -810,7 +946,6 @@ func (q *query) subtree() (any, int, string) {
 
 // roots lists nodes without parents.
 func (q *query) roots() (any, int, string) {
-	q.tags["all:"+q.g.Catalog] = true
 	out := []any{}
 	for _, name := range q.g.Names() {
 		n := q.g.Node(name)
@@ -839,7 +974,6 @@ func (q *query) parentsJSON(n *Node) []any {
 // orphans lists nodes whose every parent is gone, dangling, not a folder
 // or in a cycle (§B.5, §B.7: children of a deleted folder).
 func (q *query) orphans() (any, int, string) {
-	q.tags["all:"+q.g.Catalog] = true
 	out := []any{}
 	for _, name := range q.g.Names() {
 		n := q.g.Node(name)
@@ -857,12 +991,12 @@ func (q *query) orphans() (any, int, string) {
 // deeper than MaxDepth (§B.3, §B.5).
 func (q *query) problems() (any, int, string) {
 	g := q.g
-	q.tags["all:"+g.Catalog] = true
 	cycles := []any{}
 	for _, scc := range g.Cycles() {
 		arr := []any{}
 		for _, name := range scc {
 			if n := g.Node(name); n != nil && q.v.node(g, n) {
+				q.tags.node(g, name)
 				arr = append(arr, g.Href(name))
 			}
 		}
@@ -877,6 +1011,7 @@ func (q *query) problems() (any, int, string) {
 			continue
 		}
 		if n.State == StateDangling {
+			q.tags.node(g, name)
 			e := map[string]any{"href": g.Href(name), "reason": n.Dangling}
 			if it := n.Item(); it != "" {
 				e["item"] = it
@@ -888,6 +1023,7 @@ func (q *query) problems() (any, int, string) {
 			if st == EdgeValid || st == EdgeCycle {
 				continue
 			}
+			q.tags.node(g, name)
 			e := map[string]any{"href": g.Href(name), "state": EdgeStateName(st)}
 			if p.Href != "" {
 				e["parent"] = p.Href
@@ -898,6 +1034,7 @@ func (q *query) problems() (any, int, string) {
 			parents = append(parents, e)
 		}
 		if n.Deep {
+			q.tags.node(g, name)
 			deep = append(deep, map[string]any{"href": g.Href(name), "depth": n.Depth})
 		}
 	}
@@ -913,7 +1050,7 @@ func (q *query) where() (any, int, string) {
 		return nil, http.StatusBadRequest, "item must be /r/{ns}/{name} of a content namespace"
 	}
 	pl := ns + "." + name
-	q.tags.node(q.g.Catalog, pl)
+	q.tags.node(q.g, pl)
 	body := map[string]any{"at": q.at, "item": ref, "placement": nil}
 	n := q.g.Node(pl)
 	if n == nil || !q.v.node(q.g, n) {
@@ -961,6 +1098,7 @@ func (q *query) manifest() (any, int, string) {
 				if slicesContains(path, c.Node.Name) {
 					continue
 				}
+				q.tags.node(q.g, c.Node.Name)
 				walk(c.Node, append(append([]string(nil), path...), c.Node.Name), depth+1)
 				continue
 			}
@@ -971,6 +1109,7 @@ func (q *query) manifest() (any, int, string) {
 				tooLarge = true
 				return
 			}
+			q.tags.node(q.g, c.Node.Name)
 			p := make([]any, len(path))
 			for i, s := range path {
 				p[i] = s

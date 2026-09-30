@@ -347,11 +347,21 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 		t.Errorf("pointer: %d %v", r.status, r.header)
 	}
 	r = s.raw(r.header.Get("Location"), "")
-	if r.status != 200 || !strings.Contains(r.header.Get("Cache-Control"), "immutable") || r.header.Get("Cache-Tag") != "ns:matches" {
+	if r.status != 200 || !strings.Contains(r.header.Get("Cache-Control"), "immutable") {
 		t.Errorf("at: %d %v", r.status, r.header)
 	}
+	// §A.4: tagged idx:{ns} and r:{ns}/{name} for every hit.
+	if got := tagSet(r); !got["idx:matches"] || !got["r:matches/cup"] || !got["r:matches/final"] || got["r:matches/derby"] || got["ns:matches"] || len(got) != 3 {
+		t.Errorf("at tags: %v", r.header.Get("Cache-Tag"))
+	}
+	// A result with facet counts also carries the counts tag.
+	r = s.raw(s.raw("/matches?counts=/tags&q=zlatan", "").header.Get("Location"), "")
+	if got := tagSet(r); !got["idx:matches:counts"] || !got["r:matches/derby"] {
+		t.Errorf("counts tags: %v", r.header.Get("Cache-Tag"))
+	}
 	// Bad input.
-	for _, p := range []string{"/matches?bogus=1", "/matches?sort=kickoff", "/matches?limit=0", "/matches?facet[x]=1", "/matches?min=nope"} {
+	for _, p := range []string{"/matches?bogus=1", "/matches?sort=kickoff", "/matches?limit=0", "/matches?facet[x]=1", "/matches?min=nope",
+		"/matches?min=Bad:" + s.ix.Checkpoint("matches"), "/matches?min=other:" + s.ix.Checkpoint("matches")} {
 		if r := s.raw(p, ""); r.status != 400 {
 			t.Errorf("%s: %d", p, r.status)
 		}
@@ -359,6 +369,16 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 	if r := s.raw("/other", ""); r.status != 404 {
 		t.Errorf("unindexed namespace: %d", r.status)
 	}
+}
+
+func tagSet(r resp) map[string]bool {
+	out := map[string]bool{}
+	for _, t := range strings.Split(r.header.Get("Cache-Tag"), ",") {
+		if t != "" {
+			out[t] = true
+		}
+	}
+	return out
 }
 
 func TestUntypedListingOff(t *testing.T) {
@@ -412,7 +432,7 @@ func TestUpdatesTombstonePurge(t *testing.T) {
 	s.mu.Lock()
 	purges := fmt.Sprint(s.purges)
 	s.mu.Unlock()
-	if purges != "[[ns:matches]]" {
+	if purges != "[[r:matches/final idx:matches:counts]]" {
 		t.Errorf("purges %s", purges)
 	}
 }
@@ -556,6 +576,10 @@ func TestMinAndStale(t *testing.T) {
 	if r := s.raw("/matches?min="+first, ""); r.status != 302 {
 		t.Fatalf("old min: %d", r.status)
 	}
+	// {ns}:{ns_id}, repeatable (§A.5).
+	if r := s.raw("/matches?q=derby&min=matches:"+wr.NSID+"&min="+first, ""); r.status != 302 || strings.Contains(r.header.Get("Location"), "min=") {
+		t.Fatalf("ns:min: %d %v", r.status, r.header)
+	}
 
 	// Stale ns_id: 302 to the current checkpoint.
 	cur := s.ix.Checkpoint("matches")
@@ -595,7 +619,7 @@ func TestPurgeNamespace(t *testing.T) {
 	s.mu.Lock()
 	purges := fmt.Sprint(s.purges)
 	s.mu.Unlock()
-	if purges != "[[ns:matches]]" {
+	if purges != "[[idx:matches ns:matches]]" {
 		t.Errorf("purges %s", purges)
 	}
 	// The purged state survives a restart.
@@ -606,5 +630,35 @@ func TestPurgeNamespace(t *testing.T) {
 	}
 	if got := s2.ix.CountRows("matches"); got != 0 {
 		t.Errorf("%d rows left", got)
+	}
+}
+
+// TestMinSeveralNamespaces: a service following several namespaces takes
+// ?min={ns}:{ns_id} for any of them, repeatable, and waits for all (§A.5).
+func TestMinSeveralNamespaces(t *testing.T) {
+	ctx := context.Background()
+	w := setup(t)
+	must(w.c.CreateNamespace(ctx, "fixtures", map[string]any{"read": "public"}))
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "fixtures"}, minWait: 2 * time.Second})
+	s.caughtUp("matches")
+	s.caughtUp("fixtures")
+	a := w.doc(t, "derby", w.match, map[string]any{"title": "The Derby"})
+	b := must(w.c.CreateDoc(ctx, "fixtures", "f1", map[string]any{"title": "x"}))
+	r := s.raw("/matches?q=derby&min=fixtures:"+b.NSID+"&min=matches:"+a.NSID, "")
+	if r.status != 302 {
+		t.Fatalf("min over two namespaces: %d %v", r.status, r.body)
+	}
+	if s.ix.Checkpoint("fixtures") != b.NSID {
+		t.Errorf("fixtures checkpoint %s, want %s", s.ix.Checkpoint("fixtures"), b.NSID)
+	}
+	s.expect(r.header.Get("Location"), "derby")
+
+	// One of them unreachable → 503.
+	s.cancel()
+	<-s.done
+	s.ix.SetMinWait(100 * time.Millisecond)
+	c := must(w.c.CreateDoc(ctx, "fixtures", "f2", map[string]any{"title": "y"}))
+	if r := s.raw("/matches?min=matches:"+a.NSID+"&min=fixtures:"+c.NSID, ""); r.status != 503 {
+		t.Fatalf("min ahead in another namespace: %d", r.status)
 	}
 }

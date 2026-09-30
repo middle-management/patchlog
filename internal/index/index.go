@@ -434,14 +434,24 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if ix.opt.OnApply != nil {
 		ix.opt.OnApply(b)
 	}
-	purge := co.PurgedNS
-	for _, p := range preps {
-		purge = purge || p.purged
+	// §A.1, §A.4: a purge removes every cached result that shows the
+	// resource, through the r:{ns}/{name} tag each result carries per hit
+	// (and results with facet counts, which may aggregate it); a purge-ns
+	// removes every cached result and pointer of the namespace.
+	var tags []string
+	if co.PurgedNS {
+		tags = append(tags, "idx:"+b.NS, "ns:"+b.NS)
 	}
-	if purge {
-		// A purged document may appear in cached results of any query: purge
-		// every cached response of the namespace.
-		ix.opt.Purger.PurgeTags([]string{"ns:" + b.NS})
+	for _, p := range preps {
+		if p.purged {
+			tags = append(tags, "r:"+b.NS+"/"+p.resource)
+		}
+	}
+	if len(tags) > 0 {
+		if !co.PurgedNS {
+			tags = append(tags, countsTag(b.NS))
+		}
+		ix.opt.Purger.PurgeTags(tags)
 	}
 	for _, u := range b.Units {
 		if u.Config != nil {

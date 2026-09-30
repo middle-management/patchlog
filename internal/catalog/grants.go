@@ -430,6 +430,12 @@ func (s *Service) catalogKey(ctx context.Context) (*grant.Key, error) {
 // planPlace decides a placement (§B.11.4): the caller is in the content
 // namespace's catalogs.{catalog}.place list, and has a role with place
 // assigned on every target folder.
+//
+// The catalog only issues the grant; the client writes the placement
+// document. Clients should give every placement (create or restore) a
+// fresh random $nonce (§C.7, §B.11.4), so its revision ids can't be used to
+// confirm guesses of its content; the grant's rules fix only /resource and
+// /doc/parents, so a $nonce is always allowed.
 func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string, to []string) (*plan, error) {
 	cat := s.t.Catalog()
 	ns, name, ok := tree.ParseHref(item)
@@ -491,7 +497,16 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 	case h.State == client.Purged:
 		return nil, conflict("the placement %s was purged", pl)
 	case h.State == client.Tombstoned:
-		// Re-placing restores the old placement.
+		// Re-placing restores the old placement (§B.11.4): the grant carries
+		// only restore, never create or append, and the client restores
+		// with a root replace. What stops a restore-only grant from acting
+		// as a move is the core's gate (§6.2 v0.21 candidate verbs): if the
+		// placement is live again by the time the grant is used, the PATCH
+		// settles as an append, which isn't a candidate verb, and is refused
+		// at step 2 before the If-Match comparison, so nothing about the
+		// live document is checked or revealed. On a still-deleted
+		// placement the restore sees the last live document at step 3, as
+		// any restore does.
 		if !key.IsStar() && !contains(key.Can, "restore") {
 			return nil, conflict("the placement %s was deleted and the catalog's key may not restore it", pl)
 		}
@@ -532,6 +547,12 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 	}
 	subs := Subjects(v)
 	admin := s.isAdmin(v)
+	var incs map[string]includes
+	if !admin {
+		if incs, err = s.includesOfTrusted(ctx); err != nil {
+			return nil, err
+		}
+	}
 	var cp string
 	err = nil
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
@@ -566,7 +587,7 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 			}
 		}
 		if !admin {
-			if subj, at, role, bad := s.widens(g, name, tos); bad {
+			if subj, at, role, bad := s.widens(g, name, tos, incs); bad {
 				err = forbidden("the move would give %s the role %s on %s", subj, role, g.Href(at))
 			}
 		}
@@ -579,9 +600,94 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 		map[string]any{"op": "writes", "within": []any{"/parents"}}}}, nil
 }
 
+// includes is one content namespace's declared role inclusions (§B.11.4):
+// role -> the roles it names in "includes".
+type includes map[string][]string
+
+// parseIncludes reads "includes" from a namespace document's roles. Other
+// role fields are the core's business; a malformed includes counts as none.
+func parseIncludes(doc map[string]any) includes {
+	out := includes{}
+	roles, _ := doc["roles"].(map[string]any)
+	for r, def := range roles {
+		d, _ := def.(map[string]any)
+		list, _ := d["includes"].([]any)
+		for _, x := range list {
+			if name, ok := x.(string); ok {
+				out[r] = append(out[r], name)
+			}
+		}
+	}
+	return out
+}
+
+// closure is every role present given roles: the roles themselves and,
+// transitively, every role they include. Cycles in includes are harmless:
+// each role is visited once.
+func (inc includes) closure(roles []string) map[string]bool {
+	out := map[string]bool{}
+	stack := append([]string(nil), roles...)
+	for len(stack) > 0 {
+		r := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if out[r] {
+			continue
+		}
+		out[r] = true
+		stack = append(stack, inc[r]...)
+	}
+	return out
+}
+
+// includesOfTrusted reads the includes of every trusted content namespace.
+// The declarations are trusted as written: changing /roles needs a * key
+// in that namespace (§B.11.4, §C.1.1).
+func (s *Service) includesOfTrusted(ctx context.Context) (map[string]includes, error) {
+	var trust []string
+	s.t.View(func(g *tree.Graph, _ map[string]string) {
+		for ns := range g.Trust {
+			trust = append(trust, ns)
+		}
+	})
+	out := map[string]includes{}
+	for _, ns := range trust {
+		cfg, err := s.t.Checker().Config(ctx, ns)
+		if err != nil {
+			return nil, upstream(err)
+		}
+		out[ns] = parseIncludes(cfg.Doc)
+	}
+	return out, nil
+}
+
+// present reports whether role r counts as present before the move at
+// node d, given the roles before (§B.11.4: it, or a role including it,
+// was present). For a placement, includes are read from its item's own
+// content namespace. A folder's roles reach whatever is, or will be,
+// placed below it, so for a folder r must be implied in every trusted
+// content namespace (a namespace declaring nothing implies nothing).
+func present(g *tree.Graph, d, r string, before []string, incs map[string]includes) bool {
+	if contains(before, r) {
+		return true
+	}
+	if n := g.Node(d); n != nil && n.ItemNS != "" {
+		return incs[n.ItemNS].closure(before)[r]
+	}
+	if len(incs) == 0 {
+		return false
+	}
+	for _, inc := range incs {
+		if !inc.closure(before)[r] {
+			return false
+		}
+	}
+	return true
+}
+
 // widens reports a subject, node and role that a move of name to tos
-// would add to the effective roles of the moved subtree (§B.11.4).
-func (s *Service) widens(g *tree.Graph, name string, tos []string) (subject, node, role string, bad bool) {
+// would add to the effective roles of the moved subtree (§B.11.4). Roles
+// are compared by name, with the content namespace's declared includes.
+func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[string]includes) (subject, node, role string, bad bool) {
 	override := map[string][]string{name: tos}
 	below := g.Descendants([]string{name})
 	nodes := make([]string, 0, len(below))
@@ -599,7 +705,7 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string) (subject, nod
 		sort.Strings(subjects)
 		for _, subj := range subjects {
 			for _, r := range after[subj] {
-				if !contains(before[subj], r) {
+				if !present(g, d, r, before[subj], incs) {
 					return subj, d, r, true
 				}
 			}
