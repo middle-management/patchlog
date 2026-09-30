@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.21 · 2026-09-30. See the change log at the end.
+Status: draft v0.22 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -554,7 +554,7 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
-Requests to private namespaces follow Addendum C. Without `read`, a resource that exists and one that doesn't both answer `404`, so existence is not revealed. The same holds for namespaces: a request without valid credentials to a namespace that doesn't exist answers `401`, exactly as one to an existing namespace whose `read` isn't `public`. Only public namespaces answer unauthenticated requests with content or `404`. With a grant, the server first reads `ns` from its blocks, before looking up any key: a namespace that isn't named in `ns` by every block that carries `ns` (the root block always does, and `"*"` names every namespace) answers `403` without being consulted, whether or not it exists. Only then is the grant verified against that namespace's keys, or against the deployment operator keys when the root `kid` names one (§C.4). This hides a namespace's existence from requests to it. Namespace names share one space and are not secret (§E.4): creating a namespace or branch with a taken name reveals that it is taken.
+Requests to private namespaces follow Addendum C. Without `read`, a resource that exists and one that doesn't both answer `404`, so existence is not revealed. The same holds for namespaces: a request without valid credentials to a namespace that doesn't exist answers `401`, exactly as one to an existing namespace whose `read` isn't `public`. Only public namespaces answer unauthenticated requests with content or `404`. With a grant, the server first reads `ns` from its blocks, before looking up any key: a namespace that isn't named in `ns` by every block that carries `ns` (the root block always does, and `"*"` names every namespace) answers `403` without being consulted, whether or not it exists. Reads of a public namespace are the exception: a grant that doesn't name the namespace, or that can't be used (malformed, badly signed, revoked, expired or not yet valid), is ignored, and the read is answered exactly as an unauthenticated one. A client can then send one bearer to every namespace it reads, including public schema namespaces (§6.1), and the namespace reveals nothing it doesn't show everyone. Writes, and every request to a namespace that isn't public or doesn't exist, keep the `403` and `401` answers. Only then is the grant verified against that namespace's keys, or against the deployment operator keys when the root `kid` names one (§C.4). This hides a namespace's existence from requests to it. Namespace names share one space and are not secret (§E.4): creating a namespace or branch with a taken name reveals that it is taken.
 
 ### 7.1 Reads
 
@@ -1851,7 +1851,7 @@ Grants are checked at step 1 of §6.2 (items 1–3 and the first part of item 4)
 -
 **Verify the chain:**
 
-  - first, without verifying anything, that every block that carries `ns` names the namespace (`403` otherwise, §7). This `403` comes before the `401` cases below; a token whose blocks can't be parsed at all is `401`.
+  - first, without verifying anything, that every block that carries `ns` names the namespace (`403` otherwise, §7). This `403` comes before the `401` cases below; a token whose blocks can't be parsed at all is `401`. A read of a public namespace skips both and ignores such a grant (§7).
 
   - the root signature by a key in the configuration in force
 
@@ -3230,3 +3230,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Loosened:** `$ref` may carry a JSON Pointer fragment into another revision (§6.1); `http` origins on loopback for local federation tests (§G.3); the integer range is judged on canonical form, so `1e300` is accepted and stored patch sets always round-trip (§3.1).
 
 - **Defined:** remote bases that are branches are verified through their bases (§G.3); mirrored schemas keep their namespace name (§G.3); retention without an archive must say `archive: false` (§8.6); no `cleanup` means the janitor keeps the branch (§F.6); a second merge after a replay uses earlier merge batches, by authors the base lists in `merge.authors`, as common ancestors (§F.3), and the janitor trusts only those batches (§F.6); `at`-pinned query results use the immutable cache class (§A.4, §B.5).
+
+- **v0.22:** public reads ignore a grant that doesn't name the namespace or can't be used, and answer as unauthenticated (§7, §C.2), so a client can send one bearer to every namespace it reads, such as a public schema namespace next to a private one.
