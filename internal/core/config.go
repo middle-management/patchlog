@@ -116,7 +116,10 @@ type Config struct {
 	// 0 if absent (no cap).
 	Epoch         int
 	HistoryEpochs int
-	level         int
+	// Pad is encryption.pad of a sealed or e2e namespace: sealed payloads
+	// are padded to size buckets (§E.2.2, seal.PadLen).
+	Pad   bool
+	level int
 }
 
 // Allowance gives a named principal its own rate and batch limits (§6.6).
@@ -341,10 +344,10 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 		case "encryption":
 			e, ok := v.(map[string]any)
 			if !ok {
-				return nil, fmt.Errorf(`/encryption must be { "level": "at-rest" | "sealed" | "e2e", "epoch"?, "historyEpochs"? }`)
+				return nil, fmt.Errorf(`/encryption must be { "level": "at-rest" | "sealed" | "e2e", "epoch"?, "historyEpochs"?, "pad"? }`)
 			}
 			for k := range e {
-				if k != "level" && k != "epoch" && k != "historyEpochs" {
+				if k != "level" && k != "epoch" && k != "historyEpochs" && k != "pad" {
 					return nil, fmt.Errorf("/encryption/%s is not supported by this server", k)
 				}
 			}
@@ -360,6 +363,9 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				}
 				if _, has := e["historyEpochs"]; has {
 					return nil, fmt.Errorf("/encryption/historyEpochs is only for sealed and e2e namespaces")
+				}
+				if _, has := e["pad"]; has {
+					return nil, fmt.Errorf("/encryption/pad is only for sealed and e2e namespaces")
 				}
 			} else {
 				// Epochs count from 1; an absent epoch is 1 (§E.2.1).
@@ -377,6 +383,13 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 						return nil, fmt.Errorf("/encryption/historyEpochs must be a positive integer")
 					}
 					c.HistoryEpochs = int(f)
+				}
+				if x, has := e["pad"]; has {
+					b, ok := x.(bool)
+					if !ok {
+						return nil, fmt.Errorf("/encryption/pad must be a boolean")
+					}
+					c.Pad = b
 				}
 			}
 			c.Encryption, c.level = lv, levelOf(lv)

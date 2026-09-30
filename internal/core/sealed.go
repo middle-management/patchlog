@@ -286,6 +286,7 @@ type sealJob struct {
 	k         []byte
 	pl        seal.PL
 	plain     []byte
+	pad       bool   // the namespace pads (§E.2.2)
 	jwe       string // the stored value once known
 }
 
@@ -318,6 +319,7 @@ func (t *tx) resJob(n *nsRow, name string, row *revRow, kind string, plain func(
 	kr, err := seal.ResourceKey(t.epochKey(n.id, e), n.name, name)
 	t.must(err)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), kr, seal.ResourcePL(n.name, name, row.id.String(), plKind), plain()
+	j.pad = t.config(n.configSeq).Pad
 	return j
 }
 
@@ -329,6 +331,7 @@ func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 	}
 	e := t.entryEpoch(n, seq)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.NamespaceDocPL(n.name, nsID), doc
+	j.pad = t.config(n.configSeq).Pad
 	return j
 }
 
@@ -341,19 +344,22 @@ func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain fu
 	}
 	e := t.entryEpoch(n, toSeq)
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()
+	j.pad = t.config(n.configSeq).Pad
 	return j
 }
 
 // finishSeal seals the jobs not stored yet and stores them (INSERT OR
 // IGNORE, then re-read, so concurrent first readers agree). Nothing is
-// stored for a namespace or resource purged since the read.
+// stored for a namespace or resource purged since the read. In a namespace
+// with encryption.pad, each JWE is padded as a whole and never compressed
+// (§E.2.2); the setting as of sealing counts, and stored bytes never change.
 func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) error {
 	var todo []*sealJob
 	for _, j := range jobs {
 		if j == nil || j.jwe != "" {
 			continue
 		}
-		s, err := seal.Seal(j.k, j.kid, j.pl, j.plain)
+		s, err := seal.SealMaybePadded(j.k, j.kid, j.pl, j.plain, j.pad)
 		if err != nil {
 			return err
 		}

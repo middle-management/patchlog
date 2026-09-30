@@ -168,7 +168,8 @@ func TestE2EClient(t *testing.T) {
 	want["branch"] = true
 	sameJSON(t, must(w.DocE2E(ctx, "eb", "d", b1.ID)).Value, want)
 
-	// Tools that can't work over ciphertext refuse.
+	// Tools that can't work over ciphertext refuse (merge without a
+	// key-holding view, §F.8.1).
 	if _, err := merge.NewPlan(ctx, adminC, "e", "eb", merge.Options{}); err == nil || !strings.Contains(err.Error(), "e2e") {
 		t.Fatalf("merge: %v", err)
 	}

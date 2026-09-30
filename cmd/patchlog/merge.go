@@ -4,8 +4,8 @@ package main
 // clients of the public API (internal/merge, internal/janitor).
 //
 //	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
-//	        [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
-//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
+//	        [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
+//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-identity key.jwk]... [-json]
 //	patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
 
 import (
@@ -24,12 +24,13 @@ import (
 	"github.com/middle-management/patchlog/internal/janitor"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/merge"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 const mergeUsage = `usage:
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
-          [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
+          [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
+  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-identity key.jwk]... [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
 
 // toolFlags are the connection flags shared by the Addendum F tools.
@@ -60,6 +61,30 @@ func (tf toolFlags) client() *client.Client {
 		toolFatal(err)
 	}
 	return c
+}
+
+// identityHelp describes -identity for merge and rebase.
+const identityHelp = "file with an X25519 private key (a private JWK {kty, crv, x, d}, or base64url d) for e2e namespaces (Addendum E.3): the key the keyrings (and -bearer's enc) name, to read the branch and re-encrypt for the target (§F.8); repeatable when they name different keys"
+
+// e2eView returns a key-holding view of c with the -identity keys, or nil
+// without any.
+func e2eView(c *client.Client, identities []string) *client.E2E {
+	if len(identities) == 0 {
+		return nil
+	}
+	x := c.E2E(nil)
+	for _, f := range identities {
+		b, err := os.ReadFile(f)
+		if err != nil {
+			toolFatal(err)
+		}
+		priv, err := seal.ParseRecipientPrivate(b)
+		if err != nil {
+			toolFatal(fmt.Errorf("-identity %s: %w", f, err))
+		}
+		x = x.WithRecipient(priv)
+	}
+	return x
 }
 
 func toolFatal(err error) {
@@ -111,6 +136,8 @@ func mergeCmd(args []string) {
 	cfgFile := fs.String("config", "", "file with an explicit config change (a patch set) for the target")
 	var resolves multi
 	fs.Var(&resolves, "resolve", "name=file.json: resolution for a conflicting resource, against the target's head: a patch set, a list of steps, \"delete\", or \"keep\" (repeatable)")
+	var identities multi
+	fs.Var(&identities, "identity", identityHelp)
 	fs.Parse(args[1:])
 	if *branch == "" {
 		fmt.Fprintln(os.Stderr, "merge: -branch is required")
@@ -122,7 +149,7 @@ func mergeCmd(args []string) {
 	if target == "" {
 		target = branchBase(ctx, c, *branch)
 	}
-	opt := merge.Options{Squash: *squash}
+	opt := merge.Options{Squash: *squash, E2E: e2eView(c, identities)}
 	if *cfgFile != "" {
 		v, err := readJSONFile(*cfgFile)
 		if err != nil {
@@ -448,6 +475,8 @@ func rebaseCmd(args []string) {
 	newName := fs.String("new", "", "name of the successor branch (resumes if it exists)")
 	onto := fs.String("onto", "", "namespace to create the successor from (default: the branch's base)")
 	sw := fs.Bool("switch", false, "freeze the old branch with successor: NEW, then replay what it got meanwhile")
+	var identities multi
+	fs.Var(&identities, "identity", identityHelp)
 	fs.Parse(args)
 	if *branch == "" || *newName == "" {
 		fmt.Fprintln(os.Stderr, "rebase: -branch and -new are required")
@@ -455,7 +484,7 @@ func rebaseCmd(args []string) {
 	}
 	ctx := context.Background()
 	c := tf.client()
-	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw})
+	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw, Plan: merge.Options{E2E: e2eView(c, identities)}})
 	if *tf.asJSON {
 		out := map[string]any{"result": res}
 		if err != nil {
