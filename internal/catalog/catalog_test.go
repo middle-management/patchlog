@@ -18,6 +18,8 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -54,6 +56,7 @@ type world struct {
 	db       string
 
 	svcClient *client.Client
+	sealed    bool // both namespaces are sealed (Addendum E.2)
 }
 
 func toAny(xs ...string) []any {
@@ -105,11 +108,29 @@ func live(c *client.Client, ns, name string) bool {
 	return err == nil && h.State == client.Live
 }
 
-func setup(t *testing.T) *world {
+func setup(t *testing.T) *world { return setupWith(t, false) }
+
+// setupWith builds the world, with both namespaces sealed if sealed.
+func setupWith(t *testing.T, sealed bool) *world {
 	ctx := context.Background()
-	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	o := clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond}
+	var copts []client.Option
+	enc := func(doc map[string]any) map[string]any { return doc }
+	if sealed {
+		ks, err := keystore.New(keystore.Generate())
+		if err != nil {
+			t.Fatal(err)
+		}
+		o.KeyStore = ks
+		copts = append(copts, client.WithKeys(client.NewKeys(nil)))
+		enc = func(doc map[string]any) map[string]any {
+			doc["encryption"] = map[string]any{"level": "sealed"}
+			return doc
+		}
+	}
+	s := clienttest.New(t, o)
 	opsKey, idp, catKey := clienttest.NewKey("ops"), clienttest.NewKey("idp"), clienttest.NewKey("catalog-01")
-	w := &world{t: t, s: s, idp: idp, cat: catKey, opsKey: opsKey}
+	w := &world{t: t, s: s, idp: idp, cat: catKey, opsKey: opsKey, sealed: sealed}
 
 	catEntry := catKey.Entry("read", "create", "append", "delete", "restore")
 	catEntry["maxTtl"] = "PT15M"
@@ -117,7 +138,7 @@ func setup(t *testing.T) *world {
 	catEntry["groups"] = map[string]any{"deny": toAny("catalog-admins", "ops")}
 	catEntry["rules"] = jsonRules(catalogKeyRules)
 	opc := s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat")))
-	must(opc.CreateNamespace(ctx, "cat", map[string]any{
+	must(opc.CreateNamespace(ctx, "cat", enc(map[string]any{
 		"read":    "grant",
 		"keys":    []any{opsKey.Entry("*"), idp.Entry(), catEntry},
 		"maxLag":  "PT60S",
@@ -125,7 +146,7 @@ func setup(t *testing.T) *world {
 		"roles": map[string]any{
 			"desk": map[string]any{"move": true, "place": true}, "translator": map[string]any{}, "reader": map[string]any{}},
 		"rules": jsonRules(catalogNSRules),
-	}))
+	})))
 	contentEntry := catKey.Entry("read", "create", "append")
 	contentEntry["maxTtl"] = "PT15M"
 	contentEntry["readScope"] = "resource"
@@ -133,7 +154,7 @@ func setup(t *testing.T) *world {
 	contentEntry["groups"] = map[string]any{"deny": toAny("ops")}
 	contentEntry["roles"] = map[string]any{"allow": toAny("desk", "translator", "reader")}
 	opm := s.Client(t, client.WithBearer(s.OperatorGrant(t, "matches")))
-	must(opm.CreateNamespace(ctx, "matches", map[string]any{
+	must(opm.CreateNamespace(ctx, "matches", enc(map[string]any{
 		"read": "grant",
 		"keys": []any{opsKey.Entry("*"), idp.Entry(), contentEntry},
 		"roles": map[string]any{
@@ -142,12 +163,12 @@ func setup(t *testing.T) *world {
 			"reader":     map[string]any{"can": toAny("read")},
 			"deleter":    map[string]any{"can": toAny("delete")}},
 		"catalogs": map[string]any{"cat": map[string]any{"place": toAny("group:match-desk", "group:editors-in-chief")}},
-	}))
-	w.ops = s.Client(t, client.WithBearer(opsKey.Grant(t, s.Now(), "user:ops", []string{"cat", "matches"},
-		[]string{"read", "create", "append", "delete", "restore"}, map[string]any{"groups": toAny("catalog-admins")})))
+	})))
+	w.ops = s.Client(t, append(copts, client.WithBearer(opsKey.Grant(t, s.Now(), "user:ops", []string{"cat", "matches"},
+		[]string{"read", "create", "append", "delete", "restore"}, map[string]any{"groups": toAny("catalog-admins")})))...)
 	w.db = filepath.Join(t.TempDir(), "catalog.db")
-	w.svcClient = s.Client(t, client.WithBearer(opsKey.Grant(t, s.Now(), "svc:catalog", []string{"cat", "matches"}, []string{"read"},
-		map[string]any{"exp": s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+	w.svcClient = s.Client(t, append(copts, client.WithBearer(opsKey.Grant(t, s.Now(), "svc:catalog", []string{"cat", "matches"}, []string{"read"},
+		map[string]any{"exp": s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))...)
 	return w
 }
 
@@ -200,14 +221,22 @@ func (w *world) caller(sub string, groups ...string) string {
 
 func (w *world) doc(ns, name string, doc map[string]any) {
 	w.t.Helper()
-	must(w.ops.CreateDoc(context.Background(), ns, name, doc))
+	must(w.ops.Create(context.Background(), ns, name, w.nonced(client.GenesisPatches(doc))))
 }
 
 func (w *world) patch(ns, name string, ops ...any) {
 	w.t.Helper()
 	ctx := context.Background()
 	h := must(w.ops.Head(ctx, ns, name))
-	must(w.ops.Append(ctx, ns, name, h.ID, ops))
+	must(w.ops.Append(ctx, ns, name, h.ID, w.nonced(ops)))
+}
+
+// nonced adds the fresh $nonce a sealed namespace needs (§C.7, §E.2.5).
+func (w *world) nonced(ops []any) []any {
+	if !w.sealed {
+		return ops
+	}
+	return append(ops, map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()})
 }
 
 func acc(kv ...any) map[string]any {

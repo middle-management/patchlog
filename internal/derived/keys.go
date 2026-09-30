@@ -24,6 +24,9 @@ type Info struct {
 	Level string // encryption.level ("" if none)
 	Epoch int    // encryption.epoch of a sealed or e2e namespace (default 1)
 	Pad   bool   // encryption.pad: sealed payloads are padded (§E.2.2)
+	// HistoryEpochs is encryption.historyEpochs: how many epochs back
+	// readers get keys for (0: all).
+	HistoryEpochs int
 }
 
 // Protected reports whether views derived from the namespace are sealed.
@@ -39,6 +42,9 @@ func InfoOf(doc map[string]any) Info {
 		in.Epoch = 1
 		if f, ok := enc["epoch"].(float64); ok && f >= 1 {
 			in.Epoch = int(f)
+		}
+		if f, ok := enc["historyEpochs"].(float64); ok && f >= 1 {
+			in.HistoryEpochs = int(f)
 		}
 	}
 	return in
@@ -197,6 +203,45 @@ func (k *Keys) Current(ctx context.Context, ns string) (Info, Key, error) {
 	}
 	key, err := k.EpochKey(ctx, ns, in.Epoch)
 	return in, Key{NS: ns, Epoch: in.Epoch, K: key, Pad: in.Pad}, err
+}
+
+// ResourceKey is a per-resource key K_r of one epoch.
+type ResourceKey struct {
+	Kid      string // "{ns}#{e}"
+	Resource string
+	Key      []byte
+}
+
+// ResourceKeys derives K_r of ns/name (§E.2.1) for every epoch a reader
+// gets keys for: from the current one back encryption.historyEpochs epochs
+// (all if unset), as far as the service holds their epoch keys. It returns
+// nothing for a namespace that is neither sealed nor e2e, and an error only
+// if not even the current epoch's key is available.
+func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey, error) {
+	in, err := k.Info(ctx, ns)
+	if err != nil || !in.Protected() {
+		return nil, err
+	}
+	first := 1
+	if in.HistoryEpochs > 0 {
+		first = max(1, in.Epoch-in.HistoryEpochs+1)
+	}
+	var out []ResourceKey
+	for e := in.Epoch; e >= first; e-- {
+		ke, err := k.EpochKey(ctx, ns, e)
+		if err != nil {
+			if e == in.Epoch {
+				return nil, err
+			}
+			continue // an epoch the service holds no key for
+		}
+		kr, err := seal.ResourceKey(ke, ns, name)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ResourceKey{Kid: seal.Kid(ns, e), Resource: name, Key: kr})
+	}
+	return out, nil
 }
 
 // Check decides whether the service can consume ns. It returns "" if it
