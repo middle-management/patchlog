@@ -102,9 +102,10 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	if err := t.rateLimit(n, cfg, a, nil, 1); err != nil {
 		return nil, err
 	}
-	if t.nsLevel(n) >= levelSealed {
-		return nil, invalid("remote branches of sealed and e2e namespaces are not supported by this server (§G.5, §F.8)")
-	}
+	// A remote branch of a private, sealed or e2e namespace must itself be
+	// private or sealed (§G.5). This side can't enforce it: it is part of
+	// what the export grant entrusts, and the branch's deployment enforces
+	// it when it creates the branch.
 	if !ValidRemoteOrigin(rr.Origin) {
 		return nil, invalid("remote.origin must be an https origin (or http on a loopback host)")
 	}

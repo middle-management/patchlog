@@ -2,6 +2,8 @@ package bundle
 
 import (
 	"context"
+	"crypto/ecdh"
+	"errors"
 	"fmt"
 	"io"
 	"sort"
@@ -70,9 +72,18 @@ type ExportOptions struct {
 	// already hold the base, e.g. by importing with the branch mapped onto
 	// the base namespace.
 	ForeignParents bool
+	// Recipients seal the bundle to their X25519 public keys (§G.5.1.1).
+	Recipients []*ecdh.PublicKey
+	// Plaintext allows writing lines of private and sealed namespaces
+	// unsealed; without it or Recipients, Write refuses (§G.5.1).
+	Plaintext bool
 	// Now overrides the clock for the header's created.
 	Now func() time.Time
 }
+
+// keyringName is the reserved keyring resource of an e2e namespace
+// (§E.3.2).
+const keyringName = "keyring"
 
 // PlannedDoc is one document of an export plan.
 type PlannedDoc struct {
@@ -98,6 +109,7 @@ type ExportPlan struct {
 	At       map[string]string      `json:"at"`
 	Docs     map[string]*PlannedDoc `json:"docs"`
 	External []string               `json:"external,omitempty"`
+	Access   map[string]string      `json:"access"` // namespace → access level (§G.5.1)
 
 	c       *client.Client
 	opt     ExportOptions
@@ -133,7 +145,7 @@ func PlanExport(ctx context.Context, c *client.Client, opt ExportOptions) (*Expo
 	if err != nil {
 		return nil, fmt.Errorf("export: origin: %w", err)
 	}
-	p := &ExportPlan{Origin: origin, At: map[string]string{}, Docs: map[string]*PlannedDoc{}, c: c, opt: opt,
+	p := &ExportPlan{Origin: origin, At: map[string]string{}, Docs: map[string]*PlannedDoc{}, Access: map[string]string{}, c: c, opt: opt,
 		heads: map[string]map[string]client.HeadItem{}, bases: map[string]map[string]client.HeadItem{}, ext: map[string]bool{}, schemas: map[string]any{}}
 
 	// Take the selected namespaces' at first (§G.4.1 consistency).
@@ -183,10 +195,22 @@ func PlanExport(ctx context.Context, c *client.Client, opt ExportOptions) (*Expo
 		}
 	}
 	for len(p.queue) > 0 {
-		k := p.queue[0]
-		p.queue = p.queue[1:]
-		if err := p.process(ctx, p.Docs[k]); err != nil {
-			return nil, fmt.Errorf("export: %s: %w", k, err)
+		for len(p.queue) > 0 {
+			k := p.queue[0]
+			p.queue = p.queue[1:]
+			if err := p.process(ctx, p.Docs[k]); err != nil {
+				return nil, fmt.Errorf("export: %s: %w", k, err)
+			}
+		}
+		// Keys travel via the keyring (§G.5): an e2e namespace's comes along.
+		for _, ns := range sortedAccess(p.Access, AccessE2E) {
+			hi, ok := p.heads[ns][keyringName]
+			if !ok || hi.Kind == "purge" || p.isExternal(ns, keyringName) || p.Docs[Key(ns, keyringName)] != nil {
+				continue
+			}
+			if err := p.add(ctx, ns, keyringName, false, "the keyring of an e2e namespace (§E.3.2, §G.5)"); err != nil {
+				return nil, err
+			}
 		}
 	}
 	// Pinned revisions must be in what is exported (or already required).
@@ -215,20 +239,16 @@ func (p *ExportPlan) loadNS(ctx context.Context, ns string) error {
 	if err != nil {
 		return fmt.Errorf("export: namespace %s: %w", ns, err)
 	}
-	lv, err := p.c.EncryptionLevel(ctx, ns)
+	access, err := p.accessOf(ctx, ns, h.ID)
 	if err != nil {
-		return fmt.Errorf("export: namespace %s: %w", ns, err)
+		return err
 	}
-	if lv == "e2e" {
-		// §G.5: a snapshot of an e2e namespace needs a client with keys,
-		// and a sealed genesis isn't deterministic; full histories would
-		// carry the ciphertext, but this exporter folds documents to find
-		// dependencies, which it can't do over ciphertext.
-		if p.opt.Mode == Snapshot {
-			return fmt.Errorf("export: namespace %s is e2e (Addendum E.3): a snapshot needs a client holding its keys, and a sealed genesis isn't deterministic (§G.5); not supported", ns)
-		}
-		return fmt.Errorf("export: namespace %s is e2e (Addendum E.3): this exporter can't fold its ciphertext to follow dependencies; not supported", ns)
+	if access == AccessE2E && p.opt.Mode == Snapshot {
+		// §G.5.1: a snapshot of an e2e namespace is a sealed genesis made
+		// by a client holding its keys, which this exporter isn't.
+		return fmt.Errorf("export: namespace %s is e2e (Addendum E.3): a snapshot needs a client holding its keys to seal a new genesis (§G.5.1); export its full history, which carries the ciphertext", ns)
 	}
+	p.Access[ns] = access
 	items, err := p.c.Heads(ctx, ns, h.ID)
 	if err != nil {
 		return fmt.Errorf("export: namespace %s heads: %w", ns, err)
@@ -239,6 +259,44 @@ func (p *ExportPlan) loadNS(ctx context.Context, ns string) error {
 	}
 	p.At[ns], p.heads[ns] = h.ID, m
 	return nil
+}
+
+// accessOf is a namespace's access level (§G.5.1). A sealed namespace's
+// document is read with the client's keys: without them the export can't
+// read its content either.
+func (p *ExportPlan) accessOf(ctx context.Context, ns, nsID string) (string, error) {
+	lv, err := p.c.EncryptionLevel(ctx, ns)
+	if err != nil {
+		return "", fmt.Errorf("export: namespace %s: %w", ns, err)
+	}
+	if lv == "e2e" {
+		return AccessE2E, nil
+	}
+	doc, err := p.c.NSDoc(ctx, ns, nsID)
+	if err != nil {
+		if errors.Is(err, client.ErrNoKeys) {
+			return "", fmt.Errorf("export: namespace %s is sealed (Addendum E.2) and the exporter has no keys for it: it needs a read grant, and the identity the grant's enc names if the keys are wrapped (§E.2.3, §G.5): %w", ns, err)
+		}
+		return "", fmt.Errorf("export: namespace %s: %w", ns, err)
+	}
+	switch {
+	case lv == "sealed":
+		return AccessSealed, nil
+	case doc.Value["read"] == "public":
+		return AccessPublic, nil
+	}
+	return AccessPrivate, nil
+}
+
+func sortedAccess(m map[string]string, level string) []string {
+	var out []string
+	for ns, a := range m {
+		if a == level {
+			out = append(out, ns)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func (p *ExportPlan) isExternal(ns, name string) bool {
@@ -408,6 +466,25 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 		return nil
 	}
 	d.done = d.Mode
+	if p.Access[d.NS] == AccessE2E {
+		// Ciphertext (§G.5): the chain is verified over it and bundled
+		// verbatim. Nothing can be folded, so it brings no dependencies.
+		entries, _, err := verify.Resource(ctx, p.c, d.NS, d.Name, d.Head, "")
+		if err != nil {
+			if client.IsPruned(err) {
+				return fmt.Errorf("e2e history below the pruning horizon %s: a full export needs the archive (§8.6)", client.Horizon(err))
+			}
+			return err
+		}
+		d.chain = make(map[string]bool, len(entries))
+		for _, e := range entries {
+			d.chain[e.ID] = true
+		}
+		if d.Requires != "" && !d.chain[d.Requires] {
+			return fmt.Errorf("requires %s is not in its chain", d.Requires)
+		}
+		return nil
+	}
 	var head any // the live head document, nil if deleted
 	if d.Mode == Full {
 		// Every revision from genesis is folded, so every exported
@@ -520,7 +597,7 @@ func (p *ExportPlan) resolvers(ctx context.Context, d *PlannedDoc, head any) err
 // Header is the bundle header the plan writes.
 func (p *ExportPlan) Header() Header {
 	h := Header{Origin: p.Origin, At: map[string]string{}, Docs: map[string]DocInfo{}, Requires: map[string]string{},
-		External: p.External, Authors: p.opt.Authors}
+		External: p.External, Authors: p.opt.Authors, Access: map[string]string{}}
 	now := time.Now
 	if p.opt.Now != nil {
 		now = p.opt.Now
@@ -532,6 +609,7 @@ func (p *ExportPlan) Header() Header {
 		}
 		h.Docs[k] = DocInfo{History: d.Mode, Head: d.Head}
 		h.At[d.NS] = p.At[d.NS]
+		h.Access[d.NS] = p.Access[d.NS]
 		if d.Mode == Full && d.Requires != "" {
 			h.Requires[k] = d.Requires
 		}
@@ -539,10 +617,38 @@ func (p *ExportPlan) Header() Header {
 	return h
 }
 
+// Protected lists the namespaces whose lines hold plaintext of private or
+// sealed content (§G.5.1).
+func (p *ExportPlan) Protected() []string {
+	h := p.Header()
+	var out []string
+	for ns, a := range h.Access {
+		if a == AccessPrivate || a == AccessSealed {
+			out = append(out, ns)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 // Write streams the bundle: the header, then every document's lines, one
 // document at a time (full documents' logs are fetched and verified again,
-// so nothing is held in memory across documents).
+// so nothing is held in memory across documents). With Recipients it is
+// written as a sealed bundle (§G.5.1.1); plaintext of private or sealed
+// namespaces isn't written unsealed unless Plaintext is set.
 func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
+	if prot := p.Protected(); len(prot) > 0 && len(p.opt.Recipients) == 0 && !p.opt.Plaintext {
+		return nil, fmt.Errorf("export: %s hold private or sealed content, which a bundle carries in plaintext: "+
+			"seal the bundle to its recipients, or ask for plaintext explicitly (§G.5.1)", strings.Join(prot, ", "))
+	}
+	var sw *SealedWriter
+	if len(p.opt.Recipients) > 0 {
+		var err error
+		if sw, err = NewSealedWriter(w, p.opt.Recipients); err != nil {
+			return nil, err
+		}
+		w = sw
+	}
 	bw, err := NewWriter(w, p.Header())
 	if err != nil {
 		return nil, err
@@ -588,6 +694,11 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 	digest, err := bw.Close()
 	if err != nil {
 		return nil, err
+	}
+	if sw != nil {
+		if err := sw.Close(); err != nil {
+			return nil, err
+		}
 	}
 	return &Summary{Header: bw.Header(), Digest: digest, Lines: n}, nil
 }

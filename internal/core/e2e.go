@@ -297,7 +297,9 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 	rid := seal.RecipientID(enc)
 	for _, e := range epochs {
 		if w, ok := ring.Epochs[e][rid]; ok {
-			out = append(out, seal.WrappedKey{Kid: seal.Kid(owner.name, e), Wrapped: w}.Value())
+			// The keyring's ns is its owner's, checked when it was written;
+			// for a remote branch's shadow, the remote base's (§G.5).
+			out = append(out, seal.WrappedKey{Kid: seal.Kid(ring.NS, e), Wrapped: w}.Value())
 		}
 	}
 	return out, nil

@@ -2,6 +2,7 @@ package bundle
 
 import (
 	"context"
+	"crypto/ecdh"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -13,15 +14,19 @@ import (
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // CLIUsage documents the bundle commands.
 const CLIUsage = `  patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T] [-author A]
           [-external ns|ns/name,…] [-authors] [-untyped-refs] [-foreign-parents] [-json]
+          [-recipient key.jwk]... [-plaintext] [-identity id.jwk]
   patchlog import -api URL -ns TARGET[,src=dst] -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T] [-author A]
-          [-resolve ns/name=skip|take|replay]... [-create=false] [-json]
-  patchlog bundle verify -i file.jsonl [-json]`
+          [-resolve ns/name=skip|take|replay]... [-create=false] [-json] [-identity id.jwk] [-allow-less-protected]
+  patchlog bundle verify -i file.jsonl [-identity id.jwk] [-json]
+  patchlog bundle keygen -o id.jwk      (prints the public key, for -recipient and a grant's enc)`
 
 type multiFlag []string
 
@@ -38,8 +43,10 @@ func splitList(s string) []string {
 	return out
 }
 
-func connect(api, bearer, author string) (*client.Client, error) {
-	var opts []client.Option
+// connect makes a client; identity unwraps the keys of sealed namespaces
+// (§E.2.3) that the grant's enc names.
+func connect(api, bearer, author string, identity *ecdh.PrivateKey) (*client.Client, error) {
+	opts := []client.Option{client.WithKeys(client.NewKeys(identity))}
 	if bearer != "" {
 		opts = append(opts, client.WithBearer(bearer))
 	}
@@ -64,11 +71,15 @@ func CLI(ctx context.Context, cmd string, args []string, stdout, stderr io.Write
 	case "import":
 		err = cliImport(ctx, args, stdout, stderr)
 	case "bundle":
-		if len(args) < 1 || args[0] != "verify" {
+		switch {
+		case len(args) >= 1 && args[0] == "verify":
+			err = cliVerify(args[1:], stdout)
+		case len(args) >= 1 && args[0] == "keygen":
+			err = cliKeygen(args[1:], stdout)
+		default:
 			fmt.Fprintln(stderr, "usage:\n"+CLIUsage)
 			return 2
 		}
-		err = cliVerify(args[1:], stdout)
 	default:
 		fmt.Fprintln(stderr, "usage:\n"+CLIUsage)
 		return 2
@@ -103,6 +114,10 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	untyped := fs.Bool("untyped-refs", false, "treat /r/… strings in untyped documents as references")
 	foreign := fs.Bool("foreign-parents", false, "branch namespaces: start chains after their foreign parent (in requires) and list read-through resources as external, instead of including the base's history")
 	asJSON := fs.Bool("json", false, "print the export plan as JSON on stderr")
+	var recipients multiFlag
+	fs.Var(&recipients, "recipient", "seal the bundle to this X25519 public key: a JWK file, or inline JSON (repeatable, §G.5.1.1)")
+	plaintext := fs.Bool("plaintext", false, "write private or sealed content unsealed (§G.5.1: it should be sealed to its recipient)")
+	idFile := fs.String("identity", "", "private key (JWK) that unwraps the keys of sealed source namespaces, when the grant's enc names it (§E.2.3)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -110,7 +125,18 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if len(nss) == 0 {
 		return fmt.Errorf("export: -ns is required")
 	}
-	opt := ExportOptions{External: splitList(*external), Authors: *authors, UntypedRefs: *untyped, ForeignParents: *foreign}
+	opt := ExportOptions{External: splitList(*external), Authors: *authors, UntypedRefs: *untyped, ForeignParents: *foreign, Plaintext: *plaintext}
+	for _, r := range recipients {
+		pub, err := LoadRecipient(r)
+		if err != nil {
+			return fmt.Errorf("export: -recipient %s: %w", r, err)
+		}
+		opt.Recipients = append(opt.Recipients, pub)
+	}
+	identity, err := loadIdentity(*idFile)
+	if err != nil {
+		return err
+	}
 	switch *mode {
 	case "history", "full":
 		opt.Mode = Full
@@ -133,7 +159,7 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	} else {
 		opt.Select = nss
 	}
-	c, err := connect(*api, *bearer, *author)
+	c, err := connect(*api, *bearer, *author, identity)
 	if err != nil {
 		return err
 	}
@@ -162,8 +188,11 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return err
 	}
 	if *asJSON {
-		writeJSON(stderr, map[string]any{"plan": plan, "digest": sum.Digest, "lines": sum.Lines})
+		writeJSON(stderr, map[string]any{"plan": plan, "digest": sum.Digest, "lines": sum.Lines, "sealed": len(opt.Recipients) > 0})
 		return nil
+	}
+	if len(opt.Recipients) > 0 {
+		fmt.Fprintf(stderr, "sealed bundle (%s) for %d recipients\n", SealedMediaType, len(opt.Recipients))
 	}
 	keys := make([]string, 0, len(plan.Docs))
 	for k := range plan.Docs {
@@ -277,13 +306,19 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	var resolves multiFlag
 	fs.Var(&resolves, "resolve", "resolve a conflict: ns/name=skip|take|replay (repeatable)")
+	idFile := fs.String("identity", "", "private key (JWK): opens a sealed bundle, and unwraps the keys of sealed targets (§G.5.1.1, §E.2.3)")
+	allowLess := fs.Bool("allow-less-protected", false, "operator override: import private or sealed namespaces into public targets (§G.5.1)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *in == "" {
 		return fmt.Errorf("import: -i is required")
 	}
-	opt := ImportOptions{DryRun: *dry, CreateNamespaces: *create, UpstreamSuffix: *suffix, Resolutions: map[string]Resolution{}}
+	identity, err := loadIdentity(*idFile)
+	if err != nil {
+		return err
+	}
+	opt := ImportOptions{DryRun: *dry, CreateNamespaces: *create, UpstreamSuffix: *suffix, Resolutions: map[string]Resolution{}, AllowLessProtected: *allowLess}
 	switch {
 	case *atomic && *pace != "":
 		return fmt.Errorf("import: choose one of -atomic and -pace")
@@ -307,7 +342,7 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		}
 		opt.Resolutions[k] = res
 	}
-	open := FileOpener(*in)
+	open := UnsealOpener(FileOpener(*in), identity)
 	schemaNS, h, err := schemaNamespaces(open)
 	if err != nil {
 		return err
@@ -315,7 +350,7 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if opt.NSMap, err = namespaceMap(h, schemaNS, *nsSpec); err != nil {
 		return err
 	}
-	c, err := connect(*api, *bearer, *author)
+	c, err := connect(*api, *bearer, *author, identity)
 	if err != nil {
 		return err
 	}
@@ -391,18 +426,27 @@ func cliVerify(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("bundle verify", flag.ContinueOnError)
 	in := fs.String("i", "", "bundle file")
 	asJSON := fs.Bool("json", false, "print JSON")
+	idFile := fs.String("identity", "", "private key (JWK) that opens a sealed bundle")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *in == "" {
 		return fmt.Errorf("bundle verify: -i is required")
 	}
+	identity, err := loadIdentity(*idFile)
+	if err != nil {
+		return err
+	}
 	f, err := os.Open(*in)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	s, err := Verify(f)
+	plain, sealed, err := Unseal(f, identity)
+	if err != nil {
+		return err
+	}
+	s, err := Verify(plain)
 	if err != nil {
 		return err
 	}
@@ -416,10 +460,17 @@ func cliVerify(args []string, stdout io.Writer) error {
 	}
 	if *asJSON {
 		writeJSON(stdout, map[string]any{"ok": true, "digest": s.Digest, "origin": s.Header.Origin, "created": s.Header.Created,
-			"at": s.Header.At, "full": full, "snapshot": snap, "lines": s.Lines, "external": s.Header.External, "requires": s.Header.Requires})
+			"at": s.Header.At, "full": full, "snapshot": snap, "lines": s.Lines, "external": s.Header.External, "requires": s.Header.Requires,
+			"access": s.Header.Access, "sealed": sealed})
 		return nil
 	}
 	fmt.Fprintf(stdout, "ok: bundle %s from %s, created %s\n", s.Digest, s.Header.Origin, s.Header.Created)
+	if sealed {
+		fmt.Fprintln(stdout, "  sealed bundle: every line decrypted and checked in order (§G.5.1.1)")
+	}
+	for _, ns := range sortedKeys(s.Header.At) {
+		fmt.Fprintf(stdout, "  %s: %s\n", ns, s.Header.AccessOf(ns))
+	}
 	fmt.Fprintf(stdout, "  %d full-history documents (every id recomputed), %d snapshots, %d lines\n", full, snap, s.Lines)
 	if len(s.Header.Requires) > 0 {
 		fmt.Fprintf(stdout, "  requires %d revisions in the target\n", len(s.Header.Requires))
@@ -428,5 +479,55 @@ func cliVerify(args []string, stdout io.Writer) error {
 		fmt.Fprintf(stdout, "  external: %s\n", strings.Join(s.Header.External, ", "))
 	}
 	fmt.Fprintln(stdout, "  snapshot lines and the header are only as trustworthy as the channel that delivered the bundle (§G.4.1)")
+	return nil
+}
+
+func sortedKeys(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func loadIdentity(path string) (*ecdh.PrivateKey, error) {
+	if path == "" {
+		return nil, nil
+	}
+	id, err := LoadIdentity(path)
+	if err != nil {
+		return nil, fmt.Errorf("-identity %s: %w", path, err)
+	}
+	return id, nil
+}
+
+// cliKeygen writes a new X25519 identity (private JWK, mode 0600) and
+// prints its public JWK.
+func cliKeygen(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("bundle keygen", flag.ContinueOnError)
+	out := fs.String("o", "", "file for the private key (JWK); must not exist")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *out == "" {
+		return fmt.Errorf("bundle keygen: -o is required")
+	}
+	_, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		return err
+	}
+	f, err := os.OpenFile(*out, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(append(jsonv.Canonical(IdentityJWK(priv)), '\n')); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, string(jsonv.Canonical(seal.RecipientJWK(priv.PublicKey()))))
 	return nil
 }

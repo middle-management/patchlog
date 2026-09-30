@@ -30,6 +30,28 @@
 //   - A deleted snapshot line carries no "doc".
 //   - Unknown members in the header or a line are rejected: this is bundle
 //     version 1, and strictness catches tampering and truncation early.
+//
+// # Encryption (§G.5)
+//
+//   - The header's "access" gives each exporting namespace's protection:
+//     "public", "private" (read-restricted, with or without E1), "sealed"
+//     (E2) or "e2e" (E3). Its keys must be namespaces of "at"; the exporter
+//     writes every one. A namespace missing from it is "private".
+//   - E2: the exporter holds keys (a read grant, and an identity when the
+//     source wraps them), so lines hold plaintext. Private and sealed
+//     content is written as a sealed bundle (sealed.go) unless the exporter
+//     is told to write plaintext.
+//   - E3: lines carry the ciphertext verbatim, the keyring resource
+//     included, and ids verify over it as usual. Only full history: a
+//     snapshot needs a client with keys (§G.5.1), which this exporter
+//     isn't, so it refuses. Nothing is folded, so an e2e document brings
+//     no dependencies.
+//   - The importer enforces what the source can't: a private or sealed
+//     source goes only into a private or sealed target, an e2e source only
+//     into an e2e target of the same name (sealed patch sets bind pl.ns,
+//     §E.3.1; importing under another name is a merge by a client holding
+//     both sets of keys, §F.8), unless ImportOptions.AllowLessProtected.
+//     Missing targets are created as protected as their source.
 package bundle
 
 import (
@@ -62,6 +84,18 @@ const (
 	Snapshot = "snapshot"
 )
 
+// Access levels of a namespace in the header's access (§G.5.1).
+const (
+	AccessPublic  = "public"
+	AccessPrivate = "private"
+	AccessSealed  = "sealed"
+	AccessE2E     = "e2e"
+)
+
+func validAccess(s string) bool {
+	return s == AccessPublic || s == AccessPrivate || s == AccessSealed || s == AccessE2E
+}
+
 // DocInfo is a header docs entry.
 type DocInfo struct {
 	History string // Full or Snapshot
@@ -77,6 +111,16 @@ type Header struct {
 	External []string           // dependencies deliberately left out
 	Requires map[string]string  // "ns/name" → id that must be in the target's chain
 	Authors  bool
+	Access   map[string]string // namespace → its access level (§G.5.1)
+}
+
+// AccessOf is a namespace's access level; one the header doesn't give is
+// private (§G.5.1).
+func (h *Header) AccessOf(ns string) string {
+	if a, ok := h.Access[ns]; ok {
+		return a
+	}
+	return AccessPrivate
 }
 
 // Key is the docs key of a resource.
@@ -207,6 +251,13 @@ func (h *Header) value() map[string]any {
 		}
 		m["requires"] = r
 	}
+	if len(h.Access) > 0 {
+		a := map[string]any{}
+		for k, v := range h.Access {
+			a[k] = v
+		}
+		m["access"] = a
+	}
 	return m
 }
 
@@ -251,7 +302,7 @@ func parseHeader(v any) (*Header, error) {
 	}
 	for k := range m {
 		switch k {
-		case "bundle", "origin", "created", "at", "docs", "external", "requires", "authors":
+		case "bundle", "origin", "created", "at", "docs", "external", "requires", "authors", "access":
 		default:
 			return nil, fmt.Errorf("unknown header member %q", k)
 		}
@@ -259,7 +310,7 @@ func parseHeader(v any) (*Header, error) {
 	if n, _ := m["bundle"].(float64); n != Version {
 		return nil, fmt.Errorf("not a version %d bundle (bundle: %v)", Version, m["bundle"])
 	}
-	h := &Header{At: map[string]string{}, Docs: map[string]DocInfo{}, Requires: map[string]string{}}
+	h := &Header{At: map[string]string{}, Docs: map[string]DocInfo{}, Requires: map[string]string{}, Access: map[string]string{}}
 	h.Origin, _ = m["origin"].(string)
 	if h.Origin == "" {
 		return nil, fmt.Errorf("header needs an origin")
@@ -285,6 +336,22 @@ func parseHeader(v any) (*Header, error) {
 			return nil, fmt.Errorf("at: invalid entry %q", ns)
 		}
 		h.At[ns] = id
+	}
+	if a, has := m["access"]; has {
+		am, ok := a.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("access must be an object")
+		}
+		for ns, v := range am {
+			s, _ := v.(string)
+			if _, ok := h.At[ns]; !ok {
+				return nil, fmt.Errorf("access: namespace %s has no at", ns)
+			}
+			if !validAccess(s) {
+				return nil, fmt.Errorf("access: %s: must be %q, %q, %q or %q", ns, AccessPublic, AccessPrivate, AccessSealed, AccessE2E)
+			}
+			h.Access[ns] = s
+		}
 	}
 	docs, ok := m["docs"].(map[string]any)
 	if !ok {

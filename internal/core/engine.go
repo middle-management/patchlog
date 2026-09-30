@@ -14,6 +14,7 @@ package core
 
 import (
 	"context"
+	"crypto/ecdh"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -113,6 +114,9 @@ type RemoteEndpoint struct {
 	BaseURL    string       // e.g. https://cms.example; defaults to the origin
 	HTTPClient *http.Client // nil: http.DefaultClient
 	Bearer     string       // grant for the base namespace (read, and export to register)
+	// Identity unwraps the keys of a sealed base (Addendum E.2) that the
+	// base wraps to the grant's enc (§E.2.3, §G.5). Nil: raw keys only.
+	Identity *ecdh.PrivateKey
 }
 
 // Purger purges CDN cache tags.

@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -102,6 +103,8 @@ func serve(args []string) {
 	var remoteBearers, remoteURLs multi
 	fs.Var(&remoteBearers, "remote-bearer", "ORIGIN=GRANT: grant sent to the deployment at ORIGIN for remote branches (read, and export to register) (repeatable, §G.3)")
 	fs.Var(&remoteURLs, "remote-url", "ORIGIN=URL: reach the deployment at ORIGIN through URL instead (repeatable)")
+	var remoteIDs multi
+	fs.Var(&remoteIDs, "remote-identity", "ORIGIN=FILE: X25519 private key (JWK) unwrapping the keys of sealed bases at ORIGIN, named by the -remote-bearer grant's enc (repeatable, §G.5.2)")
 	ignorePurges := fs.Bool("remote-ignore-purges", false, "record purges in remote bases' logs as notices instead of applying them (§G.3)")
 	remoteFollow := fs.Duration("remote-follow-interval", 5*time.Minute, "how often remote bases' logs are followed (0 disables)")
 	remoteRegister := fs.Bool("remote-register", false, "register remote branches with their bases and renew the registrations (§G.3)")
@@ -110,7 +113,7 @@ func serve(args []string) {
 	rotateEpochs := fs.Duration("rotate-epochs", 0, "rotate every sealed namespace's epoch once it is this old, e.g. 24h (Addendum E.2; 0 disables)")
 	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
 	fs.Parse(args)
-	remote, err := remoteOptions(remoteBearers, remoteURLs)
+	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -178,9 +181,9 @@ func serve(args []string) {
 }
 
 // remoteOptions builds the endpoints of remote bases from ORIGIN=VALUE flags.
-func remoteOptions(bearers, urls []string) (core.RemoteOptions, error) {
+func remoteOptions(bearers, urls, identities []string) (core.RemoteOptions, error) {
 	eps := map[string]core.RemoteEndpoint{}
-	for _, pair := range [][]string{bearers, urls} {
+	for _, pair := range [][]string{bearers, urls, identities} {
 		for _, kv := range pair {
 			o, v, ok := strings.Cut(kv, "=")
 			if !ok || !core.ValidRemoteOrigin(o) || v == "" {
@@ -199,6 +202,16 @@ func remoteOptions(bearers, urls []string) (core.RemoteOptions, error) {
 		o, v, _ := strings.Cut(kv, "=")
 		ep := eps[o]
 		ep.BaseURL = v
+		eps[o] = ep
+	}
+	for _, kv := range identities {
+		o, v, _ := strings.Cut(kv, "=")
+		id, err := bundle.LoadIdentity(v)
+		if err != nil {
+			return core.RemoteOptions{}, fmt.Errorf("-remote-identity %s: %w", o, err)
+		}
+		ep := eps[o]
+		ep.Identity = id
 		eps[o] = ep
 	}
 	return core.RemoteOptions{Resolve: func(origin string) (core.RemoteEndpoint, error) {
