@@ -48,6 +48,8 @@ func main() {
 		rebaseCmd(os.Args[2:])
 	case "janitor":
 		janitorCmd(os.Args[2:])
+	case "export", "import", "bundle":
+		bundleCmd(os.Args[1], os.Args[2:])
 	default:
 		usage()
 	}
@@ -62,7 +64,10 @@ func usage() {
   patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
-  patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`)
+  patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
+  patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
+  patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
+  patchlog bundle verify -i file.jsonl`)
 	os.Exit(2)
 }
 

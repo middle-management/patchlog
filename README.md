@@ -31,7 +31,8 @@ and serves immutable, CDN-cacheable revisions.
   public API. The optional merge *service* of §F.7 (scheduled merges, web status) is not built;
   its logic is in `internal/merge` and the CLI.
 - **Addendum E** (encryption): a namespace document with `encryption` is rejected with `422`.
-- **Addendum G** (federation): remote branches, `export`, bundles and pruning archives.
+- **Addendum G** (federation): remote branches (the `export` verb) and pruning archives. Bundles
+  (§G.4) are implemented as `patchlog export/import`.
   Because no archive destination exists, **pruning always needs a grant chained to a `*` key**
   (§8.6), and `retention` policies are validated and stored but not applied automatically.
 - CDN edge grants (§C.5): the origin checks grants itself on every read and sets
@@ -97,6 +98,22 @@ patchlog janitor -ns matches                     # purge merged/superseded branc
 - The janitor checks `merged` and `successor` claims against both logs before purging (§F.6).
   Cleanup is opt-in: a branch is purged only once a `cleanup` period, from the branch's or the
   base's document, has passed.
+
+### Bundles (§G.4)
+
+```sh
+patchlog export -ns matches -mode history -o matches.jsonl  # with schemas and x-ref targets
+patchlog bundle verify -i matches.jsonl                      # recompute every id
+patchlog import -ns matches -i matches.jsonl -dry-run -atomic
+patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split and paced
+```
+
+- **History bundles** keep ids, so importing one reproduces the source's ids exactly.
+- **Snapshot bundles** go through `{ns}-upstream` namespaces. Pinned references between snapshot
+  documents are rewritten to them, keeping any `#id` fragment.
+- **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
+  (§6.6). **`-pace`** splits batches to fit the limits and paces them for backfills.
+- **Known gap:** exporting a branch whose resources start with a foreign parent isn't supported yet.
 
 ### A short tour (dev mode)
 
@@ -186,6 +203,7 @@ internal/annot       x-* annotations and x-ref references
 internal/index       search index service (Addendum A)
 internal/merge       merge, rebase, status, diff (Addendum F)
 internal/janitor     branch cleanup with claim verification (§F.6)
+internal/bundle      bundle format, export and import (§G.4)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
 internal/ids        content-addressed ids (§3.2–§3.5)
 internal/pointer    JSON Pointer
