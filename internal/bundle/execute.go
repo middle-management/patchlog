@@ -79,7 +79,7 @@ func (im *importer) namespaceDoc(ctx context.Context, ns string) (map[string]any
 	}
 	d, err := im.c.NSDoc(ctx, ns, h.ID)
 	if err != nil {
-		return nil, false, err
+		return nil, false, noKeysHint(ns, err)
 	}
 	return d.Value, true, nil
 }
@@ -253,7 +253,7 @@ func (im *importer) defaultNSDoc(ctx context.Context, n *node) any {
 	}
 	if upstreamOf != "" {
 		// An upstream namespace is exactly as readable as the namespace it
-		// serves (§G.5).
+		// serves (§G.5); checkAccess seals it too if its source is sealed.
 		if doc, ok, err := im.namespaceDoc(ctx, upstreamOf); err == nil && ok {
 			if r, ok := doc["read"].(string); ok {
 				return map[string]any{"read": r}
@@ -324,8 +324,14 @@ func (im *importer) execute(ctx context.Context) error {
 
 	for _, n := range im.order {
 		if n.missing {
-			if _, err := im.c.CreateNamespace(ctx, n.ns, im.defaultNSDoc(ctx, n)); err != nil && !client.IsStale(err) {
+			cr, err := im.c.CreateNamespace(ctx, n.ns, im.nsDoc(ctx, n))
+			if err != nil && !client.IsStale(err) {
 				return fmt.Errorf("import: creating namespace %s: %w", n.ns, err)
+			}
+			if err == nil && im.bump[n.ns] > 0 {
+				if err := im.bumpEpochs(ctx, n.ns, cr.Config); err != nil {
+					return err
+				}
 			}
 			n.missing = false
 		}

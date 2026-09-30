@@ -438,7 +438,8 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	expectCode(t, e.branch("pl", map[string]any{"name": "plb", "patches": ops(op("add", "/encryption", map[string]any{"level": "e2e"}))}, plG), 422, "invalid")
 	expectCode(t, e.patchNS("e", ops(op("replace", "/encryption", map[string]any{"level": "sealed", "epoch": 2.0})), f.adminG), 422, "invalid")
 
-	// Remote branches of an e2e namespace are refused.
+	// Remote branches of an e2e namespace may register; B keeps them e2e
+	// (§G.5.2, remote_enc_test.go).
 	exp := e.grant(f.admin, "user:admin", []string{"e"}, []string{"read", "export"})
-	expectCode(t, e.register("e", "rel", e.nsHead("e", exp), "", exp), 422, "invalid")
+	expect(t, e.register("e", "rel", e.nsHead("e", exp), "", exp), 201)
 }

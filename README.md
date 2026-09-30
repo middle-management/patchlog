@@ -23,11 +23,12 @@ and serves immutable, CDN-cacheable revisions.
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Cache-Control classes and cache tags | §9 | ✅ (CDN purges go to a pluggable `Purger`, default: log) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
-| Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches | §G.3 | ✅ (mirrored up front) |
+| Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
+| Bundles: history and snapshot export and import, sealed bundles, access levels, e2e ciphertext | §G.4, §G.5.1 | ✅ (`patchlog export/import`) |
 | Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
 | Encryption at rest, cryptographic purge | Addendum E.1 | ✅ (local master key file; KMS adapters to come) |
 | Sealed for delivery: epoch keys, JWE responses, `POST /ns/{ns}/keys`, rotation, `$nonce` | Addendum E.2 | ✅ (client library decrypts; other consumers don't re-seal yet) |
-| End-to-end: sealed patch sets, header checks, blind rules, fold reads, keyring relay, sealed prune snapshots | Addendum E.3 | ✅ (client library seals, folds, validates and administers keyrings; merge, export and remote branches refuse) |
+| End-to-end: sealed patch sets, header checks, blind rules, fold reads, keyring relay, sealed prune snapshots | Addendum E.3 | ✅ (client library seals, folds, validates and administers keyrings; merge refuses; export and remote branches carry ciphertext) |
 
 ### Not implemented
 
@@ -36,15 +37,15 @@ and serves immutable, CDN-cacheable revisions.
 - **§F.7 merge service** (scheduled merges, web status): not built. Its logic is in
   `internal/merge` and the CLI.
 - **Addendum E.3 gaps:** merging or rebasing e2e branches (§F.8: decrypt and re-encrypt in a
-  client holding both keyrings), bundles of e2e namespaces (§G.5: history over ciphertext,
-  snapshots by a key holder) and remote branches of them are refused; retention for e2e
+  client holding both keyrings) and snapshot bundles of e2e namespaces (§G.5.1: a sealed
+  genesis by a key holder) are refused; the client library can't yet fold a remote branch's
+  read-through ciphertext (bound to the base's namespace name, which B doesn't have); retention for e2e
   namespaces needs a key-holding janitor, which isn't built (the server skips them); no
   size-bucket padding (§E.4).
 - **Addendum E.2 gaps:** consumers that re-publish (search index, tree and catalog services)
   don't seal what they serve yet (§E.2.5), so don't point them at sealed namespaces unless
-  their own output is private; remote branches of sealed namespaces (§G.3, §G.5) are refused
-  with `422`; exports with keys write plaintext bundles (§G.5 asks for them to be encrypted to
-  the recipient); no size-bucket padding (§E.4).
+  their own output is private; importing plaintext into an e2e target (sealing each patch set
+  with the target's keys, §G.5.1) isn't done; no size-bucket padding (§E.4).
 - **Addendum G** (federation): lazy read-through, mirroring pinned `x-ref` targets, and
   remote branches of a base that is itself a remote branch (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
@@ -221,6 +222,14 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
 - **Schemas** are mirrored under the same paths into a non-branch namespace of that name on B,
   created if missing with the branch's `read`, `keys` and `roles`. A path whose chain neither
   contains A's nor is a prefix of it is `409 name_conflict`; a prefix is extended.
+- **Encryption (§G.5.2).** B refuses a branch less protected than A's namespace as B reads it: a
+  private base needs a private or sealed branch, a sealed base a sealed one (it may be public),
+  an e2e base an e2e one. For a sealed base, B fetches keys with its own grant, whose `enc` names
+  B's key pair (`-remote-identity https://a.example=b.jwk`), mirrors the plaintext and seals
+  what it serves under the branch's own epoch keys. For an e2e base, B mirrors the ciphertext
+  and the `keyring` verbatim (ids verified over the ciphertext, nothing folded, no schema
+  closure) and relays the keyring's wrapped keys under A's kids; history A pruned can't be
+  mirrored (`410 pruned`). A accepts registrations whatever its level: it can't check B.
 - **What doesn't cross.** Keys and revocations are the branch's own (they stop at the shadow),
   A's rules don't apply, B's purges and namespace purge never contact A, and A's registrations
   never block A's own purges. A private base's branch can't be public (A's `read` at `at`, as
@@ -343,8 +352,8 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
   must be sealed (the level rule) and has its own epoch keys, sealing read-through content under
   them; a sealed branch of a sealed non-public base may be `public` (it only exposes
   ciphertext; a relaxation of §7.4). A namespace with public dependents that aren't sealed
-  can't become sealed (`409 in_use` with `dependents`). Remote branches of sealed namespaces,
-  and registrations of them, are `422`.
+  can't become sealed (`409 in_use` with `dependents`). Remote branches of sealed namespaces
+  are sealed too (§G.5.2, see remote branches).
 - **Client.** `client.WithKeys(client.NewKeys(recipientPriv))` makes `Doc`, `Log`, `NSDoc`,
   `NSLog`, `LongPoll`, `ResourceLongPoll`, `NSEvents` and `ResourceEvents` decrypt
   transparently, checking each JWE's kid and `pl` against the request (and that log entries
@@ -432,8 +441,8 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   `RotateEpoch` writes the keyring and the epoch bump in one batch. Keys come from `/keys`,
   falling back to the keyring resource. `client.EncryptionLevel(ns)` reports a namespace's level.
 - **Refusals.** The merge tool refuses e2e namespaces (§F.8: merges re-encrypt, never
-  fast-forward), `patchlog export` refuses them in both modes, and remote branches of them (and
-  registrations) are `422`.
+  fast-forward); `patchlog export` refuses snapshots of them (full history carries the
+  ciphertext, §G.5.1).
 - **Metadata no level hides (§E.4):** names, ids and parent links, sizes, timing, authors and the
   namespace log's shape.
 
@@ -472,6 +481,29 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
 - **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
   (§6.6). **`-pace`** splits batches to fit the limits and paces them for backfills.
 - **Branches** export with the base's history included, or with `-foreign-parents` naming the base revisions in `requires`.
+
+#### Encryption (§G.5.1)
+
+```sh
+patchlog bundle keygen -o me.jwk                         # prints the public JWK
+patchlog export -ns secret -recipient them.jwk -o s.plb  # a sealed bundle
+patchlog import -ns secret -i s.plb -identity me.jwk -atomic
+```
+
+- **`access`** in the header records each namespace's protection: `public`, `private`, `sealed`
+  or `e2e` (missing means `private`). Export refuses to write private or sealed content unsealed
+  unless `-plaintext`; `-identity` unwraps a sealed source's keys when the grant's `enc` names it.
+- **Sealed bundles** (`application/vnd.patchlog.sealed-bundle+jsonl`): an envelope line with a
+  random id and the content key HPKE-wrapped per recipient (kid: RFC 7638 thumbprint), then one
+  JWE per bundle line with `pl: {bundle, line}` and `last` on the final one. Reordered, spliced,
+  truncated or extended bundles are rejected; `source.bundle` is the plaintext bundle's digest.
+- **Import** refuses a target less protected than its source (private or sealed into a public
+  one) unless `-allow-less-protected`, and creates missing targets as protected as their source
+  (sealed ones sealed, with a fresh `$nonce` in the patch sets the importer makes).
+- **E3:** full history carries the ciphertext and the `keyring` verbatim; ids verify over it. It
+  imports only into an e2e namespace of the same name (sealed patch sets bind `pl.ns`), which a
+  missing target is created as, moved up to the bundle's epochs. Diverged e2e documents can only
+  be skipped: comparing or rewriting them needs a client with the keys (§F.8).
 
 ### A short tour (dev mode)
 

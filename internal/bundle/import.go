@@ -105,6 +105,10 @@ type ImportOptions struct {
 	MaxRetries int
 	// Progress, if set, is told about each batch as it is submitted.
 	Progress func(b *BatchReport)
+	// AllowLessProtected is the operator's explicit override, for this
+	// import, of the refusal to import a private or sealed namespace into a
+	// public target (§G.5.1).
+	AllowLessProtected bool
 }
 
 // DocReport is one bundled document, classified.
@@ -320,6 +324,11 @@ type importer struct {
 	schemas map[string]any
 	nodes   map[string]*node
 	order   []*node
+
+	// §G.5.1 (access.go).
+	create  map[string]any  // target ns → the document it is created with
+	sealedT map[string]bool // target ns is (or is created) sealed
+	bump    map[string]int  // new e2e target → the epoch to move it to
 }
 
 // Import imports a bundle into the deployment c talks to (§G.4.4). It
@@ -366,6 +375,9 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 	if to == im.h.Origin {
 		im.local = true
 		im.rep.Notes = append(im.rep.Notes, "the bundle comes from this deployment: batch sources carry no origin, so the server checks source.at against source.ns (§7.5)")
+	}
+	if err := im.checkAccess(ctx); err != nil {
+		return im.rep, err
 	}
 	if err := im.check(ctx); err != nil {
 		return im.rep, err
@@ -647,6 +659,15 @@ func stepSize(s client.Step) int {
 	return len(jsonv.Canonical(v))
 }
 
+// takeSteps turn the target's document into the bundle's version; in a
+// sealed target, ignoring the $nonce and setting a fresh one (§E.2.5).
+func (im *importer) takeSteps(ns string, tdoc any, tlive bool, bdoc any, blive bool) []client.Step {
+	if im.sealedT[ns] {
+		return nonced(takeSteps(withoutNonce(tdoc), tlive, withoutNonce(bdoc), blive))
+	}
+	return takeSteps(tdoc, tlive, bdoc, blive)
+}
+
 // takeSteps turn the target's document into the bundle's version.
 func takeSteps(tdoc any, tlive bool, bdoc any, blive bool) []client.Step {
 	switch {
@@ -831,6 +852,19 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 	} else {
 		r.Conflicts = append(r.Conflicts, conflict(ConflictDiverged, "the target has a different history"))
 	}
+	if im.h.AccessOf(d.ns) == AccessE2E {
+		// Ciphertext can't be compared, and sealed patch sets bind their
+		// parent, so they can't be replayed elsewhere (§E.3.1, §F.8).
+		r.Conflicts = append(r.Conflicts, conflict(merge.ConflictUnreadable, "e2e content: only a client holding the keys can compare it and merge it by re-encrypting (§F.8)"))
+		switch res := im.opt.Resolutions[d.key]; res {
+		case "":
+		case ResolveSkip:
+			r.Resolution, r.Class = res, "skipped"
+		default:
+			return nil, fmt.Errorf("%s can't resolve e2e content: skip it, or merge it in a client holding the keys (§F.8)", res)
+		}
+		return nil, nil
+	}
 	tlog, err := im.c.Log(ctx, d.tns, d.name, B, "")
 	if client.IsPruned(err) {
 		tlog, err = im.c.Log(ctx, d.tns, d.name, B, client.Horizon(err))
@@ -890,7 +924,7 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 		if err != nil {
 			return nil, err
 		}
-		steps := takeSteps(tdoc, tlive, bdoc, blive)
+		steps := im.takeSteps(d.tns, tdoc, tlive, bdoc, blive)
 		if len(steps) == 0 {
 			r.Note = "the target's document already equals the bundle's"
 			return nil, nil
@@ -1151,6 +1185,10 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 			return nil, err
 		}
 		u.newDoc = nd
+		if im.sealedT[u.ns] {
+			// The upstream's own $nonce isn't part of the snapshot (§E.2.5).
+			prevDoc, nd = withoutNonce(prevDoc), withoutNonce(nd)
+		}
 		switch {
 		case u.prev == "":
 			steps, ur.Class = []client.Step{client.PatchStep(client.GenesisPatches(nd))}, "create"
@@ -1168,6 +1206,11 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 	if len(steps) == 0 {
 		ur.Head = u.head
 		return nil, nil
+	}
+	if im.sealedT[u.ns] {
+		// A sealed upstream chain then depends on its nonces too, not only on
+		// the sequence of snapshots (§E.2.5, §G.4.4).
+		steps = nonced(steps)
 	}
 	exp, err := expectedIDs(u.prev, steps)
 	if err != nil {
@@ -1336,7 +1379,7 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 		if err != nil {
 			return nil, err
 		}
-		steps := takeSteps(tdoc, tlive, u.newDoc, !d.snap.Deleted)
+		steps := im.takeSteps(d.tns, tdoc, tlive, u.newDoc, !d.snap.Deleted)
 		if len(steps) == 0 {
 			r.Note = "the target's document already equals the snapshot"
 			return nil, nil

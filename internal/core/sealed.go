@@ -770,10 +770,6 @@ func checkNonces(s *itemState) *Error {
 	return nil
 }
 
-// registeredRemote reports unexpired remote branch registrations of n
-// (§G.3), which a sealed namespace can't have on this server.
-func (t *tx) registeredRemote(n *nsRow) bool { return len(t.liveRegistrations(n)) > 0 }
-
 // checkEpochKeys runs at Open when no data key exists: one stored epoch key
 // must unwrap with the configured key store (Addendum E.2).
 func (e *Engine) checkEpochKeys(ctx context.Context) error {

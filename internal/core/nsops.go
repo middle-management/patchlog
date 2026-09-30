@@ -168,15 +168,11 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		return nil, err
 	}
 	if cfg.level >= levelSealed && cur.level < levelSealed {
-		// Remote branches of sealed namespaces aren't supported (§G.3,
-		// §G.5): their mirrored content would need their own sealing.
-		if t.remoteShadow(n) != nil {
-			return nil, invalid("/encryption: a remote branch cannot be sealed on this server")
-		}
-		if t.registeredRemote(n) {
-			return nil, invalid("/encryption: a namespace with registered remote branches cannot become sealed on this server")
-		}
-		// §7.4: its content would stay public through them.
+		// A remote branch becoming sealed seals its read-through content
+		// under its own keys (§E.2.5). Registered remote branches of n are
+		// bound by §G.5, which only their deployments can enforce. Local
+		// public dependents that aren't sealed block it (§7.4): its content
+		// would stay public through them.
 		var deps []string
 		for _, d := range t.publicDependents(n) {
 			if b := t.nsByName(d); b != nil && t.nsLevel(b) < levelSealed {

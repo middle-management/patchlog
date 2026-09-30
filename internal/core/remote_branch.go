@@ -46,6 +46,27 @@ import (
 // revocations are the branch's own, purges in the base (including those
 // that propagated to it from its bases) arrive as notices from its log, and
 // nothing on this side blocks the base (§7.6).
+//
+// Encryption (§G.5). A base that isn't public, or is sealed or e2e, binds
+// the branch: it must be private or sealed (a sealed branch of a sealed
+// base may be public, as for local branches), never below the base's
+// encryption level, and e2e only if the base is. That is what A's export
+// grant entrusts to B, and B enforces it at creation. The shadows follow
+// the branch's level (at rest, and for sealing and e2e).
+//
+//   - E2. B fetches with keys: the endpoint's grant gets them from the
+//     base's POST /ns/{ns}/keys, unwrapped with the endpoint's Identity
+//     when the base wraps them (§E.2.3). The shadows hold plaintext, ids
+//     over it as usual, and the branch has its own epoch keys: read-through
+//     content is sealed under them like any other (§E.2.5).
+//   - E3. B mirrors the base's ciphertext verbatim, ids over it verified as
+//     usual, without folding anything (no documents, and no $schema
+//     closure: validation is the clients', §E.3.2). The keyring resource is
+//     mirrored like any other, so POST /ns/{branch}/keys relays the base's
+//     wrapped keys (kid "{base ns}#{e}") until the branch writes a keyring
+//     of its own; each shadow records its level's epochs and when they
+//     began, from its configuration history. History the base pruned can't
+//     be mirrored: its horizon is a sealed snapshot.
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose
@@ -129,7 +150,8 @@ func (e *Engine) remoteClient(origin string) (*client.Client, RemoteEndpoint, er
 	if err != nil {
 		return nil, ep, err
 	}
-	opts := []client.Option{client.WithHTTPClient(ep.HTTPClient)}
+	// Keys of sealed bases come with the endpoint's grant (§G.5).
+	opts := []client.Option{client.WithHTTPClient(ep.HTTPClient), client.WithKeys(client.NewKeys(ep.Identity))}
 	if ep.Bearer != "" {
 		opts = append(opts, client.WithBearer(ep.Bearer))
 	}
@@ -152,6 +174,10 @@ func fetchErr(what string, err error) *Error {
 		}
 		return remoteErr("%s: %d from the base", what, ae.Status)
 	}
+	if errors.Is(err, client.ErrNoKeys) {
+		return remoteErr("%s: the base is sealed (Addendum E.2) and its keys aren't available to this deployment; "+
+			"the endpoint's grant must get them from the base's POST /ns/{ns}/keys (§G.5)", what)
+	}
 	return remoteErr("%s: %v", what, err)
 }
 
@@ -166,6 +192,9 @@ type remoteChain struct {
 	entries    []client.LogEntry
 	horizonDoc []byte
 	index      map[string]int
+	// opaque marks e2e content (§E.3): patch sets are ciphertext, never
+	// applied, and the chain has no documents.
+	opaque bool
 }
 
 func newChain(entries []client.LogEntry, horizonDoc []byte) *remoteChain {
@@ -178,13 +207,23 @@ func newChain(entries []client.LogEntry, horizonDoc []byte) *remoteChain {
 
 func (c *remoteChain) last() client.LogEntry { return c.entries[len(c.entries)-1] }
 
+// prefix is the chain's entries up to index k.
+func (c *remoteChain) prefix(k int) *remoteChain {
+	p := newChain(c.entries[:k+1], c.horizonDoc)
+	p.opaque = c.opaque
+	return p
+}
+
 // fold walks the chain, calling f with each entry and the document after it
-// (for a tombstone, the last live document).
+// (for a tombstone, the last live document). An opaque chain has no
+// documents: f gets nil.
 func (c *remoteChain) fold(f func(i int, e client.LogEntry, doc any) error) error {
 	var doc any
 	exists := false
 	for i, e := range c.entries {
 		switch {
+		case c.opaque && (e.Kind == "rev" || e.Kind == "tombstone"):
+			// Ciphertext: readers verify and fold it (§E.3.2).
 		case i == 0 && c.horizonDoc != nil:
 			doc, exists = jsonv.MustParse(c.horizonDoc), true
 		case e.Kind == "tombstone":
@@ -231,7 +270,8 @@ var errStop = errors.New("stop")
 
 // fetchChain fetches and verifies a resource's chain up to target. mapErr
 // maps a failed fetch (fetchErr, or unreadableBase for a base's base).
-func fetchChain(ctx context.Context, c *client.Client, ns, name, target string, mapErr func(string, error) *Error) (*remoteChain, *Error) {
+// opaque fetches e2e content (§E.3), verified over its ciphertext.
+func fetchChain(ctx context.Context, c *client.Client, ns, name, target string, opaque bool, mapErr func(string, error) *Error) (*remoteChain, *Error) {
 	what := "/r/" + ns + "/" + name
 	entries, err := c.Log(ctx, ns, name, target, "")
 	if err == nil {
@@ -242,10 +282,18 @@ func fetchChain(ctx context.Context, c *client.Client, ns, name, target string, 
 		if last != target || len(entries) == 0 {
 			return nil, unverified("%s: the log ends at %s, not at %s", what, last, target)
 		}
-		return newChain(entries, nil), nil
+		ch := newChain(entries, nil)
+		ch.opaque = opaque
+		return ch, nil
 	}
 	if !client.IsPruned(err) {
 		return nil, mapErr(what, err)
+	}
+	if opaque {
+		// The horizon's document is a sealed snapshot (§8.6, §E.3), which
+		// this deployment can neither verify nor fold.
+		return nil, apiErr(410, "pruned", "message", what+": the e2e base pruned history needed at at; its horizon is a sealed snapshot, which can't be mirrored (§G.5)",
+			"horizon", client.Horizon(err))
 	}
 	// Pruned at the base (§8.6): mirror from the horizon, with its
 	// document as a snapshot, verifying ids from there on.
@@ -339,6 +387,10 @@ type remoteLevel struct {
 	log    []client.NSEntry
 	byName map[string]*remoteRes // every resource of the level's log
 	res    []*remoteRes          // the ones mirrored: read through from above, or foreign parents
+	// An e2e level's encryption member as of at, and its epochs with when
+	// they began (§E.3.2), for the shadow's keyring relay.
+	enc    map[string]any
+	epochs []epochStart
 }
 
 // remoteMirror is the base as of at, verified.
@@ -427,6 +479,53 @@ func fetchLevel(ctx context.Context, c *client.Client, ns, at string, mapErr fun
 	return lv, &BaseRef{NS: bns, At: bat}, nil
 }
 
+// fetchEpochs reads an e2e level's encryption member as of its at, and its
+// epochs with when each began: the created time of the first entry of its
+// log whose configuration names it (§E.3.2). Configuration documents are
+// only as trustworthy as the channel; they only decide which epochs a grant
+// on this side gets relayed (§E.2.3).
+func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr func(string, error) *Error) *Error {
+	epochOf := func(nsID string) (map[string]any, int, *Error) {
+		d, err := c.NSDoc(ctx, lv.ns, nsID)
+		if err != nil {
+			return nil, 0, mapErr("/ns/"+lv.ns+"/rev/"+nsID, err)
+		}
+		enc, _ := d.Value["encryption"].(map[string]any)
+		if lvl, _ := enc["level"].(string); lvl != "e2e" {
+			return nil, 0, unverified("/ns/%s: an e2e base's chain holds a namespace that isn't e2e", lv.ns)
+		}
+		e := 1
+		if f, ok := enc["epoch"].(float64); ok {
+			e = int(f)
+		}
+		return enc, e, nil
+	}
+	enc, cur, ferr := epochOf(lv.at)
+	if ferr != nil {
+		return ferr
+	}
+	lv.enc = enc
+	seen := map[int]bool{}
+	for _, en := range lv.log {
+		isConfig := en.Kind == "config"
+		for _, s := range en.Entries {
+			isConfig = isConfig || s.Kind == "config"
+		}
+		if !isConfig {
+			continue
+		}
+		_, e, ferr := epochOf(en.ID)
+		if ferr != nil {
+			return ferr
+		}
+		if !seen[e] && e <= cur {
+			seen[e] = true
+			lv.epochs = append(lv.epochs, epochStart{e: e, created: time.UnixMilli(parseCreated(en.Created, time.Now()))})
+		}
+	}
+	return nil
+}
+
 // fetchRemote fetches and verifies the base of a remote branch as of at
 // (§G.3), outside any transaction. If the base is a branch, its bases are
 // fetched and verified too, each as of the at of the branch above it, and
@@ -453,6 +552,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		}
 		m.levels = append(m.levels, lv)
 		if len(m.levels) == 1 {
+			// Sealed documents are decrypted with the endpoint's keys.
 			if d, err := c.NSDoc(ctx, base.NS, base.At); err == nil {
 				if d.Value["read"] == "public" {
 					m.read = "public"
@@ -475,6 +575,14 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		}
 		ns, at = next.NS, next.At
 		mapErrs = append(mapErrs, unreadableBase(ns))
+	}
+	opaque := m.level == levelE2E
+	if opaque {
+		for i, lv := range m.levels {
+			if ferr := fetchEpochs(ctx, c, lv, mapErrs[i]); ferr != nil {
+				return nil, ferr
+			}
+		}
 	}
 	// Every resource as the base sees it at at: the topmost level with
 	// entries for it (§7.6).
@@ -526,19 +634,21 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		if r.kind == "purge" {
 			continue
 		}
-		ch, ferr := fetchChain(ctx, c, lv.ns, name, r.target, mapErrs[i])
+		ch, ferr := fetchChain(ctx, c, lv.ns, name, r.target, opaque && name != KeyringName, mapErrs[i])
 		if ferr != nil {
 			return nil, ferr
 		}
 		r.chain = ch
-		doc, err := ch.docAt(len(ch.entries) - 1)
-		if err != nil {
-			return nil, unverified("/r/%s/%s: %v", lv.ns, name, err)
-		}
-		if dm, ok := doc.(map[string]any); ok {
-			if s, ok := dm["$schema"].(string); ok {
-				if ref, ok := schema.ParseRef(s); ok {
-					queue = append(queue, ref)
+		if !ch.opaque {
+			doc, err := ch.docAt(len(ch.entries) - 1)
+			if err != nil {
+				return nil, unverified("/r/%s/%s: %v", lv.ns, name, err)
+			}
+			if dm, ok := doc.(map[string]any); ok {
+				if s, ok := dm["$schema"].(string); ok {
+					if ref, ok := schema.ParseRef(s); ok {
+						queue = append(queue, ref)
+					}
 				}
 			}
 		}
@@ -558,7 +668,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 				break // not a foreign parent: an ordinary create above
 			}
 			cur.from, cur.parent = k+1, q
-			q.chain = newChain(ch.entries[:k+1], ch.horizonDoc)
+			q.chain = ch.prefix(k)
 			m.levels[j].res = append(m.levels[j].res, q)
 			cur = q
 		}
@@ -577,7 +687,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		key := ref.NS + "/" + ref.Name
 		s := schemas[key]
 		if _, have := s.chainIndex(ref.Rev); !have {
-			ch, ferr := fetchChain(ctx, c, ref.NS, ref.Name, ref.Rev, fetchErr)
+			ch, ferr := fetchChain(ctx, c, ref.NS, ref.Name, ref.Rev, false, fetchErr)
 			if ferr != nil {
 				return nil, ferr
 			}
@@ -656,9 +766,6 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	if err := t.checkEncryption(nil, cfg, -1); err != nil {
 		return nil, nil, nil, err
 	}
-	if cfg.level >= levelSealed {
-		return nil, nil, nil, invalid("/encryption: remote branches cannot be sealed or e2e on this server (§G.5)")
-	}
 	return cfg, doc.(map[string]any), a, nil
 }
 
@@ -715,11 +822,15 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 // insertRemoteBranch inserts the shadow, the mirrored schemas and the
 // branch, all verified before the transaction opened.
 func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc map[string]any, m *remoteMirror, author int64) (*WriteResult, *Error) {
-	if cfg.Read == "public" && m.read != "public" {
-		return nil, invalid("a branch of a non-public namespace cannot be public")
+	// The obligations of §G.5, which the base can't enforce.
+	if cfg.Read == "public" && m.read != "public" && !sealedPair(cfg.level, m.level) {
+		return nil, invalid("a branch of a non-public namespace cannot be public (§G.5): make it private (read: grant) or sealed")
 	}
 	if cfg.level < m.level {
-		return nil, invalid("/encryption: a branch cannot have a lower encryption level than its base")
+		return nil, invalid(fmt.Sprintf("/encryption: a branch cannot have a lower encryption level than its base, which is %s (§G.5)", levelNames[m.level]))
+	}
+	if cfg.level == levelE2E && m.level != levelE2E {
+		return nil, invalid("/encryption: a branch can be e2e only if its base is")
 	}
 	// The shadows' mirrored rows follow the branch's level.
 	if t.shadowLevels == nil {
@@ -743,6 +854,8 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	t.must(err)
 	cseq, _ := r.LastInsertId()
 	bn := t.nsByID(bid)
+	// A sealed branch's first epoch key, an e2e branch's first epoch.
+	t.sealedConfigWritten(bn, nil, cfg)
 	// No entry is written to any other local chain: the base's is remote.
 	_, nsID := t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
 	_, err = t.Exec(`INSERT INTO remote_bases (shadow, branch, origin, ns, at, checkpoint) VALUES (?,?,?,?,?,?)`,
@@ -761,6 +874,10 @@ func (t *tx) insertShadows(branch string, m *remoteMirror) (*nsRow, int64) {
 	heads := map[*remoteRes]int64{}
 	for i := len(m.levels) - 1; i >= 0; i-- {
 		sh, at = t.insertShadow(shadowLevelName(branch, i), m.read, m.levels[i], sh, at, heads)
+		for _, x := range m.levels[i].epochs {
+			_, err := t.Exec(`INSERT OR IGNORE INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?)`, sh.id, x.e, x.created.UnixMilli())
+			t.must(err)
+		}
 	}
 	return sh, at
 }
@@ -783,6 +900,10 @@ func shadowLevelName(branch string, i int) string {
 func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseAt int64, heads map[*remoteRes]int64) (*nsRow, int64) {
 	remote := t.authorID(RemoteAuthor)
 	cdoc := map[string]any{"read": read}
+	if lv.enc != nil {
+		// An e2e level: its epochs, for the keyring relay (§E.3.2).
+		cdoc["encryption"] = lv.enc
+	}
 	genesis := []any{map[string]any{"op": "add", "path": "", "value": cdoc}}
 	gcanon := jsonv.Canonical(genesis)
 	cid := ids.Revision(nil, gcanon)
@@ -908,7 +1029,7 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 	var last, lastLive int64 = 0, 0
 	var lastLiveDoc []byte
 	var horizon any
-	if parent != nil {
+	if parent != nil && !ch.opaque {
 		ll := t.lastLive(parent)
 		lastLive = ll.seq
 	}
@@ -924,14 +1045,17 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		}
 		kind := kindRev
 		var patches, typed, sig any
-		canonDoc := jsonv.Canonical(doc)
+		var canonDoc []byte
+		if !ch.opaque {
+			canonDoc = jsonv.Canonical(doc)
+		}
 		switch {
 		case e.Kind == "tombstone":
 			kind = kindTombstone
 		case e.HasPatches:
 			patches = t.putPatches(res, id, jsonv.Canonical(e.Patches))
 		}
-		if kind == kindRev {
+		if kind == kindRev && !ch.opaque {
 			if dm, ok := doc.(map[string]any); ok {
 				if s, ok := dm["$schema"].(string); ok {
 					typed = s
@@ -955,6 +1079,9 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 			return nil
 		}
 		state = stateLive
+		if ch.opaque {
+			return nil // e2e content has no documents on the server (§E.3)
+		}
 		lastLive, lastLiveDoc = last, canonDoc
 		if patches == nil {
 			// The horizon: its document is kept as a snapshot (§8.6).
@@ -973,6 +1100,11 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 	}
 	_, err = t.Exec(`UPDATE resources SET head_seq = ?, state = ?, horizon_seq = COALESCE(?, horizon_seq) WHERE res = ?`, last, state, horizon, res)
 	t.must(err)
+	if ch.opaque {
+		_, err = t.Exec(`DELETE FROM heads WHERE res = ?`, res)
+		t.must(err)
+		return last
+	}
 	if lastLiveDoc == nil {
 		b, derr := t.docBytesAt(t.rev(lastLive))
 		t.must(derr)

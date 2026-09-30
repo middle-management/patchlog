@@ -716,16 +716,15 @@ func TestSealedBranch(t *testing.T) {
 	expect(t, e.get("/r/b/a/rev/"+a), 410)
 }
 
-// Remote branches of sealed namespaces are refused for now (§G.3, §G.5).
-func TestSealedRemoteRefused(t *testing.T) {
+// A sealed namespace accepts remote branch registrations: that the branch
+// is sealed too is B's obligation, which A can't check (§G.5; see
+// remote_enc_test.go).
+func TestSealedRemoteRegistration(t *testing.T) {
 	e := newSealedEnv(t)
-	doc := sealedDoc(map[string]any{"read": "grant", "base": map[string]any{"origin": "https://a.example", "ns": "main", "at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}})
-	r := e.do(req{method: "PATCH", path: "/ns/rb", ifNoneMatch: "*", body: addRoot(doc), author: "admin"})
-	expectCode(t, r, 422, "invalid")
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
-	r = e.do(req{method: "POST", path: "/ns/s/branches", ifNoneMatch: "*", author: "admin",
+	r := e.do(req{method: "POST", path: "/ns/s/branches", ifNoneMatch: "*", author: "admin",
 		body: map[string]any{"remote": map[string]any{"origin": "https://b.example", "ns": "x"}, "at": e.nsHead("s")}})
-	expectCode(t, r, 422, "invalid")
+	expect(t, r, 201)
 }
 
 // A prune drops the sealed copies of what it pruned; kept documents keep
