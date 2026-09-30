@@ -51,10 +51,74 @@ type WriteResult struct {
 	ConfigID string
 }
 
-// ItemResult lists the ids an item produced.
+// ItemResult lists the ids an item produced. In a dry-run report it also
+// carries the item's index and status, and a failed item's error body.
 type ItemResult struct {
-	Resource string   `json:"resource"`
-	IDs      []string `json:"ids"`
+	Resource string         `json:"resource"`
+	IDs      []string       `json:"ids,omitempty"`
+	Index    *int           `json:"index,omitempty"`
+	Status   int            `json:"status,omitempty"`
+	Err      map[string]any `json:"-"`
+}
+
+// Value is the item as a JSON value, a failed item's error body flattened
+// into it as in §7.5 failure reports.
+func (r ItemResult) Value() map[string]any {
+	m := map[string]any{"resource": r.Resource}
+	for k, v := range r.Err {
+		m[k] = v
+	}
+	if r.IDs != nil {
+		ids := make([]any, len(r.IDs))
+		for i, id := range r.IDs {
+			ids[i] = id
+		}
+		m["ids"] = ids
+	}
+	if r.Index != nil {
+		m["index"] = *r.Index
+	}
+	if r.Status != 0 {
+		m["status"] = r.Status
+	}
+	return m
+}
+
+// dropFailed records a dry run's failures and removes those items from
+// the later steps.
+func dropFailed(st []*itemState, fs []itemErr, fails map[int]*Error) []*itemState {
+	for _, f := range fs {
+		fails[f.index] = f.err
+	}
+	out := st[:0]
+	for _, s := range st {
+		if _, failed := fails[s.index]; !failed {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func dryRunReport(items []Item, passed []*itemState, fails map[int]*Error) []ItemResult {
+	byIndex := map[int]*itemState{}
+	for _, s := range passed {
+		byIndex[s.index] = s
+	}
+	out := make([]ItemResult, len(items))
+	for i, it := range items {
+		idx := i
+		r := ItemResult{Resource: it.Resource, Index: &idx}
+		if err, failed := fails[i]; failed {
+			r.Status, r.Err = err.Status, err.Body
+		} else if s := byIndex[i]; s != nil {
+			r.Status = 200
+			for _, step := range s.steps {
+				r.IDs = append(r.IDs, step.id.String())
+			}
+		}
+		out[i] = r
+	}
+	return out
 }
 
 type stepState struct {
@@ -218,6 +282,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	for i, it := range items {
 		st[i] = &itemState{Item: it, index: i}
 	}
+	dryFails := map[int]*Error{}
 	fail := func(fs []itemErr) error {
 		if !isBatch {
 			return fs[0].err
@@ -298,7 +363,10 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 	if len(fs) > 0 {
-		return nil, fail(fs)
+		if !dryRun {
+			return nil, fail(fs)
+		}
+		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
 	// Step 3: apply.
@@ -308,7 +376,10 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 	if len(fs) > 0 {
-		return nil, fail(fs)
+		if !dryRun {
+			return nil, fail(fs)
+		}
+		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
 	// Step 4: limits.
@@ -318,7 +389,10 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 	if len(fs) > 0 {
-		return nil, fail(fs)
+		if !dryRun {
+			return nil, fail(fs)
+		}
+		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
 	// Step 5: schema. Items may reference schema revisions created by
@@ -341,7 +415,10 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 	if len(fs) > 0 {
-		return nil, fail(fs)
+		if !dryRun {
+			return nil, fail(fs)
+		}
+		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
 	// Step 6: rules.
@@ -354,7 +431,10 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 	if len(fs) > 0 {
-		return nil, fail(fs)
+		if !dryRun {
+			return nil, fail(fs)
+		}
+		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
 	result := &WriteResult{Status: 201}
@@ -374,7 +454,10 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 	}
 	if dryRun {
+		// A dry run reports every item (§7.5): its ids, or the error of the
+		// step it failed at.
 		result.Status = 200
+		result.Items = dryRunReport(items, st, dryFails)
 		return result, nil
 	}
 

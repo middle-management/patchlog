@@ -159,8 +159,12 @@ func TestBatch(t *testing.T) {
 	if nsid == "" || r.H.Get("X-Namespace-Revision") != nsid || nsid != e.nsHead("m") {
 		t.Fatalf("batch ns id %s %v", r.Body, r.H)
 	}
-	if string(canonical(dry)) != string(canonical(r.Obj()["items"])) {
-		t.Fatalf("dry run ids %v differ from %v", dry, r.Obj()["items"])
+	// The dry-run report adds index and status; the ids are the submit's.
+	for i, it := range r.Obj()["items"].([]any) {
+		d := dry.([]any)[i].(map[string]any)
+		if d["index"] != float64(i) || d["status"] != 200.0 || string(canonical(d["ids"])) != string(canonical(it.(map[string]any)["ids"])) {
+			t.Fatalf("dry run %v differs from %v", d, it)
+		}
 	}
 	// Clients can compute the ids in advance.
 	d1 := hashID(t, derby, canonical(s1))
@@ -389,9 +393,22 @@ func TestBatchDryRunNewPrincipal(t *testing.T) {
 	if ids := r.Obj()["items"].([]any)[0].(map[string]any)["ids"].([]any); ids[0] != hashID(t, "", canonical(addRoot(map[string]any{}))) {
 		t.Fatalf("dry run ids %s", r.Body)
 	}
-	// Dry-run failures report every failing item.
+	// A dry run reports every item: failed ones with the status and code of
+	// the step they failed at, the rest with their ids (§7.5).
 	r = e.do(req{method: "POST", path: "/ns/m/batch?dry-run=1", author: "newcomer2", body: map[string]any{"items": []any{
-		map[string]any{"resource": "a", "ifMatch": hashID(t, "", nil), "steps": []any{[]any{}}}}}})
-	expectCode(t, r, 412, "batch")
+		map[string]any{"resource": "a", "ifMatch": hashID(t, "", nil), "steps": []any{[]any{}}},
+		map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{ops(op("add", "/x", 1))}},
+		map[string]any{"resource": "c", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}})
+	expect(t, r, 200)
+	rep := r.Obj()["items"].([]any)
+	if len(rep) != 3 {
+		t.Fatalf("report %s", r.Body)
+	}
+	a, b, c := rep[0].(map[string]any), rep[1].(map[string]any), rep[2].(map[string]any)
+	if a["index"] != 0.0 || a["status"] != 412.0 || a["code"] != "stale" || b["status"] != 422.0 || b["code"] != "invalid" ||
+		c["status"] != 200.0 || c["ids"].([]any)[0] != hashID(t, "", canonical(addRoot(map[string]any{}))) {
+		t.Fatalf("report %s", r.Body)
+	}
+	// Authorisation failures still answer as a submit would (§6.2).
 	expect(t, e.do(req{method: "POST", path: "/ns/m/batch", body: body, author: "newcomer"}), 201)
 }

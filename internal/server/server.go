@@ -722,7 +722,11 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 	if res.NSID != "" {
 		w.Header().Set("X-Namespace-Revision", res.NSID)
 	}
-	out := map[string]any{"items": res.Items}
+	report := make([]any, len(res.Items))
+	for i, it := range res.Items {
+		report[i] = it.Value()
+	}
+	out := map[string]any{"items": report}
 	if res.NSID != "" {
 		out["ns_id"] = res.NSID
 	}
