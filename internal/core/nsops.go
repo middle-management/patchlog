@@ -137,7 +137,7 @@ func freezeOnly(writes []string, doc any) bool {
 
 // validateConfig is step 5 for a config write.
 func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, a *actor) (*Config, *Error) {
-	cfg, err := parseConfig(newDoc, t.e.opt.Limits)
+	cfg, err := t.e.parseConfig(newDoc)
 	if err != nil {
 		var le *limitError
 		if errors.As(err, &le) {
@@ -301,7 +301,7 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if err != nil {
 		return nil, patchErr(err)
 	}
-	cfg, perr := parseConfig(doc, t.e.opt.Limits)
+	cfg, perr := t.e.parseConfig(doc)
 	if perr != nil {
 		return nil, invalid(perr.Error())
 	}
@@ -427,7 +427,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	for b := base; b.isBranch(); b = t.nsByID(b.base.Int64) {
 		depth++
 	}
-	if depth > t.e.opt.Limits.BranchDepth {
+	if depth > t.e.opt.Maximums.BranchDepth {
 		return nil, limitErr(422, "branch depth exceeded")
 	}
 	live := 0
@@ -440,7 +440,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		return nil, limitErr(422, "too many live branches")
 	}
 	// Step 5.
-	cfg, perr := parseConfig(nd, t.e.opt.Limits)
+	cfg, perr := t.e.parseConfig(nd)
 	if perr != nil {
 		return nil, invalid(perr.Error())
 	}

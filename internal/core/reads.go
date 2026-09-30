@@ -385,7 +385,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			return notFound()
 		}
 		out = &HeadsPage{Items: []map[string]any{}, Public: t.config(n.configSeq).Read == "public"}
-		limit := e.opt.Limits.LogPageSize
+		limit := e.opt.Maximums.LogPageSize
 		for _, h := range t.listHeads(n, &seq) {
 			if h.name <= after {
 				continue

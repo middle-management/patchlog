@@ -61,6 +61,8 @@ func serve(args []string) {
 	origin := fs.String("origin", "http://localhost:8080", "canonical origin (§G.1)")
 	dev := fs.Bool("dev", false, "disable authentication (development only); X-Author names the author")
 	pg := fs.Bool("playground", true, "serve the web playground at /playground/")
+	maxItems := fs.Int("max-items-per-batch", 0, "deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it (§6.6)")
+	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
 	fs.Parse(args)
@@ -80,7 +82,19 @@ func serve(args []string) {
 	if !*dev && len(keys) == 0 {
 		log.Print("warning: no -operator-key given; no namespace can be created")
 	}
-	e, err := core.Open(core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys})
+	max := core.DefaultLimits()
+	if *maxItems > 0 {
+		max.ItemsPerBatch = *maxItems
+	}
+	if *maxBatch != "" {
+		n, err := core.ParseSize(*maxBatch)
+		if err != nil {
+			log.Fatalf("-max-batch-size: %v", err)
+		}
+		max.BatchSize = n
+	}
+	e, err := core.Open(core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
+		Limits: core.DefaultLimits(), Maximums: max})
 	if err != nil {
 		log.Fatal(err)
 	}

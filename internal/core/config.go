@@ -3,6 +3,7 @@ package core
 import (
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -96,9 +97,31 @@ type Config struct {
 	Limits    Limits
 	Retention []any
 	MaxLag    *time.Duration // §C.4: how old a grant's `at` in this namespace may be
+	Allowances []Allowance
 	Frozen    bool
 	Successor string
 	Base      *BaseRef
+}
+
+// Allowance gives a named principal its own rate and batch limits (§6.6).
+// Zero fields mean the namespace's own limit.
+type Allowance struct {
+	Sub, Kid      string
+	Rate          Rate
+	ItemsPerBatch int
+	BatchSize     int
+}
+
+// allowance returns the allowance of a principal, or nil. With
+// authentication disabled there is no signing key, so only sub is matched.
+func (c *Config) allowance(sub, kid string, noKeys bool) *Allowance {
+	for i := range c.Allowances {
+		a := &c.Allowances[i]
+		if a.Sub == sub && (a.Kid == kid || noKeys) {
+			return a
+		}
+	}
+	return nil
 }
 
 // BaseRef is a branch's `+"`base`"+`.
@@ -116,12 +139,13 @@ func ValidResourceName(s string) bool { return resNameRe.MatchString(s) }
 
 // parseConfig validates a namespace document against the built-in
 // namespace-document schema and the deployment maximums.
-func parseConfig(doc any, max Limits) (*Config, error) {
+// defaults are the namespace defaults; max the deployment maximums.
+func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("the namespace document must be an object")
 	}
-	c := &Config{Doc: m, Read: "grant", Limits: max, Revoked: map[string]bool{}}
+	c := &Config{Doc: m, Read: "grant", Limits: defaults, Revoked: map[string]bool{}}
 	for k, v := range m {
 		switch k {
 		case "read":
@@ -177,6 +201,12 @@ func parseConfig(doc any, max Limits) (*Config, error) {
 			if err := parseLimits(v, &c.Limits, max); err != nil {
 				return nil, err
 			}
+		case "allowances":
+			as, err := parseAllowances(v, max)
+			if err != nil {
+				return nil, err
+			}
+			c.Allowances = as
 		case "maxLag":
 			str, ok := v.(string)
 			d, err := ParseDuration(str)
@@ -235,6 +265,10 @@ func parseLimits(v any, l *Limits, max Limits) error {
 	for k, x := range m {
 		if f, ok := limitFields[k]; ok {
 			n, ok := x.(float64)
+			if s, isStr := x.(string); isStr && sizeFields[k] {
+				b, err := ParseSize(s)
+				n, ok = float64(b), err == nil
+			}
 			if !ok || n < 0 || n != float64(int(n)) {
 				return fmt.Errorf("/limits/%s must be a non-negative integer", k)
 			}
@@ -272,6 +306,114 @@ func parseLimits(v any, l *Limits, max Limits) error {
 		return fmt.Errorf("/limits/%s is not a known limit", k)
 	}
 	return nil
+}
+
+// sizeFields are limits in bytes, which may also be written as "64 MiB".
+var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "grantSize": true, "batchSize": true}
+
+var sizeRe = regexp.MustCompile(`^(\d+)\s*(B|KiB|MiB|GiB)?$`)
+
+// ParseSize parses a byte size: an integer, optionally followed by B, KiB,
+// MiB or GiB.
+func ParseSize(s string) (int, error) {
+	m := sizeRe.FindStringSubmatch(strings.TrimSpace(s))
+	if m == nil {
+		return 0, fmt.Errorf("invalid size %q", s)
+	}
+	var n int
+	fmt.Sscan(m[1], &n)
+	switch m[2] {
+	case "KiB":
+		n <<= 10
+	case "MiB":
+		n <<= 20
+	case "GiB":
+		n <<= 30
+	}
+	return n, nil
+}
+
+func parseAllowances(v any, max Limits) ([]Allowance, error) {
+	arr, ok := v.([]any)
+	if !ok {
+		return nil, fmt.Errorf("/allowances must be an array")
+	}
+	var out []Allowance
+	seen := map[string]bool{}
+	for i, e := range arr {
+		m, ok := e.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("/allowances/%d must be an object", i)
+		}
+		a := Allowance{} // unset fields fall back to the namespace's limits
+		for k, x := range m {
+			switch k {
+			case "sub", "kid":
+				s, ok := x.(string)
+				if !ok || s == "" {
+					return nil, fmt.Errorf("/allowances/%d/%s must be a string", i, k)
+				}
+				if k == "sub" {
+					a.Sub = s
+				} else {
+					a.Kid = s
+				}
+			case "rate", "burst":
+				n, ok := x.(float64)
+				if !ok || n <= 0 {
+					return nil, fmt.Errorf("/allowances/%d/%s must be a positive number", i, k)
+				}
+				if k == "rate" {
+					a.Rate.Rate = n
+				} else {
+					a.Rate.Burst = n
+				}
+			case "itemsPerBatch":
+				n, ok := x.(float64)
+				if !ok || n < 1 || n != float64(int(n)) {
+					return nil, fmt.Errorf("/allowances/%d/itemsPerBatch must be a positive integer", i)
+				}
+				if int(n) > max.ItemsPerBatch {
+					return nil, &limitError{fmt.Sprintf("/allowances/%d/itemsPerBatch exceeds the deployment maximum %d", i, max.ItemsPerBatch)}
+				}
+				a.ItemsPerBatch = int(n)
+			case "batchSize":
+				var n int
+				switch y := x.(type) {
+				case float64:
+					n = int(y)
+					if y != float64(n) || n < 1 {
+						return nil, fmt.Errorf("/allowances/%d/batchSize must be a size", i)
+					}
+				case string:
+					var err error
+					if n, err = ParseSize(y); err != nil {
+						return nil, fmt.Errorf("/allowances/%d/batchSize: %v", i, err)
+					}
+				default:
+					return nil, fmt.Errorf("/allowances/%d/batchSize must be a size", i)
+				}
+				if n > max.BatchSize {
+					return nil, &limitError{fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize)}
+				}
+				a.BatchSize = n
+			default:
+				return nil, fmt.Errorf("/allowances/%d/%s is not a known field", i, k)
+			}
+		}
+		if a.Sub == "" || a.Kid == "" {
+			return nil, fmt.Errorf("/allowances/%d needs sub and kid", i)
+		}
+		if (a.Rate.Rate == 0) != (a.Rate.Burst == 0) || (a.Rate.Burst > 0 && a.Rate.Burst < 1) {
+			return nil, fmt.Errorf("/allowances/%d needs both rate and burst, burst at least 1", i)
+		}
+		if seen[a.Sub+"\x00"+a.Kid] {
+			return nil, fmt.Errorf("/allowances/%d duplicates an earlier sub and kid", i)
+		}
+		seen[a.Sub+"\x00"+a.Kid] = true
+		out = append(out, a)
+	}
+	return out, nil
 }
 
 type limitError struct{ msg string }

@@ -37,8 +37,11 @@ type Options struct {
 	// OperatorKeys may create namespaces (§C.4 bootstrapping). They act as
 	// keys with can ["*"] for namespace creation only.
 	OperatorKeys []grant.Key
-	// Limits are the deployment maximums (and defaults) of §6.6.
+	// Limits are the namespace defaults of §6.6.
 	Limits Limits
+	// Maximums are the deployment maximums; a namespace can set its limits
+	// up to them (and allowances too). Zero means equal to Limits.
+	Maximums Limits
 	// LongPollInterval is the interval of §7.7 (default 20s).
 	LongPollInterval time.Duration
 	// Now overrides the clock (tests).
@@ -71,6 +74,9 @@ type Engine struct {
 func Open(opt Options) (*Engine, error) {
 	if opt.Limits == (Limits{}) {
 		opt.Limits = DefaultLimits()
+	}
+	if opt.Maximums == (Limits{}) {
+		opt.Maximums = opt.Limits
 	}
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
@@ -105,8 +111,13 @@ func (e *Engine) Origin() string { return e.opt.Origin }
 // LongPollInterval is the §7.7 interval.
 func (e *Engine) LongPollInterval() time.Duration { return e.opt.LongPollInterval }
 
-// Limits are the deployment limits.
-func (e *Engine) Limits() Limits { return e.opt.Limits }
+// Limits are the deployment maximums, which bound request bodies.
+func (e *Engine) Limits() Limits { return e.opt.Maximums }
+
+// parseConfig parses a namespace document with this deployment's limits.
+func (e *Engine) parseConfig(doc any) (*Config, error) {
+	return parseConfig(doc, e.opt.Limits, e.opt.Maximums)
+}
 
 func (e *Engine) now() time.Time { return e.opt.Now().UTC() }
 
@@ -278,7 +289,7 @@ func (t *tx) config(seq int64) *Config {
 	}
 	var doc string
 	t.must(t.QueryRow(`SELECT doc FROM ns_config WHERE seq = ?`, seq).Scan(&doc))
-	c, err := parseConfig(jsonv.MustParse([]byte(doc)), t.e.opt.Limits)
+	c, err := t.e.parseConfig(jsonv.MustParse([]byte(doc)))
 	if err != nil {
 		panic(fmt.Errorf("stored namespace document %d is invalid: %w", seq, err))
 	}

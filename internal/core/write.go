@@ -163,20 +163,6 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	cur := t.config(n.configSeq)
 	lim := cur.Limits
 	if isBatch {
-		if len(items) > lim.ItemsPerBatch {
-			return nil, limitErr(413, fmt.Sprintf("more than %d items", lim.ItemsPerBatch))
-		}
-		size := 0
-		for _, it := range items {
-			for _, s := range it.Steps {
-				if !s.Delete {
-					size += len(jsonv.Canonical(s.Patches))
-				}
-			}
-		}
-		if size > lim.BatchSize {
-			return nil, limitErr(413, "batch too large")
-		}
 		seen := map[string]bool{}
 		for i, it := range items {
 			if !ValidResourceName(it.Resource) {
@@ -198,6 +184,33 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)
 	if aerr != nil {
 		return nil, aerr
+	}
+	if isBatch {
+		// The batch limits come from the current configuration, raised by
+		// the principal's allowance if it has one (§6.6).
+		maxItems, maxSize := lim.ItemsPerBatch, lim.BatchSize
+		if al := t.allowanceOf(cur, a); al != nil {
+			if al.ItemsPerBatch > 0 {
+				maxItems = al.ItemsPerBatch
+			}
+			if al.BatchSize > 0 {
+				maxSize = al.BatchSize
+			}
+		}
+		if len(items) > maxItems {
+			return nil, limitErr(413, fmt.Sprintf("more than %d items", maxItems))
+		}
+		size := 0
+		for _, it := range items {
+			for _, s := range it.Steps {
+				if !s.Delete {
+					size += len(jsonv.Canonical(s.Patches))
+				}
+			}
+		}
+		if size > maxSize {
+			return nil, limitErr(413, "batch too large")
+		}
 	}
 
 	// The optional config change runs steps 1–6 first (§7.5).

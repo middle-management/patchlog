@@ -54,7 +54,7 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 	if cred.Bearer == "" {
 		return nil, apiErr(401, "unauthenticated", "message", "missing grant")
 	}
-	g, err := grant.Decode(cred.Bearer, t.e.opt.Limits.GrantSize)
+	g, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
 	if errors.Is(err, grant.ErrTooLarge) {
 		return nil, limitErr(413, "grant too large")
 	}
@@ -85,7 +85,7 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 	if err != nil {
 		return nil, authErr(err)
 	}
-	if len(v.BlockRules)+len(v.KeyRules) > t.e.opt.Limits.RulesPerGrant {
+	if len(v.BlockRules)+len(v.KeyRules) > t.e.opt.Maximums.RulesPerGrant {
 		return nil, limitErr(422, "too many rules in the grant chain")
 	}
 	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate}
@@ -463,13 +463,19 @@ func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, string
 // per-resource bucket, and items from the principal and namespace buckets.
 func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, items int) *Error {
 	l := cfg.Limits
-	pr := l.RatePerPrincipal
-	if a.keyRate != nil && a.keyRate.Rate < pr.Rate {
-		pr = Rate{a.keyRate.Rate, math.Min(a.keyRate.Burst, pr.Burst)}
-	}
-	draws := []draw{
-		{"p\x00" + a.bucketKey, pr, float64(items), "ratePerPrincipal"},
-		{"n\x00" + n.name, l.RatePerNamespace, float64(items), "ratePerNamespace"},
+	var draws []draw
+	if al := t.allowanceOf(cfg, a); al != nil && al.Rate.Rate > 0 {
+		// An allowance's own bucket replaces the principal and namespace
+		// buckets; per-resource buckets still apply (§6.6).
+		draws = append(draws, draw{"a\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.Rate, float64(items), "allowance"})
+	} else {
+		pr := l.RatePerPrincipal
+		if a.keyRate != nil && a.keyRate.Rate < pr.Rate {
+			pr = Rate{a.keyRate.Rate, math.Min(a.keyRate.Burst, pr.Burst)}
+		}
+		draws = append(draws,
+			draw{"p\x00" + a.bucketKey, pr, float64(items), "ratePerPrincipal"},
+			draw{"n\x00" + n.name, l.RatePerNamespace, float64(items), "ratePerNamespace"})
 	}
 	for _, r := range resources {
 		draws = append(draws, draw{"r\x00" + n.name + "\x00" + r + "\x00" + a.bucketKey, l.RatePerResource, 1, "ratePerResource"})
@@ -487,8 +493,17 @@ func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, item
 	return nil
 }
 
+// allowanceOf returns the actor's allowance in a configuration, if any.
+func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
+	kid := ""
+	if a.verified != nil {
+		kid = a.verified.Key.Kid
+	}
+	return cfg.allowance(a.principal.ID, kid, a.verified == nil)
+}
+
 // guardedPaths need a grant chained to a * key (§7.4).
-var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/retention", "/encryption"}
+var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/retention", "/encryption"}
 
 func touchesGuarded(writes []string) bool {
 	for _, w := range writes {

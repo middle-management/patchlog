@@ -16,8 +16,8 @@ type authFixture struct {
 	adminG, issuerG    string
 }
 
-func newAuthFixture(t *testing.T, extra map[string]any) *authFixture {
-	e := newAuthEnv(t)
+func newAuthFixture(t *testing.T, extra map[string]any, opts ...envOpt) *authFixture {
+	e := newAuthEnv(t, opts...)
 	f := &authFixture{tenv: e, admin: newKey("admin"), issuer: newKey("issuer"), svc: newKey("svc")}
 	svcEntry := f.svc.entry("read", "append")
 	svcEntry["sub"] = "svc:.*"
