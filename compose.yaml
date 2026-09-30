@@ -1,12 +1,23 @@
 # The whole stack in development mode (no authentication; X-Author names
 # the author). Start it with `docker compose up --build` or `make up`.
 #
-#   http://localhost:8080             core API
+# Everything is served through a local CDN (Varnish, deploy/varnish), which
+# caches by the origins' Cache-Control / CDN-Cache-Control and is purged by
+# cache tag (§9). Reads and writes both go through it:
+#
+#   http://localhost:8080             core API (through the CDN)
 #   http://localhost:8080/playground/ web playground
 #   http://localhost:8081             search index (Addendum A), e.g. /demo?q=derby
 #   http://localhost:8082             tree service (Addendum B), e.g. /cat/roots
 #                                     (the playground reads it through the core's
 #                                     read-only proxy at /playground/tree/, -tree-url)
+#
+# The origins, bypassing the CDN (debugging):
+#
+#   http://localhost:9080 core · http://localhost:9081 search · http://localhost:9082 tree
+#
+# `make cdn-check` shows caching and purging at work; send `X-Cache-Debug: 1`
+# to see a response's cache tags and edge TTL.
 #
 # Data (databases, archives, the at-rest master key) lives in the `data`
 # volume; `docker compose down -v` wipes it.
@@ -25,6 +36,7 @@ services:
       - serve
       - -dev
       - -addr=:8080
+      # URLs the core generates point at the CDN.
       - -origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
       - -db=/data/patchlog.db
       - -archive=file:///data/archive
@@ -35,8 +47,12 @@ services:
       # starts after the core (it waits for the seed), so the proxy answers
       # 502 until it is up.
       - -tree-url=http://tree:8082
+      # Cache-tag purges (tombstone purges, namespace purges, …). The CDN
+      # starts last; purges sent before it is up are logged and dropped,
+      # which is harmless: nothing is cached yet.
+      - -purge-url=http://cdn:8080/
     ports:
-      - "${PATCHLOG_PORT:-8080}:8080"
+      - "${CORE_DIRECT_PORT:-9080}:8080"
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/"]
       interval: 2s
@@ -44,7 +60,7 @@ services:
       retries: 30
 
   # One-shot: creates the demo namespaces (among them a catalog, a sealed and an
-  # e2e one), schemas and a few documents.
+  # e2e one), schemas and a few documents. Talks to the core directly.
   seed:
     image: curlimages/curl:8.16.0
     entrypoint: ["sh", "/deploy/seed.sh"]
@@ -55,20 +71,21 @@ services:
       patchlog:
         condition: service_healthy
 
+  # The services follow the core directly, not through the CDN.
   index:
     <<: *patchlog
-    command: [index, -api=http://patchlog:8080, -ns=demo, -db=/data/index.db, -addr=:8081]
+    command: [index, -api=http://patchlog:8080, -ns=demo, -db=/data/index.db, -addr=:8081, -purge-url=http://cdn:8080/]
     ports:
-      - "${INDEX_PORT:-8081}:8081"
+      - "${INDEX_DIRECT_PORT:-9081}:8081"
     depends_on:
       seed:
         condition: service_completed_successfully
 
   tree:
     <<: *patchlog
-    command: [tree, -api=http://patchlog:8080, -catalog=cat, -db=/data/tree.db, -addr=:8082]
+    command: [tree, -api=http://patchlog:8080, -catalog=cat, -db=/data/tree.db, -addr=:8082, -purge-url=http://cdn:8080/]
     ports:
-      - "${TREE_PORT:-8082}:8082"
+      - "${TREE_DIRECT_PORT:-9082}:8082"
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -79,6 +96,44 @@ services:
     depends_on:
       seed:
         condition: service_completed_successfully
+
+  # The local CDN: one varnishd with a listener per origin (the VCL picks
+  # the backend by listener name). It resolves the origins' host names when
+  # it loads the VCL, so it starts after their containers exist; if one is
+  # recreated with a new address, `docker compose restart cdn`.
+  cdn:
+    image: ${VARNISH_IMAGE:-varnish:7.7}
+    restart: unless-stopped
+    entrypoint: ["varnishd"]
+    command:
+      - -F
+      - -f
+      - /etc/varnish/default.vcl
+      - -n
+      - /var/lib/varnish/varnishd
+      - -a
+      - core=:8080
+      - -a
+      - search=:8081
+      - -a
+      - tree=:8082
+      - -s
+      - malloc,256m
+    volumes:
+      - ./deploy/varnish:/etc/varnish:ro
+    tmpfs:
+      - /var/lib/varnish/varnishd:exec
+    ports:
+      - "${PATCHLOG_PORT:-8080}:8080"
+      - "${INDEX_PORT:-8081}:8081"
+      - "${TREE_PORT:-8082}:8082"
+    depends_on:
+      patchlog:
+        condition: service_healthy
+      index:
+        condition: service_started
+      tree:
+        condition: service_started
 
 volumes:
   data:

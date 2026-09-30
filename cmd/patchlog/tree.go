@@ -24,7 +24,7 @@ import (
 //
 //	patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME]
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]]
-//	              [-enc-key B64URL | -enc-key-file PATH]
+//	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]...
 //
 // The service follows the catalog namespace and every namespace in its
 // catalog.trust. -bearer is its own grant, which needs read on all of them.
@@ -34,8 +34,8 @@ import (
 // Listings live at /{catalog}/at/{at}/… where at is the combined checkpoint
 // over the catalog and every followed content namespace (§B.5); they are
 // immutable and tagged r:{ns}/{name} and ns:{ns}. Read-your-writes:
-// ?min={ns}:{ns_id}, repeatable. Cache purges are logged (no CDN purger is
-// wired in here).
+// ?min={ns}:{ns_id}, repeatable. Cache purges go to the CDN at -purge-url
+// (repeatable), and are logged if it is unset.
 //
 // Encrypted namespaces (Addendum E) work as for patchlog index: -enc-key is
 // the service's X25519 private key; listings of a sealed or e2e catalog are
@@ -59,6 +59,8 @@ func treeCmd(args []string) {
 	sse := fs.Bool("sse", false, "follow by server-sent events instead of long-poll")
 	encKey := fs.String("enc-key", "", "the service's X25519 private key (base64url), for sealed and e2e namespaces (Addendum E)")
 	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
+	var purgeURLs multi
+	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	fs.Parse(args)
 
 	if *cat == "" {
@@ -80,6 +82,10 @@ func treeCmd(args []string) {
 	topt := tree.Options{Client: c, Catalog: *cat, DB: *db, Rebuild: *rebuild, SelfPlacing: *selfPlacing, MinWait: *minWait, Recipient: recipient}
 	if *sse {
 		topt.FollowOptions = append(topt.FollowOptions, follow.WithSSE())
+	}
+	purger := cdnPurger(purgeURLs)
+	if purger != nil {
+		topt.Purger = purger
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -121,6 +127,7 @@ func treeCmd(args []string) {
 		log.Printf("%v; retrying", err)
 		time.Sleep(time.Second)
 	}
+	defer closePurger(purger) // after closer: its last purges are sent
 	defer closer()
 
 	srv := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}

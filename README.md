@@ -21,7 +21,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
-| Cache-Control classes and cache tags | §9 | ✅ (CDN purges go to a pluggable `Purger`, default: log) |
+| Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
 | Bundles: history and snapshot export and import, sealed bundles, access levels, e2e ciphertext | §G.4, §G.5.1 | ✅ (`patchlog export/import`) |
@@ -50,7 +50,8 @@ and serves immutable, CDN-cacheable revisions.
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
 - CDN edge grants (§C.5): the origin checks grants itself on every read and sets
-  `Cache-Control: private` plus `CDN-Cache-Control` for non-public namespaces.
+  `Cache-Control: private` plus `CDN-Cache-Control` for non-public namespaces. The local
+  CDN therefore doesn't cache those (see [The local CDN](#the-local-cdn-9)).
 - Author signatures (§C.3): a `Signature` header is stored with the revision and returned
   in the log, but not verified.
 
@@ -61,7 +62,8 @@ make up        # or: docker compose up --build -d
 ```
 
 This starts the core server in dev mode, seeds a few demo namespaces and documents, and runs the
-search index, the tree service and the branch janitor:
+search index, the tree service and the branch janitor, all behind a local CDN (Varnish, see
+[The local CDN](#the-local-cdn-9)):
 
 | URL | What |
 |---|---|
@@ -70,6 +72,7 @@ search index, the tree service and the branch janitor:
 | http://localhost:8081/demo?q=derby | search index (Addendum A) |
 | http://localhost:8082/cat/roots | tree service (Addendum B) |
 | http://localhost:8080/playground/tree/cat/roots | the same, through the core's read-only proxy (`-tree-url`) |
+| http://localhost:9080, :9081, :9082 | the core, search and tree origins directly, bypassing the CDN |
 
 The seed creates `schemas`, `demo` (a few matches, with catalog roles), `cat` (a catalog of
 `demo`: folders, placements, `$access`, one dangling placement), `private` (sealed, E2) and
@@ -80,10 +83,91 @@ The seed creates `schemas`, `demo` (a few matches, with catalog roles), `cat` (a
 - `make down` stops the stack and keeps its data; `docker compose down -v` wipes it.
 - Data lives in the `data` volume: databases, pruning archives, and the at-rest master key,
   which is created on first start.
-- Ports and the origin can be changed with `PATCHLOG_PORT`, `INDEX_PORT`, `TREE_PORT` and
+- Ports and the origin can be changed with `PATCHLOG_PORT`, `INDEX_PORT`, `TREE_PORT` (the
+  CDN's), `CORE_DIRECT_PORT`, `INDEX_DIRECT_PORT`, `TREE_DIRECT_PORT` (the origins') and
   `PATCHLOG_ORIGIN`.
 - Without Docker, `make dev` runs just the core server, and `make check` runs vet, the tests and
   a gofmt check.
+
+### The local CDN (§9)
+
+The design is CDN-first, so the stack runs one: Varnish (`cdn` in compose.yaml, configured by
+[deploy/varnish/default.vcl](deploy/varnish/default.vcl)). One `varnishd` listens on 8080, 8081
+and 8082 and picks the core, search or tree origin by listener. Reads and writes both go
+through it; writes are passed. `make cdn-check` shows it working against the running stack:
+an immutable revision MISS then HIT, a head pointer micro-cached across an append, five
+long-poll followers collapsed onto one origin request, and a resource purge evicting its
+cached revision.
+
+**What is cached, and for how long.** Whatever the origin allows, for as long as it allows:
+
+- The edge lifetime comes from `CDN-Cache-Control` (RFC 9213) when the origin sends it, else from
+  `Cache-Control` (`s-maxage`, then `max-age`). `no-store`, `no-cache`, `ttl 0`, error statuses and
+  responses without any `Cache-Control` aren't cached. `Vary` is honoured.
+- So, per §9: immutable revisions, logs, search results and tree listings for a year; head
+  pointers (`302`) for 1 s; unknown-id `404`s for 5 s; long-poll answers for their interval
+  (`200`) or 2 s (`204`).
+- Grace, the time a stale copy is served while it is refetched (or while the origin is down), is
+  the response's `stale-while-revalidate` and nothing else: 5 s for head pointers, none for the
+  rest. §9 grants no `stale-if-error`, and a stale long-poll answer would end a wait early.
+- Identical concurrent misses wait for one origin request (Varnish's waiting list): this is what
+  collapses long-poll followers (§7.7). Event streams (`…/events`) are passed and streamed.
+  Backend timeouts are 75 s, above the long-poll interval (20 s) and the SSE keep-alive (30 s).
+
+**Headers.** Clients get `Cache-Control` exactly as the origin sent it (so browsers keep
+immutable content a day, not a year), plus `X-Cache: HIT | MISS | PASS` and `Age`.
+`CDN-Cache-Control`, `Cache-Tag` and `Surrogate-Key` are stripped. With the request header
+`X-Cache-Debug: 1` they are kept, and `X-Cache-TTL`, `X-Cache-Grace`, `X-Cache-Hits` and (for
+uncached responses) `X-Cache-Reason` are added:
+
+```sh
+curl -sI -H 'X-Cache-Debug: 1' http://localhost:8080/r/demo/derby -L | grep -i -E '^(x-cache|cache-tag|age)'
+```
+
+**Purging.** `patchlog serve`, `index` and `tree` take `-purge-url URL` (repeatable; compose
+passes `http://cdn:8080/`). Without it purges are only logged, as before. With it, each tag purge
+(resource purge `r:{ns}/{name}`, namespace purge `ns:{ns}`, the services' `idx:{ns}` and listing
+tags) becomes
+
+```
+PURGE / HTTP/1.1
+X-Purge-Tags: r:demo/derby ns:demo
+```
+
+sent asynchronously by [internal/cdnpurge](internal/cdnpurge): tags are queued (bounded),
+coalesced, batched (64 tags or 2 KiB per request), retried with backoff and flushed on shutdown
+for up to 5 s. The write path never waits for the CDN; a purge the CDN never takes is logged.
+The VCL accepts `PURGE` or `BAN` from loopback and private (Docker) addresses only. That
+includes the host through the published port, and machines on a private LAN, since compose
+publishes on all interfaces: fine for development, not for exposure. It bans every object whose `Cache-Tag` lists any
+of the tags as a whole token (`ns:dem` doesn't purge `ns:demo`; tags are matched literally).
+By hand:
+
+```sh
+curl -X PURGE -H 'X-Purge-Tags: r:demo/derby' http://localhost:8080/
+```
+
+**Bypassing it.** The origins answer directly on 9080 (core), 9081 (search) and 9082 (tree).
+`make cdn-restart` restarts Varnish, which reloads the VCL and empties the cache.
+
+**Limitations.**
+
+- **No edge grants (§C.5).** A real deployment's edge verifies an edge grant on every request to
+  a non-public namespace and serves the cached copy to anyone who holds one. This CDN verifies
+  nothing, so it doesn't cache responses marked `Cache-Control: private` at all (they pass, with
+  `X-Cache: PASS`), whatever `CDN-Cache-Control` says; the only exception is a response that also
+  says `Vary: Authorization`, which is cached per credential. Private namespaces therefore work
+  through the CDN but get no caching and no long-poll collapsing, and the origin doesn't require
+  proof that a request came through the edge. Public and sealed (E2) namespaces are cached
+  fully: a public namespace answers a request carrying a grant exactly as one without (§7), so
+  such requests are looked up in the cache too.
+- Head pointers can lag a write by up to 6 s (1 s TTL plus 5 s of stale-while-revalidate), as §9
+  intends; clients that need their own write read the revision from `Location` or pass
+  `?min=` to the services.
+- Varnish resolves the origins' host names when it loads the VCL. If an origin container is
+  recreated with a new address, restart the CDN.
+- Purges are best effort: if Varnish is down longer than the retries last, the tags are
+  dropped (and logged), and copies stay cached until their TTL.
 
 ## Running
 
@@ -718,6 +802,8 @@ internal/schema     $schema resolution and JSON Schema validation
 internal/grant      grants, keys, roles and verification (Addendum C)
 internal/core       storage and semantics (gate, batches, branches, purge, prune)
 internal/server     HTTP API
+internal/cdnpurge   HTTP cache-tag purges to a CDN (-purge-url)
+deploy/varnish      the compose stack's local CDN (Varnish VCL)
 ```
 
 `go test ./...` runs the unit and HTTP integration tests.
