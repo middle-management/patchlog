@@ -2,11 +2,13 @@ package core
 
 import (
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/rules"
 )
@@ -124,10 +126,43 @@ func (c *Config) allowance(sub, kid string, noKeys bool) *Allowance {
 	return nil
 }
 
-// BaseRef is a branch's `+"`base`"+`.
+// BaseRef is a branch's `+"`base`"+`. Origin is set for a remote branch,
+// whose base lives in another deployment (§7.6, §G.3).
 type BaseRef struct {
-	NS string
-	At string
+	Origin string
+	NS     string
+	At     string
+}
+
+// Remote reports whether the base is in another deployment.
+func (b *BaseRef) Remote() bool { return b != nil && b.Origin != "" }
+
+// ValidRemoteOrigin reports whether s is an origin another deployment may
+// have, in the RFC 6454 ASCII serialisation of §C.3 (scheme://host[:port],
+// lowercase, default port omitted). It must be https, except that plain
+// http is accepted for loopback hosts, so two local deployments can try
+// remote branches.
+func ValidRemoteOrigin(s string) bool {
+	u, err := url.Parse(s)
+	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" || u.Path != "" {
+		return false
+	}
+	switch u.Scheme {
+	case "https":
+		if u.Port() == "443" {
+			return false
+		}
+	case "http":
+		if h := u.Hostname(); h != "localhost" && h != "127.0.0.1" && h != "::1" || u.Port() == "80" {
+			return false
+		}
+	default:
+		return false
+	}
+	if strings.ToLower(u.Host) != u.Host || strings.HasSuffix(u.Host, ":") {
+		return false
+	}
+	return s == u.Scheme+"://"+u.Host
 }
 
 var nsNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
@@ -236,11 +271,20 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			b, ok := v.(map[string]any)
 			ns, _ := b["ns"].(string)
 			at, _ := b["at"].(string)
-			if !ok || ns == "" || at == "" || len(b) != 2 {
-				if _, remote := b["origin"]; remote {
-					return nil, fmt.Errorf("/base: remote branches (Addendum G) are not supported")
+			if _, remote := b["origin"]; ok && remote {
+				// A remote branch (§7.6, §G.3): { origin, ns, at }.
+				origin, _ := b["origin"].(string)
+				if len(b) != 3 || !ValidRemoteOrigin(origin) || !ValidNSName(ns) {
+					return nil, fmt.Errorf("/base must be { origin, ns, at } with an https origin")
 				}
-				return nil, fmt.Errorf("/base must be { ns, at }")
+				if _, err := ids.Parse(at); err != nil {
+					return nil, fmt.Errorf("/base/at must be an ns_id")
+				}
+				c.Base = &BaseRef{Origin: origin, NS: ns, At: at}
+				continue
+			}
+			if !ok || ns == "" || at == "" || len(b) != 2 {
+				return nil, fmt.Errorf("/base must be { ns, at } or { origin, ns, at }")
 			}
 			c.Base = &BaseRef{NS: ns, At: at}
 		case "encryption":
@@ -289,6 +333,18 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return &limitError{fmt.Sprintf("/limits/%s exceeds the deployment maximum", k)}
 			}
 			*f(l) = Rate{r, b}
+			continue
+		}
+		if k == "remoteBranchLife" {
+			s, ok := x.(string)
+			d, err := ParseDuration(s)
+			if !ok || err != nil || d <= 0 {
+				return fmt.Errorf("/limits/remoteBranchLife must be a positive ISO 8601 duration")
+			}
+			if d > max.RemoteBranchLife {
+				return &limitError{"/limits/remoteBranchLife exceeds the deployment maximum"}
+			}
+			l.RemoteBranchLife = d
 			continue
 		}
 		if k == "retryWindow" {

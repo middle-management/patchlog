@@ -157,7 +157,9 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		return nil, invalid("/base cannot change")
 	}
 	if n.isBranch() {
-		for b := n; b.isBranch(); {
+		// A remote base's keys don't reach across (§7.6): the loop stops
+		// at the shadow, which has none.
+		for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
 			b = t.nsByID(b.base.Int64)
 			for kid, k := range t.config(b.configSeq).starKeys() {
 				nk, ok := findKey(cfg.Keys, kid)
@@ -173,7 +175,7 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 	}
 	if cfg.Successor != "" {
 		s := t.nsByName(cfg.Successor)
-		if s == nil || s.base != n.base {
+		if s == nil || s.isShadow() || t.baseIdentity(s) != t.baseIdentity(n) {
 			return nil, invalid("successor must be an existing namespace with the same base")
 		}
 	}
@@ -221,9 +223,24 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 }
 
 // WriteConfig creates a namespace (IfNoneMatch) or changes its document.
+// A genesis whose base is in another deployment creates a remote branch
+// (§G.3), fetching and verifying the base before the write transaction.
 func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) (*WriteResult, error) {
+	if cc.IfNoneMatch && remoteBaseIn(cc.Patches) {
+		return e.createRemoteBranch(ctx, req, cc)
+	}
 	var res *WriteResult
 	err := e.update(ctx, func(t *tx) error {
+		r, err := t.writeConfig(req, cc)
+		res = r
+		return err
+	})
+	return res, err
+}
+
+func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
+	var res *WriteResult
+	err := func() error {
 		n := t.nsByName(req.NS)
 		if cc.IfNoneMatch && n == nil {
 			r, err := t.createNamespace(req, cc)
@@ -262,7 +279,7 @@ func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) 
 		_, nsID := t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, author)
 		res = &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: p.id.String()}
 		return nil
-	})
+	}()
 	return res, err
 }
 
@@ -319,10 +336,16 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if cfg.Successor != "" {
 		return nil, invalid("a new namespace cannot have a successor")
 	}
-	canon := jsonv.Canonical(cc.Patches)
+	_, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.authorID(a.id()))
+	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: id.String()}, nil
+}
+
+// insertNamespace inserts a new non-branch namespace with its config genesis
+// and first config entry.
+func (t *tx) insertNamespace(name string, patches, doc any, frozen bool, author int64) (*nsRow, ids.ID, ids.ID) {
+	canon := jsonv.Canonical(patches)
 	id := ids.Revision(nil, canon)
-	author := t.authorID(a.id())
-	r, dberr := t.Exec(`INSERT INTO namespaces (name, frozen) VALUES (?, ?)`, req.NS, cfg.Frozen)
+	r, dberr := t.Exec(`INSERT INTO namespaces (name, frozen) VALUES (?, ?)`, name, frozen)
 	t.must(dberr)
 	nsid, _ := r.LastInsertId()
 	r, dberr = t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?)`,
@@ -331,7 +354,7 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	cseq, _ := r.LastInsertId()
 	n := t.nsByID(nsid)
 	_, nsID := t.appendNS(n, map[string]any{"kind": "config", "target": id.String()}, nil, &cseq, cseq, author)
-	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: id.String()}, nil
+	return n, id, nsID
 }
 
 // BranchRequest is POST /ns/{base}/branches (§7.6).
@@ -603,6 +626,10 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 		t.tags = append(t.tags, "r:"+n.name+"/"+name)
 		t.flushDocs = true
 	}
+	// A remote branch's mirrored copy is its own: it goes too (§G.3).
+	if sh := t.remoteShadow(n); sh != nil {
+		t.purgeShadow(sh, name)
+	}
 	return nsID
 }
 
@@ -667,6 +694,11 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		t.must(err)
 		_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
 		t.must(err)
+		// A remote branch's mirrored copy of its base goes too; nothing
+		// reaches the base (§G.3).
+		if sh := t.remoteShadow(n); sh != nil {
+			t.purgeShadowNS(sh)
+		}
 		_, nsID := t.appendNS(n, map[string]any{"kind": "purge-ns"}, nil, nil, n.configSeq, t.authorID(a.id()))
 		out = nsID.String()
 		t.tags = append(t.tags, "ns:"+n.name)
@@ -683,7 +715,9 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 func (t *tx) referencedPaths(exclude func(ns *nsRow, res string) bool) map[string]bool {
 	out := map[string]bool{}
 	var queue []string
-	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0`)
+	// Shadows (§G.3) are read only through their remote branch, whose
+	// heads include what it reads through.
+	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
 	t.must(err)
 	var all []*nsRow
 	for rows.Next() {
@@ -825,7 +859,8 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 }
 
 // protect moves a horizon down past the protected revisions of §8.6: the
-// retry window and the heads as of every live branch's at.
+// retry window and the heads as of the at of every live local branch and
+// every unexpired remote branch registration.
 func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	var minSeq sql.NullInt64
 	cutoff := t.now.Add(-cfg.Limits.RetryWindow).UnixMilli()
@@ -833,9 +868,15 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	if minSeq.Valid && minSeq.Int64 < h.seq {
 		h = t.rev(minSeq.Int64)
 	}
+	var ats []int64
 	for _, b := range t.allBranchesOf(n) {
+		ats = append(ats, b.baseAt.Int64)
+	}
+	// Remote branches whose registration hasn't expired (§G.3).
+	ats = append(ats, t.registeredAts(n)...)
+	for _, at := range ats {
 		var p int64
-		if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, res, b.baseAt.Int64).Scan(&p); err == nil && p < h.seq {
+		if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, res, at).Scan(&p); err == nil && p < h.seq {
 			h = t.rev(p)
 		}
 	}

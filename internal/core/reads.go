@@ -438,6 +438,8 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 			}
 			out = append(out, m)
 		}
+		// Remote branches whose registration hasn't expired (§G.3).
+		out = append(out, t.liveRegistrations(n)...)
 		return nil
 	})
 	return out, public, err

@@ -114,6 +114,46 @@ CREATE TABLE IF NOT EXISTS ns_config (
   UNIQUE (ns, parent_seq)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_config_genesis ON ns_config (ns) WHERE parent_seq IS NULL;
+
+-- Addition: remote branches registered with this deployment (§G.3, source
+-- side). One row per (base namespace, remote); ns_seq is the latest remote
+-- branch entry, prev_seq the one before it (idempotent retries).
+CREATE TABLE IF NOT EXISTS remote_branches (
+  ns         INTEGER NOT NULL REFERENCES namespaces,
+  origin     TEXT    NOT NULL,
+  name       TEXT    NOT NULL,
+  at_seq     INTEGER NOT NULL,               -- ns_log.seq of at in ns
+  ns_seq     INTEGER NOT NULL,               -- latest registration entry
+  prev_seq   INTEGER,                        -- the registration entry before it
+  expires    INTEGER NOT NULL,               -- unix ms
+  PRIMARY KEY (ns, origin, name)
+) WITHOUT ROWID;
+
+-- Addition: remote branches of this deployment (§G.3, branch side). Each has
+-- a hidden shadow namespace (named "~" + the branch's name, outside the
+-- §3.6 grammar) holding the base's verified log and revisions up to at.
+CREATE TABLE IF NOT EXISTS remote_bases (
+  shadow      INTEGER PRIMARY KEY REFERENCES namespaces,
+  branch      INTEGER NOT NULL UNIQUE REFERENCES namespaces,
+  origin      TEXT    NOT NULL,
+  ns          TEXT    NOT NULL,
+  at          TEXT    NOT NULL,
+  checkpoint  TEXT    NOT NULL,               -- last verified entry of the base's log followed
+  reg_ns_id   TEXT,                           -- latest registration entry at the base, if registered
+  reg_expires INTEGER                         -- its expiry (unix ms)
+);
+
+-- Addition: purges seen in a remote base's log (§G.3), applied or not.
+CREATE TABLE IF NOT EXISTS remote_notices (
+  seq       INTEGER PRIMARY KEY,
+  branch    INTEGER NOT NULL REFERENCES namespaces,
+  id        TEXT    NOT NULL,                 -- the base's ns_id of the entry
+  kind      TEXT    NOT NULL,                 -- purge or purge-ns
+  resource  TEXT,
+  applied   INTEGER NOT NULL,
+  created   INTEGER NOT NULL,
+  UNIQUE (branch, id)
+);
 `
 
 func openDB(path string) (*sql.DB, error) {

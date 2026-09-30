@@ -133,8 +133,11 @@ func validateAttrs(schema any, attrs map[string]any) error {
 // effectiveKeys applies "keys follow the base" (§C.4): a key a branch shares
 // with a base is accepted only while the base's current configuration still
 // has it with the same pub.
+//
+// Keys don't follow a base in another deployment (§7.6, §G.3): a remote
+// branch's keys are its own.
 func (t *tx) effectiveKeys(n *nsRow, cfg *Config) []grant.Key {
-	if !n.isBranch() {
+	if !n.isBranch() || t.remoteShadow(n) != nil {
 		return cfg.Keys
 	}
 	base := t.nsByID(n.base.Int64)
@@ -164,16 +167,17 @@ func findKey(ks []grant.Key, kid string) (grant.Key, bool) {
 	return grant.Key{}, false
 }
 
-// effectiveRevoked merges the revocations of the namespace and all its bases.
+// effectiveRevoked merges the revocations of the namespace and all its
+// bases in this deployment; they stop at a remote base (§7.6, §G.3).
 func (t *tx) effectiveRevoked(n *nsRow, cfg *Config) map[string]bool {
-	if !n.isBranch() {
+	if !n.isBranch() || t.remoteShadow(n) != nil {
 		return cfg.Revoked
 	}
 	out := map[string]bool{}
 	for k := range cfg.Revoked {
 		out[k] = true
 	}
-	for b := n; b.isBranch(); {
+	for b := n; b.isBranch() && t.remoteShadow(b) == nil; {
 		b = t.nsByID(b.base.Int64)
 		for k := range t.config(b.configSeq).Revoked {
 			out[k] = true

@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -62,6 +63,37 @@ type Options struct {
 	// RetentionInterval is how often the retention applier runs (§8.6).
 	// Zero means one hour; negative disables it.
 	RetentionInterval time.Duration
+	// Remote configures remote branches of this deployment (§G.3).
+	Remote RemoteOptions
+}
+
+// RemoteOptions configure the branch side of remote branches (§G.3): how
+// this deployment reaches the deployments holding their bases.
+type RemoteOptions struct {
+	// Resolve maps a base's origin to the endpoint requests go to. Nil
+	// means the origin itself, http.DefaultClient and no bearer grant.
+	Resolve func(origin string) (RemoteEndpoint, error)
+	// IgnorePurges records purges in a base's log as notices only
+	// (RemoteNotices) instead of applying them (§G.3 SHOULD follow).
+	IgnorePurges bool
+	// FollowInterval is how often bases' logs are followed and
+	// registrations renewed. Zero means five minutes; negative disables the
+	// background follower (SyncRemotes still works).
+	FollowInterval time.Duration
+	// Register registers each remote branch with its base (optional in
+	// §G.3) when it is created, and renews the registration before it
+	// expires. It needs read and export at the base.
+	Register bool
+	// RenewBefore is how long before expiry a registration is renewed.
+	// Zero means seven days.
+	RenewBefore time.Duration
+}
+
+// RemoteEndpoint is where and how a remote origin is reached.
+type RemoteEndpoint struct {
+	BaseURL    string       // e.g. https://cms.example; defaults to the origin
+	HTTPClient *http.Client // nil: http.DefaultClient
+	Bearer     string       // grant for the base namespace (read, and export to register)
 }
 
 // Purger purges CDN cache tags.
@@ -104,6 +136,12 @@ func Open(opt Options) (*Engine, error) {
 	if opt.Maximums == (Limits{}) {
 		opt.Maximums = opt.Limits
 	}
+	if opt.Limits.RemoteBranchLife == 0 {
+		opt.Limits.RemoteBranchLife = DefaultLimits().RemoteBranchLife
+	}
+	if opt.Maximums.RemoteBranchLife == 0 {
+		opt.Maximums.RemoteBranchLife = opt.Limits.RemoteBranchLife
+	}
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
 	}
@@ -133,6 +171,16 @@ func Open(opt Options) (*Engine, error) {
 	if opt.RetentionInterval > 0 {
 		e.bg.Add(1)
 		go e.retentionLoop(opt.RetentionInterval)
+	}
+	if e.opt.Remote.FollowInterval == 0 {
+		e.opt.Remote.FollowInterval = 5 * time.Minute
+	}
+	if e.opt.Remote.RenewBefore == 0 {
+		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
+	}
+	if e.opt.Remote.FollowInterval > 0 {
+		e.bg.Add(1)
+		go e.remoteLoop(e.opt.Remote.FollowInterval)
 	}
 	return e, nil
 }
@@ -293,6 +341,12 @@ type nsRow struct {
 
 func (n *nsRow) isBranch() bool { return n.base.Valid }
 
+// isShadow reports whether n is the hidden shadow of a remote branch
+// (§G.3), holding the remote base's mirrored content. Its name starts with
+// "~", which the §3.6 grammar excludes, so it can never be addressed or
+// collide with a namespace.
+func (n *nsRow) isShadow() bool { return strings.HasPrefix(n.name, "~") }
+
 const nsCols = `ns, name, base, base_at, base_config_seq, frozen, purged, head_seq, config_seq`
 
 func scanNS(row interface{ Scan(...any) error }) (*nsRow, error) {
@@ -303,8 +357,12 @@ func scanNS(row interface{ Scan(...any) error }) (*nsRow, error) {
 	return n, err
 }
 
-// nsByName returns the namespace or nil.
+// nsByName returns the namespace or nil. Shadows (§G.3) have no name that
+// can be looked up: they are reached only through their remote branch.
 func (t *tx) nsByName(name string) *nsRow {
+	if strings.HasPrefix(name, "~") {
+		return nil
+	}
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE name = ?`, name))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil

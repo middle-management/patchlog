@@ -660,10 +660,6 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if !p.ifNoneMatch {
-		writeErr(w, &core.Error{Status: 428, Body: map[string]any{"code": "precondition_required"}})
-		return
-	}
 	body, err := readJSON(r, s.e.Limits().PatchSetSize*4)
 	if err != nil {
 		writeErr(w, err)
@@ -672,6 +668,14 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 	m, ok := body.(map[string]any)
 	if !ok {
 		writeErr(w, badInput("body must be { name, at?, patches? }"))
+		return
+	}
+	if _, remote := m["remote"]; remote {
+		s.registerRemote(w, r, ns, p, m)
+		return
+	}
+	if !p.ifNoneMatch {
+		writeErr(w, &core.Error{Status: 428, Body: map[string]any{"code": "precondition_required"}})
 		return
 	}
 	for k := range m {
@@ -697,6 +701,32 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		out["ns_id"] = res.NSID
 	}
 	writeJSON(w, res.Status, out)
+}
+
+// registerRemote registers or renews a remote branch (§G.3):
+// { "remote": { "origin", "ns" }, "at" } with If-None-Match: * or If-Match.
+func (s *Server) registerRemote(w http.ResponseWriter, r *http.Request, ns string, p precond, m map[string]any) {
+	rm, ok := m["remote"].(map[string]any)
+	origin, _ := rm["origin"].(string)
+	name, _ := rm["ns"].(string)
+	at, _ := m["at"].(string)
+	if !ok || len(rm) != 2 || origin == "" || name == "" || at == "" || len(m) != 2 {
+		writeErr(w, badInput("body must be { remote: { origin, ns }, at }"))
+		return
+	}
+	if !p.ifNoneMatch && p.ifMatch == "" {
+		writeErr(w, &core.Error{Status: 428, Body: map[string]any{"code": "precondition_required"}})
+		return
+	}
+	res, err := s.e.RegisterRemoteBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
+		core.RemoteRegistration{Origin: origin, NS: name, At: at, IfNoneMatch: p.ifNoneMatch, IfMatch: p.ifMatch})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.Header().Set("X-Namespace-Revision", res.NSID)
+	w.Header().Set("ETag", quote(res.NSID))
+	writeJSON(w, res.Status, res.Value())
 }
 
 func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {

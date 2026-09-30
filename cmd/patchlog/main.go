@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}'
@@ -62,6 +62,7 @@ func main() {
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+                 [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
   patchlog keygen
   patchlog grant mint -key SEED -block JSON
   patchlog grant narrow -grant TOKEN -block JSON
@@ -92,7 +93,21 @@ func serve(args []string) {
 	var archiveRoots multi
 	fs.Var(&archiveRoots, "archive-root", "file:// directory under which retention rules may name archive destinations (repeatable; -archive is always allowed)")
 	retention := fs.Duration("retention-interval", time.Hour, "how often retention policies are applied (0 disables)")
+	var remoteBearers, remoteURLs multi
+	fs.Var(&remoteBearers, "remote-bearer", "ORIGIN=GRANT: grant sent to the deployment at ORIGIN for remote branches (read, and export to register) (repeatable, §G.3)")
+	fs.Var(&remoteURLs, "remote-url", "ORIGIN=URL: reach the deployment at ORIGIN through URL instead (repeatable)")
+	ignorePurges := fs.Bool("remote-ignore-purges", false, "record purges in remote bases' logs as notices instead of applying them (§G.3)")
+	remoteFollow := fs.Duration("remote-follow-interval", 5*time.Minute, "how often remote bases' logs are followed (0 disables)")
+	remoteRegister := fs.Bool("remote-register", false, "register remote branches with their bases and renew the registrations (§G.3)")
 	fs.Parse(args)
+	remote, err := remoteOptions(remoteBearers, remoteURLs)
+	if err != nil {
+		log.Fatal(err)
+	}
+	remote.IgnorePurges, remote.Register, remote.FollowInterval = *ignorePurges, *remoteRegister, *remoteFollow
+	if remote.FollowInterval == 0 {
+		remote.FollowInterval = -1
+	}
 
 	var keys []grant.Key
 	for i, k := range opKeys {
@@ -128,7 +143,7 @@ func serve(args []string) {
 		*retention = -1
 	}
 	e, err := core.Open(core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
-		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention})
+		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -139,6 +154,35 @@ func serve(args []string) {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
 	}
 	log.Fatal(srv.ListenAndServe())
+}
+
+// remoteOptions builds the endpoints of remote bases from ORIGIN=VALUE flags.
+func remoteOptions(bearers, urls []string) (core.RemoteOptions, error) {
+	eps := map[string]core.RemoteEndpoint{}
+	for _, pair := range [][]string{bearers, urls} {
+		for _, kv := range pair {
+			o, v, ok := strings.Cut(kv, "=")
+			if !ok || !core.ValidRemoteOrigin(o) || v == "" {
+				return core.RemoteOptions{}, fmt.Errorf("remote endpoint %q: want ORIGIN=VALUE with an https origin", kv)
+			}
+			eps[o] = core.RemoteEndpoint{}
+		}
+	}
+	for _, kv := range bearers {
+		o, v, _ := strings.Cut(kv, "=")
+		ep := eps[o]
+		ep.Bearer = v
+		eps[o] = ep
+	}
+	for _, kv := range urls {
+		o, v, _ := strings.Cut(kv, "=")
+		ep := eps[o]
+		ep.BaseURL = v
+		eps[o] = ep
+	}
+	return core.RemoteOptions{Resolve: func(origin string) (core.RemoteEndpoint, error) {
+		return eps[origin], nil
+	}}, nil
 }
 
 // handler routes /playground/ to the web UI and everything else to the API.

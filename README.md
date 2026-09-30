@@ -23,6 +23,7 @@ and serves immutable, CDN-cacheable revisions.
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Cache-Control classes and cache tags | §9 | ✅ (CDN purges go to a pluggable `Purger`, default: log) |
 | Grants, narrowing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
+| Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices | §G.3 | ✅ (mirrored up front) |
 | Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
 
 ### Not implemented
@@ -32,8 +33,9 @@ and serves immutable, CDN-cacheable revisions.
 - **§F.7 merge service** (scheduled merges, web status): not built. Its logic is in
   `internal/merge` and the CLI.
 - **Addendum E** (encryption): a namespace document with `encryption` is rejected with `422`.
-- **Addendum G** (federation): remote branches (§G.3, the `export` verb). Bundles (§G.4) are
-  implemented as `patchlog export/import`.
+- **Addendum G** (federation): remote branches whose base is itself a branch, lazy
+  read-through, and mirroring pinned `x-ref` targets (§G.3). Bundles (§G.4) are implemented
+  as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
 - CDN edge grants (§C.5): the origin checks grants itself on every read and sets
   `Cache-Control: private` plus `CDN-Cache-Control` for non-public namespaces.
@@ -123,6 +125,49 @@ patchlog archive restore -db patchlog.db [-from file:///moved/archive] [-ns NS] 
   without an archive.
 - **Restore is offline.** It re-inserts every archived patch set whose recomputed id matches the
   kept row, then clears the horizon.
+
+### Remote branches (§G.3)
+
+```sh
+# B: reach A with a read grant (and export, to register); follow A's purges.
+patchlog serve -origin https://b.example -operator-key <PUB> \
+  -remote-bearer https://a.example=<GRANT> [-remote-url https://a.example=http://10.0.0.5:8080] \
+  [-remote-register] [-remote-ignore-purges] [-remote-follow-interval 5m]
+# Create it with the operator key; at is A's namespace head.
+curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: Bearer $OP" \
+  -d '[{"op":"add","path":"","value":{"read":"grant","keys":[…],"base":{"origin":"https://a.example","ns":"matches","at":"1k…"}}}]'
+```
+
+- **Source side (A).** `POST /ns/{ns}/branches` with `{ "remote": { "origin", "ns" }, "at" }`
+  registers (`If-None-Match: *`) or renews (`If-Match` with the latest entry's `ns_id`, same
+  `at`). It needs `read` and `export`, is checked as an `export` envelope, is rate-limited,
+  appends a remote `branch` entry, is listed in `/branches` while unexpired, and protects the
+  head as of `at` from pruning for the registration lifetime (`limits.remoteBranchLife`,
+  default `P30D`).
+- **Branch side (B): mirrored up front.** Before the write transaction, B fetches A's
+  namespace log up to `at`, `/heads` as of `at`, every resource's log and the `$schema`/`$ref`
+  closure, and verifies them all by recomputing ids; `/heads` must agree with the log. It then
+  inserts, in one transaction, a hidden shadow namespace `~{branch}` holding A's chain up to
+  `at` and A's revisions with identical ids. The remote branch is a local branch of its
+  shadow: read-through, foreign parents and logs work unchanged. History A pruned is mirrored
+  from the horizon, whose document is kept as a snapshot (only as trustworthy as the channel,
+  §8.6). A failed fetch or verification is `502` with `code: "remote"`, and nothing is written.
+- **Schemas** are mirrored under the same paths into a non-branch namespace of that name on B,
+  created if missing with the branch's `read`, `keys` and `roles`. A path whose chain neither
+  contains A's nor is a prefix of it is `409 name_conflict`; a prefix is extended.
+- **What doesn't cross.** Keys and revocations are the branch's own (they stop at the shadow),
+  A's rules don't apply, B's purges and namespace purge never contact A, and A's registrations
+  never block A's own purges. A private base's branch can't be public (A's `read` at `at`, as
+  served).
+- **Purges.** B follows A's log (`-remote-follow-interval`, or `Engine.SyncRemotes`) and on
+  `purge`/`purge-ns` applies §8.3 locally to the names concerned: its own chains, its own
+  branches and cache tags. With `-remote-ignore-purges` they are recorded as notices only
+  (`Engine.RemoteNotices`). A purge on B also removes the shadow's copy.
+- **Registration.** With `-remote-register`, B registers after creating the branch and renews
+  seven days before expiry.
+- **Origins.** Both deployments need canonical origins (`-origin`), in https. Plain http is
+  accepted only for loopback hosts, so two local servers can try this out
+  (`-origin http://localhost:8080` and `http://localhost:8081`).
 
 ### Tree and catalog (Addendum B)
 
@@ -219,7 +264,11 @@ namespace's name, or `"*"`, in `ns`.
   implementation does not make yet.
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
-  `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, and `heads.seq`.
+  `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, and `heads.seq`; and
+  for §G.3 `remote_branches` (registrations at the source: base, remote origin and name,
+  `at`, latest and previous entry, expiry), `remote_bases` (per remote branch: its shadow,
+  A's origin, namespace and `at`, the follow checkpoint and the registration at A) and
+  `remote_notices` (purges seen in A's log, applied or not).
 - **Documents are cached by revision id**, since an id determines its document everywhere
   (§3.3). Head snapshots are kept only for documents up to 16 KiB. An intermediate snapshot is
   written after every 100 revisions or 64 KiB of patch sets, so every read folds from the nearest
@@ -230,8 +279,8 @@ namespace's name, or `"*"`, in `ns`.
 - **Limit names** in a namespace document's `limits` object: `patchSetSize`, `opsPerSet`,
   `documentSize`, `nestingDepth`, `rulesPerNamespace`, `rulesPerGrant`, `grantSize`,
   `itemsPerBatch`, `batchSize`, `liveBranches`, `keepPerResource` (integers, lower only),
-  `ratePerResource`, `ratePerPrincipal`, `ratePerNamespace` (`{ rate, burst }`) and
-  `retryWindow` (an ISO 8601 duration).
+  `ratePerResource`, `ratePerPrincipal`, `ratePerNamespace` (`{ rate, burst }`),
+  `retryWindow` and `remoteBranchLife` (ISO 8601 durations).
 - **A forced schema purge** (`POST …/purge?force=1`, §6.1) needs a `*` key.
 
 ## Layout
