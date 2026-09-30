@@ -64,7 +64,7 @@ CI (`.github/workflows/ci.yml`) runs gofmt, vet, the tests and a Docker build on
 - **On a tag `vX.Y.Z`**: a GitHub Release with binaries for linux, macOS and windows (amd64 and
   arm64) and a checksum file, and the image `ghcr.io/middle-management/patchlog:X.Y.Z`, `:X.Y` and
   `:latest`. A tag with a `-` (`v0.2.0-rc.1`) is a prerelease: no `:latest` or `:X.Y`.
-- **On every push to master**: `ghcr.io/middle-management/patchlog:edge` and `:sha-<commit>`.
+- **On every push to main**: `ghcr.io/middle-management/patchlog:edge` and `:sha-<commit>`.
 
 The image holds the one `patchlog` binary (entrypoint), runs as a non-root user with its data in
 `/data`, and serves on 8080. As a backend for another project:
@@ -912,3 +912,7 @@ deploy/varnish      the compose stack's local CDN (Varnish VCL)
 ```
 
 `go test ./...` runs the unit and HTTP integration tests.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

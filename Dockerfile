@@ -15,7 +15,8 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
 
 FROM alpine:3.22
 LABEL org.opencontainers.image.source="https://github.com/middle-management/patchlog" \
-      org.opencontainers.image.description="Patch Log: versioned JSON documents as hash-chained patch logs"
+      org.opencontainers.image.description="Patch Log: versioned JSON documents as hash-chained patch logs" \
+      org.opencontainers.image.licenses="MIT"
 RUN adduser -D -u 10001 patchlog && mkdir /data && chown patchlog /data
 COPY --from=build /out/patchlog /usr/local/bin/patchlog
 USER patchlog
