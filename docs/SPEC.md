@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.25 · 2026-09-30. See the change log at the end.
+Status: draft v0.26 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -2681,7 +2681,7 @@ A merge is **one batch into the base**, built from the branch's changes:
 | Relation | Batch item |
 |---|---|
 | `B` = `H` | none: already merged |
-| `B` is an ancestor of `H` (including the foreign parent, and "absent in the base" for a resource the branch created) | **fast-forward:** the branch's entries after `B`, with `ifMatch: B` (or `ifNoneMatch: *`). The resulting ids are **identical** to the branch's. |
+| `B` is an ancestor of `H` (including the foreign parent, and "absent in the base" for a resource the branch created) | **fast-forward:** the branch's entries after `B`, with `ifMatch: B` (or `ifNoneMatch: *`). The resulting ids are **identical** to the branch's. (At E3 this is a re-sealed replay instead, §F.8.1.) |
 | `H` is an ancestor of `B` | none: the base already has it and more |
 | neither | **replay** the branch's entries after their latest common ancestor onto `B`, with new ids. **Always review it:** it conflicts if the two sides' `writes` overlap (see below), or if history it needs was pruned (§8.6), and `test` ops, schemas and rules catch the rest. |
 | resource purged in the base | none: report it |
@@ -2730,7 +2730,7 @@ There is no rebase operation. To bring `release-7` up to date with `matches`:
 
 - **Create** `release-7-b` from `matches` at its current head.
 
-- **Replay** `release-7`'s changes into it with batches carrying `source: { ns: "release-7", at }`, classified by ancestry exactly as in §F.3, but against the new branch. Resources that `matches` didn't change since the old `at` fast-forward and keep the **same ids** as before.
+- **Replay** `release-7`'s changes into it with batches carrying `source: { ns: "release-7", at }`, classified by ancestry exactly as in §F.3, but against the new branch. Resources that `matches` didn't change since the old `at` fast-forward and keep the **same ids** as before. At E3 they are re-sealed for the new branch and get new ids (§F.8.1).
 
 - **Resolve** conflicts, over as many batches and people as it takes. The new branch isn't in use yet, and the old one keeps working meanwhile.
 
@@ -2834,6 +2834,40 @@ A branch with no `head`, `tombstone` or `batch` entry of its own counts as merge
 - Merging a catalog branch goes through the catalog service. It checks every move and placement in the batch as in §B.11.4, including no widening, and issues one grant covering exactly that batch.
 
 - **Indexes (Addendum A).** Search over a branch is a separate preview index built as in §10 (branches). The main index follows only the base.
+
+### F.8.1 Merging and rebasing at E3
+
+The server can't read patches at E3, so a merge (§F.3) or a rebase (§F.5) is carried out by a client that holds keys, such as the merge service (§F.7). The batch it submits is an ordinary batch, sealed for the target.
+
+- **Keys.** The merger needs to read the branch and to write the target:
+
+- for reading, the branch's own epochs, plus the base's epochs up to the branch's `at` for read-through content;
+
+- for writing, the target's current epoch key.
+
+A `kid` `{ns}#{e}` names the namespace whose `keyring` holds its key. Read-through content in a branch keeps the base's ciphertext and `kid`, so it is opened with the base's keyring. The branch's own writes carry the branch's `kid`s.
+
+- **Classification** is by ancestry over ids, exactly as in §F.3. Ids are over ciphertext, and that is enough: read-through content keeps the base's ids, and a branch's first entry names the base's id as its foreign parent. Two rows of the table change:
+
+- **`B` is an ancestor of `H`**: a **re-sealed replay** rather than a fast-forward. The branch's entries after `B` are re-sealed onto `B` in order. The base hasn't changed the resource, so no conflict check is needed, but the ids are new.
+
+- **Neither**: a replay with the conflict check, as in §F.3.
+
+There are never fast-forwards at E3, even between namespaces with the same keys, because each sealed patch set binds its namespace and parent (§E.3.1).
+
+- **Re-sealing an entry.** The merger decrypts the patch set and checks its `pl` against where it was read: the branch (or the base, for read-through content), the resource, and the entry's parent. It then seals the same plaintext patches under the target's current epoch, with a fresh IV and `pl: { ns: target, name, parent }`. Here `parent` is `B` for the first entry, and after that the id the previous entry of the same item produces. The merger computes each new id itself (§3.3, over the sealed patch set), so it can seal a whole chain before submitting. The target's `pad` applies (§E.2.2). A tombstone has no patches and needs no sealing: its id follows from its new parent (§3.4).
+
+- **Conflicts** are found by the merger. It computes `writes` from the decrypted patch sets and compares them as in §F.3, including the rule for arrays. The server's dry run can only check preconditions, verbs and limits.
+
+- **Validation.** Before submitting, the merger folds every item and validates each resulting document against its `$schema` (§E.3.2). A document that fails is a conflict for a person, like an overlap. A resource kept at the base's version is recorded with a sealed empty set (§F.3).
+
+- **Retries.** The merger keeps the sealed batch byte for byte until it is acknowledged, so a retry reproduces the same ids (§E.3.1). Re-classifying after a `412`, or changing a resolution, seals the affected items again, and they get new ids.
+
+- **Later merges and the janitor.** Every E3 merge is a replay, so a second merge always finds its common ancestors in earlier merge batches (§F.3). Those, like the janitor's `merged` and `superseded` checks (§F.6), use only namespace logs, `source` and `merge.authors`, which stay plaintext at E3. So the janitor needs no keys.
+
+- **Rebases** (§F.5) re-seal in the same way, with the successor as the target. Only read-through content keeps its ids. Remote branches (§G.5.2) are merged in the same way, with the target's keys.
+
+- After a merge, nothing in the target depends on the branch's keys, so purging the branch, or destroying its keys, loses nothing that was merged.
 
 ## F.9 Open questions
 
@@ -3326,3 +3360,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **v0.24:** the sealed format of derived views (§E.2.6). A response from a single source may be one JWE with `pl: { ns, view }`. Otherwise entries are sealed one by one under their own namespace's key, with `pl: { ns, name, view }`, where `view` is the `at` URL's path and query. Only content-derived values are sealed; names, ids, URLs and structure stay in the clear. Services at E3 need to be keyring recipients, derived data is purged with its source, and query strings are listed as visible metadata (§E.4).
 
 - **v0.25:** encryption for bundles and remote branches (§G.5). Bundle headers give each namespace's protection in `access`, and importers refuse a less protected target unless an operator overrides it; E3 bundles import only under the same namespace name. Sealed bundles (§G.5.1.1) encrypt line by line under an HPKE-wrapped content key, with `pl: { bundle, line }` and a `last` marker, so reordering and truncation are detected, and the digest stays over the plaintext. Remote branches must be at least as protected as their source (§G.5.2).
+
+- **v0.26:** merging and rebasing at E3 (§F.8.1). A client with keys classifies by ancestry over ciphertext ids. What would be a fast-forward becomes a re-sealed replay with new ids, and there are never fast-forwards at E3. Each re-sealed patch set is bound to the target and to the id of the entry before it. The merger checks conflicts on decrypted `writes` and validates against `$schema` before submitting. Later merges and the janitor work from plaintext namespace logs, and a `kid` names the namespace whose keyring holds its key.
