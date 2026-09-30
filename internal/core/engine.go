@@ -55,6 +55,13 @@ type Options struct {
 	// intermediate snapshot is written (D.4, defaults 100 and 64 KiB).
 	SnapshotEveryRevisions int
 	SnapshotEveryBytes     int
+	// Archiver stores pruning archives (§8.6). Nil means no destination is
+	// configured: pruning then needs a * key and writes no archive, and
+	// retention rules can't name an archive.
+	Archiver Archiver
+	// RetentionInterval is how often the retention applier runs (§8.6).
+	// Zero means one hour; negative disables it.
+	RetentionInterval time.Duration
 }
 
 // Purger purges CDN cache tags.
@@ -75,6 +82,9 @@ type Engine struct {
 	docs      *docCache
 	cfgMu     sync.Mutex
 	cfgCache  map[int64]*Config
+	stop      chan struct{}
+	bg        sync.WaitGroup
+	closeOnce sync.Once
 }
 
 // Open opens or creates the database.
@@ -107,7 +117,10 @@ func Open(opt Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{
+	if opt.RetentionInterval == 0 {
+		opt.RetentionInterval = time.Hour
+	}
+	e := &Engine{
 		db:        db,
 		opt:       opt,
 		validator: schema.NewValidator(),
@@ -115,11 +128,21 @@ func Open(opt Options) (*Engine, error) {
 		rate:      newRateLimiter(),
 		docs:      newDocCache(4096),
 		cfgCache:  map[int64]*Config{},
-	}, nil
+		stop:      make(chan struct{}),
+	}
+	if opt.RetentionInterval > 0 {
+		e.bg.Add(1)
+		go e.retentionLoop(opt.RetentionInterval)
+	}
+	return e, nil
 }
 
-// Close closes the database.
-func (e *Engine) Close() error { return e.db.Close() }
+// Close stops the retention applier and closes the database.
+func (e *Engine) Close() error {
+	e.closeOnce.Do(func() { close(e.stop) })
+	e.bg.Wait()
+	return e.db.Close()
+}
 
 // Origin is the deployment origin.
 func (e *Engine) Origin() string { return e.opt.Origin }
@@ -171,6 +194,7 @@ func limitErr(status int, msg string) *Error {
 // tx is one database transaction with the engine's helpers.
 type tx struct {
 	*sql.Tx
+	ctx       context.Context
 	e         *Engine
 	now       time.Time
 	write     bool
@@ -191,7 +215,7 @@ func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 			err = fmt.Errorf("internal error: %v", p)
 		}
 	}()
-	return f(&tx{Tx: sqlTx, e: e, now: e.now()})
+	return f(&tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now()})
 }
 
 // update runs f in a write transaction and commits if it returns nil. A
@@ -210,7 +234,7 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 			err = fmt.Errorf("internal error: %v", p)
 		}
 	}()
-	t := &tx{Tx: sqlTx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
+	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
 	if err := f(t); err != nil {
 		sqlTx.Rollback()
 		return err

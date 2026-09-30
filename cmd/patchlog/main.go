@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]...
+//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}'
@@ -52,6 +52,8 @@ func main() {
 		janitorCmd(os.Args[2:])
 	case "export", "import", "bundle":
 		bundleCmd(os.Args[1], os.Args[2:])
+	case "archive":
+		archiveCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -59,7 +61,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]...
+  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
   patchlog keygen
   patchlog grant mint -key SEED -block JSON
   patchlog grant narrow -grant TOKEN -block JSON
@@ -70,7 +72,8 @@ func usage() {
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
   patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
   patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
-  patchlog bundle verify -i file.jsonl`)
+  patchlog bundle verify -i file.jsonl
+  patchlog archive restore -db patchlog.db [-from file:///path] [-ns NS] [-resource NAME]`)
 	os.Exit(2)
 }
 
@@ -85,6 +88,10 @@ func serve(args []string) {
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
+	archiveDef := fs.String("archive", "", "default pruning archive destination, a file:// directory (§8.6)")
+	var archiveRoots multi
+	fs.Var(&archiveRoots, "archive-root", "file:// directory under which retention rules may name archive destinations (repeatable; -archive is always allowed)")
+	retention := fs.Duration("retention-interval", time.Hour, "how often retention policies are applied (0 disables)")
 	fs.Parse(args)
 
 	var keys []grant.Key
@@ -113,8 +120,15 @@ func serve(args []string) {
 		}
 		max.BatchSize = n
 	}
+	arch, err := archiver(*archiveDef, archiveRoots)
+	if err != nil {
+		log.Fatalf("-archive: %v", err)
+	}
+	if *retention == 0 {
+		*retention = -1
+	}
 	e, err := core.Open(core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
-		Limits: core.DefaultLimits(), Maximums: max})
+		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention})
 	if err != nil {
 		log.Fatal(err)
 	}

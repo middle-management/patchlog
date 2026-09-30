@@ -20,7 +20,7 @@ and serves immutable, CDN-cacheable revisions.
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
-| Pruning with horizons, protected revisions and kept documents | §8.6 | ✅ (no archive, see below) |
+| Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Cache-Control classes and cache tags | §9 | ✅ (CDN purges go to a pluggable `Purger`, default: log) |
 | Grants, narrowing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
@@ -28,13 +28,13 @@ and serves immutable, CDN-cacheable revisions.
 ### Not implemented
 
 - **Addendum B:** catalog branches (§F.8 preview access and merge grants), a `groups`
-  namespace, signed manifests and `x-tree-label` titles. The optional merge *service* of §F.7 (scheduled merges, web status) is not built;
-  its logic is in `internal/merge` and the CLI.
+  namespace, signed manifests and `x-tree-label` titles.
+- **§F.7 merge service** (scheduled merges, web status): not built. Its logic is in
+  `internal/merge` and the CLI.
 - **Addendum E** (encryption): a namespace document with `encryption` is rejected with `422`.
-- **Addendum G** (federation): remote branches (the `export` verb) and pruning archives. Bundles
-  (§G.4) are implemented as `patchlog export/import`.
-  Because no archive destination exists, **pruning always needs a grant chained to a `*` key**
-  (§8.6), and `retention` policies are validated and stored but not applied automatically.
+- **Addendum G** (federation): remote branches (§G.3, the `export` verb). Bundles (§G.4) are
+  implemented as `patchlog export/import`.
+- **Archives other than `file://`** (§8.6), e.g. object storage.
 - CDN edge grants (§C.5): the origin checks grants itself on every read and sets
   `Cache-Control: private` plus `CDN-Cache-Control` for non-public namespaces.
 - Author signatures (§C.3): a `Signature` header is stored with the revision and returned
@@ -98,6 +98,31 @@ patchlog janitor -ns matches                     # purge merged/superseded branc
 - The janitor checks `merged` and `successor` claims against both logs before purging (§F.6).
   Cleanup is opt-in: a branch is purged only once a `cleanup` period, from the branch's or the
   base's document, has passed.
+
+### Pruning archives and retention (§8.6)
+
+```sh
+patchlog serve -archive file:///var/lib/patchlog/archive [-archive-root file:///other] [-retention-interval 1h]
+patchlog archive restore -db patchlog.db [-from file:///moved/archive] [-ns NS] [-resource NAME]
+```
+
+- **Archive first.** Before a prune drops patch sets, it writes them as a full-history bundle
+  (§G.4.1) to `{destination}/{ns}/{name}/{horizon}.jsonl`. A later prune writes an incremental
+  bundle whose `requires` points at the previous one.
+- **410s link to the archive.** Revisions below the horizon answer `410 pruned`, with the
+  archive's URL in the body.
+- **Who can prune.** With an archive configured, the `prune` verb is enough. Pruning without an
+  archive, or below what `retention` keeps, needs a `*` key.
+- **Destinations.** A `retention[].archive` destination must lie under an allowed root
+  (`-archive` or `-archive-root`), otherwise the config write gets `422`.
+- **Purge reaches archives.** Purging deletes the resource's archives too.
+- **Retention runs in the background.** Every `-retention-interval`, as `system:retention`, it
+  keeps the last `revisions` or everything newer than `age`, whichever keeps more. Protected
+  revisions always stay. A rule with no archive destination, when no `-archive` default exists
+  either, prunes irreversibly. `/retention` needs a `*` key, the same authority that may prune
+  without an archive.
+- **Restore is offline.** It re-inserts every archived patch set whose recomputed id matches the
+  kept row, then clears the horizon.
 
 ### Tree and catalog (Addendum B)
 
@@ -225,6 +250,7 @@ internal/janitor     branch cleanup with claim verification (§F.6)
 internal/tree        tree service: folders, placements, links, manifests (§B.2–§B.9)
 internal/catalog     tree-derived access and grant issuing (§B.11)
 internal/bundle      bundle format, export and import (§G.4)
+internal/archive     file:// archives for pruning and offline restore (§8.6)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
 internal/ids        content-addressed ids (§3.2–§3.5)
 internal/pointer    JSON Pointer

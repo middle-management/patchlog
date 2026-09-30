@@ -92,6 +92,7 @@ type Rev struct {
 	Doc     []byte
 	Code    string // "pruned", "tombstone" or "" for 410s
 	Horizon string
+	Archive string // URL of the archive holding a pruned revision, if any (§8.6)
 	Public  bool
 }
 
@@ -134,7 +135,8 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if err != nil {
 			var pe *prunedError
 			if errors.As(err, &pe) {
-				out.Status, out.Code, out.Horizon = 410, "pruned", t.horizonID(pe.res)
+				out.Status, out.Code = 410, "pruned"
+				out.Horizon, out.Archive = t.horizonID(pe.res), t.archiveURL(pe.res, row.seq)
 				return nil
 			}
 			out.Status = 410
@@ -152,6 +154,7 @@ type Log struct {
 	Entries []map[string]any
 	Last    string // id of the last entry returned (or since)
 	Horizon string
+	Archive string // with Horizon: the archive holding the newest pruned entry, if any
 	Public  bool
 }
 
@@ -205,7 +208,8 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			var pe *prunedError
 			switch {
 			case errors.As(err, &pe):
-				out.Status, out.Horizon = 410, t.horizonID(pe.res)
+				out.Status = 410
+				out.Horizon, out.Archive = t.prunedInfo(pe)
 			case errors.Is(err, errNotAncestor):
 				out.Status = 404
 			default:

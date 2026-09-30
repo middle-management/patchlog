@@ -698,7 +698,11 @@ func (t *tx) applySteps(s *itemState) *Error {
 		if err != nil {
 			var pe *prunedError
 			if errors.As(err, &pe) {
-				return apiErr(410, "pruned", "horizon", t.horizonID(pe.res))
+				h, a := t.prunedInfo(pe)
+				if a != "" {
+					return apiErr(410, "pruned", "horizon", h, "archive", a)
+				}
+				return apiErr(410, "pruned", "horizon", h)
 			}
 			return gone()
 		}

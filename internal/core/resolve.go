@@ -179,7 +179,7 @@ func (t *tx) findInAncestry(head *revRow, id ids.ID) *revRow {
 }
 
 // prunedError reports a revision below a horizon (§8.6).
-type prunedError struct{ res int64 }
+type prunedError struct{ res, seq int64 }
 
 func (e *prunedError) Error() string { return "pruned" }
 
@@ -231,7 +231,7 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 				if state == statePurged {
 					return nil, purgedError{}
 				}
-				return nil, &prunedError{res: cur.res}
+				return nil, &prunedError{res: cur.res, seq: cur.seq}
 			}
 			stack = append(stack, cur)
 		}
@@ -342,7 +342,7 @@ func (t *tx) logBetween(to *revRow, since *ids.ID) ([]LogEntry, error) {
 			if state == statePurged {
 				return nil, purgedError{}
 			}
-			return nil, &prunedError{res: cur.res}
+			return nil, &prunedError{res: cur.res, seq: cur.seq}
 		}
 		rows = append(rows, cur)
 		if !cur.parentSeq.Valid {

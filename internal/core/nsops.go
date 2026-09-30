@@ -145,6 +145,11 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		}
 		return nil, invalid(err.Error())
 	}
+	if !jsonv.Equal(cur.Doc["retention"], cfg.Doc["retention"]) {
+		if aerr := t.e.checkArchives(cfg); aerr != nil {
+			return nil, aerr
+		}
+	}
 	if (touchesGuarded(writes) || (cur.Read != "public" && cfg.Read == "public")) && !a.star {
 		return nil, forbidden("this change needs a grant chained to a * key")
 	}
@@ -305,6 +310,9 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if perr != nil {
 		return nil, invalid(perr.Error())
 	}
+	if aerr := t.e.checkArchives(cfg); aerr != nil {
+		return nil, aerr
+	}
 	if cfg.Base != nil {
 		return nil, invalid("branches are created with POST /ns/{base}/branches")
 	}
@@ -445,6 +453,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if perr != nil {
 		return nil, invalid(perr.Error())
 	}
+	if !jsonv.Equal(bcfg.Doc["retention"], cfg.Doc["retention"]) {
+		if aerr := t.e.checkArchives(cfg); aerr != nil {
+			return nil, aerr
+		}
+	}
 	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atID.String() {
 		return nil, invalid("/base cannot be changed")
 	}
@@ -575,6 +588,7 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 			res, _ = r.LastInsertId()
 		} else {
 			res = own.id
+			t.deleteArchives(`res = ?`, res)
 			_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ?`, res)
 			t.must(err)
 			_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE res = ?`, statePurged, res)
@@ -642,6 +656,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if err := t.checkRules(cfg, a, env, false); err != nil {
 			return err
 		}
+		t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
 		_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
@@ -718,10 +733,21 @@ type PruneRequest struct {
 	Keep    []string
 }
 
-// Prune prunes a resource's history below a horizon. It returns the
-// effective horizon and, if the horizon moved, the prune entry's ns_id.
-func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (string, string, error) {
-	var out, outNS string
+// PruneResult is the answer to a prune.
+type PruneResult struct {
+	Horizon string // the effective horizon
+	NSID    string // the prune entry's ns_id, if the horizon moved
+	Archive string // the URL of the archive written, if any
+}
+
+// Prune prunes a resource's history below a horizon (§8.6), archiving the
+// pruned range first when an archive destination is configured.
+//
+// The prune verb suffices when the archive exists and the horizon doesn't go
+// below what the resource's retention rule keeps; otherwise the grant must
+// be chained to a * key.
+func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
+	var out *PruneResult
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
@@ -771,10 +797,16 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			}
 			keep = append(keep, row)
 		}
-		// No archive destination is supported, so pruning always needs a
-		// * key (§8.6).
+		h = t.protect(n, cfg, v.own.id, h)
+		rule := cfg.retentionRule(name)
+		dest, hasArchive := t.archiveDest(rule)
 		if !a.star {
-			return forbidden("pruning without an archive needs a grant chained to a * key")
+			if !hasArchive {
+				return forbidden("pruning where no archive is configured needs a grant chained to a * key")
+			}
+			if rule != nil && h.seq > t.retentionBoundary(rule, v.own) {
+				return forbidden("going below what retention keeps needs a grant chained to a * key")
+			}
 		}
 		env := t.basicEnvelope("prune", name, a)
 		env["writes"], env["patches"] = []any{}, []any{}
@@ -782,100 +814,133 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if err := t.checkRules(cfg, a, env, false); err != nil {
 			return err
 		}
-		// Protected revisions: the retry window and branch points.
-		var minSeq int64
-		cutoff := t.now.Add(-cfg.Limits.RetryWindow).UnixMilli()
-		if err := t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND created >= ?`, v.own.id, cutoff).Scan(&minSeq); err == nil && minSeq != 0 && minSeq < h.seq {
-			h = t.rev(minSeq)
+		res, perr := t.pruneTo(n, name, v.own, h, keep, pr.Keep, dest, hasArchive, t.authorID(a.id()))
+		if perr != nil {
+			return perr
 		}
-		for _, b := range t.allBranchesOf(n) {
-			var p int64
-			if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, v.own.id, b.baseAt.Int64).Scan(&p); err == nil && p < h.seq {
-				h = t.rev(p)
-			}
-		}
-		cur := v.own.horizonSeq
-		if cur.Valid && h.seq <= cur.Int64 {
-			out = t.rev(cur.Int64).id.String()
-			return nil
-		}
-		// A horizon with nothing of its resource's chain below it (a first
-		// entry) prunes nothing, and a prune that changes nothing writes
-		// nothing (§8.6).
-		var below bool
-		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ? AND seq < ?)`, v.own.id, h.seq).Scan(&below))
-		if !below {
-			out = h.id.String()
-			return nil
-		}
-		// Documents that stay available: the horizon (and for a tombstone the
-		// last live document), kept revisions and referenced schemas.
-		refs := t.referencedPaths(func(*nsRow, string) bool { return false })
-		keepSeqs := map[int64]*revRow{}
-		keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
-		for _, k := range keep {
-			keepSeqs[k.seq] = k
-		}
-		// Referenced schema revisions keep their documents; one already below
-		// an earlier horizon keeps the snapshot it has.
-		preserve := map[int64]bool{}
-		rrows, qerr := t.Query(`SELECT seq, id, patches IS NOT NULL FROM revisions WHERE res = ? AND seq < ? AND kind = 0`, v.own.id, h.seq)
-		t.must(qerr)
-		for rrows.Next() {
-			var seq int64
-			var id []byte
-			var hasPatches bool
-			t.must(rrows.Scan(&seq, &id, &hasPatches))
-			if refs["/r/"+n.name+"/"+name+"/rev/"+ids.FromBytes(id).String()] {
-				if hasPatches {
-					keepSeqs[seq] = nil
-				} else {
-					preserve[seq] = true
-				}
-			}
-		}
-		rrows.Close()
-		for seq, row := range keepSeqs {
-			if row == nil {
-				row = t.rev(seq)
-			}
-			doc, err := t.docBytesAt(row)
-			if err != nil {
-				return invalid("a kept revision was already pruned")
-			}
-			_, err = t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, v.own.id, string(doc))
-			t.must(err)
-		}
-		_, err = t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, v.own.id, h.seq)
-		t.must(err)
-		// Below the horizon only the documents kept above survive:
-		// intermediate snapshots (D.4) and an earlier prune's keep set go,
-		// or pruned revisions would still be served.
-		srows, qerr := t.Query(`SELECT seq FROM snapshots WHERE res = ? AND seq < ?`, v.own.id, h.seq)
-		t.must(qerr)
-		var drop []int64
-		for srows.Next() {
-			var seq int64
-			t.must(srows.Scan(&seq))
-			if _, kept := keepSeqs[seq]; !kept && !preserve[seq] {
-				drop = append(drop, seq)
-			}
-		}
-		srows.Close()
-		for _, seq := range drop {
-			_, err = t.Exec(`DELETE FROM snapshots WHERE seq = ?`, seq)
-			t.must(err)
-		}
-		t.flushDocs = true
-		keepJSON := string(jsonv.Canonical(anyStrings(pr.Keep)))
-		_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = ? WHERE res = ?`, h.seq, keepJSON, v.own.id)
-		t.must(err)
-		target := h.seq
-		_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &v.own.id, &target, n.configSeq, t.authorID(a.id()))
-		out, outNS = h.id.String(), nsID.String()
+		out = res
 		return nil
 	})
-	return out, outNS, err
+	return out, err
+}
+
+// protect moves a horizon down past the protected revisions of §8.6: the
+// retry window and the heads as of every live branch's at.
+func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
+	var minSeq sql.NullInt64
+	cutoff := t.now.Add(-cfg.Limits.RetryWindow).UnixMilli()
+	t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND created >= ?`, res, cutoff).Scan(&minSeq))
+	if minSeq.Valid && minSeq.Int64 < h.seq {
+		h = t.rev(minSeq.Int64)
+	}
+	for _, b := range t.allBranchesOf(n) {
+		var p int64
+		if err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, res, b.baseAt.Int64).Scan(&p); err == nil && p < h.seq {
+			h = t.rev(p)
+		}
+	}
+	return h
+}
+
+// pruneTo prunes own below h, which protect has already moved down. With
+// archive set, the pruned range is written to dest first, and nothing is
+// dropped unless that succeeds.
+func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revRow, keepStrs []string, dest string, archive bool, author int64) (*PruneResult, error) {
+	cur := own.horizonSeq
+	if cur.Valid && h.seq <= cur.Int64 {
+		return &PruneResult{Horizon: t.rev(cur.Int64).id.String()}, nil
+	}
+	// A horizon with nothing of its resource's chain below it (a first
+	// entry) prunes nothing, and a prune that changes nothing writes
+	// nothing (§8.6).
+	var below bool
+	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ? AND seq < ?)`, own.id, h.seq).Scan(&below))
+	if !below {
+		return &PruneResult{Horizon: h.id.String()}, nil
+	}
+	// Documents that stay available: the horizon (and for a tombstone the
+	// last live document), kept revisions and referenced schemas.
+	refs := t.referencedPaths(func(*nsRow, string) bool { return false })
+	keepSeqs := map[int64]*revRow{}
+	keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
+	for _, k := range keep {
+		keepSeqs[k.seq] = k
+	}
+	// Referenced schema revisions keep their documents; one already below
+	// an earlier horizon keeps the snapshot it has.
+	preserve := map[int64]bool{}
+	rrows, qerr := t.Query(`SELECT seq, id, patches IS NOT NULL FROM revisions WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
+	t.must(qerr)
+	for rrows.Next() {
+		var seq int64
+		var id []byte
+		var hasPatches bool
+		t.must(rrows.Scan(&seq, &id, &hasPatches))
+		if refs["/r/"+n.name+"/"+name+"/rev/"+ids.FromBytes(id).String()] {
+			if hasPatches {
+				keepSeqs[seq] = nil
+			} else {
+				preserve[seq] = true
+			}
+		}
+	}
+	rrows.Close()
+	docs := map[int64][]byte{}
+	for seq, row := range keepSeqs {
+		if row == nil {
+			row = t.rev(seq)
+		}
+		doc, err := t.docBytesAt(row)
+		if err != nil {
+			return nil, invalid("a kept revision was already pruned")
+		}
+		docs[seq] = doc
+	}
+	// Archive before dropping anything (§8.6).
+	res := &PruneResult{Horizon: h.id.String()}
+	if archive {
+		from := own.horizonSeq.Int64
+		if !cur.Valid {
+			t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ?`, own.id).Scan(&from))
+		}
+		u, err := t.writeArchive(n, name, own.id, from, h, dest)
+		if err != nil {
+			return nil, err
+		}
+		res.Archive = u
+	}
+	for seq, doc := range docs {
+		_, err := t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, own.id, string(doc))
+		t.must(err)
+	}
+	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
+	t.must(err)
+	// Below the horizon only the documents kept above survive:
+	// intermediate snapshots (D.4) and an earlier prune's keep set go,
+	// or pruned revisions would still be served.
+	srows, qerr := t.Query(`SELECT seq FROM snapshots WHERE res = ? AND seq < ?`, own.id, h.seq)
+	t.must(qerr)
+	var drop []int64
+	for srows.Next() {
+		var seq int64
+		t.must(srows.Scan(&seq))
+		if _, kept := keepSeqs[seq]; !kept && !preserve[seq] {
+			drop = append(drop, seq)
+		}
+	}
+	srows.Close()
+	for _, seq := range drop {
+		_, err = t.Exec(`DELETE FROM snapshots WHERE seq = ?`, seq)
+		t.must(err)
+	}
+	t.flushDocs = true
+	keepJSON := string(jsonv.Canonical(anyStrings(keepStrs)))
+	_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = ? WHERE res = ?`, h.seq, keepJSON, own.id)
+	t.must(err)
+	target := h.seq
+	_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &own.id, &target, n.configSeq, author)
+	res.NSID = nsID.String()
+	return res, nil
 }
 
 // allBranchesOf lists the direct branches of n that aren't purged.

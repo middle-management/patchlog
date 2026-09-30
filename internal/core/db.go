@@ -64,6 +64,19 @@ CREATE INDEX IF NOT EXISTS heads_seq ON heads (seq);
 CREATE TABLE IF NOT EXISTS snapshots (seq INTEGER PRIMARY KEY REFERENCES revisions, res INTEGER NOT NULL, doc TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS snapshots_res ON snapshots (res, seq);
 
+-- Addition: pruning archives (§8.6). from_seq and to_seq are the first and
+-- last archived revisions of res; key is the archive's name (Archiver).
+CREATE TABLE IF NOT EXISTS archives (
+  seq        INTEGER PRIMARY KEY,
+  res        INTEGER NOT NULL REFERENCES resources,
+  from_seq   INTEGER NOT NULL,
+  to_seq     INTEGER NOT NULL,
+  key        TEXT    NOT NULL,
+  url        TEXT    NOT NULL,
+  created    INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS archives_res ON archives (res, from_seq);
+
 CREATE TABLE IF NOT EXISTS ns_log (
   seq        INTEGER PRIMARY KEY,
   ns         INTEGER NOT NULL REFERENCES namespaces,

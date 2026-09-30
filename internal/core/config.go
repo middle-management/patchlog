@@ -95,7 +95,7 @@ type Config struct {
 	Roles      grant.Roles
 	Revoked    map[string]bool
 	Limits     Limits
-	Retention  []any
+	Retention  []RetentionRule
 	MaxLag     *time.Duration // §C.4: how old a grant's `at` in this namespace may be
 	Allowances []Allowance
 	Frozen     bool
@@ -215,11 +215,11 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			}
 			c.MaxLag = &d
 		case "retention":
-			a, ok := v.([]any)
-			if !ok {
-				return nil, fmt.Errorf("/retention must be an array")
+			rs, err := parseRetention(v)
+			if err != nil {
+				return nil, err
 			}
-			c.Retention = a
+			c.Retention = rs
 		case "frozen":
 			b, ok := v.(bool)
 			if !ok {

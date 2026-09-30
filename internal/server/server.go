@@ -321,7 +321,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	case rev.Code == "pruned":
 		cache(w, ccPruned, rev.Public, resTags(ns, name)...)
-		writeJSON(w, 410, map[string]any{"code": "pruned", "horizon": rev.Horizon})
+		writeJSON(w, 410, prunedBody(rev.Horizon, rev.Archive))
 	case rev.Code == "tombstone":
 		// A tombstone id is immutable (§7.1).
 		cache(w, ccImmutable, rev.Public, resTags(ns, name)...)
@@ -363,7 +363,7 @@ func (s *Server) writeLog(w http.ResponseWriter, lg *core.Log, ns string, tags [
 	default:
 		if lg.Horizon != "" {
 			cache(w, ccPruned, lg.Public, tags...)
-			writeJSON(w, 410, map[string]any{"code": "pruned", "horizon": lg.Horizon})
+			writeJSON(w, 410, prunedBody(lg.Horizon, lg.Archive))
 			return
 		}
 		cache(w, ccLong, lg.Public)
@@ -497,15 +497,19 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, &core.Error{Status: 422, Body: map[string]any{"code": "invalid", "message": "snapshot is for E3 namespaces, which this server does not support"}})
 		return
 	}
-	eff, nsID, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, core.PruneRequest{Horizon: h, Keep: keep})
+	res, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, core.PruneRequest{Horizon: h, Keep: keep})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	if nsID != "" {
-		w.Header().Set("X-Namespace-Revision", nsID)
+	if res.NSID != "" {
+		w.Header().Set("X-Namespace-Revision", res.NSID)
 	}
-	writeJSON(w, 200, map[string]any{"horizon": eff})
+	out := map[string]any{"horizon": res.Horizon}
+	if res.Archive != "" {
+		out["archive"] = res.Archive
+	}
+	writeJSON(w, 200, out)
 }
 
 // --- namespaces --------------------------------------------------------
@@ -989,6 +993,15 @@ func sse(w http.ResponseWriter, event, id string, data any) {
 	}
 }
 
+// prunedBody is the 410 of §7.1 for pruned history.
+func prunedBody(horizon, archive string) map[string]any {
+	b := map[string]any{"code": "pruned", "horizon": horizon}
+	if archive != "" {
+		b["archive"] = archive
+	}
+	return b
+}
+
 func sinceParam(r *http.Request) string {
 	if s := r.URL.Query().Get("since"); s != "" {
 		return s
@@ -1004,7 +1017,7 @@ func sseLogErr(w http.ResponseWriter, lg *core.Log) {
 	case lg.Status == 404:
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	case lg.Horizon != "":
-		writeJSON(w, 410, map[string]any{"code": "pruned", "horizon": lg.Horizon})
+		writeJSON(w, 410, prunedBody(lg.Horizon, lg.Archive))
 	default:
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
