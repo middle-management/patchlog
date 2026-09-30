@@ -1049,10 +1049,20 @@ func (q *query) subtree() (any, int, string) {
 	}
 	count := 0
 	truncated := false
+	// In a DAG a folder is listed under each of its parents, and one
+	// reached along several paths would be expanded once per path, which
+	// grows exponentially with stacked diamonds. So a folder is expanded
+	// at its first occurrence only; later ones are marked "repeat" and
+	// listed without children (§B.5).
+	expanded := map[string]bool{}
 	var build func(x *Node, d int, onPath map[string]bool) map[string]any
 	build = func(x *Node, d int, onPath map[string]bool) map[string]any {
 		e := q.entry(x)
 		if x.Kind != KindFolder {
+			return e
+		}
+		if expanded[x.Name] {
+			e["repeat"] = true
 			return e
 		}
 		if d >= depth {
@@ -1062,6 +1072,7 @@ func (q *query) subtree() (any, int, string) {
 			return e
 		}
 		kids := []any{}
+		expanded[x.Name] = true
 		onPath[x.Name] = true
 		for _, c := range q.visibleChildren(x.Name) {
 			if onPath[c.Node.Name] {

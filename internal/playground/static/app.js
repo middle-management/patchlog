@@ -1844,7 +1844,10 @@ function treeRow(e, path = [], seen = new Map()) {
   const parent = path[path.length - 1];
   const others = n ? walkableParents(n).filter((p) => p !== parent) : [];
   const shared = n && walkableParents(n).length > 1;
-  const repeat = e.kind === 'folder' && seen.has(e.name);
+  // A folder listed again under another parent: the tree service marks it "repeat" and leaves its
+  // children out (§B.5); a listing built here has them, and is folded the same way.
+  const repeat = e.kind === 'folder' && (e.repeat || seen.has(e.name));
+  const kids = e.children && e.children.length ? e.children : repeat ? ((seen.kids && seen.kids.get(e.name)) || []) : [];
   const it = e.kind === 'item' ? itemOf(e.name) : null;
   const dangling = e.dangling || (it && itemExists(e.name) === false ? 'item missing' : '');
   const row = h('div', { class: 'cat-row' + (e.name === C.sel ? ' sel' : '') + (dangling ? ' dangling' : ''), tabindex: 0, role: 'button' },
@@ -1866,17 +1869,23 @@ function treeRow(e, path = [], seen = new Map()) {
   row.onclick = () => selectNode(e.name);
   row.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectNode(e.name); } };
   const li = h('li', {}, row);
-  if (e.children && e.children.length) {
+  if (kids.length) {
     const here = [...path, e.name];
     if (repeat) {
       // Listed again under another parent: fold its children, which are expanded where it was first listed.
-      const d = h('details', {}, h('summary', { class: 'muted small' }, `${e.children.length} child(ren), also listed under ${seen.get(e.name).map(titleOf).join(' / ') || 'a root'}`));
-      d.addEventListener('toggle', () => { if (d.open && d.children.length === 1) d.append(h('ul', {}, ...e.children.map((c) => treeRow(c, here, seen)))); });
+      const first = seen.get(e.name);
+      const d = h('details', {}, h('summary', { class: 'muted small' }, `${kids.length} child(ren), expanded where first listed${first ? ', under ' + (first.map(titleOf).join(' / ') || 'a root') : ''}`));
+      d.addEventListener('toggle', () => { if (d.open && d.children.length === 1) d.append(h('ul', {}, ...kids.map((c) => treeRow(c, here, seen)))); });
       li.append(d);
     } else {
-      if (e.kind === 'folder') seen.set(e.name, path);
-      li.append(h('ul', {}, ...e.children.map((c) => treeRow(c, here, seen))));
+      if (e.kind === 'folder') {
+        seen.set(e.name, path);
+        (seen.kids || (seen.kids = new Map())).set(e.name, kids);
+      }
+      li.append(h('ul', {}, ...kids.map((c) => treeRow(c, here, seen))));
     }
+  } else if (e.repeat) {
+    li.append(h('div', { class: 'muted small' }, 'listed again: expanded where first listed'));
   }
   return li;
 }

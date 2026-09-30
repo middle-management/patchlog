@@ -73,8 +73,29 @@ func TestMulti(t *testing.T) {
 	if fmt.Sprint(pr["cycles"]) != "[[/r/topics/loop-a /r/topics/loop-b]]" {
 		t.Errorf("cycles: %v", pr["cycles"])
 	}
-	if got := names(x.get("/topics/subtree?of=root&depth=64", "")["tree"].(map[string]any)["children"]); got != "rivalries,stockholm" {
+	sub := x.get("/topics/subtree?of=root&depth=64", "")["tree"].(map[string]any)
+	if got := names(sub["children"]); got != "rivalries,stockholm" {
 		t.Errorf("subtree: %s", got)
+	}
+	// The diamond's shared folder is expanded where it is first listed
+	// (under rivalries) and marked "repeat", without children, under
+	// stockholm (§B.5).
+	child := func(e map[string]any, name string) map[string]any {
+		for _, c := range e["children"].([]any) {
+			if c := c.(map[string]any); c["name"] == name {
+				return c
+			}
+		}
+		t.Fatalf("%v has no child %s", e["name"], name)
+		return nil
+	}
+	first := child(child(sub, "rivalries"), "derbies")
+	again := child(child(sub, "stockholm"), "derbies")
+	if first["repeat"] != nil || names(first["children"]) == "" {
+		t.Errorf("first derbies: %v", first)
+	}
+	if again["repeat"] != true || again["children"] != nil {
+		t.Errorf("repeated derbies: %v", again)
 	}
 
 	st := x.raw("/_status", "").body
