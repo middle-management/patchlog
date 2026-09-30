@@ -343,3 +343,78 @@ func mustURL(t *testing.T, s string) *url.URL {
 	}
 	return u
 }
+
+// A's namespace is itself a branch, e2e throughout: B records the chain it
+// followed in base.chain, relays the keyrings it mirrored for each level,
+// and a reader on B folds ciphertext sealed by A's base (§G.3, §G.5.2).
+func TestRemoteBranchE2EChain(t *testing.T) {
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("e", e2eDoc(map[string]any{"keys": []any{kA.entry("*")}}))
+	g := a.grant(kA, "user:admin", []string{"e", "eb"}, allVerbs)
+	readerJWK, readerPriv, _ := seal.GenerateRecipient()
+	ke, kb := seal.NewKey(), seal.NewKey()
+	kre, _ := seal.BuildKeyring("e", 1, ke, []*ecdh.PublicKey{readerPriv.PublicKey()})
+	krHead := a.create("e", "keyring", kre.Value(), g)
+	d0 := etagOf(a.writeRaw("e", "d", "", sealed(t, ke, "e#1", "e", "d", "", addRoot(map[string]any{"d": encMarker})), g))
+	g0 := etagOf(a.writeRaw("e", "g", "", sealed(t, ke, "e#1", "e", "g", "", addRoot(map[string]any{"g": 0.0})), g))
+	expect(t, a.branch("e", map[string]any{"name": "eb"}, g), 201)
+	// The branch's own keyring (on the base's as a foreign parent) and a
+	// write of its own on top of the base's content.
+	krb, _ := seal.BuildKeyring("eb", 1, kb, []*ecdh.PublicKey{readerPriv.PublicKey()})
+	a.appendRev("eb", "keyring", krHead, ops(op("replace", "", krb.Value())), g)
+	g1 := etagOf(a.writeRaw("eb", "g", g0, sealed(t, kb, "eb#1", "eb", "g", g0, ops(op("add", "/b", true))), g))
+	at := a.nsHead("eb", g)
+
+	var bPriv ed25519.PrivateKey
+	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"e", "eb"}, []string{"read"})}
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning)
+	b.opPriv = bPriv
+	kB := newKey("badmin")
+	genesis := func(chain ...any) []any {
+		doc := e2eDoc(map[string]any{"read": "grant", "keys": []any{kB.entry("*")}})
+		doc["base"] = map[string]any{"origin": originA, "ns": "eb", "at": at}
+		if chain != nil {
+			doc["base"].(map[string]any)["chain"] = chain
+		}
+		return addRoot(doc)
+	}
+	expectCode(t, b.mkRemote("rel", genesis("eb")), 422, "invalid")
+	expectCode(t, b.mkRemote("rel", genesis("eb", "x")), 422, "invalid")
+	expect(t, b.mkRemote("rel", genesis()), 201)
+	expect(t, b.mkRemote("rel2", genesis("eb", "e")), 201)
+	bAdmin := b.grant(kB, "user:b", []string{"rel"}, allVerbs)
+	base := b.get("/ns/rel/rev/"+b.nsHead("rel", bAdmin), bAdmin).Obj()["base"].(map[string]any)
+	mustEqual(t, base["chain"], []any{"eb", "e"})
+
+	// Both levels' keyrings are relayed, under their own kids.
+	readerG := b.grant(kB, "user:reader", []string{"rel"}, []string{"read"}, map[string]any{"enc": readerJWK})
+	keys, r := b.keysOf("rel", nil, readerG)
+	expect(t, r, 200)
+	_, hasE := keys["e#1"]
+	_, hasEB := keys["eb#1"]
+	if !hasE || !hasEB || len(keys) != 2 {
+		t.Fatalf("relayed keys %v", keys)
+	}
+	// A reader folds content sealed by A's base, and by A on top of it.
+	c, err := plclient.New(b.srv.URL, plclient.WithBearer(readerG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := c.E2E(readerPriv)
+	doc, err := x.DocE2E(context.Background(), "rel", "d", d0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, doc.Value, map[string]any{"d": encMarker})
+	h, cur, err := x.LoadE2E(context.Background(), "rel", "g")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.ID != g1 || len(cur.Flagged) != 0 {
+		t.Fatalf("head %s, flagged %v", h.ID, cur.Flagged)
+	}
+	mustEqual(t, cur.Value, map[string]any{"g": 0.0, "b": true})
+}

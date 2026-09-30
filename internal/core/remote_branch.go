@@ -852,6 +852,24 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	if cfg.level == levelE2E && m.level != levelE2E {
 		return nil, invalid("/encryption: a branch can be e2e only if its base is")
 	}
+	// base.chain records the namespaces followed while verifying (§G.3):
+	// readers of an e2e branch accept read-through ciphertext bound to any
+	// of them. A genesis may give it, and must then give it right;
+	// otherwise it is added, and the genesis becomes one add of the whole
+	// document, as stored.
+	chain := make([]any, len(m.levels))
+	for i, lv := range m.levels {
+		chain[i] = lv.ns
+	}
+	if cfg.Base.Chain != nil {
+		if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
+			return nil, invalid(fmt.Sprintf("/base/chain must be %v: the base's namespace and its bases as of at", chain))
+		}
+	} else {
+		doc = jsonv.Clone(doc).(map[string]any)
+		doc["base"].(map[string]any)["chain"] = chain
+		cc.Patches = []any{map[string]any{"op": "add", "path": "", "value": doc}}
+	}
 	// The shadows' mirrored rows follow the branch's level.
 	if t.shadowLevels == nil {
 		t.shadowLevels = map[string]int{}

@@ -38,8 +38,7 @@ and serves immutable, CDN-cacheable revisions.
   `internal/merge` and the CLI.
 - **Addendum E.3 gaps:** merging or rebasing e2e branches (§F.8: decrypt and re-encrypt in a
   client holding both keyrings) and snapshot bundles of e2e namespaces (§G.5.1: a sealed
-  genesis by a key holder) are refused; the client library folds a remote branch's
-  read-through ciphertext only when the remote base sealed it itself, not its own bases; retention for e2e
+  genesis by a key holder) are refused; retention for e2e
   namespaces needs a key-holding janitor, which isn't built (the server skips them); no
   size-bucket padding (§E.4).
 - **Addendum E.2 gaps:** consumers that re-publish (search index, tree and catalog services)
@@ -262,7 +261,9 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   B's key pair (`-remote-identity https://a.example=b.jwk`), mirrors the plaintext and seals
   what it serves under the branch's own epoch keys. For an e2e base, B mirrors the ciphertext
   and the `keyring` verbatim (ids verified over the ciphertext, nothing folded, no schema
-  closure) and relays the keyring's wrapped keys under A's kids; history A pruned can't be
+  closure) and relays the wrapped keys of every keyring it mirrored (one per level of A's chain)
+  under their own kids; `base.chain` records the namespaces B followed, and e2e readers accept
+  read-through ciphertext bound to any of them; history A pruned can't be
   mirrored (`410 pruned`). A accepts registrations whatever its level: it can't check B.
 - **What doesn't cross.** Keys and revocations are the branch's own (they stop at the shadow),
   A's rules don't apply, B's purges and namespace purge never contact A, and A's registrations

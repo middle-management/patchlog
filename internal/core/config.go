@@ -180,6 +180,9 @@ type BaseRef struct {
 	Origin string
 	NS     string
 	At     string
+	// Chain is a remote base's namespace and its bases as of At, as the
+	// branch's deployment followed them (§G.3); nil for a local base.
+	Chain []string
 }
 
 // Remote reports whether the base is in another deployment.
@@ -326,15 +329,34 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			ns, _ := b["ns"].(string)
 			at, _ := b["at"].(string)
 			if _, remote := b["origin"]; ok && remote {
-				// A remote branch (§7.6, §G.3): { origin, ns, at }.
+				// A remote branch (§7.6, §G.3): { origin, ns, at, chain? }.
 				origin, _ := b["origin"].(string)
-				if len(b) != 3 || !ValidRemoteOrigin(origin) || !ValidNSName(ns) {
-					return nil, fmt.Errorf("/base must be { origin, ns, at } with an https origin")
+				_, hasChain := b["chain"]
+				n := 3
+				if hasChain {
+					n = 4
+				}
+				if len(b) != n || !ValidRemoteOrigin(origin) || !ValidNSName(ns) {
+					return nil, fmt.Errorf("/base must be { origin, ns, at, chain? } with an https origin")
 				}
 				if _, err := ids.Parse(at); err != nil {
 					return nil, fmt.Errorf("/base/at must be an ns_id")
 				}
 				c.Base = &BaseRef{Origin: origin, NS: ns, At: at}
+				if hasChain {
+					// The base's namespace and its bases, as of at (§G.3).
+					arr, _ := b["chain"].([]any)
+					for _, x := range arr {
+						s, _ := x.(string)
+						if !ValidNSName(s) {
+							return nil, fmt.Errorf("/base/chain must list namespace names")
+						}
+						c.Base.Chain = append(c.Base.Chain, s)
+					}
+					if len(c.Base.Chain) == 0 || c.Base.Chain[0] != ns {
+						return nil, fmt.Errorf("/base/chain must start with /base/ns")
+					}
+				}
 				continue
 			}
 			if !ok || ns == "" || at == "" || len(b) != 2 {

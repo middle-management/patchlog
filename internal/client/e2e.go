@@ -248,7 +248,10 @@ type e2eConfig struct {
 	Epoch  int
 	Base   string // the base namespace of a branch, "" otherwise
 	Remote bool   // the base is in another deployment (§G.3)
-	Pad    bool   // encryption.pad (§E.2.2)
+	// Chain is a remote base's base.chain: its namespace and its bases as
+	// of at (§G.3); nil if the document doesn't give it.
+	Chain []string
+	Pad   bool // encryption.pad (§E.2.2)
 }
 
 func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
@@ -272,6 +275,13 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 	if b, ok := d.Value["base"].(map[string]any); ok {
 		out.Base, _ = b["ns"].(string)
 		_, out.Remote = b["origin"]
+		if arr, ok := b["chain"].([]any); ok && out.Remote {
+			for _, x := range arr {
+				if s, ok := x.(string); ok && ValidNSName(s) {
+					out.Chain = append(out.Chain, s)
+				}
+			}
+		}
 	}
 	return out, nil
 }
@@ -526,10 +536,11 @@ func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, e
 // chain maps ns and its bases to their depth: 0 for ns, 1 for its base,
 // and so on (a branch reads its base's ciphertext, whose patch sets and
 // snapshots are bound to the base, §F.8). A remote base (§G.3) ends the
-// chain: its namespace is in another deployment, so it is listed in remote
-// and not read here. A remote branch keeps its base's name in pl.ns
-// (§G.5.2); the bases of a remote base that is itself a branch aren't
-// known here, so content they sealed doesn't fold.
+// walk: its namespaces are in another deployment, so they are listed in
+// remote and not read here. They are the base's base.chain (the remote
+// base and its own bases, as the branch's deployment followed them), or
+// just the base's namespace without one. A remote branch keeps their names
+// in pl.ns (§G.5.2).
 func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, remote map[string]bool, err error) {
 	depth, remote = map[string]int{}, map[string]bool{}
 	for cur, d := ns, 0; cur != ""; d++ {
@@ -542,8 +553,14 @@ func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, remot
 			return nil, nil, err
 		}
 		if cfg.Remote {
-			if _, seen := depth[cfg.Base]; !seen {
-				depth[cfg.Base], remote[cfg.Base] = d+1, true
+			names := cfg.Chain
+			if len(names) == 0 {
+				names = []string{cfg.Base}
+			}
+			for i, b := range names {
+				if _, seen := depth[b]; !seen {
+					depth[b], remote[b] = d+1+i, true
+				}
 			}
 			break
 		}

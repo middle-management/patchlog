@@ -263,18 +263,34 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 		return nil, invalid("e2e namespaces relay only wrapped keys: the grant's root block needs enc, an X25519 public key (§E.2.3, §E.3.2)")
 	}
 	out := []map[string]any{}
+	seen := map[string]bool{}
+	rid := seal.RecipientID(enc)
+	out = t.relayKeyring(out, seen, n, a, kr, rid)
+	// A remote branch's shadows may hold keyrings of the remote base's own
+	// bases, mirrored as foreign parents or read through (§G.5.2): readers
+	// need them for the ciphertext those bases sealed.
+	for _, sh := range t.remoteShadows(n) {
+		out = t.relayKeyring(out, seen, sh, a, kr, rid)
+	}
+	return out, nil
+}
+
+// relayKeyring appends to out the entries for rid of the keyring as n sees
+// it, unless one of the same namespace was relayed already.
+func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, a *actor, kr KeysRequest, rid string) []map[string]any {
 	v := t.resolve(n, KeyringName, nil)
 	if v.state != Live || v.head == nil {
-		return out, nil
+		return out
 	}
 	d, err := t.docAt(v.head)
 	if err != nil {
-		return out, nil
+		return out
 	}
 	ring, err := seal.ParseKeyring(d)
-	if err != nil {
-		return out, nil
+	if err != nil || seen[ring.NS] {
+		return out
 	}
+	seen[ring.NS] = true
 	owner := n
 	if v.src != nil && v.src.ns != n.id {
 		owner = t.nsByID(v.src.ns)
@@ -294,7 +310,6 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 		}
 		epochs = keep
 	}
-	rid := seal.RecipientID(enc)
 	for _, e := range epochs {
 		if w, ok := ring.Epochs[e][rid]; ok {
 			// The keyring's ns is its owner's, checked when it was written;
@@ -302,7 +317,7 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 			out = append(out, seal.WrappedKey{Kid: seal.Kid(ring.NS, e), Wrapped: w}.Value())
 		}
 	}
-	return out, nil
+	return out
 }
 
 // pruneToE2E prunes an e2e resource below h (§8.6). h is the horizon after
