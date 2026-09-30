@@ -498,7 +498,25 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	// Only the current checkpoint's results are served.
+	// Publish the checkpoint before any other work: queries read the
+	// committed rows, and a gap between the two makes their "checkpoint
+	// moved" redirects alternate between the old and the new at.
+	ix.mu.Lock()
+	ix.cur[b.NS] = b.NewCheckpoint
+	if co.PurgedNS {
+		ix.purged[b.NS] = true
+	}
+	close(ix.changed)
+	ix.changed = make(chan struct{})
+	ix.mu.Unlock()
+	if ix.opt.OnApply != nil {
+		ix.opt.OnApply(b)
+	}
+	if len(tags) > 0 {
+		ix.opt.Purger.PurgeTags(tags)
+	}
+	// Housekeeping, once the checkpoint is out: only the current
+	// checkpoint's results are served, so older stored ones go.
 	if err := ix.sealed.Retire(ctx, ix.db, b.NS, b.NewCheckpoint); err != nil {
 		ix.opt.Logf("index: retiring sealed results of %s: %v", b.NS, err)
 	}
@@ -511,22 +529,6 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 	if co.PurgedNS {
 		ix.keys.Forget(b.NS)
-	}
-
-	ix.mu.Lock()
-	ix.cur[b.NS] = b.NewCheckpoint
-	if co.PurgedNS {
-		ix.purged[b.NS] = true
-	}
-	close(ix.changed)
-	ix.changed = make(chan struct{})
-	ix.mu.Unlock()
-
-	if ix.opt.OnApply != nil {
-		ix.opt.OnApply(b)
-	}
-	if len(tags) > 0 {
-		ix.opt.Purger.PurgeTags(tags)
 	}
 	for _, u := range b.Units {
 		if u.Config != nil {

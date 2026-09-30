@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // isConflict recognises the UNIQUE violations D.3 names as a lost race, and
@@ -55,11 +56,14 @@ func TestCancelledTxReportsContextError(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		err := run(ctx, func(t *tx) error {
 			cancel()
-			// Let database/sql notice the cancellation and roll back.
-			for i := 0; i < 1000; i++ {
+			// database/sql rolls back from a goroutine watching ctx; wait
+			// for it.
+			deadline := time.Now().Add(5 * time.Second)
+			for time.Now().Before(deadline) {
 				if _, err := t.ExecContext(context.Background(), `SELECT 1`); err != nil {
 					return err
 				}
+				time.Sleep(time.Millisecond)
 			}
 			return nil
 		})
