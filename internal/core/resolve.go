@@ -256,7 +256,7 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 			return nil, err
 		}
 		exists = true
-		t.e.docs.put(row.id, jsonv.Canonical(doc))
+		t.cacheDoc(row.id, jsonv.Canonical(doc))
 	}
 	if !exists {
 		return nil, errors.New("no document")

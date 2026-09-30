@@ -736,7 +736,7 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow) i
 			horizon = last
 			return nil
 		}
-		t.e.docs.put(id, canonDoc)
+		t.cacheDoc(id, canonDoc)
 		t.maybeSnapshot(res, last, canonDoc)
 		return nil
 	})

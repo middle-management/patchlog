@@ -256,12 +256,28 @@ namespace's name, or `"*"`, in `ns`.
 
 ## Design notes
 
-- **One write transaction at a time.** Every write runs its whole gate (§6.2) inside one
-  `BEGIN IMMEDIATE` transaction, also serialised by an in-process mutex. The configuration,
-  heads and revocations a write is checked against are exactly those it is inserted against,
-  so invariant 6 holds trivially, also across processes sharing the database file. D.3 moves
-  validation outside the lock and re-checks instead; that is an optimisation this
-  implementation does not make yet.
+- **Heavy work outside the write lock (D.3).** Resource writes and batches run steps 1–6 of
+  the gate (§6.2: authorisation and rate limits, idempotent-retry lookup, frozen,
+  precondition, apply, limits, schema validation, rules) in a read transaction, without the
+  write lock. They then take the lock (an in-process mutex plus `BEGIN IMMEDIATE`, which also
+  serialises other processes sharing the file) and re-check, inside that transaction, that
+  everything the decision read is unchanged: every namespace consulted (the target, every
+  base whose keys and revocations apply, §C.4, the namespaces of resolved schemas, of a
+  `requireAt` and of a batch source) keeps its config revision, frozen and purged flags;
+  every item's resource keeps its state and head (or its absence), read through bases in a
+  branch; and every schema revision resolved from storage is still available to the writer
+  (a schema referenced only by the pending write can be purged meanwhile). If so the write is
+  inserted; the configuration, heads and revocations it was checked against are exactly those
+  it is inserted against, so invariant 6 holds. If not, it rolls back and redoes the whole
+  check, so a moved head is answered `412` with the new head, and an idempotent retry that
+  landed meanwhile is answered `200`. After three rounds the gate runs entirely inside the
+  lock, so a write always terminates. Rate-limit tokens are drawn once per request. Error
+  precedence is unchanged: a refusal is decided on one consistent snapshot, in §6.2 order.
+  `UNIQUE (res, parent_seq)` and `UNIQUE (ns, prev_seq)` remain the safety net: a violation
+  is treated as a lost race and redone. Caches, CDN purges and live readers hear of a write
+  only after it commits. Dry runs stay read transactions. Config writes, batches with a config
+  change, branch creation, purges, prunes and remote-branch creation are rare and still run
+  their whole gate inside one write transaction.
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
   `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, and `heads.seq`; and

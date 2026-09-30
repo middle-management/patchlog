@@ -2,11 +2,14 @@
 // namespaces, batches, branches, deletion, pruning and the reads the HTTP
 // API serves. It stores everything in SQLite with the layout of Addendum D.2.
 //
-// Every write runs inside one BEGIN IMMEDIATE transaction, serialised by an
-// in-process mutex as well. That keeps the gate simple and exact: the
-// configuration, heads and revocations a write is checked against are the
-// ones it is inserted against (invariant 6). The cost is that validation runs
-// inside the write lock, which D.3 avoids by re-checking; see README.
+// Resource writes and batches follow D.3: steps 1–6 of the gate run in a
+// read transaction, outside the write lock; then one BEGIN IMMEDIATE
+// transaction, serialised by an in-process mutex as well, re-checks that
+// everything the decision depended on is unchanged and inserts (write.go
+// writeOptimistic). That keeps invariant 6 exact: the configuration, heads
+// and revocations a write is checked against are the ones it is inserted
+// against. The rarer writes (config, branches, purges, prunes) still run
+// their whole gate inside the write transaction; see README.
 package core
 
 import (
@@ -65,6 +68,11 @@ type Options struct {
 	RetentionInterval time.Duration
 	// Remote configures remote branches of this deployment (§G.3).
 	Remote RemoteOptions
+	// BeforeWriteLock is called by resource writes and batches after the
+	// check phase (steps 1–6, outside the write lock) and before they take
+	// the write lock and re-check (D.3). Tests use it to inject concurrent
+	// writes deterministically; it may itself write through the engine.
+	BeforeWriteLock func()
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how
@@ -249,6 +257,15 @@ type tx struct {
 	notify    map[string]bool // namespaces whose logs changed
 	tags      []string        // cache tags to purge after commit
 	flushDocs bool
+	docPuts   []docPut // documents to cache after commit
+	// deps, when set, records what a write's check phase read that a
+	// concurrent write could change (D.3 re-check).
+	deps *writeDeps
+}
+
+type docPut struct {
+	id  ids.ID
+	doc []byte
 }
 
 // read runs f in a read transaction.
@@ -260,10 +277,19 @@ func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 	defer sqlTx.Rollback()
 	defer func() {
 		if p := recover(); p != nil {
-			err = fmt.Errorf("internal error: %v", p)
+			err = panicErr(p)
 		}
 	}()
 	return f(&tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now()})
+}
+
+// panicErr turns a recovered panic (t.must) into an error, keeping a panicked
+// error wrapped so constraint violations can be recognised (D.3).
+func panicErr(p any) error {
+	if pe, ok := p.(error); ok {
+		return fmt.Errorf("internal error: %w", pe)
+	}
+	return fmt.Errorf("internal error: %v", p)
 }
 
 // update runs f in a write transaction and commits if it returns nil. A
@@ -279,7 +305,7 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 	defer func() {
 		if p := recover(); p != nil {
 			sqlTx.Rollback()
-			err = fmt.Errorf("internal error: %v", p)
+			err = panicErr(p)
 		}
 	}()
 	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
@@ -290,8 +316,14 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 	if err := sqlTx.Commit(); err != nil {
 		return err
 	}
+	// Caches, CDN purges and live readers learn of a write only once it has
+	// committed.
 	if t.flushDocs {
 		e.docs.flush()
+	} else {
+		for _, d := range t.docPuts {
+			e.docs.put(d.id, d.doc)
+		}
 	}
 	if len(t.tags) > 0 {
 		e.opt.Purger.PurgeTags(t.tags)
@@ -308,11 +340,20 @@ func (t *tx) must(err error) {
 	}
 }
 
+// authorID returns an author's row, inserting it in a write transaction. A
+// read transaction (a write's check phase, a dry run) never writes: an
+// unknown author is -1, which matches no row.
 func (t *tx) authorID(name string) int64 {
 	var id int64
 	err := t.QueryRow(`SELECT author FROM authors WHERE name = ?`, name).Scan(&id)
 	if err == nil {
 		return id
+	}
+	if !t.write {
+		if !errors.Is(err, sql.ErrNoRows) {
+			t.must(err)
+		}
+		return -1
 	}
 	res, err := t.Exec(`INSERT INTO authors (name) VALUES (?)`, name)
 	t.must(err)
@@ -368,12 +409,14 @@ func (t *tx) nsByName(name string) *nsRow {
 		return nil
 	}
 	t.must(err)
+	t.deps.addNS(n)
 	return n
 }
 
 func (t *tx) nsByID(id int64) *nsRow {
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
 	t.must(err)
+	t.deps.addNS(n)
 	return n
 }
 
@@ -485,6 +528,17 @@ func (c *docCache) put(id ids.ID, b []byte) {
 		}
 	}
 	c.m[id] = b
+}
+
+// cacheDoc caches a document by revision id: at once in a read transaction,
+// after commit in a write transaction, so a write that rolls back never
+// reaches the cache.
+func (t *tx) cacheDoc(id ids.ID, doc []byte) {
+	if t.write {
+		t.docPuts = append(t.docPuts, docPut{id, doc})
+		return
+	}
+	t.e.docs.put(id, doc)
 }
 
 func (c *docCache) flush() {

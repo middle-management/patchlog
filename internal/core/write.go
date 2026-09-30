@@ -175,15 +175,7 @@ func batchError(fails []itemErr) *Error {
 // WriteResource performs a single-resource write: create, append, restore
 // (PATCH) or delete.
 func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*WriteResult, error) {
-	var res *WriteResult
-	err := e.update(ctx, func(t *tx) error {
-		r, err := t.writeItems(req, []Item{item}, nil, nil, false, false)
-		res = r
-		if err != nil {
-			return err
-		}
-		return nil
-	})
+	res, err := e.writeOptimistic(ctx, req, []Item{item}, nil, false)
 	if err != nil {
 		return nil, err
 	}
@@ -192,20 +184,29 @@ func (e *Engine) WriteResource(ctx context.Context, req Request, item Item) (*Wr
 
 // Batch performs an atomic batch (§7.5).
 func (e *Engine) Batch(ctx context.Context, req Request, items []Item, cfg *ConfigChange, source any, dryRun bool) (*WriteResult, error) {
-	var res *WriteResult
-	run := e.update
 	if dryRun {
-		run = e.read
-	}
-	err := run(ctx, func(t *tx) error {
-		r, err := t.writeItems(req, items, cfg, source, true, dryRun)
-		res = r
-		if err != nil {
+		// A dry run writes nothing: steps 1–6 in a read transaction.
+		var res *WriteResult
+		err := e.read(ctx, func(t *tx) error {
+			r, err := t.writeItems(req, items, cfg, source, true, true, false)
+			res = r
 			return err
-		}
-		return nil
-	})
-	return res, err
+		})
+		return res, err
+	}
+	if cfg != nil {
+		// A batch that changes the configuration is rare, and its config
+		// change reads more than the re-check covers (dependents, archive
+		// destinations): it runs its whole gate inside the write lock.
+		var res *WriteResult
+		err := e.update(ctx, func(t *tx) error {
+			r, err := t.writeItems(req, items, cfg, source, true, false, false)
+			res = r
+			return err
+		})
+		return res, err
+	}
+	return e.writeOptimistic(ctx, req, items, source, true)
 }
 
 // asErr converts an *Error into error without the typed-nil trap.
@@ -216,13 +217,38 @@ func asErr(e *Error) error {
 	return e
 }
 
-func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun bool) (*WriteResult, error) {
+// writeItems runs the whole gate of §6.2 in one transaction: steps 1–6,
+// then, unless this is a dry run, the insert. rateDrawn skips the rate-limit
+// draw of step 1, for a request whose tokens an earlier attempt already drew.
+func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*WriteResult, error) {
+	p, res, err := t.checkItems(req, items, cc, source, isBatch, dryRun, rateDrawn)
+	if err != nil || res != nil {
+		return res, err
+	}
+	return t.insertPlan(req, p), nil
+}
+
+// writePlan is a write that passed steps 1–6 and waits for step 7.
+type writePlan struct {
+	n       *nsRow
+	a       *actor
+	st      []*itemState
+	cplan   *configPlan
+	src     any
+	isBatch bool
+	result  *WriteResult
+}
+
+// checkItems runs steps 1–6 of §6.2 for a resource write or batch. It
+// returns a plan to insert, or a final result (an idempotent retry, a dry
+// run), or an error.
+func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
 	n := t.nsByName(req.NS)
 	if n == nil {
-		return nil, notFound()
+		return nil, nil, notFound()
 	}
 	if n.purged {
-		return nil, gone()
+		return nil, nil, gone()
 	}
 	cur := t.config(n.configSeq)
 	lim := cur.Limits
@@ -230,24 +256,24 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		seen := map[string]bool{}
 		for i, it := range items {
 			if !ValidResourceName(it.Resource) {
-				return nil, badInput(fmt.Sprintf("item %d: invalid resource name", i))
+				return nil, nil, badInput(fmt.Sprintf("item %d: invalid resource name", i))
 			}
 			if seen[it.Resource] {
-				return nil, badInput(fmt.Sprintf("item %d: resource %q appears twice", i, it.Resource))
+				return nil, nil, badInput(fmt.Sprintf("item %d: resource %q appears twice", i, it.Resource))
 			}
 			seen[it.Resource] = true
 			if len(it.Steps) == 0 {
-				return nil, badInput(fmt.Sprintf("item %d: no steps", i))
+				return nil, nil, badInput(fmt.Sprintf("item %d: no steps", i))
 			}
 		}
 		if len(items) == 0 && cc == nil {
-			return nil, badInput("empty batch")
+			return nil, nil, badInput("empty batch")
 		}
 	}
 
 	a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)
 	if aerr != nil {
-		return nil, aerr
+		return nil, nil, aerr
 	}
 	if isBatch {
 		// The batch limits come from the current configuration, raised by
@@ -262,7 +288,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 		if len(items) > maxItems {
-			return nil, limitErr(413, fmt.Sprintf("more than %d items", maxItems))
+			return nil, nil, limitErr(413, fmt.Sprintf("more than %d items", maxItems))
 		}
 		size := 0
 		for _, it := range items {
@@ -273,7 +299,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 		if size > maxSize {
-			return nil, limitErr(413, "batch too large")
+			return nil, nil, limitErr(413, "batch too large")
 		}
 	}
 
@@ -315,18 +341,18 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
 					exp := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
 					if r := t.replay(n, a, st, &configPlan{expected: &exp}, true); r != nil {
-						return r, nil
+						return nil, r, nil
 					}
 				}
 			}
-			return nil, err
+			return nil, nil, err
 		}
 		cplan = p
 		cfg = p.cfg
 		if len(items) > 0 {
 			a, aerr = t.authenticate(n.name, n, cfg, req.Cred, nil)
 			if aerr != nil {
-				return nil, aerr
+				return nil, nil, aerr
 			}
 		}
 	}
@@ -334,28 +360,30 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	// Step 1: authorisation.
 	fs := authorizeItems(a)
 	if len(fs) > 0 {
-		return nil, fail(fs)
+		return nil, nil, fail(fs)
 	}
 	if len(items) > 0 {
 		names := make([]string, len(items))
 		for i, it := range items {
 			names[i] = it.Resource
 		}
-		if err := t.rateLimit(n, cfg, a, names, len(items)); err != nil {
-			return nil, err
+		if !rateDrawn {
+			if err := t.rateLimit(n, cfg, a, names, len(items)); err != nil {
+				return nil, nil, err
+			}
 		}
 	}
 
 	// Step 2: precondition — idempotent retry, frozen, the precondition.
 	if r := t.replay(n, a, st, cplan, isBatch); r != nil {
-		return r, nil
+		return nil, r, nil
 	}
 	if cur.Frozen && len(items) > 0 {
 		e := apiErr(409, "frozen")
 		if cur.Successor != "" {
 			e.Body["successor"] = cur.Successor
 		}
-		return nil, e
+		return nil, nil, e
 	}
 	for _, s := range st {
 		if err := t.precondition(n, s); err != nil {
@@ -364,7 +392,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	if len(fs) > 0 {
 		if !dryRun {
-			return nil, fail(fs)
+			return nil, nil, fail(fs)
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
@@ -377,7 +405,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	if len(fs) > 0 {
 		if !dryRun {
-			return nil, fail(fs)
+			return nil, nil, fail(fs)
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
@@ -390,7 +418,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	if len(fs) > 0 {
 		if !dryRun {
-			return nil, fail(fs)
+			return nil, nil, fail(fs)
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
@@ -416,7 +444,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	if len(fs) > 0 {
 		if !dryRun {
-			return nil, fail(fs)
+			return nil, nil, fail(fs)
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
@@ -432,7 +460,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	if len(fs) > 0 {
 		if !dryRun {
-			return nil, fail(fs)
+			return nil, nil, fail(fs)
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
@@ -450,7 +478,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		var err *Error
 		src, err = t.checkSource(source)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 	}
 	if dryRun {
@@ -458,9 +486,16 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		// step it failed at.
 		result.Status = 200
 		result.Items = dryRunReport(items, st, dryFails)
-		return result, nil
+		return nil, result, nil
 	}
 
+	return &writePlan{n: n, a: a, st: st, cplan: cplan, src: src, isBatch: isBatch, result: result}, nil, nil
+}
+
+// insertPlan is step 7: insert a checked write atomically with its
+// namespace entry. n must be the namespace as of this transaction.
+func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
+	n, a, st, cplan, src, isBatch, result := p.n, p.a, p.st, p.cplan, p.src, p.isBatch, p.result
 	// Step 7: insert atomically with the namespace entry.
 	author := t.authorID(a.id())
 	grantID := t.storeGrant(a)
@@ -507,7 +542,7 @@ func (t *tx) writeItems(req Request, items []Item, cc *ConfigChange, source any,
 		le := t.logEntry(t.rev(inserted[0].last))
 		result.Entry = &le
 	}
-	return result, nil
+	return result
 }
 
 // staticVerb is the verb of step j known before looking at state. The
@@ -851,6 +886,7 @@ func (t *tx) loadSchema(ref schema.Ref, a *actor, pending map[string]any) (any, 
 	if d, ok := pending[ref.Path()]; ok {
 		return d, nil
 	}
+	t.deps.addSchema(ref)
 	n := t.nsByName(ref.NS)
 	if n == nil || n.purged {
 		return nil, schema.ErrUnavailable
@@ -1002,7 +1038,7 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 			lastLive = step
 			lastLiveSeq = last
 			canon := jsonv.Canonical(step.doc)
-			t.e.docs.put(step.id, canon)
+			t.cacheDoc(step.id, canon)
 			t.maybeSnapshot(res, last, canon)
 		}
 	}
