@@ -20,11 +20,7 @@ const OpSealed = "sealed"
 // The caller MUST keep the returned bytes until the write is acknowledged:
 // the IV is random, so re-sealing gives another id (§E.3.1).
 func SealPatchSet(key []byte, kid, ns, name, parent string, patches any) ([]byte, error) {
-	jwe, err := Seal(key, kid, PatchSetPL(ns, name, parent), jsonv.Canonical(patches))
-	if err != nil {
-		return nil, err
-	}
-	return jsonv.Canonical([]any{map[string]any{"op": OpSealed, "value": jwe}}), nil
+	return SealPatchSetPad(key, kid, ns, name, parent, patches, false)
 }
 
 // SealedJWE reports whether patchSet (a model value or JSON text) is exactly
@@ -54,25 +50,36 @@ func SealedJWE(patchSet any) (string, bool) {
 // verifying that it is bound to kid and {ns, name, parent}, and returns the
 // plaintext patches as a model value.
 func OpenPatchSet(patchSet any, key []byte, kid, ns, name, parent string) (any, error) {
+	v, _, err := OpenPatchSetPadded(patchSet, key, kid, ns, name, parent)
+	return v, err
+}
+
+// OpenPatchSetPadded is OpenPatchSet that also reports whether the
+// plaintext was padded to its bucket (IsPadded), for readers of a
+// namespace with "pad" (§E.3.1).
+func OpenPatchSetPadded(patchSet any, key []byte, kid, ns, name, parent string) (any, bool, error) {
 	jwe, ok := SealedJWE(patchSet)
 	if !ok {
-		return nil, fmt.Errorf("%w: not a sealed patch set", ErrFormat)
+		return nil, false, fmt.Errorf("%w: not a sealed patch set", ErrFormat)
 	}
-	pt, err := OpenExpect(jwe, key, kid, PatchSetPL(ns, name, parent))
+	h, pt, err := Open(jwe, key)
 	if err != nil {
-		return nil, err
+		return nil, false, err
+	}
+	if err := h.Expect(kid, PatchSetPL(ns, name, parent)); err != nil {
+		return nil, false, err
 	}
 	v, err := jsonv.Parse(pt)
 	if err != nil {
-		return nil, fmt.Errorf("%w: patches: %v", ErrFormat, err)
+		return nil, false, fmt.Errorf("%w: patches: %v", ErrFormat, err)
 	}
-	return v, nil
+	return v, IsPadded(h, pt), nil
 }
 
 // SealSnapshot seals an E3 prune snapshot (§8.6): the document doc of
 // revision id, as canonical JSON, with pl {ns, name, id, kind: "snapshot"}.
 func SealSnapshot(key []byte, kid, ns, name, id string, doc any) (string, error) {
-	return Seal(key, kid, SnapshotPL(ns, name, id), jsonv.Canonical(doc))
+	return SealSnapshotPad(key, kid, ns, name, id, doc, false)
 }
 
 // OpenSnapshot decrypts a prune snapshot bound to kid and {ns, name, id}.
