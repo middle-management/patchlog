@@ -5,6 +5,10 @@ import (
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -299,4 +303,43 @@ func TestRemoteBranchE2EPruned(t *testing.T) {
 	rt := &route{url: a.srv.URL, bearer: f.readerG}
 	b := newEnv(t, withOrigin(originB), withRemote(rt), withKeyStore(newKeyStore(t)))
 	expectCode(t, b.mkRemote("rel", remoteGenesis("e", a.nsHead("e", f.readerG), e2eDoc(map[string]any{"read": "grant"}))), 410, "pruned")
+}
+
+// If B can read A's logs but not A's namespace document at at, it can't
+// tell how protected A is, and refuses the remote branch (§G.5.2).
+func TestRemoteBranchUnknownLevel(t *testing.T) {
+	a, b, rt := pair(t, nil, nil)
+	a.mkNS("m", map[string]any{"read": "public"})
+	a.create("m", "x", map[string]any{"v": 1.0})
+	at := a.nsHead("m")
+	for _, status := range []int{403, 404} {
+		p := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/ns/m/rev/"+at {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(status)
+				w.Write([]byte(`{"code":"forbidden"}`))
+				return
+			}
+			httputil.NewSingleHostReverseProxy(mustURL(t, a.srv.URL)).ServeHTTP(w, r)
+		}))
+		t.Cleanup(p.Close)
+		rt.set(p.URL, "")
+		r := b.mkRemote("rel", remoteGenesis("m", at, map[string]any{"read": "grant"}))
+		expectCode(t, r, 422, "invalid")
+		if !strings.Contains(r.Str("message"), "can't tell how protected") {
+			t.Fatalf("%d: %s", status, r.Body)
+		}
+		expect(t, b.get("/ns/rel"), 404)
+	}
+	rt.set(a.srv.URL, "")
+	expect(t, b.mkRemote("rel", remoteGenesis("m", at, nil)), 201)
+}
+
+func mustURL(t *testing.T, s string) *url.URL {
+	t.Helper()
+	u, err := url.Parse(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u
 }

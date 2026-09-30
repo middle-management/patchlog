@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -479,6 +480,21 @@ func fetchLevel(ctx context.Context, c *client.Client, ns, at string, mapErr fun
 	return lv, &BaseRef{NS: bns, At: bat}, nil
 }
 
+// unknownLevel refuses a remote branch whose base's namespace document
+// can't be read at at: without it, B can't tell how protected the base is
+// (§G.5.2). A transport failure stays a 502; anything the base answered,
+// or a document B can't open, is 422.
+func unknownLevel(base *BaseRef, err error) *Error {
+	what := "/ns/" + base.NS + "/rev/" + base.At
+	msg := fmt.Sprintf("%s: this deployment can't read the base's namespace document (%v), so it can't tell how protected the base is; "+
+		"a remote branch is refused then (§G.5.2): the endpoint's grant needs read on it, and keys if it is sealed", what, err)
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return remoteErr("%s", msg)
+	}
+	return invalid(msg)
+}
+
 // fetchEpochs reads an e2e level's encryption member as of its at, and its
 // epochs with when each began: the created time of the first entry of its
 // log whose configuration names it (§E.3.2). Configuration documents are
@@ -552,16 +568,20 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		}
 		m.levels = append(m.levels, lv)
 		if len(m.levels) == 1 {
-			// Sealed documents are decrypted with the endpoint's keys.
-			if d, err := c.NSDoc(ctx, base.NS, base.At); err == nil {
-				if d.Value["read"] == "public" {
-					m.read = "public"
-				}
-				if enc, ok := d.Value["encryption"].(map[string]any); ok {
-					lv, _ := enc["level"].(string)
-					if m.level = levelOf(lv); m.level == levelNone {
-						m.level = levelE2E // unknown: the strictest
-					}
+			// The base's protection comes from its namespace document
+			// (sealed ones are decrypted with the endpoint's keys). One B
+			// can't read is refused: its level can't be told (§G.5.2).
+			d, err := c.NSDoc(ctx, base.NS, base.At)
+			if err != nil {
+				return nil, unknownLevel(base, err)
+			}
+			if d.Value["read"] == "public" {
+				m.read = "public"
+			}
+			if enc, ok := d.Value["encryption"].(map[string]any); ok {
+				lv, _ := enc["level"].(string)
+				if m.level = levelOf(lv); m.level == levelNone {
+					m.level = levelE2E // unknown: the strictest
 				}
 			}
 		}

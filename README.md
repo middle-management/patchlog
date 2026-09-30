@@ -258,7 +258,7 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   contains A's nor is a prefix of it is `409 name_conflict`; a prefix is extended.
 - **Encryption (§G.5.2).** B refuses a branch less protected than A's namespace as B reads it: a
   private base needs a private or sealed branch, a sealed base a sealed one (it may be public),
-  an e2e base an e2e one. For a sealed base, B fetches keys with its own grant, whose `enc` names
+  an e2e base an e2e one; a base whose namespace document B can't read is refused (`422`), since its level can't be told. For a sealed base, B fetches keys with its own grant, whose `enc` names
   B's key pair (`-remote-identity https://a.example=b.jwk`), mirrors the plaintext and seals
   what it serves under the branch's own epoch keys. For an e2e base, B mirrors the ciphertext
   and the `keyring` verbatim (ids verified over the ciphertext, nothing folded, no schema
