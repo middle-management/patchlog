@@ -321,8 +321,19 @@ func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 		if p := recover(); p != nil {
 			err = panicErr(p)
 		}
+		err = ctxErr(ctx, err)
 	}()
 	return f(&tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now()})
+}
+
+// ctxErr reports a failure after ctx ended as the context's error: database/sql
+// rolls a transaction back when its context is cancelled, so later statements
+// fail with sql.ErrTxDone, which is not an internal error.
+func ctxErr(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() != nil {
+		return fmt.Errorf("%w (%v)", ctx.Err(), err)
+	}
+	return err
 }
 
 // panicErr turns a recovered panic (t.must) into an error, keeping a panicked
@@ -357,6 +368,7 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 			sqlTx.Rollback()
 			err = panicErr(p)
 		}
+		err = ctxErr(ctx, err)
 	}()
 	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
 	if err := f(t); err != nil {

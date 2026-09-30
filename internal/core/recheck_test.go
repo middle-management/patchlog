@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"errors"
 	"testing"
 )
 
@@ -36,5 +37,34 @@ func TestIsConflict(t *testing.T) {
 	_, err = e.db.ExecContext(ctx, `INSERT INTO namespaces (ns, name) VALUES (2, 'n')`)
 	if err == nil || isConflict(err) {
 		t.Fatalf("a taken namespace name is not a write race: %v", err)
+	}
+}
+
+// A transaction whose context is cancelled mid-way reports the cancellation,
+// not the sql.ErrTxDone its later statements hit.
+func TestCancelledTxReportsContextError(t *testing.T) {
+	e, err := Open(Options{Path: ":memory:", AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	for name, run := range map[string]func(context.Context, func(*tx) error) error{
+		"read":   e.read,
+		"update": e.update,
+	} {
+		ctx, cancel := context.WithCancel(context.Background())
+		err := run(ctx, func(t *tx) error {
+			cancel()
+			// Let database/sql notice the cancellation and roll back.
+			for i := 0; i < 1000; i++ {
+				if _, err := t.ExecContext(context.Background(), `SELECT 1`); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("%s: %v", name, err)
+		}
 	}
 }

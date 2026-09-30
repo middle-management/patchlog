@@ -144,8 +144,13 @@ func writeErr(w http.ResponseWriter, err error) {
 		writeJSON(w, ae.Status, ae.Body)
 		return
 	}
-	log.Printf("internal error: %v", err)
 	w.Header().Set("Cache-Control", "no-store")
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		// The client went away mid-request; nobody reads this response.
+		writeJSON(w, 503, map[string]any{"code": "unavailable", "message": "request cancelled"})
+		return
+	}
+	log.Printf("internal error: %v", err)
 	writeJSON(w, 500, map[string]any{"code": "internal", "message": "internal error"})
 }
 
