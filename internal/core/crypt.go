@@ -46,6 +46,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 
 	"github.com/middle-management/patchlog/internal/ids"
@@ -195,7 +196,9 @@ func (t *tx) nsLevel(n *nsRow) int {
 			return l
 		}
 		var cfg sql.NullInt64
-		err := t.QueryRow(`SELECT config_seq FROM namespaces WHERE name = ? AND base = ?`, n.name[1:], n.id).Scan(&cfg)
+		// "~{branch}" or, for a base of its base, "~{branch}~{i}".
+		branch, _, _ := strings.Cut(n.name[1:], "~")
+		err := t.QueryRow(`SELECT n.config_seq FROM namespaces n JOIN remote_bases r ON r.branch = n.ns WHERE n.name = ?`, branch).Scan(&cfg)
 		if err == nil && cfg.Valid {
 			return t.config(cfg.Int64).level
 		}
@@ -382,7 +385,7 @@ func (t *tx) storeGrantBlocks(id, blocks []byte, encrypt bool) {
 func (t *tx) encryptNamespace(n *nsRow) {
 	t.resLevels = nil
 	nss := []int64{n.id}
-	if sh := t.remoteShadow(n); sh != nil {
+	for _, sh := range t.remoteShadows(n) {
 		nss = append(nss, sh.id)
 	}
 	for _, ns := range nss {

@@ -23,7 +23,7 @@ and serves immutable, CDN-cacheable revisions.
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Cache-Control classes and cache tags | §9 | ✅ (CDN purges go to a pluggable `Purger`, default: log) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
-| Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices | §G.3 | ✅ (mirrored up front) |
+| Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches | §G.3 | ✅ (mirrored up front) |
 | Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
 | Encryption at rest, cryptographic purge | Addendum E.1 | ✅ (local master key file; KMS adapters to come) |
 | Sealed for delivery: epoch keys, JWE responses, `POST /ns/{ns}/keys`, rotation, `$nonce` | Addendum E.2 | ✅ (client library decrypts; other consumers don't re-seal yet) |
@@ -45,8 +45,8 @@ and serves immutable, CDN-cacheable revisions.
   their own output is private; remote branches of sealed namespaces (§G.3, §G.5) are refused
   with `422`; exports with keys write plaintext bundles (§G.5 asks for them to be encrypted to
   the recipient); no size-bucket padding (§E.4).
-- **Addendum G** (federation): remote branches whose base is itself a branch, lazy
-  read-through, and mirroring pinned `x-ref` targets (§G.3). Bundles (§G.4) are implemented
+- **Addendum G** (federation): lazy read-through, mirroring pinned `x-ref` targets, and
+  remote branches of a base that is itself a remote branch (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
 - CDN edge grants (§C.5): the origin checks grants itself on every read and sets
@@ -209,6 +209,15 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   shadow: read-through, foreign parents and logs work unchanged. History A pruned is mirrored
   from the horizon, whose document is kept as a snapshot (only as trustworthy as the channel,
   §8.6). A failed fetch or verification is `502` with `code: "remote"`, and nothing is written.
+- **A base that is itself a branch.** Its read-through heads aren't in its own log, so B
+  follows its `base` and `at` (proved by the id of its configuration genesis) recursively,
+  fetches each base's log up to that `at`, and verifies every read-through head and its
+  resource log against the base that wrote it; `/heads` must agree with the combined view.
+  Each level gets its own shadow (`~{branch}`, `~{branch}~1`, …), holding what the levels above
+  read through or use as foreign parents, each a local branch of the next, so logs cross
+  foreign parents as at A. The branch-depth limit counts every level. B needs read access to
+  every base in A's chain: a base that answers `401`/`403`/`404` is `422`. A base that is a
+  remote branch at A is refused (`422`).
 - **Schemas** are mirrored under the same paths into a non-branch namespace of that name on B,
   created if missing with the branch's `read`, `keys` and `roles`. A path whose chain neither
   contains A's nor is a prefix of it is `409 name_conflict`; a prefix is extended.
@@ -219,7 +228,9 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
 - **Purges.** B follows A's log (`-remote-follow-interval`, or `Engine.SyncRemotes`) and on
   `purge`/`purge-ns` applies §8.3 locally to the names concerned: its own chains, its own
   branches and cache tags. With `-remote-ignore-purges` they are recorded as notices only
-  (`Engine.RemoteNotices`). A purge on B also removes the shadow's copy.
+  (`Engine.RemoteNotices`). A purge on B also removes the shadows' copies. When A's base is a
+  branch, B follows only that branch's log: A's purges in its bases propagate to it as purge
+  entries there.
 - **Registration.** With `-remote-register`, B registers after creating the branch and renews
   seven days before expiry.
 - **Origins.** Both deployments need canonical origins (`-origin`), in https. Plain http is

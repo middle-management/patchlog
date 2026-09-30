@@ -702,8 +702,9 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 	}
 	// Sealed copies of its content go too (§E.2.2).
 	t.deleteSealed(`ns = ? AND name = ?`, n.id, name)
-	// A remote branch's mirrored copy is its own: it goes too (§G.3).
-	if sh := t.remoteShadow(n); sh != nil {
+	// A remote branch's mirrored copy is its own: it goes too, in every
+	// shadow of its base's chain (§G.3).
+	for _, sh := range t.remoteShadows(n) {
 		t.purgeShadow(sh, name)
 	}
 	return nsID
@@ -778,7 +779,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		t.must(err)
 		// A remote branch's mirrored copy of its base goes too; nothing
 		// reaches the base (§G.3).
-		if sh := t.remoteShadow(n); sh != nil {
+		for _, sh := range t.remoteShadows(n) {
 			t.purgeShadowNS(sh)
 		}
 		_, nsID := t.appendNS(n, map[string]any{"kind": "purge-ns"}, nil, nil, n.configSeq, t.actorID(a))

@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -31,9 +32,20 @@ import (
 // shadow namespace, "~" + the branch's name, which mirrors the base's chain
 // up to at with identical ids. The remote branch is an ordinary local
 // branch of its shadow, so read-through, foreign parents, history and logs
-// work unchanged. The rules that rely on one operator stop at the shadow:
-// keys and revocations are the branch's own, purges in the base arrive as
-// notices from its log, and nothing on this side blocks the base (§7.6).
+// work unchanged.
+//
+// If the base is itself a branch, its read-through heads aren't in its own
+// log: each is verified against the log of the base that wrote it, following
+// base and at from the verified configuration genesis, recursively. Each
+// level of that chain gets a shadow of its own, "~{branch}~{i}" for the
+// base's i-th base, holding only what the levels above read through or use
+// as foreign parents, and each shadow is a local branch of the next at the
+// right at. The branch-depth limit counts every level.
+//
+// The rules that rely on one operator stop at the shadows: keys and
+// revocations are the branch's own, purges in the base (including those
+// that propagated to it from its bases) arrive as notices from its log, and
+// nothing on this side blocks the base (§7.6).
 
 // RemoteAuthor is the author of entries this deployment writes on behalf of
 // a remote base: purges followed from its log, and mirrored horizons whose
@@ -217,8 +229,9 @@ func (c *remoteChain) docAt(i int) (any, error) {
 
 var errStop = errors.New("stop")
 
-// fetchChain fetches and verifies a resource's chain up to target.
-func fetchChain(ctx context.Context, c *client.Client, ns, name, target string) (*remoteChain, *Error) {
+// fetchChain fetches and verifies a resource's chain up to target. mapErr
+// maps a failed fetch (fetchErr, or unreadableBase for a base's base).
+func fetchChain(ctx context.Context, c *client.Client, ns, name, target string, mapErr func(string, error) *Error) (*remoteChain, *Error) {
 	what := "/r/" + ns + "/" + name
 	entries, err := c.Log(ctx, ns, name, target, "")
 	if err == nil {
@@ -232,20 +245,20 @@ func fetchChain(ctx context.Context, c *client.Client, ns, name, target string) 
 		return newChain(entries, nil), nil
 	}
 	if !client.IsPruned(err) {
-		return nil, fetchErr(what, err)
+		return nil, mapErr(what, err)
 	}
 	// Pruned at the base (§8.6): mirror from the horizon, with its
 	// document as a snapshot, verifying ids from there on.
 	h := client.Horizon(err)
 	if _, perr := ids.Parse(h); perr != nil {
-		return nil, fetchErr(what, err)
+		return nil, mapErr(what, err)
 	}
 	d, err := c.Doc(ctx, ns, name, h)
 	if err != nil {
 		if client.IsGone(err) && !client.IsPruned(err) {
 			return nil, apiErr(410, "pruned", "message", what+": the base's horizon is a tombstone, whose document can't be fetched", "horizon", h)
 		}
-		return nil, fetchErr(what, err)
+		return nil, mapErr(what, err)
 	}
 	var rest []client.LogEntry
 	if h != target {
@@ -254,7 +267,7 @@ func fetchChain(ctx context.Context, c *client.Client, ns, name, target string) 
 			if client.IsNotFound(err) {
 				return nil, apiErr(410, "pruned", "message", what+": history needed at at was pruned at the base", "horizon", h)
 			}
-			return nil, fetchErr(what, err)
+			return nil, mapErr(what, err)
 		}
 		last, verr := verify.VerifyResourceLog(rest, h)
 		if verr != nil {
@@ -272,13 +285,31 @@ func fetchChain(ctx context.Context, c *client.Client, ns, name, target string) 
 	return ch, nil
 }
 
-// remoteRes is one resource of the base as of at.
+// unreadableBase maps a failed fetch from a base of the remote base (§G.3):
+// if this deployment can't read it, it can't create the remote branch.
+func unreadableBase(ns string) func(string, error) *Error {
+	return func(what string, err error) *Error {
+		if ae, ok := client.AsAPIError(err); ok && (ae.Status == 401 || ae.Status == 403 || ae.Status == 404) {
+			return invalid(fmt.Sprintf("%s: the remote base is a branch of %s, which this deployment can't read there (%d); "+
+				"a remote branch of a branch needs read access to every base in its chain", what, ns, ae.Status))
+		}
+		return fetchErr(what, err)
+	}
+}
+
+// remoteRes is one resource of a namespace of the base's chain as of its at.
 type remoteRes struct {
 	name    string
 	kind    string // head, tombstone or purge
 	target  string
-	lastIdx int // the namespace entry that set it
-	chain   *remoteChain
+	lastIdx int // the namespace entry that set it; -1 for none
+	// chain is the resource's verified chain up to target; nil for a
+	// purged resource. Entries before from belong to lower levels.
+	chain *remoteChain
+	from  int
+	// parent is the lower level's resource whose head is the foreign
+	// parent of this level's first entry (§3.3, §7.6), or nil.
+	parent *remoteRes
 	// purgedKind is the kind of a purged resource's head, rev or tombstone.
 	purgedKind int
 }
@@ -298,65 +329,50 @@ func (s *remoteSchema) chainIndex(id string) (int, bool) {
 	return i, ok
 }
 
+// remoteLevel is one namespace of the base's chain as of its at: the base
+// itself (level 0) and, if it is a branch, its base as of the branch's at
+// (level 1), and so on (§G.3). Each level is mirrored into a shadow of its
+// own, and each shadow is a local branch of the next, so read-through and
+// foreign parents work as for local branches.
+type remoteLevel struct {
+	ns, at string
+	log    []client.NSEntry
+	byName map[string]*remoteRes // every resource of the level's log
+	res    []*remoteRes          // the ones mirrored: read through from above, or foreign parents
+}
+
 // remoteMirror is the base as of at, verified.
 type remoteMirror struct {
 	base    *BaseRef
 	read    string // the base's read mode at at (as served; §G.5)
 	level   int    // the base's encryption level at at (as served)
-	log     []client.NSEntry
-	res     []*remoteRes
+	levels  []*remoteLevel
 	schemas []*remoteSchema
 }
 
-// fetchRemote fetches and verifies the base of a remote branch as of at
-// (§G.3), outside any transaction.
-func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror, *Error) {
-	c, _, err := e.remoteClient(base.Origin)
-	if err != nil {
-		return nil, remoteErr("%s: %v", base.Origin, err)
-	}
-	if o, err := c.Origin(ctx); err != nil {
-		return nil, fetchErr("GET /", err)
-	} else if o != base.Origin {
-		return nil, remoteErr("the deployment reached for %s publishes the origin %s", base.Origin, o)
-	}
-	m := &remoteMirror{base: base, read: "grant"}
+// fetchLevel fetches and verifies a namespace's log up to at, and its
+// configuration genesis. next is its base, if it is a branch.
+func fetchLevel(ctx context.Context, c *client.Client, ns, at string, mapErr func(string, error) *Error) (*remoteLevel, *BaseRef, *Error) {
 	// The namespace log up to at, verified from its first entry: at is the
 	// trusted starting point (§G.1).
-	log, err := c.NSLog(ctx, base.NS, base.At, "")
+	log, err := c.NSLog(ctx, ns, at, "")
 	if err != nil {
-		return nil, fetchErr("/ns/"+base.NS+"/rev/"+base.At+"/log", err)
+		return nil, nil, mapErr("/ns/"+ns+"/rev/"+at+"/log", err)
 	}
 	last, verr := verify.VerifyNSChain(log, "")
 	if verr != nil {
-		return nil, unverified("namespace log: %v", verr)
+		return nil, nil, unverified("/ns/%s: namespace log: %v", ns, verr)
 	}
-	if last != base.At {
-		return nil, unverified("the namespace log ends at %s, not at %s", last, base.At)
+	if last != at {
+		return nil, nil, unverified("/ns/%s: the namespace log ends at %s, not at %s", ns, last, at)
 	}
-	m.log = log
-	if d, err := c.NSDoc(ctx, base.NS, base.At); err == nil {
-		if _, isBranch := d.Value["base"]; isBranch {
-			return nil, invalid("the remote base is itself a branch; this server mirrors only bases whose chain lists every resource")
-		}
-		if d.Value["read"] == "public" {
-			m.read = "public"
-		}
-		if enc, ok := d.Value["encryption"].(map[string]any); ok {
-			lv, _ := enc["level"].(string)
-			if m.level = levelOf(lv); m.level == levelNone {
-				m.level = levelE2E // unknown: the strictest
-			}
-		}
-	}
-	// Heads as of at, from the verified log.
-	byName := map[string]*remoteRes{}
+	lv := &remoteLevel{ns: ns, at: at, log: log, byName: map[string]*remoteRes{}}
 	set := func(name, kind, target string, i int) {
 		r := &remoteRes{name: name, kind: kind, target: target, lastIdx: i}
-		if prev := byName[name]; kind == "purge" && prev != nil && prev.kind == "tombstone" {
+		if prev := lv.byName[name]; kind == "purge" && prev != nil && prev.kind == "tombstone" {
 			r.purgedKind = kindTombstone
 		}
-		byName[name] = r
+		lv.byName[name] = r
 	}
 	for i, en := range log {
 		switch en.Kind {
@@ -369,39 +385,155 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 				}
 			}
 		case "purge-ns":
-			return nil, gone("message", "the remote base is purged")
+			return nil, nil, gone("message", "the remote base (or a base of it) is purged: /ns/"+ns)
 		}
 	}
-	// The listing the spec reads must agree with the log (§G.3).
+	// A branch's base and at are in its configuration genesis, which a
+	// local branch writes as one add of the whole document (§7.6): its id,
+	// the target of the chain's first entry, proves the base and at.
+	if len(log) == 0 || log[0].Kind != "config" {
+		return lv, nil, nil
+	}
+	d, err := c.NSDoc(ctx, ns, log[0].ID)
+	if err != nil {
+		if _, ok := client.AsAPIError(err); ok {
+			return nil, nil, mapErr("/ns/"+ns+"/rev/"+log[0].ID, err)
+		}
+		// Not readable as plain JSON (sealed): not a branch this server
+		// follows. If it is one after all, /heads won't agree.
+		return lv, nil, nil
+	}
+	bv, isBranch := d.Value["base"]
+	if !isBranch {
+		return lv, nil, nil
+	}
+	doc, perr := jsonv.Parse(d.Raw)
+	if perr != nil {
+		return nil, nil, unverified("/ns/%s: configuration genesis: %v", ns, perr)
+	}
+	genesis := []any{map[string]any{"op": "add", "path": "", "value": doc}}
+	if ids.Revision(nil, jsonv.Canonical(genesis)).String() != log[0].Target {
+		return nil, nil, unverified("/ns/%s: the configuration genesis doesn't match the namespace log", ns)
+	}
+	bm, _ := bv.(map[string]any)
+	if _, remote := bm["origin"]; remote {
+		return nil, nil, invalid(fmt.Sprintf("/ns/%s is itself a remote branch; this server mirrors only bases whose chain is in one deployment", ns))
+	}
+	bns, _ := bm["ns"].(string)
+	bat, _ := bm["at"].(string)
+	if _, err := ids.Parse(bat); err != nil || !ValidNSName(bns) {
+		return nil, nil, unverified("/ns/%s: the configuration's base is malformed", ns)
+	}
+	return lv, &BaseRef{NS: bns, At: bat}, nil
+}
+
+// fetchRemote fetches and verifies the base of a remote branch as of at
+// (§G.3), outside any transaction. If the base is a branch, its bases are
+// fetched and verified too, each as of the at of the branch above it, and
+// every read-through head is verified against the log of the base that
+// wrote it.
+func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror, *Error) {
+	c, _, err := e.remoteClient(base.Origin)
+	if err != nil {
+		return nil, remoteErr("%s: %v", base.Origin, err)
+	}
+	if o, err := c.Origin(ctx); err != nil {
+		return nil, fetchErr("GET /", err)
+	} else if o != base.Origin {
+		return nil, remoteErr("the deployment reached for %s publishes the origin %s", base.Origin, o)
+	}
+	m := &remoteMirror{base: base, read: "grant"}
+	mapErrs := []func(string, error) *Error{fetchErr}
+	ns, at := base.NS, base.At
+	for {
+		mapErr := mapErrs[len(mapErrs)-1]
+		lv, next, ferr := fetchLevel(ctx, c, ns, at, mapErr)
+		if ferr != nil {
+			return nil, ferr
+		}
+		m.levels = append(m.levels, lv)
+		if len(m.levels) == 1 {
+			if d, err := c.NSDoc(ctx, base.NS, base.At); err == nil {
+				if d.Value["read"] == "public" {
+					m.read = "public"
+				}
+				if enc, ok := d.Value["encryption"].(map[string]any); ok {
+					lv, _ := enc["level"].(string)
+					if m.level = levelOf(lv); m.level == levelNone {
+						m.level = levelE2E // unknown: the strictest
+					}
+				}
+			}
+		}
+		if next == nil {
+			break
+		}
+		// The remote branch is a branch of every namespace of the chain:
+		// the branch-depth limit counts them all (§6.6).
+		if len(m.levels)+1 > e.opt.Maximums.BranchDepth {
+			return nil, limitErr(422, fmt.Sprintf("branch depth exceeded: the remote base's chain has more than %d namespaces", e.opt.Maximums.BranchDepth))
+		}
+		ns, at = next.NS, next.At
+		mapErrs = append(mapErrs, unreadableBase(ns))
+	}
+	// Every resource as the base sees it at at: the topmost level with
+	// entries for it (§7.6).
+	visible := map[string]int{}
+	for i := len(m.levels) - 1; i >= 0; i-- {
+		for name := range m.levels[i].byName {
+			visible[name] = i
+		}
+	}
+	// The listing the spec reads must agree with the logs (§G.3).
 	heads, err := c.Heads(ctx, base.NS, base.At)
 	if err != nil {
 		return nil, fetchErr("/ns/"+base.NS+"/rev/"+base.At+"/heads", err)
 	}
-	if len(heads) != len(byName) {
-		return nil, unverified("/heads lists %d resources, the namespace log %d", len(heads), len(byName))
+	if len(heads) != len(visible) {
+		return nil, unverified("/heads lists %d resources, the namespace logs %d", len(heads), len(visible))
 	}
+	purgedAfter := map[string]*remoteRes{}
 	for _, h := range heads {
-		r := byName[h.Resource]
-		if r == nil || r.kind != h.Kind || r.target != h.Target {
-			return nil, unverified("/heads lists %s as %s %s, which the namespace log doesn't", h.Resource, h.Kind, h.Target)
+		i, ok := visible[h.Resource]
+		if !ok {
+			return nil, unverified("/heads lists %s, which no namespace log does", h.Resource)
+		}
+		r := m.levels[i].byName[h.Resource]
+		switch {
+		case r.kind == h.Kind && r.target == h.Target:
+		case h.Kind == "purge" && r.kind != "purge":
+			// Purged at the base after at (§8.3): its content is gone
+			// there, and the purge entry follows at or after at.
+			p := &remoteRes{name: r.name, kind: "purge", target: h.Target, lastIdx: -1}
+			if h.Target == r.target && r.kind == "tombstone" {
+				p.purgedKind = kindTombstone
+			}
+			purgedAfter[h.Resource] = p
+		default:
+			return nil, unverified("/heads lists %s as %s %s, which the namespace logs don't", h.Resource, h.Kind, h.Target)
 		}
 	}
-	names := sortedKeys(byName)
 	var queue []schema.Ref
-	for _, name := range names {
-		r := byName[name]
-		m.res = append(m.res, r)
+	for _, name := range sortedKeys(visible) {
+		i := visible[name]
+		lv := m.levels[i]
+		if p := purgedAfter[name]; p != nil {
+			lv.res = append(lv.res, p)
+			continue
+		}
+		r := lv.byName[name]
+		lv.res = append(lv.res, r)
 		if r.kind == "purge" {
 			continue
 		}
-		ch, ferr := fetchChain(ctx, c, base.NS, name, r.target)
+		ch, ferr := fetchChain(ctx, c, lv.ns, name, r.target, mapErrs[i])
 		if ferr != nil {
 			return nil, ferr
 		}
 		r.chain = ch
 		doc, err := ch.docAt(len(ch.entries) - 1)
 		if err != nil {
-			return nil, unverified("/r/%s/%s: %v", base.NS, name, err)
+			return nil, unverified("/r/%s/%s: %v", lv.ns, name, err)
 		}
 		if dm, ok := doc.(map[string]any); ok {
 			if s, ok := dm["$schema"].(string); ok {
@@ -409,6 +541,26 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 					queue = append(queue, ref)
 				}
 			}
+		}
+		// The chain crosses foreign parents into lower levels (§7.6): the
+		// entries up to each lower level's head as of its at are that
+		// level's, and verified by it.
+		for cur, j := r, i+1; j < len(m.levels); j++ {
+			q := m.levels[j].byName[name]
+			if q == nil {
+				continue
+			}
+			if q.kind == "purge" {
+				break
+			}
+			k, ok := ch.index[q.target]
+			if !ok || k >= len(cur.chain.entries)-1 {
+				break // not a foreign parent: an ordinary create above
+			}
+			cur.from, cur.parent = k+1, q
+			q.chain = newChain(ch.entries[:k+1], ch.horizonDoc)
+			m.levels[j].res = append(m.levels[j].res, q)
+			cur = q
 		}
 	}
 	// The $schema and $ref closure (§G.3), each schema resource's history
@@ -425,7 +577,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		key := ref.NS + "/" + ref.Name
 		s := schemas[key]
 		if _, have := s.chainIndex(ref.Rev); !have {
-			ch, ferr := fetchChain(ctx, c, ref.NS, ref.Name, ref.Rev)
+			ch, ferr := fetchChain(ctx, c, ref.NS, ref.Name, ref.Rev, fetchErr)
 			if ferr != nil {
 				return nil, ferr
 			}
@@ -569,15 +721,17 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	if cfg.level < m.level {
 		return nil, invalid("/encryption: a branch cannot have a lower encryption level than its base")
 	}
-	// The shadow's mirrored rows follow the branch's level.
+	// The shadows' mirrored rows follow the branch's level.
 	if t.shadowLevels == nil {
 		t.shadowLevels = map[string]int{}
 	}
-	t.shadowLevels[shadowName(req.NS)] = cfg.level
+	for i := range m.levels {
+		t.shadowLevels[shadowLevelName(req.NS, i)] = cfg.level
+	}
 	if err := t.mirrorSchemas(m, req.NS, cfg, author); err != nil {
 		return nil, err
 	}
-	shadow, atSeq := t.insertShadow(req.NS, m)
+	shadow, atSeq := t.insertShadows(req.NS, m)
 	canon := jsonv.Canonical(cc.Patches)
 	cfgID := ids.Revision(nil, canon)
 	r, err := t.Exec(`INSERT INTO namespaces (name, base, base_at, base_config_seq, frozen) VALUES (?,?,?,?,?)`,
@@ -597,16 +751,46 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
 }
 
-// insertShadow mirrors the base's chain up to at and its resources as of
-// at into the shadow namespace, with identical ids. It returns the shadow
-// and the seq of at in it.
-func (t *tx) insertShadow(branch string, m *remoteMirror) (*nsRow, int64) {
+// insertShadows mirrors every level of the base's chain into a shadow of
+// its own, the bottom one first, each a local branch of the one below at
+// that level's at. It returns the top shadow, which the remote branch reads
+// through, and the seq of at in it.
+func (t *tx) insertShadows(branch string, m *remoteMirror) (*nsRow, int64) {
+	var sh *nsRow
+	var at int64
+	heads := map[*remoteRes]int64{}
+	for i := len(m.levels) - 1; i >= 0; i-- {
+		sh, at = t.insertShadow(shadowLevelName(branch, i), m.read, m.levels[i], sh, at, heads)
+	}
+	return sh, at
+}
+
+// shadowLevelName is the shadow of level i of a remote branch's base chain:
+// "~{branch}" for the base itself, "~{branch}~{i}" for its bases. Neither is
+// in the §3.6 grammar.
+func shadowLevelName(branch string, i int) string {
+	if i == 0 {
+		return shadowName(branch)
+	}
+	return shadowName(branch) + "~" + strconv.Itoa(i)
+}
+
+// insertShadow mirrors one level's chain up to its at and its mirrored
+// resources into a new shadow namespace, with identical ids, as a branch of
+// base at baseAt (nil: not a branch). heads records the head row of each
+// mirrored resource, for the foreign parents of the levels above. It
+// returns the shadow and the seq of at in it.
+func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseAt int64, heads map[*remoteRes]int64) (*nsRow, int64) {
 	remote := t.authorID(RemoteAuthor)
-	cdoc := map[string]any{"read": m.read}
+	cdoc := map[string]any{"read": read}
 	genesis := []any{map[string]any{"op": "add", "path": "", "value": cdoc}}
 	gcanon := jsonv.Canonical(genesis)
 	cid := ids.Revision(nil, gcanon)
-	r, err := t.Exec(`INSERT INTO namespaces (name) VALUES (?)`, shadowName(branch))
+	var bid, bat, bcfg any
+	if base != nil {
+		bid, bat, bcfg = base.id, baseAt, base.configSeq
+	}
+	r, err := t.Exec(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?)`, name, bid, bat, bcfg)
 	t.must(err)
 	sid, _ := r.LastInsertId()
 	r, err = t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?)`,
@@ -615,11 +799,10 @@ func (t *tx) insertShadow(branch string, m *remoteMirror) (*nsRow, int64) {
 	cseq, _ := r.LastInsertId()
 	// Resources first, so the log rows can name them.
 	resIDs := map[string]int64{}
-	heads := map[string]int64{}
-	for _, rr := range m.res {
+	for _, rr := range lv.res {
 		if rr.chain == nil {
-			// Purged at the base as of at: only the head's id is known
-			// (its content and parents are gone there too).
+			// Purged at the base: only the head's id is known (its
+			// content and parents are gone there too).
 			r, err := t.Exec(`INSERT INTO resources (ns, name, state) VALUES (?,?,?)`, sid, rr.name, statePurged)
 			t.must(err)
 			res, _ := r.LastInsertId()
@@ -637,23 +820,27 @@ func (t *tx) insertShadow(branch string, m *remoteMirror) (*nsRow, int64) {
 		t.must(err)
 		res, _ := r.LastInsertId()
 		resIDs[rr.name] = res
-		heads[rr.name] = t.insertChain(res, rr.chain, 0, nil)
+		var parent *revRow
+		if rr.parent != nil {
+			parent = t.rev(heads[rr.parent])
+		}
+		heads[rr] = t.insertChain(res, rr.chain, rr.from, parent, parent != nil)
 	}
 	settles := map[int][]*remoteRes{} // log index → resources whose head it set
-	for _, rr := range m.res {
-		if rr.chain != nil {
+	for _, rr := range lv.res {
+		if rr.chain != nil && rr.lastIdx >= 0 {
 			settles[rr.lastIdx] = append(settles[rr.lastIdx], rr)
 		}
 	}
 	var prev any
 	var atSeq int64
-	for i, en := range m.log {
+	for i, en := range lv.log {
 		hf, err := verify.HashedForm(en)
 		t.must(err)
 		body := jsonv.Canonical(hf)
 		var p *ids.ID
 		if i > 0 {
-			x := mustID(m.log[i-1].ID)
+			x := mustID(lv.log[i-1].ID)
 			p = &x
 		}
 		id := ids.Hash(p, body)
@@ -662,7 +849,9 @@ func (t *tx) insertShadow(branch string, m *remoteMirror) (*nsRow, int64) {
 		}
 		var res any
 		if en.IsResource() {
-			res = resIDs[en.Resource]
+			if x, ok := resIDs[en.Resource]; ok {
+				res = x // unmirrored resources of lower levels have no row
+			}
 		}
 		author := remote
 		if en.Author != "" {
@@ -674,13 +863,28 @@ func (t *tx) insertShadow(branch string, m *remoteMirror) (*nsRow, int64) {
 		atSeq, _ = r.LastInsertId()
 		prev = atSeq
 		for _, rr := range settles[i] {
-			_, err := t.Exec(`INSERT INTO head_history (res, ns_seq, target_seq) VALUES (?,?,?)`, resIDs[rr.name], atSeq, heads[rr.name])
+			_, err := t.Exec(`INSERT INTO head_history (res, ns_seq, target_seq) VALUES (?,?,?)`, resIDs[rr.name], atSeq, heads[rr])
 			t.must(err)
 		}
 	}
 	_, err = t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, atSeq, cseq, sid)
 	t.must(err)
 	return t.nsByID(sid), atSeq
+}
+
+// remoteShadows returns the shadows a remote branch reads through, its
+// base's first, then its bases'; nil if n isn't a remote branch. All of
+// them are the remote side (§7.6).
+func (t *tx) remoteShadows(n *nsRow) []*nsRow {
+	var out []*nsRow
+	for s := t.remoteShadow(n); s != nil; {
+		out = append(out, s)
+		if !s.isBranch() {
+			break
+		}
+		s = t.nsByID(s.base.Int64)
+	}
+	return out
 }
 
 func parseCreated(s string, now time.Time) int64 {
@@ -692,8 +896,10 @@ func parseCreated(s string, now time.Time) int64 {
 
 // insertChain inserts the chain's entries from index from on into res, the
 // first chained on parent (nil: a new resource), and updates the resource's
-// head, state, horizon and cached documents. It returns the head row's seq.
-func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow) int64 {
+// head, state, horizon and cached documents. With foreign, parent is in a
+// base's resource, and the first entry is res's first, with a foreign
+// parent (§3.3). It returns the head row's seq.
+func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, foreign bool) int64 {
 	remote := t.authorID(RemoteAuthor)
 	var parentSeq any
 	if parent != nil {
@@ -713,7 +919,7 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow) i
 		}
 		id := mustID(e.ID)
 		first := 0
-		if parent == nil && i == from {
+		if (parent == nil || foreign) && i == from {
 			first = 1
 		}
 		kind := kindRev
@@ -821,7 +1027,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 				r, err := t.Exec(`INSERT INTO resources (ns, name) VALUES (?,?)`, n.id, s.name)
 				t.must(err)
 				res, _ := r.LastInsertId()
-				head := t.insertChain(res, s.chain, 0, nil)
+				head := t.insertChain(res, s.chain, 0, nil, false)
 				changes = append(changes, change{s.name, s.chain.last().Kind, head, res})
 				continue
 			}
@@ -833,7 +1039,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 				if i == len(s.chain.entries)-1 {
 					continue // same head
 				}
-				head := t.insertChain(own.id, s.chain, i+1, h) // a prefix: extend it
+				head := t.insertChain(own.id, s.chain, i+1, h, false) // a prefix: extend it
 				changes = append(changes, change{s.name, s.chain.last().Kind, head, own.id})
 				continue
 			}
@@ -1012,7 +1218,7 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 		if cp != b.checkpoint {
 			return nil // followed concurrently
 		}
-		bn, sh := t.nsByID(b.branch), t.nsByID(b.shadow)
+		bn := t.nsByID(b.branch)
 		author := t.authorID(RemoteAuthor)
 		for _, en := range entries {
 			var names []string
@@ -1020,14 +1226,20 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 			case "purge":
 				names = []string{en.Resource}
 			case "purge-ns":
-				rows, err := t.Query(`SELECT name FROM resources WHERE ns = ? ORDER BY name`, sh.id)
-				t.must(err)
-				for rows.Next() {
-					var s string
-					t.must(rows.Scan(&s))
-					names = append(names, s)
+				// Every name the base had, including those it read
+				// through from its own bases.
+				set := map[string]bool{}
+				for _, sh := range t.remoteShadows(bn) {
+					rows, err := t.Query(`SELECT name FROM resources WHERE ns = ?`, sh.id)
+					t.must(err)
+					for rows.Next() {
+						var s string
+						t.must(rows.Scan(&s))
+						set[s] = true
+					}
+					rows.Close()
 				}
-				rows.Close()
+				names = sortedKeys(set)
 			default:
 				continue
 			}
