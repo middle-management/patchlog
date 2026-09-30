@@ -135,7 +135,16 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 			if _, ok := pointer.Get(cur, op.Path); !ok {
 				return nil, nil, fail(op.PathText, "replace target does not exist")
 			}
-			nd, w, err := addAt(cur, have, op.Path, jsonv.Clone(op.Value))
+			// Replace = remove, then add at the same location, so an array
+			// element is replaced in place rather than inserted before.
+			base := cur
+			if len(op.Path) > 0 {
+				var err error
+				if base, _, err = removeAt(cur, op.Path); err != nil {
+					return nil, nil, fail(op.PathText, err.Error())
+				}
+			}
+			nd, w, err := addAt(base, have, op.Path, jsonv.Clone(op.Value))
 			if err != nil {
 				return nil, nil, fail(op.PathText, err.Error())
 			}

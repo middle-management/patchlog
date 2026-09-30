@@ -296,6 +296,9 @@ func (e LogEntry) value() map[string]any {
 	if e.Kind == "rev" && e.Patches != nil {
 		m["patches"] = e.Patches
 	}
+	if e.Signature != "" {
+		m["signature"] = e.Signature
+	}
 	return m
 }
 

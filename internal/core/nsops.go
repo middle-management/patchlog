@@ -407,13 +407,14 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	cfgID := ids.Revision(nil, gcanon)
 	if ex := t.nsByName(br.Name); ex != nil {
 		// Idempotent retry: same principal, same at and patches.
-		var author int64
+		var author, gseq int64
 		var gid []byte
-		qerr := t.QueryRow(`SELECT author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&author, &gid)
+		qerr := t.QueryRow(`SELECT seq, author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&gseq, &author, &gid)
 		if qerr == nil && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
 			author == t.authorID(a.id()) && ids.FromBytes(gid) == cfgID {
 			var seq int64
-			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND body LIKE ?`, base.id, nsKindCode("branch"), `%"name":"`+br.Name+`"%`).Scan(&seq)
+			// The base's branch entry targets the branch's config genesis.
+			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, base.id, nsKindCode("branch"), gseq).Scan(&seq)
 			r := &WriteResult{Status: 200, Replayed: true, ConfigID: cfgID.String()}
 			if seq != 0 {
 				r.NSID = t.nsLogID(seq).String()

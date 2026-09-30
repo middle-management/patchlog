@@ -637,7 +637,11 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Namespace-Revision", res.NSID)
 		w.Header().Set("Location", "/ns/"+ns+"/rev/"+res.NSID)
 	}
-	writeJSON(w, res.Status, map[string]any{"config": res.ConfigID, "ns_id": res.NSID})
+	out := map[string]any{"config": res.ConfigID}
+	if res.NSID != "" {
+		out["ns_id"] = res.NSID
+	}
+	writeJSON(w, res.Status, out)
 }
 
 func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
@@ -684,7 +688,11 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 	if res.NSID != "" {
 		w.Header().Set("X-Namespace-Revision", res.NSID)
 	}
-	writeJSON(w, res.Status, map[string]any{"name": name, "config": res.ConfigID, "ns_id": res.NSID})
+	out := map[string]any{"name": name, "config": res.ConfigID}
+	if res.NSID != "" {
+		out["ns_id"] = res.NSID
+	}
+	writeJSON(w, res.Status, out)
 }
 
 func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {

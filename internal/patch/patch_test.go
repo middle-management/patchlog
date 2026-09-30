@@ -291,3 +291,30 @@ func TestParse(t *testing.T) {
 		t.Fatal("empty patch set should parse")
 	}
 }
+
+// replace on an array element replaces it in place (RFC 6902 §4.3).
+func TestReplaceArrayElement(t *testing.T) {
+	doc := jsonv.MustParse([]byte(`{"k":[1,2,3],"o":{"a":[{"x":1},{"x":2}]}}`))
+	ops, err := Parse(jsonv.MustParse([]byte(`[{"op":"replace","path":"/k/1","value":9},{"op":"replace","path":"/o/a/0","value":{"y":0}},{"op":"replace","path":"/k/2","value":7}]`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, writes, err := Apply(doc, true, ops, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := jsonv.MustParse([]byte(`{"k":[1,9,7],"o":{"a":[{"y":0},{"x":2}]}}`))
+	if !jsonv.Equal(got, want) {
+		t.Fatalf("got %s", jsonv.Canonical(got))
+	}
+	if w := WritesStrings(writes); len(w) != 3 || w[0] != "/k/1" || w[1] != "/o/a/0" || w[2] != "/k/2" {
+		t.Fatalf("writes %v", w)
+	}
+	// Out of range and "-" still fail.
+	for _, p := range []string{`/k/3`, `/k/-`} {
+		ops, _ := Parse(jsonv.MustParse([]byte(`[{"op":"replace","path":"` + p + `","value":0}]`)))
+		if _, _, err := Apply(doc, true, ops, Options{}); err == nil {
+			t.Errorf("replace %s succeeded", p)
+		}
+	}
+}
