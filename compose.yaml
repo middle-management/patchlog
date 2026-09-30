@@ -5,6 +5,8 @@
 #   http://localhost:8080/playground/ web playground
 #   http://localhost:8081             search index (Addendum A), e.g. /demo?q=derby
 #   http://localhost:8082             tree service (Addendum B), e.g. /cat/roots
+#                                     (the playground reads it through the core's
+#                                     read-only proxy at /playground/tree/, -tree-url)
 #
 # Data (databases, archives, the at-rest master key) lives in the `data`
 # volume; `docker compose down -v` wipes it.
@@ -28,6 +30,11 @@ services:
       - -archive=file:///data/archive
       - -master-key=/data/master.key
       - -master-key-create
+      # The playground's Catalog tab reads the tree service through a
+      # same-origin, GET-only proxy at /playground/tree/. The tree service
+      # starts after the core (it waits for the seed), so the proxy answers
+      # 502 until it is up.
+      - -tree-url=http://tree:8082
     ports:
       - "${PATCHLOG_PORT:-8080}:8080"
     healthcheck:
@@ -36,7 +43,8 @@ services:
       timeout: 2s
       retries: 30
 
-  # One-shot: creates the demo namespaces, a schema and a few documents.
+  # One-shot: creates the demo namespaces (among them a catalog, a sealed and an
+  # e2e one), schemas and a few documents.
   seed:
     image: curlimages/curl:8.16.0
     entrypoint: ["sh", "/deploy/seed.sh"]

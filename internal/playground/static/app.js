@@ -102,6 +102,7 @@ const S = {
   nsHead: '', config: '', nsDoc: null, nsErr: null, nsLog: [], heads: [], headsNext: '', branches: [],
   resState: null, hist: [], selRev: '',
   ifDirty: false, cfgDirty: false,
+  nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null,
 };
 
 /* ------------------------------------------------------------------ *
@@ -211,6 +212,7 @@ function renderEntry(e) {
       const shown = e.resBody.length > 60000 ? e.resBody.slice(0, 60000) + '\n\u2026 (truncated)' : e.resBody;
       res.append(h('div', { style: 'margin-top:4px' }, jsonPre(pretty(shown))));
     } else if (!e.sse) res.append(h('div', { class: 'muted small' }, '(empty body)'));
+    if (e.dec) res.append(decView(e.dec));
     body.append(res);
   }
 
@@ -320,6 +322,7 @@ function wrap(e) {
   return {
     entry: e, status: e.status, ok: e.status >= 200 && e.status < 300, json: e.json, text: e.resBody,
     finalPath: e.finalPath, redirected: e.redirected, neterr: e.neterr,
+    jose: !!(e.resHeaders && /^application\/jose\b/i.test(e.resHeaders.get('Content-Type') || '')),
     hdr: (k) => (e.resHeaders ? e.resHeaders.get(k) : null),
     etag() { const v = this.hdr('ETag'); return v ? v.replace(/^"|"$/g, '') : ''; },
   };
@@ -353,13 +356,13 @@ function renderNsSelect() {
 
 function resetNsState() {
   Object.assign(S, { nsHead: '', config: '', nsDoc: null, nsErr: null, nsLog: [], heads: [], headsNext: '', branches: [],
-    resState: null, hist: [], selRev: '', cfgDirty: false, ifDirty: false });
+    resState: null, hist: [], selRev: '', cfgDirty: false, ifDirty: false, nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null });
 }
 
 async function selectNS(name, o = {}) {
   name = (name || '').trim();
   S.ns = name; if (!o.keepRes) S.res = '';
-  resetNsState();
+  resetNsState(); syncSealBoxes();
   store.set('pl.ns', name); store.set('pl.res', S.res);
   if (name) addKnown(name); else renderNsSelect();
   $('resName').value = S.res;
@@ -378,7 +381,17 @@ async function refreshNS() {
   if (r.status === 200) {
     S.nsHead = r.etag() || ((/\/rev\/([^/]+)$/.exec(r.finalPath) || [])[1] || '');
     S.config = r.hdr('X-Config-Revision') || '';
-    S.nsDoc = r.json;
+    S.nsRaw = r.jose ? r.text : '';
+    if (r.jose) {
+      // A sealed namespace (E2) serves its document as a JWE bound to { ns, id: ns_id, kind: "config" }.
+      const d = await decrypted(r, ns, '', { ns, id: S.nsHead, kind: 'config' });
+      if (ns !== S.ns) return;
+      S.nsDoc = d.value; S.nsSeal = d;
+    } else { S.nsDoc = r.json; S.nsSeal = null; }
+    S.nsLevel = r.jose ? 'sealed' : ((S.nsDoc && S.nsDoc.encryption && S.nsDoc.encryption.level) || '');
+    nsInfoCache.set(ns, { level: S.nsLevel, doc: S.nsDoc });
+    syncSealBoxes();
+    if (S.nsLevel === 'e2e') loadKeyring(); else if (KR.ns !== ns) { KR.ns = ns; KR.doc = null; renderKeyring(); }
   } else {
     S.nsErr = r; S.nsDoc = null; S.nsHead = ''; S.config = '';
     // Fall back to the log, which 302s to the range and reveals the head in its final URL.
@@ -386,7 +399,7 @@ async function refreshNS() {
     if (ns !== S.ns) return;
     if (l.status === 200) {
       S.nsHead = (/\/rev\/([^/]+)\/log/.exec(l.finalPath) || [])[1] || '';
-      S.nsLog = Array.isArray(l.json) ? l.json : [];
+      S.nsLog = Array.isArray(l.json) ? l.json : (l.jose ? (await nsLogOpen(ns, l, S.nsHead)) || [] : []);
       const cfg = [...S.nsLog].reverse().find((x) => x.kind === 'config');
       S.config = cfg ? cfg.target : '';
       S.nsErr = null;
@@ -402,6 +415,7 @@ async function refreshNS() {
   ]);
   if (ns !== S.ns) return;
   if (lg.status === 200 && Array.isArray(lg.json)) S.nsLog = lg.json;
+  else if (lg.status === 200 && lg.jose) { const v = await nsLogOpen(ns, lg, head); if (ns !== S.ns) return; S.nsLog = v || []; }
   if (hd.status === 200 && hd.json) { S.heads = hd.json.items || []; S.headsNext = hd.json.next || ''; }
   if (br.status === 200 && Array.isArray(br.json)) S.branches = br.json; else S.branches = [];
   renderNsAll();
@@ -431,17 +445,25 @@ function renderNsStatus() {
     h('dt', {}, 'readable'), h('dd', {}, S.nsDoc ? 'document, log, heads' : 'log only (document not readable)'));
   if (d.base) kv.append(h('dt', {}, 'base'), h('dd', {}, `${d.base.ns} @ `, idEl(d.base.at)));
   if (d.successor) kv.append(h('dt', {}, 'successor'), h('dd', {}, d.successor));
+  if (S.nsLevel) {
+    const enc = d.encryption || {};
+    kv.append(h('dt', {}, 'encryption'), h('dd', {}, `${S.nsLevel}` + (enc.epoch ? `, epoch ${enc.epoch}` : '') + (enc.pad ? ', padded' : ''),
+      S.nsSeal ? (S.nsSeal.error ? h('span', { class: 'badge err', title: S.nsSeal.error }, 'document not decrypted') : h('span', { class: 'badge ok', title: 'kid ' + S.nsSeal.kid }, 'decrypted in this browser')) : null,
+      S.nsLevel === 'e2e' ? h('button', { class: 'link small', onclick: () => showTab('keys') }, 'keyring →') : null));
+  }
   box.className = '';
   box.replaceChildren(
     h('div', { class: 'state-line' }, h('b', {}, S.ns),
       d.read ? h('span', { class: 'badge ' + (d.read === 'public' ? 'info' : '') }, 'read: ' + d.read) : null,
       d.frozen ? h('span', { class: 'badge warn' }, 'frozen') : null,
-      d.base ? h('span', { class: 'badge' }, 'branch') : null),
-    kv);
+      d.base ? h('span', { class: 'badge' }, 'branch') : null,
+      S.nsLevel === 'sealed' || S.nsLevel === 'e2e' ? h('span', { class: 'badge tomb' }, S.nsLevel === 'e2e' ? 'E3 end-to-end' : 'E2 sealed') : null),
+    kv,
+    S.nsSeal && S.nsSeal.error ? h('div', { class: 'note' }, 'The namespace document is sealed (application/jose). ' + S.nsSeal.error + ' — see the Keys tab.') : '');
 }
 
 function renderNsDoc() {
-  setJSON($('nsDoc'), S.nsDoc);
+  setJSON($('nsDoc'), S.nsDoc != null ? S.nsDoc : (S.nsRaw || null));
   $('nsDocMeta').textContent = S.nsHead ? `as of ${short(S.nsHead)}` : '';
 }
 
@@ -569,16 +591,19 @@ async function refreshRes() {
   const r = await api('GET', rpath(), { auto: true });
   if (ns !== S.ns || res !== S.res) return;
   let st;
-  if (r.status === 200) st = { kind: 'live', head: r.hdr('X-Revision') || r.etag(), doc: r.json, via: r.finalPath };
-  else if (r.status === 410 && r.json && r.json.tombstone) st = { kind: 'tomb', head: r.json.tombstone, last: r.json.last };
+  if (r.status === 200) {
+    st = { kind: 'live', head: r.hdr('X-Revision') || r.etag() || foldTarget(r.finalPath), via: r.finalPath };
+    Object.assign(st, await readDoc(ns, res, st.head, r));
+  } else if (r.status === 410 && r.json && r.json.tombstone) st = { kind: 'tomb', head: r.json.tombstone, last: r.json.last };
   else if (r.status === 410) st = { kind: 'purged' };
   else if (r.status === 404) st = { kind: 'missing' };
   else st = { kind: 'error', status: r.status, code: r.json && r.json.code };
+  if (ns !== S.ns || res !== S.res) return;
   S.resState = st;
   if (st.kind === 'tomb' && st.last) {
     const lr = await api('GET', rpath(`/rev/${st.last}`), { auto: true });
     if (ns !== S.ns || res !== S.res) return;
-    if (lr.status === 200) st.lastDoc = lr.json;
+    if (lr.status === 200) { const d = await readDoc(ns, res, st.last, lr); st.lastDoc = d.doc; st.seal = d.seal; st.fold = d.fold; st.foldErr = d.foldErr; }
   }
   renderResAll();
   if (!S.ifDirty) $('ifMatch').value = st.head || '';
@@ -589,6 +614,7 @@ async function refreshRes() {
 function renderResAll() {
   const box = $('resState'), st = S.resState;
   const pre = $('resDoc');
+  renderResSeal(st);
   if (!S.ns || !S.res) { box.className = 'muted'; box.textContent = 'Pick a resource from the heads table, or type a name above.'; setJSON(pre, null); return; }
   if (!st) { box.className = 'muted'; box.textContent = `${S.res} \u2014 loading\u2026`; setJSON(pre, null); return; }
   box.className = '';
@@ -596,12 +622,12 @@ function renderResAll() {
   switch (st.kind) {
     case 'live':
       line.append(h('span', { class: 'badge live' }, 'live'), h('span', { class: 'muted' }, 'head'), idEl(st.head));
-      setJSON(pre, st.doc); break;
+      setJSON(pre, st.doc != null ? st.doc : st.raw); break;
     case 'tomb':
       line.append(h('span', { class: 'badge tomb' }, 'tombstoned'), h('span', { class: 'muted' }, 'tombstone'), idEl(st.head));
       if (st.last) line.append(h('span', { class: 'muted' }, 'last'), idEl(st.last));
       box.replaceChildren(line, h('div', { class: 'note' }, 'GET answered 410. Restore with If-Match set to the tombstone; the document below is the last live one.'));
-      setJSON(pre, st.lastDoc); return;
+      setJSON(pre, st.lastDoc != null ? st.lastDoc : st.raw); return;
     case 'purged':
       line.append(h('span', { class: 'badge err' }, 'purged'));
       box.replaceChildren(line, h('div', { class: 'note' }, '410 gone: the content was removed for good. Creating this name again is refused.'));
@@ -621,7 +647,14 @@ function normIf(v) { v = (v || '').trim(); return v ? quoteId(v) : ''; }
 
 async function writeRes(kind) {
   if (!S.ns || !S.res) return toast('Select a namespace and a resource name');
-  const patch = $('patch').value;
+  let patch = $('patch').value;
+  const usesPatch = kind === 'create' || kind === 'append' || (kind === 'restore' && $('restoreEditor').checked);
+  if (usesPatch && $('sealE2E').checked && S.res !== 'keyring') return writeSealed(kind, patch);
+  if (usesPatch && $('addNonce').checked) {
+    const p = tryParse(patch);
+    if (!p.ok || !Array.isArray(p.v)) return toast('The patch set is not a JSON array');
+    patch = fmtPatch(withNonce(p.v));
+  }
   let r;
   if (kind === 'create') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-None-Match': '*' }, body: patch });
   else if (kind === 'append') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value) }, body: patch });
@@ -684,19 +717,36 @@ async function loadHistory() {
   const { ns, res } = S;
   const r = await api('GET', rpath(`/rev/${st.head}/log`), { auto: true });
   if (ns !== S.ns || res !== S.res) return;
-  S.hist = r.status === 200 && Array.isArray(r.json) ? r.json : [];
+  let hist = r.status === 200 && Array.isArray(r.json) ? r.json : [];
+  S.histNote = '';
+  if (hist.length && typeof hist[0] === 'string') {
+    // E2: an array of per-entry JWEs under the resource's key K_r (§E.2.2).
+    hist = await openEntries(ns, res, hist, st.head, r);
+    S.histNote = 'Entries were sealed (application/jose); decrypted in this browser.';
+  } else if (S.nsLevel === 'e2e' && res !== 'keyring' && hist.length) {
+    // E3: plain entries whose patch sets are sealed; fold them here to flag bad revisions (§E.3.2).
+    const since = new URLSearchParams((r.finalPath || '').split('?')[1] || '').get('since') || '';
+    try { hist = (await foldLog(ns, res, st.head, since, hist)).entries; S.histNote = 'Sealed patch sets opened and folded in this browser.'; }
+    catch (err) { S.histNote = 'Could not fold: ' + err.message; }
+  }
+  if (ns !== S.ns || res !== S.res) return;
+  S.hist = hist;
   if (r.status !== 200) S.histErr = r; else S.histErr = null;
   renderHistory();
 }
 
 function opsSummary(e) {
   if (e.kind === 'tombstone') return 'tombstone (deleted)';
-  return (e.patches || []).map((p) => `${p.op} ${p.path === '' ? '(root)' : p.path}`).join(', ') || '(no ops)';
+  if (e.kind === 'snapshot') return 'prune snapshot (sealed document)';
+  if (e._err) return 'sealed entry: ' + e._err;
+  const ops = (p) => p.map((x) => `${x.op} ${x.path === '' ? '(root)' : x.path}`).join(', ') || '(no ops)';
+  if (PLSeal.sealedJWE(e.patches)) return e._plain ? 'sealed: ' + ops(e._plain) : 'sealed patch set' + (e._flag ? '' : ' (not opened)');
+  return ops(e.patches || []);
 }
 
 function renderHistory() {
   const ul = $('timeline');
-  $('histMeta').textContent = S.res ? `${S.ns}/${S.res}` : '';
+  $('histMeta').textContent = S.res ? `${S.ns}/${S.res}` + (S.histNote ? ' · ' + S.histNote : '') : '';
   if (!S.hist.length) {
     ul.replaceChildren(h('li', { class: 'muted', style: 'cursor:default' }, S.res ? (S.histErr ? `Log answered ${S.histErr.status} ${(S.histErr.json || {}).code || ''}` : 'No history loaded.') : 'Select a resource.'));
     return;
@@ -704,8 +754,12 @@ function renderHistory() {
   ul.replaceChildren(...[...S.hist].reverse().map((e) => {
     const tomb = e.kind === 'tombstone';
     const li = h('li', { class: (tomb ? 'tomb ' : '') + (e.id === S.selRev ? 'sel' : ''), tabindex: 0, role: 'button' },
-      h('div', { class: 'top1' }, kindBadge(e.kind), idEl(e.id), h('span', { class: 'muted' }, e.author || ''), h('span', { class: 'muted mono', title: e.created }, tsFmt(e.created))),
-      h('div', { class: 'ops' }, opsSummary(e)));
+      h('div', { class: 'top1' }, kindBadge(e.kind), idEl(e.id), h('span', { class: 'muted' }, e.author || ''), h('span', { class: 'muted mono', title: e.created }, tsFmt(e.created)),
+        e._sealed ? h('span', { class: 'badge tomb', title: 'kid ' + e._sealed }, 'sealed') : null,
+        e._flag ? h('span', { class: 'badge err', title: e._flag }, 'flagged') : null),
+      h('div', { class: 'ops' }, opsSummary(e)),
+      e._flag ? h('div', { class: 'ops', style: 'color:var(--err)' }, e._flag + (e.author ? ` (author ${e.author} is accountable)` : '')) : null,
+      e._note ? h('div', { class: 'ops muted' }, e._note) : null);
     li.onclick = () => selectRev(e.id);
     li.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectRev(e.id); } };
     return li;
@@ -727,9 +781,18 @@ async function selectRev(id) {
     h('button', { class: 'tiny', onclick: () => { $('pruneH').value = id; toast('Prune horizon set'); showTab('res'); } }, 'Use as prune horizon'),
     h('button', { class: 'tiny', onclick: () => copy(id) }, 'Copy id'));
   const parts = [head, meta, acts];
-  if (entry.patches) parts.push(h('h3', {}, 'Patches'), jsonPre(entry.patches));
-  if (r.status === 200) parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision'), jsonPre(r.text ? pretty(r.text) : ''));
-  else if (r.status === 410 && entry.kind === 'tombstone') parts.push(h('p', { class: 'note' }, '410: a tombstone id has no document; earlier revisions stay readable.'));
+  if (entry._flag) parts.push(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'flagged'), '  ' + entry._flag + '. The revision is left out of the fold; its author is accountable (§E.3.2).'));
+  if (entry._plain) parts.push(h('h3', {}, 'Patches (decrypted in this browser)'), jsonPre(entry._plain), h('details', {}, h('summary', { class: 'muted small' }, 'sealed patch set as stored (ids are over this ciphertext)'), jsonPre(entry.patches)));
+  else if (entry.patches) parts.push(h('h3', {}, 'Patches'), jsonPre(entry.patches));
+  if (entry._raw) parts.push(h('details', {}, h('summary', { class: 'muted small' }, 'log entry as served (JWE)'), jsonPre(entry._raw)));
+  if (r.status === 200) {
+    const d = await readDoc(S.ns, S.res, id, r);
+    if (S.selRev !== id) return;
+    if (d.fold) parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision (folded in this browser)'), foldSummary(d.fold), jsonPre(d.doc));
+    else if (d.foldErr) parts.push(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'fold failed'), '  ' + d.foldErr));
+    else if (d.seal) parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision'), sealSummary(d.seal), d.doc != null ? jsonPre(d.doc) : jsonPre(r.text));
+    else parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision'), jsonPre(r.text ? pretty(r.text) : ''));
+  } else if (r.status === 410 && entry.kind === 'tombstone') parts.push(h('p', { class: 'note' }, '410: a tombstone id has no document; earlier revisions stay readable.'));
   else parts.push(h('div', { class: 'errbox' }, h('span', { class: 'code' }, (r.json && r.json.code) || 'HTTP ' + r.status), '  ' + (r.status === 410 && r.json && r.json.code === 'pruned' ? 'below the horizon ' + short(r.json.horizon || '') : '')));
   box.replaceChildren(...parts);
 }
@@ -848,6 +911,1113 @@ function restartStreams(only) {
     if (only && only !== kind) continue;
     if ($(kind === 'ns' ? 'liveNs' : 'liveRes').checked) startStream(kind); else stopStream(kind);
   }
+}
+
+/* ------------------------------------------------------------------ *
+ * encryption (Addendum E): keys, sealed responses, e2e folding
+ * ------------------------------------------------------------------ */
+const Z = PLSeal;
+const KEYS = { epoch: new Map(), res: new Map(), from: new Map(), pending: new Map() };
+const nsInfoCache = new Map(); // ns -> { level, doc }
+let ID = null; // identity { d, x } (base64url X25519 private scalar and public key)
+
+function loadIdentity() {
+  const v = store.get('pl.identity', null);
+  ID = v && typeof v.d === 'string' && typeof v.x === 'string' ? v : null;
+}
+function saveIdentity(v) {
+  ID = v;
+  try { if (v) localStorage.setItem('pl.identity', JSON.stringify(v)); else localStorage.removeItem('pl.identity'); } catch (_) { toast('localStorage is unavailable: the identity lasts until reload'); }
+  renderIdentity(); renderKeyring();
+}
+
+function keyFrom(kid, resource, from) { KEYS.from.set(kid + '\n' + (resource || ''), from); renderKeysHeld(); }
+function holdEpoch(kid, key, from) { KEYS.epoch.set(kid, key); keyFrom(kid, '', from); }
+function holdRes(kid, resource, key, from) { KEYS.res.set(kid + '\n' + resource, key); keyFrom(kid, resource, from); }
+
+/* nsInfo returns a namespace's encryption level and (plaintext or decrypted) document. */
+async function nsInfo(ns) {
+  if (nsInfoCache.has(ns)) return nsInfoCache.get(ns);
+  const r = await api('GET', `/ns/${ns}`, { auto: true });
+  let info = { level: '', doc: null };
+  if (r.status === 200 && r.jose) info = { level: 'sealed', doc: null };
+  else if (r.status === 200) info = { level: (r.json && r.json.encryption && r.json.encryption.level) || '', doc: r.json };
+  nsInfoCache.set(ns, info);
+  return info;
+}
+
+/* takeKeys stores the entries of a POST /ns/{ns}/keys answer: raw keys, or keys wrapped to the grant's enc. */
+async function takeKeys(arr) {
+  let n = 0;
+  for (const e of arr || []) {
+    if (!e || typeof e.kid !== 'string') continue;
+    let key, from = 'POST /keys (raw)';
+    if (typeof e.key === 'string') key = Z.unb64u(e.key);
+    else if (typeof e.wrapped === 'string') {
+      if (e.suite && e.suite !== Z.SUITE) continue;
+      if (!ID) throw new Error('the keys are wrapped to the grant\'s enc: import that identity in the Keys tab');
+      key = await Z.unwrapKey(ID, e.kid, e.resource || '', Z.unb64u(e.wrapped));
+      from = 'POST /keys (HPKE-wrapped)';
+    } else continue;
+    if (key.length !== 32) continue;
+    if (e.resource) holdRes(e.kid, e.resource, key, from); else holdEpoch(e.kid, key, from);
+    n++;
+  }
+  return n;
+}
+
+/* keyringKey unwraps an e2e epoch key from the namespace's keyring with this identity (§E.3.2). */
+async function keyringKey(ns, epoch) {
+  if (!ID) throw new Error('no identity: generate or import one in the Keys tab');
+  const r = await api('GET', `/r/${ns}/keyring`, { auto: true, label: 'keyring' });
+  if (r.status !== 200 || !r.json) throw new Error(`no keyring in ${ns} (GET answered ${r.status})`);
+  const kr = Z.parseKeyring(r.json);
+  const key = await Z.keyringEpochKey(kr, ID, epoch);
+  holdEpoch(Z.kid(ns, epoch), key, 'keyring (HPKE-wrapped)');
+  return key;
+}
+
+async function fetchKeyFor(kid, resource) {
+  const { ns, epoch } = Z.parseKid(kid);
+  const info = await nsInfo(ns);
+  const bearer = !!$('bearer').value.trim();
+  if (info.level !== 'e2e' || bearer) {
+    const body = { epochs: [epoch] };
+    if (resource && info.level !== 'e2e') body.resources = [resource];
+    const r = await api('POST', `/ns/${ns}/keys`, { body, auto: true, label: 'keys' });
+    if (r.ok && r.json) await takeKeys(r.json.keys);
+    if (KEYS.epoch.has(kid) || (resource && KEYS.res.has(kid + '\n' + resource))) return;
+    if (info.level !== 'e2e') throw new Error(`POST /ns/${ns}/keys gave no key for ${kid}${resource ? ' / ' + resource : ''} (HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''})`);
+  }
+  await keyringKey(ns, epoch);
+}
+
+/* contentKey returns K_e (resource "") or K_r for kid, fetching it once if needed. */
+async function contentKey(kid, resource) {
+  const rk = kid + '\n' + (resource || '');
+  if (resource && KEYS.res.has(rk)) return KEYS.res.get(rk);
+  if (!KEYS.epoch.has(kid)) {
+    if (!KEYS.pending.has(rk)) KEYS.pending.set(rk, fetchKeyFor(kid, resource).finally(() => KEYS.pending.delete(rk)));
+    await KEYS.pending.get(rk);
+    if (resource && KEYS.res.has(rk)) return KEYS.res.get(rk);
+  }
+  const ke = KEYS.epoch.get(kid);
+  if (!ke) throw new Error('no key for ' + kid);
+  if (!resource) return ke;
+  const kr = await Z.resourceKey(ke, Z.parseKid(kid).ns, resource);
+  holdRes(kid, resource, kr, 'derived from ' + kid);
+  return kr;
+}
+
+/* openSealed decrypts a JWE of namespace ns after checking its kid and pl against what was asked for. */
+async function openSealed(ns, jwe, resource, wantPL) {
+  const { header } = Z.parseJWE(jwe);
+  const k = Z.parseKid(header.kid);
+  const want = typeof wantPL === 'function' ? wantPL(header) : wantPL;
+  const diff = Z.plDiff(header.pl, want);
+  const checks = [
+    { ok: !ns || k.ns === ns, what: `kid ${header.kid} names namespace ${k.ns}` + (ns && k.ns !== ns ? `, not ${ns}` : '') },
+    { ok: !diff.length, what: diff.length ? `pl differs from the request in ${diff.join(', ')}: got ${Z.canonical(header.pl)}, want ${Z.canonical(want)}` : `pl ${Z.canonical(header.pl)} matches the request` },
+  ];
+  if (checks.some((c) => !c.ok)) throw Object.assign(new Error(checks.filter((c) => !c.ok).map((c) => c.what).join('; ')), { checks, header });
+  const key = await contentKey(header.kid, resource);
+  const o = await Z.openJWE(jwe, key);
+  checks.push({ ok: true, what: `decrypted with ${resource ? 'K_r(' + k.ns + ', ' + resource + ')' : 'K_e'} of ${header.kid}` + (header.zip ? ', inflated' : '') + (/ +$/.test(o.text) ? ', padded' : '') });
+  let value = o.text;
+  try { value = JSON.parse(o.text); } catch (_) { /* not JSON */ }
+  return { header, kid: header.kid, text: o.text, value, checks };
+}
+
+/* decrypted opens a jose response and attaches the result to its inspector entry. */
+async function decrypted(r, ns, resource, wantPL) {
+  if (!r.jose) return { value: r.json };
+  try {
+    const d = await openSealed(ns, r.text.trim(), resource, wantPL);
+    r.entry.dec = d; renderEntry(r.entry);
+    return d;
+  } catch (err) {
+    r.entry.dec = { error: err.message, checks: err.checks, header: err.header }; renderEntry(r.entry);
+    return { value: null, error: err.message, checks: err.checks };
+  }
+}
+
+function checkList(checks) {
+  return h('ul', { class: 'checks' }, ...(checks || []).map((c) => h('li', { class: c.ok ? 'ok' : 'bad' }, (c.ok ? '✓ ' : '✗ ') + c.what)));
+}
+function decView(d) {
+  return h('div', { class: 'dec' }, h('h3', {}, d.error ? 'Not decrypted' : 'Decrypted in this browser'),
+    d.header ? h('div', { class: 'mono small' }, 'protected header ' + JSON.stringify(d.header)) : null,
+    checkList(d.checks), d.error ? h('div', { class: 'errline' }, d.error) : jsonPre(typeof d.value === 'string' ? d.value : JSON.stringify(d.value, null, 2)));
+}
+function sealSummary(d) {
+  return h('div', { class: 'seal-box' + (d.error ? ' bad' : '') },
+    h('div', { class: 'state-line' }, h('span', { class: 'badge tomb' }, 'application/jose'), d.error ? h('span', { class: 'badge err' }, 'not decrypted') : h('span', { class: 'badge ok' }, 'decrypted'), d.kid ? h('span', { class: 'mono small' }, 'kid ' + d.kid) : null),
+    checkList(d.checks), d.error ? h('div', { class: 'errline' }, d.error) : null);
+}
+
+async function nsLogOpen(ns, r, head) {
+  const since = new URLSearchParams((r.finalPath || '').split('?')[1] || '').get('since') || '';
+  const d = await decrypted(r, ns, '', { ns, range: [since, head] });
+  S.nsLogSeal = d;
+  return Array.isArray(d.value) ? d.value : null;
+}
+
+/* openEntries decrypts an E2 resource log (per-entry JWEs under K_r, pl {ns, name, id, kind}) and checks the chain. */
+async function openEntries(ns, name, arr, last, r) {
+  const since = new URLSearchParams((r.finalPath || '').split('?')[1] || '').get('since') || '';
+  const out = [];
+  let prev = since, err = '';
+  for (const jwe of arr) {
+    let hdr = null;
+    try { hdr = Z.parseJWE(jwe).header; } catch (_) { /* reported below */ }
+    const pl = (hdr && hdr.pl) || {};
+    try {
+      if (pl.kind !== 'rev' && pl.kind !== 'tombstone') throw new Error('entry of kind ' + JSON.stringify(pl.kind));
+      const d = await openSealed(ns, jwe, name, { ns, name, id: pl.id, kind: pl.kind });
+      const e = d.value;
+      if (!e || e.id !== pl.id || e.kind !== pl.kind) throw new Error('the entry does not match its binding');
+      if ((out.length || since) && (e.parent || '') !== prev) err = err || `the log does not chain at ${short(e.id)}`;
+      prev = e.id;
+      out.push(Object.assign({}, e, { _sealed: d.kid, _raw: jwe }));
+    } catch (x) {
+      out.push({ id: pl.id || '?', kind: pl.kind || '?', _err: x.message, _raw: jwe });
+      prev = pl.id || prev;
+    }
+  }
+  if (!err && last && prev !== last) err = `the log ends at ${short(prev)}, not ${short(last)}`;
+  if (err) out.forEach((e) => { e._flag = e._flag || err; });
+  return out;
+}
+
+/* ---- e2e (E3) folding, as internal/client/e2e.go ---- */
+function foldTarget(path) { return (/\/rev\/(1[a-z2-7]{32})\/log(?:\?|$)/.exec(path || '') || [])[1] || ''; }
+
+/* readDoc turns a 200 answer for a document into { doc, seal?, fold?, foldErr?, raw? }. */
+async function readDoc(ns, name, id, r) {
+  if (foldTarget(r.finalPath) && Array.isArray(r.json)) {
+    const since = new URLSearchParams(r.finalPath.split('?')[1] || '').get('since') || '';
+    try { const f = await foldLog(ns, name, id, since, r.json); return { doc: f.value, fold: f }; }
+    catch (err) { return { doc: null, foldErr: err.message, raw: r.text }; }
+  }
+  if (r.jose) { const d = await decrypted(r, ns, name, { ns, name, id, kind: 'doc' }); return { doc: d.value, seal: d, raw: r.text }; }
+  return { doc: r.json };
+}
+
+/* nsChainOK: a branch reads its bases' ciphertext, sealed under their keys (§F.8). */
+async function nsChainOK(ns, kns) {
+  for (let cur = ns, i = 0; cur && i < 16; i++) {
+    if (cur === kns) return true;
+    const info = await nsInfo(cur);
+    cur = info.doc && info.doc.base && info.doc.base.ns;
+  }
+  return false;
+}
+
+const schemaCache = new Map();
+/* validateDoc checks doc against its $schema with the subset validator (§E.3.2: validation moves to clients). */
+async function validateDoc(doc) {
+  if (!doc || typeof doc !== 'object' || Array.isArray(doc) || typeof doc.$schema !== 'string') return { errors: [] };
+  const m = /^\/r\/([a-z0-9][a-z0-9_-]*)\/([^/]+)\/rev\/(1[a-z2-7]{32})$/.exec(doc.$schema);
+  if (!m) return { errors: [], note: '$schema ' + doc.$schema + ' is not a revision path; not validated here' };
+  let schema = schemaCache.get(doc.$schema);
+  if (schema === undefined) {
+    const r = await api('GET', doc.$schema, { auto: true, label: 'schema' });
+    if (r.status === 200) schema = (await readDoc(m[1], m[2], m[3], r)).doc;
+    else if (r.status === 404 || r.status === 410) schema = null;
+    else throw new Error(`fetching the schema ${doc.$schema} answered ${r.status}`);
+    schemaCache.set(doc.$schema, schema);
+  }
+  if (!schema || typeof schema !== 'object') return { errors: [{ pointer: '', message: 'schema_unavailable: ' + doc.$schema }] };
+  const v = Z.validate(schema, doc);
+  return { errors: v.errors, note: v.unchecked.length ? 'validated in this browser, except keywords ' + v.unchecked.join(', ') : 'validated in this browser against its $schema' };
+}
+
+const paddedLength = (n) => Z.padLen(n);
+
+/* foldLog verifies and folds an e2e log answer that ends at id and starts after since. */
+async function foldLog(ns, name, id, since, arr) {
+  const out = { id, since, entries: [], flagged: [], validID: '', value: undefined, notes: [] };
+  const bad = (msg) => { throw new Error(`e2e log of ${ns}/${name}: ${msg}`); };
+  let doc, exists = false, prev = '', i = 0;
+  const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
+  if (since) {
+    const m = arr[0] || {};
+    if (m.kind !== 'snapshot' || m.id !== since || typeof m.snapshot !== 'string') bad(`the range after ${since} does not start with its snapshot`);
+    const hdr = Z.parseJWE(m.snapshot).header;
+    const kns = Z.parseKid(hdr.kid).ns;
+    if (!(await nsChainOK(ns, kns))) bad('snapshot sealed under ' + hdr.kid);
+    const d = await openSealed(kns, m.snapshot, '', { ns: kns, name, id: since, kind: 'snapshot' });
+    doc = d.value; exists = true; prev = since; out.validID = since;
+    out.entries.push({ id: since, kind: 'snapshot', _sealed: hdr.kid, _note: 'the prune snapshot the log starts from', _doc: doc });
+    i = 1;
+  }
+  for (; i < arr.length; i++) {
+    const e = Object.assign({}, arr[i]);
+    out.entries.push(e);
+    if ((e.parent || '') !== prev) bad(`entry ${e.id} does not chain`);
+    if (e.kind === 'tombstone') {
+      if ((await Z.tombstoneID(e.parent)) !== e.id) bad(`tombstone ${e.id} has the wrong id`);
+      prev = e.id; continue;
+    }
+    if (e.kind !== 'rev') bad(`entry ${e.id} of kind ${e.kind}`);
+    if (!Array.isArray(e.patches)) bad(`revision ${e.id} has no patch set`);
+    const flag = (msg) => { e._flag = msg; out.flagged.push({ id: e.id, author: e.author, message: msg }); };
+    const jwe = Z.sealedJWE(e.patches);
+    if (jwe || !e.patches.length) {
+      if ((await Z.revisionID(e.parent || '', e.patches)) !== e.id) bad(`revision ${e.id} has the wrong id`);
+    }
+    prev = e.id;
+    if (!e.patches.length) { out.validID = e.id; e._note = 'restore with []: the last live document comes back'; continue; }
+    if (!jwe) { flag('not a sealed patch set'); continue; }
+    let hdr, kns;
+    try { hdr = Z.parseJWE(jwe).header; kns = Z.parseKid(hdr.kid).ns; } catch (err) { flag('sealed patch set: ' + err.message); continue; }
+    if (!(await nsChainOK(ns, kns))) { flag('sealed under another namespace\'s key ' + hdr.kid); continue; }
+    e._sealed = hdr.kid;
+    const key = await contentKey(hdr.kid, '');
+    let o;
+    try { o = await Z.openJWE(jwe, key); } catch (err) { flag('sealed patch set: ' + err.message); continue; }
+    const diff = Z.plDiff(hdr.pl, { ns: kns, name, parent: e.parent || '' });
+    if (diff.length) { flag('sealed patch set bound to another ' + diff.join(', ')); continue; }
+    let plain;
+    try { plain = JSON.parse(o.text); } catch (err) { flag('patch set: ' + err.message); continue; }
+    e._plain = plain;
+    if (cfg.pad && o.plaintext.length !== paddedLength(Z.utf8(o.text.replace(/ +$/, '')).length)) e._note = 'not padded to its size bucket (the namespace has pad; it may predate it)';
+    let res;
+    try { res = Z.applyPatch(doc, exists, plain); } catch (err) { flag('patch set does not apply: ' + err.message); continue; }
+    const v = await validateDoc(res.doc);
+    if (v.errors.length) { flag('the document does not validate against its $schema: ' + v.errors.map((x) => (x.pointer || '(root)') + ' ' + x.message).join('; ')); continue; }
+    if (v.note) e._note = (e._note ? e._note + '; ' : '') + v.note;
+    doc = res.doc; exists = res.exists; out.validID = e.id; e._doc = doc;
+  }
+  if (prev !== id) bad(`the log ends at ${prev}, not ${id}`);
+  if (!exists) bad('no valid revision');
+  out.value = doc;
+  return out;
+}
+
+function foldSummary(f) {
+  const revs = f.entries.filter((e) => e.kind === 'rev').length;
+  return h('div', { class: 'seal-box' + (f.flagged.length ? ' bad' : '') },
+    h('div', { class: 'state-line' }, h('span', { class: 'badge tomb' }, 'E3'), h('span', {}, `folded ${revs} sealed revision(s)` + (f.since ? ' from a prune snapshot' : '') + ' in this browser'),
+      f.flagged.length ? h('span', { class: 'badge err' }, `${f.flagged.length} flagged`) : h('span', { class: 'badge ok' }, 'all valid')),
+    f.validID && f.validID !== f.id ? h('div', { class: 'note' }, 'The document is that of the last valid revision ', idEl(f.validID), '.') : null,
+    f.flagged.length ? h('ul', { class: 'checks' }, ...f.flagged.map((x) => h('li', { class: 'bad' }, '✗ ', idEl(x.id), ` ${x.author || ''}: ${x.message}`))) : null);
+}
+
+function renderResSeal(st) {
+  const box = $('resSeal');
+  const parts = [];
+  if (st && st.seal) parts.push(sealSummary(st.seal));
+  if (st && st.fold) parts.push(foldSummary(st.fold));
+  if (st && st.foldErr) parts.push(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'e2e fold failed'), '  ' + st.foldErr));
+  if (st && st.raw && (st.seal || st.foldErr)) parts.push(h('details', {}, h('summary', { class: 'muted small' }, 'raw response as served'), jsonPre(st.raw)));
+  box.hidden = !parts.length;
+  box.replaceChildren(...parts);
+}
+
+function withNonce(ops) {
+  return ops.filter((o) => !(o && o.path === '/$nonce' && (o.op === 'add' || o.op === 'replace'))).concat([{ op: 'add', path: '/$nonce', value: Z.newNonce() }]);
+}
+
+/* syncSealBoxes presets the write options for the selected namespace's level. */
+function syncSealBoxes() {
+  const sealed = S.nsLevel === 'sealed' || S.nsLevel === 'e2e';
+  $('addNonce').checked = sealed;
+  $('sealE2E').checked = S.nsLevel === 'e2e';
+  $('sealE2E').disabled = S.nsLevel !== 'e2e';
+}
+
+/* writeSealed seals a patch set in the browser and sends it, like client.E2E (§E.3.1). */
+async function writeSealed(kind, patchText) {
+  const { ns, res } = S;
+  const p = tryParse(patchText);
+  if (!p.ok || !Array.isArray(p.v)) return toast('The patch set is not a JSON array');
+  const out = $('sealOut'); out.hidden = false;
+  const fail = (msg) => { out.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'not sent'), '  ' + msg)); };
+  try {
+    const parent = kind === 'create' ? '' : ($('ifMatch').value.trim().replace(/"/g, ''));
+    if (kind !== 'create' && !ID_RE.test(parent)) return fail('If-Match must be the parent revision id');
+    // The document the patches apply to: the parent's, or for a restore the last live one.
+    let base, exists = false;
+    if (kind !== 'create') {
+      const at = kind === 'restore' ? (S.resState && S.resState.last) : parent;
+      if (!at) return fail('no last live revision to restore onto');
+      const r = await api('GET', `/r/${ns}/${res}/rev/${at}`, { auto: true });
+      const d = r.status === 200 ? await readDoc(ns, res, at, r) : { foldErr: 'HTTP ' + r.status };
+      if (d.foldErr || d.doc === undefined) return fail('could not fold the base document: ' + (d.foldErr || 'no document'));
+      base = d.doc; exists = true;
+    }
+    let patches = p.v;
+    const trial = Z.applyPatch(base, exists, patches);
+    if ($('addNonce').checked && trial.doc && typeof trial.doc === 'object' && !Array.isArray(trial.doc)) patches = withNonce(patches);
+    const result = Z.applyPatch(base, exists, patches).doc;
+    const v = await validateDoc(result);
+    if (v.errors.length && !confirm('The resulting document does not validate against its $schema:\n\n' + v.errors.map((x) => (x.pointer || '(root)') + ' ' + x.message).join('\n') + '\n\nReaders will flag this revision. Write it anyway?')) return fail('the document does not validate: ' + v.errors.map((x) => x.message).join('; '));
+    const info = await nsInfo(ns);
+    const enc = (info.doc && info.doc.encryption) || {};
+    const kid = Z.kid(ns, enc.epoch || 1);
+    const key = await contentKey(kid, '');
+    const body = Z.canonical(await Z.sealPatchSet(key, kid, ns, res, parent, patches, !!enc.pad));
+    const expect = await Z.revisionID(parent, JSON.parse(body));
+    const headers = kind === 'create' ? { 'If-None-Match': '*' } : { 'If-Match': quoteId(parent) };
+    S.lastSealed = { path: rpath(), headers, body, expect, patches, kid, parent };
+    $('resendSealed').hidden = false;
+    await sendSealed();
+  } catch (err) { fail(err.message); }
+}
+
+async function sendSealed() {
+  const x = S.lastSealed; if (!x) return;
+  const r = await api('PATCH', x.path, { ct: PJ, headers: x.headers, body: x.body, label: 'e2e write' });
+  const got = r.etag();
+  $('sealOut').hidden = false;
+  $('sealOut').replaceChildren(h('div', { class: 'seal-box' + (r.ok ? '' : ' bad') },
+    h('div', { class: 'state-line' }, h('span', { class: 'badge tomb' }, 'sealed in this browser'), h('span', { class: 'mono small' }, 'kid ' + x.kid), h('span', { class: 'badge ' + (r.ok ? 'ok' : 'err') }, r.neterr ? 'network error' : 'HTTP ' + r.status)),
+    h('div', { class: 'small' }, 'pl ', h('code', {}, Z.canonical({ ns: S.ns, name: S.res, parent: x.parent })), ' · expected id ', idEl(x.expect),
+      got ? (got === x.expect ? h('span', { class: 'badge ok' }, 'server id matches') : h('span', { class: 'badge err' }, 'server id differs: ' + short(got))) : null),
+    h('details', {}, h('summary', { class: 'muted small' }, 'plaintext patch set (never sent)'), jsonPre(x.patches)),
+    r.ok || r.status === 412 || r.status === 422 ? null : h('div', { class: 'note' }, 'Not acknowledged: resend the exact same ciphertext so a retry keeps the id (§E.3.1).')));
+  if (r.status === 201 || r.status === 200) { S.ifDirty = false; S.lastSealed = null; $('resendSealed').hidden = true; await afterWrite(); }
+}
+
+/* ---- Keys tab ---- */
+function renderIdentity() {
+  const box = $('idStatus');
+  $('idDot').hidden = !ID;
+  if (!ID) { box.className = 'muted'; box.textContent = 'No identity yet: generate one, or import a private key.'; return; }
+  box.className = '';
+  const jwk = Z.recipientJWK(ID.x);
+  const rid = h('span', { class: 'muted' }, '…');
+  Z.recipientID(ID.x).then((v) => { rid.replaceWith(idEl(v)); });
+  const block = { kid: '<key id>', sub: 'user:you', ns: [S.ns || 'ns'], can: ['read'], exp: '2026-12-31T00:00:00Z', enc: jwk };
+  box.replaceChildren(
+    h('dl', { class: 'kv' }, h('dt', {}, 'public key'), h('dd', { class: 'mono' }, ID.x), h('dt', {}, 'recipient id'), h('dd', {}, rid)),
+    h('div', { class: 'row' }, h('button', { class: 'tiny', onclick: () => copy(JSON.stringify(jwk), 'public JWK') }, 'Copy public JWK'),
+      h('button', { class: 'tiny', onclick: () => { $('krReader').value = JSON.stringify(jwk); toast('Reader field set'); } }, 'Use as reader below')),
+    jsonPre(jwk),
+    h('details', {}, h('summary', { class: 'muted small' }, 'a read grant that carries it (E2)'),
+      h('pre', { class: 'raw' }, `patchlog grant mint -key SEED -block '${JSON.stringify(block)}'`)));
+}
+
+function renderKeysHeld() {
+  const tb = $('keysTbl').tBodies[0];
+  const rows = [...KEYS.from.entries()].sort();
+  if (!rows.length) { tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 3 }, 'No keys yet.'))); return; }
+  tb.replaceChildren(...rows.map(([k, from]) => { const [kid, res] = k.split('\n'); return h('tr', {}, h('td', { class: 'mono' }, kid), h('td', { class: 'mono' }, res || '—'), h('td', { class: 'small' }, from)); }));
+}
+
+async function fetchKeysForm() {
+  const ns = $('keysNs').value.trim() || S.ns;
+  if (!ns) return toast('Enter a namespace');
+  const body = {};
+  const ep = $('keysEpochs').value.split(',').map((s) => s.trim()).filter(Boolean);
+  if (ep.length) body.epochs = ep.map(Number);
+  const rs = $('keysRes').value.split(',').map((s) => s.trim()).filter(Boolean);
+  if (rs.length) body.resources = rs;
+  const r = await api('POST', `/ns/${ns}/keys`, { body });
+  if (r.ok && r.json) {
+    try { toast(`${await takeKeys(r.json.keys)} key(s) stored`); } catch (err) { toast(err.message); }
+  }
+}
+
+async function genIdentity() {
+  if (ID && !confirm('Replace the current identity? Keys wrapped to it can no longer be opened here.')) return;
+  try { saveIdentity(await Z.generateIdentity()); toast('Identity generated'); } catch (err) { toast('X25519 is not available in this browser: ' + err.message); }
+}
+async function importIdentity() {
+  const t = $('idImport').value.trim();
+  if (!t) return toast('Paste a private key');
+  try {
+    let d = t;
+    if (t.startsWith('{')) { const j = JSON.parse(t); if (j.kty !== 'OKP' || j.crv !== 'X25519' || !j.d) throw new Error('want an OKP/X25519 JWK with d'); d = j.d; }
+    saveIdentity(await Z.identityFromPrivate(d));
+    $('idImport').value = '';
+    toast('Identity imported');
+  } catch (err) { toast('Import failed: ' + err.message); }
+}
+
+/* ---- E3 keyring administration (client.E2E InitKeyring / AddReader / RotateEpoch) ---- */
+const KR = { ns: '', doc: null, head: '', status: 0 };
+async function loadKeyring() {
+  KR.ns = S.ns; KR.doc = null; KR.head = ''; KR.status = 0;
+  if (!S.ns || S.nsLevel !== 'e2e') return renderKeyring();
+  const r = await api('GET', `/r/${S.ns}/keyring`, { auto: true, label: 'keyring' });
+  KR.status = r.status;
+  if (r.status === 200) { try { KR.doc = Z.parseKeyring(r.json); KR.head = r.hdr('X-Revision') || r.etag(); } catch (err) { KR.err = err.message; } }
+  renderKeyring();
+}
+async function renderKeyring() {
+  const box = $('krStatus');
+  const lvl = S.nsLevel;
+  $('krMeta').textContent = S.ns ? `${S.ns}${lvl ? ' · ' + lvl : ''}` : '';
+  ['krInit', 'krAdd', 'krRotate'].forEach((b) => { $(b).disabled = lvl !== 'e2e'; });
+  if (!S.ns || lvl !== 'e2e') { box.className = 'muted'; box.textContent = S.ns ? `${S.ns} is not an e2e namespace (encryption.level ${lvl || 'none'}).` : 'Select an e2e namespace above.'; return; }
+  const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
+  box.className = '';
+  if (!KR.doc) {
+    box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, KR.status === 404 ? 'no keyring yet' : 'keyring not readable (' + KR.status + ')'), h('span', { class: 'muted' }, 'encryption.epoch ' + epoch)),
+      h('p', { class: 'note' }, 'Init keyring creates it with a fresh key for epoch ' + epoch + ', wrapped for this identity.'));
+    return;
+  }
+  const mine = ID ? await Z.recipientID(ID.x) : '';
+  const rows = Object.entries(KR.doc.recipients).map(([rid, jwk]) => {
+    const eps = Object.keys(KR.doc.epochs).filter((e) => KR.doc.epochs[e][rid]).sort((a, b) => a - b);
+    return h('tr', {}, h('td', {}, h('input', { type: 'checkbox', class: 'kr-keep', 'data-x': jwk.x, checked: eps.includes(String(KR.doc.current)) || rid === mine, title: 'keep in a rotation' })),
+      h('td', {}, idEl(rid), rid === mine ? h('span', { class: 'badge ok' }, 'this identity') : null), h('td', { class: 'mono small' }, eps.join(', ')));
+  });
+  box.replaceChildren(
+    h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'muted' }, 'keyring head'), idEl(KR.head), h('span', { class: 'muted' }, `current epoch ${KR.doc.current} · encryption.epoch ${epoch}`),
+      KR.doc.current !== epoch ? h('span', { class: 'badge warn' }, 'epoch mismatch') : null,
+      mine && KR.doc.epochs[String(epoch)] && KR.doc.epochs[String(epoch)][mine] ? h('span', { class: 'badge ok' }, 'this identity can read and write') : h('span', { class: 'badge err' }, 'this identity holds no current key')),
+    h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'keep'), h('th', {}, 'recipient'), h('th', {}, 'epochs'))), h('tbody', {}, ...rows))));
+}
+function readerX() {
+  const t = $('krReader').value.trim();
+  if (!t) return '';
+  return t.startsWith('{') ? Z.parseJWK(t) : Z.parseJWK({ kty: 'OKP', crv: 'X25519', x: t });
+}
+async function krInit() {
+  if (!ID) return toast('Generate or import an identity first');
+  try {
+    const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
+    const key = Z.randomBytes(32);
+    const kr = Z.buildKeyring(S.ns, epoch);
+    await Z.keyringAdd(kr, ID.x, epoch, key);
+    const other = readerX();
+    if (other) await Z.keyringAdd(kr, other, epoch, key);
+    let r;
+    if (KR.doc && KR.doc.ns === S.ns) return toast('The namespace already has a keyring');
+    if (KR.doc) r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
+    else r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: kr }], label: 'keyring' });
+    if (r.ok) { holdEpoch(Z.kid(S.ns, epoch), key, 'generated here (Init keyring)'); toast('Keyring created'); await refreshNS(); await loadKeyring(); }
+  } catch (err) { toast(err.message); }
+}
+async function krAdd() {
+  try {
+    const x = readerX();
+    if (!x) return toast('Paste the reader\'s public key');
+    await loadKeyring();
+    if (!KR.doc) return toast('No keyring');
+    const kr = JSON.parse(JSON.stringify(KR.doc));
+    for (const e of Object.keys(kr.epochs).map(Number)) {
+      if (e !== kr.current && !$('krHistory').checked) continue;
+      let key;
+      try { key = await contentKey(Z.kid(S.ns, e), ''); } catch (err) { if (e === kr.current) throw err; continue; }
+      await Z.keyringAdd(kr, x, e, key);
+    }
+    const r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
+    if (r.ok) { toast('Reader added'); await loadKeyring(); }
+  } catch (err) { toast(err.message); }
+}
+async function krRotate() {
+  try {
+    if (!ID) return toast('Generate or import an identity first');
+    await loadKeyring();
+    if (!KR.doc) return toast('No keyring');
+    const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
+    if (KR.doc.current !== epoch) return toast(`The keyring is at epoch ${KR.doc.current} but encryption.epoch is ${epoch}`);
+    const keep = new Set([...document.querySelectorAll('.kr-keep')].filter((c) => c.checked).map((c) => c.dataset.x));
+    keep.add(ID.x);
+    if (!confirm(`Rotate ${S.ns} to epoch ${epoch + 1} for ${keep.size} recipient(s)? Recipients left out cannot read anything written afterwards.`)) return;
+    const kr = JSON.parse(JSON.stringify(KR.doc));
+    const e = kr.current + 1, key = Z.randomBytes(32);
+    kr.epochs[String(e)] = {};
+    for (const x of keep) await Z.keyringAdd(kr, x, e, key);
+    kr.current = e;
+    const r = await api('POST', `/ns/${S.ns}/batch`, { label: 'rotate', body: {
+      config: { ifMatch: S.config, patches: [{ op: 'add', path: '/encryption/epoch', value: e }] },
+      items: [{ resource: 'keyring', ifMatch: KR.head, steps: [[{ op: 'replace', path: '', value: kr }]] }] } });
+    if (r.ok) { holdEpoch(Z.kid(S.ns, e), key, 'generated here (rotation)'); nsInfoCache.delete(S.ns); toast('Rotated to epoch ' + e); await refreshNS(); await loadKeyring(); }
+  } catch (err) { toast(err.message); }
+}
+
+async function decryptPasted() {
+  const out = $('jweOut');
+  const jwe = $('jweIn').value.trim();
+  if (!jwe) return;
+  try {
+    const { header } = Z.parseJWE(jwe);
+    const res = $('jweRes').value.trim() || (header.pl && header.pl.name && header.pl.kind && header.pl.kind !== 'snapshot' ? header.pl.name : '');
+    const d = await openSealed('', jwe, res, header.pl);
+    d.checks.splice(1, 1, { ok: true, what: 'pl ' + Z.canonical(header.pl) + ' (not compared: no request to compare with)' });
+    out.replaceChildren(decView(d));
+  } catch (err) { out.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'failed'), '  ' + err.message)); }
+}
+
+async function runSelfTest() {
+  const out = $('selfOut');
+  out.className = ''; out.textContent = 'Running…';
+  try {
+    const r = await api('GET', '/playground/selftest.json', { label: 'self-test' });
+    if (!r.ok || !r.json) throw new Error('selftest.json: HTTP ' + r.status);
+    const res = await Z.selfTest(r.json);
+    const ok = res.every((x) => x.ok);
+    out.replaceChildren(h('div', { class: 'state-line' }, h('span', { class: 'badge ' + (ok ? 'ok' : 'err') }, ok ? 'all passed' : 'failures'), h('span', { class: 'muted' }, `${res.filter((x) => x.ok).length}/${res.length}`)),
+      checkList(res.map((x) => ({ ok: x.ok, what: x.name + (x.detail ? ': ' + x.detail : '') }))));
+  } catch (err) { out.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'error'), '  ' + err.message)); }
+}
+
+/* ------------------------------------------------------------------ *
+ * catalog (Addendum B)
+ * ------------------------------------------------------------------ */
+const TREE = '/playground/tree';
+const NODE_RE = /^[a-z0-9][a-z0-9_-]*$/;
+const C = {
+  ns: '', head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {},
+  source: '', proxy: null, listing: null, at: '', view: '', note: '', problems: null, sel: '', min: '', loading: false, gen: 0,
+};
+
+const cmpCU = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+const hrefOf = (name) => `/r/${C.ns}/${name}`;
+function nodeName(href) {
+  const m = /^\/r\/([^/]+)\/([^/]+)$/.exec(href || '');
+  return m && m[1] === C.ns ? m[2] : '';
+}
+function itemOf(name) { const i = name.indexOf('.'); return i > 0 ? { ns: name.slice(0, i), name: name.slice(i + 1), href: `/r/${name.slice(0, i)}/${name.slice(i + 1)}` } : null; }
+function parentsOf(n) { return n && n.doc && Array.isArray(n.doc.parents) ? n.doc.parents.filter((p) => p && typeof p.href === 'string') : []; }
+
+async function mapLimit(items, n, fn) {
+  const out = new Array(items.length); let i = 0;
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, async () => { while (i < items.length) { const k = i++; out[k] = await fn(items[k], k); } }));
+  return out;
+}
+async function allHeads(ns, head) {
+  let items = [], after = '';
+  for (let page = 0; page < 20; page++) {
+    const r = await api('GET', `/ns/${ns}/rev/${head}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'catalog' });
+    if (r.status !== 200 || !r.json) break;
+    items = items.concat(r.json.items || []);
+    if (!r.json.next) break;
+    after = r.json.next;
+  }
+  return items;
+}
+/* nsHeadDoc reads a namespace document (decrypting a sealed one) and its head. */
+async function nsHeadDoc(ns) {
+  const r = await api('GET', `/ns/${ns}`, { auto: true, label: 'catalog' });
+  if (r.status !== 200) return { status: r.status };
+  const head = r.etag() || ((/\/rev\/([^/]+)$/.exec(r.finalPath) || [])[1] || '');
+  const doc = r.jose ? (await decrypted(r, ns, '', { ns, id: head, kind: 'config' })).value : r.json;
+  return { status: 200, head, config: r.hdr('X-Config-Revision') || '', doc, sealed: r.jose };
+}
+
+async function loadCatalog() {
+  const ns = ($('catNs').value.trim() || 'cat');
+  $('catNs').value = ns;
+  store.set('pl.catNs', ns);
+  if (ns !== C.ns) { C.sel = ''; C.min = ''; }
+  const gen = ++C.gen;
+  C.ns = ns; C.loading = true;
+  renderCatStatus();
+  // Everything is read into x and published at once, so a slower earlier load can't overwrite a newer one.
+  const x = { head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {} };
+  // 1. The catalog namespace itself, from the core.
+  const nd = await nsHeadDoc(ns);
+  if (gen !== C.gen) return;
+  if (nd.status !== 200) {
+    Object.assign(C, x, { listing: null, loading: false, source: '', note: `GET /ns/${ns} answered ${nd.status}: not a readable namespace.` });
+    return renderCatalog();
+  }
+  x.head = nd.head; x.config = nd.config; x.doc = nd.doc || {};
+  const cat = x.doc.catalog || {};
+  x.trust = Array.isArray(cat.trust) ? cat.trust.filter((t) => typeof t === 'string') : [];
+  x.mode = cat.mode === 'dag' ? 'dag' : 'tree';
+  // 2. Every node document at the catalog's head (needed for $access and for If-Match).
+  const heads = (await allHeads(ns, x.head)).filter((e) => e.kind === 'head');
+  const docs = await mapLimit(heads.slice(0, 500), 6, async (e) => {
+    const r = await api('GET', `/r/${ns}/${e.resource}/rev/${e.target}`, { auto: true, label: 'catalog' });
+    if (r.status !== 200) return null;
+    const d = await readDoc(ns, e.resource, e.target, r);
+    return { name: e.resource, head: e.target, doc: d.doc && typeof d.doc === 'object' ? d.doc : {}, kind: e.resource.includes('.') ? 'item' : 'folder', sealed: !!d.seal };
+  });
+  x.nodes = new Map(docs.filter(Boolean).map((n) => [n.name, n]));
+  // 3. Trusted content namespaces: their roles (what a role means, includes) and which items exist.
+  await Promise.all(x.trust.map(async (t) => {
+    const cd = await nsHeadDoc(t);
+    if (cd.status !== 200) return;
+    x.contentDocs[t] = cd.doc || {};
+    x.contentHeads[t] = new Map((await allHeads(t, cd.head)).map((e) => [e.resource, e]));
+  }));
+  // 4. The tree service, through the core's same-origin proxy (-tree-url).
+  Object.assign(x, await loadTreeListing());
+  if (x.listing) addDangling(x);
+  if (gen !== C.gen) return;
+  Object.assign(C, x, { loading: false });
+  renderCatalog();
+}
+
+/* addDangling puts dangling placements, which drop out of the service's listings (§B.7), back under
+ * their folders, marked, so a placement of a not-yet-existing item is visible where it was placed. */
+function addDangling(x) {
+  const folders = new Map();
+  const walk = (e) => { if (e.kind === 'folder') { folders.set(e.name, e); (e.children || []).forEach(walk); } };
+  x.listing.forEach(walk);
+  for (const d of ((x.problems && x.problems.body && x.problems.body.danglingItems) || [])) {
+    const name = nodeName(d.href), n = x.nodes.get(name);
+    if (!n) continue;
+    for (const p of parentsOf(n)) {
+      const f = folders.get(nodeName(p.href));
+      if (f && f.children && !f.children.some((c) => c.name === name)) f.children.push({ name, href: d.href, kind: 'item', item: d.item, dangling: d.reason || 'dangling', order: p.order, unlisted: true });
+    }
+  }
+}
+
+/* treeGet fetches a tree service listing through the proxy, following its redirect to /at/{at}/…,
+ * retrying while the service is behind ?min, and opening sealed views (§E.2.6). */
+async function treeGet(path) {
+  const q = C.min ? (path.includes('?') ? '&' : '?') + 'min=' + encodeURIComponent(C.min) : '';
+  let r;
+  for (let i = 0; i < 4; i++) {
+    r = await api('GET', `${TREE}/${C.ns}/${path}${q}`, { auto: true, label: 'tree' });
+    if (r.status !== 503) break;
+    await sleep(800);
+  }
+  if (r.status !== 200) return { r };
+  const view = r.finalPath.startsWith(TREE + '/') ? r.finalPath.slice(TREE.length) : r.finalPath;
+  let body = r.json;
+  if (r.jose) {
+    let pl = {};
+    try { pl = Z.parseJWE(r.text.trim()).header.pl || {}; } catch (_) { /* reported by decrypted */ }
+    const d = await decrypted(r, pl.ns || C.ns, '', { ns: pl.ns || C.ns, view });
+    if (d.error) return { r, view, sealedWhole: d };
+    body = d.value;
+  }
+  if (body && typeof body === 'object') await openSealedEntries(body, view);
+  return { r, view, body };
+}
+
+/* openSealedEntries decrypts per-entry sealed values ("sealed": JWE, pl {ns, name, view}) in place. */
+async function openSealedEntries(v, view) {
+  if (Array.isArray(v)) { for (const x of v) await openSealedEntries(x, view); return; }
+  if (!v || typeof v !== 'object') return;
+  if (typeof v.sealed === 'string') {
+    try {
+      const hdr = Z.parseJWE(v.sealed).header;
+      const ens = Z.parseKid(hdr.kid).ns;
+      // The entry's resource key K_r (what the tree service and the index use), else the epoch key K_e.
+      const want = { ns: ens, name: v.name, view };
+      let d;
+      try { d = await openSealed(ens, v.sealed, v.name, want); } catch (err) { if (err.checks) throw err; d = await openSealed(ens, v.sealed, '', want); }
+      if (d.value && typeof d.value === 'object') Object.assign(v, d.value);
+      v._opened = hdr.kid;
+    } catch (err) { v._sealedErr = err.message; }
+  }
+  for (const k of Object.keys(v)) if (k !== 'sealed' && typeof v[k] === 'object') await openSealedEntries(v[k], view);
+}
+
+async function loadTreeListing() {
+  const x = { listing: null, at: '', view: '', problems: null, note: '', source: 'core', treeStatus: null, sealedView: false };
+  if (C.proxy === null) {
+    const p = await api('GET', `${TREE}/`, { auto: true, label: 'tree' });
+    C.proxy = p.status === 200 && p.json && p.json.proxy === 'tree';
+  }
+  if (!C.proxy) { x.note = 'Computed listings (the combined checkpoint, ordering and dangling detection by the service, access filtering, manifests) need the tree service. Start the core with -tree-url (compose does) to read it through the same-origin proxy at /playground/tree/. Showing the catalog documents read directly from the core API.'; return x; }
+  const roots = await treeGet('roots');
+  if (!roots.body) {
+    const r = roots.r;
+    x.note = roots.sealedWhole ? 'The tree service answered with a sealed listing this browser has no key for: ' + roots.sealedWhole.error
+      : r.status === 502 ? 'The tree service is not reachable through the proxy (502): it may still be starting. Showing core documents.'
+        : r.status === 404 ? `The tree service does not serve a catalog named ${C.ns} (404): it follows one catalog, set by its -catalog flag. Showing core documents.`
+          : `The tree service answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}. Showing core documents.`;
+    return x;
+  }
+  x.source = 'tree';
+  x.at = roots.body.at || ''; x.view = roots.view;
+  // What the service follows, and whether it seals listings or skips a namespace (§E.2.6).
+  const st = await api('GET', `${TREE}/_status`, { auto: true, label: 'tree' });
+  x.treeStatus = st.status === 200 && st.json ? st.json : null;
+  x.sealedView = roots.r.jose;
+  const trees = [];
+  for (const root of roots.body.roots || []) {
+    if (root.kind !== 'folder') { trees.push(root); continue; }
+    const st = await treeGet(`subtree?of=${encodeURIComponent(root.href)}&depth=64`);
+    trees.push(st.body && st.body.tree ? st.body.tree : root);
+    if (st.body && st.body.at) x.at = st.body.at;
+  }
+  x.listing = trees;
+  const [pr, or] = [await treeGet('problems'), await treeGet('orphans')];
+  x.problems = { service: true, body: pr.body, orphans: or.body ? or.body.orphans : [] };
+  return x;
+}
+
+/* ---- the local graph: derived access, problems ---- */
+function ownAccess(n) {
+  const a = n && n.doc && n.doc.$access;
+  const out = {};
+  if (a && typeof a === 'object' && !Array.isArray(a)) for (const [s, roles] of Object.entries(a)) if (s !== 'inherit' && Array.isArray(roles)) out[s] = roles.filter((x) => typeof x === 'string');
+  return out;
+}
+function inherits(n) { const a = n && n.doc && n.doc.$access; return !(a && a.inherit === false); }
+function isLive(name) { return C.nodes.has(name); }
+function walkableParents(n) {
+  return parentsOf(n).map((p) => nodeName(p.href)).filter((pn) => pn && NODE_RE.test(pn) && isLive(pn));
+}
+function itemExists(name) {
+  const it = itemOf(name);
+  if (!it || !C.contentHeads[it.ns]) return null; // unknown: namespace not trusted or not readable
+  const x = C.contentHeads[it.ns].get(it.name);
+  return !!(x && x.kind === 'head');
+}
+/* effective: subject -> role -> Set(nodes where assigned), over every walkable path up to a root (§B.11.2). */
+function effectiveAccess(name) {
+  const eff = {};
+  const walk = (nm, path, depth) => {
+    const n = C.nodes.get(nm);
+    if (!n || path.has(nm) || depth > 64) return;
+    for (const [s, roles] of Object.entries(ownAccess(n))) for (const role of roles) ((eff[s] = eff[s] || {})[role] = eff[s][role] || new Set()).add(nm);
+    if (!inherits(n)) return;
+    const next = new Set(path); next.add(nm);
+    for (const p of walkableParents(n)) walk(p, next, depth + 1);
+  };
+  walk(name, new Set(), 0);
+  return eff;
+}
+/* roleInfo describes a role as the namespace that owns its meaning defines it. */
+function roleInfo(role, itemNs) {
+  if (itemNs) {
+    const roles = (C.contentDocs[itemNs] || {}).roles || {};
+    const d = roles[role];
+    if (!d) return `${itemNs} defines no role "${role}": it grants nothing there`;
+    const inc = [], seen = new Set([role]);
+    const q = [...(d.includes || [])];
+    while (q.length) { const x = q.shift(); if (seen.has(x)) continue; seen.add(x); inc.push(x); q.push(...(((roles[x] || {}).includes) || [])); }
+    return `${itemNs}: ${role} can ${(d.can || []).join(', ') || 'nothing'}${d.rules ? ' (with rules)' : ''}${inc.length ? '; includes ' + inc.join(', ') : ''}`;
+  }
+  const d = ((C.doc || {}).roles || {})[role];
+  return d ? `catalog role ${role}: ${Object.keys(d).filter((k) => d[k] === true).join(', ') || 'no tree powers'}` : `the catalog defines no role "${role}"`;
+}
+function treePowers(n) {
+  const roles = (C.doc || {}).roles || {};
+  const out = [];
+  for (const [s, rs] of Object.entries(ownAccess(n))) {
+    const p = ['move', 'place'].filter((k) => rs.some((r) => roles[r] && roles[r][k] === true));
+    if (p.length) out.push({ s, p });
+  }
+  return out;
+}
+function localProblems() {
+  const dangling = [], parents = [], orphans = [], cycles = [];
+  for (const n of C.nodes.values()) {
+    if (n.kind === 'item' && itemExists(n.name) === false) dangling.push(n.name);
+    const ps = parentsOf(n);
+    for (const p of ps) {
+      const pn = nodeName(p.href);
+      if (!pn) parents.push({ node: n.name, parent: p.href, why: 'not a folder of this catalog' });
+      else if (!NODE_RE.test(pn)) parents.push({ node: n.name, parent: p.href, why: 'a placement cannot be a parent' });
+      else if (!isLive(pn)) parents.push({ node: n.name, parent: p.href, why: 'missing or deleted' });
+    }
+    if (ps.length && !walkableParents(n).length) orphans.push(n.name);
+  }
+  // cycles: a node that reaches itself through parents
+  for (const n of C.nodes.values()) {
+    const seen = new Set(); const stack = walkableParents(n).slice();
+    while (stack.length) { const x = stack.pop(); if (x === n.name) { cycles.push(n.name); break; } if (seen.has(x)) continue; seen.add(x); stack.push(...walkableParents(C.nodes.get(x))); }
+  }
+  return { dangling, parents, orphans, cycles };
+}
+/* localTree builds the listing from the documents: children ordered as §B.2 (ordered first, by code unit, then by name). */
+function localTree() {
+  const kids = new Map();
+  for (const n of C.nodes.values()) {
+    parentsOf(n).forEach((p) => {
+      const pn = nodeName(p.href);
+      if (!pn || !isLive(pn) || !NODE_RE.test(pn)) return;
+      (kids.get(pn) || kids.set(pn, []).get(pn)).push({ name: n.name, order: typeof p.order === 'string' ? p.order : undefined });
+    });
+  }
+  const sortKids = (a, b) => (a.order !== undefined) !== (b.order !== undefined) ? (a.order !== undefined ? -1 : 1) : (a.order !== b.order ? cmpCU(a.order, b.order) : cmpCU(a.name, b.name));
+  const build = (name, onPath, depth) => {
+    const n = C.nodes.get(name);
+    const e = { name, href: hrefOf(name), kind: n.kind, title: n.doc.title };
+    if (n.kind === 'item') { const it = itemOf(name); e.item = it.href; const x = C.contentHeads[it.ns] && C.contentHeads[it.ns].get(it.name); if (x && x.kind === 'head') e.head = x.target; else if (itemExists(name) === false) e.dangling = 'item missing'; }
+    if (n.kind === 'folder') {
+      e.children = [];
+      if (depth < 64 && !onPath.has(name)) {
+        const next = new Set(onPath); next.add(name);
+        for (const k of (kids.get(name) || []).sort(sortKids)) if (!next.has(k.name)) { const c = build(k.name, next, depth + 1); if (k.order !== undefined) c.order = k.order; e.children.push(c); }
+      }
+    }
+    return e;
+  };
+  return [...C.nodes.values()].filter((n) => !parentsOf(n).length).sort((a, b) => cmpCU(a.name, b.name)).map((n) => build(n.name, new Set(), 0));
+}
+
+/* ---- rendering ---- */
+function renderCatStatus() {
+  const box = $('catStatus');
+  if (!C.ns) { box.className = 'muted'; box.textContent = 'Load a catalog namespace.'; return; }
+  if (C.loading) { box.className = 'muted'; box.textContent = `Loading ${C.ns}…`; return; }
+  box.className = '';
+  if (!C.head) { box.replaceChildren(h('div', { class: 'errbox' }, C.note || 'not loaded')); return; }
+  const kv = h('dl', { class: 'kv' },
+    h('dt', {}, 'source'), h('dd', {}, C.source === 'tree' ? h('span', { class: 'badge ok' }, 'tree service via /playground/tree/') : h('span', { class: 'badge warn' }, 'core documents only')),
+    h('dt', {}, 'catalog ns_id'), h('dd', {}, idEl(C.head), h('span', { class: 'muted small' }, ' the catalog namespace head (what catalog grants carry as at, §B.11.4)')),
+    C.at ? h('dt', {}, 'listing at') : null, C.at ? h('dd', {}, idEl(C.at), h('span', { class: 'muted small' }, ' combined checkpoint over the catalog and ' + (C.trust.join(', ') || 'no') + ' (§B.5); listings at an at never change')) : null,
+    C.view ? h('dt', {}, 'listing URL') : null, C.view ? h('dd', { class: 'mono small' }, C.view, C.sealedView ? h('span', { class: 'badge tomb', title: 'served as one JWE, pl { ns, view } (§E.2.6)' }, 'sealed listing') : null) : null,
+    C.treeStatus ? h('dt', {}, 'service status') : null, C.treeStatus ? h('dd', {}, h('details', {}, h('summary', { class: 'muted small' }, 'GET /_status: followed namespaces, encryption, skipped'), jsonPre(C.treeStatus))) : null,
+    C.min ? h('dt', {}, 'read-your-writes') : null, C.min ? h('dd', { class: 'mono small' }, '?min=' + C.min) : null,
+    h('dt', {}, 'trust'), h('dd', { class: 'mono' }, C.trust.join(', ') || '(none: catalog.trust is empty)'),
+    h('dt', {}, 'mode'), h('dd', {}, C.mode + (C.mode === 'tree' ? ' (one parent per node)' : ' (several parents allowed)')),
+    h('dt', {}, 'nodes'), h('dd', {}, `${[...C.nodes.values()].filter((n) => n.kind === 'folder').length} folder(s), ${[...C.nodes.values()].filter((n) => n.kind === 'item').length} placement(s)`));
+  const roles = (C.doc || {}).roles;
+  if (roles) kv.append(h('dt', {}, 'catalog roles'), h('dd', {}, ...Object.keys(roles).map((r) => h('span', { class: 'badge', title: roleInfo(r) }, r + (Object.keys(roles[r]).filter((k) => roles[r][k] === true).length ? ': ' + Object.keys(roles[r]).filter((k) => roles[r][k] === true).join('+') : '')))));
+  box.replaceChildren(kv, C.note ? h('p', { class: 'note' }, C.note) : '');
+}
+
+function accessChips(name, itemNs) {
+  const eff = effectiveAccess(name);
+  const own = ownAccess(C.nodes.get(name));
+  const chips = [];
+  for (const s of Object.keys(eff).sort()) for (const role of Object.keys(eff[s]).sort()) {
+    const where = [...eff[s][role]];
+    chips.push(h('span', { class: 'badge info chip' + ((own[s] || []).includes(role) ? ' own' : ''), title: `${roleInfo(role, itemNs)}\nassigned on: ${where.join(', ')}` }, `${s}: ${role}`));
+  }
+  return chips;
+}
+
+function treeRow(e) {
+  const n = C.nodes.get(e.name);
+  const it = e.kind === 'item' ? itemOf(e.name) : null;
+  const dangling = e.dangling || (it && itemExists(e.name) === false ? 'item missing' : '');
+  const row = h('div', { class: 'cat-row' + (e.name === C.sel ? ' sel' : '') + (dangling ? ' dangling' : ''), tabindex: 0, role: 'button' },
+    h('span', { class: 'cat-kind ' + e.kind }, e.kind === 'folder' ? 'dir' : 'item'),
+    e.title ? h('b', {}, e.title) : null,
+    it ? h('button', { class: 'link mono', title: 'open ' + it.href + ' in the Resource tab', onclick: (ev) => { ev.stopPropagation(); openItem(it.ns, it.name); } }, it.href) : h('span', { class: 'mono muted' }, e.name),
+    e.order !== undefined ? h('span', { class: 'muted small', title: 'order among siblings' }, '↕' + e.order) : null,
+    e.head ? idEl(e.head) : null,
+    dangling ? h('span', { class: 'badge err', title: 'dangling (' + dangling + '): drops out of listings and access (§B.7)' + (e.unlisted ? '; shown here from /problems, not in the service listing' : '') }, 'dangling') : null,
+    e.self ? h('span', { class: 'badge' }, 'self-placed') : null,
+    e._sealedErr ? h('span', { class: 'badge tomb', title: e._sealedErr }, 'sealed') : e._opened ? h('span', { class: 'badge ok', title: 'decrypted with ' + e._opened }, 'decrypted') : null,
+    n && n.doc.$access && n.doc.$access.inherit === false ? h('span', { class: 'badge warn', title: 'inherit: false stops the ancestor walk here' }, 'no inherit') : null,
+    !n ? h('span', { class: 'badge warn', title: 'the tree service lists it, but its document was not read' }, 'no doc') : null,
+    n ? accessChips(e.name, it && it.ns) : null,
+    n ? treePowers(n).map((x) => h('span', { class: 'badge', title: 'tree powers of ' + x.s + ' here (not inherited)' }, `${x.s}: ${x.p.join('+')}`)) : null,
+    e.more ? h('span', { class: 'muted small' }, '… deeper levels not listed') : null);
+  row.onclick = () => selectNode(e.name);
+  row.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectNode(e.name); } };
+  const li = h('li', {}, row);
+  if (e.children && e.children.length) li.append(h('ul', {}, ...e.children.map(treeRow)));
+  return li;
+}
+
+function renderCatalog() {
+  renderCatStatus();
+  const box = $('catTree');
+  const trees = C.source === 'tree' && C.listing ? C.listing : localTree();
+  $('catTreeMeta').textContent = C.head ? (C.source === 'tree' ? `tree service listing at ${short(C.at)}` : `built here from the documents at ns_id ${short(C.head)}`) : '';
+  box.replaceChildren(trees.length ? h('ul', { class: 'cat-tree' }, ...trees.map(treeRow)) : h('p', { class: 'muted' }, C.head ? 'No nodes yet: create a folder.' : '—'));
+  // folder pickers and item suggestions
+  const folders = [...C.nodes.values()].filter((n) => n.kind === 'folder').map((n) => n.name).sort();
+  const opt = (f) => h('option', { value: f }, (C.nodes.get(f).doc.title ? C.nodes.get(f).doc.title + ' — ' : '') + f);
+  for (const id of ['catFParent', 'catPParent']) {
+    const sel = $(id), cur = sel.value;
+    sel.replaceChildren(...(id === 'catFParent' ? [h('option', { value: '' }, '(none: a new root)')] : []), ...folders.map(opt));
+    if (folders.includes(cur) || cur === '') sel.value = cur; else if (id === 'catFParent' && C.sel && folders.includes(C.sel)) sel.value = C.sel;
+  }
+  const items = [];
+  for (const t of Object.keys(C.contentHeads)) for (const [name, x] of C.contentHeads[t]) if (x.kind === 'head' && !C.nodes.has(`${t}.${name}`)) items.push(`/r/${t}/${name}`);
+  $('catItemList').replaceChildren(...items.map((v) => h('option', { value: v })));
+  $('catNsList').replaceChildren(...known.map((v) => h('option', { value: v })));
+  renderCatSel();
+  renderCatProblems();
+}
+
+function renderCatProblems() {
+  const box = $('catProblems');
+  if (!C.head) { box.className = 'muted'; box.textContent = '—'; $('catProbMeta').textContent = ''; return; }
+  box.className = '';
+  const lp = localProblems();
+  const line = (label, list, f) => list.length ? h('div', {}, h('b', {}, label + ': '), ...list.map((x, i) => [i ? ', ' : '', f(x)])) : null;
+  const nodeLink = (name) => h('button', { class: 'link mono', onclick: () => selectNode(name) }, name);
+  const parts = [];
+  if (C.problems && C.problems.service && C.problems.body) {
+    const p = C.problems.body;
+    $('catProbMeta').textContent = 'from the tree service (/problems, /orphans)';
+    parts.push(line('cycles', p.cycles || [], (c) => h('span', { class: 'mono' }, [].concat(c).map((x) => nodeName(x) || x).join(' → '))),
+      line('dangling items', p.danglingItems || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` (${x.reason || 'dangling'})`)]),
+      line('dangling parents', p.danglingParents || [], (x) => [nodeLink(nodeName(x.href)), h('span', { class: 'muted small' }, ` → ${x.parent || ''} ${x.state || ''}`)]),
+      line('too deep', p.tooDeep || [], (x) => nodeLink(nodeName(x.href))),
+      line('orphans', C.problems.orphans || [], (x) => nodeLink(x.name)));
+  } else {
+    $('catProbMeta').textContent = 'computed here from the documents';
+    parts.push(line('cycles', lp.cycles, nodeLink), line('dangling items', lp.dangling, nodeLink),
+      line('dangling parents', lp.parents, (x) => [nodeLink(x.node), h('span', { class: 'muted small' }, ` → ${x.parent} (${x.why})`)]),
+      line('orphans', lp.orphans, nodeLink));
+  }
+  const shown = parts.filter(Boolean);
+  box.replaceChildren(...(shown.length ? shown : [h('span', { class: 'muted' }, 'No problems.')]));
+}
+
+function breadcrumbs(name) {
+  const paths = [];
+  const walk = (nm, acc, depth) => {
+    const n = C.nodes.get(nm);
+    if (!n || acc.includes(nm) || depth > 64 || paths.length > 20) return;
+    const next = [nm, ...acc];
+    const ps = walkableParents(n);
+    if (!parentsOf(n).length) paths.push(next); else ps.forEach((p) => walk(p, next, depth + 1));
+  };
+  walk(name, [], 0);
+  return paths;
+}
+
+function renderCatSel() {
+  const box = $('catSel');
+  const n = C.nodes.get(C.sel);
+  $('catSelMeta').textContent = n ? n.kind : '';
+  const moveTo = $('catMoveTo');
+  moveTo.multiple = C.mode === 'dag';
+  moveTo.size = C.mode === 'dag' ? 5 : 1;
+  if (!n) { box.className = 'muted'; box.textContent = C.sel ? `${C.sel} is not a live node.` : 'Select a node in the tree.'; moveTo.replaceChildren(); return; }
+  box.className = '';
+  // folders it may move under: not itself, not a descendant (that would close a cycle)
+  const below = new Set([n.name]);
+  let grew = true;
+  while (grew) { grew = false; for (const m of C.nodes.values()) if (!below.has(m.name) && walkableParents(m).some((p) => below.has(p))) { below.add(m.name); grew = true; } }
+  const cur = new Set(parentsOf(n).map((p) => nodeName(p.href)));
+  moveTo.replaceChildren(...[...C.nodes.values()].filter((m) => m.kind === 'folder' && !below.has(m.name)).map((m) => m.name).sort()
+    .map((f) => h('option', { value: f, selected: cur.has(f) }, (C.nodes.get(f).doc.title ? C.nodes.get(f).doc.title + ' — ' : '') + f)));
+  const p0 = parentsOf(n)[0];
+  $('catMoveOrder').value = p0 && typeof p0.order === 'string' ? p0.order : '';
+  const it = itemOf(n.name);
+  const crumbs = breadcrumbs(n.name);
+  box.replaceChildren(
+    h('div', { class: 'state-line' }, h('span', { class: 'cat-kind ' + n.kind }, n.kind === 'folder' ? 'dir' : 'item'), h('b', { class: 'mono' }, n.name), h('span', { class: 'muted' }, 'head'), idEl(n.head)),
+    h('dl', { class: 'kv' },
+      it ? h('dt', {}, 'item') : null, it ? h('dd', {}, h('button', { class: 'link mono', onclick: () => openItem(it.ns, it.name) }, it.href),
+        itemExists(n.name) === false ? h('span', { class: 'badge err' }, 'dangling') : itemExists(n.name) === null ? h('span', { class: 'badge warn', title: 'the item namespace is not in catalog.trust or not readable' }, 'unknown') : null) : null,
+      h('dt', {}, 'paths'), h('dd', {}, crumbs.length ? h('div', {}, ...crumbs.map((p) => h('div', { class: 'mono small' }, p.map((x) => (C.nodes.get(x).doc.title || x)).join(' / ')))) : h('span', { class: 'muted' }, 'none: an orphan or a root')),
+      h('dt', {}, 'effective'), h('dd', {}, ...accessChips(n.name, it && it.ns), (it && itemExists(n.name) === false) ? h('div', { class: 'note' }, 'A dangling placement grants nothing, except create for an item that never existed (§B.11.4).') : null)),
+    h('div', { class: 'row' },
+      h('button', { class: 'tiny', onclick: () => openItem(C.ns, n.name) }, 'Open node in Resource tab'),
+      it ? h('button', { class: 'tiny', onclick: () => openItem(it.ns, it.name) }, 'Open item') : null,
+      C.proxy && C.source === 'tree' ? h('button', { class: 'tiny', onclick: () => showWhere(n) }, it ? 'where? (tree service)' : 'ancestors (tree service)') : null),
+    h('div', { id: 'catWhere' }),
+    jsonPre(n.doc));
+}
+
+async function showWhere(n) {
+  const it = itemOf(n.name);
+  const r = await asUser(() => treeGet(it ? `where?item=${encodeURIComponent(it.href)}` : `ancestors?of=${encodeURIComponent(hrefOf(n.name))}`));
+  const box = document.getElementById('catWhere');
+  if (box) box.replaceChildren(r.body ? jsonPre(r.body) : h('div', { class: 'errbox' }, 'HTTP ' + r.r.status));
+}
+
+function selectNode(name) { C.sel = name; renderCatalog(); }
+
+function openItem(ns, name) {
+  asUser(async () => { if (S.ns !== ns) await selectNS(ns); await selectRes(name); });
+  showTab('res');
+}
+
+/* ---- writes (to the catalog namespace, through the core API) ---- */
+function commonSchema(kind) {
+  const counts = {};
+  for (const n of C.nodes.values()) if (n.kind === kind && typeof n.doc.$schema === 'string') counts[n.doc.$schema] = (counts[n.doc.$schema] || 0) + 1;
+  return Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0] || '';
+}
+function parseAccessField(id) {
+  const t = $(id).value.trim();
+  if (!t) return { ok: true };
+  const p = tryParse(t);
+  if (!p.ok || !p.v || typeof p.v !== 'object' || Array.isArray(p.v)) return { ok: false };
+  return { ok: true, v: p.v };
+}
+async function catWrite(what, method, name, o) {
+  const r = await api(method, `/r/${C.ns}/${name}`, Object.assign({ label: 'catalog' }, o));
+  const out = $('catOut');
+  out.className = '';
+  out.replaceChildren(
+    h('div', { class: 'state-line' }, h('b', {}, what), h('span', { class: 'mono' }, `${method} /r/${C.ns}/${name}`), h('span', { class: 'badge ' + (r.ok ? 'ok' : 'err') }, r.neterr ? 'network error' : `HTTP ${r.status}`),
+      r.hdr('X-Namespace-Revision') ? h('span', { class: 'muted small' }, 'catalog ns_id ') : null, r.hdr('X-Namespace-Revision') ? idEl(r.hdr('X-Namespace-Revision')) : null),
+    h('div', { class: 'split' },
+      h('div', {}, h('h3', {}, 'Request'), h('div', { class: 'mono small' }, Object.entries(o.headers || {}).map(([k, v]) => `${k}: ${v}`).join('  ')), o.body !== undefined ? jsonPre(typeof o.body === 'string' ? pretty(o.body) : o.body) : h('span', { class: 'muted small' }, '(no body)')),
+      h('div', {}, h('h3', {}, 'Response'), r.json && !r.ok ? errBox(r.entry) : null, jsonPre(r.text ? pretty(r.text) : (r.neterr || '(empty)')))));
+  if (r.ok) {
+    const nsid = r.hdr('X-Namespace-Revision');
+    if (nsid) C.min = `${C.ns}:${nsid}`;
+    await loadCatalog();
+  }
+  return r;
+}
+
+async function catCreateFolder() {
+  if (!C.head) return toast('Load a catalog first');
+  const name = $('catFName').value.trim();
+  if (!NODE_RE.test(name)) return toast('A folder name has no dot: [a-z0-9][a-z0-9_-]*');
+  const acc = parseAccessField('catFAccess');
+  if (!acc.ok) return toast('$access must be a JSON object');
+  const doc = {};
+  const schema = commonSchema('folder');
+  if (schema) doc.$schema = schema;
+  if ($('catFTitle').value.trim()) doc.title = $('catFTitle').value.trim();
+  const parent = $('catFParent').value;
+  if (parent) { const p = { href: hrefOf(parent) }; if ($('catFOrder').value.trim()) p.order = $('catFOrder').value.trim(); doc.parents = [p]; }
+  if (acc.v) doc.$access = acc.v;
+  const r = await catWrite('New folder', 'PATCH', name, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: doc }] });
+  if (r.ok) { C.sel = name; $('catFName').value = ''; renderCatalog(); }
+}
+
+async function catPlace() {
+  if (!C.head) return toast('Load a catalog first');
+  const t = $('catPItem').value.trim();
+  const m = /^(?:\/r\/)?([a-z0-9][a-z0-9_-]*)[/.]([a-z0-9][a-z0-9._-]*)$/.exec(t);
+  if (!m) return toast('Item: /r/{ns}/{name}');
+  if (m[1] === C.ns) return toast('Items are content documents, not nodes of this catalog');
+  if (C.trust.length && !C.trust.includes(m[1])) toast(`${m[1]} is not in catalog.trust; the catalog's rules may refuse it`);
+  const parent = $('catPParent').value;
+  if (!parent) return toast('Pick a folder');
+  const acc = parseAccessField('catPAccess');
+  if (!acc.ok) return toast('$access must be a JSON object');
+  const p = { href: hrefOf(parent) };
+  if ($('catPOrder').value.trim()) p.order = $('catPOrder').value.trim();
+  const doc = {};
+  const schema = commonSchema('item');
+  if (schema) doc.$schema = schema;
+  doc.parents = [p];
+  if (acc.v) doc.$access = acc.v;
+  doc.$nonce = Z.newNonce();
+  const name = `${m[1]}.${m[2]}`;
+  const r = await catWrite('Place', 'PATCH', name, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: doc }] });
+  if (r.ok) { C.sel = name; $('catPItem').value = ''; renderCatalog(); }
+}
+
+async function catMove() {
+  const n = C.nodes.get(C.sel);
+  if (!n) return toast('Select a node first');
+  const to = [...$('catMoveTo').selectedOptions].map((o) => o.value);
+  if (!to.length) return toast('Pick the new parent folder');
+  const order = $('catMoveOrder').value.trim();
+  if (order && !/^[0-9A-Za-z]{1,64}$/.test(order)) return toast('An order key is [0-9A-Za-z]{1,64}');
+  const cur = parentsOf(n);
+  const curNames = cur.map((p) => nodeName(p.href));
+  let ops;
+  if (to.length === 1 && curNames.length === 1 && curNames[0] === to[0]) {
+    // Reorder: only the order key of the existing edge changes (§B.2).
+    if ((cur[0].order || '') === order) return toast('Nothing to change');
+    ops = order ? [{ op: cur[0].order !== undefined ? 'replace' : 'add', path: '/parents/0/order', value: order }] : [{ op: 'remove', path: '/parents/0/order' }];
+  } else {
+    const parents = to.map((f) => {
+      const keep = cur.find((p) => nodeName(p.href) === f);
+      const e = { href: hrefOf(f) };
+      if (order && (to.length === 1 || !keep)) e.order = order; else if (keep && keep.order !== undefined) e.order = keep.order;
+      return e;
+    });
+    ops = [{ op: Array.isArray(n.doc.parents) ? 'replace' : 'add', path: '/parents', value: parents }];
+  }
+  await catWrite('Move', 'PATCH', n.name, { ct: PJ, headers: { 'If-Match': quoteId(n.head) }, body: ops });
+}
+
+async function catRemove() {
+  const n = C.nodes.get(C.sel);
+  if (!n) return toast('Select a node first');
+  const kids = [...C.nodes.values()].filter((m) => walkableParents(m).includes(n.name)).length;
+  const msg = n.kind === 'folder'
+    ? `Delete folder ${n.name}?` + (kids ? `\n\nIts ${kids} child node(s) are not deleted: they become orphans (§B.7).` : '')
+    : `Remove ${itemOf(n.name).href} from the catalog ${C.ns}?\n\nThe content document is unaffected.`;
+  if (!confirm(msg)) return;
+  const r = await catWrite('Remove', 'DELETE', n.name, { headers: { 'If-Match': quoteId(n.head) } });
+  if (r.ok) { C.sel = ''; renderCatalog(); }
 }
 
 /* ------------------------------------------------------------------ *
@@ -1201,11 +2371,41 @@ function init() {
   $('feedClear').onclick = () => { $('feed').replaceChildren(h('li', { class: 'muted' }, 'No events yet.')); $('feedCount').textContent = ''; };
   updateLiveWarn();
 
+  // encryption: identity, keys, keyring, write options
+  loadIdentity(); renderIdentity(); renderKeysHeld(); renderKeyring();
+  $('idGen').onclick = genIdentity;
+  $('idImportBtn').onclick = importIdentity;
+  $('idForget').onclick = () => { if (ID && confirm('Forget this identity? Keys wrapped to it can no longer be opened here.')) saveIdentity(null); };
+  $('idShowPriv').onclick = () => { if (!ID) return toast('No identity'); $('idImport').value = ID.d; toast('Private key shown in the import field: keep it secret'); };
+  $('keysClear').onclick = () => { KEYS.epoch.clear(); KEYS.res.clear(); KEYS.from.clear(); schemaCache.clear(); renderKeysHeld(); };
+  $('keysFetch').onclick = fetchKeysForm;
+  $('krRefresh').onclick = () => asUser(loadKeyring);
+  $('krInit').onclick = krInit;
+  $('krAdd').onclick = krAdd;
+  $('krRotate').onclick = krRotate;
+  $('jweOpen').onclick = decryptPasted;
+  $('selfTest').onclick = runSelfTest;
+  $('resendSealed').onclick = sendSealed;
+  $('sealE2E').disabled = true;
+
+  // catalog
+  $('catNs').value = store.get('pl.catNs', 'cat');
+  $('catLoad').onclick = () => asUser(() => loadCatalog());
+  $('catNs').onkeydown = (e) => { if (e.key === 'Enter') asUser(() => loadCatalog()); };
+  $('catRefresh').onclick = () => asUser(() => { C.proxy = null; return loadCatalog(); });
+  $('catFCreate').onclick = catCreateFolder;
+  $('catPCreate').onclick = catPlace;
+  $('catMove').onclick = catMove;
+  $('catRemove').onclick = catRemove;
+  document.querySelector('.tab[data-tab="cat"]').addEventListener('click', () => { if (!C.ns && !C.loading) loadCatalog(); });
+  document.querySelector('.tab[data-tab="keys"]').addEventListener('click', () => { if (KR.ns !== S.ns) loadKeyring(); });
+
   // restore session
   showTab(store.get('pl.tab', 'ns'));
   renderNsSelect(); renderNsAll(); renderResAll(); renderHistory(); updateLiveUrls();
   const ns = store.get('pl.ns', ''), res = store.get('pl.res', '');
   if (ns) { S.res = res; asUser(() => selectNS(ns, { keepRes: true })); $('resName').value = res; }
+  if (store.get('pl.tab', 'ns') === 'cat') loadCatalog();
 }
 
 document.addEventListener('DOMContentLoaded', init);

@@ -291,6 +291,28 @@ body.insp-off .floating-insp { display: block; }
   background: var(--text); color: var(--bg); padding: 6px 12px; border-radius: 6px; font-size: 12px; max-width: 90vw;
 }
 
+/* catalog tree */
+ul.cat-tree, ul.cat-tree ul { list-style: none; margin: 0; padding: 0; }
+ul.cat-tree ul { margin-left: 11px; padding-left: 12px; border-left: 1px dashed var(--border); }
+.cat-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 7px; padding: 3px 6px; border-radius: 6px; cursor: pointer; border: 1px solid transparent; }
+.cat-row:hover { background: var(--surface-2); }
+.cat-row.sel { border-color: var(--accent); background: var(--info-bg); }
+.cat-row.dangling > .mono, .cat-row.dangling > button.link { text-decoration: line-through; opacity: .75; }
+.cat-kind { font: 600 10px/1.6 var(--mono); text-transform: uppercase; padding: 0 5px; border-radius: 3px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
+.cat-kind.folder { background: var(--warn-bg); color: var(--warn); border-color: transparent; }
+.cat-kind.item { background: var(--info-bg); color: var(--info); border-color: transparent; }
+.badge.chip { font-weight: 500; }
+.badge.chip.own { font-weight: 700; outline: 1px solid var(--info); }
+
+/* encryption */
+.checks { list-style: none; margin: 4px 0; padding: 0; font-size: 12px; }
+.checks li { overflow-wrap: anywhere; }
+.checks li.ok { color: var(--ok); }
+.checks li.bad { color: var(--err); }
+.seal-box, .dec { border: 1px solid var(--border); border-left: 3px solid var(--tomb); border-radius: 6px; padding: 6px 9px; margin: 6px 0; background: var(--surface-2); }
+.seal-box.bad { border-left-color: var(--err); }
+#resSeal, #sealOut { margin: 6px 0; }
+
 @media (max-width: 640px) {
   .conn input { width: 120px; }
   .ctx input, #resName { width: 130px; }

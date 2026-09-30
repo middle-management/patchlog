@@ -1,0 +1,248 @@
+{
+  "note": "Known-answer vectors for seal.js, made with internal/seal by `go test ./internal/playground -update`; the playground's self-test and TestSealJSWithNode check seal.js against them, and TestSelfTestFixture checks the fromJS part with internal/seal.",
+  "recipient": {
+    "d": "ASCRSxg11FoDRcW3hGBg_47R027c0ZSt8welDKsBMbs",
+    "x": "QLWY1Wi2mxyS_zKhCi16yllzSGs0boPdnZhLTTLdZBo",
+    "rid": "1ekz5csmtwquo4ylgoo6ujkwl45d6pdkn"
+  },
+  "epochKey": "CnQmitvBLULAJQVuDP7AJSuCecpgLRD_PG-AnQy6jEQ",
+  "wrapped": {
+    "kid": "fx#3",
+    "wrapped": "DArB2CjIhNWXzO49TcE1dGZVRK_F1zze4rxlkimqp1uXSx8Uu-puscCCXTD9fWkvprdIiAr3Rx7XQ5o1J6rBfEfp_F7r6CVHN6xjDwAOWIg"
+  },
+  "wrappedResource": {
+    "kid": "fx#3",
+    "resource": "derby",
+    "wrapped": "a-BTqSZVi8X8_C-4d4l_iBPwfjNjYEfIP4MxTQDXkFh3qb4pJBqPXeRK390N_vdNxhBLkTGYoW5cie3LXv6E3z1un7hDS0bJmbPcyfoWnCc"
+  },
+  "resourceKey": {
+    "ns": "fx",
+    "name": "derby",
+    "key": "KmLDVpLEVmwNFt6hr-taJGq0RN9UsPBF5RKcHNFcYZA"
+  },
+  "jwe": {
+    "key": "KmLDVpLEVmwNFt6hr-taJGq0RN9UsPBF5RKcHNFcYZA",
+    "kid": "fx#3",
+    "pl": {
+      "id": "145jg7gsdmd6vsbkv2wz2cedqilyyu2wo",
+      "kind": "doc",
+      "name": "derby",
+      "ns": "fx"
+    },
+    "plaintext": "{\"title\":\"Stockholm derby\",\"ünïcode\":\"✓\"}",
+    "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZngjMyIsInBsIjp7ImlkIjoiMTQ1amc3Z3NkbWQ2dnNia3Yyd3oyY2VkcWlseXl1MndvIiwia2luZCI6ImRvYyIsIm5hbWUiOiJkZXJieSIsIm5zIjoiZngifX0..xKb0g-mKa7I9AuLd.ELZemBbQaYeePX3BrqblQthaGBiCVa-9L_5pk-kiU6CKjArxYyLIkKUZRJ8U.ndGn9QFz0oukriTOdr48bw"
+  },
+  "jweZip": {
+    "key": "CnQmitvBLULAJQVuDP7AJSuCecpgLRD_PG-AnQy6jEQ",
+    "kid": "fx#3",
+    "pl": {
+      "id": "145jg7gsdmd6vsbkv2wz2cedqilyyu2wo",
+      "kind": "config",
+      "ns": "fx"
+    },
+    "plaintext": "{\"text\":\"patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log \"}",
+    "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZngjMyIsInBsIjp7ImlkIjoiMTQ1amc3Z3NkbWQ2dnNia3Yyd3oyY2VkcWlseXl1MndvIiwia2luZCI6ImNvbmZpZyIsIm5zIjoiZngifSwiemlwIjoiREVGIn0..Gzk5DYyfmHiFSLEw._NcYZzX9UBQIxQ0YBxTptEsrRdtVMVV6D8kyYmd0PmnWQbTHsKrxjYti4iubbF1wLIo.sf_gMAxTfR7wQviPFuBYFQ"
+  },
+  "jwePadded": {
+    "key": "CnQmitvBLULAJQVuDP7AJSuCecpgLRD_PG-AnQy6jEQ",
+    "kid": "fx#3",
+    "pl": {
+      "ns": "fx",
+      "range": [
+        "",
+        "145jg7gsdmd6vsbkv2wz2cedqilyyu2wo"
+      ]
+    },
+    "plaintext": "{\"text\":\"patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log patch log \"}",
+    "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZngjMyIsInBsIjp7Im5zIjoiZngiLCJyYW5nZSI6WyIiLCIxNDVqZzdnc2RtZDZ2c2JrdjJ3ejJjZWRxaWx5eXUyd28iXX19..P7naUDtr_oyEOQnQ.Wx55G8p-88cSWqb8By8SrsnlGeU528bQaTnmm7-DrwL9Q6kMMEigTLdp86wr5bhNtnXd9TzfhYNnkcV9dClsADVq2_nFHmNahYFUay5gK0x-U3XUECCkWj3ngmjaLDaHD-59UPdN1UlP3pof7ocrgCCME01iZP31dyHTRtP_AFJxHFZEfUldgbTSWXeZ2IR2k3xmPkvayzVGy7lEFcf_QU19rC8oEHY1hSIPJPFiSsan2kagfclA6pGRfA971VhAtWEvgppUQclwnxOPJAjJT6Wt2NAk4EeXSgaJm0vLwsz9GPKWG01_-lIUooBzNm3nPFzSPo4a8eGcPePcgr8jOqBAa-y-f1FvF3Zcpkn7wrGOfguF9MrD_Zll8ROprhay1xPSXgvdsl85ChqueFXO6ZGAtCuTYbF8XRqQc68PiSsiVQjW_R47WD4a9KdXibqXtpHlbtwjO0XASOML483QDOdT5qANidIyvVPY6vI20w1QyIFNaXv1UyfSFFFrUAxkqqwT3hJ3JZOM3nUJYlRGDdYRjx7fqkIpSlDSTVMNRBGkUqMZoTv5WBPlDwiUQ2AG_Ctm_uhLOUOok7COiyEN-n14TBrNJQth9lGbcPnn7ZQTBSwtBXy6gF1nPpc-nDXqgrvbrW3k1WHsE8Q11rCI1cElisZgSjEdyFnrH5qtBUp2_uoBk_HMoMz1SvkjAmu6RGgRoPvxsguP4b_jEd_U4od7XODlM8i5bgi-ZlxTKxqYK5vFzISWA7tO3vLbLcBZIxrcF5HcKK958VE00UH4MwPTMKJaEdGEG6pVjbQgcsWu7sC4nDHjNEYQ7APVxXQUS7p_e89VexzDxNJ4yPiK4ibkW26OqlzBWtyahazCLoY4fHBVp1ENmCHybxMu7-7MqraSF9QiDK9vwo1UOyWVq8vWwCxrRBlMwyLO4qDW-ljBR7efYsKmNTaIkLRQ3xR0r28Xni8KphNqkoyPibKkxwU2eeVWO1r_uF2mdjiQx9BSDelhzDvQuTN2n_LnldJZQNc4VUrGBfspQYLsDgPCu7U8OTGNhRwflTcgWRux-lUgzJkhLl6ezaRFU3FsAuod4vGFwxbQx7cnI40MmGxpUaKLQrAIcpyn_z-IJ1d8qAAEuVLCqEHUcZWUe6gJPtvyts86LdPakujppdKSVj_vPEWgQQiUu5TxVbpiOKX2Y8dbz_U_gewB8W-rvKGyjU_gJ-Z5YwpE2N0a7cVR_qWFcjgWYqiaRh2bCxvsEF6dLD3u4lsrSPbre_E6RU21-H33Kj0jb7oTgy71DdV6k81Gor4hbQfe3ugW70hAcNredhq0JC7u3G5TTZ19nQXp65qV4fgBK8Y3jQxvhovKOZMdNbCgz07shj_-En3VhpbLJorbRcRc-K9NuLpGEM8-Zv6kzPvdZDA641i-2Nr7bVUvJnYEkO6DSEw0PMcsbGZP4or_EDY-iSX3qXLrf-A4WwKV0B0X-QFfpayOcHhTnmpfxiBeOYxEqKaQD91WB3x0hcZGMBQnSmIbk21NyysS8PH4YT3DODYfYCyPyvPFGKY2lWYikiEakdwXoS0UEORDy7StBoHGxfZjJqrT8pTRgCmFzEyc4tig7ZiDJ2bQ6241gnzbaiseiFA2wRGGuJcQNehWPmBr2J3Ur6Dbw93Cv88wj82xwM83y4N8XrXKFqGsIVoXEe1-B9YBhYeY9dQtFEHHwCLJFltxr_i_JjKIIqtFdBa3iVT7F6Ab0ykNChXmQ_z_WHagpti4Jdx-PS2M4KIiDyNVGgv_CQ2ELdla667ZLZNTe8Td3HxZBZqaX7nBJahHdXCJRRDfqjuS5Rg1RhUx7aEcvD8n6dSTpGHm4u-aUd1ZtRDlDlCXtqkchA9k7lnpgL06nVIf-dBQM1FgO0IdFY5WOtygN-HSHK8hf9SzY0N9w5cvdsXh9x9t0o4Df0ER7fSF74yYc_CklsinmgAYdN0Q7laekqOroCo0XUDGHoAvNT8XuWYjhP0xfz-moXX1bF86hj25ir1QpDYweQQ_xXjodONP7x4mVba_2xkfJGgcbXy0Dta8gQu3vCBO09GQQVVaQLP_yuJ-xp8KZjoilvRAtIVfEI_w83DSe4-rjg38UoEVdgQVOW7xvdu5ZKUaZRQQnmkLJQSZb6Fnp6taV481cJOo_KGtxdEoQh24s74Pkb9YBE7TO3ml4CxGwGj0fIZhm9cYpdHa-KWysxor_ieOiHC2Lv9sjHhdojopkLpPx_loOcNRJmRHPyPIhMqd447tPAK0srxnqjKAhK5vnFEJreoH-tGYWhCW0huGSrgHctrZB25F-mlUjHsgJFhGp1-cYTq7-mblhpSUW2HeeCIaSIHhYSBXzyJqQEHLrR0pFi2wWEJnhC3eHU59UrSC8UWBrL8_3Vj0ShHrlCm2wxOJf9kMVtJUJtOkyrH2TFKZaxnA5y4ZeNJt6JKec3IhleunaqTixUGksrhAFWLlj_cO-_5jM2Ulo94Aq0BkJPRHKywwQngbvc1JjANAn61vVESoEeTRenq-UhDj8ADYel3C73WX7-haAqASHeHfFHyjDbhTmIqLtVXUtlnq4rSyZGMdxxuYWArdZvjRc51ltbwlJjcbxlaWJ92XJD2bixrh-6WsymS9ebsZ-z2kWcX5937yslSMBzw-92fH0XZNjo3I8IL-KFhgqtdUE_4wMqKEbrI7FgWbEGOHwAho2xOnjI8gV3SFlIzdJOVseix7L3WIz-RbOIJ4s0ykZyCusi6i4u1trA8U8TfKOEqwy2eO3cR6p_MYk1hFM9k4jQr65TWES156vhadkZqjPbcsav0OSLHmTbJxTBDtyCXIU-EmNVYML-HHFyV7bPOJtThb0n-Kfsej8O8TdSAt6ERq5PPwvW1C7-x6CyFQU5WsP4d-DeDAzxdHA1HvMpiakKoLWuaTgblnL2myTvFnhaz3NtRay96HYCT5opAqdP-n7BisJNIFfnxKz4fhspdUtpkESjNK4b86i5bhHG8FATEUOB_uFRm9n5FPCmd9B8T_bqlT-uN16F8W7SqcIlEEeaGg8lcUMK24fI6VfwPoC_bLw1haB6-NdCw2C1hlkpnOZUIDNsHpAXWZuYIa2Kj8hZzAPyj6tt2uyLGCOyjXvmX8Z2MZ4DIayR5HSM0HK_wR3BpO8cjCQfmfE1pG3vmggIC62a26ThANR80RpQ9bp30uODOsNfV6GQ0fMH-G07EDAziratbSh9Cd2PUg0wObBGrQXIN0jMXn-JXJn1nCMd80_i4mVTpTdcZcFvMwk0mXYI1tMDEROQUVnOrSKPrphRuswjcnOzGoHqF_WWQ8h0ho6LcYUYSxGxUGz6CUcPWUWjzHg6mtZ8epC4PFnAzyrH9PC87aSs_U9yByrbESy_9dsM6lzDN12KvcVqJHsdz526jMBoGr7A9iYzNWGsjRDElSLaEdoTv8DWURNowSqlEEWpmso6bvoGRwktDGSmM_2i7X0BrcZwpdmP1kStyTKpabMu4x_LCu1iFYp-7C6FFNAy5QZAly1ENr3yhmD3idy_c6IRaRQ-_VAmzjse3uqfsVetaDHEM9GosDoX4Yc4WE_Ihr5Gtw4zdWqRtW2YQsDFwvqLovnGF7PCno-GSuvLC_ZTHWfBEQANybsrfA58iQdfVG84gNv2cGZHiztu3xPSJ2MRsbEOv0PxGiSFlY84paNtIBxMDSS3-OsoomzSly4X39g-S_5SOcWvYSSlmVAh3fATe_VX6ec3FBN8rdRrYiIVYkRQ1yMMn3JTpXNawrj5LU9KI1CM77Jcn-FS0su_A19_sIgcoCMl9DN58IWD4TrJdSrzFhpHonwkOQ8hDwhSO9QfE3OpCW6mBNkshBIJCnXOAfrWGvCZh3r1jG_6IYQYj4AYzAeu3rf4gCgbj59rXvwA5uvGArQ8fbnGviuqlu0xqkk2DQbJanCvAyLg44ebB2ng2oqR3mRMfkMX4wmsyFJ-uHZeLcpGP1vAu2EHiXKk9D5Bm9XDXcPcUSVDVwLrkO-h6qwfH44ivwUfDKkIfSARzPYvJbjvpSZWPkkHHaOIS4zvUyNGuyNNf5jnOhk_SmACRd0lZB9ATxBQfe.zdWVg-Kb5RMlqEOosqe9Fg"
+  },
+  "padLen": [
+    [
+      0,
+      256
+    ],
+    [
+      1,
+      256
+    ],
+    [
+      255,
+      256
+    ],
+    [
+      256,
+      256
+    ],
+    [
+      257,
+      272
+    ],
+    [
+      300,
+      304
+    ],
+    [
+      511,
+      512
+    ],
+    [
+      512,
+      512
+    ],
+    [
+      513,
+      544
+    ],
+    [
+      1000,
+      1024
+    ],
+    [
+      1025,
+      1088
+    ],
+    [
+      4097,
+      4352
+    ],
+    [
+      70000,
+      71680
+    ],
+    [
+      1048576,
+      1048576
+    ]
+  ],
+  "keyring": {
+    "current": 3,
+    "epochs": {
+      "3": {
+        "1ekz5csmtwquo4ylgoo6ujkwl45d6pdkn": "KAQP6W25ASN8FpXsK4viO9odnKZVDoRXHiazoouN1TnTuzgH89iS-pZrLJBH21Jz5upEbfiQoYftH3M-Q0sr65z-LTdU8mwhgRg6vi85Fnc"
+      }
+    },
+    "keyring": 1,
+    "ns": "fx",
+    "recipients": {
+      "1ekz5csmtwquo4ylgoo6ujkwl45d6pdkn": {
+        "crv": "X25519",
+        "kty": "OKP",
+        "x": "QLWY1Wi2mxyS_zKhCi16yllzSGs0boPdnZhLTTLdZBo"
+      }
+    },
+    "suite": "hpke-base-0x0020-0x0001-0x0002"
+  },
+  "patchSet": {
+    "ns": "fx",
+    "name": "derby",
+    "parent": "",
+    "patches": [
+      {
+        "op": "add",
+        "path": "",
+        "value": {
+          "title": "sealed"
+        }
+      },
+      {
+        "op": "add",
+        "path": "/$nonce",
+        "value": "f4wff3mavheksfbbarsgkchzfe"
+      }
+    ],
+    "patchSet": [
+      {
+        "op": "sealed",
+        "value": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZngjMyIsInBsIjp7Im5hbWUiOiJkZXJieSIsIm5zIjoiZngiLCJwYXJlbnQiOiIifX0..y0VMcIPZ5pYx7AFi.DiN-J8U2AmFet--B2SxNv2YdeRKvSzVP-7M3IVycjVTCJRwObrUjMH0UiZmNLzzis6IEtwTAZIwSsixBv4CoWqi99ykecjACElW-uSuVDJNudZ_6Oz-qDYOiUvGpAF31f-_89H5-OfaP9U4ORNxIFhSGrDMHow.KRmmLw8N5No49OcXfk8xYg"
+      }
+    ],
+    "id": "1nrsy6ts5nndpsij5fkw7admihmyg4r5e",
+    "tombstone": "1egb5arjurfxtioqilmvlr2tipobhz6ko"
+  },
+  "fromJS": {
+    "wrapped": {
+      "kid": "fx#7",
+      "resource": "derby",
+      "wrapped": "0Nd6Qw_O_WKY31Y3ifkQEp3YlsBpYeSUGmTD-plzYWV68vhi19kcIuL2Wn0pzn7LuAMVRGsEHYaphsf2goR6iOy-dSSJJRmK5uU633SB2HY",
+      "key": "vRzQxjvQczNNflKR-ggDGUjY4rti-CePIQyGlEHDcdg"
+    },
+    "jwe": {
+      "key": "cakfYq7qpuVIk46RRZ1T01WRF9K6YAWdzBISXfza3tM",
+      "kid": "fx#7",
+      "pl": {
+        "id": "1nrsy6ts5nndpsij5fkw7admihmyg4r5e",
+        "kind": "doc",
+        "name": "derby",
+        "ns": "fx"
+      },
+      "plaintext": "{\"title\":\"sealed by seal.js\",\"ünïcode\":\"✓\"}",
+      "jwe": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZngjNyIsInBsIjp7ImlkIjoiMW5yc3k2dHM1bm5kcHNpajVma3c3YWRtaWhteWc0cjVlIiwia2luZCI6ImRvYyIsIm5hbWUiOiJkZXJieSIsIm5zIjoiZngifX0..Ia2XKieUQrLtozq9.Mc943t4hTqWELX4eCAZcutZR68kXe38pekwq9zIbS_yWUD-fp9d4-CsFs4afTWM.xWZrSeQIWwDFqUoVQg4ETQ"
+    },
+    "patchSet": {
+      "ns": "fx",
+      "name": "derby",
+      "parent": "1nrsy6ts5nndpsij5fkw7admihmyg4r5e",
+      "patches": [
+        {
+          "op": "replace",
+          "path": "/title",
+          "value": "from JS ✓"
+        },
+        {
+          "op": "add",
+          "path": "/$nonce",
+          "value": "izox5hv3nsyy3bzqhwi6rfozbu"
+        }
+      ],
+      "patchSet": [
+        {
+          "op": "sealed",
+          "value": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZngjMyIsInBsIjp7Im5hbWUiOiJkZXJieSIsIm5zIjoiZngiLCJwYXJlbnQiOiIxbnJzeTZ0czVubmRwc2lqNWZrdzdhZG1paG15ZzRyNWUifX0..jCxbt-S1nfHRnis7.q5_kXSM_G7O-VudmGBJjI6a6UkuQjIgDDJwL5eFA9WGHqhyWaKOVKdWVdamJVb1jnfbo0yJmxt4ke8hHQBcAiKlZHeR0G1a5cYqENYzoyOzhvtlLMQvsEkNwJ4jlW95Z_Q4prW0JluQA9ZLA8ndXZQpWbdryiEfAy4Z-.r61Tkxw5F2ytcY5mbn7m2w"
+        }
+      ],
+      "id": "1c3av27jshcyyysvxlxgs2wfa6q6q5nam"
+    },
+    "patchSetPadded": {
+      "ns": "fx",
+      "name": "derby",
+      "parent": "",
+      "patches": [
+        {
+          "op": "replace",
+          "path": "/title",
+          "value": "from JS ✓"
+        },
+        {
+          "op": "add",
+          "path": "/$nonce",
+          "value": "izox5hv3nsyy3bzqhwi6rfozbu"
+        }
+      ],
+      "patchSet": [
+        {
+          "op": "sealed",
+          "value": "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2R0NNIiwia2lkIjoiZngjMyIsInBsIjp7Im5hbWUiOiJkZXJieSIsIm5zIjoiZngiLCJwYXJlbnQiOiIifX0..ju9JKEu9YIXNBXvS.4TZfKAShwyw5GP3YDqlWhMpnfR7hQtCwYkCXVKxzlyKDWUvP1eFpeiFpSGM8-H2_rPzqZru1b5NY0L6LQMB61V90vUhtTLGWVn4OfTP5GXbg--_yYcE0Yyjs6JRQxl2wRtCp8DPVQ2XaDxcz5dlVqbZbHctOrotnJ4Lmv_6sHM2w4JAsAg4nqzAgUlXuA5jP6xazNzlO2LBI77hrEmXdxgMcNMGFyYPjcXLE0kKC1mu4hgIUD967CH41pg6L7UMKn7HzywdHUYJ8kZWmquKBLC6rxo0mvusTN2F-EnCEfOSVcn_sc9rH2F3AoGd4pktDLcL2jSj53Co3s29PGQh1kw.GJ1K2Yr2lqfWM3cOCp8bxQ"
+        }
+      ],
+      "id": "1mzxhsytxbquwk6h2pxp36vmnwt2w7q3i"
+    },
+    "keyring": {
+      "keyring": 1,
+      "suite": "hpke-base-0x0020-0x0001-0x0002",
+      "ns": "fx",
+      "current": 3,
+      "recipients": {
+        "1ekz5csmtwquo4ylgoo6ujkwl45d6pdkn": {
+          "kty": "OKP",
+          "crv": "X25519",
+          "x": "QLWY1Wi2mxyS_zKhCi16yllzSGs0boPdnZhLTTLdZBo"
+        }
+      },
+      "epochs": {
+        "3": {
+          "1ekz5csmtwquo4ylgoo6ujkwl45d6pdkn": "Db3jq8D3EJt56qsSwleRenB3_06fKRFbEfSMMfwqBgSfgekiLgIiwNqUqiE5-gcSl_haI_sm2tA67JUv4JYI8lqUQpNtmET2DFtmNATDNZg"
+        }
+      }
+    }
+  }
+}

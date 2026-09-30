@@ -70,6 +70,11 @@ search index, the tree service and the branch janitor:
 | http://localhost:8080/playground/ | web playground |
 | http://localhost:8081/demo?q=derby | search index (Addendum A) |
 | http://localhost:8082/cat/roots | tree service (Addendum B) |
+| http://localhost:8080/playground/tree/cat/roots | the same, through the core's read-only proxy (`-tree-url`) |
+
+The seed creates `schemas`, `demo` (a few matches, with catalog roles), `cat` (a catalog of
+`demo`: folders, placements, `$access`, one dangling placement), `private` (sealed, E2) and
+`vault` (end-to-end, E3: create its keyring from the playground's Keys tab).
 
 - `make logs` follows the logs.
 - `make seed` re-runs the seed, which is safe to repeat.
@@ -102,9 +107,38 @@ It is plain HTML/JS embedded in the binary and talks to the same-origin API. It 
 - a request inspector with every request's preconditions, status, response headers and error body, plus "copy as curl";
 - namespace, resource, history, batch and branch editors;
 - live SSE feeds;
-- scripted examples: conflict and rebase, schema validation, rules, batch delete+restore, branch read-through.
+- scripted examples: conflict and rebase, schema validation, rules, batch delete+restore, branch read-through;
+- a **Catalog** tab (Addendum B): the folder tree of a catalog namespace with its placed items
+  (linked to the Resource tab), effective roles per subject derived in the browser from `$access`
+  (§B.11.2, `inherit: false`, tree powers, `includes` from the content namespace), the listing's
+  checkpoint (`at`) and problems (dangling items, orphans, cycles). It creates folders and places,
+  moves, reorders and removes nodes as ordinary writes to the catalog namespace (`If-None-Match`,
+  `If-Match`, fresh `$nonce` on placements), then re-reads the tree with `?min=` (read-your-writes);
+- a **Keys** tab (Addendum E): an X25519 identity kept in localStorage (its public JWK goes in a
+  grant's `enc`, or into an E3 keyring), the keys held, E3 keyring administration (init, add a
+  reader, rotate), a JWE decrypter and a self-test of the page's crypto against vectors made by
+  the Go implementation (`selftest.json`).
 
-Run it with `./patchlog serve -dev` and open `http://localhost:8080/playground/`.
+With keys, the playground decrypts sealed (E2, `application/jose`) documents, namespace documents
+and logs, fetching them with `POST /ns/{ns}/keys` (unwrapping HPKE-wrapped keys with the identity)
+and checking `kid` and `pl` against the request; the inspector shows the plaintext next to the JWE.
+In E3 namespaces it reads the keyring, folds the sealed log in the browser (checking ids, chain and
+bindings; revisions that don't open, apply or validate against their `$schema` are flagged, using a
+JSON Schema subset) and seals writes client-side with a fresh `$nonce` (padded when the namespace
+sets `pad`). All of it is WebCrypto only: HPKE (RFC 9180) is built on X25519, HKDF and AES-GCM in
+`internal/playground/static/seal.js`; `go test ./internal/playground` checks it against
+`internal/seal` (with node on `PATH`, both ways).
+
+The tree service is another origin, and the playground's CSP allows `connect-src 'self'` only, so
+`serve -tree-url http://tree:8082` mounts a read-only reverse proxy at `/playground/tree/`: `GET`
+and `HEAD` only (other methods are `405`), `Authorization` forwarded, the service's redirects
+rewritten under the prefix, `502` while it is unreachable. compose passes it. Without it, the
+Catalog tab reads the catalog's documents straight from the core API and says that computed
+listings need the tree service. Sealed listings (§E.2.6), whole or per entry, are decrypted when
+keys are at hand and shown by name otherwise.
+
+Run it with `./patchlog serve -dev` and open `http://localhost:8080/playground/`. Sealed and e2e
+namespaces need `-master-key FILE -master-key-create`.
 
 ### Search index (Addendum A)
 
