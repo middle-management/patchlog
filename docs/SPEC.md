@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.24 · 2026-09-30. See the change log at the end.
+Status: draft v0.25 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -3007,7 +3007,8 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
             "matches/cup":   { "history": "snapshot", "head": "1c…" } },
   "external": ["media/photo-12"],                          // dependencies deliberately left out
   "requires": { "matches/derby": "1h…" },                  // incremental: must already be in the target
-  "authors": false }
+  "authors": false,
+  "access": { "matches": "private", "schemas": "public" } }      // source protection, §G.5
 { "ns": "schemas", "resource": "match", "id": "1s…", "parent": "", "kind": "rev", "patches": [ … ] }
 { "ns": "matches", "resource": "derby", "id": "1a…", "parent": "1h…", "kind": "rev", "patches": [ … ] }
 { "ns": "matches", "resource": "cup", "snapshot": "1c…", "doc": { … } }
@@ -3031,7 +3032,7 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
 
 - **Digest.** A bundle's digest, recorded as `source.bundle` (§G.4.4), is `text(trunc160(sha256(b)))`, where `b` is the bundle as written: each line's canonical JSON (§3.1) followed by one newline (0x0A), header first. A file written that way has exactly those bytes.
 
-- **Trust.** Headers and snapshot lines are only as trustworthy as the channel that delivered the bundle, until signed bundles exist (§G.7). A bundle can be wrapped in a JWE to its recipient like any file.
+- **Trust.** Headers and snapshot lines are only as trustworthy as the channel that delivered the bundle, until signed bundles exist (§G.7). A bundle can be encrypted to its recipients as a sealed bundle (§G.5.1).
 
 ### G.4.2 Selection and dependencies
 
@@ -3116,6 +3117,51 @@ patchlog import release-7.plb --to https://cms.example --dry-run
 - **E2.** An exporter with keys decrypts, so the bundle holds plaintext and should be encrypted to its recipient. A remote branch has its own epoch keys.
 
 - **E3.** Bundles and remote branches carry ciphertext, and ids over it verify as usual. Keys travel separately, via the keyring, to recipients who may read. Merges across differently named namespaces re-encrypt, so they never fast-forward (§F.8). Snapshots need a client with keys, and a sealed genesis isn't deterministic (random IV).
+
+### G.5.1 Bundles
+
+- **`access`** in the header gives each exporting namespace's protection: `"public"`, `"private"` (read-restricted, with or without E1), `"sealed"` (E2) or `"e2e"` (E3). Exporters MUST include it. An importer treats a namespace that is missing from it as `"private"`.
+
+- **Importing.** The importer enforces what A can't. It MUST refuse to import into a target that is less protected than the source, unless an operator overrides this explicitly for that import:
+
+- A `public` source may go into any target.
+
+- A `private` or `sealed` source goes into a private or sealed target. An importer that holds the target's keys MAY also import it into an `e2e` target by sealing each patch set client-side. That re-encryption changes the ids, like any E3 merge (§F.8).
+
+- An `e2e` source goes only into an `e2e` target **with the same namespace name**, since sealed patch sets bind `pl.ns` (§E.3.1). Lines carry the ciphertext verbatim, including the `keyring` resource, and ids verify as usual. Importing under another name is a merge, done by a client that holds both sets of keys.
+
+- **E3 snapshots.** A snapshot line of an `e2e` namespace needs an exporter with keys. The exporter replaces `doc` with `"patches": [{ "op": "sealed", … }]`, a sealed genesis under the source's current epoch, and `snapshot` keeps the source id as provenance. The genesis id is computed over that ciphertext, so each export produces a different one.
+
+- **Plaintext of protected sources.** A bundle with lines from a `private` or `sealed` namespace holds plaintext, and SHOULD be delivered as a sealed bundle. Exporters SHOULD refuse to write it unsealed unless asked to.
+
+#### G.5.1.1 Sealed bundles
+
+A sealed bundle (`application/vnd.patchlog.sealed-bundle+jsonl`) encrypts a bundle line by line, so it can be written and read as a stream:
+
+```
+{ "sealedBundle": 1, "id": "",
+  "recipients": [ { "kid": "", "suite": "hpke-base-0x0020-0x0001-0x0002", "wrapped": "" } ] }
+
+…
+```
+
+- **Envelope line.** `id` is 128 random bits, base64url without padding. The content key `K_b` is 256 random bits, wrapped for each recipient with HPKE (RFC 9180, base mode). The suite is the one of §E.2.3: DHKEM(X25519, HKDF-SHA256), HKDF-SHA256 and AES-256-GCM. The HPKE `info` is `"patchlog-bundle-v1" ‖ 0x0A ‖ id`. A recipient's `kid` is the RFC 7638 thumbprint of its X25519 public key as a JWK (`{ crv, kty, x }`, SHA-256, base64url).
+
+- **Lines.** Each following line is a JWE compact under `K_b`, with `alg: "dir"` and `enc: "A256GCM"`. Its protected header carries `pl: { "bundle": id, "line": n }` and, on the last line only, `"last": true`. The plaintext of line `n` is bundle line `n` (header = 0) as canonical JSON, without its newline. Lines are never compressed.
+
+- **Checks.** A reader MUST reject the whole sealed bundle if any line fails to decrypt, if `pl.bundle` differs from `id`, if line numbers are not 0, 1, 2… in order, or if no line says `last` or a line follows it. Reordered, spliced or truncated sealed bundles are therefore rejected. The decrypted bundle is then checked as in §G.4.1.
+
+- **Digest.** `source.bundle` is the digest of the decrypted bundle (§G.4.1), so it is the same however the bundle was delivered.
+
+- **What stays visible:** the number of lines, their sizes and the recipients' thumbprints. Padding (§E.2.2) MAY be applied to each line's plaintext.
+
+### G.5.2 Remote branches
+
+- A remote branch of a `private`, `sealed` or `e2e` source MUST be at least as protected. B refuses to register it otherwise, since B can see the source's level in its namespace document.
+
+- **E2 sources.** B fetches keys from A with its own key pair and grant (§E.2.3), mirrors the plaintext, and seals what it serves under the branch's own epoch keys.
+
+- **E3 sources.** B mirrors ciphertext and the `keyring` verbatim, and verifies ids over the ciphertext. A remote branch of an E3 namespace keeps its source's namespace name in `pl.ns`, so its readers use the source's keys. Writes to the branch are sealed under keys the branch's own key holders manage, and are merged back by re-encryption (§F.8).
 
 ## G.6 Multi-region (outlook)
 
@@ -3278,3 +3324,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **v0.23:** optional padding of sealed payloads, `"encryption": { …, "pad": true }`: space-padded plaintext to Padmé buckets of at least 256 bytes, never compressed, at E2 and E3 alike (§E.2.2, §E.3.1, §E.4).
 
 - **v0.24:** the sealed format of derived views (§E.2.6). A response from a single source may be one JWE with `pl: { ns, view }`. Otherwise entries are sealed one by one under their own namespace's key, with `pl: { ns, name, view }`, where `view` is the `at` URL's path and query. Only content-derived values are sealed; names, ids, URLs and structure stay in the clear. Services at E3 need to be keyring recipients, derived data is purged with its source, and query strings are listed as visible metadata (§E.4).
+
+- **v0.25:** encryption for bundles and remote branches (§G.5). Bundle headers give each namespace's protection in `access`, and importers refuse a less protected target unless an operator overrides it; E3 bundles import only under the same namespace name. Sealed bundles (§G.5.1.1) encrypt line by line under an HPKE-wrapped content key, with `pl: { bundle, line }` and a `last` marker, so reordering and truncation are detected, and the digest stays over the plaintext. Remote branches must be at least as protected as their source (§G.5.2).
