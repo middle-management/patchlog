@@ -129,6 +129,7 @@ type stepState struct {
 	parentID *ids.ID
 	id       ids.ID
 	doc      any // resulting (for a delete: the last live) document
+	docCanon []byte // canonical(doc), once checkLimits computed it
 	writes   []string
 	typed    string // $schema of the resulting document
 	// prevNonce is the $nonce of the document the step applied to, if
@@ -981,7 +982,8 @@ func checkLimits(l Limits, s *itemState) *Error {
 		if ops, ok := step.raw.([]any); ok && len(ops) > l.OpsPerSet {
 			return limitErr(422, "too many operations")
 		}
-		if len(jsonv.Canonical(step.doc)) > l.DocumentSize {
+		step.docCanon = jsonv.Canonical(step.doc)
+		if len(step.docCanon) > l.DocumentSize {
 			return limitErr(413, "document too large")
 		}
 		if jsonv.Depth(step.doc) > l.NestingDepth {
@@ -1239,7 +1241,10 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 			if e2e {
 				continue
 			}
-			canon := jsonv.Canonical(step.doc)
+			canon := step.docCanon
+			if canon == nil {
+				canon = jsonv.Canonical(step.doc)
+			}
 			t.cacheDoc(step.id, canon)
 			t.maybeSnapshot(res, last, canon)
 		}

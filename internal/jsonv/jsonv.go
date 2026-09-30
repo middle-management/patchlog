@@ -12,6 +12,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"sync"
 	"unicode/utf16"
 	"unicode/utf8"
 )
@@ -212,7 +213,21 @@ func (p *parser) hex4() (rune, error) {
 
 func (p *parser) str() (string, error) {
 	p.i++ // "
-	var sb []byte
+	// Fast path: plain ASCII up to the closing quote is the string itself.
+	start := p.i
+	for p.i < len(p.b) {
+		c := p.b[p.i]
+		if c == '"' {
+			s := string(p.b[start:p.i])
+			p.i++
+			return s, nil
+		}
+		if c == '\\' || c < 0x20 || c >= utf8.RuneSelf {
+			break
+		}
+		p.i++
+	}
+	sb := append([]byte(nil), p.b[start:p.i]...)
 	for {
 		if p.i >= len(p.b) {
 			return "", p.err("unterminated string")
@@ -337,10 +352,24 @@ func UnsafeInteger(f float64) bool {
 // Canonical returns the RFC 8785 (JCS) serialisation of v, UTF-8 encoded.
 // v must be a value of the model; ints are accepted for convenience.
 func Canonical(v any) []byte {
-	var b bytes.Buffer
-	writeCanonical(&b, v)
-	return b.Bytes()
+	// A pooled buffer keeps its capacity, so a large document is written
+	// without growing (reallocating and copying) the buffer again and
+	// again; the result is one exact-size copy.
+	b := canonBufs.Get().(*bytes.Buffer)
+	b.Reset()
+	writeCanonical(b, v)
+	out := bytes.Clone(b.Bytes())
+	if b.Cap() <= maxPooledCanon {
+		canonBufs.Put(b)
+	}
+	return out
 }
+
+// maxPooledCanon bounds the buffers kept for reuse (documents are at most a
+// few MiB, §6.6).
+const maxPooledCanon = 8 << 20
+
+var canonBufs = sync.Pool{New: func() any { return new(bytes.Buffer) }}
 
 func writeCanonical(b *bytes.Buffer, v any) {
 	switch x := v.(type) {
@@ -418,6 +447,18 @@ func writeString(b *bytes.Buffer, s string) {
 	const hex = "0123456789abcdef"
 	b.WriteByte('"')
 	for i := 0; i < len(s); i++ {
+		// Copy the run of bytes that need no escaping in one go: byte by
+		// byte, canonicalising a large document was most of a write's cost.
+		j := i
+		for j < len(s) && s[j] >= 0x20 && s[j] != '"' && s[j] != '\\' {
+			j++
+		}
+		if j > i {
+			b.WriteString(s[i:j])
+			if i = j; i == len(s) {
+				break
+			}
+		}
 		c := s[i]
 		switch {
 		case c == '"':
