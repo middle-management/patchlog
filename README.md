@@ -125,7 +125,12 @@ namespace's name, or `"*"`, in `ns`.
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
   `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, and `heads.seq`.
 - **Documents are cached by revision id**, since an id determines its document everywhere
-  (§3.3). Old revisions are folded from the nearest head snapshot, kept snapshot or genesis.
+  (§3.3). Head snapshots are kept only for documents up to 16 KiB. An intermediate snapshot is
+  written after every 100 revisions or 64 KiB of patch sets, so every read folds from the nearest
+  snapshot and never folds more than that (D.4).
+- **Allowances** (§6.6): `allowances: [{ sub, kid, rate, burst, itemsPerBatch, batchSize }]` in a
+  namespace document gives one principal its own bucket and batch limits. They can go up to the
+  deployment maximums, set with `serve -max-items-per-batch` and `-max-batch-size`.
 - **Limit names** in a namespace document's `limits` object: `patchSetSize`, `opsPerSet`,
   `documentSize`, `nestingDepth`, `rulesPerNamespace`, `rulesPerGrant`, `grantSize`,
   `itemsPerBatch`, `batchSize`, `liveBranches`, `keepPerResource` (integers, lower only),

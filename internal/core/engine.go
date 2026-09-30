@@ -48,6 +48,13 @@ type Options struct {
 	Now func() time.Time
 	// Purger receives cache-tag purges (§9). Nil logs them.
 	Purger Purger
+	// HeadSnapshotMax is the largest head document kept as a head snapshot
+	// (D.4, default 16 KiB). Larger heads are folded from snapshots.
+	HeadSnapshotMax int
+	// SnapshotEveryRevisions and SnapshotEveryBytes decide when an
+	// intermediate snapshot is written (D.4, defaults 100 and 64 KiB).
+	SnapshotEveryRevisions int
+	SnapshotEveryBytes     int
 }
 
 // Purger purges CDN cache tags.
@@ -74,6 +81,15 @@ type Engine struct {
 func Open(opt Options) (*Engine, error) {
 	if opt.Limits == (Limits{}) {
 		opt.Limits = DefaultLimits()
+	}
+	if opt.HeadSnapshotMax == 0 {
+		opt.HeadSnapshotMax = 16 << 10
+	}
+	if opt.SnapshotEveryRevisions == 0 {
+		opt.SnapshotEveryRevisions = 100
+	}
+	if opt.SnapshotEveryBytes == 0 {
+		opt.SnapshotEveryBytes = 64 << 10
 	}
 	if opt.Maximums == (Limits{}) {
 		opt.Maximums = opt.Limits
@@ -394,3 +410,7 @@ func (c *docCache) flush() {
 	c.m = map[ids.ID][]byte{}
 	c.mu.Unlock()
 }
+
+// FlushCaches drops in-memory document caches, so reads fold from storage
+// (tests, and after restoring archived history).
+func (e *Engine) FlushCaches() { e.docs.flush() }

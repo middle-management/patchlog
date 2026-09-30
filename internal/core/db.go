@@ -54,12 +54,15 @@ CREATE TABLE IF NOT EXISTS revisions (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_first ON revisions (res) WHERE first = 1;
 CREATE INDEX IF NOT EXISTS revisions_id ON revisions (id);
+CREATE INDEX IF NOT EXISTS revisions_res_seq ON revisions (res, seq);
 
 CREATE TABLE IF NOT EXISTS grants (id BLOB PRIMARY KEY, blocks TEXT NOT NULL);
 
 CREATE TABLE IF NOT EXISTS heads (res INTEGER PRIMARY KEY REFERENCES resources, seq INTEGER NOT NULL, doc TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS heads_seq ON heads (seq);
+-- Intermediate snapshots (D.4) and documents kept below a horizon (§8.6).
 CREATE TABLE IF NOT EXISTS snapshots (seq INTEGER PRIMARY KEY REFERENCES revisions, res INTEGER NOT NULL, doc TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS snapshots_res ON snapshots (res, seq);
 
 CREATE TABLE IF NOT EXISTS ns_log (
   seq        INTEGER PRIMARY KEY,

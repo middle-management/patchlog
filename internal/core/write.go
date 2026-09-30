@@ -914,7 +914,9 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 		if !step.del {
 			lastLive = step
 			lastLiveSeq = last
-			t.e.docs.put(step.id, jsonv.Canonical(step.doc))
+			canon := jsonv.Canonical(step.doc)
+			t.e.docs.put(step.id, canon)
+			t.maybeSnapshot(res, last, canon)
 		}
 	}
 	final := s.steps[len(s.steps)-1]
@@ -924,16 +926,36 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 	}
 	_, err := t.Exec(`UPDATE resources SET head_seq = ?, state = ? WHERE res = ?`, last, state, res)
 	t.must(err)
-	// heads holds the last live document, which a restore needs.
+	// heads caches the last live document, which reads and restores need,
+	// but only for small documents (D.4): rewriting a large one on every
+	// save costs its whole size each time. Larger ones fold from snapshots.
 	var doc []byte
 	if lastLive != nil {
 		doc = jsonv.Canonical(lastLive.doc)
 	} else {
 		doc = jsonv.Canonical(final.doc)
 	}
-	_, err = t.Exec(`INSERT INTO heads (res, seq, doc) VALUES (?,?,?) ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc`, res, lastLiveSeq, string(doc))
+	if len(doc) <= t.e.opt.HeadSnapshotMax {
+		_, err = t.Exec(`INSERT INTO heads (res, seq, doc) VALUES (?,?,?) ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc`, res, lastLiveSeq, string(doc))
+	} else {
+		_, err = t.Exec(`DELETE FROM heads WHERE res = ?`, res)
+	}
 	t.must(err)
 	return res, last
+}
+
+// maybeSnapshot writes an intermediate snapshot at seq once enough patch
+// sets have accumulated since the resource's last snapshot (D.4), so no
+// read folds more than that.
+func (t *tx) maybeSnapshot(res, seq int64, doc []byte) {
+	var last int64
+	t.must(t.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?`, res).Scan(&last))
+	var count, size int64
+	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(patches AS BLOB))), 0) FROM revisions WHERE res = ? AND seq > ? AND kind = 0`, res, last).Scan(&count, &size))
+	if count >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes) {
+		_, err := t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, res, string(doc))
+		t.must(err)
+	}
 }
 
 // sortedKeys is a helper for stable output.

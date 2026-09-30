@@ -815,14 +815,22 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		for _, k := range keep {
 			keepSeqs[k.seq] = k
 		}
-		rrows, qerr := t.Query(`SELECT seq, id FROM revisions WHERE res = ? AND seq < ? AND kind = 0 AND patches IS NOT NULL`, v.own.id, h.seq)
+		// Referenced schema revisions keep their documents; one already below
+		// an earlier horizon keeps the snapshot it has.
+		preserve := map[int64]bool{}
+		rrows, qerr := t.Query(`SELECT seq, id, patches IS NOT NULL FROM revisions WHERE res = ? AND seq < ? AND kind = 0`, v.own.id, h.seq)
 		t.must(qerr)
 		for rrows.Next() {
 			var seq int64
 			var id []byte
-			t.must(rrows.Scan(&seq, &id))
+			var hasPatches bool
+			t.must(rrows.Scan(&seq, &id, &hasPatches))
 			if refs["/r/"+n.name+"/"+name+"/rev/"+ids.FromBytes(id).String()] {
-				keepSeqs[seq] = nil
+				if hasPatches {
+					keepSeqs[seq] = nil
+				} else {
+					preserve[seq] = true
+				}
 			}
 		}
 		rrows.Close()
@@ -839,6 +847,25 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		}
 		_, err = t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, v.own.id, h.seq)
 		t.must(err)
+		// Below the horizon only the documents kept above survive:
+		// intermediate snapshots (D.4) and an earlier prune's keep set go,
+		// or pruned revisions would still be served.
+		srows, qerr := t.Query(`SELECT seq FROM snapshots WHERE res = ? AND seq < ?`, v.own.id, h.seq)
+		t.must(qerr)
+		var drop []int64
+		for srows.Next() {
+			var seq int64
+			t.must(srows.Scan(&seq))
+			if _, kept := keepSeqs[seq]; !kept && !preserve[seq] {
+				drop = append(drop, seq)
+			}
+		}
+		srows.Close()
+		for _, seq := range drop {
+			_, err = t.Exec(`DELETE FROM snapshots WHERE seq = ?`, seq)
+			t.must(err)
+		}
+		t.flushDocs = true
 		keepJSON := string(jsonv.Canonical(anyStrings(pr.Keep)))
 		_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = ? WHERE res = ?`, h.seq, keepJSON, v.own.id)
 		t.must(err)
