@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.28 · 2026-09-30. See the change log at the end.
+Status: draft v0.29 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -1030,6 +1030,12 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
 - **Stale reads are safe.** A stale head read cannot cause a silent overwrite, because every write names its parent.
 
+- **Serving stale.** Immutable responses never change, so an edge MAY keep serving them while the origin is unreachable. A purge still removes them. Head pointers are served stale only within their `stale-while-revalidate`. Live long-poll answers (§7.7), `200` and `204` alike, MUST NOT be served stale: an old answer would end a wait without the change it waits for. They carry no `stale-*` directive, and an edge MUST NOT apply stale-if-error or grace defaults to them.
+
+- **Empty long-poll answers.** The `204` that ends a wait with nothing new must be cached like the `200`, or followers stop collapsing onto one origin request. A CDN that doesn't cache `204` by default SHOULD be configured to do so for these responses.
+
+- **Tags** are `{kind}:{value}`, where `kind` is a lowercase word (`ns`, `r`, and the kinds addenda define, such as `idx` and `rs`) and `value` is made of namespace and resource names (§3.6) joined by `/`. So a tag uses only `a–z`, `0–9`, `.`, `_`, `-`, `:`, `/` and `~`, and never contains a space or a comma. `Cache-Tag` lists a response's tags separated by commas, and `Surrogate-Key` lists the same tags separated by spaces. A purge names whole tags and never matches part of one. How purges reach the CDN is deployment-specific. For a self-hosted CDN, a `PURGE` request with the tags in `X-Purge-Tags`, separated by spaces, is a reasonable convention (Addendum D).
+
 - **Branches** are cached like any namespace, under their own URLs and tags. A purge that propagates to branches (§8.3) purges their tags too.
 
 **Sealed namespaces** (Addendum E, level E2) use the public rules above: everything leaving the origin is ciphertext, and keys decide who can read.
@@ -1038,13 +1044,15 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
 - **Downstream** responses carry `Cache-Control: private` (e.g. `private, max-age=300` for immutable content), so shared caches between the CDN and the reader never store them.
 
-- **At the edge**, lifetimes are given with `CDN-Cache-Control` (RFC 9213) or `Surrogate-Control`, using the same values as for public namespaces.
+- **Edge caching needs an edge that verifies grants.** Private content may be cached at the edge only because the edge verifies an edge grant on every request (the grant isn't part of the cache key). A CDN that doesn't verify grants would serve one reader's cached response to anyone. So there are two deployments:
 
-- **The edge verifies an edge grant on every request.** The grant is not part of the cache key.
+  - **With a verifying edge**, lifetimes at the edge are given with `CDN-Cache-Control` (RFC 9213) or `Surrogate-Control`, using the same values as for public namespaces. The origin rejects private reads that don't carry the edge's verification, such as a shared secret between the CDN and the origin. Otherwise the edge could be bypassed, and a response fetched around it could be one the edge would cache without verifying.
 
-- **The origin rejects** reads that don't carry the edge's verification (e.g. a shared secret between the CDN and the origin).
+  - **Without one** (no CDN, or a CDN that doesn't verify grants), the origin verifies grants itself and marks private responses `CDN-Cache-Control: no-store` (and `Surrogate-Control: no-store`), so no shared cache stores them. Only public and sealed content is then cached at the edge.
 
-- **Changing a namespace from public to private** requires a tag purge of `ns:{ns}`, which every response of the namespace carries. Copies already in browsers remain until their `max-age` expires.
+The origin must know which deployment it is in. It sends edge lifetimes for private content only on requests that carry the edge's verification.
+
+- **Changing a namespace from public to private** requires a tag purge of `ns:{ns}`, which every response of the namespace carries. The origin issues it with the configuration write that makes the change, as it does for any purge. Copies already in browsers remain until their `max-age` expires.
 
 ---
 
@@ -3390,3 +3398,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Bundles and remote branches (§G.4.4, §G.5):** upstream chains of sealed targets aren't deterministic. E3 imports into new targets need `config` to step through epochs. B refuses a remote branch whose source document it can't read. Epoch start times from the source are unverified but can't widen decryption.
 
 - **v0.28:** catalog `/read-grants` keys are defined (§B.11.5). There is no `K_r` for E3 items, and there are keys for placement and folder nodes of sealed catalogs. Keys are checked by role even in public sealed namespaces, and `historyEpochs` bounds the epochs, since catalog grants have no start time. Remote branches record the base chain they verified as `base.chain`, so clients can accept read-through ciphertext from a source that is itself a branch (§G.3, §G.5.2).
+
+- **v0.29:** feedback from running a real CDN in front of the implementation (§9). Private content is cached at the edge only with a grant-verifying edge. Otherwise the origin marks it `CDN-Cache-Control: no-store`, and edge lifetimes go only to requests carrying the edge's verification. The origin purges `ns:{ns}` itself when a namespace becomes private. Stale serving is defined: immutable content MAY be served while the origin is unreachable, head pointers only within `stale-while-revalidate`, and long-poll answers never. Empty long-poll `204`s must be cached. The tag grammar and delimiters are defined, purges match whole tags, and `PURGE` with `X-Purge-Tags` is suggested for self-hosted CDNs.
