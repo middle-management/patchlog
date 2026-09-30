@@ -56,6 +56,40 @@ and serves immutable, CDN-cacheable revisions.
 - Author signatures (§C.3): a `Signature` header is stored with the revision and returned
   in the log, but not verified.
 
+## Releases and images
+
+CI (`.github/workflows/ci.yml`) runs gofmt, vet, the tests and a Docker build on every push and PR.
+`.github/workflows/release.yml` publishes:
+
+- **On a tag `vX.Y.Z`**: a GitHub Release with binaries for linux, macOS and windows (amd64 and
+  arm64) and a checksum file, and the image `ghcr.io/middle-management/patchlog:X.Y.Z`, `:X.Y` and
+  `:latest`. A tag with a `-` (`v0.2.0-rc.1`) is a prerelease: no `:latest` or `:X.Y`.
+- **On every push to master**: `ghcr.io/middle-management/patchlog:edge` and `:sha-<commit>`.
+
+The image holds the one `patchlog` binary (entrypoint), runs as a non-root user with its data in
+`/data`, and serves on 8080. As a backend for another project:
+
+```sh
+docker run -p 8080:8080 -v patchlog-data:/data ghcr.io/middle-management/patchlog:edge \
+  serve -dev -addr=:8080 -db=/data/patchlog.db -origin=http://localhost:8080
+```
+
+```yaml
+# compose.yaml in the other project
+services:
+  patchlog:
+    image: ghcr.io/middle-management/patchlog:edge   # or a released :X.Y.Z
+    command: [serve, -dev, -addr=:8080, -db=/data/patchlog.db, -origin=http://localhost:8080]
+    ports: ["8080:8080"]
+    volumes: [patchlog-data:/data]
+volumes:
+  patchlog-data:
+```
+
+`-dev` turns authentication off (`X-Author` names the author); without it, give `-operator-key`
+and use grants (Addendum C). `patchlog version` prints the build's version. While the package is
+private, pulling needs `docker login ghcr.io` with a token that can read packages.
+
 ## Running the whole stack
 
 ```sh

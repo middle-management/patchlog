@@ -38,11 +38,16 @@ type multi []string
 func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
 
+// version is set at build time: -ldflags "-X main.version=v1.2.3".
+var version = "dev"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
 	}
 	switch os.Args[1] {
+	case "version", "-version", "--version":
+		fmt.Println("patchlog", version)
 	case "serve":
 		serve(os.Args[2:])
 	case "keygen":
@@ -74,6 +79,7 @@ func usage() {
   patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+  patchlog version
   patchlog keygen
   patchlog grant mint -key SEED -block JSON [-seal]
   patchlog grant narrow -grant TOKEN -block JSON [-seal]
@@ -198,7 +204,7 @@ func serve(args []string) {
 		log.Fatal(err)
 	}
 	srv := &http.Server{Addr: *addr, Handler: handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy), ReadHeaderTimeout: 10 * time.Second}
-	log.Printf("patchlog listening on %s (origin %s, dev=%v)", *addr, *origin, *dev)
+	log.Printf("patchlog %s listening on %s (origin %s, dev=%v)", version, *addr, *origin, *dev)
 	if *pg {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
 	}

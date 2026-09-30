@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          out=$(gofmt -l .)
+          if [ -n "$out" ]; then echo "not gofmt'ed:"; echo "$out"; exit 1; fi
+      - run: go vet ./...
+      - run: go test ./...
+      - name: race
+        run: go test -race ./internal/core ./internal/server ./internal/merge ./internal/index ./internal/tree
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - name: build the image (not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          build-args: VERSION=ci-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

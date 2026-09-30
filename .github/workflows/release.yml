@@ -1,0 +1,100 @@
+# Releases and images.
+#
+#   push a tag v1.2.3  → GitHub Release with binaries (linux, darwin,
+#                        windows × amd64, arm64) and checksums, and the
+#                        image ghcr.io/<owner>/patchlog:1.2.3, :1.2, :latest
+#                        (tags with a "-", e.g. v1.2.3-rc.1, are prereleases:
+#                        no :latest, no :1.2)
+#   push to master     → image ghcr.io/<owner>/patchlog:edge and :sha-<short>
+name: Release
+
+on:
+  push:
+    branches: [master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -eu
+          mkdir -p dist
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*}; arch=${target#*/}
+            name=patchlog_${VERSION}_${os}_${arch}
+            dir=dist/$name
+            mkdir -p "$dir"
+            ext=""; [ "$os" = windows ] && ext=.exe
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags="-s -w -X main.version=${VERSION}" -o "$dir/patchlog$ext" ./cmd/patchlog
+            cp README.md "$dir/"
+            mkdir -p "$dir/docs" && cp docs/SPEC.md "$dir/docs/"
+            if [ "$os" = windows ]; then
+              (cd dist && zip -qr "$name.zip" "$name")
+            else
+              tar -C dist -czf "dist/$name.tar.gz" "$name"
+            fi
+            rm -rf "$dir"
+          done
+          (cd dist && sha256sum * > "patchlog_${VERSION}_checksums.txt")
+          ls -l dist
+      - name: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          pre=""; case "$TAG" in *-*) pre="--prerelease";; esac
+          gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag $pre
+
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v5
+      # The final stage runs a RUN step (adduser), which needs emulation
+      # for the arm64 image; the Go build itself cross-compiles.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}},enable=${{ !contains(github.ref_name, '-') }}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') }}
+            type=raw,value=edge,enable=${{ github.ref == 'refs/heads/master' }}
+            type=sha,enable=${{ github.ref == 'refs/heads/master' }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: VERSION=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || format('edge-{0}', github.sha) }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
