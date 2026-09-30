@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]]
+//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -66,7 +66,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]]
   patchlog keygen
@@ -92,6 +92,7 @@ func serve(args []string) {
 	origin := fs.String("origin", "http://localhost:8080", "canonical origin (§G.1)")
 	dev := fs.Bool("dev", false, "disable authentication (development only); X-Author names the author")
 	pg := fs.Bool("playground", true, "serve the web playground at /playground/")
+	treeURL := fs.String("tree-url", "", "tree service (Addendum B) the playground reads through a read-only proxy at "+server.TreeProxyPrefix+", e.g. http://tree:8082")
 	maxItems := fs.Int("max-items-per-batch", 0, "deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it (§6.6)")
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
 	var opKeys multi
@@ -165,6 +166,15 @@ func serve(args []string) {
 	} else if *masterKeyCreate {
 		log.Fatal("-master-key-create needs -master-key")
 	}
+	var treeProxy http.Handler
+	if *treeURL != "" {
+		if !*pg {
+			log.Fatal("-tree-url needs the playground (it proxies under " + server.TreeProxyPrefix + ")")
+		}
+		if treeProxy, err = server.NewTreeProxy(*treeURL); err != nil {
+			log.Fatal(err)
+		}
+	}
 	e, err := core.Open(core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
 		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
 		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke})
@@ -172,10 +182,13 @@ func serve(args []string) {
 		log.Fatal(err)
 	}
 	defer e.Close()
-	srv := &http.Server{Addr: *addr, Handler: handler(server.New(e), *pg), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: handler(server.New(e), *pg, treeProxy), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("patchlog listening on %s (origin %s, dev=%v)", *addr, *origin, *dev)
 	if *pg {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
+	}
+	if treeProxy != nil {
+		log.Printf("tree proxy: %s%s -> %s (GET/HEAD only)", localURL(*addr), server.TreeProxyPrefix, *treeURL)
 	}
 	log.Fatal(srv.ListenAndServe())
 }
@@ -223,12 +236,17 @@ func remoteOptions(bearers, urls, identities []string) (core.RemoteOptions, erro
 // The playground has its own ServeMux, but the API is not put behind one:
 // http.ServeMux cleans paths and answers 301, where §3.6 requires the API's
 // own 400 for non-canonical URLs, so only playground paths reach the mux.
-func handler(api http.Handler, withPlayground bool) http.Handler {
+// treeProxy, if not nil, serves server.TreeProxyPrefix (-tree-url);
+// without it those paths are the playground's 404.
+func handler(api http.Handler, withPlayground bool, treeProxy http.Handler) http.Handler {
 	if !withPlayground {
 		return api
 	}
 	mux := http.NewServeMux()
 	mux.Handle(playground.Prefix, playground.Handler())
+	if treeProxy != nil {
+		mux.Handle(server.TreeProxyPrefix, treeProxy)
+	}
 	mux.HandleFunc(strings.TrimSuffix(playground.Prefix, "/"), func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, playground.Prefix, http.StatusFound)
 	})
