@@ -49,7 +49,7 @@ type revRow struct {
 	parentSeq sql.NullInt64
 	first     bool
 	kind      int
-	patches   sql.NullString
+	patches   sql.NullString // as stored: encrypted at rest or not (patchesOf)
 	author    int64
 	via       sql.NullString
 	grantID   []byte
@@ -214,15 +214,19 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 				base = b
 				break
 			}
+			// A heads row may belong to another resource than cur (a
+			// branch's head whose last live document is the base's): its
+			// own res decides the key.
 			var doc string
-			err := t.QueryRow(`SELECT doc FROM heads WHERE seq = ?`, cur.seq).Scan(&doc)
+			var dres int64
+			err := t.QueryRow(`SELECT res, doc FROM heads WHERE seq = ?`, cur.seq).Scan(&dres, &doc)
 			if err == nil {
-				base = []byte(doc)
+				base = t.docOf("heads", dres, cur.seq, doc)
 				break
 			}
-			err = t.QueryRow(`SELECT doc FROM snapshots WHERE seq = ?`, cur.seq).Scan(&doc)
+			err = t.QueryRow(`SELECT res, doc FROM snapshots WHERE seq = ?`, cur.seq).Scan(&dres, &doc)
 			if err == nil {
-				base = []byte(doc)
+				base = t.docOf("snapshots", dres, cur.seq, doc)
 				break
 			}
 			if !cur.patches.Valid {
@@ -247,7 +251,7 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 	}
 	for i := len(stack) - 1; i >= 0; i-- {
 		row := stack[i]
-		ops, err := patch.Parse(jsonv.MustParse([]byte(row.patches.String)))
+		ops, err := patch.Parse(jsonv.MustParse(t.patchesOf(row)))
 		if err != nil {
 			return nil, err
 		}
@@ -312,7 +316,7 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 	} else {
 		e.Kind = "rev"
 		if r.patches.Valid { // NULL below a horizon (§8.6)
-			e.Patches = jsonv.MustParse([]byte(r.patches.String))
+			e.Patches = jsonv.MustParse(t.patchesOf(r))
 		}
 	}
 	if r.signature.Valid {

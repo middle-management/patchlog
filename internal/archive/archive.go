@@ -19,6 +19,15 @@
 // the last entry of the previous one in `requires`, so a resource's archives
 // chain back to genesis. Archives are written to a temporary file in the
 // same directory, synced and renamed, so a URL never holds a partial bundle.
+//
+// # Encrypted namespaces
+//
+// In a namespace encrypted at rest (Addendum E.1) the bundle is written
+// through core.ArchiveBundle.Seal: the file is the standard bundle,
+// encrypted as a chunked AES-256-GCM stream under a key derived from the
+// resource's data key (format in internal/core/crypt.go). Restore decrypts
+// it with core.Engine.OpenArchive. Purging the resource destroys the data
+// key, so copies of the file that survive can't be read.
 package archive
 
 import (
@@ -142,9 +151,25 @@ func (d *Dir) Write(ctx context.Context, dest, key string, b *core.ArchiveBundle
 	tmp := f.Name()
 	defer os.Remove(tmp) // no-op after the rename
 	bw := bufio.NewWriterSize(f, 1<<16)
-	if err := Encode(ctx, bw, b); err != nil {
+	var w io.Writer = bw
+	var sw io.WriteCloser
+	if b.Seal != nil {
+		// An encrypted namespace's archive (Addendum E.1).
+		if sw, err = b.Seal(bw); err != nil {
+			f.Close()
+			return "", err
+		}
+		w = sw
+	}
+	if err := Encode(ctx, w, b); err != nil {
 		f.Close()
 		return "", err
+	}
+	if sw != nil {
+		if err := sw.Close(); err != nil {
+			f.Close()
+			return "", err
+		}
 	}
 	if err := bw.Flush(); err != nil {
 		f.Close()
@@ -287,7 +312,7 @@ func Restore(ctx context.Context, e *core.Engine, opt RestoreOptions) ([]Resourc
 				if from != "" {
 					u = fileURL(filepath.Join(from, filepath.FromSlash(r.Key)))
 				}
-				if err := readArchive(ctx, opener, u, g.ns, g.name, yield); err != nil {
+				if err := readArchive(ctx, e, opener, u, g.ns, g.name, yield); err != nil {
 					if ctx.Err() != nil {
 						return ctx.Err()
 					}
@@ -314,13 +339,19 @@ func Restore(ctx context.Context, e *core.Engine, opt RestoreOptions) ([]Resourc
 	return out, nil
 }
 
-func readArchive(ctx context.Context, o Opener, u, ns, name string, yield func(core.ArchiveEntry) error) error {
+func readArchive(ctx context.Context, e *core.Engine, o Opener, u, ns, name string, yield func(core.ArchiveEntry) error) error {
 	rc, err := o.Open(ctx, u)
 	if err != nil {
 		return err
 	}
 	defer rc.Close()
-	rd, err := bundle.NewReader(rc)
+	// An archive of an encrypted namespace is decrypted with the
+	// resource's data key; a purge destroyed it (Addendum E.1).
+	plain, err := e.OpenArchive(ctx, ns, name, rc)
+	if err != nil {
+		return err
+	}
+	rd, err := bundle.NewReader(plain)
 	if err != nil {
 		return err
 	}

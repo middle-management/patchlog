@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
+//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}'
@@ -19,6 +19,7 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/playground"
 	"github.com/middle-management/patchlog/internal/server"
 )
@@ -63,6 +64,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
+                 [-master-key FILE [-master-key-create]]
   patchlog keygen
   patchlog grant mint -key SEED -block JSON
   patchlog grant narrow -grant TOKEN -block JSON
@@ -74,7 +76,7 @@ func usage() {
   patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
   patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
   patchlog bundle verify -i file.jsonl
-  patchlog archive restore -db patchlog.db [-from file:///path] [-ns NS] [-resource NAME]`)
+  patchlog archive restore -db patchlog.db [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]`)
 	os.Exit(2)
 }
 
@@ -99,6 +101,8 @@ func serve(args []string) {
 	ignorePurges := fs.Bool("remote-ignore-purges", false, "record purges in remote bases' logs as notices instead of applying them (§G.3)")
 	remoteFollow := fs.Duration("remote-follow-interval", 5*time.Minute, "how often remote bases' logs are followed (0 disables)")
 	remoteRegister := fs.Bool("remote-register", false, "register remote branches with their bases and renew the registrations (§G.3)")
+	masterKey := fs.String("master-key", "", "file holding the 32-byte master key of encryption at rest (Addendum E.1); mode 0600")
+	masterKeyCreate := fs.Bool("master-key-create", false, "create the -master-key file with a new random key if it doesn't exist")
 	fs.Parse(args)
 	remote, err := remoteOptions(remoteBearers, remoteURLs)
 	if err != nil {
@@ -142,8 +146,18 @@ func serve(args []string) {
 	if *retention == 0 {
 		*retention = -1
 	}
+	var ks core.KeyStore
+	if *masterKey != "" {
+		l, err := keystore.LoadFile(*masterKey, *masterKeyCreate)
+		if err != nil {
+			log.Fatalf("-master-key: %v", err)
+		}
+		ks = l
+	} else if *masterKeyCreate {
+		log.Fatal("-master-key-create needs -master-key")
+	}
 	e, err := core.Open(core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
-		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote})
+		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks})
 	if err != nil {
 		log.Fatal(err)
 	}

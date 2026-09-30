@@ -156,6 +156,22 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 	if !jsonv.Equal(cur.Doc["base"], cfg.Doc["base"]) {
 		return nil, invalid("/base cannot change")
 	}
+	baseLevel := -1
+	if n.isBranch() {
+		// A remote branch's shadow follows the branch itself; its
+		// base's level was checked when it was created.
+		if b := t.nsByID(n.base.Int64); !b.isShadow() {
+			baseLevel = t.nsLevel(b)
+		}
+	}
+	if err := t.checkEncryption(cur, cfg, baseLevel); err != nil {
+		return nil, err
+	}
+	if cfg.level > cur.level {
+		if deps := t.lowerDependents(n, cfg.level); len(deps) > 0 {
+			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "raise the encryption level of these branches first")
+		}
+	}
 	if n.isBranch() {
 		// A remote base's keys don't reach across (§7.6): the loop stops
 		// at the shadow, which has none.
@@ -216,9 +232,15 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 		n.id, p.id[:], n.configSeq, string(p.canon), string(jsonv.Canonical(p.doc)), author, t.now.UnixMilli())
 	t.must(err)
 	seq, _ := r.LastInsertId()
+	raised := p.cfg.level > t.config(n.configSeq).level
 	_, err = t.Exec(`UPDATE namespaces SET frozen = ?, config_seq = ? WHERE ns = ?`, p.cfg.Frozen, seq, n.id)
 	t.must(err)
 	n.frozen = p.cfg.Frozen
+	n.configSeq = seq
+	if raised {
+		// Turning encryption at rest on encrypts what is stored (§E.1).
+		t.encryptNamespace(n)
+	}
 	return seq
 }
 
@@ -332,6 +354,9 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	}
 	if cfg.Base != nil {
 		return nil, invalid("branches are created with POST /ns/{base}/branches")
+	}
+	if err := t.checkEncryption(nil, cfg, -1); err != nil {
+		return nil, err
 	}
 	if cfg.Successor != "" {
 		return nil, invalid("a new namespace cannot have a successor")
@@ -501,6 +526,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if cfg.Read == "public" && bcfg.Read != "public" {
 		return nil, invalid("a branch of a non-public namespace cannot be public")
 	}
+	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {
+		return nil, err
+	}
 	// Step 6: the base's rules evaluate a branch envelope.
 	env := t.basicEnvelope("branch", br.Name, a)
 	env["writes"] = anyStrings(writes)
@@ -612,6 +640,9 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 		} else {
 			res = own.id
 			t.deleteArchives(`res = ?`, res)
+			// Destroying the data key makes whatever survives of the
+			// rows and archives unreadable (§8.3, §E.1).
+			t.deleteDEKs(`res = ?`, res)
 			_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ?`, res)
 			t.must(err)
 			_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE res = ?`, statePurged, res)
@@ -684,6 +715,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 			return err
 		}
 		t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+		t.deleteDEKs(`ns = ?`, n.id)
 		_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
 		_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
@@ -951,7 +983,7 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 		res.Archive = u
 	}
 	for seq, doc := range docs {
-		_, err := t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, own.id, string(doc))
+		_, err := t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, own.id, t.putDoc("snapshots", own.id, seq, doc))
 		t.must(err)
 	}
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)

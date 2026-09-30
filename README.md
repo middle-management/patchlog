@@ -25,6 +25,7 @@ and serves immutable, CDN-cacheable revisions.
 | Grants, narrowing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices | §G.3 | ✅ (mirrored up front) |
 | Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
+| Encryption at rest, cryptographic purge | Addendum E.1 | ✅ (local master key file; KMS adapters to come) |
 
 ### Not implemented
 
@@ -32,7 +33,8 @@ and serves immutable, CDN-cacheable revisions.
   namespace, signed manifests and `x-tree-label` titles.
 - **§F.7 merge service** (scheduled merges, web status): not built. Its logic is in
   `internal/merge` and the CLI.
-- **Addendum E** (encryption): a namespace document with `encryption` is rejected with `422`.
+- **Addendum E.2/E.3** (sealed, end-to-end): `encryption.level` `"sealed"` or `"e2e"` is
+  rejected with `422`. E.1 (at rest) is implemented, see below.
 - **Addendum G** (federation): remote branches whose base is itself a branch, lazy
   read-through, and mirroring pinned `x-ref` targets (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
@@ -169,6 +171,39 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   accepted only for loopback hosts, so two local servers can try this out
   (`-origin http://localhost:8080` and `http://localhost:8081`).
 
+### Encryption at rest (Addendum E.1)
+
+```sh
+patchlog serve -master-key /etc/patchlog/master.key [-master-key-create]   # 32 random bytes, mode 0600
+curl -X PATCH $B/ns/matches -H "$P" -H 'If-Match: "{config_id}"' -H "Authorization: Bearer $STAR" \
+  -d '[{"op":"add","path":"/encryption","value":{"level":"at-rest"}}]'
+```
+
+- **Keys.** A `KeyStore` (`core.Options.KeyStore`; `internal/keystore` keeps the master key in a
+  file, refused if group or others can access it) wraps per-resource data keys, stored in `deks`.
+  Grants use one deployment data key. Patch sets, head and intermediate snapshots and grants of
+  an at-rest namespace are stored as `0x01 ‖ nonce ‖ AES-256-GCM` BLOBs whose associated data
+  binds table, resource and revision id (or seq); plaintext namespaces keep canonical JSON TEXT.
+  Ids, the protocol and caching are unchanged; the in-memory document cache holds plaintext.
+- **Purge is cryptographic.** Resource and namespace purges (and their propagation) delete the
+  data keys as well as nulling the rows. SQLite runs with `secure_delete`, so freed pages are
+  zeroed once the WAL is checkpointed.
+- **Archives** of an at-rest namespace are the usual bundle, encrypted as a chunked AES-GCM
+  stream under `HKDF(data key, salt, "patchlog-archive-v1")` (format in
+  `internal/core/crypt.go`). Restore decrypts them; after a purge, surviving copies are
+  unreadable.
+- **Turning it on** for an existing namespace (a `*` key, §7.4) encrypts its stored rows, its
+  remote shadow's and its grants in the config write's transaction; reads handle mixed rows by
+  the version byte. Lowering or removing the level is `422`, and so is a branch below its base
+  (branches inherit the level); raising a base with lower branches is `409 in_use`. A remote
+  branch's mirrored rows follow the branch's level; a remote base's served level binds it.
+- **Failing closed.** `encryption` without a key store is `422`. A database with encrypted data
+  opened with the wrong master key refuses to start; without a key store, encrypted content
+  answers `500 encryption_unavailable` (reads and writes), while plaintext namespaces are served.
+- **Not yet:** a resumable background job for encrypting large namespaces (it runs in one
+  transaction), re-encrypting archives written before encryption was turned on, `-master-key`
+  for `patchlog archive restore` (the library restore decrypts), key rotation, KMS adapters.
+
 ### Tree and catalog (Addendum B)
 
 `patchlog tree -catalog cat` follows a catalog namespace and the content namespaces it trusts, and
@@ -280,7 +315,8 @@ namespace's name, or `"*"`, in `ns`.
   their whole gate inside one write transaction.
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
-  `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, and `heads.seq`; and
+  `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, `heads.seq`, `deks`
+  (wrapped data keys of encryption at rest, Addendum E.1); and
   for §G.3 `remote_branches` (registrations at the source: base, remote origin and name,
   `at`, latest and previous entry, expiry), `remote_bases` (per remote branch: its shadow,
   A's origin, namespace and `at`, the follow checkpoint and the registration at A) and
@@ -316,6 +352,7 @@ internal/tree        tree service: folders, placements, links, manifests (§B.2�
 internal/catalog     tree-derived access and grant issuing (§B.11)
 internal/bundle      bundle format, export and import (§G.4)
 internal/archive     file:// archives for pruning and offline restore (§8.6)
+internal/keystore    master key file and key wrapping for encryption at rest (Addendum E.1)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
 internal/ids        content-addressed ids (§3.2–§3.5)
 internal/pointer    JSON Pointer

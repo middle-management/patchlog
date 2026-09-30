@@ -498,7 +498,6 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	n, a, st, cplan, src, isBatch, result := p.n, p.a, p.st, p.cplan, p.src, p.isBatch, p.result
 	// Step 7: insert atomically with the namespace entry.
 	author := t.authorID(a.id())
-	grantID := t.storeGrant(a)
 	configSeq := n.configSeq
 	var entries []any
 	if cplan != nil {
@@ -506,6 +505,8 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 		entries = append(entries, map[string]any{"kind": "config", "target": cplan.id.String()})
 		result.ConfigID = cplan.id.String()
 	}
+	// After the config change, which may have turned encryption on.
+	grantID := t.storeGrant(n, a)
 	type ins struct {
 		res  int64
 		last int64
@@ -970,13 +971,12 @@ func (t *tx) checkSource(v any) (any, *Error) {
 }
 
 // storeGrant records the non-bearer form of the actor's grant (§C.3).
-func (t *tx) storeGrant(a *actor) []byte {
+func (t *tx) storeGrant(n *nsRow, a *actor) []byte {
 	if a.grant == nil {
 		return nil
 	}
 	id := a.grant.ID()
-	_, err := t.Exec(`INSERT OR IGNORE INTO grants (id, blocks) VALUES (?, ?)`, id[:], string(a.grant.Stored()))
-	t.must(err)
+	t.storeGrantBlocks(id[:], a.grant.Stored(), t.nsLevel(n) >= levelAtRest)
 	return id[:]
 }
 
@@ -1019,7 +1019,7 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 		if step.del {
 			kind = kindTombstone
 		} else {
-			patches = string(step.canon)
+			patches = t.putPatches(res, step.id, step.canon)
 			if step.typed != "" {
 				typed = step.typed
 			}
@@ -1059,7 +1059,7 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 		doc = jsonv.Canonical(final.doc)
 	}
 	if len(doc) <= t.e.opt.HeadSnapshotMax {
-		_, err = t.Exec(`INSERT INTO heads (res, seq, doc) VALUES (?,?,?) ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc`, res, lastLiveSeq, string(doc))
+		_, err = t.Exec(`INSERT INTO heads (res, seq, doc) VALUES (?,?,?) ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc`, res, lastLiveSeq, t.putDoc("heads", res, lastLiveSeq, doc))
 	} else {
 		_, err = t.Exec(`DELETE FROM heads WHERE res = ?`, res)
 	}
@@ -1076,7 +1076,7 @@ func (t *tx) maybeSnapshot(res, seq int64, doc []byte) {
 	var count, size int64
 	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(patches AS BLOB))), 0) FROM revisions WHERE res = ? AND seq > ? AND kind = 0`, res, last).Scan(&count, &size))
 	if count >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes) {
-		_, err := t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, res, string(doc))
+		_, err := t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, res, t.putDoc("snapshots", res, seq, doc))
 		t.must(err)
 	}
 }

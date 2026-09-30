@@ -52,6 +52,12 @@ type ArchiveBundle struct {
 	// Entries calls yield for each entry in chain order, streaming from the
 	// database. It stops at the first error yield returns.
 	Entries func(yield func(ArchiveEntry) error) error
+	// Seal, when set, is an encrypted namespace's (Addendum E.1): the
+	// archiver writes the encoded bundle through the writer it returns
+	// and closes it, so the archive is stored encrypted under a key
+	// derived from the resource's data key (crypt.go). Engine.OpenArchive
+	// reads it back.
+	Seal func(w io.Writer) (io.WriteCloser, error)
 }
 
 // ArchiveEntry is one history line of an archive.
@@ -102,6 +108,7 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 	if first.parentSeq.Valid {
 		b.Requires = t.rev(first.parentSeq.Int64).id.String()
 	}
+	b.Seal = t.archiveSealer(res)
 	b.Entries = func(yield func(ArchiveEntry) error) error {
 		after := fromSeq - 1
 		for {
@@ -313,7 +320,7 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 				out.Skipped++
 				return nil
 			}
-			_, err = t.Exec(`UPDATE revisions SET patches = ? WHERE seq = ?`, string(canon), row.seq)
+			_, err = t.Exec(`UPDATE revisions SET patches = ? WHERE seq = ?`, t.putPatches(own.id, row.id, canon), row.seq)
 			t.must(err)
 			out.Restored++
 			return nil
@@ -355,17 +362,18 @@ func (t *tx) rebuildSnapshots(res, upTo int64) error {
 	var count, size int
 	after := int64(0)
 	for {
-		rows, err := t.Query(`SELECT seq, kind, patches FROM revisions WHERE res = ? AND seq > ? AND seq < ? ORDER BY seq LIMIT 512`, res, after, upTo)
+		rows, err := t.Query(`SELECT seq, id, kind, patches FROM revisions WHERE res = ? AND seq > ? AND seq < ? ORDER BY seq LIMIT 512`, res, after, upTo)
 		t.must(err)
 		type r struct {
 			seq     int64
+			id      []byte
 			kind    int
 			patches sql.NullString
 		}
 		var batch []r
 		for rows.Next() {
 			var x r
-			t.must(rows.Scan(&x.seq, &x.kind, &x.patches))
+			t.must(rows.Scan(&x.seq, &x.id, &x.kind, &x.patches))
 			batch = append(batch, x)
 		}
 		rows.Close()
@@ -377,7 +385,8 @@ func (t *tx) rebuildSnapshots(res, upTo int64) error {
 			if x.kind != kindRev {
 				continue
 			}
-			ops, err := patch.Parse(jsonv.MustParse([]byte(x.patches.String)))
+			canon := t.patchesOf(&revRow{res: res, id: ids.FromBytes(x.id), patches: x.patches})
+			ops, err := patch.Parse(jsonv.MustParse(canon))
 			if err != nil {
 				return err
 			}
@@ -387,7 +396,7 @@ func (t *tx) rebuildSnapshots(res, upTo int64) error {
 			}
 			exists = true
 			count++
-			size += len(x.patches.String)
+			size += len(canon)
 			var has bool
 			t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM snapshots WHERE seq = ?)`, x.seq).Scan(&has))
 			if has {
@@ -395,7 +404,7 @@ func (t *tx) rebuildSnapshots(res, upTo int64) error {
 				continue
 			}
 			if count >= t.e.opt.SnapshotEveryRevisions || size >= t.e.opt.SnapshotEveryBytes {
-				_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?)`, x.seq, res, string(jsonv.Canonical(doc)))
+				_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?)`, x.seq, res, t.putDoc("snapshots", res, x.seq, jsonv.Canonical(doc)))
 				t.must(err)
 				count, size = 0, 0
 			}

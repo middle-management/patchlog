@@ -103,6 +103,9 @@ type Config struct {
 	Frozen     bool
 	Successor  string
 	Base       *BaseRef
+	// Encryption is encryption.level (Addendum E), "" if none.
+	Encryption string
+	level      int
 }
 
 // Allowance gives a named principal its own rate and batch limits (§6.6).
@@ -288,7 +291,24 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			}
 			c.Base = &BaseRef{NS: ns, At: at}
 		case "encryption":
-			return nil, fmt.Errorf("/encryption: encryption (Addendum E) is not supported by this server")
+			e, ok := v.(map[string]any)
+			if !ok {
+				return nil, fmt.Errorf(`/encryption must be { "level": "at-rest" | "sealed" | "e2e" }`)
+			}
+			for k := range e {
+				if k != "level" {
+					return nil, fmt.Errorf("/encryption/%s is not supported by this server", k)
+				}
+			}
+			lv, _ := e["level"].(string)
+			switch lv {
+			case "at-rest":
+			case "sealed", "e2e":
+				return nil, fmt.Errorf("/encryption/level %q (Addendum E.2, E.3) is not supported by this server; only \"at-rest\" is", lv)
+			default:
+				return nil, fmt.Errorf(`/encryption/level must be "at-rest", "sealed" or "e2e"`)
+			}
+			c.Encryption, c.level = lv, levelOf(lv)
 		}
 	}
 	return c, nil

@@ -68,6 +68,10 @@ type Options struct {
 	RetentionInterval time.Duration
 	// Remote configures remote branches of this deployment (§G.3).
 	Remote RemoteOptions
+	// KeyStore wraps the data keys of encryption at rest (Addendum E.1).
+	// Nil means none: a namespace document can't set encryption (422), and
+	// content stored encrypted answers 500.
+	KeyStore KeyStore
 	// BeforeWriteLock is called by resource writes and batches after the
 	// check phase (steps 1–6, outside the write lock) and before they take
 	// the write lock and re-check (D.3). Tests use it to inject concurrent
@@ -120,6 +124,7 @@ type Engine struct {
 	hub       *hub
 	rate      *rateLimiter
 	docs      *docCache
+	deks      *dekCache
 	cfgMu     sync.Mutex
 	cfgCache  map[int64]*Config
 	stop      chan struct{}
@@ -173,8 +178,13 @@ func Open(opt Options) (*Engine, error) {
 		hub:       newHub(),
 		rate:      newRateLimiter(),
 		docs:      newDocCache(4096),
+		deks:      newDEKCache(4096),
 		cfgCache:  map[int64]*Config{},
 		stop:      make(chan struct{}),
+	}
+	if err := e.checkKeyStore(); err != nil {
+		db.Close()
+		return nil, err
 	}
 	if opt.RetentionInterval > 0 {
 		e.bg.Add(1)
@@ -261,6 +271,13 @@ type tx struct {
 	// deps, when set, records what a write's check phase read that a
 	// concurrent write could change (D.3 re-check).
 	deps *writeDeps
+	// Encryption at rest (crypt.go): data keys created in this
+	// transaction (cached once committed), whether a purge destroyed keys,
+	// resources' levels, and the levels of shadows being created.
+	newDEKs      map[int64][]byte
+	flushDEKs    bool
+	resLevels    map[int64]int
+	shadowLevels map[string]int
 }
 
 type docPut struct {
@@ -315,6 +332,14 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 	}
 	if err := sqlTx.Commit(); err != nil {
 		return err
+	}
+	if t.flushDEKs {
+		e.deks.flush()
+	}
+	if !t.flushDEKs {
+		for res, k := range t.newDEKs {
+			e.deks.put(res, k)
+		}
 	}
 	// Caches, CDN purges and live readers learn of a write only once it has
 	// committed.

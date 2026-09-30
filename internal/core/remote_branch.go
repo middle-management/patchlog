@@ -302,6 +302,7 @@ func (s *remoteSchema) chainIndex(id string) (int, bool) {
 type remoteMirror struct {
 	base    *BaseRef
 	read    string // the base's read mode at at (as served; §G.5)
+	level   int    // the base's encryption level at at (as served)
 	log     []client.NSEntry
 	res     []*remoteRes
 	schemas []*remoteSchema
@@ -340,6 +341,12 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		}
 		if d.Value["read"] == "public" {
 			m.read = "public"
+		}
+		if enc, ok := d.Value["encryption"].(map[string]any); ok {
+			lv, _ := enc["level"].(string)
+			if m.level = levelOf(lv); m.level == levelNone {
+				m.level = levelE2E // unknown: the strictest
+			}
 		}
 	}
 	// Heads as of at, from the verified log.
@@ -494,6 +501,9 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	if cfg.Successor != "" {
 		return nil, nil, nil, invalid("a new namespace cannot have a successor")
 	}
+	if err := t.checkEncryption(nil, cfg, -1); err != nil {
+		return nil, nil, nil, err
+	}
 	return cfg, doc.(map[string]any), a, nil
 }
 
@@ -553,6 +563,14 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	if cfg.Read == "public" && m.read != "public" {
 		return nil, invalid("a branch of a non-public namespace cannot be public")
 	}
+	if cfg.level < m.level {
+		return nil, invalid("/encryption: a branch cannot have a lower encryption level than its base")
+	}
+	// The shadow's mirrored rows follow the branch's level.
+	if t.shadowLevels == nil {
+		t.shadowLevels = map[string]int{}
+	}
+	t.shadowLevels[shadowName(req.NS)] = cfg.level
 	if err := t.mirrorSchemas(m, req.NS, cfg, author); err != nil {
 		return nil, err
 	}
@@ -702,7 +720,7 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow) i
 		case e.Kind == "tombstone":
 			kind = kindTombstone
 		case e.HasPatches:
-			patches = string(jsonv.Canonical(e.Patches))
+			patches = t.putPatches(res, id, jsonv.Canonical(e.Patches))
 		}
 		if kind == kindRev {
 			if dm, ok := doc.(map[string]any); ok {
@@ -731,7 +749,7 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow) i
 		lastLive, lastLiveDoc = last, canonDoc
 		if patches == nil {
 			// The horizon: its document is kept as a snapshot (§8.6).
-			_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?)`, last, res, string(canonDoc))
+			_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?)`, last, res, t.putDoc("snapshots", res, last, canonDoc))
 			t.must(err)
 			horizon = last
 			return nil
@@ -752,7 +770,7 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow) i
 		lastLiveDoc = b
 	}
 	if len(lastLiveDoc) <= t.e.opt.HeadSnapshotMax {
-		_, err = t.Exec(`INSERT INTO heads (res, seq, doc) VALUES (?,?,?) ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc`, res, lastLive, string(lastLiveDoc))
+		_, err = t.Exec(`INSERT INTO heads (res, seq, doc) VALUES (?,?,?) ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc`, res, lastLive, t.putDoc("heads", res, lastLive, lastLiveDoc))
 	} else {
 		_, err = t.Exec(`DELETE FROM heads WHERE res = ?`, res)
 	}
@@ -786,7 +804,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 		}
 		if n == nil {
 			doc := map[string]any{"read": cfg.Read}
-			for _, k := range []string{"keys", "roles"} {
+			for _, k := range []string{"keys", "roles", "encryption"} {
 				if v, ok := cfg.Doc[k]; ok {
 					doc[k] = jsonv.Clone(v)
 				}
@@ -850,6 +868,7 @@ func (t *tx) purgeShadow(sh *nsRow, name string) {
 	if r == nil || r.state == statePurged {
 		return
 	}
+	t.deleteDEKs(`res = ?`, r.id)
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ?`, r.id)
 	t.must(err)
 	_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE res = ?`, statePurged, r.id)
@@ -864,6 +883,7 @@ func (t *tx) purgeShadow(sh *nsRow, name string) {
 // purgeShadowNS removes all of a shadow's content (the remote branch's
 // namespace purge, §8.5).
 func (t *tx) purgeShadowNS(sh *nsRow) {
+	t.deleteDEKs(`ns = ?`, sh.id)
 	q := `res IN (SELECT res FROM resources WHERE ns = ?)`
 	for _, s := range []string{
 		`UPDATE revisions SET patches = NULL WHERE ` + q,

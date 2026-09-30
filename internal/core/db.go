@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS revisions (
   parent_seq INTEGER,                        -- NULL for genesis; a row of another resource for a foreign parent
   first      INTEGER NOT NULL DEFAULT 0,
   kind       INTEGER NOT NULL,               -- 0 rev · 1 tombstone
-  patches    TEXT,                           -- canonical JSON; NULL for tombstones, after purge, and below a horizon
+  patches    TEXT,                           -- canonical JSON; NULL for tombstones, after purge, and below a horizon; a BLOB when encrypted at rest (crypt.go)
   author     INTEGER NOT NULL REFERENCES authors,
   via        TEXT,
   grant_id   BLOB,
@@ -57,6 +57,16 @@ CREATE INDEX IF NOT EXISTS revisions_id ON revisions (id);
 CREATE INDEX IF NOT EXISTS revisions_res_seq ON revisions (res, seq);
 
 CREATE TABLE IF NOT EXISTS grants (id BLOB PRIMARY KEY, blocks TEXT NOT NULL);
+
+-- Addition: data keys of encryption at rest (Addendum E.1), wrapped by the
+-- key store named in keystore. res is a resources row, or 0 for the
+-- deployment key of grants. Purge deletes a resource's key (crypt.go).
+CREATE TABLE IF NOT EXISTS deks (
+  res        INTEGER PRIMARY KEY,
+  wrapped    BLOB    NOT NULL,
+  keystore   TEXT    NOT NULL,
+  created    INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS heads (res INTEGER PRIMARY KEY REFERENCES resources, seq INTEGER NOT NULL, doc TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS heads_seq ON heads (seq);
@@ -156,10 +166,13 @@ CREATE TABLE IF NOT EXISTS remote_notices (
 );
 `
 
+// openDB opens the database. secure_delete zeroes deleted and overwritten
+// content, so a purge (and turning encryption at rest on, which rewrites
+// rows) leaves no plaintext in free pages once the WAL is checkpointed.
 func openDB(path string) (*sql.DB, error) {
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_txlock=immediate"
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)&_txlock=immediate"
 	if path == ":memory:" {
-		dsn = "file::memory:?_pragma=foreign_keys(ON)&_txlock=immediate"
+		dsn = "file::memory:?_pragma=foreign_keys(ON)&_pragma=secure_delete(ON)&_txlock=immediate"
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

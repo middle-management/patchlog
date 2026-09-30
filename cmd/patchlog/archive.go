@@ -9,13 +9,14 @@ import (
 
 	"github.com/middle-management/patchlog/internal/archive"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/keystore"
 )
 
 // archiveCmd is `patchlog archive restore`: the offline restore of pruned
 // history from its archives (§8.6, §D.4).
 func archiveCmd(args []string) {
 	if len(args) < 1 || args[0] != "restore" {
-		fmt.Fprintln(os.Stderr, "usage: patchlog archive restore -db patchlog.db [-from file:///path] [-ns NS] [-resource NAME]")
+		fmt.Fprintln(os.Stderr, "usage: patchlog archive restore -db patchlog.db [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("archive restore", flag.ExitOnError)
@@ -23,6 +24,7 @@ func archiveCmd(args []string) {
 	from := fs.String("from", "", "file:// directory the archives are in now (default: the URLs recorded when they were written)")
 	ns := fs.String("ns", "", "restore only this namespace")
 	res := fs.String("resource", "", "restore only this resource (with -ns)")
+	masterKey := fs.String("master-key", "", "master key file, needed to restore archives of encrypted namespaces (Addendum E.1)")
 	fs.Parse(args[1:])
 	if *res != "" && *ns == "" {
 		log.Fatal("-resource needs -ns")
@@ -30,7 +32,15 @@ func archiveCmd(args []string) {
 	if _, err := os.Stat(*db); err != nil {
 		log.Fatalf("-db: %v", err)
 	}
-	e, err := core.Open(core.Options{Path: *db, RetentionInterval: -1})
+	opt := core.Options{Path: *db, RetentionInterval: -1}
+	if *masterKey != "" {
+		ks, err := keystore.LoadFile(*masterKey, false)
+		if err != nil {
+			log.Fatalf("-master-key: %v", err)
+		}
+		opt.KeyStore = ks
+	}
+	e, err := core.Open(opt)
 	if err != nil {
 		log.Fatal(err)
 	}
