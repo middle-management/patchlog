@@ -60,7 +60,12 @@ type Head struct {
 
 // ResourceHead resolves the head pointer.
 func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credentials) (*Head, error) {
+	if h, ok := e.rc.head(ns, name); ok {
+		return &h, nil
+	}
+	g := e.rc.load(ns)
 	var h *Head
+	public := false
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -70,6 +75,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 			return err
 		}
 		h = &Head{Public: t.cachePublic(n)}
+		public = t.config(n.configSeq).Read == "public"
 		if n.purged {
 			h.State = Purged
 			return nil
@@ -84,6 +90,10 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		}
 		return nil
 	})
+	if err == nil && public {
+		// Credentials don't matter to a public read (readcache.go).
+		e.rc.putHead(g, ns, name, *h)
+	}
 	return h, err
 }
 
@@ -108,6 +118,11 @@ type Rev struct {
 
 // ResourceRev serves the document at a revision.
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
+	if doc := e.rc.rev(ns, name, id); doc != nil {
+		return &Rev{Status: 200, Doc: doc, Public: true}, nil
+	}
+	g := e.rc.load(ns)
+	public := false
 	var out *Rev
 	var job *sealJob
 	var nsRowID int64
@@ -120,6 +135,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return err
 		}
 		out = &Rev{Public: t.cachePublic(n)}
+		public = t.config(n.configSeq).Read == "public"
 		rid, perr := ids.Parse(id)
 		if perr != nil {
 			out.Status = 404
@@ -180,6 +196,10 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE = nil, job.jwe
 		}
+	} else if err == nil && public && out.Status == 200 {
+		// A plain document of a public namespace (sealed ones have a job,
+		// e2e ones no document): immutable, and the same for every reader.
+		e.rc.putRev(g, ns, name, id, out.Doc)
 	}
 	return out, err
 }

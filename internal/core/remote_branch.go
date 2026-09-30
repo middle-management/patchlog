@@ -1026,6 +1026,7 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 			t.must(err)
 		}
 	}
+	t.metaChanged = true
 	_, err = t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, atSeq, cseq, sid)
 	t.must(err)
 	return t.nsByID(sid), atSeq
@@ -1274,6 +1275,7 @@ func (t *tx) purgeShadowNS(sh *nsRow) {
 	}
 	_, err := t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, sh.id)
 	t.must(err)
+	t.metaChanged = true
 	_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, sh.id)
 	t.must(err)
 	t.flushDocs = true

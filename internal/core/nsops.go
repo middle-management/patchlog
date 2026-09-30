@@ -264,6 +264,7 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 	seq, _ := r.LastInsertId()
 	old := t.config(n.configSeq)
 	raised := p.cfg.level > old.level
+	t.metaChanged = true
 	_, err = t.Exec(`UPDATE namespaces SET frozen = ?, config_seq = ? WHERE ns = ?`, p.cfg.Frozen, seq, n.id)
 	t.must(err)
 	n.frozen = p.cfg.Frozen
@@ -771,6 +772,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		t.must(err)
 		_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, n.id)
 		t.must(err)
+		t.metaChanged = true
 		_, err = t.Exec(`UPDATE namespaces SET purged = 1 WHERE ns = ?`, n.id)
 		t.must(err)
 		// A remote branch's mirrored copy of its base goes too; nothing

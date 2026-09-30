@@ -140,6 +140,7 @@ type Engine struct {
 	cfgMu     sync.Mutex
 	cfgCache  map[int64]*Config
 	stmts     stmtCache
+	rc        readCache
 	stop      chan struct{}
 	bg        sync.WaitGroup
 	closeOnce sync.Once
@@ -288,7 +289,10 @@ type tx struct {
 	notify    map[string]bool // namespaces whose logs changed
 	tags      []string        // cache tags to purge after commit
 	flushDocs bool
-	docPuts   []docPut // documents to cache after commit
+	// metaChanged marks a write that changes what reads may return beyond
+	// a namespace's log: its configuration, or a purge (readcache.go).
+	metaChanged bool
+	docPuts     []docPut // documents to cache after commit
 	// deps, when set, records what a write's check phase read that a
 	// concurrent write could change (D.3 re-check).
 	deps *writeDeps
@@ -383,7 +387,10 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 		sqlTx.Rollback()
 		return nil, err
 	}
-	if err := sqlTx.Commit(); err != nil {
+	done := e.rc.commit(t)
+	err = sqlTx.Commit()
+	done()
+	if err != nil {
 		return nil, err
 	}
 	if t.flushEpochKeys {
@@ -572,6 +579,9 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 	_, err = t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, seq, configSeq, n.id)
 	t.must(err)
 	n.headSeq = sql.NullInt64{Int64: seq, Valid: true}
+	if n.configSeq != configSeq {
+		t.metaChanged = true
+	}
 	n.configSeq = configSeq
 	t.notify[n.name] = true
 	return seq, id

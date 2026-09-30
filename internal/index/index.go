@@ -498,6 +498,11 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// Purge before the new checkpoint is out, so nobody who learns of it
+	// can still be served what it removed. Purgers don't block.
+	if len(tags) > 0 {
+		ix.opt.Purger.PurgeTags(tags)
+	}
 	// Publish the checkpoint before any other work: queries read the
 	// committed rows, and a gap between the two makes their "checkpoint
 	// moved" redirects alternate between the old and the new at.
@@ -511,9 +516,6 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	ix.mu.Unlock()
 	if ix.opt.OnApply != nil {
 		ix.opt.OnApply(b)
-	}
-	if len(tags) > 0 {
-		ix.opt.Purger.PurgeTags(tags)
 	}
 	// Housekeeping, once the checkpoint is out: only the current
 	// checkpoint's results are served, so older stored ones go.

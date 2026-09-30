@@ -489,6 +489,11 @@ func (s *Service) Apply(ctx context.Context, b *follow.Batch) error {
 		s.mu.Unlock()
 		return err
 	}
+	// Purge before the new checkpoint is out, so nobody who learns of it
+	// can still be served what it removed. Purgers don't block.
+	if len(res.tags) > 0 {
+		s.opt.Purger.PurgeTags(res.tags)
+	}
 	s.cur[b.NS] = b.NewCheckpoint
 	if co.PurgedNS {
 		s.purged[b.NS] = true
@@ -496,9 +501,6 @@ func (s *Service) Apply(ctx context.Context, b *follow.Batch) error {
 	trustChanged := !sameSet(oldTrust, s.g.Trust)
 	s.mu.Unlock()
 
-	if len(res.tags) > 0 {
-		s.opt.Purger.PurgeTags(res.tags)
-	}
 	if len(res.tags) > 0 {
 		// The purged rows' traces in the WAL go too (secure_delete zeroes
 		// the freed pages of the database itself).
