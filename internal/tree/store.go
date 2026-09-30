@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
@@ -22,6 +23,7 @@ import (
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head)     liveness of every resource of the trusted namespaces
 //	self_parents(ns, name, parents)  $parents of content documents (§B.9, -self-placing)
+//	sealed_views, sealed_view_tags   sealed listings of a sealed/e2e catalog (derived.Cache)
 var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
 	`CREATE INDEX IF NOT EXISTS seen_by_id ON seen (ns_id)`,
@@ -43,7 +45,7 @@ var createStmts = []string{
 var dropStmts = []string{
 	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS meta`,
 	`DROP TABLE IF EXISTS nodes`, `DROP TABLE IF EXISTS edges`, `DROP TABLE IF EXISTS items`,
-	`DROP TABLE IF EXISTS self_parents`,
+	`DROP TABLE IF EXISTS self_parents`, derived.CacheDropStmts[0], derived.CacheDropStmts[1],
 }
 
 func canonJSON(v any) string {

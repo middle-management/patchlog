@@ -12,6 +12,7 @@
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
 //	facet(ns, resource, schema, path, value, raw)
 //	sort (ns, resource, schema, path, value)
+//	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -162,7 +163,7 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		return nil, err
 	}
 	ix := &Index{
-		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0),
+		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		schemas: NewSchemaCache(opt.Client),
@@ -198,6 +199,7 @@ func (ix *Index) Origin() string { return ix.origin }
 var dropStmts = []string{
 	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS ns_state`,
 	`DROP TABLE IF EXISTS docs`, `DROP TABLE IF EXISTS "text"`, `DROP TABLE IF EXISTS facet`, `DROP TABLE IF EXISTS "sort"`,
+	derived.CacheDropStmts[0], derived.CacheDropStmts[1],
 }
 
 var createStmts = []string{
@@ -234,6 +236,9 @@ func (ix *Index) initSchema(ctx context.Context) error {
 		if _, err := ix.db.ExecContext(ctx, s); err != nil {
 			return fmt.Errorf("index: schema: %w", err)
 		}
+	}
+	if err := ix.sealed.Init(ctx); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
 	}
 	// An existing text table decides the mode; otherwise try FTS5.
 	var sqlText string
@@ -467,21 +472,39 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			return err
 		}
 	}
+	// §A.1, §A.4: a purge removes every cached result that shows the
+	// resource, through the r:{ns}/{name} tag each result carries per hit
+	// (and results with facet counts, which may aggregate it); a purge-ns
+	// removes every cached result and pointer of the namespace. Stored
+	// sealed results go by the same tags, in this transaction.
+	var tags []string
+	if co.PurgedNS {
+		tags = append(tags, "idx:"+b.NS, "ns:"+b.NS)
+	}
+	for _, p := range preps {
+		if p.purged {
+			tags = append(tags, "r:"+b.NS+"/"+p.resource)
+		}
+	}
+	if len(tags) > 0 && !co.PurgedNS {
+		tags = append(tags, countsTag(b.NS))
+	}
+	if err := ix.sealed.Purge(ctx, tx, tags); err != nil {
+		return err
+	}
 	if err := ix.cps.Save(ctx, tx, b.Origin, b.NS, b.NewCheckpoint); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	purging := co.PurgedNS
-	for _, p := range preps {
-		purging = purging || p.purged
+	// Only the current checkpoint's results are served.
+	if err := ix.sealed.Retire(ctx, ix.db, b.NS, b.NewCheckpoint); err != nil {
+		ix.opt.Logf("index: retiring sealed results of %s: %v", b.NS, err)
 	}
-	if purging {
-		// Sealed results showing purged content go, and so do its
-		// plaintext rows' traces in the WAL (secure_delete zeroes the
-		// freed pages of the database itself).
-		ix.sealed.DropNS(b.NS)
+	if len(tags) > 0 {
+		// The purged rows' traces in the WAL go too (secure_delete zeroes
+		// the freed pages of the database itself).
 		if _, err := ix.db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 			ix.opt.Logf("index: checkpointing the WAL after a purge: %v", err)
 		}
@@ -502,23 +525,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if ix.opt.OnApply != nil {
 		ix.opt.OnApply(b)
 	}
-	// §A.1, §A.4: a purge removes every cached result that shows the
-	// resource, through the r:{ns}/{name} tag each result carries per hit
-	// (and results with facet counts, which may aggregate it); a purge-ns
-	// removes every cached result and pointer of the namespace.
-	var tags []string
-	if co.PurgedNS {
-		tags = append(tags, "idx:"+b.NS, "ns:"+b.NS)
-	}
-	for _, p := range preps {
-		if p.purged {
-			tags = append(tags, "r:"+b.NS+"/"+p.resource)
-		}
-	}
 	if len(tags) > 0 {
-		if !co.PurgedNS {
-			tags = append(tags, countsTag(b.NS))
-		}
 		ix.opt.Purger.PurgeTags(tags)
 	}
 	for _, u := range b.Units {

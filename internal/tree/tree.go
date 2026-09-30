@@ -181,7 +181,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		return nil, err
 	}
 	s := &Service{
-		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0),
+		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		cur:     map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
@@ -209,6 +209,9 @@ func (s *Service) init(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("tree: schema: %w", err)
 		}
+	}
+	if err := s.sealed.Init(ctx); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
 	}
 	if s.opt.Hook != nil {
 		if err := s.opt.Hook.Init(ctx, s.db); err != nil {
@@ -492,15 +495,9 @@ func (s *Service) Apply(ctx context.Context, b *follow.Batch) error {
 	if len(res.tags) > 0 {
 		s.opt.Purger.PurgeTags(res.tags)
 	}
-	purging := co.PurgedNS
-	for _, p := range preps {
-		purging = purging || p.purged
-	}
-	if purging {
-		// Sealed listings showing purged content go, and so do the purged
-		// rows' traces in the WAL (secure_delete zeroes the freed pages of
-		// the database itself).
-		s.sealed.DropNS(b.NS)
+	if len(res.tags) > 0 {
+		// The purged rows' traces in the WAL go too (secure_delete zeroes
+		// the freed pages of the database itself).
 		if _, err := s.db.ExecContext(context.WithoutCancel(ctx), `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
 			s.opt.Logf("tree: checkpointing the WAL after a purge: %v", err)
 		}
@@ -520,6 +517,10 @@ func (s *Service) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 	if s.opt.OnApply != nil {
 		s.opt.OnApply(b)
+	}
+	// Only listings at the current at are served.
+	if err := s.sealed.Retire(context.WithoutCancel(ctx), s.db, s.opt.Catalog, s.At()); err != nil {
+		s.opt.Logf("tree: retiring sealed listings: %v", err)
 	}
 	return nil
 }
@@ -704,6 +705,10 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO seen (ns, ns_id) VALUES (?, ?)`, b.NS, b.NewCheckpoint); err != nil {
+		return nil, err
+	}
+	// Stored sealed listings go by the same tags as cached copies.
+	if err := s.sealed.Purge(ctx, tx, res.tags); err != nil {
 		return nil, err
 	}
 	if err := s.cps.Save(ctx, tx, b.Origin, b.NS, b.NewCheckpoint); err != nil {

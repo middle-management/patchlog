@@ -121,7 +121,9 @@ func TestSealedNamespace(t *testing.T) {
 	}
 	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"sec", "pub"}, []string{"read"}, map[string]any{"enc": jwk})),
 		client.WithKeys(client.NewKeys(priv)))
-	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec", "pub"}, now: s.Now}, func(o *indexOpts) { o.Recipient = priv })
+	opts := svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec", "pub"}, now: s.Now}
+	withKey := func(o *indexOpts) { o.Recipient = priv }
+	x := startSvcWith(t, ic, opts, withKey)
 	x.caughtUp("sec")
 	x.caughtUp("pub")
 
@@ -169,6 +171,17 @@ func TestSealedNamespace(t *testing.T) {
 	if again := x.fetch(f.path, ""); string(again.body) != string(f.body) {
 		t.Fatal("resealed on a second read")
 	}
+	// Stored in the database, with its cache tags: a restart serves the
+	// same bytes.
+	if tags := x.ix.SealedViews()[f.path]; !strings.Contains(tags, "r:sec/a") || !strings.Contains(tags, "idx:sec") {
+		t.Fatalf("stored view tags %q", tags)
+	}
+	x.stop()
+	x = startSvcWith(t, ic, opts, withKey)
+	x.caughtUp("sec")
+	if again := x.fetch(f.path, ""); string(again.body) != string(f.body) || !strings.Contains(again.header.Get("Cache-Tag"), "r:sec/a") {
+		t.Fatalf("resealed after a restart (tags %q)", again.header.Get("Cache-Tag"))
+	}
 	if r := x.raw("/sec/at/"+at+"?q=secret&counts=/tag", ""); r.status != 302 || r.header.Get("Location") != f.path {
 		t.Fatalf("non-canonical: %d %s", r.status, r.header.Get("Location"))
 	}
@@ -196,6 +209,11 @@ func TestSealedNamespace(t *testing.T) {
 	x.caughtUp("sec")
 	if n := x.ix.CountRows("sec"); n >= before {
 		t.Fatalf("rows %d after purge, %d before", n, before)
+	}
+	for v, tags := range x.ix.SealedViews() {
+		if strings.Contains(tags, "r:sec/a") || v == f2.path {
+			t.Fatalf("stored view %s (%s) survived the purge", v, tags)
+		}
 	}
 	f3 := x.fetch("/sec?q=secret", "")
 	if got := strings.Join(resources(decodeJSON(t, must(derived.OpenView(string(f3.body), epochKeys(t, w, "sec"), derived.View{NS: "sec", Target: f3.path})))), ","); got != "b" {
@@ -339,5 +357,31 @@ func TestE2ENamespace(t *testing.T) {
 	b = decodeJSON(t, must(derived.OpenView(string(lst.body), func(string) []byte { return ke }, derived.View{NS: "e", Target: lst.path})))
 	if got := strings.Join(resources(b), ","); got != "a,b" {
 		t.Fatalf("listing %s", got)
+	}
+}
+
+// A namespace with encryption.pad gets padded results (§E.2.2, §E.2.6):
+// the plaintext is padded to its bucket and never compressed.
+func TestSealedPadded(t *testing.T) {
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("w"), client.WithKeys(client.NewKeys(nil)))
+	must(c.CreateNamespace(ctx, "schemas", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "p", map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed", "pad": true}}))
+	sch := must(c.CreateDoc(ctx, "schemas", "item", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}, "tag": map[string]any{"type": "string", "x-index": "facet"}}}))
+	for _, n := range []string{"a", "b", "c"} {
+		must(createNonced(c, "p", n, map[string]any{"$schema": "/r/schemas/item/rev/" + sch.ID, "title": "padded " + n, "tag": strings.Repeat(n, 700)}))
+	}
+	x := startSvc(t, c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"p"}, now: s.Now})
+	x.caughtUp("p")
+	f := x.fetch("/p?q=padded", "")
+	h := must(seal.ParseHeader(string(f.body)))
+	pt := must(derived.OpenView(string(f.body), epochKeys(t, c, "p"), derived.View{NS: "p", Target: f.path}))
+	if !seal.IsPadded(h, pt) || len(pt) <= 2100 {
+		t.Fatalf("not padded: zip %q, %d bytes", h.Zip, len(pt))
+	}
+	if got := strings.Join(resources(decodeJSON(t, pt)), ","); got != "a,b,c" {
+		t.Fatalf("hits %s", got)
 	}
 }

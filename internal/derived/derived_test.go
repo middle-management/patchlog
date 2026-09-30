@@ -1,28 +1,11 @@
 package derived
 
 import (
-	"bytes"
 	"errors"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/seal"
 )
-
-func TestPaddedLen(t *testing.T) {
-	for l, want := range map[int]int{0: 256, 100: 256, 256: 256, 257: 272, 1000: 1024, 1025: 1088, 100000: 100352} {
-		if got := PaddedLen(l); got != want {
-			t.Errorf("PaddedLen(%d) = %d, want %d", l, got, want)
-		}
-	}
-	for l := 1; l < 1<<20; l = l*3/2 + 1 {
-		if p := PaddedLen(l); p < l || (l > 256 && float64(p-l)/float64(l) > 0.12) {
-			t.Fatalf("PaddedLen(%d) = %d", l, p)
-		}
-	}
-	if b := Pad([]byte(`{"a":1}`)); len(b) != 256 || !bytes.HasPrefix(b, []byte(`{"a":1} `)) {
-		t.Fatalf("Pad: %q", b)
-	}
-}
 
 func TestSealOpen(t *testing.T) {
 	ke := seal.NewKey()
@@ -43,7 +26,7 @@ func TestSealOpen(t *testing.T) {
 		t.Fatalf("header %+v %v", h, err)
 	}
 	pt, err := OpenView(jwe, keyOf, v)
-	if err != nil || len(pt) != 256 {
+	if err != nil || len(pt) != 256 || !seal.IsPadded(h, pt) {
 		t.Fatalf("open: %d %v", len(pt), err)
 	}
 	if _, err := OpenView(jwe, keyOf, View{NS: "n", Target: "/n/at/x?q=b"}); !errors.Is(err, seal.ErrMismatch) {

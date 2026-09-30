@@ -244,7 +244,9 @@ var ops = map[string]bool{
 // through roles) gets JSON in which every node with a title carries
 // "sealed": JWE of { title } under that catalog resource's K_r, pl { ns,
 // name, view }, instead of "title". Sealed listings are produced once per
-// view (a rotation moves at) and then served unchanged from memory.
+// view (a rotation moves at), stored in the database with their cache
+// tags, and served unchanged, across restarts, until a purge with one of
+// those tags or a new at retires them (derived.Cache).
 //
 //	GET /_status    each followed namespace's encryption level and epoch,
 //	                whether listings are sealed, and why a namespace is
@@ -403,8 +405,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			return
 		}
 		perEntry = !v.catAll
-		if b, ok := s.sealed.Get(view.Target); ok {
-			s.writeListing(w, v, at, "ns:"+cat+","+ManyTag(cat), b, perEntry)
+		if st, ok := s.sealed.Get(ctx, view.Target); ok {
+			s.writeListing(w, v, at, st)
 			return
 		}
 	}
@@ -461,7 +463,18 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
 			return
 		}
-		s.writeListing(w, v, at, tags.header(cat, nss), s.sealed.Put(view.Target, nss, b), perEntry)
+		st, err := s.sealed.Put(ctx, view.Target, cat, at, derived.Stored{Body: b, JSON: perEntry, Tags: tags.header(cat, nss)})
+		if err != nil {
+			s.opt.Logf("tree: storing a sealed listing: %v", err)
+		}
+		if cur := s.At(); cur != at {
+			// An apply (maybe a purge) committed meanwhile: don't keep a
+			// listing it may have retired.
+			if err := s.sealed.Retire(ctx, s.db, cat, cur); err != nil {
+				s.opt.Logf("tree: retiring sealed listings: %v", err)
+			}
+		}
+		s.writeListing(w, v, at, st)
 		return
 	}
 	setListingHeaders(w, v, at, tags.header(cat, nss))
@@ -479,19 +492,18 @@ func setListingHeaders(w http.ResponseWriter, v *viewer, at, tags string) {
 	w.Header().Set("X-Namespace-Revision", at)
 }
 
-// writeListing writes a sealed listing: the JWE (application/jose), or the
-// JSON with per-node sealed titles. A listing served from memory is tagged
-// ns:{catalog} and rs:{catalog}: its r: tags were on the first response,
-// and every purge both drops it from memory and purges rs:{catalog}.
-func (s *Service) writeListing(w http.ResponseWriter, v *viewer, at, tags string, b []byte, isJSON bool) {
-	setListingHeaders(w, v, at, tags)
-	if isJSON {
+// writeListing writes a stored sealed listing: the JWE (application/jose),
+// or the JSON with per-node sealed titles, with the Cache-Tag it was
+// stored with.
+func (s *Service) writeListing(w http.ResponseWriter, v *viewer, at string, st derived.Stored) {
+	setListingHeaders(w, v, at, st.Tags)
+	if st.JSON {
 		w.Header().Set("Content-Type", "application/json")
 	} else {
 		w.Header().Set("Content-Type", seal.ContentType)
 	}
 	w.WriteHeader(http.StatusOK)
-	w.Write(b)
+	w.Write(st.Body)
 }
 
 // serveStatus answers GET /_status (Addendum E).

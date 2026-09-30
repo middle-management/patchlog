@@ -41,7 +41,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math/bits"
 	"os"
 	"strings"
 
@@ -104,7 +103,7 @@ func (k Key) seal(key []byte, pl seal.PL, body any) (string, error) {
 		return "", err
 	}
 	if k.Pad {
-		b = Pad(b)
+		return seal.SealPadded(key, seal.Kid(k.NS, k.Epoch), pl, b)
 	}
 	return seal.SealUncompressed(key, seal.Kid(k.NS, k.Epoch), pl, b)
 }
@@ -125,28 +124,6 @@ func SealItem(k Key, v View, name string, values any) (string, error) {
 		return "", err
 	}
 	return k.seal(kr, v.ItemPL(k.NS, name), values)
-}
-
-// Pad appends ASCII spaces to b up to its size bucket max(256, padmé(len))
-// (§E.2.2 padding). It is here until package seal offers it.
-func Pad(b []byte) []byte {
-	n := PaddedLen(len(b))
-	if n <= len(b) {
-		return b
-	}
-	return append(b, bytes.Repeat([]byte{' '}, n-len(b))...)
-}
-
-// PaddedLen is max(256, padmé(l)): with E = ⌊log₂ l⌋ and S = ⌊log₂ E⌋ + 1,
-// l rounded up to a multiple of 2^(E−S).
-func PaddedLen(l int) int {
-	if l <= 256 {
-		return 256
-	}
-	e := bits.Len(uint(l)) - 1
-	s := bits.Len(uint(e))
-	mask := (1 << (e - s)) - 1
-	return (l + mask) &^ mask
 }
 
 // OpenView decrypts a sealed view: keyOf returns the epoch key K_e of the

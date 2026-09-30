@@ -61,7 +61,9 @@ var validNS = client.ValidNSName
 // "sealed": JWE under its resource's K_r, pl { ns, name, view }; counts,
 // which aggregate over resources, are refused (400) for such readers.
 // Sealed results are produced once per view (so per epoch: a rotation
-// moves the checkpoint) and then served unchanged from memory.
+// moves the checkpoint), stored in the database with their cache tags, and
+// served unchanged, across restarts, until a purge with one of those tags
+// or the next checkpoint retires them (derived.Cache).
 //
 //	GET /_status                  each followed namespace's encryption level and
 //	                              epoch, whether results are sealed, and why a
@@ -310,8 +312,8 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			writeErr(w, http.StatusBadRequest, "bad_input", "counts over a sealed namespace need a grant that reads the whole namespace")
 			return
 		}
-		if b, ok := ix.sealed.Get(view.Target); ok {
-			ix.writeSealed(w, a, ns, at, "", b, !a.all)
+		if st, ok := ix.sealed.Get(ctx, view.Target); ok {
+			ix.writeSealed(w, a, at, st)
 			return
 		}
 	}
@@ -392,7 +394,18 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			writeErr(w, http.StatusInternalServerError, "internal", "encoding failed")
 			return
 		}
-		ix.writeSealed(w, a, ns, at, tags, ix.sealed.Put(view.Target, []string{ns}, b), !a.all)
+		st, err := ix.sealed.Put(ctx, view.Target, ns, at, derived.Stored{Body: b, JSON: !a.all, Tags: tags})
+		if err != nil {
+			ix.opt.Logf("index: storing a sealed result: %v", err)
+		}
+		if ix.Checkpoint(ns) != at {
+			// An apply (maybe a purge) committed meanwhile: don't keep a
+			// result it may have retired.
+			if err := ix.sealed.Retire(ctx, ix.db, ns, ix.Checkpoint(ns)); err != nil {
+				ix.opt.Logf("index: retiring sealed results of %s: %v", ns, err)
+			}
+		}
+		ix.writeSealed(w, a, at, st)
 		return
 	}
 	setResultHeaders(w, a, at, tags)
@@ -410,23 +423,18 @@ func setResultHeaders(w http.ResponseWriter, a *access, at, tags string) {
 	w.Header().Set("X-Namespace-Revision", at)
 }
 
-// writeSealed writes a sealed result: the JWE (application/jose), or for a
-// resource-restricted reader the JSON with per-hit sealed values. A result
-// served from memory carries idx:{ns} and the counts tag only (tags ""):
-// its r: tags were on the first response, and a purge both drops it from
-// memory and purges cached copies through those tags and idx:{ns}.
-func (ix *Index) writeSealed(w http.ResponseWriter, a *access, ns, at, tags string, b []byte, isJSON bool) {
-	if tags == "" {
-		tags = "idx:" + ns + "," + countsTag(ns)
-	}
-	setResultHeaders(w, a, at, tags)
-	if isJSON {
+// writeSealed writes a stored sealed result: the JWE (application/jose),
+// or for a resource-restricted reader the JSON with per-hit sealed values,
+// with the Cache-Tag it was stored with.
+func (ix *Index) writeSealed(w http.ResponseWriter, a *access, at string, st derived.Stored) {
+	setResultHeaders(w, a, at, st.Tags)
+	if st.JSON {
 		w.Header().Set("Content-Type", "application/json")
 	} else {
 		w.Header().Set("Content-Type", seal.ContentType)
 	}
 	w.WriteHeader(http.StatusOK)
-	w.Write(b)
+	w.Write(st.Body)
 }
 
 // serveStatus answers GET /_status (Addendum E): each followed namespace's

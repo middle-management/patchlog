@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -79,14 +80,15 @@ func TestSealedCatalog(t *testing.T) {
 	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
 		"encryption": map[string]any{"level": "sealed"}, "catalog": map[string]any{"trust": []any{"matches"}, "mode": "dag"}}))
 	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "matches"))).CreateNamespace(ctx, "matches", map[string]any{"read": "public", "keys": []any{k.Entry("*")}}))
-	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat", "matches"}, []string{"read", "create"})), client.WithKeys(client.NewKeys(nil)))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat", "matches"}, []string{"read", "create", "purge"})), client.WithKeys(client.NewKeys(nil)))
 	createNonced(t, w, "cat", "root", map[string]any{"title": "Root zqx", "parents": []any{}})
 	createNonced(t, w, "cat", "season", map[string]any{"title": "Season zqx", "parents": parents("root@a0")})
 	must(w.CreateDoc(ctx, "matches", "derby", map[string]any{"title": "derby"}))
 	createNonced(t, w, "cat", "matches.derby", map[string]any{"parents": parents("season")})
 
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat", "matches"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
-	x := startSvc(t, sc, svcOpts{now: s.Now})
+	opts := svcOpts{now: s.Now, db: filepath.Join(t.TempDir(), "tree.db")}
+	x := startSvc(t, sc, opts)
 	x.caughtUp("cat", "matches")
 
 	epoch := map[string][]byte{}
@@ -162,6 +164,26 @@ func TestSealedCatalog(t *testing.T) {
 	}
 	if _, err := derived.OpenItem(e["sealed"].(string), derived.ItemKey(keyOf, "cat", "season"), v, "cat", "season"); err == nil {
 		t.Fatal("opened as another node")
+	}
+
+	// Stored in the database with its cache tags: a restart serves the
+	// same bytes.
+	if tags := x.s.SealedViews()[f.path]; !strings.Contains(tags, "r:cat/season") {
+		t.Fatalf("stored view tags %q", tags)
+	}
+	x.stop()
+	x = startSvc(t, sc, opts)
+	x.caughtUp("cat", "matches")
+	if again := x.fetch(f.path, full); string(again.body) != string(f.body) {
+		t.Fatal("resealed after a restart")
+	}
+	// A purge removes every stored listing showing the resource.
+	must(w.Purge(ctx, "cat", "season", must(w.Head(ctx, "cat", "season")).ID, false))
+	x.caughtUp("cat")
+	for v, tags := range x.s.SealedViews() {
+		if strings.Contains(tags, "r:cat/season") || v == f.path {
+			t.Fatalf("stored view %s (%s) survived the purge", v, tags)
+		}
 	}
 
 	// Status.
