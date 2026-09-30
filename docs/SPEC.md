@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.22 · 2026-09-30. See the change log at the end.
+Status: draft v0.23 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -2443,6 +2443,20 @@ Responses for sealed namespaces use `Content-Type: application/jose` and a JWE (
 
 - **Compression.** Compress **before** sealing, and only within a single revision's own content. Log ranges seal each entry separately, so content from different authors is never compressed together (the CRIME/BREACH class of attack).
 
+- **Padding (optional).** A namespace MAY set `"pad": true` in its `encryption` object. Then every JWE sealed for it, by the server at E2 and by clients at E3 (§E.3.1), pads its plaintext to a size bucket before encryption:
+
+- **Format.** The plaintext is the UTF-8 JSON that would otherwise be sealed, followed by ASCII spaces (`0x20`) up to the padded length. Trailing whitespace is valid JSON, so readers need nothing new.
+
+- **Buckets.** For a plaintext of `L` bytes, the padded length is `max(256, padmé(L))`, where `E = ⌊log₂ L⌋`, `S = ⌊log₂ E⌋ + 1`, and `padmé(L)` rounds `L` up to a multiple of `2^(E − S)`. The overhead is at most 12%, and a size reveals only about `log₂ log₂ L` bits.
+
+- **No compression.** Padded payloads are never compressed and carry no `zip` header, since a compression ratio leaks the content that padding is meant to hide.
+
+- **Scope.** Each JWE is padded as a whole, including every JWE of a log range. Turning `pad` on or off affects only what is sealed afterwards: stored sealed bytes are served unchanged forever.
+
+- **At E3** ids are over ciphertext, so padding is part of what is hashed, and a retry reuses the exact ciphertext. The server can't check padding there. Readers with keys SHOULD flag a patch set in a padded namespace that isn't padded to its bucket, like a failed validation (§E.3.2).
+
+- Padding hides sizes within a bucket. It does not hide counts, timing or the number of revisions (§E.4).
+
 ### E.2.3 Getting keys
 
 ```
@@ -2507,6 +2521,8 @@ The origin never sees plaintext. Clients encrypt patch sets before sending them 
 
 - **Namespace documents stay plaintext.** The server must be able to read keys, rules and limits.
 
+- **Padding.** In a namespace with `pad`, clients pad the plaintext of every sealed patch set as in §E.2.2, before encrypting.
+
 ### E.3.2 What the server can and cannot do
 
 | Feature | E3 |
@@ -2555,7 +2571,7 @@ The origin never sees plaintext. Clients encrypt patch sets before sending them 
 
 - opaque names (e.g. random slugs) in sensitive namespaces
 
-- padding sealed payloads to size buckets
+- padding sealed payloads to size buckets (`pad`, §E.2.2)
 
 - edge grants to hide existence from non-readers
 
@@ -3232,3 +3248,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Defined:** remote bases that are branches are verified through their bases (§G.3); mirrored schemas keep their namespace name (§G.3); retention without an archive must say `archive: false` (§8.6); no `cleanup` means the janitor keeps the branch (§F.6); a second merge after a replay uses earlier merge batches, by authors the base lists in `merge.authors`, as common ancestors (§F.3), and the janitor trusts only those batches (§F.6); `at`-pinned query results use the immutable cache class (§A.4, §B.5).
 
 - **v0.22:** public reads ignore a grant that doesn't name the namespace or can't be used, and answer as unauthenticated (§7, §C.2), so a client can send one bearer to every namespace it reads, such as a public schema namespace next to a private one.
+
+- **v0.23:** optional padding of sealed payloads, `"encryption": { …, "pad": true }`: space-padded plaintext to Padmé buckets of at least 256 bytes, never compressed, at E2 and E3 alike (§E.2.2, §E.3.1, §E.4).
