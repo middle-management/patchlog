@@ -58,9 +58,16 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+        # A release drafted in GitHub's UI creates the tag (which runs this
+        # workflow) and the release itself: attach the assets to it. For a
+        # plain tag push, create the release.
         run: |
-          pre=""; case "$TAG" in *-*) pre="--prerelease";; esac
-          gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag $pre
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            pre=""; case "$TAG" in *-*) pre="--prerelease";; esac
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes --verify-tag $pre
+          fi
 
   image:
     runs-on: ubuntu-latest
