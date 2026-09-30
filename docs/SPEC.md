@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.23 · 2026-09-30. See the change log at the end.
+Status: draft v0.24 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -1241,6 +1241,8 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
 - Hits carry the plain document URL (`/r/{ns}/{name}/rev/{id}`). Documents are served by the core's CDN, never by the search service.
 
 - **Private namespaces:** follow the same rules as catalog listings (§B.11.5). Results are keyed by the reader's subject set in the path, and responses never embed per-reader signed URLs.
+
+- **Sealed namespaces:** results are sealed as in §E.2.6.
 
 ## A.5 Consistency
 
@@ -2501,11 +2503,33 @@ Authorization: Bearer
 
 - **Ids (§3).** Ids are still computed over plaintext canonical patches. Sealed namespaces MUST refresh `$nonce` in every patch set (§C.7), so plaintext can't be confirmed by guessing from ids.
 
-- **Consumers and addenda.** Search indexes, catalog listings and tree listings over a sealed namespace are served **sealed under that namespace's keys**, with per-resource sealing for per-item listings where needed. So a derived view never leaks what its source hid.
+- **Consumers and addenda.** Search indexes, catalog listings and tree listings over a sealed namespace are served **sealed under that namespace's keys**, with per-resource sealing for per-item listings where needed. So a derived view never leaks what its source hid. §E.2.6 gives the format.
 
 - **Schemas** usually live in a public namespace. A sealed schema namespace works too, but every writer and consumer then needs its keys.
 
 - **Branches (Addendum F)** of a sealed namespace MUST be sealed. At E2 a branch has its own epoch keys, and the server seals read-through content under them like anything else it serves. For E3, see §F.8.
+
+### E.2.6 Derived views
+
+This section applies to services that serve views derived from sealed namespaces, such as search results (Addendum A) and tree and catalog listings (Addendum B).
+
+- **Getting keys.** A service reads a sealed namespace like any reader. It holds its own key pair and a grant with `read`, and fetches epoch keys through §E.2.3. At E3, only a service whose public key is a recipient in the namespace's `keyring` can derive anything. Any other service skips the namespace and says so in its status. It MUST NOT index or list ciphertext as if it were content. A service that holds keys is inside the namespace's trust boundary, like any other reader.
+
+- **What gets sealed.** Every value a view derives from a sealed namespace's content is sealed under that namespace's current epoch key. This covers facets, scores, snippets, titles and `$access`-derived details. What §E.2.2 already leaves in the clear stays in the clear: names, ids, URLs and heads, as well as the view's own structure, `at`, order and pagination cursors.
+
+- **One source: whole-response sealing.** When every sealed value in a response comes from one namespace, the service MAY serve the whole response as one JWE in the §E.2.2 format, with `Content-Type: application/jose` and `pl: { "ns", "view" }`.
+
+- **Several sources: per-entry sealing.** Otherwise the response stays JSON. Each entry (a hit, a child, a node) that carries sealed values replaces them with `"sealed": "<JWE compact>"`, sealed under the key of the entry's own namespace with `pl: { "ns", "name", "view" }`. A reader decrypts the entries it holds keys for and shows the rest by name only. Folders and placements from a sealed catalog namespace are entries of that namespace.
+
+- **`view`** is the request target, path and query, of the `…/at/{at}/…` URL that the response is served at, exactly as the service's redirect gave it. It binds the ciphertext to one query at one checkpoint, so a result can't be replayed under another query, subject set (§B.11.5) or `at`. Readers MUST compare `pl` with the URL they fetched.
+
+- **Stored once, served forever.** A view at a given `at` is sealed once, under the epoch key current when it is produced, and then served unchanged, like revisions (§E.2.2). Views produced after a rotation use the new epoch. Padding (`pad`) follows the source namespace. Whole-response sealing pads only when every source is padded, and then compression is off as well.
+
+- **Caching** follows §E.2.5: views of sealed namespaces use the public rules, with the tags of §A.4 and §B.5.
+
+- **Local storage.** A service MUST protect the data it derives from a sealed namespace at least as well as E1 protects the source (§E.1). A purge of the source, or the destruction of its keys, MUST make the derived data unreadable, for example by deleting the derived rows or by sealing them under keys derived from the source's epoch keys.
+
+- **Queries are metadata.** Query strings are in URLs, so the service, the CDN and anyone who sees the URL learn them, whatever the level (§E.4).
 
 ## E.3 End-to-end
 
@@ -2566,6 +2590,8 @@ The origin never sees plaintext. Clients encrypt patch sets before sending them 
 - author identities (recorded by the server)
 
 - the shape of the namespace log
+
+- query strings of derived views (§E.2.6)
 
 - **Mitigations:**
 
@@ -3250,3 +3276,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **v0.22:** public reads ignore a grant that doesn't name the namespace or can't be used, and answer as unauthenticated (§7, §C.2), so a client can send one bearer to every namespace it reads, such as a public schema namespace next to a private one.
 
 - **v0.23:** optional padding of sealed payloads, `"encryption": { …, "pad": true }`: space-padded plaintext to Padmé buckets of at least 256 bytes, never compressed, at E2 and E3 alike (§E.2.2, §E.3.1, §E.4).
+
+- **v0.24:** the sealed format of derived views (§E.2.6). A response from a single source may be one JWE with `pl: { ns, view }`. Otherwise entries are sealed one by one under their own namespace's key, with `pl: { ns, name, view }`, where `view` is the `at` URL's path and query. Only content-derived values are sealed; names, ids, URLs and structure stay in the clear. Services at E3 need to be keyring recipients, derived data is purged with its source, and query strings are listed as visible metadata (§E.4).
