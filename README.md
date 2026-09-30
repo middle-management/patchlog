@@ -27,8 +27,8 @@ and serves immutable, CDN-cacheable revisions.
 
 ### Not implemented
 
-- **Addendum B** (catalog/tree service): being built as a separate consumer service on the
-  public API. The optional merge *service* of §F.7 (scheduled merges, web status) is not built;
+- **Addendum B:** catalog branches (§F.8 preview access and merge grants), a `groups`
+  namespace, signed manifests and `x-tree-label` titles. The optional merge *service* of §F.7 (scheduled merges, web status) is not built;
   its logic is in `internal/merge` and the CLI.
 - **Addendum E** (encryption): a namespace document with `encryption` is rejected with `422`.
 - **Addendum G** (federation): remote branches (the `export` verb) and pruning archives. Bundles
@@ -98,6 +98,25 @@ patchlog janitor -ns matches                     # purge merged/superseded branc
 - The janitor checks `merged` and `successor` claims against both logs before purging (§F.6).
   Cleanup is opt-in: a branch is purged only once a `cleanup` period, from the branch's or the
   base's document, has passed.
+
+### Tree and catalog (Addendum B)
+
+`patchlog tree -catalog cat` follows a catalog namespace and the content namespaces it trusts, and
+serves folder listings (`children`, `ancestors`, `subtree`, `roots`, `orphans`, `problems`,
+`where`, `manifest`) at URLs pinned to the catalog's `ns_id`. Cycles and depth over 64 show up
+under `problems`.
+
+With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
+- `POST /grants` for content verbs, `create` (genesis only; `409` for a taken name), `place`,
+  `move` and unplace, with the no-widening rule.
+- `POST /read-grants` returns resource-scoped read grants.
+
+Callers authenticate with an ordinary grant for the catalog namespace, and their groups come only
+from that grant. Issued grants carry `at` and are refused once the catalog's `maxLag` is exceeded.
+
+Note: the §B.11.3 example key rule `not writes overlaps /$access` refuses every create, since a
+genesis writes `""`. Scope it to non-create actions and require `/doc/$access` to be absent on
+create.
 
 ### Bundles (§G.4)
 
@@ -203,6 +222,8 @@ internal/annot       x-* annotations and x-ref references
 internal/index       search index service (Addendum A)
 internal/merge       merge, rebase, status, diff (Addendum F)
 internal/janitor     branch cleanup with claim verification (§F.6)
+internal/tree        tree service: folders, placements, links, manifests (§B.2–§B.9)
+internal/catalog     tree-derived access and grant issuing (§B.11)
 internal/bundle      bundle format, export and import (§G.4)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
 internal/ids        content-addressed ids (§3.2–§3.5)

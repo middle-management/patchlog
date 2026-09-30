@@ -42,6 +42,8 @@ func main() {
 		grantCmd(os.Args[2:])
 	case "index":
 		indexCmd(os.Args[2:])
+	case "tree":
+		treeCmd(os.Args[2:])
 	case "merge":
 		mergeCmd(os.Args[2:])
 	case "rebase":
@@ -62,6 +64,7 @@ func usage() {
   patchlog grant mint -key SEED -block JSON
   patchlog grant narrow -grant TOKEN -block JSON
   patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
+  patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing]
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
