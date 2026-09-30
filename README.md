@@ -27,8 +27,8 @@ and serves immutable, CDN-cacheable revisions.
 
 ### Not implemented
 
-- **Addenda A, B, F** (indexing, catalog/tree service, merge service): these are separate
-  consumer services built on the public API; nothing in the core is missing for them.
+- **Addendum B** (catalog/tree service) and **F** (merge tools): being built as separate
+  consumer services on the public API.
 - **Addendum E** (encryption): a namespace document with `encryption` is rejected with `422`.
 - **Addendum G** (federation): remote branches, `export`, bundles and pruning archives.
   Because no archive destination exists, **pruning always needs a grant chained to a `*` key**
@@ -62,6 +62,20 @@ It is plain HTML/JS embedded in the binary and talks to the same-origin API. It 
 - scripted examples: conflict and rebase, schema validation, rules, batch delete+restore, branch read-through.
 
 Run it with `./patchlog serve -dev` and open `http://localhost:8080/playground/`.
+
+### Search index (Addendum A)
+
+`patchlog index -ns matches` follows namespaces and serves a search API on its own origin
+(default `:8081`). It indexes fields that schemas mark with `x-index: "text" | "facet" | "sort"`:
+
+```sh
+curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kickoff'
+```
+
+- `GET /{ns}?…` redirects to `/{ns}/at/{checkpoint}`, which stays correct forever.
+- `?min={ns_id}` waits for your own write to be indexed, and answers 503 if it isn't in time.
+- In private namespaces the reader's grant is checked locally. Results are routed under
+  `/g/{subject-set}/…` and filtered to the resources the grant can read.
 
 ### A short tour (dev mode)
 
@@ -143,6 +157,12 @@ namespace's name, or `"*"`, in `ns`.
 ```
 cmd/patchlog        CLI: serve, keygen, grant mint/narrow
 internal/playground web UI served at /playground/
+internal/client      typed API client (+ clienttest: in-process server)
+internal/follow      §10 consumer loop with transactional checkpoints
+internal/verify      id and chain verification (§G.2)
+internal/grantcheck  local grant checks for services
+internal/annot       x-* annotations and x-ref references
+internal/index       search index service (Addendum A)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
 internal/ids        content-addressed ids (§3.2–§3.5)
 internal/pointer    JSON Pointer

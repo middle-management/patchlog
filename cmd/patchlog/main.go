@@ -40,6 +40,8 @@ func main() {
 		fmt.Printf("public  %s\nprivate %s\n", pub, grant.EncodePrivateKey(priv))
 	case "grant":
 		grantCmd(os.Args[2:])
+	case "index":
+		indexCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -50,7 +52,8 @@ func usage() {
   patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-operator-key PUB]...
   patchlog keygen
   patchlog grant mint -key SEED -block JSON
-  patchlog grant narrow -grant TOKEN -block JSON`)
+  patchlog grant narrow -grant TOKEN -block JSON
+  patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]`)
 	os.Exit(2)
 }
 

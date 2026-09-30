@@ -1,0 +1,383 @@
+package index
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
+)
+
+// Cache-Control values (§9).
+const (
+	ccHeadPointer = "public, max-age=0, s-maxage=1, stale-while-revalidate=5"
+	ccImmutable   = "public, max-age=86400, s-maxage=31536000, immutable"
+	ccPrivatePtr  = "private, no-cache"
+	ccPrivateImm  = "private, max-age=300"
+	cdnImmutable  = "max-age=31536000"
+)
+
+// Handler returns the query API (§A.4):
+//
+//	GET /{ns}?…                   302 → /{ns}/at/{checkpoint}?…            (head pointer)
+//	GET /{ns}/at/{ns_id}?…        200 { at, ns, hits, next?, counts? }       (immutable)
+//	                              302 → current checkpoint if ns_id is not current
+//	GET /g/{gs}/{ns}?…            private namespaces: as above, keyed by the
+//	GET /g/{gs}/{ns}/at/{ns_id}?… reader's subject set gs (§B.11.5)
+//
+// Private namespaces need Authorization: Bearer <grant>; a request without
+// the right gs is redirected to it.
+func (ix *Index) Handler() http.Handler {
+	return http.HandlerFunc(ix.serveHTTP)
+}
+
+func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeErr(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")
+		return
+	}
+	segs := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	var gs, ns, at string
+	isAt := false
+	switch {
+	case len(segs) == 1 && segs[0] != "":
+		ns = segs[0]
+	case len(segs) == 3 && segs[1] == "at":
+		ns, at, isAt = segs[0], segs[2], true
+	case len(segs) == 3 && segs[0] == "g":
+		gs, ns = segs[1], segs[2]
+	case len(segs) == 5 && segs[0] == "g" && segs[3] == "at":
+		gs, ns, at, isAt = segs[1], segs[2], segs[4], true
+	default:
+		writeErr(w, http.StatusNotFound, "not_found", "not found")
+		return
+	}
+	if !client.ValidNSName(ns) || !ix.known(ns) {
+		writeErr(w, http.StatusNotFound, "not_found", "namespace not indexed")
+		return
+	}
+	if isAt {
+		if _, err := ids.Parse(at); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_input", "malformed ns_id")
+			return
+		}
+	}
+	if gs != "" {
+		if _, err := ids.Parse(gs); err != nil {
+			writeErr(w, http.StatusNotFound, "not_found", "malformed subject set")
+			return
+		}
+	}
+	ix.serve(w, r, gs, ns, at, isAt)
+}
+
+// access is the outcome of the read check for one request.
+type access struct {
+	public bool
+	v      *grant.Verified
+	all    bool   // reads every resource: no per-resource filtering
+	gs     string // subject-set id (private only)
+}
+
+func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*access, error) {
+	cfg, err := ix.checker.Config(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.Read == "public" {
+		return &access{public: true, all: true}, nil
+	}
+	token := bearer(r)
+	if token == "" {
+		return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
+	}
+	v, err := ix.checker.Verify(ctx, ns, token)
+	if err != nil {
+		return nil, err
+	}
+	if ok, _ := v.Allows("read"); !ok {
+		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
+	}
+	a := &access{v: v, all: ix.checker.ReadsAll(v)}
+	if a.all && !ix.checker.AllowsRead(v, "") {
+		return nil, &grant.AuthError{Status: 403, Msg: "a grant or key rule refuses the read"}
+	}
+	// §B.11.5: results are keyed by the reader's subject set. Readers of the
+	// whole namespace see the same hits, so their key is just their groups
+	// (users share caches with their groups). A reader whose grant restricts
+	// resources sees a filtered list that depends on the grant itself, so
+	// its key also carries the subject and a digest of everything the
+	// filter reads (principal and rules); it shares only with identical
+	// grants.
+	subjects := grantcheck.SubjectSet(v, !a.all)
+	if !a.all {
+		subjects = append(subjects, "scope:"+scopeDigest(v))
+	}
+	a.gs = grantcheck.SubjectSetID(subjects)
+	return a, nil
+}
+
+func scopeDigest(v *grant.Verified) string {
+	roles := map[string]any{}
+	for _, role := range v.EffectiveRoles {
+		roles[role] = v.RoleRules(role)
+	}
+	x := map[string]any{
+		"principal": v.Principal.Envelope(), "key": v.Key.Kid, "readScope": v.Key.ReadScopeResource,
+		"keyRules": v.KeyRules, "blockRules": v.BlockRules, "roles": roles,
+	}
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(x)))
+	return ids.FromBytes(sum[:ids.Size]).String()
+}
+
+func bearer(r *http.Request) string {
+	h := r.Header.Get("Authorization")
+	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
+		return strings.TrimSpace(h[7:])
+	}
+	return ""
+}
+
+// base is the path prefix of a namespace's URLs for this reader.
+func base(a *access, ns string) string {
+	if a.public {
+		return "/" + ns
+	}
+	return "/g/" + a.gs + "/" + ns
+}
+
+// encodeQuery encodes the query canonically (sorted keys), without min.
+func encodeQuery(v url.Values, drop ...string) string {
+	c := url.Values{}
+	for k, vals := range v {
+		c[k] = vals
+	}
+	for _, d := range drop {
+		delete(c, d)
+	}
+	s := c.Encode()
+	if s == "" {
+		return ""
+	}
+	return "?" + s
+}
+
+func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string, isAt bool) {
+	ctx := r.Context()
+	if _, purged, _ := ix.state(ns); purged {
+		writeErr(w, http.StatusGone, "gone", "namespace purged")
+		return
+	}
+	vals := r.URL.Query()
+	q, err := ParseQuery(vals)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+		return
+	}
+	a, err := ix.access(ctx, ns, r)
+	if err != nil {
+		var ae *grant.AuthError
+		if errors.As(err, &ae) {
+			code := "forbidden"
+			if ae.Status == 401 {
+				code = "unauthenticated"
+				w.Header().Set("WWW-Authenticate", "Bearer")
+			}
+			w.Header().Set("Cache-Control", "no-store")
+			writeErr(w, ae.Status, code, ae.Msg)
+			return
+		}
+		ix.opt.Logf("index: access check for %s: %v", ns, err)
+		writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
+		return
+	}
+	setPtrHeaders := func() {
+		if a.public {
+			w.Header().Set("Cache-Control", ccHeadPointer)
+			w.Header().Set("Cache-Tag", "ns:"+ns)
+		} else {
+			w.Header().Set("Cache-Control", ccPrivatePtr)
+			w.Header().Set("CDN-Cache-Control", "no-store")
+			w.Header().Set("Vary", "Authorization")
+		}
+	}
+	// The reader's URL space: public, or keyed by its subject set.
+	if gs != a.gs {
+		target := base(a, ns)
+		if isAt {
+			target += "/at/" + at
+		}
+		setPtrHeaders()
+		redirect(w, target+encodeQuery(vals))
+		return
+	}
+	if q.Min != "" && !ix.waitMin(ctx, ns, q.Min) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
+		return
+	}
+	cur, _, _ := ix.state(ns)
+	if cur == "" {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached the namespace yet")
+		return
+	}
+	if !isAt || at != cur {
+		// Head pointer, or a stale ns_id: redirect to the current checkpoint
+		// (§A.7's second question resolved as redirect, as §A.4 shows).
+		setPtrHeaders()
+		redirect(w, base(a, ns)+"/at/"+cur+encodeQuery(vals, "min"))
+		return
+	}
+
+	var allow func(string) bool
+	if !a.all {
+		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
+	}
+	res, got, err := ix.query(ctx, ns, at, q, allow)
+	if err != nil {
+		ix.opt.Logf("index: query %s: %v", r.URL, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
+		return
+	}
+	if got != at {
+		// The checkpoint moved between the check and the read transaction.
+		setPtrHeaders()
+		redirect(w, base(a, ns)+"/at/"+got+encodeQuery(vals, "min"))
+		return
+	}
+	body := map[string]any{"at": at, "ns": ns}
+	hits := make([]any, 0, len(res.Hits))
+	for _, h := range res.Hits {
+		m := map[string]any{
+			"resource": h.Resource, "id": h.ID, "score": h.Score,
+			"url": ix.origin + "/r/" + ns + "/" + h.Resource + "/rev/" + h.ID,
+		}
+		if h.Schema != "" {
+			m["schema"] = h.Schema
+		}
+		// …facets (§A.4): every facet path of the document, as a list of values.
+		for p, vs := range h.Facets {
+			m[p] = vs
+		}
+		hits = append(hits, m)
+	}
+	body["hits"] = hits
+	if res.More {
+		nv := url.Values{}
+		for k, v := range vals {
+			nv[k] = v
+		}
+		nv.Set("after", strconv.Itoa(q.After+len(res.Hits)))
+		body["next"] = base(a, ns) + "/at/" + at + encodeQuery(nv, "min")
+	}
+	if res.Counts != nil {
+		body["counts"] = res.Counts
+	}
+	if a.public {
+		w.Header().Set("Cache-Control", ccImmutable)
+	} else {
+		w.Header().Set("Cache-Control", ccPrivateImm)
+		w.Header().Set("CDN-Cache-Control", cdnImmutable)
+	}
+	w.Header().Set("Cache-Tag", "ns:"+ns)
+	w.Header().Set("X-Namespace-Revision", at)
+	writeJSON(w, http.StatusOK, body)
+}
+
+// query runs q in one read transaction and returns the checkpoint it read
+// at; if that isn't at, the result is nil and the caller redirects.
+func (ix *Index) query(ctx context.Context, ns, at string, q *Query, allow func(string) bool) (*Result, string, error) {
+	tx, err := ix.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, "", err
+	}
+	defer tx.Rollback()
+	var got string
+	if err := tx.QueryRowContext(ctx, `SELECT ns_id FROM checkpoints WHERE origin = ? AND ns = ?`, ix.origin, ns).Scan(&got); err != nil {
+		return nil, "", err
+	}
+	if got != at {
+		return nil, got, nil
+	}
+	res, err := ix.run(ctx, tx, ns, q, allow)
+	return res, got, err
+}
+
+// waitMin waits up to MinWait until the checkpoint of ns is at or past min
+// (§A.5): min is the checkpoint, or an ns_id the index has applied, or (for
+// ns_ids it never saw one by one, e.g. before a branch's snapshot) an ns_id
+// the core's log places at or before the checkpoint.
+func (ix *Index) waitMin(ctx context.Context, ns, min string) bool {
+	ix.mu.Lock()
+	wait := ix.opt.MinWait
+	ix.mu.Unlock()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	for {
+		cur, _, changed := ix.state(ns)
+		if cur == min || ix.seen(ctx, ns, min) {
+			return true
+		}
+		select {
+		case <-changed:
+			continue
+		case <-ctx.Done():
+			return false
+		case <-timer.C:
+		}
+		break
+	}
+	cur, _, _ := ix.state(ns)
+	if cur == "" {
+		return false
+	}
+	// since=min is accepted only if min is in the chain up to cur.
+	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	_, err := ix.c.NSLog(cctx, ns, cur, min)
+	return err == nil
+}
+
+func (ix *Index) seen(ctx context.Context, ns, id string) bool {
+	var one int
+	err := ix.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns = ? AND ns_id = ?`, ns, id).Scan(&one)
+	return err == nil
+}
+
+func redirect(w http.ResponseWriter, loc string) {
+	w.Header().Set("Location", loc)
+	w.WriteHeader(http.StatusFound)
+}
+
+func writeErr(w http.ResponseWriter, status int, code, msg string) {
+	if w.Header().Get("Cache-Control") == "" {
+		if status == http.StatusNotFound {
+			w.Header().Set("Cache-Control", "public, max-age=5")
+		} else {
+			w.Header().Set("Cache-Control", "no-store")
+		}
+	}
+	writeJSON(w, status, map[string]any{"code": code, "message": msg})
+}
+
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	enc := json.NewEncoder(w)
+	enc.SetEscapeHTML(false)
+	_ = enc.Encode(v)
+}
