@@ -1464,7 +1464,8 @@ const TREE = '/playground/tree';
 const NODE_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const C = {
   ns: '', head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {},
-  source: '', proxy: null, listing: null, at: '', view: '', note: '', problems: null, sel: '', min: '', loading: false, gen: 0,
+  source: '', proxy: null, proxyCatalogs: [], listing: null, at: '', view: '', note: '', problems: null, sel: '', min: '', loading: false, gen: 0,
+  catalogs: null, discovering: false, // discovered catalog namespaces: [{ ns, mode }], null until found
 };
 
 const cmpCU = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
@@ -1501,10 +1502,49 @@ async function nsHeadDoc(ns) {
   return { status: 200, head, config: r.hdr('X-Config-Revision') || '', doc, sealed: r.jose };
 }
 
+/* probeProxy asks the core whether it proxies a tree service (-tree-url), and which catalogs it maps to their own. */
+async function probeProxy() {
+  const p = await api('GET', `${TREE}/`, { auto: true, label: 'tree' });
+  C.proxy = p.status === 200 && p.json && p.json.proxy === 'tree';
+  C.proxyCatalogs = C.proxy && Array.isArray(p.json.catalogs) ? p.json.catalogs.filter((c) => typeof c === 'string') : [];
+}
+
+/* discoverCatalogs finds namespaces with a catalog config (§B.6). There is no namespace listing, so the
+ * candidates are what the tree service serves (/_status), the proxy's mappings, the demo's catalogs and
+ * the namespaces this browser has used; each is kept if its namespace document has a "catalog". */
+async function discoverCatalogs() {
+  if (C.proxy === null) await probeProxy();
+  const cands = new Set(['cat', 'topics', ...known, ...C.proxyCatalogs, C.ns].filter((c) => c && NODE_RE.test(c)));
+  if (C.proxy) {
+    const st = await api('GET', `${TREE}/_status`, { auto: true, label: 'tree' });
+    if (st.status === 200 && st.json && Array.isArray(st.json.catalogs)) st.json.catalogs.forEach((c) => typeof c === 'string' && cands.add(c));
+  }
+  const found = await mapLimit([...cands].sort(), 4, async (ns) => {
+    const r = await api('GET', `/ns/${ns}`, { auto: true, label: 'catalog' });
+    if (r.status !== 200) return null;
+    if (r.jose) return { ns, mode: '?' }; // a sealed namespace document: kept, its mode shows once loaded
+    const cat = r.json && r.json.catalog;
+    return cat && typeof cat === 'object' ? { ns, mode: cat.mode === 'dag' ? 'dag' : 'tree' } : null;
+  });
+  C.catalogs = found.filter(Boolean);
+  renderCatPick();
+}
+
+function renderCatPick() {
+  const sel = $('catPick');
+  const list = (C.catalogs || []).slice();
+  if (C.ns && C.head && !list.some((c) => c.ns === C.ns) && C.doc && C.doc.catalog) list.push({ ns: C.ns, mode: C.mode });
+  list.sort((a, b) => cmpCU(a.ns, b.ns));
+  sel.replaceChildren(h('option', { value: '' }, C.catalogs === null ? 'finding catalogs…' : list.length ? '— pick —' : '— none found —'),
+    ...list.map((c) => h('option', { value: c.ns, selected: c.ns === C.ns }, `${c.ns} (${c.ns === C.ns && C.head ? C.mode : c.mode})`)));
+  $('catNsList').replaceChildren(...[...new Set([...list.map((c) => c.ns), ...known])].map((v) => h('option', { value: v })));
+}
+
 async function loadCatalog() {
   const ns = ($('catNs').value.trim() || 'cat');
   $('catNs').value = ns;
   store.set('pl.catNs', ns);
+  if (C.catalogs === null && !C.discovering) { C.discovering = true; discoverCatalogs().finally(() => { C.discovering = false; }); }
   if (ns !== C.ns) { C.sel = ''; C.min = ''; }
   const gen = ++C.gen;
   C.ns = ns; C.loading = true;
@@ -1550,14 +1590,16 @@ async function loadCatalog() {
  * their folders, marked, so a placement of a not-yet-existing item is visible where it was placed. */
 function addDangling(x) {
   const folders = new Map();
-  const walk = (e) => { if (e.kind === 'folder') { folders.set(e.name, e); (e.children || []).forEach(walk); } };
+  // In a DAG a folder is listed once per path to it: add to every listing of it.
+  const walk = (e) => { if (e.kind === 'folder') { (folders.get(e.name) || folders.set(e.name, []).get(e.name)).push(e); (e.children || []).forEach(walk); } };
   x.listing.forEach(walk);
   for (const d of ((x.problems && x.problems.body && x.problems.body.danglingItems) || [])) {
     const name = nodeName(d.href), n = x.nodes.get(name);
     if (!n) continue;
     for (const p of parentsOf(n)) {
-      const f = folders.get(nodeName(p.href));
-      if (f && f.children && !f.children.some((c) => c.name === name)) f.children.push({ name, href: d.href, kind: 'item', item: d.item, dangling: d.reason || 'dangling', order: p.order, unlisted: true });
+      for (const f of folders.get(nodeName(p.href)) || []) {
+        if (f.children && !f.children.some((c) => c.name === name)) f.children.push({ name, href: d.href, kind: 'item', item: d.item, dangling: d.reason || 'dangling', order: p.order, unlisted: true });
+      }
     }
   }
 }
@@ -1607,24 +1649,21 @@ async function openSealedEntries(v, view) {
 
 async function loadTreeListing() {
   const x = { listing: null, at: '', view: '', problems: null, note: '', source: 'core', treeStatus: null, sealedView: false };
-  if (C.proxy === null) {
-    const p = await api('GET', `${TREE}/`, { auto: true, label: 'tree' });
-    C.proxy = p.status === 200 && p.json && p.json.proxy === 'tree';
-  }
+  if (C.proxy === null) await probeProxy();
   if (!C.proxy) { x.note = 'Computed listings (the combined checkpoint, ordering and dangling detection by the service, access filtering, manifests) need the tree service. Start the core with -tree-url (compose does) to read it through the same-origin proxy at /playground/tree/. Showing the catalog documents read directly from the core API.'; return x; }
   const roots = await treeGet('roots');
   if (!roots.body) {
     const r = roots.r;
     x.note = roots.sealedWhole ? 'The tree service answered with a sealed listing this browser has no key for: ' + roots.sealedWhole.error
       : r.status === 502 ? 'The tree service is not reachable through the proxy (502): it may still be starting. Showing core documents.'
-        : r.status === 404 ? `The tree service does not serve a catalog named ${C.ns} (404): it follows one catalog, set by its -catalog flag. Showing core documents.`
+        : r.status === 404 ? `No tree service behind the proxy serves a catalog named ${C.ns} (404): add it to the tree service's -catalog flags, or map it to its own with the core's -tree-url ${C.ns}=URL. Showing core documents.`
           : `The tree service answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}. Showing core documents.`;
     return x;
   }
   x.source = 'tree';
   x.at = roots.body.at || ''; x.view = roots.view;
   // What the service follows, and whether it seals listings or skips a namespace (§E.2.6).
-  const st = await api('GET', `${TREE}/_status`, { auto: true, label: 'tree' });
+  const st = await api('GET', `${TREE}/_status?catalog=${encodeURIComponent(C.ns)}`, { auto: true, label: 'tree' });
   x.treeStatus = st.status === 200 && st.json ? st.json : null;
   x.sealedView = roots.r.jose;
   const trees = [];
@@ -1649,8 +1688,31 @@ function ownAccess(n) {
 }
 function inherits(n) { const a = n && n.doc && n.doc.$access; return !(a && a.inherit === false); }
 function isLive(name) { return C.nodes.has(name); }
-function walkableParents(n) {
+function liveFolderParents(n) {
   return parentsOf(n).map((p) => nodeName(p.href)).filter((pn) => pn && NODE_RE.test(pn) && isLive(pn));
+}
+/* cyclicSet: the folders on a cycle through parents, i.e. in a strongly connected component, as the tree
+ * service computes them (§B.5). Walks never pass through them, and they contribute no access (§B.11.2). */
+function cyclicSet() {
+  if (C.cycFor === C.nodes) return C.cyc;
+  const cyc = new Set();
+  for (const n of C.nodes.values()) {
+    if (n.kind !== 'folder') continue;
+    const seen = new Set(), stack = liveFolderParents(n);
+    while (stack.length) {
+      const x = stack.pop();
+      if (x === n.name) { cyc.add(n.name); break; }
+      if (!seen.has(x)) { seen.add(x); stack.push(...liveFolderParents(C.nodes.get(x))); }
+    }
+  }
+  C.cycFor = C.nodes; C.cyc = cyc;
+  return cyc;
+}
+/* walkableParents: live parent folders, where neither end is on a cycle (§B.5). */
+function walkableParents(n) {
+  const cyc = cyclicSet();
+  if (!n || cyc.has(n.name)) return [];
+  return liveFolderParents(n).filter((pn) => !cyc.has(pn));
 }
 function itemExists(name) {
   const it = itemOf(name);
@@ -1663,7 +1725,7 @@ function effectiveAccess(name) {
   const eff = {};
   const walk = (nm, path, depth) => {
     const n = C.nodes.get(nm);
-    if (!n || path.has(nm) || depth > 64) return;
+    if (!n || path.has(nm) || depth > 64 || cyclicSet().has(nm)) return;
     for (const [s, roles] of Object.entries(ownAccess(n))) for (const role of roles) ((eff[s] = eff[s] || {})[role] = eff[s][role] || new Set()).add(nm);
     if (!inherits(n)) return;
     const next = new Set(path); next.add(nm);
@@ -1708,11 +1770,8 @@ function localProblems() {
     }
     if (ps.length && !walkableParents(n).length) orphans.push(n.name);
   }
-  // cycles: a node that reaches itself through parents
-  for (const n of C.nodes.values()) {
-    const seen = new Set(); const stack = walkableParents(n).slice();
-    while (stack.length) { const x = stack.pop(); if (x === n.name) { cycles.push(n.name); break; } if (seen.has(x)) continue; seen.add(x); stack.push(...walkableParents(C.nodes.get(x))); }
-  }
+  // cycles: folders that reach themselves through parents
+  cycles.push(...[...cyclicSet()].sort());
   return { dangling, parents, orphans, cycles };
 }
 /* localTree builds the listing from the documents: children ordered as §B.2 (ordered first, by code unit, then by name). */
@@ -1721,7 +1780,7 @@ function localTree() {
   for (const n of C.nodes.values()) {
     parentsOf(n).forEach((p) => {
       const pn = nodeName(p.href);
-      if (!pn || !isLive(pn) || !NODE_RE.test(pn)) return;
+      if (!pn || !isLive(pn) || !NODE_RE.test(pn) || cyclicSet().has(pn) || cyclicSet().has(n.name)) return;
       (kids.get(pn) || kids.set(pn, []).get(pn)).push({ name: n.name, order: typeof p.order === 'string' ? p.order : undefined });
     });
   }
@@ -1739,7 +1798,7 @@ function localTree() {
     }
     return e;
   };
-  return [...C.nodes.values()].filter((n) => !parentsOf(n).length).sort((a, b) => cmpCU(a.name, b.name)).map((n) => build(n.name, new Set(), 0));
+  return [...C.nodes.values()].filter((n) => !parentsOf(n).length && !cyclicSet().has(n.name)).sort((a, b) => cmpCU(a.name, b.name)).map((n) => build(n.name, new Set(), 0));
 }
 
 /* ---- rendering ---- */
@@ -1775,8 +1834,17 @@ function accessChips(name, itemNs) {
   return chips;
 }
 
-function treeRow(e) {
+const titleOf = (name) => { const n = C.nodes.get(name); return (n && n.doc.title) || name; };
+
+/* treeRow renders one listing entry. In a DAG a node is listed under each of its parents (the tree service's
+ * subtree does that too): path is the chain of folders it is listed under here, and seen maps each folder
+ * already expanded to where, so a shared folder's children are expanded once and folded elsewhere. */
+function treeRow(e, path = [], seen = new Map()) {
   const n = C.nodes.get(e.name);
+  const parent = path[path.length - 1];
+  const others = n ? walkableParents(n).filter((p) => p !== parent) : [];
+  const shared = n && walkableParents(n).length > 1;
+  const repeat = e.kind === 'folder' && seen.has(e.name);
   const it = e.kind === 'item' ? itemOf(e.name) : null;
   const dangling = e.dangling || (it && itemExists(e.name) === false ? 'item missing' : '');
   const row = h('div', { class: 'cat-row' + (e.name === C.sel ? ' sel' : '') + (dangling ? ' dangling' : ''), tabindex: 0, role: 'button' },
@@ -1787,6 +1855,8 @@ function treeRow(e) {
     e.head ? idEl(e.head) : null,
     dangling ? h('span', { class: 'badge err', title: 'dangling (' + dangling + '): drops out of listings and access (§B.7)' + (e.unlisted ? '; shown here from /problems, not in the service listing' : '') }, 'dangling') : null,
     e.self ? h('span', { class: 'badge' }, 'self-placed') : null,
+    shared ? h('span', { class: 'badge info', title: `${walkableParents(n).length} parents (a DAG node, §B.2): listed under each of them` }, 'shared') : null,
+    shared && others.length ? h('span', { class: 'muted small', title: others.join(', ') }, 'also in ' + others.map(titleOf).join(', ')) : null,
     e._sealedErr ? h('span', { class: 'badge tomb', title: e._sealedErr }, 'sealed') : e._opened ? h('span', { class: 'badge ok', title: 'decrypted with ' + e._opened }, 'decrypted') : null,
     n && n.doc.$access && n.doc.$access.inherit === false ? h('span', { class: 'badge warn', title: 'inherit: false stops the ancestor walk here' }, 'no inherit') : null,
     !n ? h('span', { class: 'badge warn', title: 'the tree service lists it, but its document was not read' }, 'no doc') : null,
@@ -1796,8 +1866,29 @@ function treeRow(e) {
   row.onclick = () => selectNode(e.name);
   row.onkeydown = (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); selectNode(e.name); } };
   const li = h('li', {}, row);
-  if (e.children && e.children.length) li.append(h('ul', {}, ...e.children.map(treeRow)));
+  if (e.children && e.children.length) {
+    const here = [...path, e.name];
+    if (repeat) {
+      // Listed again under another parent: fold its children, which are expanded where it was first listed.
+      const d = h('details', {}, h('summary', { class: 'muted small' }, `${e.children.length} child(ren), also listed under ${seen.get(e.name).map(titleOf).join(' / ') || 'a root'}`));
+      d.addEventListener('toggle', () => { if (d.open && d.children.length === 1) d.append(h('ul', {}, ...e.children.map((c) => treeRow(c, here, seen)))); });
+      li.append(d);
+    } else {
+      if (e.kind === 'folder') seen.set(e.name, path);
+      li.append(h('ul', {}, ...e.children.map((c) => treeRow(c, here, seen))));
+    }
+  }
   return li;
+}
+
+/* cycleNote lists the folders on cycles, which no listing traverses (§B.5). */
+function cycleNote() {
+  const svc = C.source === 'tree' && C.problems && C.problems.body;
+  const groups = svc ? (C.problems.body.cycles || []).map((c) => [].concat(c).map((x) => nodeName(x) || x)) : (cyclicSet().size ? [[...cyclicSet()].sort()] : []);
+  if (!groups.length) return null;
+  return h('p', { class: 'note' }, h('span', { class: 'badge err' }, 'cycle'), ' not traversed: ',
+    ...groups.map((g, i) => [i ? '; ' : '', ...g.map((x, j) => [j ? ' ⇄ ' : '', h('button', { class: 'link mono', onclick: () => selectNode(x) }, x)])]),
+    h('span', { class: 'muted small' }, svc ? ' (flagged by the tree service: every edge inside a cycle is excluded, so these folders and anything only below them are listed under Problems, not here)' : ' (computed here: every edge inside a cycle is excluded from walks)'));
 }
 
 function renderCatalog() {
@@ -1805,7 +1896,10 @@ function renderCatalog() {
   const box = $('catTree');
   const trees = C.source === 'tree' && C.listing ? C.listing : localTree();
   $('catTreeMeta').textContent = C.head ? (C.source === 'tree' ? `tree service listing at ${short(C.at)}` : `built here from the documents at ns_id ${short(C.head)}`) : '';
-  box.replaceChildren(trees.length ? h('ul', { class: 'cat-tree' }, ...trees.map(treeRow)) : h('p', { class: 'muted' }, C.head ? 'No nodes yet: create a folder.' : '—'));
+  const seen = new Map();
+  box.replaceChildren(trees.length ? h('ul', { class: 'cat-tree' }, ...trees.map((e) => treeRow(e, [], seen))) : h('p', { class: 'muted' }, C.head ? 'No nodes yet: create a folder.' : '—'));
+  const cn = C.head ? cycleNote() : null;
+  if (cn) box.append(cn);
   // folder pickers and item suggestions
   const folders = [...C.nodes.values()].filter((n) => n.kind === 'folder').map((n) => n.name).sort();
   const opt = (f) => h('option', { value: f }, (C.nodes.get(f).doc.title ? C.nodes.get(f).doc.title + ' — ' : '') + f);
@@ -1817,7 +1911,7 @@ function renderCatalog() {
   const items = [];
   for (const t of Object.keys(C.contentHeads)) for (const [name, x] of C.contentHeads[t]) if (x.kind === 'head' && !C.nodes.has(`${t}.${name}`)) items.push(`/r/${t}/${name}`);
   $('catItemList').replaceChildren(...items.map((v) => h('option', { value: v })));
-  $('catNsList').replaceChildren(...known.map((v) => h('option', { value: v })));
+  renderCatPick();
   renderCatSel();
   renderCatProblems();
 }
@@ -1886,7 +1980,9 @@ function renderCatSel() {
     h('dl', { class: 'kv' },
       it ? h('dt', {}, 'item') : null, it ? h('dd', {}, h('button', { class: 'link mono', onclick: () => openItem(it.ns, it.name) }, it.href),
         itemExists(n.name) === false ? h('span', { class: 'badge err' }, 'dangling') : itemExists(n.name) === null ? h('span', { class: 'badge warn', title: 'the item namespace is not in catalog.trust or not readable' }, 'unknown') : null) : null,
-      h('dt', {}, 'paths'), h('dd', {}, crumbs.length ? h('div', {}, ...crumbs.map((p) => h('div', { class: 'mono small' }, p.map((x) => (C.nodes.get(x).doc.title || x)).join(' / ')))) : h('span', { class: 'muted' }, 'none: an orphan or a root')),
+      h('dt', {}, 'paths'), h('dd', {}, crumbs.length ? h('div', {}, ...crumbs.map((p) => pathRow(p, it && it.ns)),
+        crumbs.length > 1 ? h('div', { class: 'note' }, `${crumbs.length} paths to a root: the effective roles below are the union of what each path collects (§B.11.2).`) : null)
+        : h('span', { class: 'muted' }, cyclicSet().has(n.name) ? 'none: on a cycle, which walks never pass (§B.5)' : 'none: an orphan or a root')),
       h('dt', {}, 'effective'), h('dd', {}, ...accessChips(n.name, it && it.ns), (it && itemExists(n.name) === false) ? h('div', { class: 'note' }, 'A dangling placement grants nothing, except create for an item that never existed (§B.11.4).') : null)),
     h('div', { class: 'row' },
       h('button', { class: 'tiny', onclick: () => openItem(C.ns, n.name) }, 'Open node in Resource tab'),
@@ -1894,6 +1990,29 @@ function renderCatSel() {
       C.proxy && C.source === 'tree' ? h('button', { class: 'tiny', onclick: () => showWhere(n) }, it ? 'where? (tree service)' : 'ancestors (tree service)') : null),
     h('div', { id: 'catWhere' }),
     jsonPre(n.doc));
+}
+
+/* pathAccess collects $access along one path (root … node), from the node up, stopping after a node with
+ * inherit: false (§B.11.2). */
+function pathAccess(path) {
+  const grants = []; let stop = '';
+  for (let i = path.length - 1; i >= 0; i--) {
+    const n = C.nodes.get(path[i]);
+    for (const [s, roles] of Object.entries(ownAccess(n))) for (const role of roles) grants.push({ s, role, at: path[i] });
+    if (!inherits(n)) { if (i > 0) stop = path[i]; break; }
+  }
+  return { grants, stop };
+}
+function pathRow(path, itemNs) {
+  const { grants, stop } = pathAccess(path);
+  const by = new Map();
+  for (const g of grants) { const k = `${g.s}: ${g.role}`; (by.get(k) || by.set(k, { g, at: [] }).get(k)).at.push(g.at); }
+  return h('div', { class: 'cat-path' },
+    h('span', { class: 'mono small' }, path.map(titleOf).join(' / ')),
+    ...[...by.keys()].sort().map((k) => h('span', { class: 'badge info chip', title: `${roleInfo(by.get(k).g.role, itemNs)}
+assigned on: ${by.get(k).at.join(', ')}` }, k)),
+    !by.size ? h('span', { class: 'muted small' }, 'no roles along this path') : null,
+    stop ? h('span', { class: 'badge warn', title: `${stop} has inherit: false: nothing above it counts on this path` }, 'stops at ' + titleOf(stop)) : null);
 }
 
 async function showWhere(n) {
@@ -2392,7 +2511,8 @@ function init() {
   $('catNs').value = store.get('pl.catNs', 'cat');
   $('catLoad').onclick = () => asUser(() => loadCatalog());
   $('catNs').onkeydown = (e) => { if (e.key === 'Enter') asUser(() => loadCatalog()); };
-  $('catRefresh').onclick = () => asUser(() => { C.proxy = null; return loadCatalog(); });
+  $('catRefresh').onclick = () => asUser(() => { C.proxy = null; C.catalogs = null; return loadCatalog(); });
+  $('catPick').onchange = () => { const v = $('catPick').value; if (v) { $('catNs').value = v; asUser(() => loadCatalog()); } };
   $('catFCreate').onclick = catCreateFolder;
   $('catPCreate').onclick = catPlace;
   $('catMove').onclick = catMove;

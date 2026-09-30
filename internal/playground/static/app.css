@@ -320,3 +320,6 @@ ul.cat-tree ul { margin-left: 11px; padding-left: 12px; border-left: 1px dashed 
   .example li { grid-template-columns: 18px 1fr; }
   .example li .res { grid-column: 2; text-align: left; }
 }
+.cat-path { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 2px 0; }
+.cat-path + .cat-path { border-top: 1px dashed var(--border); }
+ul.cat-tree details > summary { cursor: pointer; padding: 1px 6px; }

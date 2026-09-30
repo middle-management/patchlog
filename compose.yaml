@@ -8,9 +8,11 @@
 #   http://localhost:8080             core API (through the CDN)
 #   http://localhost:8080/playground/ web playground
 #   http://localhost:8081             search index (Addendum A), e.g. /demo?q=derby
-#   http://localhost:8082             tree service (Addendum B), e.g. /cat/roots
-#                                     (the playground reads it through the core's
-#                                     read-only proxy at /playground/tree/, -tree-url)
+#   http://localhost:8082             tree service (Addendum B), e.g. /cat/roots (the
+#                                     catalog cat, a tree) and /topics/roots (topics,
+#                                     a DAG); the playground reads it through the
+#                                     core's read-only proxy at /playground/tree/
+#                                     (-tree-url) and switches between the two
 #
 # The origins, bypassing the CDN (debugging):
 #
@@ -45,7 +47,8 @@ services:
       # The playground's Catalog tab reads the tree service through a
       # same-origin, GET-only proxy at /playground/tree/. The tree service
       # starts after the core (it waits for the seed), so the proxy answers
-      # 502 until it is up.
+      # 502 until it is up. It serves both catalogs; a catalog served
+      # elsewhere would be mapped with another -tree-url CATALOG=URL.
       - -tree-url=http://tree:8082
       # Cache-tag purges (tombstone purges, namespace purges, …). The CDN
       # starts last; purges sent before it is up are logged and dropped,
@@ -59,8 +62,9 @@ services:
       timeout: 2s
       retries: 30
 
-  # One-shot: creates the demo namespaces (among them a catalog, a sealed and an
-  # e2e one), schemas and a few documents. Talks to the core directly.
+  # One-shot: creates the demo namespaces (among them two catalogs, cat as a
+  # tree and topics as a DAG, a sealed and an e2e namespace), schemas and a
+  # few documents. Talks to the core directly.
   seed:
     image: curlimages/curl:8.16.0
     entrypoint: ["sh", "/deploy/seed.sh"]
@@ -81,9 +85,11 @@ services:
       seed:
         condition: service_completed_successfully
 
+  # One tree service for both catalogs, each at /{catalog}/… with its own
+  # database (tree-cat.db, tree-topics.db).
   tree:
     <<: *patchlog
-    command: [tree, -api=http://patchlog:8080, -catalog=cat, -db=/data/tree.db, -addr=:8082, -purge-url=http://cdn:8080/]
+    command: [tree, -api=http://patchlog:8080, -catalog=cat, -catalog=topics, "-db=/data/tree-{catalog}.db", -addr=:8082, -purge-url=http://cdn:8080/]
     ports:
       - "${TREE_DIRECT_PORT:-9082}:8082"
     depends_on:

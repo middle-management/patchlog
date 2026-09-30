@@ -4,11 +4,15 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -22,12 +26,19 @@ import (
 // treeCmd runs the tree service of Addendum B, or with -access the catalog
 // service of §B.11 that also issues grants:
 //
-//	patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME]
+//	patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME]
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]]
 //	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]...
 //
 // The service follows the catalog namespace and every namespace in its
 // catalog.trust. -bearer is its own grant, which needs read on all of them.
+//
+// -catalog may name several catalogs (repeated, or comma-separated): each
+// gets its own tree service, database and followers, and one origin serves
+// them all, each at /{catalog}/… (tree.Multi). Their databases are -db with
+// {catalog} replaced by the catalog's name, or, if -db has no {catalog},
+// with -{catalog} before its extension (tree.db -> tree-topics.db). -access
+// serves exactly one catalog (its /grants are not per catalog).
 // Callers of POST /grants and of private listings present an ordinary core
 // grant for the catalog namespace as their identity.
 //
@@ -43,8 +54,9 @@ import (
 func treeCmd(args []string) {
 	fs := flag.NewFlagSet("tree", flag.ExitOnError)
 	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")
-	cat := fs.String("catalog", "", "catalog namespace to follow (required)")
-	db := fs.String("db", "tree.db", "SQLite database path")
+	var cats multi
+	fs.Var(&cats, "catalog", "catalog namespace to follow (required; repeatable or comma-separated)")
+	db := fs.String("db", "tree.db", "SQLite database path; with several catalogs, may contain {catalog}")
 	addr := fs.String("addr", ":8082", "listen address of the tree API")
 	bearer := fs.String("bearer", "", "grant for reading the catalog and its trusted namespaces (Authorization: Bearer)")
 	author := fs.String("author", "", "X-Author for a -dev server")
@@ -63,8 +75,12 @@ func treeCmd(args []string) {
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	fs.Parse(args)
 
-	if *cat == "" {
+	catalogs := splitCatalogs(cats)
+	if len(catalogs) == 0 {
 		log.Fatal("tree: -catalog is required")
+	}
+	if *access && len(catalogs) > 1 {
+		log.Fatal("tree: -access serves one catalog; run one catalog service per catalog")
 	}
 	var copts []client.Option
 	if *bearer != "" {
@@ -79,7 +95,7 @@ func treeCmd(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	topt := tree.Options{Client: c, Catalog: *cat, DB: *db, Rebuild: *rebuild, SelfPlacing: *selfPlacing, MinWait: *minWait, Recipient: recipient}
+	topt := tree.Options{Client: c, Catalog: catalogs[0], DB: treeDB(*db, catalogs[0], len(catalogs)), Rebuild: *rebuild, SelfPlacing: *selfPlacing, MinWait: *minWait, Recipient: recipient}
 	if *sse {
 		topt.FollowOptions = append(topt.FollowOptions, follow.WithSSE())
 	}
@@ -112,11 +128,7 @@ func treeCmd(args []string) {
 				handler, run, closer = svc.Handler(), svc.Run, svc.Close
 			}
 		} else {
-			var svc *tree.Service
-			svc, err = tree.Open(ctx, topt)
-			if err == nil {
-				handler, run, closer = svc.Handler(), svc.Run, svc.Close
-			}
+			handler, run, closer, err = openTrees(ctx, topt, catalogs, *db)
 		}
 		if err == nil {
 			break
@@ -139,7 +151,7 @@ func treeCmd(args []string) {
 	if *access {
 		mode = "catalog"
 	}
-	log.Printf("patchlog tree: %s service for %s at %s, serving on %s", mode, *cat, *api, ln.Addr())
+	log.Printf("patchlog tree: %s service for %s at %s, serving on %s", mode, strings.Join(catalogs, ", "), *api, ln.Addr())
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
@@ -149,4 +161,77 @@ func treeCmd(args []string) {
 	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	srv.Shutdown(shutdown)
+}
+
+// splitCatalogs flattens repeated and comma-separated -catalog values,
+// dropping duplicates.
+func splitCatalogs(vals []string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, v := range vals {
+		for _, c := range strings.Split(v, ",") {
+			if c = strings.TrimSpace(c); c != "" && !seen[c] {
+				seen[c] = true
+				out = append(out, c)
+			}
+		}
+	}
+	return out
+}
+
+// treeDB is the database of catalog cat when n catalogs are served.
+func treeDB(db, cat string, n int) string {
+	if strings.Contains(db, "{catalog}") {
+		return strings.ReplaceAll(db, "{catalog}", cat)
+	}
+	if n <= 1 {
+		return db
+	}
+	ext := filepath.Ext(db)
+	return strings.TrimSuffix(db, ext) + "-" + cat + ext
+}
+
+// openTrees opens one tree service per catalog (topt is the first's
+// options) and serves them on one handler; it closes what it opened if one
+// fails.
+func openTrees(ctx context.Context, topt tree.Options, catalogs []string, db string) (http.Handler, func(context.Context) error, func() error, error) {
+	var svcs []*tree.Service
+	closeAll := func() error {
+		var first error
+		for _, s := range svcs {
+			if err := s.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+		return first
+	}
+	for _, cat := range catalogs {
+		o := topt
+		o.Catalog, o.DB = cat, treeDB(db, cat, len(catalogs))
+		s, err := tree.Open(ctx, o)
+		if err != nil {
+			closeAll()
+			return nil, nil, nil, fmt.Errorf("catalog %s: %w", cat, err)
+		}
+		svcs = append(svcs, s)
+	}
+	if len(svcs) == 1 {
+		return svcs[0].Handler(), svcs[0].Run, svcs[0].Close, nil
+	}
+	h, err := tree.Multi(svcs...)
+	if err != nil {
+		closeAll()
+		return nil, nil, nil, err
+	}
+	run := func(ctx context.Context) error {
+		var wg sync.WaitGroup
+		errs := make([]error, len(svcs))
+		for i, s := range svcs {
+			wg.Add(1)
+			go func() { defer wg.Done(); errs[i] = s.Run(ctx) }()
+		}
+		wg.Wait()
+		return errors.Join(errs...)
+	}
+	return h, run, closeAll, nil
 }

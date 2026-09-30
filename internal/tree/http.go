@@ -250,7 +250,8 @@ var ops = map[string]bool{
 //
 //	GET /_status    each followed namespace's encryption level and epoch,
 //	                whether listings are sealed, and why a namespace is
-//	                skipped (or its documents not read)
+//	                skipped (or its documents not read); "catalogs" names
+//	                the catalog served (several behind Multi)
 func (s *Service) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
 
 func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
@@ -509,8 +510,11 @@ func (s *Service) writeListing(w http.ResponseWriter, v *viewer, at string, st d
 // serveStatus answers GET /_status (Addendum E).
 func (s *Service) serveStatus(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
-	WriteJSON(w, http.StatusOK, map[string]any{"namespaces": s.keys.Status(s.followed())})
+	WriteJSON(w, http.StatusOK, map[string]any{"namespaces": s.status(), "catalogs": []string{s.opt.Catalog}})
 }
+
+// status is each followed namespace's encryption state (Addendum E).
+func (s *Service) status() []derived.Status { return s.keys.Status(s.followed()) }
 
 func codeFor(status int) string {
 	switch status {
