@@ -402,3 +402,36 @@ func TestAuthBranches(t *testing.T) {
 	purger := e.grant(f.admin, "user:p", []string{"sec"}, []string{"read", "purge"})
 	expectCode(t, e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: purger}), 403, "forbidden")
 }
+
+// §C.4, §B.11.3: requireAt bounds a grant's `at` by the namespace's maxLag.
+func TestAuthRequireAtMaxLag(t *testing.T) {
+	cat := newKey("cat")
+	entry := cat.entry("read", "create", "append")
+	entry["requireAt"] = true
+	f := newAuthFixture(t, map[string]any{"maxLag": "PT60S"})
+	e := f.tenv
+	cid := e.configID("sec", f.adminG)
+	expect(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
+		body: ops(op("add", "/keys/-", entry))}), 201)
+
+	noAt := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"})
+	expect(t, e.write("PATCH", "sec", "a", "", addRoot(map[string]any{}), noAt), 403)
+
+	at := e.nsHead("sec", f.adminG)
+	g := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at})
+	expect(t, e.write("PATCH", "sec", "b", "", addRoot(map[string]any{}), g), 201)
+
+	// at stops being the head; within maxLag the grant still works…
+	e.clock.Advance(30 * time.Second)
+	expect(t, e.write("PATCH", "sec", "c", "", addRoot(map[string]any{}), g), 201)
+	// …beyond it, it doesn't.
+	e.clock.Advance(90 * time.Second)
+	expect(t, e.write("PATCH", "sec", "d", "", addRoot(map[string]any{}), g), 403)
+	fresh := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": e.nsHead("sec", f.adminG)})
+	expect(t, e.write("PATCH", "sec", "d", "", addRoot(map[string]any{}), fresh), 201)
+
+	// maxLag must be a duration.
+	cid = e.configID("sec", f.adminG)
+	expect(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
+		body: ops(op("replace", "/maxLag", "soon"))}), 422)
+}

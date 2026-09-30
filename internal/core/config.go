@@ -95,6 +95,7 @@ type Config struct {
 	Revoked   map[string]bool
 	Limits    Limits
 	Retention []any
+	MaxLag    *time.Duration // §C.4: how old a grant's `at` in this namespace may be
 	Frozen    bool
 	Successor string
 	Base      *BaseRef
@@ -176,6 +177,13 @@ func parseConfig(doc any, max Limits) (*Config, error) {
 			if err := parseLimits(v, &c.Limits, max); err != nil {
 				return nil, err
 			}
+		case "maxLag":
+			str, ok := v.(string)
+			d, err := ParseDuration(str)
+			if !ok || err != nil || d <= 0 {
+				return nil, fmt.Errorf("/maxLag must be a positive ISO 8601 duration")
+			}
+			c.MaxLag = &d
 		case "retention":
 			a, ok := v.([]any)
 			if !ok {

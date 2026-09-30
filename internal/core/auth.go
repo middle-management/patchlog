@@ -212,12 +212,17 @@ func (t *tx) checkAt(n *nsRow) func(requireAt any, at any) (time.Duration, error
 		if !ok {
 			return 0, fmt.Errorf("at is not in the chain of %s", target.name)
 		}
+		var lag time.Duration
 		var next int64
-		err = t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&next)
-		if err != nil {
-			return 0, nil // at is the head
+		if err := t.QueryRow(`SELECT created FROM ns_log WHERE ns = ? AND prev_seq = ?`, target.id, seq).Scan(&next); err == nil {
+			lag = t.now.Sub(time.UnixMilli(next)) // how long at has not been the head
 		}
-		return t.now.Sub(time.UnixMilli(next)), nil
+		// The namespace named by requireAt bounds the lag with its own
+		// maxLag (§C.4, §B.11.3). A key-level maxLag is a stricter override.
+		if ml := t.config(target.configSeq).MaxLag; ml != nil && lag > *ml {
+			return lag, fmt.Errorf("at is older than %s's maxLag", target.name)
+		}
+		return lag, nil
 	}
 }
 
