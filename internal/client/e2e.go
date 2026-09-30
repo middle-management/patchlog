@@ -153,6 +153,13 @@ func (x *E2E) AddKey(kid string, key []byte) {
 
 // Key returns the epoch key of kid, fetching and unwrapping it if needed.
 func (x *E2E) Key(ctx context.Context, kid string) ([]byte, error) {
+	return x.keyVia(ctx, kid, "")
+}
+
+// keyVia is Key for content read through namespace via: its relay is asked
+// first, since a branch relays its base's keyring, and a remote branch's
+// base (§G.5.2) isn't a namespace of this deployment at all.
+func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	x.keys.mu.Lock()
 	k := x.keys.m[kid]
 	x.keys.mu.Unlock()
@@ -167,8 +174,16 @@ func (x *E2E) Key(ctx context.Context, kid string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The relay first (§E.2.3): it needs a read grant with enc.
-	if got, err := x.c.FetchKeys(ctx, ns, []int{epoch}, nil); err == nil {
+	// The relays first (§E.2.3): they need a read grant with enc.
+	relays := []string{ns}
+	if via != "" && via != ns {
+		relays = []string{via, ns}
+	}
+	for _, relay := range relays {
+		got, err := x.c.FetchKeys(ctx, relay, []int{epoch}, nil)
+		if err != nil {
+			continue
+		}
 		for _, e := range got {
 			if e.Kid != kid || e.Resource != "" {
 				continue
@@ -232,6 +247,7 @@ type e2eConfig struct {
 	Config string // config revision id
 	Epoch  int
 	Base   string // the base namespace of a branch, "" otherwise
+	Remote bool   // the base is in another deployment (§G.3)
 	Pad    bool   // encryption.pad (§E.2.2)
 }
 
@@ -255,6 +271,7 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 	out.Pad, _ = enc["pad"].(bool)
 	if b, ok := d.Value["base"].(map[string]any); ok {
 		out.Base, _ = b["ns"].(string)
+		_, out.Remote = b["origin"]
 	}
 	return out, nil
 }
@@ -508,52 +525,74 @@ func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, e
 
 // chain maps ns and its bases to their depth: 0 for ns, 1 for its base,
 // and so on (a branch reads its base's ciphertext, whose patch sets and
-// snapshots are bound to the base, §F.8).
-func (x *E2E) chain(ctx context.Context, ns string) (map[string]int, error) {
-	out := map[string]int{}
+// snapshots are bound to the base, §F.8). A remote base (§G.3) ends the
+// chain: its namespace is in another deployment, so it is listed in remote
+// and not read here. A remote branch keeps its base's name in pl.ns
+// (§G.5.2); the bases of a remote base that is itself a branch aren't
+// known here, so content they sealed doesn't fold.
+func (x *E2E) chain(ctx context.Context, ns string) (depth map[string]int, remote map[string]bool, err error) {
+	depth, remote = map[string]int{}, map[string]bool{}
 	for cur, d := ns, 0; cur != ""; d++ {
-		if _, seen := out[cur]; seen {
+		if _, seen := depth[cur]; seen {
 			break
 		}
-		out[cur] = d
+		depth[cur] = d
 		cfg, err := x.config(ctx, cur)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
+		}
+		if cfg.Remote {
+			if _, seen := depth[cfg.Base]; !seen {
+				depth[cfg.Base], remote[cfg.Base] = d+1, true
+			}
+			break
 		}
 		cur = cfg.Base
 	}
-	return out, nil
+	return depth, remote, nil
 }
 
-// inChain returns a check, for the entries of one resource log of ns in
-// order, whether each may be sealed under namespace kns: ns itself or one
-// of its bases (read through, §F.8.1), and never a base deeper than an
-// earlier entry's, since read-through content comes before a namespace's
-// own writes.
-func (x *E2E) inChain(ctx context.Context, ns string) func(kns string) (bool, error) {
-	var depth map[string]int
-	last := -1
-	return func(kns string) (bool, error) {
-		d := 0
-		if kns != ns {
-			if depth == nil {
-				var err error
-				if depth, err = x.chain(ctx, ns); err != nil {
-					return false, err
-				}
-			}
-			var ok bool
-			if d, ok = depth[kns]; !ok {
-				return false, nil
+// chainCheck checks, for the entries of one resource log of ns in order,
+// whether each may be sealed under namespace kns: ns itself or one of its
+// bases (read through, §F.8.1), and never a base deeper than an earlier
+// entry's, since read-through content comes before a namespace's own
+// writes.
+type chainCheck struct {
+	x      *E2E
+	ctx    context.Context
+	ns     string
+	depth  map[string]int
+	remote map[string]bool
+	last   int
+}
+
+func (x *E2E) inChain(ctx context.Context, ns string) *chainCheck {
+	return &chainCheck{x: x, ctx: ctx, ns: ns, last: -1}
+}
+
+func (c *chainCheck) ok(kns string) (bool, error) {
+	d := 0
+	if kns != c.ns {
+		if c.depth == nil {
+			var err error
+			if c.depth, c.remote, err = c.x.chain(c.ctx, c.ns); err != nil {
+				return false, err
 			}
 		}
-		if last >= 0 && d > last {
+		var ok bool
+		if d, ok = c.depth[kns]; !ok {
 			return false, nil
 		}
-		last = d
-		return true, nil
 	}
+	if c.last >= 0 && d > c.last {
+		return false, nil
+	}
+	c.last = d
+	return true, nil
 }
+
+// isRemote reports a remote base, whose configuration isn't readable here.
+func (c *chainCheck) isRemote(kns string) bool { return c.remote[kns] }
 
 // openSealed opens the sealed patch set of revision e of name. A non-empty
 // flag says why the revision must be left out instead: it isn't a sealed
@@ -561,7 +600,7 @@ func (x *E2E) inChain(ctx context.Context, ns string) func(kns string) (bool, er
 // verify, or isn't padded although the namespace that sealed it padded at
 // the time (§E.3.1). err is for failures that aren't the revision's fault
 // (keys, transport).
-func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK func(string) (bool, error)) (plain any, flag string, err error) {
+func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK *chainCheck) (plain any, flag string, err error) {
 	jwe, ok := seal.SealedJWE(e.Patches)
 	if !ok {
 		return nil, "not a sealed patch set", nil
@@ -574,12 +613,12 @@ func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK func
 	if err != nil {
 		return nil, "sealed patch set: " + err.Error(), nil
 	}
-	if ok, err := nsOK(kns); err != nil {
+	if ok, err := nsOK.ok(kns); err != nil {
 		return nil, "", err
 	} else if !ok {
 		return nil, "sealed under another namespace's key " + h.Kid, nil
 	}
-	key, err := x.Key(ctx, h.Kid)
+	key, err := x.keyVia(ctx, h.Kid, nsOK.ns)
 	if err != nil {
 		return nil, "", err
 	}
@@ -587,7 +626,8 @@ func (x *E2E) openSealed(ctx context.Context, name string, e LogEntry, nsOK func
 	if err != nil {
 		return nil, "sealed patch set: " + err.Error(), nil
 	}
-	if !padded {
+	// A remote base's padding history isn't readable here (§G.5.2).
+	if !padded && !nsOK.isRemote(kns) {
 		if must, err := x.paddedAt(ctx, kns, e.ID); err != nil {
 			return nil, "", err
 		} else if must {
@@ -745,12 +785,12 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 		if err != nil {
 			return nil, bad("snapshot kid: %v", err)
 		}
-		if ok, err := nsOK(kns); err != nil {
+		if ok, err := nsOK.ok(kns); err != nil {
 			return nil, err
 		} else if !ok {
 			return nil, bad("snapshot sealed under %s", h.Kid)
 		}
-		key, err := x.Key(ctx, h.Kid)
+		key, err := x.keyVia(ctx, h.Kid, ns)
 		if err != nil {
 			return nil, err
 		}

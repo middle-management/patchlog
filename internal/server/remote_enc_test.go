@@ -1,17 +1,19 @@
 package server
 
 import (
+	"context"
 	"crypto/ecdh"
 	"crypto/ed25519"
+	"errors"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	plclient "github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -153,48 +155,6 @@ func TestRemoteBranchSealedLater(t *testing.T) {
 	}
 }
 
-// foldCipher folds an e2e log answer with keys by kid, checking each sealed
-// patch set against the kid's namespace (the base's, for read-through).
-func foldCipher(t *testing.T, arr []any, name string, keys map[string][]byte) any {
-	t.Helper()
-	var doc any
-	exists := false
-	prev := ""
-	for _, x := range arr {
-		m := x.(map[string]any)
-		parent, _ := m["parent"].(string)
-		if parent != prev {
-			t.Fatalf("chain: %v", m)
-		}
-		prev = m["id"].(string)
-		if hashID(t, parent, canonical(m["patches"])) != prev && m["kind"] == "rev" {
-			t.Fatalf("%s: id not over the ciphertext", prev)
-		}
-		if m["kind"] == "tombstone" {
-			continue
-		}
-		jwe, ok := seal.SealedJWE(m["patches"])
-		if !ok {
-			t.Fatalf("not sealed: %v", m)
-		}
-		h, _ := seal.ParseHeader(jwe)
-		kns, _, _ := seal.ParseKid(h.Kid)
-		plain, err := seal.OpenPatchSet(m["patches"], keys[h.Kid], h.Kid, kns, name, parent)
-		if err != nil {
-			t.Fatal(err)
-		}
-		o, err := patch.Parse(plain)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if doc, _, err = patch.Apply(doc, exists, o, patch.Options{}); err != nil {
-			t.Fatal(err)
-		}
-		exists = true
-	}
-	return doc
-}
-
 // An e2e base: B mirrors the ciphertext and the keyring verbatim, ids over
 // the ciphertext verify, and B relays the base's wrapped keys (kid of the
 // base's namespace) until the branch writes a keyring of its own.
@@ -255,7 +215,6 @@ func TestRemoteBranchE2E(t *testing.T) {
 	if r := b.get("/r/rel/d/rev/"+d1, bAdmin); r.Code != 302 || r.H.Get("X-E2E") != "fold" {
 		t.Fatalf("read-through %d %v", r.Code, r.H)
 	}
-	mustEqual(t, foldCipher(t, lb, "d", map[string][]byte{"e#1": k1, "e#2": k2}), map[string]any{"n": 1.0, "t": encMarker})
 	// The keyring reads as a document, and its wrapped keys are relayed
 	// under the base's kids to the grant's enc.
 	if d := b.doc("rel", "keyring", bAdmin); d["ns"] != "e" {
@@ -285,6 +244,36 @@ func TestRemoteBranchE2E(t *testing.T) {
 	expect(t, w, 201)
 	if lg := b.get("/r/rel/d/rev/"+etagOf(w)+"/log", bAdmin).Arr(); len(lg) != 3 {
 		t.Fatalf("log after the branch's write %v", lg)
+	}
+	// A reader folds B's copy through the client: the read-through
+	// entries open with the base's keys, relayed by B under A's kids, and
+	// the branch's own with its key.
+	c, err := plclient.New(b.srv.URL, plclient.WithBearer(readerG))
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := c.E2E(readerPriv)
+	doc, err := x.DocE2E(context.Background(), "rel", "d", d1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustEqual(t, doc.Value, map[string]any{"n": 1.0, "t": encMarker})
+	if len(doc.Flagged) != 0 || doc.ValidID != d1 {
+		t.Fatalf("fold %+v", doc)
+	}
+	x.AddKey("rel#1", kb)
+	h, cur, err := x.LoadE2E(context.Background(), "rel", "d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if h.ID != etagOf(w) || len(cur.Flagged) != 0 {
+		t.Fatalf("head %s, flagged %v", h.ID, cur.Flagged)
+	}
+	mustEqual(t, cur.Value, map[string]any{"n": 1.0, "t": encMarker, "x": 1.0})
+	// Without the relay's keys (no enc in the grant), nothing opens.
+	c2, _ := plclient.New(b.srv.URL, plclient.WithBearer(bAdmin))
+	if _, err := c2.E2E(readerPriv).DocE2E(context.Background(), "rel", "d", d1); !errors.Is(err, plclient.ErrNoKeys) {
+		t.Fatalf("fold without keys: %v", err)
 	}
 	// Nothing was decrypted on B.
 	assertNoPlaintext(t, path)
