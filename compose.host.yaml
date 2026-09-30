@@ -1,0 +1,79 @@
+# Host networking, for Docker hosts that can't create network namespaces
+# (Fly.io sprites, some VMs and CI runners: "bind-mount /proc/…/ns/net …
+# permission denied"). Layer it over compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.host.yaml up --build
+#   make up-host
+#
+# Every container shares the host's network. The service names still
+# resolve (to 127.0.0.1, via extra_hosts), and the ports are the ones
+# compose.yaml publishes: the CDN on 8080–8082, the origins directly on
+# 9080–9082. `docker compose exec` doesn't work on such hosts either.
+
+x-host: &host
+  network_mode: host
+  ports: !reset []
+  extra_hosts:
+    - patchlog:127.0.0.1
+    - index:127.0.0.1
+    - tree:127.0.0.1
+    - cdn:127.0.0.1
+
+services:
+  patchlog:
+    <<: *host
+    command:
+      - serve
+      - -dev
+      - -addr=:9080
+      - -origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
+      - -db=/data/patchlog.db
+      - -archive=file:///data/archive
+      - -master-key=/data/master.key
+      - -master-key-create
+      - -tree-url=http://tree:9082
+      - -purge-url=http://cdn:8080/
+    # Healthchecks run through `docker exec`, which joins the container's
+    # namespaces, and hosts like these refuse that too. The seed waits for
+    # the API itself instead, and the CDN only needs the core started.
+    healthcheck:
+      disable: true
+
+  seed:
+    <<: *host
+    environment:
+      API: http://patchlog:9080
+    entrypoint: ["sh", "-c", "until curl -fs -o /dev/null $$API/; do sleep 1; done; exec sh /deploy/seed.sh"]
+    depends_on: !override
+      patchlog:
+        condition: service_started
+
+  index:
+    <<: *host
+    command: [index, -api=http://patchlog:9080, -ns=demo, -db=/data/index.db, -addr=:9081, -purge-url=http://cdn:8080/]
+
+  tree:
+    <<: *host
+    command: [tree, -api=http://patchlog:9080, -catalog=cat, -catalog=topics, "-db=/data/tree-{catalog}.db", -addr=:9082, -purge-url=http://cdn:8080/]
+
+  janitor:
+    <<: *host
+    command: [janitor, -api=http://patchlog:9080, -ns=demo]
+
+  cdn:
+    <<: *host
+    depends_on: !override
+      patchlog:
+        condition: service_started
+      index:
+        condition: service_started
+      tree:
+        condition: service_started
+    # The VCL's backends are the origins' in-network ports (8080–8082);
+    # here they listen on 9080–9082, so point it there before starting.
+    entrypoint: ["sh", "-c"]
+    command:
+      - >-
+        sed -e 's/\.port = "808\([0-2]\)"/.port = "908\1"/' /etc/varnish/default.vcl > /var/lib/varnish/varnishd/host.vcl &&
+        exec varnishd -F -f /var/lib/varnish/varnishd/host.vcl -n /var/lib/varnish/varnishd
+        -a core=:8080 -a search=:8081 -a tree=:8082 -s malloc,256m

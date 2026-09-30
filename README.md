@@ -62,6 +62,12 @@ and serves immutable, CDN-cacheable revisions.
 make up        # or: docker compose up --build -d
 ```
 
+On hosts where Docker can't create network namespaces (a Fly.io sprite, some VMs and CI runners;
+`bind-mount /proc/…/ns/net …: permission denied`), use `make up-host`, which layers
+`compose.host.yaml` over it: host networking, the same ports, and no `docker exec` healthchecks.
+On a sprite the stack's URL (`https://{sprite}-{org}.sprites.app`) routes to the CDN on 8080; pass
+`PATCHLOG_ORIGIN` with that URL so generated links point there.
+
 This starts the core server in dev mode, seeds a few demo namespaces and documents, and runs the
 search index, the tree service and the branch janitor, all behind a local CDN (Varnish, see
 [The local CDN](#the-local-cdn-9)):

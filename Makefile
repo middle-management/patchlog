@@ -28,6 +28,10 @@ up: ## build and start the whole stack (core, seed, index, tree, janitor, cdn)
 	@echo "through the CDN: core http://localhost:8080  playground http://localhost:8080/playground/  index http://localhost:8081  tree http://localhost:8082 (/cat/roots, /topics/roots; and /playground/tree/)"
 	@echo "origins, bypassing it: core http://localhost:9080  index http://localhost:9081  tree http://localhost:9082"
 
+up-host: ## the same, with host networking (hosts where Docker can't create network namespaces, e.g. sprites)
+	docker compose -f compose.yaml -f compose.host.yaml up --build -d
+	@echo "through the CDN: core http://localhost:8080 (playground /playground/), index :8081, tree :8082; origins directly on :9080-9082"
+
 down: ## stop the stack (data is kept; `docker compose down -v` wipes it)
 	docker compose down
 
