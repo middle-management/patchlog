@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.26 · 2026-09-30. See the change log at the end.
+Status: draft v0.27 · 2026-09-30. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -1675,7 +1675,7 @@ A name that exists or existed in the content namespace is refused (`409`), so a 
 
 - **Listing URLs carry the subject set.** Listings are served at `/{catalog}/at/{at}/g/{gs}/…` (`at` as in §B.5), where `gs = text(trunc160(sha256(canonical(sorted subjects))))`. The subjects are the caller's `group:` entries, plus `user:{sub}` only if the catalog has direct entries for that user. The edge admits a request only if the caller's edge grant is bound to that exact `gs`. Listings are cached per (listing, subject set, `at`), so users without direct entries share caches with everyone in the same groups.
 
-- **Listings never embed signed URLs.** Readers obtain per-item edge grants from `POST /read-grants { items: [...] }` (`no-store`). It returns short-lived edge grants scoped to exactly `/r/{ns}/{name}` and `/r/{ns}/{name}/…`.
+- **Listings never embed signed URLs.** Readers obtain per-item edge grants from `POST /read-grants { items: [...] }` (`no-store`). It returns short-lived edge grants scoped to exactly `/r/{ns}/{name}` and `/r/{ns}/{name}/…`. For items in sealed namespaces, and for sealed catalog nodes, it also returns each item's per-resource keys `K_r` (§E.2.1), wrapped to the caller's public key in the §E.2.3 format. The catalog service derives them from the epoch keys it holds as a consumer. So a reader who sees items only through catalog roles, with no grant on the content namespace, can still read them and open their entries in listings (§E.2.6).
 
 - **Readers of a whole content namespace** use a namespace-wide edge grant instead (§C.5).
 
@@ -2455,7 +2455,7 @@ Responses for sealed namespaces use `Content-Type: application/jose` and a JWE (
 
 - **Scope.** Each JWE is padded as a whole, including every JWE of a log range. Turning `pad` on or off affects only what is sealed afterwards: stored sealed bytes are served unchanged forever.
 
-- **At E3** ids are over ciphertext, so padding is part of what is hashed, and a retry reuses the exact ciphertext. The server can't check padding there. Readers with keys SHOULD flag a patch set in a padded namespace that isn't padded to its bucket, like a failed validation (§E.3.2).
+- **At E3** ids are over ciphertext, so padding is part of what is hashed, and a retry reuses the exact ciphertext. The server can't check padding there. Readers with keys SHOULD flag a patch set that isn't padded to its bucket when the namespace had `pad` on at that revision, like a failed validation (§E.3.2). That is judged by the namespace document in force at the revision's namespace log entry. A batch that changes the configuration judges its items under the configuration before it. Revisions written while `pad` was off are never flagged.
 
 - Padding hides sizes within a bucket. It does not hide counts, timing or the number of revisions (§E.4).
 
@@ -2515,11 +2515,13 @@ This section applies to services that serve views derived from sealed namespaces
 
 - **Getting keys.** A service reads a sealed namespace like any reader. It holds its own key pair and a grant with `read`, and fetches epoch keys through §E.2.3. At E3, only a service whose public key is a recipient in the namespace's `keyring` can derive anything. Any other service skips the namespace and says so in its status. It MUST NOT index or list ciphertext as if it were content. A service that holds keys is inside the namespace's trust boundary, like any other reader.
 
-- **What gets sealed.** Every value a view derives from a sealed namespace's content is sealed under that namespace's current epoch key. This covers facets, scores, snippets, titles and `$access`-derived details. What §E.2.2 already leaves in the clear stays in the clear: names, ids, URLs and heads, as well as the view's own structure, `at`, order and pagination cursors.
+- **What gets sealed.** Every value a view derives from a sealed namespace's content is sealed. This covers facets, scores, snippets, titles and `$access`-derived details. What §E.2.2 already leaves in the clear stays in the clear: names, ids, URLs and heads, as well as the view's own structure, `at`, `ns`, order and pagination cursors.
 
-- **One source: whole-response sealing.** When every sealed value in a response comes from one namespace, the service MAY serve the whole response as one JWE in the §E.2.2 format, with `Content-Type: application/jose` and `pl: { "ns", "view" }`.
+- **Whole-response sealing.** When every sealed value in a response comes from one namespace, and the reader may read that whole namespace (or it is public), the service MAY serve the whole response as one JWE in the §E.2.2 format, sealed under the epoch key `K_e`, with `Content-Type: application/jose` and `pl: { "ns", "view" }`.
 
-- **Several sources: per-entry sealing.** Otherwise the response stays JSON. Each entry (a hit, a child, a node) that carries sealed values replaces them with `"sealed": "<JWE compact>"`, sealed under the key of the entry's own namespace with `pl: { "ns", "name", "view" }`. A reader decrypts the entries it holds keys for and shows the rest by name only. Folders and placements from a sealed catalog namespace are entries of that namespace.
+- **Per-entry sealing.** Otherwise, including a single-source view for a reader whose grant gives only per-resource keys, the response stays JSON. Each entry (a hit, a child, a node) that carries sealed values replaces them with `"sealed": "<JWE compact>"`. The entry is sealed under the per-resource key `K_r` of the entry's own resource (§E.2.1), with `kid` naming the epoch it was derived from and `pl: { "ns", "name", "view" }`. So a reader with either `K_e` or that `K_r` can open it. A reader decrypts the entries it holds keys for and shows the rest by name only. Folders and placements from a sealed catalog namespace are entries of that namespace. Which form a reader gets depends on its grant, so the two forms are different views and are cached apart (§B.11.5).
+
+- **Aggregates.** Values that combine several resources, such as facet counts, have no entry of their own. They are served only in whole-response form. A service refuses them (`400`) to a reader that would get per-entry sealing.
 
 - **`view`** is the request target, path and query, of the `…/at/{at}/…` URL that the response is served at, exactly as the service's redirect gave it. It binds the ciphertext to one query at one checkpoint, so a result can't be replayed under another query, subject set (§B.11.5) or `at`. Readers MUST compare `pl` with the URL they fetched.
 
@@ -2527,7 +2529,7 @@ This section applies to services that serve views derived from sealed namespaces
 
 - **Caching** follows §E.2.5: views of sealed namespaces use the public rules, with the tags of §A.4 and §B.5.
 
-- **Local storage.** A service MUST protect the data it derives from a sealed namespace at least as well as E1 protects the source (§E.1). A purge of the source, or the destruction of its keys, MUST make the derived data unreadable, for example by deleting the derived rows or by sealing them under keys derived from the source's epoch keys.
+- **Local storage.** A queryable index can't be sealed row by row: full-text search, facets and sorting need plaintext. So a service keeps what it derives from a sealed namespace in storage encrypted as the core's is at E1 (§E.1), with keys held outside that storage, such as an encrypted volume or database. Views it has sealed (above) may be stored as they are. A purge of the source, or the destruction of its keys, MUST remove the derived data: rows are deleted and freed pages overwritten, stored sealed views are deleted, and cached keys are forgotten.
 
 - **Queries are metadata.** Query strings are in URLs, so the service, the CDN and anyone who sees the URL learn them, whatever the level (§E.4).
 
@@ -2732,6 +2734,8 @@ There is no rebase operation. To bring `release-7` up to date with `matches`:
 
 - **Replay** `release-7`'s changes into it with batches carrying `source: { ns: "release-7", at }`, classified by ancestry exactly as in §F.3, but against the new branch. Resources that `matches` didn't change since the old `at` fast-forward and keep the **same ids** as before. At E3 they are re-sealed for the new branch and get new ids (§F.8.1).
 
+- **Resuming.** When replaying resumes, batches in the successor without `origin` whose `source.ns` is the old branch count as earlier merges (§F.3), whoever wrote them, even without `merge.authors`. The successor isn't in use yet, and §F.6 trusts the same batches to decide that a branch was superseded. Without this, a resumed rebase that replayed rather than fast-forwarded (always the case at E3, §F.8.1) would conflict on every resource.
+
 - **Resolve** conflicts, over as many batches and people as it takes. The new branch isn't in use yet, and the old one keeps working meanwhile.
 
 - **Switch** with one config write on the old branch: `"frozen": true, "successor": "release-7-b"`. Then replay whatever the old branch received after step 2.
@@ -2772,6 +2776,8 @@ The janitor needs `purge-ns` on branches only, never on bases.
 - **merged:** the base's log has a batch **without `origin`**, by a principal listed in the base's `merge.authors` (§F.3), whose `source.ns` is the branch and whose `source.at` is in the branch's chain, and the branch's log has no `head`, `tombstone` or `batch` entry after `source.at`, so no document changed after the merge. `config` entries (such as the freeze), `prune` entries and propagated purges are allowed.
 
 - **superseded:** the successor exists, isn't purged and has the same base namespace, its log has a batch without `origin` whose `source.ns` is the branch and whose `source.at` is in the branch's chain, and the branch's log has no `head`, `tombstone` or `batch` entry after that `source.at`. So the successor really took over the branch's work.
+
+- At E3, entries for the branch's `keyring` resource are allowed after `source.at` too, in either check, since the keyring is never merged (§F.8.1). A batch counts only if it has other items.
 
 A branch with no `head`, `tombstone` or `batch` entry of its own counts as merged. Otherwise a co-author with `config` on a branch could get everyone else's unmerged work purged.
 
@@ -2845,7 +2851,7 @@ The server can't read patches at E3, so a merge (§F.3) or a rebase (§F.5) is c
 
 - for writing, the target's current epoch key.
 
-A `kid` `{ns}#{e}` names the namespace whose `keyring` holds its key. Read-through content in a branch keeps the base's ciphertext and `kid`, so it is opened with the base's keyring. The branch's own writes carry the branch's `kid`s.
+A `kid` `{ns}#{e}` names the namespace whose `keyring` holds its key. Read-through content in a branch keeps the base's ciphertext and `kid`. A client asks the namespace it is reading for keys first: `POST /ns/{branch}/keys` relays the entries of keyrings the branch reads through, including a remote branch's mirrored keyring, whose base doesn't exist on that server (§G.5.2). It asks the `kid`'s namespace only if that fails. The branch's own writes carry the branch's `kid`s, and a branch's `keyring` is never merged.
 
 - **Classification** is by ancestry over ids, exactly as in §F.3. Ids are over ciphertext, and that is enough: read-through content keeps the base's ids, and a branch's first entry names the base's id as its foreign parent. Two rows of the table change:
 
@@ -2859,11 +2865,11 @@ There are never fast-forwards at E3, even between namespaces with the same keys,
 
 - **Conflicts** are found by the merger. It computes `writes` from the decrypted patch sets and compares them as in §F.3, including the rule for arrays. The server's dry run can only check preconditions, verbs and limits.
 
-- **Validation.** Before submitting, the merger folds every item and validates each resulting document against its `$schema` (§E.3.2). A document that fails is a conflict for a person, like an overlap. A resource kept at the base's version is recorded with a sealed empty set (§F.3).
+- **Validation.** Before submitting, the merger folds every item and validates each resulting document against its `$schema` (§E.3.2). A document that fails is a conflict for a person, reported with kind `invalid` next to the overlap conflicts. A resource kept at the base's version is recorded with a sealed empty set (§F.3).
 
 - **Retries.** The merger keeps the sealed batch byte for byte until it is acknowledged, so a retry reproduces the same ids (§E.3.1). Re-classifying after a `412`, or changing a resolution, seals the affected items again, and they get new ids.
 
-- **Later merges and the janitor.** Every E3 merge is a replay, so a second merge always finds its common ancestors in earlier merge batches (§F.3). Those, like the janitor's `merged` and `superseded` checks (§F.6), use only namespace logs, `source` and `merge.authors`, which stay plaintext at E3. So the janitor needs no keys.
+- **Later merges and the janitor.** Every E3 merge is a replay, so a second merge finds its common ancestors in earlier merge batches by `merge.authors` (§F.3). Those, like the janitor's `merged` and `superseded` checks (§F.6), use only namespace logs, `source` and `merge.authors`, which stay plaintext at E3, so the janitor needs no keys. Without such a batch, for instance when the base lists no `merge.authors`, a merger MAY count a resource as merged when the target's head document equals the branch's head document, compared as decrypted plaintext. Every other resource the branch changed conflicts, and rebasing (§F.5) is the way forward.
 
 - **Rebases** (§F.5) re-seal in the same way, with the successor as the target. Only read-through content keeps its ids. Remote branches (§G.5.2) are merged in the same way, with the target's keys.
 
@@ -3114,7 +3120,7 @@ Each document is exported in one of two modes:
 
 - **Import snapshot documents through an upstream namespace.** The target keeps one namespace per source namespace for them, e.g. `matches-upstream`, written only by imports.
 
-- **Upstream first.** Each import appends to each snapshot document there one revision: `diff(previous snapshot, new snapshot)`, or a genesis the first time. For a deleted document it appends a tombstone. An empty diff writes nothing. The upstream chain is exactly the sequence of snapshots as imported, and its ids depend only on that sequence.
+- **Upstream first.** Each import appends to each snapshot document there one revision: `diff(previous snapshot, new snapshot)`, or a genesis the first time. For a deleted document it appends a tombstone. An empty diff writes nothing. The upstream chain is exactly the sequence of snapshots as imported, and its ids depend only on that sequence, except in a sealed target: there each generated patch set carries a fresh `$nonce` (§C.7), so the ids differ from one import to the next. Diffs ignore `$nonce`, so an unchanged snapshot still writes nothing.
 
 - **Then the target, as a merge from upstream.** The first time, the target fast-forwards and so shares the upstream ids. Later, the base is the upstream revision recorded in the previous import batch's `source.ids`, and the upstream revisions after it are replayed onto the target's head. They conflict where they overlap the target's own changes (the array rule of §F.3). A deletion conflicts if the target changed the document.
 
@@ -3162,7 +3168,7 @@ patchlog import release-7.plb --to https://cms.example --dry-run
 
 - A `private` or `sealed` source goes into a private or sealed target. An importer that holds the target's keys MAY also import it into an `e2e` target by sealing each patch set client-side. That re-encryption changes the ids, like any E3 merge (§F.8).
 
-- An `e2e` source goes only into an `e2e` target **with the same namespace name**, since sealed patch sets bind `pl.ns` (§E.3.1). Lines carry the ciphertext verbatim, including the `keyring` resource, and ids verify as usual. Importing under another name is a merge, done by a client that holds both sets of keys.
+- An `e2e` source goes only into an `e2e` target **with the same namespace name**, since sealed patch sets bind `pl.ns` (§E.3.1). Lines carry the ciphertext verbatim, including the `keyring` resource, and ids verify as usual. Importing under another name is a merge, done by a client that holds both sets of keys. A target created for the import starts at the bundle's lowest epoch and is moved up one epoch at a time as its keyring lines arrive, so the importer needs `config` on the target, with a `*` key (§7.4). An existing target whose epoch is below the bundle's is refused.
 
 - **E3 snapshots.** A snapshot line of an `e2e` namespace needs an exporter with keys. The exporter replaces `doc` with `"patches": [{ "op": "sealed", … }]`, a sealed genesis under the source's current epoch, and `snapshot` keeps the source id as provenance. The genesis id is computed over that ciphertext, so each export produces a different one.
 
@@ -3191,11 +3197,13 @@ A sealed bundle (`application/vnd.patchlog.sealed-bundle+jsonl`) encrypts a bund
 
 ### G.5.2 Remote branches
 
-- A remote branch of a `private`, `sealed` or `e2e` source MUST be at least as protected. B refuses to register it otherwise, since B can see the source's level in its namespace document.
+- A remote branch of a `private`, `sealed` or `e2e` source MUST be at least as protected. B refuses to register it otherwise. B learns the source's level from the source's namespace document. If B can't read that document, it MUST refuse, since it can't tell the level.
 
 - **E2 sources.** B fetches keys from A with its own key pair and grant (§E.2.3), mirrors the plaintext, and seals what it serves under the branch's own epoch keys.
 
-- **E3 sources.** B mirrors ciphertext and the `keyring` verbatim, and verifies ids over the ciphertext. A remote branch of an E3 namespace keeps its source's namespace name in `pl.ns`, so its readers use the source's keys. Writes to the branch are sealed under keys the branch's own key holders manage, and are merged back by re-encryption (§F.8).
+- **E3 sources.** B mirrors ciphertext and the `keyring` verbatim, and verifies ids over the ciphertext. A remote branch of an E3 namespace keeps its source's namespace name in `pl.ns`, so its readers use the source's keys, which B relays from the mirrored keyring through `POST /ns/{branch}/keys` (§F.8.1). Writes to the branch are sealed under keys the branch's own key holders manage, and are merged back by re-encryption (§F.8).
+
+- **Epoch start times** decide which epochs B relays to a grant (§E.2.3). B takes them from the source's namespace documents, which B can't verify against the chain, so they are only as trustworthy as the channel. That limits the harm: relayed entries are wrapped to keyring recipients, so a wrong start time can only change which wrapped keys a grant receives, never who can unwrap them.
 
 ## G.6 Multi-region (outlook)
 
@@ -3362,3 +3370,13 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **v0.25:** encryption for bundles and remote branches (§G.5). Bundle headers give each namespace's protection in `access`, and importers refuse a less protected target unless an operator overrides it; E3 bundles import only under the same namespace name. Sealed bundles (§G.5.1.1) encrypt line by line under an HPKE-wrapped content key, with `pl: { bundle, line }` and a `last` marker, so reordering and truncation are detected, and the digest stays over the plaintext. Remote branches must be at least as protected as their source (§G.5.2).
 
 - **v0.26:** merging and rebasing at E3 (§F.8.1). A client with keys classifies by ancestry over ciphertext ids. What would be a fast-forward becomes a re-sealed replay with new ids, and there are never fast-forwards at E3. Each re-sealed patch set is bound to the target and to the id of the entry before it. The merger checks conflicts on decrypted `writes` and validates against `$schema` before submitting. Later merges and the janitor work from plaintext namespace logs, and a `kid` names the namespace whose keyring holds its key.
+
+- **v0.27:** feedback from implementing E-4.
+
+- **Derived views (§E.2.6):** entries are sealed under the resource's `K_r`, so per-resource readers can open them. Single-source views use per-entry sealing for per-resource readers. Aggregates such as counts are served only whole. Queryable service storage is encrypted like E1, not sealed per row. Catalog `/read-grants` returns wrapped `K_r` for sealed items (§B.11.5).
+
+- **Merges (§F.5, §F.6, §F.8.1):** a resumed rebase trusts the old branch's batches in the successor. Without `merge.authors`, an E3 merge may count identical documents as merged. The janitor ignores keyring entries after a merge. Validation failures are `invalid` conflicts. Clients ask the namespace they read for keys, which relays keyrings it reads through.
+
+- **Padding (§E.2.2):** whether a revision should be padded follows the configuration at its namespace log entry.
+
+- **Bundles and remote branches (§G.4.4, §G.5):** upstream chains of sealed targets aren't deterministic. E3 imports into new targets need `config` to step through epochs. B refuses a remote branch whose source document it can't read. Epoch start times from the source are unverified but can't widen decryption.
