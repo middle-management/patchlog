@@ -128,7 +128,7 @@ type stepState struct {
 	action   string
 	parentID *ids.ID
 	id       ids.ID
-	doc      any // resulting (for a delete: the last live) document
+	doc      any    // resulting (for a delete: the last live) document
 	docCanon []byte // canonical(doc), once checkLimits computed it
 	writes   []string
 	typed    string // $schema of the resulting document
