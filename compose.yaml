@@ -1,0 +1,76 @@
+# The whole stack in development mode (no authentication; X-Author names
+# the author). Start it with `docker compose up --build` or `make up`.
+#
+#   http://localhost:8080             core API
+#   http://localhost:8080/playground/ web playground
+#   http://localhost:8081             search index (Addendum A), e.g. /demo?q=derby
+#   http://localhost:8082             tree service (Addendum B), e.g. /cat/roots
+#
+# Data (databases, archives, the at-rest master key) lives in the `data`
+# volume; `docker compose down -v` wipes it.
+
+x-patchlog: &patchlog
+  build: .
+  image: patchlog:dev
+  restart: unless-stopped
+  volumes:
+    - data:/data
+
+services:
+  patchlog:
+    <<: *patchlog
+    command:
+      - serve
+      - -dev
+      - -addr=:8080
+      - -origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
+      - -db=/data/patchlog.db
+      - -archive=file:///data/archive
+      - -master-key=/data/master.key
+      - -master-key-create
+    ports:
+      - "${PATCHLOG_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # One-shot: creates the demo namespaces, a schema and a few documents.
+  seed:
+    image: curlimages/curl:8.16.0
+    entrypoint: ["sh", "/deploy/seed.sh"]
+    restart: "no"
+    volumes:
+      - ./deploy:/deploy:ro
+    depends_on:
+      patchlog:
+        condition: service_healthy
+
+  index:
+    <<: *patchlog
+    command: [index, -api=http://patchlog:8080, -ns=demo, -db=/data/index.db, -addr=:8081]
+    ports:
+      - "${INDEX_PORT:-8081}:8081"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  tree:
+    <<: *patchlog
+    command: [tree, -api=http://patchlog:8080, -catalog=cat, -db=/data/tree.db, -addr=:8082]
+    ports:
+      - "${TREE_PORT:-8082}:8082"
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  janitor:
+    <<: *patchlog
+    command: [janitor, -api=http://patchlog:8080, -ns=demo]
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+volumes:
+  data:

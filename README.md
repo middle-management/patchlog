@@ -44,6 +44,32 @@ and serves immutable, CDN-cacheable revisions.
 - Author signatures (§C.3): a `Signature` header is stored with the revision and returned
   in the log, but not verified.
 
+## Running the whole stack
+
+```sh
+make up        # or: docker compose up --build -d
+```
+
+This starts the core server in dev mode, seeds a few demo namespaces and documents, and runs the
+search index, the tree service and the branch janitor:
+
+| URL | What |
+|---|---|
+| http://localhost:8080 | core API |
+| http://localhost:8080/playground/ | web playground |
+| http://localhost:8081/demo?q=derby | search index (Addendum A) |
+| http://localhost:8082/cat/roots | tree service (Addendum B) |
+
+- `make logs` follows the logs.
+- `make seed` re-runs the seed, which is safe to repeat.
+- `make down` stops the stack and keeps its data; `docker compose down -v` wipes it.
+- Data lives in the `data` volume: databases, pruning archives, and the at-rest master key,
+  which is created on first start.
+- Ports and the origin can be changed with `PATCHLOG_PORT`, `INDEX_PORT`, `TREE_PORT` and
+  `PATCHLOG_ORIGIN`.
+- Without Docker, `make dev` runs just the core server, and `make check` runs vet, the tests and
+  a gofmt check.
+
 ## Running
 
 ```sh
