@@ -318,3 +318,37 @@ func TestReplaceArrayElement(t *testing.T) {
 		}
 	}
 }
+
+// Applying in place (for folds, which own the document) gives the same
+// documents as applying to a copy, step by step, including after a copy
+// whose source is changed later and a move.
+func TestApplyInPlaceMatchesCopy(t *testing.T) {
+	steps := []string{
+		`[{"op":"add","path":"","value":{"a":{"x":[1,2]},"b":[]}}]`,
+		`[{"op":"copy","from":"/a","path":"/c"}]`,
+		`[{"op":"add","path":"/a/x/-","value":3},{"op":"add","path":"/a/y","value":{"z":1}}]`,
+		`[{"op":"move","from":"/c","path":"/b/0"},{"op":"add","path":"/b/0/x/0","value":0}]`,
+		`[{"op":"remove","path":"/a/x/1"},{"op":"copy","from":"/b/0","path":"/d"},{"op":"replace","path":"/b/0/x","value":[]}]`,
+	}
+	var copied, inPlace any
+	exists := false
+	for i, s := range steps {
+		ops, err := Parse(jsonv.MustParse([]byte(s)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		c, _, err1 := Apply(copied, exists, ops, Options{})
+		p, _, err2 := Apply(inPlace, exists, ops, Options{InPlace: true})
+		if (err1 == nil) != (err2 == nil) {
+			t.Fatalf("step %d: errors %v, %v", i, err1, err2)
+		}
+		if err1 != nil {
+			// A fold stops at an error; in place, doc may be half changed.
+			t.Fatalf("step %d: %v", i, err1)
+		}
+		copied, inPlace, exists = c, p, true
+		if a, b := string(jsonv.Canonical(copied)), string(jsonv.Canonical(inPlace)); a != b {
+			t.Fatalf("step %d:\n copy     %s\n in place %s", i, a, b)
+		}
+	}
+}

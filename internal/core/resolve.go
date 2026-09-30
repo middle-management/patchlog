@@ -255,12 +255,15 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 		if err != nil {
 			return nil, err
 		}
-		doc, _, err = patch.Apply(doc, exists, ops, patch.Options{})
+		// The fold owns doc (parsed above), so the ops change it in place,
+		// and only the revision asked for is serialised and cached: copying
+		// and canonicalising the whole document at every step made a fold
+		// cost O(steps × size).
+		doc, _, err = patch.Apply(doc, exists, ops, patch.Options{InPlace: true})
 		if err != nil {
 			return nil, err
 		}
 		exists = true
-		t.cacheDoc(row.id, jsonv.Canonical(doc))
 	}
 	if !exists {
 		return nil, errors.New("no document")
@@ -268,7 +271,9 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 	if len(stack) == 0 {
 		return base, nil
 	}
-	return jsonv.Canonical(doc), nil
+	b := jsonv.Canonical(doc)
+	t.cacheDoc(r.id, b)
+	return b, nil
 }
 
 // horizonID returns the text id of a resource's horizon.

@@ -37,6 +37,9 @@ func (e *Error) Error() string {
 type Options struct {
 	// ResourceEnvelope enables the $nonce exclusion of §6.4.1.
 	ResourceEnvelope bool
+	// InPlace applies the ops to doc itself instead of a copy, for callers
+	// that own it (folding a log). On an error doc may be half changed.
+	InPlace bool
 }
 
 // Parse validates the structure of a patch set.
@@ -101,9 +104,12 @@ func WritesStrings(w []pointer.Pointer) []string {
 	return out
 }
 
-// Apply applies ops to doc without mutating it.
+// Apply applies ops to doc without mutating it (unless opt.InPlace).
 func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer, error) {
-	cur := jsonv.Clone(doc)
+	cur := doc
+	if !opt.InPlace {
+		cur = jsonv.Clone(doc)
+	}
 	have := exists
 	if !exists {
 		cur = nil
