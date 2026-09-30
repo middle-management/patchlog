@@ -276,6 +276,13 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 	// A sealed namespace's epoch key starts with the config write that
 	// begins its epoch (§E.2.1).
 	t.sealedConfigWritten(n, old, p.cfg)
+	if old.cachePublic() && !p.cfg.cachePublic() {
+		// Public copies at the edge must go (§9); every response of the
+		// namespace carries ns:{ns}. Its branches can't be public now
+		// (planConfig refuses while they are, sealed pairs aside, which
+		// keep serving ciphertext under their own tags).
+		t.tags = append(t.tags, "ns:"+n.name)
+	}
 	return seq
 }
 

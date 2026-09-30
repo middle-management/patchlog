@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]...
+//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -25,6 +25,7 @@ import (
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/cdnpurge"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/keystore"
@@ -72,13 +73,13 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
-                 [-master-key FILE [-master-key-create]] [-purge-url URL]...
+                 [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
   patchlog keygen
   patchlog grant mint -key SEED -block JSON [-seal]
   patchlog grant narrow -grant TOKEN -block JSON [-seal]
   patchlog grant seal -grant TOKEN      (grants are Biscuit v3 tokens)
-  patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false] [-purge-url URL]...
-  patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing] [-purge-url URL]...
+  patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false] [-purge-url URL]... [-edge-secret FILE]
+  patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing] [-purge-url URL]... [-edge-secret FILE]
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
@@ -119,7 +120,10 @@ func serve(args []string) {
 	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
 	var purgeURLs multi
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
+	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
+	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	fs.Parse(args)
+	ev := edgeVerifier(*edgeSecret, *edgeHeader)
 	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
 	if err != nil {
 		log.Fatal(err)
@@ -192,7 +196,7 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := &http.Server{Addr: *addr, Handler: handler(server.New(e), *pg, treeProxy), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("patchlog listening on %s (origin %s, dev=%v)", *addr, *origin, *dev)
 	if *pg {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
@@ -217,6 +221,24 @@ func serve(args []string) {
 }
 
 const purgeURLUsage = "CDN URL that cache-tag purges are sent to, as PURGE with X-Purge-Tags (repeatable; e.g. http://cdn:8080/ for deploy/varnish). Unset: purges are only logged"
+
+const (
+	edgeSecretUsage = "file holding the secret a grant-verifying edge sends in -edge-header (§9): private reads without it are refused (403 edge_required), verified ones get edge lifetimes. Unset: no verifying edge, and private responses are CDN-Cache-Control: no-store"
+	edgeHeaderUsage = "request header carrying -edge-secret"
+)
+
+// edgeVerifier returns the verifying edge of -edge-secret, or nil.
+func edgeVerifier(file, header string) *edge.Verifier {
+	if file == "" {
+		return nil
+	}
+	v, err := edge.Load(file, header)
+	if err != nil {
+		log.Fatalf("-edge-secret: %v", err)
+	}
+	log.Printf("verifying edge: private reads need %s", v.Header())
+	return v
+}
 
 // cdnPurger returns the HTTP purger for -purge-url flags, or nil (the
 // services' default purger then logs).

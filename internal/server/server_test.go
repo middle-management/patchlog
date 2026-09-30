@@ -499,8 +499,9 @@ func TestPrivateCaching(t *testing.T) {
 	if cc := r.H.Get("Cache-Control"); !strings.HasPrefix(cc, "private") {
 		t.Fatalf("private Cache-Control %q", cc)
 	}
-	if cc := r.H.Get("CDN-Cache-Control"); cc != "max-age=86400, s-maxage=31536000, immutable" {
-		t.Fatalf("CDN-Cache-Control %q", cc)
+	// No verifying edge (the default): no shared cache stores it.
+	if cc, sc := r.H.Get("CDN-Cache-Control"), r.H.Get("Surrogate-Control"); cc != "no-store" || sc != "no-store" {
+		t.Fatalf("CDN-Cache-Control %q, Surrogate-Control %q", cc, sc)
 	}
 	h := e.get("/r/priv/a")
 	if cc := h.H.Get("Cache-Control"); !strings.HasPrefix(cc, "private") {

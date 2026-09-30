@@ -2,6 +2,7 @@ package index_test
 
 import (
 	"context"
+	"net/http"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
 )
 
 func TestPrivateNamespace(t *testing.T) {
@@ -60,7 +62,8 @@ func TestPrivateNamespace(t *testing.T) {
 	}
 	at := r.header.Get("Location")
 	r = x.raw(at, bob)
-	if r.status != 200 || r.header.Get("Cache-Control") != "private, max-age=300" {
+	// No verifying edge (§9): no shared cache keeps a private result.
+	if r.status != 200 || r.header.Get("Cache-Control") != "private, max-age=300" || r.header.Get("CDN-Cache-Control") != "no-store" {
 		t.Fatalf("at: %d %v", r.status, r.header)
 	}
 	if got := strings.Join(resources(r.body), ","); got != "a,b,c" {
@@ -101,6 +104,38 @@ func TestPrivateNamespace(t *testing.T) {
 	// A reader's gs on a public-style URL of a private namespace is not served.
 	if r := x.raw("/sec/at/"+cp, onlyA); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/g/") {
 		t.Errorf("public url for a private ns: %d %s", r.status, r.header.Get("Location"))
+	}
+
+	// Behind a verifying edge (§9), private reads need its secret, and
+	// verified results get edge lifetimes.
+	ev, err := edge.New([]byte("s3cret"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	y := startSvcWith(t, indexer, svcOpts{db: filepath.Join(t.TempDir(), "e.db"), ns: []string{"sec"}, untyped: true, now: s.Now},
+		func(o *indexOpts) { o.Edge = ev })
+	y.caughtUp("sec")
+	get := func(path, secret string) *http.Response {
+		req := must(http.NewRequest("GET", y.http.URL+path, nil))
+		req.Header.Set("Authorization", "Bearer "+bob)
+		if secret != "" {
+			req.Header.Set(edge.DefaultHeader, secret)
+		}
+		res := must(noFollow.Do(req))
+		res.Body.Close()
+		return res
+	}
+	for _, secret := range []string{"", "wrong"} {
+		if res := get("/sec?q=secret", secret); res.StatusCode != 403 || res.Header.Get("Cache-Control") != "no-store" {
+			t.Errorf("secret %q: %d %v", secret, res.StatusCode, res.Header)
+		}
+	}
+	res := get("/sec?q=secret", "s3cret")
+	for res.StatusCode == 302 {
+		res = get(res.Header.Get("Location"), "s3cret")
+	}
+	if res.StatusCode != 200 || res.Header.Get("CDN-Cache-Control") != "max-age=31536000" {
+		t.Errorf("verified: %d %v", res.StatusCode, res.Header)
 	}
 }
 

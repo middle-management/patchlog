@@ -21,7 +21,9 @@ vcl 4.1;
 #   namespace answers a request with a grant exactly as one without (§7), and
 #   caches it publicly. Responses the origin marks `private` (non-public
 #   namespaces, §9 and §C.5) are not cached here, because this CDN doesn't
-#   verify edge grants: a cached copy would go to any caller. The one
+#   verify edge grants: a cached copy would go to any caller. The origins run
+#   without -edge-secret, so they already mark those responses
+#   CDN-Cache-Control: no-store; this rule is belt and braces. The one
 #   exception is a response that also says `Vary: Authorization`, which is
 #   cached per credential.
 # - `PURGE` (or `BAN`) with `X-Purge-Tags: tag1 tag2 …` from the compose

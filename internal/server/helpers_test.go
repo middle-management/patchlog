@@ -75,6 +75,12 @@ func withFileDB(t *testing.T) envOpt {
 
 func newEnv(t *testing.T, opts ...envOpt) *tenv {
 	t.Helper()
+	return newEnvWith(t, nil, opts...)
+}
+
+// newEnvWith is newEnv with server options.
+func newEnvWith(t *testing.T, sopts []Option, opts ...envOpt) *tenv {
+	t.Helper()
 	c := &clock{t: t0}
 	o := core.Options{Path: ":memory:", Origin: "https://cms.example", AuthDisabled: true, Now: c.Now, Purger: nopPurger{}}
 	for _, f := range opts {
@@ -84,7 +90,7 @@ func newEnv(t *testing.T, opts ...envOpt) *tenv {
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := httptest.NewServer(New(e))
+	srv := httptest.NewServer(New(e, sopts...))
 	env := &tenv{t: t, e: e, srv: srv, clock: c, auth: !o.AuthDisabled}
 	t.Cleanup(func() {
 		srv.CloseClientConnections()

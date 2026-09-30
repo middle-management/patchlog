@@ -14,19 +14,33 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Server is the HTTP API.
 type Server struct {
-	e   *core.Engine
-	mux *http.ServeMux
+	e    *core.Engine
+	mux  *http.ServeMux
+	edge *edge.Verifier // nil: no verifying edge (§9)
 }
 
+// Option configures a Server.
+type Option func(*Server)
+
+// WithEdge declares a verifying edge in front of the origin (§9): private
+// reads are served only to requests carrying its secret, with edge
+// lifetimes. Without it (or with nil) private responses are marked no-store
+// for shared caches.
+func WithEdge(v *edge.Verifier) Option { return func(s *Server) { s.edge = v } }
+
 // New builds the HTTP handler.
-func New(e *core.Engine) *Server {
+func New(e *core.Engine, opts ...Option) *Server {
 	s := &Server{e: e, mux: http.NewServeMux()}
+	for _, o := range opts {
+		o(s)
+	}
 	m := s.mux
 	m.HandleFunc("GET /{$}", s.root)
 
@@ -237,13 +251,18 @@ const (
 )
 
 // cache sets Cache-Control for a class, public or private (§9), and the
-// cache tags.
-func cache(w http.ResponseWriter, class string, public bool, tags ...string) {
+// cache tags. A private response gets the edge directives of s.edge: edge
+// lifetimes behind a verifying edge, no-store otherwise. It returns false,
+// having answered 403 instead, for a private response to a request that
+// didn't come through the verifying edge.
+func (s *Server) cache(w http.ResponseWriter, r *http.Request, class string, public bool, tags ...string) bool {
+	if !s.edgeAllow(w, r, public) {
+		return false
+	}
 	h := w.Header()
 	if public {
 		h.Set("Cache-Control", class)
 	} else {
-		edge := strings.TrimPrefix(class, "public, ")
 		switch class {
 		case ccImmutable:
 			h.Set("Cache-Control", "private, max-age=300")
@@ -252,12 +271,26 @@ func cache(w http.ResponseWriter, class string, public bool, tags ...string) {
 		default:
 			h.Set("Cache-Control", "private, max-age=0")
 		}
-		h.Set("CDN-Cache-Control", edge)
+		s.edge.Private(h, strings.TrimPrefix(class, "public, "))
 	}
 	if len(tags) > 0 {
 		h.Set("Cache-Tag", strings.Join(tags, ","))
 		h.Set("Surrogate-Key", strings.Join(tags, " "))
 	}
+	return true
+}
+
+// edgeAllow answers 403 edge_required, and returns false, for a private
+// response to a request without the verifying edge's secret, when the
+// origin is configured with one (§9). The origin has checked the grant
+// either way; this keeps responses fetched around the edge from being ones
+// the edge would cache without verifying.
+func (s *Server) edgeAllow(w http.ResponseWriter, r *http.Request, public bool) bool {
+	if s.edge.Allow(r, public) {
+		return true
+	}
+	writeErr(w, &core.Error{Status: 403, Body: map[string]any{"code": edge.Code, "message": edge.Message}})
+	return false
 }
 
 func noStore(w http.ResponseWriter) { w.Header().Set("Cache-Control", "no-store") }
@@ -281,17 +314,25 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 	}
 	switch h.State {
 	case core.NotFound:
-		cache(w, ccShort, h.Public)
+		if !s.cache(w, r, ccShort, h.Public) {
+			return
+		}
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	case core.Purged:
-		cache(w, ccLong, h.Public)
+		if !s.cache(w, r, ccLong, h.Public) {
+			return
+		}
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	case core.Tombstoned:
-		cache(w, ccHead, h.Public, resTags(ns, name)...)
+		if !s.cache(w, r, ccHead, h.Public, resTags(ns, name)...) {
+			return
+		}
 		w.Header().Set("ETag", quote(h.Head))
 		writeJSON(w, 410, map[string]any{"code": "gone", "tombstone": h.Head, "last": h.Last})
 	default:
-		cache(w, ccHead, h.Public, resTags(ns, name)...)
+		if !s.cache(w, r, ccHead, h.Public, resTags(ns, name)...) {
+			return
+		}
 		w.Header().Set("ETag", quote(h.Head))
 		w.Header().Set("Location", "/r/"+ns+"/"+name+"/rev/"+h.Head)
 		w.WriteHeader(302)
@@ -319,14 +360,18 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		if rev.FoldSince != "" {
 			loc += "?since=" + rev.FoldSince
 		}
-		cache(w, ccLong, rev.Public, resTags(ns, name)...)
+		if !s.cache(w, r, ccLong, rev.Public, resTags(ns, name)...) {
+			return
+		}
 		w.Header().Set("ETag", quote(id))
 		w.Header().Set("X-Revision", id)
 		w.Header().Set("X-E2E", "fold")
 		w.Header().Set("Location", loc)
 		w.WriteHeader(302)
 	case rev.Status == 200:
-		cache(w, ccImmutable, rev.Public, resTags(ns, name)...)
+		if !s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...) {
+			return
+		}
 		w.Header().Set("ETag", quote(id))
 		w.Header().Set("X-Revision", id)
 		if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, quote(id)) {
@@ -343,19 +388,27 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 			w.Write(body)
 		}
 	case rev.Status == 404:
-		cache(w, ccShort, rev.Public)
+		if !s.cache(w, r, ccShort, rev.Public) {
+			return
+		}
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	case rev.Code == "pruned":
-		cache(w, ccPruned, rev.Public, resTags(ns, name)...)
+		if !s.cache(w, r, ccPruned, rev.Public, resTags(ns, name)...) {
+			return
+		}
 		writeJSON(w, 410, prunedBody(rev.Horizon, rev.Archive))
 	case rev.Code == "tombstone":
 		// A tombstone id is immutable (§7.1).
-		cache(w, ccImmutable, rev.Public, resTags(ns, name)...)
+		if !s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...) {
+			return
+		}
 		w.Header().Set("ETag", quote(id))
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	default:
 		// A purge is "long".
-		cache(w, ccLong, rev.Public)
+		if !s.cache(w, r, ccLong, rev.Public) {
+			return
+		}
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
 }
@@ -371,24 +424,32 @@ func (s *Server) resourceRevLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	s.writeLog(w, lg, ns, resTags(ns, name))
+	s.writeLog(w, r, lg, ns, resTags(ns, name))
 }
 
-func (s *Server) writeLog(w http.ResponseWriter, lg *core.Log, ns string, tags []string) {
+func (s *Server) writeLog(w http.ResponseWriter, r *http.Request, lg *core.Log, ns string, tags []string) {
 	switch lg.Status {
 	case 200:
-		cache(w, ccImmutable, lg.Public, tags...)
+		if !s.cache(w, r, ccImmutable, lg.Public, tags...) {
+			return
+		}
 		writeLogBody(w, lg)
 	case 404:
-		cache(w, ccShort, lg.Public)
+		if !s.cache(w, r, ccShort, lg.Public) {
+			return
+		}
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	default:
 		if lg.Horizon != "" {
-			cache(w, ccPruned, lg.Public, tags...)
+			if !s.cache(w, r, ccPruned, lg.Public, tags...) {
+				return
+			}
 			writeJSON(w, 410, prunedBody(lg.Horizon, lg.Archive))
 			return
 		}
-		cache(w, ccLong, lg.Public)
+		if !s.cache(w, r, ccLong, lg.Public) {
+			return
+		}
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
 }
@@ -574,7 +635,9 @@ func (s *Server) nsHead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	cache(w, ccHead, info.Public, "ns:"+ns)
+	if !s.cache(w, r, ccHead, info.Public, "ns:"+ns) {
+		return
+	}
 	w.Header().Set("ETag", quote(info.Head))
 	w.Header().Set("X-Config-Revision", info.Config)
 	w.Header().Set("Location", "/ns/"+ns+"/rev/"+info.Head)
@@ -592,7 +655,9 @@ func (s *Server) nsRev(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	cache(w, ccImmutable, info.Public, "ns:"+ns)
+	if !s.cache(w, r, ccImmutable, info.Public, "ns:"+ns) {
+		return
+	}
 	w.Header().Set("ETag", quote(id))
 	w.Header().Set("X-Config-Revision", info.Config)
 	if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, quote(id)) {
@@ -621,7 +686,7 @@ func (s *Server) nsRevLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	s.writeLog(w, lg, ns, []string{"ns:" + ns})
+	s.writeLog(w, r, lg, ns, []string{"ns:" + ns})
 }
 
 func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
@@ -635,7 +700,9 @@ func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	cache(w, ccImmutable, page.Public, "ns:"+ns)
+	if !s.cache(w, r, ccImmutable, page.Public, "ns:"+ns) {
+		return
+	}
 	out := map[string]any{"items": page.Items}
 	if page.Next != "" {
 		out["next"] = page.Next
@@ -654,7 +721,9 @@ func (s *Server) nsBranches(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	cache(w, ccHead, public, "ns:"+ns)
+	if !s.cache(w, r, ccHead, public, "ns:"+ns) {
+		return
+	}
 	writeJSON(w, 200, list)
 }
 
@@ -969,14 +1038,20 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			return
 		}
 		if lg.Status != 200 {
-			s.writeLog(w, lg, ns, tags)
+			s.writeLog(w, r, lg, ns, tags)
 			return
 		}
 		if len(lg.Entries) > 0 {
+			if !s.setLive(w, r, lg.Public, fmt.Sprintf("public, max-age=0, s-maxage=%d", int(interval.Seconds())), tags) {
+				return
+			}
 			w.Header().Set(header, lg.Last)
 			w.Header().Set("X-Cursor", strconv.FormatInt(time.Now().UnixNano()/int64(interval), 10))
-			setLive(w, lg.Public, fmt.Sprintf("public, max-age=0, s-maxage=%d", int(interval.Seconds())), tags)
 			writeLogBody(w, lg)
+			return
+		}
+		// Refuse a private wait around the edge before waiting.
+		if !s.edgeAllow(w, r, lg.Public) {
 			return
 		}
 		select {
@@ -990,23 +1065,32 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		if reqCursor+1 > cur {
 			cur = reqCursor + 1
 		}
+		if !s.setLive(w, r, lg.Public, "public, max-age=0, s-maxage=2", tags) {
+			return
+		}
 		w.Header().Set(header, since)
 		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
-		setLive(w, lg.Public, "public, max-age=0, s-maxage=2", tags)
 		w.WriteHeader(204)
 		return
 	}
 }
 
-func setLive(w http.ResponseWriter, public bool, cc string, tags []string) {
+// setLive sets the headers of a long-poll answer (§7.7, §9); like cache it
+// returns false, having answered 403, for a private answer to a request that
+// didn't come through the verifying edge.
+func (s *Server) setLive(w http.ResponseWriter, r *http.Request, public bool, cc string, tags []string) bool {
+	if !s.edgeAllow(w, r, public) {
+		return false
+	}
 	if public {
 		w.Header().Set("Cache-Control", cc)
 	} else {
 		w.Header().Set("Cache-Control", "private, max-age=0")
-		w.Header().Set("CDN-Cache-Control", strings.TrimPrefix(cc, "public, "))
+		s.edge.Private(w.Header(), strings.TrimPrefix(cc, "public, "))
 	}
 	w.Header().Set("Cache-Tag", strings.Join(tags, ","))
 	w.Header().Set("Surrogate-Key", strings.Join(tags, " "))
+	return true
 }
 
 func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
@@ -1030,7 +1114,9 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, code, map[string]any{"code": map[int]string{404: "not_found", 410: "gone"}[code]})
 			return
 		}
-		cache(w, ccHead, h.Public, resTags(ns, name)...)
+		if !s.cache(w, r, ccHead, h.Public, resTags(ns, name)...) {
+			return
+		}
 		loc := "/r/" + ns + "/" + name + "/rev/" + h.Head + "/log"
 		if sn := r.URL.Query().Get("since"); sn != "" {
 			loc += "?since=" + sn
@@ -1057,7 +1143,9 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, err)
 			return
 		}
-		cache(w, ccHead, info.Public, "ns:"+ns)
+		if !s.cache(w, r, ccHead, info.Public, "ns:"+ns) {
+			return
+		}
 		loc := "/ns/" + ns + "/rev/" + info.Head + "/log"
 		if sn := r.URL.Query().Get("since"); sn != "" {
 			loc += "?since=" + sn

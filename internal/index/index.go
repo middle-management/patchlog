@@ -54,6 +54,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
@@ -94,6 +95,11 @@ type Options struct {
 	MinWait time.Duration
 	// Purger receives cache tag purges; default: log.
 	Purger Purger
+	// Edge is the verifying edge in front of the service (§9): private
+	// results are served only to requests carrying its secret, with edge
+	// lifetimes. Nil: there is none, and private responses are no-store
+	// for shared caches.
+	Edge *edge.Verifier
 	// Now is the clock for grant checks (default time.Now).
 	Now func() time.Time
 	// CheckerTTL is how long namespace documents are cached for grant

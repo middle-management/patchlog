@@ -14,6 +14,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/catalog"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/tree"
@@ -24,7 +25,7 @@ import (
 //
 //	patchlog tree -api URL -catalog NS [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME]
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]]
-//	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]...
+//	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //
 // The service follows the catalog namespace and every namespace in its
 // catalog.trust. -bearer is its own grant, which needs read on all of them.
@@ -61,6 +62,8 @@ func treeCmd(args []string) {
 	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
 	var purgeURLs multi
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
+	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
+	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	fs.Parse(args)
 
 	if *cat == "" {
@@ -87,6 +90,7 @@ func treeCmd(args []string) {
 	if purger != nil {
 		topt.Purger = purger
 	}
+	topt.Edge = edgeVerifier(*edgeSecret, *edgeHeader)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

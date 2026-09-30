@@ -58,6 +58,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 )
@@ -108,6 +109,11 @@ type Options struct {
 	CheckerTTL time.Duration
 	// Purger receives cache-tag purges (default: log).
 	Purger Purger
+	// Edge is the verifying edge in front of the service (§9): listings for
+	// readers with a grant are served only to requests carrying its
+	// secret, with edge lifetimes. Nil: there is none, and those listings
+	// are no-store for shared caches.
+	Edge *edge.Verifier
 	// Logf logs (default log.Printf).
 	Logf func(format string, args ...any)
 	// OnApply is called after each batch commits.

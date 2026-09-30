@@ -21,7 +21,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
-| Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack) |
+| Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only with `-edge-secret`) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
 | Bundles: history and snapshot export and import, sealed bundles, access levels, e2e ciphertext | §G.4, §G.5.1 | ✅ (`patchlog export/import`) |
@@ -49,9 +49,10 @@ and serves immutable, CDN-cacheable revisions.
   remote branches of a base that is itself a remote branch (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
-- CDN edge grants (§C.5): the origin checks grants itself on every read and sets
-  `Cache-Control: private` plus `CDN-Cache-Control` for non-public namespaces. The local
-  CDN therefore doesn't cache those (see [The local CDN](#the-local-cdn-9)).
+- CDN edge grants (§C.5): no edge grants are issued, and the origin checks grants itself on
+  every read. Both §9 deployments are supported: behind a grant-verifying edge
+  (`-edge-secret`) private content gets edge lifetimes, otherwise it is `no-store` for shared
+  caches (see [Private namespaces and the edge](#private-namespaces-and-the-edge)).
 - Author signatures (§C.3): a `Signature` header is stored with the revision and returned
   in the log, but not verified.
 
@@ -147,6 +148,43 @@ By hand:
 curl -X PURGE -H 'X-Purge-Tags: r:demo/derby' http://localhost:8080/
 ```
 
+A config write that makes a namespace's content non-public-cacheable (`read` from `public` to
+`grant`, unless the namespace is sealed or e2e, which stay publicly cacheable) purges `ns:{ns}`
+after it commits (§9), so no public copy outlives the change at the edge.
+
+#### Private namespaces and the edge
+
+§9 caches private (non-public, non-sealed) content at the edge only behind an edge that
+verifies grants, and the origin must know which deployment it is in:
+
+- **Without a verifying edge** (the default, and the compose stack: Varnish verifies nothing),
+  private responses carry `Cache-Control: private, …` plus `CDN-Cache-Control: no-store` and
+  `Surrogate-Control: no-store`, so no shared cache stores them. The origin checks the grant on
+  every request. Public and sealed responses are unchanged.
+- **With a verifying edge**, give `patchlog serve` the secret the edge sends once it has verified
+  a request: `-edge-secret FILE` (the file's content, surrounding whitespace ignored), in the
+  header `-edge-header` (default `X-Edge-Verified`). Private reads that don't carry it are
+  refused with `403 {"code":"edge_required"}` (`no-store`); the secret is compared in constant
+  time. Verified private responses get the §9 edge lifetimes in `CDN-Cache-Control`. The edge
+  must strip the header from client requests and set it itself.
+
+  What is gated: every cacheable read of a private namespace (resource and namespace heads,
+  revisions, logs, heads pages, branch lists, unknown-id `404`s, `410`s, long-polls, which are
+  refused before they wait). Not gated, because no shared cache ever stores them (`no-store`)
+  and the origin checks their grants itself: writes, batches, config writes, purges, `POST
+  /ns/{ns}/keys`, event streams (SSE), and error answers such as `401`/`403`. Public and sealed
+  reads never need the header.
+
+  `patchlog index` and `patchlog tree` take the same two flags for their private listings
+  (§A.4, §B.11.5): without `-edge-secret` those are `no-store` at the edge, with it they need the
+  header and get their edge lifetime. Their private head pointers depend on the caller's grant
+  and stay `no-store` either way.
+
+```sh
+head -c 32 /dev/urandom | base64 > edge.secret   # shared with the edge's configuration
+patchlog serve -edge-secret edge.secret           # the edge sends X-Edge-Verified: <secret>
+```
+
 **Bypassing it.** The origins answer directly on 9080 (core), 9081 (search) and 9082 (tree).
 `make cdn-restart` restarts Varnish, which reloads the VCL and empties the cache.
 
@@ -154,13 +192,14 @@ curl -X PURGE -H 'X-Purge-Tags: r:demo/derby' http://localhost:8080/
 
 - **No edge grants (§C.5).** A real deployment's edge verifies an edge grant on every request to
   a non-public namespace and serves the cached copy to anyone who holds one. This CDN verifies
-  nothing, so it doesn't cache responses marked `Cache-Control: private` at all (they pass, with
-  `X-Cache: PASS`), whatever `CDN-Cache-Control` says; the only exception is a response that also
-  says `Vary: Authorization`, which is cached per credential. Private namespaces therefore work
-  through the CDN but get no caching and no long-poll collapsing, and the origin doesn't require
-  proof that a request came through the edge. Public and sealed (E2) namespaces are cached
-  fully: a public namespace answers a request carrying a grant exactly as one without (§7), so
-  such requests are looked up in the cache too.
+  nothing, so compose runs the origins without `-edge-secret`: private responses come with
+  `CDN-Cache-Control: no-store` and pass (`X-Cache: PASS`). The VCL also refuses to cache
+  responses marked `Cache-Control: private` whatever `CDN-Cache-Control` says (belt and braces;
+  the only exception is a response that also says `Vary: Authorization`, which is cached per
+  credential). Private namespaces therefore work through the CDN but get no caching and no
+  long-poll collapsing. Public and sealed (E2) namespaces are cached fully: a public namespace
+  answers a request carrying a grant exactly as one without (§7), so such requests are looked
+  up in the cache too.
 - Head pointers can lag a write by up to 6 s (1 s TTL plus 5 s of stale-while-revalidate), as §9
   intends; clients that need their own write read the revision from `Location` or pass
   `?min=` to the services.
@@ -803,6 +842,7 @@ internal/grant      grants, keys, roles and verification (Addendum C)
 internal/core       storage and semantics (gate, batches, branches, purge, prune)
 internal/server     HTTP API
 internal/cdnpurge   HTTP cache-tag purges to a CDN (-purge-url)
+internal/edge       the verifying edge's secret and private edge directives (§9, -edge-secret)
 deploy/varnish      the compose stack's local CDN (Varnish VCL)
 ```
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -338,13 +339,22 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		}
 		return base + cp + "/g/" + v.gs + "/" + op
 	}
+	// Behind a verifying edge, private reads must come through it (§9).
+	if !s.opt.Edge.Allow(r, v.anon) {
+		w.Header().Set("Cache-Control", "no-store")
+		WriteError(w, http.StatusForbidden, edge.Code, edge.Message)
+		return
+	}
 	setPtr := func() {
 		if v.anon {
 			w.Header().Set("Cache-Control", ccHeadPointer)
 			w.Header().Set("Cache-Tag", "ns:"+cat)
 		} else {
+			// A pointer depends on the caller's grant: no shared cache
+			// keeps it, behind a verifying edge or not.
 			w.Header().Set("Cache-Control", ccPrivatePtr)
 			w.Header().Set("CDN-Cache-Control", "no-store")
+			w.Header().Set("Surrogate-Control", "no-store")
 			w.Header().Set("Vary", "Authorization")
 		}
 	}
@@ -477,16 +487,16 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		s.writeListing(w, v, at, st)
 		return
 	}
-	setListingHeaders(w, v, at, tags.header(cat, nss))
+	s.setListingHeaders(w, v, at, tags.header(cat, nss))
 	WriteJSON(w, http.StatusOK, body)
 }
 
-func setListingHeaders(w http.ResponseWriter, v *viewer, at, tags string) {
+func (s *Service) setListingHeaders(w http.ResponseWriter, v *viewer, at, tags string) {
 	if v.anon {
 		w.Header().Set("Cache-Control", ccListing)
 	} else {
 		w.Header().Set("Cache-Control", ccPrivateList)
-		w.Header().Set("CDN-Cache-Control", cdnListing)
+		s.opt.Edge.Private(w.Header(), cdnListing)
 	}
 	w.Header().Set("Cache-Tag", tags)
 	w.Header().Set("X-Namespace-Revision", at)
@@ -496,7 +506,7 @@ func setListingHeaders(w http.ResponseWriter, v *viewer, at, tags string) {
 // or the JSON with per-node sealed titles, with the Cache-Tag it was
 // stored with.
 func (s *Service) writeListing(w http.ResponseWriter, v *viewer, at string, st derived.Stored) {
-	setListingHeaders(w, v, at, st.Tags)
+	s.setListingHeaders(w, v, at, st.Tags)
 	if st.JSON {
 		w.Header().Set("Content-Type", "application/json")
 	} else {

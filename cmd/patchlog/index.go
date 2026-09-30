@@ -17,6 +17,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/index"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -26,7 +27,7 @@ import (
 //
 //	patchlog index [-api http://localhost:8080] [-db index.db] [-addr :8081] -ns matches,docs
 //	               [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
-//	               [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]...
+//	               [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //
 // Results at /{ns}/at/{ns_id} are immutable and tagged idx:{ns} and
 // r:{ns}/{name} per hit; only the current checkpoint's results are kept.
@@ -57,6 +58,8 @@ func indexCmd(args []string) {
 	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
 	var purgeURLs multi
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
+	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
+	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	fs.Parse(args)
 
 	var nss []string
@@ -94,6 +97,7 @@ func indexCmd(args []string) {
 	if purger != nil {
 		opt.Purger = purger
 	}
+	opt.Edge = edgeVerifier(*edgeSecret, *edgeHeader)
 	// The core may still be starting: retry reading its origin.
 	var ix *index.Index
 	for {

@@ -653,7 +653,8 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 		if r.status != 200 {
 			t.Fatalf("GET %s: %d %v", loc, r.status, r.body)
 		}
-		if r.header.Get("Cache-Control") != "private, max-age=300" || r.header.Get("CDN-Cache-Control") != "max-age=31536000" {
+		// No verifying edge (Options.Edge): no shared cache keeps it (§9).
+		if r.header.Get("Cache-Control") != "private, max-age=300" || r.header.Get("CDN-Cache-Control") != "no-store" || r.header.Get("Surrogate-Control") != "no-store" {
 			t.Errorf("listing cache headers %v", r.header)
 		}
 		return r.body, loc
