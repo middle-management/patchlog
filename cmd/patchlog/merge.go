@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/janitor"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/merge"
@@ -147,10 +148,11 @@ func mergeCmd(args []string) {
 		}
 	}
 
+	hints := mergeHints(p, tf)
 	switch sub {
 	case "status":
 		if *tf.asJSON {
-			printJSON(map[string]any{"target": p.Target, "branch": p.Branch, "branchAt": p.BranchAt, "resources": p.Status()})
+			printJSON(map[string]any{"target": p.Target, "branch": p.Branch, "branchAt": p.BranchAt, "resources": p.Status(), "hints": hints})
 			return
 		}
 		fmt.Printf("%s → %s (branch at %s)\n", p.Branch, p.Target, short(p.BranchAt))
@@ -167,14 +169,18 @@ func mergeCmd(args []string) {
 				line += "  (" + s.Note + ")"
 			}
 			fmt.Println(line)
+			if s.Pair != nil {
+				fmt.Printf("      %s\n", s.Pair)
+			}
 		}
 		if len(p.Resources) == 0 {
 			fmt.Println("  (the branch changed nothing)")
 		}
+		printHints(hints)
 	case "plan":
 		dry, derr := p.DryRun(ctx)
 		if *tf.asJSON {
-			out := map[string]any{"plan": p, "clean": p.Clean(), "batch": batchJSON(p)}
+			out := map[string]any{"plan": p, "clean": p.Clean(), "batch": batchJSON(p), "hints": hints}
 			if dry != nil {
 				out["dryRun"] = dry.Items
 			}
@@ -209,13 +215,15 @@ func mergeCmd(args []string) {
 				fmt.Printf("  %-28s → %s\n", it.Resource, strings.Join(shortAll(it.IDs), " "))
 			}
 		}
+		printHints(hints)
 	case "apply":
 		res, err := p.Apply(ctx)
 		if errors.Is(err, merge.ErrConflicts) {
 			if *tf.asJSON {
-				printJSON(map[string]any{"plan": p, "clean": false, "error": err.Error()})
+				printJSON(map[string]any{"plan": p, "clean": false, "error": err.Error(), "hints": hints})
 			} else {
 				printPlan(p)
+				printHints(hints)
 				fmt.Fprintln(os.Stderr, "not merged: resolve the conflicting resources with -resolve name=file.json")
 			}
 			os.Exit(1)
@@ -283,11 +291,18 @@ func printPlan(p *merge.Plan) {
 			}
 		}
 		if r.Dropped {
-			line += " kept as in the target"
+			if r.Kept {
+				line += " (kept as in the target, recorded so a later merge has its pair)"
+			} else {
+				line += " kept as in the target, not recorded: stays unmerged"
+			}
 		}
 		fmt.Println(line)
 		if r.Ancestor != "" && r.Class == merge.Replay {
 			fmt.Printf("      from ancestor %s; branch writes %v, target writes %v\n", short(r.Ancestor), r.BranchWrites, r.BaseWrites)
+		}
+		if r.Pair != nil {
+			fmt.Printf("      %s\n", r.Pair)
 		}
 		for _, c := range r.Conflicts {
 			fmt.Printf("      CONFLICT %s: %s %v\n", c.Kind, c.Message, c.Paths)
@@ -298,6 +313,41 @@ func printPlan(p *merge.Plan) {
 	}
 	if !p.Clean() {
 		fmt.Println("needs a person: resolve with -resolve name=file.json (a patch set against the target's head)")
+	}
+}
+
+// mergeHints explains merge.authors (§F.3): the plan's own hints (no
+// merge.authors in the target, earlier merge batches that don't count),
+// plus one if the merger itself isn't listed, so its batch won't serve as
+// a common ancestor for a later merge, nor verify a merged claim for the
+// janitor (§F.6). The merger is the root sub and kid of -bearer, or the
+// -author of a development server (no kid).
+func mergeHints(p *merge.Plan, tf toolFlags) []string {
+	hints := p.Hints()
+	if !p.AuthorsDeclared {
+		return hints
+	}
+	sub, kid := *tf.author, ""
+	if *tf.bearer != "" {
+		g, err := grant.Decode(*tf.bearer, 0)
+		if err != nil || len(g.Blocks) == 0 {
+			return hints
+		}
+		sub, kid = g.Blocks[0].Sub, g.Blocks[0].Kid
+	}
+	if sub == "" || merge.Listed(p.MergeAuthors, sub, kid) {
+		return hints
+	}
+	who := sub
+	if kid != "" {
+		who += "/" + kid
+	}
+	return append(hints, fmt.Sprintf("you (%s) aren't in %s's merge.authors: this merge won't count as a common ancestor for a later merge of %s, and the janitor won't accept it for a merged claim; merge as a listed principal, or rebase the branch (§F.5) before merging it again", who, p.Target, p.Branch))
+}
+
+func printHints(hints []string) {
+	for _, h := range hints {
+		fmt.Println("hint:", h)
 	}
 }
 

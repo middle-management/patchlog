@@ -42,6 +42,8 @@ func ops(o ...map[string]any) []any {
 	return out
 }
 
+var devAuthors = map[string]any{"authors": []any{map[string]any{"sub": "alice", "kid": "dev"}}}
+
 type env struct {
 	t *testing.T
 	s *clienttest.Server
@@ -52,7 +54,9 @@ func newEnv(t *testing.T) *env {
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
 	e := &env{t: t, s: s, c: c}
-	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public"}))
+	// Authentication is off, so entries carry no kid and merge.authors
+	// matches on sub alone (merge.Listed).
+	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public", "merge": devAuthors}))
 	e.create("matches", "derby", map[string]any{"title": "Derby", "score": "0-0", "blocks": []any{"a", "b", "c"}})
 	e.create("matches", "cup", map[string]any{"title": "Cup", "score": "1-1"})
 	return e

@@ -8,6 +8,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/janitor"
 	"github.com/middle-management/patchlog/internal/merge"
 )
@@ -27,6 +28,8 @@ func op(o, path string, v any) map[string]any {
 	return map[string]any{"op": o, "path": path, "value": v}
 }
 
+var devAuthors = map[string]any{"authors": []any{map[string]any{"sub": "alice", "kid": "dev"}}}
+
 type env struct {
 	t *testing.T
 	s *clienttest.Server
@@ -37,7 +40,9 @@ func newEnv(t *testing.T, baseDoc map[string]any) *env {
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
 	if baseDoc == nil {
-		baseDoc = map[string]any{"read": "public"}
+		// Authentication is off: entries carry no kid, so merge.authors
+		// matches alice on sub alone (merge.Listed).
+		baseDoc = map[string]any{"read": "public", "merge": devAuthors}
 	}
 	must(c.CreateNamespace(ctx, "matches", baseDoc))
 	must(c.CreateDoc(ctx, "matches", "derby", map[string]any{"score": "0-0"}))
@@ -211,7 +216,7 @@ func TestDependentsLeavesFirst(t *testing.T) {
 }
 
 func TestBaseMinimum(t *testing.T) {
-	e := newEnv(t, map[string]any{"read": "public", "cleanup": map[string]any{"merged": "P30D"}})
+	e := newEnv(t, map[string]any{"read": "public", "merge": devAuthors, "cleanup": map[string]any{"merged": "P30D"}})
 	e.branch("matches", "r7", map[string]any{"merged": "P1D"}) // shorter than the base allows
 	e.edit("r7", "derby", "1-0")
 	must(merge.Freeze(ctx, e.c, "r7", e.merge("r7")))
@@ -310,5 +315,54 @@ func TestRunPurgesOnSchedule(t *testing.T) {
 		case <-rctx.Done():
 			t.Fatal("not purged by Run")
 		}
+	}
+}
+
+// With authentication on, a merged claim counts only if the merge batch's
+// author (root sub and kid) is in the base's merge.authors.
+func TestMergedClaimNeedsListedAuthor(t *testing.T) {
+	for _, tc := range []struct {
+		name, sub string
+		listedKey bool
+		want      string
+	}{
+		{"listed", "svc:merge", true, janitor.ActionPurged},
+		{"other sub", "user:ed", true, janitor.ActionKeep},
+		{"other kid", "svc:merge", false, janitor.ActionKeep},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := clienttest.New(t, clienttest.Options{Auth: true})
+			ops, other := clienttest.NewKey("ops-2026"), clienttest.NewKey("other")
+			grantFor := func(k clienttest.Key, sub string) *client.Client {
+				return s.Client(t, client.WithBearer(k.Grant(t, s.Now(), sub, []string{"matches", "r7"}, grant.Verbs,
+					map[string]any{"exp": s.Now().Add(30 * day).Format(time.RFC3339)})))
+			}
+			must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "matches"))).CreateNamespace(ctx, "matches", map[string]any{
+				"read":  "public",
+				"keys":  []any{ops.Entry("*"), other.Entry("*")},
+				"merge": map[string]any{"authors": []any{map[string]any{"sub": "svc:merge", "kid": "ops-2026"}}},
+			}))
+			ed := grantFor(ops, "user:ed")
+			e := &env{t: t, s: s, c: ed}
+			must(ed.CreateDoc(ctx, "matches", "derby", map[string]any{"score": "0-0"}))
+			e.branch("matches", "r7", map[string]any{"merged": "P1D"})
+			e.edit("r7", "derby", "1-0")
+			k := ops
+			if !tc.listedKey {
+				k = other
+			}
+			m := grantFor(k, tc.sub)
+			res := must(must(merge.NewPlan(ctx, m, "matches", "r7", merge.Options{})).Apply(ctx))
+			must(merge.Freeze(ctx, m, "r7", res.NSID))
+			s.Clock.Advance(2 * day)
+			j := janitor.New(grantFor(ops, "svc:janitor"), janitor.Options{Bases: []string{"matches"}, Now: s.Clock.Now})
+			ds := must(j.Sweep(ctx))
+			if len(ds) != 1 || ds[0].Action != tc.want {
+				t.Fatalf("decisions %+v, want %s", ds, tc.want)
+			}
+			if tc.want == janitor.ActionKeep && !strings.Contains(ds[0].Reason, "merge.authors") {
+				t.Fatalf("reason %q", ds[0].Reason)
+			}
+		})
 	}
 }

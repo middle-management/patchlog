@@ -21,13 +21,18 @@
 //
 // Verification (§F.6):
 //
-//   - merged: the base's log has a batch without origin whose source.ns is
-//     the branch and whose source.at is in the branch's chain, and the
-//     branch's log has no head, tombstone or batch entry after that
-//     source.at. Config, prune and propagated purge entries are allowed.
+//   - merged: the base's log has a batch without origin, by a principal
+//     listed in the base's current merge.authors (root sub and kid, matched
+//     as in merge.Listed), whose source.ns is the branch and whose
+//     source.at is in the branch's chain, and the branch's log has no head,
+//     tombstone or batch entry after that source.at. Config, prune and
+//     propagated purge entries are allowed. A base without merge.authors
+//     never verifies a merged claim this way.
 //   - superseded: the successor exists, isn't purged, has the same base
-//     namespace, and its log has such a batch, with nothing after it in the
-//     branch.
+//     namespace, and its log has a batch without origin whose source.ns is
+//     the branch and whose source.at is in the branch's chain, with nothing
+//     after it in the branch. §F.6 asks for no merge.authors check here:
+//     the successor is a branch too, and its batches are the rebase.
 //   - a branch with no head, tombstone or batch entry of its own counts as
 //     merged.
 //
@@ -313,16 +318,25 @@ func hasDocEntries(log []client.NSEntry, i int) bool {
 
 // coveredBy finds the latest merge batch of branch in entries whose
 // source.at is in the branch's chain, and checks that the branch changed no
-// document after it.
-func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry) (bool, string) {
+// document after it. If authors is non-nil, only batches by a principal
+// listed in *authors count.
+func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author) (bool, string) {
 	pos := map[string]int{}
 	for i, e := range blog {
 		pos[e.ID] = i
 	}
 	best, found := -1, false
-	forged := 0
+	forged, untrusted := 0, []string{}
 	for _, e := range entries {
 		if !merge.IsMergeOf(e, branch) {
+			continue
+		}
+		if authors != nil && !merge.Listed(*authors, e.Author, e.Kid) {
+			who := e.Author
+			if e.Kid != "" {
+				who += "/" + e.Kid
+			}
+			untrusted = append(untrusted, e.ID+" by "+who)
 			continue
 		}
 		at, _ := e.Source["at"].(string)
@@ -337,6 +351,9 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry) (
 		}
 	}
 	if !found {
+		if len(untrusted) > 0 {
+			return false, "no merge batch is by a principal in the base's merge.authors (" + strings.Join(untrusted, ", ") + ")"
+		}
 		if forged > 0 {
 			return false, "its batches' source.at is not in the branch's chain"
 		}
@@ -360,7 +377,15 @@ func (j *Janitor) verifyMerged(ctx context.Context, base, at, ns string, blog []
 	if err != nil {
 		return false, "", err
 	}
-	ok, why := coveredBy(entries, ns, blog)
+	bdoc, err := j.c.NSDoc(ctx, base, bh.ID)
+	if err != nil {
+		return false, "", err
+	}
+	authors, declared := merge.MergeAuthors(bdoc.Value)
+	if !declared {
+		return false, "the base " + base + " declares no merge.authors, so no merge batch can be trusted (§F.3)", nil
+	}
+	ok, why := coveredBy(entries, ns, blog, &authors)
 	return ok, why, nil
 }
 
@@ -400,7 +425,8 @@ func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, b
 	if err != nil {
 		return false, "", err
 	}
-	ok, why := coveredBy(entries, ns, blog)
+	// §F.6 names no merge.authors check for the successor's batch.
+	ok, why := coveredBy(entries, ns, blog, nil)
 	return ok, why, nil
 }
 

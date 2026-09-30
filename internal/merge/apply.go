@@ -53,7 +53,11 @@ func (p *Plan) Resource(name string) *Resource {
 
 // Resolve replaces a resource's steps with a resolution written against
 // the target's current head B (§F.3), usually one patch set. With no steps
-// the resource is dropped: the target is kept as it is. A resolution only
+// the resource is dropped: the target is kept as it is. If B is a live
+// document the batch still records it, with an empty step (a nonce-only
+// patch set in a sealed namespace), so a later merge has its pair (§F.3);
+// if B is a tombstone or absent it can't be recorded, gets no item and
+// stays unmerged, so the next merge offers it again. A resolution only
 // holds while B stays the same; if Apply finds B moved, the resource
 // becomes a stale_resolution conflict again.
 func (p *Plan) Resolve(name string, steps ...client.Step) error {
@@ -75,7 +79,13 @@ func (p *Plan) applyResolution(r *Resource, steps []client.Step) {
 	r.Expected, r.Squashed = nil, false
 	r.IfMatch, r.IfNoneMatch = r.Base, r.Base == ""
 	if len(steps) == 0 {
-		r.Dropped, r.Resolved, r.Steps = true, true, nil
+		r.Dropped, r.Resolved, r.Steps, r.Kept = true, true, nil, false
+		if r.BaseState == client.Live.String() {
+			r.Kept, r.Steps = true, []client.Step{p.keepStep()}
+		} else {
+			r.IfMatch, r.IfNoneMatch = "", false
+			r.Note = "kept as in the target, whose head is " + map[bool]string{true: "a tombstone", false: "absent"}[r.BaseState == client.Tombstoned.String()] + ": this can't be recorded in the batch, so the resource stays unmerged and is offered again (§F.3)"
+		}
 		return
 	}
 	r.Steps = steps
@@ -132,7 +142,8 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 }
 
 // Batch builds the batch request: one item per resource with an item, the
-// explicit config change if any, and source { ns: branch, at: branchAt }.
+// explicit config change if any, and source { ns: branch, at: branchAt },
+// where branchAt is the branch revision the plan was classified from.
 func (p *Plan) Batch() client.BatchRequest {
 	req := client.BatchRequest{Source: map[string]any{"ns": p.Branch, "at": p.BranchAt}}
 	for _, r := range p.Items() {
@@ -195,7 +206,10 @@ type Result struct {
 
 // Apply submits the batch with source { ns: branch, at: branchAt }. If the
 // target moved meanwhile, the failing items (412) are re-classified and the
-// batch resubmitted, up to MaxRetries times. It returns ErrConflicts when a
+// batch resubmitted, up to MaxRetries times. Re-classification reads the
+// target again but keeps the branch revision the plan was built from, so
+// source.at stays the revision every item was classified from; work the
+// branch got meanwhile is left for the next merge. It returns ErrConflicts when a
 // resource needs a person, before or after re-classification.
 func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 	for attempt := 1; ; attempt++ {

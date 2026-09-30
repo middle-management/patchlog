@@ -86,8 +86,13 @@ type NSEntry struct {
 	Source    map[string]any // batch: optional provenance
 	HasSource bool
 	Author    string
-	Created   string
-	Raw       map[string]any // the entry as served
+	// Kid is the root key id of the grant the entry was written under, as
+	// the server exposes it (not part of the hashed entry, like Author and
+	// Created). "" with authentication disabled, or for entries written
+	// before servers recorded it.
+	Kid     string
+	Created string
+	Raw     map[string]any // the entry as served
 }
 
 // IsResource reports whether the entry concerns one resource (head,
@@ -109,7 +114,7 @@ func ParseNSEntry(v any) (NSEntry, error) {
 	e := NSEntry{
 		ID: str(m, "id"), Prev: str(m, "prev"), Kind: str(m, "kind"), Resource: str(m, "resource"),
 		Name: str(m, "name"), At: str(m, "at"), Target: str(m, "target"),
-		Author: str(m, "author"), Created: str(m, "created"), Raw: m,
+		Author: str(m, "author"), Kid: str(m, "kid"), Created: str(m, "created"), Raw: m,
 	}
 	e.Remote, _ = m["remote"].(map[string]any)
 	if s, has := m["source"]; has {

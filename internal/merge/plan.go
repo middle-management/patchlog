@@ -16,12 +16,30 @@
 //   - nothing, when the target already has the branch head (or more), or the
 //     resource was purged (reported).
 //
-// Merge points: when the target's log already holds a merge batch whose
-// source is the branch (an earlier replayed merge, or the first pass of a
-// rebase), the branch revision it merged and the target revision it
-// produced are treated as a common ancestor. A second merge after a replay
-// then picks up exactly the branch's new entries, instead of replaying the
-// already merged ones again.
+// Merge points (§F.3): when the target's log already holds a merge batch of
+// the branch (an earlier replayed merge, or the first pass of a rebase),
+// the branch revision as of its source.at and the target revision it
+// produced are treated as a common ancestor. Per resource, the pair comes
+// from the most recent such batch with an entry for it. A second merge
+// after a replay then picks up exactly the branch's new entries, instead of
+// replaying the already merged ones again. source is asserted, not
+// verified, so only batches without origin, whose source.ns is the branch
+// and whose author (root sub and kid) is listed in the target's
+// merge.authors count (see Listed). Without merge.authors there are no
+// merge points: classification falls back to ancestry by ids, and a second
+// merge after a replay conflicts; such a branch should be rebased (§F.5).
+//
+// A resource resolved by keeping the target's version (Resolve with no
+// steps) is still recorded in the batch with an empty step [] (in a sealed
+// namespace, a patch set that only adds a fresh $nonce), so the batch holds
+// its pair, but only when the target's head is a live document. On a
+// tombstone or an absent resource that would restore or fail, so the
+// resource gets no item: it stays unmerged and is offered again.
+//
+// The batch's source.at is the branch revision the plan was classified
+// from (BranchAt), never a later one: re-classification after a 412 only
+// reads the target again, and a plan built later (NewPlan) reads the
+// branch's new head and uses that as its source.at.
 package merge
 
 import (
@@ -32,6 +50,7 @@ import (
 	"sort"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Class is a resource's classification by ancestry (§F.3).
@@ -99,8 +118,15 @@ type Resource struct {
 	Conflicts    []Conflict `json:"conflicts,omitempty"`
 	Resolved     bool       `json:"resolved,omitempty"`
 	Dropped      bool       `json:"dropped,omitempty"` // resolved by keeping the target as is
-	Squashed     bool       `json:"squashed,omitempty"`
-	Note         string     `json:"note,omitempty"`
+	// Kept: dropped, and recorded in the batch with an empty step (a
+	// nonce-only one in a sealed namespace), so the batch holds the pair.
+	// A dropped resource that isn't Kept stays unmerged.
+	Kept bool `json:"kept,omitempty"`
+	// Pair is the common-ancestor pair from the most recent trusted merge
+	// batch with an entry for the resource, if any (§F.3).
+	Pair     *Pair  `json:"pair,omitempty"`
+	Squashed bool   `json:"squashed,omitempty"`
+	Note     string `json:"note,omitempty"`
 
 	branchPurged bool
 	resolution   []client.Step
@@ -136,7 +162,7 @@ func (r *Resource) NeedsPerson() bool { return len(r.Conflicts) > 0 && !r.Resolv
 // HasItem reports whether the resource contributes a batch item.
 func (r *Resource) HasItem() bool {
 	if r.Dropped {
-		return false
+		return r.Kept && len(r.Steps) > 0
 	}
 	return (r.Class == FastForward || r.Class == Replay) && len(r.Steps) > 0
 }
@@ -198,13 +224,45 @@ type Plan struct {
 
 	Resources []*Resource `json:"resources"`
 
-	opt    Options
-	points map[string][]mergePoint // per resource
-	logs   map[string]ancestry     // cache: ns/name@head
+	// MergeAuthors is the target's merge.authors; AuthorsDeclared is false
+	// when its namespace document has none (then there are no merge
+	// points).
+	MergeAuthors    []Author `json:"mergeAuthors,omitempty"`
+	AuthorsDeclared bool     `json:"authorsDeclared"`
+	// Ignored lists the earlier merge batches of the branch in the target
+	// that don't count as merge points, with the reason.
+	Ignored []MergeBatch `json:"ignoredMerges,omitempty"`
+	// TargetLevel is the target's encryption level ("", "at-rest",
+	// "sealed").
+	TargetLevel string `json:"targetLevel,omitempty"`
+
+	opt        Options
+	points     map[string]Pair         // per resource: the most recent trusted pair
+	ignoredFor map[string][]MergeBatch // per resource: untrusted batches with an entry for it
+	logs       map[string]ancestry     // cache: ns/name@head
 }
 
-type mergePoint struct {
-	branchID, targetID string
+// Pair is a common ancestor from an earlier merge batch (§F.3): the branch
+// revision as of the batch's source.at and the target revision the batch
+// produced for the resource.
+type Pair struct {
+	Batch  string `json:"batch"`  // the batch entry's ns_id in the target
+	Author string `json:"author"` // its root sub
+	Kid    string `json:"kid,omitempty"`
+	At     string `json:"at"`     // its source.at
+	Branch string `json:"branch"` // branch revision as of At
+	Target string `json:"target"` // target revision from the batch
+	// Used: the pair is the common ancestor the classification started
+	// from (a later common ancestor by ids wins).
+	Used bool `json:"used,omitempty"`
+}
+
+// MergeBatch is an earlier merge batch of the branch that isn't trusted.
+type MergeBatch struct {
+	Batch  string `json:"batch"`
+	Author string `json:"author"`
+	Kid    string `json:"kid,omitempty"`
+	Reason string `json:"reason"`
 }
 
 type ancestry struct {
@@ -230,6 +288,9 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		if err != nil {
 			return nil, fmt.Errorf("merge: %s: %w", ns, err)
 		}
+		if ns == target {
+			p.TargetLevel = lv
+		}
 		if lv == "e2e" {
 			return nil, fmt.Errorf("merge: %s is an e2e namespace (Addendum E.3): its merges must decrypt and re-encrypt under the target's keys in a client holding both, never fast-forward (§F.8); this merge tool doesn't support that", ns)
 		}
@@ -252,6 +313,11 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		return nil, fmt.Errorf("merge: target %s: %w", target, err)
 	}
 	p.TargetAt, p.TargetConfig = th.ID, th.Config
+	tdoc, err := c.NSDoc(ctx, target, th.ID)
+	if err != nil {
+		return nil, fmt.Errorf("merge: target %s: %w", target, err)
+	}
+	p.MergeAuthors, p.AuthorsDeclared = MergeAuthors(tdoc.Value)
 
 	changed := Collect(blog)
 	var only map[string]bool
@@ -367,7 +433,7 @@ func headsAt(log []client.NSEntry, at string) map[string]string {
 }
 
 func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since string) error {
-	p.points = map[string][]mergePoint{}
+	p.points, p.ignoredFor = map[string]Pair{}, map[string][]MergeBatch{}
 	tlog, err := p.c.NSLog(ctx, p.Target, p.TargetAt, since)
 	if client.IsNotFound(err) && since != "" {
 		tlog, err = p.c.NSLog(ctx, p.Target, p.TargetAt, "")
@@ -375,8 +441,25 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 	if err != nil {
 		return fmt.Errorf("merge: target %s log: %w", p.Target, err)
 	}
+	// Oldest first, so a later batch's pair replaces an earlier one.
 	for _, e := range tlog {
 		if !IsMergeOf(e, p.Branch) {
+			continue
+		}
+		mb := MergeBatch{Batch: e.ID, Author: e.Author, Kid: e.Kid}
+		switch {
+		case !p.AuthorsDeclared:
+			mb.Reason = "the target declares no merge.authors"
+		case !Listed(p.MergeAuthors, e.Author, e.Kid):
+			mb.Reason = "its author " + principal(e.Author, e.Kid) + " is not in the target's merge.authors"
+		}
+		if mb.Reason != "" {
+			p.Ignored = append(p.Ignored, mb)
+			for _, s := range e.Entries {
+				if s.Kind == "head" || s.Kind == "tombstone" {
+					p.ignoredFor[s.Resource] = append(p.ignoredFor[s.Resource], mb)
+				}
+			}
 			continue
 		}
 		at, _ := e.Source["at"].(string)
@@ -389,11 +472,34 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 				continue
 			}
 			if bid, ok := heads[s.Resource]; ok {
-				p.points[s.Resource] = append(p.points[s.Resource], mergePoint{branchID: bid, targetID: s.Target})
+				p.points[s.Resource] = Pair{Batch: e.ID, Author: e.Author, Kid: e.Kid, At: at, Branch: bid, Target: s.Target}
 			}
 		}
 	}
 	return nil
+}
+
+func principal(sub, kid string) string {
+	if kid == "" {
+		return sub + " (no kid)"
+	}
+	return sub + "/" + kid
+}
+
+// Hints explains, in words, why earlier merge batches were or weren't used
+// as common ancestors (§F.3).
+func (p *Plan) Hints() []string {
+	var out []string
+	if !p.AuthorsDeclared {
+		out = append(out, p.Target+" declares no merge.authors: earlier merge batches aren't used as common ancestors (§F.3), so after a replayed merge a second merge conflicts; rebase the branch (§F.5) before merging it again, or have a * key holder add \"merge\": { \"authors\": [{ \"sub\", \"kid\" }] } to "+p.Target)
+	}
+	for _, mb := range p.Ignored {
+		if !p.AuthorsDeclared {
+			break
+		}
+		out = append(out, "merge batch "+mb.Batch+" from "+p.Branch+" doesn't count as a common ancestor: "+mb.Reason+"; if it replayed resources, rebase the branch (§F.5) before merging it again")
+	}
+	return out
 }
 
 // IsMergeOf reports whether e is a batch entry without origin whose
@@ -451,7 +557,7 @@ func (r *Resource) reset() {
 	r.Ancestor, r.TargetAncestor = "", ""
 	r.IfMatch, r.IfNoneMatch, r.Steps, r.Expected = "", false, nil, nil
 	r.BranchWrites, r.BaseWrites, r.Conflicts = nil, nil, nil
-	r.Squashed, r.Note = false, ""
+	r.Squashed, r.Note, r.Kept, r.Pair = false, "", false, nil
 }
 
 func (r *Resource) conflict(kind, msg string, paths ...string) {
@@ -586,17 +692,21 @@ func (p *Plan) classifyAncestry(ctx context.Context, r *Resource, h *client.Head
 			break
 		}
 	}
-	// A later merge point from an earlier merge batch wins.
-	for _, mp := range p.points[r.Name] {
-		mh := indexOf(hes, mp.branchID)
-		mb, ok := inB[mp.targetID]
-		if mh < 0 || !ok || mh <= hi {
-			continue
+	// The pair from the most recent trusted merge batch, if it is later
+	// than the common ancestor by ids.
+	if mp, ok := p.points[r.Name]; ok {
+		pair := mp
+		r.Pair = &pair
+		mh := indexOf(hes, mp.Branch)
+		mb, ok := inB[mp.Target]
+		if mh >= 0 && ok && mh > hi {
+			hi, bi = mh, mb
+			pair.Used = true
 		}
-		hi, bi = mh, mb
 	}
 	r.Class = Replay
 	r.IfMatch = B
+	defer p.hintIgnored(r)
 	if hi < 0 {
 		if ha.truncated || ba.truncated {
 			r.conflict(ConflictPruned, "no common ancestor in the history that is left (pruned)")
@@ -666,6 +776,32 @@ func (p *Plan) classifyAncestry(ctx context.Context, r *Resource, h *client.Head
 		r.conflict(ConflictOverlap, "both sides wrote these paths since the common ancestor", ov...)
 	}
 	return nil
+}
+
+// hintIgnored adds a note to a conflicting replay when an earlier merge
+// batch with an entry for the resource didn't count as a merge point.
+func (p *Plan) hintIgnored(r *Resource) {
+	ig := p.ignoredFor[r.Name]
+	if len(ig) == 0 || len(r.Conflicts) == 0 || (r.Pair != nil && r.Pair.Used) {
+		return
+	}
+	mb := ig[len(ig)-1]
+	note := "earlier merge batch " + mb.Batch + " by " + principal(mb.Author, mb.Kid) + " isn't a common ancestor (" + mb.Reason + "); rebase the branch (§F.5) before merging it again"
+	if r.Note != "" {
+		note = r.Note + "; " + note
+	}
+	r.Note = note
+}
+
+// keepStep is the step that records a resource kept at the target's live
+// head (§F.3): an empty patch set, which writes a revision with identical
+// content, or in a sealed namespace a patch set that only adds a fresh
+// $nonce, since every patch set there must refresh it (§E.2.5).
+func (p *Plan) keepStep() client.Step {
+	if p.TargetLevel == "sealed" {
+		return client.PatchStep([]any{map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()}})
+	}
+	return client.PatchStep([]any{})
 }
 
 // docAt returns the document state at es[i] (for a tombstone, the last live

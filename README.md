@@ -132,12 +132,29 @@ patchlog janitor -ns matches                     # purge merged/superseded branc
 - Resources are classified by ancestry, using ids only (§F.3). A fast-forward reproduces the
   branch's ids exactly. A replay reports overlapping `writes` under the array rule, and the
   delete-versus-change cases always go to a person.
-- `-resolve name=file.json` replaces a conflicting item's steps with a resolution.
-- Earlier merge batches from the same branch count as common ancestors, so a second merge only
-  picks up what is new.
+- `-resolve name=file.json` replaces a conflicting item's steps with a resolution. A `"keep"`
+  resolution is still recorded in the batch with an empty step `[]` (in a sealed namespace, a
+  patch set that only adds a fresh `$nonce`), so the batch holds the resource's pair, but only
+  when the base's head is live. On a tombstone or an absent resource it gets no item, stays
+  unmerged, and is offered again by the next merge.
+- The batch's `source.at` is the branch revision the plan was classified from. A `412` retry
+  re-classifies against the base's new head but keeps that revision; work the branch got
+  meanwhile waits for the next merge.
+- Earlier merge batches from the same branch count as common ancestors, so a second merge after
+  a replay only picks up what is new. Per resource, the pair comes from the most recent such
+  batch with an entry for it. Only batches without `origin`, whose `source.ns` is the branch
+  and whose author (root `sub` and `kid`) is listed in the base's `merge.authors` count. With
+  authentication disabled entries carry no `kid`, so a kid-less entry matches on `sub` alone
+  (development only). Without `merge.authors` there are no such common ancestors: a second
+  merge after a replay conflicts, and the tool suggests rebasing (§F.5). `status` and `plan`
+  show per resource which batch and author its pair came from, and print a hint when the base
+  has no `merge.authors` or the merger (`-bearer`'s root `sub`/`kid`, or `-author`) isn't
+  listed.
 - The janitor checks `merged` and `successor` claims against both logs before purging (§F.6).
-  Cleanup is opt-in: a branch is purged only once a `cleanup` period, from the branch's or the
-  base's document, has passed.
+  A `merged` claim needs a merge batch by a principal in the base's `merge.authors`; the
+  successor's batch for `superseded` needs no such author, as §F.6 states. Cleanup is opt-in: a
+  branch is purged only once a `cleanup` period, from the branch's or the base's document, has
+  passed.
 
 ### Pruning archives and retention (§8.6)
 

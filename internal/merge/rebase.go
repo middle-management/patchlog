@@ -186,6 +186,9 @@ type ResourceStatus struct {
 	Branch    string     `json:"branch,omitempty"`
 	Conflicts []Conflict `json:"conflicts,omitempty"`
 	Note      string     `json:"note,omitempty"`
+	// Pair is where the resource's common-ancestor pair came from: the
+	// merge batch, its author and kid (§F.3).
+	Pair *Pair `json:"pair,omitempty"`
 }
 
 // Status is the §F.7 status of every resource the branch changed, against
@@ -202,7 +205,7 @@ func Status(ctx context.Context, c *client.Client, target, branch string) ([]Res
 func (p *Plan) Status() []ResourceStatus {
 	out := make([]ResourceStatus, 0, len(p.Resources))
 	for _, r := range p.Resources {
-		out = append(out, ResourceStatus{Resource: r.Name, Status: r.Status(), Class: r.Class, Base: r.Base, Branch: r.Branch, Conflicts: r.Conflicts, Note: r.Note})
+		out = append(out, ResourceStatus{Resource: r.Name, Status: r.Status(), Class: r.Class, Base: r.Base, Branch: r.Branch, Conflicts: r.Conflicts, Note: r.Note, Pair: r.Pair})
 	}
 	return out
 }
