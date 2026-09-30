@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"context"
+	"crypto/ecdh"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +13,9 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -108,6 +111,22 @@ const maxReadGrants = 100
 // serveReadGrants issues one read grant per item, fixed to that resource
 // (§B.11.5). Items of public namespaces need none; refusals are reported
 // per item.
+//
+// Keys (§B.11.5, §E.2.6). For an item of a sealed content namespace the
+// answer also carries the item's per-resource keys K_r, which open its
+// revisions; for a sealed or e2e catalog, the keys of its placement node
+// {ns}.{name}, which open the placement's per-entry listing entries. An
+// item may also be a catalog node /r/{catalog}/{name} the caller sees
+// through its roles: it gets that node's keys only (no grant). Keys are
+// derived from the epoch keys the service holds as a consumer, for the
+// epochs a reader gets (derived.Keys.ResourceKeys), and wrapped (HPKE) to
+// the enc key of the caller's grant in the §E.2.3 format:
+//
+//	"keys": [{ "kid": "{ns}#{e}", "resource": name, "suite", "wrapped" }, …]
+//
+// A caller whose grant has no enc gets "keysWithheld" instead. Keys of an
+// e2e content namespace are not given: its revisions are sealed by clients
+// under the epoch key, which only the keyring distributes (§E.3.2).
 func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	ctx := r.Context()
@@ -126,33 +145,117 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	lagOK := map[string]bool{}
+	cat := s.t.Catalog()
+	keys := s.t.Keys()
+	var enc *ecdh.PublicKey
+	if len(v.Grant.Blocks) > 0 {
+		enc = v.Grant.Blocks[0].Enc
+	}
+	var vis tree.Visibility
 	out := []any{}
 	for _, item := range req.Items {
 		e := map[string]any{"item": item}
-		if ns, _, ok := tree.ParseHref(item); ok && ns != s.t.Catalog() {
-			if cfg, err := s.t.Checker().Config(ctx, ns); err == nil && cfg.Read == "public" {
+		ns, name, ok := tree.ParseHref(item)
+		var err error
+		var want []keyOf // the keys the item's answer carries
+		switch {
+		case ok && ns == cat:
+			// A catalog node: its keys, if the caller sees it.
+			if vis == nil {
+				if _, vis, err = s.Resolve(ctx, v); err != nil {
+					err = upstream(err)
+					break
+				}
+			}
+			visible := false
+			s.t.View(func(g *tree.Graph, _ map[string]string) {
+				n := g.Node(name)
+				visible = n != nil && n.Live() && vis.Node(g, n)
+			})
+			if !visible {
+				err = forbidden("%s is not a catalog node you can see", item)
+			}
+			want = []keyOf{{cat, name}}
+		default:
+			public := false
+			if ok {
+				if cfg, cerr := s.t.Checker().Config(ctx, ns); cerr == nil && cfg.Read == "public" {
+					public = true
+				}
+			}
+			in, _ := keys.Info(ctx, ns)
+			if public && !in.Protected() {
 				e["public"] = true
 				out = append(out, e)
 				continue
 			}
+			var p *plan
+			p, err = s.planContent(ctx, v, item, []string{"read"})
+			if err == nil && public {
+				// Ciphertext is public; the keys decide (§E.2.5).
+				e["public"] = true
+			} else if err == nil {
+				var is *Issued
+				if is, err = s.mint(ctx, v, p, lagOK); err == nil {
+					e["grant"], e["exp"] = is.Grant, is.Exp
+				}
+			}
+			if in.Level == derived.LevelSealed {
+				want = append(want, keyOf{ns, name})
+			}
+			want = append(want, keyOf{cat, ns + "." + name})
 		}
-		p, err := s.planContent(ctx, v, item, []string{"read"})
-		var is *Issued
 		if err == nil {
-			is, err = s.mint(ctx, v, p, lagOK)
+			err = s.addKeys(ctx, e, enc, want)
 		}
 		if err != nil {
+			delete(e, "grant")
+			delete(e, "exp")
+			delete(e, "public")
 			var ce *Error
 			if !errors.As(err, &ce) {
 				ce = &Error{Status: 500, Code: "internal", Msg: err.Error()}
 			}
 			e["error"] = map[string]any{"status": ce.Status, "code": ce.Code, "message": ce.Msg}
-		} else {
-			e["grant"], e["exp"] = is.Grant, is.Exp
 		}
 		out = append(out, e)
 	}
 	tree.WriteJSON(w, http.StatusOK, map[string]any{"grants": out})
+}
+
+// keyOf names a resource whose per-resource keys an answer carries.
+type keyOf struct{ ns, name string }
+
+// addKeys sets e["keys"] to the per-resource keys of want (those of
+// namespaces that are sealed or e2e), wrapped to enc, or e["keysWithheld"]
+// if there are keys and no enc to wrap them to.
+func (s *Service) addKeys(ctx context.Context, e map[string]any, enc *ecdh.PublicKey, want []keyOf) error {
+	var got []derived.ResourceKey
+	for _, k := range want {
+		ks, err := s.t.Keys().ResourceKeys(ctx, k.ns, k.name)
+		if err != nil {
+			logf(s)("catalog: keys of %s/%s: %v", k.ns, k.name, err)
+			return errf(503, "keys", "the catalog service cannot obtain the keys of %s", k.ns)
+		}
+		got = append(got, ks...)
+	}
+	if len(got) == 0 {
+		return nil
+	}
+	if enc == nil {
+		e["keysWithheld"] = "the caller's grant has no enc key to wrap per-resource keys to (§E.2.3)"
+		return nil
+	}
+	arr := make([]any, 0, len(got))
+	for _, k := range got {
+		wk, err := seal.WrapKey(enc, k.Kid, k.Resource, k.Key)
+		if err != nil {
+			return err
+		}
+		arr = append(arr, wk.Value())
+	}
+	e["keys"] = arr
+	return nil
 }
 
 func logf(s *Service) func(string, ...any) {

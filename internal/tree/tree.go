@@ -291,6 +291,10 @@ func (s *Service) Catalog() string { return s.opt.Catalog }
 // Checker is the grant checker the service verifies readers with.
 func (s *Service) Checker() *grantcheck.Checker { return s.checker }
 
+// Keys is the encryption state and keys of the followed namespaces
+// (Addendum E).
+func (s *Service) Keys() *derived.Keys { return s.keys }
+
 // Client is the core client.
 func (s *Service) Client() *client.Client { return s.c }
 
