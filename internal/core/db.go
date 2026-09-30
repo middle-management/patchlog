@@ -68,6 +68,38 @@ CREATE TABLE IF NOT EXISTS deks (
   created    INTEGER NOT NULL
 );
 
+-- Addition: epoch keys of sealed namespaces (Addendum E.2, sealed.go), 32
+-- random bytes per (namespace, epoch), wrapped by the key store. created is
+-- the epoch's start: the created time of the config write that began it.
+CREATE TABLE IF NOT EXISTS epoch_keys (
+  ns         INTEGER NOT NULL REFERENCES namespaces,
+  epoch      INTEGER NOT NULL,
+  wrapped    BLOB    NOT NULL,
+  keystore   TEXT    NOT NULL,
+  created    INTEGER NOT NULL,
+  PRIMARY KEY (ns, epoch)
+) WITHOUT ROWID;
+-- Addition: the epoch in force when a revision or tombstone of a sealed
+-- namespace was written (§E.2.1), keyed by revisions.seq.
+CREATE TABLE IF NOT EXISTS rev_epochs (seq INTEGER PRIMARY KEY, epoch INTEGER NOT NULL);
+-- Addition: sealed bytes, stored once and served forever (§E.2.2). ns is
+-- the serving namespace (a branch seals read-through content under its own
+-- keys); kind is doc, entry, config or range; key is name/id for doc and
+-- entry, the ns_id for config and "since:id" for range. name and rev_seq
+-- let purges and prunes find a resource's rows.
+CREATE TABLE IF NOT EXISTS sealed (
+  ns         INTEGER NOT NULL,
+  kind       TEXT    NOT NULL,
+  key        TEXT    NOT NULL,
+  name       TEXT,
+  rev_seq    INTEGER,
+  jwe        TEXT    NOT NULL,
+  created    INTEGER NOT NULL,
+  PRIMARY KEY (ns, kind, key)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS sealed_name ON sealed (ns, name);
+CREATE INDEX IF NOT EXISTS sealed_rev ON sealed (rev_seq);
+
 CREATE TABLE IF NOT EXISTS heads (res INTEGER PRIMARY KEY REFERENCES resources, seq INTEGER NOT NULL, doc TEXT NOT NULL);
 CREATE INDEX IF NOT EXISTS heads_seq ON heads (seq);
 -- Intermediate snapshots (D.4) and documents kept below a horizon (§8.6).

@@ -72,6 +72,13 @@ type Options struct {
 	// Nil means none: a namespace document can't set encryption (422), and
 	// content stored encrypted answers 500.
 	KeyStore KeyStore
+	// RotateEpochs, if positive, rotates every sealed namespace whose
+	// current epoch is at least that old (§E.2.1), as RotateAuthor.
+	RotateEpochs time.Duration
+	// RotateOnRevoke rotates a sealed namespace's epoch (and its sealed
+	// branches') right after a committed config write that adds a
+	// revocation or removes or changes a key (§E.2.4).
+	RotateOnRevoke bool
 	// BeforeWriteLock is called by resource writes and batches after the
 	// check phase (steps 1–6, outside the write lock) and before they take
 	// the write lock and re-check (D.3). Tests use it to inject concurrent
@@ -125,6 +132,7 @@ type Engine struct {
 	rate      *rateLimiter
 	docs      *docCache
 	deks      *dekCache
+	ekeys     epochKeyCache
 	cfgMu     sync.Mutex
 	cfgCache  map[int64]*Config
 	stop      chan struct{}
@@ -195,6 +203,10 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if e.opt.Remote.RenewBefore == 0 {
 		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
+	}
+	if opt.RotateEpochs > 0 {
+		e.bg.Add(1)
+		go e.rotateLoop(opt.RotateEpochs)
 	}
 	if e.opt.Remote.FollowInterval > 0 {
 		e.bg.Add(1)
@@ -278,6 +290,12 @@ type tx struct {
 	flushDEKs    bool
 	resLevels    map[int64]int
 	shadowLevels map[string]int
+	// Sealed namespaces (sealed.go): epoch keys created in this
+	// transaction, whether a namespace purge destroyed some, and the
+	// namespaces whose config change revoked access (rotate-on-revoke).
+	newEpochKeys   map[epochRef][]byte
+	flushEpochKeys bool
+	rotate         []string
 }
 
 type docPut struct {
@@ -312,12 +330,20 @@ func panicErr(p any) error {
 // update runs f in a write transaction and commits if it returns nil. A
 // panic (t.must) rolls back and is returned as an error, so a failed write
 // never leaves its transaction, and the connection, open.
-func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
+func (e *Engine) update(ctx context.Context, f func(t *tx) error) error {
+	rotate, err := e.update1(ctx, f)
+	if err == nil && len(rotate) > 0 && e.opt.RotateOnRevoke {
+		e.rotateAfterRevoke(rotate)
+	}
+	return err
+}
+
+func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []string, err error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	sqlTx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
 		if p := recover(); p != nil {
@@ -328,10 +354,17 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
 	if err := f(t); err != nil {
 		sqlTx.Rollback()
-		return err
+		return nil, err
 	}
 	if err := sqlTx.Commit(); err != nil {
-		return err
+		return nil, err
+	}
+	if t.flushEpochKeys {
+		e.ekeys.flush()
+	} else {
+		for r, k := range t.newEpochKeys {
+			e.ekeys.put(r, k)
+		}
 	}
 	if t.flushDEKs {
 		e.deks.flush()
@@ -356,7 +389,7 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
 	for ns := range t.notify {
 		e.hub.publish(ns)
 	}
-	return nil
+	return t.rotate, nil
 }
 
 func (t *tx) must(err error) {

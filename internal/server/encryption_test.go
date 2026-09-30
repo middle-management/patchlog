@@ -354,7 +354,8 @@ func TestEncryptionTurnOn(t *testing.T) {
 	// Downgrades are refused.
 	expectCode(t, e.patchNS("s", ops(op("remove", "/encryption")), ga), 422, "invalid")
 	expectCode(t, e.patchNS("sb", ops(op("remove", "/encryption")), ga), 422, "invalid")
-	expectCode(t, e.patchNS("s", ops(op("replace", "/encryption/level", "sealed")), ga), 422, "invalid")
+	// Raising s to sealed while its branch stays at rest is 409 (§7.4).
+	expectCode(t, e.patchNS("s", ops(op("replace", "/encryption/level", "sealed")), ga), 409, "in_use")
 }
 
 // Configuration errors: no key store, unknown levels and members, a branch
@@ -370,7 +371,7 @@ func TestEncryptionConfigErrors(t *testing.T) {
 	expectCode(t, e.patchNS("p", ops(op("add", "/encryption", map[string]any{"level": "at-rest"})), ""), 422, "invalid")
 
 	k := newEnv(t, withKeyStore(newKeyStore(t)))
-	for _, bad := range []any{"at-rest", map[string]any{"level": "sealed"}, map[string]any{"level": "e2e"}, map[string]any{"level": "x"}, map[string]any{"level": "at-rest", "keys": []any{}}} {
+	for _, bad := range []any{"at-rest", map[string]any{"level": "sealed", "epoch": 0.0}, map[string]any{"level": "at-rest", "epoch": 1.0}, map[string]any{"level": "sealed", "historyEpochs": 1.5}, map[string]any{"level": "e2e"}, map[string]any{"level": "x"}, map[string]any{"level": "at-rest", "keys": []any{}}} {
 		r := k.do(req{method: "PATCH", path: "/ns/bad", ifNoneMatch: "*", body: addRoot(map[string]any{"read": "public", "encryption": bad}), author: "admin"})
 		expectCode(t, r, 422, "invalid")
 	}

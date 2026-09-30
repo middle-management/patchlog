@@ -42,6 +42,7 @@ type Client struct {
 	hc     *http.Client
 	bearer string
 	author string
+	keys   *Keys // sealed namespaces (sealed.go)
 
 	originMu sync.Mutex
 	origin   string
@@ -83,7 +84,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // With returns a copy of the client with further options applied, e.g. a
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
-	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author}
+	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys}
 	c.originMu.Lock()
 	n.origin = c.origin
 	c.originMu.Unlock()

@@ -131,6 +131,9 @@ type stepState struct {
 	doc      any // resulting (for a delete: the last live) document
 	writes   []string
 	typed    string // $schema of the resulting document
+	// prevNonce is the $nonce of the document the step applied to, if
+	// any (sealed namespaces refuse a repeated nonce, §E.2.5).
+	prevNonce string
 }
 
 type itemState struct {
@@ -397,10 +400,15 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
-	// Step 3: apply.
+	// Step 3: apply. Sealed namespaces also need a fresh $nonce in every
+	// patch set (§C.7, §E.2.5).
 	for _, s := range st {
 		if err := t.applySteps(s); err != nil {
 			fs = append(fs, itemErr{s.index, err})
+		} else if cfg.level == levelSealed {
+			if err := checkNonces(s); err != nil {
+				fs = append(fs, itemErr{s.index, err})
+			}
 		}
 	}
 	if len(fs) > 0 {
@@ -775,6 +783,9 @@ func (t *tx) applySteps(s *itemState) *Error {
 			if err != nil {
 				return patchErr(err)
 			}
+			if m, ok := doc.(map[string]any); ok && exists {
+				ss.prevNonce, _ = m["$nonce"].(string)
+			}
 			ss.canon = jsonv.Canonical(step.Patches)
 			ss.id = ids.Revision(parentID, ss.canon)
 			ss.doc = nd
@@ -1034,6 +1045,11 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 		}
 		last, _ = r.LastInsertId()
 		parentSeq = last
+		if cfg := t.config(n.configSeq); cfg.level == levelSealed {
+			// The epoch that seals this entry forever (§E.2.1).
+			_, err := t.Exec(`INSERT INTO rev_epochs (seq, epoch) VALUES (?, ?)`, last, cfg.Epoch)
+			t.must(err)
+		}
 		if !step.del {
 			lastLive = step
 			lastLiveSeq = last

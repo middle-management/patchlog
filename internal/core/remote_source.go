@@ -102,6 +102,9 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	if err := t.rateLimit(n, cfg, a, nil, 1); err != nil {
 		return nil, err
 	}
+	if t.nsLevel(n) >= levelSealed {
+		return nil, invalid("remote branches of sealed namespaces are not supported by this server (§G.5)")
+	}
 	if !ValidRemoteOrigin(rr.Origin) {
 		return nil, invalid("remote.origin must be an https origin (or http on a loopback host)")
 	}

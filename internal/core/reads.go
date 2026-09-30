@@ -68,7 +68,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
 		}
-		h = &Head{Public: t.config(n.configSeq).Read == "public"}
+		h = &Head{Public: t.cachePublic(n)}
 		if n.purged {
 			h.State = Purged
 			return nil
@@ -88,8 +88,11 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 
 // Rev is the answer for GET /r/{ns}/{name}/rev/{id}.
 type Rev struct {
-	Status  int // 200, 404, 410
-	Doc     []byte
+	Status int // 200, 404, 410
+	Doc    []byte
+	// JWE is the sealed document of a sealed namespace (Addendum E.2),
+	// served instead of Doc.
+	JWE     string
 	Code    string // "pruned", "tombstone" or "" for 410s
 	Horizon string
 	Archive string // URL of the archive holding a pruned revision, if any (§8.6)
@@ -99,6 +102,8 @@ type Rev struct {
 // ResourceRev serves the document at a revision.
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
 	var out *Rev
+	var job *sealJob
+	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -107,7 +112,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
 		}
-		out = &Rev{Public: t.config(n.configSeq).Read == "public"}
+		out = &Rev{Public: t.cachePublic(n)}
 		rid, perr := ids.Parse(id)
 		if perr != nil {
 			out.Status = 404
@@ -143,8 +148,17 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		out.Status, out.Doc = 200, b
+		if t.isSealedNS(n) {
+			nsRowID = n.id
+			job = t.resJob(n, name, row, sealDoc, func() []byte { return b })
+		}
 		return nil
 	})
+	if err == nil && job != nil {
+		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+			out.Doc, out.JWE = nil, job.jwe
+		}
+	}
 	return out, err
 }
 
@@ -152,10 +166,19 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 type Log struct {
 	Status  int
 	Entries []map[string]any
-	Last    string // id of the last entry returned (or since)
-	Horizon string
-	Archive string // with Horizon: the archive holding the newest pruned entry, if any
-	Public  bool
+	// Sealed namespaces (Addendum E.2) serve JWEs instead of Entries:
+	// resource logs one per entry (EntryJWEs); namespace logs one for the
+	// whole range (Range), and for event streams one per entry covering
+	// (prev, id] (EntryJWEs). Entries stay set, for the metadata a
+	// response carries in the clear (ids, event types), and must not be
+	// served.
+	Sealed    bool
+	EntryJWEs []string
+	Range     string
+	Last      string // id of the last entry returned (or since)
+	Horizon   string
+	Archive   string // with Horizon: the archive holding the newest pruned entry, if any
+	Public    bool
 }
 
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
@@ -163,6 +186,8 @@ type Log struct {
 // (for long-poll and SSE).
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
+	var jobs []*sealJob
+	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -171,7 +196,7 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
 		}
-		out = &Log{Public: t.config(n.configSeq).Read == "public"}
+		out = &Log{Public: t.cachePublic(n)}
 		v := t.resolve(n, name, nil)
 		if n.purged || v.state == Purged {
 			out.Status = 410
@@ -222,12 +247,28 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		}
 		out.Status = 200
 		out.Last = since
+		sealed := t.isSealedNS(n)
 		for _, e := range entries {
-			out.Entries = append(out.Entries, e.value())
+			v := e.value()
+			out.Entries = append(out.Entries, v)
 			out.Last = e.ID
+			if sealed {
+				jobs = append(jobs, t.resJob(n, name, e.row, sealEntry, func() []byte { return jsonv.Canonical(v) }))
+			}
+		}
+		if sealed {
+			out.Sealed, nsRowID = true, n.id
 		}
 		return nil
 	})
+	if err == nil && out != nil && out.Sealed {
+		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
+			out.EntryJWEs = make([]string, len(jobs))
+			for i, j := range jobs {
+				out.EntryJWEs[i] = j.jwe
+			}
+		}
+	}
 	return out, err
 }
 
@@ -238,6 +279,7 @@ type NSInfo struct {
 	Public bool
 	Purged bool
 	Doc    []byte
+	JWE    string // sealed namespaces (Addendum E.2): the sealed document
 }
 
 // NamespaceHead returns the namespace head and config ids.
@@ -254,7 +296,7 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 		out = &NSInfo{
 			Head:   t.nsLogID(n.headSeq.Int64).String(),
 			Config: t.configID(n.configSeq).String(),
-			Public: t.config(n.configSeq).Read == "public",
+			Public: t.cachePublic(n),
 			Purged: n.purged,
 		}
 		return nil
@@ -265,6 +307,8 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 // NamespaceRev returns the namespace document in force at an ns_id.
 func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credentials) (*NSInfo, error) {
 	var out *NSInfo
+	var job *sealJob
+	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -285,16 +329,38 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		var doc string
 		t.must(t.QueryRow(`SELECT l.config_seq, c.doc FROM ns_log l JOIN ns_config c ON c.seq = l.config_seq WHERE l.seq = ?`, seq).Scan(&cseq, &doc))
 		out = &NSInfo{Head: nsID, Config: t.configID(cseq).String(), Doc: []byte(doc),
-			Public: t.config(n.configSeq).Read == "public"}
+			Public: t.cachePublic(n)}
+		if t.isSealedNS(n) {
+			nsRowID = n.id
+			job = t.configJob(n, seq, nsID, []byte(doc))
+		}
 		return nil
 	})
+	if err == nil && job != nil {
+		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+			out.Doc, out.JWE = nil, job.jwe
+		}
+	}
 	return out, err
 }
 
 // NamespaceLog serves /ns/{ns}/rev/{ns_id}/log?since= (§7.4). With nsID
 // empty it serves from the current head, up to limit entries after since.
 func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials) (*Log, error) {
+	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false)
+}
+
+// NamespaceEvents is NamespaceLog from the current head for event streams:
+// in a sealed namespace each entry is sealed on its own, as the range
+// (prev, id] (EntryJWEs).
+func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, cred Credentials) (*Log, error) {
+	return e.namespaceLog(ctx, ns, "", since, 0, cred, true)
+}
+
+func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool) (*Log, error) {
 	var out *Log
+	var jobs []*sealJob
+	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -303,7 +369,7 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if _, err := t.reader(n, cred, ""); err != nil {
 			return err
 		}
-		out = &Log{Public: t.config(n.configSeq).Read == "public"}
+		out = &Log{Public: t.cachePublic(n)}
 		toSeq := n.headSeq.Int64
 		if nsID != "" {
 			id, err := ids.Parse(nsID)
@@ -333,6 +399,7 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 		rows, err := t.Query(q, args...)
 		t.must(err)
 		type raw struct {
+			seq     int64
 			id      []byte
 			prev    *int64
 			body    string
@@ -342,8 +409,7 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 		var rs []raw
 		for rows.Next() {
 			var r raw
-			var seq int64
-			t.must(rows.Scan(&seq, &r.id, &r.prev, &r.body, &r.author, &r.created))
+			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created))
 			rs = append(rs, r)
 		}
 		rows.Close()
@@ -360,8 +426,42 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)
 		}
+		if t.isSealedNS(n) {
+			out.Sealed, nsRowID = true, n.id
+			if perEntry {
+				for i, r := range rs {
+					m := out.Entries[i]
+					prev, _ := m["prev"].(string)
+					jobs = append(jobs, t.rangeJob(n, prev, r.seq, m["id"].(string), func() []byte { return jsonv.Canonical([]any{m}) }))
+				}
+			} else if len(rs) > 0 || nsID != "" {
+				// A range, even an empty one, is sealed as a whole. A
+				// live read with nothing new has no range (204).
+				entries := make([]any, len(out.Entries))
+				for i, m := range out.Entries {
+					entries[i] = m
+				}
+				to, toID := toSeq, nsID
+				if len(rs) > 0 {
+					to, toID = rs[len(rs)-1].seq, out.Last
+				}
+				jobs = append(jobs, t.rangeJob(n, since, to, toID, func() []byte { return jsonv.Canonical(entries) }))
+			}
+		}
 		return nil
 	})
+	if err == nil && out != nil && out.Sealed {
+		if err = e.finishSeal(ctx, nsRowID, jobs); err == nil {
+			if perEntry {
+				out.EntryJWEs = make([]string, len(jobs))
+				for i, j := range jobs {
+					out.EntryJWEs[i] = j.jwe
+				}
+			} else if len(jobs) == 1 {
+				out.Range = jobs[0].jwe
+			}
+		}
+	}
 	return out, err
 }
 
@@ -388,7 +488,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		if perr != nil || !ok {
 			return notFound()
 		}
-		out = &HeadsPage{Items: []map[string]any{}, Public: t.config(n.configSeq).Read == "public"}
+		out = &HeadsPage{Items: []map[string]any{}, Public: t.cachePublic(n)}
 		limit := e.opt.Maximums.LogPageSize
 		for _, h := range t.listHeads(n, &seq) {
 			if h.name <= after {
@@ -428,7 +528,7 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 		if _, err := t.reader(n, cred, ""); err != nil {
 			return err
 		}
-		public = t.config(n.configSeq).Read == "public"
+		public = t.cachePublic(n)
 		out = []map[string]any{}
 		for _, b := range t.branchesOf(n) {
 			cfg := t.config(b.configSeq)

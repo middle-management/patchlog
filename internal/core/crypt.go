@@ -476,6 +476,17 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 	if baseLevel >= 0 && cfg.level < baseLevel {
 		return invalid("/encryption: a branch cannot have a lower encryption level than its base")
 	}
+	// Epochs (§E.2.1): a sealed namespace's epoch only moves forward, one
+	// at a time; a namespace that becomes sealed starts at epoch 1. A new
+	// namespace or branch may start at any epoch.
+	if cur != nil && cfg.level == levelSealed {
+		switch {
+		case cur.level == levelSealed && cfg.Epoch != cur.Epoch && cfg.Epoch != cur.Epoch+1:
+			return invalid(fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
+		case cur.level < levelSealed && cfg.Epoch != 1:
+			return invalid("/encryption/epoch: a namespace becoming sealed starts at epoch 1")
+		}
+	}
 	return nil
 }
 
@@ -719,7 +730,7 @@ func (e *Engine) checkKeyStore() error {
 	var name string
 	err := e.db.QueryRowContext(ctx, `SELECT res, wrapped, keystore FROM deks ORDER BY res LIMIT 1`).Scan(&res, &wrapped, &name)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+		return e.checkEpochKeys(ctx)
 	}
 	if err != nil {
 		return err

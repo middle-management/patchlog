@@ -52,6 +52,9 @@ type Options struct {
 	Start time.Time
 	// RealClock uses time.Now instead of an injectable clock.
 	RealClock bool
+	// KeyStore enables encryption (Addendum E): at-rest and sealed
+	// namespaces need one.
+	KeyStore core.KeyStore
 }
 
 // Server is a running test server.
@@ -76,7 +79,7 @@ func New(t testing.TB, opt Options) *Server {
 	if opt.Start.IsZero() {
 		opt.Start = time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
 	}
-	o := core.Options{Path: ":memory:", Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}}
+	o := core.Options{Path: ":memory:", Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore}
 	s := &Server{}
 	if !opt.RealClock {
 		s.Clock = &Clock{t: opt.Start}

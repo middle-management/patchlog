@@ -6,6 +6,7 @@ import (
 	"net/url"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // NSHead is the answer of GET /ns/{ns}.
@@ -52,7 +53,13 @@ func (c *Client) NSDoc(ctx context.Context, ns, nsID string) (*NSDoc, error) {
 	if r.status != 200 {
 		return nil, r.apiError()
 	}
-	v, err := jsonv.Parse(r.body)
+	body := r.body
+	if isJOSE(r) {
+		if body, err = c.open(ctx, ns, "", string(r.body), fixedPL(seal.NamespaceDocPL(ns, nsID))); err != nil {
+			return nil, fmt.Errorf("client: namespace document %s@%s: %w", ns, nsID, err)
+		}
+	}
+	v, err := jsonv.Parse(body)
 	if err != nil {
 		return nil, fmt.Errorf("client: namespace document %s@%s: %w", ns, nsID, err)
 	}
@@ -60,7 +67,7 @@ func (c *Client) NSDoc(ctx context.Context, ns, nsID string) (*NSDoc, error) {
 	if !ok {
 		return nil, fmt.Errorf("client: namespace document %s@%s is not an object", ns, nsID)
 	}
-	return &NSDoc{ID: nsID, Config: r.header.Get("X-Config-Revision"), Raw: r.body, Value: m}, nil
+	return &NSDoc{ID: nsID, Config: r.header.Get("X-Config-Revision"), Raw: body, Value: m}, nil
 }
 
 // NSEntry is one entry of a namespace log (§7.4), with the fields of §3.5.
@@ -160,6 +167,13 @@ func (c *Client) NSLog(ctx context.Context, ns, nsID, since string) ([]NSEntry, 
 	}
 	if r.status != 200 {
 		return nil, r.apiError()
+	}
+	if isJOSE(r) {
+		v, err := c.openRange(ctx, ns, since, nsID, string(r.body))
+		if err != nil {
+			return nil, fmt.Errorf("client: namespace log %s: %w", ns, err)
+		}
+		return parseNSLog(v, r.path)
 	}
 	return parseNSLog(r.value(), r.path)
 }

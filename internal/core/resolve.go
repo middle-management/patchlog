@@ -290,6 +290,8 @@ type LogEntry struct {
 	Author    string `json:"author"`
 	Created   string `json:"created"`
 	Signature string `json:"signature,omitempty"`
+
+	row *revRow // the entry's row (sealing, sealed.go)
 }
 
 func (e LogEntry) value() map[string]any {
@@ -307,7 +309,7 @@ func (e LogEntry) value() map[string]any {
 }
 
 func (t *tx) logEntry(r *revRow) LogEntry {
-	e := LogEntry{ID: r.id.String(), Author: t.authorName(r.author), Created: formatTime(r.created)}
+	e := LogEntry{ID: r.id.String(), Author: t.authorName(r.author), Created: formatTime(r.created), row: r}
 	if r.parentSeq.Valid {
 		e.Parent = t.rev(r.parentSeq.Int64).id.String()
 	}

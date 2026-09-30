@@ -103,6 +103,8 @@ func serve(args []string) {
 	remoteRegister := fs.Bool("remote-register", false, "register remote branches with their bases and renew the registrations (§G.3)")
 	masterKey := fs.String("master-key", "", "file holding the 32-byte master key of encryption at rest (Addendum E.1); mode 0600")
 	masterKeyCreate := fs.Bool("master-key-create", false, "create the -master-key file with a new random key if it doesn't exist")
+	rotateEpochs := fs.Duration("rotate-epochs", 0, "rotate every sealed namespace's epoch once it is this old, e.g. 24h (Addendum E.2; 0 disables)")
+	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
 	fs.Parse(args)
 	remote, err := remoteOptions(remoteBearers, remoteURLs)
 	if err != nil {
@@ -157,7 +159,8 @@ func serve(args []string) {
 		log.Fatal("-master-key-create needs -master-key")
 	}
 	e, err := core.Open(core.Options{Path: *db, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
-		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks})
+		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
+		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke})
 	if err != nil {
 		log.Fatal(err)
 	}

@@ -6,6 +6,7 @@ import (
 	"net/url"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // State is a resource's state as seen through its head pointer (§7.1).
@@ -81,11 +82,17 @@ func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
 	if r.status != 200 {
 		return nil, r.apiError()
 	}
-	v, err := jsonv.Parse(r.body)
+	body := r.body
+	if isJOSE(r) {
+		if body, err = c.open(ctx, ns, name, string(r.body), fixedPL(seal.ResourcePL(ns, name, id, seal.KindDoc))); err != nil {
+			return nil, fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
+		}
+	}
+	v, err := jsonv.Parse(body)
 	if err != nil {
 		return nil, fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
 	}
-	return &Doc{ID: id, Raw: r.body, Value: v}, nil
+	return &Doc{ID: id, Raw: body, Value: v}, nil
 }
 
 // Load reads the head and, if live, the document at it (§11 load).
@@ -183,7 +190,7 @@ func (c *Client) Log(ctx context.Context, ns, name, id, since string) ([]LogEntr
 	if r.status != 200 {
 		return nil, r.apiError()
 	}
-	return parseLog(r)
+	return c.openLog(ctx, ns, name, since, id, r)
 }
 
 // --- writes ------------------------------------------------------------

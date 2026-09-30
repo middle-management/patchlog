@@ -17,6 +17,7 @@ package grant
 
 import (
 	"bytes"
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/base64"
@@ -26,6 +27,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Verbs are the actions a grant may carry (§C.1). "*" is valid only in a
@@ -78,7 +80,11 @@ type Block struct {
 	At                      any
 	Rules                   []any
 	HasRoles, HasCan, HasNS bool
-	Raw                     map[string]any
+	// Enc is the root block's recipient key for wrapped key responses
+	// (§E.2.3): { "kty": "OKP", "crv": "X25519", "x" }. Nil if absent.
+	// Narrowing blocks cannot carry or change it.
+	Enc *ecdh.PublicKey
+	Raw map[string]any
 }
 
 // Grant is a decoded chain of blocks.
@@ -336,7 +342,7 @@ func (g *Grant) verifyRoot(pub ed25519.PublicKey) bool {
 	return ed25519.Verify(pub, signingInput(g.Blocks[0].Raw, g.nexts[0], nil), g.sigs[0])
 }
 
-var rootFields = map[string]bool{"kid": true, "sub": true, "groups": true, "roles": true, "attrs": true, "ns": true, "can": true, "nbf": true, "exp": true, "at": true, "rules": true}
+var rootFields = map[string]bool{"kid": true, "sub": true, "groups": true, "roles": true, "attrs": true, "ns": true, "can": true, "nbf": true, "exp": true, "at": true, "rules": true, "enc": true}
 var narrowFields = map[string]bool{"via": true, "ns": true, "can": true, "roles": true, "nbf": true, "exp": true, "rules": true}
 
 func parseBlock(raw map[string]any, root bool) (Block, error) {
@@ -394,6 +400,14 @@ func parseBlock(raw map[string]any, root bool) (Block, error) {
 				return b, err
 			}
 			b.At = v
+		}
+		if v, ok := raw["enc"]; ok {
+			m, isObj := v.(map[string]any)
+			pub, err := seal.ParseRecipientJWK(v)
+			if !isObj || err != nil || len(m) != 3 {
+				return b, errors.New(`enc must be { "kty": "OKP", "crv": "X25519", "x" }`)
+			}
+			b.Enc = pub
 		}
 	} else {
 		if b.Via, err = str("via", false); err != nil {

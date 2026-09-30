@@ -105,7 +105,12 @@ type Config struct {
 	Base       *BaseRef
 	// Encryption is encryption.level (Addendum E), "" if none.
 	Encryption string
-	level      int
+	// Epoch is encryption.epoch of a sealed namespace (E2, §E.2.1): 1 if
+	// absent, 0 unless sealed. HistoryEpochs is encryption.historyEpochs,
+	// 0 if absent (no cap).
+	Epoch         int
+	HistoryEpochs int
+	level         int
 }
 
 // Allowance gives a named principal its own rate and batch limits (§6.6).
@@ -293,20 +298,45 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 		case "encryption":
 			e, ok := v.(map[string]any)
 			if !ok {
-				return nil, fmt.Errorf(`/encryption must be { "level": "at-rest" | "sealed" | "e2e" }`)
+				return nil, fmt.Errorf(`/encryption must be { "level": "at-rest" | "sealed" | "e2e", "epoch"?, "historyEpochs"? }`)
 			}
 			for k := range e {
-				if k != "level" {
+				if k != "level" && k != "epoch" && k != "historyEpochs" {
 					return nil, fmt.Errorf("/encryption/%s is not supported by this server", k)
 				}
 			}
 			lv, _ := e["level"].(string)
 			switch lv {
-			case "at-rest":
-			case "sealed", "e2e":
-				return nil, fmt.Errorf("/encryption/level %q (Addendum E.2, E.3) is not supported by this server; only \"at-rest\" is", lv)
+			case "at-rest", "sealed":
+			case "e2e":
+				return nil, fmt.Errorf("/encryption/level %q (Addendum E.3) is not supported by this server; only \"at-rest\" and \"sealed\" are", lv)
 			default:
 				return nil, fmt.Errorf(`/encryption/level must be "at-rest", "sealed" or "e2e"`)
+			}
+			if lv != "sealed" {
+				if _, has := e["epoch"]; has {
+					return nil, fmt.Errorf("/encryption/epoch is only for sealed namespaces")
+				}
+				if _, has := e["historyEpochs"]; has {
+					return nil, fmt.Errorf("/encryption/historyEpochs is only for sealed namespaces")
+				}
+			} else {
+				// Epochs count from 1; an absent epoch is 1 (§E.2.1).
+				c.Epoch = 1
+				if x, has := e["epoch"]; has {
+					f, ok := x.(float64)
+					if !ok || f < 1 || f != float64(int(f)) || f > 1<<31 {
+						return nil, fmt.Errorf("/encryption/epoch must be a positive integer")
+					}
+					c.Epoch = int(f)
+				}
+				if x, has := e["historyEpochs"]; has {
+					f, ok := x.(float64)
+					if !ok || f < 1 || f != float64(int(f)) || f > 1<<31 {
+						return nil, fmt.Errorf("/encryption/historyEpochs must be a positive integer")
+					}
+					c.HistoryEpochs = int(f)
+				}
 			}
 			c.Encryption, c.level = lv, levelOf(lv)
 		}

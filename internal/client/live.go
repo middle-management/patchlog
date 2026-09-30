@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // LongPollResult is one answer of a long-poll read (§7.7).
@@ -40,7 +41,13 @@ func (c *Client) LongPoll(ctx context.Context, ns, since, cursor string) (*LongP
 		}
 		return res, nil
 	}
-	res.Entries, err = parseNSLog(r.value(), r.path)
+	body := r.value()
+	if isJOSE(r) {
+		if body, err = c.openRange(ctx, ns, since, res.Since, string(r.body)); err != nil {
+			return nil, fmt.Errorf("client: namespace log %s: %w", ns, err)
+		}
+	}
+	res.Entries, err = parseNSLog(body, r.path)
 	if err != nil {
 		return nil, err
 	}
@@ -75,7 +82,7 @@ func (c *Client) ResourceLongPoll(ctx context.Context, ns, name, since, cursor s
 		}
 		return res, nil
 	}
-	res.Entries, err = parseLog(r)
+	res.Entries, err = c.openLog(ctx, ns, name, since, res.Since, r)
 	if err != nil {
 		return nil, err
 	}
@@ -110,7 +117,9 @@ func (c *Client) longPoll(ctx context.Context, path, since, cursor string) (*res
 type Event struct {
 	Type string // the entry's kind (namespace streams) or revision/tombstone/purge/prune
 	ID   string
-	Data any // parsed data (jsonv model)
+	Data any // parsed data (jsonv model); decrypted in a sealed namespace
+	// JWE is the data as served in a sealed namespace (Addendum E.2).
+	JWE string
 }
 
 // NSEvents streams namespace entries after since over SSE (§7.4) and calls
@@ -121,11 +130,28 @@ func (c *Client) NSEvents(ctx context.Context, ns, since string, fn func(NSEntry
 	if err := checkNS(ns); err != nil {
 		return err
 	}
+	prev := since
 	return c.events(ctx, "/ns/"+ns+"/events", since, func(ev Event) error {
+		if ev.JWE != "" {
+			// One entry per event, sealed as the range (prev, id] (§E.2.2).
+			v, err := c.openRange(ctx, ns, prev, ev.ID, ev.JWE)
+			if err != nil {
+				return fmt.Errorf("client: event %s: %w", ev.ID, err)
+			}
+			arr, _ := v.([]any)
+			if len(arr) != 1 {
+				return fmt.Errorf("client: event %s: sealed data is not one entry", ev.ID)
+			}
+			ev.Data = arr[0]
+		}
 		e, err := ParseNSEntry(ev.Data)
 		if err != nil {
 			return err
 		}
+		if ev.JWE != "" && e.ID != ev.ID {
+			return fmt.Errorf("client: event %s carries entry %s: %w", ev.ID, e.ID, seal.ErrMismatch)
+		}
+		prev = ev.ID
 		return fn(e)
 	})
 }
@@ -135,7 +161,42 @@ func (c *Client) ResourceEvents(ctx context.Context, ns, name, since string, fn 
 	if err := checkRes(ns, name); err != nil {
 		return err
 	}
-	return c.events(ctx, "/r/"+ns+"/"+name+"/events", since, fn)
+	return c.events(ctx, "/r/"+ns+"/"+name+"/events", since, func(ev Event) error {
+		if ev.JWE == "" {
+			return fn(ev)
+		}
+		switch ev.Type {
+		case "revision", "tombstone":
+			e, err := c.openEntry(ctx, ns, name, ev.JWE)
+			if err != nil {
+				return fmt.Errorf("client: event %s: %w", ev.ID, err)
+			}
+			if e.ID != ev.ID {
+				return fmt.Errorf("client: event %s carries entry %s: %w", ev.ID, e.ID, seal.ErrMismatch)
+			}
+			ev.Data = e.Raw
+		default:
+			// purge and prune: a namespace entry, sealed as its range.
+			pt, err := c.open(ctx, ns, "", ev.JWE, func(h *seal.Header) (seal.PL, error) {
+				rg, _ := h.PL["range"].([]any)
+				if len(rg) != 2 {
+					return nil, seal.ErrMismatch
+				}
+				from, _ := rg[0].(string)
+				return seal.RangePL(ns, from, ev.ID), nil
+			})
+			if err != nil {
+				return fmt.Errorf("client: event %s: %w", ev.ID, err)
+			}
+			v, err := jsonv.Parse(pt)
+			arr, _ := v.([]any)
+			if err != nil || len(arr) != 1 {
+				return fmt.Errorf("client: event %s: sealed data is not one entry", ev.ID)
+			}
+			ev.Data = arr[0]
+		}
+		return fn(ev)
+	})
 }
 
 func (c *Client) events(ctx context.Context, path, since string, fn func(Event) error) error {
@@ -171,11 +232,15 @@ func (c *Client) events(ctx context.Context, path, since string, fn func(Event) 
 		switch {
 		case line == "":
 			if data.Len() > 0 {
-				v, err := jsonv.Parse([]byte(data.String()))
-				if err != nil {
-					return fmt.Errorf("client: bad event data: %w", err)
+				if d := data.String(); d[0] != '{' && d[0] != '[' {
+					ev.JWE = d // sealed (Addendum E.2)
+				} else {
+					v, err := jsonv.Parse([]byte(d))
+					if err != nil {
+						return fmt.Errorf("client: bad event data: %w", err)
+					}
+					ev.Data = v
 				}
-				ev.Data = v
 				if err := fn(ev); err != nil {
 					return err
 				}

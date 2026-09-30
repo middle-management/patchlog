@@ -26,6 +26,7 @@ and serves immutable, CDN-cacheable revisions.
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices | §G.3 | ✅ (mirrored up front) |
 | Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
 | Encryption at rest, cryptographic purge | Addendum E.1 | ✅ (local master key file; KMS adapters to come) |
+| Sealed for delivery: epoch keys, JWE responses, `POST /ns/{ns}/keys`, rotation, `$nonce` | Addendum E.2 | ✅ (client library decrypts; other consumers don't re-seal yet) |
 
 ### Not implemented
 
@@ -33,8 +34,12 @@ and serves immutable, CDN-cacheable revisions.
   namespace, signed manifests and `x-tree-label` titles.
 - **§F.7 merge service** (scheduled merges, web status): not built. Its logic is in
   `internal/merge` and the CLI.
-- **Addendum E.2/E.3** (sealed, end-to-end): `encryption.level` `"sealed"` or `"e2e"` is
-  rejected with `422`. E.1 (at rest) is implemented, see below.
+- **Addendum E.3** (end-to-end): `encryption.level` `"e2e"` is rejected with `422`.
+- **Addendum E.2 gaps:** consumers that re-publish (search index, tree and catalog services)
+  don't seal what they serve yet (§E.2.5), so don't point them at sealed namespaces unless
+  their own output is private; remote branches of sealed namespaces (§G.3, §G.5) are refused
+  with `422`; exports with keys write plaintext bundles (§G.5 asks for them to be encrypted to
+  the recipient); no size-bucket padding (§E.4).
 - **Addendum G** (federation): remote branches whose base is itself a branch, lazy
   read-through, and mirroring pinned `x-ref` targets (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
@@ -230,6 +235,89 @@ curl -X PATCH $B/ns/matches -H "$P" -H 'If-Match: "{config_id}"' -H "Authorizati
   transaction), re-encrypting archives written before encryption was turned on, `-master-key`
   for `patchlog archive restore` (the library restore decrypts), key rotation, KMS adapters.
 
+### Sealed namespaces (Addendum E.2)
+
+```sh
+patchlog serve -master-key /etc/patchlog/master.key [-rotate-epochs 24h] [-rotate-on-revoke]
+curl -X PATCH $B/ns/matches -H "$P" -H 'If-Match: "{config_id}"' -H "Authorization: Bearer $STAR" \
+  -d '[{"op":"add","path":"/encryption","value":{"level":"sealed"}}]'
+curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs":[1]}'
+```
+
+- **What it is.** A sealed namespace keeps encryption at rest (E1) and serves every response
+  that carries content as a JWE (`Content-Type: application/jose`, `alg: dir`, `enc: A256GCM`,
+  protected header `{ kid: "{ns}#{e}", pl, zip? }`, `internal/seal`). The CDN then holds only
+  ciphertext and caches it with the **public** classes of §9, whatever `read` says.
+- **Wire shapes.**
+  - `GET /r/{ns}/{name}/rev/{id}`: one JWE, `pl { ns, name, id, kind: "doc" }`.
+  - `…/rev/{id}/log` and resource long-polls: a JSON array of per-entry JWE strings, `pl { ns,
+    name, id, kind: "rev" | "tombstone" }`, each sealing the plaintext entry object.
+  - `GET /ns/{ns}/rev/{ns_id}`: one JWE, `pl { ns, id: ns_id, kind: "config" }`.
+  - `…/log?since=` ranges and namespace long-polls: **one** JWE per range, never compressed,
+    `pl { ns, range: [since, id] }` (`since` `""` from the start), sealing the JSON array.
+  - Events: the SSE `data:` line is a JWE. Resource events carry the entry's JWE (the same
+    bytes as in the log); namespace events, and `purge`/`prune` events on resource streams,
+    carry the range `(prev, id]` of their one entry (the same bytes as
+    `…/rev/{id}/log?since={prev}`), whose plaintext is a one-element array.
+  - Clear: URLs, status codes, `ETag`, `X-Revision`, `X-Config-Revision`, `X-Namespace-Revision`,
+    `X-Cursor`, error bodies (including `410` bodies with `tombstone`/`last`/`horizon`), and the
+    metadata listings `/heads` and `/branches` (names and ids are in URLs anyway, §E.2.2).
+    Write responses go only to the writer (`no-store`) and stay plaintext.
+- **Keys.** Each (namespace, epoch) has a 256-bit random epoch key, wrapped by the key store in
+  `epoch_keys`. `encryption.epoch` starts at 1 (absent means 1; a new namespace or branch may
+  name any start) and a config write may only keep it or add exactly 1, which starts a new
+  epoch; its start time is that write's time. Resource content is sealed under
+  `K_r = HKDF(K_e, ns, name)`, namespace documents and ranges under `K_e`.
+- **Which epoch.** A revision or tombstone is sealed under the epoch in force when it was
+  written (recorded in `rev_epochs`); a namespace document or range under the epoch in force at
+  that entry (at the range's end). Content with no such epoch — read through from a base, or
+  written before the namespace became sealed — gets the serving namespace's epoch current at
+  its first sealing, kept forever.
+- **Stored once, served forever.** Sealed bytes are made lazily on first read and stored in
+  `sealed` (per serving namespace); concurrent first readers `INSERT OR IGNORE` and re-read, so
+  everyone gets identical bytes, and ETags, `304`s and CDN copies stay valid. Ranges are stored
+  too, at most 4096 per namespace (the oldest are dropped and resealed with fresh bytes on
+  demand; event streams and long-polls reuse them). Purges delete a resource's sealed rows,
+  a namespace purge also the epoch keys (cryptographic), and prunes the rows of what they
+  pruned (kept documents keep their bytes). Documents of 1 KiB or more are DEFLATE-compressed
+  before sealing, each on its own; ranges never are.
+- **`POST /ns/{ns}/keys`** `{ "epochs"?: [e…], "resources"?: [name…] }` → `{ "keys": [ { kid,
+  resource?, key } ] }`, `Cache-Control: no-store`. It needs a verified grant with `read`
+  (also for a `read: "public"` sealed namespace); with `-dev` anyone gets epoch keys. A grant
+  restricted to resources (rules on `/resource`, or a key with `readScope: "resource"`) gets
+  `K_r` for each requested resource it may read, others get `K_e` (and `resources` is ignored).
+  Epochs run from the one in force at the root block's `nbf` (without `nbf`: the first), capped
+  to the last `encryption.historyEpochs`, up to the current one, never one that started at or
+  after the grant's effective `exp`; requested epochs outside that are omitted. A root block
+  with `"enc": { "kty": "OKP", "crv": "X25519", "x" }` gets keys HPKE-wrapped to it
+  (`{ kid, resource?, suite, wrapped }`, `seal.WrapKey`) and never raw ones; narrowing blocks
+  can't carry `enc`.
+- **`$nonce`.** Every create, append and restore patch set must end up setting `/$nonce` to 128
+  fresh random bits (26 base32 characters, `seal.HasFreshNonce`) that differ from the previous
+  document's, or it is `422 invalid` — so schemas of sealed namespaces must allow `$nonce`. A
+  restore with `[]` is exempt: its id hashes the (public) tombstone id and `[]`, so it reveals
+  nothing, and the document it brings back was written with a nonce.
+- **Rotation.** A config write incrementing `encryption.epoch` (a `*` key, §7.4) rotates;
+  earlier revisions keep their epoch and bytes. `-rotate-epochs 24h` rotates every sealed,
+  unfrozen namespace whose epoch is that old, as `system:rotate` (`Engine.RotateEpoch`,
+  `Engine.RotateDue`). `-rotate-on-revoke` follows a committed config write that adds to
+  `revoked` or removes or changes a key with a rotation of that namespace and its sealed
+  branches.
+- **Access and branches.** `read: "grant"` still decides who may fetch ciphertext (without it:
+  `401`/`404`); a sealed namespace may also be `read: "public"`. A branch of a sealed namespace
+  must be sealed (the level rule) and has its own epoch keys, sealing read-through content under
+  them; a sealed branch of a sealed non-public base may be `public` (it only exposes
+  ciphertext; a relaxation of §7.4). A namespace with public dependents that aren't sealed
+  can't become sealed (`409 in_use` with `dependents`). Remote branches of sealed namespaces,
+  and registrations of them, are `422`.
+- **Client.** `client.WithKeys(client.NewKeys(recipientPriv))` makes `Doc`, `Log`, `NSDoc`,
+  `NSLog`, `LongPoll`, `ResourceLongPoll`, `NSEvents` and `ResourceEvents` decrypt
+  transparently, checking each JWE's kid and `pl` against the request (and that log entries
+  chain); keys are fetched from `/keys` and cached by kid and resource. `client.Sealed(ns)`
+  reports whether a namespace is sealed; without keys, sealed content is `client.ErrNoKeys`.
+  The follower, merge, bundle and other client-based tools thus work over sealed namespaces
+  when their client has keys.
+
 ### Tree and catalog (Addendum B)
 
 `patchlog tree -catalog cat` follows a catalog namespace and the content namespaces it trusts, and
@@ -342,7 +430,8 @@ namespace's name, or `"*"`, in `ns`.
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
   `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, `heads.seq`, `deks`
-  (wrapped data keys of encryption at rest, Addendum E.1); and
+  (wrapped data keys of encryption at rest, Addendum E.1), `epoch_keys`, `rev_epochs` and
+  `sealed` (sealed namespaces, Addendum E.2); and
   for §G.3 `remote_branches` (registrations at the source: base, remote origin and name,
   `at`, latest and previous entry, expiry), `remote_bases` (per remote branch: its shadow,
   A's origin, namespace and `at`, the follow checkpoint and the registration at A) and
@@ -379,6 +468,7 @@ internal/catalog     tree-derived access and grant issuing (§B.11)
 internal/bundle      bundle format, export and import (§G.4)
 internal/archive     file:// archives for pruning and offline restore (§8.6)
 internal/keystore    master key file and key wrapping for encryption at rest (Addendum E.1)
+internal/seal        JWE sealing, key derivation, HPKE wrapping, $nonce (Addendum E)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
 internal/ids        content-addressed ids (§3.2–§3.5)
 internal/pointer    JSON Pointer

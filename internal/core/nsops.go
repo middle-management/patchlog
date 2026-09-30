@@ -167,6 +167,26 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 	if err := t.checkEncryption(cur, cfg, baseLevel); err != nil {
 		return nil, err
 	}
+	if cfg.level >= levelSealed && cur.level < levelSealed {
+		// Remote branches of sealed namespaces aren't supported (§G.3,
+		// §G.5): their mirrored content would need their own sealing.
+		if t.remoteShadow(n) != nil {
+			return nil, invalid("/encryption: a remote branch cannot be sealed on this server")
+		}
+		if t.registeredRemote(n) {
+			return nil, invalid("/encryption: a namespace with registered remote branches cannot become sealed on this server")
+		}
+		// §7.4: its content would stay public through them.
+		var deps []string
+		for _, d := range t.publicDependents(n) {
+			if b := t.nsByName(d); b != nil && t.nsLevel(b) < levelSealed {
+				deps = append(deps, d)
+			}
+		}
+		if len(deps) > 0 {
+			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "a namespace with public dependents cannot become sealed")
+		}
+	}
 	if cfg.level > cur.level {
 		if deps := t.lowerDependents(n, cfg.level); len(deps) > 0 {
 			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "raise the encryption level of these branches first")
@@ -185,7 +205,7 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 			}
 		}
 		base := t.nsByID(n.base.Int64)
-		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
+		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" && !sealedPair(cfg.level, t.nsLevel(base)) {
 			return nil, invalid("a branch of a non-public namespace cannot be public")
 		}
 	}
@@ -196,11 +216,25 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		}
 	}
 	if cur.Read == "public" && cfg.Read != "public" {
-		if deps := t.publicDependents(n); len(deps) > 0 {
+		var deps []string
+		for _, d := range t.publicDependents(n) {
+			// A sealed branch of a sealed base may stay public.
+			if b := t.nsByName(d); b == nil || !sealedPair(t.nsLevel(b), cfg.level) {
+				deps = append(deps, d)
+			}
+		}
+		if len(deps) > 0 {
 			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps))
 		}
 	}
 	return cfg, nil
+}
+
+// sealedPair reports a sealed branch of a sealed base. Such a branch may be
+// public even if its base isn't (a relaxation of §7.4): it only ever serves
+// ciphertext under its own keys (§E.2.5).
+func sealedPair(branchLevel, baseLevel int) bool {
+	return branchLevel == levelSealed && baseLevel == levelSealed
 }
 
 func (t *tx) publicDependents(n *nsRow) []string {
@@ -232,7 +266,8 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 		n.id, p.id[:], n.configSeq, string(p.canon), string(jsonv.Canonical(p.doc)), author, t.now.UnixMilli())
 	t.must(err)
 	seq, _ := r.LastInsertId()
-	raised := p.cfg.level > t.config(n.configSeq).level
+	old := t.config(n.configSeq)
+	raised := p.cfg.level > old.level
 	_, err = t.Exec(`UPDATE namespaces SET frozen = ?, config_seq = ? WHERE ns = ?`, p.cfg.Frozen, seq, n.id)
 	t.must(err)
 	n.frozen = p.cfg.Frozen
@@ -241,6 +276,9 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 		// Turning encryption at rest on encrypts what is stored (§E.1).
 		t.encryptNamespace(n)
 	}
+	// A sealed namespace's epoch key starts with the config write that
+	// begins its epoch (§E.2.1).
+	t.sealedConfigWritten(n, old, p.cfg)
 	return seq
 }
 
@@ -361,7 +399,8 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if cfg.Successor != "" {
 		return nil, invalid("a new namespace cannot have a successor")
 	}
-	_, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.authorID(a.id()))
+	nn, id, nsID := t.insertNamespace(req.NS, cc.Patches, doc, cfg.Frozen, t.authorID(a.id()))
+	t.sealedConfigWritten(nn, nil, cfg)
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: id.String()}, nil
 }
 
@@ -523,7 +562,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 			break
 		}
 	}
-	if cfg.Read == "public" && bcfg.Read != "public" {
+	if cfg.Read == "public" && bcfg.Read != "public" && !sealedPair(cfg.level, t.nsLevel(base)) {
 		return nil, invalid("a branch of a non-public namespace cannot be public")
 	}
 	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {
@@ -548,6 +587,8 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	cseq, _ := r.LastInsertId()
 	bn := t.nsByID(bid)
 	t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
+	// A sealed branch has its own epoch keys (§E.2.5).
+	t.sealedConfigWritten(bn, nil, cfg)
 	_, nsID := t.appendNS(base, map[string]any{"kind": "branch", "name": br.Name, "at": atID.String(), "target": cfgID.String()}, nil, &cseq, base.configSeq, author)
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
 }
@@ -657,6 +698,8 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 		t.tags = append(t.tags, "r:"+n.name+"/"+name)
 		t.flushDocs = true
 	}
+	// Sealed copies of its content go too (§E.2.2).
+	t.deleteSealed(`ns = ? AND name = ?`, n.id, name)
 	// A remote branch's mirrored copy is its own: it goes too (§G.3).
 	if sh := t.remoteShadow(n); sh != nil {
 		t.purgeShadow(sh, name)
@@ -716,6 +759,9 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		}
 		t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.deleteDEKs(`ns = ?`, n.id)
+		// Sealed bytes and epoch keys go too (§E.2, §8.5).
+		t.deleteSealed(`ns = ?`, n.id)
+		t.deleteEpochKeys(n.id)
 		_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
 		_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
@@ -1007,6 +1053,9 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 		t.must(err)
 	}
 	t.flushDocs = true
+	// Sealed copies of what was pruned go too, wherever they are served
+	// (a branch reads through); kept documents keep their bytes.
+	t.deletePrunedSealed(own.id, h.seq, keepSeqs)
 	keepJSON := string(jsonv.Canonical(anyStrings(keepStrs)))
 	_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = ? WHERE res = ?`, h.seq, keepJSON, own.id)
 	t.must(err)

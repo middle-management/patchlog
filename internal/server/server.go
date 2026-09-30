@@ -15,6 +15,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Server is the HTTP API.
@@ -50,6 +51,7 @@ func New(e *core.Engine) *Server {
 	m.HandleFunc("POST /ns/{ns}/branches", s.nsCreateBranch)
 	m.HandleFunc("POST /ns/{ns}/batch", s.nsBatch)
 	m.HandleFunc("POST /ns/{ns}/purge", s.nsPurge)
+	m.HandleFunc("POST /ns/{ns}/keys", s.nsKeys)
 	return s
 }
 
@@ -311,10 +313,14 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(304)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
+		body, ct := rev.Doc, "application/json"
+		if rev.JWE != "" {
+			body, ct = []byte(rev.JWE), seal.ContentType
+		}
+		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(200)
 		if r.Method != http.MethodHead {
-			w.Write(rev.Doc)
+			w.Write(body)
 		}
 	case rev.Status == 404:
 		cache(w, ccShort, rev.Public)
@@ -352,11 +358,7 @@ func (s *Server) writeLog(w http.ResponseWriter, lg *core.Log, ns string, tags [
 	switch lg.Status {
 	case 200:
 		cache(w, ccImmutable, lg.Public, tags...)
-		entries := make([]any, len(lg.Entries))
-		for i, e := range lg.Entries {
-			entries[i] = e
-		}
-		writeJSON(w, 200, entries)
+		writeLogBody(w, lg)
 	case 404:
 		cache(w, ccShort, lg.Public)
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
@@ -368,6 +370,30 @@ func (s *Server) writeLog(w http.ResponseWriter, lg *core.Log, ns string, tags [
 		}
 		cache(w, ccLong, lg.Public)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
+	}
+}
+
+// writeLogBody writes a 200 log answer: the entries, or in a sealed
+// namespace (Addendum E.2) the range's JWE (namespace logs) or an array of
+// per-entry JWEs (resource logs).
+func writeLogBody(w http.ResponseWriter, lg *core.Log) {
+	switch {
+	case lg.Sealed && lg.Range != "":
+		w.Header().Set("Content-Type", seal.ContentType)
+		w.WriteHeader(200)
+		io.WriteString(w, lg.Range)
+	case lg.Sealed:
+		entries := make([]any, len(lg.EntryJWEs))
+		for i, e := range lg.EntryJWEs {
+			entries[i] = e
+		}
+		writeJSON(w, 200, entries)
+	default:
+		entries := make([]any, len(lg.Entries))
+		for i, e := range lg.Entries {
+			entries[i] = e
+		}
+		writeJSON(w, 200, entries)
 	}
 }
 
@@ -550,10 +576,14 @@ func (s *Server) nsRev(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(304)
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	body, ct := info.Doc, "application/json"
+	if info.JWE != "" {
+		body, ct = []byte(info.JWE), seal.ContentType
+	}
+	w.Header().Set("Content-Type", ct)
 	w.WriteHeader(200)
 	if r.Method != http.MethodHead {
-		w.Write(info.Doc)
+		w.Write(body)
 	}
 }
 
@@ -916,11 +946,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			w.Header().Set(header, lg.Last)
 			w.Header().Set("X-Cursor", strconv.FormatInt(time.Now().UnixNano()/int64(interval), 10))
 			setLive(w, lg.Public, fmt.Sprintf("public, max-age=0, s-maxage=%d", int(interval.Seconds())), tags)
-			entries := make([]any, len(lg.Entries))
-			for i, e := range lg.Entries {
-				entries[i] = e
-			}
-			writeJSON(w, 200, entries)
+			writeLogBody(w, lg)
 			return
 		}
 		select {
@@ -1017,10 +1043,26 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 
 // sse writes one server-sent event.
 func sse(w http.ResponseWriter, event, id string, data any) {
-	fmt.Fprintf(w, "event: %s\nid: %s\ndata: %s\n\n", event, id, jsonv.Canonical(jsonv.FromGo(toModel(data))))
+	sseRaw(w, event, id, string(jsonv.Canonical(jsonv.FromGo(toModel(data)))))
+}
+
+// sseRaw writes one server-sent event whose data is one line of text (a
+// JWE in sealed namespaces, Addendum E.2).
+func sseRaw(w http.ResponseWriter, event, id, data string) {
+	fmt.Fprintf(w, "event: %s\nid: %s\ndata: %s\n\n", event, id, data)
 	if f, ok := w.(http.Flusher); ok {
 		f.Flush()
 	}
+}
+
+// sseEntry writes entry i of lg: its JWE in a sealed namespace.
+func sseEntry(w http.ResponseWriter, event string, lg *core.Log, i int) {
+	e := lg.Entries[i]
+	if lg.Sealed {
+		sseRaw(w, event, e["id"].(string), lg.EntryJWEs[i])
+		return
+	}
+	sse(w, event, e["id"].(string), e)
 }
 
 // prunedBody is the 410 of §7.1 for pruned history.
@@ -1072,7 +1114,7 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 	cred := creds(r)
 	// Wait before every fetch, so no entry committed in between is missed.
 	wait := s.e.Wait(ns)
-	lg, err := s.e.NamespaceLog(r.Context(), ns, "", since, 0, cred)
+	lg, err := s.e.NamespaceEvents(r.Context(), ns, since, cred)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1083,8 +1125,8 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	startSSE(w)
 	for {
-		for _, e := range lg.Entries {
-			sse(w, e["kind"].(string), e["id"].(string), e)
+		for i, e := range lg.Entries {
+			sseEntry(w, e["kind"].(string), lg, i)
 			since = e["id"].(string)
 		}
 		select {
@@ -1098,7 +1140,7 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		wait = s.e.Wait(ns)
-		lg, err = s.e.NamespaceLog(r.Context(), ns, "", since, 0, cred)
+		lg, err = s.e.NamespaceEvents(r.Context(), ns, since, cred)
 		if err != nil || lg.Status != 200 {
 			return
 		}
@@ -1132,12 +1174,12 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	startSSE(w)
 	emit := func(lg *core.Log) {
-		for _, e := range lg.Entries {
+		for i, e := range lg.Entries {
 			ev := "revision"
 			if e["kind"] == "tombstone" {
 				ev = "tombstone"
 			}
-			sse(w, ev, e["id"].(string), e)
+			sseEntry(w, ev, lg, i)
 			since = e["id"].(string)
 		}
 	}
@@ -1155,21 +1197,21 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		wait = s.e.Wait(ns)
-		nl, err := s.e.NamespaceLog(r.Context(), ns, "", nsSince, 0, cred)
+		nl, err := s.e.NamespaceEvents(r.Context(), ns, nsSince, cred)
 		if err != nil || nl.Status != 200 {
 			return
 		}
 		nsSince = nl.Last
-		for _, e := range nl.Entries {
+		for i, e := range nl.Entries {
 			if e["resource"] != name {
 				continue
 			}
 			switch e["kind"] {
 			case "purge":
-				sse(w, "purge", e["id"].(string), e)
+				sseEntry(w, "purge", nl, i)
 				return
 			case "prune":
-				sse(w, "prune", e["id"].(string), e)
+				sseEntry(w, "prune", nl, i)
 			}
 		}
 		lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, 0, cred)
@@ -1178,4 +1220,70 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		}
 		emit(lg)
 	}
+}
+
+// nsKeys answers POST /ns/{ns}/keys (§E.2.3): { "epochs"?: [e…],
+// "resources"?: [name…] } → { "keys": [ { kid, resource?, key | suite,
+// wrapped } ] }, never cached.
+func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
+	noStore(w)
+	ns := r.PathValue("ns")
+	if err := validNames(ns, ""); err != nil {
+		writeErr(w, err)
+		return
+	}
+	var kr core.KeysRequest
+	if r.ContentLength != 0 {
+		body, err := readJSON(r, 1<<20)
+		if err != nil {
+			writeErr(w, err)
+			return
+		}
+		m, ok := body.(map[string]any)
+		if !ok {
+			writeErr(w, badInput(`body must be { "epochs"?, "resources"? }`))
+			return
+		}
+		for k, v := range m {
+			arr, ok := v.([]any)
+			if !ok {
+				writeErr(w, badInput(k+" must be an array"))
+				return
+			}
+			switch k {
+			case "epochs":
+				kr.Epochs = []int{}
+				for _, x := range arr {
+					f, ok := x.(float64)
+					if !ok || f < 0 || f != float64(int(f)) {
+						writeErr(w, badInput("epochs must be non-negative integers"))
+						return
+					}
+					kr.Epochs = append(kr.Epochs, int(f))
+				}
+			case "resources":
+				for _, x := range arr {
+					n, ok := x.(string)
+					if !ok {
+						writeErr(w, badInput("resources must be resource names"))
+						return
+					}
+					kr.Resources = append(kr.Resources, n)
+				}
+			default:
+				writeErr(w, badInput("unknown member "+k))
+				return
+			}
+		}
+	}
+	keys, err := s.e.Keys(r.Context(), ns, creds(r), kr)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	out := make([]any, len(keys))
+	for i, k := range keys {
+		out[i] = k
+	}
+	writeJSON(w, 200, map[string]any{"keys": out})
 }
