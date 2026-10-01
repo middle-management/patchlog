@@ -44,12 +44,22 @@ package core
 //   - Prune (§8.6) needs an archive and the horizon's document as a sealed
 //     snapshot (pl {ns, name, id, kind: "snapshot"}); keep isn't supported.
 //     Retention isn't applied by the server.
+//   - Blobs (§E.3.1). Clients encrypt blobs under keys of their own, so the
+//     server stores and serves them as uploaded (SealedBlobType only). A
+//     sealed op lists the blobs its document references in plaintext,
+//     {"op":"sealed","value":"<JWE>","blobs":[ids]}, part of the hashed
+//     patch set; a restore with [] keeps the last live document's list.
+//     Step 4 checks each is available (checkDeclared) and step 7 attaches
+//     them and records the list in blob_refs, which outlives pruning, like
+//     a document's references. A prune's snapshot may declare its own list
+//     ("blobs" beside "snapshot"), which then stands for the horizon's.
 //   - POST /ns/{ns}/keys relays the keyring's wrapped keys for the grant's
 //     enc recipient only.
 
 import (
 	"database/sql"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/ids"
@@ -144,8 +154,10 @@ func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 				ss.action = "append"
 			}
 			ss.canon = jsonv.Canonical(step.Patches)
-			if !(ss.action == "restore" && string(ss.canon) == "[]") {
-				jwe, ok := seal.SealedJWE(step.Patches)
+			if ss.action == "restore" && string(ss.canon) == "[]" {
+				ss.keepsList = true
+			} else {
+				jwe, blobs, ok := seal.SealedOp(step.Patches)
 				if !ok {
 					if ss.action == "restore" {
 						return invalid(`e2e namespaces take a patch set of one sealed op, [{"op":"sealed","value":"<JWE>"}], or [] for a restore (§6.2, §E.3.1)`)
@@ -159,6 +171,10 @@ func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 				if err := t.checkSealedHeader(n, cfg, jwe, seal.PatchSetPL(n.name, s.Resource, parent), "sealed patch set"); err != nil {
 					return err
 				}
+				var err *Error
+				if ss.declared, err = parseDeclared(blobs); err != nil {
+					return err
+				}
 			}
 			ss.id = ids.Revision(parentID, ss.canon)
 			ss.writes = []string{}
@@ -170,6 +186,60 @@ func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 		s.steps = append(s.steps, ss)
 	}
 	return nil
+}
+
+// parseDeclared parses a sealed op's declared blob list (§E.3.1): distinct
+// blob ids.
+func parseDeclared(list []string) ([]ids.ID, *Error) {
+	out := make([]ids.ID, 0, len(list))
+	seen := map[ids.ID]bool{}
+	for i, s := range list {
+		id, err := ids.Parse(s)
+		if err != nil {
+			return nil, blobErr("/0/blobs/"+strconv.Itoa(i), "the declared blob list holds blob ids (§E.3.1)")
+		}
+		if seen[id] {
+			return nil, blobErr("/0/blobs/"+strconv.Itoa(i), "the declared blob list names a blob twice (§E.3.1)")
+		}
+		seen[id] = true
+		out = append(out, id)
+	}
+	return out, nil
+}
+
+// checkDeclared is step 4 for a sealed step (§6.2, §E.3.1): every blob of
+// its declared list is available to the item's resource, and is a sealed
+// blob, the only type an e2e reference has.
+func (t *tx) checkDeclared(n *nsRow, s *itemState, step *stepState, list []ids.ID, uploader string, cutoff int64, bs *batchSource) *Error {
+	step.blobs = map[ids.ID]*blobRow{}
+	for i, bid := range list {
+		ptr := "/0/blobs/" + strconv.Itoa(i)
+		src := t.availableBlob(n, s, uploader, cutoff, bid, bs)
+		if src == nil {
+			return blobErr(ptr, "the declared blob is not available to this resource (§7.8, §E.3.1)")
+		}
+		if src.typ != SealedBlobType {
+			return blobErr(ptr, "the declared blob is not a sealed blob (§E.3.1)")
+		}
+		step.blobs[bid] = src
+	}
+	return nil
+}
+
+// declaredAt is the list of blobs the document at revision row references
+// as the server knows it (blob_refs): at E3, the declared list of the
+// revision, or for a tombstone that of the last live document (§E.3.1).
+func (t *tx) declaredAt(row *revRow) []ids.ID {
+	rows, err := t.Query(`SELECT bid FROM blob_refs WHERE res = ? AND from_seq <= ? AND (to_seq IS NULL OR to_seq > ?) ORDER BY bid`, row.res, row.seq, row.seq)
+	t.must(err)
+	defer rows.Close()
+	var out []ids.ID
+	for rows.Next() {
+		var b []byte
+		t.must(rows.Scan(&b))
+		out = append(out, ids.FromBytes(b))
+	}
+	return out
 }
 
 // checkKeyring checks the keyring resource's documents in an e2e
@@ -324,7 +394,8 @@ func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, 
 // protect; it must be the requested one, since snapshot is sealed for it.
 // The pruned range is archived first, snapshot becomes h's kept document,
 // and no document is computed.
-func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revRow, requested ids.ID, snapshot, dest string, author int64) (*PruneResult, error) {
+func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revRow, requested ids.ID, pr PruneRequest, dest string, author int64) (*PruneResult, error) {
+	snapshot := pr.Snapshot
 	cur := own.horizonSeq
 	if cur.Valid && h.seq <= cur.Int64 {
 		return &PruneResult{Horizon: t.rev(cur.Int64).id.String()}, nil
@@ -340,6 +411,25 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	if err := t.checkSealedHeader(n, cfg, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot"); err != nil {
 		return nil, err
 	}
+	// The snapshot's declared blobs (§E.3.1) must be attached here: they
+	// are what the kept document references.
+	var kept []ids.ID
+	if pr.HasBlobs {
+		var err *Error
+		if kept, err = parseDeclared(pr.Blobs); err != nil {
+			return nil, err
+		}
+		if len(kept) > cfg.Limits.BlobsPerDocument {
+			return nil, limitErr(422, fmt.Sprintf("more than %d blobs declared", cfg.Limits.BlobsPerDocument))
+		}
+		for i, bid := range kept {
+			if b := t.attachedBlob(own.id, bid); b == nil || b.pruned {
+				return nil, blobErr("/blobs/"+strconv.Itoa(i), "the snapshot declares a blob that isn't attached to this resource (§E.3.1)")
+			}
+		}
+	} else {
+		kept = t.declaredAt(h)
+	}
 	from := own.horizonSeq.Int64
 	if !cur.Valid {
 		t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ?`, own.id).Scan(&from))
@@ -351,10 +441,9 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	res := &PruneResult{Horizon: h.id.String(), Archive: u}
 	_, err = t.Exec(`INSERT INTO e2e_snapshots (seq, res, jwe) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, jwe = excluded.jwe`, h.seq, own.id, snapshot)
 	t.must(err)
-	// TODO(blobs-e2e): end the attachments that no kept revision's declared
-	// blob list names (§E.3.1: the snapshot carries its blobs list), as
-	// pruneBlobs does from blob_refs for documents the server can read.
-	// blob_refs is not written for sealed writes yet.
+	// Attachments end unless the snapshot or a revision after the horizon
+	// declares them (§7.8, §E.3.1); the archive written above has them.
+	t.pruneBlobsE2E(own.id, h.seq, kept)
 	_, err = t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
 	_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res = ? AND seq < ?`, own.id, h.seq)
@@ -365,4 +454,41 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &own.id, &target, n.configSeq, author)
 	res.NSID = nsID.String()
 	return res, nil
+}
+
+// pruneBlobsE2E ends the attachments of res that neither kept, the
+// snapshot's declared list, nor the declared list of a revision after the
+// horizon hseq names (§7.8, §E.3.1). blob_refs keeps every declared list
+// after pruning, with the revisions' skeletons; the snapshot's stands for
+// the horizon's document, so the horizon's own list counts only through it.
+func (t *tx) pruneBlobsE2E(res, hseq int64, kept []ids.ID) {
+	keep := map[ids.ID]bool{}
+	for _, bid := range kept {
+		keep[bid] = true
+	}
+	var next sql.NullInt64
+	t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ? AND seq > ?`, res, hseq).Scan(&next))
+	rows, err := t.Query(`SELECT `+blobCols+` FROM blobs WHERE res = ? AND pruned = 0`, res)
+	t.must(err)
+	var all []*blobRow
+	for rows.Next() {
+		b, err := scanBlobRow(rows)
+		t.must(err)
+		all = append(all, b)
+	}
+	rows.Close()
+	for _, b := range all {
+		alive := keep[b.bid]
+		if !alive && next.Valid {
+			// An interval [from, to) of the chain covers a revision after
+			// the horizon exactly when it reaches past the next one.
+			t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM blob_refs WHERE res = ? AND bid = ? AND (to_seq IS NULL OR to_seq > ?))`, res, b.bid[:], next.Int64).Scan(&alive))
+		}
+		if alive {
+			continue
+		}
+		_, err := t.Exec(`UPDATE blobs SET pruned = 1 WHERE res = ? AND bid = ?`, res, b.bid[:])
+		t.must(err)
+		t.gcBytes(b.owner, b.hash)
+	}
 }

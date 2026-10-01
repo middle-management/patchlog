@@ -20,7 +20,11 @@ package client
 //     A revision that doesn't apply or doesn't validate is flagged with its
 //     author and left out: the fold continues from the last valid document.
 //   - PruneE2E folds the horizon's document and supplies it sealed as the
-//     prune's snapshot (§8.6).
+//     prune's snapshot (§8.6), with its declared blob list.
+//   - Blobs (§E.3.1, sealedblobs.go). Writes declare the blobs of the
+//     resulting document in the sealed op (BlobIDs), so a write folds the
+//     document even WithoutValidation; folds flag a revision whose list
+//     differs from its decrypted document.
 //   - Keyring administration (InitKeyring, AddReader, RotateEpoch) writes
 //     the namespace's plaintext "keyring" resource (seal.Keyring), and
 //     RotateEpoch bumps encryption.epoch in the same batch.
@@ -294,6 +298,13 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 // [{"op":"sealed","value":"<JWE>"}]. Keep the bytes until the write is
 // acknowledged: sealing again gives another id (§E.3.1).
 func (x *E2E) SealPatches(ctx context.Context, ns, name, parent string, patches any) ([]byte, error) {
+	return x.SealPatchesBlobs(ctx, ns, name, parent, patches, nil)
+}
+
+// SealPatchesBlobs is SealPatches with the declared blob list of the
+// sealed op (§E.3.1): the ids of every blob the resulting document
+// references (BlobIDs), omitted when empty.
+func (x *E2E) SealPatchesBlobs(ctx context.Context, ns, name, parent string, patches any, blobs []string) ([]byte, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
 	}
@@ -310,7 +321,11 @@ func (x *E2E) SealPatches(ctx context.Context, ns, name, parent string, patches 
 	if err != nil {
 		return nil, err
 	}
-	return seal.SealPatchSetPad(key, kid, ns, name, parent, v, cfg.Pad)
+	body, err := seal.SealPatchSetPad(key, kid, ns, name, parent, v, cfg.Pad)
+	if err != nil || len(blobs) == 0 {
+		return body, err
+	}
+	return seal.WithBlobs(body, blobs)
 }
 
 // send sends a sealed patch set, resending the same bytes after a
@@ -333,47 +348,55 @@ func (x *E2E) send(ctx context.Context, write func(body []byte) (*WriteResult, e
 	return nil, err
 }
 
-// validateWrite checks the document patches produce on base (a revision
-// id, "" for genesis) against its $schema before writing.
-func (x *E2E) validateWrite(ctx context.Context, ns, name, base string, patches any) error {
-	if x.noValidate {
-		return nil
-	}
+// prepareWrite folds the document patches produce on base (a revision
+// id, "" for genesis), checks it against its $schema and returns its
+// declared blob list (§E.3.1). WithoutValidation skips the check, and a
+// document it can't fold then declares no blobs.
+func (x *E2E) prepareWrite(ctx context.Context, ns, name, base string, patches any) ([]string, error) {
 	v, err := ToValue(patches)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	fail := func(err error) ([]string, error) {
+		if x.noValidate {
+			return nil, nil
+		}
+		return nil, err
 	}
 	var doc any
 	exists := false
 	if base != "" {
 		d, err := x.DocE2E(ctx, ns, name, base)
 		if err != nil {
-			return err
+			return fail(err)
 		}
 		doc, exists = d.Value, true
 	}
 	ops, err := patch.Parse(v)
 	if err != nil {
-		return fmt.Errorf("client: e2e write %s/%s: %w", ns, name, err)
+		return fail(fmt.Errorf("client: e2e write %s/%s: %w", ns, name, err))
 	}
 	nd, _, err := patch.Apply(doc, exists, ops, patch.Options{})
 	if err != nil {
-		return fmt.Errorf("client: e2e write %s/%s: %w", ns, name, err)
+		return fail(fmt.Errorf("client: e2e write %s/%s: %w", ns, name, err))
 	}
-	if msg, err := x.validate(ctx, nd); err != nil {
-		return err
-	} else if msg != "" {
-		return fmt.Errorf("client: e2e write %s/%s: the document doesn't validate against its $schema: %s", ns, name, msg)
+	if !x.noValidate {
+		if msg, err := x.validate(ctx, nd); err != nil {
+			return nil, err
+		} else if msg != "" {
+			return nil, fmt.Errorf("client: e2e write %s/%s: the document doesn't validate against its $schema: %s", ns, name, msg)
+		}
 	}
-	return nil
+	return BlobIDs(nd), nil
 }
 
 // CreateSealed creates ns/name with a sealed genesis patch set.
 func (x *E2E) CreateSealed(ctx context.Context, ns, name string, patches any, opts ...WriteOption) (*WriteResult, error) {
-	if err := x.validateWrite(ctx, ns, name, "", patches); err != nil {
+	blobs, err := x.prepareWrite(ctx, ns, name, "", patches)
+	if err != nil {
 		return nil, err
 	}
-	body, err := x.SealPatches(ctx, ns, name, "", patches)
+	body, err := x.SealPatchesBlobs(ctx, ns, name, "", patches, blobs)
 	if err != nil {
 		return nil, err
 	}
@@ -390,10 +413,11 @@ func (x *E2E) AppendSealed(ctx context.Context, ns, name, parent string, patches
 	if err := checkID("parent", parent); err != nil {
 		return nil, err
 	}
-	if err := x.validateWrite(ctx, ns, name, parent, patches); err != nil {
+	blobs, err := x.prepareWrite(ctx, ns, name, parent, patches)
+	if err != nil {
 		return nil, err
 	}
-	body, err := x.SealPatches(ctx, ns, name, parent, patches)
+	body, err := x.SealPatchesBlobs(ctx, ns, name, parent, patches, blobs)
 	if err != nil {
 		return nil, err
 	}
@@ -414,19 +438,19 @@ func (x *E2E) RestoreSealed(ctx context.Context, ns, name, tombstone string, pat
 	if patches == nil {
 		return x.send(ctx, func([]byte) (*WriteResult, error) { return x.c.Restore(ctx, ns, name, tombstone, []any{}, opts...) }, nil)
 	}
-	if !x.noValidate {
-		h, err := x.c.Head(ctx, ns, name)
-		if err != nil {
-			return nil, err
-		}
-		if h.State != Tombstoned || h.ID != tombstone {
-			return nil, fmt.Errorf("client: restore %s/%s: %s is not the head tombstone", ns, name, tombstone)
-		}
-		if err := x.validateWrite(ctx, ns, name, h.Last, patches); err != nil {
-			return nil, err
-		}
+	h, err := x.c.Head(ctx, ns, name)
+	if err != nil {
+		return nil, err
 	}
-	body, err := x.SealPatches(ctx, ns, name, tombstone, patches)
+	var blobs []string
+	if h.State == Tombstoned && h.ID == tombstone {
+		if blobs, err = x.prepareWrite(ctx, ns, name, h.Last, patches); err != nil {
+			return nil, err
+		}
+	} else if !x.noValidate {
+		return nil, fmt.Errorf("client: restore %s/%s: %s is not the head tombstone", ns, name, tombstone)
+	}
+	body, err := x.SealPatchesBlobs(ctx, ns, name, tombstone, patches, blobs)
 	if err != nil {
 		return nil, err
 	}
@@ -876,6 +900,10 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 			flag("the document doesn't validate against its $schema: " + msg)
 			continue
 		}
+		if _, declared, _ := seal.SealedOp(e.Patches); !sameBlobs(declared, BlobIDs(nd)) {
+			flag("the declared blob list doesn't match the blobs the document references (§E.3.1)")
+			continue
+		}
 		doc, exists, out.ValidID = nd, true, e.ID
 	}
 	if prev != id {
@@ -990,7 +1018,12 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	if err != nil {
 		return nil, err
 	}
-	return x.c.Prune(ctx, ns, name, PruneRequest{Horizon: horizon, Snapshot: snap})
+	// The snapshot carries its declared blob list (§E.3.1).
+	blobs := BlobIDs(d.Value)
+	if blobs == nil {
+		blobs = []string{}
+	}
+	return x.c.Prune(ctx, ns, name, PruneRequest{Horizon: horizon, Snapshot: snap, Blobs: blobs})
 }
 
 // --- keyring administration -------------------------------------------------

@@ -56,6 +56,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("POST /r/{ns}/{name}/prune", s.resourcePrune)
 	m.HandleFunc("PUT /r/{ns}/{name}/blob/{bid}", s.blobPut)
 	m.HandleFunc("GET /r/{ns}/{name}/blob/{bid}", s.blobGet)
+	m.HandleFunc("GET /r/{ns}/{name}/blob/{bid}/e/{e}", s.blobEpochGet)
 
 	m.HandleFunc("GET /ns/{ns}", s.nsHead)
 	m.HandleFunc("PATCH /ns/{ns}", s.nsPatch)
@@ -594,7 +595,7 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 	m, ok := body.(map[string]any)
 	h, _ := m["horizon"].(string)
 	if !ok || h == "" {
-		writeErr(w, badInput("body must be { horizon, keep?, snapshot? }"))
+		writeErr(w, badInput("body must be { horizon, keep?, snapshot?, blobs? }"))
 		return
 	}
 	var keep []string
@@ -620,7 +621,25 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	res, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, core.PruneRequest{Horizon: h, Keep: keep, Snapshot: snapshot})
+	pr := core.PruneRequest{Horizon: h, Keep: keep, Snapshot: snapshot}
+	if x, has := m["blobs"]; has {
+		// The snapshot's declared blob list (§E.3.1).
+		arr, ok := x.([]any)
+		if !ok {
+			writeErr(w, badInput("blobs must be an array of blob ids"))
+			return
+		}
+		pr.HasBlobs, pr.Blobs = true, []string{}
+		for _, b := range arr {
+			s, ok := b.(string)
+			if !ok {
+				writeErr(w, badInput("blobs must be an array of blob ids"))
+				return
+			}
+			pr.Blobs = append(pr.Blobs, s)
+		}
+	}
+	res, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, pr)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -673,15 +692,54 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if b.Status == 302 {
+		// A sealed namespace: to the latest epoch the blob is served under,
+		// cached as a head pointer (§E.2.2).
+		if !s.cache(w, r, ccHead, b.Public, resTags(ns, name)...) {
+			return
+		}
+		w.Header().Set("Location", "/r/"+ns+"/"+name+"/blob/"+bid+"/e/"+strconv.Itoa(b.Epoch))
+		w.WriteHeader(302)
+		return
+	}
+	s.serveBlob(w, r, ns, name, quote(bid), b)
+}
+
+// blobEpochGet serves a blob of a sealed namespace sealed under an epoch
+// (§E.2.2).
+func (s *Server) blobEpochGet(w http.ResponseWriter, r *http.Request) {
+	ns, name, bid, ep := r.PathValue("ns"), r.PathValue("name"), r.PathValue("bid"), r.PathValue("e")
+	if err := validNames(ns, name); err != nil {
+		writeErr(w, err)
+		return
+	}
+	b, err := s.e.ReadSealedBlob(r.Context(), ns, name, bid, ep, creds(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	s.serveBlob(w, r, ns, name, quote(bid+"."+ep), b)
+}
+
+// serveBlob writes a blob answer (§7.8 Reading) with ETag etag for a 200.
+func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, etag string, b *core.Blob) {
 	switch {
 	case b.Status == 200:
 		// Immutable, with the resource's tags (§9); ranges are 206.
 		if !s.cache(w, r, ccImmutable, b.Public, resTags(ns, name)...) {
 			return
 		}
-		w.Header().Set("ETag", quote(bid))
+		w.Header().Set("ETag", etag)
 		w.Header().Set("Content-Type", b.Type)
 		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(b.Data))
+	case b.NoStore:
+		// An epoch a sealed namespace doesn't serve the blob under, yet
+		// (§E.2.2).
+		if !s.edgeAllow(w, r, b.Public) {
+			return
+		}
+		noStore(w)
+		writeJSON(w, b.Status, map[string]any{"code": "not_found"})
 	case b.Status == 404:
 		if !s.cache(w, r, ccShort, b.Public) {
 			return
@@ -697,10 +755,6 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		writeJSON(w, 410, map[string]any{"code": "gone"})
-	default:
-		noStore(w)
-		writeJSON(w, b.Status, map[string]any{"code": "not_implemented",
-			"message": "blobs of sealed namespaces are not served yet (§E.2.2)"})
 	}
 }
 

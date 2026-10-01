@@ -24,26 +24,75 @@ func SealPatchSet(key []byte, kid, ns, name, parent string, patches any) ([]byte
 }
 
 // SealedJWE reports whether patchSet (a model value or JSON text) is exactly
-// one sealed op with a string value and no other members, and returns the
-// JWE.
+// one sealed op with a string value, and no other members than an optional
+// declared blob list (SealedOp), and returns the JWE.
 func SealedJWE(patchSet any) (string, bool) {
-	if b, ok := patchSet.([]byte); ok {
+	jwe, _, ok := SealedOp(patchSet)
+	return jwe, ok
+}
+
+// SealedOp parses a sealed patch set (a model value or JSON text): one
+// sealed op, {"op": "sealed", "value": "<JWE>", "blobs"?: [ids]}. It
+// returns the JWE and the declared blob list (§E.3.1), nil when the op has
+// no "blobs" member. ok is false for anything else, including a "blobs"
+// that isn't an array of strings; whether those are blob ids is the
+// caller's to check.
+func SealedOp(patchSet any) (jwe string, blobs []string, ok bool) {
+	if b, isBytes := patchSet.([]byte); isBytes {
 		p, err := jsonv.Parse(b)
 		if err != nil {
-			return "", false
+			return "", nil, false
 		}
 		patchSet = p
 	}
-	arr, ok := patchSet.([]any)
-	if !ok || len(arr) != 1 {
-		return "", false
+	arr, isArr := patchSet.([]any)
+	if !isArr || len(arr) != 1 {
+		return "", nil, false
 	}
-	op, ok := arr[0].(map[string]any)
-	if !ok || len(op) != 2 || op["op"] != OpSealed {
-		return "", false
+	op, isObj := arr[0].(map[string]any)
+	if !isObj || op["op"] != OpSealed {
+		return "", nil, false
 	}
-	s, ok := op["value"].(string)
-	return s, ok && s != ""
+	s, _ := op["value"].(string)
+	if s == "" {
+		return "", nil, false
+	}
+	switch len(op) {
+	case 2:
+	case 3:
+		list, isList := op["blobs"].([]any)
+		if !isList {
+			return "", nil, false
+		}
+		blobs = make([]string, len(list))
+		for i, x := range list {
+			if blobs[i], isList = x.(string); !isList {
+				return "", nil, false
+			}
+		}
+	default:
+		return "", nil, false
+	}
+	return s, blobs, true
+}
+
+// WithBlobs returns the sealed patch set sealed (canonical JSON of one
+// sealed op, as SealPatchSet returns it) with its declared blob list set to
+// blobs (§E.3.1), or without one when blobs is empty.
+func WithBlobs(sealed []byte, blobs []string) ([]byte, error) {
+	jwe, _, ok := SealedOp(sealed)
+	if !ok {
+		return nil, fmt.Errorf("%w: not a sealed patch set", ErrFormat)
+	}
+	op := map[string]any{"op": OpSealed, "value": jwe}
+	if len(blobs) > 0 {
+		list := make([]any, len(blobs))
+		for i, b := range blobs {
+			list[i] = b
+		}
+		op["blobs"] = list
+	}
+	return jsonv.Canonical([]any{op}), nil
 }
 
 // OpenPatchSet decrypts a sealed patch set (model value or JSON text),

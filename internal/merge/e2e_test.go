@@ -263,6 +263,35 @@ func TestE2EMergeValidates(t *testing.T) {
 	sameDoc(t, e.doc("m", "item"), map[string]any{"$schema": ref, "n": 2})
 }
 
+// §E.3.1, §F.8.1: a merge keeps blobs. Re-sealed ops keep their declared
+// lists, the blobs keep their ciphertext and ids, and the branch's blobs
+// reach the base through the batch's source, uploaded nowhere else.
+func TestE2EMergeKeepsBlobs(t *testing.T) {
+	e := newE3(t, nil)
+	e.branch("r7")
+	ref := must(e.x.UploadBlob(ctx, "r7", "derby", "image/png", []byte("goal")))
+	bid := ref["$blob"].(string)
+	e.append("r7", "derby", op("add", "/photo", ref))
+	e.append("r7", "derby", op("replace", "/score", "1-0"))
+	p := e.plan("m", "r7")
+	if !p.Clean() {
+		t.Fatalf("not clean: %+v", p.Conflicting())
+	}
+	must(p.Apply(ctx))
+	sameDoc(t, e.doc("m", "derby"), map[string]any{"title": "Derby", "score": "1-0", "photo": ref})
+	h := must(e.c.Head(ctx, "m", "derby"))
+	les := must(e.c.Log(ctx, "m", "derby", h.ID, ""))
+	for _, le := range les[len(les)-2:] {
+		if _, list, ok := seal.SealedOp(le.Patches); !ok || len(list) != 1 || list[0] != bid {
+			t.Fatalf("re-sealed %s declares %v", le.ID, le.Patches)
+		}
+	}
+	b := must(e.x.GetBlob(ctx, "m", "derby", ref))
+	if string(b.Data) != "goal" {
+		t.Fatalf("blob %q", b.Data)
+	}
+}
+
 // Rebasing an e2e branch gives the successor its own keyring, replays
 // re-encrypted under it, switches, and catches up exactly what is new.
 func TestE2ERebase(t *testing.T) {
