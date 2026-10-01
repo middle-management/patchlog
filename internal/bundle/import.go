@@ -428,6 +428,12 @@ func (im *importer) load(open Opener) error {
 		if err != nil {
 			return err
 		}
+		if l.IsBlob() {
+			// TODO(blobs-tooling): upload blob lines (or copy them with
+			// Blob-From within a deployment) before the batches that
+			// reference them (§G.4.4); the tooling agent implements it.
+			return fmt.Errorf("import: %s: blob lines are not supported by this importer yet", l.Key())
+		}
 		d := im.docs[l.Key()]
 		if l.IsSnapshot() {
 			d.snap = l

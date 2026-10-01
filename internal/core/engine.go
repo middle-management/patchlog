@@ -92,6 +92,10 @@ type Options struct {
 	// the write lock and re-check (D.3). Tests use it to inject concurrent
 	// writes deterministically; it may itself write through the engine.
 	BeforeWriteLock func()
+	// BlobSweepInterval is how often pending blobs past blobGrace are
+	// deleted (§7.8, SweepBlobs), on the leader. Zero means ten minutes;
+	// negative disables it.
+	BlobSweepInterval time.Duration
 	// TailInterval is how often the tailer polls the namespace logs on
 	// Postgres (tailer.go, default 100 ms): it wakes live readers for
 	// writes of other instances and invalidates in-memory caches.
@@ -194,6 +198,9 @@ func Open(opt Options) (*Engine, error) {
 	if opt.Maximums.RemoteRegistration == 0 {
 		opt.Maximums.RemoteRegistration = opt.Limits.RemoteRegistration
 	}
+	// Options from before blobs (§7.8) leave their limits zero.
+	defaultBlobLimits(&opt.Limits, DefaultLimits())
+	defaultBlobLimits(&opt.Maximums, opt.Limits)
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
 	}
@@ -249,6 +256,13 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if e.opt.Remote.RenewBefore == 0 {
 		e.opt.Remote.RenewBefore = 7 * 24 * time.Hour
+	}
+	if e.opt.BlobSweepInterval == 0 {
+		e.opt.BlobSweepInterval = 10 * time.Minute
+	}
+	if e.opt.BlobSweepInterval > 0 {
+		e.bg.Add(1)
+		go e.blobSweepLoop(e.opt.BlobSweepInterval)
 	}
 	if opt.RotateEpochs > 0 {
 		e.bg.Add(1)

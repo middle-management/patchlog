@@ -536,6 +536,11 @@ func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, string
 // rateLimit draws a request's tokens: one per resource from each
 // per-resource bucket, and items from the principal and namespace buckets.
 func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, items int) *Error {
+	return t.admit(t.writeDraws(n, cfg, a, resources, items))
+}
+
+// writeDraws are the draws of a write (rateLimit).
+func (t *tx) writeDraws(n *nsRow, cfg *Config, a *actor, resources []string, items int) []draw {
 	l := cfg.Limits
 	var draws []draw
 	if al := t.allowanceOf(cfg, a); al != nil && al.Rate.Rate > 0 {
@@ -554,6 +559,20 @@ func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, item
 	for _, r := range resources {
 		draws = append(draws, draw{"r\x00" + n.name + "\x00" + r + "\x00" + a.bucketKey, l.RatePerResource, 1, "ratePerResource"})
 	}
+	return draws
+}
+
+// blobDraw is the draw of an upload's bytes from the principal's blobRate
+// bucket, or its allowance's (§6.6, §7.8).
+func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
+	if al := t.allowanceOf(cfg, a); al != nil && al.BlobRate.Rate > 0 {
+		return draw{"ab\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.BlobRate, float64(size), "allowance.blobRate"}
+	}
+	return draw{"b\x00" + a.bucketKey, cfg.Limits.BlobRate, float64(size), "blobRate"}
+}
+
+// admit draws tokens, or answers 429 with Retry-After (§6.6).
+func (t *tx) admit(draws []draw) *Error {
 	wait, hit, ok := t.e.rate.admit(t.now, draws)
 	if !ok {
 		secs := int(math.Ceil(wait.Seconds()))
@@ -565,6 +584,21 @@ func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, item
 		return e
 	}
 	return nil
+}
+
+// charge deducts more from a bucket an admitted request drew on: an
+// upload's bytes beyond what it declared (§7.8).
+func (rl *rateLimiter) charge(now time.Time, d draw) {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+	b := rl.b[d.key]
+	if b == nil {
+		b = &bucket{tokens: d.rate.Burst, last: now}
+		rl.b[d.key] = b
+	}
+	b.tokens = math.Min(d.rate.Burst, b.tokens+now.Sub(b.last).Seconds()*d.rate.Rate)
+	b.last = now
+	b.tokens -= d.cost
 }
 
 // allowanceOf returns the actor's allowance in a configuration, if any.

@@ -61,12 +61,21 @@ type ArchiveBundle struct {
 	Seal func(w io.Writer) (io.WriteCloser, error)
 }
 
-// ArchiveEntry is one history line of an archive.
+// ArchiveEntry is one history line of an archive, or with Blob set a blob
+// line (§G.4.1): a blob the archived documents reference, before the first
+// entry whose document references it.
 type ArchiveEntry struct {
 	ID, Parent, Kind string // Kind "rev" or "tombstone"
 	Patches          any    // jsonv value; revisions only
 	Author, Created  string
 	Signature        string
+	Blob             *ArchiveBlob
+}
+
+// ArchiveBlob is a blob line of an archive.
+type ArchiveBlob struct {
+	ID, Type, Nonce string
+	Data            []byte
 }
 
 // ArchiveKey is the archive naming scheme.
@@ -110,6 +119,36 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 		b.Requires = t.rev(first.parentSeq.Int64).id.String()
 	}
 	b.Seal = t.archiveSealer(res)
+	// The blobs the archived documents reference (§7.8: the archive has
+	// them), each before the first entry whose document references it.
+	blobsAt := map[int64][]ids.ID{}
+	brows, err := t.Query(`SELECT bid, from_seq FROM blob_refs WHERE res = ? AND from_seq <= ? AND (to_seq IS NULL OR to_seq > ?) ORDER BY from_seq, bid`, res, lastSeq, fromSeq)
+	t.must(err)
+	for brows.Next() {
+		var bid []byte
+		var from int64
+		t.must(brows.Scan(&bid, &from))
+		blobsAt[max(from, fromSeq)] = append(blobsAt[max(from, fromSeq)], ids.FromBytes(bid))
+	}
+	brows.Close()
+	emitted := map[ids.ID]bool{}
+	emitBlobs := func(seq int64, yield func(ArchiveEntry) error) error {
+		for _, bid := range blobsAt[seq] {
+			if emitted[bid] {
+				continue
+			}
+			emitted[bid] = true
+			br := t.attachedBlob(res, bid)
+			if br == nil || br.pruned {
+				return fmt.Errorf("blob %s, which the archived range references, is no longer stored", bid)
+			}
+			ab := &ArchiveBlob{ID: bid.String(), Type: br.typ, Nonce: br.nonce, Data: t.readBytes(br.owner, br.hash)}
+			if err := yield(ArchiveEntry{Blob: ab}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	b.Entries = func(yield func(ArchiveEntry) error) error {
 		after := fromSeq - 1
 		for {
@@ -132,6 +171,9 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 				return nil
 			}
 			for _, r := range batch {
+				if err := emitBlobs(r.seq, yield); err != nil {
+					return err
+				}
 				le := t.logEntry(r)
 				if r.kind == kindRev && le.Patches == nil {
 					return fmt.Errorf("revision %s has no patch set to archive", le.ID)

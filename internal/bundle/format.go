@@ -28,6 +28,12 @@
 //     signatures are carried but not verified (the server does not verify
 //     them either, see README).
 //   - A deleted snapshot line carries no "doc".
+//   - Blob lines (§G.4.1) carry "data" as unpadded base64url (padded input
+//     is accepted too), and "nonce" only if the blob has one. Each must
+//     belong to a resource listed in docs, and comes at most once per
+//     resource; its id is recomputed. Whether it precedes the first line
+//     that references it is not checked here (that needs the documents);
+//     the archive writer emits them in that order.
 //   - Unknown members in the header or a line are rejected: this is bundle
 //     version 1, and strictness catches tampering and truncation early.
 //
@@ -58,6 +64,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"hash"
@@ -69,6 +76,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/verify"
 )
 
@@ -174,10 +182,19 @@ type Line struct {
 	Snapshot string // the source id: head revision, or tombstone if Deleted
 	Doc      any
 	Deleted  bool
+
+	// Blob lines (§G.4.1): a blob an exported document references.
+	Blob  string // the blob id (§3.7)
+	Type  string
+	Nonce string // "" if none
+	Data  []byte
 }
 
 // IsSnapshot reports a snapshot line.
 func (l *Line) IsSnapshot() bool { return l.Snapshot != "" }
+
+// IsBlob reports a blob line.
+func (l *Line) IsBlob() bool { return l.Blob != "" }
 
 // Key is the line's docs key.
 func (l *Line) Key() string { return Key(l.NS, l.Resource) }
@@ -203,6 +220,13 @@ func HistoryLine(ns, name string, e client.LogEntry, authors bool) Line {
 
 func (l *Line) value() map[string]any {
 	m := map[string]any{"ns": l.NS, "resource": l.Resource}
+	if l.IsBlob() {
+		m["blob"], m["type"], m["data"] = l.Blob, l.Type, base64.RawURLEncoding.EncodeToString(l.Data)
+		if l.Nonce != "" {
+			m["nonce"] = l.Nonce
+		}
+		return m
+	}
 	if l.IsSnapshot() {
 		m["snapshot"] = l.Snapshot
 		if l.Deleted {
@@ -292,6 +316,9 @@ func (e *Error) Is(target error) bool { return target == ErrInvalid }
 // --- header parsing and checks -------------------------------------------
 
 var idRE = regexp.MustCompile(`^1[a-z2-7]{32}$`)
+
+// blobTypeRE is a blob's type (§3.7): lowercase type/subtype.
+var blobTypeRE = regexp.MustCompile(`^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$`)
 
 func validID(s string) bool { return idRE.MatchString(s) }
 
@@ -449,6 +476,39 @@ func parseLine(v any, authors bool) (*Line, error) {
 	if !client.ValidNSName(l.NS) || !client.ValidResourceName(l.Resource) {
 		return nil, fmt.Errorf("line needs a valid ns and resource")
 	}
+	if b, has := m["blob"]; has {
+		for k := range m {
+			switch k {
+			case "ns", "resource", "blob", "type", "nonce", "data":
+			default:
+				return nil, fmt.Errorf("blob line: unknown member %q", k)
+			}
+		}
+		l.Blob, _ = b.(string)
+		if !validID(l.Blob) {
+			return nil, fmt.Errorf("blob line: invalid blob id")
+		}
+		l.Type, _ = m["type"].(string)
+		if !blobTypeRE.MatchString(l.Type) {
+			return nil, fmt.Errorf("blob line %s: type must be a lowercase type/subtype", l.Blob)
+		}
+		if n, has := m["nonce"]; has {
+			l.Nonce, _ = n.(string)
+			if !seal.ValidNonce(l.Nonce) {
+				return nil, fmt.Errorf("blob line %s: nonce must be 26 base32 characters", l.Blob)
+			}
+		}
+		d, ok := m["data"].(string)
+		if !ok {
+			return nil, fmt.Errorf("blob line %s: data must be base64url", l.Blob)
+		}
+		data, err := base64.RawURLEncoding.Strict().DecodeString(strings.TrimRight(d, "="))
+		if err != nil {
+			return nil, fmt.Errorf("blob line %s: data must be base64url", l.Blob)
+		}
+		l.Data = data
+		return l, nil
+	}
 	if snap, has := m["snapshot"]; has {
 		for k := range m {
 			switch k {
@@ -529,14 +589,15 @@ type docState struct {
 }
 
 type checker struct {
-	h    *Header
-	docs map[string]*docState
-	n    int // lines checked, header included
-	hash hash.Hash
+	h     *Header
+	docs  map[string]*docState
+	blobs map[string]bool // "ns/name blob" of the blob lines seen
+	n     int             // lines checked, header included
+	hash  hash.Hash
 }
 
 func newChecker(h *Header) *checker {
-	return &checker{h: h, docs: map[string]*docState{}, n: 1, hash: sha256.New()}
+	return &checker{h: h, docs: map[string]*docState{}, blobs: map[string]bool{}, n: 1, hash: sha256.New()}
 }
 
 func (c *checker) digestLine(canon []byte) {
@@ -557,6 +618,16 @@ func (c *checker) line(l *Line) error {
 	info, ok := c.h.Docs[k]
 	if !ok {
 		return fail("not listed in the header's docs")
+	}
+	if l.IsBlob() {
+		if c.blobs[k+" "+l.Blob] {
+			return fail("blob %s comes more than once", l.Blob)
+		}
+		if id := ids.Blob(l.Type, l.Nonce, l.Data).String(); id != l.Blob {
+			return fail("blob %s does not match its bytes (recomputed %s)", l.Blob, id)
+		}
+		c.blobs[k+" "+l.Blob] = true
+		return nil
 	}
 	st := c.docs[k]
 	if st == nil {
@@ -804,14 +875,14 @@ func (w *Writer) Line(l Line) error {
 	if !w.h.Authors {
 		l.Author, l.Created, l.Signature = "", "", ""
 	}
-	if l.IsSnapshot() && !l.Deleted {
+	if l.IsSnapshot() && !l.IsBlob() && !l.Deleted {
 		v, err := client.ToValue(docJSON(l.Doc))
 		if err != nil {
 			return &Error{Line: w.c.n + 1, Key: l.Key(), Msg: "doc: " + err.Error()}
 		}
 		l.Doc = v
 	}
-	if !l.IsSnapshot() && l.Kind == "rev" {
+	if !l.IsSnapshot() && !l.IsBlob() && l.Kind == "rev" {
 		v, err := client.ToValue(docJSON(l.Patches))
 		if err != nil {
 			return &Error{Line: w.c.n + 1, Key: l.Key(), Msg: "patches: " + err.Error()}

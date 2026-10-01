@@ -73,6 +73,23 @@ func Revision(parent *ID, canonicalPatches []byte) ID { return Hash(parent, cano
 // Tombstone is the tombstone id of §3.4.
 func Tombstone(parent ID) ID { return Hash(&parent, []byte("tombstone")) }
 
+// Blob is the blob id of §3.7:
+// trunc160(sha256("patchlog-blob-v1" ‖ 0x0A ‖ type ‖ 0x0A ‖ nonce ‖ 0x0A ‖ bytes)).
+// typ is the lowercased media type without parameters; nonce is "" or 26
+// base32 characters.
+func Blob(typ, nonce string, data []byte) ID {
+	h := sha256.New()
+	h.Write([]byte("patchlog-blob-v1\n"))
+	h.Write([]byte(typ))
+	h.Write([]byte{0x0A})
+	h.Write([]byte(nonce))
+	h.Write([]byte{0x0A})
+	h.Write(data)
+	var id ID
+	copy(id[:], h.Sum(nil))
+	return id
+}
+
 // Of is trunc160(sha256(b)), used for grant ids and revocation ids.
 func Of(b []byte) ID {
 	sum := sha256.Sum256(b)

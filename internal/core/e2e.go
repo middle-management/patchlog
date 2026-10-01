@@ -351,6 +351,10 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	res := &PruneResult{Horizon: h.id.String(), Archive: u}
 	_, err = t.Exec(`INSERT INTO e2e_snapshots (seq, res, jwe) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, jwe = excluded.jwe`, h.seq, own.id, snapshot)
 	t.must(err)
+	// TODO(blobs-e2e): end the attachments that no kept revision's declared
+	// blob list names (§E.3.1: the snapshot carries its blobs list), as
+	// pruneBlobs does from blob_refs for documents the server can read.
+	// blob_refs is not written for sealed writes yet.
 	_, err = t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
 	_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res = ? AND seq < ?`, own.id, h.seq)

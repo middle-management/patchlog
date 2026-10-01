@@ -99,9 +99,18 @@ func TestBlobReferencesWellFormed(t *testing.T) {
 	}
 	nonce := strings.Repeat("a", 26)
 
-	expect(t, mk(map[string]any{"hero": blobRef(id, nil)}), 201)
-	expect(t, mk(map[string]any{"l": []any{map[string]any{"deep": blobRef(id, map[string]any{"nonce": nonce})}}}), 201)
-	expect(t, mk(map[string]any{"size": 0, "x": blobRef(id, map[string]any{"size": 0})}), 201)
+	// Well-formed references to blobs that aren't available are 422 too
+	// (§7.8); blob_test.go has the available ones.
+	for _, doc := range []map[string]any{
+		{"hero": blobRef(id, nil)},
+		{"l": []any{map[string]any{"deep": blobRef(id, map[string]any{"nonce": nonce})}}},
+		{"size": 0, "x": blobRef(id, map[string]any{"size": 0})},
+	} {
+		r := mk(doc)
+		if r.Code != 422 || r.Str("code") != "blob" || !strings.Contains(r.Str("message"), "not available") {
+			t.Errorf("%v: %d %s", doc, r.Code, r.Body)
+		}
+	}
 	// Not a string: an ordinary member.
 	expect(t, mk(map[string]any{"x": map[string]any{"$blob": 1, "any": "thing"}}), 201)
 
@@ -134,8 +143,8 @@ func TestBlobReferencesWellFormed(t *testing.T) {
 	expect(t, e.write("PATCH", "b", "schema", "", addRoot(map[string]any{
 		"$schema": dialect, "const": map[string]any{"$blob": "not a blob id"}})), 201)
 
-	// blobsPerDocument counts distinct blobs.
-	expect(t, mk(map[string]any{"a": blobRef(id, nil), "b": blobRef(id, nil), "c": blobRef(id2, nil)}), 201)
+	// blobsPerDocument counts distinct blobs, before availability.
+	expectCode(t, mk(map[string]any{"a": blobRef(id, nil), "b": blobRef(id, nil), "c": blobRef(id2, nil)}), 422, "blob")
 	expectCode(t, mk(map[string]any{"a": blobRef(id, nil), "b": blobRef(id2, nil), "c": blobRef(id3, nil)}), 422, "limit")
 }
 

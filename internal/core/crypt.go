@@ -421,6 +421,8 @@ func (t *tx) encryptNamespace(n *nsRow) {
 }
 
 func (t *tx) encryptResource(res int64) {
+	// Blob bytes move under the resource's own key (blobs.go).
+	t.encryptBlobs(res)
 	type revVal struct {
 		seq int64
 		id  []byte

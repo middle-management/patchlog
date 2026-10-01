@@ -689,6 +689,9 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 			t.must(err)
 			_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE res = ?`, statePurged, res)
 			t.must(err)
+			// Purge ends every attachment, and pending entries go too
+			// (§7.8, §8.3).
+			t.purgeBlobs(`res = ?`, res)
 		}
 		_, err := t.Exec(`DELETE FROM heads WHERE res = ?`, res)
 		t.must(err)
@@ -774,6 +777,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		t.must(err)
 		_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
+		t.purgeBlobs(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, n.id)
 		t.must(err)
 		t.metaChanged = true
@@ -1074,6 +1078,16 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 		_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc`, seq, own.id, t.putDoc("snapshots", own.id, seq, doc))
 		t.must(err)
 	}
+	// Attachments no kept document references end (§7.8); the archive
+	// written above carries their blobs.
+	kept := make([]int64, 0, len(keepSeqs)+len(preserve))
+	for seq := range keepSeqs {
+		kept = append(kept, seq)
+	}
+	for seq := range preserve {
+		kept = append(kept, seq)
+	}
+	t.pruneBlobs(own.id, h.seq, kept)
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
 	// Below the horizon only the documents kept above survive:

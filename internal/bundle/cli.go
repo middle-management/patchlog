@@ -282,6 +282,9 @@ func schemaNamespaces(open Opener) (map[string]bool, *Header, error) {
 		if err != nil {
 			return nil, nil, err
 		}
+		if l.IsBlob() {
+			continue
+		}
 		if l.IsSnapshot() {
 			note(l.Doc)
 		} else {

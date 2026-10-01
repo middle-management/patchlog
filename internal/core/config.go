@@ -38,6 +38,13 @@ type Limits struct {
 	KeepPerResource      int
 	BlobsPerDocument     int
 	RemoteRegistration   time.Duration
+	// Blobs (§7.8): the largest blob, the bytes of pending blobs per
+	// uploader and namespace, the age at which a pending blob is deleted,
+	// and the bytes a principal may upload (a token bucket in bytes).
+	BlobSize    int
+	BlobPending int
+	BlobGrace   time.Duration
+	BlobRate    Rate
 }
 
 // Rate is a token bucket: Rate tokens per second, Burst the bucket size.
@@ -68,6 +75,10 @@ func DefaultLimits() Limits {
 		KeepPerResource:      100,
 		BlobsPerDocument:     1000,
 		RemoteRegistration:   30 * 24 * time.Hour,
+		BlobSize:             64 << 20,
+		BlobPending:          256 << 20,
+		BlobGrace:            24 * time.Hour,
+		BlobRate:             Rate{8 << 20, 256 << 20},
 	}
 }
 
@@ -89,6 +100,8 @@ var limitFields = map[string]func(*Limits) *int{
 	"branchesPerNamespace": func(l *Limits) *int { return &l.BranchesPerNamespace },
 	"keepPerResource":      func(l *Limits) *int { return &l.KeepPerResource },
 	"blobsPerDocument":     func(l *Limits) *int { return &l.BlobsPerDocument },
+	"blobSize":             func(l *Limits) *int { return &l.BlobSize },
+	"blobPending":          func(l *Limits) *int { return &l.BlobPending },
 }
 
 // deploymentOnlyLimits are limits of §6.6 that only a deployment sets.
@@ -98,6 +111,7 @@ var rateFields = map[string]func(*Limits) *Rate{
 	"ratePerResource":  func(l *Limits) *Rate { return &l.RatePerResource },
 	"ratePerPrincipal": func(l *Limits) *Rate { return &l.RatePerPrincipal },
 	"ratePerNamespace": func(l *Limits) *Rate { return &l.RatePerNamespace },
+	"blobRate":         func(l *Limits) *Rate { return &l.BlobRate },
 }
 
 // Config is a parsed namespace document (§2, §7.4).
@@ -138,6 +152,10 @@ type Allowance struct {
 	Rate          Rate // the allowance's "bucket"
 	ItemsPerBatch int
 	BatchSize     int
+	// BlobRate and BlobPending replace the namespace's blob limits for
+	// this principal (§6.6, §7.8); zero means the namespace's.
+	BlobRate    Rate
+	BlobPending int
 	// Until is when the allowance ends (§6.6); zero if it doesn't.
 	Until time.Time
 }
@@ -499,6 +517,18 @@ func parseLimits(v any, l *Limits, max Limits) error {
 			l.RemoteRegistration = d
 			continue
 		}
+		if k == "blobGrace" {
+			s, ok := x.(string)
+			d, err := ParseDuration(s)
+			if !ok || err != nil || d <= 0 {
+				return fmt.Errorf("/limits/blobGrace must be a positive ISO 8601 duration")
+			}
+			if d > max.BlobGrace {
+				return &limitError{"/limits/blobGrace exceeds the deployment maximum"}
+			}
+			l.BlobGrace = d
+			continue
+		}
 		if k == "retryWindow" {
 			s, ok := x.(string)
 			d, err := ParseDuration(s)
@@ -513,12 +543,16 @@ func parseLimits(v any, l *Limits, max Limits) error {
 		}
 		return fmt.Errorf("/limits/%s is not a known limit", k)
 	}
+	// A pending blob lives at least as long as a retry may come (§6.6).
+	if l.BlobGrace < l.RetryWindow {
+		return &limitError{"/limits/blobGrace must be at least retryWindow (§6.6)"}
+	}
 	return nil
 }
 
 // sizeFields are limits in bytes. A namespace document writes them as
 // integers (§6.6); ParseSize's "64 MiB" form is for deployment flags only.
-var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "valueSize": true, "pathSize": true, "grantSize": true, "batchSize": true}
+var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "valueSize": true, "pathSize": true, "grantSize": true, "batchSize": true, "blobSize": true, "blobPending": true}
 
 var sizeRe = regexp.MustCompile(`^(\d+)\s*(B|KiB|MiB|GiB)?$`)
 
@@ -594,6 +628,27 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, &limitError{fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize)}
 				}
 				a.BatchSize = n
+			case "blobRate":
+				o, ok := x.(map[string]any)
+				r, rok := o["rate"].(float64)
+				b, bok := o["burst"].(float64)
+				if !ok || len(o) != 2 || !rok || !bok || r <= 0 || b < 1 {
+					return nil, fmt.Errorf("/allowances/%d/blobRate must be { rate, burst } in bytes, rate positive and burst at least 1", i)
+				}
+				if r > max.BlobRate.Rate || b > max.BlobRate.Burst {
+					return nil, &limitError{fmt.Sprintf("/allowances/%d/blobRate exceeds the deployment maximum", i)}
+				}
+				a.BlobRate = Rate{r, b}
+			case "blobPending":
+				y, ok := x.(float64)
+				n := int(y)
+				if !ok || y != float64(n) || n < 1 {
+					return nil, fmt.Errorf("/allowances/%d/blobPending must be a positive integer, in bytes (§6.6)", i)
+				}
+				if n > max.BlobPending {
+					return nil, &limitError{fmt.Sprintf("/allowances/%d/blobPending exceeds the deployment maximum %d", i, max.BlobPending)}
+				}
+				a.BlobPending = n
 			case "until":
 				str, ok := x.(string)
 				u, err := time.Parse(time.RFC3339, str)

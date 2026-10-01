@@ -2,6 +2,7 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -53,6 +54,8 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /r/{ns}/{name}/events", s.resourceEvents)
 	m.HandleFunc("POST /r/{ns}/{name}/purge", s.resourcePurge)
 	m.HandleFunc("POST /r/{ns}/{name}/prune", s.resourcePrune)
+	m.HandleFunc("PUT /r/{ns}/{name}/blob/{bid}", s.blobPut)
+	m.HandleFunc("GET /r/{ns}/{name}/blob/{bid}", s.blobGet)
 
 	m.HandleFunc("GET /ns/{ns}", s.nsHead)
 	m.HandleFunc("PATCH /ns/{ns}", s.nsPatch)
@@ -86,6 +89,16 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers -----------------------------------------------------------
+
+// sourceCreds are Source-Authorization's (§7.8): the grant a copy's or a
+// batch's source is read with.
+func sourceCreds(r *http.Request) core.Credentials {
+	var c core.Credentials
+	if a := r.Header.Get("Source-Authorization"); strings.HasPrefix(a, "Bearer ") {
+		c.Bearer = strings.TrimSpace(a[len("Bearer "):])
+	}
+	return c
+}
 
 func creds(r *http.Request) core.Credentials {
 	c := core.Credentials{Author: r.Header.Get("X-Author")}
@@ -622,6 +635,75 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, out)
 }
 
+// --- blobs (§7.8) --------------------------------------------------------
+
+func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
+	noStore(w)
+	ns, name, bid := r.PathValue("ns"), r.PathValue("name"), r.PathValue("bid")
+	if err := validNames(ns, name); err != nil {
+		writeErr(w, err)
+		return
+	}
+	up := core.BlobUpload{Type: r.Header.Get("Content-Type"), Nonce: r.Header.Get("Blob-Nonce"),
+		From: r.Header.Get("Blob-From"), Body: r.Body, Length: r.ContentLength}
+	if up.From != "" {
+		// A copy has an empty body (400 if not, in its place in the order).
+		var one [1]byte
+		n, _ := io.ReadFull(r.Body, one[:])
+		up.HasBody = n > 0
+	}
+	req := core.Request{NS: ns, Cred: creds(r), SourceCred: sourceCreds(r)}
+	if err := s.e.UploadBlob(r.Context(), req, name, bid, up); err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.Header().Set("ETag", quote(bid))
+	w.Header().Set("Location", "/r/"+ns+"/"+name+"/blob/"+bid)
+	w.WriteHeader(201)
+}
+
+func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
+	ns, name, bid := r.PathValue("ns"), r.PathValue("name"), r.PathValue("bid")
+	if err := validNames(ns, name); err != nil {
+		writeErr(w, err)
+		return
+	}
+	b, err := s.e.ReadBlob(r.Context(), ns, name, bid, creds(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	switch {
+	case b.Status == 200:
+		// Immutable, with the resource's tags (§9); ranges are 206.
+		if !s.cache(w, r, ccImmutable, b.Public, resTags(ns, name)...) {
+			return
+		}
+		w.Header().Set("ETag", quote(bid))
+		w.Header().Set("Content-Type", b.Type)
+		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(b.Data))
+	case b.Status == 404:
+		if !s.cache(w, r, ccShort, b.Public) {
+			return
+		}
+		writeJSON(w, 404, map[string]any{"code": "not_found"})
+	case b.Code == "pruned":
+		if !s.cache(w, r, ccPruned, b.Public, resTags(ns, name)...) {
+			return
+		}
+		writeJSON(w, 410, prunedBody(b.Horizon, b.Archive))
+	case b.Status == 410:
+		if !s.cache(w, r, ccLong, b.Public) {
+			return
+		}
+		writeJSON(w, 410, map[string]any{"code": "gone"})
+	default:
+		noStore(w)
+		writeJSON(w, b.Status, map[string]any{"code": "not_implemented",
+			"message": "blobs of sealed namespaces are not served yet (§E.2.2)"})
+	}
+}
+
 // --- namespaces --------------------------------------------------------
 
 func (s *Server) nsHead(w http.ResponseWriter, r *http.Request) {
@@ -860,7 +942,7 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	// Batch limits depend on the principal (§6.6): authenticate first, then
 	// stop reading a body larger than that principal's batchSize (§7.5).
-	req := core.Request{NS: ns, Cred: creds(r)}
+	req := core.Request{NS: ns, Cred: creds(r), SourceCred: sourceCreds(r)}
 	max, err := s.e.BatchBodyLimit(r.Context(), req)
 	if err != nil {
 		writeErr(w, err)

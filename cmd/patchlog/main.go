@@ -116,6 +116,8 @@ func serve(args []string) {
 	fs.Var(&treeURLs, "tree-url", "tree service (Addendum B) the playground reads through a read-only proxy at "+server.TreeProxyPrefix+", e.g. http://tree:8082; CATALOG=URL maps one catalog to its own (repeatable)")
 	maxItems := fs.Int("max-items-per-batch", 0, "deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it (§6.6)")
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
+	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
+	maxBlobPending := fs.String("max-blob-pending", "", "deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
 	archiveDef := fs.String("archive", "", "default pruning archive destination, a file:// directory (§8.6)")
@@ -174,6 +176,19 @@ func serve(args []string) {
 			log.Fatalf("-max-batch-size: %v", err)
 		}
 		max.BatchSize = n
+	}
+	for _, f := range []struct {
+		flag, v string
+		dst     *int
+	}{{"-max-blob-size", *maxBlobSize, &max.BlobSize}, {"-max-blob-pending", *maxBlobPending, &max.BlobPending}} {
+		if f.v == "" {
+			continue
+		}
+		n, err := core.ParseSize(f.v)
+		if err != nil {
+			log.Fatalf("%s: %v", f.flag, err)
+		}
+		*f.dst = n
 	}
 	arch, err := archiver(*archiveDef, archiveRoots)
 	if err != nil {

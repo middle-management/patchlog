@@ -404,6 +404,10 @@ type BatchRequest struct {
 	Items  []BatchItem
 	Config *BatchConfig
 	Source map[string]any // optional provenance { origin?, ns, at, bundle?, ids? }
+	// SourceAuthorization, if set, is the grant sent as
+	// Source-Authorization: it reads a local source, whose blobs the items
+	// may then reference (§7.5, §7.8).
+	SourceAuthorization string
 }
 
 // BatchItemResult lists the ids an item produced (or, for a dry run, would).
@@ -487,7 +491,11 @@ func (c *Client) Batch(ctx context.Context, ns string, b BatchRequest, dryRun bo
 	if dryRun {
 		q = url.Values{"dry-run": {"1"}}
 	}
-	r, err := c.do(ctx, "POST", "/ns/"+ns+"/batch", q, &request{body: raw, ct: "application/json"})
+	rq := &request{body: raw, ct: "application/json"}
+	if b.SourceAuthorization != "" {
+		rq.header = map[string]string{"Source-Authorization": "Bearer " + b.SourceAuthorization}
+	}
+	r, err := c.do(ctx, "POST", "/ns/"+ns+"/batch", q, rq)
 	if err != nil {
 		return nil, err
 	}

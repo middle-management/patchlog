@@ -39,6 +39,9 @@ type Request struct {
 	NS        string
 	Cred      Credentials
 	Signature string // optional author signature header (§C.3)
+	// SourceCred is Source-Authorization: the grant a copy's source, or a
+	// batch's local source, is read with (§7.8). Empty: Cred.
+	SourceCred Credentials
 }
 
 // WriteResult is the outcome of a resource write or batch.
@@ -138,6 +141,9 @@ type stepState struct {
 	// sealed marks a create, append or restore of an e2e resource: its
 	// patch set is opaque and its document unknown (§6.2, §E.3).
 	sealed bool
+	// blobs are the blobs the resulting document references, with where
+	// each is available from (step 4, §7.8), for step 7 to attach.
+	blobs map[ids.ID]*blobRow
 }
 
 type itemState struct {
@@ -291,6 +297,10 @@ type writePlan struct {
 	src     any
 	isBatch bool
 	result  *WriteResult
+	// req and source are the request and its raw batch source, which the
+	// re-check of blob availability needs (recheck.go).
+	req    Request
+	source any
 }
 
 // checkItems runs steps 1–6 of §6.2 for a resource write or batch. It
@@ -528,6 +538,19 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
+	// Blob references name available blobs (§7.8), also at step 4.
+	bs := blobSourceOf(req, source, isBatch)
+	for _, s := range st {
+		if err := t.checkBlobs(n, s, a, bs); err != nil {
+			fs = append(fs, itemErr{s.index, err})
+		}
+	}
+	if len(fs) > 0 {
+		if !dryRun {
+			return nil, nil, fail(fs)
+		}
+		st, fs = dropFailed(st, fs, dryFails), nil
+	}
 
 	// Step 5: schema. Items may reference schema revisions created by
 	// earlier items (§6.1).
@@ -599,7 +622,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		return nil, result, nil
 	}
 
-	return &writePlan{n: n, a: a, st: st, cplan: cplan, src: src, isBatch: isBatch, result: result}, nil, nil
+	return &writePlan{n: n, a: a, st: st, cplan: cplan, src: src, isBatch: isBatch, result: result, req: req, source: source}, nil, nil
 }
 
 // insertPlan is step 7: insert a checked write atomically with its
@@ -1245,6 +1268,14 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 			panic(fmt.Errorf("inserting revision: %w", err))
 		}
 		parentSeq = last
+		if !step.del && !step.sealed {
+			// The blobs the document references are attached with it
+			// (§7.8, step 7).
+			t.attachStep(res, step, last)
+		}
+		// TODO(blobs-e2e): a sealed step attaches the blobs its op declares
+		// (§E.3.1), and records them in blob_refs for pruning and archives;
+		// a restore with [] keeps the last live document's list.
 		if cfg := t.config(n.configSeq); cfg.level == levelSealed {
 			// The epoch that seals this entry forever (§E.2.1).
 			_, err := t.Exec(`INSERT INTO rev_epochs (seq, epoch) VALUES (?, ?)`, last, cfg.Epoch)
