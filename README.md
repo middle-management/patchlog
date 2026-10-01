@@ -317,19 +317,34 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   an instance without the directory can't serve bytes stored in files.
 - **Several instances** can share the database (rolling deploys, horizontal scaling). Writes
   take transaction-scoped advisory locks per namespace, `pg_advisory_xact_lock(0x504c, ns)`,
-  in ascending order: exclusive on every namespace they change (the written one; a branch's
-  base, which receives the `branch` entry; every branch and remote shadow a purge reaches),
-  shared on the namespaces their decision read (bases whose keys and revocations a branch
-  write re-checks, the namespaces `$schema` and `$ref` resolve into, a batch source). Writers
-  to different namespaces run in parallel; the D.3 re-check reads after the locks, so `412`
-  and internal retries work as on SQLite. Details in `internal/core/pglock.go`.
+  in ascending order. Config writes, purges, prunes, branch operations and blob uploads take
+  them exclusive on every namespace they change (the written one; a branch's base, which
+  receives the `branch` entry; every branch and remote shadow a purge reaches). Resource
+  writes and batches take their own namespace's lock **shared**, like every namespace a
+  decision read (bases whose keys and revocations a branch write re-checks, the namespaces
+  `$schema` and `$ref` resolve into, a batch source), so writers of different resources of
+  one namespace check and insert in parallel, and a namespace's configuration, frozen and
+  purged flags can't change under them. Two writers of the same resource settle it on insert:
+  the chain's unique constraints, and the resource's head moving only from the one the
+  precondition matched, make the loser re-check and answer `412` with the new head (or the
+  idempotent retry), as on SQLite. The namespace entry is appended last, at the head read with
+  `SELECT … FOR NO KEY UPDATE` on the namespace row, held until commit, so entries commit in
+  chain order. Details in `internal/core/pglock.go`.
 - **Round trips.** Each statement is one, so a write costs what its statements cost: about
-  16 for a small append (lock, namespace, resource, head, insert, chains, commit), 2.9 ms on a
-  local `postgres:16` with `fsync` on (about 0.6 ms of it the commit's flush), against 0.3 ms
-  on SQLite (`go test ./internal/core -run '^$' -bench .` with `PATCHLOG_TEST_PG` set). A write
-  whose patches are under 16 KiB is checked inside its namespace's lock, skipping the separate
-  check transaction of D.3; larger ones are checked outside it first. Writes to different
-  namespaces run in parallel, so throughput grows with namespaces rather than per write.
+  13 for a small append (begin, lock, namespace, resource, head, retry lookup, insert, head,
+  heads, chain, commit) and 10 for a create, about 3 ms on a local `postgres:16` with `fsync` on,
+  against 0.3 ms on SQLite (`go test ./internal/core -run '^$' -bench .` with `PATCHLOG_TEST_PG`
+  set). Every write is checked inside its namespace's shared lock (`LockedCheckBytes`), skipping
+  the separate check transaction of D.3. What writers of one namespace still do one at a time is
+  the chain append: two statements and the commit's flush. A batch inserts its items with one
+  statement per table (over arrays, `unnest`), so 1,000 creates cost about as many round trips
+  as one.
+- **Throughput** (`-bench 'CreatesOneNamespace|Batch1000'`, 20–70 KiB documents to distinct
+  resources of one namespace, on 4 vCPUs shared by the benchmark and `postgres:16`): 160
+  writes/s from one writer, 440–500 from 8, ~350 from 32 and 64 (where the CPU is saturated),
+  against ~160 at every concurrency before writers shared the namespace's lock; p99 at 64
+  writers 0.8 s, from 1.1 s. A batch of 1,000 creates takes about 330 ms (1.5 s before), on
+  SQLite 250 ms. Writes to different namespaces run in parallel too.
 - **A tailer per instance** polls `ns_log` by transaction id every 100 ms
   (`ns_log.xid xid8 DEFAULT pg_current_xact_id()`, `pg_snapshot_xmin`) and wakes long-polls and
   SSE streams for writes of every instance, and moves the read cache's generations. Commits
