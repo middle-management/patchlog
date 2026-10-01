@@ -80,6 +80,8 @@ func main() {
 		bundleCmd(os.Args[1], os.Args[2:])
 	case "archive":
 		archiveCmd(os.Args[2:])
+	case "schema":
+		schemaCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -103,7 +105,8 @@ func usage() {
   patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
   patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
   patchlog bundle verify -i file.jsonl
-  patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]`)
+  patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]
+  patchlog schema import -api URL -ns NS [-bearer T] [-author A] [-name NAME] [-dry-run] [-json] URL|FILE...`)
 	os.Exit(2)
 }
 

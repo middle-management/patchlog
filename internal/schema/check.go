@@ -36,6 +36,10 @@ func init() {
 	}
 }
 
+// IsKeyword reports whether k is a draft 2020-12 keyword (§6.5: any other
+// keyword not starting with "x-" makes a schema invalid).
+func IsKeyword(k string) bool { return keywords[k] }
+
 var (
 	schemaKeywords    = []string{"items", "contains", "additionalProperties", "not", "if", "then", "else", "propertyNames", "unevaluatedItems", "unevaluatedProperties", "contentSchema"}
 	schemaMapKeywords = []string{"properties", "patternProperties", "$defs", "dependentSchemas"}
