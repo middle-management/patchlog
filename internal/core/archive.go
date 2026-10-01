@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -304,6 +305,10 @@ type RestoreResult struct {
 	Skipped  int  // entries with no matching kept row, or whose id didn't match
 	Purged   bool // the resource is purged, so nothing was restored (§8.3)
 	Cleared  bool // every pruned patch set is back, so the horizon was cleared
+	// Blobs counts the attachments pruning ended that were brought back
+	// from blob lines; only once the horizon is cleared, since until then
+	// no stored document references them (§7.8).
+	Blobs int
 }
 
 // RestoreResource re-inserts archived patch sets of ns/name (§D.4, an
@@ -312,8 +317,10 @@ type RestoreResult struct {
 // set, horizon_seq and keep are cleared. Documents kept at the old horizon
 // stay as snapshots, and intermediate snapshots are rebuilt over the
 // restored range so no fold grows past the D.4 bound. Purged resources are
-// skipped. entries is called inside the write transaction: once, or again
-// if Postgres rolls the transaction back to run it again (pglock.go).
+// skipped. Once the horizon is cleared, the attachments that pruning ended
+// get their bytes back from the archives' blob lines (§7.8, §G.4.1).
+// entries is called inside the write transaction: once, or again if
+// Postgres rolls the transaction back to run it again (pglock.go).
 func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error) {
 	out := &RestoreResult{}
 	err := e.update(ctx, func(t *tx) error {
@@ -331,7 +338,15 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 			return notFound()
 		}
 		e2e := t.e2eContent(n, name)
+		blobs := map[ids.ID]*ArchiveBlob{}
 		err := entries(func(en ArchiveEntry) error {
+			if en.Blob != nil {
+				// Verified against its id (§3.7) when the line was read.
+				if bid, err := ids.Parse(en.Blob.ID); err == nil && ids.Blob(en.Blob.Type, en.Blob.Nonce, en.Blob.Data) == bid {
+					blobs[bid] = en.Blob
+				}
+				return nil
+			}
 			id, err := ids.Parse(en.ID)
 			if err != nil {
 				out.Skipped++
@@ -384,6 +399,8 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 			t.flushDocs = true
 		}
 		if !own.horizonSeq.Valid {
+			// Cleared before: every document is stored.
+			out.Blobs = t.restoreBlobs(own.id, blobs)
 			return nil
 		}
 		var missing bool
@@ -398,12 +415,43 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 		}
 		_, err = t.Exec(`UPDATE resources SET horizon_seq = NULL, keep = NULL WHERE res = ?`, own.id)
 		t.must(err)
+		out.Blobs = t.restoreBlobs(own.id, blobs)
 		t.flushDocs = true
 		t.tags = append(t.tags, "r:"+n.name+"/"+name)
 		out.Cleared = true
 		return nil
 	})
 	return out, err
+}
+
+// restoreBlobs brings back res's attachments that pruning ended, from the
+// archives' blob lines, now that every document is stored again (§7.8). An
+// attachment no blob line carries stays ended (410). It returns how many
+// it brought back.
+func (t *tx) restoreBlobs(res int64, blobs map[ids.ID]*ArchiveBlob) int {
+	rows, err := t.Query(`SELECT `+blobCols+` FROM blobs WHERE res = ? AND pruned = 1`, res)
+	t.must(err)
+	var ended []*blobRow
+	for rows.Next() {
+		b, err := scanBlobRow(rows)
+		t.must(err)
+		ended = append(ended, b)
+	}
+	rows.Close()
+	owner := t.bytesOwner(res)
+	n := 0
+	for _, b := range ended {
+		ab := blobs[b.bid]
+		if ab == nil || ab.Type != b.typ || ab.Nonce != b.nonce || int64(len(ab.Data)) != b.size {
+			continue
+		}
+		h := sha256.Sum256(ab.Data)
+		t.putBytes(owner, h[:], ab.Data)
+		_, err := t.Exec(`UPDATE blobs SET hash = ?, owner = ?, pruned = 0 WHERE res = ? AND bid = ?`, h[:], owner, res, b.bid[:])
+		t.must(err)
+		n++
+	}
+	return n
 }
 
 // rebuildSnapshots folds res's chain from its first entry up to (excluding)

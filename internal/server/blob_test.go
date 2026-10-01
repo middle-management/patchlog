@@ -498,11 +498,69 @@ func TestBlobPrune(t *testing.T) {
 	e.upload("main", "r", "text/plain", da)
 	expect(t, e.write("PATCH", "main", "r", head, ops(op("add", "/a", ref(ba, "text/plain", len(da), "")))), 201)
 	expect(t, e.get(blobPath("main", "r", ba)), 200)
-	// Restoring the archive reads past its blob lines.
+	// Restoring the archive: A was attached again by the write, so no
+	// attachment is left to bring back.
 	reps, err := archive.Restore(context.Background(), e.e, archive.RestoreOptions{})
-	if err != nil || len(reps) != 1 || len(reps[0].Failed) != 0 || reps[0].Restored != 3 || !reps[0].Cleared {
+	if err != nil || len(reps) != 1 || len(reps[0].Failed) != 0 || reps[0].Restored != 3 || !reps[0].Cleared || reps[0].Blobs != 0 {
 		t.Fatalf("restore %+v %v", reps, err)
 	}
+}
+
+// §8.6, §D.4: restoring archives brings back the attachments pruning
+// ended, from their blob lines, once every document is stored again.
+func TestBlobArchiveRestore(t *testing.T) {
+	dir := t.TempDir()
+	e := newEnv(t, withBlobTuning, withArchive(t, dir), withoutRetentionLoop)
+	e.mkNS("main", map[string]any{"read": "public"})
+	d1, d2, d3 := []byte("first"), []byte("second"), []byte("third")
+	b1 := e.upload("main", "r", "image/png", d1)
+	revs := []string{e.create("main", "r", map[string]any{"a": ref(b1, "image/png", len(d1), "")})}
+	b2 := e.upload("main", "r", "image/png", d2)
+	revs = append(revs, e.appendRev("main", "r", revs[0], ops(op("replace", "/a", ref(b2, "image/png", len(d2), "")))))
+	b3 := e.upload("main", "r", "image/png", d3)
+	revs = append(revs, e.appendRev("main", "r", revs[1], ops(op("replace", "/a", ref(b3, "image/png", len(d3), "")))))
+	revs = append(revs, e.appendRev("main", "r", revs[2], ops(op("remove", "/a"))))
+	e.clock.Advance(time.Hour)
+	// Two archives: [r0] and [r1, r2].
+	expect(t, e.prune("main", "r", map[string]any{"horizon": revs[1]}, "admin"), 200)
+	expect(t, e.prune("main", "r", map[string]any{"horizon": revs[3]}, "admin"), 200)
+	for _, b := range []string{b1, b2, b3} {
+		expectCode(t, e.get(blobPath("main", "r", b)), 410, "pruned")
+	}
+	if s := e.blobStats(); s.Attached != 0 || s.Pruned != 3 || s.Bytes != 0 {
+		t.Fatalf("stats after pruning %+v", s)
+	}
+	// One archive missing: the horizon stays, and so do the ended attachments.
+	first := filepath.Join(dir, "main", "r", revs[1]+".jsonl")
+	if err := os.Rename(first, first+".away"); err != nil {
+		t.Fatal(err)
+	}
+	reps, err := archive.Restore(context.Background(), e.e, archive.RestoreOptions{})
+	if err != nil || len(reps) != 1 || reps[0].Cleared || reps[0].Blobs != 0 || len(reps[0].Failed) != 1 {
+		t.Fatalf("partial restore %+v %v", reps, err)
+	}
+	expectCode(t, e.get(blobPath("main", "r", b3)), 410, "pruned")
+	if err := os.Rename(first+".away", first); err != nil {
+		t.Fatal(err)
+	}
+	reps, err = archive.Restore(context.Background(), e.e, archive.RestoreOptions{})
+	if err != nil || len(reps) != 1 || !reps[0].Cleared || reps[0].Blobs != 3 {
+		t.Fatalf("restore %+v %v", reps, err)
+	}
+	e.e.FlushCaches()
+	for b, want := range map[string][]byte{b1: d1, b2: d2, b3: d3} {
+		g := e.get(blobPath("main", "r", b))
+		expect(t, g, 200)
+		if string(g.Body) != string(want) {
+			t.Fatalf("restored blob %s: %q", b, g.Body)
+		}
+	}
+	if s := e.blobStats(); s.Attached != 3 || s.Pruned != 0 || s.Bytes != 3 {
+		t.Fatalf("stats after restoring %+v", s)
+	}
+	// Pruning again ends them again.
+	expect(t, e.prune("main", "r", map[string]any{"horizon": revs[3]}, "admin"), 200)
+	expectCode(t, e.get(blobPath("main", "r", b1)), 410, "pruned")
 }
 
 // §6.6: an allowance may raise blobPending and blobRate for its principal.

@@ -172,6 +172,8 @@ type BatchReport struct {
 	NSID      string         `json:"ns_id,omitempty"`
 	Error     string         `json:"error,omitempty"`
 	Failures  []string       `json:"failures,omitempty"`
+	Uploaded  int            `json:"uploaded,omitempty"` // blobs uploaded before it (§G.4.4)
+	Copied    int            `json:"copied,omitempty"`   // blobs copied with Blob-From before it
 }
 
 // Report is the outcome of an import or a dry run.
@@ -252,7 +254,9 @@ type bdoc struct {
 	refKeys       map[string]bool // over-approximated references (source keys)
 	refNS         map[string]bool
 	rep           *DocReport
-	requiresBad   bool // requires isn't in the target's chain (the target moved on)
+	requiresBad   bool             // requires isn't in the target's chain (the target moved on)
+	blobs         map[string]*Line // its blob lines, by blob id (§G.4.1)
+	refd          map[string]bool  // blobs its lines read so far reference
 }
 
 type item struct {
@@ -263,8 +267,9 @@ type item struct {
 	ifNone   bool
 	steps    []client.Step
 	expected []string
-	sameIDs  bool   // the ids are the source's (fast-forward): source.ids follows them
-	srcID    string // source.ids member otherwise
+	sameIDs  bool       // the ids are the source's (fast-forward): source.ids follows them
+	srcID    string     // source.ids member otherwise
+	blobs    [][]string // per step, the blobs it may bring in (blobs.go)
 }
 
 type upPlan struct {
@@ -329,6 +334,8 @@ type importer struct {
 	create  map[string]any  // target ns → the document it is created with
 	sealedT map[string]bool // target ns is (or is created) sealed
 	bump    map[string]int  // new e2e target → the epoch to move it to
+
+	sent map[string]time.Time // "ns/name/bid" → when the blob was last uploaded or copied there
 }
 
 // Import imports a bundle into the deployment c talks to (§G.4.4). It
@@ -409,7 +416,7 @@ func (im *importer) load(open Opener) error {
 	for k, info := range im.h.Docs {
 		ns, name, _ := SplitKey(k)
 		d := &bdoc{key: k, ns: ns, name: name, tns: im.mapNS(ns), info: info, requires: im.h.Requires[k],
-			idx: map[string]int{}, refKeys: map[string]bool{}, refNS: map[string]bool{}}
+			idx: map[string]int{}, refKeys: map[string]bool{}, refNS: map[string]bool{}, blobs: map[string]*Line{}, refd: map[string]bool{}}
 		d.rep = &DocReport{Doc: k, Target: Key(d.tns, name), History: info.History, BundleHead: info.Head}
 		im.docs[k] = d
 		if prev, ok := targets[d.tns]; ok && prev != ns {
@@ -428,22 +435,33 @@ func (im *importer) load(open Opener) error {
 		if err != nil {
 			return err
 		}
-		if l.IsBlob() {
-			// TODO(blobs-tooling): upload blob lines (or copy them with
-			// Blob-From within a deployment) before the batches that
-			// reference them (§G.4.4); the tooling agent implements it.
-			return fmt.Errorf("import: %s: blob lines are not supported by this importer yet", l.Key())
-		}
 		d := im.docs[l.Key()]
+		if l.IsBlob() {
+			// Its id was recomputed by the Reader (§G.4.1); it must come
+			// before the first line that references it.
+			if d.refd[l.Blob] {
+				return &Error{Key: l.Key(), Msg: fmt.Sprintf("blob %s comes after a line that references it (§G.4.1)", l.Blob)}
+			}
+			d.blobs[l.Blob] = l
+			continue
+		}
 		if l.IsSnapshot() {
 			d.snap = l
 			if !l.Deleted {
 				im.scanRefs(d, l.Doc)
+				for _, r := range docBlobs(l.Doc) {
+					d.refd[r.bid] = true
+				}
 			}
 		} else {
 			d.idx[l.ID] = len(d.lines)
 			d.lines = append(d.lines, l)
 			im.scanRefs(d, l.Patches)
+			if l.Kind == "rev" {
+				for _, b := range stepBlobs(client.PatchStep(l.Patches)) {
+					d.refd[b] = true
+				}
+			}
 		}
 	}
 	im.digest = rd.Digest()
@@ -796,6 +814,10 @@ func (im *importer) plan(ctx context.Context) error {
 			return fmt.Errorf("import: %s/%s: %w", it.ns, it.name, err)
 		}
 		it.expected = exp
+		it.blobs = make([][]string, len(it.steps))
+		for i, st := range it.steps {
+			it.blobs[i] = stepBlobs(st)
+		}
 		if !it.upstream {
 			it.d.rep.Steps = len(it.steps)
 			it.d.rep.Expected = exp

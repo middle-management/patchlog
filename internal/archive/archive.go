@@ -273,7 +273,8 @@ type ResourceReport struct {
 // it against a database no server has open. For every archive of every
 // unpurged resource, it reads and verifies the bundle and re-inserts each
 // patch set whose recomputed id matches the kept row; once a resource has
-// all its patch sets back, its horizon is cleared. An archive that can't be
+// all its patch sets back, its horizon is cleared and the attachments
+// pruning ended get their bytes back from the archives' blob lines. An archive that can't be
 // read or fails verification is reported, and the entries verified before
 // the failure still count, because each is checked against the kept id.
 func Restore(ctx context.Context, e *core.Engine, opt RestoreOptions) ([]ResourceReport, error) {
@@ -334,7 +335,7 @@ func Restore(ctx context.Context, e *core.Engine, opt RestoreOptions) ([]Resourc
 		case res.Purged:
 			logf("%s/%s: purged, skipped", g.ns, g.name)
 		case res.Cleared:
-			logf("%s/%s: restored %d patch sets from %d archives; horizon cleared", g.ns, g.name, res.Restored, len(g.recs))
+			logf("%s/%s: restored %d patch sets and %d blobs from %d archives; horizon cleared", g.ns, g.name, res.Restored, res.Blobs, len(g.recs))
 		default:
 			logf("%s/%s: restored %d patch sets from %d archives; history still incomplete (%d skipped)", g.ns, g.name, res.Restored, len(g.recs), res.Skipped)
 		}
@@ -368,9 +369,11 @@ func readArchive(ctx context.Context, e *core.Engine, o Opener, u, ns, name stri
 			return err
 		}
 		if l.IsBlob() && l.NS == ns && l.Resource == name {
-			// TODO(blobs-tooling): restoring archived history doesn't bring
-			// back attachments pruning ended (§D.4); their blob lines are
-			// verified and skipped.
+			// The bytes of attachments pruning ended (§7.8), verified
+			// against their ids by the reader (§G.4.1).
+			if err := yield(core.ArchiveEntry{Blob: &core.ArchiveBlob{ID: l.Blob, Type: l.Type, Nonce: l.Nonce, Data: l.Data}}); err != nil {
+				return err
+			}
 			continue
 		}
 		if l.IsSnapshot() || l.NS != ns || l.Resource != name {

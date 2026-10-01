@@ -32,8 +32,9 @@
 //     is accepted too), and "nonce" only if the blob has one. Each must
 //     belong to a resource listed in docs, and comes at most once per
 //     resource; its id is recomputed. Whether it precedes the first line
-//     that references it is not checked here (that needs the documents);
-//     the archive writer emits them in that order.
+//     that references it is not checked here (that needs the documents):
+//     export and the archive writer emit them in that order, and import
+//     checks it (blobs.go).
 //   - Unknown members in the header or a line are rejected: this is bundle
 //     version 1, and strictness catches tampering and truncation early.
 //
