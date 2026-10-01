@@ -127,6 +127,19 @@ func (s *svc) batches() []*follow.Batch {
 	return append([]*follow.Batch(nil), s.batch...)
 }
 
+// appliedUpTo waits until OnApply has recorded the batch that reached head,
+// and returns the batches so far. The index publishes a checkpoint before
+// it calls OnApply, so caughtUp alone can return before the batch is seen.
+func (s *svc) appliedUpTo(head string) []*follow.Batch {
+	s.t.Helper()
+	var bs []*follow.Batch
+	waitFor(s.t, "the batch reaching "+head, func() bool {
+		bs = s.batches()
+		return len(bs) > 0 && bs[len(bs)-1].NewCheckpoint == head
+	})
+	return bs
+}
+
 // caughtUp waits until the index reached the core's head of ns.
 func (s *svc) caughtUp(ns string) string {
 	s.t.Helper()
@@ -528,9 +541,8 @@ func TestCheckpointSurvivesRestart(t *testing.T) {
 	if s2.ix.Checkpoint("matches") != cp {
 		t.Fatalf("checkpoint after reopen %q, want %q", s2.ix.Checkpoint("matches"), cp)
 	}
-	s2.caughtUp("matches")
-	bs := s2.batches()
-	if len(bs) == 0 || bs[0].From != cp {
+	bs := s2.appliedUpTo(s2.caughtUp("matches"))
+	if bs[0].From != cp {
 		t.Fatalf("first batch after restart from %q, want %q", bs[0].From, cp)
 	}
 	n := 0
@@ -558,8 +570,7 @@ func TestRebuild(t *testing.T) {
 	}
 	s2.stop()
 	s3 := startSvc(t, w.c, svcOpts{db: db, ns: []string{"matches"}, untyped: true, rebuild: true})
-	s3.caughtUp("matches")
-	if bs := s3.batches(); len(bs) == 0 || bs[0].From != "" {
+	if bs := s3.appliedUpTo(s3.caughtUp("matches")); bs[0].From != "" {
 		t.Fatal("rebuild did not replay from the beginning")
 	}
 	s3.expect("/matches?q=larsson", "cup", "derby")
