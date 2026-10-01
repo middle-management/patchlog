@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -110,6 +111,25 @@ func TestParse(t *testing.T) {
 	for _, bad := range []string{"a.example", "ftp://a.example", "https://a.example/path", "https://"} {
 		if _, err := Parse([]string{bad}); err == nil {
 			t.Errorf("%q accepted", bad)
+		}
+	}
+}
+
+// Every request header the servers read is allowed, X-Author (serve -dev)
+// included; the edge's verification header never is.
+func TestHeaderLists(t *testing.T) {
+	allowed := strings.Split(Headers, ", ")
+	for _, h := range []string{"Authorization", "If-Match", "If-None-Match", "If-Range", "Range", "Signature", "Source-Authorization", "Blob-From", "Blob-Nonce", "Last-Event-ID", "X-Author"} {
+		if !slices.Contains(allowed, h) {
+			t.Errorf("%s not allowed", h)
+		}
+	}
+	if slices.Contains(allowed, "X-Edge-Verified") {
+		t.Error("edge header allowed")
+	}
+	for _, h := range []string{"ETag", "Location", "X-Namespace-Revision", "X-Cursor", "X-E2E"} {
+		if !slices.Contains(strings.Split(Exposed, ", "), h) {
+			t.Errorf("%s not exposed", h)
 		}
 	}
 }

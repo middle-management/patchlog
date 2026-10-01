@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **CORS:** `X-Author` (the author under `serve -dev`) and `If-Range` are allowed in requests, and `X-E2E` is exposed in responses.
+
 ## v0.3.2
 
 CORS for the servers, for demos and apps on other origins.

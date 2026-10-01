@@ -428,8 +428,8 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
 
 - Preflights (`OPTIONS` with `Access-Control-Request-Method`) are answered by the server. The
   request headers the API reads are allowed (`Authorization`, `Content-Type`, `If-Match`,
-  `If-None-Match`, `Range`, `Signature`, `Source-Authorization`, `Blob-From`, `Blob-Nonce`,
-  `Last-Event-ID`), and the response headers it sets are exposed (`ETag`, `Location`,
+  `If-None-Match`, `If-Range`, `Range`, `Signature`, `Source-Authorization`, `Blob-From`,
+  `Blob-Nonce`, `Last-Event-ID`, and `X-Author`, which names the author under `serve -dev`), and the response headers it sets are exposed (`ETag`, `Location`,
   `Retry-After`, `X-Namespace-Revision`, `X-Cursor`, …). `-cors-max-age` (default 10m) is how long
   browsers cache a preflight.
 - Grants travel in `Authorization`, which a page sets itself, so cross-origin calls need no
