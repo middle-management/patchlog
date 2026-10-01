@@ -389,6 +389,7 @@ func (t *tx) encryptNamespace(n *nsRow) {
 		nss = append(nss, sh.id)
 	}
 	for _, ns := range nss {
+		t.lockNS(ns, lockExclusive)
 		var resIDs []int64
 		rows, err := t.Query(`SELECT res FROM resources WHERE ns = ? AND state != ?`, ns, statePurged)
 		t.must(err)

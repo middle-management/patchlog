@@ -270,11 +270,13 @@ type RestoreResult struct {
 // set, horizon_seq and keep are cleared. Documents kept at the old horizon
 // stay as snapshots, and intermediate snapshots are rebuilt over the
 // restored range so no fold grows past the D.4 bound. Purged resources are
-// skipped. entries is called once, inside the write transaction.
+// skipped. entries is called inside the write transaction: once, or again
+// if Postgres rolls the transaction back to run it again (pglock.go).
 func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries func(yield func(ArchiveEntry) error) error) (*RestoreResult, error) {
 	out := &RestoreResult{}
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(ns)
+		*out = RestoreResult{}
+		n := t.nsForWrite(ns)
 		if n == nil {
 			return notFound()
 		}

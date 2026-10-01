@@ -301,8 +301,29 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   gone from disk now), and in WAL archives and backups until they expire. With encryption at
   rest (Addendum E.1) a purge also destroys the data keys, which makes those leftovers
   unreadable: use it where purges must be final.
-- **One instance** at a time: writes are serialised by an in-process lock, and caches and live
-  readers hear only of their own instance's writes.
+- **Several instances** can share the database (rolling deploys, horizontal scaling). Writes
+  take transaction-scoped advisory locks per namespace, `pg_advisory_xact_lock(0x504c, ns)`,
+  in ascending order: exclusive on every namespace they change (the written one; a branch's
+  base, which receives the `branch` entry; every branch and remote shadow a purge reaches),
+  shared on the namespaces their decision read (bases whose keys and revocations a branch
+  write re-checks, the namespaces `$schema` and `$ref` resolve into, a batch source). Writers
+  to different namespaces run in parallel; the D.3 re-check reads after the locks, so `412`
+  and internal retries work as on SQLite. Details in `internal/core/pglock.go`.
+- **A tailer per instance** polls `ns_log` by transaction id every 100 ms
+  (`ns_log.xid xid8 DEFAULT pg_current_xact_id()`, `pg_snapshot_xmin`) and wakes long-polls and
+  SSE streams for writes of every instance, and moves the read cache's generations. Commits
+  that change what reads may return (configuration, purges, prunes, restores, key
+  destruction) also increment a one-row `cache_gen` counter that every poll reads. The
+  transaction-free read cache serves only while the tailer's last successful poll is recent,
+  so another instance's purge, revocation or configuration change stops being served from
+  this instance's memory at most **300 ms** (three poll intervals) after it commits, and head
+  pointers are micro-cached for at most that long. A wake-up for another instance's write can
+  be later while an older write transaction is still running (the tailer never skips one).
+- **Background loops** that must run once per deployment (the retention applier, epoch
+  rotation, following and registering remote bases) run on the instance holding a
+  session-level advisory lock (class `0x504d`); another one takes over when it goes away.
+- **Per instance:** rate-limit buckets (§6.6), so each instance enforces the limits on what it
+  serves (D.8), and the in-memory caches above.
 - **The services keep SQLite.** The search index and tree service (`-db index.db`,
   `-db tree.db`) store derived state they rebuild from the core's API; only the core runs on
   Postgres.

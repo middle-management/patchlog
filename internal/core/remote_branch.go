@@ -815,7 +815,7 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 	}
 	var res *WriteResult
 	err = e.update(ctx, func(t *tx) error {
-		if t.nsByName(req.NS) != nil || m == nil {
+		if t.nsForWrite(req.NS) != nil || m == nil {
 			r, err := t.writeConfig(req, cc) // 412 for a taken name
 			res = r
 			return err
@@ -1157,7 +1157,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 		byNS[s.ns] = append(byNS[s.ns], s)
 	}
 	for _, nsName := range sortedKeys(byNS) {
-		n := t.nsByName(nsName)
+		n := t.nsForWrite(nsName)
 		conflict := func(s *remoteSchema, why string) *Error {
 			return apiErr(409, "name_conflict", "path", "/r/"+s.ns+"/"+s.name+"/rev/"+s.chain.last().ID, "message", why)
 		}
@@ -1224,6 +1224,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 // (the shadow's chain mirrors the base's). It runs whenever the remote
 // branch purges the name, so the copy never outlives the branch's purge.
 func (t *tx) purgeShadow(sh *nsRow, name string) {
+	t.lockNS(sh.id, lockExclusive)
 	r := t.resource(sh.id, name)
 	if r == nil || r.state == statePurged {
 		return
@@ -1243,6 +1244,7 @@ func (t *tx) purgeShadow(sh *nsRow, name string) {
 // purgeShadowNS removes all of a shadow's content (the remote branch's
 // namespace purge, §8.5).
 func (t *tx) purgeShadowNS(sh *nsRow) {
+	t.lockNS(sh.id, lockExclusive)
 	t.deleteDEKs(`ns = ?`, sh.id)
 	q := `res IN (SELECT res FROM resources WHERE ns = ?)`
 	for _, s := range []string{
@@ -1365,12 +1367,13 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	}
 	follow := !e.opt.Remote.IgnorePurges
 	return e.update(ctx, func(t *tx) error {
+		// The branch's lock first: the checkpoint is read as of it.
+		bn := t.nsByIDLocked(b.branch, lockExclusive)
 		var cp string
 		t.must(t.QueryRow(`SELECT checkpoint FROM remote_bases WHERE shadow = ?`, b.shadow).Scan(&cp))
 		if cp != b.checkpoint {
 			return nil // followed concurrently
 		}
-		bn := t.nsByID(b.branch)
 		author := t.authorID(RemoteAuthor)
 		for _, en := range entries {
 			var names []string
@@ -1484,6 +1487,10 @@ func (e *Engine) remoteLoop(interval time.Duration) {
 				}
 				cancel()
 			}()
+			if !e.leader(ctx) {
+				cancel()
+				continue // another instance follows them (pglock.go)
+			}
 			if err := e.SyncRemotes(ctx); err != nil {
 				log.Printf("remote: %v", err)
 			}

@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"sync/atomic"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/pgtest"
@@ -57,6 +58,39 @@ func BenchmarkWrite(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
+}
+
+// BenchmarkWriteParallel appends from several goroutines, each to a
+// resource of its own namespace: serialised in SQLite, in parallel on
+// Postgres (one lock per namespace).
+func BenchmarkWriteParallel(b *testing.B) {
+	e := benchEngine(b, "public")
+	var next atomic.Int64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		ns := fmt.Sprint("p", next.Add(1))
+		genesis := []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"read": "public"}}}
+		if _, err := e.WriteConfig(context.Background(), Request{NS: ns, Cred: Credentials{Author: "a"}}, ConfigChange{IfNoneMatch: true, Patches: genesis}); err != nil {
+			b.Error(err)
+			return
+		}
+		head, i := "", 0
+		for pb.Next() {
+			it := Item{Resource: "r", IfMatch: head, IfNoneMatch: head == ""}
+			op := "replace"
+			if head == "" {
+				op = "add"
+			}
+			it.Steps = []Step{{Patches: []any{map[string]any{"op": op, "path": "", "value": map[string]any{"n": float64(i)}}}}}
+			r, err := e.WriteResource(context.Background(), Request{NS: ns, Cred: Credentials{Author: "a"}}, it)
+			if err != nil {
+				b.Error(err)
+				return
+			}
+			head = r.Items[0].IDs[0]
+			i++
+		}
+	})
 }
 
 // BenchmarkReadHead resolves a head pointer in a namespace that isn't

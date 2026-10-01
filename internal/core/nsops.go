@@ -303,7 +303,7 @@ func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) 
 func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 	var res *WriteResult
 	err := func() error {
-		n := t.nsByName(req.NS)
+		n := t.nsForWrite(req.NS)
 		if cc.IfNoneMatch && n == nil {
 			r, err := t.createNamespace(req, cc)
 			res = r
@@ -439,7 +439,7 @@ func (e *Engine) CreateBranch(ctx context.Context, req Request, br BranchRequest
 }
 
 func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) {
-	base := t.nsByName(req.NS)
+	base := t.nsForWrite(req.NS)
 	if base == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
 	}
@@ -591,7 +591,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(req.NS)
+		n := t.nsForWrite(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
@@ -656,6 +656,11 @@ func (t *tx) isBranchOf(b, base *nsRow) bool {
 // purgeResource purges name in n and propagates to every branch (§8.3). It
 // returns the id of n's purge entry.
 func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
+	if t.locking() {
+		// Every namespace a purge reaches is locked exclusively, and read
+		// as of its lock (D.8 purge propagation).
+		n = t.nsByIDLocked(n.id, lockExclusive)
+	}
 	// Branches first: a branch reading the resource through must still see
 	// it, so that it records its own purge entry.
 	for _, b := range t.branchesOf(n) {
@@ -707,7 +712,7 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(req.NS)
+		n := t.nsForWrite(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
@@ -791,6 +796,12 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 func (t *tx) referencedPaths(exclude func(ns *nsRow, res string) bool) map[string]bool {
 	out := map[string]bool{}
 	var queue []string
+	// The namespaces read here aren't locked (on Postgres, pglock.go): a
+	// write that makes a schema referenced holds the schema namespace's lock
+	// shared (it resolved the schema), and purges and prunes, the callers,
+	// hold that namespace's lock exclusively.
+	t.noLock++
+	defer func() { t.noLock-- }()
 	// Shadows (§G.3) are read only through their remote branch, whose
 	// heads include what it reads through.
 	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
@@ -863,7 +874,7 @@ type PruneResult struct {
 func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
 	var out *PruneResult
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(req.NS)
+		n := t.nsForWrite(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}

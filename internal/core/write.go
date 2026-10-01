@@ -297,7 +297,7 @@ type writePlan struct {
 // returns a plan to insert, or a final result (an idempotent retry, a dry
 // run), or an error.
 func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
-	n := t.nsByName(req.NS)
+	n := t.nsForWrite(req.NS)
 	if n == nil {
 		return nil, nil, t.absentNS(req.NS, req.Cred)
 	}

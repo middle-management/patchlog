@@ -11,6 +11,10 @@
 // and revocations a write is checked against are the ones it is inserted
 // against. The rarer writes (config, branches, purges, prunes) still run
 // their whole gate inside the write transaction; see README.
+//
+// On Postgres several instances may share the database: advisory locks
+// per namespace replace the mutex (pglock.go), and a tailer tells each
+// instance of every commit, for its live readers and caches (tailer.go).
 package core
 
 import (
@@ -23,6 +27,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -87,6 +92,10 @@ type Options struct {
 	// the write lock and re-check (D.3). Tests use it to inject concurrent
 	// writes deterministically; it may itself write through the engine.
 	BeforeWriteLock func()
+	// TailInterval is how often the tailer polls the namespace logs on
+	// Postgres (tailer.go, default 100 ms): it wakes live readers for
+	// writes of other instances and invalidates in-memory caches.
+	TailInterval time.Duration
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how
@@ -150,6 +159,16 @@ type Engine struct {
 	// retentionSkipped remembers retention rules already logged as
 	// skipped for lack of an archive (§8.6), so each is logged once.
 	retentionSkipped sync.Map
+	// Postgres: when the tailer's last successful poll started (since
+	// epoch, plus one; tailer.go), and the leader connection of the
+	// background loops (pglock.go).
+	epoch      time.Time
+	lastPoll   atomic.Int64
+	leaderMu   sync.Mutex
+	leaderConn *sql.Conn
+	// afterWriteLock, if set, is called by resource writes and batches
+	// once they hold the write lock, with the namespace (tests).
+	afterWriteLock func(ns string)
 }
 
 // Open opens or creates the database.
@@ -207,6 +226,20 @@ func Open(opt Options) (*Engine, error) {
 		db.Close()
 		return nil, err
 	}
+	if pg {
+		if e.opt.TailInterval <= 0 {
+			e.opt.TailInterval = 100 * time.Millisecond
+		}
+		s, err := e.tailStart(context.Background())
+		if err != nil {
+			db.Close()
+			return nil, fmt.Errorf("starting the tailer: %w", err)
+		}
+		e.epoch = time.Now()
+		e.rc.fresh, e.rc.headTTL = e.fresh, e.freshFor()
+		e.bg.Add(1)
+		go e.tailLoop(s)
+	}
 	if opt.RetentionInterval > 0 {
 		e.bg.Add(1)
 		go e.retentionLoop(opt.RetentionInterval)
@@ -228,10 +261,11 @@ func Open(opt Options) (*Engine, error) {
 	return e, nil
 }
 
-// Close stops the retention applier and closes the database.
+// Close stops the background loops and closes the database.
 func (e *Engine) Close() error {
 	e.closeOnce.Do(func() { close(e.stop) })
 	e.bg.Wait()
+	e.resign()
 	e.stmts.close()
 	return e.db.Close()
 }
@@ -317,6 +351,11 @@ type tx struct {
 	newEpochKeys   map[epochRef][]byte
 	flushEpochKeys bool
 	rotate         []string
+	// Postgres: the advisory locks held (pglock.go), the largest key among
+	// them, and whether reading namespaces locks them (noLock > 0: no).
+	locks  map[int32]lockMode
+	maxKey int32
+	noLock int
 }
 
 type docPut struct {
@@ -378,9 +417,31 @@ func (e *Engine) update(ctx context.Context, f func(t *tx) error) error {
 }
 
 func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []string, err error) {
-	e.stmts.prepare(e.db)
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	if !e.pg {
+		e.stmts.prepare(e.db)
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		return e.updateOnce(ctx, f, nil)
+	}
+	// Postgres: advisory locks instead of the mutex (pglock.go). A
+	// transaction that rolled back to take its locks in order, or on a
+	// deadlock or a shared row's unique violation, runs again.
+	var want map[int32]lockMode
+	for attempt := 1; ; attempt++ {
+		rotate, err = e.updateOnce(ctx, f, want)
+		if err == nil || attempt == maxWriteAttempts || !retryable(err) || ctx.Err() != nil {
+			return rotate, err
+		}
+		var rl *errRelock
+		if errors.As(err, &rl) {
+			want = rl.want
+		}
+	}
+}
+
+// updateOnce runs f in one write transaction, first taking the advisory
+// locks of want (Postgres).
+func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode) (rotate []string, err error) {
 	sqlTx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -393,36 +454,38 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 		err = ctxErr(ctx, err)
 	}()
 	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
+	t.lockAll(want)
 	if err := f(t); err != nil {
 		sqlTx.Rollback()
 		return nil, err
 	}
-	done := e.rc.commit(t)
+	inv := t.invalidation()
+	if e.pg && inv.meta {
+		// Other instances' tailers learn of it at their next poll, however
+		// long older transactions hold back the log they follow (tailer.go).
+		_, err := t.Tx.Exec(`UPDATE cache_gen SET gen = gen + 1 WHERE id = 1`)
+		t.must(err)
+	}
+	e.rc.begin(inv)
 	err = sqlTx.Commit()
-	done()
 	if err != nil {
+		e.rc.bump(inv)
 		return nil, err
 	}
-	if t.flushEpochKeys {
-		e.ekeys.flush()
-	} else {
+	// Caches, CDN purges and live readers learn of a write only once it has
+	// committed.
+	e.invalidate(inv, false)
+	if !t.flushEpochKeys {
 		for r, k := range t.newEpochKeys {
 			e.ekeys.put(r, k)
 		}
-	}
-	if t.flushDEKs {
-		e.deks.flush()
 	}
 	if !t.flushDEKs {
 		for res, k := range t.newDEKs {
 			e.deks.put(res, k)
 		}
 	}
-	// Caches, CDN purges and live readers learn of a write only once it has
-	// committed.
-	if t.flushDocs {
-		e.docs.flush()
-	} else {
+	if !t.flushDocs {
 		for _, d := range t.docPuts {
 			e.docs.put(d.id, d.doc)
 		}
@@ -430,10 +493,50 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 	if len(t.tags) > 0 {
 		e.opt.Purger.PurgeTags(t.tags)
 	}
+	return t.rotate, nil
+}
+
+// invalidation is what a committed write changed that in-memory state must
+// learn of: the namespaces whose logs moved, and whether what reads may
+// return changed beyond them (readcache.go), with the caches to flush.
+type invalidation struct {
+	nss                                  []string
+	meta                                 bool
+	flushDocs, flushDEKs, flushEpochKeys bool
+}
+
+func (t *tx) invalidation() invalidation {
+	inv := invalidation{flushDocs: t.flushDocs, flushDEKs: t.flushDEKs, flushEpochKeys: t.flushEpochKeys}
+	inv.meta = t.metaChanged || t.flushDocs || t.flushDEKs || t.flushEpochKeys
 	for ns := range t.notify {
+		inv.nss = append(inv.nss, ns)
+	}
+	return inv
+}
+
+// invalidate applies a committed write's invalidation: the read cache's
+// generations, the document, data key and epoch key caches, and the live
+// readers waiting on its namespaces. A local commit calls it right after
+// committing, closing the read cache's bracket; on Postgres the tailer
+// calls it (seen) for every commit of any instance it sees (tailer.go).
+func (e *Engine) invalidate(inv invalidation, seen bool) {
+	if seen {
+		e.rc.see(inv)
+	} else {
+		e.rc.bump(inv)
+	}
+	if inv.flushEpochKeys {
+		e.ekeys.flush()
+	}
+	if inv.flushDEKs {
+		e.deks.flush()
+	}
+	if inv.flushDocs {
+		e.docs.flush()
+	}
+	for _, ns := range inv.nss {
 		e.hub.publish(ns)
 	}
-	return t.rotate, nil
 }
 
 func (t *tx) must(err error) {
@@ -457,7 +560,13 @@ func (t *tx) authorID(name string) int64 {
 		}
 		return -1
 	}
-	id = t.mustInsert(`INSERT INTO authors (name) VALUES (?) RETURNING author`, name)
+	// Authors are shared by all namespaces: a concurrent writer on
+	// Postgres may insert the same one first.
+	err = t.QueryRow(`INSERT INTO authors (name) VALUES (?) ON CONFLICT DO NOTHING RETURNING author`, name).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		err = t.QueryRow(`SELECT author FROM authors WHERE name = ?`, name).Scan(&id)
+	}
+	t.must(err)
 	return id
 }
 
@@ -499,10 +608,33 @@ func scanNS(row interface{ Scan(...any) error }) (*nsRow, error) {
 }
 
 // nsByName returns the namespace or nil. Shadows (§G.3) have no name that
-// can be looked up: they are reached only through their remote branch.
+// can be looked up: they are reached only through their remote branch. In
+// a write transaction on Postgres it takes the namespace's lock shared
+// (pglock.go).
 func (t *tx) nsByName(name string) *nsRow {
+	return t.nsByNameLocked(name, lockShared)
+}
+
+// nsForWrite is nsByName for a namespace the transaction will change: on
+// Postgres it takes the namespace's lock exclusively, not shared
+// (pglock.go), before reading it.
+func (t *tx) nsForWrite(name string) *nsRow {
+	return t.nsByNameLocked(name, lockExclusive)
+}
+
+func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 	if strings.HasPrefix(name, "~") {
 		return nil
+	}
+	if t.locking() {
+		// The lock first, then the row as of the lock.
+		var id int64
+		err := t.QueryRow(`SELECT ns FROM namespaces WHERE name = ?`, name).Scan(&id)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil
+		}
+		t.must(err)
+		t.lockNS(id, mode)
 	}
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE name = ?`, name))
 	if errors.Is(err, sql.ErrNoRows) {
@@ -513,7 +645,13 @@ func (t *tx) nsByName(name string) *nsRow {
 	return n
 }
 
+// nsByID returns a namespace, taking its lock shared on Postgres.
 func (t *tx) nsByID(id int64) *nsRow {
+	return t.nsByIDLocked(id, lockShared)
+}
+
+func (t *tx) nsByIDLocked(id int64, mode lockMode) *nsRow {
+	t.lockNS(id, mode)
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
 	t.must(err)
 	t.deps.addNS(n)
@@ -566,6 +704,12 @@ func (t *tx) nsLogSeq(ns int64, id ids.ID) (int64, bool) {
 // appendNS appends an entry to a namespace chain (§3.5) and returns its seq
 // and id.
 func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int64, configSeq int64, author int64) (int64, ids.ID) {
+	if t.locking() {
+		// The chain is appended to under the namespace's exclusive lock,
+		// at its head as of that lock (pglock.go).
+		t.lockNS(n.id, lockExclusive)
+		t.must(t.QueryRow(`SELECT head_seq FROM namespaces WHERE ns = ?`, n.id).Scan(&n.headSeq))
+	}
 	var prev *ids.ID
 	var prevSeq any
 	if n.headSeq.Valid {

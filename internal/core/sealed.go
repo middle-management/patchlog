@@ -371,6 +371,8 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 		return nil
 	}
 	return e.update(ctx, func(t *tx) error {
+		// Shared: purges, which delete sealed rows, lock exclusively.
+		t.lockNS(ns, lockShared)
 		var purged bool
 		if err := t.QueryRow(`SELECT purged FROM namespaces WHERE ns = ?`, ns).Scan(&purged); err != nil || purged {
 			return nil
@@ -626,7 +628,7 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error) {
 	var epoch int
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(ns)
+		n := t.nsForWrite(ns)
 		if n == nil {
 			return notFound()
 		}
@@ -736,6 +738,9 @@ func (e *Engine) rotateLoop(maxAge time.Duration) {
 		case <-e.stop:
 			return
 		case <-tk.C:
+			if !e.leader(context.Background()) {
+				continue // another instance rotates (pglock.go)
+			}
 			if done, err := e.RotateDue(context.Background(), maxAge); err != nil {
 				log.Printf("rotate-epochs: %v", err)
 			} else if len(done) > 0 {

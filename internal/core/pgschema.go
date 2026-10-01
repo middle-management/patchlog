@@ -200,19 +200,14 @@ CREATE TABLE IF NOT EXISTS remote_notices (
   created   bigint   NOT NULL,
   UNIQUE (branch, id)
 );
+
+-- The tailer (tailer.go) follows ns_log by transaction id, and reads
+-- cache_gen, which commits that change what reads may return increment.
+ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS xid xid8 NOT NULL DEFAULT pg_current_xact_id();
+CREATE INDEX IF NOT EXISTS ns_log_xid ON ns_log (xid);
+CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
+INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 `
-
-// lockClass is the class id of this deployment's advisory locks, the
-// first argument of the two-argument pg_advisory_*lock forms (D.8), so
-// they never collide with other advisory locks in a shared database.
-// ("PL" in ASCII.)
-const lockClass = 0x504c
-
-// Lock ids within lockClass that are not namespaces (namespace ids are
-// positive).
-const (
-	lockSchema = 0 // creating and migrating the schema
-)
 
 // openPG opens a Postgres database and creates or migrates its schema.
 func openPG(url string) (*sql.DB, error) {
