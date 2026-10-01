@@ -39,9 +39,11 @@ type Request struct {
 	NS        string
 	Cred      Credentials
 	Signature string // optional author signature header (§C.3)
-	// SourceCred is Source-Authorization: the grant a copy's source, or a
-	// batch's local source, is read with (§7.8). Empty: Cred.
-	SourceCred Credentials
+	// SourceCreds are the grants of Source-Authorization, which may be
+	// repeated (§6.1, §7.8): any of them that verifies for a namespace
+	// serves for it, to read a copy's source, a batch's local source, or a
+	// branch holding draft schema revisions. Empty: Cred alone.
+	SourceCreds []Credentials
 }
 
 // WriteResult is the outcome of a resource write or batch.
@@ -618,21 +620,23 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 
 	// Step 5: schema. Items may reference schema revisions created by
-	// earlier items (§6.1).
+	// earlier items (§6.1). In a branch, a path its namespace can't resolve
+	// is looked up among drafts in branches of that namespace.
 	pending := map[string]any{}
+	sc := &schemaCtx{a: a, target: n, creds: req.anyCreds()}
 	for _, s := range st {
 		for _, step := range s.steps {
 			if step.del || step.sealed {
 				continue // e2e: validation moves to clients (§E.3.2)
 			}
-			typed, err := t.validateDoc(step.doc, a, pending)
+			typed, err := t.validateDoc(step.doc, sc, pending)
 			if err != nil {
 				fs = append(fs, itemErr{s.index, err})
 				break
 			}
 			step.typed = typed
-			if !n.isBranch() {
-				pending["/r/"+n.name+"/"+s.Resource+"/rev/"+step.id.String()] = step.doc
+			if k := t.pendingKey(n, s.Resource, step.id); k != "" {
+				pending[k] = step.doc
 			}
 		}
 	}
@@ -1087,7 +1091,7 @@ func checkLimits(l Limits, s *itemState) *Error {
 
 // validateDoc is step 5: resolve $schema and validate (§6.1). It returns the
 // document's $schema, if typed.
-func (t *tx) validateDoc(doc any, a *actor, pending map[string]any) (string, *Error) {
+func (t *tx) validateDoc(doc any, sc *schemaCtx, pending map[string]any) (string, *Error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
@@ -1097,7 +1101,7 @@ func (t *tx) validateDoc(doc any, a *actor, pending map[string]any) (string, *Er
 		return "", nil
 	}
 	s, _ := sv.(string)
-	load := func(ref schema.Ref) (any, error) { return t.loadSchema(ref, a, pending) }
+	load := func(ref schema.Ref) (any, error) { return t.loadSchema(ref, sc, pending) }
 	// The validator caches compiled schemas forever, so availability and
 	// read permission are checked here for the whole $ref closure.
 	if r, ok := schema.ParseRef(s); ok {
@@ -1149,12 +1153,27 @@ func schemaErr(err error, path string) *Error {
 	return invalid(err.Error())
 }
 
-// loadSchema resolves a schema revision path for a writer (§6.1).
-func (t *tx) loadSchema(ref schema.Ref, a *actor, pending map[string]any) (any, error) {
+// loadSchema resolves a schema revision path for a writer (§6.1): from the
+// write's own earlier items, in the path's namespace, or, in a write to a
+// branch, among the drafts in branches of that namespace (loadDraft). A
+// path naming a branch is ErrBranch, whatever the drafts.
+func (t *tx) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (any, error) {
 	if d, ok := pending[ref.Path()]; ok {
 		return d, nil
 	}
 	t.deps.addSchema(ref)
+	d, err := t.loadSchemaIn(ref, sc.a)
+	if err == nil || errors.Is(err, schema.ErrBranch) {
+		return d, err
+	}
+	if dd, ok := t.loadDraft(ref, sc); ok {
+		return dd, nil
+	}
+	return nil, err
+}
+
+// loadSchemaIn resolves a schema revision path in its own namespace.
+func (t *tx) loadSchemaIn(ref schema.Ref, a *actor) (any, error) {
 	n := t.nsByName(ref.NS)
 	if n == nil || n.purged {
 		return nil, schema.ErrUnavailable

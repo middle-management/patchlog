@@ -70,7 +70,15 @@ CREATE TABLE IF NOT EXISTS revisions (
   UNIQUE (res, parent_seq)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_first ON revisions (res) WHERE first = 1;
-CREATE INDEX IF NOT EXISTS revisions_id ON revisions (id);
+-- Databases from before v0.33 named it revisions_id.
+DO $$ BEGIN
+  IF to_regclass('revisions_id') IS NOT NULL THEN
+    IF to_regclass('revisions_by_id') IS NULL THEN ALTER INDEX revisions_id RENAME TO revisions_by_id;
+    ELSE DROP INDEX revisions_id;
+    END IF;
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS revisions_by_id ON revisions (id);  -- also finds draft schema revisions in branches (§6.1, D.2)
 CREATE INDEX IF NOT EXISTS revisions_res_seq ON revisions (res, seq);
 
 CREATE TABLE IF NOT EXISTS grants (id bytea PRIMARY KEY, blocks bytea NOT NULL);

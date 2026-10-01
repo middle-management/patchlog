@@ -146,8 +146,9 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 			return nil, false
 		}
 	}
+	sc := &schemaCtx{a: p.a, target: target, creds: p.req.anyCreds()}
 	for _, ref := range d.schemas {
-		if _, err := t.loadSchema(ref, p.a, nil); err != nil {
+		if _, err := t.loadSchema(ref, sc, nil); err != nil {
 			return nil, false
 		}
 	}

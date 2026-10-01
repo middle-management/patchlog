@@ -1,6 +1,6 @@
 # patchlog
 
-A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.32).
+A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.33).
 Each resource is an append-only log of content-addressed JSON Patch sets. The server
 validates documents that opt in with `$schema`, enforces namespace rules and grants,
 and serves immutable, CDN-cacheable revisions.
@@ -12,6 +12,7 @@ and serves immutable, CDN-cacheable revisions.
 | I-JSON input, JCS canonical form, base32 ids (`1…`) | §3 | ✅ |
 | Revisions, tombstones, namespace chain, names grammar, canonical URLs | §3.3–§3.6 | ✅ |
 | Opt-in `$schema` validation (JSON Schema 2020-12, format assertions, strict refs, unknown keywords rejected); `schema import` brings in external schemas (e.g. schemastore) with refs pinned | §6.1–§6.3, §6.5 | ✅ |
+| Draft schema revisions in branches (`drafts.for`, repeated `Source-Authorization`), `in_use` by last available copy | §6.1, §7.4 | ✅ (the §F.9 release tooling — merge ordering, release previews, janitor ordering — is not built yet) |
 | Change envelopes, rule engine (`test`, `writes`, `compare`, `all`/`any`/`not`/`if`) | §6.4 | ✅ |
 | Limits (configurable, deployment maximums) and token-bucket rate limits | §6.6 | ✅ |
 | Reads, writes, gate order, `412`/`428`, idempotent retry | §6.2, §7.1–§7.2 | ✅ |
@@ -668,6 +669,48 @@ patchlog janitor -ns matches                     # purge merged/superseded branc
   successor's batch for `superseded` needs no such author, as §F.6 states. Cleanup is opt-in: a
   branch is purged only once a `cleanup` period, from the branch's or the base's document, has
   passed.
+
+### Draft schemas in branches (§6.1, §7.4, §F.9)
+
+A schema path never names a branch (`422 schema_ref`), but a release can draft its schemas in a
+branch of the schema namespace and its documents keep naming the base path:
+
+```sh
+# schemas-r7 drafts /r/schemas/team/rev/X; matches-r7 may use it
+POST /ns/schemas/branches  {"name": "schemas-r7", "patches": [{"op": "add", "path": "/drafts", "value": {"for": ["matches-r7"]}}]}
+PATCH /r/matches-r7/derby  {"$schema": "/r/schemas/team/rev/X", …}
+  Source-Authorization: Bearer <grant reading schemas-r7>   # repeatable
+```
+
+- **Where drafts resolve.** Only in a write to a branch, and only for a path its namespace `N`
+  can't resolve: the server then looks the id up (index `revisions_by_id`) among the local,
+  non-e2e branches of `N`, branches of branches included, counting only revisions a branch
+  wrote itself. A candidate serves itself and its own branches, and the namespaces its
+  `drafts.for` lists (names, or prefixes ending in `*`) with their branches. `drafts` is only
+  allowed in a branch's namespace document. In a namespace that isn't a branch, paths resolve
+  only in `N`, so documents using drafts can be merged into a base only after their schemas
+  (fast-forward the schema branch first: the same patches give the same ids).
+- **Read access.** The writer needs `read` on the schema resource in the candidate: with the
+  request's grant if it names the candidate and verifies under its keys, or with any grant of
+  `Source-Authorization`, which may be repeated (or comma-joined) on resource writes, batches
+  and blob copies. A draft the writer can't read is reported like an unknown one
+  (`422 schema_unavailable`). The client library sends several grants with
+  `client.WithSourceAuthorization`, `client.WithSourceGrants` (one write),
+  `BatchRequest.SourceAuthorizations` and `CopyBlobWith`.
+- **`in_use`.** A reference (every revision a branch wrote counts, not only its head; tombstoned
+  documents too) is satisfied by any available copy: in `N`, or for a branch in a candidate
+  serving it. A resource or namespace purge that would remove the last such copy, in any
+  namespace it reaches, is `409 in_use` with `referencing`: the referencing namespaces the
+  caller can read. So are narrowing `drafts.for` and raising a draft branch to `e2e`. `?force=1`
+  with a grant chained to a `*` key (the branch's own or inherited) overrides a purge, on
+  `POST /r/{ns}/{name}/purge` and now also `POST /ns/{ns}/purge`. On Postgres a purge takes the
+  other copy holders' locks shared, so two purges can't each remove one of the last two copies.
+- **Consumers** find drafts the same way (`client.ResolveSchema`, `client.SchemaResolver`):
+  `N` first, then its branches via `GET /ns/{N}/branches`, preferred branches first. The search
+  index does this for documents of branches, and an e2e merge validates as the target's gate
+  would (drafts only into a branch). `patchlog export` refuses a document whose schema exists
+  only in a branch, and a remote branch whose documents use drafts is `422 schema_unavailable`
+  (§G.3): merge the schemas first.
 
 ### Pruning archives and retention (§8.6)
 

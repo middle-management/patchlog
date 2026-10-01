@@ -93,12 +93,21 @@ func (s *Server) root(w http.ResponseWriter, r *http.Request) {
 
 // sourceCreds are Source-Authorization's (§7.8): the grant a copy's or a
 // batch's source is read with.
-func sourceCreds(r *http.Request) core.Credentials {
-	var c core.Credentials
-	if a := r.Header.Get("Source-Authorization"); strings.HasPrefix(a, "Bearer ") {
-		c.Bearer = strings.TrimSpace(a[len("Bearer "):])
+// The header may be repeated, or its values joined with commas by an
+// intermediary (§6.1): every Bearer grant in it is kept.
+func sourceCreds(r *http.Request) []core.Credentials {
+	var out []core.Credentials
+	for _, h := range r.Header.Values("Source-Authorization") {
+		for _, a := range strings.Split(h, ",") {
+			a = strings.TrimSpace(a)
+			if strings.HasPrefix(a, "Bearer ") {
+				if g := strings.TrimSpace(a[len("Bearer "):]); g != "" {
+					out = append(out, core.Credentials{Bearer: g})
+				}
+			}
+		}
 	}
-	return c
+	return out
 }
 
 func creds(r *http.Request) core.Credentials {
@@ -513,7 +522,7 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	res, err := s.e.WriteResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature")},
+	res, err := s.e.WriteResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature"), SourceCreds: sourceCreds(r)},
 		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Patches: body}}})
 	if err != nil {
 		writeErr(w, err)
@@ -663,7 +672,7 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 			up.HasBody = n > 0
 		}
 	}
-	req := core.Request{NS: ns, Cred: creds(r), SourceCred: sourceCreds(r)}
+	req := core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}
 	if err := s.e.UploadBlob(r.Context(), req, name, bid, up); err != nil {
 		writeErr(w, err)
 		return
@@ -990,7 +999,7 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 	}
 	// Batch limits depend on the principal (§6.6): authenticate first, then
 	// stop reading a body larger than that principal's batchSize (§7.5).
-	req := core.Request{NS: ns, Cred: creds(r), SourceCred: sourceCreds(r)}
+	req := core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}
 	max, err := s.e.BatchBodyLimit(r.Context(), req)
 	if err != nil {
 		writeErr(w, err)
@@ -1114,7 +1123,7 @@ func (s *Server) nsPurge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	nsID, err := s.e.PurgeNamespace(r.Context(), core.Request{NS: ns, Cred: creds(r)}, p.ifMatch)
+	nsID, err := s.e.PurgeNamespace(r.Context(), core.Request{NS: ns, Cred: creds(r)}, p.ifMatch, r.URL.Query().Get("force") == "1")
 	if err != nil {
 		writeErr(w, err)
 		return

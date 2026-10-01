@@ -18,23 +18,43 @@ import (
 
 // SchemaCache loads schema revisions through the core API and keeps them
 // forever: a revision id determines its document (§3.3), so an entry never
-// goes stale.
+// goes stale. For documents of a branch it also finds draft schema
+// revisions in branches of the path's namespace, as the server resolves
+// them (§6.1, client.ResolveSchema).
 type SchemaCache struct {
-	c  *client.Client
-	mu sync.Mutex
-	m  map[string]any
+	c      *client.Client
+	mu     sync.Mutex
+	m      map[string]any
+	branch map[string]bool // namespace -> is a branch (never changes, §7.4)
 }
 
 // NewSchemaCache returns a cache reading through c.
 func NewSchemaCache(c *client.Client) *SchemaCache {
-	return &SchemaCache{c: c, m: map[string]any{}}
+	return &SchemaCache{c: c, m: map[string]any{}, branch: map[string]bool{}}
 }
 
-// Loader returns a schema.Loader for one Collect call. A revision that is
-// unknown, purged or unreadable is schema.ErrUnavailable; any other failure
-// (network, 5xx, 429) is recorded in *transient so the caller can retry
-// instead of indexing the document without its fields.
+// Loader returns a schema.Loader for one Collect call, resolving paths in
+// their own namespaces only. A revision that is unknown, purged or
+// unreadable is schema.ErrUnavailable; any other failure (network, 5xx,
+// 429) is recorded in *transient so the caller can retry instead of
+// indexing the document without its fields.
 func (s *SchemaCache) Loader(ctx context.Context, transient *error) schema.Loader {
+	return s.LoaderFor(ctx, "", transient)
+}
+
+// LoaderFor is Loader for a document of namespace ns: if ns is a branch,
+// a path its namespace can't resolve is looked up among that namespace's
+// branches (§6.1).
+func (s *SchemaCache) LoaderFor(ctx context.Context, ns string, transient *error) schema.Loader {
+	fail := func(err error) (any, error) {
+		if client.IsNotFound(err) || client.IsGone(err) || client.IsAuth(err) {
+			return nil, schema.ErrUnavailable
+		}
+		if *transient == nil {
+			*transient = err
+		}
+		return nil, err
+	}
 	return func(r schema.Ref) (any, error) {
 		p := r.Path()
 		s.mu.Lock()
@@ -43,21 +63,41 @@ func (s *SchemaCache) Loader(ctx context.Context, transient *error) schema.Loade
 		if ok {
 			return jsonv.Clone(v), nil
 		}
-		d, err := s.c.Doc(ctx, r.NS, r.Name, r.Rev)
+		d, err := s.c.ResolveSchema(ctx, r, client.ResolveOptions{})
+		if err != nil && ns != "" && (client.IsNotFound(err) || client.IsGone(err) || client.IsAuth(err)) {
+			// Only a branch's documents may use drafts. A namespace
+			// document this client can't read (sealed, say) means no.
+			if b, berr := s.isBranch(ctx, ns); berr == nil && b {
+				if dd, derr := s.c.ResolveSchema(ctx, r, client.ResolveOptions{Drafts: true}); derr == nil || !client.IsNotFound(derr) && !client.IsGone(derr) && !client.IsAuth(derr) {
+					d, err = dd, derr
+				}
+			}
+		}
 		if err != nil {
-			if client.IsNotFound(err) || client.IsGone(err) || client.IsAuth(err) {
-				return nil, schema.ErrUnavailable
-			}
-			if *transient == nil {
-				*transient = err
-			}
-			return nil, err
+			return fail(err)
 		}
 		s.mu.Lock()
-		s.m[p] = d.Value
+		s.m[p] = d.Doc.Value
 		s.mu.Unlock()
-		return jsonv.Clone(d.Value), nil
+		return jsonv.Clone(d.Doc.Value), nil
 	}
+}
+
+func (s *SchemaCache) isBranch(ctx context.Context, ns string) (bool, error) {
+	s.mu.Lock()
+	b, ok := s.branch[ns]
+	s.mu.Unlock()
+	if ok {
+		return b, nil
+	}
+	b, err := s.c.IsBranch(ctx, ns)
+	if err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	s.branch[ns] = b
+	s.mu.Unlock()
+	return b, nil
 }
 
 type textRow struct{ path, body string }
@@ -88,7 +128,7 @@ func (ix *Index) extract(ctx context.Context, ns, resource string, doc any) (str
 		return "", false, nil, nil
 	}
 	var transient error
-	anns, err := annot.Collect(doc, ix.schemas.Loader(ctx, &transient), "x-index")
+	anns, err := annot.Collect(doc, ix.schemas.LoaderFor(ctx, ns, &transient), "x-index")
 	if err != nil {
 		if transient != nil {
 			return "", false, nil, transient

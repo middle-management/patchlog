@@ -93,9 +93,11 @@ type e2eKeys struct {
 }
 
 type e2eSchemas struct {
-	v  *schema.Validator
-	mu sync.Mutex
-	m  map[string]any // schema revision path -> document
+	v      *schema.Validator
+	mu     sync.Mutex
+	m      map[string]any  // schema revision path -> document, in its own namespace
+	drafts map[string]any  // schema revision path -> document drafted in a branch (§6.1)
+	branch map[string]bool // namespace -> is a branch
 }
 
 // E2E returns an e2e view of c. recipient is the private key whose public
@@ -103,7 +105,7 @@ type e2eSchemas struct {
 // added with AddKey.
 func (c *Client) E2E(recipient *ecdh.PrivateKey) *E2E {
 	return &E2E{c: c, recipient: recipient, keys: &e2eKeys{m: map[string][]byte{}},
-		schemas: &e2eSchemas{v: schema.NewValidator(), m: map[string]any{}}, pads: &e2ePads{m: map[string]*padHistory{}}}
+		schemas: &e2eSchemas{v: schema.NewValidator(), m: map[string]any{}, drafts: map[string]any{}, branch: map[string]bool{}}, pads: &e2ePads{m: map[string]*padHistory{}}}
 }
 
 // WithRecipient returns a view that also unwraps keys with priv, sharing
@@ -381,7 +383,7 @@ func (x *E2E) prepareWrite(ctx context.Context, ns, name, base string, patches a
 		return fail(fmt.Errorf("client: e2e write %s/%s: %w", ns, name, err))
 	}
 	if !x.noValidate {
-		if msg, err := x.validate(ctx, nd); err != nil {
+		if msg, err := x.validate(ctx, ns, nd); err != nil {
 			return nil, err
 		} else if msg != "" {
 			return nil, fmt.Errorf("client: e2e write %s/%s: the document doesn't validate against its $schema: %s", ns, name, msg)
@@ -797,7 +799,18 @@ func (x *E2E) Validate(ctx context.Context, doc any) (string, error) {
 	if x.noValidate {
 		return "", nil
 	}
-	return x.validate(ctx, doc)
+	return x.validate(ctx, "", doc)
+}
+
+// ValidateIn is Validate for a document written to namespace target,
+// resolving $schema as the target's gate would (§6.1, §F.8.1): in a branch,
+// a path its namespace can't resolve is looked up among drafts in that
+// namespace's branches; elsewhere only in the schema namespaces themselves.
+func (x *E2E) ValidateIn(ctx context.Context, target string, doc any) (string, error) {
+	if x.noValidate {
+		return "", nil
+	}
+	return x.validate(ctx, target, doc)
 }
 
 // fold verifies and folds a log answer ending at id and starting after
@@ -892,7 +905,7 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 			flag("patch set doesn't apply: " + err.Error())
 			continue
 		}
-		msg, err = x.validate(ctx, nd)
+		msg, err = x.validate(ctx, ns, nd)
 		if err != nil {
 			return nil, err
 		}
@@ -933,22 +946,43 @@ func (e *errSchemaLoad) Unwrap() error { return e.err }
 // validate checks doc against its $schema (§6.1 forms), fetching schemas
 // through the client. It returns a message for an invalid document, or an
 // error when a schema couldn't be fetched.
-func (x *E2E) validate(ctx context.Context, doc any) (string, error) {
+func (x *E2E) validate(ctx context.Context, target string, doc any) (string, error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
 	}
-	if _, has := m["$schema"]; !has {
+	sv, has := m["$schema"]
+	if !has {
 		return "", nil
+	}
+	drafts := false
+	if target != "" {
+		x.schemas.mu.Lock()
+		b, known := x.schemas.branch[target]
+		x.schemas.mu.Unlock()
+		if !known {
+			// A namespace document the client can't read counts as not a
+			// branch: paths then resolve only in their own namespaces.
+			var err error
+			if b, err = x.c.IsBranch(ctx, target); err == nil {
+				x.schemas.mu.Lock()
+				x.schemas.branch[target] = b
+				x.schemas.mu.Unlock()
+			}
+		}
+		drafts = b
 	}
 	load := func(ref schema.Ref) (any, error) {
 		x.schemas.mu.Lock()
 		d, ok := x.schemas.m[ref.Path()]
+		if !ok && drafts {
+			d, ok = x.schemas.drafts[ref.Path()]
+		}
 		x.schemas.mu.Unlock()
 		if ok {
 			return d, nil
 		}
-		sd, err := x.c.Doc(ctx, ref.NS, ref.Name, ref.Rev)
+		r, err := x.c.ResolveSchema(ctx, ref, ResolveOptions{Drafts: drafts})
 		if err != nil {
 			if IsNotFound(err) || IsGone(err) || IsAuth(err) {
 				return nil, schema.ErrUnavailable
@@ -956,9 +990,38 @@ func (x *E2E) validate(ctx context.Context, doc any) (string, error) {
 			return nil, &errSchemaLoad{err}
 		}
 		x.schemas.mu.Lock()
-		x.schemas.m[ref.Path()] = sd.Value
+		if r.NS == ref.NS {
+			x.schemas.m[ref.Path()] = r.Doc.Value
+		} else {
+			x.schemas.drafts[ref.Path()] = r.Doc.Value
+		}
 		x.schemas.mu.Unlock()
-		return sd.Value, nil
+		return r.Doc.Value, nil
+	}
+	// The validator keeps compiled schemas, so whether each revision of the
+	// closure resolves for this target is checked first.
+	if s, _ := sv.(string); s != "" {
+		if r, ok := schema.ParseRef(s); ok {
+			seen := map[string]bool{}
+			queue := []schema.Ref{r}
+			for len(queue) > 0 {
+				r := queue[0]
+				queue = queue[1:]
+				if seen[r.Path()] {
+					continue
+				}
+				seen[r.Path()] = true
+				d, err := load(r)
+				if err != nil {
+					var le *errSchemaLoad
+					if errors.As(err, &le) {
+						return "", le.err
+					}
+					return fmt.Sprintf("%s: %v", r.Path(), err), nil
+				}
+				queue = append(queue, schema.Refs(d)...)
+			}
+		}
 	}
 	err := x.schemas.v.Validate(doc, load)
 	if err == nil {

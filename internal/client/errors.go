@@ -42,6 +42,14 @@ func (e *APIError) Horizon() string { return str(e.Body, "horizon") }
 // Successor is the successor namespace of a 409 frozen (§8.4).
 func (e *APIError) Successor() string { return str(e.Body, "successor") }
 
+// Referencing lists, for a 409 in_use refusing a purge or config write that
+// would leave schema references without a copy (§6.1), the referencing
+// namespaces the caller can read.
+func (e *APIError) Referencing() []string { return strList(e.Body["referencing"]) }
+
+// Dependents lists the dependents of a 409 in_use (§7.4, §8.5).
+func (e *APIError) Dependents() []string { return strList(e.Body["dependents"]) }
+
 // Items are the per-item failures of a batch error (§7.5).
 func (e *APIError) Items() []map[string]any {
 	a, _ := e.Body["items"].([]any)
@@ -106,6 +114,11 @@ func IsPruned(err error) bool { return statusIs(err, 410, "pruned") }
 
 // IsNotFound reports a 404 (unknown, or not readable by the caller, §7).
 func IsNotFound(err error) bool { return statusIs(err, 404) }
+
+// IsInUse reports a 409 in_use: a purge of the last copy of a referenced
+// schema revision, a namespace with dependents, or a config write that
+// would break either (§6.1, §7.4, §8.5).
+func IsInUse(err error) bool { return statusIs(err, 409, "in_use") }
 
 // IsFrozen reports a write to a frozen namespace (409 frozen, §8.4).
 func IsFrozen(err error) bool { return statusIs(err, 409, "frozen") }

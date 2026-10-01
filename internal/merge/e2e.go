@@ -109,7 +109,7 @@ func (p *Plan) sealSteps(ctx context.Context, r *Resource) (steps []client.Step,
 		if err != nil {
 			return nil, fmt.Sprintf("step %d doesn't apply: %v", i, err), nil
 		}
-		if m, err := x.Validate(ctx, nd); err != nil {
+		if m, err := x.ValidateIn(ctx, p.Target, nd); err != nil {
 			return nil, "", err
 		} else if m != "" {
 			return nil, fmt.Sprintf("step %d: the document doesn't validate against its $schema: %s", i, m), nil

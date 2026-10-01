@@ -214,6 +214,13 @@ func WithSignature(sig string) WriteOption {
 	return func(r *request) { r.header["Signature"] = sig }
 }
 
+// WithSourceGrants sends each grant as a repeated Source-Authorization
+// header: any that verifies for a branch holding draft schema revisions
+// lets the write resolve them there (§6.1).
+func WithSourceGrants(grants ...string) WriteOption {
+	return func(r *request) { r.sourceAuth = append(r.sourceAuth, grants...) }
+}
+
 func (c *Client) patchResource(ctx context.Context, ns, name string, precond map[string]string, patches any, opts []WriteOption) (*WriteResult, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err

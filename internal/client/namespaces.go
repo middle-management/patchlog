@@ -408,6 +408,11 @@ type BatchRequest struct {
 	// Source-Authorization: it reads a local source, whose blobs the items
 	// may then reference (§7.5, §7.8).
 	SourceAuthorization string
+	// SourceAuthorizations are further grants sent as repeated
+	// Source-Authorization headers: any that verifies for a namespace
+	// serves for it, e.g. one per branch holding draft schema revisions
+	// the items resolve (§6.1).
+	SourceAuthorizations []string
 }
 
 // BatchItemResult lists the ids an item produced (or, for a dry run, would).
@@ -493,8 +498,9 @@ func (c *Client) Batch(ctx context.Context, ns string, b BatchRequest, dryRun bo
 	}
 	rq := &request{body: raw, ct: "application/json"}
 	if b.SourceAuthorization != "" {
-		rq.header = map[string]string{"Source-Authorization": "Bearer " + b.SourceAuthorization}
+		rq.sourceAuth = append(rq.sourceAuth, b.SourceAuthorization)
 	}
+	rq.sourceAuth = append(rq.sourceAuth, b.SourceAuthorizations...)
 	r, err := c.do(ctx, "POST", "/ns/"+ns+"/batch", q, rq)
 	if err != nil {
 		return nil, err
@@ -518,13 +524,24 @@ func (c *Client) Batch(ctx context.Context, ns string, b BatchRequest, dryRun bo
 // PurgeNamespace purges a frozen namespace (§8.5). head is its current
 // ns_id. It returns the purge-ns entry's ns_id.
 func (c *Client) PurgeNamespace(ctx context.Context, ns, head string) (string, error) {
+	return c.PurgeNamespaceForce(ctx, ns, head, false)
+}
+
+// PurgeNamespaceForce is PurgeNamespace; with force (a grant chained to a *
+// key), it goes ahead even if the namespace holds the last copy of a
+// referenced schema revision (§6.1).
+func (c *Client) PurgeNamespaceForce(ctx context.Context, ns, head string, force bool) (string, error) {
 	if err := checkNS(ns); err != nil {
 		return "", err
 	}
 	if err := checkID("namespace head", head); err != nil {
 		return "", err
 	}
-	r, err := c.do(ctx, "POST", "/ns/"+ns+"/purge", nil, &request{header: map[string]string{"If-Match": quote(head)}})
+	var q url.Values
+	if force {
+		q = url.Values{"force": {"1"}}
+	}
+	r, err := c.do(ctx, "POST", "/ns/"+ns+"/purge", q, &request{header: map[string]string{"If-Match": quote(head)}})
 	if err != nil {
 		return "", err
 	}

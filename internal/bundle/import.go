@@ -971,7 +971,8 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 }
 
 // schemaLoader loads schema revisions for x-ref walks: from the bundle's
-// full documents, else from the target (where $schema paths resolve).
+// full documents, else from the target (where $schema paths resolve, or
+// drafts in branches of their namespaces do).
 func (im *importer) schemaLoader(ctx context.Context) schema.Loader {
 	return func(ref schema.Ref) (any, error) {
 		p := ref.Path()
@@ -988,15 +989,18 @@ func (im *importer) schemaLoader(ctx context.Context) schema.Loader {
 				return v, nil
 			}
 		}
-		doc, err := im.c.Doc(ctx, ref.NS, ref.Name, ref.Rev)
+		// A draft in a branch of the path's namespace has the same content
+		// as any copy (§3.3, §6.1); whether a write may use it is the gate's
+		// to decide.
+		r, err := im.c.ResolveSchema(ctx, ref, client.ResolveOptions{Drafts: true})
 		if err != nil {
 			if client.IsNotFound(err) || client.IsGone(err) {
 				return nil, &schema.UnavailableError{Ref: p}
 			}
 			return nil, err
 		}
-		im.schemas[p] = doc.Value
-		return doc.Value, nil
+		im.schemas[p] = r.Doc.Value
+		return r.Doc.Value, nil
 	}
 }
 

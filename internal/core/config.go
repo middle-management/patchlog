@@ -141,8 +141,13 @@ type Config struct {
 	HistoryEpochs int
 	// Pad is encryption.pad of a sealed or e2e namespace: sealed payloads
 	// are padded to size buckets (§E.2.2, seal.PadLen).
-	Pad   bool
-	level int
+	Pad bool
+	// DraftsFor is drafts.for of a branch (§7.4): the other namespaces,
+	// names or prefixes ending in "*", whose writes (and their branches')
+	// may resolve schema paths into this branch's own revisions (§6.1).
+	// Nil when absent: the drafts serve only the branch and its branches.
+	DraftsFor []string
+	level     int
 }
 
 // Allowance gives a named principal its own rate and batch limits (§6.6).
@@ -392,6 +397,12 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				return nil, fmt.Errorf("/base must be { ns, at } or { origin, ns, at }")
 			}
 			c.Base = &BaseRef{NS: ns, At: at}
+		case "drafts":
+			df, err := parseDrafts(v)
+			if err != nil {
+				return nil, err
+			}
+			c.DraftsFor = df
 		case "encryption":
 			e, ok := v.(map[string]any)
 			if !ok {
@@ -445,6 +456,9 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			}
 			c.Encryption, c.level = lv, levelOf(lv)
 		}
+	}
+	if c.DraftsFor != nil && c.Base == nil {
+		return nil, fmt.Errorf("/drafts is only for branches (§7.4)")
 	}
 	if c.level == levelE2E {
 		// Sealing grows a patch set by half, and it carries the declared

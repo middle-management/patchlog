@@ -43,6 +43,9 @@ type Client struct {
 	bearer string
 	author string
 	keys   *Keys // sealed namespaces (sealed.go)
+	// sourceAuth are grants sent as Source-Authorization on every write
+	// (WithSourceAuthorization).
+	sourceAuth []string
 
 	originMu sync.Mutex
 	origin   string
@@ -62,6 +65,16 @@ func WithHTTPClient(hc *http.Client) Option {
 
 // WithBearer sends Authorization: Bearer <token> (Addendum C) on every request.
 func WithBearer(token string) Option { return func(c *Client) { c.bearer = token } }
+
+// WithSourceAuthorization sends each grant as a Source-Authorization header
+// on every write: resource writes, batches and blob copies (§6.1, §7.8).
+// Any of them that verifies for a namespace serves for it: to read a
+// batch's local source, a copy's source, or a branch holding draft schema
+// revisions the written documents resolve (§6.1). Requests that pass their
+// own Source-Authorization grants send those too.
+func WithSourceAuthorization(grants ...string) Option {
+	return func(c *Client) { c.sourceAuth = append([]string(nil), grants...) }
+}
 
 // WithAuthor sends X-Author on every request (development mode only, §7.2).
 func WithAuthor(name string) Option { return func(c *Client) { c.author = name } }
@@ -84,7 +97,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // With returns a copy of the client with further options applied, e.g. a
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
-	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys}
+	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth}
 	c.originMu.Lock()
 	n.origin = c.origin
 	c.originMu.Unlock()
@@ -205,6 +218,9 @@ type request struct {
 	header map[string]string
 	body   []byte
 	ct     string
+	// sourceAuth are grants sent as repeated Source-Authorization headers
+	// (§6.1, §7.8), after the client's own.
+	sourceAuth []string
 }
 
 func (c *Client) do(ctx context.Context, method, path string, q url.Values, rq *request) (*response, error) {
@@ -227,6 +243,18 @@ func (c *Client) do(ctx context.Context, method, path string, q url.Values, rq *
 		}
 		for k, v := range rq.header {
 			hr.Header.Set(k, v)
+		}
+	}
+	if method != "GET" && method != "HEAD" {
+		var grants []string
+		grants = append(grants, c.sourceAuth...)
+		if rq != nil {
+			grants = append(grants, rq.sourceAuth...)
+		}
+		for _, g := range grants {
+			if g != "" {
+				hr.Header.Add("Source-Authorization", "Bearer "+g)
+			}
 		}
 	}
 	res, err := c.hc.Do(hr)

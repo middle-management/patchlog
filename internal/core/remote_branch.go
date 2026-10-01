@@ -182,6 +182,21 @@ func fetchErr(what string, err error) *Error {
 	return remoteErr("%s: %v", what, err)
 }
 
+// schemaFetchErr maps a failed fetch of a referenced schema revision from
+// its namespace at the base (§G.3): a revision that doesn't resolve there,
+// as with a draft in a branch (§6.1), can't be mirrored, and creation fails
+// with 422.
+func schemaFetchErr(ref schema.Ref) func(string, error) *Error {
+	return func(what string, err error) *Error {
+		if ae, ok := client.AsAPIError(err); ok && ae.Status == 404 {
+			return apiErr(422, "schema_unavailable", "ref", ref.Path(), "message",
+				ref.Path()+" doesn't resolve in "+ref.NS+" at the base (a draft in a branch there, §6.1, or unreadable); "+
+					"a remote branch mirrors schema revisions only from their own namespace (§G.3)")
+		}
+		return fetchErr(what, err)
+	}
+}
+
 // --- fetching and verifying the base -------------------------------------
 
 // remoteChain is a verified resource chain from the base, oldest first. If
@@ -714,7 +729,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		key := ref.NS + "/" + ref.Name
 		s := schemas[key]
 		if _, have := s.chainIndex(ref.Rev); !have {
-			ch, ferr := fetchChain(ctx, c, ref.NS, ref.Name, ref.Rev, false, fetchErr)
+			ch, ferr := fetchChain(ctx, c, ref.NS, ref.Name, ref.Rev, false, schemaFetchErr(ref))
 			if ferr != nil {
 				return nil, ferr
 			}

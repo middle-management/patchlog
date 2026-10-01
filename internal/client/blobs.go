@@ -65,6 +65,18 @@ func (c *Client) UploadBlob(ctx context.Context, ns, name, typ, nonce string, da
 // is sent as Source-Authorization to read the source; otherwise the
 // client's own grant is used.
 func (c *Client) CopyBlob(ctx context.Context, ns, name, bid, fromNS, fromName, sourceGrant string) error {
+	var gs []string
+	if sourceGrant != "" {
+		gs = []string{sourceGrant}
+	}
+	return c.CopyBlobWith(ctx, ns, name, bid, fromNS, fromName, gs...)
+}
+
+// CopyBlobWith is CopyBlob with any number of Source-Authorization grants,
+// sent as repeated headers: any that verifies for fromNS reads the source
+// (§7.8). Without any (and none set with WithSourceAuthorization), the
+// client's own grant is used.
+func (c *Client) CopyBlobWith(ctx context.Context, ns, name, bid, fromNS, fromName string, sourceGrants ...string) error {
 	if err := checkRes(ns, name); err != nil {
 		return err
 	}
@@ -75,10 +87,7 @@ func (c *Client) CopyBlob(ctx context.Context, ns, name, bid, fromNS, fromName, 
 		return err
 	}
 	h := map[string]string{"Blob-From": "/r/" + fromNS + "/" + fromName + "/blob/" + bid}
-	if sourceGrant != "" {
-		h["Source-Authorization"] = "Bearer " + sourceGrant
-	}
-	r, err := c.do(ctx, "PUT", "/r/"+ns+"/"+name+"/blob/"+bid, nil, &request{header: h})
+	r, err := c.do(ctx, "PUT", "/r/"+ns+"/"+name+"/blob/"+bid, nil, &request{header: h, sourceAuth: sourceGrants})
 	if err != nil {
 		return err
 	}

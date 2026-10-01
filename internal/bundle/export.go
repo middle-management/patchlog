@@ -471,6 +471,9 @@ func (p *ExportPlan) revisionDeps(ctx context.Context, d *PlannedDoc, rev string
 	}
 	if schema.IsDialect(s) {
 		for _, r := range schema.Refs(doc) {
+			if err := p.notDraft(ctx, d, r, "$ref in "+rev); err != nil {
+				return true, err
+			}
 			if err := p.need(ctx, d, Target{r.NS, r.Name, r.Rev}, true, "$ref in "+rev); err != nil {
 				return true, err
 			}
@@ -478,9 +481,35 @@ func (p *ExportPlan) revisionDeps(ctx context.Context, d *PlannedDoc, rev string
 		return true, nil
 	}
 	if r, ok := schema.ParseRef(s); ok {
+		if err := p.notDraft(ctx, d, r, "$schema of "+rev); err != nil {
+			return false, err
+		}
 		return false, p.need(ctx, d, Target{r.NS, r.Name, r.Rev}, true, "$schema of "+rev)
 	}
 	return false, nil
+}
+
+// notDraft refuses a schema reference that resolves only in a branch of
+// its namespace (§6.1 drafts): the bundle couldn't carry it under its path,
+// so the document can't be exported until that branch is merged (§G.4.2).
+func (p *ExportPlan) notDraft(ctx context.Context, d *PlannedDoc, r schema.Ref, why string) error {
+	if p.isExternal(r.NS, r.Name) {
+		return nil
+	}
+	_, err := p.loader(ctx)(r)
+	var ue *schema.UnavailableError
+	if err == nil || !errors.As(err, &ue) {
+		return nil // available, or a failure reported where it is needed
+	}
+	b, ferr := p.c.FindDraft(ctx, r)
+	if ferr != nil {
+		return ferr
+	}
+	if b != "" {
+		return fmt.Errorf("export: %s: the %s, %s, exists only in branch %s (a draft schema revision, §6.1); merge that branch's schemas into %s before exporting (§G.4.2)",
+			d.Key, why, r.Path(), b, r.NS)
+	}
+	return nil // reported as unavailable where it is needed
 }
 
 func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {

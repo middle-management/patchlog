@@ -10,7 +10,6 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
-	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // configPlan is a config change that passed steps 1–6.
@@ -221,6 +220,13 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		}
 		if len(deps) > 0 {
 			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps))
+		}
+	}
+	if n.isBranch() && (!sameStrings(cur.DraftsFor, cfg.DraftsFor) || cfg.level == levelE2E && cur.level != levelE2E) {
+		// Narrowing drafts.for, or raising a branch to e2e, may leave a
+		// reference to its drafts without a copy (§6.1, §7.4).
+		if broken := t.brokenReferences(refChange{cfg: map[int64]*Config{n.id: cfg}}); len(broken) > 0 {
+			return nil, t.inUse(a, broken, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)")
 		}
 	}
 	return cfg, nil
@@ -624,16 +630,18 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 			return apiErr(412, "stale", "head", v.head.id.String())
 		}
 		if force && !a.star {
+			// An operator's override, or for drafts in a branch a grant
+			// chained to a * key of the branch, inherited or its own
+			// (§6.1): both verify as a * key here.
 			return forbidden("a forced purge needs a * key")
 		}
 		if !force {
-			refs := t.referencedPaths(func(ns *nsRow, res string) bool {
-				return res == name && (ns.id == n.id || t.isBranchOf(ns, n))
-			})
-			for p := range refs {
-				if r, ok := schema.ParseRef(p); ok && r.NS == n.name && r.Name == name {
-					return apiErr(409, "in_use", "message", "a revision of this resource is a referenced schema")
-				}
+			// The purge reaches n and every branch it propagates to
+			// (§8.3), each locked exclusively before it is read.
+			reached := t.purgeReach(n)
+			gone := func(ns *nsRow, res string) bool { return res == name && reached[ns.id] }
+			if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+				return t.inUse(a, broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
 			}
 		}
 		env := t.basicEnvelope("purge", name, a)
@@ -647,14 +655,23 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 	return out, err
 }
 
-func (t *tx) isBranchOf(b, base *nsRow) bool {
-	for b.isBranch() {
-		if b.base.Int64 == base.id {
-			return true
+// purgeReach locks n and every unpurged branch a resource purge in n
+// propagates to (§8.3) exclusively, in the order purgeResource does, and
+// returns their ids.
+func (t *tx) purgeReach(n *nsRow) map[int64]bool {
+	reached := map[int64]bool{n.id: true}
+	var walk func(x *nsRow)
+	walk = func(x *nsRow) {
+		for _, b := range t.branchesOf(x) {
+			if !b.purged && !reached[b.id] {
+				t.lockNS(b.id, lockExclusive)
+				reached[b.id] = true
+				walk(b)
+			}
 		}
-		b = t.nsByID(b.base.Int64)
 	}
-	return false
+	walk(n)
+	return reached
 }
 
 // purgeResource purges name in n and propagates to every branch (§8.3). It
@@ -717,7 +734,10 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 
 // PurgeNamespace purges a frozen namespace (§8.5). It returns the purge-ns
 // entry's ns_id.
-func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string) (string, error) {
+//
+// With force, which needs a * key, it purges even if that removes the last
+// copy of a referenced schema revision (§6.1).
+func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(req.NS)
@@ -754,10 +774,13 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if len(deps) > 0 {
 			return apiErr(409, "in_use", "dependents", anyStrings(deps))
 		}
-		refs := t.referencedPaths(func(ns *nsRow, _ string) bool { return ns.id == n.id })
-		for p := range refs {
-			if r, ok := schema.ParseRef(p); ok && r.NS == n.name {
-				return apiErr(409, "in_use", "message", "a schema revision of this namespace is referenced elsewhere")
+		if force && !a.star {
+			return forbidden("a forced purge needs a * key")
+		}
+		if !force {
+			gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
+			if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+				return t.inUse(a, broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
 			}
 		}
 		env := t.basicEnvelope("purge-ns", "", a)
@@ -797,65 +820,6 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		return nil
 	})
 	return out, err
-}
-
-// referencedPaths computes the referenced schema revisions of §6.1: those
-// named by $schema in the last live document of any unpurged resource
-// (including read-through ones), and everything reachable through $ref.
-// exclude skips referencing resources.
-func (t *tx) referencedPaths(exclude func(ns *nsRow, res string) bool) map[string]bool {
-	out := map[string]bool{}
-	var queue []string
-	// The namespaces read here aren't locked (on Postgres, pglock.go): a
-	// write that makes a schema referenced holds the schema namespace's lock
-	// shared (it resolved the schema), and purges and prunes, the callers,
-	// hold that namespace's lock exclusively.
-	t.noLock++
-	defer func() { t.noLock-- }()
-	// Shadows (§G.3) are read only through their remote branch, whose
-	// heads include what it reads through.
-	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
-	t.must(err)
-	var all []*nsRow
-	for rows.Next() {
-		n, err := scanNS(rows)
-		t.must(err)
-		all = append(all, n)
-	}
-	rows.Close()
-	for _, n := range all {
-		for _, h := range t.listHeads(n, nil) {
-			if h.state == Purged || h.row == nil || exclude(n, h.name) {
-				continue
-			}
-			var ref sql.NullString
-			ll := t.lastLive(h.row)
-			t.must(t.QueryRow(`SELECT schema_ref FROM revisions WHERE seq = ?`, ll.seq).Scan(&ref))
-			if ref.Valid && !out[ref.String] {
-				out[ref.String] = true
-				queue = append(queue, ref.String)
-			}
-		}
-	}
-	for len(queue) > 0 {
-		p := queue[0]
-		queue = queue[1:]
-		r, ok := schema.ParseRef(p)
-		if !ok {
-			continue
-		}
-		d, err := t.loadSchema(r, &actor{}, nil)
-		if err != nil {
-			continue
-		}
-		for _, x := range schema.Refs(d) {
-			if !out[x.Path()] {
-				out[x.Path()] = true
-				queue = append(queue, x.Path())
-			}
-		}
-	}
-	return out
 }
 
 // PruneRequest is POST /r/{ns}/{name}/prune (§8.6).
@@ -1027,7 +991,7 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 	}
 	// Documents that stay available: the horizon (and for a tombstone the
 	// last live document), kept revisions and referenced schemas.
-	refs := t.referencedPaths(func(*nsRow, string) bool { return false })
+	refs := t.referencedPaths()
 	keepSeqs := map[int64]*revRow{}
 	keepSeqs[t.lastLive(h).seq] = t.lastLive(h)
 	for _, k := range keep {

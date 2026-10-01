@@ -57,7 +57,8 @@ CREATE TABLE IF NOT EXISTS revisions (
   UNIQUE (res, parent_seq)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_first ON revisions (res) WHERE first = 1;
-CREATE INDEX IF NOT EXISTS revisions_id ON revisions (id);
+CREATE INDEX IF NOT EXISTS revisions_by_id ON revisions (id);  -- also finds draft schema revisions in branches (§6.1, D.2)
+DROP INDEX IF EXISTS revisions_id;
 CREATE INDEX IF NOT EXISTS revisions_res_seq ON revisions (res, seq);
 
 CREATE TABLE IF NOT EXISTS grants (id BLOB PRIMARY KEY, blocks TEXT NOT NULL);

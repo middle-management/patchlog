@@ -258,29 +258,46 @@ func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
 
 // sourceUnrestricted reports whether a batch may read its local source
 // unrestricted (§7.5): every resource of it, as branch creation requires
-// (§7.6), with the grant in Source-Authorization, or the request's own.
+// (§7.6), with the request's own grant or any in Source-Authorization.
 func (t *tx) sourceUnrestricted(n *nsRow, req Request) bool {
-	cred := req.Cred
-	if req.SourceCred.Bearer != "" {
-		cred = req.SourceCred
+	for _, cred := range req.anyCreds() {
+		a, err := t.reader(n, cred, "")
+		if err != nil {
+			continue
+		}
+		if a == nil || t.config(n.configSeq).Read == "public" || a.unrestrictedRead() {
+			return true
+		}
 	}
-	a, err := t.reader(n, cred, "")
-	if err != nil {
-		return false
+	return false
+}
+
+// anyCreds are the grants a request may read another namespace with: its
+// own, then each of Source-Authorization's (§6.1, §7.5). Any of them that
+// verifies there serves.
+func (r Request) anyCreds() []Credentials {
+	return append([]Credentials{r.Cred}, r.SourceCreds...)
+}
+
+// copyCreds are the grants a copy's source is read with (§7.8): those of
+// Source-Authorization, or the request's own if there are none.
+func (r Request) copyCreds() []Credentials {
+	if len(r.SourceCreds) > 0 {
+		return r.SourceCreds
 	}
-	return a == nil || t.config(n.configSeq).Read == "public" || a.unrestrictedRead()
+	return []Credentials{r.Cred}
 }
 
 // sourceReadable is the read check of a copy's or a batch's source
-// (§7.8): a read of /r/{ns}/{name} against that namespace's keys, with the
-// grant in Source-Authorization, or the request's own.
+// (§7.8): a read of /r/{ns}/{name} against that namespace's keys, with any
+// grant in Source-Authorization, or the request's own if there is none.
 func (t *tx) sourceReadable(n *nsRow, name string, req Request) bool {
-	cred := req.Cred
-	if req.SourceCred.Bearer != "" {
-		cred = req.SourceCred
+	for _, cred := range req.copyCreds() {
+		if _, err := t.reader(n, cred, name); err == nil {
+			return true
+		}
 	}
-	_, err := t.reader(n, cred, name)
-	return err == nil
+	return false
 }
 
 // checkBlobs is the availability check of step 4 (§6.2, §7.8): every
