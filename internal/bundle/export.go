@@ -557,7 +557,7 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 					if _, err := p.revisionDeps(ctx, d, e.ID, doc); err != nil {
 						return err
 					}
-					for _, b := range stepBlobs(client.PatchStep(e.Patches)) {
+					for _, b := range mentions(client.PatchStep(e.Patches)) {
 						if _, ok := mentioned[b]; !ok {
 							mentioned[b] = e.ID
 						}

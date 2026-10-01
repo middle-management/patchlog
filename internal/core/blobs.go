@@ -230,63 +230,19 @@ func blobRefsOf(doc any) []blobRef {
 	return out
 }
 
-// batchSource is a batch's local source (§7.5), through which blobs are
-// available to its items if the batch may read the source (§7.8).
+// batchSource is a batch's local source (§7.5) whose source.at the server
+// checked (checkSource), through which blobs are available to its items
+// (§7.8).
 type batchSource struct {
-	raw      any
-	req      Request
-	resolved bool
-	n        *nsRow
-	atSeq    int64
-	readable map[string]bool
+	n     *nsRow
+	atSeq int64
 }
 
-func (bs *batchSource) resolve(t *tx) {
-	if bs.resolved {
-		return
-	}
-	bs.resolved = true
-	m, ok := bs.raw.(map[string]any)
-	if !ok {
-		return
-	}
-	if _, remote := m["origin"]; remote {
-		return // another deployment's blobs are uploaded (§G.3)
-	}
-	ns, _ := m["ns"].(string)
-	at, _ := m["at"].(string)
-	id, err := ids.Parse(at)
-	if !ValidNSName(ns) || err != nil {
-		return
-	}
-	n := t.nsByName(ns)
-	if n == nil || n.purged {
-		return
-	}
-	seq, ok := t.nsLogSeq(n.id, id)
-	if !ok {
-		return
-	}
-	bs.n, bs.atSeq = n, seq
-}
-
-// blob finds bid attached to name in the source and referenced by a
-// document in its history as of source.at, if the batch passes the read
-// check on the source (§7.8 Availability).
+// blob finds bid attached to name in the source, or in a base it reads
+// through, and referenced by a document in that resource's history as the
+// source sees it at source.at (§7.8 Availability, §7.6).
 func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
-	bs.resolve(t)
-	if bs.n == nil {
-		return nil
-	}
-	ok, seen := bs.readable[name]
-	if !seen {
-		ok = t.sourceReadable(bs.n, name, bs.req)
-		if bs.readable == nil {
-			bs.readable = map[string]bool{}
-		}
-		bs.readable[name] = ok
-	}
-	if !ok {
+	if bs == nil || bs.n == nil {
 		return nil
 	}
 	v := t.resolve(bs.n, name, &bs.atSeq)
@@ -297,12 +253,19 @@ func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
 	return b
 }
 
-// blobSourceOf is a batch's source for blob availability, or nil.
-func blobSourceOf(req Request, source any, isBatch bool) *batchSource {
-	if !isBatch || source == nil {
-		return nil
+// sourceUnrestricted reports whether a batch may read its local source
+// unrestricted (§7.5): every resource of it, as branch creation requires
+// (§7.6), with the grant in Source-Authorization, or the request's own.
+func (t *tx) sourceUnrestricted(n *nsRow, req Request) bool {
+	cred := req.Cred
+	if req.SourceCred.Bearer != "" {
+		cred = req.SourceCred
 	}
-	return &batchSource{raw: source, req: req}
+	a, err := t.reader(n, cred, "")
+	if err != nil {
+		return false
+	}
+	return a == nil || t.config(n.configSeq).Read == "public" || a.unrestrictedRead()
 }
 
 // sourceReadable is the read check of a copy's or a batch's source
@@ -438,6 +401,9 @@ func (t *tx) attachBlob(res int64, src *blobRow, seq int64) {
 	bid := src.bid
 	cur := t.attachedBlob(res, bid)
 	if cur != nil && !cur.pruned {
+		// Already attached: the write still ends every pending entry for
+		// it in this resource, whoever uploaded it (§7.8 Pending).
+		t.deletePending(`res = ? AND bid = ?`, res, bid[:])
 		return
 	}
 	owner := t.bytesOwner(res)
@@ -794,9 +760,6 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	if n == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
 	}
-	if n.purged {
-		return nil, gone()
-	}
 	cfg := t.config(n.configSeq)
 	a, err := t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if err != nil {
@@ -831,8 +794,9 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 			return nil, err
 		}
 	}
-	// 2. A purged resource.
-	if t.resolve(n, name, nil).state == Purged {
+	// 2. A purged namespace or resource, after authorisation and the rate
+	// limits (§7.8).
+	if n.purged || t.resolve(n, name, nil).state == Purged {
 		return nil, gone()
 	}
 	// 3. A frozen namespace.
@@ -845,7 +809,11 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	}
 	size := up.Length
 	if up.From != "" {
-		// A copy: the same bid, then the source as a read.
+		// A copy: a body or an unparseable Blob-From is 400, before any
+		// body is read; then the same bid; then the source as a read.
+		if up.HasBody {
+			return nil, badInput("a copy has an empty body")
+		}
 		sns, sname, sbid, ok := parseBlobURL(up.From)
 		if !ok {
 			return nil, badInput("Blob-From must be /r/{ns}/{name}/blob/{bid}")
@@ -856,9 +824,6 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 		src := t.copySource(n, req, sns, sname, bid)
 		if src == nil {
 			return nil, notFound()
-		}
-		if up.HasBody {
-			return nil, badInput("a copy has an empty body")
 		}
 		g.src, g.typ, g.nonce, size = src, src.typ, src.nonce, src.size
 	} else {
@@ -1169,6 +1134,8 @@ func (e *Engine) OpenBlob(ctx context.Context, ns, name, bidText string, cred Cr
 
 func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Credentials) (*Blob, error) {
 	var out *Blob
+	var job *sealJob
+	var nsID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -1194,7 +1161,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		if t.isSealedNS(n) {
 			// Sealed namespaces never serve the plaintext: 302 to the blob
 			// sealed under an epoch (§E.2.2, sealedblobs.go).
-			t.sealedBlobHead(n, name, bid, out)
+			job, nsID = t.sealedBlobHead(n, name, bid, out), n.id
 			return nil
 		}
 		out.Type = ans.row.typ
@@ -1204,6 +1171,18 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 	if err != nil {
 		out.Close()
 		return nil, err
+	}
+	if job != nil {
+		// No referencing revision had an epoch yet: the newest is sealed
+		// under the current one first, which fixes its epoch (§E.2.2).
+		if err := e.finishSeal(ctx, nsID, []*sealJob{job}); err != nil {
+			return nil, err
+		}
+		if ep, ok := jweEpoch(job.jwe); ok {
+			out.Status, out.Epoch = 302, ep
+		} else {
+			out.Status, out.NoStore = 404, true
+		}
 	}
 	return out, nil
 }
@@ -1277,7 +1256,7 @@ func (e *Engine) SweepBlobs(ctx context.Context) (int, error) {
 	}
 	total := 0
 	for _, ns := range nss {
-		if err := ctx.Err(); err != nil {
+		if err := e.jobStep(ctx); err != nil {
 			return total, err
 		}
 		var n int
@@ -1316,10 +1295,11 @@ func (e *Engine) blobSweepLoop(interval time.Duration) {
 				cancel()
 			}()
 			if e.leader(ctx) {
-				if _, err := e.SweepBlobs(ctx); err != nil && ctx.Err() == nil {
+				job := leaderJob(ctx)
+				if _, err := e.SweepBlobs(job); err != nil && ctx.Err() == nil {
 					log.Printf("blob sweep: %v", err)
 				}
-				if _, err := e.SweepBlobFiles(ctx); err != nil && ctx.Err() == nil {
+				if _, err := e.SweepBlobFiles(job); err != nil && ctx.Err() == nil {
 					log.Printf("blob file sweep: %v", err)
 				}
 			}

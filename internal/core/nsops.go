@@ -866,11 +866,6 @@ type PruneRequest struct {
 	// (seal.SealSnapshot), required for e2e resources and refused
 	// elsewhere (§8.6).
 	Snapshot string
-	// Blobs is the snapshot's declared blob list (§E.3.1), if the request
-	// has one: the blobs the horizon's document references. Without it the
-	// horizon revision's own declared list is taken.
-	Blobs    []string
-	HasBlobs bool
 }
 
 // PruneResult is the answer to a prune.
@@ -931,8 +926,6 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			return invalid("snapshot is only for e2e resources, whose documents the server can't compute (§8.6)")
 		case e2e && len(pr.Keep) > 0:
 			return invalid("keep is not supported for e2e resources: the server can't keep documents it can't compute (protect revisions with retention or a lower horizon)")
-		case !e2e && pr.HasBlobs:
-			return invalid("blobs is only for e2e resources: it is the declared blob list of the snapshot (§E.3.1)")
 		case e2e && pr.Snapshot == "":
 			return invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
 		}

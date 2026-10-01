@@ -138,8 +138,16 @@ func (c *readCache) head(ns, name string) (Head, bool) {
 	return e.head, true
 }
 
+// unchanged reports whether the counters still hold g's values after a
+// read: only then is its answer stored (D.8), so a read that began before
+// a purge can't put purged content back. (An answer stored under older
+// values would never be served anyway; this keeps it out.)
+func (c *readCache) unchanged(g gens, ns string) bool {
+	return c.meta.Load() == g.meta && (ns == "" || c.nsGen(ns).Load() == g.ns)
+}
+
 func (c *readCache) putRev(g gens, ns, name, id string, doc []byte) {
-	if !g.stable() {
+	if !g.stable() || !c.unchanged(g, "") {
 		return
 	}
 	c.mu.Lock()
@@ -153,7 +161,7 @@ func (c *readCache) putRev(g gens, ns, name, id string, doc []byte) {
 }
 
 func (c *readCache) putHead(g gens, ns, name string, h Head) {
-	if !g.stable() {
+	if !g.stable() || !c.unchanged(g, ns) {
 		return
 	}
 	c.mu.Lock()

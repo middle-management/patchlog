@@ -1018,12 +1018,9 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	if err != nil {
 		return nil, err
 	}
-	// The snapshot carries its declared blob list (§E.3.1).
-	blobs := BlobIDs(d.Value)
-	if blobs == nil {
-		blobs = []string{}
-	}
-	return x.c.Prune(ctx, ns, name, PruneRequest{Horizon: horizon, Snapshot: snap, Blobs: blobs})
+	// The snapshot needs no declared list: the server keeps the list of
+	// the horizon's revision (§8.6, §E.3.1).
+	return x.c.Prune(ctx, ns, name, PruneRequest{Horizon: horizon, Snapshot: snap})
 }
 
 // --- keyring administration -------------------------------------------------

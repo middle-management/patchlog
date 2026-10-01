@@ -241,3 +241,49 @@ func (e *Engine) resign() {
 	e.leaderConn.Close()
 	e.leaderConn = nil
 }
+
+// leaderJobKey marks the context of a background job that runs because
+// this instance is the leader.
+type leaderJobKey struct{}
+
+// leaderJob marks ctx as a leader's background job's: jobStep checks
+// before each step that the leader lock is still held.
+func leaderJob(ctx context.Context) context.Context {
+	return context.WithValue(ctx, leaderJobKey{}, true)
+}
+
+// errLostLeader stops a background job whose instance no longer holds the
+// leader lock.
+var errLostLeader = errors.New("background job: this instance no longer holds the leader lock")
+
+// jobStep is checked before each step of a background job (D.8): a leader
+// that lost its session, and so its lock, stops, since another instance
+// may already run the job. Steps are idempotent, so one still under way
+// when that happens does no harm. Calls outside a leader's job (an
+// operator's, or a test's) always proceed, as on SQLite.
+func (e *Engine) jobStep(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !e.pg || ctx.Value(leaderJobKey{}) == nil {
+		return nil
+	}
+	if e.holdsLeader(ctx) {
+		return nil
+	}
+	return errLostLeader
+}
+
+// holdsLeader reports whether this instance's leader connection still
+// holds the leader lock.
+func (e *Engine) holdsLeader(ctx context.Context) bool {
+	e.leaderMu.Lock()
+	defer e.leaderMu.Unlock()
+	if e.leaderConn == nil {
+		return false
+	}
+	var ok bool
+	err := e.leaderConn.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory'
+		AND classid = ($1::bigint)::oid AND objid = 0 AND objsubid = 2 AND pid = pg_backend_pid() AND granted)`, leaderClass).Scan(&ok)
+	return err == nil && ok
+}

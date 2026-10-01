@@ -174,6 +174,9 @@ type BatchReport struct {
 	Failures  []string       `json:"failures,omitempty"`
 	Uploaded  int            `json:"uploaded,omitempty"` // blobs uploaded before it (§G.4.4)
 	Copied    int            `json:"copied,omitempty"`   // blobs copied with Blob-From before it
+	// ViaSource counts the blobs its local source made available, which
+	// needed no copy (§7.8, §G.4.4).
+	ViaSource int `json:"viaSource,omitempty"`
 }
 
 // Report is the outcome of an import or a dry run.
@@ -336,6 +339,10 @@ type importer struct {
 	bump    map[string]int  // new e2e target → the epoch to move it to
 
 	sent map[string]time.Time // "ns/name/bid" → when the blob was last uploaded or copied there
+	// noSource marks target namespaces whose batches' local source didn't
+	// make their blobs available (the importer can't read the source
+	// unrestricted, §7.5): their blobs are copied or uploaded instead.
+	noSource map[string]bool
 }
 
 // Import imports a bundle into the deployment c talks to (§G.4.4). It
@@ -458,7 +465,7 @@ func (im *importer) load(open Opener) error {
 			d.lines = append(d.lines, l)
 			im.scanRefs(d, l.Patches)
 			if l.Kind == "rev" {
-				for _, b := range stepBlobs(client.PatchStep(l.Patches)) {
+				for _, b := range mentions(client.PatchStep(l.Patches)) {
 					d.refd[b] = true
 				}
 			}

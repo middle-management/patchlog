@@ -1351,7 +1351,9 @@ async function getBlob(ns, name, ref, auto) {
   };
   const got = await fetchAt(0);
   let bytes = got.bytes, note = '';
-  if (got.ct === Z.BLOB_TYPE && hasKid(bytes)) {
+  // Only a sealed namespace redirects to …/e/{e}: elsewhere a blob of the sealed type is bytes as stored (§E.2.2).
+  const viaEpoch = got.redirected && /\/e\/\d+$/.test(got.via || '');
+  if (viaEpoch && got.ct === Z.BLOB_TYPE && hasKid(bytes)) {
     let o;
     try { o = await openE2Blob(ns, name, bid, bytes); } catch (err) {
       if (!err.noKey) throw err;

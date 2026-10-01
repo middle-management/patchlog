@@ -1,6 +1,6 @@
 # patchlog
 
-A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.19).
+A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.32).
 Each resource is an append-only log of content-addressed JSON Patch sets. The server
 validates documents that opt in with `$schema`, enforces namespace rules and grants,
 and serves immutable, CDN-cacheable revisions.
@@ -52,8 +52,12 @@ and serves immutable, CDN-cacheable revisions.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
 - **Blob gaps** (§7.8): bytes live in files on a local or shared filesystem (`-blob-dir`, see
   [Blob storage](#blob-storage)), not in object storage (D.2, D.8); importing a private or
-  sealed source into an e2e target (re-encrypting blobs, §G.5.1) isn't implemented; no
-  resumable uploads, and ranges of sealed blobs are served as stored.
+  sealed source into an e2e target, which re-encrypts each blob and rewrites its references to
+  the new ids (a MAY of §G.5.1, for a client holding the target's keys), isn't implemented; no
+  resumable uploads. Ranges of sealed blobs are served over the sealed bytes (§E.2.2), so a
+  download resumes, but a range can't be opened on its own. A branch keeps its stored sealings
+  of a base's blobs after the base prunes them (it stops serving them; deleting them is a MAY
+  of §E.2.2 not done).
 - CDN edge grants (§C.5): no edge grants are issued, and the origin checks grants itself on
   every read. Both §9 deployments are supported: behind a grant-verifying edge
   (`-edge-secret`) private content gets edge lifetimes, otherwise it is `no-store` for shared
@@ -337,8 +341,22 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   pointers are micro-cached for at most that long. A wake-up for another instance's write can
   be later while an older write transaction is still running (the tailer never skips one).
 - **Background loops** that must run once per deployment (the retention applier, epoch
-  rotation, following and registering remote bases, the blob sweeps) run on the instance holding a
-  session-level advisory lock (class `0x504d`); another one takes over when it goes away.
+  rotation, following and registering remote bases, the blob sweeps, second CDN purges) run on
+  the instance holding a session-level advisory lock (class `0x504d`); another one takes over
+  when it goes away. Before each step of a job (a resource pruned, a namespace swept, a base
+  followed, a purge resent) the leader checks on its connection that it still holds the lock,
+  so a leader that lost its session stops; steps are idempotent.
+- **Second CDN purge** (D.8). A stale instance, a lagging replica or a response already under
+  way may hand the CDN content just purged. So the transaction that commits a CDN tag purge
+  (§8.3: resource and namespace purges, a switch to private or sealed, a restore from an
+  archive, a remote base's purges) also queues it in `cdn_repurge`, keyed on its namespace
+  entry, and the leader sends it again once `RepurgeDelay` has passed (default three tail
+  intervals plus two minutes, covering the cache staleness bound, replica lag and the response
+  deadline), then deletes the row. SQLite deployments do the same.
+- **Keep transactions short.** The tailer can't move past the oldest running transaction in the
+  database (its `xmin`), so one left open holds back every instance's wake-ups: set
+  `idle_in_transaction_session_timeout` (e.g. `ALTER ROLE patchlog SET
+  idle_in_transaction_session_timeout = '60s'`).
 - **Per instance:** rate-limit buckets (§6.6), so each instance enforces the limits on what it
   serves (D.8), and the in-memory caches above.
 - **The services keep SQLite.** The search index and tree service (`-db index.db`,
@@ -475,8 +493,10 @@ patchlog janitor -ns matches                     # purge merged/superseded branc
   meanwhile waits for the next merge.
 - Earlier merge batches from the same branch count as common ancestors, so a second merge after
   a replay only picks up what is new. Per resource, the pair comes from the most recent such
-  batch with an entry for it. Only batches without `origin`, whose `source.ns` is the branch
-  and whose author (root `sub` and `kid`) is listed in the base's `merge.authors` count. With
+  batch with an entry for it. Only batches without `origin`, whose `source.ns` is the branch,
+  whose `source.at` is in the branch's chain (checked by the tool itself, since the server
+  checks it only for writers who can read the branch, §7.5) and whose author (root `sub` and
+  `kid`) is listed in the base's `merge.authors` count. With
   authentication disabled entries carry no `kid`, so a kid-less entry matches on `sub` alone
   (development only). Without `merge.authors` there are no such common ancestors: a second
   merge after a replay conflicts, and the tool suggests rebasing (§F.5). `status` and `plan`
@@ -754,7 +774,9 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   `encryption.epoch` (by exactly 1, a `*` key) in one batch; old revisions keep their epoch.
   Server-side rotation (`-rotate-epochs`, `-rotate-on-revoke`) doesn't touch e2e namespaces.
 - **Prune (§8.6).** `POST /r/{ns}/{name}/prune` `{ horizon, snapshot }` needs `snapshot` (a JWE
-  with `pl { ns, name, id: horizon, kind: "snapshot" }` and a known epoch's `kid`) and an archive
+  of the horizon's document, or for a tombstone the last live one, with
+  `pl { ns, name, id: horizon, kind: "snapshot" }` and a known epoch's `kid`; it carries no
+  declared blob list, since the server keeps every revision's, §E.3.1) and an archive
   destination, even with a `*` key (`422` otherwise). `keep` is refused (the server can't keep
   documents it can't compute). If protected revisions move the horizon down, the answer is `422`
   with the effective `horizon` to seal for. The snapshot is stored opaque as the horizon's kept
@@ -818,12 +840,18 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
 - **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
   (§6.6). **`-pace`** splits batches to fit the limits and paces them for backfills.
 - **Branches** export with the base's history included, or with `-foreign-parents` naming the base revisions in `requires`.
-- **Blobs** (§G.4.1) travel as blob lines, each before the first line that references it;
-  incremental bundles leave out what the history up to `requires` referenced. Import checks
-  each id and uploads the blobs a batch references before it (a snapshot's to its upstream
-  resource and target), or copies them with `Blob-From` within one deployment; uploads are
-  repeated when half of `blobGrace` has passed. A dry run uploads nothing and reports blob
-  failures as deferred.
+- **Blobs** (§G.4.1) travel as blob lines (unpadded base64url; padded is accepted), each
+  before the first line that mentions it: a `$blob` member in any op's value (tests too), the
+  value of an op at `…/$blob`, a snapshot's document or a declared list. Incremental bundles
+  leave out what the history up to `requires` referenced. Import checks each id and uploads
+  the blobs a batch's steps bring in before its dry run (a snapshot's to its upstream resource
+  and target), or copies them with `Blob-From` within one deployment; uploads are repeated
+  when half of `blobGrace` has passed. Within the deployment the bundle came from, the batch's
+  local `source` already makes them available, so nothing is copied; if a dry run shows it
+  doesn't (the importer can't read the source unrestricted, §7.5), they are copied or
+  uploaded after all. A dry-run-only import uploads nothing and reports blob failures as
+  deferred. An e2e namespace's blob lines must have the sealed type and no nonce, or the
+  import is refused before anything is uploaded.
 
 #### Encryption (§G.5.1)
 
@@ -988,6 +1016,14 @@ just doesn't apply).
   `$blob` objects must be well-formed and name available blobs that match their type, size
   and nonce (`422`, `code: "blob"`). Allowances may also set `blobRate` and `blobPending`; the
   deployment maximums are set with `serve -max-blob-size` and `-max-blob-pending`.
+- **Batch sources** (§7.5, §7.8): a local `source.at` is checked against `source.ns`'s chain
+  (`422`, `code: "source"`) at step 4, before blob references, only when the caller may read
+  `source.ns` unrestricted (with `Source-Authorization`, if given); then the blobs attached to
+  the same resource there, or in a base it reads through, are available as `source.ns` sees it
+  at `source.at`. Anyone else's source is recorded unchecked and makes no blobs available. A
+  dry run reports an unavailable blob and runs the later steps anyway: the item reports
+  `blob` with the ids it would produce, or a later step's failure with the blob failure under
+  `blob`. A write referencing a blob ends every pending entry for it in that resource.
 - **Batch limits after authentication** (§7.5): the server authenticates a batch before
   reading its body, and stops reading at the principal's `batchSize` (its allowance's, if any,
   plus room for the batch's own JSON) with `413`. Item counts and the patch-set total are

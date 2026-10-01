@@ -224,6 +224,14 @@ CREATE TABLE IF NOT EXISTS blob_epochs (
   PRIMARY KEY (ns, name, bid, epoch)
 );
 
+CREATE TABLE IF NOT EXISTS cdn_repurge (
+  id       bigserial PRIMARY KEY,
+  ns_seq   bigint UNIQUE,
+  tags     text   NOT NULL,
+  due      bigint NOT NULL
+);
+CREATE INDEX IF NOT EXISTS cdn_repurge_due ON cdn_repurge (due);
+
 CREATE TABLE IF NOT EXISTS remote_branches (
   ns         bigint NOT NULL REFERENCES namespaces,
   origin     text   NOT NULL,

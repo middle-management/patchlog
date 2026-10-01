@@ -516,6 +516,11 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 			continue
 		}
 		mb := MergeBatch{Batch: e.ID, Author: e.Author, Kid: e.Kid}
+		// source.at must be in the branch's chain: the merger checks it
+		// itself, as the janitor does (§F.3, §F.6), since the server checks
+		// it only for writers who may read the branch (§7.5).
+		at, _ := e.Source["at"].(string)
+		heads := headsAt(blog, at)
 		switch {
 		case p.opt.successor:
 			// The rebase's own replays.
@@ -523,6 +528,8 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 			mb.Reason = "the target declares no merge.authors"
 		case !Listed(p.MergeAuthors, e.Author, e.Kid):
 			mb.Reason = "its author " + principal(e.Author, e.Kid) + " is not in the target's merge.authors"
+		case heads == nil:
+			mb.Reason = "its source.at " + at + " is not in the chain of " + p.Branch
 		}
 		if mb.Reason != "" {
 			p.Ignored = append(p.Ignored, mb)
@@ -533,8 +540,6 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 			}
 			continue
 		}
-		at, _ := e.Source["at"].(string)
-		heads := headsAt(blog, at)
 		if heads == nil {
 			continue
 		}

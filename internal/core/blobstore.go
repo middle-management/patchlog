@@ -374,6 +374,9 @@ func (e *Engine) SweepBlobFiles(ctx context.Context) (int, error) {
 	}
 	orphans = append(orphans, temps...)
 	n := 0
+	if err := e.jobStep(ctx); err != nil {
+		return 0, err
+	}
 	for _, f := range orphans {
 		if err := e.blobs.remove(f); err != nil {
 			log.Printf("blob sweep: %v", err)

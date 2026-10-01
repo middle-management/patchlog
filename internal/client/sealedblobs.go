@@ -6,7 +6,9 @@ package client
 //     /r/{ns}/{name}/blob/{bid} answers 302 to …/blob/{bid}/e/{e}, the blob
 //     in the binary sealed form (seal.SealBlob) under the resource's K_r of
 //     epoch e. GetBlobRef follows the redirect, opens the blob with the
-//     client's Keys (WithKeys) and checks it against the reference; a
+//     client's Keys (WithKeys) and checks it against the reference. Only a
+//     blob reached through …/e/{e} is opened so: in any other namespace a
+//     blob of the sealed type is just bytes as stored. A
 //     reader holding only older epochs asks for one with GetBlobRefEpoch.
 //     Writers give the blobs they create a nonce (§C.7): UploadBlob with
 //     seal.NewNonce().
@@ -19,6 +21,7 @@ package client
 //     decrypts with the reference's key.
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"fmt"
@@ -27,6 +30,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 )
@@ -67,8 +71,30 @@ func BlobIDs(doc any) []string {
 	for s := range seen {
 		out = append(out, s)
 	}
-	sort.Strings(out)
+	sortBlobIDs(out)
 	return out
+}
+
+// sortBlobIDs sorts blob ids by their binary form (§3.2, §E.3.1), the
+// order a declared list is written in. The text form's alphabet puts the
+// digits after the letters, so this is not the strings' order. Text that
+// isn't an id sorts after every id, by its text.
+func sortBlobIDs(list []string) {
+	key := func(s string) (ids.ID, bool) {
+		id, err := ids.Parse(s)
+		return id, err == nil
+	}
+	sort.SliceStable(list, func(i, j int) bool {
+		a, aok := key(list[i])
+		b, bok := key(list[j])
+		switch {
+		case aok && bok:
+			return bytes.Compare(a[:], b[:]) < 0
+		case aok != bok:
+			return aok
+		}
+		return list[i] < list[j]
+	})
 }
 
 // sameBlobs reports whether two blob lists name the same set of ids.
@@ -208,7 +234,13 @@ func (c *Client) getBlobRef(ctx context.Context, ns, name string, ref any, epoch
 	if err != nil {
 		return nil, err
 	}
+	// Only a sealed namespace serves …/blob/{bid}/e/{e}, directly or by the
+	// epoch redirect: only there is a blob sealed for delivery. Anywhere
+	// else a blob of the sealed type is opened as stored (§E.2.2), since any
+	// namespace may store a file of that type.
+	delivery := epoch > 0
 	if resp.status == 302 && epoch == 0 {
+		delivery = true
 		loc := resp.header.Get("Location")
 		if !strings.HasPrefix(loc, base+"/e/") {
 			return nil, fmt.Errorf("client: %s redirects to %q", path, loc)
@@ -221,12 +253,10 @@ func (c *Client) getBlobRef(ctx context.Context, ns, name string, ref any, epoch
 		return nil, resp.apiError()
 	}
 	body := resp.body
-	if blobType(resp.header.Get("Content-Type")) == SealedBlobType {
-		if h, err := seal.ParseBlobHeader(body); err == nil && h.Kid != "" {
-			// Sealed for delivery (E2).
-			if body, err = c.openBlob(ctx, ns, name, r.bid, body); err != nil {
-				return nil, err
-			}
+	if delivery {
+		// Sealed for delivery (E2).
+		if body, err = c.openBlob(ctx, ns, name, r.bid, body); err != nil {
+			return nil, err
 		}
 	}
 	if r.sealed != nil {

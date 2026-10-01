@@ -321,10 +321,6 @@ type PruneRequest struct {
 	// Snapshot is the horizon's document sealed by a key holder, required
 	// for resources of e2e namespaces (§8.6; see E2E.Prune).
 	Snapshot string
-	// Blobs is the snapshot's declared blob list (§E.3.1): the blobs its
-	// document references. Nil sends none, and the server takes the
-	// horizon revision's own list.
-	Blobs []string
 }
 
 // PruneResult is the outcome of a prune.
@@ -345,9 +341,6 @@ func (c *Client) Prune(ctx context.Context, ns, name string, p PruneRequest) (*P
 	}
 	if p.Snapshot != "" {
 		body["snapshot"] = p.Snapshot
-	}
-	if p.Blobs != nil {
-		body["blobs"] = p.Blobs
 	}
 	b, err := encodeJSON(body)
 	if err != nil {

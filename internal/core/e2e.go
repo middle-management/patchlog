@@ -411,25 +411,11 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	if err := t.checkSealedHeader(n, cfg, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot"); err != nil {
 		return nil, err
 	}
-	// The snapshot's declared blobs (§E.3.1) must be attached here: they
-	// are what the kept document references.
-	var kept []ids.ID
-	if pr.HasBlobs {
-		var err *Error
-		if kept, err = parseDeclared(pr.Blobs); err != nil {
-			return nil, err
-		}
-		if len(kept) > cfg.Limits.BlobsPerDocument {
-			return nil, limitErr(422, fmt.Sprintf("more than %d blobs declared", cfg.Limits.BlobsPerDocument))
-		}
-		for i, bid := range kept {
-			if b := t.attachedBlob(own.id, bid); b == nil || b.pruned {
-				return nil, blobErr("/blobs/"+strconv.Itoa(i), "the snapshot declares a blob that isn't attached to this resource (§E.3.1)")
-			}
-		}
-	} else {
-		kept = t.declaredAt(h)
-	}
+	// The snapshot needs no list (§8.6, §E.3.1): the server keeps the
+	// declared list of every revision, and the snapshot's document is h's
+	// (for a tombstone, the last live one's, whose runs a tombstone
+	// doesn't close).
+	kept := t.declaredAt(h)
 	from := own.horizonSeq.Int64
 	if !cur.Valid {
 		t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ?`, own.id).Scan(&from))

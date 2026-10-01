@@ -253,7 +253,7 @@ func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
 	}
 	rep := &RetentionReport{}
 	for _, tg := range targets {
-		if err := ctx.Err(); err != nil {
+		if err := e.jobStep(ctx); err != nil {
 			return rep, err
 		}
 		var checked, pruned bool
@@ -356,7 +356,7 @@ func (e *Engine) retentionLoop(interval time.Duration) {
 				cancel()
 				continue // another instance applies it (pglock.go)
 			}
-			rep, err := e.ApplyRetention(ctx)
+			rep, err := e.ApplyRetention(leaderJob(ctx))
 			cancel()
 			if err != nil {
 				log.Printf("retention: %v", err)

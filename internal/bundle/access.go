@@ -149,6 +149,31 @@ func (im *importer) checkAccess(ctx context.Context) error {
 	}
 	sort.Strings(names)
 	var problems []string
+	// An e2e namespace's blob lines carry the writers' ciphertext: the
+	// sealed type and no nonce, since declared lists carry only ids
+	// (§E.3.1, §G.5.1). Any other is refused before anything is uploaded.
+	keys := make([]string, 0, len(im.docs))
+	for k := range im.docs {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		d := im.docs[k]
+		if im.h.AccessOf(d.ns) != AccessE2E {
+			continue
+		}
+		bids := make([]string, 0, len(d.blobs))
+		for bid := range d.blobs {
+			bids = append(bids, bid)
+		}
+		sort.Strings(bids)
+		for _, bid := range bids {
+			if l := d.blobs[bid]; normType(l.Type) != SealedBlobType || l.Nonce != "" {
+				problems = append(problems, fmt.Sprintf("blob %s of e2e namespace %s (%s) has type %q and nonce %q: an e2e namespace's blob lines have type %s and no nonce (§E.3.1, §G.5.1)",
+					bid, d.ns, d.name, l.Type, l.Nonce, SealedBlobType))
+			}
+		}
+	}
 	for _, tns := range names {
 		tg := targets[tns]
 		src := im.h.AccessOf(tg.src)

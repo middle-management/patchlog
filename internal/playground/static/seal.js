@@ -303,7 +303,8 @@ async function blobID(type, nonce, bytes) {
 }
 
 /* blobIDs lists the distinct ids a document references: objects whose $blob member is a string, at any depth,
- * not looking inside them; schema documents have none (client.BlobIDs). Sorted. */
+ * not looking inside them; schema documents have none (client.BlobIDs). Sorted by the ids' binary form (§3.2, §E.3.1):
+ * the base32 alphabet puts the digits after the letters, so text order isn't it. */
 function blobIDs(doc) {
   if (doc && typeof doc === 'object' && !Array.isArray(doc) && doc.$schema === 'https://json-schema.org/draft/2020-12/schema') return [];
   const seen = new Set();
@@ -315,7 +316,8 @@ function blobIDs(doc) {
     }
   };
   walk(doc);
-  return [...seen].sort();
+  const key = (s) => s.replace(/[a-z2-7]/g, (c) => String.fromCharCode(65 + 'abcdefghijklmnopqrstuvwxyz234567'.indexOf(c)));
+  return [...seen].sort((a, b) => { const x = key(a), y = key(b); return x < y ? -1 : x > y ? 1 : 0; });
 }
 function sameBlobs(a, b) { const x = new Set(a), y = new Set(b); return x.size === y.size && [...x].every((i) => y.has(i)); }
 

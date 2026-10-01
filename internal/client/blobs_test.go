@@ -6,6 +6,8 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // §7.8 through the client: upload, reference, read, ranges and copies.
@@ -44,6 +46,42 @@ func TestBlobs(t *testing.T) {
 	nb := must(c.UploadBlob(ctx, "media", "hero", "image/png", nonce, data))
 	if nb == bid {
 		t.Fatal("nonce ignored")
+	}
+}
+
+// §E.2.2: clients open sealed blobs only where they know the namespace is
+// sealed, after the epoch redirect: anywhere else a blob of the sealed
+// type, even one whose header names a kid, is bytes as stored.
+func TestBlobSealedTypeInPlainNamespace(t *testing.T) {
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{})
+	c := s.Client(t, client.WithAuthor("alice")).With(client.WithKeys(client.NewKeys(nil)))
+	must(c.CreateNamespace(ctx, "files", map[string]any{"read": "public"}))
+	sealed, err := seal.SealBlob(seal.NewKey(), "files#1", seal.BlobPL("files", "f", "x"), []byte("looks sealed"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bid := must(c.UploadBlob(ctx, "files", "f", client.SealedBlobType, "", sealed))
+	ref := client.BlobRef(bid, client.SealedBlobType, len(sealed), "")
+	must(c.Create(ctx, "files", "f", client.GenesisPatches(map[string]any{"file": ref})))
+	b := must(c.GetBlobRef(ctx, "files", "f", ref))
+	if string(b.Data) != string(sealed) || b.Type != client.SealedBlobType {
+		t.Fatalf("blob %q %s", b.Data, b.Type)
+	}
+}
+
+// §E.3.1: declared lists are sorted by the ids' binary form, not their
+// text: the base32 alphabet puts the digits after the letters.
+func TestBlobIDsBinaryOrder(t *testing.T) {
+	var lo, hi ids.ID
+	hi[0] = 0xf8 // text "17…", which sorts before "1a…" as a string
+	doc := map[string]any{"x": map[string]any{"$blob": hi.String()}, "y": map[string]any{"$blob": lo.String()}, "z": map[string]any{"$blob": hi.String()}}
+	got := client.BlobIDs(doc)
+	if len(got) != 2 || got[0] != lo.String() || got[1] != hi.String() {
+		t.Fatalf("BlobIDs %v", got)
+	}
+	if hi.String() > lo.String() {
+		t.Fatal("the example doesn't show the difference")
 	}
 }
 

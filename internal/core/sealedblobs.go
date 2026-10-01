@@ -13,14 +13,18 @@ package core
 // revisions reference it, and each revision's epoch is the one it was
 // written in (rev_epochs) or, for content without one (read through from a
 // base, or written before the namespace became sealed), that of its stored
-// sealing (sealed.go), which exists once a reader fetched it. Revisions
+// sealing (sealed.go), which exists once a reader fetched it, or once a
+// request for the blob found none of its referencing revisions with an
+// epoch and sealed the newest of them (sealedBlobHead). Revisions
 // pruned away (below the horizon and not kept) don't count. D.2 keeps a
 // row per served epoch in blob_epochs; here the epochs are derived from
 // those tables when asked, and blob_epochs holds only what can't be: the
 // stored sealings, and a marker (data NULL) for an epoch whose referencing
 // revisions pruning removed, which answers 410 as in §7.1. Other epochs
 // are 404 with no-store: a branch may yet serve a read-through revision
-// under a new epoch.
+// under a new epoch. A stored sealing no longer served (a branch's of a
+// blob its base pruned) is 404 too, not 410; it stays stored (§E.2.2
+// allows deleting it).
 //
 // Stored once, served forever. An epoch's sealing is produced on its first
 // read and stored (INSERT … ON CONFLICT), the first one stored winning when
@@ -124,14 +128,50 @@ func latestEpoch(eps map[int]bool) int {
 
 // sealedBlobHead fills the answer of GET /r/{ns}/{name}/blob/{bid} for a
 // blob n serves (status 200 so far): 302 to the latest epoch it is served
-// under, or 404 (no-store) if there is none yet (§E.2.2).
-func (t *tx) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) {
+// under. If none of its referencing revisions has an epoch yet (read
+// through from a base, or written before n was sealed), it returns the
+// sealing of the newest of them under n's current epoch, which fixes that
+// revision's epoch once stored (§E.2.2, §E.2.5): the caller stores it
+// (finishSeal) and redirects to its epoch. Without any, 404 (no-store).
+func (t *tx) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJob {
 	v := t.resolve(n, name, nil)
 	if e := latestEpoch(t.blobEpochs(n, v.head, bid)); e > 0 {
 		out.Status, out.Epoch = 302, e
-		return
+		return nil
+	}
+	if v.head != nil {
+		if job := t.newestBlobRev(n, name, v.head, bid); job != nil {
+			return job
+		}
 	}
 	out.Status, out.NoStore = 404, true
+	return nil
+}
+
+// newestBlobRev prepares the sealing of the newest still served revision
+// of the history ending at head whose document references bid, or nil.
+func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sealJob {
+	where := ` WHERE b.res = ? AND b.bid = ? AND r.seq <= ? AND r.kind = 0 AND ` + servedRev
+	for _, seg := range t.ancestry(head) {
+		rows, err := t.Query(`SELECT r.seq`+refRevs+where+` ORDER BY r.seq DESC`, seg.res, bid[:], seg.max)
+		t.must(err)
+		var seqs []int64
+		for rows.Next() {
+			var s int64
+			t.must(rows.Scan(&s))
+			seqs = append(seqs, s)
+		}
+		rows.Close()
+		for _, s := range seqs {
+			row := t.rev(s)
+			b, err := t.docBytesAt(row)
+			if err != nil {
+				continue
+			}
+			return t.resJob(n, name, row, sealDoc, func() []byte { return b })
+		}
+	}
+	return nil
 }
 
 // sealedBlobJob is the sealing of a blob under one epoch, to store.
@@ -203,8 +243,11 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			t.must(err)
 		}
 		if !t.blobEpochs(n, v.head, bid)[ep] {
-			if row {
-				// Every revision of that epoch referencing it was pruned.
+			if row && data == nil && !file.Valid {
+				// Recorded when pruning removed every revision of that
+				// epoch referencing it: 410 (§E.2.2). Anything else not
+				// served, such as a branch's sealing of a base's blob the
+				// base has since pruned, is 404.
 				out.Status, out.Code = 410, "pruned"
 				out.Horizon = t.horizonID(ans.row.res)
 				return nil

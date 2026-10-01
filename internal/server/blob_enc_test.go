@@ -171,8 +171,9 @@ func TestBlobSealedPadded(t *testing.T) {
 	}
 }
 
-// §E.2.2, §E.2.5: a branch seals read-through blobs under its own keys,
-// once it serves a revision that references them.
+// §E.2.2, §E.2.5: a branch seals read-through blobs under its own keys. A
+// request for a blob none of whose referencing revisions has an epoch yet
+// fixes the newest of them under the current epoch first.
 func TestBlobSealedBranch(t *testing.T) {
 	e := newSealedEnv(t, withoutBlobSweep)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
@@ -181,18 +182,20 @@ func TestBlobSealedBranch(t *testing.T) {
 	_, bid := e.putBlob("s", "x", "text/plain", nonce, data)
 	x1 := e.wr("s", "x", "", withNonce(addRoot(map[string]any{"b": ref(bid, "text/plain", len(data), nonce)})))
 	expect(t, e.branch("s", map[string]any{"name": "b"}, "admin"), 201)
-	// No revision referencing it is served by the branch yet.
+	// No revision referencing it has an epoch in the branch yet: the blob
+	// request seals x1 under the branch's current epoch first.
 	g := e.get(blobPath("b", "x", bid))
-	expect(t, g, 404)
-	if g.H.Get("Cache-Control") != "no-store" {
-		t.Fatalf("not yet served %v", g.H)
-	}
-	expect(t, e.get("/r/b/x/rev/"+x1), 200)
-	g = e.get(blobPath("b", "x", bid))
 	expect(t, g, 302)
+	if g.H.Get("Location") != blobPath("b", "x", bid)+"/e/1" {
+		t.Fatalf("redirect %v", g.H)
+	}
+	// The document is then served under that epoch.
+	bk, _ := e.keysOf("b", nil, "")
+	rv := e.get("/r/b/x/rev/" + x1)
+	expect(t, rv, 200)
+	open(t, string(rv.Body), resKey(t, bk["b#1"], "b", "x"), "b#1", seal.ResourcePL("b", "x", x1, seal.KindDoc))
 	s := e.get(g.H.Get("Location"))
 	expect(t, s, 200)
-	bk, _ := e.keysOf("b", nil, "")
 	if got := openSealedBlob(t, s.Body, resKey(t, bk["b#1"], "b", "x"), "b#1", seal.BlobPL("b", "x", bid)); string(got) != string(data) {
 		t.Fatalf("opened %q", got)
 	}
@@ -303,14 +306,10 @@ func TestBlobE2EDeclared(t *testing.T) {
 	a3 := etagOf(r)
 	e.clock.Advance(10 * time.Minute)
 	snap3, _ := seal.SealSnapshot(k, "e#1", "e", "a", a3, map[string]any{})
-	expectCode(t, e.prune("e", "a", map[string]any{"horizon": a3, "snapshot": snap3, "blobs": []any{other}}, "admin"), 422, "blob")
-	expect(t, e.prune("e", "a", map[string]any{"horizon": a3, "snapshot": snap3, "blobs": []any{}}, "admin"), 200)
+	// The snapshot needs no list (§8.6): the server keeps a3's, which is
+	// empty.
+	expect(t, e.prune("e", "a", map[string]any{"horizon": a3, "snapshot": snap3}, "admin"), 200)
 	expectCode(t, e.get(blobPath("e", "a", bid)), 410, "pruned")
-	// blobs is only for e2e snapshots.
-	e.mkNS("plain", map[string]any{})
-	pr := e.chain("plain", "x", 2)
-	e.clock.Advance(10 * time.Minute)
-	expectCode(t, e.prune("plain", "x", map[string]any{"horizon": pr[1], "blobs": []any{}}, "admin"), 422, "invalid")
 
 	// §F.8.1: a merge from a branch re-seals the patch set for the base with
 	// the same list, and the branch's blobs are available through the

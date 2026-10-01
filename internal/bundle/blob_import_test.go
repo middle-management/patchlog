@@ -53,6 +53,13 @@ func order(t *testing.T, b []byte) string {
 	return strings.Join(out, " ")
 }
 
+func viaSource(rep *bundle.Report) (n int) {
+	for _, b := range rep.Batches {
+		n += b.ViaSource
+	}
+	return n
+}
+
 func sentBlobs(rep *bundle.Report) (uploaded, copied int) {
 	for _, b := range rep.Batches {
 		uploaded += b.Uploaded
@@ -137,13 +144,27 @@ func TestBundleBlobs(t *testing.T) {
 		t.Fatalf("incremental import %+v", rep.Batches)
 	}
 
-	// Within one deployment the blobs are copied, not uploaded.
+	// Within one deployment the batch's local source makes the blobs
+	// available: nothing is copied or uploaded (§G.4.4).
 	rep = importB(t, src, full, bundle.ImportOptions{NSMap: map[string]string{"m": "m2"}})
-	if u, c := sentBlobs(rep); u != 0 || c != 2 {
-		t.Fatalf("local import uploaded %d, copied %d", u, c)
+	if u, c := sentBlobs(rep); u != 0 || c != 0 || viaSource(rep) != 2 {
+		t.Fatalf("local import uploaded %d, copied %d, via its source %d", u, c, viaSource(rep))
 	}
 	if src.head("m2", "a").ID != r3 || src.blobBytes("m2", "a", ry) != "blob y" {
 		t.Fatal("local import with blobs")
+	}
+	// A source that doesn't make them available (here: its resource was
+	// purged since the export) fails the dry run with code blob; the blobs
+	// are then sent after all, the copy refused, so uploaded.
+	ph := src.head("m", "a").ID
+	_, err = src.c.Purge(ctx, "m", "a", ph, false)
+	noErr(t, err)
+	rep = importB(t, src, full, bundle.ImportOptions{NSMap: map[string]string{"m": "m4"}})
+	if u, c := sentBlobs(rep); u != 2 || c != 0 {
+		t.Fatalf("fallback uploaded %d, copied %d", u, c)
+	}
+	if src.head("m4", "a").ID != r3 || src.blobBytes("m4", "a", ry) != "blob y" {
+		t.Fatal("fallback import with blobs")
 	}
 
 	// A new target replays the whole upstream chain: the blob of an earlier
@@ -189,6 +210,62 @@ func TestBundleBlobOrder(t *testing.T) {
 	dst := newDeployment(t, cmsOrigin)
 	importErr(t, dst, write(true), bundle.ImportOptions{}, "comes after a line that references it")
 	importErr(t, dst, write(false), bundle.ImportOptions{}, "blob")
+
+	// §G.4.1: a line mentions a blob also by a test op's value, so a blob
+	// line after it is out of order too.
+	g0 := client.GenesisPatches(map[string]any{})
+	gv, err := client.ToValue(g0)
+	noErr(t, err)
+	gid := ids.Revision(nil, jsonv.Canonical(gv))
+	tp := ops(op("test", "/b", client.BlobRef(bid, "text/plain", len(data), "")))
+	r2 := ids.Revision(&gid, jsonv.Canonical(jsonv.FromGo(tp))).String()
+	var buf bytes.Buffer
+	w, err := bundle.NewWriter(&buf, bundle.Header{Origin: stagingOrigin, Created: "2026-10-01T00:00:00Z",
+		At: map[string]string{"m": r2}, Docs: map[string]bundle.DocInfo{"m/a": {History: bundle.Full, Head: r2}},
+		Access: map[string]string{"m": bundle.AccessPublic}})
+	noErr(t, err)
+	noErr(t, w.Line(bundle.Line{NS: "m", Resource: "a", ID: gid.String(), Kind: "rev", Patches: g0}))
+	noErr(t, w.Line(bundle.Line{NS: "m", Resource: "a", ID: r2, Parent: gid.String(), Kind: "rev", Patches: tp}))
+	noErr(t, w.Line(bundle.Line{NS: "m", Resource: "a", Blob: bid, Type: "text/plain", Data: data}))
+	_, err = w.Close()
+	noErr(t, err)
+	importErr(t, dst, buf.Bytes(), bundle.ImportOptions{}, "comes after a line that references it")
+}
+
+// §G.4.1: blob lines are written as unpadded base64url; readers accept
+// padding too.
+func TestBundleBlobPadding(t *testing.T) {
+	data := []byte("pad") // 3 bytes: no padding either way
+	data2 := []byte("padded!")
+	for _, d := range [][]byte{data, data2} {
+		var buf bytes.Buffer
+		bid := ids.Blob("text/plain", "", d).String()
+		patches := client.GenesisPatches(map[string]any{"b": client.BlobRef(bid, "text/plain", len(d), "")})
+		pv, err := client.ToValue(patches)
+		noErr(t, err)
+		r := ids.Revision(nil, jsonv.Canonical(pv)).String()
+		w, err := bundle.NewWriter(&buf, bundle.Header{Origin: stagingOrigin, Created: "2026-10-01T00:00:00Z",
+			At: map[string]string{"m": r}, Docs: map[string]bundle.DocInfo{"m/a": {History: bundle.Full, Head: r}},
+			Access: map[string]string{"m": bundle.AccessPublic}})
+		noErr(t, err)
+		noErr(t, w.Line(bundle.Line{NS: "m", Resource: "a", Blob: bid, Type: "text/plain", Data: d}))
+		noErr(t, w.Line(bundle.Line{NS: "m", Resource: "a", ID: r, Kind: "rev", Patches: patches}))
+		_, err = w.Close()
+		noErr(t, err)
+		if bytes.Contains(buf.Bytes(), []byte("=\"")) {
+			t.Fatalf("padded blob line: %s", buf.Bytes())
+		}
+		padded := bytes.Replace(buf.Bytes(), []byte(base64.RawURLEncoding.EncodeToString(d)), []byte(base64.URLEncoding.EncodeToString(d)), 1)
+		for _, b := range [][]byte{buf.Bytes(), padded} {
+			rd, err := bundle.NewReader(bytes.NewReader(b))
+			noErr(t, err)
+			l, err := rd.Next()
+			noErr(t, err)
+			if string(l.Data) != string(d) {
+				t.Fatalf("read %q", l.Data)
+			}
+		}
+	}
 }
 
 // §G.5.1.1: in a sealed bundle a blob line is sealed like any other.
@@ -344,5 +421,5 @@ func TestBundleE2EBlobs(t *testing.T) {
 	noErr(t, w.Line(bundle.Line{NS: "e", Resource: "x", ID: x0, Kind: "rev", Patches: pv}))
 	_, err = w.Close()
 	noErr(t, err)
-	importErr(t, newEncDeployment(t, cmsOrigin), crafted.Bytes(), bundle.ImportOptions{}, "an e2e target accepts only sealed blobs")
+	importErr(t, newEncDeployment(t, cmsOrigin), crafted.Bytes(), bundle.ImportOptions{}, "blob lines have type "+bundle.SealedBlobType+" and no nonce")
 }

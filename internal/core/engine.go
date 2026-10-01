@@ -111,6 +111,16 @@ type Options struct {
 	// Postgres (tailer.go, default 100 ms): it wakes live readers for
 	// writes of other instances and invalidates in-memory caches.
 	TailInterval time.Duration
+	// RepurgeDelay is how long after a CDN tag purge (§8.3) it is sent
+	// again, by a durable job on the leader (repurge.go, D.8): longer than
+	// the read caches' staleness bound, the longest replica lag allowed and
+	// the hard deadline of a response. Zero means three tail intervals plus
+	// two minutes; negative disables the second purge.
+	RepurgeDelay time.Duration
+	// RepurgeInterval is how often the leader looks for second purges that
+	// are due. Zero means ten seconds; negative disables the loop
+	// (Repurge still sends them).
+	RepurgeInterval time.Duration
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how
@@ -287,6 +297,16 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.rotateLoop(opt.RotateEpochs)
 	}
+	if e.opt.RepurgeDelay == 0 {
+		e.opt.RepurgeDelay = 3*e.opt.TailInterval + 2*time.Minute
+	}
+	if e.opt.RepurgeInterval == 0 {
+		e.opt.RepurgeInterval = 10 * time.Second
+	}
+	if e.opt.RepurgeDelay > 0 && e.opt.RepurgeInterval > 0 {
+		e.bg.Add(1)
+		go e.repurgeLoop(e.opt.RepurgeInterval)
+	}
 	if e.opt.Remote.FollowInterval > 0 {
 		e.bg.Add(1)
 		go e.remoteLoop(e.opt.Remote.FollowInterval)
@@ -353,12 +373,15 @@ func limitErr(status int, msg string) *Error {
 // tx is one database transaction with the engine's helpers.
 type tx struct {
 	*sql.Tx
-	ctx       context.Context
-	e         *Engine
-	now       time.Time
-	write     bool
-	notify    map[string]bool // namespaces whose logs changed
-	tags      []string        // cache tags to purge after commit
+	ctx    context.Context
+	e      *Engine
+	now    time.Time
+	write  bool
+	notify map[string]bool // namespaces whose logs changed
+	tags   []string        // cache tags to purge after commit
+	// lastNS is the seq of the last namespace entry this transaction
+	// appended: what a CDN purge it sends is keyed on (repurge.go).
+	lastNS    int64
 	flushDocs bool
 	// metaChanged marks a write that changes what reads may return beyond
 	// a namespace's log: its configuration, or a purge (readcache.go).
@@ -510,6 +533,10 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 		sqlTx.Rollback()
 		e.removeFiles(t.newFiles)
 		return nil, err
+	}
+	if len(t.tags) > 0 {
+		// The second purge, durable with the commit (repurge.go).
+		t.queueRepurge()
 	}
 	inv := t.invalidation()
 	if e.pg && inv.meta {
@@ -808,6 +835,7 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 	_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, seq, configSeq, n.id)
 	t.must(err)
 	n.headSeq = sql.NullInt64{Int64: seq, Valid: true}
+	t.lastNS = seq
 	if n.configSeq != configSeq {
 		t.metaChanged = true
 	}

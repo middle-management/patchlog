@@ -1353,6 +1353,10 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 	}
 	var errs []error
 	for _, b := range bases {
+		if err := e.jobStep(ctx); err != nil {
+			errs = append(errs, err)
+			break
+		}
 		if err := e.followRemote(ctx, b); err != nil {
 			errs = append(errs, fmt.Errorf("remote branch %s: following %s/ns/%s: %w", b.branchName, b.origin, b.ns, err))
 		}
@@ -1510,7 +1514,7 @@ func (e *Engine) remoteLoop(interval time.Duration) {
 				cancel()
 				continue // another instance follows them (pglock.go)
 			}
-			if err := e.SyncRemotes(ctx); err != nil {
+			if err := e.SyncRemotes(leaderJob(ctx)); err != nil {
 				log.Printf("remote: %v", err)
 			}
 			cancel()

@@ -132,7 +132,13 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 	// Every blob a step references is still available: attached, pending
 	// for the writer, or readable through a base or the batch's source
 	// (D.2). This also records where step 7 takes each from.
-	bs := blobSourceOf(p.req, p.source, p.isBatch)
+	var bs *batchSource
+	if p.isBatch && p.source != nil {
+		var err *Error
+		if _, bs, err = t.checkSource(p.req, p.source); err != nil {
+			return nil, false
+		}
+	}
 	for _, s := range p.st {
 		if t.checkBlobs(target, s, p.a, bs) != nil {
 			return nil, false

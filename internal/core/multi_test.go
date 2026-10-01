@@ -419,3 +419,45 @@ func TestPGLeader(t *testing.T) {
 		t.Fatal("b didn't take over")
 	}
 }
+
+// D.8: a leader checks that it still holds the lock before each step of a
+// job, and stops once it lost it. Calls outside a leader's job proceed.
+func TestPGLeaderJobStep(t *testing.T) {
+	a, b := twoInstances(t)
+	ctx := context.Background()
+	if !a.leader(ctx) {
+		t.Fatal("a isn't leading")
+	}
+	job := leaderJob(ctx)
+	if err := a.jobStep(job); err != nil {
+		t.Fatalf("leader's step: %v", err)
+	}
+	if err := b.jobStep(job); !errors.Is(err, errLostLeader) {
+		t.Fatalf("non-leader's step: %v", err)
+	}
+	if err := b.jobStep(ctx); err != nil {
+		t.Fatalf("a call outside a job: %v", err)
+	}
+	// a loses its session: its next step stops.
+	a.leaderMu.Lock()
+	_, err := a.leaderConn.ExecContext(ctx, `SELECT pg_advisory_unlock($1, 0)`, leaderClass)
+	a.leaderMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.jobStep(job); !errors.Is(err, errLostLeader) {
+		t.Fatalf("step after losing the lock: %v", err)
+	}
+}
+
+// D.8: on SQLite the one instance always leads.
+func TestLeaderJobStepSQLite(t *testing.T) {
+	e, err := Open(Options{Path: ":memory:", AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}, Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if err := e.jobStep(leaderJob(context.Background())); err != nil {
+		t.Fatal(err)
+	}
+}

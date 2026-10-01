@@ -401,6 +401,7 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 		if !own.horizonSeq.Valid {
 			// Cleared before: every document is stored.
 			out.Blobs = t.restoreBlobs(own.id, blobs)
+			t.clearPrunedEpochs(n, name)
 			return nil
 		}
 		var missing bool
@@ -416,6 +417,7 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 		_, err = t.Exec(`UPDATE resources SET horizon_seq = NULL, keep = NULL WHERE res = ?`, own.id)
 		t.must(err)
 		out.Blobs = t.restoreBlobs(own.id, blobs)
+		t.clearPrunedEpochs(n, name)
 		t.flushDocs = true
 		t.tags = append(t.tags, "r:"+n.name+"/"+name)
 		out.Cleared = true
@@ -452,6 +454,15 @@ func (t *tx) restoreBlobs(res int64, blobs map[ids.ID]*ArchiveBlob) int {
 		n++
 	}
 	return n
+}
+
+// clearPrunedEpochs clears the 410 epochs recorded when pruning removed
+// every revision of an epoch referencing a blob of name (§E.2.2): once the
+// archive is restored those revisions are served again, so their epochs
+// are served too, and sealed again on demand (D.4).
+func (t *tx) clearPrunedEpochs(n *nsRow, name string) {
+	_, err := t.Exec(`DELETE FROM blob_epochs WHERE ns = ? AND name = ? AND data IS NULL AND file IS NULL`, n.id, name)
+	t.must(err)
 }
 
 // rebuildSnapshots folds res's chain from its first entry up to (excluding)

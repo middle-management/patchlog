@@ -246,6 +246,19 @@ CREATE TABLE IF NOT EXISTS blob_epochs (
   PRIMARY KEY (ns, name, bid, epoch)
 ) WITHOUT ROWID;
 
+-- Addition: second CDN purges (D.8, repurge.go). Each CDN tag purge is
+-- queued in the transaction that commits it, keyed on its namespace entry
+-- (ns_seq; NULL for a restore from an archive, which has none), and sent
+-- again by the leader once due. The row is the job's durable progress: it
+-- is deleted once sent.
+CREATE TABLE IF NOT EXISTS cdn_repurge (
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ns_seq   INTEGER UNIQUE,
+  tags     TEXT    NOT NULL,                -- JSON array of tags
+  due      INTEGER NOT NULL                 -- unix ms
+);
+CREATE INDEX IF NOT EXISTS cdn_repurge_due ON cdn_repurge (due);
+
 -- Addition: remote branches registered with this deployment (§G.3, source
 -- side). One row per (base namespace, remote); ns_seq is the latest remote
 -- branch entry, prev_seq the one before it (idempotent retries).

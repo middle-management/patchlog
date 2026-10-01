@@ -413,7 +413,7 @@ func TestBlobBatchSource(t *testing.T) {
 	}
 	expectCode(t, batch(nil), 422, "batch")
 	// A source.at outside the source's chain makes nothing available.
-	expectCode(t, batch(map[string]any{"ns": "feat", "at": e.nsHead("main")}), 422, "batch")
+	expectCode(t, batch(map[string]any{"ns": "feat", "at": e.nsHead("main")}), 422, "source")
 	r := batch(map[string]any{"ns": "feat", "at": at})
 	expect(t, r, 201)
 	if s := e.blobStats(); s.Attached != 2 || s.Bytes != 1 {

@@ -262,6 +262,17 @@ func (t *tx) revEpoch(n *nsRow, r *revRow) int {
 			return e
 		}
 	}
+	// Content without an epoch of its own keeps the one its first stored
+	// sealing fixed, whichever form that was (§E.2.2, §E.2.5).
+	var prefix string
+	err := t.QueryRow(`SELECT substr(jwe, 1, 4096) FROM sealed WHERE ns = ? AND rev_seq = ? AND kind IN ('doc', 'entry') ORDER BY created LIMIT 1`, n.id, r.seq).Scan(&prefix)
+	if err == nil {
+		if e, ok := jweEpoch(prefix); ok {
+			return e
+		}
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
 	return t.config(n.configSeq).Epoch
 }
 
@@ -715,6 +726,9 @@ func (e *Engine) RotateDue(ctx context.Context, maxAge time.Duration) ([]string,
 	}
 	var done []string
 	for _, ns := range due {
+		if err := e.jobStep(ctx); err != nil {
+			return done, err
+		}
 		if _, err := e.RotateEpoch(ctx, ns, RotateAuthor); err != nil {
 			log.Printf("rotate-epochs %s: %v", ns, err)
 			continue
@@ -741,7 +755,7 @@ func (e *Engine) rotateLoop(maxAge time.Duration) {
 			if !e.leader(context.Background()) {
 				continue // another instance rotates (pglock.go)
 			}
-			if done, err := e.RotateDue(context.Background(), maxAge); err != nil {
+			if done, err := e.RotateDue(leaderJob(context.Background()), maxAge); err != nil {
 				log.Printf("rotate-epochs: %v", err)
 			} else if len(done) > 0 {
 				log.Printf("rotate-epochs: rotated %v", done)

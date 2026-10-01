@@ -220,7 +220,7 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 		return fmt.Errorf("import: dry run of the batch into %s: %w", b.n.ns, err)
 	}
 	var failures []string
-	allDeferrable, onlyBlobs := true, true
+	allDeferrable, onlyBlobs, allBlob := true, true, true
 	for i, it := range res.Items {
 		st, _ := it.Raw["status"].(float64)
 		if st != 200 {
@@ -229,6 +229,9 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 			failures = append(failures, fmt.Sprintf("%s: %v %s %s", it.Resource, st, code, msg))
 			if !deferrable[code] {
 				allDeferrable = false
+			}
+			if code != "blob" {
+				allBlob = false
 			}
 			// A dry-run import uploads no blobs (§G.4.4): their absence is
 			// expected for blobs it would upload.
@@ -239,13 +242,16 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 		}
 		if i < len(expected) && (len(it.IDs) == 0 || it.IDs[len(it.IDs)-1] != expected[i]) {
 			failures = append(failures, fmt.Sprintf("%s: would produce %v, expected %s", it.Resource, it.IDs, expected[i]))
-			allDeferrable, onlyBlobs = false, false
+			allDeferrable, onlyBlobs, allBlob = false, false, false
 		}
 	}
 	b.rep.Failures = failures
 	if len(failures) == 0 {
 		b.rep.DryRun, b.dryOK = "ok", true
 		return nil
+	}
+	if allBlob && b.rep.ViaSource > 0 && !im.opt.DryRun {
+		return errViaSource
 	}
 	if deferOK && allDeferrable {
 		b.rep.DryRun = "deferred"
@@ -330,12 +336,13 @@ func (im *importer) execute(ctx context.Context) error {
 				deferOK = deferOK || pending[dep]
 			}
 			if !im.opt.DryRun {
-				// Blobs first (§G.4.4): the dry run checks them too.
-				if err := im.sendBlobs(ctx, b, lims[n]); err != nil {
+				// Blobs first (§G.4.4): uploads change no head, so they
+				// come before the dry run, which checks them too.
+				if err := im.prepare(ctx, b, lims[n], deferOK); err != nil {
 					return err
 				}
-			}
-			if err := im.dryRun(ctx, b, deferOK); err != nil {
+			} else if err := im.dryRun(ctx, b, deferOK); err != nil {
+				// A dry-run-only import uploads none (§G.4.4).
 				return err
 			}
 		}
@@ -360,13 +367,12 @@ func (im *importer) execute(ctx context.Context) error {
 		}
 		for i, b := range n.batches {
 			// Blobs first (§G.4.4), again if they may have expired since.
-			if err := im.sendBlobs(ctx, b, lims[n]); err != nil {
-				return err
-			}
 			if !b.dryOK {
-				if err := im.dryRun(ctx, b, false); err != nil {
+				if err := im.prepare(ctx, b, lims[n], false); err != nil {
 					return err
 				}
+			} else if err := im.sendBlobs(ctx, b, lims[n]); err != nil {
+				return err
 			}
 			req, expected := im.request(b)
 			res, err := im.call(ctx, n.ns, req, false)

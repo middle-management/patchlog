@@ -102,7 +102,11 @@ func dropFailed(st []*itemState, fs []itemErr, fails map[int]*Error) []*itemStat
 	return out
 }
 
-func dryRunReport(items []Item, passed []*itemState, fails map[int]*Error) []ItemResult {
+// dryRunReport is a dry run's report (§7.5). An item whose only failure
+// is a blob that isn't available reports that failure with the ids a
+// submit would produce once the blob is; one that also fails a later step
+// reports that step's failure, with the blob failure as its "blob" member.
+func dryRunReport(items []Item, passed []*itemState, fails, blobFails map[int]*Error) []ItemResult {
 	byIndex := map[int]*itemState{}
 	for _, s := range passed {
 		byIndex[s.index] = s
@@ -111,10 +115,22 @@ func dryRunReport(items []Item, passed []*itemState, fails map[int]*Error) []Ite
 	for i, it := range items {
 		idx := i
 		r := ItemResult{Resource: it.Resource, Index: &idx}
+		berr := blobFails[i]
 		if err, failed := fails[i]; failed {
 			r.Status, r.Err = err.Status, err.Body
+			if berr != nil {
+				body := map[string]any{}
+				for k, v := range err.Body {
+					body[k] = v
+				}
+				body["blob"] = berr.Body
+				r.Err = body
+			}
 		} else if s := byIndex[i]; s != nil {
 			r.Status = 200
+			if berr != nil {
+				r.Status, r.Err = berr.Status, berr.Body
+			}
 			for _, step := range s.steps {
 				r.IDs = append(r.IDs, step.id.String())
 			}
@@ -550,18 +566,31 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
-	// Blob references name available blobs (§7.8), also at step 4.
-	bs := blobSourceOf(req, source, isBatch)
+	// A batch's source, then blob references naming available blobs
+	// (§7.5, §7.8), also at step 4: the blobs may depend on the source.
+	var src any
+	var bs *batchSource
+	if isBatch && source != nil {
+		var err *Error
+		src, bs, err = t.checkSource(req, source)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	// A dry run reports a blob that isn't available, and runs the later
+	// steps as if it were (§7.5).
+	blobFails := map[int]*Error{}
 	for _, s := range st {
 		if err := t.checkBlobs(n, s, a, bs); err != nil {
+			if dryRun {
+				blobFails[s.index] = err
+				continue
+			}
 			fs = append(fs, itemErr{s.index, err})
 		}
 	}
 	if len(fs) > 0 {
-		if !dryRun {
-			return nil, nil, fail(fs)
-		}
-		st, fs = dropFailed(st, fs, dryFails), nil
+		return nil, nil, fail(fs)
 	}
 
 	// Step 5: schema. Items may reference schema revisions created by
@@ -618,19 +647,11 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 		result.Items = append(result.Items, ir)
 	}
-	var src any
-	if isBatch && source != nil {
-		var err *Error
-		src, err = t.checkSource(source)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
 	if dryRun {
 		// A dry run reports every item (§7.5): its ids, or the error of the
 		// step it failed at.
 		result.Status = 200
-		result.Items = dryRunReport(items, st, dryFails)
+		result.Items = dryRunReport(items, st, dryFails, blobFails)
 		return nil, result, nil
 	}
 
@@ -1171,39 +1192,48 @@ func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor) map[string]an
 	return env
 }
 
-// checkSource validates a batch's source (§7.5).
-func (t *tx) checkSource(v any) (any, *Error) {
+// checkSource validates a batch's source at step 4 (§7.5). It returns the
+// source as recorded and, for a local source the caller may read
+// unrestricted (with the grant in Source-Authorization, if given), whose
+// source.at it checked, the source that makes blobs available (§7.8). Any
+// other caller's local source is recorded unchecked and makes no blobs
+// available, so the check reveals nothing about a namespace it can't read.
+func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
 	m, ok := v.(map[string]any)
 	if !ok {
-		return nil, invalid("source must be an object")
+		return nil, nil, invalid("source must be an object")
 	}
 	for k := range m {
 		switch k {
 		case "origin", "ns", "at", "bundle", "ids":
 		default:
-			return nil, invalid("unknown source member " + k)
+			return nil, nil, invalid("unknown source member " + k)
 		}
 	}
 	ns, _ := m["ns"].(string)
 	at, _ := m["at"].(string)
 	if !ValidNSName(ns) || at == "" {
-		return nil, invalid("source needs ns and at")
+		return nil, nil, invalid("source needs ns and at")
 	}
 	if o, has := m["origin"]; has {
 		if o == t.e.opt.Origin {
-			return nil, invalid("source origin is this deployment")
+			return nil, nil, invalid("source origin is this deployment")
 		}
-		return m, nil
+		return m, nil, nil // another deployment's blobs are uploaded (§G.3)
 	}
 	sn := t.nsByName(ns)
+	if sn == nil || sn.purged || !t.sourceUnrestricted(sn, req) {
+		return m, nil, nil
+	}
 	id, err := ids.Parse(at)
-	if sn == nil || err != nil {
-		return nil, invalid("source.at is not in the chain of source.ns")
+	if err != nil {
+		return nil, nil, apiErr(422, "source", "message", "source.at is not in the chain of source.ns")
 	}
-	if _, ok := t.nsLogSeq(sn.id, id); !ok {
-		return nil, invalid("source.at is not in the chain of source.ns")
+	seq, ok := t.nsLogSeq(sn.id, id)
+	if !ok {
+		return nil, nil, apiErr(422, "source", "message", "source.at is not in the chain of source.ns")
 	}
-	return m, nil
+	return m, &batchSource{n: sn, atSeq: seq}, nil
 }
 
 // actorID is authorID for an actor. Under a grant it also remembers the key

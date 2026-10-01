@@ -160,7 +160,16 @@ func revisionBlobs(e2e bool, patches, doc any) []blobRef {
 // stepBlobs over-approximates the blobs a step references that it may
 // bring into the document: references in the values its ops write, ids
 // written at …/$blob, and at E3 the blobs its sealed op declares.
-func stepBlobs(s client.Step) []string {
+func stepBlobs(s client.Step) []string { return patchBlobs(s, false) }
+
+// mentions lists the blobs a line's patches mention (§G.4.1): its id as a
+// $blob member of any op's value, tests included, or as the value of an op
+// whose path ends in /$blob, or in its sealed op's declared list. A blob
+// line must come before the first line that mentions it; a snapshot line
+// mentions the blobs its document references (docBlobs).
+func mentions(s client.Step) []string { return patchBlobs(s, true) }
+
+func patchBlobs(s client.Step, tests bool) []string {
 	if s.Delete || s.Patches == nil {
 		return nil
 	}
@@ -185,8 +194,8 @@ func stepBlobs(s client.Step) []string {
 	ops, _ := v.([]any)
 	for _, o := range ops {
 		m, _ := o.(map[string]any)
-		if m["op"] == "test" {
-			continue
+		if m["op"] == "test" && !tests {
+			continue // a test brings nothing in
 		}
 		val, has := m["value"]
 		if !has {

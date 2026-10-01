@@ -594,7 +594,7 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 	m, ok := body.(map[string]any)
 	h, _ := m["horizon"].(string)
 	if !ok || h == "" {
-		writeErr(w, badInput("body must be { horizon, keep?, snapshot?, blobs? }"))
+		writeErr(w, badInput("body must be { horizon, keep?, snapshot? }"))
 		return
 	}
 	var keep []string
@@ -620,24 +620,9 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	// A sealed snapshot needs no declared list (§8.6, §E.3.1): the server
+	// keeps the list of the snapshot's revision.
 	pr := core.PruneRequest{Horizon: h, Keep: keep, Snapshot: snapshot}
-	if x, has := m["blobs"]; has {
-		// The snapshot's declared blob list (§E.3.1).
-		arr, ok := x.([]any)
-		if !ok {
-			writeErr(w, badInput("blobs must be an array of blob ids"))
-			return
-		}
-		pr.HasBlobs, pr.Blobs = true, []string{}
-		for _, b := range arr {
-			s, ok := b.(string)
-			if !ok {
-				writeErr(w, badInput("blobs must be an array of blob ids"))
-				return
-			}
-			pr.Blobs = append(pr.Blobs, s)
-		}
-	}
 	res, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, pr)
 	if err != nil {
 		writeErr(w, err)
@@ -665,10 +650,17 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 	up := core.BlobUpload{Type: r.Header.Get("Content-Type"), Nonce: r.Header.Get("Blob-Nonce"),
 		From: r.Header.Get("Blob-From"), Body: r.Body, Length: r.ContentLength}
 	if up.From != "" {
-		// A copy has an empty body (400 if not, in its place in the order).
-		var one [1]byte
-		n, _ := io.ReadFull(r.Body, one[:])
-		up.HasBody = n > 0
+		// A copy has an empty body (400 if not, in its place in the order,
+		// before any body is read): a declared length says so; only a
+		// body of unknown length is peeked at.
+		switch {
+		case r.ContentLength > 0:
+			up.HasBody = true
+		case r.ContentLength < 0:
+			var one [1]byte
+			n, _ := io.ReadFull(r.Body, one[:])
+			up.HasBody = n > 0
+		}
 	}
 	req := core.Request{NS: ns, Cred: creds(r), SourceCred: sourceCreds(r)}
 	if err := s.e.UploadBlob(r.Context(), req, name, bid, up); err != nil {

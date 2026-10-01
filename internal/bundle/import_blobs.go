@@ -2,6 +2,7 @@ package bundle
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -46,6 +47,7 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 	if im.sent == nil {
 		im.sent = map[string]time.Time{}
 	}
+	b.rep.ViaSource = 0
 	for _, nd := range im.batchBlobs(b) {
 		it := nd.it
 		k := it.ns + "/" + it.name + "/" + nd.bid
@@ -53,6 +55,13 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 			continue
 		}
 		line := it.d.blobs[nd.bid]
+		if line != nil && im.sourceHas(b, it) {
+			// The batch's local source makes it available: the source's
+			// same resource referenced it as of source.at, since the
+			// bundle carries it (§7.8, §G.4.4). Nothing to copy.
+			b.rep.ViaSource++
+			continue
+		}
 		switch {
 		case line != nil && im.local && im.copyBlob(ctx, it.ns, it.name, nd.bid, it.d.ns, it.d.name):
 			b.rep.Copied++
@@ -90,6 +99,41 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 		im.sent[k] = time.Now()
 	}
 	return nil
+}
+
+// sourceHas reports whether a batch's local source makes the blobs of item
+// it that the bundle carries available (§7.8): a local import whose source
+// is the item's own source resource, under the same name, unless a dry run
+// showed the source doesn't serve (noSource).
+func (im *importer) sourceHas(b *batch, it *item) bool {
+	return im.local && !im.noSource[b.n.ns] && it.d.ns == b.n.srcNS && it.d.name == it.name
+}
+
+// errViaSource is a dry run that failed only for blobs left to the batch's
+// source: they are sent after all, and the batch dry-run again.
+var errViaSource = errors.New("import: the batch's source doesn't make its blobs available")
+
+// prepare sends a batch's blobs and dry-runs it. If the dry run fails only
+// for blobs left to the batch's local source (the importer can't read the
+// source unrestricted, so it makes none available, §7.5), they are copied
+// or uploaded after all, for that namespace from then on, and the batch is
+// dry-run again.
+func (im *importer) prepare(ctx context.Context, b *batch, l limits, deferOK bool) error {
+	if err := im.sendBlobs(ctx, b, l); err != nil {
+		return err
+	}
+	err := im.dryRun(ctx, b, deferOK)
+	if !errors.Is(err, errViaSource) {
+		return err
+	}
+	if im.noSource == nil {
+		im.noSource = map[string]bool{}
+	}
+	im.noSource[b.n.ns] = true
+	if err := im.sendBlobs(ctx, b, l); err != nil {
+		return err
+	}
+	return im.dryRun(ctx, b, deferOK)
 }
 
 // copyBlob copies a blob within the deployment (§7.8 Copying) and reports

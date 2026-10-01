@@ -327,3 +327,30 @@ func TestListed(t *testing.T) {
 		}
 	}
 }
+
+// §F.3: a batch by a listed author whose source.at isn't in the branch's
+// chain doesn't count. The server records such a source unchecked for a
+// writer who can't read the branch (§7.5), so the merger checks the chain
+// itself, as the janitor does, and reports the batch as ignored.
+func TestMergeBatchSourceAtOutsideChain(t *testing.T) {
+	a := newAuthEnv(t)
+	a.append("r7", "derby", op("replace", "/score", "1-0"))
+	a.append("matches", "cup", op("replace", "/score", "2-2"))
+	// r7 becomes private, and a listed principal's grant that doesn't name
+	// it can't read it.
+	must(a.editor.PatchConfig(ctx, "r7", must(a.editor.NSHead(ctx, "r7")).Config, ops(op("replace", "/read", "grant"))))
+	blind := a.s.Client(t, client.WithBearer(a.ops.Grant(t, a.s.Now(), "svc:merge", []string{"matches"}, grant.Verbs)))
+	bogus := must(blind.NSHead(ctx, "matches")).ID // in the base's chain, not r7's
+	h := must(blind.Head(ctx, "matches", "derby"))
+	res := must(blind.Batch(ctx, "matches", client.BatchRequest{
+		Items:  []client.BatchItem{{Resource: "derby", IfMatch: h.ID, Steps: []client.Step{client.PatchStep(ops(op("replace", "/score", "1-0")))}}},
+		Source: map[string]any{"ns": "r7", "at": bogus},
+	}, false))
+	p := must(merge.NewPlan(ctx, a.merger(a.ops, "svc:merge"), "matches", "r7", merge.Options{}))
+	if len(p.Ignored) != 1 || p.Ignored[0].Batch != res.NSID || !strings.Contains(p.Ignored[0].Reason, "not in the chain of r7") {
+		t.Fatalf("ignored %+v", p.Ignored)
+	}
+	if d := p.Resource("derby"); d.Pair != nil {
+		t.Fatalf("derby paired by a batch outside the chain: %+v", d.Pair)
+	}
+}
