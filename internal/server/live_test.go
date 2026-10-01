@@ -227,6 +227,12 @@ func TestLongPollWakes(t *testing.T) {
 	e := newEnv(t, withLongPoll(20*time.Second), withFileDB(t))
 	e.mkNS("docs", map[string]any{"read": "public"})
 	head := e.nsHead("docs")
+	// A long-poll ends at the next cursor boundary (§7.7): start well
+	// before one, so the write below comes first.
+	const interval = 20 * time.Second
+	if rem := interval - time.Duration(time.Now().UnixNano()%int64(interval)); rem < time.Second {
+		time.Sleep(rem + 10*time.Millisecond)
+	}
 	done := make(chan *resp, 1)
 	go func() { done <- e.get("/ns/docs/log?since=" + head + "&live=long-poll") }()
 	time.Sleep(100 * time.Millisecond)

@@ -50,11 +50,9 @@ and serves immutable, CDN-cacheable revisions.
   remote branches of a base that is itself a remote branch (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
-- **Blob gaps** (§7.8): sealed namespaces answer `501` for blobs instead of the sealed form
-  per epoch (§E.2.2); e2e writes don't check or attach the blobs their sealed ops declare
-  (§E.3.1); bundles of sealed namespaces can't carry blobs until the client opens sealed
-  blobs, and remote branches of e2e bases don't mirror the blobs declared by sealed ops (§G.3).
-  Bytes live in a `blob_bytes` table rather than in object storage (D.2, D.8).
+- **Blob gaps** (§7.8): bytes live in a `blob_bytes` table rather than in object storage (D.2,
+  D.8); importing a private or sealed source into an e2e target (re-encrypting blobs, §G.5.1)
+  isn't implemented; no resumable uploads, and ranges of sealed blobs are served as stored.
 - CDN edge grants (§C.5): no edge grants are issued, and the origin checks grants itself on
   every read. Both §9 deployments are supported: behind a grant-verifying edge
   (`-edge-secret`) private content gets edge lifetimes, otherwise it is `no-store` for shared
