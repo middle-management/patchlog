@@ -33,6 +33,7 @@ services:
       - -master-key=/data/master.key
       - -master-key-create
       - -tree-url=http://tree:9082
+      - -index-url=http://index:9081
       - -purge-url=http://cdn:8080/
     # Healthchecks run through `docker exec`, which joins the container's
     # namespaces, and hosts like these refuse that too. The seed waits for

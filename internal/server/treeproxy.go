@@ -2,10 +2,8 @@ package server
 
 import (
 	"fmt"
-	"net"
 	"net/http"
 	"net/http/httputil"
-	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +16,9 @@ import (
 // B) through the core's origin: the playground's CSP allows connect-src
 // 'self' only, and the tree service is another origin.
 const TreeProxyPrefix = "/playground/tree/"
+
+// treeSvc is the tree proxy's side of serviceProxy.
+var treeSvc = serviceProxy{prefix: TreeProxyPrefix, name: "tree", timeout: 30 * time.Second, hint: ", optionally as CATALOG=URL"}
 
 // NewTreeProxy returns a read-only reverse proxy to one or more tree services,
 // to be mounted at TreeProxyPrefix. Each target is either a plain URL (e.g.
@@ -50,7 +51,7 @@ func NewTreeProxy(targets ...string) (http.Handler, error) {
 	catalogs := []string{}
 	for _, t := range targets {
 		cat, target := splitTreeTarget(t)
-		rp, err := newTreeReverseProxy(target)
+		rp, err := treeSvc.reverse(target)
 		if err != nil {
 			return nil, err
 		}
@@ -68,20 +69,7 @@ func NewTreeProxy(targets ...string) (http.Handler, error) {
 	}
 	sort.Strings(catalogs)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet && r.Method != http.MethodHead {
-			treeProxyHeaders(w.Header())
-			w.Header().Set("Allow", "GET, HEAD")
-			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"code": "bad_input", "message": "the tree proxy is read-only"})
-			return
-		}
-		if !strings.HasPrefix(r.URL.Path, TreeProxyPrefix) {
-			http.NotFound(w, r)
-			return
-		}
-		if r.URL.Path == TreeProxyPrefix {
-			treeProxyHeaders(w.Header())
-			w.Header().Set("Cache-Control", "no-store")
-			writeJSON(w, http.StatusOK, map[string]any{"proxy": "tree", "catalogs": catalogs, "default": def != nil})
+		if treeSvc.gate(w, r, func() map[string]any { return map[string]any{"catalogs": catalogs, "default": def != nil} }) {
 			return
 		}
 		cat, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, TreeProxyPrefix), "/")
@@ -93,7 +81,7 @@ func NewTreeProxy(targets ...string) (http.Handler, error) {
 			rp = def
 		}
 		if rp == nil {
-			treeProxyHeaders(w.Header())
+			treeSvc.headers(w.Header())
 			writeJSON(w, http.StatusNotFound, map[string]any{"code": "not_found", "message": "no tree service for catalog " + strconv.Quote(cat) + " (-tree-url CATALOG=URL)"})
 			return
 		}
@@ -109,84 +97,4 @@ func splitTreeTarget(t string) (catalog, target string) {
 		return k, v
 	}
 	return "", t
-}
-
-// newTreeReverseProxy proxies TreeProxyPrefix+{path} to {target}/{path}.
-func newTreeReverseProxy(target string) (*httputil.ReverseProxy, error) {
-	u, err := url.Parse(target)
-	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.Fragment != "" {
-		return nil, fmt.Errorf("tree url %q: want http(s)://host[:port][/path], optionally as CATALOG=URL", target)
-	}
-	base := strings.TrimSuffix(u.Path, "/")
-	return &httputil.ReverseProxy{
-		Rewrite: func(pr *httputil.ProxyRequest) {
-			rest := strings.TrimPrefix(pr.In.URL.Path, TreeProxyPrefix)
-			pr.Out.URL.Scheme, pr.Out.URL.Host = u.Scheme, u.Host
-			pr.Out.URL.Path, pr.Out.URL.RawPath = base+"/"+rest, ""
-			pr.Out.URL.RawQuery = pr.In.URL.RawQuery
-			pr.Out.Host = u.Host
-			pr.Out.Header.Del("Cookie")
-			pr.SetXForwarded()
-		},
-		Transport: &http.Transport{
-			Proxy:                 nil,
-			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			ResponseHeaderTimeout: 30 * time.Second,
-			MaxIdleConnsPerHost:   8,
-			IdleConnTimeout:       90 * time.Second,
-		},
-		ModifyResponse: func(res *http.Response) error {
-			if loc := res.Header.Get("Location"); loc != "" {
-				res.Header.Set("Location", rewriteTreeLocation(loc, u, base))
-			}
-			res.Header.Del("Set-Cookie")
-			treeProxyHeaders(res.Header)
-			return nil
-		},
-		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
-			treeProxyHeaders(w.Header())
-			writeJSON(w, http.StatusBadGateway, map[string]any{"code": "upstream", "message": "the tree service is not reachable (yet)"})
-		},
-	}, nil
-}
-
-func treeProxyHeaders(h http.Header) {
-	// The core's own CORS (-cors-origin) applies to proxied responses,
-	// not whatever the tree service answers with.
-	for k := range h {
-		if strings.HasPrefix(k, "Access-Control-") {
-			h.Del(k)
-		}
-	}
-	h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")
-	h.Set("X-Content-Type-Options", "nosniff")
-}
-
-// rewriteTreeLocation maps a tree service redirect target into the proxy's
-// URL space: an absolute path, or an absolute URL on the tree service's own
-// origin, below its base path. Anything else is left alone.
-func rewriteTreeLocation(loc string, target *url.URL, base string) string {
-	l, err := url.Parse(loc)
-	if err != nil {
-		return loc
-	}
-	if l.IsAbs() || l.Host != "" {
-		if !strings.EqualFold(l.Host, target.Host) {
-			return loc
-		}
-	} else if !strings.HasPrefix(l.Path, "/") {
-		return loc
-	}
-	p := l.Path
-	if base != "" {
-		if p != base && !strings.HasPrefix(p, base+"/") {
-			return loc
-		}
-		p = strings.TrimPrefix(p, base)
-	}
-	out := TreeProxyPrefix + strings.TrimPrefix(p, "/")
-	if l.RawQuery != "" {
-		out += "?" + l.RawQuery
-	}
-	return out
 }

@@ -47,7 +47,7 @@ func TestHandler(t *testing.T) {
 	if rec.Code != http.StatusFound || rec.Header().Get("Location") != "/playground/" {
 		t.Errorf("redirect: %d %q", rec.Code, rec.Header().Get("Location"))
 	}
-	for _, p := range []string{"/playground/nope", "/playground/tree/", "/playground/tree/cat/roots"} {
+	for _, p := range []string{"/playground/nope", "/playground/tree/", "/playground/tree/cat/roots", "/playground/index/", "/playground/index/demo"} {
 		rec = httptest.NewRecorder()
 		h.ServeHTTP(rec, httptest.NewRequest("GET", p, nil))
 		if rec.Code != 404 {
@@ -74,7 +74,7 @@ func TestPage(t *testing.T) {
 			t.Errorf("tab %s has no panel", tab[1])
 		}
 	}
-	for _, want := range []string{`data-tab="cat"`, `data-tab="keys"`, `<script src="seal.js"></script>`} {
+	for _, want := range []string{`data-tab="cat"`, `data-tab="sr"`, `data-tab="keys"`, `<script src="seal.js"></script>`} {
 		if !bytes.Contains(html, []byte(want)) {
 			t.Errorf("index.html lacks %s", want)
 		}

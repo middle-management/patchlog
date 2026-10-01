@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -87,7 +87,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
   patchlog version
@@ -117,6 +117,7 @@ func serve(args []string) {
 	pg := fs.Bool("playground", true, "serve the web playground at /playground/")
 	var treeURLs multi
 	fs.Var(&treeURLs, "tree-url", "tree service (Addendum B) the playground reads through a read-only proxy at "+server.TreeProxyPrefix+", e.g. http://tree:8082; CATALOG=URL maps one catalog to its own (repeatable)")
+	indexURL := fs.String("index-url", "", "search index (Addendum A) the playground reads through a read-only proxy at "+server.IndexProxyPrefix+", e.g. http://index:8081; one index serves several namespaces")
 	maxItems := fs.Int("max-items-per-batch", 0, "deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it (§6.6)")
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
 	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
@@ -220,6 +221,15 @@ func serve(args []string) {
 			log.Fatal(err)
 		}
 	}
+	var indexProxy http.Handler
+	if *indexURL != "" {
+		if !*pg {
+			log.Fatal("-index-url needs the playground (it proxies under " + server.IndexProxyPrefix + ")")
+		}
+		if indexProxy, err = server.NewIndexProxy(*indexURL); err != nil {
+			log.Fatal(err)
+		}
+	}
 	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
 		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
 		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke}
@@ -231,13 +241,16 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy)), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy, indexProxy)), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("patchlog %s listening on %s (origin %s, dev=%v)", version, *addr, *origin, *dev)
 	if *pg {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
 	}
 	if treeProxy != nil {
 		log.Printf("tree proxy: %s%s -> %s (GET/HEAD only)", localURL(*addr), server.TreeProxyPrefix, treeURLs.String())
+	}
+	if indexProxy != nil {
+		log.Printf("index proxy: %s%s -> %s (GET/HEAD only)", localURL(*addr), server.IndexProxyPrefix, *indexURL)
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -378,8 +391,9 @@ func remoteOptions(bearers, urls, identities []string) (core.RemoteOptions, erro
 // http.ServeMux cleans paths and answers 301, where §3.6 requires the API's
 // own 400 for non-canonical URLs, so only playground paths reach the mux.
 // treeProxy, if not nil, serves server.TreeProxyPrefix (-tree-url);
-// without it those paths are the playground's 404.
-func handler(api http.Handler, withPlayground bool, treeProxy http.Handler) http.Handler {
+// without it those paths are the playground's 404. indexProxy likewise
+// serves server.IndexProxyPrefix (-index-url).
+func handler(api http.Handler, withPlayground bool, treeProxy, indexProxy http.Handler) http.Handler {
 	if !withPlayground {
 		return api
 	}
@@ -387,6 +401,9 @@ func handler(api http.Handler, withPlayground bool, treeProxy http.Handler) http
 	mux.Handle(playground.Prefix, playground.Handler())
 	if treeProxy != nil {
 		mux.Handle(server.TreeProxyPrefix, treeProxy)
+	}
+	if indexProxy != nil {
+		mux.Handle(server.IndexProxyPrefix, indexProxy)
 	}
 	mux.HandleFunc(strings.TrimSuffix(playground.Prefix, "/"), func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, playground.Prefix, http.StatusFound)

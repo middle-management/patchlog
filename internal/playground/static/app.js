@@ -322,8 +322,19 @@ async function api(method, path, o = {}) {
     e.neterr = err && err.message ? err.message : String(err);
   }
   e.ms = performance.now() - t0;
+  noteWrite(method, path, e);
   renderEntry(e);
   return wrap(e);
+}
+
+/* WRITES: the last write this page made to each namespace, by X-Namespace-Revision. The Search tab passes it as
+ * ?min= (§A.5) so the index has applied it before it answers. */
+const WRITES = new Map(); // ns -> { id, at: Date }
+function noteWrite(method, path, e) {
+  if (method === 'GET' || method === 'HEAD' || !(e.status >= 200 && e.status < 300) || !e.resHeaders || /[?&]dry-run=/.test(path)) return;
+  const id = e.resHeaders.get('X-Namespace-Revision');
+  const m = /^\/(?:r|ns)\/([^/?]+)/.exec(path);
+  if (id && m && ID_RE.test(id)) { WRITES.set(m[1], { id, at: new Date() }); if (document.getElementById('srRywInfo')) renderSrRyw(); }
 }
 function wrap(e) {
   return {
@@ -1846,9 +1857,11 @@ async function openSealedEntries(v, view) {
       const hdr = Z.parseJWE(v.sealed).header;
       const ens = Z.parseKid(hdr.kid).ns;
       // The entry's resource key K_r (what the tree service and the index use), else the epoch key K_e.
-      const want = { ns: ens, name: v.name, view };
+      // (The tree service names its entries "name", the index its hits "resource".)
+      const rname = v.name !== undefined ? v.name : v.resource;
+      const want = { ns: ens, name: rname, view };
       let d;
-      try { d = await openSealed(ens, v.sealed, v.name, want); } catch (err) { if (err.checks) throw err; d = await openSealed(ens, v.sealed, '', want); }
+      try { d = await openSealed(ens, v.sealed, rname, want); } catch (err) { if (err.checks) throw err; d = await openSealed(ens, v.sealed, '', want); }
       if (d.value && typeof d.value === 'object') Object.assign(v, d.value);
       v._opened = hdr.kid;
     } catch (err) { v._sealedErr = err.message; }
@@ -2585,6 +2598,229 @@ async function runExampleAll() {
 }
 
 /* ------------------------------------------------------------------ *
+ * search (Addendum A): the index service through the core's proxy
+ * ------------------------------------------------------------------ */
+const INDEX = '/playground/index';
+const SR = {
+  proxy: null, status: null, indexed: [], // the proxy exists (-index-url); GET /_status of the index
+  ns: '', info: null, q: null, next: '', at: '', view: '', hits: [], counts: null, state: '', note: '', busy: false, gen: 0,
+};
+
+/* probeIndex asks the core whether it proxies a search index (-index-url), and what the index follows (/_status). */
+async function probeIndex() {
+  const p = await api('GET', `${INDEX}/`, { auto: true, label: 'index' });
+  SR.proxy = p.status === 200 && !!p.json && p.json.proxy === 'index';
+  SR.status = null; SR.indexed = [];
+  if (!SR.proxy) return;
+  const st = await api('GET', `${INDEX}/_status`, { auto: true, label: 'index' });
+  if (st.status === 200 && st.json && Array.isArray(st.json.namespaces)) {
+    SR.status = st.json.namespaces.filter((n) => n && typeof n.ns === 'string');
+    SR.indexed = SR.status.map((n) => n.ns);
+  }
+}
+
+function srStatusOf(ns) { return (SR.status || []).find((n) => n.ns === ns) || null; }
+
+function renderSrPick() {
+  const sel = $('srPick');
+  const list = SR.indexed.slice().sort(cmpCU);
+  sel.replaceChildren(h('option', { value: '' }, SR.proxy === null ? 'finding namespaces…' : SR.proxy === false ? '— no index configured —' : list.length ? '— pick —' : '— none reported —'),
+    ...list.map((n) => {
+      const st = srStatusOf(n);
+      const tag = st && st.skipped ? ' (skipped)' : st && st.sealed ? ' (sealed)' : '';
+      return h('option', { value: n, selected: n === SR.ns }, n + tag);
+    }));
+  $('srNsList').replaceChildren(...[...new Set([...list, ...known])].map((v) => h('option', { value: v })));
+}
+
+/* The last write this browser made to each namespace (X-Namespace-Revision), for ?min= (§A.5). */
+function renderSrRyw() {
+  const ns = ($('srNs').value || '').trim();
+  const w = WRITES.get(ns);
+  $('srRyw').disabled = !w;
+  $('srRywInfo').replaceChildren(w
+    ? h('span', {}, `your last write in ${ns}: `, idEl(w.id), h('span', { class: 'muted small' }, ' ' + w.at.toTimeString().slice(0, 8)))
+    : h('span', { class: 'muted small' }, ns ? `no write to ${ns} made in this page yet: write something in the Resource tab` : 'pick a namespace'));
+}
+
+/* srFilters turns the filter lines into query parameters: raw (facet[/league]=cup, ge[/kickoff]=2026-10-10)
+ * or short (/league=cup, /kickoff>=2026-10-10). */
+function srFilters(text) {
+  const out = [], ops = { '>=': 'ge', '>': 'gt', '<=': 'le', '<': 'lt', '=': 'facet' };
+  for (const line of text.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    const m = /^(\/[^=<>]*)(>=|<=|>|<|=)(.*)$/.exec(line);
+    if (m) { out.push([`${ops[m[2]]}[${m[1]}]`, m[3].trim()]); continue; }
+    const i = line.indexOf('=');
+    if (i > 0) out.push([line.slice(0, i).trim(), line.slice(i + 1).trim()]);
+    else throw new Error(`filter "${line}": want /path=value, /path>=value or facet[/path]=value`);
+  }
+  return out;
+}
+
+function srParams(ns) {
+  const p = new URLSearchParams();
+  const q = $('srQ').value.trim();
+  if (q) p.set('q', q);
+  if ($('srSchema').value.trim()) p.set('schema', $('srSchema').value.trim());
+  for (const [k, v] of srFilters($('srFilters').value)) p.append(k, v);
+  for (const s of $('srSort').value.split(',').map((x) => x.trim()).filter(Boolean)) p.append('sort', s);
+  for (const c of $('srCounts').value.split(',').map((x) => x.trim()).filter(Boolean)) p.append('counts', c);
+  if ($('srLimit').value.trim()) p.set('limit', $('srLimit').value.trim());
+  const w = WRITES.get(ns);
+  if ($('srRyw').checked && w) p.set('min', w.id);
+  return p;
+}
+
+function srMessage(kind, ...kids) {
+  $('srResults').className = '';
+  $('srResults').replaceChildren(h('div', { class: kind === 'info' ? 'note' : 'errbox' }, ...kids));
+  $('srMore').hidden = true; $('srCountsOut').replaceChildren(); $('srMeta').textContent = '';
+}
+
+/* srGet fetches one result through the proxy, following the checkpoint redirect (fetch does), retrying while the
+ * index is behind ?min (503), and opening sealed results (§E.2.6): the whole JWE, then per-hit "sealed" values. */
+async function srGet(path, ns) {
+  let r;
+  for (let i = 0; i < 4; i++) {
+    r = await api('GET', path, { label: 'search' });
+    if (r.status !== 503 || !(r.json && r.json.code === 'behind')) break;
+    await sleep(800);
+  }
+  if (r.status !== 200) return { r };
+  const view = r.finalPath.startsWith(INDEX + '/') ? r.finalPath.slice(INDEX.length) : r.finalPath;
+  let body = r.json;
+  if (r.jose) {
+    let pl = {};
+    try { pl = Z.parseJWE(r.text.trim()).header.pl || {}; } catch (_) { /* reported by decrypted */ }
+    const d = await decrypted(r, pl.ns || ns, '', { ns: pl.ns || ns, view });
+    if (d.error) return { r, view, sealedWhole: d };
+    body = d.value;
+  }
+  if (body && typeof body === 'object') await openSealedEntries(body, view);
+  return { r, view, body };
+}
+
+/* runSearch queries the namespace in the page's fields, or fetches the next page of the last result. */
+async function runSearch(more) {
+  if (SR.busy) return;
+  if (SR.proxy === null) await probeIndex();
+  renderSrPick();
+  if (!SR.proxy) return renderSearch();
+  const ns = more ? SR.ns : $('srNs').value.trim();
+  if (!more) store.set('pl.srNs', ns);
+  if (!ns) return toast('Pick a namespace');
+  if (!NODE_RE.test(ns)) return toast('Not a namespace name');
+  let path;
+  if (more) path = INDEX + SR.next;
+  else {
+    let p;
+    try { p = srParams(ns); } catch (err) { return srMessage('err', err.message); }
+    path = `${INDEX}/${ns}` + (p.toString() ? '?' + p : '');
+  }
+  const gen = ++SR.gen;
+  SR.busy = true; $('srGo').disabled = true;
+  $('srStatus').textContent = `Searching ${ns}…`;
+  try {
+    if (!more) {
+      SR.ns = ns; SR.info = await nsInfo(ns);
+      renderSrRyw();
+      if (SR.info.level === 'e2e') {
+        SR.hits = []; SR.next = ''; SR.at = ''; SR.view = '';
+        $('srStatus').textContent = '';
+        return srMessage('info', `${ns} is an end-to-end encrypted (E3) namespace: the server holds only ciphertext, so an index service cannot read its documents and there is nothing to search here (§E.3). Search it by opening its resources, or index it in a client that holds the keys.`);
+      }
+    }
+    const res = await srGet(path, ns);
+    if (gen !== SR.gen) return;
+    $('srStatus').textContent = '';
+    const r = res.r;
+    if (!res.body) {
+      const st = srStatusOf(ns);
+      const why = res.sealedWhole ? 'The index answered with a sealed result this browser has no key for: ' + res.sealedWhole.error
+        : r.neterr ? 'Network error: ' + r.neterr
+          : r.status === 502 ? 'The search index is not reachable through the proxy (502): it may still be starting.'
+            : r.status === 404 ? `The index does not serve a namespace named ${ns} (404): it follows ${SR.indexed.length ? SR.indexed.join(', ') : 'only what its -ns flag lists'}.`
+              : r.status === 401 || r.status === 403 ? `The index refused the read (${r.status}): ${ns} is not public; put a read grant in the connection bar's bearer field.`
+                : r.status === 503 && r.json && r.json.code === 'skipped' ? `The index does not consume ${ns}: ${r.json.message || (st && st.reason) || ''}`
+                  : r.status === 503 ? `The index has not reached ${ns} yet (503 ${(r.json && r.json.code) || ''}): ${(r.json && r.json.message) || ''}`
+                    : `The index answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}${r.json && r.json.message ? ': ' + r.json.message : ''}`;
+      return srMessage('err', why);
+    }
+    const b = res.body;
+    SR.at = b.at || ''; SR.view = res.view; SR.next = typeof b.next === 'string' ? b.next : '';
+    SR.hits = more ? SR.hits.concat(b.hits || []) : (b.hits || []);
+    if (b.counts) SR.counts = b.counts; else if (!more) SR.counts = null;
+    SR.sealedView = r.jose; SR.perEntry = !r.jose && SR.hits.some((x) => x && x._opened);
+    SR.state = 'ok'; SR.rev = r.hdr('X-Namespace-Revision') || ''; SR.min = new URLSearchParams(path.split('?')[1] || '').get('min') || '';
+    renderSearch();
+  } finally {
+    SR.busy = false; $('srGo').disabled = false;
+  }
+}
+
+function srAddFilter(path, value) {
+  const line = `${path}=${typeof value === 'string' ? value : JSON.stringify(value)}`;
+  const t = $('srFilters');
+  if (!t.value.split('\n').map((l) => l.trim()).includes(line)) t.value = (t.value.trim() ? t.value.trim() + '\n' : '') + line;
+  $('srMoreBox').open = true;
+  asUser(() => runSearch(false));
+}
+
+function renderSearch() {
+  const res = $('srResults');
+  if (SR.proxy === false) {
+    $('srStatus').replaceChildren();
+    return srMessage('info', 'Search needs the index service (Addendum A). Start the core with -index-url (compose does) to read it through the same-origin proxy at /playground/index/. Without it there is nothing to query: the core has no search of its own.');
+  }
+  if (SR.state !== 'ok') return;
+  const st = srStatusOf(SR.ns);
+  $('srStatus').replaceChildren(h('dl', { class: 'kv' },
+    h('dt', {}, 'index checkpoint'), h('dd', {}, idEl(SR.at), h('span', { class: 'muted small' }, ' the result is immutable at this ns_id (§A.4): the index redirected the query to it')),
+    h('dt', {}, 'result URL'), h('dd', { class: 'mono small' }, SR.view,
+      SR.sealedView ? h('span', { class: 'badge tomb', title: 'served as one JWE, pl { ns, view } (§E.2.6)' }, 'sealed result') : null,
+      SR.perEntry ? h('span', { class: 'badge tomb', title: 'each hit sealed under its resource key, pl { ns, name, view } (§E.2.6)' }, 'sealed per hit') : null),
+    SR.min ? h('dt', {}, 'read-your-writes') : null, SR.min ? h('dd', { class: 'mono small' }, '?min=' + SR.min + ' (waited until the index had applied it)') : null,
+    st ? h('dt', {}, 'namespace') : null, st ? h('dd', {}, h('span', { class: 'badge' }, st.level || 'plain'), st.epoch ? h('span', { class: 'muted small' }, ' epoch ' + st.epoch) : null, st.skipped ? h('span', { class: 'badge warn' }, 'skipped: ' + (st.reason || '')) : null) : null));
+  $('srMeta').textContent = `${SR.hits.length} hit(s)${SR.next ? ', more available' : ''}`;
+  if (!SR.hits.length) {
+    res.className = 'muted';
+    res.textContent = 'No hits. Plain listings show untyped documents too; text, facet and sort queries only match documents whose $schema marks fields with x-index.';
+  } else {
+    res.className = '';
+    const rows = SR.hits.map((x) => {
+      const facets = Object.keys(x).filter((k) => k.startsWith('/')).sort();
+      return h('tr', {},
+        h('td', {}, h('button', { class: 'link mono', title: `open ${SR.ns}/${x.resource} in the Resource tab`, onclick: () => openItem(SR.ns, x.resource) }, x.resource)),
+        h('td', { class: 'mono small' }, x.schema ? x.schema.replace(/^\/r\//, '').replace(/\/rev\/(1[a-z2-7]{32})$/, (m, id) => ' @' + short(id)) : (x._sealedErr ? '' : h('span', { class: 'muted' }, 'untyped'))),
+        h('td', { class: 'mono small' }, typeof x.score === 'number' ? x.score.toFixed(3) : ''),
+        h('td', {}, facets.map((p) => (Array.isArray(x[p]) ? x[p] : [x[p]]).map((v) => h('button', { class: 'badge info chip', title: `filter on ${p} = ${v}`, onclick: () => srAddFilter(p, v) }, `${p}: ${v}`)))),
+        h('td', { class: 'mono small' }, x.id ? idEl(x.id) : ''),
+        h('td', {}, x.sealed && !x._opened ? h('span', { class: 'badge err', title: x._sealedErr || 'no key' }, 'sealed: ' + (x._sealedErr ? 'not opened' : 'no key')) : x._opened ? h('span', { class: 'badge ok', title: 'opened with ' + x._opened }, 'opened') : ''));
+    });
+    res.replaceChildren(h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['resource', 'schema', 'score', 'facets', 'revision', ''].map((c) => h('th', {}, c)))), h('tbody', {}, rows))));
+  }
+  $('srMore').hidden = !SR.next;
+  const counts = SR.counts && typeof SR.counts === 'object' ? Object.keys(SR.counts).sort() : [];
+  $('srCountsOut').replaceChildren(...counts.map((p) => h('div', { class: 'chips' }, h('span', {}, 'counts ' + p + ':'),
+    ...(SR.counts[p] || []).map((c) => h('button', { class: 'badge info chip', title: `filter on ${p} = ${c.value}`, onclick: () => srAddFilter(p, c.value) }, `${c.value} × ${c.count}`)))));
+}
+
+function initSearch() {
+  $('srNs').value = store.get('pl.srNs', 'demo');
+  $('srGo').onclick = () => asUser(() => runSearch(false));
+  for (const id of ['srQ', 'srNs', 'srSchema', 'srSort', 'srCounts', 'srLimit']) $(id).onkeydown = (e) => { if (e.key === 'Enter') asUser(() => runSearch(false)); };
+  $('srNs').oninput = renderSrRyw;
+  $('srPick').onchange = () => { const v = $('srPick').value; if (v) { $('srNs').value = v; renderSrRyw(); asUser(() => runSearch(false)); } };
+  $('srMore').onclick = () => asUser(() => runSearch(true));
+  $('srRefresh').onclick = () => asUser(async () => { SR.proxy = null; await probeIndex(); renderSrPick(); renderSearch(); });
+  document.querySelector('.tab[data-tab="sr"]').addEventListener('click', async () => {
+    if (SR.proxy === null) { await probeIndex(); renderSrPick(); renderSearch(); }
+    renderSrRyw();
+  });
+  renderSrRyw();
+}
+
+/* ------------------------------------------------------------------ *
  * tabs and wiring
  * ------------------------------------------------------------------ */
 function showTab(name) {
@@ -2739,12 +2975,16 @@ function init() {
   document.querySelector('.tab[data-tab="cat"]').addEventListener('click', () => { if (!C.ns && !C.loading) loadCatalog(); });
   document.querySelector('.tab[data-tab="keys"]').addEventListener('click', () => { if (KR.ns !== S.ns) loadKeyring(); });
 
+  // search
+  initSearch();
+
   // restore session
   showTab(store.get('pl.tab', 'ns'));
   renderNsSelect(); renderNsAll(); renderResAll(); renderHistory(); updateLiveUrls();
   const ns = store.get('pl.ns', ''), res = store.get('pl.res', '');
   if (ns) { S.res = res; asUser(() => selectNS(ns, { keepRes: true })); $('resName').value = res; }
   if (store.get('pl.tab', 'ns') === 'cat') loadCatalog();
+  if (store.get('pl.tab', 'ns') === 'sr') probeIndex().then(() => { renderSrPick(); renderSearch(); });
 }
 
 document.addEventListener('DOMContentLoaded', init);

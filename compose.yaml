@@ -7,7 +7,9 @@
 #
 #   http://localhost:8080             core API (through the CDN)
 #   http://localhost:8080/playground/ web playground
-#   http://localhost:8081             search index (Addendum A), e.g. /demo?q=derby
+#   http://localhost:8081             search index (Addendum A), e.g. /demo?q=derby; the
+#                                     playground's Search tab reads it through the core's
+#                                     read-only proxy at /playground/index/ (-index-url)
 #   http://localhost:8082             tree service (Addendum B), e.g. /cat/roots (the
 #                                     catalog cat, a tree) and /topics/roots (topics,
 #                                     a DAG); the playground reads it through the
@@ -55,6 +57,9 @@ services:
       # 502 until it is up. It serves both catalogs; a catalog served
       # elsewhere would be mapped with another -tree-url CATALOG=URL.
       - -tree-url=http://tree:8082
+      # The Search tab reads the index the same way, at /playground/index/.
+      # It follows demo; like the tree service it starts after the seed.
+      - -index-url=http://index:8081
       # Cache-tag purges (tombstone purges, namespace purges, …). The CDN
       # starts last; purges sent before it is up are logged and dropped,
       # which is harmless: nothing is cached yet.

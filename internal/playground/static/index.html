@@ -51,6 +51,7 @@
     <button class="tab" role="tab" data-tab="batch" aria-selected="false">Batch</button>
     <button class="tab" role="tab" data-tab="live" aria-selected="false">Live <span id="liveDot" class="dot" hidden></span></button>
     <button class="tab" role="tab" data-tab="cat" aria-selected="false">Catalog</button>
+    <button class="tab" role="tab" data-tab="sr" aria-selected="false">Search</button>
     <button class="tab" role="tab" data-tab="keys" aria-selected="false">Keys <span id="idDot" class="dot" hidden></span></button>
   </div>
 
@@ -291,6 +292,44 @@
   </section>
 
   <!-- ============ Keys ============ -->
+  <!-- ============ Search ============ -->
+  <section id="tab-sr" class="grid" role="tabpanel" hidden>
+    <div class="card wide">
+      <header><h2>Search</h2><span class="muted small">Addendum A &middot; the index service's query API, read through the core's proxy at /playground/index/</span><button id="srRefresh" class="tiny" title="ask the index again which namespaces it follows">Refresh</button></header>
+      <div class="row">
+        <label for="srPick">Namespace</label>
+        <select id="srPick" class="mono" title="the namespaces the index follows (its /_status)"><option value="">&mdash;</option></select>
+        <input id="srNs" class="mono" list="srNsList" placeholder="demo" autocomplete="off" spellcheck="false" aria-label="namespace">
+        <datalist id="srNsList"></datalist>
+      </div>
+      <div class="row">
+        <label for="srQ">q</label>
+        <input id="srQ" class="mono" placeholder="words that all occur, a trailing * is a prefix, e.g. derby or cup*; empty lists the namespace" autocomplete="off" spellcheck="false">
+        <button id="srGo" class="primary">Search</button>
+      </div>
+      <details id="srMoreBox">
+        <summary class="muted small">Filters, sort, counts, page size</summary>
+        <div class="row"><label for="srSchema">schema</label><input id="srSchema" class="mono" placeholder="/r/schemas/match (exact $schema, or a prefix at a path segment)" autocomplete="off" spellcheck="false"></div>
+        <div class="row"><label for="srFilters">filters</label><textarea id="srFilters" class="mono" rows="3" placeholder="one per line: /league=allsvenskan &nbsp; /kickoff&gt;=2026-10-10 &nbsp; (or facet[/league]=cup, ge[/kickoff]=…)" spellcheck="false" style="flex:1 1 280px"></textarea></div>
+        <div class="row">
+          <label for="srSort">sort</label><input id="srSort" class="mono" placeholder="/kickoff,-/title" autocomplete="off" spellcheck="false">
+          <label for="srCounts">counts</label><input id="srCounts" class="mono" placeholder="/league" autocomplete="off" spellcheck="false">
+          <label for="srLimit">limit</label><input id="srLimit" class="mono" placeholder="20" autocomplete="off" spellcheck="false" style="flex:0 0 5em">
+        </div>
+      </details>
+      <div class="row"><label class="check"><input type="checkbox" id="srRyw"> wait for my last write (<code>min=</code>)</label><span id="srRywInfo"></span></div>
+      <div id="srStatus" class="muted">Search a namespace the index follows (the demo stack indexes <code>demo</code>: try <code>derby</code>).</div>
+    </div>
+
+    <div class="card wide">
+      <header><h2>Results</h2><span id="srMeta" class="muted small"></span></header>
+      <div id="srResults" class="muted">&mdash;</div>
+      <div id="srCountsOut"></div>
+      <div class="row"><button id="srMore" class="tiny" hidden>More results</button></div>
+      <p class="note">Resource names open in the Resource tab. Facet chips and counts add a filter. A hit is the document's head at the index's checkpoint; the index returns ids and indexed fields, not snippets. Sealed namespaces are decrypted here with the keys the Keys tab holds (&sect;E.2.6); end-to-end ones have no server index.</p>
+    </div>
+  </section>
+
   <section id="tab-keys" class="grid" role="tabpanel" hidden>
     <div class="card">
       <header><h2>Identity</h2><span class="muted small">X25519 key pair (&sect;E.2.3, &sect;E.3.2)</span></header>

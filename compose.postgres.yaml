@@ -41,6 +41,7 @@ services:
       - -master-key=/data/master.key
       - -master-key-create
       - -tree-url=http://tree:8082
+      - -index-url=http://index:8081
       - -purge-url=http://cdn:8080/
     depends_on:
       postgres:

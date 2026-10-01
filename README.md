@@ -123,6 +123,7 @@ search index, the tree service and the branch janitor, all behind a local CDN (V
 | http://localhost:8082/cat/roots | tree service (Addendum B): the catalog `cat`, a tree |
 | http://localhost:8082/topics/roots | the same service: the catalog `topics`, a DAG |
 | http://localhost:8080/playground/tree/cat/roots | the same, through the core's read-only proxy (`-tree-url`) |
+| http://localhost:8080/playground/index/demo?q=derby | the search index, through the core's read-only proxy (`-index-url`) |
 | http://localhost:9080, :9081, :9082 | the core, search and tree origins directly, bypassing the CDN |
 
 The seed creates `schemas`, `demo` (a few matches, with catalog roles), two catalogs of `demo`,
@@ -438,7 +439,7 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
 - With `*`, responses are the same for every origin and the CDN keeps one copy. With a list, the
   matching origin is echoed and every response says `Vary: Origin`, so the CDN keeps one copy per
   origin and never serves one origin's allowance to another.
-- The playground's tree proxy drops the tree service's own CORS headers; the core's apply.
+- The playground's tree and index proxies drop the services' own CORS headers; the core's apply.
 
 ### Playground
 
@@ -491,6 +492,22 @@ takes every other catalog. Without it, the
 Catalog tab reads the catalog's documents straight from the core API and says that computed
 listings need the tree service. Sealed listings (§E.2.6), whole or per entry, are decrypted when
 keys are at hand and shown by name otherwise.
+
+The **Search** tab does the same for the search index (Addendum A): `serve -index-url
+http://index:8081` mounts the same kind of read-only proxy (`GET`/`HEAD` only, `Authorization`
+forwarded, cookies and the service's CORS headers dropped, redirects rewritten under the prefix,
+`502` while unreachable) at `/playground/index/`. One index serves several namespaces, so there is
+one URL; it waits up to two minutes for an answer, since a `?min=` query waits for the index to
+catch up. The tab picks a namespace (the ones the index's `/_status` lists, or any name), takes `q`
+and, under "Filters", the `schema`, facet and range filters (`/league=cup`, `/kickoff>=2026-10-10`,
+or the raw `facet[/league]=cup`), `sort`, `counts` and `limit`, and shows each hit's resource,
+`$schema`, score, facets and revision, with the checkpoint (`at`) the index redirected the query to
+(the browser follows that redirect through the proxy). A resource name opens in the Resource tab;
+a facet chip or count adds a filter; "More results" follows `next`. "Wait for my last write" sends
+`min=` with the `X-Namespace-Revision` of the last write the page made to that namespace, so the
+results include it (§A.5). Sealed results (§E.2.6), whole or per hit, are decrypted with the keys the
+playground holds; an end-to-end namespace has no server index, and the tab says so. Without
+`-index-url` it says that search needs the index service.
 
 Run it with `./patchlog serve -dev` and open `http://localhost:8080/playground/`. Sealed and e2e
 namespaces need `-master-key FILE -master-key-create`.
