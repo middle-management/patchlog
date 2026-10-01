@@ -494,7 +494,7 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	body, err := readJSON(r, s.e.Limits().PatchSetSize*4)
+	body, err := readJSON(r, max(s.e.Limits().PatchSetSize, s.e.Limits().DocumentSize)*4)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -743,7 +743,7 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	body, err := readJSON(r, s.e.Limits().PatchSetSize*4)
+	body, err := readJSON(r, max(s.e.Limits().PatchSetSize, s.e.Limits().DocumentSize)*4)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -782,7 +782,7 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	body, err := readJSON(r, s.e.Limits().PatchSetSize*4)
+	body, err := readJSON(r, max(s.e.Limits().PatchSetSize, s.e.Limits().DocumentSize)*4)
 	if err != nil {
 		writeErr(w, err)
 		return

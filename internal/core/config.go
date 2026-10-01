@@ -19,6 +19,8 @@ type Limits struct {
 	PatchSetSize         int
 	OpsPerSet            int
 	DocumentSize         int
+	ValueSize            int
+	PathSize             int
 	NestingDepth         int
 	RulesPerNS           int
 	RulesPerGrant        int
@@ -34,6 +36,7 @@ type Limits struct {
 	RetryWindow          time.Duration
 	RetryWindowMin       time.Duration // deployment only
 	KeepPerResource      int
+	BlobsPerDocument     int
 	RemoteRegistration   time.Duration
 }
 
@@ -46,6 +49,8 @@ func DefaultLimits() Limits {
 		PatchSetSize:         256 << 10,
 		OpsPerSet:            1000,
 		DocumentSize:         4 << 20,
+		ValueSize:            64 << 10,
+		PathSize:             2 << 10,
 		NestingDepth:         64,
 		RulesPerNS:           256,
 		RulesPerGrant:        32,
@@ -61,6 +66,7 @@ func DefaultLimits() Limits {
 		RetryWindow:          5 * time.Minute,
 		RetryWindowMin:       5 * time.Minute,
 		KeepPerResource:      100,
+		BlobsPerDocument:     1000,
 		RemoteRegistration:   30 * 24 * time.Hour,
 	}
 }
@@ -72,6 +78,8 @@ var limitFields = map[string]func(*Limits) *int{
 	"patchSetSize":         func(l *Limits) *int { return &l.PatchSetSize },
 	"opsPerSet":            func(l *Limits) *int { return &l.OpsPerSet },
 	"documentSize":         func(l *Limits) *int { return &l.DocumentSize },
+	"valueSize":            func(l *Limits) *int { return &l.ValueSize },
+	"pathSize":             func(l *Limits) *int { return &l.PathSize },
 	"nestingDepth":         func(l *Limits) *int { return &l.NestingDepth },
 	"rulesPerNamespace":    func(l *Limits) *int { return &l.RulesPerNS },
 	"rulesPerGrant":        func(l *Limits) *int { return &l.RulesPerGrant },
@@ -80,6 +88,7 @@ var limitFields = map[string]func(*Limits) *int{
 	"batchSize":            func(l *Limits) *int { return &l.BatchSize },
 	"branchesPerNamespace": func(l *Limits) *int { return &l.BranchesPerNamespace },
 	"keepPerResource":      func(l *Limits) *int { return &l.KeepPerResource },
+	"blobsPerDocument":     func(l *Limits) *int { return &l.BlobsPerDocument },
 }
 
 // deploymentOnlyLimits are limits of §6.6 that only a deployment sets.
@@ -129,6 +138,8 @@ type Allowance struct {
 	Rate          Rate // the allowance's "bucket"
 	ItemsPerBatch int
 	BatchSize     int
+	// Until is when the allowance ends (§6.6); zero if it doesn't.
+	Until time.Time
 }
 
 // MergeAuthor is one entry of merge.authors (§F.3).
@@ -418,6 +429,12 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 		}
 	}
 	if c.level == levelE2E {
+		// Sealing grows a patch set by half, and it carries the declared
+		// blob list (§6.6, Values).
+		l := c.Limits
+		if 3*(l.ValueSize+l.PathSize)+(1<<10)+36*l.BlobsPerDocument > l.PatchSetSize {
+			return nil, &limitError{"an e2e namespace needs 3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize (§6.6)"}
+		}
 		for i, r := range c.Retention {
 			if r.NoArchive {
 				return nil, fmt.Errorf(`/retention/%d/archive: "archive": false is not allowed in an e2e namespace, where pruning needs an archive (§8.6)`, i)
@@ -501,7 +518,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 
 // sizeFields are limits in bytes. A namespace document writes them as
 // integers (§6.6); ParseSize's "64 MiB" form is for deployment flags only.
-var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "grantSize": true, "batchSize": true}
+var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "valueSize": true, "pathSize": true, "grantSize": true, "batchSize": true}
 
 var sizeRe = regexp.MustCompile(`^(\d+)\s*(B|KiB|MiB|GiB)?$`)
 
@@ -577,6 +594,13 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, &limitError{fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize)}
 				}
 				a.BatchSize = n
+			case "until":
+				str, ok := x.(string)
+				u, err := time.Parse(time.RFC3339, str)
+				if !ok || err != nil {
+					return nil, fmt.Errorf("/allowances/%d/until must be an RFC 3339 time with an offset, e.g. 2026-12-31T23:59:59Z", i)
+				}
+				a.Until = u
 			default:
 				return nil, fmt.Errorf("/allowances/%d/%s is not a known field", i, k)
 			}
