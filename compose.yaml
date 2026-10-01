@@ -30,6 +30,10 @@ x-patchlog: &patchlog
   restart: unless-stopped
   volumes:
     - data:/data
+  environment:
+    # Browser pages on other origins (a demo app): e.g.
+    # PATCHLOG_CORS_ORIGINS=http://localhost:5173 docker compose up, or *.
+    PATCHLOG_CORS_ORIGINS: ${PATCHLOG_CORS_ORIGINS:-}
 
 services:
   patchlog:

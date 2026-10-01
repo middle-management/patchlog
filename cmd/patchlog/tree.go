@@ -76,6 +76,7 @@ func treeCmd(args []string) {
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
+	corsFlags := addCORSFlags(fs)
 	fs.Parse(args)
 
 	catalogs := splitCatalogs(cats)
@@ -146,7 +147,7 @@ func treeCmd(args []string) {
 	defer closePurger(purger) // after closer: its last purges are sent
 	defer closer()
 
-	srv := &http.Server{Addr: *addr, Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler), ReadHeaderTimeout: 10 * time.Second}
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatal(err)

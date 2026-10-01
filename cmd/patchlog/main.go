@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
@@ -25,6 +26,7 @@ import (
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/cdnpurge"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/cors"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -141,6 +143,7 @@ func serve(args []string) {
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
+	corsFlags := addCORSFlags(fs)
 	fs.Parse(args)
 	ev := edgeVerifier(*edgeSecret, *edgeHeader)
 	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
@@ -228,7 +231,7 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := &http.Server{Addr: *addr, Handler: handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy)), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("patchlog %s listening on %s (origin %s, dev=%v)", version, *addr, *origin, *dev)
 	if *pg {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
@@ -258,6 +261,39 @@ const (
 	edgeSecretUsage = "file holding the secret a grant-verifying edge sends in -edge-header (§9): private reads without it are refused (403 edge_required), verified ones get edge lifetimes. Unset: no verifying edge, and private responses are CDN-Cache-Control: no-store"
 	edgeHeaderUsage = "request header carrying -edge-secret"
 )
+
+// corsFlags are the -cors-* flags every server takes.
+type corsFlags struct {
+	origins     multi
+	credentials *bool
+	maxAge      *time.Duration
+}
+
+func addCORSFlags(fs *flag.FlagSet) *corsFlags {
+	c := &corsFlags{}
+	if v := os.Getenv("PATCHLOG_CORS_ORIGINS"); v != "" {
+		c.origins = multi{v}
+	}
+	fs.Var(&c.origins, "cors-origin", "origin browser pages may call from, e.g. https://app.example, or * for any (repeatable or comma-separated; default $PATCHLOG_CORS_ORIGINS; unset: no CORS)")
+	c.credentials = fs.Bool("cors-credentials", false, "send Access-Control-Allow-Credentials, for pages that send cookies (needs explicit -cors-origin values; grants travel in Authorization and don't need it)")
+	c.maxAge = fs.Duration("cors-max-age", 10*time.Minute, "how long browsers may cache a CORS preflight")
+	return c
+}
+
+// wrap adds CORS to h as the flags configure it, exiting on bad values.
+func (c *corsFlags) wrap(h http.Handler) http.Handler {
+	origins, err := cors.Parse(c.origins)
+	if err != nil {
+		log.Fatalf("-cors-origin: %v", err)
+	}
+	if *c.credentials && slices.Contains(origins, "*") {
+		log.Fatal("-cors-credentials needs explicit -cors-origin values, not *")
+	}
+	if len(origins) > 0 {
+		log.Printf("CORS: allowing %s", strings.Join(origins, ", "))
+	}
+	return cors.Wrap(h, cors.Config{Origins: origins, Credentials: *c.credentials, MaxAge: *c.maxAge})
+}
 
 // edgeVerifier returns the verifying edge of -edge-secret, or nil.
 func edgeVerifier(file, header string) *edge.Verifier {

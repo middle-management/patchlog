@@ -416,6 +416,30 @@ sealings' rows in `blob_epochs`, §E.2.2) stay in the database and decide which 
   (`file` is NULL) and are served, copied and collected from there; new bytes go to files. To
   move old bytes out, re-upload them, or leave them until they are collected.
 
+### CORS
+
+Browser pages on other origins (a demo app, a frontend on another port) can call `serve`, `index`
+and `tree` once those allow their origin. This is a deployment setting, not part of the spec:
+
+```sh
+./patchlog serve -cors-origin http://localhost:5173 -cors-origin https://demo.example
+PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
+```
+
+- Preflights (`OPTIONS` with `Access-Control-Request-Method`) are answered by the server. The
+  request headers the API reads are allowed (`Authorization`, `Content-Type`, `If-Match`,
+  `If-None-Match`, `Range`, `Signature`, `Source-Authorization`, `Blob-From`, `Blob-Nonce`,
+  `Last-Event-ID`), and the response headers it sets are exposed (`ETag`, `Location`,
+  `Retry-After`, `X-Namespace-Revision`, `X-Cursor`, …). `-cors-max-age` (default 10m) is how long
+  browsers cache a preflight.
+- Grants travel in `Authorization`, which a page sets itself, so cross-origin calls need no
+  cookies. `-cors-credentials` adds `Access-Control-Allow-Credentials` for pages that do send
+  them; it needs explicit origins.
+- With `*`, responses are the same for every origin and the CDN keeps one copy. With a list, the
+  matching origin is echoed and every response says `Vary: Origin`, so the CDN keeps one copy per
+  origin and never serves one origin's allowance to another.
+- The playground's tree proxy drops the tree service's own CORS headers; the core's apply.
+
 ### Playground
 
 `serve` also hosts a web playground at **`/playground/`** (turn it off with `-playground=false`).

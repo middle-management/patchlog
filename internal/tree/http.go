@@ -356,7 +356,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			w.Header().Set("Cache-Control", ccPrivatePtr)
 			w.Header().Set("CDN-Cache-Control", "no-store")
 			w.Header().Set("Surrogate-Control", "no-store")
-			w.Header().Set("Vary", "Authorization")
+			w.Header().Add("Vary", "Authorization")
 		}
 	}
 	mins, err := parseMins(vals["min"])

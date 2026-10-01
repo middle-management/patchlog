@@ -151,6 +151,13 @@ func newTreeReverseProxy(target string) (*httputil.ReverseProxy, error) {
 }
 
 func treeProxyHeaders(h http.Header) {
+	// The core's own CORS (-cors-origin) applies to proxied responses,
+	// not whatever the tree service answers with.
+	for k := range h {
+		if strings.HasPrefix(k, "Access-Control-") {
+			h.Del(k)
+		}
+	}
 	h.Set("Content-Security-Policy", "default-src 'none'; frame-ancestors 'none'; sandbox")
 	h.Set("X-Content-Type-Options", "nosniff")
 }

@@ -60,6 +60,7 @@ func indexCmd(args []string) {
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
+	corsFlags := addCORSFlags(fs)
 	fs.Parse(args)
 
 	var nss []string
@@ -117,7 +118,7 @@ func indexCmd(args []string) {
 		log.Printf("index: FTS5 is not available; text search uses LIKE")
 	}
 
-	srv := &http.Server{Addr: *addr, Handler: ix.Handler(), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(ix.Handler()), ReadHeaderTimeout: 10 * time.Second}
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatal(err)

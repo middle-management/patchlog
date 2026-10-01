@@ -258,7 +258,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			w.Header().Set("Cache-Control", ccPrivatePtr)
 			w.Header().Set("CDN-Cache-Control", "no-store")
 			w.Header().Set("Surrogate-Control", "no-store")
-			w.Header().Set("Vary", "Authorization")
+			w.Header().Add("Vary", "Authorization")
 		}
 	}
 	// The reader's URL space: public, or keyed by its subject set.

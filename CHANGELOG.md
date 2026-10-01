@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **CORS** for `serve`, `index` and `tree`, for demos and apps on other origins:
+  - `-cors-origin` (repeatable or comma-separated, or `*`) or `PATCHLOG_CORS_ORIGINS`.
+  - Preflights are answered by the server; the headers the API reads (`Authorization`, `If-Match`, `Blob-From`, …) are allowed and the ones it sets (`ETag`, `Location`, `X-Namespace-Revision`, …) exposed.
+  - With a list of origins, responses say `Vary: Origin`, so the CDN keeps one copy per origin; `*` keeps one for all.
+  - `-cors-credentials` for pages that send cookies (grants travel in `Authorization` and don't need it); `-cors-max-age`.
+  - The compose files pass `PATCHLOG_CORS_ORIGINS` through.
+
 ## v0.3.1
 
 Faster writes on both databases. On Postgres, writes to different resources of one namespace now run in parallel.
