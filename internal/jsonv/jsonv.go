@@ -434,6 +434,30 @@ func sortUTF16(keys []string) {
 }
 
 func lessUTF16(a, b string) bool {
+	// Most member names differ first at an ASCII byte, after a common
+	// prefix that decodes the same in both (an ASCII byte ends any
+	// sequence before it): their order is that byte's. Encoding both names
+	// at every comparison was most of the cost of canonicalising.
+	i := 0
+	for i < len(a) && i < len(b) && a[i] == b[i] {
+		i++
+	}
+	switch {
+	case i < len(a) && i < len(b):
+		if a[i] < utf8.RuneSelf && b[i] < utf8.RuneSelf {
+			return a[i] < b[i]
+		}
+	case i == len(a) && i == len(b):
+		return false
+	case i == len(a):
+		if b[i] < utf8.RuneSelf {
+			return true
+		}
+	default:
+		if a[i] < utf8.RuneSelf {
+			return false
+		}
+	}
 	ua, ub := utf16.Encode([]rune(a)), utf16.Encode([]rune(b))
 	for i := 0; i < len(ua) && i < len(ub); i++ {
 		if ua[i] != ub[i] {

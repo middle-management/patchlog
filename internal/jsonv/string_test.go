@@ -5,6 +5,7 @@ import (
 	"math/rand"
 	"strings"
 	"testing"
+	"unicode/utf16"
 )
 
 // refWriteString is the byte-by-byte writer the bulk one replaced.
@@ -70,6 +71,36 @@ func TestStringFastPaths(t *testing.T) {
 	for _, bad := range []string{"\"ab\x01\"", `"abc`, "\"ab\xff\"", `"\ud83d"`} {
 		if _, err := Parse([]byte(bad)); err == nil {
 			t.Errorf("%q parsed", bad)
+		}
+	}
+}
+
+// The ASCII fast path of lessUTF16 orders as encoding both names does, on
+// random names mixing ASCII, BMP runes above the surrogates, supplementary
+// runes and invalid bytes.
+func TestLessUTF16(t *testing.T) {
+	ref := func(a, b string) bool {
+		ua, ub := utf16.Encode([]rune(a)), utf16.Encode([]rune(b))
+		for i := 0; i < len(ua) && i < len(ub); i++ {
+			if ua[i] != ub[i] {
+				return ua[i] < ub[i]
+			}
+		}
+		return len(ua) < len(ub)
+	}
+	pieces := []string{"a", "b", "A", "z", "~", "é", "", "￿", "😀", "\xc3", "\xff"}
+	r := rand.New(rand.NewSource(2))
+	gen := func() string {
+		var sb strings.Builder
+		for k := r.Intn(5); k > 0; k-- {
+			sb.WriteString(pieces[r.Intn(len(pieces))])
+		}
+		return sb.String()
+	}
+	for n := 0; n < 20000; n++ {
+		a, b := gen(), gen()
+		if got, want := lessUTF16(a, b), ref(a, b); got != want {
+			t.Fatalf("lessUTF16(%q, %q) = %v, want %v", a, b, got, want)
 		}
 	}
 }

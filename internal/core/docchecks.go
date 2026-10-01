@@ -106,6 +106,9 @@ func checkBlobRefs(l Limits, doc any) *Error {
 			return nil
 		}
 	}
+	if !hasBlobMember(doc) {
+		return nil
+	}
 	distinct := map[string]bool{}
 	var bad *Error
 	var walk func(v any, ptr string)
@@ -126,7 +129,7 @@ func checkBlobRefs(l Limits, doc any) *Error {
 				return
 			}
 			for k, e := range x {
-				walk(e, ptr+"/"+strings.NewReplacer("~", "~0", "/", "~1").Replace(k))
+				walk(e, ptr+"/"+ptrEscaper.Replace(k))
 			}
 		}
 	}
@@ -138,6 +141,33 @@ func checkBlobRefs(l Limits, doc any) *Error {
 		return limitErr(422, fmt.Sprintf("more than %d blobs referenced", l.BlobsPerDocument))
 	}
 	return nil
+}
+
+// ptrEscaper escapes a member name as a JSON Pointer token.
+var ptrEscaper = strings.NewReplacer("~", "~0", "/", "~1")
+
+// hasBlobMember reports whether any object of a document has a $blob
+// member: most documents have none, and are then not walked again with
+// the pointers of their members (checkBlobRefs, blobRefsOf).
+func hasBlobMember(v any) bool {
+	switch x := v.(type) {
+	case []any:
+		for _, e := range x {
+			if hasBlobMember(e) {
+				return true
+			}
+		}
+	case map[string]any:
+		if _, ok := x["$blob"]; ok {
+			return true
+		}
+		for _, e := range x {
+			if hasBlobMember(e) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func checkBlobRef(m map[string]any, id, ptr string) *Error {

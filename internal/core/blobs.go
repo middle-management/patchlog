@@ -194,6 +194,9 @@ func blobRefsOf(doc any) []blobRef {
 			return nil
 		}
 	}
+	if !hasBlobMember(doc) {
+		return nil
+	}
 	var out []blobRef
 	var walk func(v any, ptr string)
 	walk = func(v any, ptr string) {
@@ -222,7 +225,7 @@ func blobRefsOf(doc any) []blobRef {
 			}
 			sort.Strings(keys)
 			for _, k := range keys {
-				walk(x[k], ptr+"/"+strings.NewReplacer("~", "~0", "/", "~1").Replace(k))
+				walk(x[k], ptr+"/"+ptrEscaper.Replace(k))
 			}
 		}
 	}
