@@ -21,6 +21,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
+| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines) | §7.8 | ✅ (bytes in a table, encrypted per resource at rest; sealed and e2e specifics to come) |
 | Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only with `-edge-secret`) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
@@ -49,6 +50,12 @@ and serves immutable, CDN-cacheable revisions.
   remote branches of a base that is itself a remote branch (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
+- **Blob gaps** (§7.8): sealed namespaces answer `501` for blobs instead of the sealed form
+  per epoch (§E.2.2); e2e writes don't check or attach the blobs their sealed ops declare
+  (§E.3.1); bundles' blob lines are written by pruning archives only (export and import don't
+  carry blobs yet, and restoring an archive doesn't bring back pruned attachments); remote
+  branches can't reference or serve their remote base's blobs (§G.3). Bytes live in a
+  `blob_bytes` table rather than in object storage (D.2, D.8).
 - CDN edge grants (§C.5): no edge grants are issued, and the origin checks grants itself on
   every read. Both §9 deployments are supported: behind a grant-verifying edge
   (`-edge-secret`) private content gets edge lifetimes, otherwise it is `no-store` for shared
@@ -912,15 +919,17 @@ just doesn't apply).
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`, `rulesPerNamespace`,
   `rulesPerGrant`, `grantSize`, `itemsPerBatch`, `batchSize`, `branchesPerNamespace`,
-  `keepPerResource`, `blobsPerDocument` (integers, sizes in bytes, lower only), `ratePerResource`,
-  `ratePerPrincipal`, `ratePerNamespace` (`{ rate, burst }`), `retryWindow` and
-  `remoteRegistration` (ISO 8601 durations). Sizes written with units (`"64 MiB"`), unknown or
+  `keepPerResource`, `blobsPerDocument`, `blobSize`, `blobPending` (integers, sizes in bytes,
+  lower only), `ratePerResource`, `ratePerPrincipal`, `ratePerNamespace`, `blobRate`
+  (`{ rate, burst }`, `blobRate` in bytes), `retryWindow`, `remoteRegistration` and `blobGrace`
+  (ISO 8601 durations; `blobGrace` at least `retryWindow`). Sizes written with units (`"64 MiB"`), unknown or
   v0.20 names (`liveBranches`, `remoteBranchLife`) and the deployment-only `logPageSize` and
   `branchDepth` are `422`. Creates, and restores from scratch, may be as large as
   `documentSize`; `valueSize` and `pathSize` bound strings and pointers, and an e2e namespace
   needs `3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize`.
-  `$blob` objects must be well-formed (`422`, `code: "blob"`); blob availability is not
-  checked yet.
+  `$blob` objects must be well-formed and name available blobs that match their type, size
+  and nonce (`422`, `code: "blob"`). Allowances may also set `blobRate` and `blobPending`; the
+  deployment maximums are set with `serve -max-blob-size` and `-max-blob-pending`.
 - **Batch limits after authentication** (§7.5): the server authenticates a batch before
   reading its body, and stops reading at the principal's `batchSize` (its allowance's, if any,
   plus room for the batch's own JSON) with `413`. Item counts and the patch-set total are

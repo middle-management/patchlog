@@ -120,7 +120,20 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 		return nil, false
 	}
 	for _, s := range p.st {
-		if !sameView(s.view, t.resolve(target, s.Resource, nil)) {
+		v := t.resolve(target, s.Resource, nil)
+		if !sameView(s.view, v) {
+			return nil, false
+		}
+		// The same head, but the resource row may have appeared since (a
+		// pending blob's, blobs.go).
+		s.view = v
+	}
+	// Every blob a step references is still available: attached, pending
+	// for the writer, or readable through a base or the batch's source
+	// (D.2). This also records where step 7 takes each from.
+	bs := blobSourceOf(p.req, p.source, p.isBatch)
+	for _, s := range p.st {
+		if t.checkBlobs(target, s, p.a, bs) != nil {
 			return nil, false
 		}
 	}

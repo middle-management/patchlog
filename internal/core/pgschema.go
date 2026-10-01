@@ -168,6 +168,50 @@ CREATE TABLE IF NOT EXISTS ns_config (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_config_genesis ON ns_config (ns) WHERE parent_seq IS NULL;
 
+CREATE TABLE IF NOT EXISTS blobs (
+  res      bigint   NOT NULL REFERENCES resources,
+  bid      bytea    NOT NULL CHECK (octet_length(bid) = 20),
+  type     text     NOT NULL,
+  nonce    text,
+  size     bigint   NOT NULL,
+  hash     bytea    NOT NULL,
+  owner    bigint   NOT NULL,
+  created  bigint   NOT NULL,
+  ref_seq  bigint   NOT NULL REFERENCES revisions,
+  pruned   smallint NOT NULL DEFAULT 0,
+  PRIMARY KEY (res, bid)
+);
+CREATE INDEX IF NOT EXISTS blobs_bytes ON blobs (owner, hash);
+CREATE TABLE IF NOT EXISTS blob_pending (
+  res      bigint NOT NULL REFERENCES resources,
+  bid      bytea  NOT NULL CHECK (octet_length(bid) = 20),
+  uploader text   NOT NULL,
+  type     text   NOT NULL,
+  nonce    text,
+  size     bigint NOT NULL,
+  hash     bytea  NOT NULL,
+  owner    bigint NOT NULL,
+  created  bigint NOT NULL,
+  PRIMARY KEY (res, bid, uploader)
+);
+CREATE INDEX IF NOT EXISTS blob_pending_bytes ON blob_pending (owner, hash);
+CREATE INDEX IF NOT EXISTS blob_pending_created ON blob_pending (created);
+CREATE TABLE IF NOT EXISTS blob_refs (
+  res      bigint NOT NULL REFERENCES resources,
+  bid      bytea  NOT NULL,
+  from_seq bigint NOT NULL,
+  to_seq   bigint,
+  PRIMARY KEY (res, bid, from_seq)
+);
+-- Blob bytes as bytea (D.8 prefers object storage; blobs.go). Values are
+-- at most blobSize, far below bytea's 1 GB.
+CREATE TABLE IF NOT EXISTS blob_bytes (
+  owner    bigint NOT NULL,
+  hash     bytea  NOT NULL,
+  data     bytea  NOT NULL,
+  UNIQUE (owner, hash)
+);
+
 CREATE TABLE IF NOT EXISTS remote_branches (
   ns         bigint NOT NULL REFERENCES namespaces,
   origin     text   NOT NULL,

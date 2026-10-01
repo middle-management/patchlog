@@ -175,6 +175,59 @@ CREATE TABLE IF NOT EXISTS ns_config (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_config_genesis ON ns_config (ns) WHERE parent_seq IS NULL;
 
+-- Blobs (§7.8, D.2). Attachments: one row per resource and blob, pruned
+-- once pruning ended it (410). owner is an addition: the blob_bytes row
+-- holding the bytes (0 for plaintext shared by every resource, else the
+-- resource whose data key encrypts them, blobs.go).
+CREATE TABLE IF NOT EXISTS blobs (
+  res      INTEGER NOT NULL REFERENCES resources,
+  bid      BLOB    NOT NULL,
+  type     TEXT    NOT NULL,
+  nonce    TEXT,
+  size     INTEGER NOT NULL,
+  hash     BLOB    NOT NULL,                -- sha256 of the bytes
+  owner    INTEGER NOT NULL,
+  created  INTEGER NOT NULL,
+  ref_seq  INTEGER NOT NULL REFERENCES revisions,  -- first revision here that references it
+  pruned   INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (res, bid)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS blobs_bytes ON blobs (owner, hash);
+-- One row per resource, blob and uploader (root sub and kid, §7.8).
+CREATE TABLE IF NOT EXISTS blob_pending (
+  res      INTEGER NOT NULL REFERENCES resources,
+  bid      BLOB    NOT NULL,
+  uploader TEXT    NOT NULL,
+  type     TEXT    NOT NULL,
+  nonce    TEXT,
+  size     INTEGER NOT NULL,
+  hash     BLOB    NOT NULL,
+  owner    INTEGER NOT NULL,
+  created  INTEGER NOT NULL,
+  PRIMARY KEY (res, bid, uploader)
+) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS blob_pending_bytes ON blob_pending (owner, hash);
+CREATE INDEX IF NOT EXISTS blob_pending_created ON blob_pending (created);
+-- Addition: which revisions reference which blob (§5), as intervals of the
+-- resource's chain: the documents at revisions from_seq up to (excluding)
+-- to_seq reference bid; to_seq is NULL while the head's document does.
+CREATE TABLE IF NOT EXISTS blob_refs (
+  res      INTEGER NOT NULL REFERENCES resources,
+  bid      BLOB    NOT NULL,
+  from_seq INTEGER NOT NULL,
+  to_seq   INTEGER,
+  PRIMARY KEY (res, bid, from_seq)
+) WITHOUT ROWID;
+-- Addition: blob bytes, by owner and sha256 (D.2 keeps them outside the
+-- database; see blobs.go). Encrypted under the owner's data key when owner
+-- is a resource.
+CREATE TABLE IF NOT EXISTS blob_bytes (
+  owner    INTEGER NOT NULL,
+  hash     BLOB    NOT NULL,
+  data     BLOB    NOT NULL,
+  UNIQUE (owner, hash)
+);
+
 -- Addition: remote branches registered with this deployment (§G.3, source
 -- side). One row per (base namespace, remote); ns_seq is the latest remote
 -- branch entry, prev_seq the one before it (idempotent retries).
