@@ -233,6 +233,9 @@ func Encode(ctx context.Context, w io.Writer, b *core.ArchiveBundle) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if e.Blob != nil {
+			return bw.Line(bundle.Line{NS: b.NS, Resource: b.Name, Blob: e.Blob.ID, Type: e.Blob.Type, Nonce: e.Blob.Nonce, Data: e.Blob.Data})
+		}
 		return bw.Line(bundle.Line{NS: b.NS, Resource: b.Name, ID: e.ID, Parent: e.Parent, Kind: e.Kind,
 			Patches: e.Patches, Author: e.Author, Created: e.Created, Signature: e.Signature})
 	})
@@ -363,6 +366,12 @@ func readArchive(ctx context.Context, e *core.Engine, o Opener, u, ns, name stri
 		}
 		if err != nil {
 			return err
+		}
+		if l.IsBlob() && l.NS == ns && l.Resource == name {
+			// TODO(blobs-tooling): restoring archived history doesn't bring
+			// back attachments pruning ended (§D.4); their blob lines are
+			// verified and skipped.
+			continue
 		}
 		if l.IsSnapshot() || l.NS != ns || l.Resource != name {
 			return fmt.Errorf("line for %s is not a history line of %s/%s", l.Key(), ns, name)
