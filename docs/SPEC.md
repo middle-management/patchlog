@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.31 · 2026-10-01. See the change log at the end.
+Status: draft v0.32 · 2026-10-01. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -568,11 +568,11 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 "allowances": [ { "sub": "svc:importer", "kid": "ops-2026",
                   "bucket": { "rate": 100, "burst": 20000 },   // writes per second, and bucket size
                   "itemsPerBatch": 20000, "batchSize": 67108864,      // 64 MiB, in bytes as in `limits`
-                  "blobRate": { "rate": 67108864, "burst": 1073741824 }, "blobPending": 17179869184,
+                  "blobRate": { "rate": 67108864, "burst": 1073741824 }, "blobPending": 17179869184,   // above the defaults
                   "until": "2026-10-08T00:00:00Z" } ]
 ```
 
-  - That principal's writes draw on the allowance's own bucket instead of the principal and namespace buckets (an allowance also replaces a key scope's lower `rate`), and its batches may be as large as the allowance says, up to the deployment maximums. Per-resource buckets still apply. Uploads (§7.8) draw on the allowance's bucket too, and an allowance may also set `blobRate` and `blobPending` for that principal.
+  - That principal's writes draw on the allowance's own bucket instead of the principal and namespace buckets (an allowance also replaces a key scope's lower `rate`), and its batches may be as large as the allowance says, up to the deployment maximums. Per-resource buckets still apply. Uploads (§7.8) draw on the allowance's bucket too, and an allowance may also set `blobRate` and `blobPending` for that principal. Allowances never exceed the deployment maximums, so a deployment that expects large imports raises those, as the example needs.
 
   - `until` (optional) is an absolute RFC 3339 time. The allowance applies only while `now` (§6.4.1) is before it, and is ignored afterwards until an administrator removes it. Allowances for an import or a release should set one, so a forgotten entry doesn't leave a principal with a large budget.
 
@@ -611,7 +611,7 @@ Requests to private namespaces follow Addendum C. Without `read`, a resource tha
 | same, purged | `410` | long |
 | same, below the horizon, without a kept document (§8.6) | `410` with `{ "code": "pruned", "horizon": id, "archive"?: url }` | pruned |
 | `GET /r/{ns}/{name}/blob/{bid}` | `200` with the blob, `206` for a range; `404` if pending or unknown, `410` if pruned or purged (§7.8). In sealed namespaces, `302` to `…/blob/{bid}/e/{e}` (§E.2.2) | immutable (a `410` as pruned or long, the `302` as a head pointer) |
-| `GET /r/{ns}/{name}/blob/{bid}/e/{e}` | sealed namespaces only: `200` with the blob sealed under epoch `e`, `206` for a range; `404` for an epoch it isn't served under (§E.2.2) | immutable |
+| `GET /r/{ns}/{name}/blob/{bid}/e/{e}` | sealed namespaces only: `200` with the blob sealed under epoch `e`, `206` for a range of the sealed bytes; `404` for an epoch it isn't served under (§E.2.2) | immutable |
 | `GET /r/{ns}/{name}/rev/{id}/log?since={a}` | `200` with the entries after `a` (exclusive) up to `id` (inclusive). Omitting `since` means from genesis. `404` if `a` is not an ancestor of `id`. `410` naming the horizon if any revision after `a`, up to `id`, lies below the horizon, its patch set pruned. `a` itself may lie below it | immutable (a `410` is cached as pruned) |
 
 Log entry shape (patches in canonical form):
@@ -634,7 +634,7 @@ Writes are **never** unconditional: a write without a precondition is `428`. The
 | **Restore:** `PATCH` on a tombstoned resource | `If-Match: "{tombstone}"` | `201`. The patches apply to the last live document; `[]` restores it unchanged | as for append |
 | **Delete:** `DELETE /r/{ns}/{name}` | `If-Match: "{head}"` | `200` + `{ tombstone }` | `412` + `{ head }` · `410` if already tombstoned |
 | **Purge:** `POST /r/{ns}/{name}/purge` | `If-Match: "{head or tombstone}"` | `204` | `412` · `409 in_use` (§6.1) |
-| **Upload a blob:** `PUT /r/{ns}/{name}/blob/{bid}` (§7.8) | none | `201` with `ETag: "{bid}"` | in the order of §7.8: `401`/`403` · `429` · `410` if purged · `409 frozen` · for a copy, `422 blob` then `404` · `400`/`415` · `413` · `422 blob_mismatch` |
+| **Upload a blob:** `PUT /r/{ns}/{name}/blob/{bid}` (§7.8) | none | `201` with `ETag: "{bid}"` | in the order of §7.8: `401`/`403` · `429` · `410` if the resource or namespace is purged · `409 frozen` · for a copy, `400`, `422 blob`, then `404` · `400`/`415` · `413` · `422 blob_mismatch` |
 
 -
 **Authorization:** `Authorization: Bearer <grant>` (Addendum C). With authentication disabled (development only), `X-Author` names the author.
@@ -759,13 +759,13 @@ Resource purge is never part of a batch.
 **Failure.** Nothing is written. The status is that of the earliest failing step of §6.2, and the body is `{ "code": "batch", "items": [{ "index", "status", "code", … }] }` for the items that failed at that step. If any item fails authorisation, only those items are reported.
 
 -
-**Dry run.** `?dry-run=1` runs steps 1–6 for every item and writes nothing. It returns `200` with the report for every item, including the ids a submit would produce. Authorisation still comes first: if any item fails step 1, the dry run answers exactly as a submit would (`401` or `403`, reporting only those items), so it never reveals a precondition before authorisation (§6.2). The result may differ by the time the batch is submitted.
+**Dry run.** `?dry-run=1` runs steps 1–6 for every item and writes nothing. A blob that isn't available is reported, and the later steps run as if it were, so a dry run isn't cut short by blobs not yet uploaded. It returns `200` with the report for every item, including the ids a submit would produce. Authorisation still comes first: if any item fails step 1, the dry run answers exactly as a submit would (`401` or `403`, reporting only those items), so it never reveals a precondition before authorisation (§6.2). The result may differ by the time the batch is submitted.
 
 -
 **Idempotent retry.** If one earlier `batch` entry by the same principal already contains exactly the entries this batch would produce, and every item's recorded verb is one of its candidate verbs (§6.2), the response is `200` with that batch, as in §7.2.
 
 -
-**`source`** is recorded in the batch entry. For a local source, the server checks that `source.at` is in the chain of `source.ns` (`422` otherwise). A source in another deployment carries `origin` and is recorded without checks (§G.3, §G.4.4). An `origin` equal to this deployment's own is `422`. Either way, that the items correspond to the source is asserted by the writer, not verified.
+**`source`** is recorded in the batch entry. For a local source, and a caller with unrestricted `read` on `source.ns` (as branch creation requires, §7.6; with the grant in `Source-Authorization`, if given, §7.8), the server checks that `source.at` is in the chain of `source.ns` (`422`, `code: "source"`), at step 4 of §6.2, before blob references, which may depend on it. For any other caller the source is recorded unchecked and makes no blobs available, so the check reveals nothing about a namespace the caller can't read. A source in another deployment carries `origin` and is recorded without checks (§G.3, §G.4.4). An `origin` equal to this deployment's own is `422`. Either way, that the items correspond to the source is asserted by the writer, not verified.
 
 -
 **Scope.** A batch never spans namespaces, and there is no other way to change several namespaces atomically.
@@ -903,7 +903,7 @@ Large values, such as images, audio, PDFs or long texts, are stored as **blobs**
 -
 **Attachments.** A blob belongs to a resource in a namespace through an **attachment**:
 
-  - **Pending:** after an upload or a copy, until a revision references it. The **uploader** is the principal as rate limits know it: root `sub` and `kid` (§6.6). After a key rotation, a writer uploads its pending blobs again. A pending blob is invisible: reads answer `404`, and only its uploader can reference it. Each uploader has its own pending entry, even for bytes already stored, so one uploader learns nothing from another's. An entry counts toward its uploader's `blobPending`, at least 4 KiB per blob, and is deleted once it is older than `blobGrace`. Uploading it again restarts that time.
+  - **Pending:** after an upload or a copy, until a revision references it. The **uploader** is the principal as rate limits know it: root `sub` and `kid` (§6.6). After a key rotation, a writer uploads its pending blobs again. A pending blob is invisible: reads answer `404`, and only its uploader can reference it. Each uploader has its own pending entry, even for bytes already stored, so one uploader learns nothing from another's. An entry counts toward its uploader's `blobPending`, at least 4 KiB per blob, and is deleted once it is older than `blobGrace`. Uploading it again restarts that time. A write whose document references the blob ends every pending entry for it in that resource, whoever uploaded it, so uploading a blob that is already attached costs nothing once a write uses it.
 
   - **Attached:** at step 7 of §6.2, a write attaches every blob its resulting document references to its own resource, in the same transaction as the revision.
 
@@ -918,7 +918,7 @@ Large values, such as images, audio, PDFs or long texts, are stored as **blobs**
 
   - in a branch, attached to the same resource in a base and referenced by a document in the resource's history as the branch sees it (§7.6). The write attaches it to the branch's own resource, so the branch keeps it whatever the base prunes later.
 
-  - in a batch with a local `source` (§7.5), attached to the same resource in `source.ns` and referenced by a document in its history as of `source.at`, if the batch passes the read check for copies on the source (below). Any failure of that check makes the blob unavailable. The ranking for copies doesn't apply: the batch publishes the source's documents anyway, and its rules and the merger's grants decide whether it may. Merges and rebases therefore copy nothing (§F.3).
+  - in a batch with a local `source` whose `source.at` the server has checked (§7.5), attached to the same resource in `source.ns`, or in a base it reads through, and referenced by a document in that resource's history as `source.ns` sees it at `source.at` (§7.6). That check needs unrestricted `read` on the source, with the grant in `Source-Authorization` if the batch's own doesn't serve; a per-resource reader of the source copies instead (below). Anything less makes the blob unavailable. The ranking for copies doesn't apply: the batch publishes the source's documents anyway, and its rules and the merger's grants decide whether it may. Merges and rebases therefore copy nothing (§F.3).
 
 A reference to a blob that isn't available, or that doesn't match the blob's `type`, `size` or `nonce`, is `422` with `code: "blob"`, at step 4 of §6.2.
 
@@ -936,11 +936,11 @@ The checks run in this order:
 
   - **Authorisation**, at step 1 of §6.2, with `create`, `append` and `restore` as candidate verbs: the upload is allowed if the grant could write the resource with any of them. Then the rate limits (§6.6). Rules beyond step 1 never see an upload: a blob has no effect until a write references it, and that write passes the whole gate.
 
-  - A purged resource is `410`.
+  - A purged resource, or a purged namespace (§8.5), is `410`.
 
   - A frozen namespace is `409` (§8.4).
 
-  - A media type that can't be parsed, or a copy with a body, is `400`. In an E3 namespace, any type other than `application/vnd.patchlog.sealed-blob` is `415` (§E.3.1).
+  - A media type that can't be parsed is `400`. In an E3 namespace, any type other than `application/vnd.patchlog.sealed-blob` is `415` (§E.3.1).
 
   - A body larger than `blobSize`, or one that would take the uploader's pending blobs in the namespace past `blobPending`, is `413`.
 
@@ -950,7 +950,7 @@ The checks run in this order:
 
   - **Copying.** With an empty body and `Blob-From: /r/{ns2}/{name2}/blob/{bid}`, naming the same `bid`, the server copies a blob within the deployment instead of receiving it again:
 
-    - Checks 1–3 run first, for the target. A different `bid` is `422` (`code: "blob"`).
+    - Checks 1–3 run first, for the target. Then a request with a body, or a `Blob-From` that can't be parsed, is `400`, before any body is read, and a different `bid` is `422` (`code: "blob"`).
 
     - The source is then checked as a read of `/r/{ns2}/{name2}` (§C.2), against that namespace's keys, with the grant in `Source-Authorization: Bearer …`, or the request's own if there is none. A grant whose blocks name both namespaces, signed by a key they share (as a base and its branches do, §C.4), serves for both. Any failure of this check, including the `401` and `403` cases of §C.2, answers `404`.
 
@@ -1115,7 +1115,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
   - The archive is only as trustworthy as its storage. The kept ids let anyone check an archived revision against the live chain.
 
-  - In encrypted namespaces (Addendum E), archives hold patch sets as stored, under the keys that purge destroys. At E3 the server can't compute documents, so a key-holding client supplies `H`'s document as `snapshot`, sealed like a patch set (§E.3.1), and pruning needs an archive. Retention at E3 is therefore applied by a key-holding janitor, not by the server.
+  - In encrypted namespaces (Addendum E), archives hold patch sets as stored, under the keys that purge destroys. At E3 the server can't compute documents, so a key-holding client supplies `H`'s document as `snapshot` (or, when `H` is a tombstone, the last live document), sealed like a patch set (§E.3.1), and pruning needs an archive. The server already holds that document's declared blob list. Retention at E3 is therefore applied by a key-holding janitor, not by the server.
 
   - Restoring archived history into the live store is an operational task (§D.4).
 
@@ -1342,8 +1342,9 @@ A document should be split when it grows without bound (a log, a comment thread)
 | `precondition_required` | 428 | No `If-Match` / `If-None-Match` |
 | `rate` | 429 | A rate limit of §6.6 was exceeded; `Retry-After` is set |
 | `pruned` | 410 | The revision or log range lies below the horizon (§8.6) |
-| `blob` | 422 | A blob reference is malformed, names a blob that isn't available, or doesn't match it; or a copy names another id (§7.8) |
+| `blob` | 422 | A blob reference is malformed, names a blob that isn't available, or doesn't match it; a copy names another id (§7.8); or an E3 declared list has duplicates or a blob that isn't sealed (§E.3.1) |
 | `blob_mismatch` | 422 | An uploaded blob doesn't hash to its id (§7.8) |
+| `source` | 422 | A batch's local `source.at` isn't in the chain of `source.ns`, for a caller who may read it (§7.5) |
 
 ---
 
@@ -2333,17 +2334,24 @@ CREATE TABLE head_history (
   PRIMARY KEY (res, ns_seq)
 ) WITHOUT ROWID;
 
-CREATE TABLE blobs (
+CREATE TABLE blobs (                        -- attached blobs
   res      INTEGER NOT NULL REFERENCES resources,
   bid      BLOB    NOT NULL,                -- 20 bytes (§3.7)
   type     TEXT    NOT NULL,
   nonce    TEXT,
   size     INTEGER NOT NULL,
-  hash     BLOB    NOT NULL,                -- sha256 of the bytes: the key into blob storage
+  hash     BLOB    NOT NULL,                -- sha256 of the bytes
+  file     TEXT    NOT NULL,                -- this copy's own name in blob storage: hash plus a random suffix
   created  INTEGER NOT NULL,
-  ref_seq  INTEGER NOT NULL REFERENCES revisions,  -- first revision here that references it
   pruned   INTEGER NOT NULL DEFAULT 0,      -- 1 once pruning ended the attachment: answers 410
   PRIMARY KEY (res, bid)
+) WITHOUT ROWID;
+CREATE TABLE blob_refs (                    -- runs of revisions whose documents reference a blob
+  res      INTEGER NOT NULL REFERENCES resources,
+  bid      BLOB    NOT NULL,
+  from_seq INTEGER NOT NULL REFERENCES revisions,  -- first revision of the run
+  to_seq   INTEGER REFERENCES revisions,           -- first revision after it; NULL while the head references it
+  PRIMARY KEY (res, bid, from_seq)
 ) WITHOUT ROWID;
 CREATE TABLE blob_pending (                 -- one row per resource, blob and uploader
   res      INTEGER NOT NULL REFERENCES resources,
@@ -2353,6 +2361,7 @@ CREATE TABLE blob_pending (                 -- one row per resource, blob and up
   nonce    TEXT,
   size     INTEGER NOT NULL,
   hash     BLOB    NOT NULL,
+  file     TEXT    NOT NULL,
   created  INTEGER NOT NULL,
   PRIMARY KEY (res, bid, uploader)
 ) WITHOUT ROWID;
@@ -2373,23 +2382,23 @@ CREATE UNIQUE INDEX one_config_genesis ON ns_config (ns) WHERE parent_seq IS NUL
 
 - **`head_history`** answers read-through (§7.6) and `/heads` (§7.4): the head of a resource as of `at` is its latest row with `ns_seq ≤ base_at`.
 
-- **Blob bytes live outside SQLite**, in files or object storage named by `hash`. Large values in rows would bloat the WAL and the page cache.
+- **Blob bytes live outside SQLite**, as files in a blob directory or objects in a bucket. Large values in rows would bloat the WAL and the page cache. The database row decides which bytes exist; the store only holds them.
 
-  - Identical bytes in several resources MAY be stored once. Under per-resource E1 keys (§E.1), each resource's blobs are encrypted under its own key, so files are named by resource and `hash`.
+  - **One name per stored copy.** Each copy is stored under its own name, the `hash` plus a random suffix, recorded in its row, so a delete only ever removes its own file. Names by `hash` alone race: a cleanup commits the deletion of the last row, a concurrent upload of the same bytes writes the same file and inserts a new row, and the cleanup's delete after commit then removes the file the new row names. Storing identical bytes once is possible only if deletes are ordered with re-uploads of the same `hash`, e.g. by one lock on it held from writing the file until the row commits.
 
-  - Bytes are written under a temporary name and renamed when their row commits. They are deleted only by the transaction that removes, or marks pruned, the last row naming them, so a concurrent upload of the same bytes can't lose them. A row marked `pruned` no longer names its bytes.
+  - **Ordering.** A file is written durably before the transaction that adds its row commits: to a temporary name, `fsync`, rename, then `fsync` of the directory. A crash then leaves at most an orphan file. A file is deleted only after the commit that leaves its row gone, or marked pruned. A sweep removes files that no row names and that are older than a grace period longer than any transaction.
 
-  - Under per-resource keys, a row inserted for a blob taken from another resource (a base, a batch's `source` or a copy) copies and re-encrypts the bytes.
+  - **Encryption at rest.** Under per-resource E1 keys (§E.1), each copy is encrypted under its resource's key, and a row inserted for a blob taken from another resource (a base, a batch's `source` or a copy) gets its own re-encrypted copy, written before the write lock is taken.
 
-  - **Attaching** happens in the write transaction: D.3's re-check also confirms that every blob the write references is still attached, or still pending for the writer, and the commit inserts a `blobs` row unless one exists (a row marked `pruned` has its mark cleared and is reused), and deletes every `blob_pending` row for that blob, since an attached blob is available to every writer.
+  - **Attaching** happens in the write transaction: D.3's re-check also confirms that every blob the write references is still attached, or still pending for the writer. The commit opens a `blob_refs` run for each blob the new document starts to reference, closes the runs of those it stops referencing (a tombstone closes none, since the last live document stays stored), inserts a `blobs` row unless one exists (a row marked `pruned` has its mark cleared and is reused), and deletes every `blob_pending` row for the blobs it references.
 
-  - A background task deletes `blob_pending` rows past `blobGrace`, in a write transaction. The pruner marks `pruned` on the rows whose last referencing document it removed.
+  - A background task deletes `blob_pending` rows past `blobGrace`, in a write transaction. The pruner marks `pruned` on the rows none of whose runs still reaches a stored document.
 
-  - Branches read their bases' blobs through `blobs` rows of the same name whose `ref_seq` lies in their view.
+  - Branches and batch sources find blobs through runs that cover a revision in their view.
 
-  - In sealed namespaces, `blob_epochs (res, bid, e)` records each epoch a blob is served under (§E.2.2), written when a revision that references it is sealed under that epoch, and the stored sealing per epoch.
+  - In sealed namespaces, `sealings (ns, name, id, e, bytes)` holds each revision's stored sealing, whose first insert fixes its epoch. The epochs a blob is served under (§E.2.2) are worked out at read time from the sealings of the revisions that reference it. `blob_epochs (ns, name, bid, e, file)` has a row only for each sealed copy of a blob actually stored, as a file written in the order above, and its first insert decides which copy wins across instances. Both are keyed by name, so a branch can store sealings of read-through content without creating resource rows on a read.
 
-- **Rows are not shared between namespaces.** A branch that replays the same patch sets produces the same ids, but stores its own rows. Namespace purge (§8.5) therefore just clears `patches`, `heads`, `snapshots`, `blobs` and `blob_pending` for the namespace's resources.
+- **Rows are not shared between namespaces.** A branch that replays the same patch sets produces the same ids, but stores its own rows. Namespace purge (§8.5) therefore just clears `patches`, `heads`, `snapshots`, `blobs`, `blob_refs` and `blob_pending` for the namespace's resources, and `blob_epochs` for every name in it, read-through ones included. A resource purge clears its name's `blob_epochs` rows in every branch it reaches. Their files are deleted after the commit. Deleting a plaintext file is no secure erasure: only encryption at rest makes a purge final, since the purge destroys the per-resource keys (§E.1).
 
 ## D.3 Write path
 
@@ -2409,7 +2418,7 @@ CREATE UNIQUE INDEX one_config_genesis ON ns_config (ns) WHERE parent_seq IS NUL
 
   - one `ns_log` row, with `entries` and `source`
 
-- **Heavy work happens outside the lock.** Validation and rule evaluation never run inside the single SQLite write lock, and invariant 6 still holds.
+- **Heavy work happens outside the lock.** Validation and rule evaluation never run inside the single SQLite write lock, and invariant 6 still holds. Where the lock is per namespace (D.8), small writes MAY be checked inside it instead, which saves the separate check phase and its round trips at the cost of holding the lock a little longer. Keep large writes and batches outside.
 
 - **Constraint violations are handled explicitly:**
 
@@ -2429,7 +2438,7 @@ CREATE UNIQUE INDEX one_config_genesis ON ns_config (ns) WHERE parent_seq IS NUL
 **Pruning.** A pruned row keeps `id` and `parent_seq` and sets `patches` to NULL. The horizon's document, and any kept ones, go into a `snapshots (res, seq, doc)` table. `resources.horizon_seq` marks the horizon. A background pruner applies `retention`, writing the archive bundle before it drops anything.
 
 -
-**Restoring from an archive** is an offline task. Skip purged resources (§8.3). Re-insert each patch set whose recomputed id matches the kept row, then clear `horizon_seq`.
+**Restoring from an archive** is an offline task. Skip purged resources (§8.3). Re-insert each patch set whose recomputed id matches the kept row, then clear `horizon_seq`. Attachments that pruning ended come back at the same time, with their blobs from the archive, and the recorded `410` epochs (§E.2.2) are cleared.
 
 -
 **Rate limits** are in-memory token buckets per (resource, principal), principal and namespace, where the principal is the root `sub` and signing `kid`. With one process that is exact. Several processes would need a shared counter, or would split the limits between them.
@@ -2528,17 +2537,19 @@ For deployments that already run Postgres. The model is the one of D.2 and D.3; 
 
 - Branch creation locks the base, which receives the `branch` entry, then creates the branch.
 
-- Purge propagation (§8.3) locks the affected namespaces in ascending `ns` order, so concurrent propagations can't deadlock.
+- Purge propagation (§8.3) locks the affected namespaces in ascending lock-key order (below), so concurrent propagations can't deadlock.
 
-- **Other namespaces a write depends on** are locked too, in shared mode: the namespaces its `$schema` and `$ref` resolve into (§6.1), and, in a branch, every base whose keys and revocations it re-checks (§C.4). Config writes, purges and prunes take their namespace's lock exclusively. A schema purge or a base revocation therefore can't commit between a write's check and its insert.
+- **Other namespaces a write depends on** are locked too, in shared mode: the namespaces its `$schema` and its whole `$ref` closure resolve into (§6.1), and, in a branch, every base whose keys and revocations it re-checks (§C.4). Config writes, purges and prunes take their namespace's lock exclusively. A schema purge or a base revocation therefore can't commit between a write's check and its insert.
 
-- Locks are taken in ascending `ns` order, whatever their mode, so no two writers can deadlock.
+- Locks are taken in ascending lock-key order, whatever their mode, so no two writers can deadlock. Some writes find their locks as they go: a branch's bases, a `$ref` closure, a batch's `source`, the branches a purge reaches. One that needs a lock below one it holds tries it without waiting (`pg_try_advisory_xact_lock`, or `…_shared`), and if that fails, rolls back and restarts, taking in order every lock it has found so far. A key it holds shared and now needs exclusively counts as found late too. Each restart only grows the set, so the loop ends.
 
-- With those locks, `READ COMMITTED` is enough: every re-check reads after the locks are held.
+- Writes run in `READ COMMITTED`, which is enough with those locks provided every re-check reads after the locks are held: a namespace row read before taking its lock is read again. The check phase of D.3 and reads each use one snapshot (`REPEATABLE READ READ ONLY`), so they see one consistent state.
 
-- Use the two-argument form with a fixed class id, `pg_advisory_xact_lock(<class>, ns)`, so these locks never collide with other advisory locks in a shared database.
+- Use the two-argument form with a fixed class id, `pg_advisory_xact_lock(<class>, ns)`, so these locks never collide with other advisory locks in a shared database. Its arguments are 32-bit, so fold the `bigint` namespace id into an `int4`, e.g. its low 32 bits. Then the lock-key order is that of the folded keys, and each key is taken once, in the strongest mode any of its namespaces needs, or two namespaces with one key can deadlock. Alternatively use the one-argument `int8` form, with the class in the high 16 bits. Either way, retry a transaction that Postgres aborts with `40P01`.
 
-- **Exact bytes.** `patches`, `heads.doc`, snapshots and `ns_log.entries` are `text` holding canonical JSON, never `jsonb`, which reorders keys and normalises numbers. Ids must be served and re-hashed from exactly the stored bytes (§3.1).
+- **Rows shared by all namespaces,** such as authors, stored grants and namespace names, aren't covered by any namespace lock. Insert them with `ON CONFLICT DO NOTHING` and select them again. A unique violation on one of them retries the transaction (others mean what D.3 says).
+
+- **Exact bytes.** `patches`, `heads.doc`, snapshots and `ns_log.entries` are `text` holding canonical JSON, never `jsonb`, which reorders keys and normalises numbers. Ids must be served and re-hashed from exactly the stored bytes (§3.1). Anything that may be encrypted at rest (§E.1), such as patch sets, head and other snapshots and stored grants, is `bytea` instead, holding the canonical JSON or its encryption.
 
 - **Content apart from the skeleton.** Patch sets live in their own table, so purge and pruning are `DELETE`s rather than updates that leave dead rows in an append-heavy table:
 
@@ -2583,7 +2594,8 @@ CREATE TABLE patch_sets (seq bigint PRIMARY KEY REFERENCES revisions, patches te
 CREATE TABLE heads (res bigint PRIMARY KEY REFERENCES resources, doc text NOT NULL) WITH (fillfactor = 70);
 CREATE TABLE snapshots (res bigint NOT NULL REFERENCES resources, seq bigint NOT NULL REFERENCES revisions,
                         doc text NOT NULL, PRIMARY KEY (res, seq));
--- grants, ns_log, head_history and ns_config as in D.2, with bytea ids, bigint keys and timestamptz
+-- grants, ns_log, head_history and ns_config as in D.2, with bytea ids and bigint keys.
+-- Times may be timestamptz or, as in D.2, integer milliseconds.
 ```
 
 - `heads` is the only table updated in place, and holds only small documents (D.4). A value over about 2 KB is stored out of line (TOAST) and rewritten whole on every update, so larger documents are served by folding from `snapshots`. The lower `fillfactor` keeps the small updates on the same page (HOT updates), so they need little vacuuming.
@@ -2594,7 +2606,7 @@ CREATE TABLE snapshots (res bigint NOT NULL REFERENCES resources, seq bigint NOT
 
 - It reads new `ns_log` rows by sequence every 50–100 ms (`WHERE seq > $last ORDER BY seq`, an index range scan), and wakes the long-polls (§7.7) and SSE streams waiting on those namespaces. They then read their entries by id.
 
-- Sequence numbers are assigned before commit, so they can commit out of order, and a large batch can take a while to commit. So the tailer follows transaction ids, not sequence numbers, as a transactional outbox does: `ns_log` gains `xid xid8 NOT NULL DEFAULT pg_current_xact_id()` (indexed), and each poll reads `WHERE xid >= $from AND xid < pg_snapshot_xmin(pg_current_snapshot()) ORDER BY xid`, then advances `$from` to that `xmin`. Everything below `xmin` has committed or aborted, so no transaction, however long, is skipped. (These functions exist from Postgres 13.)
+- Sequence numbers are assigned before commit, so they can commit out of order, and a large batch can take a while to commit. So the tailer follows transaction ids, not sequence numbers, as a transactional outbox does: `ns_log` gains `xid xid8 NOT NULL DEFAULT pg_current_xact_id()` (indexed), and each poll reads `WHERE xid >= $from AND xid < pg_snapshot_xmin(pg_current_snapshot()) ORDER BY xid`, then advances `$from` to that `xmin`. Everything below `xmin` has committed or aborted, so no transaction, however long, is skipped. (These functions exist from Postgres 13.) The same `xmin` means a long transaction anywhere in the database holds back every tailer, so keep transactions short and set `idle_in_transaction_session_timeout`.
 
 - A wake-up is a hint, never data: waiters always re-read from their own `since`, so a late wake-up delays and never loses anything.
 
@@ -2602,9 +2614,21 @@ CREATE TABLE snapshots (res bigint NOT NULL REFERENCES resources, seq bigint NOT
 
 - Transaction-scoped advisory locks work through a transaction-pooling layer such as pgbouncer, so the write path needs no dedicated connections.
 
-- **Blobs.** Bytes go to object storage, as in D.2, not into `bytea` columns, which are limited to 1 GB and rewritten through TOAST. The `blobs` and `blob_pending` tables are as in D.2.
+- **Blobs.** Bytes go to a bucket, or to a shared filesystem that every instance mounts, named and ordered as D.2 gives, not into `bytea` columns, which are limited to 1 GB and rewritten through TOAST. The blob tables are as in D.2.
 
-- **Per-instance state.** The validator cache and a head cache keyed by head id are safe on every instance, since what they cache is immutable. Rate buckets (§6.6) are per instance and approximate, each instance enforcing its share of the limits, unless a shared counter is available, e.g. in Redis.
+- **Back up the database and the blob store together.** A database restored to an earlier point names files deleted since. So keep deleted files, or the bucket's object versions, for as long as point-in-time recovery reaches back, and let the orphan sweep and deletes after commit remove a file only once it is older than that window. A purge's plaintext files are then gone only after the window; with encryption at rest, the destroyed key ends them at once (§E.1).
+
+- **Per-instance caches.** A cache keyed by id holds content that never changes, but what a read of an id may return does: purge, pruning, namespace purge, key destruction and a switch to private all change it. So does a switch to sealed, and a restore from an archive. Every commit that does any of these increments a one-row generation counter, which the tailer reads on each poll:
+
+- An instance serves from its caches only while its last successful poll started within a bound, such as three poll intervals, and empties them when the counter moves. Such commits are rare, so the counter is no hot spot, and emptying is cheap.
+
+- A read notes the counter before it takes its snapshot, and fills the cache only if the counter is still the same afterwards, so a read that began before a purge can't put purged content back.
+
+- A stale instance, or a lagging replica (below), may still answer the CDN for a moment, which would put purged content back at the edge for a year. So each CDN tag purge (§8.3) is sent again by a durable background job, keyed on the purge's namespace entry, once that bound, the longest replica lag allowed and a hard response deadline have all passed. Compiled validators need none of this: a write re-checks its schemas under their shared locks.
+
+- **Background jobs** (retention and pruning, epoch rotation, the blob sweep, following remote bases) run once per deployment. A session-level advisory lock in a class of its own elects the instance that runs them, and another takes over if that session ends. It needs a dedicated connection that bypasses any transaction-pooling layer, and the leader checks that it still holds the lock before each step of a job, so a leader that lost its session stops. Job steps are idempotent, since a step may still be under way when that happens.
+
+- **Rate buckets** (§6.6) are per instance and approximate, each instance enforcing its share of the limits, unless a shared counter is available, e.g. in Redis.
 
 - **Replicas.** The CDN is the read tier, so replicas matter little. Serve head pointers from the primary, or from a replica that has replayed at least the revision a client presents (`X-Namespace-Revision`, §7.2). Immutable reads may use any replica. One that doesn't have the id yet asks the primary instead of answering `404`, because a cached `404` would hide a revision that exists.
 
@@ -2729,9 +2753,9 @@ plaintext = size ‖ bytes ‖ padding
 
 - **At E2** the header is `{ "enc": "A256GCM", "kid": "{ns}#{e}", "pl": { "ns", "name", "blob": bid } }`, and the key is the one the resource's revisions of epoch `e` are sealed under (§E.2.1), so per-resource readers can open it.
 
-- **Epochs.** A blob outlives epochs, and a reader may hold only some of them. In a sealed namespace, `…/blob/{bid}` therefore answers `302` (head-pointer caching) to `…/blob/{bid}/e/{e}`, and a reader that holds only older epochs asks for one of those it holds. The epochs served are exactly those under which this namespace serves a revision whose document references the blob, so a reader can open a blob under precisely the epochs in which it can read a document that references it. Others are `404`, sent with `no-store`, since a branch may come to serve a read-through revision under a new epoch. An epoch whose referencing revisions were all pruned answers `410` as in §7.1. `…/blob/{bid}` redirects to the latest served epoch. Each epoch's sealing is produced once and stored, the first one stored winning when two instances seal at once, and only the stored bytes are served, unchanged, with `ETag: "{bid}.{e}"`. Its `Content-Type` is the sealed type: the blob's own type is in its reference.
+- **Epochs.** A blob outlives epochs, and a reader may hold only some of them. In a sealed namespace, `…/blob/{bid}` therefore answers `302` (head-pointer caching) to `…/blob/{bid}/e/{e}`, and a reader that holds only older epochs asks for one of those it holds. The epochs served are the epochs of the revisions here whose documents are still stored and reference the blob. A revision's epoch is fixed by its first stored sealing, the first one stored winning as for blobs: when it is written, or, for one read through from a base or written before the namespace was sealed, when it is first served (§E.2.5). A request for a blob none of whose referencing revisions has an epoch yet fixes the newest of them under the current epoch first. So a reader can open a blob under precisely the epochs in which it can read a document that references it. Others are `404`, sent with `no-store`, since a branch may come to serve a read-through revision under a new epoch. An epoch whose referencing revisions were all pruned answers `410` as in §7.1 where the server recorded it when pruning, and `404` otherwise. A branch's stored sealings of a base's blobs are its own copies: pruning in the base doesn't delete them (§8.6), but the branch stops serving them, answers as above, and MAY delete them. `…/blob/{bid}` redirects to the latest served epoch. Each epoch's sealing is produced once and stored, the first one stored winning when two instances seal at once, and only the stored bytes are served, unchanged, with `ETag: "{bid}.{e}"`. Its `Content-Type` is the sealed type: the blob's own type is in its reference. Clients open sealed blobs only in namespaces whose namespace document says they are sealed, or after the epoch redirect, since any namespace may store a file of that type.
 
-- A range of a sealed blob can't be decrypted on its own. Media that must stream in ranges belongs in a namespace that isn't sealed, or is split into several blobs.
+- Range requests are served over the sealed bytes, which lets a download resume, but a range can't be decrypted on its own. Media that must stream in ranges belongs in a namespace that isn't sealed, or is split into several blobs.
 
 ### E.2.3 Getting keys
 
@@ -2781,7 +2805,7 @@ Authorization: Bearer
 
 - **Schemas** usually live in a public namespace. A sealed schema namespace works too, but every writer and consumer then needs its keys.
 
-- **Branches (Addendum F)** of a sealed namespace MUST be sealed. At E2 a branch has its own epoch keys, and the server seals read-through content under them like anything else it serves. For E3, see §F.8.
+- **Branches (Addendum F)** of a sealed namespace MUST be sealed. At E2 a branch has its own epoch keys, and the server seals read-through content under them like anything else it serves. Read-through revisions, and revisions written before a namespace became sealed, are sealed under the epoch current when they are first served, and keep that epoch. For E3, see §F.8.
 
 ### E.2.6 Derived views
 
@@ -2829,7 +2853,7 @@ The origin never sees plaintext. Clients encrypt patch sets before sending them 
 
 `sealed.type` and `sealed.size` describe the plaintext. Whoever can read the document can read the blob, and nobody else can. With `pad`, the plaintext is padded with zero bytes before encryption (§E.2.2).
 
-- **Declared blobs.** The server can't see references at E3, so the `sealed` op lists, in plaintext, the id of every blob the resulting document references: `[{ "op": "sealed", "value": "<JWE compact>", "blobs": ["1m4…"] }]`. A restore with `[]` keeps the list of the last live document, and a sealed empty set that keeps a document unchanged (§F.3) repeats its list. The list is part of the hashed patch set, and the server keeps it with the revision's skeleton after pruning, so it knows what kept documents reference. Its length is checked against `blobsPerDocument`. The server checks that the blobs are available (§7.8), and uses the lists for unreferenced blobs, pruning, purge and bundles. Readers MUST compare the list with the decrypted document, and flag a revision whose list differs, like a failed validation (§E.3.2). A sealed `snapshot` for pruning (§8.6) carries `blobs` in the same way.
+- **Declared blobs.** The server can't see references at E3, so the `sealed` op lists, in plaintext, the id of every blob the resulting document references: `[{ "op": "sealed", "value": "<JWE compact>", "blobs": ["1m4…"] }]`. Writers omit the member when the list is empty, and otherwise sort it by the ids' binary form (§3.2). Ids at E3 are over ciphertext with a random IV and differ on every sealing anyway, so the server accepts an empty list either omitted or as `[]`, in any order, and readers compare lists as sets. A list with duplicates is `422` (`code: "blob"`), and so is a declared blob whose type isn't the sealed type, so a batch's `source` can't bring a plaintext blob in. A restore with `[]` keeps the list of the last live document, and a sealed empty set that keeps a document unchanged (§F.3) repeats its list. The list is part of the hashed patch set, and the server keeps it with the revision's skeleton after pruning, so it knows what kept documents reference. Its length is checked against `blobsPerDocument`. The server checks that the blobs are available (§7.8), and uses the lists for unreferenced blobs, pruning, purge and bundles. Readers MUST compare the list with the decrypted document, and flag a revision whose list differs, like a failed validation (§E.3.2). A prune's sealed `snapshot` needs no list (§8.6): the server keeps the declared list of every revision, including the one whose document the snapshot is.
 
 - **Merges keep blobs.** A blob's key travels inside the document, not under the namespace's keys. Re-sealing a patch set for another namespace (§F.8.1) therefore leaves its references unchanged, and the blob's ciphertext and id with them.
 
@@ -2998,7 +3022,7 @@ Tombstones are entries like any other, and a `"delete"` step reproduces them (§
 
 - A resource deliberately kept at the base's version is still recorded in the batch with an empty step `[]`, but only when the base's head is a live document. That writes a revision with identical content, so consumers see a head change and nothing different. In sealed namespaces the step is a fresh `$nonce` add (E2, §C.7) or a sealed empty set (E3). Where the base's head is a tombstone or absent, `[]` would restore or fail, so such a resource can't be recorded this way: it stays unmerged and is offered again.
 
-- `source` is asserted, not verified (§7.5), so only batches without `origin`, whose `source.ns` is the branch and whose recorded grant (§C.3) has a root `sub` and `kid` listed in the base's `merge.authors`, count. The base declares them in its namespace document, e.g. `"merge": { "authors": [{ "sub": "svc:merge", "kid": "ops-2026" }] }`; changing `/merge` needs a `*` key (§7.4). Merges by anyone else, such as an editor merging by hand, aren't tracked this way, so a branch merged like that should be rebased (§F.5) before it is merged again. The dry run lists, per resource, which batch and author its pair came from. Rebasing (§F.5) remains an alternative.
+- `source` is asserted, not verified (§7.5), so only batches without `origin`, whose `source.ns` is the branch, whose `source.at` is in the branch's chain, and whose recorded grant (§C.3) has a root `sub` and `kid` listed in the base's `merge.authors`, count. The merger checks the chain itself, as the janitor does (§F.6), since the server checks it only for callers who may read the branch (§7.5). The base declares them in its namespace document, e.g. `"merge": { "authors": [{ "sub": "svc:merge", "kid": "ops-2026" }] }`; changing `/merge` needs a `*` key (§7.4). Merges by anyone else, such as an editor merging by hand, aren't tracked this way, so a branch merged like that should be rebased (§F.5) before it is merged again. The dry run lists, per resource, which batch and author its pair came from. Rebasing (§F.5) remains an alternative.
 
 - **Blobs.** A merge within the deployment copies nothing: the blobs the branch attached are available to the batch's items through its `source`, and are attached in the base when it commits (§7.8). The merger's grant must therefore also read the branch, or the batch carries one that does in `Source-Authorization`. Blob ids don't depend on where a blob is stored, so fast-forwards still reproduce the branch's ids. A merge from another deployment uploads the blobs first (§G.3). The dry run reports a missing blob as a `blob` failure.
 
@@ -3298,7 +3322,7 @@ The ids prove the copies exact. If B already has a resource at one of those path
 
 - B MAY fetch lazily, proxying and caching, or mirror everything up front. It serves the content under its own URLs.
 
-- A lazily fetching B depends on keeping A's read access: a fetch that fails is `502` for that resource. Mirror up front to be independent.
+- A lazily fetching B depends on keeping A's read access: a fetch that fails is `502` for that resource. It also depends on A's pruning: A protects history from `at` on only while B's registration lasts, and older history and the blobs it references not at all (§8.6), so they may become `410`. Mirror up front, blobs included, to be independent.
 
 - A's head is never needed until a rebase or merge.
 
@@ -3371,7 +3395,7 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
 
 - **Snapshot lines** carry the document and its source id as provenance. A document tombstoned at the source is `{ …, "snapshot": <tombstone id>, "deleted": true }`.
 
-- **Blob lines** carry every blob that an exported document references, from any exported revision of a `full` document or from a snapshot. Each comes once per resource, before the first line that references it, with `nonce` if it has one. `data` is the bytes in base64url. The importer recomputes each id (§3.7), and a mismatch rejects the bundle. An incremental bundle MAY leave out blobs that the history up to `requires` already references, since the target has them. In a sealed bundle (§G.5.1.1), a blob line is base64 inside a JWE, about 1.8 times the blob's size.
+- **Blob lines** carry every blob that an exported document references, from any exported revision of a `full` document or from a snapshot. Each comes once per resource, with `nonce` if it has one, before the first line that **mentions** it: one whose patches carry its id as a `$blob` member or as the value of an operation whose path ends in `/$blob`, whose snapshot document references it, or whose declared list (§E.3.1) names it. `data` is the bytes in base64url, written without padding; readers accept either. The importer recomputes each id (§3.7), and a mismatch rejects the bundle. An incremental bundle MAY leave out blobs that the history up to `requires` already references, since the target has them. In a sealed bundle (§G.5.1.1), a blob line is base64 inside a JWE, about 1.8 times the blob's size.
 
 - **`requires`** applies only to `full` documents. `requires[r]` MUST be in the target's chain for `r`. If the target has moved on along another line, `r` is a conflict.
 
@@ -3445,7 +3469,7 @@ Each document is exported in one of two modes:
 
 - **Size.** Batches are split to fit §6.6, which makes the import non-atomic. A backfill can accept that, and its tool paces the batches at a fraction of the namespace rate so other writers aren't held up. An import that must land at once, such as a release, runs as one batch under an allowance (§6.6), typically as a merge from a branch it was first imported into (§F.3).
 
-- **Blobs first.** The blobs a batch references are uploaded before it by the importer, or copied with `Blob-From` within one deployment (§7.8). A snapshot document's blobs go to both its upstream resource and its target. Pending blobs expire after `blobGrace`, so a long review re-uploads them, which restarts it. A large import needs an allowance that raises the importer's `blobPending` (§6.6).
+- **Blobs first.** The blobs a batch needs are those its steps' values mention (§G.4.1), since references the target's head already has are attached there. They are uploaded before it by the importer, or copied with `Blob-From` within one deployment (§7.8), unless the batch's local `source` already makes them available. Uploads change no head, so they don't count as writes for step 1: an import that will submit uploads its blobs before the dry run of step 4, and one that only dry-runs uploads none, and gets them reported as missing (§7.5). A snapshot document's blobs go to both its upstream resource and its target. Pending blobs expire after `blobGrace`, so a long review re-uploads them, which restarts it. A large import needs an allowance that raises the importer's `blobPending` (§6.6).
 
 - **Rewriting waits for its targets.** A document's references are rewritten only after the batches of its dependencies have committed, using the ids they returned.
 
@@ -3479,9 +3503,9 @@ patchlog import release-7.plb --to https://cms.example --dry-run
 
 - A `public` source may go into any target.
 
-- A `private` or `sealed` source goes into a private or sealed target. An importer that holds the target's keys MAY also import it into an `e2e` target by sealing each patch set client-side. That re-encryption changes the ids, like any E3 merge (§F.8).
+- A `private` or `sealed` source goes into a private or sealed target. An importer that holds the target's keys MAY also import it into an `e2e` target by sealing each patch set client-side, encrypting each blob as in §E.3.1 and rewriting its references to the new blob ids. Only a client with the target's keys can do this. That re-encryption changes the ids, like any E3 merge (§F.8).
 
-- An `e2e` source goes only into an `e2e` target **with the same namespace name**, since sealed patch sets bind `pl.ns` (§E.3.1). Lines carry the ciphertext verbatim, including the `keyring` resource, and ids verify as usual. Importing under another name is a merge, done by a client that holds both sets of keys. A target created for the import starts at the bundle's lowest epoch and is moved up one epoch at a time as its keyring lines arrive, so the importer needs `config` on the target, with a `*` key (§7.4). An existing target whose epoch is below the bundle's is refused.
+- An `e2e` source goes only into an `e2e` target **with the same namespace name**, since sealed patch sets bind `pl.ns` (§E.3.1). Lines carry the ciphertext verbatim, including the `keyring` resource, and ids verify as usual. Its blob lines have the sealed type and no nonce (§E.3.1), since declared lists carry only ids, and an importer refuses one that doesn't, before uploading anything. Importing under another name is a merge, done by a client that holds both sets of keys. A target created for the import starts at the bundle's lowest epoch and is moved up one epoch at a time as its keyring lines arrive, so the importer needs `config` on the target, with a `*` key (§7.4). An existing target whose epoch is below the bundle's is refused.
 
 - **E3 snapshots.** A snapshot line of an `e2e` namespace needs an exporter with keys. The exporter replaces `doc` with `"patches": [{ "op": "sealed", … }]`, a sealed genesis under the source's current epoch with its `blobs` list (§E.3.1), and `snapshot` keeps the source id as provenance. The genesis id is computed over that ciphertext, so each export produces a different one.
 
@@ -3709,3 +3733,13 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Allowances** take an optional `until` (§6.6).
 
 - **Designing documents** (§11.1): member order, `$schema` revision paths, keeping namespace names on import, blobs, and when to split a document.
+
+- **v0.32:** feedback from implementing v0.31 in Go, on Postgres and with blobs.
+
+- **Blobs (§7.8):** a copy's `400`s come before its source is read, and a purged namespace is `410` after authorisation, like a purged resource. Attaching a blob ends every pending entry for it. A batch's `source` is judged in the source's own view, only for callers who may read it, and a bad `source.at` has its own code, `source` (§7.5, §12). Dry runs report missing blobs and carry on.
+
+- **Sealed blobs (§E.2.2):** epochs are defined for revisions not yet sealed, pruned epochs are `410` only where recorded, ranges are over the sealed bytes, and clients open sealed blobs only where they know the namespace is sealed. Read-through and pre-sealing revisions keep the epoch they were first served under (§E.2.5). At E3, declared lists have a preferred form, no duplicates and only sealed blobs, and a prune needs no list (§E.3.1, §8.6).
+
+- **Bundles and federation (§G):** "before the first line that mentions it" is defined, blob lines are unpadded base64url, imports upload blobs before their dry run, local imports need no copies, E3 blob lines and re-encrypting imports are specified, and lazily mirrored remote branches may lose blobs to pruning.
+
+- **Addendum D:** blob bytes are written durably before their row commits, deleted after it, and stored under one name per copy, so a delete can't hit a re-upload; `blob_refs` runs record which revisions reference a blob, and `blob_epochs` is keyed by name. On Postgres: 32-bit lock keys, try-and-restart for locks found late, shared rows, snapshots, `bytea` where encryption at rest applies, a generation counter that bounds cache staleness, with a second CDN purge, one runner for background jobs, and small writes checked inside the lock (D.3).
