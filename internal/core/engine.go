@@ -94,6 +94,10 @@ type Options struct {
 	// the write lock and re-check (D.3). Tests use it to inject concurrent
 	// writes deterministically; it may itself write through the engine.
 	BeforeWriteLock func()
+	// BeforeCommit is called by every write transaction, with its
+	// context, after its work and right before it commits. Tests use it to
+	// hold a write in flight (graceful shutdown); it must not write.
+	BeforeCommit func(ctx context.Context)
 	// LockedCheckBytes: on Postgres, a resource write or batch whose
 	// patches are smaller than this, roughly as JSON, runs its check
 	// inside its namespace's (shared) lock rather than first in a
@@ -325,6 +329,9 @@ func (e *Engine) Close() error {
 	return e.db.Close()
 }
 
+// Ping checks that the database is reachable (the /_ready check).
+func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) }
+
 // Origin is the deployment origin.
 func (e *Engine) Origin() string { return e.opt.Origin }
 
@@ -541,6 +548,9 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 		sqlTx.Rollback()
 		e.removeFiles(t.newFiles)
 		return nil, err
+	}
+	if h := e.opt.BeforeCommit; h != nil {
+		h(ctx)
 	}
 	if len(t.tags) > 0 {
 		// The second purge, durable with the commit (repurge.go).

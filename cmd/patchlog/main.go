@@ -17,10 +17,8 @@ import (
 	"net"
 	"net/http"
 	"os"
-	"os/signal"
 	"slices"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/bundle"
@@ -80,6 +78,8 @@ func main() {
 		bundleCmd(os.Args[1], os.Args[2:])
 	case "archive":
 		archiveCmd(os.Args[2:])
+	case "health":
+		healthCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -103,7 +103,10 @@ func usage() {
   patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
   patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
   patchlog bundle verify -i file.jsonl
-  patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]`)
+  patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]
+  patchlog health [-timeout 2s] [URL]   (exit 0 if URL, default http://localhost:8080/_health, answers 200)
+
+serve, index and tree also take -shutdown-timeout 30s and -shutdown-delay 0 (graceful shutdown) and answer /_health and /_ready.`)
 	os.Exit(2)
 }
 
@@ -145,6 +148,7 @@ func serve(args []string) {
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	corsFlags := addCORSFlags(fs)
+	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
 	ev := edgeVerifier(*edgeSecret, *edgeHeader)
 	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
@@ -242,6 +246,12 @@ func serve(args []string) {
 		log.Fatal(err)
 	}
 	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy, indexProxy)), ReadHeaderTimeout: 10 * time.Second}
+	ls := sdFlags.server("patchlog", srv, e.Ping)
+	sigCtx, sigs := shutdownSignals("patchlog")
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
 	log.Printf("patchlog %s listening on %s (origin %s, dev=%v)", version, *addr, *origin, *dev)
 	if *pg {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
@@ -252,20 +262,18 @@ func serve(args []string) {
 	if indexProxy != nil {
 		log.Printf("index proxy: %s%s -> %s (GET/HEAD only)", localURL(*addr), server.IndexProxyPrefix, *indexURL)
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatal(err)
-		}
-	}()
-	<-ctx.Done()
-	log.Print("patchlog: shutting down")
-	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	srv.Shutdown(shutdown)
-	e.Close()
+	serveOn(ls, ln)
+	<-sigCtx.Done()
+	forceOnSecond(sigs)
+	// Handlers have returned (or been cancelled) before the engine stops
+	// its background jobs and closes the database; queued purges are
+	// flushed last.
+	ls.Shutdown()
+	if err := e.Close(); err != nil {
+		log.Printf("patchlog: closing the engine: %v", err)
+	}
 	closePurger(purger)
+	log.Print("patchlog: stopped")
 }
 
 const purgeURLUsage = "CDN URL that cache-tag purges are sent to, as PURGE with X-Purge-Tags (repeatable; e.g. http://cdn:8080/ for deploy/varnish). Unset: purges are only logged"
