@@ -387,6 +387,10 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	}
 	cfg, perr := t.e.parseConfig(doc)
 	if perr != nil {
+		var le *limitError
+		if errors.As(perr, &le) {
+			return nil, limitErr(422, le.msg)
+		}
 		return nil, invalid(perr.Error())
 	}
 	if aerr := t.e.checkArchives(cfg); aerr != nil {

@@ -573,7 +573,11 @@ func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
 	if a.verified != nil {
 		kid = a.verified.Key.Kid
 	}
-	return cfg.allowance(a.principal.ID, kid, a.verified == nil)
+	al := cfg.allowance(a.principal.ID, kid, a.verified == nil)
+	if al != nil && !al.Until.IsZero() && !t.now.Before(al.Until) {
+		return nil // ended: ignored from `until` on (§6.6)
+	}
+	return al
 }
 
 // guardedPaths need a grant chained to a * key (§7.4).

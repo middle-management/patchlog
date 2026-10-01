@@ -257,7 +257,7 @@ func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (int, error) {
 			return aerr
 		}
 		items, size := t.batchLimits(cur, a)
-		limit = size + size/4 + 512*items + cur.Limits.PatchSetSize + 64<<10
+		limit = size + size/4 + 512*items + max(cur.Limits.PatchSetSize, cur.Limits.DocumentSize) + 64<<10
 		return nil
 	})
 	return limit, err
@@ -980,7 +980,11 @@ func checkLimits(l Limits, s *itemState) *Error {
 		if step.del {
 			continue
 		}
-		if len(step.canon) > l.PatchSetSize {
+		maxPatch := l.PatchSetSize
+		if fromScratch(step) {
+			maxPatch = l.DocumentSize
+		}
+		if len(step.canon) > maxPatch {
 			return limitErr(413, "patch set too large")
 		}
 		if ops, ok := step.raw.([]any); ok && len(ops) > l.OpsPerSet {
@@ -992,6 +996,15 @@ func checkLimits(l Limits, s *itemState) *Error {
 		}
 		if jsonv.Depth(step.doc) > l.NestingDepth {
 			return limitErr(422, "document nested too deeply")
+		}
+		if step.sealed {
+			continue // e2e: clients check the limits on documents (§E.3.2)
+		}
+		if err := checkValuesAndPaths(l, step.doc); err != nil {
+			return err
+		}
+		if err := checkBlobRefs(l, step.doc); err != nil {
+			return err
 		}
 	}
 	return nil

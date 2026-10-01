@@ -904,18 +904,23 @@ just doesn't apply).
   written after every 100 revisions or 64 KiB of patch sets, so every read folds from the nearest
   snapshot and never folds more than that (D.4).
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
-  batchSize }]` in a namespace document gives one principal its own bucket (replacing the
-  principal and namespace buckets, and a key scope's lower rate) and batch limits. They can go
+  batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
+  principal and namespace buckets, and a key scope's lower rate) and batch limits, until the
+  optional RFC 3339 `until`. They can go
   up to the deployment maximums, set with `serve -max-items-per-batch` and `-max-batch-size`
   (the flag accepts `64MiB`; the document takes bytes).
 - **Limit names** in a namespace document's `limits` object, exactly as §6.6's table:
-  `patchSetSize`, `opsPerSet`, `documentSize`, `nestingDepth`, `rulesPerNamespace`,
+  `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`, `rulesPerNamespace`,
   `rulesPerGrant`, `grantSize`, `itemsPerBatch`, `batchSize`, `branchesPerNamespace`,
-  `keepPerResource` (integers, sizes in bytes, lower only), `ratePerResource`,
+  `keepPerResource`, `blobsPerDocument` (integers, sizes in bytes, lower only), `ratePerResource`,
   `ratePerPrincipal`, `ratePerNamespace` (`{ rate, burst }`), `retryWindow` and
   `remoteRegistration` (ISO 8601 durations). Sizes written with units (`"64 MiB"`), unknown or
   v0.20 names (`liveBranches`, `remoteBranchLife`) and the deployment-only `logPageSize` and
-  `branchDepth` are `422`.
+  `branchDepth` are `422`. Creates, and restores from scratch, may be as large as
+  `documentSize`; `valueSize` and `pathSize` bound strings and pointers, and an e2e namespace
+  needs `3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize`.
+  `$blob` objects must be well-formed (`422`, `code: "blob"`); blob availability is not
+  checked yet.
 - **Batch limits after authentication** (§7.5): the server authenticates a batch before
   reading its body, and stops reading at the principal's `batchSize` (its allowance's, if any,
   plus room for the batch's own JSON) with `413`. Item counts and the patch-set total are

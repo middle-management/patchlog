@@ -189,11 +189,11 @@ func TestBatchBodyLimit(t *testing.T) {
 	})
 	e := f.tenv
 	eve := e.grant(f.issuer, "user:eve", []string{"sec"}, []string{"read", "create", "append"})
-	big := strings.Repeat("x", 200<<10)
-	items := make([]any, 8) // about 1.6 MB of patch sets
+	big := strings.Repeat("x", 60<<10) // valueSize bounds a string, so three per document
+	items := make([]any, 8)            // about 1.6 MB of patch sets
 	for i := range items {
 		items[i] = map[string]any{"resource": "big-" + string(rune('a'+i)), "ifNoneMatch": "*",
-			"steps": []any{addRoot(map[string]any{"s": big})}}
+			"steps": []any{addRoot(map[string]any{"a": big, "b": big, "c": big})}}
 	}
 	body := map[string]any{"items": items}
 	post := func(bearer string) *resp {
