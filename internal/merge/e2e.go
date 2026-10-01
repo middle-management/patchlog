@@ -114,7 +114,9 @@ func (p *Plan) sealSteps(ctx context.Context, r *Resource) (steps []client.Step,
 		} else if m != "" {
 			return nil, fmt.Sprintf("step %d: the document doesn't validate against its $schema: %s", i, m), nil
 		}
-		body, err := x.SealPatches(ctx, p.Target, r.Name, prev, v)
+		// The re-sealed op keeps its declared blob list: the blobs of the
+		// document it produces (§E.3.1, §F.8.1).
+		body, err := x.SealPatchesBlobs(ctx, p.Target, r.Name, prev, v, client.BlobIDs(nd))
 		if err != nil {
 			return nil, "", err
 		}

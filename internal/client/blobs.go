@@ -108,6 +108,9 @@ func (c *Client) GetBlob(ctx context.Context, ns, name, bid, nonce string) (*Blo
 	if err != nil {
 		return nil, err
 	}
+	if r.status == 302 {
+		return nil, fmt.Errorf("client: blob %s/%s/%s is sealed for delivery (§E.2.2): read it with GetBlobRef", ns, name, bid)
+	}
 	if r.status != 200 {
 		return nil, r.apiError()
 	}
