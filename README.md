@@ -12,7 +12,8 @@ and serves immutable, CDN-cacheable revisions.
 | I-JSON input, JCS canonical form, base32 ids (`1…`) | §3 | ✅ |
 | Revisions, tombstones, namespace chain, names grammar, canonical URLs | §3.3–§3.6 | ✅ |
 | Opt-in `$schema` validation (JSON Schema 2020-12, format assertions, strict refs, unknown keywords rejected); `schema import` brings in external schemas (e.g. schemastore) with refs pinned | §6.1–§6.3, §6.5 | ✅ |
-| Draft schema revisions in branches (`drafts.for`, repeated `Source-Authorization`), `in_use` by last available copy | §6.1, §7.4 | ✅ (the §F.9 release tooling — merge ordering, release previews, janitor ordering — is not built yet) |
+| Draft schema revisions in branches (`drafts.for`, repeated `Source-Authorization`), `in_use` by last available copy | §6.1, §7.4 | ✅ |
+| Releases across namespaces: release documents, the four-step release merge (plan, approve, resume), release rebases, release previews, janitor ordering; catalog merge grants | §F.9, §F.8, §B.5 | ✅ (`patchlog merge release`, `tree -release`, `POST /merge-grants`; see [Releases across namespaces](#releases-across-namespaces-f9)) |
 | Change envelopes, rule engine (`test`, `writes`, `compare`, `all`/`any`/`not`/`if`) | §6.4 | ✅ |
 | Limits (configurable, deployment maximums) and token-bucket rate limits | §6.6 | ✅ |
 | Reads, writes, gate order, `412`/`428`, idempotent retry | §6.2, §7.1–§7.2 | ✅ |
@@ -34,7 +35,8 @@ and serves immutable, CDN-cacheable revisions.
 
 ### Not implemented
 
-- **Addendum B:** catalog branches (§F.8 preview access and merge grants), a `groups`
+- **Addendum B:** preview access computed from a catalog branch by the catalog service itself
+  (§F.8; a release preview, `tree -release`, serves branch listings without roles), a `groups`
   namespace, signed manifests and `x-tree-label` titles.
 - **§F.7 merge service** (scheduled merges, web status): not built. Its logic is in
   `internal/merge` and the CLI.
@@ -712,6 +714,110 @@ PATCH /r/matches-r7/derby  {"$schema": "/r/schemas/team/rev/X", …}
   only in a branch, and a remote branch whose documents use drafts is `422 schema_unavailable`
   (§G.3): merge the schemas first.
 
+### Releases across namespaces (§F.9)
+
+A release spans several namespaces: new documents in `matches`, their placements in the catalog
+`cat-season`, a draft schema in `schemas`. Each is branched, and a **release document** lists the
+branches (package `internal/release`):
+
+```json
+// /r/releases/release-7
+{ "name": "release-7",
+  "branches": { "matches":    { "ns": "matches-r7",    "at": "1k…" },
+                "cat-season": { "ns": "cat-season-r7", "at": "1m…" },
+                "schemas":    { "ns": "schemas-r7",    "at": "1d…" } },
+  "on": "/r/releases/release-6/rev/1x…",
+  "owners": ["user:anna"] }
+```
+
+Keys are the namespaces paths name; `at` (top level, a combined checkpoint) and `on` are optional.
+The core never reads it; every tool checks for itself what it is about to do.
+
+```sh
+R=/r/releases/release-7
+patchlog merge release plan    -api URL -bearer $ANNA -catalog-service cat-season=$CATSVC $R   # classify, report conflicts, store the plan
+patchlog merge release approve -api URL -bearer $ANNA $R                                     # plan again, require it clean, freeze every branch
+patchlog merge release apply   -api URL -bearer $ANNA -catalog-service cat-season=$CATSVC $R  # the four steps; run again to resume
+patchlog merge release status  -api URL -bearer $ANNA $R
+patchlog merge release rebase  -api URL -bearer $ANNA -suffix -b $R                          # successors of every branch, new release revision
+patchlog tree -catalog cat-season -release $R -bearer $PREVIEW                               # a release preview (§B.5)
+patchlog janitor -ns schemas,matches,cat-season -release $R                                  # drafts purged last, in_use retried
+```
+
+- **The steps** (one batch per branch and step, each classified again with a dry run right
+  before it is submitted): (1) schema resources (documents whose `$schema` is the dialect URL) by
+  fast-forward only, in `$ref` order; (2) catalog changes that narrow access, judged by the
+  §B.11.4 test (for every subject, effective roles on every node afterwards a subset of those
+  before, `includes` honoured) on the step-2 batch as a whole; a folder the release creates goes
+  here only when a narrowing move needs it, with the roles that carry `place` or `move` stripped
+  from its `$access`; (3) the content branches; (4) the remaining catalog changes (placements,
+  widening moves, `$access` edits, the stripped folders' roles), which publishes the release.
+  A branch with schemas and content merges its schemas in step 1 and the rest in step 3.
+- **Conflicts reported before anything is submitted** (`plan` exits 1): a schema resource the
+  base changed (`schema_changed`: rebase the release, then migrate documents with
+  `replace /$schema`); a catalog node that narrows for some subjects and widens for others
+  (`narrows_and_widens`: give `-split KEY/NODE=narrow.json`, the node's document after step 2;
+  the branch's document is reached in step 4; a split that doesn't narrow then widen is
+  `bad_split`); a narrowing batch that widens as a whole (`step2_widens`); a content item step 3
+  creates or restores that a placement in the catalog base already names (`placed_item`: accept
+  with `-accept-placement NS.NAME` if the release keeps that placement unchanged); a pinned link
+  (any string `/r/{ns}/{name}/rev/{id}` in a changed document but `$schema`/`$ref`, which covers
+  `x-ref` pins and manifest entries) to a revision of a listed branch that the merge replays
+  (`dangling_pin`); a `$schema` (or its `$ref` closure) resolving to a draft in a branch the
+  release doesn't list (`foreign_draft`), found with `client.ResolveSchema` preferring the
+  listed branches; one the merger can't resolve at all (`schema_unavailable`); every §F.3
+  merge conflict of a content or catalog resource (`merge`; content ones take
+  `-resolve KEY/NAME=file.json`). The pre-approval checks report `base_chain` (a branch whose
+  base chain doesn't reach its listed base, or for a release with `on`, the earlier release's
+  branch), `frozen` and `purged`.
+- **The stored plan** is the resource `{release}.merge` in the release document's namespace (or
+  `-state-ns`), with the release document's revision. `approve` (the approving person's grant)
+  plans again with the stored splits, acceptances and resolutions, requires it clean and for the
+  same revision, freezes every listed branch (§8.4) and records each branch's config id, step by
+  step, so a stopped approval resumes. The whole plan, both halves of every split node included,
+  is stored before step 2. `apply` refuses a plan whose release document moved or whose branches'
+  config ids changed (unfreezing invalidates the plan: plan and approve again; already merged
+  steps then classify as merged), records each step's batch as it completes, resumes from there,
+  never reverts, and has every branch record `merged` (config write `frozen` + `merged.at`) only
+  after step 4. A resumed step whose batch went in before the stop classifies as merged
+  (fast-forwards by id, replays through merge points, which need the merger in the base's
+  `merge.authors`; halves by content).
+- **Catalog batches** (steps 2 and 4) are submitted under a grant the catalog service signs for
+  exactly that batch: `POST {catalog service}/merge-grants` with `{ "batch": … }` and the merging
+  person's grant for the catalog (`tree -access`). The service folds each item onto the
+  revision its precondition names and checks it as in §B.11.4: `$access` changes need the admin
+  group; a new placement needs the content namespace's `catalogs.{catalog}.place` list and `place`
+  on its folders; a deleted node, `move` on its parents; a move, `move` on the parents left and
+  added and, unless admin, no widening of nodes in the moved subtree; other edits, `move` on the
+  node's parents; a new folder, `place` on its parents; a folder created in the same batch is
+  entered on that consent. The grant's root is the caller's `sub` under the catalog's `kid`, and
+  its rules allow, per resource, exactly the actions its steps take. So list
+  `{ "sub": <merging person>, "kid": <catalog kid> }` in the catalog base's `merge.authors`.
+  `503 behind` until the service has reached the batch's preconditions (the tool waits).
+- **One release per catalog base at a time.** `apply` holds the lock resource
+  `merge-lock.{catalog base}` in the state namespace, a document `{ "release": link }` taken
+  with `If-None-Match: *` or, when its `release` is null, `If-Match`, from its first step until
+  every branch records `merged`. Another release's `apply` fails with `ErrLocked` meanwhile. Two
+  runs of the same release serialise on the stored plan's `If-Match`.
+- **Rebasing** (`rebase -suffix -b`) creates successors (§F.5) of every branch, schema branches
+  first, each schema successor with `drafts.for` naming the other successors in its creation
+  patches. A draft that has to be replayed gets a new id; a resource whose entries reference it
+  is squashed (one resolution set against its new base, reaching the branch's document with
+  `$schema` moved to the draft's new revision). Old branches are switched (`frozen`,
+  `successor`), and the release document gets a new revision listing the successors (`at` is
+  dropped unless given with `-at`). It stops on conflicts and resumes.
+- **Previews** (`tree -release LINK`, `tree.Options.Branches`): the tree service follows the
+  listed branches in place of their bases (their `/heads` at their first entry, then their logs).
+  The graph keeps the bases' names, as documents do; checkpoints, the combined checkpoint, cache
+  tags, `/_status` and read checks use the branches, and items carry `url` into the branch and
+  `branch`. A viewer sees the catalog only with a grant reading the catalog's branch, and an
+  item's head only with one reading the content branch. A preview issues no grants (`-access` is
+  refused). The release document is read once, at start.
+- **The janitor** (`-release LINK`, repeatable) purges a release's non-draft branches before its
+  draft branches (those with `drafts`, or holding schema documents). A purge refused with
+  `in_use` is retried at the end of the sweep and otherwise reported as `retry` for the next
+  sweep; it never forces. A release document only orders the sweep, never authorises a purge.
+
 ### Pruning archives and retention (§8.6)
 
 ```sh
@@ -1019,6 +1125,10 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 - `POST /grants` for content verbs, `create` (genesis only; `409` for a taken name), `place`,
   `move` and unplace, with the no-widening rule.
 - `POST /read-grants` returns resource-scoped read grants.
+- `POST /merge-grants` checks a catalog branch's merge batch and signs one grant covering exactly
+  that batch (§F.8; see [Releases across namespaces](#releases-across-namespaces-f9)).
+
+With `-release /r/{ns}/{release}` (not with `-access`) it previews a release (§B.5).
 
 Callers authenticate with an ordinary grant for the catalog namespace, and their groups come only
 from that grant. Issued grants carry `at`; the service refuses to issue from a checkpoint that
@@ -1311,7 +1421,8 @@ internal/verify      id and chain verification (§G.2)
 internal/grantcheck  local grant checks for services
 internal/annot       x-* annotations and x-ref references
 internal/index       search index service (Addendum A)
-internal/merge       merge, rebase, status, diff (Addendum F)
+internal/merge       merge, rebase, status, diff; release merges and rebases (Addendum F, §F.9)
+internal/release     release documents (§F.9)
 internal/janitor     branch cleanup with claim verification (§F.6)
 internal/tree        tree service: folders, placements, links, manifests (§B.2–§B.9)
 internal/catalog     tree-derived access and grant issuing (§B.11)

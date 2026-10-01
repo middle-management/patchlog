@@ -3,10 +3,11 @@ package main
 // Addendum F tools: merge, rebase and the branch janitor. All of them are
 // clients of the public API (internal/merge, internal/janitor).
 //
+//	patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}  (cmd/patchlog/release.go)
 //	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
 //	        [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
 //	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-identity key.jwk]... [-json]
-//	patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
+//	patchlog janitor -api URL -ns base1,base2 [-release LINK]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
 
 import (
 	"context"
@@ -28,10 +29,11 @@ import (
 )
 
 const mergeUsage = `usage:
+  patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}   (§F.9; see patchlog merge release)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
           [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-identity key.jwk]... [-json]
-  patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
+  patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
 
 // toolFlags are the connection flags shared by the Addendum F tools.
 type toolFlags struct {
@@ -123,6 +125,9 @@ func mergeCmd(args []string) {
 	sub := args[0]
 	switch sub {
 	case "status", "plan", "apply":
+	case "release":
+		releaseCmd(args[1:])
+		return
 	default:
 		fmt.Fprintln(os.Stderr, mergeUsage)
 		os.Exit(2)
@@ -534,6 +539,8 @@ func janitorCmd(args []string) {
 	dry := fs.Bool("dry-run", false, "only report what would be purged")
 	once := fs.Bool("once", false, "sweep once and exit instead of following the bases")
 	interval := fs.Duration("interval", time.Minute, "sweep interval while following")
+	var releases multi
+	fs.Var(&releases, "release", "release document /r/{ns}/{release} whose draft branches are purged after its other branches (§F.9); repeatable")
 	fs.Parse(args)
 	var bases []string
 	for _, s := range strings.Split(*nsList, ",") {
@@ -554,7 +561,7 @@ func janitorCmd(args []string) {
 		}
 		fmt.Printf("%-24s %-12s %s\n", d.NS, d.Action, d.Reason)
 	}
-	opt := janitor.Options{Bases: bases, DryRun: *dry, Interval: *interval,
+	opt := janitor.Options{Bases: bases, DryRun: *dry, Interval: *interval, Releases: releases,
 		OnError: func(err error) { fmt.Fprintln(os.Stderr, "janitor:", err) }}
 	if *once {
 		ds, err := janitor.New(c, opt).Sweep(context.Background())

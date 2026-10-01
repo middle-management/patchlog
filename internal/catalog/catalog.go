@@ -117,16 +117,19 @@ func (s *Service) Handler() http.Handler {
 	th := s.t.Handler()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
-		case "/grants", "/read-grants":
+		case "/grants", "/read-grants", "/merge-grants":
 			if r.Method != http.MethodPost {
 				w.Header().Set("Allow", "POST")
 				tree.WriteError(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")
 				return
 			}
-			if r.URL.Path == "/grants" {
+			switch r.URL.Path {
+			case "/grants":
 				s.serveGrants(w, r)
-			} else {
+			case "/read-grants":
 				s.serveReadGrants(w, r)
+			default:
+				s.serveMergeGrants(w, r)
 			}
 		default:
 			th.ServeHTTP(w, r)

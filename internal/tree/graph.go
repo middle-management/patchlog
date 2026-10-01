@@ -132,6 +132,9 @@ type Graph struct {
 	Config map[string]any
 	// Trust is catalog.trust (§B.6).
 	Trust map[string]bool
+	// Aliases maps a namespace to the branch followed in its place in a
+	// release preview (§B.5, §F.9); nil otherwise.
+	Aliases map[string]string
 
 	nodes    map[string]*Node // merged: explicit, else implicit
 	explicit map[string]*Node
@@ -165,6 +168,26 @@ func (g *Graph) Len() int { return len(g.nodes) }
 
 // Href is the node's live link.
 func (g *Graph) Href(name string) string { return "/r/" + g.Catalog + "/" + name }
+
+// Actual is the namespace read in place of ns: its branch in a release
+// preview (§B.5), otherwise ns itself.
+func (g *Graph) Actual(ns string) string {
+	if a := g.Aliases[ns]; a != "" {
+		return a
+	}
+	return ns
+}
+
+// ItemHref is the live link of a placement's item where the service reads
+// it: in a release preview, in the release's branch of the item's
+// namespace (§B.5: placements such as matches.final resolve to the
+// release's branch of matches).
+func (g *Graph) ItemHref(n *Node) string {
+	if n.ItemNS == "" {
+		return ""
+	}
+	return "/r/" + g.Actual(n.ItemNS) + "/" + n.ItemName
+}
 
 // WalkableParents returns the parents a walk may go up to from n: edges in
 // state EdgeValid (a live, non-cyclic folder), without duplicates, in

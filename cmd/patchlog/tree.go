@@ -18,13 +18,14 @@ import (
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/release"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // treeCmd runs the tree service of Addendum B, or with -access the catalog
 // service of §B.11 that also issues grants:
 //
-//	patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME]
+//	patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME] [-release /r/{ns}/{release}]
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]]
 //	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //
@@ -64,6 +65,7 @@ func treeCmd(args []string) {
 	kid := fs.String("kid", "", "kid of the catalog key in the catalog and content namespaces, for -access")
 	ttl := fs.Duration("ttl", 15*time.Minute, "lifetime of issued grants (capped by the key's maxTtl)")
 	adminGroup := fs.String("admin-group", "catalog-admins", "group whose moves skip the no-widening check")
+	rel := fs.String("release", "", "preview a release (§B.5, §F.9): follow the branches the release document /r/{ns}/{release} lists in place of their bases; previews only, no grants (not with -access); read when the service starts")
 	rebuild := fs.Bool("rebuild", false, "drop the database and replay from the beginning")
 	minWait := fs.Duration("min-wait", 2*time.Second, "how long ?min= waits for the service to catch up")
 	sse := fs.Bool("sse", false, "follow by server-sent events instead of long-poll")
@@ -108,6 +110,24 @@ func treeCmd(args []string) {
 	topt.Edge = edgeVerifier(*edgeSecret, *edgeHeader)
 
 	ctx, sigs := shutdownSignals("patchlog tree")
+	if *rel != "" {
+		if *access {
+			log.Fatal("tree: a release preview serves previews only and issues no grants (§B.5): -release can't be combined with -access")
+		}
+		for {
+			loaded, lerr := release.Load(ctx, c, *rel)
+			if lerr == nil {
+				topt.Branches = loaded.Doc.Aliases()
+				log.Printf("patchlog tree: previewing release %s at %s: %v", loaded.Ref.Live(), loaded.Ref.Rev, topt.Branches)
+				break
+			}
+			if ctx.Err() != nil {
+				log.Fatal(lerr)
+			}
+			log.Printf("tree: reading the release document: %v; retrying", lerr)
+			time.Sleep(time.Second)
+		}
+	}
 
 	var (
 		handler http.Handler

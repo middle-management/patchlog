@@ -118,7 +118,9 @@ func Bearer(r *http.Request) string {
 // markers for how much of the catalog and which content namespaces it
 // reads as a whole.
 func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) {
-	cat := s.opt.Catalog
+	// In a release preview every check is on the branch read in place of
+	// a namespace: a viewer sees only branches it can read (§B.5).
+	cat := s.actual(s.opt.Catalog)
 	cfg, err := s.checker.Config(ctx, cat)
 	if err != nil {
 		return nil, err
@@ -139,7 +141,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		}
 		v.anon, v.catAll = true, true
 		for _, ns := range trust {
-			if c, err := s.checker.Config(ctx, ns); err == nil && c.Read == "public" {
+			if c, err := s.checker.Config(ctx, s.actual(ns)); err == nil && c.Read == "public" {
 				v.contentAll[ns] = true
 			}
 		}
@@ -162,7 +164,8 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		markers = append(markers, "catalog:scope:"+ScopeDigest(vg))
 	}
 	for _, ns := range trust {
-		c, err := s.checker.Config(ctx, ns)
+		real := s.actual(ns)
+		c, err := s.checker.Config(ctx, real)
 		if err != nil {
 			continue
 		}
@@ -170,13 +173,13 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 			v.contentAll[ns] = true
 			continue
 		}
-		cv, err := s.checker.Verify(ctx, ns, token)
+		cv, err := s.checker.Verify(ctx, real, token)
 		if err != nil {
 			continue
 		}
 		if ok, _ := cv.Allows("read"); ok && s.checker.ReadsAll(cv) && s.checker.AllowsRead(cv, "") {
 			v.contentAll[ns] = true
-			markers = append(markers, "reads:"+ns)
+			markers = append(markers, "reads:"+real)
 		}
 	}
 	var subjects []string
@@ -370,7 +373,10 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	for _, ns := range s.followed() {
 		followed[ns] = true
 	}
-	for _, m := range mins {
+	for i, m := range mins {
+		// A preview's readers write to the branches, so min names them.
+		m.ns = s.logical(m.ns)
+		mins[i] = m
 		if m.ns != "" && !followed[m.ns] {
 			w.Header().Set("Cache-Control", "no-store")
 			WriteError(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow")
@@ -525,7 +531,13 @@ func (s *Service) serveStatus(w http.ResponseWriter) {
 }
 
 // status is each followed namespace's encryption state (Addendum E).
-func (s *Service) status() []derived.Status { return s.keys.Status(s.followed()) }
+func (s *Service) status() []derived.Status {
+	var nss []string
+	for _, ns := range s.followed() {
+		nss = append(nss, s.actual(ns))
+	}
+	return s.keys.Status(nss)
+}
 
 func codeFor(status int) string {
 	switch status {
@@ -547,10 +559,11 @@ func codeFor(status int) string {
 func CombinedAt(g *Graph, cur map[string]string) (string, []string) {
 	m := map[string]any{}
 	nss := []string{}
+	// In a release preview the checkpoint is over the branches (§B.5).
 	add := func(ns string) {
 		if id := cur[ns]; id != "" {
-			m[ns] = id
-			nss = append(nss, ns)
+			m[g.Actual(ns)] = id
+			nss = append(nss, g.Actual(ns))
 		}
 	}
 	add(g.Catalog)
@@ -576,9 +589,9 @@ type tagSet map[string]bool
 
 // node tags a catalog node and, for a placement, its item.
 func (t tagSet) node(g *Graph, name string) {
-	t["r:"+g.Catalog+"/"+name] = true
+	t["r:"+g.Actual(g.Catalog)+"/"+name] = true
 	if n := g.Node(name); n != nil && n.ItemNS != "" {
-		t["r:"+n.ItemNS+"/"+n.ItemName] = true
+		t["r:"+g.Actual(n.ItemNS)+"/"+n.ItemName] = true
 	}
 }
 
@@ -820,7 +833,12 @@ func (q *query) entry(n *Node) map[string]any {
 		}
 		if q.v.item(q.g, n) && n.ItemHead != "" {
 			m["head"] = n.ItemHead
-			m["url"] = q.s.origin + n.Item() + "/rev/" + n.ItemHead
+			// In a release preview the head is the branch's: url reads it
+			// there (§B.5), while item keeps the name documents use.
+			m["url"] = q.s.origin + q.g.ItemHref(n) + "/rev/" + n.ItemHead
+			if a := q.g.Actual(n.ItemNS); a != n.ItemNS {
+				m["branch"] = a
+			}
 		}
 		if n.State == StateDangling {
 			m["dangling"] = n.Dangling
@@ -1274,7 +1292,7 @@ func (q *query) manifest() (any, int, string) {
 			for i, s := range path {
 				p[i] = s
 			}
-			e := map[string]any{"href": c.Node.Item() + "/rev/" + c.Node.ItemHead, "path": p}
+			e := map[string]any{"href": q.g.ItemHref(c.Node) + "/rev/" + c.Node.ItemHead, "path": p}
 			if c.HasOrder {
 				e["order"] = c.Order
 			}

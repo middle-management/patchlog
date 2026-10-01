@@ -55,6 +55,8 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/merge"
+	"github.com/middle-management/patchlog/internal/release"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // Options configure a Janitor.
@@ -72,6 +74,11 @@ type Options struct {
 	OnDecision func(Decision)
 	// OnError receives errors Run retries.
 	OnError func(error)
+	// Releases are release documents (§F.9) whose branches the janitor
+	// orders: those holding schema documents (drafts) are purged after
+	// every other branch. A release document never authorises a purge;
+	// each branch is checked as usual.
+	Releases []string
 }
 
 // Actions of a decision.
@@ -79,6 +86,9 @@ const (
 	ActionPurged     = "purged"
 	ActionWouldPurge = "would-purge" // dry run
 	ActionKeep       = "keep"
+	// ActionRetry: eligible, but the purge was refused with in_use (§6.1);
+	// a later sweep tries again.
+	ActionRetry = "retry"
 )
 
 // Decision is the janitor's verdict on one branch.
@@ -115,44 +125,155 @@ func New(c *client.Client, opt Options) *Janitor {
 
 // Sweep makes one pass over every base's branch tree, leaves first, and
 // returns a decision per live branch.
+//
+// Draft branches go last (§F.9 Cleanup): a branch holding draft schema
+// revisions can't be purged while documents rely on its last copy of one
+// (§6.1), so every other branch of every base is handled first, and with
+// it the documents of a release that rely on the drafts. A draft branch is
+// one whose namespace document has drafts (§7.4), or one a release in
+// Options.Releases lists that holds schema documents. A purge refused with
+// in_use, of a draft branch or any other, is retried once at the end of
+// the sweep, and if it is still refused, the decision is ActionRetry: the
+// next sweep tries again. The janitor never forces a purge, and a release
+// document only orders the sweep: it never authorises a purge.
 func (j *Janitor) Sweep(ctx context.Context) ([]Decision, error) {
-	var out []Decision
+	var cands []candidate
 	var errs []error
 	for _, b := range j.opt.Bases {
-		ds, err := j.walk(ctx, b)
-		out = append(out, ds...)
+		cs, err := j.walk(ctx, b)
+		cands = append(cands, cs...)
 		if err != nil {
 			errs = append(errs, err)
 		}
 	}
+	drafts, err := j.draftBranches(ctx, cands)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	var first, last []candidate
+	for _, c := range cands {
+		if drafts[c.ns] {
+			last = append(last, c)
+		} else {
+			first = append(first, c)
+		}
+	}
+	var out []Decision
+	var retry []candidate
+	check := func(c candidate, final bool) {
+		d, err := j.Check(ctx, c.base, c.ns)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("janitor: %s: %w", c.ns, err))
+			return
+		}
+		if d.Action == ActionRetry && !final {
+			retry = append(retry, c)
+			return
+		}
+		out = append(out, d)
+	}
+	for _, c := range first {
+		check(c, false)
+	}
+	for _, c := range last {
+		check(c, false)
+	}
+	for _, c := range retry {
+		check(c, true)
+	}
 	return out, errors.Join(errs...)
 }
 
-// walk handles ns's branches, each after its own branches.
-func (j *Janitor) walk(ctx context.Context, ns string) ([]Decision, error) {
+type candidate struct{ base, ns string }
+
+// walk lists ns's live branches, each after its own branches.
+func (j *Janitor) walk(ctx context.Context, ns string) ([]candidate, error) {
 	brs, err := j.c.Branches(ctx, ns)
 	if err != nil {
 		return nil, fmt.Errorf("janitor: branches of %s: %w", ns, err)
 	}
-	var out []Decision
+	var out []candidate
 	var errs []error
 	for _, b := range brs {
 		if b.Name == "" || b.Purged || b.Remote != nil {
 			continue
 		}
-		ds, err := j.walk(ctx, b.Name)
-		out = append(out, ds...)
+		cs, err := j.walk(ctx, b.Name)
+		out = append(out, cs...)
 		if err != nil {
 			errs = append(errs, err)
 		}
-		d, err := j.Check(ctx, ns, b.Name)
-		if err != nil {
-			errs = append(errs, fmt.Errorf("janitor: %s: %w", b.Name, err))
-			continue
-		}
-		out = append(out, d)
+		out = append(out, candidate{ns, b.Name})
 	}
 	return out, errors.Join(errs...)
+}
+
+// draftBranches finds the draft branches among the candidates: drafts in
+// their namespace document, or listed by a release of Options.Releases
+// and holding schema documents (a $schema that is a dialect URL).
+func (j *Janitor) draftBranches(ctx context.Context, cands []candidate) (map[string]bool, error) {
+	out := map[string]bool{}
+	listed := map[string]bool{}
+	var errs []error
+	for _, link := range j.opt.Releases {
+		rel, err := release.Load(ctx, j.c, link)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("janitor: release %s: %w", link, err))
+			continue
+		}
+		for _, b := range rel.Doc.Branches {
+			listed[b.NS] = true
+		}
+	}
+	for _, c := range cands {
+		h, err := j.c.NSHead(ctx, c.ns)
+		if err != nil {
+			continue // Check reports it
+		}
+		doc, err := j.c.NSDoc(ctx, c.ns, h.ID)
+		if err != nil {
+			continue
+		}
+		if _, ok := doc.Value["drafts"]; ok {
+			out[c.ns] = true
+			continue
+		}
+		if !listed[c.ns] {
+			continue
+		}
+		holds, err := j.holdsSchemas(ctx, c.ns, h.ID)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("janitor: %s: %w", c.ns, err))
+			continue
+		}
+		out[c.ns] = holds
+	}
+	return out, errors.Join(errs...)
+}
+
+// holdsSchemas reports whether a branch wrote a schema document.
+func (j *Janitor) holdsSchemas(ctx context.Context, ns, at string) (bool, error) {
+	log, err := j.c.NSLog(ctx, ns, at, "")
+	if err != nil {
+		return false, err
+	}
+	for _, ch := range merge.Collect(log) {
+		if ch.Kind != "head" || ch.Purged {
+			continue
+		}
+		d, err := j.c.Doc(ctx, ns, ch.Resource, ch.Target)
+		if err != nil {
+			if client.IsGone(err) || client.IsNotFound(err) {
+				continue
+			}
+			return false, err
+		}
+		m, _ := d.Value.(map[string]any)
+		if s, _ := m["$schema"].(string); schema.IsDialect(s) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // Check evaluates one branch of base and purges it if every condition holds
@@ -291,6 +412,19 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 	if err != nil {
 		if client.IsStale(err) {
 			d.Reason = "the branch changed while checking; next sweep"
+			return d, nil
+		}
+		if client.IsInUse(err) {
+			// Documents still rely on the branch's last copy of a schema
+			// revision (§6.1), e.g. a release's drafts while its other
+			// branches aren't purged yet (§F.9): try again later, never
+			// force.
+			ae, _ := client.AsAPIError(err)
+			d.Action, d.Reason = ActionRetry, d.Claim+", verified and expired, but the purge is refused with in_use"
+			if ae != nil && len(ae.Referencing()) > 0 {
+				d.Reason += ": still referenced from " + strings.Join(ae.Referencing(), ", ")
+			}
+			d.Reason += "; retried later"
 			return d, nil
 		}
 		if ae, ok := client.AsAPIError(err); ok && ae.Status == 409 {

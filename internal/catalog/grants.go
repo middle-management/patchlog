@@ -650,7 +650,7 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 	}
 	subs := Subjects(v)
 	admin := s.isAdmin(v)
-	var incs map[string]includes
+	var incs map[string]Includes
 	if !admin {
 		if incs, err = s.includesOfTrusted(ctx); err != nil {
 			return nil, err
@@ -703,14 +703,14 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 		map[string]any{"op": "writes", "within": []any{"/parents"}}}}, nil
 }
 
-// includes is one content namespace's declared role inclusions (§B.11.4):
+// Includes is one content namespace's declared role inclusions (§B.11.4):
 // role -> the roles it names in "includes".
-type includes map[string][]string
+type Includes map[string][]string
 
-// parseIncludes reads "includes" from a namespace document's roles. Other
+// ParseIncludes reads "includes" from a namespace document's roles. Other
 // role fields are the core's business; a malformed includes counts as none.
-func parseIncludes(doc map[string]any) includes {
-	out := includes{}
+func ParseIncludes(doc map[string]any) Includes {
+	out := Includes{}
 	roles, _ := doc["roles"].(map[string]any)
 	for r, def := range roles {
 		d, _ := def.(map[string]any)
@@ -727,7 +727,7 @@ func parseIncludes(doc map[string]any) includes {
 // closure is every role present given roles: the roles themselves and,
 // transitively, every role they include. Cycles in includes are harmless:
 // each role is visited once.
-func (inc includes) closure(roles []string) map[string]bool {
+func (inc Includes) closure(roles []string) map[string]bool {
 	out := map[string]bool{}
 	stack := append([]string(nil), roles...)
 	for len(stack) > 0 {
@@ -745,20 +745,20 @@ func (inc includes) closure(roles []string) map[string]bool {
 // includesOfTrusted reads the includes of every trusted content namespace.
 // The declarations are trusted as written: changing /roles needs a * key
 // in that namespace (§B.11.4, §C.1.1).
-func (s *Service) includesOfTrusted(ctx context.Context) (map[string]includes, error) {
+func (s *Service) includesOfTrusted(ctx context.Context) (map[string]Includes, error) {
 	var trust []string
 	s.t.View(func(g *tree.Graph, _ map[string]string) {
 		for ns := range g.Trust {
 			trust = append(trust, ns)
 		}
 	})
-	out := map[string]includes{}
+	out := map[string]Includes{}
 	for _, ns := range trust {
 		cfg, err := s.t.Checker().Config(ctx, ns)
 		if err != nil {
 			return nil, upstream(err)
 		}
-		out[ns] = parseIncludes(cfg.Doc)
+		out[ns] = ParseIncludes(cfg.Doc)
 	}
 	return out, nil
 }
@@ -769,7 +769,7 @@ func (s *Service) includesOfTrusted(ctx context.Context) (map[string]includes, e
 // content namespace. A folder's roles reach whatever is, or will be,
 // placed below it, so for a folder r must be implied in every trusted
 // content namespace (a namespace declaring nothing implies nothing).
-func present(g *tree.Graph, d, r string, before []string, incs map[string]includes) bool {
+func present(g *tree.Graph, d, r string, before []string, incs map[string]Includes) bool {
 	if contains(before, r) {
 		return true
 	}
@@ -790,7 +790,7 @@ func present(g *tree.Graph, d, r string, before []string, incs map[string]includ
 // widens reports a subject, node and role that a move of name to tos
 // would add to the effective roles of the moved subtree (§B.11.4). Roles
 // are compared by name, with the content namespace's declared includes.
-func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[string]includes) (subject, node, role string, bad bool) {
+func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[string]Includes) (subject, node, role string, bad bool) {
 	override := map[string][]string{name: tos}
 	below := g.Descendants([]string{name})
 	nodes := make([]string, 0, len(below))

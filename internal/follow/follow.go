@@ -126,6 +126,7 @@ type options struct {
 	sse        bool
 	branches   bool
 	snapshot   bool
+	isBranch   bool
 	maxUnits   int
 	minBackoff time.Duration
 	maxBackoff time.Duration
@@ -148,6 +149,13 @@ func WithBranches() Option { return func(o *options) { o.branches = true } }
 // WithSnapshot makes a consumer with an empty checkpoint start from the
 // /heads listing at the current head instead of replaying from "" (§10).
 func WithSnapshot() Option { return func(o *options) { o.snapshot = true } }
+
+// AsBranch makes a consumer that follows a branch directly (not through
+// its base, WithBranches) start, with an empty checkpoint, from the
+// branch's first entry together with its /heads listing there, which
+// includes what it reads through, then follow its own log (§10 Branches:
+// contents). A release preview follows branches this way (§B.5).
+func AsBranch() Option { return func(o *options) { o.isBranch = true } }
 
 // WithMaxUnits sets how many units one Apply may receive. The default 1
 // delivers each unit separately; 0 delivers every unit of a fetched page
@@ -227,7 +235,7 @@ func (n *nsFollower) run(ctx context.Context) error {
 	}
 	if n.cur == "" {
 		isBranch := n.branch != nil
-		if !isBranch && n.ns != f.ns {
+		if !isBranch && (n.ns != f.ns || f.opt.isBranch) {
 			isBranch = true
 		}
 		if isBranch {

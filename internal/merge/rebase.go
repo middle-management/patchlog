@@ -30,6 +30,14 @@ type RebaseOptions struct {
 	// "cleanup", so a private draft stays private and keeps its cleanup
 	// policy (the successor otherwise starts as a copy of Onto's document).
 	CopyConfig []string
+	// Patches are further changes to the successor's namespace document
+	// in its creation request, after CopyConfig's: e.g. the drafts.for of a
+	// release's schema successor naming the other successors (§F.9).
+	Patches []any
+	// Prepare, if set, is called with each replay plan (the first and the
+	// catch-up) before it is checked and applied, e.g. to resolve
+	// resources by squashing them (§F.9 Rebasing).
+	Prepare func(ctx context.Context, p *Plan) error
 	// Plan options for the replays (Squash is ignored: a rebase keeps ids).
 	// An e2e branch needs Plan.E2E.
 	Plan Options
@@ -118,6 +126,7 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 			patches = append(patches, map[string]any{"op": "add", "path": "/" + k, "value": v})
 		}
 	}
+	patches = append(patches, opt.Patches...)
 	out := &RebaseResult{New: opt.New}
 	br := client.BranchRequest{Name: opt.New}
 	if len(patches) > 0 {
@@ -158,6 +167,11 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 		return out, err
 	}
 	out.First = first
+	if opt.Prepare != nil {
+		if err := opt.Prepare(ctx, first); err != nil {
+			return out, err
+		}
+	}
 	if !first.Clean() {
 		return out, ErrConflicts
 	}
@@ -195,6 +209,11 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 		return out, err
 	}
 	out.CatchUp = catch
+	if opt.Prepare != nil {
+		if err := opt.Prepare(ctx, catch); err != nil {
+			return out, err
+		}
+	}
 	if !catch.Clean() {
 		return out, ErrConflicts
 	}

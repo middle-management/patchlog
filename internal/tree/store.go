@@ -135,6 +135,7 @@ func b2i(b bool) int {
 // loadGraph rebuilds the graph from the database.
 func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 	g := newGraph(s.opt.Catalog)
+	g.Aliases = s.opt.Branches
 	var cfg string
 	err := q.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'config'`).Scan(&cfg)
 	switch {

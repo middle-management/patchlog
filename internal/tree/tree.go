@@ -124,6 +124,15 @@ type Options struct {
 	Hook Hook
 	// RoleView, if set, lets readers see nodes through roles (§B.11.5).
 	RoleView RoleView
+	// Branches makes the service a release preview (§B.5, §F.9): it maps
+	// a namespace (the catalog, or a content namespace it trusts) to the
+	// release's branch of it, which is followed in its place. Documents
+	// keep naming the bases (placements say matches.final, parents say
+	// /r/{catalog}/…), so the graph is keyed by the bases' names, while
+	// checkpoints, the combined checkpoint, cache tags, item links and
+	// read checks use the branches. A preview issues no grants: it can't
+	// be combined with a catalog service (RoleView, Hook).
+	Branches map[string]string
 }
 
 // Service is a running tree service.
@@ -159,6 +168,16 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	}
 	if !client.ValidNSName(opt.Catalog) {
 		return nil, fmt.Errorf("tree: invalid catalog namespace %q", opt.Catalog)
+	}
+	if len(opt.Branches) > 0 && (opt.RoleView != nil || opt.Hook != nil) {
+		return nil, errors.New("tree: a release preview (Branches) serves previews only and issues no grants (§B.5); it can't be a catalog service")
+	}
+	seenBr := map[string]bool{}
+	for ns, br := range opt.Branches {
+		if !client.ValidNSName(ns) || !client.ValidNSName(br) || ns == br || seenBr[br] {
+			return nil, fmt.Errorf("tree: invalid preview branch %q for %q", br, ns)
+		}
+		seenBr[br] = true
 	}
 	if opt.MinWait == 0 {
 		opt.MinWait = 2 * time.Second
@@ -234,7 +253,7 @@ func (s *Service) init(ctx context.Context) error {
 			rows.Close()
 			return err
 		}
-		s.cur[ns] = id
+		s.cur[s.logical(ns)] = id
 	}
 	rows.Close()
 	rows, err = s.db.QueryContext(ctx, `SELECT substr(k, 8) FROM meta WHERE k LIKE 'purged:%'`)
@@ -287,6 +306,30 @@ func (s *Service) reload(ctx context.Context) error {
 
 // Close closes the database.
 func (s *Service) Close() error { return s.db.Close() }
+
+// actual is the namespace followed for ns: its branch in a release preview
+// (Options.Branches), otherwise ns.
+func (s *Service) actual(ns string) string {
+	if a := s.opt.Branches[ns]; a != "" {
+		return a
+	}
+	return ns
+}
+
+// logical is the namespace a followed namespace stands for: the base whose
+// branch it is in a release preview, otherwise ns itself.
+func (s *Service) logical(ns string) string {
+	for k, v := range s.opt.Branches {
+		if v == ns {
+			return k
+		}
+	}
+	return ns
+}
+
+// Branches is the release preview's namespace -> branch map (nil if the
+// service is no preview).
+func (s *Service) Branches() map[string]string { return s.opt.Branches }
 
 // Origin is the core's canonical origin.
 func (s *Service) Origin() string { return s.origin }
@@ -396,29 +439,35 @@ func (s *Service) follow(ctx context.Context, ns string) {
 	}
 	opts = append(opts, s.opt.FollowOptions...)
 	pause := time.Second
+	real := s.actual(ns) // a release preview follows the branch
+	if real != ns {
+		// Its read-through content comes from its /heads at its first
+		// entry (§10 Branches).
+		opts = append(opts, follow.AsBranch())
+	}
 	for {
 		var err error
 		// Addendum E: never consume what can't be decrypted (or, for the
 		// catalog, whose listings can't be sealed); skip it and say why. A
 		// content namespace is followed for heads even if its e2e
 		// documents can't be read.
-		if reason, permanent := s.keys.Check(ctx, ns, ns != s.opt.Catalog); reason != "" {
+		if reason, permanent := s.keys.Check(ctx, real, ns != s.opt.Catalog); reason != "" {
 			if permanent {
-				s.opt.Logf("tree: skipping %s: %s", ns, reason)
+				s.opt.Logf("tree: skipping %s: %s", real, reason)
 				return
 			}
 			err = fmt.Errorf("skipped: %s", reason)
 		} else {
-			err = follow.New(s.c, ns, s.cps, s, opts...).Run(ctx)
+			err = follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
 		}
 		if ctx.Err() != nil {
 			return
 		}
 		if errors.Is(err, follow.ErrPurged) {
-			s.opt.Logf("tree: %s was purged", ns)
+			s.opt.Logf("tree: %s was purged", real)
 			return
 		}
-		s.opt.Logf("tree: following %s stopped: %v; restarting in %s", ns, err, pause)
+		s.opt.Logf("tree: following %s stopped: %v; restarting in %s", real, err, pause)
 		t := time.NewTimer(pause)
 		select {
 		case <-ctx.Done():
@@ -444,22 +493,31 @@ type prep struct {
 // Apply implements follow.Handler. The batch's units are coalesced and
 // fetched outside the locks, then applied to the graph, the derived rows,
 // the hook's tables and the checkpoint in one transaction (§A.1, §B.11.7).
-func (s *Service) Apply(ctx context.Context, b *follow.Batch) error {
+func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
+	// In a release preview the followed namespace is a branch, and the
+	// graph is keyed by the namespace it stands for (Options.Branches): b
+	// is the batch under that name, fb the batch as followed.
+	b := fb
+	if lg := s.logical(fb.NS); lg != fb.NS {
+		c := *fb
+		c.NS = lg
+		b = &c
+	}
 	co := b.Coalesce()
 	isCat := b.NS == s.opt.Catalog
 	var cfg *client.NSDoc
 	for _, u := range b.Units {
 		if u.Config != nil {
 			cfg = u.Config
-			s.keys.Observe(b.NS, u.Config.Value)
+			s.keys.Observe(fb.NS, u.Config.Value)
 		}
 	}
 	var preps []prep
 	for _, ch := range co.Changes {
 		p := prep{name: ch.Resource, kind: ch.Kind, head: ch.Target, purged: ch.Purged}
 		if ch.Kind == "head" && (isCat || s.opt.SelfPlacing) {
-			doc, err := s.keys.FetchDoc(ctx, b.NS, ch.Resource, ch.Target, func(f client.Flag) {
-				s.opt.Logf("tree: %s/%s: revision %s by %s is flagged and left out: %s", b.NS, ch.Resource, f.ID, f.Author, f.Message)
+			doc, err := s.keys.FetchDoc(ctx, fb.NS, ch.Resource, ch.Target, func(f client.Flag) {
+				s.opt.Logf("tree: %s/%s: revision %s by %s is flagged and left out: %s", fb.NS, ch.Resource, f.ID, f.Author, f.Message)
 			})
 			switch {
 			case err == nil:
@@ -515,20 +573,20 @@ func (s *Service) Apply(ctx context.Context, b *follow.Batch) error {
 		}
 	}
 	if co.PurgedNS {
-		s.keys.Forget(b.NS)
+		s.keys.Forget(fb.NS)
 	}
 	s.mu.Lock()
 	close(s.changed)
 	s.changed = make(chan struct{})
 	s.mu.Unlock()
 	if cfg != nil {
-		s.checker.Observe(b.NS, b.NewCheckpoint)
+		s.checker.Observe(fb.NS, b.NewCheckpoint)
 	}
 	if trustChanged {
 		s.ensureFollowers()
 	}
 	if s.opt.OnApply != nil {
-		s.opt.OnApply(b)
+		s.opt.OnApply(fb)
 	}
 	// Only listings at the current at are served.
 	if err := s.sealed.Retire(context.WithoutCancel(ctx), s.db, s.opt.Catalog, s.At()); err != nil {
@@ -677,12 +735,12 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	// large to name all they show), a purged namespace from every cached
 	// listing whose checkpoint covers it (ns:{ns}).
 	if co.PurgedNS {
-		res.tags = append(res.tags, "ns:"+b.NS)
+		res.tags = append(res.tags, "ns:"+s.actual(b.NS))
 	}
 	nr := 0
 	for _, p := range preps {
 		if p.purged {
-			res.tags = append(res.tags, "r:"+b.NS+"/"+p.name)
+			res.tags = append(res.tags, "r:"+s.actual(b.NS)+"/"+p.name)
 			nr++
 		}
 	}
@@ -723,7 +781,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	if err := s.sealed.Purge(ctx, tx, res.tags); err != nil {
 		return nil, err
 	}
-	if err := s.cps.Save(ctx, tx, b.Origin, b.NS, b.NewCheckpoint); err != nil {
+	if err := s.cps.Save(ctx, tx, b.Origin, s.actual(b.NS), b.NewCheckpoint); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

@@ -3,6 +3,7 @@ package merge
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -72,6 +73,27 @@ func (p *Plan) Resolve(name string, steps ...client.Step) error {
 	r.resolution = append([]client.Step(nil), steps...)
 	p.applyResolution(r, r.resolution)
 	return nil
+}
+
+// Force resolves a resource whatever its classification: a resource that
+// classifies as merged or behind (e.g. through the merge point of an
+// earlier batch that recorded only part of it, the first half of a node a
+// release merges in two halves, §F.9) gets an item too, with the
+// resolution written against the target's current head.
+func (p *Plan) Force(name string, steps ...client.Step) error {
+	r := p.Resource(name)
+	if r == nil {
+		return fmt.Errorf("merge: %s is not in the plan", name)
+	}
+	r.forced = true
+	r.forceClass()
+	return p.Resolve(name, steps...)
+}
+
+func (r *Resource) forceClass() {
+	if r.forced && (r.Class == Merged || r.Class == Behind) && r.Base != "" {
+		r.Class, r.IfMatch, r.IfNoneMatch, r.Conflicts = Replay, r.Base, false, nil
+	}
 }
 
 func (p *Plan) applyResolution(r *Resource, steps []client.Step) {
@@ -147,7 +169,7 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 // an e2e target the steps are the sealed ones (see sealItems, which
 // DryRun and Apply run first); plaintext is never sent there.
 func (p *Plan) Batch() client.BatchRequest {
-	req := client.BatchRequest{Source: map[string]any{"ns": p.Branch, "at": p.BranchAt}}
+	req := client.BatchRequest{Source: map[string]any{"ns": p.Branch, "at": p.BranchAt}, SourceAuthorizations: p.opt.SourceAuthorizations}
 	for _, r := range p.Items() {
 		steps := r.Steps
 		if p.TargetLevel == "e2e" {
@@ -162,6 +184,42 @@ func (p *Plan) Batch() client.BatchRequest {
 }
 
 func (p *Plan) empty(req client.BatchRequest) bool { return len(req.Items) == 0 && req.Config == nil }
+
+// batchClient is the client batches are submitted with: Options.BatchClient
+// if set (e.g. under a catalog service's merge grant, §F.8), else the
+// plan's.
+func (p *Plan) batchClient() *client.Client {
+	if p.opt.BatchClient != nil {
+		return p.opt.BatchClient
+	}
+	return p.c
+}
+
+// SetBatchClient replaces the client the plan's batches (dry runs
+// included) are submitted with, e.g. with a fresh grant before a retry.
+func (p *Plan) SetBatchClient(c *client.Client) { p.opt.BatchClient = c }
+
+// Order moves the named resources to the front of the plan, in the order
+// given, so their items come first in the batch: schema resources in $ref
+// order, so later items may reference schema revisions earlier ones create
+// (§6.1, §7.5). Names not in the plan are ignored.
+func (p *Plan) Order(names []string) {
+	pos := map[string]int{}
+	for i, n := range names {
+		pos[n] = i
+	}
+	sort.SliceStable(p.Resources, func(i, j int) bool {
+		pi, iok := pos[p.Resources[i].Name]
+		pj, jok := pos[p.Resources[j].Name]
+		switch {
+		case iok && jok:
+			return pi < pj
+		case iok != jok:
+			return iok
+		}
+		return false
+	})
+}
 
 // checkIDs verifies that fast-forwarded items produced (or would produce)
 // exactly the branch's ids.
@@ -198,7 +256,7 @@ func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	if p.empty(req) {
 		return nil, nil
 	}
-	res, err := p.c.Batch(ctx, p.Target, req, true)
+	res, err := p.batchClient().Batch(ctx, p.Target, req, true)
 	if err != nil {
 		return nil, err
 	}
@@ -235,7 +293,7 @@ func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 		if p.empty(req) {
 			return &Result{Noop: true, Attempts: attempt}, nil
 		}
-		res, err := p.c.Batch(ctx, p.Target, req, false)
+		res, err := p.batchClient().Batch(ctx, p.Target, req, false)
 		if err == nil {
 			out := &Result{NSID: res.NSID, Items: res.Items, Attempts: attempt, IDs: map[string][]string{}}
 			for _, it := range res.Items {

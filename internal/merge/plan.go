@@ -152,6 +152,7 @@ type Resource struct {
 	Note     string `json:"note,omitempty"`
 
 	branchPurged bool
+	forced       bool // Force: an item whatever the classification
 	resolution   []client.Step
 	resolvedAt   string // B the resolution was written against
 	baseLast     string // the last live revision when B is a tombstone
@@ -240,6 +241,15 @@ type Options struct {
 	// target when either is an e2e namespace (§F.8); it must hold (or be
 	// able to fetch) both namespaces' keys.
 	E2E *client.E2E
+	// SourceAuthorizations are sent as repeated Source-Authorization
+	// headers with every batch (§7.5, §7.8): grants that read the branch,
+	// for its blobs, or branches holding draft schema revisions the items
+	// resolve (§6.1).
+	SourceAuthorizations []string
+	// BatchClient, if set, submits the batches (dry runs included) in
+	// place of the plan's client, e.g. under a catalog service's merge
+	// grant (§F.8). Reads still use the plan's client.
+	BatchClient *client.Client
 
 	// successor is set by Rebase: the target is the branch's successor,
 	// whose merge batches of the branch are the rebase itself, so all of
@@ -706,6 +716,7 @@ func (p *Plan) classify(ctx context.Context, r *Resource) error {
 	if err := p.classifyAncestry(ctx, r, h); err != nil {
 		return err
 	}
+	r.forceClass()
 	if hadResolution {
 		if resolvedAt == r.Base && (r.Class == FastForward || r.Class == Replay) {
 			p.applyResolution(r, resolution)
