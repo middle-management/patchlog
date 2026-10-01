@@ -16,8 +16,9 @@ var assets embed.FS
 const Prefix = "/playground/"
 
 // csp keeps the page honest: everything is same-origin, nothing external.
+// Images may come from blob: URLs, for the previews of fetched blobs (§7.8).
 const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; " +
-	"img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+	"img-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
 
 // Handler serves the playground under /playground/. Mount it at that prefix;
 // a request for /playground (no slash) is redirected.

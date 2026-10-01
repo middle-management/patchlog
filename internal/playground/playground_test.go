@@ -15,6 +15,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -36,8 +37,9 @@ func TestHandler(t *testing.T) {
 		if rec.Code != 200 || !strings.Contains(rec.Header().Get("Content-Type"), want) || rec.Body.Len() == 0 {
 			t.Errorf("%s: %d %q", path, rec.Code, rec.Header().Get("Content-Type"))
 		}
-		if !strings.Contains(rec.Header().Get("Content-Security-Policy"), "connect-src 'self'") {
-			t.Errorf("%s: CSP %q", path, rec.Header().Get("Content-Security-Policy"))
+		// connect-src stays same-origin; img-src adds blob: for blob previews (§7.8).
+		if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "connect-src 'self'") || !strings.Contains(csp, "img-src 'self' data: blob:;") {
+			t.Errorf("%s: CSP %q", path, csp)
 		}
 	}
 	rec := httptest.NewRecorder()
@@ -110,6 +112,11 @@ type fixture struct {
 	PadLen          [][2]int        `json:"padLen"`
 	Keyring         json.RawMessage `json:"keyring"`
 	PatchSet        fxPatchSet      `json:"patchSet"`
+	BlobIDs         []fxBlobID      `json:"blobIDs"`
+	BlobE3          fxBlob          `json:"blobE3"`
+	BlobE3Padded    fxBlob          `json:"blobE3Padded"`
+	BlobE2          fxBlob          `json:"blobE2"`
+	PatchSetBlobs   fxPatchSet      `json:"patchSetBlobs"`
 	FromJS          *fromJS         `json:"fromJS,omitempty"`
 }
 
@@ -142,6 +149,26 @@ type fxPatchSet struct {
 	PatchSet  json.RawMessage `json:"patchSet"`
 	ID        string          `json:"id"`
 	Tombstone string          `json:"tombstone,omitempty"`
+	Blobs     []string        `json:"blobs,omitempty"` // the declared blob list of the sealed op
+}
+
+// fxBlobID is a blob id vector (§3.7).
+type fxBlobID struct {
+	Type  string `json:"type"`
+	Nonce string `json:"nonce"`
+	Data  string `json:"data"`
+	ID    string `json:"id"`
+}
+
+// fxBlob is a sealed blob (§E.2.2, §E.3.1). Key is the key it is sealed
+// under (K_r at E2, the reference's key at E3); Kid and PL are the E2 header.
+type fxBlob struct {
+	Key    string         `json:"key"`
+	Kid    string         `json:"kid,omitempty"`
+	PL     map[string]any `json:"pl,omitempty"`
+	Data   string         `json:"data"`
+	Sealed string         `json:"sealed"`
+	Ref    map[string]any `json:"ref,omitempty"`
 }
 
 // fromJS holds outputs of seal.js (run under node) that Go must open.
@@ -150,6 +177,10 @@ type fromJS struct {
 	JWE      fxJWE           `json:"jwe"`
 	PatchSet fxPatchSet      `json:"patchSet"`
 	Padded   fxPatchSet      `json:"patchSetPadded"`
+	Blobs    fxPatchSet      `json:"patchSetBlobs"`
+	BlobE3   fxBlob          `json:"blobE3"`
+	BlobE3Pd fxBlob          `json:"blobE3Padded"`
+	BlobE2   fxBlob          `json:"blobE2"`
 	Keyring  json.RawMessage `json:"keyring"`
 }
 
@@ -222,6 +253,36 @@ func generateFixture(t *testing.T) *fixture {
 	}
 	rid := ids.Revision(nil, ps)
 	f.PatchSet = fxPatchSet{NS: "fx", Name: "derby", Parent: "", Patches: jsonv.Canonical(jsonv.FromGo(patches)), PatchSet: ps, ID: rid.String(), Tombstone: ids.Tombstone(rid).String()}
+	// Blobs: ids, an E3 blob (plain and padded), an E2 blob, and a sealed op declaring blobs.
+	blobData := []byte("\x89PNG\r\n\x1a\n blob bytes \x00\x01\xff")
+	for _, v := range []struct{ typ, nonce string }{{"image/png", ""}, {"text/plain", seal.NewNonce()}, {"application/octet-stream", ""}} {
+		f.BlobIDs = append(f.BlobIDs, fxBlobID{Type: v.typ, Nonce: v.nonce, Data: b64.EncodeToString(blobData), ID: ids.Blob(v.typ, v.nonce, blobData).String()})
+	}
+	for _, v := range []struct {
+		dst *fxBlob
+		pad bool
+	}{{&f.BlobE3, false}, {&f.BlobE3Padded, true}} {
+		sealed, ref, err := client.EncryptBlob("image/png", blobData, v.pad)
+		if err != nil {
+			t.Fatal(err)
+		}
+		*v.dst = fxBlob{Key: ref["sealed"].(map[string]any)["key"].(string), Data: b64.EncodeToString(blobData), Sealed: b64.EncodeToString(sealed), Ref: ref}
+	}
+	bid := ids.Blob("image/png", seal.NewNonce(), blobData).String()
+	sb, err := seal.SealBlob(kr, kid, seal.BlobPL("fx", "derby", bid), blobData, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.BlobE2 = fxBlob{Key: f.ResourceKey.Key, Kid: kid, PL: seal.BlobPL("fx", "derby", bid), Data: b64.EncodeToString(blobData), Sealed: b64.EncodeToString(sb)}
+	bpatches := []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"pic": f.BlobE3.Ref}}}
+	bps, err := seal.SealPatchSet(ke, kid, "fx", "derby", "", jsonv.FromGo(bpatches))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bps, err = seal.WithBlobs(bps, []string{f.BlobE3.Ref["$blob"].(string)}); err != nil {
+		t.Fatal(err)
+	}
+	f.PatchSetBlobs = fxPatchSet{NS: "fx", Name: "derby", Patches: jsonv.Canonical(jsonv.FromGo(bpatches)), PatchSet: bps, ID: ids.Revision(nil, bps).String(), Blobs: []string{f.BlobE3.Ref["$blob"].(string)}}
 	return f
 }
 
@@ -318,6 +379,15 @@ func TestSelfTestFixture(t *testing.T) {
 		t.Fatalf("keyring: %v", err)
 	}
 	checkPatchSet(t, f.PatchSet, ke)
+	checkPatchSet(t, f.PatchSetBlobs, ke)
+	for _, b := range f.BlobIDs {
+		if got := ids.Blob(b.Type, b.Nonce, unb64(t, b.Data)).String(); got != b.ID {
+			t.Fatalf("blob id %s %q = %s, fixture %s", b.Type, b.Nonce, got, b.ID)
+		}
+	}
+	checkBlob(t, f.BlobE3)
+	checkBlob(t, f.BlobE3Padded)
+	checkBlob(t, f.BlobE2)
 
 	if f.FromJS == nil {
 		t.Fatal("the fixture has no fromJS part; regenerate with node on PATH: go test ./internal/playground -run TestSelfTestFixture -update")
@@ -325,8 +395,34 @@ func TestSelfTestFixture(t *testing.T) {
 	checkFromJS(t, f, priv, f.FromJS)
 }
 
+// checkBlob opens a sealed blob in Go and checks its header and bytes. At
+// E3 (no kid) it also checks the blob against its reference.
+func checkBlob(t *testing.T, b fxBlob) {
+	t.Helper()
+	sealed := unb64(t, b.Sealed)
+	h, data, err := seal.OpenBlob(sealed, unb64(t, b.Key))
+	if err != nil || !bytes.Equal(data, unb64(t, b.Data)) {
+		t.Fatalf("open blob: %v", err)
+	}
+	if b.Kid == "" {
+		if h.Kid != "" || h.PL != nil || string(h.Raw) != `{"enc":"A256GCM"}` {
+			t.Fatalf("e3 blob header %s", h.Raw)
+		}
+	} else if err := h.Expect(b.Kid, seal.PL(b.PL)); err != nil {
+		t.Fatalf("e2 blob header %s: %v", h.Raw, err)
+	}
+	if b.Ref != nil {
+		if _, err := client.DecryptBlob(b.Ref, sealed); err != nil {
+			t.Fatalf("DecryptBlob: %v", err)
+		}
+	}
+}
+
 func checkPatchSet(t *testing.T, p fxPatchSet, ke []byte) {
 	t.Helper()
+	if _, declared, ok := seal.SealedOp([]byte(p.PatchSet)); !ok || strings.Join(declared, ",") != strings.Join(p.Blobs, ",") {
+		t.Fatalf("declared blobs %v, want %v", declared, p.Blobs)
+	}
 	var parent *ids.ID
 	if p.Parent != "" {
 		pid, err := ids.Parse(p.Parent)
@@ -377,6 +473,10 @@ func checkFromJS(t *testing.T, f *fixture, priv *ecdh.PrivateKey, js *fromJS) {
 	}
 	checkPatchSet(t, js.PatchSet, unb64(t, f.EpochKey))
 	checkPatchSet(t, js.Padded, unb64(t, f.EpochKey))
+	checkPatchSet(t, js.Blobs, unb64(t, f.EpochKey))
+	checkBlob(t, js.BlobE3)
+	checkBlob(t, js.BlobE3Pd)
+	checkBlob(t, js.BlobE2)
 	h := mustHeader(t, mustSealedJWE(t, js.Padded.PatchSet))
 	if _, padded, err := seal.OpenPatchSetPadded([]byte(js.Padded.PatchSet), unb64(t, f.EpochKey), h.Kid, js.Padded.NS, js.Padded.Name, js.Padded.Parent); err != nil || !padded {
 		t.Fatalf("JS padded patch set: padded %v, %v", padded, err)
@@ -409,6 +509,14 @@ const fx = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
   const patches = [{ op: 'replace', path: '/title', value: 'from JS ✓' }, { op: 'add', path: '/$nonce', value: S.newNonce() }];
   const ps = await S.sealPatchSet(ke, 'fx#3', 'fx', 'derby', fx.patchSet.id, patches);
   const pps = await S.sealPatchSet(ke, 'fx#3', 'fx', 'derby', '', patches, true);
+  const blobData = S.unb64u(fx.blobE3.data);
+  const e3 = await S.encryptBlob('image/png', blobData, false);
+  const e3p = await S.encryptBlob('image/png', blobData, true);
+  const e2pl = { ns: 'fx', name: 'derby', blob: await S.blobID('image/png', 'abcdefghijklmnopqrstuvwxyz', blobData) };
+  const e2 = await S.sealBlob(S.unb64u(fx.resourceKey.key), 'fx#3', e2pl, blobData, false);
+  const asBlob = (x) => ({ key: x.ref.sealed.key, data: S.b64u(blobData), sealed: S.b64u(x.sealed), ref: x.ref });
+  const bpatches = [{ op: 'add', path: '', value: { pic: e3.ref } }];
+  const bps = await S.sealPatchSet(ke, 'fx#3', 'fx', 'derby', '', bpatches, false, S.blobIDs({ pic: e3.ref }));
   const kr = S.buildKeyring('fx', 3);
   await S.keyringAdd(kr, fx.recipient.x, 3, ke);
   process.stdout.write(JSON.stringify({ selfTest, fromJS: {
@@ -416,6 +524,9 @@ const fx = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
     jwe: { key: S.b64u(jweKey), kid: 'fx#7', pl, plaintext, jwe },
     patchSet: { ns: 'fx', name: 'derby', parent: fx.patchSet.id, patches, patchSet: ps, id: await S.revisionID(fx.patchSet.id, ps) },
     patchSetPadded: { ns: 'fx', name: 'derby', parent: '', patches, patchSet: pps, id: await S.revisionID('', pps) },
+    patchSetBlobs: { ns: 'fx', name: 'derby', parent: '', patches: bpatches, patchSet: bps, id: await S.revisionID('', bps), blobs: S.blobIDs({ pic: e3.ref }) },
+    blobE3: asBlob(e3), blobE3Padded: asBlob(e3p),
+    blobE2: { key: fx.resourceKey.key, kid: 'fx#3', pl: e2pl, data: S.b64u(blobData), sealed: S.b64u(e2) },
     keyring: kr } }));
 })().catch((e) => { console.error(e); process.exit(1); });
 `

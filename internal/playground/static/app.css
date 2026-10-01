@@ -323,3 +323,11 @@ ul.cat-tree ul { margin-left: 11px; padding-left: 12px; border-left: 1px dashed 
 .cat-path { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; padding: 2px 0; }
 .cat-path + .cat-path { border-top: 1px dashed var(--border); }
 ul.cat-tree details > summary { cursor: pointer; padding: 1px 6px; }
+
+/* blobs (§7.8) */
+.blobs h3 { margin: 8px 0 4px; }
+.blob-chip { border: 1px solid var(--border); border-radius: 6px; padding: 5px 8px; margin: 4px 0; background: var(--surface-2); }
+.blob-chip .row { flex-wrap: wrap; gap: 6px; margin: 0; }
+.blob-body { margin-top: 4px; }
+.blob-img { display: block; max-width: 100%; max-height: 260px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); }
+.blob-text { margin: 0; max-height: 160px; overflow: auto; font: 12px/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }

@@ -127,6 +127,7 @@
       <div id="resState" class="muted">Pick a resource from the heads table, or type a name above.</div>
       <div id="resSeal" hidden></div>
       <pre id="resDoc" class="json empty">&mdash;</pre>
+      <div id="resBlobs" hidden></div>
     </div>
 
     <div class="card">
@@ -153,6 +154,13 @@
         <button id="resendSealed" class="tiny" hidden title="Resend the exact ciphertext of the last sealed write, so a retry keeps its id (&sect;E.3.1)">resend last ciphertext</button>
       </div>
       <div id="sealOut" hidden></div>
+      <div class="row">
+        <label for="attachFile" title="Uploads the file as a blob of this resource (PUT /r/{ns}/{name}/blob/{id}, &sect;7.8) and inserts its reference into the patch set above. Sealed namespaces get a Blob-Nonce; e2e ones get the file encrypted in this browser first (&sect;E.3.1).">Attach file</label>
+        <input id="attachFile" type="file">
+        <input id="attachPath" class="mono" placeholder="path (default /attachments/-)" spellcheck="false" title="JSON Pointer where the reference is added; /- appends to an array">
+        <button id="attachBtn" class="tiny">Upload &amp; insert</button>
+      </div>
+      <div id="attachOut" hidden></div>
       <p class="note">Edit If-Match to test <code>412</code>; resend an identical request to see the idempotent-retry <code>200</code>. Blank If-Match sends none (<code>428</code>).</p>
     </div>
 
