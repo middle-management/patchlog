@@ -5,6 +5,7 @@
 CORS fixes: dev-mode writes and resumed blob downloads from other origins.
 
 - **CORS:** `X-Author` (the author under `serve -dev`) and `If-Range` are allowed in requests, and `X-E2E` is exposed in responses.
+- **Tests:** two index tests no longer race the index's checkpoint against the batch they inspect (seen once under `-race` in CI).
 
 ## v0.3.2
 
