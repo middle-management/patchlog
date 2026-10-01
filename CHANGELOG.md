@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+### Postgres: writes in one namespace run in parallel
+
+- Resource writes and batches hold their namespace's lock shared. Config writes, purges, prunes, branch operations and blob uploads still take it exclusively.
+- Only the namespace-log append is serialized: two statements and the commit, under the namespace row's lock.
+- Two writers racing on one resource still give one success and a 412 with the new head. A write that keeps losing retries with the namespace locked exclusively, so every write finishes.
+- Every write is now checked inside its own transaction (`LockedCheckBytes` 0).
+- Batches insert their rows in multi-row statements.
+- Missing resources are cached within a transaction.
+- The counts that decide intermediate snapshots live on the resource row.
+- New columns, migrated on startup: `namespaces.head_id`, `resources.snap_revs`, `resources.snap_bytes`.
+
+### CPU, both databases
+
+- Blob-reference walks skip documents without `$blob`.
+- Canonical key sorting compares ASCII names bytewise.
+- Each document's and patch set's canonical form is computed once.
+
+### Measured (4 vCPUs shared with the database, fsync on)
+
+Writes/s, p99 in brackets, for 20–70 KiB creates into one namespace:
+
+| | 1 writer | 8 | 32 | 64 | 1,000-create batch |
+|---|---|---|---|---|---|
+| Postgres, v0.3.0 | 35 (51 ms) | 51 (228 ms) | 52 (1,376 ms) | 54 (3,225 ms) | 2,623 ms |
+| Postgres, now | 161 (11 ms) | 438–500 (40–60 ms) | 350 (282 ms) | 343 (799 ms) | 330 ms |
+| SQLite, v0.3.0 | 43 (45 ms) | 81 (154 ms) | 98 (419 ms) | 108 (887 ms) | 1,079 ms |
+| SQLite, now | 381 (18 ms) | 669 (32 ms) | 664 (83 ms) | 721 (118 ms) | 252 ms |
+
 ## v0.3.0
 
 Implements spec **v0.32** (`docs/SPEC.md`). Blobs are now complete across every namespace level and tool, blob bytes live on disk, and writes on Postgres are faster.
