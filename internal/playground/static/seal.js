@@ -10,6 +10,7 @@
  *   - revision ids trunc160(sha256(parent ‖ 0x0A ‖ canonical patches)) (§3.3)
  *   - RFC 6902 JSON Patch, for folding e2e logs client-side
  *   - a small JSON Schema subset, for flagging e2e revisions on read (§E.3.2)
+ *   - blob ids (§3.7) and the binary sealed-blob form (§E.2.2, §E.3.1), for viewing and attaching files
  *
  * No dependencies; runs in browsers and in Node >= 20 (globalThis.crypto).
  */
@@ -267,17 +268,119 @@ function plDiff(got, want) {
   return out;
 }
 
-/* E3 sealed patch sets (§E.3.1): [{"op":"sealed","value":"<JWE>"}] with pl {ns, name, parent};
- * pad (a namespace with encryption.pad) pads the plaintext to its bucket with spaces (§E.2.2). */
-async function sealPatchSet(key, kidStr, ns, name, parent, patches, pad) {
+/* E3 sealed patch sets (§E.3.1): [{"op":"sealed","value":"<JWE>","blobs":[…]?}] with pl {ns, name, parent};
+ * pad (a namespace with encryption.pad) pads the plaintext to its bucket with spaces (§E.2.2).
+ * blobs is the declared list of the blob ids the resulting document references (blobIDs), left out when empty. */
+async function sealPatchSet(key, kidStr, ns, name, parent, patches, pad, blobs) {
   let pt = utf8(canonical(patches));
   if (pad) { const out = new Uint8Array(padLen(pt.length)).fill(0x20); out.set(pt); pt = out; }
   const jwe = await sealJWE(key, kidStr, { ns, name, parent: parent || '' }, pt);
-  return [{ op: 'sealed', value: jwe }];
+  const op = { op: 'sealed', value: jwe };
+  if (blobs && blobs.length) op.blobs = blobs;
+  return [op];
 }
-function sealedJWE(ps) {
-  return Array.isArray(ps) && ps.length === 1 && ps[0] && ps[0].op === 'sealed' && Object.keys(ps[0]).length === 2 &&
-    typeof ps[0].value === 'string' && ps[0].value ? ps[0].value : '';
+function sealedOp(ps) {
+  if (!Array.isArray(ps) || ps.length !== 1 || !ps[0] || ps[0].op !== 'sealed') return null;
+  const op = ps[0], n = Object.keys(op).length;
+  if (typeof op.value !== 'string' || !op.value) return null;
+  if (n === 3 && Array.isArray(op.blobs) && op.blobs.every((b) => typeof b === 'string')) return op;
+  return n === 2 ? op : null;
+}
+function sealedJWE(ps) { const op = sealedOp(ps); return op ? op.value : ''; }
+/* sealedBlobs is the declared blob list of a sealed patch set ([] when it has none) */
+function sealedBlobs(ps) { const op = sealedOp(ps); return op && op.blobs ? op.blobs : []; }
+
+/* ---------------- blobs (§3.7, §7.8, §E.2.2, §E.3.1) ---------------- */
+const BLOB_TYPE = 'application/vnd.patchlog.sealed-blob';
+const BLOB_MAGIC = utf8('PLB1');
+const MAX_BLOB_HEADER = 64 << 10;
+
+/* blobType: a media type lowercased, without parameters (client.blobType) */
+function blobType(ct) { return String(ct || '').split(';')[0].trim().toLowerCase(); }
+/* blobID = trunc160(sha256("patchlog-blob-v1" ‖ 0x0A ‖ type ‖ 0x0A ‖ nonce ‖ 0x0A ‖ bytes)), nonce "" for none (ids.Blob) */
+async function blobID(type, nonce, bytes) {
+  return idText((await sha256(concat(utf8('patchlog-blob-v1\n' + blobType(type) + '\n' + (nonce || '') + '\n'), bytes))).slice(0, 20));
+}
+
+/* blobIDs lists the distinct ids a document references: objects whose $blob member is a string, at any depth,
+ * not looking inside them; schema documents have none (client.BlobIDs). Sorted. */
+function blobIDs(doc) {
+  if (doc && typeof doc === 'object' && !Array.isArray(doc) && doc.$schema === 'https://json-schema.org/draft/2020-12/schema') return [];
+  const seen = new Set();
+  const walk = (v) => {
+    if (Array.isArray(v)) v.forEach(walk);
+    else if (v && typeof v === 'object') {
+      if (typeof v.$blob === 'string') seen.add(v.$blob);
+      else Object.values(v).forEach(walk);
+    }
+  };
+  walk(doc);
+  return [...seen].sort();
+}
+function sameBlobs(a, b) { const x = new Set(a), y = new Set(b); return x.size === y.size && [...x].every((i) => y.has(i)); }
+
+/* parseBlob splits "PLB1" ‖ len ‖ header ‖ iv ‖ ciphertext ‖ tag and checks the header (seal.ParseBlobHeader).
+ * kid and pl come together (E2) or not at all (E3). The header is unauthenticated until openBlob succeeds. */
+function parseBlob(bytes) {
+  const bad = (w) => { throw new Error('malformed sealed blob: ' + w); };
+  if (bytes.length < 8 || !equalBytes(bytes.slice(0, 4), BLOB_MAGIC)) bad('not a sealed blob');
+  const l = new DataView(bytes.buffer, bytes.byteOffset, bytes.length).getUint32(4);
+  if (l > MAX_BLOB_HEADER || l > bytes.length - 8) bad('header length');
+  let header;
+  try { header = JSON.parse(td.decode(bytes.slice(8, 8 + l))); } catch (e) { bad('header: ' + e.message); }
+  if (!header || typeof header !== 'object' || Array.isArray(header)) bad('header is not an object');
+  if (header.enc !== 'A256GCM') bad('unsupported enc');
+  for (const k of Object.keys(header)) if (k !== 'enc' && k !== 'kid' && k !== 'pl') bad('header member ' + JSON.stringify(k));
+  if ('kid' in header && (typeof header.kid !== 'string' || !header.kid)) bad('kid');
+  if ('pl' in header && (!header.pl || typeof header.pl !== 'object' || Array.isArray(header.pl))) bad('pl');
+  if (('kid' in header) !== ('pl' in header)) bad('a sealed blob has both kid and pl or neither');
+  return { header, off: 8 + l };
+}
+/* openBlob decrypts a sealed blob under key (seal.OpenBlob): the AAD is everything before the IV, the
+ * plaintext is size (8 bytes, big-endian) ‖ bytes ‖ zero padding. Callers check the header. */
+async function openBlob(bytes, key) {
+  const { header, off } = parseBlob(bytes);
+  if (bytes.length < off + 12 + 16) throw new Error('malformed sealed blob: too short');
+  const plain = await gcmOpen(key, bytes.slice(off, off + 12), bytes.slice(off + 12), bytes.slice(0, off));
+  if (plain.length < 8) throw new Error('malformed sealed blob: plaintext too short');
+  const size = new DataView(plain.buffer, plain.byteOffset, plain.length).getBigUint64(0);
+  if (size > BigInt(plain.length - 8)) throw new Error('malformed sealed blob: size exceeds its plaintext');
+  const n = Number(size);
+  if (plain.slice(8 + n).some((b) => b !== 0)) throw new Error('malformed sealed blob: padding is not zeros');
+  return { header, data: plain.slice(8, 8 + n) };
+}
+/* sealBlob seals data in the binary form; kid and pl give the E2 header, both left out the E3 one {enc}.
+ * pad zero-pads the plaintext to its padmé bucket (seal.SealBlob). */
+async function sealBlob(key, kidStr, pl, data, pad) {
+  const hdr = utf8(canonical(kidStr || pl ? { enc: 'A256GCM', kid: kidStr, pl } : { enc: 'A256GCM' }));
+  const plain = new Uint8Array(pad ? padLen(8 + data.length) : 8 + data.length);
+  new DataView(plain.buffer).setBigUint64(0, BigInt(data.length));
+  plain.set(data, 8);
+  const head = new Uint8Array(8 + hdr.length);
+  head.set(BLOB_MAGIC); new DataView(head.buffer).setUint32(4, hdr.length); head.set(hdr, 8);
+  const iv = randomBytes(12);
+  return concat(head, iv, await gcmSeal(key, iv, plain, head));
+}
+/* encryptBlob prepares a file for an e2e namespace (§E.3.1, client.EncryptBlob): a fresh key, the sealed form, and
+ * the reference that carries the key. Upload sealed with Content-Type BLOB_TYPE and no nonce. */
+async function encryptBlob(type, data, pad) {
+  const key = randomBytes(32);
+  const sealed = await sealBlob(key, '', null, data, pad);
+  const ref = { $blob: await blobID(BLOB_TYPE, '', sealed), type: BLOB_TYPE, size: sealed.length, sealed: { key: b64u(key), type: blobType(type), size: data.length } };
+  return { sealed, ref };
+}
+/* decryptBlob opens an e2e blob against its reference (client.DecryptBlob): id, size, the key of the reference,
+ * a header without kid, and the plaintext size it declares. */
+async function decryptBlob(ref, sealed) {
+  const s = ref && ref.sealed;
+  if (!s || typeof s.key !== 'string') throw new Error('the reference carries no key (§E.3.1)');
+  const key = unb64u(s.key);
+  if (key.length !== 32) throw new Error('malformed sealed blob reference: the key is not 32 bytes');
+  if (await blobID(ref.type, ref.nonce || '', sealed) !== ref.$blob || sealed.length !== ref.size) throw new Error('the blob does not match its id or size');
+  const o = await openBlob(sealed, key);
+  if (o.header.kid) throw new Error('an e2e blob\'s header has no kid');
+  if (o.data.length !== s.size) throw new Error(`the blob has ${o.data.length} bytes, the reference says ${s.size}`);
+  return { type: s.type, data: o.data };
 }
 
 /* ---------------- keyring (§E.3.2, seal.Keyring) ---------------- */
@@ -504,6 +607,34 @@ async function selfTest(fx) {
     const bare = o.text.replace(/ +$/, '');
     return (!o.header.zip && o.plaintext.length === padLen(utf8(bare).length) && canonical(JSON.parse(o.text)) === canonical(JSON.parse(fx.jwePadded.plaintext))) || 'mismatch';
   });
+  if (fx.blobIDs) {
+    await check('blob ids (§3.7)', async () => {
+      for (const b of fx.blobIDs) if ((await blobID(b.type, b.nonce, unb64u(b.data))) !== b.id) return 'mismatch for ' + b.type;
+      return fx.blobIDs.length > 0 || 'no vectors';
+    });
+    await check('open Go-sealed E3 blobs against their references, plain and padded', async () => {
+      for (const b of [fx.blobE3, fx.blobE3Padded]) {
+        const o = await decryptBlob(b.ref, unb64u(b.sealed));
+        if (o.type !== 'image/png' || !equalBytes(o.data, unb64u(b.data))) return 'mismatch';
+      }
+      return true;
+    });
+    await check('open a Go-sealed E2 blob and check its header', async () => {
+      const b = fx.blobE2, sealed = unb64u(b.sealed);
+      const o = await openBlob(sealed, unb64u(b.key));
+      return (o.header.kid === b.kid && !plDiff(o.header.pl, b.pl).length && equalBytes(o.data, unb64u(b.data))) || 'mismatch';
+    });
+    await check('tampered or mis-keyed blob is refused', async () => {
+      const b = unb64u(fx.blobE3.sealed); b[b.length - 20] ^= 1;
+      try { await openBlob(b, unb64u(fx.blobE3.key)); return 'opened'; } catch (_) { /* expected */ }
+      try { await openBlob(unb64u(fx.blobE3.sealed), unb64u(fx.blobE2.key)); return 'opened under another key'; } catch (_) { return true; }
+    });
+    await check('sealed op with a declared blob list', async () => {
+      const p = fx.patchSetBlobs;
+      if ((await revisionID(p.parent, p.patchSet)) !== p.id) return 'revision id differs';
+      return (canonical(sealedBlobs(p.patchSet)) === canonical(p.blobs) && canonical(blobIDs(p.patches[0].value)) === canonical(p.blobs)) || 'blob list differs';
+    });
+  }
   return results;
 }
 
@@ -512,7 +643,8 @@ root.PLSeal = {
   sha256, chainID, revisionID, tombstoneID, idBytes,
   hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, parseJWK,
   hpkeSeal, hpkeOpen, wrapKey, unwrapKey, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
-  sealPatchSet, sealedJWE, parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
+  sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
+  parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,
 };
 })(typeof window !== 'undefined' ? window : globalThis);
