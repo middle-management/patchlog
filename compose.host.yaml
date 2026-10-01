@@ -52,7 +52,7 @@ services:
 
   index:
     <<: *host
-    command: [index, -api=http://patchlog:9080, -ns=demo, -db=/data/index.db, -addr=:9081, -purge-url=http://cdn:8080/]
+    command: [index, -api=http://patchlog:9080, -ns=demo, -branches, -db=/data/index.db, -addr=:9081, -purge-url=http://cdn:8080/]
 
   tree:
     <<: *host
