@@ -361,10 +361,9 @@ func (t *tx) availableBlob(n *nsRow, s *itemState, uploader string, cutoff int64
 	}
 	if n.isBranch() && s.view != nil && s.view.head != nil {
 		// Attached to the same resource in a base and referenced by a
-		// document in the history as the branch sees it.
-		// TODO(blobs-remote): a remote branch's bases are shadows (§G.3),
-		// which hold no blobs: read-through blobs would be fetched from
-		// the base deployment's blob URLs and verified against their ids.
+		// document in the history as the branch sees it. A remote
+		// branch's bases are shadows, which mirror the base's blobs with
+		// its chains (§G.3, remote_blobs.go).
 		if b, _ := t.historyBlob(s.view.head, own, bid); b != nil {
 			return b
 		}

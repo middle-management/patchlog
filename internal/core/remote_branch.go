@@ -196,6 +196,9 @@ type remoteChain struct {
 	// opaque marks e2e content (§E.3): patch sets are ciphertext, never
 	// applied, and the chain has no documents.
 	opaque bool
+	// blobs are the blobs its documents reference, fetched from the base
+	// and verified (remote_blobs.go).
+	blobs map[ids.ID]*remoteBlob
 }
 
 func newChain(entries []client.LogEntry, horizonDoc []byte) *remoteChain {
@@ -211,7 +214,7 @@ func (c *remoteChain) last() client.LogEntry { return c.entries[len(c.entries)-1
 // prefix is the chain's entries up to index k.
 func (c *remoteChain) prefix(k int) *remoteChain {
 	p := newChain(c.entries[:k+1], c.horizonDoc)
-	p.opaque = c.opaque
+	p.opaque, p.blobs = c.opaque, c.blobs
 	return p
 }
 
@@ -659,6 +662,10 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 			return nil, ferr
 		}
 		r.chain = ch
+		// The blobs its documents reference, mirrored with it (§G.3).
+		if ferr := fetchBlobs(ctx, c, lv.ns, name, ch, mapErrs[i]); ferr != nil {
+			return nil, ferr
+		}
 		if !ch.opaque {
 			doc, err := ch.docAt(len(ch.entries) - 1)
 			if err != nil {
@@ -1104,6 +1111,7 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 			return nil // e2e content has no documents on the server (§E.3)
 		}
 		lastLive, lastLiveDoc = last, canonDoc
+		t.attachMirrored(res, ch, doc, last)
 		if patches == nil {
 			// The horizon: its document is kept as a snapshot (§8.6).
 			_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?)`, last, res, t.putDoc("snapshots", res, last, canonDoc))
@@ -1238,6 +1246,7 @@ func (t *tx) purgeShadow(sh *nsRow, name string) {
 	t.must(err)
 	_, err = t.Exec(`DELETE FROM snapshots WHERE res = ?`, r.id)
 	t.must(err)
+	t.purgeBlobs(`res = ?`, r.id)
 	t.flushDocs = true
 }
 
@@ -1255,6 +1264,7 @@ func (t *tx) purgeShadowNS(sh *nsRow) {
 		_, err := t.Exec(s, sh.id)
 		t.must(err)
 	}
+	t.purgeBlobs(q, sh.id)
 	_, err := t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE ns = ?`, statePurged, sh.id)
 	t.must(err)
 	t.metaChanged = true
