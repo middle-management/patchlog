@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.3.1
+
+Faster writes on both databases. On Postgres, writes to different resources of one namespace now run in parallel.
 
 ### Postgres: writes in one namespace run in parallel
 
