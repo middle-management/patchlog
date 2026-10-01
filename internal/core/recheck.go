@@ -1,7 +1,6 @@
 package core
 
 import (
-	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -15,9 +14,10 @@ import (
 // record what they read that a concurrent write could change (writeDeps).
 // Then the write lock is taken (in SQLite the engine mutex and BEGIN
 // IMMEDIATE, which also serialises other processes; on Postgres the
-// advisory locks of every namespace the check read: the target's
-// exclusive, the others shared, pglock.go), and the re-check confirms,
-// inside that transaction and after the locks, that all of it is unchanged:
+// advisory locks of every namespace the check read, all shared, the
+// target's included: writers of its other resources run alongside,
+// pglock.go), and the re-check confirms, inside that transaction and after
+// the locks, that all of it is unchanged:
 //
 //   - every namespace the check read: the target, every base whose keys and
 //     revocations applied (§C.4), the namespaces of resolved schemas, of a
@@ -35,7 +35,9 @@ import (
 //     check and insert.
 //
 // If all of it is unchanged, the decision is exactly the one steps 1–6 would
-// reach inside the lock, and the write is inserted. Otherwise the whole check
+// reach inside the lock, and the write is inserted (on Postgres, a writer of
+// the same resource that re-checked alongside may still insert first: the
+// loser's insert conflicts, isConflict, and it redoes the check as below). Otherwise the whole check
 // is redone, outside the lock again; a moved head then fails its
 // precondition (412, with the new head) in the redo. Rate-limit tokens are
 // drawn once, by the first attempt that passes step 1. After
@@ -155,10 +157,12 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 // writeOptimistic runs a resource write or a batch without a config change
 // on the D.3 write path: check outside the lock, re-check and insert inside.
 func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item, source any, isBatch bool) (*WriteResult, error) {
-	if e.pg && e.opt.LockedCheckBytes >= 0 && smallWrite(items, cmp.Or(e.opt.LockedCheckBytes, 16<<10)) {
-		// On Postgres the write lock is the namespace's alone, and the
-		// check's own transaction costs a dozen round trips, more than
-		// checking a small write takes: check it inside the lock.
+	if e.pg && (e.opt.LockedCheckBytes == 0 || e.opt.LockedCheckBytes > 0 && smallWrite(items, e.opt.LockedCheckBytes)) {
+		// On Postgres the write lock is the namespace's, held shared by
+		// writers of its resources (pglock.go), and the check's own
+		// transaction and the re-check cost a dozen round trips: check
+		// inside the lock, where only the namespace's config writes,
+		// purges and the like wait for it.
 		return e.writeLocked(ctx, req, items, source, isBatch, false)
 	}
 	rateDrawn := false
@@ -215,19 +219,30 @@ func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item,
 }
 
 // writeLocked runs a write's whole gate inside the write lock.
+//
+// On Postgres that lock is the namespace's shared one, and a concurrent
+// writer of the same resource can still win the race to insert
+// (isConflict): the check, redone, then answers with the precondition that
+// now fails (412 and the new head) or the idempotent retry. If it passes
+// again the write runs again, the last time with the namespace's lock
+// exclusive, which no writer of its resources shares, so a write always
+// terminates.
 func (e *Engine) writeLocked(ctx context.Context, req Request, items []Item, source any, isBatch, rateDrawn bool) (*WriteResult, error) {
-	var res *WriteResult
-	err := e.update(ctx, func(t *tx) error {
-		// A transaction that runs again (Postgres, pglock.go) doesn't draw
-		// its rate-limit tokens again.
-		t.rateDrawn = &rateDrawn
-		r, err := t.writeItems(req, items, nil, source, isBatch, false, rateDrawn)
-		res = r
-		return err
-	})
-	if err != nil && isConflict(err) {
-		// A concurrent writer won even so: the check, redone, answers with
-		// the precondition that now fails (412 and the new head).
+	for attempt := 0; ; attempt++ {
+		exclusive := attempt == lockedAttempts-1
+		var res *WriteResult
+		err := e.update(ctx, func(t *tx) error {
+			// A transaction that runs again (Postgres, pglock.go) doesn't draw
+			// its rate-limit tokens again.
+			t.rateDrawn = &rateDrawn
+			t.exclusive = exclusive
+			r, err := t.writeItems(req, items, nil, source, isBatch, false, rateDrawn)
+			res = r
+			return err
+		})
+		if err == nil || !isConflict(err) || exclusive {
+			return res, err
+		}
 		var r *WriteResult
 		rerr := e.read(ctx, func(t *tx) error {
 			_, rr, err := t.checkItems(req, items, nil, source, isBatch, false, true)
@@ -237,10 +252,12 @@ func (e *Engine) writeLocked(ctx context.Context, req Request, items []Item, sou
 		if rerr != nil || r != nil {
 			return r, rerr
 		}
-		return nil, err
 	}
-	return res, err
 }
+
+// lockedAttempts bounds how often writeLocked runs a write that lost a
+// race to insert but whose check passes again.
+const lockedAttempts = 3
 
 // smallWrite reports whether a write's patches are smaller than max,
 // judged by a rough size of their JSON. (The document they apply to may

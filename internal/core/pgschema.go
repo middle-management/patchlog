@@ -272,6 +272,9 @@ CREATE INDEX IF NOT EXISTS ns_log_xid ON ns_log (xid);
 -- Blob files (blobstore.go).
 ALTER TABLE blob_bytes ADD COLUMN IF NOT EXISTS file text;
 ALTER TABLE blob_epochs ADD COLUMN IF NOT EXISTS file text;
+-- The id of namespaces.head_seq, read with the row's lock (appendNS); NULL
+-- in rows from before it and in remote shadows, whose ids are looked up.
+ALTER TABLE namespaces ADD COLUMN IF NOT EXISTS head_id bytea;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 `

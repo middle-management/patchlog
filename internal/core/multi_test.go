@@ -94,11 +94,12 @@ func within(t *testing.T, d time.Duration, what string, cond func() bool) time.D
 	return time.Since(start)
 }
 
-// Writers to different namespaces run in parallel; writers to the same
-// namespace wait for each other's lock.
+// Writers to different namespaces run in parallel, and so do writers of
+// different resources of one namespace, which hold its lock shared; a
+// config write, which takes it exclusively, waits for them.
 func TestPGParallelNamespaces(t *testing.T) {
 	a, b := twoInstances(t)
-	mkNS(t, a, "n1", map[string]any{"read": "public"})
+	cfg1 := mkNS(t, a, "n1", map[string]any{"read": "public"})
 	mkNS(t, a, "n2", map[string]any{"read": "public"})
 	entered, release := make(chan struct{}), make(chan struct{})
 	var once sync.Once
@@ -138,11 +139,27 @@ func TestPGParallelNamespaces(t *testing.T) {
 	}()
 	select {
 	case err := <-same:
-		t.Fatalf("a write to n1 didn't wait for n1's lock: %v", err)
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a write to n1's s waited for a write to n1's r")
+	}
+
+	cfg := make(chan error, 1)
+	go func() {
+		r := who
+		r.NS = "n1"
+		_, err := b.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg1, Patches: []any{map[string]any{"op": "add", "path": "/title", "value": "t"}}})
+		cfg <- err
+	}()
+	select {
+	case err := <-cfg:
+		t.Fatalf("a config write to n1 didn't wait for n1's lock: %v", err)
 	case <-time.After(300 * time.Millisecond):
 	}
 	close(release)
-	for _, c := range []chan error{held, same} {
+	for _, c := range []chan error{held, cfg} {
 		if err := <-c; err != nil {
 			t.Fatal(err)
 		}
@@ -151,8 +168,11 @@ func TestPGParallelNamespaces(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(info.Entries) != 3 { // config, r, s
-		t.Fatalf("n1's log has %d entries, want 3", len(info.Entries))
+	if len(info.Entries) != 4 { // config, s, r, config
+		t.Fatalf("n1's log has %d entries, want 4", len(info.Entries))
+	}
+	if e := info.Entries[len(info.Entries)-1]; e["kind"] != "config" {
+		t.Fatalf("n1's last entry is %v, want the config write's", e["kind"])
 	}
 }
 
@@ -275,6 +295,161 @@ func TestPGRace412(t *testing.T) {
 			t.Fatalf("round %d: 412 names %v, the winner is %s", round, ae.Body["head"], ids[win])
 		}
 		head = ids[win]
+	}
+}
+
+// barrier holds the first n writers that reach it until all n have, so
+// they are known to hold their namespace's lock at once; later ones pass.
+type barrier struct {
+	mu      sync.Mutex
+	n       int
+	arrived chan struct{}
+}
+
+func newBarrier(n int) *barrier { return &barrier{n: n, arrived: make(chan struct{})} }
+
+func (b *barrier) wait(t *testing.T) {
+	b.mu.Lock()
+	if b.n == 0 {
+		b.mu.Unlock()
+		return
+	}
+	if b.n--; b.n == 0 {
+		close(b.arrived)
+	}
+	b.mu.Unlock()
+	select {
+	case <-b.arrived:
+	case <-time.After(5 * time.Second):
+		t.Error("the writers didn't hold the namespace's lock at once")
+	}
+}
+
+// Writers of one namespace hold its lock shared, checked (inside the lock,
+// or first outside it with the D.3 re-check inside) and inserting at once:
+// writers of different resources both succeed, and of the same resource
+// one wins and the other is answered 412 with the winner's head, on both
+// paths and from both instances. Every chain stays linear.
+func TestPGSharedNamespaceLock(t *testing.T) {
+	for _, mode := range []struct {
+		name   string
+		locked int
+	}{{"check-inside", 0}, {"re-check", -1}} {
+		t.Run(mode.name, func(t *testing.T) {
+			a, b := twoInstances(t)
+			mkNS(t, a, "n", map[string]any{"read": "public"})
+			var bar atomic.Pointer[barrier]
+			for _, e := range []*Engine{a, b} {
+				e.opt.LockedCheckBytes = mode.locked
+				e.afterWriteLock = func(ns string) {
+					if br := bar.Load(); br != nil && ns == "n" {
+						br.wait(t)
+					}
+				}
+			}
+			// both runs f on a and b at once, past the barrier together.
+			both := func(f func(e *Engine, i int) (string, error)) (ids [2]string, errs [2]error) {
+				bar.Store(newBarrier(2))
+				defer bar.Store(nil)
+				var wg sync.WaitGroup
+				for i, e := range []*Engine{a, b} {
+					wg.Add(1)
+					go func() {
+						defer wg.Done()
+						ids[i], errs[i] = f(e, i)
+					}()
+				}
+				wg.Wait()
+				return
+			}
+			oneWins := func(what string, ids [2]string, errs [2]error) string {
+				t.Helper()
+				win := 0
+				if errs[0] != nil {
+					win = 1
+				}
+				if errs[win] != nil || status(errs[1-win]) != 412 {
+					t.Fatalf("%s: %v, %v", what, errs[0], errs[1])
+				}
+				var ae *Error
+				errors.As(errs[1-win], &ae)
+				if ae.Body["head"] != ids[win] {
+					t.Fatalf("%s: 412 names %v, the winner is %s", what, ae.Body["head"], ids[win])
+				}
+				return ids[win]
+			}
+
+			// Different resources: both proceed.
+			ids, errs := both(func(e *Engine, i int) (string, error) { return put(e, "n", fmt.Sprint("r", i), "", i) })
+			if errs[0] != nil || errs[1] != nil {
+				t.Fatal(errs)
+			}
+			heads := map[string]string{"r0": ids[0], "r1": ids[1]}
+			// The same new resource.
+			ids, errs = both(func(e *Engine, i int) (string, error) { return put(e, "n", "c", "", i) })
+			heads["c"] = oneWins("create", ids, errs)
+			// The same head of one resource, a few times over.
+			for round := 0; round < 5; round++ {
+				h := heads["r0"]
+				ids, errs := both(func(e *Engine, i int) (string, error) { return put(e, "n", "r0", h, 10+round*2+i) })
+				heads["r0"] = oneWins(fmt.Sprint("append ", round), ids, errs)
+			}
+			// A batch and a single write racing for one resource; the
+			// batch's other item doesn't land either when it loses.
+			h := heads["r1"]
+			ids, errs = both(func(e *Engine, i int) (string, error) {
+				if i == 1 {
+					return put(e, "n", "r1", h, 100)
+				}
+				r := who
+				r.NS = "n"
+				res, err := e.Batch(context.Background(), r, []Item{
+					{Resource: "r1", IfMatch: h, Steps: []Step{{Patches: []any{map[string]any{"op": "replace", "path": "/n", "value": 101.0}}}}},
+					{Resource: "d", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}}}},
+				}, nil, nil, false)
+				if err != nil {
+					var ae *Error
+					if errors.As(err, &ae) && ae.Status == 412 {
+						items, _ := ae.Body["items"].([]any)
+						if len(items) == 1 {
+							return "", &Error{Status: 412, Body: items[0].(map[string]any)}
+						}
+					}
+					return "", err
+				}
+				heads["d"] = res.Items[1].IDs[0]
+				return res.Items[0].IDs[0], nil
+			})
+			heads["r1"] = oneWins("batch", ids, errs)
+
+			// The namespace chain holds one entry per success, in a
+			// linear chain, and every resource's head is its last write.
+			info, err := b.NamespaceLog(context.Background(), "n", "", "", 0, who.Cred)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if want := 1 + 2 + 1 + 5 + 1; len(info.Entries) != want {
+				t.Fatalf("n's log has %d entries, want %d", len(info.Entries), want)
+			}
+			prev := ""
+			for i, en := range info.Entries {
+				if p, _ := en["prev"].(string); i > 0 && p != prev {
+					t.Fatalf("entry %d's prev is %q, want %q", i, p, prev)
+				}
+				prev, _ = en["id"].(string)
+			}
+			for name, want := range heads {
+				hd, err := a.ResourceHead(context.Background(), "n", name, who.Cred)
+				if err != nil || hd.Head != want {
+					t.Fatalf("%s: head %v %v, want %s", name, hd, err, want)
+				}
+			}
+			if _, ok := heads["d"]; !ok {
+				if hd, err := a.ResourceHead(context.Background(), "n", "d", who.Cred); err != nil || hd.State != NotFound {
+					t.Fatalf("the losing batch's other item: %v %v", hd, err)
+				}
+			}
+		})
 	}
 }
 

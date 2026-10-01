@@ -328,7 +328,14 @@ type writePlan struct {
 // returns a plan to insert, or a final result (an idempotent retry, a dry
 // run), or an error.
 func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
-	n := t.nsForWrite(req.NS)
+	// A config change locks the namespace exclusively; resource writes
+	// alone lock it shared (pglock.go).
+	var n *nsRow
+	if cc != nil || t.exclusive {
+		n = t.nsForWrite(req.NS)
+	} else {
+		n = t.nsForResources(req.NS)
+	}
 	if n == nil {
 		return nil, nil, t.absentNS(req.NS, req.Cred)
 	}
@@ -673,14 +680,10 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	}
 	// After the config change, which may have turned encryption on.
 	grantID := t.storeGrant(n, a)
-	type ins struct {
-		res  int64
-		last int64
-	}
-	var inserted []ins
+	var inserted []histRow
 	for _, s := range st {
 		res, last := t.insertItem(n, s, a, author, grantID, req.Signature)
-		inserted = append(inserted, ins{res, last})
+		inserted = append(inserted, histRow{res, last})
 		final := s.steps[len(s.steps)-1]
 		kind := "head"
 		if final.del {
@@ -688,27 +691,22 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 		}
 		entries = append(entries, map[string]any{"resource": s.Resource, "kind": kind, "target": final.id.String()})
 	}
-	var nsSeq int64
+	// The namespace entry last: on Postgres it is appended under the
+	// namespace row's lock, held until commit (appendNS).
 	var nsID ids.ID
 	if isBatch {
 		entry := map[string]any{"kind": "batch", "entries": entries}
 		if src != nil {
 			entry["source"] = src
 		}
-		nsSeq, nsID = t.appendNS(n, entry, nil, nil, configSeq, author)
+		_, nsID = t.appendNS(n, entry, nil, nil, configSeq, author, inserted...)
 	} else {
+		le := t.logEntry(t.rev(inserted[0].target))
+		result.Entry = &le
 		e := entries[0].(map[string]any)
-		nsSeq, nsID = t.appendNS(n, e, &inserted[0].res, &inserted[0].last, configSeq, author)
-	}
-	for _, x := range inserted {
-		_, err := t.Exec(`INSERT INTO head_history (res, ns_seq, target_seq) VALUES (?,?,?)`, x.res, nsSeq, x.last)
-		t.must(err)
+		_, nsID = t.appendNS(n, e, &inserted[0].res, &inserted[0].target, configSeq, author, inserted...)
 	}
 	result.NSID = nsID.String()
-	if !isBatch {
-		le := t.logEntry(t.rev(inserted[0].last))
-		result.Entry = &le
-	}
 	return result
 }
 
@@ -1264,7 +1262,8 @@ func (t *tx) storeGrant(n *nsRow, a *actor) []byte {
 // insertItem is step 7 for one item. It returns the resource row and the
 // seq of its final entry.
 func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID []byte, signature string) (int64, int64) {
-	own := t.resource(n.id, s.Resource)
+	// The row the precondition was checked against, in this transaction.
+	own := s.view.own
 	var res int64
 	if own == nil {
 		res = t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?, ?) RETURNING res`, n.id, s.Resource)
@@ -1356,8 +1355,19 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 	if final.del {
 		state = stateTombstoned
 	}
-	_, err := t.Exec(`UPDATE resources SET head_seq = ?, state = ? WHERE res = ?`, last, state, res)
+	// The head moves from the one the precondition matched, or not at all:
+	// on Postgres a writer of another resource holds the namespace's lock
+	// too, and a concurrent writer of this one that inserted first fails
+	// here, if not on the chain's unique constraints (pglock.go).
+	var oldHead int64
+	if own != nil {
+		oldHead = own.headSeq.Int64
+	}
+	r, err := t.Exec(`UPDATE resources SET head_seq = ?, state = ? WHERE res = ? AND COALESCE(head_seq, 0) = ?`, last, state, res, oldHead)
 	t.must(err)
+	if k, err := r.RowsAffected(); err != nil || k != 1 {
+		panic(errChainRace)
+	}
 	// heads caches the last live document, which reads and restores need,
 	// but only for small documents (D.4): rewriting a large one on every
 	// save costs its whole size each time. Larger ones fold from snapshots.

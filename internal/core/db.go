@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS namespaces (
   frozen     INTEGER NOT NULL DEFAULT 0,
   purged     INTEGER NOT NULL DEFAULT 0,
   head_seq   INTEGER,                        -- addition: current ns_log head
-  config_seq INTEGER                         -- addition: current ns_config head
+  config_seq INTEGER,                        -- addition: current ns_config head
+  head_id    BLOB                            -- addition: the id of head_seq (NULL: look it up, e.g. a shadow's)
 );
 CREATE TABLE IF NOT EXISTS authors (author INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
 
@@ -352,13 +353,14 @@ func openSQLite(path string) (*sql.DB, error) {
 // migrate adds columns that databases created by earlier versions lack.
 func migrate(db *sql.DB) error {
 	ctx := context.Background()
-	for _, c := range []struct{ table, col string }{{"ns_log", "kid"}, {"blob_bytes", "file"}, {"blob_epochs", "file"}} {
+	for _, c := range []struct{ table, col, typ string }{{"ns_log", "kid", "TEXT"}, {"blob_bytes", "file", "TEXT"}, {"blob_epochs", "file", "TEXT"},
+		{"namespaces", "head_id", "BLOB"}} {
 		var has bool
 		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {
 			return err
 		}
 		if !has {
-			if _, err := db.ExecContext(ctx, `ALTER TABLE `+c.table+` ADD COLUMN `+c.col+` TEXT`); err != nil {
+			if _, err := db.ExecContext(ctx, `ALTER TABLE `+c.table+` ADD COLUMN `+c.col+` `+c.typ); err != nil {
 				return err
 			}
 		}

@@ -101,11 +101,21 @@ func (e *Engine) blobArg(b []byte) any {
 // writer won the race of a resource chain or a namespace chain (D.3).
 var conflictTables = []string{"revisions", "resources", "ns_log", "head_history", "heads"}
 
+// errChainRace rolls back a write that found its resource's head moved
+// since its precondition was checked (insertItem): on Postgres, writers of
+// one namespace insert concurrently, and a resource chain's race is caught
+// by its unique constraints or by this check (pglock.go).
+var errChainRace = errors.New("a concurrent write moved the resource's head")
+
 // isConflict reports a UNIQUE violation of a resource chain or a namespace
-// chain: a concurrent writer won the race (D.3). Within one deployment the
-// re-check under the write lock makes it unreachable; it remains the final
-// safety net.
+// chain, or errChainRace: a concurrent writer won the race (D.3). On SQLite
+// the re-check under the write lock makes it unreachable, and it remains
+// the final safety net; on Postgres it is how two writers of one resource
+// that checked concurrently learn which one won (pglock.go).
 func isConflict(err error) bool {
+	if errors.Is(err, errChainRace) {
+		return true
+	}
 	var pe *pgconn.PgError
 	if errors.As(err, &pe) {
 		if pe.Code != "23505" { // unique_violation

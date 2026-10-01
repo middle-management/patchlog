@@ -1018,7 +1018,7 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 		}
 	}
 	t.metaChanged = true
-	_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, atSeq, cseq, sid)
+	_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, head_id = NULL, config_seq = ? WHERE ns = ?`, atSeq, cseq, sid)
 	t.must(err)
 	return t.nsByID(sid), atSeq
 }

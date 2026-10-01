@@ -15,36 +15,69 @@ import (
 // Write serialisation on Postgres (Addendum D.8).
 //
 // SQLite has one writer at a time: Engine.mu and BEGIN IMMEDIATE. On
-// Postgres several instances share the database, and writers of different
-// namespaces run in parallel. Every write transaction holds
-// transaction-scoped advisory locks, pg_advisory_xact_lock(lockClass, ns):
+// Postgres several instances share the database, writers of different
+// namespaces run in parallel, and so do writers of different resources of
+// one namespace. Every write transaction holds transaction-scoped advisory
+// locks, pg_advisory_xact_lock(lockClass, ns):
 //
-//   - exclusive on every namespace it changes: the one it writes (an entry
-//     in its log, its configuration, its rows), the base that receives a
-//     branch entry, every branch and remote shadow a purge propagates to;
-//   - shared on every other namespace whose state its decision read
-//     (nsByName, nsByID): the bases whose keys and revocations a branch
-//     write re-checks (§C.4), the namespaces its $schema and $ref resolve
-//     into (§6.1), a requireAt's or a batch source's namespace. A schema
-//     purge, a base revocation or a config change therefore can't commit
-//     between a write's check and its insert, and READ COMMITTED is
-//     enough: every read of a namespace happens after its lock is held.
+//   - exclusive on every namespace whose configuration or rows beyond its
+//     resources' chains it changes: a config write, a purge, a prune, a
+//     branch or freeze, the base that receives a branch entry, every
+//     branch and remote shadow a purge propagates to, a blob upload;
+//   - shared on the namespace a resource write or batch (without a config
+//     change) appends to (nsForResources), and on every other namespace
+//     whose state a decision read (nsByName, nsByID): the bases whose keys
+//     and revocations a branch write re-checks (§C.4), the namespaces its
+//     $schema and $ref resolve into (§6.1), a requireAt's or a batch
+//     source's namespace. A schema purge, a base revocation, a config
+//     change, a frozen or purged flag therefore can't commit between a
+//     write's check and its insert, and READ COMMITTED is enough: every
+//     read of a namespace happens after its lock is held.
+//
+// What a shared lock leaves to the writers of one namespace to settle
+// among themselves:
+//
+//   - their resources' chains. Two writers of one resource may both pass
+//     their check; the first to insert wins. The other fails on the
+//     chain's unique constraints (revisions (res, parent_seq) and (res,
+//     id), the one first revision, resources (ns, name)), waiting for the
+//     winner to commit, or on the head it moves from (insertItem updates
+//     the resources row only from the head its precondition matched:
+//     errChainRace). Either is a conflict (isConflict): the check runs
+//     again and answers 412 with the new head, or the idempotent retry,
+//     as on the D.3 path (recheck.go).
+//   - the namespace chain. Its entry is appended last (appendNS), at the
+//     head read with SELECT … FOR NO KEY UPDATE on the namespace row,
+//     which waits for a concurrent appender's commit and then reads its
+//     head; entry, head and head_history go in one statement. The row
+//     lock is held until commit, so entries commit in chain order (the
+//     tailer's xid window and readers' snapshots never see a gap) and
+//     ns_log.seq grows along the chain. It is taken after every advisory
+//     lock, and its holder waits for nothing but its commit, so it adds
+//     no deadlock; FOR NO KEY UPDATE doesn't block the foreign-key checks
+//     of other writers' inserts.
+//
+// The namespace's lock is thus held shared for a write's whole check and
+// insert, and serialisation per namespace is reduced to two statements and
+// the commit (README "Postgres").
 //
 // Locks are taken in ascending key order, whatever their mode, so writers
 // never deadlock on them. A resource write or batch knows its namespaces
 // from its check phase (writeDeps) and takes them all before its re-check
-// (recheck.go). The rarer writes run their whole gate in the transaction
-// and lock as they go: the target namespace exclusively first
-// (nsForWrite), then each namespace as they read or change it. A lock
-// whose key is above every key held is waited for; one below is only
-// tried, and if it is busy the transaction rolls back and runs again with
-// every lock it needed taken up front, in order (errRelock). A write
-// therefore waits only for keys above the ones it holds.
+// (recheck.go), or checks inside them, taking them as it reads. The rarer
+// writes run their whole gate in the transaction and lock as they go: the
+// target namespace exclusively first (nsForWrite), then each namespace as
+// they read or change it. A lock whose key is above every key held is
+// waited for; one below is only tried, and if it is busy the transaction
+// rolls back and runs again with every lock it needed taken up front, in
+// order (errRelock). A write therefore waits only for keys above the ones
+// it holds.
 //
 // The few rows shared by all namespaces (authors, grants, the grants data
-// key) are inserted with ON CONFLICT or retried: a unique violation, a
-// deadlock between such row locks and a lock wait, or a serialization
-// failure rolls the transaction back and runs it again (update1).
+// key, blob bytes) are inserted with ON CONFLICT or retried: a unique
+// violation, a deadlock between such row locks and a lock wait, or a
+// serialization failure rolls the transaction back and runs it again
+// (update1).
 
 // lockClass is the class id of the namespace and schema locks, the first
 // argument of the two-argument pg_advisory_*lock forms (D.8), so they never
@@ -159,14 +192,16 @@ func (t *tx) lockAll(want map[int32]lockMode) {
 }
 
 // lockDeps takes a resource write's or batch's locks before its re-check:
-// its namespace exclusively, every other namespace its check read shared.
+// every namespace its check read shared, its own included (sharedNS).
 func (t *tx) lockDeps(target int64, d *writeDeps) {
-	want := map[int32]lockMode{lockKey(target): lockExclusive}
+	want := map[int32]lockMode{lockKey(target): lockShared}
 	for id := range d.ns {
-		k := lockKey(id)
-		want[k] = max(want[k], lockShared)
+		want[lockKey(id)] = lockShared
 	}
 	t.lockAll(want)
+	if t.locking() {
+		t.sharedNS = target
+	}
 }
 
 // retryable reports an error after which a write transaction runs again:

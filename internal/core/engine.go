@@ -13,8 +13,10 @@
 // their whole gate inside the write transaction; see README.
 //
 // On Postgres several instances may share the database: advisory locks
-// per namespace replace the mutex (pglock.go), and a tailer tells each
-// instance of every commit, for its live readers and caches (tailer.go).
+// per namespace replace the mutex (pglock.go), held shared by the writers
+// of a namespace's resources, which check inside them and serialise only
+// to append to the namespace chain; and a tailer tells each instance of
+// every commit, for its live readers and caches (tailer.go).
 package core
 
 import (
@@ -94,9 +96,9 @@ type Options struct {
 	BeforeWriteLock func()
 	// LockedCheckBytes: on Postgres, a resource write or batch whose
 	// patches are smaller than this, roughly as JSON, runs its check
-	// inside its namespace's lock rather than first in a transaction of
-	// its own (D.3), saving that transaction's round trips. Zero means
-	// 16 KiB; negative, never.
+	// inside its namespace's (shared) lock rather than first in a
+	// transaction of its own (D.3), saving that transaction's and the
+	// re-check's round trips. Zero means every write; negative, none.
 	LockedCheckBytes int
 	// BlobSweepInterval is how often pending blobs past blobGrace are
 	// deleted (§7.8, SweepBlobs), and orphan blob files (SweepBlobFiles),
@@ -421,6 +423,12 @@ type tx struct {
 	locks  map[int32]lockMode
 	maxKey int32
 	noLock int
+	// sharedNS is the namespace a resource write or batch appends to
+	// holding its lock only shared (pglock.go); 0 if none.
+	sharedNS int64
+	// exclusive makes a resource write or batch lock its namespace
+	// exclusively, as other writes do (writeLocked's last attempt).
+	exclusive bool
 	// Blob files (blobstore.go): those this transaction stored, deleted
 	// if it rolls back, and those whose rows it deleted, deleted once it
 	// has committed.
@@ -714,6 +722,18 @@ func (t *tx) nsForWrite(name string) *nsRow {
 	return t.nsByNameLocked(name, lockExclusive)
 }
 
+// nsForResources is nsByName for the namespace a resource write or batch
+// appends to: on Postgres it takes the namespace's lock shared, so writers
+// of other resources run alongside, and the entry is appended under the
+// namespace row's lock (appendNS, pglock.go).
+func (t *tx) nsForResources(name string) *nsRow {
+	n := t.nsByNameLocked(name, lockShared)
+	if n != nil && t.locking() {
+		t.sharedNS = n.id
+	}
+	return n
+}
+
 func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 	if strings.HasPrefix(name, "~") {
 		return nil
@@ -800,40 +820,76 @@ func (t *tx) nsLogSeq(ns int64, id ids.ID) (int64, bool) {
 	return seq, true
 }
 
+// histRow is a head_history row an entry records: res's head is target as
+// of the entry.
+type histRow struct{ res, target int64 }
+
 // appendNS appends an entry to a namespace chain (§3.5) and returns its seq
-// and id.
-func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int64, configSeq int64, author int64) (int64, ids.ID) {
-	if t.locking() {
-		// The chain is appended to under the namespace's exclusive lock,
-		// at its head as of that lock (pglock.go).
+// and id, recording the resource heads it moves (head_history).
+//
+// On Postgres the chain is appended to at its head as of the namespace
+// row's lock (SELECT … FOR NO KEY UPDATE), held until commit: under the
+// namespace's exclusive advisory lock it is never contended; a resource
+// write or batch holds that lock only shared (sharedNS), and the row lock
+// orders its entry with those of the other resources' writers. Rows
+// therefore commit in chain order (pglock.go).
+func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int64, configSeq int64, author int64, hist ...histRow) (int64, ids.ID) {
+	if t.locking() && t.sharedNS != n.id {
 		t.lockNS(n.id, lockExclusive)
 	}
-	var prev *ids.ID
-	var prevSeq any
-	if t.locking() {
-		var b []byte
-		t.must(t.QueryRow(`SELECT n.head_seq, l.id FROM namespaces n LEFT JOIN ns_log l ON l.seq = n.head_seq WHERE n.ns = ?`, n.id).Scan(&n.headSeq, &b))
-		if n.headSeq.Valid {
-			p := ids.FromBytes(b)
-			prev = &p
-			prevSeq = n.headSeq.Int64
-		}
-	} else if n.headSeq.Valid {
-		p := t.nsLogID(n.headSeq.Int64)
-		prev = &p
-		prevSeq = n.headSeq.Int64
-	}
+	// What doesn't depend on the head first, outside the row's lock.
 	body := jsonv.Canonical(entry)
-	id := ids.Hash(prev, body)
 	kind := nsKindCode(entry["kind"].(string))
 	var kid any
 	if k, ok := t.kids[author]; ok {
 		kid = k
 	}
-	seq := t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
-		n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), kid)
-	_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, seq, configSeq, n.id)
-	t.must(err)
+	rs, ts := make([]int64, len(hist)), make([]int64, len(hist))
+	for i, h := range hist {
+		rs[i], ts[i] = h.res, h.target
+	}
+	q := `SELECT head_seq, head_id FROM namespaces WHERE ns = ?`
+	if t.e.pg {
+		q += ` FOR NO KEY UPDATE`
+	}
+	var headID []byte
+	t.must(t.QueryRow(q, n.id).Scan(&n.headSeq, &headID))
+	t.forget() // read after the row's lock
+	var prev *ids.ID
+	var prevSeq any
+	if n.headSeq.Valid {
+		// head_id is NULL in rows from before the column, and in remote
+		// shadows, whose chains are mirrored.
+		p := ids.FromBytes(headID)
+		if headID == nil {
+			p = t.nsLogID(n.headSeq.Int64)
+		}
+		prev = &p
+		prevSeq = n.headSeq.Int64
+	}
+	id := ids.Hash(prev, body)
+	var seq int64
+	if t.e.pg {
+		// One statement: the entry, the namespace's head and the heads it
+		// moves, so the row lock is held for a single round trip and the
+		// commit.
+		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
+			u AS (UPDATE namespaces SET head_seq = (SELECT seq FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
+			h AS (INSERT INTO head_history (res, ns_seq, target_seq) SELECT v.res, l.seq, v.target FROM l, unnest(?::bigint[], ?::bigint[]) AS v(res, target))
+			SELECT seq FROM l`,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), kid,
+			id[:], configSeq, n.id, rs, ts)
+	} else {
+		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), kid)
+		_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, head_id = ?, config_seq = ? WHERE ns = ?`, seq, id[:], configSeq, n.id)
+		t.must(err)
+		for _, h := range hist {
+			_, err := t.Exec(`INSERT INTO head_history (res, ns_seq, target_seq) VALUES (?,?,?)`, h.res, seq, h.target)
+			t.must(err)
+		}
+	}
 	n.headSeq = sql.NullInt64{Int64: seq, Valid: true}
 	t.lastNS = seq
 	if n.configSeq != configSeq {
