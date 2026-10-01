@@ -37,9 +37,14 @@ services:
       - -schema-fetch
       - -schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com
       - -purge-url=http://cdn:8080/
+      - -shutdown-timeout=20s
     # Healthchecks run through `docker exec`, which joins the container's
-    # namespaces, and hosts like these refuse that too. The seed waits for
-    # the API itself instead, and the CDN only needs the core started.
+    # namespaces, and hosts like these refuse that too, so compose.yaml's
+    # `patchlog health` checks are off for the core, index and tree. The
+    # seed polls /_health itself instead, and the CDN only needs the
+    # origins started (its own probes of /_health still work: they are
+    # plain HTTP over the host network). Graceful shutdown doesn't depend
+    # on them.
     healthcheck:
       disable: true
 
@@ -47,18 +52,22 @@ services:
     <<: *host
     environment:
       API: http://patchlog:9080
-    entrypoint: ["sh", "-c", "until curl -fs -o /dev/null $$API/; do sleep 1; done; exec sh /deploy/seed.sh"]
+    entrypoint: ["sh", "-c", "until curl -fs -o /dev/null $$API/_health; do sleep 1; done; exec sh /deploy/seed.sh"]
     depends_on: !override
       patchlog:
         condition: service_started
 
   index:
     <<: *host
-    command: [index, -api=http://patchlog:9080, -ns=demo, -branches, -db=/data/index.db, -addr=:9081, -purge-url=http://cdn:8080/]
+    command: [index, -api=http://patchlog:9080, -ns=demo, -branches, -db=/data/index.db, -addr=:9081, -purge-url=http://cdn:8080/, -shutdown-timeout=20s]
+    healthcheck:
+      disable: true
 
   tree:
     <<: *host
-    command: [tree, -api=http://patchlog:9080, -catalog=cat, -catalog=topics, "-db=/data/tree-{catalog}.db", -addr=:9082, -purge-url=http://cdn:8080/]
+    command: [tree, -api=http://patchlog:9080, -catalog=cat, -catalog=topics, "-db=/data/tree-{catalog}.db", -addr=:9082, -purge-url=http://cdn:8080/, -shutdown-timeout=20s]
+    healthcheck:
+      disable: true
 
   janitor:
     <<: *host

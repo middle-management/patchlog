@@ -18,6 +18,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -546,6 +547,8 @@ func (ix *Index) waitMin(ctx context.Context, ns, min string, wait time.Duration
 		case <-ctx.Done():
 			return false
 		case <-timer.C:
+		case <-lifecycle.Stopping(ctx):
+			// Shutting down: answer now, as if the wait had run out.
 		}
 		break
 	}

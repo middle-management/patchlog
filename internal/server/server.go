@@ -16,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -1187,6 +1188,9 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		case <-wait:
 			continue
 		case <-time.After(time.Until(deadline)):
+		case <-lifecycle.Stopping(r.Context()):
+			// The server is shutting down: the normal "no change" answer
+			// now, so the client polls again (elsewhere).
 		case <-r.Context().Done():
 			return
 		}
@@ -1383,6 +1387,10 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 			if f, ok := w.(http.Flusher); ok {
 				f.Flush()
 			}
+		case <-lifecycle.Stopping(r.Context()):
+			// The server is shutting down: end the stream; EventSource
+			// reconnects with Last-Event-ID (elsewhere).
+			return
 		case <-r.Context().Done():
 			return
 		}
@@ -1440,6 +1448,10 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 				f.Flush()
 			}
 			continue
+		case <-lifecycle.Stopping(r.Context()):
+			// The server is shutting down: end the stream; EventSource
+			// reconnects with Last-Event-ID (elsewhere).
+			return
 		case <-r.Context().Done():
 			return
 		}

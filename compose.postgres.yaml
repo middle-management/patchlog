@@ -45,6 +45,7 @@ services:
       - -schema-fetch
       - -schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com
       - -purge-url=http://cdn:8080/
+      - -shutdown-timeout=20s
     depends_on:
       postgres:
         condition: service_healthy

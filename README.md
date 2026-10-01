@@ -441,6 +441,72 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
   origin and never serves one origin's allowance to another.
 - The playground's tree and index proxies drop the services' own CORS headers; the core's apply.
 
+### Health checks and graceful shutdown
+
+`serve`, `index` and `tree` answer two paths ahead of their own routes. Both are
+`Cache-Control: no-store` and `CDN-Cache-Control: no-store`, and the compose CDN passes them, so
+a probe always reaches the origin itself:
+
+| Path | Answer |
+| --- | --- |
+| `GET /_health` | Liveness and drain state: `200 {"status":"ok"}` while serving, `503 {"status":"draining"}` from the moment shutdown starts. It touches no database, so frequent probes are cheap. Use it for load-balancer and CDN probes and container healthchecks. |
+| `GET /_ready` | Readiness: `503 {"status":"draining"}` while draining, `503 {"status":"unavailable","error":…}` when the core can't reach its database (a ping with a 2 s timeout), else `200 {"status":"ok"}`. The index and tree keep local SQLite databases they opened at start, so for them it is the drain state alone. |
+
+The paths start with `_`, which no namespace or catalog name can (§3.6), so they never shadow
+the index's `/{ns}` or the tree's `/{catalog}`; they sit beside the services' `/_status`.
+`patchlog health [URL]` (default `http://localhost:8080/_health`; `:8081` is short for
+`http://localhost:8081/_health`) exits 0 on a 200 and 1 otherwise, so the image needs no curl or
+wget for healthchecks.
+
+On SIGTERM or SIGINT a server shuts down in phases:
+
+1. **Drain.** `/_health` and `/_ready` answer 503 and keep-alives are turned off (responses say
+   `Connection: close`), so load balancers take the instance out of rotation and clients
+   reconnect elsewhere. Requests are still served normally.
+2. **Delay.** That goes on for `-shutdown-delay` (default 0): the time a load balancer needs to
+   see the 503s, typically a probe interval or two.
+3. **Stop.** The listener closes. Long-polls (§7.7) answer at once with their normal "no change"
+   `204` and a fresh `X-Cursor`, so clients just poll again; event streams (§7.3, §7.4) end, and
+   EventSource reconnects with `Last-Event-ID`; the index's and tree's `?min=` waits answer as if
+   their wait had run out. Every other request in flight, writes included, is waited for, up to
+   `-shutdown-timeout` (default 30s).
+4. **Cancel**, only if that timeout expires: the remaining requests' contexts are cancelled, so
+   their transactions roll back (nothing of a cancelled write is stored, and the chains stay
+   intact), and their handlers get 2 s more to return.
+5. **Close.** Only then does the core stop its background jobs (retention, remote follows,
+   epoch rotation), resign leadership and close the database, and the CDN purger flush its queue
+   (up to 5 s); the index and tree stop following and close their databases. The database is
+   never closed under a running handler.
+
+Each phase is logged, with the requests waited for or cancelled (method, path, age). A second
+signal exits at once (exit status 1). Give the process manager's grace period more than
+`-shutdown-delay` + `-shutdown-timeout` + about 10 s; compose uses `-shutdown-timeout=20s` with
+`stop_grace_period: 30s`. On Kubernetes:
+
+```yaml
+spec:
+  terminationGracePeriodSeconds: 45     # > delay (5s) + timeout (25s) + ~10s
+  containers:
+    - name: patchlog
+      image: ghcr.io/middle-management/patchlog:X.Y.Z
+      args: [serve, -shutdown-delay=5s, -shutdown-timeout=25s, ...]
+      ports: [{containerPort: 8080}]
+      readinessProbe:
+        httpGet: {path: /_ready, port: 8080}
+        periodSeconds: 2
+        failureThreshold: 1
+      livenessProbe:
+        exec: {command: [patchlog, health, "http://localhost:8080/_health"]}
+        periodSeconds: 10
+        failureThreshold: 3
+```
+
+Kubernetes sends SIGTERM and removes the pod from its Service endpoints at the same time, so
+`-shutdown-delay` keeps the pod serving while kube-proxy and ingress controllers catch up; no
+`preStop` sleep is needed (a `preStop: sleep 5` with `-shutdown-delay=0` is equivalent, but its
+time also counts against the grace period). Point readiness at `/_ready`; liveness at `/_health`
+should tolerate the drain (it answers 503 then), hence the higher threshold.
+
 ### Playground
 
 `serve` also hosts a web playground at **`/playground/`** (turn it off with `-playground=false`).
@@ -1221,6 +1287,7 @@ internal/schemaimport external JSON Schemas into a namespace, refs pinned (schem
 internal/grant      grants, keys, roles and verification (Addendum C)
 internal/core       storage and semantics (gate, batches, branches, purge, prune)
 internal/server     HTTP API
+internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
 internal/cdnpurge   HTTP cache-tag purges to a CDN (-purge-url)
 internal/edge       the verifying edge's secret and private edge directives (§9, -edge-secret)
 deploy/varnish      the compose stack's local CDN (Varnish VCL)

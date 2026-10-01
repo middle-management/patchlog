@@ -40,9 +40,13 @@ vcl 4.1;
 import std;
 
 # Health checks: a sick origin gets its graced copies served (up to their
-# stale-while-revalidate) and a quick 503 otherwise.
+# stale-while-revalidate) and a quick 503 otherwise. Every origin answers
+# /_health without touching its database, 200 while serving and 503 once it
+# drains for shutdown, so a stopping origin leaves rotation (with several
+# instances behind one director, give them a -shutdown-delay of a probe
+# interval or two).
 probe core_up {
-	.url = "/";
+	.url = "/_health";
 	.interval = 5s;
 	.timeout = 2s;
 	.window = 3;
@@ -51,7 +55,7 @@ probe core_up {
 }
 
 probe service_up {
-	.url = "/_status";
+	.url = "/_health";
 	.interval = 5s;
 	.timeout = 2s;
 	.window = 3;
@@ -117,6 +121,10 @@ sub vcl_recv {
 
 	# Writes, batches, key requests and anything else that isn't a read.
 	if (req.method != "GET" && req.method != "HEAD") {
+		return (pass);
+	}
+	# Health endpoints are each origin's own state, never a cached copy.
+	if (req.url ~ "^/_(health|ready)(\?|$)") {
 		return (pass);
 	}
 	# Event streams (§7.3, §7.4) are no-store: pass them, streamed.

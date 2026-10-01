@@ -8,12 +8,9 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
-	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/catalog"
@@ -77,6 +74,7 @@ func treeCmd(args []string) {
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	corsFlags := addCORSFlags(fs)
+	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
 
 	catalogs := splitCatalogs(cats)
@@ -109,8 +107,7 @@ func treeCmd(args []string) {
 	}
 	topt.Edge = edgeVerifier(*edgeSecret, *edgeHeader)
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, sigs := shutdownSignals("patchlog tree")
 
 	var (
 		handler http.Handler
@@ -148,6 +145,7 @@ func treeCmd(args []string) {
 	defer closer()
 
 	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler), ReadHeaderTimeout: 10 * time.Second}
+	ls := sdFlags.server("patchlog tree", srv, nil)
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatal(err)
@@ -157,15 +155,25 @@ func treeCmd(args []string) {
 		mode = "catalog"
 	}
 	log.Printf("patchlog tree: %s service for %s at %s, serving on %s", mode, strings.Join(catalogs, ", "), *api, ln.Addr())
+	serveOn(ls, ln)
+	// The followers keep the listings current while requests drain; they
+	// stop after the HTTP server, and the databases close (deferred) last.
+	runCtx, stopRun := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
 	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
+		defer close(runDone)
+		if err := run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("patchlog tree: following stopped: %v", err)
 		}
 	}()
-	run(ctx)
-	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	srv.Shutdown(shutdown)
+	select {
+	case <-ctx.Done():
+	case <-runDone:
+	}
+	forceOnSecond(sigs)
+	ls.Shutdown()
+	stopRun()
+	<-runDone
 }
 
 // splitCatalogs flattens repeated and comma-separated -catalog values,

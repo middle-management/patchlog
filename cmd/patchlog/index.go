@@ -9,10 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
-	"os/signal"
 	"strings"
-	"syscall"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -61,6 +58,7 @@ func indexCmd(args []string) {
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	corsFlags := addCORSFlags(fs)
+	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
 
 	var nss []string
@@ -86,8 +84,7 @@ func indexCmd(args []string) {
 		log.Fatal(err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
+	ctx, sigs := shutdownSignals("patchlog index")
 
 	opt := index.Options{Client: c, DB: *db, Namespaces: nss, Branches: *branches, Rebuild: *rebuild,
 		UntypedListing: *untyped, MinWait: *minWait, Recipient: recipient}
@@ -119,20 +116,31 @@ func indexCmd(args []string) {
 	}
 
 	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(ix.Handler()), ReadHeaderTimeout: 10 * time.Second}
+	ls := sdFlags.server("patchlog index", srv, nil)
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatal(err)
 	}
 	log.Printf("patchlog index: following %s at %s, serving on %s", strings.Join(nss, ","), *api, ln.Addr())
+	serveOn(ls, ln)
+	// The followers keep the index current while requests drain; they
+	// stop after the HTTP server, and the database closes (deferred) last.
+	runCtx, stopRun := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
 	go func() {
-		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatal(err)
+		defer close(runDone)
+		if err := ix.Run(runCtx); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("patchlog index: following stopped: %v", err)
 		}
 	}()
-	ix.Run(ctx)
-	shutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	srv.Shutdown(shutdown)
+	select {
+	case <-ctx.Done():
+	case <-runDone:
+	}
+	forceOnSecond(sigs)
+	ls.Shutdown()
+	stopRun()
+	<-runDone
 }
 
 func followSSE() follow.Option { return follow.WithSSE() }
