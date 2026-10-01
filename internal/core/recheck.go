@@ -4,10 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"strings"
-
-	"modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/middle-management/patchlog/internal/schema"
 )
@@ -16,9 +12,11 @@ import (
 //
 // Steps 1–6 of §6.2 run in a read transaction, without the write lock. They
 // record what they read that a concurrent write could change (writeDeps).
-// Then the write lock is taken (the engine mutex and BEGIN IMMEDIATE, which
-// also serialises other processes), and the re-check confirms, inside that
-// transaction, that all of it is unchanged:
+// Then the write lock is taken (in SQLite the engine mutex and BEGIN
+// IMMEDIATE, which also serialises other processes; on Postgres the
+// advisory locks of every namespace the check read: the target's
+// exclusive, the others shared, pglock.go), and the re-check confirms,
+// inside that transaction and after the locks, that all of it is unchanged:
 //
 //   - every namespace the check read: the target, every base whose keys and
 //     revocations applied (§C.4), the namespaces of resolved schemas, of a
@@ -134,28 +132,6 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 	return target, true
 }
 
-// isConflict reports a UNIQUE violation of a resource chain or a namespace
-// chain: a concurrent writer won the race (D.3). The re-check makes it
-// unreachable within one deployment's lock; it remains the final safety net.
-func isConflict(err error) bool {
-	var se *sqlite.Error
-	if !errors.As(err, &se) {
-		return false
-	}
-	switch se.Code() {
-	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
-	default:
-		return false
-	}
-	msg := se.Error()
-	for _, c := range []string{"revisions.res", "resources.ns", "ns_log.ns", "head_history.res", "heads.res"} {
-		if strings.Contains(msg, c) {
-			return true
-		}
-	}
-	return false
-}
-
 // writeOptimistic runs a resource write or a batch without a config change
 // on the D.3 write path: check outside the lock, re-check and insert inside.
 func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item, source any, isBatch bool) (*WriteResult, error) {
@@ -185,6 +161,12 @@ func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item,
 			h()
 		}
 		err = e.update(ctx, func(t *tx) error {
+			// On Postgres, the locks of every namespace the check read,
+			// before re-reading any (pglock.go).
+			t.lockDeps(plan.n.id, deps)
+			if h := e.afterWriteLock; h != nil {
+				h(plan.n.name)
+			}
 			n, ok := t.recheck(plan, deps)
 			if !ok {
 				return errRecheck

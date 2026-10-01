@@ -815,7 +815,7 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 	}
 	var res *WriteResult
 	err = e.update(ctx, func(t *tx) error {
-		if t.nsByName(req.NS) != nil || m == nil {
+		if t.nsForWrite(req.NS) != nil || m == nil {
 			r, err := t.writeConfig(req, cc) // 412 for a taken name
 			res = r
 			return err
@@ -883,20 +883,16 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	shadow, atSeq := t.insertShadows(req.NS, m)
 	canon := jsonv.Canonical(cc.Patches)
 	cfgID := ids.Revision(nil, canon)
-	r, err := t.Exec(`INSERT INTO namespaces (name, base, base_at, base_config_seq, frozen) VALUES (?,?,?,?,?)`,
+	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq, frozen) VALUES (?,?,?,?,?) RETURNING ns`,
 		req.NS, shadow.id, atSeq, shadow.configSeq, cfg.Frozen)
-	t.must(err)
-	bid, _ := r.LastInsertId()
-	r, err = t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?)`,
+	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
 		bid, cfgID[:], string(canon), string(jsonv.Canonical(doc)), author, t.now.UnixMilli())
-	t.must(err)
-	cseq, _ := r.LastInsertId()
 	bn := t.nsByID(bid)
 	// A sealed branch's first epoch key, an e2e branch's first epoch.
 	t.sealedConfigWritten(bn, nil, cfg)
 	// No entry is written to any other local chain: the base's is remote.
 	_, nsID := t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
-	_, err = t.Exec(`INSERT INTO remote_bases (shadow, branch, origin, ns, at, checkpoint) VALUES (?,?,?,?,?,?)`,
+	_, err := t.Exec(`INSERT INTO remote_bases (shadow, branch, origin, ns, at, checkpoint) VALUES (?,?,?,?,?,?)`,
 		shadow.id, bid, m.base.Origin, m.base.NS, m.base.At, m.base.At)
 	t.must(err)
 	return &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: cfgID.String()}, nil
@@ -913,7 +909,7 @@ func (t *tx) insertShadows(branch string, m *remoteMirror) (*nsRow, int64) {
 	for i := len(m.levels) - 1; i >= 0; i-- {
 		sh, at = t.insertShadow(shadowLevelName(branch, i), m.read, m.levels[i], sh, at, heads)
 		for _, x := range m.levels[i].epochs {
-			_, err := t.Exec(`INSERT OR IGNORE INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?)`, sh.id, x.e, x.created.UnixMilli())
+			_, err := t.Exec(`INSERT INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?) ON CONFLICT DO NOTHING`, sh.id, x.e, x.created.UnixMilli())
 			t.must(err)
 		}
 	}
@@ -949,35 +945,25 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 	if base != nil {
 		bid, bat, bcfg = base.id, baseAt, base.configSeq
 	}
-	r, err := t.Exec(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?)`, name, bid, bat, bcfg)
-	t.must(err)
-	sid, _ := r.LastInsertId()
-	r, err = t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?)`,
+	sid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, name, bid, bat, bcfg)
+	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
 		sid, cid[:], string(gcanon), string(jsonv.Canonical(cdoc)), remote, t.now.UnixMilli())
-	t.must(err)
-	cseq, _ := r.LastInsertId()
 	// Resources first, so the log rows can name them.
 	resIDs := map[string]int64{}
 	for _, rr := range lv.res {
 		if rr.chain == nil {
 			// Purged at the base: only the head's id is known (its
 			// content and parents are gone there too).
-			r, err := t.Exec(`INSERT INTO resources (ns, name, state) VALUES (?,?,?)`, sid, rr.name, statePurged)
-			t.must(err)
-			res, _ := r.LastInsertId()
+			res := t.mustInsert(`INSERT INTO resources (ns, name, state) VALUES (?,?,?) RETURNING res`, sid, rr.name, statePurged)
 			resIDs[rr.name] = res
 			id := mustID(rr.target)
-			r, err = t.Exec(`INSERT INTO revisions (res, id, parent_seq, first, kind, author, created) VALUES (?,?,NULL,1,?,?,?)`,
+			head := t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, author, created) VALUES (?,?,NULL,1,?,?,?) RETURNING seq`,
 				res, id[:], rr.purgedKind, remote, t.now.UnixMilli())
-			t.must(err)
-			head, _ := r.LastInsertId()
-			_, err = t.Exec(`UPDATE resources SET head_seq = ? WHERE res = ?`, head, res)
+			_, err := t.Exec(`UPDATE resources SET head_seq = ? WHERE res = ?`, head, res)
 			t.must(err)
 			continue
 		}
-		r, err := t.Exec(`INSERT INTO resources (ns, name) VALUES (?,?)`, sid, rr.name)
-		t.must(err)
-		res, _ := r.LastInsertId()
+		res := t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, sid, rr.name)
 		resIDs[rr.name] = res
 		var parent *revRow
 		if rr.parent != nil {
@@ -1016,10 +1002,8 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 		if en.Author != "" {
 			author = t.authorID(en.Author)
 		}
-		r, err := t.Exec(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created) VALUES (?,?,?,?,?,NULL,?,?,?,?)`,
+		atSeq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created) VALUES (?,?,?,?,?,NULL,?,?,?,?) RETURNING seq`,
 			sid, id[:], prev, nsKindCode(en.Kind), res, string(body), cseq, author, parseCreated(en.Created, t.now))
-		t.must(err)
-		atSeq, _ = r.LastInsertId()
 		prev = atSeq
 		for _, rr := range settles[i] {
 			_, err := t.Exec(`INSERT INTO head_history (res, ns_seq, target_seq) VALUES (?,?,?)`, resIDs[rr.name], atSeq, heads[rr])
@@ -1027,7 +1011,7 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 		}
 	}
 	t.metaChanged = true
-	_, err = t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, atSeq, cseq, sid)
+	_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, atSeq, cseq, sid)
 	t.must(err)
 	return t.nsByID(sid), atSeq
 }
@@ -1108,10 +1092,8 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		if e.Author != "" {
 			author = t.authorID(e.Author)
 		}
-		r, err := t.Exec(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?,?)`,
+		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?,?) RETURNING seq`,
 			res, id[:], parentSeq, first, kind, patches, author, sig, typed, parseCreated(e.Created, t.now))
-		t.must(err)
-		last, _ = r.LastInsertId()
 		parentSeq = last
 		if kind == kindTombstone {
 			state = stateTombstoned
@@ -1175,7 +1157,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 		byNS[s.ns] = append(byNS[s.ns], s)
 	}
 	for _, nsName := range sortedKeys(byNS) {
-		n := t.nsByName(nsName)
+		n := t.nsForWrite(nsName)
 		conflict := func(s *remoteSchema, why string) *Error {
 			return apiErr(409, "name_conflict", "path", "/r/"+s.ns+"/"+s.name+"/rev/"+s.chain.last().ID, "message", why)
 		}
@@ -1195,9 +1177,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 		for _, s := range byNS[nsName] {
 			own := t.resource(n.id, s.name)
 			if own == nil {
-				r, err := t.Exec(`INSERT INTO resources (ns, name) VALUES (?,?)`, n.id, s.name)
-				t.must(err)
-				res, _ := r.LastInsertId()
+				res := t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, n.id, s.name)
 				head := t.insertChain(res, s.chain, 0, nil, false)
 				changes = append(changes, change{s.name, s.chain.last().Kind, head, res})
 				continue
@@ -1244,6 +1224,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 // (the shadow's chain mirrors the base's). It runs whenever the remote
 // branch purges the name, so the copy never outlives the branch's purge.
 func (t *tx) purgeShadow(sh *nsRow, name string) {
+	t.lockNS(sh.id, lockExclusive)
 	r := t.resource(sh.id, name)
 	if r == nil || r.state == statePurged {
 		return
@@ -1263,6 +1244,7 @@ func (t *tx) purgeShadow(sh *nsRow, name string) {
 // purgeShadowNS removes all of a shadow's content (the remote branch's
 // namespace purge, §8.5).
 func (t *tx) purgeShadowNS(sh *nsRow) {
+	t.lockNS(sh.id, lockExclusive)
 	t.deleteDEKs(`ns = ?`, sh.id)
 	q := `res IN (SELECT res FROM resources WHERE ns = ?)`
 	for _, s := range []string{
@@ -1385,12 +1367,13 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	}
 	follow := !e.opt.Remote.IgnorePurges
 	return e.update(ctx, func(t *tx) error {
+		// The branch's lock first: the checkpoint is read as of it.
+		bn := t.nsByIDLocked(b.branch, lockExclusive)
 		var cp string
 		t.must(t.QueryRow(`SELECT checkpoint FROM remote_bases WHERE shadow = ?`, b.shadow).Scan(&cp))
 		if cp != b.checkpoint {
 			return nil // followed concurrently
 		}
-		bn := t.nsByID(b.branch)
 		author := t.authorID(RemoteAuthor)
 		for _, en := range entries {
 			var names []string
@@ -1420,7 +1403,7 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 				res = en.Resource
 			}
 			applied := follow && !bn.purged
-			_, err := t.Exec(`INSERT OR IGNORE INTO remote_notices (branch, id, kind, resource, applied, created) VALUES (?,?,?,?,?,?)`,
+			_, err := t.Exec(`INSERT INTO remote_notices (branch, id, kind, resource, applied, created) VALUES (?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
 				bn.id, en.ID, en.Kind, res, applied, t.now.UnixMilli())
 			t.must(err)
 			if !applied {
@@ -1504,6 +1487,10 @@ func (e *Engine) remoteLoop(interval time.Duration) {
 				}
 				cancel()
 			}()
+			if !e.leader(ctx) {
+				cancel()
+				continue // another instance follows them (pglock.go)
+			}
 			if err := e.SyncRemotes(ctx); err != nil {
 				log.Printf("remote: %v", err)
 			}

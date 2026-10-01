@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -37,6 +37,15 @@ type multi []string
 
 func (m *multi) String() string     { return strings.Join(*m, ",") }
 func (m *multi) Set(s string) error { *m = append(*m, s); return nil }
+
+// envOr is the environment variable k, or def if it is unset (a database
+// URL with a password is better kept out of the process arguments).
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
 
 // version is set at build time: -ldflags "-X main.version=v1.2.3".
 var version = "dev"
@@ -76,7 +85,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
   patchlog version
@@ -99,7 +108,7 @@ func usage() {
 func serve(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	addr := fs.String("addr", ":8080", "listen address")
-	db := fs.String("db", "patchlog.db", "SQLite database path")
+	db := fs.String("db", envOr("PATCHLOG_DB", "patchlog.db"), "SQLite database path, or a Postgres URL (postgres://user:pass@host/db, Addendum D.8); default $PATCHLOG_DB, else patchlog.db")
 	origin := fs.String("origin", "http://localhost:8080", "canonical origin (§G.1)")
 	dev := fs.Bool("dev", false, "disable authentication (development only); X-Author names the author")
 	pg := fs.Bool("playground", true, "serve the web playground at /playground/")

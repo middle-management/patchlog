@@ -78,7 +78,7 @@ func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	if old != nil && old.level == levelE2E && old.Epoch == cfg.Epoch {
 		return
 	}
-	_, err := t.Exec(`INSERT OR IGNORE INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?)`, n.id, cfg.Epoch, t.now.UnixMilli())
+	_, err := t.Exec(`INSERT INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?) ON CONFLICT DO NOTHING`, n.id, cfg.Epoch, t.now.UnixMilli())
 	t.must(err)
 }
 
@@ -349,7 +349,7 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 		return nil, err
 	}
 	res := &PruneResult{Horizon: h.id.String(), Archive: u}
-	_, err = t.Exec(`INSERT OR REPLACE INTO e2e_snapshots (seq, res, jwe) VALUES (?,?,?)`, h.seq, own.id, snapshot)
+	_, err = t.Exec(`INSERT INTO e2e_snapshots (seq, res, jwe) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, jwe = excluded.jwe`, h.seq, own.id, snapshot)
 	t.must(err)
 	_, err = t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)

@@ -276,6 +276,61 @@ go build -o patchlog ./cmd/patchlog
 ./patchlog serve -db prod.db -origin https://cms.example -operator-key <PUBLIC>
 ```
 
+### Postgres (Addendum D.8)
+
+SQLite is the default. Give `-db` a Postgres URL instead of a file (or set `PATCHLOG_DB`, which
+keeps the password out of the process arguments), and the core stores everything there:
+
+```sh
+PATCHLOG_DB='postgres://patchlog:secret@db.internal:5432/patchlog?sslmode=require' \
+  ./patchlog serve -origin https://cms.example -operator-key <PUBLIC>
+make up-pg     # the compose stack with a postgres:16 container (compose.postgres.yaml)
+```
+
+- **Schema.** Created on first start (and migrated by later versions) under an advisory lock, in
+  whatever schema the URL's user defaults to (add `search_path=…` to the URL for another). It
+  mirrors the SQLite layout (`internal/core/pgschema.go`): bigint identity keys, 20-byte
+  `bytea` ids, canonical JSON in `text` (never `jsonb`, which would change the bytes ids are
+  computed over), integer millisecond timestamps. Patch sets, head and intermediate snapshots
+  and grants are `bytea`, because encryption at rest stores binary rows there.
+- **Reads** run in `REPEATABLE READ READ ONLY` transactions (one snapshot, as in SQLite's WAL
+  mode); writes in `READ COMMITTED`, serialised as described below.
+- **Purged content.** There is no `secure_delete`: a purge deletes or nulls rows, but the old
+  tuples stay in the table files until `VACUUM` reclaims them (autovacuum does, eventually; run
+  `VACUUM` on `revisions`, `heads`, `snapshots`, `sealed` and `deks` after a purge that must be
+  gone from disk now), and in WAL archives and backups until they expire. With encryption at
+  rest (Addendum E.1) a purge also destroys the data keys, which makes those leftovers
+  unreadable: use it where purges must be final.
+- **Several instances** can share the database (rolling deploys, horizontal scaling). Writes
+  take transaction-scoped advisory locks per namespace, `pg_advisory_xact_lock(0x504c, ns)`,
+  in ascending order: exclusive on every namespace they change (the written one; a branch's
+  base, which receives the `branch` entry; every branch and remote shadow a purge reaches),
+  shared on the namespaces their decision read (bases whose keys and revocations a branch
+  write re-checks, the namespaces `$schema` and `$ref` resolve into, a batch source). Writers
+  to different namespaces run in parallel; the D.3 re-check reads after the locks, so `412`
+  and internal retries work as on SQLite. Details in `internal/core/pglock.go`.
+- **A tailer per instance** polls `ns_log` by transaction id every 100 ms
+  (`ns_log.xid xid8 DEFAULT pg_current_xact_id()`, `pg_snapshot_xmin`) and wakes long-polls and
+  SSE streams for writes of every instance, and moves the read cache's generations. Commits
+  that change what reads may return (configuration, purges, prunes, restores, key
+  destruction) also increment a one-row `cache_gen` counter that every poll reads. The
+  transaction-free read cache serves only while the tailer's last successful poll is recent,
+  so another instance's purge, revocation or configuration change stops being served from
+  this instance's memory at most **300 ms** (three poll intervals) after it commits, and head
+  pointers are micro-cached for at most that long. A wake-up for another instance's write can
+  be later while an older write transaction is still running (the tailer never skips one).
+- **Background loops** that must run once per deployment (the retention applier, epoch
+  rotation, following and registering remote bases) run on the instance holding a
+  session-level advisory lock (class `0x504d`); another one takes over when it goes away.
+- **Per instance:** rate-limit buckets (§6.6), so each instance enforces the limits on what it
+  serves (D.8), and the in-memory caches above.
+- **The services keep SQLite.** The search index and tree service (`-db index.db`,
+  `-db tree.db`) store derived state they rebuild from the core's API; only the core runs on
+  Postgres.
+- **Tests.** `PATCHLOG_TEST_PG=postgres://postgres@localhost:5432/postgres make test-pg` runs
+  the storage-dependent tests with a fresh database per test (`internal/pgtest`); CI does the
+  same against a `postgres:16` service container.
+
 ### Playground
 
 `serve` also hosts a web playground at **`/playground/`** (turn it off with `-playground=false`).
@@ -483,7 +538,7 @@ curl -X PATCH $B/ns/matches -H "$P" -H 'If-Match: "{config_id}"' -H "Authorizati
   Ids, the protocol and caching are unchanged; the in-memory document cache holds plaintext.
 - **Purge is cryptographic.** Resource and namespace purges (and their propagation) delete the
   data keys as well as nulling the rows. SQLite runs with `secure_delete`, so freed pages are
-  zeroed once the WAL is checkpointed.
+  zeroed once the WAL is checkpointed (Postgres has no equivalent: see above).
 - **Archives** of an at-rest namespace are the usual bundle, encrypted as a chunked AES-GCM
   stream under `HKDF(data key, salt, "patchlog-archive-v1")` (format in
   `internal/core/crypt.go`). Restore decrypts them; after a purge, surviving copies are
@@ -895,6 +950,7 @@ internal/tree        tree service: folders, placements, links, manifests (§B.2�
 internal/catalog     tree-derived access and grant issuing (§B.11)
 internal/bundle      bundle format, export and import (§G.4)
 internal/archive     file:// archives for pruning and offline restore (§8.6)
+internal/pgtest      a fresh Postgres database per test (PATCHLOG_TEST_PG)
 internal/keystore    master key file and key wrapping for encryption at rest (Addendum E.1)
 internal/seal        JWE sealing, key derivation, HPKE wrapping, $nonce (Addendum E)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality

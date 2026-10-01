@@ -1,6 +1,6 @@
 # Common tasks. `make up` starts the whole stack in Docker; `make dev` runs
 # just the core server natively.
-.PHONY: help build test vet fmt check dev up down logs seed cdn-check cdn-restart clean fixture
+.PHONY: help build test test-pg vet fmt check dev up up-pg down logs seed cdn-check cdn-restart clean fixture
 
 help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-12s %s\n", $$1, $$2}'
@@ -10,6 +10,12 @@ build: ## build ./patchlog
 
 test: ## run all tests
 	go test ./...
+
+PG_PACKAGES = ./internal/core ./internal/server ./internal/client/... ./internal/merge ./internal/janitor ./internal/bundle
+
+test-pg: ## run the storage-dependent tests on Postgres (PATCHLOG_TEST_PG=postgres://user@host:port/postgres; a fresh database per test)
+	@test -n "$$PATCHLOG_TEST_PG" || (echo "set PATCHLOG_TEST_PG to a Postgres URL whose user may create databases"; exit 1)
+	go test $(PG_PACKAGES)
 
 vet: ## go vet
 	go vet ./...
@@ -27,6 +33,9 @@ up: ## build and start the whole stack (core, seed, index, tree, janitor, cdn)
 	docker compose up --build -d
 	@echo "through the CDN: core http://localhost:8080  playground http://localhost:8080/playground/  index http://localhost:8081  tree http://localhost:8082 (/cat/roots, /topics/roots; and /playground/tree/)"
 	@echo "origins, bypassing it: core http://localhost:9080  index http://localhost:9081  tree http://localhost:9082"
+
+up-pg: ## the same, with the core on Postgres (compose.postgres.yaml, Addendum D.8)
+	docker compose -f compose.yaml -f compose.postgres.yaml up --build -d
 
 up-host: ## the same, with host networking (hosts where Docker can't create network namespaces, e.g. sprites)
 	docker compose -f compose.yaml -f compose.host.yaml up --build -d

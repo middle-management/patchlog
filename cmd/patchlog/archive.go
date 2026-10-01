@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/archive"
 	"github.com/middle-management/patchlog/internal/core"
@@ -20,7 +21,7 @@ func archiveCmd(args []string) {
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("archive restore", flag.ExitOnError)
-	db := fs.String("db", "patchlog.db", "SQLite database path (no server may have it open)")
+	db := fs.String("db", "patchlog.db", "SQLite database path (no server may have it open), or a Postgres URL")
 	from := fs.String("from", "", "file:// directory the archives are in now (default: the URLs recorded when they were written)")
 	ns := fs.String("ns", "", "restore only this namespace")
 	res := fs.String("resource", "", "restore only this resource (with -ns)")
@@ -29,7 +30,7 @@ func archiveCmd(args []string) {
 	if *res != "" && *ns == "" {
 		log.Fatal("-resource needs -ns")
 	}
-	if _, err := os.Stat(*db); err != nil {
+	if _, err := os.Stat(*db); err != nil && !strings.HasPrefix(*db, "postgres") {
 		log.Fatalf("-db: %v", err)
 	}
 	opt := core.Options{Path: *db, RetentionInterval: -1}

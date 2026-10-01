@@ -20,6 +20,7 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/server"
 )
@@ -38,7 +39,7 @@ func newEncDeployment(t *testing.T, origin string) *deployment {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := core.Open(core.Options{Path: ":memory:", Origin: origin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks})
+	e, err := core.Open(core.Options{Path: pgtest.DB(t), Origin: origin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks})
 	if err != nil {
 		t.Fatal(err)
 	}

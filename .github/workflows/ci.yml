@@ -25,6 +25,33 @@ jobs:
       - name: race
         run: go test -race ./internal/core ./internal/server ./internal/merge ./internal/index ./internal/tree
 
+  # The storage-dependent tests again, on Postgres (Addendum D.8): each test
+  # gets a fresh database (internal/pgtest).
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      PATCHLOG_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test ./internal/core ./internal/server ./internal/client/... ./internal/merge ./internal/janitor ./internal/bundle
+      - name: race
+        run: go test -race ./internal/core ./internal/server
+
   docker:
     runs-on: ubuntu-latest
     steps:

@@ -321,7 +321,7 @@ func (t *tx) deleteDEKs(where string, args ...any) {
 // putPatches is the stored form of a revision's canonical patch set.
 func (t *tx) putPatches(res int64, id ids.ID, canon []byte) any {
 	if t.resLevel(res) < levelAtRest {
-		return string(canon)
+		return t.e.blobArg(canon)
 	}
 	return sealRow(t.dek(res, true), revAAD(res, id), canon)
 }
@@ -329,7 +329,7 @@ func (t *tx) putPatches(res int64, id ids.ID, canon []byte) any {
 // putDoc is the stored form of a document in heads or snapshots.
 func (t *tx) putDoc(table string, res, seq int64, doc []byte) any {
 	if t.resLevel(res) < levelAtRest {
-		return string(doc)
+		return t.e.blobArg(doc)
 	}
 	return sealRow(t.dek(res, true), docAAD(table, res, seq), doc)
 }
@@ -360,7 +360,7 @@ func (t *tx) openValue(res int64, raw string, aad func() []byte) []byte {
 // stored in plaintext earlier is encrypted then.
 func (t *tx) storeGrantBlocks(id, blocks []byte, encrypt bool) {
 	if !encrypt {
-		_, err := t.Exec(`INSERT OR IGNORE INTO grants (id, blocks) VALUES (?, ?)`, id, string(blocks))
+		_, err := t.Exec(`INSERT INTO grants (id, blocks) VALUES (?, ?) ON CONFLICT DO NOTHING`, id, t.e.blobArg(blocks))
 		t.must(err)
 		return
 	}
@@ -389,6 +389,7 @@ func (t *tx) encryptNamespace(n *nsRow) {
 		nss = append(nss, sh.id)
 	}
 	for _, ns := range nss {
+		t.lockNS(ns, lockExclusive)
 		var resIDs []int64
 		rows, err := t.Query(`SELECT res FROM resources WHERE ns = ? AND state != ?`, ns, statePurged)
 		t.must(err)

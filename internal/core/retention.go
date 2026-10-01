@@ -276,7 +276,7 @@ func (e *Engine) ApplyRetention(ctx context.Context) (*RetentionReport, error) {
 }
 
 func (t *tx) applyRetention(nsName, name string) (checked, pruned bool, err error) {
-	n := t.nsByName(nsName)
+	n := t.nsForWrite(nsName)
 	if n == nil || n.purged || n.isBranch() || n.isShadow() {
 		return false, false, nil
 	}
@@ -352,6 +352,10 @@ func (e *Engine) retentionLoop(interval time.Duration) {
 				}
 				cancel()
 			}()
+			if !e.leader(ctx) {
+				cancel()
+				continue // another instance applies it (pglock.go)
+			}
 			rep, err := e.ApplyRetention(ctx)
 			cancel()
 			if err != nil {

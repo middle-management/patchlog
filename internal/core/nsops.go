@@ -258,14 +258,12 @@ func (t *tx) branchesOf(n *nsRow) []*nsRow {
 
 // insertConfig inserts a planned config revision and returns its seq.
 func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
-	r, err := t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,?,?,?,?,?)`,
+	seq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,?,?,?,?,?) RETURNING seq`,
 		n.id, p.id[:], n.configSeq, string(p.canon), string(jsonv.Canonical(p.doc)), author, t.now.UnixMilli())
-	t.must(err)
-	seq, _ := r.LastInsertId()
 	old := t.config(n.configSeq)
 	raised := p.cfg.level > old.level
 	t.metaChanged = true
-	_, err = t.Exec(`UPDATE namespaces SET frozen = ?, config_seq = ? WHERE ns = ?`, p.cfg.Frozen, seq, n.id)
+	_, err := t.Exec(`UPDATE namespaces SET frozen = ?, config_seq = ? WHERE ns = ?`, p.cfg.Frozen, seq, n.id)
 	t.must(err)
 	n.frozen = p.cfg.Frozen
 	n.configSeq = seq
@@ -305,7 +303,7 @@ func (e *Engine) WriteConfig(ctx context.Context, req Request, cc ConfigChange) 
 func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 	var res *WriteResult
 	err := func() error {
-		n := t.nsByName(req.NS)
+		n := t.nsForWrite(req.NS)
 		if cc.IfNoneMatch && n == nil {
 			r, err := t.createNamespace(req, cc)
 			res = r
@@ -413,13 +411,9 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 func (t *tx) insertNamespace(name string, patches, doc any, frozen bool, author int64) (*nsRow, ids.ID, ids.ID) {
 	canon := jsonv.Canonical(patches)
 	id := ids.Revision(nil, canon)
-	r, dberr := t.Exec(`INSERT INTO namespaces (name, frozen) VALUES (?, ?)`, name, frozen)
-	t.must(dberr)
-	nsid, _ := r.LastInsertId()
-	r, dberr = t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?)`,
+	nsid := t.mustInsert(`INSERT INTO namespaces (name, frozen) VALUES (?, ?) RETURNING ns`, name, frozen)
+	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
 		nsid, id[:], string(canon), string(jsonv.Canonical(doc)), author, t.now.UnixMilli())
-	t.must(dberr)
-	cseq, _ := r.LastInsertId()
 	n := t.nsByID(nsid)
 	_, nsID := t.appendNS(n, map[string]any{"kind": "config", "target": id.String()}, nil, &cseq, cseq, author)
 	return n, id, nsID
@@ -445,7 +439,7 @@ func (e *Engine) CreateBranch(ctx context.Context, req Request, br BranchRequest
 }
 
 func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) {
-	base := t.nsByName(req.NS)
+	base := t.nsForWrite(req.NS)
 	if base == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
 	}
@@ -582,13 +576,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	}
 	// Step 7.
 	author := t.actorID(a)
-	r, dberr := t.Exec(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?)`, br.Name, base.id, atSeq, base.configSeq)
-	t.must(dberr)
-	bid, _ := r.LastInsertId()
-	r, dberr = t.Exec(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?)`,
+	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, br.Name, base.id, atSeq, base.configSeq)
+	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
 		bid, cfgID[:], string(gcanon), string(jsonv.Canonical(nd)), author, t.now.UnixMilli())
-	t.must(dberr)
-	cseq, _ := r.LastInsertId()
 	bn := t.nsByID(bid)
 	t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
 	// A sealed branch has its own epoch keys (§E.2.5).
@@ -601,7 +591,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, force bool) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(req.NS)
+		n := t.nsForWrite(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
@@ -666,6 +656,11 @@ func (t *tx) isBranchOf(b, base *nsRow) bool {
 // purgeResource purges name in n and propagates to every branch (§8.3). It
 // returns the id of n's purge entry.
 func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
+	if t.locking() {
+		// Every namespace a purge reaches is locked exclusively, and read
+		// as of its lock (D.8 purge propagation).
+		n = t.nsByIDLocked(n.id, lockExclusive)
+	}
 	// Branches first: a branch reading the resource through must still see
 	// it, so that it records its own purge entry.
 	for _, b := range t.branchesOf(n) {
@@ -679,9 +674,7 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 		own := v.own
 		var res int64
 		if own == nil {
-			r, err := t.Exec(`INSERT INTO resources (ns, name, head_seq, state) VALUES (?,?,?,?)`, n.id, name, v.head.seq, statePurged)
-			t.must(err)
-			res, _ = r.LastInsertId()
+			res = t.mustInsert(`INSERT INTO resources (ns, name, head_seq, state) VALUES (?,?,?,?) RETURNING res`, n.id, name, v.head.seq, statePurged)
 		} else {
 			res = own.id
 			t.deleteArchives(`res = ?`, res)
@@ -719,7 +712,7 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(req.NS)
+		n := t.nsForWrite(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
@@ -803,6 +796,12 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 func (t *tx) referencedPaths(exclude func(ns *nsRow, res string) bool) map[string]bool {
 	out := map[string]bool{}
 	var queue []string
+	// The namespaces read here aren't locked (on Postgres, pglock.go): a
+	// write that makes a schema referenced holds the schema namespace's lock
+	// shared (it resolved the schema), and purges and prunes, the callers,
+	// hold that namespace's lock exclusively.
+	t.noLock++
+	defer func() { t.noLock-- }()
 	// Shadows (§G.3) are read only through their remote branch, whose
 	// heads include what it reads through.
 	rows, err := t.Query(`SELECT ` + nsCols + ` FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
@@ -875,7 +874,7 @@ type PruneResult struct {
 func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRequest) (*PruneResult, error) {
 	var out *PruneResult
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(req.NS)
+		n := t.nsForWrite(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
@@ -1068,7 +1067,7 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 		res.Archive = u
 	}
 	for seq, doc := range docs {
-		_, err := t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, own.id, t.putDoc("snapshots", own.id, seq, doc))
+		_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc`, seq, own.id, t.putDoc("snapshots", own.id, seq, doc))
 		t.must(err)
 	}
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)

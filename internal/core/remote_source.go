@@ -77,7 +77,7 @@ func (e *Engine) RegisterRemoteBranch(ctx context.Context, req Request, rr Remot
 }
 
 func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationResult, *Error) {
-	n := t.nsByName(req.NS)
+	n := t.nsForWrite(req.NS)
 	if n == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
 	}

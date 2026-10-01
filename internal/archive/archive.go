@@ -307,6 +307,7 @@ func Restore(ctx context.Context, e *core.Engine, opt RestoreOptions) ([]Resourc
 	for _, g := range groups {
 		rep := ResourceReport{NS: g.ns, Name: g.name, Archives: len(g.recs)}
 		res, err := e.RestoreResource(ctx, g.ns, g.name, func(yield func(core.ArchiveEntry) error) error {
+			rep.Failed = nil // a run again starts over
 			for _, r := range g.recs {
 				u := r.URL
 				if from != "" {

@@ -27,8 +27,8 @@ package core
 //
 // Stored once, served forever (§E.2.2). Sealed bytes are produced lazily on
 // first read and stored in the sealed table per serving namespace; a
-// concurrent first reader's INSERT OR IGNORE loses and serves the stored
-// value, so every reader sees identical bytes. Namespace log ranges depend
+// concurrent first reader's INSERT (ON CONFLICT DO NOTHING) loses and
+// serves the stored value, so every reader sees identical bytes. Namespace log ranges depend
 // on (since, id) and are stored too; at most maxSealedRanges per namespace
 // are kept (oldest dropped, and resealed on demand with fresh bytes). Purges
 // delete a resource's sealed rows, a namespace purge also its epoch keys,
@@ -349,8 +349,8 @@ func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain fu
 	return j
 }
 
-// finishSeal seals the jobs not stored yet and stores them (INSERT OR
-// IGNORE, then re-read, so concurrent first readers agree). Nothing is
+// finishSeal seals the jobs not stored yet and stores them (INSERT ON
+// CONFLICT DO NOTHING, then re-read, so concurrent first readers agree). Nothing is
 // stored for a namespace or resource purged since the read. In a namespace
 // with encryption.pad, each JWE is padded as a whole and never compressed
 // (§E.2.2); the setting as of sealing counts, and stored bytes never change.
@@ -371,6 +371,8 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 		return nil
 	}
 	return e.update(ctx, func(t *tx) error {
+		// Shared: purges, which delete sealed rows, lock exclusively.
+		t.lockNS(ns, lockShared)
 		var purged bool
 		if err := t.QueryRow(`SELECT purged FROM namespaces WHERE ns = ?`, ns).Scan(&purged); err != nil || purged {
 			return nil
@@ -391,7 +393,7 @@ func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) erro
 			if j.name != "" {
 				name = j.name
 			}
-			_, err := t.Exec(`INSERT OR IGNORE INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?)`,
+			_, err := t.Exec(`INSERT INTO sealed (ns, kind, key, name, rev_seq, jwe, created) VALUES (?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
 				ns, j.kind, j.key, name, rev, j.jwe, t.now.UnixMilli())
 			t.must(err)
 			t.must(t.QueryRow(`SELECT jwe FROM sealed WHERE ns = ? AND kind = ? AND key = ?`, ns, j.kind, j.key).Scan(&j.jwe))
@@ -626,7 +628,7 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error) {
 	var epoch int
 	err := e.update(ctx, func(t *tx) error {
-		n := t.nsByName(ns)
+		n := t.nsForWrite(ns)
 		if n == nil {
 			return notFound()
 		}
@@ -736,6 +738,9 @@ func (e *Engine) rotateLoop(maxAge time.Duration) {
 		case <-e.stop:
 			return
 		case <-tk.C:
+			if !e.leader(context.Background()) {
+				continue // another instance rotates (pglock.go)
+			}
 			if done, err := e.RotateDue(context.Background(), maxAge); err != nil {
 				log.Printf("rotate-epochs: %v", err)
 			} else if len(done) > 0 {
