@@ -357,6 +357,12 @@ It is plain HTML/JS embedded in the binary and talks to the same-origin API. It 
   folders on a cycle are reported, not traversed. It creates folders and places,
   moves, reorders and removes nodes as ordinary writes to the catalog namespace (`If-None-Match`,
   `If-Match`, fresh `$nonce` on placements), then re-reads the tree with `?min=` (read-your-writes);
+- blobs (§7.8): a document's `$blob` references show as chips (type, size, Open, Download, inline preview
+  of images and small text), including sealed (E2) blobs, opened with the epoch's key and an older epoch if
+  that is all the reader holds, and E3 blobs, decrypted with the key inside the reference. "Attach file" on
+  the Resource tab uploads a blob (with a `Blob-Nonce` in sealed namespaces, encrypted in the browser in E3
+  ones) and inserts its reference into the patch set; E3 writes declare their `blobs`, and the fold flags a
+  revision whose list is wrong. Only inert types open in a tab; the rest download;
 - a **Keys** tab (Addendum E): an X25519 identity kept in localStorage (its public JWK goes in a
   grant's `enc`, or into an E3 keyring), the keys held, E3 keyring administration (init, add a
   reader, rotate), a JWE decrypter and a self-test of the page's crypto against vectors made by

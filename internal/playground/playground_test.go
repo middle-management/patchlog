@@ -37,8 +37,9 @@ func TestHandler(t *testing.T) {
 		if rec.Code != 200 || !strings.Contains(rec.Header().Get("Content-Type"), want) || rec.Body.Len() == 0 {
 			t.Errorf("%s: %d %q", path, rec.Code, rec.Header().Get("Content-Type"))
 		}
-		if !strings.Contains(rec.Header().Get("Content-Security-Policy"), "connect-src 'self'") {
-			t.Errorf("%s: CSP %q", path, rec.Header().Get("Content-Security-Policy"))
+		// connect-src stays same-origin; img-src adds blob: for blob previews (§7.8).
+		if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "connect-src 'self'") || !strings.Contains(csp, "img-src 'self' data: blob:;") {
+			t.Errorf("%s: CSP %q", path, csp)
 		}
 	}
 	rec := httptest.NewRecorder()

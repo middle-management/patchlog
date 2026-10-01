@@ -127,6 +127,7 @@ function toCurl(e) {
   parts.push(sq(location.origin + e.path));
   for (const [k, v] of Object.entries(e.reqHeaders)) parts.push('-H ' + sq(k + ': ' + v));
   if (e.reqBody !== undefined) parts.push('--data-raw ' + sq(e.reqBody));
+  else if (e.reqNote) parts.push('--data-binary @FILE');
   return parts.join(' \\\n  ');
 }
 
@@ -184,7 +185,8 @@ function renderEntry(e) {
     h('h3', {}, 'Request'),
     h('div', { class: 'mono' }, e.method + ' ' + location.origin + e.path),
     Object.keys(e.reqHeaders).length ? reqHdrs : h('div', { class: 'muted small' }, '(no custom headers)'),
-    e.reqBody !== undefined ? h('div', { style: 'margin-top:4px' }, jsonPre(pretty(e.reqBody))) : null));
+    e.reqBody !== undefined ? h('div', { style: 'margin-top:4px' }, jsonPre(pretty(e.reqBody))) : null,
+    e.reqNote ? h('div', { class: 'muted small' }, e.reqNote) : null));
 
   // response
   if (e.neterr) {
@@ -211,7 +213,8 @@ function renderEntry(e) {
     if (e.resBody) {
       const shown = e.resBody.length > 60000 ? e.resBody.slice(0, 60000) + '\n\u2026 (truncated)' : e.resBody;
       res.append(h('div', { style: 'margin-top:4px' }, jsonPre(pretty(shown))));
-    } else if (!e.sse) res.append(h('div', { class: 'muted small' }, '(empty body)'));
+    } else if (e.binNote) res.append(h('div', { class: 'muted small' }, e.binNote));
+    else if (!e.sse) res.append(h('div', { class: 'muted small' }, '(empty body)'));
     if (e.dec) res.append(decView(e.dec));
     body.append(res);
   }
@@ -292,14 +295,15 @@ function authHeaders() {
   return hd;
 }
 
-/* api(method, path, {headers, body, ct, auto, label, stream}) -> Response wrapper */
+/* api(method, path, {headers, body, ct, auto, label, stream, raw, binary}) -> Response wrapper.
+ * raw sends body (bytes) as is, binary keeps a 2xx body as bytes (wrapper .bin) instead of text. */
 async function api(method, path, o = {}) {
   const headers = authHeaders();
   for (const [k, v] of Object.entries(o.headers || {})) if (v != null && v !== '') headers[k] = v;
   let body = o.body;
-  if (body !== undefined && typeof body !== 'string') body = JSON.stringify(body);
+  if (body !== undefined && typeof body !== 'string' && !o.raw) body = JSON.stringify(body);
   if (body !== undefined && !headers['Content-Type']) headers['Content-Type'] = o.ct || 'application/json';
-  const e = newEntry({ method, path, reqHeaders: headers, reqBody: body, auto: !!o.auto && !insp.manual, label: o.label !== undefined ? o.label : insp.label });
+  const e = newEntry({ method, path, reqHeaders: headers, reqBody: o.raw ? undefined : body, reqNote: o.raw ? `(${body.length} bytes of binary data, not shown)` : '', auto: !!o.auto && !insp.manual, label: o.label !== undefined ? o.label : insp.label });
   const t0 = performance.now();
   const ctl = new AbortController();
   try {
@@ -309,7 +313,10 @@ async function api(method, path, o = {}) {
     if (res.redirected) { const u = new URL(res.url); e.finalPath = u.pathname + u.search; }
     else e.finalPath = path;
     if (o.stream && res.ok) { ctl.abort(); e.resBody = '(event stream opened, then closed by the probe)'; }
-    else e.resBody = await res.text();
+    else if (o.binary && res.ok) {
+      e.bin = new Uint8Array(await res.arrayBuffer()); e.resBody = '';
+      e.binNote = `(${e.bin.length} bytes of ${(res.headers.get('Content-Type') || 'unknown type').split(';')[0]}, not shown)`;
+    } else e.resBody = await res.text();
     try { e.json = e.resBody ? JSON.parse(e.resBody) : null; } catch (_) { e.json = null; }
   } catch (err) {
     e.neterr = err && err.message ? err.message : String(err);
@@ -321,7 +328,7 @@ async function api(method, path, o = {}) {
 function wrap(e) {
   return {
     entry: e, status: e.status, ok: e.status >= 200 && e.status < 300, json: e.json, text: e.resBody,
-    finalPath: e.finalPath, redirected: e.redirected, neterr: e.neterr,
+    finalPath: e.finalPath, redirected: e.redirected, neterr: e.neterr, bin: e.bin,
     jose: !!(e.resHeaders && /^application\/jose\b/i.test(e.resHeaders.get('Content-Type') || '')),
     hdr: (k) => (e.resHeaders ? e.resHeaders.get(k) : null),
     etag() { const v = this.hdr('ETag'); return v ? v.replace(/^"|"$/g, '') : ''; },
@@ -614,7 +621,7 @@ async function refreshRes() {
 function renderResAll() {
   const box = $('resState'), st = S.resState;
   const pre = $('resDoc');
-  renderResSeal(st);
+  renderResSeal(st); renderBlobs(null);
   if (!S.ns || !S.res) { box.className = 'muted'; box.textContent = 'Pick a resource from the heads table, or type a name above.'; setJSON(pre, null); return; }
   if (!st) { box.className = 'muted'; box.textContent = `${S.res} \u2014 loading\u2026`; setJSON(pre, null); return; }
   box.className = '';
@@ -622,12 +629,12 @@ function renderResAll() {
   switch (st.kind) {
     case 'live':
       line.append(h('span', { class: 'badge live' }, 'live'), h('span', { class: 'muted' }, 'head'), idEl(st.head));
-      setJSON(pre, st.doc != null ? st.doc : st.raw); break;
+      setJSON(pre, st.doc != null ? st.doc : st.raw); renderBlobs(st.doc); break;
     case 'tomb':
       line.append(h('span', { class: 'badge tomb' }, 'tombstoned'), h('span', { class: 'muted' }, 'tombstone'), idEl(st.head));
       if (st.last) line.append(h('span', { class: 'muted' }, 'last'), idEl(st.last));
       box.replaceChildren(line, h('div', { class: 'note' }, 'GET answered 410. Restore with If-Match set to the tombstone; the document below is the last live one.'));
-      setJSON(pre, st.lastDoc != null ? st.lastDoc : st.raw); return;
+      setJSON(pre, st.lastDoc != null ? st.lastDoc : st.raw); renderBlobs(st.lastDoc); return;
     case 'purged':
       line.append(h('span', { class: 'badge err' }, 'purged'));
       box.replaceChildren(line, h('div', { class: 'note' }, '410 gone: the content was removed for good. Creating this name again is refused.'));
@@ -788,10 +795,10 @@ async function selectRev(id) {
   if (r.status === 200) {
     const d = await readDoc(S.ns, S.res, id, r);
     if (S.selRev !== id) return;
-    if (d.fold) parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision (folded in this browser)'), foldSummary(d.fold), jsonPre(d.doc));
+    if (d.fold) parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision (folded in this browser)'), foldSummary(d.fold), jsonPre(d.doc), blobsPanel(d.doc));
     else if (d.foldErr) parts.push(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'fold failed'), '  ' + d.foldErr));
-    else if (d.seal) parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision'), sealSummary(d.seal), d.doc != null ? jsonPre(d.doc) : jsonPre(r.text));
-    else parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision'), jsonPre(r.text ? pretty(r.text) : ''));
+    else if (d.seal) parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision'), sealSummary(d.seal), d.doc != null ? jsonPre(d.doc) : jsonPre(r.text), blobsPanel(d.doc));
+    else parts.push(h('h3', { style: 'margin-top:8px' }, 'Document at this revision'), jsonPre(r.text ? pretty(r.text) : ''), blobsPanel(d.doc));
   } else if (r.status === 410 && entry.kind === 'tombstone') parts.push(h('p', { class: 'note' }, '410: a tombstone id has no document; earlier revisions stay readable.'));
   else parts.push(h('div', { class: 'errbox' }, h('span', { class: 'code' }, (r.json && r.json.code) || 'HTTP ' + r.status), '  ' + (r.status === 410 && r.json && r.json.code === 'pruned' ? 'below the horizon ' + short(r.json.horizon || '') : '')));
   box.replaceChildren(...parts);
@@ -1187,6 +1194,7 @@ async function foldLog(ns, name, id, since, arr) {
     const v = await validateDoc(res.doc);
     if (v.errors.length) { flag('the document does not validate against its $schema: ' + v.errors.map((x) => (x.pointer || '(root)') + ' ' + x.message).join('; ')); continue; }
     if (v.note) e._note = (e._note ? e._note + '; ' : '') + v.note;
+    if (!Z.sameBlobs(Z.sealedBlobs(e.patches), Z.blobIDs(res.doc))) { flag('the declared blob list does not match the blobs the document references (\u00a7E.3.1)'); continue; }
     doc = res.doc; exists = res.exists; out.validID = e.id; e._doc = doc;
   }
   if (prev !== id) bad(`the log ends at ${prev}, not ${id}`);
@@ -1257,10 +1265,11 @@ async function writeSealed(kind, patchText) {
     const enc = (info.doc && info.doc.encryption) || {};
     const kid = Z.kid(ns, enc.epoch || 1);
     const key = await contentKey(kid, '');
-    const body = Z.canonical(await Z.sealPatchSet(key, kid, ns, res, parent, patches, !!enc.pad));
+    const blobs = Z.blobIDs(result); // declared in plaintext on the sealed op (§E.3.1)
+    const body = Z.canonical(await Z.sealPatchSet(key, kid, ns, res, parent, patches, !!enc.pad, blobs));
     const expect = await Z.revisionID(parent, JSON.parse(body));
     const headers = kind === 'create' ? { 'If-None-Match': '*' } : { 'If-Match': quoteId(parent) };
-    S.lastSealed = { path: rpath(), headers, body, expect, patches, kid, parent };
+    S.lastSealed = { path: rpath(), headers, body, expect, patches, kid, parent, blobs };
     $('resendSealed').hidden = false;
     await sendSealed();
   } catch (err) { fail(err.message); }
@@ -1275,9 +1284,207 @@ async function sendSealed() {
     h('div', { class: 'state-line' }, h('span', { class: 'badge tomb' }, 'sealed in this browser'), h('span', { class: 'mono small' }, 'kid ' + x.kid), h('span', { class: 'badge ' + (r.ok ? 'ok' : 'err') }, r.neterr ? 'network error' : 'HTTP ' + r.status)),
     h('div', { class: 'small' }, 'pl ', h('code', {}, Z.canonical({ ns: S.ns, name: S.res, parent: x.parent })), ' · expected id ', idEl(x.expect),
       got ? (got === x.expect ? h('span', { class: 'badge ok' }, 'server id matches') : h('span', { class: 'badge err' }, 'server id differs: ' + short(got))) : null),
+    x.blobs && x.blobs.length ? h('div', { class: 'small' }, `declares ${x.blobs.length} blob(s) in plaintext: `, ...x.blobs.map((b) => idEl(b))) : null,
     h('details', {}, h('summary', { class: 'muted small' }, 'plaintext patch set (never sent)'), jsonPre(x.patches)),
     r.ok || r.status === 412 || r.status === 422 ? null : h('div', { class: 'note' }, 'Not acknowledged: resend the exact same ciphertext so a retry keeps the id (§E.3.1).')));
   if (r.status === 201 || r.status === 200) { S.ifDirty = false; S.lastSealed = null; $('resendSealed').hidden = true; await afterWrite(); }
+}
+
+/* ------------------------------------------------------------------ *
+ * blobs (§7.8, §E.2.2, §E.3.1): chips for the references of a document, and attaching files
+ * ------------------------------------------------------------------ */
+/* Types a blob URL may be opened as in a tab. Anything else (html, svg, xml, scripts) is offered as a download
+ * only: a blob: URL shares this page's origin, which holds the Bearer grant and the identity. */
+const OPEN_SAFE = /^(image\/(png|jpe?g|gif|webp|avif|bmp)|text\/plain)$/;
+const PREVIEW_IMG = 4 << 20, PREVIEW_TEXT = 64 << 10;
+const EXT = { 'image/png': 'png', 'image/jpeg': 'jpg', 'image/gif': 'gif', 'image/webp': 'webp', 'image/svg+xml': 'svg', 'text/plain': 'txt', 'text/html': 'html', 'application/pdf': 'pdf', 'application/json': 'json' };
+const blobCache = new Map(); // ns/name/bid[/key] -> { type, data }, bounded by bytes
+let blobCacheBytes = 0;
+
+const fmtBytes = (n) => (n < 1024 ? n + ' B' : n < 1 << 20 ? (n / 1024).toFixed(1) + ' KiB' : (n / (1 << 20)).toFixed(1) + ' MiB');
+const ptrEsc = (k) => String(k).replace(/~/g, '~0').replace(/\//g, '~1');
+
+/* findBlobRefs lists the references of a document: objects with a $blob string, at any depth (client.BlobIDs). */
+function findBlobRefs(doc) {
+  const out = [];
+  if (doc && typeof doc === 'object' && !Array.isArray(doc) && doc.$schema === 'https://json-schema.org/draft/2020-12/schema') return out;
+  const walk = (v, at) => {
+    if (Array.isArray(v)) v.forEach((x, i) => walk(x, at + '/' + i));
+    else if (v && typeof v === 'object') {
+      if (typeof v.$blob === 'string') out.push({ path: at, ref: v });
+      else for (const [k, x] of Object.entries(v)) walk(x, at + '/' + ptrEsc(k));
+    }
+  };
+  walk(doc, '');
+  return out;
+}
+
+const httpFail = (r) => new Error(r.neterr ? 'network error: ' + r.neterr : `HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}${r.json && r.json.message ? ': ' + r.json.message : ''}`);
+
+/* openE2Blob opens a blob a sealed namespace delivered sealed (§E.2.2): kid names this namespace, pl is
+ * { ns, name, blob }, and the key is the resource's K_r of that epoch. A missing key is tagged noKey. */
+async function openE2Blob(ns, name, bid, bytes) {
+  const { header } = Z.parseBlob(bytes);
+  const k = Z.parseKid(header.kid);
+  if (k.ns !== ns) throw new Error(`the blob is sealed under ${header.kid}, not a key of ${ns}`);
+  let key;
+  try { key = await contentKey(header.kid, name); } catch (err) { throw Object.assign(err, { noKey: true, epoch: k.epoch }); }
+  const o = await Z.openBlob(bytes, key);
+  const diff = Z.plDiff(o.header.pl, { ns, name, blob: bid });
+  if (o.header.kid !== header.kid || diff.length) throw new Error('the sealed blob is bound to another ' + (diff.join(', ') || 'kid'));
+  return { data: o.data, epoch: k.epoch };
+}
+
+/* getBlob reads the blob a reference names and returns { type, data, note }, like client.GetBlobRef: a sealed namespace
+ * answers 302 to …/blob/{bid}/e/{e} (fetch follows it) with the sealed-blob form, opened with the epoch's key, and
+ * if this reader lacks that key, with older epochs it holds. E3 references carry their key. Ids and sizes are checked. */
+async function getBlob(ns, name, ref, auto) {
+  const bid = ref.$blob;
+  if (!ID_RE.test(bid) || typeof ref.type !== 'string' || !Number.isInteger(ref.size)) throw new Error('malformed blob reference');
+  const ck = [ns, name, bid, ref.sealed ? ref.sealed.key : ''].join('/');
+  if (blobCache.has(ck)) return blobCache.get(ck);
+  const base = `/r/${ns}/${name}/blob/${bid}`;
+  const fetchAt = async (epoch) => {
+    const r = await api('GET', base + (epoch ? '/e/' + epoch : ''), { binary: true, auto, label: 'blob' });
+    if (r.status !== 200) throw Object.assign(httpFail(r), { status: r.status });
+    return { bytes: r.bin, ct: Z.blobType(r.hdr('Content-Type')), via: r.finalPath, redirected: r.redirected };
+  };
+  const got = await fetchAt(0);
+  let bytes = got.bytes, note = '';
+  if (got.ct === Z.BLOB_TYPE && hasKid(bytes)) {
+    let o;
+    try { o = await openE2Blob(ns, name, bid, bytes); } catch (err) {
+      if (!err.noKey) throw err;
+      // No key for the epoch served: ask for an older one this reader holds (§E.2.2).
+      for (let e = err.epoch - 1; e >= 1 && !o; e--) {
+        let alt; try { alt = await fetchAt(e); } catch (x) { if (x.status === 404 || x.status === 410) continue; throw x; }
+        try { o = await openE2Blob(ns, name, bid, alt.bytes); } catch (x) { if (!x.noKey) throw x; }
+      }
+      if (!o) throw err;
+    }
+    bytes = o.data; note = `sealed under epoch ${o.epoch}, opened in this browser`;
+  }
+  let out;
+  if (ref.sealed) {
+    out = await Z.decryptBlob(ref, bytes);
+    note = 'end-to-end: decrypted in this browser with the key of the reference';
+  } else {
+    if (bytes.length !== ref.size || (await Z.blobID(ref.type, ref.nonce || '', bytes)) !== bid) throw new Error('the blob does not match its reference (id or size)');
+    out = { type: Z.blobType(ref.type), data: bytes };
+  }
+  out.note = note;
+  const res = { type: out.type, data: out.data, note: out.note };
+  if (res.data.length <= 8 << 20) {
+    blobCache.set(ck, res); blobCacheBytes += res.data.length;
+    for (const [k, v] of blobCache) { if (blobCacheBytes <= 32 << 20) break; blobCache.delete(k); blobCacheBytes -= v.data.length; }
+  }
+  return res;
+}
+function hasKid(bytes) { try { return !!Z.parseBlob(bytes).header.kid; } catch (_) { return false; } }
+
+/* blobChip: the reference as a chip with its type and size, Open and Download, and an inline preview. */
+function blobChip(ns, name, path, ref, urls) {
+  const e3 = ref.sealed && typeof ref.sealed === 'object' ? ref.sealed : null;
+  const type = Z.blobType(e3 ? e3.type : ref.type), size = e3 ? e3.size : ref.size;
+  const body = h('div', { class: 'blob-body' });
+  let loaded = null;
+  const load = async (auto) => {
+    if (loaded) return loaded;
+    const st = h('span', { class: 'muted small' }, 'loading…');
+    body.append(st);
+    try { loaded = await getBlob(ns, name, ref, auto); } catch (err) { st.replaceWith(h('span', { class: 'errline' }, err.message)); throw err; }
+    st.remove();
+    return loaded;
+  };
+  const url = (b, asType) => { const u = URL.createObjectURL(new Blob([b.data], { type: asType })); urls.push(u); return u; };
+  const click = (u, attrs) => { const a = h('a', Object.assign({ href: u, rel: 'noopener' }, attrs)); document.body.append(a); a.click(); a.remove(); };
+  const fname = () => (path.split('/').filter((x) => x && !/^\d+$/.test(x)).pop() || 'blob') + '-' + short(ref.$blob).replace('…', '') + (EXT[type] ? '.' + EXT[type] : '');
+  const preview = async (auto) => {
+    try {
+      const b = await load(auto);
+      if (/^image\//.test(b.type)) body.append(h('img', { class: 'blob-img', src: url(b, b.type), alt: path }));
+      else if (/^text\//.test(b.type)) {
+        const t = new TextDecoder().decode(b.data.slice(0, PREVIEW_TEXT));
+        body.append(h('pre', { class: 'blob-text' }, t + (b.data.length > PREVIEW_TEXT ? '\n…' : '')));
+      }
+      if (b.note) body.append(h('div', { class: 'muted small' }, b.note));
+    } catch (_) { /* shown by load */ }
+  };
+  const previewable = (/^image\//.test(type) && size <= PREVIEW_IMG) || (/^text\//.test(type) && size <= PREVIEW_TEXT);
+  const chip = h('div', { class: 'blob-chip' },
+    h('div', { class: 'row' },
+      h('span', { class: 'badge info' }, type), h('span', { class: 'muted small' }, fmtBytes(size)),
+      e3 ? h('span', { class: 'badge tomb', title: 'encrypted in the browser of the writer; the key is inside the sealed reference (§E.3.1)' }, 'E3 sealed') : null,
+      ref.nonce ? h('span', { class: 'badge', title: 'blob nonce ' + ref.nonce }, 'nonce') : null,
+      h('span', { class: 'mono small' }, path || '(root)'), idEl(ref.$blob),
+      h('button', { class: 'tiny', onclick: async () => { try { const b = await load(); click(url(b, OPEN_SAFE.test(b.type) ? b.type : 'application/octet-stream'), OPEN_SAFE.test(b.type) ? { target: '_blank' } : { download: fname() }); } catch (_) { /* shown */ } } }, 'Open'),
+      h('button', { class: 'tiny', onclick: async () => { try { const b = await load(); click(url(b, 'application/octet-stream'), { download: fname() }); } catch (_) { /* shown */ } } }, 'Download'),
+      !previewable && /^(image|text)\//.test(type) ? h('button', { class: 'tiny', onclick: (ev) => { ev.target.remove(); preview(false); } }, 'Preview') : null),
+    body);
+  if (previewable) preview(true);
+  return chip;
+}
+
+/* blobsPanel renders every reference of doc, of resource ns/name (the selected ones by default), or null if none. */
+function blobsPanel(doc, ns = S.ns, name = S.res) {
+  const refs = findBlobRefs(doc);
+  if (!refs.length) return null;
+  const urls = [];
+  const box = h('div', { class: 'blobs' }, h('h3', {}, `Blobs (${refs.length})`));
+  box.append(...refs.map((x) => blobChip(ns, name, x.path, x.ref, urls)));
+  box._urls = urls;
+  return box;
+}
+/* renderBlobs fills the Resource tab's panel, freeing the object URLs of the last one. */
+function renderBlobs(doc) {
+  const box = $('resBlobs');
+  (box._urls || []).forEach((u) => URL.revokeObjectURL(u));
+  const p = doc ? blobsPanel(doc) : null;
+  box._urls = p ? p._urls : [];
+  box.hidden = !p;
+  box.replaceChildren(...(p ? [p] : []));
+}
+
+/* attachFile uploads the chosen file as a blob of the selected resource (PUT …/blob/{bid}, §7.8) and inserts
+ * its reference into the patch set in the editor. Sealed namespaces get a Blob-Nonce (§C.7); e2e ones get the
+ * file encrypted here first (§E.3.1), with the key in the reference. */
+async function attachFile() {
+  if (!S.ns || !S.res) return toast('Select a namespace and a resource name');
+  const f = $('attachFile').files[0];
+  if (!f) return toast('Choose a file');
+  const out = $('attachOut'); out.hidden = false;
+  const fail = (msg) => out.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'not attached'), '  ' + msg));
+  out.replaceChildren(h('span', { class: 'muted small' }, 'uploading\u2026'));
+  try {
+    const data = new Uint8Array(await f.arrayBuffer());
+    const info = await nsInfo(S.ns);
+    const level = S.nsLevel || info.level;
+    const type = Z.blobType(f.type) || 'application/octet-stream';
+    let body = data, ct = type, nonce = '', ref;
+    if (level === 'e2e') {
+      const enc = (info.doc && info.doc.encryption) || {};
+      const e = await Z.encryptBlob(type, data, !!enc.pad);
+      body = e.sealed; ct = Z.BLOB_TYPE; ref = e.ref;
+    } else {
+      if (level === 'sealed') nonce = Z.newNonce();
+      ref = { $blob: await Z.blobID(type, nonce, data), type, size: data.length };
+      if (nonce) ref.nonce = nonce;
+    }
+    const r = await api('PUT', `/r/${S.ns}/${S.res}/blob/${ref.$blob}`, { raw: true, body, ct, headers: { 'Blob-Nonce': nonce }, label: 'blob upload' });
+    if (r.status !== 201) return fail(r.neterr ? 'network error: ' + r.neterr : `HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}${r.json && r.json.message ? ': ' + r.json.message : ''}`);
+    // Where it goes: the path the user picked, else /attachments/- on an existing array, else a new /attachments array.
+    let path = $('attachPath').value.trim(), value = ref;
+    if (!path) {
+      const doc = S.resState && S.resState.kind === 'live' ? S.resState.doc : null;
+      if (doc && Array.isArray(doc.attachments)) path = '/attachments/-';
+      else { path = '/attachments'; value = [ref]; }
+    }
+    insertOp($('patch'), { op: 'add', path, value });
+    out.replaceChildren(h('div', { class: 'seal-box' },
+      h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'uploaded'), idEl(ref.$blob), h('span', { class: 'muted small' }, `${type}, ${fmtBytes(data.length)}` + (level === 'e2e' ? ', encrypted here' : nonce ? ', with a nonce' : ''))),
+      h('div', { class: 'small' }, 'Inserted ', h('code', {}, `add ${path}`), ' into the patch set. The blob stays pending, visible to nobody else, until a write references it: press Create or Append.'),
+      h('details', {}, h('summary', { class: 'muted small' }, 'reference'), jsonPre(ref))));
+  } catch (err) { fail(err.message); }
 }
 
 /* ---- Keys tab ---- */
@@ -2473,6 +2680,7 @@ function init() {
   $('btnAppend').onclick = () => writeRes('append');
   $('btnDelete').onclick = () => writeRes('delete');
   $('btnRestore').onclick = () => writeRes('restore');
+  $('attachBtn').onclick = attachFile;
   $('btnPurge').onclick = purgeRes;
   $('btnPrune').onclick = pruneRes;
   $('ifMatch').oninput = () => { S.ifDirty = true; };
