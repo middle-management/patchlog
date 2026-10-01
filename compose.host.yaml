@@ -28,6 +28,7 @@ services:
       - -addr=:9080
       - -origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
       - -db=/data/patchlog.db
+      - -blob-dir=/data/blobs
       - -archive=file:///data/archive
       - -master-key=/data/master.key
       - -master-key-create

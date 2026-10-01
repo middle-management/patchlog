@@ -21,8 +21,8 @@
 # `make cdn-check` shows caching and purging at work; send `X-Cache-Debug: 1`
 # to see a response's cache tags and edge TTL.
 #
-# Data (databases, archives, the at-rest master key) lives in the `data`
-# volume; `docker compose down -v` wipes it.
+# Data (databases, blob files, archives, the at-rest master key) lives in
+# the `data` volume; `docker compose down -v` wipes it.
 
 x-patchlog: &patchlog
   build: .
@@ -41,6 +41,7 @@ services:
       # URLs the core generates point at the CDN.
       - -origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
       - -db=/data/patchlog.db
+      - -blob-dir=/data/blobs
       - -archive=file:///data/archive
       - -master-key=/data/master.key
       - -master-key-create

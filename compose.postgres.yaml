@@ -5,9 +5,11 @@
 #   make up-pg
 #
 # The core reads its database URL from PATCHLOG_DB (so the password stays
-# out of its arguments). The search index and tree service keep their own
-# SQLite databases in the data volume: they are derived state, rebuilt from
-# the core's API. `docker compose down -v` wipes Postgres's volume too.
+# out of its arguments). Blob bytes go to files in the data volume
+# (-blob-dir); more core instances would all mount that same volume. The
+# search index and tree service keep their own SQLite databases in the data
+# volume: they are derived state, rebuilt from the core's API.
+# `docker compose down -v` wipes Postgres's volume too.
 
 services:
   postgres:
@@ -34,6 +36,7 @@ services:
       - -dev
       - -addr=:8080
       - -origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
+      - -blob-dir=/data/blobs
       - -archive=file:///data/archive
       - -master-key=/data/master.key
       - -master-key-create

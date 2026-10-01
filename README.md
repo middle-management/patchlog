@@ -21,7 +21,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
-| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in a table, encrypted per resource at rest; sealed and e2e specifics to come) |
+| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
 | Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only with `-edge-secret`) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
@@ -50,9 +50,10 @@ and serves immutable, CDN-cacheable revisions.
   remote branches of a base that is itself a remote branch (§G.3). Bundles (§G.4) are implemented
   as `patchlog export/import`; merging a remote branch back is a bundle or merge-tool task.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
-- **Blob gaps** (§7.8): bytes live in a `blob_bytes` table rather than in object storage (D.2,
-  D.8); importing a private or sealed source into an e2e target (re-encrypting blobs, §G.5.1)
-  isn't implemented; no resumable uploads, and ranges of sealed blobs are served as stored.
+- **Blob gaps** (§7.8): bytes live in files on a local or shared filesystem (`-blob-dir`, see
+  [Blob storage](#blob-storage)), not in object storage (D.2, D.8); importing a private or
+  sealed source into an e2e target (re-encrypting blobs, §G.5.1) isn't implemented; no
+  resumable uploads, and ranges of sealed blobs are served as stored.
 - CDN edge grants (§C.5): no edge grants are issued, and the origin checks grants itself on
   every read. Both §9 deployments are supported: behind a grant-verifying edge
   (`-edge-secret`) private content gets edge lifetimes, otherwise it is `no-store` for shared
@@ -304,7 +305,12 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   `VACUUM` on `revisions`, `heads`, `snapshots`, `sealed` and `deks` after a purge that must be
   gone from disk now), and in WAL archives and backups until they expire. With encryption at
   rest (Addendum E.1) a purge also destroys the data keys, which makes those leftovers
-  unreadable: use it where purges must be final.
+  unreadable: use it where purges must be final. Blob files are deleted, not erased (see
+  [Blob storage](#blob-storage)).
+- **Blob files** need `-blob-dir` (or `PATCHLOG_BLOB_DIR`), a directory every instance mounts
+  (a shared volume, NFS, …). Without it the core logs so at startup and keeps blob bytes in
+  the database (`bytea`), as before; mixing is possible (rows say where their bytes are), but
+  an instance without the directory can't serve bytes stored in files.
 - **Several instances** can share the database (rolling deploys, horizontal scaling). Writes
   take transaction-scoped advisory locks per namespace, `pg_advisory_xact_lock(0x504c, ns)`,
   in ascending order: exclusive on every namespace they change (the written one; a branch's
@@ -331,7 +337,7 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   pointers are micro-cached for at most that long. A wake-up for another instance's write can
   be later while an older write transaction is still running (the tailer never skips one).
 - **Background loops** that must run once per deployment (the retention applier, epoch
-  rotation, following and registering remote bases) run on the instance holding a
+  rotation, following and registering remote bases, the blob sweeps) run on the instance holding a
   session-level advisory lock (class `0x504d`); another one takes over when it goes away.
 - **Per instance:** rate-limit buckets (§6.6), so each instance enforces the limits on what it
   serves (D.8), and the in-memory caches above.
@@ -341,6 +347,41 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
 - **Tests.** `PATCHLOG_TEST_PG=postgres://postgres@localhost:5432/postgres make test-pg` runs
   the storage-dependent tests with a fresh database per test (`internal/pgtest`); CI does the
   same against a `postgres:16` service container.
+
+### Blob storage
+
+Blob bytes (§7.8) are files under the blob directory; their rows in `blob_bytes` (and stored
+sealings' rows in `blob_epochs`, §E.2.2) stay in the database and decide which bytes exist
+(`internal/core/blobstore.go`).
+
+- **Where.** `-blob-dir DIR` (or `PATCHLOG_BLOB_DIR`); by default `<db>.blobs` next to a SQLite
+  file. `:memory:` keeps bytes in the database, and so does Postgres unless `-blob-dir` is given
+  (see above). `patchlog archive restore` takes the same flag. A directory belongs to one
+  database: the sweep deletes whatever that database doesn't name.
+- **Layout.** `{owner}/{hh}/{sha256}.{random}`: owner `0` for plaintext shared by every resource
+  that names the same bytes, else the resource row whose data key encrypts them (encryption at
+  rest), `hh` the hash's first two hex digits. Sealings are `e/{ns}/{hh}/{bid}.{epoch}.{random}`.
+  The random suffix makes each stored copy its own file, so deleting a collected one never
+  races a new upload of the same bytes on another instance.
+- **Writes** go to a temporary file in the target directory, are synced, renamed into place
+  and the directory synced, before the transaction inserting the row commits; a transaction
+  that rolls back deletes what it wrote. **Deletes** (the grace sweep, pruning, purges, a lost
+  race for a sealing) happen after the deleting transaction commits. A crash in between
+  leaves only orphan files: on the leader, the blob sweep (every ten minutes) also deletes
+  files older than an hour that no row names, and stray temporary files.
+- **Reads** of plaintext are served from the file, ranges reading only what they ask for;
+  bytes encrypted at rest are decrypted whole, sealings are served from their file.
+- **Purges.** With encryption at rest a purge destroys the resource's data key, so its files
+  are unreadable even before they are deleted. Plaintext files are deleted once the purge
+  commits, but deleting a file is not erasing it: its blocks stay on disk (and in snapshots and
+  backups) until overwritten, as with Postgres tuples before `VACUUM`. Use encryption at rest
+  where purges must be final.
+- **Backups** take the database and the directory together: one filesystem snapshot, or the
+  database first and then the directory. Files the restored database doesn't name are swept;
+  a blob collected between the two copies answers `500` after a restore.
+- **Databases from before blob files** need nothing: their rows keep the bytes in the table
+  (`file` is NULL) and are served, copied and collected from there; new bytes go to files. To
+  move old bytes out, re-upload them, or leave them until they are collected.
 
 ### Playground
 
