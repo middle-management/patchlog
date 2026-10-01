@@ -1,0 +1,56 @@
+# Changelog
+
+## v0.3.0
+
+Implements spec **v0.32** (`docs/SPEC.md`). Blobs are now complete across every namespace level and tool, blob bytes live on disk, and writes on Postgres are faster.
+
+### Blobs everywhere
+
+- **Sealed namespaces (E2):** `GET …/blob/{bid}` redirects (`302`) to `…/blob/{bid}/e/{e}`, which serves the blob in the binary sealed form (`application/vnd.patchlog.sealed-blob`, zero-padded). Each epoch's sealing is stored once; the first instance to store it wins. A blob is served under exactly the epochs of the revisions that reference it. A request for a blob whose revisions have no epoch yet fixes one under the current epoch.
+- **End-to-end namespaces (E3):** clients encrypt each blob under its own key, which travels in the sealed reference. Each `sealed` op declares in plaintext the blobs its document references. The server checks those lists (`blobsPerDocument`, availability, sealed type, no duplicates) and uses them for attaching, pruning, purge and bundles. Readers flag revisions whose list differs from the document.
+- **Merges** keep E3 blob ids and carry the declared lists over.
+- **Bundles** export blob lines and import them: blobs are uploaded, or copied with `Blob-From` within one deployment, before the batches that need them. Sealed bundles seal blob lines like any other line.
+- **Archives:** restore brings back the blobs that pruning ended.
+- **Remote branches** mirror their base's blobs up front, from plaintext, sealed and E3 bases, and check each one against its id.
+- **Playground:** blob references show as chips with previews (images, text), open and download. An "Attach file" control uploads files into public, sealed (with `Blob-Nonce`) and E3 namespaces (encrypted in the browser).
+- **Go client:** `GetBlobRef`, `EncryptBlob`/`DecryptBlob`, `E2E.UploadBlob`/`GetBlob`.
+
+### Blob storage on disk
+
+- Blob bytes are stored as files: `serve -blob-dir DIR` or `PATCHLOG_BLOB_DIR`. A SQLite file database defaults to `<db>.blobs/`.
+- Each file is written and fsynced before its row commits, and deleted only after the commit that frees it. Every stored copy has its own name, so a cleanup can't delete a concurrent re-upload. A sweep on the leader removes orphan files.
+- Range requests read only their range. Bytes encrypted at rest are still per-resource and decrypted whole.
+- **Postgres:** several instances must share the directory. Without `-blob-dir`, Postgres keeps bytes in the database and logs a line at startup.
+- Rows that the earlier table stored keep working; no migration is needed. Back up the database and the blob directory together.
+
+### Postgres
+
+- **Faster writes:** a small write sends 16 statements instead of about 32. That's 2.9 ms instead of 4.4 ms on a local `postgres:16` with fsync on, and 0.9 ms instead of 1.34 ms when writing in parallel.
+  - Small writes are checked inside their namespace's lock, skipping the separate check transaction.
+  - Author and namespace ids are cached.
+  - Rows are reused within a transaction.
+  - A few queries were merged.
+- **A second CDN purge:** a durable queue (`cdn_repurge`) sends every CDN tag purge again once no stale instance or replica can still serve the old content.
+- **Leader checks:** background jobs confirm they still hold leadership before each step.
+- A retried transaction no longer draws rate-limit tokens twice.
+
+### Spec v0.32 behaviour changes
+
+- **Blob upload order (`PUT`):** a purged namespace answers `410` after authorisation and rate limits. A copy with a body or an unreadable `Blob-From` is `400` before anything is read.
+- **Pending uploads:** a write that references a blob ends every pending upload of it in that resource, including blobs already attached.
+- **Batch `source`:** a bad `source.at` is `422` with the new code `source`. It is checked only for callers who may read the source; for anyone else, the source makes no blobs available.
+- **Dry runs** report missing blobs and carry on with the later steps.
+- **E3 prune** no longer takes a `blobs` list: the server already keeps every revision's declared list. Clients sort declared lists by binary id.
+- **Bundles:** a blob line comes before the first line that mentions the blob (`test` values included). A local import doesn't copy blobs that the batch's `source` already covers. E3 blob lines must have the sealed type and no nonce.
+- **Clients** decrypt a sealed blob only when it was served through `…/e/{e}`.
+- The merge tool reports batches whose `source.at` isn't in the branch's chain.
+
+### Fixes
+
+- `TestLongPollWakes` no longer fails when a long-poll's cursor boundary falls inside the test's pause.
+
+### Known gaps
+
+- Importing a private or sealed source into an E3 target (re-encrypting blobs) isn't implemented.
+- No resumable uploads.
+- Restoring an archive of a namespace encrypted at rest deadlocks on an in-memory SQLite database. File databases and Postgres are unaffected.

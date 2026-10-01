@@ -85,7 +85,11 @@ jobs:
             pre=""; case "$TAG" in *-*) pre="--prerelease";; esac
             # A pushed tag must exist; a manual run creates it on this commit.
             if [ -n "${{ inputs.version }}" ]; then where="--target $GITHUB_SHA"; else where="--verify-tag"; fi
-            gh release create "$TAG" dist/* --title "$TAG" --generate-notes $where $pre
+            # The tag's section of CHANGELOG.md, if it has one, heads the
+            # notes; GitHub's generated list of changes follows.
+            awk -v tag="$TAG" '$0 == "## " tag {on = 1; next} /^## / {on = 0} on' CHANGELOG.md > notes.md 2>/dev/null || true
+            if [ -s notes.md ]; then notes="--notes-file notes.md"; else notes=""; fi
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes $notes $where $pre
           fi
 
   image:
