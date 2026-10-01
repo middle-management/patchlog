@@ -45,7 +45,9 @@ import (
 //     the resources row only from the head its precondition matched:
 //     errChainRace). Either is a conflict (isConflict): the check runs
 //     again and answers 412 with the new head, or the idempotent retry,
-//     as on the D.3 path (recheck.go).
+//     as on the D.3 path (recheck.go). Batches insert their rows in one
+//     statement per table, in resource order (insertItems), so two batches
+//     never wait for each other's rows in a cycle.
 //   - the namespace chain. Its entry is appended last (appendNS), at the
 //     head read with SELECT … FOR NO KEY UPDATE on the namespace row,
 //     which waits for a concurrent appender's commit and then reads its

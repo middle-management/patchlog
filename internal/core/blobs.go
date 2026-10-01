@@ -377,6 +377,13 @@ func (t *tx) attachStep(res int64, step *stepState, seq int64) {
 		open[ids.FromBytes(b)] = true
 	}
 	rows.Close()
+	t.attachStepFrom(res, step, seq, open)
+}
+
+// attachStepFrom is attachStep for a resource whose open blob_refs (the
+// blobs its previous revision's document references) are known. Those of
+// step.blobs are open afterwards.
+func (t *tx) attachStepFrom(res int64, step *stepState, seq int64, open map[ids.ID]bool) {
 	for bid := range open {
 		if _, still := step.blobs[bid]; !still {
 			_, err := t.Exec(`UPDATE blob_refs SET to_seq = ? WHERE res = ? AND bid = ? AND to_seq IS NULL`, seq, res, bid[:])

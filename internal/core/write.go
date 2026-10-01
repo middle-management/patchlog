@@ -680,10 +680,8 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	}
 	// After the config change, which may have turned encryption on.
 	grantID := t.storeGrant(n, a)
-	var inserted []histRow
+	inserted := t.insertItems(n, st, a, author, grantID, req.Signature)
 	for _, s := range st {
-		res, last := t.insertItem(n, s, a, author, grantID, req.Signature)
-		inserted = append(inserted, histRow{res, last})
 		final := s.steps[len(s.steps)-1]
 		kind := "head"
 		if final.del {
@@ -1259,87 +1257,177 @@ func (t *tx) storeGrant(n *nsRow, a *actor) []byte {
 	return id[:]
 }
 
-// insertItem is step 7 for one item. It returns the resource row and the
-// seq of its final entry.
-func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID []byte, signature string) (int64, int64) {
-	// The row the precondition was checked against, in this transaction.
-	own := s.view.own
-	var res int64
-	if own == nil {
-		res = t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?, ?) RETURNING res`, n.id, s.Resource)
-	} else {
-		res = own.id
+// The statements of step 7 (bulk.go).
+var (
+	insResources = bulkInsert("resources", "ns bigint, name text", "RETURNING res, name")
+	insRevisions = bulkInsert("revisions", "res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
+		"via text, grant_id bytea, signature text, schema_ref text, created bigint", "RETURNING seq, res")
+	insRevEpochs = bulkInsert("rev_epochs", "seq bigint, epoch bigint", "")
+	insSnapshots = bulkInsert("snapshots", "seq bigint, res bigint, doc bytea", "ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc")
+	upsertHeads  = bulkInsert("heads", "res bigint, seq bigint, doc bytea", "ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc")
+	delHeads     = bulkStmt{pg: `DELETE FROM heads WHERE res = ANY($1::bigint[])`, lite: `DELETE FROM heads WHERE res = ?`, types: []string{"bigint"}}
+	openBlobRefs = bulkStmt{pg: `SELECT res, bid FROM blob_refs WHERE res = ANY($1::bigint[]) AND to_seq IS NULL`,
+		lite: `SELECT res, bid FROM blob_refs WHERE res = ? AND to_seq IS NULL`, types: []string{"bigint"}}
+	// moveHeads moves each resource's head from the one its precondition
+	// matched (old, 0 for none), or not at all (insertItems).
+	moveHeads = bulkStmt{
+		pg: `UPDATE resources SET head_seq = v.h, state = v.st FROM unnest($1::bigint[], $2::smallint[], $3::bigint[], $4::bigint[]) AS v(h, st, res, old)
+			WHERE resources.res = v.res AND COALESCE(resources.head_seq, 0) = v.old`,
+		lite:  `UPDATE resources SET head_seq = ?, state = ? WHERE res = ? AND COALESCE(head_seq, 0) = ?`,
+		types: []string{"bigint", "smallint", "bigint", "bigint"},
 	}
-	// A resource with a head has revisions (a purge keeps their rows).
-	hasRows := own != nil && own.headSeq.Valid
-	if own != nil && !hasRows {
-		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ?)`, res).Scan(&hasRows))
-	}
-	if _, ok := t.resLevels[res]; !ok {
-		if t.resLevels == nil {
-			t.resLevels = map[int64]int{}
-		}
-		t.resLevels[res] = t.nsLevel(n)
-	}
+)
+
+// insertItems is step 7 for a write's items: their resources' rows,
+// revisions, attached blobs, snapshots and heads, in a few statements
+// whatever the number of items (bulk.go). It returns each item's resource
+// row and the seq of its final entry, in the items' order.
+//
+// Rows go in resource order: two batches writing some of the same
+// resources at once (Postgres, pglock.go) then wait for each other's rows
+// in that order, never in a cycle.
+func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, grantID []byte, signature string) []histRow {
+	cfg := t.config(n.configSeq)
+	level := t.nsLevel(n)
 	var via any
 	if len(a.principal.Via) > 0 {
 		via = string(jsonv.Canonical(jsonv.FromGo(a.principal.Via)))
 	}
-	var parentSeq any
-	if s.parent != nil {
-		parentSeq = s.parent.seq
+	type item struct {
+		*itemState
+		own     *resRow // the row the precondition was checked against
+		res     int64
+		hasRows bool
+		e2e     bool // e2e content has no documents on the server (§E.3)
+		open    map[ids.ID]bool
+		// The chain as inserted so far: the last entry, the last live
+		// revision and its step.
+		last, lastLiveSeq int64
+		lastLive          *stepState
 	}
-	var last int64
-	var lastLive *stepState
-	var lastLiveSeq int64
-	if s.parent != nil {
-		ll := t.lastLive(s.parent)
-		lastLiveSeq = ll.seq
+	items := make([]*item, len(st))
+	for i, s := range st {
+		items[i] = &item{itemState: s, own: s.view.own, e2e: cfg.level == levelE2E && s.Resource != KeyringName}
 	}
-	// E2e content has no documents on the server (§E.3).
-	e2e := t.config(n.configSeq).level == levelE2E && s.Resource != KeyringName
-	for i, step := range s.steps {
-		first := 0
-		if !hasRows && i == 0 {
-			first = 1
+	sorted := append([]*item(nil), items...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Resource < sorted[j].Resource })
+
+	// Resource rows for the items that have none.
+	var newRows [][]any
+	byName := map[string]*item{}
+	for _, it := range sorted {
+		if it.own == nil {
+			newRows = append(newRows, []any{n.id, it.Resource})
+			byName[it.Resource] = it
 		}
-		kind := kindRev
-		var patches, typed, sig any
-		if step.del {
-			kind = kindTombstone
-		} else {
-			patches = t.putPatches(res, step.id, step.canon)
-			if step.typed != "" {
-				typed = step.typed
+	}
+	t.bulkQuery(insResources, newRows, func(rs *sql.Rows) {
+		var res int64
+		var name string
+		t.must(rs.Scan(&res, &name))
+		byName[name].res = res
+	})
+	var existing [][]any
+	byRes := map[int64]*item{}
+	for _, it := range sorted {
+		if it.own != nil {
+			it.res = it.own.id
+			// A resource with a head has revisions (a purge keeps their
+			// rows); one without may have none yet (a pending blob's).
+			it.hasRows = it.own.headSeq.Valid
+			if !it.hasRows {
+				t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ?)`, it.res).Scan(&it.hasRows))
 			}
+			existing = append(existing, []any{it.res})
 		}
-		if i == 0 && signature != "" {
-			sig = signature
+		byRes[it.res] = it
+		it.open = map[ids.ID]bool{}
+		if _, ok := t.resLevels[it.res]; !ok {
+			if t.resLevels == nil {
+				t.resLevels = map[int64]int{}
+			}
+			t.resLevels[it.res] = level
 		}
-		var err error
-		last, err = t.insert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
-			res, step.id[:], parentSeq, first, kind, patches, author, via, grantID, sig, typed, t.now.UnixMilli())
-		if err != nil {
-			panic(fmt.Errorf("inserting revision: %w", err))
+		if it.parent != nil {
+			it.last = it.parent.seq
+			it.lastLiveSeq = t.lastLive(it.parent).seq
 		}
-		t.inserted(revRow{seq: last, res: res, id: step.id, parentSeq: anyInt(parentSeq), first: first == 1, kind: kind,
-			patches: anyStr(patches), author: author, via: anyStr(via), grantID: grantID, signature: anyStr(sig), created: t.now.UnixMilli()})
-		parentSeq = last
-		if !step.del {
-			// The blobs the document references are attached with it
-			// (§7.8, step 7); a sealed step's are those its op declares,
-			// or for a restore with [] the last live document's (§E.3.1).
-			t.attachStep(res, step, last)
+	}
+	// The blobs the existing resources' heads reference (blob_refs still
+	// open), which a new revision ends or keeps (attachStep).
+	t.bulkQuery(openBlobRefs, existing, func(rs *sql.Rows) {
+		var res int64
+		var bid []byte
+		t.must(rs.Scan(&res, &bid))
+		byRes[res].open[ids.FromBytes(bid)] = true
+	})
+
+	// The revisions, one statement per step index: a step's parent is the
+	// step before it.
+	var epochs, snaps [][]any
+	for k := 0; ; k++ {
+		var rows [][]any
+		var stepItems []*item
+		for _, it := range sorted {
+			if k >= len(it.steps) {
+				continue
+			}
+			step := it.steps[k]
+			first := 0
+			if !it.hasRows && k == 0 {
+				first = 1
+			}
+			kind := kindRev
+			var patches, typed, sig any
+			if step.del {
+				kind = kindTombstone
+			} else {
+				patches = t.putPatches(it.res, step.id, step.canon)
+				if step.typed != "" {
+					typed = step.typed
+				}
+			}
+			if k == 0 && signature != "" {
+				sig = signature
+			}
+			var parent any
+			if it.last != 0 {
+				parent = it.last
+			}
+			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, author, via, grantID, sig, typed, t.now.UnixMilli()})
+			stepItems = append(stepItems, it)
 		}
-		if cfg := t.config(n.configSeq); cfg.level == levelSealed {
-			// The epoch that seals this entry forever (§E.2.1).
-			_, err := t.Exec(`INSERT INTO rev_epochs (seq, epoch) VALUES (?, ?)`, last, cfg.Epoch)
-			t.must(err)
+		if len(rows) == 0 {
+			break
 		}
-		if !step.del {
-			lastLive = step
-			lastLiveSeq = last
-			if e2e {
+		t.bulkQuery(insRevisions, rows, func(rs *sql.Rows) {
+			var seq, res int64
+			t.must(rs.Scan(&seq, &res))
+			byRes[res].last = seq
+		})
+		for i, it := range stepItems {
+			step, row, seq := it.steps[k], rows[i], it.last
+			t.inserted(revRow{seq: seq, res: it.res, id: step.id, parentSeq: anyInt(row[2]), first: row[3] == 1, kind: row[4].(int),
+				patches: anyStr(row[5]), author: author, via: anyStr(via), grantID: grantID, signature: anyStr(row[9]), created: row[11].(int64)})
+			if !step.del {
+				// The blobs the document references are attached with it
+				// (§7.8, step 7); a sealed step's are those its op declares,
+				// or for a restore with [] the last live document's (§E.3.1).
+				t.attachStepFrom(it.res, step, seq, it.open)
+				it.open = map[ids.ID]bool{}
+				for bid := range step.blobs {
+					it.open[bid] = true
+				}
+			}
+			if cfg.level == levelSealed {
+				// The epoch that seals this entry forever (§E.2.1).
+				epochs = append(epochs, []any{seq, cfg.Epoch})
+			}
+			if step.del {
+				continue
+			}
+			it.lastLive, it.lastLiveSeq = step, seq
+			if it.e2e {
 				continue
 			}
 			canon := step.docCanon
@@ -1347,55 +1435,82 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 				canon = jsonv.Canonical(step.doc)
 			}
 			t.cacheDoc(step.id, canon)
-			t.maybeSnapshot(res, last, canon)
+			if t.snapshotDue(it.res) {
+				snaps = append(snaps, []any{seq, it.res, t.putDoc("snapshots", it.res, seq, canon)})
+			}
+		}
+		// Before the next step's snapshotDue, which counts from them.
+		t.bulkExec(insSnapshots, snaps)
+		snaps = snaps[:0]
+	}
+	t.bulkExec(insRevEpochs, epochs)
+
+	// The heads move, each from the one its precondition matched, or not
+	// at all: on Postgres a writer of another resource holds the
+	// namespace's lock too, and a concurrent writer of this one that
+	// inserted first fails here, if not on the chain's unique constraints
+	// (pglock.go).
+	var moves, heads, dropHeads [][]any
+	for _, it := range sorted {
+		final := it.steps[len(it.steps)-1]
+		state := stateLive
+		if final.del {
+			state = stateTombstoned
+		}
+		var old int64
+		if it.own != nil {
+			old = it.own.headSeq.Int64
+		}
+		moves = append(moves, []any{it.last, state, it.res, old})
+		// heads caches the last live document, which reads and restores
+		// need, but only for small documents (D.4): rewriting a large one on
+		// every save costs its whole size each time. Larger ones fold from
+		// snapshots.
+		var doc []byte
+		switch {
+		case it.e2e:
+		case it.lastLive != nil:
+			doc = it.lastLive.docCanon
+			if doc == nil {
+				doc = jsonv.Canonical(it.lastLive.doc)
+			}
+		default:
+			doc = jsonv.Canonical(final.doc)
+		}
+		if !it.e2e && len(doc) <= t.e.opt.HeadSnapshotMax {
+			heads = append(heads, []any{it.res, it.lastLiveSeq, t.putDoc("heads", it.res, it.lastLiveSeq, doc)})
+		} else if it.own != nil {
+			dropHeads = append(dropHeads, []any{it.res})
 		}
 	}
-	final := s.steps[len(s.steps)-1]
-	state := stateLive
-	if final.del {
-		state = stateTombstoned
-	}
-	// The head moves from the one the precondition matched, or not at all:
-	// on Postgres a writer of another resource holds the namespace's lock
-	// too, and a concurrent writer of this one that inserted first fails
-	// here, if not on the chain's unique constraints (pglock.go).
-	var oldHead int64
-	if own != nil {
-		oldHead = own.headSeq.Int64
-	}
-	r, err := t.Exec(`UPDATE resources SET head_seq = ?, state = ? WHERE res = ? AND COALESCE(head_seq, 0) = ?`, last, state, res, oldHead)
-	t.must(err)
-	if k, err := r.RowsAffected(); err != nil || k != 1 {
+	if t.bulkExec(moveHeads, moves) != int64(len(moves)) {
 		panic(errChainRace)
 	}
-	// heads caches the last live document, which reads and restores need,
-	// but only for small documents (D.4): rewriting a large one on every
-	// save costs its whole size each time. Larger ones fold from snapshots.
-	var doc []byte
-	if lastLive != nil {
-		doc = jsonv.Canonical(lastLive.doc)
-	} else {
-		doc = jsonv.Canonical(final.doc)
+	t.bulkExec(upsertHeads, heads)
+	t.bulkExec(delHeads, dropHeads)
+
+	out := make([]histRow, len(items))
+	for i, it := range items {
+		out[i] = histRow{it.res, it.last}
 	}
-	if !e2e && len(doc) <= t.e.opt.HeadSnapshotMax {
-		_, err = t.Exec(`INSERT INTO heads (res, seq, doc) VALUES (?,?,?) ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc`, res, lastLiveSeq, t.putDoc("heads", res, lastLiveSeq, doc))
-	} else {
-		_, err = t.Exec(`DELETE FROM heads WHERE res = ?`, res)
-	}
-	t.must(err)
-	return res, last
+	return out
 }
 
-// maybeSnapshot writes an intermediate snapshot at seq once enough patch
-// sets have accumulated since the resource's last snapshot (D.4), so no
-// read folds more than that.
-func (t *tx) maybeSnapshot(res, seq int64, doc []byte) {
+// snapshotDue reports whether enough patch sets have accumulated since
+// res's last snapshot for an intermediate one at its latest revision
+// (D.4), so no read folds more than that.
+func (t *tx) snapshotDue(res int64) bool {
 	var count, size int64
 	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(patches)), 0) FROM revisions
 		WHERE res = ? AND kind = 0 AND seq > (SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?)`, res, res).Scan(&count, &size))
-	if count >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes) {
-		_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc`, seq, res, t.putDoc("snapshots", res, seq, doc))
-		t.must(err)
+	return count >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes)
+}
+
+// maybeSnapshot writes an intermediate snapshot at seq, res's latest
+// revision, if one is due (snapshotDue).
+func (t *tx) maybeSnapshot(res, seq int64, doc []byte) {
+	if t.snapshotDue(res) {
+		t.bulkExec(insSnapshots, [][]any{{seq, res, t.putDoc("snapshots", res, seq, doc)}})
 	}
 }
 
