@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -73,10 +74,18 @@ func checkpoint(t *testing.T, path string) {
 	}
 }
 
-// storedAnywhere reports whether s occurs in the database file or its WAL.
+// storedAnywhere reports whether s occurs in the database file, its WAL or
+// a file of its blob directory.
 func storedAnywhere(t *testing.T, path, s string) bool {
 	t.Helper()
-	for _, p := range []string{path, path + "-wal"} {
+	files := []string{path, path + "-wal"}
+	filepath.WalkDir(path+".blobs", func(p string, d fs.DirEntry, err error) error {
+		if err == nil && !d.IsDir() {
+			files = append(files, p)
+		}
+		return nil
+	})
+	for _, p := range files {
 		b, err := os.ReadFile(p)
 		if err != nil && !os.IsNotExist(err) {
 			t.Fatal(err)

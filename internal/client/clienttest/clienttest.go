@@ -84,7 +84,7 @@ func New(t testing.TB, opt Options) *Server {
 	if opt.Start.IsZero() {
 		opt.Start = time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
 	}
-	o := core.Options{Path: pgtest.DB(t), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
+	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
 		Archiver: opt.Archiver, RetentionInterval: -1}
 	s := &Server{}
 	if !opt.RealClock {

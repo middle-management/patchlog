@@ -2,7 +2,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -687,11 +686,12 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	b, err := s.e.ReadBlob(r.Context(), ns, name, bid, creds(r))
+	b, err := s.e.OpenBlob(r.Context(), ns, name, bid, creds(r))
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	defer b.Close()
 	if b.Status == 302 {
 		// A sealed namespace: to the latest epoch the blob is served under,
 		// cached as a head pointer (§E.2.2).
@@ -713,11 +713,12 @@ func (s *Server) blobEpochGet(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	b, err := s.e.ReadSealedBlob(r.Context(), ns, name, bid, ep, creds(r))
+	b, err := s.e.OpenSealedBlob(r.Context(), ns, name, bid, ep, creds(r))
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	defer b.Close()
 	s.serveBlob(w, r, ns, name, quote(bid+"."+ep), b)
 }
 
@@ -731,7 +732,7 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, eta
 		}
 		w.Header().Set("ETag", etag)
 		w.Header().Set("Content-Type", b.Type)
-		http.ServeContent(w, r, "", time.Time{}, bytes.NewReader(b.Data))
+		http.ServeContent(w, r, "", time.Time{}, b.Content)
 	case b.NoStore:
 		// An epoch a sealed namespace doesn't serve the blob under, yet
 		// (§E.2.2).

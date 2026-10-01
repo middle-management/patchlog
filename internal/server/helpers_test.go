@@ -80,6 +80,13 @@ func withFileDB(t *testing.T) envOpt {
 	}
 }
 
+// tableBlobs, as BlobDir, keeps blob bytes in the database
+// (":memory:" and Postgres without a blob directory) instead of the
+// temporary directory tests use by default.
+const tableBlobs = "\x00table"
+
+func withTableBlobs(o *core.Options) { o.BlobDir = tableBlobs }
+
 func newEnv(t *testing.T, opts ...envOpt) *tenv {
 	t.Helper()
 	return newEnvWith(t, nil, opts...)
@@ -95,6 +102,13 @@ func newEnvWith(t *testing.T, sopts []Option, opts ...envOpt) *tenv {
 	}
 	if o.Path == "" {
 		o.Path = pgtest.DB(t)
+	}
+	switch {
+	case o.BlobDir == tableBlobs:
+		o.BlobDir = ""
+	case o.BlobDir == "" && (o.Path == ":memory:" || strings.HasPrefix(o.Path, "postgres")):
+		// Blob bytes in files, as a SQLite file has them by default.
+		o.BlobDir = t.TempDir()
 	}
 	e, err := core.Open(o)
 	if err != nil {

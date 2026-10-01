@@ -203,12 +203,14 @@ CREATE TABLE IF NOT EXISTS blob_refs (
   to_seq   bigint,
   PRIMARY KEY (res, bid, from_seq)
 );
--- Blob bytes as bytea (D.8 prefers object storage; blobs.go). Values are
--- at most blobSize, far below bytea's 1 GB.
+-- Blob bytes in files under the blob directory every instance shares (file),
+-- or without one as bytea (blobstore.go). Values are at most blobSize, far
+-- below bytea's 1 GB.
 CREATE TABLE IF NOT EXISTS blob_bytes (
   owner    bigint NOT NULL,
   hash     bytea  NOT NULL,
   data     bytea  NOT NULL,
+  file     text,
   UNIQUE (owner, hash)
 );
 CREATE TABLE IF NOT EXISTS blob_epochs (
@@ -217,6 +219,7 @@ CREATE TABLE IF NOT EXISTS blob_epochs (
   bid      bytea  NOT NULL CHECK (octet_length(bid) = 20),
   epoch    bigint NOT NULL,
   data     bytea,
+  file     text,
   created  bigint NOT NULL,
   PRIMARY KEY (ns, name, bid, epoch)
 );
@@ -258,6 +261,9 @@ CREATE TABLE IF NOT EXISTS remote_notices (
 -- cache_gen, which commits that change what reads may return increment.
 ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS xid xid8 NOT NULL DEFAULT pg_current_xact_id();
 CREATE INDEX IF NOT EXISTS ns_log_xid ON ns_log (xid);
+-- Blob files (blobstore.go).
+ALTER TABLE blob_bytes ADD COLUMN IF NOT EXISTS file text;
+ALTER TABLE blob_epochs ADD COLUMN IF NOT EXISTS file text;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 `

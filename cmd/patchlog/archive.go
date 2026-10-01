@@ -17,11 +17,12 @@ import (
 // history from its archives (§8.6, §D.4).
 func archiveCmd(args []string) {
 	if len(args) < 1 || args[0] != "restore" {
-		fmt.Fprintln(os.Stderr, "usage: patchlog archive restore -db patchlog.db [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]")
+		fmt.Fprintln(os.Stderr, "usage: patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]")
 		os.Exit(2)
 	}
 	fs := flag.NewFlagSet("archive restore", flag.ExitOnError)
 	db := fs.String("db", "patchlog.db", "SQLite database path (no server may have it open), or a Postgres URL")
+	blobDir := fs.String("blob-dir", envOr("PATCHLOG_BLOB_DIR", ""), "the server's blob directory (default $PATCHLOG_BLOB_DIR, else <db>.blobs next to a SQLite file)")
 	from := fs.String("from", "", "file:// directory the archives are in now (default: the URLs recorded when they were written)")
 	ns := fs.String("ns", "", "restore only this namespace")
 	res := fs.String("resource", "", "restore only this resource (with -ns)")
@@ -33,7 +34,7 @@ func archiveCmd(args []string) {
 	if _, err := os.Stat(*db); err != nil && !strings.HasPrefix(*db, "postgres") {
 		log.Fatalf("-db: %v", err)
 	}
-	opt := core.Options{Path: *db, RetentionInterval: -1}
+	opt := core.Options{Path: *db, BlobDir: *blobDir, RetentionInterval: -1}
 	if *masterKey != "" {
 		ks, err := keystore.LoadFile(*masterKey, false)
 		if err != nil {

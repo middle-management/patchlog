@@ -21,12 +21,13 @@ type discardPurger struct{}
 
 func (discardPurger) PurgeTags([]string) {}
 
-func openInstance(t *testing.T, url string) *Engine {
+// openInstance opens an engine on url, with blob files in dir.
+func openInstance(t *testing.T, url, dir string) *Engine {
 	t.Helper()
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: url, AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+	e, err := Open(Options{Path: url, BlobDir: dir, AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}})
 	if err != nil {
 		t.Fatal(err)
@@ -35,10 +36,11 @@ func openInstance(t *testing.T, url string) *Engine {
 	return e
 }
 
-// twoInstances opens two engines on a fresh database.
+// twoInstances opens two engines on a fresh database, sharing a blob
+// directory.
 func twoInstances(t *testing.T) (*Engine, *Engine) {
-	url := pgtest.NewDB(t)
-	return openInstance(t, url), openInstance(t, url)
+	url, dir := pgtest.NewDB(t), t.TempDir()
+	return openInstance(t, url, dir), openInstance(t, url, dir)
 }
 
 var who = Request{Cred: Credentials{Author: "a"}}
@@ -407,8 +409,7 @@ func TestPGLockOrder(t *testing.T) {
 
 // One instance at a time runs the background loops.
 func TestPGLeader(t *testing.T) {
-	url := pgtest.NewDB(t)
-	a, b := openInstance(t, url), openInstance(t, url)
+	a, b := twoInstances(t)
 	ctx := context.Background()
 	if !a.leader(ctx) || b.leader(ctx) {
 		t.Fatal("want a leading and b not")

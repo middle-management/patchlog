@@ -99,9 +99,14 @@ type Options struct {
 	// 16 KiB; negative, never.
 	LockedCheckBytes int
 	// BlobSweepInterval is how often pending blobs past blobGrace are
-	// deleted (§7.8, SweepBlobs), on the leader. Zero means ten minutes;
-	// negative disables it.
+	// deleted (§7.8, SweepBlobs), and orphan blob files (SweepBlobFiles),
+	// on the leader. Zero means ten minutes; negative disables it.
 	BlobSweepInterval time.Duration
+	// BlobDir is the directory blob bytes are stored in (blobstore.go).
+	// Empty means "<Path>.blobs" for a SQLite file, and the database itself
+	// for ":memory:" and Postgres. Instances sharing a Postgres database
+	// must share the directory too.
+	BlobDir string
 	// TailInterval is how often the tailer polls the namespace logs on
 	// Postgres (tailer.go, default 100 ms): it wakes live readers for
 	// writes of other instances and invalidates in-memory caches.
@@ -153,6 +158,7 @@ type Engine struct {
 	pg        bool // Postgres (Addendum D.8), not SQLite
 	opt       Options
 	mu        sync.Mutex // serialises write transactions
+	blobs     blobStore
 	validator *schema.Validator
 	hub       *hub
 	rate      *rateLimiter
@@ -221,6 +227,11 @@ func Open(opt Options) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
+	blobs, err := openBlobStore(opt.BlobDir, opt.Path, pg)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
 	if opt.RetentionInterval == 0 {
 		opt.RetentionInterval = time.Hour
 	}
@@ -228,6 +239,7 @@ func Open(opt Options) (*Engine, error) {
 		db:        db,
 		pg:        pg,
 		opt:       opt,
+		blobs:     blobs,
 		validator: schema.NewValidator(),
 		hub:       newHub(),
 		rate:      newRateLimiter(),
@@ -386,6 +398,11 @@ type tx struct {
 	locks  map[int32]lockMode
 	maxKey int32
 	noLock int
+	// Blob files (blobstore.go): those this transaction stored, deleted
+	// if it rolls back, and those whose rows it deleted, deleted once it
+	// has committed.
+	newFiles  []string
+	dropFiles []string
 }
 
 type docPut struct {
@@ -476,17 +493,22 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 	if err != nil {
 		return nil, err
 	}
+	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
+	committing := false
 	defer func() {
 		if p := recover(); p != nil {
 			sqlTx.Rollback()
+			if !committing {
+				e.removeFiles(t.newFiles)
+			}
 			err = panicErr(p)
 		}
 		err = ctxErr(ctx, err)
 	}()
-	t := &tx{Tx: sqlTx, ctx: ctx, e: e, now: e.now(), write: true, notify: map[string]bool{}}
 	t.lockAll(want)
 	if err := f(t); err != nil {
 		sqlTx.Rollback()
+		e.removeFiles(t.newFiles)
 		return nil, err
 	}
 	inv := t.invalidation()
@@ -497,11 +519,15 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 		t.must(err)
 	}
 	e.rc.begin(inv)
+	committing = true
 	err = sqlTx.Commit()
 	if err != nil {
+		// Whether it committed may be unknown (a lost connection): the
+		// files it stored are left to the sweep.
 		e.rc.bump(inv)
 		return nil, err
 	}
+	e.removeFiles(t.dropFiles)
 	// Caches, CDN purges and live readers learn of a write only once it has
 	// committed.
 	e.invalidate(inv, false)

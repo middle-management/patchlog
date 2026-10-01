@@ -36,7 +36,7 @@ type deployment struct {
 
 func newDeployment(t *testing.T, origin string) *deployment {
 	t.Helper()
-	e, err := core.Open(core.Options{Path: pgtest.DB(t), Origin: origin, AuthDisabled: true, Purger: nopPurger{}})
+	e, err := core.Open(core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}})
 	if err != nil {
 		t.Fatal(err)
 	}

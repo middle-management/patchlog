@@ -18,10 +18,10 @@ package core
 //     archives (which blobs an archived range references) read it.
 //   - blob_epochs: in sealed namespaces, each blob's sealing per epoch,
 //     stored once (sealedblobs.go, §E.2.2).
-//   - blob_bytes: the bytes, by (owner, sha256). D.2 puts bytes outside the
-//     database; storing them in a table keeps one backend for both
-//     dialects, encryption at rest and transactional garbage collection.
-//     Values are at most blobSize (64 MiB by default).
+//   - blob_bytes: one row per stored byte string, by (owner, sha256). The
+//     bytes are in a file the row names (as D.2 suggests: outside the
+//     database), or in the row itself (blobstore.go). Values are at most
+//     blobSize (64 MiB by default).
 //
 // Ownership and encryption at rest (Addendum E.1). Bytes of a resource in
 // a namespace below at-rest are stored once for the whole deployment, with
@@ -36,7 +36,8 @@ package core
 // resource's plaintext bytes under its own key (encryptResource).
 //
 // Garbage collection. Bytes are deleted by the transaction that removes
-// (or marks pruned) the last row naming them (gcBytes). On Postgres two
+// (or marks pruned) the last row naming them (gcBytes); their file, once it
+// has committed. On Postgres two
 // namespaces may share owner-0 bytes, so the collector first locks the
 // bytes row (SELECT … FOR UPDATE) and only then, in a new statement that
 // sees every commit before the lock, looks for rows naming it; whoever
@@ -61,6 +62,7 @@ import (
 	"io"
 	"log"
 	"mime"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -524,18 +526,57 @@ func (t *tx) putBytes(owner int64, hash, plain []byte) {
 	if owner != 0 {
 		data = sealRow(t.dek(owner, true), bytesAAD(owner, hash), plain)
 	}
-	_, err := t.Exec(`INSERT INTO blob_bytes (owner, hash, data) VALUES (?,?,?) ON CONFLICT (owner, hash) DO UPDATE SET owner = excluded.owner`, owner, hash, data)
-	t.must(err)
+	var file any
+	if f := t.storeFile(bytesFile(owner, hash), data); f != "" {
+		file, data = f, []byte{}
+	}
+	// On Postgres a concurrent upload may insert the row first: its file
+	// wins, and this one is discarded.
+	var stored sql.NullString
+	t.must(t.QueryRow(`INSERT INTO blob_bytes (owner, hash, data, file) VALUES (?,?,?,?)
+		ON CONFLICT (owner, hash) DO UPDATE SET owner = excluded.owner RETURNING file`, owner, hash, data, file).Scan(&stored))
+	if f, ok := file.(string); ok && stored.String != f {
+		t.discardFile(f)
+	}
 }
 
 // readBytes returns the plaintext bytes stored under owner.
 func (t *tx) readBytes(owner int64, hash []byte) []byte {
-	var data []byte
-	err := t.QueryRow(`SELECT data FROM blob_bytes WHERE owner = ? AND hash = ?`, owner, hash).Scan(&data)
+	data, file := t.bytesRow(owner, hash)
+	if file != "" {
+		data = t.readFile(file)
+	}
+	return t.openStored(owner, hash, data)
+}
+
+// bytesRow returns the row of the bytes stored under owner: the bytes, or
+// the file holding them.
+func (t *tx) bytesRow(owner int64, hash []byte) (data []byte, file string) {
+	var f sql.NullString
+	err := t.QueryRow(`SELECT data, file FROM blob_bytes WHERE owner = ? AND hash = ?`, owner, hash).Scan(&data, &f)
 	if errors.Is(err, sql.ErrNoRows) {
 		panic(fmt.Errorf("blob bytes %x of owner %d are missing", hash, owner))
 	}
 	t.must(err)
+	return data, f.String
+}
+
+// openBytes opens the plaintext bytes stored under owner for serving:
+// shared plaintext in a file is served from the file, anything else from
+// memory (encrypted bytes are opened whole).
+func (t *tx) openBytes(owner int64, hash []byte) blobContent {
+	data, file := t.bytesRow(owner, hash)
+	if file != "" && owner == 0 {
+		return fileContent(t.openFile(file))
+	}
+	if file != "" {
+		data = t.readFile(file)
+	}
+	return memContent(t.openStored(owner, hash, data))
+}
+
+// openStored returns the plaintext of bytes stored under owner as data.
+func (t *tx) openStored(owner int64, hash, data []byte) []byte {
 	if owner == 0 {
 		return data
 	}
@@ -552,27 +593,30 @@ func (t *tx) readBytes(owner int64, hash []byte) []byte {
 // touches or inserts it, putBytes) is ordered with this one, and the check
 // after the lock sees its commit.
 func (t *tx) gcBytes(owner int64, hash []byte) {
+	q := `SELECT file FROM blob_bytes WHERE owner = ? AND hash = ?`
 	if t.e.pg && t.write {
-		var one int
-		err := t.QueryRow(`SELECT 1 FROM blob_bytes WHERE owner = ? AND hash = ? FOR UPDATE`, owner, hash).Scan(&one)
-		if errors.Is(err, sql.ErrNoRows) {
-			return
-		}
-		t.must(err)
+		q += ` FOR UPDATE`
 	}
+	var file sql.NullString
+	err := t.QueryRow(q, owner, hash).Scan(&file)
+	if errors.Is(err, sql.ErrNoRows) {
+		return
+	}
+	t.must(err)
 	var used bool
 	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM blobs WHERE owner = ? AND hash = ? AND pruned = 0)
 		OR EXISTS (SELECT 1 FROM blob_pending WHERE owner = ? AND hash = ?)`, owner, hash, owner, hash).Scan(&used))
 	if !used {
 		_, err := t.Exec(`DELETE FROM blob_bytes WHERE owner = ? AND hash = ?`, owner, hash)
 		t.must(err)
+		t.dropFile(file.String)
 	}
 }
 
 // purgeBlobs ends every attachment and pending entry of the resources
 // matched by where (a condition on res, §8.3, §8.5) and deletes their
 // bytes: their own (owner = res, whose data keys the purge destroys too)
-// and the shared ones nothing else names.
+// and the shared ones nothing else names. Files go once it commits.
 func (t *tx) purgeBlobs(where string, args ...any) {
 	var shared [][]byte
 	seen := map[string]bool{}
@@ -593,7 +637,16 @@ func (t *tx) purgeBlobs(where string, args ...any) {
 		_, err := t.Exec(`DELETE FROM `+table+` WHERE `+where, args...)
 		t.must(err)
 	}
-	_, err := t.Exec(`DELETE FROM blob_bytes WHERE owner <> 0 AND owner IN (SELECT res FROM resources WHERE `+where+`)`, args...)
+	own := `owner <> 0 AND owner IN (SELECT res FROM resources WHERE ` + where + `)`
+	rows, err := t.Query(`SELECT file FROM blob_bytes WHERE file IS NOT NULL AND `+own, args...)
+	t.must(err)
+	for rows.Next() {
+		var f string
+		t.must(rows.Scan(&f))
+		t.dropFile(f)
+	}
+	rows.Close()
+	_, err = t.Exec(`DELETE FROM blob_bytes WHERE `+own, args...)
 	t.must(err)
 	for _, h := range shared {
 		t.gcBytes(0, h)
@@ -1041,15 +1094,80 @@ type Blob struct {
 	Epoch   int // the epoch a sealed namespace's 302 names (§E.2.2)
 	NoStore bool
 	Type    string
+	// Data is a 200's bytes (ReadBlob, ReadSealedBlob). OpenBlob and
+	// OpenSealedBlob leave it nil and set Content instead, which the caller
+	// closes (Close).
 	Data    []byte
+	Content io.ReadSeeker
 	Code    string // "pruned" for a 410 whose attachment pruning ended
 	Horizon string
 	Archive string
 	Public  bool
+	closer  io.Closer
 }
 
-// ReadBlob serves a blob (§7.8 Reading). Access is that of the resource.
+// Close releases an opened blob's content.
+func (b *Blob) Close() error {
+	if b == nil || b.closer == nil {
+		return nil
+	}
+	return b.closer.Close()
+}
+
+// setContent sets an opened blob's content.
+func (b *Blob) setContent(c blobContent) { b.Content, b.closer = c.r, c.c }
+
+// readAll turns an opened blob into a read one.
+func (b *Blob) readAll() (*Blob, error) {
+	if b == nil || b.Content == nil {
+		return b, nil
+	}
+	defer b.Close()
+	data, err := io.ReadAll(b.Content)
+	if err != nil {
+		return nil, err
+	}
+	b.Data, b.Content, b.closer = data, nil, nil
+	return b, nil
+}
+
+// blobContent is bytes to serve: a file, or bytes in memory.
+type blobContent struct {
+	r io.ReadSeeker
+	c io.Closer
+}
+
+func fileContent(f *os.File) blobContent { return blobContent{r: f, c: f} }
+func memContent(b []byte) blobContent    { return blobContent{r: bytes.NewReader(b)} }
+
+// readAgain runs open again once if it failed because a file it read was
+// deleted after its snapshot (errBytesGone): the second read sees the
+// deletion's commit.
+func readAgain(open func() (*Blob, error)) (*Blob, error) {
+	b, err := open()
+	if errors.Is(err, errBytesGone) {
+		b, err = open()
+	}
+	return b, err
+}
+
+// ReadBlob serves a blob (§7.8 Reading), its bytes in Data. Access is that
+// of the resource.
 func (e *Engine) ReadBlob(ctx context.Context, ns, name, bidText string, cred Credentials) (*Blob, error) {
+	b, err := e.OpenBlob(ctx, ns, name, bidText, cred)
+	if err != nil {
+		return nil, err
+	}
+	return b.readAll()
+}
+
+// OpenBlob is ReadBlob with the bytes in Content, read from their file
+// where they are stored as is (ranges then read only what they need).
+func (e *Engine) OpenBlob(ctx context.Context, ns, name, bidText string, cred Credentials) (*Blob, error) {
+	return readAgain(func() (*Blob, error) { return e.openBlob(ctx, ns, name, bidText, cred) })
+}
+
+func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Credentials) (*Blob, error) {
 	var out *Blob
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
@@ -1079,10 +1197,15 @@ func (e *Engine) ReadBlob(ctx context.Context, ns, name, bidText string, cred Cr
 			t.sealedBlobHead(n, name, bid, out)
 			return nil
 		}
-		out.Type, out.Data = ans.row.typ, t.readBytes(ans.row.owner, ans.row.hash)
+		out.Type = ans.row.typ
+		out.setContent(t.openBytes(ans.row.owner, ans.row.hash))
 		return nil
 	})
-	return out, err
+	if err != nil {
+		out.Close()
+		return nil, err
+	}
+	return out, nil
 }
 
 // BlobStats counts what blob storage holds, for operators and tests.
@@ -1092,20 +1215,41 @@ type BlobStats struct {
 	Pending   int // pending entries, expired or not
 	Bytes     int // stored byte strings (blob_bytes rows)
 	Encrypted int // of them, encrypted under a resource's data key
+	Files     int // of them, in files (blobstore.go); the rest in the table
 	Size      int64
+	// Dir is the blob directory, "" if bytes are stored in the database.
+	Dir string
 }
 
-// BlobStats counts the rows of blob storage.
+// BlobStats counts the rows of blob storage, and sizes their files.
 func (e *Engine) BlobStats(ctx context.Context) (*BlobStats, error) {
-	s := &BlobStats{}
+	s := &BlobStats{Dir: e.blobs.root()}
+	var files []string
 	err := e.read(ctx, func(t *tx) error {
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blobs WHERE pruned = 0`).Scan(&s.Attached))
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blobs WHERE pruned = 1`).Scan(&s.Pruned))
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blob_pending`).Scan(&s.Pending))
 		t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(data)), 0) FROM blob_bytes`).Scan(&s.Bytes, &s.Size))
 		t.must(t.QueryRow(`SELECT COUNT(*) FROM blob_bytes WHERE owner <> 0`).Scan(&s.Encrypted))
+		rows, err := t.Query(`SELECT file FROM blob_bytes WHERE file IS NOT NULL`)
+		t.must(err)
+		for rows.Next() {
+			var f string
+			t.must(rows.Scan(&f))
+			files = append(files, f)
+		}
+		rows.Close()
 		return nil
 	})
+	s.Files = len(files)
+	for _, f := range files {
+		if fh, err := e.blobs.open(f); err == nil {
+			if info, err := fh.Stat(); err == nil {
+				s.Size += info.Size()
+			}
+			fh.Close()
+		}
+	}
 	return s, err
 }
 
@@ -1174,6 +1318,9 @@ func (e *Engine) blobSweepLoop(interval time.Duration) {
 			if e.leader(ctx) {
 				if _, err := e.SweepBlobs(ctx); err != nil && ctx.Err() == nil {
 					log.Printf("blob sweep: %v", err)
+				}
+				if _, err := e.SweepBlobFiles(ctx); err != nil && ctx.Err() == nil {
+					log.Printf("blob file sweep: %v", err)
 				}
 			}
 			cancel()

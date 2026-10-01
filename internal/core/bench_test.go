@@ -19,7 +19,7 @@ func benchEngine(b *testing.B, read string) *Engine {
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
-	e, err := Open(Options{Path: pgtest.DB(b), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}, Limits: lim})
+	e, err := Open(Options{Path: pgtest.DB(b), BlobDir: b.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}, Limits: lim})
 	if err != nil {
 		b.Fatal(err)
 	}

@@ -218,26 +218,30 @@ CREATE TABLE IF NOT EXISTS blob_refs (
   to_seq   INTEGER,
   PRIMARY KEY (res, bid, from_seq)
 ) WITHOUT ROWID;
--- Addition: blob bytes, by owner and sha256 (D.2 keeps them outside the
--- database; see blobs.go). Encrypted under the owner's data key when owner
--- is a resource.
+-- Addition: blob bytes, by owner and sha256. Encrypted under the owner's
+-- data key when owner is a resource. The bytes are in the file under the
+-- blob directory that file names (D.2 keeps them outside the database), data
+-- then empty, or with no file in data (blobstore.go).
 CREATE TABLE IF NOT EXISTS blob_bytes (
   owner    INTEGER NOT NULL,
   hash     BLOB    NOT NULL,
   data     BLOB    NOT NULL,
+  file     TEXT,
   UNIQUE (owner, hash)
 );
 -- The sealed form of a blob per epoch it is served under (§E.2.2, D.2's
 -- blob_epochs), stored once and served forever. Keyed like sealed: ns is
 -- the serving namespace (a branch seals read-through blobs under its own
--- keys) and name the resource. data is NULL once pruning removed every
--- revision of the epoch that references the blob (410).
+-- keys) and name the resource. The sealing is in data, or in the file file
+-- names (blobstore.go); both are NULL once pruning removed every revision of
+-- the epoch that references the blob (410).
 CREATE TABLE IF NOT EXISTS blob_epochs (
   ns       INTEGER NOT NULL,
   name     TEXT    NOT NULL,
   bid      BLOB    NOT NULL,
   epoch    INTEGER NOT NULL,
   data     BLOB,
+  file     TEXT,
   created  INTEGER NOT NULL,
   PRIMARY KEY (ns, name, bid, epoch)
 ) WITHOUT ROWID;
@@ -335,13 +339,15 @@ func openSQLite(path string) (*sql.DB, error) {
 // migrate adds columns that databases created by earlier versions lack.
 func migrate(db *sql.DB) error {
 	ctx := context.Background()
-	var has bool
-	if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info('ns_log') WHERE name = 'kid')`).Scan(&has); err != nil {
-		return err
-	}
-	if !has {
-		if _, err := db.ExecContext(ctx, `ALTER TABLE ns_log ADD COLUMN kid TEXT`); err != nil {
+	for _, c := range []struct{ table, col string }{{"ns_log", "kid"}, {"blob_bytes", "file"}, {"blob_epochs", "file"}} {
+		var has bool
+		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {
 			return err
+		}
+		if !has {
+			if _, err := db.ExecContext(ctx, `ALTER TABLE `+c.table+` ADD COLUMN `+c.col+` TEXT`); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
