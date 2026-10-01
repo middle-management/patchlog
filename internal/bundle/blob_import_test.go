@@ -213,3 +213,136 @@ func TestSealedBundleBlobs(t *testing.T) {
 		t.Fatal("blob of a sealed bundle")
 	}
 }
+
+// §G.4.1, §E.2.2, §G.5.1: a sealed (E2) source serves its blobs sealed
+// under an epoch; the exporter follows the redirect and opens them with
+// its keys, so the blob lines carry the plaintext, which a sealed bundle
+// seals per line; the import uploads the plaintext to the sealed target.
+func TestBundleSealedNamespaceBlobs(t *testing.T) {
+	src := newEncDeployment(t, stagingOrigin)
+	src.ns("s", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
+	secret := []byte(marker + " in a sealed blob")
+	ref := src.upload("s", "a", "image/png", seal.NewNonce(), secret)
+	a1 := must(src.c.Create(ctx, "s", "a", append(client.GenesisPatches(map[string]any{"img": ref}), op("add", "/$nonce", seal.NewNonce())))).ID
+	// The source serves it sealed only: GetBlob refuses the redirect.
+	if _, err := src.c.GetBlob(ctx, "s", "a", ref["$blob"].(string), ref["nonce"].(string)); err == nil {
+		t.Fatal("a sealed namespace served a blob's plaintext")
+	}
+
+	var plain bytes.Buffer
+	_, _, err := bundle.Export(ctx, src.c, &plain, bundle.ExportOptions{Select: []string{"s"}, Plaintext: true})
+	noErr(t, err)
+	if got := order(t, plain.Bytes()); got != "blob:"+string(secret)+" rev:"+a1 {
+		t.Fatalf("lines %s", got)
+	}
+	id := identity(t)
+	var buf bytes.Buffer
+	_, _, err = bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"s"}, Recipients: []*ecdh.PublicKey{id.PublicKey()}})
+	noErr(t, err)
+	if bytes.Contains(buf.Bytes(), []byte(base64.RawURLEncoding.EncodeToString(secret)[:24])) {
+		t.Fatal("blob bytes in the sealed bundle")
+	}
+	dst := newEncDeployment(t, cmsOrigin)
+	_, err = bundle.Import(ctx, dst.c, bundle.UnsealOpener(bundle.BytesOpener(buf.Bytes()), id), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true})
+	noErr(t, err)
+	if lv := must(dst.c.EncryptionLevel(ctx, "s")); lv != "sealed" || dst.head("s", "a").ID != a1 {
+		t.Fatalf("target level %q", lv)
+	}
+	b, err := dst.c.GetBlobRef(ctx, "s", "a", ref)
+	noErr(t, err)
+	if string(b.Data) != string(secret) || b.Type != "image/png" {
+		t.Fatalf("target blob %q %s", b.Data, b.Type)
+	}
+}
+
+// §G.4.1, §E.3.1: an e2e export carries the blobs the sealed ops declare,
+// the writers' ciphertext verbatim (a restore with [] declares nothing
+// new); the import uploads them as sealed blobs, so the target serves the
+// same bytes, which the references' keys decrypt.
+func TestBundleE2EBlobs(t *testing.T) {
+	src := newEncDeployment(t, stagingOrigin)
+	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
+	reader := identity(t)
+	k := seal.NewKey()
+	kr, err := seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{reader.PublicKey()})
+	noErr(t, err)
+	krHead := src.create("e", "keyring", kr.Value())
+	upload := func(data string) ([]byte, map[string]any) {
+		sealed, ref, err := client.EncryptBlob("image/png", []byte(data), false)
+		noErr(t, err)
+		must(src.c.UploadBlob(ctx, "e", "d", bundle.SealedBlobType, "", sealed))
+		return sealed, ref
+	}
+	write := func(parent string, patches []any, blobs ...string) string {
+		ps, err := seal.SealPatchSet(k, "e#1", "e", "d", parent, jsonv.FromGo(patches))
+		noErr(t, err)
+		ps, err = seal.WithBlobs(ps, blobs)
+		noErr(t, err)
+		if parent == "" {
+			return must(src.c.Create(ctx, "e", "d", jsonv.MustParse(ps))).ID
+		}
+		return must(src.c.Append(ctx, "e", "d", parent, jsonv.MustParse(ps))).ID
+	}
+	s1, ref1 := upload(marker + " one")
+	s2, ref2 := upload(marker + " two")
+	b1, b2 := ref1["$blob"].(string), ref2["$blob"].(string)
+	d0 := write("", client.GenesisPatches(map[string]any{"p": ref1}), b1)
+	d1 := write(d0, ops(op("add", "/q", ref2)), b1, b2)
+	tomb := must(src.c.Delete(ctx, "e", "d", d1)).ID
+	d2 := must(src.c.Append(ctx, "e", "d", tomb, []any{})).ID
+
+	var buf bytes.Buffer
+	_, _, err = bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"e/d"}})
+	noErr(t, err)
+	want := "blob:" + string(s1) + " rev:" + d0 + " blob:" + string(s2) + " rev:" + d1 + " rev:" + tomb + " rev:" + d2 + " rev:" + krHead
+	if got := order(t, buf.Bytes()); got != want {
+		t.Fatalf("lines %q, want %q", got, want)
+	}
+	if bytes.Contains(buf.Bytes(), []byte(`"type":"image/png"`)) {
+		t.Fatal("a blob line of an e2e namespace isn't of the sealed type")
+	}
+
+	dst := newEncDeployment(t, cmsOrigin)
+	rep := importB(t, dst, buf.Bytes(), bundle.ImportOptions{})
+	if u, _ := sentBlobs(rep); u != 2 || dst.head("e", "d").ID != d2 {
+		t.Fatalf("e2e import uploaded %d, head %s", u, dst.head("e", "d").ID)
+	}
+	for _, c := range []struct {
+		ref    map[string]any
+		sealed []byte
+		plain  string
+	}{{ref1, s1, marker + " one"}, {ref2, s2, marker + " two"}} {
+		g := must(dst.c.GetBlob(ctx, "e", "d", c.ref["$blob"].(string), ""))
+		if !bytes.Equal(g.Data, c.sealed) || g.Type != bundle.SealedBlobType {
+			t.Fatalf("target blob %s", g.Type)
+		}
+		if b := must(client.DecryptBlob(c.ref, g.Data)); string(b.Data) != c.plain {
+			t.Fatalf("decrypted %q", b.Data)
+		}
+	}
+
+	// A blob line of an e2e namespace that isn't a sealed blob (only a
+	// crafted bundle has one) is refused before it is uploaded.
+	png := []byte("not sealed")
+	pbid := ids.Blob("image/png", "", png).String()
+	ps, err := seal.SealPatchSet(k, "e#1", "e", "x", "", jsonv.FromGo(client.GenesisPatches(map[string]any{})))
+	noErr(t, err)
+	ps, err = seal.WithBlobs(ps, []string{pbid})
+	noErr(t, err)
+	pv := jsonv.MustParse(ps)
+	x0 := ids.Revision(nil, jsonv.Canonical(pv)).String()
+	krPatches := client.GenesisPatches(kr.Value())
+	krv, err := client.ToValue(krPatches)
+	noErr(t, err)
+	var crafted bytes.Buffer
+	w, err := bundle.NewWriter(&crafted, bundle.Header{Origin: stagingOrigin, Created: "2026-10-01T00:00:00Z",
+		At: map[string]string{"e": x0}, Docs: map[string]bundle.DocInfo{"e/x": {History: bundle.Full, Head: x0}, "e/keyring": {History: bundle.Full, Head: krHead}},
+		Access: map[string]string{"e": bundle.AccessE2E}})
+	noErr(t, err)
+	noErr(t, w.Line(bundle.Line{NS: "e", Resource: "keyring", ID: ids.Revision(nil, jsonv.Canonical(krv)).String(), Kind: "rev", Patches: krPatches}))
+	noErr(t, w.Line(bundle.Line{NS: "e", Resource: "x", Blob: pbid, Type: "image/png", Data: png}))
+	noErr(t, w.Line(bundle.Line{NS: "e", Resource: "x", ID: x0, Kind: "rev", Patches: pv}))
+	_, err = w.Close()
+	noErr(t, err)
+	importErr(t, newEncDeployment(t, cmsOrigin), crafted.Bytes(), bundle.ImportOptions{}, "an e2e target accepts only sealed blobs")
+}

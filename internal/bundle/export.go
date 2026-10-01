@@ -788,12 +788,18 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 }
 
 // writeBlob reads a blob of d from the source, checked against its id with
-// the reference's type and nonce, and writes its blob line.
+// the reference's type and nonce, and writes its blob line. A sealed (E2)
+// source's blob is fetched through its epoch's URL and opened with the
+// client's keys, and checked against the reference (§E.2.2), so the line
+// carries the plaintext.
 func (p *ExportPlan) writeBlob(ctx context.Context, bw *Writer, d *PlannedDoc, b plannedBlob) error {
-	// TODO(blobs-sealed): a sealed (E2) source answers with the blob's
-	// sealed form (§E.2.2), which the client must open with its keys
-	// before the plaintext can go into the bundle.
-	blob, err := p.c.GetBlob(ctx, d.NS, d.Name, b.bid, b.nonce)
+	var blob *client.Blob
+	var err error
+	if p.Access[d.NS] == AccessSealed {
+		blob, err = p.c.GetBlobRef(ctx, d.NS, d.Name, client.BlobRef(b.bid, b.typ, b.size, b.nonce))
+	} else {
+		blob, err = p.c.GetBlob(ctx, d.NS, d.Name, b.bid, b.nonce)
+	}
 	if err != nil {
 		return fmt.Errorf("blob %s: %w", b.bid, err)
 	}

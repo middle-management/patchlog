@@ -57,6 +57,12 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 		case line != nil && im.local && im.copyBlob(ctx, it.ns, it.name, nd.bid, it.d.ns, it.d.name):
 			b.rep.Copied++
 		case line != nil:
+			if im.h.AccessOf(it.d.ns) == AccessE2E && normType(line.Type) != SealedBlobType {
+				// An e2e target takes only the writers' ciphertext (§E.3.1),
+				// which the line carries verbatim; it would answer 415.
+				return fmt.Errorf("import: blob %s of e2e namespace %s is of type %q, not %s: an e2e target accepts only sealed blobs (§E.3.1)",
+					nd.bid, it.d.ns, line.Type, SealedBlobType)
+			}
 			err := im.retry(ctx, func() error {
 				bid, err := im.c.UploadBlob(ctx, it.ns, it.name, line.Type, line.Nonce, line.Data)
 				if err == nil && bid != nd.bid {
