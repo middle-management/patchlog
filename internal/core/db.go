@@ -34,6 +34,8 @@ CREATE TABLE IF NOT EXISTS resources (
   state       INTEGER NOT NULL DEFAULT 0,    -- 0 live · 1 tombstoned · 2 purged
   horizon_seq INTEGER,                       -- §8.6; NULL if never pruned
   keep        TEXT,                          -- addition: canonical JSON array of kept ids (§8.6)
+  snap_revs   INTEGER,                       -- addition: revisions since the last intermediate snapshot (D.4); NULL: count them
+  snap_bytes  INTEGER,                       -- addition: their stored patch sets' bytes
   UNIQUE (ns, name)
 );
 
@@ -354,7 +356,7 @@ func openSQLite(path string) (*sql.DB, error) {
 func migrate(db *sql.DB) error {
 	ctx := context.Background()
 	for _, c := range []struct{ table, col, typ string }{{"ns_log", "kid", "TEXT"}, {"blob_bytes", "file", "TEXT"}, {"blob_epochs", "file", "TEXT"},
-		{"namespaces", "head_id", "BLOB"}} {
+		{"namespaces", "head_id", "BLOB"}, {"resources", "snap_revs", "INTEGER"}, {"resources", "snap_bytes", "INTEGER"}} {
 		var has bool
 		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {
 			return err

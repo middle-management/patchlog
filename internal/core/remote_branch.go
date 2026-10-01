@@ -1136,7 +1136,9 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 	if last == 0 {
 		return parent.seq
 	}
-	_, err = t.Exec(`UPDATE resources SET head_seq = ?, state = ?, horizon_seq = COALESCE(?, horizon_seq) WHERE res = ?`, last, state, horizon, res)
+	// Its revisions were counted for snapshots by maybeSnapshot, not in the
+	// row (insertItems): counted again from the table next time.
+	_, err = t.Exec(`UPDATE resources SET head_seq = ?, state = ?, horizon_seq = COALESCE(?, horizon_seq), snap_revs = NULL, snap_bytes = NULL WHERE res = ?`, last, state, horizon, res)
 	t.must(err)
 	if ch.opaque {
 		_, err = t.Exec(`DELETE FROM heads WHERE res = ?`, res)

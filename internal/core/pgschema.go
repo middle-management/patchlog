@@ -275,6 +275,10 @@ ALTER TABLE blob_epochs ADD COLUMN IF NOT EXISTS file text;
 -- The id of namespaces.head_seq, read with the row's lock (appendNS); NULL
 -- in rows from before it and in remote shadows, whose ids are looked up.
 ALTER TABLE namespaces ADD COLUMN IF NOT EXISTS head_id bytea;
+-- Revisions, and their stored patch sets' bytes, since a resource's last
+-- intermediate snapshot (insertItems); NULL: count them.
+ALTER TABLE resources ADD COLUMN IF NOT EXISTS snap_revs bigint;
+ALTER TABLE resources ADD COLUMN IF NOT EXISTS snap_bytes bigint;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 `

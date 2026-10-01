@@ -177,6 +177,21 @@ type itemState struct {
 	// set under If-Match: those of append and restore that passed step 1
 	// (§6.2). Nil for any other item, whose verbs are known from the request.
 	cands []string
+	// canons are the canonical forms of the steps' patch sets, once
+	// computed (canon): the retry lookup, the batch size and step 3 each
+	// need them, and a create's is its whole document.
+	canons [][]byte
+}
+
+// canon returns the canonical form of step j's patch set.
+func (s *itemState) canon(j int) []byte {
+	if s.canons == nil {
+		s.canons = make([][]byte, len(s.Steps))
+	}
+	if s.canons[j] == nil {
+		s.canons[j] = jsonv.Canonical(s.Steps[j].Patches)
+	}
+	return s.canons[j]
 }
 
 // itemErr is a failure of one item at one step.
@@ -380,6 +395,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	for i, it := range items {
 		st[i] = &itemState{Item: it, index: i}
 	}
+	all := append([]*itemState(nil), st...) // a dry run drops failed items from st
 	dryFails := map[int]*Error{}
 	fail := func(fs []itemErr) error {
 		if !isBatch {
@@ -459,6 +475,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		for i, it := range items {
 			names[i] = it.Resource
 		}
+		t.prefetchResources(n.id, names)
 		if !rateDrawn && (t.rateDrawn == nil || !*t.rateDrawn) {
 			if err := t.rateLimit(n, cfg, a, names, len(items)); err != nil {
 				return nil, nil, err
@@ -551,10 +568,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			return nil, nil, limitErr(413, fmt.Sprintf("more than %d items", maxItems))
 		}
 		size := 0
-		for _, it := range items {
-			for _, s := range it.Steps {
-				if !s.Delete {
-					size += len(jsonv.Canonical(s.Patches))
+		for _, s := range all {
+			for j, step := range s.Steps {
+				if !step.Delete {
+					size += len(s.canon(j))
 				}
 			}
 		}
@@ -765,7 +782,8 @@ func staticVerb(it Item, j int) string {
 
 // expectedIDs computes the ids an item would produce from its precondition
 // alone (§3.3, §3.4). ok is false if it cannot be computed.
-func expectedIDs(it Item) ([]ids.ID, bool) {
+func expectedIDs(s *itemState) ([]ids.ID, bool) {
+	it := s.Item
 	var parent *ids.ID
 	if it.IfMatch != "" {
 		p, err := ids.Parse(it.IfMatch)
@@ -777,15 +795,15 @@ func expectedIDs(it Item) ([]ids.ID, bool) {
 		return nil, false
 	}
 	var out []ids.ID
-	for _, s := range it.Steps {
+	for j, step := range it.Steps {
 		var id ids.ID
-		if s.Delete {
+		if step.Delete {
 			if parent == nil {
 				return nil, false
 			}
 			id = ids.Tombstone(*parent)
 		} else {
-			id = ids.Revision(parent, jsonv.Canonical(s.Patches))
+			id = ids.Revision(parent, s.canon(j))
 		}
 		out = append(out, id)
 		p := id
@@ -802,7 +820,7 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 			return nil
 		}
 		s := st[0]
-		want, ok := expectedIDs(s.Item)
+		want, ok := expectedIDs(s)
 		if !ok {
 			return nil
 		}
@@ -837,7 +855,7 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 	}
 	var items []ItemResult
 	for _, s := range st {
-		want, ok := expectedIDs(s.Item)
+		want, ok := expectedIDs(s)
 		if !ok {
 			return nil
 		}
@@ -886,7 +904,7 @@ func (t *tx) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
 		if s.cands == nil {
 			continue
 		}
-		want, ok := expectedIDs(s.Item)
+		want, ok := expectedIDs(s)
 		own := t.resource(n.id, s.Resource)
 		if !ok || own == nil {
 			return false
@@ -974,7 +992,7 @@ func (t *tx) applySteps(s *itemState) *Error {
 		parentID = &p
 		tomb = s.parent.kind == kindTombstone
 	}
-	for _, step := range s.Steps {
+	for j, step := range s.Steps {
 		ss := &stepState{del: step.Delete, raw: step.Patches, parentID: parentID}
 		if step.Delete {
 			if parentID == nil || tomb {
@@ -1005,7 +1023,7 @@ func (t *tx) applySteps(s *itemState) *Error {
 			if m, ok := doc.(map[string]any); ok && exists {
 				ss.prevNonce, _ = m["$nonce"].(string)
 			}
-			ss.canon = jsonv.Canonical(step.Patches)
+			ss.canon = s.canon(j)
 			ss.id = ids.Revision(parentID, ss.canon)
 			ss.doc = nd
 			ss.writes = patch.WritesStrings(writes)
@@ -1269,12 +1287,14 @@ var (
 	openBlobRefs = bulkStmt{pg: `SELECT res, bid FROM blob_refs WHERE res = ANY($1::bigint[]) AND to_seq IS NULL`,
 		lite: `SELECT res, bid FROM blob_refs WHERE res = ? AND to_seq IS NULL`, types: []string{"bigint"}}
 	// moveHeads moves each resource's head from the one its precondition
-	// matched (old, 0 for none), or not at all (insertItems).
+	// matched (old, 0 for none), or not at all (insertItems), with its
+	// snapshot counts.
 	moveHeads = bulkStmt{
-		pg: `UPDATE resources SET head_seq = v.h, state = v.st FROM unnest($1::bigint[], $2::smallint[], $3::bigint[], $4::bigint[]) AS v(h, st, res, old)
+		pg: `UPDATE resources SET head_seq = v.h, state = v.st, snap_revs = v.sr, snap_bytes = v.sb
+			FROM unnest($1::bigint[], $2::smallint[], $3::bigint[], $4::bigint[], $5::bigint[], $6::bigint[]) AS v(h, st, sr, sb, res, old)
 			WHERE resources.res = v.res AND COALESCE(resources.head_seq, 0) = v.old`,
-		lite:  `UPDATE resources SET head_seq = ?, state = ? WHERE res = ? AND COALESCE(head_seq, 0) = ?`,
-		types: []string{"bigint", "smallint", "bigint", "bigint"},
+		lite:  `UPDATE resources SET head_seq = ?, state = ?, snap_revs = ?, snap_bytes = ? WHERE res = ? AND COALESCE(head_seq, 0) = ?`,
+		types: []string{"bigint", "smallint", "bigint", "bigint", "bigint", "bigint"},
 	}
 )
 
@@ -1304,6 +1324,8 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 		// revision and its step.
 		last, lastLiveSeq int64
 		lastLive          *stepState
+		// Revisions and their patch sets' bytes since the last snapshot.
+		snapRevs, snapBytes int64
 	}
 	items := make([]*item, len(st))
 	for i, s := range st {
@@ -1339,6 +1361,7 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 				t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ?)`, it.res).Scan(&it.hasRows))
 			}
 			existing = append(existing, []any{it.res})
+			it.snapRevs, it.snapBytes = t.snapCounts(it.own)
 		}
 		byRes[it.res] = it
 		it.open = map[ids.ID]bool{}
@@ -1435,15 +1458,18 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 				canon = jsonv.Canonical(step.doc)
 			}
 			t.cacheDoc(step.id, canon)
-			if t.snapshotDue(it.res) {
+			// An intermediate snapshot once enough patch sets have
+			// accumulated since the last one (D.4), so no read folds more.
+			it.snapRevs++
+			it.snapBytes += int64(storedLen(row[5]))
+			if it.snapRevs >= int64(t.e.opt.SnapshotEveryRevisions) || it.snapBytes >= int64(t.e.opt.SnapshotEveryBytes) {
 				snaps = append(snaps, []any{seq, it.res, t.putDoc("snapshots", it.res, seq, canon)})
+				it.snapRevs, it.snapBytes = 0, 0
 			}
 		}
-		// Before the next step's snapshotDue, which counts from them.
-		t.bulkExec(insSnapshots, snaps)
-		snaps = snaps[:0]
 	}
 	t.bulkExec(insRevEpochs, epochs)
+	t.bulkExec(insSnapshots, snaps)
 
 	// The heads move, each from the one its precondition matched, or not
 	// at all: on Postgres a writer of another resource holds the
@@ -1461,7 +1487,7 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 		if it.own != nil {
 			old = it.own.headSeq.Int64
 		}
-		moves = append(moves, []any{it.last, state, it.res, old})
+		moves = append(moves, []any{it.last, state, it.snapRevs, it.snapBytes, it.res, old})
 		// heads caches the last live document, which reads and restores
 		// need, but only for small documents (D.4): rewriting a large one on
 		// every save costs its whole size each time. Larger ones fold from
@@ -1496,20 +1522,44 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 	return out
 }
 
-// snapshotDue reports whether enough patch sets have accumulated since
-// res's last snapshot for an intermediate one at its latest revision
-// (D.4), so no read folds more than that.
-func (t *tx) snapshotDue(res int64) bool {
-	var count, size int64
+// countSinceSnapshot counts res's revisions since its last snapshot, and
+// the bytes of their stored patch sets.
+func (t *tx) countSinceSnapshot(res int64) (revs, size int64) {
 	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(patches)), 0) FROM revisions
-		WHERE res = ? AND kind = 0 AND seq > (SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?)`, res, res).Scan(&count, &size))
-	return count >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes)
+		WHERE res = ? AND kind = 0 AND seq > (SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?)`, res, res).Scan(&revs, &size))
+	return revs, size
+}
+
+// snapCounts returns a resource row's snapshot counts, counted from its
+// revisions if the row doesn't have them: a row from before the columns,
+// or whose revisions another path inserted (maybeSnapshot). Snapshots
+// written outside step 7 (pruning, restoring an archive) aren't counted
+// from: the next one is then only due earlier.
+func (t *tx) snapCounts(r *resRow) (revs, size int64) {
+	if r.snapRevs.Valid && r.snapBytes.Valid {
+		return r.snapRevs.Int64, r.snapBytes.Int64
+	}
+	return t.countSinceSnapshot(r.id)
+}
+
+// storedLen is the length of a stored patch set (putPatches).
+func storedLen(v any) int {
+	switch v := v.(type) {
+	case string:
+		return len(v)
+	case []byte:
+		return len(v)
+	}
+	return 0
 }
 
 // maybeSnapshot writes an intermediate snapshot at seq, res's latest
-// revision, if one is due (snapshotDue).
+// revision, once enough patch sets have accumulated since its last one
+// (D.4), counted from its revisions; the paths that insert revisions
+// outside step 7 use it, and leave the row's counts unknown.
 func (t *tx) maybeSnapshot(res, seq int64, doc []byte) {
-	if t.snapshotDue(res) {
+	revs, size := t.countSinceSnapshot(res)
+	if revs >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes) {
 		t.bulkExec(insSnapshots, [][]any{{seq, res, t.putDoc("snapshots", res, seq, doc)}})
 	}
 }

@@ -28,25 +28,80 @@ type resRow struct {
 	state      int
 	horizonSeq sql.NullInt64
 	keep       sql.NullString
+	// snapRevs and snapBytes count the revisions, and the bytes of their
+	// stored patch sets, since the resource's last intermediate snapshot
+	// (D.4, insertItems); NULL when unknown (snapCounts).
+	snapRevs, snapBytes sql.NullInt64
 }
 
+const resCols = `res, ns, name, head_seq, state, horizon_seq, keep, snap_revs, snap_bytes`
+
+func scanRes(row interface{ Scan(...any) error }) (*resRow, error) {
+	r := &resRow{}
+	err := row.Scan(&r.id, &r.ns, &r.name, &r.headSeq, &r.state, &r.horizonSeq, &r.keep, &r.snapRevs, &r.snapBytes)
+	return r, err
+}
+
+// resource returns a namespace's own resource row, or nil. The transaction
+// remembers the answer, absence included (memo.go).
 func (t *tx) resource(ns int64, name string) *resRow {
 	k := resKey{ns, name}
 	if r, ok := t.memo.res[k]; ok {
-		return &r
+		if r == nil {
+			return nil
+		}
+		c := *r
+		return &c
 	}
-	r := &resRow{}
-	err := t.QueryRow(`SELECT res, ns, name, head_seq, state, horizon_seq, keep FROM resources WHERE ns = ? AND name = ?`, ns, name).
-		Scan(&r.id, &r.ns, &r.name, &r.headSeq, &r.state, &r.horizonSeq, &r.keep)
+	r, err := scanRes(t.QueryRow(`SELECT `+resCols+` FROM resources WHERE ns = ? AND name = ?`, ns, name))
 	if errors.Is(err, sql.ErrNoRows) {
+		r = nil
+	} else {
+		t.must(err)
+	}
+	t.memoRes(k, r)
+	if r == nil {
 		return nil
 	}
-	t.must(err)
+	c := *r
+	return &c
+}
+
+func (t *tx) memoRes(k resKey, r *resRow) {
 	if t.memo.res == nil {
-		t.memo.res = map[resKey]resRow{}
+		t.memo.res = map[resKey]*resRow{}
 	}
-	t.memo.res[k] = *r
-	return r
+	t.memo.res[k] = r
+}
+
+// prefetchResources reads the rows of several resources of a namespace in
+// one statement, for resource to answer from memory: a batch's items.
+func (t *tx) prefetchResources(ns int64, names []string) {
+	if !t.e.pg || len(names) < 2 {
+		return // a SQLite query costs no round trip
+	}
+	var want []string
+	for _, name := range names {
+		if _, ok := t.memo.res[resKey{ns, name}]; !ok {
+			want = append(want, name)
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	rows, err := t.Query(`SELECT `+resCols+` FROM resources WHERE ns = ? AND name = ANY(?::text[])`, ns, want)
+	t.must(err)
+	found := map[string]*resRow{}
+	for rows.Next() {
+		r, err := scanRes(rows)
+		t.must(err)
+		found[r.name] = r
+	}
+	t.must(rows.Err())
+	rows.Close()
+	for _, name := range want {
+		t.memoRes(resKey{ns, name}, found[name])
+	}
 }
 
 // revRow is a revisions row.
