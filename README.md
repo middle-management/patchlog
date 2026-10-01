@@ -315,6 +315,13 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   write re-checks, the namespaces `$schema` and `$ref` resolve into, a batch source). Writers
   to different namespaces run in parallel; the D.3 re-check reads after the locks, so `412`
   and internal retries work as on SQLite. Details in `internal/core/pglock.go`.
+- **Round trips.** Each statement is one, so a write costs what its statements cost: about
+  16 for a small append (lock, namespace, resource, head, insert, chains, commit), 2.9 ms on a
+  local `postgres:16` with `fsync` on (about 0.6 ms of it the commit's flush), against 0.3 ms
+  on SQLite (`go test ./internal/core -run '^$' -bench .` with `PATCHLOG_TEST_PG` set). A write
+  whose patches are under 16 KiB is checked inside its namespace's lock, skipping the separate
+  check transaction of D.3; larger ones are checked outside it first. Writes to different
+  namespaces run in parallel, so throughput grows with namespaces rather than per write.
 - **A tailer per instance** polls `ns_log` by transaction id every 100 ms
   (`ns_log.xid xid8 DEFAULT pg_current_xact_id()`, `pg_snapshot_xmin`) and wakes long-polls and
   SSE streams for writes of every instance, and moves the read cache's generations. Commits
