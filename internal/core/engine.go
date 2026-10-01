@@ -1,6 +1,7 @@
 // Package core implements the patch log: identity, the write gate of §6.2,
 // namespaces, batches, branches, deletion, pruning and the reads the HTTP
-// API serves. It stores everything in SQLite with the layout of Addendum D.2.
+// API serves. It stores everything in SQLite with the layout of Addendum D.2,
+// or in Postgres with the equivalent of Addendum D.8 (dialect.go).
 //
 // Resource writes and batches follow D.3: steps 1–6 of the gate run in a
 // read transaction, outside the write lock; then one BEGIN IMMEDIATE
@@ -32,7 +33,8 @@ import (
 
 // Options configure an Engine.
 type Options struct {
-	// Path of the SQLite database, or ":memory:".
+	// Path of the SQLite database, or ":memory:", or a Postgres URL
+	// (postgres://…, Addendum D.8).
 	Path string
 	// Origin is the deployment's canonical origin (§G.1), e.g. https://cms.example.
 	Origin string
@@ -129,6 +131,7 @@ func (logPurger) PurgeTags(tags []string) { log.Printf("cdn purge %v", tags) }
 // Engine is the patch-log service.
 type Engine struct {
 	db        *sql.DB
+	pg        bool // Postgres (Addendum D.8), not SQLite
 	opt       Options
 	mu        sync.Mutex // serialises write transactions
 	validator *schema.Validator
@@ -181,7 +184,7 @@ func Open(opt Options) (*Engine, error) {
 	if opt.Purger == nil {
 		opt.Purger = logPurger{}
 	}
-	db, err := openDB(opt.Path)
+	db, pg, err := openDB(opt.Path)
 	if err != nil {
 		return nil, err
 	}
@@ -190,6 +193,7 @@ func Open(opt Options) (*Engine, error) {
 	}
 	e := &Engine{
 		db:        db,
+		pg:        pg,
 		opt:       opt,
 		validator: schema.NewValidator(),
 		hub:       newHub(),
@@ -323,7 +327,13 @@ type docPut struct {
 // read runs f in a read transaction.
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
 	e.stmts.prepare(e.db)
-	sqlTx, err := e.db.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	opts := &sql.TxOptions{ReadOnly: true}
+	if e.pg {
+		// A read sees one snapshot, as in SQLite's WAL mode: READ
+		// COMMITTED would see each statement's own.
+		opts.Isolation = sql.LevelRepeatableRead
+	}
+	sqlTx, err := e.db.BeginTx(ctx, opts)
 	if err != nil {
 		return err
 	}
@@ -447,9 +457,7 @@ func (t *tx) authorID(name string) int64 {
 		}
 		return -1
 	}
-	res, err := t.Exec(`INSERT INTO authors (name) VALUES (?)`, name)
-	t.must(err)
-	id, _ = res.LastInsertId()
+	id = t.mustInsert(`INSERT INTO authors (name) VALUES (?) RETURNING author`, name)
 	return id
 }
 
@@ -572,11 +580,9 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 	if k, ok := t.kids[author]; ok {
 		kid = k
 	}
-	r, err := t.Exec(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+	seq := t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
 		n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), kid)
-	t.must(err)
-	seq, _ := r.LastInsertId()
-	_, err = t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, seq, configSeq, n.id)
+	_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, config_seq = ? WHERE ns = ?`, seq, configSeq, n.id)
 	t.must(err)
 	n.headSeq = sql.NullInt64{Int64: seq, Valid: true}
 	if n.configSeq != configSeq {

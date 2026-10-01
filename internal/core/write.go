@@ -803,24 +803,28 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 	want := string(jsonv.Canonical(entries))
 	rows, err := t.Query(`SELECT id, body FROM ns_log WHERE ns = ? AND kind = ? AND author = ?`, n.id, nsKindCode("batch"), author)
 	t.must(err)
-	defer rows.Close()
+	var match []byte
 	for rows.Next() {
 		var id []byte
 		var body string
 		t.must(rows.Scan(&id, &body))
 		b := jsonv.MustParse([]byte(body)).(map[string]any)
 		if string(jsonv.Canonical(b["entries"])) == want {
-			if !t.candidateVerbsMatch(n, st) {
-				return nil
-			}
-			r := &WriteResult{Status: 200, Replayed: true, NSID: ids.FromBytes(id).String(), Items: items}
-			if cp != nil {
-				r.ConfigID = cp.expected.String()
-			}
-			return r
+			match = id
+			break
 		}
 	}
-	return nil
+	// Closed before querying again: a Postgres connection runs one query
+	// at a time.
+	rows.Close()
+	if match == nil || !t.candidateVerbsMatch(n, st) {
+		return nil
+	}
+	r := &WriteResult{Status: 200, Replayed: true, NSID: ids.FromBytes(match).String(), Items: items}
+	if cp != nil {
+		r.ConfigID = cp.expected.String()
+	}
+	return r
 }
 
 // candidateVerbsMatch reports whether every item with candidate verbs
@@ -1180,9 +1184,7 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 	own := t.resource(n.id, s.Resource)
 	var res int64
 	if own == nil {
-		r, err := t.Exec(`INSERT INTO resources (ns, name) VALUES (?, ?)`, n.id, s.Resource)
-		t.must(err)
-		res, _ = r.LastInsertId()
+		res = t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?, ?) RETURNING res`, n.id, s.Resource)
 	} else {
 		res = own.id
 	}
@@ -1223,12 +1225,12 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 		if i == 0 && signature != "" {
 			sig = signature
 		}
-		r, err := t.Exec(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`,
+		var err error
+		last, err = t.insert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
 			res, step.id[:], parentSeq, first, kind, patches, author, via, grantID, sig, typed, t.now.UnixMilli())
 		if err != nil {
 			panic(fmt.Errorf("inserting revision: %w", err))
 		}
-		last, _ = r.LastInsertId()
 		parentSeq = last
 		if cfg := t.config(n.configSeq); cfg.level == levelSealed {
 			// The epoch that seals this entry forever (§E.2.1).
@@ -1281,9 +1283,9 @@ func (t *tx) maybeSnapshot(res, seq int64, doc []byte) {
 	var last int64
 	t.must(t.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?`, res).Scan(&last))
 	var count, size int64
-	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(patches AS BLOB))), 0) FROM revisions WHERE res = ? AND seq > ? AND kind = 0`, res, last).Scan(&count, &size))
+	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(patches)), 0) FROM revisions WHERE res = ? AND seq > ? AND kind = 0`, res, last).Scan(&count, &size))
 	if count >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes) {
-		_, err := t.Exec(`INSERT OR REPLACE INTO snapshots (seq, res, doc) VALUES (?,?,?)`, seq, res, t.putDoc("snapshots", res, seq, doc))
+		_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc`, seq, res, t.putDoc("snapshots", res, seq, doc))
 		t.must(err)
 	}
 }

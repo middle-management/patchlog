@@ -1,0 +1,47 @@
+# The core on Postgres instead of SQLite (Addendum D.8). Layer it over
+# compose.yaml:
+#
+#   docker compose -f compose.yaml -f compose.postgres.yaml up --build
+#   make up-pg
+#
+# The core reads its database URL from PATCHLOG_DB (so the password stays
+# out of its arguments). The search index and tree service keep their own
+# SQLite databases in the data volume: they are derived state, rebuilt from
+# the core's API. `docker compose down -v` wipes Postgres's volume too.
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: patchlog
+      POSTGRES_PASSWORD: patchlog
+      POSTGRES_DB: patchlog
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "patchlog", "-d", "patchlog"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  patchlog:
+    environment:
+      PATCHLOG_DB: postgres://patchlog:patchlog@postgres:5432/patchlog?sslmode=disable
+    # compose.yaml's command without -db (PATCHLOG_DB names the database).
+    command:
+      - serve
+      - -dev
+      - -addr=:8080
+      - -origin=${PATCHLOG_ORIGIN:-http://localhost:8080}
+      - -archive=file:///data/archive
+      - -master-key=/data/master.key
+      - -master-key-create
+      - -tree-url=http://tree:8082
+      - -purge-url=http://cdn:8080/
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

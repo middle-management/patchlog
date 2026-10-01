@@ -4,10 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"strings"
-
-	"modernc.org/sqlite"
-	sqlite3 "modernc.org/sqlite/lib"
 
 	"github.com/middle-management/patchlog/internal/schema"
 )
@@ -132,28 +128,6 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 		}
 	}
 	return target, true
-}
-
-// isConflict reports a UNIQUE violation of a resource chain or a namespace
-// chain: a concurrent writer won the race (D.3). The re-check makes it
-// unreachable within one deployment's lock; it remains the final safety net.
-func isConflict(err error) bool {
-	var se *sqlite.Error
-	if !errors.As(err, &se) {
-		return false
-	}
-	switch se.Code() {
-	case sqlite3.SQLITE_CONSTRAINT_UNIQUE, sqlite3.SQLITE_CONSTRAINT_PRIMARYKEY:
-	default:
-		return false
-	}
-	msg := se.Error()
-	for _, c := range []string{"revisions.res", "resources.ns", "ns_log.ns", "head_history.res", "heads.res"} {
-		if strings.Contains(msg, c) {
-			return true
-		}
-	}
-	return false
 }
 
 // writeOptimistic runs a resource write or a batch without a config change

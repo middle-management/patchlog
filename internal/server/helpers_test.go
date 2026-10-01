@@ -18,6 +18,7 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
 // clock is an injectable clock (Options.Now).
@@ -70,7 +71,13 @@ func withLongPoll(d time.Duration) envOpt {
 }
 
 func withFileDB(t *testing.T) envOpt {
-	return func(o *core.Options) { o.Path = filepath.Join(t.TempDir(), "test.db") }
+	return func(o *core.Options) {
+		if pgtest.Enabled() {
+			o.Path = pgtest.NewDB(t)
+			return
+		}
+		o.Path = filepath.Join(t.TempDir(), "test.db")
+	}
 }
 
 func newEnv(t *testing.T, opts ...envOpt) *tenv {
@@ -82,9 +89,12 @@ func newEnv(t *testing.T, opts ...envOpt) *tenv {
 func newEnvWith(t *testing.T, sopts []Option, opts ...envOpt) *tenv {
 	t.Helper()
 	c := &clock{t: t0}
-	o := core.Options{Path: ":memory:", Origin: "https://cms.example", AuthDisabled: true, Now: c.Now, Purger: nopPurger{}}
+	o := core.Options{Origin: "https://cms.example", AuthDisabled: true, Now: c.Now, Purger: nopPurger{}}
 	for _, f := range opts {
 		f(&o)
+	}
+	if o.Path == "" {
+		o.Path = pgtest.DB(t)
 	}
 	e, err := core.Open(o)
 	if err != nil {

@@ -216,10 +216,24 @@ CREATE TABLE IF NOT EXISTS remote_notices (
 );
 `
 
-// openDB opens the database. secure_delete zeroes deleted and overwritten
-// content, so a purge (and turning encryption at rest on, which rewrites
-// rows) leaves no plaintext in free pages once the WAL is checkpointed.
-func openDB(path string) (*sql.DB, error) {
+// openDB opens the database: a Postgres URL (pgschema.go), or a SQLite
+// file or ":memory:".
+//
+// In SQLite, secure_delete zeroes deleted and overwritten content, so a
+// purge (and turning encryption at rest on, which rewrites rows) leaves no
+// plaintext in free pages once the WAL is checkpointed. Postgres has no
+// equivalent: deleted and overwritten tuples stay in the table's files
+// until VACUUM reclaims them (and in WAL and backups until those expire).
+func openDB(path string) (db *sql.DB, pg bool, err error) {
+	if isPostgresURL(path) {
+		db, err := openPG(path)
+		return db, true, err
+	}
+	db, err = openSQLite(path)
+	return db, false, err
+}
+
+func openSQLite(path string) (*sql.DB, error) {
 	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=foreign_keys(ON)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)&_txlock=immediate"
 	if path == ":memory:" {
 		dsn = "file::memory:?_pragma=foreign_keys(ON)&_pragma=secure_delete(ON)&_txlock=immediate"

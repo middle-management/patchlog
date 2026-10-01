@@ -91,8 +91,14 @@ func (c *stmtCache) close() {
 // QueryRow, Query and Exec shadow the embedded *sql.Tx's, running cached
 // prepared statements within the transaction. Like sql.Tx's, they use no
 // context of their own: the transaction's context already ends it.
+//
+// On Postgres they rewrite the query for the dialect (dialect.go) and leave
+// statement caching to pgx, which prepares each query once per connection.
 
 func (t *tx) QueryRow(q string, args ...any) *sql.Row {
+	if t.e.pg {
+		return t.Tx.QueryRow(rebind(q), pgArgs(args)...)
+	}
 	if s := t.e.stmts.get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).QueryRow(args...)
 	}
@@ -100,6 +106,9 @@ func (t *tx) QueryRow(q string, args ...any) *sql.Row {
 }
 
 func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
+	if t.e.pg {
+		return t.Tx.Query(rebind(q), pgArgs(args)...)
+	}
 	if s := t.e.stmts.get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).Query(args...)
 	}
@@ -107,8 +116,26 @@ func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
 }
 
 func (t *tx) Exec(q string, args ...any) (sql.Result, error) {
+	if t.e.pg {
+		return t.Tx.Exec(rebind(q), pgArgs(args)...)
+	}
 	if s := t.e.stmts.get(q); s != nil {
 		return t.Tx.StmtContext(context.Background(), s).Exec(args...)
 	}
 	return t.Tx.Exec(q, args...)
+}
+
+// insert runs an INSERT … RETURNING of one integer key and returns the
+// key. Both dialects support RETURNING; Postgres has no LastInsertId.
+func (t *tx) insert(q string, args ...any) (int64, error) {
+	var id int64
+	err := t.QueryRow(q, args...).Scan(&id)
+	return id, err
+}
+
+// mustInsert is insert for an INSERT that fails only by a bug.
+func (t *tx) mustInsert(q string, args ...any) int64 {
+	id, err := t.insert(q, args...)
+	t.must(err)
+	return id
 }

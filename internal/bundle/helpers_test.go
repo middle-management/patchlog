@@ -9,6 +9,7 @@ import (
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/server"
 )
@@ -35,7 +36,7 @@ type deployment struct {
 
 func newDeployment(t *testing.T, origin string) *deployment {
 	t.Helper()
-	e, err := core.Open(core.Options{Path: ":memory:", Origin: origin, AuthDisabled: true, Purger: nopPurger{}})
+	e, err := core.Open(core.Options{Path: pgtest.DB(t), Origin: origin, AuthDisabled: true, Purger: nopPurger{}})
 	if err != nil {
 		t.Fatal(err)
 	}
