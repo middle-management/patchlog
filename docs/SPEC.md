@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.32 · 2026-10-01. See the change log at the end.
+Status: draft v0.33 · 2026-10-01. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -268,13 +268,27 @@ i.e. the path of a schema revision on this service. The only other accepted valu
 
 - **`$ref`.** `$ref` inside a schema MAY be a same-document fragment (`#…`), or another schema revision path in the form above, optionally followed by a JSON Pointer fragment (`/r/schemas/common/rev/1…#/$defs/address`). A fragment points into an immutable revision, so it is immutable too. Nothing else is resolved.
 
-- **Never into a branch.** `$schema` and `$ref` MUST NOT name a branch namespace (§7.6), which is temporary by design (`422`, `code: "schema_ref"`). New schema revisions are written to a namespace that isn't a branch. They are immutable and unused until referenced, so this is safe before a migration is merged (§F.1).
+- **Never into a branch.** `$schema` and `$ref` MUST NOT name a branch namespace (§7.6), which is temporary by design (`422`, `code: "schema_ref"`). New schema revisions are written to a namespace that isn't a branch, or drafted in a branch of one (below). They are immutable and unused until referenced, so this is safe before a migration is merged (§F.1).
+
+- **Drafts in branches.** A path still never names a branch. But in a write **to a branch**, a path `/r/N/R/rev/X` that `N` can't resolve is looked up in the branches of `N`, so a release can draft its schemas privately (§F.9):
+
+  - The candidates are the local branches of `N`, branches of branches included, that aren't end-to-end encrypted. In a candidate, only revisions it wrote itself count, never those it reads through.
+
+  - A candidate serves writes to itself and to its own branches, and to the namespaces its `drafts.for` lists (§7.4) and their branches.
+
+  - The writer needs `read` on `R` in the candidate (§C.2), with the request's grant, which must name the candidate and verify under its keys, or with a grant in `Source-Authorization` (§7.8). That header may be repeated, and any grant in it that verifies for a namespace serves for that namespace. A revision the writer can't read there counts as not found, so a failed lookup reveals nothing beyond what guessing ids against readable logs already can (§C.7): the extra verification on a hit takes time.
+
+  - An id determines its document everywhere (§3.3), so it doesn't matter which candidate holds `X`. The whole `$ref` closure resolves the same way.
+
+  - In a namespace that isn't a branch, paths resolve only in `N`. Nothing in such a namespace therefore depends on a branch, and documents that use drafts can be merged into it only after their schemas have been (§F.9). A merge into a base that is itself a branch, as for a stacked release, may still resolve drafts. At E3 the server doesn't validate (§6.2), so this rests on the merging client (§F.8.1).
+
+  - Clients and consumers that validate such documents find drafts the same way: they try `N`, then the branches it lists (`GET /ns/{N}/branches`, recursively), trying first the branches named in a release document if there is one (§F.9). Any branch that serves `X` serves the right schema.
 
 - **Within a batch,** items may reference schema revisions created by earlier items of the same batch (§7.5).
 
 - **Tombstoned schema resources.** Revisions of a tombstoned schema resource still resolve (§8.1), so documents that reference them stay valid and can still be appended to. New references to them are also allowed.
 
-- **Purged or unknown references.** An unknown or purged reference is `422` with `code: "schema_unavailable"`. A **referenced schema revision** is one named by `$schema` in the head, or the last live document, of any unpurged resource in the deployment, including resources a branch reads through (their head as of `at`), or reachable from such a revision through `$ref`, transitively. A tombstoned document still counts, so a restore (§8.2) keeps working. A server MUST refuse to purge a schema resource with a referenced revision (`409`, `code: "in_use"`), unless an operator forces it. At E3 documents are ciphertext, so the server can't see their references (§E.3.2). A forced purge knowingly breaks invariant 3 for the referencing documents and is recorded in the namespace log.
+- **Purged or unknown references.** An unknown or purged reference is `422` with `code: "schema_unavailable"`. A **referenced schema revision** is one named by `$schema` in the head, or the last live document, of any unpurged resource in the deployment, including resources a branch reads through (their head as of `at`), or reachable from such a revision through `$ref`, transitively. For a branch, every revision it wrote counts as referencing, not only its head: a merge replays and validates every step (§7.5), and branches keep their whole history (§8.6). A reference is satisfied by a copy of the revision whose document is available, neither purged nor pruned: in `N`, or, for a document in a branch, in a branch it may resolve drafts in, judged structurally by the candidate rules above (a local branch of `N`, not E3, serving that namespace), never by any one writer's grants. A fast-forward merge or rebase leaves several copies with the same id. A revision pruned in `N` counts as one `N` can't resolve. A tombstoned document still counts, so a restore (§8.2) keeps working. A server MUST refuse a purge, of a resource or a namespace, that would remove the last copy satisfying a reference, in any namespace the purge reaches, including the branches it propagates to (§8.3) (`409`, `code: "in_use"`), unless an operator forces it, or, for drafts in a branch, a grant chained to a `*` key in that branch's namespace document, inherited or its own. The answer lists the referencing namespaces the caller can read. A config write that would leave a reference without a copy, such as narrowing `drafts.for` or raising a branch that holds drafts to `e2e`, is refused the same way. At E3 documents are ciphertext, so the server can't see their references (§E.3.2). A forced purge knowingly breaks invariant 3 for the referencing documents and is recorded in the namespace log.
 
 - **Read permission.** Resolving a `$schema` or `$ref` requires the writer to have `read` on the schema's namespace (Addendum C). Otherwise validation errors could reveal the content of a schema the writer may not read.
 
@@ -713,6 +727,8 @@ If that entry was written by the **same principal**, respond `200` with it inste
 
   - A branch MUST NOT have a lower `encryption.level` than its base (`422`), for the same reason.
 
+  - `drafts: { "for": [ … ] }` (optional) lists the other namespaces whose writes may resolve schema paths into this branch, with their branches (§6.1): names, or prefixes ending in `*`. Without it, a branch's drafts serve only itself and its own branches, so nobody can come to depend on them uninvited. Narrowing it is subject to the `in_use` rule of §6.1.
+
   - Conversely, a namespace with public dependents can't stop being public or become sealed (`409`, `code: "in_use"`, with `dependents`). Otherwise its content would stay public through them.
 
 ### 7.5 Batches
@@ -1053,7 +1069,7 @@ The checks run in this order:
 
   - no **dependents**: a namespace whose `base` is this namespace and that isn't purged. Otherwise `409` with `code: "in_use"` and `dependents: [...]`, and cleanup proceeds leaves first.
 
-  - none of its schema revisions is referenced (§6.1) by a resource in another namespace: otherwise `409` with `code: "in_use"`.
+  - it would remove no last copy of a referenced schema revision (§6.1) referenced from another namespace: otherwise `409` with `code: "in_use"`.
 
 - **Effect.**
 
@@ -1327,7 +1343,7 @@ A document should be split when it grows without bound (a log, a comment thread)
 | `unauthenticated` | 401 | No usable grant: missing, malformed, badly signed, revoked, expired or not yet valid (§C.2) |
 | `forbidden` | 403 | Grant, key scope or grant rule refuses the request |
 | `not_found` | 404 | Unknown, or not readable by the caller |
-| `in_use` | 409 | Purge of a referenced schema; purge of a namespace with dependents or referenced schemas; making a namespace with public dependents non-public (`dependents` included) |
+| `in_use` | 409 | Purge of the last copy of a referenced schema revision; purge of a namespace with dependents or such revisions; narrowing `drafts.for` or raising a branch to `e2e` while its drafts are referenced (§6.1); making a namespace with public dependents non-public (`dependents` included) |
 | `frozen` | 409 | Write to a frozen namespace (`successor` included, if set) |
 | `not_frozen` | 409 | Namespace purge of a namespace that isn't frozen |
 | `name_conflict` | 409 | A remote branch would need a schema revision at a path that holds a different history (§G.3) |
@@ -1598,6 +1614,9 @@ This is deliberately strict. Excluding just one edge would make the result depen
 
 -
 **Shared nodes in DAGs.** Listings are about paths, so `subtree`, `ancestors` and `where` show a node with several parents under each of them. A node reached through several paths, such as the bottom of a diamond, would repeat, and a DAG of repeated diamonds grows exponentially. Services MUST bound a response, by the depth limit and a per-response node limit, and report when a response was cut. They SHOULD expand a shared node only at its first occurrence in a `subtree` response and mark later occurrences `"repeat": true`, without children.
+
+-
+**Previews of a release** (§F.9). A tree service previewing a release follows the branches its release document lists in place of their bases: `checkpoints` holds those branches, and placements such as `matches.final` resolve to the release's branch of `matches`. It shows a viewer only branches the viewer can read, serves previews only, and issues no grants (§F.8).
 
 -
 **`mode` is enforced by the catalog's rules** (§B.6), not by consumers. The tree service serves the edges it finds, so a `tree` catalog whose rules allow several parents is served as a DAG. A service MAY report nodes with several parents in a `tree` catalog under `/problems`.
@@ -2304,6 +2323,7 @@ CREATE TABLE revisions (
   UNIQUE (res, parent_seq)
 );
 CREATE UNIQUE INDEX one_first ON revisions (res) WHERE first = 1;
+CREATE INDEX revisions_by_id ON revisions (id);   -- finds draft schema revisions in branches (§6.1)
 
 CREATE TABLE grants (id BLOB PRIMARY KEY, blocks TEXT NOT NULL);              -- non-bearer form (§C.3)
 
@@ -2539,7 +2559,7 @@ For deployments that already run Postgres. The model is the one of D.2 and D.3; 
 
 - Purge propagation (§8.3) locks the affected namespaces in ascending lock-key order (below), so concurrent propagations can't deadlock.
 
-- **Other namespaces a write depends on** are locked too, in shared mode: the namespaces its `$schema` and its whole `$ref` closure resolve into (§6.1), and, in a branch, every base whose keys and revocations it re-checks (§C.4). Config writes, purges and prunes take their namespace's lock exclusively. A schema purge or a base revocation therefore can't commit between a write's check and its insert.
+- **Other namespaces a write depends on** are locked too, in shared mode: the namespaces its `$schema` and its whole `$ref` closure resolve into (§6.1), branches holding drafts included, and, in a branch, every base whose keys and revocations it re-checks (§C.4). Config writes, purges and prunes take their namespace's lock exclusively. A purge also takes, in shared mode, the lock of every other namespace holding a copy of a referenced schema revision it would remove (§6.1), as locks found late (below), so two purges can't each remove one of the last two copies. A schema purge or a base revocation therefore can't commit between a write's check and its insert.
 
 - Locks are taken in ascending lock-key order, whatever their mode, so no two writers can deadlock. Some writes find their locks as they go: a branch's bases, a `$ref` closure, a batch's `source`, the branches a purge reaches. One that needs a lock below one it holds tries it without waiting (`pg_try_advisory_xact_lock`, or `…_shared`), and if that fails, rolls back and restarts, taking in order every lock it has found so far. A key it holds shared and now needs exclusively counts as found late too. Each restart only grows the set, so the loop ends.
 
@@ -2589,6 +2609,7 @@ CREATE TABLE revisions (                          -- the skeleton: kept after pu
   UNIQUE (res, parent_seq)
 );
 CREATE UNIQUE INDEX one_first ON revisions (res) WHERE first;
+CREATE INDEX revisions_by_id ON revisions (id);
 
 CREATE TABLE patch_sets (seq bigint PRIMARY KEY REFERENCES revisions, patches text NOT NULL);
 CREATE TABLE heads (res bigint PRIMARY KEY REFERENCES resources, doc text NOT NULL) WITH (fillfactor = 70);
@@ -2956,8 +2977,8 @@ release-7         └── derby′ ── cup′ ── +final ┘
 | Use | How |
 |---|---|
 | Drafts and review | Authors write in a branch, an editor merges |
-| Releases | Prepare many documents, publish them as one batch, possibly at a set time |
-| Schema migrations | Write the new schema revision to the schema namespace first (never to a branch, §6.1). Migrate the documents in a branch, then merge them as one batch whose config change updates the rule that allows the new `$schema` |
+| Releases | Prepare many documents, publish them as one batch per namespace, possibly at a set time (§F.9 for releases across namespaces) |
+| Schema migrations | Write the new schema revision to the schema namespace first, or draft it in a branch of the schema namespace (§6.1, §F.9). Migrate the documents in a branch, then merge them as one batch whose config change updates the rule that allows the new `$schema` |
 | Previews | Point a preview site at the branch |
 | Proposals from services | A plug-in service writes to a branch instead of the base (§C.6) |
 | Private drafts of public content | A branch with `read: "grant"` |
@@ -2978,7 +2999,7 @@ Authorization: Bearer
 
 - **Base policy.** The base's rules see a `branch` envelope whose `resource` is the new name. A base can therefore require, for example, that branches are named `release-…` and are never public.
 
-- **Grants name namespaces explicitly.** A grant for `matches` does not work in `release-7`. Issuers add branches to the grants they issue, typically only for the people working on the branch.
+- **Grants name namespaces explicitly.** A grant for `matches` does not work in `release-7`. Issuers add branches to the grants they issue, typically only for the people working on the branch. For a release that spans several namespaces, they add every branch it lists (§F.9).
 
 - **Editors** need nothing new: load, sync, submit and watch work exactly as in §11.
 
@@ -3157,6 +3178,8 @@ A branch with no `head`, `tombstone` or `batch` entry of its own counts as merge
 
 - Merging a catalog branch goes through the catalog service. It checks every move and placement in the batch as in §B.11.4, including no widening, and issues one grant covering exactly that batch.
 
+- A catalog branch in a release previews against the release's content branches (§B.5), and is merged in two batches around the content (§F.9).
+
 - **Indexes (Addendum A).** Search over a branch is a separate preview index built as in §10 (branches). The main index follows only the base.
 
 ### F.8.1 Merging and rebasing at E3
@@ -3191,7 +3214,7 @@ There are never fast-forwards at E3, even between namespaces with the same keys,
 **Conflicts** are found by the merger. It computes `writes` from the decrypted patch sets and compares them as in §F.3, including the rule for arrays. The server's dry run can only check preconditions, verbs and limits.
 
 -
-**Validation.** Before submitting, the merger folds every item and validates each resulting document against its `$schema` (§E.3.2). A document that fails is a conflict for a person, reported with kind `invalid` next to the overlap conflicts. A resource kept at the base's version is recorded with a sealed empty set (§F.3).
+**Validation.** Before submitting, the merger folds every item and validates each resulting document against its `$schema` (§E.3.2), resolved as the target's gate would resolve it (§6.1): only in the schema namespaces themselves when the target isn't a branch. A document that fails is a conflict for a person, reported with kind `invalid` next to the overlap conflicts. A resource kept at the base's version is recorded with a sealed empty set (§F.3).
 
 -
 **Retries.** The merger keeps the sealed batch byte for byte until it is acknowledged, so a retry reproduces the same ids (§E.3.1). Re-classifying after a `412`, or changing a resolution, seals the affected items again, and they get new ids.
@@ -3205,9 +3228,84 @@ There are never fast-forwards at E3, even between namespaces with the same keys,
 -
 After a merge, nothing in the target depends on the branch's keys, so purging the branch, or destroying its keys, loses nothing that was merged.
 
-## F.9 Open questions
+## F.9 Releases across namespaces
 
-- Should grants have a form covering a namespace **and its branches**, e.g. `ns: ["matches/*"]`?
+A release often spans several namespaces: new documents in `matches`, their placements in a catalog namespace `cat-season` (Addendum B), and perhaps a new schema revision in `schemas`. Each is branched as usual, and the branches are listed together in a **release document**: an ordinary resource that tools read, and the core never does.
+
+```
+// /r/releases/release-7
+{ "name": "release-7",
+  "at": "1c…",                                   // combined checkpoint the branches started from (§B.5)
+  "branches": { "matches":    { "ns": "matches-r7",    "at": "1k…" },
+                "cat-season": { "ns": "cat-season-r7", "at": "1m…" },
+                "schemas":    { "ns": "schemas-r7",    "at": "1d…" } },
+  "on": "/r/releases/release-6/rev/1x…",          // optional: the release this one builds on
+  "owners": ["user:anna"] }
+```
+
+-
+**Where it lives.** Release documents live in a namespace whose rules decide who may create and change them, and can, for example, forbid changing `branches` once a merge has started. A release document only says which branches go together: every tool that acts on it checks for itself, under its own authority, what it is about to do.
+
+-
+**Starting.** The branches SHOULD start at heads that were current together, such as the `ns_id`s in a catalog service's combined checkpoint (§B.5), so the preview shows content and catalog as they were at one moment.
+
+-
+**Documents keep naming the bases.** Placements say `matches.final`, `x-ref`s say `/r/matches/…`, and `$schema` says `/r/schemas/…`, never the branch names. Nothing is rewritten when the branches merge, and a fast-forward still reproduces every id.
+
+-
+**Schemas.** Draft schema revisions are written in the release's branch of the schema namespace, and documents in the release's other branches resolve them by their base paths (§6.1). No namespace name is special: a namespace that keeps its schemas next to its content drafts them in its own branch, which is then all a release needs. A separate draft branch serves only itself until it lists the release's other branches in `drafts.for` (§7.4).
+
+-
+**Reading.** Previews and tree services follow the listed branches in place of their bases (§B.5), and show each viewer only branches the viewer can read. Grant issuers add every listed branch (§F.2).
+
+-
+**Merging** is one batch per branch. Namespaces stay the unit of atomicity (§1), so the release as a whole isn't atomic. Before approval, the merge service checks that each listed branch's `base` chain reaches the listed base and that the branch isn't frozen or purged; on resuming, it accepts the freeze its own approval made. It records the release document's revision in its plan, and a person approves the plan. Approving freezes every listed branch (§8.4), so no new drafts or references arrive mid-merge; unfreezing one invalidates the plan. Each step is classified again, with a dry run, right before it is submitted. It orders the batches so that each state in between is safe:
+
+- **Schemas, by fast-forward only,** in `$ref` order. A schema resource is one whose documents are schemas, with a dialect URL as `$schema` (§6.1). Then `$schema` paths resolve in the bases too. A schema resource the base changed since `at` can't fast-forward, and replaying it would give new ids that no document references. That is a conflict: rebase (below), and migrate the documents to the new revision with `replace /$schema` (§6.3). A branch that holds both schemas and content merges its schema resources here and its content in step 3.
+
+- **Catalog changes that narrow access.** A change goes here when, for every subject, the effective roles on every node afterwards are a subset of those before, judged by the test of §B.11.4 on the step-2 batch as a whole, whoever merges, `catalog-admins` included. That covers unplacing, moves into more restricted folders and `$access` edits that remove roles. A folder the release creates goes here only when a narrowing move needs it, and then without `place` or `move` roles, which step 4 adds. Its title is visible to readers of its parent from then on.
+
+- **Content branches,** in any order. New documents aren't placed yet, so catalog listings don't show them, and catalog roles grant nothing on them.
+
+- **Catalog changes that widen access:** new placements, and the remaining moves and `$access` edits. This step publishes the release.
+
+Before submitting anything, the merge service reports these as conflicts for a person:
+
+- a catalog node whose change narrows access for some subjects and widens it for others. It is resolved with two resolution sets (§F.3), one narrowing for step 2 and one widening for step 4.
+
+- a content item that step 3 creates or restores and that a placement in the catalog base already names, which step 3 would publish under that placement, unless the release keeps that placement unchanged and its approver accepts that.
+
+- a pinned reference (§6.5) or manifest entry (§B.4) naming a revision of another listed branch that the merge replays rather than fast-forwards, which would dangle. At E3 every merge replays (§F.8.1), so pinned references between branches of an E3 release must be rewritten after the merge.
+
+- a document resolving a draft in a branch the release doesn't list, which ties this release to another one.
+
+The merge service stores the whole plan, both halves of every split node included, before it submits step 2, and a merge that stops part-way resumes from that plan. Each batch carries its own `source`, so steps not yet submitted can still be classified again (§F.3). Catalog batches are submitted under grants the catalog service signs (§F.8), whose root names the person merging and the service's key, so the catalog base lists each principal allowed to merge, with that `kid`, in `merge.authors`. A merge service resumes and never reverts. Every branch records `merged` only after step 4.
+
+- **Exposure between steps.** Step 1 makes the schema drafts visible to readers of the schema namespace. Step 3 makes new documents visible to anyone who reads the content namespace directly: by URL in a public namespace, and to namespace-wide readers and consumers such as search indexes. Where that matters, keep the content private and read it through the catalog, or keep catalog and content in one namespace (§B.8, §B.9), where one branch suffices.
+
+-
+**Several releases.**
+
+- Releases on the same bases merge one at a time. Steps 2 and 4 are classified against the base as it is, and another release's catalog changes in between can turn a narrowing move into a widening one without touching the moved node, so preconditions wouldn't catch it. The merge service merges one release per catalog base at a time, and classifies each step again, with a dry run, right before submitting it.
+
+- Two drafts of the same schema resource in different releases both start from its head, so only the first merged fast-forwards. The other release is rebased onto it, and its documents move to a revision that has both changes. Larger schema changes avoid this by going into a new schema resource. Since schema revisions are harmless until referenced, a release may also merge its step 1 early, accepting that the drafts become visible.
+
+- A release built on another one branches that release's branches and names it in `on`. Its `branches` are still keyed by the namespaces paths name, and each listed branch's `base` chain must reach the branch of the earlier release it is merged into. Its documents resolve drafts from both, since branches of branches are candidates too (§6.1), as long as the earlier release's draft branches list the earlier release's branches in `drafts.for`, since their branches are served too.
+
+-
+**Rebasing** a release creates a successor of each branch (§F.5) and lists them in a new revision of the release document. The schema successor is created with `drafts.for` naming the other successors, in its creation `patches`, and is replayed first, so the others' documents resolve as they are replayed. A draft that has to be replayed gets a new id, and older entries naming the old one can't be replayed into the successors. So a resource whose entries reference such a draft is squashed (§F.3): one resolution set against its new base, reaching the branch's document with `$schema` moved to the new revision.
+
+-
+**Cleanup.** The janitor (§F.6) purges each branch as usual. A draft branch can't be purged while documents rely on its last copy of a revision (§6.1), so the janitor purges the release's other branches first. The release document only orders this, and never authorises a purge.
+
+-
+**Abandoning** a release before step 1 leaves nothing in the bases. After step 1, the merged schema revisions stay in the schema namespace's history, unused.
+
+## F.10 Open questions
+
+- Should grants have a form covering a namespace **and its branches**, or all the branches of a release, e.g. `ns: ["matches/*"]`?
+
+- Releases with branches in several deployments, and exporting documents that reference drafts (§G.3, §G.4).
 
 - Should there be a stable alias that follows `successor` chains, for previews and bookmarks?
 
@@ -3309,7 +3407,7 @@ A branch on deployment B whose base is a namespace on deployment A:
 
 - collects the `$schema` and `$ref` closure of every resource
 
-- mirrors each schema resource's history, up to the referenced revisions, into the namespace of the same name on B, created if missing, since `$schema` paths contain the namespace name. It must not be a branch.
+- mirrors each schema resource's history, up to the referenced revisions (if any of them doesn't resolve in its namespace itself, as with drafts in a branch, §6.1, creation fails with `422`), into the namespace of the same name on B, created if missing, since `$schema` paths contain the namespace name. It must not be a branch.
 
 The ids prove the copies exact. If B already has a resource at one of those paths whose chain neither contains A's nor is a prefix of it, creation fails with `409 name_conflict`. Pinned `x-ref`s in read-through documents resolve on B only if B mirrors their targets too.
 
@@ -3413,7 +3511,7 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
 
 A selection is a list of resources, or anything a resolver turns into one, e.g. a catalog folder (Addendum B). The **dependency closure** is built in three levels:
 
-- **Core references, always:** the `$schema` of **every exported revision**, not only the head's, `$ref` inside those schemas, and the blobs those revisions reference (§7.8).
+- **Core references, always** (a document that references a schema revision existing only in a branch, §6.1, can't be exported until that branch is merged): the `$schema` of **every exported revision**, not only the head's, `$ref` inside those schemas, and the blobs those revisions reference (§7.8).
 
 - **Declared references:** fields marked `x-ref` in the documents' schemas (§6.5). A **pinned** reference needs that exact revision. A **live** reference needs the head as of the export's `at`.
 
@@ -3544,7 +3642,7 @@ A sealed bundle (`application/vnd.patchlog.sealed-bundle+jsonl`) encrypts a bund
 
 ## G.6 Multi-region (outlook)
 
-A read-only mirror is a remote branch that is never written. A mirror that tracks its source needs periodic rebasing, which creates a new namespace each time (§F.5). So it needs a stable alias that follows `successor` (§F.9) before it can serve stable URLs. Multi-primary writes would need a way to order concurrent heads, and are out of scope.
+A read-only mirror is a remote branch that is never written. A mirror that tracks its source needs periodic rebasing, which creates a new namespace each time (§F.5). So it needs a stable alias that follows `successor` (§F.10) before it can serve stable URLs. Multi-primary writes would need a way to order concurrent heads, and are out of scope.
 
 ## G.7 Open questions
 
@@ -3743,3 +3841,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Bundles and federation (§G):** "before the first line that mentions it" is defined, blob lines are unpadded base64url, imports upload blobs before their dry run, local imports need no copies, E3 blob lines and re-encrypting imports are specified, and lazily mirrored remote branches may lose blobs to pruning.
 
 - **Addendum D:** blob bytes are written durably before their row commits, deleted after it, and stored under one name per copy, so a delete can't hit a re-upload; `blob_refs` runs record which revisions reference a blob, and `blob_epochs` is keyed by name. On Postgres: 32-bit lock keys, try-and-restart for locks found late, shared rows, snapshots, `bytea` where encryption at rest applies, a generation counter that bounds cache staleness, with a second CDN purge, one runner for background jobs, and small writes checked inside the lock (D.3).
+
+- **v0.33:** releases across namespaces (§F.9). In a write to a branch, a schema path its namespace can't resolve is looked up among revisions written in that namespace's branches (§6.1), so a release drafts its schemas privately and its documents never name a branch. Paths in bases still resolve only in the base. Purges are refused only for the last available copy of a referenced revision, counting every revision a branch wrote. A draft branch serves only itself and its branches unless `drafts.for` names others (§7.4), and clients find drafts by trying the branches. The branches of a release are listed in an ordinary release document that previews, grant issuers and the merge service read (§B.5). The merge service merges in a safe order: schemas by fast-forward, catalog changes that narrow access, content, then catalog changes that widen it, and reports in advance the conflicts that order can't make safe.
