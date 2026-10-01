@@ -10,16 +10,18 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/grant"
 )
 
 // limits are the batch and rate limits of a target namespace (§6.6).
 type limits struct {
 	items, size       int
 	nsRate, principal float64
+	blobGrace         time.Duration
 }
 
 func defaultLimits() limits {
-	return limits{items: 1000, size: 16 << 20, nsRate: 500, principal: 50}
+	return limits{items: 1000, size: 16 << 20, nsRate: 500, principal: 50, blobGrace: 24 * time.Hour}
 }
 
 var sizeRE = regexp.MustCompile(`^(\d+)\s*(B|KiB|MiB|GiB)?$`)
@@ -64,6 +66,11 @@ func limitsOf(doc map[string]any) limits {
 	if r, ok := m["ratePerPrincipal"].(map[string]any); ok {
 		if x, ok := r["rate"].(float64); ok && x > 0 {
 			l.principal = x
+		}
+	}
+	if s, ok := m["blobGrace"].(string); ok {
+		if d, err := grant.ParseDuration(s); err == nil && d > 0 {
+			l.blobGrace = d
 		}
 	}
 	return l
@@ -213,7 +220,7 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 		return fmt.Errorf("import: dry run of the batch into %s: %w", b.n.ns, err)
 	}
 	var failures []string
-	allDeferrable := true
+	allDeferrable, onlyBlobs := true, true
 	for i, it := range res.Items {
 		st, _ := it.Raw["status"].(float64)
 		if st != 200 {
@@ -223,11 +230,16 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 			if !deferrable[code] {
 				allDeferrable = false
 			}
+			// A dry-run import uploads no blobs (§G.4.4): their absence is
+			// expected for blobs it would upload.
+			if code != "blob" || !im.opt.DryRun || len(im.batchBlobs(b)) == 0 {
+				onlyBlobs = false
+			}
 			continue
 		}
 		if i < len(expected) && (len(it.IDs) == 0 || it.IDs[len(it.IDs)-1] != expected[i]) {
 			failures = append(failures, fmt.Sprintf("%s: would produce %v, expected %s", it.Resource, it.IDs, expected[i]))
-			allDeferrable = false
+			allDeferrable, onlyBlobs = false, false
 		}
 	}
 	b.rep.Failures = failures
@@ -237,6 +249,11 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 	}
 	if deferOK && allDeferrable {
 		b.rep.DryRun = "deferred"
+		return nil
+	}
+	if onlyBlobs {
+		b.rep.DryRun = "deferred"
+		b.rep.Failures = append(b.rep.Failures, "a dry run uploads no blobs; the import uploads them before the batch")
 		return nil
 	}
 	b.rep.DryRun = "failed"
@@ -312,6 +329,12 @@ func (im *importer) execute(ctx context.Context) error {
 			for dep := range n.deps {
 				deferOK = deferOK || pending[dep]
 			}
+			if !im.opt.DryRun {
+				// Blobs first (§G.4.4): the dry run checks them too.
+				if err := im.sendBlobs(ctx, b, lims[n]); err != nil {
+					return err
+				}
+			}
 			if err := im.dryRun(ctx, b, deferOK); err != nil {
 				return err
 			}
@@ -336,6 +359,10 @@ func (im *importer) execute(ctx context.Context) error {
 			n.missing = false
 		}
 		for i, b := range n.batches {
+			// Blobs first (§G.4.4), again if they may have expired since.
+			if err := im.sendBlobs(ctx, b, lims[n]); err != nil {
+				return err
+			}
 			if !b.dryOK {
 				if err := im.dryRun(ctx, b, false); err != nil {
 					return err

@@ -96,11 +96,33 @@ type PlannedDoc struct {
 	Requires string   `json:"requires,omitempty"`
 	Selected bool     `json:"selected,omitempty"`
 	Reasons  []string `json:"reasons,omitempty"` // why it is included, and why full
+	Blobs    []string `json:"blobs,omitempty"`   // the blob lines it gets (§G.4.1)
 
 	needRevs map[string]string // pinned revisions needed → by whom
 	done     string            // the mode it was processed in
 	chain    map[string]bool   // full: every id from genesis to head
 	skip     bool              // requires names the head: already in the target
+	blobs    []plannedBlob     // its blob lines, in order
+}
+
+// plannedBlob is a blob line of a document: written right before the line
+// whose id is before, the first whose document references it (§G.4.1).
+type plannedBlob struct {
+	blobRef
+	before string
+}
+
+// addBlobs plans blob lines for the blobs refs that seen doesn't have yet,
+// before the line before.
+func (d *PlannedDoc) addBlobs(seen map[string]bool, refs []blobRef, before string) {
+	for _, r := range refs {
+		if seen[r.bid] {
+			continue
+		}
+		seen[r.bid] = true
+		d.blobs = append(d.blobs, plannedBlob{blobRef: r, before: before})
+		d.Blobs = append(d.Blobs, r.bid)
+	}
 }
 
 // ExportPlan is a selection closed over its dependencies.
@@ -466,6 +488,9 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 		return nil
 	}
 	d.done = d.Mode
+	d.blobs, d.Blobs = nil, nil
+	// Blobs referenced up to requires are in the target (§G.4.1): seen.
+	seen := map[string]bool{}
 	if p.Access[d.NS] == AccessE2E {
 		// Ciphertext (§G.5): the chain is verified over it and bundled
 		// verbatim. Nothing can be folded, so it brings no dependencies.
@@ -477,8 +502,23 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 			return err
 		}
 		d.chain = make(map[string]bool, len(entries))
+		exporting := d.Requires == ""
 		for _, e := range entries {
 			d.chain[e.ID] = true
+			// The blobs the sealed ops declare (§E.3.1).
+			if e.Kind == "rev" {
+				refs := revisionBlobs(true, e.Patches, nil)
+				if exporting {
+					d.addBlobs(seen, refs, e.ID)
+				} else {
+					for _, r := range refs {
+						seen[r.bid] = true
+					}
+				}
+			}
+			if e.ID == d.Requires {
+				exporting = true
+			}
 		}
 		if d.Requires != "" && !d.chain[d.Requires] {
 			return fmt.Errorf("requires %s is not in its chain", d.Requires)
@@ -500,15 +540,39 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 		exporting := d.Requires == ""
 		var doc any
 		live := false
+		// The first exported line whose patch set writes a reference to
+		// each blob: its blob line goes before that one if it comes before
+		// the first document referencing it, as importers check it.
+		mentioned := map[string]string{}
 		for _, e := range entries {
 			d.chain[e.ID] = true
 			doc, live, err = verify.Replay(doc, live, []client.LogEntry{e})
 			if err != nil {
 				return err
 			}
-			if exporting && e.Kind == "rev" {
-				if _, err := p.revisionDeps(ctx, d, e.ID, doc); err != nil {
-					return err
+			if e.Kind == "rev" {
+				// Core references (§G.4.2): its $schema and blobs.
+				refs := revisionBlobs(false, nil, doc)
+				if exporting {
+					if _, err := p.revisionDeps(ctx, d, e.ID, doc); err != nil {
+						return err
+					}
+					for _, b := range stepBlobs(client.PatchStep(e.Patches)) {
+						if _, ok := mentioned[b]; !ok {
+							mentioned[b] = e.ID
+						}
+					}
+					for _, r := range refs {
+						before := e.ID
+						if m, ok := mentioned[r.bid]; ok {
+							before = m
+						}
+						d.addBlobs(seen, []blobRef{r}, before)
+					}
+				} else {
+					for _, r := range refs {
+						seen[r.bid] = true
+					}
 				}
 			}
 			if e.ID == d.Requires {
@@ -538,6 +602,7 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 			d.done = ""
 			return p.process(ctx, d)
 		}
+		d.addBlobs(seen, revisionBlobs(false, nil, head), d.Head)
 	}
 	if head == nil {
 		return p.resolvers(ctx, d, nil)
@@ -663,18 +728,37 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 	n := 0
 	for _, k := range keys {
 		d := p.Docs[k]
+		// Blob lines, each right before the first line that references it.
+		blobs := func(before string) error {
+			for _, b := range d.blobs {
+				if b.before != before {
+					continue
+				}
+				if err := p.writeBlob(ctx, bw, d, b); err != nil {
+					return fmt.Errorf("export: %s: %w", k, err)
+				}
+				n++
+			}
+			return nil
+		}
 		if d.Mode == Full {
 			entries, _, err := verify.Resource(ctx, p.c, d.NS, d.Name, d.Head, d.Requires)
 			if err != nil {
 				return nil, fmt.Errorf("export: %s: %w", k, err)
 			}
 			for _, e := range entries {
+				if err := blobs(e.ID); err != nil {
+					return nil, err
+				}
 				if err := bw.History(d.NS, d.Name, e); err != nil {
 					return nil, err
 				}
 				n++
 			}
 			continue
+		}
+		if err := blobs(d.Head); err != nil {
+			return nil, err
 		}
 		if d.Deleted {
 			err = bw.SnapshotDoc(d.NS, d.Name, d.Head, nil, true)
@@ -701,6 +785,19 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 		}
 	}
 	return &Summary{Header: bw.Header(), Digest: digest, Lines: n}, nil
+}
+
+// writeBlob reads a blob of d from the source, checked against its id with
+// the reference's type and nonce, and writes its blob line.
+func (p *ExportPlan) writeBlob(ctx context.Context, bw *Writer, d *PlannedDoc, b plannedBlob) error {
+	// TODO(blobs-sealed): a sealed (E2) source answers with the blob's
+	// sealed form (§E.2.2), which the client must open with its keys
+	// before the plaintext can go into the bundle.
+	blob, err := p.c.GetBlob(ctx, d.NS, d.Name, b.bid, b.nonce)
+	if err != nil {
+		return fmt.Errorf("blob %s: %w", b.bid, err)
+	}
+	return bw.Line(Line{NS: d.NS, Resource: d.Name, Blob: b.bid, Type: b.typ, Nonce: b.nonce, Data: blob.Data})
 }
 
 // Export plans and writes a bundle.

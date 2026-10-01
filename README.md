@@ -21,7 +21,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
-| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines) | §7.8 | ✅ (bytes in a table, encrypted per resource at rest; sealed and e2e specifics to come) |
+| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in a table, encrypted per resource at rest; sealed and e2e specifics to come) |
 | Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only with `-edge-secret`) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
@@ -52,10 +52,9 @@ and serves immutable, CDN-cacheable revisions.
 - **Archives other than `file://`** (§8.6), e.g. object storage.
 - **Blob gaps** (§7.8): sealed namespaces answer `501` for blobs instead of the sealed form
   per epoch (§E.2.2); e2e writes don't check or attach the blobs their sealed ops declare
-  (§E.3.1); bundles' blob lines are written by pruning archives only (export and import don't
-  carry blobs yet, and restoring an archive doesn't bring back pruned attachments); remote
-  branches can't reference or serve their remote base's blobs (§G.3). Bytes live in a
-  `blob_bytes` table rather than in object storage (D.2, D.8).
+  (§E.3.1); bundles of sealed namespaces can't carry blobs until the client opens sealed
+  blobs, and remote branches of e2e bases don't mirror the blobs declared by sealed ops (§G.3).
+  Bytes live in a `blob_bytes` table rather than in object storage (D.2, D.8).
 - CDN edge grants (§C.5): no edge grants are issued, and the origin checks grants itself on
   every read. Both §9 deployments are supported: behind a grant-verifying edge
   (`-edge-secret`) private content gets edge lifetimes, otherwise it is `no-store` for shared
@@ -447,7 +446,8 @@ patchlog archive restore -db patchlog.db [-from file:///moved/archive] [-ns NS] 
 
 - **Archive first.** Before a prune drops patch sets, it writes them as a full-history bundle
   (§G.4.1) to `{destination}/{ns}/{name}/{horizon}.jsonl`. A later prune writes an incremental
-  bundle whose `requires` points at the previous one.
+  bundle whose `requires` points at the previous one. Blobs whose attachments the prune ends
+  go in as blob lines; `archive restore` brings them back once the horizon is cleared.
 - **410s link to the archive.** Revisions below the horizon answer `410 pruned`, with the
   archive's URL in the body.
 - **Who can prune.** With an archive configured, the `prune` verb is enough. Pruning without an
@@ -766,6 +766,12 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
 - **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
   (§6.6). **`-pace`** splits batches to fit the limits and paces them for backfills.
 - **Branches** export with the base's history included, or with `-foreign-parents` naming the base revisions in `requires`.
+- **Blobs** (§G.4.1) travel as blob lines, each before the first line that references it;
+  incremental bundles leave out what the history up to `requires` referenced. Import checks
+  each id and uploads the blobs a batch references before it (a snapshot's to its upstream
+  resource and target), or copies them with `Blob-From` within one deployment; uploads are
+  repeated when half of `blobGrace` has passed. A dry run uploads nothing and reports blob
+  failures as deferred.
 
 #### Encryption (§G.5.1)
 
