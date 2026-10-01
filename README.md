@@ -11,7 +11,7 @@ and serves immutable, CDN-cacheable revisions.
 |---|---|---|
 | I-JSON input, JCS canonical form, base32 ids (`1…`) | §3 | ✅ |
 | Revisions, tombstones, namespace chain, names grammar, canonical URLs | §3.3–§3.6 | ✅ |
-| Opt-in `$schema` validation (JSON Schema 2020-12, format assertions, strict refs, unknown keywords rejected) | §6.1–§6.3, §6.5 | ✅ |
+| Opt-in `$schema` validation (JSON Schema 2020-12, format assertions, strict refs, unknown keywords rejected); `schema import` brings in external schemas (e.g. schemastore) with refs pinned | §6.1–§6.3, §6.5 | ✅ |
 | Change envelopes, rule engine (`test`, `writes`, `compare`, `all`/`any`/`not`/`if`) | §6.4 | ✅ |
 | Limits (configurable, deployment maximums) and token-bucket rate limits | §6.6 | ✅ |
 | Reads, writes, gate order, `412`/`428`, idempotent retry | §6.2, §7.1–§7.2 | ✅ |
@@ -932,6 +932,58 @@ patchlog import -ns secret -i s.plb -identity me.jwk -atomic
   missing target is created as, moved up to the bundle's epochs. Diverged e2e documents can only
   be skipped: comparing or rewriting them needs a client with the keys (§F.8).
 
+### Importing external schemas (§6.1)
+
+How do I use a schema from [schemastore.org](https://www.schemastore.org) (or any other URL, or
+a local file)? A document's `$schema`, and a schema's `$ref`, can only name an immutable schema
+revision on this deployment (`/r/{ns}/{name}/rev/{id}`, optionally `#/json/pointer`), so the
+schema and everything it references must first be brought in as schema resources, with their
+references rewritten. `patchlog schema import` does that:
+
+```sh
+patchlog schema import -api http://localhost:8080 -ns schemas -author me \
+  https://www.schemastore.org/petstore-v1.0.json
+# SOURCE                                          RESOURCE       ACTION  PATH
+# https://www.schemastore.org/petstore-v1.0.json  petstore-v1.0  create  /r/schemas/petstore-v1.0/rev/1h7u…
+```
+
+The last row is the root: paste its path into a document's `$schema` (or another schema's `$ref`).
+
+- **Fetching.** The given URLs or files and, transitively, every document they `$ref`, relative
+  refs resolved per JSON Schema base-URI rules (`$id` in the document and its subschemas; `id` in
+  draft-04). Only http(s) and local files, and a remote document may not reference a local one.
+  `-max-docs` (100), `-max-bytes` (32 MiB in total) and `-timeout` (30 s per fetch) bound it.
+- **Conversion** to draft 2020-12 as the server accepts it (§6.1, §6.5): `$schema` becomes the
+  2020-12 dialect URL; `definitions` → `$defs`, array `items`/`additionalItems` →
+  `prefixItems`/`items`, `dependencies` → `dependentSchemas`/`dependentRequired`, draft-04 boolean
+  `exclusiveMaximum`/`exclusiveMinimum` → numbers; `$id` and `$anchor` are dropped, since every
+  reference is resolved; unknown keywords (schemastore's `markdownDescription`, `tsType`, …)
+  become `x-*` annotations, which don't change validation. Each kind of change is reported.
+- **References.** Every `$ref` becomes either a same-document pointer (`#/$defs/…`) or the
+  revision path of its target plus a JSON Pointer. Plain-name fragments (`#foo`: `$anchor`,
+  `$dynamicAnchor`, draft-07 `"$id": "#foo"`) are resolved to pointers, since §6.1 resolves none
+  across revisions. A `$ref` to a JSON Schema meta-schema (accepted by no server in `$ref`) is
+  dropped with a warning, kept as `x-meta-ref`; that subschema then accepts anything.
+- **Names** come from the URL's last segment (`petstore-v1.0.json` → `petstore-v1.0`), sanitised
+  to resource names (§3.6); `-name` names the root. Colliding names keep the base name for the
+  root (else the smallest URL); the others get `-` and 8 hex digits of their URL's SHA-256.
+- **Order and cycles.** A revision can only reference revisions that exist, so the schemas are
+  written leaves first, each revision id predicted client-side (§3.3) and pinned by its
+  dependents. Documents that reference each other in a cycle can't pin each other: each cycle
+  is merged into one resource (the root, else the smallest URL), the others under `$defs`, and
+  reported. Their rows show the bundled path, e.g. `/r/schemas/a/rev/1…#/$defs/b`.
+- **Checked, then written atomically.** Every converted schema is compiled as the server will
+  (regular expressions must be RE2, §6.6) before anything is written; a failure refuses the
+  import with the schema and the reason. Then one batch (§7.5), or dependency-ordered batches
+  when beyond the namespace's `itemsPerBatch`/`batchSize`.
+- **Idempotent.** A resource whose head already holds the converted content is reused
+  (`unchanged`), so a re-run with unchanged sources writes nothing. A changed source appends a
+  revision (`If-Match` the head, `append`) to it and to every schema that pins it, which then
+  pins the new revision; documents keep validating against the revision they name (§6.3).
+- **`-dry-run`** fetches, converts, compiles and prints the plan without writing (without
+  `-api`, every resource is planned as a create). **`-json`** prints `entries`
+  (`source`, `resource`, `path`, `action`, `root`), `bundled` and `warnings`.
+
 ### A short tour (dev mode)
 
 ```sh
@@ -1123,6 +1175,7 @@ internal/pointer    JSON Pointer
 internal/patch      JSON Patch and the `writes` of §6.4.1
 internal/rules      the rule language of §6.4.2
 internal/schema     $schema resolution and JSON Schema validation
+internal/schemaimport external JSON Schemas into a namespace, refs pinned (schema import)
 internal/grant      grants, keys, roles and verification (Addendum C)
 internal/core       storage and semantics (gate, batches, branches, purge, prune)
 internal/server     HTTP API
