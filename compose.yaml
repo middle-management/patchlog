@@ -60,6 +60,12 @@ services:
       # The Search tab reads the index the same way, at /playground/index/.
       # It follows demo; like the tree service it starts after the seed.
       - -index-url=http://index:8081
+      # The Schemas tab plans imports of external JSON Schemas; the core
+      # fetches the URLs it is given, from these hosts only (and never from
+      # private addresses unless listed). Without -schema-fetch the tab takes
+      # uploaded files only.
+      - -schema-fetch
+      - -schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com
       # Cache-tag purges (tombstone purges, namespace purges, …). The CDN
       # starts last; purges sent before it is up are logged and dropped,
       # which is harmless: nothing is cached yet.

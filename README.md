@@ -509,6 +509,44 @@ results include it (§A.5). Sealed results (§E.2.6), whole or per hit, are decr
 playground holds; an end-to-end namespace has no server index, and the tab says so. Without
 `-index-url` it says that search needs the index service.
 
+The **Schemas** tab imports external JSON Schemas from the browser (see
+[Importing external schemas](#importing-external-schemas-61)). Pick a namespace, give URLs and/or
+files (a file picker, a drop zone, or a pasted schema with a file name; `$ref`s between the files
+are resolved by file name), optionally a root name, and press **Plan**: the core fetches,
+converts and compiles as `patchlog schema import` does and answers with the plan, which the
+tab shows as a table (source, resource, action, revision path) with the warnings, the cycles that
+were merged, and the rewritten schema of each resource. **Import** then writes the plan from the
+browser through the normal API, with the grant or author in the page's connection bar: the
+plan's items in one `POST /ns/{ns}/batch` (chunked, one batch after another, when beyond the
+namespace's limits), `If-None-Match: *` for a create and `If-Match: head` for an append. It
+checks that the server assigned the predicted revision ids (and warns if not) and shows the
+root's pinned `$schema` path with a copy button and a button that starts a new document with it
+in the Resource editor. A second Plan shows every row `unchanged`. Plain (not sealed)
+namespaces only.
+
+The plan endpoint, `POST /playground/schema-import/plan`, takes `{ns, sources: [url…], files:
+[{name, content}…], name?}` and writes nothing. It reads the current heads in process through the
+API handler with the request's own headers (`Authorization`, `X-Author`, an edge secret), so a
+caller plans against what their grant may read; a caller who can't read the namespace gets the
+API's own refusal before anything is fetched. It answers `entries`, `resources` (with the
+converted `content`), `bundled`, `warnings` and `batches` (`items` in the batch wire format, and
+the `ids` they are predicted to get); `GET /playground/schema-import/` says whether fetching is on.
+
+**Fetching URLs is off by default**, since it makes the core request what callers name:
+
+| Flag | Effect |
+|---|---|
+| `serve -schema-fetch` | the endpoint fetches http(s) URLs (and what they `$ref`); without it, uploaded files only (a URL is `403 fetch_disabled`, and the tab says so) |
+| `-schema-fetch-hosts a,b` | only these hosts (a name, an IP or `host:port`), redirects and references included; they are trusted with private addresses too, which is how a local schema server is allowed |
+
+Without a host list any public host may be fetched, but a host with an address that is loopback,
+private (RFC 1918, `fc00::/7`, CGNAT), link-local (cloud metadata), multicast or unspecified is
+refused after DNS resolution, checking every address the name has and connecting to the one
+checked. The environment's proxy settings are ignored (the check has to see the address dialled).
+The size, document-count (100) and per-fetch timeout (30 s) limits of the CLI apply; a request
+body is capped at 16 MiB and 50 files. The demo composes pass
+`-schema-fetch -schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com`.
+
 Run it with `./patchlog serve -dev` and open `http://localhost:8080/playground/`. Sealed and e2e
 namespaces need `-master-key FILE -master-key-create`.
 
@@ -983,6 +1021,10 @@ The last row is the root: paste its path into a document's `$schema` (or another
 - **`-dry-run`** fetches, converts, compiles and prints the plan without writing (without
   `-api`, every resource is planned as a create). **`-json`** prints `entries`
   (`source`, `resource`, `path`, `action`, `root`), `bundled` and `warnings`.
+- **In the playground.** The same plan and write are available from the Schemas tab
+  ([Playground](#playground)), with uploaded files as well as URLs; the core fetches URLs only
+  with `serve -schema-fetch`, and then never from private addresses unless the host is in
+  `-schema-fetch-hosts`.
 
 ### A short tour (dev mode)
 

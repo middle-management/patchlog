@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"time"
@@ -31,6 +32,8 @@ func (e limitError) Error() string { return string(e) }
 // fetcher loads documents over http(s) and from local files, within the
 // limits of Options.
 type fetcher struct {
+	files    map[string][]byte
+	noDisk   bool
 	hc       *http.Client
 	timeout  time.Duration
 	maxDocs  int
@@ -40,7 +43,7 @@ type fetcher struct {
 }
 
 func newFetcher(opt Options) *fetcher {
-	f := &fetcher{hc: opt.HTTPClient, timeout: opt.Timeout, maxDocs: opt.MaxDocs, maxBytes: opt.MaxBytes}
+	f := &fetcher{files: opt.Files, noDisk: opt.NoDisk, hc: opt.HTTPClient, timeout: opt.Timeout, maxDocs: opt.MaxDocs, maxBytes: opt.MaxBytes}
 	if f.timeout <= 0 {
 		f.timeout = DefaultTimeout
 	}
@@ -66,6 +69,21 @@ func newFetcher(opt Options) *fetcher {
 		return nil
 	}
 	return f
+}
+
+// FileURL is the location of the in-memory file name (Options.Files): the
+// base its relative references resolve against.
+func FileURL(name string) *url.URL {
+	return &url.URL{Scheme: "file", Path: "/upload/" + strings.TrimPrefix(path.Clean("/"+name), "/")}
+}
+
+func (f *fetcher) memFile(u *url.URL) ([]byte, bool) {
+	for name, b := range f.files {
+		if FileURL(name).String() == u.String() {
+			return b, true
+		}
+	}
+	return nil, false
 }
 
 // sourceURL turns a command-line argument into an absolute URL: an http(s)
@@ -109,6 +127,13 @@ func (f *fetcher) fetch(ctx context.Context, u *url.URL) (any, *url.URL, error) 
 	final := u
 	switch u.Scheme {
 	case "file":
+		if mem, ok := f.memFile(u); ok {
+			body = mem
+			break
+		}
+		if f.noDisk {
+			return nil, nil, fmt.Errorf("%s: no such uploaded file", u)
+		}
 		fh, err := os.Open(filepath.FromSlash(u.Path))
 		if err != nil {
 			return nil, nil, err

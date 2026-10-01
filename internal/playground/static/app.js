@@ -2821,6 +2821,233 @@ function initSearch() {
 }
 
 /* ------------------------------------------------------------------ *
+ * schemas: import external JSON Schemas (§6.1)
+ *
+ * The core plans (fetch, convert, rewrite refs to pinned revision paths, predict ids) and writes nothing; this page
+ * writes the plan through the normal API, as the user: the batches the plan carries, each atomic.
+ * ------------------------------------------------------------------ */
+const SI_URL = '/playground/schema-import/';
+const SI = { probe: null, files: [], plan: null, stale: false, busy: false, imported: null, pasted: 0 };
+
+async function probeSI() {
+  const r = await api('GET', SI_URL, { auto: true, label: 'schema import' });
+  SI.probe = r.status === 200 && r.json && r.json.proxy === 'schema-import' ? r.json : false;
+  renderSIFetch();
+}
+
+function renderSIFetch() {
+  const p = SI.probe, ta = $('siUrls'), note = $('siFetchNote');
+  ta.disabled = p === null ? false : !(p && p.fetch);
+  if (p === null) { note.textContent = 'Asking the core whether it fetches URLs…'; return; }
+  if (!p) { note.textContent = 'The core has no schema import endpoint (this playground is served without it): nothing to plan with.'; $('siPlan').disabled = true; return; }
+  $('siPlan').disabled = SI.busy;
+  if (!p.fetch) { note.textContent = 'URL fetching is disabled on this server (serve -schema-fetch). Upload or paste schema files instead; $refs between them are resolved by file name.'; return; }
+  note.textContent = p.hosts && p.hosts.length
+    ? 'The core fetches URLs from these hosts only: ' + p.hosts.join(', ') + '.'
+    : 'The core fetches URLs from public addresses only (private, loopback and link-local ones are refused).';
+}
+
+function renderSIPick() {
+  const sel = $('siPick');
+  const list = known.slice().sort(cmpCU);
+  sel.replaceChildren(h('option', { value: '' }, list.length ? '— pick —' : '— add a namespace above —'),
+    ...list.map((n) => h('option', { value: n, selected: n === $('siNs').value.trim() }, n)));
+}
+
+function siDirty() {
+  if (SI.plan && !SI.stale) { SI.stale = true; renderSIStatus(); }
+}
+
+function renderSIFiles() {
+  $('siFiles').replaceChildren(...SI.files.map((f, i) => h('span', { class: 'badge info chip', title: f.content.length + ' bytes' },
+    f.name, h('button', { type: 'button', title: 'remove', 'aria-label': 'remove ' + f.name, onclick: () => { SI.files.splice(i, 1); renderSIFiles(); siDirty(); } }, '×'))));
+}
+
+function siAddFile(name, content) {
+  name = String(name || '').trim();
+  const at = SI.files.findIndex((f) => f.name === name);
+  if (at >= 0) SI.files[at] = { name, content }; else SI.files.push({ name, content });
+  renderSIFiles(); siDirty();
+}
+
+async function siReadFiles(list) {
+  for (const f of Array.from(list || [])) {
+    try { siAddFile(f.name, await f.text()); } catch (e) { toast('Could not read ' + f.name); }
+  }
+}
+
+function siRequest() {
+  const sources = $('siUrls').value.split(/\s+/).map((s) => s.trim()).filter(Boolean);
+  const body = { ns: $('siNs').value.trim(), sources, files: SI.files };
+  const name = $('siName').value.trim();
+  if (name) body.name = name;
+  return body;
+}
+
+function renderSIStatus(msg, cls) {
+  const st = $('siStatus');
+  if (msg !== undefined) { st.className = cls || 'muted'; st.textContent = msg; SI.msg = [msg, cls]; }
+  else if (SI.stale) { st.className = 'muted'; st.textContent = 'The inputs changed since the plan: plan again.'; }
+  $('siImport').disabled = SI.busy || !SI.plan || SI.stale || !SI.plan.changed || !!SI.imported;
+  $('siPlan').disabled = SI.busy || SI.probe === false;
+}
+
+const siActionClass = { create: 'ok', append: 'info', restore: 'warn', unchanged: '' };
+const siRoots = (plan) => (plan.entries || []).filter((e) => e.root);
+
+async function siPlan() {
+  if (SI.busy) return;
+  const req = siRequest();
+  if (!req.ns) return toast('Pick or type a namespace');
+  if (!req.sources.length && !req.files.length) return toast('Give a URL or add a file');
+  store.set('pl.siNs', req.ns);
+  SI.busy = true; SI.imported = null; renderSIStatus('Planning…');
+  const r = await api('POST', SI_URL + 'plan', { body: req, label: 'schema import' });
+  SI.busy = false;
+  if (!r.ok) {
+    SI.plan = null; $('siPlanCard').hidden = true; $('siResultCard').hidden = true;
+    const msg = r.neterr ? 'network error: ' + r.neterr : (r.json && r.json.message) || `HTTP ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}`;
+    renderSIStatus(msg, 'bad');
+    return;
+  }
+  SI.plan = r.json; SI.stale = false;
+  addKnown(req.ns); renderSIPick();
+  renderSIPlan();
+  const n = SI.plan.batches.reduce((a, b) => a + b.items.length, 0);
+  renderSIStatus(SI.plan.changed ? `${n} resource${n === 1 ? '' : 's'} to write in ${SI.plan.batches.length} batch${SI.plan.batches.length === 1 ? '' : 'es'}.` : 'Nothing to write: every schema is unchanged.', SI.plan.changed ? 'good' : 'muted');
+  if (!SI.plan.changed) renderSIResult();
+  else $('siResultCard').hidden = true;
+}
+
+function renderSIPlan() {
+  const p = SI.plan;
+  $('siPlanCard').hidden = !p;
+  if (!p) return;
+  const notes = $('siNotes');
+  notes.replaceChildren(
+    ...(p.bundled || []).map((b) => h('div', { class: 'warn-box' }, 'These documents reference each other in a cycle and were merged into one resource (the others under $defs): ' + b.join(', '))),
+    ...(p.warnings || []).map((w) => h('div', { class: 'warn-box' }, 'warning: ' + w)));
+  const tb = $('siTbl').tBodies[0];
+  tb.replaceChildren(...(p.entries || []).map((e) => h('tr', {},
+    h('td', { class: 'mono wrap' }, e.source, e.root ? h('span', { class: 'badge info', style: 'margin-left:6px' }, 'root') : null),
+    h('td', { class: 'mono' }, e.resource),
+    h('td', {}, h('span', { class: 'badge ' + (siActionClass[e.action] || '') }, e.action)),
+    h('td', { class: 'mono wrap' }, h('span', { class: 'id', title: 'click to copy', onclick: () => copy(e.path) }, e.path)),
+    h('td', {}, h('button', { class: 'tiny', onclick: () => siView(e.resource) }, 'view')))));
+  $('siPlanMeta').textContent = `${(p.resources || []).length} resource${(p.resources || []).length === 1 ? '' : 's'} in ${p.ns}`;
+  $('siViewBox').hidden = true;
+}
+
+function siView(name) {
+  const r = (SI.plan.resources || []).find((x) => x.name === name);
+  if (!r) return;
+  $('siViewBox').hidden = false;
+  $('siViewName').textContent = `${r.name}  →  ${r.path}  (rewritten schema)`;
+  setJSON($('siView'), r.content);
+}
+
+async function siImport() {
+  const p = SI.plan;
+  if (SI.busy || !p || !p.changed || SI.stale || SI.imported) return;
+  SI.busy = true; renderSIStatus('Writing…');
+  const mismatch = [];
+  let done = 0, failed = null;
+  await asUser(async () => {
+    for (const b of p.batches) {
+      const r = await api('POST', `/ns/${p.ns}/batch`, { label: 'schema import', body: { items: b.items } });
+      if (r.status !== 201 && r.status !== 200) { failed = r; break; }
+      const got = (r.json && r.json.items) || [];
+      b.items.forEach((it, i) => {
+        const id = got[i] && got[i].ids && got[i].ids[0];
+        if (id !== b.ids[i]) mismatch.push({ resource: it.resource, want: b.ids[i], got: id || '(none)' });
+      });
+      done++;
+    }
+  });
+  SI.busy = false;
+  if (failed) {
+    SI.stale = true;
+    const j = failed.json;
+    renderSIStatus((failed.neterr ? 'network error: ' + failed.neterr : `HTTP ${failed.status}${j && j.code ? ' ' + j.code : ''}${j && j.message ? ': ' + j.message : ''}`) +
+      (done ? ` (${done} of ${p.batches.length} batches were written)` : ' (nothing was written)') + '. Plan again.', 'bad');
+    if (failed.json && failed.entry) $('siStatus').append(errBox(failed.entry));
+    return;
+  }
+  SI.imported = { mismatch };
+  renderSIStatus(`Written: ${p.batches.reduce((a, b) => a + b.items.length, 0)} resource(s) in ${p.batches.length} batch(es).`, 'good');
+  renderSIResult();
+  if (p.ns === S.ns) await refreshNS();
+}
+
+function renderSIResult() {
+  const p = SI.plan, box = $('siResult');
+  $('siResultCard').hidden = !p;
+  if (!p) return;
+  const roots = siRoots(p);
+  const kids = [];
+  if (SI.imported && SI.imported.mismatch.length) {
+    kids.push(h('div', { class: 'warn-box' }, 'The server assigned other revision ids than predicted, so references between these schemas may not point where intended: ',
+      SI.imported.mismatch.map((m) => `${m.resource}: expected ${m.want}, got ${m.got}`).join('; ')));
+  }
+  roots.forEach((e, i) => {
+    const docName = h('input', { class: 'mono', value: store.get('pl.siDoc', 'example'), spellcheck: 'false', autocomplete: 'off', 'aria-label': 'name of the new document', style: 'flex:0 1 180px' });
+    kids.push(h('div', { class: 'row' },
+      h('b', { class: 'mono' }, e.resource), h('span', { class: 'muted' }, '$schema'),
+      h('code', { class: 'siPath', style: 'overflow-wrap:anywhere' }, e.path),
+      h('button', { class: 'tiny', onclick: () => copy(e.path, '$schema path') }, 'Copy')));
+    kids.push(h('div', { class: 'row' },
+      h('label', {}, 'New document'), docName,
+      h('button', { class: 'tiny primary', title: 'opens the Resource tab with a create patch that sets this $schema', onclick: () => { store.set('pl.siDoc', docName.value.trim()); siNewDoc(p.ns, docName.value.trim(), e.path); } }, 'Start in the Resource editor')));
+  });
+  kids.push(h('p', { class: 'note' }, 'A document that names this path in its $schema is validated against it when written (§6.2); the path is a revision, so it never changes under the document.'));
+  box.replaceChildren(...kids);
+  $('siResultMeta').textContent = SI.imported ? 'written' : 'already in place';
+}
+
+async function siNewDoc(ns, name, path) {
+  if (!name) return toast('Name the new document');
+  await asUser(async () => {
+    if (!S.ns) await selectNS(ns); // documents usually live elsewhere than their schemas: keep the namespace in use
+    await selectRes(name);
+  });
+  $('patch').value = fmtPatch([{ op: 'add', path: '', value: { $schema: path } }]);
+  $('patch').dispatchEvent(new Event('input'));
+  showTab('res');
+  toast('Edit the patch, then Create');
+}
+
+function initSchemas() {
+  $('siNs').value = store.get('pl.siNs', '');
+  $('siPick').onchange = () => { const v = $('siPick').value; if (v) { $('siNs').value = v; siDirty(); } };
+  $('siNs').oninput = siDirty; $('siUrls').oninput = siDirty; $('siName').oninput = siDirty;
+  $('siFileIn').onchange = async () => { await siReadFiles($('siFileIn').files); $('siFileIn').value = ''; };
+  const drop = $('siDrop');
+  drop.ondragover = (e) => { e.preventDefault(); drop.classList.add('over'); };
+  drop.ondragleave = () => drop.classList.remove('over');
+  drop.ondrop = async (e) => { e.preventDefault(); drop.classList.remove('over'); await siReadFiles(e.dataTransfer && e.dataTransfer.files); };
+  drop.onkeydown = (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('siFileIn').click(); } };
+  drop.onclick = () => $('siFileIn').click();
+  $('siPasteAdd').onclick = () => {
+    const text = $('siPaste').value;
+    if (!text.trim()) return toast('Paste a schema first');
+    const p = tryParse(text);
+    if (!p.ok) return toast('Not valid JSON: ' + p.err);
+    siAddFile($('siPasteName').value.trim() || `pasted-${++SI.pasted}.json`, text);
+    $('siPaste').value = ''; $('siPasteName').value = '';
+  };
+  $('siPlan').onclick = () => asUser(siPlan);
+  $('siImport').onclick = siImport;
+  $('siViewClose').onclick = () => { $('siViewBox').hidden = true; };
+  $('siRefresh').onclick = () => asUser(async () => { SI.probe = null; renderSIFetch(); await probeSI(); });
+  document.querySelector('.tab[data-tab="si"]').addEventListener('click', () => {
+    if (!$('siNs').value.trim() && S.ns) $('siNs').value = S.ns;
+    renderSIPick();
+    if (SI.probe === null) asUser(probeSI);
+  });
+  renderSIPick(); renderSIFiles(); renderSIStatus();
+}
+
+/* ------------------------------------------------------------------ *
  * tabs and wiring
  * ------------------------------------------------------------------ */
 function showTab(name) {
@@ -2977,6 +3204,7 @@ function init() {
 
   // search
   initSearch();
+  initSchemas();
 
   // restore session
   showTab(store.get('pl.tab', 'ns'));
@@ -2984,6 +3212,7 @@ function init() {
   const ns = store.get('pl.ns', ''), res = store.get('pl.res', '');
   if (ns) { S.res = res; asUser(() => selectNS(ns, { keepRes: true })); $('resName').value = res; }
   if (store.get('pl.tab', 'ns') === 'cat') loadCatalog();
+  if (store.get('pl.tab', 'ns') === 'si') asUser(probeSI);
   if (store.get('pl.tab', 'ns') === 'sr') probeIndex().then(() => { renderSrPick(); renderSearch(); });
 }
 

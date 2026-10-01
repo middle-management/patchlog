@@ -89,7 +89,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
   patchlog version
@@ -121,6 +121,8 @@ func serve(args []string) {
 	var treeURLs multi
 	fs.Var(&treeURLs, "tree-url", "tree service (Addendum B) the playground reads through a read-only proxy at "+server.TreeProxyPrefix+", e.g. http://tree:8082; CATALOG=URL maps one catalog to its own (repeatable)")
 	indexURL := fs.String("index-url", "", "search index (Addendum A) the playground reads through a read-only proxy at "+server.IndexProxyPrefix+", e.g. http://index:8081; one index serves several namespaces")
+	schemaFetch := fs.Bool("schema-fetch", false, "let the playground's schema import fetch http(s) URLs (off: it takes uploaded files only); private, loopback and link-local addresses are refused unless the host is in -schema-fetch-hosts")
+	schemaHosts := fs.String("schema-fetch-hosts", "", "comma-separated hosts -schema-fetch is limited to, e.g. www.schemastore.org,raw.githubusercontent.com (also trusted with private addresses)")
 	maxItems := fs.Int("max-items-per-batch", 0, "deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it (§6.6)")
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
 	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
@@ -244,7 +246,7 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy, indexProxy)), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy, indexProxy, playground.Options{SchemaFetch: *schemaFetch, SchemaFetchHosts: splitHosts(*schemaHosts)})), ReadHeaderTimeout: 10 * time.Second}
 	log.Printf("patchlog %s listening on %s (origin %s, dev=%v)", version, *addr, *origin, *dev)
 	if *pg {
 		log.Printf("playground: %s%s", localURL(*addr), playground.Prefix)
@@ -396,12 +398,16 @@ func remoteOptions(bearers, urls, identities []string) (core.RemoteOptions, erro
 // treeProxy, if not nil, serves server.TreeProxyPrefix (-tree-url);
 // without it those paths are the playground's 404. indexProxy likewise
 // serves server.IndexProxyPrefix (-index-url).
-func handler(api http.Handler, withPlayground bool, treeProxy, indexProxy http.Handler) http.Handler {
+func handler(api http.Handler, withPlayground bool, treeProxy, indexProxy http.Handler, pgOpt ...playground.Options) http.Handler {
 	if !withPlayground {
 		return api
 	}
 	mux := http.NewServeMux()
-	mux.Handle(playground.Prefix, playground.Handler())
+	var po playground.Options
+	if len(pgOpt) > 0 {
+		po = pgOpt[0]
+	}
+	mux.Handle(playground.Prefix, playground.HandlerWith(api, po))
 	if treeProxy != nil {
 		mux.Handle(server.TreeProxyPrefix, treeProxy)
 	}
@@ -418,6 +424,17 @@ func handler(api http.Handler, withPlayground bool, treeProxy, indexProxy http.H
 		}
 		api.ServeHTTP(w, r)
 	})
+}
+
+// splitHosts splits a comma-separated host list.
+func splitHosts(s string) []string {
+	var out []string
+	for _, h := range strings.Split(s, ",") {
+		if h = strings.TrimSpace(h); h != "" {
+			out = append(out, h)
+		}
+	}
+	return out
 }
 
 // localURL turns a listen address into a URL a browser on this machine can open.

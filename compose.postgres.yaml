@@ -42,6 +42,8 @@ services:
       - -master-key-create
       - -tree-url=http://tree:8082
       - -index-url=http://index:8081
+      - -schema-fetch
+      - -schema-fetch-hosts=www.schemastore.org,json.schemastore.org,raw.githubusercontent.com
       - -purge-url=http://cdn:8080/
     depends_on:
       postgres:

@@ -331,3 +331,11 @@ ul.cat-tree details > summary { cursor: pointer; padding: 1px 6px; }
 .blob-body { margin-top: 4px; }
 .blob-img { display: block; max-width: 100%; max-height: 260px; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); }
 .blob-text { margin: 0; max-height: 160px; overflow: auto; font: 12px/1.4 var(--mono); white-space: pre-wrap; overflow-wrap: anywhere; }
+
+/* ---- schema import ------------------------------------------------ */
+.drop { flex: 1 1 200px; border: 1px dashed var(--border); border-radius: 6px; padding: 8px 10px; color: var(--muted); text-align: center; }
+.drop.over, .drop:focus-visible { border-color: var(--accent); background: var(--info-bg); color: var(--text); }
+.chips .badge button { all: unset; cursor: pointer; margin-left: 4px; }
+td.wrap, td.wrap code { white-space: normal; overflow-wrap: anywhere; }
+.bad { color: var(--err); }
+.good { color: var(--ok); }

@@ -52,6 +52,7 @@
     <button class="tab" role="tab" data-tab="live" aria-selected="false">Live <span id="liveDot" class="dot" hidden></span></button>
     <button class="tab" role="tab" data-tab="cat" aria-selected="false">Catalog</button>
     <button class="tab" role="tab" data-tab="sr" aria-selected="false">Search</button>
+    <button class="tab" role="tab" data-tab="si" aria-selected="false">Schemas</button>
     <button class="tab" role="tab" data-tab="keys" aria-selected="false">Keys <span id="idDot" class="dot" hidden></span></button>
   </div>
 
@@ -327,6 +328,59 @@
       <div id="srCountsOut"></div>
       <div class="row"><button id="srMore" class="tiny" hidden>More results</button></div>
       <p class="note">Resource names open in the Resource tab. Facet chips and counts add a filter. A hit is the document's head at the index's checkpoint; the index returns ids and indexed fields, not snippets. Sealed namespaces are decrypted here with the keys the Keys tab holds (&sect;E.2.6); end-to-end ones have no server index.</p>
+    </div>
+  </section>
+
+  <!-- ============ Schemas: import external JSON Schemas (§6.1) ============ -->
+  <section id="tab-si" class="grid" role="tabpanel" hidden>
+    <div class="card wide">
+      <header><h2>Import external schemas</h2><span class="muted small">&sect;6.1 &middot; the same plan as <code>patchlog schema import</code>, computed by the core at /playground/schema-import/plan</span><button id="siRefresh" class="tiny" title="ask the core again whether it fetches URLs">Refresh</button></header>
+      <div class="row">
+        <label for="siPick">Namespace</label>
+        <select id="siPick" class="mono" title="the namespaces this page knows"><option value="">&mdash;</option></select>
+        <input id="siNs" class="mono" placeholder="schemas" autocomplete="off" spellcheck="false" aria-label="namespace the schemas are written to">
+      </div>
+      <div class="row">
+        <label for="siUrls">URLs</label>
+        <textarea id="siUrls" class="mono" rows="2" spellcheck="false" placeholder="one http(s) URL per line, e.g. https://json.schemastore.org/package.json; what they $ref is fetched too" style="flex:1 1 280px"></textarea>
+      </div>
+      <div id="siFetchNote" class="note">Asking the core whether it fetches URLs&hellip;</div>
+      <div class="row">
+        <label for="siFileIn">Files</label>
+        <input id="siFileIn" type="file" multiple accept=".json,application/json,application/schema+json">
+        <div id="siDrop" class="drop" tabindex="0">drop schema files here</div>
+      </div>
+      <div class="row">
+        <input id="siPasteName" class="mono" placeholder="file name, e.g. address.json" autocomplete="off" spellcheck="false" style="flex:0 1 220px" aria-label="name of the pasted schema">
+        <textarea id="siPaste" class="code" rows="3" spellcheck="false" placeholder="or paste a schema here. A $ref to another file is resolved against the names of the files above (address.json, ./defs/address.json#/$defs/zip)" style="flex:1 1 280px"></textarea>
+        <button id="siPasteAdd" class="tiny">Add pasted</button>
+      </div>
+      <div id="siFiles" class="chips"></div>
+      <div class="row">
+        <label for="siName">Root name</label>
+        <input id="siName" class="mono" placeholder="optional; default: from the file or URL name (one source only)" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="row">
+        <button id="siPlan" class="primary" title="POST /playground/schema-import/plan: fetches and converts, writes nothing">Plan</button>
+        <button id="siImport" title="POST /ns/{ns}/batch with your own grant: the plan's writes in one atomic batch" disabled>Import</button>
+        <span id="siStatus" class="muted">Give URLs and/or files, then Plan.</span>
+      </div>
+    </div>
+
+    <div class="card wide" id="siPlanCard" hidden>
+      <header><h2>Plan</h2><span id="siPlanMeta" class="muted small"></span></header>
+      <div id="siNotes"></div>
+      <div class="scroll"><table id="siTbl"><thead><tr><th>source</th><th>resource</th><th>action</th><th>revision path</th><th></th></tr></thead><tbody></tbody></table></div>
+      <div id="siViewBox" hidden>
+        <div class="row"><b id="siViewName" class="mono"></b><button id="siViewClose" class="tiny">Close</button></div>
+        <pre id="siView" class="json"></pre>
+      </div>
+      <p class="note">Every <code>$ref</code> between the documents is rewritten to the immutable revision path of its target. Import writes the plan from this browser with your own grant: <code>If-None-Match: *</code> for a create, <code>If-Match: head</code> for an append.</p>
+    </div>
+
+    <div class="card wide" id="siResultCard" hidden>
+      <header><h2>Use the schema</h2><span id="siResultMeta" class="muted small"></span></header>
+      <div id="siResult"></div>
     </div>
   </section>
 

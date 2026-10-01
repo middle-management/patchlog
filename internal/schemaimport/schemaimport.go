@@ -56,6 +56,13 @@ type Options struct {
 	// HTTPClient fetches http(s) sources (default: a client using the
 	// environment's proxy settings).
 	HTTPClient *http.Client
+	// Files supplies documents in memory, by name: sources and the targets
+	// of relative references between them are looked up here, at the
+	// virtual location FileURL(name). Use FileURL(name).String() as the source.
+	Files map[string][]byte
+	// NoDisk refuses local files that aren't in Files (a server must not
+	// read its own disk for a caller).
+	NoDisk bool
 }
 
 // Actions of a Resource.
@@ -767,11 +774,11 @@ func compile(res *Result) error {
 
 // --- writing ----------------------------------------------------------------
 
-// Write writes the planned resources: in one atomic batch (§7.5) when within
-// the namespace's batch limits, else in dependency-ordered batches. It checks
-// that every revision got the predicted id.
-func (r *Result) Write(ctx context.Context, c *client.Client) error {
-	maxItems, maxBytes := batchLimits(ctx, c, r.NS)
+// Chunks splits the resources that need writing into dependency-ordered
+// groups that each fit one batch of at most maxItems items and about
+// maxBytes bytes (§6.6). A plan within the limits is one group, one atomic
+// batch (§7.5).
+func (r *Result) Chunks(maxItems, maxBytes int) [][]*Resource {
 	var chunks [][]*Resource
 	var cur []*Resource
 	var size int
@@ -790,16 +797,40 @@ func (r *Result) Write(ctx context.Context, c *client.Client) error {
 	if len(cur) > 0 {
 		chunks = append(chunks, cur)
 	}
-	for _, ch := range chunks {
+	return chunks
+}
+
+// Item is the batch item that writes the resource.
+func (res *Resource) Item() client.BatchItem {
+	it := client.BatchItem{Resource: res.Name, Steps: []client.Step{client.PatchStep(res.Patches)}}
+	if res.Action == Create {
+		it.IfNoneMatch = true
+	} else {
+		it.IfMatch = res.Parent
+	}
+	return it
+}
+
+// WireItem is the item as it goes in the body of POST /ns/{ns}/batch (§7.5).
+func (res *Resource) WireItem() map[string]any {
+	m := map[string]any{"resource": res.Name, "steps": []any{res.Patches}}
+	if res.Action == Create {
+		m["ifNoneMatch"] = "*"
+	} else {
+		m["ifMatch"] = res.Parent
+	}
+	return m
+}
+
+// Write writes the planned resources: in one atomic batch (§7.5) when within
+// the namespace's batch limits, else in dependency-ordered batches. It checks
+// that every revision got the predicted id.
+func (r *Result) Write(ctx context.Context, c *client.Client) error {
+	maxItems, maxBytes := BatchLimits(ctx, c, r.NS)
+	for _, ch := range r.Chunks(maxItems, maxBytes) {
 		var b client.BatchRequest
 		for _, res := range ch {
-			it := client.BatchItem{Resource: res.Name, Steps: []client.Step{client.PatchStep(res.Patches)}}
-			if res.Action == Create {
-				it.IfNoneMatch = true
-			} else {
-				it.IfMatch = res.Parent
-			}
-			b.Items = append(b.Items, it)
+			b.Items = append(b.Items, res.Item())
 		}
 		out, err := c.Batch(ctx, r.NS, b, false)
 		if err != nil {
@@ -828,9 +859,9 @@ func describe(err error) error {
 	return fmt.Errorf("%w: %s", err, strings.Join(parts, "; "))
 }
 
-// batchLimits reads the namespace's itemsPerBatch and batchSize (§6.6),
+// BatchLimits reads the namespace's itemsPerBatch and batchSize (§6.6),
 // falling back to the defaults.
-func batchLimits(ctx context.Context, c *client.Client, ns string) (items, bytes int) {
+func BatchLimits(ctx context.Context, c *client.Client, ns string) (items, bytes int) {
 	items, bytes = 1000, 16<<20
 	h, err := c.NSHead(ctx, ns)
 	if err != nil {
