@@ -92,6 +92,12 @@ type Options struct {
 	// the write lock and re-check (D.3). Tests use it to inject concurrent
 	// writes deterministically; it may itself write through the engine.
 	BeforeWriteLock func()
+	// LockedCheckBytes: on Postgres, a resource write or batch whose
+	// patches are smaller than this, roughly as JSON, runs its check
+	// inside its namespace's lock rather than first in a transaction of
+	// its own (D.3), saving that transaction's round trips. Zero means
+	// 16 KiB; negative, never.
+	LockedCheckBytes int
 	// BlobSweepInterval is how often pending blobs past blobGrace are
 	// deleted (§7.8, SweepBlobs), on the leader. Zero means ten minutes;
 	// negative disables it.
@@ -151,6 +157,7 @@ type Engine struct {
 	hub       *hub
 	rate      *rateLimiter
 	docs      *docCache
+	ids       idCache
 	deks      *dekCache
 	ekeys     epochKeyCache
 	cfgMu     sync.Mutex
@@ -348,6 +355,15 @@ type tx struct {
 	// deps, when set, records what a write's check phase read that a
 	// concurrent write could change (D.3 re-check).
 	deps *writeDeps
+	// rateDrawn, when set, records that a write drew its rate-limit tokens,
+	// so a transaction run again doesn't draw them twice.
+	rateDrawn *bool
+	// memo and dirty: rows read in this transaction, and whether it has
+	// written (memo.go).
+	memo    memo
+	dirty   bool
+	ownRevs map[int64]revRow
+	revIDs  map[int64]ids.ID
 	// kids maps an author written in this transaction to the key that
 	// signed its grant's root block (actorID), recorded with namespace
 	// entries (§F.3).
@@ -563,9 +579,13 @@ func (t *tx) must(err error) {
 // read transaction (a write's check phase, a dry run) never writes: an
 // unknown author is -1, which matches no row.
 func (t *tx) authorID(name string) int64 {
+	if v, ok := t.e.ids.authors.Load(name); ok {
+		return v.(int64)
+	}
 	var id int64
 	err := t.QueryRow(`SELECT author FROM authors WHERE name = ?`, name).Scan(&id)
 	if err == nil {
+		t.learnAuthor(name, id)
 		return id
 	}
 	if !t.write {
@@ -576,6 +596,7 @@ func (t *tx) authorID(name string) int64 {
 	}
 	// Authors are shared by all namespaces: a concurrent writer on
 	// Postgres may insert the same one first.
+	t.wrote()
 	err = t.QueryRow(`INSERT INTO authors (name) VALUES (?) ON CONFLICT DO NOTHING RETURNING author`, name).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		err = t.QueryRow(`SELECT author FROM authors WHERE name = ?`, name).Scan(&id)
@@ -585,8 +606,12 @@ func (t *tx) authorID(name string) int64 {
 }
 
 func (t *tx) authorName(id int64) string {
+	if v, ok := t.e.ids.authorNames.Load(id); ok {
+		return v.(string)
+	}
 	var s string
 	t.must(t.QueryRow(`SELECT name FROM authors WHERE author = ?`, id).Scan(&s))
+	t.learnAuthor(s, id)
 	return s
 }
 
@@ -643,11 +668,18 @@ func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 	if t.locking() {
 		// The lock first, then the row as of the lock.
 		var id int64
-		err := t.QueryRow(`SELECT ns FROM namespaces WHERE name = ?`, name).Scan(&id)
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil
+		if v, ok := t.e.ids.nss.Load(name); ok {
+			id = v.(int64)
+		} else {
+			err := t.QueryRow(`SELECT ns FROM namespaces WHERE name = ?`, name).Scan(&id)
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil
+			}
+			t.must(err)
+			if !t.dirty {
+				t.e.ids.nss.Store(name, id)
+			}
 		}
-		t.must(err)
 		t.lockNS(id, mode)
 	}
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE name = ?`, name))
@@ -722,11 +754,18 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 		// The chain is appended to under the namespace's exclusive lock,
 		// at its head as of that lock (pglock.go).
 		t.lockNS(n.id, lockExclusive)
-		t.must(t.QueryRow(`SELECT head_seq FROM namespaces WHERE ns = ?`, n.id).Scan(&n.headSeq))
 	}
 	var prev *ids.ID
 	var prevSeq any
-	if n.headSeq.Valid {
+	if t.locking() {
+		var b []byte
+		t.must(t.QueryRow(`SELECT n.head_seq, l.id FROM namespaces n LEFT JOIN ns_log l ON l.seq = n.head_seq WHERE n.ns = ?`, n.id).Scan(&n.headSeq, &b))
+		if n.headSeq.Valid {
+			p := ids.FromBytes(b)
+			prev = &p
+			prevSeq = n.headSeq.Int64
+		}
+	} else if n.headSeq.Valid {
 		p := t.nsLogID(n.headSeq.Int64)
 		prev = &p
 		prevSeq = n.headSeq.Int64

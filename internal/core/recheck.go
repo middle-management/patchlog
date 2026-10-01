@@ -1,6 +1,7 @@
 package core
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -148,6 +149,12 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 // writeOptimistic runs a resource write or a batch without a config change
 // on the D.3 write path: check outside the lock, re-check and insert inside.
 func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item, source any, isBatch bool) (*WriteResult, error) {
+	if e.pg && e.opt.LockedCheckBytes >= 0 && smallWrite(items, cmp.Or(e.opt.LockedCheckBytes, 16<<10)) {
+		// On Postgres the write lock is the namespace's alone, and the
+		// check's own transaction costs a dozen round trips, more than
+		// checking a small write takes: check it inside the lock.
+		return e.writeLocked(ctx, req, items, source, isBatch, false)
+	}
 	rateDrawn := false
 	for attempt := 0; attempt < optimisticAttempts; attempt++ {
 		var plan *writePlan
@@ -198,8 +205,16 @@ func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item,
 		}
 	}
 	// Still contended: run the whole gate inside the write lock.
+	return e.writeLocked(ctx, req, items, source, isBatch, rateDrawn)
+}
+
+// writeLocked runs a write's whole gate inside the write lock.
+func (e *Engine) writeLocked(ctx context.Context, req Request, items []Item, source any, isBatch, rateDrawn bool) (*WriteResult, error) {
 	var res *WriteResult
 	err := e.update(ctx, func(t *tx) error {
+		// A transaction that runs again (Postgres, pglock.go) doesn't draw
+		// its rate-limit tokens again.
+		t.rateDrawn = &rateDrawn
 		r, err := t.writeItems(req, items, nil, source, isBatch, false, rateDrawn)
 		res = r
 		return err
@@ -219,4 +234,45 @@ func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item,
 		return nil, err
 	}
 	return res, err
+}
+
+// smallWrite reports whether a write's patches are smaller than max,
+// judged by a rough size of their JSON. (The document they apply to may
+// still be large; checking it holds only its namespace's lock.)
+func smallWrite(items []Item, max int) bool {
+	n := 0
+	for _, it := range items {
+		for _, s := range it.Steps {
+			if n += approxSize(s.Patches, max-n); n >= max {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// approxSize approximates the length of v as JSON, stopping past max.
+func approxSize(v any, max int) int {
+	switch v := v.(type) {
+	case string:
+		return len(v) + 2
+	case map[string]any:
+		n := 2
+		for k, x := range v {
+			if n += len(k) + 4 + approxSize(x, max-n); n > max {
+				break
+			}
+		}
+		return n
+	case []any:
+		n := 2
+		for _, x := range v {
+			if n += 1 + approxSize(x, max-n); n > max {
+				break
+			}
+		}
+		return n
+	default:
+		return 8
+	}
 }

@@ -139,6 +139,7 @@ func (t *tx) held(k int32, mode lockMode) {
 	}
 	t.locks[k] = max(t.locks[k], mode)
 	t.maxKey = max(t.maxKey, k)
+	t.forget()
 }
 
 // lockAll takes several locks in ascending order: all waited for at the

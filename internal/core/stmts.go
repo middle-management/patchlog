@@ -116,6 +116,7 @@ func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
 }
 
 func (t *tx) Exec(q string, args ...any) (sql.Result, error) {
+	t.wrote()
 	if t.e.pg {
 		return t.Tx.Exec(rebind(q), pgArgs(args)...)
 	}
@@ -128,6 +129,7 @@ func (t *tx) Exec(q string, args ...any) (sql.Result, error) {
 // insert runs an INSERT … RETURNING of one integer key and returns the
 // key. Both dialects support RETURNING; Postgres has no LastInsertId.
 func (t *tx) insert(q string, args ...any) (int64, error) {
+	t.wrote()
 	var id int64
 	err := t.QueryRow(q, args...).Scan(&id)
 	return id, err

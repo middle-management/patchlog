@@ -37,7 +37,7 @@ func (h *raceHook) run() {
 }
 
 func withRaceHook(h *raceHook) envOpt {
-	return func(o *core.Options) { o.BeforeWriteLock = h.run }
+	return func(o *core.Options) { o.BeforeWriteLock, o.LockedCheckBytes = h.run, -1 }
 }
 
 // bothDBs runs a test on :memory: (one connection) and on a file database.

@@ -770,6 +770,7 @@ func TestBlobSourceAuthorization(t *testing.T) {
 func TestBlobRecheck(t *testing.T) {
 	var hook func()
 	e := newEnv(t, withBlobTuning, func(o *core.Options) {
+		o.LockedCheckBytes = -1
 		o.BeforeWriteLock = func() {
 			if h := hook; h != nil {
 				hook = nil

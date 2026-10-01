@@ -31,6 +31,10 @@ type resRow struct {
 }
 
 func (t *tx) resource(ns int64, name string) *resRow {
+	k := resKey{ns, name}
+	if r, ok := t.memo.res[k]; ok {
+		return &r
+	}
 	r := &resRow{}
 	err := t.QueryRow(`SELECT res, ns, name, head_seq, state, horizon_seq, keep FROM resources WHERE ns = ? AND name = ?`, ns, name).
 		Scan(&r.id, &r.ns, &r.name, &r.headSeq, &r.state, &r.horizonSeq, &r.keep)
@@ -38,6 +42,10 @@ func (t *tx) resource(ns int64, name string) *resRow {
 		return nil
 	}
 	t.must(err)
+	if t.memo.res == nil {
+		t.memo.res = map[resKey]resRow{}
+	}
+	t.memo.res[k] = *r
 	return r
 }
 
@@ -68,9 +76,35 @@ func scanRev(row interface{ Scan(...any) error }) (*revRow, error) {
 }
 
 func (t *tx) rev(seq int64) *revRow {
+	if r, ok := t.memo.rev[seq]; ok {
+		return &r
+	}
+	if r, ok := t.ownRevs[seq]; ok {
+		return &r
+	}
 	r, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE seq = ?`, seq))
 	t.must(err)
+	if t.memo.rev == nil {
+		t.memo.rev = map[int64]revRow{}
+	}
+	t.memo.rev[seq] = *r
+	t.knowRevID(seq, r.id)
 	return r
+}
+
+// revID returns a revision's id, which never changes once inserted.
+func (t *tx) revID(seq int64) ids.ID {
+	if id, ok := t.revIDs[seq]; ok {
+		return id
+	}
+	return t.rev(seq).id
+}
+
+func (t *tx) knowRevID(seq int64, id ids.ID) {
+	if t.revIDs == nil {
+		t.revIDs = map[int64]ids.ID{}
+	}
+	t.revIDs[seq] = id
 }
 
 // view is a resource as a namespace sees it, possibly read through from a
@@ -316,7 +350,7 @@ func (e LogEntry) value() map[string]any {
 func (t *tx) logEntry(r *revRow) LogEntry {
 	e := LogEntry{ID: r.id.String(), Author: t.authorName(r.author), Created: formatTime(r.created), row: r}
 	if r.parentSeq.Valid {
-		e.Parent = t.rev(r.parentSeq.Int64).id.String()
+		e.Parent = t.revID(r.parentSeq.Int64).String()
 	}
 	if r.kind == kindTombstone {
 		e.Kind = "tombstone"

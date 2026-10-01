@@ -311,6 +311,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	if n == nil {
 		return nil, nil, t.absentNS(req.NS, req.Cred)
 	}
+	if h := t.e.afterWriteLock; h != nil && t.write && cc == nil {
+		// The whole gate runs in the write lock (writeLocked).
+		h(n.name)
+	}
 	if n.purged {
 		return nil, nil, gone()
 	}
@@ -427,9 +431,12 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		for i, it := range items {
 			names[i] = it.Resource
 		}
-		if !rateDrawn {
+		if !rateDrawn && (t.rateDrawn == nil || !*t.rateDrawn) {
 			if err := t.rateLimit(n, cfg, a, names, len(items)); err != nil {
 				return nil, nil, err
+			}
+			if t.rateDrawn != nil {
+				*t.rateDrawn = true
 			}
 		}
 	}
@@ -1224,8 +1231,17 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 	} else {
 		res = own.id
 	}
-	var hasRows bool
-	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ?)`, res).Scan(&hasRows))
+	// A resource with a head has revisions (a purge keeps their rows).
+	hasRows := own != nil && own.headSeq.Valid
+	if own != nil && !hasRows {
+		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ?)`, res).Scan(&hasRows))
+	}
+	if _, ok := t.resLevels[res]; !ok {
+		if t.resLevels == nil {
+			t.resLevels = map[int64]int{}
+		}
+		t.resLevels[res] = t.nsLevel(n)
+	}
 	var via any
 	if len(a.principal.Via) > 0 {
 		via = string(jsonv.Canonical(jsonv.FromGo(a.principal.Via)))
@@ -1267,6 +1283,8 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 		if err != nil {
 			panic(fmt.Errorf("inserting revision: %w", err))
 		}
+		t.inserted(revRow{seq: last, res: res, id: step.id, parentSeq: anyInt(parentSeq), first: first == 1, kind: kind,
+			patches: anyStr(patches), author: author, via: anyStr(via), grantID: grantID, signature: anyStr(sig), created: t.now.UnixMilli()})
 		parentSeq = last
 		if !step.del && !step.sealed {
 			// The blobs the document references are attached with it
@@ -1324,10 +1342,9 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 // sets have accumulated since the resource's last snapshot (D.4), so no
 // read folds more than that.
 func (t *tx) maybeSnapshot(res, seq int64, doc []byte) {
-	var last int64
-	t.must(t.QueryRow(`SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?`, res).Scan(&last))
 	var count, size int64
-	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(patches)), 0) FROM revisions WHERE res = ? AND seq > ? AND kind = 0`, res, last).Scan(&count, &size))
+	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(patches)), 0) FROM revisions
+		WHERE res = ? AND kind = 0 AND seq > (SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?)`, res, res).Scan(&count, &size))
 	if count >= int64(t.e.opt.SnapshotEveryRevisions) || size >= int64(t.e.opt.SnapshotEveryBytes) {
 		_, err := t.Exec(`INSERT INTO snapshots (seq, res, doc) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc`, seq, res, t.putDoc("snapshots", res, seq, doc))
 		t.must(err)
