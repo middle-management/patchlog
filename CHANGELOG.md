@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.3.2
+
+CORS for the servers, for demos and apps on other origins.
 
 - **CORS** for `serve`, `index` and `tree`, for demos and apps on other origins:
   - `-cors-origin` (repeatable or comma-separated, or `*`) or `PATCHLOG_CORS_ORIGINS`.
