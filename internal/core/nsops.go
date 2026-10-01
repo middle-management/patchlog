@@ -706,6 +706,7 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 	}
 	// Sealed copies of its content go too (§E.2.2).
 	t.deleteSealed(`ns = ? AND name = ?`, n.id, name)
+	t.deleteBlobEpochs(`ns = ? AND name = ?`, n.id, name)
 	// A remote branch's mirrored copy is its own: it goes too, in every
 	// shadow of its base's chain (§G.3).
 	for _, sh := range t.remoteShadows(n) {
@@ -768,6 +769,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		t.deleteDEKs(`ns = ?`, n.id)
 		// Sealed bytes and epoch keys go too (§E.2, §8.5).
 		t.deleteSealed(`ns = ?`, n.id)
+		t.deleteBlobEpochs(`ns = ?`, n.id)
 		t.deleteEpochKeys(n.id)
 		_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
@@ -864,6 +866,11 @@ type PruneRequest struct {
 	// (seal.SealSnapshot), required for e2e resources and refused
 	// elsewhere (§8.6).
 	Snapshot string
+	// Blobs is the snapshot's declared blob list (§E.3.1), if the request
+	// has one: the blobs the horizon's document references. Without it the
+	// horizon revision's own declared list is taken.
+	Blobs    []string
+	HasBlobs bool
 }
 
 // PruneResult is the answer to a prune.
@@ -924,6 +931,8 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			return invalid("snapshot is only for e2e resources, whose documents the server can't compute (§8.6)")
 		case e2e && len(pr.Keep) > 0:
 			return invalid("keep is not supported for e2e resources: the server can't keep documents it can't compute (protect revisions with retention or a lower horizon)")
+		case !e2e && pr.HasBlobs:
+			return invalid("blobs is only for e2e resources: it is the declared blob list of the snapshot (§E.3.1)")
 		case e2e && pr.Snapshot == "":
 			return invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
 		}
@@ -969,7 +978,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		var res *PruneResult
 		var perr error
 		if e2e {
-			res, perr = t.pruneToE2E(n, cfg, name, v.own, h, hid, pr.Snapshot, dest, t.actorID(a))
+			res, perr = t.pruneToE2E(n, cfg, name, v.own, h, hid, pr, dest, t.actorID(a))
 		} else {
 			res, perr = t.pruneTo(n, name, v.own, h, keep, pr.Keep, dest, hasArchive, t.actorID(a))
 		}
@@ -1087,6 +1096,11 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 	for seq := range preserve {
 		kept = append(kept, seq)
 	}
+	var epochs map[ids.ID]map[int]bool
+	if t.isSealedNS(n) {
+		// The epochs each blob is served under, before (§E.2.2).
+		epochs = t.resourceBlobEpochs(n, own)
+	}
 	t.pruneBlobs(own.id, h.seq, kept)
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
@@ -1115,6 +1129,9 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 	keepJSON := string(jsonv.Canonical(anyStrings(keepStrs)))
 	_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = ? WHERE res = ?`, h.seq, keepJSON, own.id)
 	t.must(err)
+	if epochs != nil {
+		t.pruneBlobEpochs(n, name, own.id, epochs)
+	}
 	target := h.seq
 	_, nsID := t.appendNS(n, map[string]any{"resource": name, "kind": "prune", "target": h.id.String()}, &own.id, &target, n.configSeq, author)
 	res.NSID = nsID.String()

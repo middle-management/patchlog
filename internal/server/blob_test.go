@@ -618,22 +618,6 @@ func TestBlobE2EType(t *testing.T) {
 	expect(t, e.copyBlob("e", "a", bid, blobPath("pub", "a", bid), ""), 415)
 }
 
-// §E.2.2: sealed namespaces serve nothing until the sealed form exists.
-func TestBlobSealedNotServed(t *testing.T) {
-	e := newSealedEnv(t)
-	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
-	data := []byte("secret blob")
-	nonce := seal.NewNonce()
-	r, bid := e.putBlob("s", "a", "text/plain", nonce, data)
-	expect(t, r, 201)
-	expect(t, e.write("PATCH", "s", "a", "", withNonce(addRoot(map[string]any{"b": ref(bid, "text/plain", len(data), nonce)}))), 201)
-	g := e.get(blobPath("s", "a", bid))
-	expect(t, g, 501)
-	if strings.Contains(string(g.Body), string(data)) {
-		t.Fatal("plaintext served")
-	}
-}
-
 // §E.1: blob bytes of encrypted namespaces are encrypted at rest, under
 // each resource's key; a purge leaves nothing recoverable.
 func TestBlobAtRest(t *testing.T) {

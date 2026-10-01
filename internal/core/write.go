@@ -144,6 +144,11 @@ type stepState struct {
 	// blobs are the blobs the resulting document references, with where
 	// each is available from (step 4, §7.8), for step 7 to attach.
 	blobs map[ids.ID]*blobRow
+	// declared is a sealed step's declared blob list (§E.3.1), in the order
+	// sent; keepsList marks a sealed restore with [], which keeps the list
+	// of the last live document instead.
+	declared  []ids.ID
+	keepsList bool
 }
 
 type itemState struct {
@@ -1021,7 +1026,12 @@ func checkLimits(l Limits, s *itemState) *Error {
 			return limitErr(422, "document nested too deeply")
 		}
 		if step.sealed {
-			continue // e2e: clients check the limits on documents (§E.3.2)
+			// e2e: clients check the limits on documents (§E.3.2); the
+			// server checks blobsPerDocument on the declared list (§E.3.1).
+			if len(step.declared) > l.BlobsPerDocument {
+				return limitErr(422, fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
+			}
+			continue
 		}
 		if err := checkValuesAndPaths(l, step.doc); err != nil {
 			return err
@@ -1268,14 +1278,12 @@ func (t *tx) insertItem(n *nsRow, s *itemState, a *actor, author int64, grantID 
 			panic(fmt.Errorf("inserting revision: %w", err))
 		}
 		parentSeq = last
-		if !step.del && !step.sealed {
+		if !step.del {
 			// The blobs the document references are attached with it
-			// (§7.8, step 7).
+			// (§7.8, step 7); a sealed step's are those its op declares,
+			// or for a restore with [] the last live document's (§E.3.1).
 			t.attachStep(res, step, last)
 		}
-		// TODO(blobs-e2e): a sealed step attaches the blobs its op declares
-		// (§E.3.1), and records them in blob_refs for pruning and archives;
-		// a restore with [] keeps the last live document's list.
 		if cfg := t.config(n.configSeq); cfg.level == levelSealed {
 			// The epoch that seals this entry forever (§E.2.1).
 			_, err := t.Exec(`INSERT INTO rev_epochs (seq, epoch) VALUES (?, ?)`, last, cfg.Epoch)

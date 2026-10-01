@@ -16,6 +16,8 @@ package core
 //     a kept document still needs), branch read-through and batch sources
 //     (whether a document in the history as seen references a blob) and
 //     archives (which blobs an archived range references) read it.
+//   - blob_epochs: in sealed namespaces, each blob's sealing per epoch,
+//     stored once (sealedblobs.go, §E.2.2).
 //   - blob_bytes: the bytes, by (owner, sha256). D.2 puts bytes outside the
 //     database; storing them in a table keeps one backend for both
 //     dialects, encryption at rest and transactional garbage collection.
@@ -320,11 +322,26 @@ func (t *tx) sourceReadable(n *nsRow, name string, req Request) bool {
 func (t *tx) checkBlobs(n *nsRow, s *itemState, a *actor, bs *batchSource) *Error {
 	cutoff := t.blobCutoff(t.config(n.configSeq))
 	uploader := uploaderOf(a)
+	var lastLive []ids.ID // at E3, the last live document's declared list
+	known := s.parent == nil
 	for _, step := range s.steps {
 		step.blobs = nil
-		if step.del || step.sealed {
-			// TODO(blobs-e2e): at E3 step 4 checks the blobs the sealed op
-			// declares (§E.3.1) instead; the next agent implements it.
+		if step.del {
+			continue
+		}
+		if step.sealed {
+			// E3: the blobs the sealed op declares, in plaintext (§E.3.1).
+			list := step.declared
+			if step.keepsList {
+				if !known {
+					lastLive = t.declaredAt(t.lastLive(s.parent))
+				}
+				list = lastLive
+			}
+			lastLive, known = list, true
+			if err := t.checkDeclared(n, s, step, list, uploader, cutoff, bs); err != nil {
+				return err
+			}
 			continue
 		}
 		refs := blobRefsOf(step.doc)
@@ -1018,9 +1035,12 @@ func (t *tx) servableBlob(n *nsRow, name string, bid ids.ID) blobAnswer {
 	return blobAnswer{status: 404}
 }
 
-// Blob is the answer of GET /r/{ns}/{name}/blob/{bid}.
+// Blob is the answer of GET /r/{ns}/{name}/blob/{bid}, or in a sealed
+// namespace of …/blob/{bid}/e/{e} (ReadSealedBlob).
 type Blob struct {
-	Status  int // 200, 404, 410; 501 in sealed namespaces (not served yet)
+	Status  int // 200, 404, 410; in sealed namespaces 302 to Epoch
+	Epoch   int // the epoch a sealed namespace's 302 names (§E.2.2)
+	NoStore bool
 	Type    string
 	Data    []byte
 	Code    string // "pruned" for a 410 whose attachment pruning ended
@@ -1055,12 +1075,9 @@ func (e *Engine) ReadBlob(ctx context.Context, ns, name, bidText string, cred Cr
 			return nil
 		}
 		if t.isSealedNS(n) {
-			// TODO(blobs-sealed): sealed namespaces answer 302 to
-			// …/blob/{bid}/e/{e} with the blob in the binary sealed form,
-			// sealed once per epoch and stored (§E.2.2); the next agent
-			// implements it. Until then nothing is served, least of all the
-			// plaintext.
-			out.Status = 501
+			// Sealed namespaces never serve the plaintext: 302 to the blob
+			// sealed under an epoch (§E.2.2, sealedblobs.go).
+			t.sealedBlobHead(n, name, bid, out)
 			return nil
 		}
 		out.Type, out.Data = ans.row.typ, t.readBytes(ans.row.owner, ans.row.hash)

@@ -227,6 +227,20 @@ CREATE TABLE IF NOT EXISTS blob_bytes (
   data     BLOB    NOT NULL,
   UNIQUE (owner, hash)
 );
+-- The sealed form of a blob per epoch it is served under (§E.2.2, D.2's
+-- blob_epochs), stored once and served forever. Keyed like sealed: ns is
+-- the serving namespace (a branch seals read-through blobs under its own
+-- keys) and name the resource. data is NULL once pruning removed every
+-- revision of the epoch that references the blob (410).
+CREATE TABLE IF NOT EXISTS blob_epochs (
+  ns       INTEGER NOT NULL,
+  name     TEXT    NOT NULL,
+  bid      BLOB    NOT NULL,
+  epoch    INTEGER NOT NULL,
+  data     BLOB,
+  created  INTEGER NOT NULL,
+  PRIMARY KEY (ns, name, bid, epoch)
+) WITHOUT ROWID;
 
 -- Addition: remote branches registered with this deployment (§G.3, source
 -- side). One row per (base namespace, remote); ns_seq is the latest remote

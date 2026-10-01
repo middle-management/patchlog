@@ -211,6 +211,15 @@ CREATE TABLE IF NOT EXISTS blob_bytes (
   data     bytea  NOT NULL,
   UNIQUE (owner, hash)
 );
+CREATE TABLE IF NOT EXISTS blob_epochs (
+  ns       bigint NOT NULL,
+  name     text   NOT NULL,
+  bid      bytea  NOT NULL CHECK (octet_length(bid) = 20),
+  epoch    bigint NOT NULL,
+  data     bytea,
+  created  bigint NOT NULL,
+  PRIMARY KEY (ns, name, bid, epoch)
+);
 
 CREATE TABLE IF NOT EXISTS remote_branches (
   ns         bigint NOT NULL REFERENCES namespaces,
