@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## v0.3.3
+
+CORS fixes: dev-mode writes and resumed blob downloads from other origins.
 
 - **CORS:** `X-Author` (the author under `serve -dev`) and `If-Range` are allowed in requests, and `X-E2E` is exposed in responses.
 
