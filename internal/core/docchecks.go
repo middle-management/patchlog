@@ -162,10 +162,7 @@ func checkBlobRef(m map[string]any, id, ptr string) *Error {
 			return blobErr(ptr, "a blob reference's nonce must be 26 base32 characters")
 		}
 	}
-	// TODO(blobs): availability (§7.8) is checked here, at step 4: the blob
-	// must be attached to this resource, pending for this uploader, or
-	// readable through a base or a batch source, and match its type, size
-	// and nonce (422, code "blob"). Until blobs exist, a well-formed
-	// reference to an unknown blob is accepted.
+	// Availability (§7.8), also at step 4, needs the store: checkBlobs
+	// (blobs.go) runs right after the limits.
 	return nil
 }
