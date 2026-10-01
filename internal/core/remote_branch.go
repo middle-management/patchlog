@@ -1064,6 +1064,12 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		lastLive = ll.seq
 	}
 	state := stateLive
+	var declared [][]ids.ID
+	if ch.opaque {
+		var err error
+		declared, err = ch.declaredLists()
+		t.must(err) // verified before the transaction (fetchBlobs)
+	}
 	err := ch.fold(func(i int, e client.LogEntry, doc any) error {
 		if i < from {
 			return nil
@@ -1108,7 +1114,10 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		}
 		state = stateLive
 		if ch.opaque {
-			return nil // e2e content has no documents on the server (§E.3)
+			// e2e content has no documents on the server (§E.3); its blobs
+			// are those the sealed op declares (§E.3.1).
+			t.attachFetched(res, ch, declared[i], last)
+			return nil
 		}
 		lastLive, lastLiveDoc = last, canonDoc
 		t.attachMirrored(res, ch, doc, last)

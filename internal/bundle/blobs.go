@@ -18,6 +18,13 @@ import (
 //     (the target has them). The bytes are read from the source's
 //     /r/{ns}/{name}/blob/{bid}, which serves a branch's read-through blobs
 //     too, and checked against the id with the reference's type and nonce.
+//     A sealed (E2) source never serves a blob's plaintext: its /blob/{bid}
+//     answers 302 to the blob sealed under an epoch (§E.2.2), which the
+//     client follows and opens with its keys, checking the plaintext
+//     against the reference (client.GetBlobRef). The blob line carries the
+//     plaintext, like every line of a sealed namespace (§G.5: E2), and a
+//     sealed bundle seals it like any other line (§G.5.1.1). An e2e source
+//     serves the writer's ciphertext, which the line carries verbatim.
 //   - References are found by walking the documents (§7.8), schema
 //     documents excepted. At E3 the documents are ciphertext and the
 //     sealed op declares the blobs in plaintext (§E.3.1): a revision's
@@ -47,9 +54,12 @@ import (
 // SealedBlobType is the media type of an e2e namespace's blobs (§E.3.1).
 const SealedBlobType = "application/vnd.patchlog.sealed-blob"
 
-// blobRef is a blob reference in a document (§7.8).
+// blobRef is a blob reference in a document (§7.8). size is the
+// reference's, which a sealed source's blobs are checked against (§E.2.2);
+// a declared e2e blob has none (0).
 type blobRef struct {
 	bid, typ, nonce string
+	size            int
 }
 
 // docBlobs lists the blob references of a document, in document order,
@@ -85,6 +95,9 @@ func walkBlobs(v any, fn func(blobRef)) {
 				r.typ, _ = x["type"].(string)
 				r.typ = normType(r.typ)
 				r.nonce, _ = x["nonce"].(string)
+				if f, ok := x["size"].(float64); ok {
+					r.size = int(f)
+				}
 				fn(r)
 			}
 			return
