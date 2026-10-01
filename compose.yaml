@@ -25,11 +25,23 @@
 #
 # Data (databases, blob files, archives, the at-rest master key) lives in
 # the `data` volume; `docker compose down -v` wipes it.
+#
+# Health and shutdown: the core, index and tree answer GET /_health (200
+# while serving, 503 once shutdown starts) and /_ready. Their healthchecks
+# run `patchlog health`, so the image needs no curl or wget. On `docker
+# compose stop` / `down` they drain: long-polls and event streams end at
+# once, other requests get up to -shutdown-timeout (20s) before they are
+# cancelled and roll back, and stop_grace_period (30s) leaves room for that
+# plus the engine's and the CDN purger's own shutdown before Docker kills
+# the process.
 
 x-patchlog: &patchlog
   build: .
   image: patchlog:dev
   restart: unless-stopped
+  # Longer than -shutdown-timeout (+ -shutdown-delay), so a graceful
+  # shutdown isn't cut short by SIGKILL.
+  stop_grace_period: 30s
   volumes:
     - data:/data
   environment:
@@ -64,12 +76,18 @@ services:
       # starts last; purges sent before it is up are logged and dropped,
       # which is harmless: nothing is cached yet.
       - -purge-url=http://cdn:8080/
+      # Graceful shutdown: in-flight requests get 20s, under the 30s
+      # stop_grace_period. With a load balancer in front of several
+      # instances, add e.g. -shutdown-delay=5s so it sees /_health go 503
+      # before the listener closes (one instance behind the CDN gains
+      # nothing from it).
+      - -shutdown-timeout=20s
     ports:
       - "${CORE_DIRECT_PORT:-9080}:8080"
     healthcheck:
-      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/"]
+      test: ["CMD", "patchlog", "health", "http://localhost:8080/_health"]
       interval: 2s
-      timeout: 2s
+      timeout: 3s
       retries: 30
 
   # One-shot: creates the demo namespaces (among them two catalogs, cat as a
@@ -88,9 +106,14 @@ services:
   # The services follow the core directly, not through the CDN.
   index:
     <<: *patchlog
-    command: [index, -api=http://patchlog:8080, -ns=demo, -branches, -db=/data/index.db, -addr=:8081, -purge-url=http://cdn:8080/]
+    command: [index, -api=http://patchlog:8080, -ns=demo, -branches, -db=/data/index.db, -addr=:8081, -purge-url=http://cdn:8080/, -shutdown-timeout=20s]
     ports:
       - "${INDEX_DIRECT_PORT:-9081}:8081"
+    healthcheck:
+      test: ["CMD", "patchlog", "health", "http://localhost:8081/_health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -99,9 +122,14 @@ services:
   # database (tree-cat.db, tree-topics.db).
   tree:
     <<: *patchlog
-    command: [tree, -api=http://patchlog:8080, -catalog=cat, -catalog=topics, "-db=/data/tree-{catalog}.db", -addr=:8082, -purge-url=http://cdn:8080/]
+    command: [tree, -api=http://patchlog:8080, -catalog=cat, -catalog=topics, "-db=/data/tree-{catalog}.db", -addr=:8082, -purge-url=http://cdn:8080/, -shutdown-timeout=20s]
     ports:
       - "${TREE_DIRECT_PORT:-9082}:8082"
+    healthcheck:
+      test: ["CMD", "patchlog", "health", "http://localhost:8082/_health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
     depends_on:
       seed:
         condition: service_completed_successfully
@@ -115,8 +143,9 @@ services:
 
   # The local CDN: one varnishd with a listener per origin (the VCL picks
   # the backend by listener name). It resolves the origins' host names when
-  # it loads the VCL, so it starts after their containers exist; if one is
-  # recreated with a new address, `docker compose restart cdn`.
+  # it loads the VCL, so it starts once they are up and healthy; if one is
+  # recreated with a new address, `docker compose restart cdn`. Its backend
+  # probes read /_health too, so a draining origin leaves rotation.
   cdn:
     image: ${VARNISH_IMAGE:-varnish:7.7}
     restart: unless-stopped
@@ -147,9 +176,9 @@ services:
       patchlog:
         condition: service_healthy
       index:
-        condition: service_started
+        condition: service_healthy
       tree:
-        condition: service_started
+        condition: service_healthy
 
 volumes:
   data:
