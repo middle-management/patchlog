@@ -130,7 +130,7 @@ func TestFreeze(t *testing.T) {
 	expectCode(t, e.write("PATCH", "main", "a", hashID(t, "", nil), []any{}), 409, "frozen")
 	// Still allowed: reads, config, branches, purge, prune.
 	expect(t, e.get("/r/main/a"), 302)
-	expect(t, e.patchNS("main", ops(op("add", "/title", "t")), ""), 201)
+	expect(t, e.patchNS("main", ops(op("add", "/x-title", "t")), ""), 201)
 	expect(t, e.branch("main", map[string]any{"name": "fb"}, "alice"), 201)
 	r = e.do(req{method: "POST", path: "/r/main/a/prune", body: map[string]any{"horizon": a}, author: "admin"})
 	expect(t, r, 200)

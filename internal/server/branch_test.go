@@ -19,7 +19,7 @@ func (e *tenv) branch(base string, body map[string]any, who string) *resp {
 // §7.6 branches: creation, read-through, first writes, config copy, listings.
 func TestBranches(t *testing.T) {
 	e := newEnv(t)
-	e.mkNS("main", map[string]any{"read": "public", "title": "Main"})
+	e.mkNS("main", map[string]any{"read": "public", "x-title": "Main"})
 	a1 := e.create("main", "a", map[string]any{"v": 1.0})
 	a2 := e.appendRev("main", "a", a1, ops(op("replace", "/v", 2.0)))
 	b1 := e.create("main", "b", map[string]any{"b": true})
@@ -34,7 +34,7 @@ func TestBranches(t *testing.T) {
 	e.create("main", "c", map[string]any{})
 	e.del("main", "b", b1)
 	e.appendRev("main", "d", dt, []any{})
-	expect(t, e.patchNS("main", ops(op("replace", "/title", "Main2")), ""), 201)
+	expect(t, e.patchNS("main", ops(op("replace", "/x-title", "Main2")), ""), 201)
 
 	// 428 without If-None-Match; 422 for an at not in the chain; 400 for a bad name.
 	expect(t, e.do(req{method: "POST", path: "/ns/main/branches", body: map[string]any{"name": "rel"}, author: "alice"}), 428)
@@ -42,7 +42,7 @@ func TestBranches(t *testing.T) {
 	expect(t, e.branch("main", map[string]any{"name": "Rel", "at": at}, "alice"), 400)
 	expect(t, e.branch("nope", map[string]any{"name": "rel"}, "alice"), 404)
 
-	body := map[string]any{"name": "rel", "at": at, "patches": ops(op("add", "/branchNote", "x"))}
+	body := map[string]any{"name": "rel", "at": at, "patches": ops(op("add", "/x-branchNote", "x"))}
 	before := e.nsHead("main")
 	r := e.branch("main", body, "alice")
 	expect(t, r, 201)
@@ -53,7 +53,7 @@ func TestBranches(t *testing.T) {
 	br := e.get("/ns/rel/rev/" + e.nsHead("rel"))
 	expect(t, br, 200)
 	doc := br.Obj()
-	wantDoc := map[string]any{"read": "public", "title": "Main2", "frozen": nil, "base": map[string]any{"ns": "main", "at": at}, "branchNote": "x"}
+	wantDoc := map[string]any{"read": "public", "x-title": "Main2", "frozen": nil, "base": map[string]any{"ns": "main", "at": at}, "x-branchNote": "x"}
 	delete(wantDoc, "frozen")
 	// The base had frozen: false at creation; it is removed.
 	if string(canonical(doc)) != string(canonical(wantDoc)) {

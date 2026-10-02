@@ -150,7 +150,7 @@ func TestPGParallelNamespaces(t *testing.T) {
 	go func() {
 		r := who
 		r.NS = "n1"
-		_, err := b.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg1, Patches: []any{map[string]any{"op": "add", "path": "/title", "value": "t"}}})
+		_, err := b.WriteConfig(context.Background(), r, ConfigChange{IfMatch: cfg1, Patches: []any{map[string]any{"op": "add", "path": "/x-title", "value": "t"}}})
 		cfg <- err
 	}()
 	select {

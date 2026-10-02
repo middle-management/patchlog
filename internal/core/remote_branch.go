@@ -538,7 +538,9 @@ func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr 
 	if ferr != nil {
 		return ferr
 	}
-	lv.enc = enc
+	if lv.enc, ferr = shadowEncryption(lv.ns, enc); ferr != nil {
+		return ferr
+	}
 	seen := map[int]bool{}
 	for _, en := range lv.log {
 		isConfig := en.Kind == "config"
@@ -558,6 +560,24 @@ func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr 
 		}
 	}
 	return nil
+}
+
+// shadowEncryption is what a shadow keeps of an e2e level's encryption
+// member (§G.3): the members this version defines, which its keyring relay
+// reads. The shadow's document is stored here and read under this
+// deployment's schema (§7.4), so members a base of a newer version may
+// carry are left out rather than stored, and the ones kept must be valid.
+func shadowEncryption(ns string, enc map[string]any) (map[string]any, *Error) {
+	out := map[string]any{}
+	for _, k := range []string{"level", "epoch", "historyEpochs", "pad"} {
+		if v, ok := enc[k]; ok {
+			out[k] = v
+		}
+	}
+	if _, err := parseConfig(map[string]any{"encryption": out}, DefaultLimits(), DefaultLimits()); err != nil {
+		return nil, unverified("/ns/%s: the base's encryption member: %v", ns, err)
+	}
+	return out, nil
 }
 
 // fetchRemote fetches and verifies the base of a remote branch as of at
@@ -785,13 +805,9 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	if err != nil {
 		return nil, nil, nil, patchErr(err)
 	}
-	cfg, perr := t.e.parseConfig(doc)
+	cfg, perr := t.e.newConfig(doc, nil)
 	if perr != nil {
-		var le *limitError
-		if errors.As(perr, &le) {
-			return nil, nil, nil, limitErr(422, le.msg)
-		}
-		return nil, nil, nil, invalid(perr.Error())
+		return nil, nil, nil, perr
 	}
 	if aerr := t.e.checkArchives(cfg); aerr != nil {
 		return nil, nil, nil, aerr

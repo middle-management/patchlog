@@ -18,7 +18,7 @@ and serves immutable, CDN-cacheable revisions.
 | Limits (configurable, deployment maximums) and token-bucket rate limits | §6.6 | ✅ |
 | Reads, writes, gate order, `412`/`428`, idempotent retry | §6.2, §7.1–§7.2 | ✅ |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
-| Namespace documents, log, `/heads`, `/branches` | §7.4 | ✅ |
+| Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads`, `/branches` | §7.4 | ✅ |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
@@ -1503,6 +1503,26 @@ just doesn't apply).
   (§3.3). Head snapshots are kept only for documents up to 16 KiB. An intermediate snapshot is
   written after every 100 revisions or 64 KiB of patch sets, so every read folds from the nearest
   snapshot and never folds more than that (D.4).
+- **Namespace-document members** (§7.4). A namespace document may hold only the members the
+  spec defines: `read`, `keys`, `roles`, `revoked`, `rules`, `limits`, `allowances`,
+  `retention`, `encryption`, `maxLag`, `base`, `frozen`, `successor` and `drafts`, Addendum B's
+  `catalog` and `catalogs`, and Addendum F's `merge`, `merged`, `cleanup` and `abandoned`. Any
+  other member must start with `x-` (`"x-title": "Docs"`) and is stored as data. Creating a
+  namespace, a config write (in a batch too), creating a branch (the base's document plus the
+  patches) and a remote branch's genesis answer anything else with `422`, `code: "invalid"`,
+  `path` naming the member (`"/title"`) and a message saying other members must start with
+  `x-`. The addenda's members are checked in their shapes: `catalog: { trust?: [namespace
+  names], mode?: "tree" | "dag" }`, `catalogs: { <catalog>: { place?: ["group:…" | "user:…"] } }`,
+  `merged: { at: ns_id }`, `cleanup: { merged?, superseded?, abandoned? }` (ISO 8601
+  durations), `abandoned` a boolean; and `revoked` lists revocation ids. Role entries keep
+  their other fields (`move`, `place`, `includes`), which the core ignores (§C.1.1), and key
+  entries accept `x-` fields. **Upgrading:** documents stored by an earlier version are served
+  as they are. A member a write leaves unchanged, as the namespace's current document (or, for
+  a new branch, the base's) holds it, is kept, so such a namespace can still be frozen,
+  rotated, branched and merged; a write that adds or changes it gets the `422`, and a
+  `{"op":"move","from":"/title","path":"/x-title"}` renames it. Bundles carry no namespace
+  documents, so an import from an older deployment brings no such members (§G.4); a remote
+  branch's shadow keeps only the `encryption` fields this version defines of an e2e base's.
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
   batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
   principal and namespace buckets, and a key scope's lower rate) and batch limits, until the

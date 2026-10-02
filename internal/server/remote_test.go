@@ -291,7 +291,7 @@ func populateA(t *testing.T, a *tenv) aFixture {
 	a.mkNS("schemas", map[string]any{"read": "public"})
 	f.s1 = a.create("schemas", "match", matchSchema())
 	f.s2 = a.appendRev("schemas", "match", f.s1, ops(op("add", "/properties/venue", map[string]any{"type": "string"})))
-	a.mkNS("main", map[string]any{"read": "public", "title": "A's main"})
+	a.mkNS("main", map[string]any{"read": "public", "x-title": "A's main"})
 	f.d1 = a.create("main", "derby", map[string]any{"$schema": "/r/schemas/match/rev/" + f.s2, "score": "0-0"})
 	f.d2 = a.appendRev("main", "derby", f.d1, ops(op("replace", "/score", "1-0")))
 	f.o1 = a.create("main", "old", map[string]any{"$schema": "/r/schemas/match/rev/" + f.s1, "score": "2-2"})
@@ -327,11 +327,11 @@ func TestRemoteBranch(t *testing.T) {
 	expectCode(t, b.mkRemote("rel", remoteGenesis("main", hashID(t, "", nil), nil)), 422, "invalid")
 	expect(t, b.get("/ns/rel"), 404)
 
-	r := b.mkRemote("rel", remoteGenesis("main", f.at, map[string]any{"title": "B's release"}))
+	r := b.mkRemote("rel", remoteGenesis("main", f.at, map[string]any{"x-title": "B's release"}))
 	expect(t, r, 201)
 	// Its document is B's own; its log only its own config entry.
 	doc := b.get("/ns/rel/rev/" + b.nsHead("rel")).Obj()
-	if doc["title"] != "B's release" || doc["base"].(map[string]any)["origin"] != originA {
+	if doc["x-title"] != "B's release" || doc["base"].(map[string]any)["origin"] != originA {
 		t.Fatalf("remote branch document %v", doc)
 	}
 	if k := b.nsKinds("rel"); len(k) != 1 || k[0] != "config" {

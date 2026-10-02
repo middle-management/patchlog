@@ -67,7 +67,7 @@
       <header><h2>Create namespace</h2><span class="muted small">PATCH /ns/{ns} &middot; If-None-Match: *</span></header>
       <div class="row"><label for="nsNewName">Name</label><input id="nsNewName" class="mono" placeholder="matches" autocomplete="off" spellcheck="false"></div>
       <textarea id="nsNewDoc" class="code" rows="4" spellcheck="false" data-json>{"read":"public"}</textarea>
-      <div class="row"><button id="nsCreate" class="primary">Create</button><span class="note">The document becomes the genesis patch set <code>[{"op":"add","path":"","value":&hellip;}]</code>. <code>read</code> is <code>public</code> or <code>grant</code>.</span></div>
+      <div class="row"><button id="nsCreate" class="primary">Create</button><span class="note">The document becomes the genesis patch set <code>[{"op":"add","path":"","value":&hellip;}]</code>. <code>read</code> is <code>public</code> or <code>grant</code>. Members the spec doesn&rsquo;t define must start with <code>x-</code>, e.g. <code>"x-title"</code> (422 otherwise, &sect;7.4).</span></div>
     </div>
 
     <div class="card wide">
