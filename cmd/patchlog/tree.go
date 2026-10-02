@@ -18,7 +18,6 @@ import (
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grant"
-	"github.com/middle-management/patchlog/internal/release"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -70,7 +69,7 @@ func treeCmd(args []string) {
 	mergeKid := fs.String("merge-kid", "", "the merge key's kid in the catalog namespace")
 	mergeService := fs.String("merge-service", "", "the merge service's sub: merge grants are issued only to it, and name it as their root (§F.8)")
 	mergeTTL := fs.Duration("merge-ttl", 5*time.Minute, "lifetime of merge grants (capped by the merge key's maxTtl)")
-	rel := fs.String("release", "", "preview a release (§B.5, §F.9): follow the branches the release document /r/{ns}/{release} lists in place of their bases; previews only, no grants (not with -access); read when the service starts")
+	rel := fs.String("release", "", "preview a release (§B.5, §F.9): follow the branches the release document /r/{ns}/{release} lists in place of their bases; previews only, no grants (not with -access), one catalog; the document's log is followed, so a new revision (a rebase's successors) takes effect without a restart")
 	rebuild := fs.Bool("rebuild", false, "drop the database and replay from the beginning")
 	minWait := fs.Duration("min-wait", 2*time.Second, "how long ?min= waits for the service to catch up")
 	sse := fs.Bool("sse", false, "follow by server-sent events instead of long-poll")
@@ -119,18 +118,8 @@ func treeCmd(args []string) {
 		if *access {
 			log.Fatal("tree: a release preview serves previews only and issues no grants (§B.5): -release can't be combined with -access")
 		}
-		for {
-			loaded, lerr := release.Load(ctx, c, *rel)
-			if lerr == nil {
-				topt.Branches = loaded.Doc.Aliases()
-				log.Printf("patchlog tree: previewing release %s at %s: %v", loaded.Ref.Live(), loaded.Ref.Rev, topt.Branches)
-				break
-			}
-			if ctx.Err() != nil {
-				log.Fatal(lerr)
-			}
-			log.Printf("tree: reading the release document: %v; retrying", lerr)
-			time.Sleep(time.Second)
+		if len(catalogs) > 1 {
+			log.Fatal("tree: -release previews one catalog")
 		}
 	}
 
@@ -163,6 +152,14 @@ func treeCmd(args []string) {
 			svc, err = catalog.Open(ctx, copt)
 			if err == nil {
 				handler, run, closer = svc.Handler(), svc.Run, svc.Close
+			}
+		} else if *rel != "" {
+			// The release document is read now and followed afterwards
+			// (§B.5): a new revision switches the preview's branches.
+			var pv *tree.Preview
+			pv, err = tree.OpenPreview(ctx, topt, *rel)
+			if err == nil {
+				handler, run, closer = pv.Handler(), pv.Run, pv.Close
 			}
 		} else {
 			handler, run, closer, err = openTrees(ctx, topt, catalogs, *db)

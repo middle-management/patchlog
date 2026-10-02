@@ -39,7 +39,9 @@ const (
 	ccListing     = "public, max-age=86400, s-maxage=31536000, immutable"
 	ccPrivatePtr  = "private, no-cache"
 	ccPrivateList = "private, max-age=300"
-	cdnListing    = "max-age=31536000"
+	// privateListMaxAge is ccPrivateList's max-age.
+	privateListMaxAge = 300 * time.Second
+	cdnListing        = "max-age=31536000"
 )
 
 // Limits of listings.
@@ -71,6 +73,10 @@ type Visibility interface {
 	Item(g *Graph, n *Node) bool
 }
 
+// AllSubjects is the subject set segment of unfiltered listings,
+// /{catalog}/at/{at}/g/all/… (§B.11.5).
+const AllSubjects = "all"
+
 // viewer is the outcome of the read check for one request.
 type viewer struct {
 	anon       bool // no grant: the public URL space
@@ -79,6 +85,24 @@ type viewer struct {
 	catRead    func(name string) bool
 	contentAll map[string]bool
 	vis        Visibility
+	// exp, if set, is the earliest expiry of the grants an unfiltered
+	// listing was admitted with: it isn't kept past it (§B.11.5).
+	exp time.Time
+}
+
+// wide reports whether the viewer reads the catalog and every namespace of
+// nss namespace-wide (or they are public): what unfiltered listings need
+// (§B.11.5).
+func (v *viewer) wide(nss []string) bool {
+	if !v.catAll {
+		return false
+	}
+	for _, ns := range nss {
+		if !v.contentAll[ns] {
+			return false
+		}
+	}
+	return true
 }
 
 func (v *viewer) node(g *Graph, n *Node) bool {
@@ -109,14 +133,19 @@ func Bearer(r *http.Request) string {
 //     (filtered per node) one whose rules restrict /resource;
 //   - items' heads: public content namespaces, or content namespaces the
 //     same grant reads as a whole;
-//   - with a RoleView (the catalog), additionally what the reader's roles
-//     reach (§B.11.5).
+//   - with a RoleView (the catalog), listings are filtered by the reader's
+//     subject set alone (§B.11.5): what its roles make visible, under
+//     /g/{gs}/ with gs over the subjects. A reader whose grants read the
+//     catalog and every trusted content namespace as a whole (or that are
+//     public) gets unfiltered listings instead, under /g/all/, shared by
+//     every such reader, and kept no longer than the earliest of those
+//     grants. Namespace-wide reads of only some of them don't count: the
+//     listing is then the subject set's.
 //
-// Anonymous readers of a public catalog use the public URL space; a reader
-// with a grant is routed under /g/{gs}/, where gs keys everything its
-// listings depend on: its subjects (from the RoleView, or its groups) and
-// markers for how much of the catalog and which content namespaces it
-// reads as a whole.
+// Anonymous readers of a public catalog use the public URL space; without
+// a RoleView, a reader with a grant is routed under /g/{gs}/, where gs
+// keys everything its listings depend on: its groups and markers for how
+// much of the catalog and which content namespaces it reads as a whole.
 func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) {
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
@@ -151,6 +180,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 	if err != nil {
 		return nil, err
 	}
+	exp := grantExp(vg, time.Time{})
 	var markers []string
 	readsCat, _ := vg.Allows("read")
 	switch {
@@ -180,22 +210,48 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		if ok, _ := cv.Allows("read"); ok && s.checker.ReadsAll(cv) && s.checker.AllowsRead(cv, "") {
 			v.contentAll[ns] = true
 			markers = append(markers, "reads:"+real)
+			exp = grantExp(cv, exp)
 		}
 	}
-	var subjects []string
 	if s.opt.RoleView != nil {
+		if v.wide(trust) {
+			// Unfiltered (§B.11.5): namespace-wide read on the catalog and
+			// on every content namespace it trusts.
+			v.catRead, v.gs, v.exp = nil, AllSubjects, exp
+			return v, nil
+		}
+		// Filtered by the subject set alone (§B.11.5).
+		v.catAll, v.catRead = catPublic, nil
+		for ns := range v.contentAll {
+			if c, err := s.checker.Config(ctx, s.actual(ns)); err != nil || c.Read != "public" {
+				delete(v.contentAll, ns)
+			}
+		}
+		var subjects []string
 		subjects, v.vis, err = s.opt.RoleView.Resolve(ctx, vg)
 		if err != nil {
 			return nil, err
 		}
-	} else {
-		if !v.catAll && v.catRead == nil {
-			return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow reading the catalog"}
-		}
-		subjects = grantcheck.SubjectSet(vg, false)
+		v.gs = grantcheck.SubjectSetID(subjects)
+		return v, nil
 	}
+	if !v.catAll && v.catRead == nil {
+		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow reading the catalog"}
+	}
+	subjects := grantcheck.SubjectSet(vg, false)
 	v.gs = grantcheck.SubjectSetID(append(subjects, markers...))
 	return v, nil
+}
+
+// grantExp is the earlier of exp (zero: none) and the earliest expiry of
+// a verified grant's blocks.
+func grantExp(v *grant.Verified, exp time.Time) time.Time {
+	for _, b := range v.Grant.Blocks {
+		if b.Exp != nil && (exp.IsZero() || b.Exp.Before(exp)) {
+			exp = *b.Exp
+		}
+	}
+	return exp
 }
 
 // ScopeDigest digests everything a resource-restricted read decision of a
@@ -227,6 +283,15 @@ var ops = map[string]bool{
 // at is the combined checkpoint (CombinedAt). op is one of
 // children?of=&after=&limit=, ancestors?of=, subtree?of=&depth=, roots,
 // orphans, problems, where?item=, manifest?of=.
+//
+// children, ancestors, subtree, roots and where show the nodes the reader
+// may see, and only paths through visible folders, with no trace of hidden
+// nodes (no counts); limits, cut markers and pagination count visible
+// nodes only (§B.11.5). orphans, problems and manifest aren't filtered:
+// they answer 403 unless the reader reads the catalog and the content
+// namespaces they cover as a whole. A catalog service's readers with such
+// grants on the catalog and every trusted namespace are served unfiltered
+// listings under /g/all/ (§B.11.5, viewer).
 //
 // The service keeps no results: it answers 200 only at the current at,
 // and redirects every other at to the current one (§B.5 "only if it is
@@ -293,7 +358,7 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if gs != "" {
+	if gs != "" && gs != AllSubjects {
 		if _, err := ids.Parse(gs); err != nil {
 			WriteError(w, http.StatusNotFound, "not_found", "malformed subject set")
 			return
@@ -500,9 +565,16 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 }
 
 func (s *Service) setListingHeaders(w http.ResponseWriter, v *viewer, at, tags string) {
-	if v.anon {
+	switch {
+	case v.anon:
 		w.Header().Set("Cache-Control", ccListing)
-	} else {
+	case !v.exp.IsZero() && v.exp.Sub(s.opt.Now()) < privateListMaxAge:
+		// An unfiltered listing expires with the earliest grant it was
+		// admitted with (§B.11.5).
+		secs := max(int(v.exp.Sub(s.opt.Now())/time.Second), 0)
+		w.Header().Set("Cache-Control", "private, max-age="+strconv.Itoa(secs))
+		s.opt.Edge.Private(w.Header(), "max-age="+strconv.Itoa(secs))
+	default:
 		w.Header().Set("Cache-Control", ccPrivateList)
 		s.opt.Edge.Private(w.Header(), cdnListing)
 	}
@@ -547,6 +619,8 @@ func codeFor(status int) string {
 		return "bad_input"
 	case http.StatusUnprocessableEntity:
 		return "too_large"
+	case http.StatusForbidden:
+		return "forbidden"
 	}
 	return "error"
 }
@@ -956,10 +1030,14 @@ func nonNil(a []any) []any {
 	return a
 }
 
-// paths returns every walkable path from n up to a root, root first,
-// without n itself, bounded at MaxDepth and maxPaths. incomplete counts
-// paths that end below a root (at a node whose parents are all gone,
-// dangling or cyclic), deep those cut at MaxDepth.
+// paths returns every walkable path from n up to a root through nodes the
+// viewer may see, root first, without n itself, bounded at MaxDepth and
+// maxPaths. incomplete counts paths that end below a root (at a node whose
+// parents are all gone, dangling or cyclic), deep those cut at MaxDepth. A
+// path through a node the viewer may not see is left out without a trace:
+// listings show only paths through visible folders, and nothing about a
+// hidden node, not even a count (§B.11.5), so limits apply to visible
+// paths only.
 func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated bool) {
 	var stack []*Node
 	var walk func(x *Node, depth int)
@@ -987,6 +1065,9 @@ func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated
 		}
 		for _, pn := range ps {
 			parent := q.g.Node(pn)
+			if !q.v.node(q.g, parent) {
+				continue
+			}
 			onPath := false
 			for _, s := range stack {
 				if s == parent {
@@ -1005,28 +1086,19 @@ func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated
 	return
 }
 
-func (q *query) pathJSON(ps [][]*Node) (out []any, hidden int) {
-	out = []any{}
+func (q *query) pathJSON(ps [][]*Node) []any {
+	out := []any{}
 	for _, p := range ps {
-		ok := true
 		arr := make([]any, 0, len(p))
 		for _, x := range p {
-			if !q.v.node(q.g, x) {
-				ok = false
-				break
-			}
 			q.tags.node(q.g, x.Name)
 			e := map[string]any{"href": q.g.Href(x.Name), "name": x.Name}
 			q.title(e, x)
 			arr = append(arr, e)
 		}
-		if !ok {
-			hidden++
-			continue
-		}
 		out = append(out, arr)
 	}
-	return out, hidden
+	return out
 }
 
 // ancestors lists every path from the node to a root, root first, for
@@ -1037,16 +1109,12 @@ func (q *query) ancestors() (any, int, string) {
 		return nil, st, msg
 	}
 	ps, incomplete, deep, trunc := q.paths(n)
-	js, hidden := q.pathJSON(ps)
-	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "node": q.entry(n), "paths": js}
+	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "node": q.entry(n), "paths": q.pathJSON(ps)}
 	if incomplete > 0 {
 		body["incomplete"] = incomplete
 	}
 	if deep > 0 {
 		body["tooDeep"] = deep
-	}
-	if hidden > 0 {
-		body["hidden"] = hidden
 	}
 	if trunc {
 		body["truncated"] = true
@@ -1149,13 +1217,37 @@ func (q *query) parentsJSON(n *Node) []any {
 	return out
 }
 
+// trusted is every content namespace the catalog trusts, sorted.
+func (q *query) trusted() []string {
+	out := make([]string, 0, len(q.g.Trust))
+	for ns := range q.g.Trust {
+		out = append(out, ns)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// unfiltered checks that the viewer may see an unfiltered listing covering
+// the content namespaces nss: problems, orphans and manifests aren't
+// filtered, and need namespace-wide read on the catalog and on the content
+// namespaces they cover (§B.11.5).
+func (q *query) unfiltered(nss []string) (int, string) {
+	if !q.v.wide(nss) {
+		return http.StatusForbidden, "this listing isn't filtered: it needs namespace-wide read on the catalog and on " + strings.Join(nss, ", ")
+	}
+	return http.StatusOK, ""
+}
+
 // orphans lists nodes whose every parent is gone, dangling, not a folder
-// or in a cycle (§B.5, §B.7: children of a deleted folder).
+// or in a cycle (§B.5, §B.7: children of a deleted folder). Unfiltered.
 func (q *query) orphans() (any, int, string) {
+	if st, msg := q.unfiltered(q.trusted()); st != http.StatusOK {
+		return nil, st, msg
+	}
 	out := []any{}
 	for _, name := range q.g.Names() {
 		n := q.g.Node(name)
-		if len(n.Parents) == 0 || len(q.g.WalkableParents(n)) > 0 || !q.v.node(q.g, n) {
+		if len(n.Parents) == 0 || len(q.g.WalkableParents(n)) > 0 {
 			continue
 		}
 		e := q.entry(n)
@@ -1166,17 +1258,18 @@ func (q *query) orphans() (any, int, string) {
 }
 
 // problems reports cycles, dangling items, dangling parents and nodes
-// deeper than MaxDepth (§B.3, §B.5).
+// deeper than MaxDepth (§B.3, §B.5). Unfiltered.
 func (q *query) problems() (any, int, string) {
+	if st, msg := q.unfiltered(q.trusted()); st != http.StatusOK {
+		return nil, st, msg
+	}
 	g := q.g
 	cycles := []any{}
 	for _, scc := range g.Cycles() {
 		arr := []any{}
 		for _, name := range scc {
-			if n := g.Node(name); n != nil && q.v.node(g, n) {
-				q.tags.node(g, name)
-				arr = append(arr, g.Href(name))
-			}
+			q.tags.node(g, name)
+			arr = append(arr, g.Href(name))
 		}
 		if len(arr) > 0 {
 			cycles = append(cycles, arr)
@@ -1185,9 +1278,6 @@ func (q *query) problems() (any, int, string) {
 	items, parents, deep := []any{}, []any{}, []any{}
 	for _, name := range g.Names() {
 		n := g.Node(name)
-		if !q.v.node(g, n) {
-			continue
-		}
 		if n.State == StateDangling {
 			q.tags.node(g, name)
 			e := map[string]any{"href": g.Href(name), "reason": n.Dangling}
@@ -1236,16 +1326,12 @@ func (q *query) where() (any, int, string) {
 	}
 	body["placement"] = q.entry(n)
 	ps, incomplete, deep, trunc := q.paths(n)
-	js, hidden := q.pathJSON(ps)
-	body["paths"] = js
+	body["paths"] = q.pathJSON(ps)
 	if incomplete > 0 {
 		body["incomplete"] = incomplete
 	}
 	if deep > 0 {
 		body["tooDeep"] = deep
-	}
-	if hidden > 0 {
-		body["hidden"] = hidden
 	}
 	if trunc {
 		body["truncated"] = true
@@ -1255,8 +1341,13 @@ func (q *query) where() (any, int, string) {
 
 // manifest generates a manifest (§B.4) for a folder's subtree as of the
 // checkpoint: the folder's pinned revision and one pinned entry per item
-// and path. The client creates it as an ordinary resource.
+// and path. The client creates it as an ordinary resource. Unfiltered: it
+// needs namespace-wide read on the catalog and on the content namespaces
+// of the items it pins.
 func (q *query) manifest() (any, int, string) {
+	if st, msg := q.unfiltered(nil); st != http.StatusOK {
+		return nil, st, msg
+	}
 	n, st, msg := q.node("of")
 	if n == nil {
 		return nil, st, msg
@@ -1265,13 +1356,17 @@ func (q *query) manifest() (any, int, string) {
 		return nil, http.StatusBadRequest, "of must be a folder"
 	}
 	entries := []any{}
+	covers := map[string]bool{}
 	tooLarge := false
 	var walk func(x *Node, path []string, depth int)
 	walk = func(x *Node, path []string, depth int) {
 		if depth > MaxDepth || tooLarge {
 			return
 		}
-		for _, c := range q.visibleChildren(x.Name) {
+		for _, c := range q.g.Children(x.Name) {
+			if !c.Node.Live() {
+				continue
+			}
 			if c.Node.Kind == KindFolder {
 				if slicesContains(path, c.Node.Name) {
 					continue
@@ -1280,9 +1375,10 @@ func (q *query) manifest() (any, int, string) {
 				walk(c.Node, append(append([]string(nil), path...), c.Node.Name), depth+1)
 				continue
 			}
-			if !q.v.item(q.g, c.Node) || c.Node.ItemHead == "" {
+			if c.Node.ItemHead == "" {
 				continue
 			}
+			covers[c.Node.ItemNS] = true
 			if len(entries) >= maxManifest {
 				tooLarge = true
 				return
@@ -1300,6 +1396,14 @@ func (q *query) manifest() (any, int, string) {
 		}
 	}
 	walk(n, []string{n.Name}, 0)
+	nss := make([]string, 0, len(covers))
+	for ns := range covers {
+		nss = append(nss, ns)
+	}
+	sort.Strings(nss)
+	if st, msg := q.unfiltered(nss); st != http.StatusOK {
+		return nil, st, msg
+	}
 	if tooLarge {
 		return nil, http.StatusUnprocessableEntity, "the subtree has too many items for one manifest"
 	}

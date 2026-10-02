@@ -259,6 +259,12 @@ type queryer interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
+// ReadItemState is ItemState inside a transaction (for hooks, which see
+// the apply's uncommitted item states).
+func ReadItemState(ctx context.Context, tx *sql.Tx, ns, name string) (int, string, error) {
+	return itemState(ctx, tx, ns, name)
+}
+
 func itemState(ctx context.Context, q queryer, ns, name string) (int, string, error) {
 	var st int
 	var head sql.NullString

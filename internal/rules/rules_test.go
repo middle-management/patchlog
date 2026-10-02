@@ -341,3 +341,23 @@ func TestFailPath(t *testing.T) {
 		t.Error("first failing index")
 	}
 }
+
+func TestRefPaths(t *testing.T) {
+	cases := []struct{ rule, want string }{
+		{`{"op":"test","path":"/principal/groups","schema":{"contains":{"const":"x"}}}`, "/principal/groups"},
+		{`{"op":"test","path":"","exists":true}`, ""},
+		{`{"op":"compare","path":"/doc/a","eq":{"path":"/principal/id"}}`, "/doc/a /principal/id"},
+		{`{"not":{"all":[{"op":"test","path":"/resource","exists":true},{"if":[{"op":"writes","within":[]}],"then":[{"op":"test","path":"/patches/0","exists":true}]}]}}`,
+			"/resource /writes /patches/0"},
+		{`{"any":[]}`, ""},
+	}
+	for _, x := range cases {
+		var got []string
+		for _, p := range c(t, x.rule).RefPaths() {
+			got = append(got, p.String())
+		}
+		if strings.Join(got, " ") != x.want {
+			t.Errorf("%s: paths %q, want %q", x.rule, got, x.want)
+		}
+	}
+}

@@ -535,7 +535,10 @@ It is plain HTML/JS embedded in the binary and talks to the same-origin API. It 
   path to a root with the roles that path collects (and where `inherit: false` stops it), and
   folders on a cycle are reported, not traversed. It creates folders and places,
   moves, reorders and removes nodes as ordinary writes to the catalog namespace (`If-None-Match`,
-  `If-Match`, fresh `$nonce` on placements), then re-reads the tree with `?min=` (read-your-writes);
+  `If-Match`, fresh `$nonce` on placements), then re-reads the tree with `?min=` (read-your-writes):
+  tree listings go through the browser's HTTP cache, and `?min={ns}:{ns_id}` from the page's last
+  write to the catalog and to each namespace it trusts (`X-Namespace-Revision`) makes a new URL that
+  the service answers once caught up (§B.5), instead of `no-store`;
 - blobs (§7.8): a document's `$blob` references show as chips (type, size, Open, Download, inline preview
   of images and small text), including sealed (E2) blobs, opened with the epoch's key and an older epoch if
   that is all the reader holds, and E3 blobs, decrypted with the key inside the reference. "Attach file" on
@@ -767,7 +770,7 @@ patchlog merge release apply   -api URL -bearer $ANNA -merge-bearer $MERGESVC -c
 patchlog merge release abandon -api URL -bearer $ADMIN $R                                    # freeze every branch with abandoned: true
 patchlog merge release status  -api URL -bearer $ANNA $R
 patchlog merge release rebase  -api URL -bearer $ANNA -suffix -b $R                          # successors of every branch, new release revision
-patchlog tree -catalog cat-season -release $R -bearer $PREVIEW                               # a release preview (§B.5)
+patchlog tree -catalog cat-season -release $R -bearer $PREVIEW                               # a release preview (§B.5), following $R's revisions
 patchlog janitor -ns schemas,matches,cat-season -release $R                                  # drafts purged last, in_use retried
 ```
 
@@ -871,7 +874,11 @@ patchlog janitor -ns schemas,matches,cat-season -release $R                     
   `branch`. A viewer sees the catalog only with a grant reading the catalog's branch (`403`
   otherwise), and an item's head only with one reading the content branch: items in a content
   branch the viewer can't read are hidden, never shown from the base. A preview issues no grants (`-access` is
-  refused). The release document is read once, at start.
+  refused), and covers one catalog. It follows the release document's namespace log (§10,
+  `tree.OpenPreview`): a revision listing other branches, such as a rebase's successors, switches the
+  preview to them without a restart (it rebuilds its database from the new branches, answering `503`
+  `behind` until it has reached them); a revision with the same branches, an invalid one, or deleting
+  the document leaves it as it is.
 - **The janitor** (`-release LINK`, repeatable) purges a release's non-draft branches before its
   draft branches (those with `drafts`, or holding schema documents). A purge refused with
   `in_use` is retried at the end of the sweep and otherwise reported as `retry` for the next
@@ -1188,13 +1195,46 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   own `$access`; until an admin gives it some, only admins may move or place into it.
 - `POST /grants` for content verbs, `create` (genesis only; `409` for a taken name), `place`,
   `move` and unplace (pinned to the placement's current parents), with the no-widening rule.
-- `POST /read-grants` returns resource-scoped read grants.
+- `POST /grants` with `{ "item", "want": ["restore"] }` restores a deleted item where it is placed
+  (§B.11.4): the roles come from the `effective` rows frozen when the service saw the item's
+  tombstone (marked `tombstoned`, kept across restarts, no longer recomputed, ignored by the move
+  no-widening check), so placing the deleted item or moving folders afterwards changes nothing. The
+  grant carries `can: ["restore"]` only; used on an item that is live again, the write is an append
+  and the core refuses it. A purged item is `410`, a live one `409`, one that never existed `404`.
+  The catalog key's entry in content namespaces lists `restore` for this (§B.11.3):
+  `"can": ["read", "create", "append", "restore"]`.
+- `POST /read-grants` returns resource-scoped read grants, and the keys of catalog nodes (and of an
+  item's placement) visible to the caller.
+
+Listings are filtered by the caller's subject set (§B.11.5). A node is visible when the walk up
+collects a role granting `read` without conditions: for an item, a role its content namespace defines
+with `read` and the catalog key there may grant (its `roles` and `groups` scope), whose rules, if
+any, refer only to `/resource` and `/principal/groups` (evaluated for the item and the caller's
+groups); for a folder, such a role without rules in some trusted content namespace. So a role whose
+read has rules on anything else (`/writes`, `/now`, …) grants reading through `POST /grants` but
+shows nothing in listings. `children`, `subtree`, `roots`, `ancestors` and `where` show visible nodes
+and only paths through visible folders, with no counts of hidden ones; limits, cut markers and
+pagination count visible nodes. `/read-grants` uses the same test. Visibility is decided per request
+from `effective` and the content namespaces' role definitions, so a change to `/roles` takes effect
+from the listing `at` that includes it. `problems`, `orphans` and `manifest` aren't filtered: they
+need namespace-wide `read` on the catalog and on the content namespaces they cover (`403`
+otherwise), in the plain tree service too. A reader whose grant reads the catalog and every trusted
+content namespace as a whole is served unfiltered listings under `/{catalog}/at/{at}/g/all/…`,
+shared by all such readers, with a private `max-age` no longer than that grant's expiry; reading
+only some of them as a whole doesn't count (the listing is then the subject set's). There are no
+CDN edge grants: the service decides `all` per request.
+
+Read-your-writes: after its own write, a client relists with `?min={ns}:{ns_id}` from the write's
+`X-Namespace-Revision` (repeatable, the catalog or any content namespace it trusts), which is a new
+URL past any cached head pointer and waits for the service to catch up (`503` with `Retry-After`
+otherwise), instead of fetching with `no-store` (§B.5, §A.5).
 - `POST /merge-grants` checks a catalog branch's merge batch for the approver and signs one grant
   covering exactly that batch with the merge key, for the merge service only (`-merge-key`,
   `-merge-kid`, `-merge-service`, `-merge-ttl`; without a merge key it is refused); see
   [Releases across namespaces](#releases-across-namespaces-f9) (§F.8).
 
-With `-release /r/{ns}/{release}` (not with `-access`) it previews a release (§B.5).
+With `-release /r/{ns}/{release}` (not with `-access`) it previews a release (§B.5), following the
+release document's revisions.
 
 Callers authenticate with an ordinary grant for the catalog namespace, and their groups come only
 from that grant. Issued grants carry `at`; the service refuses to issue from a checkpoint that

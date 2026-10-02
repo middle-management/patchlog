@@ -19,7 +19,8 @@ type node interface {
 	eval(env map[string]any) bool
 	// failPath describes the innermost failing leaf; called only after eval returned false.
 	failPath(env map[string]any) string
-	refs(m map[string]bool)
+	// refs calls add with every envelope pointer the node can read.
+	refs(add func(pointer.Pointer))
 }
 
 // Compile validates and compiles one rule.
@@ -67,8 +68,24 @@ func EvalList(rs []*Rule, env map[string]any) (int, string, bool) {
 // Refs reports every top-level envelope member the rule can read ("*" for the whole envelope).
 func (r *Rule) Refs() map[string]bool {
 	m := map[string]bool{}
-	r.n.refs(m)
+	r.n.refs(func(p pointer.Pointer) {
+		if len(p) == 0 {
+			m["*"] = true
+			return
+		}
+		m[p[0]] = true
+	})
 	return m
+}
+
+// RefPaths reports every envelope pointer the rule can read: the paths of
+// test and compare operands (the empty pointer for the whole envelope),
+// and /writes for a writes op. A rule reads only what lies at or below
+// these pointers.
+func (r *Rule) RefPaths() []pointer.Pointer {
+	var out []pointer.Pointer
+	r.n.refs(func(p pointer.Pointer) { out = append(out, p) })
+	return out
 }
 
 // OnlyRefs reports whether every member in Refs() is in allowed.
@@ -83,14 +100,6 @@ func (r *Rule) OnlyRefs(allowed ...string) bool {
 		}
 	}
 	return true
-}
-
-func addRef(m map[string]bool, p pointer.Pointer) {
-	if len(p) == 0 {
-		m["*"] = true
-		return
-	}
-	m[p[0]] = true
 }
 
 // ---- compilation helpers ----
@@ -318,7 +327,7 @@ func (n *testNode) eval(env map[string]any) bool {
 	}
 }
 func (n *testNode) failPath(map[string]any) string { return n.raw }
-func (n *testNode) refs(m map[string]bool)         { addRef(m, n.path) }
+func (n *testNode) refs(add func(pointer.Pointer)) { add(n.path) }
 
 // ---- writes ----
 
@@ -446,7 +455,7 @@ func (n *writesNode) failPath(env map[string]any) string {
 	}
 	return n.raw
 }
-func (n *writesNode) refs(m map[string]bool) { m["writes"] = true }
+func (n *writesNode) refs(add func(pointer.Pointer)) { add(pointer.Pointer{"writes"}) }
 
 // ---- compare ----
 
@@ -586,10 +595,10 @@ func order(a, b any) (int, bool) {
 }
 
 func (n *compareNode) failPath(map[string]any) string { return n.raw }
-func (n *compareNode) refs(m map[string]bool) {
-	addRef(m, n.path)
+func (n *compareNode) refs(add func(pointer.Pointer)) {
+	add(n.path)
 	if n.right.isPath {
-		addRef(m, n.right.path)
+		add(n.right.path)
 	}
 }
 
@@ -616,9 +625,9 @@ func (a *allNode) failPath(env map[string]any) string {
 	}
 	return ""
 }
-func (a *allNode) refs(m map[string]bool) {
+func (a *allNode) refs(add func(pointer.Pointer)) {
 	for _, n := range a.ns {
-		n.refs(m)
+		n.refs(add)
 	}
 }
 
@@ -631,9 +640,9 @@ func (a *anyNode) eval(env map[string]any) bool {
 	return false
 }
 func (a *anyNode) failPath(env map[string]any) string { return "" }
-func (a *anyNode) refs(m map[string]bool) {
+func (a *anyNode) refs(add func(pointer.Pointer)) {
 	for _, n := range a.ns {
-		n.refs(m)
+		n.refs(add)
 	}
 }
 
@@ -641,7 +650,7 @@ func (n *notNode) eval(env map[string]any) bool { return !n.n.eval(env) }
 func (n *notNode) failPath(env map[string]any) string {
 	return leafPath(n.n)
 }
-func (n *notNode) refs(m map[string]bool) { n.n.refs(m) }
+func (n *notNode) refs(add func(pointer.Pointer)) { n.n.refs(add) }
 
 // leafPath returns the operand pointer of a leaf node without needing a failure.
 func leafPath(n node) string {
@@ -679,11 +688,11 @@ func (n *ifNode) failPath(env map[string]any) string {
 	}
 	return ""
 }
-func (n *ifNode) refs(m map[string]bool) {
+func (n *ifNode) refs(add func(pointer.Pointer)) {
 	for _, c := range n.cond {
-		c.refs(m)
+		c.refs(add)
 	}
 	for _, t := range n.then {
-		t.refs(m)
+		t.refs(add)
 	}
 }

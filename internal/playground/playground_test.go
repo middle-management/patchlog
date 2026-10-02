@@ -85,6 +85,15 @@ func TestPage(t *testing.T) {
 			t.Errorf("app.js uses #%s, which index.html lacks", m[1])
 		}
 	}
+	// Fresh listings after a write (§B.5): tree listings use the HTTP cache
+	// and relist with ?min= from the page's writes (X-Namespace-Revision) to
+	// the catalog and the namespaces it trusts, not with no-store.
+	treeGet := regexp.MustCompile(`(?s)async function treeGet\(path\) \{.*?\n\}`).Find(js)
+	treeMins := regexp.MustCompile(`(?s)function treeMins\(ns, trust\) \{.*?\n\}`).Find(js)
+	if !bytes.Contains(treeGet, []byte(`cache: 'default'`)) || !bytes.Contains(treeGet, []byte(`'min=' + encodeURIComponent(m)`)) ||
+		!bytes.Contains(treeMins, []byte("WRITES.get(n).id")) || !bytes.Contains(js, []byte("C.min = treeMins(ns, x.trust)")) {
+		t.Errorf("tree listings: treeGet %q, treeMins %q", treeGet, treeMins)
+	}
 	for _, f := range []string{"static/app.js", "static/seal.js"} {
 		b, _ := assets.ReadFile(f)
 		if bytes.Contains(b, []byte("eval(")) || bytes.Contains(b, []byte("new Function")) || regexp.MustCompile(`(fetch|import|src)\(?\s*['"]https?:`).Match(b) {
