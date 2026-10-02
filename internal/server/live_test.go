@@ -265,3 +265,70 @@ func TestEventsErrors(t *testing.T) {
 	r := e.get("/r/docs/a/events?since=" + h)
 	expectCode(t, r, 410, "pruned")
 }
+
+// Event streams catch up a log page at a time (§7.1 Paging, §7.3): with a
+// page of 2, a stream from the beginning still delivers every entry, in
+// order and once, and then goes on live.
+func TestEventsPaged(t *testing.T) {
+	e := newEnv(t, withLogPageSize(2))
+	e.mkNS("docs", map[string]any{"read": "public"})
+	nsWant := []string{e.nsHead("docs")}
+	h := e.create("docs", "a", map[string]any{})
+	revs := []string{h}
+	nsWant = append(nsWant, e.nsHead("docs"))
+	for i := 0; i < 6; i++ {
+		h = e.appendRev("docs", "a", h, ops(op("add", "/n", float64(i))))
+		revs = append(revs, h)
+		nsWant = append(nsWant, e.nsHead("docs"))
+		if i == 2 {
+			e.create("docs", "other", map[string]any{})
+			nsWant = append(nsWant, e.nsHead("docs"))
+		}
+	}
+	nsCh, _, _ := e.openSSE("/ns/docs/events", nil)
+	resCh, _, _ := e.openSSE("/r/docs/a/events", nil)
+	resume, _, _ := e.openSSE("/r/docs/a/events?since="+revs[1], nil)
+	for i, w := range nsWant {
+		if ev := next(t, nsCh); ev.id != w {
+			t.Fatalf("namespace event %d: %v, want %s", i, ev, w)
+		}
+	}
+	for i, w := range revs {
+		if ev := next(t, resCh); ev.event != "revision" || ev.id != w {
+			t.Fatalf("resource event %d: %v, want %s", i, ev, w)
+		}
+	}
+	for i, w := range revs[2:] {
+		if ev := next(t, resume); ev.id != w {
+			t.Fatalf("resumed event %d: %v, want %s", i, ev, w)
+		}
+	}
+	// Then live: several entries at once arrive in pages too.
+	var more []string
+	for i := 0; i < 5; i++ {
+		h = e.appendRev("docs", "a", h, ops(op("replace", "/n", float64(10+i))))
+		more = append(more, h)
+	}
+	for i, w := range more {
+		if ev := next(t, resCh); ev.id != w {
+			t.Fatalf("live event %d: %v, want %s", i, ev, w)
+		}
+		if ev := next(t, resume); ev.id != w {
+			t.Fatalf("live resumed event %d: %v, want %s", i, ev, w)
+		}
+	}
+	for i := range more {
+		if ev := next(t, nsCh); ev.event != "head" {
+			t.Fatalf("live namespace event %d: %v", i, ev)
+		}
+	}
+	// A purge still ends a resource stream with its event.
+	tomb := e.del("docs", "a", h)
+	if ev := next(t, resCh); ev.id != tomb {
+		t.Fatalf("tombstone %v", ev)
+	}
+	expect(t, e.purge("docs", "a", tomb, "admin"), 204)
+	if ev := next(t, resCh); ev.event != "purge" {
+		t.Fatalf("purge %v", ev)
+	}
+}

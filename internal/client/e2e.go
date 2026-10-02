@@ -537,26 +537,36 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 	return x.fold(ctx, ns, name, id, since, arr)
 }
 
+// foldLog fetches the log a fold reads, the range after since up to id as
+// served (with its snapshot first when since is set), following its pages
+// (§7.1). A later page repeats the snapshot of its since, if it has one; it
+// is left out, so the entries chain as one range for fold.
 func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, error) {
-	var q url.Values
-	if since != "" {
-		if err := checkID("since", since); err != nil {
-			return nil, err
-		}
-		q = url.Values{"since": {since}}
-	}
-	r, err := x.c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+id+"/log", q, nil)
-	if err != nil {
+	if err := checkOptID("since", since); err != nil {
 		return nil, err
 	}
-	if r.status != 200 {
-		return nil, r.apiError()
+	arr := []any{}
+	for cur := since; ; {
+		next, err := x.c.logPage(ctx, "/r/"+ns+"/"+name+"/rev/"+id+"/log", cur, id, func(r *response, end string) (string, error) {
+			page, ok := r.value().([]any)
+			if !ok {
+				return "", fmt.Errorf("client: %s: log is not an array", r.path)
+			}
+			if m, _ := arrAt(page, 0).(map[string]any); cur != since && str(m, "kind") == "snapshot" && str(m, "id") == cur {
+				page = page[1:]
+			}
+			arr = append(arr, page...)
+			m, _ := arrAt(page, len(page)-1).(map[string]any)
+			return str(m, "id"), nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		if next == "" {
+			return arr, nil
+		}
+		cur = next
 	}
-	arr, ok := r.value().([]any)
-	if !ok {
-		return nil, fmt.Errorf("client: %s: log is not an array", r.path)
-	}
-	return arr, nil
 }
 
 // chain maps ns and its bases to their depth: 0 for ns, 1 for its base,

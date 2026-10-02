@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func api() http.Handler {
@@ -56,6 +57,45 @@ func TestAnyOrigin(t *testing.T) {
 	}
 	if w.Code != 200 {
 		t.Fatalf("status %d", w.Code)
+	}
+	// Without Origin too (curl, a service, a same-origin page): a cache
+	// that keeps this copy serves it to cross-origin pages, which need
+	// the allowance and the exposed headers (X-Log-Next) as well (§7
+	// "Browsers").
+	w = do(h, "GET", "", nil)
+	if w.Header().Get("Access-Control-Allow-Origin") != "*" || w.Header().Get("Access-Control-Expose-Headers") != Exposed {
+		t.Fatalf("no Origin: headers %v", w.Header())
+	}
+	if v := w.Header().Values("Vary"); !slices.Equal(v, []string{"Authorization"}) || w.Code != 200 {
+		t.Fatalf("no Origin: %d, vary %v", w.Code, v)
+	}
+}
+
+// Every response is the same with or without Origin, or carries Vary:
+// Origin (§7 "Browsers"), whatever the configuration.
+func TestSameOrVaries(t *testing.T) {
+	for _, c := range []Config{
+		{Origins: []string{"*"}},
+		{Origins: []string{"*"}, Credentials: true},
+		{Origins: []string{"https://a.example"}},
+		{Origins: []string{"https://a.example", "https://b.example"}, Credentials: true},
+	} {
+		h := Wrap(api(), c)
+		for _, method := range []string{"GET", "HEAD", "PATCH", "DELETE"} {
+			ref := do(h, method, "", nil).Header()
+			for _, origin := range []string{"https://a.example", "https://b.example", "https://evil.example"} {
+				got := do(h, method, origin, nil).Header()
+				same := true
+				for _, k := range []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Credentials", "Access-Control-Expose-Headers"} {
+					if got.Get(k) != ref.Get(k) {
+						same = false
+					}
+				}
+				if !same && !(slices.Contains(got.Values("Vary"), "Origin") && slices.Contains(ref.Values("Vary"), "Origin")) {
+					t.Errorf("%+v %s from %s: differs from the answer without Origin and doesn't say Vary: Origin (%v / %v)", c, method, origin, got, ref)
+				}
+			}
+		}
 	}
 }
 
@@ -116,10 +156,13 @@ func TestParse(t *testing.T) {
 }
 
 // Every request header the servers read is allowed, X-Author (serve -dev)
-// included; the edge's verification header never is.
+// included; the edge's verification header never is. The lists cover what
+// §7 "Browsers" requires: the methods and headers that make requests
+// non-simple, plus Blob-Nonce and Blob-From, allowed; the headers clients
+// read, X-Log-Next (§7.1 Paging) among them, exposed.
 func TestHeaderLists(t *testing.T) {
 	allowed := strings.Split(Headers, ", ")
-	for _, h := range []string{"Authorization", "If-Match", "If-None-Match", "If-Range", "Range", "Signature", "Source-Authorization", "Blob-From", "Blob-Nonce", "Last-Event-ID", "X-Author"} {
+	for _, h := range []string{"Authorization", "Content-Type", "If-Match", "If-None-Match", "If-Range", "Range", "Signature", "Source-Authorization", "Blob-From", "Blob-Nonce", "Last-Event-ID", "X-Author"} {
 		if !slices.Contains(allowed, h) {
 			t.Errorf("%s not allowed", h)
 		}
@@ -127,9 +170,58 @@ func TestHeaderLists(t *testing.T) {
 	if slices.Contains(allowed, "X-Edge-Verified") {
 		t.Error("edge header allowed")
 	}
-	for _, h := range []string{"ETag", "Location", "X-Namespace-Revision", "X-Cursor", "X-E2E"} {
-		if !slices.Contains(strings.Split(Exposed, ", "), h) {
+	methods := strings.Split(Methods, ", ")
+	for _, m := range []string{"GET", "HEAD", "PATCH", "PUT", "POST", "DELETE"} {
+		if !slices.Contains(methods, m) {
+			t.Errorf("method %s not allowed", m)
+		}
+	}
+	exposed := strings.Split(Exposed, ", ")
+	for _, h := range []string{"ETag", "Location", "Retry-After", "Content-Range", "X-Revision", "X-Namespace-Revision", "X-Config-Revision", "X-Cursor", "X-Log-Next", "X-E2E"} {
+		if !slices.Contains(exposed, h) {
 			t.Errorf("%s not exposed", h)
 		}
+	}
+	// No duplicates, no stray spacing: each list is "A, B, C".
+	for name, l := range map[string][]string{"Headers": allowed, "Methods": methods, "Exposed": exposed} {
+		seen := map[string]bool{}
+		for _, h := range l {
+			if h == "" || strings.TrimSpace(h) != h || seen[strings.ToLower(h)] {
+				t.Errorf("%s: malformed or repeated entry %q", name, h)
+			}
+			seen[strings.ToLower(h)] = true
+		}
+	}
+}
+
+// A preflight answer sets Access-Control-Max-Age, every allowed method and
+// header, and, for "*" without credentials, the same answer for all.
+func TestPreflightAnyOrigin(t *testing.T) {
+	h := Wrap(api(), Config{Origins: []string{"*"}, MaxAge: 90 * time.Second})
+	w := do(h, "OPTIONS", "https://a.example", map[string]string{"Access-Control-Request-Method": "DELETE", "Access-Control-Request-Headers": "if-match, blob-nonce"})
+	if w.Code != 204 || w.Header().Get("Access-Control-Max-Age") != "90" || w.Header().Get("Access-Control-Allow-Origin") != "*" ||
+		w.Header().Get("Access-Control-Allow-Methods") != Methods || w.Header().Get("Access-Control-Allow-Headers") != Headers {
+		t.Fatalf("preflight %d %v", w.Code, w.Header())
+	}
+	if v := w.Header().Values("Vary"); len(v) != 0 {
+		t.Fatalf("vary %v on an answer the same for every origin", v)
+	}
+}
+
+// Credentials need the origin named, even with "*" configured: the answer
+// then varies by origin and says so (Vary: Origin), so a CDN doesn't serve
+// one origin's answer to another (§7 "Browsers").
+func TestCredentialsVaryByOrigin(t *testing.T) {
+	h := Wrap(api(), Config{Origins: []string{"*"}, Credentials: true})
+	w := do(h, "GET", "https://a.example", nil)
+	if w.Header().Get("Access-Control-Allow-Origin") != "https://a.example" || w.Header().Get("Access-Control-Allow-Credentials") != "true" {
+		t.Fatalf("headers %v", w.Header())
+	}
+	if !slices.Contains(w.Header().Values("Vary"), "Origin") {
+		t.Fatalf("vary %v: the answer names the origin", w.Header().Values("Vary"))
+	}
+	w = do(h, "OPTIONS", "https://b.example", map[string]string{"Access-Control-Request-Method": "PATCH"})
+	if w.Header().Get("Access-Control-Allow-Origin") != "https://b.example" || !slices.Contains(w.Header().Values("Vary"), "Origin") {
+		t.Fatalf("preflight %v", w.Header())
 	}
 }

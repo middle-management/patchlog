@@ -35,6 +35,20 @@ func DB(t testing.TB) string {
 // returns its URL. It skips the test if PATCHLOG_TEST_PG isn't set.
 func NewDB(t testing.TB) string {
 	t.Helper()
+	return newDB(t, "")
+}
+
+// NewDBCollated is NewDB with an ICU locale (e.g. "en") as the database's
+// default collation, whose order of text differs from byte order (it
+// ignores punctuation at first), for tests of orders a spec defines in
+// bytes. It skips the test if the server lacks ICU.
+func NewDBCollated(t testing.TB, icuLocale string) string {
+	t.Helper()
+	return newDB(t, ` LOCALE_PROVIDER icu ICU_LOCALE '`+icuLocale+`' LOCALE 'C.UTF-8'`)
+}
+
+func newDB(t testing.TB, with string) string {
+	t.Helper()
 	admin := os.Getenv(Env)
 	if admin == "" {
 		t.Skip(Env + " is not set")
@@ -50,8 +64,11 @@ func NewDB(t testing.TB) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.Exec(`CREATE DATABASE ` + name + ` TEMPLATE template0`); err != nil {
+	if _, err := db.Exec(`CREATE DATABASE ` + name + ` TEMPLATE template0` + with); err != nil {
 		db.Close()
+		if with != "" {
+			t.Skipf("creating a test database%s: %v", with, err)
+		}
 		t.Fatalf("creating test database: %v", err)
 	}
 	t.Cleanup(func() {

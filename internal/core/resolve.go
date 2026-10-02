@@ -3,6 +3,7 @@ package core
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -255,16 +256,23 @@ func (t *tx) findInAncestry(head *revRow, id ids.ID) *revRow {
 	if head.id == id {
 		return head
 	}
-	for _, s := range t.ancestry(head) {
+	_, r := t.locate(t.ancestry(head), id)
+	return r
+}
+
+// locate returns the row with id in segs (an ancestry, newest first) and
+// the index of its segment, or nil and -1.
+func (t *tx) locate(segs []segment, id ids.ID) (int, *revRow) {
+	for i, s := range segs {
 		r, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ? AND seq <= ?`, s.res, id[:], s.max))
 		if err == nil {
-			return r
+			return i, r
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			t.must(err)
 		}
 	}
-	return nil
+	return -1, nil
 }
 
 // prunedError reports a revision below a horizon (§8.6).
@@ -422,42 +430,127 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 }
 
 // logBetween returns the entries after since (exclusive; nil = from the
-// first entry) up to to (inclusive), oldest first. ok is false if since is
-// not an ancestor of to. A pruned entry in the range is a prunedError.
-func (t *tx) logBetween(to *revRow, since *ids.ID) ([]LogEntry, error) {
-	// Ids and parent links survive pruning, so ancestry is decided first: a
-	// since that isn't an ancestor is 404 even across a horizon (§7.1).
-	if since != nil && t.findInAncestry(to, *since) == nil {
-		return nil, errNotAncestor
+// first entry) up to to (inclusive), oldest first: with limit > 0 only the
+// oldest limit of them, more reporting that the range goes on (a page,
+// §7.1). A since that isn't an ancestor of to is errNotAncestor. A pruned
+// entry anywhere in the range is a prunedError, so every page of a range
+// answers alike.
+//
+// A page costs its own rows, whatever the range's length (§7.1 Paging): a
+// resource's chain is its rows in seq order (one first row, one child per
+// parent), so the range is a seq interval of each ancestry segment, read
+// oldest first and only as far as the page goes, and the pruning check
+// looks only below horizons (prunedIn). Walking the parent links from to
+// instead read the whole rest of the range for every page.
+func (t *tx) logBetween(to *revRow, since *ids.ID, limit int) (entries []LogEntry, more bool, err error) {
+	segs := t.ancestry(to)
+	// The range is (lo, max] of the oldest segment it reaches, segs[k],
+	// and the whole of the newer ones. Ids and parent links survive
+	// pruning, so ancestry is decided first: a since that isn't an
+	// ancestor is 404 even across a horizon (§7.1).
+	k, lo := len(segs)-1, int64(0)
+	if since != nil {
+		var srow *revRow
+		if to.id == *since {
+			k, srow = 0, to
+		} else {
+			k, srow = t.locate(segs, *since)
+		}
+		if srow == nil {
+			return nil, false, errNotAncestor
+		}
+		lo = srow.seq
+		t.knowRevID(srow.seq, srow.id) // the first entry's parent
+	}
+	segs = segs[:k+1]
+	if err := t.prunedIn(segs, lo); err != nil {
+		return nil, false, err
 	}
 	var rows []*revRow
-	cur := to
-	for {
-		if since != nil && cur.id == *since {
-			break
+	for i := k; i >= 0 && (limit <= 0 || len(rows) < limit); i-- {
+		from := int64(0)
+		if i == k {
+			from = lo
 		}
-		if cur.kind == kindRev && !cur.patches.Valid {
-			var state int
-			t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, cur.res).Scan(&state))
-			if state == statePurged {
-				return nil, purgedError{}
-			}
-			return nil, &prunedError{res: cur.res, seq: cur.seq}
+		q := `SELECT ` + revCols + ` FROM revisions WHERE res = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		args := []any{segs[i].res, from, segs[i].max}
+		if limit > 0 {
+			q += ` LIMIT ?`
+			args = append(args, limit-len(rows))
 		}
-		rows = append(rows, cur)
-		if !cur.parentSeq.Valid {
-			if since != nil {
-				return nil, errNotAncestor
-			}
-			break
+		rs, err := t.Query(q, args...)
+		t.must(err)
+		for rs.Next() {
+			r, err := scanRev(rs)
+			t.must(err)
+			rows = append(rows, r)
 		}
-		cur = t.rev(cur.parentSeq.Int64)
+		t.must(rs.Err())
+		rs.Close()
 	}
+	// Each entry's parent is the row before it (a segment's first row's,
+	// the last of the older segment), so its id is known. The schema keeps
+	// one first row and one child per parent in a resource (one_first,
+	// UNIQUE (res, parent_seq)), but not that a later row's parent is a
+	// row of the same resource before it, so that is checked here, where
+	// the rows are at hand: a writer that broke the chain would otherwise
+	// make the range answer rows that aren't ancestors of to.
+	prev := lo
+	for _, r := range rows {
+		if r.parentSeq.Valid != (prev != 0) || r.parentSeq.Valid && r.parentSeq.Int64 != prev {
+			t.must(fmt.Errorf("revision row %d: parent %v, not the row before it, %d: the chain forks", r.seq, r.parentSeq, prev))
+		}
+		prev = r.seq
+		t.knowRevID(r.seq, r.id)
+	}
+	more = len(rows) > 0 && rows[len(rows)-1].seq != to.seq
 	out := make([]LogEntry, 0, len(rows))
-	for i := len(rows) - 1; i >= 0; i-- {
-		out = append(out, t.logEntry(rows[i]))
+	for _, r := range rows {
+		out = append(out, t.logEntry(r))
 	}
-	return out, nil
+	return out, more, nil
+}
+
+// prunedIn reports a range's newest pruned entry (§8.6) as a prunedError,
+// or purgedError if its resource is purged; segs are the range's segments,
+// newest first, the oldest one from lo (exclusive). Pruning drops the patch
+// sets of a resource's revisions below its horizon (a remote branch's
+// mirrored horizon has none itself, §G.3; a partial restore fills some
+// back in), and purging all of them, so a resource that is neither is
+// looked at only at or below its horizon: a range above every horizon
+// costs a query per segment, not a row per entry.
+func (t *tx) prunedIn(segs []segment, lo int64) error {
+	for i, s := range segs {
+		from := int64(0)
+		if i == len(segs)-1 {
+			from = lo
+		}
+		var state int
+		var horizon sql.NullInt64
+		var nsPurged bool
+		t.must(t.QueryRow(`SELECT r.state, r.horizon_seq, n.purged FROM resources r JOIN namespaces n ON n.ns = r.ns WHERE r.res = ?`, s.res).Scan(&state, &horizon, &nsPurged))
+		to := s.max
+		if state != statePurged && !nsPurged {
+			if !horizon.Valid {
+				continue
+			}
+			to = min(to, horizon.Int64)
+		}
+		if to <= from {
+			continue
+		}
+		var seq int64
+		err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND seq > ? AND seq <= ? AND kind = 0 AND patches IS NULL ORDER BY seq DESC LIMIT 1`, s.res, from, to).Scan(&seq)
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		t.must(err)
+		if state == statePurged {
+			return purgedError{}
+		}
+		return &prunedError{res: s.res, seq: seq}
+	}
+	return nil
 }
 
 var errNotAncestor = errors.New("not an ancestor")

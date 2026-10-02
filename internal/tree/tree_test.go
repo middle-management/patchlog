@@ -638,6 +638,9 @@ func TestTrustAndRestart(t *testing.T) {
 	if got := names(y.get("/cat/children?of=season", "")["children"]); got != "matches.opener,matches.derby,matches.cup" {
 		t.Errorf("after restart and create: %s", got)
 	}
+	// OnApply runs just after the checkpoint is out, so caughtUp can return
+	// before the batch is counted.
+	waitFor(t, "the batch to be counted", func() bool { return y.batches() >= 1 })
 	if y.batches() != 1 {
 		t.Errorf("batches after one write: %d", y.batches())
 	}

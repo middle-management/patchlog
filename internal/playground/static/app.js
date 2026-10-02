@@ -102,7 +102,7 @@ const S = {
   nsHead: '', config: '', nsDoc: null, nsErr: null, nsLog: [], heads: [], headsNext: '', branches: [],
   resState: null, hist: [], selRev: '',
   ifDirty: false, cfgDirty: false,
-  nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null,
+  nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null, nsLogErr: '',
 };
 
 /* ------------------------------------------------------------------ *
@@ -376,7 +376,7 @@ function renderNsSelect() {
 
 function resetNsState() {
   Object.assign(S, { nsHead: '', config: '', nsDoc: null, nsErr: null, nsLog: [], heads: [], headsNext: '', branches: [],
-    resState: null, hist: [], selRev: '', cfgDirty: false, ifDirty: false, nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null });
+    resState: null, hist: [], selRev: '', cfgDirty: false, ifDirty: false, nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null, nsLogErr: '' });
 }
 
 async function selectNS(name, o = {}) {
@@ -419,7 +419,8 @@ async function refreshNS() {
     if (ns !== S.ns) return;
     if (l.status === 200) {
       S.nsHead = (/\/rev\/([^/]+)\/log/.exec(l.finalPath) || [])[1] || '';
-      S.nsLog = Array.isArray(l.json) ? l.json : (l.jose ? (await nsLogOpen(ns, l, S.nsHead)) || [] : []);
+      S.nsLog = await nsLogRead(ns, l);
+      if (ns !== S.ns) return;
       const cfg = [...S.nsLog].reverse().find((x) => x.kind === 'config');
       S.config = cfg ? cfg.target : '';
       S.nsErr = null;
@@ -434,8 +435,7 @@ async function refreshNS() {
     api('GET', `/ns/${ns}/branches`, { auto: true }),
   ]);
   if (ns !== S.ns) return;
-  if (lg.status === 200 && Array.isArray(lg.json)) S.nsLog = lg.json;
-  else if (lg.status === 200 && lg.jose) { const v = await nsLogOpen(ns, lg, head); if (ns !== S.ns) return; S.nsLog = v || []; }
+  if (lg.status === 200) { const v = await nsLogRead(ns, lg); if (ns !== S.ns) return; S.nsLog = v; }
   if (hd.status === 200 && hd.json) { S.heads = hd.json.items || []; S.headsNext = hd.json.next || ''; }
   if (br.status === 200 && Array.isArray(br.json)) S.branches = br.json; else S.branches = [];
   renderNsAll();
@@ -495,7 +495,8 @@ function kindBadge(kind) {
 function renderNsLog() {
   const tb = $('nsLog').tBodies[0];
   const rows = [...S.nsLog].reverse().slice(0, 200);
-  $('nsLogMeta').textContent = S.nsLog.length ? `${S.nsLog.length} entr${S.nsLog.length === 1 ? 'y' : 'ies'}${S.nsLog.length > 200 ? ' (latest 200 shown)' : ''}` : '';
+  $('nsLogMeta').textContent = (S.nsLog.length ? `${S.nsLog.length} entr${S.nsLog.length === 1 ? 'y' : 'ies'}${S.nsLog.length > 200 ? ' (latest 200 shown)' : ''}` : '') +
+    (S.nsLogErr ? ` · incomplete: ${S.nsLogErr}` : '');
   if (!rows.length) { tb.replaceChildren(h('tr', {}, h('td', { class: 'empty', colspan: 6 }, S.ns ? 'No entries.' : 'No namespace selected.'))); return; }
   tb.replaceChildren(...rows.map((e) => {
     const target = e.target || e.name || '';
@@ -737,17 +738,20 @@ async function loadHistory() {
   const { ns, res } = S;
   const r = await api('GET', rpath(`/rev/${st.head}/log`), { auto: true });
   if (ns !== S.ns || res !== S.res) return;
-  let hist = r.status === 200 && Array.isArray(r.json) ? r.json : [];
-  S.histNote = '';
+  // Every page of the range (§7.1 Paging).
+  const L = r.status === 200 && Array.isArray(r.json) ? await readLogRange(r, { auto: true }) : { arr: [], since: '', err: '' };
+  if (ns !== S.ns || res !== S.res) return;
+  let hist = L.arr;
+  S.histNote = L.err ? 'Incomplete: ' + L.err : '';
+  const note = (s) => { S.histNote = S.histNote ? S.histNote + ' · ' + s : s; };
   if (hist.length && typeof hist[0] === 'string') {
-    // E2: an array of per-entry JWEs under the resource's key K_r (§E.2.2).
-    hist = await openEntries(ns, res, hist, st.head, r);
-    S.histNote = 'Entries were sealed (application/jose); decrypted in this browser.';
+    // E2: an array of per-entry JWEs under the resource's key K_r (§E.2.2), on every page.
+    hist = await openEntries(ns, res, hist, st.head, L.since);
+    note('Entries were sealed (application/jose); decrypted in this browser.');
   } else if (S.nsLevel === 'e2e' && res !== 'keyring' && hist.length) {
     // E3: plain entries whose patch sets are sealed; fold them here to flag bad revisions (§E.3.2).
-    const since = new URLSearchParams((r.finalPath || '').split('?')[1] || '').get('since') || '';
-    try { hist = (await foldLog(ns, res, st.head, since, hist)).entries; S.histNote = 'Sealed patch sets opened and folded in this browser.'; }
-    catch (err) { S.histNote = 'Could not fold: ' + err.message; }
+    try { hist = (await foldLog(ns, res, st.head, L.since, hist)).entries; note('Sealed patch sets opened and folded in this browser.'); }
+    catch (err) { note('Could not fold: ' + err.message); }
   }
   if (ns !== S.ns || res !== S.res) return;
   S.hist = hist;
@@ -1075,16 +1079,79 @@ function sealSummary(d) {
     checkList(d.checks), d.error ? h('div', { class: 'errline' }, d.error) : null);
 }
 
-async function nsLogOpen(ns, r, head) {
-  const since = new URLSearchParams((r.finalPath || '').split('?')[1] || '').get('since') || '';
-  const d = await decrypted(r, ns, '', { ns, range: [since, head] });
-  S.nsLogSeal = d;
-  return Array.isArray(d.value) ? d.value : null;
+/* ---- paged log ranges (§7.1 Paging) ----
+ * A log range longer than the deployment's log page size answers its first page only, with X-Log-Next
+ * naming the page's last entry: the since of the next page, an immutable range up to the same id. A
+ * reader reads pages until the last entry it received is the range's id; a page that stops short of it
+ * without X-Log-Next is an error, so a truncated copy can't pass for the whole range. */
+
+/* logPages fetches the pages of a log range after r, the answer for its first page (after any redirect:
+ * its final URL names the range, …/rev/{id}/log?since=…). It returns { pages: [{ r, since, end }], since,
+ * to, err }: end is what each page must end at, its X-Log-Next or, for the last, the range's id `to`. */
+async function logPages(r, o = {}) {
+  const [path, query] = (r.finalPath || '').split('?');
+  const to = (/\/rev\/(1[a-z2-7]{32})\/log$/.exec(path) || [])[1] || '';
+  const first = new URLSearchParams(query || '').get('since') || '';
+  const pages = [];
+  for (let cur = r, since = first; ;) {
+    const next = cur.hdr('X-Log-Next') || '';
+    pages.push({ r: cur, since, end: next || to });
+    if (!next) return { pages, since: first, to, err: '' };
+    if (!ID_RE.test(next) || next === since) return { pages, since: first, to, err: `a malformed X-Log-Next ${next}` };
+    since = next;
+    cur = await api('GET', `${path}?since=${since}`, o);
+    if (cur.status !== 200) return { pages, since: first, to, err: `the page after ${short(since)} answered ${cur.status}` };
+  }
 }
 
-/* openEntries decrypts an E2 resource log (per-entry JWEs under K_r, pl {ns, name, id, kind}) and checks the chain. */
-async function openEntries(ns, name, arr, last, r) {
-  const since = new URLSearchParams((r.finalPath || '').split('?')[1] || '').get('since') || '';
+/* pageEndErr says how a page that ends at last falls short of its end, or ''. */
+function pageEndErr(p, last) {
+  return last === p.end ? '' : `the page after ${p.since ? short(p.since) : 'the start'} ends at ${last ? short(last) : 'nothing'}, not ${short(p.end)}`;
+}
+function jweID(jwe) { try { return (Z.parseJWE(jwe).header.pl || {}).id || ''; } catch (_) { return ''; } }
+
+/* readLogRange reads a plain log range (entries, or an E2 resource log's per-entry JWEs) from the answer r
+ * for its first page, and returns { arr, since, to, err } with the pages' arrays joined. A later page of an
+ * e2e range repeats the snapshot of its since; it is left out, so the entries chain as one range. */
+async function readLogRange(r, o = {}) {
+  const L = await logPages(r, o);
+  const arr = [];
+  let err = L.err;
+  L.pages.forEach((p, i) => {
+    let a = Array.isArray(p.r.json) ? p.r.json : [];
+    if (i > 0 && a.length && a[0] && a[0].kind === 'snapshot' && a[0].id === p.since) a = a.slice(1);
+    arr.push(...a);
+    const x = a.length ? a[a.length - 1] : null;
+    err = err || pageEndErr(p, x == null ? p.since : (typeof x === 'string' ? jweID(x) : x.id));
+  });
+  return { arr, since: L.since, to: L.to, err };
+}
+
+/* nsLogRead reads a namespace log range from the answer r for its first page, page by page. A sealed page
+ * (E2) is one JWE bound to { ns, range: [since, end] }, the bounds of that page itself (§E.2.2), so it
+ * can't pass for another page or for the whole range. S.nsLogErr says why the range is incomplete. */
+async function nsLogRead(ns, r) {
+  const L = await logPages(r, { auto: true });
+  const out = [];
+  let err = L.err;
+  for (const p of L.pages) {
+    let arr = Array.isArray(p.r.json) ? p.r.json : [];
+    if (p.r.jose) {
+      const d = await decrypted(p.r, ns, '', { ns, range: [p.since, p.end] });
+      S.nsLogSeal = d;
+      if (!Array.isArray(d.value)) { err = err || `the sealed page after ${p.since ? short(p.since) : 'the start'} did not open: ${d.error || 'not an array'}`; break; }
+      arr = d.value;
+    }
+    out.push(...arr);
+    err = err || pageEndErr(p, arr.length ? arr[arr.length - 1].id : p.since);
+  }
+  if (ns === S.ns) S.nsLogErr = err;
+  return out;
+}
+
+/* openEntries decrypts an E2 resource log (per-entry JWEs under K_r, pl {ns, name, id, kind}) after since
+ * and checks the chain, across pages, up to last. */
+async function openEntries(ns, name, arr, last, since) {
   const out = [];
   let prev = since, err = '';
   for (const jwe of arr) {
@@ -1115,9 +1182,13 @@ function foldTarget(path) { return (/\/rev\/(1[a-z2-7]{32})\/log(?:\?|$)/.exec(p
 /* readDoc turns a 200 answer for a document into { doc, seal?, fold?, foldErr?, raw? }. */
 async function readDoc(ns, name, id, r) {
   if (foldTarget(r.finalPath) && Array.isArray(r.json)) {
-    const since = new URLSearchParams(r.finalPath.split('?')[1] || '').get('since') || '';
-    try { const f = await foldLog(ns, name, id, since, r.json); return { doc: f.value, fold: f }; }
-    catch (err) { return { doc: null, foldErr: err.message, raw: r.text }; }
+    // The fold redirect's range, page by page (§7.1).
+    const L = await readLogRange(r, { auto: true });
+    try {
+      if (L.err) throw new Error(L.err);
+      const f = await foldLog(ns, name, id, L.since, L.arr);
+      return { doc: f.value, fold: f };
+    } catch (err) { return { doc: null, foldErr: err.message, raw: r.text }; }
   }
   if (r.jose) { const d = await decrypted(r, ns, name, { ns, name, id, kind: 'doc' }); return { doc: d.value, seal: d, raw: r.text }; }
   return { doc: r.json };
@@ -2517,7 +2588,7 @@ const EXAMPLES = [
         run: (c) => c.req('GET', `/r/${c.v.br}/page`) },
       { t: 'First write in the branch', why: 'The precondition is checked against the base head as of "at" (p1, not the base head p2). That revision becomes the foreign parent.', expect: 201,
         run: async (c) => { const r = await c.req('PATCH', `/r/${c.v.br}/page`, { ct: PJ, headers: { 'If-Match': q(c.v.p1) }, body: [{ op: 'replace', path: '/title', value: 'Branch edit' }] }); c.v.b1 = r.etag(); return r; } },
-      { t: 'History of the branch resource', why: 'The log crosses the foreign parent: the base revision and the branch revision both appear.', expect: 200,
+      { t: 'History of the branch resource', why: 'The log crosses the foreign parent: the base revision and the branch revision both appear. (A range longer than the log page size answers a page at a time, X-Log-Next naming the next page\'s since.)', expect: 200,
         run: (c) => c.req('GET', `/r/${c.v.br}/page/rev/${c.v.b1}/log`) },
       { t: 'Base is untouched by the branch write', why: 'The base still reads "Base v2" on its own chain.', expect: 200,
         run: (c) => c.req('GET', `/r/${c.ns}/page`) },

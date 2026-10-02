@@ -18,6 +18,7 @@
 package follow
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -316,7 +317,8 @@ func (n *nsFollower) bootstrapBranch(ctx context.Context) error {
 				return nil, err
 			}
 		}
-		entries, err := n.f.c.NSLog(ctx, n.ns, h.ID, "")
+		// The first page holds the first entry (§7.1 Paging).
+		entries, _, err := n.f.c.NSLogPage(ctx, n.ns, h.ID, "")
 		if err != nil {
 			return nil, err
 		}
@@ -352,21 +354,38 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *clien
 	return n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: units, From: n.cur, NewCheckpoint: at, Snapshot: true})
 }
 
-// catchUp replays the immutable range from the checkpoint to the head.
+// catchUp replays the immutable range from the checkpoint to the head,
+// page by page (§7.1, §10 Catch up): each page is delivered, and the
+// checkpoint advanced, before the next is fetched.
 func (n *nsFollower) catchUp(ctx context.Context) error {
 	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
 	if err != nil {
 		return err
 	}
 	head := v.(*client.NSHead)
-	if head.ID == n.cur {
-		return nil
+	for n.cur != head.ID {
+		type page struct {
+			entries []client.NSEntry
+			next    string
+		}
+		v, err = n.f.retryValue(ctx, n.ns, func() (any, error) {
+			es, next, err := n.f.c.NSLogPage(ctx, n.ns, head.ID, n.cur)
+			return page{es, next}, err
+		})
+		if err != nil {
+			return err
+		}
+		p := v.(page)
+		if err := n.deliver(ctx, p.entries); err != nil {
+			return err
+		}
+		// deliver moved the checkpoint to the page's last entry: the next
+		// page's since (X-Log-Next), or the head.
+		if want := cmp.Or(p.next, head.ID); n.cur != want {
+			return fmt.Errorf("follow: %s: caught up to %s, not %s", n.ns, n.cur, want)
+		}
 	}
-	v, err = n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSLog(ctx, n.ns, head.ID, n.cur) })
-	if err != nil {
-		return err
-	}
-	return n.deliver(ctx, v.([]client.NSEntry))
+	return nil
 }
 
 func (n *nsFollower) followLongPoll(ctx context.Context) error {

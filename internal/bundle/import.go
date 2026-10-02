@@ -517,7 +517,9 @@ func (im *importer) inChain(ctx context.Context, ns, name, head, id string) (boo
 	if head == id {
 		return true, nil
 	}
-	_, err := im.c.Log(ctx, ns, name, head, id)
+	// One page answers it: ancestry is decided for the whole range on
+	// every page (§7.1 Paging).
+	_, _, err := im.c.LogPage(ctx, ns, name, head, id)
 	switch {
 	case err == nil:
 		return true, nil

@@ -19,7 +19,9 @@ type headItem struct {
 }
 
 // listHeads lists every resource of n as of asOf (nil = now), including
-// read-through ones, sorted by name.
+// read-through ones, sorted by name in ascending byte order (§7.4), by Go's
+// string order and never by the database's collation, which on Postgres may
+// order punctuation otherwise.
 func (t *tx) listHeads(n *nsRow, asOf *int64) []headItem {
 	names := map[string]bool{}
 	t.collectNames(n, names)
@@ -218,14 +220,16 @@ type Log struct {
 	EntryJWEs []string
 	Range     string
 	Last      string // id of the last entry returned (or since)
+	More      bool   // the range goes on past Last: a page (§7.1), Last the next since (X-Log-Next)
 	Horizon   string
 	Archive   string // with Horizon: the archive holding the newest pruned entry, if any
 	Public    bool
 }
 
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
-// empty it serves from the current head, up to limit entries after since
-// (for long-poll and SSE).
+// empty it serves from the current head (for long-poll and SSE). Either
+// way it answers at most limit entries after since (0: all), oldest first,
+// and sets More when the range goes on (§7.1 Paging, §7.7).
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
@@ -270,7 +274,7 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			}
 			sinceID = &sid
 		}
-		entries, err := t.logBetween(to, sinceID)
+		entries, more, err := t.logBetween(to, sinceID, limit)
 		if err != nil {
 			var pe *prunedError
 			switch {
@@ -284,14 +288,15 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			}
 			return nil
 		}
-		if limit > 0 && len(entries) > limit {
-			entries = entries[:limit]
-		}
-		out.Status = 200
+		out.Status, out.More = 200, more
 		out.Last = since
 		if sinceID != nil && id != "" && t.e2eContent(n, name) {
 			// An e2e range starting at a snapshot (a pruning horizon)
-			// begins with it (§8.6): the client folds from there.
+			// begins with it (§8.6): the client folds from there. A page
+			// is a range of its own, so a later page whose since is a
+			// snapshot begins with it too (clients skip it there). It
+			// isn't an entry of the range, so it doesn't count towards
+			// the page size.
 			if srow := t.findInAncestry(to, *sinceID); srow != nil {
 				if jwe := t.e2eSnapshot(srow); jwe != "" {
 					out.Entries = append(out.Entries, map[string]any{"id": since, "kind": "snapshot", "snapshot": jwe})
@@ -396,16 +401,21 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 }
 
 // NamespaceLog serves /ns/{ns}/rev/{ns_id}/log?since= (§7.4). With nsID
-// empty it serves from the current head, up to limit entries after since.
+// empty it serves from the current head (for long-poll). Either way it
+// answers at most limit entries after since (0: all), oldest first, and
+// sets More when the range goes on (§7.1 Paging, §7.7). In a sealed
+// namespace the answer is one JWE for the page actually served, pl.range
+// [since, Last] (§E.2.2).
 func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials) (*Log, error) {
 	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false)
 }
 
-// NamespaceEvents is NamespaceLog from the current head for event streams:
-// in a sealed namespace each entry is sealed on its own, as the range
-// (prev, id] (EntryJWEs).
-func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, cred Credentials) (*Log, error) {
-	return e.namespaceLog(ctx, ns, "", since, 0, cred, true)
+// NamespaceEvents is NamespaceLog from the current head for event streams,
+// at most limit entries (0: all) with More set when there are more: in a
+// sealed namespace each entry is sealed on its own, as the range (prev, id]
+// (EntryJWEs).
+func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit int, cred Credentials) (*Log, error) {
+	return e.namespaceLog(ctx, ns, "", since, limit, cred, true)
 }
 
 func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool) (*Log, error) {
@@ -482,6 +492,9 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)
 		}
+		// A namespace's chain runs in seq order, so a page that stops
+		// short of toSeq is a prefix of the range.
+		out.More = len(rs) > 0 && rs[len(rs)-1].seq < toSeq
 		if t.isSealedNS(n) {
 			out.Sealed, nsRowID = true, n.id
 			if perEntry {
@@ -491,8 +504,11 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 					jobs = append(jobs, t.rangeJob(n, prev, r.seq, m["id"].(string), func() []byte { return jsonv.Canonical([]any{m}) }))
 				}
 			} else if len(rs) > 0 || nsID != "" {
-				// A range, even an empty one, is sealed as a whole. A
-				// live read with nothing new has no range (204).
+				// A range, even an empty one, is sealed as a whole, with
+				// the bounds of the page actually served: [since, last]
+				// (§7.1, §E.2.2). The same page of a range up to a later
+				// id, or of a live read, is the same bytes. A live read
+				// with nothing new has no range (204).
 				entries := make([]any, len(out.Entries))
 				for i, m := range out.Entries {
 					entries[i] = m
@@ -528,7 +544,10 @@ type HeadsPage struct {
 	Public bool             `json:"-"`
 }
 
-// NamespaceHeads lists every resource as of a namespace revision.
+// NamespaceHeads lists every resource as of a namespace revision, including
+// those a branch reads through, in ascending byte order of name after after
+// (a byte-order bound, not necessarily a name), a page of at most the log
+// page size (§7.4).
 func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cred Credentials) (*HeadsPage, error) {
 	var out *HeadsPage
 	err := e.read(ctx, func(t *tx) error {
@@ -547,7 +566,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		out = &HeadsPage{Items: []map[string]any{}, Public: t.cachePublic(n)}
 		limit := e.opt.Maximums.LogPageSize
 		for _, h := range t.listHeads(n, &seq) {
-			if h.name <= after {
+			if h.name <= after { // byte order, as listHeads sorts
 				continue
 			}
 			if len(out.Items) == limit {

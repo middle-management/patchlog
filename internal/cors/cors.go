@@ -5,11 +5,14 @@
 // C), which a page sets itself, so cross-origin reads and writes need no
 // cookies: Access-Control-Allow-Credentials is sent only when configured.
 //
-// With "*", every origin is allowed and responses are the same for all of
-// them, so shared caches (the CDN, §9) keep one copy. With a list, the
+// With "*", every origin is allowed and every response says so, whether or
+// not the request names an origin, so responses are the same for all of
+// them and shared caches (the CDN, §9) keep one copy: one fetched without
+// Origin (curl, a service, a same-origin page) serves a cross-origin page
+// too. With a list (or with credentials, which need the origin named), the
 // matching origin is echoed and every response carries Vary: Origin, so a
 // cache keeps one copy per origin and never serves one origin's allowance
-// to another.
+// to another (§7 "Browsers").
 package cors
 
 import (
@@ -45,8 +48,10 @@ const Methods = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
 const Headers = "Authorization, Content-Type, If-Match, If-None-Match, If-Range, Range, Signature, Source-Authorization, Blob-From, Blob-Nonce, Last-Event-ID, X-Author"
 
 // Exposed are the response headers pages may read beyond the safelisted
-// ones.
-const Exposed = "ETag, Location, Retry-After, Allow, WWW-Authenticate, Accept-Ranges, Content-Range, X-Namespace-Revision, X-Config-Revision, X-Revision, X-Cursor, X-E2E"
+// ones: at least those §7 "Browsers" lists, among them X-Log-Next, without
+// which a page can't follow a paged log range (§7.1) and must treat its
+// first page as truncated.
+const Exposed = "ETag, Location, Retry-After, Allow, WWW-Authenticate, Accept-Ranges, Content-Range, X-Namespace-Revision, X-Config-Revision, X-Revision, X-Cursor, X-Log-Next, X-E2E"
 
 // Parse splits comma-separated origins, as given on the command line, and
 // checks them: each is "*" or a scheme://host[:port] without a path.
@@ -88,17 +93,23 @@ func Wrap(h http.Handler, c Config) http.Handler {
 		maxAge = 10 * time.Minute
 	}
 	age := strconv.Itoa(int(maxAge.Seconds()))
+	// The answer varies by origin unless every origin gets "*": credentials
+	// need the origin named, even with "*" configured (§7 Browsers).
+	echo := !anyOrigin || c.Credentials
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hd := w.Header()
-		if !anyOrigin {
+		if echo {
 			// Before the handler writes anything: it adds its own Vary
 			// values (Authorization) rather than replacing these.
 			hd.Add("Vary", "Origin")
 		}
 		origin := r.Header.Get("Origin")
-		allowed := origin != "" && (anyOrigin || slices.Contains(c.Origins, origin))
+		// Without echo the answer allows every origin, so it doesn't
+		// depend on the request's: it carries the allowance even without
+		// Origin, or it would vary by origin without saying so.
+		allowed := !echo || origin != "" && (anyOrigin || slices.Contains(c.Origins, origin))
 		if allowed {
-			if anyOrigin && !c.Credentials {
+			if !echo {
 				hd.Set("Access-Control-Allow-Origin", "*")
 			} else {
 				hd.Set("Access-Control-Allow-Origin", origin)
@@ -109,7 +120,7 @@ func Wrap(h http.Handler, c Config) http.Handler {
 		}
 		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 			// A preflight: answered here, never by the API.
-			if !anyOrigin {
+			if echo {
 				hd.Add("Vary", "Access-Control-Request-Method")
 				hd.Add("Vary", "Access-Control-Request-Headers")
 			}
