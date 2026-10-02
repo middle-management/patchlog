@@ -49,6 +49,7 @@ type world struct {
 	ops      *client.Client // "*" key on both namespaces
 	idp, cat clienttest.Key
 	opsKey   clienttest.Key // "*" on both namespaces
+	mergeKey clienttest.Key // the catalog service's merge key (§F.8)
 	svc      *catalog.Service
 	http     *httptest.Server
 	cancel   context.CancelFunc
@@ -130,7 +131,10 @@ func setupWith(t *testing.T, sealed bool) *world {
 	}
 	s := clienttest.New(t, o)
 	opsKey, idp, catKey := clienttest.NewKey("ops"), clienttest.NewKey("idp"), clienttest.NewKey("catalog-01")
-	w := &world{t: t, s: s, idp: idp, cat: catKey, opsKey: opsKey, sealed: sealed}
+	w := &world{t: t, s: s, idp: idp, cat: catKey, opsKey: opsKey, sealed: sealed, mergeKey: clienttest.NewKey("catalog-merge")}
+	mergeEntry := w.mergeKey.Entry("create", "append", "delete", "restore")
+	mergeEntry["maxTtl"] = "PT10M"
+	mergeEntry["requireAt"] = true
 
 	catEntry := catKey.Entry("read", "create", "append", "delete", "restore")
 	catEntry["maxTtl"] = "PT15M"
@@ -140,7 +144,7 @@ func setupWith(t *testing.T, sealed bool) *world {
 	opc := s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat")))
 	must(opc.CreateNamespace(ctx, "cat", enc(map[string]any{
 		"read":    "grant",
-		"keys":    []any{opsKey.Entry("*"), idp.Entry(), catEntry},
+		"keys":    []any{opsKey.Entry("*"), idp.Entry(), catEntry, mergeEntry},
 		"maxLag":  "PT60S",
 		"catalog": map[string]any{"trust": toAny("matches"), "mode": "dag"},
 		"roles": map[string]any{
@@ -180,6 +184,7 @@ func (w *world) start() {
 			Logf:          func(f string, a ...any) { w.t.Logf(f, a...) },
 			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}},
 		Key: w.cat.Priv, Kid: "catalog-01",
+		MergeKey: w.mergeKey.Priv, MergeKid: "catalog-merge", MergeService: "svc:merge",
 	})
 	if err != nil {
 		w.t.Fatal(err)
@@ -289,6 +294,11 @@ var noRedirect = &http.Client{CheckRedirect: func(*http.Request, []*http.Request
 
 func (w *world) do(method, path, token string, body any) resp {
 	w.t.Helper()
+	return w.doWith(method, path, token, body, nil)
+}
+
+func (w *world) doWith(method, path, token string, body any, hdr map[string]string) resp {
+	w.t.Helper()
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(must(json.Marshal(body)))
@@ -296,6 +306,9 @@ func (w *world) do(method, path, token string, body any) resp {
 	req := must(http.NewRequest(method, w.http.URL+path, rd))
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	for k, v := range hdr {
+		req.Header.Set(k, v)
 	}
 	r := must(noRedirect.Do(req))
 	defer r.Body.Close()

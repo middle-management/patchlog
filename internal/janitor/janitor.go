@@ -2,12 +2,12 @@
 // namespaces, discovers their branches (recursively), and purges a branch
 // (§8.5) only when all of these hold:
 //
-//   - it is frozen, and merged or superseded, and the claim is verified
-//     (below), never trusted;
+//   - it is frozen, and merged, superseded or abandoned, and the claim is
+//     verified (below), never trusted;
 //   - its cleanup period has passed since it was frozen: the branch
 //     document's "cleanup": { "merged": ISO duration, "superseded": ISO
-//     duration } for the verified claim, measured from the created time of
-//     the config entry that froze it;
+//     duration, "abandoned": ISO duration } for the verified claim,
+//     measured from the created time of the config entry that froze it;
 //   - so has the base's minimum, if the base declares one;
 //   - it has no dependents that aren't purged (leaves are purged first).
 //
@@ -33,6 +33,12 @@
 //     the branch and whose source.at is in the branch's chain, with nothing
 //     after it in the branch. §F.6 asks for no merge.authors check here:
 //     the successor is a branch too, and its batches are the rebase.
+//   - abandoned: the branch's document has "abandoned": true, set by a
+//     config write whose recorded grant chains to a * key of the branch,
+//     inherited or its own (§F.6): the entry's kid names a key with scope
+//     "*" in the branch's document as of that write, or in a base's. With
+//     authentication disabled entries carry no kid, and the claim is taken
+//     as the development server's operator's.
 //   - a branch with no head, tombstone or batch entry of its own counts as
 //     merged.
 //   - at E3, entries for the branch's keyring resource don't count in any
@@ -96,7 +102,8 @@ type Decision struct {
 	NS     string `json:"ns"`
 	Base   string `json:"base"`
 	Action string `json:"action"`
-	// Claim is the verified claim ("merged" or "superseded"), if any.
+	// Claim is the verified claim ("merged", "superseded" or
+	// "abandoned"), if any.
 	Claim  string `json:"claim,omitempty"`
 	Reason string `json:"reason"`
 	// FrozenAt and EligibleAt are set once the claim is verified.
@@ -338,8 +345,21 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 		}
 	}
 	if d.Claim == "" {
+		if ab, _ := doc.Value["abandoned"].(bool); ab {
+			ok, reason, err := j.verifyAbandoned(ctx, ns, log)
+			if err != nil {
+				return d, err
+			}
+			if ok {
+				d.Claim = "abandoned"
+			} else {
+				why = append(why, "abandoned claim not verified: "+reason)
+			}
+		}
+	}
+	if d.Claim == "" {
 		if len(why) == 0 {
-			why = append(why, "frozen, but neither merged nor superseded")
+			why = append(why, "frozen, but neither merged, superseded nor abandoned")
 		}
 		d.Reason = strings.Join(why, "; ")
 		return d, nil
@@ -580,6 +600,75 @@ func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, b
 	// §F.6 names no merge.authors check for the successor's batch.
 	ok, why := coveredBy(entries, ns, blog, nil, e2e)
 	return ok, why, nil
+}
+
+// verifyAbandoned checks an abandoned claim (§F.6): the config write that
+// set "abandoned": true was made under a grant chained to a * key of the
+// branch, inherited or its own. Only its administrators can give up
+// everyone's unmerged work.
+func (j *Janitor) verifyAbandoned(ctx context.Context, ns string, log []client.NSEntry) (bool, string, error) {
+	var setter *client.NSEntry
+	was := false
+	for i := range log {
+		e := log[i]
+		isConfig := e.Kind == "config" || (e.Kind == "batch" && len(e.Entries) > 0 && e.Entries[0].Kind == "config")
+		if !isConfig {
+			continue
+		}
+		d, err := j.c.NSDoc(ctx, ns, e.ID)
+		if err != nil {
+			return false, "", err
+		}
+		ab, _ := d.Value["abandoned"].(bool)
+		if ab && !was {
+			setter = &log[i]
+		}
+		was = ab
+	}
+	if setter == nil {
+		return false, "no config write set abandoned", nil
+	}
+	if setter.Kid == "" {
+		return true, "", nil // authentication disabled: the operator's
+	}
+	d, err := j.c.NSDoc(ctx, ns, setter.ID)
+	if err != nil {
+		return false, "", err
+	}
+	docs := []map[string]any{d.Value}
+	for cur, i := d.Value, 0; i < 64; i++ {
+		bref, _ := cur["base"].(map[string]any)
+		bns, _ := bref["ns"].(string)
+		if bns == "" {
+			break
+		}
+		bh, err := j.c.NSHead(ctx, bns)
+		if err != nil {
+			break // an unreadable base: its keys can't be checked
+		}
+		bd, err := j.c.NSDoc(ctx, bns, bh.ID)
+		if err != nil {
+			break
+		}
+		docs = append(docs, bd.Value)
+		cur = bd.Value
+	}
+	for _, doc := range docs {
+		keys, _ := doc["keys"].([]any)
+		for _, k := range keys {
+			km, _ := k.(map[string]any)
+			if km["kid"] != setter.Kid {
+				continue
+			}
+			can, _ := km["can"].([]any)
+			for _, c := range can {
+				if c == "*" {
+					return true, "", nil
+				}
+			}
+		}
+	}
+	return false, fmt.Sprintf("the config write %s that set it was by %s under key %q, not a * key of the branch", setter.ID, setter.Author, setter.Kid), nil
 }
 
 // frozenSince returns the created time of the config entry that froze the

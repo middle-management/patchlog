@@ -4,7 +4,7 @@
 //
 //	// /r/releases/release-7
 //	{ "name": "release-7",
-//	  "at": "1c…",                                   // combined checkpoint the branches started from (§B.5)
+//	  "at": "1c…",                                   // optional: combined checkpoint the branches started from (§B.5)
 //	  "branches": { "matches":    { "ns": "matches-r7",    "at": "1k…" },
 //	                "cat-season": { "ns": "cat-season-r7", "at": "1m…" },
 //	                "schemas":    { "ns": "schemas-r7",    "at": "1d…" } },
@@ -49,7 +49,8 @@ type Branch struct {
 type Doc struct {
 	Name string `json:"name"`
 	// At is the combined checkpoint the branches started from (§B.5),
-	// optional (a rebased release has no single one).
+	// optional, and dropped after a rebase. Each branch's own at is
+	// authoritative (§F.9 Starting); tools never use this one in its place.
 	At string `json:"at,omitempty"`
 	// Branches maps the namespace paths name to its branch.
 	Branches map[string]Branch `json:"branches"`

@@ -2,7 +2,7 @@ package main
 
 // Releases across namespaces (§F.9):
 //
-//	patchlog merge release plan|approve|apply|status|rebase -api URL [flags] /r/{ns}/{release}
+//	patchlog merge release plan|approve|apply|status|rebase|abandon -api URL [flags] /r/{ns}/{release}
 //
 // plan classifies the release and reports its conflicts, and stores the
 // plan (as {release}.merge in -state-ns, default the release document's
@@ -13,7 +13,15 @@ package main
 // changes that widen it), each classified again with a dry run right
 // before it is submitted, and resumes a merge that stopped. status shows
 // the stored plan. rebase creates a successor of every branch (§F.5) and
-// writes a new revision of the release document listing them.
+// writes a new revision of the release document listing them. abandon
+// freezes every branch with abandoned: true (needs a * key, §F.6).
+//
+// Catalog batches (§F.8): -merge-bearer is the merge service's own grant
+// for the catalog (merge grants are issued only to it); -bearer, the
+// person's, is the approver whose powers the catalog service checks, and
+// for a batch that changes $access the catalog admin's grant it is
+// submitted under, narrowed with the merge service's via. Without
+// -merge-bearer, -bearer is sent for both.
 
 import (
 	"context"
@@ -31,9 +39,10 @@ import (
 
 const releaseUsage = `usage:
   patchlog merge release plan|approve|apply|status -api URL [-bearer T] [-author A] [-state-ns NS]
-          [-catalog-service CAT=URL]... [-split KEY/NODE=narrow.json]... [-accept-placement NS.NAME]...
-          [-resolve KEY/NAME=file.json]... [-source-grant G]... [-dry-run] [-json] /r/{ns}/{release}
-  patchlog merge release rebase -api URL -suffix SUFFIX [-at ID] [-bearer T] [-author A] [-json] /r/{ns}/{release}`
+          [-catalog-service CAT=URL]... [-merge-bearer G] [-split KEY/NODE=narrow.json]... [-accept-placement NS.NAME]...
+          [-resolve KEY/NAME=file.json]... [-source-grant G]... [-digest D] [-dry-run] [-json] /r/{ns}/{release}
+  patchlog merge release rebase -api URL -suffix SUFFIX [-at ID] [-bearer T] [-author A] [-json] /r/{ns}/{release}
+  patchlog merge release abandon -api URL [-bearer T] [-author A] [-state-ns NS] /r/{ns}/{release}`
 
 func releaseCmd(args []string) {
 	if len(args) < 1 {
@@ -42,7 +51,7 @@ func releaseCmd(args []string) {
 	}
 	sub := args[0]
 	switch sub {
-	case "plan", "approve", "apply", "status", "rebase":
+	case "plan", "approve", "apply", "status", "rebase", "abandon":
 	default:
 		fmt.Fprintln(os.Stderr, releaseUsage)
 		os.Exit(2)
@@ -53,6 +62,8 @@ func releaseCmd(args []string) {
 	dry := fs.Bool("dry-run", false, "plan: report only, store nothing")
 	suffix := fs.String("suffix", "", "rebase: successor names are each branch's name plus this suffix")
 	at := fs.String("at", "", "rebase: the new release document's combined checkpoint (§B.5), if known")
+	digest := fs.String("digest", "", "approve: the plan digest you reviewed (plan prints it); approval fails unless planning again gives it (§F.9)")
+	mergeBearer := fs.String("merge-bearer", "", "the merge service's own grant for catalogs, sent to catalog services as Authorization (§F.8); its root sub is the via of narrowed admin grants")
 	var catSvcs, splits, accepts, resolves, srcGrants multi
 	fs.Var(&catSvcs, "catalog-service", "CAT=URL: the catalog service that signs merge grants for catalog base CAT (§F.8); repeatable")
 	fs.Var(&splits, "split", "KEY/NODE=narrow.json: a catalog node that narrows and widens, merged in two halves; the file is its document after the narrowing step (§F.9); repeatable")
@@ -114,9 +125,37 @@ func releaseCmd(args []string) {
 		return
 	}
 
-	opt := merge.ReleaseOptions{Release: link, StateNS: *stateNS, Accept: accepts, SourceAuthorizations: srcGrants, Who: whoAmI(tf)}
+	if sub == "abandon" {
+		abandoned, err := merge.AbandonRelease(ctx, c, merge.ReleaseOptions{Release: link, StateNS: *stateNS, Who: whoAmI(tf)})
+		if *tf.asJSON {
+			out := map[string]any{"abandoned": abandoned}
+			if err != nil {
+				out["error"] = err.Error()
+			}
+			printJSON(out)
+		} else {
+			for _, ns := range abandoned {
+				fmt.Printf("%s: frozen, abandoned\n", ns)
+			}
+		}
+		if err != nil {
+			toolFatal(err)
+		}
+		return
+	}
+
+	opt := merge.ReleaseOptions{Release: link, StateNS: *stateNS, Accept: accepts, SourceAuthorizations: srcGrants, Who: whoAmI(tf),
+		Digest: *digest, AdminGrant: *tf.bearer}
+	if *mergeBearer != "" {
+		if g, err := grant.Decode(*mergeBearer, 0); err == nil && len(g.Blocks) > 0 {
+			opt.Via = g.Blocks[0].Sub
+		}
+	}
 	if len(catSvcs) > 0 {
 		g := &merge.HTTPGranter{URLs: map[string]string{}, Bearer: *tf.bearer, Author: *tf.author}
+		if *mergeBearer != "" {
+			g.Bearer, g.Approver = *mergeBearer, *tf.bearer
+		}
 		for _, s := range catSvcs {
 			k, u, ok := strings.Cut(s, "=")
 			if !ok {
@@ -224,6 +263,9 @@ func whoAmI(tf toolFlags) string {
 
 func printReleasePlan(rp *merge.ReleasePlan) {
 	fmt.Printf("release %s at %s: %s\n", rp.Release, short(rp.Revision), rp.State)
+	if rp.Digest != "" {
+		fmt.Printf("  digest %s (approve with -digest %s)\n", rp.Digest, rp.Digest)
+	}
 	if rp.ApprovedBy != "" {
 		fmt.Printf("  approved by %s at %s\n", rp.ApprovedBy, rp.ApprovedAt)
 	}
