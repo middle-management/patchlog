@@ -275,6 +275,11 @@ func TestE2EGateAndReads(t *testing.T) {
 	// A /doc rule doesn't block deletes: they are checked as usual (doc null).
 	expect(t, e.patchNS("e", ops(op("replace", "/rules", []any{docRule})), f.adminG), 201)
 	e.del("e", "b", e.head("e", "b", f.readerG), f.writerG)
+	// A delete rule reading /doc fails: the server can't see the document.
+	delDocRule := map[string]any{"if": []any{map[string]any{"op": "test", "path": "/action", "value": "delete"}},
+		"then": []any{map[string]any{"op": "test", "path": "/doc/n", "exists": true}}}
+	expect(t, e.patchNS("e", ops(op("replace", "/rules", []any{delDocRule})), f.adminG), 201)
+	expectCode(t, e.write("DELETE", "e", "d", d4, nil, f.writerG), 422, "rule")
 	expect(t, e.patchNS("e", ops(op("remove", "/rules")), f.adminG), 201)
 
 	// Grant rules reading writes: 403; rules on /resource still apply.

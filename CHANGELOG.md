@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The rule envelope of a `delete` now carries the document being deleted as `doc` (read through in a branch; after the item's earlier steps in a batch), so rules can decide deletes by content, e.g. owner-only deletes. Before, it was `null`. This goes ahead of the spec text (§6.4.1). At E3 `doc` stays `null`, so a delete rule reading `/doc` refuses there.
+  - **Check before upgrading:** a rule that relied on `/doc` being absent for deletes (e.g. `test /doc exists: false` to single out deletes) now behaves differently; test `/action` instead.
+
 ## v0.5.0
 
 Implements spec **v0.34**: feedback from implementing v0.33 (drafts, `in_use`, release tooling, D.8 locking).

@@ -1113,7 +1113,8 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   namespace rule that reads `writes`, `/doc` or the whole envelope (`rules.Rule.Refs()`) fails
   every such write as a whole with `422 rule`; such a grant, key or role rule with `403` (a role
   with one doesn't allow it). Rules on `/action`, `/resource`, `/principal`, `/now` and
-  `/patches` work. Deletes, config, branch and prune writes are checked as usual.
+  `/patches` work. Deletes, config, branch and prune writes are checked as usual; a delete's
+  `doc` is `null` here, so a delete rule that reads `/doc` refuses every delete.
 - **No documents on the server.** No head documents, intermediate snapshots or document cache
   for e2e content; the `$schema` index (§6.1 `in_use`, prune protection) sees nothing, and a
   `$schema` into an e2e namespace is `schema_unavailable`.
@@ -1412,6 +1413,13 @@ just doesn't apply).
 
 ## Design notes
 
+- **A delete's `doc` (ahead of §6.4.1).** The envelope of a `delete` carries the document
+  being deleted as `doc`: the resource's last live document as the namespace sees it (read
+  through its bases in a branch, or produced by the item's earlier steps in a batch).
+  `patches` is `[]` and `writes` is `[]`, as before. Rules can then decide deletes by content,
+  e.g. only a document's owner may delete it:
+  `{"if":[{"op":"test","path":"/action","value":"delete"}],"then":[{"op":"compare","path":"/doc/owner","eq":{"path":"/principal/id"}}]}`.
+  At E3 the server can't see the document, so `doc` stays `null`. `purge` keeps `doc: null`.
 - **Heavy work outside the write lock (D.3).** Resource writes and batches run steps 1–6 of
   the gate (§6.2: authorisation and rate limits, idempotent-retry lookup, frozen,
   precondition, apply, limits, schema validation, rules) in a read transaction, without the

@@ -1225,7 +1225,11 @@ func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor) map[string]an
 	}
 	env["writes"] = w
 	if step.del {
-		env["doc"] = nil
+		// The document being deleted: the resource's last live document as
+		// this namespace sees it (read through in a branch), so rules can
+		// decide deletes by content, e.g. by an owner field. Null at E3,
+		// where the server can't see it, so a rule reading doc fails there.
+		env["doc"] = step.doc
 		env["patches"] = []any{}
 	} else {
 		env["doc"] = step.doc
