@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.6.0
 
 Implements spec **v0.35**: a delete's rule envelope carries the document being deleted.
 
