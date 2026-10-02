@@ -321,19 +321,25 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   an instance without the directory can't serve bytes stored in files.
 - **Several instances** can share the database (rolling deploys, horizontal scaling). Writes
   take transaction-scoped advisory locks per namespace, `pg_advisory_xact_lock(0x504c, ns)`,
-  in ascending order. Config writes, purges, prunes, branch operations and blob uploads take
-  them exclusive on every namespace they change (the written one; a branch's base, which
-  receives the `branch` entry; every branch and remote shadow a purge reaches). Resource
-  writes and batches take their own namespace's lock **shared**, like every namespace a
-  decision read (bases whose keys and revocations a branch write re-checks, the namespaces
-  `$schema` and `$ref` resolve into, a batch source), so writers of different resources of
-  one namespace check and insert in parallel, and a namespace's configuration, frozen and
-  purged flags can't change under them. Two writers of the same resource settle it on insert:
-  the chain's unique constraints, and the resource's head moving only from the one the
-  precondition matched, make the loser re-check and answer `412` with the new head (or the
-  idempotent retry), as on SQLite. The namespace entry is appended last, at the head read with
-  `SELECT … FOR NO KEY UPDATE` on the namespace row, held until commit, so entries commit in
-  chain order. Details in `internal/core/pglock.go`.
+  in ascending order. Writes that change a namespace's configuration or state (config writes,
+  purges, prunes, branch operations, freezing, the pending-blob sweep) take them exclusive on
+  every namespace they change (the written one; a branch's base, which receives the `branch`
+  entry; every branch and remote shadow a purge reaches). Resource writes, batches and blob
+  uploads take their own namespace's lock **shared**, like every namespace a decision read
+  (bases whose keys and revocations a branch write re-checks, the namespaces `$schema` and
+  `$ref` resolve into, a batch source), so writers of different resources of one namespace
+  check and insert in parallel, and a namespace's configuration, frozen and purged flags can't
+  change under them. Two writers of the same resource settle it on insert: the chain's unique
+  constraints, and the resource's head moving only from the one the precondition matched, make
+  the loser re-check and answer `412` with the new head (or the idempotent retry), as on
+  SQLite. The namespace entry is appended last, under a separate advisory **log lock**,
+  `pg_advisory_xact_lock(0x504e, ns)`, taken after every other lock, in ascending order when a
+  write appends to several logs (purge propagation, branch creation), and held through commit,
+  so entries commit, and their sequence numbers grow, in chain order. A transaction holding a
+  log lock never waits for a namespace lock (it tries, and restarts with the lock taken up
+  front if that fails). An uploader's pending blob total (§7.8) is ordered by a row of its
+  own (`blob_uploaders`), so concurrent uploads can't together exceed `blobPending`. Details in
+  `internal/core/pglock.go`.
 - **Round trips.** Each statement is one, so a write costs what its statements cost: about
   13 for a small append (begin, lock, namespace, resource, head, retry lookup, insert, head,
   heads, chain, commit) and 10 for a create, about 3 ms on a local `postgres:16` with `fsync` on,

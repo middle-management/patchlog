@@ -863,6 +863,14 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	if r := t.resource(n.id, name); r != nil {
 		res = r.id
 	}
+	if t.e.pg && t.write {
+		// The namespace's lock is only shared (D.8): the uploader's row
+		// orders its concurrent uploads, so their pending total is read
+		// after the other's commit (blob_uploaders).
+		_, err := t.Exec(`INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?)
+			ON CONFLICT (ns, uploader) DO UPDATE SET uploader = excluded.uploader`, n.id, g.uploader)
+		t.must(err)
+	}
 	t.must(t.QueryRow(`SELECT COALESCE(SUM(CASE WHEN p.size < ? THEN ? ELSE p.size END), 0)
 		FROM blob_pending p JOIN resources r ON r.res = p.res
 		WHERE r.ns = ? AND p.uploader = ? AND p.created >= ? AND NOT (p.res = ? AND p.bid = ?)`,

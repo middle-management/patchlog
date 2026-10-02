@@ -433,7 +433,13 @@ type tx struct {
 	// them, and whether reading namespaces locks them (noLock > 0: no).
 	locks  map[int32]lockMode
 	maxKey int32
-	noLock int
+	// logLocks are the log locks held (logClass, D.8), maxLogKey the
+	// largest, and logPlan the ones a restarted transaction takes in
+	// ascending order at its first append (errRelock).
+	logLocks  map[int32]bool
+	maxLogKey int32
+	logPlan   map[int32]bool
+	noLock    int
 	// sharedNS is the namespace a resource write or batch appends to
 	// holding its lock only shared (pglock.go); 0 if none.
 	sharedNS int64
@@ -510,27 +516,28 @@ func (e *Engine) update1(ctx context.Context, f func(t *tx) error) (rotate []str
 		e.stmts.prepare(e.db)
 		e.mu.Lock()
 		defer e.mu.Unlock()
-		return e.updateOnce(ctx, f, nil)
+		return e.updateOnce(ctx, f, nil, nil)
 	}
 	// Postgres: advisory locks instead of the mutex (pglock.go). A
 	// transaction that rolled back to take its locks in order, or on a
 	// deadlock or a shared row's unique violation, runs again.
 	var want map[int32]lockMode
+	var logs map[int32]bool
 	for attempt := 1; ; attempt++ {
-		rotate, err = e.updateOnce(ctx, f, want)
+		rotate, err = e.updateOnce(ctx, f, want, logs)
 		if err == nil || attempt == maxWriteAttempts || !retryable(err) || ctx.Err() != nil {
 			return rotate, err
 		}
 		var rl *errRelock
 		if errors.As(err, &rl) {
-			want = rl.want
+			want, logs = rl.want, rl.logs
 		}
 	}
 }
 
 // updateOnce runs f in one write transaction, first taking the advisory
-// locks of want (Postgres).
-func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode) (rotate []string, err error) {
+// locks of want (Postgres), and the log locks of logs at its first append.
+func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[int32]lockMode, logs map[int32]bool) (rotate []string, err error) {
 	sqlTx, err := e.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -548,6 +555,7 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 		err = ctxErr(ctx, err)
 	}()
 	t.lockAll(want)
+	t.logPlan = logs
 	if err := f(t); err != nil {
 		sqlTx.Rollback()
 		e.removeFiles(t.newFiles)
@@ -841,12 +849,13 @@ type histRow struct{ res, target int64 }
 // appendNS appends an entry to a namespace chain (§3.5) and returns its seq
 // and id, recording the resource heads it moves (head_history).
 //
-// On Postgres the chain is appended to at its head as of the namespace
-// row's lock (SELECT … FOR NO KEY UPDATE), held until commit: under the
-// namespace's exclusive advisory lock it is never contended; a resource
-// write or batch holds that lock only shared (sharedNS), and the row lock
-// orders its entry with those of the other resources' writers. Rows
-// therefore commit in chain order (pglock.go).
+// On Postgres the chain is appended to at its head as of the namespace's
+// log lock (D.8), an advisory lock in a class of its own taken last, just
+// before the append, and held through commit: under the namespace's
+// exclusive state lock it is never contended; a resource write or batch
+// holds that lock only shared (sharedNS), and the log lock orders its
+// entry with those of the other resources' writers. Entries therefore
+// commit, and their seqs grow, in chain order (pglock.go).
 func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int64, configSeq int64, author int64, hist ...histRow) (int64, ids.ID) {
 	if t.locking() && t.sharedNS != n.id {
 		t.lockNS(n.id, lockExclusive)
@@ -862,13 +871,10 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 	for i, h := range hist {
 		rs[i], ts[i] = h.res, h.target
 	}
-	q := `SELECT head_seq, head_id FROM namespaces WHERE ns = ?`
-	if t.e.pg {
-		q += ` FOR NO KEY UPDATE`
-	}
+	t.lockLog(n.id)
 	var headID []byte
-	t.must(t.QueryRow(q, n.id).Scan(&n.headSeq, &headID))
-	t.forget() // read after the row's lock
+	t.must(t.QueryRow(`SELECT head_seq, head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&n.headSeq, &headID))
+	t.forget() // read after the log lock
 	var prev *ids.ID
 	var prevSeq any
 	if n.headSeq.Valid {
@@ -885,7 +891,7 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 	var seq int64
 	if t.e.pg {
 		// One statement: the entry, the namespace's head and the heads it
-		// moves, so the row lock is held for a single round trip and the
+		// moves, so the log lock is held for a single round trip and the
 		// commit.
 		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid)
 				VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),

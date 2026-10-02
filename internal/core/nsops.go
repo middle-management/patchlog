@@ -597,7 +597,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	bid := t.mustInsert(`INSERT INTO namespaces (name, base, base_at, base_config_seq) VALUES (?,?,?,?) RETURNING ns`, br.Name, base.id, atSeq, base.configSeq)
 	cseq := t.mustInsert(`INSERT INTO ns_config (ns, id, parent_seq, patches, doc, author, created) VALUES (?,?,NULL,?,?,?,?) RETURNING seq`,
 		bid, cfgID[:], string(gcanon), string(jsonv.Canonical(nd)), author, t.now.UnixMilli())
-	bn := t.nsByID(bid)
+	bn := t.nsByIDLocked(bid, lockExclusive)
+	// Both logs, in ascending key order, after every other lock (D.8).
+	t.lockLogs(base.id, bid)
 	t.appendNS(bn, map[string]any{"kind": "config", "target": cfgID.String()}, nil, &cseq, cseq, author)
 	// A sealed branch has its own epoch keys (§E.2.5).
 	t.sealedConfigWritten(bn, nil, cfg)
@@ -658,6 +660,13 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 				return err
 			}
 		}
+		// Every log the purge appends to, in ascending key order, after
+		// every other lock (D.8).
+		logs := make([]int64, 0, len(reached))
+		for id := range reached {
+			logs = append(logs, id)
+		}
+		t.lockLogs(logs...)
 		out = t.purgeResource(n, name, t.actorID(a), forced).String()
 		return nil
 	})

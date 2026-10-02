@@ -1,7 +1,9 @@
 package server
 
 import (
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -237,4 +239,40 @@ func TestV034ForcedNamespacePurge(t *testing.T) {
 	if en["kind"] != "purge-ns" || en["forced"] != true || en["id"] != hashID(t, head, canonical(map[string]any{"kind": "purge-ns", "forced": true})) {
 		t.Fatalf("forced purge-ns entry %v", en)
 	}
+}
+
+// D.8 (v0.34): blob uploads hold their namespace's lock only shared; an
+// uploader's pending total is ordered by a row of its own, so concurrent
+// uploads by one uploader can't together exceed blobPending.
+func TestV034ConcurrentUploadsPending(t *testing.T) {
+	bothDBs(t, func(t *testing.T, opts ...envOpt) {
+		e := newEnv(t, append(opts, withBlobTuning)...)
+		e.mkNS("c", map[string]any{"limits": map[string]any{"blobSize": 5000, "blobPending": 10000}})
+		const n = 8
+		codes := make([]int, n)
+		var wg sync.WaitGroup
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				r, _ := e.putBlob("c", fmt.Sprintf("r%d", i), "text/plain", "", []byte(fmt.Sprintf("%04000d", i)), "alice")
+				codes[i] = r.Code
+			}(i)
+		}
+		wg.Wait()
+		ok := 0
+		for _, c := range codes {
+			switch c {
+			case 201:
+				ok++
+			case 413:
+			default:
+				t.Fatalf("upload answered %d (%v)", c, codes)
+			}
+		}
+		// Each blob counts at least 4 KiB: two fit in 10000 bytes.
+		if ok != 2 {
+			t.Fatalf("%d uploads succeeded, want 2 (%v)", ok, codes)
+		}
+	})
 }
