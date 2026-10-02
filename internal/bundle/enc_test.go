@@ -17,12 +17,14 @@ import (
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/server"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 // §G.5: sealed bundles, access levels, and bundles of sealed (E2) and e2e
@@ -39,11 +41,13 @@ func newEncDeployment(t *testing.T, origin string) *deployment {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e, err := core.Open(core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks})
+	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}, KeyStore: ks}
+	testenv.Apply(&o)
+	e, err := core.Open(o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hs := httptest.NewServer(server.New(e))
+	hs := httptest.NewServer(clienttest.CountPages(server.New(e)))
 	t.Cleanup(func() {
 		hs.CloseClientConnections()
 		hs.Close()

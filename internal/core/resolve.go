@@ -422,13 +422,16 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 }
 
 // logBetween returns the entries after since (exclusive; nil = from the
-// first entry) up to to (inclusive), oldest first. ok is false if since is
-// not an ancestor of to. A pruned entry in the range is a prunedError.
-func (t *tx) logBetween(to *revRow, since *ids.ID) ([]LogEntry, error) {
+// first entry) up to to (inclusive), oldest first: with limit > 0 only the
+// oldest limit of them, more reporting that the range goes on (a page,
+// §7.1). A since that isn't an ancestor of to is errNotAncestor. A pruned
+// entry anywhere in the range is a prunedError, so every page of a range
+// answers alike.
+func (t *tx) logBetween(to *revRow, since *ids.ID, limit int) (entries []LogEntry, more bool, err error) {
 	// Ids and parent links survive pruning, so ancestry is decided first: a
 	// since that isn't an ancestor is 404 even across a horizon (§7.1).
 	if since != nil && t.findInAncestry(to, *since) == nil {
-		return nil, errNotAncestor
+		return nil, false, errNotAncestor
 	}
 	var rows []*revRow
 	cur := to
@@ -440,24 +443,30 @@ func (t *tx) logBetween(to *revRow, since *ids.ID) ([]LogEntry, error) {
 			var state int
 			t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, cur.res).Scan(&state))
 			if state == statePurged {
-				return nil, purgedError{}
+				return nil, false, purgedError{}
 			}
-			return nil, &prunedError{res: cur.res, seq: cur.seq}
+			return nil, false, &prunedError{res: cur.res, seq: cur.seq}
 		}
 		rows = append(rows, cur)
 		if !cur.parentSeq.Valid {
 			if since != nil {
-				return nil, errNotAncestor
+				return nil, false, errNotAncestor
 			}
 			break
 		}
 		cur = t.rev(cur.parentSeq.Int64)
 	}
-	out := make([]LogEntry, 0, len(rows))
-	for i := len(rows) - 1; i >= 0; i-- {
+	// rows run newest first. Only the page's entries are built (patch sets
+	// read and decrypted, authors looked up).
+	n := len(rows)
+	if limit > 0 && n > limit {
+		n, more = limit, true
+	}
+	out := make([]LogEntry, 0, n)
+	for i := len(rows) - 1; i >= len(rows)-n; i-- {
 		out = append(out, t.logEntry(rows[i]))
 	}
-	return out, nil
+	return out, more, nil
 }
 
 var errNotAncestor = errors.New("not an ancestor")

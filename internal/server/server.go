@@ -442,7 +442,7 @@ func (s *Server) resourceRevLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	lg, err := s.e.ResourceLog(r.Context(), ns, name, id, r.URL.Query().Get("since"), 0, creds(r))
+	lg, err := s.e.ResourceLog(r.Context(), ns, name, id, r.URL.Query().Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -450,11 +450,19 @@ func (s *Server) resourceRevLog(w http.ResponseWriter, r *http.Request) {
 	s.writeLog(w, r, lg, ns, resTags(ns, name))
 }
 
+// writeLog answers a log range (§7.1, §7.4), or a live read's error. A
+// range longer than the log page size (§6.6) answers its first page with
+// X-Log-Next naming the page's last entry, the since of the next page
+// (§7.1 Paging). Every page is a prefix of its immutable range, so it
+// caches as immutable too.
 func (s *Server) writeLog(w http.ResponseWriter, r *http.Request, lg *core.Log, ns string, tags []string) {
 	switch lg.Status {
 	case 200:
 		if !s.cache(w, r, ccImmutable, lg.Public, tags...) {
 			return
+		}
+		if lg.More {
+			w.Header().Set("X-Log-Next", lg.Last)
 		}
 		writeLogBody(w, lg)
 	case 404:
@@ -820,7 +828,7 @@ func (s *Server) nsRevLog(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	lg, err := s.e.NamespaceLog(r.Context(), ns, id, r.URL.Query().Get("since"), 0, creds(r))
+	lg, err := s.e.NamespaceLog(r.Context(), ns, id, r.URL.Query().Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1181,6 +1189,10 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			return
 		}
 		if len(lg.Entries) > 0 {
+			// A page, as a range's (fetch asks for the log page size,
+			// §7.1): header names its last entry, the next since. It
+			// carries no X-Log-Next, which continues an immutable range
+			// up to a fixed id; a live reader polls again at once anyway.
 			if !s.setLive(w, r, lg.Public, fmt.Sprintf("public, max-age=0, s-maxage=%d", int(interval.Seconds())), tags) {
 				return
 			}

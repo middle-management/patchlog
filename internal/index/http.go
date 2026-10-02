@@ -556,10 +556,11 @@ func (ix *Index) waitMin(ctx context.Context, ns, min string, wait time.Duration
 	if cur == "" {
 		return false
 	}
-	// since=min is accepted only if min is in the chain up to cur.
+	// since=min is accepted only if min is in the chain up to cur: the
+	// range's first page answers that (§7.1 Paging).
 	cctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	_, err := ix.c.NSLog(cctx, ns, cur, min)
+	_, _, err := ix.c.NSLogPage(cctx, ns, cur, min)
 	return err == nil
 }
 

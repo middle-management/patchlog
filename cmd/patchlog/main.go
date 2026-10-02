@@ -130,6 +130,7 @@ func serve(args []string) {
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
 	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
 	maxBlobPending := fs.String("max-blob-pending", "", "deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)")
+	logPageSize := fs.Int("log-page-size", 0, "log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
 	archiveDef := fs.String("archive", "", "default pruning archive destination, a file:// directory (§8.6)")
@@ -183,6 +184,12 @@ func serve(args []string) {
 	max := core.DefaultLimits()
 	if *maxItems > 0 {
 		max.ItemsPerBatch = *maxItems
+	}
+	if *logPageSize < 0 {
+		log.Fatal("-log-page-size must be positive")
+	}
+	if *logPageSize > 0 {
+		max.LogPageSize = *logPageSize
 	}
 	if *maxBatch != "" {
 		n, err := core.ParseSize(*maxBatch)

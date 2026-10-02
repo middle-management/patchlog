@@ -154,37 +154,62 @@ func parseNSLog(body any, path string) ([]NSEntry, error) {
 }
 
 // NSLog fetches the namespace log after since (exclusive; "" = from the
-// first entry) up to nsID (inclusive), oldest first (immutable). A since
-// not in the chain is a 404.
+// first entry) up to nsID (inclusive), oldest first (immutable), following
+// its pages (§7.1). A since not in the chain is a 404.
 func (c *Client) NSLog(ctx context.Context, ns, nsID, since string) ([]NSEntry, error) {
+	all := []NSEntry{}
+	for {
+		page, next, err := c.NSLogPage(ctx, ns, nsID, since)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, page...)
+		if next == "" {
+			return all, nil
+		}
+		since = next
+	}
+}
+
+// NSLogPage fetches one page of the namespace log after since up to nsID
+// (§7.1 Paging): at most the deployment's log page size of entries, oldest
+// first, and next, the since of the following page, or "" when the page
+// ends at nsID. A page that ends short of nsID without X-Log-Next is an
+// error. A sealed page is opened as the range [since, its last entry]
+// (§E.2.2).
+func (c *Client) NSLogPage(ctx context.Context, ns, nsID, since string) (entries []NSEntry, next string, err error) {
 	if err := checkNS(ns); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := checkID("namespace revision", nsID); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if err := checkOptID("since", since); err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	var q url.Values
-	if since != "" {
-		q = url.Values{"since": {since}}
-	}
-	r, err := c.do(ctx, "GET", "/ns/"+ns+"/rev/"+nsID+"/log", q, nil)
-	if err != nil {
-		return nil, err
-	}
-	if r.status != 200 {
-		return nil, r.apiError()
-	}
-	if isJOSE(r) {
-		v, err := c.openRange(ctx, ns, since, nsID, string(r.body))
-		if err != nil {
-			return nil, fmt.Errorf("client: namespace log %s: %w", ns, err)
+	next, err = c.logPage(ctx, "/ns/"+ns+"/rev/"+nsID+"/log", since, nsID, func(r *response, end string) (string, error) {
+		body := r.value()
+		if isJOSE(r) {
+			v, err := c.openRange(ctx, ns, since, end, string(r.body))
+			if err != nil {
+				return "", fmt.Errorf("client: namespace log %s: %w", ns, err)
+			}
+			body = v
 		}
-		return parseNSLog(v, r.path)
+		es, err := parseNSLog(body, r.path)
+		if err != nil {
+			return "", err
+		}
+		entries = es
+		if len(es) == 0 {
+			return "", nil
+		}
+		return es[len(es)-1].ID, nil
+	})
+	if err != nil {
+		return nil, "", err
 	}
-	return parseNSLog(r.value(), r.path)
+	return entries, next, nil
 }
 
 // HeadItem is one resource of a /heads listing.

@@ -16,9 +16,9 @@ and serves immutable, CDN-cacheable revisions.
 | Releases across namespaces: release documents, the four-step release merge (plan, approve, resume), release rebases, release previews, janitor ordering; catalog merge grants | §F.9, §F.8, §B.5 | ✅ (`patchlog merge release`, `tree -release`, `POST /merge-grants`; see [Releases across namespaces](#releases-across-namespaces-f9)) |
 | Change envelopes, rule engine (`test`, `writes`, `compare`, `all`/`any`/`not`/`if`) | §6.4 | ✅ |
 | Limits (configurable, deployment maximums) and token-bucket rate limits | §6.6 | ✅ |
-| Reads, writes, gate order, `412`/`428`, idempotent retry | §6.2, §7.1–§7.2 | ✅ |
+| Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`) | §6.2, §7.1–§7.2 | ✅ (`serve -log-page-size`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
-| Namespace documents, log, `/heads`, `/branches` | §7.4 | ✅ |
+| Namespace documents, log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
@@ -447,14 +447,17 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
   request headers the API reads are allowed (`Authorization`, `Content-Type`, `If-Match`,
   `If-None-Match`, `If-Range`, `Range`, `Signature`, `Source-Authorization`, `Blob-From`,
   `Blob-Nonce`, `Last-Event-ID`, and `X-Author`, which names the author under `serve -dev`), and the response headers it sets are exposed (`ETag`, `Location`,
-  `Retry-After`, `X-Namespace-Revision`, `X-Cursor`, …). `-cors-max-age` (default 10m) is how long
+  `Retry-After`, `Content-Range`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`,
+  `X-Cursor`, `X-Log-Next`, …), as §7 "Browsers" lists them; without `X-Log-Next` a page couldn't
+  follow a paged log range. `-cors-max-age` (default 10m) sets `Access-Control-Max-Age`, how long
   browsers cache a preflight.
 - Grants travel in `Authorization`, which a page sets itself, so cross-origin calls need no
   cookies. `-cors-credentials` adds `Access-Control-Allow-Credentials` for pages that do send
   them; it needs explicit origins.
 - With `*`, responses are the same for every origin and the CDN keeps one copy. With a list, the
   matching origin is echoed and every response says `Vary: Origin`, so the CDN keeps one copy per
-  origin and never serves one origin's allowance to another.
+  origin and never serves one origin's allowance to another. (The library echoes the origin, with
+  `Vary: Origin`, for `*` with credentials too; `serve` refuses that combination.)
 - The playground's tree and index proxies drop the services' own CORS headers; the core's apply.
 
 ### Health checks and graceful shutdown
@@ -1034,8 +1037,10 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
   - `…/rev/{id}/log` and resource long-polls: a JSON array of per-entry JWE strings, `pl { ns,
     name, id, kind: "rev" | "tombstone" }`, each sealing the plaintext entry object.
   - `GET /ns/{ns}/rev/{ns_id}`: one JWE, `pl { ns, id: ns_id, kind: "config" }`.
-  - `…/log?since=` ranges and namespace long-polls: **one** JWE per range, never compressed,
-    `pl { ns, range: [since, id] }` (`since` `""` from the start), sealing the JSON array.
+  - `…/log?since=` ranges and namespace long-polls: **one** JWE per page, never compressed,
+    `pl { ns, range: [since, last] }` (`since` `""` from the start), the bounds of the page
+    actually served (§7.1: `last` is its `X-Log-Next`, or the range's id on its last page),
+    sealing the JSON array. The long-poll page from a `since` is the same stored JWE.
   - Events: the SSE `data:` line is a JWE. Resource events carry the entry's JWE (the same
     bytes as in the log); namespace events, and `purge`/`prune` events on resource streams,
     carry the range `(prev, id]` of their one entry (the same bytes as
@@ -1503,6 +1508,22 @@ just doesn't apply).
   (§3.3). Head snapshots are kept only for documents up to 16 KiB. An intermediate snapshot is
   written after every 100 revisions or 64 KiB of patch sets, so every read folds from the nearest
   snapshot and never folds more than that (D.4).
+- **Paged log ranges** (§7.1). `…/rev/{id}/log?since=` (resources and namespaces) answers at most
+  the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first; a
+  range that goes on carries `X-Log-Next: {id}`, the page's last entry and the `since` of the
+  next page, an immutable range up to the same id, so every page caches as immutable. Errors are
+  the range's on every page: a range crossing a pruning horizon is `410` on all of them. Entries
+  are built (patch sets read and decrypted) only for the page; the ancestry walk that checks
+  `since` and the horizon still runs over the whole range. Long-polls (§7.7) answer pages of the
+  same size and shape, without `X-Log-Next` (their header names the next `since`), and `/heads`
+  pages are as long. In an e2e namespace, a page whose `since` is a prune snapshot starts with
+  that snapshot, as the first page of a range does; readers skip it on later pages. Every
+  reader follows pages and treats a page that stops short of the range's id without
+  `X-Log-Next` as an error: `client.Log`, `NSLog` (one page: `NSLogPage`) and e2e folds, and so
+  `follow` (catch-up delivers and checkpoints page by page, §10), the index (`?min` checks only
+  the first page), tree and catalog, merge, rebase, release and janitor tooling, bundle export
+  and import, remote branches mirroring and following their bases (§G.3), and the playground
+  (namespace logs, histories and e2e folds; each sealed page is opened as its own range).
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
   batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
   principal and namespace buckets, and a key scope's lower rate) and batch limits, until the
@@ -1568,6 +1589,7 @@ internal/catalog     tree-derived access and grant issuing (§B.11)
 internal/bundle      bundle format, export and import (§G.4)
 internal/archive     file:// archives for pruning and offline restore (§8.6)
 internal/pgtest      a fresh Postgres database per test (PATCHLOG_TEST_PG)
+internal/testenv     test-suite knobs: the log page size of test servers (PATCHLOG_TEST_LOG_PAGE_SIZE)
 internal/keystore    master key file and key wrapping for encryption at rest (Addendum E.1)
 internal/seal        JWE sealing, key derivation, HPKE wrapping, $nonce (Addendum E)
 internal/jsonv      I-JSON parsing, JCS canonicalisation, equality
@@ -1586,7 +1608,12 @@ internal/edge       the verifying edge's secret and private edge directives (§9
 deploy/varnish      the compose stack's local CDN (Varnish VCL)
 ```
 
-`go test ./...` runs the unit and HTTP integration tests.
+`go test ./...` runs the unit and HTTP integration tests. `PATCHLOG_TEST_LOG_PAGE_SIZE=2 go test
+./...` starts the API consumers' test servers (`clienttest`, bundles) with log ranges paged after
+two entries, so every multi-page path runs; each consumer package also has a `TestPagedFlows`
+that runs some of its flows that way (`clienttest.Paged`), and the server package tests paging,
+sealed page bounds and `/heads` byte order directly (with `PATCHLOG_TEST_PG`, also on a database
+whose default collation isn't byte order).
 
 ## License
 

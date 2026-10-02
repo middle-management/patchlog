@@ -8,10 +8,12 @@ import (
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/server"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 var ctx = context.Background()
@@ -34,13 +36,18 @@ type deployment struct {
 	c      *client.Client
 }
 
-func newDeployment(t *testing.T, origin string) *deployment {
+func newDeployment(t *testing.T, origin string, opts ...func(*core.Options)) *deployment {
 	t.Helper()
-	e, err := core.Open(core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}})
+	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}}
+	for _, f := range opts {
+		f(&o)
+	}
+	testenv.Apply(&o)
+	e, err := core.Open(o)
 	if err != nil {
 		t.Fatal(err)
 	}
-	hs := httptest.NewServer(server.New(e))
+	hs := httptest.NewServer(clienttest.CountPages(server.New(e)))
 	t.Cleanup(func() {
 		hs.CloseClientConnections()
 		hs.Close()
