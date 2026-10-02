@@ -151,7 +151,9 @@ func setupWith(t *testing.T, sealed bool) *world {
 			"desk": map[string]any{"move": true, "place": true}, "translator": map[string]any{}, "reader": map[string]any{}},
 		"rules": jsonRules(catalogNSRules),
 	})))
-	contentEntry := catKey.Entry("read", "create", "append")
+	// §B.11.3: in content namespaces the catalog key reads, creates, appends
+	// and restores, through the roles allowed.
+	contentEntry := catKey.Entry("read", "create", "append", "restore")
 	contentEntry["maxTtl"] = "PT15M"
 	contentEntry["readScope"] = "resource"
 	contentEntry["requireAt"] = "cat"
@@ -162,7 +164,7 @@ func setupWith(t *testing.T, sealed bool) *world {
 		"read": "grant",
 		"keys": []any{opsKey.Entry("*"), idp.Entry(), contentEntry},
 		"roles": map[string]any{
-			"desk":       map[string]any{"can": toAny("read", "create", "append")},
+			"desk":       map[string]any{"can": toAny("read", "create", "append", "restore")},
 			"translator": map[string]any{"can": toAny("read", "append"), "rules": []any{map[string]any{"op": "writes", "within": toAny("/i18n")}}},
 			"reader":     map[string]any{"can": toAny("read")},
 			"deleter":    map[string]any{"can": toAny("delete")}},
@@ -758,8 +760,9 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 	if b["placement"] == nil {
 		t.Errorf("guest where: %v", b)
 	}
-	// Paths through folders the guest may not see are left out.
-	if len(b["paths"].([]any)) != 0 || b["hidden"] != 1.0 {
+	// Paths through folders the guest may not see are left out, without a
+	// count of them (§B.11.5).
+	if len(b["paths"].([]any)) != 0 || b["hidden"] != nil || b["incomplete"] != nil {
 		t.Errorf("guest paths: %v", b)
 	}
 

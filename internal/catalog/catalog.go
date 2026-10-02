@@ -17,6 +17,11 @@
 //     apply only where a role granting them is assigned directly (§B.11.2).
 //   - Content namespaces define what a role means (§B.11.1): the catalog
 //     keeps only roles the content namespace defines with a wanted verb.
+//   - A deleted item's effective rows are frozen when its tombstone is
+//     seen, and a restore is decided from them (§B.11.4, §B.11.7).
+//   - Listings and /read-grants share one visibility test (§B.11.5,
+//     visibility.Node), decided per request from effective and the
+//     content namespaces' roles.
 //
 // Callers of the catalog's own API (POST /grants, POST /read-grants, and
 // private listings) authenticate with an ordinary core grant for the
@@ -43,6 +48,8 @@ import (
 
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/pointer"
+	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -84,6 +91,12 @@ type Service struct {
 	// View for reading).
 	eff   map[string]map[string][]string // node -> subject -> roles (sorted)
 	users map[string]bool                // user: subjects with direct $access entries
+	// Placements whose item is tombstoned, with the effective roles frozen
+	// when the tombstone was seen (§B.11.7): restores are resolved from
+	// them (§B.11.4). tomb holds every such name, frozen only those with
+	// roles; neither is in eff.
+	tomb   map[string]bool
+	frozen map[string]map[string][]string
 }
 
 // Open opens the catalog service.
@@ -110,7 +123,8 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	if opt.MergeTTL == 0 {
 		opt.MergeTTL = 5 * time.Minute
 	}
-	s := &Service{opt: opt, eff: map[string]map[string][]string{}, users: map[string]bool{}}
+	s := &Service{opt: opt, eff: map[string]map[string][]string{}, users: map[string]bool{},
+		tomb: map[string]bool{}, frozen: map[string]map[string][]string{}}
 	s.now = opt.Tree.Now
 	if s.now == nil {
 		s.now = time.Now
@@ -165,37 +179,62 @@ func (s *Service) Handler() http.Handler {
 // Init creates the tables of §B.11.7. The spec's nodes(node, inherit) is
 // access_nodes here (the tree service has its own nodes table), and
 // effective is kept for every node (folders too, for listing visibility),
-// keyed by the node's href.
+// keyed by the node's href. Rows with tombstoned = 1 are a deleted item's,
+// frozen as they were when its tombstone was seen (§B.11.7).
 func (s *Service) Init(ctx context.Context, db *sql.DB) error {
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS access_nodes (node TEXT PRIMARY KEY, inherit INTEGER NOT NULL DEFAULT 1)`,
 		`CREATE TABLE IF NOT EXISTS acl (node TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (node, subject, role)) WITHOUT ROWID`,
-		`CREATE TABLE IF NOT EXISTS effective (node TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL, PRIMARY KEY (node, subject, role)) WITHOUT ROWID`,
+		`CREATE TABLE IF NOT EXISTS effective (node TEXT NOT NULL, subject TEXT NOT NULL, role TEXT NOT NULL,
+			tombstoned INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (node, subject, role)) WITHOUT ROWID`,
 		`CREATE INDEX IF NOT EXISTS effective_by_subject ON effective (subject, node)`,
 	} {
 		if _, err := db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("catalog: schema: %w", err)
 		}
 	}
+	// A database from before tombstoned rows: the rows of placements whose
+	// item is tombstoned become its frozen rows.
+	var has int
+	if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('effective') WHERE name = 'tombstoned'`).Scan(&has); err != nil {
+		return fmt.Errorf("catalog: schema: %w", err)
+	}
+	if has == 0 {
+		for _, q := range []string{
+			`ALTER TABLE effective ADD COLUMN tombstoned INTEGER NOT NULL DEFAULT 0`,
+			fmt.Sprintf(`UPDATE effective SET tombstoned = 1 WHERE node IN (SELECT href FROM nodes WHERE item_state = %d)`, tree.ItemTombstoned),
+		} {
+			if _, err := db.ExecContext(ctx, q); err != nil {
+				return fmt.Errorf("catalog: schema: %w", err)
+			}
+		}
+	}
 	return nil
 }
 
-// Rebuild recomputes acl and effective from the graph.
+// Rebuild recomputes acl and effective from the graph. Frozen rows of
+// deleted items can't be derived from the graph, so they are kept and
+// read back; a placement whose item is tombstoned and has none gets none.
 func (s *Service) Rebuild(ctx context.Context, tx *sql.Tx, g *tree.Graph) error {
-	for _, q := range []string{`DELETE FROM access_nodes`, `DELETE FROM acl`, `DELETE FROM effective`} {
+	for _, q := range []string{`DELETE FROM access_nodes`, `DELETE FROM acl`, `DELETE FROM effective WHERE tombstoned = 0`} {
 		if _, err := tx.ExecContext(ctx, q); err != nil {
 			return err
 		}
 	}
 	s.eff = map[string]map[string][]string{}
+	if err := s.loadFrozen(ctx, tx, g); err != nil {
+		return err
+	}
 	for _, name := range g.Names() {
 		if err := s.writeACL(ctx, tx, g, name, false); err != nil {
 			return err
 		}
-		e := Effective(g, name, nil)
-		if err := s.writeEffective(ctx, tx, g, name, e, false); err != nil {
+		if err := s.refresh(ctx, tx, g, name, false); err != nil {
 			return err
 		}
+	}
+	if err := s.sweepFrozen(ctx, tx, g); err != nil {
+		return err
 	}
 	s.users = directUsers(g)
 	return nil
@@ -211,16 +250,122 @@ func (s *Service) Update(ctx context.Context, tx *sql.Tx, g *tree.Graph, changed
 		}
 	}
 	for name := range g.Descendants(names) {
-		e := Effective(g, name, nil)
-		if sameEff(e, s.eff[name]) {
-			continue
-		}
-		if err := s.writeEffective(ctx, tx, g, name, e, true); err != nil {
+		if err := s.refresh(ctx, tx, g, name, true); err != nil {
 			return err
 		}
 	}
+	if err := s.sweepFrozen(ctx, tx, g); err != nil {
+		return err
+	}
 	s.users = directUsers(g)
 	return nil
+}
+
+// refresh brings a node's effective rows up to date (§B.11.7): computed
+// from the graph, except for a placement whose item is tombstoned. Its rows
+// are frozen when the tombstone is first seen, as they were while the item
+// was live, and no longer recomputed, so neither placing the deleted item
+// again nor moving folders can change who may restore it (§B.11.4). When
+// the item is live again, purged or forgotten, the frozen rows go and its
+// rows are computed again.
+func (s *Service) refresh(ctx context.Context, tx *sql.Tx, g *tree.Graph, name string, clear bool) error {
+	n := g.Node(name)
+	if n != nil && !n.Self && n.ItemState == tree.ItemTombstoned {
+		if s.tomb[name] {
+			return nil
+		}
+		return s.freeze(ctx, tx, g, name)
+	}
+	if s.tomb[name] {
+		if n == nil {
+			return nil // unplaced while deleted: kept while the item stays tombstoned (sweepFrozen)
+		}
+		if err := s.unfreeze(ctx, tx, g, name); err != nil {
+			return err
+		}
+	}
+	e := Effective(g, name, nil)
+	if clear && sameEff(e, s.eff[name]) {
+		return nil
+	}
+	return s.writeEffective(ctx, tx, g, name, e, clear)
+}
+
+// freeze marks a node's effective rows as a deleted item's (§B.11.7).
+func (s *Service) freeze(ctx context.Context, tx *sql.Tx, g *tree.Graph, name string) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE effective SET tombstoned = 1 WHERE node = ?`, g.Href(name)); err != nil {
+		return err
+	}
+	if e := s.eff[name]; len(e) > 0 {
+		s.frozen[name] = e
+	}
+	delete(s.eff, name)
+	s.tomb[name] = true
+	return nil
+}
+
+// unfreeze drops a node's frozen rows.
+func (s *Service) unfreeze(ctx context.Context, tx *sql.Tx, g *tree.Graph, name string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM effective WHERE node = ? AND tombstoned = 1`, g.Href(name)); err != nil {
+		return err
+	}
+	delete(s.frozen, name)
+	delete(s.tomb, name)
+	return nil
+}
+
+// sweepFrozen drops the frozen rows of deleted items that are no longer
+// placed (refresh doesn't see them) once the item isn't tombstoned any
+// more: restored outside the catalog, or purged. A later deletion then
+// freezes afresh, never reusing rows of an earlier one.
+func (s *Service) sweepFrozen(ctx context.Context, tx *sql.Tx, g *tree.Graph) error {
+	for name := range s.tomb {
+		if g.Node(name) != nil {
+			continue
+		}
+		st := tree.ItemUnknown
+		if ns, item, ok := tree.SplitPlacement(name); ok {
+			var err error
+			if st, _, err = tree.ReadItemState(ctx, tx, ns, item); err != nil {
+				return err
+			}
+		}
+		if st != tree.ItemTombstoned {
+			if err := s.unfreeze(ctx, tx, g, name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// loadFrozen reads the frozen rows back (Rebuild).
+func (s *Service) loadFrozen(ctx context.Context, tx *sql.Tx, g *tree.Graph) error {
+	s.tomb, s.frozen = map[string]bool{}, map[string]map[string][]string{}
+	rows, err := tx.QueryContext(ctx, `SELECT node, subject, role FROM effective WHERE tombstoned = 1 ORDER BY node, subject, role`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	prefix := g.Href("")
+	for rows.Next() {
+		var href, subj, role string
+		if err := rows.Scan(&href, &subj, &role); err != nil {
+			return err
+		}
+		name, ok := strings.CutPrefix(href, prefix)
+		if !ok {
+			continue
+		}
+		s.tomb[name] = true
+		m := s.frozen[name]
+		if m == nil {
+			m = map[string][]string{}
+			s.frozen[name] = m
+		}
+		m[subj] = append(m[subj], role)
+	}
+	return rows.Err()
 }
 
 func (s *Service) writeACL(ctx context.Context, tx *sql.Tx, g *tree.Graph, name string, clear bool) error {
@@ -252,7 +397,7 @@ func (s *Service) writeACL(ctx context.Context, tx *sql.Tx, g *tree.Graph, name 
 func (s *Service) writeEffective(ctx context.Context, tx *sql.Tx, g *tree.Graph, name string, e map[string][]string, clear bool) error {
 	href := g.Href(name)
 	if clear {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM effective WHERE node = ?`, href); err != nil {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM effective WHERE node = ? AND tombstoned = 0`, href); err != nil {
 			return err
 		}
 	}
@@ -407,9 +552,31 @@ func (s *Service) rolesFor(name string, subs map[string]bool) map[string]bool {
 	return out
 }
 
+// frozenRolesFor is the union over subjects of the roles a deleted item's
+// placement had when its tombstone was seen (§B.11.7).
+func (s *Service) frozenRolesFor(name string, subs map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for subj, roles := range s.frozen[name] {
+		if subs[subj] {
+			for _, r := range roles {
+				out[r] = true
+			}
+		}
+	}
+	return out
+}
+
 // Resolve implements tree.RoleView: listings are keyed by the caller's
 // group subjects, plus its user subject only if the catalog has direct
-// entries for that user (§B.11.5).
+// entries for that user (§B.11.5), and filtered by the visibility test.
+//
+// What a role means is read from the trusted content namespaces' documents
+// through the grant checker, which drops a namespace's document as soon as
+// the tree service applies a config entry of it (Checker.Observe). So a
+// change to /roles in a content namespace takes effect on visibility from
+// the combined checkpoint that includes it (§B.11.7), without anything to
+// recompute: visibility is decided per request from effective and the
+// roles' definitions.
 func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tree.Visibility, error) {
 	subs := Subjects(v)
 	user := UserSubject(v.Principal.ID)
@@ -425,66 +592,172 @@ func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tre
 	if direct {
 		keyed = append(keyed, user)
 	}
-	vis := &visibility{s: s, subs: subs, defined: map[string]map[string]bool{}, reads: map[string]map[string]bool{}}
+	vis := &visibility{s: s, subs: subs, groups: v.Principal.Groups, ns: map[string]*readRoles{}}
 	for _, ns := range trust {
 		cfg, err := s.t.Checker().Config(ctx, ns)
 		if err != nil {
 			continue
 		}
-		key := findKey(cfg.Keys, s.opt.Kid)
-		vis.defined[ns], vis.reads[ns] = map[string]bool{}, map[string]bool{}
-		for r, def := range cfg.Roles {
-			if key == nil || !roleAllowed(key, r) {
-				continue
-			}
-			vis.defined[ns][r] = true
-			for _, c := range def.Can {
-				if c == "read" && (key.IsStar() || contains(key.Can, "read")) {
-					vis.reads[ns][r] = true
-				}
-			}
-		}
+		vis.ns[ns] = s.readRoles(cfg)
 	}
 	return keyed, vis, nil
 }
 
+// readRoles are the roles through which the catalog's key may grant read
+// in one trusted content namespace (§B.11.5): roles the namespace defines
+// with read, within the key's roles scope, for a key that may grant read.
+type readRoles struct {
+	key   *grant.Key // nil: the namespace doesn't list the key, or the key can't grant read
+	roles map[string]*readRole
+}
+
+// readRole is one such role. A role whose read has rules counts, for
+// items only, if they refer to nothing but /resource and
+// /principal/groups: everyone with the same subject set shares a listing,
+// and a listing at a given at can't depend on /now.
+type readRole struct {
+	plain bool          // read without rules
+	rules []*rules.Rule // otherwise, the rules, evaluated per item
+}
+
+var (
+	ptrResource = pointer.Pointer{"resource"}
+	ptrGroups   = pointer.Pointer{"principal", "groups"}
+)
+
+func (s *Service) readRoles(cfg *grantcheck.Config) *readRoles {
+	out := &readRoles{roles: map[string]*readRole{}}
+	key := findKey(cfg.Keys, s.opt.Kid)
+	if key == nil || !key.IsStar() && !contains(key.Can, "read") {
+		return out
+	}
+	out.key = key
+	for r, def := range cfg.Roles {
+		if !contains(def.Can, "read") || !roleAllowed(key, r) {
+			continue
+		}
+		rr := &readRole{plain: len(def.Rules) == 0}
+		for _, x := range def.Rules {
+			c, err := rules.Compile(x)
+			if err != nil || !listable(c) {
+				rr = nil
+				break
+			}
+			rr.rules = append(rr.rules, c)
+		}
+		if rr != nil {
+			out.roles[r] = rr
+		}
+	}
+	return out
+}
+
+// listable reports whether a rule reads nothing but /resource and
+// /principal/groups (§B.11.5).
+func listable(r *rules.Rule) bool {
+	for _, p := range r.RefPaths() {
+		if !p.HasPrefix(ptrResource) && !p.HasPrefix(ptrGroups) {
+			return false
+		}
+	}
+	return true
+}
+
+// asserts reports whether the key's groups scope lets the catalog act for
+// a subject: a user always, a group only if the key may assert it
+// (§B.11.3, §B.11.6).
+func (rr *readRoles) asserts(subj string) bool {
+	g, ok := strings.CutPrefix(subj, grantcheck.GroupPrefix)
+	if !ok {
+		return true
+	}
+	allowed, _ := rr.key.Groups.Permits([]string{g})
+	return allowed
+}
+
+// grants reports whether a subject of subs collects at the node (eff, its
+// effective roles) a role granting read: one without rules, or, if env is
+// set (an item), one whose rules pass against env.
+func (rr *readRoles) grants(eff map[string][]string, subs map[string]bool, env map[string]any) bool {
+	if rr == nil || rr.key == nil {
+		return false
+	}
+	for subj, roles := range eff {
+		if !subs[subj] || !rr.asserts(subj) {
+			continue
+		}
+		for _, r := range roles {
+			def := rr.roles[r]
+			switch {
+			case def == nil:
+			case def.plain:
+				return true
+			case env != nil:
+				if _, _, ok := rules.EvalList(def.rules, env); ok {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// visibility is a subject set's view of the catalog (§B.11.5).
 type visibility struct {
-	s       *Service
-	subs    map[string]bool
-	defined map[string]map[string]bool // ns -> roles it defines (that the catalog key may assert)
-	reads   map[string]map[string]bool // ns -> roles granting read
+	s      *Service
+	subs   map[string]bool
+	groups []string // the caller's groups, as its grant has them (for /principal/groups)
+	ns     map[string]*readRoles
 }
 
-// Node: a folder is visible to anyone with any effective role at it; a
-// placement to anyone with a role its content namespace defines, while its
-// item is live (a dangling placement grants nothing).
+// Node is the visibility test of §B.11.5, the one test listings and
+// /read-grants (for catalog nodes and their keys) use. A node is visible
+// when the walk up from it collects a role granting read without
+// conditions: for an item, a role its content namespace defines with read
+// that the catalog's key there may grant (roles and groups scope), with
+// rules on nothing but /resource and /principal/groups; for a folder, such
+// a role without rules in some trusted content namespace. Only live nodes
+// are visible: a dangling placement, a deleted item's included, grants
+// nothing, and cyclic and implicit nodes collect nothing (§B.11.2).
 func (v *visibility) Node(g *tree.Graph, n *tree.Node) bool {
-	roles := v.s.rolesFor(n.Name, v.subs)
-	if n.Kind == tree.KindFolder {
-		return len(roles) > 0
-	}
-	if n.State != tree.StateLive {
+	if n == nil || n.Self || !n.Live() {
 		return false
 	}
-	for r := range roles {
-		if v.defined[n.ItemNS][r] {
-			return true
+	eff := v.s.eff[n.Name]
+	if n.Kind == tree.KindFolder {
+		for _, rr := range v.ns {
+			if rr.grants(eff, v.subs, nil) {
+				return true
+			}
+		}
+		return false
+	}
+	rr := v.ns[n.ItemNS]
+	if rr == nil || rr.key == nil {
+		return false
+	}
+	// The envelope as the gate would see it for these rules: the grant the
+	// catalog signs names the resource and carries the caller's groups the
+	// key may assert (mint).
+	var groups []any
+	for _, gr := range v.groups {
+		if ok, _ := rr.key.Groups.Permits([]string{gr}); ok {
+			groups = append(groups, gr)
 		}
 	}
-	return false
+	env := map[string]any{"resource": n.ItemName, "principal": map[string]any{"groups": nonNilAny(groups)}}
+	return rr.grants(eff, v.subs, env)
 }
 
-// Item: the item's head is visible with a role granting read.
-func (v *visibility) Item(g *tree.Graph, n *tree.Node) bool {
-	if n.State != tree.StateLive {
-		return false
+// Item: a visible placement's item is visible too, since visibility is
+// decided by read (§B.11.5).
+func (v *visibility) Item(g *tree.Graph, n *tree.Node) bool { return v.Node(g, n) }
+
+func nonNilAny(xs []any) []any {
+	if xs == nil {
+		return []any{}
 	}
-	for r := range v.s.rolesFor(n.Name, v.subs) {
-		if v.reads[n.ItemNS][r] {
-			return true
-		}
-	}
-	return false
+	return xs
 }
 
 func findKey(ks []grant.Key, kid string) *grant.Key {

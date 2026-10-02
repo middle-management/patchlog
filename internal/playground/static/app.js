@@ -295,8 +295,9 @@ function authHeaders() {
   return hd;
 }
 
-/* api(method, path, {headers, body, ct, auto, label, stream, raw, binary}) -> Response wrapper.
- * raw sends body (bytes) as is, binary keeps a 2xx body as bytes (wrapper .bin) instead of text. */
+/* api(method, path, {headers, body, ct, auto, label, stream, raw, binary, cache}) -> Response wrapper.
+ * raw sends body (bytes) as is, binary keeps a 2xx body as bytes (wrapper .bin) instead of text. cache is the
+ * fetch cache mode, 'no-store' unless given (tree listings use the HTTP cache, see treeGet). */
 async function api(method, path, o = {}) {
   const headers = authHeaders();
   for (const [k, v] of Object.entries(o.headers || {})) if (v != null && v !== '') headers[k] = v;
@@ -307,7 +308,7 @@ async function api(method, path, o = {}) {
   const t0 = performance.now();
   const ctl = new AbortController();
   try {
-    const res = await fetch(path, { method, headers, body, cache: 'no-store', redirect: 'follow', credentials: 'same-origin', signal: ctl.signal });
+    const res = await fetch(path, { method, headers, body, cache: o.cache || 'no-store', redirect: 'follow', credentials: 'same-origin', signal: ctl.signal });
     e.status = res.status; e.statusText = res.statusText; e.resHeaders = res.headers;
     e.redirected = res.redirected;
     if (res.redirected) { const u = new URL(res.url); e.finalPath = u.pathname + u.search; }
@@ -328,7 +329,8 @@ async function api(method, path, o = {}) {
 }
 
 /* WRITES: the last write this page made to each namespace, by X-Namespace-Revision. The Search tab passes it as
- * ?min= (§A.5) so the index has applied it before it answers. */
+ * ?min= (§A.5) so the index has applied it before it answers, and the Catalog tab for the catalog and the
+ * namespaces it trusts (§B.5 fresh listings after a write). */
 const WRITES = new Map(); // ns -> { id, at: Date }
 function noteWrite(method, path, e) {
   if (method === 'GET' || method === 'HEAD' || !(e.status >= 200 && e.status < 300) || !e.resHeaders || /[?&]dry-run=/.test(path)) return;
@@ -1693,7 +1695,7 @@ const TREE = '/playground/tree';
 const NODE_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const C = {
   ns: '', head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {},
-  source: '', proxy: null, proxyCatalogs: [], listing: null, at: '', view: '', note: '', problems: null, sel: '', min: '', loading: false, gen: 0,
+  source: '', proxy: null, proxyCatalogs: [], listing: null, at: '', view: '', note: '', problems: null, sel: '', min: [], loading: false, gen: 0,
   catalogs: null, discovering: false, // discovered catalog namespaces: [{ ns, mode }], null until found
 };
 
@@ -1774,7 +1776,7 @@ async function loadCatalog() {
   $('catNs').value = ns;
   store.set('pl.catNs', ns);
   if (C.catalogs === null && !C.discovering) { C.discovering = true; discoverCatalogs().finally(() => { C.discovering = false; }); }
-  if (ns !== C.ns) { C.sel = ''; C.min = ''; }
+  if (ns !== C.ns) C.sel = '';
   const gen = ++C.gen;
   C.ns = ns; C.loading = true;
   renderCatStatus();
@@ -1791,6 +1793,7 @@ async function loadCatalog() {
   const cat = x.doc.catalog || {};
   x.trust = Array.isArray(cat.trust) ? cat.trust.filter((t) => typeof t === 'string') : [];
   x.mode = cat.mode === 'dag' ? 'dag' : 'tree';
+  C.min = treeMins(ns, x.trust);
   // 2. Every node document at the catalog's head (needed for $access and for If-Match).
   const heads = (await allHeads(ns, x.head)).filter((e) => e.kind === 'head');
   const docs = await mapLimit(heads.slice(0, 500), 6, async (e) => {
@@ -1833,13 +1836,23 @@ function addDangling(x) {
   }
 }
 
+/* treeMins is ?min= for the tree service: {ns}:{ns_id} of this page's last write to the catalog and to each
+ * namespace it trusts (WRITES, from X-Namespace-Revision), the namespaces its listings depend on (§A.5, §B.5). */
+function treeMins(ns, trust) {
+  return [ns, ...trust].filter((n) => WRITES.has(n)).map((n) => `${n}:${WRITES.get(n).id}`);
+}
+
 /* treeGet fetches a tree service listing through the proxy, following its redirect to /at/{at}/…,
- * retrying while the service is behind ?min, and opening sealed views (§E.2.6). */
+ * retrying while the service is behind ?min, and opening sealed views (§E.2.6). It uses the HTTP cache:
+ * listings at an at never change, and the redirect to the current at is a head pointer, which a browser may
+ * serve stale for a few seconds. So after its own write the page relists with ?min= from the write's
+ * X-Namespace-Revision: a new URL, which the service answers once it has caught up (§B.5), rather than
+ * fetching with no-store. */
 async function treeGet(path) {
-  const q = C.min ? (path.includes('?') ? '&' : '?') + 'min=' + encodeURIComponent(C.min) : '';
+  const q = C.min.map((m, i) => (i === 0 && !path.includes('?') ? '?' : '&') + 'min=' + encodeURIComponent(m)).join('');
   let r;
   for (let i = 0; i < 4; i++) {
-    r = await api('GET', `${TREE}/${C.ns}/${path}${q}`, { auto: true, label: 'tree' });
+    r = await api('GET', `${TREE}/${C.ns}/${path}${q}`, { auto: true, label: 'tree', cache: 'default' });
     if (r.status !== 503) break;
     await sleep(800);
   }
@@ -2045,7 +2058,7 @@ function renderCatStatus() {
     C.at ? h('dt', {}, 'listing at') : null, C.at ? h('dd', {}, idEl(C.at), h('span', { class: 'muted small' }, ' combined checkpoint over the catalog and ' + (C.trust.join(', ') || 'no') + ' (§B.5); listings at an at never change')) : null,
     C.view ? h('dt', {}, 'listing URL') : null, C.view ? h('dd', { class: 'mono small' }, C.view, C.sealedView ? h('span', { class: 'badge tomb', title: 'served as one JWE, pl { ns, view } (§E.2.6)' }, 'sealed listing') : null) : null,
     C.treeStatus ? h('dt', {}, 'service status') : null, C.treeStatus ? h('dd', {}, h('details', {}, h('summary', { class: 'muted small' }, 'GET /_status: followed namespaces, encryption, skipped'), jsonPre(C.treeStatus))) : null,
-    C.min ? h('dt', {}, 'read-your-writes') : null, C.min ? h('dd', { class: 'mono small' }, '?min=' + C.min) : null,
+    C.min.length ? h('dt', {}, 'read-your-writes') : null, C.min.length ? h('dd', { class: 'mono small' }, C.min.map((m) => '?min=' + m).join(' ')) : null,
     h('dt', {}, 'trust'), h('dd', { class: 'mono' }, C.trust.join(', ') || '(none: catalog.trust is empty)'),
     h('dt', {}, 'mode'), h('dd', {}, C.mode + (C.mode === 'tree' ? ' (one parent per node)' : ' (several parents allowed)')),
     h('dt', {}, 'nodes'), h('dd', {}, `${[...C.nodes.values()].filter((n) => n.kind === 'folder').length} folder(s), ${[...C.nodes.values()].filter((n) => n.kind === 'item').length} placement(s)`));
@@ -2292,11 +2305,8 @@ async function catWrite(what, method, name, o) {
     h('div', { class: 'split' },
       h('div', {}, h('h3', {}, 'Request'), h('div', { class: 'mono small' }, Object.entries(o.headers || {}).map(([k, v]) => `${k}: ${v}`).join('  ')), o.body !== undefined ? jsonPre(typeof o.body === 'string' ? pretty(o.body) : o.body) : h('span', { class: 'muted small' }, '(no body)')),
       h('div', {}, h('h3', {}, 'Response'), r.json && !r.ok ? errBox(r.entry) : null, jsonPre(r.text ? pretty(r.text) : (r.neterr || '(empty)')))));
-  if (r.ok) {
-    const nsid = r.hdr('X-Namespace-Revision');
-    if (nsid) C.min = `${C.ns}:${nsid}`;
-    await loadCatalog();
-  }
+  // The write's X-Namespace-Revision is in WRITES (noteWrite): relisting adds it as ?min= (treeMins).
+  if (r.ok) await loadCatalog();
   return r;
 }
 

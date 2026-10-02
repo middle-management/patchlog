@@ -25,8 +25,9 @@ nonce() { # 26 random base32 characters, a fresh $nonce (§C.7)
 
 create_ns schemas '{"read":"public"}' >/dev/null
 # Roles say what a catalog role means for demo's documents (§B.11.1); desk
-# includes reader, so moving an item from desk to reader narrows access.
-create_ns demo '{"read":"public","roles":{"desk":{"can":["read","create","append"],"includes":["reader"]},"translator":{"can":["read","append"]},"reader":{"can":["read"]}},"catalogs":{"cat":{"place":["group:match-desk"]},"topics":{"place":["group:match-desk"]}}}' >/dev/null
+# includes reader, so moving an item from desk to reader narrows access, and
+# may restore, so a deleted item comes back through the catalog (§B.11.4).
+create_ns demo '{"read":"public","roles":{"desk":{"can":["read","create","append","restore"],"includes":["reader"]},"translator":{"can":["read","append"]},"reader":{"can":["read"]}},"catalogs":{"cat":{"place":["group:match-desk"]},"topics":{"place":["group:match-desk"]}}}' >/dev/null
 # The catalog: folders and placements of demo's documents (Addendum B). Its
 # rules (added below, after the root exists) keep placement names to trusted
 # items, parents to folders of this catalog, one parent per node, and no new

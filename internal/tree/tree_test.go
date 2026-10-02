@@ -755,6 +755,26 @@ func TestPrivateCatalog(t *testing.T) {
 	if r := x.raw(x.raw("/cat/children?of=hidden", scoped).header.Get("Location"), scoped); r.status != 404 {
 		t.Errorf("scoped reader on a hidden folder: %d", r.status)
 	}
+	// problems, orphans and manifests aren't filtered: they need
+	// namespace-wide read on the catalog and the content namespaces they
+	// cover (§B.11.5).
+	for _, op := range []string{"problems", "orphans", "manifest?of=top"} {
+		for name, g := range map[string]string{"scoped": scoped, "catalog-only": catOnly} {
+			if r := x.raw(x.raw("/cat/"+op, g).header.Get("Location"), g); r.status != 403 {
+				t.Errorf("%s for a %s reader: %d %v", op, name, r.status, r.body)
+			}
+		}
+		x.get("/cat/"+op, both)
+	}
+	// Paths through hidden folders are left out without a count.
+	if b := x.get("/cat/ancestors?of=hidden", both); pathsOf(b["paths"]) != "top" {
+		t.Errorf("ancestors for a whole reader: %v", b)
+	}
+	scoped2 := reader.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"}, map[string]any{"groups": []any{"eds"},
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"hidden"}}}}})
+	if b := x.get("/cat/ancestors?of=hidden", scoped2); pathsOf(b["paths"]) != "" || b["hidden"] != nil || b["incomplete"] != nil {
+		t.Errorf("ancestors through a hidden folder: %v", b)
+	}
 }
 
 // TestManyTag: a listing showing more resources than fit in its tags

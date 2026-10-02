@@ -131,7 +131,9 @@ type Options struct {
 	// /r/{catalog}/…), so the graph is keyed by the bases' names, while
 	// checkpoints, the combined checkpoint, cache tags, item links and
 	// read checks use the branches. A preview issues no grants: it can't
-	// be combined with a catalog service (RoleView, Hook).
+	// be combined with a catalog service (RoleView, Hook). Branches are
+	// fixed for a Service; a Preview (OpenPreview) follows the release
+	// document and replaces its Service when the branches change.
 	Branches map[string]string
 }
 

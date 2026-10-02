@@ -23,6 +23,7 @@ import (
 //
 //	{ "item": "/r/matches/derby", "want": ["read", "append"] }        content verbs, from effective roles
 //	{ "item": "/r/matches/final", "want": ["create"] }                 genesis of a placed, never-existing item
+//	{ "item": "/r/matches/final", "want": ["restore"] }                a deleted item, by the roles it had when deleted
 //	{ "item": "/r/matches/derby", "want": ["place"], "to": [folders] } create the placement
 //	{ "node": "matches.derby",    "want": ["move"],  "to": [folders] } replace the node's parents
 //	{ "node": "matches.derby",    "want": ["delete"] }                  unplace
@@ -116,9 +117,11 @@ const maxReadGrants = 100
 // Keys (§B.11.5, §E.2.6). For an item of a sealed content namespace the
 // answer also carries the item's per-resource keys K_r, which open its
 // revisions; for a sealed or e2e catalog, the keys of its placement node
-// {ns}.{name}, which open the placement's per-entry listing entries. An
-// item may also be a catalog node /r/{catalog}/{name} the caller sees
-// through its roles: it gets that node's keys only (no grant). Keys are
+// {ns}.{name}, which open the placement's per-entry listing entries, if
+// the placement is visible to the caller. An item may also be a catalog
+// node /r/{catalog}/{name} visible to the caller: it gets that node's
+// keys only (no grant). Visible is the one test listings use (§B.11.5,
+// visibility.Node). Keys are
 // derived from the epoch keys the service holds as a consumer, for the
 // epochs a reader gets (derived.Keys.ResourceKeys), and wrapped (HPKE) to
 // the enc key of the caller's grant in the §E.2.3 format:
@@ -152,7 +155,24 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 	if len(v.Grant.Blocks) > 0 {
 		enc = v.Grant.Blocks[0].Enc
 	}
+	// visible is the visibility test listings use (§B.11.5), for catalog
+	// nodes and their keys.
 	var vis tree.Visibility
+	visible := func(name string) (bool, error) {
+		if vis == nil {
+			var err error
+			if _, vis, err = s.Resolve(ctx, v); err != nil {
+				return false, upstream(err)
+			}
+		}
+		ok := false
+		s.t.View(func(g *tree.Graph, _ map[string]string) {
+			if n := g.Node(name); n != nil {
+				ok = vis.Node(g, n)
+			}
+		})
+		return ok, nil
+	}
 	out := []any{}
 	for _, item := range req.Items {
 		e := map[string]any{"item": item}
@@ -162,18 +182,8 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 		switch {
 		case ok && ns == cat:
 			// A catalog node: its keys, if the caller sees it.
-			if vis == nil {
-				if _, vis, err = s.Resolve(ctx, v); err != nil {
-					err = upstream(err)
-					break
-				}
-			}
-			visible := false
-			s.t.View(func(g *tree.Graph, _ map[string]string) {
-				n := g.Node(name)
-				visible = n != nil && n.Live() && vis.Node(g, n)
-			})
-			if !visible {
+			var seen bool
+			if seen, err = visible(name); err == nil && !seen {
 				err = forbidden("%s is not a catalog node you can see", item)
 			}
 			want = []keyOf{{cat, name}}
@@ -204,7 +214,14 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 			if in.Level == derived.LevelSealed {
 				want = append(want, keyOf{ns, name})
 			}
-			want = append(want, keyOf{cat, ns + "." + name})
+			// The placement's keys open its listing entry, so they go only
+			// to callers the entry is listed for (§B.11.5).
+			if err == nil {
+				var seen bool
+				if seen, err = visible(ns + "." + name); seen {
+					want = append(want, keyOf{cat, ns + "." + name})
+				}
+			}
 		}
 		if err == nil {
 			err = s.addKeys(ctx, e, enc, want)
@@ -375,7 +392,8 @@ func parentHrefsRule(list []string) any {
 }
 
 // planContent decides content verbs (read, append, create, …) on an item
-// from the caller's effective roles at its placement (§B.11.4).
+// from the caller's effective roles at its placement (§B.11.4); restore
+// from the roles frozen when the item's tombstone was seen (§B.11.7).
 func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (*plan, error) {
 	for _, w := range want {
 		if !grant.IsVerb(w) {
@@ -393,6 +411,10 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	create := contains(want, "create")
 	if create && len(want) != 1 {
 		return nil, badInput("create can't be combined with other verbs")
+	}
+	restore := contains(want, "restore")
+	if restore && len(want) != 1 {
+		return nil, badInput("restore can't be combined with other verbs")
 	}
 	cfg, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
@@ -415,7 +437,11 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		if n := g.Node(pl); n != nil && !n.Self {
 			placed, state, itemSt = true, n.State, n.ItemState
 		}
-		roles = s.rolesFor(pl, subs)
+		if restore {
+			roles = s.frozenRolesFor(pl, subs)
+		} else {
+			roles = s.rolesFor(pl, subs)
+		}
 		cp = cur[cat]
 	})
 	switch {
@@ -435,6 +461,20 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		}
 		if h.State != client.NotFound {
 			return nil, conflict("%s exists or existed", item)
+		}
+	case restore:
+		// A restore brings back a deleted item where it was placed, for the
+		// roles its placement had when the tombstone was seen (§B.11.4,
+		// §B.11.7). The grant can only restore: if the item is live by the
+		// time it is used, the write is an append and the core refuses it.
+		switch itemSt {
+		case tree.ItemTombstoned:
+		case tree.ItemPurged:
+			return nil, errf(410, "gone", "%s was purged: there is nothing to restore", item)
+		case tree.ItemLive:
+			return nil, conflict("%s is not deleted", item)
+		default:
+			return nil, errf(404, "not_found", "%s has never existed", item)
 		}
 	case state != tree.StateLive:
 		// A dangling placement grants nothing (§B.11.2).
@@ -896,6 +936,12 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[stri
 	}
 	sort.Strings(nodes)
 	for _, d := range nodes {
+		// A deleted item's rows are frozen and ignored here (§B.11.7): no
+		// one has access to it until it is restored, and who may restore it
+		// doesn't change with a move.
+		if n := g.Node(d); n != nil && n.ItemState == tree.ItemTombstoned {
+			continue
+		}
 		after := Effective(g, d, override)
 		before := s.eff[d]
 		subjects := make([]string, 0, len(after))
