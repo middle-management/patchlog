@@ -47,8 +47,8 @@ type Client struct {
 	// (WithSourceAuthorization).
 	sourceAuth []string
 
-	originMu sync.Mutex
-	origin   string
+	rootMu sync.Mutex
+	root   *Root // GET /, once fetched
 }
 
 // Option configures a Client.
@@ -98,9 +98,9 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
 	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth}
-	c.originMu.Lock()
-	n.origin = c.origin
-	c.originMu.Unlock()
+	c.rootMu.Lock()
+	n.root = c.root
+	c.rootMu.Unlock()
 	for _, o := range opts {
 		o(n)
 	}
@@ -108,34 +108,59 @@ func (c *Client) With(opts ...Option) *Client {
 	return n
 }
 
+// HasBearer reports whether the client sends a bearer grant. A tool
+// without one talks to a server with authentication disabled (§1), whose
+// namespace entries record no grants (§7.4), or reads public namespaces
+// only.
+func (c *Client) HasBearer() bool { return c.bearer != "" }
+
 // BaseURL is the base URL the client was created with.
 func (c *Client) BaseURL() string { return c.base }
+
+// Root is the answer of GET /.
+type Root struct {
+	// Spec is the version of the spec the deployment implements (§7.4),
+	// e.g. "0.37"; "" for deployments from before v0.37, which didn't
+	// publish it.
+	Spec string
+	// Origin is the deployment's canonical origin (§G.1).
+	Origin string
+}
+
+// Root fetches GET / (§7, §G.1). It is fetched once and cached.
+func (c *Client) Root(ctx context.Context) (Root, error) {
+	c.rootMu.Lock()
+	cached := c.root
+	c.rootMu.Unlock()
+	if cached != nil {
+		return *cached, nil
+	}
+	r, err := c.do(ctx, "GET", "/", nil, nil)
+	if err != nil {
+		return Root{}, err
+	}
+	if r.status != 200 {
+		return Root{}, r.apiError()
+	}
+	m, _ := r.value().(map[string]any)
+	root := Root{Spec: str(m, "spec"), Origin: str(m, "origin")}
+	c.rootMu.Lock()
+	c.root = &root
+	c.rootMu.Unlock()
+	return root, nil
+}
 
 // Origin returns the deployment's canonical origin from GET / (§G.1). It is
 // fetched once and cached.
 func (c *Client) Origin(ctx context.Context) (string, error) {
-	c.originMu.Lock()
-	o := c.origin
-	c.originMu.Unlock()
-	if o != "" {
-		return o, nil
-	}
-	r, err := c.do(ctx, "GET", "/", nil, nil)
+	root, err := c.Root(ctx)
 	if err != nil {
 		return "", err
 	}
-	if r.status != 200 {
-		return "", r.apiError()
-	}
-	m, _ := r.value().(map[string]any)
-	o, _ = m["origin"].(string)
-	if o == "" {
+	if root.Origin == "" {
 		return "", fmt.Errorf("client: GET / returned no origin")
 	}
-	c.originMu.Lock()
-	c.origin = o
-	c.originMu.Unlock()
-	return o, nil
+	return root.Origin, nil
 }
 
 // --- names -------------------------------------------------------------

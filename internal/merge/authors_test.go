@@ -13,8 +13,8 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// authEnv runs with authentication on, so namespace log entries carry the
-// root kid of the grant they were written under. The base lists
+// authEnv runs with authentication on, so namespace log entries record the
+// grant they were written under (§7.4). The base lists
 // svc:merge/ops-2026 in merge.authors; the ops and other keys are both
 // * keys of the base.
 type authEnv struct {
@@ -76,7 +76,7 @@ func TestSecondMergeAfterReplayNeedsListedAuthor(t *testing.T) {
 			wantClasses(t, p1, map[string]merge.Class{"derby": merge.Replay})
 			res := must(p1.Apply(ctx))
 			be := a.lastEntry("matches")
-			if be.ID != res.NSID || be.Author != tc.sub || be.Kid != tc.key(a).Kid {
+			if be.ID != res.NSID || be.Author != tc.sub || be.Grant == nil || be.Grant.Sub != tc.sub || be.Grant.Kid != tc.key(a).Kid || len(be.Grant.ID) != 33 {
 				t.Fatalf("batch entry %+v", be)
 			}
 			if at, _ := be.Source["at"].(string); at != p1.BranchAt {
@@ -306,6 +306,36 @@ func TestPairProvenanceReported(t *testing.T) {
 	for _, want := range []string{`"pair":{"batch":"` + res.NSID + `","author":"svc:merge","kid":"ops-2026"`, `"used":true`} {
 		if !strings.Contains(string(b), want) {
 			t.Fatalf("plan JSON lacks %s: %s", want, b)
+		}
+	}
+}
+
+// §F.3, §7.4: an entry counts by the root sub and kid of the grant it
+// records; one without a grant counts by its author only for a tool in
+// development mode (§1), never otherwise.
+func TestEntryListed(t *testing.T) {
+	authors := []merge.Author{{Sub: "svc:merge", Kid: "ops-2026"}}
+	g := func(sub, kid string) *client.NSGrant {
+		return &client.NSGrant{ID: "1" + strings.Repeat("a", 32), Sub: sub, Kid: kid}
+	}
+	for _, tc := range []struct {
+		e        client.NSEntry
+		dev      bool
+		want     bool
+		sub, kid string
+	}{
+		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "ops-2026")}, false, true, "svc:merge", "ops-2026"},
+		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "ops-2026")}, true, true, "svc:merge", "ops-2026"},
+		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "other")}, true, false, "svc:merge", "other"},
+		{client.NSEntry{Author: "svc:merge"}, false, false, "svc:merge", ""}, // no grant recorded
+		{client.NSEntry{Author: "svc:merge"}, true, true, "svc:merge", ""},   // development mode
+		{client.NSEntry{Author: "user:ed"}, true, false, "user:ed", ""},
+	} {
+		if got := merge.EntryListed(authors, tc.e, tc.dev); got != tc.want {
+			t.Fatalf("EntryListed(%+v, dev %v) = %v", tc.e, tc.dev, got)
+		}
+		if sub, kid := merge.EntryPrincipal(tc.e); sub != tc.sub || kid != tc.kid {
+			t.Fatalf("EntryPrincipal(%+v) = %s %s", tc.e, sub, kid)
 		}
 	}
 }

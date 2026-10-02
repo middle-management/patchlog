@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
@@ -701,7 +702,7 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 		result.ConfigID = cplan.id.String()
 	}
 	// After the config change, which may have turned encryption on.
-	grantID := t.storeGrant(n, a)
+	grantID := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
 	inserted := t.insertItems(n, st, a, author, grantID, req.Signature)
 	for _, s := range st {
 		final := s.steps[len(s.steps)-1]
@@ -817,9 +818,17 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 	return out, true
 }
 
-// replay implements the idempotent-retry lookup (§7.2, §7.5).
+// replay implements the idempotent-retry lookup (§7.2, §7.5). It doesn't
+// apply to a purged resource, whose answer is 410 as for every URL of it
+// (§6.2 step 2, §8.3): a single write, or a batch with an item for one,
+// goes on to step 2's other checks, which answer that.
 func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
 	author := t.actorID(a)
+	for _, s := range st {
+		if own := t.resource(n.id, s.Resource); own != nil && own.state == statePurged {
+			return nil
+		}
+	}
 	if !isBatch {
 		if len(st) != 1 {
 			return nil
@@ -830,8 +839,8 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 			return nil
 		}
 		own := t.resource(n.id, s.Resource)
-		if own == nil || own.state == statePurged {
-			return nil // a purged resource answers 410, never its content
+		if own == nil {
+			return nil
 		}
 		last := want[len(want)-1]
 		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
@@ -1291,28 +1300,37 @@ func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
 	return m, &batchSource{n: sn, atSeq: seq}, nil
 }
 
-// actorID is authorID for an actor. Under a grant it also remembers the key
-// that signed the root block, which the namespace entries this transaction
-// writes for that author record (§F.3: merge tools and the janitor match
-// author and kid against merge.authors).
+// actorID is authorID for an actor. Under a grant it also remembers the
+// grant, whose id the namespace entries this transaction writes for that
+// author on the request record (§5, §7.4): merge tools and the janitor
+// match its root sub and kid against merge.authors (§F.3, §F.6). With
+// authentication disabled there is no grant, and none is recorded (§1).
 func (t *tx) actorID(a *actor) int64 {
 	id := t.authorID(a.id())
-	if a.verified != nil && id >= 0 {
-		if t.kids == nil {
-			t.kids = map[int64]string{}
+	if a.grant != nil && id >= 0 {
+		if t.grants == nil {
+			t.grants = map[int64]*grant.Grant{}
 		}
-		t.kids[id] = a.verified.Key.Kid
+		t.grants[id] = a.grant
 	}
 	return id
 }
 
-// storeGrant records the non-bearer form of the actor's grant (§C.3).
-func (t *tx) storeGrant(n *nsRow, a *actor) []byte {
-	if a.grant == nil {
+// storeGrant records the non-bearer form of a grant (§C.3), encrypted at
+// rest if encrypt is set (§E.1), and returns its id (nil for no grant). A
+// grant is stored once per transaction, and again only to encrypt it.
+func (t *tx) storeGrant(g *grant.Grant, encrypt bool) []byte {
+	if g == nil {
 		return nil
 	}
-	id := a.grant.ID()
-	t.storeGrantBlocks(id[:], a.grant.Stored(), t.nsLevel(n) >= levelAtRest)
+	id := g.ID()
+	if enc, ok := t.storedGrants[id]; !ok || (encrypt && !enc) {
+		t.storeGrantBlocks(id[:], g.Stored(), encrypt)
+		if t.storedGrants == nil {
+			t.storedGrants = map[ids.ID]bool{}
+		}
+		t.storedGrants[id] = encrypt
+	}
 	return id[:]
 }
 

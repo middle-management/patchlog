@@ -59,3 +59,18 @@ func TestAbandonedClaim(t *testing.T) {
 func op1(o, path string, v any) map[string]any {
 	return map[string]any{"op": o, "path": path, "value": v}
 }
+
+// §1, §F.6: with authentication disabled no entry records a grant, and a
+// janitor without one takes an abandoned claim as the development server's
+// operator's.
+func TestAbandonedClaimDev(t *testing.T) {
+	e := newEnv(t, map[string]any{"read": "public", "cleanup": map[string]any{"abandoned": "P1D"}})
+	e.branch("matches", "r1", nil)
+	e.edit("r1", "derby", "1-0")
+	e.config("r1", op1("add", "/frozen", true), op1("add", "/abandoned", true))
+	e.s.Clock.Advance(48 * time.Hour)
+	d := e.sweep(false)["r1"]
+	if d.Action != janitor.ActionPurged || d.Claim != "abandoned" {
+		t.Fatalf("abandoned in development mode: %+v", d)
+	}
+}

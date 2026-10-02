@@ -379,9 +379,10 @@ func (t *tx) storeGrantBlocks(id, blocks []byte, encrypt bool) {
 
 // encryptNamespace encrypts the stored rows of n (and of its remote shadow)
 // that are still plaintext, after its level was raised to at-rest: patch
-// sets, head and intermediate snapshots, and the grants its revisions were
-// written with. It runs in the config write's transaction, so the
-// namespace is never observed half-way; reads handle mixed rows anyway.
+// sets, head and intermediate snapshots, and the grants its revisions and
+// namespace entries were written with. It runs in the config write's
+// transaction, so the namespace is never observed half-way; reads handle
+// mixed rows anyway.
 func (t *tx) encryptNamespace(n *nsRow) {
 	t.resLevels = nil
 	nss := []int64{n.id}
@@ -403,7 +404,8 @@ func (t *tx) encryptNamespace(n *nsRow) {
 			t.encryptResource(res)
 		}
 		var grants [][]byte
-		rows, err = t.Query(`SELECT DISTINCT grant_id FROM revisions WHERE grant_id IS NOT NULL AND res IN (SELECT res FROM resources WHERE ns = ?)`, ns)
+		rows, err = t.Query(`SELECT grant_id FROM revisions WHERE grant_id IS NOT NULL AND res IN (SELECT res FROM resources WHERE ns = ?)
+			UNION SELECT grant_id FROM ns_log WHERE grant_id IS NOT NULL AND ns = ?`, ns, ns)
 		t.must(err)
 		for rows.Next() {
 			var g []byte

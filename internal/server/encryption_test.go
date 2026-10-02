@@ -282,7 +282,9 @@ func TestEncryptionAtRestNoPlaintext(t *testing.T) {
 	}
 }
 
-// Grants used in an encrypted namespace are stored encrypted.
+// Grants used in an encrypted namespace are stored encrypted: the
+// writer's, and the operator's, which the namespace's first entry records
+// (§7.4). The log still serves their root sub and kid.
 func TestEncryptionGrants(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "g.db")
 	e := newAuthEnv(t, withPath(path), withKeyStore(newKeyStore(t)))
@@ -294,8 +296,18 @@ func TestEncryptionGrants(t *testing.T) {
 		t.Fatalf("doc %v", d)
 	}
 	assertNoPlaintext(t, path)
-	if n := queryInt(t, path, `SELECT COUNT(*) FROM grants WHERE substr(blocks, 1, 1) = x'01'`); n != 1 {
-		t.Fatalf("%d encrypted grants, want 1", n)
+	if n := queryInt(t, path, `SELECT COUNT(*) FROM grants WHERE substr(blocks, 1, 1) = x'01'`); n != 2 {
+		t.Fatalf("%d encrypted grants, want 2", n)
+	}
+	lg := e.get("/ns/s/rev/"+e.nsHead("s", g)+"/log", g).Arr()
+	if len(lg) != 2 {
+		t.Fatalf("log %v", lg)
+	}
+	for i, want := range []string{"op:root operator", "user:ann w"} {
+		gr, _ := lg[i].(map[string]any)["grant"].(map[string]any)
+		if fmt.Sprint(gr["sub"], " ", gr["kid"]) != want {
+			t.Fatalf("entry %d grant %v, want %s", i, gr, want)
+		}
 	}
 }
 

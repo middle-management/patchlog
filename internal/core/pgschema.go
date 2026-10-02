@@ -149,7 +149,7 @@ CREATE TABLE IF NOT EXISTS ns_log (
   config_seq bigint   NOT NULL,
   author     bigint   NOT NULL REFERENCES authors,
   created    bigint   NOT NULL,
-  kid        text,
+  grant_id   bytea,
   UNIQUE (ns, id),
   UNIQUE (ns, prev_seq)
 );
@@ -295,6 +295,19 @@ ALTER TABLE namespaces ADD COLUMN IF NOT EXISTS head_id bytea;
 -- intermediate snapshot (insertItems); NULL: count them.
 ALTER TABLE resources ADD COLUMN IF NOT EXISTS snap_revs bigint;
 ALTER TABLE resources ADD COLUMN IF NOT EXISTS snap_bytes bigint;
+-- Grant references of namespace entries (§5, §7.4), with the backfill of
+-- backfillNSGrants (db.go). Databases from before them keep the column
+-- kid, the root kid only, which nothing reads.
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM information_schema.columns
+                 WHERE table_schema = current_schema() AND table_name = 'ns_log' AND column_name = 'grant_id') THEN
+    ALTER TABLE ns_log ADD COLUMN grant_id bytea;
+    UPDATE ns_log SET grant_id = g.grant_id
+    FROM (SELECT DISTINCT ON (h.ns_seq) h.ns_seq AS seq, r.grant_id FROM head_history h JOIN revisions r ON r.seq = h.target_seq
+          WHERE r.grant_id IS NOT NULL ORDER BY h.ns_seq) AS g
+    WHERE g.seq = ns_log.seq AND ns_log.kind IN (0, 1, 4);
+  END IF;
+END $$;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 `

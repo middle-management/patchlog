@@ -21,13 +21,13 @@
 //
 // Verification (§F.6):
 //
-//   - merged: the base's log has a batch without origin, by a principal
-//     listed in the base's current merge.authors (root sub and kid, matched
-//     as in merge.Listed), whose source.ns is the branch and whose
-//     source.at is in the branch's chain, and the branch's log has no head,
-//     tombstone or batch entry after that source.at. Config, prune and
-//     propagated purge entries are allowed. A base without merge.authors
-//     never verifies a merged claim this way.
+//   - merged: the base's log has a batch without origin, written under a
+//     grant whose root sub and kid are listed in the base's current
+//     merge.authors (§7.4, merge.EntryListed), whose source.ns is the
+//     branch and whose source.at is in the branch's chain, and the
+//     branch's log has no head, tombstone or batch entry after that
+//     source.at. Config, prune and propagated purge entries are allowed. A
+//     base without merge.authors never verifies a merged claim this way.
 //   - superseded: the successor exists, isn't purged, has the same base
 //     namespace, and its log has a batch without origin whose source.ns is
 //     the branch and whose source.at is in the branch's chain, with nothing
@@ -35,10 +35,12 @@
 //     the successor is a branch too, and its batches are the rebase.
 //   - abandoned: the branch's document has "abandoned": true, set by a
 //     config write whose recorded grant chains to a * key of the branch,
-//     inherited or its own (§F.6): the entry's kid names a key with scope
-//     "*" in the branch's document as of that write, or in a base's. With
-//     authentication disabled entries carry no kid, and the claim is taken
-//     as the development server's operator's.
+//     inherited or its own (§F.6): the root kid of the entry's grant (§7.4)
+//     names a key with scope "*" in the branch's document as of that
+//     write, or in a base's. With authentication disabled entries record no
+//     grant (§1), and the claim is taken as the development server's
+//     operator's; a janitor with a grant of its own takes an entry without
+//     one (from before servers recorded grants) as no one's.
 //   - a branch with no head, tombstone or batch entry of its own counts as
 //     merged.
 //   - at E3, entries for the branch's keyring resource don't count in any
@@ -490,9 +492,10 @@ func hasDocEntries(log []client.NSEntry, i int, e2e bool) bool {
 
 // coveredBy finds the latest merge batch of branch in entries whose
 // source.at is in the branch's chain, and checks that the branch changed no
-// document after it. If authors is non-nil, only batches by a principal
-// listed in *authors count.
-func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author, e2e bool) (bool, string) {
+// document after it. If authors is non-nil, only batches whose recorded
+// grant has a root sub and kid listed in *authors count (merge.EntryListed,
+// with dev for a janitor without a grant of its own).
+func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author, e2e, dev bool) (bool, string) {
 	pos := map[string]int{}
 	for i, e := range blog {
 		pos[e.ID] = i
@@ -503,10 +506,13 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, a
 		if !merge.IsMergeOf(e, branch) {
 			continue
 		}
-		if authors != nil && !merge.Listed(*authors, e.Author, e.Kid) {
+		if authors != nil && !merge.EntryListed(*authors, e, dev) {
 			who := e.Author
-			if e.Kid != "" {
-				who += "/" + e.Kid
+			switch {
+			case e.Grant != nil:
+				who = e.Grant.Sub + "/" + e.Grant.Kid
+			case !dev:
+				who += " (no grant recorded)"
 			}
 			untrusted = append(untrusted, e.ID+" by "+who)
 			continue
@@ -557,7 +563,7 @@ func (j *Janitor) verifyMerged(ctx context.Context, base, at, ns string, blog []
 	if !declared {
 		return false, "the base " + base + " declares no merge.authors, so no merge batch can be trusted (§F.3)", nil
 	}
-	ok, why := coveredBy(entries, ns, blog, &authors, e2e)
+	ok, why := coveredBy(entries, ns, blog, &authors, e2e, !j.c.HasBearer())
 	return ok, why, nil
 }
 
@@ -598,7 +604,7 @@ func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, b
 		return false, "", err
 	}
 	// §F.6 names no merge.authors check for the successor's batch.
-	ok, why := coveredBy(entries, ns, blog, nil, e2e)
+	ok, why := coveredBy(entries, ns, blog, nil, e2e, !j.c.HasBearer())
 	return ok, why, nil
 }
 
@@ -628,8 +634,13 @@ func (j *Janitor) verifyAbandoned(ctx context.Context, ns string, log []client.N
 	if setter == nil {
 		return false, "no config write set abandoned", nil
 	}
-	if setter.Kid == "" {
-		return true, "", nil // authentication disabled: the operator's
+	if setter.Grant == nil {
+		if !j.c.HasBearer() {
+			// Authentication disabled: no entry records a grant (§1), and
+			// the claim is the development server's operator's.
+			return true, "", nil
+		}
+		return false, fmt.Sprintf("the config write %s that set it records no grant (§7.4), so its key can't be checked; set abandoned again", setter.ID), nil
 	}
 	d, err := j.c.NSDoc(ctx, ns, setter.ID)
 	if err != nil {
@@ -657,7 +668,7 @@ func (j *Janitor) verifyAbandoned(ctx context.Context, ns string, log []client.N
 		keys, _ := doc["keys"].([]any)
 		for _, k := range keys {
 			km, _ := k.(map[string]any)
-			if km["kid"] != setter.Kid {
+			if km["kid"] != setter.Grant.Kid {
 				continue
 			}
 			can, _ := km["can"].([]any)
@@ -668,7 +679,7 @@ func (j *Janitor) verifyAbandoned(ctx context.Context, ns string, log []client.N
 			}
 		}
 	}
-	return false, fmt.Sprintf("the config write %s that set it was by %s under key %q, not a * key of the branch", setter.ID, setter.Author, setter.Kid), nil
+	return false, fmt.Sprintf("the config write %s that set it was by %s under key %q, not a * key of the branch", setter.ID, setter.Grant.Sub, setter.Grant.Kid), nil
 }
 
 // frozenSince returns the created time of the config entry that froze the

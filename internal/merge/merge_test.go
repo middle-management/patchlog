@@ -54,8 +54,8 @@ func newEnv(t *testing.T) *env {
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
 	e := &env{t: t, s: s, c: c}
-	// Authentication is off, so entries carry no kid and merge.authors
-	// matches on sub alone (merge.Listed).
+	// Authentication is off, so entries record no grant and, for a merger
+	// without one, merge.authors matches on sub alone (merge.EntryListed).
 	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public", "merge": devAuthors}))
 	e.create("matches", "derby", map[string]any{"title": "Derby", "score": "0-0", "blocks": []any{"a", "b", "c"}})
 	e.create("matches", "cup", map[string]any{"title": "Cup", "score": "1-1"})

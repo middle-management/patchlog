@@ -255,34 +255,6 @@ func TestMergeAuthorsGuarded(t *testing.T) {
 	expect(t, e.branch("sec", map[string]any{"name": "sec-b", "patches": ops(op("remove", "/merge"))}, f.adminG), 201)
 }
 
-// §F.3, §F.6: namespace log entries carry the kid of the key that signed
-// the writer's root block, outside the hashed entry.
-func TestNSLogKid(t *testing.T) {
-	f := newAuthFixture(t, nil)
-	e := f.tenv
-	a := e.create("sec", "a", map[string]any{}, f.issuerG)
-	e.appendRev("sec", "a", a, ops(op("add", "/x", 1.0)), f.adminG)
-	lg := e.get("/ns/sec/rev/"+e.nsHead("sec", f.adminG)+"/log", f.adminG).Arr()
-	n := len(lg)
-	if n < 3 {
-		t.Fatalf("log %v", lg)
-	}
-	create, app := lg[n-2].(map[string]any), lg[n-1].(map[string]any)
-	if create["author"] != "user:bob" || create["kid"] != "issuer" || app["author"] != "user:root" || app["kid"] != "admin" {
-		t.Fatalf("entries %v %v", create, app)
-	}
-
-	// Without authentication there is no kid.
-	d := newEnv(t)
-	d.mkNS("main", map[string]any{})
-	d.create("main", "a", map[string]any{})
-	for _, x := range d.get("/ns/main/rev/" + d.nsHead("main") + "/log").Arr() {
-		if _, has := x.(map[string]any)["kid"]; has {
-			t.Fatalf("dev-mode entry with kid: %v", x)
-		}
-	}
-}
-
 // §8.6: retention with "archive": false, and rules without an archive
 // where the operator configured none.
 func TestRetentionArchiveFalse(t *testing.T) {

@@ -58,8 +58,10 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 		var author int64
 		err := t.QueryRow(`SELECT seq, author FROM ns_config WHERE ns = ? AND id = ?`, n.id, p.expected[:]).Scan(&seq, &author)
 		if err == nil && author == t.actorID(a) {
+			// The entry that wrote it: the first in force with it, a
+			// config entry or a batch with a config change (§7.4).
 			var nsSeq int64
-			t.QueryRow(`SELECT seq FROM ns_log WHERE ns = ? AND kind = ? AND target_seq = ?`, n.id, nsKindCode("config"), seq).Scan(&nsSeq)
+			t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, seq).Scan(&nsSeq)
 			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String()}
 			if nsSeq != 0 {
 				r.NSID = t.nsLogID(nsSeq).String()
@@ -723,6 +725,8 @@ func (t *tx) mayForce(n *nsRow, a *actor, operator bool) *Error {
 // purgeResource purges name in n and propagates to every branch (§8.3). It
 // returns the id of n's purge entry. forced marks every entry it writes,
 // propagated ones included, as overriding an in_use refusal (§3.5, §6.1).
+// Propagated entries are the server's own: they keep the purger as author
+// but record no grant (§7.4).
 func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids.ID {
 	if t.locking() {
 		// Every namespace a purge reaches is locked exclusively, and read
@@ -733,7 +737,7 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 	// it, so that it records its own purge entry.
 	for _, b := range t.branchesOf(n) {
 		if !b.purged {
-			t.purgeResource(b, name, author, forced)
+			t.asServer(func() { t.purgeResource(b, name, author, forced) })
 		}
 	}
 	v := t.resolve(n, name, nil)

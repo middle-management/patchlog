@@ -152,7 +152,7 @@ CREATE TABLE IF NOT EXISTS ns_log (
   config_seq INTEGER NOT NULL,               -- addition: ns_config row in force after this entry
   author     INTEGER NOT NULL REFERENCES authors,
   created    INTEGER NOT NULL,
-  kid        TEXT,                           -- addition: the key that signed the writer's root block (§F.3 merge.authors); NULL without a grant
+  grant_id   BLOB,                           -- §C.3; the root sub and kid are read from the stored grant (§7.4); NULL for entries the server writes itself and without authentication
   UNIQUE (ns, id),
   UNIQUE (ns, prev_seq)
 );
@@ -353,11 +353,13 @@ func openSQLite(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// migrate adds columns that databases created by earlier versions lack.
+// migrate adds columns that databases created by earlier versions lack,
+// running a column's then statement once, right after adding it.
 func migrate(db *sql.DB) error {
 	ctx := context.Background()
-	for _, c := range []struct{ table, col, typ string }{{"ns_log", "kid", "TEXT"}, {"blob_bytes", "file", "TEXT"}, {"blob_epochs", "file", "TEXT"},
-		{"namespaces", "head_id", "BLOB"}, {"resources", "snap_revs", "INTEGER"}, {"resources", "snap_bytes", "INTEGER"}} {
+	for _, c := range []struct{ table, col, typ, then string }{
+		{"ns_log", "grant_id", "BLOB", backfillNSGrants}, {"blob_bytes", "file", "TEXT", ""}, {"blob_epochs", "file", "TEXT", ""},
+		{"namespaces", "head_id", "BLOB", ""}, {"resources", "snap_revs", "INTEGER", ""}, {"resources", "snap_bytes", "INTEGER", ""}} {
 		var has bool
 		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {
 			return err
@@ -366,10 +368,29 @@ func migrate(db *sql.DB) error {
 			if _, err := db.ExecContext(ctx, `ALTER TABLE `+c.table+` ADD COLUMN `+c.col+` `+c.typ); err != nil {
 				return err
 			}
+			if c.then != "" {
+				if _, err := db.ExecContext(ctx, c.then); err != nil {
+					return err
+				}
+			}
 		}
 	}
 	return nil
 }
+
+// backfillNSGrants gives the namespace entries of a database from before
+// grant references (§5, §7.4) the grant they were written under, where the
+// revisions they record still say it: a head, tombstone or batch entry
+// written on a request moved heads to revisions that all store the
+// request's grant (§C.3), and those the server wrote itself (mirrored
+// schemas, §G.3) moved them to revisions without one. Earlier versions
+// recorded only the root kid, in a column ns_log.kid that such databases
+// keep but nothing reads: other entries (config, branch, purge, purge-ns,
+// prune) serve no grant.
+const backfillNSGrants = `UPDATE ns_log SET grant_id = g.grant_id
+FROM (SELECT h.ns_seq AS seq, MAX(r.grant_id) AS grant_id FROM head_history h JOIN revisions r ON r.seq = h.target_seq
+      WHERE r.grant_id IS NOT NULL GROUP BY h.ns_seq) AS g
+WHERE g.seq = ns_log.seq AND ns_log.kind IN (0, 1, 4)`
 
 // Entry kinds, as stored.
 const (

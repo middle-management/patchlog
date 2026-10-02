@@ -560,6 +560,63 @@ func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr 
 	return nil
 }
 
+// checkRemoteSpec checks the spec version the base's deployment publishes
+// at GET / (§7.4) before anything of it is read. B reads the base's
+// namespace documents (read, encryption and base, for the obligations of
+// §G.5 and the chain of §G.3), and namespace-document members are what a
+// spec version defines: a base implementing a later version may have
+// settings B can't read, or reads differently, so B refuses to create the
+// branch (422) rather than misjudge how protected the base is. A
+// deployment from before v0.37 publishes no version: its documents hold
+// nothing B doesn't know.
+func checkRemoteSpec(origin, spec string) *Error {
+	if spec == "" {
+		return nil
+	}
+	newer, ok := specNewer(spec, SpecVersion)
+	switch {
+	case !ok:
+		return invalid(fmt.Sprintf("the base's deployment %s publishes the spec version %q, which this deployment (%s) can't compare with its own", origin, spec, SpecVersion))
+	case newer:
+		return invalid(fmt.Sprintf("the base's deployment %s implements spec %s, later than this deployment's %s: its namespace documents may hold settings this deployment can't read (§7.4), so it can't tell how protected the base is (§G.5); upgrade this deployment first", origin, spec, SpecVersion))
+	}
+	return nil
+}
+
+// specNewer reports whether spec version a is later than b, both dotted
+// decimal numbers ("0.37"); ok is false if a isn't one.
+func specNewer(a, b string) (newer, ok bool) {
+	parse := func(s string) ([]int, bool) {
+		var out []int
+		for _, p := range strings.Split(s, ".") {
+			n, err := strconv.Atoi(p)
+			if err != nil || n < 0 || p != strconv.Itoa(n) {
+				return nil, false
+			}
+			out = append(out, n)
+		}
+		return out, true
+	}
+	av, ok := parse(a)
+	bv, _ := parse(b)
+	if !ok {
+		return false, false
+	}
+	for i := 0; i < max(len(av), len(bv)); i++ {
+		var x, y int
+		if i < len(av) {
+			x = av[i]
+		}
+		if i < len(bv) {
+			y = bv[i]
+		}
+		if x != y {
+			return x > y, true
+		}
+	}
+	return false, true
+}
+
 // fetchRemote fetches and verifies the base of a remote branch as of at
 // (§G.3), outside any transaction. If the base is a branch, its bases are
 // fetched and verified too, each as of the at of the branch above it, and
@@ -570,10 +627,15 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 	if err != nil {
 		return nil, remoteErr("%s: %v", base.Origin, err)
 	}
-	if o, err := c.Origin(ctx); err != nil {
+	root, err := c.Root(ctx)
+	if err != nil {
 		return nil, fetchErr("GET /", err)
-	} else if o != base.Origin {
-		return nil, remoteErr("the deployment reached for %s publishes the origin %s", base.Origin, o)
+	}
+	if root.Origin != base.Origin {
+		return nil, remoteErr("the deployment reached for %s publishes the origin %q", base.Origin, root.Origin)
+	}
+	if ferr := checkRemoteSpec(base.Origin, root.Spec); ferr != nil {
+		return nil, ferr
 	}
 	m := &remoteMirror{base: base, read: "grant"}
 	mapErrs := []func(string, error) *Error{fetchErr}
@@ -1178,8 +1240,13 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 // deployment that aren't branches, under the same paths, so $schema
 // resolves here (§G.3). A namespace that doesn't exist is created with the
 // branch's read mode, keys and roles. A path whose chain neither contains
-// the base's nor is a prefix of it is 409 name_conflict.
+// the base's nor is a prefix of it is 409 name_conflict. The entries it
+// writes are the server's own mirrors, outside the namespace the request
+// was authorised in: they keep the creator as author but record no grant
+// (§7.4).
 func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author int64) *Error {
+	t.serverWrites++
+	defer func() { t.serverWrites-- }()
 	type change struct {
 		name string
 		kind string
