@@ -135,12 +135,19 @@ func freezeOnly(writes []string, doc any) bool {
 }
 
 // newConfig is the schema check of step 5 for a namespace document a write
-// produces (§7.4): parseConfig, then checkMembers against prev, the
-// document the write starts from (nil for a new namespace).
-func (e *Engine) newConfig(doc any, prev map[string]any) (*Config, *Error) {
+// produces (§7.4): parseConfig, then checkMembers against prev, what the
+// write keeps (nil for a new namespace). base is a new branch's base's
+// document, so a member refused because the branch inherits it says so.
+func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error) {
 	cfg, err := e.parseConfig(doc)
 	if err == nil {
 		err = checkMembers(cfg.Doc, prev)
+	}
+	var me *memberError
+	if errors.As(err, &me) {
+		if _, ok := base[me.member]; ok {
+			me.inherited = true
+		}
 	}
 	if err != nil {
 		return nil, configErr(err)
@@ -164,7 +171,7 @@ func configErr(err error) *Error {
 
 // validateConfig is step 5 for a config write.
 func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, a *actor) (*Config, *Error) {
-	cfg, err := t.e.newConfig(newDoc, cur.Doc)
+	cfg, err := t.e.newConfig(newDoc, cur.Doc, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -419,7 +426,7 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if err != nil {
 		return nil, patchErr(err)
 	}
-	cfg, perr := t.e.newConfig(doc, nil)
+	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
 		return nil, perr
 	}
@@ -568,9 +575,11 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if live >= bcfg.Limits.BranchesPerNamespace {
 		return nil, limitErr(422, "too many live branches")
 	}
-	// Step 5. The document starts as the base's, so members it holds
-	// unchanged are judged as there (checkMembers).
-	cfg, perr := t.e.newConfig(nd, bcfg.Doc)
+	// Step 5. The document starts as the base's, so the members this
+	// version defines that it holds unchanged are judged as there; any
+	// other member is refused, since a branch is a new namespace
+	// (checkMembers).
+	cfg, perr := t.e.newConfig(nd, definedMembers(bcfg.Doc), bcfg.Doc)
 	if perr != nil {
 		return nil, perr
 	}

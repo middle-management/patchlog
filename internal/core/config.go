@@ -264,11 +264,22 @@ var nsMembers = map[string]bool{
 
 // memberError is a namespace-document member this version doesn't define
 // and that doesn't start with "x-" (§7.4). Its 422 names the member.
-type memberError struct{ member string }
+// inherited is set when a new branch's document holds it because its
+// base's does (stored under an earlier version): the message says how the
+// branch's patches can rename it.
+type memberError struct {
+	member    string
+	inherited bool
+}
 
 func (e *memberError) Error() string {
+	x := pointer.Pointer{"x-" + e.member}
+	if e.inherited {
+		return fmt.Sprintf(`%s, which the base's document holds, is not a namespace-document member of the spec version this server implements, and a new namespace can't hold it; other members must start with "x-": the branch's patches can rename it, {"op":"move","from":%q,"path":%q} (§7.4)`,
+			e.path(), e.path(), x.String())
+	}
 	return fmt.Sprintf(`%s is not a namespace-document member of the spec version this server implements; other members must start with "x-", e.g. %s (§7.4)`,
-		e.path(), pointer.Pointer{"x-" + e.member})
+		e.path(), x)
 }
 
 // path is the member as a JSON Pointer.
@@ -280,11 +291,15 @@ func (e *memberError) path() string { return pointer.Pointer{e.member}.String() 
 // stored as data, so a typo or a setting from a newer version is refused
 // rather than ignored. parseConfig checks the core's members, and reads
 // stored documents too; this checks the rest, which only services read,
-// and revocation ids. prev is the document the write starts from (the
-// namespace's current document, or a new branch's base's): a member it
-// holds with the same value was stored under an earlier version, and is
-// kept as data until a write changes or removes it, so a namespace written
-// before an upgrade can still be frozen, rotated or branched. A new
+// and revocation ids and key entries. prev is what the write keeps: for a
+// config write the namespace's current document, so a member it holds
+// with the same value, stored under an earlier version, is kept as data
+// until a write changes or removes it, and a namespace written before an
+// upgrade can still be frozen, rotated or merged; for a new branch only
+// the members its base's document holds that this version defines
+// (definedMembers), since a new namespace holds no others. Within
+// revoked and keys, entries prev holds are kept the same way, so a
+// revocation can be added next to one an older version stored. A new
 // namespace has no prev.
 func checkMembers(doc, prev map[string]any) error {
 	for _, k := range sortedKeys(doc) {
@@ -299,15 +314,25 @@ func checkMembers(doc, prev map[string]any) error {
 		switch k {
 		case "revoked":
 			// parseConfig, which reads stored documents too, checks only
-			// that they are strings, as older versions did.
+			// that they are strings, as older versions did; entries prev
+			// holds are kept.
+			kept := map[string]bool{}
+			pa, _ := prev[k].([]any)
+			for _, e := range pa {
+				if s, ok := e.(string); ok {
+					kept[s] = true
+				}
+			}
 			arr, _ := v.([]any)
 			for i, e := range arr {
 				s, _ := e.(string)
-				if _, perr := ids.Parse(s); perr != nil {
+				if _, perr := ids.Parse(s); perr != nil && !kept[s] {
 					err = fmt.Errorf("/revoked/%d must be a revocation id, the text id of a block's signature (§C.4)", i)
 					break
 				}
 			}
+		case "keys":
+			err = checkKeyFields(v, prev[k])
 		case "catalog":
 			err = checkCatalog(v)
 		case "catalogs":
@@ -326,11 +351,51 @@ func checkMembers(doc, prev map[string]any) error {
 			}
 		default:
 			if !nsMembers[k] {
-				err = &memberError{k}
+				err = &memberError{member: k}
 			}
 		}
 		if err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+// definedMembers is what a new branch keeps of its base's document as
+// stored (checkMembers): the members this version defines.
+func definedMembers(doc map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range doc {
+		if nsMembers[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// checkKeyFields refuses fields a key entry doesn't define (§C.4), which
+// grant.ParseKeys accepts when they start with "x-", as stored documents
+// may hold them: §7.4 sanctions "x-" only for members of the document
+// itself. An entry prev holds unchanged is kept.
+func checkKeyFields(v, prev any) error {
+	pa, _ := prev.([]any)
+	arr, _ := v.([]any)
+	for i, e := range arr {
+		m, _ := e.(map[string]any)
+		kept := false
+		for _, p := range pa {
+			if jsonv.Equal(p, e) {
+				kept = true
+				break
+			}
+		}
+		if kept {
+			continue
+		}
+		for _, f := range sortedKeys(m) {
+			if strings.HasPrefix(f, "x-") {
+				return fmt.Errorf("/keys/%d/%s is not a key field; a key entry holds only the fields of §C.4", i, pointer.Pointer{f}.String()[1:])
+			}
 		}
 	}
 	return nil

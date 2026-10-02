@@ -1515,12 +1515,16 @@ just doesn't apply).
   names], mode?: "tree" | "dag" }`, `catalogs: { <catalog>: { place?: ["group:…" | "user:…"] } }`,
   `merged: { at: ns_id }`, `cleanup: { merged?, superseded?, abandoned? }` (ISO 8601
   durations), `abandoned` a boolean; and `revoked` lists revocation ids. Role entries keep
-  their other fields (`move`, `place`, `includes`), which the core ignores (§C.1.1), and key
-  entries accept `x-` fields. **Upgrading:** documents stored by an earlier version are served
-  as they are. A member a write leaves unchanged, as the namespace's current document (or, for
-  a new branch, the base's) holds it, is kept, so such a namespace can still be frozen,
-  rotated, branched and merged; a write that adds or changes it gets the `422`, and a
-  `{"op":"move","from":"/title","path":"/x-title"}` renames it. Bundles carry no namespace
+  their other fields (`move`, `place`, `includes`), which the core ignores (§C.1.1); key
+  entries hold only the fields of §C.4 (`x-` fields too are refused). **Upgrading:** documents
+  stored by an earlier version are served as they are. A config write keeps a member the
+  namespace's current document holds, if the write leaves it unchanged, and likewise entries
+  of `revoked` and `keys`, so such a namespace can still be frozen, rotated and merged, and a
+  revocation added next to a malformed one; a write that adds or changes it gets the `422`,
+  and a `{"op":"move","from":"/title","path":"/x-title"}` renames it. A branch is a new
+  namespace: it keeps the base's members the spec defines as stored, but a member it would
+  inherit that isn't one is refused (the message gives the `move` the branch's patches can
+  rename it with). Bundles carry no namespace
   documents, so an import from an older deployment brings no such members (§G.4); a remote
   branch's shadow keeps only the `encryption` fields this version defines of an e2e base's.
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,

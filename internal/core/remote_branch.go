@@ -518,7 +518,7 @@ func unknownLevel(base *BaseRef, err error) *Error {
 // log whose configuration names it (§E.3.2). Configuration documents are
 // only as trustworthy as the channel; they only decide which epochs a grant
 // on this side gets relayed (§E.2.3).
-func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr func(string, error) *Error) *Error {
+func (e *Engine) fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr func(string, error) *Error) *Error {
 	epochOf := func(nsID string) (map[string]any, int, *Error) {
 		d, err := c.NSDoc(ctx, lv.ns, nsID)
 		if err != nil {
@@ -528,17 +528,17 @@ func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr 
 		if lvl, _ := enc["level"].(string); lvl != "e2e" {
 			return nil, 0, unverified("/ns/%s: an e2e base's chain holds a namespace that isn't e2e", lv.ns)
 		}
-		e := 1
+		ep := 1
 		if f, ok := enc["epoch"].(float64); ok {
-			e = int(f)
+			ep = int(f)
 		}
-		return enc, e, nil
+		return enc, ep, nil
 	}
 	enc, cur, ferr := epochOf(lv.at)
 	if ferr != nil {
 		return ferr
 	}
-	if lv.enc, ferr = shadowEncryption(lv.ns, enc); ferr != nil {
+	if lv.enc, ferr = e.shadowEncryption(lv.ns, enc); ferr != nil {
 		return ferr
 	}
 	seen := map[int]bool{}
@@ -550,13 +550,13 @@ func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr 
 		if !isConfig {
 			continue
 		}
-		_, e, ferr := epochOf(en.ID)
+		_, ep, ferr := epochOf(en.ID)
 		if ferr != nil {
 			return ferr
 		}
-		if !seen[e] && e <= cur {
-			seen[e] = true
-			lv.epochs = append(lv.epochs, epochStart{e: e, created: time.UnixMilli(parseCreated(en.Created, time.Now()))})
+		if !seen[ep] && ep <= cur {
+			seen[ep] = true
+			lv.epochs = append(lv.epochs, epochStart{e: ep, created: time.UnixMilli(parseCreated(en.Created, time.Now()))})
 		}
 	}
 	return nil
@@ -565,16 +565,17 @@ func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr 
 // shadowEncryption is what a shadow keeps of an e2e level's encryption
 // member (§G.3): the members this version defines, which its keyring relay
 // reads. The shadow's document is stored here and read under this
-// deployment's schema (§7.4), so members a base of a newer version may
-// carry are left out rather than stored, and the ones kept must be valid.
-func shadowEncryption(ns string, enc map[string]any) (map[string]any, *Error) {
+// deployment's schema and limits (§7.4), so members a base of a newer
+// version may carry are left out rather than stored, and the ones kept
+// must be valid as tx.config will read them.
+func (e *Engine) shadowEncryption(ns string, enc map[string]any) (map[string]any, *Error) {
 	out := map[string]any{}
 	for _, k := range []string{"level", "epoch", "historyEpochs", "pad"} {
 		if v, ok := enc[k]; ok {
 			out[k] = v
 		}
 	}
-	if _, err := parseConfig(map[string]any{"encryption": out}, DefaultLimits(), DefaultLimits()); err != nil {
+	if _, err := e.parseConfig(map[string]any{"encryption": out}); err != nil {
 		return nil, unverified("/ns/%s: the base's encryption member: %v", ns, err)
 	}
 	return out, nil
@@ -637,7 +638,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 	opaque := m.level == levelE2E
 	if opaque {
 		for i, lv := range m.levels {
-			if ferr := fetchEpochs(ctx, c, lv, mapErrs[i]); ferr != nil {
+			if ferr := e.fetchEpochs(ctx, c, lv, mapErrs[i]); ferr != nil {
 				return nil, ferr
 			}
 		}
@@ -805,7 +806,7 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	if err != nil {
 		return nil, nil, nil, patchErr(err)
 	}
-	cfg, perr := t.e.newConfig(doc, nil)
+	cfg, perr := t.e.newConfig(doc, nil, nil)
 	if perr != nil {
 		return nil, nil, nil, perr
 	}
