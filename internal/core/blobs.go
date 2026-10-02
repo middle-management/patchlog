@@ -279,25 +279,12 @@ func (r Request) anyCreds() []Credentials {
 	return append([]Credentials{r.Cred}, r.SourceCreds...)
 }
 
-// copyCreds are the grants a copy's source is read with (§7.8): those of
-// Source-Authorization, or the request's own if there are none.
-func (r Request) copyCreds() []Credentials {
-	if len(r.SourceCreds) > 0 {
-		return r.SourceCreds
-	}
-	return []Credentials{r.Cred}
-}
-
-// sourceReadable is the read check of a copy's or a batch's source
-// (§7.8): a read of /r/{ns}/{name} against that namespace's keys, with any
-// grant in Source-Authorization, or the request's own if there is none.
+// sourceReadable is the read check of a copy's source (§7.8): a read of
+// /r/{ns}/{name} by the rule for other namespaces (§7.5): the request's own
+// grant or any in Source-Authorization that names the namespace, verifies
+// under its keys and allows the read. A public namespace needs none.
 func (t *tx) sourceReadable(n *nsRow, name string, req Request) bool {
-	for _, cred := range req.copyCreds() {
-		if _, err := t.reader(n, cred, name); err == nil {
-			return true
-		}
-	}
-	return false
+	return t.credsRead(n, name, req.anyCreds())
 }
 
 // checkBlobs is the availability check of step 4 (§6.2, §7.8): every
@@ -875,6 +862,14 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	var res int64
 	if r := t.resource(n.id, name); r != nil {
 		res = r.id
+	}
+	if t.e.pg && t.write {
+		// The namespace's lock is only shared (D.8): the uploader's row
+		// orders its concurrent uploads, so their pending total is read
+		// after the other's commit (blob_uploaders).
+		_, err := t.Exec(`INSERT INTO blob_uploaders (ns, uploader) VALUES (?, ?)
+			ON CONFLICT (ns, uploader) DO UPDATE SET uploader = excluded.uploader`, n.id, g.uploader)
+		t.must(err)
 	}
 	t.must(t.QueryRow(`SELECT COALESCE(SUM(CASE WHEN p.size < ? THEN ? ELSE p.size END), 0)
 		FROM blob_pending p JOIN resources r ON r.res = p.res

@@ -592,6 +592,9 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 			if cfg.Successor != "" {
 				m["successor"] = cfg.Successor
 			}
+			if d, ok := cfg.Doc["drafts"]; ok && cfg.DraftsFor != nil {
+				m["drafts"] = d // §7.4: clients apply drafts.for (§6.1)
+			}
 			out = append(out, m)
 		}
 		// Remote branches whose registration hasn't expired (§G.3).

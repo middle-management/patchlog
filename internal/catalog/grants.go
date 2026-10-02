@@ -26,6 +26,7 @@ import (
 //	{ "item": "/r/matches/derby", "want": ["place"], "to": [folders] } create the placement
 //	{ "node": "matches.derby",    "want": ["move"],  "to": [folders] } replace the node's parents
 //	{ "node": "matches.derby",    "want": ["delete"] }                  unplace
+//	{ "node": "highlights",       "want": ["create"], "to": [folders] } create a folder
 //
 // Folders and nodes may be given as /r/{catalog}/{name} or bare names.
 type Request struct {
@@ -307,9 +308,14 @@ func (s *Service) Issue(ctx context.Context, v *grant.Verified, req Request) (*I
 			return nil, badInput(`move takes a node and want ["move"]`)
 		}
 		p, err = s.planMove(ctx, v, req.Node, req.To)
+	case req.Node != "" && contains(want, "create"):
+		if len(want) != 1 {
+			return nil, badInput(`creating a folder takes a node and want ["create"]`)
+		}
+		p, err = s.planCreateFolder(ctx, v, req.Node, req.To)
 	case req.Node != "":
 		if len(want) != 1 || want[0] != "delete" {
-			return nil, badInput(`a node request wants ["move"] or ["delete"]`)
+			return nil, badInput(`a node request wants ["move"], ["create"] or ["delete"]`)
 		}
 		p, err = s.planUnplace(ctx, v, req.Node)
 	case req.Item != "":
@@ -509,6 +515,87 @@ func hasPower(g *tree.Graph, folder string, subs map[string]bool, power string) 
 	return false
 }
 
+// noPower reports whether no catalog role with the tree power is assigned
+// directly on folder at all: until an admin gives it some, only admins
+// can move or place anything into it (§B.11.4 Create a folder).
+func noPower(g *tree.Graph, folder, power string) bool {
+	n := g.Node(folder)
+	if n == nil {
+		return true
+	}
+	roles, _ := g.Config["roles"].(map[string]any)
+	for _, rs := range n.Access {
+		for _, r := range rs {
+			if def, _ := roles[r].(map[string]any); def[power] == true {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// powerOn is hasPower, or for an admin a folder nobody holds the power on
+// yet (§B.11.4).
+func powerOn(g *tree.Graph, folder string, subs map[string]bool, power string, admin bool) bool {
+	return hasPower(g, folder, subs, power) || admin && noPower(g, folder, power)
+}
+
+// planCreateFolder decides creating a folder (§B.11.4): a role with move
+// on every folder in to. Items in it get their parents' roles through the
+// walk-up, but tree powers on it come only from its own $access, which
+// needs the admin group, as any $access does: the grant refuses a document
+// with $access unless the caller is an admin.
+func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node string, to []string) (*plan, error) {
+	cat := s.t.Catalog()
+	name, ok := tree.Resolve(cat, node)
+	if !ok || strings.Contains(name, ".") || !client.ValidResourceName(name) {
+		return nil, badInput("a folder name is a resource name without a dot")
+	}
+	tos, err := s.folders(to)
+	if err != nil {
+		return nil, err
+	}
+	key, err := s.catalogKey(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !key.IsStar() && !contains(key.Can, "create") {
+		return nil, forbidden("the catalog's key may not create in %s", cat)
+	}
+	subs := Subjects(v)
+	admin := s.isAdmin(v)
+	var cp string
+	err = nil
+	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		cp = cur[cat]
+		for _, f := range tos {
+			if !liveFolder(g, f) {
+				err = errf(422, "not_folder", "%s is not a live folder of %s", f, cat)
+				return
+			}
+			if !powerOn(g, f, subs, "move", admin) {
+				err = forbidden("no role of yours with move is assigned on %s", f)
+				return
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	h, herr := s.t.Client().Head(ctx, cat, name)
+	if herr != nil {
+		return nil, upstream(herr)
+	}
+	if h.State != client.NotFound {
+		return nil, conflict("%s exists or existed in %s", name, cat)
+	}
+	rules := []any{resourceRule(name), parentsRule(cat, tos)}
+	if !admin {
+		rules = append(rules, map[string]any{"op": "test", "path": "/doc/$access", "exists": false})
+	}
+	return &plan{ns: cat, resource: name, can: []string{"create"}, rules: rules, cp: cp, key: key}, nil
+}
+
 func (s *Service) isAdmin(v *grant.Verified) bool {
 	for _, g := range v.Principal.Groups {
 		if g == s.opt.AdminGroup || g == "group:"+s.opt.AdminGroup {
@@ -558,6 +645,7 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		return nil, upstream(err)
 	}
 	subs := Subjects(v)
+	admin := s.isAdmin(v)
 	if !inPlaceList(ccfg.Doc, cat, subs) {
 		return nil, forbidden("namespace %s does not let you place its items in %s (catalogs.%s.place)", ns, cat, cat)
 	}
@@ -578,7 +666,7 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 				err = errf(422, "not_folder", "%s is not a live folder of %s", f, cat)
 				return
 			}
-			if !hasPower(g, f, subs, "place") {
+			if !powerOn(g, f, subs, "place", admin) {
 				err = forbidden("no role of yours with place is assigned on %s", f)
 				return
 			}
@@ -675,7 +763,7 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 				err = conflict("moving %s under %s would make a cycle", name, f)
 				return
 			}
-			if !hasPower(g, f, subs, "move") {
+			if !powerOn(g, f, subs, "move", admin) {
 				err = forbidden("no role of yours with move is assigned on %s", f)
 				return
 			}

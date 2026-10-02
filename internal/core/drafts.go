@@ -183,18 +183,58 @@ func (t *tx) credsRead(n *nsRow, name string, creds []Credentials) bool {
 	return false
 }
 
-// actorCanRead reports whether an authenticated caller's grant may read
-// namespace m (for the referencing namespaces an in_use answer lists).
-func (t *tx) actorCanRead(a *actor, m *nsRow) bool {
-	cfg := t.config(m.configSeq)
-	if t.e.opt.AuthDisabled || cfg.Read == "public" {
+// credsReadAny reports whether any of creds may read anything in m: some
+// resource of it (the rule for other namespaces, §7.5), for the
+// referencing namespaces an in_use answer lists (§6.1).
+func (t *tx) credsReadAny(m *nsRow, creds []Credentials) bool {
+	if t.e.opt.AuthDisabled || t.config(m.configSeq).Read == "public" {
 		return true
 	}
-	if a == nil || a.grant == nil || !a.grant.NamesNS(m.name) {
-		return false
+	cfg := t.config(m.configSeq)
+	var names []string
+	for _, c := range creds {
+		if c.Bearer == "" {
+			continue
+		}
+		g, err := t.decodeGrant(m.name, c)
+		if err != nil {
+			continue // doesn't name m, or isn't a grant
+		}
+		ma, err := t.verifyGrant(g, m.name, m, cfg, nil)
+		if err != nil {
+			continue
+		}
+		if t.canRead(m, cfg, ma, "") {
+			return true // no rule ties it to a resource
+		}
+		if !ma.verified.Can["read"] {
+			continue
+		}
+		if names == nil {
+			names = t.resourceNames(m, 1000)
+		}
+		for _, name := range names {
+			if t.canRead(m, cfg, ma, name) {
+				return true
+			}
+		}
 	}
-	ma, err := t.verifyGrant(a.grant, m.name, m, cfg, nil)
-	return err == nil && t.canRead(m, cfg, ma, "")
+	return false
+}
+
+// resourceNames lists up to limit resource names of m and the bases it
+// reads through.
+func (t *tx) resourceNames(m *nsRow, limit int) []string {
+	var out []string
+	for _, h := range t.listHeads(m, nil) {
+		if h.state != Purged {
+			out = append(out, h.name)
+		}
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out
 }
 
 // schemaCtx is who resolves schema paths, for which namespace (§6.1).
@@ -485,11 +525,13 @@ func (t *tx) brokenReferences(ch refChange) []*nsRow {
 }
 
 // inUse is the 409 of §6.1 for a change that would leave references
-// without a copy: it lists the referencing namespaces the caller can read.
-func (t *tx) inUse(a *actor, broken []*nsRow, msg string) *Error {
+// without a copy: it lists, as referencing, the referencing namespaces in
+// which the caller may read anything, by the rule for other namespaces
+// (§7.5): with the request's grant or any in Source-Authorization.
+func (t *tx) inUse(broken []*nsRow, msg string) *Error {
 	names := []string{}
 	for _, m := range broken {
-		if t.actorCanRead(a, m) {
+		if t.credsReadAny(m, t.reqCreds) {
 			names = append(names, m.name)
 		}
 	}

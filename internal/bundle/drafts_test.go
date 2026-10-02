@@ -2,6 +2,7 @@ package bundle_test
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -25,8 +26,14 @@ func TestExportRefusesDrafts(t *testing.T) {
 
 	var buf bytes.Buffer
 	_, _, err := bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"matches-r7"}})
-	if err == nil || !strings.Contains(err.Error(), "exists only in branch schemas-r7") {
+	if err == nil || !strings.Contains(err.Error(), "exists only in branch schemas-r7") || !errors.Is(err, bundle.ErrSchemaUnavailable) {
 		t.Fatalf("export of a document using a draft: %v", err)
+	}
+	// v0.34: unless the schema's namespace is declared external, when the
+	// importer checks the target instead.
+	buf.Reset()
+	if _, _, err := bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"matches-r7"}, External: []string{"schemas"}}); err != nil {
+		t.Fatalf("export with schemas external: %v", err)
 	}
 
 	// The client resolver finds the draft as validating consumers must.

@@ -204,6 +204,14 @@ CREATE TABLE IF NOT EXISTS blob_pending (
 );
 CREATE INDEX IF NOT EXISTS blob_pending_bytes ON blob_pending (owner, hash);
 CREATE INDEX IF NOT EXISTS blob_pending_created ON blob_pending (created);
+-- One row per namespace and uploader, locked by each upload before it sums
+-- the uploader's pending bytes (§7.8): uploads hold the namespace's lock
+-- only shared (D.8), so this row orders an uploader's own uploads.
+CREATE TABLE IF NOT EXISTS blob_uploaders (
+  ns       bigint NOT NULL,
+  uploader text   NOT NULL,
+  PRIMARY KEY (ns, uploader)
+);
 CREATE TABLE IF NOT EXISTS blob_refs (
   res      bigint NOT NULL REFERENCES resources,
   bid      bytea  NOT NULL,

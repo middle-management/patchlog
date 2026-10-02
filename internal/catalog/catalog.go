@@ -62,6 +62,16 @@ type Options struct {
 	// AdminGroup may move nodes without the no-widening check (default
 	// "catalog-admins", §B.11.4).
 	AdminGroup string
+	// MergeKey signs merge grants (§F.8), and nothing else; MergeKid is
+	// its id in the catalog namespace. MergeService is the merge
+	// service's sub: merge grants are issued only to it, and name it as
+	// their root sub. Without MergeKey, POST /merge-grants is refused.
+	MergeKey     ed25519.PrivateKey
+	MergeKid     string
+	MergeService string
+	// MergeTTL is the lifetime of merge grants (default 5 minutes), capped
+	// by the merge key's maxTtl and by the callers' grants' expiry.
+	MergeTTL time.Duration
 }
 
 // Service is a running catalog service.
@@ -86,6 +96,19 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	}
 	if opt.AdminGroup == "" {
 		opt.AdminGroup = "catalog-admins"
+	}
+	if opt.MergeKey != nil {
+		switch {
+		case len(opt.MergeKey) != ed25519.PrivateKeySize || opt.MergeKid == "":
+			return nil, errors.New("catalog: a merge key needs its kid")
+		case opt.MergeKid == opt.Kid:
+			return nil, errors.New("catalog: the merge key must be a key of its own, not the catalog's (§F.8)")
+		case opt.MergeService == "":
+			return nil, errors.New("catalog: a merge key needs the merge service's sub")
+		}
+	}
+	if opt.MergeTTL == 0 {
+		opt.MergeTTL = 5 * time.Minute
 	}
 	s := &Service{opt: opt, eff: map[string]map[string][]string{}, users: map[string]bool{}}
 	s.now = opt.Tree.Now

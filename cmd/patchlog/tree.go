@@ -26,7 +26,8 @@ import (
 // service of §B.11 that also issues grants:
 //
 //	patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME] [-release /r/{ns}/{release}]
-//	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]]
+//	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]
+//	              [-merge-key SEED -merge-kid KID -merge-service SUB [-merge-ttl 5m]]]
 //	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //
 // The service follows the catalog namespace and every namespace in its
@@ -65,6 +66,10 @@ func treeCmd(args []string) {
 	kid := fs.String("kid", "", "kid of the catalog key in the catalog and content namespaces, for -access")
 	ttl := fs.Duration("ttl", 15*time.Minute, "lifetime of issued grants (capped by the key's maxTtl)")
 	adminGroup := fs.String("admin-group", "catalog-admins", "group whose moves skip the no-widening check")
+	mergeSeed := fs.String("merge-key", "", "merge grant signing key (b64url Ed25519 seed), a key of its own used for nothing else (§F.8); without it POST /merge-grants is refused")
+	mergeKid := fs.String("merge-kid", "", "the merge key's kid in the catalog namespace")
+	mergeService := fs.String("merge-service", "", "the merge service's sub: merge grants are issued only to it, and name it as their root (§F.8)")
+	mergeTTL := fs.Duration("merge-ttl", 5*time.Minute, "lifetime of merge grants (capped by the merge key's maxTtl)")
 	rel := fs.String("release", "", "preview a release (§B.5, §F.9): follow the branches the release document /r/{ns}/{release} lists in place of their bases; previews only, no grants (not with -access); read when the service starts")
 	rebuild := fs.Bool("rebuild", false, "drop the database and replay from the beginning")
 	minWait := fs.Duration("min-wait", 2*time.Second, "how long ?min= waits for the service to catch up")
@@ -134,6 +139,9 @@ func treeCmd(args []string) {
 		run     func(context.Context) error
 		closer  func() error
 	)
+	if *mergeSeed != "" && (*mergeKid == "" || *mergeService == "" || *mergeKid == *kid) {
+		log.Fatal("tree: -merge-key needs -merge-kid (not the catalog's -kid) and -merge-service")
+	}
 	// The core may still be starting: retry opening (which reads its origin).
 	for {
 		if *access {
@@ -144,8 +152,15 @@ func treeCmd(args []string) {
 			if perr != nil {
 				log.Fatal(perr)
 			}
+			copt := catalog.Options{Tree: topt, Key: priv, Kid: *kid, TTL: *ttl, AdminGroup: *adminGroup,
+				MergeKid: *mergeKid, MergeService: *mergeService, MergeTTL: *mergeTTL}
+			if *mergeSeed != "" {
+				if copt.MergeKey, perr = grant.ParsePrivateKey(*mergeSeed); perr != nil {
+					log.Fatal(perr)
+				}
+			}
 			var svc *catalog.Service
-			svc, err = catalog.Open(ctx, catalog.Options{Tree: topt, Key: priv, Kid: *kid, TTL: *ttl, AdminGroup: *adminGroup})
+			svc, err = catalog.Open(ctx, copt)
 			if err == nil {
 				handler, run, closer = svc.Handler(), svc.Run, svc.Close
 			}

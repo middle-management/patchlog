@@ -580,7 +580,7 @@ func (s *Server) resourcePurge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "1"
-	nsID, err := s.e.Purge(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, p.ifMatch, force)
+	nsID, err := s.e.Purge(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}, name, p.ifMatch, force)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -891,7 +891,7 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, &core.Error{Status: 428, Body: map[string]any{"code": "precondition_required"}})
 		return
 	}
-	res, err := s.e.WriteConfig(r.Context(), core.Request{NS: ns, Cred: creds(r)},
+	res, err := s.e.WriteConfig(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)},
 		core.ConfigChange{IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Patches: body})
 	if err != nil {
 		writeErr(w, err)
@@ -1123,7 +1123,7 @@ func (s *Server) nsPurge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	nsID, err := s.e.PurgeNamespace(r.Context(), core.Request{NS: ns, Cred: creds(r)}, p.ifMatch, r.URL.Query().Get("force") == "1")
+	nsID, err := s.e.PurgeNamespace(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}, p.ifMatch, r.URL.Query().Get("force") == "1")
 	if err != nil {
 		writeErr(w, err)
 		return

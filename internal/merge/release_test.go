@@ -53,8 +53,11 @@ type relWorld struct {
 	idp    clienttest.Key
 	opsKey clienttest.Key
 	catKey clienttest.Key
-	svc    *catalog.Service
-	svcURL string
+	// mergeKey is the catalog service's merge key (§F.8), used for
+	// nothing else.
+	mergeKey clienttest.Key
+	svc      *catalog.Service
+	svcURL   string
 	// T0 is the base revision of /r/schemas/match.
 	T0 string
 }
@@ -75,11 +78,12 @@ func matchSchema(extra ...string) map[string]any {
 
 func newRelWorld(t *testing.T) *relWorld {
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 100 * time.Millisecond})
-	w := &relWorld{t: t, s: s, idp: clienttest.NewKey("idp"), opsKey: clienttest.NewKey("ops"), catKey: clienttest.NewKey("catalog-01")}
+	w := &relWorld{t: t, s: s, idp: clienttest.NewKey("idp"), opsKey: clienttest.NewKey("ops"), catKey: clienttest.NewKey("catalog-01"),
+		mergeKey: clienttest.NewKey("catalog-merge")}
 	authors := func(kid string) map[string]any {
 		return map[string]any{"authors": []any{map[string]any{"sub": "user:anna", "kid": kid}}}
 	}
-	cleanup := map[string]any{"merged": "PT0S", "superseded": "PT0S"}
+	cleanup := map[string]any{"merged": "PT0S", "superseded": "PT0S", "abandoned": "PT0S"}
 	mk := func(ns string, doc map[string]any) {
 		doc["read"] = "grant"
 		keys := []any{w.opsKey.Entry("*"), w.idp.Entry("read", "create", "append", "delete", "restore", "config", "branch", "purge-ns", "purge")}
@@ -87,7 +91,10 @@ func newRelWorld(t *testing.T) *relWorld {
 			ce := w.catKey.Entry("read", "create", "append", "delete", "restore")
 			ce["maxTtl"] = "PT15M"
 			ce["requireAt"] = true
-			keys = append(keys, ce)
+			me := w.mergeKey.Entry("create", "append", "delete", "restore")
+			me["maxTtl"] = "PT10M"
+			me["requireAt"] = true
+			keys = append(keys, ce, me)
 		}
 		doc["keys"] = keys
 		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
@@ -96,7 +103,10 @@ func newRelWorld(t *testing.T) *relWorld {
 	mk("matches", map[string]any{"merge": authors("idp"), "cleanup": cleanup,
 		"roles":    map[string]any{"desk": map[string]any{"can": sAny("read", "create", "append")}, "reader": map[string]any{"can": sAny("read")}},
 		"catalogs": map[string]any{"cat-season": map[string]any{"place": sAny("group:match-desk")}}})
-	mk("cat-season", map[string]any{"merge": authors("catalog-01"), "cleanup": cleanup,
+	// The catalog's merge batches: the merge service under the merge key,
+	// or a catalog admin for $access changes (§F.8, §F.9).
+	catAuthors := map[string]any{"authors": []any{map[string]any{"sub": "svc:merge", "kid": "catalog-merge"}, map[string]any{"sub": "user:anna", "kid": "idp"}}}
+	mk("cat-season", map[string]any{"merge": catAuthors, "cleanup": cleanup,
 		"catalog": map[string]any{"trust": sAny("matches"), "mode": "dag"},
 		"roles":   map[string]any{"desk": map[string]any{"move": true, "place": true}, "reader": map[string]any{}}})
 	mk("releases", map[string]any{})
@@ -134,6 +144,7 @@ func (w *relWorld) startCatalog() {
 			Logf:          func(string, ...any) {},
 			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}},
 		Key: w.catKey.Priv, Kid: "catalog-01",
+		MergeKey: w.mergeKey.Priv, MergeKid: "catalog-merge", MergeService: "svc:merge",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +159,20 @@ func (w *relWorld) startCatalog() {
 }
 
 func (w *relWorld) granter() merge.MergeGranter {
-	return &merge.HTTPGranter{URLs: map[string]string{"cat-season": w.svcURL}, Bearer: w.annaBearer()}
+	return &merge.HTTPGranter{URLs: map[string]string{"cat-season": w.svcURL}, Bearer: w.mergeBearer(), Approver: w.annaBearer()}
+}
+
+// mergeBearer is the merge service's identity grant for the catalog.
+func (w *relWorld) mergeBearer() string {
+	return w.opsKey.Grant(w.t, w.s.Now(), "svc:merge", []string{"cat-season"}, []string{"read"},
+		map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})
+}
+
+// annaAll is anna's grant with every verb: a catalog admin's, under which
+// the merge service submits $access changes (§F.8).
+func (w *relWorld) annaAll() string {
+	return w.idp.Grant(w.t, w.s.Now(), "user:anna", relNS, []string{"read", "create", "append", "delete", "restore", "config", "branch", "purge-ns", "purge"},
+		map[string]any{"groups": sAny("match-desk", "catalog-admins"), "exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})
 }
 
 func (w *relWorld) annaBearer() string {
@@ -241,7 +265,8 @@ func (w *relWorld) writeRelease(name string, branches map[string]string) {
 }
 
 func (w *relWorld) opts(rel string) merge.ReleaseOptions {
-	return merge.ReleaseOptions{Release: "/r/releases/" + rel, Granter: w.granter(), Who: "user:anna", Now: w.s.Now, BehindWait: 5 * time.Second}
+	return merge.ReleaseOptions{Release: "/r/releases/" + rel, Granter: w.granter(), Who: "user:anna", Now: w.s.Now, BehindWait: 5 * time.Second,
+		AdminGrant: w.annaAll(), Via: "svc:merge"}
 }
 
 func stepsOf(rp *merge.ReleasePlan) []string {
@@ -289,13 +314,18 @@ func TestReleaseMerge(t *testing.T) {
 		"1 schemas match",
 		"2 cat-season locked matches.cup matches.derby",
 		"3 matches derby final",
-		"4 cat-season locked matches.final",
+		"4 cat-season matches.final",
 	}
 	if got := stepsOf(rp); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("steps\n got %q\nwant %q", got, want)
 	}
-	if h := rp.Halves["cat-season"]["locked"]; h.Reason != "folder" {
+	// v0.34: the folder a narrowing move needs is created in step 2 with
+	// its own $access, in one piece.
+	if _, ok := rp.Halves["cat-season"]["locked"]; ok {
 		t.Fatalf("locked halves: %+v", rp.Halves)
+	}
+	if rp.Digest == "" || rp.Steps[0].Digest == "" {
+		t.Fatalf("no plan digest: %+v", rp)
 	}
 	noErr(t, merge.SaveReleasePlan(ctx, w.anna, w.opts("release-7"), rp))
 
@@ -338,8 +368,8 @@ func TestReleaseMerge(t *testing.T) {
 	if h := must(w.anna.Head(ctx, "schemas", "match")); h.ID != t1 {
 		t.Fatalf("schemas/match is %s, want the draft's id %s (fast-forward)", h.ID, t1)
 	}
-	// After step 2: the narrowing moves are in, locked exists without desk,
-	// nothing new is placed or created.
+	// After step 2: the narrowing moves are in, locked exists with its own
+	// $access, nothing new is placed or created.
 	if got := parentNames(w.doc("cat-season", "matches.cup")); strings.Join(got, ",") != "vault" {
 		t.Fatalf("matches.cup parents %v", got)
 	}
@@ -347,7 +377,7 @@ func TestReleaseMerge(t *testing.T) {
 		t.Fatalf("matches.derby parents %v", got)
 	}
 	lk := w.doc("cat-season", "locked")
-	if acc, _ := lk["$access"].(map[string]any); acc["group:match-desk"] != nil || acc["inherit"] != false {
+	if acc, _ := lk["$access"].(map[string]any); acc["group:match-desk"] == nil || acc["inherit"] != false {
 		t.Fatalf("locked after step 2: %v", lk)
 	}
 	if w.live("matches", "final") || w.live("cat-season", "matches.final") {
@@ -385,11 +415,10 @@ func TestReleaseMerge(t *testing.T) {
 	if got := parentNames(w.doc("cat-season", "matches.final")); strings.Join(got, ",") != "season" {
 		t.Fatalf("matches.final parents %v", got)
 	}
-	if acc, _ := w.doc("cat-season", "locked")["$access"].(map[string]any); acc["group:match-desk"] == nil {
-		t.Fatal("step 4 didn't give locked its desk role")
-	}
-	// Every branch records merged; the janitor verifies the claims
-	// (catalog batches are anna's under the catalog's kid, §F.8).
+	// Every branch records merged, at the target's ns_id after the last
+	// batch into it; the janitor verifies the claims (catalog batches are
+	// the merge service's under the merge key, or anna's, an admin's, for
+	// $access, §F.8).
 	j := janitor.New(w.anna, janitor.Options{DryRun: true, Now: func() time.Time { return w.s.Now().Add(time.Hour) }})
 	for base, br := range map[string]string{"schemas": "schemas-r7", "matches": "matches-r7", "cat-season": "cat-season-r7"} {
 		h := must(w.anna.NSHead(ctx, br))

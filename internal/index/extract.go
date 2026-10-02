@@ -68,7 +68,7 @@ func (s *SchemaCache) LoaderFor(ctx context.Context, ns string, transient *error
 			// Only a branch's documents may use drafts. A namespace
 			// document this client can't read (sealed, say) means no.
 			if b, berr := s.isBranch(ctx, ns); berr == nil && b {
-				if dd, derr := s.c.ResolveSchema(ctx, r, client.ResolveOptions{Drafts: true}); derr == nil || !client.IsNotFound(derr) && !client.IsGone(derr) && !client.IsAuth(derr) {
+				if dd, derr := s.c.ResolveSchema(ctx, r, client.ResolveOptions{Drafts: true, For: ns}); derr == nil || !client.IsNotFound(derr) && !client.IsGone(derr) && !client.IsAuth(derr) {
 					d, err = dd, derr
 				}
 			}

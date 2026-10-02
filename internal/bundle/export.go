@@ -447,6 +447,14 @@ func (p *ExportPlan) loader(ctx context.Context) schema.Loader {
 			return d, nil
 		}
 		doc, err := p.c.Doc(ctx, ref.NS, ref.Name, ref.Rev)
+		if err != nil && (client.IsNotFound(err) || client.IsGone(err)) && p.isExternal(ref.NS, ref.Name) {
+			// Left out on purpose: a draft in a branch has the same
+			// content (§3.3), enough to walk x-refs; the importer checks
+			// the target holds it (§G.4.2).
+			if r, rerr := p.c.ResolveSchema(ctx, ref, client.ResolveOptions{Drafts: true}); rerr == nil {
+				doc, err = r.Doc, nil
+			}
+		}
 		if err != nil {
 			if client.IsNotFound(err) || client.IsGone(err) {
 				return nil, &schema.UnavailableError{Ref: ref.Path()}
@@ -489,6 +497,11 @@ func (p *ExportPlan) revisionDeps(ctx context.Context, d *PlannedDoc, rev string
 	return false, nil
 }
 
+// ErrSchemaUnavailable is the error an export answers for a document that
+// references a schema revision existing only in a branch (§6.1 drafts,
+// §G.4.2), unless that schema's namespace is declared external.
+var ErrSchemaUnavailable = errors.New("schema_unavailable")
+
 // notDraft refuses a schema reference that resolves only in a branch of
 // its namespace (§6.1 drafts): the bundle couldn't carry it under its path,
 // so the document can't be exported until that branch is merged (§G.4.2).
@@ -506,8 +519,8 @@ func (p *ExportPlan) notDraft(ctx context.Context, d *PlannedDoc, r schema.Ref, 
 		return ferr
 	}
 	if b != "" {
-		return fmt.Errorf("export: %s: the %s, %s, exists only in branch %s (a draft schema revision, §6.1); merge that branch's schemas into %s before exporting (§G.4.2)",
-			d.Key, why, r.Path(), b, r.NS)
+		return fmt.Errorf("export: %w: %s: the %s, %s, exists only in branch %s (a draft schema revision, §6.1); merge that branch's schemas into %s before exporting, or declare %s external (§G.4.2)",
+			ErrSchemaUnavailable, d.Key, why, r.Path(), b, r.NS, r.NS)
 	}
 	return nil // reported as unavailable where it is needed
 }

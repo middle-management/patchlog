@@ -1,6 +1,6 @@
 # patchlog
 
-A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.33).
+A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.34).
 Each resource is an append-only log of content-addressed JSON Patch sets. The server
 validates documents that opt in with `$schema`, enforces namespace rules and grants,
 and serves immutable, CDN-cacheable revisions.
@@ -321,19 +321,25 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   an instance without the directory can't serve bytes stored in files.
 - **Several instances** can share the database (rolling deploys, horizontal scaling). Writes
   take transaction-scoped advisory locks per namespace, `pg_advisory_xact_lock(0x504c, ns)`,
-  in ascending order. Config writes, purges, prunes, branch operations and blob uploads take
-  them exclusive on every namespace they change (the written one; a branch's base, which
-  receives the `branch` entry; every branch and remote shadow a purge reaches). Resource
-  writes and batches take their own namespace's lock **shared**, like every namespace a
-  decision read (bases whose keys and revocations a branch write re-checks, the namespaces
-  `$schema` and `$ref` resolve into, a batch source), so writers of different resources of
-  one namespace check and insert in parallel, and a namespace's configuration, frozen and
-  purged flags can't change under them. Two writers of the same resource settle it on insert:
-  the chain's unique constraints, and the resource's head moving only from the one the
-  precondition matched, make the loser re-check and answer `412` with the new head (or the
-  idempotent retry), as on SQLite. The namespace entry is appended last, at the head read with
-  `SELECT … FOR NO KEY UPDATE` on the namespace row, held until commit, so entries commit in
-  chain order. Details in `internal/core/pglock.go`.
+  in ascending order. Writes that change a namespace's configuration or state (config writes,
+  purges, prunes, branch operations, freezing, the pending-blob sweep) take them exclusive on
+  every namespace they change (the written one; a branch's base, which receives the `branch`
+  entry; every branch and remote shadow a purge reaches). Resource writes, batches and blob
+  uploads take their own namespace's lock **shared**, like every namespace a decision read
+  (bases whose keys and revocations a branch write re-checks, the namespaces `$schema` and
+  `$ref` resolve into, a batch source), so writers of different resources of one namespace
+  check and insert in parallel, and a namespace's configuration, frozen and purged flags can't
+  change under them. Two writers of the same resource settle it on insert: the chain's unique
+  constraints, and the resource's head moving only from the one the precondition matched, make
+  the loser re-check and answer `412` with the new head (or the idempotent retry), as on
+  SQLite. The namespace entry is appended last, under a separate advisory **log lock**,
+  `pg_advisory_xact_lock(0x504e, ns)`, taken after every other lock, in ascending order when a
+  write appends to several logs (purge propagation, branch creation), and held through commit,
+  so entries commit, and their sequence numbers grow, in chain order. A transaction holding a
+  log lock never waits for a namespace lock (it tries, and restarts with the lock taken up
+  front if that fails). An uploader's pending blob total (§7.8) is ordered by a row of its
+  own (`blob_uploaders`), so concurrent uploads can't together exceed `blobPending`. Details in
+  `internal/core/pglock.go`.
 - **Round trips.** Each statement is one, so a write costs what its statements cost: about
   13 for a small append (begin, lock, namespace, resource, head, retry lookup, insert, head,
   heads, chain, commit) and 10 for a create, about 3 ms on a local `postgres:16` with `fsync` on,
@@ -640,7 +646,7 @@ patchlog merge status -branch release-7          # per resource: ahead, behind, 
 patchlog merge plan   -branch release-7          # the batch, plus a dry run
 patchlog merge apply  -branch release-7 -freeze  # one batch into the base, then freeze with "merged"
 patchlog rebase -branch release-7 -new release-7-b -switch
-patchlog janitor -ns matches                     # purge merged/superseded branches after `cleanup`
+patchlog janitor -ns matches                     # purge merged/superseded/abandoned branches after `cleanup`
 ```
 
 - Resources are classified by ancestry, using ids only (§F.3). A fast-forward reproduces the
@@ -666,11 +672,14 @@ patchlog janitor -ns matches                     # purge merged/superseded branc
   show per resource which batch and author its pair came from, and print a hint when the base
   has no `merge.authors` or the merger (`-bearer`'s root `sub`/`kid`, or `-author`) isn't
   listed.
-- The janitor checks `merged` and `successor` claims against both logs before purging (§F.6).
+- The janitor checks `merged`, `successor` and `abandoned` claims before purging (§F.6).
   A `merged` claim needs a merge batch by a principal in the base's `merge.authors`; the
-  successor's batch for `superseded` needs no such author, as §F.6 states. Cleanup is opt-in: a
-  branch is purged only once a `cleanup` period, from the branch's or the base's document, has
-  passed.
+  successor's batch for `superseded` needs no such author, as §F.6 states; `"abandoned": true`
+  counts only if the config write that set it was made under a grant whose root key is a `*`
+  key of the branch (its own or a base's), so only its administrators can give up everyone's
+  unmerged work. Cleanup is opt-in: a branch is purged only once a `cleanup` period
+  (`"cleanup": { "merged": …, "superseded": …, "abandoned": … }`), from the branch's or the
+  base's document, has passed.
 
 ### Draft schemas in branches (§6.1, §7.4, §F.9)
 
@@ -685,34 +694,50 @@ PATCH /r/matches-r7/derby  {"$schema": "/r/schemas/team/rev/X", …}
 ```
 
 - **Where drafts resolve.** Only in a write to a branch, and only for a path its namespace `N`
-  can't resolve: the server then looks the id up (index `revisions_by_id`) among the local,
-  non-e2e branches of `N`, branches of branches included, counting only revisions a branch
-  wrote itself. A candidate serves itself and its own branches, and the namespaces its
-  `drafts.for` lists (names, or prefixes ending in `*`) with their branches. `drafts` is only
-  allowed in a branch's namespace document. In a namespace that isn't a branch, paths resolve
+  can't resolve for the writer, because `N` lacks the revision or the writer can't read it
+  there: the server then looks the id up (index `revisions_by_id`) among the local, non-e2e
+  branches of `N`, branches of branches included, counting only revisions a branch wrote
+  itself. A candidate serves itself and its own branches, and the namespaces its own
+  `drafts.for` lists (names, prefixes ending in `*`, or a bare `"*"` for every namespace) with
+  their branches; branches of a candidate don't inherit it (branch creation drops `drafts`,
+  `merged` and `abandoned`). `drafts` is `422` outside a local branch that isn't e2e (remote
+  branches and their branches included). In a namespace that isn't a branch, paths resolve
   only in `N`, so documents using drafts can be merged into a base only after their schemas
   (fast-forward the schema branch first: the same patches give the same ids).
-- **Read access.** The writer needs `read` on the schema resource in the candidate: with the
-  request's grant if it names the candidate and verifies under its keys, or with any grant of
-  `Source-Authorization`, which may be repeated (or comma-joined) on resource writes, batches
-  and blob copies. A draft the writer can't read is reported like an unknown one
-  (`422 schema_unavailable`). The client library sends several grants with
-  `client.WithSourceAuthorization`, `client.WithSourceGrants` (one write),
-  `BatchRequest.SourceAuthorizations` and `CopyBlobWith`.
+- **Reading other namespaces** (§7.5) follows one rule, for batch sources, blob copies, drafts
+  and the schema's own namespace alike: the request's grant or any grant of
+  `Source-Authorization` (repeatable, or comma-joined) that names the namespace, verifies under
+  its keys and allows the read; a public namespace needs none. So the writer needs `read` on
+  the schema resource where it resolves: a grant naming only the namespace written no longer
+  reads schemas in another private namespace. A blob copy's source is read with the request's
+  grant as well as the header's (before, a `Source-Authorization` header replaced it). A
+  draft the writer can't read is reported like an unknown one (`422 schema_unavailable`). The
+  client library sends several grants with `client.WithSourceAuthorization`,
+  `client.WithSourceGrants` (one write), `BatchRequest.SourceAuthorizations` and `CopyBlobWith`.
 - **`in_use`.** A reference (every revision a branch wrote counts, not only its head; tombstoned
   documents too) is satisfied by any available copy: in `N`, or for a branch in a candidate
   serving it. A resource or namespace purge that would remove the last such copy, in any
-  namespace it reaches, is `409 in_use` with `referencing`: the referencing namespaces the
-  caller can read. So are narrowing `drafts.for` and raising a draft branch to `e2e`. `?force=1`
-  with a grant chained to a `*` key (the branch's own or inherited) overrides a purge, on
-  `POST /r/{ns}/{name}/purge` and now also `POST /ns/{ns}/purge`. On Postgres a purge takes the
-  other copy holders' locks shared, so two purges can't each remove one of the last two copies.
+  namespace it reaches, is `409 in_use` with `referencing`: the referencing namespaces in which
+  the caller may read anything, by the rule above (one readable resource suffices). So are
+  narrowing `drafts.for` and raising a draft branch to `e2e`. `?force=1` overrides a purge
+  (`POST /r/{ns}/{name}/purge`, `POST /ns/{ns}/purge`) with a grant chained to a deployment
+  operator key (`serve -operator-key`; the namespace's rules don't apply to it), or, for a
+  purge of a branch or of a resource in one, to a `*` key of that branch, its own or inherited.
+  A `*` key of a namespace that isn't a branch no longer forces. Every entry a forced purge
+  writes, propagated ones included, carries `"forced": true`, part of the hashed entry
+  (verified by `internal/verify`, `client.NSEntry.Forced`); a purge nothing refused isn't
+  marked, `?force=1` or not. Dependents can't be forced. On Postgres a purge takes the other
+  copy holders' locks shared, so two purges can't each remove one of the last two copies.
 - **Consumers** find drafts the same way (`client.ResolveSchema`, `client.SchemaResolver`):
-  `N` first, then its branches via `GET /ns/{N}/branches`, preferred branches first. The search
-  index does this for documents of branches, and an e2e merge validates as the target's gate
-  would (drafts only into a branch). `patchlog export` refuses a document whose schema exists
-  only in a branch, and a remote branch whose documents use drafts is `422 schema_unavailable`
-  (§G.3): merge the schemas first.
+  `N` first, then its branches via `GET /ns/{N}/branches`, which shows each branch's `drafts`,
+  preferred branches first. With `ResolveOptions.For` (the namespace of the document) the
+  resolver skips candidates whose visible `drafts.for` doesn't serve it; this is best effort,
+  and only the server's check decides a write. Resolved schemas may be cached by path across
+  namespaces. The search index does this for documents of branches, and an e2e merge
+  validates as the target's gate would (drafts only into a branch). `patchlog export` refuses
+  a document whose schema exists only in a branch (`bundle.ErrSchemaUnavailable`) unless that
+  schema's namespace is declared `-external`, and a remote branch whose documents use drafts
+  is `422 schema_unavailable` (§G.3): merge the schemas first.
 
 ### Releases across namespaces (§F.9)
 
@@ -731,13 +756,15 @@ branches (package `internal/release`):
 ```
 
 Keys are the namespaces paths name; `at` (top level, a combined checkpoint) and `on` are optional.
+Each branch's own `at` is authoritative; the top-level one is dropped by a rebase.
 The core never reads it; every tool checks for itself what it is about to do.
 
 ```sh
 R=/r/releases/release-7
-patchlog merge release plan    -api URL -bearer $ANNA -catalog-service cat-season=$CATSVC $R   # classify, report conflicts, store the plan
-patchlog merge release approve -api URL -bearer $ANNA $R                                     # plan again, require it clean, freeze every branch
-patchlog merge release apply   -api URL -bearer $ANNA -catalog-service cat-season=$CATSVC $R  # the four steps; run again to resume
+patchlog merge release plan    -api URL -bearer $ANNA -catalog-service cat-season=$CATSVC $R   # classify, report conflicts, store the plan and its digest
+patchlog merge release approve -api URL -bearer $ANNA -digest $DIGEST $R                     # plan again, require the same digest, freeze every branch
+patchlog merge release apply   -api URL -bearer $ANNA -merge-bearer $MERGESVC -catalog-service cat-season=$CATSVC $R  # the four steps; run again to resume
+patchlog merge release abandon -api URL -bearer $ADMIN $R                                    # freeze every branch with abandoned: true
 patchlog merge release status  -api URL -bearer $ANNA $R
 patchlog merge release rebase  -api URL -bearer $ANNA -suffix -b $R                          # successors of every branch, new release revision
 patchlog tree -catalog cat-season -release $R -bearer $PREVIEW                               # a release preview (§B.5)
@@ -749,9 +776,11 @@ patchlog janitor -ns schemas,matches,cat-season -release $R                     
   fast-forward only, in `$ref` order; (2) catalog changes that narrow access, judged by the
   §B.11.4 test (for every subject, effective roles on every node afterwards a subset of those
   before, `includes` honoured) on the step-2 batch as a whole; a folder the release creates goes
-  here only when a narrowing move needs it, with the roles that carry `place` or `move` stripped
-  from its `$access`; (3) the content branches; (4) the remaining catalog changes (placements,
-  widening moves, `$access` edits, the stripped folders' roles), which publishes the release.
+  here, with its own `$access`, when a narrowing move needs it (an empty folder gives access to
+  nothing but its title and its tree powers, so the test applies to the items moved into it);
+  (3) the content branches; (4) the remaining catalog changes (placements, widening moves,
+  `$access` edits), which publishes the release. Tombstoned schema resources still merge in
+  step 1.
   A branch with schemas and content merges its schemas in step 1 and the rest in step 3.
 - **Conflicts reported before anything is submitted** (`plan` exits 1): a schema resource the
   base changed (`schema_changed`: rebase the release, then migrate documents with
@@ -759,8 +788,9 @@ patchlog janitor -ns schemas,matches,cat-season -release $R                     
   (`narrows_and_widens`: give `-split KEY/NODE=narrow.json`, the node's document after step 2;
   the branch's document is reached in step 4; a split that doesn't narrow then widen is
   `bad_split`); a narrowing batch that widens as a whole (`step2_widens`); a content item step 3
-  creates or restores that a placement in the catalog base already names (`placed_item`: accept
-  with `-accept-placement NS.NAME` if the release keeps that placement unchanged); a pinned link
+  creates or restores that a placement in the catalog base already names (`placed_item`: fine if
+  step 2 removes that placement; accept with `-accept-placement NS.NAME` if the release keeps it
+  unchanged; any other change to it is a conflict); a pinned link
   (any string `/r/{ns}/{name}/rev/{id}` in a changed document but `$schema`/`$ref`, which covers
   `x-ref` pins and manifest entries) to a revision of a listed branch that the merge replays
   (`dangling_pin`); a `$schema` (or its `$ref` closure) resolving to a draft in a branch the
@@ -771,34 +801,62 @@ patchlog janitor -ns schemas,matches,cat-season -release $R                     
   base chain doesn't reach its listed base, or for a release with `on`, the earlier release's
   branch), `frozen` and `purged`.
 - **The stored plan** is the resource `{release}.merge` in the release document's namespace (or
-  `-state-ns`), with the release document's revision. `approve` (the approving person's grant)
-  plans again with the stored splits, acceptances and resolutions, requires it clean and for the
-  same revision, freezes every listed branch (§8.4) and records each branch's config id, step by
-  step, so a stopped approval resumes. The whole plan, both halves of every split node included,
-  is stored before step 2. `apply` refuses a plan whose release document moved or whose branches'
-  config ids changed (unfreezing invalidates the plan: plan and approve again; already merged
-  steps then classify as merged), records each step's batch as it completes, resumes from there,
-  never reverts, and has every branch record `merged` (config write `frozen` + `merged.at`) only
-  after step 4. A resumed step whose batch went in before the stop classifies as merged
-  (fast-forwards by id, replays through merge points, which need the merger in the base's
-  `merge.authors`; halves by content).
-- **Catalog batches** (steps 2 and 4) are submitted under a grant the catalog service signs for
-  exactly that batch: `POST {catalog service}/merge-grants` with `{ "batch": … }` and the merging
-  person's grant for the catalog (`tree -access`). The service folds each item onto the
-  revision its precondition names and checks it as in §B.11.4: `$access` changes need the admin
-  group; a new placement needs the content namespace's `catalogs.{catalog}.place` list and `place`
-  on its folders; a deleted node, `move` on its parents; a move, `move` on the parents left and
-  added and, unless admin, no widening of nodes in the moved subtree; other edits, `move` on the
-  node's parents; a new folder, `place` on its parents; a folder created in the same batch is
-  entered on that consent. The grant's root is the caller's `sub` under the catalog's `kid`, and
-  its rules allow, per resource, exactly the actions its steps take. So list
-  `{ "sub": <merging person>, "kid": <catalog kid> }` in the catalog base's `merge.authors`.
-  `503 behind` until the service has reached the batch's preconditions (the tool waits).
+  `-state-ns`), with the release document's revision and the plan's **digest**
+  (`merge.PlanDigest`): `text(trunc160(sha256(canonical(plan))))` over
+  `{ "release": <revision>, "steps": [ { "step", "key", "items": [ { "resource", "ifMatch" |
+  "ifNoneMatch" | "after", "steps" } ] } ] }`, items by resource name, steps as plaintext before
+  any sealing with `$nonce` values left out, and the second half of a split node's
+  precondition written as `"after": { "step": 2, "key", "item" }` instead of an id; each step
+  also stores its own part's digest. `plan` prints the digest; `approve` (the approving
+  person's grant) plans again with the stored splits, acceptances and resolutions, requires it
+  clean, for the same revision and with the same digest (and the one given with `-digest`, if
+  any), freezes every listed branch (§8.4) and records each branch's config id, step by step,
+  so a stopped approval resumes. The whole plan, both halves of every split node included, is
+  stored before step 2. `apply` refuses a plan without a digest or whose release document
+  moved or whose branches' config ids changed (unfreezing invalidates the plan: plan and
+  approve again; already merged steps then classify as merged), rebuilds each step right
+  before submitting it and stops (`merge.ErrPlanChanged`) if its items differ from the
+  approved ones, records each step's batch as it completes, resumes from there, never reverts,
+  and has every branch record `merged` (config write `frozen` + `merged.at`) only after step
+  4, with `at` the target's `ns_id` after the last batch into it (for the catalog, step 4's).
+  A resumed step whose batch went in before the stop has nothing left to do (fast-forwards by
+  id, replays through merge points, which need the merger in the base's `merge.authors`;
+  halves by content); a split node's step-4 pair replaces its step-2 one (§F.3), and until then
+  the stored plan decides what is left.
+- **Catalog batches** (steps 2 and 4) are submitted by the merge service itself, under a grant
+  the catalog service signs for it for exactly that batch: `POST {catalog service}/merge-grants`
+  with `{ "batch": … }`, the merge service's own grant for the catalog as `Authorization`
+  (`-merge-bearer`) and the approving person's in `Approver-Authorization` (`-bearer`). The
+  catalog service (`tree -access -merge-key SEED -merge-kid KID -merge-service SUB`) issues
+  merge grants only to that `sub`, signs them with the merge key, a key used for nothing else,
+  and folds each item onto the revision its precondition names to check it, for the approver,
+  as in §B.11.4: a new placement needs the content namespace's `catalogs.{catalog}.place` list
+  and `place` on its folders; a new folder, `move` on its parents; a deleted node, `move` on
+  its parents; a move, `move` on the parents left and added and, unless admin, no widening of
+  nodes in the moved subtree; other edits, `move` on the node's parents. Tree powers on a
+  folder created in the same batch come only from its own `$access` (an admin may enter one
+  nobody holds them on yet). The grant's root is `{ "sub": <merge service>, "kid": <merge key>,
+  "attrs": { "approvedBy": <approver> } }`, without groups, its rules allow exactly the
+  batch's pairs of `/resource` and `/action`, and it expires within minutes (`-merge-ttl`,
+  default 5m). A batch that changes `$access`, which needs `catalog-admins` and so no catalog
+  key may assert, is checked the same way and answered `{ "admin": true }` without a grant: the
+  merge service submits it under the approver's grant, which must be a catalog admin's,
+  narrowed with a block carrying its own `via`, the catalog, the batch's actions and pairs, and
+  a five-minute `exp`. So list `{ "sub": <merge service>, "kid": <merge key> }` and each such
+  admin `{ "sub", "kid" }` in the catalog base's `merge.authors`. `503 behind` until the service
+  has reached the batch's preconditions (the tool waits).
 - **One release per catalog base at a time.** `apply` holds the lock resource
-  `merge-lock.{catalog base}` in the state namespace, a document `{ "release": link }` taken
-  with `If-None-Match: *` or, when its `release` is null, `If-Match`, from its first step until
-  every branch records `merged`. Another release's `apply` fails with `ErrLocked` meanwhile. Two
-  runs of the same release serialise on the stored plan's `If-Match`.
+  `merge-lock.{catalog base}` in the state namespace, a document `{ "release": link }` naming its
+  holder, taken with an append with `If-Match` when its `release` is null (or created with
+  `If-None-Match: *` the first time) and released with an append that clears it, from its
+  first step until every branch records `merged`; a merge resuming from a stored plan takes
+  over the lock that plan holds. Another release's `apply` fails with `ErrLocked` meanwhile.
+  Two runs of the same release serialise on the stored plan's `If-Match`.
+- **Abandoning** (`abandon`, `merge.AbandonRelease`) freezes every listed branch with
+  `"abandoned": true`, marks a stored plan `abandoned` and releases its catalog locks. Run it
+  with a `*` key of the branches (an administrator's): the janitor accepts the claim only then
+  and purges the branches after their `cleanup.abandoned` period. What step 1 merged stays in
+  the schema namespace's history, unused.
 - **Rebasing** (`rebase -suffix -b`) creates successors (§F.5) of every branch, schema branches
   first, each schema successor with `drafts.for` naming the other successors in its creation
   patches. A draft that has to be replayed gets a new id; a resource whose entries reference it
@@ -810,8 +868,9 @@ patchlog janitor -ns schemas,matches,cat-season -release $R                     
   listed branches in place of their bases (their `/heads` at their first entry, then their logs).
   The graph keeps the bases' names, as documents do; checkpoints, the combined checkpoint, cache
   tags, `/_status` and read checks use the branches, and items carry `url` into the branch and
-  `branch`. A viewer sees the catalog only with a grant reading the catalog's branch, and an
-  item's head only with one reading the content branch. A preview issues no grants (`-access` is
+  `branch`. A viewer sees the catalog only with a grant reading the catalog's branch (`403`
+  otherwise), and an item's head only with one reading the content branch: items in a content
+  branch the viewer can't read are hidden, never shown from the base. A preview issues no grants (`-access` is
   refused). The release document is read once, at start.
 - **The janitor** (`-release LINK`, repeatable) purges a release's non-draft branches before its
   draft branches (those with `drafts`, or holding schema documents). A purge refused with
@@ -1122,11 +1181,17 @@ service and database (`-db` with `{catalog}` replaced, or `-{catalog}` added bef
 extension) behind one origin, and `/_status` covers them all (`?catalog=` for one).
 
 With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
+- `POST /grants` with `{ "node", "want": ["create"], "to": [folders] }` creates a folder
+  (§B.11.4): `move` on every folder in `to`; the grant fixes the name and parents and, unless
+  the caller is an admin, refuses `$access`. Tree powers on the new folder come only from its
+  own `$access`; until an admin gives it some, only admins may move or place into it.
 - `POST /grants` for content verbs, `create` (genesis only; `409` for a taken name), `place`,
   `move` and unplace, with the no-widening rule.
 - `POST /read-grants` returns resource-scoped read grants.
-- `POST /merge-grants` checks a catalog branch's merge batch and signs one grant covering exactly
-  that batch (§F.8; see [Releases across namespaces](#releases-across-namespaces-f9)).
+- `POST /merge-grants` checks a catalog branch's merge batch for the approver and signs one grant
+  covering exactly that batch with the merge key, for the merge service only (`-merge-key`,
+  `-merge-kid`, `-merge-service`, `-merge-ttl`; without a merge key it is refused); see
+  [Releases across namespaces](#releases-across-namespaces-f9) (§F.8).
 
 With `-release /r/{ns}/{release}` (not with `-access`) it previews a release (§B.5).
 
@@ -1425,7 +1490,8 @@ just doesn't apply).
   and for entries the server writes itself). Merge tools and the janitor match `author` and
   `kid` against the base's `merge: { authors: [{ sub, kid }] }` (§F.3, §F.6), which the server
   validates and guards with a `*` key like `/keys`.
-- **A forced schema purge** (`POST …/purge?force=1`, §6.1) needs a `*` key.
+- **A forced schema purge** (`POST …/purge?force=1`, §6.1) needs a deployment operator key, or in
+  a branch a `*` key of the branch; its entries say `"forced": true`.
 
 ## Layout
 

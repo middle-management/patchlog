@@ -20,12 +20,13 @@ import (
 // one namespace. Every write transaction holds transaction-scoped advisory
 // locks, pg_advisory_xact_lock(lockClass, ns):
 //
-//   - exclusive on every namespace whose configuration or rows beyond its
-//     resources' chains it changes: a config write, a purge, a prune, a
-//     branch or freeze, the base that receives a branch entry, every
-//     branch and remote shadow a purge propagates to, a blob upload;
+//   - exclusive on every namespace whose configuration or state it
+//     changes: a config write, a purge, a prune, a branch or freeze, the
+//     base that receives a branch entry, every branch and remote shadow a
+//     purge propagates to, a sweep of expired pending blobs;
 //   - shared on the namespace a resource write or batch (without a config
-//     change) appends to (nsForResources), and on every other namespace
+//     change) appends to (nsForResources), or a blob upload adds a pending
+//     entry to, and on every other namespace
 //     whose state a decision read (nsByName, nsByID): the bases whose keys
 //     and revocations a branch write re-checks (§C.4), the namespaces its
 //     $schema and $ref resolve into (§6.1), a requireAt's or a batch
@@ -48,16 +49,24 @@ import (
 //     as on the D.3 path (recheck.go). Batches insert their rows in one
 //     statement per table, in resource order (insertItems), so two batches
 //     never wait for each other's rows in a cycle.
-//   - the namespace chain. Its entry is appended last (appendNS), at the
-//     head read with SELECT … FOR NO KEY UPDATE on the namespace row,
-//     which waits for a concurrent appender's commit and then reads its
-//     head; entry, head and head_history go in one statement. The row
-//     lock is held until commit, so entries commit in chain order (the
-//     tailer's xid window and readers' snapshots never see a gap) and
-//     ns_log.seq grows along the chain. It is taken after every advisory
-//     lock, and its holder waits for nothing but its commit, so it adds
-//     no deadlock; FOR NO KEY UPDATE doesn't block the foreign-key checks
-//     of other writers' inserts.
+//   - the namespace chain. Its entry is appended last (appendNS), under a
+//     second advisory lock in a class of its own, the log lock
+//     pg_advisory_xact_lock(logClass, ns), taken just before the append
+//     and held through commit, at the head read once it is held; entry,
+//     head and head_history go in one statement. A concurrent appender's
+//     lock is released only once its commit is visible, so entries commit
+//     in chain order (the tailer's xid window and readers' snapshots never
+//     see a gap) and ns_log.seq grows along the chain. (A row lock on the
+//     namespace would conflict with the key-share locks that inserting a
+//     resource row takes on it, and deadlock concurrent creates, D.8.)
+//     Log locks come after every other lock: a transaction holding one
+//     never waits for a namespace lock (it only tries, and restarts if
+//     that fails), takes several in ascending key order (purge
+//     propagation, branch creation; lockLogs), each while holding that
+//     namespace's lock, and otherwise waits only for its commit, so log
+//     locks take part in no deadlock. Other per-namespace counters, such
+//     as an uploader's pending blob total (§7.8), use row locks of their
+//     own (blob_uploaders).
 //
 // The namespace's lock is thus held shared for a write's whole check and
 // insert, and serialisation per namespace is reduced to two statements and
@@ -84,10 +93,12 @@ import (
 // lockClass is the class id of the namespace and schema locks, the first
 // argument of the two-argument pg_advisory_*lock forms (D.8), so they never
 // collide with other advisory locks in a shared database ("PL" in ASCII).
-// leaderClass is the class of the leader lock of the background loops.
+// leaderClass is the class of the leader lock of the background loops,
+// logClass that of the namespaces' log locks (appendNS).
 const (
 	lockClass   = 0x504c
 	leaderClass = 0x504d
+	logClass    = 0x504e
 )
 
 // lockSchema is the key, in lockClass, held while creating or migrating
@@ -117,10 +128,37 @@ func lockKey(ns int64) int32 {
 }
 
 // errRelock rolls back a write transaction that needs a lock below one it
-// holds and found it busy: it runs again with want taken up front.
-type errRelock struct{ want map[int32]lockMode }
+// holds and found it busy: it runs again with want taken up front, and the
+// log locks of logs taken in order at its first append.
+type errRelock struct {
+	want map[int32]lockMode
+	logs map[int32]bool
+}
 
-func (e *errRelock) Error() string { return fmt.Sprintf("advisory locks out of order: %v", e.want) }
+func (e *errRelock) Error() string {
+	return fmt.Sprintf("advisory locks out of order: %v (log locks %v)", e.want, e.logs)
+}
+
+func (t *tx) relock(k int32, mode lockMode, logKey int32) {
+	want := map[int32]lockMode{}
+	if mode != 0 {
+		want[k] = mode
+	}
+	for k2, m := range t.locks {
+		want[k2] = max(want[k2], m)
+	}
+	logs := map[int32]bool{}
+	for k2 := range t.logLocks {
+		logs[k2] = true
+	}
+	for k2 := range t.logPlan {
+		logs[k2] = true
+	}
+	if logKey >= 0 {
+		logs[logKey] = true
+	}
+	panic(&errRelock{want: want, logs: logs})
+}
 
 // locking reports whether this transaction takes advisory locks.
 func (t *tx) locking() bool { return t.e.pg && t.write && t.noLock == 0 }
@@ -137,7 +175,9 @@ func (t *tx) lock(k int32, mode lockMode) {
 	if t.locks[k] >= mode {
 		return
 	}
-	if len(t.locks) == 0 || k > t.maxKey {
+	// Once a log lock is held, namespace locks are only tried: its holder
+	// never waits for one (D.8).
+	if len(t.logLocks) == 0 && (len(t.locks) == 0 || k > t.maxKey) {
 		t.acquire(k, mode)
 		return
 	}
@@ -148,11 +188,7 @@ func (t *tx) lock(k int32, mode lockMode) {
 	var ok bool
 	t.must(t.Tx.QueryRow(fn, lockClass, k).Scan(&ok))
 	if !ok {
-		want := map[int32]lockMode{k: mode}
-		for k2, m := range t.locks {
-			want[k2] = max(want[k2], m)
-		}
-		panic(&errRelock{want: want})
+		t.relock(k, mode, -1)
 	}
 	t.held(k, mode)
 }
@@ -175,6 +211,64 @@ func (t *tx) held(k int32, mode lockMode) {
 	t.locks[k] = max(t.locks[k], mode)
 	t.maxKey = max(t.maxKey, k)
 	t.forget()
+}
+
+// lockLog takes ns's log lock (logClass, D.8), last, just before its entry
+// is appended, and holds it through commit. Several are taken in ascending
+// key order: one above every log lock held is waited for, one below only
+// tried, and if it is busy the transaction restarts and takes them all in
+// order at its first append (logPlan).
+func (t *tx) lockLog(ns int64) {
+	if !t.locking() {
+		return
+	}
+	k := lockKey(ns)
+	if t.logLocks[k] {
+		return
+	}
+	keys := []int32{k}
+	for k2 := range t.logPlan {
+		if !t.logLocks[k2] && k2 != k {
+			keys = append(keys, k2)
+		}
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
+	for _, k2 := range keys {
+		if len(t.logLocks) == 0 || k2 > t.maxLogKey {
+			_, err := t.Tx.Exec(`SELECT pg_advisory_xact_lock($1, $2)`, logClass, k2)
+			t.must(err)
+		} else {
+			var ok bool
+			t.must(t.Tx.QueryRow(`SELECT pg_try_advisory_xact_lock($1, $2)`, logClass, k2).Scan(&ok))
+			if !ok {
+				t.relock(0, 0, k2)
+			}
+		}
+		if t.logLocks == nil {
+			t.logLocks = map[int32]bool{}
+		}
+		t.logLocks[k2] = true
+		t.maxLogKey = max(t.maxLogKey, k2)
+	}
+	t.logPlan = nil
+}
+
+// lockLogs takes the log locks of several namespaces, in ascending key
+// order, before a write appends to all of them (purge propagation, branch
+// creation): every other lock must be held by then (D.8).
+func (t *tx) lockLogs(nss ...int64) {
+	if !t.locking() {
+		return
+	}
+	if t.logPlan == nil {
+		t.logPlan = map[int32]bool{}
+	}
+	for _, ns := range nss {
+		t.logPlan[lockKey(ns)] = true
+	}
+	if len(nss) > 0 {
+		t.lockLog(nss[0])
+	}
 }
 
 // lockAll takes several locks in ascending order: all waited for at the
