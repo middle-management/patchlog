@@ -410,11 +410,12 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false)
 }
 
-// NamespaceEvents is NamespaceLog from the current head for event streams:
-// in a sealed namespace each entry is sealed on its own, as the range
-// (prev, id] (EntryJWEs).
-func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, cred Credentials) (*Log, error) {
-	return e.namespaceLog(ctx, ns, "", since, 0, cred, true)
+// NamespaceEvents is NamespaceLog from the current head for event streams,
+// at most limit entries (0: all) with More set when there are more: in a
+// sealed namespace each entry is sealed on its own, as the range (prev, id]
+// (EntryJWEs).
+func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit int, cred Credentials) (*Log, error) {
+	return e.namespaceLog(ctx, ns, "", since, limit, cred, true)
 }
 
 func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool) (*Log, error) {

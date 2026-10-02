@@ -95,3 +95,62 @@ func TestLogPageReadsItsRows(t *testing.T) {
 		t.Fatalf("empty range: %v %+v", err, lg)
 	}
 }
+
+// A page reads a resource's rows in seq order, which is its chain only
+// while every row's parent is the row before it. The schema allows one
+// first row and one child per parent in a resource, but not that a later
+// row's parent is in the same resource, so a broken chain is an error, not
+// a range answering rows that aren't ancestors of its id.
+func TestLogPageBrokenChain(t *testing.T) {
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	mkNS(t, e, "n", map[string]any{"read": "public"})
+	ctx := context.Background()
+	var revs []string
+	head := ""
+	for i := 0; i < 4; i++ {
+		if head, err = put(e, "n", "a", head, i); err != nil {
+			t.Fatal(err)
+		}
+		revs = append(revs, head)
+	}
+	other, err := put(e, "n", "b", "", 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, since := range []string{"", revs[0]} {
+		if lg, err := e.ResourceLog(ctx, "n", "a", head, since, 2, Credentials{}); err != nil || lg.Status != 200 {
+			t.Fatalf("before, after %q: %v %+v", since, err, lg)
+		}
+	}
+	// revs[2]'s parent is now b's revision: revs[0] and revs[1] are no
+	// ancestors of the head by the parent links, though still before it
+	// in a's seq order.
+	seqOf := func(t *tx, id string) (seq int64) {
+		b := mustID(id)
+		t.must(t.QueryRow(`SELECT seq FROM revisions WHERE id = ?`, b[:]).Scan(&seq))
+		return seq
+	}
+	if err := e.update(ctx, func(t *tx) error {
+		_, err := t.Exec(`UPDATE revisions SET parent_seq = ? WHERE seq = ?`, seqOf(t, other), seqOf(t, revs[2]))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, c := range []struct {
+		since string
+		limit int
+	}{{"", 0}, {"", 3}, {revs[0], 2}, {revs[1], 1}} {
+		if lg, err := e.ResourceLog(ctx, "n", "a", head, c.since, c.limit, Credentials{}); err == nil {
+			t.Errorf("broken chain after %q, limit %d: answered %d entries", c.since, c.limit, len(lg.Entries))
+		}
+	}
+	// A page that doesn't reach the break still answers.
+	if lg, err := e.ResourceLog(ctx, "n", "a", head, "", 2, Credentials{}); err != nil || lg.Status != 200 || len(lg.Entries) != 2 {
+		t.Fatalf("page before the break: %v %+v", err, lg)
+	}
+}

@@ -6,14 +6,18 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/middle-management/patchlog/internal/archive"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// §7.1 Paging: NSLog and Log read every page of a range; NSLogPage reads
-// one, naming the next page's since.
+// §7.1 Paging: NSLog and Log read every page of a range; NSLogPage and
+// LogPage read one, naming the next page's since.
 func TestLogPages(t *testing.T) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LogPageSize: 2})
@@ -78,6 +82,18 @@ func TestLogPages(t *testing.T) {
 	}
 	if es := must(c.Log(ctx, "docs", "a", ids[2], ids[2])); len(es) != 0 {
 		t.Fatalf("empty resource range %d", len(es))
+	}
+	// LogPage reads one page: enough to learn whether since is an
+	// ancestor.
+	es, next, err := c.LogPage(ctx, "docs", "a", ids[4], "")
+	if err != nil || len(es) != 2 || es[1].ID != ids[1] || next != ids[1] {
+		t.Fatalf("first resource page: %v, next %q, %v", es, next, err)
+	}
+	if es, next, err = c.LogPage(ctx, "docs", "a", ids[4], ids[2]); err != nil || len(es) != 2 || es[1].ID != ids[4] || next != "" {
+		t.Fatalf("last resource page: %v, next %q, %v", es, next, err)
+	}
+	if _, _, err := c.LogPage(ctx, "docs", "a", ids[2], ids[3]); !client.IsNotFound(err) {
+		t.Fatalf("page after a since that isn't an ancestor: %v", err)
 	}
 }
 
@@ -178,5 +194,99 @@ func TestPagedFlows(t *testing.T) {
 		"namespace": TestNamespaceAPI, "sealed": TestSealedTransparent, "e2e": TestE2EClient,
 	} {
 		t.Run(name, func(t *testing.T) { clienttest.Paged(t, 2, f) })
+	}
+}
+
+// A real server prunes an e2e resource at the last entry of the first page
+// of a range a client is reading, before the client asks for the next: the
+// next page's since is then the horizon, and the page starts with its
+// snapshot (§8.6), which Log and the fold leave out, so the range reads as
+// one chain from where it began (§7.1 Paging).
+func TestLogPageFromSnapshot(t *testing.T) {
+	ctx := context.Background()
+	arch, err := archive.NewDir(archive.URL(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu     sync.Mutex
+		heads  = map[string]string{} // armed: name → the range's id
+		pruned = map[string]string{} // name → horizon
+		w      *client.E2E
+	)
+	// After serving the first page of a range up to an armed head, and
+	// before the client sees it, prune at the page's last entry.
+	wrap := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			seg := strings.Split(r.URL.Path, "/") // "", r, e, name, rev, id, log
+			if len(seg) != 7 || seg[1] != "r" || seg[6] != "log" || r.URL.Query().Get("since") != "" {
+				h.ServeHTTP(rw, r)
+				return
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, r)
+			mu.Lock()
+			name, next := seg[3], rec.Header().Get("X-Log-Next")
+			arm := heads[name] == seg[5] && next != ""
+			if arm {
+				delete(heads, name)
+			}
+			mu.Unlock()
+			if arm {
+				if _, err := w.PruneE2E(context.Background(), "e", name, next); err != nil {
+					t.Errorf("prune %s at %s: %v", name, next, err)
+				}
+				mu.Lock()
+				pruned[name] = next
+				mu.Unlock()
+			}
+			for k, v := range rec.Header() {
+				rw.Header()[k] = v
+			}
+			rw.WriteHeader(rec.Code)
+			rw.Write(rec.Body.Bytes())
+		})
+	}
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), Archiver: arch, LogPageSize: 2, Wrap: wrap})
+	writer := clienttest.NewKey("writer")
+	opc := s.Client(t, client.WithBearer(s.OperatorGrant(t, "e")))
+	must(opc.CreateNamespace(ctx, "e", map[string]any{"keys": []any{writer.Entry("*")}, "encryption": map[string]any{"level": "e2e"}}))
+	jwk, priv, _ := seal.GenerateRecipient()
+	wc := s.Client(t, client.WithBearer(writer.Grant(t, s.Now(), "user:writer", []string{"e"}, []string{"read", "create", "append", "prune", "config"}, map[string]any{"enc": jwk})))
+	w = wc.E2E(priv)
+	must(w.InitKeyring(ctx, "e"))
+	revs := map[string][]string{}
+	for _, name := range []string{"a", "b"} {
+		r := must(w.CreateDocSealed(ctx, "e", name, map[string]any{"n": 0}))
+		revs[name] = []string{r.ID}
+		for i := 1; i < 6; i++ {
+			r = must(w.AppendSealed(ctx, "e", name, r.ID, ops(op("replace", "/n", i))))
+			revs[name] = append(revs[name], r.ID)
+		}
+	}
+	s.Clock.Advance(10 * time.Minute)
+	mu.Lock()
+	heads["a"], heads["b"] = revs["a"][5], revs["b"][5]
+	mu.Unlock()
+
+	es := must(wc.Log(ctx, "e", "a", revs["a"][5], ""))
+	var got []string
+	for _, e := range es {
+		got = append(got, e.ID)
+	}
+	if strings.Join(got, ",") != strings.Join(revs["a"], ",") {
+		t.Fatalf("log across a prune: %v, want %v", got, revs["a"])
+	}
+	d := must(w.DocE2E(ctx, "e", "b", revs["b"][5]))
+	sameJSON(t, d.Value, map[string]any{"n": 5})
+	mu.Lock()
+	pa, pb := pruned["a"], pruned["b"]
+	mu.Unlock()
+	if pa != revs["a"][1] || pb != revs["b"][1] {
+		t.Fatalf("pruned at %s and %s", pa, pb)
+	}
+	// The prune really happened: the range from genesis is gone now.
+	if _, err := wc.Log(ctx, "e", "a", revs["a"][5], ""); !client.IsPruned(err) {
+		t.Fatalf("range across the horizon after the prune: %v", err)
 	}
 }

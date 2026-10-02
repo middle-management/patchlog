@@ -1384,9 +1384,13 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 	}
 	since := sinceParam(r)
 	cred := creds(r)
+	// Catching up reads a log page at a time (§7.1 Paging), so a stream
+	// from far back costs the server a page per fetch, not the whole
+	// history (for a sealed namespace, a JWE per entry) at once.
+	page := s.e.Limits().LogPageSize
 	// Wait before every fetch, so no entry committed in between is missed.
 	wait := s.e.Wait(ns)
-	lg, err := s.e.NamespaceEvents(r.Context(), ns, since, cred)
+	lg, err := s.e.NamespaceEvents(r.Context(), ns, since, page, cred)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1401,22 +1405,26 @@ func (s *Server) nsEvents(w http.ResponseWriter, r *http.Request) {
 			sseEntry(w, e["kind"].(string), lg, i)
 			since = e["id"].(string)
 		}
-		select {
-		case <-wait:
-		case <-time.After(30 * time.Second):
-			fmt.Fprint(w, ": keep-alive\n\n")
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
+		if !lg.More {
+			select {
+			case <-wait:
+			case <-time.After(30 * time.Second):
+				fmt.Fprint(w, ": keep-alive\n\n")
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			case <-lifecycle.Stopping(r.Context()):
+				// The server is shutting down: end the stream; EventSource
+				// reconnects with Last-Event-ID (elsewhere).
+				return
+			case <-r.Context().Done():
+				return
 			}
-		case <-lifecycle.Stopping(r.Context()):
-			// The server is shutting down: end the stream; EventSource
-			// reconnects with Last-Event-ID (elsewhere).
-			return
-		case <-r.Context().Done():
+		} else if r.Context().Err() != nil {
 			return
 		}
 		wait = s.e.Wait(ns)
-		lg, err = s.e.NamespaceEvents(r.Context(), ns, since, cred)
+		lg, err = s.e.NamespaceEvents(r.Context(), ns, since, page, cred)
 		if err != nil || lg.Status != 200 {
 			return
 		}
@@ -1439,7 +1447,9 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	nsSince := info.Head
-	lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, 0, cred)
+	// Catching up reads a log page at a time (§7.1 Paging), as nsEvents.
+	page := s.e.Limits().LogPageSize
+	lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, page, cred)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1459,7 +1469,44 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 			since = e["id"].(string)
 		}
 	}
+	// nsEntries emits this resource's purge and prune entries after
+	// nsSince, a page per fetch; ok is false when a read failed, done
+	// is true after a purge, which ends the stream.
+	nsEntries := func() (ok, done bool) {
+		for {
+			nl, err := s.e.NamespaceEvents(r.Context(), ns, nsSince, page, cred)
+			if err != nil || nl.Status != 200 {
+				return false, false
+			}
+			nsSince = nl.Last
+			for i, e := range nl.Entries {
+				if e["resource"] != name {
+					continue
+				}
+				switch e["kind"] {
+				case "purge":
+					sseEntry(w, "purge", nl, i)
+					return true, true
+				case "prune":
+					sseEntry(w, "prune", nl, i)
+				}
+			}
+			if !nl.More || r.Context().Err() != nil {
+				return true, false
+			}
+		}
+	}
 	emit(lg)
+	// The rest of the catch-up, a page per fetch. A read failing in
+	// between (a purge, or a prune past since) ends the stream as it does
+	// below.
+	for lg.More && r.Context().Err() == nil {
+		if lg, err = s.e.ResourceLog(r.Context(), ns, name, "", since, page, cred); err != nil || lg.Status != 200 {
+			nsEntries()
+			return
+		}
+		emit(lg)
+	}
 	for {
 		select {
 		case <-wait:
@@ -1477,41 +1524,22 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		wait = s.e.Wait(ns)
-		nl, err := s.e.NamespaceEvents(r.Context(), ns, nsSince, cred)
-		if err != nil || nl.Status != 200 {
+		if ok, done := nsEntries(); !ok || done {
 			return
 		}
-		// nsEntries emits this resource's purge and prune entries; true
-		// after a purge, which ends the stream.
-		nsEntries := func(nl *core.Log) bool {
-			nsSince = nl.Last
-			for i, e := range nl.Entries {
-				if e["resource"] != name {
-					continue
-				}
-				switch e["kind"] {
-				case "purge":
-					sseEntry(w, "purge", nl, i)
-					return true
-				case "prune":
-					sseEntry(w, "prune", nl, i)
-				}
+		for {
+			lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, page, cred)
+			if err != nil || lg.Status != 200 {
+				// A purge that committed after the namespace read above:
+				// send its event before ending the stream.
+				nsEntries()
+				return
 			}
-			return false
-		}
-		if nsEntries(nl) {
-			return
-		}
-		lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, 0, cred)
-		if err != nil || lg.Status != 200 {
-			// A purge that committed after the namespace read above: send
-			// its event before ending the stream.
-			if nl, err := s.e.NamespaceEvents(r.Context(), ns, nsSince, cred); err == nil && nl.Status == 200 {
-				nsEntries(nl)
+			emit(lg)
+			if !lg.More || r.Context().Err() != nil {
+				break
 			}
-			return
 		}
-		emit(lg)
 	}
 }
 

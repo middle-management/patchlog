@@ -503,3 +503,53 @@ func TestLogPagingBranch(t *testing.T) {
 	}
 	expect(t, e.get("/r/br2/a/rev/"+head+"/log?since="+later), 404)
 }
+
+// A page of an e2e range whose since is a prune snapshot starts with that
+// snapshot (§8.6), a later page as much as a first: the URL is the same.
+// The snapshot isn't an entry of the range, so it doesn't count towards
+// the page size. A later page's since is a snapshot when the resource was
+// pruned at the previous page's last entry between the two reads.
+func TestE2ELogPageFromSnapshot(t *testing.T) {
+	f := newE2E(t, withArchive(t, t.TempDir()), withLogPageSize(2))
+	e := f.tenv
+	k := seal.NewKey()
+	revs := []string{etagOf(e.writeRaw("e", "p", "", sealed(t, k, "e#1", "e", "p", "", addRoot(map[string]any{"n": 0.0})), f.writerG))}
+	for i := 1; i < 6; i++ {
+		revs = append(revs, etagOf(e.writeRaw("e", "p", revs[i-1], sealed(t, k, "e#1", "e", "p", revs[i-1], ops(op("replace", "/n", float64(i)))), f.writerG)))
+	}
+	e.clock.Advance(10 * time.Minute)
+	path := "/r/e/p/rev/" + revs[5] + "/log"
+	r := e.get(path, f.readerG)
+	expect(t, r, 200)
+	if got := entryIDs(anyMaps(r.Arr())); strings.Join(got, ",") != strings.Join(revs[:2], ",") || r.H.Get("X-Log-Next") != revs[1] {
+		t.Fatalf("first page %v, next %q", got, r.H.Get("X-Log-Next"))
+	}
+	snap, err := seal.SealSnapshot(k, "e#1", "e", "p", revs[1], map[string]any{"n": 1.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expect(t, e.prune("e", "p", map[string]any{"horizon": revs[1], "snapshot": snap}, f.writerG), 200)
+	r = e.get(path+"?since="+revs[1], f.readerG)
+	expect(t, r, 200)
+	arr := anyMaps(r.Arr())
+	if len(arr) != 3 || arr[0]["kind"] != "snapshot" || arr[0]["id"] != revs[1] || arr[0]["snapshot"] != snap {
+		t.Fatalf("page from the horizon: %v", arr)
+	}
+	if got := entryIDs(arr[1:]); strings.Join(got, ",") != strings.Join(revs[2:4], ",") || arr[1]["parent"] != revs[1] || r.H.Get("X-Log-Next") != revs[3] {
+		t.Fatalf("page from the horizon: %v, next %q", got, r.H.Get("X-Log-Next"))
+	}
+	// The page after it has no snapshot to start with.
+	r = e.get(path+"?since="+revs[3], f.readerG)
+	expect(t, r, 200)
+	if got := entryIDs(anyMaps(r.Arr())); strings.Join(got, ",") != strings.Join(revs[4:], ",") || r.H.Get("X-Log-Next") != "" {
+		t.Fatalf("last page %v, next %q", got, r.H.Get("X-Log-Next"))
+	}
+}
+
+func anyMaps(xs []any) []map[string]any {
+	out := []map[string]any{}
+	for _, x := range xs {
+		out = append(out, x.(map[string]any))
+	}
+	return out
+}

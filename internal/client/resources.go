@@ -183,30 +183,58 @@ func (c *Client) Log(ctx context.Context, ns, name, id, since string) ([]LogEntr
 	}
 	all := []LogEntry{}
 	for cur := since; ; {
-		next, err := c.logPage(ctx, "/r/"+ns+"/"+name+"/rev/"+id+"/log", cur, id, func(r *response, end string) (string, error) {
-			es, err := c.openLog(ctx, ns, name, cur, end, r)
-			if err != nil {
-				return "", err
-			}
-			if len(es) > 0 && es[0].Kind == "snapshot" && es[0].ID == cur && cur != since {
-				// A later page of an e2e range repeats the snapshot of
-				// its since, if it has one (core: ResourceLog).
-				es = es[1:]
-			}
-			all = append(all, es...)
-			if len(es) == 0 {
-				return "", nil
-			}
-			return es[len(es)-1].ID, nil
-		})
+		es, next, err := c.resLogPage(ctx, ns, name, id, cur)
 		if err != nil {
 			return nil, err
 		}
+		if len(es) > 0 && es[0].Kind == "snapshot" && es[0].ID == cur && cur != since {
+			// A later page of an e2e range repeats the snapshot of its
+			// since, if it has one (core: ResourceLog).
+			es = es[1:]
+		}
+		all = append(all, es...)
 		if next == "" {
 			return all, nil
 		}
 		cur = next
 	}
+}
+
+// LogPage fetches one page of the resource log range after since up to id
+// (§7.1 Paging): its entries, oldest first, and next, the since of the
+// following page, or "" when the page ends at id. A page whose since is an
+// e2e prune snapshot starts with it (kind "snapshot", §8.6), as served. It
+// answers whether since is an ancestor of id (a 404 when not; a 410 pruned
+// when the range crosses the horizon) for the price of one page.
+func (c *Client) LogPage(ctx context.Context, ns, name, id, since string) (entries []LogEntry, next string, err error) {
+	if err := checkRes(ns, name); err != nil {
+		return nil, "", err
+	}
+	if err := checkOptID("since", since); err != nil {
+		return nil, "", err
+	}
+	if err := checkID("revision", id); err != nil {
+		return nil, "", err
+	}
+	return c.resLogPage(ctx, ns, name, id, since)
+}
+
+func (c *Client) resLogPage(ctx context.Context, ns, name, id, since string) (entries []LogEntry, next string, err error) {
+	next, err = c.logPage(ctx, "/r/"+ns+"/"+name+"/rev/"+id+"/log", since, id, func(r *response, end string) (string, error) {
+		es, err := c.openLog(ctx, ns, name, since, end, r)
+		if err != nil {
+			return "", err
+		}
+		entries = es
+		if len(es) == 0 {
+			return "", nil
+		}
+		return es[len(es)-1].ID, nil
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return entries, next, nil
 }
 
 // --- writes ------------------------------------------------------------

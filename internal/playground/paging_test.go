@@ -5,13 +5,18 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/middle-management/patchlog/internal/archive"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/keystore"
@@ -252,5 +257,154 @@ func TestLogReadersUsed(t *testing.T) {
 	}
 	if !strings.Contains(jsFunction(t, js, "readDoc"), "readLogRange(") {
 		t.Error("readDoc folds without following the range's pages")
+	}
+}
+
+// snapshotHarness reads one e2e resource log range with app.js's
+// readLogRange against a live server.
+const snapshotHarness = `
+const fs = require('fs');
+require(process.argv[2]);
+const input = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
+const Z = globalThis.PLSeal;
+const ID_RE = /^1[a-z2-7]{32}$/;
+const short = (id) => id || '';
+async function api(method, path, o) {
+  const res = await fetch(input.base + path, { method, headers: { Authorization: 'Bearer ' + input.bearer } });
+  const text = await res.text();
+  let json = null;
+  try { json = text ? JSON.parse(text) : null; } catch (_) { /* not JSON */ }
+  const u = new URL(res.url);
+  return { status: res.status, json, text, finalPath: u.pathname + u.search,
+    jose: /^application\/jose\b/i.test(res.headers.get('Content-Type') || ''), hdr: (k) => res.headers.get(k) };
+}
+FUNCTIONS
+(async () => {
+  const L = await readLogRange(await api('GET', input.path));
+  process.stdout.write(JSON.stringify({ kinds: L.arr.map((x) => x.kind + ':' + x.id), err: L.err }));
+})().catch((e) => { console.error(e); process.exit(1); });
+`
+
+// A real server prunes an e2e resource at the last entry of the first page
+// the playground reads, before it asks for the next: that page's since is
+// the horizon and it starts with the horizon's snapshot (§8.6), which
+// readLogRange leaves out, so the range reads as one chain (§7.1 Paging).
+func TestLogPageFromSnapshotWithNode(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	ctx := context.Background()
+	arch, err := archive.NewDir(archive.URL(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu     sync.Mutex
+		armed  string // the range's id
+		pruned string
+		w      *client.E2E
+	)
+	wrap := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			seg := strings.Split(r.URL.Path, "/") // "", r, e, p, rev, id, log
+			if len(seg) != 7 || seg[6] != "log" || r.URL.Query().Get("since") != "" {
+				h.ServeHTTP(rw, r)
+				return
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, r)
+			next := rec.Header().Get("X-Log-Next")
+			mu.Lock()
+			arm := armed != "" && armed == seg[5] && next != ""
+			if arm {
+				armed = ""
+			}
+			mu.Unlock()
+			if arm {
+				if _, err := w.PruneE2E(context.Background(), "e", "p", next); err != nil {
+					t.Errorf("prune at %s: %v", next, err)
+				}
+				mu.Lock()
+				pruned = next
+				mu.Unlock()
+			}
+			for k, v := range rec.Header() {
+				rw.Header()[k] = v
+			}
+			rw.WriteHeader(rec.Code)
+			rw.Write(rec.Body.Bytes())
+		})
+	}
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: newTestKeyStore(t), Archiver: arch, LogPageSize: 2, Wrap: wrap})
+	writer := clienttest.NewKey("writer")
+	if _, err := s.Client(t, client.WithBearer(s.OperatorGrant(t, "e"))).CreateNamespace(ctx, "e", map[string]any{"keys": []any{writer.Entry("*")}, "encryption": map[string]any{"level": "e2e"}}); err != nil {
+		t.Fatal(err)
+	}
+	jwk, priv, _ := seal.GenerateRecipient()
+	bearer := writer.Grant(t, s.Now(), "user:writer", []string{"e"}, []string{"read", "create", "append", "prune", "config"}, map[string]any{"enc": jwk})
+	w = s.Client(t, client.WithBearer(bearer)).E2E(priv)
+	if _, err := w.InitKeyring(ctx, "e"); err != nil {
+		t.Fatal(err)
+	}
+	var revs []string
+	r, err := w.CreateDocSealed(ctx, "e", "p", map[string]any{"n": 0})
+	for i := 1; err == nil; i++ {
+		revs = append(revs, r.ID)
+		if i == 6 {
+			break
+		}
+		r, err = w.AppendSealed(ctx, "e", "p", r.ID, []any{map[string]any{"op": "replace", "path": "/n", "value": i}})
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Clock.Advance(10 * time.Minute)
+	armed = revs[5]
+
+	js, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fns []string
+	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange"} {
+		fns = append(fns, jsFunction(t, js, f))
+	}
+	dir := t.TempDir()
+	h := filepath.Join(dir, "harness.js")
+	if err := os.WriteFile(h, []byte(strings.Replace(snapshotHarness, "FUNCTIONS", strings.Join(fns, "\n"), 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := json.Marshal(map[string]any{"base": s.URL, "bearer": bearer, "path": "/r/e/p/rev/" + revs[5] + "/log"})
+	inPath := filepath.Join(dir, "input.json")
+	if err := os.WriteFile(inPath, in, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sealJS, _ := filepath.Abs("static/seal.js")
+	cmd := exec.Command(node, h, sealJS, inPath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	b, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("node: %v\n%s", err, stderr.String())
+	}
+	var out struct {
+		Kinds []string
+		Err   string
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("node output %s: %v", b, err)
+	}
+	var want []string
+	for _, id := range revs {
+		want = append(want, "rev:"+id)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if pruned != revs[1] {
+		t.Fatalf("pruned at %q, want %s", pruned, revs[1])
+	}
+	if strings.Join(out.Kinds, ",") != strings.Join(want, ",") || out.Err != "" {
+		t.Fatalf("range across a prune: %v (%q), want %v", out.Kinds, out.Err, want)
 	}
 }

@@ -3,6 +3,7 @@ package core
 import (
 	"database/sql"
 	"errors"
+	"fmt"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -488,8 +489,18 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit int) (entries []LogEntr
 		rs.Close()
 	}
 	// Each entry's parent is the row before it (a segment's first row's,
-	// the last of the older segment), so its id is known.
+	// the last of the older segment), so its id is known. The schema keeps
+	// one first row and one child per parent in a resource (one_first,
+	// UNIQUE (res, parent_seq)), but not that a later row's parent is a
+	// row of the same resource before it, so that is checked here, where
+	// the rows are at hand: a writer that broke the chain would otherwise
+	// make the range answer rows that aren't ancestors of to.
+	prev := lo
 	for _, r := range rows {
+		if r.parentSeq.Valid != (prev != 0) || r.parentSeq.Valid && r.parentSeq.Int64 != prev {
+			t.must(fmt.Errorf("revision row %d: parent %v, not the row before it, %d: the chain forks", r.seq, r.parentSeq, prev))
+		}
+		prev = r.seq
 		t.knowRevID(r.seq, r.id)
 	}
 	more = len(rows) > 0 && rows[len(rows)-1].seq != to.seq

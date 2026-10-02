@@ -1519,17 +1519,23 @@ just doesn't apply).
   costs its own rows, however long the range: a resource's chain is its rows in seq order, so a
   page is one `seq > ? … LIMIT` query per ancestry segment it reaches, after a query or two per
   segment to place `since` and look for pruned patch sets, which only exist at or below a
-  resource's horizon (or in a purged one); a namespace page is one `LIMIT` query. Long-polls
-  (§7.7) answer pages of the same size and shape, without `X-Log-Next` (their header names the
-  next `since`), and `/heads` pages are as long. In an e2e namespace, a page whose `since` is a
-  prune snapshot starts with that snapshot, as the first page of a range does; readers skip it
-  on later pages. Every reader follows pages and treats a page that stops short of the range's
-  id without `X-Log-Next` as an error: `client.Log`, `NSLog` (one page: `NSLogPage`) and e2e
+  resource's horizon (or in a purged one); a namespace page is one `LIMIT` query. The rows a
+  page reads are checked to chain (each one's parent is the row before it), so a broken chain is
+  a `500`, never a range with rows that aren't ancestors. Long-polls (§7.7) answer pages of the
+  same size and shape, without `X-Log-Next` (their header names the next `since`), and `/heads`
+  pages are as long. Event streams (§7.3) catch up a page per fetch too, before they go live, so
+  a stream from far back never builds (or, sealed, seals) the whole history at once. In an e2e
+  namespace, a page whose `since` is a prune snapshot starts with that snapshot, as the first
+  page of a range does (it is the same URL), and the snapshot doesn't count towards the page
+  size, so such a page has up to one element more; a later page's `since` is a snapshot when the
+  resource was pruned at the previous page's end between the two reads, and readers skip it
+  there. Every reader follows pages and treats a page that stops short of the range's id without
+  `X-Log-Next` as an error: `client.Log`, `NSLog` (one page each: `LogPage`, `NSLogPage`) and e2e
   folds, and so `follow` (catch-up delivers and checkpoints page by page, §10), the index (`?min`
   checks only the first page), tree and catalog, merge, rebase, release and janitor tooling,
-  bundle export and import, remote branches mirroring and following their bases (§G.3), and the
-  playground (namespace logs, histories and e2e folds; each sealed page is opened as its own
-  range).
+  bundle export and import (whether `requires` is in the target's chain takes one page), remote
+  branches mirroring and following their bases (§G.3), and the playground (namespace logs,
+  histories and e2e folds; each sealed page is opened as its own range).
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
   batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
   principal and namespace buckets, and a key scope's lower rate) and batch limits, until the

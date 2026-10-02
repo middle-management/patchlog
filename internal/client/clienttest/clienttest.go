@@ -68,6 +68,9 @@ type Options struct {
 	// Paging). Zero means PATCHLOG_TEST_LOG_PAGE_SIZE (testenv), else the
 	// default, 1000.
 	LogPageSize int
+	// Wrap, if set, wraps the server's handler, e.g. to change state
+	// between two requests of a flow.
+	Wrap func(http.Handler) http.Handler
 }
 
 // Server is a running test server.
@@ -119,7 +122,11 @@ func New(t testing.TB, opt Options) *Server {
 		t.Fatal(err)
 	}
 	s.Engine = e
-	s.HTTP = httptest.NewServer(CountPages(server.New(e)))
+	var h http.Handler = server.New(e)
+	if opt.Wrap != nil {
+		h = opt.Wrap(h)
+	}
+	s.HTTP = httptest.NewServer(CountPages(h))
 	s.URL = s.HTTP.URL
 	t.Cleanup(func() {
 		s.HTTP.CloseClientConnections()
