@@ -453,6 +453,13 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
 					exp := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
 					if r := t.replay(n, a, st, &configPlan{expected: &exp}, true); r != nil {
+						// It is that batch, but the lookup doesn't apply
+						// to a purged resource (§6.2 step 2, §7.2): 410
+						// for its items, not a 412 that would invite the
+						// client to apply its config change again.
+						if pf := t.purgedItems(n, st); len(pf) > 0 {
+							return nil, nil, fail(pf)
+						}
 						return nil, r, nil
 					}
 				}
@@ -491,7 +498,15 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 
 	// Step 2: precondition — idempotent retry, settling the verb, frozen,
-	// the precondition.
+	// the precondition. The retry lookup doesn't apply to a purged
+	// resource: the answer is 410, as for every URL of it, before the
+	// frozen check (§6.2 step 2, §7.2, §8.3).
+	if pf := t.purgedItems(n, st); len(pf) > 0 {
+		if !dryRun {
+			return nil, nil, fail(pf)
+		}
+		st = dropFailed(st, pf, dryFails)
+	}
 	if r := t.replay(n, a, st, cplan, isBatch); r != nil {
 		return nil, r, nil
 	}
@@ -818,17 +833,24 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 	return out, true
 }
 
-// replay implements the idempotent-retry lookup (§7.2, §7.5). It doesn't
-// apply to a purged resource, whose answer is 410 as for every URL of it
-// (§6.2 step 2, §8.3): a single write, or a batch with an item for one,
-// goes on to step 2's other checks, which answer that.
-func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
-	author := t.actorID(a)
+// purgedItems answers 410 for each item whose resource is purged, as the
+// writer sees it (§7.6): the idempotent-retry lookup doesn't apply to it
+// (§6.2 step 2, §7.2), and every URL of it is 410 (§8.3).
+func (t *tx) purgedItems(n *nsRow, st []*itemState) []itemErr {
+	var fs []itemErr
 	for _, s := range st {
-		if own := t.resource(n.id, s.Resource); own != nil && own.state == statePurged {
-			return nil
+		if t.resolve(n, s.Resource, nil).state == Purged {
+			fs = append(fs, itemErr{s.index, gone()})
 		}
 	}
+	return fs
+}
+
+// replay implements the idempotent-retry lookup (§7.2, §7.5). Callers
+// answer a purged resource first (purgedItems): the lookup doesn't apply
+// to one.
+func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
+	author := t.actorID(a)
 	if !isBatch {
 		if len(st) != 1 {
 			return nil
@@ -1325,7 +1347,11 @@ func (t *tx) storeGrant(g *grant.Grant, encrypt bool) []byte {
 	}
 	id := g.ID()
 	if enc, ok := t.storedGrants[id]; !ok || (encrypt && !enc) {
-		t.storeGrantBlocks(id[:], g.Stored(), encrypt)
+		var root *grantRoot
+		if len(g.Blocks) > 0 {
+			root = &grantRoot{sub: g.Blocks[0].Sub, kid: g.Blocks[0].Kid}
+		}
+		t.storeGrantBlocks(id[:], g.Stored(), root, encrypt)
 		if t.storedGrants == nil {
 			t.storedGrants = map[ids.ID]bool{}
 		}

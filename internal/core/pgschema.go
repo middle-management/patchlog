@@ -81,7 +81,7 @@ END $$;
 CREATE INDEX IF NOT EXISTS revisions_by_id ON revisions (id);  -- also finds draft schema revisions in branches (§6.1, D.2)
 CREATE INDEX IF NOT EXISTS revisions_res_seq ON revisions (res, seq);
 
-CREATE TABLE IF NOT EXISTS grants (id bytea PRIMARY KEY, blocks bytea NOT NULL);
+CREATE TABLE IF NOT EXISTS grants (id bytea PRIMARY KEY, blocks bytea NOT NULL, root_sub text, root_kid text);
 
 CREATE TABLE IF NOT EXISTS deks (
   res        bigint PRIMARY KEY,
@@ -308,6 +308,10 @@ DO $$ BEGIN
     WHERE g.seq = ns_log.seq AND ns_log.kind IN (0, 1, 4);
   END IF;
 END $$;
+-- The root sub and kid of stored grants, in plaintext (db.go); migratePG
+-- backfills them once, for the grants stored in plaintext.
+ALTER TABLE grants ADD COLUMN IF NOT EXISTS root_sub text;
+ALTER TABLE grants ADD COLUMN IF NOT EXISTS root_kid text;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 `
@@ -341,8 +345,20 @@ func migratePG(db *sql.DB) error {
 	if _, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock($1, $2)`, lockClass, lockSchema); err != nil {
 		return err
 	}
+	// A database from before grants.root_sub has a grants table without
+	// it: backfill it once, after the schema adds it.
+	var oldGrants bool
+	if err := tx.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = current_schema() AND table_name = 'grants')
+		AND NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema = current_schema() AND table_name = 'grants' AND column_name = 'root_sub')`).Scan(&oldGrants); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, schemaPG); err != nil {
 		return fmt.Errorf("creating schema: %w", err)
+	}
+	if oldGrants {
+		if err := backfillGrantRoots(func(n int) string { return fmt.Sprintf("$%d", n) })(ctx, tx); err != nil {
+			return fmt.Errorf("backfilling grant roots: %w", err)
+		}
 	}
 	return tx.Commit()
 }

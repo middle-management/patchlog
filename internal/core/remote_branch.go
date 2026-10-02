@@ -422,8 +422,9 @@ type remoteMirror struct {
 }
 
 // fetchLevel fetches and verifies a namespace's log up to at, and its
-// configuration genesis. next is its base, if it is a branch.
-func fetchLevel(ctx context.Context, c *client.Client, ns, at string, mapErr func(string, error) *Error) (*remoteLevel, *BaseRef, *Error) {
+// configuration genesis, which check judges first (checkRemoteDoc). next
+// is its base, if it is a branch.
+func fetchLevel(ctx context.Context, c *client.Client, ns, at string, mapErr func(string, error) *Error, check func(ns string, doc map[string]any) *Error) (*remoteLevel, *BaseRef, *Error) {
 	// The namespace log up to at, verified from its first entry: at is the
 	// trusted starting point (§G.1).
 	log, err := c.NSLog(ctx, ns, at, "")
@@ -473,6 +474,9 @@ func fetchLevel(ctx context.Context, c *client.Client, ns, at string, mapErr fun
 		// Not readable as plain JSON (sealed): not a branch this server
 		// follows. If it is one after all, /heads won't agree.
 		return lv, nil, nil
+	}
+	if ferr := check(ns, d.Value); ferr != nil {
+		return nil, nil, ferr
 	}
 	bv, isBranch := d.Value["base"]
 	if !isBranch {
@@ -560,25 +564,42 @@ func fetchEpochs(ctx context.Context, c *client.Client, lv *remoteLevel, mapErr 
 	return nil
 }
 
-// checkRemoteSpec checks the spec version the base's deployment publishes
-// at GET / (§7.4) before anything of it is read. B reads the base's
-// namespace documents (read, encryption and base, for the obligations of
-// §G.5 and the chain of §G.3), and namespace-document members are what a
-// spec version defines: a base implementing a later version may have
-// settings B can't read, or reads differently, so B refuses to create the
-// branch (422) rather than misjudge how protected the base is. A
-// deployment from before v0.37 publishes no version: its documents hold
-// nothing B doesn't know.
-func checkRemoteSpec(origin, spec string) *Error {
+// remoteSpecLater reports whether the base's deployment publishes, at
+// GET / (§7.4), a spec version later than this deployment's, or one it
+// can't compare with its own. A deployment from before v0.37 publishes
+// none: its documents hold nothing this one doesn't know.
+func remoteSpecLater(spec string) bool {
 	if spec == "" {
-		return nil
+		return false
 	}
 	newer, ok := specNewer(spec, SpecVersion)
-	switch {
-	case !ok:
-		return invalid(fmt.Sprintf("the base's deployment %s publishes the spec version %q, which this deployment (%s) can't compare with its own", origin, spec, SpecVersion))
-	case newer:
-		return invalid(fmt.Sprintf("the base's deployment %s implements spec %s, later than this deployment's %s: its namespace documents may hold settings this deployment can't read (§7.4), so it can't tell how protected the base is (§G.5); upgrade this deployment first", origin, spec, SpecVersion))
+	return newer || !ok
+}
+
+// nsDocMembers are the namespace-document members this deployment's spec
+// version defines, core and addenda (§7.4).
+var nsDocMembers = map[string]bool{
+	"read": true, "keys": true, "roles": true, "revoked": true, "rules": true, "limits": true, "allowances": true,
+	"retention": true, "encryption": true, "maxLag": true, "base": true, "frozen": true, "successor": true, "drafts": true,
+	"catalog": true, "catalogs": true, "merge": true, "merged": true, "cleanup": true, "abandoned": true,
+}
+
+// checkRemoteDoc checks a namespace document of a remote base that B
+// reads (§G.3: its read, encryption and base members, for the obligations
+// of §G.5 and the chain), against the spec version its deployment
+// publishes (§7.4). Nothing of A's configuration is copied, so a later
+// version alone is no reason to refuse: only a member this deployment
+// doesn't know, and that isn't an x- extension, is, since it may change
+// how protected the base is (422). From a deployment of this version or
+// an earlier one, every member is one B knows or data.
+func checkRemoteDoc(origin, spec, ns string, doc map[string]any) *Error {
+	if !remoteSpecLater(spec) {
+		return nil
+	}
+	for _, k := range sortedKeys(doc) {
+		if !nsDocMembers[k] && !strings.HasPrefix(k, "x-") {
+			return invalid(fmt.Sprintf("the base's deployment %s implements spec %q, later than this deployment's %s, and /ns/%s's namespace document holds %q, a member this deployment doesn't know (§7.4): it can't tell how protected the base is (§G.5)", origin, spec, SpecVersion, ns, k))
+		}
 	}
 	return nil
 }
@@ -634,15 +655,14 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 	if root.Origin != base.Origin {
 		return nil, remoteErr("the deployment reached for %s publishes the origin %q", base.Origin, root.Origin)
 	}
-	if ferr := checkRemoteSpec(base.Origin, root.Spec); ferr != nil {
-		return nil, ferr
-	}
 	m := &remoteMirror{base: base, read: "grant"}
 	mapErrs := []func(string, error) *Error{fetchErr}
 	ns, at := base.NS, base.At
 	for {
 		mapErr := mapErrs[len(mapErrs)-1]
-		lv, next, ferr := fetchLevel(ctx, c, ns, at, mapErr)
+		lv, next, ferr := fetchLevel(ctx, c, ns, at, mapErr, func(ns string, doc map[string]any) *Error {
+			return checkRemoteDoc(base.Origin, root.Spec, ns, doc)
+		})
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -654,6 +674,9 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 			d, err := c.NSDoc(ctx, base.NS, base.At)
 			if err != nil {
 				return nil, unknownLevel(base, err)
+			}
+			if ferr := checkRemoteDoc(base.Origin, root.Spec, base.NS, d.Value); ferr != nil {
+				return nil, ferr
 			}
 			if d.Value["read"] == "public" {
 				m.read = "public"

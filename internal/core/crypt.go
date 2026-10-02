@@ -49,6 +49,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 )
 
@@ -357,10 +358,16 @@ func (t *tx) openValue(res int64, raw string, aad func() []byte) []byte {
 
 // storeGrantBlocks stores a grant's non-bearer form, encrypted under the
 // deployment grants key when it is used in an encrypted namespace; a grant
-// stored in plaintext earlier is encrypted then.
-func (t *tx) storeGrantBlocks(id, blocks []byte, encrypt bool) {
+// stored in plaintext earlier is encrypted then. The root block's sub and
+// kid are stored in plaintext next to it (root, nil when they are already
+// stored), so serving grant references never needs the key store (§7.4).
+func (t *tx) storeGrantBlocks(id, blocks []byte, root *grantRoot, encrypt bool) {
+	var sub, kid any
+	if root != nil {
+		sub, kid = root.sub, root.kid
+	}
 	if !encrypt {
-		_, err := t.Exec(`INSERT INTO grants (id, blocks) VALUES (?, ?) ON CONFLICT DO NOTHING`, id, t.e.blobArg(blocks))
+		_, err := t.Exec(`INSERT INTO grants (id, blocks, root_sub, root_kid) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING`, id, t.e.blobArg(blocks), sub, kid)
 		t.must(err)
 		return
 	}
@@ -368,9 +375,17 @@ func (t *tx) storeGrantBlocks(id, blocks []byte, encrypt bool) {
 	err := t.QueryRow(`SELECT blocks FROM grants WHERE id = ?`, id).Scan(&cur)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		_, err = t.Exec(`INSERT INTO grants (id, blocks) VALUES (?, ?)`, id, sealRow(t.dek(grantsDEK, true), grantAAD(id), blocks))
+		_, err = t.Exec(`INSERT INTO grants (id, blocks, root_sub, root_kid) VALUES (?, ?, ?, ?)`, id, sealRow(t.dek(grantsDEK, true), grantAAD(id), blocks), sub, kid)
 	case err == nil && !isSealed(cur):
-		_, err = t.Exec(`UPDATE grants SET blocks = ? WHERE id = ?`, sealRow(t.dek(grantsDEK, true), grantAAD(id), []byte(cur)), id)
+		if root == nil {
+			// A row from before root_sub that the migration couldn't
+			// fill: it is plaintext until now.
+			if g, perr := grant.ParseStored([]byte(cur)); perr == nil && len(g.Blocks) > 0 {
+				sub, kid = g.Blocks[0].Sub, g.Blocks[0].Kid
+			}
+		}
+		_, err = t.Exec(`UPDATE grants SET blocks = ?, root_sub = COALESCE(root_sub, ?), root_kid = COALESCE(root_kid, ?) WHERE id = ?`,
+			sealRow(t.dek(grantsDEK, true), grantAAD(id), []byte(cur)), sub, kid, id)
 	}
 	t.must(err)
 }
@@ -416,7 +431,7 @@ func (t *tx) encryptNamespace(n *nsRow) {
 		for _, g := range grants {
 			var cur string
 			if err := t.QueryRow(`SELECT blocks FROM grants WHERE id = ?`, g).Scan(&cur); err == nil {
-				t.storeGrantBlocks(g, []byte(cur), true)
+				t.storeGrantBlocks(g, []byte(cur), nil, true)
 			}
 		}
 	}

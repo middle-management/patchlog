@@ -3,7 +3,8 @@ package core
 import "testing"
 
 // §7.4: spec versions compare as dotted decimal numbers; a remote base's
-// deployment implementing a later version is refused (§G.3).
+// deployment implementing a later version is refused only for a member of
+// a namespace document B reads that B doesn't know (§G.3).
 func TestSpecNewer(t *testing.T) {
 	for _, c := range []struct {
 		a, b      string
@@ -26,13 +27,25 @@ func TestSpecNewer(t *testing.T) {
 			t.Errorf("specNewer(%q, %q) = %v, %v", c.a, c.b, newer, ok)
 		}
 	}
-	if err := checkRemoteSpec("https://a.example", ""); err != nil {
-		t.Fatalf("no version: %v", err)
-	}
-	if err := checkRemoteSpec("https://a.example", SpecVersion); err != nil {
-		t.Fatalf("our version: %v", err)
-	}
-	if err := checkRemoteSpec("https://a.example", "99"); err == nil || err.Status != 422 {
-		t.Fatalf("a later version: %v", err)
+	// A remote base's namespace documents are judged by their members, and
+	// only from a deployment of a later (or unknown) version (§G.3).
+	odd := map[string]any{"read": "public", "x-team": "a", "wardens": []any{}}
+	for _, c := range []struct {
+		spec string
+		doc  map[string]any
+		ok   bool
+	}{
+		{"", odd, true},
+		{"0.36", odd, true},
+		{SpecVersion, odd, true},
+		{"0.38", map[string]any{"read": "public", "x-team": "a", "encryption": map[string]any{"level": "at-rest"}}, true},
+		{"0.38", odd, false},
+		{"0.37.1", odd, false},
+		{"0.37-rc", odd, false},
+	} {
+		err := checkRemoteDoc("https://a.example", c.spec, "main", c.doc)
+		if (err == nil) != c.ok || (err != nil && err.Status != 422) {
+			t.Errorf("checkRemoteDoc(%q, %v) = %v", c.spec, c.doc, err)
+		}
 	}
 }

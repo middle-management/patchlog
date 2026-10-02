@@ -227,7 +227,9 @@ func TestNSLogGrantMigration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, q := range []string{`ALTER TABLE ns_log ADD COLUMN kid TEXT`, `UPDATE ns_log SET kid = 'issuer'`, `ALTER TABLE ns_log DROP COLUMN grant_id`} {
+	// And grants without the plaintext root sub and kid.
+	for _, q := range []string{`ALTER TABLE ns_log ADD COLUMN kid TEXT`, `UPDATE ns_log SET kid = 'issuer'`, `ALTER TABLE ns_log DROP COLUMN grant_id`,
+		`ALTER TABLE grants DROP COLUMN root_sub`, `ALTER TABLE grants DROP COLUMN root_kid`} {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)
 		}
@@ -235,6 +237,22 @@ func TestNSLogGrantMigration(t *testing.T) {
 	db.Close()
 
 	e2 := newEnv(t, withPath(path), withOperator(e.opPriv))
+	// The migration filled them for every grant (all stored in plaintext).
+	db, err = sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var missing, filled int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM grants WHERE root_sub IS NULL`).Scan(&missing); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRow(`SELECT COUNT(*) FROM grants WHERE root_sub = 'user:bob' AND root_kid = 'issuer'`).Scan(&filled); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	if missing != 0 || filled != 1 {
+		t.Fatalf("grant roots after the migration: %d missing, %d of the issuer's", missing, filled)
+	}
 	checkEntries(t, "sec", e2.get("/ns/sec/rev/"+e2.nsHead("sec", f.adminG)+"/log", f.adminG).Arr(), [][3]string{
 		{"config", "op:root", ""},
 		{"head", "user:bob", grantRef(t, f.issuerG)},
@@ -248,5 +266,32 @@ func TestNSLogGrantMigration(t *testing.T) {
 	lg := e2.get("/ns/sec/rev/"+e2.nsHead("sec", f.adminG)+"/log", f.adminG).Arr()
 	if got := entryRef(t, lg[len(lg)-1]); got != grantRef(t, f.adminG) {
 		t.Fatalf("new entry grant %q", got)
+	}
+}
+
+// §1, §7.4: authentication disabled means no grant references are
+// recorded; a database written with authentication on and later served in
+// development mode keeps serving the references it recorded.
+func TestNSLogGrantRecordedBeforeDev(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "dev.db")
+	if pgtest.Enabled() {
+		path = pgtest.NewDB(t)
+	}
+	f := newAuthFixture(t, nil, withPath(path))
+	e := f.tenv
+	e.create("sec", "a", map[string]any{}, f.issuerG)
+	e.close()
+
+	d := newEnv(t, withPath(path))
+	d.create("sec", "b", map[string]any{}, "ann")
+	lg := d.get("/ns/sec/rev/" + d.nsHead("sec") + "/log").Arr()
+	if len(lg) < 2 {
+		t.Fatalf("log %v", lg)
+	}
+	if got := entryRef(t, lg[len(lg)-2]); got != grantRef(t, f.issuerG) {
+		t.Fatalf("entry recorded with authentication on: grant %q", got)
+	}
+	if got := entryRef(t, lg[len(lg)-1]); got != "" {
+		t.Fatalf("entry written in development mode: grant %q", got)
 	}
 }

@@ -494,7 +494,8 @@ func hasDocEntries(log []client.NSEntry, i int, e2e bool) bool {
 // source.at is in the branch's chain, and checks that the branch changed no
 // document after it. If authors is non-nil, only batches whose recorded
 // grant has a root sub and kid listed in *authors count (merge.EntryListed,
-// with dev for a janitor without a grant of its own).
+// with dev for a deployment with authentication disabled,
+// client.WithAuthDisabled).
 func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author, e2e, dev bool) (bool, string) {
 	pos := map[string]int{}
 	for i, e := range blog {
@@ -563,7 +564,7 @@ func (j *Janitor) verifyMerged(ctx context.Context, base, at, ns string, blog []
 	if !declared {
 		return false, "the base " + base + " declares no merge.authors, so no merge batch can be trusted (§F.3)", nil
 	}
-	ok, why := coveredBy(entries, ns, blog, &authors, e2e, !j.c.HasBearer())
+	ok, why := coveredBy(entries, ns, blog, &authors, e2e, j.c.AuthDisabled())
 	return ok, why, nil
 }
 
@@ -604,7 +605,7 @@ func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, b
 		return false, "", err
 	}
 	// §F.6 names no merge.authors check for the successor's batch.
-	ok, why := coveredBy(entries, ns, blog, nil, e2e, !j.c.HasBearer())
+	ok, why := coveredBy(entries, ns, blog, nil, e2e, j.c.AuthDisabled())
 	return ok, why, nil
 }
 
@@ -635,9 +636,9 @@ func (j *Janitor) verifyAbandoned(ctx context.Context, ns string, log []client.N
 		return false, "no config write set abandoned", nil
 	}
 	if setter.Grant == nil {
-		if !j.c.HasBearer() {
+		if j.c.AuthDisabled() {
 			// Authentication disabled: no entry records a grant (§1), and
-			// the claim is the development server's operator's.
+			// every writer counts as holding a * key.
 			return true, "", nil
 		}
 		return false, fmt.Sprintf("the config write %s that set it records no grant (§7.4), so its key can't be checked; set abandoned again", setter.ID), nil

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"runtime"
 
+	"github.com/middle-management/patchlog/internal/grant"
 	_ "modernc.org/sqlite"
 )
 
@@ -61,7 +62,10 @@ CREATE INDEX IF NOT EXISTS revisions_by_id ON revisions (id);  -- also finds dra
 DROP INDEX IF EXISTS revisions_id;
 CREATE INDEX IF NOT EXISTS revisions_res_seq ON revisions (res, seq);
 
-CREATE TABLE IF NOT EXISTS grants (id BLOB PRIMARY KEY, blocks TEXT NOT NULL);
+-- root_sub and root_kid: the root block's sub and kid, in plaintext even
+-- when blocks is encrypted (crypt.go), for the grant references namespace
+-- entries serve (§7.4, grantref.go). Neither is secret: the log serves both.
+CREATE TABLE IF NOT EXISTS grants (id BLOB PRIMARY KEY, blocks TEXT NOT NULL, root_sub TEXT, root_kid TEXT);
 
 -- Addition: data keys of encryption at rest (Addendum E.1), wrapped by the
 -- key store named in keystore. res is a resources row, or 0 for the
@@ -354,28 +358,91 @@ func openSQLite(path string) (*sql.DB, error) {
 }
 
 // migrate adds columns that databases created by earlier versions lack,
-// running a column's then statement once, right after adding it.
+// running a column's then statement (or function) once, right after adding
+// it, in the same transaction: a migration stopped half-way leaves neither.
 func migrate(db *sql.DB) error {
 	ctx := context.Background()
-	for _, c := range []struct{ table, col, typ, then string }{
-		{"ns_log", "grant_id", "BLOB", backfillNSGrants}, {"blob_bytes", "file", "TEXT", ""}, {"blob_epochs", "file", "TEXT", ""},
-		{"namespaces", "head_id", "BLOB", ""}, {"resources", "snap_revs", "INTEGER", ""}, {"resources", "snap_bytes", "INTEGER", ""}} {
+	for _, c := range []struct {
+		table, col, typ, then string
+		thenGo                func(context.Context, *sql.Tx) error
+	}{
+		{"ns_log", "grant_id", "BLOB", backfillNSGrants, nil}, {"grants", "root_sub", "TEXT", "", nil},
+		{"grants", "root_kid", "TEXT", "", backfillGrantRoots(func(int) string { return "?" })},
+		{"blob_bytes", "file", "TEXT", "", nil}, {"blob_epochs", "file", "TEXT", "", nil},
+		{"namespaces", "head_id", "BLOB", "", nil}, {"resources", "snap_revs", "INTEGER", "", nil}, {"resources", "snap_bytes", "INTEGER", "", nil}} {
 		var has bool
 		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {
 			return err
 		}
-		if !has {
-			if _, err := db.ExecContext(ctx, `ALTER TABLE `+c.table+` ADD COLUMN `+c.col+` `+c.typ); err != nil {
+		if has {
+			continue
+		}
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `ALTER TABLE `+c.table+` ADD COLUMN `+c.col+` `+c.typ); err != nil {
+			tx.Rollback()
+			return err
+		}
+		if c.then != "" {
+			if _, err := tx.ExecContext(ctx, c.then); err != nil {
+				tx.Rollback()
 				return err
 			}
-			if c.then != "" {
-				if _, err := db.ExecContext(ctx, c.then); err != nil {
-					return err
-				}
+		}
+		if c.thenGo != nil {
+			if err := c.thenGo(ctx, tx); err != nil {
+				tx.Rollback()
+				return err
 			}
+		}
+		if err := tx.Commit(); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// backfillGrantRoots fills grants.root_sub and root_kid of a database from
+// before them, for the grants stored in plaintext. Those stored encrypted
+// keep NULL, and grantRef reads them by decrypting, as before (§7.4, E.1).
+// ph is the dialect's placeholder for the n-th argument.
+func backfillGrantRoots(ph func(n int) string) func(context.Context, *sql.Tx) error {
+	return func(ctx context.Context, tx *sql.Tx) error {
+		rows, err := tx.QueryContext(ctx, `SELECT id, blocks FROM grants WHERE root_sub IS NULL`)
+		if err != nil {
+			return err
+		}
+		type root struct {
+			id       []byte
+			sub, kid string
+		}
+		var roots []root
+		for rows.Next() {
+			var id, blocks []byte
+			if err := rows.Scan(&id, &blocks); err != nil {
+				rows.Close()
+				return err
+			}
+			if isSealed(string(blocks)) {
+				continue
+			}
+			if g, err := grant.ParseStored(blocks); err == nil && len(g.Blocks) > 0 {
+				roots = append(roots, root{id, g.Blocks[0].Sub, g.Blocks[0].Kid})
+			}
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, r := range roots {
+			if _, err := tx.ExecContext(ctx, `UPDATE grants SET root_sub = `+ph(1)+`, root_kid = `+ph(2)+` WHERE id = `+ph(3), r.sub, r.kid, r.id); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 }
 
 // backfillNSGrants gives the namespace entries of a database from before

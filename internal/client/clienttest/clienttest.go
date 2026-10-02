@@ -68,6 +68,7 @@ type Server struct {
 	HTTP        *httptest.Server
 	Clock       *Clock // nil with RealClock
 	OperatorKey ed25519.PrivateKey
+	auth        bool
 }
 
 type nopPurger struct{}
@@ -86,7 +87,7 @@ func New(t testing.TB, opt Options) *Server {
 	}
 	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
 		Archiver: opt.Archiver, RetentionInterval: -1}
-	s := &Server{}
+	s := &Server{auth: opt.Auth}
 	if !opt.RealClock {
 		s.Clock = &Clock{t: opt.Start}
 		o.Now = s.Clock.Now
@@ -123,9 +124,13 @@ func (s *Server) Now() time.Time {
 	return s.Clock.Now()
 }
 
-// Client returns a client for the server.
+// Client returns a client for the server; without Auth, one that knows
+// authentication is disabled (client.WithAuthDisabled).
 func (s *Server) Client(t testing.TB, opts ...client.Option) *client.Client {
 	t.Helper()
+	if !s.auth {
+		opts = append([]client.Option{client.WithAuthDisabled()}, opts...)
+	}
 	c, err := client.New(s.URL, opts...)
 	if err != nil {
 		t.Fatal(err)

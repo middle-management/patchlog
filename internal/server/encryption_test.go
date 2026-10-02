@@ -311,6 +311,31 @@ func TestEncryptionGrants(t *testing.T) {
 	}
 }
 
+// §7.4: the root sub and kid of a stored grant are kept in plaintext next
+// to it, so a plaintext namespace's log reads without the key store even
+// when its writer's grant is stored encrypted for an at-rest namespace.
+func TestEncryptionGrantRefsWithoutKeyStore(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gr.db")
+	e := newAuthEnv(t, withPath(path), withKeyStore(newKeyStore(t)))
+	w := newKey("w")
+	e.mkNS("s", atRest(map[string]any{"read": "grant", "keys": []any{w.entry("read", "create")}}))
+	e.mkNS("p", map[string]any{"read": "public", "keys": []any{w.entry("read", "create")}})
+	g := e.grant(w, "user:ann", []string{"s", "p"}, []string{"read", "create"})
+	e.create("p", "x", map[string]any{"v": 1.0}, g)
+	e.create("s", "x", map[string]any{"v": encMarker}, g)
+	gid := strings.Fields(grantRef(t, g))[2]
+	if n := queryInt(t, path, `SELECT COUNT(*) FROM grants WHERE substr(blocks, 1, 1) = x'01' AND root_sub = 'user:ann' AND root_kid = 'w'`); n != 1 {
+		t.Fatalf("%d encrypted grants of user:ann with their root, want 1", n)
+	}
+	e.close()
+
+	n := newEnv(t, withPath(path)) // no key store
+	lg := n.get("/ns/p/rev/" + n.nsHead("p") + "/log").Arr()
+	if len(lg) != 2 || entryRef(t, lg[1]) != "user:ann w "+gid {
+		t.Fatalf("plaintext log without the key store: %v", lg)
+	}
+}
+
 // Turning at-rest on for an existing namespace encrypts what it stores,
 // grants included, and everything still reads. Lowering it is refused.
 func TestEncryptionTurnOn(t *testing.T) {

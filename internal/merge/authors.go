@@ -67,10 +67,11 @@ func EntryPrincipal(e client.NSEntry) (sub, kid string) {
 // EntryListed reports whether a namespace entry was written under a grant
 // whose root sub and kid are in authors (§F.3). An entry without a grant
 // reference is matched on its author alone only in development mode (dev):
-// for a tool without a grant of its own, against a server with
-// authentication disabled, where no entry records a grant (§1). Otherwise
-// such an entry, one the server wrote itself or one from before servers
-// recorded grants, is no one's.
+// for a deployment with authentication disabled, where no entry records a
+// grant (§1). The tool can't tell that from the entries, so its operator
+// says so (client.WithAuthDisabled, -dev). Otherwise such an entry, one
+// the server wrote itself or one from before servers recorded grants, is
+// no one's.
 func EntryListed(authors []Author, e client.NSEntry, dev bool) bool {
 	if e.Grant == nil && !dev {
 		return false

@@ -538,9 +538,9 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 			// The rebase's own replays.
 		case !p.AuthorsDeclared:
 			mb.Reason = "the target declares no merge.authors"
-		case !EntryListed(p.MergeAuthors, e, !p.c.HasBearer()):
+		case !EntryListed(p.MergeAuthors, e, p.c.AuthDisabled()):
 			mb.Reason = "its author " + principal(sub, kid) + " is not in the target's merge.authors"
-			if e.Grant == nil && p.c.HasBearer() {
+			if e.Grant == nil && !p.c.AuthDisabled() {
 				mb.Reason = "it records no grant (§7.4), so its author " + e.Author + " can't be matched against the target's merge.authors"
 			}
 		case heads == nil:

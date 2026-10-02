@@ -46,6 +46,9 @@ type Client struct {
 	// sourceAuth are grants sent as Source-Authorization on every write
 	// (WithSourceAuthorization).
 	sourceAuth []string
+	// authOff: the deployment has authentication disabled
+	// (WithAuthDisabled).
+	authOff bool
 
 	rootMu sync.Mutex
 	root   *Root // GET /, once fetched
@@ -79,6 +82,14 @@ func WithSourceAuthorization(grants ...string) Option {
 // WithAuthor sends X-Author on every request (development mode only, §7.2).
 func WithAuthor(name string) Option { return func(c *Client) { c.author = name } }
 
+// WithAuthDisabled declares that the deployment runs with authentication
+// disabled (serve -dev, §1). Such a deployment records no grant references
+// on namespace entries (§7.4), so tools that check merge.authors (§F.3,
+// §F.6) match grant-less entries on their author alone, and only then.
+// Whether authentication is on is the deployment's property, which the
+// API doesn't publish: the tool's operator says so.
+func WithAuthDisabled() Option { return func(c *Client) { c.authOff = true } }
+
 // New returns a client for the deployment at baseURL (e.g.
 // "https://cms.example"). The origin (§G.1) is fetched lazily by Origin.
 func New(baseURL string, opts ...Option) (*Client, error) {
@@ -97,7 +108,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // With returns a copy of the client with further options applied, e.g. a
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
-	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth}
+	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, authOff: c.authOff}
 	c.rootMu.Lock()
 	n.root = c.root
 	c.rootMu.Unlock()
@@ -108,11 +119,9 @@ func (c *Client) With(opts ...Option) *Client {
 	return n
 }
 
-// HasBearer reports whether the client sends a bearer grant. A tool
-// without one talks to a server with authentication disabled (§1), whose
-// namespace entries record no grants (§7.4), or reads public namespaces
-// only.
-func (c *Client) HasBearer() bool { return c.bearer != "" }
+// AuthDisabled reports whether the client was told the deployment runs
+// with authentication disabled (WithAuthDisabled).
+func (c *Client) AuthDisabled() bool { return c.authOff }
 
 // BaseURL is the base URL the client was created with.
 func (c *Client) BaseURL() string { return c.base }

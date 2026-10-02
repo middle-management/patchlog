@@ -684,9 +684,11 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   whose `source.at` is in the branch's chain (checked by the tool itself, since the server
   checks it only for writers who can read the branch, §7.5) and whose recorded grant (root
   `sub` and `kid` of the entry's `grant`, §7.4) is listed in the base's `merge.authors` count.
-  With authentication disabled entries record no grant (§1), so a merger without `-bearer`
-  matches them on `author` alone (development only); with `-bearer`, an entry without a grant
-  (one from before servers recorded grants) counts for no one. Without `merge.authors` there
+  With authentication disabled entries record no grant (§1), so a merger told so (`-dev`,
+  implied by `-author`; `client.WithAuthDisabled`) matches them on `author` alone, whether or
+  not it sends a bearer the server ignores. Otherwise an entry without a grant (one the server
+  wrote itself, or from before servers recorded grants) counts for no one: the API doesn't
+  publish whether authentication is on, so the tool's operator says so. Without `merge.authors` there
   are no such common ancestors: a second merge after a replay conflicts, and the tool suggests
   rebasing (§F.5). `status` and `plan` show per resource which batch and author its pair came
   from, and print a hint when the base has no `merge.authors` or the merger (`-bearer`'s root
@@ -696,8 +698,8 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   base's `merge.authors`; the successor's batch for `superseded` needs no such author, as §F.6
   states; `"abandoned": true` counts only if the config write that set it records a grant whose
   root key is a `*` key of the branch (its own or a base's), so only its administrators can
-  give up everyone's unmerged work. A janitor running without a grant (against `serve -dev`)
-  takes entries without one as the development operator's. Cleanup is opt-in: a branch is
+  give up everyone's unmerged work. A janitor run with `-dev` (against `serve -dev`) takes
+  entries without a grant as the development operator's; without `-dev` it trusts none. Cleanup is opt-in: a branch is
   purged only once a `cleanup` period (`"cleanup": { "merged": …, "superseded": …,
   "abandoned": … }`), from the branch's or the base's document, has passed.
 
@@ -1557,33 +1559,49 @@ just doesn't apply).
 - **Namespace log entries** are `{ …entry, id, prev?, author, grant?, created }` (§7.4).
   `author`, `grant` and `created` are stored alongside the hashed entry, not in it. `grant` is
   `{ "id", "sub", "kid" }`: the id (§C.3) of the grant the entry was written under, stored as
-  `ns_log.grant_id` (D.2), and its root `sub` and `kid`, read from the stored, non-bearer grant
-  (decrypted when encrypted at rest). Every kind of entry written on a request has one (`head`,
+  `ns_log.grant_id` (D.2), and its root `sub` and `kid`, stored in plaintext next to the
+  non-bearer grant (`grants.root_sub`, `root_kid`; neither is secret, the log serves both), so
+  reading a log never needs the key store even when the grant itself is encrypted at rest
+  for some at-rest namespace. Opening a database from before them fills them for grants
+  stored in plaintext; grants an earlier version stored encrypted are still decrypted to
+  serve them. Every kind of entry written on a request has one (`head`,
   `tombstone`, `purge`, `config`, `batch`, `branch` (local or remote), `purge-ns`, `prune`), in
   sealed namespaces inside the sealed ranges. Entries the server writes itself have none, though
   they keep an author: purges propagated to branches (the purger), the schema namespaces a
   remote branch mirrors (its creator), purges applied from a remote base, retention's prunes
-  and epoch rotations. Neither does any entry with authentication disabled. Merge tools and
+  and epoch rotations. Neither does any entry written with authentication disabled; references recorded while it
+  was on are still served if the database is later served with `-dev`. Merge tools and
   the janitor match the grant's root `sub` and `kid` against the base's
   `merge: { authors: [{ sub, kid }] }` (§F.3, §F.6), which the server validates and guards with
   a `*` key like `/keys`, and the janitor accepts `"abandoned": true` only from an entry whose
   grant's root key is a `*` key of the branch. Databases from before v0.37 recorded only the
   root `kid` (`ns_log.kid`, kept but no longer read): opening one adds `grant_id` and fills it
   for `head`, `tombstone` and `batch` entries from the revisions they record, which store the
-  request's grant; their other entries serve no `grant`. Sealed log ranges stored before the
-  upgrade are served as sealed then (§E.2.2: stored once, served forever), with `kid`.
+  request's grant (in the same transaction as adding the column). Their other entries
+  (`config`, `branch`, `purge`, `purge-ns`, `prune`) serve no `grant`: a kid alone can't make a
+  §C.3 grant reference, which names the grant by id. Sealed log ranges stored before the
+  upgrade are served as sealed then (§E.2.2: stored once, served forever), with `kid`, which
+  the client no longer reads. The cost: tools count those entries for no one, so an
+  `"abandoned": true` set before the upgrade must be set again, and a merge batch the backfill
+  couldn't fill (only `[]` items, or config only) no longer counts as a common ancestor.
 - **`GET /`** answers `{ "spec": "0.37", "origin" }` (§7.4, §G.1), the spec version from one
   constant (`core.SpecVersion`; `client.Root` reads both). Creating a remote branch checks the
-  base deployment's `spec` first (see [Remote branches](#remote-branches-g3)).
+  base deployment's `spec` first: from a deployment of a later (or unparseable) version, a
+  namespace document B reads (the base's as of `at`, and each configuration genesis of its
+  chain) that holds a member B doesn't know, and that isn't an `x-` one, is refused (`422`),
+  since it may change how protected the base is; a later version alone isn't (§G.3: nothing
+  of A's configuration is copied). B reads those documents only at creation (`at` is fixed;
+  following reads only purges), so that is the one place it checks.
 - **`PATCH /ns/{ns}`** answers `201` with `X-Config-Revision`, `X-Namespace-Revision` and
   `Location: /ns/{ns}/rev/{ns_id}`, naming the entry it wrote, and the body
   `{ "config", "ns_id" }` (§7.4); an idempotent retry answers `200` with the same, also when
   the config change was written by a batch. `client.PatchConfig` and `CreateNamespace` return
   both.
 - **Retries and purges** (§6.2, §7.2): the idempotent-retry lookup never applies to a purged
-  resource, so a retried write, or a retried batch with an item for one, answers `410` like
-  every URL of the resource (a batch whose config change is stale by then answers its `412`
-  first).
+  resource, so a write, or a batch with an item for one, answers `410` like every URL of the
+  resource, before the frozen check (purges are allowed in frozen namespaces). A retried
+  batch whose config change is stale by then answers `410` too, not the config's `412`, which
+  would tell the client its change didn't apply when it did.
 - **Blobs before a restore** (§7.8): a tombstoned resource accepts uploads (only a purged one
   is `410`), so a restore can reference blobs uploaded after the delete, by a grant that may
   only restore.

@@ -53,32 +53,41 @@ func (c *grantRootCache) put(id ids.ID, r grantRoot) {
 }
 
 // grantRef is the grant reference a namespace entry serves for the grant
-// stored under id (§7.4). It is nil if the grant isn't stored or doesn't
-// parse, which a server that stores every grant it records never sees: the
-// entry then serves no grant, and counts for no one's merge.authors.
+// stored under id (§7.4). The root sub and kid are stored in plaintext next
+// to the grant (storeGrantBlocks), so reading a log never needs the key
+// store; only a grant stored encrypted by a version from before that is
+// decrypted. It is nil if the grant isn't stored or doesn't parse, which a
+// server that stores every grant it records never sees: the entry then
+// serves no grant, and counts for no one's merge.authors.
 func (t *tx) grantRef(id []byte) map[string]any {
 	gid := ids.FromBytes(id)
 	r, ok := t.e.grantRoots.get(gid)
 	if !ok {
 		var blocks []byte
-		err := t.QueryRow(`SELECT blocks FROM grants WHERE id = ?`, id).Scan(&blocks)
+		var sub, kid sql.NullString
+		err := t.QueryRow(`SELECT blocks, root_sub, root_kid FROM grants WHERE id = ?`, id).Scan(&blocks, &sub, &kid)
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil
 		}
 		t.must(err)
-		if isSealed(string(blocks)) {
-			// Encrypted at rest under the deployment key of grants (§E.1).
-			plain, err := openRow(t.dek(grantsDEK, false), grantAAD(id), blocks)
-			if err != nil {
-				panic(encUnavailable(fmt.Sprintf("the stored grant %s does not decrypt: %v", gid, err)))
+		if sub.Valid {
+			r = grantRoot{sub: sub.String, kid: kid.String}
+		} else {
+			if isSealed(string(blocks)) {
+				// Encrypted at rest under the deployment key of grants
+				// (§E.1), before root_sub was stored.
+				plain, err := openRow(t.dek(grantsDEK, false), grantAAD(id), blocks)
+				if err != nil {
+					panic(encUnavailable(fmt.Sprintf("the stored grant %s does not decrypt: %v", gid, err)))
+				}
+				blocks = plain
 			}
-			blocks = plain
+			g, err := grant.ParseStored(blocks)
+			if err != nil || len(g.Blocks) == 0 {
+				return nil
+			}
+			r = grantRoot{sub: g.Blocks[0].Sub, kid: g.Blocks[0].Kid}
 		}
-		g, err := grant.ParseStored(blocks)
-		if err != nil || len(g.Blocks) == 0 {
-			return nil
-		}
-		r = grantRoot{sub: g.Blocks[0].Sub, kid: g.Blocks[0].Kid}
 		t.e.grantRoots.put(gid, r)
 	}
 	return map[string]any{"id": gid.String(), "sub": r.sub, "kid": r.kid}

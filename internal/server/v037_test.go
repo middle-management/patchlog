@@ -5,6 +5,9 @@ import (
 	"context"
 	"crypto/ed25519"
 	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -124,7 +127,30 @@ func TestV037RetryOnPurged(t *testing.T) {
 	expect(t, e.batchReq("m", withCfg, "alice"), 201)
 	expect(t, e.batchReq("m", withCfg, "alice"), 200)
 	expect(t, e.purge("m", "d", e.head("m", "d"), "admin"), 204)
-	expectCode(t, e.batchReq("m", withCfg, "alice"), 412, "stale")
+	// It is still 410, not the config change's 412: that would tell the
+	// client its change didn't apply, though it did.
+	cfgAfter := e.configID("m")
+	r = e.batchReq("m", withCfg, "alice")
+	expectCode(t, r, 410, "batch")
+	if items, _ := r.Obj()["items"].([]any); len(items) != 1 || items[0].(map[string]any)["status"] != 410.0 {
+		t.Fatalf("batch retry with a config change on a purged item: %s", r.Body)
+	}
+	if e.configID("m") != cfgAfter {
+		t.Fatal("the config changed again")
+	}
+
+	// Purges are allowed in a frozen namespace; a retry on the purged
+	// resource is 410 there too, before the frozen check (§6.2 step 2).
+	e.mkNS("f", map[string]any{})
+	f1 := e.create("f", "a", map[string]any{"v": 1.0})
+	expect(t, e.patchNS("f", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, e.purge("f", "a", f1, "admin"), 204)
+	expectCode(t, e.write("PATCH", "f", "a", "", create), 410, "gone")
+	expectCode(t, e.write("PATCH", "f", "a", f1, next), 410, "gone")
+	fb := map[string]any{"items": []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{create}}}}
+	expectCode(t, e.batchReq("f", fb, "alice"), 410, "batch")
+	// A resource that isn't purged still gets 409 frozen.
+	expectCode(t, e.write("PATCH", "f", "z", "", create), 409, "frozen")
 }
 
 // §7.8: a tombstoned resource accepts uploads, so a restore can reference
@@ -202,37 +228,50 @@ func TestV037DevConformance(t *testing.T) {
 	}
 }
 
-// §7.4, §G.3: B checks the spec version A publishes before creating a
-// remote branch: a later version is refused (B can't vouch for reading A's
-// namespace documents), an earlier one, or none (before v0.37), is fine.
+// §7.4, §G.3: B checks the spec version A publishes before reading A's
+// namespace documents. Nothing of them is copied, so a later version is
+// refused only when a document B reads holds a member B doesn't know (not
+// an x- extension); from a deployment of B's version or an earlier one, or
+// one from before v0.37 that publishes none, every member is fine.
 func TestV037RemoteSpecVersion(t *testing.T) {
 	a, b, rt := pair(t, nil, nil)
 	f := populateA(t, a)
 	ours := []byte(`"spec":"` + core.SpecVersion + `"`)
 	for i, c := range []struct {
-		spec string
-		ok   bool
+		spec   string
+		member string // added to the base's namespace document as of at
+		ok     bool
 	}{
-		{`"spec":"99.0"`, false},
-		{`"spec":"0.37.1"`, false},
-		{`"spec":"1"`, false},
-		{`"spec":"0.37-rc"`, false},
-		{`"spec":"0.36"`, true},
-		{`"spec":"0.37"`, true},
-		{"", true}, // a deployment from before v0.37
+		{`"spec":"0.38"`, `"wardens":[]`, false},
+		{`"spec":"0.37-rc"`, `"wardens":[]`, false},
+		{`"spec":"99.0"`, "", true},
+		{`"spec":"0.37.1"`, `"x-team":"a"`, true},
+		{`"spec":"0.36"`, `"wardens":[]`, true},
+		{`"spec":"0.37"`, `"wardens":[]`, true},
+		{"", `"wardens":[]`, true}, // a deployment from before v0.37
 	} {
-		repl := []byte(c.spec)
-		rt.set(tamper(t, a, "", func(body []byte) []byte {
-			if c.spec == "" {
+		c := c
+		rt.set(tamperPaths(t, a, func(path string, body []byte) []byte {
+			switch {
+			case path == "/" && c.spec == "":
 				return bytes.Replace(body, append([]byte(","), ours...), nil, 1)
+			case path == "/":
+				return bytes.Replace(body, ours, []byte(c.spec), 1)
+			case strings.HasPrefix(path, "/ns/main/rev/") && strings.Count(path, "/") == 4:
+				// A's own title predates strict members (§7.4): a
+				// deployment that validates them would hold none.
+				body = bytes.Replace(body, []byte(`,"title":"A's main"`), nil, 1)
+				if c.member != "" && path == "/ns/main/rev/"+f.at {
+					body = append([]byte("{"+c.member+","), bytes.TrimPrefix(body, []byte("{"))...)
+				}
 			}
-			return bytes.Replace(body, ours, repl, 1)
+			return body
 		}), "")
 		name := fmt.Sprintf("rel%d", i)
 		r := b.mkRemote(name, remoteGenesis("main", f.at, nil))
 		if !c.ok {
 			expectCode(t, r, 422, "invalid")
-			if !strings.Contains(r.Str("message"), "spec") {
+			if !strings.Contains(r.Str("message"), "spec") || !strings.Contains(r.Str("message"), "wardens") {
 				t.Fatalf("%s: %s", c.spec, r.Body)
 			}
 			expect(t, b.get("/ns/"+name), 404)
@@ -241,6 +280,32 @@ func TestV037RemoteSpecVersion(t *testing.T) {
 		}
 		expect(t, r, 201)
 	}
+}
+
+// tamperPaths is tamper with the request path passed to rewrite.
+func tamperPaths(t *testing.T, a *tenv, rewrite func(path string, body []byte) []byte) string {
+	t.Helper()
+	p := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hr, _ := http.NewRequest(r.Method, a.srv.URL+r.URL.RequestURI(), r.Body)
+		hr.Header = r.Header.Clone()
+		res, err := http.DefaultClient.Do(hr)
+		if err != nil {
+			w.WriteHeader(502)
+			return
+		}
+		defer res.Body.Close()
+		body, _ := io.ReadAll(res.Body)
+		body = rewrite(r.URL.Path, body)
+		for k, v := range res.Header {
+			if k != "Content-Length" {
+				w.Header()[k] = v
+			}
+		}
+		w.WriteHeader(res.StatusCode)
+		w.Write(body)
+	}))
+	t.Cleanup(p.Close)
+	return p.URL
 }
 
 // §7.4: a remote branch's own first config entry is written on the

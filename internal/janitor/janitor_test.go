@@ -41,7 +41,8 @@ func newEnv(t *testing.T, baseDoc map[string]any) *env {
 	c := s.Client(t, client.WithAuthor("alice"))
 	if baseDoc == nil {
 		// Authentication is off: entries record no grant, so for a
-		// janitor without one merge.authors matches alice on sub alone
+		// janitor told so (client.WithAuthDisabled, which clienttest
+		// sets) merge.authors matches alice on sub alone
 		// (merge.EntryListed).
 		baseDoc = map[string]any{"read": "public", "merge": devAuthors}
 	}
