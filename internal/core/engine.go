@@ -15,8 +15,9 @@
 // On Postgres several instances may share the database: advisory locks
 // per namespace replace the mutex (pglock.go), held shared by the writers
 // of a namespace's resources, which check inside them and serialise only
-// to append to the namespace chain; and a tailer tells each instance of
-// every commit, for its live readers and caches (tailer.go).
+// to append to the namespace chain, and under contention commit in groups
+// (groupcommit.go); and a tailer tells each instance of every commit, for
+// its live readers and caches (tailer.go).
 package core
 
 import (
@@ -104,6 +105,15 @@ type Options struct {
 	// transaction of its own (D.3), saving that transaction's and the
 	// re-check's round trips. Zero means every write; negative, none.
 	LockedCheckBytes int
+	// GroupCommit: on Postgres, at most how many checked resource writes
+	// and batches of one namespace one transaction appends and commits at
+	// once (group commit, D.8; groupcommit.go). Zero means 32; 1 or less
+	// turns group commit off, so every write commits on its own.
+	GroupCommit int
+	// GroupCommitWait is at most how long a group waits for writes of its
+	// namespace still in their check phase (zero means 200µs; negative,
+	// no wait). Writes that find no group of their namespace never wait.
+	GroupCommitWait time.Duration
 	// BlobSweepInterval is how often pending blobs past blobGrace are
 	// deleted (§7.8, SweepBlobs), and orphan blob files (SweepBlobFiles),
 	// on the leader. Zero means ten minutes; negative disables it.
@@ -202,6 +212,14 @@ type Engine struct {
 	// afterWriteLock, if set, is called by resource writes and batches
 	// once they hold the write lock, with the namespace (tests).
 	afterWriteLock func(ns string)
+	// Group commit (groupcommit.go): the queues, and for tests, noSolo
+	// queues even a write that finds its namespace idle, groupStart is
+	// called in a group's transaction once it holds its locks, and
+	// groupMember before each of its writes' entries is appended.
+	groups      groups
+	noSolo      bool
+	groupStart  func(t *tx, size int)
+	groupMember func(t *tx, i int)
 }
 
 // Open opens or creates the database.
@@ -238,6 +256,12 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if opt.Purger == nil {
 		opt.Purger = logPurger{}
+	}
+	if opt.GroupCommit == 0 {
+		opt.GroupCommit = defaultGroupCommit
+	}
+	if opt.GroupCommitWait == 0 {
+		opt.GroupCommitWait = defaultGroupCommitWait
 	}
 	db, pg, err := openDB(opt.Path)
 	if err != nil {
@@ -439,7 +463,11 @@ type tx struct {
 	logLocks  map[int32]bool
 	maxLogKey int32
 	logPlan   map[int32]bool
-	noLock    int
+	// logHeads, when set (a group commit's transaction), are the heads of
+	// the chains it appended to, which it knows while it holds their log
+	// locks.
+	logHeads map[int64]logHead
+	noLock   int
 	// sharedNS is the namespace a resource write or batch appends to
 	// holding its lock only shared (pglock.go); 0 if none.
 	sharedNS int64
@@ -451,6 +479,12 @@ type tx struct {
 	// has committed.
 	newFiles  []string
 	dropFiles []string
+}
+
+// logHead is a namespace chain's head entry.
+type logHead struct {
+	seq int64
+	id  ids.ID
 }
 
 type docPut struct {
@@ -872,21 +906,7 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 		rs[i], ts[i] = h.res, h.target
 	}
 	t.lockLog(n.id)
-	var headID []byte
-	t.must(t.QueryRow(`SELECT head_seq, head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&n.headSeq, &headID))
-	t.forget() // read after the log lock
-	var prev *ids.ID
-	var prevSeq any
-	if n.headSeq.Valid {
-		// head_id is NULL in rows from before the column, and in remote
-		// shadows, whose chains are mirrored.
-		p := ids.FromBytes(headID)
-		if headID == nil {
-			p = t.nsLogID(n.headSeq.Int64)
-		}
-		prev = &p
-		prevSeq = n.headSeq.Int64
-	}
+	prev, prevSeq := t.logHeadOf(n)
 	id := ids.Hash(prev, body)
 	var seq int64
 	if t.e.pg {
@@ -911,6 +931,9 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 		}
 	}
 	n.headSeq = sql.NullInt64{Int64: seq, Valid: true}
+	if t.logHeads != nil {
+		t.logHeads[n.id] = logHead{seq, id}
+	}
 	t.lastNS = seq
 	if n.configSeq != configSeq {
 		t.metaChanged = true
@@ -918,6 +941,113 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 	n.configSeq = configSeq
 	t.notify[n.name] = true
 	return seq, id
+}
+
+// logHeadOf reads n's chain head once its log lock is held, into
+// n.headSeq, and returns its id and seq (nil for an empty chain).
+func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
+	var headID []byte
+	if h, ok := t.logHeads[n.id]; ok && t.logLocks[lockKey(n.id)] {
+		// The head this transaction appended last, under the log lock it
+		// still holds (group commit).
+		n.headSeq, headID = sql.NullInt64{Int64: h.seq, Valid: true}, h.id[:]
+	} else {
+		t.must(t.QueryRow(`SELECT head_seq, head_id FROM namespaces WHERE ns = ?`, n.id).Scan(&n.headSeq, &headID))
+		t.forget() // read after the log lock
+	}
+	if !n.headSeq.Valid {
+		return nil, nil
+	}
+	// head_id is NULL in rows from before the column, and in remote
+	// shadows, whose chains are mirrored.
+	p := ids.FromBytes(headID)
+	if headID == nil {
+		p = t.nsLogID(n.headSeq.Int64)
+	}
+	return &p, n.headSeq.Int64
+}
+
+// nsAppend is a namespace entry to append (appendNSMany): as appendNS's
+// arguments.
+type nsAppend struct {
+	entry       map[string]any
+	res, target *int64
+	author      int64
+	kid         *string // the key that signed the author's grant (entryKid)
+	hist        []histRow
+}
+
+// appendNSMany is appendNS for several entries of one namespace, without
+// a config change, appended in order in one statement (Postgres; group
+// commit, groupcommit.go). Each entry's id covers the one before it
+// (§3.5), so all are computed from the head as of the log lock; their seqs
+// are drawn together and given out in ascending order, so they grow along
+// the chain as appendNS's do. It returns their ids.
+func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
+	if t.locking() && t.sharedNS != n.id {
+		t.lockNS(n.id, lockExclusive)
+	}
+	k := len(as)
+	bodies := make([]string, k)
+	kinds, authors := make([]int64, k), make([]int64, k)
+	res, targets := make([]*int64, k), make([]*int64, k)
+	kids := make([]*string, k)
+	var hord, hres, htarget []int64
+	for i, a := range as {
+		bodies[i] = string(jsonv.Canonical(a.entry))
+		kinds[i] = int64(nsKindCode(a.entry["kind"].(string)))
+		authors[i], res[i], targets[i], kids[i] = a.author, a.res, a.target, a.kid
+		for _, h := range a.hist {
+			hord, hres, htarget = append(hord, int64(i+1)), append(hres, h.res), append(htarget, h.target)
+		}
+	}
+	t.lockLog(n.id)
+	prev, prevSeq := t.logHeadOf(n)
+	out := make([]ids.ID, k)
+	idBytes := make([][]byte, k)
+	for i := range as {
+		out[i] = ids.Hash(prev, []byte(bodies[i]))
+		idBytes[i] = out[i][:]
+		prev = &out[i]
+	}
+	t.wrote()
+	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::text[])
+				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, kid, ord)),
+			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
+			s AS (SELECT seq, row_number() OVER (ORDER BY seq) AS ord FROM r),
+			c AS (SELECT v.*, s.seq, COALESCE(lag(s.seq) OVER (ORDER BY v.ord), ?::bigint) AS prev_seq FROM v JOIN s USING (ord)),
+			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid)
+				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, kid FROM c ORDER BY ord RETURNING seq),
+			u AS (UPDATE namespaces SET head_seq = (SELECT max(seq) FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
+			h AS (INSERT INTO head_history (res, ns_seq, target_seq)
+				SELECT x.res, c.seq, x.target FROM unnest(?::bigint[], ?::bigint[], ?::bigint[]) AS x(ord, res, target) JOIN c USING (ord))
+			SELECT seq FROM c ORDER BY ord`,
+		idBytes, kinds, res, targets, bodies, authors, kids, k, prevSeq,
+		n.id, configSeq, t.now.UnixMilli(), idBytes[k-1], configSeq, n.id, hord, hres, htarget)
+	t.must(err)
+	var seqs []int64
+	for rows.Next() {
+		var seq int64
+		t.must(rows.Scan(&seq))
+		seqs = append(seqs, seq)
+	}
+	t.must(rows.Err())
+	rows.Close()
+	if len(seqs) != k {
+		panic(fmt.Errorf("appended %d namespace entries, want %d", len(seqs), k))
+	}
+	last := seqs[k-1]
+	n.headSeq = sql.NullInt64{Int64: last, Valid: true}
+	if t.logHeads != nil {
+		t.logHeads[n.id] = logHead{last, out[k-1]}
+	}
+	t.lastNS = last
+	if n.configSeq != configSeq {
+		t.metaChanged = true
+	}
+	n.configSeq = configSeq
+	t.notify[n.name] = true
+	return out
 }
 
 func nullInt(p *int64) any {

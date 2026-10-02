@@ -148,6 +148,8 @@ func serve(args []string) {
 	masterKeyCreate := fs.Bool("master-key-create", false, "create the -master-key file with a new random key if it doesn't exist")
 	rotateEpochs := fs.Duration("rotate-epochs", 0, "rotate every sealed namespace's epoch once it is this old, e.g. 24h (Addendum E.2; 0 disables)")
 	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
+	groupCommit := fs.Int("group-commit", 32, "Postgres: at most this many concurrent resource writes and batches of one namespace committed in one transaction (group commit, D.8); 1 or less commits every write on its own")
+	groupWait := fs.Duration("group-commit-wait", 200*time.Microsecond, "Postgres: at most how long a group waits for writes of its namespace still being checked (0: no wait)")
 	var purgeURLs multi
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
@@ -241,7 +243,13 @@ func serve(args []string) {
 	}
 	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
 		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
-		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke}
+		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait}
+	if opt.GroupCommit < 1 {
+		opt.GroupCommit = 1 // off
+	}
+	if opt.GroupCommitWait <= 0 {
+		opt.GroupCommitWait = -1 // none
+	}
 	purger := cdnPurger(purgeURLs)
 	if purger != nil {
 		opt.Purger = purger

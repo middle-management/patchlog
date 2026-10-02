@@ -199,9 +199,22 @@ func (t *tx) acquire(k int32, mode lockMode) {
 	if mode == lockShared {
 		fn = `SELECT pg_advisory_xact_lock_shared($1, $2)`
 	}
-	_, err := t.Tx.Exec(fn, lockClass, k)
+	_, err := t.Tx.ExecContext(t.waitCtx(), fn, lockClass, k)
 	t.must(err)
 	t.held(k, mode)
+}
+
+// waitCtx is the context of a statement that waits for a lock: the
+// transaction's. Other statements use none (stmts.go), and cancelling the
+// transaction's context rolls it back only once the statement running
+// returns, which a lock wait may not do for long (another instance's config
+// write, purge or encryption): so a cancelled request, or a group whose
+// requests are all cancelled (commitGroup), stops waiting.
+func (t *tx) waitCtx() context.Context {
+	if t.ctx == nil {
+		return context.Background()
+	}
+	return t.ctx
 }
 
 func (t *tx) held(k int32, mode lockMode) {
@@ -235,7 +248,7 @@ func (t *tx) lockLog(ns int64) {
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	for _, k2 := range keys {
 		if len(t.logLocks) == 0 || k2 > t.maxLogKey {
-			_, err := t.Tx.Exec(`SELECT pg_advisory_xact_lock($1, $2)`, logClass, k2)
+			_, err := t.Tx.ExecContext(t.waitCtx(), `SELECT pg_advisory_xact_lock($1, $2)`, logClass, k2)
 			t.must(err)
 		} else {
 			var ok bool

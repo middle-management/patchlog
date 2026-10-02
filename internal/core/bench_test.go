@@ -172,6 +172,70 @@ func BenchmarkCreatesOneNamespace(b *testing.B) {
 	}
 }
 
+// Small appends from concurrent writers into one namespace, each writer to
+// a resource of its own, so they contend only on the namespace's log (D.8
+// "Contention"). Every sub-benchmark writes b.N revisions with that many
+// writers and reports writes/s and the 99th percentile latency:
+//
+//	PATCHLOG_TEST_PG=postgres://… go test ./internal/core -run '^$' -bench AppendsOneNamespace -benchtime 3000x
+func BenchmarkAppendsOneNamespace(b *testing.B) {
+	e := benchFileEngine(b)
+	var runs atomic.Int64
+	for _, writers := range []int{1, 2, 4, 8, 16, 32} {
+		b.Run(fmt.Sprintf("writers=%d", writers), func(b *testing.B) {
+			// Resources of their own for every run (b.Run runs more than once).
+			run := runs.Add(1)
+			heads := make([]string, writers)
+			for w := range heads {
+				h, err := benchWrite(e, fmt.Sprintf("w%d_%d", run, w), "", 0)
+				if err != nil {
+					b.Fatal(err)
+				}
+				heads[w] = h
+			}
+			lat := make([]time.Duration, b.N)
+			var next atomic.Int64
+			var wg sync.WaitGroup
+			groups, grouped := e.groups.committed.Load(), e.groups.appended.Load()
+			b.ResetTimer()
+			start := time.Now()
+			for w := 0; w < writers; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for {
+						i := int(next.Add(1)) - 1
+						if i >= b.N {
+							return
+						}
+						t0 := time.Now()
+						h, err := benchWrite(e, fmt.Sprintf("w%d_%d", run, w), heads[w], i+1)
+						if err != nil {
+							b.Error(err)
+							return
+						}
+						heads[w] = h
+						lat[i] = time.Since(t0)
+					}
+				}()
+			}
+			wg.Wait()
+			el := time.Since(start)
+			b.StopTimer()
+			sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
+			b.ReportMetric(float64(b.N)/el.Seconds(), "writes/s")
+			b.ReportMetric(float64(lat[len(lat)*99/100].Microseconds())/1000, "p99-ms")
+			// Group commit (Postgres): the share of writes appended in
+			// groups, and their average size.
+			if n := e.groups.committed.Load() - groups; n > 0 {
+				g := e.groups.appended.Load() - grouped
+				b.ReportMetric(float64(g)/float64(b.N), "grouped/op")
+				b.ReportMetric(float64(g)/float64(n), "writes/group")
+			}
+		})
+	}
+}
+
 // BenchmarkBatch1000 creates 1,000 resources of about 2 KiB in one batch.
 func BenchmarkBatch1000(b *testing.B) {
 	e := benchFileEngine(b)
