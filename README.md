@@ -454,10 +454,13 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
 - Grants travel in `Authorization`, which a page sets itself, so cross-origin calls need no
   cookies. `-cors-credentials` adds `Access-Control-Allow-Credentials` for pages that do send
   them; it needs explicit origins.
-- With `*`, responses are the same for every origin and the CDN keeps one copy. With a list, the
-  matching origin is echoed and every response says `Vary: Origin`, so the CDN keeps one copy per
-  origin and never serves one origin's allowance to another. (The library echoes the origin, with
-  `Vary: Origin`, for `*` with credentials too; `serve` refuses that combination.)
+- With `*`, every response allows `*` and exposes the headers, whether or not the request sends
+  `Origin`, so responses are the same for every origin and the CDN keeps one copy: one cached
+  from a request without `Origin` (curl, a service, a same-origin page) serves cross-origin
+  pages too. With a list, the matching origin is echoed and every response says `Vary: Origin`,
+  so the CDN keeps one copy per origin and never serves one origin's allowance to another. (The
+  library echoes the origin, with `Vary: Origin`, for `*` with credentials too; `serve` refuses
+  that combination.)
 - The playground's tree and index proxies drop the services' own CORS headers; the core's apply.
 
 ### Health checks and graceful shutdown
@@ -1512,18 +1515,21 @@ just doesn't apply).
   the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first; a
   range that goes on carries `X-Log-Next: {id}`, the page's last entry and the `since` of the
   next page, an immutable range up to the same id, so every page caches as immutable. Errors are
-  the range's on every page: a range crossing a pruning horizon is `410` on all of them. Entries
-  are built (patch sets read and decrypted) only for the page; the ancestry walk that checks
-  `since` and the horizon still runs over the whole range. Long-polls (§7.7) answer pages of the
-  same size and shape, without `X-Log-Next` (their header names the next `since`), and `/heads`
-  pages are as long. In an e2e namespace, a page whose `since` is a prune snapshot starts with
-  that snapshot, as the first page of a range does; readers skip it on later pages. Every
-  reader follows pages and treats a page that stops short of the range's id without
-  `X-Log-Next` as an error: `client.Log`, `NSLog` (one page: `NSLogPage`) and e2e folds, and so
-  `follow` (catch-up delivers and checkpoints page by page, §10), the index (`?min` checks only
-  the first page), tree and catalog, merge, rebase, release and janitor tooling, bundle export
-  and import, remote branches mirroring and following their bases (§G.3), and the playground
-  (namespace logs, histories and e2e folds; each sealed page is opened as its own range).
+  the range's on every page: a range crossing a pruning horizon is `410` on all of them. A page
+  costs its own rows, however long the range: a resource's chain is its rows in seq order, so a
+  page is one `seq > ? … LIMIT` query per ancestry segment it reaches, after a query or two per
+  segment to place `since` and look for pruned patch sets, which only exist at or below a
+  resource's horizon (or in a purged one); a namespace page is one `LIMIT` query. Long-polls
+  (§7.7) answer pages of the same size and shape, without `X-Log-Next` (their header names the
+  next `since`), and `/heads` pages are as long. In an e2e namespace, a page whose `since` is a
+  prune snapshot starts with that snapshot, as the first page of a range does; readers skip it
+  on later pages. Every reader follows pages and treats a page that stops short of the range's
+  id without `X-Log-Next` as an error: `client.Log`, `NSLog` (one page: `NSLogPage`) and e2e
+  folds, and so `follow` (catch-up delivers and checkpoints page by page, §10), the index (`?min`
+  checks only the first page), tree and catalog, merge, rebase, release and janitor tooling,
+  bundle export and import, remote branches mirroring and following their bases (§G.3), and the
+  playground (namespace logs, histories and e2e folds; each sealed page is opened as its own
+  range).
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
   batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
   principal and namespace buckets, and a key scope's lower rate) and batch limits, until the

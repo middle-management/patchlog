@@ -58,6 +58,45 @@ func TestAnyOrigin(t *testing.T) {
 	if w.Code != 200 {
 		t.Fatalf("status %d", w.Code)
 	}
+	// Without Origin too (curl, a service, a same-origin page): a cache
+	// that keeps this copy serves it to cross-origin pages, which need
+	// the allowance and the exposed headers (X-Log-Next) as well (§7
+	// "Browsers").
+	w = do(h, "GET", "", nil)
+	if w.Header().Get("Access-Control-Allow-Origin") != "*" || w.Header().Get("Access-Control-Expose-Headers") != Exposed {
+		t.Fatalf("no Origin: headers %v", w.Header())
+	}
+	if v := w.Header().Values("Vary"); !slices.Equal(v, []string{"Authorization"}) || w.Code != 200 {
+		t.Fatalf("no Origin: %d, vary %v", w.Code, v)
+	}
+}
+
+// Every response is the same with or without Origin, or carries Vary:
+// Origin (§7 "Browsers"), whatever the configuration.
+func TestSameOrVaries(t *testing.T) {
+	for _, c := range []Config{
+		{Origins: []string{"*"}},
+		{Origins: []string{"*"}, Credentials: true},
+		{Origins: []string{"https://a.example"}},
+		{Origins: []string{"https://a.example", "https://b.example"}, Credentials: true},
+	} {
+		h := Wrap(api(), c)
+		for _, method := range []string{"GET", "HEAD", "PATCH", "DELETE"} {
+			ref := do(h, method, "", nil).Header()
+			for _, origin := range []string{"https://a.example", "https://b.example", "https://evil.example"} {
+				got := do(h, method, origin, nil).Header()
+				same := true
+				for _, k := range []string{"Access-Control-Allow-Origin", "Access-Control-Allow-Credentials", "Access-Control-Expose-Headers"} {
+					if got.Get(k) != ref.Get(k) {
+						same = false
+					}
+				}
+				if !same && !(slices.Contains(got.Values("Vary"), "Origin") && slices.Contains(ref.Values("Vary"), "Origin")) {
+					t.Errorf("%+v %s from %s: differs from the answer without Origin and doesn't say Vary: Origin (%v / %v)", c, method, origin, got, ref)
+				}
+			}
+		}
+	}
 }
 
 func TestOriginList(t *testing.T) {

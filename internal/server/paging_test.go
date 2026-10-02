@@ -445,3 +445,61 @@ func TestRemoteBranchPaged(t *testing.T) {
 		t.Fatal("derby changed")
 	}
 }
+
+// A resource's range in a branch of a branch crosses its bases' chains
+// (§7.6): pages run oldest first across the segments, chained by parent at
+// each fork, from any since (in a base's segment, at a fork, in the
+// branch's own), and are the whole range cut into pages (§7.1 Paging).
+func TestLogPagingBranch(t *testing.T) {
+	e := newEnv(t, withLogPageSize(2))
+	e.mkNS("main", map[string]any{"read": "public"})
+	revs := e.chain("main", "a", 3)
+	expect(t, e.branch("main", map[string]any{"name": "br"}, "alice"), 201)
+	// After the branch: not in the branch's range.
+	later := e.appendRev("main", "a", revs[2], ops(op("replace", "/n", 9.0)))
+	for i := 0; i < 3; i++ {
+		revs = append(revs, e.appendRev("br", "a", revs[len(revs)-1], ops(op("replace", "/n", float64(10+i)))))
+	}
+	expect(t, e.branch("br", map[string]any{"name": "br2"}, "alice"), 201)
+	for i := 0; i < 2; i++ {
+		revs = append(revs, e.appendRev("br2", "a", revs[len(revs)-1], ops(op("replace", "/n", float64(20+i)))))
+	}
+	head := revs[len(revs)-1]
+	if e.head("br2", "a") != head {
+		t.Fatal("branch head")
+	}
+	whole, err := e.e.ResourceLog(context.Background(), "br2", "a", head, "", 0, core.Credentials{})
+	if err != nil || whole.Status != 200 || len(whole.Entries) != len(revs) {
+		t.Fatalf("whole range %v %+v", err, whole)
+	}
+	for i, since := range append([]string{""}, revs...) {
+		ps := e.pages("/r/br2/a/rev/"+head+"/log", since)
+		var got []map[string]any
+		prev := since
+		for j, p := range ps {
+			if len(p.entries) > 2 || len(p.entries) == 0 && len(ps) > 1 {
+				t.Fatalf("since %q: page %d has %d entries", since, j, len(p.entries))
+			}
+			if p.next != "" && p.next != p.entries[len(p.entries)-1]["id"] {
+				t.Fatalf("since %q: page %d: X-Log-Next %s isn't its last entry", since, j, p.next)
+			}
+			for _, m := range p.entries {
+				if par, _ := m["parent"].(string); par != prev {
+					t.Fatalf("since %q: entry %s has parent %q, want %q", since, m["id"], par, prev)
+				}
+				prev = m["id"].(string)
+			}
+			got = append(got, p.entries...)
+		}
+		if string(canonical(anyOf(got))) != string(canonical(anyOf(whole.Entries[i:]))) {
+			t.Fatalf("since %q: pages %v, want %v", since, entryIDs(got), entryIDs(whole.Entries[i:]))
+		}
+	}
+	// A range up to an id of a base's segment pages alike; a since off the
+	// ancestry is 404.
+	ps := e.pages("/r/br2/a/rev/"+revs[4]+"/log", "")
+	if len(ps) != 3 || ps[2].entries[0]["id"] != revs[4] || ps[1].next != revs[3] {
+		t.Fatalf("range up to %s: %d pages", revs[4], len(ps))
+	}
+	expect(t, e.get("/r/br2/a/rev/"+head+"/log?since="+later), 404)
+}

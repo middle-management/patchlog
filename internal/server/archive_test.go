@@ -180,6 +180,19 @@ func TestArchiveRestorePartialAndPurged(t *testing.T) {
 	}
 	expectCode(t, e.get("/r/main/a/rev/"+a[0]), 410, "pruned")
 	expect(t, e.get("/r/main/a/rev/"+a[4]), 200)
+	// Log ranges (§7.1): one over the restored revisions, below the
+	// horizon, answers; one reaching the lost ones is 410, naming the
+	// archive of the newest of them.
+	if lg := e.get("/r/main/a/rev/" + a[4] + "/log?since=" + a[1]); lg.Code != 200 || len(lg.Arr()) != 3 {
+		t.Fatalf("log over the restored revisions %d %s", lg.Code, lg.Body)
+	}
+	for _, since := range []string{"", a[0]} {
+		lg := e.get("/r/main/a/rev/" + a[4] + "/log?since=" + since)
+		expectCode(t, lg, 410, "pruned")
+		if lg.Str("horizon") != a[4] || lg.Str("archive") != archive.URL(filepath.Join(dir, "main", "a", a[2]+".jsonl")) {
+			t.Fatalf("log since %q: %s", since, lg.Body)
+		}
+	}
 
 	// Purge b: its archive is deleted and restore skips it.
 	pb := filepath.Join(dir, "main", "b", b[2]+".jsonl")

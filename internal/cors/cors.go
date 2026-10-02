@@ -5,12 +5,14 @@
 // C), which a page sets itself, so cross-origin reads and writes need no
 // cookies: Access-Control-Allow-Credentials is sent only when configured.
 //
-// With "*", every origin is allowed and responses are the same for all of
-// them, so shared caches (the CDN, §9) keep one copy. With a list (or with
-// credentials, which need the origin named), the matching origin is echoed
-// and every response carries Vary: Origin, so a cache keeps one copy per
-// origin and never serves one origin's allowance to another (§7
-// "Browsers").
+// With "*", every origin is allowed and every response says so, whether or
+// not the request names an origin, so responses are the same for all of
+// them and shared caches (the CDN, §9) keep one copy: one fetched without
+// Origin (curl, a service, a same-origin page) serves a cross-origin page
+// too. With a list (or with credentials, which need the origin named), the
+// matching origin is echoed and every response carries Vary: Origin, so a
+// cache keeps one copy per origin and never serves one origin's allowance
+// to another (§7 "Browsers").
 package cors
 
 import (
@@ -102,7 +104,10 @@ func Wrap(h http.Handler, c Config) http.Handler {
 			hd.Add("Vary", "Origin")
 		}
 		origin := r.Header.Get("Origin")
-		allowed := origin != "" && (anyOrigin || slices.Contains(c.Origins, origin))
+		// Without echo the answer allows every origin, so it doesn't
+		// depend on the request's: it carries the allowance even without
+		// Origin, or it would vary by origin without saying so.
+		allowed := !echo || origin != "" && (anyOrigin || slices.Contains(c.Origins, origin))
 		if allowed {
 			if !echo {
 				hd.Set("Access-Control-Allow-Origin", "*")
