@@ -79,7 +79,14 @@ func hashedForm(e client.NSEntry, sub bool) (map[string]any, error) {
 		if err := errors.Join(need("resource", e.Resource), need("target", e.Target)); err != nil {
 			return nil, err
 		}
-		return map[string]any{"resource": e.Resource, "kind": e.Kind, "target": e.Target}, nil
+		m := map[string]any{"resource": e.Resource, "kind": e.Kind, "target": e.Target}
+		if e.Forced {
+			if e.Kind != "purge" {
+				return nil, fmt.Errorf("forced on a %s entry", e.Kind)
+			}
+			m["forced"] = true // a purge that overrode in_use (§3.5, §6.1)
+		}
+		return m, nil
 	case "config":
 		if err := need("target", e.Target); err != nil {
 			return nil, err
@@ -122,6 +129,9 @@ func hashedForm(e client.NSEntry, sub bool) (map[string]any, error) {
 		}
 		return map[string]any{"kind": "branch", "name": e.Name, "at": e.At, "target": e.Target}, nil
 	case "purge-ns":
+		if e.Forced {
+			return map[string]any{"kind": "purge-ns", "forced": true}, nil
+		}
 		return map[string]any{"kind": "purge-ns"}, nil
 	}
 	return nil, fmt.Errorf("unknown entry kind %q", e.Kind)

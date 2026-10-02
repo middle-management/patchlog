@@ -1451,7 +1451,7 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 				continue
 			}
 			for _, name := range names {
-				t.purgeResource(bn, name, author)
+				t.purgeResource(bn, name, author, false)
 			}
 		}
 		_, err := t.Exec(`UPDATE remote_bases SET checkpoint = ? WHERE shadow = ?`, head, b.shadow)

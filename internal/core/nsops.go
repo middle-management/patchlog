@@ -155,6 +155,9 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 	if !jsonv.Equal(cur.Doc["base"], cfg.Doc["base"]) {
 		return nil, invalid("/base cannot change")
 	}
+	if cfg.DraftsFor != nil && t.draftRoot(n) == "" {
+		return nil, invalid("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
+	}
 	baseLevel := -1
 	if n.isBranch() {
 		// A remote branch's shadow follows the branch itself; its
@@ -226,7 +229,7 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		// Narrowing drafts.for, or raising a branch to e2e, may leave a
 		// reference to its drafts without a copy (§6.1, §7.4).
 		if broken := t.brokenReferences(refChange{cfg: map[int64]*Config{n.id: cfg}}); len(broken) > 0 {
-			return nil, t.inUse(a, broken, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)")
+			return nil, t.inUse(broken, "the change would leave references to this branch's draft schema revisions without a copy (§6.1)")
 		}
 	}
 	return cfg, nil
@@ -334,6 +337,7 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 		if aerr != nil {
 			return aerr
 		}
+		t.reqCreds = req.anyCreds()
 		p, err := t.planConfig(n, cur, a, &cc, false)
 		if err != nil {
 			return err
@@ -493,8 +497,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	atID := t.nsLogID(atSeq)
 	// Build the branch's namespace document (step 3).
 	doc := cloneDoc(bcfg.Doc)
-	delete(doc, "frozen")
-	delete(doc, "successor")
+	for _, k := range []string{"frozen", "successor", "merged", "abandoned", "drafts"} {
+		delete(doc, k) // §7.6: none of them is inherited
+	}
 	doc["base"] = map[string]any{"ns": base.name, "at": atID.String()}
 	ops, err := patch.Parse(br.Patches)
 	if err != nil {
@@ -556,6 +561,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if cfg.Base == nil || cfg.Base.NS != base.name || cfg.Base.At != atID.String() {
 		return nil, invalid("/base cannot be changed")
 	}
+	if cfg.DraftsFor != nil && base.isBranch() && t.draftRoot(base) == "" {
+		return nil, invalid("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
+	}
 	if touchesGuarded(writes) && !a.star {
 		return nil, forbidden("these patches need a grant chained to a * key of the base")
 	}
@@ -609,7 +617,7 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 			return gone()
 		}
 		cfg := t.config(n.configSeq)
-		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
+		a, operator, aerr := t.purger(n, cfg, req, force)
 		if aerr != nil {
 			return aerr
 		}
@@ -629,27 +637,28 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if ifMatch != v.head.id.String() {
 			return apiErr(412, "stale", "head", v.head.id.String())
 		}
-		if force && !a.star {
-			// An operator's override, or for drafts in a branch a grant
-			// chained to a * key of the branch, inherited or its own
-			// (§6.1): both verify as a * key here.
-			return forbidden("a forced purge needs a * key")
+		// The purge reaches n and every branch it propagates to (§8.3),
+		// each locked exclusively before it is read.
+		reached := t.purgeReach(n)
+		gone := func(ns *nsRow, res string) bool { return res == name && reached[ns.id] }
+		forced := false
+		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+			if !force {
+				return t.inUse(broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
+			}
+			if err := t.mayForce(n, a, operator); err != nil {
+				return err
+			}
+			forced = true
 		}
-		if !force {
-			// The purge reaches n and every branch it propagates to
-			// (§8.3), each locked exclusively before it is read.
-			reached := t.purgeReach(n)
-			gone := func(ns *nsRow, res string) bool { return res == name && reached[ns.id] }
-			if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
-				return t.inUse(a, broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
+		if !operator {
+			env := t.basicEnvelope("purge", name, a)
+			env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+			if err := t.checkRules(cfg, a, env, false); err != nil {
+				return err
 			}
 		}
-		env := t.basicEnvelope("purge", name, a)
-		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
-		if err := t.checkRules(cfg, a, env, false); err != nil {
-			return err
-		}
-		out = t.purgeResource(n, name, t.actorID(a)).String()
+		out = t.purgeResource(n, name, t.actorID(a), forced).String()
 		return nil
 	})
 	return out, err
@@ -674,9 +683,38 @@ func (t *tx) purgeReach(n *nsRow) map[int64]bool {
 	return reached
 }
 
+// purger authenticates a purge (§8.3, §8.5). A forced one (§6.1) may come
+// with a grant chained to a deployment operator key instead of one of the
+// namespace's: then operator is true, and the namespace's rules don't
+// apply to it.
+func (t *tx) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, operator bool, err *Error) {
+	t.reqCreds = req.anyCreds()
+	a, err = t.authenticate(n.name, n, cfg, req.Cred, nil)
+	if err == nil || !force || len(t.e.opt.OperatorKeys) == 0 {
+		return a, false, err
+	}
+	if oa, oerr := t.authenticate(n.name, nil, nil, req.Cred, t.e.opt.OperatorKeys); oerr == nil {
+		return oa, true, nil
+	}
+	return nil, false, err
+}
+
+// mayForce decides whether a purge refused as in_use may be forced (§6.1):
+// with ?force=1 and a grant chained to a deployment operator key, or, for
+// a purge of a branch or of a resource in one, to a * key of that branch,
+// inherited or its own. A * key of a namespace that isn't a branch
+// doesn't force. With authentication disabled everyone is the operator.
+func (t *tx) mayForce(n *nsRow, a *actor, operator bool) *Error {
+	if operator || t.e.opt.AuthDisabled || (n.isBranch() && a.star) {
+		return nil
+	}
+	return forbidden("forcing a purge refused as in_use needs a grant chained to a deployment operator key, or, in a branch, to a * key of the branch (§6.1)")
+}
+
 // purgeResource purges name in n and propagates to every branch (§8.3). It
-// returns the id of n's purge entry.
-func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
+// returns the id of n's purge entry. forced marks every entry it writes,
+// propagated ones included, as overriding an in_use refusal (§3.5, §6.1).
+func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids.ID {
 	if t.locking() {
 		// Every namespace a purge reaches is locked exclusively, and read
 		// as of its lock (D.8 purge propagation).
@@ -686,7 +724,7 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 	// it, so that it records its own purge entry.
 	for _, b := range t.branchesOf(n) {
 		if !b.purged {
-			t.purgeResource(b, name, author)
+			t.purgeResource(b, name, author, forced)
 		}
 	}
 	v := t.resolve(n, name, nil)
@@ -717,7 +755,11 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 		_, err = t.Exec(`DELETE FROM e2e_snapshots WHERE res = ?`, res)
 		t.must(err)
 		target := v.head.seq
-		_, nsID = t.appendNS(n, map[string]any{"resource": name, "kind": "purge", "target": v.head.id.String()}, &res, &target, n.configSeq, author)
+		entry := map[string]any{"resource": name, "kind": "purge", "target": v.head.id.String()}
+		if forced {
+			entry["forced"] = true
+		}
+		_, nsID = t.appendNS(n, entry, &res, &target, n.configSeq, author)
 		t.tags = append(t.tags, "r:"+n.name+"/"+name)
 		t.flushDocs = true
 	}
@@ -735,8 +777,10 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64) ids.ID {
 // PurgeNamespace purges a frozen namespace (§8.5). It returns the purge-ns
 // entry's ns_id.
 //
-// With force, which needs a * key, it purges even if that removes the last
-// copy of a referenced schema revision (§6.1).
+// With force it purges even if that removes the last copy of a referenced
+// schema revision (§6.1, §8.5): with a grant chained to a deployment
+// operator key, or, for a branch, to a * key of the branch. The purge-ns
+// entry then says forced: true (§3.5). Dependents can't be forced.
 func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string, force bool) (string, error) {
 	var out string
 	err := e.update(ctx, func(t *tx) error {
@@ -748,7 +792,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 			return gone()
 		}
 		cfg := t.config(n.configSeq)
-		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
+		a, operator, aerr := t.purger(n, cfg, req, force)
 		if aerr != nil {
 			return aerr
 		}
@@ -774,19 +818,23 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if len(deps) > 0 {
 			return apiErr(409, "in_use", "dependents", anyStrings(deps))
 		}
-		if force && !a.star {
-			return forbidden("a forced purge needs a * key")
-		}
-		if !force {
-			gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
-			if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
-				return t.inUse(a, broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
+		gone := func(ns *nsRow, _ string) bool { return ns.id == n.id }
+		forced := false
+		if broken := t.brokenReferences(refChange{exclude: gone, removed: gone}); len(broken) > 0 {
+			if !force {
+				return t.inUse(broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
 			}
+			if err := t.mayForce(n, a, operator); err != nil {
+				return err
+			}
+			forced = true
 		}
-		env := t.basicEnvelope("purge-ns", "", a)
-		env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
-		if err := t.checkRules(cfg, a, env, false); err != nil {
-			return err
+		if !operator {
+			env := t.basicEnvelope("purge-ns", "", a)
+			env["writes"], env["doc"], env["patches"] = []any{}, nil, []any{}
+			if err := t.checkRules(cfg, a, env, false); err != nil {
+				return err
+			}
 		}
 		t.deleteArchives(`res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.deleteDEKs(`ns = ?`, n.id)
@@ -813,7 +861,11 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		for _, sh := range t.remoteShadows(n) {
 			t.purgeShadowNS(sh)
 		}
-		_, nsID := t.appendNS(n, map[string]any{"kind": "purge-ns"}, nil, nil, n.configSeq, t.actorID(a))
+		entry := map[string]any{"kind": "purge-ns"}
+		if forced {
+			entry["forced"] = true
+		}
+		_, nsID := t.appendNS(n, entry, nil, nil, n.configSeq, t.actorID(a))
 		out = nsID.String()
 		t.tags = append(t.tags, "ns:"+n.name)
 		t.flushDocs = true

@@ -396,6 +396,10 @@ type tx struct {
 	// a namespace's log: its configuration, or a purge (readcache.go).
 	metaChanged bool
 	docPuts     []docPut // documents to cache after commit
+	// reqCreds are the request's grant and those of Source-Authorization,
+	// for an in_use answer's referencing list (§6.1, the rule for other
+	// namespaces of §7.5).
+	reqCreds []Credentials
 	// deps, when set, records what a write's check phase read that a
 	// concurrent write could change (D.3 re-check).
 	deps *writeDeps

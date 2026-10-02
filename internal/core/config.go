@@ -458,7 +458,11 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 		}
 	}
 	if c.DraftsFor != nil && c.Base == nil {
-		return nil, fmt.Errorf("/drafts is only for branches (§7.4)")
+		return nil, fmt.Errorf("/drafts is only for local branches (§7.4)")
+	}
+	if c.DraftsFor != nil && (c.Base.Remote() || c.level == levelE2E) {
+		// It could have no effect there (§6.1, §7.4).
+		return nil, fmt.Errorf("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
 	}
 	if c.level == levelE2E {
 		// Sealing grows a patch set by half, and it carries the declared

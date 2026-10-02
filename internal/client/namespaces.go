@@ -92,7 +92,10 @@ type NSEntry struct {
 	// before servers recorded it.
 	Kid     string
 	Created string
-	Raw     map[string]any // the entry as served
+	// Forced marks a purge or purge-ns entry of a purge that overrode an
+	// in_use refusal (§3.5, §6.1); it is part of the hashed entry.
+	Forced bool
+	Raw    map[string]any // the entry as served
 }
 
 // IsResource reports whether the entry concerns one resource (head,
@@ -117,6 +120,7 @@ func ParseNSEntry(v any) (NSEntry, error) {
 		Author: str(m, "author"), Kid: str(m, "kid"), Created: str(m, "created"), Raw: m,
 	}
 	e.Remote, _ = m["remote"].(map[string]any)
+	e.Forced, _ = m["forced"].(bool)
 	if s, has := m["source"]; has {
 		e.Source, _ = s.(map[string]any)
 		e.HasSource = true
@@ -245,7 +249,9 @@ type Branch struct {
 	Purged    bool
 	Successor string
 	Remote    map[string]any // remote branch registrations (§G.3)
-	Raw       map[string]any
+	// Drafts is the branch's drafts.for (§7.4), nil without drafts.
+	Drafts []string
+	Raw    map[string]any
 }
 
 // Branches lists a namespace's direct branches (§7.4).
@@ -268,6 +274,7 @@ func (c *Client) Branches(ctx context.Context, ns string) ([]Branch, error) {
 		b.Frozen, _ = m["frozen"].(bool)
 		b.Purged, _ = m["purged"].(bool)
 		b.Remote, _ = m["remote"].(map[string]any)
+		b.Drafts = draftsFor(m["drafts"])
 		out = append(out, b)
 	}
 	return out, nil

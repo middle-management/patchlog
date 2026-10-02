@@ -982,7 +982,7 @@ func (x *E2E) validate(ctx context.Context, target string, doc any) (string, err
 		if ok {
 			return d, nil
 		}
-		r, err := x.c.ResolveSchema(ctx, ref, ResolveOptions{Drafts: drafts})
+		r, err := x.c.ResolveSchema(ctx, ref, ResolveOptions{Drafts: drafts, For: target})
 		if err != nil {
 			if IsNotFound(err) || IsGone(err) || IsAuth(err) {
 				return nil, schema.ErrUnavailable

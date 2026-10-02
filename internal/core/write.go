@@ -347,6 +347,7 @@ type writePlan struct {
 func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any, isBatch, dryRun, rateDrawn bool) (*writePlan, *WriteResult, error) {
 	// A config change locks the namespace exclusively; resource writes
 	// alone lock it shared (pglock.go).
+	t.reqCreds = req.anyCreds()
 	var n *nsRow
 	if cc != nil || t.exclusive {
 		n = t.nsForWrite(req.NS)
@@ -1162,7 +1163,7 @@ func (t *tx) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (
 		return d, nil
 	}
 	t.deps.addSchema(ref)
-	d, err := t.loadSchemaIn(ref, sc.a)
+	d, err := t.loadSchemaIn(ref, sc)
 	if err == nil || errors.Is(err, schema.ErrBranch) {
 		return d, err
 	}
@@ -1172,8 +1173,12 @@ func (t *tx) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (
 	return nil, err
 }
 
-// loadSchemaIn resolves a schema revision path in its own namespace.
-func (t *tx) loadSchemaIn(ref schema.Ref, a *actor) (any, error) {
+// loadSchemaIn resolves a schema revision path in its own namespace. The
+// writer needs read on the copy (§6.1 Read permission): in the namespace
+// written, with the write's own grant; in any other, by the rule for other
+// namespaces (§7.5). A revision it can't read there is ErrForbidden, which
+// falls through to drafts in a branch (loadSchema), as an absent one does.
+func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 	n := t.nsByName(ref.NS)
 	if n == nil || n.purged {
 		return nil, schema.ErrUnavailable
@@ -1185,7 +1190,11 @@ func (t *tx) loadSchemaIn(ref schema.Ref, a *actor) (any, error) {
 		// The server can't read schemas in an e2e namespace (§E.3.2).
 		return nil, schema.ErrUnavailable
 	}
-	if !t.canRead(n, t.config(n.configSeq), a, ref.Name) {
+	if sc.target != nil && n.id == sc.target.id {
+		if !t.canRead(n, t.config(n.configSeq), sc.a, ref.Name) {
+			return nil, schema.ErrForbidden
+		}
+	} else if !t.credsRead(n, ref.Name, sc.creds) {
 		return nil, schema.ErrForbidden
 	}
 	v := t.resolve(n, ref.Name, nil)

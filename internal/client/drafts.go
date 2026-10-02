@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/middle-management/patchlog/internal/schema"
@@ -18,10 +19,16 @@ import (
 // first the branches a release document names (§F.9). An id determines its
 // document (§3.3), so any branch that serves X serves the right schema.
 //
-// The resolver doesn't apply drafts.for (§7.4): it finds content, which is
-// the same in every copy. Whether a write may use a draft is the gate's to
-// decide, or at E3 the merging client's (§F.8.1), which therefore resolves
-// drafts only for a target that is a branch.
+// With ResolveOptions.For, the namespace of the document being validated,
+// the resolver also applies drafts.for where it can see it (the branch
+// listing shows each branch's drafts, §7.4): a candidate serves For if For
+// is the candidate or one of its branches, or For or one of its bases is
+// listed in the candidate's own drafts.for (§6.1). This is best effort: a
+// client may not see every candidate or every rule (For's base chain may be
+// unreadable, and then nothing is filtered), and only the server's check
+// decides whether a write is accepted. Resolved schemas may be cached by
+// path across namespaces, since a path that resolves always means the same
+// schema.
 
 // ResolvedSchema is a schema revision found by ResolveSchema.
 type ResolvedSchema struct {
@@ -45,6 +52,10 @@ type ResolveOptions struct {
 	Prefer []string
 	// MaxBranches bounds how many branches are tried (0: 256).
 	MaxBranches int
+	// For is the namespace whose document refers to the path: candidates
+	// whose visible drafts.for doesn't serve it are skipped (§6.1). ""
+	// applies no drafts.for.
+	For string
 }
 
 // ResolveSchema fetches the schema revision ref: in ref.NS, then, with
@@ -64,6 +75,23 @@ func (c *Client) ResolveSchema(ctx context.Context, ref schema.Ref, opt ResolveO
 		max = 256
 	}
 	tried := map[string]bool{ref.NS: true}
+	// For and its bases, nearest first; nil if they can't be read.
+	var forChain []string
+	if opt.For != "" {
+		forChain = c.baseChain(ctx, opt.For)
+	}
+	// serves applies a candidate's drafts.for (known: it could be seen).
+	serves := func(ns string, drafts []string, known bool) bool {
+		if forChain == nil || !known {
+			return true
+		}
+		for _, x := range forChain {
+			if x == ns || DraftsMatch(drafts, x) {
+				return true
+			}
+		}
+		return false
+	}
 	try := func(ns string) (*ResolvedSchema, bool, error) {
 		if tried[ns] || !ValidNSName(ns) {
 			return nil, false, nil
@@ -82,6 +110,11 @@ func (c *Client) ResolveSchema(ctx context.Context, ref schema.Ref, opt ResolveO
 	for _, ns := range opt.Prefer {
 		if max <= 0 {
 			break
+		}
+		if forChain != nil {
+			if d, known := c.draftsOf(ctx, ns); !serves(ns, d, known) {
+				continue
+			}
 		}
 		r, ok, terr := try(ns)
 		if terr != nil {
@@ -116,6 +149,9 @@ func (c *Client) ResolveSchema(ctx context.Context, ref schema.Ref, opt ResolveO
 			if max <= 0 {
 				break
 			}
+			if !serves(b.Name, b.Drafts, true) {
+				continue
+			}
 			r, ok, terr := try(b.Name)
 			if terr != nil {
 				return nil, terr
@@ -126,6 +162,77 @@ func (c *Client) ResolveSchema(ctx context.Context, ref schema.Ref, opt ResolveO
 		}
 	}
 	return nil, err
+}
+
+// baseChain returns ns and its bases, nearest first, from their namespace
+// documents; nil if one can't be read (best effort, §6.1).
+func (c *Client) baseChain(ctx context.Context, ns string) []string {
+	out := []string{}
+	for i := 0; i < 64 && ns != ""; i++ {
+		out = append(out, ns)
+		h, err := c.NSHead(ctx, ns)
+		if err != nil || h.ID == "" {
+			return nil
+		}
+		d, err := c.NSDoc(ctx, ns, h.ID)
+		if err != nil {
+			return nil
+		}
+		b, _ := d.Value["base"].(map[string]any)
+		if b == nil {
+			return out
+		}
+		if _, remote := b["origin"]; remote {
+			return out
+		}
+		ns, _ = b["ns"].(string)
+	}
+	return out
+}
+
+// draftsOf reads a namespace's drafts.for from its document; known is
+// false if it can't be read.
+func (c *Client) draftsOf(ctx context.Context, ns string) (drafts []string, known bool) {
+	h, err := c.NSHead(ctx, ns)
+	if err != nil || h.ID == "" {
+		return nil, false
+	}
+	d, err := c.NSDoc(ctx, ns, h.ID)
+	if err != nil {
+		return nil, false
+	}
+	return draftsFor(d.Value["drafts"]), true
+}
+
+// draftsFor parses a drafts member, { "for": [ … ] } (§7.4).
+func draftsFor(v any) []string {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return nil
+	}
+	arr, _ := m["for"].([]any)
+	out := []string{}
+	for _, x := range arr {
+		if s, ok := x.(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// DraftsMatch reports whether a drafts.for list names a namespace, by name
+// or by a prefix ending in "*"; a bare "*" names every namespace (§7.4).
+func DraftsMatch(list []string, ns string) bool {
+	for _, p := range list {
+		if pre, ok := strings.CutSuffix(p, "*"); ok {
+			if strings.HasPrefix(ns, pre) {
+				return true
+			}
+		} else if p == ns {
+			return true
+		}
+	}
+	return false
 }
 
 // unresolved reports an answer meaning "not here for this caller".
