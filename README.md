@@ -348,18 +348,21 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   and one transaction appends up to `-group-commit` of them (default 32) and commits once:
   - A write is checked first on its own, outside any lock (D.3), and queued. The namespace's
     worker takes the queue, waiting at most `-group-commit-wait` (default 200µs) for writes still
-    being checked, takes the shared locks of every namespace the group's checks read, re-checks
-    each write and appends them in queue order, each entry computed from the one before it
-    (§3.5). Writes of distinct resources go in together, one statement per table, as a batch's
-    items do, and their entries in one statement; the rest are appended one by one, each under
-    a savepoint of its own (and all of them so if inserting them together loses a race to
-    another instance).
-  - A write whose resource's head moved (another write of the group, or of another instance) is
-    rolled back to its savepoint and answered alone after the commit: from the idempotent-retry
-    lookup if the same write committed (§7.2), otherwise `412` with the new head. One that finds
-    the configuration changed is checked again, as on its own (D.3). The rest of the group is
-    unaffected. An error that aborts the whole transaction (a deadlock, `40P01`, a serialization
-    failure) retries the whole group; one that persists answers every write alone.
+    being checked, takes the shared locks of every namespace the group's checks read, and
+    re-checks each write. The writes that pass and write distinct resources go in together, one
+    statement per table with rows in resource order, as a batch's items do; only then is the log
+    lock taken and their entries appended in queue order, in one statement, each computed from
+    the one before it (§3.5). So a group, like any writer, never waits for another writer's rows
+    while holding the log lock, and takes part in no deadlock a batch doesn't.
+  - A write whose resource's head moved (another instance's write), or that writes a resource an
+    earlier write of the group writes, is left out and answered alone after the commit: from the
+    idempotent-retry lookup if the same write committed (§7.2), otherwise `412` with the new head.
+    One that finds the configuration changed is checked again, as on its own (D.3). The rest of
+    the group is unaffected. If inserting the group loses a race to another instance's writer,
+    the transaction runs again and the re-checks leave out the writes that lost. An error that
+    aborts the whole transaction (a deadlock, `40P01`, a serialization failure) retries the whole
+    group; one that persists answers every write alone. A group is cancelled, even while it
+    waits for a lock, only once all of its requests are.
   - Every write is answered after the group's commit; caches, live readers and CDN purges hear of
     its writes only then.
   - While no group of a namespace is queued or committing, up to four of its writes take the

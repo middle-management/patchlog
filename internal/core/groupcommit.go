@@ -3,8 +3,7 @@ package core
 import (
 	"context"
 	"errors"
-	"fmt"
-	"maps"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -28,28 +27,31 @@ import (
 //     writes, waiting at most GroupCommitWait for writes of the namespace
 //     still in their check phase. Its transaction takes, in ascending
 //     order and all shared, the namespace locks of everything the group's
-//     checks read, then appends the writes in queue order, as if each were
-//     under a savepoint of its own: the D.3 re-check, the insert and the
-//     namespace entry. An entry is computed from the one before it, at the
-//     chain's head as of the log lock, since its id covers the entry
-//     before it (§3.5). The log lock is taken at the first append and held
-//     through the commit, which flushes once for the whole group.
-//   - Appending them literally one by one costs a dozen statements a write,
-//     one after another in one transaction, which on a fast disk costs
-//     more than the flushes saved. So the writes of distinct resources are
-//     re-checked first and appended together, with one statement per table
-//     (appendGroup), which has the same outcome; the others, and all of
-//     them if that loses a race to insert, are appended one by one, each
-//     under its savepoint (appendGrouped).
-//   - A write whose re-check fails, because its resource's head moved (an
-//     earlier write of the group, another instance) or because the
-//     configuration or anything else its check read changed, or that loses
-//     a race to insert (isConflict), rolls back to its savepoint and is
+//     checks read, and re-checks every write (D.3), sharing what they read.
+//     The writes that pass and write resources no earlier write of the
+//     group writes are inserted together, with one statement per table and
+//     rows in resource order, as a batch's items are (insertItemsBy); then
+//     their entries are appended in queue order, in one statement
+//     (appendNSMany), each computed from the one before it at the chain's
+//     head as of the log lock, since its id covers the entry before it
+//     (§3.5). The log lock is taken only then, after every row is inserted,
+//     and held through the commit, which flushes once for the whole group.
+//     So, as for any writer (pglock.go), the group waits for other writers'
+//     rows only before it holds the log lock, and for them in resource
+//     order: it takes part in no deadlock a batch doesn't.
+//   - A write whose re-check fails, because its resource's head moved
+//     (another instance) or because the configuration or anything else its
+//     check read changed, or that writes a resource an earlier write of the
+//     group writes (whose re-check would then fail), is left out and
 //     answered alone once the group has committed: on the path a write
 //     takes without group commit, with its rate-limit tokens already
 //     drawn, so it finds the idempotent retry (§7.2) if the same write
 //     committed, answers 412 with the new head, or is checked again against
 //     the new configuration (D.3). The other writes are unaffected.
+//   - If inserting the writes loses a race to insert (isConflict: another
+//     writer of one of the resources, on another instance or on its own,
+//     committed first), the transaction runs again (errApart), and the
+//     re-checks then leave out the writes that lost.
 //   - An error that aborts the whole transaction (a deadlock, 40P01, a
 //     serialization failure, locks needed out of order) retries the whole
 //     group (update1). One that persists, or any other, sends every write
@@ -153,24 +155,32 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 		// write to the namespace itself).
 		s.solo++
 		g.mu.Unlock()
-		res, err := e.writeAlone(ctx, req, items, source, isBatch, false, 0)
-		g.mu.Lock()
-		s.solo--
-		s.nudge()
-		g.tidy(req.NS, s)
-		g.mu.Unlock()
-		return res, err
+		// Deferred, so a panic (a hook's) doesn't leave the namespace
+		// counted busy for good.
+		defer func() {
+			g.mu.Lock()
+			s.solo--
+			s.nudge()
+			g.tidy(req.NS, s)
+			g.mu.Unlock()
+		}()
+		return e.writeAlone(ctx, req, items, source, isBatch, false, 0)
 	}
 	s.checking++
 	g.mu.Unlock()
+	checking := true
+	defer func() {
+		if checking {
+			g.mu.Lock()
+			s.checking--
+			s.nudge()
+			g.tidy(req.NS, s)
+			g.mu.Unlock()
+		}
+	}()
 
 	plan, deps, res, err := e.checkOutside(ctx, req, items, source, isBatch, false)
 	if err != nil || res != nil {
-		g.mu.Lock()
-		s.checking--
-		s.nudge()
-		g.tidy(req.NS, s)
-		g.mu.Unlock()
 		return res, err
 	}
 	if h := e.opt.BeforeWriteLock; h != nil {
@@ -178,6 +188,7 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 	}
 	w := &groupWrite{ctx: ctx, req: req, items: items, source: source, isBatch: isBatch, plan: plan, deps: deps, done: make(chan struct{})}
 	g.mu.Lock()
+	checking = false
 	s.checking--
 	s.queue = append(s.queue, w)
 	s.nudge()
@@ -188,14 +199,11 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 	case <-w.done:
 	case <-ctx.Done():
 		g.mu.Lock()
-		for i, q := range s.queue {
-			if q == w {
-				// Not taken into a group yet: never written.
-				s.queue = append(s.queue[:i], s.queue[i+1:]...)
-				g.tidy(req.NS, s)
-				g.mu.Unlock()
-				return nil, ctx.Err()
-			}
+		if s.remove(w) {
+			// Not taken into a group yet: never written.
+			g.tidy(req.NS, s)
+			g.mu.Unlock()
+			return nil, ctx.Err()
 		}
 		g.mu.Unlock()
 		// In a group already: it commits or not, and is cancelled once all
@@ -207,6 +215,27 @@ func (e *Engine) writeGrouped(ctx context.Context, req Request, items []Item, so
 		return e.writeAlone(ctx, req, items, source, isBatch, true, 1)
 	}
 	return w.res, nil
+}
+
+// take removes the first n queued writes and returns them. Callers hold
+// g.mu.
+func (s *nsGroup) take(n int) []*groupWrite {
+	group := append([]*groupWrite(nil), s.queue[:n]...)
+	// Cleared from the queue's array too (slices.Delete), so answered
+	// writes aren't kept reachable while the namespace stays busy.
+	s.queue = slices.Delete(s.queue, 0, n)
+	return group
+}
+
+// remove removes w from the queue, and reports whether it was queued.
+// Callers hold g.mu.
+func (s *nsGroup) remove(w *groupWrite) bool {
+	i := slices.Index(s.queue, w)
+	if i < 0 {
+		return false
+	}
+	s.queue = slices.Delete(s.queue, i, i+1)
+	return true
 }
 
 // startWorker starts ns's worker if writes are queued and none runs.
@@ -253,8 +282,7 @@ func (e *Engine) groupWorker(ns string, s *nsGroup) {
 			g.mu.Unlock()
 			continue
 		}
-		group := append([]*groupWrite(nil), s.queue[:n]...)
-		s.queue = append(s.queue[:0], s.queue[n:]...)
+		group := s.take(n)
 		g.mu.Unlock()
 		e.commitGroup(ns, group)
 		for _, w := range group {
@@ -263,11 +291,16 @@ func (e *Engine) groupWorker(ns string, s *nsGroup) {
 	}
 }
 
+// groupRuns bounds how often a group's transaction runs again after
+// losing a race to insert (errApart) before every write is answered alone.
+const groupRuns = 3
+
 // commitGroup appends a group of checked writes in one transaction
 // (above). On return each write has its result, or is marked alone.
 func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 	// No single request's cancellation aborts the group, but once every
-	// one of its requests is cancelled (a shutdown timeout), so is it.
+	// one of its requests is cancelled (a shutdown timeout), so is it,
+	// even while it waits for a lock (acquire).
 	ctx, cancel := context.WithCancel(context.WithoutCancel(group[0].ctx))
 	defer cancel()
 	var left atomic.Int64
@@ -280,7 +313,6 @@ func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 		})
 		defer stop()
 	}
-	together := true
 	f := func(t *tx) error {
 		// A whole-group retry starts over.
 		for _, w := range group {
@@ -305,17 +337,16 @@ func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 			h(t, len(group))
 		}
 		if len(group) == 1 {
-			// No savepoint: a write that must be answered alone rolls the
-			// whole transaction back.
-			t.appendGrouped(group[0], 0, false, nil)
+			// A write that must be answered alone rolls the whole
+			// transaction back.
+			t.appendOne(group[0])
 			return nil
 		}
-		t.appendGroup(group, together)
+		t.appendGroup(group)
 		return nil
 	}
 	err := e.update(ctx, f)
-	if errors.Is(err, errApart) {
-		together = false
+	for runs := 1; errors.Is(err, errApart) && runs < groupRuns; runs++ {
 		err = e.update(ctx, f)
 	}
 	if err != nil {
@@ -342,21 +373,26 @@ func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 // transaction with its locks held.
 //
 // Writing them one by one, each re-checked and inserted under a savepoint
-// of its own (appendGrouped), costs a dozen statements a write, one after
-// another in one transaction. So the writes are re-checked first, sharing
-// what they read, and those that pass and write resources no other write
-// of the group writes are inserted together, with one statement per table
-// as a batch's items are (insertItemsBy); then their entries are appended
-// in queue order, each computed from the one before it (appendNSMany).
-// That has the outcome of appending them one by one: writes of distinct
-// resources don't change what each other's re-checks read, and rows go in
-// resource order whatever write they belong to (insertItems). If that
-// fails, as when another instance moved one of the heads, the whole
-// transaction runs again with together unset, appending every write one
-// by one. The writes left (sharing a resource with an earlier one, or
-// referencing blobs, whose rows writes may share) are appended one by one
-// after them.
-func (t *tx) appendGroup(group []*groupWrite, together bool) {
+// of its own, would cost a dozen statements a write, one after another in
+// one transaction, and insert their rows across statements in queue
+// order, which isn't resource order, and later ones while holding the log
+// lock taken for the first: both can deadlock with other writers
+// (pglock.go). So the writes are re-checked first, sharing what they read,
+// and those that pass and write resources no earlier write of the group
+// writes are inserted together, with one statement per table and rows in
+// resource order whatever write they belong to, as a batch's items are
+// (insertItemsBy); then their entries are appended in queue order, each
+// computed from the one before it (appendNSMany). That has the outcome of
+// appending them one by one: writes of distinct resources don't change
+// what each other's re-checks read. A write that writes a resource an
+// earlier write of the group writes would fail its re-check once that one
+// is inserted, so it is answered alone, like one whose re-check fails, or
+// of another namespace than the group's first (one deleted and created
+// again between their checks). If inserting them loses a race to insert,
+// as when another instance moved one of the heads, the whole transaction
+// runs again (errApart), and the re-checks then leave out the writes that
+// lost.
+func (t *tx) appendGroup(group []*groupWrite) {
 	target := group[0].plan.n.id
 	var names []string
 	for _, w := range group {
@@ -381,64 +417,48 @@ func (t *tx) appendGroup(group []*groupWrite, together bool) {
 		}
 	}
 	nss := map[int64]*nsRow{}
-	var joint, apart []*groupWrite
+	var joint []*groupWrite
 	taken := map[string]bool{}
 	for _, w := range group {
+		if w.plan.n.id != target || overlaps(w, taken) {
+			w.alone = true
+			continue
+		}
 		n, ok := t.recheckIn(w.plan, w.deps, nss)
 		if !ok {
 			w.alone = true
 			continue
 		}
 		w.plan.n = n
-		if !together || n.id != target || !distinct(w, taken) || referencesBlobs(w) {
-			apart = append(apart, w)
-			continue
+		for _, s := range w.plan.st {
+			taken[s.Resource] = true
 		}
 		joint = append(joint, w)
 	}
 	if len(joint) > 0 {
 		t.appendTogether(joint)
 	}
-	for i, w := range apart {
-		if !t.appendGrouped(w, i, true, nss) {
-			w.alone = true
-		}
-	}
 }
 
-// distinct reports whether none of w's resources is in taken, and if so
-// adds them.
-func distinct(w *groupWrite, taken map[string]bool) bool {
+// overlaps reports whether any of w's resources is in taken.
+func overlaps(w *groupWrite, taken map[string]bool) bool {
 	for _, s := range w.plan.st {
 		if taken[s.Resource] {
-			return false
-		}
-	}
-	for _, s := range w.plan.st {
-		taken[s.Resource] = true
-	}
-	return true
-}
-
-// referencesBlobs reports whether a write attaches blobs (§7.8).
-func referencesBlobs(w *groupWrite) bool {
-	for _, s := range w.plan.st {
-		for _, step := range s.steps {
-			if len(step.blobs) > 0 || len(step.declared) > 0 || step.keepsList {
-				return true
-			}
+			return true
 		}
 	}
 	return false
 }
 
 // errApart rolls back a group's transaction whose writes, inserted
-// together, lost a race to insert: it runs again appending them one by one
+// together, lost a race to insert: it runs again, re-checking them
 // (appendGroup).
-var errApart = errors.New("group commit: a write lost a race to insert; appending one by one")
+var errApart = errors.New("group commit: a write lost a race to insert; re-checking the group")
 
 // appendTogether inserts re-checked writes of distinct resources of one
 // namespace together, then appends their entries in order (appendGroup).
+// Every row is inserted before the namespace's log lock is taken
+// (appendNSMany), as on a write's own path (insertPlan).
 func (t *tx) appendTogether(ws []*groupWrite) {
 	defer func() {
 		if p := recover(); p != nil {
@@ -478,6 +498,9 @@ func (t *tx) appendTogether(ws []*groupWrite) {
 		}
 		k := len(w.plan.st)
 		as[i] = t.planEntry(w.plan, authors[i], nil, inserted[:k])
+		// The kid of this write's own grant: one author (a root sub) may
+		// write under grants of several keys.
+		as[i].kid = entryKid(w.plan.a, authors[i])
 		inserted = inserted[k:]
 	}
 	nsIDs := t.appendNSMany(n, n.configSeq, as)
@@ -487,103 +510,16 @@ func (t *tx) appendTogether(ws []*groupWrite) {
 	}
 }
 
-// appendGrouped re-checks and inserts one write of a group, under a
-// savepoint if savepoint is set, and reports false if it rolled back to
-// it: the write must be answered alone. Without a savepoint, such a write
-// fails the whole transaction instead. An error that aborts the whole
-// transaction panics on, to retry or fail the group. nss is as in
-// recheckIn.
-func (t *tx) appendGrouped(w *groupWrite, i int, savepoint bool, nss map[int64]*nsRow) (ok bool) {
-	sp := fmt.Sprintf("g%d", i)
-	var m txMark
-	if savepoint {
-		m = t.mark()
-		_, err := t.Tx.Exec(`SAVEPOINT ` + sp)
-		t.must(err)
-	}
-	defer func() {
-		p := recover()
-		if p == nil {
-			return
-		}
-		err, _ := p.(error)
-		if err == nil || !savepoint || !(errors.Is(err, errRecheck) || isConflict(err)) {
-			panic(p)
-		}
-		_, rerr := t.Tx.Exec(`ROLLBACK TO SAVEPOINT ` + sp)
-		t.must(rerr)
-		t.undo(m)
-		ok = false
-	}()
+// appendOne re-checks and inserts the one write of a group. A write that
+// must be answered alone fails the whole transaction.
+func (t *tx) appendOne(w *groupWrite) {
 	if h := t.e.groupMember; h != nil {
-		h(t, i)
+		h(t, 0)
 	}
-	n, good := t.recheckIn(w.plan, w.deps, nss)
-	if !good {
+	n, ok := t.recheck(w.plan, w.deps)
+	if !ok {
 		panic(errRecheck)
 	}
 	w.plan.n = n
-	res := t.insertPlan(w.req, w.plan)
-	if savepoint {
-		_, err := t.Tx.Exec(`RELEASE SAVEPOINT ` + sp)
-		t.must(err)
-	}
-	w.res = res
-	return true
-}
-
-// txMark is what a transaction has done in memory up to a savepoint, so
-// rolling back to it forgets what came after (appendGrouped).
-type txMark struct {
-	notify                    map[string]bool
-	tags, docPuts, rotate     int
-	newFiles, dropFiles       int
-	lastNS                    int64
-	flushDocs, metaChanged    bool
-	flushDEKs, flushEpochKeys bool
-	ownRevs                   map[int64]revRow
-	kids                      map[int64]string
-	newDEKs                   map[int64][]byte
-	resLevels                 map[int64]int
-	shadowLevels              map[string]int
-	newEpochKeys              map[epochRef][]byte
-	locks                     map[int32]lockMode
-	maxKey, maxLogKey         int32
-	logLocks, logPlan         map[int32]bool
-	logHeads                  map[int64]logHead
-	sharedNS                  int64
-}
-
-func (t *tx) mark() txMark {
-	return txMark{
-		notify: maps.Clone(t.notify), tags: len(t.tags), docPuts: len(t.docPuts), rotate: len(t.rotate),
-		newFiles: len(t.newFiles), dropFiles: len(t.dropFiles), lastNS: t.lastNS,
-		flushDocs: t.flushDocs, metaChanged: t.metaChanged, flushDEKs: t.flushDEKs, flushEpochKeys: t.flushEpochKeys,
-		ownRevs: maps.Clone(t.ownRevs), kids: maps.Clone(t.kids), newDEKs: maps.Clone(t.newDEKs),
-		resLevels: maps.Clone(t.resLevels), shadowLevels: maps.Clone(t.shadowLevels), newEpochKeys: maps.Clone(t.newEpochKeys),
-		locks: maps.Clone(t.locks), maxKey: t.maxKey, maxLogKey: t.maxLogKey,
-		logLocks: maps.Clone(t.logLocks), logPlan: maps.Clone(t.logPlan), logHeads: maps.Clone(t.logHeads), sharedNS: t.sharedNS,
-	}
-}
-
-// undo returns a transaction to a mark after ROLLBACK TO SAVEPOINT, which
-// also released the advisory locks taken since (they are held again, or
-// tried, when next needed).
-func (t *tx) undo(m txMark) {
-	t.notify = m.notify
-	if t.notify == nil {
-		t.notify = map[string]bool{}
-	}
-	t.tags, t.docPuts, t.rotate = t.tags[:m.tags], t.docPuts[:m.docPuts], t.rotate[:m.rotate]
-	t.e.removeFiles(t.newFiles[m.newFiles:])
-	t.newFiles, t.dropFiles = t.newFiles[:m.newFiles], t.dropFiles[:m.dropFiles]
-	t.lastNS = m.lastNS
-	t.flushDocs, t.metaChanged, t.flushDEKs, t.flushEpochKeys = m.flushDocs, m.metaChanged, m.flushDEKs, m.flushEpochKeys
-	t.ownRevs, t.kids, t.newDEKs = m.ownRevs, m.kids, m.newDEKs
-	t.resLevels, t.shadowLevels, t.newEpochKeys = m.resLevels, m.shadowLevels, m.newEpochKeys
-	t.locks, t.maxKey, t.maxLogKey = m.locks, m.maxKey, m.maxLogKey
-	t.logLocks, t.logPlan, t.logHeads, t.sharedNS = m.logLocks, m.logPlan, m.logHeads, m.sharedNS
-	// Rows read since may be ones the savepoint took back.
-	t.revIDs = nil
-	t.forget()
+	w.res = t.insertPlan(w.req, w.plan)
 }

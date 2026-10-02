@@ -973,6 +973,7 @@ type nsAppend struct {
 	entry       map[string]any
 	res, target *int64
 	author      int64
+	kid         *string // the key that signed the author's grant (entryKid)
 	hist        []histRow
 }
 
@@ -995,10 +996,7 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	for i, a := range as {
 		bodies[i] = string(jsonv.Canonical(a.entry))
 		kinds[i] = int64(nsKindCode(a.entry["kind"].(string)))
-		authors[i], res[i], targets[i] = a.author, a.res, a.target
-		if kid, ok := t.kids[a.author]; ok {
-			kids[i] = &kid
-		}
+		authors[i], res[i], targets[i], kids[i] = a.author, a.res, a.target, a.kid
 		for _, h := range a.hist {
 			hord, hres, htarget = append(hord, int64(i+1)), append(hres, h.res), append(htarget, h.target)
 		}

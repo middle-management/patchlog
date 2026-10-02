@@ -1311,6 +1311,17 @@ func (t *tx) actorID(a *actor) int64 {
 	return id
 }
 
+// entryKid is the kid a namespace entry by author, written by a, records
+// (actorID), or nil. Entries appended together (appendNSMany) take it per
+// entry, since one author may write under grants signed by several keys.
+func entryKid(a *actor, author int64) *string {
+	if a.verified == nil || author < 0 {
+		return nil
+	}
+	kid := a.verified.Key.Kid
+	return &kid
+}
+
 // storeGrant records the non-bearer form of the actor's grant (§C.3).
 func (t *tx) storeGrant(n *nsRow, a *actor) []byte {
 	if a.grant == nil {
