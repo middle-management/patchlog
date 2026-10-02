@@ -105,18 +105,34 @@ func sameView(a, b *view) bool {
 // phase depended on is unchanged. It returns the target namespace as of
 // this transaction (its head moves with other resources' writes).
 func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
+	return t.recheckIn(p, d, nil)
+}
+
+// recheckIn is recheck sharing the namespace rows it reads through nss,
+// for writes re-checked together under the same locks (group commit): what
+// sameNS compares can't change while they are held, and a row's head is
+// read again where it matters (appendNS).
+func (t *tx) recheckIn(p *writePlan, d *writeDeps, nss map[int64]*nsRow) (*nsRow, bool) {
 	var target *nsRow
 	for _, id := range d.order {
-		cur, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
-		if errors.Is(err, sql.ErrNoRows) {
-			return nil, false
+		cur := nss[id]
+		if cur == nil {
+			var err error
+			cur, err = scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
+			if errors.Is(err, sql.ErrNoRows) {
+				return nil, false
+			}
+			t.must(err)
+			if nss != nil {
+				nss[id] = cur
+			}
 		}
-		t.must(err)
 		if !sameNS(d.ns[id], cur) {
 			return nil, false
 		}
 		if id == p.n.id {
-			target = cur
+			c := *cur
+			target = &c
 		}
 	}
 	if target == nil {
@@ -156,30 +172,49 @@ func (t *tx) recheck(p *writePlan, d *writeDeps) (*nsRow, bool) {
 }
 
 // writeOptimistic runs a resource write or a batch without a config change
-// on the D.3 write path: check outside the lock, re-check and insert inside.
+// on the D.3 write path: check outside the lock, re-check and insert inside,
+// on Postgres in a group of the namespace's writes (groupcommit.go).
 func (e *Engine) writeOptimistic(ctx context.Context, req Request, items []Item, source any, isBatch bool) (*WriteResult, error) {
+	if e.grouping() {
+		return e.writeGrouped(ctx, req, items, source, isBatch)
+	}
+	return e.writeAlone(ctx, req, items, source, isBatch, false, 0)
+}
+
+// checkOutside runs steps 1–6 of a resource write or batch in a read
+// transaction, outside any lock (D.3), recording what it read (writeDeps).
+// It returns a plan to re-check and insert, or a final result or error.
+func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, source any, isBatch, rateDrawn bool) (*writePlan, *writeDeps, *WriteResult, error) {
+	var plan *writePlan
+	var deps *writeDeps
+	var res *WriteResult
+	// The read transaction is closed before the write lock is taken, so
+	// the single connection of :memory: is never held while waiting.
+	err := e.read(ctx, func(t *tx) error {
+		t.deps = newWriteDeps()
+		deps = t.deps
+		p, r, err := t.checkItems(req, items, nil, source, isBatch, false, rateDrawn)
+		plan, res = p, r
+		return err
+	})
+	return plan, deps, res, err
+}
+
+// writeAlone is writeOptimistic for a write on its own. rateDrawn skips
+// the rate-limit draw, for a write whose tokens were already drawn (a
+// write of a group answered alone, groupcommit.go), and rounds counts the
+// check-then-re-check rounds it already made (its group's).
+func (e *Engine) writeAlone(ctx context.Context, req Request, items []Item, source any, isBatch, rateDrawn bool, rounds int) (*WriteResult, error) {
 	if e.pg && (e.opt.LockedCheckBytes == 0 || e.opt.LockedCheckBytes > 0 && smallWrite(items, e.opt.LockedCheckBytes)) {
 		// On Postgres the write lock is the namespace's, held shared by
 		// writers of its resources (pglock.go), and the check's own
 		// transaction and the re-check cost a dozen round trips: check
 		// inside the lock, where only the namespace's config writes,
 		// purges and the like wait for it.
-		return e.writeLocked(ctx, req, items, source, isBatch, false)
+		return e.writeLocked(ctx, req, items, source, isBatch, rateDrawn)
 	}
-	rateDrawn := false
-	for attempt := 0; attempt < optimisticAttempts; attempt++ {
-		var plan *writePlan
-		var deps *writeDeps
-		var res *WriteResult
-		// The read transaction is closed before the write lock is taken, so
-		// the single connection of :memory: is never held while waiting.
-		err := e.read(ctx, func(t *tx) error {
-			t.deps = newWriteDeps()
-			deps = t.deps
-			p, r, err := t.checkItems(req, items, nil, source, isBatch, false, rateDrawn)
-			plan, res = p, r
-			return err
-		})
+	for attempt := rounds; attempt < optimisticAttempts; attempt++ {
+		plan, deps, res, err := e.checkOutside(ctx, req, items, source, isBatch, rateDrawn)
 		if err != nil || res != nil {
 			// Refused, or answered (an idempotent retry), as of a consistent
 			// snapshot: nothing to insert.

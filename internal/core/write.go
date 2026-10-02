@@ -690,7 +690,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 // insertPlan is step 7: insert a checked write atomically with its
 // namespace entry. n must be the namespace as of this transaction.
 func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
-	n, a, st, cplan, src, isBatch, result := p.n, p.a, p.st, p.cplan, p.src, p.isBatch, p.result
+	n, a, cplan, result := p.n, p.a, p.cplan, p.result
 	// Step 7: insert atomically with the namespace entry.
 	author := t.actorID(a)
 	configSeq := n.configSeq
@@ -702,8 +702,20 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	}
 	// After the config change, which may have turned encryption on.
 	grantID := t.storeGrant(n, a)
-	inserted := t.insertItems(n, st, a, author, grantID, req.Signature)
-	for _, s := range st {
+	inserted := t.insertItems(n, p.st, a, author, grantID, req.Signature)
+	// The namespace entry last: on Postgres it is appended under the
+	// namespace row's lock, held until commit (appendNS).
+	na := t.planEntry(p, author, entries, inserted)
+	_, nsID := t.appendNS(p.n, na.entry, na.res, na.target, configSeq, author, na.hist...)
+	p.result.NSID = nsID.String()
+	return p.result
+}
+
+// planEntry is the namespace entry of a write whose rows are inserted
+// (inserted, in its items' order), after the entries of its config change
+// if any. It completes the write's result but for the entry's id.
+func (t *tx) planEntry(p *writePlan, author int64, entries []any, inserted []histRow) nsAppend {
+	for _, s := range p.st {
 		final := s.steps[len(s.steps)-1]
 		kind := "head"
 		if final.del {
@@ -711,23 +723,16 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 		}
 		entries = append(entries, map[string]any{"resource": s.Resource, "kind": kind, "target": final.id.String()})
 	}
-	// The namespace entry last: on Postgres it is appended under the
-	// namespace row's lock, held until commit (appendNS).
-	var nsID ids.ID
-	if isBatch {
+	if p.isBatch {
 		entry := map[string]any{"kind": "batch", "entries": entries}
-		if src != nil {
-			entry["source"] = src
+		if p.src != nil {
+			entry["source"] = p.src
 		}
-		_, nsID = t.appendNS(n, entry, nil, nil, configSeq, author, inserted...)
-	} else {
-		le := t.logEntry(t.rev(inserted[0].target))
-		result.Entry = &le
-		e := entries[0].(map[string]any)
-		_, nsID = t.appendNS(n, e, &inserted[0].res, &inserted[0].target, configSeq, author, inserted...)
+		return nsAppend{entry: entry, author: author, hist: inserted}
 	}
-	result.NSID = nsID.String()
-	return result
+	le := t.logEntry(t.rev(inserted[0].target))
+	p.result.Entry = &le
+	return nsAppend{entry: entries[0].(map[string]any), res: &inserted[0].res, target: &inserted[0].target, author: author, hist: inserted}
 }
 
 // hasCandidates reports whether an item's first step may be an append or a
@@ -1348,14 +1353,39 @@ var (
 // resources at once (Postgres, pglock.go) then wait for each other's rows
 // in that order, never in a cycle.
 func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, grantID []byte, signature string) []histRow {
+	by := writtenBy(a, author, grantID, signature)
+	ws := make([]writer, len(st))
+	for i := range ws {
+		ws[i] = by
+	}
+	return t.insertItemsBy(n, st, ws)
+}
+
+// writer is who wrote an item, as its revisions record it.
+type writer struct {
+	author    int64
+	via       any // the principal's delegation chain, canonical JSON, or nil
+	grantID   []byte
+	signature string // the author signature of the item's first step (§C.3)
+}
+
+func writtenBy(a *actor, author int64, grantID []byte, signature string) writer {
+	w := writer{author: author, grantID: grantID, signature: signature}
+	if len(a.principal.Via) > 0 {
+		w.via = string(jsonv.Canonical(jsonv.FromGo(a.principal.Via)))
+	}
+	return w
+}
+
+// insertItemsBy is insertItems for items of several writes of one
+// namespace, each item written by ws[i] (group commit, groupcommit.go).
+// The items' resources must be distinct.
+func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 	cfg := t.config(n.configSeq)
 	level := t.nsLevel(n)
-	var via any
-	if len(a.principal.Via) > 0 {
-		via = string(jsonv.Canonical(jsonv.FromGo(a.principal.Via)))
-	}
 	type item struct {
 		*itemState
+		writer
 		own     *resRow // the row the precondition was checked against
 		res     int64
 		hasRows bool
@@ -1370,7 +1400,7 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 	}
 	items := make([]*item, len(st))
 	for i, s := range st {
-		items[i] = &item{itemState: s, own: s.view.own, e2e: cfg.level == levelE2E && s.Resource != KeyringName}
+		items[i] = &item{itemState: s, writer: ws[i], own: s.view.own, e2e: cfg.level == levelE2E && s.Resource != KeyringName}
 	}
 	sorted := append([]*item(nil), items...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Resource < sorted[j].Resource })
@@ -1451,14 +1481,14 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 					typed = step.typed
 				}
 			}
-			if k == 0 && signature != "" {
-				sig = signature
+			if k == 0 && it.signature != "" {
+				sig = it.signature
 			}
 			var parent any
 			if it.last != 0 {
 				parent = it.last
 			}
-			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, author, via, grantID, sig, typed, t.now.UnixMilli()})
+			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli()})
 			stepItems = append(stepItems, it)
 		}
 		if len(rows) == 0 {
@@ -1472,7 +1502,7 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 		for i, it := range stepItems {
 			step, row, seq := it.steps[k], rows[i], it.last
 			t.inserted(revRow{seq: seq, res: it.res, id: step.id, parentSeq: anyInt(row[2]), first: row[3] == 1, kind: row[4].(int),
-				patches: anyStr(row[5]), author: author, via: anyStr(via), grantID: grantID, signature: anyStr(row[9]), created: row[11].(int64)})
+				patches: anyStr(row[5]), author: it.author, via: anyStr(it.via), grantID: it.grantID, signature: anyStr(row[9]), created: row[11].(int64)})
 			if !step.del {
 				// The blobs the document references are attached with it
 				// (§7.8, step 7); a sealed step's are those its op declares,

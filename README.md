@@ -340,21 +340,65 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   front if that fails). An uploader's pending blob total (§7.8) is ordered by a row of its
   own (`blob_uploaders`), so concurrent uploads can't together exceed `blobPending`. Details in
   `internal/core/pglock.go`.
+- **Group commit per namespace** (D.8 "Contention"). Holding the log lock through commit means
+  one append and one WAL flush per write per namespace, and writers queueing on the lock add a
+  hand-over each, so without more, throughput in one namespace peaks and then falls as writers
+  are added. So each instance queues the checked resource writes and batches of a namespace (never
+  config writes, purges, prunes, branch operations, or batches that change the configuration),
+  and one transaction appends up to `-group-commit` of them (default 32) and commits once:
+  - A write is checked first on its own, outside any lock (D.3), and queued. The namespace's
+    worker takes the queue, waiting at most `-group-commit-wait` (default 200µs) for writes still
+    being checked, takes the shared locks of every namespace the group's checks read, re-checks
+    each write and appends them in queue order, each entry computed from the one before it
+    (§3.5). Writes of distinct resources go in together, one statement per table, as a batch's
+    items do, and their entries in one statement; the rest are appended one by one, each under
+    a savepoint of its own (and all of them so if inserting them together loses a race to
+    another instance).
+  - A write whose resource's head moved (another write of the group, or of another instance) is
+    rolled back to its savepoint and answered alone after the commit: from the idempotent-retry
+    lookup if the same write committed (§7.2), otherwise `412` with the new head. One that finds
+    the configuration changed is checked again, as on its own (D.3). The rest of the group is
+    unaffected. An error that aborts the whole transaction (a deadlock, `40P01`, a serialization
+    failure) retries the whole group; one that persists answers every write alone.
+  - Every write is answered after the group's commit; caches, live readers and CDN purges hear of
+    its writes only then.
+  - While no group of a namespace is queued or committing, up to four of its writes take the
+    path they take without group commit (checked inside the lock, fewer round trips), so groups
+    form only once writers contend. `-group-commit 1` turns it off: every write then commits on
+    its own, exactly as before. SQLite has a single writer and doesn't group. Details in
+    `internal/core/groupcommit.go`.
+- **One writer per namespace.** Groups are per instance: two instances writing one namespace
+  each form their own groups, which then contend for the same log lock. With several instances,
+  route each namespace's writes to one of them, e.g. by hashing the namespace name in the load
+  balancer: it is the second path segment of every write (`/r/{ns}/…`, `/ns/{ns}/…`), so extract
+  it with a regex and hash it consistently (nginx `map` plus `hash $ns consistent`, HAProxy
+  `balance hdr()` on a header set from the path, Envoy's ring hash). Reads can go anywhere. That instance
+  then enforces the namespace's and its resources' whole rate limits (§6.6) rather than a share;
+  per-principal limits span namespaces and stay split between instances. Routing is an
+  optimisation, not a requirement: writes from any instance stay correct.
 - **Round trips.** Each statement is one, so a write costs what its statements cost: about
   13 for a small append (begin, lock, namespace, resource, head, retry lookup, insert, head,
   heads, chain, commit) and 10 for a create, about 3 ms on a local `postgres:16` with `fsync` on,
   against 0.3 ms on SQLite (`go test ./internal/core -run '^$' -bench .` with `PATCHLOG_TEST_PG`
-  set). Every write is checked inside its namespace's shared lock (`LockedCheckBytes`), skipping
-  the separate check transaction of D.3. What writers of one namespace still do one at a time is
-  the chain append: two statements and the commit's flush. A batch inserts its items with one
-  statement per table (over arrays, `unnest`), so 1,000 creates cost about as many round trips
-  as one.
+  set). A write on its own is checked inside its namespace's shared lock (`LockedCheckBytes`),
+  skipping the separate check transaction of D.3; one that joins a group (below) is checked
+  first, outside it. What writers of one namespace still do one at a time is the chain append:
+  two statements and the commit's flush, or per group about a dozen statements and one flush. A
+  batch inserts its items with one statement per table (over arrays, `unnest`), so 1,000
+  creates cost about as many round trips as one.
 - **Throughput** (`-bench 'CreatesOneNamespace|Batch1000'`, 20–70 KiB documents to distinct
   resources of one namespace, on 4 vCPUs shared by the benchmark and `postgres:16`): 160
   writes/s from one writer, 440–500 from 8, ~350 from 32 and 64 (where the CPU is saturated),
   against ~160 at every concurrency before writers shared the namespace's lock; p99 at 64
   writers 0.8 s, from 1.1 s. A batch of 1,000 creates takes about 330 ms (1.5 s before), on
-  SQLite 250 ms. Writes to different namespaces run in parallel too.
+  SQLite 250 ms. Writes to different namespaces run in parallel too. Small appends from
+  concurrent writers to distinct resources of one namespace (`-bench AppendsOneNamespace`,
+  medians of three interleaved runs) show what group commit changes: without it about 250
+  writes/s from one writer, 490 from 2, 715 from 4, then falling to 590 from 8, 575 from 16 and
+  615 from 32 (p99 165 ms); with it the same up to 4 writers (groups don't form), then 805 from
+  8, 1,030 from 16 and 1,650 from 32 (groups of about half the writers; p99 31 ms). Large
+  creates are bound by the CPU, where it changes little but the tail (p99 at 64 writers
+  0.2–0.45 s, from 0.55–1.7 s).
 - **A tailer per instance** polls `ns_log` by transaction id every 100 ms
   (`ns_log.xid xid8 DEFAULT pg_current_xact_id()`, `pg_snapshot_xmin`) and wakes long-polls and
   SSE streams for writes of every instance, and moves the read cache's generations. Commits
