@@ -426,6 +426,13 @@ sealings' rows in `blob_epochs`, §E.2.2) stay in the database and decide which 
   (`file` is NULL) and are served, copied and collected from there; new bytes go to files. To
   move old bytes out, re-upload them, or leave them until they are collected.
 
+### HTTP/2
+
+`serve`, `index` and `tree` speak HTTP/2 without TLS (h2c, prior knowledge) as well as HTTP/1.1.
+A page following several logs by long-poll then shares one connection instead of using up the
+browser's six per host (§7.7). Browsers only use HTTP/2 over TLS, so put a TLS terminator or
+CDN that speaks HTTP/2 in front; it can reach the servers over h2c or HTTP/1.1.
+
 ### CORS
 
 Browser pages on other origins (a demo app, a frontend on another port) can call `serve`, `index`
@@ -1282,18 +1289,17 @@ The last row is the root: paste its path into a document's `$schema` (or another
   `exclusiveMaximum`/`exclusiveMinimum` → numbers; `$id` and `$anchor` are dropped, since every
   reference is resolved; unknown keywords (schemastore's `markdownDescription`, `tsType`, …)
   become `x-*` annotations, which don't change validation. Each kind of change is reported.
-- **Closed schemas can type documents.** A document's top-level `$schema` is validated against
-  the schema it names (§6.1), so a schema closed at the root (`additionalProperties: false` or
-  `unevaluatedProperties: false`) would reject every document that uses it. For each imported
-  resource (any can be a `$schema`) the subschemas that apply at the instance root are found:
-  the root and what it reaches through `$ref`, `allOf` and, conservatively, every branch of
-  `anyOf`/`oneOf`/`if`/`then`/`else`/`dependentSchemas`. Each of them that is closed and doesn't
-  already cover `$schema` (in `properties`, or a matching `patternProperties`) gets
-  `"$schema": {"type": "string"}` in its `properties`, and the count is reported. Side effect: a
-  patched subschema that is also used below the root (a shared `$defs` entry) permits a `$schema`
-  key there too; that is reported. A closed schema with `maxProperties`, or a `propertyNames`
-  that rejects `$schema`, is left alone and warned about, since no document can then use it.
-  Only literal `false` is recognised as closed. `-no-declare-schema` skips all this.
+- **Closed schemas type documents as they are.** Validation leaves out a document's top-level
+  `$schema`, and a top-level `$nonce` of the fresh-nonce form (§6.2 step 5, since spec v0.36),
+  so a schema closed at the root (`additionalProperties: false`) needn't declare them, and the
+  import leaves it unchanged. For servers before v0.36 (patchlog before v0.7.0),
+  `-declare-schema` (`Options.DeclareSchema`) adds `"$schema": {"type": "string"}` to the
+  `properties` of every subschema that applies at the instance root (the root and what it
+  reaches through `$ref`, `allOf` and, conservatively, every branch of
+  `anyOf`/`oneOf`/`if`/`then`/`else`/`dependentSchemas`) and is closed without already covering
+  `$schema`, and reports the count; a patched subschema also used below the root permits a
+  `$schema` key there too, and one with `maxProperties`, or a `propertyNames` that rejects
+  `$schema`, is left alone with a warning.
 - **The source is kept.** `$id` can't be (§6.1), so each imported resource's root gets
   `"x-source"` (the URL it was fetched from, or the upload's name) and, when the document
   declared another `$id` (draft-04 `id`), `"x-source-id"`; so does each document bundled under

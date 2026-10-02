@@ -72,7 +72,7 @@ func TestDeclareSchema(t *testing.T) {
 		{name: "maxProperties", src: `{"maxProperties":2,"additionalProperties":false}`, absent: []string{""}, warn: "maxProperties"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
-			res := planFiles(t, map[string]string{"x.json": c.src}, "x.json", schemaimport.Options{})
+			res := planFiles(t, map[string]string{"x.json": c.src}, "x.json", schemaimport.Options{DeclareSchema: true})
 			content := res.Resources[0].Content
 			for _, p := range c.patched {
 				if got := jsonv.Canonical(get(t, content, p+"/properties/$schema")); string(got) != declared {
@@ -92,14 +92,14 @@ func TestDeclareSchema(t *testing.T) {
 			}
 
 			// Opting out leaves the bytes (but for x-source) alone.
-			off := planFiles(t, map[string]string{"x.json": c.src}, "x.json", schemaimport.Options{NoDeclareSchema: true})
+			off := planFiles(t, map[string]string{"x.json": c.src}, "x.json", schemaimport.Options{})
 			for _, p := range c.patched {
 				if has(off.Resources[0].Content, p+"/properties/$schema") {
-					t.Errorf("-no-declare-schema: %q gained $schema", p)
+					t.Errorf("without -declare-schema: %q gained $schema", p)
 				}
 			}
 			if warned(off, "declared $schema") || warned(off, "can't type documents") {
-				t.Errorf("-no-declare-schema warned: %q", off.Warnings)
+				t.Errorf("without -declare-schema, warned: %q", off.Warnings)
 			}
 		})
 	}
@@ -113,7 +113,7 @@ func TestDeclareSchemaShared(t *testing.T) {
 	  "properties": { "child": { "$ref": "#/$defs/C" } },
 	  "$defs": { "C": { "properties": { "a": {} }, "additionalProperties": false },
 	             "OnlyBelow": { "additionalProperties": false } }
-	}`}, "x.json", schemaimport.Options{})
+	}`}, "x.json", schemaimport.Options{DeclareSchema: true})
 	c := res.Resources[0].Content
 	if !has(c, "/$defs/C/properties/$schema") {
 		t.Error("C not patched")
@@ -135,7 +135,7 @@ func TestDeclareSchemaCrossResource(t *testing.T) {
 		"closed.json": `{"properties":{"a":{}},"$ref":"deeper.json#/$defs/D","additionalProperties":false}`,
 		"deeper.json": `{"$defs":{"D":{"allOf":[{"unevaluatedProperties":false}]}}}`,
 	}
-	res := planFiles(t, files, "root.json", schemaimport.Options{})
+	res := planFiles(t, files, "root.json", schemaimport.Options{DeclareSchema: true})
 	if len(res.Resources) != 3 {
 		t.Fatalf("%d resources", len(res.Resources))
 	}
@@ -161,7 +161,7 @@ func TestDeclareSchemaCrossResource(t *testing.T) {
 	cyc := planFiles(t, map[string]string{
 		"a.json": `{"properties":{"b":{"$ref":"b.json"}}}`,
 		"b.json": `{"additionalProperties":false,"properties":{"a":{"$ref":"a.json"}}}`,
-	}, "a.json", schemaimport.Options{})
+	}, "a.json", schemaimport.Options{DeclareSchema: true})
 	if len(cyc.Resources) != 1 {
 		t.Fatalf("%d resources", len(cyc.Resources))
 	}
@@ -175,7 +175,7 @@ func TestDeclareSchemaCrossResource(t *testing.T) {
 	cyc = planFiles(t, map[string]string{
 		"a.json": `{"$ref":"b.json"}`,
 		"b.json": `{"additionalProperties":false,"allOf":[{"$ref":"a.json"}]}`,
-	}, "a.json", schemaimport.Options{})
+	}, "a.json", schemaimport.Options{DeclareSchema: true})
 	if !has(cyc.Resources[0].Content, "/$defs/b/properties/$schema") {
 		t.Errorf("bundle %s", jsonv.Canonical(cyc.Resources[0].Content))
 	}
@@ -186,7 +186,7 @@ func TestSourceKept(t *testing.T) {
 		"blueprints/door.json": `{"$id":"https://doors.example/blueprints/door","type":"object"}`,
 		"plain.json":           `{"$id":"file:///upload/plain.json","type":"object"}`,
 		"d4.json":              `{"$schema":"http://json-schema.org/draft-04/schema#","id":"http://old.example/d4#"}`,
-	}, "blueprints/door.json", schemaimport.Options{})
+	}, "blueprints/door.json", schemaimport.Options{DeclareSchema: true})
 	c := res.Resources[0].Content
 	if get(t, c, "/x-source") != "blueprints/door.json" || get(t, c, "/x-source-id") != "https://doors.example/blueprints/door" {
 		t.Errorf("%s", jsonv.Canonical(c))
@@ -196,7 +196,7 @@ func TestSourceKept(t *testing.T) {
 	}
 	res = planFiles(t, map[string]string{
 		"plain.json": `{"$id":"file:///upload/plain.json","type":"object"}`,
-	}, "plain.json", schemaimport.Options{})
+	}, "plain.json", schemaimport.Options{DeclareSchema: true})
 	if c := res.Resources[0].Content; get(t, c, "/x-source") != "plain.json" || has(c, "/x-source-id") {
 		t.Errorf("%s", jsonv.Canonical(c))
 	}
@@ -204,15 +204,16 @@ func TestSourceKept(t *testing.T) {
 	res = planFiles(t, map[string]string{
 		"main.json": `{"properties":{"o":{"$ref":"d4.json"}}}`,
 		"d4.json":   `{"$schema":"http://json-schema.org/draft-04/schema#","id":"http://old.example/d4#"}`,
-	}, "main.json", schemaimport.Options{})
+	}, "main.json", schemaimport.Options{DeclareSchema: true})
 	d4 := byName(t, res, "d4").Content
 	if get(t, d4, "/x-source") != "d4.json" || get(t, d4, "/x-source-id") != "http://old.example/d4#" {
 		t.Errorf("%s", jsonv.Canonical(d4))
 	}
 }
 
-// A closed blueprint imported with the tool can type documents; an invalid
-// one still fails; re-running is a no-op.
+// A closed blueprint imported with the tool can type documents as it is,
+// since validation leaves out $schema and a fresh $nonce (§6.2 step 5, spec
+// v0.36); an invalid one still fails; re-running is a no-op.
 func TestImportClosedBlueprintEndToEnd(t *testing.T) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
@@ -238,8 +239,8 @@ func TestImportClosedBlueprintEndToEnd(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !warned(res, "declared $schema in 1 closed schema ") {
-		t.Errorf("warnings %q", res.Warnings)
+	if warned(res, "declared $schema") {
+		t.Errorf("declared without -declare-schema: %q", res.Warnings)
 	}
 	if err := res.Write(ctx, c); err != nil {
 		t.Fatal(err)
@@ -249,7 +250,7 @@ func TestImportClosedBlueprintEndToEnd(t *testing.T) {
 		t.Errorf("%s", jsonv.Canonical(r.Content))
 	}
 	path := r.Path("schemas")
-	if _, err := c.CreateDoc(ctx, "docs", "front", map[string]any{"$schema": path, "height": 200}); err != nil {
+	if _, err := c.CreateDoc(ctx, "docs", "front", map[string]any{"$schema": path, "height": 200, "$nonce": "abcdefghijklmnopqrstuvwxyz"}); err != nil {
 		t.Fatalf("typed document: %v", err)
 	}
 	_, err = c.CreateDoc(ctx, "docs", "bad", map[string]any{"$schema": path, "height": 0})
@@ -268,18 +269,28 @@ func TestImportClosedBlueprintEndToEnd(t *testing.T) {
 		t.Fatalf("re-run: changed=%v id %s want %s", again.Changed(), again.Resources[0].ID, r.ID)
 	}
 
-	// Opting out keeps the old behaviour: the closed schema can't type documents.
+	// A $nonce not of the fresh-nonce form is data, and the closed schema
+	// refuses it.
+	_, err = c.CreateDoc(ctx, "docs", "nonce", map[string]any{"$schema": path, "height": 2, "$nonce": "x"})
+	if ae, ok := client.AsAPIError(err); !ok || ae.Status != 422 {
+		t.Fatalf("$nonce of another form: %v", err)
+	}
+
+	// -declare-schema adds the declaration for older servers; documents
+	// still validate.
 	opt.NS = "docs"
-	opt.NoDeclareSchema = true
-	raw, err := schemaimport.Plan(ctx, c, src, opt)
+	opt.DeclareSchema = true
+	decl, err := schemaimport.Plan(ctx, c, src, opt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := raw.Write(ctx, c); err != nil {
+	if !warned(decl, "declared $schema in 1 closed schema ") {
+		t.Errorf("warnings %q", decl.Warnings)
+	}
+	if err := decl.Write(ctx, c); err != nil {
 		t.Fatal(err)
 	}
-	_, err = c.CreateDoc(ctx, "docs", "untyped", map[string]any{"$schema": raw.Resources[0].Path("docs"), "height": 2})
-	if ae, ok := client.AsAPIError(err); !ok || ae.Status != 422 {
-		t.Fatalf("closed blueprint without declaration: %v", err)
+	if _, err := c.CreateDoc(ctx, "docs", "declared", map[string]any{"$schema": decl.Resources[0].Path("docs"), "height": 2}); err != nil {
+		t.Fatalf("declared blueprint: %v", err)
 	}
 }

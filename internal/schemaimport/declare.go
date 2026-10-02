@@ -163,8 +163,10 @@ func refusesSchemaKey(obj map[string]any) string {
 		return ""
 	}
 	const path = "/r/x/pn/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	doc := map[string]any{"$schema": schema.Dialect2020, "propertyNames": pn}
-	probe := map[string]any{"$schema": path}
+	// Probed one level down: validation leaves out the top-level $schema
+	// (§6.2 step 5), and an older server is what the declaration is for.
+	doc := map[string]any{"$schema": schema.Dialect2020, "properties": map[string]any{"p": map[string]any{"propertyNames": pn}}}
+	probe := map[string]any{"$schema": path, "p": map[string]any{"$schema": ""}}
 	load := func(ref schema.Ref) (any, error) {
 		if ref.Path() == path {
 			return doc, nil
@@ -245,7 +247,7 @@ func (p *planner) noteDeclaration(patch map[string][]pointer.Pointer, refused ma
 		if n == 1 {
 			s = ""
 		}
-		p.notes = append(p.notes, fmt.Sprintf("declared $schema in %d closed schema%s so they can type documents (§6.1); -no-declare-schema keeps them as they are", n, s))
+		p.notes = append(p.notes, fmt.Sprintf("declared $schema in %d closed schema%s for servers before spec v0.36 (-declare-schema)", n, s))
 	}
 	if len(shared) > 0 {
 		var at []string

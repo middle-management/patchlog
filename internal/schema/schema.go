@@ -207,6 +207,35 @@ func newCompiler(load urlLoaderFunc) *jsonschema.Compiler {
 	return c
 }
 
+// freshNonce is the fresh-nonce form of §6.4.1: 128 bits as 26 base32
+// characters.
+var freshNonce = regexp.MustCompile(`^[a-z2-7]{26}$`)
+
+// Instance returns what §6.2 step 5 validates for a document: the document
+// without its top-level $schema, and without a top-level $nonce of the
+// fresh-nonce form. They are mechanics rather than data, so closed schemas
+// needn't declare them. Reference walks (§6.5) and clients validating at
+// E3 use the same instance. doc itself is never modified.
+func Instance(doc any) any {
+	obj, ok := doc.(map[string]any)
+	if !ok {
+		return doc
+	}
+	n, hasNonce := obj["$nonce"].(string)
+	strip := hasNonce && freshNonce.MatchString(n)
+	if _, ok := obj["$schema"]; !ok && !strip {
+		return doc
+	}
+	out := make(map[string]any, len(obj))
+	for k, v := range obj {
+		if k == "$schema" || (k == "$nonce" && strip) {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // Validate implements §6.2 step 5 for a resulting document.
 func (v *Validator) Validate(doc any, load Loader) error {
 	obj, ok := doc.(map[string]any)
@@ -232,7 +261,7 @@ func (v *Validator) Validate(doc any, load Loader) error {
 	if err != nil {
 		return err
 	}
-	return toValidationError(sch.Validate(doc))
+	return toValidationError(sch.Validate(Instance(doc)))
 }
 
 // validateSchemaDocument checks a document whose $schema is a dialect URL.

@@ -63,10 +63,11 @@ type Options struct {
 	// NoDisk refuses local files that aren't in Files (a server must not
 	// read its own disk for a caller).
 	NoDisk bool
-	// NoDeclareSchema leaves closed schemas as they are. By default a
-	// schema that is closed at the instance root gets a "$schema" property
-	// so that it can type documents (§6.1).
-	NoDeclareSchema bool
+	// DeclareSchema gives a schema that is closed at the instance root a
+	// "$schema" property, for servers before spec v0.36, which validated a
+	// document's $schema member. Since v0.36 validation leaves it out
+	// (§6.2 step 5), so closed schemas type documents as they are.
+	DeclareSchema bool
 }
 
 // Actions of a Resource.
@@ -631,7 +632,7 @@ func (p *planner) build(ctx context.Context, c *client.Client, bundles []*bundle
 		}
 	}
 	var patch map[string][]pointer.Pointer
-	if !p.opt.NoDeclareSchema {
+	if p.opt.DeclareSchema {
 		// Dry run: convert with stub references (a dependency's revision id
 		// isn't known before its content is final) and find what to patch.
 		docs := map[string]any{}

@@ -141,7 +141,7 @@ func FindRefs(doc any, load schema.Loader) ([]Ref, error) {
 	if _, err := c.doc(base); err != nil {
 		return nil, err
 	}
-	return c.findRefs(base, doc)
+	return c.findRefs(base, schema.Instance(doc))
 }
 
 // FindRefsWith is FindRefs with an explicit root schema document; rootPath is
@@ -154,7 +154,7 @@ func FindRefsWith(root any, rootPath string, doc any, load schema.Loader) ([]Ref
 	}
 	c.rootLabel = rootPath
 	c.docs[base] = jsonv.Clone(root)
-	return c.findRefs(base, doc)
+	return c.findRefs(base, schema.Instance(doc))
 }
 
 type refItem struct {

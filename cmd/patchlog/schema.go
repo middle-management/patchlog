@@ -14,7 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/schemaimport"
 )
 
-const schemaUsage = "usage: patchlog schema import -api URL -ns NS [-bearer GRANT] [-author A] [-name NAME] [-dry-run] [-json] [-no-declare-schema] [-max-docs N] [-max-bytes N] [-timeout D] URL|FILE..."
+const schemaUsage = "usage: patchlog schema import -api URL -ns NS [-bearer GRANT] [-author A] [-name NAME] [-dry-run] [-json] [-declare-schema] [-max-docs N] [-max-bytes N] [-timeout D] URL|FILE..."
 
 // schemaCmd is `patchlog schema import`: external JSON Schemas into a
 // namespace as schema resources, references pinned to revision paths (§6.1).
@@ -39,7 +39,7 @@ func schemaImport(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	maxDocs := fs.Int("max-docs", schemaimport.DefaultMaxDocs, "most documents to fetch")
 	maxBytes := fs.Int64("max-bytes", schemaimport.DefaultMaxBytes, "most bytes to fetch, in total")
 	timeout := fs.Duration("timeout", schemaimport.DefaultTimeout, "timeout of each fetch")
-	noDeclare := fs.Bool("no-declare-schema", false, "don't add a $schema property to schemas that are closed at the document root (§6.1)")
+	declare := fs.Bool("declare-schema", false, "add a $schema property to schemas that are closed at the document root, for servers before spec v0.36 (patchlog before v0.7.0), which validated it")
 	fs.Usage = func() { fmt.Fprintln(stderr, schemaUsage); fs.PrintDefaults() }
 	if err := fs.Parse(args); err != nil {
 		return 2
@@ -66,7 +66,7 @@ func schemaImport(ctx context.Context, args []string, stdout, stderr io.Writer) 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	res, err := schemaimport.Plan(ctx, c, fs.Args(), schemaimport.Options{
-		NS: *ns, Name: *name, MaxDocs: *maxDocs, MaxBytes: *maxBytes, Timeout: *timeout, NoDeclareSchema: *noDeclare,
+		NS: *ns, Name: *name, MaxDocs: *maxDocs, MaxBytes: *maxBytes, Timeout: *timeout, DeclareSchema: *declare,
 	})
 	if err != nil {
 		fmt.Fprintln(stderr, "schema import:", err)

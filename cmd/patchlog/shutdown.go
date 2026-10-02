@@ -28,7 +28,20 @@ func addShutdownFlags(fs *flag.FlagSet) *shutdownFlags {
 // server wraps srv with the health endpoints (ready: /_ready's check, may
 // be nil) and the phased shutdown the flags configure.
 func (f *shutdownFlags) server(name string, srv *http.Server, ready func(context.Context) error) *lifecycle.Server {
+	allowH2C(srv)
 	return lifecycle.New(srv, lifecycle.Options{Name: name, Timeout: *f.timeout, Delay: *f.delay, Ready: ready, Logf: log.Printf})
+}
+
+// allowH2C lets srv speak HTTP/2 without TLS (h2c, prior knowledge), as
+// well as HTTP/1.1: a page following several logs by long-poll shares one
+// HTTP/2 connection instead of using up the browser's six per host (§7.7).
+// Behind a TLS terminator or CDN, that hop decides what browsers get.
+func allowH2C(srv *http.Server) {
+	var p http.Protocols
+	p.SetHTTP1(true)
+	p.SetHTTP2(true)
+	p.SetUnencryptedHTTP2(true)
+	srv.Protocols = &p
 }
 
 // shutdownSignals returns a context cancelled by the first SIGINT or

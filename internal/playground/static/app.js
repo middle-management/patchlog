@@ -1132,6 +1132,15 @@ async function nsChainOK(ns, kns) {
 }
 
 const schemaCache = new Map();
+/* validationInstance is what §6.2 step 5 validates: doc without its top-level
+   $schema, and without a top-level $nonce of the fresh-nonce form. */
+function validationInstance(doc) {
+  const out = { ...doc };
+  delete out.$schema;
+  if (typeof out.$nonce === 'string' && /^[a-z2-7]{26}$/.test(out.$nonce)) delete out.$nonce;
+  return out;
+}
+
 /* validateDoc checks doc against its $schema with the subset validator (§E.3.2: validation moves to clients). */
 async function validateDoc(doc) {
   if (!doc || typeof doc !== 'object' || Array.isArray(doc) || typeof doc.$schema !== 'string') return { errors: [] };
@@ -1146,7 +1155,7 @@ async function validateDoc(doc) {
     schemaCache.set(doc.$schema, schema);
   }
   if (!schema || typeof schema !== 'object') return { errors: [{ pointer: '', message: 'schema_unavailable: ' + doc.$schema }] };
-  const v = Z.validate(schema, doc);
+  const v = Z.validate(schema, validationInstance(doc));
   return { errors: v.errors, note: v.unchecked.length ? 'validated in this browser, except keywords ' + v.unchecked.join(', ') : 'validated in this browser against its $schema' };
 }
 

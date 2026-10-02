@@ -91,7 +91,7 @@ func Collect(doc any, load schema.Loader, keywords ...string) ([]Annotation, err
 	if _, err := c.doc(base); err != nil {
 		return nil, err
 	}
-	return c.run(base, doc)
+	return c.run(base, schema.Instance(doc))
 }
 
 // CollectWith uses an explicit root schema document instead of doc's $schema.
@@ -109,7 +109,7 @@ func CollectWith(root any, rootPath string, doc any, load schema.Loader, keyword
 		return nil, &schema.SchemaError{Msg: err.Error()}
 	}
 	c.docs[base] = root
-	return c.run(base, doc)
+	return c.run(base, schema.Instance(doc))
 }
 
 type collector struct {
