@@ -180,7 +180,7 @@ func TestRaceConfigChange(t *testing.T) {
 		})
 		expectCode(t, e.write("PATCH", "main", "a", a0, ops(op("replace", "/n", 2.0))), 422, "rule")
 		// Allowed by the new rules: re-checked and inserted.
-		h.arm(func() { expect(t, e.patchNS("main", ops(op("add", "/title", "t")), ""), 201) })
+		h.arm(func() { expect(t, e.patchNS("main", ops(op("add", "/x-title", "t")), ""), 201) })
 		a1 := e.appendRev("main", "a", a0, ops(op("add", "/i18n/sv", "x")))
 		if a1 == "" {
 			t.Fatal("no id")
@@ -274,7 +274,7 @@ func TestRaceRateDrawnOnce(t *testing.T) {
 			"ratePerPrincipal": map[string]any{"rate": 0.001, "burst": 2.0}}})
 		a0 := e.create("main", "a", map[string]any{"n": 1.0}, "alice") // one token
 		// The config change forces a redo; a second draw would be 429.
-		h.arm(func() { expect(t, e.patchNS("main", ops(op("add", "/title", "t")), ""), 201) })
+		h.arm(func() { expect(t, e.patchNS("main", ops(op("add", "/x-title", "t")), ""), 201) })
 		calls := h.calls.Load()
 		a1 := e.appendRev("main", "a", a0, ops(op("replace", "/n", 2.0)), "alice")
 		if n := h.calls.Load() - calls; n < 2 {
@@ -518,7 +518,7 @@ func TestRaceFallbackUnderLock(t *testing.T) {
 		rounds := 0
 		bump = func() {
 			rounds++
-			expect(t, e.patchNS("main", ops(op("add", "/title", strconv.Itoa(rounds))), ""), 201)
+			expect(t, e.patchNS("main", ops(op("add", "/x-title", strconv.Itoa(rounds))), ""), 201)
 			h.arm(bump) // every round loses
 		}
 		h.arm(bump)

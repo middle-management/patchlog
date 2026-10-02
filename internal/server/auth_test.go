@@ -242,7 +242,7 @@ func TestAuthNarrowingRolesRevocation(t *testing.T) {
 	// Revocation is by block, however re-serialised; other grants of the key still work.
 	a = e.appendRev("sec", "a", a, ops(op("add", "/z", 1.0)), f.issuerG)
 	// Revoking needs a * key.
-	expectCode(t, e.patchNS("sec", ops(op("add", "/revoked/-", "1aaaa")), f.issuerG), 403, "forbidden")
+	expectCode(t, e.patchNS("sec", ops(op("add", "/revoked/-", hashID(t, "", []byte("a block signature")))), f.issuerG), 403, "forbidden")
 
 	// Key scope: sub pattern and verbs.
 	svcBad := e.grant(f.svc, "user:x", []string{"sec"}, []string{"append"})
@@ -283,15 +283,15 @@ func TestAuthConfigAndRules(t *testing.T) {
 	}
 	noTitle := map[string]any{
 		"if":   []any{map[string]any{"op": "test", "path": "/action", "value": "config"}},
-		"then": []any{map[string]any{"not": map[string]any{"op": "writes", "overlaps": "/title"}}},
+		"then": []any{map[string]any{"not": map[string]any{"op": "writes", "overlaps": "/x-title"}}},
 	}
 	f := newAuthFixture(t, map[string]any{"rules": []any{ownership, opsOnly, noTitle}})
 	e := f.tenv
 
 	// Config: rules apply except under a * key.
-	expectCode(t, e.patchNS("sec", ops(op("add", "/title", "x")), f.issuerG), 422, "rule")
-	expect(t, e.patchNS("sec", ops(op("add", "/title", "x")), f.adminG), 201)
-	expect(t, e.patchNS("sec", ops(op("add", "/other", "x")), f.issuerG), 201)
+	expectCode(t, e.patchNS("sec", ops(op("add", "/x-title", "x")), f.issuerG), 422, "rule")
+	expect(t, e.patchNS("sec", ops(op("add", "/x-title", "x")), f.adminG), 201)
+	expect(t, e.patchNS("sec", ops(op("add", "/x-other", "x")), f.issuerG), 201)
 	// Guarded paths need a * key.
 	for _, p := range [][]any{
 		ops(op("add", "/keys/-", newKey("k2").entry("read"))),

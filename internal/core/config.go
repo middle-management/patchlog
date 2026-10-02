@@ -10,6 +10,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/rules"
 )
 
@@ -250,6 +251,244 @@ func ValidRemoteOrigin(s string) bool {
 	return s == u.Scheme+"://"+u.Host
 }
 
+// nsMembers are the namespace-document members this version of the spec
+// defines (§7.4): the core's, then Addendum B's and Addendum F's. Any other
+// member must start with "x-" and is stored as data.
+var nsMembers = map[string]bool{
+	"read": true, "keys": true, "roles": true, "revoked": true, "rules": true, "limits": true,
+	"allowances": true, "retention": true, "encryption": true, "maxLag": true, "base": true,
+	"frozen": true, "successor": true, "drafts": true,
+	"catalog": true, "catalogs": true, // Addendum B
+	"merge": true, "merged": true, "cleanup": true, "abandoned": true, // Addendum F
+}
+
+// memberError is a namespace-document member this version doesn't define
+// and that doesn't start with "x-" (§7.4). Its 422 names the member.
+// inherited is set when a new branch's document holds it because its
+// base's does (stored under an earlier version): the message says how the
+// branch's patches can rename it.
+type memberError struct {
+	member    string
+	inherited bool
+}
+
+func (e *memberError) Error() string {
+	x := pointer.Pointer{"x-" + e.member}
+	if e.inherited {
+		return fmt.Sprintf(`%s, which the base's document holds, is not a namespace-document member of the spec version this server implements, and a new namespace can't hold it; other members must start with "x-": the branch's patches can rename it, {"op":"move","from":%q,"path":%q} (§7.4)`,
+			e.path(), e.path(), x.String())
+	}
+	return fmt.Sprintf(`%s is not a namespace-document member of the spec version this server implements; other members must start with "x-", e.g. %s (§7.4)`,
+		e.path(), x)
+}
+
+// path is the member as a JSON Pointer.
+func (e *memberError) path() string { return pointer.Pointer{e.member}.String() }
+
+// checkMembers is the strict part of the namespace-document schema (§7.4),
+// for a document a write produces, after parseConfig accepted it: every
+// member is one the spec defines, in its shape, or starts with "x-" and is
+// stored as data, so a typo or a setting from a newer version is refused
+// rather than ignored. parseConfig checks the core's members, and reads
+// stored documents too; this checks the rest, which only services read,
+// and revocation ids and key entries. prev is what the write keeps: for a
+// config write the namespace's current document, so a member it holds
+// with the same value, stored under an earlier version, is kept as data
+// until a write changes or removes it, and a namespace written before an
+// upgrade can still be frozen, rotated or merged; for a new branch only
+// the members its base's document holds that this version defines
+// (definedMembers), since a new namespace holds no others. Within
+// revoked and keys, entries prev holds are kept the same way, so a
+// revocation can be added next to one an older version stored. A new
+// namespace has no prev.
+func checkMembers(doc, prev map[string]any) error {
+	for _, k := range sortedKeys(doc) {
+		v := doc[k]
+		if strings.HasPrefix(k, "x-") {
+			continue
+		}
+		if pv, ok := prev[k]; ok && jsonv.Equal(pv, v) {
+			continue
+		}
+		var err error
+		switch k {
+		case "revoked":
+			// parseConfig, which reads stored documents too, checks only
+			// that they are strings, as older versions did; entries prev
+			// holds are kept.
+			kept := map[string]bool{}
+			pa, _ := prev[k].([]any)
+			for _, e := range pa {
+				if s, ok := e.(string); ok {
+					kept[s] = true
+				}
+			}
+			arr, _ := v.([]any)
+			for i, e := range arr {
+				s, _ := e.(string)
+				if _, perr := ids.Parse(s); perr != nil && !kept[s] {
+					err = fmt.Errorf("/revoked/%d must be a revocation id, the text id of a block's signature (§C.4)", i)
+					break
+				}
+			}
+		case "keys":
+			err = checkKeyFields(v, prev[k])
+		case "catalog":
+			err = checkCatalog(v)
+		case "catalogs":
+			err = checkCatalogs(v)
+		case "merged":
+			m, ok := v.(map[string]any)
+			at, _ := m["at"].(string)
+			if _, perr := ids.Parse(at); !ok || len(m) != 1 || perr != nil {
+				err = fmt.Errorf(`/merged must be { "at": the base's ns_id after the merge } (§F.3)`)
+			}
+		case "cleanup":
+			err = checkCleanup(v)
+		case "abandoned":
+			if _, ok := v.(bool); !ok {
+				err = fmt.Errorf("/abandoned must be a boolean (§F.6)")
+			}
+		default:
+			if !nsMembers[k] {
+				err = &memberError{member: k}
+			}
+		}
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// definedMembers is what a new branch keeps of its base's document as
+// stored (checkMembers): the members this version defines.
+func definedMembers(doc map[string]any) map[string]any {
+	out := map[string]any{}
+	for k, v := range doc {
+		if nsMembers[k] {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// checkKeyFields refuses fields a key entry doesn't define (§C.4), which
+// grant.ParseKeys accepts when they start with "x-", as stored documents
+// may hold them: §7.4 sanctions "x-" only for members of the document
+// itself. An entry prev holds unchanged is kept.
+func checkKeyFields(v, prev any) error {
+	pa, _ := prev.([]any)
+	arr, _ := v.([]any)
+	for i, e := range arr {
+		m, _ := e.(map[string]any)
+		kept := false
+		for _, p := range pa {
+			if jsonv.Equal(p, e) {
+				kept = true
+				break
+			}
+		}
+		if kept {
+			continue
+		}
+		for _, f := range sortedKeys(m) {
+			if strings.HasPrefix(f, "x-") {
+				return fmt.Errorf("/keys/%d/%s is not a key field; a key entry holds only the fields of §C.4", i, pointer.Pointer{f}.String()[1:])
+			}
+		}
+	}
+	return nil
+}
+
+// checkCatalog checks a catalog namespace's "catalog" (§B.6):
+// { "trust"?: [namespace names], "mode"?: "tree" | "dag" }.
+func checkCatalog(v any) error {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf(`/catalog must be { "trust"?: [namespace names], "mode"?: "tree" | "dag" } (§B.6)`)
+	}
+	for _, k := range sortedKeys(m) {
+		switch x := m[k]; k {
+		case "trust":
+			arr, ok := x.([]any)
+			if !ok {
+				return fmt.Errorf("/catalog/trust must be an array of namespace names (§B.6)")
+			}
+			for i, e := range arr {
+				if s, ok := e.(string); !ok || !ValidNSName(s) {
+					return fmt.Errorf("/catalog/trust/%d must be a namespace name (§3.6)", i)
+				}
+			}
+		case "mode":
+			if x != "tree" && x != "dag" {
+				return fmt.Errorf(`/catalog/mode must be "tree" or "dag" (§B.6)`)
+			}
+		default:
+			return fmt.Errorf("/catalog/%s is not a known field (§B.6)", k)
+		}
+	}
+	return nil
+}
+
+// subjectRe is a catalog subject (§B.11.1): a group or a user.
+var subjectRe = regexp.MustCompile(`^(group|user):.+$`)
+
+// checkCatalogs checks a content namespace's "catalogs" (§B.11.3):
+// { catalog namespace: { "place"?: [subjects] } }.
+func checkCatalogs(v any) error {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf(`/catalogs must be { catalog namespace: { "place": ["group:…" or "user:…", …] } } (§B.11.3)`)
+	}
+	for _, cat := range sortedKeys(m) {
+		if !ValidNSName(cat) {
+			return fmt.Errorf("/catalogs/%s: the keys of /catalogs must be catalog namespace names (§B.11.3)", cat)
+		}
+		o, ok := m[cat].(map[string]any)
+		if !ok {
+			return fmt.Errorf(`/catalogs/%s must be { "place": ["group:…" or "user:…", …] } (§B.11.3)`, cat)
+		}
+		for _, k := range sortedKeys(o) {
+			if k != "place" {
+				return fmt.Errorf("/catalogs/%s/%s is not a known field (§B.11.3)", cat, k)
+			}
+			arr, ok := o[k].([]any)
+			if !ok {
+				return fmt.Errorf(`/catalogs/%s/place must be an array of subjects, "group:…" or "user:…" (§B.11.3)`, cat)
+			}
+			for i, e := range arr {
+				if s, ok := e.(string); !ok || !subjectRe.MatchString(s) {
+					return fmt.Errorf(`/catalogs/%s/place/%d must be a subject, "group:…" or "user:…" (§B.11.1)`, cat, i)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// checkCleanup checks a branch's "cleanup" (§F.6), which the janitor reads,
+// and a base's minimums in the same shape: { "merged"?, "superseded"?,
+// "abandoned"? }, each an ISO 8601 duration.
+func checkCleanup(v any) error {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return fmt.Errorf(`/cleanup must be { "merged"?, "superseded"?, "abandoned"? }, each an ISO 8601 duration (§F.6)`)
+	}
+	for _, k := range sortedKeys(m) {
+		switch k {
+		case "merged", "superseded", "abandoned":
+			s, ok := m[k].(string)
+			if _, err := ParseDuration(s); !ok || err != nil {
+				return fmt.Errorf("/cleanup/%s must be an ISO 8601 duration, e.g. P7D (§F.6)", k)
+			}
+		default:
+			return fmt.Errorf("/cleanup/%s is not a known field (§F.6)", k)
+		}
+	}
+	return nil
+}
+
 var nsNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
 var resNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
 
@@ -258,7 +497,9 @@ func ValidNSName(s string) bool       { return nsNameRe.MatchString(s) }
 func ValidResourceName(s string) bool { return resNameRe.MatchString(s) }
 
 // parseConfig validates a namespace document against the built-in
-// namespace-document schema and the deployment maximums.
+// namespace-document schema and the deployment maximums: the members the
+// core reads. It also reads stored documents, so it leaves other members
+// alone; writes check them with checkMembers (§7.4).
 // defaults are the namespace defaults; max the deployment maximums.
 func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 	m, ok := doc.(map[string]any)

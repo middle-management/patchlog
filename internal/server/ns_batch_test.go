@@ -8,7 +8,7 @@ import (
 // §7.4 namespace reads and config writes (dev mode).
 func TestNamespace(t *testing.T) {
 	e := newEnv(t)
-	cfg0 := e.mkNS("docs", map[string]any{"read": "public", "title": "Docs"})
+	cfg0 := e.mkNS("docs", map[string]any{"read": "public", "x-title": "Docs"})
 
 	// GET /ns: 302 with Location, ETag and X-Config-Revision.
 	r := e.get("/ns/docs")
@@ -24,7 +24,7 @@ func TestNamespace(t *testing.T) {
 	// GET /ns/rev: the document in force, immutable.
 	r = e.get("/ns/docs/rev/" + head)
 	expect(t, r, 200)
-	if r.Obj()["title"] != "Docs" || r.H.Get("X-Config-Revision") != cfg0 || r.H.Get("Cache-Control") != ccImmutable {
+	if r.Obj()["x-title"] != "Docs" || r.H.Get("X-Config-Revision") != cfg0 || r.H.Get("Cache-Control") != ccImmutable {
 		t.Fatalf("GET /ns/rev %s %v", r.Body, r.H)
 	}
 	expect(t, e.get("/ns/docs/rev/"+hashID(t, "", []byte("x"))), 404)
@@ -41,7 +41,7 @@ func TestNamespace(t *testing.T) {
 	if e.configID("docs") != cfg0 {
 		t.Fatal("config id moved on a document write")
 	}
-	patches := ops(op("replace", "/title", "Documents"))
+	patches := ops(op("replace", "/x-title", "Documents"))
 	r = e.do(req{method: "PATCH", path: "/ns/docs", ifMatch: cfg0, body: patches, author: "admin"})
 	expect(t, r, 201)
 	cfg1 := r.H.Get("X-Config-Revision")
@@ -77,7 +77,7 @@ func TestNamespace(t *testing.T) {
 
 	// The old revision still serves the old document.
 	r = e.get("/ns/docs/rev/" + head)
-	if r.Obj()["title"] != "Docs" {
+	if r.Obj()["x-title"] != "Docs" {
 		t.Fatalf("old ns revision changed: %s", r.Body)
 	}
 
@@ -323,9 +323,16 @@ func TestBatchConfigAndSchemas(t *testing.T) {
 	if r.Str("ns_id") != nsid {
 		t.Fatalf("retry %s", r.Body)
 	}
-	// Config change alone in a batch.
+	// Config change alone in a batch. Its members are checked as a config
+	// write's (§7.4): one that doesn't start with "x-" is refused.
 	r = e.do(req{method: "POST", path: "/ns/m/batch", author: "alice", body: map[string]any{
 		"config": map[string]any{"ifMatch": cfg1, "patches": ops(op("add", "/title", "x"))}}})
+	expectCode(t, r, 422, "invalid")
+	if r.Str("path") != "/title" {
+		t.Fatalf("batch config with an unknown member: %s", r.Body)
+	}
+	r = e.do(req{method: "POST", path: "/ns/m/batch", author: "alice", body: map[string]any{
+		"config": map[string]any{"ifMatch": cfg1, "patches": ops(op("add", "/x-title", "x"))}}})
 	expect(t, r, 201)
 
 	// Items may reference schema revisions created by earlier items.

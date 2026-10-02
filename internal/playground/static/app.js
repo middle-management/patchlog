@@ -3156,6 +3156,8 @@ function init() {
     ['successor', () => add('/successor', 'other-namespace')],
     ['frozen: true', () => add('/frozen', true)],
     ['frozen: false', () => add('/frozen', false)],
+    // Members the spec doesn't define must start with "x-" (§7.4).
+    ['x-title', () => add('/x-title', 'My namespace')],
   ], 'nsPatch');
 
   // resource tab

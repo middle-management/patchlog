@@ -38,7 +38,7 @@ func populateChain(t *testing.T, a *tenv) chainFixture {
 	var f chainFixture
 	a.mkNS("schemas", map[string]any{"read": "public"})
 	f.s1 = a.create("schemas", "match", matchSchema())
-	a.mkNS("matches", map[string]any{"read": "public", "title": "A's matches"})
+	a.mkNS("matches", map[string]any{"read": "public", "x-title": "A's matches"})
 	f.d1 = a.create("matches", "derby", map[string]any{"$schema": "/r/schemas/match/rev/" + f.s1, "score": "0-0"})
 	f.d2 = a.appendRev("matches", "derby", f.d1, ops(op("replace", "/score", "1-0")))
 	f.o1 = a.create("matches", "own", map[string]any{"v": 1.0})
