@@ -973,6 +973,12 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 	}
 }
 
+// doubleDelete answers a delete step right after another (§7.5): 422, as a
+// DELETE of a tombstoned resource is 410.
+func doubleDelete() *Error {
+	return apiErr(422, "invalid", "message", "a delete step can't follow another delete")
+}
+
 // applySteps is step 3: apply each step's patches in turn.
 func (t *tx) applySteps(s *itemState) *Error {
 	var doc any
@@ -1000,6 +1006,9 @@ func (t *tx) applySteps(s *itemState) *Error {
 	for j, step := range s.Steps {
 		ss := &stepState{del: step.Delete, raw: step.Patches, parentID: parentID}
 		if step.Delete {
+			if j > 0 && s.Steps[j-1].Delete {
+				return doubleDelete()
+			}
 			if parentID == nil || tomb {
 				return gone()
 			}

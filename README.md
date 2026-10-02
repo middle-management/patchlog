@@ -1,6 +1,6 @@
 # patchlog
 
-A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.34).
+A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.35).
 Each resource is an append-only log of content-addressed JSON Patch sets. The server
 validates documents that opt in with `$schema`, enforces namespace rules and grants,
 and serves immutable, CDN-cacheable revisions.
@@ -1187,7 +1187,7 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   the caller is an admin, refuses `$access`. Tree powers on the new folder come only from its
   own `$access`; until an admin gives it some, only admins may move or place into it.
 - `POST /grants` for content verbs, `create` (genesis only; `409` for a taken name), `place`,
-  `move` and unplace, with the no-widening rule.
+  `move` and unplace (pinned to the placement's current parents), with the no-widening rule.
 - `POST /read-grants` returns resource-scoped read grants.
 - `POST /merge-grants` checks a catalog branch's merge batch for the approver and signs one grant
   covering exactly that batch with the merge key, for the merge service only (`-merge-key`,
@@ -1413,13 +1413,15 @@ just doesn't apply).
 
 ## Design notes
 
-- **A delete's `doc` (ahead of §6.4.1).** The envelope of a `delete` carries the document
+- **A delete's `doc` (§6.4.1).** The envelope of a `delete` carries the document
   being deleted as `doc`: the resource's last live document as the namespace sees it (read
   through its bases in a branch, or produced by the item's earlier steps in a batch).
   `patches` is `[]` and `writes` is `[]`, as before. Rules can then decide deletes by content,
   e.g. only a document's owner may delete it:
   `{"if":[{"op":"test","path":"/action","value":"delete"}],"then":[{"op":"compare","path":"/doc/owner","eq":{"path":"/principal/id"}}]}`.
   At E3 the server can't see the document, so `doc` stays `null`. `purge` keeps `doc: null`.
+  A batch item with two `"delete"` steps in a row is `422 invalid`. Unplace grants from the
+  catalog service fix `/doc/parents` to the parents checked (§B.11.4).
 - **Heavy work outside the write lock (D.3).** Resource writes and batches run steps 1–6 of
   the gate (§6.2: authorisation and rate limits, idempotent-retry lookup, frozen,
   precondition, apply, limits, schema validation, rules) in a read transaction, without the

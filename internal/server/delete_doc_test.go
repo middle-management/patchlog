@@ -16,7 +16,7 @@ func TestDeleteRuleSeesDoc(t *testing.T) {
 	}
 	f := newAuthFixture(t, map[string]any{"rules": []any{ownerDeletes}})
 	e := f.tenv
-	li := e.grant(f.issuer, "user:li", []string{"sec", "sec-b"}, []string{"read", "create", "append", "delete"})
+	li := e.grant(f.issuer, "user:li", []string{"sec", "sec-b"}, []string{"read", "create", "append", "restore", "delete"})
 
 	a := e.create("sec", "a", map[string]any{"owner": "user:li"}, li)
 	expectCode(t, e.write("DELETE", "sec", "a", a, nil, f.issuerG), 422, "rule")
@@ -41,4 +41,15 @@ func TestDeleteRuleSeesDoc(t *testing.T) {
 		t.Fatalf("batch refusal %s", r.Body)
 	}
 	expect(t, e.batchReq("sec", map[string]any{"items": []any{item("user:li")}}, li), 201)
+
+	// Two deletes in a row in one item: 422 (§7.5).
+	c := e.create("sec", "c", map[string]any{"owner": "user:li"}, li)
+	r = e.batchReq("sec", map[string]any{"items": []any{map[string]any{"resource": "c", "ifMatch": c, "steps": []any{"delete", "delete"}}}}, li)
+	expectCode(t, r, 422, "batch")
+	if !strings.Contains(string(r.Body), `"code":"invalid"`) {
+		t.Fatalf("double delete %s", r.Body)
+	}
+	// A delete, a restore, then a delete again is fine.
+	steps := []any{"delete", addRoot(map[string]any{"owner": "user:li"}), "delete"}
+	expect(t, e.batchReq("sec", map[string]any{"items": []any{map[string]any{"resource": "c", "ifMatch": c, "steps": steps}}}, li), 201)
 }

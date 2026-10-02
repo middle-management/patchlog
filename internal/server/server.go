@@ -1469,21 +1469,34 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 		if err != nil || nl.Status != 200 {
 			return
 		}
-		nsSince = nl.Last
-		for i, e := range nl.Entries {
-			if e["resource"] != name {
-				continue
+		// nsEntries emits this resource's purge and prune entries; true
+		// after a purge, which ends the stream.
+		nsEntries := func(nl *core.Log) bool {
+			nsSince = nl.Last
+			for i, e := range nl.Entries {
+				if e["resource"] != name {
+					continue
+				}
+				switch e["kind"] {
+				case "purge":
+					sseEntry(w, "purge", nl, i)
+					return true
+				case "prune":
+					sseEntry(w, "prune", nl, i)
+				}
 			}
-			switch e["kind"] {
-			case "purge":
-				sseEntry(w, "purge", nl, i)
-				return
-			case "prune":
-				sseEntry(w, "prune", nl, i)
-			}
+			return false
+		}
+		if nsEntries(nl) {
+			return
 		}
 		lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, 0, cred)
 		if err != nil || lg.Status != 200 {
+			// A purge that committed after the namespace read above: send
+			// its event before ending the stream.
+			if nl, err := s.e.NamespaceEvents(r.Context(), ns, nsSince, cred); err == nil && nl.Status == 200 {
+				nsEntries(nl)
+			}
 			return
 		}
 		emit(lg)

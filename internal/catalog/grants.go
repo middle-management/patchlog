@@ -346,16 +346,25 @@ func resourceRule(name string) any {
 // parentsRule fixes /doc/parents to exactly the given folders (any order,
 // any order keys).
 func parentsRule(catalog string, folders []string) any {
-	hrefs := make([]any, len(folders))
-	var all []any
+	hrefs := make([]string, len(folders))
 	for i, f := range folders {
 		hrefs[i] = "/r/" + catalog + "/" + f
+	}
+	return parentHrefsRule(hrefs)
+}
+
+// parentHrefsRule fixes /doc/parents to exactly the given hrefs.
+func parentHrefsRule(list []string) any {
+	hrefs := make([]any, len(list))
+	var all []any
+	for i, h := range list {
+		hrefs[i] = h
 		all = append(all, map[string]any{"contains": map[string]any{
 			"type": "object", "required": []any{"href"},
-			"properties": map[string]any{"href": map[string]any{"const": hrefs[i]}}}})
+			"properties": map[string]any{"href": map[string]any{"const": h}}}})
 	}
 	sch := map[string]any{
-		"type": "array", "minItems": len(folders), "maxItems": len(folders),
+		"type": "array", "minItems": len(list), "maxItems": len(list),
 		"items": map[string]any{"type": "object", "required": []any{"href"},
 			"properties": map[string]any{"href": map[string]any{"enum": hrefs}}},
 	}
@@ -921,7 +930,10 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 		return nil, err
 	}
 	subs := Subjects(v)
-	var cp string
+	var (
+		cp    string
+		hrefs []string
+	)
 	err = nil
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
@@ -931,6 +943,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 			return
 		}
 		for _, p := range n.Parents {
+			hrefs = append(hrefs, p.Href)
 			if pn := g.Node(p.Name); p.Name != "" && pn != nil && pn.Kind == tree.KindFolder && !hasPower(g, p.Name, subs, "move") {
 				err = forbidden("no role of yours with move is assigned on %s", p.Name)
 				return
@@ -940,7 +953,9 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 	if err != nil {
 		return nil, err
 	}
-	return &plan{ns: cat, resource: name, can: []string{"delete"}, rules: []any{resourceRule(name)}, cp: cp, key: key}, nil
+	// §B.11.4: the grant fixes /doc/parents (the document being deleted)
+	// to the parents checked, so the placement can't be moved first.
+	return &plan{ns: cat, resource: name, can: []string{"delete"}, rules: []any{resourceRule(name), parentHrefsRule(hrefs)}, cp: cp, key: key}, nil
 }
 
 // checkLag refuses to issue from a checkpoint older than the catalog's

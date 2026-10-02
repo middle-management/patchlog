@@ -2,8 +2,18 @@
 
 ## Unreleased
 
-- The rule envelope of a `delete` now carries the document being deleted as `doc` (read through in a branch; after the item's earlier steps in a batch), so rules can decide deletes by content, e.g. owner-only deletes. Before, it was `null`. This goes ahead of the spec text (§6.4.1). At E3 `doc` stays `null`, so a delete rule reading `/doc` refuses there.
-  - **Check before upgrading:** a rule that relied on `/doc` being absent for deletes (e.g. `test /doc exists: false` to single out deletes) now behaves differently; test `/action` instead.
+Implements spec **v0.35**: a delete's rule envelope carries the document being deleted.
+
+**Changes to check before upgrading:**
+- The rule envelope of a `delete` now carries the document being deleted as `doc` (before, `null`). A rule that relied on `/doc` being absent for deletes (e.g. `test /doc exists: false` to single out deletes) now behaves differently; test `/action` instead. Rules about a document's shape should exempt `delete`, or documents written under earlier rules can't be deleted.
+- A batch item with two `"delete"` steps in a row is now `422 invalid` (it was `410`).
+
+**Added:**
+- Rules can decide deletes by content, e.g. only a document's owner may delete it (§6.4.1, §6.4.4). `doc` is read through the bases in a branch, and in a batch it is the document after the item's earlier steps. At E3 `doc` stays `null`, so a delete rule reading `/doc` refuses there. `purge`, `purge-ns` and `read` keep `doc: null`.
+- Unplace grants from the catalog service fix `/doc/parents` to the placement's current parents, so it can't be moved before it is deleted (§B.11.4).
+
+**Fixed:**
+- A resource's event stream could end without its `purge` event when the purge committed between the stream's two reads (seen on Postgres).
 
 ## v0.5.0
 

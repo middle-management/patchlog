@@ -259,13 +259,13 @@ func TestAuthConfigAndRules(t *testing.T) {
 	ownership := map[string]any{
 		"if": []any{
 			map[string]any{"not": map[string]any{"op": "test", "path": "/principal/roles", "schema": map[string]any{"contains": map[string]any{"const": "editor"}}}},
-			map[string]any{"op": "test", "path": "/action", "schema": map[string]any{"enum": []any{"create", "append", "restore"}}},
+			map[string]any{"op": "test", "path": "/action", "schema": map[string]any{"enum": []any{"create", "append", "restore", "delete"}}},
 		},
 		"then": []any{
 			map[string]any{"op": "compare", "path": "/doc/owner", "eq": map[string]any{"path": "/principal/id"}},
 			map[string]any{"op": "compare", "path": "/doc/region", "in": map[string]any{"path": "/principal/attrs/regions"}},
 			map[string]any{
-				"if": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/action", "value": "create"}}},
+				"if": []any{map[string]any{"op": "test", "path": "/action", "schema": map[string]any{"enum": []any{"append", "restore"}}}},
 				"then": []any{
 					map[string]any{"not": map[string]any{"op": "writes", "overlaps": "/owner"}},
 					map[string]any{"not": map[string]any{"op": "writes", "overlaps": "/lockAt"}},
@@ -331,10 +331,18 @@ func TestAuthConfigAndRules(t *testing.T) {
 	li = e.grant(f.issuer, "user:li", []string{"sec"}, []string{"read", "create", "append", "delete"}, map[string]any{"attrs": map[string]any{"regions": []any{"se"}}})
 	expectCode(t, e.write("PATCH", "sec", "m", m, ops(op("replace", "/v", 9.0)), li), 422, "rule")
 
-	// Only the ops group may delete.
+	// Only the ops group may delete, and (§6.4.4, v0.35) without editor
+	// only its own documents in its regions, before lockAt: the delete's
+	// /doc is the document being deleted.
 	expectCode(t, e.write("DELETE", "sec", "m", m, nil, li), 422, "rule")
 	opsG := e.grant(f.issuer, "user:o", []string{"sec"}, []string{"delete"}, map[string]any{"groups": []any{"ops"}})
-	e.del("sec", "m", m, opsG)
+	expectCode(t, e.write("DELETE", "sec", "m", m, nil, opsG), 422, "rule")
+	liOps := e.grant(f.issuer, "user:li", []string{"sec"}, []string{"delete"}, map[string]any{"groups": []any{"ops"}, "attrs": map[string]any{"regions": []any{"se"}}})
+	expectCode(t, e.write("DELETE", "sec", "m", m, nil, liOps), 422, "rule") // after lockAt
+	n := e.create("sec", "n", map[string]any{"owner": "user:li", "region": "se"}, li)
+	e.del("sec", "n", n, liOps)
+	opsEd := e.grant(f.issuer, "user:o", []string{"sec"}, []string{"delete"}, map[string]any{"groups": []any{"ops"}, "roles": []any{"editor"}})
+	e.del("sec", "m", m, opsEd)
 }
 
 // §7.6 / §C.4: branches with auth — unrestricted read, * keys kept, keys follow the base.

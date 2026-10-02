@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.34 · 2026-10-02. See the change log at the end.
+Status: draft v0.35 · 2026-10-02. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -324,7 +324,7 @@ a frozen namespace: `409` (§8.4)
   -
 the precondition itself: `428` or `412`
 
-- **Apply** the patches to the parent's document, with operation validation. `test` ops are evaluated, and a failing `test` is `422`.
+- **Apply** the patches to the parent's document, with operation validation. A delete skips steps 3–5: it has no patches, and what it removes isn't validated. `test` ops are evaluated, and a failing `test` is `422`.
 
 - **Limits** (§6.6) and **blob references** (§7.8): every reference in the resulting document is well-formed and names a blob available to the resource, `422` otherwise.
 
@@ -336,7 +336,7 @@ the precondition itself: `428` or `412`
 
 For a batch (§7.5), each step runs for **every item** before the next step starts, so nothing about any item's precondition is revealed until every item is authorised. Step 7 inserts all items in one atomic operation.
 
-**End-to-end namespaces (§E.3).** For `create`, `append` and `restore` in an `e2e` namespace, step 3 accepts a patch set of one reserved `sealed` op, or `[]` for a restore, and doesn't apply it. Step 4 checks the blobs the op declares (§E.3.1). Step 5 is skipped. The server can't see the resulting document or which paths change, so any namespace, grant, key or role rule that evaluates a `writes` predicate or a `/doc` path fails as a whole for these writes (`422` or `403`), wherever it appears in the rule. E3 namespaces therefore can't carry path or document rules for resource writes (§E.3.2). Config, branch, prune and delete writes are checked as usual.
+**End-to-end namespaces (§E.3).** For `create`, `append` and `restore` in an `e2e` namespace, step 3 accepts a patch set of one reserved `sealed` op, or `[]` for a restore, and doesn't apply it. Step 4 checks the blobs the op declares (§E.3.1). Step 5 is skipped. The server can't see the resulting document or which paths change, so any namespace, grant, key or role rule that evaluates a `writes` predicate or a `/doc` path fails as a whole for these writes (`422` or `403`), wherever it appears in the rule. E3 namespaces therefore can't carry path or document rules for resource writes (§E.3.2). Config, branch and prune writes are checked as usual. A delete is too, except that its `doc` is null, so a rule that evaluates a `/doc` path fails as a whole for it.
 
 ### 6.3 Changing type
 
@@ -346,7 +346,7 @@ For a batch (§7.5), each step runs for **every item** before the next step star
 
 - **Removing** `$schema` makes the document untyped from that revision on. Namespaces can forbid this with a rule (§6.4.4).
 
-- Tombstones carry no document state and are not validated.
+- Tombstones carry no document state and are not validated. Neither is the document a delete removes, which rules see as `/doc` (§6.4.1).
 
 ### 6.4 Namespace rules
 
@@ -364,7 +364,7 @@ For every write, the server builds:
                  "via": [ … ], "grant": "1…" },  // absent when auth is disabled
   "now":       "2026-10-04T18:02:11.482Z",     // server time at the gate
   "writes":    [ "/title", "/blocks/3" ],      // normative, see below
-  "doc":       { … },                          // the resulting document; null for delete, purge, read, purge-ns; { remote, at } for export; { horizon, keep } for prune
+  "doc":       { … },                          // the resulting document; for delete, the document deleted; null for purge, read, purge-ns; { remote, at } for export; { horizon, keep } for prune
   "patches":   [ … ]                           // canonical patch set; [] when there is none
 }
 ```
@@ -380,6 +380,8 @@ For every write, the server builds:
 
   - A root operation writes `""`. A genesis `add ""` writes `""`.
 
+  - A delete has no patches, so its `writes` and `patches` are `[]`. `within` is true when there are no writes, so it doesn't restrict deleting: limit deletes by verb, e.g. narrowing blocks that drop `delete` (§C.6), or by rules on `/doc`.
+
   - An array append `…/-` is recorded with the resulting index.
 
   - In resource envelopes only, an `add` or `replace` at exactly `/$nonce` whose value is 26 base32 characters (`^[a-z2-7]{26}$`, a fresh nonce, §C.7) is left out, so the nonce never affects path policy or merge conflicts. Any other operation at or below `/$nonce` (a `remove`, a `move` or `copy` to or from it, a deeper path, another value) is a write as usual.
@@ -387,7 +389,7 @@ For every write, the server builds:
 Pointers are compared **segment by segment after RFC 6901 unescaping**, never as strings.
 
 -
-**`doc`** is the document as it will be stored if the write succeeds. For `config` it is the resulting namespace document. For `branch` it is the new branch's namespace document, and the envelope is evaluated in the **base** namespace (§7.6).
+**`doc`** is the document as it will be stored if the write succeeds. For a delete it is the document being deleted: the resource's last live document as the target namespace sees it, read through its bases in a branch (§7.6), or, in a batch, the document after the item's earlier steps. For `purge`, `purge-ns` and `read` it is null. In an end-to-end namespace the server can't see documents, so `doc` is null for every resource action there, and a rule that reads `/doc` fails the write (§6.2). Rules can then decide deletes by content, e.g. "only the owner may delete". A replay of a delete (§F.3, §G.4.4) is judged against the document the target has at that step. For `config` it is the resulting namespace document. For `branch` it is the new branch's namespace document, and the envelope is evaluated in the **base** namespace (§7.6).
 
 -
 **Batches** produce one envelope per patch set, with the ordinary actions. There is no `batch` action: a batch can do nothing that its items couldn't do one by one.
@@ -402,7 +404,10 @@ Pointers are compared **segment by segment after RFC 6901 unescaping**, never as
 **`read`** envelopes are used only to evaluate grant and role rules on reads (§C.2, item 5). They carry `action`, `resource`, `principal` and `now`, and no `writes`, `doc` or `patches`.
 
 -
-There is deliberately no previous state in the envelope. Rules judge the resulting document and the change itself.
+There is deliberately no previous state in the envelope. Rules judge the resulting document and the change itself. A delete is no exception: what it changes is the document it removes, which is the state the writer saw just before. `purge`, `purge-ns` and `read` keep `doc: null`: purge is administrative and must work on anything, and read rules stay free of content (§C.5.1).
+
+-
+**What rule failures reveal.** A rule that tests `/doc` and fails tells the writer something about that document, for a delete as for an append. A writer who may delete but not read learns only what such a rule tests; namespaces that care keep `delete` with `read`.
 
 #### 6.4.2 Rule forms
 
@@ -442,7 +447,7 @@ There is deliberately no previous state in the envelope. Rules judge the resulti
 
 - **Config writes are rule-checked too.** Namespace rules also apply to `config` writes, except for principals whose grant chains to a key with `can: ["*"]`, so that a bad rule set cannot lock everyone out.
 
-- **Rules see every action,** including `delete`, `purge`, `config`, `branch` (evaluated in the base) and `purge-ns`, where `doc` is null or a namespace document. Rules about documents should therefore be scoped with `if` on `/action`, as in §6.4.4.
+- **Rules see every action,** including `delete`, `purge`, `config`, `branch` (evaluated in the base) and `purge-ns`, where `doc` is the deleted document, null or a namespace document. Rules about documents should therefore be scoped with `if` on `/action`, as in §6.4.4. Rules about a document's shape, in particular, should exempt `delete`: otherwise a document written under earlier rules can't be deleted.
 
 #### 6.4.4 Examples
 
@@ -477,19 +482,19 @@ In order, these say:
 
 ```
 { "if":   [{ "not": { "op": "test", "path": "/principal/roles", "schema": { "contains": { "const": "editor" } } } },
-           { "op": "test", "path": "/action", "schema": { "enum": ["create", "append", "restore"] } }],
+           { "op": "test", "path": "/action", "schema": { "enum": ["create", "append", "restore", "delete"] } }],
   "then": [{ "op": "compare", "path": "/doc/owner",  "eq": { "path": "/principal/id" } },
            { "op": "compare", "path": "/doc/region", "in": { "path": "/principal/attrs/regions" } },
-           { "if":   [{ "not": { "op": "test", "path": "/action", "value": "create" } }],
+           { "if":   [{ "op": "test", "path": "/action", "schema": { "enum": ["append", "restore"] } }],
              "then": [{ "not": { "op": "writes", "overlaps": "/owner" } },
                       { "not": { "op": "writes", "overlaps": "/lockAt" } }] },
            { "if":   [{ "op": "test", "path": "/doc/lockAt", "exists": true }],
              "then": [{ "op": "compare", "path": "/now", "lt": { "path": "/doc/lockAt" } }] }] }
 ```
 
-Without the `editor` role, a principal may only create, edit or restore documents it owns, in one of its regions. After creating a document, it can never reassign ownership or touch the lock, and cannot edit after `lockAt`. (Every create writes `""`, which overlaps everything, hence the `create` exception.)
+Without the `editor` role, a principal may only create, edit, restore or delete documents it owns, in one of its regions. After creating a document, it can never reassign ownership or touch the lock, and cannot edit or delete after `lockAt`. (Every create writes `""`, which overlaps everything, hence the overlap rules apply only to appends and restores. For a delete, `/doc` is the document being deleted.)
 
-**The pattern for fields that policy depends on.** The envelope has no previous state, so such a field is protected by forbidding writes to it (`writes overlaps`), not by comparing old and new values. `overlaps` also catches root replaces and `move`, so "can't change `/owner`" plus "`/doc/owner` is me" means "it was already mine". Every create writes `""`, which overlaps every path, so such rules must exempt `create` and test the created document instead, as the rule above does; otherwise they forbid creating anything. A restore with a root replace also writes `""`. Exempt it only where a test of the resulting document is enough on its own, such as "no `$access`" (§B.11.3). For ownership fields, keep restores under the overlap rule, as the example does, so that only editors can recreate a deleted document from scratch; otherwise a non-owner could restore someone else's document with itself as owner.
+**The pattern for fields that policy depends on.** The envelope has no previous state, so such a field is protected by forbidding writes to it (`writes overlaps`), not by comparing old and new values. `overlaps` also catches root replaces and `move`, so "can't change `/owner`" plus "`/doc/owner` is me" means "it was already mine". Every create writes `""`, which overlaps every path, so such rules must exempt `create` and test the created document instead, as the rule above does; otherwise they forbid creating anything. A delete writes nothing, so overlap rules never stop it; decide deletes by testing `/doc`, the document being deleted, as the rule above does. A restore with a root replace also writes `""`. Exempt it only where a test of the resulting document is enough on its own, such as "no `$access`" (§B.11.3). For ownership fields, keep restores under the overlap rule, as the example does, so that only editors can recreate a deleted document from scratch; otherwise a non-owner could restore someone else's document with itself as owner.
 
 ### 6.5 Reserved keys and extension keywords
 
@@ -755,7 +760,7 @@ Content-Type: application/json
 
   - a patch set appends a revision, or restores if the previous entry is a tombstone
 
-  - `"delete"` appends a tombstone
+  - `"delete"` appends a tombstone. One that follows another `"delete"`, with no patch set between them, is `422`, as a `DELETE` of a tombstoned resource is `410` (§7.2).
 
 Resource purge is never part of a batch.
 
@@ -1636,11 +1641,12 @@ This is deliberately strict. Excluding just one edge would make the result depen
   "rules": [
     { "op": "test", "path": "/resource", "schema": { "pattern": "^([a-z0-9][a-z0-9_-]*|(matches|docs)\\.[a-z0-9][a-z0-9._-]*)$" } },
 
-    { "op": "test", "path": "/doc/parents", "schema": { "type": "array", "maxItems": 1, "items": {
+    { "if":   [{ "op": "test", "path": "/action", "schema": { "enum": ["create", "append", "restore"] } }],
+      "then": [{ "op": "test", "path": "/doc/parents", "schema": { "type": "array", "maxItems": 1, "items": {
         "type": "object", "required": ["href"], "additionalProperties": false,
         "properties": {
           "href":  { "type": "string", "pattern": "^/r/cat-season/[a-z0-9][a-z0-9_-]{0,127}$" },
-          "order": { "type": "string", "pattern": "^[0-9A-Za-z]{1,64}$" } } } } },
+          "order": { "type": "string", "pattern": "^[0-9A-Za-z]{1,64}$" } } } } }] },
 
     { "if":   [{ "op": "test", "path": "/action", "value": "create" }],
       "then": [{ "op": "test", "path": "/doc/parents", "schema": { "minItems": 1 } }] }
@@ -1840,7 +1846,7 @@ The catalog decides **who has which role where**. Each content namespace decides
 
   - It may never assert admin groups.
 
-- **Only `catalog-admins` change access settings**, including via root replaces or `move` from `/$access`, because the rules use `writes overlaps`. A create, and a restore with a root replace, write the whole document (`""`), which overlaps every path, so creates and restores are judged by the document they produce instead: a folder or placement may be created or restored with `$access` only by an admin.
+- **Only `catalog-admins` change access settings**, including via root replaces or `move` from `/$access`, because the rules use `writes overlaps`. A create, and a restore with a root replace, write the whole document (`""`), which overlaps every path, so creates and restores are judged by the document they produce instead: a folder or placement may be created or restored with `$access` only by an admin. Deletes write nothing and pass these rules: deleting a node only narrows access (§B.11.2). A later restore is judged by the document it produces, like a create.
 
 - **Content owners decide who may bring their content into a catalog.** `catalogs.{catalog}.place` in the *content* namespace lists the groups allowed to create a first placement of its items in that catalog. It is part of the content namespace's own configuration and history.
 
@@ -1885,7 +1891,7 @@ Placing is a deliberate act of publishing into a folder's audience, so these two
   - **no widening:** for every subject, the effective roles for the moved node's subtree after the move must be a subset of what they were before, unless the caller is in `catalog-admins`. Roles are compared by name, but a content namespace may declare that one role includes others: `"desk": { "can": [ … ], "includes": ["reader"] }`. A role counts as present before the move if it, or a role that includes it, was present. So moving an item from where a subject has `desk` to where it has `reader` narrows access. `includes` is transitive, is read from the item's own content namespace, and is trusted as declared: changing `/roles` needs a `*` key there (§C.1.1).
 
 -
-**Unplace** (`want: ["delete"]` on a placement) requires a role with `move` on every current parent.
+**Unplace** (`want: ["delete"]` on a placement) requires a role with `move` on every current parent. The grant fixes `/doc/parents` to exactly those parents, so the placement can't be moved before it is deleted.
 
 -
 **Create a folder** (`{ "node": …, "want": ["create"], "to": [folders] }`) requires a role with `move` on every folder in `to`. Items in it get their parents' roles through the walk-up (§B.11.2), but tree powers on it come only from its own `$access`, which needs `catalog-admins`, as any `$access` does. Until an admin gives it some, only admins can move or place anything into it.
@@ -1954,6 +1960,8 @@ CREATE INDEX effective_by_subject ON effective (subject, item);
 - Should listing titles come from the folder, from the item via an `x-tree-label` schema annotation, or both?
 
 - Should manifests be signed for publishing workflows?
+
+- A placement deleted and placed again with a root replace loses its own `$access`, such as an embargo with `inherit: false`. Should re-placing keep the last `$access` unless an admin drops it?
 
 - Should a content namespace be able to *require* that every item is placed in some catalog, e.g. through a catalog-consumer that reports unplaced items?
 
@@ -3595,7 +3603,7 @@ Each document is exported in one of two modes:
 
 - **Partial failure.** A failure part-way can leave dependencies updated. New resources are unused, but updated heads take effect, and live references see them. So promotions that change existing dependencies should be dry-run end to end first.
 
-- **Today's rules judge old history.** A full-history import replays every step through the target's **current** gate (§6.2), as the importer, at the current `now`. Rules on `/principal`, `/now` or `writes` may reject history that was valid at the source. Such imports need an importer whose roles satisfy those rules, or snapshot mode.
+- **Today's rules judge old history.** A full-history import replays every step through the target's **current** gate (§6.2), as the importer, at the current `now`. Rules on `/principal`, `/now`, `writes` or, for replayed deletes, `/doc` may reject history that was valid at the source. Such imports need an importer whose roles satisfy those rules, or snapshot mode.
 
 Tooling is non-normative. For example:
 
@@ -3873,3 +3881,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Releases (§F.9) and catalogs:** approval binds to a plan digest; catalog merge grants are bounded per resource and action, signed by a dedicated key only for the merge service, which submits them itself (§F.3, §F.8); `$access` changes are submitted by a catalog admin; folders have a creation rule (§B.11.4); `abandoned` is a claim the janitor verifies (§F.6); previews hide unreadable branches; split nodes, `merged.at`, the release lock and the release's optional `at` are defined.
 
 - **D.8:** resource writes and blob uploads lock their namespace shared and state changes exclusively, a separate advisory log lock, taken last, orders the namespace entries, and same-resource races are decided by constraints at insert.
+
+- **v0.35:** a delete's envelope carries the document being deleted as `doc`, so rules can decide deletes by content, e.g. "only the owner may delete" (§6.4.1). `patches` and `writes` stay `[]`, so `within` doesn't restrict deletes: limit them by verb or by rules on `/doc`. `purge`, `purge-ns` and `read` keep `doc: null`, and in end-to-end namespaces `doc` is null for every resource action. The ownership example (§6.4.4) now covers deletes. Also fixed: the catalog's shape rule (§B.6) failed every delete, so placements couldn't be removed; unplace grants now pin `/doc/parents`; two deletes in a row in a batch item are `422`.

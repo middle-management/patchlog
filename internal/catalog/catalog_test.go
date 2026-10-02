@@ -580,6 +580,20 @@ func TestPlaceMoveUnplace(t *testing.T) {
 	if _, err := w.core(g).Delete(ctx, "cat", "matches.derby", must(w.ops.Head(ctx, "cat", "matches.derby")).ID); !isStatus(err, 403) {
 		t.Errorf("unplace grant deleting another node: %v", err)
 	}
+	// The grant pins /doc/parents: moved meanwhile, the placement can't be
+	// deleted with it.
+	_, od, err := w.ops.Load(ctx, "cat", "matches.newone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	orig := od.Value.(map[string]any)
+	w.patch("cat", "matches.newone", map[string]any{"op": "add", "path": "/parents/-", "value": map[string]any{"href": "/r/cat/rumours"}})
+	h = must(w.ops.Head(ctx, "cat", "matches.newone"))
+	if _, err := w.core(g).Delete(ctx, "cat", "matches.newone", h.ID); !isStatus(err, 403) {
+		t.Errorf("unplace grant after a move: %v", err)
+	}
+	w.patch("cat", "matches.newone", map[string]any{"op": "replace", "path": "/parents", "value": orig["parents"]})
+	h = must(w.ops.Head(ctx, "cat", "matches.newone"))
 	must(w.core(g).Delete(ctx, "cat", "matches.newone", h.ID))
 	w.caughtUp()
 	w.issue(bob, map[string]any{"item": "/r/matches/newone", "want": toAny("read")}, 403)

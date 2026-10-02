@@ -136,9 +136,12 @@ func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 		parentID = &p
 		tomb = s.parent.kind == kindTombstone
 	}
-	for _, step := range s.Steps {
+	for j, step := range s.Steps {
 		ss := &stepState{del: step.Delete, raw: step.Patches, parentID: parentID}
 		if step.Delete {
+			if j > 0 && s.Steps[j-1].Delete {
+				return doubleDelete()
+			}
 			if parentID == nil || tomb {
 				return gone()
 			}
