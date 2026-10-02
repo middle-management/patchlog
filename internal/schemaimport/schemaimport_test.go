@@ -195,12 +195,12 @@ func TestPlanFixtures(t *testing.T) {
 	}
 	// Draft-07: definitions, items arrays, additionalItems, dependencies, $id anchors.
 	d7 := byName(t, res, "d7").Content
-	want7 := `{"$defs":{"name":{"minLength":1,"type":"string"},"pos":{"items":false,"prefixItems":[{"type":"number"},{"type":"number"}],"type":"array"}},"$schema":"https://json-schema.org/draft/2020-12/schema","dependentRequired":{"a":["b"]},"dependentSchemas":{"c":{"required":["d"]}}}`
+	want7 := `{"$defs":{"name":{"minLength":1,"type":"string"},"pos":{"items":false,"prefixItems":[{"type":"number"},{"type":"number"}],"type":"array"}},"$schema":"https://json-schema.org/draft/2020-12/schema","dependentRequired":{"a":["b"]},"dependentSchemas":{"c":{"required":["d"]}},"x-source":"` + fs.URL + `/legacy/d7.json"}`
 	if got := string(jsonv.Canonical(d7)); got != want7 {
 		t.Errorf("d7:\n got %s\nwant %s", got, want7)
 	}
 	d4 := byName(t, res, "d4").Content
-	want4 := `{"$defs":{"pct":{"exclusiveMaximum":100,"minimum":0,"type":"number"}},"$schema":"https://json-schema.org/draft/2020-12/schema"}`
+	want4 := `{"$defs":{"pct":{"exclusiveMaximum":100,"minimum":0,"type":"number"}},"$schema":"https://json-schema.org/draft/2020-12/schema","x-source":"` + fs.URL + `/legacy/d4.json"}`
 	if got := string(jsonv.Canonical(d4)); got != want4 {
 		t.Errorf("d4:\n got %s\nwant %s", got, want4)
 	}

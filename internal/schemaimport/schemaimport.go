@@ -63,6 +63,10 @@ type Options struct {
 	// NoDisk refuses local files that aren't in Files (a server must not
 	// read its own disk for a caller).
 	NoDisk bool
+	// NoDeclareSchema leaves closed schemas as they are. By default a
+	// schema that is closed at the instance root gets a "$schema" property
+	// so that it can type documents (§6.1).
+	NoDeclareSchema bool
 }
 
 // Actions of a Resource.
@@ -163,6 +167,7 @@ type planner struct {
 	fetchErr  map[string]error
 	warnings  map[string]*warning
 	warnOrder []string
+	notes     []string // conversion lines that aren't per-location warnings
 }
 
 type warning struct {
@@ -214,6 +219,7 @@ func Plan(ctx context.Context, c *client.Client, sources []string, opt Options) 
 	if err := compile(res); err != nil {
 		return nil, err
 	}
+	res.Warnings = append(res.Warnings, p.notes...)
 	for _, k := range p.warnOrder {
 		w := p.warnings[k]
 		msg := k + " (at " + w.first
@@ -624,35 +630,29 @@ func (p *planner) build(ctx context.Context, c *client.Client, bundles []*bundle
 			m.prefix = pointer.Pointer{"$defs", k}
 		}
 	}
-	for _, b := range bundles {
-		var content any
-		for i, m := range b.members {
-			cv := &converter{where: m.key, warn: p.warn, rewrite: p.rewriter(m, res.NS)}
-			out, err := cv.schema(m.raw, pointer.Pointer{}, draftUnknown)
+	var patch map[string][]pointer.Pointer
+	if !p.opt.NoDeclareSchema {
+		// Dry run: convert with stub references (a dependency's revision id
+		// isn't known before its content is final) and find what to patch.
+		docs := map[string]any{}
+		for _, b := range bundles {
+			content, err := p.convertBundle(b, func(d *doc) refRewriter { return p.rewriterFor(d, res.NS, true) }, func(string, string) {})
 			if err != nil {
 				return err
 			}
-			if i == 0 {
-				if bv, ok := out.(bool); ok && len(b.members) > 1 {
-					out = map[string]any{}
-					if !bv {
-						out = map[string]any{"not": map[string]any{}}
-					}
-				}
-				if obj, ok := out.(map[string]any); ok {
-					obj["$schema"] = schema.Dialect2020
-				}
-				content = out
-				continue
-			}
-			obj := content.(map[string]any)
-			defs, _ := obj["$defs"].(map[string]any)
-			if defs == nil {
-				defs = map[string]any{}
-				obj["$defs"] = defs
-			}
-			defs[m.prefix[1]] = out
+			docs[b.res.Name] = content
 		}
+		var refused map[string]string
+		var shared []nodeRef
+		patch, refused, shared = declareSchema(docs)
+		p.noteDeclaration(patch, refused, shared)
+	}
+	for _, b := range bundles {
+		content, err := p.convertBundle(b, func(d *doc) refRewriter { return p.rewriterFor(d, res.NS, false) }, p.warn)
+		if err != nil {
+			return err
+		}
+		applyDeclaration(content, patch[b.res.Name])
 		r := b.res
 		r.Content = content
 		if err := plan(ctx, c, res.NS, r); err != nil {
@@ -682,9 +682,85 @@ func (p *planner) build(ctx context.Context, c *client.Client, bundles []*bundle
 	return nil
 }
 
+// convertBundle converts the members of a bundle and merges them into one
+// document: the primary at the root, the others under $defs. Each document
+// keeps where it came from in x-source (and its own identifier in
+// x-source-id, when that differs), as $id itself can't be kept (§6.1).
+func (p *planner) convertBundle(b *bundle, rw func(*doc) refRewriter, warn func(kind, detail string)) (any, error) {
+	var content any
+	for i, m := range b.members {
+		cv := &converter{where: m.key, warn: warn, rewrite: rw(m)}
+		out, err := cv.schema(m.raw, pointer.Pointer{}, draftUnknown)
+		if err != nil {
+			return nil, err
+		}
+		if i == 0 {
+			if bv, ok := out.(bool); ok && len(b.members) > 1 {
+				out = map[string]any{}
+				if !bv {
+					out = map[string]any{"not": map[string]any{}}
+				}
+			}
+		}
+		if obj, ok := out.(map[string]any); ok {
+			if _, taken := obj["x-source"]; !taken {
+				obj["x-source"] = strings.TrimPrefix(m.key, "file:///upload/")
+				if id := sourceID(m); id != "" {
+					obj["x-source-id"] = id
+				}
+			}
+			if i == 0 {
+				obj["$schema"] = schema.Dialect2020
+			}
+		}
+		if i == 0 {
+			content = out
+			continue
+		}
+		obj := content.(map[string]any)
+		defs, _ := obj["$defs"].(map[string]any)
+		if defs == nil {
+			defs = map[string]any{}
+			obj["$defs"] = defs
+		}
+		defs[m.prefix[1]] = out
+	}
+	return content, nil
+}
+
+// sourceID returns the identifier a document declared for itself ($id, or
+// id in draft 3 and 4) when it isn't the URL it was fetched from.
+func sourceID(m *doc) string {
+	obj, ok := m.raw.(map[string]any)
+	if !ok {
+		return ""
+	}
+	k := "$id"
+	if d := draftAt(obj, draftUnknown); d == draft3 || d == draft4 {
+		k = "id"
+	}
+	s, _ := obj[k].(string)
+	if s == "" {
+		return ""
+	}
+	u, err := m.url.Parse(s)
+	if err != nil {
+		return s
+	}
+	u.Fragment, u.RawFragment = "", ""
+	if u.String() == "" || u.String() == m.url.String() || u.String() == m.key {
+		return ""
+	}
+	return s
+}
+
 // rewriter rewrites the $refs of document d: into its own bundle as a
 // same-document fragment, into another as that bundle's revision path.
-func (p *planner) rewriter(d *doc, ns string) refRewriter {
+func (p *planner) rewriter(d *doc, ns string) refRewriter { return p.rewriterFor(d, ns, false) }
+
+// rewriterFor is rewriter, or with stub set, one that refers to other
+// bundles as "@name#fragment" so that no revision id is needed.
+func (p *planner) rewriterFor(d *doc, ns string, stub bool) refRewriter {
 	return func(at pointer.Pointer) (string, string, error) {
 		t, ok := d.targets[at.String()]
 		if !ok {
@@ -700,6 +776,9 @@ func (p *planner) rewriter(d *doc, ns string) refRewriter {
 		np := append(append(pointer.Pointer{}, t.d.prefix...), tp...)
 		if t.d.b == d.b {
 			return "#" + fragment(np), "", nil
+		}
+		if stub {
+			return stubPrefix + t.d.b.res.Name + "#" + fragment(np), "", nil
 		}
 		if t.d.b.res.ID == "" {
 			return "", "", fmt.Errorf("internal error: %s referenced before it is planned", t.d.key)

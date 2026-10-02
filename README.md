@@ -1216,6 +1216,23 @@ The last row is the root: paste its path into a document's `$schema` (or another
   `exclusiveMaximum`/`exclusiveMinimum` → numbers; `$id` and `$anchor` are dropped, since every
   reference is resolved; unknown keywords (schemastore's `markdownDescription`, `tsType`, …)
   become `x-*` annotations, which don't change validation. Each kind of change is reported.
+- **Closed schemas can type documents.** A document's top-level `$schema` is validated against
+  the schema it names (§6.1), so a schema closed at the root (`additionalProperties: false` or
+  `unevaluatedProperties: false`) would reject every document that uses it. For each imported
+  resource (any can be a `$schema`) the subschemas that apply at the instance root are found:
+  the root and what it reaches through `$ref`, `allOf` and, conservatively, every branch of
+  `anyOf`/`oneOf`/`if`/`then`/`else`/`dependentSchemas`. Each of them that is closed and doesn't
+  already cover `$schema` (in `properties`, or a matching `patternProperties`) gets
+  `"$schema": {"type": "string"}` in its `properties`, and the count is reported. Side effect: a
+  patched subschema that is also used below the root (a shared `$defs` entry) permits a `$schema`
+  key there too; that is reported. A closed schema with `maxProperties`, or a `propertyNames`
+  that rejects `$schema`, is left alone and warned about, since no document can then use it.
+  Only literal `false` is recognised as closed. `-no-declare-schema` skips all this.
+- **The source is kept.** `$id` can't be (§6.1), so each imported resource's root gets
+  `"x-source"` (the URL it was fetched from, or the upload's name) and, when the document
+  declared another `$id` (draft-04 `id`), `"x-source-id"`; so does each document bundled under
+  `$defs` for a cycle. This changes content and so revision ids: re-importing something imported
+  with v0.4.0 appends new revisions.
 - **References.** Every `$ref` becomes either a same-document pointer (`#/$defs/…`) or the
   revision path of its target plus a JSON Pointer. Plain-name fragments (`#foo`: `$anchor`,
   `$dynamicAnchor`, draft-07 `"$id": "#foo"`) are resolved to pointers, since §6.1 resolves none
