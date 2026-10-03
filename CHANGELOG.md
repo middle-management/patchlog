@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.36** and **v0.37**.
+
+**Changes to check before upgrading:**
+- **Namespace documents are strict (§7.4).** Only the members the spec defines are accepted (`read`, `keys`, `roles`, `revoked`, `rules`, `limits`, `allowances`, `retention`, `encryption`, `maxLag`, `base`, `frozen`, `successor`, `drafts`, `catalog`, `catalogs`, `merge`, `merged`, `cleanup`, `abandoned`); any other member must start with `x-` (`422` otherwise). Documents stored by earlier versions are served as they are, and a write that leaves such a member unchanged keeps it; rename with `{"op":"move","from":"/title","path":"/x-title"}`. A new branch can't inherit an undefined member. Addendum members are now checked in their shapes, `revoked` entries must be revocation ids, and key entries refuse `x-` fields.
+- **Log ranges are paged (§7.1).** `…/rev/{id}/log?since=` answers at most the log page size (default 1,000, `serve -log-page-size`) with `X-Log-Next` when the range goes on. Every bundled client follows pages; other clients must too, and treat a page that stops short without `X-Log-Next` as an error.
+- **Namespace log entries carry `grant: {id, sub, kid}`** instead of `kid` (§7.4). Existing databases are migrated: head, tombstone and batch entries get the grant their revisions recorded; older config, branch, purge, purge-ns and prune entries serve none. The merger and janitor match `merge.authors` against the recorded grant: an `abandoned` flag set before the upgrade must be set again, and in dev mode tools must be told so (`client.WithAuthDisabled`, implied by `-author`).
+- A retry of a write to a purged resource is `410` (was `200` from the retry lookup, or `409`/`412`).
+- `schema import` no longer adds `$schema` to closed schemas, since validation ignores it now (below); `-declare-schema` restores that for servers before this release.
+- `tree -release` serves one catalog.
+- Catalog listings follow §B.11.5's visibility exactly: folders are visible only through roles without rules, and `problems`, `orphans`, `manifest` and unfiltered `g/all` listings need namespace-wide `read`.
+
+**Added:**
+- Validation leaves out a document's top-level `$schema` and a top-level `$nonce` of the fresh-nonce form (§6.2 step 5), so closed schemas type documents as they are; reference walks, annotations, the e2e client and the playground validate the same instance.
+- Restore a deleted item through the catalog (`want: ["restore"]`), decided by the roles frozen when it was deleted (§B.11.4).
+- Release previews follow the release document live (§B.5); the playground relists with `?min` after its own writes.
+- `GET /` answers `{ "spec": "0.37", "origin" }`; remote-branch creation refuses a base of a later version whose documents hold members this version doesn't know.
+- `PATCH /ns` answers with `X-Namespace-Revision` and a body `{ config, ns_id }`.
+- Blobs can be uploaded to a deleted resource before the restore that references them.
+- `/heads` is in byte order of name on both backends.
+- `serve`, `index` and `tree` speak HTTP/2 without TLS (h2c) as well as HTTP/1.1 (§7.7). CORS exposes `X-Log-Next`; with `*`, every response carries the allowance.
+- **Postgres group commit per namespace** (D.8): under contention, checked writes of one namespace are committed together in one transaction (`-group-commit`, default 32; `-group-commit-wait`). Throughput in one namespace keeps rising with load instead of falling. `-group-commit 1` keeps the old behaviour.
+
+**Fixed:**
+- Event streams catch up a page per fetch instead of reading the whole history at once.
+
 ## v0.6.0
 
 Implements spec **v0.35**: a delete's rule envelope carries the document being deleted.
