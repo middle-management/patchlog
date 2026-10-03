@@ -15,7 +15,8 @@ import (
 //
 //	checkpoints(origin, ns, ns_id)   follow.SQLCheckpoints: the catalog and each trusted namespace
 //	seen(ns, ns_id)                  every ns_id applied, for ?min= (§A.5)
-//	meta(k, v)                       "config": the catalog namespace document; "purged:{ns}"
+//	meta(k, v)                       "config": the catalog namespace document; "config:{ns}": a
+//	                                 content namespace's document as of its checkpoint; "purged:{ns}"
 //	nodes(href, name, kind, item, item_head, title, state, …)
 //	                                 one row per node (explicit, or implicit from $parents);
 //	                                 raw parents/$access kept to rebuild the graph on start
@@ -143,6 +144,24 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		m, _ := parseJSON(cfg).(map[string]any)
 		g.setConfig(m)
 	case !errors.Is(err, sql.ErrNoRows):
+		return nil, err
+	}
+	crows, err := q.QueryContext(ctx, `SELECT substr(k, 8), v FROM meta WHERE k LIKE 'config:%'`)
+	if err != nil {
+		return nil, err
+	}
+	for crows.Next() {
+		var ns, v string
+		if err := crows.Scan(&ns, &v); err != nil {
+			crows.Close()
+			return nil, err
+		}
+		if m, ok := parseJSON(v).(map[string]any); ok {
+			g.Content[ns] = &NSConfig{NS: ns, Doc: m}
+		}
+	}
+	crows.Close()
+	if err := crows.Err(); err != nil {
 		return nil, err
 	}
 	rows, err := q.QueryContext(ctx, `SELECT name, self, head, title, parents, access, state, dangling, cyclic, deep, item_state, item_head FROM nodes`)

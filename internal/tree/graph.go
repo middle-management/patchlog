@@ -132,6 +132,10 @@ type Graph struct {
 	Config map[string]any
 	// Trust is catalog.trust (§B.6).
 	Trust map[string]bool
+	// Content is each followed content namespace's document as of the
+	// checkpoint the service reflects for it, so what depends on roles and
+	// keys is pinned to the combined checkpoint (§B.11.5).
+	Content map[string]*NSConfig
 	// Aliases maps a namespace to the branch followed in its place in a
 	// release preview (§B.5, §F.9); nil otherwise.
 	Aliases map[string]string
@@ -144,8 +148,17 @@ type Graph struct {
 	saved    map[string]*savedRow       // derived state the nodes/edges tables hold
 }
 
+// NSConfig is a content namespace's document as of the checkpoint the
+// service reflects for it. A new document replaces the NSConfig rather than
+// changing it, so its pointer identifies one version, and consumers may
+// cache what they derive from it by pointer.
+type NSConfig struct {
+	NS  string
+	Doc map[string]any
+}
+
 func newGraph(catalog string) *Graph {
-	return &Graph{Catalog: catalog, Trust: map[string]bool{}, nodes: map[string]*Node{},
+	return &Graph{Catalog: catalog, Trust: map[string]bool{}, Content: map[string]*NSConfig{}, nodes: map[string]*Node{},
 		explicit: map[string]*Node{}, self: map[string]*Node{}, children: map[string]map[string]bool{},
 		saved: map[string]*savedRow{}}
 }

@@ -459,6 +459,10 @@ func (s *Service) follow(ctx context.Context, ns string) {
 				return
 			}
 			err = fmt.Errorf("skipped: %s", reason)
+		} else if ns != s.opt.Catalog && s.opt.RoleView != nil {
+			if err = s.ensureContent(ctx, ns); err == nil {
+				err = follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
+			}
 		} else {
 			err = follow.New(s.c, real, s.cps, s, opts...).Run(ctx)
 		}
@@ -514,6 +518,21 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 			s.keys.Observe(fb.NS, u.Config.Value)
 		}
 	}
+	// A content namespace's document as of the new checkpoint, which a
+	// catalog's visibility is pinned to (§B.11.5): a config entry's, or,
+	// when the batch has none and the service doesn't hold it (a snapshot,
+	// or a database from before it was kept), read at the checkpoint.
+	var content *client.NSDoc
+	if !isCat && !co.PurgedNS && s.opt.RoleView != nil {
+		content = cfg
+		if content == nil && (b.Snapshot || !s.hasContent(b.NS)) {
+			d, err := s.c.NSDoc(ctx, fb.NS, b.NewCheckpoint)
+			if err != nil {
+				return fmt.Errorf("tree: reading the document of %s at %s: %w", fb.NS, b.NewCheckpoint, err)
+			}
+			content = d
+		}
+	}
 	var preps []prep
 	for _, ch := range co.Changes {
 		p := prep{name: ch.Resource, kind: ch.Kind, head: ch.Target, purged: ch.Purged}
@@ -547,7 +566,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	}
 	s.mu.Lock()
 	oldTrust := s.g.Trust
-	res, err := s.applyLocked(context.WithoutCancel(ctx), b, co, preps, cfg)
+	res, err := s.applyLocked(context.WithoutCancel(ctx), b, co, preps, cfg, content)
 	if err != nil {
 		if rerr := s.reload(context.Background()); rerr != nil {
 			s.opt.Logf("tree: reloading after a failed apply: %v", rerr)
@@ -601,7 +620,7 @@ type applyResult struct {
 	tags []string
 }
 
-func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg *client.NSDoc) (*applyResult, error) {
+func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc) (*applyResult, error) {
 	g := s.g
 	cat := s.opt.Catalog
 	res := &applyResult{}
@@ -722,6 +741,14 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			if err := saveMeta(ctx, tx, "purged:"+ns, "1"); err != nil {
 				return nil, err
 			}
+			if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "config:"+ns); err != nil {
+				return nil, err
+			}
+			delete(g.Content, ns)
+		} else if content != nil {
+			if err := g.setContent(ctx, tx, ns, content.Value); err != nil {
+				return nil, err
+			}
 		}
 	}
 	if b.NS == cat && co.PurgedNS {
@@ -807,6 +834,60 @@ func sameSet(a, b map[string]bool) bool {
 type logPurger struct{ logf func(string, ...any) }
 
 func (l logPurger) PurgeTags(tags []string) { l.logf("tree: purge cache tags %v", tags) }
+
+// hasContent reports whether the service holds a content namespace's
+// document (Graph.Content).
+func (s *Service) hasContent(ns string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.g.Content[ns] != nil
+}
+
+// setContent records a content namespace's document as of the checkpoint
+// being applied in tx.
+func (g *Graph) setContent(ctx context.Context, tx *sql.Tx, ns string, doc map[string]any) error {
+	if err := saveMeta(ctx, tx, "config:"+ns, canonJSON(doc)); err != nil {
+		return err
+	}
+	g.Content[ns] = &NSConfig{NS: ns, Doc: doc}
+	return nil
+}
+
+// ensureContent reads the document of a content namespace the service
+// has a checkpoint for but no document (a database from before documents
+// were kept), so visibility doesn't wait for its next entry.
+func (s *Service) ensureContent(ctx context.Context, ns string) error {
+	s.mu.RLock()
+	cp, have := s.cur[ns], s.g.Content[ns] != nil
+	s.mu.RUnlock()
+	if have || cp == "" {
+		return nil
+	}
+	doc, err := s.c.NSDoc(ctx, s.actual(ns), cp)
+	if err != nil {
+		return fmt.Errorf("tree: reading the document of %s at %s: %w", s.actual(ns), cp, err)
+	}
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cur[ns] != cp || s.g.Content[ns] != nil || s.purged[ns] {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err := s.g.setContent(ctx, tx, ns, doc.Value); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		delete(s.g.Content, ns)
+		return err
+	}
+	return nil
+}
 
 // ItemState returns the recorded state and head of a content resource
 // (ItemUnknown if the service has never seen it).

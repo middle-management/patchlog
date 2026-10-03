@@ -1272,35 +1272,54 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   the caller is an admin, refuses `$access`. Tree powers on the new folder come only from its
   own `$access`; until an admin gives it some, only admins may move or place into it.
 - `POST /grants` for content verbs, `create` (genesis only; `409` for a taken name), `place`,
-  `move` and unplace (pinned to the placement's current parents), with the no-widening rule.
+  `move` and unplace (pinned to the placement's current parents), with the no-widening rule. Effective
+  roles on an item are collected only through subjects the catalog key in its content namespace may
+  assert (its `groups` scope; the caller's `user:` subject always), for `/read-grants` and restores
+  too (§B.11.4 Resolve). A move of a deleted item's placement is checked like any other, against the
+  roles the item would have now (§B.11.7).
 - `POST /grants` with `{ "item", "want": ["restore"] }` restores a deleted item where it is placed
   (§B.11.4): the roles come from the `effective` rows frozen when the service saw the item's
-  tombstone (marked `tombstoned`, kept across restarts, no longer recomputed, ignored by the move
-  no-widening check), so placing the deleted item or moving folders afterwards changes nothing. The
-  grant carries `can: ["restore"]` only; used on an item that is live again, the write is an append
-  and the core refuses it. A purged item is `410`, a live one `409`, one that never existed `404`.
-  The catalog key's entry in content namespaces lists `restore` for this (§B.11.3):
+  tombstone (marked `tombstoned`, kept across restarts, no longer recomputed), so placing the deleted
+  item or moving folders afterwards changes nothing; they stay those of its deletion even if it was
+  unplaced and placed again, but it must still be placed. The grant carries `can: ["restore"]` only;
+  used on an item that is live again, the write is an append and the core refuses it. The answers,
+  in order: a name that never existed `404`; a purged item `410`; `403` for a caller without a role
+  granting `read` on the item (in its frozen rows if deleted, its current ones if live), without one
+  granting `restore`, whose item has no placement, or whose restore would widen: the roles the item
+  would have after it, from its current placement, exceed its frozen rows for some subject, judged
+  with `includes` as for moves (a catalog admin skips that check, as for moves); then a live item
+  `409`. The catalog key's entry in content namespaces lists `restore` for this (§B.11.3):
   `"can": ["read", "create", "append", "restore"]`.
 - `POST /read-grants` returns resource-scoped read grants, and the keys of catalog nodes (and of an
   item's placement) visible to the caller.
 
 Listings are filtered by the caller's subject set (§B.11.5). A node is visible when the walk up
-collects a role granting `read` without conditions: for an item, a role its content namespace defines
-with `read` and the catalog key there may grant (its `roles` and `groups` scope), whose rules, if
-any, refer only to `/resource` and `/principal/groups` (evaluated for the item and the caller's
-groups); for a folder, such a role without rules in some trusted content namespace. So a role whose
-read has rules on anything else (`/writes`, `/now`, …) grants reading through `POST /grants` but
-shows nothing in listings. `children`, `subtree`, `roots`, `ancestors` and `where` show visible nodes
-and only paths through visible folders, with no counts of hidden ones; limits, cut markers and
-pagination count visible nodes. `/read-grants` uses the same test. Visibility is decided per request
-from `effective` and the content namespaces' role definitions, so a change to `/roles` takes effect
-from the listing `at` that includes it. `problems`, `orphans` and `manifest` aren't filtered: they
-need namespace-wide `read` on the catalog and on the content namespaces they cover (`403`
-otherwise), in the plain tree service too. A reader whose grant reads the catalog and every trusted
-content namespace as a whole is served unfiltered listings under `/{catalog}/at/{at}/g/all/…`,
-shared by all such readers, with a private `max-age` no longer than that grant's expiry; reading
-only some of them as a whole doesn't count (the listing is then the subject set's). There are no
-CDN edge grants: the service decides `all` per request.
+collects, through a subject the catalog key may assert, a role granting `read` without conditions:
+for an item, a role its content namespace defines with `read` and the catalog key there may grant
+(its `roles` and `groups` scope), without rules or with rules that pass as a read of the item would
+evaluate them: `action` `read`, the item as `resource`, and `/principal` holding only the caller's
+groups the key may assert; no `writes`, `doc` or `patches`, so `within` is true and `covers` and
+`overlaps` are false. A rule that refers to `/now`, or to anything in `/principal` but
+`/principal/groups` (or to the whole envelope), makes the role not count. So the spec's
+`translator` (`writes within ["/i18n"]`) sees the items it may read. For a folder, only a role
+without rules in some trusted content namespace counts. `children`, `subtree`, `roots`, `ancestors`
+and `where` show visible nodes and only paths through visible folders, with no counts of hidden
+ones; limits, cut markers and pagination count visible nodes. `/read-grants` uses the same test.
+Visibility is decided per request from `effective` and the content namespaces' documents (roles,
+their definitions and the catalog key) as of their `ns_id`s in the listing's combined checkpoint:
+the service keeps each content namespace's document with its checkpoint (`meta` `config:{ns}`,
+read at the checkpoint after a snapshot or an upgrade), never the grant checker's latest copy, so a
+listing at a given `at` never changes when a `/roles` change lands later. `problems`, `orphans` and
+`manifest` aren't filtered: they need namespace-wide `read` on the catalog and on the content
+namespaces they cover (`403` otherwise), for a manifest those of the items it pins, for `problems`
+and `orphans` every trusted one; a public namespace counts as read namespace-wide; in the plain
+tree service too. A reader whose grant reads the catalog and every trusted content namespace as a
+whole is served unfiltered listings under `/{catalog}/at/{at}/g/all/…`, shared by all such
+readers, with a private `max-age` no longer than that grant's expiry. Reading only some of them as
+a whole doesn't change the URL space (the listing is then the subject set's), but still admits
+`problems`, `orphans` and manifests covering only those, served `private` with a `max-age` no
+longer than the grants, `no-store` for shared caches, and never stored sealed. There are no CDN
+edge grants: the service decides `all` per request.
 
 Read-your-writes: after its own write, a client relists with `?min={ns}:{ns_id}` from the write's
 `X-Namespace-Revision` (repeatable, the catalog or any content namespace it trusts), which is a new

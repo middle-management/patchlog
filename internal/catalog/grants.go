@@ -392,8 +392,9 @@ func parentHrefsRule(list []string) any {
 }
 
 // planContent decides content verbs (read, append, create, …) on an item
-// from the caller's effective roles at its placement (§B.11.4); restore
-// from the roles frozen when the item's tombstone was seen (§B.11.7).
+// from the caller's effective roles at its placement, collected only
+// through subjects the catalog's key in the content namespace may assert
+// (§B.11.4); restore is planRestore's.
 func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (*plan, error) {
 	for _, w := range want {
 		if !grant.IsVerb(w) {
@@ -412,9 +413,11 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	if create && len(want) != 1 {
 		return nil, badInput("create can't be combined with other verbs")
 	}
-	restore := contains(want, "restore")
-	if restore && len(want) != 1 {
-		return nil, badInput("restore can't be combined with other verbs")
+	if contains(want, "restore") {
+		if len(want) != 1 {
+			return nil, badInput("restore can't be combined with other verbs")
+		}
+		return s.planRestore(ctx, v, ns, name, item)
 	}
 	cfg, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
@@ -424,7 +427,9 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	if key == nil {
 		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
 	}
-	subs := Subjects(v)
+	// Effective roles are collected only through subjects the catalog's
+	// key in the content namespace may assert (§B.11.4 Resolve).
+	subs := assertable(key, Subjects(v))
 	pl := ns + "." + name
 	var (
 		trusted, placed bool
@@ -437,11 +442,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		if n := g.Node(pl); n != nil && !n.Self {
 			placed, state, itemSt = true, n.State, n.ItemState
 		}
-		if restore {
-			roles = s.frozenRolesFor(pl, subs)
-		} else {
-			roles = s.rolesFor(pl, subs)
-		}
+		roles = s.rolesFor(pl, subs)
 		cp = cur[cat]
 	})
 	switch {
@@ -461,20 +462,6 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		}
 		if h.State != client.NotFound {
 			return nil, conflict("%s exists or existed", item)
-		}
-	case restore:
-		// A restore brings back a deleted item where it was placed, for the
-		// roles its placement had when the tombstone was seen (§B.11.4,
-		// §B.11.7). The grant can only restore: if the item is live by the
-		// time it is used, the write is an append and the core refuses it.
-		switch itemSt {
-		case tree.ItemTombstoned:
-		case tree.ItemPurged:
-			return nil, errf(410, "gone", "%s was purged: there is nothing to restore", item)
-		case tree.ItemLive:
-			return nil, conflict("%s is not deleted", item)
-		default:
-			return nil, errf(404, "not_found", "%s has never existed", item)
 		}
 	case state != tree.StateLive:
 		// A dangling placement grants nothing (§B.11.2).
@@ -518,6 +505,126 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	}
 	sort.Strings(final)
 	return &plan{ns: ns, resource: name, can: can, roles: final, rules: []any{resourceRule(name)}, cp: cp, key: key}, nil
+}
+
+// planRestore decides a restore (§B.11.4): it brings back a deleted item
+// where it is placed, for the roles its placement had when the tombstone
+// was seen (§B.11.7), collected through subjects the catalog's key may
+// assert. The frozen rows stay those of the deletion even if the item was
+// unplaced and placed again, but the item must still have a placement in
+// this catalog. The grant can only restore: if the item is live by the
+// time it is used, the write is an append and the core refuses it.
+//
+// The answers come in this order, so they reveal nothing to callers
+// without read beyond what names and purges already do (§E.4):
+//
+//   - 404 for a name that never existed, 410 for a purged item;
+//   - 403 for a caller without a role granting read on the item (in its
+//     frozen rows if deleted, its current ones if live), without a role
+//     granting restore, whose item has no placement, or whose restore
+//     would widen: the roles the item would have after it, from its
+//     current placement, exceed its frozen rows for some subject, judged
+//     with includes as for moves (§B.11.7). Such an item is restored by
+//     a catalog admin, who skips that check as for moves;
+//   - then 409 for a live item.
+func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, item string) (*plan, error) {
+	cat := s.t.Catalog()
+	pl := ns + "." + name
+	trusted := false
+	s.t.View(func(g *tree.Graph, _ map[string]string) { trusted = g.Trust[ns] })
+	if !trusted {
+		// The service follows only trusted namespaces: it knows nothing of
+		// this one's items.
+		return nil, forbidden("namespace %s is not trusted by catalog %s", ns, cat)
+	}
+	itemSt, _, err := s.t.ItemState(ctx, ns, name)
+	if err != nil {
+		return nil, err
+	}
+	switch itemSt {
+	case tree.ItemUnknown:
+		return nil, errf(404, "not_found", "%s has never existed", item)
+	case tree.ItemPurged:
+		return nil, errf(410, "gone", "%s was purged: there is nothing to restore", item)
+	}
+	cfg, err := s.t.Checker().Config(ctx, ns)
+	if err != nil {
+		return nil, upstream(err)
+	}
+	key := findKey(cfg.Keys, s.opt.Kid)
+	if key == nil {
+		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
+	}
+	subs := assertable(key, Subjects(v))
+	admin := s.isAdmin(v)
+	incs := map[string]Includes{ns: ParseIncludes(cfg.Doc)}
+	var (
+		placed      bool
+		roles       map[string]bool
+		cp          string
+		wSubj, wRol string
+		widens      bool
+	)
+	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		cp = cur[cat]
+		n := g.Node(pl)
+		placed = n != nil && !n.Self
+		if placed {
+			itemSt = n.ItemState
+		}
+		if itemSt == tree.ItemLive {
+			roles = s.rolesFor(pl, subs)
+			return
+		}
+		roles = s.frozenRolesFor(pl, subs)
+		if !placed || admin {
+			return
+		}
+		frozen := s.frozen[pl]
+		after := Effective(g, pl, nil)
+		subjects := make([]string, 0, len(after))
+		for subj := range after {
+			subjects = append(subjects, subj)
+		}
+		sort.Strings(subjects)
+		for _, subj := range subjects {
+			for _, r := range after[subj] {
+				if !present(g, pl, r, frozen[subj], incs) {
+					wSubj, wRol, widens = subj, r, true
+					return
+				}
+			}
+		}
+	})
+	if itemSt == tree.ItemPurged {
+		return nil, errf(410, "gone", "%s was purged: there is nothing to restore", item)
+	}
+	// Roles the content namespace defines with a verb, within the key's
+	// roles scope.
+	with := func(verb string) []string {
+		var out []string
+		for r := range roles {
+			if def, ok := cfg.Roles[r]; ok && roleAllowed(key, r) && contains(def.Can, verb) {
+				out = append(out, r)
+			}
+		}
+		sort.Strings(out)
+		return out
+	}
+	kept := with("restore")
+	switch {
+	case len(with("read")) == 0:
+		return nil, forbidden("no role of yours allows read on %s", item)
+	case len(kept) == 0 || !key.IsStar() && !contains(key.Can, "restore"):
+		return nil, forbidden("no role of yours allows restore on %s", item)
+	case !placed:
+		return nil, forbidden("%s is not placed in catalog %s", item, cat)
+	case widens:
+		return nil, forbidden("restoring %s would give %s the role %s, which it didn't have when the item was deleted; a catalog admin can restore it", item, wSubj, wRol)
+	case itemSt == tree.ItemLive:
+		return nil, conflict("%s is not deleted", item)
+	}
+	return &plan{ns: ns, resource: name, can: []string{"restore"}, roles: kept, rules: []any{resourceRule(name)}, cp: cp, key: key}, nil
 }
 
 // folders resolves a to list to distinct folder names.
@@ -927,6 +1034,7 @@ func present(g *tree.Graph, d, r string, before []string, incs map[string]Includ
 // widens reports a subject, node and role that a move of name to tos
 // would add to the effective roles of the moved subtree (§B.11.4). Roles
 // are compared by name, with the content namespace's declared includes.
+// Deleted items' placements are no exception (§B.11.7).
 func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[string]Includes) (subject, node, role string, bad bool) {
 	override := map[string][]string{name: tos}
 	below := g.Descendants([]string{name})
@@ -936,14 +1044,13 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[stri
 	}
 	sort.Strings(nodes)
 	for _, d := range nodes {
-		// A deleted item's rows are frozen and ignored here (§B.11.7): no
-		// one has access to it until it is restored, and who may restore it
-		// doesn't change with a move.
-		if n := g.Node(d); n != nil && n.ItemState == tree.ItemTombstoned {
-			continue
-		}
+		// Before is what the node has now, computed from the graph, for a
+		// deleted item's placement too: its move is checked like any other,
+		// against the roles the item would have now, not against its frozen
+		// rows (§B.11.7). Who may restore it still doesn't change with a
+		// move, and a restore that would widen is refused (planRestore).
 		after := Effective(g, d, override)
-		before := s.eff[d]
+		before := Effective(g, d, nil)
 		subjects := make([]string, 0, len(after))
 		for subj := range after {
 			subjects = append(subjects, subj)

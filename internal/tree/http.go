@@ -88,6 +88,19 @@ type viewer struct {
 	// exp, if set, is the earliest expiry of the grants an unfiltered
 	// listing was admitted with: it isn't kept past it (§B.11.5).
 	exp time.Time
+	// In a subject set's URL space (RoleView), the namespace-wide reads
+	// the reader has besides: wideCat for the catalog, wideNS per content
+	// namespace (public ones included, §B.11.5), and wideExp the earliest
+	// expiry of the grants behind them. problems, orphans and manifests
+	// need only those of the namespaces they cover. An answer admitted
+	// through such a grant (not public namespaces alone) depends on more
+	// than the subject set: priv marks it, and it is kept by no shared
+	// cache and no longer than wideExp.
+	wideCat   bool
+	wideNS    map[string]bool
+	wideGrant map[string]bool // namespaces read namespace-wide through a grant, not because they are public ("" the catalog)
+	wideExp   time.Time
+	priv      bool
 }
 
 // wide reports whether the viewer reads the catalog and every namespace of
@@ -214,6 +227,13 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		}
 	}
 	if s.opt.RoleView != nil {
+		v.wideCat, v.wideNS, v.wideGrant, v.wideExp = v.catAll, map[string]bool{}, map[string]bool{}, exp
+		if v.catAll && !catPublic {
+			v.wideGrant[""] = true
+		}
+		for ns := range v.contentAll {
+			v.wideNS[ns] = true
+		}
 		if v.wide(trust) {
 			// Unfiltered (§B.11.5): namespace-wide read on the catalog and
 			// on every content namespace it trusts.
@@ -225,6 +245,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		for ns := range v.contentAll {
 			if c, err := s.checker.Config(ctx, s.actual(ns)); err != nil || c.Read != "public" {
 				delete(v.contentAll, ns)
+				v.wideGrant[ns] = true
 			}
 		}
 		var subjects []string
@@ -488,7 +509,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			return
 		}
 		perEntry = !v.catAll
-		if st, ok := s.sealed.Get(ctx, view.Target); ok {
+		if st, ok := s.sealed.Get(ctx, view.Target); ok && !perReader(op, v) {
 			s.writeListing(w, v, at, st)
 			return
 		}
@@ -546,7 +567,13 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
 			return
 		}
-		st, err := s.sealed.Put(ctx, view.Target, cat, at, derived.Stored{Body: b, JSON: perEntry, Tags: tags.header(cat, nss)})
+		st := derived.Stored{Body: b, JSON: perEntry, Tags: tags.header(cat, nss)}
+		if perReader(op, v) {
+			// Not stored: whether it may be served depends on the reader.
+			s.writeListing(w, v, at, st)
+			return
+		}
+		st, err := s.sealed.Put(ctx, view.Target, cat, at, st)
 		if err != nil {
 			s.opt.Logf("tree: storing a sealed listing: %v", err)
 		}
@@ -564,8 +591,27 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	WriteJSON(w, http.StatusOK, body)
 }
 
+// perReader reports whether an answer to op may be served depends
+// on more than the reader's URL space: problems, orphans and manifests in
+// a subject set's URL space, which need namespace-wide reads the subject
+// set doesn't imply (query.unfiltered).
+func perReader(op string, v *viewer) bool {
+	return !v.anon && v.gs != AllSubjects && v.wideNS != nil && (op == "problems" || op == "orphans" || op == "manifest")
+}
+
 func (s *Service) setListingHeaders(w http.ResponseWriter, v *viewer, at, tags string) {
 	switch {
+	case v.priv:
+		// Admitted through namespace-wide grants the subject set doesn't
+		// imply: no shared cache keeps it, and the browser no longer than
+		// those grants (§B.11.5).
+		secs := int(privateListMaxAge / time.Second)
+		if !v.wideExp.IsZero() {
+			secs = min(secs, max(int(v.wideExp.Sub(s.opt.Now())/time.Second), 0))
+		}
+		w.Header().Set("Cache-Control", "private, max-age="+strconv.Itoa(secs))
+		w.Header().Set("CDN-Cache-Control", "no-store")
+		w.Header().Set("Surrogate-Control", "no-store")
 	case v.anon:
 		w.Header().Set("Cache-Control", ccListing)
 	case !v.exp.IsZero() && v.exp.Sub(s.opt.Now()) < privateListMaxAge:
@@ -1231,11 +1277,27 @@ func (q *query) trusted() []string {
 // the content namespaces nss: problems, orphans and manifests aren't
 // filtered, and need namespace-wide read on the catalog and on the content
 // namespaces they cover (§B.11.5).
+//
+// In a subject set's URL space the reader's namespace-wide grants count
+// too, those of the namespaces covered only (a public namespace counts as
+// read namespace-wide); an answer that needed such a grant is marked
+// private (viewer.priv).
 func (q *query) unfiltered(nss []string) (int, string) {
-	if !q.v.wide(nss) {
-		return http.StatusForbidden, "this listing isn't filtered: it needs namespace-wide read on the catalog and on " + strings.Join(nss, ", ")
+	if q.v.wide(nss) {
+		return http.StatusOK, ""
 	}
-	return http.StatusOK, ""
+	if q.v.wideCat && q.v.wideNS != nil {
+		ok, priv := true, q.v.wideGrant[""]
+		for _, ns := range nss {
+			ok = ok && q.v.wideNS[ns]
+			priv = priv || q.v.wideGrant[ns]
+		}
+		if ok {
+			q.v.priv = q.v.priv || priv
+			return http.StatusOK, ""
+		}
+	}
+	return http.StatusForbidden, "this listing isn't filtered: it needs namespace-wide read on the catalog and on " + strings.Join(nss, ", ")
 }
 
 // orphans lists nodes whose every parent is gone, dangling, not a folder
