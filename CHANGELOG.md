@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.7.0
 
 Implements spec **v0.36** and **v0.37**.
 
