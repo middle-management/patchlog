@@ -23,8 +23,11 @@
 //     "{ns}/{name}" for a live dependency (checked by name in the target)
 //     or "{ns}/{name}/rev/{id}" for a pinned one (checked by id).
 //   - History lines always carry "parent" ("" for genesis). "author",
-//     "created" and "signature" appear only with "authors": true; a line that
-//     carries them in a bundle without authors is rejected. Author
+//     "created", "signature", "gesture" and "undoes" appear only with
+//     "authors": true; a line that carries them in a bundle without authors
+//     is rejected, and gesture and undoes must be gesture ids (§7.2). An
+//     import carries them into its batch steps (§7.5), like a merge
+//     (§F.3), wherever it writes the bundle's own revisions. Author
 //     signatures are carried but not verified (the server does not verify
 //     them either, see README).
 //   - A deleted snapshot line carries no "doc".
@@ -176,8 +179,10 @@ type Line struct {
 	// History lines (§3.3, §3.4).
 	ID, Parent, Kind string // Kind "rev" or "tombstone"
 	Patches          any    // canonical patch set (jsonv model), revisions only
-	// Attribution, only with Header.Authors.
+	// Attribution, only with Header.Authors (§G.4.1); Gesture and Undoes
+	// are "" if the revision had none (§7.2).
 	Author, Created, Signature string
+	Gesture, Undoes            string
 
 	// Snapshot lines.
 	Snapshot string // the source id: head revision, or tombstone if Deleted
@@ -203,7 +208,8 @@ func (l *Line) Key() string { return Key(l.NS, l.Resource) }
 // LogEntry returns a history line as a resource log entry.
 func (l *Line) LogEntry() client.LogEntry {
 	return client.LogEntry{ID: l.ID, Parent: l.Parent, Kind: l.Kind, Patches: l.Patches,
-		HasPatches: l.Kind == "rev" && l.Patches != nil, Author: l.Author, Created: l.Created, Signature: l.Signature}
+		HasPatches: l.Kind == "rev" && l.Patches != nil, Author: l.Author, Created: l.Created, Signature: l.Signature,
+		Gesture: l.Gesture, Undoes: l.Undoes}
 }
 
 // HistoryLine converts a verified log entry of ns/name into a line. The
@@ -215,6 +221,7 @@ func HistoryLine(ns, name string, e client.LogEntry, authors bool) Line {
 	}
 	if authors {
 		l.Author, l.Created, l.Signature = e.Author, e.Created, e.Signature
+		l.Gesture, l.Undoes = e.Gesture, e.Undoes
 	}
 	return l
 }
@@ -241,7 +248,7 @@ func (l *Line) value() map[string]any {
 	if l.Kind == "rev" {
 		m["patches"] = l.Patches
 	}
-	for k, v := range map[string]string{"author": l.Author, "created": l.Created, "signature": l.Signature} {
+	for k, v := range map[string]string{"author": l.Author, "created": l.Created, "signature": l.Signature, "gesture": l.Gesture, "undoes": l.Undoes} {
 		if v != "" {
 			m[k] = v
 		}
@@ -542,7 +549,7 @@ func parseLine(v any, authors bool) (*Line, error) {
 	for k := range m {
 		switch k {
 		case "ns", "resource", "id", "parent", "kind", "patches":
-		case "author", "created", "signature":
+		case "author", "created", "signature", "gesture", "undoes":
 			if !authors {
 				return nil, fmt.Errorf("history line carries %q in a bundle without authors", k)
 			}
@@ -556,6 +563,14 @@ func parseLine(v any, authors bool) (*Line, error) {
 	l.Author, _ = m["author"].(string)
 	l.Created, _ = m["created"].(string)
 	l.Signature, _ = m["signature"].(string)
+	for k, dst := range map[string]*string{"gesture": &l.Gesture, "undoes": &l.Undoes} {
+		if v, has := m[k]; has {
+			*dst, _ = v.(string)
+			if !client.ValidGesture(*dst) {
+				return nil, fmt.Errorf("history line: %s must be a gesture id (26 base32 characters)", k)
+			}
+		}
+	}
 	if !validID(l.ID) {
 		return nil, fmt.Errorf("history line: invalid id")
 	}
@@ -874,7 +889,7 @@ func (w *Writer) Line(l Line) error {
 		return errors.New("bundle: write after Close")
 	}
 	if !w.h.Authors {
-		l.Author, l.Created, l.Signature = "", "", ""
+		l.Author, l.Created, l.Signature, l.Gesture, l.Undoes = "", "", "", "", ""
 	}
 	if l.IsSnapshot() && !l.IsBlob() && !l.Deleted {
 		v, err := client.ToValue(docJSON(l.Doc))

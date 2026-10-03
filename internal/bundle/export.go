@@ -56,7 +56,8 @@ type ExportOptions struct {
 	// UntypedRefs treats any string of an untyped document that has the
 	// form of a reference (/r/…) as a reference (opt-in, §G.4.2).
 	UntypedRefs bool
-	// Authors includes authors, creation times and author signatures.
+	// Authors includes authors, creation times, author signatures, and
+	// gestures (gesture and undoes, §G.4.1).
 	Authors bool
 	// Requires makes an incremental bundle: "ns/name" → an id already in
 	// the target. Full documents then start right after it; a document

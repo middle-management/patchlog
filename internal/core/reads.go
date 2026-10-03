@@ -462,7 +462,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
-		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth, gestures FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {
 			q += ` LIMIT ?`
@@ -479,11 +479,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			created int64
 			grantID []byte
 			noAuth  sql.NullInt64
+			meta    sql.NullString
 		}
 		var rs []raw
 		for rows.Next() {
 			var r raw
-			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth))
+			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta))
 			rs = append(rs, r)
 		}
 		rows.Close()
@@ -508,6 +509,14 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 				// Written while authentication was disabled (§1): null,
 				// unlike the server's own entries, which have none.
 				m["grant"] = nil
+			}
+			if r.meta.Valid {
+				// gesture and undoes of a single write, gestures of a
+				// batch: not part of the hashed entry either (§7.4). In a
+				// sealed namespace they are sealed with it (§E.4).
+				for k, v := range jsonv.MustParse([]byte(r.meta.String)).(map[string]any) {
+					m[k] = v
+				}
 			}
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)

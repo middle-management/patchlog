@@ -237,7 +237,7 @@ func Encode(ctx context.Context, w io.Writer, b *core.ArchiveBundle) error {
 			return bw.Line(bundle.Line{NS: b.NS, Resource: b.Name, Blob: e.Blob.ID, Type: e.Blob.Type, Nonce: e.Blob.Nonce, Data: e.Blob.Data})
 		}
 		return bw.Line(bundle.Line{NS: b.NS, Resource: b.Name, ID: e.ID, Parent: e.Parent, Kind: e.Kind,
-			Patches: e.Patches, Author: e.Author, Created: e.Created, Signature: e.Signature})
+			Patches: e.Patches, Author: e.Author, Created: e.Created, Signature: e.Signature, Gesture: e.Gesture, Undoes: e.Undoes})
 	})
 	if err != nil {
 		return err

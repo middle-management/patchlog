@@ -117,8 +117,11 @@ type LogEntry struct {
 	HasPatches bool
 	Author     string
 	Created    string
-	Signature  string         // author signature (§C.3), if served
-	Raw        map[string]any // the entry as served
+	Signature  string // author signature (§C.3), if served
+	// Gesture and Undoes are the gesture ids the entry was written with
+	// (§7.1, §7.2), "" if none; not hashed.
+	Gesture, Undoes string
+	Raw             map[string]any // the entry as served
 }
 
 func parseLogEntry(v any) (LogEntry, error) {
@@ -128,7 +131,8 @@ func parseLogEntry(v any) (LogEntry, error) {
 	}
 	e := LogEntry{
 		ID: str(m, "id"), Parent: str(m, "parent"), Kind: str(m, "kind"),
-		Author: str(m, "author"), Created: str(m, "created"), Signature: str(m, "signature"), Raw: m,
+		Author: str(m, "author"), Created: str(m, "created"), Signature: str(m, "signature"),
+		Gesture: str(m, "gesture"), Undoes: str(m, "undoes"), Raw: m,
 	}
 	if p, has := m["patches"]; has {
 		e.Patches, e.HasPatches = p, true
@@ -239,6 +243,10 @@ type WriteResult struct {
 	ID     string // the new revision or tombstone id (ETag)
 	NSID   string // X-Namespace-Revision: the namespace entry of the write
 	Entry  *LogEntry
+	// Gesture and Undoes are the response's Gesture and Undoes headers:
+	// what the entry recorded (§7.2). An idempotent retry is answered with
+	// the entry as first recorded, so they may differ from what it sent.
+	Gesture, Undoes string
 }
 
 // Replayed reports an idempotent retry answered with the existing entry.
@@ -250,6 +258,26 @@ type WriteOption func(*request)
 // WithSignature sends an author signature header (§C.3), "alg:kid:sig".
 func WithSignature(sig string) WriteOption {
 	return func(r *request) { r.header["Signature"] = sig }
+}
+
+// WithGesture sends Gesture: id, naming the user action the write belongs
+// to (§7.2, §11.2): a gesture id (NewGesture). "" sends nothing.
+func WithGesture(id string) WriteOption {
+	return func(r *request) {
+		if id != "" {
+			r.header["Gesture"] = id
+		}
+	}
+}
+
+// WithUndoes sends Undoes: id, naming the gesture the write undoes (§7.2,
+// §11.2). "" sends nothing.
+func WithUndoes(id string) WriteOption {
+	return func(r *request) {
+		if id != "" {
+			r.header["Undoes"] = id
+		}
+	}
 }
 
 // WithSourceGrants sends each grant as a repeated Source-Authorization
@@ -278,7 +306,8 @@ func (c *Client) patchResource(ctx context.Context, ns, name string, precond map
 	if r.status != 200 && r.status != 201 {
 		return nil, r.apiError()
 	}
-	res := &WriteResult{Status: r.status, ID: r.etag(), NSID: r.header.Get("X-Namespace-Revision")}
+	res := &WriteResult{Status: r.status, ID: r.etag(), NSID: r.header.Get("X-Namespace-Revision"),
+		Gesture: r.header.Get("Gesture"), Undoes: r.header.Get("Undoes")}
 	if m := r.obj(); m != nil {
 		if e, err := parseLogEntry(m); err == nil {
 			res.Entry = &e
@@ -313,15 +342,19 @@ func (c *Client) Restore(ctx context.Context, ns, name, tombstone string, patche
 }
 
 // Delete tombstones a resource whose head is head. The result's ID is the
-// tombstone id.
-func (c *Client) Delete(ctx context.Context, ns, name, head string) (*WriteResult, error) {
+// tombstone id. Of opts, WithGesture and WithUndoes apply (§7.2).
+func (c *Client) Delete(ctx context.Context, ns, name, head string, opts ...WriteOption) (*WriteResult, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
 	}
 	if err := checkID("head", head); err != nil {
 		return nil, err
 	}
-	r, err := c.do(ctx, "DELETE", "/r/"+ns+"/"+name, nil, &request{header: map[string]string{"If-Match": quote(head)}})
+	rq := &request{header: map[string]string{"If-Match": quote(head)}}
+	for _, o := range opts {
+		o(rq)
+	}
+	r, err := c.do(ctx, "DELETE", "/r/"+ns+"/"+name, nil, rq)
 	if err != nil {
 		return nil, err
 	}
@@ -332,7 +365,8 @@ func (c *Client) Delete(ctx context.Context, ns, name, head string) (*WriteResul
 	if id == "" {
 		id = r.etag()
 	}
-	return &WriteResult{Status: r.status, ID: id, NSID: r.header.Get("X-Namespace-Revision")}, nil
+	return &WriteResult{Status: r.status, ID: id, NSID: r.header.Get("X-Namespace-Revision"),
+		Gesture: r.header.Get("Gesture"), Undoes: r.header.Get("Undoes")}, nil
 }
 
 // Purge purges a resource whose head (revision or tombstone) is head

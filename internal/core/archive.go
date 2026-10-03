@@ -70,6 +70,7 @@ type ArchiveEntry struct {
 	Patches          any    // jsonv value; revisions only
 	Author, Created  string
 	Signature        string
+	Gesture, Undoes  string // §7.2, "" if none
 	Blob             *ArchiveBlob
 }
 
@@ -180,7 +181,7 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 					return fmt.Errorf("revision %s has no patch set to archive", le.ID)
 				}
 				if err := yield(ArchiveEntry{ID: le.ID, Parent: le.Parent, Kind: le.Kind, Patches: le.Patches,
-					Author: le.Author, Created: le.Created, Signature: le.Signature}); err != nil {
+					Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes}); err != nil {
 					return err
 				}
 				after = r.seq

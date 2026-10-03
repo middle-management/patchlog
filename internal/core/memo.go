@@ -62,6 +62,14 @@ func anyStr(v any) sql.NullString {
 	return sql.NullString{}
 }
 
+// nullStr is s as a column value: NULL if empty.
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 type resKey struct {
 	ns   int64
 	name string

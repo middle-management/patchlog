@@ -210,18 +210,32 @@ func (r *Resource) MarshalJSON() ([]byte, error) {
 	return json.Marshal(out)
 }
 
-// StepsJSON renders steps as in a batch body.
+// StepsJSON renders steps as in a batch body: a step with a gesture as a
+// step object (§7.5).
 func StepsJSON(steps []client.Step) []any {
 	if len(steps) == 0 {
 		return nil
 	}
 	out := make([]any, len(steps))
 	for i, s := range steps {
+		var v any = s.Patches
 		if s.Delete {
-			out[i] = "delete"
-		} else {
-			out[i] = s.Patches
+			v = "delete"
 		}
+		if s.Gesture != "" || s.Undoes != "" {
+			m := map[string]any{"patches": v}
+			if s.Delete {
+				m = map[string]any{"delete": true}
+			}
+			if s.Gesture != "" {
+				m["gesture"] = s.Gesture
+			}
+			if s.Undoes != "" {
+				m["undoes"] = s.Undoes
+			}
+			v = m
+		}
+		out[i] = v
 	}
 	return out
 }

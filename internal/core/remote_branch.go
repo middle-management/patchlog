@@ -1146,8 +1146,17 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		if e.Author != "" {
 			author = t.authorID(e.Author)
 		}
-		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?,?) RETURNING seq`,
-			res, id[:], parentSeq, first, kind, patches, author, sig, typed, parseCreated(e.Created, t.now))
+		// The base's gestures are mirrored with its entries (§7.2, §G.3);
+		// one that isn't a gesture id is dropped, never stored.
+		var gesture, undoes any
+		if ValidGesture(e.Gesture) {
+			gesture = e.Gesture
+		}
+		if ValidGesture(e.Undoes) {
+			undoes = e.Undoes
+		}
+		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created, gesture, undoes) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?) RETURNING seq`,
+			res, id[:], parentSeq, first, kind, patches, author, sig, typed, parseCreated(e.Created, t.now), gesture, undoes)
 		parentSeq = last
 		if kind == kindTombstone {
 			state = stateTombstoned

@@ -94,7 +94,7 @@ func (p *Plan) sealSteps(ctx context.Context, r *Resource) (steps []client.Step,
 			if prev, err = client.ExpectedTombstone(prev); err != nil {
 				return nil, "", err
 			}
-			steps = append(steps, client.DeleteStep())
+			steps = append(steps, client.DeleteStep().WithGesture(s.Gesture, s.Undoes))
 			continue
 		}
 		v, err := client.ToValue(s.Patches)
@@ -127,7 +127,8 @@ func (p *Plan) sealSteps(ctx context.Context, r *Resource) (steps []client.Step,
 		if prev, err = client.ExpectedRevision(prev, sealed); err != nil {
 			return nil, "", err
 		}
-		steps = append(steps, client.PatchStep(sealed))
+		// The re-sealed step keeps the source revision's gesture (§F.3).
+		steps = append(steps, client.PatchStep(sealed).WithGesture(s.Gesture, s.Undoes))
 		doc, exists = nd, true
 	}
 	return steps, "", nil

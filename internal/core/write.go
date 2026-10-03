@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
 	"sort"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -18,6 +19,33 @@ import (
 type Step struct {
 	Delete  bool
 	Patches any // a JSON value (validated as a patch set at step 3)
+	// Gesture and Undoes are the step's gesture ids (§7.2), "" if absent:
+	// stored with its revision or tombstone as metadata, like its author,
+	// outside its id (§3.3), and never seen by rules. A batch's item and
+	// batch defaults are resolved into each step before it gets here.
+	Gesture, Undoes string
+}
+
+// gestureRe is the form of a gesture id (§7.2): 26 base32 characters,
+// 128 random bits the client chooses.
+var gestureRe = regexp.MustCompile(`^[a-z2-7]{26}$`)
+
+// ValidGesture reports whether s is a gesture id (§7.2).
+func ValidGesture(s string) bool { return gestureRe.MatchString(s) }
+
+// checkGestures answers 400 for a step whose Gesture or Undoes isn't a
+// gesture id (§7.2).
+func checkGestures(items []Item) *Error {
+	for i, it := range items {
+		for j, st := range it.Steps {
+			for _, g := range [2]string{st.Gesture, st.Undoes} {
+				if g != "" && !ValidGesture(g) {
+					return badInput(fmt.Sprintf("item %d, step %d: a gesture id is 26 base32 characters", i, j))
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // Item is a write to one resource: a precondition and its steps.
@@ -366,6 +394,9 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		return nil, nil, gone()
 	}
 	cur := t.config(n.configSeq)
+	if err := checkGestures(items); err != nil {
+		return nil, nil, err
+	}
 	if isBatch {
 		seen := map[string]bool{}
 		for i, it := range items {
@@ -722,7 +753,7 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	// The namespace entry last: on Postgres it is appended under the
 	// namespace row's lock, held until commit (appendNS).
 	na := t.planEntry(p, author, entries, inserted)
-	_, nsID := t.appendNS(p.n, na.entry, na.res, na.target, configSeq, author, na.hist...)
+	_, nsID := t.appendNSMeta(p.n, na.entry, na.meta, na.res, na.target, configSeq, author, na.hist...)
 	p.result.NSID = nsID.String()
 	return p.result
 }
@@ -744,11 +775,54 @@ func (t *tx) planEntry(p *writePlan, author int64, entries []any, inserted []his
 		if p.src != nil {
 			entry["source"] = p.src
 		}
-		return nsAppend{entry: entry, author: author, hist: inserted}
+		return nsAppend{entry: entry, meta: batchGestures(p.st), author: author, hist: inserted}
 	}
 	le := t.logEntry(t.rev(inserted[0].target))
 	p.result.Entry = &le
-	return nsAppend{entry: entries[0].(map[string]any), res: &inserted[0].res, target: &inserted[0].target, author: author, hist: inserted}
+	return nsAppend{entry: entries[0].(map[string]any), meta: stepGestures(p.st[0].Steps[0]), res: &inserted[0].res, target: &inserted[0].target, author: author, hist: inserted}
+}
+
+// stepGestures are a step's gesture members, { gesture?, undoes? } (§7.4),
+// or nil if it has neither: a single write's entry carries them.
+func stepGestures(st Step) map[string]any {
+	var m map[string]any
+	for k, v := range map[string]string{"gesture": st.Gesture, "undoes": st.Undoes} {
+		if v != "" {
+			if m == nil {
+				m = map[string]any{}
+			}
+			m[k] = v
+		}
+	}
+	return m
+}
+
+// batchGestures are a batch entry's gesture members (§7.4): "gestures"
+// maps each resource of the batch to a list of { gesture?, undoes? }, one
+// per step in order, {} for a step with neither. The member is left out
+// when no step of the batch has one, so batches without gestures serve
+// what they did before v0.39; when it is there, every resource is, so a
+// step's position in its list is its position among the item's steps.
+func batchGestures(st []*itemState) map[string]any {
+	has := false
+	out := map[string]any{}
+	for _, s := range st {
+		list := make([]any, len(s.Steps))
+		for j, step := range s.Steps {
+			g := stepGestures(step)
+			if g == nil {
+				g = map[string]any{}
+			} else {
+				has = true
+			}
+			list[j] = g
+		}
+		out[s.Resource] = list
+	}
+	if !has {
+		return nil
+	}
+	return map[string]any{"gestures": out}
 }
 
 // hasCandidates reports whether an item's first step may be an append or a
@@ -1387,7 +1461,7 @@ func (t *tx) storeGrant(g *grant.Grant, encrypt bool) []byte {
 var (
 	insResources = bulkInsert("resources", "ns bigint, name text", "RETURNING res, name")
 	insRevisions = bulkInsert("revisions", "res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
-		"via text, grant_id bytea, signature text, schema_ref text, created bigint", "RETURNING seq, res")
+		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text", "RETURNING seq, res")
 	insRevEpochs = bulkInsert("rev_epochs", "seq bigint, epoch bigint", "")
 	insSnapshots = bulkInsert("snapshots", "seq bigint, res bigint, doc bytea", "ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc")
 	upsertHeads  = bulkInsert("heads", "res bigint, seq bigint, doc bytea", "ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc")
@@ -1550,7 +1624,9 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			if it.last != 0 {
 				parent = it.last
 			}
-			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli()})
+			// The step's gestures (§7.2), as the request resolved them.
+			gesture, undoes := nullStr(it.Steps[k].Gesture), nullStr(it.Steps[k].Undoes)
+			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli(), gesture, undoes})
 			stepItems = append(stepItems, it)
 		}
 		if len(rows) == 0 {
@@ -1564,7 +1640,8 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		for i, it := range stepItems {
 			step, row, seq := it.steps[k], rows[i], it.last
 			t.inserted(revRow{seq: seq, res: it.res, id: step.id, parentSeq: anyInt(row[2]), first: row[3] == 1, kind: row[4].(int),
-				patches: anyStr(row[5]), author: it.author, via: anyStr(it.via), grantID: it.grantID, signature: anyStr(row[9]), created: row[11].(int64)})
+				patches: anyStr(row[5]), author: it.author, via: anyStr(it.via), grantID: it.grantID, signature: anyStr(row[9]), created: row[11].(int64),
+				gesture: anyStr(row[12]), undoes: anyStr(row[13])})
 			if !step.del {
 				// The blobs the document references are attached with it
 				// (§7.8, step 7); a sealed step's are those its op declares,

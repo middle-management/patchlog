@@ -361,7 +361,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.38"
+const SpecVersion = "0.39"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -919,11 +919,19 @@ type histRow struct{ res, target int64 }
 // entry with those of the other resources' writers. Entries therefore
 // commit, and their seqs grow, in chain order (pglock.go).
 func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int64, configSeq int64, author int64, hist ...histRow) (int64, ids.ID) {
+	return t.appendNSMeta(n, entry, nil, res, targetSeq, configSeq, author, hist...)
+}
+
+// appendNSMeta is appendNS for an entry with unhashed gesture members
+// (§7.4): meta, stored beside the hashed body and merged into the entry
+// when it is served (namespaceLog), or nil.
+func (t *tx) appendNSMeta(n *nsRow, entry, meta map[string]any, res *int64, targetSeq *int64, configSeq int64, author int64, hist ...histRow) (int64, ids.ID) {
 	if t.locking() && t.sharedNS != n.id {
 		t.lockNS(n.id, lockExclusive)
 	}
 	// What doesn't depend on the head first, outside the row's lock.
 	body := jsonv.Canonical(entry)
+	gestures := metaColumn(meta)
 	kind := nsKindCode(entry["kind"].(string))
 	var grantID any
 	if g := t.grants[author]; g != nil && t.serverWrites == 0 {
@@ -944,16 +952,16 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 		// One statement: the entry, the namespace's head and the heads it
 		// moves, so the log lock is held for a single round trip and the
 		// commit.
-		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
+		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT seq FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq) SELECT v.res, l.seq, v.target FROM l, unnest(?::bigint[], ?::bigint[]) AS v(res, target))
 			SELECT seq FROM l`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures,
 			id[:], configSeq, n.id, rs, ts)
 	} else {
-		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth)
+		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth, gestures)
 		_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, head_id = ?, config_seq = ? WHERE ns = ?`, seq, id[:], configSeq, n.id)
 		t.must(err)
 		for _, h := range hist {
@@ -1002,6 +1010,7 @@ func (t *tx) logHeadOf(n *nsRow) (*ids.ID, any) {
 // arguments.
 type nsAppend struct {
 	entry       map[string]any
+	meta        map[string]any // unhashed gesture members (appendNSMeta), or nil
 	res, target *int64
 	author      int64
 	grant       *grant.Grant // the grant the entry was written under (entryGrant), or nil
@@ -1024,9 +1033,13 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	res, targets := make([]*int64, k), make([]*int64, k)
 	grantIDs := make([][]byte, k)
 	noAuth := make([]*int64, k)
+	gestures := make([]*string, k)
 	var hord, hres, htarget []int64
 	for i, a := range as {
 		bodies[i] = string(jsonv.Canonical(a.entry))
+		if g, ok := metaColumn(a.meta).(string); ok {
+			gestures[i] = &g
+		}
 		kinds[i] = int64(nsKindCode(a.entry["kind"].(string)))
 		authors[i], res[i], targets[i] = a.author, a.res, a.target
 		if a.grant != nil && t.serverWrites == 0 {
@@ -1051,18 +1064,18 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		prev = &out[i]
 	}
 	t.wrote()
-	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[])
-				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, ord)),
+	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[], ?::text[])
+				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, gestures, ord)),
 			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
 			s AS (SELECT seq, row_number() OVER (ORDER BY seq) AS ord FROM r),
 			c AS (SELECT v.*, s.seq, COALESCE(lag(s.seq) OVER (ORDER BY v.ord), ?::bigint) AS prev_seq FROM v JOIN s USING (ord)),
-			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth)
-				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id, no_auth FROM c ORDER BY ord RETURNING seq),
+			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth, gestures)
+				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id, no_auth, gestures FROM c ORDER BY ord RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT max(seq) FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq)
 				SELECT x.res, c.seq, x.target FROM unnest(?::bigint[], ?::bigint[], ?::bigint[]) AS x(ord, res, target) JOIN c USING (ord))
 			SELECT seq FROM c ORDER BY ord`,
-		idBytes, kinds, res, targets, bodies, authors, grantIDs, noAuth, k, prevSeq,
+		idBytes, kinds, res, targets, bodies, authors, grantIDs, noAuth, gestures, k, prevSeq,
 		n.id, configSeq, t.now.UnixMilli(), idBytes[k-1], configSeq, n.id, hord, hres, htarget)
 	t.must(err)
 	var seqs []int64
@@ -1107,6 +1120,15 @@ func (t *tx) asServer(f func()) {
 	t.serverWrites++
 	defer func() { t.serverWrites-- }()
 	f()
+}
+
+// metaColumn is ns_log.gestures for an entry's unhashed gesture members:
+// their canonical JSON, or NULL for none.
+func metaColumn(meta map[string]any) any {
+	if len(meta) == 0 {
+		return nil
+	}
+	return string(jsonv.Canonical(meta))
 }
 
 func nullInt(p *int64) any {

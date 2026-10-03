@@ -100,7 +100,20 @@ type NSEntry struct {
 	// Forced marks a purge or purge-ns entry of a purge that overrode an
 	// in_use refusal (§3.5, §6.1); it is part of the hashed entry.
 	Forced bool
-	Raw    map[string]any // the entry as served
+	// Gesture and Undoes are those of a single write (head or tombstone
+	// entry), "" if none (§7.2, §7.4). Not hashed.
+	Gesture, Undoes string
+	// Gestures, of a batch entry, maps each resource to its steps'
+	// gestures, one per step in order (§7.4); nil when no step had one
+	// (the server then leaves the member out). Not hashed.
+	Gestures map[string][]StepGesture
+	Raw      map[string]any // the entry as served
+}
+
+// StepGesture is the gesture and undoes of one step of a batch (§7.4),
+// "" where absent.
+type StepGesture struct {
+	Gesture, Undoes string
 }
 
 // NSGrant is a namespace entry's grant reference (§7.4): the grant id
@@ -139,6 +152,19 @@ func ParseNSEntry(v any) (NSEntry, error) {
 	}
 	e.Remote, _ = m["remote"].(map[string]any)
 	e.Forced, _ = m["forced"].(bool)
+	e.Gesture, e.Undoes = str(m, "gesture"), str(m, "undoes")
+	if gm, ok := m["gestures"].(map[string]any); ok {
+		e.Gestures = map[string][]StepGesture{}
+		for res, v := range gm {
+			list, _ := v.([]any)
+			steps := make([]StepGesture, len(list))
+			for i, x := range list {
+				sm, _ := x.(map[string]any)
+				steps[i] = StepGesture{Gesture: str(sm, "gesture"), Undoes: str(sm, "undoes")}
+			}
+			e.Gestures[res] = steps
+		}
+	}
 	if s, has := m["source"]; has {
 		e.Source, _ = s.(map[string]any)
 		e.HasSource = true
@@ -422,10 +448,55 @@ func (c *Client) CreateBranch(ctx context.Context, base string, br BranchRequest
 	return res, nil
 }
 
-// Step is one step of a batch item: a patch set or a delete.
+// Step is one step of a batch item: a patch set or a delete, with the
+// gesture it belongs to and the gesture it undoes, if any (§7.2, §7.5).
+// A step with either is sent as a step object; its values override the
+// item's and the batch's defaults.
 type Step struct {
-	Delete  bool
-	Patches any
+	Delete          bool
+	Patches         any
+	Gesture, Undoes string
+}
+
+// WithGesture returns the step with its gesture and undoes set ("" for
+// none, which leaves the defaults in force).
+func (s Step) WithGesture(gesture, undoes string) Step {
+	s.Gesture, s.Undoes = gesture, undoes
+	return s
+}
+
+// value is the step as in a batch body (§7.5): a patch set or "delete",
+// or a step object when it carries a gesture.
+func (s Step) value() (any, error) {
+	var body any = "delete"
+	if !s.Delete {
+		p, err := ToValue(s.Patches)
+		if err != nil {
+			return nil, err
+		}
+		body = p
+	}
+	if s.Gesture == "" && s.Undoes == "" {
+		return body, nil
+	}
+	m := map[string]any{}
+	if s.Delete {
+		m["delete"] = true
+	} else {
+		m["patches"] = body
+	}
+	putGestures(m, s.Gesture, s.Undoes)
+	return m, nil
+}
+
+// putGestures sets the gesture and undoes members of m that aren't "".
+func putGestures(m map[string]any, gesture, undoes string) {
+	if gesture != "" {
+		m["gesture"] = gesture
+	}
+	if undoes != "" {
+		m["undoes"] = undoes
+	}
 }
 
 // PatchStep is a step appending (or restoring with) a patch set.
@@ -441,6 +512,9 @@ type BatchItem struct {
 	IfMatch     string
 	IfNoneMatch bool
 	Steps       []Step
+	// Gesture and Undoes, if set, are the defaults of the item's steps
+	// (§7.5), over the batch's.
+	Gesture, Undoes string
 }
 
 // BatchConfig is an optional config change in a batch.
@@ -454,6 +528,8 @@ type BatchRequest struct {
 	Items  []BatchItem
 	Config *BatchConfig
 	Source map[string]any // optional provenance { origin?, ns, at, bundle?, ids? }
+	// Gesture and Undoes, if set, are the defaults of every step (§7.5).
+	Gesture, Undoes string
 	// SourceAuthorization, if set, is the grant sent as
 	// Source-Authorization: it reads a local source, whose blobs the items
 	// may then reference (§7.5, §7.8).
@@ -492,17 +568,14 @@ func (b BatchRequest) body() (map[string]any, error) {
 			if it.IfNoneMatch {
 				m["ifNoneMatch"] = "*"
 			}
+			putGestures(m, it.Gesture, it.Undoes)
 			steps := make([]any, 0, len(it.Steps))
 			for _, s := range it.Steps {
-				if s.Delete {
-					steps = append(steps, "delete")
-					continue
-				}
-				p, err := ToValue(s.Patches)
+				v, err := s.value()
 				if err != nil {
 					return nil, fmt.Errorf("client: batch item %s: %w", it.Resource, err)
 				}
-				steps = append(steps, p)
+				steps = append(steps, v)
 			}
 			m["steps"] = steps
 			items = append(items, m)
@@ -523,6 +596,7 @@ func (b BatchRequest) body() (map[string]any, error) {
 	if b.Source != nil {
 		out["source"] = b.Source
 	}
+	putGestures(out, b.Gesture, b.Undoes)
 	return out, nil
 }
 

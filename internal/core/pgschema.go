@@ -317,6 +317,15 @@ ALTER TABLE grants ADD COLUMN IF NOT EXISTS root_kid text;
 -- §7.4; db.go). Rows from before v0.38 keep NULL: they can't be told from
 -- the server's own entries, and serve no grant.
 ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS no_auth smallint;
+-- Gestures (§7.2): metadata of revisions and tombstones, outside their ids,
+-- kept by pruning (§8.6), with partial indexes for GET
+-- /ns/{ns}/gestures/{gesture} (§7.4, D.2); and the unhashed gesture
+-- members of namespace entries (§7.4, db.go).
+ALTER TABLE revisions ADD COLUMN IF NOT EXISTS gesture text;
+ALTER TABLE revisions ADD COLUMN IF NOT EXISTS undoes text;
+CREATE INDEX IF NOT EXISTS revisions_by_gesture ON revisions (gesture) WHERE gesture IS NOT NULL;
+CREATE INDEX IF NOT EXISTS revisions_by_undoes ON revisions (undoes) WHERE undoes IS NOT NULL;
+ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS gestures text;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 `

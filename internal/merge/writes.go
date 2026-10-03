@@ -170,18 +170,21 @@ func ApplySteps(doc any, exists, deleted bool, steps []client.Step) (any, bool, 
 // stepsOf turns log entries into batch steps. A revision without its patch
 // set (pruned or purged) becomes a step with nil Patches, which callers
 // treat as pruned history.
+//
+// Each step carries its entry's gesture and undoes (§F.3 Attribution), so
+// fast-forwarded and replayed revisions keep their grouping for history
+// views and undo (§11.2); squashing replaces the steps, and loses them.
 func stepsOf(entries []client.LogEntry) []client.Step {
 	out := make([]client.Step, 0, len(entries))
 	for _, e := range entries {
-		if e.Kind == "tombstone" {
-			out = append(out, client.DeleteStep())
-			continue
+		var s client.Step
+		switch {
+		case e.Kind == "tombstone":
+			s = client.DeleteStep()
+		case e.HasPatches:
+			s = client.PatchStep(e.Patches)
 		}
-		if !e.HasPatches {
-			out = append(out, client.Step{})
-			continue
-		}
-		out = append(out, client.PatchStep(e.Patches))
+		out = append(out, s.WithGesture(e.Gesture, e.Undoes))
 	}
 	return out
 }

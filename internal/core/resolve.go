@@ -119,14 +119,17 @@ type revRow struct {
 	grantID   []byte
 	signature sql.NullString
 	created   int64
+	// gesture and undoes are the gesture ids it was written with (§7.2),
+	// metadata outside its id that pruning keeps (§8.6).
+	gesture, undoes sql.NullString
 }
 
-const revCols = `seq, res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, created`
+const revCols = `seq, res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, created, gesture, undoes`
 
 func scanRev(row interface{ Scan(...any) error }) (*revRow, error) {
 	r := &revRow{}
 	var id []byte
-	err := row.Scan(&r.seq, &r.res, &id, &r.parentSeq, &r.first, &r.kind, &r.patches, &r.author, &r.via, &r.grantID, &r.signature, &r.created)
+	err := row.Scan(&r.seq, &r.res, &id, &r.parentSeq, &r.first, &r.kind, &r.patches, &r.author, &r.via, &r.grantID, &r.signature, &r.created, &r.gesture, &r.undoes)
 	r.id = ids.FromBytes(id)
 	return r, err
 }
@@ -392,6 +395,10 @@ type LogEntry struct {
 	Author    string `json:"author"`
 	Created   string `json:"created"`
 	Signature string `json:"signature,omitempty"`
+	// Gesture and Undoes are the gesture ids the entry was written with
+	// (§7.1, §7.2), not hashed.
+	Gesture string `json:"gesture,omitempty"`
+	Undoes  string `json:"undoes,omitempty"`
 
 	row *revRow // the entry's row (sealing, sealed.go)
 }
@@ -406,6 +413,12 @@ func (e LogEntry) value() map[string]any {
 	}
 	if e.Signature != "" {
 		m["signature"] = e.Signature
+	}
+	if e.Gesture != "" {
+		m["gesture"] = e.Gesture
+	}
+	if e.Undoes != "" {
+		m["undoes"] = e.Undoes
 	}
 	return m
 }
@@ -426,6 +439,7 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 	if r.signature.Valid {
 		e.Signature = r.signature.String
 	}
+	e.Gesture, e.Undoes = r.gesture.String, r.undoes.String
 	return e
 }
 

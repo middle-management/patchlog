@@ -65,6 +65,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /ns/{ns}/rev/{id}/heads", s.nsHeads)
 	m.HandleFunc("GET /ns/{ns}/log", s.nsLive)
 	m.HandleFunc("GET /ns/{ns}/events", s.nsEvents)
+	m.HandleFunc("GET /ns/{ns}/gestures/{gesture}", s.nsGestures)
 	m.HandleFunc("GET /ns/{ns}/branches", s.nsBranches)
 	m.HandleFunc("POST /ns/{ns}/branches", s.nsCreateBranch)
 	m.HandleFunc("POST /ns/{ns}/batch", s.nsBatch)
@@ -255,6 +256,41 @@ func preconditions(r *http.Request) (precond, error) {
 		return p, badInput("both If-Match and If-None-Match")
 	}
 	return p, nil
+}
+
+// gestures reads a write's Gesture and Undoes headers (§7.2): each, if
+// present, once, as a gesture id (26 base32 characters), otherwise 400.
+func gestures(r *http.Request) (gesture, undoes string, err error) {
+	read := func(h string) (string, error) {
+		vs := r.Header.Values(h)
+		switch {
+		case len(vs) == 0:
+			return "", nil
+		case len(vs) > 1 || !core.ValidGesture(strings.TrimSpace(vs[0])):
+			return "", badInput(h + " must be one gesture id: 26 base32 characters")
+		}
+		return strings.TrimSpace(vs[0]), nil
+	}
+	if gesture, err = read("Gesture"); err != nil {
+		return "", "", err
+	}
+	undoes, err = read("Undoes")
+	return gesture, undoes, err
+}
+
+// setGestures sets a write response's Gesture and Undoes headers: what the
+// entry recorded, which for an idempotent retry may differ from what the
+// retry sent (§7.2).
+func setGestures(w http.ResponseWriter, e *core.LogEntry) {
+	if e == nil {
+		return
+	}
+	if e.Gesture != "" {
+		w.Header().Set("Gesture", e.Gesture)
+	}
+	if e.Undoes != "" {
+		w.Header().Set("Undoes", e.Undoes)
+	}
 }
 
 func validNames(ns, name string) error {
@@ -554,13 +590,18 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	g, u, err := gestures(r)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	body, err := readJSON(r, max(s.e.Limits().PatchSetSize, s.e.Limits().DocumentSize)*4)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	res, err := s.e.WriteResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature"), SourceCreds: sourceCreds(r)},
-		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Patches: body}}})
+		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Patches: body, Gesture: g, Undoes: u}}})
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -568,6 +609,7 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 	id := res.Items[0].IDs[len(res.Items[0].IDs)-1]
 	w.Header().Set("Location", "/r/"+ns+"/"+name+"/rev/"+id)
 	w.Header().Set("ETag", quote(id))
+	setGestures(w, res.Entry)
 	if res.NSID != "" {
 		w.Header().Set("X-Namespace-Revision", res.NSID)
 	}
@@ -590,14 +632,20 @@ func (s *Server) resourceDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, badInput("DELETE takes If-Match"))
 		return
 	}
+	g, u, err := gestures(r)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	res, err := s.e.WriteResource(r.Context(), core.Request{NS: ns, Cred: creds(r)},
-		core.Item{Resource: name, IfMatch: p.ifMatch, Steps: []core.Step{{Delete: true}}})
+		core.Item{Resource: name, IfMatch: p.ifMatch, Steps: []core.Step{{Delete: true, Gesture: g, Undoes: u}}})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
 	id := res.Items[0].IDs[0]
 	w.Header().Set("ETag", quote(id))
+	setGestures(w, res.Entry)
 	if res.NSID != "" {
 		w.Header().Set("X-Namespace-Revision", res.NSID)
 	}
@@ -865,6 +913,32 @@ func (s *Server) nsRevLog(w http.ResponseWriter, r *http.Request) {
 	s.writeLog(w, r, lg, ns, []string{"ns:" + ns})
 }
 
+// nsGestures is GET /ns/{ns}/gestures/{gesture} (§7.4, optional): the
+// revisions and tombstones written with the gesture or undoing it, oldest
+// first, paged as in §7.1 with X-Log-Next naming the cursor of the next
+// page, "{resource}/{id}" (core/gestures.go). The list grows: no-store.
+func (s *Server) nsGestures(w http.ResponseWriter, r *http.Request) {
+	noStore(w)
+	ns := r.PathValue("ns")
+	if err := validNames(ns, ""); err != nil {
+		writeErr(w, err)
+		return
+	}
+	page, err := s.e.Gestures(r.Context(), ns, r.PathValue("gesture"), r.URL.Query().Get("since"), creds(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if page.Next != "" {
+		w.Header().Set("X-Log-Next", page.Next)
+	}
+	entries := make([]any, len(page.Entries))
+	for i, e := range page.Entries {
+		entries[i] = e
+	}
+	writeJSON(w, 200, entries)
+}
+
 func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 	ns, id := r.PathValue("ns"), r.PathValue("id")
 	if err := validNames(ns, ""); err != nil {
@@ -1080,8 +1154,17 @@ func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
 	if !ok {
 		return nil, nil, nil, badInput("batch body must be an object")
 	}
-	for k := range m {
-		if k != "items" && k != "config" && k != "source" {
+	// The batch's own gesture and undoes are defaults for every step
+	// (§7.5), as an item's are for its steps.
+	var batchG gestureDefaults
+	for k, v := range m {
+		switch k {
+		case "items", "config", "source":
+		case "gesture", "undoes":
+			if err := batchG.set(k, v, "batch"); err != nil {
+				return nil, nil, nil, err
+			}
+		default:
 			return nil, nil, nil, badInput("unknown member " + k)
 		}
 	}
@@ -1097,6 +1180,8 @@ func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
 				return nil, nil, nil, badInput(fmt.Sprintf("item %d must be an object", i))
 			}
 			it := core.Item{}
+			itemG := batchG
+			var steps []any
 			for k, v := range o {
 				switch k {
 				case "resource":
@@ -1113,22 +1198,24 @@ func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
 					}
 					it.IfNoneMatch = true
 				case "steps":
-					steps, ok := v.([]any)
-					if !ok {
+					if steps, ok = v.([]any); !ok {
 						return nil, nil, nil, badInput(fmt.Sprintf("item %d: steps must be an array", i))
 					}
-					for _, st := range steps {
-						if st == "delete" {
-							it.Steps = append(it.Steps, core.Step{Delete: true})
-						} else if _, ok := st.([]any); ok {
-							it.Steps = append(it.Steps, core.Step{Patches: st})
-						} else {
-							return nil, nil, nil, badInput(fmt.Sprintf("item %d: a step is a patch set or \"delete\"", i))
-						}
+				case "gesture", "undoes":
+					if err := itemG.set(k, v, fmt.Sprintf("item %d", i)); err != nil {
+						return nil, nil, nil, err
 					}
 				default:
 					return nil, nil, nil, badInput(fmt.Sprintf("item %d: unknown member %s", i, k))
 				}
+			}
+			// The steps after the item's members, whose defaults they take.
+			for j, st := range steps {
+				step, err := parseStep(st, itemG, fmt.Sprintf("item %d, step %d", i, j))
+				if err != nil {
+					return nil, nil, nil, err
+				}
+				it.Steps = append(it.Steps, step)
 			}
 			items = append(items, it)
 		}
@@ -1146,6 +1233,69 @@ func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
 		}
 	}
 	return items, cc, m["source"], nil
+}
+
+// gestureDefaults are the gesture and undoes a batch or item gives its
+// steps (§7.5); a step's own values override each.
+type gestureDefaults struct{ gesture, undoes string }
+
+// set reads member k ("gesture" or "undoes") of where: a gesture id, or
+// 400 (§7.2).
+func (d *gestureDefaults) set(k string, v any, where string) error {
+	g, ok := v.(string)
+	if !ok || !core.ValidGesture(g) {
+		return badInput(fmt.Sprintf("%s: %s must be a gesture id: 26 base32 characters", where, k))
+	}
+	if k == "gesture" {
+		d.gesture = g
+	} else {
+		d.undoes = g
+	}
+	return nil
+}
+
+// parseStep reads one step of a batch item (§7.5): a patch set, "delete",
+// or an object with exactly one of "patches" and "delete": true, and
+// optional gesture and undoes, which override the defaults d.
+func parseStep(v any, d gestureDefaults, where string) (core.Step, error) {
+	switch x := v.(type) {
+	case string:
+		if x == "delete" {
+			return core.Step{Delete: true, Gesture: d.gesture, Undoes: d.undoes}, nil
+		}
+	case []any:
+		return core.Step{Patches: x, Gesture: d.gesture, Undoes: d.undoes}, nil
+	case map[string]any:
+		_, hasP := x["patches"]
+		_, hasD := x["delete"]
+		if hasP == hasD {
+			return core.Step{}, badInput(where + ": a step object has exactly one of patches and delete")
+		}
+		var step core.Step
+		for k, mv := range x {
+			switch k {
+			case "patches":
+				if _, ok := mv.([]any); !ok {
+					return core.Step{}, badInput(where + ": patches must be a patch set")
+				}
+				step.Patches = mv
+			case "delete":
+				if mv != true {
+					return core.Step{}, badInput(where + ": delete must be true")
+				}
+				step.Delete = true
+			case "gesture", "undoes":
+				if err := d.set(k, mv, where); err != nil {
+					return core.Step{}, err
+				}
+			default:
+				return core.Step{}, badInput(fmt.Sprintf("%s: unknown member %s", where, k))
+			}
+		}
+		step.Gesture, step.Undoes = d.gesture, d.undoes
+		return step, nil
+	}
+	return core.Step{}, badInput(where + ": a step is a patch set, \"delete\" or a step object")
 }
 
 func (s *Server) nsPurge(w http.ResponseWriter, r *http.Request) {

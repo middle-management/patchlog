@@ -40,18 +40,19 @@ type Config struct {
 const Methods = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
 
 // Headers are the request headers the API reads beyond the CORS-safelisted
-// ones: credentials (§C.1), preconditions (§7.2), author signatures
-// (§C.3), blob uploads and copies (§7.8), ranges and event-stream resumes
+// ones: credentials (§C.1), preconditions (§7.2), gestures (§7.2), author
+// signatures (§C.3), blob uploads and copies (§7.8), ranges and event-stream resumes
 // (§9), and X-Author, which names the author when authentication is off
 // (serve -dev). The edge's verification header (-edge-header) is left out
 // on purpose: a browser has no business sending it.
-const Headers = "Authorization, Content-Type, If-Match, If-None-Match, If-Range, Range, Signature, Source-Authorization, Blob-From, Blob-Nonce, Last-Event-ID, X-Author"
+const Headers = "Authorization, Content-Type, If-Match, If-None-Match, If-Range, Range, Signature, Source-Authorization, Gesture, Undoes, Blob-From, Blob-Nonce, Last-Event-ID, X-Author"
 
 // Exposed are the response headers pages may read beyond the safelisted
-// ones: at least those §7 "Browsers" lists, among them X-Log-Next, without
+// ones: at least those §7 "Browsers" lists, among them Gesture and Undoes
+// (what a write recorded, §7.2) and X-Log-Next, without
 // which a page can't follow a paged log range (§7.1) and must treat its
 // first page as truncated.
-const Exposed = "ETag, Location, Retry-After, Allow, WWW-Authenticate, Accept-Ranges, Content-Range, X-Namespace-Revision, X-Config-Revision, X-Revision, X-Cursor, X-Log-Next, X-E2E"
+const Exposed = "ETag, Location, Retry-After, Allow, WWW-Authenticate, Accept-Ranges, Content-Range, Gesture, Undoes, X-Namespace-Revision, X-Config-Revision, X-Revision, X-Cursor, X-Log-Next, X-E2E"
 
 // Parse splits comma-separated origins, as given on the command line, and
 // checks them: each is "*" or a scheme://host[:port] without a path.

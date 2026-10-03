@@ -1,6 +1,6 @@
 # patchlog
 
-A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.38).
+A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.39).
 Each resource is an append-only log of content-addressed JSON Patch sets. The server
 validates documents that opt in with `$schema`, enforces namespace rules and grants,
 and serves immutable, CDN-cacheable revisions.
@@ -20,6 +20,7 @@ and serves immutable, CDN-cacheable revisions.
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
+| Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling and client library; the client's undo procedure, §11.2, to come; see [Design notes](#design-notes)) |
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
@@ -502,11 +503,11 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
 
 - Preflights (`OPTIONS` with `Access-Control-Request-Method`) are answered by the server. The
   request headers the API reads are allowed (`Authorization`, `Content-Type`, `If-Match`,
-  `If-None-Match`, `If-Range`, `Range`, `Signature`, `Source-Authorization`, `Blob-From`,
-  `Blob-Nonce`, `Last-Event-ID`, and `X-Author`, which names the author under `serve -dev`), and the response headers it sets are exposed (`ETag`, `Location`,
-  `Retry-After`, `Content-Range`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`,
+  `If-None-Match`, `If-Range`, `Range`, `Signature`, `Source-Authorization`, `Gesture`, `Undoes`,
+  `Blob-From`, `Blob-Nonce`, `Last-Event-ID`, and `X-Author`, which names the author under `serve -dev`), and the response headers it sets are exposed (`ETag`, `Location`,
+  `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`,
   `X-Cursor`, `X-Log-Next`, …), as §7 "Browsers" lists them; without `X-Log-Next` a page couldn't
-  follow a paged log range. `-cors-max-age` (default 10m) sets `Access-Control-Max-Age`, how long
+  follow a paged log range, and without `Gesture` it couldn't see what a retried write recorded. `-cors-max-age` (default 10m) sets `Access-Control-Max-Age`, how long
   browsers cache a preflight.
 - Grants travel in `Authorization`, which a page sets itself, so cross-origin calls need no
   cookies. `-cors-credentials` adds `Access-Control-Allow-Credentials` for pages that do send
@@ -725,6 +726,9 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
 - Resources are classified by ancestry, using ids only (§F.3). A fast-forward reproduces the
   branch's ids exactly. A replay reports overlapping `writes` under the array rule, and the
   delete-versus-change cases always go to a person.
+- Fast-forwarded and replayed steps carry each branch revision's `gesture` and `undoes` (§F.3,
+  step objects of §7.5), so history views and undo keep their grouping in the base; rebases do
+  the same, and `-squash` loses them.
 - `-resolve name=file.json` replaces a conflicting item's steps with a resolution. A `"keep"`
   resolution is still recorded in the batch with an empty step `[]` (in a sealed namespace, a
   patch set that only adds a fresh `$nonce`), so the batch holds the resource's pair, but only
@@ -1367,6 +1371,10 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
 ```
 
 - **History bundles** keep ids, so importing one reproduces the source's ids exactly.
+- **Authors** (`-authors`, `"authors": true`) adds each history line's author, creation time,
+  signature, and its `gesture` and `undoes` (§G.4.1). Imports write the gestures with the
+  revisions (batch step objects, §7.5), so undo history survives the move; authors and times
+  stay the importer's, as for any batch. Without authors a line carrying them is refused.
 - **Snapshot bundles** go through `{ns}-upstream` namespaces. Pinned references between snapshot
   documents are rewritten to them, keeping any `#id` fragment.
 - **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
@@ -1702,8 +1710,9 @@ just doesn't apply).
   resource's state (a branch's view, read-through included) after the idempotent-retry lookup
   and before frozen and the precondition, so a grant that can't restore gets `403` on a
   tombstoned resource, whatever `If-Match` says.
-- **Namespace log entries** are `{ …entry, id, prev?, author, grant?, created }` (§7.4).
-  `author`, `grant` and `created` are stored alongside the hashed entry, not in it. `grant` is
+- **Namespace log entries** are `{ …entry, id, prev?, author, grant?, gesture?, undoes?,
+  gestures?, created }` (§7.4). `author`, `grant`, the gesture members (see Gestures) and
+  `created` are stored alongside the hashed entry, not in it. `grant` is
   `{ "id", "sub", "kid" }`: the id (§C.3) of the grant the entry was written under, stored as
   `ns_log.grant_id` (D.2), and its root `sub` and `kid`, stored in plaintext next to the
   non-bearer grant (`grants.root_sub`, `root_kid`; neither is secret, the log serves both), so
@@ -1735,7 +1744,39 @@ just doesn't apply).
   the client no longer reads. The cost: tools count those entries for no one, so an
   `"abandoned": true` set before the upgrade must be set again, and a merge batch the backfill
   couldn't fill (only `[]` items, or config only) no longer counts as a common ancestor.
-- **`GET /`** answers `{ "spec": "0.38", "auth": "grants" | "disabled", "origin" }` (§1, §7,
+- **Gestures** (§7.2, §7.4, §7.5, v0.39). `Gesture` and `Undoes` on `PATCH`, `DELETE` and
+  restores, each one gesture id (`^[a-z2-7]{26}$`, otherwise `400`; blob uploads, purges and
+  prunes write no revision or tombstone and don't read them), are stored with the revision
+  or tombstone (`revisions.gesture`, `undoes`, with partial indexes, D.2), outside its id and the
+  change envelope, so ids don't depend on them and rules never see them; pruning keeps them
+  (§8.6), purges keep them with the ids. Write responses carry `Gesture`/`Undoes` naming what the
+  entry recorded, so an idempotent retry, answered with the entry as first recorded, says so
+  whatever it sent. In a batch a step may be `{ "patches": [...] | "delete": true, "gesture"?,
+  "undoes"? }`; an item's and the batch's `gesture`/`undoes` are defaults, a step's own values
+  override each, and the older step forms (`[...]`, `"delete"`) still work. Resource log entries
+  carry `gesture?`/`undoes?`; namespace entries of single writes `gesture?`/`undoes?`, and batch
+  entries `gestures: { resource: [{ gesture?, undoes? }, …] }`, one object per step (`{}` for a
+  step with neither) for every resource of the batch, the member left out when no step has one.
+  None of them are hashed: namespace entries keep them beside the hashed body
+  (`ns_log.gestures`) and merge them in when served, by ranges, long-polls and event streams
+  alike; sealed namespaces seal them inside their entries (§E.4), e2e ones serve them in
+  plaintext. Opening an older database adds the columns and indexes empty.
+  `GET /ns/{ns}/gestures/{gesture}` (optional in the spec) lists `{ resource, id, kind,
+  gesture?, undoes?, author, ns_id }` for every revision and tombstone written with the gesture
+  or undoing it, in insertion order (a resource's chain order; across resources, the order of a
+  client's successive saves), `no-store`. Pages are as long as log pages; `X-Log-Next` names the
+  next page's `since`, `{resource}/{id}` of the page's last entry (ids repeat across resources),
+  and the last page has none. It needs unrestricted read (`403`; `404` for a grant that can't
+  read the namespace as a whole, as for `/heads`), answers `404 not_offered` in sealed and e2e
+  namespaces after authorisation, leaves out purged resources, and in a branch lists only the
+  branch's own rows, not what it reads through from its base (ask the base). Merges carry each
+  fast-forwarded or replayed revision's gestures in their steps (§F.3), and remote branches
+  mirror them; squashes don't. The client library sends them with `client.WithGesture`,
+  `WithUndoes` (writes, `Delete` included), `Step.Gesture`/`WithGesture` and
+  `BatchItem`/`BatchRequest` defaults, reads them from `WriteResult`, `LogEntry`, `NSEntry`
+  (`Gestures` for batches) and lists with `Gestures`/`GesturesPage`; `client.NewGesture` makes
+  an id.
+- **`GET /`** answers `{ "spec": "0.39", "auth": "grants" | "disabled", "origin" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace

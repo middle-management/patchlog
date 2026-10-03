@@ -633,6 +633,9 @@ func (im *importer) bundleState(ctx context.Context, d *bdoc, id string) (any, b
 	return nil, false, fmt.Errorf("%s: %s is not in the bundle", d.key, id)
 }
 
+// stepsOfLines are the steps that write history lines, each with the
+// line's gesture and undoes, which a bundle carries with "authors": true
+// (§G.4.1), as a merge carries them (§F.3).
 func stepsOfLines(ls []*Line) []client.Step {
 	out := make([]client.Step, len(ls))
 	for i, l := range ls {
@@ -641,10 +644,13 @@ func stepsOfLines(ls []*Line) []client.Step {
 		} else {
 			out[i] = client.PatchStep(l.Patches)
 		}
+		out[i] = out[i].WithGesture(l.Gesture, l.Undoes)
 	}
 	return out
 }
 
+// stepsOfLog are the steps that write log entries, with their gestures
+// (§F.3).
 func stepsOfLog(es []client.LogEntry) []client.Step {
 	out := make([]client.Step, len(es))
 	for i, e := range es {
@@ -653,6 +659,7 @@ func stepsOfLog(es []client.LogEntry) []client.Step {
 		} else {
 			out[i] = client.Step{Patches: e.Patches}
 		}
+		out[i] = out[i].WithGesture(e.Gesture, e.Undoes)
 	}
 	return out
 }

@@ -33,7 +33,7 @@ func TestV038Root(t *testing.T) {
 			t.Fatal(err)
 		}
 		root, err := c.Root(context.Background())
-		if err != nil || root.Spec != "0.38" || root.Auth != tc.auth || root.Origin != "https://cms.example" {
+		if err != nil || root.Spec != core.SpecVersion || root.Auth != tc.auth || root.Origin != "https://cms.example" {
 			t.Fatalf("%s: client root %+v %v", tc.name, root, err)
 		}
 		if off, err := c.AuthDisabled(context.Background()); err != nil || off != (tc.auth == "disabled") {

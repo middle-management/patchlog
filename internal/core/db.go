@@ -54,6 +54,8 @@ CREATE TABLE IF NOT EXISTS revisions (
   signature  TEXT,                           -- addition: optional author signature (§C.3)
   schema_ref TEXT,                           -- addition: $schema of the resulting document, if typed (§6.1 index)
   created    INTEGER NOT NULL,
+  gesture    TEXT,                           -- §7.2, metadata, not hashed; its partial index is created after migrate (gestureIndexes)
+  undoes     TEXT,
   UNIQUE (res, id),
   UNIQUE (res, parent_seq)
 );
@@ -158,6 +160,7 @@ CREATE TABLE IF NOT EXISTS ns_log (
   created    INTEGER NOT NULL,
   grant_id   BLOB,                           -- §C.3; the root sub and kid are read from the stored grant (§7.4); NULL for entries the server writes itself and without authentication
   no_auth    INTEGER,                        -- 1: written on a request while authentication was disabled, served as "grant": null (§1, §7.4); NULL otherwise, and in rows from before v0.38
+  gestures   TEXT,                           -- addition: canonical JSON of the entry's unhashed gesture members (§7.4): { gesture?, undoes? } of a single write, { gestures } of a batch; NULL for none
   UNIQUE (ns, id),
   UNIQUE (ns, prev_seq)
 );
@@ -370,7 +373,8 @@ func migrate(db *sql.DB) error {
 		{"ns_log", "grant_id", "BLOB", backfillNSGrants, nil}, {"ns_log", "no_auth", "INTEGER", "", nil}, {"grants", "root_sub", "TEXT", "", nil},
 		{"grants", "root_kid", "TEXT", "", backfillGrantRoots(func(int) string { return "?" })},
 		{"blob_bytes", "file", "TEXT", "", nil}, {"blob_epochs", "file", "TEXT", "", nil},
-		{"namespaces", "head_id", "BLOB", "", nil}, {"resources", "snap_revs", "INTEGER", "", nil}, {"resources", "snap_bytes", "INTEGER", "", nil}} {
+		{"namespaces", "head_id", "BLOB", "", nil}, {"resources", "snap_revs", "INTEGER", "", nil}, {"resources", "snap_bytes", "INTEGER", "", nil},
+		{"revisions", "gesture", "TEXT", "", nil}, {"revisions", "undoes", "TEXT", "", nil}, {"ns_log", "gestures", "TEXT", "", nil}} {
 		var has bool
 		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {
 			return err
@@ -402,8 +406,17 @@ func migrate(db *sql.DB) error {
 			return err
 		}
 	}
-	return nil
+	// After the columns exist, in databases from before them too.
+	_, err := db.ExecContext(ctx, gestureIndexes)
+	return err
 }
+
+// gestureIndexes find the revisions of a gesture, and those undoing it
+// (§7.4, D.2): partial, since most revisions have neither.
+const gestureIndexes = `
+CREATE INDEX IF NOT EXISTS revisions_by_gesture ON revisions (gesture) WHERE gesture IS NOT NULL;
+CREATE INDEX IF NOT EXISTS revisions_by_undoes ON revisions (undoes) WHERE undoes IS NOT NULL;
+`
 
 // backfillGrantRoots fills grants.root_sub and root_kid of a database from
 // before them, for the grants stored in plaintext. Those stored encrypted

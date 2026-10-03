@@ -158,11 +158,12 @@ func TestParse(t *testing.T) {
 // Every request header the servers read is allowed, X-Author (serve -dev)
 // included; the edge's verification header never is. The lists cover what
 // §7 "Browsers" requires: the methods and headers that make requests
-// non-simple, plus Blob-Nonce and Blob-From, allowed; the headers clients
-// read, X-Log-Next (§7.1 Paging) among them, exposed.
+// non-simple, plus Gesture, Undoes (§7.2), Blob-Nonce and Blob-From,
+// allowed; the headers clients read, Gesture, Undoes and X-Log-Next (§7.1
+// Paging) among them, exposed.
 func TestHeaderLists(t *testing.T) {
 	allowed := strings.Split(Headers, ", ")
-	for _, h := range []string{"Authorization", "Content-Type", "If-Match", "If-None-Match", "If-Range", "Range", "Signature", "Source-Authorization", "Blob-From", "Blob-Nonce", "Last-Event-ID", "X-Author"} {
+	for _, h := range []string{"Authorization", "Content-Type", "If-Match", "If-None-Match", "If-Range", "Range", "Signature", "Source-Authorization", "Gesture", "Undoes", "Blob-From", "Blob-Nonce", "Last-Event-ID", "X-Author"} {
 		if !slices.Contains(allowed, h) {
 			t.Errorf("%s not allowed", h)
 		}
@@ -177,7 +178,7 @@ func TestHeaderLists(t *testing.T) {
 		}
 	}
 	exposed := strings.Split(Exposed, ", ")
-	for _, h := range []string{"ETag", "Location", "Retry-After", "Content-Range", "X-Revision", "X-Namespace-Revision", "X-Config-Revision", "X-Cursor", "X-Log-Next", "X-E2E"} {
+	for _, h := range []string{"ETag", "Location", "Retry-After", "Content-Range", "Gesture", "Undoes", "X-Revision", "X-Namespace-Revision", "X-Config-Revision", "X-Cursor", "X-Log-Next", "X-E2E"} {
 		if !slices.Contains(exposed, h) {
 			t.Errorf("%s not exposed", h)
 		}
