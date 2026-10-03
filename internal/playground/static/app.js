@@ -103,6 +103,7 @@ const S = {
   resState: null, hist: [], selRev: '',
   ifDirty: false, cfgDirty: false,
   nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null, nsLogErr: '',
+  gesture: '', // the Gesture of this page's last save (§7.2)
 };
 
 /* ------------------------------------------------------------------ *
@@ -445,7 +446,7 @@ async function refreshNS() {
 }
 
 function renderNsAll() {
-  renderNsStatus(); renderNsDoc(); renderNsLog(); renderHeads(); renderBranches();
+  renderNsStatus(); renderNsDoc(); renderNsLog(); renderHeads(); renderBranches(); undoRefresh();
   if (!S.cfgDirty) $('nsIfMatch').value = S.config || '';
   if (!$('nsPurgeIm').dataset.dirty) $('nsPurgeIm').value = S.nsHead || '';
 }
@@ -510,7 +511,7 @@ function renderNsLog() {
   tb.replaceChildren(...rows.map((e) => {
     const target = e.target || e.name || '';
     const tr = h('tr', { class: 'click' + (e.kind === 'tombstone' ? ' tomb' : '') },
-      h('td', {}, kindBadge(e.kind)),
+      h('td', {}, kindBadge(e.kind), ...nsGestureBadges(e)),
       h('td', { class: 'mono' }, e.resource || (e.kind === 'branch' ? e.name : '') || ''),
       h('td', {}, ID_RE.test(target) ? idEl(target) : h('span', { class: 'mono' }, target)),
       h('td', { title: grantTitle(e) }, e.author || '', e.grant ? h('span', { class: 'muted small' }, ' \u00b7 ' + e.grant.kid) : null),
@@ -520,6 +521,17 @@ function renderNsLog() {
     tr.onclick = () => { if (e.resource) openResource(e.resource); else if (e.kind === 'branch' && e.name) asUser(() => selectNS(e.name)); };
     return tr;
   }));
+}
+
+/* nsGestureBadges shows the gestures of a namespace entry (§7.4): a single write's gesture and undoes, or for a
+ * batch the distinct gestures of its steps. */
+function nsGestureBadges(e) {
+  if (e.kind !== 'batch' || !e.gestures) return gestureBadges(e);
+  const gs = new Set(), us = new Set();
+  Object.values(e.gestures).forEach((steps) => (steps || []).forEach((x) => { if (x && x.gesture) gs.add(x.gesture); if (x && x.undoes) us.add(x.undoes); }));
+  if (gs.size + us.size === 0) return [];
+  if (gs.size <= 1 && us.size <= 1) return gestureBadges({ gesture: [...gs][0], undoes: [...us][0] });
+  return [h('span', { class: 'badge info', title: 'gestures per resource and step: ' + JSON.stringify(e.gestures) }, `${gs.size} gestures`)];
 }
 
 function renderHeads() {
@@ -685,11 +697,14 @@ async function writeRes(kind) {
     if (!p.ok || !Array.isArray(p.v)) return toast('The patch set is not a JSON array');
     patch = fmtPatch(withNonce(p.v));
   }
+  // Every save is one user action, with its own Gesture (§7.2, §11.2 Recording), unless "same gesture" is on.
+  const gesture = takeGesture();
   let r;
-  if (kind === 'create') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-None-Match': '*' }, body: patch });
-  else if (kind === 'append') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value) }, body: patch });
-  else if (kind === 'restore') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value) }, body: $('restoreEditor').checked ? patch : '[]' });
-  else if (kind === 'delete') r = await api('DELETE', rpath(), { headers: { 'If-Match': normIf($('ifMatch').value) } });
+  if (kind === 'create') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-None-Match': '*', Gesture: gesture }, body: patch });
+  else if (kind === 'append') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body: patch });
+  else if (kind === 'restore') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body: $('restoreEditor').checked ? patch : '[]' });
+  else if (kind === 'delete') r = await api('DELETE', rpath(), { headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture } });
+  if (r && r.ok) noteGesture(r.hdr('Gesture') || gesture);
   if (r && (r.status === 201 || (kind === 'delete' && r.ok))) { S.ifDirty = false; await afterWrite(); }
   else if (r && r.status === 200) toast('200: idempotent retry, entry already in the log');
 }
@@ -789,7 +804,7 @@ function renderHistory() {
     const li = h('li', { class: (tomb ? 'tomb ' : '') + (e.id === S.selRev ? 'sel' : ''), tabindex: 0, role: 'button' },
       h('div', { class: 'top1' }, kindBadge(e.kind), idEl(e.id), h('span', { class: 'muted' }, e.author || ''), h('span', { class: 'muted mono', title: e.created }, tsFmt(e.created)),
         e._sealed ? h('span', { class: 'badge tomb', title: 'kid ' + e._sealed }, 'sealed') : null,
-        e._flag ? h('span', { class: 'badge err', title: e._flag }, 'flagged') : null),
+        e._flag ? h('span', { class: 'badge err', title: e._flag }, 'flagged') : null, ...gestureBadges(e)),
       h('div', { class: 'ops' }, opsSummary(e)),
       e._flag ? h('div', { class: 'ops', style: 'color:var(--err)' }, e._flag + (e.author ? ` (author ${e.author} is accountable)` : '')) : null,
       e._note ? h('div', { class: 'ops muted' }, e._note) : null);
@@ -808,11 +823,13 @@ async function selectRev(id) {
   if (S.selRev !== id) return;
   const head = h('div', { class: 'state-line' }, kindBadge(entry.kind || '?'), h('span', { class: 'id', onclick: () => copy(id) }, id),
     entry.parent ? h('span', { class: 'muted' }, 'parent') : null, entry.parent ? idEl(entry.parent) : null);
-  const meta = h('div', { class: 'muted small' }, `${entry.author || ''}  ${tsFmt(entry.created)}`);
+  const meta = h('div', { class: 'muted small' }, `${entry.author || ''}  ${tsFmt(entry.created)}`,
+    entry.gesture ? `  \u00b7 gesture ${entry.gesture}` : '', entry.undoes ? `  \u00b7 undoes ${entry.undoes}` : '');
   const acts = h('div', { class: 'row' },
     h('button', { class: 'tiny', onclick: () => { setIfMatch(id); toast('If-Match set'); showTab('res'); } }, 'Use as If-Match'),
     h('button', { class: 'tiny', onclick: () => { $('pruneH').value = id; toast('Prune horizon set'); showTab('res'); } }, 'Use as prune horizon'),
-    h('button', { class: 'tiny', onclick: () => copy(id) }, 'Copy id'));
+    h('button', { class: 'tiny', onclick: () => copy(id) }, 'Copy id'),
+    entry.gesture ? h('button', { class: 'tiny', title: 'undo every revision of gesture ' + entry.gesture + ' (§11.2); the result shows in the Namespace tab', onclick: () => { showTab('ns'); undoAction(entry.gesture, `Undo ${entry.gesture.slice(0, 6)}`); } }, 'Undo this gesture') : null);
   const parts = [head, meta, acts];
   if (entry._flag) parts.push(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'flagged'), '  ' + entry._flag + '. The revision is left out of the fold; its author is accountable (§E.3.2).'));
   if (entry._plain) parts.push(h('h3', {}, 'Patches (decrypted in this browser)'), jsonPre(entry._plain), h('details', {}, h('summary', { class: 'muted small' }, 'sealed patch set as stored (ids are over this ciphertext)'), jsonPre(entry.patches)));
@@ -828,6 +845,488 @@ async function selectRev(id) {
   } else if (r.status === 410 && entry.kind === 'tombstone') parts.push(h('p', { class: 'note' }, '410: a tombstone id has no document; earlier revisions stay readable.'));
   else parts.push(h('div', { class: 'errbox' }, h('span', { class: 'code' }, (r.json && r.json.code) || 'HTTP ' + r.status), '  ' + (r.status === 410 && r.json && r.json.code === 'pruned' ? 'below the horizon ' + short(r.json.horizon || '') : '')));
   box.replaceChildren(...parts);
+}
+
+/* ------------------------------------------------------------------ *
+ * undo and redo (§11.2), the procedure of internal/client/undo.go
+ * ------------------------------------------------------------------ */
+const GESTURE_RE = /^[a-z2-7]{26}$/;
+const U = { stack: null, busy: false };
+
+/* takeGesture returns the Gesture of the next save (§7.2): a fresh id per save, or the last one again while
+ * "same gesture" is checked, so several saves make one user action for undo (§11.1, §11.2 Recording). */
+function takeGesture() {
+  if ($('gestureKeep').checked && GESTURE_RE.test(S.gesture || '')) return S.gesture;
+  return Z.newNonce();
+}
+function noteGesture(g) { S.gesture = g; $('gestureCur').textContent = g ? 'last gesture ' + g : ''; }
+function gestureBadges(e) {
+  return [e.gesture ? h('span', { class: 'badge info', title: 'gesture ' + e.gesture + ' (§7.2): the user action this entry belongs to' }, 'gesture ' + e.gesture.slice(0, 6)) : null,
+    e.undoes ? h('span', { class: 'badge warn', title: 'undoes gesture ' + e.undoes + ' (§11.2)' }, 'undoes ' + e.undoes.slice(0, 6)) : null];
+}
+
+function undoPtr(s) { return s === '' ? [] : s.slice(1).split('/').map((t) => t.replace(/~1/g, '/').replace(/~0/g, '~')); }
+function undoPtrStr(toks) { return toks.map((t) => '/' + String(t).replace(/~/g, '~0').replace(/\//g, '~1')).join(''); }
+function ptrGet(doc, toks) {
+  let cur = doc;
+  for (const t of toks) {
+    if (Array.isArray(cur)) { if (!/^(0|[1-9][0-9]*)$/.test(t) || Number(t) >= cur.length) return { ok: false }; cur = cur[Number(t)]; }
+    else if (cur && typeof cur === 'object' && Object.prototype.hasOwnProperty.call(cur, t)) cur = cur[t];
+    else return { ok: false };
+  }
+  return { ok: true, v: cur };
+}
+function sameAt(a, b) { return a.ok === b.ok && (!a.ok || Z.canonical(a.v) === Z.canonical(b.v)); }
+function hasPrefix(p, q) { return q.length <= p.length && q.every((t, i) => p[i] === t); }
+
+/* widenWrite widens a write whose last segment addresses an array element (an index, or "-") to the whole
+ * array (§11.2, as merges do, §F.3). */
+function widenWrite(doc, toks) {
+  if (!toks.length) return toks;
+  const parent = toks.slice(0, -1);
+  if (toks[toks.length - 1] === '-') return parent;
+  const p = ptrGet(doc, parent);
+  return p.ok && Array.isArray(p.v) ? parent : toks.slice();
+}
+
+/* coverPaths keeps the topmost of ws (arrays of segments), sorted as pointer strings. */
+function coverPaths(ws) {
+  const out = [];
+  [...ws].sort((a, b) => a.length - b.length || (undoPtrStr(a) < undoPtrStr(b) ? -1 : 1))
+    .forEach((w) => { if (!out.some((k) => hasPrefix(w, k))) out.push(w); });
+  return out.sort((a, b) => (undoPtrStr(a) < undoPtrStr(b) ? -1 : undoPtrStr(a) > undoPtrStr(b) ? 1 : 0));
+}
+
+function pathsOverlap(a, b) {
+  const set = new Set();
+  for (const x of a) for (const y of b) if (hasPrefix(x, y) || hasPrefix(y, x)) { set.add(undoPtrStr(x)); set.add(undoPtrStr(y)); }
+  return [...set].sort();
+}
+
+/* foldUndo folds log entries (plaintext) onto start = { doc, exists, deleted }, keeping the states around each
+ * entry and, from index from on, its writes (§6.4.1): fresh $nonce adds and anything at /$nonce left out,
+ * array element writes widened. A patch set on a tombstone is a restore. */
+function foldUndo(start, entries, from) {
+  let st = { doc: start.doc, exists: start.exists, deleted: start.deleted };
+  return entries.map((e, i) => {
+    const fe = { e, pre: st, writes: [], ops: null, restore: false, flag: e._err || e._flag || '' };
+    if (e.kind === 'tombstone') {
+      if (!st.exists || st.deleted) throw new Error(`${e.id} deletes a resource that isn't live`);
+      st = { doc: st.doc, exists: true, deleted: true };
+    } else if (fe.flag) {
+      /* left out, as folds do */
+    } else if (!Array.isArray(e.patches)) {
+      throw Object.assign(new Error(`the patch set of ${e.id} is pruned`), { pruned: true });
+    } else {
+      fe.ops = e.patches; fe.restore = st.deleted;
+      let doc = st.doc, exists = st.exists;
+      for (const op of e.patches) {
+        const pre = doc;
+        const r = Z.applyPatch(doc, exists, [op]);
+        doc = r.doc; exists = r.exists;
+        if (i < from || op.op === 'test') continue;
+        if ((op.op === 'add' || op.op === 'replace') && op.path === '/$nonce' && typeof op.value === 'string' && GESTURE_RE.test(op.value)) continue;
+        if (op.op === 'remove') fe.writes.push(widenWrite(pre, undoPtr(op.path)));
+        else if (op.op === 'move') fe.writes.push(widenWrite(pre, undoPtr(op.from)), widenWrite(doc, undoPtr(op.path)));
+        else fe.writes.push(widenWrite(doc, undoPtr(op.path)));
+      }
+      fe.writes = fe.writes.filter((w) => w[0] !== '$nonce');
+      st = { doc, exists, deleted: false };
+    }
+    fe.post = st;
+    return fe;
+  });
+}
+
+/* moveBack inverts a revision made only of moves (and fresh $nonce adds) by moves back, when both ends are
+ * unchanged since and the moves back restore the parent's values (§11.2). It returns ops or null. */
+function moveBack(fe, st, paths) {
+  const moves = [];
+  for (const op of fe.ops) {
+    if (op.op === 'move') moves.push(op);
+    else if (!((op.op === 'add' || op.op === 'replace') && op.path === '/$nonce')) return null;
+  }
+  if (!moves.length || !paths.length) return null;
+  const same = (a, b) => paths.every((w) => sameAt(ptrGet(a, w), ptrGet(b, w)));
+  if (!same(st.doc, fe.post.doc)) return null;
+  let doc = fe.pre.doc;
+  const back = [];
+  for (const op of moves) {
+    const to = undoPtr(op.path);
+    if (to[to.length - 1] === '-') {
+      const arr = ptrGet(Z.applyPatch(doc, true, [{ op: 'remove', path: op.from }]).doc, to.slice(0, -1));
+      if (!arr.ok || !Array.isArray(arr.v)) return null;
+      to[to.length - 1] = String(arr.v.length);
+    }
+    doc = Z.applyPatch(doc, true, [op]).doc;
+    back.unshift({ op: 'move', from: undoPtrStr(to), path: op.from });
+  }
+  let res;
+  try { res = Z.applyPatch(st.doc, st.exists, back); } catch (_) { return null; }
+  if (!same(res.doc, fe.pre.doc)) return null;
+  st.doc = res.doc;
+  return back;
+}
+
+/* invertRev returns the ops that set fe's paths back to its parent's values on st, applying them to st, or
+ * { conflict } when one doesn't apply. $nonce is never restored. */
+function invertRev(fe, st) {
+  const paths = coverPaths(fe.writes);
+  const mb = moveBack(fe, st, paths);
+  if (mb) return { ops: mb };
+  const noNonce = (v) => { if (!v || typeof v !== 'object' || Array.isArray(v) || !('$nonce' in v)) return v; const c = Object.assign({}, v); delete c.$nonce; return c; };
+  const ops = [];
+  for (const w of paths) {
+    const t = w.length ? ptrGet(fe.pre.doc, w) : { ok: fe.pre.exists, v: noNonce(fe.pre.doc) };
+    const c = w.length ? ptrGet(st.doc, w) : { ok: true, v: noNonce(st.doc) };
+    if (sameAt(t, c)) continue;
+    const path = undoPtrStr(w);
+    const op = !t.ok ? { op: 'remove', path } : c.ok ? { op: 'replace', path, value: t.v } : { op: 'add', path, value: t.v };
+    try { st.doc = Z.applyPatch(st.doc, st.exists, [op]).doc; } catch (_) { return { conflict: { kind: 'apply', entry: fe.e.id, author: fe.e.author, paths: [path] } }; }
+    ops.push(JSON.parse(JSON.stringify(op)));
+  }
+  return { ops };
+}
+
+/* planUndoResource plans one resource (§11.2): o = { name, head, headKind ('live'|'tomb'), start, entries
+ * (plaintext log after start, up to head), gesture, author, nonce, maxOps, maxBytes }. It returns null when the
+ * gesture has no entries there, else { resource, head, entries, writes, conflicts, steps, doc, deleted }. */
+function planUndoResource(o) {
+  const own = (e) => e.gesture === o.gesture && e.author === o.author;
+  const first = o.entries.findIndex(own);
+  if (first < 0) return null;
+  let last = first;
+  o.entries.forEach((e, i) => { if (own(e)) last = i; });
+  const folded = foldUndo(o.start, o.entries, first);
+  const mine = folded.slice(first, last + 1).filter((fe) => own(fe.e));
+  const bad = mine.find((fe) => fe.flag);
+  if (bad) throw Object.assign(new Error(`the gesture's revision ${bad.e.id} doesn't open: ${bad.flag}`), { impossible: 'invalid' });
+  let gw = [];
+  mine.forEach((fe) => { gw.push(...fe.writes); if (fe.e.kind === 'rev' && !fe.e.parent) gw.push([]); });
+  gw = coverPaths(gw);
+  const out = { resource: o.name, head: o.head, entries: mine.map((fe) => fe.e.id), writes: gw.map(undoPtrStr), conflicts: [], steps: [] };
+  for (const fe of folded.slice(last + 1)) {
+    const c = { resource: o.name, entry: fe.e.id, author: fe.e.author || '', gesture: fe.e.gesture || '', paths: [] };
+    if (fe.e.undoes === o.gesture) c.kind = 'undone';
+    else if (fe.e.kind === 'tombstone') c.kind = 'deleted';
+    else if (fe.flag) c.kind = 'unreadable';
+    else if (fe.restore) c.kind = 'restored';
+    else { c.paths = pathsOverlap(gw, fe.writes); if (!c.paths.length) continue; c.kind = 'overlap'; }
+    out.conflicts.push(c);
+  }
+  if (out.conflicts.length) return out;
+  const fin = folded[folded.length - 1].post;
+  const st = { doc: JSON.parse(JSON.stringify(fin.doc === undefined ? null : fin.doc)), exists: fin.exists, deleted: fin.deleted };
+  const nonce = o.nonce || !!(st.doc && typeof st.doc === 'object' && !Array.isArray(st.doc) && '$nonce' in st.doc);
+  const withN = (ops) => (nonce ? ops.concat([{ op: 'add', path: '/$nonce', value: Z.newNonce() }]) : ops);
+  let pending = [], restore = false;
+  const flush = () => {
+    const ops = pending, rs = restore;
+    pending = []; restore = false;
+    if (!ops.length) { if (rs) out.steps.push(withN([])); return; }
+    const maxOps = (o.maxOps || 1000) - (nonce ? 1 : 0), maxBytes = (o.maxBytes || 262144) - (nonce ? 64 : 0);
+    let cur = [], size = 2;
+    for (const op of ops) {
+      const n = JSON.stringify(op).length + 1;
+      if (cur.length && (cur.length + 1 > maxOps || size + n > maxBytes)) { out.steps.push(withN(cur)); cur = []; size = 2; }
+      cur.push(op); size += n;
+    }
+    out.steps.push(withN(cur));
+  };
+  for (let i = mine.length - 1; i >= 0; i--) {
+    const fe = mine[i];
+    if (fe.e.kind === 'tombstone') { flush(); restore = true; st.deleted = false; }
+    else if (!fe.e.parent) { flush(); out.steps.push('delete'); st.deleted = true; }
+    else {
+      const r = invertRev(fe, st);
+      if (r.conflict) { out.conflicts.push(Object.assign({ resource: o.name }, r.conflict)); return out; }
+      pending.push(...r.ops);
+      if (fe.restore) { flush(); out.steps.push('delete'); st.deleted = true; }
+    }
+  }
+  flush();
+  if (!out.steps.length && o.headKind === 'live') { restore = true; flush(); }
+  out.doc = st.doc; out.deleted = st.deleted;
+  return out;
+}
+
+/* undoSites finds where a gesture wrote, from a namespace log (§11.2 Finding a gesture): entries carrying it by
+ * the same author (the first one's, unless given), each resource with a hint (its head before) to read from. */
+function undoSites(nsLog, gesture, author) {
+  const last = new Map(), sites = new Map();
+  let who = author || '';
+  const note = (res, target, a, match) => {
+    if (!match || (who && who !== a)) return;
+    who = a;
+    if (!sites.has(res)) sites.set(res, { resource: res, hint: last.get(res) || '', markers: [] });
+    sites.get(res).markers.push(target);
+  };
+  for (const e of nsLog) {
+    if (e.kind === 'head' || e.kind === 'tombstone') { note(e.resource, e.target, e.author, e.gesture === gesture); if (e.kind === 'head') last.set(e.resource, e.target); }
+    else if (e.kind === 'batch') {
+      for (const sub of e.entries || []) {
+        if (!sub.resource) continue;
+        note(sub.resource, sub.target, e.author, ((e.gestures || {})[sub.resource] || []).some((x) => x && x.gesture === gesture));
+        if (sub.kind === 'head') last.set(sub.resource, sub.target);
+      }
+    } else if (e.kind === 'purge') last.delete(e.resource);
+  }
+  return { author: who, sites: [...sites.values()] };
+}
+
+/* undoStackFrom rebuilds an author's undo stack from a namespace log (§11.2 Redo): the gestures that author made,
+ * minus those the same author undid and didn't redo. Others' undos are listed (undoneBy), not counted; Undoes
+ * naming a gesture that isn't in the log, or another author's, is ignored. target is what to undo next. */
+function undoStackFrom(nsLog, author) {
+  const recs = [], by = new Map();
+  nsLog.forEach((e, i) => {
+    const add = (res, g) => {
+      if (!g || !g.gesture) return;
+      const k = e.author + '\n' + g.gesture;
+      let r = by.get(k);
+      if (!r) { r = { gesture: g.gesture, author: e.author, undoes: '', resources: [], first: i, last: i, created: e.created }; by.set(k, r); recs.push(r); }
+      if (!r.undoes && g.undoes) r.undoes = g.undoes;
+      r.last = i; r.created = e.created;
+      if (res && !r.resources.includes(res)) r.resources.push(res);
+    };
+    if (e.kind === 'head' || e.kind === 'tombstone') add(e.resource, e);
+    else if (e.kind === 'batch') for (const sub of e.entries || []) for (const g of (e.gestures || {})[sub.resource] || []) add(sub.resource, g);
+  });
+  const own = (g) => by.get(author + '\n' + g);
+  const undoers = (g) => recs.filter((r) => r.undoes === g);
+  const done = [], undone = [];
+  for (const r of recs) {
+    if (r.author !== author) continue;
+    if (r.undoes && own(r.undoes) && own(r.undoes).first < r.first) continue;
+    let tip = r;
+    const chain = [];
+    for (;;) {
+      const next = undoers(tip.gesture).filter((y) => y.author === author && y.first > tip.first).pop();
+      if (!next) break;
+      tip = next; chain.push(next.gesture);
+    }
+    const it = Object.assign({}, r, { target: tip.gesture, chain, at: tip.last, undoneBy: [] });
+    if (chain.length % 2 === 0) { it.undoneBy = undoers(tip.gesture).filter((y) => y.author !== author && y.first > tip.first); done.push(it); }
+    else undone.push(it);
+  }
+  const byAt = (a, b) => a.at - b.at;
+  return { author, done: done.sort(byAt), undone: undone.sort(byAt) };
+}
+
+/* undoGestureList reads GET /ns/{ns}/gestures/{g} page by page (§7.4), or returns null where it isn't offered. */
+async function undoGestureList(ns, g) {
+  const out = [];
+  for (let since = '', i = 0; i < 1000; i++) {
+    const r = await api('GET', `/ns/${ns}/gestures/${g}` + (since ? '?since=' + encodeURIComponent(since) : ''), { auto: true, label: 'undo' });
+    if (r.status === 404 || r.status === 403 || r.status === 401) return null;
+    if (r.status !== 200 || !Array.isArray(r.json)) throw new Error('listing the gesture answered ' + r.status);
+    out.push(...r.json);
+    since = r.hdr('X-Log-Next') || '';
+    if (!since) return out;
+  }
+  throw new Error('the gesture listing does not end');
+}
+
+/* undoNSLog reads a namespace's whole log, page by page. */
+async function undoNSLog(ns) {
+  const r = await api('GET', `/ns/${ns}/log`, { auto: true, label: 'undo' });
+  if (r.status !== 200) throw new Error('the namespace log answered ' + r.status);
+  return nsLogRead(ns, r);
+}
+
+/* undoReadRes reads a resource's head, its log after the site's hint (or its pruning horizon) and the document
+ * there, decrypting E2 entries. */
+async function undoReadRes(ns, site) {
+  const name = site.resource;
+  const hr = await api('GET', `/r/${ns}/${name}`, { auto: true, label: 'undo' });
+  let head, headKind;
+  if (hr.status === 200) { head = hr.hdr('X-Revision') || hr.etag(); headKind = 'live'; }
+  else if (hr.status === 410 && hr.json && hr.json.tombstone) { head = hr.json.tombstone; headKind = 'tomb'; }
+  else if (hr.status === 410) throw Object.assign(new Error(name + ' is purged'), { impossible: 'purged', resource: name });
+  else throw new Error(`reading ${name} answered ${hr.status}`);
+  let since = site.hint, L = null;
+  for (let tries = 0; tries < 4; tries++) {
+    const r = await api('GET', `/r/${ns}/${name}/rev/${head}/log` + (since ? '?since=' + since : ''), { auto: true, label: 'undo' });
+    if (r.status === 410 && r.json && r.json.code === 'pruned' && r.json.horizon && r.json.horizon !== since) { since = r.json.horizon; continue; }
+    if (r.status === 404 && since) { since = ''; continue; }
+    if (r.status === 410 && r.json && r.json.code === 'pruned') throw Object.assign(new Error('the log of ' + name + ' is pruned'), { impossible: 'pruned', resource: name });
+    if (r.status !== 200) throw new Error(`the log of ${name} answered ${r.status}`);
+    L = await readLogRange(r, { auto: true, label: 'undo' });
+    break;
+  }
+  if (!L) throw new Error('could not read the log of ' + name);
+  if (L.err) throw new Error(`the log of ${name} is incomplete: ${L.err}`);
+  let entries = L.arr;
+  if (entries.length && typeof entries[0] === 'string') entries = await openEntries(ns, name, entries, head, since);
+  let start = { doc: null, exists: false, deleted: false };
+  if (since) {
+    const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'undo' });
+    if (r.status === 410) throw Object.assign(new Error(`the document at ${short(since)} is gone`), { impossible: 'pruned', resource: name });
+    if (r.status !== 200) throw new Error(`the document at ${short(since)} answered ${r.status}`);
+    const d = await readDoc(ns, name, since, r);
+    if (d.doc == null) throw new Error(`the document at ${short(since)} did not open` + (d.seal && d.seal.error ? ': ' + d.seal.error : ''));
+    start = { doc: d.doc, exists: true, deleted: false };
+  }
+  return { head, headKind, start, entries };
+}
+
+/* undoPlan plans the undo of gesture g in ns (§11.2): o = { author, level, limits, scanLog }. It returns
+ * { gesture, author, source, resources, conflicts, items }; an undo that can't be done throws with .impossible. */
+async function undoPlan(ns, g, o = {}) {
+  if (o.level === 'e2e') throw Object.assign(new Error('undo in an e2e namespace folds and seals the inverse client-side: use the Go client (client.Undo with UndoE2E); the playground does it for plaintext and sealed (E2) namespaces'), { refused: true });
+  let found = null, source = 'gestures';
+  const list = o.scanLog ? null : await undoGestureList(ns, g);
+  if (list) {
+    let who = o.author || '';
+    const sites = new Map();
+    for (const e of list) {
+      if (e.gesture !== g) continue;
+      if (!who) who = e.author;
+      if (e.author !== who) continue;
+      if (!sites.has(e.resource)) sites.set(e.resource, { resource: e.resource, hint: '', markers: [] });
+      sites.get(e.resource).markers.push(e.id);
+    }
+    found = { author: who, sites: [...sites.values()] };
+  } else { source = 'log'; found = undoSites(await undoNSLog(ns), g, o.author); }
+  if (!found.sites.length) throw Object.assign(new Error('the gesture ' + g + ' has no revisions here' + (o.author ? ' by ' + o.author : '')), { refused: true });
+  const plan = { gesture: g, author: found.author, source, resources: [], conflicts: [], items: [] };
+  const lim = o.limits || {};
+  for (const site of found.sites) {
+    const rr = await undoReadRes(ns, site);
+    const ids = new Set(rr.entries.map((e) => e.id));
+    const lost = site.markers.find((m) => !ids.has(m));
+    if (lost) throw Object.assign(new Error(`the gesture's entry ${short(lost)} lies below the pruning horizon of ${site.resource}`), { impossible: 'pruned', resource: site.resource });
+    let r;
+    try {
+      r = planUndoResource({ name: site.resource, head: rr.head, headKind: rr.headKind, start: rr.start, entries: rr.entries, gesture: g, author: found.author,
+        nonce: o.level === 'sealed', maxOps: lim.opsPerSet, maxBytes: lim.patchSetSize });
+    } catch (err) { if (err.pruned) err.impossible = 'pruned'; if (err.impossible) err.resource = site.resource; throw err; }
+    if (!r) continue;
+    plan.resources.push(r);
+    plan.conflicts.push(...r.conflicts);
+    if (!r.conflicts.length && r.steps.length) plan.items.push({ resource: r.resource, ifMatch: r.head, steps: r.steps });
+  }
+  return plan;
+}
+
+/* undoImpossible names why a failed undo batch can't be done (§11.2 When undo is impossible), or ''. */
+function undoImpossible(r) {
+  const j = r.json || {};
+  if (r.status === 410 && j.code === 'pruned') return 'pruned';
+  if (r.status !== 422) return '';
+  const codes = [j.code].concat((j.items || []).map((x) => x && x.code));
+  if (codes.includes('blob')) return 'blob';
+  if (codes.includes('invalid') || codes.includes('schema_unavailable')) return 'invalid';
+  return '';
+}
+
+/* undoRun undoes gesture g: plans, stops on conflicts, writes one batch with a fresh Gesture and Undoes: g, and on
+ * 412 plans again (3 retries). It returns { ok, plan, gesture, attempts, ns_id }, { conflicts }, { impossible },
+ * { refused } or { nothing }. */
+async function undoRun(ns, g, o = {}) {
+  const gesture = o.gesture || Z.newNonce();
+  let plan = null;
+  for (let attempt = 1; attempt <= 4; attempt++) {
+    try { plan = await undoPlan(ns, g, o); }
+    catch (err) {
+      if (err.impossible) return { impossible: err.impossible, resource: err.resource || '', message: err.message };
+      if (err.refused) return { refused: err.message };
+      throw err;
+    }
+    if (plan.conflicts.length) return { conflicts: plan.conflicts, plan };
+    if (!plan.items.length) return { nothing: true, plan };
+    const r = await api('POST', `/ns/${ns}/batch`, { body: { gesture, undoes: g, items: plan.items }, label: 'undo' });
+    if (r.status === 201 || r.status === 200) return { ok: true, plan, gesture, attempts: attempt, ns_id: r.hdr('X-Namespace-Revision') || (r.json || {}).ns_id };
+    if (r.status === 412) continue;
+    const why = undoImpossible(r);
+    if (why) return { impossible: why, message: httpFail(r).message, plan };
+    throw httpFail(r);
+  }
+  throw new Error('the heads kept moving (412 four times)');
+}
+
+/* undoLatest finds the latest undo of gesture g (by author, if given): redo undoes it (§11.2 Redo). */
+async function undoLatest(ns, g, author) {
+  const list = await undoGestureList(ns, g);
+  if (list) {
+    const u = list.filter((e) => e.undoes === g && e.gesture && (!author || e.author === author)).pop();
+    return u ? { gesture: u.gesture, author: u.author } : null;
+  }
+  const st = undoStackFrom(await undoNSLog(ns), author || '');
+  const u = st.undone.find((x) => x.gesture === g);
+  return u ? { gesture: u.target, author } : null;
+}
+
+/* ---- the Undo / redo card ---- */
+function undoAuthor() { return $('undoAuthor').value.trim() || $('author').value.trim(); }
+
+function undoRefresh() {
+  U.stack = S.ns && S.nsHead && undoAuthor() ? undoStackFrom(S.nsLog, undoAuthor()) : null;
+  renderUndo();
+}
+
+function undoItemRow(it, kind) {
+  const btn = kind === 'done'
+    ? h('button', { class: 'tiny', title: 'undo gesture ' + it.target, onclick: () => undoAction(it.target, `Undo ${it.gesture.slice(0, 6)}`) }, 'Undo')
+    : h('button', { class: 'tiny', title: 'undo the undo ' + it.target, onclick: () => undoAction(it.target, `Redo ${it.gesture.slice(0, 6)}`) }, 'Redo');
+  return h('li', {}, btn, ' ', h('span', { class: 'mono', title: 'gesture ' + it.gesture }, it.gesture.slice(0, 10) + '…'), ' ', h('span', { class: 'muted' }, it.resources.join(', ')), ' ',
+    h('span', { class: 'muted small mono', title: it.created }, tsFmt(it.created)),
+    it.chain.length ? h('span', { class: 'badge', title: 'undos and redos so far: ' + it.chain.join(', ') }, kind === 'done' ? 'redone' : 'undone') : null,
+    it.undoneBy && it.undoneBy.length ? h('span', { class: 'badge warn', title: it.undoneBy.map((y) => y.gesture).join(', ') }, 'undone by ' + [...new Set(it.undoneBy.map((y) => y.author))].join(', ')) : null);
+}
+
+function renderUndo() {
+  const box = $('undoStack');
+  const st = U.stack;
+  $('undoLast').disabled = !(st && st.done.length);
+  $('redoLast').disabled = !(st && st.undone.length);
+  if (!S.ns) { box.replaceChildren(h('p', { class: 'muted' }, 'No namespace selected.')); return; }
+  if (!undoAuthor()) { box.replaceChildren(h('p', { class: 'muted' }, 'Set the author (X-Author above, or the principal id your grant writes as) to rebuild its stack.')); return; }
+  if (!st) { box.replaceChildren(h('p', { class: 'muted' }, 'Loading…')); return; }
+  const parts = [h('div', { class: 'muted small' }, `${undoAuthor()}: ${st.done.length} action(s) to undo, ${st.undone.length} to redo, rebuilt from the namespace log` + (S.nsLogErr ? ' (incomplete: ' + S.nsLogErr + ')' : ''))];
+  if (st.done.length) parts.push(h('h3', {}, 'Undo'), h('ul', { class: 'checks' }, ...st.done.slice(-8).reverse().map((it) => undoItemRow(it, 'done'))));
+  if (st.undone.length) parts.push(h('h3', {}, 'Redo'), h('ul', { class: 'checks' }, ...st.undone.slice(-8).reverse().map((it) => undoItemRow(it, 'undone'))));
+  if (S.nsLevel === 'e2e') parts.push(h('p', { class: 'note' }, 'E3: the playground lists the stack but doesn\'t write undos here; the Go client does (client.Undo with UndoE2E).'));
+  box.replaceChildren(...parts);
+}
+
+function renderUndoOut(label, res) {
+  const out = $('undoOut'); out.hidden = false;
+  if (res.ok) {
+    out.replaceChildren(h('div', { class: 'seal-box' }, h('div', { class: 'state-line' }, h('span', { class: 'badge ok' }, 'done'), h('b', {}, label),
+      h('span', { class: 'muted small' }, `gesture ${res.gesture}, undoes ${res.plan.gesture}` + (res.attempts > 1 ? ` (after ${res.attempts - 1} × 412)` : ''))),
+    h('ul', { class: 'checks' }, ...res.plan.resources.map((r) => h('li', { class: 'ok' }, '✓ ', h('span', { class: 'mono' }, r.resource), ` ${r.steps.length} step(s), paths ${r.writes.join(', ') || '(none)'}` + (r.deleted ? ', deleted' : ''))))));
+  } else if (res.conflicts) {
+    out.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'conflict'), `  ${label}: later entries changed what the gesture wrote. Nothing was written; a person decides (§11.2 The guard).`,
+      h('ul', { class: 'checks' }, ...res.conflicts.map((c) => h('li', { class: 'bad' }, '✗ ', h('span', { class: 'mono' }, c.resource), ` ${c.kind}`, c.entry ? [' by ', idEl(c.entry), c.author ? ` (${c.author})` : ''] : null, c.paths && c.paths.length ? ' at ' + c.paths.join(', ') : '')))));
+  } else if (res.impossible) {
+    const why = { pruned: 'a revision it needs lies below a pruning horizon', blob: 'a blob the earlier document references is gone', invalid: 'the earlier values no longer validate against the document\'s $schema', purged: 'the resource was purged' }[res.impossible] || '';
+    out.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'undo impossible: ' + res.impossible), `  ${label}` + (res.resource ? ` (${res.resource})` : '') + ': ' + why + (res.message ? ` — ${res.message}` : '')));
+  } else if (res.refused) {
+    out.replaceChildren(h('div', { class: 'errbox' }, h('span', { class: 'code' }, 'not done'), '  ' + res.refused));
+  } else if (res.nothing) {
+    out.replaceChildren(h('p', { class: 'note' }, label + ': the inverse writes nothing.'));
+  }
+}
+
+async function undoAction(target, label) {
+  if (!S.ns || U.busy) return;
+  if (!GESTURE_RE.test(target || '')) return toast('A gesture id is 26 base32 characters');
+  U.busy = true;
+  try {
+    const res = await asUser(() => undoRun(S.ns, target, { level: S.nsLevel, limits: (S.nsDoc || {}).limits }));
+    renderUndoOut(label, res);
+    if (res.ok) await afterWrite();
+  } catch (err) {
+    renderUndoOut(label, { refused: err.message });
+  } finally { U.busy = false; undoRefresh(); }
+}
+
+async function redoGesture(g, label) {
+  if (!S.ns) return;
+  const u = await asUser(() => undoLatest(S.ns, g, undoAuthor()));
+  if (!u) return renderUndoOut(label, { refused: 'nobody undid ' + g + (undoAuthor() ? ' as ' + undoAuthor() : '') });
+  return undoAction(u.gesture, label);
 }
 
 /* ------------------------------------------------------------------ *
@@ -859,7 +1358,12 @@ function batchInsert(kind) {
 }
 async function runBatch(dry) {
   if (!S.ns) return toast('Select a namespace first');
-  const r = await api('POST', `/ns/${S.ns}/batch${dry ? '?dry-run=1' : ''}`, { body: $('batchBody').value });
+  // A batch is one user action: it carries a Gesture default unless the body sets one (§7.5).
+  let body = $('batchBody').value;
+  const p = tryParse(body), gesture = takeGesture();
+  if (!dry && p.ok && p.v && typeof p.v === 'object' && !Array.isArray(p.v) && !('gesture' in p.v)) body = JSON.stringify(Object.assign({ gesture }, p.v), null, 2);
+  const r = await api('POST', `/ns/${S.ns}/batch${dry ? '?dry-run=1' : ''}`, { body });
+  if (r.ok && !dry && body !== $('batchBody').value) noteGesture(gesture);
   const out = $('batchOut'); out.hidden = false;
   out.replaceChildren(h('div', { class: 'state-line' }, h('span', { class: 'badge ' + (r.ok ? 'ok' : 'err') }, r.neterr ? 'network error' : `HTTP ${r.status}`), h('span', { class: 'muted' }, dry ? 'dry run: nothing written' : (r.ok ? 'committed' : 'nothing written'))),
     jsonPre(r.text ? pretty(r.text) : (r.neterr || '')));
@@ -1386,6 +1890,8 @@ async function writeSealed(kind, patchText) {
     const body = Z.canonical(await Z.sealPatchSet(key, kid, ns, res, parent, patches, !!enc.pad, blobs));
     const expect = await Z.revisionID(parent, JSON.parse(body));
     const headers = kind === 'create' ? { 'If-None-Match': '*' } : { 'If-Match': quoteId(parent) };
+    headers.Gesture = takeGesture(); // resent unchanged with the same ciphertext
+
     S.lastSealed = { path: rpath(), headers, body, expect, patches, kid, parent, blobs };
     $('resendSealed').hidden = false;
     await sendSealed();
@@ -1404,6 +1910,7 @@ async function sendSealed() {
     x.blobs && x.blobs.length ? h('div', { class: 'small' }, `declares ${x.blobs.length} blob(s) in plaintext: `, ...x.blobs.map((b) => idEl(b))) : null,
     h('details', {}, h('summary', { class: 'muted small' }, 'plaintext patch set (never sent)'), jsonPre(x.patches)),
     r.ok || r.status === 412 || r.status === 422 ? null : h('div', { class: 'note' }, 'Not acknowledged: resend the exact same ciphertext so a retry keeps the id (§E.3.1).')));
+  if (r.ok) noteGesture(r.hdr('Gesture') || x.headers.Gesture);
   if (r.status === 201 || r.status === 200) { S.ifDirty = false; S.lastSealed = null; $('resendSealed').hidden = true; await afterWrite(); }
 }
 
@@ -3271,6 +3778,17 @@ function init() {
 
   // history
   $('histRefresh').onclick = () => asUser(loadHistory);
+
+  // undo and redo (§11.2)
+  $('undoAuthor').value = store.get('pl.undoAuthor', '');
+  $('undoAuthor').placeholder = 'author (default: X-Author above)';
+  $('undoAuthor').oninput = () => { store.set('pl.undoAuthor', $('undoAuthor').value); undoRefresh(); };
+  $('author').addEventListener('input', undoRefresh);
+  $('undoLast').onclick = () => { const it = U.stack && U.stack.done[U.stack.done.length - 1]; if (it) undoAction(it.target, `Undo ${it.gesture.slice(0, 6)}`); };
+  $('redoLast').onclick = () => { const it = U.stack && U.stack.undone[U.stack.undone.length - 1]; if (it) undoAction(it.target, `Redo ${it.gesture.slice(0, 6)}`); };
+  $('undoRefresh').onclick = () => asUser(refreshNS);
+  $('undoAny').onclick = () => undoAction($('undoGesture').value.trim(), 'Undo ' + $('undoGesture').value.trim().slice(0, 6));
+  $('redoAny').onclick = () => redoGesture($('undoGesture').value.trim(), 'Redo ' + $('undoGesture').value.trim().slice(0, 6));
 
   // batch
   $('batchBody').value = batchExample();

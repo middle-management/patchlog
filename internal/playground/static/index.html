@@ -96,6 +96,22 @@
     </div>
 
     <div class="card wide">
+      <header><h2>Undo / redo</h2><span class="muted small">&sect;11.2 &middot; gestures from the log, inverse as one batch with <code>Undoes</code></span><button id="undoRefresh" class="tiny">Refresh</button></header>
+      <div class="row">
+        <label for="undoAuthor">Author</label><input id="undoAuthor" class="mono" spellcheck="false" autocomplete="off">
+        <button id="undoLast" class="primary" title="Undo this author's last action that stands">Undo last</button>
+        <button id="redoLast" title="Redo this author's last undone action (undo the undo)">Redo last</button>
+      </div>
+      <div id="undoStack" class="muted">No namespace selected.</div>
+      <div class="row">
+        <label for="undoGesture">Gesture</label><input id="undoGesture" class="mono" placeholder="any gesture id (26 base32 characters)" spellcheck="false" autocomplete="off">
+        <button id="undoAny" class="tiny">Undo</button><button id="redoAny" class="tiny">Redo</button>
+      </div>
+      <div id="undoOut" hidden></div>
+      <p class="note">The stack is rebuilt from the namespace log: the author&rsquo;s gestures minus those the same author undid and didn&rsquo;t redo; undos by others are shown, not counted. An undo reads each resource&rsquo;s log after the gesture, refuses on overlapping later writes (a <b>conflict</b>), and reports a pruned revision, a missing blob or a document that no longer validates as <b>undo impossible</b>. The batch is guarded by <code>ifMatch</code> and re-planned on <code>412</code>.</p>
+    </div>
+
+    <div class="card wide">
       <header><h2>Heads</h2><span id="headsMeta" class="muted small"></span><button id="headsMore" class="tiny" hidden>Load more</button></header>
       <div class="scroll"><table id="headsTbl"><thead><tr><th>resource</th><th>kind</th><th>target</th></tr></thead><tbody></tbody></table></div>
       <p class="note">GET /ns/{ns}/rev/{id}/heads &mdash; click a row to open the resource.</p>
@@ -154,6 +170,10 @@
         <label class="check" title="Sealed and e2e namespaces refuse patch sets without a fresh $nonce (&sect;C.7, &sect;E.2.5)"><input type="checkbox" id="addNonce"> append a fresh <code>$nonce</code></label>
         <label class="check" title="E3: seal the patch set in this browser under the namespace's current epoch key, bound to {ns, name, parent} (&sect;E.3.1)"><input type="checkbox" id="sealE2E"> seal client-side (e2e)</label>
         <button id="resendSealed" class="tiny" hidden title="Resend the exact ciphertext of the last sealed write, so a retry keeps its id (&sect;E.3.1)">resend last ciphertext</button>
+      </div>
+      <div class="row">
+        <label class="check" title="Every save sends a fresh Gesture header: one user action, undone as one (&sect;7.2, &sect;11.2). Check this to send the last save's gesture again, so several saves (in several resources) are undone together."><input type="checkbox" id="gestureKeep"> same gesture as the last save</label>
+        <span id="gestureCur" class="muted small mono"></span>
       </div>
       <div id="sealOut" hidden></div>
       <div class="row">

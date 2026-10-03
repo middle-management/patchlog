@@ -20,7 +20,7 @@ and serves immutable, CDN-cacheable revisions.
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
-| Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling and client library; the client's undo procedure, §11.2, to come; see [Design notes](#design-notes)) |
+| Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
@@ -616,6 +616,11 @@ It is plain HTML/JS embedded in the binary and talks to the same-origin API. It 
   the Resource tab uploads a blob (with a `Blob-Nonce` in sealed namespaces, encrypted in the browser in E3
   ones) and inserts its reference into the patch set; E3 writes declare their `blobs`, and the fold flags a
   revision whose list is wrong. Only inert types open in a tab; the rest download;
+- gestures (§7.2): every save from the Resource editor (and every batch without its own `gesture`) sends a
+  fresh `Gesture`, or the last save's again while "same gesture as the last save" is checked; history and
+  the namespace log show each entry's gesture and `undoes`, and an **Undo / redo** card on the Namespace tab
+  rebuilds the author's stack from the namespace log and undoes or redoes with the procedure of §11.2 (see
+  [Undo and redo](#undo-and-redo-112));
 - a **Keys** tab (Addendum E): an X25519 identity kept in localStorage (its public JWK goes in a
   grant's `enc`, or into an E3 keyring), the keys held, E3 keyring administration (init, add a
   reader, rotate), a JWE decrypter and a self-test of the page's crypto against vectors made by
@@ -698,6 +703,55 @@ body is capped at 16 MiB and 50 files. The demo composes pass
 
 Run it with `./patchlog serve -dev` and open `http://localhost:8080/playground/`. Sealed and e2e
 namespaces need `-master-key FILE -master-key-create`.
+
+### Undo and redo (§11.2)
+
+A client sends a `Gesture` with every write a user action produces (`client.NewGesture`,
+`client.WithGesture`, `Step.WithGesture`, `BatchRequest.Gesture`). `internal/client/undo.go` undoes
+one from the log, so undo works after a reload, from another device and from a history view:
+
+```go
+plan, err := c.PlanUndo(ctx, "docs", g)        // the inverse and the conflicts; writes nothing
+res, err := c.Undo(ctx, "docs", g)              // writes it: one batch, Gesture res.Gesture, Undoes g
+res, err  = c.Redo(ctx, "docs", g)              // undoes the latest undo of g
+st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each item's Target to pass to Undo
+```
+
+- **Finding it.** `GET /ns/{ns}/gestures/{gesture}` where offered; otherwise (sealed and e2e
+  namespaces, older deployments, grants without unrestricted read, or `UndoScanLog()`) the namespace
+  log, all of it page by page or after `UndoSince(nsID)`, for entries with the gesture by the same
+  author (`UndoAuthor`, by default the author of its first revision found). Each resource's log is
+  read from its head just before the gesture in that log (or its head as of `UndoSince`), else from
+  genesis, and from the pruning horizon when that is later.
+- **The inverse**, per resource, the gesture's own entries newest first: a revision becomes the patch
+  set that sets the paths it wrote back to its parent's values (writes to array elements widened to
+  the whole array, as merges do; a revision of moves only is moved back when both ends are unchanged);
+  a tombstone a restore with `[]`; a restore the inverse of its patches, then `"delete"`; a genesis
+  `"delete"`. Edits others made to other paths, also between the gesture's saves, are kept. `$nonce`
+  is never restored: each patch set gets a fresh one in sealed namespaces and where the document has
+  one. The sets are joined and split again within the namespace's `opsPerSet` and `patchSetSize`.
+- **The guard.** The log after the gesture's last entry in each resource: a write overlapping the
+  gesture's paths, a delete, a restore or an undo of the gesture is a conflict, returned as
+  `*client.ConflictError` (`Conflicts`: resource, entry, author, kind, paths) and listed in
+  `plan.Conflicts`. The batch names the checked heads in `ifMatch`; a `412` re-plans, up to
+  `UndoRetries(n)` times (3).
+- **Impossible** (`*client.ImpossibleError`, `Reason`): a revision the inverse needs is below a
+  pruning horizon (`pruned`), a blob is gone (`blob`, `422 blob`), the old values don't validate any
+  more (`invalid`, `422 invalid` or `schema_unavailable`), or the resource was purged.
+- **Redo** undoes the undo. **The stack** is the author's gestures minus those the same author undid
+  and didn't redo; others' undos are listed in `UndoneBy`, not counted, and an `Undoes` naming a gesture
+  that isn't in the log (or another author's) is ignored.
+- **Encryption.** Plaintext and sealed (E2, with `client.WithKeys`) namespaces work as they are; e2e
+  ones (E3) need `UndoE2E(x)`: logs are opened and folded through the E2E view, the guard compares
+  decrypted entries, every resulting document is validated, and each step is sealed bound to the id of
+  the step before. Without it an e2e namespace is refused.
+
+The playground's **Undo / redo** card (Namespace tab) does the same in the browser for plaintext and
+sealed namespaces: it rebuilds the stack of the author in the connection bar (or another one typed in)
+from the namespace log, offers Undo/Redo for the last actions (and for any gesture id, or "Undo this
+gesture" in History), and shows conflicts (red, with the later entries and paths; nothing written)
+apart from "undo impossible" (pruned, blob, invalid). It refuses to write undos in e2e namespaces and
+points to the Go client.
 
 ### Search index (Addendum A)
 
