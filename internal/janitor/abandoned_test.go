@@ -59,3 +59,38 @@ func TestAbandonedClaim(t *testing.T) {
 func op1(o, path string, v any) map[string]any {
 	return map[string]any{"op": o, "path": path, "value": v}
 }
+
+// §1, §F.6: with authentication disabled no entry records a grant, and a
+// janitor told so takes an abandoned claim as the development server's
+// operator's, whether or not it sends a bearer (the server ignores it). One
+// not told so trusts no grant-less claim, bearer or not: development mode
+// is the deployment's property, not the tool's.
+func TestAbandonedClaimDev(t *testing.T) {
+	e := newEnv(t, map[string]any{"read": "public", "cleanup": map[string]any{"abandoned": "P1D"}})
+	e.branch("matches", "r1", nil)
+	e.edit("r1", "derby", "1-0")
+	e.config("r1", op1("add", "/frozen", true), op1("add", "/abandoned", true))
+	e.s.Clock.Advance(48 * time.Hour)
+	dry := func(c *client.Client) janitor.Decision {
+		j := janitor.New(c, janitor.Options{Bases: []string{"matches"}, Now: e.s.Clock.Now, DryRun: true})
+		for _, d := range must(j.Sweep(ctx)) {
+			if d.NS == "r1" {
+				return d
+			}
+		}
+		t.Fatal("no decision for r1")
+		return janitor.Decision{}
+	}
+	if d := dry(e.s.Client(t, client.WithBearer("ignored"))); d.Action != janitor.ActionWouldPurge {
+		t.Fatalf("a dev janitor with a bearer: %+v", d)
+	}
+	for _, c := range []*client.Client{must(client.New(e.s.URL)), must(client.New(e.s.URL, client.WithBearer("ignored")))} {
+		if d := dry(c); d.Action != janitor.ActionKeep || !strings.Contains(d.Reason, "records no grant") {
+			t.Fatalf("a janitor not told authentication is off: %+v", d)
+		}
+	}
+	d := e.sweep(false)["r1"]
+	if d.Action != janitor.ActionPurged || d.Claim != "abandoned" {
+		t.Fatalf("abandoned in development mode: %+v", d)
+	}
+}

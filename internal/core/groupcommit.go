@@ -472,19 +472,10 @@ func (t *tx) appendTogether(ws []*groupWrite) {
 	authors := make([]int64, len(ws))
 	var st []*itemState
 	var by []writer
-	stored := map[string]bool{}
 	for i, w := range ws {
 		a := w.plan.a
 		authors[i] = t.actorID(a)
-		var grantID []byte
-		if a.grant != nil {
-			// Each grant once.
-			id := a.grant.ID()
-			if grantID = id[:]; !stored[string(grantID)] {
-				stored[string(grantID)] = true
-				t.storeGrant(n, a)
-			}
-		}
+		grantID := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
 		wr := writtenBy(a, authors[i], grantID, w.req.Signature)
 		for _, s := range w.plan.st {
 			st, by = append(st, s), append(by, wr)
@@ -498,9 +489,9 @@ func (t *tx) appendTogether(ws []*groupWrite) {
 		}
 		k := len(w.plan.st)
 		as[i] = t.planEntry(w.plan, authors[i], nil, inserted[:k])
-		// The kid of this write's own grant: one author (a root sub) may
-		// write under grants of several keys.
-		as[i].kid = entryKid(w.plan.a, authors[i])
+		// This write's own grant: one author (a root sub) may write under
+		// several grants.
+		as[i].grant = entryGrant(w.plan.a, authors[i])
 		inserted = inserted[k:]
 	}
 	nsIDs := t.appendNSMany(n, n.configSeq, as)

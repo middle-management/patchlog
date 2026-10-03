@@ -492,6 +492,12 @@ function kindBadge(kind) {
   return h('span', { class: 'badge ' + cls }, kind);
 }
 
+/* grantTitle describes the grant a namespace entry was written under (§7.4): absent for entries the server writes itself and without authentication. */
+function grantTitle(e) {
+  if (!e.grant) return e.author ? 'no grant recorded (written by the server itself, or with authentication disabled)' : null;
+  return `grant ${e.grant.id}: root sub ${e.grant.sub}, key ${e.grant.kid}`;
+}
+
 function renderNsLog() {
   const tb = $('nsLog').tBodies[0];
   const rows = [...S.nsLog].reverse().slice(0, 200);
@@ -504,7 +510,7 @@ function renderNsLog() {
       h('td', {}, kindBadge(e.kind)),
       h('td', { class: 'mono' }, e.resource || (e.kind === 'branch' ? e.name : '') || ''),
       h('td', {}, ID_RE.test(target) ? idEl(target) : h('span', { class: 'mono' }, target)),
-      h('td', {}, e.author || ''),
+      h('td', { title: grantTitle(e) }, e.author || '', e.grant ? h('span', { class: 'muted small' }, ' \u00b7 ' + e.grant.kid) : null),
       h('td', { class: 'mono', title: e.created }, tsFmt(e.created)),
       h('td', {}, idEl(e.id)));
     tr.title = 'entry ' + JSON.stringify(e);

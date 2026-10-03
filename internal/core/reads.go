@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"database/sql"
 	"errors"
 	"sort"
 	"sync"
@@ -451,7 +450,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
-		q := `SELECT seq, id, prev_seq, body, author, created, kid FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		q := `SELECT seq, id, prev_seq, body, author, created, grant_id FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {
 			q += ` LIMIT ?`
@@ -466,12 +465,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			body    string
 			author  int64
 			created int64
-			kid     sql.NullString
+			grantID []byte
 		}
 		var rs []raw
 		for rows.Next() {
 			var r raw
-			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.kid))
+			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID))
 			rs = append(rs, r)
 		}
 		rows.Close()
@@ -485,9 +484,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			m["author"] = t.authorName(r.author)
 			m["created"] = formatTime(r.created)
-			if r.kid.Valid {
-				// Not part of the hashed entry, like author and created.
-				m["kid"] = r.kid.String
+			if r.grantID != nil {
+				// Not part of the hashed entry, like author and created
+				// (§7.4, grantref.go).
+				if g := t.grantRef(r.grantID); g != nil {
+					m["grant"] = g
+				}
 			}
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)

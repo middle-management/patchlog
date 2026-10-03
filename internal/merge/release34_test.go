@@ -53,11 +53,11 @@ func TestReleaseCatalogSubmitters(t *testing.T) {
 			step4 = st.Done
 		}
 	}
-	if e := entryOf(t, w.anna, "cat-season", step2); e.Author != "user:anna" || e.Kid != "idp" {
-		t.Fatalf("the $access batch is %s/%s, want the admin's", e.Author, e.Kid)
+	if e := entryOf(t, w.anna, "cat-season", step2); e.Author != "user:anna" || e.Grant == nil || e.Grant.Sub != "user:anna" || e.Grant.Kid != "idp" {
+		t.Fatalf("the $access batch is %s/%+v, want the admin's", e.Author, e.Grant)
 	}
-	if e := entryOf(t, w.anna, "cat-season", step4); e.Author != "svc:merge" || e.Kid != "catalog-merge" {
-		t.Fatalf("the step-4 batch is %s/%s, want the merge service's under the merge key", e.Author, e.Kid)
+	if e := entryOf(t, w.anna, "cat-season", step4); e.Author != "svc:merge" || e.Grant == nil || e.Grant.Sub != "svc:merge" || e.Grant.Kid != "catalog-merge" {
+		t.Fatalf("the step-4 batch is %s/%+v, want the merge service's under the merge key", e.Author, e.Grant)
 	}
 	for _, b := range rp.Branches {
 		h := must(w.anna.NSHead(ctx, b.NS))

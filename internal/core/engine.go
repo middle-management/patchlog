@@ -199,6 +199,8 @@ type Engine struct {
 	stop      chan struct{}
 	bg        sync.WaitGroup
 	closeOnce sync.Once
+	// grantRoots are the root sub and kid of stored grants (grantref.go).
+	grantRoots grantRootCache
 	// retentionSkipped remembers retention rules already logged as
 	// skipped for lack of an archive (§8.6), so each is logged once.
 	retentionSkipped sync.Map
@@ -356,6 +358,11 @@ func (e *Engine) Close() error {
 // Ping checks that the database is reachable (the /_ready check).
 func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) }
 
+// SpecVersion is the version of the Patch Log specification this
+// implementation follows, published at GET / as { "spec" } (§7.4), so tools
+// that copy namespace documents between deployments can check it first.
+const SpecVersion = "0.37"
+
 // Origin is the deployment origin.
 func (e *Engine) Origin() string { return e.opt.Origin }
 
@@ -436,10 +443,15 @@ type tx struct {
 	dirty   bool
 	ownRevs map[int64]revRow
 	revIDs  map[int64]ids.ID
-	// kids maps an author written in this transaction to the key that
-	// signed its grant's root block (actorID), recorded with namespace
-	// entries (§F.3).
-	kids map[int64]string
+	// grants maps an author authenticated in this transaction under a
+	// grant to that grant (actorID): the namespace entries written for it
+	// record the grant's id (§5, §7.4, §C.3), unless serverWrites > 0,
+	// while the transaction writes entries of its own, such as propagated
+	// purges (§8.3), which record none. storedGrants are the grants stored
+	// in it, and whether encrypted (storeGrant).
+	grants       map[int64]*grant.Grant
+	serverWrites int
+	storedGrants map[ids.ID]bool
 	// Encryption at rest (crypt.go): data keys created in this
 	// transaction (cached once committed), whether a purge destroyed keys,
 	// resources' levels, and the levels of shadows being created.
@@ -897,9 +909,11 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 	// What doesn't depend on the head first, outside the row's lock.
 	body := jsonv.Canonical(entry)
 	kind := nsKindCode(entry["kind"].(string))
-	var kid any
-	if k, ok := t.kids[author]; ok {
-		kid = k
+	var grantID any
+	if g := t.grants[author]; g != nil && t.serverWrites == 0 {
+		// Encrypted if the configuration in force after the entry
+		// encrypts at rest: a namespace's first entry has none before it.
+		grantID = t.storeGrant(g, t.config(configSeq).level >= levelAtRest)
 	}
 	rs, ts := make([]int64, len(hist)), make([]int64, len(hist))
 	for i, h := range hist {
@@ -913,16 +927,16 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 		// One statement: the entry, the namespace's head and the heads it
 		// moves, so the log lock is held for a single round trip and the
 		// commit.
-		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid)
+		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id)
 				VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT seq FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq) SELECT v.res, l.seq, v.target FROM l, unnest(?::bigint[], ?::bigint[]) AS v(res, target))
 			SELECT seq FROM l`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), kid,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID,
 			id[:], configSeq, n.id, rs, ts)
 	} else {
-		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), kid)
+		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID)
 		_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, head_id = ?, config_seq = ? WHERE ns = ?`, seq, id[:], configSeq, n.id)
 		t.must(err)
 		for _, h := range hist {
@@ -973,7 +987,7 @@ type nsAppend struct {
 	entry       map[string]any
 	res, target *int64
 	author      int64
-	kid         *string // the key that signed the author's grant (entryKid)
+	grant       *grant.Grant // the grant the entry was written under (entryGrant), or nil
 	hist        []histRow
 }
 
@@ -991,12 +1005,16 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	bodies := make([]string, k)
 	kinds, authors := make([]int64, k), make([]int64, k)
 	res, targets := make([]*int64, k), make([]*int64, k)
-	kids := make([]*string, k)
+	grantIDs := make([][]byte, k)
 	var hord, hres, htarget []int64
 	for i, a := range as {
 		bodies[i] = string(jsonv.Canonical(a.entry))
 		kinds[i] = int64(nsKindCode(a.entry["kind"].(string)))
-		authors[i], res[i], targets[i], kids[i] = a.author, a.res, a.target, a.kid
+		authors[i], res[i], targets[i] = a.author, a.res, a.target
+		if a.grant != nil && t.serverWrites == 0 {
+			// Each entry its own grant (§7.4): one author may write under several.
+			grantIDs[i] = t.storeGrant(a.grant, t.config(configSeq).level >= levelAtRest)
+		}
 		for _, h := range a.hist {
 			hord, hres, htarget = append(hord, int64(i+1)), append(hres, h.res), append(htarget, h.target)
 		}
@@ -1011,18 +1029,18 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		prev = &out[i]
 	}
 	t.wrote()
-	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::text[])
-				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, kid, ord)),
+	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[])
+				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, ord)),
 			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
 			s AS (SELECT seq, row_number() OVER (ORDER BY seq) AS ord FROM r),
 			c AS (SELECT v.*, s.seq, COALESCE(lag(s.seq) OVER (ORDER BY v.ord), ?::bigint) AS prev_seq FROM v JOIN s USING (ord)),
-			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, kid)
-				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, kid FROM c ORDER BY ord RETURNING seq),
+			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id)
+				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id FROM c ORDER BY ord RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT max(seq) FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq)
 				SELECT x.res, c.seq, x.target FROM unnest(?::bigint[], ?::bigint[], ?::bigint[]) AS x(ord, res, target) JOIN c USING (ord))
 			SELECT seq FROM c ORDER BY ord`,
-		idBytes, kinds, res, targets, bodies, authors, kids, k, prevSeq,
+		idBytes, kinds, res, targets, bodies, authors, grantIDs, k, prevSeq,
 		n.id, configSeq, t.now.UnixMilli(), idBytes[k-1], configSeq, n.id, hord, hres, htarget)
 	t.must(err)
 	var seqs []int64
@@ -1048,6 +1066,14 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	n.configSeq = configSeq
 	t.notify[n.name] = true
 	return out
+}
+
+// asServer runs f, whose namespace entries are the server's own, such as
+// propagated purges (§8.3): they record no grant (§7.4).
+func (t *tx) asServer(f func()) {
+	t.serverWrites++
+	defer func() { t.serverWrites-- }()
+	f()
 }
 
 func nullInt(p *int64) any {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
@@ -452,6 +453,13 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
 					exp := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
 					if r := t.replay(n, a, st, &configPlan{expected: &exp}, true); r != nil {
+						// It is that batch, but the lookup doesn't apply
+						// to a purged resource (§6.2 step 2, §7.2): 410
+						// for its items, not a 412 that would invite the
+						// client to apply its config change again.
+						if pf := t.purgedItems(n, st); len(pf) > 0 {
+							return nil, nil, fail(pf)
+						}
 						return nil, r, nil
 					}
 				}
@@ -490,7 +498,15 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 
 	// Step 2: precondition — idempotent retry, settling the verb, frozen,
-	// the precondition.
+	// the precondition. The retry lookup doesn't apply to a purged
+	// resource: the answer is 410, as for every URL of it, before the
+	// frozen check (§6.2 step 2, §7.2, §8.3).
+	if pf := t.purgedItems(n, st); len(pf) > 0 {
+		if !dryRun {
+			return nil, nil, fail(pf)
+		}
+		st = dropFailed(st, pf, dryFails)
+	}
 	if r := t.replay(n, a, st, cplan, isBatch); r != nil {
 		return nil, r, nil
 	}
@@ -701,7 +717,7 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 		result.ConfigID = cplan.id.String()
 	}
 	// After the config change, which may have turned encryption on.
-	grantID := t.storeGrant(n, a)
+	grantID := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
 	inserted := t.insertItems(n, p.st, a, author, grantID, req.Signature)
 	// The namespace entry last: on Postgres it is appended under the
 	// namespace row's lock, held until commit (appendNS).
@@ -822,7 +838,22 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 	return out, true
 }
 
-// replay implements the idempotent-retry lookup (§7.2, §7.5).
+// purgedItems answers 410 for each item whose resource is purged, as the
+// writer sees it (§7.6): the idempotent-retry lookup doesn't apply to it
+// (§6.2 step 2, §7.2), and every URL of it is 410 (§8.3).
+func (t *tx) purgedItems(n *nsRow, st []*itemState) []itemErr {
+	var fs []itemErr
+	for _, s := range st {
+		if t.resolve(n, s.Resource, nil).state == Purged {
+			fs = append(fs, itemErr{s.index, gone()})
+		}
+	}
+	return fs
+}
+
+// replay implements the idempotent-retry lookup (§7.2, §7.5). Callers
+// answer a purged resource first (purgedItems): the lookup doesn't apply
+// to one.
 func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
 	author := t.actorID(a)
 	if !isBatch {
@@ -835,8 +866,8 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 			return nil
 		}
 		own := t.resource(n.id, s.Resource)
-		if own == nil || own.state == statePurged {
-			return nil // a purged resource answers 410, never its content
+		if own == nil {
+			return nil
 		}
 		last := want[len(want)-1]
 		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
@@ -1296,39 +1327,51 @@ func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
 	return m, &batchSource{n: sn, atSeq: seq}, nil
 }
 
-// actorID is authorID for an actor. Under a grant it also remembers the key
-// that signed the root block, which the namespace entries this transaction
-// writes for that author record (§F.3: merge tools and the janitor match
-// author and kid against merge.authors).
+// actorID is authorID for an actor. Under a grant it also remembers the
+// grant, whose id the namespace entries this transaction writes for that
+// author on the request record (§5, §7.4): merge tools and the janitor
+// match its root sub and kid against merge.authors (§F.3, §F.6). With
+// authentication disabled there is no grant, and none is recorded (§1).
 func (t *tx) actorID(a *actor) int64 {
 	id := t.authorID(a.id())
-	if a.verified != nil && id >= 0 {
-		if t.kids == nil {
-			t.kids = map[int64]string{}
+	if a.grant != nil && id >= 0 {
+		if t.grants == nil {
+			t.grants = map[int64]*grant.Grant{}
 		}
-		t.kids[id] = a.verified.Key.Kid
+		t.grants[id] = a.grant
 	}
 	return id
 }
 
-// entryKid is the kid a namespace entry by author, written by a, records
-// (actorID), or nil. Entries appended together (appendNSMany) take it per
-// entry, since one author may write under grants signed by several keys.
-func entryKid(a *actor, author int64) *string {
-	if a.verified == nil || author < 0 {
+// entryGrant is the grant a namespace entry by author, written by a,
+// records (§7.4), or nil. Entries appended together (appendNSMany) take it
+// per entry, since one author may write under several grants.
+func entryGrant(a *actor, author int64) *grant.Grant {
+	if a.grant == nil || author < 0 {
 		return nil
 	}
-	kid := a.verified.Key.Kid
-	return &kid
+	return a.grant
 }
 
-// storeGrant records the non-bearer form of the actor's grant (§C.3).
-func (t *tx) storeGrant(n *nsRow, a *actor) []byte {
-	if a.grant == nil {
+// storeGrant records the non-bearer form of a grant (§C.3), encrypted at
+// rest if encrypt is set (§E.1), and returns its id (nil for no grant). A
+// grant is stored once per transaction, and again only to encrypt it.
+func (t *tx) storeGrant(g *grant.Grant, encrypt bool) []byte {
+	if g == nil {
 		return nil
 	}
-	id := a.grant.ID()
-	t.storeGrantBlocks(id[:], a.grant.Stored(), t.nsLevel(n) >= levelAtRest)
+	id := g.ID()
+	if enc, ok := t.storedGrants[id]; !ok || (encrypt && !enc) {
+		var root *grantRoot
+		if len(g.Blocks) > 0 {
+			root = &grantRoot{sub: g.Blocks[0].Sub, kid: g.Blocks[0].Kid}
+		}
+		t.storeGrantBlocks(id[:], g.Stored(), root, encrypt)
+		if t.storedGrants == nil {
+			t.storedGrants = map[ids.ID]bool{}
+		}
+		t.storedGrants[id] = encrypt
+	}
 	return id[:]
 }
 

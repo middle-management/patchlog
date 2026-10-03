@@ -975,9 +975,9 @@ func TestPGGroupCommitSharedResources(t *testing.T) {
 }
 
 // Two writes of one principal (root sub) under grants signed by different
-// namespace keys, appended together: each entry records the kid of its own
-// grant (§F.3), which merge tools and the janitor match against
-// merge.authors.
+// namespace keys, appended together: each entry records its own grant
+// (§7.4), whose root kid merge tools and the janitor match against
+// merge.authors (§F.3).
 func TestPGGroupCommitKidPerWrite(t *testing.T) {
 	opPub, opPriv := grant.GenerateKey()
 	ops, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": opPub, "can": []any{"*"}}}))
@@ -1039,7 +1039,7 @@ func TestPGGroupCommitKidPerWrite(t *testing.T) {
 	for i, r := range res {
 		var kid string
 		id, _ := ids.Parse(r.NSID)
-		if err := e.db.QueryRow(`SELECT kid FROM ns_log WHERE id = $1`, id[:]).Scan(&kid); err != nil {
+		if err := e.db.QueryRow(`SELECT g.root_kid FROM ns_log l JOIN grants g ON g.id = l.grant_id WHERE l.id = $1`, id[:]).Scan(&kid); err != nil {
 			t.Fatal(err)
 		}
 		if want := []string{"k1", "k2"}[i]; kid != want {

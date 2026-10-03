@@ -40,8 +40,10 @@ func newEnv(t *testing.T, baseDoc map[string]any) *env {
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
 	if baseDoc == nil {
-		// Authentication is off: entries carry no kid, so merge.authors
-		// matches alice on sub alone (merge.Listed).
+		// Authentication is off: entries record no grant, so for a
+		// janitor told so (client.WithAuthDisabled, which clienttest
+		// sets) merge.authors matches alice on sub alone
+		// (merge.EntryListed).
 		baseDoc = map[string]any{"read": "public", "merge": devAuthors}
 	}
 	must(c.CreateNamespace(ctx, "matches", baseDoc))

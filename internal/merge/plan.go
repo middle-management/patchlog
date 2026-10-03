@@ -24,10 +24,11 @@
 // after a replay then picks up exactly the branch's new entries, instead of
 // replaying the already merged ones again. source is asserted, not
 // verified, so only batches without origin, whose source.ns is the branch
-// and whose author (root sub and kid) is listed in the target's
-// merge.authors count (see Listed). Without merge.authors there are no
-// merge points: classification falls back to ancestry by ids, and a second
-// merge after a replay conflicts; such a branch should be rebased (§F.5).
+// and whose recorded grant (§7.4) has a root sub and kid listed in the
+// target's merge.authors count (see EntryListed). Without merge.authors
+// there are no merge points: classification falls back to ancestry by ids,
+// and a second merge after a replay conflicts; such a branch should be
+// rebased (§F.5).
 //
 // A resource resolved by keeping the target's version (Resolve with no
 // steps) is still recorded in the batch with an empty step [] (in a sealed
@@ -525,7 +526,8 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 		if !IsMergeOf(e, p.Branch) {
 			continue
 		}
-		mb := MergeBatch{Batch: e.ID, Author: e.Author, Kid: e.Kid}
+		sub, kid := EntryPrincipal(e)
+		mb := MergeBatch{Batch: e.ID, Author: sub, Kid: kid}
 		// source.at must be in the branch's chain: the merger checks it
 		// itself, as the janitor does (§F.3, §F.6), since the server checks
 		// it only for writers who may read the branch (§7.5).
@@ -536,8 +538,11 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 			// The rebase's own replays.
 		case !p.AuthorsDeclared:
 			mb.Reason = "the target declares no merge.authors"
-		case !Listed(p.MergeAuthors, e.Author, e.Kid):
-			mb.Reason = "its author " + principal(e.Author, e.Kid) + " is not in the target's merge.authors"
+		case !EntryListed(p.MergeAuthors, e, p.c.AuthDisabled()):
+			mb.Reason = "its author " + principal(sub, kid) + " is not in the target's merge.authors"
+			if e.Grant == nil && !p.c.AuthDisabled() {
+				mb.Reason = "it records no grant (§7.4), so its author " + e.Author + " can't be matched against the target's merge.authors"
+			}
 		case heads == nil:
 			mb.Reason = "its source.at " + at + " is not in the chain of " + p.Branch
 		}
@@ -558,7 +563,7 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 				continue
 			}
 			if bid, ok := heads[s.Resource]; ok {
-				p.points[s.Resource] = Pair{Batch: e.ID, Author: e.Author, Kid: e.Kid, At: at, Branch: bid, Target: s.Target}
+				p.points[s.Resource] = Pair{Batch: e.ID, Author: sub, Kid: kid, At: at, Branch: bid, Target: s.Target}
 			}
 		}
 	}

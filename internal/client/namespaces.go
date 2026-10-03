@@ -86,16 +86,22 @@ type NSEntry struct {
 	Source    map[string]any // batch: optional provenance
 	HasSource bool
 	Author    string
-	// Kid is the root key id of the grant the entry was written under, as
-	// the server exposes it (not part of the hashed entry, like Author and
-	// Created). "" with authentication disabled, or for entries written
-	// before servers recorded it.
-	Kid     string
+	// Grant is the grant the entry was written under (§7.4), not part of
+	// the hashed entry, like Author and Created. nil for entries the server
+	// writes itself, such as propagated purges, with authentication
+	// disabled (§1), and for entries from before servers recorded grants.
+	Grant   *NSGrant
 	Created string
 	// Forced marks a purge or purge-ns entry of a purge that overrode an
 	// in_use refusal (§3.5, §6.1); it is part of the hashed entry.
 	Forced bool
 	Raw    map[string]any // the entry as served
+}
+
+// NSGrant is a namespace entry's grant reference (§7.4): the grant id
+// (§C.3) and its root sub and kid.
+type NSGrant struct {
+	ID, Sub, Kid string
 }
 
 // IsResource reports whether the entry concerns one resource (head,
@@ -117,7 +123,10 @@ func ParseNSEntry(v any) (NSEntry, error) {
 	e := NSEntry{
 		ID: str(m, "id"), Prev: str(m, "prev"), Kind: str(m, "kind"), Resource: str(m, "resource"),
 		Name: str(m, "name"), At: str(m, "at"), Target: str(m, "target"),
-		Author: str(m, "author"), Kid: str(m, "kid"), Created: str(m, "created"), Raw: m,
+		Author: str(m, "author"), Created: str(m, "created"), Raw: m,
+	}
+	if g, ok := m["grant"].(map[string]any); ok {
+		e.Grant = &NSGrant{ID: str(g, "id"), Sub: str(g, "sub"), Kid: str(g, "kid")}
 	}
 	e.Remote, _ = m["remote"].(map[string]any)
 	e.Forced, _ = m["forced"].(bool)

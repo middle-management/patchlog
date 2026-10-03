@@ -3,6 +3,7 @@ package merge_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -54,8 +55,9 @@ func newEnv(t *testing.T) *env {
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
 	e := &env{t: t, s: s, c: c}
-	// Authentication is off, so entries carry no kid and merge.authors
-	// matches on sub alone (merge.Listed).
+	// Authentication is off, so entries record no grant and, for a merger
+	// told so (client.WithAuthDisabled, which clienttest sets),
+	// merge.authors matches on sub alone (merge.EntryListed).
 	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public", "merge": devAuthors}))
 	e.create("matches", "derby", map[string]any{"title": "Derby", "score": "0-0", "blocks": []any{"a", "b", "c"}})
 	e.create("matches", "cup", map[string]any{"title": "Cup", "score": "1-1"})
@@ -371,6 +373,34 @@ func TestSecondMergePicksUpNewChanges(t *testing.T) {
 	// Nothing new: all merged.
 	p3 := e.plan("matches", "r7", merge.Options{})
 	wantClasses(t, p3, map[string]merge.Class{"derby": merge.Merged, "cup": merge.Merged})
+}
+
+// §1, §F.3: development mode is the deployment's property. A merger told
+// authentication is off trusts grant-less merge batches by author, even
+// when it sends a bearer the server ignores; one not told so, bearer or
+// not, trusts none, and a second merge after a replay replays again.
+func TestMergePointsDevModeIsTheDeployments(t *testing.T) {
+	e := newEnv(t)
+	e.branch("matches", "r7")
+	e.append("r7", "cup", op("replace", "/score", "2-1"))
+	e.append("matches", "cup", op("replace", "/title", "Cup!")) // cup replays
+	must(e.plan("matches", "r7", merge.Options{}).Apply(ctx))
+	e.append("r7", "cup", op("replace", "/score", "3-1"))
+
+	dev := e.s.Client(t, client.WithAuthor("alice"), client.WithBearer("ignored"))
+	p := must(merge.NewPlan(ctx, dev, "matches", "r7", merge.Options{}))
+	if c := p.Resource("cup"); c.Class != merge.Replay || len(c.Steps) != 1 || len(p.Ignored) != 0 {
+		t.Fatalf("dev merger with a bearer: cup %+v, ignored %+v", c, p.Ignored)
+	}
+	for _, c := range []*client.Client{must(client.New(e.s.URL, client.WithAuthor("alice"))), must(client.New(e.s.URL, client.WithBearer("ignored")))} {
+		p := must(merge.NewPlan(ctx, c, "matches", "r7", merge.Options{}))
+		if len(p.Ignored) != 1 || !strings.Contains(p.Ignored[0].Reason, "records no grant") {
+			t.Fatalf("merger not told authentication is off: ignored %+v", p.Ignored)
+		}
+		if c := p.Resource("cup"); len(c.Steps) != 2 {
+			t.Fatalf("without the merge point cup replays both steps: %+v", c)
+		}
+	}
 }
 
 func TestStackedRetargetAfterFastForward(t *testing.T) {

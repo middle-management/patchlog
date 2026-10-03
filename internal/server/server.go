@@ -85,8 +85,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.mux.ServeHTTP(w, r)
 }
 
+// root is GET /: the spec version the deployment implements (§7.4) and its
+// canonical origin (§G.1).
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"origin": s.e.Origin()})
+	writeJSON(w, 200, map[string]any{"spec": core.SpecVersion, "origin": s.e.Origin()})
 }
 
 // --- helpers -----------------------------------------------------------
