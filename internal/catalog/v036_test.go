@@ -90,14 +90,16 @@ func TestListingVisibility(t *testing.T) {
 	if childNames(r.body) != "matches.derby" || r.body["next"] == nil {
 		t.Errorf("fan on season, limit 1: %v", r.body)
 	}
-	// Translators' role reads with rules on /writes: it lists nothing, not
-	// even the folder (for a folder only a role without rules counts).
+	// Translators' role reads with rules on /writes, which pass as a read
+	// evaluates them (no writes: within is true, §B.11.5 v0.38): its items
+	// are visible, but not the folder (for a folder only a role without
+	// rules counts).
 	anna := w.caller("user:anna", "translators")
 	if r, _ := w.follow("/cat/children?of=season", anna); r.status != 404 {
 		t.Errorf("translator on season: %d %v", r.status, r.body)
 	}
-	if placed(anna, "/r/matches/derby") {
-		t.Error("translator sees derby's placement")
+	if !placed(anna, "/r/matches/derby") {
+		t.Error("translator doesn't see derby's placement")
 	}
 	// Grants still go by role names (§B.11.4): the translator may read.
 	w.issue(anna, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
@@ -246,14 +248,28 @@ func TestRestoreThroughCatalog(t *testing.T) {
 	}
 	// The dangling placement grants nothing else.
 	w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 403)
-	// Moving the deleted item's placement where fan-club has desk: the
-	// no-widening check ignores frozen rows, and the move changes nothing
-	// about who may restore.
-	g := w.grantFor(bob, map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("derbies")})
-	h := must(w.ops.Head(ctx, "cat", "matches.derby"))
-	must(w.core(g).Append(ctx, "cat", "matches.derby", h.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents("derbies")}}))
-	w.caughtUp()
+	// Moving the deleted item's placement where fan-club has desk is
+	// checked like any other move, against the roles the item would have
+	// now (§B.11.7 v0.38): it widens, so only an admin may.
+	w.issue(bob, map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("derbies")}, 403)
+	move := func(token string, to ...string) {
+		t.Helper()
+		g := w.grantFor(token, map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny(to...)})
+		h := must(w.ops.Head(ctx, "cat", "matches.derby"))
+		must(w.core(g).Append(ctx, "cat", "matches.derby", h.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents(to...)}}))
+		w.caughtUp()
+	}
+	move(admin, "derbies")
 	restore(fan, "/r/matches/derby", 403) // reader had no restore, and desk under derbies came after
+	// From derbies, a restore would give fan-club desk, which its frozen
+	// rows don't have: refused, so a move can't widen what a restore
+	// publishes (§B.11.7).
+	if r := restore(bob, "/r/matches/derby", 403); !strings.Contains(r.body["message"].(string), "would give group:fan-club the role desk") {
+		t.Errorf("widening restore: %v", r.body)
+	}
+	// Back under season (only an admin may: translators would gain
+	// translator), the restore no longer widens.
+	move(admin, "season")
 	// Frozen rows survive a restart.
 	w.stop()
 	w.start()
@@ -287,7 +303,10 @@ func TestRestoreThroughCatalog(t *testing.T) {
 	if frozen != 0 {
 		t.Errorf("frozen rows after the restore: %d", frozen)
 	}
-	// Restored, its rows are computed from where it is now.
+	// Restored, its rows are computed from where it is now: under derbies
+	// fan-club has desk.
+	w.issue(fan, map[string]any{"item": "/r/matches/derby", "want": toAny("append")}, 403)
+	move(admin, "season", "derbies")
 	w.issue(fan, map[string]any{"item": "/r/matches/derby", "want": toAny("append")}, 200)
 
 	// An item deleted while unplaced gets nothing from a placement made

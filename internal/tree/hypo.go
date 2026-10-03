@@ -47,6 +47,9 @@ func (g *Graph) With(changes map[string]any) *Graph {
 		h.Trust[ns] = true
 	}
 	h.Aliases = g.Aliases
+	for ns, c := range g.Content {
+		h.Content[ns] = c
+	}
 	for name, n := range g.self {
 		c := *n
 		h.self[name] = &c

@@ -438,8 +438,10 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 				if g.Node(d) == nil {
 					continue
 				}
+				// What the node has now, computed from the graph, for a
+				// deleted item's placement too (§B.11.7).
 				a := Effective(after, d, nil)
-				b := s.eff[d]
+				b := Effective(g, d, nil)
 				for _, subj := range subjectsOf(a) {
 					for _, r := range a[subj] {
 						if !present(after, d, r, b[subj], incs) {

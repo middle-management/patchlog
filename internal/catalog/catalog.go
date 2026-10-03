@@ -17,11 +17,16 @@
 //     apply only where a role granting them is assigned directly (§B.11.2).
 //   - Content namespaces define what a role means (§B.11.1): the catalog
 //     keeps only roles the content namespace defines with a wanted verb.
+//   - Effective roles count only through subjects the catalog's key in the
+//     content namespace may assert (§B.11.4 Resolve, §B.11.5).
 //   - A deleted item's effective rows are frozen when its tombstone is
-//     seen, and a restore is decided from them (§B.11.4, §B.11.7).
+//     seen, and a restore is decided from them, refused if the item's
+//     current placement would widen them (§B.11.4, §B.11.7). A move of a
+//     deleted item's placement is checked like any other.
 //   - Listings and /read-grants share one visibility test (§B.11.5,
 //     visibility.Node), decided per request from effective and the
-//     content namespaces' roles.
+//     content namespaces' documents as of the combined checkpoint
+//     (tree.Graph.Content).
 //
 // Callers of the catalog's own API (POST /grants, POST /read-grants, and
 // private listings) authenticate with an ordinary core grant for the
@@ -44,6 +49,7 @@ import (
 	"net/http"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -97,6 +103,11 @@ type Service struct {
 	// roles; neither is in eff.
 	tomb   map[string]bool
 	frozen map[string]map[string][]string
+
+	// readRoles per content namespace, with the document they were
+	// derived from (readRolesOf).
+	rrMu    sync.Mutex
+	rrCache map[string]rrEntry
 }
 
 // Open opens the catalog service.
@@ -124,7 +135,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		opt.MergeTTL = 5 * time.Minute
 	}
 	s := &Service{opt: opt, eff: map[string]map[string][]string{}, users: map[string]bool{},
-		tomb: map[string]bool{}, frozen: map[string]map[string][]string{}}
+		tomb: map[string]bool{}, frozen: map[string]map[string][]string{}, rrCache: map[string]rrEntry{}}
 	s.now = opt.Tree.Now
 	if s.now == nil {
 		s.now = time.Now
@@ -570,37 +581,22 @@ func (s *Service) frozenRolesFor(name string, subs map[string]bool) map[string]b
 // group subjects, plus its user subject only if the catalog has direct
 // entries for that user (§B.11.5), and filtered by the visibility test.
 //
-// What a role means is read from the trusted content namespaces' documents
-// through the grant checker, which drops a namespace's document as soon as
-// the tree service applies a config entry of it (Checker.Observe). So a
-// change to /roles in a content namespace takes effect on visibility from
-// the combined checkpoint that includes it (§B.11.7), without anything to
-// recompute: visibility is decided per request from effective and the
-// roles' definitions.
+// What a role means, and the catalog's key, are read from the trusted
+// content namespaces' documents as of the content namespaces' ns_ids in
+// the combined checkpoint (tree.Graph.Content, replaced in the same apply
+// as the checkpoint), never from the grant checker's latest copy, so a
+// listing at a given at never changes when a /roles change lands later
+// (§B.11.5, §B.11.7). There is nothing to recompute: visibility is decided
+// per request from effective and those documents.
 func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tree.Visibility, error) {
-	subs := Subjects(v)
 	user := UserSubject(v.Principal.ID)
-	var trust []string
 	direct := false
-	s.t.View(func(g *tree.Graph, _ map[string]string) {
-		direct = s.users[user]
-		for ns := range g.Trust {
-			trust = append(trust, ns)
-		}
-	})
+	s.t.View(func(g *tree.Graph, _ map[string]string) { direct = s.users[user] })
 	keyed := grantcheck.SubjectSet(v, false)
 	if direct {
 		keyed = append(keyed, user)
 	}
-	vis := &visibility{s: s, subs: subs, groups: v.Principal.Groups, ns: map[string]*readRoles{}}
-	for _, ns := range trust {
-		cfg, err := s.t.Checker().Config(ctx, ns)
-		if err != nil {
-			continue
-		}
-		vis.ns[ns] = s.readRoles(cfg)
-	}
-	return keyed, vis, nil
+	return keyed, &visibility{s: s, subs: Subjects(v), groups: v.Principal.Groups}, nil
 }
 
 // readRoles are the roles through which the catalog's key may grant read
@@ -612,18 +608,46 @@ type readRoles struct {
 }
 
 // readRole is one such role. A role whose read has rules counts, for
-// items only, if they refer to nothing but /resource and
+// items only, if they pass as a read of the item would evaluate them, and
+// refer neither to /now nor to anything in /principal but
 // /principal/groups: everyone with the same subject set shares a listing,
-// and a listing at a given at can't depend on /now.
+// and a listing at a given at can't change (§B.11.5).
 type readRole struct {
 	plain bool          // read without rules
 	rules []*rules.Rule // otherwise, the rules, evaluated per item
 }
 
 var (
-	ptrResource = pointer.Pointer{"resource"}
-	ptrGroups   = pointer.Pointer{"principal", "groups"}
+	ptrNow       = pointer.Pointer{"now"}
+	ptrPrincipal = pointer.Pointer{"principal"}
+	ptrGroups    = pointer.Pointer{"principal", "groups"}
 )
+
+// rrEntry is a cached readRoles with the document it was derived from.
+type rrEntry struct {
+	cfg *tree.NSConfig
+	rr  *readRoles
+}
+
+// readRolesOf is the readRoles of a content namespace's document as of
+// the checkpoint (Graph.Content), cached by the document's identity: a
+// new document is a new *tree.NSConfig.
+func (s *Service) readRolesOf(c *tree.NSConfig) *readRoles {
+	s.rrMu.Lock()
+	e, ok := s.rrCache[c.NS]
+	s.rrMu.Unlock()
+	if ok && e.cfg == c {
+		return e.rr
+	}
+	rr := &readRoles{roles: map[string]*readRole{}}
+	if cfg, err := grantcheck.ParseConfig(c.NS, "", c.Doc); err == nil {
+		rr = s.readRoles(cfg)
+	}
+	s.rrMu.Lock()
+	s.rrCache[c.NS] = rrEntry{c, rr}
+	s.rrMu.Unlock()
+	return rr
+}
 
 func (s *Service) readRoles(cfg *grantcheck.Config) *readRoles {
 	out := &readRoles{roles: map[string]*readRole{}}
@@ -652,38 +676,51 @@ func (s *Service) readRoles(cfg *grantcheck.Config) *readRoles {
 	return out
 }
 
-// listable reports whether a rule reads nothing but /resource and
-// /principal/groups (§B.11.5).
+// listable reports whether a rule can count for a listing (§B.11.5): it
+// reads neither /now nor anything in /principal but /principal/groups (a
+// pointer above them, such as the whole envelope, reads them too).
 func listable(r *rules.Rule) bool {
 	for _, p := range r.RefPaths() {
-		if !p.HasPrefix(ptrResource) && !p.HasPrefix(ptrGroups) {
+		if p.Overlaps(ptrNow) || p.Overlaps(ptrPrincipal) && !p.HasPrefix(ptrGroups) {
 			return false
 		}
 	}
 	return true
 }
 
-// asserts reports whether the key's groups scope lets the catalog act for
-// a subject: a user always, a group only if the key may assert it
-// (§B.11.3, §B.11.6).
-func (rr *readRoles) asserts(subj string) bool {
+// asserts reports whether a key's groups scope lets the catalog act for a
+// subject: a user always, a group only if the key may assert it (§B.11.3,
+// §B.11.6).
+func asserts(key *grant.Key, subj string) bool {
 	g, ok := strings.CutPrefix(subj, grantcheck.GroupPrefix)
 	if !ok {
 		return true
 	}
-	allowed, _ := rr.key.Groups.Permits([]string{g})
+	allowed, _ := key.Groups.Permits([]string{g})
 	return allowed
 }
 
-// grants reports whether a subject of subs collects at the node (eff, its
-// effective roles) a role granting read: one without rules, or, if env is
-// set (an item), one whose rules pass against env.
+// assertable is the subjects of subs the key may assert: effective roles
+// are collected only through them (§B.11.4 Resolve, §B.11.5).
+func assertable(key *grant.Key, subs map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for subj, ok := range subs {
+		if ok && asserts(key, subj) {
+			out[subj] = true
+		}
+	}
+	return out
+}
+
+// grants reports whether a subject of subs the key may assert collects at
+// the node (eff, its effective roles) a role granting read: one without
+// rules, or, if env is set (an item), one whose rules pass against env.
 func (rr *readRoles) grants(eff map[string][]string, subs map[string]bool, env map[string]any) bool {
 	if rr == nil || rr.key == nil {
 		return false
 	}
 	for subj, roles := range eff {
-		if !subs[subj] || !rr.asserts(subj) {
+		if !subs[subj] || !asserts(rr.key, subj) {
 			continue
 		}
 		for _, r := range roles {
@@ -707,45 +744,58 @@ type visibility struct {
 	s      *Service
 	subs   map[string]bool
 	groups []string // the caller's groups, as its grant has them (for /principal/groups)
-	ns     map[string]*readRoles
+}
+
+// roles is the readRoles of a trusted content namespace as of the
+// checkpoint g reflects (nil if it isn't trusted or not followed yet).
+func (v *visibility) roles(g *tree.Graph, ns string) *readRoles {
+	c := g.Content[ns]
+	if !g.Trust[ns] || c == nil {
+		return nil
+	}
+	return v.s.readRolesOf(c)
 }
 
 // Node is the visibility test of §B.11.5, the one test listings and
 // /read-grants (for catalog nodes and their keys) use. A node is visible
-// when the walk up from it collects a role granting read without
-// conditions: for an item, a role its content namespace defines with read
-// that the catalog's key there may grant (roles and groups scope), with
-// rules on nothing but /resource and /principal/groups; for a folder, such
-// a role without rules in some trusted content namespace. Only live nodes
-// are visible: a dangling placement, a deleted item's included, grants
-// nothing, and cyclic and implicit nodes collect nothing (§B.11.2).
+// when the walk up from it collects, through a subject the catalog's key
+// may assert, a role granting read without conditions: for an item, a
+// role its content namespace defines with read that the catalog's key
+// there may grant (roles and groups scope), without rules or with rules
+// that pass as a read of the item would evaluate them; for a folder, such
+// a role without rules in some trusted content namespace. Roles, their
+// definitions and keys are those as of the combined checkpoint. Only live
+// nodes are visible: a dangling placement, a deleted item's included,
+// grants nothing, and cyclic and implicit nodes collect nothing (§B.11.2).
 func (v *visibility) Node(g *tree.Graph, n *tree.Node) bool {
 	if n == nil || n.Self || !n.Live() {
 		return false
 	}
 	eff := v.s.eff[n.Name]
 	if n.Kind == tree.KindFolder {
-		for _, rr := range v.ns {
-			if rr.grants(eff, v.subs, nil) {
+		for ns := range g.Trust {
+			if v.roles(g, ns).grants(eff, v.subs, nil) {
 				return true
 			}
 		}
 		return false
 	}
-	rr := v.ns[n.ItemNS]
+	rr := v.roles(g, n.ItemNS)
 	if rr == nil || rr.key == nil {
 		return false
 	}
-	// The envelope as the gate would see it for these rules: the grant the
-	// catalog signs names the resource and carries the caller's groups the
-	// key may assert (mint).
+	// The read envelope as the gate would build it for a grant the catalog
+	// signs (§6.4.1, mint): action read, the resource, and a principal
+	// holding the caller's groups the key may assert. No writes, doc or
+	// patches, so within is true and covers and overlaps are false
+	// (§6.4.2); no now, since rules reading it never count.
 	var groups []any
 	for _, gr := range v.groups {
 		if ok, _ := rr.key.Groups.Permits([]string{gr}); ok {
 			groups = append(groups, gr)
 		}
 	}
-	env := map[string]any{"resource": n.ItemName, "principal": map[string]any{"groups": nonNilAny(groups)}}
+	env := map[string]any{"action": "read", "resource": n.ItemName, "principal": map[string]any{"groups": nonNilAny(groups)}}
 	return rr.grants(eff, v.subs, env)
 }
 
