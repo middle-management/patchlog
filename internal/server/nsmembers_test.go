@@ -6,13 +6,29 @@ import (
 )
 
 // expectMember expects the 422 of a namespace-document member that isn't
-// defined and doesn't start with "x-" (§7.4): it names the member.
+// defined and doesn't start with "x-" (§7.4): code invalid, with
+// errors [{ pointer, message }] naming it, as for schema validation.
 func expectMember(t *testing.T, r *resp, path string) {
 	t.Helper()
 	expectCode(t, r, 422, "invalid")
-	if r.Str("path") != path || !strings.Contains(r.Str("message"), `must start with "x-"`) {
+	if errPointer(t, r) != path || !strings.Contains(r.Str("message"), `must start with "x-"`) {
 		t.Fatalf("unknown member %s: %s", path, r.Body)
 	}
+}
+
+// errPointer is the pointer of a 422 invalid's only error (§7.4, §12).
+func errPointer(t *testing.T, r *resp) string {
+	t.Helper()
+	errs, _ := r.Obj()["errors"].([]any)
+	if len(errs) != 1 {
+		t.Fatalf("errors: %s", r.Body)
+	}
+	m := errs[0].(map[string]any)
+	if m["message"] == "" {
+		t.Fatalf("error without a message: %s", r.Body)
+	}
+	p, _ := m["pointer"].(string)
+	return p
 }
 
 // §7.4: namespace creation, config writes, batch config changes and branch

@@ -157,6 +157,7 @@ CREATE TABLE IF NOT EXISTS ns_log (
   author     INTEGER NOT NULL REFERENCES authors,
   created    INTEGER NOT NULL,
   grant_id   BLOB,                           -- §C.3; the root sub and kid are read from the stored grant (§7.4); NULL for entries the server writes itself and without authentication
+  no_auth    INTEGER,                        -- 1: written on a request while authentication was disabled, served as "grant": null (§1, §7.4); NULL otherwise, and in rows from before v0.38
   UNIQUE (ns, id),
   UNIQUE (ns, prev_seq)
 );
@@ -366,7 +367,7 @@ func migrate(db *sql.DB) error {
 		table, col, typ, then string
 		thenGo                func(context.Context, *sql.Tx) error
 	}{
-		{"ns_log", "grant_id", "BLOB", backfillNSGrants, nil}, {"grants", "root_sub", "TEXT", "", nil},
+		{"ns_log", "grant_id", "BLOB", backfillNSGrants, nil}, {"ns_log", "no_auth", "INTEGER", "", nil}, {"grants", "root_sub", "TEXT", "", nil},
 		{"grants", "root_kid", "TEXT", "", backfillGrantRoots(func(int) string { return "?" })},
 		{"blob_bytes", "file", "TEXT", "", nil}, {"blob_epochs", "file", "TEXT", "", nil},
 		{"namespaces", "head_id", "BLOB", "", nil}, {"resources", "snap_revs", "INTEGER", "", nil}, {"resources", "snap_bytes", "INTEGER", "", nil}} {

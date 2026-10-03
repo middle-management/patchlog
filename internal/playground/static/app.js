@@ -357,7 +357,9 @@ function initConn() {
   $('author').addEventListener('input', () => store.set('pl.author', $('author').value));
   $('bearer').addEventListener('input', () => { store.set('pl.bearer', $('bearer').value); updateLiveWarn(); });
   api('GET', '/', { label: 'connect' }).then((r) => {
-    $('origin').textContent = r.ok && r.json && r.json.origin ? 'origin ' + r.json.origin : (r.neterr ? 'server unreachable' : 'HTTP ' + r.status);
+    // GET / (§7): { spec, auth: "grants" | "disabled", origin }.
+    const j = r.ok && r.json;
+    $('origin').textContent = j && j.origin ? 'origin ' + j.origin + (j.auth === 'disabled' ? ' \u00b7 authentication disabled (development)' : '') : (r.neterr ? 'server unreachable' : 'HTTP ' + r.status);
   });
 }
 
@@ -492,9 +494,10 @@ function kindBadge(kind) {
   return h('span', { class: 'badge ' + cls }, kind);
 }
 
-/* grantTitle describes the grant a namespace entry was written under (§7.4): absent for entries the server writes itself and without authentication. */
+/* grantTitle describes the grant a namespace entry was written under (§7.4): null when written with authentication disabled (§1), absent for entries the server writes itself and those from before v0.37. */
 function grantTitle(e) {
-  if (!e.grant) return e.author ? 'no grant recorded (written by the server itself, or with authentication disabled)' : null;
+  if (e.grant === null) return 'grant: null (written with authentication disabled; it counts for merge.authors only while the deployment still runs disabled, §1)';
+  if (!e.grant) return e.author ? 'no grant recorded (written by the server itself, or before v0.37)' : null;
   return `grant ${e.grant.id}: root sub ${e.grant.sub}, key ${e.grant.kid}`;
 }
 
@@ -3233,7 +3236,8 @@ function init() {
     ['successor', () => add('/successor', 'other-namespace')],
     ['frozen: true', () => add('/frozen', true)],
     ['frozen: false', () => add('/frozen', false)],
-    // Members the spec doesn't define must start with "x-" (§7.4).
+    // Members the spec doesn't define must start with "x-" (§7.4), at the
+    // top level and inside the addenda's objects (catalog, merge, cleanup…).
     ['x-title', () => add('/x-title', 'My namespace')],
   ], 'nsPatch');
 

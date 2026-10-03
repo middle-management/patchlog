@@ -521,6 +521,12 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 	if err != nil {
 		return fmt.Errorf("merge: target %s log: %w", p.Target, err)
 	}
+	// Whether an entry with "grant": null can count is the deployment's
+	// mode, from GET / (§1, §7).
+	disabled, err := p.c.AuthDisabled(ctx)
+	if err != nil {
+		return fmt.Errorf("merge: GET /: %w", err)
+	}
 	// Oldest first, so a later batch's pair replaces an earlier one.
 	for _, e := range tlog {
 		if !IsMergeOf(e, p.Branch) {
@@ -538,11 +544,8 @@ func (p *Plan) loadMergePoints(ctx context.Context, blog []client.NSEntry, since
 			// The rebase's own replays.
 		case !p.AuthorsDeclared:
 			mb.Reason = "the target declares no merge.authors"
-		case !EntryListed(p.MergeAuthors, e, p.c.AuthDisabled()):
-			mb.Reason = "its author " + principal(sub, kid) + " is not in the target's merge.authors"
-			if e.Grant == nil && !p.c.AuthDisabled() {
-				mb.Reason = "it records no grant (§7.4), so its author " + e.Author + " can't be matched against the target's merge.authors"
-			}
+		case !EntryListed(p.MergeAuthors, e, disabled):
+			mb.Reason = Unlisted(e, disabled)
 		case heads == nil:
 			mb.Reason = "its source.at " + at + " is not in the chain of " + p.Branch
 		}

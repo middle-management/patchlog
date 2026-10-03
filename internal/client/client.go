@@ -46,9 +46,6 @@ type Client struct {
 	// sourceAuth are grants sent as Source-Authorization on every write
 	// (WithSourceAuthorization).
 	sourceAuth []string
-	// authOff: the deployment has authentication disabled
-	// (WithAuthDisabled).
-	authOff bool
 
 	rootMu sync.Mutex
 	root   *Root // GET /, once fetched
@@ -82,14 +79,6 @@ func WithSourceAuthorization(grants ...string) Option {
 // WithAuthor sends X-Author on every request (development mode only, §7.2).
 func WithAuthor(name string) Option { return func(c *Client) { c.author = name } }
 
-// WithAuthDisabled declares that the deployment runs with authentication
-// disabled (serve -dev, §1). Such a deployment records no grant references
-// on namespace entries (§7.4), so tools that check merge.authors (§F.3,
-// §F.6) match grant-less entries on their author alone, and only then.
-// Whether authentication is on is the deployment's property, which the
-// API doesn't publish: the tool's operator says so.
-func WithAuthDisabled() Option { return func(c *Client) { c.authOff = true } }
-
 // New returns a client for the deployment at baseURL (e.g.
 // "https://cms.example"). The origin (§G.1) is fetched lazily by Origin.
 func New(baseURL string, opts ...Option) (*Client, error) {
@@ -108,7 +97,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // With returns a copy of the client with further options applied, e.g. a
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
-	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, authOff: c.authOff}
+	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth}
 	c.rootMu.Lock()
 	n.root = c.root
 	c.rootMu.Unlock()
@@ -119,24 +108,28 @@ func (c *Client) With(opts ...Option) *Client {
 	return n
 }
 
-// AuthDisabled reports whether the client was told the deployment runs
-// with authentication disabled (WithAuthDisabled).
-func (c *Client) AuthDisabled() bool { return c.authOff }
-
 // BaseURL is the base URL the client was created with.
 func (c *Client) BaseURL() string { return c.base }
 
 // Root is the answer of GET /.
 type Root struct {
-	// Spec is the version of the spec the deployment implements (§7.4),
-	// e.g. "0.37"; "" for deployments from before v0.37, which didn't
-	// publish it.
+	// Spec is the version of the spec the deployment implements (§7),
+	// dotted decimal, e.g. "0.38"; "" for deployments from before v0.37,
+	// which didn't publish it.
 	Spec string
+	// Auth is "grants" when the deployment authenticates requests with
+	// grants and "disabled" when it runs with authentication disabled
+	// (§1); "" for deployments from before v0.38, which didn't publish it.
+	Auth string
 	// Origin is the deployment's canonical origin (§G.1).
 	Origin string
 }
 
-// Root fetches GET / (§7, §G.1). It is fetched once and cached.
+// AuthDisabled reports whether Auth is "disabled" (§1).
+func (r Root) AuthDisabled() bool { return r.Auth == "disabled" }
+
+// Root fetches GET / (§7, §G.1). It is fetched once and cached;
+// AuthDisabled fetches it again.
 func (c *Client) Root(ctx context.Context) (Root, error) {
 	c.rootMu.Lock()
 	cached := c.root
@@ -144,6 +137,10 @@ func (c *Client) Root(ctx context.Context) (Root, error) {
 	if cached != nil {
 		return *cached, nil
 	}
+	return c.fetchRoot(ctx)
+}
+
+func (c *Client) fetchRoot(ctx context.Context) (Root, error) {
 	r, err := c.do(ctx, "GET", "/", nil, nil)
 	if err != nil {
 		return Root{}, err
@@ -152,11 +149,26 @@ func (c *Client) Root(ctx context.Context) (Root, error) {
 		return Root{}, r.apiError()
 	}
 	m, _ := r.value().(map[string]any)
-	root := Root{Spec: str(m, "spec"), Origin: str(m, "origin")}
+	root := Root{Spec: str(m, "spec"), Auth: str(m, "auth"), Origin: str(m, "origin")}
 	c.rootMu.Lock()
 	c.root = &root
 	c.rootMu.Unlock()
 	return root, nil
+}
+
+// AuthDisabled reports whether the deployment says, at GET /, that it runs
+// with authentication disabled (§1, §7). Only then do checks that match
+// merge.authors (§F.3, §F.6) match an entry with "grant": null on its
+// author alone; under "grants", and for a deployment that doesn't say
+// (before v0.38), such entries count for no one. Unlike Root, it asks
+// every time, so a long-running tool such as the janitor notices when a
+// deployment is restarted with authentication on.
+func (c *Client) AuthDisabled(ctx context.Context) (bool, error) {
+	root, err := c.fetchRoot(ctx)
+	if err != nil {
+		return false, err
+	}
+	return root.AuthDisabled(), nil
 }
 
 // Origin returns the deployment's canonical origin from GET / (§G.1). It is

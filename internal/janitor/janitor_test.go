@@ -40,10 +40,9 @@ func newEnv(t *testing.T, baseDoc map[string]any) *env {
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
 	if baseDoc == nil {
-		// Authentication is off: entries record no grant, so for a
-		// janitor told so (client.WithAuthDisabled, which clienttest
-		// sets) merge.authors matches alice on sub alone
-		// (merge.EntryListed).
+		// Authentication is off: entries record "grant": null, so while
+		// GET / says "auth": "disabled", merge.authors matches alice on
+		// sub alone (merge.EntryListed, §1).
 		baseDoc = map[string]any{"read": "public", "merge": devAuthors}
 	}
 	must(c.CreateNamespace(ctx, "matches", baseDoc))
@@ -366,5 +365,30 @@ func TestMergedClaimNeedsListedAuthor(t *testing.T) {
 				t.Fatalf("reason %q", ds[0].Reason)
 			}
 		})
+	}
+}
+
+// §1, §F.6: a merge batch written while authentication is disabled records
+// "grant": null. It verifies a merged claim on its author alone while the
+// deployment says "auth": "disabled" at GET /, and counts for no one once
+// the same deployment says "grants".
+func TestMergedClaimDevNeedsDisabledDeployment(t *testing.T) {
+	e := newEnv(t, nil)
+	e.branch("matches", "r7", map[string]any{"merged": "P1D"})
+	e.edit("r7", "derby", "1-0")
+	at := e.merge("r7")
+	must(merge.Freeze(ctx, e.c, "r7", at))
+	e.s.Clock.Advance(2 * day)
+	dry := func(c *client.Client) janitor.Decision {
+		t.Helper()
+		ds := must(janitor.New(c, janitor.Options{Bases: []string{"matches"}, Now: e.s.Clock.Now, DryRun: true}).Sweep(ctx))
+		if len(ds) != 1 {
+			t.Fatalf("decisions %+v", ds)
+		}
+		return ds[0]
+	}
+	wantKeep(t, dry(must(client.New(e.s.AuthProxy(t, "grants")))), "written without authentication")
+	if d := dry(e.c); d.Action != janitor.ActionWouldPurge || d.Claim != "merged" {
+		t.Fatalf("dev deployment: %+v", d)
 	}
 }

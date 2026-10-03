@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sort"
 	"sync"
@@ -450,7 +451,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			fromSeq = s
 		}
-		q := `SELECT seq, id, prev_seq, body, author, created, grant_id FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
+		q := `SELECT seq, id, prev_seq, body, author, created, grant_id, no_auth FROM ns_log WHERE ns = ? AND seq > ? AND seq <= ? ORDER BY seq`
 		args := []any{n.id, fromSeq, toSeq}
 		if limit > 0 {
 			q += ` LIMIT ?`
@@ -466,11 +467,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			author  int64
 			created int64
 			grantID []byte
+			noAuth  sql.NullInt64
 		}
 		var rs []raw
 		for rows.Next() {
 			var r raw
-			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID))
+			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth))
 			rs = append(rs, r)
 		}
 		rows.Close()
@@ -484,12 +486,17 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 			m["author"] = t.authorName(r.author)
 			m["created"] = formatTime(r.created)
-			if r.grantID != nil {
+			switch {
+			case r.grantID != nil:
 				// Not part of the hashed entry, like author and created
 				// (§7.4, grantref.go).
 				if g := t.grantRef(r.grantID); g != nil {
 					m["grant"] = g
 				}
+			case r.noAuth.Valid && r.noAuth.Int64 != 0:
+				// Written while authentication was disabled (§1): null,
+				// unlike the server's own entries, which have none.
+				m["grant"] = nil
 			}
 			out.Entries = append(out.Entries, m)
 			out.Last = m["id"].(string)

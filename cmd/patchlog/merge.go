@@ -6,7 +6,7 @@ package main
 //	patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}  (cmd/patchlog/release.go)
 //	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
 //	        [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
-//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-dev] [-identity key.jwk]... [-json]
+//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-identity key.jwk]... [-json]
 //	patchlog janitor -api URL -ns base1,base2 [-release LINK]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
 
 import (
@@ -30,10 +30,10 @@ import (
 
 const mergeUsage = `usage:
   patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}   (§F.9; see patchlog merge release)
-  patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-dev]
+  patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
           [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-dev] [-identity key.jwk]... [-json]
-  patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-dev] [-json]`
+  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-identity key.jwk]... [-json]
+  patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
 
 // toolFlags are the connection flags shared by the Addendum F tools.
 type toolFlags struct {
@@ -47,7 +47,7 @@ func addToolFlags(fs *flag.FlagSet) toolFlags {
 		bearer: fs.String("bearer", "", "grant sent as Authorization: Bearer"),
 		author: fs.String("author", "", "X-Author (development servers only)"),
 		asJSON: fs.Bool("json", false, "print JSON"),
-		dev:    fs.Bool("dev", false, "the deployment runs with authentication disabled (serve -dev): its entries record no grants, so merge.authors match on the author alone (§1, §F.3); implied by -author"),
+		dev:    fs.Bool("dev", false, "ignored, kept for scripts: whether the deployment runs with authentication disabled is read from GET / (§1, §7)"),
 	}
 }
 
@@ -58,9 +58,6 @@ func (tf toolFlags) client() *client.Client {
 	}
 	if *tf.author != "" {
 		opts = append(opts, client.WithAuthor(*tf.author))
-	}
-	if *tf.dev || *tf.author != "" {
-		opts = append(opts, client.WithAuthDisabled())
 	}
 	c, err := client.New(*tf.api, opts...)
 	if err != nil {

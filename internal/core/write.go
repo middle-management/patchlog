@@ -1331,7 +1331,9 @@ func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
 // grant, whose id the namespace entries this transaction writes for that
 // author on the request record (§5, §7.4): merge tools and the janitor
 // match its root sub and kid against merge.authors (§F.3, §F.6). With
-// authentication disabled there is no grant, and none is recorded (§1).
+// authentication disabled there is no grant: the entries record
+// "grant": null instead (§1, tx.noAuth), which those checks match on the
+// author alone while the deployment runs disabled.
 func (t *tx) actorID(a *actor) int64 {
 	id := t.authorID(a.id())
 	if a.grant != nil && id >= 0 {
@@ -1339,6 +1341,12 @@ func (t *tx) actorID(a *actor) int64 {
 			t.grants = map[int64]*grant.Grant{}
 		}
 		t.grants[id] = a.grant
+	}
+	if a.noAuth && id >= 0 {
+		if t.unauth == nil {
+			t.unauth = map[int64]bool{}
+		}
+		t.unauth[id] = true
 	}
 	return id
 }

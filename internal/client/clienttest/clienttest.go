@@ -4,8 +4,13 @@
 package clienttest
 
 import (
+	"bytes"
 	"crypto/ed25519"
+	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -176,13 +181,46 @@ func (s *Server) Now() time.Time {
 	return s.Clock.Now()
 }
 
-// Client returns a client for the server; without Auth, one that knows
-// authentication is disabled (client.WithAuthDisabled).
+// AuthProxy returns the URL of a proxy to the server whose GET / says
+// "auth": mode (§1, §7), as the same deployment restarted in that mode
+// would, e.g. "grants" for a development server's database served with
+// authentication on. Everything else passes through unchanged.
+func (s *Server) AuthProxy(t testing.TB, mode string) string {
+	t.Helper()
+	u, err := url.Parse(s.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp := httputil.NewSingleHostReverseProxy(u)
+	rp.ModifyResponse = func(r *http.Response) error {
+		if r.Request.URL.Path != "/" || r.StatusCode != 200 {
+			return nil
+		}
+		var m map[string]any
+		b, err := io.ReadAll(r.Body)
+		r.Body.Close()
+		if err != nil {
+			return err
+		}
+		if err := json.Unmarshal(b, &m); err != nil {
+			return err
+		}
+		m["auth"] = mode
+		b, _ = json.Marshal(m)
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		r.ContentLength = int64(len(b))
+		r.Header.Set("Content-Length", strconv.Itoa(len(b)))
+		return nil
+	}
+	p := httptest.NewServer(rp)
+	t.Cleanup(p.Close)
+	return p.URL
+}
+
+// Client returns a client for the server. Without Auth, the server says
+// at GET / that authentication is disabled (§1, client.AuthDisabled).
 func (s *Server) Client(t testing.TB, opts ...client.Option) *client.Client {
 	t.Helper()
-	if !s.auth {
-		opts = append([]client.Option{client.WithAuthDisabled()}, opts...)
-	}
 	c, err := client.New(s.URL, opts...)
 	if err != nil {
 		t.Fatal(err)

@@ -87,11 +87,16 @@ type NSEntry struct {
 	HasSource bool
 	Author    string
 	// Grant is the grant the entry was written under (§7.4), not part of
-	// the hashed entry, like Author and Created. nil for entries the server
-	// writes itself, such as propagated purges, with authentication
-	// disabled (§1), and for entries from before servers recorded grants.
-	Grant   *NSGrant
-	Created string
+	// the hashed entry, like Author and Created. nil for entries written
+	// while authentication was disabled (GrantNull), entries the server
+	// writes itself, such as propagated purges, and entries from before
+	// servers recorded grants.
+	Grant *NSGrant
+	// GrantNull is set for an entry served with "grant": null: written
+	// while authentication was disabled (§1, §7.4). Entries without
+	// "grant" at all have neither Grant nor GrantNull.
+	GrantNull bool
+	Created   string
 	// Forced marks a purge or purge-ns entry of a purge that overrode an
 	// in_use refusal (§3.5, §6.1); it is part of the hashed entry.
 	Forced bool
@@ -125,8 +130,12 @@ func ParseNSEntry(v any) (NSEntry, error) {
 		Name: str(m, "name"), At: str(m, "at"), Target: str(m, "target"),
 		Author: str(m, "author"), Created: str(m, "created"), Raw: m,
 	}
-	if g, ok := m["grant"].(map[string]any); ok {
-		e.Grant = &NSGrant{ID: str(g, "id"), Sub: str(g, "sub"), Kid: str(g, "kid")}
+	if g, has := m["grant"]; has {
+		if gm, ok := g.(map[string]any); ok {
+			e.Grant = &NSGrant{ID: str(gm, "id"), Sub: str(gm, "sub"), Kid: str(gm, "kid")}
+		} else {
+			e.GrantNull = g == nil
+		}
 	}
 	e.Remote, _ = m["remote"].(map[string]any)
 	e.Forced, _ = m["forced"].(bool)

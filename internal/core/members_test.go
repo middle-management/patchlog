@@ -28,6 +28,13 @@ func TestCheckMembers(t *testing.T) {
 		`{"abandoned":false}`,
 		`{"revoked":["` + id + `"]}`,
 		`{"merge":{"authors":[]},"frozen":true,"successor":"next","maxLag":"PT60S"}`,
+		// v0.38: the addenda's objects may carry x- members; the keys of
+		// catalogs are catalog names, so "x-desk" is one.
+		`{"catalog":{"mode":"tree","x-label":"Season"}}`,
+		`{"catalogs":{"cat":{"place":["group:desk"],"x-note":"since 2025"},"x-desk":{}}}`,
+		`{"merged":{"at":"` + id + `","x-by":"release-bot"}}`,
+		`{"cleanup":{"merged":"P7D","x-why":"short-lived"}}`,
+		`{"merge":{"authors":[],"x-note":"bots only"}}`,
 	}
 	bad := map[string]string{
 		`{"title":"Docs"}`:                                    `/title is not a namespace-document member`,
@@ -48,7 +55,6 @@ func TestCheckMembers(t *testing.T) {
 		`{"catalogs":{"cat":{"move":[]}}}`:                    `/catalogs/cat/move is not a known field`,
 		`{"merged":true}`:                                     `/merged must be`,
 		`{"merged":{"at":"nope"}}`:                            `/merged must be`,
-		`{"merged":{"at":"` + id + `","by":"x"}}`:             `/merged must be`,
 		`{"cleanup":"P7D"}`:                                   `/cleanup must be`,
 		`{"cleanup":{"merged":"7 days"}}`:                     `/cleanup/merged must be an ISO 8601 duration`,
 		`{"cleanup":{"merged":7}}`:                            `/cleanup/merged must be an ISO 8601 duration`,
@@ -58,6 +64,10 @@ func TestCheckMembers(t *testing.T) {
 		`{"revoked":["` + id + `","not an id"]}`:              `/revoked/1 must be a revocation id`,
 		`{"x-title":1,"titel":2,"catalog":{"mode":"forest"}}`: `/catalog/mode`, // in member order
 		`{"keys":[{"kid":"a","x-note":"ops"}]}`:               `/keys/0/x-note is not a key field`,
+		`{"catalogs":{"X-desk":{}}}`:                          `/catalogs/X-desk is not a catalog namespace name`,
+		`{"catalog":{"X-label":"Season"}}`:                    `/catalog/X-label is not a known field`,
+		`{"merged":{"at":"` + id + `","by":"x"}}`:             `/merged/by is not a known field`,
+		`{"cleanup":{"x-why":"a","why":"b"}}`:                 `/cleanup/why is not a known field`,
 	}
 	for _, s := range ok {
 		if err := checkMembers(jsonv.MustParse([]byte(s)).(map[string]any), nil); err != nil {
@@ -70,12 +80,48 @@ func TestCheckMembers(t *testing.T) {
 			t.Errorf("%s: %v, want %q", s, err, want)
 		}
 	}
-	// The 422 names the member and says what other members must look like.
-	err := checkMembers(map[string]any{"title": "x"}, nil)
-	ae := configErr(err)
-	if ae.Status != 422 || ae.Body["code"] != "invalid" || ae.Body["path"] != "/title" || !strings.Contains(ae.Body["message"].(string), `must start with "x-"`) {
+	// The 422 is code invalid with errors [{ pointer, message }], as for
+	// schema validation (§7.4 v0.38); the message says what other members
+	// must look like.
+	ae := configErr(checkMembers(map[string]any{"title": "x"}, nil))
+	if p, msg := errPointer(t, ae); ae.Status != 422 || ae.Body["code"] != "invalid" || p != "/title" || !strings.Contains(msg, `must start with "x-"`) {
 		t.Fatalf("unknown member error %v", ae)
 	}
+	ae = configErr(checkMembers(jsonv.MustParse([]byte(`{"catalogs":{"cat":{"place":["desk"]}}}`)).(map[string]any), nil))
+	if p, _ := errPointer(t, ae); p != "/catalogs/cat/place/0" {
+		t.Fatalf("nested error %v", ae)
+	}
+	// merge is read by parseConfig: x- members are data there too, others
+	// are refused with a pointer; so are the core's members.
+	e := &Engine{opt: Options{Limits: DefaultLimits(), Maximums: DefaultLimits()}}
+	if _, ae := e.newConfig(jsonv.MustParse([]byte(`{"merge":{"authors":[],"x-note":1}}`)), nil, nil); ae != nil {
+		t.Fatalf("merge with an x- member: %v", ae)
+	}
+	for doc, want := range map[string]string{
+		`{"merge":{"authors":[],"note":1}}`: "/merge/note",
+		`{"read":"everyone"}`:               "/read",
+		`{"keys":{}}`:                       "/keys",
+		`[]`:                                "",
+	} {
+		_, ae := e.newConfig(jsonv.MustParse([]byte(doc)), nil, nil)
+		if ae == nil {
+			t.Fatalf("%s accepted", doc)
+		}
+		if p, _ := errPointer(t, ae); ae.Status != 422 || ae.Body["code"] != "invalid" || p != want {
+			t.Errorf("%s: %v, want pointer %q", doc, ae.Body, want)
+		}
+	}
+}
+
+// errPointer is the pointer and message of a 422 invalid's only error.
+func errPointer(t *testing.T, ae *Error) (string, string) {
+	t.Helper()
+	errs, _ := ae.Body["errors"].([]any)
+	if len(errs) != 1 {
+		t.Fatalf("errors %v", ae.Body)
+	}
+	m := errs[0].(map[string]any)
+	return m["pointer"].(string), m["message"].(string)
 }
 
 // A member the document a write starts from already holds, unchanged, was
@@ -84,6 +130,11 @@ func TestCheckMembers(t *testing.T) {
 func TestCheckMembersKeepsStoredMembers(t *testing.T) {
 	prev := map[string]any{"read": "public", "title": "Old", "cleanup": map[string]any{"merged": "7 days"}}
 	same := map[string]any{"read": "grant", "title": "Old", "cleanup": map[string]any{"merged": "7 days"}, "frozen": true}
+	// v0.38: removing one member an earlier version defined, keeping
+	// another, is accepted.
+	if err := checkMembers(map[string]any{"read": "public", "title": "Old"}, prev); err != nil {
+		t.Fatalf("removing one stored member: %v", err)
+	}
 	if err := checkMembers(same, prev); err != nil {
 		t.Fatalf("stored members refused: %v", err)
 	}
@@ -134,8 +185,8 @@ func TestDefinedMembers(t *testing.T) {
 	}
 	e := &Engine{opt: Options{Limits: DefaultLimits(), Maximums: DefaultLimits()}}
 	_, ae := e.newConfig(base, got, base)
-	if ae == nil || ae.Status != 422 || ae.Body["path"] != "/title" ||
-		!strings.Contains(ae.Body["message"].(string), `{"op":"move","from":"/title","path":"/x-title"}`) {
+	if p, msg := errPointer(t, ae); ae.Status != 422 || p != "/title" ||
+		!strings.Contains(msg, `{"op":"move","from":"/title","path":"/x-title"}`) {
 		t.Fatalf("inherited member: %v", ae)
 	}
 }
@@ -176,7 +227,7 @@ func TestStoredMembersAfterUpgrade(t *testing.T) {
 	defer e.Close()
 	ctx := context.Background()
 	// As an earlier version stored it: no member check then.
-	old := map[string]any{"read": "public", "title": "Old", "cleanup": map[string]any{"merged": "P7D", "note": "x"}, "revoked": []any{"1aaaa"}}
+	old := map[string]any{"read": "public", "title": "Old", "legacy": true, "cleanup": map[string]any{"merged": "P7D", "note": "x"}, "revoked": []any{"1aaaa"}}
 	if err := e.update(ctx, func(t *tx) error {
 		t.insertNamespace("old", []any{map[string]any{"op": "add", "path": "", "value": old}}, old, false, t.authorID("op"))
 		return nil
@@ -200,10 +251,19 @@ func TestStoredMembersAfterUpgrade(t *testing.T) {
 		if !ok {
 			t.Fatal(err)
 		}
-		return ae.Status, ae.Body["path"]
+		errs, _ := ae.Body["errors"].([]any)
+		if len(errs) != 1 {
+			return ae.Status, nil
+		}
+		return ae.Status, errs[0].(map[string]any)["pointer"]
 	}
 	add := func(path string, v any) any { return map[string]any{"op": "add", "path": path, "value": v} }
 
+	// A write may remove a member only an earlier version defined, keeping
+	// the others (v0.38).
+	if s, p := status(write(map[string]any{"op": "remove", "path": "/legacy"})); s != 201 {
+		t.Fatalf("removing a stored member: %d %v", s, p)
+	}
 	// Writes that leave the stored members alone.
 	if s, _ := status(write(add("/frozen", true))); s != 201 {
 		t.Fatalf("freezing: %d", s)
@@ -217,7 +277,7 @@ func TestStoredMembersAfterUpgrade(t *testing.T) {
 	if s, _ := status(write(add("/revoked/-", rid))); s != 201 {
 		t.Fatalf("revoking next to a stored malformed revocation: %d", s)
 	}
-	if s, p := status(write(add("/revoked/-", "2bbbb"))); s != 422 || p != nil {
+	if s, p := status(write(add("/revoked/-", "2bbbb"))); s != 422 || p != "/revoked/2" {
 		t.Fatalf("adding a malformed revocation: %d %v", s, p)
 	}
 	// A branch is a new namespace, so it can't hold the base's stored

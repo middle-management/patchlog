@@ -62,7 +62,7 @@ func TestIdsVerifiable(t *testing.T) {
 		entry := map[string]any{}
 		for k, v := range m {
 			switch k {
-			case "id", "prev", "author", "created":
+			case "id", "prev", "author", "created", "grant":
 			default:
 				entry[k] = v
 			}
