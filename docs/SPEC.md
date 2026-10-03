@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.38 · 2026-10-03. See the change log at the end.
+Status: draft v0.39 · 2026-10-03. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -80,6 +80,7 @@ Large values, such as images, PDFs or long texts, are **blobs**: immutable bytes
 | **Config revision** | A revision of the namespace document, with its own content-addressed id. |
 | **Resource** | A named, versioned JSON document inside a namespace, addressed `{ns}/{name}` (§3.6). |
 | **Patch set** | An ordered array of JSON Patch operations (RFC 6902). |
+| **Gesture** | The revisions one user action produced, possibly across several saves and resources of a namespace, grouped by an id the client chooses (§7.2). Used for undo and redo (§11.2). |
 | **Blob** | Immutable bytes attached to a resource, stored and served apart from its documents, which refer to it with a blob reference (§7.8). |
 | **Revision** | A resource log entry: `{ id, parent, kind, patches, author, created }`. |
 | **Head** | The latest entry in a resource's log. |
@@ -255,7 +256,7 @@ bytes(bid) = trunc160( sha256( "patchlog-blob-v1" ‖ 0x0A ‖ type ‖ 0x0A ‖
 
 The core does not prescribe a storage engine. An implementation MUST:
 
-- persist, for each entry, its id, its parent, its kind, `canonical(patches)` (until purged), its author, the grant reference (Addendum C), and a creation time
+- persist, for each entry, its id, its parent, its kind, `canonical(patches)` (until purged), its author, the grant reference (Addendum C), a creation time, and the `gesture` and `undoes` it was written with, if any (§7.2)
 
 - persist an author and a creation time for each namespace log entry, and the grant reference (§C.3) of each entry written on a request (none of these are part of its hash), so purges and namespace purges are attributed, and merges can be checked against `merge.authors` (§F.3)
 
@@ -267,7 +268,7 @@ The core does not prescribe a storage engine. An implementation MUST:
 
 - after purge, retain ids, parent links and namespace entries, and nothing else of the resource's content
 
-- after pruning, retain ids, parent links, authors, grant references and creation times below the horizon, the horizon's document, and the documents kept for protected revisions (§8.6)
+- after pruning, retain ids, parent links, authors, grant references, creation times, `gesture` and `undoes` below the horizon, the horizon's document, and the documents kept for protected revisions (§8.6)
 
 - apply a batch atomically, holding invariants 2, 5 and 6 across all of its items
 
@@ -675,9 +676,9 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 ## 7. HTTP API
 
-Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.38", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum G adds `origin` (§G.1). Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
+Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.39", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum G adds `origin` (§G.1). Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
-**Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
+**Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Gesture`, `Undoes`, `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
 
 Requests to private namespaces follow Addendum C. Without `read`, a resource that exists and one that doesn't both answer `404`, so existence is not revealed. The same holds for namespaces: a request without valid credentials to a namespace that doesn't exist answers `401`, exactly as one to an existing namespace whose `read` isn't `public`. Only public namespaces answer unauthenticated requests with content or `404`. With a grant, the server first reads `ns` from its blocks, before looking up any key: a namespace that isn't named in `ns` by every block that carries `ns` (the root block always does, and `"*"` names every namespace) answers `403` without being consulted, whether or not it exists. Reads of a public namespace are the exception: a grant that doesn't name the namespace, or that can't be used (malformed, badly signed, revoked, expired or not yet valid), is ignored, and the read is answered exactly as an unauthenticated one. A client can then send one bearer to every namespace it reads, including public schema namespaces (§6.1), and the namespace reveals nothing it doesn't show everyone. Writes, and every request to a namespace that isn't public or doesn't exist, keep the `403` and `401` answers. Only then is the grant verified against that namespace's keys, or against the deployment operator keys when the root `kid` names one (§C.4). This hides a namespace's existence from requests to it. Namespace names share one space and are not secret (§E.4): creating a namespace or branch with a taken name reveals that it is taken.
 
@@ -714,8 +715,8 @@ Requests to private namespaces follow Addendum C. Without `read`, a resource tha
 Log entry shape (patches in canonical form):
 
 ```
-{ "id": "…", "parent": "…", "kind": "rev", "patches": [ … ], "author": "…", "created": "…" }
-{ "id": "…", "parent": "…", "kind": "tombstone", "author": "…", "created": "…" }
+{ "id": "…", "parent": "…", "kind": "rev", "patches": [ … ], "author": "…", "created": "…", "gesture"?: "…", "undoes"?: "…" }
+{ "id": "…", "parent": "…", "kind": "tombstone", "author": "…", "created": "…", "gesture"?: "…", "undoes"?: "…" }
 ```
 
 All cursors are ids. Internal sequence numbers are never exposed.
@@ -738,6 +739,15 @@ Writes are **never** unconditional: a write without a precondition is `428`. The
 
 -
 **Author** is the verified principal id. `via` (Addendum C) is recorded with it.
+
+-
+**Gestures.** A write MAY carry `Gesture: <id>`, naming the user action it belongs to, and `Undoes: <id>`, naming the gesture it undoes (§11.2). Both are 26 base32 characters (`^[a-z2-7]{26}$`, 128 random bits the client chooses when the action starts), otherwise `400`.
+
+  - They are stored with the revision or tombstone as metadata, like its author: they are not part of its id (§3.3), so identical patches in different gestures still have identical ids, and rules don't see them.
+
+  - A gesture's revisions may span several saves and resources of one namespace. The id is the writer's own label, never verified, so tools group revisions by author and gesture together, and attribute an `Undoes` to whoever wrote it (§11.2).
+
+  - An idempotent retry (§7.2) is answered with the entry as first recorded, whatever its retry carries, and its `Gesture` and `Undoes` headers say what was recorded.
 
 -
 **Idempotent retry.** Suppose the precondition fails, but the log already contains the entry this request would have produced, recorded **with that parent**:
@@ -775,9 +785,10 @@ If that entry was written by the **same principal**, respond `200` with it inste
 |---|---|---|
 | `GET /ns/{ns}` | `302` with `Location: /ns/{ns}/rev/{ns_id}`, `ETag: "{ns_id}"`, `X-Config-Revision: {config_id}` | head pointer |
 | `GET /ns/{ns}/rev/{ns_id}` | `200` with the namespace document in force at that point in the chain, `ETag: "{ns_id}"`, `X-Config-Revision: {config_id}` | immutable |
-| `GET /ns/{ns}/rev/{ns_id}/log?since={a}` | `200` with an array of `{ id, prev, kind, resource?, name?, remote?, at?, target?, entries?, source?, forced?, author, grant?, created }`, following §3.5, where `grant` is `{ "id", "sub", "kid" }`: the grant id (§C.3) in the text form of §3.2, and its root `sub` and `kid`. A local branch's creation records the creator's grant on both its entries, and a namespace's genesis the operator's. `grant` is absent from entries the server writes itself: propagated purges, purges applied from a remote base, and the prunes and epoch rotations the server performs on its own. Prunes and rotations by a janitor or operator service record its grant, and the schema namespaces a remote branch mirrors at creation record the creating operator's. It is `null` on entries written while authentication is disabled (§1), and absent from entries written before v0.37 unless the grant can be recovered from their revisions; such entries count for no one in `merge.authors` and claim checks (§F.3, §F.6). Paged as in §7.1 | immutable |
+| `GET /ns/{ns}/rev/{ns_id}/log?since={a}` | `200` with an array of `{ id, prev, kind, resource?, name?, remote?, at?, target?, entries?, source?, forced?, author, grant?, gesture?, undoes?, gestures?, created }`, following §3.5, where `gesture` and `undoes` are those of a single write, and `gestures` maps each resource of a batch to a list of `{ "gesture"?, "undoes"? }`, one per step (§7.2), none of them hashed, and `grant` is `{ "id", "sub", "kid" }`: the grant id (§C.3) in the text form of §3.2, and its root `sub` and `kid`. A local branch's creation records the creator's grant on both its entries, and a namespace's genesis the operator's. `grant` is absent from entries the server writes itself: propagated purges, purges applied from a remote base, and the prunes and epoch rotations the server performs on its own. Prunes and rotations by a janitor or operator service record its grant, and the schema namespaces a remote branch mirrors at creation record the creating operator's. It is `null` on entries written while authentication is disabled (§1), and absent from entries written before v0.37 unless the grant can be recovered from their revisions; such entries count for no one in `merge.authors` and claim checks (§F.3, §F.6). Paged as in §7.1 | immutable |
 | `GET /ns/{ns}/rev/{ns_id}/heads?after={name}` | `200` with a page of `{ resource, kind, target }`, one per resource as of that revision, including resources a branch reads through, in ascending byte order of name, strictly after `after`, which is a plain bound and needn't name an existing resource; `next` for the following page | immutable |
 | `GET /ns/{ns}/events?since={ns_id}` | SSE of namespace entries | `no-store` |
+| `GET /ns/{ns}/gestures/{gesture}` | optional: `200` with `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]`, one per revision or tombstone written with that gesture or undoing it, oldest first, paged as in §7.1. Requires unrestricted `read` on the namespace (as §7.6 does); not offered in sealed or end-to-end namespaces, whose logs are the place to look | `no-store` |
 | `GET /ns/{ns}/branches` | `200` with `[{ name, at, frozen, purged, successor?, drafts? }]` for the namespace's direct branches, and `{ remote, at, ns_id, expires }` for remote branches whose registration hasn't expired (§G.3). Requires `read` | head pointer |
 
 **Namespace writes.** The namespace document is edited like a resource, with a JSON Patch on its own URL:
@@ -851,6 +862,8 @@ Content-Type: application/json
   - a patch set appends a revision, or restores if the previous entry is a tombstone
 
   - `"delete"` appends a tombstone. One that follows another `"delete"`, with no patch set between them, is `422`, as a `DELETE` of a tombstoned resource is `410` (§7.2).
+
+A step may also be an object with exactly one of `"patches": [ … ]` or `"delete": true`, plus optional `gesture` and `undoes` (§7.2). An item, or the whole batch, may carry `gesture` and `undoes` as defaults, which a step's own values override. Merges use this to carry each replayed revision's gesture (§F.3).
 
 Resource purge is never part of a batch.
 
@@ -1197,7 +1210,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
 - **Horizon.** Pruning a resource below a horizon revision `H` removes the patch sets of the revisions before `H`.
 
-  - **Kept:** every id, parent link, author, grant reference and creation time, so audit (§C.3) keeps working, and `H`'s document, and the documents kept for protected revisions (below).
+  - **Kept:** every id, parent link, author, grant reference, creation time, `gesture` and `undoes`, so audit (§C.3) keeps working, and `H`'s document, and the documents kept for protected revisions (below).
 
   - **Dropped:** the patch sets before `H`, roughly a third of the storage per revision (§D.5), and the attachments of blobs that only the dropped documents referenced (§7.8). The archive carries those blobs. Ids, parent links and log rows still grow linearly; rate limits (§6.6) bound that growth.
 
@@ -1399,7 +1412,7 @@ Anything that derives data from a namespace, such as a search index, a feed, ana
 
 - **Several resources at once:** a batch (§7.5). The client can compute the resulting ids itself, so it can chain several sets for one resource in one request.
 
-- **Combining changes under a rate limit:** while a save is in flight, keep collecting edits into one pending patch set. It is simply the diff from the last saved revision, so a later `replace` of a path wins. Send it when the response arrives. If that response is lost, first resend the in-flight set **unchanged** (§7.2), and only then the combined rest. On `429`, wait for `Retry-After`, then send whatever has accumulated. High-frequency input, such as typing or dragging, then yields a few revisions a second, each carrying the latest values.
+- **Combining changes under a rate limit:** while a save is in flight, keep collecting edits into one pending patch set. It is simply the diff from the last saved revision, so a later `replace` of a path wins. Send it when the response arrives. If that response is lost, first resend the in-flight set **unchanged** (§7.2), and only then the combined rest. On `429`, wait for `Retry-After`, then send whatever has accumulated. High-frequency input, such as typing or dragging, then yields a few revisions a second, each carrying the latest values. A combined set carries one `Gesture`, so combining across actions makes them one gesture for undo from the log (§11.2); a client that wants each action undoable from the log sends at each action's end instead.
 
 ### 11.1 Designing documents
 
@@ -1432,6 +1445,44 @@ Lessons from loading real data:
   - size: every revision of a large document costs folding, snapshots and bandwidth (§D.4)
 
 A document should be split when it grows without bound (a log, a comment thread), when parts of it have different readers, or when unrelated people edit it at the same time. Link the parts with `x-ref` (§6.5) and group them with a catalog (Addendum B).
+
+### 11.2 Undo and redo
+
+A client keeps its own undo stack for the edits it just made. Gestures (§7.2) make undo work beyond that: after a reload, from another device, and from a history view.
+
+-
+**Recording.** When an action starts, the client picks a gesture id and sends it as `Gesture` with every write the action produces, in every resource it touches.
+
+-
+**Finding a gesture.** `GET /ns/{ns}/gestures/{gesture}` lists its revisions where offered (§7.4). Otherwise the client scans the logs it follows for entries with that `gesture`, by the same author.
+
+-
+**The inverse.** For each resource, walk the gesture's own entries newest first, and turn each into steps of one batch item (§7.5):
+
+  - a revision: the patch set that turns its document back into its parent's, limited to the paths it wrote (§6.4.1), with a write inside an array widened to the whole array, as for merges (§F.3), since inserts and moves shift indices. A `move` whose two ends are unchanged since is inverted as a `move` back, not by copying its subtree twice. A fresh `$nonce` is added where §C.7 asks for one, never an old one restored.
+
+  - a tombstone: a restore with `[]` (§8.2), which brings back the last live document.
+
+  - a restore: the inverse of its patches, then `"delete"`.
+
+  - a genesis: `"delete"`, after the inverses of the later revisions have brought the document back to it. A resource the gesture created ends up deleted, not absent.
+
+These steps undo the gesture and nothing else: edits others made to other paths, even between the gesture's saves, are kept. An edit someone made to a path between two of the gesture's own writes to it was already overwritten by the gesture, and stays lost.
+
+-
+**The guard.** Before writing, the client reads the log after the gesture's last entry in each resource, and compares those entries' `writes` (§6.4.1), widened for arrays as above, with the paths the gesture wrote. Any overlap, or a later delete or restore, is a conflict for a person, as in a merge. The batch then names the heads the client checked in `ifMatch`, so a write landing in between makes it fail with `412`, and the client checks again. `test` ops aren't needed for this, which keeps the inverse small, and at E3, where the server doesn't evaluate patches (§6.2), the check is the client's anyway, against decrypted entries.
+
+-
+**Writing it.** Apply the steps to the current heads with a fresh `Gesture` and `Undoes: <gesture>`, so history stays append-only. Several resources go in one batch (§7.5). A large inverse is split into more chained steps to stay within `opsPerSet` and `patchSetSize` (§6.6). A gesture can't span namespaces, since a batch can't (§7.5); an action that touched several namespaces is undone per namespace, and may be undone only in part.
+
+-
+**When undo is impossible.** If a revision the inverse needs lies below a pruning horizon (`410`), if a blob the earlier document references is no longer available (`422 blob`, §7.8), or if the document's `$schema` has since been migrated so the old values no longer validate (`422 invalid`), the undo fails. These are reported as such, not as conflicts.
+
+-
+**Redo** is undoing the undo: its `Undoes` names the undo's gesture. An author's undo stack can be rebuilt on any device from the log: the gestures that author made, minus those the same author undid and didn't redo. An undo by someone else, such as an editor, is shown as undone by them; it doesn't silently drop the gesture from the author's stack, since `Undoes` isn't verified. `Undoes` naming a gesture that no longer exists, for instance after a squashed merge (§F.3), is ignored.
+
+-
+**Scope.** A gesture is a client's grouping, and the server only stores it. Who may undo what is decided by the ordinary rules for the writes the undo makes.
 
 ---
 
@@ -2453,6 +2504,8 @@ CREATE TABLE revisions (
   patches    TEXT,                         -- canonical JSON; NULL for tombstones, after purge, and below a horizon
   author     INTEGER NOT NULL REFERENCES authors,
   via        TEXT,                         -- JSON array, when delegated
+  gesture    TEXT,                         -- §7.2, metadata, not hashed
+  undoes     TEXT,
   grant_id   BLOB,                         -- §C.3
   created    INTEGER NOT NULL,
   UNIQUE (res, id),
@@ -2460,6 +2513,8 @@ CREATE TABLE revisions (
 );
 CREATE UNIQUE INDEX one_first ON revisions (res) WHERE first = 1;
 CREATE INDEX revisions_by_id ON revisions (id);   -- finds draft schema revisions in branches (§6.1)
+CREATE INDEX revisions_by_gesture ON revisions (gesture) WHERE gesture IS NOT NULL;  -- §7.4
+CREATE INDEX revisions_by_undoes ON revisions (undoes) WHERE undoes IS NOT NULL;
 
 CREATE TABLE grants (id BLOB PRIMARY KEY, blocks TEXT NOT NULL,               -- non-bearer form (§C.3)
                      sub TEXT NOT NULL, kid TEXT NOT NULL);   -- root sub and kid, in plaintext even under E1 (§E.1), so log reads never need the key store
@@ -3104,6 +3159,8 @@ The origin never sees plaintext. Clients encrypt patch sets before sending them 
 
 - the shape of the namespace log
 
+- gesture ids, which group edits into user actions (§7.2). At E2 they are sealed with log entries; at E3 the server sees them, so clients that must hide the grouping keep it inside their sealed content instead
+
 - query strings of derived views (§E.2.6)
 
 - blob sizes and counts; at E3, which revisions reference which blobs; at E2, which epochs a blob is served under
@@ -3233,7 +3290,7 @@ Tombstones are entries like any other, and a `"delete"` step reproduces them (§
 
 - **Authorisation.** The batch is checked in the base, under the merger's grant: the merger needs the base's verbs for every item, and the base's rules apply. Branch authors need no rights in the base at all, so review is structural.
 
-- **Attribution.** Merged revisions, fast-forwarded or replayed, are recorded with the merger as author. The batch's `source` points at the branch revisions, whose authors are recorded there, and audit views show both. Author signatures bind the namespace (§C.3), so they verify against the `source` branch, not the base.
+- **Attribution.** Merged revisions, fast-forwarded or replayed, are recorded with the merger as author. The merger MAY carry each source revision's `gesture` and `undoes` in its steps (§7.5), so history views keep their grouping; squashing loses them. The batch's `source` points at the branch revisions, whose authors are recorded there, and audit views show both. Author signatures bind the namespace (§C.3), so they verify against the `source` branch, not the base.
 
 ## F.4 Stacked branches
 
@@ -3525,7 +3582,7 @@ Remote read-through runs in the receiving deployment's server. Export and import
 
 ## G.1 Principles
 
-- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.38", "auth": "grants" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
+- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.39", "auth": "grants" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
 
 - **Ids travel, trust doesn't.** Content that comes **with its history** can be verified by anyone by recomputing ids (invariant 4), given a trusted starting point: an `ns_id` or revision id obtained from the source itself. Integrity then needs no trusted transport, cache or mirror. Snapshots, headers and listings not covered by ids are only as trustworthy as their channel.
 
@@ -3679,7 +3736,7 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
 
 - **`requires`** applies only to `full` documents. `requires[r]` MUST be in the target's chain for `r`. If the target has moved on along another line, `r` is a conflict.
 
-- **Authors, `via`, grant ids and author signatures** are included only with `"authors": true`. Signatures are verified against the header's `origin`.
+- **Authors, `via`, grant ids, author signatures, `gesture` and `undoes`** are included only with `"authors": true`. Signatures are verified against the header's `origin`.
 
 - **Never exported:** purged content.
 
@@ -4073,3 +4130,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Also:** a retried batch's purged items are `410`; a retried namespace `PATCH` answers `200`; spec versions are dotted decimals; CORS sends `*` on every response when every origin is allowed.
 
 - **Note for tools:** since v0.36, validation leaves out a document's top-level `$schema` and fresh `$nonce`; schema tools that also talk to older servers still declare `$schema` in closed schemas.
+
+- **v0.39:** gestures for undo and redo. A write may carry `Gesture` and `Undoes` ids, 128 random bits the client picks per user action, stored with each revision as metadata, outside its id (§7.2). Logs serve them, a batch can set them per step, and an optional endpoint lists a gesture's revisions (§7.4, §7.5). Undo is a client procedure (§11.2): the inverse of the gesture's own entries, newest first and widened to whole arrays, written after checking the later log for overlapping writes and guarded by `ifMatch`; redo undoes the undo, and an author's stack counts that author's undos, showing others' as such. Merges and bundles may carry gestures along (§F.3, §G.4.1), and pruning keeps them.
