@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -175,9 +176,10 @@ func parseMerge(v any) ([]MergeAuthor, error) {
 	if !ok {
 		return nil, fmt.Errorf(shape)
 	}
-	for k := range m {
-		if k != "authors" {
-			return nil, fmt.Errorf("/merge/%s is not a known field", k)
+	for _, k := range sortedKeys(m) {
+		// Other members must start with "x-" (§7.4).
+		if k != "authors" && !strings.HasPrefix(k, "x-") {
+			return nil, badAt(pointer.Pointer{"merge", k}, `is not a known field; other members must start with "x-" (§F.3, §7.4)`)
 		}
 	}
 	arr, ok := m["authors"].([]any)
@@ -262,55 +264,82 @@ var nsMembers = map[string]bool{
 	"merge": true, "merged": true, "cleanup": true, "abandoned": true, // Addendum F
 }
 
-// memberError is a namespace-document member this version doesn't define
-// and that doesn't start with "x-" (§7.4). Its 422 names the member.
-// inherited is set when a new branch's document holds it because its
-// base's does (stored under an earlier version): the message says how the
-// branch's patches can rename it.
+// memberError is a namespace document that fails the strict part of the
+// namespace-document schema (§7.4): the JSON Pointer of the offending
+// value, and why. Its 422 is code "invalid" with
+// errors: [{ "pointer", "message" }], as for schema validation
+// (configErr). member is set for a top-level member this version doesn't
+// define and that doesn't start with "x-"; inherited, when a new branch's
+// document holds it because its base's does (stored under an earlier
+// version): the message then says how the branch's patches can rename it.
 type memberError struct {
+	pointer   string
+	msg       string
 	member    string
 	inherited bool
 }
 
 func (e *memberError) Error() string {
+	if e.member == "" {
+		return e.msg
+	}
 	x := pointer.Pointer{"x-" + e.member}
 	if e.inherited {
 		return fmt.Sprintf(`%s, which the base's document holds, is not a namespace-document member of the spec version this server implements, and a new namespace can't hold it; other members must start with "x-": the branch's patches can rename it, {"op":"move","from":%q,"path":%q} (§7.4)`,
-			e.path(), e.path(), x.String())
+			e.pointer, e.pointer, x.String())
 	}
 	return fmt.Sprintf(`%s is not a namespace-document member of the spec version this server implements; other members must start with "x-", e.g. %s (§7.4)`,
-		e.path(), x)
+		e.pointer, x)
 }
 
-// path is the member as a JSON Pointer.
-func (e *memberError) path() string { return pointer.Pointer{e.member}.String() }
+// badAt is a memberError at the value p; the message starts with p.
+func badAt(p pointer.Pointer, format string, args ...any) *memberError {
+	s := p.String()
+	return &memberError{pointer: s, msg: s + " " + fmt.Sprintf(format, args...)}
+}
+
+// unknownMember is the memberError of a top-level member k this version
+// doesn't define.
+func unknownMember(k string) *memberError {
+	return &memberError{pointer: pointer.Pointer{k}.String(), member: k}
+}
+
+// isX reports an "x-" member, stored as data (§7.4). The prefix is
+// case-sensitive.
+func isX(k string) bool { return strings.HasPrefix(k, "x-") }
 
 // checkMembers is the strict part of the namespace-document schema (§7.4),
 // for a document a write produces, after parseConfig accepted it: every
-// member is one the spec defines, in its shape, or starts with "x-" and is
-// stored as data, so a typo or a setting from a newer version is refused
-// rather than ignored. parseConfig checks the core's members, and reads
-// stored documents too; this checks the rest, which only services read,
-// and revocation ids and key entries. prev is what the write keeps: for a
-// config write the namespace's current document, so a member it holds
-// with the same value, stored under an earlier version, is kept as data
-// until a write changes or removes it, and a namespace written before an
-// upgrade can still be frozen, rotated or merged; for a new branch only
-// the members its base's document holds that this version defines
-// (definedMembers), since a new namespace holds no others. Within
-// revoked and keys, entries prev holds are kept the same way, so a
-// revocation can be added next to one an older version stored. A new
-// namespace has no prev.
+// top-level member is one the spec defines, in its shape, or starts with
+// "x-" and is stored as data, so a typo or a setting from a newer version
+// is refused rather than ignored. So may members inside the addenda's
+// objects (catalog, each catalogs entry, merge, merged, cleanup), except
+// as keys of catalogs, which are catalog names; role entries are open
+// (grant.ParseRoles reads can and rules and ignores the rest); key entries
+// and other nested objects are strict. parseConfig checks the core's
+// members, and reads stored documents too; this checks the rest, which
+// only services read, and revocation ids and key entries.
+//
+// prev is what the write keeps: for a config write the namespace's current
+// document, so a member it holds with the same value, stored under an
+// earlier version, is kept as data until a write changes or removes it,
+// and a namespace written before an upgrade can still be frozen, rotated
+// or merged; for a new branch only the members its base's document holds
+// that this version defines (definedMembers), since a new namespace holds
+// no others. Within revoked and keys, entries prev holds are kept the
+// same way, so a revocation can be added next to one an older version
+// stored. A new namespace has no prev. Removing a member is always
+// accepted: only what the document holds is checked.
 func checkMembers(doc, prev map[string]any) error {
 	for _, k := range sortedKeys(doc) {
 		v := doc[k]
-		if strings.HasPrefix(k, "x-") {
+		if isX(k) {
 			continue
 		}
 		if pv, ok := prev[k]; ok && jsonv.Equal(pv, v) {
 			continue
 		}
-		var err error
+		var err *memberError
 		switch k {
 		case "revoked":
 			// parseConfig, which reads stored documents too, checks only
@@ -327,7 +356,7 @@ func checkMembers(doc, prev map[string]any) error {
 			for i, e := range arr {
 				s, _ := e.(string)
 				if _, perr := ids.Parse(s); perr != nil && !kept[s] {
-					err = fmt.Errorf("/revoked/%d must be a revocation id, the text id of a block's signature (§C.4)", i)
+					err = badAt(pointer.Pointer{"revoked", strconv.Itoa(i)}, "must be a revocation id, the text id of a block's signature (§C.4)")
 					break
 				}
 			}
@@ -337,21 +366,19 @@ func checkMembers(doc, prev map[string]any) error {
 			err = checkCatalog(v)
 		case "catalogs":
 			err = checkCatalogs(v)
+		case "merge":
+			// parseConfig checked its shape; x- members are data.
 		case "merged":
-			m, ok := v.(map[string]any)
-			at, _ := m["at"].(string)
-			if _, perr := ids.Parse(at); !ok || len(m) != 1 || perr != nil {
-				err = fmt.Errorf(`/merged must be { "at": the base's ns_id after the merge } (§F.3)`)
-			}
+			err = checkMerged(v)
 		case "cleanup":
 			err = checkCleanup(v)
 		case "abandoned":
 			if _, ok := v.(bool); !ok {
-				err = fmt.Errorf("/abandoned must be a boolean (§F.6)")
+				err = badAt(pointer.Pointer{"abandoned"}, "must be a boolean (§F.6)")
 			}
 		default:
 			if !nsMembers[k] {
-				err = &memberError{member: k}
+				err = unknownMember(k)
 			}
 		}
 		if err != nil {
@@ -375,9 +402,9 @@ func definedMembers(doc map[string]any) map[string]any {
 
 // checkKeyFields refuses fields a key entry doesn't define (§C.4), which
 // grant.ParseKeys accepts when they start with "x-", as stored documents
-// may hold them: §7.4 sanctions "x-" only for members of the document
-// itself. An entry prev holds unchanged is kept.
-func checkKeyFields(v, prev any) error {
+// may hold them: key entries are strict (§7.4). An entry prev holds
+// unchanged is kept.
+func checkKeyFields(v, prev any) *memberError {
 	pa, _ := prev.([]any)
 	arr, _ := v.([]any)
 	for i, e := range arr {
@@ -393,8 +420,8 @@ func checkKeyFields(v, prev any) error {
 			continue
 		}
 		for _, f := range sortedKeys(m) {
-			if strings.HasPrefix(f, "x-") {
-				return fmt.Errorf("/keys/%d/%s is not a key field; a key entry holds only the fields of §C.4", i, pointer.Pointer{f}.String()[1:])
+			if isX(f) {
+				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), f}, "is not a key field; a key entry holds only the fields of §C.4")
 			}
 		}
 	}
@@ -402,30 +429,31 @@ func checkKeyFields(v, prev any) error {
 }
 
 // checkCatalog checks a catalog namespace's "catalog" (§B.6):
-// { "trust"?: [namespace names], "mode"?: "tree" | "dag" }.
-func checkCatalog(v any) error {
+// { "trust"?: [namespace names], "mode"?: "tree" | "dag" }, and x- members.
+func checkCatalog(v any) *memberError {
 	m, ok := v.(map[string]any)
 	if !ok {
-		return fmt.Errorf(`/catalog must be { "trust"?: [namespace names], "mode"?: "tree" | "dag" } (§B.6)`)
+		return badAt(pointer.Pointer{"catalog"}, `must be { "trust"?: [namespace names], "mode"?: "tree" | "dag" } (§B.6)`)
 	}
 	for _, k := range sortedKeys(m) {
-		switch x := m[k]; k {
-		case "trust":
+		switch x := m[k]; {
+		case k == "trust":
 			arr, ok := x.([]any)
 			if !ok {
-				return fmt.Errorf("/catalog/trust must be an array of namespace names (§B.6)")
+				return badAt(pointer.Pointer{"catalog", "trust"}, "must be an array of namespace names (§B.6)")
 			}
 			for i, e := range arr {
 				if s, ok := e.(string); !ok || !ValidNSName(s) {
-					return fmt.Errorf("/catalog/trust/%d must be a namespace name (§3.6)", i)
+					return badAt(pointer.Pointer{"catalog", "trust", strconv.Itoa(i)}, "must be a namespace name (§3.6)")
 				}
 			}
-		case "mode":
+		case k == "mode":
 			if x != "tree" && x != "dag" {
-				return fmt.Errorf(`/catalog/mode must be "tree" or "dag" (§B.6)`)
+				return badAt(pointer.Pointer{"catalog", "mode"}, `must be "tree" or "dag" (§B.6)`)
 			}
+		case isX(k):
 		default:
-			return fmt.Errorf("/catalog/%s is not a known field (§B.6)", k)
+			return badAt(pointer.Pointer{"catalog", k}, `is not a known field; other members must start with "x-" (§B.6, §7.4)`)
 		}
 	}
 	return nil
@@ -435,31 +463,35 @@ func checkCatalog(v any) error {
 var subjectRe = regexp.MustCompile(`^(group|user):.+$`)
 
 // checkCatalogs checks a content namespace's "catalogs" (§B.11.3):
-// { catalog namespace: { "place"?: [subjects] } }.
-func checkCatalogs(v any) error {
+// { catalog namespace: { "place"?: [subjects] } }. Its keys are catalog
+// names, never x- members; each entry may hold x- members.
+func checkCatalogs(v any) *memberError {
 	m, ok := v.(map[string]any)
 	if !ok {
-		return fmt.Errorf(`/catalogs must be { catalog namespace: { "place": ["group:…" or "user:…", …] } } (§B.11.3)`)
+		return badAt(pointer.Pointer{"catalogs"}, `must be { catalog namespace: { "place": ["group:…" or "user:…", …] } } (§B.11.3)`)
 	}
 	for _, cat := range sortedKeys(m) {
 		if !ValidNSName(cat) {
-			return fmt.Errorf("/catalogs/%s: the keys of /catalogs must be catalog namespace names (§B.11.3)", cat)
+			return badAt(pointer.Pointer{"catalogs", cat}, "is not a catalog namespace name: the keys of /catalogs must be catalog namespace names (§B.11.3)")
 		}
 		o, ok := m[cat].(map[string]any)
 		if !ok {
-			return fmt.Errorf(`/catalogs/%s must be { "place": ["group:…" or "user:…", …] } (§B.11.3)`, cat)
+			return badAt(pointer.Pointer{"catalogs", cat}, `must be { "place": ["group:…" or "user:…", …] } (§B.11.3)`)
 		}
 		for _, k := range sortedKeys(o) {
+			if isX(k) {
+				continue
+			}
 			if k != "place" {
-				return fmt.Errorf("/catalogs/%s/%s is not a known field (§B.11.3)", cat, k)
+				return badAt(pointer.Pointer{"catalogs", cat, k}, `is not a known field; other members must start with "x-" (§B.11.3, §7.4)`)
 			}
 			arr, ok := o[k].([]any)
 			if !ok {
-				return fmt.Errorf(`/catalogs/%s/place must be an array of subjects, "group:…" or "user:…" (§B.11.3)`, cat)
+				return badAt(pointer.Pointer{"catalogs", cat, "place"}, `must be an array of subjects, "group:…" or "user:…" (§B.11.3)`)
 			}
 			for i, e := range arr {
 				if s, ok := e.(string); !ok || !subjectRe.MatchString(s) {
-					return fmt.Errorf(`/catalogs/%s/place/%d must be a subject, "group:…" or "user:…" (§B.11.1)`, cat, i)
+					return badAt(pointer.Pointer{"catalogs", cat, "place", strconv.Itoa(i)}, `must be a subject, "group:…" or "user:…" (§B.11.1)`)
 				}
 			}
 		}
@@ -467,23 +499,40 @@ func checkCatalogs(v any) error {
 	return nil
 }
 
-// checkCleanup checks a branch's "cleanup" (§F.6), which the janitor reads,
-// and a base's minimums in the same shape: { "merged"?, "superseded"?,
-// "abandoned"? }, each an ISO 8601 duration.
-func checkCleanup(v any) error {
+// checkMerged checks a merged branch's "merged" (§F.3): { "at": the base's
+// ns_id after the merge }, and x- members.
+func checkMerged(v any) *memberError {
 	m, ok := v.(map[string]any)
-	if !ok {
-		return fmt.Errorf(`/cleanup must be { "merged"?, "superseded"?, "abandoned"? }, each an ISO 8601 duration (§F.6)`)
+	at, _ := m["at"].(string)
+	if _, perr := ids.Parse(at); !ok || perr != nil {
+		return badAt(pointer.Pointer{"merged"}, `must be { "at": the base's ns_id after the merge } (§F.3)`)
 	}
 	for _, k := range sortedKeys(m) {
-		switch k {
-		case "merged", "superseded", "abandoned":
+		if k != "at" && !isX(k) {
+			return badAt(pointer.Pointer{"merged", k}, `is not a known field; other members must start with "x-" (§F.3, §7.4)`)
+		}
+	}
+	return nil
+}
+
+// checkCleanup checks a branch's "cleanup" (§F.6), which the janitor reads,
+// and a base's minimums in the same shape: { "merged"?, "superseded"?,
+// "abandoned"? }, each an ISO 8601 duration, and x- members.
+func checkCleanup(v any) *memberError {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return badAt(pointer.Pointer{"cleanup"}, `must be { "merged"?, "superseded"?, "abandoned"? }, each an ISO 8601 duration (§F.6)`)
+	}
+	for _, k := range sortedKeys(m) {
+		switch {
+		case k == "merged" || k == "superseded" || k == "abandoned":
 			s, ok := m[k].(string)
 			if _, err := ParseDuration(s); !ok || err != nil {
-				return fmt.Errorf("/cleanup/%s must be an ISO 8601 duration, e.g. P7D (§F.6)", k)
+				return badAt(pointer.Pointer{"cleanup", k}, "must be an ISO 8601 duration, e.g. P7D (§F.6)")
 			}
+		case isX(k):
 		default:
-			return fmt.Errorf("/cleanup/%s is not a known field (§F.6)", k)
+			return badAt(pointer.Pointer{"cleanup", k}, `is not a known field; other members must start with "x-" (§F.6, §7.4)`)
 		}
 	}
 	return nil

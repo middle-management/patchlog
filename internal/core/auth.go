@@ -29,6 +29,9 @@ type actor struct {
 	bucketKey string
 	keyRate   *grant.Rate
 	grant     *grant.Grant
+	// noAuth: a request made while authentication is disabled (§1). The
+	// namespace entries written for it record "grant": null (§7.4).
+	noAuth bool
 }
 
 func (a *actor) id() string { return a.principal.ID }
@@ -49,7 +52,7 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 		if name == "" {
 			name = "anonymous"
 		}
-		return &actor{principal: grant.Principal{ID: name}, star: true, bucketKey: name}, nil
+		return &actor{principal: grant.Principal{ID: name}, star: true, bucketKey: name, noAuth: true}, nil
 	}
 	g, err := t.decodeGrant(nsName, cred)
 	if err != nil {

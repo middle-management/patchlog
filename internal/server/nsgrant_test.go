@@ -26,13 +26,17 @@ func grantRef(t *testing.T, token string) string {
 	return g.Blocks[0].Sub + " " + g.Blocks[0].Kid + " " + g.ID().String()
 }
 
-// entryRef is an entry's grant member as "sub kid id", or "" without one.
+// entryRef is an entry's grant member as "sub kid id", "null" for
+// "grant": null (§1, §7.4), or "" without one.
 func entryRef(t *testing.T, x any) string {
 	t.Helper()
 	m := x.(map[string]any)
 	g, has := m["grant"]
 	if !has {
 		return ""
+	}
+	if g == nil {
+		return "null"
 	}
 	gm, ok := g.(map[string]any)
 	if !ok || len(gm) != 3 {
@@ -167,7 +171,9 @@ func TestNSLogGrantSealed(t *testing.T) {
 	})
 }
 
-// §1, §7.4: with authentication disabled no entry records a grant.
+// §1, §7.4 (v0.38): entries written while authentication is disabled
+// record "grant": null; the server's own entries, such as a purge it
+// propagates to a branch, record none at all.
 func TestNSLogGrantDev(t *testing.T) {
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{})
@@ -175,9 +181,14 @@ func TestNSLogGrantDev(t *testing.T) {
 	expect(t, e.branch("main", map[string]any{"name": "main-b"}, "bea"), 201)
 	expect(t, e.purge("main", "a", a, "cid"), 204)
 	for _, ns := range []string{"main", "main-b"} {
-		for _, x := range e.get("/ns/" + ns + "/rev/" + e.nsHead(ns) + "/log").Arr() {
-			if _, has := x.(map[string]any)["grant"]; has {
-				t.Fatalf("%s: dev-mode entry with a grant: %v", ns, x)
+		lg := e.get("/ns/" + ns + "/rev/" + e.nsHead(ns) + "/log").Arr()
+		for i, x := range lg {
+			want := "null"
+			if ns == "main-b" && i == len(lg)-1 {
+				want = "" // the propagated purge (§8.3)
+			}
+			if got := entryRef(t, x); got != want {
+				t.Fatalf("%s: entry %d grant %q, want %q: %v", ns, i, got, want, x)
 			}
 		}
 	}
@@ -269,9 +280,9 @@ func TestNSLogGrantMigration(t *testing.T) {
 	}
 }
 
-// §1, §7.4: authentication disabled means no grant references are
-// recorded; a database written with authentication on and later served in
-// development mode keeps serving the references it recorded.
+// §1, §7.4: a database written with authentication on and later served in
+// development mode keeps serving the grant references it recorded; the
+// entries written in development mode record "grant": null.
 func TestNSLogGrantRecordedBeforeDev(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "dev.db")
 	if pgtest.Enabled() {
@@ -291,7 +302,7 @@ func TestNSLogGrantRecordedBeforeDev(t *testing.T) {
 	if got := entryRef(t, lg[len(lg)-2]); got != grantRef(t, f.issuerG) {
 		t.Fatalf("entry recorded with authentication on: grant %q", got)
 	}
-	if got := entryRef(t, lg[len(lg)-1]); got != "" {
+	if got := entryRef(t, lg[len(lg)-1]); got != "null" {
 		t.Fatalf("entry written in development mode: grant %q", got)
 	}
 }

@@ -1,6 +1,6 @@
 # patchlog
 
-A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.37).
+A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.38).
 Each resource is an append-only log of content-addressed JSON Patch sets. The server
 validates documents that opt in with `$schema`, enforces namespace rules and grants,
 and serves immutable, CDN-cacheable revisions.
@@ -99,9 +99,11 @@ volumes:
 ```
 
 `-dev` turns authentication off (`X-Author` names the author), for development only: every
-request then counts as holding a `*` key, so config guards and forced purges are open, and no
-grant references are recorded on namespace entries (§1, Conformance). Without it, give
-`-operator-key` and use grants (Addendum C). `patchlog version` prints the build's version.
+request then counts as holding a `*` key, so config guards and forced purges are open and
+config writes skip namespace rules (resource writes are still checked), and namespace entries
+record `"grant": null` (§1, Conformance). `GET /` says which mode a deployment runs in
+(`"auth": "disabled"` or `"grants"`), and the merge tools and the janitor read it from there.
+Without it, give `-operator-key` and use grants (Addendum C). `patchlog version` prints the build's version.
 While the package is private, pulling needs `docker login ghcr.io` with a token that can read
 packages.
 
@@ -737,11 +739,15 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   whose `source.at` is in the branch's chain (checked by the tool itself, since the server
   checks it only for writers who can read the branch, §7.5) and whose recorded grant (root
   `sub` and `kid` of the entry's `grant`, §7.4) is listed in the base's `merge.authors` count.
-  With authentication disabled entries record no grant (§1), so a merger told so (`-dev`,
-  implied by `-author`; `client.WithAuthDisabled`) matches them on `author` alone, whether or
-  not it sends a bearer the server ignores. Otherwise an entry without a grant (one the server
-  wrote itself, or from before servers recorded grants) counts for no one: the API doesn't
-  publish whether authentication is on, so the tool's operator says so. Without `merge.authors` there
+  Entries written with authentication disabled record `"grant": null` (§1). The merger reads
+  the deployment's mode from `GET /` (`client.AuthDisabled`, asked on every plan): while it
+  says `"auth": "disabled"`, such entries match on `author` alone, whether or not the merger
+  sends a bearer the server ignores; under `"grants"` they count for no one, so nothing
+  written without authentication is trusted once the database is served with authentication
+  on. Entries without `grant` at all (the server's own, or from before v0.37) always count for
+  no one. (v0.37's `client.WithAuthDisabled` and the tools' `-dev` declaration are gone: an
+  operator override could only make a production deployment trust unauthenticated entries.
+  `-dev` is still accepted, and ignored, so scripts keep working.) Without `merge.authors` there
   are no such common ancestors: a second merge after a replay conflicts, and the tool suggests
   rebasing (§F.5). `status` and `plan` show per resource which batch and author its pair came
   from, and print a hint when the base has no `merge.authors` or the merger (`-bearer`'s root
@@ -751,8 +757,10 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   base's `merge.authors`; the successor's batch for `superseded` needs no such author, as §F.6
   states; `"abandoned": true` counts only if the config write that set it records a grant whose
   root key is a `*` key of the branch (its own or a base's), so only its administrators can
-  give up everyone's unmerged work. A janitor run with `-dev` (against `serve -dev`) takes
-  entries without a grant as the development operator's; without `-dev` it trusts none. Cleanup is opt-in: a branch is
+  give up everyone's unmerged work. An entry with `"grant": null` counts, on its author alone
+  for `merged` and as a `*`-key write for `abandoned`, only while `GET /` says
+  `"auth": "disabled"` (asked on each check, so a janitor notices a restart with grants);
+  entries without `grant` count for no one. Cleanup is opt-in: a branch is
   purged only once a `cleanup` period (`"cleanup": { "merged": …, "superseded": …,
   "abandoned": … }`), from the branch's or the base's document, has passed.
 
@@ -1047,10 +1055,10 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
 - **Origins.** Both deployments need canonical origins (`-origin`), in https. Plain http is
   accepted only for loopback hosts, so two local servers can try this out
   (`-origin http://localhost:8080` and `http://localhost:8081`).
-- **Spec versions.** B reads A's `GET /` first: its origin must be the one the genesis names,
-  and a `spec` later than B's own is refused (`422`), since B reads A's namespace documents to
-  judge its protection (§7.4, §G.5). Upgrade B first. A deployment that publishes no `spec`
-  (before v0.37) is accepted.
+- **Spec versions.** B reads A's `GET /` first: its origin must be the one the genesis names.
+  B reads A's namespace documents (`read`, `encryption`, `base`) and ignores members it doesn't
+  define, so it never refuses for an unknown member or for A's `spec` alone, and A may upgrade
+  first (§7.4, §G.3). An `encryption.level` B doesn't know counts as the strictest.
 
 ### Encryption at rest (Addendum E.1)
 
@@ -1607,19 +1615,26 @@ just doesn't apply).
   `catalog` and `catalogs`, and Addendum F's `merge`, `merged`, `cleanup` and `abandoned`. Any
   other member must start with `x-` (`"x-title": "Docs"`) and is stored as data. Creating a
   namespace, a config write (in a batch too), creating a branch (the base's document plus the
-  patches) and a remote branch's genesis answer anything else with `422`, `code: "invalid"`,
-  `path` naming the member (`"/title"`) and a message saying other members must start with
-  `x-`. The addenda's members are checked in their shapes: `catalog: { trust?: [namespace
-  names], mode?: "tree" | "dag" }`, `catalogs: { <catalog>: { place?: ["group:…" | "user:…"] } }`,
-  `merged: { at: ns_id }`, `cleanup: { merged?, superseded?, abandoned? }` (ISO 8601
-  durations), `abandoned` a boolean; and `revoked` lists revocation ids. Role entries keep
-  their other fields (`move`, `place`, `includes`), which the core ignores (§C.1.1); key
-  entries hold only the fields of §C.4 (`x-` fields too are refused). **Upgrading:** documents
-  stored by an earlier version are served as they are. A config write keeps a member the
-  namespace's current document holds, if the write leaves it unchanged, and likewise entries
-  of `revoked` and `keys`, so such a namespace can still be frozen, rotated and merged, and a
-  revocation added next to a malformed one; a write that adds or changes it gets the `422`,
-  and a `{"op":"move","from":"/title","path":"/x-title"}` renames it. A branch is a new
+  patches) and a remote branch's genesis answer anything else with `422`, `code: "invalid"` and
+  `errors: [{ "pointer", "message" }]`, as for schema validation (`"pointer": "/title"`; the
+  body's `message` repeats the error), saying other members must start with `x-`. The check
+  runs before the `*`-key guard. Other invalid namespace documents (a malformed `read`, `keys`,
+  …) answer the same way, with the pointer their message names. The addenda's members are
+  checked in their shapes: `catalog: { trust?: [namespace names], mode?: "tree" | "dag" }`,
+  `catalogs: { <catalog>: { place?: ["group:…" | "user:…"] } }`, `merge: { authors: [{ sub,
+  kid }] }`, `merged: { at: ns_id }`, `cleanup: { merged?, superseded?, abandoned? }` (ISO
+  8601 durations), `abandoned` a boolean; and `revoked` lists revocation ids. `catalog`, each
+  `catalogs` entry, `merge`, `merged` and `cleanup` may also carry `x-` members (v0.38); the
+  keys of `catalogs` are catalog names, so they are checked as names, never as `x-` members.
+  Role entries keep their other fields (`move`, `place`, `includes`), which the core ignores
+  (§C.1.1); key entries, `merge.authors` entries and the core's nested objects are strict
+  (key entries hold only the fields of §C.4; `x-` fields too are refused). **Upgrading:**
+  documents stored by an earlier version are served as they are. A config write keeps a member
+  the namespace's current document holds, if the write leaves it unchanged, and likewise
+  entries of `revoked` and `keys`, so such a namespace can still be frozen, rotated and merged,
+  and a revocation added next to a malformed one; a write may remove it; one that adds or
+  changes it gets the `422`, and a `{"op":"move","from":"/title","path":"/x-title"}` renames
+  it. A branch is a new
   namespace: it keeps the base's members the spec defines as stored, but a member it would
   inherit that isn't one is refused (the message gives the `move` the branch's patches can
   rename it with). Bundles carry no namespace
@@ -1700,8 +1715,13 @@ just doesn't apply).
   sealed namespaces inside the sealed ranges. Entries the server writes itself have none, though
   they keep an author: purges propagated to branches (the purger), the schema namespaces a
   remote branch mirrors (its creator), purges applied from a remote base, retention's prunes
-  and epoch rotations. Neither does any entry written with authentication disabled; references recorded while it
-  was on are still served if the database is later served with `-dev`. Merge tools and
+  and epoch rotations. Entries written on a request with authentication disabled record
+  `"grant": null` (`ns_log.no_auth`, v0.38), so tools can tell them from the server's own;
+  references recorded while authentication was on are still served if the database is later
+  served with `-dev`. Entries a development server wrote before v0.38 can't be told from the
+  server's own (neither stored anything): opening such a database adds `no_auth` empty, so they
+  keep serving no `grant` and count for no one, and an `"abandoned": true` or merge batch
+  written that way in development must be written again to count. Merge tools and
   the janitor match the grant's root `sub` and `kid` against the base's
   `merge: { authors: [{ sub, kid }] }` (§F.3, §F.6), which the server validates and guards with
   a `*` key like `/keys`, and the janitor accepts `"abandoned": true` only from an entry whose
@@ -1715,14 +1735,14 @@ just doesn't apply).
   the client no longer reads. The cost: tools count those entries for no one, so an
   `"abandoned": true` set before the upgrade must be set again, and a merge batch the backfill
   couldn't fill (only `[]` items, or config only) no longer counts as a common ancestor.
-- **`GET /`** answers `{ "spec": "0.37", "origin" }` (§7.4, §G.1), the spec version from one
-  constant (`core.SpecVersion`; `client.Root` reads both). Creating a remote branch checks the
-  base deployment's `spec` first: from a deployment of a later (or unparseable) version, a
-  namespace document B reads (the base's as of `at`, and each configuration genesis of its
-  chain) that holds a member B doesn't know, and that isn't an `x-` one, is refused (`422`),
-  since it may change how protected the base is; a later version alone isn't (§G.3: nothing
-  of A's configuration is copied). B reads those documents only at creation (`at` is fixed;
-  following reads only purges), so that is the one place it checks.
+- **`GET /`** answers `{ "spec": "0.38", "auth": "grants" | "disabled", "origin" }` (§1, §7,
+  §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
+  authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
+  time, for tools that decide on the mode. A remote branch reads its base's namespace
+  documents and ignores members it doesn't define, so neither an unknown member nor the
+  base's `spec` is a reason to refuse (§7.4, §G.3). Only a tool that copies a namespace
+  document into a namespace would refuse unknown members that don't start with `x-`; this
+  repository has none (bundle imports create namespaces from a fresh document, §G.4).
 - **`PATCH /ns/{ns}`** answers `201` with `X-Config-Revision`, `X-Namespace-Revision` and
   `Location: /ns/{ns}/rev/{ns_id}`, naming the entry it wrote, and the body
   `{ "config", "ns_id" }` (§7.4); an idempotent retry answers `200` with the same, also when

@@ -5,11 +5,13 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
+	"github.com/middle-management/patchlog/internal/pointer"
 )
 
 // configPlan is a config change that passed steps 1–6.
@@ -146,7 +148,7 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 		err = checkMembers(cfg.Doc, prev)
 	}
 	var me *memberError
-	if errors.As(err, &me) {
+	if errors.As(err, &me) && me.member != "" {
 		if _, ok := base[me.member]; ok {
 			me.inherited = true
 		}
@@ -157,8 +159,10 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 	return cfg, nil
 }
 
-// configErr is the 422 for a namespace document that fails its schema: an
-// unknown member is named in path, a limit has code "limit".
+// configErr is the 422 for a namespace document that fails its schema: a
+// limit has code "limit"; anything else is code "invalid" with
+// errors: [{ "pointer", "message" }], as for schema validation (§7.4,
+// §12), and the message alone too, for clients that show only that.
 func configErr(err error) *Error {
 	var le *limitError
 	var me *memberError
@@ -166,9 +170,30 @@ func configErr(err error) *Error {
 	case errors.As(err, &le):
 		return limitErr(422, le.msg)
 	case errors.As(err, &me):
-		return apiErr(422, "invalid", "path", me.path(), "message", me.Error())
+		return docInvalid(me.pointer, me.Error())
 	}
-	return invalid(err.Error())
+	return docInvalid(messagePointer(err.Error()), err.Error())
+}
+
+// docInvalid is a 422 invalid with one error at ptr.
+func docInvalid(ptr, msg string) *Error {
+	return apiErr(422, "invalid", "message", msg, "errors", []any{map[string]any{"pointer": ptr, "message": msg}})
+}
+
+// messagePointer is the JSON Pointer a parseConfig message starts with,
+// such as "/read" of "/read must be …" or "/keys" of "/keys: …", or ""
+// for the whole document.
+func messagePointer(msg string) string {
+	if !strings.HasPrefix(msg, "/") {
+		return ""
+	}
+	if i := strings.IndexAny(msg, " :"); i > 0 {
+		msg = msg[:i]
+	}
+	if _, err := pointer.Parse(msg); err != nil {
+		return ""
+	}
+	return msg
 }
 
 // validateConfig is step 5 for a config write.

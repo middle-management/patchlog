@@ -150,6 +150,7 @@ CREATE TABLE IF NOT EXISTS ns_log (
   author     bigint   NOT NULL REFERENCES authors,
   created    bigint   NOT NULL,
   grant_id   bytea,
+  no_auth    smallint,
   UNIQUE (ns, id),
   UNIQUE (ns, prev_seq)
 );
@@ -312,6 +313,10 @@ END $$;
 -- backfills them once, for the grants stored in plaintext.
 ALTER TABLE grants ADD COLUMN IF NOT EXISTS root_sub text;
 ALTER TABLE grants ADD COLUMN IF NOT EXISTS root_kid text;
+-- "grant": null on entries written while authentication is disabled (§1,
+-- §7.4; db.go). Rows from before v0.38 keep NULL: they can't be told from
+-- the server's own entries, and serve no grant.
+ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS no_auth smallint;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 `

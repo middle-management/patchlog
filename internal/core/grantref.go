@@ -7,11 +7,15 @@ package core
 // and its root sub and kid, read from the stored grant. Merge tools and the
 // janitor match the root sub and kid against merge.authors (§F.3, §F.6).
 //
-// Entries the server writes itself (propagated purges, mirrored schemas,
-// purges applied from a remote base, retention's prunes, rotations) and
-// every entry written with authentication disabled (§1) have none. Neither
-// do entries of databases from before grant references that the migration
-// couldn't give one (backfillNSGrants, db.go).
+// Entries written on a request while authentication is disabled (§1)
+// serve "grant": null instead (ns_log.no_auth, tx.noAuth), which merge
+// tools and the janitor match on the author alone while GET / says
+// "auth": "disabled". Entries the server writes itself (propagated purges,
+// mirrored schemas, purges applied from a remote base, retention's prunes,
+// rotations) serve no grant at all. Neither do entries of databases from
+// before grant references that the migration couldn't give one
+// (backfillNSGrants, db.go), nor those a development server wrote before
+// v0.38, which stored nothing to tell them from the server's own.
 
 import (
 	"database/sql"

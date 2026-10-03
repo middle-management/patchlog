@@ -359,9 +359,20 @@ func (e *Engine) Close() error {
 func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) }
 
 // SpecVersion is the version of the Patch Log specification this
-// implementation follows, published at GET / as { "spec" } (§7.4), so tools
-// that copy namespace documents between deployments can check it first.
-const SpecVersion = "0.37"
+// implementation follows, published at GET / as { "spec" } (§7, §7.4), in
+// dotted decimal numbers compared component by component.
+const SpecVersion = "0.38"
+
+// AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
+// requests authenticate with grants (Addendum C), "disabled" for a
+// development deployment, where every request counts as holding a * key
+// and the namespace entries it writes record "grant": null (§7.4).
+func (e *Engine) AuthMode() string {
+	if e.opt.AuthDisabled {
+		return "disabled"
+	}
+	return "grants"
+}
 
 // Origin is the deployment origin.
 func (e *Engine) Origin() string { return e.opt.Origin }
@@ -451,6 +462,11 @@ type tx struct {
 	// in it, and whether encrypted (storeGrant).
 	grants       map[int64]*grant.Grant
 	serverWrites int
+	// unauth are the authors of requests made in this transaction while
+	// authentication is disabled (actorID): the entries written for them
+	// record "grant": null (ns_log.no_auth, §1, §7.4), unless serverWrites
+	// > 0, so the server's own entries still record no grant at all.
+	unauth       map[int64]bool
 	storedGrants map[ids.ID]bool
 	// Encryption at rest (crypt.go): data keys created in this
 	// transaction (cached once committed), whether a purge destroyed keys,
@@ -915,6 +931,7 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 		// encrypts at rest: a namespace's first entry has none before it.
 		grantID = t.storeGrant(g, t.config(configSeq).level >= levelAtRest)
 	}
+	noAuth := t.noAuth(author)
 	rs, ts := make([]int64, len(hist)), make([]int64, len(hist))
 	for i, h := range hist {
 		rs[i], ts[i] = h.res, h.target
@@ -927,16 +944,16 @@ func (t *tx) appendNS(n *nsRow, entry map[string]any, res *int64, targetSeq *int
 		// One statement: the entry, the namespace's head and the heads it
 		// moves, so the log lock is held for a single round trip and the
 		// commit.
-		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
+		seq = t.mustInsert(`WITH l AS (INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT seq FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq) SELECT v.res, l.seq, v.target FROM l, unnest(?::bigint[], ?::bigint[]) AS v(res, target))
 			SELECT seq FROM l`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth,
 			id[:], configSeq, n.id, rs, ts)
 	} else {
-		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id) VALUES (?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
-			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID)
+		seq = t.mustInsert(`INSERT INTO ns_log (ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) RETURNING seq`,
+			n.id, id[:], prevSeq, kind, nullInt(res), nullInt(targetSeq), string(body), configSeq, author, t.now.UnixMilli(), grantID, noAuth)
 		_, err := t.Exec(`UPDATE namespaces SET head_seq = ?, head_id = ?, config_seq = ? WHERE ns = ?`, seq, id[:], configSeq, n.id)
 		t.must(err)
 		for _, h := range hist {
@@ -1006,6 +1023,7 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	kinds, authors := make([]int64, k), make([]int64, k)
 	res, targets := make([]*int64, k), make([]*int64, k)
 	grantIDs := make([][]byte, k)
+	noAuth := make([]*int64, k)
 	var hord, hres, htarget []int64
 	for i, a := range as {
 		bodies[i] = string(jsonv.Canonical(a.entry))
@@ -1014,6 +1032,10 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		if a.grant != nil && t.serverWrites == 0 {
 			// Each entry its own grant (§7.4): one author may write under several.
 			grantIDs[i] = t.storeGrant(a.grant, t.config(configSeq).level >= levelAtRest)
+		}
+		if t.noAuth(a.author) != nil {
+			one := int64(1)
+			noAuth[i] = &one
 		}
 		for _, h := range a.hist {
 			hord, hres, htarget = append(hord, int64(i+1)), append(hres, h.res), append(htarget, h.target)
@@ -1029,18 +1051,18 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 		prev = &out[i]
 	}
 	t.wrote()
-	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[])
-				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, ord)),
+	rows, err := t.Query(`WITH v AS (SELECT * FROM unnest(?::bytea[], ?::smallint[], ?::bigint[], ?::bigint[], ?::text[], ?::bigint[], ?::bytea[], ?::smallint[])
+				WITH ORDINALITY AS v(id, kind, res, target_seq, body, author, grant_id, no_auth, ord)),
 			r AS MATERIALIZED (SELECT nextval(pg_get_serial_sequence('ns_log', 'seq')) AS seq FROM generate_series(1, ?::int)),
 			s AS (SELECT seq, row_number() OVER (ORDER BY seq) AS ord FROM r),
 			c AS (SELECT v.*, s.seq, COALESCE(lag(s.seq) OVER (ORDER BY v.ord), ?::bigint) AS prev_seq FROM v JOIN s USING (ord)),
-			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id)
-				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id FROM c ORDER BY ord RETURNING seq),
+			l AS (INSERT INTO ns_log (seq, ns, id, prev_seq, kind, res, target_seq, body, config_seq, author, created, grant_id, no_auth)
+				SELECT seq, ?, id, prev_seq, kind, res, target_seq, body, ?, author, ?, grant_id, no_auth FROM c ORDER BY ord RETURNING seq),
 			u AS (UPDATE namespaces SET head_seq = (SELECT max(seq) FROM l), head_id = ?, config_seq = ? WHERE ns = ?),
 			h AS (INSERT INTO head_history (res, ns_seq, target_seq)
 				SELECT x.res, c.seq, x.target FROM unnest(?::bigint[], ?::bigint[], ?::bigint[]) AS x(ord, res, target) JOIN c USING (ord))
 			SELECT seq FROM c ORDER BY ord`,
-		idBytes, kinds, res, targets, bodies, authors, grantIDs, k, prevSeq,
+		idBytes, kinds, res, targets, bodies, authors, grantIDs, noAuth, k, prevSeq,
 		n.id, configSeq, t.now.UnixMilli(), idBytes[k-1], configSeq, n.id, hord, hres, htarget)
 	t.must(err)
 	var seqs []int64
@@ -1066,6 +1088,17 @@ func (t *tx) appendNSMany(n *nsRow, configSeq int64, as []nsAppend) []ids.ID {
 	n.configSeq = configSeq
 	t.notify[n.name] = true
 	return out
+}
+
+// noAuth is ns_log.no_auth for an entry by author: 1 if it is written on
+// a request made while authentication is disabled, so it serves
+// "grant": null (§1, §7.4), NULL otherwise. The server's own entries
+// (serverWrites > 0) record neither a grant nor null: they serve none.
+func (t *tx) noAuth(author int64) any {
+	if t.unauth[author] && t.serverWrites == 0 {
+		return int64(1)
+	}
+	return nil
 }
 
 // asServer runs f, whose namespace entries are the server's own, such as

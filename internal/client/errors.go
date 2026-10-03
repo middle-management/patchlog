@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -20,6 +21,18 @@ type APIError struct {
 
 func (e *APIError) Error() string {
 	msg := str(e.Body, "message")
+	if msg == "" {
+		// Validation errors (§12): errors: [{ "pointer", "message" }].
+		var parts []string
+		for _, x := range e.ValidationErrors() {
+			p := x.Pointer
+			if p == "" {
+				p = "(root)"
+			}
+			parts = append(parts, p+": "+x.Message)
+		}
+		msg = strings.Join(parts, "; ")
+	}
 	s := fmt.Sprintf("patchlog: %s %s: %d", e.Method, e.Path, e.Status)
 	if e.Code != "" {
 		s += " " + e.Code
@@ -28,6 +41,23 @@ func (e *APIError) Error() string {
 		s += ": " + msg
 	}
 	return s
+}
+
+// ValidationError is one entry of a 422 invalid's errors (§12): where the
+// document fails, as a JSON Pointer, and why.
+type ValidationError struct{ Pointer, Message string }
+
+// ValidationErrors are the errors of a 422 invalid body: a document that
+// fails its schema, or a namespace document that fails the
+// namespace-document schema (§7.4).
+func (e *APIError) ValidationErrors() []ValidationError {
+	arr, _ := e.Body["errors"].([]any)
+	var out []ValidationError
+	for _, x := range arr {
+		m, _ := x.(map[string]any)
+		out = append(out, ValidationError{Pointer: str(m, "pointer"), Message: str(m, "message")})
+	}
+	return out
 }
 
 // Head is the current head named by a 412 stale body ({ head }).

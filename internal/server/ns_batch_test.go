@@ -328,7 +328,7 @@ func TestBatchConfigAndSchemas(t *testing.T) {
 	r = e.do(req{method: "POST", path: "/ns/m/batch", author: "alice", body: map[string]any{
 		"config": map[string]any{"ifMatch": cfg1, "patches": ops(op("add", "/title", "x"))}}})
 	expectCode(t, r, 422, "invalid")
-	if r.Str("path") != "/title" {
+	if errPointer(t, r) != "/title" {
 		t.Fatalf("batch config with an unknown member: %s", r.Body)
 	}
 	r = e.do(req{method: "POST", path: "/ns/m/batch", author: "alice", body: map[string]any{

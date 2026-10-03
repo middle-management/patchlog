@@ -37,10 +37,12 @@
 //     config write whose recorded grant chains to a * key of the branch,
 //     inherited or its own (§F.6): the root kid of the entry's grant (§7.4)
 //     names a key with scope "*" in the branch's document as of that
-//     write, or in a base's. With authentication disabled entries record no
-//     grant (§1), and the claim is taken as the development server's
-//     operator's; a janitor with a grant of its own takes an entry without
-//     one (from before servers recorded grants) as no one's.
+//     write, or in a base's. An entry written while authentication was
+//     disabled records "grant": null (§1): it counts while the deployment
+//     still runs disabled, as GET / says ("auth": "disabled"), since every
+//     request then counts as holding a * key, and for no one under
+//     "grants". An entry without "grant" at all (the server's own, or one
+//     from before v0.37) counts for no one.
 //   - a branch with no head, tombstone or batch entry of its own counts as
 //     merged.
 //   - at E3, entries for the branch's keyring resource don't count in any
@@ -493,10 +495,10 @@ func hasDocEntries(log []client.NSEntry, i int, e2e bool) bool {
 // coveredBy finds the latest merge batch of branch in entries whose
 // source.at is in the branch's chain, and checks that the branch changed no
 // document after it. If authors is non-nil, only batches whose recorded
-// grant has a root sub and kid listed in *authors count (merge.EntryListed,
-// with dev for a deployment with authentication disabled,
-// client.WithAuthDisabled).
-func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author, e2e, dev bool) (bool, string) {
+// grant has a root sub and kid listed in *authors count (merge.EntryListed),
+// and those with "grant": null on their author alone while disabled: the
+// deployment says, at GET /, it runs with authentication disabled (§1).
+func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author, e2e, disabled bool) (bool, string) {
 	pos := map[string]int{}
 	for i, e := range blog {
 		pos[e.ID] = i
@@ -507,12 +509,14 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, a
 		if !merge.IsMergeOf(e, branch) {
 			continue
 		}
-		if authors != nil && !merge.EntryListed(*authors, e, dev) {
+		if authors != nil && !merge.EntryListed(*authors, e, disabled) {
 			who := e.Author
 			switch {
 			case e.Grant != nil:
 				who = e.Grant.Sub + "/" + e.Grant.Kid
-			case !dev:
+			case e.GrantNull && !disabled:
+				who += " (written without authentication, which counts for no one under grants)"
+			case !e.GrantNull:
 				who += " (no grant recorded)"
 			}
 			untrusted = append(untrusted, e.ID+" by "+who)
@@ -564,7 +568,11 @@ func (j *Janitor) verifyMerged(ctx context.Context, base, at, ns string, blog []
 	if !declared {
 		return false, "the base " + base + " declares no merge.authors, so no merge batch can be trusted (§F.3)", nil
 	}
-	ok, why := coveredBy(entries, ns, blog, &authors, e2e, j.c.AuthDisabled())
+	disabled, err := j.c.AuthDisabled(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	ok, why := coveredBy(entries, ns, blog, &authors, e2e, disabled)
 	return ok, why, nil
 }
 
@@ -605,7 +613,7 @@ func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, b
 		return false, "", err
 	}
 	// §F.6 names no merge.authors check for the successor's batch.
-	ok, why := coveredBy(entries, ns, blog, nil, e2e, j.c.AuthDisabled())
+	ok, why := coveredBy(entries, ns, blog, nil, e2e, false)
 	return ok, why, nil
 }
 
@@ -636,12 +644,20 @@ func (j *Janitor) verifyAbandoned(ctx context.Context, ns string, log []client.N
 		return false, "no config write set abandoned", nil
 	}
 	if setter.Grant == nil {
-		if j.c.AuthDisabled() {
-			// Authentication disabled: no entry records a grant (§1), and
-			// every writer counts as holding a * key.
+		if !setter.GrantNull {
+			return false, fmt.Sprintf("the config write %s that set it records no grant (§7.4), so its key can't be checked; set abandoned again", setter.ID), nil
+		}
+		// Written while authentication was disabled (grant: null), when
+		// every request counted as holding a * key: it counts only while
+		// the deployment still runs disabled (§1).
+		disabled, err := j.c.AuthDisabled(ctx)
+		if err != nil {
+			return false, "", err
+		}
+		if disabled {
 			return true, "", nil
 		}
-		return false, fmt.Sprintf("the config write %s that set it records no grant (§7.4), so its key can't be checked; set abandoned again", setter.ID), nil
+		return false, fmt.Sprintf("the config write %s that set it was written while authentication was disabled (grant: null), which counts for no one now that the deployment runs with grants (§1); set abandoned again", setter.ID), nil
 	}
 	d, err := j.c.NSDoc(ctx, ns, setter.ID)
 	if err != nil {

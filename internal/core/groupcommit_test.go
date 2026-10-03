@@ -226,6 +226,13 @@ func TestPGGroupCommit(t *testing.T) {
 	if want := 1 + 3 + n; len(log.Entries) != want {
 		t.Fatalf("%d entries, want %d", len(log.Entries), want)
 	}
+	// Authentication is disabled: entries appended together record
+	// "grant": null like the others (§1, §7.4).
+	for i, m := range log.Entries {
+		if g, has := m["grant"]; !has || g != nil {
+			t.Fatalf("entry %d: %v", i, m)
+		}
+	}
 }
 
 // A write of a group whose resource an earlier write of the same group

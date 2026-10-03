@@ -37,11 +37,11 @@ func MergeAuthors(doc map[string]any) (authors []Author, declared bool) {
 
 // Listed reports whether the principal (sub, kid) is in authors.
 //
-// Matching is on both sub and kid. The one exception is development mode:
-// with authentication disabled the server records no grants (§1) and a
-// tool has none, so a kid of "" matches on sub alone, the same way the
-// core matches allowances without keys. (merge.authors entries always have
-// a kid: the core requires one.)
+// Matching is on both sub and kid. A kid of "" matches on sub alone: that
+// is how an entry written while authentication is disabled is matched
+// (EntryListed), and a development server's -author has no key either,
+// the same way the core matches allowances without keys. (merge.authors
+// entries always have a kid: the core requires one.)
 func Listed(authors []Author, sub, kid string) bool {
 	if sub == "" {
 		return false
@@ -64,29 +64,50 @@ func EntryPrincipal(e client.NSEntry) (sub, kid string) {
 	return e.Author, ""
 }
 
-// EntryListed reports whether a namespace entry was written under a grant
-// whose root sub and kid are in authors (§F.3). An entry without a grant
-// reference is matched on its author alone only in development mode (dev):
-// for a deployment with authentication disabled, where no entry records a
-// grant (§1). The tool can't tell that from the entries, so its operator
-// says so (client.WithAuthDisabled, -dev). Otherwise such an entry, one
-// the server wrote itself or one from before servers recorded grants, is
-// no one's.
-func EntryListed(authors []Author, e client.NSEntry, dev bool) bool {
-	if e.Grant == nil && !dev {
-		return false
+// EntryListed reports whether a namespace entry counts as written by one
+// of authors (§1, §F.3, §F.6):
+//
+//   - An entry recording a grant counts when the grant's root sub and kid
+//     are listed.
+//   - An entry recording "grant": null, written while authentication was
+//     disabled, counts on its author's sub alone while the deployment runs
+//     with authentication disabled (disabled: GET / says "auth":
+//     "disabled", client.AuthDisabled). Under "grants" it counts for no
+//     one, so nothing written without authentication is trusted in
+//     production.
+//   - An entry without "grant" at all, one the server wrote itself or one
+//     from before v0.37, counts for no one.
+func EntryListed(authors []Author, e client.NSEntry, disabled bool) bool {
+	switch {
+	case e.Grant != nil:
+		return e.Grant.Kid != "" && Listed(authors, e.Grant.Sub, e.Grant.Kid)
+	case e.GrantNull && disabled:
+		return Listed(authors, e.Author, "")
 	}
-	sub, kid := EntryPrincipal(e)
-	return Listed(authors, sub, kid)
+	return false
+}
+
+// Unlisted explains why EntryListed is false for an entry by no listed
+// principal, for status and dry-run output.
+func Unlisted(e client.NSEntry, disabled bool) string {
+	switch {
+	case e.Grant != nil:
+		return "its author " + principal(e.Grant.Sub, e.Grant.Kid) + " is not in the target's merge.authors"
+	case e.GrantNull && disabled:
+		return "its author " + e.Author + " is not in the target's merge.authors"
+	case e.GrantNull:
+		return "it was written while authentication was disabled (grant: null, §1), and the deployment now runs with grants, so it counts for no one"
+	}
+	return "it records no grant (§7.4), so its author " + e.Author + " can't be matched against the target's merge.authors"
 }
 
 // IsTrustedMergeOf reports whether e is a merge batch of branch that
 // counts for §F.3 (common ancestors) and §F.6 (the janitor's merged
 // check): a batch without origin whose source.ns is branch, written under
 // a grant whose root sub and kid are listed in the base's merge.authors
-// (EntryListed, dev as there).
-func IsTrustedMergeOf(e client.NSEntry, branch string, authors []Author, dev bool) bool {
-	return IsMergeOf(e, branch) && EntryListed(authors, e, dev)
+// (EntryListed, disabled as there).
+func IsTrustedMergeOf(e client.NSEntry, branch string, authors []Author, disabled bool) bool {
+	return IsMergeOf(e, branch) && EntryListed(authors, e, disabled)
 }
 
 // String describes where the pair came from, for dry-run and status

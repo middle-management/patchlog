@@ -16,27 +16,6 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 )
 
-// §7, §G.1: GET / publishes the spec version next to the origin.
-func TestV037Root(t *testing.T) {
-	e := newEnv(t)
-	r := e.get("/")
-	expect(t, r, 200)
-	if m := r.Obj(); len(m) != 2 || m["spec"] != core.SpecVersion || m["origin"] != "https://cms.example" {
-		t.Fatalf("GET / %s", r.Body)
-	}
-	if core.SpecVersion != "0.37" {
-		t.Fatalf("spec version %s", core.SpecVersion)
-	}
-	c, err := plclient.New(e.srv.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
-	root, err := c.Root(context.Background())
-	if err != nil || root.Spec != core.SpecVersion || root.Origin != "https://cms.example" {
-		t.Fatalf("client root %+v %v", root, err)
-	}
-}
-
 // §7.4: PATCH /ns/{ns} answers 201 with X-Config-Revision,
 // X-Namespace-Revision and Location naming the entry it wrote, and the body
 // { config, ns_id }. A retry by the same principal answers 200 with the
@@ -184,8 +163,8 @@ func TestV037BlobBeforeRestore(t *testing.T) {
 }
 
 // §1 Conformance: with authentication disabled every request counts as
-// holding a * key, so config guards and forced purges are open, and no
-// grant references are recorded.
+// holding a * key, so config guards and forced purges are open, and every
+// entry written on a request records "grant": null (v0.38).
 func TestV037DevConformance(t *testing.T) {
 	e := newEnv(t, withoutRetentionLoop)
 	e.mkNS("schemas", map[string]any{})
@@ -218,7 +197,7 @@ func TestV037DevConformance(t *testing.T) {
 	for _, ns := range []string{"schemas", "docs"} {
 		for _, x := range e.get("/ns/" + ns + "/rev/" + e.nsHead(ns) + "/log").Arr() {
 			m := x.(map[string]any)
-			if _, has := m["grant"]; has || m["author"] == "" {
+			if g, has := m["grant"]; !has || g != nil || m["author"] == "" {
 				t.Fatalf("%s: %v", ns, m)
 			}
 			if m["kind"] == "purge" && m["forced"] != true {
@@ -228,11 +207,10 @@ func TestV037DevConformance(t *testing.T) {
 	}
 }
 
-// §7.4, §G.3: B checks the spec version A publishes before reading A's
-// namespace documents. Nothing of them is copied, so a later version is
-// refused only when a document B reads holds a member B doesn't know (not
-// an x- extension); from a deployment of B's version or an earlier one, or
-// one from before v0.37 that publishes none, every member is fine.
+// §7.4, §G.3 (v0.38): a deployment that reads another's namespace
+// documents, as a remote branch reads its base's, ignores members it
+// doesn't define: it never refuses for an unknown member, or for the spec
+// version A publishes alone, later, malformed or absent.
 func TestV037RemoteSpecVersion(t *testing.T) {
 	a, b, rt := pair(t, nil, nil)
 	f := populateA(t, a)
@@ -240,15 +218,14 @@ func TestV037RemoteSpecVersion(t *testing.T) {
 	for i, c := range []struct {
 		spec   string
 		member string // added to the base's namespace document as of at
-		ok     bool
 	}{
-		{`"spec":"0.38"`, `"wardens":[]`, false},
-		{`"spec":"0.37-rc"`, `"wardens":[]`, false},
-		{`"spec":"99.0"`, "", true},
-		{`"spec":"0.37.1"`, `"x-team":"a"`, true},
-		{`"spec":"0.36"`, `"wardens":[]`, true},
-		{`"spec":"0.37"`, `"wardens":[]`, true},
-		{"", `"wardens":[]`, true}, // a deployment from before v0.37
+		{`"spec":"0.39"`, `"wardens":[]`},
+		{`"spec":"0.38-rc"`, `"wardens":[]`},
+		{`"spec":"99.0"`, ""},
+		{`"spec":"0.38.1"`, `"x-team":"a"`},
+		{`"spec":"0.36"`, `"wardens":[]`},
+		{`"spec":"0.38"`, `"policy":{"embargo":true}`},
+		{"", `"wardens":[]`}, // a deployment from before v0.37
 	} {
 		c := c
 		rt.set(tamperPaths(t, a, func(path string, body []byte) []byte {
@@ -258,9 +235,6 @@ func TestV037RemoteSpecVersion(t *testing.T) {
 			case path == "/":
 				return bytes.Replace(body, ours, []byte(c.spec), 1)
 			case strings.HasPrefix(path, "/ns/main/rev/") && strings.Count(path, "/") == 4:
-				// A's own title predates strict members (§7.4): a
-				// deployment that validates them would hold none.
-				body = bytes.Replace(body, []byte(`,"title":"A's main"`), nil, 1)
 				if c.member != "" && path == "/ns/main/rev/"+f.at {
 					body = append([]byte("{"+c.member+","), bytes.TrimPrefix(body, []byte("{"))...)
 				}
@@ -268,17 +242,7 @@ func TestV037RemoteSpecVersion(t *testing.T) {
 			return body
 		}), "")
 		name := fmt.Sprintf("rel%d", i)
-		r := b.mkRemote(name, remoteGenesis("main", f.at, nil))
-		if !c.ok {
-			expectCode(t, r, 422, "invalid")
-			if !strings.Contains(r.Str("message"), "spec") || !strings.Contains(r.Str("message"), "wardens") {
-				t.Fatalf("%s: %s", c.spec, r.Body)
-			}
-			expect(t, b.get("/ns/"+name), 404)
-			expect(t, b.get("/ns/schemas"), 404)
-			continue
-		}
-		expect(t, r, 201)
+		expect(t, b.mkRemote(name, remoteGenesis("main", f.at, nil)), 201)
 	}
 }
 

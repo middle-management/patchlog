@@ -310,9 +310,11 @@ func TestPairProvenanceReported(t *testing.T) {
 	}
 }
 
-// §F.3, §7.4: an entry counts by the root sub and kid of the grant it
-// records; one without a grant counts by its author only for a tool in
-// development mode (§1), never otherwise.
+// §1, §F.3, §7.4: an entry counts by the root sub and kid of the grant it
+// records. One recording "grant": null, written while authentication was
+// disabled, counts by its author's sub alone while the deployment runs
+// disabled, and for no one under grants. One without "grant" at all (the
+// server's own, or from before v0.37) counts for no one, in either mode.
 func TestEntryListed(t *testing.T) {
 	authors := []merge.Author{{Sub: "svc:merge", Kid: "ops-2026"}}
 	g := func(sub, kid string) *client.NSGrant {
@@ -320,22 +322,29 @@ func TestEntryListed(t *testing.T) {
 	}
 	for _, tc := range []struct {
 		e        client.NSEntry
-		dev      bool
+		disabled bool
 		want     bool
 		sub, kid string
+		why      string
 	}{
-		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "ops-2026")}, false, true, "svc:merge", "ops-2026"},
-		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "ops-2026")}, true, true, "svc:merge", "ops-2026"},
-		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "other")}, true, false, "svc:merge", "other"},
-		{client.NSEntry{Author: "svc:merge"}, false, false, "svc:merge", ""}, // no grant recorded
-		{client.NSEntry{Author: "svc:merge"}, true, true, "svc:merge", ""},   // development mode
-		{client.NSEntry{Author: "user:ed"}, true, false, "user:ed", ""},
+		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "ops-2026")}, false, true, "svc:merge", "ops-2026", ""},
+		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "ops-2026")}, true, true, "svc:merge", "ops-2026", ""},
+		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "other")}, true, false, "svc:merge", "other", "svc:merge/other is not in"},
+		{client.NSEntry{Author: "svc:merge", Grant: g("svc:merge", "")}, true, false, "svc:merge", "", "is not in"},
+		{client.NSEntry{Author: "svc:merge", GrantNull: true}, true, true, "svc:merge", "", ""},
+		{client.NSEntry{Author: "svc:merge", GrantNull: true}, false, false, "svc:merge", "", "now runs with grants"},
+		{client.NSEntry{Author: "user:ed", GrantNull: true}, true, false, "user:ed", "", "user:ed is not in"},
+		{client.NSEntry{Author: "svc:merge"}, false, false, "svc:merge", "", "records no grant"},
+		{client.NSEntry{Author: "svc:merge"}, true, false, "svc:merge", "", "records no grant"},
 	} {
-		if got := merge.EntryListed(authors, tc.e, tc.dev); got != tc.want {
-			t.Fatalf("EntryListed(%+v, dev %v) = %v", tc.e, tc.dev, got)
+		if got := merge.EntryListed(authors, tc.e, tc.disabled); got != tc.want {
+			t.Fatalf("EntryListed(%+v, disabled %v) = %v", tc.e, tc.disabled, got)
 		}
 		if sub, kid := merge.EntryPrincipal(tc.e); sub != tc.sub || kid != tc.kid {
 			t.Fatalf("EntryPrincipal(%+v) = %s %s", tc.e, sub, kid)
+		}
+		if tc.why != "" && !strings.Contains(merge.Unlisted(tc.e, tc.disabled), tc.why) {
+			t.Fatalf("Unlisted(%+v, %v) = %q", tc.e, tc.disabled, merge.Unlisted(tc.e, tc.disabled))
 		}
 	}
 }
