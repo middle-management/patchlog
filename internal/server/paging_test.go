@@ -504,11 +504,11 @@ func TestLogPagingBranch(t *testing.T) {
 	expect(t, e.get("/r/br2/a/rev/"+head+"/log?since="+later), 404)
 }
 
-// A page of an e2e range whose since is a prune snapshot starts with that
-// snapshot (§8.6), a later page as much as a first: the URL is the same.
-// The snapshot isn't an entry of the range, so it doesn't count towards
-// the page size. A later page's since is a snapshot when the resource was
-// pruned at the previous page's last entry between the two reads.
+// An e2e range whose since is a prune's horizon holds only the entries
+// after it, paged like any other: the horizon's sealed snapshot is served
+// as /rev/{H}, never as a log entry (§7.1 Paging, §8.6). A later page's
+// since is the horizon when the resource was pruned at the previous page's
+// last entry between the two reads; that page is no different.
 func TestE2ELogPageFromSnapshot(t *testing.T) {
 	f := newE2E(t, withArchive(t, t.TempDir()), withLogPageSize(2))
 	e := f.tenv
@@ -532,17 +532,40 @@ func TestE2ELogPageFromSnapshot(t *testing.T) {
 	r = e.get(path+"?since="+revs[1], f.readerG)
 	expect(t, r, 200)
 	arr := anyMaps(r.Arr())
-	if len(arr) != 3 || arr[0]["kind"] != "snapshot" || arr[0]["id"] != revs[1] || arr[0]["snapshot"] != snap {
-		t.Fatalf("page from the horizon: %v", arr)
+	if got := entryIDs(arr); strings.Join(got, ",") != strings.Join(revs[2:4], ",") || arr[0]["parent"] != revs[1] || r.H.Get("X-Log-Next") != revs[3] {
+		t.Fatalf("page from the horizon: %v, next %q", arr, r.H.Get("X-Log-Next"))
 	}
-	if got := entryIDs(arr[1:]); strings.Join(got, ",") != strings.Join(revs[2:4], ",") || arr[1]["parent"] != revs[1] || r.H.Get("X-Log-Next") != revs[3] {
-		t.Fatalf("page from the horizon: %v, next %q", got, r.H.Get("X-Log-Next"))
-	}
-	// The page after it has no snapshot to start with.
 	r = e.get(path+"?since="+revs[3], f.readerG)
 	expect(t, r, 200)
 	if got := entryIDs(anyMaps(r.Arr())); strings.Join(got, ",") != strings.Join(revs[4:], ",") || r.H.Get("X-Log-Next") != "" {
 		t.Fatalf("last page %v, next %q", got, r.H.Get("X-Log-Next"))
+	}
+	// A range from the horizon that fits one page, and an empty one.
+	r = e.get("/r/e/p/rev/"+revs[3]+"/log?since="+revs[1], f.readerG)
+	expect(t, r, 200)
+	if got := entryIDs(anyMaps(r.Arr())); strings.Join(got, ",") != strings.Join(revs[2:4], ",") || r.H.Get("X-Log-Next") != "" {
+		t.Fatalf("single page %v, next %q", got, r.H.Get("X-Log-Next"))
+	}
+	r = e.get("/r/e/p/rev/"+revs[1]+"/log?since="+revs[1], f.readerG)
+	expect(t, r, 200)
+	if len(r.Arr()) != 0 {
+		t.Fatalf("empty range at the horizon: %s", r.Body)
+	}
+	// The snapshot is the horizon's revision: immutable and conditional.
+	r = e.get("/r/e/p/rev/"+revs[1], f.readerG)
+	expect(t, r, 200)
+	if string(r.Body) != snap || r.H.Get("Content-Type") != seal.ContentType || r.H.Get("X-E2E") != "snapshot" || r.H.Get("X-Revision") != revs[1] {
+		t.Fatalf("/rev/{H}: %v %s", r.H, r.Body)
+	}
+	expect(t, e.do(req{method: "GET", path: "/r/e/p/rev/" + revs[1], bearer: f.readerG, ifNoneMatch: `"` + revs[1] + `"`}), 304)
+	keys := map[string][]byte{"e#1": k}
+	mustEqual(t, f.fold("e", "p", revs[5], keys, f.readerG), map[string]any{"n": 5.0})
+	mustEqual(t, f.fold("e", "p", revs[3], keys, f.readerG), map[string]any{"n": 3.0})
+	mustEqual(t, f.fold("e", "p", revs[1], keys, f.readerG), map[string]any{"n": 1.0})
+	// Other revisions still redirect to the fold from the horizon (§13).
+	r = e.get("/r/e/p/rev/"+revs[4], f.readerG)
+	if r.Code != 302 || r.H.Get("Location") != "/r/e/p/rev/"+revs[4]+"/log?since="+revs[1] {
+		t.Fatalf("/rev/%s: %d %v", revs[4], r.Code, r.H)
 	}
 }
 

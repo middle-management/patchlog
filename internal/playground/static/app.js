@@ -1117,15 +1117,14 @@ function pageEndErr(p, last) {
 function jweID(jwe) { try { return (Z.parseJWE(jwe).header.pl || {}).id || ''; } catch (_) { return ''; } }
 
 /* readLogRange reads a plain log range (entries, or an E2 resource log's per-entry JWEs) from the answer r
- * for its first page, and returns { arr, since, to, err } with the pages' arrays joined. A later page of an
- * e2e range repeats the snapshot of its since; it is left out, so the entries chain as one range. */
+ * for its first page, and returns { arr, since, to, err } with the pages' arrays joined. An e2e range never
+ * holds a prune snapshot: it is served as /rev/{H} (§7.1 Paging), where foldLog fetches it. */
 async function readLogRange(r, o = {}) {
   const L = await logPages(r, o);
   const arr = [];
   let err = L.err;
-  L.pages.forEach((p, i) => {
-    let a = Array.isArray(p.r.json) ? p.r.json : [];
-    if (i > 0 && a.length && a[0] && a[0].kind === 'snapshot' && a[0].id === p.since) a = a.slice(1);
+  L.pages.forEach((p) => {
+    const a = Array.isArray(p.r.json) ? p.r.json : [];
     arr.push(...a);
     const x = a.length ? a[a.length - 1] : null;
     err = err || pageEndErr(p, x == null ? p.since : (typeof x === 'string' ? jweID(x) : x.id));
@@ -1196,6 +1195,13 @@ async function readDoc(ns, name, id, r) {
       return { doc: f.value, fold: f };
     } catch (err) { return { doc: null, foldErr: err.message, raw: r.text }; }
   }
+  if (r.hdr('X-E2E') === 'snapshot') {
+    // An E3 pruning horizon: /rev/{H} serves the prune's sealed snapshot (§7.1 Paging, §8.6).
+    try {
+      const d = await openSnapshot(ns, name, id, r);
+      return { doc: d.value, seal: d, raw: r.text };
+    } catch (err) { return { doc: null, foldErr: err.message, raw: r.text }; }
+  }
   if (r.jose) { const d = await decrypted(r, ns, name, { ns, name, id, kind: 'doc' }); return { doc: d.value, seal: d, raw: r.text }; }
   return { doc: r.json };
 }
@@ -1240,24 +1246,33 @@ async function validateDoc(doc) {
 
 const paddedLength = (n) => Z.padLen(n);
 
-/* foldLog verifies and folds an e2e log answer that ends at id and starts after since. */
+/* openSnapshot opens the sealed snapshot of the pruning horizon h that r, the answer of /rev/{h} with
+ * X-E2E: snapshot, serves: its body (200 application/jose), or for a tombstone horizon the "snapshot" member
+ * of its 410 (the last live document). It is sealed under ns or one of its bases, bound to { name, h }. */
+async function openSnapshot(ns, name, h, r) {
+  const jwe = r.status === 410 ? (r.json && r.json.snapshot) : (r.jose ? (r.text || '').trim() : '');
+  if (typeof jwe !== 'string' || !jwe) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: no sealed snapshot in the answer`);
+  const hdr = Z.parseJWE(jwe).header;
+  const kns = Z.parseKid(hdr.kid).ns;
+  if (!(await nsChainOK(ns, kns))) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: sealed under ${hdr.kid}`);
+  return openSealed(kns, jwe, '', { ns: kns, name, id: h, kind: 'snapshot' });
+}
+
+/* foldLog verifies and folds an e2e log answer that ends at id and starts after since. A fold from a pruning
+ * horizon (since set) starts from its sealed snapshot, which /rev/{since} serves (never the log, §7.1 Paging). */
 async function foldLog(ns, name, id, since, arr) {
   const out = { id, since, entries: [], flagged: [], validID: '', value: undefined, notes: [] };
   const bad = (msg) => { throw new Error(`e2e log of ${ns}/${name}: ${msg}`); };
-  let doc, exists = false, prev = '', i = 0;
+  let doc, exists = false, prev = '';
   const cfg = ((await nsInfo(ns)).doc || {}).encryption || {};
   if (since) {
-    const m = arr[0] || {};
-    if (m.kind !== 'snapshot' || m.id !== since || typeof m.snapshot !== 'string') bad(`the range after ${since} does not start with its snapshot`);
-    const hdr = Z.parseJWE(m.snapshot).header;
-    const kns = Z.parseKid(hdr.kid).ns;
-    if (!(await nsChainOK(ns, kns))) bad('snapshot sealed under ' + hdr.kid);
-    const d = await openSealed(kns, m.snapshot, '', { ns: kns, name, id: since, kind: 'snapshot' });
+    const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'prune snapshot' });
+    if ((r.status !== 200 && r.status !== 410) || r.hdr('X-E2E') !== 'snapshot') bad(`/rev/${since} does not serve the snapshot the fold starts from (HTTP ${r.status})`);
+    const d = await openSnapshot(ns, name, since, r);
     doc = d.value; exists = true; prev = since; out.validID = since;
-    out.entries.push({ id: since, kind: 'snapshot', _sealed: hdr.kid, _note: 'the prune snapshot the log starts from', _doc: doc });
-    i = 1;
+    out.entries.push({ id: since, kind: 'snapshot', _sealed: d.kid, _note: 'the prune snapshot the fold starts from, served as /rev/' + since, _doc: doc });
   }
-  for (; i < arr.length; i++) {
+  for (let i = 0; i < arr.length; i++) {
     const e = Object.assign({}, arr[i]);
     out.entries.push(e);
     if ((e.parent || '') !== prev) bad(`entry ${e.id} does not chain`);

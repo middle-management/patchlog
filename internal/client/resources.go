@@ -156,8 +156,9 @@ func parseLog(r *response) ([]LogEntry, error) {
 // up to id (inclusive), oldest first, following its pages (§7.1). With id
 // "" it resolves the current head (a revision or tombstone) first. A range
 // crossing the pruning horizon is a 410 pruned *APIError; a since that is
-// not an ancestor is a 404. In an e2e namespace, a range from a snapshot
-// starts with it (kind "snapshot", §8.6), as served.
+// not an ancestor is a 404. In an e2e namespace, a range from a pruning
+// horizon holds only the entries after it: the horizon's sealed snapshot
+// is served as /rev/{H} (§7.1 Paging, §8.6; E2E folds fetch it).
 func (c *Client) Log(ctx context.Context, ns, name, id, since string) ([]LogEntry, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
@@ -187,11 +188,6 @@ func (c *Client) Log(ctx context.Context, ns, name, id, since string) ([]LogEntr
 		if err != nil {
 			return nil, err
 		}
-		if len(es) > 0 && es[0].Kind == "snapshot" && es[0].ID == cur && cur != since {
-			// A later page of an e2e range repeats the snapshot of its
-			// since, if it has one (core: ResourceLog).
-			es = es[1:]
-		}
 		all = append(all, es...)
 		if next == "" {
 			return all, nil
@@ -202,9 +198,7 @@ func (c *Client) Log(ctx context.Context, ns, name, id, since string) ([]LogEntr
 
 // LogPage fetches one page of the resource log range after since up to id
 // (§7.1 Paging): its entries, oldest first, and next, the since of the
-// following page, or "" when the page ends at id. A page whose since is an
-// e2e prune snapshot starts with it (kind "snapshot", §8.6), as served. It
-// answers whether since is an ancestor of id (a 404 when not; a 410 pruned
+// following page, or "" when the page ends at id. It answers whether since is an ancestor of id (a 404 when not; a 410 pruned
 // when the range crosses the horizon) for the price of one page.
 func (c *Client) LogPage(ctx context.Context, ns, name, id, since string) (entries []LogEntry, next string, err error) {
 	if err := checkRes(ns, name); err != nil {

@@ -3,6 +3,7 @@ package client_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -101,8 +102,8 @@ func fakeID(c byte) string { return "1" + strings.Repeat(string(c), 32) }
 
 // A page short of its range without X-Log-Next can't pass for the whole
 // range, nor can an X-Log-Next that isn't the page's last entry, or an
-// empty page that names one (§7.1 Paging). A later page of an e2e range
-// repeats the snapshot of its since; Log leaves it out.
+// empty page that names one (§7.1 Paging). A range from an e2e pruning
+// horizon holds only the entries after it (its snapshot is /rev/{H}).
 func TestLogPagesChecked(t *testing.T) {
 	ctx := context.Background()
 	s0, e1, e2, e3 := fakeID('s'), fakeID('b'), fakeID('c'), fakeID('d')
@@ -119,9 +120,6 @@ func TestLogPagesChecked(t *testing.T) {
 			m["parent"] = parent
 		}
 		return m
-	}
-	snapshot := func(id string) map[string]any {
-		return map[string]any{"id": id, "kind": "snapshot", "snapshot": "x.y.z"}
 	}
 	type answer struct {
 		next    string
@@ -170,8 +168,8 @@ func TestLogPagesChecked(t *testing.T) {
 	}
 
 	pages = map[string]answer{
-		s0: {e2, []any{snapshot(s0), resEntry(e1, s0), resEntry(e2, e1)}},
-		e2: {"", []any{snapshot(e2), resEntry(e3, e2)}},
+		s0: {e2, []any{resEntry(e1, s0), resEntry(e2, e1)}},
+		e2: {"", []any{resEntry(e3, e2)}},
 	}
 	es, err := c.Log(ctx, "n", "a", e3, s0)
 	if err != nil {
@@ -181,14 +179,14 @@ func TestLogPagesChecked(t *testing.T) {
 	for _, e := range es {
 		got = append(got, e.Kind+":"+e.ID[1:2])
 	}
-	if strings.Join(got, ",") != "snapshot:s,rev:b,rev:c,rev:d" {
+	if strings.Join(got, ",") != "rev:b,rev:c,rev:d" {
 		t.Fatalf("e2e range %v", got)
 	}
 }
 
 // The client's own flows with a log page size of 2: every log range they
 // read spans pages (sealed namespace ranges are opened page by page, and
-// e2e folds read the range from a prune snapshot across pages).
+// e2e folds read the range after a prune's horizon across pages).
 func TestPagedFlows(t *testing.T) {
 	for name, f := range map[string]func(*testing.T){
 		"namespace": TestNamespaceAPI, "sealed": TestSealedTransparent, "e2e": TestE2EClient,
@@ -199,9 +197,9 @@ func TestPagedFlows(t *testing.T) {
 
 // A real server prunes an e2e resource at the last entry of the first page
 // of a range a client is reading, before the client asks for the next: the
-// next page's since is then the horizon, and the page starts with its
-// snapshot (§8.6), which Log and the fold leave out, so the range reads as
-// one chain from where it began (§7.1 Paging).
+// next page's since is then the horizon. That page holds only the entries
+// after it (the snapshot is /rev/{H}, never a log entry), so the range
+// reads as one chain from where it began (§7.1 Paging).
 func TestLogPageFromSnapshot(t *testing.T) {
 	ctx := context.Background()
 	arch, err := archive.NewDir(archive.URL(t.TempDir()))
@@ -288,5 +286,145 @@ func TestLogPageFromSnapshot(t *testing.T) {
 	// The prune really happened: the range from genesis is gone now.
 	if _, err := wc.Log(ctx, "e", "a", revs["a"][5], ""); !client.IsPruned(err) {
 		t.Fatalf("range across the horizon after the prune: %v", err)
+	}
+}
+
+// A pruned e2e resource folds from its horizon's snapshot, which /rev/{H}
+// serves, plus the range after it, which never holds the snapshot (§7.1
+// Paging, §8.6): across pages and on a single page, at the horizon itself,
+// and from a tombstone horizon, whose /rev/{H} is a 410 carrying the last
+// live document.
+func TestE2EFoldFromHorizon(t *testing.T) {
+	for _, size := range []int{2, 100} {
+		t.Run(fmt.Sprintf("page%d", size), func(t *testing.T) { testE2EFoldFromHorizon(t, size) })
+	}
+}
+
+func testE2EFoldFromHorizon(t *testing.T, size int) {
+	ctx := context.Background()
+	arch, err := archive.NewDir(archive.URL(t.TempDir()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var (
+		mu    sync.Mutex
+		paths []string
+		pages = map[string]int{} // log range URL path → pages read
+	)
+	wrap := func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, r)
+			mu.Lock()
+			paths = append(paths, r.URL.RequestURI())
+			if strings.HasSuffix(r.URL.Path, "/log") && rec.Code == 200 {
+				pages[r.URL.Path]++
+				var arr []map[string]any
+				if err := json.Unmarshal(rec.Body.Bytes(), &arr); err == nil {
+					for _, m := range arr {
+						if m["kind"] == "snapshot" || m["snapshot"] != nil {
+							t.Errorf("%s: a snapshot in a log range: %v", r.URL, m)
+						}
+					}
+				}
+			}
+			mu.Unlock()
+			for k, v := range rec.Header() {
+				rw.Header()[k] = v
+			}
+			rw.WriteHeader(rec.Code)
+			rw.Write(rec.Body.Bytes())
+		})
+	}
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), Archiver: arch, LogPageSize: size, Wrap: wrap})
+	writer := clienttest.NewKey("writer")
+	opc := s.Client(t, client.WithBearer(s.OperatorGrant(t, "e")))
+	must(opc.CreateNamespace(ctx, "e", map[string]any{"keys": []any{writer.Entry("*")}, "encryption": map[string]any{"level": "e2e"}}))
+	jwk, priv, _ := seal.GenerateRecipient()
+	wc := s.Client(t, client.WithBearer(writer.Grant(t, s.Now(), "user:writer", []string{"e"}, []string{"read", "create", "append", "delete", "restore", "prune", "config"}, map[string]any{"enc": jwk})))
+	w := wc.E2E(priv)
+	must(w.InitKeyring(ctx, "e"))
+	r := must(w.CreateDocSealed(ctx, "e", "p", map[string]any{"n": 0}))
+	revs := []string{r.ID}
+	for i := 1; i < 7; i++ {
+		r = must(w.AppendSealed(ctx, "e", "p", r.ID, ops(op("replace", "/n", i))))
+		revs = append(revs, r.ID)
+	}
+	s.Clock.Advance(10 * time.Minute)
+	h := revs[2]
+	if pr := must(w.PruneE2E(ctx, "e", "p", h)); pr.Horizon != h {
+		t.Fatalf("horizon %s, want %s", pr.Horizon, h)
+	}
+	// A fresh view (no cached keys or documents) reads it.
+	x := wc.E2E(priv)
+	read := func(id string) (any, []string) {
+		t.Helper()
+		mu.Lock()
+		paths, pages = nil, map[string]int{}
+		mu.Unlock()
+		d := must(x.DocE2E(ctx, "e", "p", id))
+		if len(d.Flagged) != 0 || d.ValidID != id {
+			t.Fatalf("fold at %s: flagged %v, valid %s", id, d.Flagged, d.ValidID)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return d.Value, append([]string(nil), paths...)
+	}
+	has := func(ps []string, p string) bool {
+		for _, x := range ps {
+			if x == p {
+				return true
+			}
+		}
+		return false
+	}
+	revPath := func(id string) string { return "/r/e/p/rev/" + id }
+
+	// After the horizon: /rev/{H} for the snapshot, then the range after H.
+	v, ps := read(revs[6])
+	sameJSON(t, v, map[string]any{"n": 6})
+	if !has(ps, revPath(h)) || !has(ps, revPath(revs[6])+"/log?since="+h) {
+		t.Fatalf("fold at the head read %v", ps)
+	}
+	mu.Lock()
+	n := pages[revPath(revs[6])+"/log"]
+	mu.Unlock()
+	if want := (4 + size - 1) / size; n != want {
+		t.Fatalf("4 entries after the horizon in pages of %d took %d pages, want %d", size, n, want)
+	}
+	// Right after it: a one-entry range.
+	v, _ = read(revs[3])
+	sameJSON(t, v, map[string]any{"n": 3})
+	// At the horizon: the snapshot alone, no log.
+	v, ps = read(h)
+	sameJSON(t, v, map[string]any{"n": 2})
+	for _, p := range ps {
+		if strings.Contains(p, "/log") {
+			t.Fatalf("fold at the horizon read a log range: %v", ps)
+		}
+	}
+	// Log and LogPage after the horizon hold only revisions.
+	es := must(wc.Log(ctx, "e", "p", revs[6], h))
+	if len(es) != 4 || es[0].Parent != h || es[0].Kind != "rev" {
+		t.Fatalf("log after the horizon: %v", es)
+	}
+	page, _, err := wc.LogPage(ctx, "e", "p", revs[6], h)
+	if err != nil || len(page) != min(4, size) || page[0].ID != revs[3] {
+		t.Fatalf("first page after the horizon: %v %v", page, err)
+	}
+
+	// A tombstone horizon: a restore with [] brings back the snapshot's
+	// document, the last live one.
+	del := must(wc.Delete(ctx, "e", "p", revs[6]))
+	s.Clock.Advance(10 * time.Minute)
+	must(w.PruneE2E(ctx, "e", "p", del.ID))
+	res := must(w.RestoreSealed(ctx, "e", "p", del.ID, nil))
+	v, ps = read(res.ID)
+	sameJSON(t, v, map[string]any{"n": 6})
+	if !has(ps, revPath(del.ID)) || !has(ps, revPath(res.ID)+"/log?since="+del.ID) {
+		t.Fatalf("fold after a tombstone horizon read %v", ps)
+	}
+	if _, err := x.DocE2E(ctx, "e", "p", del.ID); !client.IsGone(err) {
+		t.Fatalf("the tombstone horizon itself: %v", err)
 	}
 }

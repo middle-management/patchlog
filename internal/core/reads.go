@@ -115,6 +115,11 @@ type Rev struct {
 	// genesis) up to the revision.
 	Fold      bool
 	FoldSince string
+	// Snapshot is set for a revision of an e2e resource that has a stored
+	// prune snapshot (§7.1 Paging, §8.6): JWE is that sealed snapshot,
+	// served as the revision (Status 200), or with the 410 of a tombstone
+	// horizon (Code "tombstone"), whose snapshot is the last live document.
+	Snapshot bool
 }
 
 // ResourceRev serves the document at a revision.
@@ -156,11 +161,27 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			out.Status = 404
 			return nil
 		}
+		e2e := t.e2eContent(n, name)
+		if e2e {
+			// A prune's sealed snapshot is served as /rev/{H}, never as a
+			// log entry (§7.1 Paging, §8.6). It stays stored after an
+			// archive restore clears the horizon, so the answer doesn't
+			// change once given.
+			if jwe := t.e2eSnapshot(row); jwe != "" {
+				out.Snapshot, out.JWE = true, jwe
+				if row.kind == kindTombstone {
+					out.Status, out.Code = 410, "tombstone"
+				} else {
+					out.Status = 200
+				}
+				return nil
+			}
+		}
 		if row.kind == kindTombstone {
 			out.Status, out.Code = 410, "tombstone"
 			return nil
 		}
-		if t.e2eContent(n, name) {
+		if e2e {
 			if !row.patches.Valid {
 				var state int
 				t.must(t.QueryRow(`SELECT state FROM resources WHERE res = ?`, row.res).Scan(&state))
@@ -197,7 +218,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE = nil, job.jwe
 		}
-	} else if err == nil && public && out.Status == 200 {
+	} else if err == nil && public && out.Status == 200 && !out.Snapshot {
 		// A plain document of a public namespace (sealed ones have a job,
 		// e2e ones no document): immutable, and the same for every reader.
 		e.rc.putRev(g, ns, name, id, out.Doc)
@@ -288,20 +309,10 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			return nil
 		}
 		out.Status, out.More = 200, more
+		// An e2e range whose since is a pruning horizon holds only the
+		// entries after it: the horizon's sealed snapshot is served as
+		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
 		out.Last = since
-		if sinceID != nil && id != "" && t.e2eContent(n, name) {
-			// An e2e range starting at a snapshot (a pruning horizon)
-			// begins with it (§8.6): the client folds from there. A page
-			// is a range of its own, so a later page whose since is a
-			// snapshot begins with it too (clients skip it there). It
-			// isn't an entry of the range, so it doesn't count towards
-			// the page size.
-			if srow := t.findInAncestry(to, *sinceID); srow != nil {
-				if jwe := t.e2eSnapshot(srow); jwe != "" {
-					out.Entries = append(out.Entries, map[string]any{"id": since, "kind": "snapshot", "snapshot": jwe})
-				}
-			}
-		}
 		sealed := t.isSealedNS(n)
 		for _, e := range entries {
 			v := e.value()

@@ -393,6 +393,32 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-E2E", "fold")
 		w.Header().Set("Location", loc)
 		w.WriteHeader(302)
+	case rev.Snapshot:
+		// An e2e prune's sealed snapshot, served as /rev/{H} and never as
+		// a log entry (§7.1 Paging, §8.6): 200 as the revision's sealed
+		// document, or for a tombstone horizon the tombstone's 410 with
+		// the snapshot (the last live document) in its body. Either is
+		// immutable: the snapshot stays stored until a later prune or a
+		// purge makes the revision 410 for good.
+		if !s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...) {
+			return
+		}
+		w.Header().Set("ETag", quote(id))
+		w.Header().Set("X-Revision", id)
+		w.Header().Set("X-E2E", "snapshot")
+		if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, quote(id)) {
+			w.WriteHeader(304)
+			return
+		}
+		if rev.Status == 410 {
+			writeJSON(w, 410, map[string]any{"code": "gone", "snapshot": rev.JWE})
+			return
+		}
+		w.Header().Set("Content-Type", seal.ContentType)
+		w.WriteHeader(200)
+		if r.Method != http.MethodHead {
+			w.Write([]byte(rev.JWE))
+		}
 	case rev.Status == 200:
 		if !s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...) {
 			return

@@ -273,6 +273,11 @@ func TestBlobE2EDeclaredOrderAndPrune(t *testing.T) {
 		t.Fatal(err)
 	}
 	expect(t, e.prune("e", "a", map[string]any{"horizon": tomb, "snapshot": snap}, "admin"), 200)
+	// The tombstone answers its 410 with the snapshot, the last live
+	// document, served as /rev/{H} (§7.1 Paging).
+	if r := e.get("/r/e/a/rev/" + tomb); r.Code != 410 || r.Str("code") != "gone" || r.Str("snapshot") != snap || r.H.Get("X-E2E") != "snapshot" {
+		t.Fatalf("/rev/{tombstone horizon}: %d %v %s", r.Code, r.H, r.Body)
+	}
 	// The tombstone's last live document still references both.
 	expect(t, e.get(blobPath("e", "a", b1)), 200)
 	expect(t, e.get(blobPath("e", "a", b2)), 200)

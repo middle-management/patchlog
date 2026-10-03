@@ -1203,15 +1203,21 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
 - **No documents on the server.** No head documents, intermediate snapshots or document cache
   for e2e content; the `$schema` index (§6.1 `in_use`, prune protection) sees nothing, and a
   `$schema` into an e2e namespace is `schema_unavailable`.
-- **Reads.** `GET /r/{ns}/{name}` redirects as usual. `GET /r/{ns}/{name}/rev/{id}` answers
-  `302` with `X-E2E: fold`, `ETag`/`X-Revision` and `Location:
+- **Reads.** `GET /r/{ns}/{name}` redirects as usual. `GET /r/{ns}/{name}/rev/{id}` (other
+  than a pruning horizon, below) answers `302` with `X-E2E: fold`, `ETag`/`X-Revision` and `Location:
   /r/{ns}/{name}/rev/{id}/log?since={s}`, where `s` is the latest client-supplied snapshot at or
   before `id` in its ancestry (omitted if none); cached with the long public class (a later
   prune leaves the old target correct; clients restart from the horizon on a `410 pruned`).
   Tombstones and purges answer `410` as usual. The log serves entries as stored (the patch sets
-  are the sealed ones). A range whose `since` has a snapshot starts with
-  `{ "id": s, "kind": "snapshot", "snapshot": "<JWE>" }`, the document at `s` sealed with `pl
-  { ns, name, id: s, kind: "snapshot" }` (for a tombstone horizon: the last live document).
+  are the sealed ones), and never a snapshot: a prune's sealed snapshot, the document at `s`
+  sealed with `pl { ns, name, id: s, kind: "snapshot" }`, is served as `/rev/{s}` (§7.1 Paging,
+  §8.6): `200` with the JWE as `application/jose`, `X-E2E: snapshot`, `ETag`/`X-Revision` and
+  the immutable class (`If-None-Match` answers `304`). For a tombstone horizon the snapshot is
+  the last live document, and `/rev/{s}` keeps the tombstone's `410`, with `X-E2E: snapshot` and
+  `{ "code": "gone", "snapshot": "<JWE>" }`. The snapshot stays served after an archive restore
+  clears the horizon, until a later prune or a purge. Every other revision keeps the fold
+  redirect (what it should serve is §13's open question), so a key holder folding a revision
+  after the horizon reads `/rev/{s}` and then the range after `s`.
 - **The keyring.** The reserved resource `keyring` holds `seal.Keyring` in plaintext (wrapped
   epoch keys and public X25519 JWKs only). It is the only plaintext resource: written by key
   holders with ordinary writes, checked like any document plus `seal.ParseKeyring`, `ns` equal
@@ -1244,7 +1250,9 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   current epoch with the right `pl` and resend identical bytes on retries (`SealPatches` exposes
   them); they validate the resulting document against its `$schema` first unless
   `WithoutValidation()`. `DocE2E`/`LoadE2E` follow the fold redirect, verify the chain, every id
-  and every `kid`/`pl` (the namespace or one of its bases), fold from the snapshot or genesis,
+  and every `kid`/`pl` (the namespace or one of its bases), fold from genesis or from the
+  horizon's snapshot (fetched from `/rev/{since}`; at the horizon itself `/rev/{id}` is the
+  snapshot, so no log is read),
   and validate each document with a `$schema`: a revision that doesn't open, apply or validate
   is **flagged** (`E2EDoc.Flagged`, with its author) and left out, so `Value` is the document of
   the last valid revision (`ValidID`). `PruneE2E` folds and seals the snapshot. `InitKeyring`,
@@ -1612,11 +1620,11 @@ just doesn't apply).
   same size and shape, without `X-Log-Next` (their header names the next `since`), and `/heads`
   pages are as long. Event streams (§7.3) catch up a page per fetch too, before they go live, so
   a stream from far back never builds (or, sealed, seals) the whole history at once. In an e2e
-  namespace, a page whose `since` is a prune snapshot starts with that snapshot, as the first
-  page of a range does (it is the same URL), and the snapshot doesn't count towards the page
-  size, so such a page has up to one element more; a later page's `since` is a snapshot when the
-  resource was pruned at the previous page's end between the two reads, and readers skip it
-  there. Every reader follows pages and treats a page that stops short of the range's id without
+  namespace, a range or page whose `since` is a pruning horizon holds only the entries after it:
+  the horizon's sealed snapshot is served as `/rev/{H}`, never as a log entry, so a page whose
+  `since` became the horizon between two reads (pruned at the previous page's end) is like any
+  other, and every e2e fold (the client's `DocE2E`, and so merge and rebase, PruneE2E, derived
+  views; the playground) fetches `/rev/{H}` when it starts at the horizon. Every reader follows pages and treats a page that stops short of the range's id without
   `X-Log-Next` as an error: `client.Log`, `NSLog` (one page each: `LogPage`, `NSLogPage`) and e2e
   folds, and so `follow` (catch-up delivers and checkpoints page by page, §10), the index (`?min`
   checks only the first page), tree and catalog, merge, rebase, release and janitor tooling,

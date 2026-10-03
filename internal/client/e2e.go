@@ -15,8 +15,11 @@ package client
 //   - Reads (DocE2E, LoadE2E) follow the X-E2E: fold redirect of
 //     /r/{ns}/{name}/rev/{id} to the log, open every sealed patch set
 //     (checking kid, pl {ns, name, parent}, the id chain and each id over the
-//     ciphertext), fold from the snapshot the log starts with or from
-//     genesis, and verify every intermediate document that has a $schema.
+//     ciphertext), fold from genesis or, when the redirect's since is a
+//     pruning horizon, from its sealed snapshot, which /rev/{since} serves
+//     (never the log, §7.1 Paging, §8.6), and verify every intermediate
+//     document that has a $schema. /rev/{id} of a horizon answers its
+//     snapshot directly (X-E2E: snapshot).
 //     A revision that doesn't apply or doesn't validate is flagged with its
 //     author and left out: the fold continues from the last valid document.
 //   - PruneE2E folds the horizon's document and supplies it sealed as the
@@ -51,6 +54,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"sync"
 
 	"github.com/middle-management/patchlog/internal/patch"
@@ -507,6 +511,13 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 		return nil, err
 	}
 	switch {
+	case r.status == 200 && r.header.Get("X-E2E") == "snapshot":
+		// A pruning horizon: its sealed snapshot is the document (§8.6).
+		doc, err := x.openSnapshot(ctx, ns, name, id, r, x.inChain(ctx, ns))
+		if err != nil {
+			return nil, err
+		}
+		return &E2EDoc{ID: id, Value: doc, ValidID: id}, nil
 	case r.status == 200:
 		d, err := x.c.Doc(ctx, ns, name, id)
 		if err != nil {
@@ -537,10 +548,9 @@ func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) 
 	return x.fold(ctx, ns, name, id, since, arr)
 }
 
-// foldLog fetches the log a fold reads, the range after since up to id as
-// served (with its snapshot first when since is set), following its pages
-// (§7.1). A later page repeats the snapshot of its since, if it has one; it
-// is left out, so the entries chain as one range for fold.
+// foldLog fetches the log a fold reads, the range after since up to id,
+// following its pages (§7.1). The range never holds since's snapshot: fold
+// fetches that from /rev/{since}.
 func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, error) {
 	if err := checkOptID("since", since); err != nil {
 		return nil, err
@@ -551,9 +561,6 @@ func (x *E2E) foldLog(ctx context.Context, ns, name, id, since string) ([]any, e
 			page, ok := r.value().([]any)
 			if !ok {
 				return "", fmt.Errorf("client: %s: log is not an array", r.path)
-			}
-			if m, _ := arrAt(page, 0).(map[string]any); cur != since && str(m, "kind") == "snapshot" && str(m, "id") == cur {
-				page = page[1:]
 			}
 			arr = append(arr, page...)
 			m, _ := arrAt(page, len(page)-1).(map[string]any)
@@ -823,8 +830,68 @@ func (x *E2E) ValidateIn(ctx context.Context, target string, doc any) (string, e
 	return x.validate(ctx, target, doc)
 }
 
+// snapshot fetches the sealed snapshot of the pruning horizon h of ns/name
+// from /rev/{h}, where it is served instead of being a log entry (§7.1
+// Paging, §8.6), and opens it.
+func (x *E2E) snapshot(ctx context.Context, ns, name, h string, nsOK *chainCheck) (any, error) {
+	r, err := x.c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+h, nil, nil)
+	if err != nil {
+		return nil, err
+	}
+	if (r.status != 200 && r.status != 410) || r.header.Get("X-E2E") != "snapshot" {
+		if r.status >= 400 {
+			return nil, r.apiError()
+		}
+		return nil, fmt.Errorf("client: e2e log of %s/%s: /rev/%s doesn't serve the snapshot the fold starts from (status %d): %w", ns, name, h, r.status, seal.ErrMismatch)
+	}
+	return x.openSnapshot(ctx, ns, name, h, r, nsOK)
+}
+
+// openSnapshot opens the sealed snapshot of h that r, the answer of
+// /rev/{h} with X-E2E: snapshot, serves: its body (200 application/jose),
+// or for a tombstone horizon the "snapshot" member of its 410 body (the
+// last live document). The snapshot is sealed under ns or one of its bases
+// (a branch reads its base's ciphertext, §F.8) and bound to {name, h}.
+func (x *E2E) openSnapshot(ctx context.Context, ns, name, h string, r *response, nsOK *chainCheck) (any, error) {
+	bad := func(format string, args ...any) error {
+		return fmt.Errorf("client: e2e snapshot of %s/%s at %s: %s: %w", ns, name, h, fmt.Sprintf(format, args...), seal.ErrMismatch)
+	}
+	var jwe string
+	if r.status == 410 {
+		jwe = str(r.obj(), "snapshot")
+	} else if isJOSE(r) {
+		jwe = strings.TrimSpace(string(r.body))
+	}
+	if jwe == "" {
+		return nil, bad("no sealed snapshot in the answer")
+	}
+	hd, err := seal.ParseHeader(jwe)
+	if err != nil {
+		return nil, bad("%v", err)
+	}
+	kns, _, err := seal.ParseKid(hd.Kid)
+	if err != nil {
+		return nil, bad("kid: %v", err)
+	}
+	if ok, err := nsOK.ok(kns); err != nil {
+		return nil, err
+	} else if !ok {
+		return nil, bad("sealed under %s", hd.Kid)
+	}
+	key, err := x.keyVia(ctx, hd.Kid, ns)
+	if err != nil {
+		return nil, err
+	}
+	doc, err := seal.OpenSnapshot(jwe, key, hd.Kid, kns, name, h)
+	if err != nil {
+		return nil, fmt.Errorf("client: e2e snapshot of %s/%s at %s: %w", ns, name, h, err)
+	}
+	return doc, nil
+}
+
 // fold verifies and folds a log answer ending at id and starting after
-// since (with its snapshot first when since is set).
+// since. A fold that starts at a pruning horizon (since set) starts from
+// its snapshot, fetched from /rev/{since}.
 func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (*E2EDoc, error) {
 	nsOK := x.inChain(ctx, ns)
 	out := &E2EDoc{ID: id}
@@ -834,37 +901,14 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 	bad := func(format string, args ...any) error {
 		return fmt.Errorf("client: e2e log of %s/%s: %s: %w", ns, name, fmt.Sprintf(format, args...), seal.ErrMismatch)
 	}
-	i := 0
 	if since != "" {
-		m, _ := arrAt(arr, 0).(map[string]any)
-		jwe := str(m, "snapshot")
-		if str(m, "kind") != "snapshot" || str(m, "id") != since || jwe == "" {
-			return nil, bad("the range after %s doesn't start with its snapshot", since)
-		}
-		h, err := seal.ParseHeader(jwe)
-		if err != nil {
-			return nil, bad("snapshot: %v", err)
-		}
-		kns, _, err := seal.ParseKid(h.Kid)
-		if err != nil {
-			return nil, bad("snapshot kid: %v", err)
-		}
-		if ok, err := nsOK.ok(kns); err != nil {
+		var err error
+		if doc, err = x.snapshot(ctx, ns, name, since, nsOK); err != nil {
 			return nil, err
-		} else if !ok {
-			return nil, bad("snapshot sealed under %s", h.Kid)
-		}
-		key, err := x.keyVia(ctx, h.Kid, ns)
-		if err != nil {
-			return nil, err
-		}
-		if doc, err = seal.OpenSnapshot(jwe, key, h.Kid, kns, name, since); err != nil {
-			return nil, fmt.Errorf("client: e2e snapshot of %s/%s at %s: %w", ns, name, since, err)
 		}
 		exists, prev, out.ValidID = true, since, since
-		i = 1
 	}
-	for ; i < len(arr); i++ {
+	for i := 0; i < len(arr); i++ {
 		e, err := parseLogEntry(arr[i])
 		if err != nil {
 			return nil, err

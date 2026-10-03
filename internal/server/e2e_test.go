@@ -78,6 +78,10 @@ func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer st
 	t := f.t
 	t.Helper()
 	r := f.get("/r/"+ns+"/"+name+"/rev/"+id, bearer)
+	if r.Code == 200 && r.H.Get("X-E2E") == "snapshot" {
+		// A pruning horizon serves its sealed snapshot (§7.1, §8.6).
+		return f.snapshotAt(ns, name, id, keys, r)
+	}
 	expect(t, r, 302)
 	if r.H.Get("X-E2E") != "fold" || !strings.HasPrefix(r.H.Get("Cache-Control"), "public") {
 		t.Fatalf("fold headers %v", r.H)
@@ -91,25 +95,23 @@ func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer st
 	r = f.get(loc, bearer)
 	expect(t, r, 200)
 	arr := r.Arr()
+	for next := r.H.Get("X-Log-Next"); next != ""; next = r.H.Get("X-Log-Next") {
+		r = f.get(u.Path+"?since="+next, bearer)
+		expect(t, r, 200)
+		arr = append(arr, r.Arr()...)
+	}
 	var doc any
 	exists := false
 	prev := ""
 	if since != "" {
-		m := arr[0].(map[string]any)
-		if m["kind"] != "snapshot" || m["id"] != since {
-			t.Fatalf("no snapshot first: %v", m)
-		}
-		jwe := m["snapshot"].(string)
-		h, _ := seal.ParseHeader(jwe)
-		d, err := seal.OpenSnapshot(jwe, keys[h.Kid], h.Kid, ns, name, since)
-		if err != nil {
-			t.Fatal(err)
-		}
-		doc, exists, prev = d, true, since
-		arr = arr[1:]
+		// The range holds no snapshot (§7.1 Paging): /rev/{since} serves it.
+		doc, exists, prev = f.snapshotAt(ns, name, since, keys, f.get("/r/"+ns+"/"+name+"/rev/"+since, bearer)), true, since
 	}
 	for _, x := range arr {
 		m := x.(map[string]any)
+		if m["kind"] == "snapshot" {
+			t.Fatalf("a snapshot in a log range: %v", m)
+		}
 		parent, _ := m["parent"].(string)
 		if parent != prev {
 			t.Fatalf("chain: %v", m)
@@ -144,6 +146,38 @@ func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer st
 		t.Fatalf("log ends at %s, not %s", prev, id)
 	}
 	return doc
+}
+
+// snapshotAt opens the prune snapshot that r, the answer of
+// /r/{ns}/{name}/rev/{h}, serves: 200 application/jose, or a tombstone
+// horizon's 410 carrying it, both immutable with X-E2E: snapshot.
+func (f *e2eFixture) snapshotAt(ns, name, h string, keys map[string][]byte, r *resp) any {
+	t := f.t
+	t.Helper()
+	if r.H.Get("X-E2E") != "snapshot" || r.H.Get("ETag") != `"`+h+`"` || !strings.Contains(r.H.Get("Cache-Control"), "immutable") {
+		t.Fatalf("/rev/%s: %d %v", h, r.Code, r.H)
+	}
+	var jwe string
+	switch r.Code {
+	case 200:
+		if r.H.Get("Content-Type") != seal.ContentType {
+			t.Fatalf("snapshot content type %q", r.H.Get("Content-Type"))
+		}
+		jwe = string(r.Body)
+	case 410:
+		jwe = r.Str("snapshot")
+	default:
+		t.Fatalf("/rev/%s: %d", h, r.Code)
+	}
+	hd, err := seal.ParseHeader(jwe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := seal.OpenSnapshot(jwe, keys[hd.Kid], hd.Kid, ns, name, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return d
 }
 
 func mustEqual(t *testing.T, got, want any) {

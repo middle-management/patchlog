@@ -38,9 +38,11 @@ package core
 //   - Reads. GET /r/{ns}/{name}/rev/{id} answers 302 to
 //     /r/{ns}/{name}/rev/{id}/log?since={s} with X-E2E: fold, where s is
 //     the latest client-supplied snapshot at or before id (omitted if none).
-//     The log serves the stored entries (the ciphertext is inside), and a
-//     range whose since has a snapshot starts with
-//     {"id": s, "kind": "snapshot", "snapshot": "<JWE>"}. Clients fold.
+//     The log serves the stored entries (the ciphertext is inside), never
+//     the snapshot: /rev/{s} itself serves it (200 application/jose, or
+//     for a tombstone horizon a 410 whose body carries it, both with
+//     X-E2E: snapshot; §7.1 Paging). Clients fetch it and fold the range
+//     after it. What /rev/{id} serves for other revisions is open (§13).
 //   - Prune (§8.6) needs an archive and the horizon's document as a sealed
 //     snapshot (pl {ns, name, id, kind: "snapshot"}); keep isn't supported.
 //     Retention isn't applied by the server.
@@ -430,6 +432,10 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	res := &PruneResult{Horizon: h.id.String(), Archive: u}
 	_, err = t.Exec(`INSERT INTO e2e_snapshots (seq, res, jwe) VALUES (?,?,?) ON CONFLICT (seq) DO UPDATE SET res = excluded.res, jwe = excluded.jwe`, h.seq, own.id, snapshot)
 	t.must(err)
+	// /rev/{h} now serves the snapshot (§7.1 Paging) instead of the fold
+	// redirect it may have been cached as: purge the resource's tag, so a
+	// fold that starts at h doesn't get the old redirect from a CDN.
+	t.tags = append(t.tags, "r:"+n.name+"/"+name)
 	// Attachments end unless the snapshot or a revision after the horizon
 	// declares them (§7.8, §E.3.1); the archive written above has them.
 	t.pruneBlobsE2E(own.id, h.seq, kept)
