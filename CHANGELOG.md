@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.9.0
 
 Implements spec **v0.39**: gestures for undo and redo.
 
