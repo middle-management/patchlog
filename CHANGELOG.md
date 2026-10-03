@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.38**.
+
+**Changes to check before upgrading:**
+- **`GET /`** answers `{ "spec": "0.38", "auth": "grants" | "disabled", "origin" }`. Merge, release and janitor tools read the mode from it; `client.WithAuthDisabled` is gone and the tools' `-dev` flag is accepted but ignored.
+- **Entries written with authentication disabled record `"grant": null`.** While a deployment runs `disabled`, `merge.authors` and `abandoned` checks match them on their author; under `grants` they count for no one. Entries written in dev mode before this release serve no `grant` and count for no one, so a merge batch or `abandoned` flag written then must be written again.
+- **Namespace-document errors** are `422` `code: "invalid"` with `errors: [{ pointer, message }]` (no `path`).
+- **E3 prune snapshots** are served at `/rev/{H}` (`200 application/jose`, `X-E2E: snapshot`; a tombstone horizon answers `410` with the snapshot in the body) and are never log entries. Readers fold from `/rev/{H}` plus the range after it.
+- **Catalog restore** answers in the spec's order (`404`, `410`, `403`, `409`) and refuses (`403`) a restore that would widen access compared with the item's state at deletion; catalog admins may still restore. Moves of deleted placements are checked like any other move.
+
+**Added:**
+- The addenda's namespace-document members (`catalog`, `catalogs.{catalog}`, `merge`, `merged`, `cleanup`) may carry `x-` members; a write may remove a member only an earlier version defined.
+- Remote branches ignore members of the base's documents they don't define, whatever the base's spec version.
+- Catalog visibility evaluates a role's rules as a read would (the spec's `translator` example now sees its items), counts roles only through subjects the catalog's key may assert, and is pinned to the listing's checkpoint. Grants are issued through those subjects only.
+- A reader with namespace-wide read on the namespaces a manifest, `problems` or `orphans` answer covers gets it, without needing every trusted namespace.
+- Schema namespaces mirrored for a remote branch record the creating operator's grant.
+
 ## v0.7.0
 
 Implements spec **v0.36** and **v0.37**.

@@ -1205,12 +1205,8 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 // resolves here (§G.3). A namespace that doesn't exist is created with the
 // branch's read mode, keys and roles. A path whose chain neither contains
 // the base's nor is a prefix of it is 409 name_conflict. The entries it
-// writes are the server's own mirrors, outside the namespace the request
-// was authorised in: they keep the creator as author but record no grant
-// (§7.4).
+// writes record the creating operator as author and its grant (§7.4).
 func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author int64) *Error {
-	t.serverWrites++
-	defer func() { t.serverWrites-- }()
 	type change struct {
 		name string
 		kind string

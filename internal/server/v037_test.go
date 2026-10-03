@@ -273,8 +273,8 @@ func tamperPaths(t *testing.T, a *tenv, rewrite func(path string, body []byte) [
 }
 
 // §7.4: a remote branch's own first config entry is written on the
-// request and records the operator's grant; the schema namespaces it
-// mirrors are the server's own entries and record none. At the source,
+// request and records the operator's grant, as do the schema namespaces it
+// mirrors (v0.38). At the source,
 // registration entries record the registrant's grant.
 func TestV037RemoteGrants(t *testing.T) {
 	var bPriv ed25519.PrivateKey
@@ -291,7 +291,7 @@ func TestV037RemoteGrants(t *testing.T) {
 		t.Fatalf("mirrored schemas log %v", sl)
 	}
 	for _, x := range sl {
-		if entryRef(t, x) != "" || x.(map[string]any)["author"] != "op:root" {
+		if !strings.HasPrefix(entryRef(t, x), "op:root operator 1") || x.(map[string]any)["author"] != "op:root" {
 			t.Fatalf("mirrored schema entry %v", x)
 		}
 	}
