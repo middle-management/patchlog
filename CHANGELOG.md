@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.39**: gestures for undo and redo.
+
+**Added:**
+- **Gestures (§7.2).** Writes may carry `Gesture` and `Undoes` headers (26 base32 characters, `400` otherwise), stored with each revision or tombstone as metadata outside its id; retries answer with what was first recorded. Batch steps may be `{ "patches" | "delete": true, "gesture"?, "undoes"? }`, with item and batch defaults. Resource and namespace logs serve them (`gestures` per step for batches), pruning keeps them, and CORS allows and exposes both headers.
+- `GET /ns/{ns}/gestures/{gesture}` lists a gesture's revisions and undos, paged, for readers of the whole namespace; not offered (`404`) in sealed and e2e namespaces.
+- Merges carry each replayed revision's gesture (squashing drops them); bundles with `"authors": true` carry them too.
+- **Undo and redo (§11.2)** in the Go client: `PlanUndo`, `Undo`, `Redo` and `UndoStack`. The inverse of a gesture's own entries, widened to whole arrays, is checked against the later log for overlapping writes (`ConflictError`) and written as one batch guarded by `ifMatch` with a fresh gesture and `Undoes`; pruned history, missing blobs and schema migrations are reported as `ImpossibleError`. Works for plaintext, sealed and (with `UndoE2E`) e2e namespaces, using the endpoint or a log scan.
+- The playground sends a gesture per save, shows gestures in history and the namespace log, and has undo/redo for the current author (plaintext and sealed namespaces).
+
+**Changes to check before upgrading:**
+- `client.Delete` takes write options (`…, head string, opts ...WriteOption`) and returns a `*WriteResult`.
+
 ## v0.8.0
 
 Implements spec **v0.38**.
