@@ -452,6 +452,12 @@ func TestSealedKeys(t *testing.T) {
 	if got := epochsOf(keys); got != "s#1,s#2,s#3" {
 		t.Fatalf("epochs before exp: %s", got)
 	}
+	atExp := e.grant(k, "user:r", []string{"s"}, []string{"read"}, map[string]any{"exp": t0.Add(5 * time.Hour).Format(time.RFC3339)})
+	keys, _ = e.keysOf("s", nil, atExp)
+	if got := epochsOf(keys); got != "s#1,s#2,s#3,s#4" {
+		// An epoch that starts exactly at exp is included (§E.2.3).
+		t.Fatalf("epochs to exp: %s", got)
+	}
 	later := e.grant(k, "user:r", []string{"s"}, []string{"read"}, map[string]any{"exp": t0.Add(6 * time.Hour).Format(time.RFC3339)})
 	keys, _ = e.keysOf("s", nil, later)
 	if got := epochsOf(keys); got != "s#1,s#2,s#3,s#4" {

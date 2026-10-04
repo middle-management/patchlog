@@ -440,8 +440,8 @@ type KeysRequest struct {
 // readScope "resource") gets K_r for each requested resource it may read;
 // any other gets K_e. Epochs run from the one in force at the root block's
 // nbf (without nbf: the first, capped to the last historyEpochs) to the
-// current one, and never include an epoch that started at or after the
-// grant's effective exp. Keys are HPKE-wrapped to the root block's enc if
+// current one, and never include an epoch that started after the grant's
+// effective exp (§E.2.3). Keys are HPKE-wrapped to the root block's enc if
 // it has one, and raw base64url otherwise.
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) ([]map[string]any, error) {
 	var out []map[string]any
@@ -622,7 +622,9 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 	}
 	var out []int
 	for _, x := range all {
-		if x.e < first || (exp != nil && !x.created.Before(*exp)) {
+		// §E.2.3: a grant never receives epochs that started after its
+		// exp. One that starts exactly at exp is included.
+		if x.e < first || (exp != nil && x.created.After(*exp)) {
 			continue
 		}
 		out = append(out, x.e)
