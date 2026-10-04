@@ -2,6 +2,7 @@ package core
 
 import (
 	"fmt"
+	"net"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -225,6 +226,19 @@ type BaseRef struct {
 // Remote reports whether the base is in another deployment.
 func (b *BaseRef) Remote() bool { return b != nil && b.Origin != "" }
 
+// isLoopbackHost reports whether host is a loopback host: "localhost", an
+// address in 127.0.0.0/8, or "::1" (§G.3).
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		// 127.0.0.0/8 for IPv4, exactly ::1 for IPv6.
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // ValidRemoteOrigin reports whether s is an origin another deployment may
 // have, in the RFC 6454 ASCII serialisation of §C.3 (scheme://host[:port],
 // lowercase, default port omitted). It must be https, except that plain
@@ -241,7 +255,9 @@ func ValidRemoteOrigin(s string) bool {
 			return false
 		}
 	case "http":
-		if h := u.Hostname(); h != "localhost" && h != "127.0.0.1" && h != "::1" || u.Port() == "80" {
+		// http is for loopback hosts: localhost, the whole 127.0.0.0/8
+		// range, or [::1] (§G.3).
+		if !isLoopbackHost(u.Hostname()) || u.Port() == "80" {
 			return false
 		}
 	default:
