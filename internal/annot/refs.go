@@ -255,6 +255,15 @@ func (w *refWalker) walk(l loc, inst any, key []tok, depth int, refs map[string]
 			}
 		}
 	}
+	if _, ok := inst.(string); ok {
+		if _, ok := obj["contentSchema"]; ok {
+			// contentSchema applies to the string's content; the walk
+			// over-approximates and judges the string itself (§6.5).
+			if err := same(l.child("contentSchema")); err != nil {
+				return err
+			}
+		}
+	}
 
 	down := func(cl loc, v any, ck []tok) error { return w.walk(cl, v, ck, 0, nil) }
 	switch v := inst.(type) {
@@ -275,6 +284,13 @@ func (w *refWalker) walk(l loc, inst any, key []tok, depth int, refs map[string]
 		_, hasUneval := obj["unevaluatedProperties"]
 		for _, name := range sortedKeys(v) {
 			ck := appendKey(key, tok{key: name})
+			if _, ok := obj["propertyNames"]; ok {
+				// propertyNames applies a subschema to the member names,
+				// which are strings of the document (§6.5).
+				if err := down(l.child("propertyNames"), name, ck); err != nil {
+					return err
+				}
+			}
 			matched := false
 			if _, ok := props[name]; ok {
 				matched = true

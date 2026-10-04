@@ -122,6 +122,21 @@ func TestFindRefsWith(t *testing.T) {
 			doc:    `{"list":[1,"/r/a/b"]}`,
 			want:   []string{`/list/1 a/b rev="" entry="" key="" pinned=false`},
 		},
+		{
+			// §6.5: propertyNames applies its subschema to the member
+			// names, which are strings of the document. A name counts only
+			// when it also has the reference form.
+			name:   "propertyNames",
+			schema: `{"type":"object","propertyNames":{"x-ref":{}},"minProperties":0}`,
+			doc:    `{"/r/a/b":"x","t1":3}`,
+			want:   []string{`/~1r~1a~1b a/b rev="" entry="" key="" pinned=false`},
+		},
+		{
+			name:   "contentSchema judges the string",
+			schema: `{"properties":{"media":{"type":"string","contentSchema":{"x-ref":{"pinned":true}}}}}`,
+			doc:    `{"media":"/r/a/b"}`,
+			want:   []string{`/media a/b rev="" entry="" key="" pinned=true`},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
