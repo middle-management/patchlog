@@ -395,6 +395,10 @@ type Error struct {
 	Status int
 	Body   map[string]any
 	Header http.Header
+	// Public, when set, carries a namespace's cache visibility with a
+	// not_found: unknown ids are answered with §9's short class, which the
+	// server derives from it. Write responses leave it unset (no-store).
+	Public *bool
 }
 
 func (e *Error) Error() string {

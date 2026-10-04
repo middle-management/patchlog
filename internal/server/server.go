@@ -195,6 +195,22 @@ func writeErr(w http.ResponseWriter, err error) {
 	writeJSON(w, 500, map[string]any{"code": "internal", "message": "internal error"})
 }
 
+// writeErrShort answers an error that carries its own short class (§9):
+// an unknown id of a known namespace, cacheable for five seconds, whose
+// visibility the core attached. It returns false if the error has none,
+// leaving writeErr to answer it.
+func (s *Server) writeErrShort(w http.ResponseWriter, r *http.Request, err error) bool {
+	var ae *core.Error
+	if !errors.As(err, &ae) || ae.Public == nil {
+		return false
+	}
+	if !s.cache(w, r, ccShort, *ae.Public) {
+		return true
+	}
+	writeJSON(w, ae.Status, ae.Body)
+	return true
+}
+
 func badInput(msg string) error {
 	return &core.Error{Status: 400, Body: map[string]any{"code": "bad_input", "message": msg}}
 }
@@ -876,6 +892,9 @@ func (s *Server) nsRev(w http.ResponseWriter, r *http.Request) {
 	}
 	info, err := s.e.NamespaceRev(r.Context(), ns, id, creds(r))
 	if err != nil {
+		if s.writeErrShort(w, r, err) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -947,6 +966,9 @@ func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 	}
 	page, err := s.e.NamespaceHeads(r.Context(), ns, id, r.URL.Query().Get("after"), creds(r))
 	if err != nil {
+		if s.writeErrShort(w, r, err) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -1433,6 +1455,15 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 			code := 404
 			if h.State == core.Purged {
 				code = 410
+			}
+			if code == 404 {
+				// Unknown resource: §9's short class, as resourceHead does.
+				if !s.cache(w, r, ccShort, h.Public) {
+					return
+				}
+			} else if !s.cache(w, r, ccLong, h.Public) {
+				// A purged resource is 410, "long" (§9).
+				return
 			}
 			writeJSON(w, code, map[string]any{"code": map[int]string{404: "not_found", 410: "gone"}[code]})
 			return

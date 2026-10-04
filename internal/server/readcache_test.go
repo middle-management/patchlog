@@ -137,3 +137,39 @@ func TestReadCacheConcurrentHeads(t *testing.T) {
 		t.Fatalf("after the last write: head %s, want %s", h, last)
 	}
 }
+
+// §9: a non-live log range's unknown resource 404 is "short", its purged
+// 410 "long"; an unknown id of GET /ns/{ns}/rev/{id} and /heads is "short"
+// for the namespace's visibility, public or at the edge.
+func TestReviewLogCacheClasses(t *testing.T) {
+	e := newEnv(t)
+	e.mkNS("pub", map[string]any{"read": "public"})
+	e.mkNS("priv", map[string]any{})
+	e.create("pub", "a", map[string]any{"v": 1.0}, "alice")
+
+	r := e.get("/r/pub/nope/log")
+	expectCode(t, r, 404, "not_found")
+	if cc := r.H.Get("Cache-Control"); cc != "public, max-age=5" {
+		t.Fatalf("unknown resource's log: %q", cc)
+	}
+	expect(t, e.purge("pub", "a", e.head("pub", "a"), "admin"), 204)
+	r = e.get("/r/pub/a/log")
+	expectCode(t, r, 410, "gone")
+	if cc := r.H.Get("Cache-Control"); cc != "public, max-age=86400, s-maxage=31536000" {
+		t.Fatalf("purged resource's log: %q", cc)
+	}
+
+	for _, ns := range []string{"pub", "priv"} {
+		want := "public, max-age=5"
+		if ns == "priv" {
+			want = "private, max-age=5"
+		}
+		for _, path := range []string{"/ns/" + ns + "/rev/2bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/ns/" + ns + "/rev/2bbbbbbbbbbbbbbbbbbbbbbbbbbbbb/heads"} {
+			r := e.get(path)
+			expectCode(t, r, 404, "not_found")
+			if cc := r.H.Get("Cache-Control"); cc != want {
+				t.Fatalf("%s: %q, want %q", path, cc, want)
+			}
+		}
+	}
+}

@@ -18,6 +18,15 @@ type headItem struct {
 	row   *revRow
 }
 
+// nfNS is an unknown id of an existing namespace: 404 not_found, which §9
+// answers with the short class rather than no-store. Public is the
+// namespace's visibility, for the server's cache class.
+func nfNS(public bool) *Error {
+	e := notFound()
+	e.Public = &public
+	return e
+}
+
 // listHeads lists every resource of n as of asOf (nil = now), including
 // read-through ones, sorted by name in ascending byte order (§7.4), by Go's
 // string order and never by the database's collation, which on Postgres may
@@ -386,11 +395,11 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		}
 		id, perr := ids.Parse(nsID)
 		if perr != nil {
-			return notFound()
+			return nfNS(t.cachePublic(n))
 		}
 		seq, ok := t.nsLogSeq(n.id, id)
 		if !ok {
-			return notFound()
+			return nfNS(t.cachePublic(n))
 		}
 		var cseq int64
 		var doc string
@@ -590,7 +599,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		id, perr := ids.Parse(nsID)
 		seq, ok := t.nsLogSeq(n.id, id)
 		if perr != nil || !ok {
-			return notFound()
+			return nfNS(t.cachePublic(n))
 		}
 		out = &HeadsPage{Items: []map[string]any{}, Public: t.cachePublic(n)}
 		limit := e.opt.Maximums.LogPageSize
