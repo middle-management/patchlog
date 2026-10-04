@@ -11,8 +11,10 @@ package core
 // serve "grant": null instead (ns_log.no_auth, tx.noAuth), which merge
 // tools and the janitor match on the author alone while GET / says
 // "auth": "disabled". Entries the server writes itself (propagated purges,
-// mirrored schemas, purges applied from a remote base, retention's prunes,
-// rotations) serve no grant at all. Neither do entries of databases from
+// purges applied from a remote base, retention's prunes, rotations) serve
+// no grant at all. Mirrored schema namespaces are not among them: the
+// creating operator's entries are, including theirs (v0.38, remote_branch).
+// Neither do entries of databases from
 // before grant references that the migration couldn't give one
 // (backfillNSGrants, db.go), nor those a development server wrote before
 // v0.38, which stored nothing to tell them from the server's own.
