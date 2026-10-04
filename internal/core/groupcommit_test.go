@@ -1108,7 +1108,7 @@ func TestPGGroupCommitBaseConfigRace(t *testing.T) {
 	cfg := mkNS(t, e, "n", map[string]any{"read": "public"})
 	r := who
 	r.NS = "n"
-	if _, err := e.CreateBranch(context.Background(), r, BranchRequest{Name: "b"}); err != nil {
+	if _, err := e.CreateBranch(context.Background(), r, BranchRequest{Name: "b", IfNoneMatch: true}); err != nil {
 		t.Fatal(err)
 	}
 	sizes := groupSizes(e)

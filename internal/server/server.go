@@ -998,10 +998,7 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if p.ifMatch == "" && !p.ifNoneMatch {
-		writeErr(w, &core.Error{Status: 428, Body: map[string]any{"code": "precondition_required"}})
-		return
-	}
+	// No server-side 428: the core answers it after authorisation (§6.2).
 	res, err := s.e.WriteConfig(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)},
 		core.ConfigChange{IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Patches: body})
 	if err != nil {
@@ -1046,10 +1043,6 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		s.registerRemote(w, r, ns, p, m)
 		return
 	}
-	if !p.ifNoneMatch {
-		writeErr(w, &core.Error{Status: 428, Body: map[string]any{"code": "precondition_required"}})
-		return
-	}
 	for k := range m {
 		if k != "name" && k != "at" && k != "patches" {
 			writeErr(w, badInput("unknown member "+k))
@@ -1059,7 +1052,7 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 	name, _ := m["name"].(string)
 	at, _ := m["at"].(string)
 	res, err := s.e.CreateBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
-		core.BranchRequest{Name: name, At: at, Patches: m["patches"], IfNoneMatch: true})
+		core.BranchRequest{Name: name, At: at, Patches: m["patches"], IfNoneMatch: p.ifNoneMatch})
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1086,10 +1079,7 @@ func (s *Server) registerRemote(w http.ResponseWriter, r *http.Request, ns strin
 		writeErr(w, badInput("body must be { remote: { origin, ns }, at }"))
 		return
 	}
-	if !p.ifNoneMatch && p.ifMatch == "" {
-		writeErr(w, &core.Error{Status: 428, Body: map[string]any{"code": "precondition_required"}})
-		return
-	}
+	// The precondition is checked in the core, after authorisation (§G.3).
 	res, err := s.e.RegisterRemoteBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
 		core.RemoteRegistration{Origin: origin, NS: name, At: at, IfNoneMatch: p.ifNoneMatch, IfMatch: p.ifMatch})
 	if err != nil {

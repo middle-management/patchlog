@@ -81,9 +81,6 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	if n == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
 	}
-	if n.purged {
-		return nil, gone()
-	}
 	cfg := t.config(n.configSeq)
 	a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
 	if aerr != nil {
@@ -101,6 +98,10 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	}
 	if err := t.rateLimit(n, cfg, a, nil, 1); err != nil {
 		return nil, err
+	}
+	// 410 after authorisation, like every write (§6.2).
+	if n.purged {
+		return nil, gone()
 	}
 	// A remote branch of a private, sealed or e2e namespace must itself be
 	// private or sealed (§G.5). This side can't enforce it: it is part of

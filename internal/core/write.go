@@ -321,14 +321,13 @@ func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (int, error) {
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
-		if n.purged {
-			return gone()
-		}
 		cur := t.config(n.configSeq)
 		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)
 		if aerr != nil {
 			return aerr
 		}
+		// No state checks here: the gate answers them in order after the
+		// body is parsed (§6.2, §7.5). This only bounds how much is read.
 		items, size := t.batchLimits(cur, a)
 		limit = size + size/4 + 512*items + max(cur.Limits.PatchSetSize, cur.Limits.DocumentSize) + 64<<10
 		return nil
@@ -389,9 +388,6 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	if h := t.e.afterWriteLock; h != nil && t.write && cc == nil {
 		// The whole gate runs in the write lock (writeLocked).
 		h(n.name)
-	}
-	if n.purged {
-		return nil, nil, gone()
 	}
 	cur := t.config(n.configSeq)
 	if err := checkGestures(items); err != nil {
@@ -526,6 +522,12 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 				*t.rateDrawn = true
 			}
 		}
+	}
+
+	// A purged namespace is 410 after authorisation (§6.2 step 2, §7.8's
+	// order), before step 2.
+	if n.purged {
+		return nil, nil, gone()
 	}
 
 	// Step 2: precondition — idempotent retry, settling the verb, frozen,

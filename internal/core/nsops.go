@@ -53,6 +53,11 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 			return nil, err
 		}
 	}
+	// A purged namespace is 410 after authorisation (§6.2 step 2, §7.8's
+	// order), before the retry lookup and the precondition.
+	if n.purged {
+		return nil, gone()
+	}
 	// Step 2: idempotent retry, then the precondition. Config writes are
 	// allowed in frozen namespaces.
 	if !inBatch && p.expected != nil {
@@ -387,9 +392,6 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 			}
 			return apiErr(412, "stale", "config", t.configID(n.configSeq).String())
 		}
-		if n.purged {
-			return gone()
-		}
 		cur := t.config(n.configSeq)
 		a, aerr := t.authenticate(n.name, n, cur, req.Cred, nil)
 		if aerr != nil {
@@ -511,9 +513,6 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if base == nil {
 		return nil, t.absentNS(req.NS, req.Cred)
 	}
-	if base.purged {
-		return nil, gone()
-	}
 	bcfg := t.config(base.configSeq)
 	a, aerr := t.authenticate(base.name, base, bcfg, req.Cred, nil)
 	if aerr != nil {
@@ -531,6 +530,15 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
 		return nil, err
+	}
+	// 410 after authorisation, like every write (§6.2).
+	if base.purged {
+		return nil, gone()
+	}
+	// Step 2: the precondition. A branch requires If-None-Match: * (§7.6);
+	// 428 comes after authorisation (§6.2).
+	if !br.IfNoneMatch {
+		return nil, apiErr(428, "precondition_required")
 	}
 	if br.Patches == nil {
 		br.Patches = []any{}
@@ -672,9 +680,6 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
-		if n.purged {
-			return gone()
-		}
 		cfg := t.config(n.configSeq)
 		a, operator, aerr := t.purger(n, cfg, req, force)
 		if aerr != nil {
@@ -682,6 +687,10 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		}
 		if err := t.authorize(a, "purge", name); err != nil {
 			return err
+		}
+		// 410 after authorisation, like every write (§6.2).
+		if n.purged {
+			return gone()
 		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
@@ -856,9 +865,6 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
-		if n.purged {
-			return gone()
-		}
 		cfg := t.config(n.configSeq)
 		a, operator, aerr := t.purger(n, cfg, req, force)
 		if aerr != nil {
@@ -866,6 +872,10 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		}
 		if err := t.authorize(a, "purge-ns", ""); err != nil {
 			return err
+		}
+		// 410 after authorisation, like every write (§6.2).
+		if n.purged {
+			return gone()
 		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
@@ -972,9 +982,6 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
 		}
-		if n.purged {
-			return gone()
-		}
 		cfg := t.config(n.configSeq)
 		a, aerr := t.authenticate(n.name, n, cfg, req.Cred, nil)
 		if aerr != nil {
@@ -982,6 +989,10 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		}
 		if err := t.authorize(a, "prune", name); err != nil {
 			return err
+		}
+		// 410 after authorisation, like every write (§6.2).
+		if n.purged {
+			return gone()
 		}
 		if n.isBranch() {
 			return invalid("branches don't prune (§8.6)")

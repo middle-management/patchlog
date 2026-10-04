@@ -283,16 +283,16 @@ func TestStoredMembersAfterUpgrade(t *testing.T) {
 	// A branch is a new namespace, so it can't hold the base's stored
 	// "title"; its patches can rename it. The defined members it inherits,
 	// such as cleanup, are kept as stored.
-	_, err = e.CreateBranch(ctx, Request{NS: "old", Cred: req.Cred}, BranchRequest{Name: "old-b"})
+	_, err = e.CreateBranch(ctx, Request{NS: "old", Cred: req.Cred}, BranchRequest{Name: "old-b", IfNoneMatch: true})
 	if s, p := status(err); s != 422 || p != "/title" || !strings.Contains(err.(*Error).Body["message"].(string), `"op":"move"`) {
 		t.Fatalf("branch inheriting a stored member: %d %v %v", s, p, err)
 	}
-	_, err = e.CreateBranch(ctx, Request{NS: "old", Cred: req.Cred}, BranchRequest{Name: "old-c",
+	_, err = e.CreateBranch(ctx, Request{NS: "old", Cred: req.Cred}, BranchRequest{Name: "old-c", IfNoneMatch: true,
 		Patches: []any{map[string]any{"op": "replace", "path": "/title", "value": "C"}}})
 	if s, p := status(err); s != 422 || p != "/title" {
 		t.Fatalf("branch changing a stored member: %d %v", s, p)
 	}
-	if _, err := e.CreateBranch(ctx, Request{NS: "old", Cred: req.Cred}, BranchRequest{Name: "old-b",
+	if _, err := e.CreateBranch(ctx, Request{NS: "old", Cred: req.Cred}, BranchRequest{Name: "old-b", IfNoneMatch: true,
 		Patches: []any{map[string]any{"op": "move", "from": "/title", "path": "/x-title"}}}); err != nil {
 		t.Fatalf("branch renaming a stored member: %v", err)
 	}
