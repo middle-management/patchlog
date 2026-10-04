@@ -1,5 +1,42 @@
 # Changelog
 
+## Unreleased
+
+A conformance review against spec v0.39 (docs/SPEC-FEEDBACK.md carries the spec-side
+requests). All changes below fix the implementation to match the spec as written.
+
+**Fixed:**
+- **The gate order of §6.2 now holds on every namespace-level write.** An
+  unauthenticated caller answers `401` for resource writes, batches, `PATCH /ns`,
+  branch creation, remote registration, purge, namespace purge and prune, whatever
+  preconditions it omitted and whatever purged state the namespace is in (they were
+  allowed to elicit `428` or `410` first). A valid grant without the verb now
+  answers `403` before a purged namespace's `410`, which itself comes before the
+  precondition's `428` — the order v0.32 pinned for blob uploads.
+- **A config-stale batch's idempotent retry draws its rate tokens** (§6.6): the
+  whole-batch replay answered `200` without the step-1 draw, so a client could
+  re-send it for free.
+- **§9's cache classes** on the answers the pagination work had missed: a non-live
+  `/log` range's `404` is `short` and its purged `410` is `long`; an unknown id of
+  `GET /ns/{ns}/rev/{id}` and `/heads` is `short` (`public, max-age=5`, or
+  `private, max-age=5` at the edge) instead of `no-store`.
+- **A batch's body-limit step no longer pre-empts the gate:** the purged-namespace
+  `410` it answered before the items were authorised moved to the gate proper, so a
+  batch's `400`/`403`/`410` report follows §6.2's order.
+- A grant with `exp` exactly at an epoch's start is given that epoch's key
+  (`POST /ns/{ns}/keys`, §E.2.3 reads "started after").
+- Loopback origins accept the whole `127.0.0.0/8`, as §G.3 says (was only
+  `localhost`, `127.0.0.1`, `[::1]`).
+- The static `x-ref` walk finds references under `propertyNames` and `contentSchema`
+  (§6.5), so exports and reverse-reference consumers no longer drop them.
+
+**Added:**
+- **A config write may carry `Gesture` and `Undoes`** (§7.2, §7.4): a config entry
+  is a single write, so its headers are validated (`400` otherwise),
+  stored with the entry outside its id, mixed into what its log entry serves, and
+  echoed on the response — a retry answers with what was recorded. This was
+  previously ignored silently.
+
 ## v0.9.0
 
 Implements spec **v0.39**: gestures for undo and redo.
