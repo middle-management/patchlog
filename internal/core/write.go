@@ -61,6 +61,9 @@ type ConfigChange struct {
 	IfMatch     string
 	IfNoneMatch bool
 	Patches     any
+	// Gesture and Undoes are the single config write's gesture ids (§7.2,
+	// §7.4), stored with the config entry, outside its id. "" if absent.
+	Gesture, Undoes string
 }
 
 // Request carries what every write request has in common.
@@ -537,7 +540,6 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 	}
-
 	// A purged namespace is 410 after authorisation (§6.2 step 2, §7.8's
 	// order), before step 2.
 	if n.purged {
@@ -839,6 +841,23 @@ func batchGestures(st []*itemState) map[string]any {
 		return nil
 	}
 	return map[string]any{"gestures": out}
+}
+
+// gestureMeta is a single config write's gesture members (§7.2, §7.4), or
+// nil when it carries neither: the config entry can carry them too.
+func gestureMeta(gesture, undoes string) map[string]any {
+	return stepGestures(Step{Gesture: gesture, Undoes: undoes})
+}
+
+// checkConfigGestures answers 400 for a config write whose Gesture or
+// Undoes header isn't a gesture id (§7.2), like checkGestures for steps.
+func checkConfigGestures(cc *ConfigChange) *Error {
+	for _, g := range [2]string{cc.Gesture, cc.Undoes} {
+		if g != "" && !ValidGesture(g) {
+			return badInput("Gesture and Undoes must be one gesture id: 26 base32 characters")
+		}
+	}
+	return nil
 }
 
 // hasCandidates reports whether an item's first step may be an append or a

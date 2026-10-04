@@ -402,3 +402,55 @@ func TestV039LiveGestures(t *testing.T) {
 		t.Fatalf("batch event %v", ev)
 	}
 }
+
+// Review fix: a config write is a single write (§7.4), so it MAY carry
+// gestures (§7.2): validated, stored with the config entry outside its id,
+// echoed on the response, and a retry answers what was recorded.
+func TestReviewGesturesOnConfigWrite(t *testing.T) {
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	cfg0 := e.configID("m")
+	g, u := reviewGesture(1), reviewGesture(2)
+	change := ops(op("add", "/x-note", "n"))
+	r := e.do(req{method: "PATCH", path: "/ns/m", ifMatch: cfg0, body: change, author: "admin",
+		hdr: map[string]string{"Gesture": g, "Undoes": u}})
+	expect(t, r, 201)
+	if r.H.Get("Gesture") != g || r.H.Get("Undoes") != u {
+		t.Fatalf("echo %q %q", r.H.Get("Gesture"), r.H.Get("Undoes"))
+	}
+	// The entry carries them; the config id does not depend on them.
+	var found bool
+	for _, en := range e.nsLog("m") {
+		if en["kind"] != "config" {
+			continue
+		}
+		if en["target"] == r.H.Get("X-Config-Revision") {
+			found = true
+			if en["gesture"] != g || en["undoes"] != u {
+				t.Fatalf("entry %v", en)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the gesture config entry is not in the log")
+	}
+	// A retry with a different gesture answers with what was recorded.
+	r3 := e.do(req{method: "PATCH", path: "/ns/m", ifMatch: cfg0, body: change, author: "admin",
+		hdr: map[string]string{"Gesture": reviewGesture(4)}})
+	expect(t, r3, 200)
+	if r3.H.Get("Gesture") != g || r3.H.Get("Undoes") != u {
+		t.Fatalf("replay echoes what was recorded: %q %q", r3.H.Get("Gesture"), r3.H.Get("Undoes"))
+	}
+	// A malformed gesture id is 400.
+	expectCode(t, e.do(req{method: "PATCH", path: "/ns/m", ifMatch: r3.H.Get("X-Config-Revision"), body: ops(op("add", "/x-y", 1.0)),
+		author: "admin", hdr: map[string]string{"Gesture": "NOT-A-GESTURE!"}}), 400, "bad_input")
+}
+
+// reviewGesture builds a distinct 26-base32 gesture id.
+func reviewGesture(n int) string {
+	s := []byte("aaaaaaaaaaaaaaaaaaaaaaaaaa")
+	for i := range s {
+		s[i] = byte('a' + (n>>i)&1)
+	}
+	return string(s)
+}

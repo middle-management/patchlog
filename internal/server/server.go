@@ -1020,13 +1020,21 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// A config write is a single write (§7.4), so it MAY carry gestures,
+	// which are stored with the config entry, outside its id (§7.2).
+	gesture, undoes, gerr := gestures(r)
+	if gerr != nil {
+		writeErr(w, gerr)
+		return
+	}
 	// No server-side 428: the core answers it after authorisation (§6.2).
 	res, err := s.e.WriteConfig(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)},
-		core.ConfigChange{IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Patches: body})
+		core.ConfigChange{IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Patches: body, Gesture: gesture, Undoes: undoes})
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
+	setGestures(w, res.Entry)
 	w.Header().Set("X-Config-Revision", res.ConfigID)
 	if res.NSID != "" {
 		w.Header().Set("X-Namespace-Revision", res.NSID)

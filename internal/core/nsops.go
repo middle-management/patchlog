@@ -72,6 +72,22 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 			r := &WriteResult{Status: 200, Replayed: true, ConfigID: p.expected.String()}
 			if nsSeq != 0 {
 				r.NSID = t.nsLogID(nsSeq).String()
+				// The retry carries what was recorded, gestures included
+				// (§7.2); only a config entry has them (§7.4).
+				var gjson sql.NullString
+				if t.QueryRow(`SELECT gestures FROM ns_log WHERE seq = ? AND kind = ?`, nsSeq, nsKindCode("config")).Scan(&gjson) == nil && gjson.Valid {
+					if g, ok := jsonv.Parse([]byte(gjson.String)); ok == nil {
+						if m, ok := g.(map[string]any); ok {
+							r.Entry = &LogEntry{}
+							if s, ok := m["gesture"].(string); ok {
+								r.Entry.Gesture = s
+							}
+							if s, ok := m["undoes"].(string); ok {
+								r.Entry.Undoes = s
+							}
+						}
+					}
+				}
 			}
 			p.replay = r
 			return p, nil
@@ -398,6 +414,9 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 			return aerr
 		}
 		t.reqCreds = req.anyCreds()
+		if err := checkConfigGestures(&cc); err != nil {
+			return err
+		}
 		p, err := t.planConfig(n, cur, a, &cc, false)
 		if err != nil {
 			return err
@@ -408,8 +427,9 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 		}
 		author := t.actorID(a)
 		seq := t.insertConfig(n, p, author)
-		_, nsID := t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, author)
-		res = &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: p.id.String()}
+		meta := gestureMeta(cc.Gesture, cc.Undoes)
+		_, nsID := t.appendNSMeta(n, map[string]any{"kind": "config", "target": p.id.String()}, meta, nil, &seq, seq, author)
+		res = &WriteResult{Status: 201, NSID: nsID.String(), ConfigID: p.id.String(), Entry: &LogEntry{Gesture: cc.Gesture, Undoes: cc.Undoes}}
 		return nil
 	}()
 	return res, err
