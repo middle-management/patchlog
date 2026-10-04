@@ -589,3 +589,28 @@ func TestInvariantConfigurationInForce(t *testing.T) {
 	expect(t, e.patchNS("docs", ops(op("remove", "/rules")), ""), 201)
 	e.appendRev("docs", "a", h, ops(op("add", "/draft", true)))
 }
+
+// §6.6, §7.5: a batch whose config change went stale draws its tokens
+// before the whole-batch replay answers it (§7.2), like every request that
+// passed step 1; a drained bucket is 429, not a free 200.
+func TestReviewRetryAfterStaleConfigDraws(t *testing.T) {
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"limits": map[string]any{
+		"ratePerPrincipal": map[string]any{"rate": 1, "burst": 1}}})
+	cfg := e.configID("m")
+	batch := map[string]any{
+		"config": map[string]any{"ifMatch": cfg, "patches": ops(op("add", "/x-a", 1.0))},
+		"items": []any{
+			map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"b": true})}}}}
+	// The first submit lands the batch.
+	expect(t, e.batchReq("m", batch, "alice"), 201)
+	// Its retry arrives after the config moved: the config precondition is
+	// stale, the whole-batch replay matches, and the answer is 200 — having
+	// consumed the principal's token, which the bucket had refilled.
+	e.clock.Advance(5 * time.Second)
+	e.patchNS("m", ops(op("add", "/x-other", 1.0)), "admin")
+	expect(t, e.batchReq("m", batch, "alice"), 200)
+	// A copy right after it finds the bucket drained: 429. Without the
+	// draw, both retries would be token-free 200s.
+	expectCode(t, e.batchReq("m", batch, "alice"), 429, "rate")
+}

@@ -478,6 +478,20 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			var ae *Error
 			if errors.As(err, &ae) && ae.Status == 412 && cc.IfMatch != "" {
 				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
+					// The request passed step 1, so it draws its tokens,
+					// even though the replay lookup ends it (§6.6, §6.2).
+					if len(items) > 0 {
+						names := make([]string, len(items))
+						for i, it := range items {
+							names[i] = it.Resource
+						}
+						if err := t.rateLimit(n, cur, a, names, len(items)); err != nil {
+							return nil, nil, err
+						}
+						if t.rateDrawn != nil {
+							*t.rateDrawn = true
+						}
+					}
 					exp := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
 					if r := t.replay(n, a, st, &configPlan{expected: &exp}, true); r != nil {
 						// It is that batch, but the lookup doesn't apply
