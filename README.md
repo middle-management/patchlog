@@ -1,6 +1,13 @@
 # patchlog
 
-A Go implementation of the **Patch Log** specification ([docs/SPEC.md](docs/SPEC.md), draft v0.39).
+This is the **reference implementation** of the **Patch Log** specification. The
+canonical text of the specification is maintained outside this repository;
+[docs/SPEC.md](docs/SPEC.md) mirrors it, and deltas the reference takes that the
+text doesn't yet describe are collected for its writer in
+[docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) — when the two disagree, the
+reference and this README are what implementations are measured against, and the
+mirror follows.
+
 Each resource is an append-only log of content-addressed JSON Patch sets. The server
 validates documents that opt in with `$schema`, enforces namespace rules and grants,
 and serves immutable, CDN-cacheable revisions.

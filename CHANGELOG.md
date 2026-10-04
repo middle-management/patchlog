@@ -2,8 +2,12 @@
 
 ## Unreleased
 
-A conformance review against spec v0.39 (docs/SPEC-FEEDBACK.md carries the spec-side
-requests). All changes below fix the implementation to match the spec as written.
+A conformance review against spec v0.39. **This repository is the reference
+implementation; the specification is maintained outside it and `docs/SPEC.md`
+mirrors that text (see the note at the top of the README).**
+[docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) states the reference's positions
+the mirror doesn't yet describe. The changes below fix the implementation to
+match the spec as written.
 
 **Fixed:**
 - **The gate order of §6.2 now holds on every namespace-level write.** An
