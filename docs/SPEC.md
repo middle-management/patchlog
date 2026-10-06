@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.44 · 2026-10-06. See the change log at the end.
+Status: draft v0.45 · 2026-10-06. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -681,7 +681,7 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 ## 7. HTTP API
 
-Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.44", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
+Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.45", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
 **Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Gesture`, `Undoes`, `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
 
@@ -892,10 +892,10 @@ Resource purge is never part of a batch.
 **Success.** `201` with `{ "ns_id": …, "items": [{ "resource": …, "ids": [ … ] }] }` and `X-Namespace-Revision`. One `batch` entry is appended (§3.5). Clients can compute the ids in advance (§3.3).
 
 -
-**Failure.** Nothing is written. The status is that of the earliest failing step of §6.2, and the body is `{ "code": "batch", "items": [{ "index", "status", "code", … }] }` for the items that failed at that step. If any item fails authorisation, only those items are reported.
+**Failure.** Nothing is written. The status is that of the earliest failing step of §6.2, and the body is `{ "code": "batch", "items": [{ "index", "status", "code", … }] }` for the items that failed at that step, such as `"code": "signature"` for each item whose signature failed (§C.3.1). If any item fails authorisation, only those items are reported.
 
 -
-**Dry run.** `?dry-run=1` runs steps 1–6 for every item and writes nothing. A blob that isn't available is reported, and the later steps run as if it were, so a dry run isn't cut short by blobs not yet uploaded. It returns `200` with the report for every item, including the ids a submit would produce. Authorisation still comes first: if any item fails step 1, the dry run answers exactly as a submit would (`401` or `403`, reporting only those items), so it never reveals a precondition before authorisation (§6.2). The result may differ by the time the batch is submitted.
+**Dry run.** `?dry-run=1` runs steps 1–6 for every item and writes nothing. A blob that isn't available is reported, and the later steps run as if it were, so a dry run isn't cut short by blobs not yet uploaded. It returns `200` with the report for every item, including the ids a submit would produce and any `signature` failure. Authorisation still comes first: if any item fails step 1, the dry run answers exactly as a submit would (`401` or `403`, reporting only those items), so it never reveals a precondition before authorisation (§6.2). The result may differ by the time the batch is submitted.
 
 -
 **Idempotent retry.** If one earlier `batch` entry by the same principal already contains exactly the entries this batch would produce, and every item's recorded verb is one of its candidate verbs (§6.2), the response is `200` with that batch, as in §7.2. Items of such a retry whose resources have been purged since are `410`, as for single writes (§6.2), before any other precondition.
@@ -1585,7 +1585,7 @@ A search service for typed documents, built as a namespace consumer (§10). It r
 
   - `sort`: ordering and range filters.
 
-- **References** are indexed without `x-index`: `x-ref` already opts a location in. Walk each document with the schema revision it pins, not the schema's head, as §6.5 describes, and keep every string at an `x-ref` location that has a reference form. Store its target as `{ ns, name }`, with the revision of a pinned reference and the entry of an `#id` one, and the path where it sits.
+- **References** are indexed without `x-index`: `x-ref` already opts a location in. Walk each document with the schema revision it pins, not the schema's head, as §6.5 describes, and keep every string at an `x-ref` location that has a reference form. Store its target as `{ ns, name }`, with the revision of a pinned reference and the entry of an `#id` one, and the path where it sits: the full instance pointer, array indices included (`/related/0`), so references in one array don't collide. `x-index` rows name the field, without indices.
 
   - Untyped documents have no schema to walk, so their references aren't found. Typing a document is what makes its references count.
 
@@ -1632,7 +1632,9 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
 
   - `?ref=/r/{ns2}/{name}%23{entry}`: only those naming that entry, pinned or not. The `#` is percent-encoded in a query.
 
-Each hit then carries `refs: [{ "path", "ref" }]`, the locations and the strings as written. A reference changes only when its referrer is written, so the tags above keep cached results correct.
+  - `?ref=/r/{ns2}/{name}/rev/{id}%23{entry}`: only those naming that entry and pinned to that revision.
+
+Each hit of a `ref` query carries `refs: [{ "path", "ref" }]`, the locations and the strings that matched, as written. Hits of other queries don't. A reference changes only when its referrer is written, so the tags above keep cached results correct.
 
 -
 **Delete guards are advisory.** The index is eventually consistent, so a guard such as "still used by 4 documents" asks with `?min=` (§A.5) and can still race a write that adds a reference. The core enforces references only for schemas (§6.1).
@@ -1657,7 +1659,7 @@ Hits carry the plain document URL (`/r/{ns}/{name}/rev/{id}`). Documents are ser
 
 ## A.6 Operations
 
-- **Rebuild:** delete the index and replay from `""`. A new schema revision needs no rebuild; only documents that switch to it are re-indexed, through their normal head change.
+- **Rebuild:** delete the index and replay from `""`. A consumer that starts deriving something new, such as references in an index built before v0.44, replays from `""` once (§10). A new schema revision needs no rebuild; only documents that switch to it are re-indexed, through their normal head change.
 
 - **Alternative backends:** Meilisearch, Typesense, Tantivy and the like work behind the same checkpoint protocol.
 
@@ -2393,7 +2395,7 @@ A signature is checked along one chain, every link of which is immutable or in a
 
   - In a batch, each step object (§7.5) carries its own `signature`. The `Signature` header covers single writes, and is `400` on a batch request.
 
-- **Requiring signatures.** A namespace document may set `"signatures": "required"`; the default is `"optional"`. Every revision and tombstone written to such a namespace then needs a valid signature by a signer of its grant (`422 signature` otherwise, at the same point of the gate). A batch's items are judged under the configuration its config change produces; if that change fails, the batch fails with it.
+- **Requiring signatures.** A namespace document may set `"signatures": "required"`; the default is `"optional"`. Every revision and tombstone written to such a namespace then needs a valid signature by a signer of its grant (`422 signature` otherwise, at the same point of the gate). A batch's items are judged under the configuration its config change produces. If that change fails, as with a stale `ifMatch`, the batch fails with it and its items' signatures aren't checked: only a replay (§7.5) can still succeed, answered as first recorded.
 
   - It covers resource revisions and tombstones; namespace documents aren't signed. It is judged by the configuration the gate checks the write against: for a batch item, the one its batch's config change produces (§7.5). Revisions written before it was turned on, and those a branch reads through from its base, aren't covered, so a reader relying on it checks the log position, not only the current document.
 
@@ -2409,7 +2411,7 @@ A signature is checked along one chain, every link of which is immutable or in a
 
   - A grant shows the principal's groups and attributes and every narrowing block, so it needs unrestricted `read` on the namespace. In a public namespace that is anyone, so issuers keep the `groups` and `attrs` of grants with `signers` for public namespaces to what may be public. It is immutable.
 
-  - Sealed namespaces seal it like a log entry, with `pl: { "ns", "grant": gid }` (§E.2.2), under the epoch that sealed the first namespace log entry recording it, so it reaches the readers who could read that entry and no others. A grant recorded only by a branch's base is sealed under the branch's current epoch, like content it reads through. End-to-end namespaces serve it in the clear, as the server holds it in the clear and serves their logs so (§E.4), with `Cache-Control: private` instead of the immutable class (§9), since a grant shows more than a log entry does.
+  - Sealed namespaces seal it like a log entry, with `pl: { "ns", "grant": gid }` (§E.2.2), under the epoch that sealed the first namespace log entry recording it, so it reaches the readers who could read that entry and no others. A grant recorded only by a branch's base is sealed under the branch's current epoch, like content it reads through. End-to-end namespaces serve it in the clear, as the server holds it in the clear and serves their logs so (§E.4), with `Cache-Control: private` instead of the immutable class (§9), and `no-store` for shared caches (`CDN-Cache-Control`, `Surrogate-Control`), since a grant shows more than a log entry does. Edges don't serve it, even ones that verify grants.
 
   - Bundles carry the grants their history references (§G.4.1), so they verify offline.
 
@@ -3701,7 +3703,7 @@ Remote read-through runs in the receiving deployment's server. Export and import
 
 ## G.1 Principles
 
-- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.44", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
+- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.45", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
 
 - **Ids travel, trust doesn't.** Content that comes **with its history** can be verified by anyone by recomputing ids (invariant 4), given a trusted starting point: an `ns_id` or revision id obtained from the source itself. Integrity then needs no trusted transport, cache or mirror. Snapshots, headers and listings not covered by ids are only as trustworthy as their channel.
 
@@ -4305,3 +4307,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **v0.43:** small fixes from implementing v0.42. A grant in a sealed namespace is sealed under the epoch of the first entry recording it (§C.3.1); repeated query parameters are `400` (§7); an operator key's `from` binds like its `until` (§C.4); a bundle line whose writing namespace is unknown carries neither `written` nor `grant` (§G.4.1).
 
 - **v0.44:** reverse-reference queries in the indexing service, from a proposal by an editor built on Patch Log. The index collects every `x-ref` reference by §6.5's walk, with no extra opt-in (§A.2), and `?ref=` answers "who uses this?", for any form, one pinned revision or one entry, with the paths where each reference sits (§A.4). Delete guards built on it are advisory. A cross-namespace form is an open question (§A.7).
+
+- **v0.45:** clarifications from implementing v0.42 and v0.44. End-to-end grants are `no-store` for shared caches (§C.3.1); a batch whose config change fails doesn't check its items' signatures; batch errors and dry runs report `signature` per item (§7.5). In the index, `refs` paths keep array indices, a pinned entry is a fourth `ref` form, `refs` appear only in `ref` hits, and adding references to an existing index means one replay (§A).

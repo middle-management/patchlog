@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.45**, which settles the reference's remaining notes from v0.42 and
+v0.44. Nothing changes in behaviour: the text now says what the reference already does.
+`GET /` answers `"spec": "0.45"`.
+
 ## v0.14.0
 
 Implements spec **v0.44**: reverse-reference queries in the indexing service (Addendum A).

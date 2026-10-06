@@ -1,33 +1,22 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.44**. This file
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.45**. This file
 collects what the reference does that the text doesn't yet describe.
 
 ## Open
 
-Still open from v0.42; the reference's choices stand until the text says otherwise.
+Nothing at the moment.
 
-1. **"`private`" for end-to-end grants.** Served `private, max-age=300`, with
-   `CDN-Cache-Control` and `Surrogate-Control: no-store`; not routed through the
-   verifying-edge check.
-2. **A batch whose config change is stale** no longer checks signatures: it can only succeed
-   as a replay (answered as first recorded), and otherwise fails with the change's `412`.
-3. **A dry run** reports `422 signature` per item, like other step-2 errors.
-4. **Per-item `422 signature` in batch errors** isn't mentioned in the text.
+## Settled in v0.45
 
-From implementing v0.44 (§A.2–§A.4):
-
-5. **The `path` column of `refs`.** §A.3's key is `(ns, resource, path)`, but §A.2 strips
-   array indices from paths, which would make every array of references collide. The
-   reference stores the full instance pointer (`/related/0`) in `refs`; `x-index` rows keep
-   stripping indices. *Propose:* say `refs.path` keeps indices.
-6. **A pinned reference to an entry** (`/r/ns/name/rev/id#entry`) isn't one of the three
-   `ref` forms. The reference accepts it and matches both. *Propose:* list it.
-7. **`refs` in hits without `?ref=`** are left out; §A.4 describes them only for `ref`
-   queries.
-8. **Existing index databases** have no references. The reference rebuilds once when it
-   finds a database without the `refs` table. *Propose:* say a consumer that adds a derived
-   table replays from `""` (§10).
+All eight open notes, as the reference does them:
+- end-to-end grants are `no-store` for shared caches, and edges don't serve them;
+- a batch whose config change fails doesn't check its items' signatures;
+- batch errors and dry runs report `signature` per item;
+- index `refs` paths keep array indices;
+- a pinned entry is a fourth `ref` form;
+- `refs` appear only in `ref` hits;
+- adding references to an existing index means one replay.
 
 ## Settled in v0.43
 

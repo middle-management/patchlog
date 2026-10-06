@@ -1894,7 +1894,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   (`since`, `live`, `cursor`, `after`, `dry-run=1`, `force=1`, each on its own routes), and
   answers anything else, a repeated parameter or another flag value with `400 bad_input`,
   `no-store`, before authentication.
-- **`GET /`** answers `{ "spec": "0.44", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.45", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace
