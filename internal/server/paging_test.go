@@ -576,3 +576,37 @@ func anyMaps(xs []any) []map[string]any {
 	}
 	return out
 }
+
+// /heads at an earlier namespace revision skips names that have no head
+// there, however many lie between two that do: a page is filled from
+// chunks of names, not from one (§7.4).
+func TestHeadsSkipsNamesAbsentAtAt(t *testing.T) {
+	e := newEnv(t, withLogPageSize(2))
+	e.mkNS("main", map[string]any{"read": "public"})
+	for _, n := range []string{"a", "m", "z"} {
+		e.create("main", n, map[string]any{})
+	}
+	at := e.nsHead("main")
+	// Created after at: eleven names between a and m, and more after z.
+	for _, n := range []string{"b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "zz", "zzz"} {
+		e.create("main", n, map[string]any{})
+	}
+	var names []string
+	for after, i := "", 0; i < 10; i++ {
+		p := "/ns/main/rev/" + at + "/heads"
+		if after != "" {
+			p += "?after=" + after
+		}
+		r := e.get(p)
+		expect(t, r, 200)
+		for _, x := range r.Obj()["items"].([]any) {
+			names = append(names, x.(map[string]any)["resource"].(string))
+		}
+		if after = r.Str("next"); after == "" {
+			break
+		}
+	}
+	if got := strings.Join(names, ","); got != "a,m,z" {
+		t.Fatalf("heads at at: %s", got)
+	}
+}

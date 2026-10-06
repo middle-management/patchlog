@@ -80,6 +80,8 @@ DO $$ BEGIN
 END $$;
 CREATE INDEX IF NOT EXISTS revisions_by_id ON revisions (id);  -- also finds draft schema revisions in branches (§6.1, D.2)
 CREATE INDEX IF NOT EXISTS revisions_res_seq ON revisions (res, seq);
+-- Resource names in byte order, for paging heads listings (§7.4).
+CREATE INDEX IF NOT EXISTS resources_ns_name_c ON resources (ns, name COLLATE "C");
 
 CREATE TABLE IF NOT EXISTS grants (id bytea PRIMARY KEY, blocks bytea NOT NULL, root_sub text, root_kid text);
 

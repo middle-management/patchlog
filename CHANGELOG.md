@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+**Fixes:**
+- **`GET /ns/{ns}/rev/{at}/heads` pages in time proportional to the page, not the
+  namespace.** Each page used to list every name and resolve every head at `at`, and only
+  then page, so listing a namespace cost O(N²): about 14 s for 20 000 documents on SQLite
+  and 14 minutes for 50 000 on Postgres. A page now takes its names from the `(ns, name)`
+  index after the cursor, in byte order (on Postgres, a new `name COLLATE "C"` index),
+  and resolves only those. Names with no head at `at` are skipped by fetching further
+  chunks. Reported by an implementer.
+
 ## v0.11.0
 
 Implements spec **v0.41**: verifiable author signatures (§C.3.1), adopted from the

@@ -28,6 +28,15 @@ From implementing v0.41 (§C.3.1). Each gives what the reference chose.
 5. **Failures inside a batch** are reported per item in the `batch` error, with
    `items[].code: "signature"`, like other step-1 failures.
 
+**Paging**
+
+- **Unknown query parameters.** An implementer sent `GET …/heads?limit=5000` and got pages
+  of 1,000. That is right, since the page size is a deployment setting (§6.6 table) and
+  `limit` isn't a parameter, but nothing says unknown parameters are ignored. The
+  reference ignores them. *Propose:* say so, or answer `400`, so a client can't mistake
+  its own `limit` for the page size. Pages already carry `next`, so a short page never
+  looks like the end.
+
 **Grants and logs**
 
 6. **Resource logs while authentication is disabled.** Namespace logs serve

@@ -32,31 +32,72 @@ func nfNS(public bool) *Error {
 // string order and never by the database's collation, which on Postgres may
 // order punctuation otherwise.
 func (t *tx) listHeads(n *nsRow, asOf *int64) []headItem {
-	names := map[string]bool{}
-	t.collectNames(n, names)
-	sorted := sortedKeys(names)
 	var out []headItem
-	for _, name := range sorted {
-		v := t.resolve(n, name, asOf)
-		if v.state == NotFound {
-			continue
+	for after := ""; ; {
+		page, next := t.pageHeads(n, asOf, after, 1000)
+		out = append(out, page...)
+		if next == "" {
+			return out
 		}
-		out = append(out, headItem{name: name, state: v.state, row: v.head})
+		after = next
 	}
-	return out
 }
 
-func (t *tx) collectNames(n *nsRow, names map[string]bool) {
-	rows, err := t.Query(`SELECT name FROM resources WHERE ns = ?`, n.id)
-	t.must(err)
-	for rows.Next() {
-		var s string
-		t.must(rows.Scan(&s))
-		names[s] = true
+// namesAfter returns up to k distinct names of n's resources, including
+// those of its bases (read-through), greater than after in ascending byte
+// order. Each level answers its own k smallest from the (ns, name) index,
+// and the union's k smallest are the answer. Postgres compares and orders
+// under the "C" collation, which is byte order, as SQLite's BINARY is.
+func (t *tx) namesAfter(n *nsRow, after string, k int) []string {
+	q := `SELECT name FROM resources WHERE ns = ? AND name > ? ORDER BY name LIMIT ?`
+	if t.e.pg {
+		q = `SELECT name FROM resources WHERE ns = ? AND name COLLATE "C" > ? ORDER BY name COLLATE "C" LIMIT ?`
 	}
-	rows.Close()
-	if n.isBranch() {
-		t.collectNames(t.nsByID(n.base.Int64), names)
+	names := map[string]bool{}
+	for m := n; ; m = t.nsByID(m.base.Int64) {
+		rows, err := t.Query(q, m.id, after, k)
+		t.must(err)
+		for rows.Next() {
+			var s string
+			t.must(rows.Scan(&s))
+			names[s] = true
+		}
+		rows.Close()
+		if !m.isBranch() {
+			break
+		}
+	}
+	sorted := sortedKeys(names)
+	if len(sorted) > k {
+		sorted = sorted[:k]
+	}
+	return sorted
+}
+
+// pageHeads lists at most limit resources of n as of asOf (nil = now)
+// with names after after, in ascending byte order, and the name to resume
+// after when more follow (§7.4). It resolves only the names the page
+// needs, so a page costs its own size, not the namespace's: names are
+// fetched in chunks, skipping those with no head at asOf, until the page
+// is full and one more resource is known to exist.
+func (t *tx) pageHeads(n *nsRow, asOf *int64, after string, limit int) (out []headItem, next string) {
+	chunk := limit + 1
+	for {
+		names := t.namesAfter(n, after, chunk)
+		for _, name := range names {
+			v := t.resolve(n, name, asOf)
+			if v.state == NotFound {
+				continue
+			}
+			if len(out) == limit {
+				return out, out[len(out)-1].name
+			}
+			out = append(out, headItem{name: name, state: v.state, row: v.head})
+		}
+		if len(names) < chunk {
+			return out, ""
+		}
+		after = names[len(names)-1]
 	}
 }
 
@@ -602,15 +643,9 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			return nfNS(t.cachePublic(n))
 		}
 		out = &HeadsPage{Items: []map[string]any{}, Public: t.cachePublic(n)}
-		limit := e.opt.Maximums.LogPageSize
-		for _, h := range t.listHeads(n, &seq) {
-			if h.name <= after { // byte order, as listHeads sorts
-				continue
-			}
-			if len(out.Items) == limit {
-				out.Next = out.Items[len(out.Items)-1]["resource"].(string)
-				break
-			}
+		page, next := t.pageHeads(n, &seq, after, e.opt.Maximums.LogPageSize)
+		out.Next = next
+		for _, h := range page {
 			kind := "head"
 			switch h.state {
 			case Tombstoned:
