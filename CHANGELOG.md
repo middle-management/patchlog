@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+Implements spec **v0.42**, which settles the reference's v0.41 notes on signatures.
+
+**Changes to check before upgrading:**
+- **Unknown query parameters are `400 bad_input`** on every core endpoint, before
+  authentication, as are repeated parameters and flag values other than `1`
+  (`dry-run=true` used to be ignored and the write made).
+- **The gestures listing pages with `?after=`**, as §7.4 says; it took `?since=`. The Go
+  client and the playground follow.
+- **Author signatures are checked at §6.2 step 2.3**, after rate limits, the retry lookup
+  and settling the verb: an idempotent retry is answered as first recorded whatever
+  signature it carries, even after `required` was turned on; `403` and `429` come before
+  `422`; a dry run reports `422 signature` per item; a write without a usable precondition
+  gets `428`/`400`. A batch whose config change is stale fails with that change's `412`.
+- **`GET /ns/{ns}/grants/{gid}`** is offered in sealed namespaces (sealed, `pl: { ns, grant }`,
+  stored once) and end-to-end ones (clear, `Cache-Control: private`), and is `410` once the
+  namespace is purged; `not_offered` is gone. `client.Grant` opens sealed answers.
+- **An operator key past its `until` authorises nothing**; it used to be accepted after it.
+- `GET /` answers `"spec": "0.42"`.
+
+**Bundles and archives:**
+- A grant line's `ns` is the namespace whose entry first recorded the grant; `key` is
+  optional, looked up in the namespace document at that entry, then the operator key history
+  at the first naming revision's `created`, and left out otherwise.
+- History lines for revisions written elsewhere (a branch's read-through, a remote branch's
+  base) carry `written`, used in the signing input, so branch bundles verify.
+- Sealed and end-to-end exports carry grant lines (`ExportOptions.Bearer`/`Identity` for
+  sealed grants); a grant the exporter can't fetch is left off the lines that would name it.
+- Pruning archives (§8.6) carry authors and grant lines; restore skips them.
+
 **Performance:**
 - **Heads pages on Postgres take a few statements, not three per resource.** A page now
   reads its resources, their heads at `at` (one `LATERAL` join on `head_history`) and those

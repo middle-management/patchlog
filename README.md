@@ -1442,8 +1442,12 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
   in a `grant` member. `patchlog bundle verify -signatures` reports each revision as verified,
   attested (the chain completes only through the exporter's `key`), failed, unsigned or
   unverifiable; `-source URL` checks `key` against the source's namespace log and operator
-  key history, turning attested into verified. Sealed and end-to-end namespaces don't offer
-  their grants over the API, so their bundles carry signatures without grant lines.
+  key history, turning attested into verified. A grant line names the namespace whose entry
+  first recorded the grant, and its `key` is left out when the exporter can't find one; a
+  history line for a revision written in another namespace (one a branch reads through, or a
+  remote branch's base) carries `written`, which verifiers put in the signing input. Sealed
+  namespaces' grants are fetched sealed and opened with the epoch key (pass `-bearer`), and
+  end-to-end ones in the clear. Pruning archives (§8.6) carry grant lines too.
   `patchlog import` and the merge tools sign their own steps with `-sign-key kid:seed` (or
   `$PATCHLOG_SIGN_KEY`); original signatures are never re-sent.
 - **Snapshot bundles** go through `{ns}-upstream` namespaces. Pinned references between snapshot
@@ -1652,15 +1656,20 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   "can":["append"],"exp":"…","signers":[{"kid":"ann-1","alg":"Ed25519","pub":"<43 chars>"}]}'
 ```
 
-- The gate verifies a signature whose kid the grant lists (`422 signature`) at the end of §6.2
-  step 1, using the `If-Match` id as the parent (nil for a create). A malformed `Signature`
-  is `400`, and so is the header on a batch: each step object carries its own `signature`.
+- The gate verifies a signature whose kid the grant lists (`422 signature`) at §6.2 step 2.3:
+  after rate limits, the idempotent-retry lookup and settling the verb, so a retry is answered
+  as first recorded and authorisation failures come first. The parent is the one the
+  precondition names (the `If-Match` id, none for a create); a write without a usable
+  precondition gets `428` or `400`. A malformed `Signature` is `400`, and so is the header on
+  a batch: each step object carries its own `signature`.
 - `"signatures": "required"` in the namespace document (a `*` key) makes every revision and
   tombstone need a valid signature by a signer of its grant. Narrowing blocks can't carry
   `signers`, so delegated grants can't write there.
 - Resource logs serve each revision's `grant: { id, sub, kid }` and `signature`, and
   `GET /ns/{ns}/grants/{gid}` serves the stored grant (`{ id, root, stored }`) to readers with
-  unrestricted `read`; sealed and end-to-end namespaces answer `404 not_offered`.
+  unrestricted `read`: sealed in sealed namespaces (`pl: { ns, grant }`, stored once), in the
+  clear with `Cache-Control: private` in end-to-end ones, and `410` once the namespace is
+  purged. An operator key past its `until` authorises nothing.
 - `GET /` gives `jwks_uri`, by default `/.well-known/patchlog-keys`: the operator key history
   as a JWK Set, each key with `"patchlog": { "from", "until"? }`. `serve
   -operator-key-history KID=PUB,FROM[,UNTIL]` records retired keys (published, but they
@@ -1862,7 +1871,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   gesture?, undoes?, author, ns_id }` for every revision and tombstone written with the gesture
   or undoing it, in insertion order (a resource's chain order; across resources, the order of a
   client's successive saves), `no-store`. Pages are as long as log pages; `X-Log-Next` names the
-  next page's `since`, `{resource}/{id}` of the page's last entry (ids repeat across resources),
+  next page's `after`, `{resource}/{id}` of the page's last entry (ids repeat across resources),
   and the last page has none. It needs unrestricted read (`403`; `404` for a grant that can't
   read the namespace as a whole, as for `/heads`), answers `404 not_offered` in sealed and e2e
   namespaces after authorisation, leaves out purged resources, and in a branch lists only the
@@ -1873,7 +1882,11 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `BatchItem`/`BatchRequest` defaults, reads them from `WriteResult`, `LogEntry`, `NSEntry`
   (`Gestures` for batches) and lists with `Gestures`/`GesturesPage`; `client.NewGesture` makes
   an id.
-- **`GET /`** answers `{ "spec": "0.41", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **Query parameters** (§7): every core endpoint accepts only those the spec defines for it
+  (`since`, `live`, `cursor`, `after`, `dry-run=1`, `force=1`, each on its own routes), and
+  answers anything else, a repeated parameter or another flag value with `400 bad_input`,
+  `no-store`, before authentication.
+- **`GET /`** answers `{ "spec": "0.42", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace
