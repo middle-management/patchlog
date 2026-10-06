@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.14.1
 
 Implements spec **v0.45**, which settles the reference's remaining notes from v0.42 and
 v0.44. Nothing changes in behaviour: the text now says what the reference already does.
