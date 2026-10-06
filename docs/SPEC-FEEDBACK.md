@@ -1,31 +1,31 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.42**. This file
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.43**. This file
 collects what the reference does that the text doesn't yet describe.
 
 ## Open
 
-From implementing v0.42. Each gives what the reference chose.
+Still open from v0.42; the reference's choices stand until the text says otherwise.
 
-1. **Which epoch seals a grant** (§E.2.2). The reference seals it under the epoch that
-   sealed the namespace's first log entry recording the grant, and a grant recorded only by
-   a branch's base under the serving namespace's current epoch, like read-through content.
-   Readers pick the key by the JWE's `kid`, so either works for them. *Propose:* say which.
-2. **"`private`" for end-to-end grants.** Served `private, max-age=300`, with
+1. **"`private`" for end-to-end grants.** Served `private, max-age=300`, with
    `CDN-Cache-Control` and `Surrogate-Control: no-store`; not routed through the
    verifying-edge check.
-3. **Repeated query parameters** (`?after=a&after=b`) are `400` too. The text speaks only of
-   unknown parameters and flag values. *Propose:* include repeats.
-4. **A key used before its `from`** isn't refused; only `until` is enforced, as §C.4 states.
-   *Question:* should `from` bind too, or is it informative only?
-5. **A batch whose config change is stale** no longer checks signatures: it can only succeed
+2. **A batch whose config change is stale** no longer checks signatures: it can only succeed
    as a replay (answered as first recorded), and otherwise fails with the change's `412`.
-6. **A dry run** reports `422 signature` per item, like other step-2 errors.
-7. **A history line whose `written` can't be determined** (no log on the chain records it, or
-   a remote chain the exporter can't read) is written without `written` and without `grant`,
-   rather than guessed, so its signature reports unverifiable.
-8. **Conformance fix found by the parameter check:** the reference's gestures listing paged
-   with `?since=`; §7.4 says `?after=`. Fixed in server, client and playground.
+3. **A dry run** reports `422 signature` per item, like other step-2 errors.
+4. **Per-item `422 signature` in batch errors** isn't mentioned in the text.
+
+## Settled in v0.43
+
+- **Which epoch seals a grant:** the epoch of the first entry recording it, or the branch's
+  current epoch for a grant only its base recorded (as the reference did).
+- **Repeated query parameters** are `400` (as the reference did).
+- **`from` binds** like `until`. The reference now refuses grants signed by an operator key
+  before its `from`.
+- **A line whose `written` is unknown** carries neither `written` nor `grant` (as the
+  reference did).
+- The gestures listing's `?after=` (a conformance fix in the reference) needed no change in
+  the text.
 
 ## Settled in v0.42
 

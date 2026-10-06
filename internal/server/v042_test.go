@@ -239,3 +239,18 @@ func TestV042OperatorKeyUntil(t *testing.T) {
 	e.clock.Advance(2 * time.Hour)
 	expect(t, e.do(req{method: "PATCH", path: "/ns/n2", ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: e.operatorGrant("n2")}), 401)
 }
+
+// §C.4 (v0.43): a key authorises only within its period, so one whose from
+// lies ahead is refused until then, as verifiers would refuse it for
+// revisions created before it.
+func TestV043OperatorKeyFrom(t *testing.T) {
+	var opPriv ed25519.PrivateKey
+	from := t0.Add(time.Hour)
+	e := newEnv(t, withAuth(&opPriv), func(o *core.Options) {
+		o.OperatorKeyHistory = []core.OperatorKeyPeriod{{Kid: "operator", Pub: opPriv.Public().(ed25519.PublicKey), From: from}}
+	})
+	e.opPriv = opPriv
+	expect(t, e.do(req{method: "PATCH", path: "/ns/early", ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: e.operatorGrant("early")}), 401)
+	e.clock.Advance(time.Hour)
+	expect(t, e.do(req{method: "PATCH", path: "/ns/ontime", ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: e.operatorGrant("ontime")}), 201)
+}

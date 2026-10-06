@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.42 · 2026-10-06. See the change log at the end.
+Status: draft v0.43 · 2026-10-06. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -681,7 +681,7 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 ## 7. HTTP API
 
-Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.42", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, and flags such as `force` and `dry-run` only the value `1`; anything else is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
+Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.43", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
 **Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Gesture`, `Undoes`, `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
 
@@ -2377,7 +2377,7 @@ A signature is checked along one chain, every link of which is immutable or in a
 
   - A grant shows the principal's groups and attributes and every narrowing block, so it needs unrestricted `read` on the namespace. In a public namespace that is anyone, so issuers keep the `groups` and `attrs` of grants with `signers` for public namespaces to what may be public. It is immutable.
 
-  - Sealed namespaces seal it like a log entry, with `pl: { "ns", "grant": gid }` (§E.2.2). End-to-end namespaces serve it in the clear, as the server holds it in the clear and serves their logs so (§E.4), with `Cache-Control: private` instead of the immutable class (§9), since a grant shows more than a log entry does.
+  - Sealed namespaces seal it like a log entry, with `pl: { "ns", "grant": gid }` (§E.2.2), under the epoch that sealed the first namespace log entry recording it, so it reaches the readers who could read that entry and no others. A grant recorded only by a branch's base is sealed under the branch's current epoch, like content it reads through. End-to-end namespaces serve it in the clear, as the server holds it in the clear and serves their logs so (§E.4), with `Cache-Control: private` instead of the immutable class (§9), since a grant shows more than a log entry does.
 
   - Bundles carry the grants their history references (§G.4.1), so they verify offline.
 
@@ -2427,7 +2427,7 @@ A signature is checked along one chain, every link of which is immutable or in a
 
   - Each key is an OKP Ed25519 JWK with `kid` and `use: "sig"`, plus `"patchlog": { "from", "until"? }`, the RFC 3339 period it was in force. Generic JOSE tools ignore that member. The set is served as `application/jwk-set+json`, publicly cached for minutes, e.g. `public, max-age=300`.
 
-  - The period is the operator's to declare. `from` MUST be no later than the first entry written under a grant the key signed, so a deployment publishing a key it already used gives the time the key was configured, or else the time of the deployment's first entry. A key past its `until` authorises nothing: grants it signed are refused from then on, and verify only for revisions created before it.
+  - The period is the operator's to declare. `from` MUST be no later than the first entry written under a grant the key signed, so a deployment publishing a key it already used gives the time the key was configured, or else the time of the deployment's first entry. A key authorises only within its period: grants it signed are refused before its `from` and after its `until`, and verify only for revisions created within it. The gate and verifiers then agree, and a key published later can't vouch for older history.
 
   - It is a history, not a current set: keys are never removed, and `kid`s never reused. A grant signed by an operator key verifies against the key in force at the revision's `created` time (§C.3.1).
 
@@ -3669,7 +3669,7 @@ Remote read-through runs in the receiving deployment's server. Export and import
 
 ## G.1 Principles
 
-- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.42", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
+- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.43", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
 
 - **Ids travel, trust doesn't.** Content that comes **with its history** can be verified by anyone by recomputing ids (invariant 4), given a trusted starting point: an `ns_id` or revision id obtained from the source itself. Integrity then needs no trusted transport, cache or mirror. Snapshots, headers and listings not covered by ids are only as trustworthy as their channel.
 
@@ -3825,7 +3825,7 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
 
 - **Authors, `via`, grant ids, author signatures, creation times, `gesture` and `undoes`** are included only with `"authors": true`. With them, history lines carry `grant: gid` (the id only, not §7.1's object), and a bundle carries one grant line `{ "ns", "grant": gid, "root", "stored", "key"?: { "kid", "alg", "pub" } }` per grant its lines name, before the first line that does. Its `ns` is the namespace whose entry first recorded the grant, in the form of `written` below. An exporter that can't fetch a grant leaves `grant` off the lines that would name it. A line naming a grant with no earlier grant line, a second grant line for one grant, or a grant line in a bundle without `"authors": true` rejects the bundle.
 
-- **`written`.** A signature binds the namespace it was written in (§C.3), and history lines name the exporting namespace. A line for a revision written elsewhere, such as one a branch reads through from its base, also carries `written`: that namespace's name, or `{ "origin", "ns" }` when it is in another deployment, as a remote branch's base is. Verifiers use it, and its `origin`, in the signing input.
+- **`written`.** A signature binds the namespace it was written in (§C.3), and history lines name the exporting namespace. A line for a revision written elsewhere, such as one a branch reads through from its base, also carries `written`: that namespace's name, or `{ "origin", "ns" }` when it is in another deployment, as a remote branch's base is. Verifiers use it, and its `origin`, in the signing input. An exporter that can't determine it, because no log it can read records the revision, writes the line without `written` and without `grant` rather than guess, so its signature reports as unverifiable.
 
 - **`key`** is the key entry the grant's root block verified against at the source (§C.3.1): a key of the namespace document in force at the first entry that recorded the grant, or else an operator key in force at the `created` of the first revision naming the grant (§C.4). An exporter that can find neither leaves `key` out. `key` is attested by the exporter, not proven: the digest isn't a signature (Trust, below).
 
@@ -4269,3 +4269,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Bundles (§G.4.1):** history lines name their grant; a line for a revision written in another namespace says where (`written`); how an exporter finds `key` is defined; malformed grant lines reject the bundle. Archives carry grants (§8.6).
 
 - **Query parameters (§7):** a core endpoint accepts only those the spec defines, and flags only `1`; others are `400`. The bundle endpoint takes `authors=1`.
+
+- **v0.43:** small fixes from implementing v0.42. A grant in a sealed namespace is sealed under the epoch of the first entry recording it (§C.3.1); repeated query parameters are `400` (§7); an operator key's `from` binds like its `until` (§C.4); a bundle line whose writing namespace is unknown carries neither `written` nor `grant` (§G.4.1).

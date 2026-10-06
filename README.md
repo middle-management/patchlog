@@ -1669,7 +1669,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `GET /ns/{ns}/grants/{gid}` serves the stored grant (`{ id, root, stored }`) to readers with
   unrestricted `read`: sealed in sealed namespaces (`pl: { ns, grant }`, stored once), in the
   clear with `Cache-Control: private` in end-to-end ones, and `410` once the namespace is
-  purged. An operator key past its `until` authorises nothing.
+  purged. An operator key authorises only within its `from`–`until` period.
 - `GET /` gives `jwks_uri`, by default `/.well-known/patchlog-keys`: the operator key history
   as a JWK Set, each key with `"patchlog": { "from", "until"? }`. `serve
   -operator-key-history KID=PUB,FROM[,UNTIL]` records retired keys (published, but they
@@ -1886,7 +1886,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   (`since`, `live`, `cursor`, `after`, `dry-run=1`, `force=1`, each on its own routes), and
   answers anything else, a repeated parameter or another flag value with `400 bad_input`,
   `no-store`, before authentication.
-- **`GET /`** answers `{ "spec": "0.42", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.43", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace

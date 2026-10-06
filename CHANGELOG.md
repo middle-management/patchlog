@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.43**, small fixes from the reference's v0.42 notes.
+
+**Changes to check before upgrading:**
+- **An operator key authorises only within its period:** grants it signed are refused
+  before its `from` as well as after its `until` (§C.4). A key configured with
+  `-operator-key` and no history entry is unaffected.
+- `GET /` answers `"spec": "0.43"`.
+
+The other v0.43 changes state what the reference already did: grants in sealed namespaces
+are sealed under the epoch of the first entry recording them, repeated query parameters are
+`400`, and a bundle line whose writing namespace is unknown carries neither `written` nor
+`grant`.
+
 ## v0.12.0
 
 Implements spec **v0.42**, which settles the reference's v0.41 notes on signatures.

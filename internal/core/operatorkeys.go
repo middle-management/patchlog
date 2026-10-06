@@ -47,22 +47,24 @@ func (t *tx) operatorKeys() []grant.Key {
 	}
 	out := make([]grant.Key, 0, len(keys))
 	for _, k := range keys {
-		if !operatorKeyRetired(t.e.opt.OperatorKeyHistory, k.Kid, t.now) {
+		if operatorKeyInForce(t.e.opt.OperatorKeyHistory, k.Kid, t.now) {
 			out = append(out, k)
 		}
 	}
 	return out
 }
 
-// operatorKeyRetired reports whether the history gives kid an until at or
-// before now.
-func operatorKeyRetired(hist []OperatorKeyPeriod, kid string, now time.Time) bool {
+// operatorKeyInForce reports whether now lies within the period the
+// history gives kid, [from, until): a key authorises only within it (§C.4,
+// v0.43), so the gate and verifiers agree. A key the history doesn't list
+// is in force.
+func operatorKeyInForce(hist []OperatorKeyPeriod, kid string, now time.Time) bool {
 	for _, p := range hist {
 		if p.Kid == kid {
-			return !p.Until.IsZero() && !now.Before(p.Until)
+			return !now.Before(p.From) && (p.Until.IsZero() || now.Before(p.Until))
 		}
 	}
-	return false
+	return true
 }
 
 // DefaultJWKSPath is where the operator key history is served by default
