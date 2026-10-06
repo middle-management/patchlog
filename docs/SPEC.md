@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.43 · 2026-10-06. See the change log at the end.
+Status: draft v0.44 · 2026-10-06. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -572,7 +572,7 @@ Without the `editor` role, a principal may only create, edit, restore or delete 
 
 - **`x-*` keywords.** Schema keywords starting with `x-` are annotations. The core validator ignores them, and they carry meaning only for namespace consumers (e.g. `x-index` in Addendum A). Any other unknown keyword makes a schema invalid.
 
-- **`x-ref`** marks a string that references another resource, so tools can follow it: exporters (§G.4.2), static publishers, and reverse-reference indexes that answer "who uses this?".
+- **`x-ref`** marks a string that references another resource, so tools can follow it: exporters (§G.4.2), static publishers, and reverse-reference indexes that answer "who uses this?" (§A.4).
 ```
 "hero":    { "type": "string", "x-ref": { "pinned": true } },   // "/r/media/photo-12/rev/1q…": exactly that revision
 "related": { "type": "array", "items": { "type": "string", "x-ref": {} } },  // "/r/matches/cup": whatever is the head
@@ -681,7 +681,7 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 ## 7. HTTP API
 
-Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.43", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
+Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.44", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
 **Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Gesture`, `Undoes`, `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
 
@@ -1236,7 +1236,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
   - Going below what `retention` keeps for the resource, or pruning where no archive is configured, needs a grant chained to a `*` key. Applying a retention rule that says `"archive": false`, within what it keeps, needs only `prune`: the `*` key was needed to write that rule.
 
-  - `keep` lists extra revisions whose documents stay available, e.g. targets of pinned `x-ref`s found by a reverse-reference consumer (§6.5). A kept document costs far more than the patch set it replaces, so `keep` is limited (§6.6). Each prune's `keep` replaces the resource's earlier `keep` set. It is `422` in an E3 namespace, where the server can't compute documents. The core doesn't interpret `x-ref`. Pinned references to other pruned revisions get `410`.
+  - `keep` lists extra revisions whose documents stay available, e.g. targets of pinned `x-ref`s found by a reverse-reference index (§6.5, §A.4). A kept document costs far more than the patch set it replaces, so `keep` is limited (§6.6). Each prune's `keep` replaces the resource's earlier `keep` set. It is `422` in an E3 namespace, where the server can't compute documents. The core doesn't interpret `x-ref`. Pinned references to other pruned revisions get `410`.
 
   - A `prune` entry `{ resource, kind: "prune", target: H }` is appended to the namespace log, only if the horizon moved. A prune that changes nothing writes nothing.
 
@@ -1569,7 +1569,7 @@ A search service for typed documents, built as a namespace consumer (§10). It r
 
   - Without `$schema`, remove any rows for the resource.
 
-  - Otherwise fetch the schema (immutable, so cache its field map forever) and index the annotated fields.
+  - Otherwise fetch the schema revision the document pins (immutable, so cache its field map forever), and index the annotated fields and the references (§A.2).
 
 - `tombstone` → remove the resource's rows. `purge` → also purge the service's own cache tags.
 
@@ -1585,6 +1585,12 @@ A search service for typed documents, built as a namespace consumer (§10). It r
 
   - `sort`: ordering and range filters.
 
+- **References** are indexed without `x-index`: `x-ref` already opts a location in. Walk each document with the schema revision it pins, not the schema's head, as §6.5 describes, and keep every string at an `x-ref` location that has a reference form. Store its target as `{ ns, name }`, with the revision of a pinned reference and the entry of an `#id` one, and the path where it sits.
+
+  - Untyped documents have no schema to walk, so their references aren't found. Typing a document is what makes its references count.
+
+  - Don't scan text for paths instead: an embedded copy of another document, or an id mentioned in prose, isn't a reference, and the walk tells them apart.
+
 - The core ignores `x-*` keywords (§6.5).
 
 ## A.3 Storage (example, SQLite)
@@ -1595,8 +1601,11 @@ CREATE TABLE docs  (ns TEXT, resource TEXT, head TEXT, schema TEXT, PRIMARY KEY 
 CREATE VIRTUAL TABLE text USING fts5(ns UNINDEXED, resource UNINDEXED, schema UNINDEXED, path UNINDEXED, body);
 CREATE TABLE facet (ns TEXT, resource TEXT, schema TEXT, path TEXT, value TEXT, PRIMARY KEY (ns, resource, path, value));
 CREATE TABLE sort  (ns TEXT, resource TEXT, schema TEXT, path TEXT, value,      PRIMARY KEY (ns, resource, path));
+CREATE TABLE refs  (ns TEXT, resource TEXT, schema TEXT, path TEXT, ref TEXT,  -- ref as written
+                    target_ns TEXT, target TEXT, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path));
 CREATE INDEX facet_q ON facet (ns, schema, path, value);
 CREATE INDEX sort_q  ON sort  (ns, schema, path, value);
+CREATE INDEX refs_q  ON refs  (target_ns, target, rev, entry);
 ```
 
 Current state only. History search is out of scope; replay the resource log instead.
@@ -1611,13 +1620,34 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
 | `GET /{ns}/at/{ns_id}?…` | `200` with `{ "at": ns_id, "hits": [{ "resource", "id", "url", "score", …facets }] }` | immutable (a result for a given `at` never changes). Tags `idx:{ns}` and `r:{ns}/{name}` for every hit, so a purge removes every cached result that shows the resource |
 | same, an `ns_id` the service no longer keeps results for | `302` to the current checkpoint | head pointer |
 
-- `schema` filters by an exact `$schema` reference, or by prefix to match all revisions of one schema.
+-
+`schema` filters by an exact `$schema` reference, or by prefix to match all revisions of one schema.
 
-- Hits carry the plain document URL (`/r/{ns}/{name}/rev/{id}`). Documents are served by the core's CDN, never by the search service.
+-
+`ref` finds the documents of `{ns}` that reference a resource, for "used by" lists, delete guards and impact checks before a merge. It combines with the other filters, e.g. `?ref=/r/logic/route-3&schema=/r/schemas/layout/`:
 
-- **Private namespaces:** follow the same rules as catalog listings (§B.11.5). Results are keyed by the reader's subject set in the path, and responses never embed per-reader signed URLs.
+  - `?ref=/r/{ns2}/{name}`: references to it in any form, live, pinned or to an entry
 
-- **Sealed namespaces:** results are sealed as in §E.2.6.
+  - `?ref=/r/{ns2}/{name}/rev/{id}`: only those pinned to that revision, which pruning it without `keep` (§8.6), or a purge, would leave dangling
+
+  - `?ref=/r/{ns2}/{name}%23{entry}`: only those naming that entry, pinned or not. The `#` is percent-encoded in a query.
+
+Each hit then carries `refs: [{ "path", "ref" }]`, the locations and the strings as written. A reference changes only when its referrer is written, so the tags above keep cached results correct.
+
+-
+**Delete guards are advisory.** The index is eventually consistent, so a guard such as "still used by 4 documents" asks with `?min=` (§A.5) and can still race a write that adds a reference. The core enforces references only for schemas (§6.1).
+
+-
+**Branches.** Documents in a branch name the base (§F.9), so in a branch's preview index (§F.8) `ref` matches targets as written, and hits are the branch's versions of the referrers.
+
+-
+Hits carry the plain document URL (`/r/{ns}/{name}/rev/{id}`). Documents are served by the core's CDN, never by the search service.
+
+-
+**Private namespaces:** follow the same rules as catalog listings (§B.11.5). Results are keyed by the reader's subject set in the path, and responses never embed per-reader signed URLs.
+
+-
+**Sealed namespaces:** results are sealed as in §E.2.6. In end-to-end namespaces only a service that holds keys can walk documents, for references as for search (§E.3.2).
 
 ## A.5 Consistency
 
@@ -1638,6 +1668,8 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
 - Should untyped documents appear in a plain listing, even though they aren't searchable?
 
 - Should queries on a stale `ns_id` redirect to the current checkpoint (as above) or return `404`?
+
+- Should one request find references across every namespace a service follows, e.g. `GET /refs?to=…` with per-namespace read checks? It would need a combined checkpoint, as §B.5 uses, and a path that can't collide with a namespace name. Until then, ask each namespace.
 
 ---
 
@@ -3669,7 +3701,7 @@ Remote read-through runs in the receiving deployment's server. Export and import
 
 ## G.1 Principles
 
-- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.43", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
+- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.44", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
 
 - **Ids travel, trust doesn't.** Content that comes **with its history** can be verified by anyone by recomputing ids (invariant 4), given a trusted starting point: an `ns_id` or revision id obtained from the source itself. Integrity then needs no trusted transport, cache or mirror. Snapshots, headers and listings not covered by ids are only as trustworthy as their channel.
 
@@ -4271,3 +4303,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Query parameters (§7):** a core endpoint accepts only those the spec defines, and flags only `1`; others are `400`. The bundle endpoint takes `authors=1`.
 
 - **v0.43:** small fixes from implementing v0.42. A grant in a sealed namespace is sealed under the epoch of the first entry recording it (§C.3.1); repeated query parameters are `400` (§7); an operator key's `from` binds like its `until` (§C.4); a bundle line whose writing namespace is unknown carries neither `written` nor `grant` (§G.4.1).
+
+- **v0.44:** reverse-reference queries in the indexing service, from a proposal by an editor built on Patch Log. The index collects every `x-ref` reference by §6.5's walk, with no extra opt-in (§A.2), and `?ref=` answers "who uses this?", for any form, one pinned revision or one entry, with the paths where each reference sits (§A.4). Delete guards built on it are advisory. A cross-namespace form is an open question (§A.7).
