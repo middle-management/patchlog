@@ -328,6 +328,9 @@ CREATE INDEX IF NOT EXISTS revisions_by_undoes ON revisions (undoes) WHERE undoe
 ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS gestures text;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
+-- The namespace entries recording a grant, for GET /ns/{ns}/grants/{gid}
+-- (§C.3.1, grants.go).
+CREATE INDEX IF NOT EXISTS ns_log_by_grant ON ns_log (grant_id, ns, seq) WHERE grant_id IS NOT NULL;
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.

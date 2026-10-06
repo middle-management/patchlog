@@ -66,6 +66,8 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /ns/{ns}/log", s.nsLive)
 	m.HandleFunc("GET /ns/{ns}/events", s.nsEvents)
 	m.HandleFunc("GET /ns/{ns}/gestures/{gesture}", s.nsGestures)
+	m.HandleFunc("GET /ns/{ns}/grants/{gid}", s.nsGrant)
+	m.HandleFunc("GET "+core.DefaultJWKSPath, s.operatorKeys)
 	m.HandleFunc("GET /ns/{ns}/branches", s.nsBranches)
 	m.HandleFunc("POST /ns/{ns}/branches", s.nsCreateBranch)
 	m.HandleFunc("POST /ns/{ns}/batch", s.nsBatch)
@@ -87,10 +89,49 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // root is GET /: the spec version the deployment implements (§7), whether
-// authentication is on ("grants") or "disabled" (§1), and its canonical
-// origin (§G.1).
+// authentication is on ("grants") or "disabled" (§1), its canonical
+// origin (§G.1) and where its operator key history is (§C.4).
 func (s *Server) root(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, map[string]any{"spec": core.SpecVersion, "auth": s.e.AuthMode(), "origin": s.e.Origin()})
+	writeJSON(w, 200, map[string]any{"spec": core.SpecVersion, "auth": s.e.AuthMode(), "origin": s.e.Origin(), "jwks_uri": s.e.JWKSURI()})
+}
+
+// operatorKeys is GET /.well-known/patchlog-keys: the operator key history
+// as a JWK Set (§C.4). It grows when keys are added or retired, so it is
+// cached briefly. A deployment configured with another jwks_uri serves it
+// here too.
+func (s *Server) operatorKeys(w http.ResponseWriter, r *http.Request) {
+	set, err := s.e.JWKS(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "public, max-age=300")
+	w.Header().Set("Content-Type", "application/jwk-set+json")
+	w.WriteHeader(200)
+	w.Write(jsonv.Canonical(jsonv.FromGo(set)))
+}
+
+// nsGrant is GET /ns/{ns}/grants/{gid} (§C.3.1): a grant recorded by an
+// entry of the namespace or of its local bases, in its non-bearer form.
+// Immutable.
+func (s *Server) nsGrant(w http.ResponseWriter, r *http.Request) {
+	ns := r.PathValue("ns")
+	if err := validNames(ns, ""); err != nil {
+		writeErr(w, err)
+		return
+	}
+	g, err := s.e.Grant(r.Context(), ns, r.PathValue("gid"), creds(r))
+	if err != nil {
+		if s.writeErrShort(w, r, err) {
+			return
+		}
+		writeErr(w, err)
+		return
+	}
+	if !s.cache(w, r, ccImmutable, g.Public, "ns:"+ns) {
+		return
+	}
+	writeJSON(w, 200, g)
 }
 
 // --- helpers -----------------------------------------------------------
@@ -653,7 +694,7 @@ func (s *Server) resourceDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	res, err := s.e.WriteResource(r.Context(), core.Request{NS: ns, Cred: creds(r)},
+	res, err := s.e.WriteResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature")},
 		core.Item{Resource: name, IfMatch: p.ifMatch, Steps: []core.Step{{Delete: true, Gesture: g, Undoes: u}}})
 	if err != nil {
 		writeErr(w, err)
@@ -1128,6 +1169,13 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// Each step carries its own signature (§7.5); the header covers
+	// single writes and is 400 on a batch (§C.3.1), a request-shape error
+	// that comes before the gate (§6.2).
+	if _, has := r.Header["Signature"]; has {
+		writeErr(w, badInput("a batch carries signatures in its step objects, not in a Signature header (§C.3.1)"))
+		return
+	}
 	// Batch limits depend on the principal (§6.6): authenticate first, then
 	// stop reading a body larger than that principal's batchSize (§7.5).
 	req := core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}
@@ -1308,6 +1356,14 @@ func parseStep(v any, d gestureDefaults, where string) (core.Step, error) {
 				if err := d.set(k, mv, where); err != nil {
 					return core.Step{}, err
 				}
+			case "signature":
+				// The step's author signature (§7.5, §C.3.1); its form is
+				// checked with the rest of the request's shape (core).
+				sv, ok := mv.(string)
+				if !ok || sv == "" {
+					return core.Step{}, badInput(where + ": signature must be a string, \"<alg>:<kid>:<sig>\"")
+				}
+				step.Signature = sv
 			default:
 				return core.Step{}, badInput(fmt.Sprintf("%s: unknown member %s", where, k))
 			}

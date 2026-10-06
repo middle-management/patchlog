@@ -150,7 +150,11 @@ type Config struct {
 	// may resolve schema paths into this branch's own revisions (§6.1).
 	// Nil when absent: the drafts serve only the branch and its branches.
 	DraftsFor []string
-	level     int
+	// SignaturesRequired is "signatures": "required" (§C.3.1): every
+	// resource revision and tombstone needs a valid author signature by a
+	// signer of its grant. False for "optional", the default.
+	SignaturesRequired bool
+	level              int
 }
 
 // Allowance gives a named principal its own rate and batch limits (§6.6).
@@ -275,7 +279,7 @@ func ValidRemoteOrigin(s string) bool {
 var nsMembers = map[string]bool{
 	"read": true, "keys": true, "roles": true, "revoked": true, "rules": true, "limits": true,
 	"allowances": true, "retention": true, "encryption": true, "maxLag": true, "base": true,
-	"frozen": true, "successor": true, "drafts": true,
+	"frozen": true, "successor": true, "drafts": true, "signatures": true,
 	"catalog": true, "catalogs": true, // Addendum B
 	"merge": true, "merged": true, "cleanup": true, "abandoned": true, // Addendum F
 }
@@ -703,6 +707,14 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				return nil, fmt.Errorf("/base must be { ns, at } or { origin, ns, at }")
 			}
 			c.Base = &BaseRef{NS: ns, At: at}
+		case "signatures":
+			switch v {
+			case "optional":
+			case "required":
+				c.SignaturesRequired = true
+			default:
+				return nil, fmt.Errorf(`/signatures must be "optional" or "required"`)
+			}
 		case "drafts":
 			df, err := parseDrafts(v)
 			if err != nil {

@@ -456,6 +456,10 @@ type Step struct {
 	Delete          bool
 	Patches         any
 	Gesture, Undoes string
+	// Signature is the step's author signature (§7.5, §C.3.1), sent in a
+	// step object; "" for none. A client with a signer (WithSigner) fills
+	// in the steps that have none.
+	Signature string
 }
 
 // WithGesture returns the step with its gesture and undoes set ("" for
@@ -476,7 +480,7 @@ func (s Step) value() (any, error) {
 		}
 		body = p
 	}
-	if s.Gesture == "" && s.Undoes == "" {
+	if s.Gesture == "" && s.Undoes == "" && s.Signature == "" {
 		return body, nil
 	}
 	m := map[string]any{}
@@ -486,6 +490,9 @@ func (s Step) value() (any, error) {
 		m["patches"] = body
 	}
 	putGestures(m, s.Gesture, s.Undoes)
+	if s.Signature != "" {
+		m["signature"] = s.Signature
+	}
 	return m, nil
 }
 
@@ -608,6 +615,11 @@ func (c *Client) Batch(ctx context.Context, ns string, b BatchRequest, dryRun bo
 	if err := checkNS(ns); err != nil {
 		return nil, err
 	}
+	signed, err := c.signBatch(ctx, ns, b.Items)
+	if err != nil {
+		return nil, err
+	}
+	b.Items = signed
 	body, err := b.body()
 	if err != nil {
 		return nil, err

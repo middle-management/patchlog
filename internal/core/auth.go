@@ -618,7 +618,7 @@ func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
 }
 
 // guardedPaths need a grant chained to a * key (§7.4).
-var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption"}
+var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures"}
 
 func touchesGuarded(writes []string) bool {
 	for _, w := range writes {

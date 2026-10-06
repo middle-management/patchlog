@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/url"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -118,6 +119,9 @@ type LogEntry struct {
 	Author     string
 	Created    string
 	Signature  string // author signature (§C.3), if served
+	// Grant is the grant the entry was written under (§7.1, §C.3), if
+	// served: its id and root sub and kid.
+	Grant *NSGrant
 	// Gesture and Undoes are the gesture ids the entry was written with
 	// (§7.1, §7.2), "" if none; not hashed.
 	Gesture, Undoes string
@@ -136,6 +140,9 @@ func parseLogEntry(v any) (LogEntry, error) {
 	}
 	if p, has := m["patches"]; has {
 		e.Patches, e.HasPatches = p, true
+	}
+	if gm, ok := m["grant"].(map[string]any); ok {
+		e.Grant = &NSGrant{ID: str(gm, "id"), Sub: str(gm, "sub"), Kid: str(gm, "kid")}
 	}
 	return e, nil
 }
@@ -299,6 +306,9 @@ func (c *Client) patchResource(ctx context.Context, ns, name string, precond map
 	for _, o := range opts {
 		o(rq)
 	}
+	if err := c.signHeader(ctx, rq, ns, name, strings.Trim(precond["If-Match"], `"`), patches, false); err != nil {
+		return nil, err
+	}
 	r, err := c.do(ctx, "PATCH", "/r/"+ns+"/"+name, nil, rq)
 	if err != nil {
 		return nil, err
@@ -342,7 +352,8 @@ func (c *Client) Restore(ctx context.Context, ns, name, tombstone string, patche
 }
 
 // Delete tombstones a resource whose head is head. The result's ID is the
-// tombstone id. Of opts, WithGesture and WithUndoes apply (§7.2).
+// tombstone id. Of opts, WithGesture, WithUndoes and WithSignature apply
+// (§7.2, §C.3.1); a client with a signer signs the tombstone.
 func (c *Client) Delete(ctx context.Context, ns, name, head string, opts ...WriteOption) (*WriteResult, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
@@ -353,6 +364,9 @@ func (c *Client) Delete(ctx context.Context, ns, name, head string, opts ...Writ
 	rq := &request{header: map[string]string{"If-Match": quote(head)}}
 	for _, o := range opts {
 		o(rq)
+	}
+	if err := c.signHeader(ctx, rq, ns, name, head, nil, true); err != nil {
+		return nil, err
 	}
 	r, err := c.do(ctx, "DELETE", "/r/"+ns+"/"+name, nil, rq)
 	if err != nil {

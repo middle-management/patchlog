@@ -388,13 +388,17 @@ func (t *tx) horizonID(res int64) string {
 
 // LogEntry is a resource log entry (§7.1).
 type LogEntry struct {
-	ID        string `json:"id"`
-	Parent    string `json:"parent,omitempty"`
-	Kind      string `json:"kind"`
-	Patches   any    `json:"patches,omitempty"`
-	Author    string `json:"author"`
-	Created   string `json:"created"`
-	Signature string `json:"signature,omitempty"`
+	ID      string `json:"id"`
+	Parent  string `json:"parent,omitempty"`
+	Kind    string `json:"kind"`
+	Patches any    `json:"patches,omitempty"`
+	Author  string `json:"author"`
+	Created string `json:"created"`
+	// Grant is the grant reference { id, sub, kid } of the grant the entry
+	// was written under (§7.1, §C.3), as namespace entries serve it
+	// (grantref.go); nil if it wasn't written under one.
+	Grant     map[string]any `json:"grant,omitempty"`
+	Signature string         `json:"signature,omitempty"`
 	// Gesture and Undoes are the gesture ids the entry was written with
 	// (§7.1, §7.2), not hashed.
 	Gesture string `json:"gesture,omitempty"`
@@ -410,6 +414,9 @@ func (e LogEntry) value() map[string]any {
 	}
 	if e.Kind == "rev" && e.Patches != nil {
 		m["patches"] = e.Patches
+	}
+	if e.Grant != nil {
+		m["grant"] = e.Grant
 	}
 	if e.Signature != "" {
 		m["signature"] = e.Signature
@@ -435,6 +442,9 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 		if r.patches.Valid { // NULL below a horizon (§8.6)
 			e.Patches = jsonv.MustParse(t.patchesOf(r))
 		}
+	}
+	if r.grantID != nil {
+		e.Grant = t.grantRef(r.grantID)
 	}
 	if r.signature.Valid {
 		e.Signature = r.signature.String

@@ -239,7 +239,7 @@ func TestNSLogGrantMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	// And grants without the plaintext root sub and kid.
-	for _, q := range []string{`ALTER TABLE ns_log ADD COLUMN kid TEXT`, `UPDATE ns_log SET kid = 'issuer'`, `ALTER TABLE ns_log DROP COLUMN grant_id`,
+	for _, q := range []string{`ALTER TABLE ns_log ADD COLUMN kid TEXT`, `UPDATE ns_log SET kid = 'issuer'`, `DROP INDEX IF EXISTS ns_log_by_grant`, `ALTER TABLE ns_log DROP COLUMN grant_id`,
 		`ALTER TABLE grants DROP COLUMN root_sub`, `ALTER TABLE grants DROP COLUMN root_kid`} {
 		if _, err := db.Exec(q); err != nil {
 			t.Fatalf("%s: %v", q, err)

@@ -416,6 +416,9 @@ func migrate(db *sql.DB) error {
 const gestureIndexes = `
 CREATE INDEX IF NOT EXISTS revisions_by_gesture ON revisions (gesture) WHERE gesture IS NOT NULL;
 CREATE INDEX IF NOT EXISTS revisions_by_undoes ON revisions (undoes) WHERE undoes IS NOT NULL;
+-- The namespace entries recording a grant, for GET /ns/{ns}/grants/{gid}
+-- (§C.3.1, grants.go).
+CREATE INDEX IF NOT EXISTS ns_log_by_grant ON ns_log (grant_id, ns, seq) WHERE grant_id IS NOT NULL;
 `
 
 // backfillGrantRoots fills grants.root_sub and root_kid of a database from

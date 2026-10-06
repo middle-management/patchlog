@@ -26,6 +26,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Verbs are the actions a grant may carry (§C.1). "*" is valid only in a
@@ -84,7 +85,10 @@ type Block struct {
 	// (§E.2.3): { "kty": "OKP", "crv": "X25519", "x" }. Nil if absent.
 	// Narrowing blocks cannot carry or change it.
 	Enc *ecdh.PublicKey
-	Raw map[string]any
+	// Signers are the root block's signer keys (§C.3.1), nil if absent.
+	// Narrowing blocks cannot carry them (401).
+	Signers []sig.Signer
+	Raw     map[string]any
 }
 
 // Grant is a decoded chain of blocks.
@@ -112,6 +116,17 @@ func (g *Grant) RevocationIDs() []string {
 // Stored is the non-bearer form (§C.3): the Biscuit without its proof.
 func (g *Grant) Stored() []byte {
 	return (&container{blocks: g.c.blocks}).encode()
+}
+
+// SignedBlocks are the token's protobuf SignedBlock messages in order,
+// authority first: the stored form's blocks, as GET /ns/{ns}/grants/{gid}
+// serves them (§C.3.1).
+func (g *Grant) SignedBlocks() [][]byte {
+	out := make([][]byte, len(g.c.blocks))
+	for i, sb := range g.c.blocks {
+		out[i] = sb.encode()
+	}
+	return out
 }
 
 // Encode returns the bearer token, Biscuit URL-safe base64 without the
@@ -213,6 +228,25 @@ func (g *Grant) Narrow(block map[string]any) (*Grant, error) {
 	if err != nil {
 		return nil, err
 	}
+	return g.appendBlock(raw, blk), nil
+}
+
+// NarrowUnvalidated appends block like Narrow without checking it is a
+// valid narrowing block, so tests can build the grants a verifier must
+// refuse (a narrowing block with signers, §C.3.1). Anyone holding a grant's
+// proof can do this; verification is what refuses it.
+func (g *Grant) NarrowUnvalidated(block map[string]any) (*Grant, error) {
+	if g.proof == nil {
+		return nil, errors.New("grant: cannot narrow a grant without proof")
+	}
+	raw, err := normalizeInput(block)
+	if err != nil {
+		return nil, err
+	}
+	return g.appendBlock(raw, Block{Raw: raw}), nil
+}
+
+func (g *Grant) appendBlock(raw map[string]any, blk Block) *Grant {
 	data, added := encodeBlockData(string(jsonv.Canonical(raw)), g.symbols)
 	prev := g.c.blocks[len(g.c.blocks)-1]
 	sb, next := newBlock(g.proof, data, prev.sig)
@@ -222,7 +256,7 @@ func (g *Grant) Narrow(block map[string]any) (*Grant, error) {
 		proof:   next,
 		c: &container{blocks: append(append([]signedBlock(nil), g.c.blocks...), sb),
 			nextSecret: next.Seed()},
-	}, nil
+	}
 }
 
 // Seal returns the grant as a sealed token (§C.8): the proof becomes a
@@ -335,7 +369,7 @@ func (g *Grant) usesStar() bool {
 	return false
 }
 
-var rootFields = map[string]bool{"kid": true, "sub": true, "groups": true, "roles": true, "attrs": true, "ns": true, "can": true, "nbf": true, "exp": true, "at": true, "rules": true, "enc": true}
+var rootFields = map[string]bool{"kid": true, "sub": true, "groups": true, "roles": true, "attrs": true, "ns": true, "can": true, "nbf": true, "exp": true, "at": true, "rules": true, "enc": true, "signers": true}
 var narrowFields = map[string]bool{"via": true, "ns": true, "can": true, "roles": true, "nbf": true, "exp": true, "rules": true}
 
 func parseBlock(raw map[string]any, root bool) (Block, error) {
@@ -401,6 +435,13 @@ func parseBlock(raw map[string]any, root bool) (Block, error) {
 				return b, errors.New(`enc must be { "kty": "OKP", "crv": "X25519", "x" }`)
 			}
 			b.Enc = pub
+		}
+		if v, ok := raw["signers"]; ok {
+			ss, err := sig.ParseSigners(v)
+			if err != nil {
+				return b, err
+			}
+			b.Signers = ss
 		}
 	} else {
 		if b.Via, err = str("via", false); err != nil {

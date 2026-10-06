@@ -24,6 +24,11 @@ type Step struct {
 	// outside its id (§3.3), and never seen by rules. A batch's item and
 	// batch defaults are resolved into each step before it gets here.
 	Gesture, Undoes string
+	// Signature is the step's author signature, "<alg>:<kid>:<sig>"
+	// (§C.3.1), "" if absent: a batch step object's "signature" (§7.5),
+	// or a single write's Signature header. Stored with the step's
+	// revision or tombstone, outside its id.
+	Signature string
 }
 
 // gestureRe is the form of a gesture id (§7.2): 26 base32 characters,
@@ -396,6 +401,9 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	if err := checkGestures(items); err != nil {
 		return nil, nil, err
 	}
+	if err := checkSignatureShapes(req, items, isBatch); err != nil {
+		return nil, nil, err
+	}
 	if isBatch {
 		seen := map[string]bool{}
 		for i, it := range items {
@@ -480,7 +488,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			// for the batch it would have produced first (§7.5, §7.2).
 			var ae *Error
 			if errors.As(err, &ae) && ae.Status == 412 && cc.IfMatch != "" {
-				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
+				// Signatures are checked against the current configuration
+				// for listed kids only: whether the batch's config change
+				// required them isn't known once its precondition failed.
+				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 && len(t.checkSignatures(n, cur, a, st, false)) == 0 {
 					// The request passed step 1, so it draws its tokens,
 					// even though the replay lookup ends it (§6.6, §6.2).
 					// Its config change costs a token unless a * key
@@ -528,6 +539,11 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// Step 1: authorisation.
 	fs := authorizeItems(a)
 	if len(fs) > 0 {
+		return nil, nil, fail(fs)
+	}
+	// Author signatures, after authorisation and before rate limits, in
+	// the configuration the write is checked against (§6.2, §C.3.1).
+	if fs = t.checkSignatures(n, cfg, a, st, true); len(fs) > 0 {
 		return nil, nil, fail(fs)
 	}
 	// A batch costs a token per item, and one for its config change unless
@@ -785,7 +801,7 @@ func (t *tx) insertPlan(req Request, p *writePlan) *WriteResult {
 	}
 	// After the config change, which may have turned encryption on.
 	grantID := t.storeGrant(a.grant, t.nsLevel(n) >= levelAtRest)
-	inserted := t.insertItems(n, p.st, a, author, grantID, req.Signature)
+	inserted := t.insertItems(n, p.st, a, author, grantID)
 	// The namespace entry last: on Postgres it is appended under the
 	// namespace row's lock, held until commit (appendNS).
 	na := t.planEntry(p, author, entries, inserted)
@@ -1541,8 +1557,8 @@ var (
 // Rows go in resource order: two batches writing some of the same
 // resources at once (Postgres, pglock.go) then wait for each other's rows
 // in that order, never in a cycle.
-func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, grantID []byte, signature string) []histRow {
-	by := writtenBy(a, author, grantID, signature)
+func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, grantID []byte) []histRow {
+	by := writtenBy(a, author, grantID)
 	ws := make([]writer, len(st))
 	for i := range ws {
 		ws[i] = by
@@ -1552,14 +1568,13 @@ func (t *tx) insertItems(n *nsRow, st []*itemState, a *actor, author int64, gran
 
 // writer is who wrote an item, as its revisions record it.
 type writer struct {
-	author    int64
-	via       any // the principal's delegation chain, canonical JSON, or nil
-	grantID   []byte
-	signature string // the author signature of the item's first step (§C.3)
+	author  int64
+	via     any // the principal's delegation chain, canonical JSON, or nil
+	grantID []byte
 }
 
-func writtenBy(a *actor, author int64, grantID []byte, signature string) writer {
-	w := writer{author: author, grantID: grantID, signature: signature}
+func writtenBy(a *actor, author int64, grantID []byte) writer {
+	w := writer{author: author, grantID: grantID}
 	if len(a.principal.Via) > 0 {
 		w.via = string(jsonv.Canonical(jsonv.FromGo(a.principal.Via)))
 	}
@@ -1670,8 +1685,9 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 					typed = step.typed
 				}
 			}
-			if k == 0 && it.signature != "" {
-				sig = it.signature
+			// Each step carries its own signature (§7.5, §C.3.1).
+			if s := it.Steps[k].Signature; s != "" {
+				sig = s
 			}
 			var parent any
 			if it.last != 0 {

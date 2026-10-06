@@ -52,6 +52,15 @@ type Options struct {
 	// OperatorKeys may create namespaces (§C.4 bootstrapping). They act as
 	// keys with can ["*"] for namespace creation only.
 	OperatorKeys []grant.Key
+	// OperatorKeyHistory is the operator key history published as a JWK
+	// Set (§C.4, operatorkeys.go): every operator key the deployment has
+	// had, retired ones included, with the period it was in force. Keys of
+	// OperatorKeys it doesn't list are published as in force since the
+	// deployment's first namespace entry.
+	OperatorKeyHistory []OperatorKeyPeriod
+	// JWKSURI is the jwks_uri GET / publishes (§7, §C.4); default
+	// <Origin>/.well-known/patchlog-keys, which the server serves.
+	JWKSURI string
 	// Limits are the namespace defaults of §6.6.
 	Limits Limits
 	// Maximums are the deployment maximums; a namespace can set its limits
@@ -222,6 +231,11 @@ type Engine struct {
 	noSolo      bool
 	groupStart  func(t *tx, size int)
 	groupMember func(t *tx, i int)
+	// started is when the engine opened; firstEntry the created time of
+	// the deployment's first namespace entry, once known (operatorkeys.go).
+	started      time.Time
+	firstEntryMu sync.Mutex
+	firstEntry   time.Time
 }
 
 // Open opens or creates the database.
@@ -259,6 +273,9 @@ func Open(opt Options) (*Engine, error) {
 	if opt.Purger == nil {
 		opt.Purger = logPurger{}
 	}
+	if err := checkOperatorKeyHistory(&opt); err != nil {
+		return nil, err
+	}
 	if opt.GroupCommit == 0 {
 		opt.GroupCommit = defaultGroupCommit
 	}
@@ -289,6 +306,7 @@ func Open(opt Options) (*Engine, error) {
 		deks:      newDEKCache(4096),
 		cfgCache:  map[int64]*Config{},
 		stop:      make(chan struct{}),
+		started:   opt.Now().UTC(),
 	}
 	if err := e.checkKeyStore(); err != nil {
 		db.Close()
@@ -361,7 +379,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.40"
+const SpecVersion = "0.41"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a

@@ -34,6 +34,7 @@ import (
 	"sync"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Client talks to one deployment. It is safe for concurrent use.
@@ -46,6 +47,8 @@ type Client struct {
 	// sourceAuth are grants sent as Source-Authorization on every write
 	// (WithSourceAuthorization).
 	sourceAuth []string
+	// signer signs resource writes and batch steps (WithSigner, §C.3.1).
+	signer *sig.Key
 
 	rootMu sync.Mutex
 	root   *Root // GET /, once fetched
@@ -97,7 +100,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 // With returns a copy of the client with further options applied, e.g. a
 // different bearer grant. The copy shares the HTTP client.
 func (c *Client) With(opts ...Option) *Client {
-	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth}
+	n := &Client{base: c.base, hc: c.hc, bearer: c.bearer, author: c.author, keys: c.keys, sourceAuth: c.sourceAuth, signer: c.signer}
 	c.rootMu.Lock()
 	n.root = c.root
 	c.rootMu.Unlock()
@@ -123,6 +126,9 @@ type Root struct {
 	Auth string
 	// Origin is the deployment's canonical origin (§G.1).
 	Origin string
+	// JWKSURI is where the deployment publishes its operator key history
+	// (§C.4); "" for deployments from before v0.41.
+	JWKSURI string
 }
 
 // AuthDisabled reports whether Auth is "disabled" (§1).
@@ -149,7 +155,7 @@ func (c *Client) fetchRoot(ctx context.Context) (Root, error) {
 		return Root{}, r.apiError()
 	}
 	m, _ := r.value().(map[string]any)
-	root := Root{Spec: str(m, "spec"), Auth: str(m, "auth"), Origin: str(m, "origin")}
+	root := Root{Spec: str(m, "spec"), Auth: str(m, "auth"), Origin: str(m, "origin"), JWKSURI: str(m, "jwks_uri")}
 	c.rootMu.Lock()
 	c.root = &root
 	c.rootMu.Unlock()

@@ -25,7 +25,7 @@ func TestV038Root(t *testing.T) {
 	} {
 		r := tc.e.get("/")
 		expect(t, r, 200)
-		if m := r.Obj(); len(m) != 3 || m["spec"] != core.SpecVersion || m["auth"] != tc.auth || m["origin"] != "https://cms.example" {
+		if m := r.Obj(); len(m) != 4 || m["jwks_uri"] != "https://cms.example/.well-known/patchlog-keys" || m["spec"] != core.SpecVersion || m["auth"] != tc.auth || m["origin"] != "https://cms.example" {
 			t.Fatalf("%s: GET / %s", tc.name, r.Body)
 		}
 		c, err := plclient.New(tc.e.srv.URL)

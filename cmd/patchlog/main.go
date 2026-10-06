@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -89,7 +89,7 @@ func main() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
-  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
+  patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
                  [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
   patchlog version
@@ -133,6 +133,9 @@ func serve(args []string) {
 	logPageSize := fs.Int("log-page-size", 0, "log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
+	var opHistory multi
+	fs.Var(&opHistory, "operator-key-history", "KID=PUB,FROM[,UNTIL]: an operator key and the RFC 3339 period it was in force, published in the JWK Set at jwks_uri (§C.4); list retired keys here too, which are published but no longer accepted (repeatable; an -operator-key not listed is published as in force since the deployment's first entry)")
+	jwksURI := fs.String("jwks-uri", "", "the jwks_uri GET / publishes (§C.4); default <origin>"+core.DefaultJWKSPath+", which this server serves")
 	archiveDef := fs.String("archive", "", "default pruning archive destination, a file:// directory (§8.6)")
 	var archiveRoots multi
 	fs.Var(&archiveRoots, "archive-root", "file:// directory under which retention rules may name archive destinations (repeatable; -archive is always allowed)")
@@ -179,6 +182,10 @@ func serve(args []string) {
 			log.Fatalf("operator key: %v", err)
 		}
 		keys = append(keys, ks...)
+	}
+	history, err := operatorKeyHistory(opHistory)
+	if err != nil {
+		log.Fatalf("-operator-key-history: %v", err)
 	}
 	if !*dev && len(keys) == 0 {
 		log.Print("warning: no -operator-key given; no namespace can be created")
@@ -248,7 +255,7 @@ func serve(args []string) {
 			log.Fatal(err)
 		}
 	}
-	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys,
+	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: *jwksURI,
 		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
 		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait}
 	if opt.GroupCommit < 1 {
@@ -373,6 +380,35 @@ func closePurger(p *cdnpurge.Purger) {
 	if err := p.Close(ctx); err != nil {
 		log.Printf("cdn purge: flush on shutdown: %v", err)
 	}
+}
+
+// operatorKeyHistory parses -operator-key-history flags,
+// KID=PUB,FROM[,UNTIL] with PUB a base64url Ed25519 public key and the
+// times in RFC 3339 (§C.4).
+func operatorKeyHistory(flags []string) ([]core.OperatorKeyPeriod, error) {
+	var out []core.OperatorKeyPeriod
+	for _, f := range flags {
+		kid, rest, ok := strings.Cut(f, "=")
+		parts := strings.Split(rest, ",")
+		if !ok || kid == "" || len(parts) < 2 || len(parts) > 3 {
+			return nil, fmt.Errorf("%q: want KID=PUB,FROM[,UNTIL]", f)
+		}
+		ks, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": kid, "alg": "ed25519", "pub": parts[0], "can": []any{"*"}}}))
+		if err != nil {
+			return nil, fmt.Errorf("%q: %v", f, err)
+		}
+		p := core.OperatorKeyPeriod{Kid: kid, Pub: ks[0].Pub}
+		if p.From, err = time.Parse(time.RFC3339, parts[1]); err != nil {
+			return nil, fmt.Errorf("%q: from: %v", f, err)
+		}
+		if len(parts) == 3 {
+			if p.Until, err = time.Parse(time.RFC3339, parts[2]); err != nil {
+				return nil, fmt.Errorf("%q: until: %v", f, err)
+			}
+		}
+		out = append(out, p)
+	}
+	return out, nil
 }
 
 // remoteOptions builds the endpoints of remote bases from ORIGIN=VALUE flags.
