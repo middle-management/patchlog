@@ -10,6 +10,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/middle-management/patchlog/internal/annot"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pointer"
@@ -21,6 +22,9 @@ import (
 //	                    document (in any text field); a trailing * makes a word a prefix
 //	schema=ref          exact $schema, or a prefix ending at a path segment
 //	                    (/r/schemas/match matches /r/schemas/match/rev/…)
+//	ref=/r/ns/name      documents that reference a resource (§A.4): any form; with
+//	                    /rev/{id} only those pinned to that revision; with #entry (sent as
+//	                    %23entry) only those naming that entry
 //	facet[/path]=v      exact match on an x-index "facet" field; repeated values of one
 //	                    path are ORed, different paths ANDed
 //	gt|ge|lt|le[/path]=v range filter on an x-index "sort" field: a number compares with
@@ -37,6 +41,7 @@ type Query struct {
 	Q      string
 	words  []string
 	Schema string
+	Ref    *RefFilter
 	Facets map[string][]string // path -> values (ORed)
 	Ranges []rangeFilter
 	Sorts  []sortKey
@@ -46,6 +51,20 @@ type Query struct {
 	// Mins are the ?min= values; NS is "" for a bare ns_id (the queried
 	// namespace).
 	Mins []MinRef
+}
+
+// RefFilter is a parsed ?ref= (§A.4). Rev and Entry are "" when the form
+// has none.
+type RefFilter struct{ NS, Name, Rev, Entry string }
+
+// ParseRefFilter parses /r/{ns}/{name}[/rev/{id}][#{entry}]. The entry is
+// percent-decoded, as it is stored.
+func ParseRefFilter(s string) (*RefFilter, error) {
+	r, ok := annot.ParseRefString(s)
+	if !ok {
+		return nil, fmt.Errorf("ref must be /r/{ns}/{name}, /r/{ns}/{name}/rev/{id} or /r/{ns}/{name}%%23{entry}")
+	}
+	return &RefFilter{NS: r.NS, Name: r.Name, Rev: r.Rev, Entry: r.Entry}, nil
 }
 
 // MinRef is one ?min= value (§A.5).
@@ -110,7 +129,7 @@ func ParseQuery(v url.Values) (*Query, error) {
 	}
 	for k, vals := range v {
 		switch k {
-		case "q", "schema", "limit", "after":
+		case "q", "schema", "ref", "limit", "after":
 			if _, err := one(k); err != nil {
 				return nil, err
 			}
@@ -182,6 +201,13 @@ func ParseQuery(v url.Values) (*Query, error) {
 		return nil, fmt.Errorf("q has no searchable words")
 	}
 	q.Schema = v.Get("schema")
+	if _, ok := v["ref"]; ok {
+		rf, err := ParseRefFilter(v.Get("ref"))
+		if err != nil {
+			return nil, err
+		}
+		q.Ref = rf
+	}
 	if s := v.Get("limit"); s != "" {
 		n, err := strconv.Atoi(s)
 		if err != nil || n < 1 || n > 100 {
@@ -234,6 +260,13 @@ type Hit struct {
 	Schema   string
 	Score    float64
 	Facets   map[string][]any
+	Refs     []RefHit // with ?ref=: the matching references (§A.4)
+}
+
+// RefHit is one reference of a hit: where it sits and the string as written.
+type RefHit struct {
+	Path string `json:"path"`
+	Ref  string `json:"ref"`
 }
 
 // Result is a page of hits.
@@ -287,6 +320,11 @@ func (ix *Index) candidateSQL(ns string, q *Query) (string, []any) {
 		sb.WriteString(` AND (d.schema = ? OR substr(d.schema, 1, ?) = ?)`)
 		args = append(args, q.Schema, len(pre), pre)
 	}
+	if rf := q.Ref; rf != nil {
+		cond, a := refCond(rf)
+		sb.WriteString(` AND EXISTS (SELECT 1 FROM refs x WHERE x.ns = d.ns AND x.resource = d.resource AND ` + cond + `)`)
+		args = append(args, a...)
+	}
 	paths := make([]string, 0, len(q.Facets))
 	for p := range q.Facets {
 		paths = append(paths, p)
@@ -331,6 +369,52 @@ func (ix *Index) candidateSQL(ns string, q *Query) (string, []any) {
 	return sb.String(), args
 }
 
+// refCond is the condition on a refs row x that matches the filter.
+func refCond(rf *RefFilter) (string, []any) {
+	cond := `x.target_ns = ? AND x.target = ?`
+	args := []any{rf.NS, rf.Name}
+	if rf.Rev != "" {
+		cond += ` AND x.rev = ?`
+		args = append(args, rf.Rev)
+	}
+	if rf.Entry != "" {
+		cond += ` AND x.entry = ?`
+		args = append(args, rf.Entry)
+	}
+	return cond, args
+}
+
+// attachRefs gives each hit the references that matched the filter.
+func (ix *Index) attachRefs(ctx context.Context, tx *sql.Tx, ns string, rf *RefFilter, hits []Hit) error {
+	if rf == nil || len(hits) == 0 {
+		return nil
+	}
+	idx := map[string]int{}
+	ph := make([]string, len(hits))
+	cond, args := refCond(rf)
+	args = append([]any{ns}, args...)
+	for i, h := range hits {
+		idx[h.Resource] = i
+		ph[i] = "?"
+		args = append(args, h.Resource)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT x.resource, x.path, x.ref FROM refs x WHERE x.ns = ? AND `+cond+` AND x.resource IN (`+strings.Join(ph, ",")+`) ORDER BY x.resource, x.path`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r string
+		var rh RefHit
+		if err := rows.Scan(&r, &rh.Path, &rh.Ref); err != nil {
+			return err
+		}
+		h := &hits[idx[r]]
+		h.Refs = append(h.Refs, rh)
+	}
+	return rows.Err()
+}
+
 // run executes q against ns inside tx. allow filters hits (nil = all).
 func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(resource string) bool) (*Result, error) {
 	stmt, args := ix.candidateSQL(ns, q)
@@ -371,6 +455,9 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 		return nil, err
 	}
 	if err := ix.attachFacets(ctx, tx, ns, res.Hits); err != nil {
+		return nil, err
+	}
+	if err := ix.attachRefs(ctx, tx, ns, q.Ref, res.Hits); err != nil {
 		return nil, err
 	}
 	if len(q.Counts) > 0 {

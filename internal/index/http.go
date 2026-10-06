@@ -355,6 +355,10 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		if h.Schema != "" {
 			m["schema"] = h.Schema
 		}
+		// refs (§A.4): with ?ref=, where each matching reference sits.
+		if len(h.Refs) > 0 {
+			m["refs"] = h.Refs
+		}
 		// …facets (§A.4): every facet path of the document, as a list of values.
 		for p, vs := range h.Facets {
 			m[p] = vs

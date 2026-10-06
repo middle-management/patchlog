@@ -107,10 +107,17 @@ type sortRow struct {
 	value any // float64 or string
 }
 
+type refRow struct {
+	path, ref        string // instance pointer of the string, and the string as written
+	targetNS, target string
+	rev, entry       string // "" when the reference is live / names no entry
+}
+
 type docRows struct {
 	text  []textRow
 	facet []facetRow
 	sort  []sortRow
+	refs  []refRow
 }
 
 // extract returns the document's $schema and its index rows. Untyped
@@ -128,18 +135,60 @@ func (ix *Index) extract(ctx context.Context, ns, resource string, doc any) (str
 		return "", false, nil, nil
 	}
 	var transient error
-	anns, err := annot.Collect(doc, ix.schemas.LoaderFor(ctx, ns, &transient), "x-index")
-	if err != nil {
+	load := ix.schemas.LoaderFor(ctx, ns, &transient)
+	// failed classifies an error of one of the two walks: transient ones
+	// (and cancellation) are returned so Apply retries; the rest are
+	// permanent, and the document is indexed without what the walk gave.
+	failed := func(what string, err error) error {
 		if transient != nil {
-			return "", false, nil, transient
+			return transient
 		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		ix.opt.Logf("index: %s/%s: %s: %v (indexed without them)", ns, resource, what, err)
+		return nil
+	}
+	var rows *docRows
+	anns, err := annot.Collect(doc, load, "x-index")
+	if err != nil {
+		if err := failed("collecting x-index", err); err != nil {
 			return "", false, nil, err
 		}
-		ix.opt.Logf("index: %s/%s: collecting x-index: %v (indexed without fields)", ns, resource, err)
-		return sch, true, nil, nil
+	} else {
+		rows = rowsFor(doc, anns)
 	}
-	return sch, true, rowsFor(doc, anns), nil
+	// §A.2: references come from §6.5's static walk with the schema
+	// revision the document pins, whether or not the document validates.
+	found, err := annot.FindRefs(doc, load)
+	if err != nil {
+		if err := failed("walking x-ref", err); err != nil {
+			return "", false, nil, err
+		}
+	}
+	if len(found) > 0 {
+		if rows == nil {
+			rows = &docRows{}
+		}
+		rows.refs = refRows(found)
+	}
+	return sch, true, rows, nil
+}
+
+// refRows turns found references into rows: the target as written (not
+// resolved, so a branch's preview index matches what its documents say,
+// §A.4), one row per location.
+func refRows(found []annot.Ref) []refRow {
+	var out []refRow
+	seen := map[string]bool{}
+	for _, r := range found {
+		if seen[r.Pointer] {
+			continue // the same location, found with another pinned/key
+		}
+		seen[r.Pointer] = true
+		out = append(out, refRow{path: r.Pointer, ref: r.Raw, targetNS: r.NS, target: r.Name, rev: r.Rev, entry: r.Entry})
+	}
+	return out
 }
 
 // rowsFor turns x-index annotations into rows (§A.2).

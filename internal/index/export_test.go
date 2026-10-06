@@ -21,7 +21,7 @@ func (ix *Index) SealedViews() map[string]string {
 // CountRows counts every row the index holds for ns (tests).
 func (ix *Index) CountRows(ns string) int {
 	total := 0
-	for _, tbl := range []string{"docs", `"text"`, "facet", `"sort"`} {
+	for _, tbl := range []string{"docs", `"text"`, "facet", `"sort"`, "refs"} {
 		var n int
 		if err := ix.db.QueryRow(`SELECT count(*) FROM `+tbl+` WHERE ns = ?`, ns).Scan(&n); err != nil {
 			panic(err)
@@ -29,4 +29,11 @@ func (ix *Index) CountRows(ns string) int {
 		total += n
 	}
 	return total
+}
+
+// DropRefsForTest drops the refs table, as a database from before v0.44
+// lacks it.
+func (ix *Index) DropRefsForTest() (int, error) {
+	_, err := ix.db.Exec(`DROP TABLE refs`)
+	return 0, err
 }

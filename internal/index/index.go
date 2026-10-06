@@ -12,6 +12,8 @@
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
 //	facet(ns, resource, schema, path, value, raw)
 //	sort (ns, resource, schema, path, value)
+//	refs(ns, resource, schema, path, ref, target_ns, target, rev, entry)  x-ref references (§A.2, §A.3);
+//	                                      path is the full instance pointer, indices included
 //	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
@@ -204,7 +206,7 @@ func (ix *Index) Origin() string { return ix.origin }
 
 var dropStmts = []string{
 	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS ns_state`,
-	`DROP TABLE IF EXISTS docs`, `DROP TABLE IF EXISTS "text"`, `DROP TABLE IF EXISTS facet`, `DROP TABLE IF EXISTS "sort"`,
+	`DROP TABLE IF EXISTS docs`, `DROP TABLE IF EXISTS "text"`, `DROP TABLE IF EXISTS facet`, `DROP TABLE IF EXISTS "sort"`, `DROP TABLE IF EXISTS refs`,
 	derived.CacheDropStmts[0], derived.CacheDropStmts[1],
 }
 
@@ -214,7 +216,9 @@ var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, UNIQUE (ns, resource))`,
 	`CREATE TABLE IF NOT EXISTS facet (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value TEXT NOT NULL, raw TEXT NOT NULL, PRIMARY KEY (ns, resource, path, value))`,
 	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, PRIMARY KEY (ns, resource, path))`,
+	`CREATE TABLE IF NOT EXISTS refs (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, ref TEXT NOT NULL, target_ns TEXT NOT NULL, target TEXT NOT NULL, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path))`,
 	`CREATE INDEX IF NOT EXISTS docs_q ON docs (ns, schema)`,
+	`CREATE INDEX IF NOT EXISTS refs_q ON refs (target_ns, target, rev, entry)`,
 	`CREATE INDEX IF NOT EXISTS facet_q ON facet (ns, path, value)`,
 	`CREATE INDEX IF NOT EXISTS sort_q ON "sort" (ns, path, value)`,
 }
@@ -228,6 +232,21 @@ var likeCreate = []string{
 }
 
 func (ix *Index) initSchema(ctx context.Context) error {
+	if !ix.opt.Rebuild {
+		// A database from before v0.44 has no refs table, so its documents'
+		// references were never collected (§A.2): replay it, as a rebuild.
+		var docs, refs int
+		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'docs'`).Scan(&docs); err != nil {
+			return err
+		}
+		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'refs'`).Scan(&refs); err != nil {
+			return err
+		}
+		if docs > 0 && refs == 0 {
+			ix.opt.Logf("index: the database predates reference indexing (§A.2); rebuilding it from the logs")
+			ix.opt.Rebuild = true
+		}
+	}
 	if ix.opt.Rebuild {
 		for _, s := range dropStmts {
 			if _, err := ix.db.ExecContext(ctx, s); err != nil {
@@ -550,7 +569,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 
 // dropNS deletes every row of a namespace.
 func (ix *Index) dropNS(ctx context.Context, tx *sql.Tx, ns string) error {
-	for _, q := range []string{`DELETE FROM "text" WHERE ns = ?`, `DELETE FROM facet WHERE ns = ?`, `DELETE FROM "sort" WHERE ns = ?`, `DELETE FROM docs WHERE ns = ?`} {
+	for _, q := range []string{`DELETE FROM "text" WHERE ns = ?`, `DELETE FROM facet WHERE ns = ?`, `DELETE FROM "sort" WHERE ns = ?`, `DELETE FROM refs WHERE ns = ?`, `DELETE FROM docs WHERE ns = ?`} {
 		if _, err := tx.ExecContext(ctx, q, ns); err != nil {
 			return err
 		}
@@ -578,7 +597,7 @@ func (ix *Index) clearRows(ctx context.Context, tx *sql.Tx, ns, resource string)
 	if err != nil {
 		return 0, false, err
 	}
-	for _, q := range []string{`DELETE FROM facet WHERE ns = ? AND resource = ?`, `DELETE FROM "sort" WHERE ns = ? AND resource = ?`} {
+	for _, q := range []string{`DELETE FROM facet WHERE ns = ? AND resource = ?`, `DELETE FROM "sort" WHERE ns = ? AND resource = ?`, `DELETE FROM refs WHERE ns = ? AND resource = ?`} {
 		if _, err := tx.ExecContext(ctx, q, ns, resource); err != nil {
 			return 0, false, err
 		}
@@ -631,6 +650,19 @@ func (ix *Index) write(ctx context.Context, tx *sql.Tx, ns string, p prepared) e
 	for _, f := range p.rows.facet {
 		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO facet (ns, resource, schema, path, value, raw) VALUES (?, ?, ?, ?, ?, ?)`,
 			ns, p.resource, schemaCol, f.path, f.value, f.raw); err != nil {
+			return err
+		}
+	}
+	for _, r := range p.rows.refs {
+		var rev, entry any
+		if r.rev != "" {
+			rev = r.rev
+		}
+		if r.entry != "" {
+			entry = r.entry
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO refs (ns, resource, schema, path, ref, target_ns, target, rev, entry) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			ns, p.resource, schemaCol, r.path, r.ref, r.targetNS, r.target, rev, entry); err != nil {
 			return err
 		}
 	}

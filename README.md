@@ -772,6 +772,14 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
 
 - `GET /{ns}?…` redirects to `/{ns}/at/{checkpoint}`, which stays correct forever.
 - `?min={ns_id}` waits for your own write to be indexed, and answers 503 if it isn't in time.
+- `?ref=` answers "who uses this?" (§A.4): the documents of `{ns}` that reference a resource through
+  a schema's `x-ref`, found by walking each typed document with the schema revision it pins, with
+  no `x-index` needed. `?ref=/r/logic/route-3` matches any form, `/r/logic/route-3/rev/{id}` only
+  references pinned to that revision, and `/r/logic/route-3%23t-42` only those naming that entry. It
+  combines with the other filters, and each hit lists `refs: [{path, ref}]`. Untyped documents, and
+  paths that merely appear in prose or embedded copies, are not references. Delete guards built on
+  it are advisory (use `?min=` and expect races). A database from before this version is rebuilt
+  from the logs on start. In a branch's preview index targets match as written.
 - In private namespaces the reader's grant is checked locally. Results are routed under
   `/g/{subject-set}/…` and filtered to the resources the grant can read.
 
@@ -1886,7 +1894,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   (`since`, `live`, `cursor`, `after`, `dry-run=1`, `force=1`, each on its own routes), and
   answers anything else, a repeated parameter or another flag value with `400 bad_input`,
   `no-store`, before authentication.
-- **`GET /`** answers `{ "spec": "0.43", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.44", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace
