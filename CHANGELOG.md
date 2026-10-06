@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.13.0
 
 Implements spec **v0.43**, small fixes from the reference's v0.42 notes.
 
