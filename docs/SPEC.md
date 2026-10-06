@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.41 · 2026-10-06. See the change log at the end.
+Status: draft v0.42 · 2026-10-06. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -363,7 +363,7 @@ The answer lists, as `referencing`, the referencing namespaces in which the call
 
 The order of checks at the gate is normative. Only errors in a request's own shape, which no state influences, may come before step 1: malformed names or URLs, content types, header and body syntax, and the size of what is read (`400`, `413`, `415`), unless an endpoint fixes its own order, as blob uploads do (§7.8). Everything else follows this order:
 
-- **Authenticate and authorise** the request (Addendum C): `401` or `403`. This covers the verbs and every grant, key-scope and role rule that refers only to `/action`, `/resource`, `/principal` or `/now` (§C.2), so a grant limited to one resource learns nothing about others. A `PATCH` with `If-Match` may be an append or a restore, which only the resource's state decides. It passes this step if, for `append` or for `restore`, the grant allows that verb and every step-1 rule passes with `/action` set to it. Those are its **candidate verbs**. Step 2 settles which one the write is, and step 6 evaluates the rules again with the settled action. In a batch (§7.5), a patch set that follows a `"delete"` step in the same item is a restore and any other later step an append; those verbs are known from the request and are checked here like `"delete"`. Author signatures (§C.3.1) are checked next, for every write that passed: `422` with `code: "signature"`. Rate limits (§6.6) are checked last in this step, only for requests that passed it: `429`.
+- **Authenticate and authorise** the request (Addendum C): `401` or `403`. This covers the verbs and every grant, key-scope and role rule that refers only to `/action`, `/resource`, `/principal` or `/now` (§C.2), so a grant limited to one resource learns nothing about others. A `PATCH` with `If-Match` may be an append or a restore, which only the resource's state decides. It passes this step if, for `append` or for `restore`, the grant allows that verb and every step-1 rule passes with `/action` set to it. Those are its **candidate verbs**. Step 2 settles which one the write is, and step 6 evaluates the rules again with the settled action. In a batch (§7.5), a patch set that follows a `"delete"` step in the same item is a restore and any other later step an append; those verbs are known from the request and are checked here like `"delete"`. Rate limits (§6.6) are checked last in this step, only for requests that passed it: `429`.
 
 - **Precondition** (§7.2), in this order:
 
@@ -380,6 +380,9 @@ for a `PATCH` with `If-Match` (in a batch, an item whose first step is a patch s
     - in a branch, the state is the branch's view (§7.6): a resource read through settles by the base's head as of `at`, and a tombstone there makes the first write a restore, with that tombstone as its foreign parent
 
 A settled verb that isn't a candidate is `403` here, before the `If-Match` comparison, so steps 3–5 never run for the wrong verb and no head is revealed. This reveals only whether the resource is currently deleted, which is what a restore grant is for. In a batch this sub-step runs for every item before the next runs for any, and a `403` here counts as failing authorisation, for §7.5's failure report and for the dry run.
+
+  -
+author signatures (§C.3.1): `422` with `code: "signature"`. They come after the retry lookup, so a retry is answered with the entry as first recorded, and after the verb is settled, so authorisation failures are still reported first (§7.5). They need no head: the signed parent is the one the precondition names.
 
   -
 a frozen namespace: `409` (§8.4)
@@ -678,7 +681,7 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 ## 7. HTTP API
 
-Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.41", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
+Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.42", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, and flags such as `force` and `dry-run` only the value `1`; anything else is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
 **Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Gesture`, `Undoes`, `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
 
@@ -721,7 +724,7 @@ Log entry shape (patches in canonical form):
 { "id": "…", "parent": "…", "kind": "tombstone", "author": "…", "created": "…", "grant"?: { "id", "sub", "kid" }, "signature"?: "…", "gesture"?: "…", "undoes"?: "…" }
 ```
 
-All cursors are ids. Internal sequence numbers are never exposed.
+`grant` is absent where none was recorded, including writes made while authentication was disabled, whose namespace entries say `"grant": null` (§7.4). All cursors are ids. Internal sequence numbers are never exposed.
 
 ### 7.2 Writes
 
@@ -793,7 +796,7 @@ If that entry was written by the **same principal**, respond `200` with it inste
 | `GET /ns/{ns}/rev/{ns_id}/heads?after={name}` | `200` with a page of `{ resource, kind, target }`, one per resource as of that revision, including resources a branch reads through, in ascending byte order of name, strictly after `after`, which is a plain bound and needn't name an existing resource; `next` for the following page | immutable |
 | `GET /ns/{ns}/events?since={ns_id}` | SSE of namespace entries | `no-store` |
 | `GET /ns/{ns}/gestures/{gesture}` | optional: `200` with `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]`, one per revision or tombstone written with that gesture or undoing it, oldest first, leaving out purged resources. Paged by `logPageSize`, oldest first: a full page carries `X-Log-Next: {resource}/{id}` (its last row, `id` in text form, unquoted; ids repeat across resources), the next page is `?after=` that value, and a page without `X-Log-Next` is the last. Lists revisions and tombstones only: config writes with that gesture are found in the namespace log. Requires unrestricted `read` on the namespace (as §7.6 does). Not offered in sealed or end-to-end namespaces, whose logs are the place to look: `404` with `code: "not_offered"`, after the `read` check | `no-store` |
-| `GET /ns/{ns}/grants/{gid}` | `200` with `{ id, root, stored }`, a grant recorded by an entry of this namespace or, in a local branch, of its bases, in its non-bearer form (§C.3.1); `404` for any other. Requires unrestricted `read` on the namespace (as §7.6 does); not offered in sealed or end-to-end namespaces (`404 not_offered`) | immutable |
+| `GET /ns/{ns}/grants/{gid}` | `200` with `{ id, root, stored }`, a grant recorded by an entry of this namespace or, in a local branch, of its bases, in its non-bearer form (§C.3.1); `404` for any other. Requires unrestricted `read` on the namespace (as §7.6 does); sealed in sealed namespaces, `private` in end-to-end ones | immutable (`private` at E3) |
 | `GET /ns/{ns}/branches` | `200` with `[{ name, at, frozen, purged, successor?, drafts? }]` for the namespace's direct branches, and `{ remote, at, ns_id, expires }` for remote branches whose registration hasn't expired (§G.3). Requires `read` | head pointer |
 
 **Namespace writes.** The namespace document is edited like a resource, with a JSON Patch on its own URL:
@@ -1199,7 +1202,7 @@ The checks run in this order:
 
   - The namespace document chain, the namespace log (with authors, §5) and every resource's ids and parent links are kept, so the history of who changed what stays verifiable.
 
-  - All `/r/{ns}/…` URLs return `410`. `/ns/{ns}` and its log stay readable.
+  - All `/r/{ns}/…` URLs, and `/ns/{ns}/grants/…`, return `410`. `/ns/{ns}` and its log stay readable.
 
   - The name stays reserved and can't be reused.
 
@@ -1251,7 +1254,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
 - **Branches don't prune.** A branch's own entries are protected until the branch is purged (§8.5). Branches are short-lived, and merges and rebases need their whole history.
 
-- **Archive.** Before pruning, the server writes the pruned history as a full-history bundle (§G.4.1) to a destination configured by the operator or in `retention`. It MUST NOT write anywhere else.
+- **Archive.** Before pruning, the server writes the pruned history as a full-history bundle (§G.4.1) to a destination configured by the operator or in `retention`. It MUST NOT write anywhere else. Archives are written with `"authors": true`, grant lines included, so archived signatures stay verifiable.
 
   - The archive is only as trustworthy as its storage. The kept ids let anyone check an archived revision against the live chain.
 
@@ -1297,7 +1300,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 | Response | Cache-Control | Tag (`Cache-Tag` / `Surrogate-Key`) |
 |---|---|---|
 | Head pointer (resource or namespace `302`, head `410`) | `public, max-age=0, s-maxage=1, stale-while-revalidate=5` | `ns:{ns}`, and `r:{ns}/{name}` for resources |
-| Immutable (`/rev/{id}`, `/rev/{id}/log`, namespace log ranges (sealed ones may be sealed again with other bytes, §E.2.2), `/blob/{bid}`, `/blob/{bid}/e/{e}` and their ranges) | `public, max-age=86400, s-maxage=31536000, immutable` | `ns:{ns}`, and `r:{ns}/{name}` for resources |
+| Immutable (`/rev/{id}`, `/rev/{id}/log`, namespace log ranges (sealed ones may be sealed again with other bytes, §E.2.2), `/ns/{ns}/grants/{gid}` (`private` at E3, §C.3.1), `/blob/{bid}`, `/blob/{bid}/e/{e}` and their ranges) | `public, max-age=86400, s-maxage=31536000, immutable` | `ns:{ns}`, and `r:{ns}/{name}` for resources |
 | Short (unknown id `404`) | `public, max-age=5` | — |
 | Long (purged `410`) | `public, max-age=86400, s-maxage=31536000` | — |
 | Pruned (`410` below a horizon) | `public, max-age=3600` | `r:{ns}/{name}`, `ns:{ns}` |
@@ -1501,7 +1504,7 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 
 | `code` | Status | Meaning |
 |---|---|---|
-| `bad_input` | 400 | Not I-JSON, non-canonical name or URL |
+| `bad_input` | 400 | Not I-JSON, non-canonical name or URL, an unknown query parameter (§7), a malformed `Signature` (§C.3.1) |
 | `unauthenticated` | 401 | No usable grant: missing, malformed, badly signed, revoked, expired or not yet valid (§C.2) |
 | `forbidden` | 403 | Grant, key scope or grant rule refuses the request |
 | `not_found` | 404 | Unknown, or not readable by the caller |
@@ -2346,13 +2349,19 @@ A signature is checked along one chain, every link of which is immutable or in a
 
 - **Tombstones** are signed over the same input with the ASCII bytes `tombstone` in place of `canonical(patches)`, as their ids are (§3.4). A canonical patch set starts with `[`, so the two never collide, and a delete's signature can't pass for an empty append's.
 
-- **At the gate.** When a write carries a signature whose `kid` its grant's `signers` list, the server MUST verify it, after authentication, since it depends on the grant (§6.2); a bad one is `422` with `code: "signature"`. A signature with any other `kid` is stored unverified, and readers treat it as unattributed.
+- **At the gate.** When a write carries a signature whose `kid` its grant's `signers` list, the server MUST verify it, after the retry lookup and the verb (§6.2 step 2.3); a bad one is `422` with `code: "signature"`, and so is one whose `alg` isn't that signer's. A signature with any other `kid` is stored unverified, and readers treat it as unattributed.
+
+  - **The parent** in the input is the one the write's precondition names: its `If-Match` id, empty for a create, and in a batch the item's `ifMatch` (empty with `ifNoneMatch`) for its first step and the previous step's id for each later one. A write is accepted only on that parent, so it is the one the revision gets. A write without a usable precondition can't be checked, and gets the precondition's own error (`428`, or `400` for a malformed one).
+
+  - A `Signature` header or step member that isn't `<alg>:<kid>:<sig>` with a base64url `<sig>` is `400` (`bad_input`), as a request-shape error.
+
+  - **Retries.** An idempotent retry (§7.2) is answered with the entry as first recorded, whatever well-formed signature it carries or lacks, even after `required` was turned on: the write was accepted once, and the retry adds nothing.
 
   - At E3 the input covers the sealed patch set as sent (§E.3.1), so the server verifies without content keys.
 
   - In a batch, each step object (§7.5) carries its own `signature`. The `Signature` header covers single writes, and is `400` on a batch request.
 
-- **Requiring signatures.** A namespace document may set `"signatures": "required"`; the default is `"optional"`. Every revision and tombstone written to such a namespace then needs a valid signature by a signer of its grant (`422 signature` otherwise).
+- **Requiring signatures.** A namespace document may set `"signatures": "required"`; the default is `"optional"`. Every revision and tombstone written to such a namespace then needs a valid signature by a signer of its grant (`422 signature` otherwise, at the same point of the gate). A batch's items are judged under the configuration its config change produces; if that change fails, the batch fails with it.
 
   - It covers resource revisions and tombstones; namespace documents aren't signed. It is judged by the configuration the gate checks the write against: for a batch item, the one its batch's config change produces (§7.5). Revisions written before it was turned on, and those a branch reads through from its base, aren't covered, so a reader relying on it checks the log position, not only the current document.
 
@@ -2364,9 +2373,11 @@ A signature is checked along one chain, every link of which is immutable or in a
 
 - **Reading grants.** `GET /ns/{ns}/grants/{gid}` answers `{ "id", "root", "stored" }`. `stored` is the non-bearer form (§C.8) as a JSON array of the token's protobuf `SignedBlock`s in order, authority first, each in base64url without padding. A verifier checks the authority block's signature under the key `root.kid` names, that its one `grant_block` string equals `canonical(root)` byte for byte, and that `id` is `text(trunc160(sha256(that string)))`.
 
-  - It serves the grants recorded by entries of this namespace and, in a local branch, of its bases up to their `at`, recursively; any other is `404`. A revision a remote branch reads through is verified at its base (§G.3).
+  - It serves the grants recorded by namespace log entries of this namespace and, in a local branch, of its bases up to their `at`, recursively; any other is `404`. A revision a remote branch reads through is verified at its base (§G.3). In a purged namespace it is `410` after the `read` check, since the content its signatures cover is gone (§8.5).
 
-  - A grant shows the principal's groups and attributes and every narrowing block, so it needs unrestricted `read` on the namespace. It is immutable. Like the gestures listing (§7.4), it isn't offered in sealed or end-to-end namespaces (`404`, `code: "not_offered"`, after the `read` check); their bundles carry the grants (§G.4.1).
+  - A grant shows the principal's groups and attributes and every narrowing block, so it needs unrestricted `read` on the namespace. In a public namespace that is anyone, so issuers keep the `groups` and `attrs` of grants with `signers` for public namespaces to what may be public. It is immutable.
+
+  - Sealed namespaces seal it like a log entry, with `pl: { "ns", "grant": gid }` (§E.2.2). End-to-end namespaces serve it in the clear, as the server holds it in the clear and serves their logs so (§E.4), with `Cache-Control: private` instead of the immutable class (§9), since a grant shows more than a log entry does.
 
   - Bundles carry the grants their history references (§G.4.1), so they verify offline.
 
@@ -2414,7 +2425,9 @@ A signature is checked along one chain, every link of which is immutable or in a
 -
 **Operator key history.** A deployment publishes its operator keys as a JWK Set (RFC 7517) at the `jwks_uri` it gives at `GET /` (§7), by default `/.well-known/patchlog-keys`. Verifiers read the URI there rather than guess a path. `/.well-known/jwks.json` is a convention, not a registered name, and an identity provider on the same domain may publish keys for another purpose there.
 
-  - Each key is an OKP Ed25519 JWK with `kid` and `use: "sig"`, plus `"patchlog": { "from", "until"? }`, the RFC 3339 period it was in force. Generic JOSE tools ignore that member.
+  - Each key is an OKP Ed25519 JWK with `kid` and `use: "sig"`, plus `"patchlog": { "from", "until"? }`, the RFC 3339 period it was in force. Generic JOSE tools ignore that member. The set is served as `application/jwk-set+json`, publicly cached for minutes, e.g. `public, max-age=300`.
+
+  - The period is the operator's to declare. `from` MUST be no later than the first entry written under a grant the key signed, so a deployment publishing a key it already used gives the time the key was configured, or else the time of the deployment's first entry. A key past its `until` authorises nothing: grants it signed are refused from then on, and verify only for revisions created before it.
 
   - It is a history, not a current set: keys are never removed, and `kid`s never reused. A grant signed by an operator key verifies against the key in force at the revision's `created` time (§C.3.1).
 
@@ -3021,6 +3034,8 @@ Responses for sealed namespaces use `Content-Type: application/jose` and a JWE (
 
 - The `pl` claims are integrity-protected as AAD, so a ciphertext can't be replayed under another resource, revision or epoch.
 
+- For a grant (§C.3.1), `pl` carries `{ "ns", "grant": gid }`.
+
 - For namespace log ranges, `pl` carries `{ "ns", "range": [since, last] }`, the bounds of the page actually served (§7.1), or `[since, id]` for an empty page. Resource log ranges are sealed entry by entry, each with its own `pl.id`, so their pages chain from `since` to `X-Log-Next`.
 
 - **What gets sealed:**
@@ -3032,6 +3047,8 @@ Responses for sealed namespaces use `Content-Type: application/jose` and a JWE (
 - namespace documents
 
 - namespace log ranges
+
+- grants (§C.3.1)
 
 - event payloads
 
@@ -3047,7 +3064,7 @@ Responses for sealed namespaces use `Content-Type: application/jose` and a JWE (
 
 - sizes and timing
 
-- **Stored once, served forever.** Sealed bytes for a revision, a document or a resource log entry are produced once, stored, and served identically forever, so ETags, `304`s and caching are unchanged. Namespace log ranges (§7.4) are the exception: one range per `since` would store a page for every entry, so a deployment MAY keep only some, oldest evicted first, and seal an evicted range again on request, with fresh bytes, under the epoch key and `pad` setting current then. The plaintext is the same except for fields a later version has added (below), so readers accept either copy and MUST NOT rely on one; a range's `ETag`, if it has one, is weak. Fields a later version adds to what is sealed, such as `grant` in log entries (§7.4), are absent from bytes sealed before; readers accept both. In sealed namespaces, grants recovered for entries written before v0.37 (§7.4) are therefore missing from bytes sealed before, and from a range sealed again only if the server still lacks them; they don't count in the janitor's checks (§F.6).
+- **Stored once, served forever.** Sealed bytes for a revision, a document, a resource log entry or a grant are produced once, stored, and served identically forever, so ETags, `304`s and caching are unchanged. Namespace log ranges (§7.4) are the exception: one range per `since` would store a page for every entry, so a deployment MAY keep only some, oldest evicted first, and seal an evicted range again on request, with fresh bytes, under the epoch key and `pad` setting current then. The plaintext is the same except for fields a later version has added (below), so readers accept either copy and MUST NOT rely on one; a range's `ETag`, if it has one, is weak. Fields a later version adds to what is sealed, such as `grant` in log entries (§7.4), are absent from bytes sealed before; readers accept both. In sealed namespaces, grants recovered for entries written before v0.37 (§7.4) are therefore missing from bytes sealed before, and from a range sealed again only if the server still lacks them; they don't count in the janitor's checks (§F.6).
 
 - **Compression.** Compress **before** sealing, and only within a single revision's own content. Log ranges seal each entry separately, so content from different authors is never compressed together (the CRIME/BREACH class of attack).
 
@@ -3225,7 +3242,7 @@ The origin never sees plaintext. Clients encrypt patch sets before sending them 
 
 - edit timing
 
-- author identities and the grants they wrote with (recorded by the server, §7.4)
+- author identities and the grants they wrote with (recorded by the server, §7.4; at E3 served in the clear to readers, §C.3.1)
 
 - the shape of the namespace log
 
@@ -3652,7 +3669,7 @@ Remote read-through runs in the receiving deployment's server. Export and import
 
 ## G.1 Principles
 
-- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.41", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
+- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.42", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
 
 - **Ids travel, trust doesn't.** Content that comes **with its history** can be verified by anyone by recomputing ids (invariant 4), given a trusted starting point: an `ns_id` or revision id obtained from the source itself. Integrity then needs no trusted transport, cache or mirror. Snapshots, headers and listings not covered by ids are only as trustworthy as their channel.
 
@@ -3772,7 +3789,7 @@ The ids prove the copies exact. If B already has a resource at one of those path
 
 ## G.4 Bundles
 
-A bundle carries selected documents from one deployment to another as a file: for release promotion, fixtures, handovers, or a backup of part of a namespace. Exporting is a consumer (§G.2), and importing is a client of the batch API (§7.5). A server MAY offer `GET /ns/{ns}/rev/{at}/bundle?select=…` as an optimisation.
+A bundle carries selected documents from one deployment to another as a file: for release promotion, fixtures, handovers, or a backup of part of a namespace. Exporting is a consumer (§G.2), and importing is a client of the batch API (§7.5). A server MAY offer `GET /ns/{ns}/rev/{at}/bundle?select=…` as an optimisation, with `authors=1` for `"authors": true`.
 
 ### G.4.1 Format
 
@@ -3806,9 +3823,13 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
 
 - **`requires`** applies only to `full` documents. `requires[r]` MUST be in the target's chain for `r`. If the target has moved on along another line, `r` is a conflict.
 
-- **Authors, `via`, grant ids, author signatures, creation times, `gesture` and `undoes`** are included only with `"authors": true`. With them, a bundle carries one grant line `{ "ns", "grant": gid, "root", "stored", "key": { "kid", "alg", "pub" } }` per grant its lines reference, before the first line that does, where `key` is the key entry the grant's root block verified against at the source (§C.3.1). `key` is attested by the exporter, not proven: the digest isn't a signature (Trust, below).
+- **Authors, `via`, grant ids, author signatures, creation times, `gesture` and `undoes`** are included only with `"authors": true`. With them, history lines carry `grant: gid` (the id only, not §7.1's object), and a bundle carries one grant line `{ "ns", "grant": gid, "root", "stored", "key"?: { "kid", "alg", "pub" } }` per grant its lines name, before the first line that does. Its `ns` is the namespace whose entry first recorded the grant, in the form of `written` below. An exporter that can't fetch a grant leaves `grant` off the lines that would name it. A line naming a grant with no earlier grant line, a second grant line for one grant, or a grant line in a bundle without `"authors": true` rejects the bundle.
 
-- Bundle tools SHOULD verify signatures through §C.3.1's chain against the header's `origin`. A tool holding the source's namespace log, or its operator key history, checks `key` at the revision's position; otherwise it reports the signature as attested, not verified. An importer signs its own steps (§C.3.1); the original signatures stay in the bundle, which its batches' `source` names (§G.4.4).
+- **`written`.** A signature binds the namespace it was written in (§C.3), and history lines name the exporting namespace. A line for a revision written elsewhere, such as one a branch reads through from its base, also carries `written`: that namespace's name, or `{ "origin", "ns" }` when it is in another deployment, as a remote branch's base is. Verifiers use it, and its `origin`, in the signing input.
+
+- **`key`** is the key entry the grant's root block verified against at the source (§C.3.1): a key of the namespace document in force at the first entry that recorded the grant, or else an operator key in force at the `created` of the first revision naming the grant (§C.4). An exporter that can find neither leaves `key` out. `key` is attested by the exporter, not proven: the digest isn't a signature (Trust, below).
+
+- Bundle tools SHOULD verify signatures through §C.3.1's chain against the line's `written` origin, else the header's `origin`. A tool holding the source's namespace log, or its operator key history, checks `key` at the revision's position; otherwise it reports the signature as attested, not verified. An importer signs its own steps (§C.3.1); the original signatures stay in the bundle, which its batches' `source` names (§G.4.4).
 
 - **Never exported:** purged content.
 
@@ -4236,3 +4257,15 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Operator keys** are published as a JWK Set history at the `jwks_uri` of `GET /`, by default `/.well-known/patchlog-keys` (§C.4). Namespace keys aren't listed there: their source is the namespace log.
 
 - Two §C.9 questions are answered and removed.
+
+- **v0.42:** signatures as implemented by the reference (§C.3.1).
+
+- **Gate (§6.2):** signatures are checked at step 2.3, after the retry lookup and the verb, so a retry is answered as first recorded and authorisation failures are still reported first; the signed parent is the one the precondition names; a malformed `Signature` is `400`.
+
+- **Grants:** the endpoint is offered in sealed namespaces, sealed with `pl: { ns, grant }`, and at E3 in the clear with `private` caching, so sealed and E3 bundles can carry grants; a purged namespace answers `410`; in public namespaces grants are public. Resource logs leave `grant` out where none was recorded.
+
+- **Operator keys (§C.4):** the period is the operator's to declare, `from` no later than first use; the set is `application/jwk-set+json`.
+
+- **Bundles (§G.4.1):** history lines name their grant; a line for a revision written in another namespace says where (`written`); how an exporter finds `key` is defined; malformed grant lines reject the bundle. Archives carry grants (§8.6).
+
+- **Query parameters (§7):** a core endpoint accepts only those the spec defines, and flags only `1`; others are `400`. The bundle endpoint takes `authors=1`.
