@@ -2,8 +2,10 @@ package core
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -71,7 +73,35 @@ type ArchiveEntry struct {
 	Author, Created  string
 	Signature        string
 	Gesture, Undoes  string // §7.2, "" if none
-	Blob             *ArchiveBlob
+	// Grant is the id of the grant the entry was written under (§C.3),
+	// "" if none or if no grant line carries it. Its grant line (GrantLine)
+	// comes before the first entry that names it (§8.6, §G.4.1).
+	Grant     string
+	GrantLine *ArchiveGrant
+	Blob      *ArchiveBlob
+}
+
+// ArchiveGrant is a grant line of an archive (§G.4.1): a grant as GET
+// /ns/{ns}/grants/{gid} serves it, with the keys that could have signed its
+// root block, from which the archiver picks the one that verifies.
+type ArchiveGrant struct {
+	// NS is the namespace whose entry first recorded the grant: the
+	// archived namespace, or a base of it (§C.3.1).
+	NS     string
+	ID     string
+	Root   map[string]any
+	Stored []string // base64url blocks, authority first
+	// Keys are the candidates in the order of §G.4.1: the keys of the
+	// namespace document in force at the first entry that recorded the
+	// grant, then the operator keys in force at the created time of the
+	// first revision naming it (§C.4).
+	Keys []ArchiveCandidateKey
+}
+
+// ArchiveCandidateKey is a candidate key of an ArchiveGrant.
+type ArchiveCandidateKey struct {
+	Kid string
+	Pub ed25519.PublicKey
 }
 
 // ArchiveBlob is a blob line of an archive.
@@ -133,6 +163,7 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 		blobsAt[max(from, fromSeq)] = append(blobsAt[max(from, fromSeq)], ids.FromBytes(bid))
 	}
 	brows.Close()
+	grantLines := map[ids.ID]bool{} // grants named by the archive: carried (true) or not
 	emitted := map[ids.ID]bool{}
 	emitBlobs := func(seq int64, yield func(ArchiveEntry) error) error {
 		for _, bid := range blobsAt[seq] {
@@ -180,8 +211,28 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 				if r.kind == kindRev && le.Patches == nil {
 					return fmt.Errorf("revision %s has no patch set to archive", le.ID)
 				}
-				if err := yield(ArchiveEntry{ID: le.ID, Parent: le.Parent, Kind: le.Kind, Patches: le.Patches,
-					Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes}); err != nil {
+				ae := ArchiveEntry{ID: le.ID, Parent: le.Parent, Kind: le.Kind, Patches: le.Patches,
+					Author: le.Author, Created: le.Created, Signature: le.Signature, Gesture: le.Gesture, Undoes: le.Undoes}
+				if r.grantID != nil {
+					// The grant line comes before the first entry that names
+					// the grant (§8.6): archives carry them with the authors.
+					gid := ids.FromBytes(r.grantID)
+					carried, seen := grantLines[gid]
+					if !seen {
+						gl := t.archiveGrant(n, gid, time.UnixMilli(r.created))
+						carried = gl != nil
+						grantLines[gid] = carried
+						if carried {
+							if err := yield(ArchiveEntry{GrantLine: gl}); err != nil {
+								return err
+							}
+						}
+					}
+					if carried {
+						ae.Grant = gid.String()
+					}
+				}
+				if err := yield(ae); err != nil {
 					return err
 				}
 				after = r.seq
@@ -201,6 +252,100 @@ func (t *tx) writeArchive(n *nsRow, name string, res int64, fromSeq int64, h *re
 		res, fromSeq, lastSeq, key, u, t.now.UnixMilli())
 	t.must(err)
 	return u, nil
+}
+
+// archiveGrant builds the grant line of grant gid for an archive of
+// namespace n (§8.6, §G.4.1): the stored grant, the namespace whose entry
+// first recorded it, and the candidate keys. created is the time of the
+// first revision naming it. nil if the stored grant is gone.
+func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant {
+	g, ok := t.storedGrant(gid)
+	if !ok {
+		return nil
+	}
+	out := &ArchiveGrant{NS: n.name, ID: gid.String(), Root: g.Blocks[0].Raw}
+	for _, b := range g.SignedBlocks() {
+		out.Stored = append(out.Stored, base64.RawURLEncoding.EncodeToString(b))
+	}
+	// The first entry that recorded the grant: in the namespace itself, or
+	// in the oldest of its local bases whose log records it, a base's only
+	// up to the at its derived namespace reads it at (§C.3.1).
+	type link struct {
+		n     *nsRow
+		bound sql.NullInt64
+	}
+	var chain []link
+	var bound sql.NullInt64
+	for cur := n; cur != nil && !cur.isShadow(); {
+		chain = append(chain, link{cur, bound})
+		if !cur.base.Valid {
+			break
+		}
+		bound = cur.baseAt
+		cur = t.nsByID(cur.base.Int64)
+	}
+	for i := len(chain) - 1; i >= 0; i-- {
+		var seq, cfg int64
+		var err error
+		if chain[i].bound.Valid {
+			err = t.QueryRow(`SELECT seq, config_seq FROM ns_log WHERE grant_id = ? AND ns = ? AND seq <= ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id, chain[i].bound.Int64).Scan(&seq, &cfg)
+		} else {
+			err = t.QueryRow(`SELECT seq, config_seq FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id).Scan(&seq, &cfg)
+		}
+		if errors.Is(err, sql.ErrNoRows) {
+			continue
+		}
+		t.must(err)
+		out.NS = chain[i].n.name
+		for _, k := range t.config(cfg).Keys {
+			out.Keys = append(out.Keys, ArchiveCandidateKey{Kid: k.Kid, Pub: k.Pub})
+		}
+		break
+	}
+	out.Keys = append(out.Keys, t.operatorKeysAt(created)...)
+	return out
+}
+
+// operatorKeysAt lists the operator keys in force at created (§C.4), as
+// the deployment publishes them (OperatorKeyHistory in a transaction).
+func (t *tx) operatorKeysAt(created time.Time) []ArchiveCandidateKey {
+	o := &t.e.opt
+	type period struct {
+		kid         string
+		pub         ed25519.PublicKey
+		from, until time.Time
+	}
+	var ps []period
+	listed := map[string]bool{}
+	for _, p := range o.OperatorKeyHistory {
+		listed[p.Kid] = true
+		ps = append(ps, period{p.Kid, p.Pub, p.From, p.Until})
+	}
+	var first time.Time
+	for _, k := range o.OperatorKeys {
+		if listed[k.Kid] {
+			continue
+		}
+		if first.IsZero() {
+			// In force from the deployment's first namespace entry, as
+			// Engine.OperatorKeyHistory publishes it.
+			var ms sql.NullInt64
+			t.must(t.QueryRow(`SELECT MIN(created) FROM ns_log WHERE seq = (SELECT MIN(seq) FROM ns_log)`).Scan(&ms))
+			first = t.e.started
+			if ms.Valid {
+				first = time.UnixMilli(ms.Int64).UTC()
+			}
+		}
+		ps = append(ps, period{k.Kid, k.Pub, first, time.Time{}})
+	}
+	var out []ArchiveCandidateKey
+	for _, p := range ps {
+		if created.Before(p.from) || (!p.until.IsZero() && !created.Before(p.until)) {
+			continue
+		}
+		out = append(out, ArchiveCandidateKey{Kid: p.kid, Pub: p.pub})
+	}
+	return out
 }
 
 // archiveURL returns the URL of the newest archive holding revision seq of

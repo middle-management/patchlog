@@ -31,9 +31,15 @@
 //     never re-sends a carried signature: a step's signature is the
 //     importer's own (§C.3.1), and the originals stay in the bundle.
 //   - Grant lines (§G.4.1, §C.3.1): with "authors": true a bundle carries
-//     one line { "ns", "grant", "root", "stored", "key": { "kid", "alg",
+//     one line { "ns", "grant", "root", "stored", "key"?: { "kid", "alg",
 //     "pub" } } per grant its history lines reference, before the first
-//     that does. A history line names its grant in an optional "grant"
+//     that does. Its ns is the namespace whose entry first recorded the
+//     grant, a name or { origin, ns } like "written", and a grant is one
+//     line per bundle whatever its ns; key is left out when the exporter
+//     could find none. A history line for a revision written in another
+//     namespace than its ns (a branch's read-through) carries "written"
+//     (a name, or { origin, ns } for another deployment); signatures bind
+//     it. A history line names its grant in an optional "grant"
 //     member (the grant id); this format decision is needed because the
 //     spec's grant lines are matched to lines by id. A history line whose
 //     "grant" has no grant line before it is rejected. Grant lines are
@@ -86,6 +92,7 @@ import (
 	"fmt"
 	"hash"
 	"io"
+	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -201,6 +208,10 @@ type Line struct {
 	// only with Header.Authors, "" if none is carried. A grant line for it
 	// (same ns) comes earlier in the bundle.
 	Grant string
+	// Written is the namespace the revision was written in when it isn't
+	// the line's ns (§G.4.1): one a branch reads through from its base.
+	// Zero if the line's own ns wrote it. Only with Header.Authors.
+	Written NSRef
 
 	// GrantLine is set on a grant line (§G.4.1): no resource, no history.
 	GrantLine *GrantLine
@@ -217,6 +228,63 @@ type Line struct {
 	Data  []byte
 }
 
+// NSRef names a namespace in the form of the `written` member (§G.4.1): a
+// name, or with Origin set a namespace of another deployment, as a remote
+// branch's base is.
+type NSRef struct{ Origin, NS string }
+
+// IsZero reports an unset reference.
+func (r NSRef) IsZero() bool { return r.NS == "" }
+
+func (r NSRef) value() any {
+	if r.Origin == "" {
+		return r.NS
+	}
+	return map[string]any{"origin": r.Origin, "ns": r.NS}
+}
+
+// Signing returns the origin and namespace a signature of a line binds
+// (§C.3): the line's written namespace and its origin, else the header's
+// origin and the line's own ns.
+func (l *Line) Signing(headerOrigin string) (origin, ns string) {
+	if l.Written.IsZero() {
+		return headerOrigin, l.NS
+	}
+	if l.Written.Origin != "" {
+		return l.Written.Origin, l.Written.NS
+	}
+	return headerOrigin, l.Written.NS
+}
+
+// parseNSRef parses a namespace in the form of `written`.
+func parseNSRef(v any) (NSRef, error) {
+	switch x := v.(type) {
+	case string:
+		if !client.ValidNSName(x) {
+			return NSRef{}, fmt.Errorf("%q is not a namespace name", x)
+		}
+		return NSRef{NS: x}, nil
+	case map[string]any:
+		for k := range x {
+			if k != "origin" && k != "ns" {
+				return NSRef{}, fmt.Errorf("unknown member %q (want { origin, ns })", k)
+			}
+		}
+		o, _ := x["origin"].(string)
+		n, _ := x["ns"].(string)
+		if !validOrigin(o) || !client.ValidNSName(n) {
+			return NSRef{}, fmt.Errorf("want a namespace name or { origin, ns } with an origin and a valid ns")
+		}
+		return NSRef{Origin: o, NS: n}, nil
+	}
+	return NSRef{}, fmt.Errorf("want a namespace name or { origin, ns }")
+}
+
+func validOrigin(o string) bool {
+	u, err := url.Parse(o)
+	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && u.Path == "" && u.RawQuery == "" && u.Fragment == "" && u.User == nil
+}
+
 // KeyEntry is a signer or namespace key entry as a grant line's key gives
 // it: { "kid", "alg", "pub" } (§G.4.1). Alg is "Ed25519", Pub the public
 // key in base64url without padding.
@@ -230,8 +298,17 @@ type GrantLine struct {
 	ID     string         // the grant id, text(trunc160(sha256(canonical(root))))
 	Root   map[string]any // the root block
 	Stored []string       // the token's SignedBlocks in base64url, authority first
-	Key    KeyEntry
+	// Key is the key entry the root block verified against; the zero value
+	// (no Kid) when the exporter could find none, and the line leaves
+	// `key` out.
+	Key KeyEntry
+	// Origin is the deployment of the line's ns, "" for the header's: the
+	// ns of a grant line is a namespace in the form of `written`.
+	Origin string
 }
+
+// HasKey reports whether the line carries a key.
+func (g *GrantLine) HasKey() bool { return g.Key.Kid != "" }
 
 // IsGrant reports a grant line.
 func (l *Line) IsGrant() bool { return l.GrantLine != nil }
@@ -272,8 +349,11 @@ func (l *Line) value() map[string]any {
 		for i, b := range g.Stored {
 			stored[i] = b
 		}
-		return map[string]any{"ns": l.NS, "grant": g.ID, "root": g.Root, "stored": stored,
-			"key": map[string]any{"kid": g.Key.Kid, "alg": g.Key.Alg, "pub": g.Key.Pub}}
+		m := map[string]any{"ns": NSRef{Origin: g.Origin, NS: l.NS}.value(), "grant": g.ID, "root": g.Root, "stored": stored}
+		if g.HasKey() {
+			m["key"] = map[string]any{"kid": g.Key.Kid, "alg": g.Key.Alg, "pub": g.Key.Pub}
+		}
+		return m
 	}
 	m := map[string]any{"ns": l.NS, "resource": l.Resource}
 	if l.IsBlob() {
@@ -300,6 +380,9 @@ func (l *Line) value() map[string]any {
 		if v != "" {
 			m[k] = v
 		}
+	}
+	if !l.Written.IsZero() {
+		m["written"] = l.Written.value()
 	}
 	return m
 }
@@ -527,12 +610,12 @@ func parseLine(v any, authors bool) (*Line, error) {
 		return nil, fmt.Errorf("line is not an object")
 	}
 	l := &Line{}
-	l.NS, _ = m["ns"].(string)
 	if _, has := m["grant"]; has {
 		if _, hasID := m["id"]; !hasID {
 			return parseGrantLine(m, l, authors)
 		}
 	}
+	l.NS, _ = m["ns"].(string)
 	l.Resource, _ = m["resource"].(string)
 	if !client.ValidNSName(l.NS) || !client.ValidResourceName(l.Resource) {
 		return nil, fmt.Errorf("line needs a valid ns and resource")
@@ -602,7 +685,7 @@ func parseLine(v any, authors bool) (*Line, error) {
 	for k := range m {
 		switch k {
 		case "ns", "resource", "id", "parent", "kind", "patches":
-		case "author", "created", "signature", "gesture", "undoes", "grant":
+		case "author", "created", "signature", "gesture", "undoes", "grant", "written":
 			if !authors {
 				return nil, fmt.Errorf("history line carries %q in a bundle without authors", k)
 			}
@@ -621,6 +704,13 @@ func parseLine(v any, authors bool) (*Line, error) {
 		if !validID(l.Grant) {
 			return nil, fmt.Errorf("history line: grant must be a grant id")
 		}
+	}
+	if w, has := m["written"]; has {
+		ref, err := parseNSRef(w)
+		if err != nil {
+			return nil, fmt.Errorf("history line: written: %v", err)
+		}
+		l.Written = ref
 	}
 	for k, dst := range map[string]*string{"gesture": &l.Gesture, "undoes": &l.Undoes} {
 		if v, has := m[k]; has {
@@ -668,10 +758,12 @@ func parseGrantLine(m map[string]any, l *Line, authors bool) (*Line, error) {
 			return nil, fmt.Errorf("grant line: unknown member %q", k)
 		}
 	}
-	if !client.ValidNSName(l.NS) {
-		return nil, fmt.Errorf("grant line needs a valid ns")
+	ref, err := parseNSRef(m["ns"])
+	if err != nil {
+		return nil, fmt.Errorf("grant line needs a valid ns: %v", err)
 	}
-	g := &GrantLine{}
+	l.NS = ref.NS
+	g := &GrantLine{Origin: ref.Origin}
 	g.ID, _ = m["grant"].(string)
 	if !validID(g.ID) {
 		return nil, fmt.Errorf("grant line: grant must be a grant id")
@@ -695,7 +787,14 @@ func parseGrantLine(m map[string]any, l *Line, authors bool) (*Line, error) {
 		}
 		g.Stored = append(g.Stored, str)
 	}
-	km, ok := m["key"].(map[string]any)
+	kv, hasKey := m["key"]
+	if !hasKey {
+		// The exporter found no key (§G.4.1): the chain can't be completed
+		// from the bundle.
+		l.GrantLine = g
+		return l, nil
+	}
+	km, ok := kv.(map[string]any)
 	if !ok {
 		return nil, fmt.Errorf("grant line %s: key must be an object { kid, alg, pub }", g.ID)
 	}
@@ -728,7 +827,7 @@ type checker struct {
 	h      *Header
 	docs   map[string]*docState
 	blobs  map[string]bool // "ns/name blob" of the blob lines seen
-	grants map[string]bool // "ns\x00grant" of the grant lines seen
+	grants map[string]bool // ids of the grant lines seen
 	n      int             // lines checked, header included
 	hash   hash.Hash
 }
@@ -749,19 +848,20 @@ func (c *checker) line(l *Line) error {
 	fail := func(format string, args ...any) error {
 		return &Error{Line: c.n, Key: k, Msg: fmt.Sprintf(format, args...)}
 	}
-	if _, ok := c.h.At[l.NS]; !ok {
-		return fail("namespace %s has no at in the header", l.NS)
-	}
 	if g := l.GrantLine; g != nil {
+		// A grant line's ns is where the grant was first recorded, which
+		// may be a base the header has no at for.
 		if !c.h.Authors {
 			return fail("a grant line in a bundle without authors")
 		}
-		gk := l.NS + "\x00" + g.ID
-		if c.grants[gk] {
-			return fail("grant %s comes more than once for %s", g.ID, l.NS)
+		if c.grants[g.ID] {
+			return fail("grant %s comes more than once", g.ID)
 		}
-		c.grants[gk] = true
+		c.grants[g.ID] = true
 		return nil
+	}
+	if _, ok := c.h.At[l.NS]; !ok {
+		return fail("namespace %s has no at in the header", l.NS)
 	}
 	info, ok := c.h.Docs[k]
 	if !ok {
@@ -798,7 +898,7 @@ func (c *checker) line(l *Line) error {
 	if info.History != Full {
 		return fail("a history line for a %s document", info.History)
 	}
-	if l.Grant != "" && !c.grants[l.NS+"\x00"+l.Grant] {
+	if l.Grant != "" && !c.grants[l.Grant] {
 		return fail("line %s names grant %s, which has no grant line before it (§G.4.1)", l.ID, l.Grant)
 	}
 	want := c.h.Requires[k] // "" = genesis
@@ -1017,6 +1117,7 @@ func (w *Writer) Line(l Line) error {
 	}
 	if !w.h.Authors {
 		l.Author, l.Created, l.Signature, l.Gesture, l.Undoes, l.Grant = "", "", "", "", "", ""
+		l.Written = NSRef{}
 	}
 	if l.IsGrant() {
 		if err := w.c.line(&l); err != nil {

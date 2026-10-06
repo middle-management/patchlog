@@ -15,7 +15,8 @@
 //	{destination}/{ns}/{name}/{H}.jsonl
 //
 // (core.ArchiveKey). It holds the entries from the previous horizon (or
-// genesis) up to the one before H, with authors; an incremental archive names
+// genesis) up to the one before H, with authors and the grant lines of the
+// grants its entries name (§8.6); an incremental archive names
 // the last entry of the previous one in `requires`, so a resource's archives
 // chain back to genesis. Archives are written to a temporary file in the
 // same directory, synced and renamed, so a URL never holds a partial bundle.
@@ -33,6 +34,7 @@ package archive
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -45,6 +47,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Dir is a file:// archiver.
@@ -236,8 +239,22 @@ func Encode(ctx context.Context, w io.Writer, b *core.ArchiveBundle) error {
 		if e.Blob != nil {
 			return bw.Line(bundle.Line{NS: b.NS, Resource: b.Name, Blob: e.Blob.ID, Type: e.Blob.Type, Nonce: e.Blob.Nonce, Data: e.Blob.Data})
 		}
+		if g := e.GrantLine; g != nil {
+			// A grant line (§8.6, §G.4.1), with the key that verifies its
+			// root block among the candidates; left out if none does.
+			gl := &bundle.GrantLine{ID: g.ID, Root: g.Root, Stored: g.Stored}
+			cands := make([]bundle.KeyEntry, len(g.Keys))
+			for i, k := range g.Keys {
+				cands[i] = bundle.KeyEntry{Kid: k.Kid, Alg: sig.Alg, Pub: base64.RawURLEncoding.EncodeToString(k.Pub)}
+			}
+			if k, ok := bundle.FindRootKey(g.Stored, g.NS, cands); ok {
+				gl.Key = k
+			}
+			return bw.Line(bundle.Line{NS: g.NS, GrantLine: gl})
+		}
 		return bw.Line(bundle.Line{NS: b.NS, Resource: b.Name, ID: e.ID, Parent: e.Parent, Kind: e.Kind,
-			Patches: e.Patches, Author: e.Author, Created: e.Created, Signature: e.Signature, Gesture: e.Gesture, Undoes: e.Undoes})
+			Patches: e.Patches, Author: e.Author, Created: e.Created, Signature: e.Signature, Gesture: e.Gesture, Undoes: e.Undoes,
+			Grant: e.Grant})
 	})
 	if err != nil {
 		return err
@@ -367,6 +384,11 @@ func readArchive(ctx context.Context, e *core.Engine, o Opener, u, ns, name stri
 		}
 		if err != nil {
 			return err
+		}
+		if l.IsGrant() {
+			// Grant lines keep archived signatures verifiable (§8.6); a
+			// restore re-inserts patch sets only.
+			continue
 		}
 		if l.IsBlob() && l.NS == ns && l.Resource == name {
 			// The bytes of attachments pruning ended (§7.8), verified

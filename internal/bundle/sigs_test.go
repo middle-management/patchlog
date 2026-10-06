@@ -62,7 +62,13 @@ func storedBlocks(t *testing.T, g *grant.Grant) []string {
 // mint mints a root grant signed by issuer, listing signers.
 func mint(t *testing.T, issuer ed25519.PrivateKey, kid, sub string, signers ...sig.Key) *grant.Grant {
 	t.Helper()
-	root := map[string]any{"kid": kid, "sub": sub, "ns": []any{"matches"}, "can": []any{"create", "append", "delete", "read"},
+	return mintFor(t, issuer, kid, sub, "matches", signers...)
+}
+
+// mintFor is mint for a grant naming namespace ns.
+func mintFor(t *testing.T, issuer ed25519.PrivateKey, kid, sub, ns string, signers ...sig.Key) *grant.Grant {
+	t.Helper()
+	root := map[string]any{"kid": kid, "sub": sub, "ns": []any{ns}, "can": []any{"create", "append", "delete", "read"},
 		"exp": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}
 	if len(signers) > 0 {
 		var es []any
@@ -494,17 +500,27 @@ func TestExportGrantLinesAndSourceVerification(t *testing.T) {
 			}
 		}
 	}
-	if len(order) != 2 || order[0] != ga.ID().String() || order[1] != gb.ID().String() {
-		t.Fatalf("grant lines %v, want alice's then bob's", order)
+	// Carol's grant is carried without a key: nobody can find the key that
+	// signed it.
+	if len(order) != 3 || order[0] != ga.ID().String() || order[1] != gb.ID().String() || order[2] != gc.ID().String() {
+		t.Fatalf("grant lines %v, want alice's, bob's then carol's", order)
 	}
-	if sum.Lines != 6+2 { // 5 revisions and a tombstone, and 2 grant lines
+	for _, l := range ls[1:] {
+		var m map[string]any
+		json.Unmarshal(l, &m)
+		_, hasKey := m["key"]
+		if m["stored"] != nil && (m["grant"] == gc.ID().String()) == hasKey {
+			t.Errorf("grant line %s: key present is %v", m["grant"], hasKey)
+		}
+	}
+	if sum.Lines != 6+3 { // 5 revisions and a tombstone, and 3 grant lines
 		t.Fatalf("lines %d", sum.Lines)
 	}
 	if len(plan.Notes) != 2 {
 		t.Fatalf("notes: %v", plan.Notes)
 	}
 	joined := strings.Join(plan.Notes, "\n")
-	if !strings.Contains(joined, gc.ID().String()) || !strings.Contains(joined, gd.ID().String()) || !strings.Contains(joined, "404") {
+	if !strings.Contains(joined, gc.ID().String()) || !strings.Contains(joined, "without a key") || !strings.Contains(joined, gd.ID().String()) || !strings.Contains(joined, "404") {
 		t.Fatalf("notes %v", plan.Notes)
 	}
 

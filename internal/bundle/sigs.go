@@ -98,11 +98,21 @@ const (
 // rev (§C.3.1). reason explains a verdict other than KeyInForce.
 type KeyChecker func(ctx context.Context, ns string, key KeyEntry, rev *Line) (v KeyVerdict, reason string)
 
+// KeyFinder supplies the keys that could have signed the root block of a
+// grant whose grant line leaves `key` out (§G.4.1): the keys named kid that
+// were in force at the revision's position in ns's log or, for an operator
+// key, at its created time. The verifier tries each against the root block.
+type KeyFinder func(ctx context.Context, ns, kid string, rev *Line) []KeyEntry
+
 // VerifyOptions configure VerifyWith.
 type VerifyOptions struct {
 	// Keys, if set, completes the chain at its last link (see
 	// SourceKeyChecker); without it every complete chain is attested.
 	Keys KeyChecker
+	// Finder, if set, supplies the key of a grant line without one; the
+	// chain is then complete only if a key it names verifies the root
+	// block, and such a key counts as in force (SourceKeyChecker's finder).
+	Finder KeyFinder
 	// OnSignature, if set, is called with the status of every revision of
 	// a bundle with authors, in bundle order.
 	OnSignature func(SigResult)
@@ -114,6 +124,10 @@ type grantState struct {
 	err     string // "" if the grant is genuine under its key
 	signers []sig.Signer
 	sub     string
+	// gr is the parsed stored grant; it is set when the line carries no
+	// key, so that a finder's key can be tried against its root block.
+	gr *grant.Grant
+	ns string // the grant line's namespace
 }
 
 // SigVerifier checks the signatures of a bundle's lines as they are read.
@@ -141,7 +155,7 @@ func (v *SigVerifier) Line(l *Line) {
 	switch {
 	case l.IsGrant():
 		gs := checkGrantLine(l)
-		v.grants[l.NS+"\x00"+l.GrantLine.ID] = gs
+		v.grants[l.GrantLine.ID] = gs
 		v.rep.Grants++
 		if gs.err != "" {
 			v.rep.BadGrants = append(v.rep.BadGrants, l.NS+"/"+l.GrantLine.ID+": "+gs.err)
@@ -183,7 +197,7 @@ func (v *SigVerifier) history(l *Line) {
 		fail(SigUnverifiable, "the revision names no grant, so its signer's key can't be found")
 		return
 	}
-	gs := v.grants[l.NS+"\x00"+l.Grant]
+	gs := v.grants[l.Grant]
 	if gs == nil {
 		fail(SigUnverifiable, "no grant line for %s", l.Grant)
 		return
@@ -211,14 +225,37 @@ func (v *SigVerifier) history(l *Line) {
 	if l.Kind == "rev" {
 		body = jsonv.Canonical(l.Patches)
 	}
-	if !sig.Verify(signer, s, sig.Digest(v.origin, l.NS, l.Resource, parent, body)) {
-		fail(SigFailed, "the signature doesn't verify for %s %s/%s at origin %s", l.NS, l.Resource, l.ID, v.origin)
+	origin, ns := l.Signing(v.origin)
+	if !sig.Verify(signer, s, sig.Digest(origin, ns, l.Resource, parent, body)) {
+		fail(SigFailed, "the signature doesn't verify for %s %s/%s at origin %s", ns, l.Resource, l.ID, origin)
+		return
+	}
+	if gs.gr != nil {
+		// The grant line has no key (§G.4.1): only a finder can complete
+		// the chain, with a key that verifies the root block.
+		if v.opt.Finder == nil {
+			fail(SigUnverifiable, "the grant line for %s names no key, so the chain can't be completed from the bundle", l.Grant)
+			return
+		}
+		kid := gs.gr.Blocks[0].Kid
+		for _, k := range v.opt.Finder(v.ctx, ns, kid, l) {
+			pub, err := base64.RawURLEncoding.Strict().DecodeString(k.Pub)
+			if err != nil || len(pub) != ed25519.PublicKeySize || k.Kid != kid {
+				continue
+			}
+			if verifyRootSignature(gs.gr, gs.ns, ed25519.PublicKey(pub)) == nil {
+				r.Status = SigVerified
+				v.done(r)
+				return
+			}
+		}
+		fail(SigUnverifiable, "the grant line for %s names no key, and no key named %q in the source's namespace log or operator key history verifies its root block", l.Grant, kid)
 		return
 	}
 	// The chain is complete up to the grant line's key.
 	r.Status = SigAttested
 	if v.opt.Keys != nil {
-		switch verdict, why := v.opt.Keys(v.ctx, l.NS, gs.line.Key, l); verdict {
+		switch verdict, why := v.opt.Keys(v.ctx, ns, gs.line.Key, l); verdict {
 		case KeyInForce:
 			r.Status = SigVerified
 		case KeyNotInForce:
@@ -257,7 +294,7 @@ func storedContainer(stored []string) ([]byte, error) {
 // string, and the signers of the root block.
 func checkGrantLine(l *Line) *grantState {
 	g := l.GrantLine
-	gs := &grantState{line: g}
+	gs := &grantState{line: g, ns: l.NS}
 	bad := func(format string, args ...any) *grantState {
 		gs.err = fmt.Sprintf(format, args...)
 		return gs
@@ -274,6 +311,17 @@ func checkGrantLine(l *Line) *grantState {
 	}
 	if id := gr.ID().String(); id != g.ID {
 		return bad("id is %s, not the grant_block's %s", g.ID, id)
+	}
+	if !g.HasKey() {
+		// Everything but the authority block's signature, which needs a key.
+		gs.gr = gr
+		gs.sub = root.Sub
+		if raw, has := g.Root["signers"]; has {
+			if gs.signers, err = sig.ParseSigners(raw); err != nil {
+				return bad("signers: %v", err)
+			}
+		}
+		return gs
 	}
 	if root.Kid != g.Key.Kid {
 		return bad("the root block names key %q, the line's key is %q", root.Kid, g.Key.Kid)
@@ -380,18 +428,32 @@ func VerifyWith(ctx context.Context, r io.Reader, opt VerifyOptions) (*Summary, 
 // reads: the revision's position in the source namespace's log, whose
 // namespace document in force there must list the key; or, for an operator
 // key, the deployment's JWK Set, whose entry must have been in force at the
-// revision's created time (§C.3.1, §C.4). It returns KeyUnchecked where the
-// source can't tell: the revision isn't in the namespace's own log (a
-// branch's read-through history), or the source can't be read.
+// revision's created time (§C.3.1, §C.4). The namespace is the one the
+// revision was written in (the line's written, else its ns), so a branch's
+// read-through revision is placed in its base's log. It returns
+// KeyUnchecked where the source can't tell: the revision isn't in that
+// namespace's log, was written at another deployment, or the source can't
+// be read.
 func SourceKeyChecker(c *client.Client) KeyChecker {
+	chk, _ := SourceKeys(c)
+	return chk
+}
+
+// SourceKeys is SourceKeyChecker with the matching KeyFinder, for grant
+// lines that leave `key` out (§G.4.1): the finder lists the keys named kid
+// that the source's namespace document at the revision's position, or its
+// operator key history at the revision's created time, has.
+func SourceKeys(c *client.Client) (KeyChecker, KeyFinder) {
 	sk := &sourceKeys{c: c, logs: map[string]*nsPositions{}, docs: map[string][]KeyEntry{}}
-	return sk.check
+	return sk.check, sk.find
 }
 
 type nsPositions struct {
 	err     error
 	pos     map[string]string // revision id → the namespace log entry that wrote it
 	configs []string          // the entries that changed the namespace document, genesis first
+	index   map[string]int    // entry id → its place in the log, oldest first
+	grants  map[string]string // grant id → the first entry that recorded it
 }
 
 type sourceKeys struct {
@@ -410,7 +472,7 @@ func (sk *sourceKeys) positions(ctx context.Context, ns string) *nsPositions {
 	if p, ok := sk.logs[ns]; ok {
 		return p
 	}
-	p := &nsPositions{pos: map[string]string{}}
+	p := &nsPositions{pos: map[string]string{}, index: map[string]int{}, grants: map[string]string{}}
 	sk.logs[ns] = p
 	h, err := sk.c.NSHead(ctx, ns)
 	if err != nil {
@@ -422,7 +484,13 @@ func (sk *sourceKeys) positions(ctx context.Context, ns string) *nsPositions {
 		p.err = err
 		return p
 	}
-	for _, e := range log {
+	for i, e := range log {
+		p.index[e.ID] = i
+		if e.Grant != nil && e.Grant.ID != "" {
+			if _, seen := p.grants[e.Grant.ID]; !seen {
+				p.grants[e.Grant.ID] = e.ID
+			}
+		}
 		switch e.Kind {
 		case "config":
 			p.configs = append(p.configs, e.ID)
@@ -467,9 +535,63 @@ func (sk *sourceKeys) keysAt(ctx context.Context, ns, entry string) ([]KeyEntry,
 	return out, nil
 }
 
+// find implements KeyFinder.
+func (sk *sourceKeys) find(ctx context.Context, ns, kid string, rev *Line) []KeyEntry {
+	sk.mu.Lock()
+	defer sk.mu.Unlock()
+	if !rev.Written.IsZero() && rev.Written.Origin != "" {
+		return nil // another deployment than the source
+	}
+	var out []KeyEntry
+	if p := sk.positions(ctx, ns); p.err == nil {
+		if entry, ok := p.pos[rev.ID]; ok {
+			if keys, err := sk.keysAt(ctx, ns, entry); err == nil {
+				for _, k := range keys {
+					if k.Kid == kid {
+						out = append(out, k)
+					}
+				}
+			}
+		}
+	}
+	return append(out, sk.operatorKeysAt(ctx, kid, rev.Created)...)
+}
+
+// operatorKeysAt lists the operator keys named kid that were in force at
+// created (§C.4); none if the history can't be read or created isn't a time.
+func (sk *sourceKeys) operatorKeysAt(ctx context.Context, kid, created string) []KeyEntry {
+	if !sk.jwksOK {
+		sk.jwks, sk.jwksErr = sk.c.OperatorKeys(ctx)
+		sk.jwksOK = true
+	}
+	at, err := time.Parse(time.RFC3339, created)
+	if err != nil {
+		return nil
+	}
+	var out []KeyEntry
+	for _, k := range sk.jwks {
+		if k.Kid != kid {
+			continue
+		}
+		if from, err := time.Parse(time.RFC3339, k.From); err == nil && at.Before(from) {
+			continue
+		}
+		if k.Until != "" {
+			if until, err := time.Parse(time.RFC3339, k.Until); err == nil && !at.Before(until) {
+				continue
+			}
+		}
+		out = append(out, KeyEntry{Kid: k.Kid, Alg: sig.Alg, Pub: base64.RawURLEncoding.EncodeToString(k.Pub)})
+	}
+	return out
+}
+
 func (sk *sourceKeys) check(ctx context.Context, ns string, key KeyEntry, rev *Line) (KeyVerdict, string) {
 	sk.mu.Lock()
 	defer sk.mu.Unlock()
+	if !rev.Written.IsZero() && rev.Written.Origin != "" {
+		return KeyUnchecked, "the revision was written at " + rev.Written.Origin + ", not at the source deployment"
+	}
 	p := sk.positions(ctx, ns)
 	if p.err != nil {
 		return KeyUnchecked, "the source's namespace log can't be read: " + p.err.Error()
@@ -513,7 +635,7 @@ func (sk *sourceKeys) check(ctx context.Context, ns string, key KeyEntry, rev *L
 		}
 	}
 	if _, ok := p.pos[rev.ID]; !ok {
-		return KeyUnchecked, "the revision isn't in the source namespace's own log, so its position is unknown (a branch's read-through history?)"
+		return KeyUnchecked, "the revision isn't in the source namespace's own log, so its position is unknown"
 	}
 	if sk.jwksErr != nil {
 		return KeyUnchecked, "the key isn't in the namespace document at that position, and the operator key history can't be read: " + sk.jwksErr.Error()
