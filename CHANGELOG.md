@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.14.0
 
 Implements spec **v0.44**: reverse-reference queries in the indexing service (Addendum A).
 
