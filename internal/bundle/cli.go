@@ -148,7 +148,7 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if len(nss) == 0 {
 		return fmt.Errorf("export: -ns is required")
 	}
-	opt := ExportOptions{External: splitList(*external), Authors: *authors, UntypedRefs: *untyped, ForeignParents: *foreign, Plaintext: *plaintext}
+	opt := ExportOptions{Bearer: *bearer, External: splitList(*external), Authors: *authors, UntypedRefs: *untyped, ForeignParents: *foreign, Plaintext: *plaintext}
 	for _, r := range recipients {
 		pub, err := LoadRecipient(r)
 		if err != nil {
@@ -160,6 +160,7 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if err != nil {
 		return err
 	}
+	opt.Identity = identity
 	switch *mode {
 	case "history", "full":
 		opt.Mode = Full
@@ -490,7 +491,7 @@ func cliVerify(args []string, stdout io.Writer) error {
 		if err != nil {
 			return err
 		}
-		vo.Keys = SourceKeyChecker(sc)
+		vo.Keys, vo.Finder = SourceKeys(sc)
 	}
 	var results []SigResult
 	if *perRev {

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/http"
 	"sort"
 	"strings"
 	"time"
@@ -81,6 +82,15 @@ type ExportOptions struct {
 	Plaintext bool
 	// Now overrides the clock for the header's created.
 	Now func() time.Time
+	// Bearer, HTTP and Identity are for reading the grants of sealed
+	// namespaces (§C.3.1), which the client doesn't: Bearer is the grant
+	// the exporter's client sends, HTTP the transport (default
+	// http.DefaultClient), and Identity unwraps the epoch keys the grant's
+	// enc names (§E.2.3). Without Bearer a sealed grant is read without
+	// credentials, which works only where the namespace is public.
+	Bearer   string
+	HTTP     *http.Client
+	Identity *ecdh.PrivateKey
 }
 
 // keyringName is the reserved keyring resource of an e2e namespace
@@ -802,10 +812,14 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 					return nil, err
 				}
 				l := HistoryLine(d.NS, d.Name, e, p.opt.Authors)
+				var writtenOK = true
 				if ge != nil {
-					if gid := grantEntry(e); gid != "" {
+					// A revision written in a base, which a branch reads
+					// through, says where (§G.4.1).
+					l.Written, writtenOK = ge.writtenIn(ctx, d.NS, e.ID)
+					if gid := grantEntry(e); gid != "" && writtenOK {
 						before := ge.n
-						ok, err := ge.ensure(ctx, bw, d.NS, gid, e)
+						ok, err := ge.ensure(ctx, bw, d.NS, gid, e, l.Written)
 						if err != nil {
 							return nil, err
 						}
