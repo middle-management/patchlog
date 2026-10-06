@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.11.1
 
 **Fixes:**
 - **`GET /ns/{ns}/rev/{at}/heads` pages in time proportional to the page, not the
