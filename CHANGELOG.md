@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.12.0
 
 Implements spec **v0.42**, which settles the reference's v0.41 notes on signatures.
 
