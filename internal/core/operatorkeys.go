@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/grant"
 )
 
 // Operator key history (§C.4). A deployment publishes its operator keys as
@@ -19,7 +21,10 @@ import (
 //
 // The history is configuration: Options.OperatorKeyHistory lists every
 // key the deployment has had with its period, retired ones included, which
-// are published but no longer accepted. A key of Options.OperatorKeys that
+// are published but no longer accepted. A key past its until authorises
+// nothing (§C.4): an operator key the history gives an until is refused
+// from that time on (operatorKeys), judged against the current time, so a
+// key can be scheduled to retire. A key of Options.OperatorKeys that
 // the history doesn't list is published as in force from the deployment's
 // first namespace entry (the earliest time anything it signed can have
 // been used here), or from the time the server started if there is none
@@ -31,6 +36,33 @@ type OperatorKeyPeriod struct {
 	Kid         string
 	Pub         ed25519.PublicKey
 	From, Until time.Time
+}
+
+// operatorKeys is Options.OperatorKeys without the keys past their until
+// in the history (§C.4): nil if none are configured, else possibly empty.
+func (t *tx) operatorKeys() []grant.Key {
+	keys := t.e.opt.OperatorKeys
+	if len(keys) == 0 || len(t.e.opt.OperatorKeyHistory) == 0 {
+		return keys
+	}
+	out := make([]grant.Key, 0, len(keys))
+	for _, k := range keys {
+		if !operatorKeyRetired(t.e.opt.OperatorKeyHistory, k.Kid, t.now) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// operatorKeyRetired reports whether the history gives kid an until at or
+// before now.
+func operatorKeyRetired(hist []OperatorKeyPeriod, kid string, now time.Time) bool {
+	for _, p := range hist {
+		if p.Kid == kid {
+			return !p.Until.IsZero() && !now.Before(p.Until)
+		}
+	}
+	return false
 }
 
 // DefaultJWKSPath is where the operator key history is served by default

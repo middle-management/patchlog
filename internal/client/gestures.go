@@ -40,13 +40,13 @@ type GestureEntry struct {
 }
 
 // GesturesPage fetches one page of GET /ns/{ns}/gestures/{gesture} after
-// since ("" for the first page): its entries, oldest first, and next, the
-// since of the following page, or "" on the last one. The list isn't
+// after ("" for the first page; sent as ?after=, §7.4): its entries,
+// oldest first, and next, the after of the following page, or "" on the last one. The list isn't
 // immutable: a later read may find more. A deployment that doesn't offer
 // the endpoint, or a sealed or e2e namespace, answers 404 (IsNotFound); a
 // grant without unrestricted read 403. Clients then scan the logs they
 // follow instead (§11.2).
-func (c *Client) GesturesPage(ctx context.Context, ns, gesture, since string) (entries []GestureEntry, next string, err error) {
+func (c *Client) GesturesPage(ctx context.Context, ns, gesture, after string) (entries []GestureEntry, next string, err error) {
 	if err := checkNS(ns); err != nil {
 		return nil, "", err
 	}
@@ -54,8 +54,8 @@ func (c *Client) GesturesPage(ctx context.Context, ns, gesture, since string) (e
 		return nil, "", fmt.Errorf("client: invalid gesture id %q", gesture)
 	}
 	var q url.Values
-	if since != "" {
-		q = url.Values{"since": {since}}
+	if after != "" {
+		q = url.Values{"after": {after}}
 	}
 	r, err := c.do(ctx, "GET", "/ns/"+ns+"/gestures/"+gesture, q, nil)
 	if err != nil {

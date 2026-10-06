@@ -237,11 +237,11 @@ func TestV039GesturesEndpoint(t *testing.T) {
 	if m["resource"] != "a" || m["id"] != a0 || m["kind"] != "rev" || m["gesture"] != gA || m["author"] != "user:root" || m["ns_id"] == nil {
 		t.Fatalf("entry %v", m)
 	}
-	p2, next := list("/ns/sec/gestures/"+gA+"?since="+next, f.adminG)
+	p2, next := list("/ns/sec/gestures/"+gA+"?after="+next, f.adminG)
 	if len(p2) != 2 || next != "" || p2[0].(map[string]any)["id"] != b0 || p2[0].(map[string]any)["undoes"] != gA || p2[1].(map[string]any)["resource"] != "c" {
 		t.Fatalf("page 2 %v %q", p2, next)
 	}
-	expectCode(t, e.get("/ns/sec/gestures/"+gA+"?since=a/"+b0, f.adminG), 404, "not_found")
+	expectCode(t, e.get("/ns/sec/gestures/"+gA+"?after=a/"+b0, f.adminG), 404, "not_found")
 	expectCode(t, e.get("/ns/sec/gestures/NOPE", f.adminG), 400, "bad_input")
 	if none, _ := list("/ns/sec/gestures/"+gC, f.adminG); len(none) != 0 {
 		t.Fatalf("unknown gesture %v", none)
@@ -265,7 +265,7 @@ func TestV039GesturesEndpoint(t *testing.T) {
 	// A purged resource is left out.
 	expect(t, e.purge("sec", "c", e.head("sec", "c", f.adminG), f.adminG), 204)
 	p1, _ = list("/ns/sec/gestures/"+gA, f.adminG)
-	p2, _ = list("/ns/sec/gestures/"+gA+"?since=a/"+a1, f.adminG)
+	p2, _ = list("/ns/sec/gestures/"+gA+"?after=a/"+a1, f.adminG)
 	if len(p1)+len(p2) != 3 {
 		t.Fatalf("after purge %v %v", p1, p2)
 	}

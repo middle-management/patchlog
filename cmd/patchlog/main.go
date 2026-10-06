@@ -134,7 +134,7 @@ func serve(args []string) {
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
 	var opHistory multi
-	fs.Var(&opHistory, "operator-key-history", "KID=PUB,FROM[,UNTIL]: an operator key and the RFC 3339 period it was in force, published in the JWK Set at jwks_uri (§C.4); list retired keys here too, which are published but no longer accepted (repeatable; an -operator-key not listed is published as in force since the deployment's first entry)")
+	fs.Var(&opHistory, "operator-key-history", "KID=PUB,FROM[,UNTIL]: an operator key and the RFC 3339 period it was in force, published in the JWK Set at jwks_uri (§C.4); list retired keys here too, which are published but no longer accepted; a key past its UNTIL authorises nothing from then on, even as an -operator-key (repeatable; FROM must be no later than the first entry written under a grant the key signed; an -operator-key not listed is published as in force since the deployment's first entry)")
 	jwksURI := fs.String("jwks-uri", "", "the jwks_uri GET / publishes (§C.4); default <origin>"+core.DefaultJWKSPath+", which this server serves")
 	archiveDef := fs.String("archive", "", "default pruning archive destination, a file:// directory (§8.6)")
 	var archiveRoots multi

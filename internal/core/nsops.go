@@ -431,7 +431,7 @@ func (t *tx) writeConfig(req Request, cc ConfigChange) (*WriteResult, error) {
 // 412: an operator grant may create namespaces (§C.4), and otherwise the
 // caller needs config on the namespace itself.
 func (t *tx) authorizeTaken(n *nsRow, req Request) *Error {
-	if keys := t.e.opt.OperatorKeys; len(keys) > 0 {
+	if keys := t.operatorKeys(); len(keys) > 0 {
 		if a, err := t.authenticate(n.name, nil, nil, req.Cred, keys); err == nil && (a.verified == nil || a.star) {
 			return nil
 		}
@@ -448,7 +448,7 @@ func (t *tx) createNamespace(req Request, cc ConfigChange) (*WriteResult, *Error
 	if !ValidNSName(req.NS) {
 		return nil, badInput("invalid namespace name")
 	}
-	keys := t.e.opt.OperatorKeys
+	keys := t.operatorKeys()
 	if keys == nil {
 		keys = []grant.Key{}
 	}
@@ -777,10 +777,10 @@ func (t *tx) purgeReach(n *nsRow) map[int64]bool {
 func (t *tx) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, operator bool, err *Error) {
 	t.reqCreds = req.anyCreds()
 	a, err = t.authenticate(n.name, n, cfg, req.Cred, nil)
-	if err == nil || !force || len(t.e.opt.OperatorKeys) == 0 {
+	if err == nil || !force || len(t.operatorKeys()) == 0 {
 		return a, false, err
 	}
-	if oa, oerr := t.authenticate(n.name, nil, nil, req.Cred, t.e.opt.OperatorKeys); oerr == nil {
+	if oa, oerr := t.authenticate(n.name, nil, nil, req.Cred, t.operatorKeys()); oerr == nil {
 		return oa, true, nil
 	}
 	return nil, false, err

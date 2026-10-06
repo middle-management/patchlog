@@ -27,7 +27,7 @@ import (
 //     nothing of their content is left to undo (§8.3).
 //   - Paged as in §7.1, a page of at most the log page size. The cursor is
 //     "{resource}/{id}" of a page's last entry, sent as X-Log-Next and as
-//     the next page's since: ids repeat across resources (§3.3), resource
+//     the next page's ?after= (§7.4): ids repeat across resources (§3.3), resource
 //     names never contain "/" (§3.6). The list grows, so the last page is
 //     the one without X-Log-Next, and nothing is cached (no-store).
 //   - It needs unrestricted read on the namespace, as branching does
@@ -44,7 +44,7 @@ type GesturePage struct {
 }
 
 // Gestures lists the revisions and tombstones of ns written with gesture
-// or undoing it, after since ("" for the first page; else the Next of the
+// or undoing it, after since (?after=; "" for the first page, else the Next of the
 // previous page), oldest first (§7.4).
 func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred Credentials) (*GesturePage, error) {
 	if !ValidGesture(gesture) {

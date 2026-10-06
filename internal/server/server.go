@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -85,7 +86,63 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, &core.Error{Status: 400, Body: map[string]any{"code": "bad_input", "message": "non-canonical URL"}})
 		return
 	}
+	if _, pattern := s.mux.Handler(r); pattern != "" {
+		if err := checkQuery(pattern, r.URL.RawQuery); err != nil {
+			writeErr(w, err)
+			return
+		}
+	}
 	s.mux.ServeHTTP(w, r)
+}
+
+// flag marks a query parameter that takes only the value 1 (§7).
+const flag = "1"
+
+// queryParams lists, per route, the query parameters the spec defines for
+// it (§7): a parameter maps to "" for any value, or to the one value it
+// takes. Routes not listed take none. The JWKS (§C.4) isn't checked: like
+// the services of the addenda, it isn't an endpoint of the core API.
+// Signed-URL grant parameters (§C.5) never reach the origin: the edge that
+// verifies them strips them before forwarding.
+var queryParams = map[string]map[string]string{
+	"GET /r/{ns}/{name}/rev/{id}/log": {"since": ""},                           // §7.1
+	"GET /r/{ns}/{name}/log":          {"since": "", "live": "", "cursor": ""}, // §7.7 (longPoll checks live)
+	"GET /r/{ns}/{name}/events":       {"since": ""},                           // §7.3
+	"POST /r/{ns}/{name}/purge":       {"force": flag},                         // §6.1, §8.3
+	"GET /ns/{ns}/rev/{id}/log":       {"since": ""},                           // §7.4
+	"GET /ns/{ns}/rev/{id}/heads":     {"after": ""},                           // §7.4
+	"GET /ns/{ns}/log":                {"since": "", "live": "", "cursor": ""}, // §7.7
+	"GET /ns/{ns}/events":             {"since": ""},                           // §7.4
+	"GET /ns/{ns}/gestures/{gesture}": {"after": ""},                           // §7.4
+	"POST /ns/{ns}/batch":             {"dry-run": flag},                       // §7.5
+	"POST /ns/{ns}/purge":             {"force": flag},                         // §8.5
+	"GET " + core.DefaultJWKSPath:     nil,                                     // §C.4: not checked
+}
+
+// checkQuery answers 400 bad_input for a query parameter the route doesn't
+// define, a repeated one, or a flag with a value other than 1: request-shape
+// errors, answered before step 1 and not cached (§7, §6.2).
+func checkQuery(pattern, raw string) error {
+	allowed, listed := queryParams[pattern]
+	if raw == "" || listed && allowed == nil {
+		return nil
+	}
+	q, err := url.ParseQuery(raw)
+	if err != nil {
+		return badInput("malformed query string")
+	}
+	for k, vs := range q {
+		want, ok := allowed[k]
+		switch {
+		case !ok:
+			return badInput(fmt.Sprintf("unknown query parameter %q (§7)", k))
+		case len(vs) > 1:
+			return badInput(fmt.Sprintf("query parameter %q given more than once (§7)", k))
+		case want != "" && vs[0] != want:
+			return badInput(fmt.Sprintf("query parameter %q takes only the value %s (§7)", k, want))
+		}
+	}
+	return nil
 }
 
 // root is GET /: the spec version the deployment implements (§7), whether
@@ -113,7 +170,8 @@ func (s *Server) operatorKeys(w http.ResponseWriter, r *http.Request) {
 
 // nsGrant is GET /ns/{ns}/grants/{gid} (§C.3.1): a grant recorded by an
 // entry of the namespace or of its local bases, in its non-bearer form.
-// Immutable.
+// Immutable; a JWE in sealed namespaces (§E.2.2), and private rather than
+// publicly cached in end-to-end ones (§9).
 func (s *Server) nsGrant(w http.ResponseWriter, r *http.Request) {
 	ns := r.PathValue("ns")
 	if err := validNames(ns, ""); err != nil {
@@ -128,7 +186,21 @@ func (s *Server) nsGrant(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if !s.cache(w, r, ccImmutable, g.Public, "ns:"+ns) {
+	if g.Private {
+		// Not the immutable class: no shared cache, edge included, keeps
+		// a copy (§C.3.1, §9).
+		w.Header().Set("Cache-Control", "private, max-age=300")
+		w.Header().Set("CDN-Cache-Control", "no-store")
+		w.Header().Set("Surrogate-Control", "no-store")
+	} else if !s.cache(w, r, ccImmutable, g.Public, "ns:"+ns) {
+		return
+	}
+	if g.JWE != "" {
+		w.Header().Set("Content-Type", seal.ContentType)
+		w.WriteHeader(200)
+		if r.Method != http.MethodHead {
+			w.Write([]byte(g.JWE))
+		}
 		return
 	}
 	writeJSON(w, 200, g)
@@ -976,7 +1048,8 @@ func (s *Server) nsRevLog(w http.ResponseWriter, r *http.Request) {
 // nsGestures is GET /ns/{ns}/gestures/{gesture} (§7.4, optional): the
 // revisions and tombstones written with the gesture or undoing it, oldest
 // first, paged as in §7.1 with X-Log-Next naming the cursor of the next
-// page, "{resource}/{id}" (core/gestures.go). The list grows: no-store.
+// page, "{resource}/{id}", which the next request gives as ?after=
+// (core/gestures.go). The list grows: no-store.
 func (s *Server) nsGestures(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	ns := r.PathValue("ns")
@@ -984,7 +1057,7 @@ func (s *Server) nsGestures(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	page, err := s.e.Gestures(r.Context(), ns, r.PathValue("gesture"), r.URL.Query().Get("since"), creds(r))
+	page, err := s.e.Gestures(r.Context(), ns, r.PathValue("gesture"), r.URL.Query().Get("after"), creds(r))
 	if err != nil {
 		writeErr(w, err)
 		return

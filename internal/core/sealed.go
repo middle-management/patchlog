@@ -63,6 +63,7 @@ const (
 	sealEntry  = "entry"
 	sealConfig = "config"
 	sealRange  = "range"
+	sealGrant  = "grant"
 )
 
 type epochRef struct {

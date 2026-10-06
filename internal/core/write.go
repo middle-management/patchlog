@@ -488,10 +488,13 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			// for the batch it would have produced first (§7.5, §7.2).
 			var ae *Error
 			if errors.As(err, &ae) && ae.Status == 412 && cc.IfMatch != "" {
-				// Signatures are checked against the current configuration
-				// for listed kids only: whether the batch's config change
-				// required them isn't known once its precondition failed.
-				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 && len(t.checkSignatures(n, cur, a, st, false)) == 0 {
+				// Signatures aren't checked: they come after the retry
+				// lookup (§6.2 step 2.3), which answers a retry as first
+				// recorded whatever it carries. If the lookup finds
+				// nothing, the batch fails with its config change's error,
+				// so no item is ever judged under the wrong configuration
+				// (§C.3.1 "Requiring signatures").
+				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
 					// The request passed step 1, so it draws its tokens,
 					// even though the replay lookup ends it (§6.6, §6.2).
 					// Its config change costs a token unless a * key
@@ -539,11 +542,6 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// Step 1: authorisation.
 	fs := authorizeItems(a)
 	if len(fs) > 0 {
-		return nil, nil, fail(fs)
-	}
-	// Author signatures, after authorisation and before rate limits, in
-	// the configuration the write is checked against (§6.2, §C.3.1).
-	if fs = t.checkSignatures(n, cfg, a, st, true); len(fs) > 0 {
 		return nil, nil, fail(fs)
 	}
 	// A batch costs a token per item, and one for its config change unless
@@ -610,6 +608,14 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		return nil, nil, fail(denied)
 	}
 	if len(fs) > 0 {
+		if !dryRun {
+			return nil, nil, fail(fs)
+		}
+		st, fs = dropFailed(st, fs, dryFails), nil
+	}
+	// Author signatures, after the retry lookup and the verb, in the
+	// configuration the write is checked against (§6.2 step 2.3, §C.3.1).
+	if fs = t.checkSignatures(n, cfg, a, st); len(fs) > 0 {
 		if !dryRun {
 			return nil, nil, fail(fs)
 		}

@@ -9,6 +9,8 @@ import (
 
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Reading stored grants (§C.3.1): GET /ns/{ns}/grants/{gid} answers
@@ -23,10 +25,18 @@ import (
 // entry. A remote branch's base is followed no further than the branch
 // itself: what it reads through is verified at its base (§G.3).
 //
-// It needs unrestricted read on the namespace, as gestures do, and isn't
-// offered in sealed or e2e namespaces (404 not_offered after the read
-// check). A grant id names its root block, and the stored form doesn't
-// change once recorded, so the answer is immutable.
+// It needs unrestricted read on the namespace, as gestures do. A purged
+// namespace answers 410 after the read check, since the content the
+// grant's signatures cover is gone (§8.5). A grant id names its root
+// block, and the stored form doesn't change once recorded, so the answer
+// is immutable. Sealed namespaces seal it like a log entry, under the
+// epoch key, with pl { ns, grant: gid } (§E.2.2): sealed once, stored in
+// the sealed table and served identically forever. The epoch is the one
+// sealing the namespace's first entry recording it, or the current one for
+// a grant only its bases record. End-to-end namespaces serve it in the
+// clear, as their logs are, but marked Private: Cache-Control private
+// instead of the immutable class (§9), since a grant shows more than a log
+// entry does.
 
 // GrantDoc is the answer of GET /ns/{ns}/grants/{gid}.
 type GrantDoc struct {
@@ -35,11 +45,19 @@ type GrantDoc struct {
 	Stored []string       `json:"stored"`
 	// Public: the namespace uses the public cache classes.
 	Public bool `json:"-"`
+	// Private: an end-to-end namespace's grant, served with
+	// Cache-Control private (§C.3.1, §9).
+	Private bool `json:"-"`
+	// JWE: in a sealed namespace, the sealed answer to serve instead
+	// (application/jose).
+	JWE string `json:"-"`
 }
 
 // Grant serves a grant recorded in ns (§C.3.1).
 func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*GrantDoc, error) {
 	var out *GrantDoc
+	var job *sealJob
+	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -52,9 +70,6 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		// An anonymous reader of a public namespace reads all of it.
 		if a != nil && !a.unrestrictedRead() {
 			return forbidden("reading a grant needs unrestricted read on the namespace")
-		}
-		if t.nsLevel(n) >= levelSealed {
-			return apiErr(404, "not_offered", "message", "grants aren't served in sealed or end-to-end namespaces: their bundles carry them (§C.3.1)")
 		}
 		if n.purged {
 			return gone()
@@ -72,9 +87,45 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		for _, b := range g.SignedBlocks() {
 			out.Stored = append(out.Stored, base64.RawURLEncoding.EncodeToString(b))
 		}
+		switch t.nsLevel(n) {
+		case levelSealed:
+			nsRowID = n.id
+			job = t.grantJob(n, id, func() []byte {
+				stored := make([]any, len(out.Stored))
+				for i, s := range out.Stored {
+					stored[i] = s
+				}
+				return jsonv.Canonical(map[string]any{"id": out.ID, "root": out.Root, "stored": stored})
+			})
+		case levelE2E:
+			out.Private = true
+		}
 		return nil
 	})
+	if err == nil && job != nil {
+		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
+			out.JWE = job.jwe
+		}
+	}
 	return out, err
+}
+
+// grantJob prepares the sealing of grant id as n serves it (§E.2.2).
+func (t *tx) grantJob(n *nsRow, id ids.ID, plain func() []byte) *sealJob {
+	j := &sealJob{kind: sealGrant, key: id.String()}
+	if t.stored(n, j) {
+		return j
+	}
+	e := t.config(n.configSeq).Epoch
+	var seq int64
+	if err := t.QueryRow(`SELECT seq FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, id[:], n.id).Scan(&seq); err == nil {
+		e = t.entryEpoch(n, seq)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		t.must(err)
+	}
+	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.GrantPL(n.name, id.String()), plain()
+	j.pad = t.config(n.configSeq).Pad
+	return j
 }
 
 // recordsGrant reports whether an entry of n, or of its local bases up to

@@ -1117,7 +1117,7 @@ function undoStackFrom(nsLog, author) {
 async function undoGestureList(ns, g) {
   const out = [];
   for (let since = '', i = 0; i < 1000; i++) {
-    const r = await api('GET', `/ns/${ns}/gestures/${g}` + (since ? '?since=' + encodeURIComponent(since) : ''), { auto: true, label: 'undo' });
+    const r = await api('GET', `/ns/${ns}/gestures/${g}` + (since ? '?after=' + encodeURIComponent(since) : ''), { auto: true, label: 'undo' });
     if (r.status === 404 || r.status === 403 || r.status === 401) return null;
     if (r.status !== 200 || !Array.isArray(r.json)) throw new Error('listing the gesture answered ' + r.status);
     out.push(...r.json);

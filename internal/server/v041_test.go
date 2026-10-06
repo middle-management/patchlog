@@ -120,8 +120,9 @@ func TestV041Signatures(t *testing.T) {
 	if le := e.lastLog("sec", "a", a1, g); le["signature"] != junk {
 		t.Fatalf("unverified signature not stored: %v", le)
 	}
-	// Checked at step 1, before the precondition (§6.2): with a stale
-	// If-Match, a signature that doesn't verify is 422, one that does 412.
+	// Checked at step 2.3, before the precondition comparison (§6.2), on
+	// the parent If-Match names: with a stale If-Match, a signature that
+	// doesn't verify is 422, one that does 412.
 	p3 := ops(op("add", "/w", "3"))
 	expectCode(t, e.swrite("PATCH", "sec", "a", a0, p3, g, signP(t, k1, "sec", "a", a0, p1)), 422, "signature")
 	expectCode(t, e.swrite("PATCH", "sec", "a", a0, p3, g, signP(t, k1, "sec", "a", a0, p3)), 412, "stale")
@@ -305,10 +306,8 @@ func TestV041Grants(t *testing.T) {
 	expect(t, e.get("/ns/sec/grants/"+grantIDOf(t, j), f.adminG), 200)
 	expect(t, e.get("/ns/sec-b/grants/"+grantIDOf(t, j), f.adminG), 404) // after the branch's at
 
-	// Not offered in sealed namespaces, after the read check.
-	s := newSealedEnv(t)
-	s.mkNS("s", sealedDoc(map[string]any{}))
-	expectCode(t, s.get("/ns/s/grants/"+gid), 404, "not_offered")
+	// Sealed and end-to-end namespaces serve them too (v0.42,
+	// TestV042Grants).
 }
 
 func (f *authFixture) svcGrant(e *tenv) string {

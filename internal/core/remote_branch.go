@@ -796,7 +796,7 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	if !ValidNSName(req.NS) {
 		return nil, nil, nil, badInput("invalid namespace name")
 	}
-	keys := t.e.opt.OperatorKeys
+	keys := t.operatorKeys()
 	if keys == nil {
 		keys = []grant.Key{}
 	}

@@ -5,35 +5,38 @@ package core
 // A write's revisions and tombstones may carry author signatures: the
 // Signature header of a single write, a step object's "signature" in a
 // batch (§7.5). Each is stored with its revision or tombstone (outside its
-// id) and served in resource logs. At the end of §6.2 step 1, after
-// authentication and authorisation and before rate limits, every write
-// that passed is checked: a signature whose kid the grant's root block
-// lists in "signers" is verified, and a bad one is 422 "signature"; one
-// with any other kid is stored unverified. A namespace whose configuration
-// (the one the gate checks the write against: for a batch item, after the
-// batch's config change) says "signatures": "required" refuses every
-// revision and tombstone without a valid signature by a signer of its
-// grant, with the same 422.
+// id) and served in resource logs. A malformed one is 400, a request-shape
+// error checked before step 1 (checkSignatureShapes).
 //
-// The signing input binds the revision's parent (§C.3). It is known from
-// the request: the step 2 precondition only passes when If-Match names the
-// resource's head as the writer sees it (§7.2), which in a branch may be a
-// revision its base wrote, so the parent a revision is written on is the
-// If-Match id, a create's is nil, and each later step's is the id the step
-// before it produces (§3.3, §3.4), exactly as expectedIDs computes them.
-// Verifying with the If-Match id at step 1 therefore checks the same input
-// a successful write is stored with, and keeps the order of §6.2: a bad
-// signature on a write whose precondition is stale is 422, not 412.
+// They are checked at §6.2 step 2.3: after authentication, authorisation
+// and rate limits (step 1), after the idempotent-retry lookup, so a retry
+// is answered with the entry as first recorded whatever well-formed
+// signature it carries or lacks, even after "required" was turned on, and
+// after the verb is settled, so authorisation failures (including a 403
+// from settling the verb) are reported first. Then a signature whose kid
+// the grant's root block lists in "signers" is verified, and a bad one is
+// 422 "signature"; one with any other kid is stored unverified. A
+// namespace whose configuration (the one the gate checks the write
+// against: for a batch item, after the batch's config change) says
+// "signatures": "required" refuses every revision and tombstone without a
+// valid signature by a signer of its grant, with the same 422. A batch
+// whose config change fails fails with it, so its items are never judged
+// under another configuration.
 //
-// Deviations, where step 1 can't know the parent:
+// The signing input binds the revision's parent (§C.3). It needs no head:
+// the precondition only passes when If-Match names the resource's head as
+// the writer sees it (§7.2), which in a branch may be a revision its base
+// wrote, so the parent a revision is written on is the If-Match id, a
+// create's is nil, and each later step's is the id the step before it
+// produces (§3.3, §3.4), exactly as expectedIDs computes them. Verifying
+// with the If-Match id before the precondition comparison therefore checks
+// the same input a successful write is stored with: a bad signature on a
+// write whose precondition is stale is 422, not 412.
 //
-//   - A write without If-Match or If-None-Match is 428 at step 2. Its
-//     signatures can't be verified (there is no parent to bind), so they
-//     aren't, and it fails with 428; a missing signature where one is
-//     required is still 422 here.
-//   - A malformed If-Match is a request-shape error (400) that this
-//     implementation answers at step 2; its signatures aren't verified
-//     here either, so it gets that 400.
+// A write without a usable precondition (no If-Match or If-None-Match, or
+// a malformed If-Match) has no parent to bind, so its signatures can't be
+// checked: they aren't, "required" included, and it gets the
+// precondition's own error (428, or 400) at step 2.5 (§C.3.1 "The parent").
 
 import (
 	"fmt"
@@ -74,17 +77,15 @@ func signatureErr(msg string) *Error {
 	return apiErr(422, "signature", "message", msg)
 }
 
-// checkSignatures is the signature check at the end of §6.2 step 1 for
-// the items that passed authorisation, against cfg, the configuration the
-// write is checked against. honourRequired false skips the "required" rule
-// (verifying listed kids only), for the replay lookup of a batch whose
-// config change no longer applies.
-func (t *tx) checkSignatures(n *nsRow, cfg *Config, a *actor, st []*itemState, honourRequired bool) []itemErr {
+// checkSignatures is the signature check of §6.2 step 2.3 for the items
+// still standing, against cfg, the configuration the write is checked
+// against.
+func (t *tx) checkSignatures(n *nsRow, cfg *Config, a *actor, st []*itemState) []itemErr {
 	var signers []sig.Signer
 	if a != nil && a.grant != nil && len(a.grant.Blocks) > 0 {
 		signers = a.grant.Blocks[0].Signers
 	}
-	required := honourRequired && cfg.SignaturesRequired
+	required := cfg.SignaturesRequired
 	if !required && len(signers) == 0 {
 		// Nothing to verify: every signature is stored unverified.
 		return nil
@@ -107,18 +108,18 @@ func (t *tx) checkItemSignatures(n *nsRow, s *itemState, signers []sig.Signer, r
 	}
 	// The parent of the first step (see the package comment above).
 	var parent *ids.ID
-	known := true
 	switch {
 	case s.IfMatch != "" && !s.IfNoneMatch:
 		p, err := ids.Parse(s.IfMatch)
 		if err != nil {
-			known = false
-		} else {
-			parent = &p
+			return nil // malformed: step 2.5 answers it
 		}
+		parent = &p
 	case s.IfNoneMatch && s.IfMatch == "":
 	default:
-		known = false
+		// No usable precondition: nothing to bind, and step 2.5
+		// answers it (see the package comment above).
+		return nil
 	}
 	origin := t.e.Origin()
 	for j, step := range s.Steps {
@@ -127,12 +128,12 @@ func (t *tx) checkItemSignatures(n *nsRow, s *itemState, signers []sig.Signer, r
 				return signatureErr(where(j) + "this namespace requires author signatures (§C.3.1)")
 			}
 		} else {
-			sg, _ := sig.Parse(step.Signature) // shape checked before step 1
+			sg, _ := sig.Parse(step.Signature) // shape checked before step 1 (§6.2)
 			signer, listed := sig.Find(signers, sg.Kid)
 			switch {
 			case !listed && required:
 				return signatureErr(where(j) + fmt.Sprintf("the grant lists no signer %q, and this namespace requires author signatures (§C.3.1)", sg.Kid))
-			case listed && known:
+			case listed:
 				var body []byte // nil: a tombstone's input
 				if !step.Delete {
 					body = s.canon(j)
@@ -145,9 +146,6 @@ func (t *tx) checkItemSignatures(n *nsRow, s *itemState, signers []sig.Signer, r
 					return signatureErr(where(j) + fmt.Sprintf("the signature by %q does not verify (§C.3.1)", sg.Kid))
 				}
 			}
-		}
-		if !known {
-			continue
 		}
 		var id ids.ID
 		if step.Delete {

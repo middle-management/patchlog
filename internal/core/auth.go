@@ -132,10 +132,10 @@ func (t *tx) absentNS(nsName string, cred Credentials) *Error {
 	if err != nil {
 		return err
 	}
-	if _, ok := findKey(t.e.opt.OperatorKeys, g.Blocks[0].Kid); !ok {
+	if _, ok := findKey(t.operatorKeys(), g.Blocks[0].Kid); !ok {
 		return apiErr(401, "unauthenticated", "message", "no key can verify the grant")
 	}
-	if _, err := t.verifyGrant(g, nsName, nil, nil, t.e.opt.OperatorKeys); err != nil {
+	if _, err := t.verifyGrant(g, nsName, nil, nil, t.operatorKeys()); err != nil {
 		return err
 	}
 	return notFound()

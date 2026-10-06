@@ -8,6 +8,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sig"
 )
 
@@ -144,8 +145,10 @@ func (g *GrantDoc) Blocks() ([][]byte, error) {
 }
 
 // Grant fetches a grant recorded in ns (§C.3.1). It needs unrestricted
-// read on the namespace; sealed and end-to-end namespaces don't offer it
-// (404, code "not_offered").
+// read on the namespace. A sealed namespace serves it sealed, pl
+// { ns, grant: gid } (§E.2.2), which needs the client's keys (ErrNoKeys
+// without them); an end-to-end one serves it in the clear. A purged
+// namespace answers 410.
 func (c *Client) Grant(ctx context.Context, ns, gid string) (*GrantDoc, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, err
@@ -161,7 +164,21 @@ func (c *Client) Grant(ctx context.Context, ns, gid string) (*GrantDoc, error) {
 		return nil, r.apiError()
 	}
 	m := r.obj()
+	if isJOSE(r) {
+		pt, err := c.open(ctx, ns, "", strings.TrimSpace(string(r.body)), fixedPL(seal.GrantPL(ns, gid)))
+		if err != nil {
+			return nil, fmt.Errorf("client: grant %s of %s: %w", gid, ns, err)
+		}
+		v, err := jsonv.Parse(pt)
+		if err != nil {
+			return nil, fmt.Errorf("client: grant %s of %s: %w", gid, ns, err)
+		}
+		m, _ = v.(map[string]any)
+	}
 	g := &GrantDoc{ID: str(m, "id")}
+	if g.ID != gid {
+		return nil, fmt.Errorf("client: %s: grant %q answered for %q", r.path, g.ID, gid)
+	}
 	g.Root, _ = m["root"].(map[string]any)
 	arr, _ := m["stored"].([]any)
 	for _, x := range arr {

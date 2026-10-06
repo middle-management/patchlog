@@ -99,6 +99,12 @@ func RangePL(ns, since, id string) PL {
 	return PL{"ns": ns, "range": []any{since, id}}
 }
 
+// GrantPL binds a grant served by GET /ns/{ns}/grants/{gid} (§C.3.1,
+// §E.2.2): { ns, grant: gid }.
+func GrantPL(ns, gid string) PL {
+	return PL{"ns": ns, "grant": gid}
+}
+
 // PatchSetPL binds an E3 sealed patch set: { ns, name, parent }, parent ""
 // for genesis (§E.3.1).
 func PatchSetPL(ns, name, parent string) PL {
