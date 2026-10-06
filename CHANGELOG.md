@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.44**: reverse-reference queries in the indexing service (Addendum A).
+
+**New:**
+- The index collects every `x-ref` reference of typed documents by §6.5's walk, with the
+  schema revision each document pins (no `x-index` needed), into a new `refs` table.
+- `?ref=/r/{ns}/{name}` finds the documents that reference a resource in any form;
+  `…/rev/{id}` only those pinned to that revision; `…%23{entry}` only those naming that
+  entry. It combines with the other filters, and hits carry `refs: [{ path, ref }]`.
+  Malformed or repeated `ref` is `400`.
+- An index database from before v0.44 is rebuilt once at startup, so its references are
+  collected.
+- `GET /` answers `"spec": "0.44"`.
+
 ## v0.13.0
 
 Implements spec **v0.43**, small fixes from the reference's v0.42 notes.
