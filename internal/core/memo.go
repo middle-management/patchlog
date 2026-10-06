@@ -32,7 +32,13 @@ type idCache struct {
 type memo struct {
 	res map[resKey]*resRow
 	rev map[int64]revRow
+	// headAt is a resource's head as of a namespace log position, from
+	// head_history (resolve); 0 when it had none there. Prefetched for a
+	// page of a heads listing (prefetchHeads).
+	headAt map[headAtKey]int64
 }
+
+type headAtKey struct{ res, asOf int64 }
 
 // inserted remembers a revision row the transaction inserted: its own, so
 // valid until the transaction ends (nothing changes a row it just

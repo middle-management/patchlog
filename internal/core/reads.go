@@ -84,6 +84,7 @@ func (t *tx) pageHeads(n *nsRow, asOf *int64, after string, limit int) (out []he
 	chunk := limit + 1
 	for {
 		names := t.namesAfter(n, after, chunk)
+		t.prefetchHeads(n, names, asOf)
 		for _, name := range names {
 			v := t.resolve(n, name, asOf)
 			if v.state == NotFound {

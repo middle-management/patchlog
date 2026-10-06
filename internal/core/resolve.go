@@ -105,6 +105,98 @@ func (t *tx) prefetchResources(ns int64, names []string) {
 	}
 }
 
+// prefetchHeads reads what resolve needs for several resources of n as of
+// asOf (nil = now) in a few statements per namespace level, for resolve to
+// answer from memory: their resource rows, their heads at asOf from
+// head_history, and those head revisions. Names with no head of n's own
+// there are looked up in its base, as resolve reads them through. A page of
+// a heads listing (pageHeads) costs a handful of round trips this way
+// instead of three per resource. Postgres only: a SQLite query costs no
+// round trip.
+func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
+	for t.e.pg && len(names) > 1 {
+		t.prefetchResources(n.id, names)
+		var rest []string
+		var heads []int64
+		var resIDs []int64
+		for _, name := range names {
+			r := t.memo.res[resKey{n.id, name}]
+			switch {
+			case r == nil:
+				rest = append(rest, name)
+			case r.state == statePurged || asOf == nil:
+				if r.headSeq.Valid {
+					heads = append(heads, r.headSeq.Int64)
+				} else if r.state != statePurged {
+					rest = append(rest, name)
+				}
+			default:
+				resIDs = append(resIDs, r.id)
+			}
+		}
+		if len(resIDs) > 0 {
+			rows, err := t.Query(`SELECT r.res, h.target_seq FROM unnest(?::bigint[]) AS r(res)
+				LEFT JOIN LATERAL (SELECT target_seq FROM head_history
+					WHERE res = r.res AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1) h ON true`, resIDs, *asOf)
+			t.must(err)
+			if t.memo.headAt == nil {
+				t.memo.headAt = map[headAtKey]int64{}
+			}
+			at := map[int64]int64{}
+			for rows.Next() {
+				var res int64
+				var target sql.NullInt64
+				t.must(rows.Scan(&res, &target))
+				at[res] = target.Int64
+				t.memo.headAt[headAtKey{res, *asOf}] = target.Int64
+				if target.Valid {
+					heads = append(heads, target.Int64)
+				}
+			}
+			t.must(rows.Err())
+			rows.Close()
+			for _, name := range names {
+				if r := t.memo.res[resKey{n.id, name}]; r != nil && r.state != statePurged && at[r.id] == 0 {
+					rest = append(rest, name)
+				}
+			}
+		}
+		t.prefetchRevs(heads)
+		if !n.isBranch() {
+			return
+		}
+		at := n.baseAt.Int64
+		n, names, asOf = t.nsByID(n.base.Int64), rest, &at
+	}
+}
+
+// prefetchRevs reads several revision rows in one statement into the
+// transaction's memo, for rev to answer from memory.
+func (t *tx) prefetchRevs(seqs []int64) {
+	var want []int64
+	for _, seq := range seqs {
+		if _, ok := t.memo.rev[seq]; !ok {
+			want = append(want, seq)
+		}
+	}
+	if len(want) == 0 {
+		return
+	}
+	rows, err := t.Query(`SELECT `+revCols+` FROM revisions WHERE seq = ANY(?::bigint[])`, want)
+	t.must(err)
+	if t.memo.rev == nil {
+		t.memo.rev = map[int64]revRow{}
+	}
+	for rows.Next() {
+		r, err := scanRev(rows)
+		t.must(err)
+		t.memo.rev[r.seq] = *r
+		t.knowRevID(r.seq, r.id)
+	}
+	t.must(rows.Err())
+	rows.Close()
+}
+
 // revRow is a revisions row.
 type revRow struct {
 	seq       int64
@@ -202,6 +294,8 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 			if r.headSeq.Valid {
 				headSeq, found = r.headSeq.Int64, true
 			}
+		} else if seq, ok := t.memo.headAt[headAtKey{r.id, *asOf}]; ok {
+			headSeq, found = seq, seq != 0
 		} else {
 			err := t.QueryRow(`SELECT target_seq FROM head_history WHERE res = ? AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1`, r.id, *asOf).Scan(&headSeq)
 			if err == nil {

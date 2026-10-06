@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+**Performance:**
+- **Heads pages on Postgres take a few statements, not three per resource.** A page now
+  reads its resources, their heads at `at` (one `LATERAL` join on `head_history`) and those
+  revisions in one statement each per namespace level, and resolves from memory.
+
 ## v0.11.1
 
 **Fixes:**
