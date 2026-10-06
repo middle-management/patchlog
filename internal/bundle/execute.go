@@ -11,6 +11,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/merge"
 )
 
 // limits are the batch and rate limits of a target namespace (§6.6).
@@ -156,6 +157,16 @@ func (im *importer) request(b *batch) (client.BatchRequest, []string) {
 		default:
 			bi.IfMatch = it.ifMatch
 		}
+		if im.opt.Signer != nil {
+			// The importer's own signature on each step; any signature of
+			// the bundle's revisions stays in the bundle (§C.3.1).
+			steps, err := merge.SignSteps(*im.opt.Signer, im.origin, b.n.ns, it.name, bi.IfMatch, bi.Steps)
+			if err != nil {
+				im.signErr = err
+			} else {
+				bi.Steps = steps
+			}
+		}
 		req.Items = append(req.Items, bi)
 		if it.sameIDs {
 			ids[it.name] = it.expected[p.to-1]
@@ -210,6 +221,9 @@ var deferrable = map[string]bool{"schema_unavailable": true}
 // earlier batch hasn't committed yet.
 func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 	req, expected := im.request(b)
+	if im.signErr != nil {
+		return fmt.Errorf("import: %w", im.signErr)
+	}
 	res, err := im.call(ctx, b.n.ns, req, true)
 	if err != nil {
 		b.rep.DryRun = "failed"
@@ -375,6 +389,9 @@ func (im *importer) execute(ctx context.Context) error {
 				return err
 			}
 			req, expected := im.request(b)
+			if im.signErr != nil {
+				return fmt.Errorf("import: %w", im.signErr)
+			}
 			res, err := im.call(ctx, n.ns, req, false)
 			if err != nil {
 				b.rep.Error = err.Error()

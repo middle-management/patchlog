@@ -87,7 +87,7 @@ func releaseCmd(args []string) {
 			fmt.Fprintln(os.Stderr, "merge release rebase: -suffix is required")
 			os.Exit(2)
 		}
-		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: *suffix, At: *at})
+		res, err := merge.RebaseRelease(ctx, c, merge.RebaseReleaseOptions{Release: link, Suffix: *suffix, At: *at, Plan: merge.Options{Signer: tf.signer()}})
 		if *tf.asJSON {
 			out := map[string]any{"result": res}
 			if err != nil {
@@ -145,7 +145,7 @@ func releaseCmd(args []string) {
 	}
 
 	opt := merge.ReleaseOptions{Release: link, StateNS: *stateNS, Accept: accepts, SourceAuthorizations: srcGrants, Who: whoAmI(tf),
-		Digest: *digest, AdminGrant: *tf.bearer}
+		Digest: *digest, AdminGrant: *tf.bearer, Signer: tf.signer()}
 	if *mergeBearer != "" {
 		if g, err := grant.Decode(*mergeBearer, 0); err == nil && len(g.Blocks) > 0 {
 			opt.Via = g.Blocks[0].Sub

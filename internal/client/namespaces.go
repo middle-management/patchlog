@@ -456,6 +456,9 @@ type Step struct {
 	Delete          bool
 	Patches         any
 	Gesture, Undoes string
+	// Signature is the writer's own author signature over the step, in the
+	// header form "<alg>:<kid>:<sig>" (§C.3.1). Never a source revision's.
+	Signature string
 }
 
 // WithGesture returns the step with its gesture and undoes set ("" for
@@ -476,7 +479,7 @@ func (s Step) value() (any, error) {
 		}
 		body = p
 	}
-	if s.Gesture == "" && s.Undoes == "" {
+	if s.Gesture == "" && s.Undoes == "" && s.Signature == "" {
 		return body, nil
 	}
 	m := map[string]any{}
@@ -486,6 +489,9 @@ func (s Step) value() (any, error) {
 		m["patches"] = body
 	}
 	putGestures(m, s.Gesture, s.Undoes)
+	if s.Signature != "" {
+		m["signature"] = s.Signature
+	}
 	return m, nil
 }
 

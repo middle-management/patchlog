@@ -17,6 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/sig"
 	"github.com/middle-management/patchlog/internal/verify"
 )
 
@@ -109,6 +110,16 @@ type ImportOptions struct {
 	// import, of the refusal to import a private or sealed namespace into a
 	// public target (§G.5.1).
 	AllowLessProtected bool
+	// Signer, if set, signs every step the import writes (§C.3.1) with the
+	// importer's own key, bound to the target deployment's origin, the
+	// target namespace (an upstream namespace for a snapshot document's
+	// upstream chain), the resource and the step's parent. Targets with
+	// "signatures": "required" need it, and the key must be listed in the
+	// signers of the grant the import runs under. The bundle's own
+	// signatures are never re-sent: they stay in the bundle, which the
+	// batches' source names (§G.4.4), where they verify against the source
+	// (VerifyWith).
+	Signer *sig.Key
 }
 
 // DocReport is one bundled document, classified.
@@ -327,6 +338,9 @@ type importer struct {
 	rep    *Report
 	local  bool // the bundle's origin is the target's own
 
+	origin  string // the target deployment's origin, for signing
+	signErr error  // a step that request couldn't sign
+
 	up      map[string]*upPlan
 	points  map[string]map[string]point // target ns → "srcNS/name" → point
 	schemas map[string]any
@@ -386,6 +400,7 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 		return nil, fmt.Errorf("import: target origin: %w", err)
 	}
 	im.rep.TargetOrigin = to
+	im.origin = to
 	if to == im.h.Origin {
 		im.local = true
 		im.rep.Notes = append(im.rep.Notes, "the bundle comes from this deployment: batch sources carry no origin, so the server checks source.at against source.ns (§7.5)")
@@ -441,6 +456,11 @@ func (im *importer) load(open Opener) error {
 		}
 		if err != nil {
 			return err
+		}
+		if l.IsGrant() {
+			// Grant lines (§G.4.1) are provenance of the bundle's
+			// signatures; an import never re-sends them (§C.3.1).
+			continue
 		}
 		d := im.docs[l.Key()]
 		if l.IsBlob() {

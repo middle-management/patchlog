@@ -74,6 +74,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Class is a resource's classification by ancestry (§F.3).
@@ -222,7 +223,7 @@ func StepsJSON(steps []client.Step) []any {
 		if s.Delete {
 			v = "delete"
 		}
-		if s.Gesture != "" || s.Undoes != "" {
+		if s.Gesture != "" || s.Undoes != "" || s.Signature != "" {
 			m := map[string]any{"patches": v}
 			if s.Delete {
 				m = map[string]any{"delete": true}
@@ -232,6 +233,9 @@ func StepsJSON(steps []client.Step) []any {
 			}
 			if s.Undoes != "" {
 				m["undoes"] = s.Undoes
+			}
+			if s.Signature != "" {
+				m["signature"] = s.Signature
 			}
 			v = m
 		}
@@ -265,6 +269,13 @@ type Options struct {
 	// place of the plan's client, e.g. under a catalog service's merge
 	// grant (§F.8). Reads still use the plan's client.
 	BatchClient *client.Client
+	// Signer, if set, signs every step the plan's batches write (§C.3.1):
+	// the digest binds the target deployment's origin, the target
+	// namespace, the resource and the step's parent. Targets with
+	// "signatures": "required" need it, and the key must be listed in the
+	// signers of the grant the batch is sent under. Original signatures
+	// are never carried over (§C.3).
+	Signer *sig.Key
 
 	// successor is set by Rebase: the target is the branch's successor,
 	// whose merge batches of the branch are the rebase itself, so all of
@@ -309,6 +320,7 @@ type Plan struct {
 	Reencrypt bool `json:"reencrypt,omitempty"`
 
 	opt        Options
+	origin     string                  // the target deployment's origin, when signing
 	points     map[string]Pair         // per resource: the most recent trusted pair
 	ignoredFor map[string][]MergeBatch // per resource: untrusted batches with an entry for it
 	logs       map[string]ancestry     // cache: ns/name@head
@@ -353,6 +365,13 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		opt.MaxRetries = 3
 	}
 	p := &Plan{c: c, Target: target, Branch: branch, opt: opt, logs: map[string]ancestry{}, flags: map[string]string{}}
+	if opt.Signer != nil {
+		o, err := c.Origin(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("merge: signing needs the deployment's origin: %w", err)
+		}
+		p.origin = o
+	}
 	// Sealed patch sets bind their namespace (§E.3.1): merging to or from
 	// an e2e namespace decrypts and re-encrypts under the target's keys,
 	// never a fast-forward (§F.8).

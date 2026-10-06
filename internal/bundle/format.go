@@ -27,9 +27,21 @@
 //     "authors": true; a line that carries them in a bundle without authors
 //     is rejected, and gesture and undoes must be gesture ids (§7.2). An
 //     import carries them into its batch steps (§7.5), like a merge
-//     (§F.3), wherever it writes the bundle's own revisions. Author
-//     signatures are carried but not verified (the server does not verify
-//     them either, see README).
+//     (§F.3), wherever it writes the bundle's own revisions. An import
+//     never re-sends a carried signature: a step's signature is the
+//     importer's own (§C.3.1), and the originals stay in the bundle.
+//   - Grant lines (§G.4.1, §C.3.1): with "authors": true a bundle carries
+//     one line { "ns", "grant", "root", "stored", "key": { "kid", "alg",
+//     "pub" } } per grant its history lines reference, before the first
+//     that does. A history line names its grant in an optional "grant"
+//     member (the grant id); this format decision is needed because the
+//     spec's grant lines are matched to lines by id. A history line whose
+//     "grant" has no grant line before it is rejected. Grant lines are
+//     bundle lines like the rest: they count for the digest, and carry no
+//     "resource". Whether a grant line is genuine is checked by
+//     VerifySignatures (sigs.go), not by the Reader, which only checks the
+//     shape: a bundle with a bad grant line still reads, and its
+//     signatures report as failed.
 //   - A deleted snapshot line carries no "doc".
 //   - Blob lines (§G.4.1) carry "data" as unpadded base64url (padded input
 //     is accepted too), and "nonce" only if the blob has one. Each must
@@ -67,6 +79,7 @@ package bundle
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"errors"
@@ -81,6 +94,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sig"
 	"github.com/middle-management/patchlog/internal/verify"
 )
 
@@ -183,6 +197,13 @@ type Line struct {
 	// are "" if the revision had none (§7.2).
 	Author, Created, Signature string
 	Gesture, Undoes            string
+	// Grant is the id of the grant the revision was written under (§C.3),
+	// only with Header.Authors, "" if none is carried. A grant line for it
+	// (same ns) comes earlier in the bundle.
+	Grant string
+
+	// GrantLine is set on a grant line (§G.4.1): no resource, no history.
+	GrantLine *GrantLine
 
 	// Snapshot lines.
 	Snapshot string // the source id: head revision, or tombstone if Deleted
@@ -195,6 +216,25 @@ type Line struct {
 	Nonce string // "" if none
 	Data  []byte
 }
+
+// KeyEntry is a signer or namespace key entry as a grant line's key gives
+// it: { "kid", "alg", "pub" } (§G.4.1). Alg is "Ed25519", Pub the public
+// key in base64url without padding.
+type KeyEntry struct{ Kid, Alg, Pub string }
+
+// GrantLine is a grant line (§G.4.1): a grant recorded by an entry of the
+// namespace, in its non-bearer form as GET /ns/{ns}/grants/{gid} serves it
+// (§C.3.1), with the key entry its root block verified against at the
+// source. Key is attested by the exporter, not proven.
+type GrantLine struct {
+	ID     string         // the grant id, text(trunc160(sha256(canonical(root))))
+	Root   map[string]any // the root block
+	Stored []string       // the token's SignedBlocks in base64url, authority first
+	Key    KeyEntry
+}
+
+// IsGrant reports a grant line.
+func (l *Line) IsGrant() bool { return l.GrantLine != nil }
 
 // IsSnapshot reports a snapshot line.
 func (l *Line) IsSnapshot() bool { return l.Snapshot != "" }
@@ -227,6 +267,14 @@ func HistoryLine(ns, name string, e client.LogEntry, authors bool) Line {
 }
 
 func (l *Line) value() map[string]any {
+	if g := l.GrantLine; g != nil {
+		stored := make([]any, len(g.Stored))
+		for i, b := range g.Stored {
+			stored[i] = b
+		}
+		return map[string]any{"ns": l.NS, "grant": g.ID, "root": g.Root, "stored": stored,
+			"key": map[string]any{"kid": g.Key.Kid, "alg": g.Key.Alg, "pub": g.Key.Pub}}
+	}
 	m := map[string]any{"ns": l.NS, "resource": l.Resource}
 	if l.IsBlob() {
 		m["blob"], m["type"], m["data"] = l.Blob, l.Type, base64.RawURLEncoding.EncodeToString(l.Data)
@@ -248,7 +296,7 @@ func (l *Line) value() map[string]any {
 	if l.Kind == "rev" {
 		m["patches"] = l.Patches
 	}
-	for k, v := range map[string]string{"author": l.Author, "created": l.Created, "signature": l.Signature, "gesture": l.Gesture, "undoes": l.Undoes} {
+	for k, v := range map[string]string{"author": l.Author, "created": l.Created, "signature": l.Signature, "gesture": l.Gesture, "undoes": l.Undoes, "grant": l.Grant} {
 		if v != "" {
 			m[k] = v
 		}
@@ -480,6 +528,11 @@ func parseLine(v any, authors bool) (*Line, error) {
 	}
 	l := &Line{}
 	l.NS, _ = m["ns"].(string)
+	if _, has := m["grant"]; has {
+		if _, hasID := m["id"]; !hasID {
+			return parseGrantLine(m, l, authors)
+		}
+	}
 	l.Resource, _ = m["resource"].(string)
 	if !client.ValidNSName(l.NS) || !client.ValidResourceName(l.Resource) {
 		return nil, fmt.Errorf("line needs a valid ns and resource")
@@ -549,7 +602,7 @@ func parseLine(v any, authors bool) (*Line, error) {
 	for k := range m {
 		switch k {
 		case "ns", "resource", "id", "parent", "kind", "patches":
-		case "author", "created", "signature", "gesture", "undoes":
+		case "author", "created", "signature", "gesture", "undoes", "grant":
 			if !authors {
 				return nil, fmt.Errorf("history line carries %q in a bundle without authors", k)
 			}
@@ -563,6 +616,12 @@ func parseLine(v any, authors bool) (*Line, error) {
 	l.Author, _ = m["author"].(string)
 	l.Created, _ = m["created"].(string)
 	l.Signature, _ = m["signature"].(string)
+	if g, has := m["grant"]; has {
+		l.Grant, _ = g.(string)
+		if !validID(l.Grant) {
+			return nil, fmt.Errorf("history line: grant must be a grant id")
+		}
+	}
 	for k, dst := range map[string]*string{"gesture": &l.Gesture, "undoes": &l.Undoes} {
 		if v, has := m[k]; has {
 			*dst, _ = v.(string)
@@ -597,6 +656,67 @@ func parseLine(v any, authors bool) (*Line, error) {
 	return l, nil
 }
 
+// parseGrantLine parses a grant line (§G.4.1) after the ns was read.
+func parseGrantLine(m map[string]any, l *Line, authors bool) (*Line, error) {
+	if !authors {
+		return nil, fmt.Errorf("a grant line in a bundle without authors")
+	}
+	for k := range m {
+		switch k {
+		case "ns", "grant", "root", "stored", "key":
+		default:
+			return nil, fmt.Errorf("grant line: unknown member %q", k)
+		}
+	}
+	if !client.ValidNSName(l.NS) {
+		return nil, fmt.Errorf("grant line needs a valid ns")
+	}
+	g := &GrantLine{}
+	g.ID, _ = m["grant"].(string)
+	if !validID(g.ID) {
+		return nil, fmt.Errorf("grant line: grant must be a grant id")
+	}
+	root, ok := m["root"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("grant line %s: root must be an object", g.ID)
+	}
+	g.Root = root
+	arr, ok := m["stored"].([]any)
+	if !ok || len(arr) == 0 {
+		return nil, fmt.Errorf("grant line %s: stored must be a non-empty array of base64url blocks", g.ID)
+	}
+	for _, x := range arr {
+		str, ok := x.(string)
+		if !ok || str == "" {
+			return nil, fmt.Errorf("grant line %s: stored must be an array of base64url strings", g.ID)
+		}
+		if _, err := base64.RawURLEncoding.Strict().DecodeString(str); err != nil {
+			return nil, fmt.Errorf("grant line %s: stored blocks must be base64url without padding", g.ID)
+		}
+		g.Stored = append(g.Stored, str)
+	}
+	km, ok := m["key"].(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("grant line %s: key must be an object { kid, alg, pub }", g.ID)
+	}
+	for k := range km {
+		if k != "kid" && k != "alg" && k != "pub" {
+			return nil, fmt.Errorf("grant line %s: key has unknown member %q", g.ID, k)
+		}
+	}
+	g.Key.Kid, _ = km["kid"].(string)
+	g.Key.Alg, _ = km["alg"].(string)
+	g.Key.Pub, _ = km["pub"].(string)
+	if g.Key.Kid == "" || strings.Contains(g.Key.Kid, ":") || g.Key.Alg != sig.Alg {
+		return nil, fmt.Errorf("grant line %s: key needs a kid and alg %q", g.ID, sig.Alg)
+	}
+	if raw, err := base64.RawURLEncoding.Strict().DecodeString(g.Key.Pub); err != nil || len(g.Key.Pub) != 43 || len(raw) != 32 {
+		return nil, fmt.Errorf("grant line %s: key.pub must be an Ed25519 key in base64url without padding", g.ID)
+	}
+	l.GrantLine = g
+	return l, nil
+}
+
 // --- the checker shared by Reader and Writer ---------------------------------
 
 type docState struct {
@@ -605,15 +725,16 @@ type docState struct {
 }
 
 type checker struct {
-	h     *Header
-	docs  map[string]*docState
-	blobs map[string]bool // "ns/name blob" of the blob lines seen
-	n     int             // lines checked, header included
-	hash  hash.Hash
+	h      *Header
+	docs   map[string]*docState
+	blobs  map[string]bool // "ns/name blob" of the blob lines seen
+	grants map[string]bool // "ns\x00grant" of the grant lines seen
+	n      int             // lines checked, header included
+	hash   hash.Hash
 }
 
 func newChecker(h *Header) *checker {
-	return &checker{h: h, docs: map[string]*docState{}, blobs: map[string]bool{}, n: 1, hash: sha256.New()}
+	return &checker{h: h, docs: map[string]*docState{}, blobs: map[string]bool{}, grants: map[string]bool{}, n: 1, hash: sha256.New()}
 }
 
 func (c *checker) digestLine(canon []byte) {
@@ -630,6 +751,17 @@ func (c *checker) line(l *Line) error {
 	}
 	if _, ok := c.h.At[l.NS]; !ok {
 		return fail("namespace %s has no at in the header", l.NS)
+	}
+	if g := l.GrantLine; g != nil {
+		if !c.h.Authors {
+			return fail("a grant line in a bundle without authors")
+		}
+		gk := l.NS + "\x00" + g.ID
+		if c.grants[gk] {
+			return fail("grant %s comes more than once for %s", g.ID, l.NS)
+		}
+		c.grants[gk] = true
+		return nil
 	}
 	info, ok := c.h.Docs[k]
 	if !ok {
@@ -665,6 +797,9 @@ func (c *checker) line(l *Line) error {
 	}
 	if info.History != Full {
 		return fail("a history line for a %s document", info.History)
+	}
+	if l.Grant != "" && !c.grants[l.NS+"\x00"+l.Grant] {
+		return fail("line %s names grant %s, which has no grant line before it (§G.4.1)", l.ID, l.Grant)
 	}
 	want := c.h.Requires[k] // "" = genesis
 	if st.lines > 0 {
@@ -816,25 +951,17 @@ type Summary struct {
 	Header *Header
 	Digest string
 	Lines  int // entry lines, header excluded
+	// Signatures reports the author signatures of a bundle with authors
+	// (§C.3.1, §G.4.1); nil for one without, and from Verify or a Reader.
+	// See VerifyWith.
+	Signatures *SigReport
 }
 
 // Verify reads a whole bundle, checking every line and the whole bundle.
+// For a bundle with authors it also reports the signatures, none of them
+// checked against the source (see VerifyWith, SourceKeyChecker).
 func Verify(r io.Reader) (*Summary, error) {
-	rd, err := NewReader(r)
-	if err != nil {
-		return nil, err
-	}
-	n := 0
-	for {
-		_, err := rd.Next()
-		if err == io.EOF {
-			return &Summary{Header: rd.Header(), Digest: rd.Digest(), Lines: n}, nil
-		}
-		if err != nil {
-			return nil, err
-		}
-		n++
-	}
+	return VerifyWith(context.Background(), r, VerifyOptions{})
 }
 
 // --- Writer ----------------------------------------------------------------
@@ -889,7 +1016,13 @@ func (w *Writer) Line(l Line) error {
 		return errors.New("bundle: write after Close")
 	}
 	if !w.h.Authors {
-		l.Author, l.Created, l.Signature, l.Gesture, l.Undoes = "", "", "", "", ""
+		l.Author, l.Created, l.Signature, l.Gesture, l.Undoes, l.Grant = "", "", "", "", "", ""
+	}
+	if l.IsGrant() {
+		if err := w.c.line(&l); err != nil {
+			return err
+		}
+		return w.emit(l.value())
 	}
 	if l.IsSnapshot() && !l.IsBlob() && !l.Deleted {
 		v, err := client.ToValue(docJSON(l.Doc))
