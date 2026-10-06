@@ -168,7 +168,17 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 // where branchAt is the branch revision the plan was classified from. For
 // an e2e target the steps are the sealed ones (see sealItems, which
 // DryRun and Apply run first); plaintext is never sent there.
+//
+// With Options.Signer each step carries the signer's own signature
+// (§C.3.1); a step never carries a source revision's (§C.3). Batch is
+// best effort about signing: DryRun and Apply use batch, which reports a
+// step that can't be signed.
 func (p *Plan) Batch() client.BatchRequest {
+	req, _ := p.batch()
+	return req
+}
+
+func (p *Plan) batch() (client.BatchRequest, error) {
 	req := client.BatchRequest{Source: map[string]any{"ns": p.Branch, "at": p.BranchAt}, SourceAuthorizations: p.opt.SourceAuthorizations}
 	for _, r := range p.Items() {
 		steps := r.Steps
@@ -180,7 +190,12 @@ func (p *Plan) Batch() client.BatchRequest {
 	if p.opt.Config != nil {
 		req.Config = &client.BatchConfig{IfMatch: p.TargetConfig, Patches: p.opt.Config}
 	}
-	return req
+	signed := req
+	signed.Items = append([]client.BatchItem(nil), req.Items...)
+	if err := p.signItems(&signed); err != nil {
+		return req, err
+	}
+	return signed, nil
 }
 
 func (p *Plan) empty(req client.BatchRequest) bool { return len(req.Items) == 0 && req.Config == nil }
@@ -252,7 +267,10 @@ func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	if p.TargetLevel == "e2e" && !p.Clean() {
 		return nil, ErrConflicts
 	}
-	req := p.Batch()
+	req, err := p.batch()
+	if err != nil {
+		return nil, err
+	}
 	if p.empty(req) {
 		return nil, nil
 	}
@@ -289,7 +307,10 @@ func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 		if !p.Clean() {
 			return nil, ErrConflicts
 		}
-		req := p.Batch()
+		req, err := p.batch()
+		if err != nil {
+			return nil, err
+		}
 		if p.empty(req) {
 			return &Result{Noop: true, Attempts: attempt}, nil
 		}

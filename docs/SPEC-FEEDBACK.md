@@ -5,7 +5,70 @@ collects what the reference does that the text doesn't yet describe.
 
 ## Open
 
-Nothing yet for v0.41; notes from implementing it follow below once collected.
+From implementing v0.41 (§C.3.1). Each gives what the reference chose.
+
+**Gate**
+
+1. **The parent at step 1.** The signing input needs the parent, but step 1 runs before the
+   head is read. The reference uses the `If-Match` id (none for a create): a write only
+   passes its precondition when that id is the head it is written on, so this keeps §6.2's
+   order exactly. A write with no precondition (`428`) or a malformed `If-Match` (`400` at
+   step 2) can't be verified, so it falls through to those errors. A missing signature in a
+   `required` namespace is still `422` at step 1. *Propose:* say the parent is the
+   precondition's id.
+2. **A malformed `Signature`** (header or step member, not `<alg>:<kid>:<sig>` with
+   base64url) is `400 bad_input`, as request shape. A listed kid with an `alg` other than
+   Ed25519 fails verification (`422`). *Propose:* name the status.
+3. **Idempotent retries.** Signatures are checked before the retry lookup. A retry whose
+   signature doesn't verify is `422`, not a replay; so is an unsigned retry, after
+   `required` was turned on, of a write made before. *Question:* which should win?
+4. **A batch whose config change has a stale precondition.** Listed kids are verified
+   against the current configuration, but `required` isn't applied, since the change's
+   effect is unknown. As with an authorisation failure there, the batch answers `412`.
+5. **Failures inside a batch** are reported per item in the `batch` error, with
+   `items[].code: "signature"`, like other step-1 failures.
+
+**Grants and logs**
+
+6. **Resource logs while authentication is disabled.** Namespace logs serve
+   `"grant": null`; resource logs leave `grant` out, since the revision row records no
+   mode. *Question:* should resource logs serve `null` too?
+7. **"Recorded by entries"** for `GET /ns/{ns}/grants/{gid}` is read as namespace log
+   entries; a write's revisions record the same grant as its entry. A purged namespace
+   answers `410` after the `read` and `not_offered` checks; the text is silent on it.
+
+**Operator key history**
+
+8. **`from` for keys already configured.** Nothing says how a deployment establishes when
+   an existing operator key came into force. The reference publishes it from the
+   deployment's first namespace log entry (or start time if empty), unless the operator
+   lists a period. Keys listed with an `until` in the past are published but authorise
+   nothing. The JWKS is served `application/jwk-set+json`, `public, max-age=300`.
+   *Propose:* name the media type and say the period of a key is the operator's to declare.
+
+**Bundles (§G.4.1)**
+
+9. **How a history line names its grant.** Grant lines carry `grant: gid`, but nothing says
+   how a revision line points at one. The reference adds `grant: gid` to history lines
+   (with authors). A line naming a grant with no earlier grant line, a duplicate grant
+   line, or a grant line without `authors` is refused. *Propose:* specify the member.
+10. **(important) Sealed and end-to-end bundles can't carry grants.** §C.3.1 says "their
+    bundles carry the grants", but the endpoint isn't offered there and no other API gives
+    the exporter them. The reference writes no grant lines for such namespaces, so their
+    signatures verify as unverifiable, and says so in the export plan's notes. *Propose:*
+    either offer `GET …/grants/{gid}` sealed (sealed like a log range), or serve grants
+    through the `export` verb.
+11. **Branch bundles.** A signature binds the namespace it was written in, but a branch
+    bundle names the exporting branch as `ns` on every line, so a revision the branch reads
+    through from its base fails the digest under the branch's name. *Propose:* lines (or
+    grant lines) record the namespace a revision was written in, when it differs.
+12. **Key lookup for `key`.** The exporter takes the first of: the namespace document's keys
+    at the position of the first revision naming the grant; the operator JWK Set at that
+    revision's `created`; any version of the namespace document. The text says "the key
+    entry the grant's root block verified against at the source", which an API-only
+    exporter has to reconstruct this way.
+13. **Archives (§8.6)** keep signatures but no grant lines, so archived signatures report
+    as unverifiable. *Question:* should archives carry grants like bundles?
 
 ## Settled in v0.41
 

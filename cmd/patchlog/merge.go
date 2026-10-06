@@ -5,8 +5,8 @@ package main
 //
 //	patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}  (cmd/patchlog/release.go)
 //	patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
-//	        [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
-//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-identity key.jwk]... [-json]
+//	        [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
+//	patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]... [-json]
 //	patchlog janitor -api URL -ns base1,base2 [-release LINK]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
 
 import (
@@ -26,29 +26,49 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 const mergeUsage = `usage:
   patchlog merge release plan|approve|apply|status|rebase … /r/{ns}/{release}   (§F.9; see patchlog merge release)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A]
-          [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-identity key.jwk]... [-json]
+          [-freeze] [-squash] [-sign-key kid:seed] [-resolve name=file.json]... [-config patches.json] [-identity key.jwk]... [-json]
+  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-sign-key kid:seed] [-bearer T] [-author A] [-identity key.jwk]... [-json]
   patchlog janitor -api URL -ns base1,base2 [-release /r/{ns}/{release}]... [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]`
 
 // toolFlags are the connection flags shared by the Addendum F tools.
 type toolFlags struct {
 	api, bearer, author *string
 	asJSON, dev         *bool
+	signKey             *string
 }
+
+// signKeyEnv names the environment variable that sets -sign-key.
+const signKeyEnv = "PATCHLOG_SIGN_KEY"
+
+const signKeyHelp = "kid:seed (the seed 32 bytes in base64url; default $" + signKeyEnv + "): sign every step this tool writes with this key (§C.3.1). The kid must be listed in the signers of the grant (-bearer) the writes are sent under. Original signatures are never carried over"
 
 func addToolFlags(fs *flag.FlagSet) toolFlags {
 	return toolFlags{
-		api:    fs.String("api", "http://localhost:8080", "deployment base URL"),
-		bearer: fs.String("bearer", "", "grant sent as Authorization: Bearer"),
-		author: fs.String("author", "", "X-Author (development servers only)"),
-		asJSON: fs.Bool("json", false, "print JSON"),
-		dev:    fs.Bool("dev", false, "ignored, kept for scripts: whether the deployment runs with authentication disabled is read from GET / (§1, §7)"),
+		api:     fs.String("api", "http://localhost:8080", "deployment base URL"),
+		bearer:  fs.String("bearer", "", "grant sent as Authorization: Bearer"),
+		author:  fs.String("author", "", "X-Author (development servers only)"),
+		asJSON:  fs.Bool("json", false, "print JSON"),
+		signKey: fs.String("sign-key", os.Getenv(signKeyEnv), signKeyHelp),
+		dev:     fs.Bool("dev", false, "ignored, kept for scripts: whether the deployment runs with authentication disabled is read from GET / (§1, §7)"),
 	}
+}
+
+// signer returns the key of -sign-key (or $PATCHLOG_SIGN_KEY), nil if unset.
+func (tf toolFlags) signer() *sig.Key {
+	if *tf.signKey == "" {
+		return nil
+	}
+	k, err := sig.ParseKey(*tf.signKey)
+	if err != nil {
+		toolFatal(fmt.Errorf("-sign-key: %w", err))
+	}
+	return &k
 }
 
 func (tf toolFlags) client() *client.Client {
@@ -155,7 +175,7 @@ func mergeCmd(args []string) {
 	if target == "" {
 		target = branchBase(ctx, c, *branch)
 	}
-	opt := merge.Options{Squash: *squash, E2E: e2eView(c, identities)}
+	opt := merge.Options{Squash: *squash, E2E: e2eView(c, identities), Signer: tf.signer()}
 	if *cfgFile != "" {
 		v, err := readJSONFile(*cfgFile)
 		if err != nil {
@@ -490,7 +510,7 @@ func rebaseCmd(args []string) {
 	}
 	ctx := context.Background()
 	c := tf.client()
-	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw, Plan: merge.Options{E2E: e2eView(c, identities)}})
+	res, err := merge.Rebase(ctx, c, merge.RebaseOptions{Branch: *branch, New: *newName, Onto: *onto, Switch: *sw, Plan: merge.Options{E2E: e2eView(c, identities), Signer: tf.signer()}})
 	if *tf.asJSON {
 		out := map[string]any{"result": res}
 		if err != nil {

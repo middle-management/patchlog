@@ -56,8 +56,9 @@ type ExportOptions struct {
 	// UntypedRefs treats any string of an untyped document that has the
 	// form of a reference (/r/…) as a reference (opt-in, §G.4.2).
 	UntypedRefs bool
-	// Authors includes authors, creation times, author signatures, and
-	// gestures (gesture and undoes, §G.4.1).
+	// Authors includes authors, creation times, author signatures, the
+	// grants they were written under (as grant lines, before the first
+	// line that names each) and gestures (gesture and undoes, §G.4.1).
 	Authors bool
 	// Requires makes an incremental bundle: "ns/name" → an id already in
 	// the target. Full documents then start right after it; a document
@@ -133,6 +134,9 @@ type ExportPlan struct {
 	Docs     map[string]*PlannedDoc `json:"docs"`
 	External []string               `json:"external,omitempty"`
 	Access   map[string]string      `json:"access"` // namespace → access level (§G.5.1)
+	// Notes, set by Write, says what an export with authors couldn't carry:
+	// grants it left out, and why (see grants_export.go).
+	Notes []string `json:"notes,omitempty"`
 
 	c       *client.Client
 	opt     ExportOptions
@@ -769,6 +773,10 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 	}
 	sort.Strings(keys)
 	n := 0
+	var ge *grantExporter
+	if p.opt.Authors {
+		ge = newGrantExporter(p)
+	}
 	for _, k := range keys {
 		d := p.Docs[k]
 		// Blob lines, each right before the first line that references it.
@@ -793,7 +801,21 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 				if err := blobs(e.ID); err != nil {
 					return nil, err
 				}
-				if err := bw.History(d.NS, d.Name, e); err != nil {
+				l := HistoryLine(d.NS, d.Name, e, p.opt.Authors)
+				if ge != nil {
+					if gid := grantEntry(e); gid != "" {
+						before := ge.n
+						ok, err := ge.ensure(ctx, bw, d.NS, gid, e)
+						if err != nil {
+							return nil, err
+						}
+						n += ge.n - before
+						if ok {
+							l.Grant = gid
+						}
+					}
+				}
+				if err := bw.Line(l); err != nil {
 					return nil, err
 				}
 				n++

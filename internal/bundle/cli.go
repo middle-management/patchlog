@@ -17,6 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // CLIUsage documents the bundle commands.
@@ -25,8 +26,30 @@ const CLIUsage = `  patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode 
           [-recipient key.jwk]... [-plaintext] [-identity id.jwk]
   patchlog import -api URL -ns TARGET[,src=dst] -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T] [-author A]
           [-resolve ns/name=skip|take|replay]... [-create=false] [-json] [-identity id.jwk] [-allow-less-protected]
-  patchlog bundle verify -i file.jsonl [-identity id.jwk] [-json]
+          [-sign-key kid:seed]
+  patchlog bundle verify -i file.jsonl [-identity id.jwk] [-json] [-signatures]
+          [-source URL [-bearer T] [-author A]]    (-source checks signer keys against the source's namespace log, §C.3.1)
   patchlog bundle keygen -o id.jwk      (prints the public key, for -recipient and a grant's enc)`
+
+// SignKeyEnv names the environment variable that sets -sign-key.
+const SignKeyEnv = "PATCHLOG_SIGN_KEY"
+
+// signKeyFlag registers -sign-key, defaulting to $PATCHLOG_SIGN_KEY.
+func signKeyFlag(fs *flag.FlagSet) *string {
+	return fs.String("sign-key", os.Getenv(SignKeyEnv), "kid:seed (the seed 32 bytes in base64url; default $"+SignKeyEnv+"): sign every step this import writes with this key (§C.3.1). The kid must be listed in the signers of the grant (-bearer). The bundle's own signatures are never re-sent")
+}
+
+// parseSignKey parses a -sign-key value; "" is no key.
+func parseSignKey(v string) (*sig.Key, error) {
+	if v == "" {
+		return nil, nil
+	}
+	k, err := sig.ParseKey(v)
+	if err != nil {
+		return nil, fmt.Errorf("-sign-key: %w", err)
+	}
+	return &k, nil
+}
 
 type multiFlag []string
 
@@ -210,6 +233,9 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	for _, e := range plan.External {
 		fmt.Fprintf(stderr, "  external %s\n", e)
 	}
+	for _, n := range plan.Notes {
+		fmt.Fprintf(stderr, "  note: %s\n", n)
+	}
 	return nil
 }
 
@@ -282,7 +308,7 @@ func schemaNamespaces(open Opener) (map[string]bool, *Header, error) {
 		if err != nil {
 			return nil, nil, err
 		}
-		if l.IsBlob() {
+		if l.IsBlob() || l.IsGrant() {
 			continue
 		}
 		if l.IsSnapshot() {
@@ -311,17 +337,22 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.Var(&resolves, "resolve", "resolve a conflict: ns/name=skip|take|replay (repeatable)")
 	idFile := fs.String("identity", "", "private key (JWK): opens a sealed bundle, and unwraps the keys of sealed targets (§G.5.1.1, §E.2.3)")
 	allowLess := fs.Bool("allow-less-protected", false, "operator override: import private or sealed namespaces into public targets (§G.5.1)")
+	signKey := signKeyFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *in == "" {
 		return fmt.Errorf("import: -i is required")
 	}
+	signer, err := parseSignKey(*signKey)
+	if err != nil {
+		return err
+	}
 	identity, err := loadIdentity(*idFile)
 	if err != nil {
 		return err
 	}
-	opt := ImportOptions{DryRun: *dry, CreateNamespaces: *create, UpstreamSuffix: *suffix, Resolutions: map[string]Resolution{}, AllowLessProtected: *allowLess}
+	opt := ImportOptions{DryRun: *dry, CreateNamespaces: *create, UpstreamSuffix: *suffix, Resolutions: map[string]Resolution{}, AllowLessProtected: *allowLess, Signer: signer}
 	switch {
 	case *atomic && *pace != "":
 		return fmt.Errorf("import: choose one of -atomic and -pace")
@@ -430,6 +461,10 @@ func cliVerify(args []string, stdout io.Writer) error {
 	in := fs.String("i", "", "bundle file")
 	asJSON := fs.Bool("json", false, "print JSON")
 	idFile := fs.String("identity", "", "private key (JWK) that opens a sealed bundle")
+	source := fs.String("source", "", "the source deployment's base URL: checks the key of each grant line against its namespace log and operator key history (§C.3.1), so complete chains are verified, not only attested")
+	bearer := fs.String("bearer", "", "-source: grant sent as Authorization: Bearer (needs read)")
+	author := fs.String("author", "", "-source: X-Author (development servers only)")
+	perRev := fs.Bool("signatures", false, "list the signature status of every revision")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -449,7 +484,19 @@ func cliVerify(args []string, stdout io.Writer) error {
 	if err != nil {
 		return err
 	}
-	s, err := Verify(plain)
+	var vo VerifyOptions
+	if *source != "" {
+		sc, err := connect(*source, *bearer, *author, identity)
+		if err != nil {
+			return err
+		}
+		vo.Keys = SourceKeyChecker(sc)
+	}
+	var results []SigResult
+	if *perRev {
+		vo.OnSignature = func(r SigResult) { results = append(results, r) }
+	}
+	s, err := VerifyWith(context.Background(), plain, vo)
 	if err != nil {
 		return err
 	}
@@ -462,9 +509,16 @@ func cliVerify(args []string, stdout io.Writer) error {
 		}
 	}
 	if *asJSON {
-		writeJSON(stdout, map[string]any{"ok": true, "digest": s.Digest, "origin": s.Header.Origin, "created": s.Header.Created,
+		out := map[string]any{"ok": true, "digest": s.Digest, "origin": s.Header.Origin, "created": s.Header.Created,
 			"at": s.Header.At, "full": full, "snapshot": snap, "lines": s.Lines, "external": s.Header.External, "requires": s.Header.Requires,
-			"access": s.Header.Access, "sealed": sealed})
+			"access": s.Header.Access, "sealed": sealed}
+		if s.Signatures != nil {
+			out["signatures"] = s.Signatures
+			if *perRev {
+				out["revisions"] = results
+			}
+		}
+		writeJSON(stdout, out)
 		return nil
 	}
 	fmt.Fprintf(stdout, "ok: bundle %s from %s, created %s\n", s.Digest, s.Header.Origin, s.Header.Created)
@@ -481,8 +535,42 @@ func cliVerify(args []string, stdout io.Writer) error {
 	if len(s.Header.External) > 0 {
 		fmt.Fprintf(stdout, "  external: %s\n", strings.Join(s.Header.External, ", "))
 	}
+	printSignatures(stdout, s, results, *source != "")
 	fmt.Fprintln(stdout, "  snapshot lines and the header are only as trustworthy as the channel that delivered the bundle (§G.4.1)")
 	return nil
+}
+
+// printSignatures prints the signature report of a bundle with authors.
+func printSignatures(w io.Writer, s *Summary, results []SigResult, online bool) {
+	if s.Signatures == nil {
+		return
+	}
+	r := s.Signatures
+	fmt.Fprintf(w, "  signatures (%d grant lines): %d verified, %d attested, %d failed, %d unverifiable, %d unsigned\n", r.Grants,
+		r.Counts[SigVerified], r.Counts[SigAttested], r.Counts[SigFailed], r.Counts[SigUnverifiable], r.Counts[SigUnsigned])
+	if r.Counts[SigAttested] > 0 && !online {
+		fmt.Fprintln(w, "    attested: the chain is complete up to the key the exporter names; check it against the source with -source (§C.3.1)")
+	}
+	for _, g := range r.BadGrants {
+		fmt.Fprintf(w, "    bad grant line %s\n", g)
+	}
+	list := r.Problems
+	if len(results) > 0 {
+		list = results
+	}
+	for _, x := range list {
+		line := fmt.Sprintf("    %s/%s %s: %s", x.NS, x.Resource, x.ID, x.Status)
+		if x.Kid != "" {
+			line += " kid " + x.Kid
+		}
+		if x.Sub != "" {
+			line += " sub " + x.Sub
+		}
+		if x.Reason != "" {
+			line += " (" + x.Reason + ")"
+		}
+		fmt.Fprintln(w, line)
+	}
 }
 
 func sortedKeys(m map[string]string) []string {

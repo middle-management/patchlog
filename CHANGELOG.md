@@ -1,5 +1,35 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.41**: verifiable author signatures (§C.3.1), adopted from the
+reference's proposal P1.
+
+**Changes to check before upgrading:**
+- **Signatures whose kid the grant lists are now verified** at the end of §6.2 step 1,
+  before rate limits: `422 signature`. A malformed `Signature` is `400`, and so is a
+  `Signature` header on a batch request (steps carry their own `signature`).
+- **Grants:** a root block may list `signers`; a narrowing block carrying it, or a malformed
+  entry, makes the grant invalid (`401`).
+- Every batch step now stores its own signature; only an item's first step used to.
+- `GET /` answers `"spec": "0.41"` and adds `jwks_uri`.
+
+**New:**
+- `"signatures": "optional" | "required"` namespace-document member, guarded by a `*` key
+  (of the base, in branches). Under `required` every revision and tombstone needs a valid
+  signature by a signer of its grant.
+- Resource logs and write responses serve each revision's `grant: { id, sub, kid }`.
+- `GET /ns/{ns}/grants/{gid}` serves stored grants (`{ id, root, stored }`), including those
+  of local bases up to their `at`; `404 not_offered` in sealed and end-to-end namespaces.
+- `/.well-known/patchlog-keys`: the operator key history as a JWK Set (`serve
+  -operator-key-history`, `-jwks-uri`).
+- Go client: `WithSigner`, `SignWrite`, `Step.Signature`, `Client.Grant`, `OperatorKeys`.
+- Bundles with authors carry grant lines (with the key each verified against) and a `grant`
+  member on history lines; `patchlog bundle verify -signatures [-source URL]` reports
+  verified / attested / failed / unsigned / unverifiable per revision.
+- `patchlog import`, `merge` (plan/apply/release) and `rebase` sign their own steps with
+  `-sign-key kid:seed` or `$PATCHLOG_SIGN_KEY`.
+
 ## v0.10.0
 
 Also implements spec **v0.40**, which adopts most of the reference's v0.39 notes.

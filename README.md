@@ -73,8 +73,9 @@ and serves immutable, CDN-cacheable revisions.
   every read. Both §9 deployments are supported: behind a grant-verifying edge
   (`-edge-secret`) private content gets edge lifetimes, otherwise it is `no-store` for shared
   caches (see [Private namespaces and the edge](#private-namespaces-and-the-edge)).
-- Author signatures (§C.3): a `Signature` header is stored with the revision and returned
-  in the log, but not verified.
+- Author signatures (§C.3.1): a signature whose kid the grant's root `signers` lists is
+  verified at the gate (`422 signature`); others are stored unverified. See
+  [Author signatures](#author-signatures).
 
 ## Releases and images
 
@@ -1436,6 +1437,15 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
   signature, and its `gesture` and `undoes` (§G.4.1). Imports write the gestures with the
   revisions (batch step objects, §7.5), so undo history survives the move; authors and times
   stay the importer's, as for any batch. Without authors a line carrying them is refused.
+- **Signatures** (§C.3.1): with authors, a bundle carries one grant line per grant its history
+  references, with the key it verified against at the source; history lines name their grant
+  in a `grant` member. `patchlog bundle verify -signatures` reports each revision as verified,
+  attested (the chain completes only through the exporter's `key`), failed, unsigned or
+  unverifiable; `-source URL` checks `key` against the source's namespace log and operator
+  key history, turning attested into verified. Sealed and end-to-end namespaces don't offer
+  their grants over the API, so their bundles carry signatures without grant lines.
+  `patchlog import` and the merge tools sign their own steps with `-sign-key kid:seed` (or
+  `$PATCHLOG_SIGN_KEY`); original signatures are never re-sent.
 - **Snapshot bundles** go through `{ns}-upstream` namespaces. Pinned references between snapshot
   documents are rewritten to them, keeping any `#id` fragment.
 - **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
@@ -1631,6 +1641,32 @@ with the key-scope fields of §C.4. Operator keys (`-operator-key`) get kid `ope
 namespace's name, which need not exist yet, or `"*"`, in `ns`. Only operator grants may use
 `"*"`: a grant signed by a namespace key that names `"*"` is refused with `403` (it is valid, it
 just doesn't apply).
+
+### Author signatures
+
+A root block may list the principal's signing keys, and a client signs each write over
+§C.3's input (tombstones with `tombstone` in place of the patch set):
+
+```sh
+patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["docs"],
+  "can":["append"],"exp":"…","signers":[{"kid":"ann-1","alg":"Ed25519","pub":"<43 chars>"}]}'
+```
+
+- The gate verifies a signature whose kid the grant lists (`422 signature`) at the end of §6.2
+  step 1, using the `If-Match` id as the parent (nil for a create). A malformed `Signature`
+  is `400`, and so is the header on a batch: each step object carries its own `signature`.
+- `"signatures": "required"` in the namespace document (a `*` key) makes every revision and
+  tombstone need a valid signature by a signer of its grant. Narrowing blocks can't carry
+  `signers`, so delegated grants can't write there.
+- Resource logs serve each revision's `grant: { id, sub, kid }` and `signature`, and
+  `GET /ns/{ns}/grants/{gid}` serves the stored grant (`{ id, root, stored }`) to readers with
+  unrestricted `read`; sealed and end-to-end namespaces answer `404 not_offered`.
+- `GET /` gives `jwks_uri`, by default `/.well-known/patchlog-keys`: the operator key history
+  as a JWK Set, each key with `"patchlog": { "from", "until"? }`. `serve
+  -operator-key-history KID=PUB,FROM[,UNTIL]` records retired keys (published, but they
+  authorise nothing); a configured operator key without a period is published from the
+  deployment's first namespace log entry. `-jwks-uri` points it elsewhere.
+- The Go client signs with `client.WithSigner(sig.Key)`.
 
 ## Design notes
 
@@ -1837,7 +1873,7 @@ just doesn't apply).
   `BatchItem`/`BatchRequest` defaults, reads them from `WriteResult`, `LogEntry`, `NSEntry`
   (`Gestures` for batches) and lists with `Gestures`/`GesturesPage`; `client.NewGesture` makes
   an id.
-- **`GET /`** answers `{ "spec": "0.40", "auth": "grants" | "disabled", "origin" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.41", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace

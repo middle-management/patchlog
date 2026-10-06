@@ -81,6 +81,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/release"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/sig"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -338,6 +339,11 @@ type ReleaseOptions struct {
 	// -> config id, ReleasePlan.FrozenBy): PlanRelease doesn't count them
 	// as frozen.
 	AcceptFrozen map[string]string
+	// Signer, if set, signs every step the release writes (§C.3.1). Its
+	// key must be listed in the signers of the grant the batches are sent
+	// under, which for catalog batches is the service's, so a catalog
+	// merge normally signs with the service's key or not at all.
+	Signer *sig.Key
 }
 
 func (o *ReleaseOptions) now() time.Time {
@@ -644,7 +650,7 @@ func (x *relCtx) classify(ctx context.Context) error {
 		if len(b.Schemas) == 0 {
 			continue
 		}
-		p, err := NewPlan(ctx, x.c, b.Target, b.NS, Options{Resources: b.Schemas, SourceAuthorizations: x.opt.SourceAuthorizations})
+		p, err := NewPlan(ctx, x.c, b.Target, b.NS, Options{Resources: b.Schemas, SourceAuthorizations: x.opt.SourceAuthorizations, Signer: x.opt.Signer})
 		if err != nil {
 			return err
 		}
@@ -658,7 +664,7 @@ func (x *relCtx) classify(ctx context.Context) error {
 		if b.Catalog || len(b.Content) == 0 {
 			continue
 		}
-		p, err := NewPlan(ctx, x.c, b.Target, b.NS, Options{Resources: b.Content, SourceAuthorizations: x.opt.SourceAuthorizations})
+		p, err := NewPlan(ctx, x.c, b.Target, b.NS, Options{Resources: b.Content, SourceAuthorizations: x.opt.SourceAuthorizations, Signer: x.opt.Signer})
 		if err != nil {
 			return err
 		}
@@ -798,7 +804,7 @@ func (x *relCtx) catalogBase(ctx context.Context, target string) (map[string]any
 // and step 4 (the rest), with halves for split nodes and for new folders
 // a narrowing move needs.
 func (x *relCtx) catalogSteps(ctx context.Context, b *ReleaseBranch) (narrow, wide []string, err error) {
-	p, err := NewPlan(ctx, x.c, b.Target, b.NS, Options{Resources: b.Content})
+	p, err := NewPlan(ctx, x.c, b.Target, b.NS, Options{Resources: b.Content, Signer: x.opt.Signer})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1707,7 +1713,7 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 	if len(all) == 0 {
 		return nil, sortItems(items), nil
 	}
-	p, err := NewPlan(ctx, c, b.Target, b.NS, Options{Resources: all, SourceAuthorizations: opt.SourceAuthorizations})
+	p, err := NewPlan(ctx, c, b.Target, b.NS, Options{Resources: all, SourceAuthorizations: opt.SourceAuthorizations, Signer: opt.Signer})
 	if err != nil {
 		return nil, nil, err
 	}
