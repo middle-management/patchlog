@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.10.0
 
 Also implements spec **v0.40**, which adopts most of the reference's v0.39 notes.
 Two came out the other way, and the reference now follows the text:
