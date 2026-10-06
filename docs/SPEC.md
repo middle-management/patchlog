@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.39 · 2026-10-03. See the change log at the end.
+Status: draft v0.40 · 2026-10-05. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -361,7 +361,7 @@ The answer lists, as `referencing`, the referencing namespaces in which the call
 
 ### 6.2 On write
 
-The order of checks at the gate is normative:
+The order of checks at the gate is normative. Only errors in a request's own shape, which no state influences, may come before step 1: malformed names or URLs, content types, header and body syntax, and the size of what is read (`400`, `413`, `415`), unless an endpoint fixes its own order, as blob uploads do (§7.8). Everything else follows this order:
 
 - **Authenticate and authorise** the request (Addendum C): `401` or `403`. This covers the verbs and every grant, key-scope and role rule that refers only to `/action`, `/resource`, `/principal` or `/now` (§C.2), so a grant limited to one resource learns nothing about others. A `PATCH` with `If-Match` may be an append or a restore, which only the resource's state decides. It passes this step if, for `append` or for `restore`, the grant allows that verb and every step-1 rule passes with `/action` set to it. Those are its **candidate verbs**. Step 2 settles which one the write is, and step 6 evaluates the rules again with the settled action. In a batch (§7.5), a patch set that follows a `"delete"` step in the same item is a restore and any other later step an append; those verbs are known from the request and are checked here like `"delete"`. Rate limits (§6.6) are checked last in this step, only for requests that passed it: `429`.
 
@@ -510,7 +510,9 @@ There is deliberately no previous state in the envelope. Rules judge the resulti
 
 - **Config writes are rule-checked too.** Namespace rules also apply to `config` writes, except for principals whose grant chains to a key with `can: ["*"]`, so that a bad rule set cannot lock everyone out.
 
-- **Rules see every action,** including `delete`, `purge`, `config`, `branch` (evaluated in the base) and `purge-ns`, where `doc` is the deleted document, null or a namespace document. Rules about documents should therefore be scoped with `if` on `/action`, as in §6.4.4. Rules about a document's shape, in particular, should exempt `delete`: otherwise a document written under earlier rules can't be deleted.
+- **Operator overrides.** A purge or namespace purge forced past an `in_use` refusal under a deployment operator grant (§6.1) isn't judged by namespace rules either: forcing is the operator's override of policy, and a rule such as "only `ops` may purge" is policy of the same kind. A purge forced with a `*` key of the branch, inherited or its own, is still judged, and so is any purge while authentication is disabled (§1), where no operator grant is verified.
+
+- **Except as above, rules see every action,** including `delete`, `purge`, `config`, `branch` (evaluated in the base) and `purge-ns`, where `doc` is the deleted document, null or a namespace document. Rules about documents should therefore be scoped with `if` on `/action`, as in §6.4.4. Rules about a document's shape, in particular, should exempt `delete`: otherwise a document written under earlier rules can't be deleted.
 
 #### 6.4.4 Examples
 
@@ -602,7 +604,7 @@ Without the `editor` role, a principal may only create, edit, restore or delete 
 | grant size | `grantSize` | 8 KiB |
 | items per batch | `itemsPerBatch` | 1,000 |
 | batch size (all patch sets) | `batchSize` | 16 MiB |
-| log page size for log ranges (§7.1), `/heads` pages (§7.4), event-stream catch-up (§7.3) and long-poll answers (§7.7), deployment only | `logPageSize` | 1,000 entries |
+| log page size for log ranges (§7.1), `/heads` pages and gesture listings (§7.4), event-stream catch-up (§7.3) and long-poll answers (§7.7), deployment only | `logPageSize` | 1,000 entries |
 | branch depth (bases of bases), deployment only | `branchDepth` | 8 |
 | live branches per namespace | `branchesPerNamespace` | 100 |
 | writes per resource, per principal | `ratePerResource` | 10/s, burst 20 |
@@ -637,7 +639,7 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
   - **Exceeding one** is `429 Too Many Requests` with `Retry-After`, `code: "rate"`, and the limit that was hit.
 
-  - **Cost.** A request is admitted while every bucket it draws on holds at least one token, and its cost is then deducted, even below zero. A batch costs one token per resource it touches from each per-resource bucket, and one token per item from the principal and namespace buckets. So a batch larger than a burst is still admitted, takes the buckets below zero, and delays the writes after it. A blob upload (§7.8) costs one token from the per-resource, principal and namespace buckets, and its size from the principal's `blobRate` bucket.
+  - **Cost.** A request is admitted while every bucket it draws on holds at least one token, and its cost is then deducted, even below zero. A batch costs one token per resource it touches from each per-resource bucket, and one token per item from the principal and namespace buckets; its `config` change, if any, costs one token from the principal and namespace buckets unless it is exempt (below), as a config write does, so only a batch with no items and an exempt change costs nothing. So a batch larger than a burst is still admitted, takes the buckets below zero, and delays the writes after it. A blob upload (§7.8) costs one token from the per-resource, principal and namespace buckets, and its size from the principal's `blobRate` bucket.
 
   - **Exempt:** config writes under a `*` key, config writes whose `writes` are non-empty and all at `/frozen`, `/successor` or `/merged` and whose resulting document has `frozen: true`, purges, and entries the server writes itself (purge propagation, §8.3). Freezing a namespace or revoking a key must never wait.
 
@@ -676,7 +678,7 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 ## 7. HTTP API
 
-Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.39", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum G adds `origin` (§G.1). Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
+Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.40", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum G adds `origin` (§G.1). Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
 **Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Gesture`, `Undoes`, `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
 
@@ -749,6 +751,8 @@ Writes are **never** unconditional: a write without a precondition is `428`. The
 
   - An idempotent retry (§7.2) is answered with the entry as first recorded, whatever its retry carries, and its `Gesture` and `Undoes` headers say what was recorded.
 
+  - A namespace-document write (§7.4) is a write too, and carries them the same way. A batch's `config` change carries none: a batch's defaults apply to its items' steps. Undoing a config change is outside §11.2.
+
 -
 **Idempotent retry.** Suppose the precondition fails, but the log already contains the entry this request would have produced, recorded **with that parent**:
 
@@ -788,7 +792,7 @@ If that entry was written by the **same principal**, respond `200` with it inste
 | `GET /ns/{ns}/rev/{ns_id}/log?since={a}` | `200` with an array of `{ id, prev, kind, resource?, name?, remote?, at?, target?, entries?, source?, forced?, author, grant?, gesture?, undoes?, gestures?, created }`, following §3.5, where `gesture` and `undoes` are those of a single write, and `gestures` maps each resource of a batch to a list of `{ "gesture"?, "undoes"? }`, one per step (§7.2), none of them hashed, and `grant` is `{ "id", "sub", "kid" }`: the grant id (§C.3) in the text form of §3.2, and its root `sub` and `kid`. A local branch's creation records the creator's grant on both its entries, and a namespace's genesis the operator's. `grant` is absent from entries the server writes itself: propagated purges, purges applied from a remote base, and the prunes and epoch rotations the server performs on its own. Prunes and rotations by a janitor or operator service record its grant, and the schema namespaces a remote branch mirrors at creation record the creating operator's. It is `null` on entries written while authentication is disabled (§1), and absent from entries written before v0.37 unless the grant can be recovered from their revisions; such entries count for no one in `merge.authors` and claim checks (§F.3, §F.6). Paged as in §7.1 | immutable |
 | `GET /ns/{ns}/rev/{ns_id}/heads?after={name}` | `200` with a page of `{ resource, kind, target }`, one per resource as of that revision, including resources a branch reads through, in ascending byte order of name, strictly after `after`, which is a plain bound and needn't name an existing resource; `next` for the following page | immutable |
 | `GET /ns/{ns}/events?since={ns_id}` | SSE of namespace entries | `no-store` |
-| `GET /ns/{ns}/gestures/{gesture}` | optional: `200` with `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]`, one per revision or tombstone written with that gesture or undoing it, oldest first, paged as in §7.1. Requires unrestricted `read` on the namespace (as §7.6 does); not offered in sealed or end-to-end namespaces, whose logs are the place to look | `no-store` |
+| `GET /ns/{ns}/gestures/{gesture}` | optional: `200` with `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]`, one per revision or tombstone written with that gesture or undoing it, oldest first, leaving out purged resources. Paged by `logPageSize`, oldest first: a full page carries `X-Log-Next: {resource}/{id}` (its last row, `id` in text form, unquoted; ids repeat across resources), the next page is `?after=` that value, and a page without `X-Log-Next` is the last. Lists revisions and tombstones only: config writes with that gesture are found in the namespace log. Requires unrestricted `read` on the namespace (as §7.6 does). Not offered in sealed or end-to-end namespaces, whose logs are the place to look: `404` with `code: "not_offered"`, after the `read` check | `no-store` |
 | `GET /ns/{ns}/branches` | `200` with `[{ name, at, frozen, purged, successor?, drafts? }]` for the namespace's direct branches, and `{ remote, at, ns_id, expires }` for remote branches whose registration hasn't expired (§G.3). Requires `read` | head pointer |
 
 **Namespace writes.** The namespace document is edited like a resource, with a JSON Patch on its own URL:
@@ -811,7 +815,7 @@ If that entry was written by the **same principal**, respond `200` with it inste
 
   - **Addendum F:** `merge`, `{ "authors": [{ "sub", "kid" }] }`; `merged`, `{ "at" }`; `cleanup`, `{ "merged"?, "superseded"?, "abandoned"? }` as ISO 8601 durations; and `abandoned`, a boolean. They may appear in any namespace. They mean something in branches, and a base's own `cleanup` sets the minimums for its branches (§F.6).
 
-  - **`x-` members.** Any other top-level member must start with `x-` (case-sensitive) and is stored as data. So may members inside the addenda's objects above, except as keys of `catalogs`, which are catalog names. Role entries are open: the core reads `can`, `rules` and `includes` and ignores the rest, which consumers use, such as `move` and `place` (§C.1.1, §B.11.1). Other nested objects, such as key entries, are strict.
+  - **`x-` members.** Any other top-level member must start with `x-` (case-sensitive) and is stored as data. So may members inside the addenda's objects above, except as keys of `catalogs`, which are catalog names. Role entries are open: the core reads `can` and `rules` and ignores the rest, which consumers use, such as `move`, `place` and `includes` (§C.1.1, §B.11.1, §B.11.4). Other nested objects, such as key entries, are strict.
 
   - **Errors.** Anything else is `422` with `code: "invalid"` and `errors: [{ "pointer", "message" }]`, as for schema validation, so a typo, or a setting from a newer version, is refused rather than silently ignored. This check runs before the `*`-key guard.
 
@@ -870,11 +874,13 @@ Resource purge is never part of a batch.
 -
 **Checks.** Every step is checked with its own envelope, following §6.2 across the whole batch.
 
+  - `items` may be empty or absent when `config` is present.
+
   - The optional `config` change runs steps 1–6 **first**, as a config write (§7.4, including the key and role guards).
 
   - The items are then checked against the configuration it produces, except that `frozen` and the batch limits (§6.6) always come from the current configuration.
 
-  - Batch limits can depend on the principal, through an allowance (§6.6). The principal is known as soon as the grant is verified, so the server stops reading a body larger than that principal's `batchSize` at once (`413`), which reveals nothing about any item. Item counts are checked at step 4, like other limits.
+  - Batch limits can depend on the principal, through an allowance (§6.6). The principal is known as soon as the grant is verified, so the server stops reading a body larger than that principal's `batchSize`, plus room for the batch's own envelope (item names, preconditions, a `config` change), at once (`413`), which reveals nothing about any item. Item counts are checked at step 4, like other limits.
 
   - Items may reference schema revisions created by earlier items (§6.1). Blobs they reference are uploaded or copied before the batch, or, with a local `source`, taken from it, which needs a grant that may read the source there, or one in `Source-Authorization` (§7.8).
 
@@ -1226,7 +1232,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
   - Going below what `retention` keeps for the resource, or pruning where no archive is configured, needs a grant chained to a `*` key. Applying a retention rule that says `"archive": false`, within what it keeps, needs only `prune`: the `*` key was needed to write that rule.
 
-  - `keep` lists extra revisions whose documents stay available, e.g. targets of pinned `x-ref`s found by a reverse-reference consumer (§6.5). A kept document costs far more than the patch set it replaces, so `keep` is limited (§6.6). Each prune's `keep` replaces the resource's earlier `keep` set. The core doesn't interpret `x-ref`. Pinned references to other pruned revisions get `410`.
+  - `keep` lists extra revisions whose documents stay available, e.g. targets of pinned `x-ref`s found by a reverse-reference consumer (§6.5). A kept document costs far more than the patch set it replaces, so `keep` is limited (§6.6). Each prune's `keep` replaces the resource's earlier `keep` set. It is `422` in an E3 namespace, where the server can't compute documents. The core doesn't interpret `x-ref`. Pinned references to other pruned revisions get `410`.
 
   - A `prune` entry `{ resource, kind: "prune", target: H }` is appended to the namespace log, only if the horizon moved. A prune that changes nothing writes nothing.
 
@@ -1238,7 +1244,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
 - **Protected documents.** These keep their documents below the horizon:
 
-  - referenced schema revisions (§6.1), from any namespace of the deployment. This is the same reverse index the purge refusal of §6.1 needs. At E3 the server can't see references, so protect schemas with `keep` or `retention`.
+  - referenced schema revisions (§6.1), from any namespace of the deployment. This is the same reverse index the purge refusal of §6.1 needs. At E3 the server can't see references, so protect schemas with `retention`, applied by a key-holding janitor (below). A prune's `keep` asks the server for documents it can't compute there, and is `422` in an E3 namespace.
 
   - the revisions listed in `keep`
 
@@ -1248,7 +1254,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 
   - The archive is only as trustworthy as its storage. The kept ids let anyone check an archived revision against the live chain.
 
-  - In encrypted namespaces (Addendum E), archives hold patch sets as stored, under the keys that purge destroys. At E3 the server can't compute documents, so a key-holding client supplies `H`'s document as `snapshot` (or, when `H` is a tombstone, the last live document), sealed like a patch set (§E.3.1), and pruning needs an archive. The server already holds that document's declared blob list. Retention at E3 is therefore applied by a key-holding janitor, not by the server.
+  - In encrypted namespaces (Addendum E), archives hold patch sets as stored, under the keys that purge destroys. At E3 the server can't compute documents, so a key-holding client supplies `H`'s document as `snapshot` (or, when `H` is a tombstone, the last live document), sealed like a patch set (§E.3.1), and pruning needs an archive. The server already holds that document's declared blob list. Retention at E3 is therefore applied by a key-holding janitor, not by the server: a client with `read` and `prune` and the epoch keys, which folds each resource, picks the horizon its `retention` asks for, and submits the prune with the sealed `snapshot`. The server skips E3 namespaces when it applies retention itself.
 
   - Restoring archived history into the live store is an operational task (§D.4).
 
@@ -1290,7 +1296,7 @@ Pruning bounds the storage of long or fast-growing histories **without changing 
 | Response | Cache-Control | Tag (`Cache-Tag` / `Surrogate-Key`) |
 |---|---|---|
 | Head pointer (resource or namespace `302`, head `410`) | `public, max-age=0, s-maxage=1, stale-while-revalidate=5` | `ns:{ns}`, and `r:{ns}/{name}` for resources |
-| Immutable (`/rev/{id}`, `/rev/{id}/log`, namespace log ranges, `/blob/{bid}`, `/blob/{bid}/e/{e}` and their ranges) | `public, max-age=86400, s-maxage=31536000, immutable` | `ns:{ns}`, and `r:{ns}/{name}` for resources |
+| Immutable (`/rev/{id}`, `/rev/{id}/log`, namespace log ranges (sealed ones may be sealed again with other bytes, §E.2.2), `/blob/{bid}`, `/blob/{bid}/e/{e}` and their ranges) | `public, max-age=86400, s-maxage=31536000, immutable` | `ns:{ns}`, and `r:{ns}/{name}` for resources |
 | Short (unknown id `404`) | `public, max-age=5` | — |
 | Long (purged `410`) | `public, max-age=86400, s-maxage=31536000` | — |
 | Pruned (`410` below a horizon) | `public, max-age=3600` | `r:{ns}/{name}`, `ns:{ns}` |
@@ -1482,7 +1488,7 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 **Redo** is undoing the undo: its `Undoes` names the undo's gesture. An author's undo stack can be rebuilt on any device from the log: the gestures that author made, minus those the same author undid and didn't redo. An undo by someone else, such as an editor, is shown as undone by them; it doesn't silently drop the gesture from the author's stack, since `Undoes` isn't verified. `Undoes` naming a gesture that no longer exists, for instance after a squashed merge (§F.3), is ignored.
 
 -
-**Scope.** A gesture is a client's grouping, and the server only stores it. Who may undo what is decided by the ordinary rules for the writes the undo makes.
+**Scope.** A gesture is a client's grouping, and the server only stores it. Who may undo what is decided by the ordinary rules for the writes the undo makes. Config writes may carry a gesture (§7.2), but undoing one is out of scope.
 
 ---
 
@@ -1515,6 +1521,8 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 | `pruned` | 410 | The revision, or a revision of the log range, has its patch set pruned (§8.6) |
 | `blob` | 422 | A blob reference is malformed, names a blob that isn't available, or doesn't match it; a copy names another id (§7.8); or an E3 declared list has duplicates or a blob that isn't sealed (§E.3.1) |
 | `blob_mismatch` | 422 | An uploaded blob doesn't hash to its id (§7.8) |
+| `signature` | 422 | An author signature failed verification, where the server verifies them (§C.3) |
+| `not_offered` | 404 | An optional endpoint this namespace doesn't offer, such as `/gestures` in a sealed namespace (§7.4) |
 | `source` | 422 | A batch's local `source.at` isn't in the chain of `source.ns`, for a caller who may read it (§7.5) |
 
 ---
@@ -1531,7 +1539,7 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 
 - **Create conflicts:** a create's `412` returns the existing head to a holder that may have only `create`. Ids aren't secrets (§C.5), but should it answer without the head? The same applies to the per-item preconditions a batch's dry run reports.
 
-- **E3 documents:** the server can't fold E3 documents, so what should `/rev/{id}` serve there, other than a prune's stored snapshot (§7.1)? Head redirects, remote read-through (§G.3) and `keep` (§8.6) all assume a document.
+- **E3 documents:** the server can't fold E3 documents, so what should `/rev/{id}` serve there, other than a prune's stored snapshot (§7.1)? Head redirects and remote read-through (§G.3) assume a document.
 
 - **Namespace-document versions:** should namespace documents carry a version, or a `$schema` of their own, so deployments of different versions can exchange them?
 
@@ -2307,9 +2315,9 @@ Failures are `401` when there is no usable grant: missing, malformed, badly sign
 
   - The input is the **full** digest, and is domain-separated and bound to the deployment, namespace and resource, so a signature can't be replayed into another resource with identical history, even in another deployment with the same names.
 
-  - Signatures are stored **alongside** revisions, never inside ids.
+  - Signatures are stored **alongside** revisions, never inside ids, and served in logs. A server stores them without verifying them; it MAY verify and reject a bad one where it knows the signer's key (`422`, `code: "signature"`). How signers' keys are published is open (§C.9).
 
-  - A signature binds the namespace, so it verifies only where the revision was written. A revision merged or replayed into another namespace (Addendum F) keeps its signature as provenance, verified against the batch's `source`.
+  - A signature binds the namespace, so it verifies only where the revision was written. A revision merged or replayed into another namespace (Addendum F) keeps its signature as provenance, verifiable against the batch's `source`.
 
 ## C.4 Keys, scopes and revocation
 
@@ -2442,6 +2450,8 @@ Grants are carried as Biscuit v3 tokens. Biscuit provides exactly what §C.1 nee
 ## C.9 Open questions
 
 - Should author signatures be required per namespace (a namespace document flag)?
+
+- How are signers' keys published, so a server or bundle tool can verify `Signature`s (§C.3, §G.4.1)?
 
 - Should revocation lists be shared across namespaces, e.g. per issuer?
 
@@ -2977,7 +2987,7 @@ Responses for sealed namespaces use `Content-Type: application/jose` and a JWE (
 
 - sizes and timing
 
-- **Stored once, served forever.** Sealed bytes for a revision are produced once, stored, and served identically forever, so ETags, `304`s and caching are unchanged. Fields a later version adds to what is sealed, such as `grant` in log entries (§7.4), are absent from bytes sealed before; readers accept both. In sealed namespaces, grants recovered for entries written before v0.37 (§7.4) are therefore missing from what readers see, and don't count in the janitor's checks (§F.6).
+- **Stored once, served forever.** Sealed bytes for a revision, a document or a resource log entry are produced once, stored, and served identically forever, so ETags, `304`s and caching are unchanged. Namespace log ranges (§7.4) are the exception: one range per `since` would store a page for every entry, so a deployment MAY keep only some, oldest evicted first, and seal an evicted range again on request, with fresh bytes, under the epoch key and `pad` setting current then. The plaintext is the same except for fields a later version has added (below), so readers accept either copy and MUST NOT rely on one; a range's `ETag`, if it has one, is weak. Fields a later version adds to what is sealed, such as `grant` in log entries (§7.4), are absent from bytes sealed before; readers accept both. In sealed namespaces, grants recovered for entries written before v0.37 (§7.4) are therefore missing from bytes sealed before, and from a range sealed again only if the server still lacks them; they don't count in the janitor's checks (§F.6).
 
 - **Compression.** Compress **before** sealing, and only within a single revision's own content. Log ranges seal each entry separately, so content from different authors is never compressed together (the CRIME/BREACH class of attack).
 
@@ -2989,7 +2999,7 @@ Responses for sealed namespaces use `Content-Type: application/jose` and a JWE (
 
 - **No compression.** Padded payloads are never compressed and carry no `zip` header, since a compression ratio leaks the content that padding is meant to hide.
 
-- **Scope.** Each JWE is padded as a whole, including every JWE of a log range. Turning `pad` on or off affects only what is sealed afterwards: stored sealed bytes are served unchanged forever.
+- **Scope.** Each JWE is padded as a whole, including every JWE of a log range. Turning `pad` on or off affects only what is sealed afterwards: stored sealed bytes are served unchanged forever, and a log range sealed again after eviction (above) is padded as the namespace says then.
 
 - **At E3** ids are over ciphertext, so padding is part of what is hashed, and a retry reuses the exact ciphertext. The server can't check padding there. Readers with keys SHOULD flag a patch set that isn't padded to its bucket when the namespace had `pad` on at that revision, like a failed validation (§E.3.2). That is judged by the namespace document in force at the revision's namespace log entry. A batch that changes the configuration judges its items under the configuration before it. Revisions written while `pad` was off are never flagged.
 
@@ -3582,7 +3592,7 @@ Remote read-through runs in the receiving deployment's server. Export and import
 
 ## G.1 Principles
 
-- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.39", "auth": "grants" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
+- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.40", "auth": "grants" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
 
 - **Ids travel, trust doesn't.** Content that comes **with its history** can be verified by anyone by recomputing ids (invariant 4), given a trusted starting point: an `ns_id` or revision id obtained from the source itself. Integrity then needs no trusted transport, cache or mirror. Snapshots, headers and listings not covered by ids are only as trustworthy as their channel.
 
@@ -3736,7 +3746,7 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
 
 - **`requires`** applies only to `full` documents. `requires[r]` MUST be in the target's chain for `r`. If the target has moved on along another line, `r` is a conflict.
 
-- **Authors, `via`, grant ids, author signatures, `gesture` and `undoes`** are included only with `"authors": true`. Signatures are verified against the header's `origin`.
+- **Authors, `via`, grant ids, author signatures, `gesture` and `undoes`** are included only with `"authors": true`. Bundle tools SHOULD verify signatures against the header's `origin` when they know the signers' keys; an importer carries them either way.
 
 - **Never exported:** purged content.
 
@@ -4132,3 +4142,21 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Note for tools:** since v0.36, validation leaves out a document's top-level `$schema` and fresh `$nonce`; schema tools that also talk to older servers still declare `$schema` in closed schemas.
 
 - **v0.39:** gestures for undo and redo. A write may carry `Gesture` and `Undoes` ids, 128 random bits the client picks per user action, stored with each revision as metadata, outside its id (§7.2). Logs serve them, a batch can set them per step, and an optional endpoint lists a gesture's revisions (§7.4, §7.5). Undo is a client procedure (§11.2): the inverse of the gesture's own entries, newest first and widened to whole arrays, written after checking the later log for overlapping writes and guarded by `ifMatch`; redo undoes the undo, and an author's stack counts that author's undos, showing others' as such. Merges and bundles may carry gestures along (§F.3, §G.4.1), and pruning keeps them.
+
+- **v0.40:** feedback from a second implementation (the reference, through its v0.9.0).
+
+- **Rules (§6.4.3):** a purge forced under a deployment operator grant isn't judged by namespace rules; one forced with a branch's `*` key still is.
+
+- **Gate (§6.2):** errors in a request's own shape (`400`, `413`, `415`) may come before authentication; nothing else may.
+
+- **Gestures (§7.2, §7.4):** config writes carry them too, a batch's config change doesn't, and undoing config is out of scope; the gestures listing pages by `{resource}/{id}`, leaves out purged resources, and answers `404 not_offered` in sealed namespaces.
+
+- **Limits (§6.6, §7.5):** a batch's config change costs a token; the body bound leaves room for the batch envelope.
+
+- **Encryption (§E.2.2, §8.6):** sealed namespace log ranges may be evicted and sealed again; `keep` is `422` at E3, and E3 retention is a key-holding client's job.
+
+- **Roles (§7.4):** the core reads `can` and `rules` in role entries; `includes` is the catalog's.
+
+- **Signatures (§C.3, §G.4.1):** stored and served, not verified by the server unless it knows the key (`422 signature`); bundle tools SHOULD verify when they can.
+
+- **Not adopted:** a public sealed branch of a non-public base. Ciphertext would be safe, but names, sizes and timing aren't, and the base's `read: "grant"` is what hides them from the public (§E.4), so §7.4 keeps its rule.

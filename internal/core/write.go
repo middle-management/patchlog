@@ -483,17 +483,22 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
 					// The request passed step 1, so it draws its tokens,
 					// even though the replay lookup ends it (§6.6, §6.2).
-					if len(items) > 0 {
-						names := make([]string, len(items))
-						for i, it := range items {
-							names[i] = it.Resource
-						}
-						if err := t.rateLimit(n, cur, a, names, len(items)); err != nil {
-							return nil, nil, err
-						}
-						if t.rateDrawn != nil {
-							*t.rateDrawn = true
-						}
+					// Its config change costs a token unless a * key
+					// made it (§6.6); whether it was only a freeze isn't
+					// known once the precondition failed.
+					cost := len(items)
+					if !a.star {
+						cost++
+					}
+					names := make([]string, len(items))
+					for i, it := range items {
+						names[i] = it.Resource
+					}
+					if err := t.rateLimit(n, cur, a, names, cost); err != nil {
+						return nil, nil, err
+					}
+					if t.rateDrawn != nil {
+						*t.rateDrawn = true
 					}
 					exp := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
 					if r := t.replay(n, a, st, &configPlan{expected: &exp}, true); r != nil {
@@ -525,14 +530,27 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	if len(fs) > 0 {
 		return nil, nil, fail(fs)
 	}
+	// A batch costs a token per item, and one for its config change unless
+	// that is exempt (§6.6), so only a batch with no items and an exempt
+	// change costs nothing.
+	cost := len(items)
+	if cplan != nil && !cplan.exempt {
+		cost++
+	}
 	if len(items) > 0 {
 		names := make([]string, len(items))
 		for i, it := range items {
 			names[i] = it.Resource
 		}
 		t.prefetchResources(n.id, names)
+	}
+	if cost > 0 {
+		var names []string
+		for _, it := range items {
+			names = append(names, it.Resource)
+		}
 		if !rateDrawn && (t.rateDrawn == nil || !*t.rateDrawn) {
-			if err := t.rateLimit(n, cfg, a, names, len(items)); err != nil {
+			if err := t.rateLimit(n, cfg, a, names, cost); err != nil {
 				return nil, nil, err
 			}
 			if t.rateDrawn != nil {

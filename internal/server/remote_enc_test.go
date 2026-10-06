@@ -87,9 +87,8 @@ func TestRemoteBranchSealed(t *testing.T) {
 		}
 	}
 	expect(t, b.mkRemote("rel", remoteGenesis("s", at, sealed)), 201)
-	// A sealed public branch of a sealed base is allowed: it only serves
-	// ciphertext.
-	expect(t, b.mkRemote("relpub", remoteGenesis("s", at, map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed"}})), 201)
+	// Nor a public sealed one (§7.4, v0.40).
+	expectCode(t, b.mkRemote("relpub", remoteGenesis("s", at, map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed"}})), 422, "invalid")
 	assertNoPlaintext(t, path)
 
 	// Ids over plaintext, as at A.
@@ -125,11 +124,6 @@ func TestRemoteBranchSealed(t *testing.T) {
 		t.Fatalf("log %v", lg)
 	}
 	open(t, lg[1].(string), resKey(t, bk["rel#1"], "rel", "x"), "rel#1", seal.ResourcePL("rel", "x", x2, "rev"))
-	// The public sealed branch has keys of its own too.
-	pk, _ := b.keysOf("relpub", nil, "")
-	if pk["relpub#1"] == nil || string(pk["relpub#1"]) == string(bk["rel#1"]) {
-		t.Fatalf("relpub keys %v", pk)
-	}
 	// B writes on the foreign parent, with a nonce, sealed under its keys.
 	w := b.wr("rel", "x", x2, withNonce(ops(op("add", "/b", encMarker+"-b"))))
 	open(t, string(b.get("/r/rel/x/rev/"+w).Body), resKey(t, bk["rel#1"], "rel", "x"), "rel#1", seal.ResourcePL("rel", "x", w, "doc"))

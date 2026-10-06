@@ -614,3 +614,22 @@ func TestReviewRetryAfterStaleConfigDraws(t *testing.T) {
 	// draw, both retries would be token-free 200s.
 	expectCode(t, e.batchReq("m", batch, "alice"), 429, "rate")
 }
+
+// §6.6 (v0.40): a batch's config change costs a token from the principal
+// and namespace buckets unless it is exempt, as a config write does, so a
+// config-only batch isn't free; under a * key it costs nothing.
+func TestBatchConfigChangeDrawsToken(t *testing.T) {
+	f := newAuthFixture(t, map[string]any{"limits": map[string]any{
+		"ratePerPrincipal": map[string]any{"rate": 0.001, "burst": 1}}})
+	e := f.tenv
+	change := func(who, member string) *resp {
+		return e.batchReq("sec", map[string]any{"config": map[string]any{
+			"ifMatch": e.configID("sec", f.adminG), "patches": ops(op("add", "/"+member, 1.0))}}, who)
+	}
+	expect(t, change(f.issuerG, "x-a"), 201)
+	expectCode(t, change(f.issuerG, "x-b"), 429, "rate")
+	// Exempt under a * key, however many.
+	for _, m := range []string{"x-c", "x-d", "x-e"} {
+		expect(t, change(f.adminG, m), 201)
+	}
+}

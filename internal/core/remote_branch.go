@@ -891,7 +891,7 @@ func (e *Engine) createRemoteBranch(ctx context.Context, req Request, cc ConfigC
 // branch, all verified before the transaction opened.
 func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc map[string]any, m *remoteMirror, author int64) (*WriteResult, *Error) {
 	// The obligations of §G.5, which the base can't enforce.
-	if cfg.Read == "public" && m.read != "public" && !sealedPair(cfg.level, m.level) {
+	if cfg.Read == "public" && m.read != "public" {
 		return nil, invalid("a branch of a non-public namespace cannot be public (§G.5): make it private (read: grant) or sealed")
 	}
 	if cfg.level < m.level {

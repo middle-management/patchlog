@@ -678,18 +678,16 @@ func TestSealedBranch(t *testing.T) {
 	lg := e.get("/r/b/a/rev/" + a2 + "/log").Arr()
 	open(t, lg[0].(string), resKey(t, bk["b#1"], "b", "a"), "b#1", seal.ResourcePL("b", "a", a, "rev"))
 
-	// A sealed branch of a sealed non-public base may be public (it only
-	// exposes ciphertext); a non-sealed branch of a non-public base may not.
-	expect(t, e.branch("s", map[string]any{"name": "pub", "patches": ops(op("replace", "/read", "public"))}, "admin"), 201)
-	if r := e.get("/r/pub/a/rev/" + a); r.Code != 200 || r.H.Get("Cache-Control") != ccImmutable {
-		t.Fatalf("public sealed branch %d %v", r.Code, r.H)
-	}
+	// A branch of a non-public base may not be public, sealed or not
+	// (§7.4, v0.40): names, sizes and timing would become public.
+	expectCode(t, e.branch("s", map[string]any{"name": "pub", "patches": ops(op("replace", "/read", "public"))}, "admin"), 422, "invalid")
 	e.mkNS("g", atRest(map[string]any{"read": "grant"}))
 	expectCode(t, e.branch("g", map[string]any{"name": "gp", "patches": ops(op("replace", "/read", "public"))}, "admin"), 422, "invalid")
-	// A sealed public branch doesn't stop a sealed base from going private.
+	// A public sealed branch of a public sealed base stops the base from
+	// going private, like any public branch.
 	e.mkNS("sp", sealedDoc(map[string]any{"read": "public"}))
 	expect(t, e.branch("sp", map[string]any{"name": "spb"}, "admin"), 201)
-	expect(t, e.patchNS("sp", ops(op("replace", "/read", "grant")), ""), 201)
+	expectCode(t, e.patchNS("sp", ops(op("replace", "/read", "grant")), ""), 409, "in_use")
 
 	// At-rest base, sealed branch: allowed, own keys from epoch 1.
 	e.mkNS("r", atRest(map[string]any{"read": "public"}))

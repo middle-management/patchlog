@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+Also implements spec **v0.40**, which adopts most of the reference's v0.39 notes.
+Two came out the other way, and the reference now follows the text:
+
+**Changes to check before upgrading:**
+- **A batch's config change costs a rate token** from the principal and namespace
+  buckets unless it is exempt (a `*` key, or only a freeze), as a config write does
+  (§6.6). A config-only batch used to cost nothing.
+- **A branch of a non-public base can't be `public`, sealed or not** (§7.4), and
+  remote branches likewise. A public sealed branch also counts again as a
+  dependent that keeps its base from going private (`409 in_use`). Existing public
+  sealed branches of private bases are left as they are.
+- `GET /` answers `"spec": "0.40"`.
+
+
 A conformance review against spec v0.39. **This repository is the reference
 implementation; the specification is maintained outside it and `docs/SPEC.md`
 mirrors that text (see the note at the top of the README).**

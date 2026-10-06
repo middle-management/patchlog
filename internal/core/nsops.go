@@ -22,6 +22,10 @@ type configPlan struct {
 	id       ids.ID
 	expected *ids.ID
 	replay   *WriteResult
+	// exempt: the change draws no rate tokens, being by a * key or only a
+	// freeze (§6.6). A batch's config change otherwise costs one token
+	// from the principal and namespace buckets, as a config write does.
+	exempt bool
 }
 
 // planConfig runs steps 1–6 of a config write on an existing namespace.
@@ -48,7 +52,8 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 			newDoc, writes = d, patch.WritesStrings(w)
 		}
 	}
-	if !inBatch && !a.star && !freezeOnly(writes, newDoc) {
+	p.exempt = a.star || freezeOnly(writes, newDoc)
+	if !inBatch && !p.exempt {
 		if err := t.rateLimit(n, cur, a, nil, 1); err != nil {
 			return nil, err
 		}
@@ -282,7 +287,7 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 			}
 		}
 		base := t.nsByID(n.base.Int64)
-		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" && !sealedPair(cfg.level, t.nsLevel(base)) {
+		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
 			return nil, invalid("a branch of a non-public namespace cannot be public")
 		}
 	}
@@ -293,13 +298,7 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		}
 	}
 	if cur.Read == "public" && cfg.Read != "public" {
-		var deps []string
-		for _, d := range t.publicDependents(n) {
-			// A sealed branch of a sealed base may stay public.
-			if b := t.nsByName(d); b == nil || !sealedPair(t.nsLevel(b), cfg.level) {
-				deps = append(deps, d)
-			}
-		}
+		deps := t.publicDependents(n)
 		if len(deps) > 0 {
 			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps))
 		}
@@ -312,13 +311,6 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		}
 	}
 	return cfg, nil
-}
-
-// sealedPair reports a sealed branch of a sealed base. Such a branch may be
-// public even if its base isn't (a relaxation of §7.4): it only ever serves
-// ciphertext under its own keys (§E.2.5).
-func sealedPair(branchLevel, baseLevel int) bool {
-	return branchLevel >= levelSealed && baseLevel >= levelSealed
 }
 
 func (t *tx) publicDependents(n *nsRow) []string {
@@ -663,7 +655,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 			break
 		}
 	}
-	if cfg.Read == "public" && bcfg.Read != "public" && !sealedPair(cfg.level, t.nsLevel(base)) {
+	if cfg.Read == "public" && bcfg.Read != "public" {
 		return nil, invalid("a branch of a non-public namespace cannot be public")
 	}
 	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {

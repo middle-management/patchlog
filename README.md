@@ -1231,8 +1231,8 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
 - **Access and branches.** `read: "grant"` still decides who may fetch ciphertext (without it:
   `401`/`404`); a sealed namespace may also be `read: "public"`. A branch of a sealed namespace
   must be sealed (the level rule) and has its own epoch keys, sealing read-through content under
-  them; a sealed branch of a sealed non-public base may be `public` (it only exposes
-  ciphertext; a relaxation of §7.4). A namespace with public dependents that aren't sealed
+  them. As for any branch, a branch of a non-public base can't be `public`, sealed or not
+  (§7.4: names, sizes and timing would become public). A namespace with public dependents that aren't sealed
   can't become sealed (`409 in_use` with `dependents`). Remote branches of sealed namespaces
   are sealed too (§G.5.2, see remote branches).
 - **Client.** `client.WithKeys(client.NewKeys(recipientPriv))` makes `Doc`, `Log`, `NSDoc`,
@@ -1837,7 +1837,7 @@ just doesn't apply).
   `BatchItem`/`BatchRequest` defaults, reads them from `WriteResult`, `LogEntry`, `NSEntry`
   (`Gestures` for batches) and lists with `Gestures`/`GesturesPage`; `client.NewGesture` makes
   an id.
-- **`GET /`** answers `{ "spec": "0.39", "auth": "grants" | "disabled", "origin" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.40", "auth": "grants" | "disabled", "origin" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace
