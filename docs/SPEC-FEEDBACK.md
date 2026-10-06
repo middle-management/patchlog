@@ -92,15 +92,29 @@ link 3 is answered by the namespace document. Across deployments it isn't always
 - a remote reader may lack `read` on the base's document;
 - operator keys are configured outside the system (§C.4 bootstrapping).
 
-Propose `GET /.well-known/patchlog-keys`, a JWKS-shaped document published at the
-deployment's canonical origin. The signing input already binds that origin.
+Propose a key history published as a JWK Set (RFC 7517), so any JOSE library can
+parse it.
+
+- **Discovery:** `GET /` gains `"jwks_uri"`, the URL of the set, as OIDC discovery
+  does (§7, §G.1). Verifiers read it there rather than guess a path. It lives at
+  the deployment's canonical origin, which the signing input already binds.
+- **Default path:** `/.well-known/patchlog-keys`, a name that could be registered
+  with IANA (RFC 8615). `/.well-known/jwks.json` isn't a registered name, only a
+  convention. On a shared domain an identity provider or API gateway often serves
+  its own token-signing keys there. Mixing those with grant-root keys would let a
+  verifier accept a key for a purpose it was never meant for. A deployment that
+  owns its domain outright may still point `jwks_uri` at `jwks.json`.
+- **Keys:** OKP/Ed25519 JWKs. Each carries `kid` and `use: "sig"`, plus the
+  Patch Log members described below. Generic JWKS consumers ignore those members,
+  which is another reason not to share a generic path.
 
 - **What it lists:** the deployment's operator keys, plus the keys of its public
   namespaces. It lists no keys of private namespaces, since that would reveal they
   exist (§E.4).
 - **It's a history, not a current set:** keys are never removed and `kid`s are never
   reused. Each key carries the period it was in force (`nbf`, and `exp` or
-  `retired`) and, for namespace keys, `ns`. A signature verifies against the key in
+  `retired`), its role (`"patchlog": "operator"` or `"namespace"`) and, for
+  namespace keys, `ns`. A signature verifies against the key in
   force at the revision's position, so rotation never breaks old signatures.
 - **Bundles of private namespaces** instead carry the key entries of the namespace
   document revisions their grants verify against. The bundle digest covers them, so
@@ -108,7 +122,7 @@ deployment's canonical origin. The signing input already binds that origin.
 - **What it isn't for:** author keys. Those stay in grants (P1.1), so a deployment
   can't swap an author's key without the issuer's signature.
 
-**The open question this leaves:** trust in a deployment's well-known document
+**The open question this leaves:** trust in a deployment's published key set
 rests on TLS and the origin. That's the same trust a remote branch already places
 in its base (§G.3), but a verifier that wants more needs the operator keys
 distributed out of band. The spec should say which it expects.
