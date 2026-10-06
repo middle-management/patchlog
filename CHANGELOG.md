@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.11.0
 
 Implements spec **v0.41**: verifiable author signatures (§C.3.1), adopted from the
 reference's proposal P1.
