@@ -613,9 +613,12 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if depth > t.e.opt.Maximums.BranchDepth {
 		return nil, limitErr(422, "branch depth exceeded")
 	}
+	// Live branches only (§6.6): merged or superseded branches are frozen,
+	// not live (§F.6), and don't count, so branches kept for review after
+	// their merge don't block new ones.
 	live := 0
 	for _, b := range t.branchesOf(base) {
-		if !b.purged {
+		if !b.purged && !t.config(b.configSeq).Frozen {
 			live++
 		}
 	}

@@ -177,6 +177,11 @@ func TestLimitKeys(t *testing.T) {
 	e.mkNS("one", map[string]any{"limits": map[string]any{"branchesPerNamespace": 1}})
 	expect(t, e.branch("one", map[string]any{"name": "one-a"}, "alice"), 201)
 	expectCode(t, e.branch("one", map[string]any{"name": "one-b"}, "alice"), 422, "limit")
+	// Frozen branches (merged or superseded) aren't live (§F.6): freezing
+	// one makes room for another.
+	expect(t, e.patchNS("one-a", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, e.branch("one", map[string]any{"name": "one-b"}, "alice"), 201)
+	expectCode(t, e.branch("one", map[string]any{"name": "one-c"}, "alice"), 422, "limit")
 }
 
 // §7.5: the body of a batch is read only up to the principal's batchSize,
