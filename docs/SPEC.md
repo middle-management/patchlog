@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.45 · 2026-10-06. See the change log at the end.
+Status: draft v0.46 · 2026-10-07. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -306,6 +306,21 @@ i.e. the path of a schema revision on this service. The only other accepted valu
 **Never into a branch.** `$schema` and `$ref` MUST NOT name a branch namespace (§7.6), which is temporary by design (`422`, `code: "schema_ref"`). New schema revisions are written to a namespace that isn't a branch, or drafted in a branch of one (below). They are immutable and unused until referenced, so this is safe before a migration is merged (§F.1).
 
 -
+**Schemas follow their documents.** A namespace `N` MAY set `"schemaReads": { "for": [ … ] }`, namespace names or prefixes ending in `*`, matched as `drafts.for` is (§7.4); `N` itself always counts. A schema revision in `N`, one whose own `$schema` is a dialect URL, then:
+
+  - resolves for a write to a listed namespace, or to a local branch of one, whose document pins it through `$schema` or its `$ref` closure, without the `read` that resolving otherwise needs (below);
+
+  - may be read by revision path, even under a grant that doesn't name `N` (§7), when the grant may read a resource of a listed namespace that counts as a referrer of it under the refusals below (the list of what references count).
+
+That is all it opens: never the schema resource's head, log or other revisions, never a document that isn't a schema, and never a draft in a branch, since branches don't copy the member (§7.6).
+
+  - So a writer whose grant fixes one resource (`readScope: "resource"`, §C.4) can validate, and render forms for, documents that pin schemas kept in a private namespace, such as a content namespace that drafts its schemas with its content, or a data namespace that pins them.
+
+  - Anyone who may write to a listed namespace can pin such a revision once they know its id, and ids aren't secrets (§C.5). Keep nothing in such schemas that only `N`'s readers may see.
+
+  - Setting it needs a `*` key (§7.4). It is `422` in sealed and end-to-end namespaces, whose readers need keys that a pinning document doesn't give them.
+
+-
 **Drafts in branches.** A path still never names a branch. But in a write **to a branch**, a path `/r/N/R/rev/X` that `N` can't resolve for the writer, because `N` lacks it or the writer can't read it there, is looked up in the branches of `N`, so a release can draft its schemas privately (§F.9):
 
   - The candidates are the local branches of `N`, branches of branches included, that aren't end-to-end encrypted. In a candidate, only revisions it wrote itself count, never those it reads through.
@@ -327,7 +342,7 @@ i.e. the path of a schema revision on this service. The only other accepted valu
 **Tombstoned schema resources.** Revisions of a tombstoned schema resource still resolve (§8.1), so documents that reference them stay valid and can still be appended to. New references to them are also allowed.
 
 -
-**Purged or unknown references.** An unknown or purged reference is `422` with `code: "schema_unavailable"`.
+**Purged or unknown references.** An unknown or purged reference is `422` with `code: "schema_unavailable"`, naming the revision path that didn't resolve. One the writer can't read answers the same, revealing nothing more.
 
 -
 **Referenced schema revisions.** A schema revision is **referenced** when any of these names it by `$schema`, or reaches it through `$ref`, transitively:
@@ -354,7 +369,7 @@ The answer lists, as `referencing`, the referencing namespaces in which the call
 **Forcing.** A refused purge can be forced: `?force=1` on the purge request, with a grant chained to a deployment operator key, or, for a purge of a branch or of a resource in one, to a `*` key of that branch, inherited or its own. A forced purge knowingly breaks invariant 3 for the referencing documents, and its entries carry `forced: true` (§3.5).
 
 -
-**Read permission.** Resolving a `$schema` or `$ref` requires the writer to have `read` on the copy it resolves to: in the schema's namespace, or in the branch holding a draft (below; Addendum C). Otherwise validation errors could reveal the content of a schema the writer may not read.
+**Read permission.** Resolving a `$schema` or `$ref` requires the writer to have `read` on the copy it resolves to: in the schema's namespace, or in the branch holding a draft (Addendum C), unless that namespace opens it with `schemaReads` (above). Otherwise validation errors could reveal the content of a schema the writer may not read.
 
 -
 **Validator cache.** Compiled validators MAY be cached by revision path forever, since references are immutable.
@@ -540,7 +555,7 @@ In order, these say:
 
 - every document is typed with a revision of the match schema
 
-- once typed, `$schema` can't be removed, including by a root replace
+- once typed, `$schema` can't be removed, including by a root replace. A restore written as a root `replace` overlaps `/$schema` even when it keeps it, so it is refused too; where such rules apply, restore with `[]` (§8.2)
 
 - only the `ops` group may delete or purge
 
@@ -609,7 +624,7 @@ Without the `editor` role, a principal may only create, edit, restore or delete 
 | batch size (all patch sets) | `batchSize` | 16 MiB |
 | log page size for log ranges (§7.1), `/heads` pages and gesture listings (§7.4), event-stream catch-up (§7.3) and long-poll answers (§7.7), deployment only | `logPageSize` | 1,000 entries |
 | branch depth (bases of bases), deployment only | `branchDepth` | 8 |
-| live branches per namespace | `branchesPerNamespace` | 100 |
+| live branches per namespace: neither frozen nor purged (§F.6) | `branchesPerNamespace` | 100 |
 | writes per resource, per principal | `ratePerResource` | 10/s, burst 20 |
 | writes per principal | `ratePerPrincipal` | 50/s, burst 100 |
 | writes per namespace | `ratePerNamespace` | 500/s, burst 1,000 |
@@ -681,11 +696,11 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 ## 7. HTTP API
 
-Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.45", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
+Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.46", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
 **Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Gesture`, `Undoes`, `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
 
-Requests to private namespaces follow Addendum C. Without `read`, a resource that exists and one that doesn't both answer `404`, so existence is not revealed. The same holds for namespaces: a request without valid credentials to a namespace that doesn't exist answers `401`, exactly as one to an existing namespace whose `read` isn't `public`. Only public namespaces answer unauthenticated requests with content or `404`. With a grant, the server first reads `ns` from its blocks, before looking up any key: a namespace that isn't named in `ns` by every block that carries `ns` (the root block always does, and `"*"` names every namespace) answers `403` without being consulted, whether or not it exists. Reads of a public namespace are the exception: a grant that doesn't name the namespace, or that can't be used (malformed, badly signed, revoked, expired or not yet valid), is ignored, and the read is answered exactly as an unauthenticated one. A client can then send one bearer to every namespace it reads, including public schema namespaces (§6.1), and the namespace reveals nothing it doesn't show everyone. Writes, and every request to a namespace that isn't public or doesn't exist, keep the `403` and `401` answers. Only then is the grant verified against that namespace's keys, or against the deployment operator keys when the root `kid` names one (§C.4). This hides a namespace's existence from requests to it. Namespace names share one space and are not secret (§E.4): creating a namespace or branch with a taken name reveals that it is taken.
+Requests to private namespaces follow Addendum C. Without `read`, a resource that exists and one that doesn't both answer `404`, so existence is not revealed. The same holds for namespaces: a request without valid credentials to a namespace that doesn't exist answers `401`, exactly as one to an existing namespace whose `read` isn't `public`. Only public namespaces answer unauthenticated requests with content or `404`. With a grant, the server first reads `ns` from its blocks, before looking up any key: a namespace that isn't named in `ns` by every block that carries `ns` (the root block always does, and `"*"` names every namespace) answers `403` without being consulted, whether or not it exists, except for a schema revision that namespace opens with `schemaReads` (§6.1). Reads of a public namespace are the exception: a grant that doesn't name the namespace, or that can't be used (malformed, badly signed, revoked, expired or not yet valid), is ignored, and the read is answered exactly as an unauthenticated one. A client can then send one bearer to every namespace it reads, including public schema namespaces (§6.1), and the namespace reveals nothing it doesn't show everyone. Writes, and every request to a namespace that isn't public or doesn't exist, keep the `403` and `401` answers. Only then is the grant verified against that namespace's keys, or against the deployment operator keys when the root `kid` names one (§C.4). This hides a namespace's existence from requests to it. Namespace names share one space and are not secret (§E.4): creating a namespace or branch with a taken name reveals that it is taken.
 
 ### 7.1 Reads
 
@@ -795,7 +810,7 @@ If that entry was written by the **same principal**, respond `200` with it inste
 | `GET /ns/{ns}/rev/{ns_id}/log?since={a}` | `200` with an array of `{ id, prev, kind, resource?, name?, remote?, at?, target?, entries?, source?, forced?, author, grant?, gesture?, undoes?, gestures?, created }`, following §3.5, where `gesture` and `undoes` are those of a single write, and `gestures` maps each resource of a batch to a list of `{ "gesture"?, "undoes"? }`, one per step (§7.2), none of them hashed, and `grant` is `{ "id", "sub", "kid" }`: the grant id (§C.3) in the text form of §3.2, and its root `sub` and `kid`. A local branch's creation records the creator's grant on both its entries, and a namespace's genesis the operator's. `grant` is absent from entries the server writes itself: propagated purges, purges applied from a remote base, and the prunes and epoch rotations the server performs on its own. Prunes and rotations by a janitor or operator service record its grant, and the schema namespaces a remote branch mirrors at creation record the creating operator's. It is `null` on entries written while authentication is disabled (§1), and absent from entries written before v0.37 unless the grant can be recovered from their revisions; such entries count for no one in `merge.authors` and claim checks (§F.3, §F.6). Paged as in §7.1 | immutable |
 | `GET /ns/{ns}/rev/{ns_id}/heads?after={name}` | `200` with a page of `{ resource, kind, target }`, one per resource as of that revision, including resources a branch reads through, in ascending byte order of name, strictly after `after`, which is a plain bound and needn't name an existing resource; `next` for the following page | immutable |
 | `GET /ns/{ns}/events?since={ns_id}` | SSE of namespace entries | `no-store` |
-| `GET /ns/{ns}/gestures/{gesture}` | optional: `200` with `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]`, one per revision or tombstone written with that gesture or undoing it, oldest first, leaving out purged resources. Paged by `logPageSize`, oldest first: a full page carries `X-Log-Next: {resource}/{id}` (its last row, `id` in text form, unquoted; ids repeat across resources), the next page is `?after=` that value, and a page without `X-Log-Next` is the last. Lists revisions and tombstones only: config writes with that gesture are found in the namespace log. Requires unrestricted `read` on the namespace (as §7.6 does). Not offered in sealed or end-to-end namespaces, whose logs are the place to look: `404` with `code: "not_offered"`, after the `read` check | `no-store` |
+| `GET /ns/{ns}/gestures/{gesture}` | optional: `200` with `[{ resource, id, kind, gesture?, undoes?, author, ns_id }]`, one per revision or tombstone written with that gesture or undoing it, oldest first, leaving out purged resources. Paged by `logPageSize`, oldest first: a full page carries `X-Log-Next: {resource}/{id}` (its last row, `id` in text form, unquoted; ids repeat across resources), the next page is `?after=` that value, and a page without `X-Log-Next` is the last. Lists revisions and tombstones only: config writes with that gesture are found in the namespace log. Answers any reader, listing only entries for resources its grant may read, so a reader limited to some documents finds its own gestures and learns nothing of others. Not offered in sealed or end-to-end namespaces, whose logs are the place to look: `404` with `code: "not_offered"`, after the `read` check | `no-store` |
 | `GET /ns/{ns}/grants/{gid}` | `200` with `{ id, root, stored }`, a grant recorded by an entry of this namespace or, in a local branch, of its bases, in its non-bearer form (§C.3.1); `404` for any other. Requires unrestricted `read` on the namespace (as §7.6 does); sealed in sealed namespaces, `private` in end-to-end ones | immutable (`private` at E3) |
 | `GET /ns/{ns}/branches` | `200` with `[{ name, at, frozen, purged, successor?, drafts? }]` for the namespace's direct branches, and `{ remote, at, ns_id, expires }` for remote branches whose registration hasn't expired (§G.3). Requires `read` | head pointer |
 
@@ -809,13 +824,13 @@ If that entry was written by the **same principal**, respond `200` with it inste
 
 - **Envelope.** Config writes are checked with a `config` envelope (§6.4.1). Key-scope and grant rules apply to them.
 
-- **Keys, roles, revocations, limits and exposure.** Writes covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption` or `/signatures`, and writes that set `read` to `public`, additionally require a grant chained to a key with `can: ["*"]`. A role definition changes what every outstanding grant naming it can do (§C.1.1), so it is guarded like a key. Making a namespace public or changing its encryption exposes everything in it, so those are guarded too. Making `read` stricter needs no `*` key.
+- **Keys, roles, revocations, limits and exposure.** Writes covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption`, `/signatures` or `/schemaReads`, and writes that set `read` to `public`, additionally require a grant chained to a key with `can: ["*"]`. A role definition changes what every outstanding grant naming it can do (§C.1.1), so it is guarded like a key. Making a namespace public or changing its encryption exposes everything in it, so those are guarded too. Making `read` stricter needs no `*` key.
 
 - **Validation.** The namespace document is validated against the built-in namespace-document schema of the deployment's version. Rules and patterns must be well-formed and within limits. The members this spec defines are validated strictly:
 
-  - **Core:** `read`, `keys`, `roles`, `revoked`, `rules`, `limits`, `allowances`, `retention`, `encryption`, `maxLag`, `base`, `frozen`, `successor`, `drafts` and `signatures` (§C.3.1).
+  - **Core:** `read`, `keys`, `roles`, `revoked`, `rules`, `limits`, `allowances`, `retention`, `encryption`, `maxLag`, `base`, `frozen`, `successor`, `drafts`, `signatures` (§C.3.1) and `schemaReads` (§6.1), `{ "for": [names or prefixes] }`.
 
-  - **Addendum B:** `catalog`, `{ "trust"?: [namespace names], "mode"?: "tree" | "dag" }`, and `catalogs`, `{ "<catalog>": { "place"?: [subjects] } }`, where subjects are `group:…` or `user:…`.
+  - **Addendum B:** `catalog`, `{ "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer }`, and `catalogs`, `{ "<catalog>": { "place"?: [subjects] } }`, where subjects are `group:…` or `user:…`.
 
   - **Addendum F:** `merge`, `{ "authors": [{ "sub", "kid" }] }`; `merged`, `{ "at" }`; `cleanup`, `{ "merged"?, "superseded"?, "abandoned"? }` as ISO 8601 durations; and `abandoned`, a boolean. They may appear in any namespace. They mean something in branches, and a base's own `cleanup` sets the minimums for its branches (§F.6).
 
@@ -932,7 +947,7 @@ If-None-Match: *
 
 - **Configuration.** The branch's namespace document starts as a copy of the base's **current** document, so keys and revocations are up to date.
 
-  - `frozen`, `successor`, `merged`, `abandoned` and `drafts` are removed, `base: { "ns": base, "at": at }` is added, and then `patches` are applied.
+  - `frozen`, `successor`, `merged`, `abandoned`, `drafts` and `schemaReads` are removed, `base: { "ns": base, "at": at }` is added, and then `patches` are applied.
 
   - The branch's configuration chain starts with the genesis patch set `[{ "op": "add", "path": "", "value": <that document> }]`, so its config id is reproducible.
 
@@ -942,9 +957,9 @@ If-None-Match: *
 
   - The caller needs `branch` on the base.
 
-  - The caller needs **unrestricted** `read` on the base. No rule in the grant's blocks, its key's scope or its effective roles may refer to `/resource`, and the key may not have `readScope`. Otherwise a reader limited to some resources could branch the namespace and read the rest through the branch. Bases whose read access is decided per document (§C.5.1) should not grant `branch` at all.
+  - The caller needs **unrestricted** `read` on the base. No rule in the grant's blocks, its key's scope or its effective roles may refer to `/resource`, and the key may not have `readScope`. Otherwise a reader limited to some resources could branch the namespace and read the rest through the branch. Bases whose read access is decided per document (§C.5.1) should grant `branch` only to a service that creates branches for editors limited to some documents (§F.8).
 
-  - `patches` covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption` or `/signatures` need a grant chained to a `*` key **of the base**. Every `*` key of the base is kept in the branch and can't be removed from it, so the base's administrators can always freeze and purge its branches.
+  - `patches` covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption`, `/signatures` or `/schemaReads` need a grant chained to a `*` key **of the base**. Every `*` key of the base is kept in the branch and can't be removed from it, so the base's administrators can always freeze and purge its branches.
 
   - The base's rules evaluate a `branch` envelope. Its `resource` is the new namespace's name, its `doc` is the new namespace document, and its `writes` come from `patches`. A base can therefore decide who may branch it, how branches are named (e.g. `^release-`), and what they may change.
 
@@ -1164,7 +1179,7 @@ The checks run in this order:
 
 ### 8.4 Freezing a namespace
 
-- **Freezing.** A config write sets `"frozen": true`. Resource writes and batches are then `409` with `code: "frozen"`, and the body carries `successor` if set. Setting `frozen` to `false` unfreezes the namespace.
+- **Freezing.** A config write sets `"frozen": true`. Resource writes and batches are then `409` with `code: "frozen"`, and the body carries `successor` if set. Setting `frozen` to `false` unfreezes the namespace. Unfreezing a branch whose base already has `branchesPerNamespace` live branches is `422` (§6.6).
 
 - **What still works:**
 
@@ -1350,7 +1365,7 @@ Anything that derives data from a namespace, such as a search index, a feed, ana
 
 - **Follow.** `GET /ns/{ns}/events?since={checkpoint}` streams new entries. Where many consumers or pages follow the same namespace, long-poll `GET /ns/{ns}/log?since={checkpoint}&live=long-poll` instead, which the CDN collapses (§7.7).
 
-- **Coalesce.** Within a range of entries, only the latest entry per resource matters.
+- **Coalesce.** Within a range of entries, only the latest entry per resource matters. A new consumer that needs only current state starts from the heads instead of replaying history: it lists `GET /ns/{ns}/rev/{current}/heads` (§7.4), or scans the log once and fetches each resource's last revision, and then follows from `current`.
 
 - **Fetch content** from immutable URLs: `/r/{ns}/{name}/rev/{id}`, schema revisions and blobs (§7.8).
 
@@ -1424,6 +1439,8 @@ Anything that derives data from a namespace, such as a search index, a feed, ana
 
 - **Combining changes under a rate limit:** while a save is in flight, keep collecting edits into one pending patch set. It is simply the diff from the last saved revision, so a later `replace` of a path wins. Send it when the response arrives. If that response is lost, first resend the in-flight set **unchanged** (§7.2), and only then the combined rest. On `429`, wait for `Retry-After`, then send whatever has accumulated. High-frequency input, such as typing or dragging, then yields a few revisions a second, each carrying the latest values. A combined set carries one `Gesture`, so combining across actions makes them one gesture for undo from the log (§11.2); a client that wants each action undoable from the log sends at each action's end instead.
 
+- **Presence is out of scope.** Cursors, selections and strokes in progress change many times a second and matter only while someone is looking. As writes they would exceed `ratePerResource` (§6.6) and leave permanent log entries. Send them over a side channel: a service that admits a client with the same read decision as the resource (§C.5), stamps each message with the verified principal, fans it out to the others viewing that resource, and keeps nothing. Who is editing what can already be derived from the log.
+
 ### 11.1 Designing documents
 
 Lessons from loading real data:
@@ -1489,7 +1506,7 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 **When undo is impossible.** If a revision the inverse needs lies below a pruning horizon (`410`), if a blob the earlier document references is no longer available (`422 blob`, §7.8), or if the document's `$schema` has since been migrated so the old values no longer validate (`422 invalid`), the undo fails. These are reported as such, not as conflicts.
 
 -
-**Redo** is undoing the undo: its `Undoes` names the undo's gesture. An author's undo stack can be rebuilt on any device from the log: the gestures that author made, minus those the same author undid and didn't redo. An undo by someone else, such as an editor, is shown as undone by them; it doesn't silently drop the gesture from the author's stack, since `Undoes` isn't verified. `Undoes` naming a gesture that no longer exists, for instance after a squashed merge (§F.3), is ignored.
+**Redo** is undoing the undo: its `Undoes` names the undo's gesture. An author's undo stack can be rebuilt on any device from the log: the gestures that author made, minus those the same author undid and didn't redo. A gesture that a merge carried into the base (§F.3) counts for the author who wrote it in `source.ns`, so authors keep their stacks after a release, but only when the batch counts as a merge under §F.3 (no `origin`, `source.at` in the branch's chain, a merger listed in `merge.authors`); otherwise it counts for whoever wrote the batch, since `source` is asserted, not verified. An undo by someone else, such as an editor, is shown as undone by them; it doesn't silently drop the gesture from the author's stack, since `Undoes` isn't verified. `Undoes` naming a gesture that no longer exists, for instance after a squashed merge (§F.3), is ignored.
 
 -
 **Scope.** A gesture is a client's grouping, and the server only stores it. Who may undo what is decided by the ordinary rules for the writes the undo makes. Config writes may carry a gesture (§7.2), but undoing one is out of scope.
@@ -1518,7 +1535,7 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 | `limit` | 413 / 422 | A limit of §6.6 was exceeded |
 | `invalid` | 422 | Patch application or `test` failed, or `$schema` validation failed |
 | `schema_ref` | 422 | Malformed `$schema` or `$ref` |
-| `schema_unavailable` | 422 | Unknown or purged schema revision |
+| `schema_unavailable` | 422 | A schema revision path that doesn't resolve for the writer: unknown, purged or unreadable (§6.1) |
 | `rule` | 422 | A namespace rule failed |
 | `precondition_required` | 428 | No `If-Match` / `If-None-Match` |
 | `rate` | 429 | A rate limit of §6.6 was exceeded; `Retry-After` is set |
@@ -1551,6 +1568,10 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 
 - **Blobs:** resumable or chunked uploads for very large blobs? Ranges of sealed blobs (§E.2.2)?
 
+- **Required nonces:** should a namespace be able to require a fresh `$nonce` in every patch set (`"nonce": "required"`), as sealed namespaces must (§C.7), since a SHOULD the server can't check is easy to miss?
+
+- **Scoped branches:** a branch whose read-through is limited to the resources its creator could read at `at`, so editors limited to some documents could branch without a service (§F.8).
+
 - **Auth:** see the open questions of Addendum C.
 
 ---
@@ -1569,6 +1590,8 @@ A search service for typed documents, built as a namespace consumer (§10). It r
 
   - Without `$schema`, remove any rows for the resource.
 
+  - A schema document, whose `$schema` is a dialect URL (§6.1), is indexed against that dialect's meta-schema: `schema=` with the dialect URL lists schema documents, and the revision paths of `$ref` keywords at schema positions, fragment dropped, count as references (§A.2), so "which schemas `$ref` this one" can be asked.
+
   - Otherwise fetch the schema revision the document pins (immutable, so cache its field map forever), and index the annotated fields and the references (§A.2).
 
 - `tombstone` → remove the resource's rows. `purge` → also purge the service's own cache tags.
@@ -1577,7 +1600,7 @@ A search service for typed documents, built as a namespace consumer (§10). It r
 
 ## A.2 What gets indexed: `x-index`
 
-- Schemas opt fields in with `"x-index": "text" | "facet" | "sort"`:
+- Schemas opt fields in with `"x-index"`: one of `"text"`, `"facet"` and `"sort"`, or an array of them, such as `["facet", "sort"]` to filter and order by one field:
 
   - `text`: full-text search.
 
@@ -1634,7 +1657,7 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
 
   - `?ref=/r/{ns2}/{name}/rev/{id}%23{entry}`: only those naming that entry and pinned to that revision.
 
-Each hit of a `ref` query carries `refs: [{ "path", "ref" }]`, the locations and the strings that matched, as written. Hits of other queries don't. A reference changes only when its referrer is written, so the tags above keep cached results correct.
+Each hit of a `ref` query carries `refs: [{ "path", "ref" }]`, the locations and the strings that matched, as written. Hits of other queries don't. A document that references itself is a hit of its own query, with `"self": true`, so a delete guard can leave it out. A reference changes only when its referrer is written, so the tags above keep cached results correct.
 
 -
 **Delete guards are advisory.** The index is eventually consistent, so a guard such as "still used by 4 documents" asks with `?min=` (§A.5) and can still race a write that adds a reference. The core enforces references only for schemas (§6.1).
@@ -1644,6 +1667,9 @@ Each hit of a `ref` query carries `refs: [{ "path", "ref" }]`, the locations and
 
 -
 Hits carry the plain document URL (`/r/{ns}/{name}/rev/{id}`). Documents are served by the core's CDN, never by the search service.
+
+-
+**Fields in hits.** Hits carry their facet and `sort` values. `fields=/name,/title` also asks for those indexed fields, `text` ones included, so a list can be rendered without fetching every document. A path that no schema indexed in `{ns}` marks with `x-index` is `400`.
 
 -
 **Private namespaces:** follow the same rules as catalog listings (§B.11.5). Results are keyed by the reader's subject set in the path, and responses never embed per-reader signed URLs.
@@ -1809,7 +1835,7 @@ CREATE INDEX edges_by_parent ON edges (parent, ord, child);
 **Fresh listings after a write.** The redirect to `…/at/{at}/…` is cached like a head pointer, by browsers too, within its `stale-while-revalidate`. A client that relists right after its own write adds `?min={ns}:{ns_id}` from the write's `X-Namespace-Revision` (§A.5), which gives a new URL and waits for the service to catch up, instead of fetching with `no-store`.
 
 -
-**Items in listings** carry their content URL and current head. The document itself is always fetched from the core's CDN.
+**Items in listings** carry their content URL and current head. The document itself is always fetched from the core's CDN. A catalog may set `"title": <JSON Pointer>` in its `catalog` object; the service then copies the string at that pointer in each item's head into listings as `title`, for items in namespaces that aren't sealed or end-to-end, so a list needs no document reads.
 
 -
 **Cycles.** The core can't prevent them. In a DAG no single edge "closes" a cycle, so the unit is the node:
@@ -1971,6 +1997,8 @@ The catalog decides **who has which role where**. Each content namespace decides
 
 - **`inherit: false`:** stops the ancestor walk at this node.
 
+- **`inheritPowers: true`:** lets tree powers collected on the walk up apply at this folder too (§B.11.2).
+
 - **Placements** may carry `$access` too, to share one item.
 
 - **`user:` entries** are for exceptions. Listings are cached per subject set (§B.11.5), so each user with direct entries gets their own listing cache.
@@ -1997,7 +2025,7 @@ The catalog decides **who has which role where**. Each content namespace decides
 
 - **Allow-only.** There are no denies, so in a DAG the union is well defined. Roles are alternatives at the gate (§C.1.1), so a union of roles never grants more than the most permissive role in it.
 
-- **Tree powers** (`move`, `place`) apply only at the folder where a role granting them is assigned, and are never inherited.
+- **Tree powers** (`move`, `place`) apply only at the folder where a role granting them is assigned, unless the folder's `$access` sets `"inheritPowers": true`. Then roles collected on the walk up from it grant them there too, as roles do for items. Moves stay bounded by no widening (§B.11.4).
 
 ### B.11.3 Keys and namespace documents
 
@@ -2068,6 +2096,8 @@ Authorization: Bearer
 
 The grant says **where** (`/resource`) and **who** (`roles`). The `/i18n` restriction is not in it: the gate applies it from the content namespace's definition of `translator`, so changing that definition takes effect on outstanding grants at once. The catalog grants role names without evaluating their rules, so a grant may carry a role whose rules the gate then refuses for a particular write. A client that shows what is editable evaluates the role's rules itself, or submits with `?dry-run=1` in a batch (§7.5).
 
+**Read-your-writes.** `POST /grants` and `POST /read-grants` accept `?min={ns}:{ns_id}`, repeatable, as listings do (§A.5): the service decides at a checkpoint at or past every `min`, or answers `503` with `Retry-After`. A client passes the `X-Namespace-Revision` of its own placement or `$access` write, so a grant asked for just after it isn't decided on the tree before it.
+
 Organising requests yield grants for the **catalog** namespace, each fixing `/resource` to the node name and `/doc/parents` to exactly the requested target set:
 
 -
@@ -2092,7 +2122,7 @@ Placing is a deliberate act of publishing into a folder's audience, so these two
 **Unplace** (`want: ["delete"]` on a placement) requires a role with `move` on every current parent. The grant fixes `/doc/parents` to exactly those parents, so the placement can't be moved before it is deleted.
 
 -
-**Create a folder** (`{ "node": …, "want": ["create"], "to": [folders] }`) requires a role with `move` on every folder in `to`. Items in it get their parents' roles through the walk-up (§B.11.2), but tree powers on it come only from its own `$access`, which needs `catalog-admins`, as any `$access` does. Until an admin gives it some, only admins can move or place anything into it.
+**Create a folder** (`{ "node": …, "want": ["create"], "to": [folders] }`) requires a role with `move` on every folder in `to`. Items in it get their parents' roles through the walk-up (§B.11.2), but tree powers on it come only from its own `$access`, or from the walk up if its `$access` sets `inheritPowers` (§B.11.2), which needs `catalog-admins`, as any `$access` does. Until an admin gives it some, only admins can move or place anything into it.
 
 -
 **Create** (`{ "item": "/r/matches/final", "want": ["create"] }`) makes a new document in a folder:
@@ -2127,7 +2157,7 @@ A name that exists or existed in the content namespace is refused (`409`), so a 
 
   - `/read-grants` is then needed only for the items a reader opens, not to decide what to list.
 
-- **Listings never embed signed URLs.** Readers obtain per-item edge grants from `POST /read-grants { items: [...] }` (`no-store`). It returns short-lived edge grants scoped to exactly `/r/{ns}/{name}` and `/r/{ns}/{name}/…`. For sealed items and sealed catalog nodes, it also returns per-resource keys `K_r` (§E.2.1), wrapped to the caller's public key in the §E.2.3 format. The catalog service derives them from the epoch keys it holds as a consumer. So a reader who sees items only through catalog roles, with no grant on the content namespace, can still read them and open their entries in listings (§E.2.6):
+- **Listings never embed signed URLs.** Readers obtain per-item edge grants from `POST /read-grants { items: [...] }` (`no-store`). It returns short-lived grants fixed to exactly `/r/{ns}/{name}` and `/r/{ns}/{name}/…`, which the client exchanges at the origin's `POST /edge-grants` for cookies (§C.5), or edge grants in a signed-URL form the deployment's edge verifies. For sealed items and sealed catalog nodes, it also returns per-resource keys `K_r` (§E.2.1), wrapped to the caller's public key in the §E.2.3 format. The catalog service derives them from the epoch keys it holds as a consumer. So a reader who sees items only through catalog roles, with no grant on the content namespace, can still read them and open their entries in listings (§E.2.6):
 
   - **Which keys.** A content item in a sealed (E2) namespace gets its own `K_r`. An item in an E3 namespace gets none, since clients seal E3 revisions under the epoch key, which `K_r` doesn't open. When the catalog is sealed or E3, the item's placement node also gets its `K_r`, for its listing entry. `items` may also name catalog nodes (`/r/{catalog}/{name}`): a node visible to the caller (§B.11.5, below) gets its `K_r` and no grant, so folder titles can be read.
 
@@ -2279,6 +2309,8 @@ It MUST NOT change `sub`, `groups` or `attrs`. The effective principal is always
 
   - Unknown names grant nothing, so removing a role revokes it.
 
+  - `roles: []` grants no verb, since a grant that carries roles needs one that lists the verb (§C.2). A grant without role checks leaves `roles` out.
+
   - Changing `/roles` requires a `*` key (§7.4).
 
 - **Combination.** Roles are alternatives, everything else is conjunctive. A grant with roles allows an action only if:
@@ -2367,7 +2399,7 @@ A signature is checked along one chain, every link of which is immutable or in a
 
 - an entry with that `kid` in the `signers` of the root block of the grant it was written under, named by its grant reference (§C.3);
 
-- the key that signed that root block: a key of the configuration the write was checked against, which is the namespace document in force at its namespace log entry, after the config change of a batch that makes one (§6.2, §7.5); or a deployment operator key in force at its `created` time (§C.4);
+- the key that signed that root block: a key of the configuration the write was checked against (in a branch, its own keys and those its bases had at the entry's `created`, §C.4), which is the namespace document in force at its namespace log entry, after the config change of a batch that makes one (§6.2, §7.5); or a deployment operator key in force at its `created` time (§C.4);
 
 - the namespace log for a namespace key, or the deployment's operator key history (§C.4) for an operator key.
 
@@ -2415,7 +2447,7 @@ A signature is checked along one chain, every link of which is immutable or in a
 
   - Bundles carry the grants their history references (§G.4.1), so they verify offline.
 
-- **Verifiers** follow the chain with the namespace document's history (from its log, or the key entries a bundle carries) and the operator key history. Verifiers don't check `revoked` (§C.4): the gate refused revoked grants when the write was made, and a later revocation doesn't unsign history. A signature that fails, or whose chain can't be completed, is reported as such. It says nothing about the content, which ids verify (invariant 4), only about who wrote it.
+- **Verifiers** follow the chain with the namespace document's history, and in a branch its bases' too (from their logs, or the key entries a bundle carries) and the operator key history. Verifiers don't check `revoked` (§C.4): the gate refused revoked grants when the write was made, and a later revocation doesn't unsign history. A signature that fails, or whose chain can't be completed, is reported as such. It says nothing about the content, which ids verify (invariant 4), only about who wrote it.
 
 ## C.4 Keys, scopes and revocation
 
@@ -2451,10 +2483,13 @@ A signature is checked along one chain, every link of which is immutable or in a
   - **In a branch**, a chain is also rejected if any of its blocks is revoked in any of the branch's bases.
 
 -
-**Keys follow the base.** A branch copies its base's keys when it is created (§7.6). A key that a branch shares with a base (same `kid`) is accepted only while it is still present, with the same `pub`, in that base's current configuration. Removing or replacing a compromised key in a base therefore removes it from every branch too. Keys added only to a branch were added with a base `*` key (§7.6), and are the branch's own.
+**Keys follow the base.** A branch accepts its base's **current** keys as well as its own. A key added to the base after the branch was created works in the branch too, so rotating a key is one config write however many branches there are; a key removed or replaced in the base stops working in every branch. A key the branch shares with its base (same `kid`) is the base's, accepted only while the base has it with the same `pub`; if the base later adds a `kid` the branch already has, only the base's entry is accepted. In nested branches this applies recursively, through every local base. Keys added only to a branch were added with a base `*` key (§7.6), and are the branch's own. A branch can't refuse a base key, just as it can't drop the base's `*` keys (§7.6); base administrators control their branches anyway.
 
 -
 **Bootstrapping.** Creating a namespace needs a deployment-level operator key configured outside the system. It is the one step that cannot describe itself. A grant for a namespace that doesn't exist yet names it in `ns`, or uses `"*"`, which only grants signed by an operator key may do. Branches are the exception: they are created with a `branch` grant on their base (§7.6).
+
+-
+**Operator grants** authorise exactly: creating a namespace with its genesis document; creating a remote branch, including the schema histories it mirrors (§G.3); and forcing a purge or namespace purge (§6.1). Any other request under one is `401`, as for a key the namespace doesn't list, except reads of a public namespace, which ignore it (§7). An operator who needs more adds a key to the namespace document, as anyone with its `*` key can.
 
 -
 **Operator key history.** A deployment publishes its operator keys as a JWK Set (RFC 7517) at the `jwks_uri` it gives at `GET /` (§7), by default `/.well-known/patchlog-keys`. Verifiers read the URI there rather than guess a path. `/.well-known/jwks.json` is a convention, not a registered name, and an identity provider on the same domain may publish keys for another purpose there.
@@ -2482,6 +2517,18 @@ A signature is checked along one chain, every link of which is immutable or in a
     - `/r/{ns}/{name}` and `/r/{ns}/{name}/…` when its rules fix `/resource`
 
     - otherwise `/r/{ns}/…` and `/ns/{ns}/…`
+
+**Issuing them.** `POST /edge-grants` on the origin, with the grant in `Authorization`, answers `200` with `{ "prefixes": [ … ], "exp" }` and one `Set-Cookie` per prefix: `Path` set to the prefix, `Secure`, `HttpOnly`, named per prefix so cookies for several namespaces coexist.
+
+    - It issues one per namespace the grant's `ns` names; `"*"` is `403`, as is a grant without `read` there, and one whose read rules refer to `/resource` without fixing it, or to `/now`, since the edge evaluates no rules.
+
+    - A cookie authorises only `GET` and `HEAD` under its prefix: never writes, never `/edge-grants`, never a service's URLs.
+
+    - A page on another origin calls it with credentials. Credentialed responses name that origin from the deployment's list, with `Access-Control-Allow-Credentials: true` and `Vary: Origin`, never `*` and never an echoed `Origin` (§7, browsers).
+
+    - The cookie's format is the deployment's, since only its edge reads it. When no verifying edge is in front, the origin verifies the cookie itself, so a client works the same either way.
+
+    - Cookies fixed to single resources add up; a reader of many documents is better served by a namespace-wide grant, or by a proxy (§C.6).
 
 The edge verifies the edge grant on every request, and it is not part of the cache key. Downstream caching is `private` (§9). The edge grant's lifetime is the revocation latency, so keep it short (5–15 minutes). No edge grant is issued before the grant's `nbf`, and none outlives its `exp`.
 
@@ -2523,6 +2570,8 @@ The edge verifies the edge grant on every request, and it is not part of the cac
   - A service that **proposes** changes, such as an AI summariser or a bulk rename, can write to a branch instead of the base (Addendum F). A person then reviews and merges, and the service needs no write access to the base at all.
 
   - A translator narrowed to `within ["/i18n"]` cannot write anything else, however it spells its patches, apart from a fresh `$nonce` (§6.4.1).
+
+- **Filtering proxies.** A service that serves a namespace's `/ns/{ns}/…` view filtered per document, for readers limited to some documents, can hide names and content but not timing: the namespace revision, `X-Namespace-Revision` and long-poll wake-ups move on edits the reader can't see. It pages and derives cursors itself, such as for `/heads`, and never passes upstream ones on, since they can name hidden resources. Hiding timing from such readers is a non-goal; content that needs it goes in its own namespace (§B.10).
 
 - **Services that re-publish content MUST enforce reader permissions.** Search, tree and catalog results are filtered by the reader's verified grant. Private results are cached per subject set (§B.11.5), not per request, and never with embedded bearer URLs.
 
@@ -2566,9 +2615,9 @@ Grants are carried as Biscuit v3 tokens. Biscuit provides exactly what §C.1 nee
 
 ---
 
-# Addendum D — Reference implementation (Bun + SQLite)
+# Addendum D — Bun prototype (this repository)
 
-Everything in this addendum is specific to the implementation in this repository. It is not part of the specification. D.2–D.5 describe the SQLite layout; D.8 describes an alternative on Postgres.
+Everything in this addendum is specific to the prototype in this repository. It is not part of the specification. The reference implementation is the `patchlog` server, whose changelog says what it implements; this addendum's layouts remain useful as worked examples. D.2–D.5 describe the SQLite layout; D.8 describes an alternative on Postgres.
 
 ## D.1 Stack
 
@@ -2814,30 +2863,7 @@ CREATE UNIQUE INDEX one_config_genesis ON ns_config (ns) WHERE parent_seq IS NUL
 
 ## D.6 Implementation status
 
-The current code (`log.ts`, `server.ts`, `client.ts`, `demo.ts`) predates most of this spec.
-
-| Area | Status |
-|---|---|
-| Content-addressed revisions, SHA-256 | ⚠️ 64-char hex over `parent + "\n" + patches`; to change to §3.2–3.3 |
-| Canonical JSON | ⚠️ sorted-key JSON, not JCS; no I-JSON input checks |
-| Storage | ⚠️ single table, text ids; to change to D.2 |
-| Schema validation | ⚠️ single global `schema.json`; to change to opt-in `$schema` (§6.1) |
-| Linear log, ids unique per resource | ✅ |
-| Replay and verification | ✅ |
-| Head redirect, immutable `/rev/{id}`, `/rev/{id}/log?since=`, ETag/304 | ✅ (cache headers to update per §9) |
-| SSE with catch-up | ✅ |
-| Long-poll with cursors (§7.7) | ❌ |
-| Client load / sync / submit-with-rebase / watch | ⚠️ uses the old `POST` + body `parent` + `409` API |
-| Writes | ⚠️ `POST`, `409`; to change to `PATCH` + `If-Match`, gate order of §6.2, `412`/`428`, idempotent retry |
-| Namespaces, names grammar, namespace log and document, rules with `writes` and `compare` | ❌ |
-| Tombstone / restore / purge | ❌ |
-| Limits, linear-time regex | ❌ |
-| Addendum C grants, roles and attributes | ❌ |
-| Batches, branches, freeze, namespace purge | ❌ |
-| Remote branches: read-through, verification, schema mirroring (§G.3) | ❌ |
-| Rate limits, pruning and retention (§6.6, §8.6) | ❌ |
-| Blobs (§7.8) | ❌ |
-| Addenda A and B services, Addendum F merge service, Addendum G export and import tools | ❌ (optional, separate processes) |
+The prototype's code (`log.ts`, `server.ts`, `client.ts`, `demo.ts`) predates most of this spec: it has content-addressed revisions, replay and verification, head redirects and SSE, with the older id and write formats. The `patchlog` server implements the core and the addenda's services through v0.45; its changelog is the place to look, not this section.
 
 ## D.7 Suggested order
 
@@ -3403,6 +3429,8 @@ Tombstones are entries like any other, and a `"delete"` step reproduces them (§
 
 - **Blobs.** A merge within the deployment copies nothing: the blobs the branch attached are available to the batch's items through its `source`, and are attached in the base when it commits (§7.8). The merger's grant must therefore also read the branch, or the batch carries one that does in `Source-Authorization`. Blob ids don't depend on where a blob is stored, so fast-forwards still reproduce the branch's ids. A merge from another deployment uploads the blobs first (§G.3). The dry run reports a missing blob as a `blob` failure.
 
+- **Nonces.** `writes` leave out a fresh `$nonce` (§6.4.1), so refreshing it never conflicts. Tools that diff documents for a merge or a review leave it out too.
+
 - **Conflicts inside arrays.** `writes` are compared segment by segment, and array indices shift. So `/blocks/0` in the base and `/blocks/3` in the branch don't overlap as pointers, yet replaying the branch's `remove /blocks/3` after the base's insert at 0 removes a different block. For merge and rebase, a write whose last segment addresses an array element (an index or `-`) counts as a write to the whole array.
 
 - **Configuration is never merged implicitly.** The branch's own configuration (read mode, cleanup) stays in the branch. A config change meant for the base, such as a migration rule, goes in the batch's `config` explicitly.
@@ -3513,6 +3541,8 @@ A branch with no `head`, `tombstone` or `batch` entry of its own counts as merge
 ## F.8 Access, encryption, catalogs and indexes
 
 - **Reads.** A branch is a copy of its base (§7.6). Creating one needs unrestricted `read` on the base, and a branch of a namespace that isn't public can't be public. A namespace with public branches can't become private until they are dealt with (§7.4).
+
+- **Editors limited to some documents** can't branch the base themselves (§7.6). A service that may (unrestricted `read` and `branch`) creates the branch for them, recorded with `via` (§C.1), with `read: "grant"`, and issues them grants on it fixed to the resources their base grants cover, as the catalog does for the base (§B.11.4). Nothing in the branch is then readable more widely than in the base. A branch scoped by the creator's own reads is an open question (§13).
 
 - **Keys and revocation** in a base reach its branches (§C.4). Roles and rules don't: a branch's writes stay in the branch until a merge, which the base's own rules judge.
 
@@ -3703,7 +3733,7 @@ Remote read-through runs in the receiving deployment's server. Export and import
 
 ## G.1 Principles
 
-- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.45", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
+- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.46", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
 
 - **Ids travel, trust doesn't.** Content that comes **with its history** can be verified by anyone by recomputing ids (invariant 4), given a trusted starting point: an `ns_id` or revision id obtained from the source itself. Integrity then needs no trusted transport, cache or mirror. Snapshots, headers and listings not covered by ids are only as trustworthy as their channel.
 
@@ -3861,7 +3891,7 @@ Newline-delimited JSON (`application/vnd.patchlog.bundle+jsonl`). The first line
 
 - **`written`.** A signature binds the namespace it was written in (§C.3), and history lines name the exporting namespace. A line for a revision written elsewhere, such as one a branch reads through from its base, also carries `written`: that namespace's name, or `{ "origin", "ns" }` when it is in another deployment, as a remote branch's base is. Verifiers use it, and its `origin`, in the signing input. An exporter that can't determine it, because no log it can read records the revision, writes the line without `written` and without `grant` rather than guess, so its signature reports as unverifiable.
 
-- **`key`** is the key entry the grant's root block verified against at the source (§C.3.1): a key of the namespace document in force at the first entry that recorded the grant, or else an operator key in force at the `created` of the first revision naming the grant (§C.4). An exporter that can find neither leaves `key` out. `key` is attested by the exporter, not proven: the digest isn't a signature (Trust, below).
+- **`key`** is the key entry the grant's root block verified against at the source (§C.3.1): a key of the namespace document in force at the first entry that recorded the grant (in a branch, or of its bases' then), or else an operator key in force at the `created` of the first revision naming the grant (§C.4). An exporter that can find neither leaves `key` out. `key` is attested by the exporter, not proven: the digest isn't a signature (Trust, below).
 
 - Bundle tools SHOULD verify signatures through §C.3.1's chain against the line's `written` origin, else the header's `origin`. A tool holding the source's namespace log, or its operator key history, checks `key` at the revision's position; otherwise it reports the signature as attested, not verified. An importer signs its own steps (§C.3.1); the original signatures stay in the bundle, which its batches' `source` names (§G.4.4).
 
@@ -4309,3 +4339,15 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **v0.44:** reverse-reference queries in the indexing service, from a proposal by an editor built on Patch Log. The index collects every `x-ref` reference by §6.5's walk, with no extra opt-in (§A.2), and `?ref=` answers "who uses this?", for any form, one pinned revision or one entry, with the paths where each reference sits (§A.4). Delete guards built on it are advisory. A cross-namespace form is an open question (§A.7).
 
 - **v0.45:** clarifications from implementing v0.42 and v0.44. End-to-end grants are `no-store` for shared caches (§C.3.1); a batch whose config change fails doesn't check its items' signatures; batch errors and dry runs report `signature` per item (§7.5). In the index, `refs` paths keep array indices, a pinned entry is a fourth `ref` form, `refs` appear only in `ref` hits, and adding references to an existing index means one replay (§A).
+
+- **v0.46:** feedback from Doors, an editor built on Patch Log.
+
+- **Schemas (§6.1):** a namespace may set `schemaReads: { for }`, so its schema revisions resolve for writes in the listed namespaces that pin them and can be read by readers of documents that pin them, without a grant on the namespace; `schema_unavailable` names the path.
+
+- **Access (§C.4, §C.5, §F.8):** branches accept keys added to the base after they were created; operator grants authorise creating namespaces and forcing purges, nothing else; `POST /edge-grants` issues edge grants as cookies, and the origin verifies them when no edge is in front; a service creates branches for editors limited to some documents.
+
+- **Catalog (§B.5, §B.11):** `?min` on `/grants` and `/read-grants`; an optional title pointer copied into listings; `inheritPowers` lets tree powers inherit.
+
+- **Index (Addendum A):** `x-index` arrays; schema documents indexed against their dialect, with their `$ref`s as references; self-references flagged; hits carry sort values and requested `fields`.
+
+- **Also:** "live" branches exclude frozen ones (§6.6); the gestures listing answers limited readers for their own resources (§7.4); merged gestures count for their source author (§11.2); presence is out of scope (§11); consumers may start from heads (§10); `roles: []` grants nothing (§C.1.1); filtering proxies can't hide timing (§C.6); nonce refreshes never conflict in merges (§F.3); a `$schema`-keeping rule needs `[]` restores (§6.4.4); Addendum D is the Bun prototype, and the reference implementation's changelog replaces its status table.
