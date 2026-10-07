@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -287,7 +288,19 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
 		return
 	}
-	cur, _, _ := ix.state(ns)
+	// The committed checkpoint, not the in-memory one: Apply publishes the
+	// latter just after its commit, and queries read the committed rows. A
+	// redirect decided by one and a read by the other made the head pointer
+	// and at URLs alternate between the old and the new at while an apply
+	// sat between the two (e.g. in a slow purger), and sent ?min= readers
+	// to a checkpoint behind min, which seen (committed with it) had passed.
+	// The committed checkpoint only moves forward, so every redirect does.
+	cur, err := ix.committed(ctx, ns)
+	if err != nil {
+		ix.opt.Logf("index: checkpoint of %s: %v", ns, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "cannot read the checkpoint")
+		return
+	}
 	if cur == "" {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
@@ -413,10 +426,10 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		if err != nil {
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}
-		if ix.Checkpoint(ns) != at {
+		if now, err := ix.committed(ctx, ns); err == nil && now != at {
 			// An apply (maybe a purge) committed meanwhile: don't keep a
 			// result it may have retired.
-			if err := ix.sealed.Retire(ctx, ix.db, ns, ix.Checkpoint(ns)); err != nil {
+			if err := ix.sealed.Retire(ctx, ix.db, ns, now); err != nil {
 				ix.opt.Logf("index: retiring sealed results of %s: %v", ns, err)
 			}
 		}
@@ -505,6 +518,18 @@ func (ix *Index) query(ctx context.Context, ns, at string, q *Query, allow func(
 	}
 	res, err := ix.run(ctx, tx, ns, q, allow)
 	return res, got, err
+}
+
+// committed returns the checkpoint of ns the database holds ("" if none):
+// what queries read. It is at or past the in-memory one (Checkpoint), which
+// Apply publishes after its commit.
+func (ix *Index) committed(ctx context.Context, ns string) (string, error) {
+	var id string
+	err := ix.db.QueryRowContext(ctx, `SELECT ns_id FROM checkpoints WHERE origin = ? AND ns = ?`, ix.origin, ns).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return id, err
 }
 
 // countsTag tags results with facet counts, which can reflect any resource
