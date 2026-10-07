@@ -3,7 +3,10 @@
 //
 // Requests carry their credentials in the Authorization header (Addendum
 // C), which a page sets itself, so cross-origin reads and writes need no
-// cookies: Access-Control-Allow-Credentials is sent only when configured.
+// cookies: Access-Control-Allow-Credentials is sent only when configured,
+// and only to origins named in the configuration, such as pages that use
+// edge-grant cookies (§C.5); an Origin that isn't listed is never echoed
+// with credentials.
 //
 // With "*", every origin is allowed and every response says so, whether or
 // not the request names an origin, so responses are the same for all of
@@ -31,6 +34,12 @@ type Config struct {
 	// Credentials sends Access-Control-Allow-Credentials, for pages that
 	// send cookies. Not allowed with "*".
 	Credentials bool
+	// CredentialOrigins are origins whose pages may call with credentials
+	// (cookies), such as edge-grant cookies (§C.5): a request from one of
+	// them is answered with that origin named, from this list, and
+	// Access-Control-Allow-Credentials: true, also when Origins is "*".
+	// Any other origin is answered as Origins says, without credentials.
+	CredentialOrigins []string
 	// MaxAge is how long browsers may cache a preflight; zero means 10
 	// minutes.
 	MaxAge time.Duration
@@ -85,7 +94,7 @@ func (e *originError) Error() string {
 
 // Wrap adds CORS to h. With no origins configured it returns h.
 func Wrap(h http.Handler, c Config) http.Handler {
-	if len(c.Origins) == 0 {
+	if len(c.Origins) == 0 && len(c.CredentialOrigins) == 0 {
 		return h
 	}
 	anyOrigin := slices.Contains(c.Origins, "*")
@@ -96,7 +105,7 @@ func Wrap(h http.Handler, c Config) http.Handler {
 	age := strconv.Itoa(int(maxAge.Seconds()))
 	// The answer varies by origin unless every origin gets "*": credentials
 	// need the origin named, even with "*" configured (§7 Browsers).
-	echo := !anyOrigin || c.Credentials
+	echo := !anyOrigin || c.Credentials || len(c.CredentialOrigins) > 0
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hd := w.Header()
 		if echo {
@@ -105,18 +114,25 @@ func Wrap(h http.Handler, c Config) http.Handler {
 			hd.Add("Vary", "Origin")
 		}
 		origin := r.Header.Get("Origin")
+		// A credentialed answer names the origin from the configured
+		// list, never "*" and never an origin that isn't listed (§C.5,
+		// §7 Browsers).
+		credOrigin := origin != "" && (slices.Contains(c.CredentialOrigins, origin) ||
+			c.Credentials && !anyOrigin && slices.Contains(c.Origins, origin))
 		// Without echo the answer allows every origin, so it doesn't
 		// depend on the request's: it carries the allowance even without
 		// Origin, or it would vary by origin without saying so.
-		allowed := !echo || origin != "" && (anyOrigin || slices.Contains(c.Origins, origin))
+		allowed := credOrigin || origin != "" && (anyOrigin || slices.Contains(c.Origins, origin)) ||
+			len(c.Origins) > 0 && !echo
 		if allowed {
-			if !echo {
-				hd.Set("Access-Control-Allow-Origin", "*")
-			} else {
+			switch {
+			case credOrigin:
 				hd.Set("Access-Control-Allow-Origin", origin)
-			}
-			if c.Credentials {
 				hd.Set("Access-Control-Allow-Credentials", "true")
+			case anyOrigin && !c.Credentials:
+				hd.Set("Access-Control-Allow-Origin", "*")
+			default:
+				hd.Set("Access-Control-Allow-Origin", origin)
 			}
 		}
 		if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {

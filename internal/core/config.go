@@ -150,6 +150,11 @@ type Config struct {
 	// may resolve schema paths into this branch's own revisions (§6.1).
 	// Nil when absent: the drafts serve only the branch and its branches.
 	DraftsFor []string
+	// SchemaReadsFor is schemaReads.for (§6.1): the namespaces, names or
+	// prefixes ending in "*", for whose writes and readers this
+	// namespace's schema revisions resolve without read here. Nil when
+	// absent. The namespace itself always counts (schemaReadsOpen).
+	SchemaReadsFor []string
 	// SignaturesRequired is "signatures": "required" (§C.3.1): every
 	// resource revision and tombstone needs a valid author signature by a
 	// signer of its grant. False for "optional", the default.
@@ -279,7 +284,7 @@ func ValidRemoteOrigin(s string) bool {
 var nsMembers = map[string]bool{
 	"read": true, "keys": true, "roles": true, "revoked": true, "rules": true, "limits": true,
 	"allowances": true, "retention": true, "encryption": true, "maxLag": true, "base": true,
-	"frozen": true, "successor": true, "drafts": true, "signatures": true,
+	"frozen": true, "successor": true, "drafts": true, "signatures": true, "schemaReads": true,
 	"catalog": true, "catalogs": true, // Addendum B
 	"merge": true, "merged": true, "cleanup": true, "abandoned": true, // Addendum F
 }
@@ -728,6 +733,12 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				return nil, err
 			}
 			c.DraftsFor = df
+		case "schemaReads":
+			sr, err := parseSchemaReads(v)
+			if err != nil {
+				return nil, err
+			}
+			c.SchemaReadsFor = sr
 		case "encryption":
 			e, ok := v.(map[string]any)
 			if !ok {
@@ -788,6 +799,11 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 	if c.DraftsFor != nil && (c.Base.Remote() || c.level == levelE2E) {
 		// It could have no effect there (§6.1, §7.4).
 		return nil, fmt.Errorf("/drafts is only for local branches that aren't end-to-end encrypted (§7.4)")
+	}
+	if c.SchemaReadsFor != nil && c.level >= levelSealed {
+		// Their readers need keys that a pinning document doesn't give
+		// them (§6.1).
+		return nil, fmt.Errorf("/schemaReads is not allowed in sealed and end-to-end namespaces (§6.1)")
 	}
 	if c.level == levelE2E {
 		// Sealing grows a patch set by half, and it carries the declared

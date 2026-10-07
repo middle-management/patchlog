@@ -290,6 +290,14 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
 			return nil, invalid("a branch of a non-public namespace cannot be public")
 		}
+		if cur.Frozen && !cfg.Frozen && !base.isShadow() {
+			// Unfreezing makes the branch live again, which counts against
+			// its base's branchesPerNamespace as creating one does (§6.6,
+			// §8.4).
+			if t.liveBranches(base, n) >= t.config(base.configSeq).Limits.BranchesPerNamespace {
+				return nil, limitErr(422, "too many live branches: the base already has branchesPerNamespace live branches (§6.6, §8.4)")
+			}
+		}
 	}
 	if cfg.Successor != "" {
 		s := t.nsByName(cfg.Successor)
@@ -321,6 +329,21 @@ func (t *tx) publicDependents(n *nsRow) []string {
 		}
 	}
 	return out
+}
+
+// liveBranches counts n's direct branches that are live (§6.6): neither
+// frozen nor purged, leaving out except.
+func (t *tx) liveBranches(n, except *nsRow) int {
+	live := 0
+	for _, b := range t.branchesOf(n) {
+		if except != nil && b.id == except.id {
+			continue
+		}
+		if !b.purged && !t.config(b.configSeq).Frozen {
+			live++
+		}
+	}
+	return live
 }
 
 func (t *tx) branchesOf(n *nsRow) []*nsRow {
@@ -571,7 +594,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	atID := t.nsLogID(atSeq)
 	// Build the branch's namespace document (step 3).
 	doc := cloneDoc(bcfg.Doc)
-	for _, k := range []string{"frozen", "successor", "merged", "abandoned", "drafts"} {
+	for _, k := range []string{"frozen", "successor", "merged", "abandoned", "drafts", "schemaReads"} {
 		delete(doc, k) // §7.6: none of them is inherited
 	}
 	doc["base"] = map[string]any{"ns": base.name, "at": atID.String()}
@@ -616,13 +639,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	// Live branches only (§6.6): merged or superseded branches are frozen,
 	// not live (§F.6), and don't count, so branches kept for review after
 	// their merge don't block new ones.
-	live := 0
-	for _, b := range t.branchesOf(base) {
-		if !b.purged && !t.config(b.configSeq).Frozen {
-			live++
-		}
-	}
-	if live >= bcfg.Limits.BranchesPerNamespace {
+	if t.liveBranches(base, nil) >= bcfg.Limits.BranchesPerNamespace {
 		return nil, limitErr(422, "too many live branches")
 	}
 	// Step 5. The document starts as the base's, so the members this
@@ -693,7 +710,7 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(req.NS)
 		if n == nil {
-			return t.absentNS(req.NS, req.Cred)
+			return t.absentNSOp(req.NS, req.Cred, force)
 		}
 		cfg := t.config(n.configSeq)
 		a, operator, aerr := t.purger(n, cfg, req, force)
@@ -878,7 +895,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 	err := e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(req.NS)
 		if n == nil {
-			return t.absentNS(req.NS, req.Cred)
+			return t.absentNSOp(req.NS, req.Cred, force)
 		}
 		cfg := t.config(n.configSeq)
 		a, operator, aerr := t.purger(n, cfg, req, force)

@@ -30,8 +30,10 @@ import (
 //     the next page's ?after= (§7.4): ids repeat across resources (§3.3), resource
 //     names never contain "/" (§3.6). The list grows, so the last page is
 //     the one without X-Log-Next, and nothing is cached (no-store).
-//   - It needs unrestricted read on the namespace, as branching does
-//     (§7.6), and isn't offered in sealed or e2e namespaces: 404 with code
+//   - It answers any reader, listing only the entries of resources its
+//     grant may read, so a reader limited to some documents finds its own
+//     gestures and learns nothing of others. It isn't offered in sealed
+//     or e2e namespaces: 404 with code
 //     "not_offered", after authorisation, as a deployment without the
 //     endpoint answers 404. Their logs are the place to look (§11.2).
 
@@ -56,13 +58,24 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		a, err := t.reader(n, cred, "")
+		a, err := t.anyReader(n, cred)
 		if err != nil {
 			return err
 		}
-		// An anonymous reader of a public namespace reads all of it.
-		if a != nil && !a.unrestrictedRead() {
-			return forbidden("listing a gesture needs unrestricted read on the namespace")
+		// A reader limited to some resources gets only theirs (§7.4). An
+		// anonymous reader of a public namespace reads all of it.
+		cfg := t.config(n.configSeq)
+		var visible func(name string) bool
+		if a != nil && !a.unrestrictedRead() && cfg.Read != "public" {
+			seen := map[string]bool{}
+			visible = func(name string) bool {
+				v, ok := seen[name]
+				if !ok {
+					v = t.canRead(n, cfg, a, name)
+					seen[name] = v
+				}
+				return v
+			}
 		}
 		if t.nsLevel(n) >= levelSealed {
 			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
@@ -75,7 +88,7 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			name, idText, ok := strings.Cut(since, "/")
 			id, perr := ids.Parse(idText)
 			r := t.resource(n.id, name)
-			if !ok || perr != nil || r == nil {
+			if !ok || perr != nil || r == nil || (visible != nil && !visible(name)) {
 				return notFound()
 			}
 			if err := t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, r.id, id[:]).Scan(&after); err != nil {
@@ -83,10 +96,6 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			}
 		}
 		limit := e.opt.Maximums.LogPageSize
-		rows, qerr := t.Query(`SELECT r.seq, r.res, s.name, r.id, r.kind, r.gesture, r.undoes, r.author FROM revisions r JOIN resources s ON s.res = r.res
-			WHERE s.ns = ? AND s.state <> ? AND (r.gesture = ? OR r.undoes = ?) AND r.seq > ? ORDER BY r.seq LIMIT ?`,
-			n.id, statePurged, gesture, gesture, after, limit+1)
-		t.must(qerr)
 		type row struct {
 			seq, res        int64
 			name            string
@@ -95,16 +104,34 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			gesture, undoes *string
 			author          int64
 		}
+		// Rows the reader may not read are skipped, so a page is filled
+		// from as many batches as it takes.
 		var rs []row
-		for rows.Next() {
-			var r row
-			t.must(rows.Scan(&r.seq, &r.res, &r.name, &r.id, &r.kind, &r.gesture, &r.undoes, &r.author))
-			rs = append(rs, r)
+		for len(rs) <= limit {
+			rows, qerr := t.Query(`SELECT r.seq, r.res, s.name, r.id, r.kind, r.gesture, r.undoes, r.author FROM revisions r JOIN resources s ON s.res = r.res
+				WHERE s.ns = ? AND s.state <> ? AND (r.gesture = ? OR r.undoes = ?) AND r.seq > ? ORDER BY r.seq LIMIT ?`,
+				n.id, statePurged, gesture, gesture, after, limit+1)
+			t.must(qerr)
+			var batch []row
+			for rows.Next() {
+				var r row
+				t.must(rows.Scan(&r.seq, &r.res, &r.name, &r.id, &r.kind, &r.gesture, &r.undoes, &r.author))
+				batch = append(batch, r)
+			}
+			t.must(rows.Err())
+			// Closed before querying again: a Postgres connection runs one
+			// query at a time.
+			rows.Close()
+			for _, r := range batch {
+				if visible == nil || visible(r.name) {
+					rs = append(rs, r)
+				}
+			}
+			if len(batch) <= limit {
+				break
+			}
+			after = batch[len(batch)-1].seq
 		}
-		t.must(rows.Err())
-		// Closed before querying again: a Postgres connection runs one
-		// query at a time.
-		rows.Close()
 		out = &GesturePage{Entries: []map[string]any{}}
 		if len(rs) > limit {
 			rs = rs[:limit]

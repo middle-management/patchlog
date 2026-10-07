@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]] [-edge-grant-key FILE] [-cors-credentials-origin ORIGIN]...
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -98,7 +98,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
-                 [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+                 [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]] [-edge-grant-key FILE] [-cors-credentials-origin ORIGIN]...
   patchlog version
   patchlog keygen
   patchlog grant mint -key SEED -block JSON [-seal]
@@ -165,10 +165,12 @@ func serve(args []string) {
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
+	edgeGrantKey := fs.String("edge-grant-key", "", "file holding the key edge-grant cookies of POST /edge-grants are signed with (§C.5); default: derived from -edge-secret, or else random per process, so cookies don't survive a restart or reach another instance")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
 	ev := edgeVerifier(*edgeSecret, *edgeHeader)
+	cookies := edgeGrantCookies(*edgeGrantKey, ev, corsFlags)
 	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
 	if err != nil {
 		log.Fatal(err)
@@ -279,7 +281,7 @@ func serve(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev)), *pg, treeProxy, indexProxy, playground.Options{SchemaFetch: *schemaFetch, SchemaFetchHosts: splitHosts(*schemaHosts)})), ReadHeaderTimeout: 10 * time.Second}
+	srv := &http.Server{Addr: *addr, Handler: corsFlags.wrap(handler(server.New(e, server.WithEdge(ev), server.WithEdgeGrants(cookies)), *pg, treeProxy, indexProxy, playground.Options{SchemaFetch: *schemaFetch, SchemaFetchHosts: splitHosts(*schemaHosts)})), ReadHeaderTimeout: 10 * time.Second}
 	ls := sdFlags.server("patchlog", srv, e.Ping)
 	sigCtx, sigs := shutdownSignals("patchlog")
 	ln, err := net.Listen("tcp", *addr)
@@ -320,6 +322,7 @@ const (
 // corsFlags are the -cors-* flags every server takes.
 type corsFlags struct {
 	origins     multi
+	credOrigins multi
 	credentials *bool
 	maxAge      *time.Duration
 }
@@ -330,6 +333,7 @@ func addCORSFlags(fs *flag.FlagSet) *corsFlags {
 		c.origins = multi{v}
 	}
 	fs.Var(&c.origins, "cors-origin", "origin browser pages may call from, e.g. https://app.example, or * for any (repeatable or comma-separated; default $PATCHLOG_CORS_ORIGINS; unset: no CORS)")
+	fs.Var(&c.credOrigins, "cors-credentials-origin", "origin whose pages may call with credentials (cookies), such as edge-grant cookies (§C.5): named in Access-Control-Allow-Origin with Access-Control-Allow-Credentials: true, even when -cors-origin is * (repeatable or comma-separated; never *)")
 	c.credentials = fs.Bool("cors-credentials", false, "send Access-Control-Allow-Credentials, for pages that send cookies (needs explicit -cors-origin values; grants travel in Authorization and don't need it)")
 	c.maxAge = fs.Duration("cors-max-age", 10*time.Minute, "how long browsers may cache a CORS preflight")
 	return c
@@ -344,10 +348,52 @@ func (c *corsFlags) wrap(h http.Handler) http.Handler {
 	if *c.credentials && slices.Contains(origins, "*") {
 		log.Fatal("-cors-credentials needs explicit -cors-origin values, not *")
 	}
+	credOrigins, err := c.credentialOrigins()
+	if err != nil {
+		log.Fatal(err)
+	}
 	if len(origins) > 0 {
 		log.Printf("CORS: allowing %s", strings.Join(origins, ", "))
 	}
-	return cors.Wrap(h, cors.Config{Origins: origins, Credentials: *c.credentials, MaxAge: *c.maxAge})
+	if len(credOrigins) > 0 {
+		log.Printf("CORS: allowing credentials from %s", strings.Join(credOrigins, ", "))
+	}
+	return cors.Wrap(h, cors.Config{Origins: origins, CredentialOrigins: credOrigins, Credentials: *c.credentials, MaxAge: *c.maxAge})
+}
+
+// credentialOrigins are the -cors-credentials-origin values, checked.
+func (c *corsFlags) credentialOrigins() ([]string, error) {
+	out, err := cors.Parse(c.credOrigins)
+	if err != nil {
+		return nil, fmt.Errorf("-cors-credentials-origin: %v", err)
+	}
+	if slices.Contains(out, "*") {
+		return nil, fmt.Errorf("-cors-credentials-origin takes named origins, not *")
+	}
+	return out, nil
+}
+
+// edgeGrantCookies returns the edge-grant cookies of POST /edge-grants
+// (§C.5): signed with -edge-grant-key, or the key derived from
+// -edge-secret, or a random one. They are SameSite=None when pages on
+// other origins may call with credentials (-cors-credentials-origin),
+// else Lax.
+func edgeGrantCookies(keyFile string, ev *edge.Verifier, c *corsFlags) *edge.Cookies {
+	key := ev.CookieKey()
+	if keyFile != "" {
+		b, err := os.ReadFile(keyFile)
+		if err != nil {
+			log.Fatalf("-edge-grant-key: %v", err)
+		}
+		if key = []byte(strings.TrimSpace(string(b))); len(key) < 16 {
+			log.Fatal("-edge-grant-key: the key must be at least 16 bytes")
+		}
+	}
+	ck := edge.NewCookies(key)
+	if co, err := c.credentialOrigins(); err == nil && (len(co) > 0 || *c.credentials) {
+		ck.SameSite = http.SameSiteNoneMode
+	}
+	return ck
 }
 
 // edgeVerifier returns the verifying edge of -edge-secret, or nil.

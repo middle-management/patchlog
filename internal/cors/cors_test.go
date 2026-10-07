@@ -209,11 +209,13 @@ func TestPreflightAnyOrigin(t *testing.T) {
 	}
 }
 
-// Credentials need the origin named, even with "*" configured: the answer
+// Credentials need the origin named from the configured list: the answer
 // then varies by origin and says so (Vary: Origin), so a CDN doesn't serve
-// one origin's answer to another (§7 "Browsers").
+// one origin's answer to another (§7 "Browsers"). With "*" there is no
+// list, so no origin gets credentials: an arbitrary Origin is never echoed
+// with them (§C.5).
 func TestCredentialsVaryByOrigin(t *testing.T) {
-	h := Wrap(api(), Config{Origins: []string{"*"}, Credentials: true})
+	h := Wrap(api(), Config{Origins: []string{"https://a.example", "https://b.example"}, Credentials: true})
 	w := do(h, "GET", "https://a.example", nil)
 	if w.Header().Get("Access-Control-Allow-Origin") != "https://a.example" || w.Header().Get("Access-Control-Allow-Credentials") != "true" {
 		t.Fatalf("headers %v", w.Header())
@@ -224,5 +226,41 @@ func TestCredentialsVaryByOrigin(t *testing.T) {
 	w = do(h, "OPTIONS", "https://b.example", map[string]string{"Access-Control-Request-Method": "PATCH"})
 	if w.Header().Get("Access-Control-Allow-Origin") != "https://b.example" || !slices.Contains(w.Header().Values("Vary"), "Origin") {
 		t.Fatalf("preflight %v", w.Header())
+	}
+	h = Wrap(api(), Config{Origins: []string{"*"}, Credentials: true})
+	w = do(h, "GET", "https://evil.example", nil)
+	if w.Header().Get("Access-Control-Allow-Credentials") != "" {
+		t.Fatalf("credentials for an unlisted origin: %v", w.Header())
+	}
+}
+
+// CredentialOrigins (§C.5): a listed origin gets itself named and
+// credentials, even with "*" for everyone else; another origin gets "*"
+// without credentials; every answer varies by origin.
+func TestCredentialOrigins(t *testing.T) {
+	h := Wrap(api(), Config{Origins: []string{"*"}, CredentialOrigins: []string{"https://app.example"}})
+	w := do(h, "GET", "https://app.example", nil)
+	if w.Header().Get("Access-Control-Allow-Origin") != "https://app.example" || w.Header().Get("Access-Control-Allow-Credentials") != "true" ||
+		!slices.Contains(w.Header().Values("Vary"), "Origin") {
+		t.Fatalf("listed origin: %v", w.Header())
+	}
+	w = do(h, "GET", "https://other.example", nil)
+	if w.Header().Get("Access-Control-Allow-Origin") != "*" || w.Header().Get("Access-Control-Allow-Credentials") != "" ||
+		!slices.Contains(w.Header().Values("Vary"), "Origin") {
+		t.Fatalf("other origin: %v", w.Header())
+	}
+	w = do(h, "OPTIONS", "https://app.example", map[string]string{"Access-Control-Request-Method": "POST"})
+	if w.Code != 204 || w.Header().Get("Access-Control-Allow-Origin") != "https://app.example" || w.Header().Get("Access-Control-Allow-Credentials") != "true" {
+		t.Fatalf("preflight: %d %v", w.Code, w.Header())
+	}
+	// Only credentialed origins configured: others get no CORS at all.
+	h = Wrap(api(), Config{CredentialOrigins: []string{"https://app.example"}})
+	w = do(h, "GET", "https://other.example", nil)
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("unlisted origin allowed: %v", w.Header())
+	}
+	w = do(h, "GET", "https://app.example", nil)
+	if w.Header().Get("Access-Control-Allow-Origin") != "https://app.example" || w.Header().Get("Access-Control-Allow-Credentials") != "true" {
+		t.Fatalf("listed origin: %v", w.Header())
 	}
 }

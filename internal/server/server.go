@@ -27,6 +27,8 @@ type Server struct {
 	e    *core.Engine
 	mux  *http.ServeMux
 	edge *edge.Verifier // nil: no verifying edge (§9)
+	// cookies issues and verifies edge grants as cookies (§C.5).
+	cookies *edge.Cookies
 }
 
 // Option configures a Server.
@@ -43,6 +45,9 @@ func New(e *core.Engine, opts ...Option) *Server {
 	s := &Server{e: e, mux: http.NewServeMux()}
 	for _, o := range opts {
 		o(s)
+	}
+	if s.cookies == nil {
+		s.cookies = edge.NewCookies(s.edge.CookieKey())
 	}
 	m := s.mux
 	m.HandleFunc("GET /{$}", s.root)
@@ -75,6 +80,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("POST /ns/{ns}/batch", s.nsBatch)
 	m.HandleFunc("POST /ns/{ns}/purge", s.nsPurge)
 	m.HandleFunc("POST /ns/{ns}/keys", s.nsKeys)
+	m.HandleFunc("POST /edge-grants", s.edgeGrants)
 	return s
 }
 
@@ -94,6 +100,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	r = s.edgeCred(r)
 	s.mux.ServeHTTP(w, r)
 	annotate(r)
 }
@@ -234,6 +241,9 @@ func creds(r *http.Request) core.Credentials {
 	c := core.Credentials{Author: r.Header.Get("X-Author")}
 	if a := r.Header.Get("Authorization"); strings.HasPrefix(a, "Bearer ") {
 		c.Bearer = strings.TrimSpace(a[len("Bearer "):])
+	}
+	if eg, ok := r.Context().Value(edgeGrantKey{}).(*core.EdgeGrant); ok {
+		c.Edge = eg // an edge-grant cookie (§C.5), GET and HEAD only
 	}
 	return c
 }

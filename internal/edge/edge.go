@@ -33,8 +33,9 @@ const (
 // Verifier checks that a request came through the verifying edge. A nil
 // *Verifier means there is none.
 type Verifier struct {
-	sum    [32]byte
-	header string
+	sum       [32]byte
+	header    string
+	cookieKey []byte // edge-grant cookies (KeyFromSecret)
 }
 
 // New returns a Verifier for secret in header (DefaultHeader if empty).
@@ -45,7 +46,7 @@ func New(secret []byte, header string) (*Verifier, error) {
 	if header == "" {
 		header = DefaultHeader
 	}
-	return &Verifier{sum: sha256.Sum256(secret), header: http.CanonicalHeaderKey(header)}, nil
+	return &Verifier{sum: sha256.Sum256(secret), header: http.CanonicalHeaderKey(header), cookieKey: KeyFromSecret(secret)}, nil
 }
 
 // Load reads the secret from a file (surrounding whitespace, such as a

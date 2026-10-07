@@ -246,13 +246,26 @@ func TestV039GesturesEndpoint(t *testing.T) {
 	if none, _ := list("/ns/sec/gestures/"+gC, f.adminG); len(none) != 0 {
 		t.Fatalf("unknown gesture %v", none)
 	}
-	// Unrestricted read, as branching needs (§7.6): a grant whose rules
-	// refer to /resource is 403, or 404 if it can't read the namespace as
-	// a whole at all, as for /heads.
+	// Any reader (v0.46, §7.4), listing only entries of resources its
+	// grant may read: a reader limited to some documents finds its own
+	// gestures and learns nothing of others, cursors included.
 	restricted := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "z"}}}})
-	expectCode(t, e.get("/ns/sec/gestures/"+gA, restricted), 403, "forbidden")
+	if rp, rnext := list("/ns/sec/gestures/"+gA, restricted); len(rp) != 2 || rnext != "a/"+a1 {
+		t.Fatalf("restricted %v %q", rp, rnext)
+	}
 	only := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
-	expectCode(t, e.get("/ns/sec/gestures/"+gA, only), 404, "not_found")
+	oa, onext := list("/ns/sec/gestures/"+gA, only)
+	if len(oa) != 2 || onext != "" || oa[0].(map[string]any)["resource"] != "a" || oa[1].(map[string]any)["resource"] != "a" {
+		t.Fatalf("only a: %v %q", oa, onext)
+	}
+	onlyB := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "b"}}})
+	if bp, bnext := list("/ns/sec/gestures/"+gA, onlyB); len(bp) != 1 || bnext != "" || bp[0].(map[string]any)["id"] != b0 {
+		t.Fatalf("only b: %v %q", bp, bnext)
+	}
+	// A cursor naming a resource the reader can't read is unknown.
+	expectCode(t, e.get("/ns/sec/gestures/"+gA+"?after=b/"+b0, only), 404, "not_found")
+	noRead := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"append"})
+	expectCode(t, e.get("/ns/sec/gestures/"+gA, noRead), 404, "not_found")
 	expect(t, e.get("/ns/sec/gestures/"+gA), 401)
 
 	// Pruning keeps gestures (§8.6), and the listing still finds them.

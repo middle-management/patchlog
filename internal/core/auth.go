@@ -19,6 +19,9 @@ import (
 type Credentials struct {
 	Bearer string
 	Author string
+	// Edge is a verified edge grant (§C.5), for GET and HEAD under its
+	// prefix only: the server sets it from a cookie, never for writes.
+	Edge *EdgeGrant
 }
 
 // actor is the authenticated principal of a request in one namespace.
@@ -121,10 +124,17 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 // absentNS answers a request to a namespace that doesn't exist exactly as
 // one to an existing namespace whose read isn't public (§7), so existence
 // is not revealed: 401 without a usable grant, 403 for a grant that
-// doesn't name the namespace. A grant naming it can only be usable if an
-// operator key signed it (§C.4): then the answer is 404, otherwise 401,
-// since no key of the namespace can verify it.
+// doesn't name the namespace, and 401 for any other grant naming it, since
+// no key of the namespace can verify it. Operator grants authorise only
+// creating namespaces and forcing purges (§C.4): any other request under
+// one is 401, as for an existing namespace whose keys don't list it.
 func (t *tx) absentNS(nsName string, cred Credentials) *Error {
+	return t.absentNSOp(nsName, cred, false)
+}
+
+// absentNSOp is absentNS for a request an operator grant may authorise
+// (operator: a forced purge): a usable operator grant then gets 404.
+func (t *tx) absentNSOp(nsName string, cred Credentials, operator bool) *Error {
 	if t.e.opt.AuthDisabled {
 		return notFound()
 	}
@@ -132,7 +142,7 @@ func (t *tx) absentNS(nsName string, cred Credentials) *Error {
 	if err != nil {
 		return err
 	}
-	if _, ok := findKey(t.operatorKeys(), g.Blocks[0].Kid); !ok {
+	if _, ok := findKey(t.operatorKeys(), g.Blocks[0].Kid); !ok || !operator {
 		return apiErr(401, "unauthenticated", "message", "no key can verify the grant")
 	}
 	if _, err := t.verifyGrant(g, nsName, nil, nil, t.operatorKeys()); err != nil {
@@ -178,9 +188,12 @@ func validateAttrs(schema any, attrs map[string]any) error {
 	return nil
 }
 
-// effectiveKeys applies "keys follow the base" (§C.4): a key a branch shares
-// with a base is accepted only while the base's current configuration still
-// has it with the same pub.
+// effectiveKeys applies "keys follow the base" (§C.4): a branch accepts its
+// base's current keys, recursively through every local base, as well as
+// its own. A kid the base has is the base's: only the base's entry is
+// accepted, whatever the branch's entry says. A key the branch copied from
+// its base at creation that the base has since removed stops working. Keys
+// added only to the branch are its own.
 //
 // Keys don't follow a base in another deployment (§7.6, §G.3): a remote
 // branch's keys are its own.
@@ -191,13 +204,10 @@ func (t *tx) effectiveKeys(n *nsRow, cfg *Config) []grant.Key {
 	base := t.nsByID(n.base.Int64)
 	copied := t.config(n.baseConfigSeq.Int64)
 	baseKeys := t.effectiveKeys(base, t.config(base.configSeq))
-	var out []grant.Key
+	out := append([]grant.Key(nil), baseKeys...)
 	for _, k := range cfg.Keys {
-		if hasKid(copied.Keys, k.Kid) {
-			bk, ok := findKey(baseKeys, k.Kid)
-			if !ok || string(bk.Pub) != string(k.Pub) {
-				continue
-			}
+		if hasKid(baseKeys, k.Kid) || hasKid(copied.Keys, k.Kid) {
+			continue
 		}
 		out = append(out, k)
 	}
@@ -426,6 +436,30 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 // 404 rather than 403 so existence is not revealed.
 func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
+	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
+		return t.edgeReader(n, cred.Edge, resource)
+	}
+	return t.readerCheck(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) })
+}
+
+// anyReader is reader for a request that answers any reader of the
+// namespace, filtered to what it may read (the gestures listing, §7.4):
+// a grant with read, whatever its rules say about resources.
+func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
+	cfg := t.config(n.configSeq)
+	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
+		return t.edgeReader(n, cred.Edge, "")
+	}
+	return t.readerCheck(n, cred, func(a *actor) bool {
+		if cfg.Read == "public" || t.e.opt.AuthDisabled {
+			return true
+		}
+		return a != nil && a.verified != nil && a.verified.Can["read"]
+	})
+}
+
+func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
+	cfg := t.config(n.configSeq)
 	var a *actor
 	if t.e.opt.AuthDisabled {
 		a, _ = t.authenticate(n.name, n, cfg, cred, nil)
@@ -448,7 +482,7 @@ func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error
 			return nil, notFound()
 		}
 	}
-	if !t.canRead(n, cfg, a, resource) {
+	if !may(a) {
 		if a == nil {
 			return nil, apiErr(401, "unauthenticated", "message", "missing grant")
 		}
@@ -618,7 +652,7 @@ func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
 }
 
 // guardedPaths need a grant chained to a * key (§7.4).
-var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures"}
+var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures", "/schemaReads"}
 
 func touchesGuarded(writes []string) bool {
 	for _, w := range writes {

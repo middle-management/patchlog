@@ -39,8 +39,10 @@ func TestAuthUnknownNamespace(t *testing.T) {
 	named := e.grant(f.issuer, "user:bob", []string{"nope"}, []string{"read", "create"})
 	expectCode(t, e.get("/r/nope/a", named), 401, "unauthenticated")
 	expectCode(t, create("nope", named), 401, "unauthenticated")
-	// An operator grant naming it is usable: the namespace is not found.
-	expectCode(t, e.get("/ns/nope", e.operatorGrant("nope")), 404, "not_found")
+	// An operator grant authorises only creating namespaces and forcing
+	// purges (§C.4): a read under one is 401, as for an existing
+	// namespace whose keys don't list it.
+	expectCode(t, e.get("/ns/nope", e.operatorGrant("nope")), 401, "unauthenticated")
 	expired = mint(t, e.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"nope"}, "can": []any{"config"},
 		"exp": e.clock.Now().Add(-time.Minute).Format(time.RFC3339)})
 	expectCode(t, e.get("/ns/nope", expired), 401, "unauthenticated")
