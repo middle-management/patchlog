@@ -84,7 +84,11 @@ type viewer struct {
 	catAll     bool
 	catRead    func(name string) bool
 	contentAll map[string]bool
-	vis        Visibility
+	// contentRead, per content namespace the reader's grant reads only in
+	// part (rules on /resource), decides which items' heads it may see.
+	// Its scope is part of the subject set (no RoleView).
+	contentRead map[string]func(name string) bool
+	vis         Visibility
 	// exp, if set, is the earliest expiry of the grants an unfiltered
 	// listing was admitted with: it isn't kept past it (§B.11.5).
 	exp time.Time
@@ -126,7 +130,11 @@ func (v *viewer) item(g *Graph, n *Node) bool {
 	if n.ItemNS == "" || n.State != StateLive {
 		return false
 	}
-	return v.contentAll[n.ItemNS] || (v.vis != nil && v.vis.Item(g, n))
+	if v.contentAll[n.ItemNS] || (v.vis != nil && v.vis.Item(g, n)) {
+		return true
+	}
+	rd := v.contentRead[n.ItemNS]
+	return rd != nil && rd(n.ItemName)
 }
 
 // Bearer returns the request's bearer token.
@@ -176,7 +184,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 	})
 	sort.Strings(trust)
 	token := Bearer(r)
-	v := &viewer{contentAll: map[string]bool{}}
+	v := &viewer{contentAll: map[string]bool{}, contentRead: map[string]func(string) bool{}}
 	if token == "" {
 		if !catPublic {
 			return nil, &grant.AuthError{Status: 401, Msg: "missing grant"}
@@ -224,9 +232,18 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 			v.contentAll[ns] = true
 			markers = append(markers, "reads:"+real)
 			exp = grantExp(cv, exp)
+		} else if ok {
+			// A grant that reads only some resources (§B.11.5): the items
+			// it may read carry their heads, as they would for a reader of
+			// the whole namespace. Readers share listings only with
+			// identical scopes.
+			v.contentRead[ns] = func(name string) bool { return s.checker.AllowsRead(cv, name) }
+			markers = append(markers, "reads:"+real+":scope:"+ScopeDigest(cv))
+			exp = grantExp(cv, exp)
 		}
 	}
 	if s.opt.RoleView != nil {
+		v.contentRead = nil // the subject set alone decides (vis)
 		v.wideCat, v.wideNS, v.wideGrant, v.wideExp = v.catAll, map[string]bool{}, map[string]bool{}, exp
 		if v.catAll && !catPublic {
 			v.wideGrant[""] = true
