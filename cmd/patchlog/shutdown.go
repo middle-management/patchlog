@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/lifecycle"
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // shutdownFlags are the -shutdown-* flags of serve, index and tree.
@@ -29,6 +30,8 @@ func addShutdownFlags(fs *flag.FlagSet) *shutdownFlags {
 // be nil) and the phased shutdown the flags configure.
 func (f *shutdownFlags) server(name string, srv *http.Server, ready func(context.Context) error) *lifecycle.Server {
 	allowH2C(srv)
+	// Traced inside the health endpoints lifecycle adds: probes aren't.
+	srv.Handler = telemetry.Handler(srv.Handler)
 	return lifecycle.New(srv, lifecycle.Options{Name: name, Timeout: *f.timeout, Delay: *f.delay, Ready: ready, Logf: log.Printf})
 }
 

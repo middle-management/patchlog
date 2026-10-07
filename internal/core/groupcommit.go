@@ -298,6 +298,7 @@ const groupRuns = 3
 // commitGroup appends a group of checked writes in one transaction
 // (above). On return each write has its result, or is marked alone.
 func (e *Engine) commitGroup(ns string, group []*groupWrite) {
+	observeGroup(len(group))
 	// No single request's cancellation aborts the group, but once every
 	// one of its requests is cancelled (a shutdown timeout), so is it,
 	// even while it waits for a lock (acquire).

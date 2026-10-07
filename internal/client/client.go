@@ -35,6 +35,8 @@ import (
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/sig"
+
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Client talks to one deployment. It is safe for concurrent use.
@@ -89,7 +91,7 @@ func New(baseURL string, opts ...Option) (*Client, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("client: invalid base URL %q", baseURL)
 	}
-	c := &Client{base: strings.TrimRight(baseURL, "/"), hc: &http.Client{}}
+	c := &Client{base: strings.TrimRight(baseURL, "/"), hc: &http.Client{Transport: telemetry.Transport(nil)}}
 	for _, o := range opts {
 		o(c)
 	}

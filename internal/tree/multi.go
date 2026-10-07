@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Multi serves several tree services, one per catalog, on one origin. Each
@@ -39,6 +40,7 @@ func Multi(svcs ...*Service) (http.Handler, error) {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		first, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
 		if first == "_status" && r.URL.Path == "/_status" {
+			telemetry.SetRoute(r, "/_status")
 			if r.Method != http.MethodGet && r.Method != http.MethodHead {
 				w.Header().Set("Allow", "GET, HEAD")
 				WriteError(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")

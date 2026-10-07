@@ -59,6 +59,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/rules"
+	"github.com/middle-management/patchlog/internal/telemetry"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -169,6 +170,7 @@ func (s *Service) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/grants", "/read-grants", "/merge-grants":
+			telemetry.SetRoute(r, r.URL.Path) // one of three fixed paths
 			if r.Method != http.MethodPost {
 				w.Header().Set("Allow", "POST")
 				tree.WriteError(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")

@@ -14,6 +14,8 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/sig"
+
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Grant lines and `written` in an export (§G.4.1, §C.3.1).
@@ -300,7 +302,7 @@ func (g *grantExporter) fetchSealed(ctx context.Context, ns, gid string) (*clien
 	}
 	hc := g.p.opt.HTTP
 	if hc == nil {
-		hc = http.DefaultClient
+		hc = telemetry.DefaultClient
 	}
 	res, err := hc.Do(req)
 	if err != nil {

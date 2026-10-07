@@ -83,6 +83,8 @@ import (
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/sig"
 	"github.com/middle-management/patchlog/internal/tree"
+
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Release plan states.
@@ -270,7 +272,7 @@ func (h *HTTPGranter) MergeGrant(ctx context.Context, cat string, batch map[stri
 	}
 	hc := h.HTTP
 	if hc == nil {
-		hc = http.DefaultClient
+		hc = telemetry.DefaultClient
 	}
 	resp, err := hc.Do(req)
 	if err != nil {

@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // serviceProxy is what the playground's read-only proxies to the search
@@ -49,13 +51,13 @@ func (s serviceProxy) reverse(target string) (*httputil.ReverseProxy, error) {
 			pr.Out.Header.Del("Cookie")
 			pr.SetXForwarded()
 		},
-		Transport: &http.Transport{
+		Transport: telemetry.Transport(&http.Transport{
 			Proxy:                 nil,
 			DialContext:           (&net.Dialer{Timeout: 5 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
 			ResponseHeaderTimeout: s.timeout,
 			MaxIdleConnsPerHost:   8,
 			IdleConnTimeout:       90 * time.Second,
-		},
+		}),
 		ModifyResponse: func(res *http.Response) error {
 			if loc := res.Header.Get("Location"); loc != "" {
 				res.Header.Set("Location", s.rewriteLocation(loc, u, base))

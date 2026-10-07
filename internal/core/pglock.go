@@ -199,7 +199,9 @@ func (t *tx) acquire(k int32, mode lockMode) {
 	if mode == lockShared {
 		fn = `SELECT pg_advisory_xact_lock_shared($1, $2)`
 	}
+	done := lockTimer("ns")
 	_, err := t.Tx.ExecContext(t.waitCtx(), fn, lockClass, k)
+	done()
 	t.must(err)
 	t.held(k, mode)
 }
@@ -248,7 +250,9 @@ func (t *tx) lockLog(ns int64) {
 	sort.Slice(keys, func(i, j int) bool { return keys[i] < keys[j] })
 	for _, k2 := range keys {
 		if len(t.logLocks) == 0 || k2 > t.maxLogKey {
+			done := lockTimer("log")
 			_, err := t.Tx.ExecContext(t.waitCtx(), `SELECT pg_advisory_xact_lock($1, $2)`, logClass, k2)
+			done()
 			t.must(err)
 		} else {
 			var ok bool

@@ -48,6 +48,16 @@ x-patchlog: &patchlog
     # Browser pages on other origins (a demo app): e.g.
     # PATCHLOG_CORS_ORIGINS=http://localhost:5173 docker compose up, or *.
     PATCHLOG_CORS_ORIGINS: ${PATCHLOG_CORS_ORIGINS:-}
+    # OpenTelemetry (README, Observability): off unless an endpoint or
+    # exporter is set, e.g. with the jaeger profile below:
+    #   OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 OTEL_METRICS_EXPORTER=none \
+    #     docker compose --profile otel up --build
+    OTEL_EXPORTER_OTLP_ENDPOINT: ${OTEL_EXPORTER_OTLP_ENDPOINT:-}
+    OTEL_EXPORTER_OTLP_PROTOCOL: ${OTEL_EXPORTER_OTLP_PROTOCOL:-}
+    OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-}
+    OTEL_METRICS_EXPORTER: ${OTEL_METRICS_EXPORTER:-}
+    OTEL_TRACES_SAMPLER: ${OTEL_TRACES_SAMPLER:-}
+    OTEL_TRACES_SAMPLER_ARG: ${OTEL_TRACES_SAMPLER_ARG:-}
 
 services:
   patchlog:
@@ -185,6 +195,17 @@ services:
         condition: service_healthy
       tree:
         condition: service_healthy
+
+  # Optional (--profile otel): Jaeger receives OTLP traces on 4317 (gRPC)
+  # and 4318 (HTTP) and shows them at http://localhost:16686. It takes no
+  # metrics: export them to a collector instead, or set
+  # OTEL_METRICS_EXPORTER=none (README, Observability).
+  jaeger:
+    image: ${JAEGER_IMAGE:-jaegertracing/jaeger:2.10.0}
+    profiles: [otel]
+    restart: unless-stopped
+    ports:
+      - "${JAEGER_UI_PORT:-16686}:16686"
 
 volumes:
   data:

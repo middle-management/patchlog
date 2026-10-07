@@ -15,6 +15,8 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Defaults for Options.
@@ -59,6 +61,7 @@ func newFetcher(opt Options) *fetcher {
 		cp := *f.hc
 		f.hc = &cp
 	}
+	f.hc.Transport = telemetry.Transport(f.hc.Transport)
 	f.hc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 5 {
 			return errors.New("too many redirects")

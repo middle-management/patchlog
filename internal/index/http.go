@@ -21,6 +21,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Cache-Control values (§9).
@@ -86,16 +87,21 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	isAt := false
 	switch {
 	case len(segs) == 1 && segs[0] == "_status":
+		telemetry.SetRoute(r, "/_status")
 		ix.serveStatus(w)
 		return
 	case len(segs) == 1 && segs[0] != "":
 		ns = segs[0]
+		telemetry.SetRoute(r, "/{ns}")
 	case len(segs) == 3 && segs[1] == "at":
 		ns, at, isAt = segs[0], segs[2], true
+		telemetry.SetRoute(r, "/{ns}/at/{at}")
 	case len(segs) == 3 && segs[0] == "g":
 		gs, ns = segs[1], segs[2]
+		telemetry.SetRoute(r, "/g/{gs}/{ns}")
 	case len(segs) == 5 && segs[0] == "g" && segs[3] == "at":
 		gs, ns, at, isAt = segs[1], segs[2], segs[4], true
+		telemetry.SetRoute(r, "/g/{gs}/{ns}/at/{at}")
 	default:
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
 		return

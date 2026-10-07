@@ -55,6 +55,13 @@ func main() {
 		usage()
 	}
 	switch os.Args[1] {
+	case "serve", "index", "tree", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema":
+		// OpenTelemetry, if configured by OTEL_* (off by default):
+		// flushed when the command returns (after a server's graceful
+		// shutdown), not on log.Fatal.
+		defer startTelemetry(os.Args[1])()
+	}
+	switch os.Args[1] {
 	case "version", "-version", "--version":
 		fmt.Println("patchlog", version)
 	case "serve":

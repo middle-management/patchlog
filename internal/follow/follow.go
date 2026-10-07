@@ -533,6 +533,7 @@ func (n *nsFollower) apply(ctx context.Context, b *Batch) error {
 		}
 	}
 	n.cur = b.NewCheckpoint
+	observeApplied(b)
 	for _, u := range b.Units {
 		if u.Config != nil {
 			st := State{NS: n.ns}

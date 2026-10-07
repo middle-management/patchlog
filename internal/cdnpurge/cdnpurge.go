@@ -30,6 +30,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Options configure a Purger. Zero values take the defaults.
@@ -125,7 +127,7 @@ func New(opt Options) (*Purger, error) {
 		opt.MaxBackoff = 10 * time.Second
 	}
 	if opt.Client == nil {
-		opt.Client = &http.Client{Timeout: opt.Timeout}
+		opt.Client = &http.Client{Timeout: opt.Timeout, Transport: telemetry.Transport(nil)}
 	}
 	if opt.Logf == nil {
 		opt.Logf = log.Printf

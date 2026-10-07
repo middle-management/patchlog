@@ -21,6 +21,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Cache-Control values (§9). A listing's at is the service's combined
@@ -374,6 +375,7 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	isAt := false
 	switch {
 	case len(segs) == 1 && segs[0] == "_status":
+		telemetry.SetRoute(r, "/_status")
 		s.serveStatus(w)
 		return
 	case len(segs) == 2 && segs[0] == cat:
@@ -389,6 +391,15 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	if !ops[op] {
 		WriteError(w, http.StatusNotFound, "not_found", "unknown listing")
 		return
+	}
+	// The listing is one of a fixed set: it stays in the route.
+	switch {
+	case gs != "":
+		telemetry.SetRoute(r, "/{catalog}/at/{at}/g/{gs}/"+op)
+	case isAt:
+		telemetry.SetRoute(r, "/{catalog}/at/{at}/"+op)
+	default:
+		telemetry.SetRoute(r, "/{catalog}/"+op)
 	}
 	if isAt {
 		if _, err := ids.Parse(at); err != nil {

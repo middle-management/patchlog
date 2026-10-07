@@ -20,6 +20,8 @@ import (
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/verify"
+
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // This file is the branch side of remote branches (§G.3): a namespace of
@@ -141,7 +143,7 @@ func (e *Engine) endpoint(origin string) (RemoteEndpoint, error) {
 		}
 	}
 	if ep.HTTPClient == nil {
-		ep.HTTPClient = http.DefaultClient
+		ep.HTTPClient = telemetry.DefaultClient
 	}
 	return ep, nil
 }

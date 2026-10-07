@@ -608,6 +608,87 @@ Kubernetes sends SIGTERM and removes the pod from its Service endpoints at the s
 time also counts against the grace period). Point readiness at `/_ready`; liveness at `/_health`
 should tolerate the drain (it answers 503 then), hence the higher threshold.
 
+### Observability (OpenTelemetry)
+
+Every command that talks HTTP or serves it (`serve`, `index`, `tree`, `janitor`, `merge`,
+`rebase`, `export`/`import`/`bundle`, `archive`, `schema`) exports OpenTelemetry traces and
+metrics when the standard `OTEL_*` environment variables ask for it. **It is off by default:**
+with no exporter configured nothing is installed, the HTTP handlers and transports are not
+wrapped, and instrumented code costs an atomic load (a cached read measures the same with and
+without this support, allocations included). There are no flags.
+
+| Variable | Effect |
+| --- | --- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | Turns on OTLP export of traces and metrics, e.g. `http://collector:4318` (HTTP) or `http://collector:4317` (gRPC). |
+| `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | Per signal; either alone turns on that signal (a full URL for HTTP, e.g. `…:4318/v1/traces`). |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` (and `_TRACES_`/`_METRICS_PROTOCOL`) | `http/protobuf` (default) or `grpc`. `http/json` is not supported. |
+| `OTEL_EXPORTER_OTLP_HEADERS`, `_TIMEOUT`, `_COMPRESSION`, `_CERTIFICATE`, `_INSECURE` | As the OTLP exporter specification has them (also per signal). |
+| `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER` | `otlp`, `console` (JSON on stderr, for a quick look) or `none`. Set, they decide alone: `otlp` with no endpoint sends to `localhost`; `none` turns a signal off while the other is exported. |
+| `OTEL_SERVICE_NAME` | Default `patchlog-<command>`: `patchlog-serve`, `patchlog-index`, `patchlog-tree`, `patchlog-janitor`, … |
+| `OTEL_RESOURCE_ATTRIBUTES` | Extra resource attributes, e.g. `deployment.environment.name=prod`. `service.version` is the build's version (`-X main.version`, as release builds and the image set it); host, OS, process id and Go runtime are detected. The command line is not recorded (flags such as `-bearer` carry grants). |
+| `OTEL_TRACES_SAMPLER`, `OTEL_TRACES_SAMPLER_ARG` | Default `parentbased_always_on`; e.g. `parentbased_traceidratio` with `0.1`. |
+| `OTEL_BSP_*`, `OTEL_METRIC_EXPORT_INTERVAL` | Span batching; metric export interval (default 60 s). |
+| `OTEL_SDK_DISABLED=true` | Everything off, whatever else is set. |
+
+Context propagates as W3C `traceparent`/`tracestate` and `baggage`, in and out. Spans and metrics
+are flushed (up to 5 s) when the command returns, for the servers after their graceful shutdown
+(above), so the last requests' spans are not lost; `/_health` and `/_ready` are not traced.
+
+What is instrumented:
+
+- **HTTP servers** (`serve` with its playground and proxies, `index`, `tree`/catalog): a server
+  span per request named `{method} {route}`, with the route the matched pattern, never the
+  path's ids or names: `GET /r/{ns}/{name}/rev/{id}`, `POST /ns/{ns}/batch`, the index's
+  `GET /{ns}`, `GET /g/{gs}/{ns}/at/{at}`, the tree's `GET /{catalog}/at/{at}/children`, the
+  catalog's `POST /grants`, `GET /playground/`; requests without one (a CORS preflight, a 404)
+  are named by the method alone. Attributes are the HTTP semantic conventions (`http.route`,
+  `http.response.status_code`, `url.path`, `client.address`, …) and `patchlog.ns` on the core's
+  routes; request and response bodies, the query, `Authorization`, `Source-Authorization`
+  and other headers are not recorded. Metrics: `http.server.request.duration`,
+  `http.server.request.body.size`, `http.server.response.body.size` by method, route and
+  status. Long-polls and event streams count with their real duration (they are long by design;
+  read their routes' histograms accordingly).
+- **HTTP clients**: `internal/client` (the index, tree, janitor, merge tools and bundles),
+  remote branches following other deployments, the CDN purger, the playground's proxies to the
+  index and tree, schema fetches and catalog grant requests: a client span per request (named by
+  the method), `http.client.request.duration`, and the trace context sent along, so a trace runs
+  from the index or tree into the core.
+- **Engine writes**, as children of the server span: `core.WriteResource`, `core.Batch`,
+  `core.WriteConfig`, `core.CreateBranch`, `core.RegisterRemoteBranch`, `core.Purge`,
+  `core.PurgeNamespace`, `core.Prune`, `core.UploadBlob`, with `patchlog.ns`,
+  `patchlog.write.kind` (`resource`, `delete`, `batch`, `config`, `branch`,
+  `remote_registration`, `purge`, `purge_ns`, `prune`, `blob`), `patchlog.outcome` (`created`,
+  `ok`, `replayed`, `dry_run`, or the error code: `stale`, `forbidden`, …), `patchlog.status`
+  and for batches `patchlog.batch.items`, `patchlog.dry_run`. A refusal (4xx) is an outcome,
+  not a span error. Metrics `patchlog.writes` (count) and `patchlog.write.duration` (s), by kind
+  and outcome; the namespace is never a metric attribute.
+- **Database transactions**: `core.db.read` and `core.db.update` (with `db.system.name`) inside
+  a trace, so a read served from the read cache has none, and Postgres write retries show in
+  one `core.db.update`. Background jobs (the tailer, retention, remote follows) are not traced.
+  Statement-level SQL spans are not recorded.
+- **Postgres**: `patchlog.groupcommit.size` (writes per group commit transaction, D.8) and
+  `patchlog.db.lock.wait` (s, by `patchlog.lock` = `ns` or `log`: time waiting for advisory
+  locks).
+- **Consumers** (index, tree, catalog): `patchlog.follow.units` (units applied, by
+  `patchlog.follow.snapshot`) and `patchlog.follow.lag` (s: from the newest applied entry's
+  `created` to its application, so catching up shows as large values).
+
+Logs are not exported: the commands log with the standard `log` package, without trace ids.
+
+A local look at traces with the compose stack's `otel` profile (Jaeger, which takes traces but
+not metrics):
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4318 OTEL_METRICS_EXPORTER=none \
+  docker compose --profile otel up --build
+# then open http://localhost:16686 (services patchlog-serve, patchlog-index, patchlog-tree, …)
+```
+
+For metrics too, point the endpoint at an OpenTelemetry Collector (e.g. `otel/opentelemetry-collector`
+with an `otlp` receiver and `prometheus`/`otlp` exporters). For a binary on its own,
+`OTEL_TRACES_EXPORTER=console OTEL_METRICS_EXPORTER=none patchlog serve -dev` prints spans to
+stderr.
+
 ### Playground
 
 `serve` also hosts a web playground at **`/playground/`** (turn it off with `-playground=false`).
@@ -1978,6 +2059,7 @@ internal/server     HTTP API
 internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
 internal/cdnpurge   HTTP cache-tag purges to a CDN (-purge-url)
 internal/edge       the verifying edge's secret and private edge directives (§9, -edge-secret)
+internal/telemetry  OpenTelemetry from OTEL_* (off by default), HTTP handler and transport
 deploy/varnish      the compose stack's local CDN (Varnish VCL)
 ```
 

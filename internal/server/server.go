@@ -19,6 +19,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // Server is the HTTP API.
@@ -88,11 +89,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if _, pattern := s.mux.Handler(r); pattern != "" {
 		if err := checkQuery(pattern, r.URL.RawQuery); err != nil {
+			telemetry.SetRoute(r, pattern) // the span is named by it all the same
 			writeErr(w, err)
 			return
 		}
 	}
 	s.mux.ServeHTTP(w, r)
+	annotate(r)
 }
 
 // flag marks a query parameter that takes only the value 1 (§7).
@@ -729,7 +732,7 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	res, err := s.e.WriteResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature"), SourceCreds: sourceCreds(r)},
+	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature"), SourceCreds: sourceCreds(r)},
 		core.Item{Resource: name, IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Steps: []core.Step{{Patches: body, Gesture: g, Undoes: u}}})
 	if err != nil {
 		writeErr(w, err)
@@ -766,7 +769,7 @@ func (s *Server) resourceDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	res, err := s.e.WriteResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature")},
+	res, err := s.writeResource(r.Context(), core.Request{NS: ns, Cred: creds(r), Signature: r.Header.Get("Signature")},
 		core.Item{Resource: name, IfMatch: p.ifMatch, Steps: []core.Step{{Delete: true, Gesture: g, Undoes: u}}})
 	if err != nil {
 		writeErr(w, err)
@@ -794,7 +797,7 @@ func (s *Server) resourcePurge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	force := r.URL.Query().Get("force") == "1"
-	nsID, err := s.e.Purge(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}, name, p.ifMatch, force)
+	nsID, err := s.purge(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}, name, p.ifMatch, force)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -847,7 +850,7 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 	// A sealed snapshot needs no declared list (§8.6, §E.3.1): the server
 	// keeps the list of the snapshot's revision.
 	pr := core.PruneRequest{Horizon: h, Keep: keep, Snapshot: snapshot}
-	res, err := s.e.Prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, pr)
+	res, err := s.prune(r.Context(), core.Request{NS: ns, Cred: creds(r)}, name, pr)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -887,7 +890,7 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	req := core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}
-	if err := s.e.UploadBlob(r.Context(), req, name, bid, up); err != nil {
+	if err := s.uploadBlob(r.Context(), req, name, bid, up); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -1142,7 +1145,7 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// No server-side 428: the core answers it after authorisation (§6.2).
-	res, err := s.e.WriteConfig(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)},
+	res, err := s.writeConfig(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)},
 		core.ConfigChange{IfMatch: p.ifMatch, IfNoneMatch: p.ifNoneMatch, Patches: body, Gesture: gesture, Undoes: undoes})
 	if err != nil {
 		writeErr(w, err)
@@ -1195,7 +1198,7 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 	}
 	name, _ := m["name"].(string)
 	at, _ := m["at"].(string)
-	res, err := s.e.CreateBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
+	res, err := s.createBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
 		core.BranchRequest{Name: name, At: at, Patches: m["patches"], IfNoneMatch: p.ifNoneMatch})
 	if err != nil {
 		writeErr(w, err)
@@ -1224,7 +1227,7 @@ func (s *Server) registerRemote(w http.ResponseWriter, r *http.Request, ns strin
 		return
 	}
 	// The precondition is checked in the core, after authorisation (§G.3).
-	res, err := s.e.RegisterRemoteBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
+	res, err := s.registerRemoteBranch(r.Context(), core.Request{NS: ns, Cred: creds(r)},
 		core.RemoteRegistration{Origin: origin, NS: name, At: at, IfNoneMatch: p.ifNoneMatch, IfMatch: p.ifMatch})
 	if err != nil {
 		writeErr(w, err)
@@ -1268,7 +1271,7 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dry := r.URL.Query().Get("dry-run") == "1"
-	res, err := s.e.Batch(r.Context(), req, items, cc, source, dry)
+	res, err := s.batch(r.Context(), req, items, cc, source, dry)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1459,7 +1462,7 @@ func (s *Server) nsPurge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	nsID, err := s.e.PurgeNamespace(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}, p.ifMatch, r.URL.Query().Get("force") == "1")
+	nsID, err := s.purgeNamespace(r.Context(), core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}, p.ifMatch, r.URL.Query().Get("force") == "1")
 	if err != nil {
 		writeErr(w, err)
 		return

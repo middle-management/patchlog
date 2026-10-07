@@ -544,6 +544,8 @@ type docPut struct {
 
 // read runs f in a read transaction.
 func (e *Engine) read(ctx context.Context, f func(t *tx) error) (err error) {
+	ctx, span := e.dbSpan(ctx, "core.db.read")
+	defer func() { endDBSpan(span, err) }()
 	e.stmts.prepare(e.db)
 	opts := &sql.TxOptions{ReadOnly: true}
 	if e.pg {
@@ -587,7 +589,9 @@ func panicErr(p any) error {
 // update runs f in a write transaction and commits if it returns nil. A
 // panic (t.must) rolls back and is returned as an error, so a failed write
 // never leaves its transaction, and the connection, open.
-func (e *Engine) update(ctx context.Context, f func(t *tx) error) error {
+func (e *Engine) update(ctx context.Context, f func(t *tx) error) (err error) {
+	ctx, span := e.dbSpan(ctx, "core.db.update")
+	defer func() { endDBSpan(span, err) }()
 	rotate, err := e.update1(ctx, f)
 	if err == nil && len(rotate) > 0 && e.opt.RotateOnRevoke {
 		e.rotateAfterRevoke(rotate)
