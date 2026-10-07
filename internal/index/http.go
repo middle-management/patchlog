@@ -347,6 +347,11 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
 	}
 	res, got, err := ix.query(ctx, ns, at, q, allow)
+	var fe *FieldError
+	if errors.As(err, &fe) {
+		writeErr(w, http.StatusBadRequest, "bad_input", fe.Error())
+		return
+	}
 	if err != nil {
 		ix.opt.Logf("index: query %s: %v", r.URL, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
@@ -375,6 +380,16 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// …facets (§A.4): every facet path of the document, as a list of values.
 		for p, vs := range h.Facets {
 			m[p] = vs
+		}
+		// …sort values and requested fields (§A.4), under the same paths.
+		for p, vs := range h.Sorts {
+			m[p] = vs
+		}
+		for p, vs := range h.Text {
+			m[p] = vs
+		}
+		if h.Self {
+			m["self"] = true
 		}
 		if info.Protected() && !a.all {
 			// Per-entry sealing: what the document gave (score, schema,

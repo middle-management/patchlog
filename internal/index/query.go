@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -32,6 +33,8 @@ import (
 //	sort=/path | -/path order by a "sort" field (repeatable; missing values last); default:
 //	                    score (with q), then resource name
 //	counts=/path        facet counts over all hits (repeatable)
+//	fields=/a,/b        also show those indexed fields in hits, "text" ones included; a path
+//	                    no schema marks with x-index in the namespace is 400 (§A.4)
 //	limit=n             page size, 1–100 (default 20)
 //	after=n             continue after the first n hits (from "next")
 //	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, or
@@ -46,6 +49,7 @@ type Query struct {
 	Ranges []rangeFilter
 	Sorts  []sortKey
 	Counts []string
+	Fields []string
 	Limit  int
 	After  int
 	// Mins are the ?min= values; NS is "" for a bare ns_id (the queried
@@ -151,6 +155,20 @@ func ParseQuery(v url.Values) (*Query, error) {
 					return nil, fmt.Errorf("sort: %v", err)
 				}
 				q.Sorts = append(q.Sorts, sk)
+			}
+		case "fields":
+			if _, err := one(k); err != nil {
+				return nil, err
+			}
+			seen := map[string]bool{}
+			for _, p := range strings.Split(vals[0], ",") {
+				if err := validPath(p); err != nil {
+					return nil, fmt.Errorf("fields: %v", err)
+				}
+				if !seen[p] {
+					seen[p] = true
+					q.Fields = append(q.Fields, p)
+				}
 			}
 		case "counts":
 			for _, s := range vals {
@@ -260,7 +278,11 @@ type Hit struct {
 	Schema   string
 	Score    float64
 	Facets   map[string][]any
-	Refs     []RefHit // with ?ref=: the matching references (§A.4)
+	Sorts    map[string][]any // sort values as written, for paths with no facet value
+	Text     map[string][]any // with ?fields=: the requested text fields
+	Refs     []RefHit         // with ?ref=: the matching references (§A.4)
+	Self     bool             // with ?ref=: the document references itself
+	docid    int64
 }
 
 // RefHit is one reference of a hit: where it sits and the string as written.
@@ -411,12 +433,22 @@ func (ix *Index) attachRefs(ctx context.Context, tx *sql.Tx, ns string, rf *RefF
 		}
 		h := &hits[idx[r]]
 		h.Refs = append(h.Refs, rh)
+		h.Self = rf.NS == ns && rf.Name == r
 	}
 	return rows.Err()
 }
 
 // run executes q against ns inside tx. allow filters hits (nil = all).
 func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(resource string) bool) (*Result, error) {
+	for _, f := range q.Fields {
+		ok, err := ix.indexedField(ctx, tx, ns, f)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, &FieldError{Path: f}
+		}
+	}
 	stmt, args := ix.candidateSQL(ns, q)
 	rows, err := tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
@@ -427,8 +459,7 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 	n := 0
 	for rows.Next() {
 		var h Hit
-		var docid int64
-		if err := rows.Scan(&docid, &h.Resource, &h.ID, &h.Schema, &h.Score); err != nil {
+		if err := rows.Scan(&h.docid, &h.Resource, &h.ID, &h.Schema, &h.Score); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -457,6 +488,12 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 	if err := ix.attachFacets(ctx, tx, ns, res.Hits); err != nil {
 		return nil, err
 	}
+	if err := ix.attachSorts(ctx, tx, ns, res.Hits); err != nil {
+		return nil, err
+	}
+	if err := ix.attachText(ctx, tx, q.Fields, res.Hits); err != nil {
+		return nil, err
+	}
 	if err := ix.attachRefs(ctx, tx, ns, q.Ref, res.Hits); err != nil {
 		return nil, err
 	}
@@ -466,6 +503,113 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 		}
 	}
 	return res, nil
+}
+
+// FieldError is a ?fields= path that no schema indexed in the namespace
+// marks with x-index (§A.4): 400.
+type FieldError struct{ Path string }
+
+func (e *FieldError) Error() string {
+	return "fields: " + e.Path + " is not a field any schema indexed in the namespace marks with x-index"
+}
+
+// indexedField reports whether some document of ns has indexed rows at path.
+func (ix *Index) indexedField(ctx context.Context, tx *sql.Tx, ns, path string) (bool, error) {
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 WHERE EXISTS (SELECT 1 FROM facet WHERE ns = ? AND path = ?)
+		OR EXISTS (SELECT 1 FROM "sort" WHERE ns = ? AND path = ?)
+		OR EXISTS (SELECT 1 FROM "text" WHERE ns = ? AND path = ?)`, ns, path, ns, path, ns, path).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// attachSorts gives each hit its sort values as written, for the paths
+// that have no facet value (a field that is both shows its facet values).
+func (ix *Index) attachSorts(ctx context.Context, tx *sql.Tx, ns string, hits []Hit) error {
+	if len(hits) == 0 {
+		return nil
+	}
+	idx := map[string]int{}
+	ph := make([]string, len(hits))
+	args := []any{ns}
+	for i, h := range hits {
+		idx[h.Resource] = i
+		ph[i] = "?"
+		args = append(args, h.Resource)
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT resource, path, raw FROM "sort" WHERE ns = ? AND resource IN (`+strings.Join(ph, ",")+`) ORDER BY resource, path`, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var r, p string
+		var raw sql.NullString
+		if err := rows.Scan(&r, &p, &raw); err != nil {
+			return err
+		}
+		h := &hits[idx[r]]
+		if _, ok := h.Facets[p]; ok || !raw.Valid {
+			continue
+		}
+		v, err := jsonv.Parse([]byte(raw.String))
+		if err != nil {
+			return err
+		}
+		if h.Sorts == nil {
+			h.Sorts = map[string][]any{}
+		}
+		h.Sorts[p] = []any{v}
+	}
+	return rows.Err()
+}
+
+// attachText gives each hit the strings of its requested text fields.
+func (ix *Index) attachText(ctx context.Context, tx *sql.Tx, fields []string, hits []Hit) error {
+	if len(fields) == 0 {
+		return nil
+	}
+	want := map[string]bool{}
+	for _, f := range fields {
+		want[f] = true
+	}
+	for i := range hits {
+		h := &hits[i]
+		var rows *sql.Rows
+		var err error
+		if ix.fts {
+			rows, err = tx.QueryContext(ctx, `SELECT path, body FROM "text" WHERE rowid BETWEEN ? AND ? ORDER BY rowid`, h.docid<<textShift, h.docid<<textShift|(1<<textShift-1))
+		} else {
+			rows, err = tx.QueryContext(ctx, `SELECT path, body FROM "text" WHERE docid = ? ORDER BY rowid`, h.docid)
+		}
+		if err != nil {
+			return err
+		}
+		for rows.Next() {
+			var p, body string
+			if err := rows.Scan(&p, &body); err != nil {
+				rows.Close()
+				return err
+			}
+			if !want[p] {
+				continue
+			}
+			if _, ok := h.Facets[p]; ok {
+				continue // shown with the facet values already
+			}
+			if h.Text == nil {
+				h.Text = map[string][]any{}
+			}
+			h.Text[p] = append(h.Text[p], body)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (ix *Index) attachFacets(ctx context.Context, tx *sql.Tx, ns string, hits []Hit) error {

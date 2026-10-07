@@ -215,7 +215,7 @@ var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,
 	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, UNIQUE (ns, resource))`,
 	`CREATE TABLE IF NOT EXISTS facet (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value TEXT NOT NULL, raw TEXT NOT NULL, PRIMARY KEY (ns, resource, path, value))`,
-	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, PRIMARY KEY (ns, resource, path))`,
+	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, raw TEXT, PRIMARY KEY (ns, resource, path))`,
 	`CREATE TABLE IF NOT EXISTS refs (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, ref TEXT NOT NULL, target_ns TEXT NOT NULL, target TEXT NOT NULL, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path))`,
 	`CREATE INDEX IF NOT EXISTS docs_q ON docs (ns, schema)`,
 	`CREATE INDEX IF NOT EXISTS refs_q ON refs (target_ns, target, rev, entry)`,
@@ -244,6 +244,20 @@ func (ix *Index) initSchema(ctx context.Context) error {
 		}
 		if docs > 0 && refs == 0 {
 			ix.opt.Logf("index: the database predates reference indexing (§A.2); rebuilding it from the logs")
+			ix.opt.Rebuild = true
+		}
+		// Before v0.46 the sort table kept no value as written, and schema
+		// documents were not indexed: replay those too.
+		var noRaw int
+		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('sort') WHERE name = 'raw'`).Scan(&noRaw); err != nil {
+			return err
+		}
+		var haveSort int
+		if err := ix.db.QueryRowContext(ctx, `SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'sort'`).Scan(&haveSort); err != nil {
+			return err
+		}
+		if haveSort > 0 && noRaw == 0 && !ix.opt.Rebuild {
+			ix.opt.Logf("index: the database predates sort values in hits and indexed schema documents (§A.4); rebuilding it from the logs")
 			ix.opt.Rebuild = true
 		}
 	}
@@ -667,8 +681,8 @@ func (ix *Index) write(ctx context.Context, tx *sql.Tx, ns string, p prepared) e
 		}
 	}
 	for _, s := range p.rows.sort {
-		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO "sort" (ns, resource, schema, path, value) VALUES (?, ?, ?, ?, ?)`,
-			ns, p.resource, schemaCol, s.path, s.value); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO "sort" (ns, resource, schema, path, value, raw) VALUES (?, ?, ?, ?, ?, ?)`,
+			ns, p.resource, schemaCol, s.path, s.value, s.raw); err != nil {
 			return err
 		}
 	}

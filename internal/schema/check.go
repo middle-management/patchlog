@@ -226,3 +226,70 @@ func Refs(schemaDoc any) []Ref {
 	sort.Slice(out, func(i, j int) bool { return out[i].Path() < out[j].Path() })
 	return out
 }
+
+// RefAt is one $ref of a schema document that names a schema revision, with
+// where it sits.
+type RefAt struct {
+	Pointer pointer.Pointer // the $ref string's location in the document
+	Raw     string          // the string as written, fragment included
+	Ref     Ref             // the revision, fragment dropped
+}
+
+// RefLocations returns every $ref at a schema position of a schema document
+// (§6.1) that names a schema revision path (same-document fragments don't
+// count), in document order with members sorted. $ref strings in const,
+// enum, default, examples or any other non-schema position are not found.
+func RefLocations(schemaDoc any) []RefAt {
+	var out []RefAt
+	var walk func(s any, at pointer.Pointer)
+	walk = func(s any, at pointer.Pointer) {
+		obj, ok := s.(map[string]any)
+		if !ok {
+			return
+		}
+		if r, ok := obj["$ref"].(string); ok && !strings.HasPrefix(r, "#") {
+			if ref, _, err := SplitRef(r); err == nil {
+				out = append(out, RefAt{Pointer: child(at, "$ref"), Raw: r, Ref: ref})
+			}
+		}
+		keys := make([]string, 0, len(obj))
+		for k := range obj {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			switch {
+			case inList(schemaKeywords, k):
+				walk(obj[k], child(at, k))
+			case inList(schemaMapKeywords, k):
+				if m, ok := obj[k].(map[string]any); ok {
+					names := make([]string, 0, len(m))
+					for n := range m {
+						names = append(names, n)
+					}
+					sort.Strings(names)
+					for _, n := range names {
+						walk(m[n], child(at, k, n))
+					}
+				}
+			case inList(schemaArrKeywords, k):
+				if arr, ok := obj[k].([]any); ok {
+					for i, e := range arr {
+						walk(e, child(at, k, fmt.Sprint(i)))
+					}
+				}
+			}
+		}
+	}
+	walk(schemaDoc, pointer.Pointer{})
+	return out
+}
+
+func inList(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
