@@ -405,6 +405,10 @@ type gestureSite struct {
 	// markers are ids that must be in the log after hint: the gesture's
 	// entries (the endpoint) or the namespace entries' targets (the scan).
 	markers []string
+	// writer is the log author of the gesture's entries here when it
+	// differs from the gesture's author: the merger of a counted merge
+	// that carried it (§11.2). "" means the gesture's author.
+	writer string
 }
 
 type gestureFind struct {
@@ -455,10 +459,17 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 				s := site(e.Resource, since[e.Resource])
 				s.markers = append(s.markers, e.ID)
 			}
-			if len(f.sites) == 0 {
+			if len(f.sites) > 0 {
+				return f, nil
+			}
+			if cfg.author == "" {
 				return nil, ErrGestureNotFound
 			}
-			return f, nil
+			// The listing names the batch's writer. A gesture a merge
+			// carried into this namespace counts for its source author
+			// (§11.2), which only the log shows: scan it.
+			f = &gestureFind{author: cfg.author}
+			byRes = map[string]*gestureSite{}
 		case IsNotFound(err) || IsAuth(err):
 			// Not offered: sealed, e2e, an older deployment, or a grant
 			// without unrestricted read. The log is the place to look.
@@ -471,6 +482,12 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 	if err != nil {
 		return nil, err
 	}
+	// With a named author, a counted merge's gestures count for whoever
+	// wrote them in the branch (§11.2), as UndoStack attributes them.
+	var merges *mergeResolver
+	if cfg.author != "" {
+		merges = c.newMergeResolver(ctx, ns, h.ID)
+	}
 	log, err := c.NSLog(ctx, ns, h.ID, cfg.since)
 	if err != nil {
 		return nil, err
@@ -479,11 +496,14 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 	for k, v := range since {
 		last[k] = v
 	}
-	note := func(res, target, author string, match bool) {
+	note := func(res, target, author, writer string, match bool) {
 		if match && (f.author == "" || f.author == author) {
 			f.author = author
 			s := site(res, last[res])
 			s.markers = append(s.markers, target)
+			if writer != author {
+				s.writer = writer
+			}
 		}
 	}
 	// A tombstone keeps the last revision as the hint: it is still an
@@ -496,7 +516,7 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 	for _, e := range log {
 		switch e.Kind {
 		case "head", "tombstone":
-			note(e.Resource, e.Target, e.Author, e.Gesture == gesture)
+			note(e.Resource, e.Target, e.Author, e.Author, e.Gesture == gesture)
 			setLast(e.Kind, e.Resource, e.Target)
 		case "batch":
 			for _, sub := range e.Entries {
@@ -507,7 +527,19 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 				for _, sg := range e.Gestures[sub.Resource] {
 					match = match || sg.Gesture == gesture
 				}
-				note(sub.Resource, sub.Target, e.Author, match)
+				author := e.Author
+				if match && merges != nil && author != f.author {
+					wrote, err := merges.authorsOf(e)
+					if err != nil {
+						return nil, err
+					}
+					for _, a := range wrote[sub.Resource+"\n"+gesture] {
+						if a == f.author {
+							author = a
+						}
+					}
+				}
+				note(sub.Resource, sub.Target, author, e.Author, match)
 				setLast(sub.Kind, sub.Resource, sub.Target)
 			}
 		case "purge":
@@ -851,6 +883,9 @@ func (c *Client) planResource(ctx context.Context, env *undoEnv, author string, 
 	head, start, log, flags, err := c.readResource(ctx, env, s)
 	if err != nil {
 		return nil, nil, nil, err
+	}
+	if s.writer != "" {
+		author = s.writer // a merge carried the gesture here (§11.2)
 	}
 	isOwn := func(e LogEntry) bool { return e.Gesture == env.gesture && e.Author == author }
 	first, last := -1, -1

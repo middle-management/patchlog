@@ -116,3 +116,45 @@ func TestUndoStackMergedGestures(t *testing.T) {
 		}
 	}
 }
+
+// Undoing a merged gesture as its source author (§11.2): UndoAuthor names
+// the author who wrote it in the branch, though the base's entries are the
+// merger's.
+func TestUndoMergedGestureAsItsAuthor(t *testing.T) {
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{})
+	admin := s.Client(t, client.WithAuthor("admin"))
+	alice := s.Client(t, client.WithAuthor("alice"))
+	bot := s.Client(t, client.WithAuthor("merge-bot"))
+	must(admin.CreateNamespace(ctx, "m", map[string]any{
+		"merge": map[string]any{"authors": []any{map[string]any{"sub": "merge-bot", "kid": "k1"}}},
+	}))
+	must(admin.CreateDoc(ctx, "m", "a", map[string]any{"v": 0}))
+	must(admin.CreateBranch(ctx, "m", client.BranchRequest{Name: "r1"}))
+	g := client.NewGesture()
+	must(alice.Append(ctx, "r1", "a", head(t, alice, "r1", "a"), ops(op("replace", "/v", 1)), client.WithGesture(g)))
+	at := must(alice.NSHead(ctx, "r1")).ID
+	must(bot.Batch(ctx, "m", client.BatchRequest{
+		Items:  []client.BatchItem{{Resource: "a", IfMatch: head(t, bot, "m", "a"), Steps: []client.Step{client.PatchStep(ops(op("replace", "/v", 1)))}, Gesture: g}},
+		Source: map[string]any{"ns": "r1", "at": at},
+	}, false))
+
+	res, err := alice.Undo(ctx, "m", g, client.UndoAuthor("alice"))
+	if err != nil {
+		t.Fatalf("undo as alice: %v", err)
+	}
+	if res.Batch == nil || res.Batch.Status != 201 {
+		t.Fatalf("undo %+v", res)
+	}
+	_, d, err := alice.Load(ctx, "m", "a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v := d.Value.(map[string]any)["v"]; v != 0.0 && v != int64(0) {
+		t.Fatalf("after undo %v", d.Value)
+	}
+	// Someone else's name finds nothing.
+	if _, err := alice.Undo(ctx, "m", g, client.UndoAuthor("bob")); err == nil {
+		t.Fatal("undo as bob found the gesture")
+	}
+}
