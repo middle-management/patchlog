@@ -442,7 +442,7 @@ func (g *grantExporter) ensure(ctx context.Context, bw *Writer, ns, gid string, 
 	}
 	key := g.findKey(ctx, lineRef, found, entry, rec, rev, ns)
 	if !key.valid {
-		g.note("key "+gid, "grant %s is carried without a key: no key named %q in the namespace document at the first entry that recorded it, or in the operator key history at %s, verifies its root block (%d candidates)", gid, gr.Blocks[0].Kid, rev.Created, key.tried)
+		g.note("key "+gid, "grant %s is carried without a key: no key named %q in the namespace document at the first entry that recorded it (or in its bases' then, in a branch), or in the operator key history at %s, verifies its root block (%d candidates)", gid, gr.Blocks[0].Kid, rev.Created, key.tried)
 	}
 	line := Line{NS: lineRef.NS, GrantLine: &GrantLine{ID: rec.ID, Root: rec.Root, Stored: rec.Stored, Origin: lineRef.Origin}}
 	if key.valid {
@@ -499,7 +499,7 @@ func (g *grantExporter) findKey(ctx context.Context, lineRef NSRef, found bool, 
 				at = p.pos[rev.ID]
 			}
 			if at != "" {
-				if keys, err := sk.keysAt(ctx, lineRef.NS, at); err == nil {
+				if keys, err := sk.keysInForce(ctx, lineRef.NS, at, rev.Created); err == nil {
 					for _, k := range keys {
 						if try(k) {
 							sk.mu.Unlock()

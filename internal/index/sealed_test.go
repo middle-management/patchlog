@@ -159,6 +159,12 @@ func TestSealedNamespace(t *testing.T) {
 	if fmt.Sprint(hit["/tag"]) != "[ta]" || hit["score"] == nil {
 		t.Fatalf("hit %v", hit)
 	}
+	// Requested fields are sealed with the rest (§A.4).
+	ff := x.fetch("/sec?q=secret&fields=%2Ftitle", "")
+	fpt := must(derived.OpenView(string(ff.body), keys, derived.View{NS: "sec", Target: ff.path}))
+	if fh := decodeJSON(t, fpt)["hits"].([]any)[0].(map[string]any); fmt.Sprint(fh["/title"]) != "[secret a]" || strings.Contains(string(ff.body), "secret") {
+		t.Fatalf("fields in a sealed result: %s", fpt)
+	}
 	// Not with another key, nor as another query's result.
 	other := seal.NewKey()
 	if _, err := derived.OpenView(string(f.body), func(string) []byte { return other }, derived.View{NS: "sec", Target: f.path}); !errors.Is(err, seal.ErrDecrypt) {

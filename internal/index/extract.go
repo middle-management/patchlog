@@ -104,7 +104,8 @@ type textRow struct{ path, body string }
 type facetRow struct{ path, value, raw string }
 type sortRow struct {
 	path  string
-	value any // float64 or string
+	value any    // float64 or string
+	raw   string // the value as written, canonical JSON (hits show it)
 }
 
 type refRow struct {
@@ -121,7 +122,8 @@ type docRows struct {
 }
 
 // extract returns the document's $schema and its index rows. Untyped
-// documents (no $schema, or a schema document) are typed=false. A typed
+// documents (no $schema) are typed=false; a schema document is typed by its
+// dialect URL. A typed
 // document whose annotations cannot be collected for a permanent reason
 // (invalid against its schema, unavailable schema) is indexed without rows
 // and logged; transient failures are returned so Apply retries.
@@ -131,8 +133,21 @@ func (ix *Index) extract(ctx context.Context, ns, resource string, doc any) (str
 		return "", false, nil, nil
 	}
 	sch, _ := obj["$schema"].(string)
-	if sch == "" || schema.IsDialect(sch) {
+	if sch == "" {
 		return "", false, nil, nil
+	}
+	if schema.IsDialect(sch) {
+		// §A.4: a schema document is indexed against its dialect's
+		// meta-schema, which has no x-index; its references are the
+		// revision paths of $ref keywords at schema positions.
+		var rows *docRows
+		for _, r := range schema.RefLocations(doc) {
+			if rows == nil {
+				rows = &docRows{}
+			}
+			rows.refs = append(rows.refs, refRow{path: r.Pointer.String(), ref: r.Raw, targetNS: r.Ref.NS, target: r.Ref.Name, rev: r.Ref.Rev})
+		}
+		return sch, true, rows, nil
 	}
 	var transient error
 	load := ix.schemas.LoaderFor(ctx, ns, &transient)
@@ -228,7 +243,7 @@ func rowsFor(doc any, anns []annot.Annotation) *docRows {
 				}
 				if v, ok := sortValue(a.Instance); ok {
 					sortSeen[path] = true
-					r.sort = append(r.sort, sortRow{path, v})
+					r.sort = append(r.sort, sortRow{path, v, string(jsonv.Canonical(sortElem(a.Instance)))})
 				}
 			}
 		}
@@ -357,6 +372,19 @@ func sortValue(v any) (any, bool) {
 		}
 	}
 	return nil, false
+}
+
+// sortElem is the value sortValue stored the key of: the instance, or for
+// an array its first sortable element.
+func sortElem(v any) any {
+	if arr, ok := v.([]any); ok {
+		for _, e := range arr {
+			if _, ok := sortValue(e); ok {
+				return sortElem(e)
+			}
+		}
+	}
+	return v
 }
 
 func containsFold(s, sub string) bool {

@@ -764,7 +764,8 @@ points to the Go client.
 ### Search index (Addendum A)
 
 `patchlog index -ns matches` follows namespaces and serves a search API on its own origin
-(default `:8081`). It indexes fields that schemas mark with `x-index: "text" | "facet" | "sort"`:
+(default `:8081`). It indexes fields that schemas mark with `x-index: "text" | "facet" | "sort"`,
+or an array of them such as `["facet", "sort"]`:
 
 ```sh
 curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kickoff'
@@ -780,6 +781,17 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   paths that merely appear in prose or embedded copies, are not references. Delete guards built on
   it are advisory (use `?min=` and expect races). A database from before this version is rebuilt
   from the logs on start. In a branch's preview index targets match as written.
+  A document that references itself is a hit of its own query with `"self": true`, so a delete
+  guard can leave it out.
+- Schema documents (whose `$schema` is a dialect URL) are indexed too: `?schema=https://json-schema.org/draft/2020-12/schema`
+  lists them, and the revision paths of `$ref` keywords at schema positions (fragment dropped; not
+  those inside `const`, `enum`, `default` or `examples`) count as references, so
+  `?ref=/r/schemas/address` lists the schemas that `$ref` it.
+- Hits carry their facet and sort values under the field's path (always a list; sort values as
+  written), and `?fields=/name,/title` adds those indexed fields, `text` ones included, so a list
+  renders without fetching every document. A path no schema marks with `x-index` in the namespace is
+  `400`. In sealed namespaces they are sealed with the rest of the hit. A database from before this
+  version is rebuilt from the logs on start.
 - In private namespaces the reader's grant is checked locally. Results are routed under
   `/g/{subject-set}/…` and filtered to the resources the grant can read.
 

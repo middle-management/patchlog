@@ -345,7 +345,7 @@ func (c *Client) latestUndo(ctx context.Context, ns, gesture string, cfg *undoCo
 			return nil, err
 		}
 	}
-	recs, err := c.scanGestures(ctx, ns, cfg.since)
+	recs, err := c.scanGestures(ctx, ns, cfg.since, false)
 	if err != nil {
 		return nil, err
 	}
@@ -1228,7 +1228,10 @@ type gestureIndex struct {
 
 // scanGestures reads the namespace log (after since) and groups its writes
 // by author and gesture (§7.2: tools group by both).
-func (c *Client) scanGestures(ctx context.Context, ns, since string) (*gestureIndex, error) {
+//
+// With attribute, a gesture a merge carried into ns (§F.3) is grouped under
+// the author who wrote it in the branch instead of the merger's (§11.2).
+func (c *Client) scanGestures(ctx context.Context, ns, since string, attribute bool) (*gestureIndex, error) {
 	h, err := c.NSHead(ctx, ns)
 	if err != nil {
 		return nil, err
@@ -1238,14 +1241,14 @@ func (c *Client) scanGestures(ctx context.Context, ns, since string) (*gestureIn
 		return nil, err
 	}
 	ix := &gestureIndex{by: map[string]*GestureRecord{}, ids: map[string]bool{}}
-	add := func(i int, e NSEntry, res string, g StepGesture) {
+	add := func(i int, e NSEntry, author, res string, g StepGesture) {
 		if g.Gesture == "" {
 			return
 		}
-		k := e.Author + "\n" + g.Gesture
+		k := author + "\n" + g.Gesture
 		r := ix.by[k]
 		if r == nil {
-			r = &GestureRecord{Gesture: g.Gesture, Author: e.Author, FirstNSID: e.ID, first: i}
+			r = &GestureRecord{Gesture: g.Gesture, Author: author, FirstNSID: e.ID, first: i}
 			ix.by[k] = r
 			ix.list = append(ix.list, r)
 			ix.ids[g.Gesture] = true
@@ -1261,14 +1264,30 @@ func (c *Client) scanGestures(ctx context.Context, ns, since string) (*gestureIn
 		}
 		r.Resources = append(r.Resources, res)
 	}
+	var merges *mergeResolver
+	if attribute {
+		merges = c.newMergeResolver(ctx, ns, h.ID)
+	}
 	for i, e := range log {
 		switch e.Kind {
 		case "head", "tombstone":
-			add(i, e, e.Resource, StepGesture{e.Gesture, e.Undoes})
+			add(i, e, e.Author, e.Resource, StepGesture{e.Gesture, e.Undoes})
 		case "batch":
+			var wrote gestureAuthors
+			if merges != nil && len(e.Gestures) > 0 {
+				if wrote, err = merges.authorsOf(e); err != nil {
+					return nil, err
+				}
+			}
 			for _, sub := range e.Entries {
 				for _, sg := range e.Gestures[sub.Resource] {
-					add(i, e, sub.Resource, sg)
+					if as := wrote[sub.Resource+"\n"+sg.Gesture]; len(as) > 0 {
+						for _, a := range as {
+							add(i, e, a, sub.Resource, sg)
+						}
+						continue
+					}
+					add(i, e, e.Author, sub.Resource, sg)
 				}
 			}
 		}
@@ -1308,9 +1327,15 @@ type UndoStack struct {
 // authors are listed in UndoneBy instead of dropping the action. An
 // Undoes naming a gesture that isn't in the log (or another author's) is
 // ignored: the gesture counts as an action of its own.
+//
+// A gesture a merge carried into ns counts for the author who wrote it in
+// the merge's source.ns (§11.2), when the batch counts as a merge under
+// §F.3: no origin, source.at in the branch's chain, and the merger's grant
+// listed in merge.authors of ns's document. Otherwise, or when the branch
+// can't be read, it counts for whoever wrote the batch.
 func (c *Client) UndoStack(ctx context.Context, ns, author string, opts ...UndoOption) (*UndoStack, error) {
 	cfg := undoOptions(opts)
-	ix, err := c.scanGestures(ctx, ns, cfg.since)
+	ix, err := c.scanGestures(ctx, ns, cfg.since, true)
 	if err != nil {
 		return nil, err
 	}

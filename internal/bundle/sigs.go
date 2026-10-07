@@ -454,14 +454,16 @@ type nsPositions struct {
 	configs []string          // the entries that changed the namespace document, genesis first
 	index   map[string]int    // entry id → its place in the log, oldest first
 	grants  map[string]string // grant id → the first entry that recorded it
+	created map[string]string // entry id → its created time
 }
 
 type sourceKeys struct {
 	c  *client.Client
 	mu sync.Mutex
 
-	logs map[string]*nsPositions
-	docs map[string][]KeyEntry // "ns/entry" → the keys of the namespace document there
+	logs  map[string]*nsPositions
+	docs  map[string][]KeyEntry // "ns/entry" → the keys of the namespace document there
+	bases map[string]*localBase // "ns/entry" → the local base the document there names
 
 	jwks    []client.OperatorKey
 	jwksErr error
@@ -472,7 +474,7 @@ func (sk *sourceKeys) positions(ctx context.Context, ns string) *nsPositions {
 	if p, ok := sk.logs[ns]; ok {
 		return p
 	}
-	p := &nsPositions{pos: map[string]string{}, index: map[string]int{}, grants: map[string]string{}}
+	p := &nsPositions{pos: map[string]string{}, index: map[string]int{}, grants: map[string]string{}, created: map[string]string{}}
 	sk.logs[ns] = p
 	h, err := sk.c.NSHead(ctx, ns)
 	if err != nil {
@@ -486,6 +488,7 @@ func (sk *sourceKeys) positions(ctx context.Context, ns string) *nsPositions {
 	}
 	for i, e := range log {
 		p.index[e.ID] = i
+		p.created[e.ID] = e.Created
 		if e.Grant != nil && e.Grant.ID != "" {
 			if _, seen := p.grants[e.Grant.ID]; !seen {
 				p.grants[e.Grant.ID] = e.ID
@@ -522,6 +525,20 @@ func (sk *sourceKeys) keysAt(ctx context.Context, ns, entry string) ([]KeyEntry,
 	if err != nil {
 		return nil, err
 	}
+	if sk.bases == nil {
+		sk.bases = map[string]*localBase{}
+	}
+	sk.bases[k] = nil
+	if b, ok := doc.Value["base"].(map[string]any); ok {
+		// A remote branch's keys don't follow its base (§C.4, §G.3).
+		if origin, _ := b["origin"].(string); origin == "" {
+			bns, _ := b["ns"].(string)
+			bat, _ := b["at"].(string)
+			if bns != "" {
+				sk.bases[k] = &localBase{ns: bns, at: bat}
+			}
+		}
+	}
 	var out []KeyEntry
 	arr, _ := doc.Value["keys"].([]any)
 	for _, x := range arr {
@@ -535,6 +552,86 @@ func (sk *sourceKeys) keysAt(ctx context.Context, ns, entry string) ([]KeyEntry,
 	return out, nil
 }
 
+// localBase is the local base a branch's namespace document names.
+type localBase struct{ ns, at string }
+
+// keysInForce are the keys a write at the log entry of ns was checked
+// against (§C.3.1, §C.4): the namespace document's own, and, in a local
+// branch, its bases' at the entry's created time (the entry's own, else
+// created), recursively. Keys follow the base: the base's keys at that
+// time count as the branch's; a key the branch shares with its base counts
+// only while the base has it with the same pub, and a same-kid key of the
+// base overrides the branch's. A base whose log or document can't be read
+// leaves the branch's own keys.
+func (sk *sourceKeys) keysInForce(ctx context.Context, ns, entry, created string) ([]KeyEntry, error) {
+	own, err := sk.keysAt(ctx, ns, entry)
+	if err != nil {
+		return nil, err
+	}
+	lb := sk.bases[ns+"/"+entry]
+	if lb == nil {
+		return own, nil
+	}
+	if p := sk.positions(ctx, ns); p.err == nil && p.created[entry] != "" {
+		created = p.created[entry]
+	}
+	at, err := time.Parse(time.RFC3339, created)
+	if err != nil {
+		return own, nil
+	}
+	bp := sk.positions(ctx, lb.ns)
+	if bp.err != nil {
+		return own, nil
+	}
+	// The base's document in force at that time: its last config change
+	// created at or before it.
+	var bentry string
+	for _, id := range bp.configs {
+		t, err := time.Parse(time.RFC3339, bp.created[id])
+		if err != nil || t.After(at) {
+			continue
+		}
+		bentry = id
+	}
+	if bentry == "" {
+		return own, nil
+	}
+	baseKeys, err := sk.keysInForce(ctx, lb.ns, bentry, created)
+	if err != nil {
+		return own, nil
+	}
+	var atBranching []KeyEntry
+	if lb.at != "" {
+		atBranching, _ = sk.keysAt(ctx, lb.ns, lb.at)
+	}
+	same := func(list []KeyEntry, k KeyEntry) bool {
+		for _, x := range list {
+			if x.Kid == k.Kid && x.Pub == k.Pub {
+				return true
+			}
+		}
+		return false
+	}
+	kidIn := func(list []KeyEntry, kid string) bool {
+		for _, x := range list {
+			if x.Kid == kid {
+				return true
+			}
+		}
+		return false
+	}
+	out := append([]KeyEntry(nil), baseKeys...)
+	for _, k := range own {
+		switch {
+		case kidIn(baseKeys, k.Kid): // the base's entry, already there
+		case same(atBranching, k): // copied from the base, which no longer has it
+		default:
+			out = append(out, k)
+		}
+	}
+	return out, nil
+}
+
 // find implements KeyFinder.
 func (sk *sourceKeys) find(ctx context.Context, ns, kid string, rev *Line) []KeyEntry {
 	sk.mu.Lock()
@@ -545,7 +642,7 @@ func (sk *sourceKeys) find(ctx context.Context, ns, kid string, rev *Line) []Key
 	var out []KeyEntry
 	if p := sk.positions(ctx, ns); p.err == nil {
 		if entry, ok := p.pos[rev.ID]; ok {
-			if keys, err := sk.keysAt(ctx, ns, entry); err == nil {
+			if keys, err := sk.keysInForce(ctx, ns, entry, rev.Created); err == nil {
 				for _, k := range keys {
 					if k.Kid == kid {
 						out = append(out, k)
@@ -597,7 +694,7 @@ func (sk *sourceKeys) check(ctx context.Context, ns string, key KeyEntry, rev *L
 		return KeyUnchecked, "the source's namespace log can't be read: " + p.err.Error()
 	}
 	if entry, ok := p.pos[rev.ID]; ok {
-		keys, err := sk.keysAt(ctx, ns, entry)
+		keys, err := sk.keysInForce(ctx, ns, entry, rev.Created)
 		if err != nil {
 			return KeyUnchecked, "the namespace document at the revision's position can't be read: " + err.Error()
 		}
