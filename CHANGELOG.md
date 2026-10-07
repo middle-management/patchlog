@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.15.0
 
 Implements spec **v0.46**, which adopts most of Doors' feedback, fixes the server bugs
 Doors reported, and adds OpenTelemetry.
