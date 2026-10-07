@@ -466,30 +466,12 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
-	mins, err := parseMins(vals["min"])
-	if err != nil {
+	if status, code, msg := s.AwaitMins(ctx, vals["min"]); status != 0 {
 		w.Header().Set("Cache-Control", "no-store")
-		WriteError(w, http.StatusBadRequest, "bad_input", err.Error())
-		return
-	}
-	followed := map[string]bool{}
-	for _, ns := range s.followed() {
-		followed[ns] = true
-	}
-	for i, m := range mins {
-		// A preview's readers write to the branches, so min names them.
-		m.ns = s.logical(m.ns)
-		mins[i] = m
-		if m.ns != "" && !followed[m.ns] {
-			w.Header().Set("Cache-Control", "no-store")
-			WriteError(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow")
-			return
+		if status == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "1")
 		}
-	}
-	if !s.waitMins(ctx, mins) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Retry-After", "1")
-		WriteError(w, http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet")
+		WriteError(w, status, code, msg)
 		return
 	}
 	if c, _, _ := s.state(); c == "" {
@@ -757,6 +739,34 @@ func ManyTag(cat string) string { return "rs:" + cat }
 // minRef is one ?min= value: {ns}:{ns_id}, or a bare {ns_id} (ns "").
 type minRef struct{ ns, id string }
 
+// AwaitMins implements ?min={ns}:{ns_id} (§A.5) for the values given: 0 once
+// the service has reached every one (waiting up to MinWait), else the
+// status and error to answer with: 400 for a malformed min or one naming a
+// namespace the service doesn't follow, 503 (with Retry-After) while it is
+// behind. Services of the addenda use it for the endpoints that take min.
+func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, code, msg string) {
+	mins, err := parseMins(vals)
+	if err != nil {
+		return http.StatusBadRequest, "bad_input", err.Error()
+	}
+	followed := map[string]bool{}
+	for _, ns := range s.followed() {
+		followed[ns] = true
+	}
+	for i, m := range mins {
+		// A preview's readers write to the branches, so min names them.
+		m.ns = s.logical(m.ns)
+		mins[i] = m
+		if m.ns != "" && !followed[m.ns] {
+			return http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow"
+		}
+	}
+	if !s.waitMins(ctx, mins) {
+		return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
+	}
+	return 0, "", ""
+}
+
 func parseMins(vals []string) ([]minRef, error) {
 	var out []minRef
 	for _, v := range vals {
@@ -969,6 +979,10 @@ func (q *query) entry(n *Node) map[string]any {
 			m["self"] = true
 		}
 		if q.v.item(q.g, n) && n.ItemHead != "" {
+			if n.Title == "" && n.ItemTitle != "" {
+				// The head's title (§B.5), unless the placement has its own.
+				q.title(m, &Node{Name: n.Name, Title: n.ItemTitle})
+			}
 			m["head"] = n.ItemHead
 			// In a release preview the head is the branch's: url reads it
 			// there (§B.5), while item keeps the name documents use.

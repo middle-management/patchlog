@@ -43,6 +43,7 @@ func BuildGraph(catalog string, config map[string]any, docs map[string]any) *Gra
 func (g *Graph) With(changes map[string]any) *Graph {
 	h := newGraph(g.Catalog)
 	h.Config, h.Trust = g.Config, map[string]bool{}
+	h.TitlePtr, h.HasTitle = g.TitlePtr, g.HasTitle
 	for ns := range g.Trust {
 		h.Trust[ns] = true
 	}
@@ -75,9 +76,9 @@ func (g *Graph) With(changes map[string]any) *Graph {
 		}
 		n := ParseNode(g.Catalog, name, "", doc)
 		if old := g.explicit[name]; old != nil {
-			n.ItemState, n.ItemHead = old.ItemState, old.ItemHead
+			n.ItemState, n.ItemHead, n.ItemTitle = old.ItemState, old.ItemHead, old.ItemTitle
 		} else if s := g.self[name]; s != nil {
-			n.ItemState, n.ItemHead = s.ItemState, s.ItemHead
+			n.ItemState, n.ItemHead, n.ItemTitle = s.ItemState, s.ItemHead, s.ItemTitle
 		} else if n.ItemNS != "" {
 			n.ItemState = ItemLive
 		}
