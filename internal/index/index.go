@@ -528,9 +528,9 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if len(tags) > 0 {
 		ix.opt.Purger.PurgeTags(tags)
 	}
-	// Publish the checkpoint before any other work: queries read the
-	// committed rows, and a gap between the two makes their "checkpoint
-	// moved" redirects alternate between the old and the new at.
+	// Publish the checkpoint before any other work, waking ?min= waiters.
+	// Redirects go by the committed checkpoint (Index.committed), so the
+	// gap between the commit and this doesn't make them alternate.
 	ix.mu.Lock()
 	ix.cur[b.NS] = b.NewCheckpoint
 	if co.PurgedNS {
