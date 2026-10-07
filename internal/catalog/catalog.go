@@ -14,7 +14,9 @@
 //     the recorded catalog checkpoint, which is the at of every grant issued
 //     from it. Only the subtree below a changed node is recomputed.
 //   - Tree powers (move, place) come from the catalog namespace's roles and
-//     apply only where a role granting them is assigned directly (§B.11.2).
+//     apply only where a role granting them is assigned directly, unless
+//     the folder's $access sets inheritPowers: then the roles collected on
+//     the walk up count there too (§B.11.2).
 //   - Content namespaces define what a role means (§B.11.1): the catalog
 //     keeps only roles the content namespace defines with a wanted verb.
 //   - Effective roles count only through subjects the catalog's key in the
@@ -37,7 +39,8 @@
 // don't matter for the catalog's API: it is only proof of identity.
 //
 // There are no CDN edge grants in this implementation: read grants are
-// ordinary core grants fixed to one resource.
+// ordinary core grants fixed to one resource, which the origin accepts as
+// they are and POST /edge-grants (§C.5) exchanges for cookies.
 package catalog
 
 import (

@@ -90,6 +90,13 @@ func (s *Service) serveGrants(w http.ResponseWriter, r *http.Request) {
 		tree.WriteAuthError(w, err, logf(s))
 		return
 	}
+	if status, code, msg := s.t.AwaitMins(r.Context(), r.URL.Query()["min"]); status != 0 {
+		if status == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "1")
+		}
+		tree.WriteError(w, status, code, msg)
+		return
+	}
 	var req Request
 	if err := decode(r, &req); err != nil {
 		writeErr(w, err)
@@ -137,6 +144,13 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 	v, err := s.Authenticate(ctx, r)
 	if err != nil {
 		tree.WriteAuthError(w, err, logf(s))
+		return
+	}
+	if status, code, msg := s.t.AwaitMins(r.Context(), r.URL.Query()["min"]); status != 0 {
+		if status == http.StatusServiceUnavailable {
+			w.Header().Set("Retry-After", "1")
+		}
+		tree.WriteError(w, status, code, msg)
 		return
 	}
 	var req ReadGrantsRequest
@@ -650,15 +664,26 @@ func liveFolder(g *tree.Graph, name string) bool {
 	return n != nil && n.Kind == tree.KindFolder && !n.Cyclic
 }
 
+// powerAccess is the $access entries whose roles give tree powers on a
+// folder: its own, or with inheritPowers the effective ones, collected on
+// the walk up (§B.11.2).
+func powerAccess(g *tree.Graph, n *tree.Node) map[string][]string {
+	if n.InheritPowers {
+		return Effective(g, n.Name, nil)
+	}
+	return n.Access
+}
+
 // hasPower reports whether a subject of subs is assigned, directly on
-// folder, a catalog role with the tree power (move or place, §B.11.1).
+// folder, a catalog role with the tree power (move or place, §B.11.1); on
+// a folder with inheritPowers also through its ancestors (§B.11.2).
 func hasPower(g *tree.Graph, folder string, subs map[string]bool, power string) bool {
 	n := g.Node(folder)
 	if n == nil {
 		return false
 	}
 	roles, _ := g.Config["roles"].(map[string]any)
-	for subj, rs := range n.Access {
+	for subj, rs := range powerAccess(g, n) {
 		if !subs[subj] {
 			continue
 		}
@@ -671,16 +696,17 @@ func hasPower(g *tree.Graph, folder string, subs map[string]bool, power string) 
 	return false
 }
 
-// noPower reports whether no catalog role with the tree power is assigned
-// directly on folder at all: until an admin gives it some, only admins
-// can move or place anything into it (§B.11.4 Create a folder).
+// noPower reports whether no catalog role with the tree power applies on
+// folder at all (assigned directly, or with inheritPowers through its
+// ancestors): until an admin gives it some, only admins can move or place
+// anything into it (§B.11.4 Create a folder).
 func noPower(g *tree.Graph, folder, power string) bool {
 	n := g.Node(folder)
 	if n == nil {
 		return true
 	}
 	roles, _ := g.Config["roles"].(map[string]any)
-	for _, rs := range n.Access {
+	for _, rs := range powerAccess(g, n) {
 		for _, r := range rs {
 			if def, _ := roles[r].(map[string]any); def[power] == true {
 				return false

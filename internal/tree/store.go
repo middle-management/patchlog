@@ -9,6 +9,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pointer"
 )
 
 // Storage (§B.5, with additions):
@@ -22,7 +23,8 @@ import (
 //	                                 raw parents/$access kept to rebuild the graph on start
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
-//	items(ns, name, state, head)     liveness of every resource of the trusted namespaces
+//	items(ns, name, state, head, title)
+//	                                 liveness of every resource of the trusted namespaces
 //	self_parents(ns, name, parents)  $parents of content documents (§B.9, -self-placing)
 //	sealed_views, sealed_view_tags   sealed listings of a sealed/e2e catalog (derived.Cache)
 var createStmts = []string{
@@ -37,7 +39,7 @@ var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS edges (child TEXT NOT NULL, pos INTEGER NOT NULL, parent TEXT NOT NULL, ord TEXT,
 		state INTEGER NOT NULL, PRIMARY KEY (child, pos))`,
 	`CREATE INDEX IF NOT EXISTS edges_by_parent ON edges (parent, ord, child)`,
-	`CREATE TABLE IF NOT EXISTS items (ns TEXT NOT NULL, name TEXT NOT NULL, state INTEGER NOT NULL, head TEXT,
+	`CREATE TABLE IF NOT EXISTS items (ns TEXT NOT NULL, name TEXT NOT NULL, state INTEGER NOT NULL, head TEXT, title TEXT,
 		PRIMARY KEY (ns, name)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS self_parents (ns TEXT NOT NULL, name TEXT NOT NULL, parents TEXT NOT NULL,
 		PRIMARY KEY (ns, name)) WITHOUT ROWID`,
@@ -264,11 +266,11 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		if n.ItemNS == "" {
 			continue
 		}
-		st, head, err := itemState(ctx, q, n.ItemNS, n.ItemName)
+		st, head, title, err := itemStateTitle(ctx, q, n.ItemNS, n.ItemName)
 		if err != nil {
 			return nil, err
 		}
-		g.setItem(name, st, head)
+		g.setItem(name, st, head, title)
 	}
 	return g, nil
 }
@@ -285,25 +287,55 @@ func ReadItemState(ctx context.Context, tx *sql.Tx, ns, name string) (int, strin
 }
 
 func itemState(ctx context.Context, q queryer, ns, name string) (int, string, error) {
+	st, head, _, err := itemStateTitle(ctx, q, ns, name)
+	return st, head, err
+}
+
+// itemStateTitle is itemState with the item's title (§B.5).
+func itemStateTitle(ctx context.Context, q queryer, ns, name string) (int, string, string, error) {
 	var st int
-	var head sql.NullString
-	err := q.QueryRowContext(ctx, `SELECT state, head FROM items WHERE ns = ? AND name = ?`, ns, name).Scan(&st, &head)
+	var head, title sql.NullString
+	err := q.QueryRowContext(ctx, `SELECT state, head, title FROM items WHERE ns = ? AND name = ?`, ns, name).Scan(&st, &head, &title)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ItemUnknown, "", nil
+		return ItemUnknown, "", "", nil
 	}
 	if err != nil {
-		return 0, "", err
+		return 0, "", "", err
 	}
 	if st != ItemLive {
-		head.String = ""
+		head.String, title.String = "", ""
 	}
-	return st, head.String, nil
+	return st, head.String, title.String, nil
+}
+
+// titlePointer reads catalog.title (§B.5), a JSON Pointer. Anything else
+// is ignored: listings then carry no item titles.
+func titlePointer(doc map[string]any) (pointer.Pointer, bool) {
+	cat, _ := doc["catalog"].(map[string]any)
+	if t, ok := cat["title"].(string); ok {
+		if p, err := pointer.Parse(t); err == nil {
+			return p, true
+		}
+	}
+	return nil, false
+}
+
+// titleAt is the string at p in an item's head document ("" if there is
+// none or it isn't a string, §B.5).
+func titleAt(doc any, p pointer.Pointer) string {
+	v, ok := pointer.Get(doc, p)
+	if !ok {
+		return ""
+	}
+	t, _ := v.(string)
+	return t
 }
 
 // setConfig records the catalog namespace document and its trust list.
 func (g *Graph) setConfig(doc map[string]any) {
 	g.Config = doc
 	g.Trust = map[string]bool{}
+	g.TitlePtr, g.HasTitle = titlePointer(doc)
 	cat, _ := doc["catalog"].(map[string]any)
 	arr, _ := cat["trust"].([]any)
 	for _, x := range arr {

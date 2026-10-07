@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/pointer"
 )
 
 // MaxDepth bounds every walk (§B.5): deeper paths are flagged.
@@ -67,11 +68,15 @@ type Node struct {
 	Access    map[string][]string // $access subject -> role names (without "inherit")
 	Inherit   bool                // false: $access has inherit: false
 	HasAccess bool
+	// InheritPowers is $access.inheritPowers: tree powers collected on the
+	// walk up apply at this folder too (§B.11.2).
+	InheritPowers bool
 
 	// Placements.
 	ItemNS, ItemName string // "" if the name doesn't split into a valid item
 	ItemState        int
 	ItemHead         string // last known head revision of a live item
+	ItemTitle        string // the string at the catalog's title pointer in that head (§B.5), "" if none
 
 	// Derived by analyze.
 	State      int    // StateLive or StateDangling
@@ -132,6 +137,11 @@ type Graph struct {
 	Config map[string]any
 	// Trust is catalog.trust (§B.6).
 	Trust map[string]bool
+	// TitlePtr is catalog.title (§B.5): the pointer into an item's head
+	// whose string listings carry as title; nil if the member is absent or
+	// not a valid JSON Pointer (then it is ignored).
+	TitlePtr pointer.Pointer
+	HasTitle bool
 	// Content is each followed content namespace's document as of the
 	// checkpoint the service reflects for it, so what depends on roles and
 	// keys is pinned to the combined checkpoint (§B.11.5).
@@ -354,9 +364,9 @@ func (g *Graph) refresh(name string) {
 
 func (g *Graph) setExplicit(n *Node) {
 	if old := g.explicit[n.Name]; old != nil {
-		n.ItemState, n.ItemHead = old.ItemState, old.ItemHead
+		n.ItemState, n.ItemHead, n.ItemTitle = old.ItemState, old.ItemHead, old.ItemTitle
 	} else if s := g.self[n.Name]; s != nil {
-		n.ItemState, n.ItemHead = s.ItemState, s.ItemHead
+		n.ItemState, n.ItemHead, n.ItemTitle = s.ItemState, s.ItemHead, s.ItemTitle
 	}
 	g.explicit[n.Name] = n
 	g.refresh(n.Name)
@@ -369,7 +379,7 @@ func (g *Graph) removeExplicit(name string) {
 
 func (g *Graph) setSelf(n *Node) {
 	if e := g.explicit[n.Name]; e != nil {
-		n.ItemState, n.ItemHead = e.ItemState, e.ItemHead
+		n.ItemState, n.ItemHead, n.ItemTitle = e.ItemState, e.ItemHead, e.ItemTitle
 	}
 	g.self[n.Name] = n
 	g.refresh(n.Name)
@@ -382,11 +392,11 @@ func (g *Graph) removeSelf(name string) {
 
 // setItem records an item's state on the explicit and implicit placement
 // for it, if any; it reports whether a node exists.
-func (g *Graph) setItem(name string, state int, head string) bool {
+func (g *Graph) setItem(name string, state int, head, title string) bool {
 	found := false
 	for _, n := range []*Node{g.explicit[name], g.self[name]} {
 		if n != nil {
-			n.ItemState, n.ItemHead = state, head
+			n.ItemState, n.ItemHead, n.ItemTitle = state, head, title
 			found = true
 		}
 	}
@@ -462,12 +472,12 @@ func parseParents(catalog string, v any, onlyCatalog bool) []Parent {
 }
 
 // parseAccess parses $access (§B.11.1): subjects (group:… or user:…) to
-// role names, and inherit.
-func parseAccess(v any) (acc map[string][]string, inherit, has bool) {
+// role names, inherit and inheritPowers.
+func parseAccess(v any) (acc map[string][]string, inherit, powers, has bool) {
 	inherit = true
 	m, ok := v.(map[string]any)
 	if !ok {
-		return nil, true, false
+		return nil, true, false, false
 	}
 	acc = map[string][]string{}
 	for k, x := range m {
@@ -475,6 +485,10 @@ func parseAccess(v any) (acc map[string][]string, inherit, has bool) {
 			if b, ok := x.(bool); ok {
 				inherit = b
 			}
+			continue
+		}
+		if k == "inheritPowers" {
+			powers = x == true
 			continue
 		}
 		if !strings.HasPrefix(k, "group:") && !strings.HasPrefix(k, "user:") {
@@ -490,7 +504,7 @@ func parseAccess(v any) (acc map[string][]string, inherit, has bool) {
 		}
 		sort.Strings(acc[k])
 	}
-	return acc, inherit, true
+	return acc, inherit, powers, true
 }
 
 // ParseNode builds an explicit node from a catalog document.
@@ -505,7 +519,7 @@ func ParseNode(catalog, name, head string, doc any) *Node {
 	m, _ := doc.(map[string]any)
 	n.Title, _ = m["title"].(string)
 	n.Parents = parseParents(catalog, m["parents"], false)
-	n.Access, n.Inherit, n.HasAccess = parseAccess(m["$access"])
+	n.Access, n.Inherit, n.InheritPowers, n.HasAccess = parseAccess(m["$access"])
 	n.rawParents, n.rawAccess = m["parents"], m["$access"]
 	return n
 }

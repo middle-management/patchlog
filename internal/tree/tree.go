@@ -61,6 +61,7 @@ import (
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/pointer"
 )
 
 // Purger purges the tree service's own cache tags.
@@ -234,6 +235,16 @@ func (s *Service) init(ctx context.Context) error {
 	}
 	for _, q := range createStmts {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
+			return fmt.Errorf("tree: schema: %w", err)
+		}
+	}
+	// A database from before item titles (§B.5).
+	var hasTitle int
+	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('items') WHERE name = 'title'`).Scan(&hasTitle); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
+	}
+	if hasTitle == 0 {
+		if _, err := s.db.ExecContext(ctx, `ALTER TABLE items ADD COLUMN title TEXT`); err != nil {
 			return fmt.Errorf("tree: schema: %w", err)
 		}
 	}
@@ -493,6 +504,7 @@ type prep struct {
 	kind   string // head, tombstone or purge
 	head   string
 	doc    any
+	title  string // the item's title at the catalog's pointer (§B.5)
 	purged bool
 }
 
@@ -533,16 +545,40 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 			content = d
 		}
 	}
+	// Item titles (§B.5): read from the heads of items in namespaces that
+	// aren't sealed or end-to-end, when the catalog names a pointer.
+	s.mu.RLock()
+	tptr, hasTitle := s.g.TitlePtr, s.g.HasTitle
+	s.mu.RUnlock()
+	var retitle map[[2]string]string
+	if isCat && cfg != nil {
+		np, nh := titlePointer(cfg.Value)
+		if nh != hasTitle || nh && np.String() != tptr.String() {
+			var err error
+			if retitle, err = s.retitle(ctx, np, nh); err != nil {
+				return err
+			}
+		}
+	}
+	titled := false
+	if !isCat && hasTitle {
+		if in, err := s.keys.Info(ctx, fb.NS); err == nil && !in.Protected() {
+			titled = true
+		}
+	}
 	var preps []prep
 	for _, ch := range co.Changes {
 		p := prep{name: ch.Resource, kind: ch.Kind, head: ch.Target, purged: ch.Purged}
-		if ch.Kind == "head" && (isCat || s.opt.SelfPlacing) {
+		if ch.Kind == "head" && (isCat || s.opt.SelfPlacing || titled) {
 			doc, err := s.keys.FetchDoc(ctx, fb.NS, ch.Resource, ch.Target, func(f client.Flag) {
 				s.opt.Logf("tree: %s/%s: revision %s by %s is flagged and left out: %s", fb.NS, ch.Resource, f.ID, f.Author, f.Message)
 			})
 			switch {
 			case err == nil:
 				p.head, p.doc = doc.ID, doc.Value
+				if titled {
+					p.title = titleAt(doc.Value, tptr)
+				}
 			case errors.Is(err, derived.ErrSkip) && !isCat:
 				// A live item whose document isn't readable content (an
 				// e2e keyring, or e2e without keys): no implicit placement.
@@ -566,7 +602,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	}
 	s.mu.Lock()
 	oldTrust := s.g.Trust
-	res, err := s.applyLocked(context.WithoutCancel(ctx), b, co, preps, cfg, content)
+	res, err := s.applyLocked(context.WithoutCancel(ctx), b, co, preps, cfg, content, retitle)
 	if err != nil {
 		if rerr := s.reload(context.Background()); rerr != nil {
 			s.opt.Logf("tree: reloading after a failed apply: %v", rerr)
@@ -620,7 +656,7 @@ type applyResult struct {
 	tags []string
 }
 
-func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc) (*applyResult, error) {
+func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc, retitle map[[2]string]string) (*applyResult, error) {
 	g := s.g
 	cat := s.opt.Catalog
 	res := &applyResult{}
@@ -643,6 +679,24 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			if err := saveMeta(ctx, tx, "config", canonJSON(cfg.Value)); err != nil {
 				return nil, err
 			}
+			// The title pointer changed: every live item's title is read
+			// again (retitle), and listings move to the new checkpoint.
+			for k, title := range retitle {
+				var col any
+				if title != "" {
+					col = title
+				}
+				if _, err := tx.ExecContext(ctx, `UPDATE items SET title = ? WHERE ns = ? AND name = ?`, col, k[0], k[1]); err != nil {
+					return nil, err
+				}
+				pl := k[0] + "." + k[1]
+				for _, n := range []*Node{g.explicit[pl], g.self[pl]} {
+					if n != nil {
+						n.ItemTitle = title
+						changed[pl] = true
+					}
+				}
+			}
 		}
 		for _, p := range preps {
 			changed[p.name] = true
@@ -651,11 +705,11 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 				g.setExplicit(n)
 				if n.ItemNS != "" {
 					// A new placement: its item's state is in the items table.
-					st, head, err := itemState(ctx, tx, n.ItemNS, n.ItemName)
+					st, head, title, err := itemStateTitle(ctx, tx, n.ItemNS, n.ItemName)
 					if err != nil {
 						return nil, err
 					}
-					g.setItem(p.name, st, head)
+					g.setItem(p.name, st, head, title)
 				}
 			} else {
 				g.removeExplicit(p.name)
@@ -668,7 +722,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 				if _, err := tx.ExecContext(ctx, `DELETE FROM items WHERE ns = ?`, ns); err != nil {
 					return nil, err
 				}
-			} else if _, err := tx.ExecContext(ctx, `UPDATE items SET state = ?, head = NULL WHERE ns = ?`, ItemPurged, ns); err != nil {
+			} else if _, err := tx.ExecContext(ctx, `UPDATE items SET state = ?, head = NULL, title = NULL WHERE ns = ?`, ItemPurged, ns); err != nil {
 				return nil, err
 			}
 			if _, err := tx.ExecContext(ctx, `DELETE FROM self_parents WHERE ns = ?`, ns); err != nil {
@@ -681,7 +735,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			for _, m := range []map[string]*Node{g.explicit, g.self} {
 				for name, n := range m {
 					if n.ItemNS == ns {
-						g.setItem(name, st, "")
+						g.setItem(name, st, "", "")
 						changed[name] = true
 					}
 				}
@@ -701,16 +755,22 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			case "purge":
 				st, head = ItemPurged, ""
 			}
-			var headCol any
+			var headCol, titleCol any
+			title := p.title
 			if head != "" {
 				headCol = head
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO items (ns, name, state, head) VALUES (?, ?, ?, ?)
-				ON CONFLICT (ns, name) DO UPDATE SET state = excluded.state, head = excluded.head`, ns, p.name, st, headCol); err != nil {
+			if title != "" && st == ItemLive {
+				titleCol = title
+			} else {
+				title = ""
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO items (ns, name, state, head, title) VALUES (?, ?, ?, ?, ?)
+				ON CONFLICT (ns, name) DO UPDATE SET state = excluded.state, head = excluded.head, title = excluded.title`, ns, p.name, st, headCol, titleCol); err != nil {
 				return nil, err
 			}
 			pl := ns + "." + p.name
-			if g.setItem(pl, st, head) {
+			if g.setItem(pl, st, head, title) {
 				changed[pl] = true
 			}
 			if !s.opt.SelfPlacing {
@@ -726,7 +786,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 					ON CONFLICT (ns, name) DO UPDATE SET parents = excluded.parents`, ns, p.name, canonJSON(m["$parents"])); err != nil {
 					return nil, err
 				}
-				sn.ItemState, sn.ItemHead = st, head
+				sn.ItemState, sn.ItemHead, sn.ItemTitle = st, head, title
 				g.setSelf(sn)
 				changed[pl] = true
 			} else if g.self[pl] != nil {
@@ -900,4 +960,53 @@ func (s *Service) ItemState(ctx context.Context, ns, name string) (int, string, 
 func (s *Service) Seen(ctx context.Context, nsID string) bool {
 	var one int
 	return s.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns_id = ? LIMIT 1`, nsID).Scan(&one) == nil
+}
+
+// retitle reads, for the new title pointer of the catalog (§B.5), the
+// title of every live item of a trusted namespace that is neither sealed
+// nor end-to-end; items it doesn't list get none.
+func (s *Service) retitle(ctx context.Context, p pointer.Pointer, has bool) (map[[2]string]string, error) {
+	out := map[[2]string]string{}
+	rows, err := s.db.QueryContext(ctx, `SELECT ns, name, head FROM items WHERE state = ? AND head IS NOT NULL`, ItemLive)
+	if err != nil {
+		return nil, err
+	}
+	type it struct{ ns, name, head string }
+	var all []it
+	for rows.Next() {
+		var i it
+		if err := rows.Scan(&i.ns, &i.name, &i.head); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		all = append(all, i)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	open := map[string]bool{}
+	for _, i := range all {
+		k := [2]string{i.ns, i.name}
+		out[k] = ""
+		if !has {
+			continue
+		}
+		ok, seen := open[i.ns]
+		if !seen {
+			in, err := s.keys.Info(ctx, s.actual(i.ns))
+			ok = err == nil && !in.Protected()
+			open[i.ns] = ok
+		}
+		if !ok {
+			continue
+		}
+		doc, err := s.keys.FetchDoc(ctx, s.actual(i.ns), i.name, i.head, nil)
+		if err != nil {
+			// Gone or unreadable since: no title; its own entry follows.
+			continue
+		}
+		out[k] = titleAt(doc.Value, p)
+	}
+	return out, nil
 }

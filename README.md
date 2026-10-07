@@ -161,6 +161,19 @@ tab). The catalogs:
 One tree service serves both (`-catalog=cat -catalog=topics`), each at `/{catalog}/…` with its own
 database.
 
+Spec v0.46 additions to the catalog and tree services:
+
+- **Item titles (§B.5).** `catalog.title` is a JSON Pointer (the core rejects anything else); the
+  service copies the string at that pointer in each item's head into listings as `title`, for
+  items of namespaces that are neither sealed nor end-to-end. A placement's own `title` wins;
+  changing the pointer re-reads every head.
+- **`?min` on `POST /grants` and `POST /read-grants` (§B.11.4).** `?min={ns}:{ns_id}`, repeatable:
+  the grant is decided at a checkpoint at or past every `min`, else `503` with `Retry-After`.
+- **`$access.inheritPowers: true` (§B.11.2).** Tree powers (`move`, `place`) collected on the walk
+  up apply at that folder too; moves stay bounded by no widening.
+- **Read grants** are core grants fixed to one resource (`/resource` tested, read only, one
+  namespace), so the origin's `POST /edge-grants` (§C.5) can exchange them for cookies.
+
 - `make logs` follows the logs.
 - `make seed` re-runs the seed, which is safe to repeat.
 - `make down` stops the stack and keeps its data; `docker compose down -v` wipes it.

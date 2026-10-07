@@ -449,11 +449,12 @@ func checkKeyFields(v, prev any) *memberError {
 }
 
 // checkCatalog checks a catalog namespace's "catalog" (§B.6):
-// { "trust"?: [namespace names], "mode"?: "tree" | "dag" }, and x- members.
+// { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer },
+// and x- members.
 func checkCatalog(v any) *memberError {
 	m, ok := v.(map[string]any)
 	if !ok {
-		return badAt(pointer.Pointer{"catalog"}, `must be { "trust"?: [namespace names], "mode"?: "tree" | "dag" } (§B.6)`)
+		return badAt(pointer.Pointer{"catalog"}, `must be { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer } (§B.6)`)
 	}
 	for _, k := range sortedKeys(m) {
 		switch x := m[k]; {
@@ -470,6 +471,12 @@ func checkCatalog(v any) *memberError {
 		case k == "mode":
 			if x != "tree" && x != "dag" {
 				return badAt(pointer.Pointer{"catalog", "mode"}, `must be "tree" or "dag" (§B.6)`)
+			}
+		case k == "title":
+			if t, ok := x.(string); !ok {
+				return badAt(pointer.Pointer{"catalog", "title"}, "must be a JSON Pointer (§B.5)")
+			} else if _, err := pointer.Parse(t); err != nil {
+				return badAt(pointer.Pointer{"catalog", "title"}, "must be a JSON Pointer (§B.5)")
 			}
 		case isX(k):
 		default:
