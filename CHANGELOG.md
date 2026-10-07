@@ -1,5 +1,60 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.46**, which adopts most of Doors' feedback, fixes the server bugs
+Doors reported, and adds OpenTelemetry.
+
+**Changes to check before upgrading:**
+- **Keys follow the base both ways:** a branch now accepts keys added to its base after
+  it was created (recursively through local bases); a kid both have is the base's entry
+  only (§C.4).
+- **Operator grants** authorise only creating namespaces (remote branches included) and
+  forced purges. A request under one to a namespace that doesn't exist is now `401`, not
+  `404` (a forced purge still gets `404`).
+- **The gestures listing** answers any reader, filtered to resources its grant may read
+  (§7.4); a `?after` naming a resource it can't read is `404`.
+- **Unfreezing a branch** whose base already has `branchesPerNamespace` live branches is
+  `422 limit`; frozen branches no longer count toward the limit (Doors B3).
+- **CORS:** `-cors-origin '*'` with credentials no longer echoes an arbitrary origin;
+  credentialed origins are listed with `-cors-credentials-origin`.
+- **Tree database** gains an `items.title` column, and **index database** a `sort.raw`
+  column; both are added or rebuilt on start.
+- `GET /` answers `"spec": "0.46"`.
+
+**New (v0.46):**
+- `schemaReads: { for }` in a namespace document: its schema revisions resolve for writes
+  in the listed namespaces that pin them, and can be read by revision path by readers of
+  documents pinning them, without a grant on the namespace (§6.1).
+- `POST /edge-grants` issues edge grants as `Secure`, `HttpOnly` cookies per prefix, which
+  the origin verifies itself when no edge is in front (`-edge-grant-key`, else derived from
+  `-edge-secret`); cookies authorise only `GET`/`HEAD` under their prefix (§C.5).
+- Catalog: `?min` on `POST /grants` and `/read-grants`; a `title` pointer copied into
+  listings; `inheritPowers` in `$access` (§B.5, §B.11).
+- Index: schema documents indexed under their dialect, with their `$ref`s as references;
+  `self: true` on self-references; hits carry sort values and `fields=` (§A).
+- Client: undo stacks count a merged gesture for its source author, and `Undo` with
+  `UndoAuthor` finds it (§11.2). Bundles look up keys through a branch's bases.
+
+**OpenTelemetry** (off unless `OTEL_*` exporters are configured): traces and metrics over
+OTLP (gRPC or HTTP), console output, W3C propagation; route-named HTTP server spans for
+`serve` and every service, client spans on outbound calls, engine write spans
+(`core.WriteResource`, `core.Batch`, …), transaction spans, and metrics for writes,
+group-commit sizes, Postgres lock waits and consumer lag. See the README's Observability
+section; `compose.yaml` has an optional Jaeger profile (`--profile otel`). No measurable
+cost when off; the binary grows by about 11 MB (gRPC).
+
+**Fixes (reported by Doors):**
+- The index's `?min=` redirect could bounce between two checkpoints during an update;
+  redirects now follow the committed checkpoint and only move forward (B1).
+- `schema_unavailable` named the dialect URL instead of the unresolved pin; it now names
+  the revision path. A schema document could `$ref` a revision the writer can't read once
+  the validator had cached it; read permission is now checked on the whole closure (B2).
+- The standalone tree service left heads and URLs out of listings for grants reading only
+  some resources of a content namespace (B4).
+- The batch retry lookup read every batch the author had written; it now looks up one
+  resource's history (5,000 earlier batches: 24.8 → 0.5 ms per batch on SQLite) (B5).
+
 ## v0.14.1
 
 Implements spec **v0.45**, which settles the reference's remaining notes from v0.42 and
