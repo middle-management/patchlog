@@ -1061,22 +1061,57 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		items = append(items, ir)
 	}
 	want := string(jsonv.Canonical(entries))
-	rows, err := t.Query(`SELECT id, body FROM ns_log WHERE ns = ? AND kind = ? AND author = ?`, n.id, nsKindCode("batch"), author)
-	t.must(err)
+	// The batch, if it was written, is an entry that moved the first item's
+	// resource to its target, or, for a batch of only a config change, the
+	// first entry with that config in force. Looking it up from there costs
+	// that resource's history, not every batch the author ever wrote here,
+	// which made each batch slower as the log grew.
+	var cands []int64
+	if len(st) > 0 {
+		own := t.resource(n.id, st[0].Resource)
+		if own == nil {
+			return nil
+		}
+		target, err := ids.Parse(items[0].IDs[len(items[0].IDs)-1])
+		if err != nil {
+			return nil
+		}
+		var rseq int64
+		if t.QueryRow(`SELECT seq FROM revisions WHERE res = ? AND id = ?`, own.id, target[:]).Scan(&rseq) != nil {
+			return nil
+		}
+		rows, err := t.Query(`SELECT ns_seq FROM head_history WHERE res = ? AND target_seq = ?`, own.id, rseq)
+		t.must(err)
+		for rows.Next() {
+			var s int64
+			t.must(rows.Scan(&s))
+			cands = append(cands, s)
+		}
+		// Closed before querying again: a Postgres connection runs one
+		// query at a time.
+		rows.Close()
+	} else if cp != nil {
+		var cseq, s int64
+		if t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND id = ?`, n.id, cp.expected[:]).Scan(&cseq) != nil {
+			return nil
+		}
+		if t.QueryRow(`SELECT MIN(seq) FROM ns_log WHERE ns = ? AND config_seq = ?`, n.id, cseq).Scan(&s) == nil && s != 0 {
+			cands = append(cands, s)
+		}
+	}
 	var match []byte
-	for rows.Next() {
+	for _, seq := range cands {
 		var id []byte
 		var body string
-		t.must(rows.Scan(&id, &body))
+		if t.QueryRow(`SELECT id, body FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body) != nil {
+			continue
+		}
 		b := jsonv.MustParse([]byte(body)).(map[string]any)
 		if string(jsonv.Canonical(b["entries"])) == want {
 			match = id
 			break
 		}
 	}
-	// Closed before querying again: a Postgres connection runs one query
-	// at a time.
-	rows.Close()
 	if match == nil || !t.candidateVerbsMatch(n, st) {
 		return nil
 	}
@@ -1299,9 +1334,17 @@ func (t *tx) validateDoc(doc any, sc *schemaCtx, pending map[string]any) (string
 	load := func(ref schema.Ref) (any, error) { return t.loadSchema(ref, sc, pending) }
 	// The validator caches compiled schemas forever, so availability and
 	// read permission are checked here for the whole $ref closure.
+	// A schema document (a dialect $schema) starts the closure at its own
+	// $refs, so a cached revision the writer may not read is still refused,
+	// and the error names the revision that didn't resolve, not the dialect.
+	var queue []schema.Ref
 	if r, ok := schema.ParseRef(s); ok {
+		queue = []schema.Ref{r}
+	} else if schema.IsDialect(s) {
+		queue = schema.Refs(doc)
+	}
+	{
 		seen := map[string]bool{}
-		queue := []schema.Ref{r}
 		for len(queue) > 0 {
 			r := queue[0]
 			queue = queue[1:]
@@ -1334,6 +1377,10 @@ func schemaErr(err error, path string) *Error {
 		return apiErr(422, "schema_ref", "message", "a schema reference must not name a branch")
 	case errors.As(err, &ue):
 		return apiErr(422, "schema_unavailable", "ref", ue.Ref)
+	case schema.RefPath(err) != "":
+		// The revision that didn't resolve, wherever in the closure it is,
+		// never the document's own $schema (a dialect URL for a schema).
+		return apiErr(422, "schema_unavailable", "ref", schema.RefPath(err))
 	case errors.Is(err, schema.ErrUnavailable), errors.Is(err, schema.ErrForbidden):
 		return apiErr(422, "schema_unavailable", "ref", path)
 	case errors.As(err, &ve):

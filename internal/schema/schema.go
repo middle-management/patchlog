@@ -168,6 +168,20 @@ type forbiddenError struct{ path string }
 func (e *forbiddenError) Error() string { return ErrForbidden.Error() + ": " + e.path }
 func (e *forbiddenError) Unwrap() error { return ErrForbidden }
 
+// RefPath returns the revision path a load failure (unknown, purged or not
+// readable) is about, or "" if err names none.
+func RefPath(err error) string {
+	var fe *forbiddenError
+	if errors.As(err, &fe) {
+		return fe.path
+	}
+	var ue *UnavailableError
+	if errors.As(err, &ue) {
+		return ue.Ref
+	}
+	return ""
+}
+
 var printer = message.NewPrinter(language.English)
 
 // Validator compiles and caches schemas by revision path. Safe for concurrent use.
