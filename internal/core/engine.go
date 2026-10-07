@@ -379,7 +379,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.45"
+const SpecVersion = "0.46"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -407,6 +407,9 @@ func (e *Engine) parseConfig(doc any) (*Config, error) {
 }
 
 func (e *Engine) now() time.Time { return e.opt.Now().UTC() }
+
+// Now is the engine's clock (Options.Now), for the server's edge grants.
+func (e *Engine) Now() time.Time { return e.now() }
 
 // Error is an API error: an HTTP status and the JSON body of §12.
 type Error struct {

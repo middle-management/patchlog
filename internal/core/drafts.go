@@ -33,26 +33,34 @@ import (
 var draftPatternRe = regexp.MustCompile(`^(?:[a-z0-9][a-z0-9_-]{0,63}|[a-z0-9_-]{0,63}\*)$`)
 
 // parseDrafts parses a branch's drafts member (§7.4).
-func parseDrafts(v any) ([]string, error) {
-	const shape = `/drafts must be { "for": [ namespace name or prefix ending in "*", … ] }`
+func parseDrafts(v any) ([]string, error) { return parseForList(v, "drafts") }
+
+// parseSchemaReads parses a namespace's schemaReads member (§6.1, §7.4),
+// shaped and matched like drafts.
+func parseSchemaReads(v any) ([]string, error) { return parseForList(v, "schemaReads") }
+
+// parseForList parses { "for": [names or prefixes ending in "*"] } at
+// /member.
+func parseForList(v any, member string) ([]string, error) {
+	shape := `/` + member + ` must be { "for": [ namespace name or prefix ending in "*", … ] }`
 	m, ok := v.(map[string]any)
 	if !ok {
-		return nil, fmt.Errorf(shape)
+		return nil, fmt.Errorf("%s", shape)
 	}
 	for k := range m {
 		if k != "for" {
-			return nil, fmt.Errorf("/drafts/%s is not a known field", k)
+			return nil, fmt.Errorf("/%s/%s is not a known field", member, k)
 		}
 	}
 	arr, ok := m["for"].([]any)
 	if !ok {
-		return nil, fmt.Errorf(shape)
+		return nil, fmt.Errorf("%s", shape)
 	}
 	out := []string{}
 	for i, x := range arr {
 		s, ok := x.(string)
 		if !ok || !draftPatternRe.MatchString(s) {
-			return nil, fmt.Errorf("/drafts/for/%d must be a namespace name or a prefix ending in \"*\"", i)
+			return nil, fmt.Errorf("/%s/for/%d must be a namespace name or a prefix ending in \"*\"", member, i)
 		}
 		out = append(out, s)
 	}
@@ -132,6 +140,28 @@ func (t *tx) isDraftCandidate(c *nsRow, root string, over map[int64]*Config) boo
 func (t *tx) draftsServe(c *nsRow, ccfg *Config, w *nsRow) bool {
 	for x := w; ; {
 		if x.id == c.id || DraftsMatch(ccfg.DraftsFor, x.name) {
+			return true
+		}
+		if !x.isBranch() {
+			return false
+		}
+		x = t.nsRowUnlocked(x.base.Int64)
+		if x.isShadow() {
+			return false
+		}
+	}
+}
+
+// schemaReadsServe reports whether n's schemaReads opens its schema
+// revisions for writes to w (§6.1): w is n, or listed in schemaReads.for,
+// or a local branch of such a namespace.
+func (t *tx) schemaReadsServe(n *nsRow, w *nsRow) bool {
+	cfg := t.config(n.configSeq)
+	if cfg.SchemaReadsFor == nil || cfg.level >= levelSealed || n.isBranch() {
+		return false
+	}
+	for x := w; ; {
+		if x.id == n.id || DraftsMatch(cfg.SchemaReadsFor, x.name) {
 			return true
 		}
 		if !x.isBranch() {

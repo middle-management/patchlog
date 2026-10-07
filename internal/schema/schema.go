@@ -113,6 +113,17 @@ func isHex(c byte) bool {
 // marks the document itself as a schema.
 func IsDialect(s string) bool { return s == Dialect2020 }
 
+// IsSchemaDoc reports whether doc is a schema: an object whose own $schema
+// is a dialect URL (§6.1).
+func IsSchemaDoc(doc any) bool {
+	m, ok := doc.(map[string]any)
+	if !ok {
+		return false
+	}
+	s, _ := m["$schema"].(string)
+	return IsDialect(s)
+}
+
 // Loader fetches the document at a schema revision. See the package errors.
 type Loader func(ref Ref) (any, error)
 

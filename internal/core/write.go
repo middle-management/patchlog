@@ -1431,13 +1431,35 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 		// The server can't read schemas in an e2e namespace (§E.3.2).
 		return nil, schema.ErrUnavailable
 	}
+	// A namespace that opens its schemas with schemaReads lets writes to a
+	// listed namespace resolve them without read (§6.1); only schema
+	// documents, checked once loaded.
+	var readable bool
 	if sc.target != nil && n.id == sc.target.id {
-		if !t.canRead(n, t.config(n.configSeq), sc.a, ref.Name) {
-			return nil, schema.ErrForbidden
-		}
-	} else if !t.credsRead(n, ref.Name, sc.creds) {
+		readable = t.canRead(n, t.config(n.configSeq), sc.a, ref.Name)
+	} else {
+		readable = t.credsRead(n, ref.Name, sc.creds)
+	}
+	if readable {
+		return t.schemaRevIn(n, ref)
+	}
+	if sc.target == nil || !t.schemaReadsServe(n, sc.target) {
 		return nil, schema.ErrForbidden
 	}
+	d, err := t.schemaRevIn(n, ref)
+	if err != nil {
+		return nil, err
+	}
+	if !schema.IsSchemaDoc(d) {
+		return nil, schema.ErrForbidden
+	}
+	return d, nil
+}
+
+// schemaRevIn loads revision ref.Rev of resource ref.Name in n, a
+// namespace that isn't a branch: ErrUnavailable if unknown, purged,
+// pruned or a tombstone.
+func (t *tx) schemaRevIn(n *nsRow, ref schema.Ref) (any, error) {
 	v := t.resolve(n, ref.Name, nil)
 	if v.head == nil || v.state == Purged || v.state == NotFound {
 		return nil, schema.ErrUnavailable

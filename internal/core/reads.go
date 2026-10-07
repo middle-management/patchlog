@@ -189,12 +189,16 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
+		rid, perr := ids.Parse(id)
 		if _, err := t.reader(n, cred, name); err != nil {
-			return err
+			// A schema revision n opens with schemaReads, to a reader of
+			// a document that pins it (§6.1, §7); nothing else of n.
+			if perr != nil || !t.schemaReadsRev(n, name, rid, cred) {
+				return err
+			}
 		}
 		out = &Rev{Public: t.cachePublic(n)}
 		public = t.config(n.configSeq).Read == "public"
-		rid, perr := ids.Parse(id)
 		if perr != nil {
 			out.Status = 404
 			return nil

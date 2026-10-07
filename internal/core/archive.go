@@ -285,12 +285,12 @@ func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant
 		cur = t.nsByID(cur.base.Int64)
 	}
 	for i := len(chain) - 1; i >= 0; i-- {
-		var seq, cfg int64
+		var seq, cfg, entryCreated int64
 		var err error
 		if chain[i].bound.Valid {
-			err = t.QueryRow(`SELECT seq, config_seq FROM ns_log WHERE grant_id = ? AND ns = ? AND seq <= ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id, chain[i].bound.Int64).Scan(&seq, &cfg)
+			err = t.QueryRow(`SELECT seq, config_seq, created FROM ns_log WHERE grant_id = ? AND ns = ? AND seq <= ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id, chain[i].bound.Int64).Scan(&seq, &cfg, &entryCreated)
 		} else {
-			err = t.QueryRow(`SELECT seq, config_seq FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id).Scan(&seq, &cfg)
+			err = t.QueryRow(`SELECT seq, config_seq, created FROM ns_log WHERE grant_id = ? AND ns = ? ORDER BY seq LIMIT 1`, gid[:], chain[i].n.id).Scan(&seq, &cfg, &entryCreated)
 		}
 		if errors.Is(err, sql.ErrNoRows) {
 			continue
@@ -299,6 +299,19 @@ func (t *tx) archiveGrant(n *nsRow, gid ids.ID, created time.Time) *ArchiveGrant
 		out.NS = chain[i].n.name
 		for _, k := range t.config(cfg).Keys {
 			out.Keys = append(out.Keys, ArchiveCandidateKey{Kid: k.Kid, Pub: k.Pub})
+		}
+		// Keys follow the base (§C.4): in a branch, the keys its local
+		// bases had at the entry's created are candidates too (§C.3.1).
+		for _, l := range chain[i+1:] {
+			var bcfg int64
+			err := t.QueryRow(`SELECT seq FROM ns_config WHERE ns = ? AND created <= ? ORDER BY seq DESC LIMIT 1`, l.n.id, entryCreated).Scan(&bcfg)
+			if errors.Is(err, sql.ErrNoRows) {
+				continue
+			}
+			t.must(err)
+			for _, k := range t.config(bcfg).Keys {
+				out.Keys = append(out.Keys, ArchiveCandidateKey{Kid: k.Kid, Pub: k.Pub})
+			}
 		}
 		break
 	}

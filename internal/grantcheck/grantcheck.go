@@ -246,14 +246,16 @@ func (ch *Checker) load(ctx context.Context, ns string, depth int) (*nsState, er
 	if err != nil {
 		return nil, err
 	}
-	// Keys follow the base (core effectiveKeys).
-	st.keys = nil
+	// Keys follow the base (core effectiveKeys): the base's current keys,
+	// whose entries win over the branch's for a shared kid, then the
+	// branch's own, less those it copied and the base has since removed.
+	st.keys = append([]grant.Key(nil), base.keys...)
 	for _, k := range cfg.Keys {
+		if _, inBase := findKey(base.keys, k.Kid); inBase {
+			continue
+		}
 		if _, shared := copied[k.Kid]; shared {
-			bk, ok := findKey(base.keys, k.Kid)
-			if !ok || string(bk.Pub) != string(k.Pub) {
-				continue
-			}
+			continue
 		}
 		st.keys = append(st.keys, k)
 	}

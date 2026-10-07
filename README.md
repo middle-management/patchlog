@@ -28,7 +28,9 @@ and serves immutable, CDN-cacheable revisions.
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
-| Local branches: read-through, foreign parents, keys follow the base | §7.6 | ✅ |
+| Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
+| `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
+| Edge grants as cookies: `POST /edge-grants`, verified by the origin without an edge | §C.5, §9 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
@@ -266,6 +268,22 @@ verifies grants, and the origin must know which deployment it is in:
 head -c 32 /dev/urandom | base64 > edge.secret   # shared with the edge's configuration
 patchlog serve -edge-secret edge.secret           # the edge sends X-Edge-Verified: <secret>
 ```
+
+**Edge grants as cookies** (§C.5). `POST /edge-grants` with a grant in `Authorization` answers
+`{ "prefixes": [...], "exp" }` (`no-store`) and sets one cookie per prefix: `/r/{ns}` and
+`/ns/{ns}` per namespace the grant names, or `/r/{ns}/{name}` when its read rules fix
+`/resource`. `"*"`, a grant without `read`, and one whose read rules refer to `/resource`
+without fixing it, or to `/now`, are `403`. Cookies are `Secure`, `HttpOnly`, `Path` the prefix,
+named `__Secure-pl-eg-…` per prefix, and live at most 15 minutes and never past the grant's
+`exp`. One authorises `GET` and `HEAD` under its prefix only, on requests without
+`Authorization`; never writes, `/edge-grants` or the services. The origin verifies them itself
+(an HMAC over prefix, namespace, resource, subject and expiry), so they work without a verifying
+edge; behind one, reads still need `-edge-header`, and the key is derived from `-edge-secret` so
+the edge can verify the same cookies. `-edge-grant-key FILE` sets the key otherwise (default:
+random per process). Pages on another origin call it with `credentials: "include"`: list them
+with `-cors-credentials-origin` (repeatable), which names the origin from that list with
+`Access-Control-Allow-Credentials: true` and `Vary: Origin`, even when `-cors-origin` is `*`, and
+makes the cookies `SameSite=None` (otherwise `Lax`).
 
 **Bypassing it.** The origins answer directly on 9080 (core), 9081 (search) and 9082 (tree).
 `make cdn-restart` restarts Varnish, which reloads the VCL and empties the cache.
@@ -519,7 +537,9 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
   browsers cache a preflight.
 - Grants travel in `Authorization`, which a page sets itself, so cross-origin calls need no
   cookies. `-cors-credentials` adds `Access-Control-Allow-Credentials` for pages that do send
-  them; it needs explicit origins.
+  them; it needs explicit origins. `-cors-credentials-origin` lists origins allowed credentials
+  on their own, for edge-grant cookies (§C.5); an origin that isn't listed is never echoed with
+  credentials.
 - With `*`, every response allows `*` and exposes the headers, whether or not the request sends
   `Origin`, so responses are the same for every origin and the CDN keeps one copy: one cached
   from a request without `Origin` (curl, a service, a same-origin page) serves cross-origin
@@ -871,6 +891,18 @@ PATCH /r/matches-r7/derby  {"$schema": "/r/schemas/team/rev/X", …}
   draft the writer can't read is reported like an unknown one (`422 schema_unavailable`). The
   client library sends several grants with `client.WithSourceAuthorization`,
   `client.WithSourceGrants` (one write), `BatchRequest.SourceAuthorizations` and `CopyBlobWith`.
+- **`schemaReads`** (§6.1). A namespace that isn't a branch may set
+  `"schemaReads": { "for": ["content", "site-*"] }` (names, or prefixes ending in `*`, matched as
+  `drafts.for`; the namespace itself always counts). Its schema revisions (resources whose own
+  `$schema` is the dialect URL) then resolve for writes to a listed namespace, or a local branch
+  of one, without the writer's read on it, through `$schema` and the `$ref` closure; and a grant
+  that may read a resource of a listed namespace whose current document (head, or last live
+  document if tombstoned) pins the revision through `$schema` and its `$ref` closure may `GET`
+  that revision by path, `/r/{N}/{name}/rev/{id}`, even if it doesn't name `N` (cached
+  `private`). Nothing else opens: not the head, log or other revisions, not a document that
+  isn't a schema, not a draft in a branch. Only the listed namespace's own resources count as
+  referrers, among the namespaces the grant names. Setting it needs a `*` key; it is `422` in
+  sealed and e2e namespaces, and branch creation drops it.
 - **`in_use`.** A reference (every revision a branch wrote counts, not only its head; tombstoned
   documents too) is satisfied by any available copy: in `N`, or for a branch in a candidate
   serving it. A resource or namespace purge that would remove the last such copy, in any
@@ -1652,7 +1684,18 @@ with the key-scope fields of §C.4. Operator keys (`-operator-key`) get kid `ope
 (then `operator-2`, …) and may create namespaces; a creating grant lists the new
 namespace's name, which need not exist yet, or `"*"`, in `ns`. Only operator grants may use
 `"*"`: a grant signed by a namespace key that names `"*"` is refused with `403` (it is valid, it
-just doesn't apply).
+just doesn't apply). An operator grant authorises exactly three things (§C.4): creating a
+namespace with its genesis document, creating a remote branch with the schema histories it
+mirrors, and forcing a purge or namespace purge (`?force=1`). Anything else under one is `401`,
+as for a key the namespace doesn't list, also for a namespace that doesn't exist; reads of a
+public namespace ignore it. An operator who needs more adds a key to the namespace document.
+
+**Keys follow the base** (§C.4). A branch accepts its base's *current* keys as well as its own,
+recursively through every local base: a key added to the base after branching works in the
+branch, one removed or replaced there stops working in every branch. A kid both have is the
+base's: only the base's entry (its `pub` and scope) is accepted. Keys added only to the branch
+(with a base `*` key) are its own. Remote branches keep their own keys. Archives list the keys
+the bases had at the recording entry as candidate keys too (§C.3.1).
 
 ### Author signatures
 
@@ -1880,9 +1923,10 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   or undoing it, in insertion order (a resource's chain order; across resources, the order of a
   client's successive saves), `no-store`. Pages are as long as log pages; `X-Log-Next` names the
   next page's `after`, `{resource}/{id}` of the page's last entry (ids repeat across resources),
-  and the last page has none. It needs unrestricted read (`403`; `404` for a grant that can't
-  read the namespace as a whole, as for `/heads`), answers `404 not_offered` in sealed and e2e
-  namespaces after authorisation, leaves out purged resources, and in a branch lists only the
+  and the last page has none. It answers any reader, listing only entries of resources its
+  grant may read (a cursor naming another resource is `404`; v0.46, before it needed
+  unrestricted read), answers `404 not_offered` in sealed and e2e namespaces after
+  authorisation, leaves out purged resources, and in a branch lists only the
   branch's own rows, not what it reads through from its base (ask the base). Merges carry each
   fast-forwarded or replayed revision's gestures in their steps (§F.3), and remote branches
   mirror them; squashes don't. The client library sends them with `client.WithGesture`,
@@ -1894,7 +1938,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   (`since`, `live`, `cursor`, `after`, `dry-run=1`, `force=1`, each on its own routes), and
   answers anything else, a repeated parameter or another flag value with `400 bad_input`,
   `no-store`, before authentication.
-- **`GET /`** answers `{ "spec": "0.45", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.46", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace
@@ -1952,7 +1996,7 @@ internal/core       storage and semantics (gate, batches, branches, purge, prune
 internal/server     HTTP API
 internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
 internal/cdnpurge   HTTP cache-tag purges to a CDN (-purge-url)
-internal/edge       the verifying edge's secret and private edge directives (§9, -edge-secret)
+internal/edge       the verifying edge's secret, private edge directives and edge-grant cookies (§9, §C.5)
 deploy/varnish      the compose stack's local CDN (Varnish VCL)
 ```
 
