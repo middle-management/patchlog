@@ -1599,7 +1599,9 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
 - **Snapshot bundles** go through `{ns}-upstream` namespaces. Pinned references between snapshot
   documents are rewritten to them, keeping any `#id` fragment.
 - **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
-  (§6.6). **`-pace`** splits batches to fit the limits and paces them for backfills.
+  (§6.6). **`-pace`** splits batches to fit the limits and paces them for backfills, at that
+  fraction of the namespace's rate; where the importer has an allowance, batches follow its
+  limits and are paced at its bucket's full rate, which holds up no other writer.
 - **Branches** export with the base's history included, or with `-foreign-parents` naming the base revisions in `requires`.
 - **Blobs** (§G.4.1) travel as blob lines (unpadded base64url; padded is accepted), each
   before the first line that mentions it: a `$blob` member in any op's value (tests too), the

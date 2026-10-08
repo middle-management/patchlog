@@ -3,7 +3,6 @@ package bundle
 import (
 	"context"
 	"fmt"
-	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,11 +13,15 @@ import (
 	"github.com/middle-management/patchlog/internal/merge"
 )
 
-// limits are the batch and rate limits of a target namespace (§6.6).
+// limits are the batch and rate limits of a target namespace (§6.6), or
+// the importer's allowance's there.
 type limits struct {
 	items, size       int
 	nsRate, principal float64
 	blobGrace         time.Duration
+	// allowance is the rate of the importer's allowance's bucket, which
+	// replaces the principal and namespace buckets (§6.6); 0 without one.
+	allowance float64
 }
 
 func defaultLimits() limits {
@@ -50,7 +53,9 @@ func parseSize(v any) (int, bool) {
 	return 0, false
 }
 
-func limitsOf(doc map[string]any) limits {
+// limitsOf reads a namespace document's limits, replaced by those that al,
+// the importer's allowance there, sets.
+func limitsOf(doc, al map[string]any) limits {
 	l := defaultLimits()
 	m, _ := doc["limits"].(map[string]any)
 	if n, ok := m["itemsPerBatch"].(float64); ok && n > 0 {
@@ -74,7 +79,56 @@ func limitsOf(doc map[string]any) limits {
 			l.blobGrace = d
 		}
 	}
+	if n, ok := al["itemsPerBatch"].(float64); ok && n > 0 {
+		l.items = int(n)
+	}
+	if n, ok := parseSize(al["batchSize"]); ok {
+		l.size = n
+	}
+	if b, ok := al["bucket"].(map[string]any); ok {
+		if x, ok := b["rate"].(float64); ok && x > 0 {
+			l.allowance = x
+		}
+	}
 	return l
+}
+
+// allowanceOf returns the allowance of the principal sub and kid in a
+// namespace document, as the server picks it (§6.6): the first with that
+// sub and kid, or with that sub when kid is "" (authentication disabled),
+// and none once now isn't before its until.
+func allowanceOf(doc map[string]any, sub, kid string, now time.Time) map[string]any {
+	if sub == "" {
+		return nil
+	}
+	as, _ := doc["allowances"].([]any)
+	for _, x := range as {
+		a, _ := x.(map[string]any)
+		if a["sub"] != sub || (kid != "" && a["kid"] != kid) {
+			continue
+		}
+		if s, ok := a["until"].(string); ok {
+			if u, err := time.Parse(time.RFC3339, s); err == nil && !now.Before(u) {
+				return nil
+			}
+		}
+		return a
+	}
+	return nil
+}
+
+// rate is the pace of a backfill into a namespace, in items per second,
+// and the bucket it paces by (§6.6, §G.4.4): an allowance's at its full
+// rate, since that bucket is the importer's own and holds up no other
+// writer; else Pace of the lower of the principal and namespace rates.
+func (l limits) rate(pace float64) (float64, string) {
+	switch {
+	case l.allowance > 0:
+		return l.allowance, "allowance"
+	case l.principal <= l.nsRate:
+		return l.principal * pace, "ratePerPrincipal"
+	}
+	return l.nsRate * pace, "ratePerNamespace"
 }
 
 func (im *importer) namespaceDoc(ctx context.Context, ns string) (map[string]any, bool, error) {
@@ -302,6 +356,12 @@ func (im *importer) defaultNSDoc(ctx context.Context, n *node) any {
 }
 
 func (im *importer) execute(ctx context.Context) error {
+	// A bearer that doesn't decode has no allowance; the server answers
+	// for it.
+	sub, kid, err := im.c.Principal(ctx)
+	if err != nil {
+		sub = ""
+	}
 	lims := map[*node]limits{}
 	for _, n := range im.order {
 		doc, ok, err := im.namespaceDoc(ctx, n.ns)
@@ -311,7 +371,7 @@ func (im *importer) execute(ctx context.Context) error {
 		n.missing = !ok
 		l := defaultLimits()
 		if ok {
-			l = limitsOf(doc)
+			l = limitsOf(doc, allowanceOf(doc, sub, kid, im.opt.Now()))
 		} else {
 			im.rep.Create = append(im.rep.Create, n.ns)
 		}
@@ -319,6 +379,9 @@ func (im *importer) execute(ctx context.Context) error {
 		im.split(n, l)
 		for i, b := range n.batches {
 			b.rep = im.batchReport(b, i+1, len(n.batches))
+			if im.opt.Mode == Backfill {
+				b.rep.Rate, b.rep.PacedBy = l.rate(im.opt.Pace)
+			}
 			im.rep.Batches = append(im.rep.Batches, b.rep)
 		}
 	}
@@ -380,6 +443,7 @@ func (im *importer) execute(ctx context.Context) error {
 			n.missing = false
 		}
 		for i, b := range n.batches {
+			start, dry := im.opt.Now(), !b.dryOK
 			// Blobs first (§G.4.4), again if they may have expired since.
 			if !b.dryOK {
 				if err := im.prepare(ctx, b, lims[n], false); err != nil {
@@ -415,13 +479,30 @@ func (im *importer) execute(ctx context.Context) error {
 				im.opt.Progress(b.rep)
 			}
 			if im.opt.Mode == Backfill {
-				rate := math.Min(lims[n].nsRate, lims[n].principal) * im.opt.Pace
-				wait := time.Duration(float64(len(req.Items)) / rate * float64(time.Second))
-				if err := im.opt.Sleep(ctx, wait); err != nil {
+				if err := im.pace(ctx, lims[n], len(req.Items), dry, start); err != nil {
 					return err
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// pace waits after a backfill's batch, begun at start, until the bucket it
+// paces by (limits.rate) has refilled what the batch drew, less the time
+// the batch took. Without an allowance that is its items, at Pace of the
+// rate. An allowance's bucket is paced at its full rate, so there it counts
+// every draw: a dry run draws as a submit does (§6.6, §7.5), so a batch
+// dry-run just before its submit draws its items twice. A 429 the pacing
+// doesn't avoid is retried after its Retry-After (call).
+func (im *importer) pace(ctx context.Context, l limits, items int, dry bool, start time.Time) error {
+	rate, _ := l.rate(im.opt.Pace)
+	if l.allowance > 0 && dry {
+		items *= 2
+	}
+	wait := time.Duration(float64(items)/rate*float64(time.Second)) - im.opt.Now().Sub(start)
+	if wait <= 0 {
+		return nil
+	}
+	return im.opt.Sleep(ctx, wait)
 }

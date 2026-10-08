@@ -495,10 +495,13 @@ func TestAtomicAndBackfill(t *testing.T) {
 	}
 
 	// Backfill: split to fit the limits (items and bytes, cutting the long
-	// chain), paced at a fraction of the rate.
+	// chain), paced at a fraction of the rate. The clock stands still, so
+	// no batch takes any of its wait.
 	var sleeps []time.Duration
+	now := time.Now()
 	rep = must(bundle.Import(ctx, bob, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 0.5,
-		Sleep: func(_ context.Context, d time.Duration) error { sleeps = append(sleeps, d); return nil }}))
+		Sleep: func(_ context.Context, d time.Duration) error { sleeps = append(sleeps, d); return nil },
+		Now:   func() time.Time { return now }}))
 	if len(rep.Batches) < 4 {
 		t.Fatalf("backfill batches %d", len(rep.Batches))
 	}
@@ -520,6 +523,9 @@ func TestAtomicAndBackfill(t *testing.T) {
 	// 3 items at 0.5 × min(500/s namespace, 50/s principal).
 	if want := time.Duration(float64(len(rep.Batches[0].Resources)) / 25 * float64(time.Second)); sleeps[0] != want {
 		t.Fatalf("pace %v, want %v", sleeps[0], want)
+	}
+	if br := rep.Batches[0]; br.PacedBy != "ratePerPrincipal" || br.Rate != 25 {
+		t.Fatalf("paced by %q at %v", br.PacedBy, br.Rate)
 	}
 	if h := dst.head("bulk", "long"); h.ID != longHead {
 		t.Fatalf("long head %s, want %s (ids kept across parts)", h.ID, longHead)
