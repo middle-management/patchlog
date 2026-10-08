@@ -22,8 +22,16 @@ jobs:
           if [ -n "$out" ]; then echo "not gofmt'ed:"; echo "$out"; exit 1; fi
       - run: go vet ./...
       - run: go test ./...
-      - name: race
-        run: go test -race ./internal/core ./internal/server ./internal/merge ./internal/index ./internal/tree
+
+  # The race detector, in its own job so it runs alongside the others.
+  race:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./internal/core ./internal/server ./internal/merge ./internal/index ./internal/tree
 
   # Every package's tests again, on Postgres (Addendum D.8): each test that
   # opens a store gets a fresh database (internal/pgtest), including the
@@ -50,8 +58,30 @@ jobs:
         with:
           go-version-file: go.mod
       - run: go test ./internal/...
-      - name: race
-        run: go test -race ./internal/core ./internal/server ./internal/index
+
+  # The same on Postgres, with the race detector.
+  postgres-race:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    env:
+      PATCHLOG_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./internal/core ./internal/server ./internal/index
 
   docker:
     runs-on: ubuntu-latest
