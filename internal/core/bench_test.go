@@ -357,9 +357,10 @@ func benchDoc(seed, size int) map[string]any {
 }
 
 // BenchmarkNamespaceHeads reads a 1000-item page of GET
-// /ns/{ns}/rev/{ns_id}/heads: of a namespace of 1,000 resources, and of a
+// /ns/{ns}/rev/{ns_id}/heads: of a namespace of 1,000 resources, of a
 // branch of it with 100 resources of its own, which reads the rest
-// through.
+// through, and of a branch of that branch with 50 of its own, which reads
+// through both.
 func BenchmarkNamespaceHeads(b *testing.B) {
 	e := benchFileEngine(b)
 	ctx := context.Background()
@@ -380,7 +381,11 @@ func BenchmarkNamespaceHeads(b *testing.B) {
 		b.Fatal(err)
 	}
 	branch := create("c", 100, 20, 1)
-	for _, c := range []struct{ ns, id string }{{"b", base}, {"c", branch}} {
+	if _, err := e.CreateBranch(ctx, Request{NS: "c", Cred: Credentials{Author: "a"}}, BranchRequest{Name: "d", IfNoneMatch: true}); err != nil {
+		b.Fatal(err)
+	}
+	nested := create("d", 50, 40, 3)
+	for _, c := range []struct{ ns, id string }{{"b", base}, {"c", branch}, {"d", nested}} {
 		b.Run("ns="+c.ns, func(b *testing.B) {
 			for i := 0; i < b.N; i++ {
 				p, err := e.NamespaceHeads(ctx, c.ns, c.id, "", Credentials{Author: "a"})

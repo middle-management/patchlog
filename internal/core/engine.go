@@ -878,16 +878,27 @@ func (t *tx) nsByNameLocked(name string, mode lockMode) *nsRow {
 	return n
 }
 
-// nsByID returns a namespace, taking its lock shared on Postgres.
+// nsByID returns a namespace, taking its lock shared on Postgres. A read
+// transaction reads each namespace once (memo.ns).
 func (t *tx) nsByID(id int64) *nsRow {
 	return t.nsByIDLocked(id, lockShared)
 }
 
 func (t *tx) nsByIDLocked(id int64, mode lockMode) *nsRow {
 	t.lockNS(id, mode)
+	if n, ok := t.memo.ns[id]; ok {
+		t.deps.addNS(&n)
+		return &n
+	}
 	n, err := scanNS(t.QueryRow(`SELECT `+nsCols+` FROM namespaces WHERE ns = ?`, id))
 	t.must(err)
 	t.deps.addNS(n)
+	if !t.write {
+		if t.memo.ns == nil {
+			t.memo.ns = map[int64]nsRow{}
+		}
+		t.memo.ns[id] = *n
+	}
 	return n
 }
 
