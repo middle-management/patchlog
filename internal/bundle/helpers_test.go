@@ -30,13 +30,13 @@ func (nopPurger) PurgeTags([]string) {}
 // deployment is an in-process server with its own origin (clienttest has
 // a fixed origin, and two deployments need two).
 type deployment struct {
-	t      *testing.T
+	t      testing.TB
 	origin string
 	url    string
 	c      *client.Client
 }
 
-func newDeployment(t *testing.T, origin string, opts ...func(*core.Options)) *deployment {
+func newDeployment(t testing.TB, origin string, opts ...func(*core.Options)) *deployment {
 	t.Helper()
 	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}}
 	for _, f := range opts {

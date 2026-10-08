@@ -328,7 +328,8 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	in := fs.String("i", "", "bundle file")
 	dry := fs.Bool("dry-run", false, "classify, check and dry-run every batch; write nothing")
 	atomic := fs.Bool("atomic", false, "one batch per namespace (large imports need an allowance, §6.6)")
-	pace := fs.String("pace", "", "backfill: split batches to fit the limits and pace them at this fraction of the namespace rate, e.g. 0.5")
+	pace := fs.String("pace", "", "backfill: split batches to fit the limits and pace them at this fraction of the namespace rate, e.g. 0.5; "+
+		"an allowance of the importer's own in a namespace sets its batches and full rate there instead (§6.6)")
 	bearer := fs.String("bearer", "", "grant sent as Authorization: Bearer")
 	author := fs.String("author", "", "X-Author (development servers only)")
 	create := fs.Bool("create", true, "create missing target and upstream namespaces")
@@ -391,7 +392,7 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	}
 	if !*asJSON {
 		opt.Progress = func(b *BatchReport) {
-			fmt.Fprintf(stderr, "batch %d/%d into %s: %d items, %d steps -> %s\n", b.Part, b.Parts, b.NS, len(b.Resources), b.Steps, b.NSID)
+			fmt.Fprintf(stderr, "batch %d/%d into %s: %d items, %d steps -> %s%s\n", b.Part, b.Parts, b.NS, len(b.Resources), b.Steps, b.NSID, paced(b))
 		}
 	}
 	rep, err := Import(ctx, c, open, opt)
@@ -403,6 +404,14 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		}
 	}
 	return err
+}
+
+// paced describes how a backfill paces a batch's namespace, "" otherwise.
+func paced(b *BatchReport) string {
+	if b.PacedBy == "" {
+		return ""
+	}
+	return fmt.Sprintf(", paced at %g items/s (%s)", b.Rate, b.PacedBy)
 }
 
 func printReport(w io.Writer, r *Report) {
@@ -444,7 +453,7 @@ func printReport(w io.Writer, r *Report) {
 		if b.NSID != "" {
 			fmt.Fprintf(w, ", committed %s", b.NSID)
 		}
-		fmt.Fprintln(w)
+		fmt.Fprintln(w, paced(b))
 		for _, f := range b.Failures {
 			fmt.Fprintf(w, "      %s\n", f)
 		}

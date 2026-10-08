@@ -31,7 +31,8 @@ const (
 	// allowance (§6.6); nothing is split.
 	Atomic ImportMode = "atomic"
 	// Backfill splits batches to fit the namespace's limits (non-atomic)
-	// and paces them at ImportOptions.Pace of the namespace rate.
+	// and paces them at ImportOptions.Pace of the namespace rate, or by
+	// the importer's allowance there (§6.6).
 	Backfill ImportMode = "backfill"
 )
 
@@ -77,7 +78,12 @@ type ImportOptions struct {
 	// Pace is the fraction of the namespace rate a backfill uses (default
 	// 0.5). The rate is the target namespace's ratePerNamespace, capped by
 	// ratePerPrincipal (the importer's own bucket, which would answer 429
-	// first).
+	// first). An importer with an allowance in the target namespace (§6.6;
+	// its sub and kid as client.Principal reads them) goes by that
+	// instead: batches of the allowance's itemsPerBatch and batchSize where
+	// it sets them, paced at the full rate of its bucket where it has one,
+	// which holds up no other writer. From a minute before the allowance's
+	// until, the rest are split again and paced by the namespace's limits.
 	Pace float64
 	// DryRun classifies, checks and dry-runs every batch that can be
 	// dry-run, and writes nothing.
@@ -100,6 +106,9 @@ type ImportOptions struct {
 	NamespaceDoc func(ns, upstreamOf string) any
 	// Sleep waits between paced batches and retries (default: a timer).
 	Sleep func(ctx context.Context, d time.Duration) error
+	// Now is the clock that pacing takes the time a batch took from, and
+	// allowances' until is judged by (default time.Now).
+	Now func() time.Time
 	// MaxRetries bounds retries of a batch after 429, 5xx or a transport
 	// error (default 5). Retries are safe: an identical batch by the same
 	// principal is answered with the earlier result (§7.5).
@@ -188,6 +197,12 @@ type BatchReport struct {
 	// ViaSource counts the blobs its local source made available, which
 	// needed no copy (§7.8, §G.4.4).
 	ViaSource int `json:"viaSource,omitempty"`
+	// PacedBy is the bucket a backfill paces the namespace's batches by
+	// (§6.6): "allowance", the importer's own, at its full rate, else
+	// "ratePerPrincipal" or "ratePerNamespace", whichever is lower, at
+	// Pace of it. Rate is that pace, in items per second.
+	PacedBy string  `json:"pacedBy,omitempty"`
+	Rate    float64 `json:"rate,omitempty"`
 }
 
 // Report is the outcome of an import or a dry run.
@@ -352,7 +367,13 @@ type importer struct {
 	sealedT map[string]bool // target ns is (or is created) sealed
 	bump    map[string]int  // new e2e target → the epoch to move it to
 
-	sent map[string]time.Time // "ns/name/bid" → when the blob was last uploaded or copied there
+	// Target heads (heads.go): the resources looked up per namespace, and
+	// the namespaces' listings (nil: looked up one by one).
+	want   map[string][]string
+	listed map[string]*listing
+
+	sent  map[string]time.Time // "ns/name/bid" → when the blob was last uploaded or copied there
+	draws map[string][]draw    // target ns → what the import drew there since its last paced batch
 	// noSource marks target namespaces whose batches' local source didn't
 	// make their blobs available (the importer can't read the source
 	// unrestricted, §7.5): their blobs are copied or uploaded instead.
@@ -389,8 +410,11 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 			}
 		}
 	}
+	if opt.Now == nil {
+		opt.Now = time.Now
+	}
 	im := &importer{c: c, opt: opt, docs: map[string]*bdoc{}, up: map[string]*upPlan{},
-		points: map[string]map[string]point{}, schemas: map[string]any{}, nodes: map[string]*node{}}
+		points: map[string]map[string]point{}, schemas: map[string]any{}, nodes: map[string]*node{}, listed: map[string]*listing{}}
 	if err := im.load(open); err != nil {
 		return nil, err
 	}
@@ -558,7 +582,7 @@ func (im *importer) check(ctx context.Context) error {
 		if d.requires == "" {
 			continue
 		}
-		th, err := im.c.Head(ctx, d.tns, d.name)
+		th, err := im.head(ctx, d.tns, d.name)
 		if err != nil {
 			return err
 		}
@@ -865,7 +889,7 @@ func (im *importer) plan(ctx context.Context) error {
 
 func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 	r := d.rep
-	th, err := im.c.Head(ctx, d.tns, d.name)
+	th, err := im.head(ctx, d.tns, d.name)
 	if err != nil {
 		return nil, err
 	}
@@ -1207,7 +1231,7 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 	im.up[d.key] = u
 	ur := &UpstreamReport{Target: Key(u.ns, u.name)}
 	d.rep.Upstream = ur
-	uh, err := im.c.Head(ctx, u.ns, u.name)
+	uh, err := im.head(ctx, u.ns, u.name)
 	if err != nil {
 		return nil, err
 	}
@@ -1343,7 +1367,7 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 		r.Class = "purged"
 		return nil, nil
 	}
-	th, err := im.c.Head(ctx, d.tns, d.name)
+	th, err := im.head(ctx, d.tns, d.name)
 	if err != nil {
 		return nil, err
 	}

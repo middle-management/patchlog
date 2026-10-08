@@ -3,8 +3,8 @@ package bundle
 import (
 	"context"
 	"fmt"
-	"math"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -14,12 +14,25 @@ import (
 	"github.com/middle-management/patchlog/internal/merge"
 )
 
-// limits are the batch and rate limits of a target namespace (§6.6).
+// limits are the batch and rate limits of a target namespace (§6.6), or
+// the importer's allowance's there.
 type limits struct {
 	items, size       int
 	nsRate, principal float64
 	blobGrace         time.Duration
+	// allowance is the rate of the importer's allowance's bucket, which
+	// replaces the principal and namespace buckets (§6.6); 0 without one.
+	allowance float64
+	// With an allowance, own are the namespace's own limits, which apply
+	// once it ends at until (zero: it doesn't end).
+	own   *limits
+	until time.Time
 }
+
+// allowanceMargin is how long before its until an importer stops going by
+// an allowance (§6.6): a batch begun before then reaches the server before
+// it, whatever the batch takes and the clocks differ by, within reason.
+const allowanceMargin = time.Minute
 
 func defaultLimits() limits {
 	return limits{items: 1000, size: 16 << 20, nsRate: 500, principal: 50, blobGrace: 24 * time.Hour}
@@ -50,7 +63,9 @@ func parseSize(v any) (int, bool) {
 	return 0, false
 }
 
-func limitsOf(doc map[string]any) limits {
+// limitsOf reads a namespace document's limits, replaced by those that al,
+// the importer's allowance there, sets.
+func limitsOf(doc, al map[string]any) limits {
 	l := defaultLimits()
 	m, _ := doc["limits"].(map[string]any)
 	if n, ok := m["itemsPerBatch"].(float64); ok && n > 0 {
@@ -74,7 +89,70 @@ func limitsOf(doc map[string]any) limits {
 			l.blobGrace = d
 		}
 	}
+	if al == nil {
+		return l
+	}
+	own := l
+	l.own = &own
+	if s, ok := al["until"].(string); ok {
+		l.until, _ = time.Parse(time.RFC3339, s)
+	}
+	if n, ok := al["itemsPerBatch"].(float64); ok && n > 0 {
+		l.items = int(n)
+	}
+	if n, ok := parseSize(al["batchSize"]); ok {
+		l.size = n
+	}
+	if b, ok := al["bucket"].(map[string]any); ok {
+		if x, ok := b["rate"].(float64); ok && x > 0 {
+			l.allowance = x
+		}
+	}
 	return l
+}
+
+// allowanceOf returns the allowance of the principal sub and kid in a
+// namespace document, as the server picks it (§6.6): the first with that
+// sub and kid, or with that sub when kid is "" (authentication disabled),
+// and none from allowanceMargin before its until.
+func allowanceOf(doc map[string]any, sub, kid string, now time.Time) map[string]any {
+	if sub == "" {
+		return nil
+	}
+	as, _ := doc["allowances"].([]any)
+	for _, x := range as {
+		a, _ := x.(map[string]any)
+		if a["sub"] != sub || (kid != "" && a["kid"] != kid) {
+			continue
+		}
+		if s, ok := a["until"].(string); ok {
+			if u, err := time.Parse(time.RFC3339, s); err == nil && !now.Add(allowanceMargin).Before(u) {
+				return nil
+			}
+		}
+		return a
+	}
+	return nil
+}
+
+// ended reports whether the allowance that l goes by ends by now, as
+// allowanceOf judges it.
+func (l limits) ended(now time.Time) bool {
+	return l.own != nil && !l.until.IsZero() && !now.Add(allowanceMargin).Before(l.until)
+}
+
+// rate is the pace of a backfill into a namespace, in items per second,
+// and the bucket it paces by (§6.6, §G.4.4): an allowance's at its full
+// rate, since that bucket is the importer's own and holds up no other
+// writer; else Pace of the lower of the principal and namespace rates.
+func (l limits) rate(pace float64) (float64, string) {
+	switch {
+	case l.allowance > 0:
+		return l.allowance, "allowance"
+	case l.principal <= l.nsRate:
+		return l.principal * pace, "ratePerPrincipal"
+	}
+	return l.nsRate * pace, "ratePerNamespace"
 }
 
 func (im *importer) namespaceDoc(ctx context.Context, ns string) (map[string]any, bool, error) {
@@ -94,7 +172,7 @@ func (im *importer) namespaceDoc(ctx context.Context, ns string) (map[string]any
 
 // split sizes a node's items into batches: one batch in Atomic mode;
 // in Backfill mode as many as the namespace's itemsPerBatch and batchSize
-// require, cutting a long chain into consecutive parts if needed.
+// require (splitParts).
 func (im *importer) split(n *node, l limits) {
 	if im.opt.Mode == Atomic {
 		b := &batch{n: n}
@@ -107,21 +185,62 @@ func (im *importer) split(n *node, l limits) {
 		n.batches = []*batch{b}
 		return
 	}
+	parts := make([]part, len(n.items))
+	for i, it := range n.items {
+		parts[i] = part{it: it, from: 0, to: len(it.steps)}
+	}
+	n.batches = splitParts(n, parts, l)
+}
+
+// resplit splits a node's batches from i on again by l, when the importer's
+// allowance ends part-way through its batches and the namespace's own
+// limits apply to the rest (§6.6). A chain cut between two of them is
+// whole again first. Their reports replace the old ones.
+func (im *importer) resplit(n *node, i int, l limits) {
+	var rest []part
+	for _, b := range n.batches[i:] {
+		for _, p := range b.parts {
+			if k := len(rest) - 1; k >= 0 && rest[k].it == p.it && rest[k].to == p.from {
+				rest[k].to = p.to
+			} else {
+				rest = append(rest, p)
+			}
+		}
+	}
+	at, old := slices.Index(im.rep.Batches, n.batches[i].rep), len(n.batches)-i
+	n.batches = append(n.batches[:i:i], splitParts(n, rest, l)...)
+	var reps []*BatchReport
+	for j, b := range n.batches {
+		if j < i {
+			b.rep.Parts = len(n.batches)
+			continue
+		}
+		b.rep = im.batchReport(b, j+1, len(n.batches))
+		b.rep.Rate, b.rep.PacedBy = l.rate(im.opt.Pace)
+		reps = append(reps, b.rep)
+	}
+	im.rep.Batches = slices.Replace(im.rep.Batches, at, at+old, reps...)
+}
+
+// splitParts sizes parts of a node's items into batches by l's itemsPerBatch
+// and batchSize, cutting a long chain into consecutive parts if needed.
+func splitParts(n *node, parts []part, l limits) []*batch {
+	var out []*batch
 	cur := &batch{n: n}
 	flush := func() {
 		if len(cur.parts) > 0 {
-			n.batches = append(n.batches, cur)
+			out = append(out, cur)
 		}
 		cur = &batch{n: n}
 	}
-	for _, it := range n.items {
-		start := 0
-		for start < len(it.steps) {
+	for _, p := range parts {
+		it, start := p.it, p.from
+		for start < p.to {
 			if len(cur.parts) >= l.items {
 				flush()
 			}
 			end, sz := start, 0
-			for end < len(it.steps) {
+			for end < p.to {
 				s := stepSize(it.steps[end])
 				if cur.size+sz+s > l.size && (end > start || len(cur.parts) > 0) {
 					break
@@ -139,6 +258,7 @@ func (im *importer) split(n *node, l limits) {
 		}
 	}
 	flush()
+	return out
 }
 
 // request builds a batch request with its source (§G.4.4).
@@ -198,7 +318,11 @@ func (im *importer) batchReport(b *batch, part, parts int) *BatchReport {
 func (im *importer) call(ctx context.Context, ns string, req client.BatchRequest, dry bool) (*client.BatchResult, error) {
 	backoff := 500 * time.Millisecond
 	for attempt := 0; ; attempt++ {
+		at := im.opt.Now()
 		res, err := im.c.Batch(ctx, ns, req, dry)
+		if err == nil {
+			im.drew(ns, at, len(req.Items))
+		}
 		if err == nil || !client.Retryable(err) || attempt >= im.opt.MaxRetries || ctx.Err() != nil {
 			return res, err
 		}
@@ -302,6 +426,12 @@ func (im *importer) defaultNSDoc(ctx context.Context, n *node) any {
 }
 
 func (im *importer) execute(ctx context.Context) error {
+	// A bearer that doesn't decode has no allowance; the server answers
+	// for it.
+	sub, kid, err := im.c.Principal(ctx)
+	if err != nil {
+		sub = ""
+	}
 	lims := map[*node]limits{}
 	for _, n := range im.order {
 		doc, ok, err := im.namespaceDoc(ctx, n.ns)
@@ -311,7 +441,7 @@ func (im *importer) execute(ctx context.Context) error {
 		n.missing = !ok
 		l := defaultLimits()
 		if ok {
-			l = limitsOf(doc)
+			l = limitsOf(doc, allowanceOf(doc, sub, kid, im.opt.Now()))
 		} else {
 			im.rep.Create = append(im.rep.Create, n.ns)
 		}
@@ -319,6 +449,9 @@ func (im *importer) execute(ctx context.Context) error {
 		im.split(n, l)
 		for i, b := range n.batches {
 			b.rep = im.batchReport(b, i+1, len(n.batches))
+			if im.opt.Mode == Backfill {
+				b.rep.Rate, b.rep.PacedBy = l.rate(im.opt.Pace)
+			}
 			im.rep.Batches = append(im.rep.Batches, b.rep)
 		}
 	}
@@ -379,7 +512,20 @@ func (im *importer) execute(ctx context.Context) error {
 			}
 			n.missing = false
 		}
-		for i, b := range n.batches {
+		for i := 0; i < len(n.batches); i++ {
+			if l := lims[n]; im.opt.Mode == Backfill && l.ended(im.opt.Now()) {
+				// The rest fit the namespace's own limits, and are paced
+				// as they say. They fit the allowance's too, which the
+				// server goes by until its until.
+				own := *l.own
+				own.items, own.size = min(own.items, l.items), min(own.size, l.size)
+				lims[n] = own
+				im.resplit(n, i, own)
+				rate, by := lims[n].rate(im.opt.Pace)
+				im.rep.Notes = append(im.rep.Notes, fmt.Sprintf("the importer's allowance in %s ends at %s (§6.6): batches %d to %d fit the namespace's own limits, paced at %g items/s (%s)",
+					n.ns, l.until.Format(time.RFC3339), i+1, len(n.batches), rate, by))
+			}
+			b, start := n.batches[i], im.opt.Now()
 			// Blobs first (§G.4.4), again if they may have expired since.
 			if !b.dryOK {
 				if err := im.prepare(ctx, b, lims[n], false); err != nil {
@@ -415,13 +561,53 @@ func (im *importer) execute(ctx context.Context) error {
 				im.opt.Progress(b.rep)
 			}
 			if im.opt.Mode == Backfill {
-				rate := math.Min(lims[n].nsRate, lims[n].principal) * im.opt.Pace
-				wait := time.Duration(float64(len(req.Items)) / rate * float64(time.Second))
-				if err := im.opt.Sleep(ctx, wait); err != nil {
+				if err := im.pace(ctx, n.ns, lims[n], len(req.Items), start); err != nil {
 					return err
 				}
 			}
 		}
 	}
 	return nil
+}
+
+// pace waits after a backfill's batch into ns, begun at start, until the
+// bucket it paces by (limits.rate) has refilled what the batch drew, less
+// the time the batch took. Without an allowance that is its items, at Pace
+// of the rate. An allowance's bucket is paced at its full rate, so there it
+// counts every draw since the last batch (drew), as the bucket does: a dry
+// run draws as a submit does (§6.6, §7.5), a blob upload or copy a token
+// (§7.8), and the bucket refills between them, up to full. A 429 the
+// pacing doesn't avoid is retried after its Retry-After (call).
+func (im *importer) pace(ctx context.Context, ns string, l limits, items int, start time.Time) error {
+	rate, _ := l.rate(im.opt.Pace)
+	wait := time.Duration(float64(items)/rate*float64(time.Second)) - im.opt.Now().Sub(start)
+	if l.allowance > 0 {
+		var owed float64
+		var last time.Time
+		for _, d := range im.draws[ns] {
+			owed = max(0, owed-d.at.Sub(last).Seconds()*rate) + float64(d.tokens)
+			last = d.at
+		}
+		wait = time.Duration(owed/rate*float64(time.Second)) - im.opt.Now().Sub(last)
+	}
+	delete(im.draws, ns)
+	if wait <= 0 {
+		return nil
+	}
+	return im.opt.Sleep(ctx, wait)
+}
+
+// draw is what an import drew from a target namespace's rate buckets, and
+// when (pace).
+type draw struct {
+	at     time.Time
+	tokens int
+}
+
+// drew records tokens drawn from ns's buckets by a request sent at at.
+func (im *importer) drew(ns string, at time.Time, tokens int) {
+	if im.draws == nil {
+		im.draws = map[string][]draw{}
+	}
+	im.draws[ns] = append(im.draws[ns], draw{at, tokens})
 }

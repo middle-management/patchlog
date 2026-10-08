@@ -339,6 +339,32 @@ func TestErrorsAndAuth(t *testing.T) {
 
 func op2(o, path string, v any) map[string]any { return op(o, path, v) }
 
+// Principal is the bearer's root sub and kid, or with authentication
+// disabled the X-Author name and no kid (§6.6).
+func TestPrincipal(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dev := clienttest.New(t, clienttest.Options{})
+	s := clienttest.New(t, clienttest.Options{Auth: true})
+	g := clienttest.NewKey("ops-2026").Grant(t, s.Now(), "svc:importer", []string{"data"}, []string{"read"})
+	for _, tc := range []struct {
+		c        *client.Client
+		sub, kid string
+	}{
+		{dev.Client(t, client.WithAuthor("bob"), client.WithBearer(g)), "bob", ""},
+		{dev.Client(t), "anonymous", ""},
+		{s.Client(t, client.WithBearer(g), client.WithAuthor("bob")), "svc:importer", "ops-2026"},
+		{s.Client(t, client.WithAuthor("bob")), "", ""},
+	} {
+		if sub, kid, err := tc.c.Principal(ctx); err != nil || sub != tc.sub || kid != tc.kid {
+			t.Fatalf("principal %q %q %v, want %q %q", sub, kid, err, tc.sub, tc.kid)
+		}
+	}
+	if _, _, err := s.Client(t, client.WithBearer("not-a-grant")).Principal(ctx); err == nil {
+		t.Fatal("a malformed bearer has a principal")
+	}
+}
+
 func TestRateLimitRetryAfter(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()

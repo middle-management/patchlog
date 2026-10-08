@@ -73,7 +73,9 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 					nd.bid, it.d.ns, line.Type, SealedBlobType)
 			}
 			err := im.retry(ctx, func() error {
+				at := im.opt.Now()
 				bid, err := im.c.UploadBlob(ctx, it.ns, it.name, line.Type, line.Nonce, line.Data)
+				im.blobDrew(it.ns, at, err)
 				if err == nil && bid != nd.bid {
 					err = fmt.Errorf("uploaded as %s", bid)
 				}
@@ -140,7 +142,21 @@ func (im *importer) prepare(ctx context.Context, b *batch, l limits, deferOK boo
 // whether the server did. A source it can't serve or read, or of a higher
 // rank than the target, answers 404, and the caller falls back.
 func (im *importer) copyBlob(ctx context.Context, ns, name, bid, fromNS, fromName string) bool {
-	return im.retry(ctx, func() error { return im.c.CopyBlob(ctx, ns, name, bid, fromNS, fromName, "") }) == nil
+	return im.retry(ctx, func() error {
+		at := im.opt.Now()
+		err := im.c.CopyBlob(ctx, ns, name, bid, fromNS, fromName, "")
+		im.blobDrew(ns, at, err)
+		return err
+	}) == nil
+}
+
+// blobDrew records the token a blob upload or copy into ns, sent at at,
+// drew (§6.6, §7.8): any the server didn't refuse with 429, since a copy
+// whose source it refuses has drawn all the same.
+func (im *importer) blobDrew(ns string, at time.Time, err error) {
+	if !client.IsRateLimited(err) {
+		im.drew(ns, at, 1)
+	}
 }
 
 // retry runs fn, again after 429, 5xx and transport errors, as call does.

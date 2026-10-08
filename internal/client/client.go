@@ -33,6 +33,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/sig"
 
@@ -197,6 +198,35 @@ func (c *Client) AuthDisabled(ctx context.Context) (bool, error) {
 		return false, err
 	}
 	return root.AuthDisabled(), nil
+}
+
+// Principal is who the deployment takes the client's writes to be by, as
+// its rate buckets and allowances know it (§6.6): the root block's sub and
+// kid of the bearer grant (§C.1), read without verifying it. With
+// authentication disabled (§1) it is the X-Author name ("anonymous"
+// without one) and kid is "": there is no signing key, and allowances
+// match on sub alone. Under grants without a bearer, sub is "" too.
+func (c *Client) Principal(ctx context.Context) (sub, kid string, err error) {
+	root, err := c.Root(ctx)
+	if err != nil {
+		return "", "", err
+	}
+	switch {
+	case root.AuthDisabled() && c.author == "":
+		return "anonymous", "", nil
+	case root.AuthDisabled():
+		return c.author, "", nil
+	case c.bearer == "":
+		return "", "", nil
+	}
+	g, err := grant.Decode(c.bearer, 0)
+	if err != nil {
+		return "", "", fmt.Errorf("client: the bearer grant: %w", err)
+	}
+	if len(g.Blocks) == 0 {
+		return "", "", errors.New("client: the bearer grant has no blocks")
+	}
+	return g.Blocks[0].Sub, g.Blocks[0].Kid, nil
 }
 
 // Origin returns the deployment's canonical origin from GET / (§G.1). It is
