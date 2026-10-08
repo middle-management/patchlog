@@ -36,6 +36,13 @@ type memo struct {
 	// head_history (resolve); 0 when it had none there. Prefetched for a
 	// page of a heads listing (prefetchHeads).
 	headAt map[headAtKey]int64
+	// ns is namespace rows by id (nsByID), in a read transaction only: it
+	// sees one snapshot, takes no lock and writes nothing, so a row stays
+	// as first read until it ends. A branch's heads page looks its base up
+	// for every name it reads through. A write transaction's rows change
+	// under it: its own config writes, freezes, purges and appends, and on
+	// Postgres other writers' appends between its statements.
+	ns map[int64]nsRow
 }
 
 type headAtKey struct{ res, asOf int64 }
