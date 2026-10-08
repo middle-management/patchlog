@@ -53,6 +53,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/semaphore"
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -115,9 +116,9 @@ type Options struct {
 	// FollowOptions are passed to every follower (e.g. follow.WithSSE,
 	// follow.WithBackoff).
 	FollowOptions []follow.Option
-	// FetchConcurrency is how many documents Apply fetches at once
-	// (default 8); 1 fetches them one by one. Rows are written in log
-	// order either way.
+	// FetchConcurrency is how many documents the index fetches at once,
+	// across every followed namespace and branch (default 8); 1 fetches
+	// them one by one. Rows are written in log order either way.
 	FetchConcurrency int
 }
 
@@ -135,7 +136,8 @@ type Index struct {
 	keys    *derived.Keys  // encryption of followed namespaces
 	sealed  *derived.Cache // sealed results
 
-	wmu sync.Mutex // serialises Apply across followers
+	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
+	wmu     sync.Mutex          // serialises Apply across followers
 
 	mu      sync.Mutex
 	cur     map[string]string // ns -> checkpoint
@@ -183,6 +185,7 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		schemas: NewSchemaCache(opt.Client),
+		fetches: semaphore.NewWeighted(int64(opt.FetchConcurrency)),
 		roots:   map[string]bool{}, cur: map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
 	}
 	for _, ns := range opt.Namespaces {
@@ -457,9 +460,10 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			ix.keys.Observe(b.NS, u.Config.Value)
 		}
 	}
-	// Fetch FetchConcurrency documents at a time (one GET each); preps
-	// keeps the coalesced order, which the writes follow. The first error
-	// fails the batch, as one by one, and the follower retries it whole.
+	// Fetch FetchConcurrency documents at a time (one GET each), counting
+	// every follower's Apply: prepare holds one of ix.fetches. preps keeps
+	// the coalesced order, which the writes follow. The first error fails
+	// the batch, as one by one, and the follower retries it whole.
 	preps := make([]prepared, len(co.Changes))
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(ix.opt.FetchConcurrency)
@@ -578,8 +582,12 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 }
 
 // prepare fetches p.resource's document at revision id and extracts its
-// rows into p.
+// rows into p, holding one of the index's FetchConcurrency fetches.
 func (ix *Index) prepare(ctx context.Context, ns, id string, p *prepared) error {
+	if err := ix.fetches.Acquire(ctx, 1); err != nil {
+		return err
+	}
+	defer ix.fetches.Release(1)
 	doc, err := ix.keys.FetchDoc(ctx, ns, p.resource, id, func(f client.Flag) {
 		ix.opt.Logf("index: %s/%s: revision %s by %s is flagged and left out: %s", ns, p.resource, f.ID, f.Author, f.Message)
 	})

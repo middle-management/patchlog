@@ -51,7 +51,7 @@ func indexCmd(args []string) {
 	untyped := fs.Bool("untyped-listing", true, "list untyped documents in plain listings (never in text/facet/sort queries)")
 	minWait := fs.Duration("min-wait", 2*time.Second, "how long ?min= waits for the index to catch up (§A.5)")
 	sse := fs.Bool("sse", false, "follow by server-sent events instead of long-poll")
-	fetchConc := fs.Int("fetch-concurrency", 8, "how many documents the index fetches at once while applying a page of the log")
+	fetchConc := fs.Int("fetch-concurrency", 8, "how many documents the index fetches at once while applying the log, across all namespaces")
 	encKey := fs.String("enc-key", "", "the service's X25519 private key (base64url), for sealed and e2e namespaces (Addendum E)")
 	encKeyFile := fs.String("enc-key-file", "", "file holding -enc-key")
 	var purgeURLs multi

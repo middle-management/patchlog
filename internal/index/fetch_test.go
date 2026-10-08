@@ -178,3 +178,49 @@ func TestConcurrentFetch(t *testing.T) {
 		t.Errorf("index after a failed Apply differs:\n%s\nwant:\n%s", failed, want)
 	}
 }
+
+// TestFetchConcurrencyShared: FetchConcurrency bounds the fetches of every
+// followed namespace together: two namespaces applying pages at once have
+// at most FetchConcurrency documents in flight between them.
+func TestFetchConcurrencyShared(t *testing.T) {
+	ctx := context.Background()
+	w := setup(t)
+	must(w.c.CreateNamespace(ctx, "cups", map[string]any{"read": "public"}))
+	const n, limit = 12, 4
+	origin := must(w.c.Origin(ctx))
+	batches := map[string]*follow.Batch{}
+	for _, ns := range []string{"matches", "cups"} {
+		for i := range n {
+			must(w.c.CreateDoc(ctx, ns, fmt.Sprintf("m%02d", i), map[string]any{"$schema": w.match, "title": fmt.Sprintf("Match %d", i)}))
+		}
+		head := must(w.c.NSHead(ctx, ns)).ID
+		var units []follow.Unit
+		for _, e := range must(w.c.NSLog(ctx, ns, head, "")) {
+			units = append(units, follow.Unit{Entry: e})
+		}
+		batches[ns] = &follow.Batch{Origin: origin, NS: ns, Units: units, NewCheckpoint: head}
+	}
+
+	rf := &revFetches{prefix: "/r/", delay: 20 * time.Millisecond, rt: http.DefaultTransport, paths: map[string]int{}}
+	s := startSvcWith(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "cups"}, noRun: true, hc: &http.Client{Transport: rf}},
+		func(o *index.Options) { o.FetchConcurrency = limit })
+	// Both at once, as their followers would.
+	var wg sync.WaitGroup
+	for _, b := range batches {
+		wg.Go(func() {
+			if err := s.ix.Apply(ctx, b); err != nil {
+				t.Error(err)
+			}
+		})
+	}
+	wg.Wait()
+	if rf.max != limit {
+		t.Errorf("at most %d fetches in flight across both namespaces, want %d", rf.max, limit)
+	}
+	for ns, b := range batches {
+		if cp := s.ix.Checkpoint(ns); cp != b.NewCheckpoint {
+			t.Errorf("%s: checkpoint %q, want %q", ns, cp, b.NewCheckpoint)
+		}
+	}
+	s.expect("/cups?q=11", "m11")
+}
