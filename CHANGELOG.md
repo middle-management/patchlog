@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.15.4
 
 **Faster bundle imports.** A backfill spent nearly all its time sleeping: it paces at half
 the lower of the namespace and principal rates (25 items/s at default limits), 40 s per
