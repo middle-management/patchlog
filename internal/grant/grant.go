@@ -14,6 +14,7 @@
 package grant
 
 import (
+	"bytes"
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -21,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
@@ -98,7 +100,29 @@ type Grant struct {
 	c       *container
 	symbols []string           // the token's own symbol table, for appending
 	proof   ed25519.PrivateKey // the next secret; nil when sealed or stored
+
+	// chainKey is the root key the signature chain last verified under
+	// (verifyChain): the chain doesn't change, so a grant decoded once
+	// and verified again (core keeps them by token) isn't re-checked.
+	chainKey atomic.Pointer[ed25519.PublicKey]
 }
+
+// verifyChain checks the signature chain under the root key, once per key.
+func (g *Grant) verifyChain(root ed25519.PublicKey) error {
+	if k := g.chainKey.Load(); k != nil && bytes.Equal(*k, root) {
+		return nil
+	}
+	if err := g.c.verify(root); err != nil {
+		return err
+	}
+	k := ed25519.PublicKey(bytes.Clone(root))
+	g.chainKey.Store(&k)
+	return nil
+}
+
+// ChainVerified reports whether the signature chain has verified under
+// some root key (Verify), as opposed to only having decoded.
+func (g *Grant) ChainVerified() bool { return g.chainKey.Load() != nil }
 
 // ID is the grant id of §C.3: trunc160(sha256(canonical(root block))).
 func (g *Grant) ID() ids.ID { return ids.Of(jsonv.Canonical(g.Blocks[0].Raw)) }

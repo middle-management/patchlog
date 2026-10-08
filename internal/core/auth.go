@@ -61,7 +61,12 @@ func (t *tx) authenticate(nsName string, n *nsRow, cfg *Config, cred Credentials
 	if err != nil {
 		return nil, err
 	}
-	return t.verifyGrant(g, nsName, n, cfg, keysOverride)
+	a, err := t.verifyGrant(g, nsName, n, cfg, keysOverride)
+	if err != nil {
+		return nil, err
+	}
+	t.e.bearers.put(cred.Bearer, g)
+	return a, nil
 }
 
 // decodeGrant decodes a bearer grant and checks, before anything is
@@ -72,17 +77,69 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 	if cred.Bearer == "" {
 		return nil, apiErr(401, "unauthenticated", "message", "missing grant")
 	}
-	g, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
-	if errors.Is(err, grant.ErrTooLarge) {
-		return nil, limitErr(413, "grant too large")
-	}
-	if err != nil {
-		return nil, authErr(err)
+	g := t.e.bearers.get(cred.Bearer)
+	if g == nil {
+		var err error
+		g, err = grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
+		if errors.Is(err, grant.ErrTooLarge) {
+			return nil, limitErr(413, "grant too large")
+		}
+		if err != nil {
+			return nil, authErr(err)
+		}
 	}
 	if !g.NamesNS(nsName) {
 		return nil, nsNotNamed(nsName)
 	}
 	return g, nil
+}
+
+// grantCache keeps bearer grants by their token once they have verified,
+// so a grant presented again is neither decoded nor its signatures checked
+// again (grant.Verify remembers the chain's root key). Verification still
+// runs on every request against the configuration in force: times,
+// revocation, key scope and rules are never cached.
+//
+// Only a grant that verified is stored (put, after verifyGrant): one that
+// doesn't, such as a well-formed token signed by a key nobody configured,
+// costs a decode on each request, as without the cache, and holds no
+// memory. A decoded grant can be several times larger than its token (an
+// 8 KiB token of empty JSON arrays decodes to about 100 KB), so the cache
+// is bounded by the total length of its tokens as well as by their number.
+type grantCache struct {
+	mu    sync.Mutex
+	m     map[string]*grant.Grant
+	bytes int // the total length of the tokens in m
+}
+
+// Past either bound the cache starts over.
+const (
+	maxGrantCacheEntries = 1024
+	maxGrantCacheBytes   = 1 << 20
+)
+
+// get returns the verified grant of token, or nil.
+func (c *grantCache) get(token string) *grant.Grant {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.m[token]
+}
+
+// put keeps g, decoded from token, if its signature chain has verified.
+func (c *grantCache) put(token string, g *grant.Grant) {
+	if !g.ChainVerified() || len(token) > maxGrantCacheBytes {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.m[token]; ok {
+		return
+	}
+	if c.m == nil || len(c.m) >= maxGrantCacheEntries || c.bytes+len(token) > maxGrantCacheBytes {
+		c.m, c.bytes = map[string]*grant.Grant{}, 0
+	}
+	c.m[token] = g
+	c.bytes += len(token)
 }
 
 func nsNotNamed(ns string) *Error {
@@ -148,6 +205,7 @@ func (t *tx) absentNSOp(nsName string, cred Credentials, operator bool) *Error {
 	if _, err := t.verifyGrant(g, nsName, nil, nil, t.operatorKeys()); err != nil {
 		return err
 	}
+	t.e.bearers.put(cred.Bearer, g)
 	return notFound()
 }
 
@@ -470,6 +528,7 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 		}
 		switch {
 		case err == nil:
+			t.e.bearers.put(cred.Bearer, g)
 		case cfg.Read == "public":
 			// Public content doesn't need the grant: one that is unusable,
 			// or doesn't name the namespace, is ignored.

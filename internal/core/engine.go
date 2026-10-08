@@ -205,6 +205,7 @@ type Engine struct {
 	cfgCache  map[int64]*Config
 	stmts     stmtCache
 	rc        readCache
+	bearers   grantCache
 	stop      chan struct{}
 	bg        sync.WaitGroup
 	closeOnce sync.Once

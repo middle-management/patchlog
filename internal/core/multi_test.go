@@ -82,7 +82,7 @@ func status(err error) int {
 }
 
 // within polls cond until it holds or d passes, and reports how long it took.
-func within(t *testing.T, d time.Duration, what string, cond func() bool) time.Duration {
+func within(t testing.TB, d time.Duration, what string, cond func() bool) time.Duration {
 	t.Helper()
 	start := time.Now()
 	for !cond() {

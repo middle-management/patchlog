@@ -118,7 +118,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 	}
 	g := e.rc.load(ns)
 	var h *Head
-	public := false
+	public, cached := false, false
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -126,6 +126,11 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		}
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
+		}
+		// May read: the answer is the same for every reader (readcache.go).
+		if c, ok := e.rc.headFor(g, ns, name); ok {
+			h, cached = &c, true
+			return nil
 		}
 		h = &Head{Public: t.cachePublic(n)}
 		public = t.config(n.configSeq).Read == "public"
@@ -143,9 +148,10 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		}
 		return nil
 	})
-	if err == nil && public {
-		// Credentials don't matter to a public read (readcache.go).
-		e.rc.putHead(g, ns, name, *h)
+	if err == nil && !cached {
+		// Credentials don't matter to a public read; other reads serve it
+		// only after their check (readcache.go).
+		e.rc.putHead(g, ns, name, *h, public)
 	}
 	return h, err
 }
@@ -180,7 +186,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		return &Rev{Status: 200, Doc: doc, Public: true}, nil
 	}
 	g := e.rc.load(ns)
-	public := false
+	public, cached := false, false
 	var out *Rev
 	var job *sealJob
 	var nsRowID int64
@@ -202,6 +208,14 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if perr != nil {
 			out.Status = 404
 			return nil
+		}
+		// May read: a plain document is the same for every reader
+		// (readcache.go). Sealed and e2e ones are never cached.
+		if !t.isSealedNS(n) && !t.e2eContent(n, name) {
+			if doc := e.rc.revFor(g, ns, name, id); doc != nil {
+				out.Status, out.Doc, cached = 200, doc, true
+				return nil
+			}
 		}
 		v := t.resolve(n, name, nil)
 		if n.purged || v.state == Purged {
@@ -274,10 +288,10 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
 			out.Doc, out.JWE = nil, job.jwe
 		}
-	} else if err == nil && public && out.Status == 200 && !out.Snapshot {
-		// A plain document of a public namespace (sealed ones have a job,
-		// e2e ones no document): immutable, and the same for every reader.
-		e.rc.putRev(g, ns, name, id, out.Doc)
+	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
+		// A plain document (sealed ones have a job, e2e ones no document):
+		// immutable, and the same for every reader.
+		e.rc.putRev(g, ns, name, id, out.Doc, public)
 	}
 	return out, err
 }

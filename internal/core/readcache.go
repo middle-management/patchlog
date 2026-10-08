@@ -6,7 +6,7 @@ import (
 	"time"
 )
 
-// Transaction-free reads of public namespaces.
+// Cached reads.
 //
 // A read of a public namespace doesn't depend on credentials (§7: public
 // reads ignore grants), so its answer depends only on the database. Two
@@ -16,6 +16,14 @@ import (
 //     prune, restore, key destruction or configuration change;
 //   - a head pointer (GET /r/{ns}/{name}): valid until the namespace's
 //     next write, or any of the above.
+//
+// Other namespaces' answers are cached too, but never served before the
+// request's read check has passed in a transaction (reads.go): whoever may
+// read them gets the same answer, so the cache saves the transaction the
+// resolution, not the check, and a refused request never looks at it.
+// They are served only if cached under the meta value loaded before that
+// transaction began (headFor, revFor), so the check and the answer were
+// decided under the same configuration.
 //
 // Validity is tracked with generation counters used as seqlocks: a write
 // transaction bumps them just before and just after its commit, so they are
@@ -63,13 +71,17 @@ type readCache struct {
 	bytes int
 }
 
+// public marks an answer of a public namespace, which the transaction-free
+// reads serve.
 type revEntry struct {
-	meta uint64
-	doc  []byte
+	meta   uint64
+	public bool
+	doc    []byte
 }
 
 type headEntry struct {
 	meta, ns uint64
+	public   bool
 	head     Head
 	at       time.Time
 }
@@ -109,33 +121,61 @@ func headKey(ns, name string) string    { return ns + "\x00" + name }
 
 func (c *readCache) serving() bool { return c.fresh == nil || c.fresh() }
 
+// rev and head serve a public namespace's answer without a transaction.
 func (c *readCache) rev(ns, name, id string) []byte {
+	if e, ok := c.revEntry(ns, name, id); ok && e.public {
+		return e.doc
+	}
+	return nil
+}
+
+func (c *readCache) head(ns, name string) (Head, bool) {
+	if e, ok := c.headEntry(ns, name); ok && e.public {
+		return e.head, true
+	}
+	return Head{}, false
+}
+
+// revFor and headFor serve any namespace's answer to a request whose read
+// check passed in a transaction begun after g was loaded.
+func (c *readCache) revFor(g gens, ns, name, id string) []byte {
+	if e, ok := c.revEntry(ns, name, id); ok && e.meta == g.meta {
+		return e.doc
+	}
+	return nil
+}
+
+func (c *readCache) headFor(g gens, ns, name string) (Head, bool) {
+	if e, ok := c.headEntry(ns, name); ok && e.meta == g.meta {
+		return e.head, true
+	}
+	return Head{}, false
+}
+
+func (c *readCache) revEntry(ns, name, id string) (revEntry, bool) {
 	if !c.serving() {
-		return nil
+		return revEntry{}, false
 	}
 	c.mu.Lock()
 	e, ok := c.revs[revKey(ns, name, id)]
 	c.mu.Unlock()
-	if !ok || e.meta != c.meta.Load() {
-		return nil
-	}
-	return e.doc
+	return e, ok && e.meta == c.meta.Load()
 }
 
-func (c *readCache) head(ns, name string) (Head, bool) {
+func (c *readCache) headEntry(ns, name string) (headEntry, bool) {
 	if !c.serving() {
-		return Head{}, false
+		return headEntry{}, false
 	}
 	c.mu.Lock()
 	e, ok := c.heads[headKey(ns, name)]
 	c.mu.Unlock()
 	if !ok || e.meta != c.meta.Load() || e.ns != c.nsGen(ns).Load() {
-		return Head{}, false
+		return headEntry{}, false
 	}
 	if c.headTTL > 0 && time.Since(e.at) > c.headTTL {
-		return Head{}, false
+		return headEntry{}, false
 	}
-	return e.head, true
+	return e, true
 }
 
 // unchanged reports whether the counters still hold g's values after a
@@ -146,7 +186,7 @@ func (c *readCache) unchanged(g gens, ns string) bool {
 	return c.meta.Load() == g.meta && (ns == "" || c.nsGen(ns).Load() == g.ns)
 }
 
-func (c *readCache) putRev(g gens, ns, name, id string, doc []byte) {
+func (c *readCache) putRev(g gens, ns, name, id string, doc []byte, public bool) {
 	if !g.stable() || !c.unchanged(g, "") {
 		return
 	}
@@ -156,11 +196,11 @@ func (c *readCache) putRev(g gens, ns, name, id string, doc []byte) {
 	if c.revs == nil {
 		c.revs = map[string]revEntry{}
 	}
-	c.revs[revKey(ns, name, id)] = revEntry{meta: g.meta, doc: doc}
+	c.revs[revKey(ns, name, id)] = revEntry{meta: g.meta, public: public, doc: doc}
 	c.bytes += len(doc)
 }
 
-func (c *readCache) putHead(g gens, ns, name string, h Head) {
+func (c *readCache) putHead(g gens, ns, name string, h Head, public bool) {
 	if !g.stable() || !c.unchanged(g, ns) {
 		return
 	}
@@ -170,7 +210,7 @@ func (c *readCache) putHead(g gens, ns, name string, h Head) {
 	if c.heads == nil {
 		c.heads = map[string]headEntry{}
 	}
-	c.heads[headKey(ns, name)] = headEntry{meta: g.meta, ns: g.ns, head: h, at: g.at}
+	c.heads[headKey(ns, name)] = headEntry{meta: g.meta, ns: g.ns, public: public, head: h, at: g.at}
 }
 
 // room starts over when an entry of n bytes would exceed the bounds.

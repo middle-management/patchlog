@@ -556,6 +556,38 @@ func TestUnknownKidAndTime(t *testing.T) {
 	}
 }
 
+// A grant verified once (and kept, as core keeps decoded grants by token)
+// skips only its signature check when verified again, and only under the
+// same root key: times, revocation and key scope are checked every time.
+func TestVerifyAgain(t *testing.T) {
+	f := newFixture(t, nil)
+	g := roundtrip(t, mustMint(t, f, nil))
+	for i := 0; i < 2; i++ {
+		if _, err := Verify(g, f.env()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Another key under the same kid.
+	other := newFixture(t, nil)
+	_, err := Verify(g, other.env())
+	wantStatus(t, err, 401)
+	if _, err := Verify(g, f.env()); err != nil {
+		t.Fatal(err)
+	}
+	env := f.env()
+	env.Now = now.Add(2 * time.Hour)
+	_, err = Verify(g, env)
+	wantStatus(t, err, 401)
+	env = f.env()
+	env.Revoked = map[string]bool{g.RevocationIDs()[0]: true}
+	_, err = Verify(g, env)
+	wantStatus(t, err, 401)
+	scoped := newFixture(t, map[string]any{"can": []any{"read"}})
+	scoped.keys[0].Pub = f.keys[0].Pub
+	_, err = Verify(g, scoped.env())
+	wantStatus(t, err, 403)
+}
+
 // The ns check comes first, before anything is verified (§C.2): a grant
 // not naming the namespace is 403 even when it would also be a 401.
 func TestNSCheckFirst(t *testing.T) {
