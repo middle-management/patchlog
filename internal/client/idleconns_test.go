@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 )
@@ -64,7 +65,11 @@ func TestIdleConns(t *testing.T) {
 				})
 			}
 			for range n {
-				<-arrived
+				select {
+				case <-arrived:
+				case <-time.After(10 * time.Second):
+					t.Fatalf("%s: burst never all in flight", tc.name)
+				}
 			}
 			mu.Lock()
 			close(release)

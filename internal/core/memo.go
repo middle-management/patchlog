@@ -14,10 +14,12 @@ import (
 //     transactions that hadn't written yet, so never a row of their own
 //     that a rollback could take back. (Neither is ever deleted.)
 //   - resource and revision rows, which the check and the insert each read
-//     several times, and resources found missing. A transaction keeps them (tx.memo) until it writes or
-//     takes another lock: on Postgres a write transaction sees each
-//     statement's own snapshot, and what it reads after a lock must be as
-//     of that lock (pglock.go).
+//     several times, and resources found missing (and, in a read
+//     transaction, namespace rows: a branch page resolves through its
+//     bases name by name). A transaction keeps them (tx.memo) until it
+//     writes or takes another lock: on Postgres a write transaction sees
+//     each statement's own snapshot, and what it reads after a lock must
+//     be as of that lock (pglock.go).
 
 // idCache maps immutable names to ids and back.
 type idCache struct {
@@ -26,7 +28,8 @@ type idCache struct {
 	nss         sync.Map // string -> int64
 }
 
-// memo is a transaction's resource and revision rows. A resource found
+// memo is a transaction's resource and revision rows, and in a read
+// transaction its namespace rows. A resource found
 // missing is remembered too (nil): a create looks its resource up again
 // and again.
 type memo struct {

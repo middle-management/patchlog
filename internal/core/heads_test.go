@@ -15,8 +15,8 @@ import (
 // namespace's log, of its branch's and of that branch's branch, and now,
 // the pages list what resolve answers alone, name by name from nothing
 // remembered, in byte order, across live, tombstoned and purged
-// resources, a branch's own and its bases'. The page reads each base once
-// (memo.ns).
+// resources, a branch's own and its bases'. A read transaction remembers
+// every base in the chain (memo.ns).
 func TestPrefetchHeads(t *testing.T) {
 	e := openInstance(t, pgtest.DB(t), t.TempDir())
 	ctx := context.Background()

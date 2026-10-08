@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+**Performance**, follow-ups from the v0.15.1 review:
+- **Branch `/heads` pages** looked up the branch's base namespace once per name that reads
+  through. A read transaction now reads each namespace row once: a branch page takes 27–33 ms
+  instead of 161–164 ms on Postgres (a branch of a branch, 34–38 ms instead of 288–297), and
+  20–29 ms instead of 36–38 ms on SQLite.
+- **The index's `-fetch-concurrency`** now limits fetches across all followed namespaces
+  and branches together, not per namespace: `-ns a,b,c` sent up to 24 GETs at once to the
+  core (whose Postgres pool has 16 connections) and now sends at most 8. It must be at least
+  1.
+- **The index reuses its connections** to the core: its client keeps an idle connection per
+  fetch (new `client.WithIdleConns`), where `http.DefaultTransport` kept 2 and redialled the
+  rest after every page. Catching up 3 × 2,000 documents opened 8–12 connections instead of
+  1,500–2,100, at the same speed.
+
 ## v0.15.1
 
 **Performance** (found by profiling with the new OpenTelemetry spans). End to end, against

@@ -73,9 +73,12 @@ func WithHTTPClient(hc *http.Client) Option {
 // close the others after each burst and dial them again for the next). It
 // replaces the transport, also one from an earlier WithHTTPClient, with a
 // clone of http.DefaultTransport (same proxy, TLS and timeouts), traced as
-// the default one is.
+// the default one is. n at or below the default's 2 changes nothing.
 func WithIdleConns(n int) Option {
 	return func(c *Client) {
+		if n <= http.DefaultMaxIdleConnsPerHost {
+			return
+		}
 		t := http.DefaultTransport.(*http.Transport).Clone()
 		t.MaxIdleConnsPerHost = n
 		t.MaxIdleConns = max(t.MaxIdleConns, n)

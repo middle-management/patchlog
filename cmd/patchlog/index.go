@@ -71,6 +71,9 @@ func indexCmd(args []string) {
 	if len(nss) == 0 {
 		log.Fatal("index: -ns is required")
 	}
+	if *fetchConc < 1 {
+		log.Fatal("index: -fetch-concurrency must be at least 1")
+	}
 	var copts []client.Option
 	if *bearer != "" {
 		copts = append(copts, client.WithBearer(*bearer))
