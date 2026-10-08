@@ -16,6 +16,25 @@ import (
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
+// authTailEvery is authEngine's TailInterval. On Postgres the read cache
+// serves nothing unless the tailer polled within 3 intervals, and keeps head
+// pointers as long: tests that expect an answer served from it can't rely
+// on a poll every tailEvery (20 ms) when the machine is busy.
+const authTailEvery = time.Second
+
+// tailed returns once the tailer (Postgres) has seen the commit to ns made
+// after ns's counter read gen. The commit moves the counter by 2 and the
+// tailer, which sees this instance's commits too, by 2 more when it polls
+// (tailer.go): whatever is cached in between is retired then. Tests that
+// cache answers after a write wait for that first. The tailer must have
+// seen ns's earlier commits, or one poll may count several.
+func tailed(t testing.TB, e *Engine, ns string, gen uint64) {
+	t.Helper()
+	if e.rc.fresh != nil {
+		within(t, 10*time.Second, "the tailer", func() bool { return e.rc.nsGen(ns).Load() >= gen+4 && e.fresh() })
+	}
+}
+
 // authEngine opens an engine with authentication on, a namespace n whose
 // read isn't public, and a clock the test moves. It returns a function
 // minting grants of n's key, and n's configuration id.
@@ -31,7 +50,7 @@ func authEngine(t testing.TB, clock *atomic.Int64) (*Engine, func(root map[strin
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
 	clock.Store(time.Now().UnixMilli())
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
-		Limits: lim, TailInterval: tailEvery, Purger: discardPurger{}, Now: func() time.Time { return time.UnixMilli(clock.Load()) }})
+		Limits: lim, TailInterval: authTailEvery, Purger: discardPurger{}, Now: func() time.Time { return time.UnixMilli(clock.Load()) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -52,13 +71,12 @@ func authEngine(t testing.TB, clock *atomic.Int64) (*Engine, func(root map[strin
 		map[string]any{"kid": "k", "alg": "ed25519", "pub": pub, "can": []any{"*"}},
 	}}
 	opG := mint(opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"n"}, "can": []any{"config"}})
+	gen := e.rc.nsGen("n").Load()
 	res, err := e.WriteConfig(context.Background(), Request{NS: "n", Cred: Credentials{Bearer: opG}}, ConfigChange{IfNoneMatch: true, Patches: []any{map[string]any{"op": "add", "path": "", "value": doc}}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.rc.fresh != nil {
-		within(t, 5*time.Second, "the tailer", e.fresh)
-	}
+	tailed(t, e, "n", gen)
 	return e, func(root map[string]any) string { return mint(priv, root) }, res.ConfigID
 }
 
@@ -79,11 +97,13 @@ func TestReadCacheAuthenticated(t *testing.T) {
 		"exp": time.UnixMilli(clock.Load()).Add(time.Minute).UTC().Format(time.RFC3339)})}
 
 	it := Item{Resource: "a", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"t": "x"}}}}}}
+	gen := e.rc.nsGen("n").Load()
 	res, err := e.WriteResource(ctx, Request{NS: "n", Cred: admin}, it)
 	if err != nil {
 		t.Fatal(err)
 	}
 	id := res.Items[0].IDs[0]
+	tailed(t, e, "n", gen)
 
 	cold, err := e.ResourceRev(ctx, "n", "a", id, reader)
 	if err != nil || cold.Status != 200 || cold.Public {
@@ -117,6 +137,7 @@ func TestReadCacheAuthenticated(t *testing.T) {
 	}
 
 	// Mark the cached answers: what follows shows who is served from them.
+	g = e.rc.load("n")
 	e.rc.putRev(g, "n", "a", id, []byte(`"cached"`), false)
 	h := *coldHead
 	h.Head = "cached"
