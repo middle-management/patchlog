@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased
+
+**Index queries cost what their matches cost (B6).** Every index query read the namespace's
+documents in order and tested each against its facets, ranges and `?ref=`, so a facet
+matching 100 of 48.7k documents read all of them, and with `sort=` sorted them all. A query
+is now driven by its most selective filter when that pays: its matches are read from the
+filter's index and looked up, and the other filters tested per document. Which filter drives
+is decided by a bounded count on the index, and the plan doesn't depend on SQLite's
+statistics. On 48.7k documents, one query / 50 at once:
+
+| query | before | after |
+|---|---|---|
+| `facet[/accountId]=…` | 109 ms / 6.2 s | 9.4 ms / 0.57 s |
+| … `&sort=/accountId` | 237 ms / 17.2 s | 9.7 ms / 0.64 s |
+| … `&counts=…` | 602 ms / 29.8 s | 10 ms / 1.15 s |
+| … `&q=…` | 5.4 s / 193 s | 137 ms / 10.8 s |
+| `ref=…` | 3.9 s / 421 s | 10 ms / 0.76 s |
+| a facet with 5,000 values | 7.2 s | 39 ms |
+| `ge[/score]=500&lt[/score]=501` | 289 ms | 3.7 ms |
+
+Queries with no selective filter (a plain listing, a facet most documents match) scan as
+before. The index replaces `refs_q` with `refs_t`, which leads with the namespace; it is
+built when the index opens (about a second per 500k references).
+
+**Development:** CI runs the race detector in jobs of its own; tests run in parallel
+(`t.Parallel()`); and Postgres tests reuse migrated databases from a pool, emptied between
+tests, instead of creating one each (`internal/pgtest`). CI takes about 2 minutes instead of
+5.
+
 ## v0.15.2
 
 **Performance**, follow-ups from the v0.15.1 review:
