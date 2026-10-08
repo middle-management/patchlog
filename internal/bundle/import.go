@@ -82,7 +82,8 @@ type ImportOptions struct {
 	// its sub and kid as client.Principal reads them) goes by that
 	// instead: batches of the allowance's itemsPerBatch and batchSize where
 	// it sets them, paced at the full rate of its bucket where it has one,
-	// which holds up no other writer.
+	// which holds up no other writer. From a minute before the allowance's
+	// until, the rest are split again and paced by the namespace's limits.
 	Pace float64
 	// DryRun classifies, checks and dry-runs every batch that can be
 	// dry-run, and writes nothing.
@@ -371,7 +372,8 @@ type importer struct {
 	want   map[string][]string
 	listed map[string]*listing
 
-	sent map[string]time.Time // "ns/name/bid" → when the blob was last uploaded or copied there
+	sent  map[string]time.Time // "ns/name/bid" → when the blob was last uploaded or copied there
+	draws map[string][]draw    // target ns → what the import drew there since its last paced batch
 	// noSource marks target namespaces whose batches' local source didn't
 	// make their blobs available (the importer can't read the source
 	// unrestricted, §7.5): their blobs are copied or uploaded instead.
