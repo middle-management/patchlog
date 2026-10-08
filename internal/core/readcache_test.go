@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"reflect"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -175,5 +177,83 @@ func TestReadCacheAuthenticated(t *testing.T) {
 	// comes from the database again.
 	if r, err := e.ResourceRev(ctx, "n", "a", id, admin); err != nil || !bytes.Equal(r.Doc, cold.Doc) {
 		t.Fatalf("after a configuration change: %+v %v", r, err)
+	}
+}
+
+// Only grants whose signature chain verified are kept by token: a
+// well-formed grant signed by a key the namespace doesn't list, however
+// large, is decoded on each request and holds nothing. The kept tokens are
+// bounded by their total length as well as by their number.
+func TestGrantCacheVerifiedOnly(t *testing.T) {
+	var clock atomic.Int64
+	e, mint, _ := authEngine(t, &clock)
+	ctx := context.Background()
+	admin := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:root", "ns": []any{"n"}, "can": []any{"read", "create", "append", "config"}})}
+	it := Item{Resource: "a", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"t": "x"}}}}}}
+	if _, err := e.WriteResource(ctx, Request{NS: "n", Cred: admin}, it); err != nil {
+		t.Fatal(err)
+	}
+	cached := func() (int, int) {
+		e.bearers.mu.Lock()
+		defer e.bearers.mu.Unlock()
+		return len(e.bearers.m), e.bearers.bytes
+	}
+	before, _ := cached()
+
+	_, evil := grant.GenerateKey()
+	empties := make([]any, 1900)
+	for i := range empties {
+		empties[i] = []any{}
+	}
+	for i := 0; i < 50; i++ {
+		g, err := grant.Mint(map[string]any{"kid": "k", "sub": fmt.Sprintf("user:%d", i), "ns": []any{"n"}, "can": []any{"read"},
+			"exp":   time.UnixMilli(clock.Load()).Add(time.Hour).UTC().Format(time.RFC3339),
+			"rules": []any{map[string]any{"op": "test", "path": "/x", "value": empties}}}, evil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		forged := Credentials{Bearer: g.Encode()}
+		if _, err := e.ResourceHead(ctx, "n", "a", forged); status(err) != 401 {
+			t.Fatalf("a forged grant: %v", err)
+		}
+		if _, err := e.ResourceRev(ctx, "n", "a", "zz", forged); status(err) != 401 {
+			t.Fatalf("a forged grant: %v", err)
+		}
+	}
+	elsewhere := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"m"}, "can": []any{"read"}})}
+	if _, err := e.ResourceHead(ctx, "n", "a", elsewhere); status(err) != 403 {
+		t.Fatalf("a grant for another namespace: %v", err)
+	}
+	if n, _ := cached(); n != before {
+		t.Fatalf("%d grants kept after refused requests, want %d", n, before)
+	}
+
+	reader := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"n"}, "can": []any{"read"}})}
+	if _, err := e.ResourceHead(ctx, "n", "a", reader); err != nil {
+		t.Fatal(err)
+	}
+	g := e.bearers.get(reader.Bearer)
+	if g == nil || !g.ChainVerified() {
+		t.Fatal("a verified grant isn't kept")
+	}
+	if _, err := e.ResourceHead(ctx, "n", "a", reader); err != nil {
+		t.Fatal(err)
+	}
+
+	// The total token length stays within its bound.
+	var c grantCache
+	for i := 0; i < 20; i++ {
+		c.put(fmt.Sprintf("%d%s", i, strings.Repeat("x", 200<<10)), g)
+		if c.bytes > maxGrantCacheBytes || len(c.m) == 0 {
+			t.Fatalf("%d tokens of %d bytes kept", len(c.m), c.bytes)
+		}
+	}
+	unverified, err := grant.Decode(reader.Bearer, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.put(reader.Bearer, unverified)
+	if c.get(reader.Bearer) != nil {
+		t.Fatal("an unverified grant is kept")
 	}
 }

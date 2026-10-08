@@ -234,6 +234,7 @@ func (t *tx) credsReadAny(m *nsRow, creds []Credentials) bool {
 		if err != nil {
 			continue
 		}
+		t.e.bearers.put(c.Bearer, g)
 		if t.canRead(m, cfg, ma, "") {
 			return true // no rule ties it to a resource
 		}

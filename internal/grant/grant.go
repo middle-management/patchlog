@@ -120,6 +120,10 @@ func (g *Grant) verifyChain(root ed25519.PublicKey) error {
 	return nil
 }
 
+// ChainVerified reports whether the signature chain has verified under
+// some root key (Verify), as opposed to only having decoded.
+func (g *Grant) ChainVerified() bool { return g.chainKey.Load() != nil }
+
 // ID is the grant id of §C.3: trunc160(sha256(canonical(root block))).
 func (g *Grant) ID() ids.ID { return ids.Of(jsonv.Canonical(g.Blocks[0].Raw)) }
 
