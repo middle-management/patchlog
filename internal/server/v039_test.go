@@ -317,7 +317,7 @@ func TestV039GestureMigration(t *testing.T) {
 	t.Parallel()
 	path, driver := filepath.Join(t.TempDir(), "old.db"), "sqlite"
 	if pgtest.Enabled() {
-		path, driver = pgtest.NewDB(t), "pgx"
+		path, driver = pgtest.FreshDB(t), "pgx"
 	}
 	e := newEnv(t, withPath(path))
 	e.mkNS("main", map[string]any{})
