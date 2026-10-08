@@ -77,9 +77,17 @@ func (t *tx) memoRes(k resKey, r *resRow) {
 
 // prefetchResources reads the rows of several resources of a namespace in
 // one statement, for resource to answer from memory: a batch's items.
+// Postgres only: a SQLite query costs no round trip.
 func (t *tx) prefetchResources(ns int64, names []string) {
-	if !t.e.pg || len(names) < 2 {
-		return // a SQLite query costs no round trip
+	if t.e.pg {
+		t.readResources(ns, names)
+	}
+}
+
+// readResources is prefetchResources in either dialect.
+func (t *tx) readResources(ns int64, names []string) {
+	if len(names) < 2 {
+		return
 	}
 	var want []string
 	for _, name := range names {
@@ -90,7 +98,7 @@ func (t *tx) prefetchResources(ns int64, names []string) {
 	if len(want) == 0 {
 		return
 	}
-	rows, err := t.Query(`SELECT `+resCols+` FROM resources WHERE ns = ? AND name = ANY(?::text[])`, ns, want)
+	rows, err := t.Query(`SELECT `+resCols+` FROM resources WHERE ns = ? AND `+t.e.inArray("name", "text"), ns, t.e.arrayArg(want))
 	t.must(err)
 	found := map[string]*resRow{}
 	for rows.Next() {
@@ -110,12 +118,13 @@ func (t *tx) prefetchResources(ns int64, names []string) {
 // answer from memory: their resource rows, their heads at asOf from
 // head_history, and those head revisions. Names with no head of n's own
 // there are looked up in its base, as resolve reads them through. A page of
-// a heads listing (pageHeads) costs a handful of round trips this way
-// instead of three per resource. Postgres only: a SQLite query costs no
-// round trip.
+// a heads listing (pageHeads) costs a handful of statements this way
+// instead of three per resource: on Postgres each is a round trip, and in
+// SQLite, though none is, three per resource were most of a 1000-item
+// page's time.
 func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
-	for t.e.pg && len(names) > 1 {
-		t.prefetchResources(n.id, names)
+	for len(names) > 1 {
+		t.readResources(n.id, names)
 		var rest []string
 		var heads []int64
 		var resIDs []int64
@@ -135,9 +144,15 @@ func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
 			}
 		}
 		if len(resIDs) > 0 {
-			rows, err := t.Query(`SELECT r.res, h.target_seq FROM unnest(?::bigint[]) AS r(res)
+			q := `SELECT r.res, h.target_seq FROM unnest(?::bigint[]) AS r(res)
 				LEFT JOIN LATERAL (SELECT target_seq FROM head_history
-					WHERE res = r.res AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1) h ON true`, resIDs, *asOf)
+					WHERE res = r.res AND ns_seq <= ? ORDER BY ns_seq DESC LIMIT 1) h ON true`
+			if !t.e.pg { // no LATERAL: a correlated subquery
+				q = `WITH r(res) AS (SELECT value FROM json_each(?))
+				SELECT r.res, (SELECT h.target_seq FROM head_history h
+					WHERE h.res = r.res AND h.ns_seq <= ? ORDER BY h.ns_seq DESC LIMIT 1) FROM r`
+			}
+			rows, err := t.Query(q, t.e.arrayArg(resIDs), *asOf)
 			t.must(err)
 			if t.memo.headAt == nil {
 				t.memo.headAt = map[headAtKey]int64{}
@@ -182,7 +197,7 @@ func (t *tx) prefetchRevs(seqs []int64) {
 	if len(want) == 0 {
 		return
 	}
-	rows, err := t.Query(`SELECT `+revCols+` FROM revisions WHERE seq = ANY(?::bigint[])`, want)
+	rows, err := t.Query(`SELECT `+revCols+` FROM revisions WHERE `+t.e.inArray("seq", "bigint"), t.e.arrayArg(want))
 	t.must(err)
 	if t.memo.rev == nil {
 		t.memo.rev = map[int64]revRow{}
