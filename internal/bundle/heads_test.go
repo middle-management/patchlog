@@ -1,0 +1,295 @@
+package bundle_test
+
+import (
+	"crypto/ecdh"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"testing"
+
+	"github.com/middle-management/patchlog/internal/bundle"
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/seal"
+)
+
+// headsTransport counts an importer's head lookups (GET /r/{ns}/{name})
+// and listing pages (GET /ns/{ns}/rev/{id}/heads), and with block answers
+// the pages 503, which leaves the import to its lookups. With race set,
+// it runs race once, before the first batch (dry: dry run) is sent.
+type headsTransport struct {
+	block          bool
+	lookups, pages atomic.Int64
+	dry            bool
+	race           func()
+	once           sync.Once
+}
+
+func (h *headsTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	switch {
+	case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/heads"):
+		h.pages.Add(1)
+		if h.block {
+			return &http.Response{StatusCode: 503, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("{}")), Request: r}, nil
+		}
+	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/r/") && strings.Count(r.URL.Path, "/") == 3:
+		h.lookups.Add(1)
+	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/batch") && h.race != nil && (r.URL.Query().Get("dry-run") == "1") == h.dry:
+		h.once.Do(h.race)
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// importer is a client of d whose requests go through h.
+func (d *deployment) importer(h *headsTransport, opts ...client.Option) *client.Client {
+	return must(client.New(d.url, append([]client.Option{client.WithAuthor("alice"), client.WithKeys(client.NewKeys(nil)),
+		client.WithHTTPClient(&http.Client{Transport: h})}, opts...)...))
+}
+
+// headsScenario imports a first bundle of namespace m into a target, then
+// changes both sides so that a second bundle meets every classification:
+// 30 new documents (c00…c29) and, already imported, ff (moved on in the
+// source), pr (unchanged), bh (moved on in the target), cf (both),
+// ts (deleted in the target), pg (purged in the target) and, for
+// snapshots, pu (its upstream resource purged in the target). With
+// branch, the second bundle goes into mb, a branch of the target's m, which
+// reads every earlier document through. It returns the second bundle and
+// the target, with the import options that map it.
+func headsScenario(t *testing.T, mode string, sealed, branch bool) ([]byte, *deployment, bundle.ImportOptions) {
+	newD := func(t *testing.T, origin string) *deployment { return newDeployment(t, origin) }
+	doc := map[string]any{"read": "public"}
+	if sealed {
+		newD, doc = newEncDeployment, map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}}
+	}
+	src, dst := newD(t, stagingOrigin), newD(t, cmsOrigin)
+	src.ns("m", doc)
+	ps := func(p ...map[string]any) []any {
+		if sealed {
+			return nonce(p...)
+		}
+		return ops(p...)
+	}
+	create := func(name string) {
+		must(src.c.Create(ctx, "m", name, append(client.GenesisPatches(map[string]any{"v": name}), ps()...)))
+	}
+	change := func(d *deployment, ns, name string) {
+		must(d.c.Append(ctx, ns, name, d.head(ns, name).ID, ps(op("replace", "/v", d.origin))))
+	}
+	names := []string{"ff", "pr", "bh", "cf", "ts", "pg"}
+	if mode == bundle.Snapshot {
+		names = append(names, "pu")
+	}
+	for _, n := range names {
+		create(n)
+	}
+	export := func() []byte {
+		b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"m"}, Mode: mode, Plaintext: sealed})
+		return b
+	}
+	importB(t, dst, export(), bundle.ImportOptions{})
+
+	for i := 0; i < 30; i++ {
+		create(fmt.Sprintf("c%02d", i))
+	}
+	change(src, "m", "ff")
+	change(src, "m", "cf")
+	for i := 0; i < 3; i++ {
+		change(dst, "m", "bh") // three ahead: its ancestry spans pages of 2
+	}
+	change(dst, "m", "cf")
+	must(dst.c.Delete(ctx, "m", "ts", dst.head("m", "ts").ID))
+	must(dst.c.Purge(ctx, "m", "pg", dst.head("m", "pg").ID, false))
+	if mode == bundle.Snapshot {
+		must(dst.c.Purge(ctx, "m-upstream", "pu", dst.head("m-upstream", "pu").ID, false))
+	}
+	opt := bundle.ImportOptions{Mode: bundle.Atomic, DryRun: true}
+	if branch {
+		must(dst.c.CreateBranch(ctx, "m", client.BranchRequest{Name: "mb"}))
+		opt.NSMap = map[string]string{"m": "mb"}
+	}
+	return export(), dst, opt
+}
+
+// The heads listing classifies every document exactly as looking each one
+// up does, and plans the same batches with the same ids (§G.4.4):
+// created, fast-forwarded, present, behind, conflicting, tombstoned and
+// purged documents, upstream resources of snapshot documents, a branch's
+// read-through documents, and a sealed namespace's.
+func TestHeadsListing(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name           string
+		mode           string
+		sealed, branch bool
+	}{
+		{"history", bundle.Full, false, false},
+		{"snapshot", bundle.Snapshot, false, false},
+		{"branch", bundle.Full, false, true},
+		{"sealed", bundle.Full, true, false},
+		{"sealed snapshot", bundle.Snapshot, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			testHeadsListing(t, tc.mode, tc.sealed, tc.branch)
+		})
+	}
+}
+
+func testHeadsListing(t *testing.T, mode string, sealed, branch bool) {
+	b, dst, opt := headsScenario(t, mode, sealed, branch)
+	run := func(h *headsTransport) (*bundle.Report, []byte) {
+		rep, err := bundle.Import(ctx, dst.importer(h), bundle.BytesOpener(b), opt)
+		if err != nil {
+			t.Fatalf("import: %v", err)
+		}
+		if sealed && mode == bundle.Snapshot {
+			// The import's own patch sets carry fresh nonces in a sealed
+			// target (§E.2.5), so the ids it plans differ on every run.
+			for _, d := range rep.Docs {
+				d.Expected, d.Upstream.Head = nil, ""
+			}
+			for _, br := range rep.Batches {
+				delete(br.Source, "ids")
+			}
+		}
+		return rep, must(json.MarshalIndent(rep, "", " "))
+	}
+	looked, listed := &headsTransport{block: true}, &headsTransport{}
+	_, want := run(looked)
+	rep, got := run(listed)
+	if string(got) != string(want) {
+		t.Fatalf("listed:\n%s\nlooked up:\n%s", got, want)
+	}
+	if listed.pages.Load() == 0 || listed.lookups.Load() >= looked.lookups.Load() {
+		t.Fatalf("listed with %d pages and %d lookups, against %d lookups", listed.pages.Load(), listed.lookups.Load(), looked.lookups.Load())
+	}
+
+	classes := map[string]string{"c00": "create", "c29": "create", "ff": "fast-forward", "pr": "present", "bh": "behind",
+		"cf": "conflict", "ts": "behind", "pg": "purged"}
+	if mode == bundle.Snapshot {
+		// The target's own changes since the last import are kept.
+		classes["bh"], classes["ts"], classes["pu"] = "present", "present", "purged"
+	}
+	for name, class := range classes {
+		if d := rep.Doc("m/" + name); d == nil || d.Class != class {
+			t.Fatalf("%s: %+v, want %s", name, d, class)
+		}
+	}
+}
+
+// With authentication disabled, a target namespace that answers 404 doesn't
+// exist, and none of its resources do: a fresh import into it and its
+// upstream namespace looks nothing up.
+func TestHeadsListingAbsent(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("m", nil)
+	for i := 0; i < 12; i++ {
+		src.create("m", fmt.Sprintf("c%02d", i), map[string]any{"v": i})
+	}
+	b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"m"}, Mode: bundle.Snapshot})
+	dst := newDeployment(t, cmsOrigin)
+	h := &headsTransport{}
+	rep, err := bundle.Import(ctx, dst.importer(h), bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true})
+	noErr(t, err)
+	if h.lookups.Load() != 0 || h.pages.Load() != 0 {
+		t.Fatalf("%d lookups, %d pages", h.lookups.Load(), h.pages.Load())
+	}
+	for _, d := range rep.Docs {
+		if d.Class != "create" || d.Upstream.Class != "create" || dst.head("m", d.Doc[2:]).State != client.Live {
+			t.Fatalf("%+v", d)
+		}
+	}
+}
+
+// An e2e target (§E.3) lists its heads in the clear as any other: the
+// listing classifies its documents as lookups do.
+func TestHeadsListingE2E(t *testing.T) {
+	t.Parallel()
+	src := newEncDeployment(t, stagingOrigin)
+	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
+	k := seal.NewKey()
+	kr, err := seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{identity(t).PublicKey()})
+	noErr(t, err)
+	src.create("e", "keyring", kr.Value())
+	write := func(d *deployment, name string, patches []any) string {
+		parent := ""
+		if h := d.head("e", name); h.State == client.Live {
+			parent = h.ID
+		}
+		return e2eWrite(t, d, k, "e#1", "e", name, parent, patches)
+	}
+	for i := 0; i < 12; i++ {
+		write(src, fmt.Sprintf("d%02d", i), client.GenesisPatches(map[string]any{"v": i}))
+	}
+	export := func() []byte {
+		b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"e"}})
+		return b
+	}
+	dst := newEncDeployment(t, cmsOrigin)
+	importB(t, dst, export(), bundle.ImportOptions{})
+	write(src, "d00", ops(op("add", "/w", 1.0)))
+	write(dst, "d01", ops(op("add", "/w", 2.0)))
+	write(src, "d02", ops(op("add", "/w", 1.0)))
+	write(dst, "d02", ops(op("add", "/w", 2.0)))
+	write(src, "n00", client.GenesisPatches(map[string]any{"v": 0}))
+	b := export()
+
+	run := func(h *headsTransport) []byte {
+		rep, err := bundle.Import(ctx, dst.importer(h), bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic, DryRun: true})
+		noErr(t, err)
+		for name, class := range map[string]string{"d00": "fast-forward", "d01": "behind", "d02": "conflict", "d03": "present", "n00": "create"} {
+			if d := rep.Doc("e/" + name); d.Class != class {
+				t.Fatalf("%s: %+v, want %s", name, d, class)
+			}
+		}
+		return must(json.MarshalIndent(rep, "", " "))
+	}
+	looked, listed := &headsTransport{block: true}, &headsTransport{}
+	if want, got := run(looked), run(listed); string(got) != string(want) {
+		t.Fatalf("listed:\n%s\nlooked up:\n%s", got, want)
+	}
+	if listed.pages.Load() == 0 || listed.lookups.Load() >= looked.lookups.Load() {
+		t.Fatalf("listed with %d pages and %d lookups, against %d lookups", listed.pages.Load(), listed.lookups.Load(), looked.lookups.Load())
+	}
+}
+
+// A write that lands in the target after its heads were listed fails the
+// batch it races, which names the head it was classified against: 412 for
+// the items it wrote in the dry run, or for the batch, the target moved,
+// when it lands between the dry run and the submit. Nothing of the batch
+// is written.
+func TestHeadsListingRace(t *testing.T) {
+	t.Parallel()
+	for _, dry := range []bool{true, false} {
+		t.Run(fmt.Sprintf("dry=%v", dry), func(t *testing.T) {
+			t.Parallel()
+			b, dst, opt := headsScenario(t, bundle.Full, false, false)
+			opt.DryRun = false
+			opt.Resolutions = map[string]bundle.Resolution{"m/cf": bundle.ResolveSkip}
+			h := &headsTransport{dry: dry, race: func() {
+				bob := dst.c.With(client.WithAuthor("bob"))
+				must(bob.CreateDoc(ctx, "m", "c00", map[string]any{"v": "bob"}))
+				must(bob.Append(ctx, "m", "ff", dst.head("m", "ff").ID, ops(op("replace", "/v", "bob"))))
+			}}
+			rep, err := bundle.Import(ctx, dst.importer(h), bundle.BytesOpener(b), opt)
+			var ae *client.APIError
+			switch {
+			case dry && (err == nil || !strings.Contains(err.Error(), "c00: 412 stale") || !strings.Contains(err.Error(), "ff: 412 stale")):
+				t.Fatalf("write racing the dry run: %v", err)
+			case !dry && (!errors.As(err, &ae) || ae.Status != 412 || !strings.Contains(err.Error(), "the target moved")):
+				t.Fatalf("write racing the submit: %v", err)
+			}
+			if h.pages.Load() == 0 || rep.Doc("m/c00").Class != "create" {
+				t.Fatalf("not listed: %d pages, %+v", h.pages.Load(), rep.Doc("m/c00"))
+			}
+			if dst.head("m", "c01").State != client.NotFound {
+				t.Fatal("the batch was written")
+			}
+		})
+	}
+}

@@ -366,6 +366,11 @@ type importer struct {
 	sealedT map[string]bool // target ns is (or is created) sealed
 	bump    map[string]int  // new e2e target → the epoch to move it to
 
+	// Target heads (heads.go): the resources looked up per namespace, and
+	// the namespaces' listings (nil: looked up one by one).
+	want   map[string][]string
+	listed map[string]*listing
+
 	sent map[string]time.Time // "ns/name/bid" → when the blob was last uploaded or copied there
 	// noSource marks target namespaces whose batches' local source didn't
 	// make their blobs available (the importer can't read the source
@@ -407,7 +412,7 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 		opt.Now = time.Now
 	}
 	im := &importer{c: c, opt: opt, docs: map[string]*bdoc{}, up: map[string]*upPlan{},
-		points: map[string]map[string]point{}, schemas: map[string]any{}, nodes: map[string]*node{}}
+		points: map[string]map[string]point{}, schemas: map[string]any{}, nodes: map[string]*node{}, listed: map[string]*listing{}}
 	if err := im.load(open); err != nil {
 		return nil, err
 	}
@@ -575,7 +580,7 @@ func (im *importer) check(ctx context.Context) error {
 		if d.requires == "" {
 			continue
 		}
-		th, err := im.c.Head(ctx, d.tns, d.name)
+		th, err := im.head(ctx, d.tns, d.name)
 		if err != nil {
 			return err
 		}
@@ -882,7 +887,7 @@ func (im *importer) plan(ctx context.Context) error {
 
 func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 	r := d.rep
-	th, err := im.c.Head(ctx, d.tns, d.name)
+	th, err := im.head(ctx, d.tns, d.name)
 	if err != nil {
 		return nil, err
 	}
@@ -1224,7 +1229,7 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 	im.up[d.key] = u
 	ur := &UpstreamReport{Target: Key(u.ns, u.name)}
 	d.rep.Upstream = ur
-	uh, err := im.c.Head(ctx, u.ns, u.name)
+	uh, err := im.head(ctx, u.ns, u.name)
 	if err != nil {
 		return nil, err
 	}
@@ -1360,7 +1365,7 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 		r.Class = "purged"
 		return nil, nil
 	}
-	th, err := im.c.Head(ctx, d.tns, d.name)
+	th, err := im.head(ctx, d.tns, d.name)
 	if err != nil {
 		return nil, err
 	}
