@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.15.2
 
 **Performance**, follow-ups from the v0.15.1 review:
 - **Branch `/heads` pages** looked up the branch's base namespace once per name that reads
