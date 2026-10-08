@@ -15,6 +15,7 @@ import (
 // §G.4.1 blob lines: written, read back with recomputed ids, at most once
 // per resource, and tampering rejects the bundle.
 func TestBlobLines(t *testing.T) {
+	t.Parallel()
 	data := []byte("blob bytes \x00\xff")
 	bid := ids.Blob("image/png", "", data).String()
 	patches := client.GenesisPatches(map[string]any{"img": client.BlobRef(bid, "image/png", len(data), "")})

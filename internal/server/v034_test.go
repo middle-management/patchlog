@@ -35,6 +35,7 @@ func (e *tenv) branchEntry(ns, name string, bearer ...string) map[string]any {
 // every namespace, it isn't inherited (nor are merged and abandoned), and
 // the branch listing shows it.
 func TestV034DraftsMember(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("schemas", map[string]any{})
 	e.mkNS("matches", map[string]any{})
@@ -82,6 +83,7 @@ func TestV034DraftsMember(t *testing.T) {
 // §7.4: drafts is 422 in a remote branch (and its branches), where it could
 // have no effect.
 func TestV034DraftsRemote(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	a.mkNS("main", map[string]any{"read": "public"})
 	a.create("main", "x", map[string]any{"v": 1.0})
@@ -98,6 +100,7 @@ func TestV034DraftsRemote(t *testing.T) {
 // can't read it there falls through to drafts; the read in N is by the
 // rule for other namespaces too (§6.1 Read permission).
 func TestV034DraftsUnreadableN(t *testing.T) {
+	t.Parallel()
 	e := newAuthEnv(t)
 	kS, kM := newKey("ks"), newKey("km")
 	e.mkNS("schemas", map[string]any{"read": "grant", "keys": []any{kS.entry("*")}})
@@ -133,6 +136,7 @@ func TestV034DraftsUnreadableN(t *testing.T) {
 // §7.5, §7.8: a blob copy's source is read with the request's grant or any
 // in Source-Authorization, not only the header's.
 func TestV034BlobCopyEitherGrant(t *testing.T) {
+	t.Parallel()
 	e := newAuthEnv(t, withBlobTuning)
 	k := newKey("k")
 	kx := newKey("kx")
@@ -157,6 +161,7 @@ func TestV034BlobCopyEitherGrant(t *testing.T) {
 // branch; every entry it writes, propagated ones included, says forced:
 // true, which is part of the hashed entry.
 func TestV034ForcedPurge(t *testing.T) {
+	t.Parallel()
 	e := newAuthEnv(t)
 	kS, kM := newKey("ks"), newKey("km")
 	e.mkNS("schemas", map[string]any{"read": "grant", "keys": []any{kS.entry("*")}})
@@ -223,6 +228,7 @@ func TestV034ForcedPurge(t *testing.T) {
 // §8.5: a namespace purge refused as in_use is forced the same way, and its
 // purge-ns entry says forced: true.
 func TestV034ForcedNamespacePurge(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("schemas", map[string]any{})
 	e.mkNS("matches", map[string]any{})
@@ -245,6 +251,7 @@ func TestV034ForcedNamespacePurge(t *testing.T) {
 // uploader's pending total is ordered by a row of its own, so concurrent
 // uploads by one uploader can't together exceed blobPending.
 func TestV034ConcurrentUploadsPending(t *testing.T) {
+	t.Parallel()
 	bothDBs(t, func(t *testing.T, opts ...envOpt) {
 		e := newEnv(t, append(opts, withBlobTuning)...)
 		e.mkNS("c", map[string]any{"limits": map[string]any{"blobSize": 5000, "blobPending": 10000}})

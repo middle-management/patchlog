@@ -10,6 +10,7 @@ import (
 // with authentication disabled ("grant": null) from one the server wrote
 // itself (no "grant").
 func TestGrantTitleWithNode(t *testing.T) {
+	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")

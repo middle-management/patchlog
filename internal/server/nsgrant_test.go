@@ -88,6 +88,7 @@ func checkEntries(t *testing.T, ns string, lg []any, want [][3]string) {
 // itself, such as a purge propagated to a branch (§8.3), keep the purger as
 // author but carry no grant.
 func TestNSLogGrant(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil, withoutRetentionLoop)
 	e := f.tenv
 	admin, issuer := grantRef(t, f.adminG), grantRef(t, f.issuerG)
@@ -145,6 +146,7 @@ func TestNSLogGrant(t *testing.T) {
 // §7.4: a sealed namespace's log ranges (§E.2.2) carry the grant
 // references in the sealed plaintext, as any log does.
 func TestNSLogGrantSealed(t *testing.T) {
+	t.Parallel()
 	e := newSealedAuthEnv(t)
 	k := newKey("k")
 	e.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{k.entry("*")}}))
@@ -175,6 +177,7 @@ func TestNSLogGrantSealed(t *testing.T) {
 // record "grant": null; the server's own entries, such as a purge it
 // propagates to a branch, record none at all.
 func TestNSLogGrantDev(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{})
 	a := e.create("main", "a", map[string]any{}, "ann")
@@ -214,6 +217,7 @@ func withOperator(priv ed25519.PrivateKey) envOpt {
 // root kid. Opening it adds ns_log.grant_id and gives head, tombstone and
 // batch entries the grant their revisions store; other entries serve none.
 func TestNSLogGrantMigration(t *testing.T) {
+	t.Parallel()
 	path, driver := filepath.Join(t.TempDir(), "old.db"), "sqlite"
 	if pgtest.Enabled() {
 		path, driver = pgtest.NewDB(t), "pgx"
@@ -284,6 +288,7 @@ func TestNSLogGrantMigration(t *testing.T) {
 // development mode keeps serving the grant references it recorded; the
 // entries written in development mode record "grant": null.
 func TestNSLogGrantRecordedBeforeDev(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "dev.db")
 	if pgtest.Enabled() {
 		path = pgtest.NewDB(t)

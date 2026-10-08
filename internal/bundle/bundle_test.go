@@ -46,7 +46,9 @@ func editHeader(t *testing.T, b []byte, fn func(h map[string]any)) []byte {
 	return join(ls)
 }
 
-func TestHistoryRoundTrip(t *testing.T) {
+func TestHistoryRoundTrip(t *testing.T) { t.Parallel(); testHistoryRoundTrip(t) }
+
+func testHistoryRoundTrip(t *testing.T) {
 	f := newFixture(t)
 	b, _, sum := f.export(t, bundle.ExportOptions{Select: []string{"matches/derby"}})
 	want := []string{"matches/cup", "matches/derby", "matches/layout", "media/photo", "schemas/common", "schemas/match"}
@@ -124,6 +126,7 @@ func TestHistoryRoundTrip(t *testing.T) {
 }
 
 func TestVerifyCatchesTampering(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	b, _, sum := f.export(t, bundle.ExportOptions{Select: []string{"matches/derby"}})
 
@@ -209,6 +212,7 @@ func TestVerifyCatchesTampering(t *testing.T) {
 }
 
 func TestWriterRefusesBadBundles(t *testing.T) {
+	t.Parallel()
 	var buf bytes.Buffer
 	h := bundle.Header{Origin: stagingOrigin, Created: "2026-09-25T10:00:00Z", At: map[string]string{"n": ids.Of([]byte("x")).String()},
 		Docs: map[string]bundle.DocInfo{"n/a": {History: bundle.Snapshot, Head: ids.Of([]byte("a")).String()}}}
@@ -229,6 +233,7 @@ func TestWriterRefusesBadBundles(t *testing.T) {
 }
 
 func TestClosure(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	p := must(bundle.PlanExport(ctx, f.src.c, bundle.ExportOptions{Select: []string{"matches/derby"}, Mode: bundle.Snapshot}))
 	modes := map[string]string{}
@@ -305,6 +310,7 @@ func TestClosure(t *testing.T) {
 }
 
 func TestSnapshotImportThroughUpstream(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	// A pinned string the schema doesn't declare.
 	f.src.append("matches", "derby", op("add", "/note", rev("matches", "layout", f.layout)))
@@ -398,7 +404,9 @@ func TestSnapshotImportThroughUpstream(t *testing.T) {
 	}
 }
 
-func TestFullImportOntoMovedTarget(t *testing.T) {
+func TestFullImportOntoMovedTarget(t *testing.T) { t.Parallel(); testFullImportOntoMovedTarget(t) }
+
+func testFullImportOntoMovedTarget(t *testing.T) {
 	f := newFixture(t)
 	b, _, _ := f.export(t, bundle.ExportOptions{Select: []string{"matches/derby"}})
 	dst := newDeployment(t, cmsOrigin)
@@ -461,6 +469,7 @@ func bulkTarget(t *testing.T) *deployment {
 }
 
 func TestAtomicAndBackfill(t *testing.T) {
+	t.Parallel()
 	b := bulkSource(t)
 	longHead := ""
 	for _, l := range lines(b)[1:] {
@@ -539,6 +548,7 @@ func TestAtomicAndBackfill(t *testing.T) {
 }
 
 func TestCLI(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	dir := t.TempDir()
 	path := filepath.Join(dir, "release.jsonl")
@@ -599,6 +609,7 @@ func TestCLI(t *testing.T) {
 }
 
 func TestSnapshotDeletion(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	dst := newDeployment(t, cmsOrigin)
 	b, _, _ := f.export(t, bundle.ExportOptions{Select: []string{"matches/cup"}, Mode: bundle.Snapshot})
@@ -652,7 +663,9 @@ func sameHeads(t *testing.T, a *deployment, ans string, b *deployment, bns strin
 	}
 }
 
-func TestBranchExport(t *testing.T) {
+func TestBranchExport(t *testing.T) { t.Parallel(); testBranchExport(t) }
+
+func testBranchExport(t *testing.T) {
 	src, base := branchSource(t)
 	baseBundle, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"matches"}})
 

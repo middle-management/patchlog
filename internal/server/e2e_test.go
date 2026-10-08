@@ -188,6 +188,7 @@ func mustEqual(t *testing.T, got, want any) {
 }
 
 func TestE2EGateAndReads(t *testing.T) {
+	t.Parallel()
 	f := newE2E(t)
 	e := f.tenv
 	adminPub := newRecipient(t)
@@ -348,6 +349,7 @@ func newRecipient(t *testing.T) *ecdh.PublicKey {
 }
 
 func TestE2EPruneRetention(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	f := newE2E(t, withArchive(t, dir))
 	e := f.tenv
@@ -408,6 +410,7 @@ func TestE2EPruneRetention(t *testing.T) {
 }
 
 func TestE2EEpochsBranchesLevels(t *testing.T) {
+	t.Parallel()
 	f := newE2E(t)
 	e := f.tenv
 	adminPriv := func() *ecdh.PrivateKey { _, p, _ := seal.GenerateRecipient(); return p }()

@@ -21,6 +21,7 @@ import (
 // { config, ns_id }. A retry by the same principal answers 200 with the
 // same, also when the config change was written by a batch.
 func TestV037NamespacePatchResponse(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	check := func(r *resp, ns string, status int) (cfg, nsID string) {
 		t.Helper()
@@ -71,6 +72,7 @@ func TestV037NamespacePatchResponse(t *testing.T) {
 // §6.2 step 2, §7.2: the idempotent-retry lookup doesn't apply to a purged
 // resource, whose answer is 410, for single writes and batches alike.
 func TestV037RetryOnPurged(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("m", map[string]any{})
 	create := addRoot(map[string]any{"v": 1.0})
@@ -136,6 +138,7 @@ func TestV037RetryOnPurged(t *testing.T) {
 // blobs uploaded after the delete; a grant that may only restore may
 // upload them.
 func TestV037BlobBeforeRestore(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil, withBlobTuning)
 	e := f.tenv
 	h := e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
@@ -166,6 +169,7 @@ func TestV037BlobBeforeRestore(t *testing.T) {
 // holding a * key, so config guards and forced purges are open, and every
 // entry written on a request records "grant": null (v0.38).
 func TestV037DevConformance(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withoutRetentionLoop)
 	e.mkNS("schemas", map[string]any{})
 	e.mkNS("docs", map[string]any{"retention": []any{map[string]any{"keep": map[string]any{"revisions": 1.0}}}})
@@ -212,6 +216,7 @@ func TestV037DevConformance(t *testing.T) {
 // doesn't define: it never refuses for an unknown member, or for the spec
 // version A publishes alone, later, malformed or absent.
 func TestV037RemoteSpecVersion(t *testing.T) {
+	t.Parallel()
 	a, b, rt := pair(t, nil, nil)
 	f := populateA(t, a)
 	ours := []byte(`"spec":"` + core.SpecVersion + `"`)
@@ -277,6 +282,7 @@ func tamperPaths(t *testing.T, a *tenv, rewrite func(path string, body []byte) [
 // mirrors (v0.38). At the source,
 // registration entries record the registrant's grant.
 func TestV037RemoteGrants(t *testing.T) {
+	t.Parallel()
 	var bPriv ed25519.PrivateKey
 	a, b, _ := pair(t, nil, []envOpt{withAuth(&bPriv)})
 	b.opPriv = bPriv

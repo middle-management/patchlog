@@ -133,6 +133,7 @@ func writeHistory(t *testing.T, ns, name string, build func(w *bundle.Writer) id
 }
 
 func TestVerifySignatureStatuses(t *testing.T) {
+	t.Parallel()
 	nsKey := clienttest.NewKey("ns-key")
 	bot := signerKey(t, "bot-1", 1)
 	other := signerKey(t, "bot-2", 2) // never listed
@@ -240,6 +241,7 @@ func TestVerifySignatureStatuses(t *testing.T) {
 }
 
 func TestGrantLineOrderingAndShape(t *testing.T) {
+	t.Parallel()
 	nsKey := clienttest.NewKey("ns-key")
 	bot := signerKey(t, "bot-1", 1)
 	g := mint(t, nsKey.Priv, nsKey.Kid, "alice", bot)
@@ -424,6 +426,7 @@ func jwk(k clienttest.Key, from, until string) map[string]any {
 }
 
 func TestExportGrantLinesAndSourceVerification(t *testing.T) {
+	t.Parallel()
 	nsKey := clienttest.NewKey("ns-key")
 	opKey := clienttest.NewKey("operator-2026")
 	botA := signerKey(t, "bot-a", 1)
@@ -558,6 +561,7 @@ func TestExportGrantLinesAndSourceVerification(t *testing.T) {
 // was never in the namespace document or the operator history is failed
 // against the source, though its chain is complete offline.
 func TestSourceKeyCheckerRejectsKeyNotInForce(t *testing.T) {
+	t.Parallel()
 	nsKey := clienttest.NewKey("ns-key")
 	rogue := clienttest.NewKey("rogue")
 	bot := signerKey(t, "bot-1", 1)
@@ -680,6 +684,7 @@ func checkBatch(t *testing.T, req map[string]any, origin string, signer sig.Sign
 }
 
 func TestImportSignsItsOwnStepsNotTheOriginals(t *testing.T) {
+	t.Parallel()
 	// A source whose revisions carry signatures, exported with authors.
 	src := newDeployment(t, stagingOrigin)
 	src.ns("matches", nil)

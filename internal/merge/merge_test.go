@@ -142,7 +142,9 @@ func hasConflict(r *merge.Resource, kind string) bool {
 	return false
 }
 
-func TestFastForwardReproducesIDs(t *testing.T) {
+func TestFastForwardReproducesIDs(t *testing.T) { t.Parallel(); testFastForwardReproducesIDs(t) }
+
+func testFastForwardReproducesIDs(t *testing.T) {
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -197,6 +199,7 @@ func TestFastForwardReproducesIDs(t *testing.T) {
 }
 
 func TestBaseAheadIsNothing(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -213,6 +216,7 @@ func TestBaseAheadIsNothing(t *testing.T) {
 }
 
 func TestReplayWithoutOverlap(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	h := e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -237,6 +241,7 @@ func TestReplayWithoutOverlap(t *testing.T) {
 }
 
 func TestOverlapAndArrayRule(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -286,6 +291,7 @@ func TestOverlapAndArrayRule(t *testing.T) {
 }
 
 func TestDeleteChangeNeedsPerson(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.del("r7", "derby")
@@ -315,6 +321,7 @@ func TestDeleteChangeNeedsPerson(t *testing.T) {
 }
 
 func TestBaseMovesBetweenPlanAndApply(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -347,6 +354,11 @@ func TestBaseMovesBetweenPlanAndApply(t *testing.T) {
 }
 
 func TestSecondMergePicksUpNewChanges(t *testing.T) {
+	t.Parallel()
+	testSecondMergePicksUpNewChanges(t)
+}
+
+func testSecondMergePicksUpNewChanges(t *testing.T) {
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -381,6 +393,7 @@ func TestSecondMergePicksUpNewChanges(t *testing.T) {
 // same deployment says "grants", they count for no one, and a second merge
 // after a replay replays again.
 func TestMergePointsDevModeIsTheDeployments(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "cup", op("replace", "/score", "2-1"))
@@ -407,6 +420,7 @@ func TestMergePointsDevModeIsTheDeployments(t *testing.T) {
 }
 
 func TestStackedRetargetAfterFastForward(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -431,7 +445,9 @@ func TestStackedRetargetAfterFastForward(t *testing.T) {
 	}
 }
 
-func TestRebaseAndSwitch(t *testing.T) {
+func TestRebaseAndSwitch(t *testing.T) { t.Parallel(); testRebaseAndSwitch(t) }
+
+func testRebaseAndSwitch(t *testing.T) {
 	e := newEnv(t)
 	must(e.c.CreateBranch(ctx, "matches", client.BranchRequest{Name: "r7", Patches: ops(op("add", "/cleanup", map[string]any{"merged": "P7D"}))}))
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -481,6 +497,7 @@ func TestRebaseAndSwitch(t *testing.T) {
 }
 
 func TestRebaseCatchUpAfterResume(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "cup", op("replace", "/score", "2-1"))
@@ -500,6 +517,7 @@ func TestRebaseCatchUpAfterResume(t *testing.T) {
 }
 
 func TestSquash(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -529,6 +547,7 @@ func TestSquash(t *testing.T) {
 }
 
 func TestExplicitConfig(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -542,7 +561,9 @@ func TestExplicitConfig(t *testing.T) {
 	}
 }
 
-func TestPurges(t *testing.T) {
+func TestPurges(t *testing.T) { t.Parallel(); testPurges(t) }
+
+func testPurges(t *testing.T) {
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))

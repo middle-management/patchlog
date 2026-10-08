@@ -11,6 +11,7 @@ import (
 // D.4: large heads aren't cached as head snapshots; intermediate snapshots
 // bound every fold, and never make pruned revisions readable (§8.6).
 func TestSnapshots(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, func(o *core.Options) {
 		o.HeadSnapshotMax = 64
 		o.SnapshotEveryRevisions = 3

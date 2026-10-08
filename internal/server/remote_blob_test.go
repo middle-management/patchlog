@@ -20,6 +20,7 @@ import (
 // to the branch's writes, kept when the base becomes unreachable, and
 // purged with the base's purges.
 func TestRemoteBranchBlobs(t *testing.T) {
+	t.Parallel()
 	a, b, rt := pair(t, []envOpt{withBlobTuning}, []envOpt{withBlobTuning})
 	a.mkNS("main", map[string]any{"read": "public"})
 	d1 := []byte("first image")
@@ -72,6 +73,7 @@ func TestRemoteBranchBlobs(t *testing.T) {
 // §G.3: a remote branch of a branch mirrors blobs read through from the
 // branch's base, at every level.
 func TestRemoteBranchBlobsChain(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, []envOpt{withBlobTuning}, []envOpt{withBlobTuning})
 	a.mkNS("base", map[string]any{"read": "public"})
 	d := []byte("base blob")
@@ -101,6 +103,7 @@ func TestRemoteBranchBlobsChain(t *testing.T) {
 // encrypted at rest and serves it sealed under its own keys, also once the
 // base is unreachable.
 func TestRemoteBranchSealedBlobs(t *testing.T) {
+	t.Parallel()
 	var aPriv ed25519.PrivateKey
 	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
 	a.opPriv = aPriv
@@ -159,6 +162,7 @@ func TestRemoteBranchSealedBlobs(t *testing.T) {
 // writers' ciphertext verbatim, verified against the ids; they are served
 // as uploaded and available to the branch's sealed writes.
 func TestRemoteBranchE2EBlobs(t *testing.T) {
+	t.Parallel()
 	var aPriv ed25519.PrivateKey
 	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning, withBlobTuning)
 	a.opPriv = aPriv

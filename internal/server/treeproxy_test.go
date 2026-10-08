@@ -42,6 +42,7 @@ func fakeTree(t *testing.T) (*httptest.Server, *[]string) {
 }
 
 func TestTreeProxy(t *testing.T) {
+	t.Parallel()
 	tree, seen := fakeTree(t)
 	h, err := NewTreeProxy(tree.URL + "/tree/")
 	if err != nil {
@@ -123,6 +124,7 @@ func TestTreeProxy(t *testing.T) {
 }
 
 func TestTreeProxyUnreachable(t *testing.T) {
+	t.Parallel()
 	tree := httptest.NewServer(http.NotFoundHandler())
 	url := tree.URL
 	tree.Close()
@@ -138,6 +140,7 @@ func TestTreeProxyUnreachable(t *testing.T) {
 }
 
 func TestTreeProxyBadURL(t *testing.T) {
+	t.Parallel()
 	for _, u := range []string{"", "tree:8082", "ftp://tree", "http://", "http://tree?x=1", "cat=ftp://tree", "cat=", "Cat=http://tree"} {
 		if _, err := NewTreeProxy(u); err == nil {
 			t.Errorf("%q accepted", u)
@@ -153,6 +156,7 @@ func TestTreeProxyBadURL(t *testing.T) {
 // Several tree services: catalogs mapped with CATALOG=URL go to their own,
 // everything else to the plain URL.
 func TestTreeProxyMapping(t *testing.T) {
+	t.Parallel()
 	echo := func(name string) *httptest.Server {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if strings.HasSuffix(r.URL.Path, "/"+name+"/roots") {

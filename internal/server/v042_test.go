@@ -15,6 +15,7 @@ import (
 // retry lookup and after the verb is settled, so a retry is answered as
 // first recorded and authorisation failures come first.
 func TestV042SignatureOrder(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	k1 := sigKey("k1", 1)
@@ -101,6 +102,7 @@ func TestV042SignatureOrder(t *testing.T) {
 // §6.2 (v0.42): rate limits are step 1, so a 429 comes before a 422
 // signature.
 func TestV042RateBeforeSignature(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("rl", map[string]any{"signatures": "required", "limits": map[string]any{
 		"ratePerResource": map[string]any{"rate": 0.001, "burst": 1.0},
@@ -113,6 +115,7 @@ func TestV042RateBeforeSignature(t *testing.T) {
 // §7 (v0.42): an endpoint accepts only the query parameters the spec
 // defines for it, and flags only the value 1.
 func TestV042QueryParams(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("q", map[string]any{"read": "public"})
 	a0 := e.create("q", "a", map[string]any{"n": 1.0})
@@ -170,6 +173,7 @@ func TestV042QueryParams(t *testing.T) {
 // §C.3.1, §E.2.2, §8.5 (v0.42): grants are served sealed in sealed
 // namespaces, privately in end-to-end ones, and 410 after a purge.
 func TestV042Grants(t *testing.T) {
+	t.Parallel()
 	// Sealed: a JWE with pl { ns, grant }, stored once.
 	s := newSealedAuthEnv(t)
 	k := newKey("k")
@@ -221,6 +225,7 @@ func TestV042Grants(t *testing.T) {
 // §C.4 (v0.42): a key past its until authorises nothing, judged against
 // the current time.
 func TestV042OperatorKeyUntil(t *testing.T) {
+	t.Parallel()
 	var opPriv ed25519.PrivateKey
 	until := t0.Add(time.Hour)
 	e := newEnv(t, withAuth(&opPriv), func(o *core.Options) {
@@ -244,6 +249,7 @@ func TestV042OperatorKeyUntil(t *testing.T) {
 // lies ahead is refused until then, as verifiers would refuse it for
 // revisions created before it.
 func TestV043OperatorKeyFrom(t *testing.T) {
+	t.Parallel()
 	var opPriv ed25519.PrivateKey
 	from := t0.Add(time.Hour)
 	e := newEnv(t, withAuth(&opPriv), func(o *core.Options) {

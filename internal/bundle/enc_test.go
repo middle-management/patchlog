@@ -95,6 +95,7 @@ func fixedNow() time.Time { return time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 // A sealed bundle round-trips for each recipient, keeps the plain bundle's
 // digest, and opens for nobody else.
 func TestSealedBundleRoundTrip(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	plain, _, psum := f.export(t, bundle.ExportOptions{Select: []string{"matches/derby"}, Now: fixedNow})
 	alice, bob, eve := identity(t), identity(t), identity(t)
@@ -185,6 +186,7 @@ func sealLine(t *testing.T, key []byte, hdr map[string]any, pt []byte) []byte {
 
 // Every check of §G.5.1.1 rejects the whole sealed bundle.
 func TestSealedBundleRejects(t *testing.T) {
+	t.Parallel()
 	f := newFixture(t)
 	id := identity(t)
 	b, _, _ := f.export(t, bundle.ExportOptions{Select: []string{"media/photo"}, Recipients: []*ecdh.PublicKey{id.PublicKey()}})
@@ -265,6 +267,7 @@ func TestSealedBundleRejects(t *testing.T) {
 // written unsealed unless asked; the importer refuses less protected
 // targets unless overridden, and creates missing ones as protected.
 func TestBundleAccess(t *testing.T) {
+	t.Parallel()
 	src := newDeployment(t, stagingOrigin)
 	src.ns("pub", nil)
 	src.ns("priv", map[string]any{"read": "grant"})
@@ -315,6 +318,7 @@ func TestBundleAccess(t *testing.T) {
 // and the import lands in a sealed target, ids unchanged; snapshots too,
 // with a fresh $nonce in the patch sets the importer makes.
 func TestBundleSealedNamespace(t *testing.T) {
+	t.Parallel()
 	src := newEncDeployment(t, stagingOrigin)
 	src.ns("s", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
 	a1 := must(src.c.Create(ctx, "s", "a", append(client.GenesisPatches(map[string]any{"v": marker}), op("add", "/$nonce", seal.NewNonce())))).ID
@@ -382,7 +386,9 @@ func e2eWrite(t *testing.T, d *deployment, key []byte, kid, ns, name, parent str
 // E3: full history carries the ciphertext and the keyring verbatim, ids
 // verify over it, and it imports only into an e2e namespace of the same
 // name, created with the bundle's epochs.
-func TestBundleE2E(t *testing.T) {
+func TestBundleE2E(t *testing.T) { t.Parallel(); testBundleE2E(t) }
+
+func testBundleE2E(t *testing.T) {
 	src := newEncDeployment(t, stagingOrigin)
 	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
 	reader := identity(t)
@@ -465,6 +471,7 @@ func TestBundleE2E(t *testing.T) {
 
 // Key files: a private JWK round-trips and stands for its public key.
 func TestIdentityFiles(t *testing.T) {
+	t.Parallel()
 	id := identity(t)
 	b := jsonv.Canonical(bundle.IdentityJWK(id))
 	got, err := bundle.ParseIdentity(b)
@@ -492,6 +499,7 @@ func TestIdentityFiles(t *testing.T) {
 // The CLI: keygen, export to a recipient, verify and import with the
 // identity; plaintext of private content only with -plaintext.
 func TestSealedBundleCLI(t *testing.T) {
+	t.Parallel()
 	src := newDeployment(t, stagingOrigin)
 	src.ns("priv", map[string]any{"read": "grant"})
 	src.create("priv", "a", map[string]any{"v": marker})

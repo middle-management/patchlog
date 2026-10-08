@@ -80,6 +80,7 @@ func grantIDOf(t *testing.T, token string) string {
 // §C.3.1 (v0.41): a signature whose kid the grant lists is verified at
 // the gate; others are stored unverified; logs serve grant and signature.
 func TestV041Signatures(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	k1, other := sigKey("k1", 1), sigKey("other", 2)
@@ -186,6 +187,7 @@ func TestV041Signatures(t *testing.T) {
 
 // §C.3.1 (v0.41): "signatures": "required".
 func TestV041RequiredSignatures(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	k1 := sigKey("k1", 1)
@@ -259,6 +261,7 @@ func TestV041RequiredSignatures(t *testing.T) {
 
 // §C.3.1 (v0.41): GET /ns/{ns}/grants/{gid}.
 func TestV041Grants(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	g := e.grant(f.issuer, "user:alice", []string{"sec", "sec-b"}, []string{"read", "create", "append"})
@@ -316,6 +319,7 @@ func (f *authFixture) svcGrant(e *tenv) string {
 
 // §C.4 (v0.41): the operator key history as a JWK Set at jwks_uri.
 func TestV041OperatorKeys(t *testing.T) {
+	t.Parallel()
 	retired := sigKey("old", 7)
 	var opPriv ed25519.PrivateKey
 	from := time.Date(2025, 1, 1, 0, 0, 0, 0, time.UTC)

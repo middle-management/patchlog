@@ -43,6 +43,7 @@ func warned(res *schemaimport.Result, sub string) bool {
 const declared = `{"type":"string"}`
 
 func TestDeclareSchema(t *testing.T) {
+	t.Parallel()
 	type tc struct {
 		name    string
 		src     string
@@ -108,6 +109,7 @@ func TestDeclareSchema(t *testing.T) {
 // A closed schema used both at the root and below it is patched, and the
 // side effect is reported.
 func TestDeclareSchemaShared(t *testing.T) {
+	t.Parallel()
 	res := planFiles(t, map[string]string{"x.json": `{
 	  "$ref": "#/$defs/C",
 	  "properties": { "child": { "$ref": "#/$defs/C" } },
@@ -130,6 +132,7 @@ func TestDeclareSchemaShared(t *testing.T) {
 // $ref from another resource's root is patched in its own resource, before
 // the ids the references pin are computed.
 func TestDeclareSchemaCrossResource(t *testing.T) {
+	t.Parallel()
 	files := map[string]string{
 		"root.json":   `{"$ref":"closed.json","properties":{"extra":{"type":"integer"}}}`,
 		"closed.json": `{"properties":{"a":{}},"$ref":"deeper.json#/$defs/D","additionalProperties":false}`,
@@ -182,6 +185,7 @@ func TestDeclareSchemaCrossResource(t *testing.T) {
 }
 
 func TestSourceKept(t *testing.T) {
+	t.Parallel()
 	res := planFiles(t, map[string]string{
 		"blueprints/door.json": `{"$id":"https://doors.example/blueprints/door","type":"object"}`,
 		"plain.json":           `{"$id":"file:///upload/plain.json","type":"object"}`,
@@ -215,6 +219,7 @@ func TestSourceKept(t *testing.T) {
 // since validation leaves out $schema and a fresh $nonce (§6.2 step 5, spec
 // v0.36); an invalid one still fails; re-running is a no-op.
 func TestImportClosedBlueprintEndToEnd(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("importer"))

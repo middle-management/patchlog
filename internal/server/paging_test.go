@@ -81,6 +81,7 @@ func entryIDs(es []map[string]any) []string {
 // prefixes of their range, cache as immutable, and the long-poll pages the
 // same way (§7.7) without X-Log-Next.
 func TestLogPaging(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withLogPageSize(2))
 	e.mkNS("docs", map[string]any{"read": "public"})
 	revs := e.chain("docs", "a", 5)
@@ -191,6 +192,7 @@ func anyOf(es []map[string]any) []any {
 // page can't pass for a range that was cut short (§7.1, §8.6); ranges from
 // the horizon page as usual.
 func TestLogPagingPruned(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withLogPageSize(2))
 	e.mkNS("main", map[string]any{"read": "public"})
 	revs := e.chain("main", "a", 7)
@@ -219,6 +221,7 @@ func TestLogPagingPruned(t *testing.T) {
 // same bytes as the long-poll page from that since; a resource page is
 // its entries' JWEs, which chain to X-Log-Next.
 func TestSealedLogPaging(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t, withLogPageSize(2))
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	var ids []string
@@ -311,11 +314,15 @@ func TestSealedLogPaging(t *testing.T) {
 // including those a branch reads through, on SQLite and Postgres alike
 // (§7.4): '-' < '.' < digits < '_' < letters, which a collation that
 // ignores punctuation (en_US) would sort otherwise.
-func TestHeadsByteOrder(t *testing.T) { testHeadsByteOrder(t) }
+func TestHeadsByteOrder(t *testing.T) {
+	t.Parallel()
+	testHeadsByteOrder(t)
+}
 
 // The same on a Postgres database whose default collation isn't byte order
 // (ICU "en"): the order never comes from the database's collation.
 func TestHeadsByteOrderCollated(t *testing.T) {
+	t.Parallel()
 	if !pgtest.Enabled() {
 		t.Skip("Postgres only (" + pgtest.Env + ")")
 	}
@@ -408,6 +415,7 @@ func testHeadsByteOrder(t *testing.T, opts ...envOpt) {
 // through paged ranges: logs longer than the base's page size on both
 // sides.
 func TestRemoteBranchPaged(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, []envOpt{withLogPageSize(2)}, []envOpt{withLogPageSize(3)})
 	f := populateA(t, a)
 	// More history than one page for derby's chain.
@@ -451,6 +459,7 @@ func TestRemoteBranchPaged(t *testing.T) {
 // each fork, from any since (in a base's segment, at a fork, in the
 // branch's own), and are the whole range cut into pages (§7.1 Paging).
 func TestLogPagingBranch(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withLogPageSize(2))
 	e.mkNS("main", map[string]any{"read": "public"})
 	revs := e.chain("main", "a", 3)
@@ -510,6 +519,7 @@ func TestLogPagingBranch(t *testing.T) {
 // since is the horizon when the resource was pruned at the previous page's
 // last entry between the two reads; that page is no different.
 func TestE2ELogPageFromSnapshot(t *testing.T) {
+	t.Parallel()
 	f := newE2E(t, withArchive(t, t.TempDir()), withLogPageSize(2))
 	e := f.tenv
 	k := seal.NewKey()
@@ -581,6 +591,7 @@ func anyMaps(xs []any) []map[string]any {
 // there, however many lie between two that do: a page is filled from
 // chunks of names, not from one (§7.4).
 func TestHeadsSkipsNamesAbsentAtAt(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withLogPageSize(2))
 	e.mkNS("main", map[string]any{"read": "public"})
 	for _, n := range []string{"a", "m", "z"} {

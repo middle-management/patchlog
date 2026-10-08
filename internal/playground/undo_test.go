@@ -93,6 +93,7 @@ FUNCTIONS
 // sealed namespaces, and rebuilds the author's stack. app.js's functions
 // run under node against a server with a log page size of 3.
 func TestUndoWithNode(t *testing.T) {
+	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")
@@ -313,6 +314,7 @@ func TestUndoWithNode(t *testing.T) {
 // undo by someone else is shown, not counted; an Undoes naming a missing
 // gesture is ignored; redo chains are followed; batch steps count.
 func TestUndoStackWithNode(t *testing.T) {
+	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")

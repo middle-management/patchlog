@@ -33,6 +33,7 @@ func entryOf(t *testing.T, c *client.Client, ns, id string) client.NSEntry {
 // the merge service and the merge key. merged.at is the target's ns_id
 // after the last batch into it.
 func TestReleaseCatalogSubmitters(t *testing.T) {
+	t.Parallel()
 	w := newRelWorld(t)
 	w.startCatalog()
 	w.release7()
@@ -73,6 +74,7 @@ func TestReleaseCatalogSubmitters(t *testing.T) {
 // another digest, or if the person reviewed another one; applying stops
 // for a new approval if a step differs from the approved plan.
 func TestReleaseDigest(t *testing.T) {
+	t.Parallel()
 	w := newRelWorld(t)
 	w.startCatalog()
 	w.release7()
@@ -124,6 +126,7 @@ func TestReleaseDigest(t *testing.T) {
 // §F.9: a placement in the catalog base that names an item step 3
 // creates is fine if step 2 removes it.
 func TestReleasePlacedItemRemovedInStep2(t *testing.T) {
+	t.Parallel()
 	w := newRelWorld(t)
 	w.startCatalog()
 	must(w.ops.CreateDoc(ctx, "cat-season", "matches.newbie", map[string]any{"parents": parentsOf("season")}))
@@ -158,6 +161,7 @@ func TestReleasePlacedItemRemovedInStep2(t *testing.T) {
 // administrator, and the janitor cleans them up (§F.6); an editor's
 // abandoning isn't accepted.
 func TestReleaseAbandon(t *testing.T) {
+	t.Parallel()
 	w := newRelWorld(t)
 	w.startCatalog()
 	w.release7()

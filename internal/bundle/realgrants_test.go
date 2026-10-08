@@ -16,6 +16,7 @@ import (
 // fetched sealed and opened by the exporter (§C.3.1, §G.4.1), and the
 // signatures verify against the source.
 func TestRealServerGrantExport(t *testing.T) {
+	t.Parallel()
 	ks, err := keystore.New(keystore.Generate())
 	if err != nil {
 		t.Fatal(err)

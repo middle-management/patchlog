@@ -17,6 +17,7 @@ import (
 // has keys: namespace logs, long-polls, events and documents decrypt
 // transparently.
 func TestFollowSealed(t *testing.T) {
+	t.Parallel()
 	for _, mode := range []string{"long-poll", "sse"} {
 		t.Run(mode, func(t *testing.T) {
 			ctx := context.Background()

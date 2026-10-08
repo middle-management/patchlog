@@ -9,6 +9,7 @@ import (
 // §7: a namespace that doesn't exist answers like an existing one whose
 // read isn't public; with a grant, ns is checked before any key lookup.
 func TestAuthUnknownNamespace(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	create := func(ns string, who ...string) *resp {
@@ -51,6 +52,7 @@ func TestAuthUnknownNamespace(t *testing.T) {
 // §C.4: "*" in ns names every namespace, and only operator grants may use
 // it. From a namespace key it is refused (403).
 func TestAuthStarNS(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{}, f.issuerG)
@@ -71,6 +73,7 @@ func TestAuthStarNS(t *testing.T) {
 // Public namespaces ignore a grant that doesn't name them, like an
 // unusable one, and answer as to an unauthenticated request.
 func TestAuthPublicIgnoresUnnamedGrant(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	e.mkNS("pub", map[string]any{"read": "public", "keys": []any{f.admin.entry("*")}})
@@ -88,6 +91,7 @@ func TestAuthPublicIgnoresUnnamedGrant(t *testing.T) {
 // issued, max(nbf, exp − maxTtl); maxLag defaults to 60 seconds, and a key
 // may set a stricter one.
 func TestAuthMaxLagAtIssuance(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil) // no maxLag: the default 60 s
 	e := f.tenv
 	cat := newKey("cat")

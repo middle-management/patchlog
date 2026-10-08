@@ -119,6 +119,7 @@ func (e *tenv) plainNSLog(ns, head string) *core.Log {
 // an equivalent unsealed namespace serves, and is stored once: the same
 // bytes on every read, across cache flushes.
 func TestSealedOutputs(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t, withLongPoll(200*time.Millisecond))
 	e.mkNS("p", atRest(map[string]any{"read": "public"}))
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
@@ -314,6 +315,7 @@ func TestSealedOutputs(t *testing.T) {
 // read: "grant" still decides who may fetch ciphertext, while caching uses
 // the public classes (§E.2.5).
 func TestSealedReadGrant(t *testing.T) {
+	t.Parallel()
 	e := newSealedAuthEnv(t)
 	k := newKey("k")
 	e.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{k.entry("*")}}))
@@ -353,6 +355,7 @@ func TestSealedReadGrant(t *testing.T) {
 
 // POST /ns/{ns}/keys: epoch keys, per-resource keys, epoch ranges, wrapping.
 func TestSealedKeys(t *testing.T) {
+	t.Parallel()
 	e := newSealedAuthEnv(t)
 	k := newKey("k")
 	rk := newKey("rk")
@@ -508,6 +511,7 @@ func TestSealedKeys(t *testing.T) {
 
 // With authentication disabled (development), anyone gets raw epoch keys.
 func TestSealedKeysDev(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "grant"}))
 	keys, r := e.keysOf("s", map[string]any{"resources": []any{"a"}}, "")
@@ -524,6 +528,7 @@ func TestSealedKeysDev(t *testing.T) {
 // Rotation: new revisions are sealed under the new epoch, old ones keep
 // their bytes forever.
 func TestSealedRotation(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	a1 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
@@ -573,6 +578,7 @@ func TestSealedRotation(t *testing.T) {
 
 // -rotate-on-revoke rotates right after a config write that revokes access.
 func TestSealedRotateOnRevoke(t *testing.T) {
+	t.Parallel()
 	e := newSealedAuthEnv(t, func(o *core.Options) { o.RotateOnRevoke = true })
 	k := newKey("k")
 	e.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{k.entry("*")}}))
@@ -620,6 +626,7 @@ func TestSealedRotateOnRevoke(t *testing.T) {
 
 // $nonce is required in every patch set of a sealed namespace (§E.2.5).
 func TestSealedNonce(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	expectCode(t, e.write("PATCH", "s", "a", "", addRoot(map[string]any{"v": 1.0})), 422, "invalid")
@@ -648,6 +655,7 @@ func TestSealedNonce(t *testing.T) {
 // A branch of a sealed namespace has its own epoch keys and seals
 // read-through content under them (§E.2.5, §F.8).
 func TestSealedBranch(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "grant"}))
 	a := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": encMarker})))
@@ -724,6 +732,7 @@ func TestSealedBranch(t *testing.T) {
 // is sealed too is B's obligation, which A can't check (§G.5; see
 // remote_enc_test.go).
 func TestSealedRemoteRegistration(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	r := e.do(req{method: "POST", path: "/ns/s/branches", ifNoneMatch: "*", author: "admin",
@@ -734,6 +743,7 @@ func TestSealedRemoteRegistration(t *testing.T) {
 // A prune drops the sealed copies of what it pruned; kept documents keep
 // their bytes.
 func TestSealedPrune(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	r1 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))

@@ -42,6 +42,7 @@ func withRemoteIdentity(mu *sync.Mutex, id **ecdh.PrivateKey) func(*core.RemoteO
 // plaintext (ids over it), and serves it sealed under the branch's own
 // epoch keys. The branch can't be less protected than the base.
 func TestRemoteBranchSealed(t *testing.T) {
+	t.Parallel()
 	var aPriv ed25519.PrivateKey
 	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
 	a.opPriv = aPriv
@@ -141,6 +142,7 @@ func TestRemoteBranchSealed(t *testing.T) {
 // A remote branch of a plain base may be made sealed later: read-through
 // content is then sealed under its own keys.
 func TestRemoteBranchSealedLater(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning})
 	a.mkNS("m", map[string]any{"read": "grant"})
 	x := a.create("m", "x", map[string]any{"v": 1.0})
@@ -157,6 +159,7 @@ func TestRemoteBranchSealedLater(t *testing.T) {
 // the ciphertext verify, and B relays the base's wrapped keys (kid of the
 // base's namespace) until the branch writes a keyring of its own.
 func TestRemoteBranchE2E(t *testing.T) {
+	t.Parallel()
 	var aPriv ed25519.PrivateKey
 	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
 	a.opPriv = aPriv
@@ -283,6 +286,7 @@ func TestRemoteBranchE2E(t *testing.T) {
 // History an e2e base pruned can't be mirrored: its horizon is a sealed
 // snapshot.
 func TestRemoteBranchE2EPruned(t *testing.T) {
+	t.Parallel()
 	f := newE2E(t, withOrigin(originA), withArchive(t, t.TempDir()))
 	a := f.tenv
 	k1 := seal.NewKey()
@@ -302,6 +306,7 @@ func TestRemoteBranchE2EPruned(t *testing.T) {
 // If B can read A's logs but not A's namespace document at at, it can't
 // tell how protected A is, and refuses the remote branch (§G.5.2).
 func TestRemoteBranchUnknownLevel(t *testing.T) {
+	t.Parallel()
 	a, b, rt := pair(t, nil, nil)
 	a.mkNS("m", map[string]any{"read": "public"})
 	a.create("m", "x", map[string]any{"v": 1.0})
@@ -342,6 +347,7 @@ func mustURL(t *testing.T, s string) *url.URL {
 // followed in base.chain, relays the keyrings it mirrored for each level,
 // and a reader on B folds ciphertext sealed by A's base (§G.3, §G.5.2).
 func TestRemoteBranchE2EChain(t *testing.T) {
+	t.Parallel()
 	var aPriv ed25519.PrivateKey
 	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
 	a.opPriv = aPriv

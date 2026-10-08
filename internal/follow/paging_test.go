@@ -14,6 +14,7 @@ import (
 // behind delivers each page as it arrives, its checkpoint advancing with
 // each, and the batches chain as one range.
 func TestCatchUpPaged(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond, LogPageSize: 2})
 	c := s.Client(t, client.WithAuthor("admin"))
@@ -58,9 +59,13 @@ func TestCatchUpPaged(t *testing.T) {
 
 // The follower's flows with a log page size of 2: catch-up ranges, branch
 // bootstraps (first page only) and snapshot starts all read paged logs.
+//
+// Paged sets the environment, so these flows run serially and call the
+// tests' bodies, not the parallel TestX.
 func TestPagedFlows(t *testing.T) {
 	for name, f := range map[string]func(*testing.T){
-		"long-poll": TestFollowLongPoll, "sse": TestFollowSSE, "branches": TestBranchDiscovery,
+		"long-poll": func(t *testing.T) { testFollow(t) }, "sse": func(t *testing.T) { testFollow(t, follow.WithSSE()) },
+		"branches": testBranchDiscovery,
 	} {
 		t.Run(name, func(t *testing.T) { clienttest.Paged(t, 2, f) })
 	}

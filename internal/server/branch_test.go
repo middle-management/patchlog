@@ -18,6 +18,7 @@ func (e *tenv) branch(base string, body map[string]any, who string) *resp {
 
 // §7.6 branches: creation, read-through, first writes, config copy, listings.
 func TestBranches(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{"read": "public", "x-title": "Main"})
 	a1 := e.create("main", "a", map[string]any{"v": 1.0})
@@ -197,6 +198,7 @@ func TestBranches(t *testing.T) {
 
 // A branch of a non-public namespace can't be public (§7.4, §7.6).
 func TestBranchPublicity(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("priv", map[string]any{"read": "grant"})
 	e.mkNS("pub", map[string]any{"read": "public"})

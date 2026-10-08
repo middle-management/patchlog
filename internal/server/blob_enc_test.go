@@ -36,6 +36,7 @@ func openSealedBlob(t *testing.T, sealed, key []byte, kid string, pl seal.PL) []
 // epoch it is served under; each epoch's sealing is stored once and served
 // unchanged; other epochs are 404 no-store, pruned ones 410.
 func TestBlobSealedDelivery(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t, withoutBlobSweep)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	data := []byte("secret blob " + encMarker)
@@ -150,6 +151,7 @@ func TestBlobSealedDelivery(t *testing.T) {
 // §E.2.2: with pad, the plaintext of a sealed blob is padded with zero
 // bytes to its bucket.
 func TestBlobSealedPadded(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t, withoutBlobSweep)
 	e.mkNS("p", map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed", "pad": true}})
 	data := []byte("short")
@@ -175,6 +177,7 @@ func TestBlobSealedPadded(t *testing.T) {
 // request for a blob none of whose referencing revisions has an epoch yet
 // fixes the newest of them under the current epoch first.
 func TestBlobSealedBranch(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t, withoutBlobSweep)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	data := []byte("base blob")
@@ -244,6 +247,7 @@ func (e *tenv) uploadE2E(ns, name string, data []byte, who string) map[string]an
 // server checks and attaches them, keeps the list for restores with [],
 // and prunes, purges and merges by it.
 func TestBlobE2EDeclared(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning, withArchive(t, dir), withoutRetentionLoop, withoutBlobSweep)
 	e.mkNS("e", e2eDoc(map[string]any{}))

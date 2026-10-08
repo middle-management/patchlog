@@ -242,6 +242,7 @@ func encScenario(t *testing.T, e *tenv, dir string, enc bool) []string {
 // database, and behaves exactly like an unencrypted one: same ids,
 // documents, logs, history, branches, batches, restores and archives.
 func TestEncryptionAtRestNoPlaintext(t *testing.T) {
+	t.Parallel()
 	plainDir, encDir := t.TempDir(), t.TempDir()
 	plainPath := filepath.Join(t.TempDir(), "plain.db")
 	pe := newEnv(t, withArchive(t, plainDir), withoutRetentionLoop, withEncTuning, withPath(plainPath))
@@ -286,6 +287,7 @@ func TestEncryptionAtRestNoPlaintext(t *testing.T) {
 // writer's, and the operator's, which the namespace's first entry records
 // (§7.4). The log still serves their root sub and kid.
 func TestEncryptionGrants(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "g.db")
 	e := newAuthEnv(t, withPath(path), withKeyStore(newKeyStore(t)))
 	w := newKey("w")
@@ -315,6 +317,7 @@ func TestEncryptionGrants(t *testing.T) {
 // to it, so a plaintext namespace's log reads without the key store even
 // when its writer's grant is stored encrypted for an at-rest namespace.
 func TestEncryptionGrantRefsWithoutKeyStore(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "gr.db")
 	e := newAuthEnv(t, withPath(path), withKeyStore(newKeyStore(t)))
 	w := newKey("w")
@@ -339,6 +342,7 @@ func TestEncryptionGrantRefsWithoutKeyStore(t *testing.T) {
 // Turning at-rest on for an existing namespace encrypts what it stores,
 // grants included, and everything still reads. Lowering it is refused.
 func TestEncryptionTurnOn(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "on.db")
 	dir := t.TempDir()
 	e := newAuthEnv(t, withPath(path), withKeyStore(newKeyStore(t)), withEncTuning, withArchive(t, dir), withoutRetentionLoop)
@@ -407,6 +411,7 @@ func TestEncryptionTurnOn(t *testing.T) {
 // Configuration errors: no key store, unknown levels and members, a branch
 // below its base.
 func TestEncryptionConfigErrors(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	r := e.do(req{method: "PATCH", path: "/ns/s", ifNoneMatch: "*", body: addRoot(atRest(map[string]any{"read": "public"})), author: "admin"})
 	expectCode(t, r, 422, "invalid")
@@ -443,6 +448,7 @@ func TestEncryptionConfigErrors(t *testing.T) {
 // A wrong master key fails at startup; no key store serves plaintext
 // namespaces and answers 500 for encrypted ones.
 func TestEncryptionWrongMasterKey(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "k.db")
 	e := newEnv(t, withPath(path), withKeyStore(newKeyStore(t)))
 	e.mkNS("s", atRest(map[string]any{"read": "public"}))
@@ -478,6 +484,7 @@ func TestEncryptionWrongMasterKey(t *testing.T) {
 // A remote branch's mirrored shadow rows follow the branch's level (§G.3),
 // from creation or once it is raised; a remote base's level binds too.
 func TestEncryptionRemoteBranch(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "b.db")
 	a, b, _ := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withPath(path), withKeyStore(newKeyStore(t)), withEncTuning})
 	a.mkNS("m", map[string]any{"read": "public"})

@@ -24,6 +24,7 @@ import (
 var update = flag.Bool("update", false, "regenerate static/selftest.json (with node on PATH, also its fromJS part)")
 
 func TestHandler(t *testing.T) {
+	t.Parallel()
 	h := Handler()
 	for path, want := range map[string]string{
 		"/playground/":              "text/html",
@@ -58,6 +59,7 @@ func TestHandler(t *testing.T) {
 
 // TestPage checks that the page stays dependency-free and wires every tab.
 func TestPage(t *testing.T) {
+	t.Parallel()
 	html, err := assets.ReadFile("static/index.html")
 	if err != nil {
 		t.Fatal(err)
@@ -339,7 +341,8 @@ func recipientOf(t *testing.T, f *fixture) *ecdh.PrivateKey {
 
 // TestSelfTestFixture checks static/selftest.json with internal/seal: the
 // Go-made vectors are consistent, and everything seal.js produced (fromJS)
-// opens in Go.
+// opens in Go. Not parallel: with -update it rewrites the fixture, which
+// TestSealJSWithNode reads.
 func TestSelfTestFixture(t *testing.T) {
 	if *update {
 		f := generateFixture(t)
@@ -576,6 +579,7 @@ func runNode(t *testing.T, node string) *nodeOut {
 // self-test must pass against the Go-made fixture, and what it seals must
 // open in Go. There is no build step; node is only a test runner here.
 func TestSealJSWithNode(t *testing.T) {
+	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")

@@ -18,6 +18,7 @@ import (
 // namespace document in force at the first entry that recorded the grant
 // (§G.4.1); a restore skips the grant lines.
 func TestArchiveCarriesGrantLines(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	f := newAuthFixture(t, nil, withArchive(t, dir), withoutRetentionLoop)
 	e := f.tenv

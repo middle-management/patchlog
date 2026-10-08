@@ -18,6 +18,7 @@ import (
 // namespaces and their branches, across a batch, a config change, a
 // tombstone, a purge and a prune.
 func TestNSLogPagePrev(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t, withLogPageSize(3))
 	ctx := context.Background()
 	fill := func(ns string, sealed bool) {

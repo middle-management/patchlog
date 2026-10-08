@@ -34,6 +34,7 @@ func (e *tenv) getEdge(path, secret string) *resp {
 // §9: with a verifying edge, private reads need its secret and get edge
 // lifetimes; public reads don't care.
 func TestEdgeVerifiedPrivateReads(t *testing.T) {
+	t.Parallel()
 	e := newEdgeEnv(t, withLongPoll(time.Minute))
 	e.mkNS("priv", map[string]any{"read": "grant"})
 	e.mkNS("pub", map[string]any{"read": "public"})
@@ -105,6 +106,7 @@ func TestEdgeVerifiedPrivateReads(t *testing.T) {
 // §9: without a verifying edge, private responses are no-store for shared
 // caches; public ones keep their lifetimes.
 func TestNoEdgePrivateNoStore(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withLongPoll(time.Minute))
 	e.mkNS("priv", map[string]any{"read": "grant"})
 	e.mkNS("pub", map[string]any{"read": "public"})
@@ -158,6 +160,7 @@ func purged(calls [][]string, tag string) bool {
 // §9: making a public namespace private purges ns:{ns}; other config
 // writes don't.
 func TestPurgeOnPublicToPrivate(t *testing.T) {
+	t.Parallel()
 	rec := &recPurger{}
 	e := newEnv(t, func(o *core.Options) { o.Purger = rec })
 	e.mkNS("docs", map[string]any{"read": "public"})

@@ -35,6 +35,7 @@ func childNames(b map[string]any) string {
 // being visible when the walk up collects a role granting read without
 // conditions (§B.11.5).
 func TestListingVisibility(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	ctx := context.Background()
@@ -166,6 +167,7 @@ func TestListingVisibility(t *testing.T) {
 // unfiltered listings under g/all, kept no longer than their grants
 // (§B.11.5).
 func TestUnfilteredListings(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -217,6 +219,7 @@ func TestUnfilteredListings(t *testing.T) {
 // placement had when the tombstone was seen, frozen then (§B.11.4,
 // §B.11.7).
 func TestRestoreThroughCatalog(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()

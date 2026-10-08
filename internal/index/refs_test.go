@@ -52,6 +52,7 @@ func refHits(t *testing.T, body map[string]any) map[string]string {
 }
 
 func TestReferenceQueries(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
 	c := s.Client(t, client.WithAuthor("admin"))
@@ -205,6 +206,7 @@ func TestReferenceQueries(t *testing.T) {
 // An index database written before v0.44 has no refs table: opening it
 // replays the logs instead of serving an index that never saw a reference.
 func TestReferenceUpgrade(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
 	c := s.Client(t, client.WithAuthor("admin"))
@@ -234,6 +236,7 @@ func TestReferenceUpgrade(t *testing.T) {
 // are routed under the reader's subject set, keep the encoded query, and
 // show only what the reader may read.
 func TestReferencePrivate(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
 	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
@@ -271,6 +274,7 @@ func TestReferencePrivate(t *testing.T) {
 // Sealed namespaces: a reference result is sealed like any other (§E.2.6),
 // refs included.
 func TestReferenceSealed(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
 	k := clienttest.NewKey("k")
@@ -310,6 +314,7 @@ func TestReferenceSealed(t *testing.T) {
 // Branch preview indexes match targets as written, and hits are the
 // branch's versions of the referrers (§A.4).
 func TestReferenceBranchPreview(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
 	c := s.Client(t, client.WithAuthor("admin"))

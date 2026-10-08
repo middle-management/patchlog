@@ -14,6 +14,7 @@ import (
 )
 
 func TestPrivateNamespace(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
 	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
@@ -140,6 +141,7 @@ func TestPrivateNamespace(t *testing.T) {
 }
 
 func TestBranchPreviewIndex(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	w := setup(t)
 	w.seed(t)

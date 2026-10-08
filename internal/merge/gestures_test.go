@@ -11,6 +11,7 @@ import (
 // their source revisions' gesture and undoes in the base; squashing loses
 // them.
 func TestMergeCarriesGestures(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	g1, g2 := client.NewGesture(), client.NewGesture()

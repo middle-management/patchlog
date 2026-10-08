@@ -56,6 +56,7 @@ func (a *authEnv) lastEntry(ns string) client.NSEntry {
 // or the listed sub under another kid) the batch isn't a merge point and
 // the second merge conflicts, with a hint to rebase.
 func TestSecondMergeAfterReplayNeedsListedAuthor(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		name    string
 		key     func(a *authEnv) clienttest.Key
@@ -119,6 +120,7 @@ func TestSecondMergeAfterReplayNeedsListedAuthor(t *testing.T) {
 
 // Without merge.authors there are no merge points, and the plan says so.
 func TestNoMergeAuthorsNoMergePoints(t *testing.T) {
+	t.Parallel()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
 	e := &env{t: t, s: s, c: c}
@@ -141,6 +143,7 @@ func TestNoMergeAuthorsNoMergePoints(t *testing.T) {
 // source.at is the branch revision the plan was classified from, also
 // when a 412 re-classification resubmits after the branch moved on.
 func TestSourceAtAfterReclassification(t *testing.T) {
+	t.Parallel()
 	a := newAuthEnv(t)
 	a.append("r7", "derby", op("replace", "/score", "1-0"))
 	a.append("r7", "cup", op("replace", "/score", "2-1"))
@@ -170,6 +173,7 @@ func TestSourceAtAfterReclassification(t *testing.T) {
 // Keeping the base's version records the pair with an empty step when the
 // base head is live, so a later merge replays only what is new.
 func TestKeptAtBaseRecorded(t *testing.T) {
+	t.Parallel()
 	a := newAuthEnv(t)
 	a.append("r7", "derby", op("replace", "/score", "1-0"))
 	a.append("matches", "derby", op("replace", "/score", "0-1"))
@@ -214,6 +218,7 @@ func TestKeptAtBaseRecorded(t *testing.T) {
 // On a tombstoned base head, keeping can't be recorded: no item, and the
 // resource is offered again.
 func TestKeptAtTombstoneNotRecorded(t *testing.T) {
+	t.Parallel()
 	a := newAuthEnv(t)
 	a.append("r7", "derby", op("replace", "/score", "1-0"))
 	a.append("r7", "cup", op("replace", "/score", "2-1"))
@@ -245,6 +250,7 @@ func TestKeptAtTombstoneNotRecorded(t *testing.T) {
 
 // In a sealed namespace the keep step only adds a fresh $nonce.
 func TestKeptAtBaseSealed(t *testing.T) {
+	t.Parallel()
 	ks, err := keystore.New(keystore.Generate())
 	noErr(t, err)
 	s := clienttest.New(t, clienttest.Options{KeyStore: ks})
@@ -285,6 +291,7 @@ func TestKeptAtBaseSealed(t *testing.T) {
 // The plan and status report, per resource, which merge batch and author
 // the common-ancestor pair came from.
 func TestPairProvenanceReported(t *testing.T) {
+	t.Parallel()
 	a := newAuthEnv(t)
 	a.append("r7", "derby", op("replace", "/score", "1-0"))
 	a.append("matches", "derby", op("replace", "/title", "Derby!"))
@@ -316,6 +323,7 @@ func TestPairProvenanceReported(t *testing.T) {
 // disabled, and for no one under grants. One without "grant" at all (the
 // server's own, or from before v0.37) counts for no one, in either mode.
 func TestEntryListed(t *testing.T) {
+	t.Parallel()
 	authors := []merge.Author{{Sub: "svc:merge", Kid: "ops-2026"}}
 	g := func(sub, kid string) *client.NSGrant {
 		return &client.NSGrant{ID: "1" + strings.Repeat("a", 32), Sub: sub, Kid: kid}
@@ -350,6 +358,7 @@ func TestEntryListed(t *testing.T) {
 }
 
 func TestListed(t *testing.T) {
+	t.Parallel()
 	authors := []merge.Author{{Sub: "svc:merge", Kid: "ops-2026"}}
 	for _, tc := range []struct {
 		sub, kid string
@@ -372,6 +381,7 @@ func TestListed(t *testing.T) {
 // writer who can't read the branch (§7.5), so the merger checks the chain
 // itself, as the janitor does, and reports the batch as ignored.
 func TestMergeBatchSourceAtOutsideChain(t *testing.T) {
+	t.Parallel()
 	a := newAuthEnv(t)
 	a.append("r7", "derby", op("replace", "/score", "1-0"))
 	a.append("matches", "cup", op("replace", "/score", "2-2"))

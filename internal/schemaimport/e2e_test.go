@@ -14,6 +14,7 @@ import (
 // revisions, documents validate against the root, a re-run is a no-op and a
 // changed source appends.
 func TestImportEndToEnd(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fs := newFixtureServer(t)
 	s := clienttest.New(t, clienttest.Options{})
@@ -118,6 +119,7 @@ func TestImportEndToEnd(t *testing.T) {
 // Beyond the namespace's batch limits, the writes go in dependency-ordered
 // chunks.
 func TestImportChunked(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fs := newFixtureServer(t)
 	s := clienttest.New(t, clienttest.Options{})

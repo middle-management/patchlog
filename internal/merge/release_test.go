@@ -265,7 +265,7 @@ func (w *relWorld) writeRelease(name string, branches map[string]string) {
 }
 
 func (w *relWorld) opts(rel string) merge.ReleaseOptions {
-	return merge.ReleaseOptions{Release: "/r/releases/" + rel, Granter: w.granter(), Who: "user:anna", Now: w.s.Now, BehindWait: 5 * time.Second,
+	return merge.ReleaseOptions{Release: "/r/releases/" + rel, Granter: w.granter(), Who: "user:anna", Now: w.s.Now, BehindWait: 30 * time.Second,
 		AdminGrant: w.annaAll(), Via: "svc:merge"}
 }
 
@@ -300,7 +300,9 @@ func parentNames(doc map[string]any) []string {
 // §F.9 Merging: plan, approve (freezes), merge in the four steps with the
 // states in between, a stop after step 2 and a resume, one release per
 // catalog base at a time, merged recorded after step 4.
-func TestReleaseMerge(t *testing.T) {
+func TestReleaseMerge(t *testing.T) { t.Parallel(); testReleaseMerge(t) }
+
+func testReleaseMerge(t *testing.T) {
 	w := newRelWorld(t)
 	w.startCatalog()
 	t1 := w.release7()
@@ -449,6 +451,7 @@ func TestReleaseMerge(t *testing.T) {
 // §F.9: unfreezing a branch invalidates the approved plan; so does a new
 // revision of the release document.
 func TestReleaseUnfreezeInvalidates(t *testing.T) {
+	t.Parallel()
 	w := newRelWorld(t)
 	w.startCatalog()
 	w.release7()
@@ -483,6 +486,7 @@ func TestReleaseUnfreezeInvalidates(t *testing.T) {
 
 // §F.9: the conflicts reported before anything is submitted.
 func TestReleaseConflicts(t *testing.T) {
+	t.Parallel()
 	w := newRelWorld(t)
 	w.startCatalog()
 	t1 := w.release7()
@@ -562,7 +566,9 @@ func TestReleaseConflicts(t *testing.T) {
 // referencing the replayed draft are squashed onto its new revision, and
 // the release document lists the successors. Then the janitor cleans up
 // the old generation: the draft branch last, retrying on in_use (§F.6).
-func TestReleaseRebaseAndJanitor(t *testing.T) {
+func TestReleaseRebaseAndJanitor(t *testing.T) { t.Parallel(); testReleaseRebaseAndJanitor(t) }
+
+func testReleaseRebaseAndJanitor(t *testing.T) {
 	w := newRelWorld(t)
 	w.startCatalog()
 	t1 := w.release7()
@@ -657,6 +663,7 @@ func strList(v any) []string {
 // branch of the content namespace, and shows a viewer only branches it
 // can read.
 func TestReleasePreview(t *testing.T) {
+	t.Parallel()
 	w := newRelWorld(t)
 	w.release7()
 	rel := must(release.Load(ctx, w.anna, "/r/releases/release-7"))
@@ -679,7 +686,7 @@ func TestReleasePreview(t *testing.T) {
 	t.Cleanup(func() { cancel(); <-done; hs.Close(); svc.Close() })
 	hcp := must(w.anna.NSHead(ctx, "cat-season-r7")).ID
 	hmp := must(w.anna.NSHead(ctx, "matches-r7")).ID
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for svc.Checkpoint("cat-season") != hcp || svc.Checkpoint("matches") != hmp {
 		if time.Now().After(deadline) {
 			t.Fatal("the preview didn't follow the branches")

@@ -14,6 +14,7 @@ import (
 // Two catalogs, a tree and a DAG over the same content namespace, served
 // by one origin.
 func TestMulti(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	ctx := context.Background()
 	w.seed(t)

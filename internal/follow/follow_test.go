@@ -70,7 +70,7 @@ func (r *recorder) kinds(ns string) []string {
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -168,10 +168,11 @@ func testFollow(t *testing.T, opts ...follow.Option) {
 	r.stop(t)
 }
 
-func TestFollowLongPoll(t *testing.T) { testFollow(t) }
-func TestFollowSSE(t *testing.T)      { testFollow(t, follow.WithSSE()) }
+func TestFollowLongPoll(t *testing.T) { t.Parallel(); testFollow(t) }
+func TestFollowSSE(t *testing.T)      { t.Parallel(); testFollow(t, follow.WithSSE()) }
 
 func TestSnapshotBootstrapAndRange(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	_, c := setup(t)
 	a := must(c.CreateDoc(ctx, "main", "a", map[string]any{"n": 0}))
@@ -207,7 +208,9 @@ func TestSnapshotBootstrapAndRange(t *testing.T) {
 	r.stop(t)
 }
 
-func TestBranchDiscovery(t *testing.T) {
+func TestBranchDiscovery(t *testing.T) { t.Parallel(); testBranchDiscovery(t) }
+
+func testBranchDiscovery(t *testing.T) {
 	ctx := context.Background()
 	_, c := setup(t)
 	must(c.CreateDoc(ctx, "main", "a", map[string]any{"n": 0}))
@@ -268,6 +271,7 @@ func TestBranchDiscovery(t *testing.T) {
 }
 
 func TestRootErrors(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	_, c := setup(t)
 	// A checkpoint not in the chain is permanent.
@@ -324,6 +328,7 @@ func (h *sqlHandler) Apply(ctx context.Context, b *follow.Batch) error {
 }
 
 func TestSQLCheckpoints(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	_, c := setup(t)
 	a := must(c.CreateDoc(ctx, "main", "a", map[string]any{"n": 0}))
@@ -352,6 +357,7 @@ func TestSQLCheckpoints(t *testing.T) {
 }
 
 func TestCoalesce(t *testing.T) {
+	t.Parallel()
 	e := func(id, kind, res, target string) client.NSEntry {
 		return client.NSEntry{ID: id, Kind: kind, Resource: res, Target: target}
 	}
@@ -379,6 +385,7 @@ func TestCoalesce(t *testing.T) {
 }
 
 func TestFetchDocPruned(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s, c := setup(t)
 	a := must(c.CreateDoc(ctx, "main", "a", map[string]any{"n": 0}))

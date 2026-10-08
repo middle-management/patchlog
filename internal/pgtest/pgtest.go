@@ -64,6 +64,9 @@ func newDB(t testing.TB, with string) string {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Hold no connection between the create and the drop: parallel tests
+	// would each keep one open for their whole run.
+	db.SetMaxIdleConns(0)
 	if _, err := db.Exec(`CREATE DATABASE ` + name + ` TEMPLATE template0` + with); err != nil {
 		db.Close()
 		if with != "" {

@@ -15,6 +15,7 @@ import (
 // namespace's 410, which itself comes before the precondition's 428 (the
 // order v0.32 pinned for blob uploads).
 func TestReviewGateOrderNS(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	h := e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)

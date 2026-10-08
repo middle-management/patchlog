@@ -130,6 +130,7 @@ func byName(t *testing.T, res *schemaimport.Result, name string) *schemaimport.R
 }
 
 func TestPlanFixtures(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	fs := newFixtureServer(t)
 	res, err := schemaimport.Plan(ctx, nil, []string{fs.URL + "/a/root.json"}, schemaimport.Options{NS: "schemas", Name: "person"})
@@ -273,6 +274,7 @@ func TestPlanFixtures(t *testing.T) {
 }
 
 func TestPlanNames(t *testing.T) {
+	t.Parallel()
 	fs := newFixtureServer(t)
 	res, err := schemaimport.Plan(context.Background(), nil, []string{fs.URL + "/dup/x/common.json"}, schemaimport.Options{NS: "schemas"})
 	if err != nil {
@@ -291,6 +293,7 @@ func TestPlanNames(t *testing.T) {
 }
 
 func TestPlanErrors(t *testing.T) {
+	t.Parallel()
 	fs := newFixtureServer(t)
 	for _, tc := range []struct {
 		src  string
@@ -314,6 +317,7 @@ func TestPlanErrors(t *testing.T) {
 }
 
 func TestPlanLocalFiles(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	os.MkdirAll(filepath.Join(dir, "defs"), 0o755)
 	os.WriteFile(filepath.Join(dir, "main.json"), []byte(`{"properties":{"n":{"$ref":"defs/num.json#/$defs/n"}}}`), 0o644)

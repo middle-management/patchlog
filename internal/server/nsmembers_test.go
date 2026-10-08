@@ -35,6 +35,7 @@ func errPointer(t *testing.T, r *resp) string {
 // creation validate the members the spec defines strictly, and accept any
 // other member only if it starts with "x-", storing it as data.
 func TestNamespaceMembers(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	create := func(ns string, doc map[string]any) *resp {
 		return e.do(req{method: "PATCH", path: "/ns/" + ns, ifNoneMatch: "*", body: addRoot(doc), author: "op"})

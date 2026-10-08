@@ -19,6 +19,7 @@ func batchOf(prefix string, n int) map[string]any {
 
 // §6.6 allowances: a named principal gets its own rate and batch limits.
 func TestAllowances(t *testing.T) {
+	t.Parallel()
 	max := core.DefaultLimits()
 	max.ItemsPerBatch = 50
 	f := newAuthFixture(t, map[string]any{

@@ -92,6 +92,7 @@ func createNonced(c *client.Client, ns, name string, doc map[string]any) (*clien
 // bound to the result's URL; a public namespace's stay plain JSON. Keys
 // come from POST /keys with the indexer's grant, wrapped to its enc.
 func TestSealedNamespace(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
 	k := clienttest.NewKey("k")
@@ -230,6 +231,7 @@ func TestSealedNamespace(t *testing.T) {
 // A reader whose grant restricts resources gets JSON with each hit's
 // derived values sealed under its resource's key, and no counts.
 func TestSealedPerResource(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
 	k := clienttest.NewKey("k")
@@ -301,6 +303,7 @@ func TestSealedPerResource(t *testing.T) {
 // An e2e namespace is indexed only by a service whose key is a keyring
 // recipient; any other skips it, says why, and holds none of its rows.
 func TestE2ENamespace(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
 	admin := clienttest.NewKey("admin")
@@ -369,6 +372,7 @@ func TestE2ENamespace(t *testing.T) {
 // A namespace with encryption.pad gets padded results (§E.2.2, §E.2.6):
 // the plaintext is padded to its bucket and never compressed.
 func TestSealedPadded(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
 	c := s.Client(t, client.WithAuthor("w"), client.WithKeys(client.NewKeys(nil)))

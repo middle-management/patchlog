@@ -14,6 +14,7 @@ import (
 // §6.1: the schema cache finds a draft for a document of a branch, as the
 // server resolved it, and never for a namespace that isn't a branch.
 func TestSchemaCacheDrafts(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))

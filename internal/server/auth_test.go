@@ -53,6 +53,7 @@ func revocationID(t *testing.T, token string, block int) string {
 
 // §C.4 bootstrapping: creating a namespace needs an operator key.
 func TestAuthNamespaceCreation(t *testing.T) {
+	t.Parallel()
 	e := newAuthEnv(t)
 	k := newKey("admin")
 	doc := addRoot(map[string]any{"keys": []any{k.entry("*")}})
@@ -80,6 +81,7 @@ func TestAuthNamespaceCreation(t *testing.T) {
 
 // §C.2: 401, 403, authorisation before the precondition.
 func TestAuthChecks(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{"title": "t", "i18n": map[string]any{}}, f.issuerG)
@@ -142,6 +144,7 @@ func TestAuthChecks(t *testing.T) {
 
 // §C.5: reads of grant namespaces.
 func TestAuthReads(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{}, f.issuerG)
@@ -192,6 +195,7 @@ func TestAuthReads(t *testing.T) {
 
 // §C.1 narrowing, §C.1.1 roles, §C.4 revocation and key scopes.
 func TestAuthNarrowingRolesRevocation(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{"title": "t", "i18n": map[string]any{}}, f.issuerG)
@@ -256,6 +260,7 @@ func TestAuthNarrowingRolesRevocation(t *testing.T) {
 // §7.4 guarded paths; §6.4.3 config writes are rule-checked except for * keys;
 // §6.4.4 group and ownership rules with a principal.
 func TestAuthConfigAndRules(t *testing.T) {
+	t.Parallel()
 	ownership := map[string]any{
 		"if": []any{
 			map[string]any{"not": map[string]any{"op": "test", "path": "/principal/roles", "schema": map[string]any{"contains": map[string]any{"const": "editor"}}}},
@@ -347,6 +352,7 @@ func TestAuthConfigAndRules(t *testing.T) {
 
 // §7.6 / §C.4: branches with auth — unrestricted read, * keys kept, keys follow the base.
 func TestAuthBranches(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{}, f.issuerG)
@@ -409,6 +415,7 @@ func TestAuthBranches(t *testing.T) {
 
 // §C.4, §B.11.3: requireAt bounds a grant's `at` by the namespace's maxLag.
 func TestAuthRequireAtMaxLag(t *testing.T) {
+	t.Parallel()
 	cat := newKey("cat")
 	entry := cat.entry("read", "create", "append")
 	entry["requireAt"] = true

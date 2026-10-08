@@ -34,6 +34,7 @@ func lastOf(xs []string) string {
 
 // §8.1–§8.3: tombstone, restore, purge and its propagation to branches.
 func TestPurge(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{"read": "public"})
 	a1 := e.create("main", "a", map[string]any{"secret": "s"})
@@ -112,6 +113,7 @@ func TestPurge(t *testing.T) {
 
 // §8.4: freezing.
 func TestFreeze(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{"read": "public"})
 	e.mkNS("next", map[string]any{"read": "public"})
@@ -143,6 +145,7 @@ func TestFreeze(t *testing.T) {
 
 // §8.5: purging a namespace.
 func TestPurgeNamespace(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("old", map[string]any{"read": "public"})
 	e.mkNS("other", map[string]any{"read": "public"})
@@ -196,6 +199,7 @@ func TestPurgeNamespace(t *testing.T) {
 
 // §8.6: pruning.
 func TestPrune(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{"read": "public"})
 	prune := func(name string, body map[string]any) *resp {
@@ -328,6 +332,7 @@ func (e *tenv) nsHeadPrev(ns string) string {
 
 // §7.2 retry lookups that find purged or pruned entries.
 func TestRetryAfterPurgeAndPrune(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{"read": "public"})
 	genesis := addRoot(map[string]any{"n": 0.0})

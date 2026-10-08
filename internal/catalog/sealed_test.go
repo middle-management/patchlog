@@ -17,6 +17,7 @@ import (
 // its placement node (opening its per-entry listing entry), wrapped to its
 // grant's enc, and nothing else (§B.11.5, §E.2.6).
 func TestReadGrantKeys(t *testing.T) {
+	t.Parallel()
 	w := setupWith(t, true)
 	w.seed()
 	w.patch("cat", "matches.derby", map[string]any{"op": "add", "path": "/title", "value": "Derby placement"})

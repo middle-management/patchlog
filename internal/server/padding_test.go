@@ -28,6 +28,7 @@ func openPadded(t *testing.T, jwe string, key []byte, kid string, pl seal.PL) (b
 // namespace documents and log ranges. Turning pad off affects only what is
 // sealed afterwards (§E.2.2).
 func TestSealedPadding(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed", "pad": true}})
 	big := strings.Repeat("abcdefgh", 300) // compressible

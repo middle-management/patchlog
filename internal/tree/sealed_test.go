@@ -70,6 +70,7 @@ func createNonced(t *testing.T, c *client.Client, ns, name string, doc map[strin
 // restricted to some catalog resources; names, hrefs and structure stay in
 // the clear.
 func TestSealedCatalog(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	ks, err := keystore.New(keystore.Generate())
 	if err != nil {
@@ -196,6 +197,7 @@ func TestSealedCatalog(t *testing.T) {
 // An e2e catalog is not consumed without a keyring recipient key: listings
 // answer 503 and /_status says why.
 func TestE2ECatalogSkipped(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	ks, err := keystore.New(keystore.Generate())
 	if err != nil {

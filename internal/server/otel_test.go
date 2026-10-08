@@ -32,7 +32,8 @@ func spanAttr(s sdktrace.ReadOnlySpan, k attribute.Key) string {
 // TestTelemetry checks the API's server spans (named by route, with the
 // namespace as an attribute), the engine write spans and metrics, and
 // that query strictness, CORS preflights and event streams behave as
-// without telemetry.
+// without telemetry. Not parallel: telemetry.Use sets the process's
+// providers.
 func TestTelemetry(t *testing.T) {
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})

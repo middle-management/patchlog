@@ -105,6 +105,7 @@ func blobPath(ns, name, bid string) string { return "/r/" + ns + "/" + name + "/
 // §7.8: upload, pending invisibility, attach at write, read with ranges and
 // immutable caching, idempotent re-uploads.
 func TestBlobUploadAndRead(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("m", map[string]any{"read": "public"})
 	data := []byte("hello, blob world: " + strings.Repeat("x", 100))
@@ -182,6 +183,7 @@ func TestBlobUploadAndRead(t *testing.T) {
 
 // §7.8: the checks of an upload, in order.
 func TestBlobUploadChecks(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("c", map[string]any{"limits": map[string]any{"blobSize": 1000, "blobPending": 10000}})
 	data := []byte("some bytes")
@@ -230,6 +232,7 @@ func TestBlobUploadChecks(t *testing.T) {
 
 // §6.6: blobRate draws an upload's bytes; a copy draws none.
 func TestBlobRate(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("r", map[string]any{"read": "public", "limits": map[string]any{"blobRate": map[string]any{"rate": 1, "burst": 1000}}})
 	a := []byte(strings.Repeat("a", 1500))
@@ -251,6 +254,7 @@ func TestBlobRate(t *testing.T) {
 // §7.8: each uploader has its own pending entry; only it can reference it;
 // once attached, any writer can.
 func TestBlobPendingPerUploader(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("p", map[string]any{})
 	data := []byte("shared bytes")
@@ -275,6 +279,7 @@ func TestBlobPendingPerUploader(t *testing.T) {
 // §7.8: a pending entry expires after blobGrace; uploading again restarts
 // it; the sweep deletes entries and bytes.
 func TestBlobGrace(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("g", map[string]any{"limits": map[string]any{"blobGrace": "PT1H"}})
 	data := []byte("short-lived")
@@ -304,6 +309,7 @@ func TestBlobGrace(t *testing.T) {
 // §8.1, §8.3: a tombstoned resource keeps serving its blobs; a purge ends
 // every attachment (410) and deletes the bytes.
 func TestBlobTombstoneAndPurge(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("d", map[string]any{"read": "public"})
 	data := []byte("purgeable")
@@ -335,6 +341,7 @@ func TestBlobTombstoneAndPurge(t *testing.T) {
 
 // §8.5: a namespace purge clears its blobs.
 func TestBlobNamespacePurge(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("z", map[string]any{})
 	data := []byte("ns purge")
@@ -352,6 +359,7 @@ func TestBlobNamespacePurge(t *testing.T) {
 // §7.6, §7.8: a branch reads its base's blobs through as of at, attaches
 // them at its first write, and purges propagate.
 func TestBlobBranch(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("base", map[string]any{"read": "public"})
 	data := []byte("base blob")
@@ -394,6 +402,7 @@ func TestBlobBranch(t *testing.T) {
 // §7.5, §7.8: a batch with a local source may reference the blobs attached
 // in the source as of source.at; merges copy nothing.
 func TestBlobBatchSource(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("main", map[string]any{"read": "public"})
 	head := e.create("main", "a", map[string]any{"n": 0})
@@ -424,6 +433,7 @@ func TestBlobBatchSource(t *testing.T) {
 
 // §7.5: the source's history as of source.at decides.
 func TestBlobBatchSourceAsOf(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("main", map[string]any{})
 	head := e.create("main", "a", map[string]any{"n": 0})
@@ -442,6 +452,7 @@ func TestBlobBatchSourceAsOf(t *testing.T) {
 // §8.6: pruning ends attachments no kept document references (410 as
 // pruned), and the archive carries their blobs as blob lines (§G.4.1).
 func TestBlobPrune(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withBlobTuning, withArchive(t, dir), withoutRetentionLoop)
 	e.mkNS("main", map[string]any{"read": "public"})
@@ -509,6 +520,7 @@ func TestBlobPrune(t *testing.T) {
 // §8.6, §D.4: restoring archives brings back the attachments pruning
 // ended, from their blob lines, once every document is stored again.
 func TestBlobArchiveRestore(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withBlobTuning, withArchive(t, dir), withoutRetentionLoop)
 	e.mkNS("main", map[string]any{"read": "public"})
@@ -565,6 +577,7 @@ func TestBlobArchiveRestore(t *testing.T) {
 
 // §6.6: an allowance may raise blobPending and blobRate for its principal.
 func TestBlobAllowance(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("a", map[string]any{
 		"limits":     map[string]any{"blobPending": 5000, "blobRate": map[string]any{"rate": 1, "burst": 100}},
@@ -589,6 +602,7 @@ func TestBlobAllowance(t *testing.T) {
 // racing an upload of the same bytes into the other (the collector and the
 // uploader are ordered by the bytes row's lock on Postgres).
 func TestBlobPurgeRacesUpload(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("one", map[string]any{"read": "public"})
 	e.mkNS("two", map[string]any{"read": "public"})
@@ -616,6 +630,7 @@ func TestBlobPurgeRacesUpload(t *testing.T) {
 
 // §7.8 Copying: ranks, read checks, and the 404s that reveal nothing.
 func TestBlobCopy(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("pub", map[string]any{"read": "public"})
 	e.mkNS("pub2", map[string]any{"read": "public"})
@@ -663,6 +678,7 @@ func TestBlobCopy(t *testing.T) {
 
 // §7.8: copies into e2e need a sealed blob; uploads of other types are 415.
 func TestBlobE2EType(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning)
 	e.mkNS("e", e2eDoc(map[string]any{}))
 	r, _ := e.putBlob("e", "a", "image/png", "", []byte("plain"))
@@ -679,6 +695,7 @@ func TestBlobE2EType(t *testing.T) {
 // §E.1: blob bytes of encrypted namespaces are encrypted at rest, under
 // each resource's key; a purge leaves nothing recoverable.
 func TestBlobAtRest(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "blobs.db")
 	e := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning, withPath(path))
 	e.mkNS("enc", atRest(map[string]any{"read": "public"}))
@@ -715,6 +732,7 @@ func TestBlobAtRest(t *testing.T) {
 // §E.1: turning encryption on moves plaintext blob bytes under the
 // resource's key.
 func TestBlobEncryptLater(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "later.db")
 	e := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning, withPath(path))
 	e.mkNS("n", map[string]any{"read": "public"})
@@ -738,6 +756,7 @@ func TestBlobEncryptLater(t *testing.T) {
 
 // §C.5, §7.8: access to a blob is read access to its resource.
 func TestBlobAccess(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil, withBlobTuning)
 	e := f.tenv
 	data := []byte("private bytes")
@@ -776,6 +795,7 @@ func TestBlobAccess(t *testing.T) {
 
 // §7.8 Copying with Source-Authorization, and the batch source read check.
 func TestBlobSourceAuthorization(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil, withBlobTuning)
 	e := f.tenv
 	// A second namespace with its own keys: the issuer's grant can't read
@@ -810,6 +830,7 @@ func TestBlobSourceAuthorization(t *testing.T) {
 // still available; a pending entry swept between check and insert fails the
 // write instead of attaching missing bytes.
 func TestBlobRecheck(t *testing.T) {
+	t.Parallel()
 	var hook func()
 	e := newEnv(t, withBlobTuning, func(o *core.Options) {
 		o.LockedCheckBytes = -1
@@ -837,6 +858,7 @@ func TestBlobRecheck(t *testing.T) {
 
 // §7.5: a dry run reports unavailable blobs as blob failures.
 func TestBlobDryRun(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("d", map[string]any{})
 	data := []byte("dry")

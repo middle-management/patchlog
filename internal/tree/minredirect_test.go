@@ -16,6 +16,7 @@ import (
 // the write's min from many clients, following redirects: no URL repeats,
 // at most one redirect, and the listing shows the write (§B.5, §A.5).
 func TestMinAfterWriteConcurrent(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	x := startSvc(t, w.c, svcOpts{})
 	x.caughtUp("cat", "matches")

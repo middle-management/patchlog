@@ -10,6 +10,7 @@ import (
 // The base is read through in a branch, and a batch's delete step sees the
 // document its earlier steps produced.
 func TestDeleteRuleSeesDoc(t *testing.T) {
+	t.Parallel()
 	ownerDeletes := map[string]any{
 		"if":   []any{map[string]any{"op": "test", "path": "/action", "value": "delete"}},
 		"then": []any{map[string]any{"op": "compare", "path": "/doc/owner", "eq": map[string]any{"path": "/principal/id"}}},

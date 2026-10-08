@@ -39,6 +39,7 @@ func hitOf(t *testing.T, body map[string]any, resource string) map[string]any {
 // TestSortFacetArray: x-index as an array, and hits carrying facet and sort
 // values and the fields asked for (v0.46 §A.2, §A.4).
 func TestSortFacetArrayAndFields(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
 	c := s.Client(t, client.WithAuthor("admin"))
@@ -122,6 +123,7 @@ func TestSortFacetArrayAndFields(t *testing.T) {
 // TestSchemaDocumentsAndSelf: schema documents are indexed against their
 // dialect with their $refs as references; a self-reference is flagged.
 func TestSchemaDocumentsAndSelf(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
 	c := s.Client(t, client.WithAuthor("admin"))
@@ -181,6 +183,7 @@ func TestSchemaDocumentsAndSelf(t *testing.T) {
 }
 
 func TestSelfReferenceFlag(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
 	c := s.Client(t, client.WithAuthor("admin"))

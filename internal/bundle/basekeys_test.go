@@ -21,6 +21,7 @@ import (
 // SourceKeyChecker accepts it, also after the base removed it again; a key
 // the base never had is not in force.
 func TestBranchGrantKeyFromBase(t *testing.T) {
+	t.Parallel()
 	nsKey := clienttest.NewKey("ns-key")
 	rotated := clienttest.NewKey("rotated")
 	bot := signerKey(t, "bot-1", 3)

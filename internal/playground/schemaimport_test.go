@@ -61,6 +61,7 @@ const (
 )
 
 func TestSchemaImportPlanFiles(t *testing.T) {
+	t.Parallel()
 	e := newSIEnv(t, false, Options{})
 	ctx := context.Background()
 	if _, err := e.s.Client(t, client.WithAuthor("a")).CreateNamespace(ctx, "schemas", map[string]any{"read": "public"}); err != nil {
@@ -151,6 +152,7 @@ func TestSchemaImportPlanFiles(t *testing.T) {
 }
 
 func TestSchemaImportInputErrors(t *testing.T) {
+	t.Parallel()
 	e := newSIEnv(t, false, Options{})
 	if _, err := e.s.Client(t, client.WithAuthor("a")).CreateNamespace(context.Background(), "schemas", map[string]any{"read": "public"}); err != nil {
 		t.Fatal(err)
@@ -208,6 +210,7 @@ func schemaSite(t *testing.T) *httptest.Server {
 }
 
 func TestSchemaImportFetchGuard(t *testing.T) {
+	t.Parallel()
 	site := schemaSite(t) // bound to 127.0.0.1
 	host := strings.TrimPrefix(site.URL, "http://")
 	ip := strings.Split(host, ":")[0]
@@ -264,6 +267,7 @@ func TestSchemaImportFetchGuard(t *testing.T) {
 }
 
 func TestBlockedAddresses(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		ip      string
 		blocked bool
@@ -279,6 +283,7 @@ func TestBlockedAddresses(t *testing.T) {
 }
 
 func TestSchemaImportForwardsCredentials(t *testing.T) {
+	t.Parallel()
 	e := newSIEnv(t, true, Options{})
 	ctx := context.Background()
 	admin := clienttest.NewKey("admin")
@@ -319,6 +324,7 @@ func TestSchemaImportForwardsCredentials(t *testing.T) {
 // TestPageSchemaImport checks the Schemas tab is wired to the endpoint the
 // handler serves, and that the CSP still keeps the page on its own origin.
 func TestPageSchemaImport(t *testing.T) {
+	t.Parallel()
 	html, _ := assets.ReadFile("static/index.html")
 	js, _ := assets.ReadFile("static/app.js")
 	if !bytes.Contains(html, []byte(`data-tab="si"`)) || !bytes.Contains(html, []byte(`id="tab-si"`)) {

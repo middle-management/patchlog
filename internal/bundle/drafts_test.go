@@ -14,6 +14,7 @@ import (
 // §G.4.2: a document referencing a schema revision that exists only in a
 // branch (a draft, §6.1) can't be exported until that branch is merged.
 func TestExportRefusesDrafts(t *testing.T) {
+	t.Parallel()
 	src := newDeployment(t, stagingOrigin)
 	src.ns("schemas", nil)
 	src.ns("matches", nil)

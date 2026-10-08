@@ -32,7 +32,7 @@ func must[T any](v T, err error) T {
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -345,6 +345,11 @@ func isStatus(err error, status int) bool {
 }
 
 func TestEffectiveAccessAndContentGrants(t *testing.T) {
+	t.Parallel()
+	testEffectiveAccessAndContentGrants(t)
+}
+
+func testEffectiveAccessAndContentGrants(t *testing.T) {
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -438,6 +443,7 @@ func TestEffectiveAccessAndContentGrants(t *testing.T) {
 }
 
 func TestGrantStalenessAndExpiry(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -475,7 +481,9 @@ func TestGrantStalenessAndExpiry(t *testing.T) {
 	}
 }
 
-func TestIssueRefusesWhenBehind(t *testing.T) {
+func TestIssueRefusesWhenBehind(t *testing.T) { t.Parallel(); testIssueRefusesWhenBehind(t) }
+
+func testIssueRefusesWhenBehind(t *testing.T) {
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -503,6 +511,7 @@ func TestIssueRefusesWhenBehind(t *testing.T) {
 }
 
 func TestPlaceMoveUnplace(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -605,6 +614,7 @@ func TestPlaceMoveUnplace(t *testing.T) {
 }
 
 func TestCreateFlow(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -664,6 +674,7 @@ func TestCreateFlow(t *testing.T) {
 }
 
 func TestPrivateListingsAndReadGrants(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -790,6 +801,7 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 }
 
 func TestRestartKeepsEffective(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -811,6 +823,7 @@ func TestRestartKeepsEffective(t *testing.T) {
 // yields a grant carrying only restore, used with a root replace (§B.11.4),
 // judged by the resulting document under §B.11.3's rules.
 func TestRePlaceRestoreOnly(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -877,6 +890,7 @@ func TestRePlaceRestoreOnly(t *testing.T) {
 // with v0.21 candidate verbs, before the If-Match comparison, whatever
 // head the writer presents; the current core refuses it at step 1).
 func TestRestoreOnlyGrantOnRevivedPlacement(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -904,6 +918,7 @@ func TestRestoreOnlyGrantOnRevivedPlacement(t *testing.T) {
 // TestNoWideningIncludes: no widening compares roles by name with the
 // content namespace's declared includes, transitively (§B.11.4).
 func TestNoWideningIncludes(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.start()
 	ctx := context.Background()

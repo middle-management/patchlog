@@ -73,6 +73,7 @@ func (e *tenv) chain(ns, name string, n int, who ...string) []string {
 // links to it; a second prune archives incrementally with requires; restore
 // brings everything back with identical ids.
 func TestArchivePruneAndRestore(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withArchive(t, dir), withoutRetentionLoop)
 	e.mkNS("main", map[string]any{"read": "public"})
@@ -158,6 +159,7 @@ func TestArchivePruneAndRestore(t *testing.T) {
 // A restore with a missing archive leaves the horizon; tampered lines are
 // skipped; purged resources are skipped (§8.3).
 func TestArchiveRestorePartialAndPurged(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withArchive(t, dir), withoutRetentionLoop)
 	e.mkNS("main", map[string]any{"read": "public"})
@@ -216,6 +218,7 @@ func TestArchiveRestorePartialAndPurged(t *testing.T) {
 
 // §8.3: purge reaches archives, also through propagation and namespace purge.
 func TestArchivePurge(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withArchive(t, dir), withoutRetentionLoop)
 	e.mkNS("main", map[string]any{"read": "public"})
@@ -246,6 +249,7 @@ func TestArchivePurge(t *testing.T) {
 // §8.6: the prune verb suffices with an archive and within retention;
 // otherwise a * key is needed.
 func TestArchivePruneAuth(t *testing.T) {
+	t.Parallel()
 	// No archive configured: only a * key prunes.
 	f := newAuthFixture(t, nil, withoutRetentionLoop)
 	e := f.tenv
@@ -290,6 +294,7 @@ func TestArchivePruneAuth(t *testing.T) {
 
 // §8.6: archive destinations are only those the operator allows (422).
 func TestArchiveDestinations(t *testing.T) {
+	t.Parallel()
 	root := t.TempDir()
 	def := filepath.Join(root, "default")
 	allowed := filepath.Join(root, "allowed")
@@ -334,6 +339,7 @@ func TestArchiveDestinations(t *testing.T) {
 // §8.6 retention policy: the applier prunes per rule, keeps whichever is
 // longer, respects the retry window and branch points, and skips branches.
 func TestRetentionApplier(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withArchive(t, dir), withoutRetentionLoop)
 	e.mkNS("tel", map[string]any{"read": "public", "retention": []any{

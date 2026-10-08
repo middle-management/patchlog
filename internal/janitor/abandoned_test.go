@@ -15,6 +15,7 @@ import (
 // branch, inherited or its own. Then the branch is purged after its
 // cleanup period, unmerged work and all.
 func TestAbandonedClaim(t *testing.T) {
+	t.Parallel()
 	s := clienttest.New(t, clienttest.Options{Auth: true})
 	ops, editor := clienttest.NewKey("ops"), clienttest.NewKey("editor")
 	nss := []string{"matches", "matches-r1", "matches-r2"}
@@ -67,6 +68,7 @@ func op1(o, path string, v any) map[string]any {
 // "grants", the claim counts for no one: development mode is the
 // deployment's property, not the tool's.
 func TestAbandonedClaimDev(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, map[string]any{"read": "public", "cleanup": map[string]any{"abandoned": "P1D"}})
 	e.branch("matches", "r1", nil)
 	e.edit("r1", "derby", "1-0")

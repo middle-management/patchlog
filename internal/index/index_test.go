@@ -32,7 +32,7 @@ const d2020 = "https://json-schema.org/draft/2020-12/schema"
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -286,10 +286,10 @@ func (w *world) seed(t *testing.T) {
 
 // --- tests ------------------------------------------------------------------
 
-func TestTypedQueries(t *testing.T) { testTypedQueries(t, false) }
+func TestTypedQueries(t *testing.T) { t.Parallel(); testTypedQueries(t, false) }
 
 // TestTypedQueriesLike runs the same queries on the LIKE-based text table.
-func TestTypedQueriesLike(t *testing.T) { testTypedQueries(t, true) }
+func TestTypedQueriesLike(t *testing.T) { t.Parallel(); testTypedQueries(t, true) }
 
 func testTypedQueries(t *testing.T, noFTS bool) {
 	w := setup(t)
@@ -405,6 +405,7 @@ func tagSet(r resp) map[string]bool {
 }
 
 func TestUntypedListingOff(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed(t)
 	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, untyped: false})
@@ -419,7 +420,9 @@ func TestUntypedListingOff(t *testing.T) {
 	s.expect("/matches?q=semi")
 }
 
-func TestUpdatesTombstonePurge(t *testing.T) {
+func TestUpdatesTombstonePurge(t *testing.T) { t.Parallel(); testUpdatesTombstonePurge(t) }
+
+func testUpdatesTombstonePurge(t *testing.T) {
 	ctx := context.Background()
 	w := setup(t)
 	w.seed(t)
@@ -475,6 +478,7 @@ func (f *failing) RoundTrip(r *http.Request) (*http.Response, error) {
 }
 
 func TestBatchIsOneUnit(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	w := setup(t)
 	ft := &failing{path: "/r/matches/b/", rt: http.DefaultTransport}
@@ -525,7 +529,9 @@ func TestBatchIsOneUnit(t *testing.T) {
 	s.expect("/matches?schema=/r/schemas/match", "a", "b")
 }
 
-func TestCheckpointSurvivesRestart(t *testing.T) {
+func TestCheckpointSurvivesRestart(t *testing.T) { t.Parallel(); testCheckpointSurvivesRestart(t) }
+
+func testCheckpointSurvivesRestart(t *testing.T) {
 	ctx := context.Background()
 	w := setup(t)
 	w.seed(t)
@@ -556,7 +562,9 @@ func TestCheckpointSurvivesRestart(t *testing.T) {
 	s2.expect("/matches?q=derby", "derby")
 }
 
-func TestRebuild(t *testing.T) {
+func TestRebuild(t *testing.T) { t.Parallel(); testRebuild(t) }
+
+func testRebuild(t *testing.T) {
 	w := setup(t)
 	w.seed(t)
 	db := filepath.Join(t.TempDir(), "i.db")
@@ -577,9 +585,10 @@ func TestRebuild(t *testing.T) {
 }
 
 func TestMinAndStale(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	w := setup(t)
-	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, minWait: 2 * time.Second})
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, minWait: 30 * time.Second})
 	first := s.caughtUp("matches")
 
 	// Read-your-writes: the write's X-Namespace-Revision as min.
@@ -625,6 +634,7 @@ func TestMinAndStale(t *testing.T) {
 }
 
 func TestPurgeNamespace(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	w := setup(t)
 	w.seed(t)
@@ -657,10 +667,11 @@ func TestPurgeNamespace(t *testing.T) {
 // TestMinSeveralNamespaces: a service following several namespaces takes
 // ?min={ns}:{ns_id} for any of them, repeatable, and waits for all (§A.5).
 func TestMinSeveralNamespaces(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	w := setup(t)
 	must(w.c.CreateNamespace(ctx, "fixtures", map[string]any{"read": "public"}))
-	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "fixtures"}, minWait: 2 * time.Second})
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "fixtures"}, minWait: 30 * time.Second})
 	s.caughtUp("matches")
 	s.caughtUp("fixtures")
 	a := w.doc(t, "derby", w.match, map[string]any{"title": "The Derby"})

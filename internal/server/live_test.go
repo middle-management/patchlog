@@ -68,6 +68,7 @@ func next(t *testing.T, ch <-chan sseEvent) sseEvent {
 
 // §7.3 resource events.
 func TestResourceEvents(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	r1 := e.create("docs", "a", map[string]any{"n": 1.0})
@@ -109,6 +110,7 @@ func TestResourceEvents(t *testing.T) {
 
 // §7.4 namespace events.
 func TestNamespaceEvents(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	ch, _, _ := e.openSSE("/ns/docs/events", nil)
@@ -146,7 +148,7 @@ func TestNamespaceEvents(t *testing.T) {
 	expect(t, e.get("/ns/docs/events?since="+a), 404)
 }
 
-// §7.7 long-poll.
+// §7.7 long-poll. Not parallel: it bounds an answer's wall time.
 func TestLongPoll(t *testing.T) {
 	e := newEnv(t, withLongPoll(200*time.Millisecond))
 	e.mkNS("docs", map[string]any{"read": "public"})
@@ -249,6 +251,7 @@ func TestLongPollWakes(t *testing.T) {
 
 // §7.3/§9: event stream errors are no-store too; a pruned replay is 410.
 func TestEventsErrors(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	h := e.create("docs", "a", map[string]any{"n": 0.0})
@@ -270,6 +273,7 @@ func TestEventsErrors(t *testing.T) {
 // page of 2, a stream from the beginning still delivers every entry, in
 // order and once, and then goes on live.
 func TestEventsPaged(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withLogPageSize(2))
 	e.mkNS("docs", map[string]any{"read": "public"})
 	nsWant := []string{e.nsHead("docs")}

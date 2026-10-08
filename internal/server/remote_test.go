@@ -127,6 +127,7 @@ func remoteEntries(bl []any) []map[string]any {
 // Registration, renewal, retries, listing, expiry and prune protection at
 // the source (§G.3, §7.4, §8.6).
 func TestRemoteRegistration(t *testing.T) {
+	t.Parallel()
 	a := newEnv(t, withOrigin(originA))
 	a.mkNS("main", map[string]any{"read": "public"})
 	p0 := a.create("main", "p", map[string]any{"n": 0.0})
@@ -251,6 +252,7 @@ func anySlice(ms []map[string]any) []any {
 
 // Registration needs read and export and is checked as an export envelope.
 func TestRemoteRegistrationAuth(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil, withOrigin(originA))
 	at := f.nsHead("sec", f.adminG)
 	readOnly := f.grant(f.admin, "user:b", []string{"sec"}, []string{"read"})
@@ -315,6 +317,7 @@ func populateA(t *testing.T, a *tenv) aFixture {
 // writes with foreign parents into the mirrored chain, and never sees A's
 // later changes (§G.3, §7.6).
 func TestRemoteBranch(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	f := populateA(t, a)
 
@@ -450,6 +453,7 @@ func headAt(t *testing.T, e *tenv, ns, at, name string) string {
 // A schema path holding a different history is 409 name_conflict; a prefix
 // is extended; nothing is written on failure.
 func TestRemoteSchemaConflict(t *testing.T) {
+	t.Parallel()
 	a, b, rt := pair(t, nil, nil)
 	f := populateA(t, a)
 
@@ -527,6 +531,7 @@ func tamper(t *testing.T, a *tenv, match string, rewrite func([]byte) []byte) st
 
 // Source data that fails verification is refused, and nothing is written.
 func TestRemoteTampered(t *testing.T) {
+	t.Parallel()
 	a, b, rt := pair(t, nil, nil)
 	f := populateA(t, a)
 	cases := []struct {
@@ -558,6 +563,7 @@ func TestRemoteTampered(t *testing.T) {
 // nothing at B, B's keys are its own, and a private base's branch can't be
 // public.
 func TestRemoteKeys(t *testing.T) {
+	t.Parallel()
 	var aPriv, bPriv ed25519.PrivateKey
 	a := newEnv(t, withOrigin(originA), withAuth(&aPriv))
 	a.opPriv = aPriv
@@ -604,6 +610,7 @@ func TestRemoteKeys(t *testing.T) {
 
 // A's purges reach B as notices from A's log (§G.3), applied by default.
 func TestRemotePurgeFollowed(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	f := populateA(t, a)
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
@@ -660,6 +667,7 @@ func TestRemotePurgeFollowed(t *testing.T) {
 
 // With IgnorePurges, A's purges are recorded as notices only.
 func TestRemotePurgeNotFollowed(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil, func(o *core.RemoteOptions) { o.IgnorePurges = true })
 	f := populateA(t, a)
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
@@ -684,6 +692,7 @@ func TestRemotePurgeNotFollowed(t *testing.T) {
 // remote registration never blocks A's namespace purge; local dependents
 // still block (§7.6, §8.5).
 func TestRemoteNamespacePurge(t *testing.T) {
+	t.Parallel()
 	a, b, rt := pair(t, nil, nil)
 	f := populateA(t, a)
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
@@ -715,6 +724,7 @@ func TestRemoteNamespacePurge(t *testing.T) {
 
 // B registers its remote branch with A and renews before expiry (§G.3).
 func TestRemoteRegisterAndRenew(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil, func(o *core.RemoteOptions) { o.Register = true })
 	f := populateA(t, a)
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
@@ -749,6 +759,7 @@ func TestRemoteRegisterAndRenew(t *testing.T) {
 // History pruned at A is mirrored from the horizon, its document a snapshot
 // (§8.6, §G.3).
 func TestRemotePrunedBase(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	a.mkNS("main", map[string]any{"read": "public"})
 	revs := a.chain("main", "p", 5)

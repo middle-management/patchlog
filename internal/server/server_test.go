@@ -8,6 +8,7 @@ import (
 
 // §3.3–§3.5, invariant "Verifiable": every id can be recomputed from the logs.
 func TestIdsVerifiable(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	r1 := e.create("docs", "a", map[string]any{"title": "x"})
@@ -92,6 +93,7 @@ func TestIdsVerifiable(t *testing.T) {
 
 // §3.1: the server stores, serves and hashes canonical(patches).
 func TestCanonicalStorage(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	raw := `[ {"value": {"z": 1.0, "a": "é", "n": 1e2}, "path": "", "op": "add"} ]`
@@ -119,6 +121,7 @@ func TestCanonicalStorage(t *testing.T) {
 
 // §3.1: I-JSON rejections.
 func TestIJSONRejected(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{})
 	for name, raw := range map[string]string{
@@ -146,6 +149,7 @@ func TestIJSONRejected(t *testing.T) {
 
 // §3.6: name grammar and canonical URLs.
 func TestNamesAndURLs(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	e.create("docs", "a.b-c_d", map[string]any{})
@@ -191,6 +195,7 @@ func TestNamesAndURLs(t *testing.T) {
 
 // §7.1 reads: head pointer states, revisions, logs.
 func TestReads(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	r1 := e.create("docs", "a", map[string]any{"v": 1.0})
@@ -294,6 +299,7 @@ func TestReads(t *testing.T) {
 
 // §7.2 writes: statuses, preconditions, bodies and headers.
 func TestWrites(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 
@@ -394,6 +400,7 @@ func TestWrites(t *testing.T) {
 
 // §7.2 idempotent retry.
 func TestIdempotentRetry(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	genesis := addRoot(map[string]any{"n": 1.0})
@@ -454,6 +461,7 @@ func TestIdempotentRetry(t *testing.T) {
 // Invariant "Append-only" / "Linear": a head only moves to a child; history
 // is never rewritten, and every mutating request writes one ns entry.
 func TestInvariantsLinearAndOrdered(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	id1 := e.create("docs", "a", map[string]any{"n": 0.0})
@@ -491,6 +499,7 @@ func TestInvariantsLinearAndOrdered(t *testing.T) {
 
 // §9 caching of private namespaces.
 func TestPrivateCaching(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("priv", map[string]any{"read": "grant"})
 	id := e.create("priv", "a", map[string]any{})
@@ -511,6 +520,7 @@ func TestPrivateCaching(t *testing.T) {
 
 // §6.6 limits: patch set size, operations, depth, and lowering via /limits.
 func TestLimits(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public", "limits": map[string]any{"patchSetSize": 200.0, "opsPerSet": 3.0, "nestingDepth": 3.0}})
 	id := e.create("docs", "a", map[string]any{"a": map[string]any{"b": 1.0}})
@@ -536,6 +546,7 @@ func TestLimits(t *testing.T) {
 
 // §6.6 rate limits: 429 with Retry-After, code rate and the limit hit.
 func TestRateLimits(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public", "limits": map[string]any{
 		"ratePerResource":  map[string]any{"rate": 1.0, "burst": 2.0},
@@ -569,6 +580,7 @@ func TestRateLimits(t *testing.T) {
 // Invariant "Configuration in force": a write is checked against the
 // configuration at the head when it is inserted; history is never re-evaluated.
 func TestInvariantConfigurationInForce(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	cfg0 := e.mkNS("docs", map[string]any{"read": "public"})
 	h := e.create("docs", "a", map[string]any{"draft": true})
@@ -594,6 +606,7 @@ func TestInvariantConfigurationInForce(t *testing.T) {
 // before the whole-batch replay answers it (§7.2), like every request that
 // passed step 1; a drained bucket is 429, not a free 200.
 func TestReviewRetryAfterStaleConfigDraws(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("m", map[string]any{"limits": map[string]any{
 		"ratePerPrincipal": map[string]any{"rate": 1, "burst": 1}}})
@@ -619,6 +632,7 @@ func TestReviewRetryAfterStaleConfigDraws(t *testing.T) {
 // and namespace buckets unless it is exempt, as a config write does, so a
 // config-only batch isn't free; under a * key it costs nothing.
 func TestBatchConfigChangeDrawsToken(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, map[string]any{"limits": map[string]any{
 		"ratePerPrincipal": map[string]any{"rate": 0.001, "burst": 1}}})
 	e := f.tenv

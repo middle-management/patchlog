@@ -13,6 +13,7 @@ import (
 // restore, and step 2 settles the verb from the resource's state, before
 // the precondition is compared.
 func TestCandidateVerbs(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	appendOnly := e.grant(f.issuer, "user:ap", []string{"sec"}, []string{"read", "append"})
@@ -64,6 +65,7 @@ func TestCandidateVerbs(t *testing.T) {
 // authorisation: only those items are reported, and a dry run answers as a
 // submit would.
 func TestCandidateVerbsBatch(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	restoreOnly := e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "restore"})
@@ -122,6 +124,7 @@ func TestCandidateVerbsBatch(t *testing.T) {
 // §6.2: in a branch, a tombstone read through from the base settles the
 // first write as a restore, with that tombstone as its foreign parent.
 func TestCandidateVerbsBranch(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	x := e.create("sec", "x", map[string]any{"v": 1.0}, f.issuerG)
@@ -142,6 +145,7 @@ func TestCandidateVerbsBranch(t *testing.T) {
 // §6.6: the limit keys of the table, integers in bytes; old names,
 // deployment-only keys and size strings are 422.
 func TestLimitKeys(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	mk := func(name string, limits map[string]any) *resp {
 		return e.do(req{method: "PATCH", path: "/ns/" + name, ifNoneMatch: "*", author: "admin",
@@ -187,6 +191,7 @@ func TestLimitKeys(t *testing.T) {
 // §7.5: the body of a batch is read only up to the principal's batchSize,
 // after authentication.
 func TestBatchBodyLimit(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, map[string]any{
 		"limits": map[string]any{"batchSize": 1024},
 		"allowances": []any{map[string]any{"sub": "user:bob", "kid": "issuer",
@@ -215,6 +220,7 @@ func TestBatchBodyLimit(t *testing.T) {
 // §7.5: item counts are checked at step 4, after authorisation and the
 // precondition.
 func TestBatchItemCountAtStep4(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, map[string]any{"limits": map[string]any{"itemsPerBatch": 2}})
 	e := f.tenv
 	createOnly := e.grant(f.issuer, "user:c", []string{"sec"}, []string{"read", "create"})
@@ -240,6 +246,7 @@ func TestBatchItemCountAtStep4(t *testing.T) {
 
 // §7.4, §F.3: /merge is guarded by a * key; merge.authors is validated.
 func TestMergeAuthorsGuarded(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	authors := map[string]any{"authors": []any{map[string]any{"sub": "svc:merge", "kid": "ops-2026"}}}
@@ -263,6 +270,7 @@ func TestMergeAuthorsGuarded(t *testing.T) {
 // §8.6: retention with "archive": false, and rules without an archive
 // where the operator configured none.
 func TestRetentionArchiveFalse(t *testing.T) {
+	t.Parallel()
 	// A rule saying "archive": false applies without an archive, and
 	// applying it needs only prune.
 	f := newAuthFixture(t, map[string]any{"retention": []any{

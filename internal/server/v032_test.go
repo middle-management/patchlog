@@ -17,6 +17,7 @@ import (
 // §7.8: a purged namespace is 410 after authorisation, like a purged
 // resource.
 func TestBlobUploadPurgedNamespaceAfterAuth(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil, withBlobTuning)
 	e := f.tenv
 	k := newKey("gone-admin")
@@ -36,6 +37,7 @@ func TestBlobUploadPurgedNamespaceAfterAuth(t *testing.T) {
 // parsed, is 400 before anything else of the copy; a different bid is 422
 // before the source is looked at (404).
 func TestBlobCopyOrder(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("c", map[string]any{})
 	data := []byte("copy me")
@@ -61,6 +63,7 @@ func TestBlobCopyOrder(t *testing.T) {
 // pending entry for it in that resource, whoever uploaded it, also when
 // the blob is attached already.
 func TestBlobWriteEndsEveryPendingEntry(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("p", map[string]any{})
 	data := []byte("shared")
@@ -85,6 +88,7 @@ func TestBlobWriteEndsEveryPendingEntry(t *testing.T) {
 // if given); for anyone else the source is recorded unchecked and makes no
 // blobs available. An origin equal to this deployment's own is 422.
 func TestBatchSourceChecked(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil, withBlobTuning)
 	e := f.tenv
 	k2 := newKey("k2")
@@ -133,6 +137,7 @@ func TestBatchSourceChecked(t *testing.T) {
 // §7.8 Availability: through a batch's source, a blob attached in a base
 // the source reads through counts, as the source sees it at source.at.
 func TestBatchSourceReadThrough(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("main", map[string]any{})
 	data := []byte("in the base")
@@ -151,6 +156,7 @@ func TestBatchSourceReadThrough(t *testing.T) {
 // steps run as if it were: the report has the ids, or a later step's
 // failure with the blob failure alongside.
 func TestBlobDryRunCarriesOn(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("d", map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/doc/forbidden", "value": nil}}})
 	missing := blobID("text/plain", "", []byte("missing"))
@@ -181,6 +187,7 @@ func TestBlobDryRunCarriesOn(t *testing.T) {
 // has no epoch until it is first served: a request for a blob it
 // references fixes it under the current epoch first.
 func TestBlobSealedFixesEpoch(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t, withoutBlobSweep)
 	e.mkNS("s", map[string]any{"read": "public"})
 	data := []byte("before sealing")
@@ -221,6 +228,7 @@ func TestBlobSealedFixesEpoch(t *testing.T) {
 // D.4, §E.2.2: restoring an archive clears the recorded 410 epochs, whose
 // revisions are served again.
 func TestBlobSealedRestoreClearsPrunedEpochs(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newSealedEnv(t, withoutBlobSweep, withArchive(t, dir), withoutRetentionLoop, func(o *core.Options) {
 		if !pgtest.Enabled() {
@@ -255,6 +263,7 @@ func TestBlobSealedRestoreClearsPrunedEpochs(t *testing.T) {
 // §E.3.1: the server accepts a declared list in any order, and a prune's
 // sealed snapshot needs no list, also when the horizon is a tombstone.
 func TestBlobE2EDeclaredOrderAndPrune(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning, withArchive(t, dir), withoutRetentionLoop, withoutBlobSweep)
 	e.mkNS("e", e2eDoc(map[string]any{}))
@@ -286,6 +295,7 @@ func TestBlobE2EDeclaredOrderAndPrune(t *testing.T) {
 // D.8: every CDN tag purge is sent again by a durable job once the
 // staleness bound, replica lag and response deadline have passed.
 func TestSecondCDNPurge(t *testing.T) {
+	t.Parallel()
 	rec := &recPurger{}
 	e := newEnv(t, func(o *core.Options) {
 		o.Purger = rec

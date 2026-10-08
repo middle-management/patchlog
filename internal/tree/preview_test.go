@@ -18,6 +18,7 @@ import (
 // document's log (§B.5, §10), so a revision listing other branches (a
 // rebase's successors) takes effect without a restart.
 func TestPreviewFollowsRelease(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	ctx := context.Background()
 	w.seed(t)

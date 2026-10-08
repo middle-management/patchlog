@@ -41,6 +41,7 @@ func (e *tenv) lastNSEntry(ns string) map[string]any {
 // both logs, and a retry answers what was first recorded. Anything but one
 // gesture id is 400.
 func TestV039GestureWrites(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	// Rules don't see gestures (§7.2): a rule refusing gesture gA by an
 	// envelope member would refuse the writes below.
@@ -111,6 +112,7 @@ func TestV039GestureWrites(t *testing.T) {
 // §7.5 (v0.39): step objects, item and batch defaults, the older step
 // forms, and the batch entry's gestures map, left out when no step has one.
 func TestV039BatchGestures(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{})
 	batch := func(body map[string]any) *resp {
@@ -193,6 +195,7 @@ func (e *tenv) headOrTomb(ns, name string) string {
 // unrestricted read, leaves out purged resources and what a branch reads
 // through, and keeps working below a pruning horizon (§8.6).
 func TestV039GesturesEndpoint(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil, withLogPageSize(2))
 	e := f.tenv
 	hdr := func(g, u string) map[string]string {
@@ -296,6 +299,7 @@ func TestV039GesturesEndpoint(t *testing.T) {
 // §7.4 (v0.39): the listing isn't offered in sealed namespaces (404,
 // after authorisation), and public namespaces answer anyone.
 func TestV039GesturesNotOffered(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", sealedDoc(map[string]any{}))
 	expectCode(t, e.get("/ns/s/gestures/"+gA), 404, "not_offered")
@@ -310,6 +314,7 @@ func TestV039GesturesNotOffered(t *testing.T) {
 // D.2 (v0.39): opening a database from before gestures adds the columns
 // and their partial indexes; old entries serve none.
 func TestV039GestureMigration(t *testing.T) {
+	t.Parallel()
 	path, driver := filepath.Join(t.TempDir(), "old.db"), "sqlite"
 	if pgtest.Enabled() {
 		path, driver = pgtest.NewDB(t), "pgx"
@@ -364,6 +369,7 @@ func TestV039GestureMigration(t *testing.T) {
 // §G.3 (v0.39): a remote branch mirrors its base's gestures with the
 // entries, so its read-through logs serve them as the base does.
 func TestV039RemoteBranchGestures(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	a.mkNS("main", map[string]any{"read": "public"})
 	r := a.gw("PATCH", "main", "d", "", addRoot(map[string]any{}), map[string]string{"Gesture": gA})
@@ -382,6 +388,7 @@ func TestV039RemoteBranchGestures(t *testing.T) {
 // §7.3, §7.7 (v0.39): long-polls and event streams serve the same entries
 // as log ranges, gestures included.
 func TestV039LiveGestures(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	first := e.nsHead("docs")
@@ -420,6 +427,7 @@ func TestV039LiveGestures(t *testing.T) {
 // gestures (§7.2): validated, stored with the config entry outside its id,
 // echoed on the response, and a retry answers what was recorded.
 func TestReviewGesturesOnConfigWrite(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("m", map[string]any{"read": "public"})
 	cfg0 := e.configID("m")

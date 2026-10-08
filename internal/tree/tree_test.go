@@ -31,7 +31,7 @@ func must[T any](v T, err error) T {
 
 func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for !cond() {
 		if time.Now().After(deadline) {
 			t.Fatalf("timed out waiting for %s", what)
@@ -77,7 +77,7 @@ func startSvc(t *testing.T, core *client.Client, o svcOpts) *svc {
 	s := &svc{t: t, core: core, done: make(chan struct{})}
 	opt := tree.Options{
 		Client: core, Catalog: o.catalog, DB: o.db, SelfPlacing: o.selfPlacing, Purger: s, Now: o.now,
-		CheckerTTL: time.Millisecond, MinWait: 2 * time.Second,
+		CheckerTTL: time.Millisecond, MinWait: 30 * time.Second,
 		Logf:          func(f string, a ...any) { t.Logf(f, a...) },
 		OnApply:       func(b *follow.Batch) { s.mu.Lock(); s.nbatch++; s.mu.Unlock() },
 		FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
@@ -256,7 +256,9 @@ func (w *world) seed(t *testing.T) {
 	w.place(t, "matches.cup", "season") // dangling: no such item yet
 }
 
-func TestTreeListings(t *testing.T) {
+func TestTreeListings(t *testing.T) { t.Parallel(); testTreeListings(t) }
+
+func testTreeListings(t *testing.T) {
 	w := setup(t)
 	w.seed(t)
 	x := startSvc(t, w.c, svcOpts{})
@@ -400,7 +402,9 @@ func tagSet(r resp) map[string]bool {
 	return out
 }
 
-func TestMovesAndDeletes(t *testing.T) {
+func TestMovesAndDeletes(t *testing.T) { t.Parallel(); testMovesAndDeletes(t) }
+
+func testMovesAndDeletes(t *testing.T) {
 	w := setup(t)
 	w.seed(t)
 	x := startSvc(t, w.c, svcOpts{})
@@ -498,6 +502,7 @@ func TestMovesAndDeletes(t *testing.T) {
 }
 
 func TestCyclesDepthAndDanglingParents(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.folder(t, "root", "Root")
 	// A cycle a -> b -> a, hanging below root through a.
@@ -561,6 +566,7 @@ func TestCyclesDepthAndDanglingParents(t *testing.T) {
 }
 
 func TestManifest(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed(t)
 	w.folder(t, "sub", "Sub", "season@b0")
@@ -597,7 +603,9 @@ func TestManifest(t *testing.T) {
 	}
 }
 
-func TestTrustAndRestart(t *testing.T) {
+func TestTrustAndRestart(t *testing.T) { t.Parallel(); testTrustAndRestart(t) }
+
+func testTrustAndRestart(t *testing.T) {
 	w := setup(t)
 	w.seed(t)
 	w.content(t, "docs", "guide")
@@ -654,6 +662,7 @@ func TestTrustAndRestart(t *testing.T) {
 }
 
 func TestSelfPlacing(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.folder(t, "root", "Root")
 	w.folder(t, "news", "News", "root")
@@ -697,6 +706,7 @@ func TestSelfPlacing(t *testing.T) {
 }
 
 func TestPrivateCatalog(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
 	admin, reader := clienttest.NewKey("admin"), clienttest.NewKey("reader")
@@ -803,6 +813,7 @@ func TestPrivateCatalog(t *testing.T) {
 // TestManyTag: a listing showing more resources than fit in its tags
 // carries rs:{catalog}, which every purge of a resource purges (§B.5).
 func TestManyTag(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.folder(t, "root", "Root")
 	var items []client.BatchItem

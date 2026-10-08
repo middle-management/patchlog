@@ -11,6 +11,7 @@ import (
 // private content namespace (read "grant"), every item a reader may see
 // (§B.11.5) carries them, in children and in subtree.
 func TestPrivateListingsCarryHeadAndURL(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()

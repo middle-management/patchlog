@@ -13,7 +13,9 @@ import (
 // checks every move and placement of the batch as in §B.11.4 (for the
 // approver) and signs one grant covering exactly that batch, with a key
 // used for nothing else, only for the merge service.
-func TestMergeGrants(t *testing.T) {
+func TestMergeGrants(t *testing.T) { t.Parallel(); testMergeGrants(t) }
+
+func testMergeGrants(t *testing.T) {
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -134,6 +136,7 @@ func TestMergeGrants(t *testing.T) {
 
 // Without a merge key the catalog service issues no merge grants.
 func TestMergeGrantsNeedMergeKey(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.mergeKey.Priv = nil
@@ -150,6 +153,7 @@ func TestMergeGrantsNeedMergeKey(t *testing.T) {
 // §B.11.4 Create a folder (POST /grants): move on every folder in to; the
 // grant fixes the name and parents and, for non-admins, refuses $access.
 func TestCreateFolderGrant(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()

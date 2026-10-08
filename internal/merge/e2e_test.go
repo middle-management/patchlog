@@ -96,6 +96,7 @@ func sameDoc(t *testing.T, got, want any) {
 // a second merge finds everything merged through the merge batch, and the
 // base then needs none of the branch's keys (§F.8).
 func TestE2EMergeReencrypts(t *testing.T) {
+	t.Parallel()
 	e := newE3(t, nil)
 	if _, err := merge.NewPlan(ctx, e.c, "m", "m", merge.Options{}); err == nil || !strings.Contains(err.Error(), "e2e") {
 		t.Fatalf("no keys: %v", err)
@@ -174,7 +175,9 @@ func TestE2EMergeReencrypts(t *testing.T) {
 
 // Replays and conflicts work on the plaintext exactly as in a plaintext
 // namespace; resolutions are sealed too.
-func TestE2EReplayAndConflicts(t *testing.T) {
+func TestE2EReplayAndConflicts(t *testing.T) { t.Parallel(); testE2EReplayAndConflicts(t) }
+
+func testE2EReplayAndConflicts(t *testing.T) {
 	e := newE3(t, nil)
 	must(e.x.CreateDocSealed(ctx, "m", "pen", map[string]any{"n": 0}))
 	e.branch("r7")
@@ -217,6 +220,7 @@ func TestE2EReplayAndConflicts(t *testing.T) {
 // already holds with the branch's document counts as merged by content,
 // one the branch changed since conflicts (rebase first).
 func TestE2EMergeWithoutAuthors(t *testing.T) {
+	t.Parallel()
 	e := newE3(t, map[string]any{"encryption": map[string]any{"level": "e2e"}})
 	e.branch("r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -235,6 +239,7 @@ func TestE2EMergeWithoutAuthors(t *testing.T) {
 // that doesn't validate against its $schema makes the resource an invalid
 // conflict, and a resolution that fixes it goes through.
 func TestE2EMergeValidates(t *testing.T) {
+	t.Parallel()
 	e := newE3(t, nil)
 	must(e.c.CreateNamespace(ctx, "schemas", map[string]any{"read": "public"}))
 	sch := must(e.c.CreateDoc(ctx, "schemas", "item", map[string]any{"$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -267,6 +272,7 @@ func TestE2EMergeValidates(t *testing.T) {
 // lists, the blobs keep their ciphertext and ids, and the branch's blobs
 // reach the base through the batch's source, uploaded nowhere else.
 func TestE2EMergeKeepsBlobs(t *testing.T) {
+	t.Parallel()
 	e := newE3(t, nil)
 	e.branch("r7")
 	ref := must(e.x.UploadBlob(ctx, "r7", "derby", "image/png", []byte("goal")))
@@ -295,6 +301,7 @@ func TestE2EMergeKeepsBlobs(t *testing.T) {
 // Rebasing an e2e branch gives the successor its own keyring, replays
 // re-encrypted under it, switches, and catches up exactly what is new.
 func TestE2ERebase(t *testing.T) {
+	t.Parallel()
 	e := newE3(t, map[string]any{"encryption": map[string]any{"level": "e2e"}})
 	e.branch("r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -340,6 +347,7 @@ func TestE2ERebase(t *testing.T) {
 // At E2 ids are over plaintext, so a fast-forward merge reproduces the
 // branch's ids (§F.8).
 func TestSealedFastForwardKeepsIDs(t *testing.T) {
+	t.Parallel()
 	ks, err := keystore.New(keystore.Generate())
 	noErr(t, err)
 	s := clienttest.New(t, clienttest.Options{KeyStore: ks})

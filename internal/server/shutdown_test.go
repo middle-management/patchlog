@@ -282,6 +282,7 @@ func TestShutdownEndsEventStreams(t *testing.T) {
 // When -shutdown-timeout expires, a blocked write is cancelled and rolls
 // back: nothing of it is stored, and the chains verify.
 func TestShutdownTimeoutRollsBackWrite(t *testing.T) {
+	t.Parallel()
 	s := newShutdownEnv(t, lifecycle.Options{Timeout: 300 * time.Millisecond, CancelGrace: 5 * time.Second})
 	s.mkNS("docs", map[string]any{"read": "public"})
 	head := s.create("docs", "a", map[string]any{"n": 1.0})

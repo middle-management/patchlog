@@ -49,6 +49,7 @@ func fakeIndex(t *testing.T) (*httptest.Server, *[]string) {
 }
 
 func TestIndexProxy(t *testing.T) {
+	t.Parallel()
 	idx, seen := fakeIndex(t)
 	h, err := NewIndexProxy(idx.URL)
 	if err != nil {
@@ -138,6 +139,7 @@ func TestIndexProxy(t *testing.T) {
 // The index may sit below a path (behind a gateway): its redirects are
 // mapped back, and ones that leave that path are left alone.
 func TestIndexProxyBasePath(t *testing.T) {
+	t.Parallel()
 	idx, _ := fakeIndex(t)
 	h, err := NewIndexProxy(idx.URL + "/idx/")
 	if err != nil {
@@ -157,6 +159,7 @@ func TestIndexProxyBasePath(t *testing.T) {
 }
 
 func TestIndexProxyUnreachable(t *testing.T) {
+	t.Parallel()
 	idx := httptest.NewServer(http.NotFoundHandler())
 	url := idx.URL
 	idx.Close()
@@ -172,6 +175,7 @@ func TestIndexProxyUnreachable(t *testing.T) {
 }
 
 func TestIndexProxyBadURL(t *testing.T) {
+	t.Parallel()
 	for _, u := range []string{"", "index:8081", "ftp://index", "http://", "http://index?x=1"} {
 		if _, err := NewIndexProxy(u); err == nil {
 			t.Errorf("%q accepted", u)

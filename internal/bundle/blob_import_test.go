@@ -75,6 +75,7 @@ func sentBlobs(rep *bundle.Report) (uploaded, copied int) {
 // the history up to requires referenced; within one deployment blobs are
 // copied.
 func TestBundleBlobs(t *testing.T) {
+	t.Parallel()
 	src := newDeployment(t, stagingOrigin)
 	src.ns("m", nil)
 	nonce := seal.NewNonce()
@@ -187,6 +188,7 @@ func TestBundleBlobs(t *testing.T) {
 // A blob line after a line that references it rejects the bundle, and a
 // referenced blob the target lacks fails the batch with code "blob".
 func TestBundleBlobOrder(t *testing.T) {
+	t.Parallel()
 	data := []byte("late blob")
 	bid := ids.Blob("text/plain", "", data).String()
 	patches := client.GenesisPatches(map[string]any{"b": client.BlobRef(bid, "text/plain", len(data), "")})
@@ -235,6 +237,7 @@ func TestBundleBlobOrder(t *testing.T) {
 // §G.4.1: blob lines are written as unpadded base64url; readers accept
 // padding too.
 func TestBundleBlobPadding(t *testing.T) {
+	t.Parallel()
 	data := []byte("pad") // 3 bytes: no padding either way
 	data2 := []byte("padded!")
 	for _, d := range [][]byte{data, data2} {
@@ -270,6 +273,7 @@ func TestBundleBlobPadding(t *testing.T) {
 
 // §G.5.1.1: in a sealed bundle a blob line is sealed like any other.
 func TestSealedBundleBlobs(t *testing.T) {
+	t.Parallel()
 	src := newDeployment(t, stagingOrigin)
 	src.ns("p", map[string]any{"read": "grant"})
 	secret := []byte(marker + " in a blob, long enough to look for")
@@ -296,6 +300,7 @@ func TestSealedBundleBlobs(t *testing.T) {
 // its keys, so the blob lines carry the plaintext, which a sealed bundle
 // seals per line; the import uploads the plaintext to the sealed target.
 func TestBundleSealedNamespaceBlobs(t *testing.T) {
+	t.Parallel()
 	src := newEncDeployment(t, stagingOrigin)
 	src.ns("s", map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}})
 	secret := []byte(marker + " in a sealed blob")
@@ -337,6 +342,7 @@ func TestBundleSealedNamespaceBlobs(t *testing.T) {
 // new); the import uploads them as sealed blobs, so the target serves the
 // same bytes, which the references' keys decrypt.
 func TestBundleE2EBlobs(t *testing.T) {
+	t.Parallel()
 	src := newEncDeployment(t, stagingOrigin)
 	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
 	reader := identity(t)

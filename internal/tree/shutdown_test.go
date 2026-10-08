@@ -34,7 +34,7 @@ func TestMinWaitEndsOnShutdown(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("min wait still running after shutdown")
 	}
-	// MinWait is 2 s in these tests.
+	// MinWait is 30 s in these tests.
 	if d := time.Since(start); d > time.Second {
 		t.Fatalf("took %s", d)
 	}

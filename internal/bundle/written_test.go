@@ -60,6 +60,7 @@ func sigStatuses(t *testing.T, b []byte, opt bundle.VerifyOptions) (map[string]b
 // `written`, and a signature made over the base's name verifies in the
 // branch's bundle.
 func TestBranchExportGrantNSAndWritten(t *testing.T) {
+	t.Parallel()
 	nsKey := clienttest.NewKey("ns-key")
 	opKey := clienttest.NewKey("operator-2026")
 	botA := signerKey(t, "bot-a", 1)
@@ -143,6 +144,7 @@ func TestBranchExportGrantNSAndWritten(t *testing.T) {
 // that leave `key` out: the chain can't be completed from the bundle, and
 // completes only through a finder that supplies a key that verifies.
 func TestWrittenOriginAndKeylessGrantLine(t *testing.T) {
+	t.Parallel()
 	const baseOrigin = "https://base.example"
 	nsKey := clienttest.NewKey("ns-key")
 	other := clienttest.NewKey("other")
@@ -344,6 +346,7 @@ func sealedGrantsHandler(t *testing.T, grants map[string]*grant.Grant, grantFor 
 // A sealed namespace's grants are fetched sealed and opened with the
 // namespace's key; the bundle carries them, so the signatures verify.
 func TestSealedNamespaceGrantsExport(t *testing.T) {
+	t.Parallel()
 	nsKey := clienttest.NewKey("ns-key")
 	bot := signerKey(t, "bot-1", 1)
 	g := mintFor(t, nsKey.Priv, nsKey.Kid, "alice", "s", bot)
@@ -400,6 +403,7 @@ func TestSealedNamespaceGrantsExport(t *testing.T) {
 // An end-to-end namespace serves its grants in the clear: the bundle
 // carries them.
 func TestE2ENamespaceGrantsExport(t *testing.T) {
+	t.Parallel()
 	nsKey := clienttest.NewKey("ns-key")
 	bot := signerKey(t, "bot-1", 1)
 	g := mintFor(t, nsKey.Priv, nsKey.Kid, "alice", "e", bot)

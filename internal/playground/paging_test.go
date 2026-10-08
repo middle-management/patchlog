@@ -108,6 +108,7 @@ FUNCTIONS
 // the whole range. app.js's readers run under node against a server with
 // a log page size of 2.
 func TestLogPagesWithNode(t *testing.T) {
+	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")
@@ -235,6 +236,7 @@ func newTestKeyStore(t *testing.T) *keystore.Local {
 // nsLogRead or readLogRange (and the fold redirect's answer, which readDoc
 // gets from its callers, too).
 func TestLogReadersUsed(t *testing.T) {
+	t.Parallel()
 	js, err := assets.ReadFile("static/app.js")
 	if err != nil {
 		t.Fatal(err)
@@ -292,6 +294,7 @@ FUNCTIONS
 // served as /rev/{H}, never as a log entry), so the range reads as one
 // chain (§7.1 Paging).
 func TestLogPageFromSnapshotWithNode(t *testing.T) {
+	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")
@@ -454,12 +457,13 @@ FUNCTIONS
 // snapshot (§7.1 Paging, §8.6): across pages and on a single page, and at
 // the horizon itself from /rev/{H} alone.
 func TestE2EFoldFromHorizonWithNode(t *testing.T) {
+	t.Parallel()
 	node, err := exec.LookPath("node")
 	if err != nil {
 		t.Skip("node not installed")
 	}
 	for _, size := range []int{2, 100} {
-		t.Run(fmt.Sprintf("page%d", size), func(t *testing.T) { testE2EFoldFromHorizonWithNode(t, node, size) })
+		t.Run(fmt.Sprintf("page%d", size), func(t *testing.T) { t.Parallel(); testE2EFoldFromHorizonWithNode(t, node, size) })
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 // §6.6: valueSize bounds the largest string, member names included, and
 // pathSize the longest pointer, both as canonical JSON.
 func TestValueAndPathSize(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("v", map[string]any{"limits": map[string]any{"valueSize": 100, "pathSize": 40}})
 	mk := func(name string, doc any) *resp { return e.write("PATCH", "v", name, "", addRoot(doc)) }
@@ -38,6 +39,7 @@ func TestValueAndPathSize(t *testing.T) {
 
 // §6.6: creates, and restores from scratch, may be as large as documentSize.
 func TestCreatesFromScratch(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("s", map[string]any{"limits": map[string]any{"patchSetSize": 1024, "documentSize": 16384}})
 	str := strings.Repeat("x", 1000)
@@ -59,6 +61,7 @@ func TestCreatesFromScratch(t *testing.T) {
 // §6.6: a config write to an e2e namespace needs room for a sealed patch set
 // that replaces one string.
 func TestE2EConfigLimits(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning)
 	put := func(ns string, limits map[string]any) *resp {
 		return e.do(req{method: "PATCH", path: "/ns/" + ns, ifNoneMatch: "*", author: "admin",
@@ -87,6 +90,7 @@ func blobRef(id string, extra map[string]any) map[string]any {
 
 // §6.5: $blob is reserved at any depth, and a reference must be well-formed.
 func TestBlobReferencesWellFormed(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("b", map[string]any{"limits": map[string]any{"blobsPerDocument": 2}})
 	id := ids.Of([]byte("one")).String()
@@ -150,6 +154,7 @@ func TestBlobReferencesWellFormed(t *testing.T) {
 
 // §6.6: an allowance's `until` ends it.
 func TestAllowanceUntil(t *testing.T) {
+	t.Parallel()
 	until := t0.Add(20 * time.Minute).Format(time.RFC3339)
 	f := newAuthFixture(t, map[string]any{
 		"limits": map[string]any{"itemsPerBatch": 2},

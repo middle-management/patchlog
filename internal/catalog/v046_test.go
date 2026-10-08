@@ -12,6 +12,8 @@ import (
 // TestMinOnGrants: POST /grants and POST /read-grants take ?min={ns}:{ns_id},
 // repeatable, as listings do: they decide at a checkpoint at or past every
 // min, or answer 503 with Retry-After (§B.11.4 Read-your-writes, §A.5).
+// Not parallel: the service must reach the mins within the default
+// MinWait (2 s).
 func TestMinOnGrants(t *testing.T) {
 	w := setup(t)
 	w.seed()
@@ -40,9 +42,21 @@ func TestMinOnGrants(t *testing.T) {
 			t.Fatalf("read-grants with two mins: %d %v", r.status, r.body)
 		}
 	}
+}
 
-	// A min the service can't reach (an id of another namespace's entry)
-	// is 503 with Retry-After, and nothing is issued.
+// TestMinOnGrantsUnreachable: a min the service can't reach (an id of
+// another namespace's entry) is 503 with Retry-After, and nothing is
+// issued; a malformed one, or one naming a namespace the service doesn't
+// follow, is 400 (§B.11.4, §A.5).
+func TestMinOnGrantsUnreachable(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	bob := w.caller("user:bob", "match-desk")
+
 	other := must(w.ops.CreateDoc(ctx, "matches", "never", map[string]any{"title": "never"}))
 	for _, c := range []struct{ path, body string }{
 		{"/grants?min=cat:" + other.NSID, "grants"},
@@ -72,6 +86,7 @@ func TestMinOnGrants(t *testing.T) {
 // powers collected on the walk up there too (§B.11.2); moves stay bounded
 // by no widening (§B.11.4).
 func TestInheritPowers(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.doc("cat", "desks", map[string]any{"title": "Desks", "parents": parents("root"), "$access": acc("group:match-desk", "desk")})
@@ -117,6 +132,7 @@ func TestInheritPowers(t *testing.T) {
 // /r/{ns}/{name} (and so /r/{ns}/{name}/…), read-only, for the one
 // namespace, so the origin can exchange it for an edge grant (§B.11.5, §C.5).
 func TestReadGrantsAreFixedToTheResource(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()

@@ -13,6 +13,7 @@ import (
 // tombstone it, and purges, prunes and namespace purges take revisions
 // away, each seen by the very next read after having been cached.
 func TestReadCacheInvalidation(t *testing.T) {
+	t.Parallel()
 	dir := t.TempDir()
 	e := newEnv(t, withArchive(t, dir), withoutRetentionLoop)
 	e.mkNS("pub", map[string]any{"read": "public"})
@@ -76,6 +77,7 @@ func TestReadCacheInvalidation(t *testing.T) {
 // Making a public namespace private stops anonymous reads at once, cached or
 // not.
 func TestReadCachePublicToPrivate(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, map[string]any{})
 	e := f.tenv
 	expect(t, e.patchNS("sec", ops(op("replace", "/read", "public")), f.adminG), 201)
@@ -94,6 +96,7 @@ func TestReadCachePublicToPrivate(t *testing.T) {
 // exactly as uncached ones, private cache headers included, and refusals
 // are unchanged by what other readers have cached (§7, §9).
 func TestReadCacheAuthenticated(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, map[string]any{})
 	e := f.tenv
 	id := e.create("sec", "a", map[string]any{"t": "x"}, f.adminG)
@@ -142,6 +145,7 @@ func TestReadCacheAuthenticated(t *testing.T) {
 // writer had produced by the time the read returned, and reads after the
 // last write see the last head.
 func TestReadCacheConcurrentHeads(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withFileDB(t))
 	e.mkNS("pub", map[string]any{"read": "public"})
 	ids := []string{e.create("pub", "a", map[string]any{"n": 0.0})}
@@ -192,6 +196,7 @@ func TestReadCacheConcurrentHeads(t *testing.T) {
 // 410 "long"; an unknown id of GET /ns/{ns}/rev/{id} and /heads is "short"
 // for the namespace's visibility, public or at the edge.
 func TestReviewLogCacheClasses(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("pub", map[string]any{"read": "public"})
 	e.mkNS("priv", map[string]any{})

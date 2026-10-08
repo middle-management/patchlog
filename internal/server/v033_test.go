@@ -31,6 +31,7 @@ func (e *tenv) typed(ns, name, ref string, who ...string) *resp {
 
 // §6.1 Never into a branch, drafts in branches; §7.4 drafts.for.
 func TestDraftSchemasResolve(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("schemas", map[string]any{})
 	e.mkNS("matches", map[string]any{})
@@ -110,6 +111,7 @@ func referencing(r *resp) []string {
 // copy satisfying a reference is in_use; a fast-forward leaves another
 // copy; a forced purge goes ahead. §7.4: narrowing drafts.for is in_use.
 func TestDraftSchemasInUse(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("schemas", map[string]any{})
 	e.mkNS("matches", map[string]any{})
@@ -164,6 +166,7 @@ func TestDraftSchemasInUse(t *testing.T) {
 // §6.1: every revision a branch wrote counts as referencing, not only its
 // head; a tombstoned document still counts.
 func TestDraftSchemasEveryRevisionCounts(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("schemas", map[string]any{})
 	e.mkNS("matches", map[string]any{})
@@ -187,6 +190,7 @@ func TestDraftSchemasEveryRevisionCounts(t *testing.T) {
 // D.8: two purges, each of one of the last two copies of a referenced
 // draft, can't both succeed.
 func TestDraftSchemasConcurrentPurges(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withFileDB(t))
 	e.mkNS("schemas", map[string]any{})
 	e.mkNS("matches", map[string]any{})
@@ -229,6 +233,7 @@ func TestDraftSchemasConcurrentPurges(t *testing.T) {
 // §G.3: a remote branch whose documents reference a draft fails with 422:
 // its schemas are mirrored only from their own namespaces.
 func TestDraftSchemasRemoteBranch(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	a.mkNS("schemas", map[string]any{"read": "public"})
 	a.mkNS("main", map[string]any{"read": "public"})
@@ -274,6 +279,7 @@ func (e *tenv) doMulti(path, bearer string, body any, header string, values []st
 // request's grant (naming the candidate, verifying under its keys) or with
 // any grant of a repeated Source-Authorization.
 func TestDraftSchemasReadGrant(t *testing.T) {
+	t.Parallel()
 	e := newAuthEnv(t)
 	kS, kM, kBoth := newKey("ks"), newKey("km"), newKey("kboth")
 	e.mkNS("schemas", map[string]any{"read": "grant", "keys": []any{kS.entry("*"), kBoth.entry("read", "create", "purge")}})

@@ -15,6 +15,7 @@ import (
 // namespace's schema revisions to writes in, and readers of documents of,
 // the listed namespaces, by revision path only.
 func TestV046SchemaReads(t *testing.T) {
+	t.Parallel()
 	e := newAuthEnv(t)
 	sk, ck, ok, cfgKey := newKey("sk"), newKey("ck"), newKey("ok"), newKey("cfg")
 	rk := newKey("rk")
@@ -109,6 +110,7 @@ func TestV046SchemaReads(t *testing.T) {
 // v0.46 §8.4: unfreezing a branch whose base already has
 // branchesPerNamespace live branches is 422 (§6.6).
 func TestV046UnfreezeCountsLiveBranches(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{"read": "public", "limits": map[string]any{"branchesPerNamespace": 1.0}})
 	e.create("main", "a", map[string]any{"v": 1.0})
@@ -124,6 +126,7 @@ func TestV046UnfreezeCountsLiveBranches(t *testing.T) {
 // v0.46 §C.4 "Keys follow the base": a branch accepts its base's current
 // keys as well as its own; a shared kid is the base's.
 func TestV046KeysFollowTheBase(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
@@ -166,6 +169,7 @@ func TestV046KeysFollowTheBase(t *testing.T) {
 // remote branches and forcing purges; anything else is 401, except reads
 // of a public namespace, which ignore them.
 func TestV046OperatorGrantScope(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
@@ -213,6 +217,7 @@ func cookieHdr(c *http.Cookie) map[string]string {
 // v0.46 §C.5 "Issuing them": POST /edge-grants exchanges a grant for edge
 // grants as cookies, which authorise GET and HEAD under their prefix.
 func TestV046EdgeGrants(t *testing.T) {
+	t.Parallel()
 	f := newAuthFixture(t, nil)
 	e := f.tenv
 	a := e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
@@ -301,6 +306,7 @@ func TestV046EdgeGrants(t *testing.T) {
 // Behind a verifying edge, a cookie read gets the edge's lifetimes, and is
 // refused around the edge (§9).
 func TestV046EdgeGrantsBehindEdge(t *testing.T) {
+	t.Parallel()
 	v, err := edge.New([]byte("s3cret"), "")
 	if err != nil {
 		t.Fatal(err)

@@ -15,6 +15,7 @@ import (
 // authentication is on ("grants") or "disabled", and the origin. Clients
 // read the mode from there (client.Root, client.AuthDisabled).
 func TestV038Root(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name string
 		e    *tenv
@@ -45,6 +46,7 @@ func TestV038Root(t *testing.T) {
 // §1 (v0.38): with authentication disabled, config writes skip namespace
 // rules, as *-key writes do (§6.4.3); resource writes are still checked.
 func TestV038DevRules(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "ok"}}})
 	expect(t, e.patchNS("main", ops(op("add", "/x-note", "config writes skip the rules")), ""), 201)
@@ -59,6 +61,7 @@ func TestV038DevRules(t *testing.T) {
 // authentication was disabled, from an entry without "grant" (the
 // server's own).
 func TestV038ClientGrantNull(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("main", map[string]any{})
 	a := e.create("main", "a", map[string]any{}, "ann")
@@ -91,6 +94,7 @@ func TestV038ClientGrantNull(t *testing.T) {
 // migration they serve no grant, and count for no one; entries written
 // from then on serve null.
 func TestV038GrantNullMigration(t *testing.T) {
+	t.Parallel()
 	path, driver := filepath.Join(t.TempDir(), "old.db"), "sqlite"
 	if pgtest.Enabled() {
 		path, driver = pgtest.NewDB(t), "pgx"
@@ -130,6 +134,7 @@ func TestV038GrantNullMigration(t *testing.T) {
 // data; the keys of catalogs are catalog names; other members of them are
 // 422 invalid with a pointer to the member.
 func TestV038AddendaXMembers(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("docs", map[string]any{"read": "public"})
 	id := e.nsHead("docs")

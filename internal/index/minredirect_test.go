@@ -75,6 +75,7 @@ func (g *gatePurger) PurgeTags(tags []string) {
 // of the previous checkpoint, both settle on the new checkpoint in one
 // redirect, never cycling between the old and the new at (§A.4, §A.5).
 func TestMinDuringPublish(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	w := setup(t)
 	gate := &gatePurger{tag: "r:matches/victim", entered: make(chan struct{}), release: make(chan struct{})}
@@ -93,7 +94,7 @@ func TestMinDuringPublish(t *testing.T) {
 	}()
 	select {
 	case <-gate.entered:
-	case <-time.After(5 * time.Second):
+	case <-time.After(30 * time.Second):
 		t.Fatal("the purge was not applied")
 	}
 	q := "?schema=" + url.QueryEscape(w.match)
@@ -128,8 +129,9 @@ func TestMinDuringPublish(t *testing.T) {
 // min from many clients, following redirects: no URL repeats, at most one
 // redirect from the head pointer, and the answer covers the write.
 func TestMinAfterWriteConcurrent(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
-	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, minWait: 3 * time.Second})
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, minWait: 30 * time.Second})
 	s.caughtUp("matches")
 	q := "?schema=" + url.QueryEscape(w.match)
 	for i := range 15 {

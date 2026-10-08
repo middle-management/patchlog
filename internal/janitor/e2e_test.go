@@ -47,6 +47,7 @@ func newE3Merged(t *testing.T) (*env, *client.E2E, string) {
 // with the epoch bump, don't count against it (the keyring is never
 // merged), and the base still folds after the purge.
 func TestE2EMergedBranchPurgedWithoutKeys(t *testing.T) {
+	t.Parallel()
 	e, x, at := newE3Merged(t)
 	_, reader, _ := seal.GenerateRecipient()
 	must(x.AddReader(ctx, "r7", reader.PublicKey(), false))
@@ -65,6 +66,7 @@ func TestE2EMergedBranchPurgedWithoutKeys(t *testing.T) {
 
 // Any other document change after the merge still keeps the branch.
 func TestE2EBranchChangedAfterMergeKept(t *testing.T) {
+	t.Parallel()
 	e, x, at := newE3Merged(t)
 	h := must(e.c.Head(ctx, "r7", "derby"))
 	must(x.AppendSealed(ctx, "r7", "derby", h.ID, []any{op("replace", "/score", "2-0")}))

@@ -23,6 +23,7 @@ func entryOf(t *testing.T, list any, name string) map[string]any {
 // TestItemTitles: catalog.title is a pointer into an item's head whose
 // string listings carry as title (§B.5).
 func TestItemTitles(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	ctx := context.Background()
 	w.folder(t, "root", "Root")

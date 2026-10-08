@@ -60,6 +60,7 @@ func (e *tenv) expectFiles(prefix string, n int, what string) []string {
 // bytes go once the collecting transaction commits: the grace sweep, and
 // a purge.
 func TestBlobFilesLifecycle(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("f", map[string]any{"read": "public", "limits": map[string]any{"blobGrace": "PT1H"}})
 	data := []byte("0123456789 file-backed blob")
@@ -107,6 +108,7 @@ func TestBlobFilesLifecycle(t *testing.T) {
 // §E.1: bytes encrypted at rest are a file per resource, without the
 // plaintext; a purge deletes them along with the data key.
 func TestBlobFilesAtRest(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning)
 	e.mkNS("enc", atRest(map[string]any{"read": "public"}))
 	data := []byte("at rest " + encMarker)
@@ -134,6 +136,7 @@ func TestBlobFilesAtRest(t *testing.T) {
 // §E.2.2: an epoch's sealing is a file too, the first stored winning among
 // concurrent first readers; purges delete it.
 func TestBlobFilesSealed(t *testing.T) {
+	t.Parallel()
 	e := newSealedEnv(t, withoutBlobSweep)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	data := []byte("sealed " + encMarker)
@@ -173,6 +176,7 @@ func TestBlobFilesSealed(t *testing.T) {
 // The orphan sweep deletes old files no row names and old temporary files,
 // and nothing else.
 func TestBlobFilesOrphanSweep(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning)
 	e.mkNS("o", map[string]any{"read": "public"})
 	data := []byte("named")
@@ -224,6 +228,7 @@ func TestBlobFilesOrphanSweep(t *testing.T) {
 // Rows written before blob files keep their bytes in the table: they are
 // served, copied and collected as before.
 func TestBlobFilesLegacyRows(t *testing.T) {
+	t.Parallel()
 	path := filepath.Join(t.TempDir(), "legacy.db")
 	e := newEnv(t, withBlobTuning, withPath(path))
 	e.mkNS("l", map[string]any{"read": "public"})
@@ -262,6 +267,7 @@ func TestBlobFilesLegacyRows(t *testing.T) {
 // Without a blob directory (":memory:", Postgres without -blob-dir) the
 // bytes stay in the database.
 func TestBlobTableStore(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withBlobTuning, withTableBlobs)
 	e.mkNS("t", map[string]any{"read": "public"})
 	data := []byte("in the table")

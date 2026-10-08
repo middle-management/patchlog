@@ -7,6 +7,7 @@ import "testing"
 // another resource in the same namespace. The answer names that revision
 // path, never the dialect URL the schema itself carries (§6.1, §12).
 func TestSchemaUnavailableNamesPin(t *testing.T) {
+	t.Parallel()
 	e := newAuthEnv(t)
 	k := newKey("k")
 	rk := newKey("rk")

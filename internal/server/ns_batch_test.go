@@ -7,6 +7,7 @@ import (
 
 // §7.4 namespace reads and config writes (dev mode).
 func TestNamespace(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	cfg0 := e.mkNS("docs", map[string]any{"read": "public", "x-title": "Docs"})
 
@@ -129,6 +130,7 @@ func TestNamespace(t *testing.T) {
 
 // §7.5 batches.
 func TestBatch(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("m", map[string]any{"read": "public"})
 	derby := e.create("m", "derby", map[string]any{"score": "0-0"})
@@ -271,6 +273,7 @@ func TestBatch(t *testing.T) {
 // §7.5: config change in a batch, items against the new configuration,
 // idempotent retry of a batch with a config change, schemas from earlier items.
 func TestBatchConfigAndSchemas(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	cfg0 := e.mkNS("m", map[string]any{"read": "public"})
 	cfgPatches := ops(op("add", "/rules", []any{map[string]any{
@@ -370,6 +373,7 @@ func TestBatchConfigAndSchemas(t *testing.T) {
 
 // §7.5 source: local sources are checked.
 func TestBatchSource(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("m", map[string]any{"read": "public"})
 	e.mkNS("rel", map[string]any{"read": "public"})
@@ -392,6 +396,7 @@ func TestBatchSource(t *testing.T) {
 
 // §7.5 dry run by a principal that has never written.
 func TestBatchDryRunNewPrincipal(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, withFileDB(t))
 	e.mkNS("m", map[string]any{"read": "public"})
 	body := map[string]any{"items": []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}

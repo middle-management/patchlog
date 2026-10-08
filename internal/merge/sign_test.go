@@ -54,6 +54,7 @@ func checkStep(t *testing.T, signer sig.Signer, origin, ns, name string, parent 
 }
 
 func TestSignedStepsFastForwardAndReplay(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -97,6 +98,7 @@ func TestSignedStepsFastForwardAndReplay(t *testing.T) {
 }
 
 func TestSignedReplayAfterTargetMoved(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.branch("matches", "r7")
 	e.append("r7", "derby", op("replace", "/score", "1-0"))
@@ -113,6 +115,7 @@ func TestSignedReplayAfterTargetMoved(t *testing.T) {
 }
 
 func TestSignStepsChainsParentsAndTombstones(t *testing.T) {
+	t.Parallel()
 	key, signer := testKey(t)
 	parent := ids.Hash(nil, []byte("x")).String()
 	patches := ops(op("replace", "/a", 1))

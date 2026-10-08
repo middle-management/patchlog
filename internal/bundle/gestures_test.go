@@ -13,6 +13,7 @@ import (
 // undoes, and an import writes them with the revisions; without authors
 // they are left out, and a line that carries them anyway is refused.
 func TestBundleGestures(t *testing.T) {
+	t.Parallel()
 	src := newDeployment(t, stagingOrigin)
 	dst := newDeployment(t, cmsOrigin)
 	must(src.c.CreateNamespace(ctx, "m", map[string]any{"read": "public"}))

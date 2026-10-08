@@ -120,6 +120,11 @@ func wantKeep(t *testing.T, d janitor.Decision, reason string) {
 }
 
 func TestPurgesGenuinelyMergedAfterPeriod(t *testing.T) {
+	t.Parallel()
+	testPurgesGenuinelyMergedAfterPeriod(t)
+}
+
+func testPurgesGenuinelyMergedAfterPeriod(t *testing.T) {
 	e := newEnv(t, nil)
 	e.branch("matches", "r7", map[string]any{"merged": "P7D"})
 	e.edit("r7", "derby", "1-0")
@@ -150,7 +155,9 @@ func TestPurgesGenuinelyMergedAfterPeriod(t *testing.T) {
 	}
 }
 
-func TestRefusesForgedMergedClaim(t *testing.T) {
+func TestRefusesForgedMergedClaim(t *testing.T) { t.Parallel(); testRefusesForgedMergedClaim(t) }
+
+func testRefusesForgedMergedClaim(t *testing.T) {
 	e := newEnv(t, nil)
 	e.branch("matches", "r7", map[string]any{"merged": "P1D"})
 	e.edit("r7", "derby", "1-0")
@@ -185,6 +192,7 @@ func TestRefusesForgedMergedClaim(t *testing.T) {
 }
 
 func TestNoOwnEntriesCountsAsMerged(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, nil)
 	e.branch("matches", "empty", map[string]any{"merged": "PT1H"})
 	e.config("empty", op("add", "/frozen", true))
@@ -195,6 +203,7 @@ func TestNoOwnEntriesCountsAsMerged(t *testing.T) {
 }
 
 func TestDependentsLeavesFirst(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, nil)
 	e.branch("matches", "r7", map[string]any{"merged": "P1D"})
 	e.edit("r7", "derby", "1-0")
@@ -217,6 +226,7 @@ func TestDependentsLeavesFirst(t *testing.T) {
 }
 
 func TestBaseMinimum(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, map[string]any{"read": "public", "merge": devAuthors, "cleanup": map[string]any{"merged": "P30D"}})
 	e.branch("matches", "r7", map[string]any{"merged": "P1D"}) // shorter than the base allows
 	e.edit("r7", "derby", "1-0")
@@ -230,6 +240,7 @@ func TestBaseMinimum(t *testing.T) {
 }
 
 func TestNoPeriodMeansKeep(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, nil)
 	e.branch("matches", "r7", nil)
 	e.edit("r7", "derby", "1-0")
@@ -238,7 +249,9 @@ func TestNoPeriodMeansKeep(t *testing.T) {
 	wantKeep(t, e.sweep(false)["r7"], "no cleanup period")
 }
 
-func TestPurgesSupersededBranch(t *testing.T) {
+func TestPurgesSupersededBranch(t *testing.T) { t.Parallel(); testPurgesSupersededBranch(t) }
+
+func testPurgesSupersededBranch(t *testing.T) {
 	e := newEnv(t, nil)
 	e.branch("matches", "r7", map[string]any{"superseded": "P2D"})
 	e.edit("r7", "derby", "1-0")
@@ -270,6 +283,7 @@ func TestPurgesSupersededBranch(t *testing.T) {
 }
 
 func TestAddDuration(t *testing.T) {
+	t.Parallel()
 	t0 := time.Date(2026, 1, 31, 0, 0, 0, 0, time.UTC)
 	for s, want := range map[string]time.Time{
 		"P7D":            t0.AddDate(0, 0, 7),
@@ -291,12 +305,13 @@ func TestAddDuration(t *testing.T) {
 }
 
 func TestRunPurgesOnSchedule(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, nil)
 	e.branch("matches", "r7", map[string]any{"merged": "PT1M"})
 	e.edit("r7", "derby", "1-0")
 	must(merge.Freeze(ctx, e.c, "r7", e.merge("r7")))
 	e.s.Clock.Advance(2 * time.Minute)
-	rctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	got := make(chan janitor.Decision, 16)
 	j := janitor.New(e.c, janitor.Options{Bases: []string{"matches"}, Now: e.s.Clock.Now, Interval: 50 * time.Millisecond,
@@ -322,6 +337,7 @@ func TestRunPurgesOnSchedule(t *testing.T) {
 // With authentication on, a merged claim counts only if the merge batch's
 // author (root sub and kid) is in the base's merge.authors.
 func TestMergedClaimNeedsListedAuthor(t *testing.T) {
+	t.Parallel()
 	for _, tc := range []struct {
 		name, sub string
 		listedKey bool
@@ -373,6 +389,7 @@ func TestMergedClaimNeedsListedAuthor(t *testing.T) {
 // deployment says "auth": "disabled" at GET /, and counts for no one once
 // the same deployment says "grants".
 func TestMergedClaimDevNeedsDisabledDeployment(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t, nil)
 	e.branch("matches", "r7", map[string]any{"merged": "P1D"})
 	e.edit("r7", "derby", "1-0")

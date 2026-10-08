@@ -18,6 +18,7 @@ func matchSchema() map[string]any {
 
 // §6.1 schema references, §6.2 step 5, §6.3.
 func TestSchemas(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("schemas", map[string]any{"read": "public"})
 	e.mkNS("docs", map[string]any{"read": "public"})
@@ -172,6 +173,7 @@ func (e *tenv) nsHeadOf(ns, name string) string {
 
 // §6.4.4 examples and §6.4.3 evaluation.
 func TestRulesExamples(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("schemas", map[string]any{"read": "public"})
 	e.mkNS("other", map[string]any{"read": "public"})
@@ -239,6 +241,7 @@ func TestRulesExamples(t *testing.T) {
 
 // §6.4.1: writes computed per op (move writes both; a fresh $nonce is left out).
 func TestRulesWritesAndNonce(t *testing.T) {
+	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("tr", map[string]any{"read": "public", "rules": []any{
 		map[string]any{

@@ -66,6 +66,7 @@ func (e *tenv) nsEntries(ns string) int {
 // A concurrent append to the same resource: the write is re-checked and
 // answered 412 with the new head; nothing is inserted for it.
 func TestRaceConcurrentAppend(t *testing.T) {
+	t.Parallel()
 	bothDBs(t, func(t *testing.T, opts ...envOpt) {
 		h := &raceHook{}
 		e := newEnv(t, append(opts, withRaceHook(h))...)
@@ -123,6 +124,7 @@ func TestRaceConcurrentAppend(t *testing.T) {
 // An idempotent retry landing between check and insert: the redo finds
 // the entry and answers 200 with it; nothing is written twice.
 func TestRaceIdempotentRetry(t *testing.T) {
+	t.Parallel()
 	bothDBs(t, func(t *testing.T, opts ...envOpt) {
 		h := &raceHook{}
 		e := newEnv(t, append(opts, withRaceHook(h))...)
@@ -168,6 +170,7 @@ func TestRaceIdempotentRetry(t *testing.T) {
 // A config rule change, a freeze, and a removed allowance between check and
 // insert: the write is re-checked against the configuration in force.
 func TestRaceConfigChange(t *testing.T) {
+	t.Parallel()
 	bothDBs(t, func(t *testing.T, opts ...envOpt) {
 		h := &raceHook{}
 		e := newEnv(t, append(opts, withRaceHook(h))...)
@@ -201,6 +204,7 @@ func TestRaceConfigChange(t *testing.T) {
 // A revocation in the namespace, and a key removed from a base, between
 // check and insert: the grant is re-checked and refused.
 func TestRaceRevocationAndKeys(t *testing.T) {
+	t.Parallel()
 	bothDBs(t, func(t *testing.T, opts ...envOpt) {
 		h := &raceHook{}
 		f := newAuthFixture(t, nil, append(opts, withRaceHook(h))...)
@@ -244,6 +248,7 @@ func TestRaceRevocationAndKeys(t *testing.T) {
 // A schema referenced only by the pending write is purged between check and
 // insert: 422 schema_unavailable.
 func TestRaceSchemaPurge(t *testing.T) {
+	t.Parallel()
 	bothDBs(t, func(t *testing.T, opts ...envOpt) {
 		h := &raceHook{}
 		e := newEnv(t, append(opts, withRaceHook(h))...)
@@ -267,6 +272,7 @@ func TestRaceSchemaPurge(t *testing.T) {
 // Rate-limit tokens are drawn once per request, however often the check is
 // redone.
 func TestRaceRateDrawnOnce(t *testing.T) {
+	t.Parallel()
 	bothDBs(t, func(t *testing.T, opts ...envOpt) {
 		h := &raceHook{}
 		e := newEnv(t, append(opts, withRaceHook(h))...)
@@ -287,6 +293,7 @@ func TestRaceRateDrawnOnce(t *testing.T) {
 // An allowance removed between check and insert: the batch limits are
 // re-checked.
 func TestRaceAllowance(t *testing.T) {
+	t.Parallel()
 	h := &raceHook{}
 	max := core.DefaultLimits()
 	max.ItemsPerBatch = 50
@@ -304,6 +311,7 @@ func TestRaceAllowance(t *testing.T) {
 // every chain stays linear, every successful write has exactly one
 // namespace entry, and everything verifies (§4 invariants 2 and 5).
 func TestConcurrentWritersStress(t *testing.T) {
+	t.Parallel()
 	lim := core.DefaultLimits()
 	lim.RatePerResource = core.Rate{Rate: 1e6, Burst: 1e6}
 	lim.RatePerPrincipal = core.Rate{Rate: 1e6, Burst: 1e6}
@@ -508,6 +516,7 @@ func TestConcurrentWritersStress(t *testing.T) {
 // A write whose re-check keeps failing runs its gate inside the write lock
 // after the optimistic rounds, and still draws its rate tokens once.
 func TestRaceFallbackUnderLock(t *testing.T) {
+	t.Parallel()
 	bothDBs(t, func(t *testing.T, opts ...envOpt) {
 		h := &raceHook{}
 		e := newEnv(t, append(opts, withRaceHook(h))...)

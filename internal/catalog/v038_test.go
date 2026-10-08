@@ -21,6 +21,7 @@ import (
 // catalog's key may assert (§B.11.5); grants are issued only through them
 // too (§B.11.4 Resolve).
 func TestVisibilityRulesV038(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	ctx := context.Background()
@@ -136,6 +137,7 @@ func (h *holdRT) RoundTrip(r *http.Request) (*http.Response, error) {
 // listing's combined checkpoint, so a listing at a given at never changes
 // when a /roles change lands later (§B.11.5).
 func TestVisibilityPinned(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	ctx := context.Background()
@@ -201,6 +203,7 @@ func TestVisibilityPinned(t *testing.T) {
 // frozen rows stay those of its deletion even if it was unplaced and
 // placed again (§B.11.4, §B.11.7).
 func TestRestoreV038(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.doc("cat", "matches.final", map[string]any{"parents": parents("season")})
@@ -271,6 +274,7 @@ func TestRestoreV038(t *testing.T) {
 // checked like any other, against the roles the item would have now
 // (§B.11.7): a narrowing move is allowed, a widening one isn't.
 func TestMoveDeletedPlacement(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	w.start()
@@ -294,6 +298,7 @@ func TestMoveDeletedPlacement(t *testing.T) {
 // namespace-wide (§B.11.5). Such an answer in a subject set's URL space
 // is kept by no shared cache, and no longer than the grants.
 func TestUnfilteredPartial(t *testing.T) {
+	t.Parallel()
 	w := setup(t)
 	w.seed()
 	ctx := context.Background()

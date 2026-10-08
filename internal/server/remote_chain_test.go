@@ -95,6 +95,7 @@ func sameHeads(t *testing.T, a, b *tenv, ans, at, bns string) {
 // foreign parents, tombstones and purges; B's first writes take the right
 // parents.
 func TestRemoteBranchOfBranch(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	f := populateChain(t, a)
 
@@ -194,6 +195,7 @@ func TestRemoteBranchOfBranch(t *testing.T) {
 // A branch of a branch on A: three levels, with a resource whose chain
 // crosses both foreign parents.
 func TestRemoteBranchTwoLevels(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	f := populateChain(t, a)
 	x1 := a.create("matches", "x", map[string]any{"n": 1.0})
@@ -246,6 +248,7 @@ func TestRemoteBranchTwoLevels(t *testing.T) {
 
 // Tampering with any level's data is 502, and nothing is written.
 func TestRemoteBranchOfBranchTampered(t *testing.T) {
+	t.Parallel()
 	a, b, rt := pair(t, nil, nil)
 	f := populateChain(t, a)
 	cases := []struct {
@@ -304,6 +307,7 @@ func refusing(t *testing.T, a *tenv, match string, status int) string {
 
 // If B can't read a base of A's branch, it can't create the remote branch.
 func TestRemoteBranchOfBranchUnreadableBase(t *testing.T) {
+	t.Parallel()
 	a, b, rt := pair(t, nil, nil)
 	f := populateChain(t, a)
 	for _, status := range []int{401, 403, 404} {
@@ -322,6 +326,7 @@ func TestRemoteBranchOfBranchUnreadableBase(t *testing.T) {
 // With authentication at A: a grant for r7 alone reads r7 (and what it
 // reads through, as r7), but not matches.
 func TestRemoteBranchOfBranchGrantScope(t *testing.T) {
+	t.Parallel()
 	var aPriv ed25519.PrivateKey
 	a := newEnv(t, withOrigin(originA), withAuth(&aPriv))
 	a.opPriv = aPriv
@@ -349,6 +354,7 @@ func TestRemoteBranchOfBranchGrantScope(t *testing.T) {
 
 // The branch-depth limit counts every namespace of A's chain.
 func TestRemoteBranchDepth(t *testing.T) {
+	t.Parallel()
 	lim := func(n int) envOpt {
 		return func(o *core.Options) {
 			m := core.DefaultLimits()
@@ -370,6 +376,7 @@ func TestRemoteBranchDepth(t *testing.T) {
 // A's purge in matches propagates to r7 at A, as purge entries in r7's log,
 // which B follows (§8.3, §G.3).
 func TestRemoteBranchOfBranchPurge(t *testing.T) {
+	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	f := populateChain(t, a)
 	expect(t, b.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), 201)

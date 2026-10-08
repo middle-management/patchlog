@@ -23,6 +23,7 @@ func applyDiff(t *testing.T, a any, d []any) any {
 }
 
 func TestDiffCases(t *testing.T) {
+	t.Parallel()
 	cases := []struct{ a, b string }{
 		{`{}`, `{}`},
 		{`{"a":1}`, `{"a":2}`},
@@ -133,6 +134,7 @@ func mutate(r *rand.Rand, v any, depth int) any {
 }
 
 func TestDiffRoundTripProperty(t *testing.T) {
+	t.Parallel()
 	r := rand.New(rand.NewPCG(1, 2))
 	for i := 0; i < 3000; i++ {
 		a := randomValue(r, 4)
