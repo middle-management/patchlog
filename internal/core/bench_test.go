@@ -119,6 +119,31 @@ func BenchmarkReadHead(b *testing.B) {
 	})
 }
 
+// BenchmarkNamespaceLogPage reads a 600-entry page of a namespace log from
+// a since, so every entry has a prev.
+func BenchmarkNamespaceLogPage(b *testing.B) {
+	e := benchEngine(b, "public")
+	head := ""
+	for i := 0; i < 601; i++ {
+		var err error
+		if head, err = benchWrite(e, "r", head, i); err != nil {
+			b.Fatal(err)
+		}
+	}
+	ctx := context.Background()
+	first, err := e.NamespaceLog(ctx, "b", "", "", 1, Credentials{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		lg, err := e.NamespaceLog(ctx, "b", "", first.Last, 600, Credentials{})
+		if err != nil || len(lg.Entries) != 600 {
+			b.Fatal(err)
+		}
+	}
+}
+
 // Concurrent creates into one namespace, shaped like a content import:
 // documents of 20–70 KiB (about 25 bytes a leaf), each to a resource of
 // its own. Every sub-benchmark writes b.N documents with that many

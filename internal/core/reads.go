@@ -545,11 +545,19 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		rows.Close()
 		out.Status = 200
 		out.Last = since
+		// An entry's prev is the row before it in the page, but for the
+		// first entry's: a query for each made a page N+1.
+		pageIDs := make(map[int64]string, len(rs))
 		for _, r := range rs {
 			m := jsonv.MustParse([]byte(r.body)).(map[string]any)
 			m["id"] = ids.FromBytes(r.id).String()
+			pageIDs[r.seq] = m["id"].(string)
 			if r.prev != nil {
-				m["prev"] = t.nsLogID(*r.prev).String()
+				prev, ok := pageIDs[*r.prev]
+				if !ok {
+					prev = t.nsLogID(*r.prev).String()
+				}
+				m["prev"] = prev
 			}
 			m["author"] = t.authorName(r.author)
 			m["created"] = formatTime(r.created)
