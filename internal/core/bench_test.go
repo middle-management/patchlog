@@ -319,3 +319,43 @@ func benchDoc(seed, size int) map[string]any {
 	}
 	return map[string]any{"title": fmt.Sprint("Document ", seed), "sections": secs}
 }
+
+// BenchmarkNamespaceHeads reads a 1000-item page of GET
+// /ns/{ns}/rev/{ns_id}/heads: of a namespace of 1,000 resources, and of a
+// branch of it with 100 resources of its own, which reads the rest
+// through.
+func BenchmarkNamespaceHeads(b *testing.B) {
+	e := benchFileEngine(b)
+	ctx := context.Background()
+	create := func(ns string, n, step, from int) string {
+		items := make([]Item, n)
+		for i := range items {
+			items[i] = Item{Resource: fmt.Sprintf("r%05d", from+i*step), IfNoneMatch: true,
+				Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"n": float64(i)}}}}}}
+		}
+		res, err := e.Batch(ctx, Request{NS: ns, Cred: Credentials{Author: "a"}}, items, nil, nil, false)
+		if err != nil {
+			b.Fatal(err)
+		}
+		return res.NSID
+	}
+	base := create("b", 1000, 2, 0)
+	if _, err := e.CreateBranch(ctx, Request{NS: "b", Cred: Credentials{Author: "a"}}, BranchRequest{Name: "c", IfNoneMatch: true}); err != nil {
+		b.Fatal(err)
+	}
+	branch := create("c", 100, 20, 1)
+	for _, c := range []struct{ ns, id string }{{"b", base}, {"c", branch}} {
+		b.Run("ns="+c.ns, func(b *testing.B) {
+			for i := 0; i < b.N; i++ {
+				p, err := e.NamespaceHeads(ctx, c.ns, c.id, "", Credentials{Author: "a"})
+				if err != nil {
+					b.Fatal(err)
+				}
+				if len(p.Items) != 1000 {
+					b.Fatalf("%d items, want 1000", len(p.Items))
+				}
+			}
+			b.ReportMetric(float64(b.Elapsed().Microseconds())/1000/float64(b.N), "ms/page")
+		})
+	}
+}

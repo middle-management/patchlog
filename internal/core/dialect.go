@@ -1,6 +1,7 @@
 package core
 
 import (
+	"encoding/json"
 	"errors"
 	"strconv"
 	"strings"
@@ -22,6 +23,7 @@ import (
 //   - values that are canonical JSON or, encrypted at rest, binary
 //     (revisions.patches, heads.doc, snapshots.doc, grants.blocks): TEXT
 //     or BLOB in SQLite's dynamic typing, bytea on Postgres (blobArg);
+//   - array arguments, which SQLite reads as JSON (inArray);
 //   - constraint violations (isConflict);
 //   - transactions and write serialisation (engine.go).
 
@@ -93,6 +95,32 @@ func pgArgs(args []any) []any {
 func (e *Engine) blobArg(b []byte) any {
 	if e.pg {
 		return b
+	}
+	return string(b)
+}
+
+// inArray is the condition that col is an element of an array argument
+// (arrayArg) of the Postgres type typ. SQLite has no arrays: there the
+// argument is a JSON array, whose elements json_each reads, so one query
+// text (stmtCache) takes any number of them, unbounded by SQLite's limit
+// on variables.
+func (e *Engine) inArray(col, typ string) string {
+	if e.pg {
+		return col + ` = ANY(?::` + typ + `[])`
+	}
+	return col + ` IN (SELECT value FROM json_each(?))`
+}
+
+// arrayArg is the argument for inArray: the slice itself on Postgres, its
+// JSON text in SQLite. Integers and resource names (ValidResourceName)
+// come back out of JSON as they went in.
+func (e *Engine) arrayArg(v any) any {
+	if e.pg {
+		return v
+	}
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err) // slices of ints or strings
 	}
 	return string(b)
 }
