@@ -91,7 +91,7 @@ func TestOldSchemasIndexedBy(t *testing.T) {
 				t.Logf("index %s on %s", n, tb)
 			}
 			rows.Close()
-			for _, n := range []string{"sqlite_autoindex_facet_1", "sqlite_autoindex_sort_1", "sqlite_autoindex_refs_1", "facet_q", "sort_q", "refs_q"} {
+			for _, n := range []string{"sqlite_autoindex_facet_1", "sqlite_autoindex_sort_1", "sqlite_autoindex_refs_1", "facet_q", "sort_q", "refs_t"} {
 				if !have[n] {
 					t.Errorf("missing %s", n)
 				}
