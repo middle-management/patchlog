@@ -68,6 +68,23 @@ func WithHTTPClient(hc *http.Client) Option {
 	}
 }
 
+// WithIdleConns keeps up to n idle connections per host, for a client that
+// sends n requests at once (http.DefaultTransport keeps 2, so it would
+// close the others after each burst and dial them again for the next). It
+// replaces the transport, also one from an earlier WithHTTPClient, with a
+// clone of http.DefaultTransport (same proxy, TLS and timeouts), traced as
+// the default one is.
+func WithIdleConns(n int) Option {
+	return func(c *Client) {
+		t := http.DefaultTransport.(*http.Transport).Clone()
+		t.MaxIdleConnsPerHost = n
+		t.MaxIdleConns = max(t.MaxIdleConns, n)
+		cp := *c.hc
+		cp.Transport = telemetry.Transport(t)
+		c.hc = &cp
+	}
+}
+
 // WithBearer sends Authorization: Bearer <token> (Addendum C) on every request.
 func WithBearer(token string) Option { return func(c *Client) { c.bearer = token } }
 

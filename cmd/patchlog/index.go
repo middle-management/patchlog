@@ -79,7 +79,9 @@ func indexCmd(args []string) {
 		copts = append(copts, client.WithAuthor(*author))
 	}
 	recipient := recipientKey("index", *encKey, *encKeyFile)
-	copts = append(copts, client.WithKeys(client.NewKeys(recipient)))
+	// Keep a connection for each fetch and each namespace's long-poll, so
+	// they are reused from one page to the next.
+	copts = append(copts, client.WithKeys(client.NewKeys(recipient)), client.WithIdleConns(*fetchConc+len(nss)))
 	c, err := client.New(*api, copts...)
 	if err != nil {
 		log.Fatal(err)
