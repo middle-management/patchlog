@@ -52,6 +52,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/sync/errgroup"
 	_ "modernc.org/sqlite"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -114,6 +115,10 @@ type Options struct {
 	// FollowOptions are passed to every follower (e.g. follow.WithSSE,
 	// follow.WithBackoff).
 	FollowOptions []follow.Option
+	// FetchConcurrency is how many documents Apply fetches at once
+	// (default 8); 1 fetches them one by one. Rows are written in log
+	// order either way.
+	FetchConcurrency int
 }
 
 // Index is a running indexing service.
@@ -155,6 +160,9 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 	}
 	if opt.CheckerTTL == 0 {
 		opt.CheckerTTL = 30 * time.Second
+	}
+	if opt.FetchConcurrency <= 0 {
+		opt.FetchConcurrency = 8
 	}
 	if opt.Purger == nil {
 		opt.Purger = logPurger{opt.Logf}
@@ -449,32 +457,20 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			ix.keys.Observe(b.NS, u.Config.Value)
 		}
 	}
-	var preps []prepared
-	for _, ch := range co.Changes {
-		p := prepared{resource: ch.Resource, purged: ch.Purged}
-		if ch.Kind != "head" {
-			p.remove = true
-			preps = append(preps, p)
-			continue
+	// Fetch FetchConcurrency documents at a time (one GET each); preps
+	// keeps the coalesced order, which the writes follow. The first error
+	// fails the batch, as one by one, and the follower retries it whole.
+	preps := make([]prepared, len(co.Changes))
+	g, gctx := errgroup.WithContext(ctx)
+	g.SetLimit(ix.opt.FetchConcurrency)
+	for i, ch := range co.Changes {
+		preps[i] = prepared{resource: ch.Resource, purged: ch.Purged, remove: ch.Kind != "head"}
+		if ch.Kind == "head" {
+			g.Go(func() error { return ix.prepare(gctx, b.NS, ch.Target, &preps[i]) })
 		}
-		doc, err := ix.keys.FetchDoc(ctx, b.NS, ch.Resource, ch.Target, func(f client.Flag) {
-			ix.opt.Logf("index: %s/%s: revision %s by %s is flagged and left out: %s", b.NS, ch.Resource, f.ID, f.Author, f.Message)
-		})
-		if err != nil {
-			if errors.Is(err, derived.ErrSkip) || errors.Is(err, follow.ErrNotLive) || client.IsGone(err) || client.IsNotFound(err) {
-				// Gone since: a later entry of the log says so too.
-				p.remove = true
-				preps = append(preps, p)
-				continue
-			}
-			return err
-		}
-		p.head = doc.ID
-		p.schema, p.typed, p.rows, err = ix.extract(ctx, b.NS, ch.Resource, doc.Value)
-		if err != nil {
-			return err
-		}
-		preps = append(preps, p)
+	}
+	if err := g.Wait(); err != nil {
+		return err
 	}
 
 	ix.wmu.Lock()
@@ -579,6 +575,25 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		}
 	}
 	return nil
+}
+
+// prepare fetches p.resource's document at revision id and extracts its
+// rows into p.
+func (ix *Index) prepare(ctx context.Context, ns, id string, p *prepared) error {
+	doc, err := ix.keys.FetchDoc(ctx, ns, p.resource, id, func(f client.Flag) {
+		ix.opt.Logf("index: %s/%s: revision %s by %s is flagged and left out: %s", ns, p.resource, f.ID, f.Author, f.Message)
+	})
+	if err != nil {
+		if errors.Is(err, derived.ErrSkip) || errors.Is(err, follow.ErrNotLive) || client.IsGone(err) || client.IsNotFound(err) {
+			// Gone since: a later entry of the log says so too.
+			p.remove = true
+			return nil
+		}
+		return err
+	}
+	p.head = doc.ID
+	p.schema, p.typed, p.rows, err = ix.extract(ctx, ns, p.resource, doc.Value)
+	return err
 }
 
 // dropNS deletes every row of a namespace.
