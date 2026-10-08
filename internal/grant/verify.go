@@ -142,7 +142,7 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 	if len(key.Pub) != ed25519.PublicKeySize {
 		return nil, unauth("bad root signature")
 	}
-	if err := g.c.verify(key.Pub); err != nil {
+	if err := g.verifyChain(key.Pub); err != nil {
 		return nil, unauth("%v", err)
 	}
 

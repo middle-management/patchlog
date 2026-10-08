@@ -1,6 +1,8 @@
 package server
 
 import (
+	"bytes"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -86,6 +88,54 @@ func TestReadCachePublicToPrivate(t *testing.T) {
 	expect(t, e.get("/r/sec/doc/rev/"+id), 401)
 	expect(t, e.get("/r/sec/doc"), 401)
 	expect(t, e.get("/r/sec/doc/rev/"+id, f.adminG), 200)
+}
+
+// With authentication on, cached reads of a private namespace answer
+// exactly as uncached ones, private cache headers included, and refusals
+// are unchanged by what other readers have cached (§7, §9).
+func TestReadCacheAuthenticated(t *testing.T) {
+	f := newAuthFixture(t, map[string]any{})
+	e := f.tenv
+	id := e.create("sec", "a", map[string]any{"t": "x"}, f.adminG)
+	reader := e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read"})
+	onlyB := e.grant(f.issuer, "user:b", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "b"}}})
+	elsewhere := e.grant(f.issuer, "user:r", []string{"other"}, []string{"read"})
+	same := func(path string, a, b *resp) {
+		t.Helper()
+		if a.Code != b.Code || !bytes.Equal(a.Body, b.Body) {
+			t.Fatalf("%s: %d %s, then %d %s", path, a.Code, a.Body, b.Code, b.Body)
+		}
+		for _, h := range []string{"Cache-Control", "CDN-Cache-Control", "Surrogate-Control", "ETag", "Location", "Content-Type", "X-Revision"} {
+			if a.H.Get(h) != b.H.Get(h) {
+				t.Fatalf("%s: %s %q, then %q", path, h, a.H.Get(h), b.H.Get(h))
+			}
+		}
+	}
+	paths := []string{"/r/sec/a", "/r/sec/a/rev/" + id}
+	for _, path := range paths {
+		cold := e.get(path, reader)
+		if cold.Code != 200 && cold.Code != 302 || !strings.HasPrefix(cold.H.Get("Cache-Control"), "private") {
+			t.Fatalf("%s: %d %q", path, cold.Code, cold.H.Get("Cache-Control"))
+		}
+		for i := 0; i < 2; i++ {
+			same(path, cold, e.get(path, reader))
+		}
+		// Refusals after the answer is cached, each as for a resource that
+		// doesn't exist.
+		absent := strings.Replace(path, "/a", "/zz", 1)
+		for _, c := range []struct {
+			bearer string
+			code   int
+		}{{"", 401}, {"garbage", 401}, {elsewhere, 403}, {onlyB, 404}} {
+			r := e.get(path, c.bearer)
+			expect(t, r, c.code)
+			same(path, e.get(absent, c.bearer), r)
+		}
+	}
+	expect(t, e.patchNS("sec", ops(op("add", "/revoked", []any{revocationID(t, reader, 0)})), f.adminG), 201)
+	for _, path := range paths {
+		expect(t, e.get(path, reader), 401)
+	}
 }
 
 // Concurrent readers and a writer: every head a reader sees is one the

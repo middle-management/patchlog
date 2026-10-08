@@ -119,6 +119,42 @@ func BenchmarkReadHead(b *testing.B) {
 	})
 }
 
+// BenchmarkReadAuth reads head pointers and revisions of a namespace that
+// isn't public with a bearer grant, as a reader following them does: each
+// read verifies the grant and checks access, and then may use the cache.
+func BenchmarkReadAuth(b *testing.B) {
+	var clock atomic.Int64
+	e, mint, _ := authEngine(b, &clock)
+	ctx := context.Background()
+	writer := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create"}})}
+	reader := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"n"}, "can": []any{"read"}})}
+	ids := make([]string, 10)
+	for i := range ids {
+		it := Item{Resource: fmt.Sprint("r", i), IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"n": float64(i)}}}}}}
+		r, err := e.WriteResource(ctx, Request{NS: "n", Cred: writer}, it)
+		if err != nil {
+			b.Fatal(err)
+		}
+		ids[i] = r.Items[0].IDs[0]
+	}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			name := fmt.Sprint("r", i%10)
+			if _, err := e.ResourceHead(ctx, "n", name, reader); err != nil {
+				b.Error(err)
+				return
+			}
+			if r, err := e.ResourceRev(ctx, "n", name, ids[i%10], reader); err != nil || r.Status != 200 {
+				b.Error(r, err)
+				return
+			}
+			i++
+		}
+	})
+}
+
 // Concurrent creates into one namespace, shaped like a content import:
 // documents of 20–70 KiB (about 25 bytes a leaf), each to a resource of
 // its own. Every sub-benchmark writes b.N documents with that many

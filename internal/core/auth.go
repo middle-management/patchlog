@@ -72,7 +72,7 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 	if cred.Bearer == "" {
 		return nil, apiErr(401, "unauthenticated", "message", "missing grant")
 	}
-	g, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
+	g, err := t.e.bearers.decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
 	if errors.Is(err, grant.ErrTooLarge) {
 		return nil, limitErr(413, "grant too large")
 	}
@@ -82,6 +82,39 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 	if !g.NamesNS(nsName) {
 		return nil, nsNotNamed(nsName)
 	}
+	return g, nil
+}
+
+// grantCache keeps decoded bearer grants by their token, so a grant
+// presented again is neither decoded nor its signatures checked again
+// (grant.Verify remembers the chain's root key). Verification still runs
+// on every request against the configuration in force: times, revocation,
+// key scope and rules are never cached.
+type grantCache struct {
+	mu sync.Mutex
+	m  map[string]*grant.Grant
+}
+
+// Past this many grants the cache starts over.
+const maxGrantCacheEntries = 1024
+
+func (c *grantCache) decode(token string, maxSize int) (*grant.Grant, error) {
+	c.mu.Lock()
+	g, ok := c.m[token]
+	c.mu.Unlock()
+	if ok {
+		return g, nil
+	}
+	g, err := grant.Decode(token, maxSize)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	if c.m == nil || len(c.m) >= maxGrantCacheEntries {
+		c.m = map[string]*grant.Grant{}
+	}
+	c.m[token] = g
+	c.mu.Unlock()
 	return g, nil
 }
 
