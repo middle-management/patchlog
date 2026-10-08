@@ -6,7 +6,7 @@ help: ## list targets
 	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "  %-12s %s\n", $$1, $$2}'
 
 build: ## build ./patchlog
-	go build -o patchlog ./cmd/patchlog
+	go build -tags grpcnotrace -o patchlog ./cmd/patchlog
 
 test: ## run all tests
 	go test ./...

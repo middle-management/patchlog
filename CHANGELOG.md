@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- **Smaller release binaries:** releases, the Docker image and `make build` build with
+  grpc-go's `grpcnotrace` tag. It drops gRPC's own request tracing (`golang.org/x/net/trace`,
+  off unless `grpc.EnableTracing` is set, which nothing here does), and with it
+  `html/template` and `text/template`, whose reflection disabled the linker's dead-code
+  elimination. OTLP export over gRPC and HTTP is unchanged. linux/amd64 is 28.4 MB (32.2 MB
+  in v0.15.0), linux/arm64 26.7 MB (30.3 MB), darwin/arm64 27.5 MB (31.2 MB),
+  windows/amd64 29.0 MB (32.8 MB). A plain `go build`/`go install` works the same, about
+  3.8 MB larger.
+
 ## v0.15.0
 
 Implements spec **v0.46**, which adopts most of Doors' feedback, fixes the server bugs
@@ -42,7 +53,8 @@ OTLP (gRPC or HTTP), console output, W3C propagation; route-named HTTP server sp
 (`core.WriteResource`, `core.Batch`, …), transaction spans, and metrics for writes,
 group-commit sizes, Postgres lock waits and consumer lag. See the README's Observability
 section; `compose.yaml` has an optional Jaeger profile (`--profile otel`). No measurable
-cost when off; the binary grows by about 11 MB (gRPC).
+cost when off; the binary grows by about 11 MB (the OpenTelemetry SDK, protobuf and gRPC
+libraries; the gRPC exporters themselves are about 0.4 MB of it).
 
 **Fixes (reported by Doors):**
 - The index's `?min=` redirect could bounce between two checkpoints during an update;

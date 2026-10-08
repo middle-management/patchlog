@@ -58,7 +58,7 @@ jobs:
             dir=dist/$name
             mkdir -p "$dir"
             ext=""; [ "$os" = windows ] && ext=.exe
-            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath -tags grpcnotrace \
               -ldflags="-s -w -X main.version=${VERSION}" -o "$dir/patchlog$ext" ./cmd/patchlog
             cp README.md LICENSE "$dir/"
             mkdir -p "$dir/docs" && cp docs/SPEC.md "$dir/docs/"

@@ -324,7 +324,7 @@ makes the cookies `SameSite=None` (otherwise `Lax`).
 ## Running
 
 ```sh
-go build -o patchlog ./cmd/patchlog
+go build -tags grpcnotrace -o patchlog ./cmd/patchlog   # the tag only trims the binary (~3.8 MB)
 
 # Development: no authentication; X-Author names the author.
 ./patchlog serve -dev -db dev.db

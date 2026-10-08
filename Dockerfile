@@ -11,7 +11,7 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH \
-    go build -trimpath -ldflags="-s -w -X main.version=${VERSION}" -o /out/patchlog ./cmd/patchlog
+    go build -trimpath -tags grpcnotrace -ldflags="-s -w -X main.version=${VERSION}" -o /out/patchlog ./cmd/patchlog
 
 FROM alpine:3.22
 LABEL org.opencontainers.image.source="https://github.com/middle-management/patchlog" \
