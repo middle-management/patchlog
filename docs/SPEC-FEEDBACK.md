@@ -39,6 +39,28 @@ From implementing v0.46. Each gives what the reference chose.
 11. **Merged gestures and undo** (§11.2): `Undo` with the source author's name plans
     against the merger's entries in the base. *Propose:* say that undoing a carried gesture
     is the source author's to do.
+12. **Dry runs draw rate tokens** (§6.6, §7.5). Rate limits are checked in step 1, and a dry
+    run runs steps 1–6, so it draws what the submit will. §G.4.4's dry-run-then-submit
+    therefore costs each batch twice. Retry-After is whole seconds (at least 1), so under a
+    fast allowance a 429 costs a second when the deficit refills in milliseconds. *Propose:*
+    say whether dry runs draw, and count them in §G.4.4's pacing if they do.
+13. **Backfill pacing** (§G.4.4) is "a fraction of the namespace rate", but the importer's
+    own `ratePerPrincipal` (a tenth of the namespace's by default) answers 429 first. The
+    reference paces at a fraction of the lower of the two, and under an allowance at the
+    allowance's full rate, since its bucket holds up no other writer; §G.4.4 mentions
+    allowances only for one atomic batch. *Propose:* say both.
+14. **Allowances with authentication disabled** (§6.6, §1): an allowance names a root `sub`
+    and `kid`, but there is no `kid` then. The reference matches `sub` (the author) alone,
+    first entry wins. *Propose:* specify it, since clients predicting their allowance need it.
+15. **`/heads` and the namespace log for readers limited per resource** (§7.4): the reference
+    checks `read` on the namespace (resource `""`), so a grant whose rules hide some
+    resources still lists their names and heads, where `GET /r/{ns}/{name}` is `404`.
+    `/grants` and branching require unrestricted read (§7.4, §7.6). *Propose:* require
+    unrestricted read for listings, or filter them.
+16. **`/heads` of a purged namespace** (§8.5): every `/r/{ns}/…` is `410`, but the listing
+    isn't covered; the reference lists formerly existing resources as `purge`, and nothing
+    says the namespace is purged short of its log (or `frozen`, which the importer uses).
+    *Propose:* `410`, or a `purged` marker.
 
 ## Settled in v0.46
 

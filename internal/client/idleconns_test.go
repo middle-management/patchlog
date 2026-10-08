@@ -17,8 +17,8 @@ import (
 // TestIdleConns: a client WithIdleConns(n) sending bursts of n requests
 // reuses its connections from one burst to the next; on
 // http.DefaultTransport all but 2 close after each burst and the next one
-// dials again. Not parallel: other tests' requests share
-// http.DefaultTransport's idle connections.
+// dials again. Not parallel: other tests' clients share the default pool's
+// idle connections.
 func TestIdleConns(t *testing.T) {
 	const n, bursts = 8, 3
 	var (

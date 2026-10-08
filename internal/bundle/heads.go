@@ -64,9 +64,12 @@ func (im *importer) head(ctx context.Context, ns, name string) (*client.Head, er
 // authentication disabled (§1) every namespace is readable, so one that
 // answers 404 doesn't exist and has no resources. Without a listing (nil)
 // the lookups go to GET /r/{ns}/{name} as before: when the namespace
-// doesn't list for the importer (a grant that may read only some of its
-// resources, §7.6), and when it is frozen, as a purged namespace is, which
-// answers 410 for every name, listed or not (§8.5).
+// doesn't list for the importer, and when it is frozen, as a purged
+// namespace is, which answers 410 for every name, listed or not (§8.5).
+// A grant that may read only some of the resources still lists them all
+// (the server checks read on the namespace), so a name it can't read is
+// classified by its listed head where a lookup says it doesn't exist; the
+// grant can't write it either, so the batch is refused (403) both ways.
 func (im *importer) listing(ctx context.Context, ns string) *listing {
 	if l, ok := im.listed[ns]; ok {
 		return l

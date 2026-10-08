@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+**Faster bundle imports.** A backfill spent nearly all its time sleeping: it paces at half
+the lower of the namespace and principal rates (25 items/s at default limits), 40 s per
+1,000-item batch, against about half a second of work.
+- **Under an allowance** (§6.6) the importer now paces at the allowance's full rate, since its
+  bucket holds up no other writer, and splits batches by its `itemsPerBatch`/`batchSize`. It
+  finds its own allowance as the core does (the grant's root `sub` and `kid`, or the author
+  with authentication disabled), counts every draw (dry runs, uploads, copies) so it doesn't
+  run into 429s, and from a minute before the allowance's `until` goes back to the
+  namespace's limits. With an allowance of 1,000 items/s, 2,000 documents wait 3.5 s instead
+  of 80 s; 145,000 would take minutes instead of over an hour. Without one, pacing is as
+  before, less the time each batch took. Progress lines say what the import is paced by.
+- **Planning** reads target heads from `/heads` pages instead of one `GET` per document
+  (twice in snapshot mode): 0.005–0.014 requests per document instead of 1–2. A small import
+  into a large namespace keeps per-document lookups.
+- `BenchmarkImport` (`internal/bundle`) measures an import's work, requests per document and
+  the time it would sleep.
+
+The client's requests use a connection pool of their own, a clone of
+`http.DefaultTransport`, so code that closes the default one's idle connections doesn't
+break them.
+
 ## v0.15.3
 
 **Index queries cost what their matches cost (B6).** Every index query read the namespace's
