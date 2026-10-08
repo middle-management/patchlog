@@ -14,6 +14,7 @@ import (
 // ResolveSchema applies drafts.for for the namespace it resolves for, where
 // it can see it.
 func TestResolveSchemaDraftsFor(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -84,6 +85,7 @@ func TestResolveSchemaDraftsFor(t *testing.T) {
 // §3.5 (v0.34): a forced purge's entries carry forced: true, parsed by the
 // client and part of the hashed entry the verifier recomputes.
 func TestForcedEntriesVerify(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))

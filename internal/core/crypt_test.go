@@ -11,6 +11,7 @@ import (
 )
 
 func TestRowSeal(t *testing.T) {
+	t.Parallel()
 	dek := make([]byte, dekSize)
 	rand.Read(dek)
 	id := ids.Of([]byte("x"))
@@ -29,6 +30,7 @@ func TestRowSeal(t *testing.T) {
 }
 
 func TestArchiveStream(t *testing.T) {
+	t.Parallel()
 	dek := make([]byte, dekSize)
 	rand.Read(dek)
 	for _, n := range []int{0, 1, archiveChunk - 1, archiveChunk, archiveChunk + 1, 3 * archiveChunk} {

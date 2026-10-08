@@ -31,6 +31,7 @@ func has(list []string, g string) bool {
 // author who wrote it in the branch, but only for a batch that counts as a
 // merge; otherwise for whoever wrote the batch.
 func TestUndoStackMergedGestures(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	admin := s.Client(t, client.WithAuthor("admin"))
@@ -121,6 +122,7 @@ func TestUndoStackMergedGestures(t *testing.T) {
 // the author who wrote it in the branch, though the base's entries are the
 // merger's.
 func TestUndoMergedGestureAsItsAuthor(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	admin := s.Client(t, client.WithAuthor("admin"))

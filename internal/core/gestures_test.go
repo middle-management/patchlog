@@ -21,6 +21,7 @@ func gestureStep(patches []any, gesture, undoes string) Step {
 // own: in their revisions and in their namespace entries, a single
 // write's gesture and undoes, and a batch's gestures map.
 func TestPGGroupCommitGestures(t *testing.T) {
+	t.Parallel()
 	e := groupEngine(t)
 	mkNS(t, e, "n", map[string]any{"read": "public"})
 	hz, err := put(e, "n", "z", "", 0)

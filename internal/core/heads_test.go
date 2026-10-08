@@ -18,6 +18,7 @@ import (
 // resources, a branch's own and its bases'. A read transaction remembers
 // every base in the chain (memo.ns).
 func TestPrefetchHeads(t *testing.T) {
+	t.Parallel()
 	e := openInstance(t, pgtest.DB(t), t.TempDir())
 	ctx := context.Background()
 	mkNS(t, e, "n", map[string]any{"read": "public"})
@@ -205,6 +206,7 @@ func TestPrefetchHeads(t *testing.T) {
 // (memo.ns); a write transaction reads it each time, as its own writes,
 // and on Postgres other writers', change it under it.
 func TestNamespaceMemo(t *testing.T) {
+	t.Parallel()
 	e := openInstance(t, pgtest.DB(t), t.TempDir())
 	ctx := context.Background()
 	mkNS(t, e, "n", map[string]any{"read": "public"})

@@ -93,6 +93,7 @@ func bytesRows(t *testing.T, e *Engine) int {
 // that commits leaves its file, and a collection's file goes only once
 // the collecting transaction commits.
 func TestBlobFilesTransactions(t *testing.T) {
+	t.Parallel()
 	e := openBlobEngine(t)
 	dir := e.blobs.root()
 	ctx := context.Background()
@@ -164,6 +165,7 @@ func TestBlobFilesTransactions(t *testing.T) {
 // A reader whose snapshot predates a collection finds the file gone and
 // reads again, seeing the collection.
 func TestBlobFilesReadAgain(t *testing.T) {
+	t.Parallel()
 	e := openBlobEngine(t)
 	ctx := context.Background()
 	mkNS(t, e, "r", map[string]any{"read": "public"})
@@ -272,6 +274,7 @@ func tryPurge(e *Engine, ns, name, head string) error {
 // naming it is purged, and uploads racing purges of the same bytes never
 // leave a row naming a deleted file.
 func TestPGBlobFilesShared(t *testing.T) {
+	t.Parallel()
 	a, b := twoInstances(t)
 	ctx := context.Background()
 	dir := a.blobs.root()

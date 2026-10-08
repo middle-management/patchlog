@@ -13,6 +13,7 @@ import (
 // §7.4: the members the spec defines are validated strictly, in their
 // shapes, and any other member must start with "x-".
 func TestCheckMembers(t *testing.T) {
+	t.Parallel()
 	id := ids.Revision(nil, []byte("x")).String()
 	ok := []string{
 		`{}`,
@@ -128,6 +129,7 @@ func errPointer(t *testing.T, ae *Error) (string, string) {
 // stored under an earlier version and is kept as data; one the write adds
 // or changes is checked (§7.4).
 func TestCheckMembersKeepsStoredMembers(t *testing.T) {
+	t.Parallel()
 	prev := map[string]any{"read": "public", "title": "Old", "cleanup": map[string]any{"merged": "7 days"}}
 	same := map[string]any{"read": "grant", "title": "Old", "cleanup": map[string]any{"merged": "7 days"}, "frozen": true}
 	// v0.38: removing one member an earlier version defined, keeping
@@ -156,6 +158,7 @@ func TestCheckMembersKeepsStoredMembers(t *testing.T) {
 // are kept; only new or changed entries are checked (§7.4), so a
 // revocation can be added next to a malformed one an older version stored.
 func TestCheckMembersKeepsStoredEntries(t *testing.T) {
+	t.Parallel()
 	id := ids.Revision(nil, []byte("x")).String()
 	key := map[string]any{"kid": "ops", "alg": "Ed25519", "pub": "p", "x-note": "old"}
 	prev := map[string]any{"revoked": []any{"1aaaa"}, "keys": []any{key}}
@@ -178,6 +181,7 @@ func TestCheckMembersKeepsStoredEntries(t *testing.T) {
 // only the members this version defines, so a member an older version
 // stored is refused with a message saying how to rename it (§7.4).
 func TestDefinedMembers(t *testing.T) {
+	t.Parallel()
 	base := map[string]any{"read": "public", "title": "Old", "cleanup": map[string]any{"merged": "7 days"}, "x-a": 1.0}
 	got := definedMembers(base)
 	if len(got) != 2 || got["read"] != "public" || got["cleanup"] == nil {
@@ -194,6 +198,7 @@ func TestDefinedMembers(t *testing.T) {
 // A shadow keeps the encryption members this version defines, and only
 // valid ones (§G.3): a base of a newer version may carry others.
 func TestShadowEncryption(t *testing.T) {
+	t.Parallel()
 	e := &Engine{opt: Options{Limits: DefaultLimits(), Maximums: DefaultLimits()}}
 	got, err := e.shadowEncryption("matches", map[string]any{"level": "e2e", "epoch": 3.0, "historyEpochs": 2.0, "pad": true, "suite": "future"})
 	if err != nil {
@@ -220,6 +225,7 @@ func TestShadowEncryption(t *testing.T) {
 // it doesn't define, can still be configured, frozen and branched; a write
 // that changes such a member must give it an "x-" name (§7.4).
 func TestStoredMembersAfterUpgrade(t *testing.T) {
+	t.Parallel()
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
 	if err != nil {
 		t.Fatal(err)

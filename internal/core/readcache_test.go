@@ -85,6 +85,7 @@ func authEngine(t testing.TB, clock *atomic.Int64) (*Engine, func(root map[strin
 // the request's read check: a refused request gets the refusal it gets
 // without the cache, and an allowed one exactly the uncached answer.
 func TestReadCacheAuthenticated(t *testing.T) {
+	t.Parallel()
 	var clock atomic.Int64
 	e, mint, cfg := authEngine(t, &clock)
 	ctx := context.Background()
@@ -206,6 +207,7 @@ func TestReadCacheAuthenticated(t *testing.T) {
 // large, is decoded on each request and holds nothing. The kept tokens are
 // bounded by their total length as well as by their number.
 func TestGrantCacheVerifiedOnly(t *testing.T) {
+	t.Parallel()
 	var clock atomic.Int64
 	e, mint, _ := authEngine(t, &clock)
 	ctx := context.Background()

@@ -20,6 +20,7 @@ import (
 // §7.1 Paging: NSLog and Log read every page of a range; NSLogPage and
 // LogPage read one, naming the next page's since.
 func TestLogPages(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LogPageSize: 2})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -105,6 +106,7 @@ func fakeID(c byte) string { return "1" + strings.Repeat(string(c), 32) }
 // empty page that names one (§7.1 Paging). A range from an e2e pruning
 // horizon holds only the entries after it (its snapshot is /rev/{H}).
 func TestLogPagesChecked(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s0, e1, e2, e3 := fakeID('s'), fakeID('b'), fakeID('c'), fakeID('d')
 	nsEntry := func(id, prev string) map[string]any {
@@ -187,9 +189,12 @@ func TestLogPagesChecked(t *testing.T) {
 // The client's own flows with a log page size of 2: every log range they
 // read spans pages (sealed namespace ranges are opened page by page, and
 // e2e folds read the range after a prune's horizon across pages).
+//
+// Paged sets the environment, so these flows run serially and call the
+// tests' bodies, not the parallel TestX.
 func TestPagedFlows(t *testing.T) {
 	for name, f := range map[string]func(*testing.T){
-		"namespace": TestNamespaceAPI, "sealed": TestSealedTransparent, "e2e": TestE2EClient,
+		"namespace": testNamespaceAPI, "sealed": testSealedTransparent, "e2e": testE2EClient,
 	} {
 		t.Run(name, func(t *testing.T) { clienttest.Paged(t, 2, f) })
 	}
@@ -201,6 +206,7 @@ func TestPagedFlows(t *testing.T) {
 // after it (the snapshot is /rev/{H}, never a log entry), so the range
 // reads as one chain from where it began (§7.1 Paging).
 func TestLogPageFromSnapshot(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	arch, err := archive.NewDir(archive.URL(t.TempDir()))
 	if err != nil {
@@ -295,6 +301,7 @@ func TestLogPageFromSnapshot(t *testing.T) {
 // and from a tombstone horizon, whose /rev/{H} is a 410 carrying the last
 // live document.
 func TestE2EFoldFromHorizon(t *testing.T) {
+	t.Parallel()
 	for _, size := range []int{2, 100} {
 		t.Run(fmt.Sprintf("page%d", size), func(t *testing.T) { testE2EFoldFromHorizon(t, size) })
 	}

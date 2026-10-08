@@ -12,6 +12,7 @@ import (
 // item too, and counted from the revisions again when the row doesn't have
 // the counts (a database from before them).
 func TestSnapshotCounts(t *testing.T) {
+	t.Parallel()
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Purger: discardPurger{}, HeadSnapshotMax: 8, SnapshotEveryRevisions: 3, SnapshotEveryBytes: 1 << 20})
 	if err != nil {

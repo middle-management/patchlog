@@ -29,7 +29,9 @@ func nonced(patches []any) []any {
 
 // The client decrypts every sealed read transparently, and returns what
 // an unsealed namespace serves.
-func TestSealedTransparent(t *testing.T) {
+func TestSealedTransparent(t *testing.T) { t.Parallel(); testSealedTransparent(t) }
+
+func testSealedTransparent(t *testing.T) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
 	plain := s.Client(t, client.WithAuthor("alice"))
@@ -153,6 +155,7 @@ func TestSealedTransparent(t *testing.T) {
 // Keys wrapped to the grant's enc are unwrapped with the recipient key, and
 // per-resource grants get only their resources' keys.
 func TestSealedWrappedAndPerResource(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t)})
 	k := clienttest.NewKey("k")

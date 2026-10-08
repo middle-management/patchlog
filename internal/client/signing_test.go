@@ -13,6 +13,7 @@ import (
 // §C.3.1: a client with a signer signs its writes, deletes and batch
 // steps, which a namespace requiring signatures accepts.
 func TestWithSigner(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true})
 	admin := clienttest.NewKey("admin")

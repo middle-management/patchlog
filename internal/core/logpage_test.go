@@ -14,6 +14,7 @@ import (
 // from its id back to since for every page made reading a long range in
 // pages quadratic.
 func TestLogPageReadsItsRows(t *testing.T) {
+	t.Parallel()
 	lim := DefaultLimits()
 	fast := Rate{1e9, 1e9}
 	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
@@ -102,6 +103,7 @@ func TestLogPageReadsItsRows(t *testing.T) {
 // row's parent is in the same resource, so a broken chain is an error, not
 // a range answering rows that aren't ancestors of its id.
 func TestLogPageBrokenChain(t *testing.T) {
+	t.Parallel()
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
 		Purger: discardPurger{}})
 	if err != nil {

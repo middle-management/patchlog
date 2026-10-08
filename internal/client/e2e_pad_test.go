@@ -40,6 +40,7 @@ func patchSetPadded(t *testing.T, c *client.Client, x *client.E2E, ns, name, id 
 // flags one that isn't padded, but not what was sealed before pad was
 // turned on. A merge into it pads what it re-encrypts (§E.2.2, §E.3.1).
 func TestE2EPadding(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t)})
 	c := s.Client(t, client.WithAuthor("alice"))

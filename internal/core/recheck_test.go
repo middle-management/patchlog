@@ -12,6 +12,7 @@ import (
 // isConflict recognises the UNIQUE violations D.3 names as a lost race, and
 // nothing else.
 func TestIsConflict(t *testing.T) {
+	t.Parallel()
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
 	if err != nil {
 		t.Fatal(err)
@@ -54,6 +55,7 @@ func TestIsConflict(t *testing.T) {
 // A transaction whose context is cancelled mid-way reports the cancellation,
 // not the sql.ErrTxDone its later statements hit.
 func TestCancelledTxReportsContextError(t *testing.T) {
+	t.Parallel()
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1}})
 	if err != nil {
 		t.Fatal(err)

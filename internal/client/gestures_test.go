@@ -13,6 +13,7 @@ import (
 // steps, reads them back from write results, resource and namespace logs
 // (a batch's gestures map), and lists a gesture's revisions page by page.
 func TestGestures(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LogPageSize: 2})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -110,6 +111,7 @@ func TestGestures(t *testing.T) {
 // §7.4, §E.4 (v0.39): sealed logs carry gestures inside their sealed
 // entries, and the gesture listing isn't offered there (404).
 func TestGesturesSealed(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t)})
 	c := s.Client(t, client.WithAuthor("alice")).With(client.WithKeys(client.NewKeys(nil)))
@@ -137,6 +139,7 @@ func TestGesturesSealed(t *testing.T) {
 // §7.2, §E.4 (v0.39): at E3 the server stores and serves gestures in
 // plaintext beside the sealed patch sets; the listing isn't offered.
 func TestGesturesE2E(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t)})
 	admin := clienttest.NewKey("admin")

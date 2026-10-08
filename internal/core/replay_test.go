@@ -47,6 +47,7 @@ func batchOf(e *Engine, prefix string, n int) (*WriteResult, error) {
 // in the namespace, so batches slowed down as the log grew. Earlier batch
 // entries are made unparseable here; a lookup that reads them fails.
 func TestBatchReplayIgnoresOtherBatches(t *testing.T) {
+	t.Parallel()
 	e := replayEngine(t)
 	ctx := context.Background()
 	for i := 0; i < 20; i++ {

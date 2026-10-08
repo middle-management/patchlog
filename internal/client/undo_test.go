@@ -52,6 +52,7 @@ func head(t *testing.T, c *client.Client, ns, name string) string {
 // written with a fresh gesture and Undoes, found through the gestures
 // endpoint.
 func TestUndoSingleResource(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -98,6 +99,7 @@ func TestUndoSingleResource(t *testing.T) {
 // others made to other paths, between the gesture's saves and after them,
 // are kept; the undo is one batch.
 func TestUndoMultiResourceKeepsOthers(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	alice := s.Client(t, client.WithAuthor("alice"))
@@ -140,6 +142,7 @@ func TestUndoMultiResourceKeepsOthers(t *testing.T) {
 // §11.2 The guard: a later write to a path the gesture wrote, or a later
 // delete, is a conflict listing the entries; nothing is written.
 func TestUndoConflict(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	alice := s.Client(t, client.WithAuthor("alice"))
@@ -183,6 +186,7 @@ func TestUndoConflict(t *testing.T) {
 // append is undone by restoring the array, an insert by someone else
 // after the gesture conflicts, a move is moved back.
 func TestUndoArrays(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	alice := s.Client(t, client.WithAuthor("alice"))
@@ -228,6 +232,7 @@ func TestUndoArrays(t *testing.T) {
 // §11.2 The inverse: a tombstone is undone by a restore with [], a restore
 // by the inverse of its patches and a delete, a genesis by a delete.
 func TestUndoDeleteRestoreCreate(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -276,6 +281,7 @@ func TestUndoDeleteRestoreCreate(t *testing.T) {
 
 // §11.2 Redo: undoing the undo; and the redo itself can be undone.
 func TestRedo(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -303,6 +309,7 @@ func TestRedo(t *testing.T) {
 // keeps the action on the stack; Undoes naming a missing gesture is
 // ignored.
 func TestUndoStack(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	alice := s.Client(t, client.WithAuthor("alice"))
@@ -360,6 +367,7 @@ func TestUndoStack(t *testing.T) {
 // §11.2 The guard: the batch names the checked heads, so a write landing
 // in between fails it with 412, and the undo is planned and sent again.
 func TestUndoRetriesOn412(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	var other atomic.Pointer[client.Client]
 	var fired atomic.Bool
@@ -397,6 +405,7 @@ func TestUndoRetriesOn412(t *testing.T) {
 // §11.2 When undo is impossible: a revision of the gesture lies below the
 // pruning horizon.
 func TestUndoPrunedImpossible(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -430,6 +439,7 @@ func TestUndoPrunedImpossible(t *testing.T) {
 // is found by scanning the namespace log; every patch set of the inverse
 // carries a fresh $nonce, never an old one.
 func TestUndoSealedLogScan(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t), LogPageSize: 2})
 	alice := s.Client(t, client.WithAuthor("alice")).With(client.WithKeys(client.NewKeys(nil)))
@@ -491,6 +501,7 @@ func TestUndoSealedLogScan(t *testing.T) {
 // §6.6, §11.2: a large inverse is split into chained steps within the
 // namespace's opsPerSet.
 func TestUndoSplitsLargeInverse(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -515,6 +526,7 @@ func TestUndoSplitsLargeInverse(t *testing.T) {
 // §11.2, §E.3: at E3 the inverse is computed from decrypted entries and
 // written sealed, each step bound to the id of the step before.
 func TestUndoE2E(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t)})
 	admin := clienttest.NewKey("admin")
@@ -549,6 +561,7 @@ func TestUndoE2E(t *testing.T) {
 // and the old values no longer validate (422 invalid), which isn't a
 // conflict: the migration wrote other paths.
 func TestUndoInvalidImpossible(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))

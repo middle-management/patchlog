@@ -18,6 +18,7 @@ import (
 // encrypted by the client, declared by its writes, verified by its folds
 // and decrypted with the key in their reference.
 func TestBlobsEncrypted(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	arch, err := archive.NewDir(archive.URL(t.TempDir()))
 	if err != nil {

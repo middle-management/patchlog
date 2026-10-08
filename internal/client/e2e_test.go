@@ -28,7 +28,9 @@ func sameJSON(t *testing.T, got, want any) {
 // A key-holding client seals writes, folds and verifies reads, validates
 // against $schema and flags what doesn't, prunes with a sealed snapshot,
 // and administers the keyring (Addendum E.3).
-func TestE2EClient(t *testing.T) {
+func TestE2EClient(t *testing.T) { t.Parallel(); testE2EClient(t) }
+
+func testE2EClient(t *testing.T) {
 	ctx := context.Background()
 	arch, err := archive.NewDir(archive.URL(t.TempDir()))
 	if err != nil {

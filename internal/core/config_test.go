@@ -3,6 +3,7 @@ package core
 import "testing"
 
 func TestValidRemoteOrigin(t *testing.T) {
+	t.Parallel()
 	good := []string{"https://cms.example", "https://cms.example:8443", "http://localhost:8080", "http://127.0.0.1:9", "http://[::1]:8080", "http://localhost", "http://127.0.0.2:8080", "http://127.255.0.9:8123"}
 	bad := []string{"http://cms.example", "https://cms.example/", "https://CMS.example", "https://cms.example:443",
 		"http://localhost:80", "ftp://cms.example", "https://u@cms.example", "https://cms.example?x", "cms.example", "https://", "http://[::2]:8080"}

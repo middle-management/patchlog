@@ -481,16 +481,15 @@ func TestPGPurgeStopsOtherInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
-	within(t, 5*time.Second, "b's tailer", b.fresh)
-	for i := 0; i < 2; i++ {
+	// b caches only while its tailer is fresh, which a loaded machine can
+	// interrupt: read until it does.
+	within(t, 5*time.Second, "b serving the revision from its cache", func() bool {
 		rev, err := b.ResourceRev(ctx, "n", "r", id, who.Cred)
 		if err != nil || rev.Status != 200 {
 			t.Fatalf("%v %v", rev, err)
 		}
-	}
-	if b.rc.rev("n", "r", id) == nil {
-		t.Fatal("b doesn't serve the revision from its cache")
-	}
+		return b.rc.rev("n", "r", id) != nil
+	})
 	r := who
 	r.NS = "n"
 	if _, err := a.Purge(ctx, r, "r", id, false); err != nil {

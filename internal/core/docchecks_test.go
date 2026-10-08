@@ -4,6 +4,7 @@ import "testing"
 
 // §6.6: at E3 every create and restore may be as large as documentSize.
 func TestCheckLimitsFromScratch(t *testing.T) {
+	t.Parallel()
 	l := DefaultLimits()
 	l.PatchSetSize, l.DocumentSize = 100, 1000
 	big := make([]byte, 500)
@@ -32,6 +33,7 @@ func TestCheckLimitsFromScratch(t *testing.T) {
 }
 
 func TestCanonStringLen(t *testing.T) {
+	t.Parallel()
 	for s, want := range map[string]int{"": 2, "abc": 5, `a"b`: 6, "\n\x01": 2 + 2 + 6, "é": 4} {
 		if got := canonStringLen(s); got != want {
 			t.Errorf("%q: %d, want %d", s, got, want)

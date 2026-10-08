@@ -30,6 +30,7 @@ func must[T any](v T, err error) T {
 }
 
 func TestResourceLifecycle(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -124,7 +125,9 @@ func TestResourceLifecycle(t *testing.T) {
 	}
 }
 
-func TestNamespaceAPI(t *testing.T) {
+func TestNamespaceAPI(t *testing.T) { t.Parallel(); testNamespaceAPI(t) }
+
+func testNamespaceAPI(t *testing.T) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("admin"))
@@ -231,6 +234,7 @@ func TestNamespaceAPI(t *testing.T) {
 }
 
 func TestLongPollAndEvents(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{LongPoll: 200 * time.Millisecond})
 	c := s.Client(t, client.WithAuthor("admin"))
@@ -286,6 +290,7 @@ func TestLongPollAndEvents(t *testing.T) {
 }
 
 func TestErrorsAndAuth(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true})
 	anon := s.Client(t)
@@ -335,6 +340,7 @@ func TestErrorsAndAuth(t *testing.T) {
 func op2(o, path string, v any) map[string]any { return op(o, path, v) }
 
 func TestRateLimitRetryAfter(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("admin"))

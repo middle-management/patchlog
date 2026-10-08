@@ -13,6 +13,7 @@ import (
 // writes and batches), drafts resolve with them, and an in_use refusal
 // names the referencing namespaces.
 func TestClientDrafts(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true})
 	kS, kM := clienttest.NewKey("ks"), clienttest.NewKey("km")

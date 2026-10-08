@@ -12,6 +12,7 @@ import (
 
 // §7.8 through the client: upload, reference, read, ranges and copies.
 func TestBlobs(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice"))
@@ -53,6 +54,7 @@ func TestBlobs(t *testing.T) {
 // sealed, after the epoch redirect: anywhere else a blob of the sealed
 // type, even one whose header names a kid, is bytes as stored.
 func TestBlobSealedTypeInPlainNamespace(t *testing.T) {
+	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{})
 	c := s.Client(t, client.WithAuthor("alice")).With(client.WithKeys(client.NewKeys(nil)))
@@ -73,6 +75,7 @@ func TestBlobSealedTypeInPlainNamespace(t *testing.T) {
 // §E.3.1: declared lists are sorted by the ids' binary form, not their
 // text: the base32 alphabet puts the digits after the letters.
 func TestBlobIDsBinaryOrder(t *testing.T) {
+	t.Parallel()
 	var lo, hi ids.ID
 	hi[0] = 0xf8 // text "17…", which sorts before "1a…" as a string
 	doc := map[string]any{"x": map[string]any{"$blob": hi.String()}, "y": map[string]any{"$blob": lo.String()}, "z": map[string]any{"$blob": hi.String()}}
