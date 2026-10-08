@@ -9,9 +9,8 @@ import (
 
 // Exports and imports with a log page size of 2 (§7.1 Paging): the
 // namespace logs and resource histories an export verifies (§G.4), and the
-// target logs an import reads, span pages, e2e ciphertext included. The
-// target heads an import lists stop after a few pages, and the rest are
-// looked up one by one.
+// target logs an import reads, span pages, e2e ciphertext included, as do
+// the target heads an import lists (§7.4).
 //
 // Paged sets the environment, so these flows run serially and call the
 // tests' bodies, not the parallel TestX.

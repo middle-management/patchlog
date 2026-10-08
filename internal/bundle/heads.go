@@ -3,6 +3,7 @@ package bundle
 import (
 	"context"
 	"sort"
+	"unicode/utf8"
 
 	"github.com/middle-management/patchlog/internal/client"
 )
@@ -21,16 +22,19 @@ import (
 
 // headsPerPage is how many lookups each page of a listing must replace: an
 // import lists at most one page per headsPerPage resources it looks up in
-// a namespace, and looks up those past where the listing stopped one by
-// one. A small import into a large namespace keeps its lookups.
+// a namespace, from just below the first, and the next page only while
+// the last replaced headsPerPage lookups, or one per headsPerPage heads it
+// listed. It looks up those past where the listing stopped one by one. A
+// small import into a large namespace keeps its lookups.
 const headsPerPage = 10
 
 // listing is what an import read of a namespace's heads: every resource
-// up to through, in byte order (§7.4), or every resource if complete.
+// after after, up to through, in byte order (§7.4), or every resource
+// after after if complete. It keeps the heads of the resources looked up.
 type listing struct {
-	heads    map[string]client.HeadItem
-	through  string
-	complete bool
+	heads          map[string]client.HeadItem
+	after, through string
+	complete       bool
 }
 
 // head reads the head of ns/name in the target: from the namespace's
@@ -38,7 +42,7 @@ type listing struct {
 // doesn't give a tombstone's last live revision (client.Head.Last), which
 // the import doesn't use.
 func (im *importer) head(ctx context.Context, ns, name string) (*client.Head, error) {
-	if l := im.listing(ctx, ns); l != nil && (l.complete || name <= l.through) {
+	if l := im.listing(ctx, ns); l != nil && name > l.after && (l.complete || name <= l.through) {
 		it, ok := l.heads[name]
 		switch {
 		case !ok:
@@ -55,14 +59,14 @@ func (im *importer) head(ctx context.Context, ns, name string) (*client.Head, er
 }
 
 // listing lists ns's heads, once, if the import looks up at least
-// headsPerPage resources there: page by page, up to the last of them or
-// until its pages are used up. With authentication disabled (§1) every
-// namespace is readable, so one that answers 404 doesn't exist and has no
-// resources. Without a listing (nil) the lookups go to GET /r/{ns}/{name}
-// as before: when the namespace doesn't list for the importer (a grant
-// that may read only some of its resources, §7.6), and when it is frozen,
-// as a purged namespace is, which answers 410 for every name, listed or
-// not (§8.5).
+// headsPerPage resources there: page by page, from just below the first of
+// them up to the last, or until the pages stop paying (headsPerPage). With
+// authentication disabled (§1) every namespace is readable, so one that
+// answers 404 doesn't exist and has no resources. Without a listing (nil)
+// the lookups go to GET /r/{ns}/{name} as before: when the namespace
+// doesn't list for the importer (a grant that may read only some of its
+// resources, §7.6), and when it is frozen, as a purged namespace is, which
+// answers 410 for every name, listed or not (§8.5).
 func (im *importer) listing(ctx context.Context, ns string) *listing {
 	if l, ok := im.listed[ns]; ok {
 		return l
@@ -83,21 +87,31 @@ func (im *importer) listing(ctx context.Context, ns string) *listing {
 	if doc, err := im.c.NSDoc(ctx, ns, h.ID); err != nil || doc.Value["frozen"] == true {
 		return nil
 	}
-	l := &listing{heads: map[string]client.HeadItem{}}
+	// after is a plain bound (§7.4): the first name a character short.
+	_, size := utf8.DecodeLastRuneInString(want[0])
+	l := &listing{heads: map[string]client.HeadItem{}, after: want[0][:len(want[0])-size]}
+	l.through = l.after
 	im.listed[ns] = l
-	for last := want[len(want)-1]; pages > 0 && l.through < last; pages-- {
+	for i, last := 0, want[len(want)-1]; pages > 0 && l.through < last; pages-- {
 		items, next, err := im.c.HeadsPage(ctx, ns, h.ID, l.through)
 		if err != nil {
 			break // the rest are looked up one by one
 		}
 		for _, it := range items {
-			l.heads[it.Resource] = it
+			if k := sort.SearchStrings(want, it.Resource); k < len(want) && want[k] == it.Resource {
+				l.heads[it.Resource] = it
+			}
 		}
 		if next == "" {
 			l.complete = true
 			break
 		}
 		l.through = next
+		j := sort.Search(len(want), func(k int) bool { return want[k] > next })
+		if n := j - i; n == 0 || n < headsPerPage && n*headsPerPage < len(items) {
+			break // the page replaced too few lookups
+		}
+		i = j
 	}
 	return l
 }

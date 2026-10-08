@@ -14,6 +14,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -48,6 +49,15 @@ func (h *headsTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 func (d *deployment) importer(h *headsTransport, opts ...client.Option) *client.Client {
 	return must(client.New(d.url, append([]client.Option{client.WithAuthor("alice"), client.WithKeys(client.NewKeys(nil)),
 		client.WithHTTPClient(&http.Client{Transport: h})}, opts...)...))
+}
+
+// pageSize sets a deployment's log page size, with fast rate limits.
+func pageSize(n int) func(*core.Options) {
+	return func(o *core.Options) {
+		fastLimits(o)
+		o.Maximums = o.Limits
+		o.Maximums.LogPageSize = n
+	}
 }
 
 // headsScenario imports a first bundle of namespace m into a target, then
@@ -178,6 +188,127 @@ func testHeadsListing(t *testing.T, mode string, sealed, branch bool) {
 		if d := rep.Doc("m/" + name); d == nil || d.Class != class {
 			t.Fatalf("%s: %+v, want %s", name, d, class)
 		}
+	}
+}
+
+// A listing whose pages run out part-way through the namespace: the names
+// up to where it stopped are read from it, the rest looked up one by one,
+// and every document is classified as lookups alone classify it. The
+// target interleaves names of its own with the bundle's, which meets every
+// classification; with branch, into a branch with writes of its own and
+// base writes after the branch point that don't show through.
+func TestHeadsPartialListing(t *testing.T) {
+	t.Parallel()
+	for _, branch := range []bool{false, true} {
+		t.Run(fmt.Sprint("branch=", branch), func(t *testing.T) {
+			t.Parallel()
+			src, dst := newDeployment(t, stagingOrigin, pageSize(3)), newDeployment(t, cmsOrigin, pageSize(3))
+			src.ns("m", nil)
+			for i := 0; i < 42; i++ {
+				src.create("m", fmt.Sprintf("d%03d", i), map[string]any{"v": i})
+			}
+			export := func() []byte { b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"m"}}); return b }
+			importB(t, dst, export(), bundle.ImportOptions{})
+			for i := 0; i < 42; i++ {
+				dst.create("m", fmt.Sprintf("d%03d%s", i, []string{"a", "-x", ".x", "_x", "0"}[i%5]), map[string]any{"x": i})
+				name := fmt.Sprintf("d%03d", i)
+				switch i % 7 {
+				case 0:
+					src.append("m", name, op("replace", "/v", "src"))
+				case 1:
+					dst.append("m", name, op("replace", "/v", "dst"))
+				case 2:
+					src.append("m", name, op("replace", "/v", "src"))
+					dst.append("m", name, op("replace", "/v", "dst"))
+				case 3:
+					must(dst.c.Delete(ctx, "m", name, dst.head("m", name).ID))
+				case 4:
+					must(dst.c.Purge(ctx, "m", name, dst.head("m", name).ID, false))
+				case 5:
+					must(dst.c.Delete(ctx, "m", name, dst.head("m", name).ID))
+					src.append("m", name, op("replace", "/v", "src"))
+				}
+			}
+			for i := 0; i < 20; i++ {
+				src.create("m", fmt.Sprintf("n%03d", i), map[string]any{"v": i})
+				src.create("m", fmt.Sprintf("d%03d%s", i, []string{"-a", ".a", "_a", "z", "-"}[i%5]), map[string]any{"v": i})
+			}
+			b := export()
+			opt := bundle.ImportOptions{Mode: bundle.Atomic, DryRun: true}
+			if branch {
+				must(dst.c.CreateBranch(ctx, "m", client.BranchRequest{Name: "mb"}))
+				opt.NSMap = map[string]string{"m": "mb"}
+				dst.append("mb", "d006", op("replace", "/v", "branch"))
+				dst.append("mb", "d000", op("replace", "/v", "branch"))
+				must(dst.c.Delete(ctx, "mb", "d013", dst.head("mb", "d013").ID))
+				dst.create("mb", "n003", map[string]any{"v": "branch"})
+				dst.create("mb", "n019", map[string]any{"v": "branch"})
+				dst.append("m", "d020", op("replace", "/v", "after"))
+				dst.create("m", "n010", map[string]any{"v": "after"})
+			}
+			run := func(h *headsTransport) []byte {
+				rep, err := bundle.Import(ctx, dst.importer(h), bundle.BytesOpener(b), opt)
+				if err != nil {
+					t.Fatalf("import: %v", err)
+				}
+				return must(json.MarshalIndent(rep, "", " "))
+			}
+			looked, listed := &headsTransport{block: true}, &headsTransport{}
+			if want, got := run(looked), run(listed); string(got) != string(want) {
+				t.Fatalf("listed:\n%s\nlooked up:\n%s", got, want)
+			}
+			if listed.pages.Load() == 0 || listed.lookups.Load() == 0 || listed.lookups.Load() >= looked.lookups.Load() {
+				t.Fatalf("not a partial listing: %d pages and %d lookups, against %d lookups", listed.pages.Load(), listed.lookups.Load(), looked.lookups.Load())
+			}
+		})
+	}
+}
+
+// A small import into a large namespace lists little of it: from just
+// below the first name it looks up, and only while pages replace enough
+// lookups. 40 new documents into a namespace of 1,000, 20 heads a page.
+func TestHeadsListingLarge(t *testing.T) {
+	t.Parallel()
+	dst := newDeployment(t, cmsOrigin, pageSize(20))
+	dst.ns("m", nil)
+	var items []client.BatchItem
+	for i := 0; i < 1000; i++ {
+		items = append(items, client.BatchItem{Resource: fmt.Sprintf("a%04d", i), IfNoneMatch: true,
+			Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"i": i}))}})
+	}
+	must(dst.c.Batch(ctx, "m", client.BatchRequest{Items: items}, false))
+	for _, tc := range []struct {
+		name           string
+		doc            func(i int) string
+		pages, lookups int64
+	}{
+		// Past every name there: an empty page lists the rest.
+		{"after", func(i int) string { return fmt.Sprintf("z%02d", i) }, 1, 0},
+		// One by every 25th name there: the first page replaces a lookup,
+		// too few to go on.
+		{"sparse", func(i int) string { return fmt.Sprintf("a%04d.n", 25*i) }, 1, 39},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			src := newDeployment(t, stagingOrigin, fastLimits)
+			src.ns("m", nil)
+			for i := 0; i < 40; i++ {
+				src.create("m", tc.doc(i), map[string]any{"i": i})
+			}
+			b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"m"}})
+			run := func(h *headsTransport) []byte {
+				rep, err := bundle.Import(ctx, dst.importer(h), bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic, DryRun: true})
+				noErr(t, err)
+				return must(json.MarshalIndent(rep, "", " "))
+			}
+			looked, listed := &headsTransport{block: true}, &headsTransport{}
+			if want, got := run(looked), run(listed); string(got) != string(want) {
+				t.Fatalf("listed:\n%s\nlooked up:\n%s", got, want)
+			}
+			if listed.pages.Load() != tc.pages || listed.lookups.Load() != tc.lookups {
+				t.Fatalf("%d pages and %d lookups, want %d and %d", listed.pages.Load(), listed.lookups.Load(), tc.pages, tc.lookups)
+			}
+		})
 	}
 }
 
