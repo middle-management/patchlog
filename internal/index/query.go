@@ -3,6 +3,7 @@ package index
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/url"
@@ -304,19 +305,177 @@ type FacetCount struct {
 	Count int `json:"count"`
 }
 
-// candidateSQL builds the query for all candidates in order.
-func (ix *Index) candidateSQL(ns string, q *Query) (string, []any) {
+// filter is the ?ref= filter, a ?facet= path or a range: a condition on
+// rows of table (as alias a), each of one resource. A query tests it per
+// document on the table's primary key, or reads the candidates from it on
+// its query index (see driver).
+type filter struct {
+	table, a string
+	idx, pk  string // the query index, the primary key's index
+	cond     string
+	args     []any
+	// test is cond as tested per document on pk, when it differs: a
+	// facet's values are then looked up once, not one seek each.
+	test string
+}
+
+// pkCond is f's condition as tested per document on its primary key.
+func (f filter) pkCond() string {
+	if f.test != "" {
+		return f.test
+	}
+	return f.cond
+}
+
+// filters lists q's filters: the ref, the facets by path, the ranges.
+func (q *Query) filters() []filter {
+	var fs []filter
+	if rf := q.Ref; rf != nil {
+		cond, args := refCond(rf)
+		fs = append(fs, filter{table: `refs`, a: "x", idx: "refs_t", pk: "sqlite_autoindex_refs_1", cond: cond, args: args})
+	}
+	paths := make([]string, 0, len(q.Facets))
+	for p := range q.Facets {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	for _, p := range paths {
+		var in strings.Builder
+		args := []any{p}
+		for i, v := range q.Facets[p] {
+			if i > 0 {
+				in.WriteString(`, `)
+			}
+			in.WriteString(`?`)
+			args = append(args, v)
+		}
+		f := filter{table: `facet`, a: "f", idx: "facet_q", pk: "sqlite_autoindex_facet_1", args: args}
+		f.cond = `f.path = ? AND f.value IN (` + in.String() + `)`
+		if len(q.Facets[p]) > 1 {
+			// Per document, seek the path's rows and test the value
+			// against the list, instead of one seek per value.
+			f.test = `f.path = ? AND +f.value IN (` + in.String() + `)`
+		}
+		fs = append(fs, f)
+	}
+	// The ranges on one path are one filter: a document has one sort value
+	// per path, and on the query index they bound one range.
+	for i := 0; i < len(q.Ranges); {
+		f := filter{table: `"sort"`, a: "r", idx: "sort_q", pk: "sqlite_autoindex_sort_1", args: []any{q.Ranges[i].path}}
+		cond := `r.path = ?`
+		for j := i; i < len(q.Ranges) && q.Ranges[i].path == q.Ranges[j].path; i++ {
+			r := q.Ranges[i]
+			if r.num {
+				cond += ` AND typeof(r.value) IN ('integer', 'real') AND r.value ` + r.op + ` ?`
+				f.args = append(f.args, r.f)
+			} else {
+				cond += ` AND typeof(r.value) = 'text' AND r.value ` + r.op + ` ?`
+				f.args = append(f.args, r.s)
+			}
+		}
+		f.cond = cond
+		fs = append(fs, f)
+	}
+	return fs
+}
+
+// A query reads its candidates either from one filter's matches (its rows
+// on the filter's query index, each looked up in docs, then sorted) or by
+// scanning the namespace's documents in resource order, testing each. A
+// match costs about four times what a tested document does, so a filter
+// drives if it matches under a quarter of the namespace's documents. That
+// is the rule when the query reads every candidate anyway (a sort, counts,
+// or a page past the matches); otherwise the scan stops at the page, and
+// the filter must also match fewer than maxDrive rows, which bounds what
+// driving can cost over the scan. Matches are counted on the filter's
+// index up to maxDriveAll, documents up to four times the matches, so the
+// counting costs little next to either plan.
+const (
+	maxDrive    = 1000
+	maxDriveAll = 1 << 14
+)
+
+// driver returns the index in fs of the filter that drives the query (the
+// one with the fewest matches, if it is selective), or -1 to scan. A q=
+// query is driven by its text matches (see candidateSQL).
+func (ix *Index) driver(ctx context.Context, tx *sql.Tx, ns string, q *Query, fs []filter) (int, error) {
+	if len(q.words) > 0 || len(fs) == 0 {
+		return -1, nil
+	}
+	best, m := -1, min(max(maxDrive, q.After+q.Limit), maxDriveAll)
+	all := len(q.Sorts) > 0 || len(q.Counts) > 0 || q.After+q.Limit >= maxDriveAll
+	if all {
+		m = maxDriveAll
+	}
+	probe := func() error {
+		for i, f := range fs {
+			var n int
+			args := append(append([]any{ns}, f.args...), m)
+			err := tx.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM `+f.table+` `+f.a+` INDEXED BY `+f.idx+` WHERE `+f.a+`.ns = ? AND `+f.cond+` LIMIT ?)`, args...).Scan(&n)
+			if err != nil {
+				return err
+			}
+			if n < m {
+				best, m = i, n
+			}
+		}
+		return nil
+	}
+	if err := probe(); err != nil {
+		return -1, err
+	}
+	if best < 0 && all {
+		// Every filter matches maxDriveAll rows or more. In a namespace of
+		// over four times that, one may still match under a quarter of
+		// its documents: count up to that, which costs a fraction of the
+		// scan the query reads otherwise.
+		var docs int
+		if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM docs WHERE ns = ?`, ns).Scan(&docs); err != nil {
+			return -1, err
+		}
+		if docs/4 <= maxDriveAll {
+			return -1, nil
+		}
+		m = docs / 4
+		if err := probe(); err != nil {
+			return -1, err
+		}
+		return best, nil
+	}
+	if best < 0 {
+		return -1, nil
+	}
+	var docs int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM docs WHERE ns = ? LIMIT ?)`, ns, 4*m+1).Scan(&docs); err != nil {
+		return -1, err
+	}
+	if docs <= 4*m {
+		return -1, nil
+	}
+	return best, nil
+}
+
+// candidateSQL builds the query for all candidates in order, read from
+// the text matches (with q=), from fs[drive] (drive >= 0), or from the
+// namespace's documents. The table that drives comes first in a CROSS
+// JOIN, so that SQLite keeps it the outer loop whatever its estimates,
+// and each filter reads the index named for it.
+func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (string, []any) {
 	var sb strings.Builder
 	var args []any
+	if len(q.words) > 0 {
+		drive = -1
+	}
 	sb.WriteString(`SELECT d.docid, d.resource, d.head, COALESCE(d.schema, ''), `)
 	if len(q.words) > 0 {
 		sb.WriteString(`t.score`)
 	} else {
 		sb.WriteString(`0.0`)
 	}
-	sb.WriteString(` FROM docs d`)
-	if len(q.words) > 0 {
-		sb.WriteString(` JOIN (SELECT docid, sum(s) AS score FROM (`)
+	sb.WriteString(` FROM `)
+	switch {
+	case len(q.words) > 0:
+		sb.WriteString(`(SELECT docid, sum(s) AS score FROM (`)
 		for i, w := range q.words {
 			if i > 0 {
 				sb.WriteString(` UNION ALL `)
@@ -329,7 +488,13 @@ func (ix *Index) candidateSQL(ns string, q *Query) (string, []any) {
 				args = append(args, likePattern(w))
 			}
 		}
-		fmt.Fprintf(&sb, `) GROUP BY docid HAVING count(DISTINCT k) = %d) t ON t.docid = d.docid`, len(q.words))
+		fmt.Fprintf(&sb, `) GROUP BY docid HAVING count(DISTINCT k) = %d) t CROSS JOIN docs d`, len(q.words))
+	case drive >= 0:
+		f := fs[drive]
+		sb.WriteString(`(SELECT DISTINCT ` + f.a + `.resource FROM ` + f.table + ` ` + f.a + ` INDEXED BY ` + f.idx + ` WHERE ` + f.a + `.ns = ? AND ` + f.cond + `) m CROSS JOIN docs d`)
+		args = append(append(args, ns), f.args...)
+	default:
+		sb.WriteString(`docs d`)
 	}
 	for i, s := range q.Sorts {
 		fmt.Fprintf(&sb, ` LEFT JOIN "sort" s%d ON s%d.ns = d.ns AND s%d.resource = d.resource AND s%d.path = ?`, i, i, i, i)
@@ -337,43 +502,21 @@ func (ix *Index) candidateSQL(ns string, q *Query) (string, []any) {
 	}
 	sb.WriteString(` WHERE d.ns = ?`)
 	args = append(args, ns)
+	switch {
+	case len(q.words) > 0:
+		sb.WriteString(` AND d.docid = t.docid`)
+	case drive >= 0:
+		sb.WriteString(` AND d.resource = m.resource`)
+	}
 	if q.Schema != "" {
 		pre := strings.TrimRight(q.Schema, "/") + "/"
 		sb.WriteString(` AND (d.schema = ? OR substr(d.schema, 1, ?) = ?)`)
 		args = append(args, q.Schema, len(pre), pre)
 	}
-	if rf := q.Ref; rf != nil {
-		cond, a := refCond(rf)
-		sb.WriteString(` AND EXISTS (SELECT 1 FROM refs x WHERE x.ns = d.ns AND x.resource = d.resource AND ` + cond + `)`)
-		args = append(args, a...)
-	}
-	paths := make([]string, 0, len(q.Facets))
-	for p := range q.Facets {
-		paths = append(paths, p)
-	}
-	sort.Strings(paths)
-	for _, p := range paths {
-		vals := q.Facets[p]
-		sb.WriteString(` AND EXISTS (SELECT 1 FROM facet f WHERE f.ns = d.ns AND f.resource = d.resource AND f.path = ? AND f.value IN (`)
-		args = append(args, p)
-		for i, v := range vals {
-			if i > 0 {
-				sb.WriteString(`, `)
-			}
-			sb.WriteString(`?`)
-			args = append(args, v)
-		}
-		sb.WriteString(`))`)
-	}
-	for _, r := range q.Ranges {
-		sb.WriteString(` AND EXISTS (SELECT 1 FROM "sort" r WHERE r.ns = d.ns AND r.resource = d.resource AND r.path = ? AND `)
-		args = append(args, r.path)
-		if r.num {
-			fmt.Fprintf(&sb, `typeof(r.value) IN ('integer', 'real') AND r.value %s ?)`, r.op)
-			args = append(args, r.f)
-		} else {
-			fmt.Fprintf(&sb, `typeof(r.value) = 'text' AND r.value %s ?)`, r.op)
-			args = append(args, r.s)
+	for i, f := range fs {
+		if i != drive {
+			sb.WriteString(` AND EXISTS (SELECT 1 FROM ` + f.table + ` ` + f.a + ` INDEXED BY ` + f.pk + ` WHERE ` + f.a + `.ns = d.ns AND ` + f.a + `.resource = d.resource AND ` + f.pkCond() + `)`)
+			args = append(args, f.args...)
 		}
 	}
 	sb.WriteString(` ORDER BY `)
@@ -449,7 +592,12 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 			return nil, &FieldError{Path: f}
 		}
 	}
-	stmt, args := ix.candidateSQL(ns, q)
+	fs := q.filters()
+	drive, err := ix.driver(ctx, tx, ns, q, fs)
+	if err != nil {
+		return nil, err
+	}
+	stmt, args := ix.candidateSQL(ns, q, fs, drive)
 	rows, err := tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
 		return nil, err
@@ -647,14 +795,34 @@ func (ix *Index) attachFacets(ctx context.Context, tx *sql.Tx, ns string, hits [
 	return rows.Err()
 }
 
+// counts tallies the facet values at paths of resources. When they are
+// few (at most maxDriveAll, and under half the path's rows, counted up to
+// that), it looks their rows up; else it reads all of the path's rows.
 func (ix *Index) counts(ctx context.Context, tx *sql.Tx, ns string, paths, resources []string) (map[string][]FacetCount, error) {
 	in := make(map[string]bool, len(resources))
 	for _, r := range resources {
 		in[r] = true
 	}
+	var resJSON []byte // resources as a JSON array, for json_each
 	out := map[string][]FacetCount{}
 	for _, p := range paths {
-		rows, err := tx.QueryContext(ctx, `SELECT resource, raw FROM facet WHERE ns = ? AND path = ?`, ns, p)
+		n := 0
+		if len(resources) <= maxDriveAll {
+			err := tx.QueryRowContext(ctx, `SELECT count(*) FROM (SELECT 1 FROM facet INDEXED BY facet_q WHERE ns = ? AND path = ? LIMIT ?)`, ns, p, 2*len(resources)+1).Scan(&n)
+			if err != nil {
+				return nil, err
+			}
+		}
+		var rows *sql.Rows
+		var err error
+		if n > 2*len(resources) {
+			if resJSON == nil {
+				resJSON, _ = json.Marshal(resources)
+			}
+			rows, err = tx.QueryContext(ctx, `SELECT f.resource, f.raw FROM json_each(?) j CROSS JOIN facet f INDEXED BY sqlite_autoindex_facet_1 WHERE f.ns = ? AND f.resource = j.value AND f.path = ?`, string(resJSON), ns, p)
+		} else {
+			rows, err = tx.QueryContext(ctx, `SELECT resource, raw FROM facet WHERE ns = ? AND path = ?`, ns, p)
+		}
 		if err != nil {
 			return nil, err
 		}

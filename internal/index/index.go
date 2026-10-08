@@ -221,6 +221,10 @@ var dropStmts = []string{
 	derived.CacheDropStmts[0], derived.CacheDropStmts[1],
 }
 
+// createStmts: query.go names facet_q, sort_q, refs_t and the primary
+// keys' indexes (sqlite_autoindex_facet_1, _sort_1, _refs_1) in INDEXED
+// BY, which fails the query if one is missing; a table keeps its primary
+// key as its only constraint (TestOldSchemasIndexedBy).
 var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,
@@ -229,7 +233,10 @@ var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, raw TEXT, PRIMARY KEY (ns, resource, path))`,
 	`CREATE TABLE IF NOT EXISTS refs (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, ref TEXT NOT NULL, target_ns TEXT NOT NULL, target TEXT NOT NULL, rev TEXT, entry TEXT, PRIMARY KEY (ns, resource, path))`,
 	`CREATE INDEX IF NOT EXISTS docs_q ON docs (ns, schema)`,
-	`CREATE INDEX IF NOT EXISTS refs_q ON refs (target_ns, target, rev, entry)`,
+	// refs_t leads with ns: a ?ref= filter reads only the namespace's
+	// references to the target (refs_q, before, read every namespace's).
+	`DROP INDEX IF EXISTS refs_q`,
+	`CREATE INDEX IF NOT EXISTS refs_t ON refs (ns, target_ns, target, rev, entry)`,
 	`CREATE INDEX IF NOT EXISTS facet_q ON facet (ns, path, value)`,
 	`CREATE INDEX IF NOT EXISTS sort_q ON "sort" (ns, path, value)`,
 }
