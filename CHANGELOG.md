@@ -2,20 +2,26 @@
 
 ## Unreleased
 
-**Performance** (found by profiling with the new OpenTelemetry spans; numbers from in-process
-benchmarks on a shared 4-CPU box):
+**Performance** (found by profiling with the new OpenTelemetry spans). End to end, against
+v0.15.0 on a shared 4-CPU box, mixed reads (head pointers, revisions, logs, `/heads`) went
+from 557 to 1,552 requests/s on SQLite and from 549 to 1,015 on Postgres, with p99 down from
+281 to 66 ms and from 248 to 68 ms:
 - **Namespace log pages** resolved each entry's `prev` with its own query (one per entry, a
-  round trip each on Postgres). They now come from the page's own rows: a 600-entry page
-  takes about 5 ms instead of about 93 ms on Postgres, and 5 ms instead of 13 ms on SQLite.
-- **`/heads` on SQLite** now batches its lookups as Postgres already did: a 1000-item page
-  takes about 19 ms instead of 38 ms (a branch's, 36 ms instead of 57 ms).
+  round trip each on Postgres). They now come from the page's own rows: a page takes 18 ms
+  instead of 160 ms on Postgres, and 13 ms instead of 48 ms on SQLite.
+- **`/heads` on SQLite** now batches its lookups as Postgres already did: 48 ms instead of
+  218 ms per page.
 - **The index** fetches a page's documents concurrently (`-fetch-concurrency`, default 8)
-  instead of one at a time, applying them in log order as before: about 4× faster per page
-  in tests. On Postgres the index used to lag writes by 1–2 s under load.
+  instead of one at a time, applying them in log order as before. On Postgres under steady
+  writes its lag fell from about 950 ms (max 2.6 s) to 24 ms, and `?min` reads no longer
+  time out with `503`. The trade-off: it now keeps up, so its reads compete with writers, and
+  write throughput with the index and tree following fell by about 23% in that test; lower
+  `-fetch-concurrency` trades freshness back.
 - **Authenticated reads** now use the read cache once the request is authorised (it served
   only public namespaces before), and verified grants are cached by token, keeping only
-  grants that verified: an authenticated head-plus-revision read takes about 70 µs instead
-  of about 530 µs. Authorisation still runs on every request, and cache-control is unchanged.
+  grants that verified. Warm authenticated reads take 0.8 ms instead of 1.3 ms, and the
+  authenticated workload ran 29% faster. Authorisation still runs on every request, and
+  cache-control is unchanged.
 
 **Build:**
 - **Smaller release binaries:** releases, the Docker image and `make build` build with
