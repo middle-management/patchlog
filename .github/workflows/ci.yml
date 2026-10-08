@@ -25,8 +25,9 @@ jobs:
       - name: race
         run: go test -race ./internal/core ./internal/server ./internal/merge ./internal/index ./internal/tree
 
-  # The storage-dependent tests again, on Postgres (Addendum D.8): each test
-  # gets a fresh database (internal/pgtest).
+  # Every package's tests again, on Postgres (Addendum D.8): each test that
+  # opens a store gets a fresh database (internal/pgtest), including the
+  # services' tests through clienttest.
   postgres:
     runs-on: ubuntu-latest
     services:
@@ -48,9 +49,9 @@ jobs:
       - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
-      - run: go test ./internal/core ./internal/server ./internal/client/... ./internal/merge ./internal/janitor ./internal/bundle
+      - run: go test ./internal/...
       - name: race
-        run: go test -race ./internal/core ./internal/server
+        run: go test -race ./internal/core ./internal/server ./internal/index
 
   docker:
     runs-on: ubuntu-latest

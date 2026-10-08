@@ -11,9 +11,9 @@ build: ## build ./patchlog
 test: ## run all tests
 	go test ./...
 
-PG_PACKAGES = ./internal/core ./internal/server ./internal/client/... ./internal/merge ./internal/janitor ./internal/bundle
+PG_PACKAGES = ./internal/...
 
-test-pg: ## run the storage-dependent tests on Postgres (PATCHLOG_TEST_PG=postgres://user@host:port/postgres; a fresh database per test)
+test-pg: ## run the tests on Postgres (PATCHLOG_TEST_PG=postgres://user@host:port/postgres; a fresh database per test)
 	@test -n "$$PATCHLOG_TEST_PG" || (echo "set PATCHLOG_TEST_PG to a Postgres URL whose user may create databases"; exit 1)
 	go test $(PG_PACKAGES)
 
