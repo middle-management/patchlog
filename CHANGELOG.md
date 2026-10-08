@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.15.1
 
 **Performance** (found by profiling with the new OpenTelemetry spans). End to end, against
 v0.15.0 on a shared 4-CPU box, mixed reads (head pointers, revisions, logs, `/heads`) went
