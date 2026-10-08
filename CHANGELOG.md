@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+**Performance** (found by profiling with the new OpenTelemetry spans; numbers from in-process
+benchmarks on a shared 4-CPU box):
+- **Namespace log pages** resolved each entry's `prev` with its own query (one per entry, a
+  round trip each on Postgres). They now come from the page's own rows: a 600-entry page
+  takes about 5 ms instead of about 93 ms on Postgres, and 5 ms instead of 13 ms on SQLite.
+- **`/heads` on SQLite** now batches its lookups as Postgres already did: a 1000-item page
+  takes about 19 ms instead of 38 ms (a branch's, 36 ms instead of 57 ms).
+- **The index** fetches a page's documents concurrently (`-fetch-concurrency`, default 8)
+  instead of one at a time, applying them in log order as before: about 4× faster per page
+  in tests. On Postgres the index used to lag writes by 1–2 s under load.
+- **Authenticated reads** now use the read cache once the request is authorised (it served
+  only public namespaces before), and verified grants are cached by token, keeping only
+  grants that verified: an authenticated head-plus-revision read takes about 70 µs instead
+  of about 530 µs. Authorisation still runs on every request, and cache-control is unchanged.
+
+**Build:**
 - **Smaller release binaries:** releases, the Docker image and `make build` build with
   grpc-go's `grpcnotrace` tag. It drops gRPC's own request tracing (`golang.org/x/net/trace`,
   off unless `grpc.EnableTracing` is set, which nothing here does), and with it
