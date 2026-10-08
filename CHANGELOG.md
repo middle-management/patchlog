@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.15.3
 
 **Index queries cost what their matches cost (B6).** Every index query read the namespace's
 documents in order and tested each against its facets, ranges and `?ref=`, so a facet
