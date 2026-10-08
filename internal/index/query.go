@@ -753,7 +753,7 @@ func (ix *Index) counts(ctx context.Context, tx *sql.Tx, ns string, paths, resou
 	for _, r := range resources {
 		in[r] = true
 	}
-	var list []byte // resources as a JSON array, for json_each
+	var resJSON []byte // resources as a JSON array, for json_each
 	out := map[string][]FacetCount{}
 	for _, p := range paths {
 		n := 0
@@ -766,10 +766,10 @@ func (ix *Index) counts(ctx context.Context, tx *sql.Tx, ns string, paths, resou
 		var rows *sql.Rows
 		var err error
 		if n > 2*len(resources) {
-			if list == nil {
-				list, _ = json.Marshal(resources)
+			if resJSON == nil {
+				resJSON, _ = json.Marshal(resources)
 			}
-			rows, err = tx.QueryContext(ctx, `SELECT f.resource, f.raw FROM json_each(?) j CROSS JOIN facet f INDEXED BY sqlite_autoindex_facet_1 WHERE f.ns = ? AND f.resource = j.value AND f.path = ?`, string(list), ns, p)
+			rows, err = tx.QueryContext(ctx, `SELECT f.resource, f.raw FROM json_each(?) j CROSS JOIN facet f INDEXED BY sqlite_autoindex_facet_1 WHERE f.ns = ? AND f.resource = j.value AND f.path = ?`, string(resJSON), ns, p)
 		} else {
 			rows, err = tx.QueryContext(ctx, `SELECT resource, raw FROM facet WHERE ns = ? AND path = ?`, ns, p)
 		}

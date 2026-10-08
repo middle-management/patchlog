@@ -221,6 +221,10 @@ var dropStmts = []string{
 	derived.CacheDropStmts[0], derived.CacheDropStmts[1],
 }
 
+// createStmts: query.go names facet_q, sort_q, refs_q and the primary
+// keys' indexes (sqlite_autoindex_facet_1, _sort_1, _refs_1) in INDEXED
+// BY, which fails the query if one is missing; a table keeps its primary
+// key as its only constraint (TestOldSchemasIndexedBy).
 var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,

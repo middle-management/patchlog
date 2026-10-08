@@ -31,6 +31,7 @@ import (
 // filter driving in turn and with the one driver picks, against the scan.
 func TestPlansMatchScan(t *testing.T) {
 	t.Parallel()
+	skipRace(t)
 	var driven, scanned, hits atomic.Int64
 	t.Run("seeds", func(t *testing.T) {
 		testPlansMatchScan(t, &driven, &scanned, &hits)
@@ -38,6 +39,16 @@ func TestPlansMatchScan(t *testing.T) {
 	// The datasets are large enough for both plans, and for results.
 	if driven.Load() < 500 || scanned.Load() < 100 || hits.Load() < 1000 {
 		t.Errorf("%d queries driven by a filter, %d scanned, %d hits", driven.Load(), scanned.Load(), hits.Load())
+	}
+}
+
+// skipRace skips a single-threaded comparison of query plans under the
+// race detector, which has nothing to check there and slows building the
+// datasets (SQLite in Go) about tenfold; go test without -race runs it.
+func skipRace(t *testing.T) {
+	t.Helper()
+	if raceBuild {
+		t.Skip("query plans, single-threaded: without -race")
 	}
 }
 
@@ -101,6 +112,7 @@ func testPlansMatchScan(t *testing.T, driven, scanned, hits *atomic.Int64) {
 // other, over random subsets of the namespace.
 func TestCountsLookup(t *testing.T) {
 	t.Parallel()
+	skipRace(t)
 	r := rand.New(rand.NewPCG(1, 1))
 	ix := randomIndex(t, r, false)
 	ctx := context.Background()
@@ -150,6 +162,7 @@ func TestCountsLookup(t *testing.T) {
 // ANALYZE statistics, even ones that make the namespace look small.
 func TestPlans(t *testing.T) {
 	t.Parallel()
+	skipRace(t)
 	ix := openTestIndex(t, false)
 	fillBench(t, ix, 5000)
 	ctx := context.Background()
