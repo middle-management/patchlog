@@ -103,3 +103,64 @@ func TestRequiredNoncesReleaseSplit(t *testing.T) {
 		t.Fatalf("matches.cup nonce %q", n)
 	}
 }
+
+// §C.7, §F.9: in a state namespace that requires nonces, the release
+// tool's own documents get a fresh $nonce in every revision: the stored
+// plan (created, restored with a root replace after a delete, appended to
+// at every step) and the catalog base's lock (taken and released).
+func TestRequiredNoncesReleaseState(t *testing.T) {
+	t.Parallel()
+	w := newRelWorld(t)
+	w.startCatalog()
+	h := must(w.ops.NSHead(ctx, "releases"))
+	must(w.ops.PatchConfig(ctx, "releases", h.Config, ops(op("add", "/nonce", "required"))))
+	w.branch("cat-season", "cat-season-r8")
+	w.appendTo("cat-season-r8", "season", op("replace", "/title", "Season 2026"))
+	w.writeRelease("release-8", map[string]string{"cat-season": "cat-season-r8"})
+	o := w.opts("release-8")
+	plan, lock := merge.PlanName("release-8"), merge.LockName("cat-season")
+	// nonces returns the $nonce of every revision of a state document,
+	// oldest first, each fresh and differing from its parent's.
+	nonces := func(name string) []string {
+		t.Helper()
+		h := must(w.anna.Head(ctx, "releases", name))
+		var out []string
+		for _, e := range must(w.anna.Log(ctx, "releases", name, h.ID, "")) {
+			if e.Kind != "rev" {
+				continue
+			}
+			d := must(w.anna.Doc(ctx, "releases", name, e.ID))
+			n, _ := d.Value.(map[string]any)["$nonce"].(string)
+			if !seal.ValidNonce(n) || (len(out) > 0 && n == out[len(out)-1]) {
+				t.Fatalf("%s rev %s: $nonce %q after %v", name, e.ID, n, out)
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, must(merge.PlanRelease(ctx, w.anna, o))))
+	h2 := must(w.anna.Head(ctx, "releases", plan))
+	must(w.anna.Delete(ctx, "releases", plan, h2.ID))
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, must(merge.PlanRelease(ctx, w.anna, o))))
+	if ns := nonces(plan); len(ns) != 2 {
+		t.Fatalf("plan revisions %v", ns)
+	}
+	must(merge.ApproveRelease(ctx, w.anna, o))
+	rp := must(merge.ApplyRelease(ctx, w.anna, o))
+	if rp.State != merge.ReleaseDone {
+		t.Fatalf("release %s", rp.State)
+	}
+	if ns := nonces(plan); len(ns) < 5 {
+		t.Fatalf("plan revisions %v", ns)
+	}
+	if ns := nonces(lock); len(ns) != 2 {
+		t.Fatalf("lock revisions %v", ns)
+	}
+	if holder := must(merge.LockHolder(ctx, w.anna, o, "cat-season")); holder != "" {
+		t.Fatalf("lock held by %s", holder)
+	}
+	if got := w.doc("cat-season", "season")["title"]; got != "Season 2026" {
+		t.Fatalf("season title %v", got)
+	}
+}

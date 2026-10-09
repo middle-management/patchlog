@@ -8,6 +8,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/schemaimport"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // An import into a real server: the schemas land at the predicted
@@ -113,6 +114,83 @@ func TestImportEndToEnd(t *testing.T) {
 	neg["$schema"] = rootPath
 	if _, err := c.CreateDoc(ctx, "docs", "neg-old", neg); err != nil {
 		t.Errorf("old revision: %v", err)
+	}
+}
+
+// §C.7: into a namespace that requires nonces, every create, append and
+// restore adds a fresh $nonce, the predicted ids include it, and a head
+// that differs from the content only in its $nonce is unchanged.
+func TestImportRequiredNonces(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fs := newFixtureServer(t)
+	s := clienttest.New(t, clienttest.Options{})
+	c := s.Client(t, client.WithAuthor("importer"))
+	if _, err := c.CreateNamespace(ctx, "schemas", map[string]any{"read": "public", "nonce": "required"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.CreateNamespace(ctx, "docs", map[string]any{"read": "public"}); err != nil {
+		t.Fatal(err)
+	}
+	src := []string{fs.URL + "/a/root.json"}
+	opt := schemaimport.Options{NS: "schemas", Name: "person"}
+	// write plans and writes the import, and returns each resource's
+	// $nonce, checking it is fresh and the head is the predicted one.
+	write := func() (*schemaimport.Result, map[string]string) {
+		t.Helper()
+		res, err := schemaimport.Plan(ctx, c, src, opt)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := res.Write(ctx, c); err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]string{}
+		for _, r := range res.Resources {
+			h, d, err := c.Load(ctx, "schemas", r.Name)
+			if err != nil || h.ID != r.ID {
+				t.Fatalf("%s: head %+v %v, want %s", r.Name, h, err, r.ID)
+			}
+			n, _ := d.Value.(map[string]any)["$nonce"].(string)
+			if !seal.ValidNonce(n) {
+				t.Fatalf("%s: $nonce %q", r.Name, n)
+			}
+			out[r.Name] = n
+		}
+		return res, out
+	}
+	res, first := write()
+	if len(res.NSIDs) != 1 {
+		t.Errorf("%d batches, want one atomic batch", len(res.NSIDs))
+	}
+	rootPath := res.Resources[len(res.Resources)-1].Path("schemas")
+	if _, err := c.CreateDoc(ctx, "docs", "ok", map[string]any{"$schema": rootPath, "addr": map[string]any{"zip": "12345"}}); err != nil {
+		t.Fatalf("valid document: %v", err)
+	}
+	if again, err := schemaimport.Plan(ctx, c, src, opt); err != nil || again.Changed() {
+		t.Fatalf("re-run: %v", err)
+	}
+
+	// A changed source appends, and a deleted resource is restored.
+	fs.set("/b/sib.json", `{ "type": "integer", "minimum": 0 }`)
+	h, err := c.Head(ctx, "schemas", "address")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := c.Delete(ctx, "schemas", "address", h.ID); err != nil {
+		t.Fatal(err)
+	}
+	res, second := write()
+	if a := byName(t, res, "sib").Action; a != schemaimport.Append {
+		t.Fatalf("sib %s", a)
+	}
+	if a := byName(t, res, "address").Action; a != schemaimport.Restore {
+		t.Fatalf("address %s", a)
+	}
+	for _, n := range []string{"sib", "address", "person"} {
+		if first[n] == second[n] {
+			t.Errorf("%s kept its $nonce", n)
+		}
 	}
 }
 

@@ -190,7 +190,8 @@ type ReleasePlan struct {
 	// Notes explain decisions that need no person.
 	Notes []string `json:"notes,omitempty"`
 
-	head string // the plan resource's head when loaded
+	head   string // the plan resource's head when loaded
+	nonced bool   // the plan resource's head has a $nonce (stateNonce)
 }
 
 // StoredResolution is a resolution set kept in the plan.
@@ -382,7 +383,7 @@ func PlanRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*Re
 // AdoptHead makes rp replace the stored plan old when saved, keeping the
 // freezes old's approval made (a plan made again after an approval).
 func AdoptHead(rp, old *ReleasePlan) {
-	rp.head = old.head
+	rp.head, rp.nonced = old.head, old.nonced
 	for _, b := range rp.Branches {
 		if ob := old.Branch(b.Key); ob != nil && ob.NS == b.NS {
 			b.FrozenConfig = ob.FrozenConfig
@@ -1188,11 +1189,14 @@ func LoadReleasePlan(ctx context.Context, c *client.Client, opt ReleaseOptions) 
 		return nil, fmt.Errorf("merge: stored plan %s/%s: %w", ns, PlanName(ref.Name), err)
 	}
 	rp.head = h.ID
+	m, _ := d.Value.(map[string]any)
+	_, rp.nonced = m["$nonce"]
 	return &rp, nil
 }
 
 // SaveReleasePlan stores rp (a new revision with If-Match on the one
-// loaded, or a new resource).
+// loaded, or a new resource), with a fresh $nonce where the state
+// namespace needs one (stateNonce).
 func SaveReleasePlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan) error {
 	ns, err := opt.stateNS(rp.Release)
 	if err != nil {
@@ -1207,6 +1211,7 @@ func SaveReleasePlan(ctx context.Context, c *client.Client, opt ReleaseOptions, 
 	if err != nil {
 		return err
 	}
+	replace := []any{map[string]any{"op": "replace", "path": "", "value": val}}
 	if rp.head == "" {
 		h, err := c.Head(ctx, ns, name)
 		if err != nil {
@@ -1216,26 +1221,29 @@ func SaveReleasePlan(ctx context.Context, c *client.Client, opt ReleaseOptions, 
 		case client.Live:
 			rp.head = h.ID
 		case client.Tombstoned:
-			res, err := c.Restore(ctx, ns, name, h.ID, []any{map[string]any{"op": "replace", "path": "", "value": val}})
+			ps, nonced := stateNonce(ctx, c, ns, false, replace)
+			res, err := c.Restore(ctx, ns, name, h.ID, ps)
 			if err != nil {
 				return fmt.Errorf("merge: storing the plan: %w", err)
 			}
-			rp.head = res.ID
+			rp.head, rp.nonced = res.ID, nonced
 			return nil
 		default:
-			res, err := c.CreateDoc(ctx, ns, name, val)
+			ps, nonced := stateNonce(ctx, c, ns, false, client.GenesisPatches(val))
+			res, err := c.Create(ctx, ns, name, ps)
 			if err != nil {
 				return fmt.Errorf("merge: storing the plan: %w", err)
 			}
-			rp.head = res.ID
+			rp.head, rp.nonced = res.ID, nonced
 			return nil
 		}
 	}
-	res, err := c.Append(ctx, ns, name, rp.head, []any{map[string]any{"op": "replace", "path": "", "value": val}})
+	ps, nonced := stateNonce(ctx, c, ns, rp.nonced, replace)
+	res, err := c.Append(ctx, ns, name, rp.head, ps)
 	if err != nil {
 		return fmt.Errorf("merge: storing the plan: %w", err)
 	}
-	rp.head = res.ID
+	rp.head, rp.nonced = res.ID, nonced
 	return nil
 }
 
@@ -1289,7 +1297,7 @@ func ApproveRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (
 	if fresh.Digest != stored.Digest {
 		return fresh, fmt.Errorf("%w: planning again gives %s, the stored plan is %s: plan again and review", ErrDigest, fresh.Digest, stored.Digest)
 	}
-	fresh.head = stored.head
+	fresh.head, fresh.nonced = stored.head, stored.nonced
 	fresh.State = ReleaseApproved
 	fresh.PlannedBy = stored.PlannedBy
 	fresh.ApprovedBy, fresh.ApprovedAt = opt.Who, opt.now().UTC().Format(time.RFC3339)
@@ -1602,14 +1610,17 @@ func acquireLock(ctx context.Context, c *client.Client, opt ReleaseOptions, base
 			return err
 		}
 		holder, _ := m["release"].(string)
+		_, had := m["$nonce"]
+		lock := map[string]any{"release": rel, "since": opt.now().UTC().Format(time.RFC3339)}
 		switch {
 		case h.State == client.NotFound:
-			_, err = c.CreateDoc(ctx, ns, name, map[string]any{"release": rel, "since": opt.now().UTC().Format(time.RFC3339)})
+			ps, _ := stateNonce(ctx, c, ns, false, client.GenesisPatches(lock))
+			_, err = c.Create(ctx, ns, name, ps)
 		case h.State == client.Live && holder == rel:
 			return nil
 		case h.State == client.Live && holder == "":
-			_, err = c.Append(ctx, ns, name, h.ID, []any{
-				map[string]any{"op": "replace", "path": "", "value": map[string]any{"release": rel, "since": opt.now().UTC().Format(time.RFC3339)}}})
+			ps, _ := stateNonce(ctx, c, ns, had, []any{map[string]any{"op": "replace", "path": "", "value": lock}})
+			_, err = c.Append(ctx, ns, name, h.ID, ps)
 		case h.State == client.Live:
 			return fmt.Errorf("%w: %s is merging into %s (lock %s/%s)", ErrLocked, holder, base, ns, name)
 		default:
@@ -1638,7 +1649,9 @@ func releaseLock(ctx context.Context, c *client.Client, opt ReleaseOptions, base
 	if holder, _ := m["release"].(string); h.State != client.Live || holder != rel {
 		return nil
 	}
-	_, err = c.Append(ctx, ns, name, h.ID, []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"release": nil}}})
+	_, had := m["$nonce"]
+	ps, _ := stateNonce(ctx, c, ns, had, []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"release": nil}}})
+	_, err = c.Append(ctx, ns, name, h.ID, ps)
 	return err
 }
 

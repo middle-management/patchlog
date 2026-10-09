@@ -21,7 +21,9 @@
 //     and write them in one atomic batch (§7.5) when within batch limits.
 //
 // A resource whose head already holds the converted content is reused as is,
-// so a re-run with unchanged sources writes nothing.
+// so a re-run with unchanged sources writes nothing. In a namespace that
+// requires nonces (§C.7) every write adds a fresh $nonce, which the predicted
+// ids include; a head's $nonce is no part of its content.
 package schemaimport
 
 import (
@@ -42,6 +44,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Options configure an import.
@@ -169,6 +172,7 @@ type planner struct {
 	warnings  map[string]*warning
 	warnOrder []string
 	notes     []string // conversion lines that aren't per-location warnings
+	nonce     bool     // the namespace requires nonces (§C.7)
 }
 
 type warning struct {
@@ -214,6 +218,11 @@ func Plan(ctx context.Context, c *client.Client, sources []string, opt Options) 
 	}
 	bundles := p.bundles()
 	res := &Result{NS: opt.NS}
+	if c != nil {
+		// A namespace document the caller can't read leaves it to each
+		// resource's head (plan).
+		p.nonce, _ = c.NonceRequired(ctx, opt.NS)
+	}
 	if err := p.build(ctx, c, bundles, res); err != nil {
 		return nil, err
 	}
@@ -656,7 +665,7 @@ func (p *planner) build(ctx context.Context, c *client.Client, bundles []*bundle
 		applyDeclaration(content, patch[b.res.Name])
 		r := b.res
 		r.Content = content
-		if err := plan(ctx, c, res.NS, r); err != nil {
+		if err := plan(ctx, c, res.NS, r, p.nonce); err != nil {
 			return err
 		}
 		res.Resources = append(res.Resources, r)
@@ -792,8 +801,12 @@ func (p *planner) rewriterFor(d *doc, ns string, stub bool) refRewriter {
 	}
 }
 
-// plan decides a resource's action from its head and predicts its id.
-func plan(ctx context.Context, c *client.Client, ns string, r *Resource) error {
+// plan decides a resource's action from its head and predicts its id. The
+// patch set adds a fresh $nonce where the namespace requires nonces (nonce,
+// §C.7) or the live head has one, which is all a caller that can't read the
+// namespace document has to go by; the head's $nonce is left out when
+// comparing it with the content.
+func plan(ctx context.Context, c *client.Client, ns string, r *Resource, nonce bool) error {
 	r.Action = Create
 	if c != nil {
 		h, err := c.Head(ctx, ns, r.Name)
@@ -806,11 +819,13 @@ func plan(ctx context.Context, c *client.Client, ns string, r *Resource) error {
 			if err != nil {
 				return fmt.Errorf("reading %s/%s: %w", ns, r.Name, err)
 			}
-			if jsonv.Equal(d.Value, r.Content) {
+			if jsonv.Equal(withoutNonce(d.Value), withoutNonce(r.Content)) {
 				r.Action, r.ID = Unchanged, h.ID
 				return nil
 			}
-			r.Action, r.Parent = Append, h.ID
+			m, _ := d.Value.(map[string]any)
+			_, had := m["$nonce"]
+			r.Action, r.Parent, nonce = Append, h.ID, nonce || had
 		case client.Tombstoned:
 			r.Action, r.Parent = Restore, h.ID
 		case client.Purged:
@@ -822,12 +837,30 @@ func plan(ctx context.Context, c *client.Client, ns string, r *Resource) error {
 	} else {
 		r.Patches = []any{map[string]any{"op": "replace", "path": "", "value": r.Content}}
 	}
+	if nonce {
+		r.Patches = append(r.Patches, map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()})
+	}
 	id, err := client.ExpectedRevision(r.Parent, r.Patches)
 	if err != nil {
 		return err
 	}
 	r.ID = id
 	return nil
+}
+
+// withoutNonce returns doc without its top-level $nonce, if it has one.
+func withoutNonce(doc any) any {
+	m, ok := doc.(map[string]any)
+	if _, has := m["$nonce"]; !ok || !has {
+		return doc
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if k != "$nonce" {
+			out[k] = v
+		}
+	}
+	return out
 }
 
 // compile checks every converted schema as the server will on write

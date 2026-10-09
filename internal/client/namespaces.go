@@ -70,6 +70,22 @@ func (c *Client) NSDoc(ctx context.Context, ns, nsID string) (*NSDoc, error) {
 	return &NSDoc{ID: nsID, Config: r.header.Get("X-Config-Revision"), Raw: body, Value: m}, nil
 }
 
+// NonceRequired reports whether namespace ns requires nonces (§C.7): its
+// document in force says "nonce": "required", and every resource create,
+// append or restore must then add a fresh $nonce. An error means the
+// document couldn't be read, as for a reader whose grant is restricted.
+func (c *Client) NonceRequired(ctx context.Context, ns string) (bool, error) {
+	h, err := c.NSHead(ctx, ns)
+	if err != nil {
+		return false, err
+	}
+	d, err := c.NSDoc(ctx, ns, h.ID)
+	if err != nil {
+		return false, err
+	}
+	return d.Value["nonce"] == "required", nil
+}
+
 // NSEntry is one entry of a namespace log (§7.4), with the fields of §3.5.
 // Sub-entries of a batch are NSEntry values with only Resource/Kind/Target
 // set (and Raw).
