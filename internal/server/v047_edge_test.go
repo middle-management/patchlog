@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/edge"
 )
@@ -154,6 +155,43 @@ func TestV047EdgeGrantCookies(t *testing.T) {
 	// Path matching is by segment: not another namespace sharing the prefix.
 	expect(t, e.do(req{method: "GET", path: "/ns/sec-x", hdr: cookieHdr(nc)}), 401)
 	expect(t, e.do(req{method: "GET", path: "/r/sec-x/a", hdr: cookieHdr(rc)}), 401)
+}
+
+// v0.47 §C.5: no edge grant outlives its exp. A cookie is verified when
+// a request starts, so an event stream opened under one checks its exp at
+// each fetch, and ends there as one under the grant in Authorization does.
+func TestV047EdgeCookieStreamEndsAtExp(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	a := e.create("sec", "a", map[string]any{"v": 1.0}, f.adminG)
+	short := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"}, map[string]any{"exp": t0.Add(5 * time.Minute).Format(time.RFC3339)})
+	r := e.do(req{method: "POST", path: "/edge-grants", bearer: short})
+	expect(t, r, 200)
+	cs := edgeCookies(t, r)
+	nsEvents, resp, _ := e.openSSE("/ns/sec/events", cookieHdr(cs["/ns/sec"]))
+	if resp.StatusCode != 200 {
+		t.Fatalf("namespace stream: %d", resp.StatusCode)
+	}
+	next(t, nsEvents) // the genesis entry
+	next(t, nsEvents) // a's create
+	resEvents, resp, _ := e.openSSE("/r/sec/a/events?since="+a, cookieHdr(cs["/r/sec"]))
+	if resp.StatusCode != 200 {
+		t.Fatalf("resource stream: %d", resp.StatusCode)
+	}
+
+	e.clock.Advance(5 * time.Minute)
+	e.appendRev("sec", "a", a, ops(op("replace", "/v", 2.0)), f.adminG)
+	for name, ch := range map[string]<-chan sseEvent{"namespace": nsEvents, "resource": resEvents} {
+		select {
+		case ev, ok := <-ch:
+			if ok {
+				t.Errorf("%s stream delivered %s %s past the edge grant's exp", name, ev.event, ev.data)
+			}
+		case <-time.After(5 * time.Second):
+			t.Errorf("%s stream still open past the edge grant's exp", name)
+		}
+	}
 }
 
 // v0.47 §6.1: a schemaReads read is made with the grant in Authorization,

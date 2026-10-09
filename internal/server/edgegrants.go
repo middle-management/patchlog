@@ -28,7 +28,7 @@ func (s *Server) edgeCred(r *http.Request) *http.Request {
 	if cl == nil {
 		return r
 	}
-	eg := &core.EdgeGrant{NS: cl.NS, Resource: cl.Resource, Sub: cl.Sub}
+	eg := &core.EdgeGrant{NS: cl.NS, Resource: cl.Resource, Sub: cl.Sub, Exp: time.Unix(cl.Exp, 0)}
 	return r.WithContext(context.WithValue(r.Context(), edgeGrantKey{}, eg))
 }
 

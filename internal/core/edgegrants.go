@@ -35,6 +35,8 @@ type EdgeGrant struct {
 	NS       string
 	Resource string
 	Sub      string
+	// Exp is when a verified edge grant expires (zero when issuing).
+	Exp time.Time
 }
 
 // Prefixes are the URL prefixes the edge grant covers (§C.5).
@@ -227,8 +229,12 @@ func fixesResource(rv any) (string, bool) {
 // edgeReader decides a read under an edge grant (§C.5): of its namespace,
 // and if fixed of its resource only. The edge grant was issued for a grant
 // with unrestricted read there, or read of that resource, so the actor
-// stands for it without rules.
+// stands for it without rules. Each read checks its exp, so an event
+// stream opened under it ends there, as under the grant.
 func (t *tx) edgeReader(n *nsRow, eg *EdgeGrant, resource string) (*actor, *Error) {
+	if !eg.Exp.IsZero() && !t.now.Before(eg.Exp) {
+		return nil, apiErr(401, "unauthenticated", "message", "the edge grant has expired")
+	}
 	if eg.NS != n.name {
 		return nil, nsNotNamed(n.name)
 	}
