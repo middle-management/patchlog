@@ -62,11 +62,10 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 		if err != nil {
 			return err
 		}
-		// A reader limited to some resources gets only theirs (§7.4). An
-		// anonymous reader of a public namespace reads all of it.
+		// A reader limited to some resources gets only theirs (§7.4).
 		cfg := t.config(n.configSeq)
 		var visible func(name string) bool
-		if a != nil && !a.unrestrictedRead() && cfg.Read != "public" {
+		if !t.readsNS(n, cfg, a, false) {
 			seen := map[string]bool{}
 			visible = func(name string) bool {
 				v, ok := seen[name]
@@ -81,7 +80,7 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
 		}
 		if n.purged {
-			return gone()
+			return purgedNS()
 		}
 		var after int64
 		if since != "" {

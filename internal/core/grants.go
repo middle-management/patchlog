@@ -25,11 +25,12 @@ import (
 // entry. A remote branch's base is followed no further than the branch
 // itself: what it reads through is verified at its base (§G.3).
 //
-// It needs unrestricted read on the namespace, as gestures do. A purged
-// namespace answers 410 after the read check, since the content the
-// grant's signatures cover is gone (§8.5). A grant id names its root
-// block, and the stored form doesn't change once recorded, so the answer
-// is immutable. Sealed namespaces seal it like a log entry, under the
+// It needs unrestricted read on the namespace, as every /ns/{ns} URL but
+// the gestures listing does (§C.5). A purged namespace answers 410
+// "purged" after the read check, since the content the grant's signatures
+// cover is gone (§8.5). A grant id names its root block, and the stored
+// form doesn't change once recorded, so the answer is immutable. Sealed
+// namespaces seal it like a log entry, under the
 // epoch key, with pl { ns, grant: gid } (§E.2.2): sealed once, stored in
 // the sealed table and served identically forever. The epoch is the one
 // sealing the namespace's first entry recording it, or the current one for
@@ -63,18 +64,13 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		a, err := t.reader(n, cred, "")
-		if err != nil {
+		if _, err := t.nsReader(n, cred); err != nil {
 			return err
 		}
-		// An anonymous reader of a public namespace reads all of it.
-		if a != nil && !a.unrestrictedRead() {
-			return forbidden("reading a grant needs unrestricted read on the namespace")
-		}
-		if n.purged {
-			return gone()
-		}
 		public := t.cachePublic(n)
+		if n.purged {
+			return purgedRead(public)
+		}
 		id, perr := ids.Parse(gid)
 		if perr != nil || !t.recordsGrant(n, id) {
 			return nfNS(public)

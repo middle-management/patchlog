@@ -218,7 +218,7 @@ func TestV042Grants(t *testing.T) {
 	expect(t, ag.get("/ns/sec/grants/"+igid, a.adminG), 200)
 	expect(t, ag.patchNS("sec", ops(op("add", "/frozen", true)), a.adminG), 201)
 	expect(t, ag.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: ag.nsHead("sec", a.adminG), bearer: a.adminG}), 204)
-	expectCode(t, ag.get("/ns/sec/grants/"+igid, a.adminG), 410, "gone")
+	expectCode(t, ag.get("/ns/sec/grants/"+igid, a.adminG), 410, "purged")
 	expect(t, ag.get("/ns/sec/grants/"+igid), 401)
 }
 

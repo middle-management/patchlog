@@ -321,16 +321,20 @@ func writeErr(w http.ResponseWriter, err error) {
 	writeJSON(w, 500, map[string]any{"code": "internal", "message": "internal error"})
 }
 
-// writeErrShort answers an error that carries its own short class (§9):
-// an unknown id of a known namespace, cacheable for five seconds, whose
-// visibility the core attached. It returns false if the error has none,
-// leaving writeErr to answer it.
+// writeErrShort answers an error that carries its own cache class (§9),
+// whose visibility the core attached: an unknown id of a known namespace,
+// short, or the 410 of a purged namespace's URL, long (§8.5). It returns
+// false if the error has none, leaving writeErr to answer it.
 func (s *Server) writeErrShort(w http.ResponseWriter, r *http.Request, err error) bool {
 	var ae *core.Error
 	if !errors.As(err, &ae) || ae.Public == nil {
 		return false
 	}
-	if !s.cache(w, r, ccShort, *ae.Public) {
+	class := ccShort
+	if ae.Status == 410 {
+		class = ccLong
+	}
+	if !s.cache(w, r, class, *ae.Public) {
 		return true
 	}
 	writeJSON(w, ae.Status, ae.Body)
@@ -513,6 +517,9 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 	}
 	h, err := s.e.ResourceHead(r.Context(), ns, name, creds(r))
 	if err != nil {
+		if s.writeErrShort(w, r, err) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -551,6 +558,9 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 	}
 	rev, err := s.e.ResourceRev(r.Context(), ns, name, id, creds(r))
 	if err != nil {
+		if s.writeErrShort(w, r, err) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -651,6 +661,9 @@ func (s *Server) resourceRevLog(w http.ResponseWriter, r *http.Request) {
 	}
 	lg, err := s.e.ResourceLog(r.Context(), ns, name, id, r.URL.Query().Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
+		if s.writeErrShort(w, r, err) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -917,6 +930,9 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.e.OpenBlob(r.Context(), ns, name, bid, creds(r))
 	if err != nil {
+		if s.writeErrShort(w, r, err) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -944,6 +960,9 @@ func (s *Server) blobEpochGet(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.e.OpenSealedBlob(r.Context(), ns, name, bid, ep, creds(r))
 	if err != nil {
+		if s.writeErrShort(w, r, err) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}
@@ -1522,6 +1541,9 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		wait := s.e.Wait(ns)
 		lg, err := fetch(r.Context(), since)
 		if err != nil {
+			if s.writeErrShort(w, r, err) {
+				return
+			}
 			writeErr(w, err)
 			return
 		}
@@ -1598,6 +1620,9 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("live") == "" {
 		h, err := s.e.ResourceHead(r.Context(), ns, name, creds(r))
 		if err != nil {
+			if s.writeErrShort(w, r, err) {
+				return
+			}
 			writeErr(w, err)
 			return
 		}
@@ -1791,14 +1816,16 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	since := sinceParam(r)
 	// Wait before every fetch, so no entry committed in between is missed.
 	wait := s.e.Wait(ns)
-	info, err := s.e.NamespaceHead(r.Context(), ns, cred)
+	// Catching up reads a log page at a time (§7.1 Paging), as nsEvents.
+	page := s.e.Limits().LogPageSize
+	// The namespace log is followed for this resource's purges and prunes
+	// from its current head, with read on the resource alone (§C.5).
+	head, err := s.e.ResourceEvents(r.Context(), ns, name, "", page, cred)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	nsSince := info.Head
-	// Catching up reads a log page at a time (§7.1 Paging), as nsEvents.
-	page := s.e.Limits().LogPageSize
+	nsSince := head.Last
 	lg, err := s.e.ResourceLog(r.Context(), ns, name, "", since, page, cred)
 	if err != nil {
 		writeErr(w, err)
@@ -1824,15 +1851,12 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 	// is true after a purge, which ends the stream.
 	nsEntries := func() (ok, done bool) {
 		for {
-			nl, err := s.e.NamespaceEvents(r.Context(), ns, nsSince, page, cred)
+			nl, err := s.e.ResourceEvents(r.Context(), ns, name, nsSince, page, cred)
 			if err != nil || nl.Status != 200 {
 				return false, false
 			}
 			nsSince = nl.Last
 			for i, e := range nl.Entries {
-				if e["resource"] != name {
-					continue
-				}
 				switch e["kind"] {
 				case "purge":
 					sseEntry(w, "purge", nl, i)

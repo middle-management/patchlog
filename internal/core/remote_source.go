@@ -64,8 +64,9 @@ func (t *tx) registration(ns int64, origin, name string) *regRow {
 }
 
 // RegisterRemoteBranch registers or renews a remote branch of a namespace
-// (§G.3). It needs read and export, is evaluated as an export envelope whose
-// doc is { remote, at }, and appends a remote branch entry (§3.5).
+// (§G.3). It needs unrestricted read and export, is evaluated as an export
+// envelope whose doc is { remote, at }, and appends a remote branch entry
+// (§3.5).
 func (e *Engine) RegisterRemoteBranch(ctx context.Context, req Request, rr RemoteRegistration) (*RegistrationResult, error) {
 	var out *RegistrationResult
 	err := e.update(ctx, func(t *tx) error {
@@ -86,12 +87,11 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	if aerr != nil {
 		return nil, aerr
 	}
-	// Step 1: read and export, then the rate limit. Remote entries don't
-	// count toward the live-branches limit, but are rate-limited.
-	if cfg.Read != "public" {
-		if err := t.authorize(a, "read", ""); err != nil {
-			return nil, forbidden("registering a remote branch needs read")
-		}
+	// Step 1: unrestricted read (§C.5) and export, then the rate limit.
+	// Remote entries don't count toward the live-branches limit, but are
+	// rate-limited.
+	if !t.readsNS(n, cfg, a, true) {
+		return nil, forbidden("registering a remote branch needs unrestricted read (§C.5)")
 	}
 	if err := t.authorize(a, "export", ""); err != nil {
 		return nil, err

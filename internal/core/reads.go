@@ -27,6 +27,19 @@ func nfNS(public bool) *Error {
 	return e
 }
 
+// purgedNS is the 410 of a URL that a namespace purge removed (§8.5): every
+// /r/{ns}/… URL, /ns/{ns}/grants/…, /ns/{ns}/gestures/… and /heads at any
+// revision, code "purged". /ns/{ns} and its log stay readable.
+func purgedNS() *Error { return apiErr(410, "purged") }
+
+// purgedRead is purgedNS for a cacheable read, which §9 answers with the
+// long class, as any purge; public is as for nfNS.
+func purgedRead(public bool) *Error {
+	e := purgedNS()
+	e.Public = &public
+	return e
+}
+
 // listHeads lists every resource of n as of asOf (nil = now), including
 // read-through ones, sorted by name in ascending byte order (§7.4), by Go's
 // string order and never by the database's collation, which on Postgres may
@@ -132,12 +145,11 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 			h, cached = &c, true
 			return nil
 		}
+		if n.purged {
+			return purgedRead(t.cachePublic(n))
+		}
 		h = &Head{Public: t.cachePublic(n)}
 		public = t.config(n.configSeq).Read == "public"
-		if n.purged {
-			h.State = Purged
-			return nil
-		}
 		v := t.resolve(n, name, nil)
 		h.State = v.state
 		if v.head != nil && v.state != Purged {
@@ -203,6 +215,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 				return err
 			}
 		}
+		if n.purged {
+			return purgedRead(t.cachePublic(n))
+		}
 		out = &Rev{Public: t.cachePublic(n)}
 		public = t.config(n.configSeq).Read == "public"
 		if perr != nil {
@@ -218,7 +233,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			}
 		}
 		v := t.resolve(n, name, nil)
-		if n.purged || v.state == Purged {
+		if v.state == Purged {
 			out.Status = 410
 			return nil
 		}
@@ -332,9 +347,12 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
 		}
+		if n.purged {
+			return purgedRead(t.cachePublic(n))
+		}
 		out = &Log{Public: t.cachePublic(n)}
 		v := t.resolve(n, name, nil)
-		if n.purged || v.state == Purged {
+		if v.state == Purged {
 			out.Status = 410
 			return nil
 		}
@@ -426,7 +444,7 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, ""); err != nil {
+		if _, err := t.nsReader(n, cred); err != nil {
 			return err
 		}
 		out = &NSInfo{
@@ -450,7 +468,7 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, ""); err != nil {
+		if _, err := t.nsReader(n, cred); err != nil {
 			return err
 		}
 		id, perr := ids.Parse(nsID)
@@ -487,7 +505,7 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 // namespace the answer is one JWE for the page actually served, pl.range
 // [since, Last] (§E.2.2).
 func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials) (*Log, error) {
-	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false)
+	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false, "")
 }
 
 // NamespaceEvents is NamespaceLog from the current head for event streams,
@@ -495,10 +513,20 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 // sealed namespace each entry is sealed on its own, as the range (prev, id]
 // (EntryJWEs).
 func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit int, cred Credentials) (*Log, error) {
-	return e.namespaceLog(ctx, ns, "", since, limit, cred, true)
+	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, "")
 }
 
-func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool) (*Log, error) {
+// ResourceEvents is NamespaceEvents for the event stream of resource name
+// (§7.3), which follows the namespace log for the resource's purges and
+// prunes: only entries naming it are answered, and they need read on it
+// alone, as the resource's own URLs do (§C.5). Last and More still cover
+// the whole page. With since "" it answers no entries and Last the
+// namespace head, where the stream starts following.
+func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
+	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name)
+}
+
+func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool, resource string) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
@@ -507,11 +535,19 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, ""); err != nil {
+		if resource != "" {
+			if _, err := t.reader(n, cred, resource); err != nil {
+				return err
+			}
+		} else if _, err := t.nsReader(n, cred); err != nil {
 			return err
 		}
 		out = &Log{Public: t.cachePublic(n)}
 		toSeq := n.headSeq.Int64
+		if resource != "" && since == "" {
+			out.Status, out.Last = 200, t.nsLogID(toSeq).String()
+			return nil
+		}
 		if nsID != "" {
 			id, err := ids.Parse(nsID)
 			s, ok := t.nsLogSeq(n.id, id)
@@ -601,6 +637,16 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// A namespace's chain runs in seq order, so a page that stops
 		// short of toSeq is a prefix of the range.
 		out.More = len(rs) > 0 && rs[len(rs)-1].seq < toSeq
+		if resource != "" {
+			var keep []raw
+			var entries []map[string]any
+			for i, m := range out.Entries {
+				if m["resource"] == resource {
+					keep, entries = append(keep, rs[i]), append(entries, m)
+				}
+			}
+			rs, out.Entries = keep, entries
+		}
 		if t.isSealedNS(n) {
 			out.Sealed, nsRowID = true, n.id
 			if perEntry {
@@ -661,8 +707,12 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, ""); err != nil {
+		if _, err := t.nsReader(n, cred); err != nil {
 			return err
+		}
+		// At any revision, once its resources are gone (§8.5).
+		if n.purged {
+			return purgedRead(t.cachePublic(n))
 		}
 		id, perr := ids.Parse(nsID)
 		seq, ok := t.nsLogSeq(n.id, id)
@@ -700,7 +750,7 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if _, err := t.reader(n, cred, ""); err != nil {
+		if _, err := t.nsReader(n, cred); err != nil {
 			return err
 		}
 		public = t.cachePublic(n)
