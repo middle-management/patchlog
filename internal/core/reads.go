@@ -217,7 +217,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if _, err := t.reader(n, cred, name); err != nil {
 			// A schema revision n opens with schemaReads, to a reader of
 			// a document that pins it (§6.1, §7); nothing else of n.
-			if perr != nil || !t.schemaReadsRev(n, name, rid, cred) {
+			if perr != nil || !t.schemaReadsRev(n, name, rid, cred, g) {
 				return err
 			}
 			referrer = true

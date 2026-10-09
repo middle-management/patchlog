@@ -32,13 +32,15 @@ import (
 // closure of that schema, resolved structurally as schemaUses does. Only
 // the listed namespace's own resources count: what a branch reads through
 // from its base is the base's to open. The namespaces considered are the
-// open ones schemaReads lists, and those the grant names, where it must
-// verify as a read of the referrer would (§C.2); a "*" grant names every
+// open ones schemaReads lists, whose answer is the same for every request
+// and kept (openrefs.go), and those the grant names, where it must verify
+// as a read of the referrer would (§C.2); a "*" grant names every
 // namespace schemaReads lists.
 
 // schemaReadsRev reports whether cred may read revision rid of resource
-// name in n by path under n's schemaReads (§6.1).
-func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials) bool {
+// name in n by path under n's schemaReads (§6.1). g holds the read cache's
+// counters, loaded before the transaction began.
+func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials, g gens) bool {
 	if n.purged || n.isBranch() || n.isShadow() {
 		return false
 	}
@@ -59,31 +61,33 @@ func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials)
 	if err != nil || !schema.IsSchemaDoc(d) {
 		return false
 	}
-	// A grant that can't be used is ignored, as for public reads (§7):
-	// open referrers still count.
-	var g *grant.Grant
-	if cred.Bearer != "" {
-		if x, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize); err == nil {
-			g = x
-		}
-	}
 	path := "/r/" + n.name + "/" + name + "/rev/" + rid.String()
 	t.noLock++
 	defer func() { t.noLock-- }()
 	closures := map[string]bool{}
-	for _, l := range t.schemaReadsCandidates(n, cfg, g) {
-		if t.refersIn(l, g, path, closures) {
+	if t.openRefers(n, cfg, path, g, closures) {
+		return true
+	}
+	// Elsewhere it takes a grant that names the referrer's namespace and
+	// verifies there (refersIn).
+	if cred.Bearer == "" {
+		return false
+	}
+	gr, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
+	if err != nil {
+		return false
+	}
+	for _, l := range t.schemaReadsListed(n, cfg) {
+		if !openToAll(t.config(l.configSeq)) && t.refersIn(l, gr, path, closures) {
 			return true
 		}
 	}
 	return false
 }
 
-// schemaReadsCandidates lists the namespaces whose referrers may open n's
-// schemas under schemaReads to a request with grant g, nil without a
-// usable one: of n and those matching schemaReads.for, the ones g names
-// and the ones open to everyone.
-func (t *tx) schemaReadsCandidates(n *nsRow, cfg *Config, g *grant.Grant) []*nsRow {
+// schemaReadsListed lists the namespaces whose referrers may open n's
+// schemas under schemaReads: n, and those matching schemaReads.for.
+func (t *tx) schemaReadsListed(n *nsRow, cfg *Config) []*nsRow {
 	names := map[string]bool{n.name: true}
 	scan := false
 	for _, p := range cfg.SchemaReadsFor {
@@ -108,11 +112,7 @@ func (t *tx) schemaReadsCandidates(n *nsRow, cfg *Config, g *grant.Grant) []*nsR
 	}
 	var out []*nsRow
 	for _, s := range sortedKeys(names) {
-		l := t.nsByName(s)
-		if l == nil || l.purged || l.isShadow() {
-			continue
-		}
-		if g != nil && g.NamesNS(s) || openToAll(t.config(l.configSeq)) {
+		if l := t.nsByName(s); l != nil && !l.purged && !l.isShadow() {
 			out = append(out, l)
 		}
 	}
