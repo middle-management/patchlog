@@ -69,7 +69,7 @@ func (e *Engine) Grant(ctx context.Context, ns, gid string, cred Credentials) (*
 		}
 		public := t.cachePublic(n)
 		if n.purged {
-			return purgedRead(public)
+			return t.purgedRead(n)
 		}
 		id, perr := ids.Parse(gid)
 		if perr != nil || !t.recordsGrant(n, id) {

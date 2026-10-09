@@ -99,9 +99,10 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	if err := t.rateLimit(n, cfg, a, nil, 1); err != nil {
 		return nil, err
 	}
-	// 410 after authorisation, like every write (§6.2).
+	// 410 after authorisation and the rate limit, like every write to a
+	// purged namespace (§6.2, §8.5).
 	if n.purged {
-		return nil, gone()
+		return nil, t.purgedNS(n)
 	}
 	// A remote branch of a private, sealed or e2e namespace must itself be
 	// private or sealed (§G.5). This side can't enforce it: it is part of

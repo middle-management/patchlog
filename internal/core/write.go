@@ -573,10 +573,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 	}
-	// A purged namespace is 410 after authorisation (§6.2 step 2, §7.8's
-	// order), before step 2.
+	// A purged namespace is 410 after authorisation and the rate limits,
+	// a config change's included (§6.2 step 2, §8.5), before step 2.
 	if n.purged {
-		return nil, nil, purgedNS()
+		return nil, nil, t.purgedNS(n)
 	}
 
 	// Step 2: precondition — idempotent retry, settling the verb, frozen,

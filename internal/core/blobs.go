@@ -807,7 +807,7 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	// 2. A purged namespace or resource, after authorisation and the rate
 	// limits (§7.8).
 	if n.purged {
-		return nil, purgedNS()
+		return nil, t.purgedNS(n)
 	}
 	if t.resolve(n, name, nil).state == Purged {
 		return nil, gone()
@@ -1166,7 +1166,7 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 			return err
 		}
 		if n.purged {
-			return purgedRead(t.cachePublic(n))
+			return t.purgedRead(n)
 		}
 		out = &Blob{Public: t.cachePublic(n)}
 		bid, perr := ids.Parse(bidText)

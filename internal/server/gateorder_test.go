@@ -71,17 +71,13 @@ func TestReviewGateOrderNS(t *testing.T) {
 			t.Fatalf("%s %s: %s", q.method, q.path, r.Body)
 		}
 	}
-	// An authorising grant reaches the 410: "purged" for writes of
-	// resources, whose URLs the namespace purge removed (§8.5).
+	// An authorising grant reaches the 410 "purged" of every write to a
+	// purged namespace (§8.5).
 	for _, q := range purged {
 		if strings.HasSuffix(q.path, "/branches") {
 			q.body = map[string]any{"name": "r", "patches": []any{}} // no If-None-Match
 		}
 		q.bearer = f.adminG
-		code := "purged"
-		if q.path == "/ns/sec" || strings.HasSuffix(q.path, "/branches") {
-			code = "gone"
-		}
-		expectCode(t, e.do(q), 410, code)
+		expectCode(t, e.do(q), 410, "purged")
 	}
 }

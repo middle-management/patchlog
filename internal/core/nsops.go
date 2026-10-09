@@ -58,10 +58,16 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 			return nil, err
 		}
 	}
-	// A purged namespace is 410 after authorisation (§6.2 step 2, §7.8's
-	// order), before the retry lookup and the precondition.
+	// A purged namespace is 410 after authorisation and the rate limits
+	// (§6.2 step 2, §8.5), before the retry lookup and the precondition. A
+	// batch answers it itself, once its items are authorised too
+	// (checkItems), so its plan keeps the configuration in force.
 	if n.purged {
-		return nil, gone()
+		if inBatch {
+			p.cfg = cur
+			return p, nil
+		}
+		return nil, t.purgedNS(n)
 	}
 	// Step 2: idempotent retry, then the precondition. Config writes are
 	// allowed in frozen namespaces.
@@ -570,9 +576,10 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
 		return nil, err
 	}
-	// 410 after authorisation, like every write (§6.2).
+	// 410 after authorisation and the rate limits, like every write to a
+	// purged namespace (§6.2, §8.5).
 	if base.purged {
-		return nil, gone()
+		return nil, t.purgedNS(base)
 	}
 	// Step 2: the precondition. A branch requires If-None-Match: * (§7.6);
 	// 428 comes after authorisation (§6.2).
@@ -615,11 +622,12 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	gcanon := jsonv.Canonical(genesis)
 	cfgID := ids.Revision(nil, gcanon)
 	if ex := t.nsByName(br.Name); ex != nil {
-		// Idempotent retry: same principal, same at and patches.
+		// Idempotent retry: same principal, same at and patches. A purged
+		// branch's name stays reserved, for its creator too (§8.5).
 		var author, gseq int64
 		var gid []byte
 		qerr := t.QueryRow(`SELECT seq, author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&gseq, &author, &gid)
-		if qerr == nil && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
+		if qerr == nil && !ex.purged && ex.base.Valid && ex.base.Int64 == base.id && ex.baseAt.Int64 == atSeq &&
 			author == t.actorID(a) && ids.FromBytes(gid) == cfgID {
 			var seq int64
 			// The base's branch entry targets the branch's config genesis.
@@ -729,7 +737,7 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		}
 		// 410 after authorisation, like every write (§6.2).
 		if n.purged {
-			return purgedNS()
+			return t.purgedNS(n)
 		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
@@ -914,7 +922,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		}
 		// 410 after authorisation, like every write (§6.2).
 		if n.purged {
-			return gone()
+			return t.purgedNS(n)
 		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
@@ -1031,7 +1039,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		}
 		// 410 after authorisation, like every write (§6.2).
 		if n.purged {
-			return purgedNS()
+			return t.purgedNS(n)
 		}
 		if n.isBranch() {
 			return invalid("branches don't prune (§8.6)")

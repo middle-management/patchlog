@@ -288,7 +288,7 @@ func TestV047OperatorGrantOrder(t *testing.T) {
 	expect(t, e.patchNS("sec", ops(op("add", "/frozen", true)), f.adminG), 201)
 	expect(t, e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: f.adminG}), 204)
 	expectCode(t, forced("/r/sec/a/purge", a, opG("sec")), 410, "purged")
-	expectCode(t, forced("/ns/sec/purge", e.nsHead("sec", f.adminG), opG("sec")), 410, "gone")
+	expectCode(t, forced("/ns/sec/purge", e.nsHead("sec", f.adminG), opG("sec")), 410, "purged")
 	expectCode(t, forced("/r/sec/a/purge", a, opG("other")), 403, "forbidden")
 	expectCode(t, e.purge("sec", "a", a, opG("sec")), 401, "unauthenticated")
 	expectCode(t, e.get("/ns/sec", opG("sec")), 401, "unauthenticated")

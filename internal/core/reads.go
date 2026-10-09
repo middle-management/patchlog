@@ -27,15 +27,20 @@ func nfNS(public bool) *Error {
 	return e
 }
 
-// purgedNS is the 410 of a URL that a namespace purge removed (§8.5): every
-// /r/{ns}/… URL, /ns/{ns}/grants/…, /ns/{ns}/gestures/… and /heads at any
-// revision, code "purged". /ns/{ns} and its log stay readable.
-func purgedNS() *Error { return apiErr(410, "purged") }
+// purgedNS is the 410 of a purged namespace n (§8.5): of every /r/{ns}/…
+// URL, /ns/{ns}/grants/…, /ns/{ns}/gestures/…, /ns/{ns}/keys and /heads at
+// any revision, and of every write to it, code "purged", with head, the
+// ns_id of its purge-ns entry, the log's last. /ns/{ns} and its log stay
+// readable.
+func (t *tx) purgedNS(n *nsRow) *Error {
+	return apiErr(410, "purged", "head", t.nsLogID(n.headSeq.Int64).String())
+}
 
 // purgedRead is purgedNS for a cacheable read, which §9 answers with the
-// long class, as any purge; public is as for nfNS.
-func purgedRead(public bool) *Error {
-	e := purgedNS()
+// long class, as any purge; Public is as for nfNS.
+func (t *tx) purgedRead(n *nsRow) *Error {
+	e := t.purgedNS(n)
+	public := t.cachePublic(n)
 	e.Public = &public
 	return e
 }
@@ -146,7 +151,7 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 			return nil
 		}
 		if n.purged {
-			return purgedRead(t.cachePublic(n))
+			return t.purgedRead(n)
 		}
 		h = &Head{Public: t.cachePublic(n)}
 		public = t.config(n.configSeq).Read == "public"
@@ -223,7 +228,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			referrer = true
 		}
 		if n.purged {
-			return purgedRead(t.cachePublic(n))
+			return t.purgedRead(n)
 		}
 		out = &Rev{Public: t.cachePublic(n), Referrer: referrer}
 		public = t.config(n.configSeq).Read == "public"
@@ -355,7 +360,7 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			return err
 		}
 		if n.purged {
-			return purgedRead(t.cachePublic(n))
+			return t.purgedRead(n)
 		}
 		out = &Log{Public: t.cachePublic(n)}
 		v := t.resolve(n, name, nil)
@@ -719,7 +724,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		}
 		// At any revision, once its resources are gone (§8.5).
 		if n.purged {
-			return purgedRead(t.cachePublic(n))
+			return t.purgedRead(n)
 		}
 		id, perr := ids.Parse(nsID)
 		seq, ok := t.nsLogSeq(n.id, id)

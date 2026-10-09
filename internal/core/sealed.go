@@ -452,9 +452,6 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		if n == nil {
 			return t.absentNS(ns, cred)
 		}
-		if n.purged {
-			return notFound()
-		}
 		cfg := t.config(n.configSeq)
 		var a *actor
 		if t.e.opt.AuthDisabled {
@@ -474,6 +471,11 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			if !a.verified.Can["read"] {
 				return notFound()
 			}
+		}
+		// 410 after the read check, as every URL of a purged namespace
+		// (§8.5).
+		if n.purged {
+			return t.purgedNS(n)
 		}
 		if cfg.level == levelE2E {
 			// The relay is a read of the keyring (§E.3.2); per-resource
@@ -659,7 +661,7 @@ func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error
 			return notFound()
 		}
 		if n.purged {
-			return gone()
+			return t.purgedNS(n)
 		}
 		cur := t.config(n.configSeq)
 		if cur.level != levelSealed {

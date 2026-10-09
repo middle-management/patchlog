@@ -217,7 +217,7 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			return err
 		}
 		if n.purged {
-			return purgedRead(t.cachePublic(n))
+			return t.purgedRead(n)
 		}
 		out = &Blob{Public: t.cachePublic(n)}
 		bid, perr := ids.Parse(bidText)
