@@ -105,25 +105,16 @@ func WithSourceAuthorization(grants ...string) Option {
 // WithAuthor sends X-Author on every request (development mode only, §7.2).
 func WithAuthor(name string) Option { return func(c *Client) { c.author = name } }
 
-// transport is the clients' connection pool, a clone of
-// http.DefaultTransport: whatever closes or reconfigures the default one
-// (httptest.Server.Close closes its idle connections) doesn't break
-// requests in flight here.
-var transport = func() http.RoundTripper {
-	if t, ok := http.DefaultTransport.(*http.Transport); ok {
-		return t.Clone()
-	}
-	return http.DefaultTransport
-}()
-
 // New returns a client for the deployment at baseURL (e.g.
 // "https://cms.example"). The origin (§G.1) is fetched lazily by Origin.
+// Requests go over telemetry's own connection pool, not
+// http.DefaultTransport's, unless WithHTTPClient says otherwise.
 func New(baseURL string, opts ...Option) (*Client, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil, fmt.Errorf("client: invalid base URL %q", baseURL)
 	}
-	c := &Client{base: strings.TrimRight(baseURL, "/"), hc: &http.Client{Transport: telemetry.Transport(transport)}}
+	c := &Client{base: strings.TrimRight(baseURL, "/"), hc: &http.Client{Transport: telemetry.Transport(nil)}}
 	for _, o := range opts {
 		o(c)
 	}

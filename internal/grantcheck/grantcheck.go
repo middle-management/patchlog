@@ -568,7 +568,7 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 // ReadsPerResource reports whether a verified grant's reads may differ
 // between resources of a namespace: its key has a readScope, or a rule of
 // its key scope, its blocks or a role that lists read refers to /resource
-// (or to the whole envelope). A grant whose reads can't reads every
+// (or to the whole envelope). A grant whose reads can't differ reads every
 // resource or none, so one that doesn't read the namespace unrestricted
 // (ReadsUnrestricted) reads none of it.
 func (ch *Checker) ReadsPerResource(v *grant.Verified) bool {

@@ -9,6 +9,11 @@
   without rules on `/resource` is enough, so a grant with a rule-free reader role and a role
   testing `/resource` by pattern shares a plain reader's subject set and unfiltered answers,
   where it was filtered per item. `grantcheck.ReadsAll` is gone.
+- `bundle import` into a namespace it creates splits and paces batches by the `limits` and the
+  importer's `allowances` entry of the document it creates it with, not the §6.6 defaults.
+- Outgoing HTTP without a configured client (remote branches, sealed grant export, release
+  granters, CDN purges, schema fetches, `patchlog health`, `internal/client`) goes over one
+  shared clone of `http.DefaultTransport`, never the default transport itself.
 
 ## v0.16.0
 

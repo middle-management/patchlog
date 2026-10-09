@@ -68,15 +68,19 @@ func (s *slowBatches) RoundTrip(r *http.Request) (*http.Response, error) {
 
 // backfill runs a backfill by who into dst on clk, which moves on by took
 // during every batch request and by every wait the import asks for, and
-// returns its report, the waits and its requests.
-func backfill(t *testing.T, dst *deployment, clk *testClock, who string, b []byte, took time.Duration) (*bundle.Report, []time.Duration, *slowBatches) {
+// returns its report, the waits and its requests. opts set further options.
+func backfill(t *testing.T, dst *deployment, clk *testClock, who string, b []byte, took time.Duration, opts ...func(*bundle.ImportOptions)) (*bundle.Report, []time.Duration, *slowBatches) {
 	t.Helper()
 	rt := &slowBatches{countingTransport: countingTransport{rt: transport}, clock: clk, took: took}
 	c := must(client.New(dst.url, client.WithAuthor(who), client.WithHTTPClient(&http.Client{Transport: rt})))
 	var sleeps []time.Duration
-	rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 0.5,
+	opt := bundle.ImportOptions{Mode: bundle.Backfill, Pace: 0.5,
 		Sleep: func(_ context.Context, d time.Duration) error { sleeps = append(sleeps, d); clk.add(d); return nil },
-		Now:   clk.Now})
+		Now:   clk.Now}
+	for _, o := range opts {
+		o(&opt)
+	}
+	rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), opt)
 	if err != nil {
 		t.Fatalf("import: %v", err)
 	}
@@ -214,6 +218,68 @@ func TestBackfillAllowanceGrant(t *testing.T) {
 	if want := []time.Duration{5 * time.Millisecond, 5 * time.Millisecond, 2 * time.Millisecond}; !slices.Equal(sleeps, want) {
 		t.Fatalf("sleeps %v, want %v", sleeps, want)
 	}
+}
+
+// A namespace the import creates goes by the limits and allowances of the
+// document it is created with, as an existing one by its own (§6.6): the
+// importer it lists an allowance for splits by the allowance and paces at
+// its bucket's rate, any other by the namespace's itemsPerBatch and
+// batchSize and at the lower of its rates. So is the dry run of its first
+// item once it exists (probe).
+func TestBackfillCreatedLimits(t *testing.T) {
+	t.Parallel()
+	b := bulkSource(t)
+	create := func(o *bundle.ImportOptions) {
+		o.CreateNamespaces = true
+		o.NamespaceDoc = func(string, string) any {
+			return map[string]any{
+				"read":   "public",
+				"limits": map[string]any{"itemsPerBatch": 3, "batchSize": 1 << 10, "ratePerNamespace": map[string]any{"rate": 20, "burst": 20}},
+				"allowances": []any{map[string]any{"sub": "svc:importer", "kid": "ops-2026", "bucket": map[string]any{"rate": 1000, "burst": 1000},
+					"itemsPerBatch": 5, "batchSize": 1 << 20}},
+			}
+		}
+	}
+
+	t.Run("allowance", func(t *testing.T) {
+		t.Parallel()
+		dst, clk := clockedTarget(t)
+		rep, sleeps, rt := backfill(t, dst, clk, "svc:importer", b, 0, create)
+		if got := batchSizes(rep); !slices.Equal(got, []int{5, 2}) || rep.Batches[1].Steps != 8 || rt.rejected.Load() != 0 {
+			t.Fatalf("batches %v, %d steps, %d 429s", got, rep.Batches[1].Steps, rt.rejected.Load())
+		}
+		// doc-0 dry-run once bulk exists, then 5 items and 2, at 1000/s.
+		if want := []time.Duration{time.Millisecond, 5 * time.Millisecond, 2 * time.Millisecond}; !slices.Equal(sleeps, want) {
+			t.Fatalf("sleeps %v, want %v", sleeps, want)
+		}
+		for _, br := range rep.Batches {
+			if br.PacedBy != "allowance" || br.Rate != 1000 || br.NSID == "" {
+				t.Fatalf("batch %+v", br)
+			}
+		}
+	})
+
+	t.Run("namespace", func(t *testing.T) {
+		t.Parallel()
+		dst, clk := clockedTarget(t)
+		rep, sleeps, rt := backfill(t, dst, clk, "bob", b, 0, create)
+		// doc-0, then each batch's items, at 0.5 × min(20/s namespace,
+		// 50/s principal), which a chain cut between batches (10/s,
+		// ratePerResource) doesn't slow.
+		want := []time.Duration{100 * time.Millisecond}
+		for _, br := range rep.Batches {
+			if len(br.Resources) > 3 || br.PacedBy != "ratePerNamespace" || br.Rate != 10 || br.NSID == "" {
+				t.Fatalf("batch %+v", br)
+			}
+			want = append(want, time.Duration(len(br.Resources))*100*time.Millisecond)
+		}
+		if len(rep.Batches) < 4 || !slices.Equal(sleeps, want) || rt.rejected.Load() != 0 {
+			t.Fatalf("batches %v slept %v, want %v; %d 429s", batchSizes(rep), sleeps, want, rt.rejected.Load())
+		}
+		if dst.head("bulk", "long").State != client.Live {
+			t.Fatal("not imported")
+		}
+	})
 }
 
 // An allowance's bucket is paced at its full rate, so a backfill counts

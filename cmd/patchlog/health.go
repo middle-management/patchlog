@@ -8,6 +8,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
 // healthCmd checks a health endpoint, for container healthchecks (the image
@@ -26,7 +28,7 @@ func healthCmd(args []string) {
 	if fs.NArg() > 0 {
 		url = healthURL(fs.Arg(0))
 	}
-	c := &http.Client{Timeout: *timeout}
+	c := &http.Client{Timeout: *timeout, Transport: telemetry.Transport(nil)}
 	r, err := c.Get(url)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "health:", err)
