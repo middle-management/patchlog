@@ -49,9 +49,28 @@ var (
 // CheckSchemaDocument validates the constraints of §6.1, §6.5 and §6.6 for a
 // document that is a schema: $id, $ref/$dynamicRef forms, unknown keywords and
 // RE2-compatible regular expressions. selfPath is the revision path the schema
-// is stored at, or "" if not yet known (then $id is forbidden).
+// is stored at, or "" if not yet known (then $id is forbidden). A top-level
+// $nonce of the fresh-nonce form is mechanics, not a keyword, as for
+// validation (Instance), so namespaces that require nonces can hold schemas
+// (§6.2, §C.7).
 func CheckSchemaDocument(doc any, selfPath string) error {
+	if m, ok := doc.(map[string]any); ok {
+		if n, _ := m["$nonce"].(string); freshNonce.MatchString(n) {
+			doc = without(m, "$nonce")
+		}
+	}
 	return checkSchema(doc, pointer.Pointer{}, selfPath)
+}
+
+// without returns a copy of m without key k.
+func without(m map[string]any, k string) map[string]any {
+	out := make(map[string]any, len(m))
+	for x, v := range m {
+		if x != k {
+			out[x] = v
+		}
+	}
+	return out
 }
 
 func checkSchema(s any, at pointer.Pointer, selfPath string) error {

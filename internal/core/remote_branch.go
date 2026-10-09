@@ -412,6 +412,8 @@ type remoteLevel struct {
 	// they began (§E.3.2), for the shadow's keyring relay.
 	enc    map[string]any
 	epochs []epochStart
+	// nonce: the base itself (level 0) requires nonces as of at (§C.7).
+	nonce bool
 }
 
 // remoteMirror is the base as of at, verified.
@@ -421,6 +423,9 @@ type remoteMirror struct {
 	level   int    // the base's encryption level at at (as served)
 	levels  []*remoteLevel
 	schemas []*remoteSchema
+	// schemaNonce: the schemas' source namespaces that require nonces
+	// (§C.7), as far as they can be read.
+	schemaNonce map[string]bool
 }
 
 // fetchLevel fetches and verifies a namespace's log up to at, and its
@@ -620,11 +625,11 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 			if err != nil {
 				return nil, unknownLevel(base, err)
 			}
-			// Only read, encryption and base are read here, and members
-			// this deployment doesn't define are ignored, so a base whose
-			// deployment upgrades first, or holds x- or older members, is
-			// still followed (§7.4, §G.3). The spec version GET /
-			// publishes is never a reason to refuse.
+			// Only read, encryption, nonce and base are read here, and
+			// members this deployment doesn't define are ignored, so a
+			// base whose deployment upgrades first, or holds x- or older
+			// members, is still followed (§7.4, §G.3). The spec version
+			// GET / publishes is never a reason to refuse.
 			if d.Value["read"] == "public" {
 				m.read = "public"
 			}
@@ -634,6 +639,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 					m.level = levelE2E // unknown: the strictest
 				}
 			}
+			lv.nonce = d.Value["nonce"] == "required" && m.level != levelE2E
 		}
 		if next == nil {
 			break
@@ -787,6 +793,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 	for _, k := range sortedKeys(schemas) {
 		m.schemas = append(m.schemas, schemas[k])
 	}
+	m.schemaNonce = fetchSchemaNonces(ctx, c, m.schemas)
 	return m, nil
 }
 
@@ -902,6 +909,9 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	if cfg.level == levelE2E && m.level != levelE2E {
 		return nil, invalid("/encryption: a branch can be e2e only if its base is")
 	}
+	if m.levels[0].nonce && !cfg.NonceRequired {
+		return nil, invalid(`/nonce: the base requires nonces, so a remote branch of it must be created with "nonce": "required" too, or merging it back would fail (§C.7, §G.3)`)
+	}
 	// base.chain records the namespaces followed while verifying (§G.3):
 	// readers of an e2e branch accept read-through ciphertext bound to any
 	// of them. A genesis may give it, and must then give it right;
@@ -987,6 +997,10 @@ func (t *tx) insertShadow(name, read string, lv *remoteLevel, base *nsRow, baseA
 	if lv.enc != nil {
 		// An e2e level: its epochs, for the keyring relay (§E.3.2).
 		cdoc["encryption"] = lv.enc
+	}
+	if lv.nonce {
+		// The branch can't turn it off (checkNonceBase).
+		cdoc["nonce"] = "required"
 	}
 	genesis := []any{map[string]any{"op": "add", "path": "", "value": cdoc}}
 	gcanon := jsonv.Canonical(genesis)
@@ -1214,9 +1228,10 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 // mirrorSchemas mirrors the schema closure into namespaces of this
 // deployment that aren't branches, under the same paths, so $schema
 // resolves here (§G.3). A namespace that doesn't exist is created with the
-// branch's read mode, keys and roles. A path whose chain neither contains
-// the base's nor is a prefix of it is 409 name_conflict. The entries it
-// writes record the creating operator as author and its grant (§7.4).
+// branch's read mode, keys and roles, and its source's nonce setting
+// (§C.7). A path whose chain neither contains the base's nor is a prefix of
+// it is 409 name_conflict. The entries it writes record the creating
+// operator as author and its grant (§7.4).
 func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author int64) *Error {
 	type change struct {
 		name string
@@ -1242,6 +1257,10 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 				if v, ok := cfg.Doc[k]; ok {
 					doc[k] = jsonv.Clone(v)
 				}
+			}
+			if m.schemaNonce[nsName] {
+				// Its source's setting, not the branch's (§C.7).
+				doc["nonce"] = "required"
 			}
 			n, _, _ = t.insertNamespace(nsName, []any{map[string]any{"op": "add", "path": "", "value": doc}}, doc, false, author)
 		}

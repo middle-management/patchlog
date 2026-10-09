@@ -101,21 +101,24 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, err error) {
 	return lo, hi, nil
 }
 
-// existing reads a target namespace's protection, or reports it missing.
-func (im *importer) existing(ctx context.Context, ns string) (access string, epoch int, ok bool, err error) {
+// existing reads a target namespace's protection and whether it requires
+// nonces (§C.7), or reports it missing.
+func (im *importer) existing(ctx context.Context, ns string) (access string, epoch int, nonce, ok bool, err error) {
 	lv, err := im.c.EncryptionLevel(ctx, ns)
 	if client.IsNotFound(err) || client.IsGone(err) {
-		return "", 0, false, nil
+		return "", 0, false, false, nil
 	}
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, false, false, err
 	}
 	if lv == "sealed" {
-		return AccessSealed, 0, true, nil // its document needs keys; its level is enough
+		// Its document needs keys; its level is enough, and generated
+		// patch sets get a fresh $nonce there anyway.
+		return AccessSealed, 0, false, true, nil
 	}
 	doc, ok, err := im.namespaceDoc(ctx, ns)
 	if err != nil || !ok {
-		return "", 0, ok, err
+		return "", 0, false, ok, err
 	}
 	if enc, _ := doc["encryption"].(map[string]any); enc != nil {
 		epoch = 1
@@ -123,7 +126,7 @@ func (im *importer) existing(ctx context.Context, ns string) (access string, epo
 			epoch = int(f)
 		}
 	}
-	return targetAccess(lv, doc), epoch, true, nil
+	return targetAccess(lv, doc), epoch, docNonce(doc), true, nil
 }
 
 // checkAccess checks every target against its source's access level
@@ -174,10 +177,11 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			}
 		}
 	}
+	nonces := map[string]bool{} // targets that require nonces (nonce.go)
 	for _, tns := range names {
 		tg := targets[tns]
 		src := im.h.AccessOf(tg.src)
-		have, epoch, ok, err := im.existing(ctx, tns)
+		have, epoch, nonce, ok, err := im.existing(ctx, tns)
 		if err != nil {
 			return fmt.Errorf("import: target namespace %s: %w", tns, err)
 		}
@@ -218,9 +222,10 @@ func (im *importer) checkAccess(ctx context.Context) error {
 				}
 			}
 			im.create[tns] = doc
-			have = docAccess(doc)
+			have, nonce = docAccess(doc), docNonce(doc)
 		}
 		im.sealedT[tns] = have == AccessSealed
+		nonces[tns] = nonce
 		switch {
 		case have == AccessE2E:
 			problems = append(problems, fmt.Sprintf("%s is e2e: importing plaintext into it means sealing each patch set with its keys in a client (§G.5.1), which this importer doesn't do", tns))
@@ -233,6 +238,7 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			im.rep.Notes = append(im.rep.Notes, msg+"; imported anyway, as the operator overrode it")
 		}
 	}
+	problems = append(problems, im.requireNonces(nonces)...)
 	if len(problems) > 0 {
 		return &AccessError{Problems: problems}
 	}
@@ -282,8 +288,9 @@ func withoutNonce(v any) any {
 }
 
 // nonced adds a fresh $nonce to every patch set the importer generates for
-// a sealed namespace (§E.2.5). Full-history lines are never changed: their
-// ids are the source's.
+// a sealed namespace (§E.2.5), or one that requires nonces (§C.7), both
+// marked in sealedT. Full-history lines are never changed: their ids are
+// the source's.
 func nonced(steps []client.Step) []client.Step {
 	out := make([]client.Step, len(steps))
 	for i, s := range steps {

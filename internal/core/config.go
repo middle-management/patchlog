@@ -159,7 +159,11 @@ type Config struct {
 	// resource revision and tombstone needs a valid author signature by a
 	// signer of its grant. False for "optional", the default.
 	SignaturesRequired bool
-	level              int
+	// NonceRequired is "nonce": "required" (§C.7): every resource create,
+	// append and restore must result in a document with a fresh $nonce
+	// that differs from its parent's. False for "optional", the default.
+	NonceRequired bool
+	level         int
 }
 
 // Allowance gives a named principal its own rate and batch limits (§6.6).
@@ -284,7 +288,7 @@ func ValidRemoteOrigin(s string) bool {
 var nsMembers = map[string]bool{
 	"read": true, "keys": true, "roles": true, "revoked": true, "rules": true, "limits": true,
 	"allowances": true, "retention": true, "encryption": true, "maxLag": true, "base": true,
-	"frozen": true, "successor": true, "drafts": true, "signatures": true, "schemaReads": true,
+	"frozen": true, "successor": true, "drafts": true, "signatures": true, "schemaReads": true, "nonce": true,
 	"catalog": true, "catalogs": true, // Addendum B
 	"merge": true, "merged": true, "cleanup": true, "abandoned": true, // Addendum F
 }
@@ -727,6 +731,14 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 			default:
 				return nil, fmt.Errorf(`/signatures must be "optional" or "required"`)
 			}
+		case "nonce":
+			switch v {
+			case "optional":
+			case "required":
+				c.NonceRequired = true
+			default:
+				return nil, fmt.Errorf(`/nonce must be "optional" or "required"`)
+			}
 		case "drafts":
 			df, err := parseDrafts(v)
 			if err != nil {
@@ -804,6 +816,11 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 		// Their readers need keys that a pinning document doesn't give
 		// them (§6.1).
 		return nil, fmt.Errorf("/schemaReads is not allowed in sealed and end-to-end namespaces (§6.1)")
+	}
+	if c.NonceRequired && c.level == levelE2E {
+		// Ids there are over ciphertext with a random IV already, and a
+		// namespace that requires nonces can't become e2e (§C.7).
+		return nil, fmt.Errorf(`/nonce: "required" is not allowed in an end-to-end namespace, whose ids are over ciphertext with a random IV already (§C.7)`)
 	}
 	if c.level == levelE2E {
 		// Sealing grows a patch set by half, and it carries the declared

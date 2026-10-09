@@ -349,6 +349,23 @@ func TestCheckSchemaDocumentSelfID(t *testing.T) {
 	}
 }
 
+// A top-level $nonce of the fresh form is no keyword (§6.2, §C.7); any
+// other $nonce is.
+func TestCheckSchemaDocumentNonce(t *testing.T) {
+	if err := CheckSchemaDocument(j(`{"$schema":"https://json-schema.org/draft/2020-12/schema","$nonce":"abcdefghijklmnopqrstuvwxyz"}`), ""); err != nil {
+		t.Fatal(err)
+	}
+	for _, d := range []string{
+		`{"$nonce":"short"}`,
+		`{"properties":{"a":{"$nonce":"abcdefghijklmnopqrstuvwxyz"}}}`,
+	} {
+		var se *SchemaError
+		if err := CheckSchemaDocument(j(d), ""); !errors.As(err, &se) {
+			t.Errorf("%s: got %v, want SchemaError", d, err)
+		}
+	}
+}
+
 func TestRefs(t *testing.T) {
 	doc := j(`{"$schema":"https://json-schema.org/draft/2020-12/schema",
 		"$ref":"` + pathPerson + `",

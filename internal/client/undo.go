@@ -26,7 +26,9 @@ package client
 //     then "delete"; a genesis "delete". Consecutive patch sets are joined
 //     and split again to stay within opsPerSet and patchSetSize (§6.6).
 //     $nonce is never restored: every patch set gets a fresh one in sealed
-//     namespaces, and where the current document has one (§C.7).
+//     namespaces and those that require nonces, a tombstone's restore then
+//     being a lone fresh $nonce, and where the current document has one
+//     (§C.7).
 //   - The guard. The log after the gesture's last entry in each resource is
 //     compared with the paths the gesture wrote: an overlapping write, a
 //     delete, a restore or an undo of the gesture is a conflict
@@ -580,6 +582,7 @@ type undoEnv struct {
 	level       string // "", "at-rest", "sealed", "e2e"
 	maxOps      int
 	maxBytes    int
+	nonces      bool // the namespace requires nonces (§C.7)
 	cfg         *undoConfig
 }
 
@@ -601,7 +604,7 @@ func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConf
 		return nil, fmt.Errorf("client: undo in the e2e namespace %s needs UndoE2E: the inverse is folded and sealed client-side", ns)
 	}
 	env := &undoEnv{ns: ns, gesture: gesture, level: level, cfg: cfg}
-	env.maxOps, env.maxBytes = c.undoLimits(ctx, ns, cfg)
+	env.maxOps, env.maxBytes, env.nonces = c.undoLimits(ctx, ns, cfg)
 	if level == "e2e" {
 		// Sealing grows a patch set by about half (§6.6 Values).
 		env.maxBytes = env.maxBytes*2/3 - 1024
@@ -633,11 +636,13 @@ func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConf
 }
 
 // undoLimits reads opsPerSet and patchSetSize from the namespace document
-// (§6.6), with the defaults when it doesn't say or can't be read.
-func (c *Client) undoLimits(ctx context.Context, ns string, cfg *undoConfig) (ops, size int) {
+// (§6.6), with the defaults when it doesn't say or can't be read, and
+// whether it requires nonces (§C.7).
+func (c *Client) undoLimits(ctx context.Context, ns string, cfg *undoConfig) (ops, size int, nonces bool) {
 	ops, size = 1000, 256<<10
 	if h, err := c.NSHead(ctx, ns); err == nil {
 		if d, err := c.NSDoc(ctx, ns, h.ID); err == nil {
+			nonces = d.Value["nonce"] == "required"
 			lim, _ := d.Value["limits"].(map[string]any)
 			if n, ok := lim["opsPerSet"].(float64); ok && n >= 2 {
 				ops = int(n)
@@ -653,7 +658,7 @@ func (c *Client) undoLimits(ctx context.Context, ns string, cfg *undoConfig) (op
 	if cfg.maxBytes > 0 {
 		size = cfg.maxBytes
 	}
-	return ops, size
+	return ops, size, nonces
 }
 
 func (env *undoEnv) impossible(res, reason string, err error) error {
@@ -963,8 +968,10 @@ func (c *Client) planResource(ctx context.Context, env *undoEnv, author string, 
 		return r, conflicts, nil, nil
 	}
 
-	// The inverse, newest first, applied to the current state.
-	needNonce := env.level == "sealed"
+	// The inverse, newest first, applied to the current state. Where nonces
+	// are required, every patch-set step gets one, a restore that would be
+	// [] and a step before a "delete" included (§11.2, §C.7).
+	needNonce := env.level == "sealed" || env.nonces
 	if m, ok := final.doc.(map[string]any); ok && env.level != "e2e" {
 		if _, has := m["$nonce"]; has {
 			needNonce = true

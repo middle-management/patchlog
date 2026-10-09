@@ -314,6 +314,8 @@ type Plan struct {
 	// "at-rest", "sealed", "e2e").
 	TargetLevel string `json:"targetLevel,omitempty"`
 	BranchLevel string `json:"branchLevel,omitempty"`
+	// TargetNonce is set when the target requires nonces (§C.7).
+	TargetNonce bool `json:"targetNonce,omitempty"`
 	// Reencrypt is set when either side is e2e: branch changes are read
 	// as plaintext and every item is written anew, never fast-forwarded
 	// (§F.8).
@@ -411,6 +413,7 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		return nil, fmt.Errorf("merge: target %s: %w", target, err)
 	}
 	p.MergeAuthors, p.AuthorsDeclared = MergeAuthors(tdoc.Value)
+	p.TargetNonce = tdoc.Value["nonce"] == "required"
 
 	changed := Collect(blog)
 	var only map[string]bool
@@ -1000,11 +1003,12 @@ func (p *Plan) hintIgnored(r *Resource) {
 
 // keepStep is the step that records a resource kept at the target's live
 // head (§F.3): an empty patch set, which writes a revision with identical
-// content, or in a sealed namespace a patch set that only adds a fresh
-// $nonce, since every patch set there must refresh it (§E.2.5). In an e2e
-// namespace the empty set is sealed like any other step (sealItems).
+// content, or in a sealed namespace or one that requires nonces a patch
+// set that only adds a fresh $nonce, since every patch set there must
+// refresh it (§C.7, §E.2.5). In an e2e namespace the empty set is sealed
+// like any other step (sealItems).
 func (p *Plan) keepStep() client.Step {
-	if p.TargetLevel == "sealed" {
+	if p.nonces() {
 		return client.PatchStep([]any{map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()}})
 	}
 	return client.PatchStep([]any{})

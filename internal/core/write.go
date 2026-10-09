@@ -191,7 +191,8 @@ type stepState struct {
 	writes   []string
 	typed    string // $schema of the resulting document
 	// prevNonce is the $nonce of the document the step applied to, if
-	// any (sealed namespaces refuse a repeated nonce, §E.2.5).
+	// any (sealed namespaces and those that require nonces refuse a
+	// repeated one, §C.7, §E.2.5).
 	prevNonce string
 	// sealed marks a create, append or restore of an e2e resource: its
 	// patch set is opaque and its document unknown (§6.2, §E.3).
@@ -640,10 +641,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		st, fs = dropFailed(st, fs, dryFails), nil
 	}
 
-	// Step 3: apply. Sealed namespaces also need a fresh $nonce in every
-	// patch set (§C.7, §E.2.5). In an e2e namespace nothing is applied but
-	// the keyring: patch sets are sealed and checked by their header
-	// (§6.2, §E.3).
+	// Step 3: apply. Namespaces that require nonces need a fresh $nonce in
+	// every resulting document, and sealed ones in every patch set (§C.7,
+	// §E.2.5). In an e2e namespace nothing is applied but the keyring:
+	// patch sets are sealed and checked by their header (§6.2, §E.3).
 	for _, s := range st {
 		var err *Error
 		switch {
@@ -651,6 +652,9 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			err = t.applyStepsE2E(n, cfg, s)
 		default:
 			err = t.applySteps(s)
+			if err == nil && cfg.NonceRequired {
+				err = checkRequiredNonces(s)
+			}
 			if err == nil && cfg.level == levelSealed {
 				err = checkNonces(s)
 			}

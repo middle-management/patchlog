@@ -290,6 +290,9 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 		if cfg.Read == "public" && t.config(base.configSeq).Read != "public" {
 			return nil, invalid("a branch of a non-public namespace cannot be public")
 		}
+		if err := t.checkNonceBase(cfg, base); err != nil {
+			return nil, err
+		}
 		if cur.Frozen && !cfg.Frozen && !base.isShadow() {
 			// Unfreezing makes the branch live again, which counts against
 			// its base's branchesPerNamespace as creating one does (§6.6,
@@ -679,6 +682,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		return nil, invalid("a branch of a non-public namespace cannot be public")
 	}
 	if err := t.checkEncryption(nil, cfg, t.nsLevel(base)); err != nil {
+		return nil, err
+	}
+	if err := t.checkNonceBase(cfg, base); err != nil {
 		return nil, err
 	}
 	// Step 6: the base's rules evaluate a branch envelope.

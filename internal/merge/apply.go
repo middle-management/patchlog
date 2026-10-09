@@ -110,7 +110,7 @@ func (p *Plan) applyResolution(r *Resource, steps []client.Step) {
 		}
 		return
 	}
-	r.Steps = steps
+	r.Steps = p.withNonces(steps)
 	r.Resolved = true
 }
 
@@ -148,7 +148,9 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 	case !start.exists:
 		r.Steps = []client.Step{client.PatchStep(client.GenesisPatches(fin.doc))}
 	default:
-		d := Diff(start.doc, fin.doc)
+		// Where the target needs a fresh $nonce, it replaces both sides'
+		// (§F.3 Nonces, §C.7).
+		d := Diff(p.nonceless(start.doc), p.nonceless(fin.doc))
 		if len(d) == 0 && !start.deleted {
 			r.Steps, r.Class, r.IfMatch, r.IfNoneMatch = nil, Merged, "", false
 			r.Note = "squashed to no change"
@@ -160,6 +162,7 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 		// A patch set on a tombstone restores (§8.2).
 		r.Steps = []client.Step{client.PatchStep(d)}
 	}
+	r.Steps = p.withNonces(r.Steps)
 	return nil
 }
 
