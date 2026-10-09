@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.16.1
 
 - **Index and tree services: a purged namespace or catalog answers `410 purged` with `head`**,
   its `purge-ns` entry, as the core does (§8.5, §12), after the read check; it was `410 gone`
