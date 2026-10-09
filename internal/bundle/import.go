@@ -189,7 +189,7 @@ type BatchReport struct {
 	Steps     int            `json:"steps"`
 	Size      int            `json:"size"` // bytes of canonical patch sets
 	Source    map[string]any `json:"source"`
-	DryRun    string         `json:"dryRun,omitempty"` // ok, deferred, failed; "" if not dry-run (only a namespace's first batch is)
+	DryRun    string         `json:"dryRun,omitempty"` // ok, deferred, failed; "" if not dry-run (only a namespace's first batch is; its first item if the import creates it)
 	Status    int            `json:"status,omitempty"` // submit status
 	NSID      string         `json:"ns_id,omitempty"`
 	Error     string         `json:"error,omitempty"`

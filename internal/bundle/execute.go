@@ -516,9 +516,11 @@ func (im *importer) execute(ctx context.Context) error {
 	// written: one that would fail stops the import with nothing written.
 	// A namespace that depends on earlier batches may fail only because
 	// they haven't committed; its submit tells. Later batches aren't
-	// dry-run: a batch is atomic, so a submit that fails writes nothing
-	// (§7.5), as its dry run would have failed, and a dry run draws the
-	// tokens a submit does (§6.6).
+	// dry-run, since a dry run draws the tokens a submit does (§6.6): a
+	// batch is atomic, so one the server refuses writes nothing (§7.5),
+	// but the ids it gives a batch's revisions are checked against the
+	// bundle's only once it has written them. A namespace the import
+	// creates has its first item dry-run once it exists (probe).
 	im.timed(&im.rep.Timings.Planning, im.start)
 	pending := map[string]bool{}
 	for _, n := range im.order {
@@ -566,6 +568,9 @@ func (im *importer) execute(ctx context.Context) error {
 				}
 			}
 			n.missing = false
+			if err := im.probe(ctx, n, lims[n]); err != nil {
+				return err
+			}
 		}
 		for i := 0; i < len(n.batches); i++ {
 			if l := lims[n]; im.opt.Mode == Backfill && l.ended(im.opt.Now()) {
@@ -630,6 +635,26 @@ func (im *importer) execute(ctx context.Context) error {
 				}
 			}
 		}
+	}
+	return nil
+}
+
+// probe dry-runs the first item of a namespace's first batch once the
+// import has created the namespace: a token, paced as a dry run is, that
+// checks before anything is written there that the server gives the
+// bundle's revisions their ids. A server that derives them otherwise
+// takes the submit all the same: source.ids only records them (§3.5).
+func (im *importer) probe(ctx context.Context, n *node, l limits) error {
+	b := n.batches[0]
+	p := &batch{n: n, parts: b.parts[:1], rep: b.rep}
+	for _, s := range p.parts[0].it.steps[p.parts[0].from:p.parts[0].to] {
+		p.size += stepSize(s)
+	}
+	if err := im.prepare(ctx, p, l, false); err != nil {
+		return err
+	}
+	if im.opt.Mode == Backfill {
+		return im.pace(ctx, n.ns, l, "")
 	}
 	return nil
 }

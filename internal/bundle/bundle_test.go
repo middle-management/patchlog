@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"slices"
@@ -551,6 +553,79 @@ func TestAtomicAndBackfill(t *testing.T) {
 	// The mode is explicit.
 	if _, err := bundle.Import(ctx, imp, bundle.BytesOpener(b), bundle.ImportOptions{}); err == nil || !strings.Contains(err.Error(), "choose a mode") {
 		t.Fatalf("no mode: %v", err)
+	}
+}
+
+// idTransport counts requests and, if other, answers every batch request
+// as a server that derives revision ids otherwise would: its first item's
+// first id differs.
+type idTransport struct {
+	countingTransport
+	other bool
+}
+
+func (o *idTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	res, err := o.countingTransport.RoundTrip(r)
+	if err != nil || !o.other || r.Method != "POST" || !strings.HasSuffix(r.URL.Path, "/batch") || res.StatusCode >= 300 {
+		return res, err
+	}
+	var m map[string]any
+	if err := json.NewDecoder(res.Body).Decode(&m); err != nil {
+		return nil, err
+	}
+	res.Body.Close()
+	ids := m["items"].([]any)[0].(map[string]any)["ids"].([]any)
+	ids[0] = "0" + ids[0].(string)
+	body, _ := json.Marshal(m)
+	res.Body, res.ContentLength = io.NopCloser(bytes.NewReader(body)), int64(len(body))
+	res.Header.Del("Content-Length")
+	return res, nil
+}
+
+// A namespace the import creates can't have its first batch dry-run before
+// anything is written, and later batches aren't: its first item is dry-run
+// once it exists, paced as a dry run is, so a server that would give the
+// bundle's revisions other ids stops the import before it writes there.
+func TestImportCreatedIDs(t *testing.T) {
+	t.Parallel()
+	b := bulkSource(t)
+	for _, mode := range []bundle.ImportMode{bundle.Atomic, bundle.Backfill} {
+		t.Run(string(mode), func(t *testing.T) {
+			t.Parallel()
+			imp := func(other bool) (*deployment, *bundle.Report, []time.Duration, *idTransport, error) {
+				dst, clk := newDeployment(t, cmsOrigin), newTestClock()
+				rt := &idTransport{countingTransport: countingTransport{rt: http.DefaultTransport}, other: other}
+				c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: rt})))
+				var sleeps []time.Duration
+				rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: mode, Pace: 1, CreateNamespaces: true, Now: clk.Now,
+					Sleep: func(_ context.Context, d time.Duration) error { sleeps = append(sleeps, d); clk.add(d); return nil }})
+				return dst, rep, sleeps, rt, err
+			}
+
+			dst, rep, _, rt, err := imp(true)
+			if err == nil || !strings.Contains(err.Error(), "doc-0: would produce") || rt.dry.Load() != 1 || rt.submits.Load() != 0 {
+				t.Fatalf("import: %v; %d dry runs, %d submits", err, rt.dry.Load(), rt.submits.Load())
+			}
+			if br := rep.Batches[0]; br.DryRun != "failed" || len(br.Failures) != 1 {
+				t.Fatalf("batch %+v", br)
+			}
+			if dst.head("bulk", "doc-0").State != client.NotFound {
+				t.Fatal("written with ids the bundle doesn't know")
+			}
+
+			dst, rep, sleeps, rt, err := imp(false)
+			noErr(t, err)
+			if len(rep.Batches) != 1 || rep.Batches[0].DryRun != "ok" || rt.dry.Load() != 1 || rt.submits.Load() != 1 || rep.Timings.DryRuns != 1 {
+				t.Fatalf("batches %+v; %d dry runs, %d submits", rep.Batches, rt.dry.Load(), rt.submits.Load())
+			}
+			// A token at 50/s, then the batch's 7 items.
+			if want := []time.Duration{20 * time.Millisecond, 140 * time.Millisecond}; mode == bundle.Backfill && !slices.Equal(sleeps, want) {
+				t.Fatalf("sleeps %v, want %v", sleeps, want)
+			}
+			if dst.head("bulk", "long").State != client.Live {
+				t.Fatal("not imported")
+			}
+		})
 	}
 }
 
