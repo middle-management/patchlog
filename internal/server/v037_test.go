@@ -224,7 +224,7 @@ func TestV037RemoteSpecVersion(t *testing.T) {
 		spec   string
 		member string // added to the base's namespace document as of at
 	}{
-		{`"spec":"0.46"`, `"wardens":[]`},
+		{`"spec":"0.47"`, `"wardens":[]`},
 		{`"spec":"0.38-rc"`, `"wardens":[]`},
 		{`"spec":"99.0"`, ""},
 		{`"spec":"0.38.1"`, `"x-team":"a"`},
