@@ -238,7 +238,11 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			im.rep.Notes = append(im.rep.Notes, msg+"; imported anyway, as the operator overrode it")
 		}
 	}
-	problems = append(problems, im.requireNonces(nonces)...)
+	np, err := im.requireNonces(ctx, nonces)
+	if err != nil {
+		return err
+	}
+	problems = append(problems, np...)
 	if len(problems) > 0 {
 		return &AccessError{Problems: problems}
 	}

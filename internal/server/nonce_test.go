@@ -96,7 +96,7 @@ func TestNonceRequired(t *testing.T) {
 
 // The check applies to every patch set, whatever its origin: history
 // written before the setting can't be fast-forwarded into a namespace that
-// requires nonces (§C.7).
+// requires nonces, and the branch it comes from can still be frozen (§C.7).
 func TestNonceRequiredFastForward(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
@@ -116,6 +116,9 @@ func TestNonceRequiredFastForward(t *testing.T) {
 	// Re-authored with a fresh $nonce, it goes in.
 	body["items"] = []any{map[string]any{"resource": "d", "ifMatch": d1, "steps": []any{withNonce(step)}}}
 	expect(t, e.batchReq("m", body, "alice"), 201)
+	// The branch never required nonces: a config write that leaves the
+	// setting off turns nothing off (§7.6).
+	expect(t, e.patchNS("mb", ops(op("add", "/frozen", true)), ""), 201)
 }
 
 // Setting or changing it needs a * key (§7.4); in a branch, a * key of the

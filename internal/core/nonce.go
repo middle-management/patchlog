@@ -39,11 +39,14 @@ func checkRequiredNonces(s *itemState) *Error {
 }
 
 // checkNonceBase refuses a branch's namespace document that turns off a
-// nonce requirement its base has (§7.6, §C.7). base is the branch's base,
-// nil for a namespace that isn't a branch. A remote branch's shadow holds
-// what its base required when the branch was created (insertShadow).
-func (t *tx) checkNonceBase(cfg *Config, base *nsRow) *Error {
-	if base != nil && !cfg.NonceRequired && t.config(base.configSeq).NonceRequired {
+// nonce requirement its base has (§7.6, §C.7). cur is the branch's config,
+// nil for a branch being created, which copies the setting; a branch made
+// before its base set it never had it on, so leaving it off turns nothing
+// off. base is the branch's base, nil for a namespace that isn't a branch.
+// A remote branch's shadow holds what its base required when the branch
+// was created (insertShadow).
+func (t *tx) checkNonceBase(cur, cfg *Config, base *nsRow) *Error {
+	if base != nil && !cfg.NonceRequired && (cur == nil || cur.NonceRequired) && t.config(base.configSeq).NonceRequired {
 		return invalid(`/nonce: a branch can't turn off the nonce requirement its base has (§7.6, §C.7)`)
 	}
 	return nil

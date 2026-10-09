@@ -1681,13 +1681,21 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 	// second halves apply to the first half's result.
 	var resolve []half
 	var items []any
+	var np *Plan // the target's nonce needs, for planned second halves
 	for _, h := range hs {
 		if planning && st.Step == 4 {
-			diff := Diff(jsonv.FromGo(halves[h.name].Narrow), jsonv.FromGo(h.doc))
+			if np == nil {
+				var err error
+				if np, err = noncePlan(ctx, c, b.Target); err != nil {
+					return nil, nil, err
+				}
+			}
+			// As Force will build it from the first half's result.
+			diff := Diff(np.nonceless(jsonv.FromGo(halves[h.name].Narrow)), np.nonceless(jsonv.FromGo(h.doc)))
 			if diff == nil {
 				diff = []any{}
 			}
-			items = append(items, digestItem(h.name, map[string]any{"after": map[string]any{"step": 2, "key": st.Key, "item": h.name}}, []client.Step{client.PatchStep(diff)}))
+			items = append(items, digestItem(h.name, map[string]any{"after": map[string]any{"step": 2, "key": st.Key, "item": h.name}}, np.withNonces([]client.Step{client.PatchStep(diff)})))
 			continue
 		}
 		cur, err := c.Head(ctx, b.Target, h.name)
@@ -1699,10 +1707,12 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 			if err != nil {
 				return nil, nil, err
 			}
-			if jsonv.Equal(d.Value, jsonv.FromGo(h.doc)) {
+			// $nonce aside: where the target needs one, the half was
+			// written with a fresh one (§C.7).
+			if jsonv.Equal(dropNonce(d.Value), dropNonce(jsonv.FromGo(h.doc))) {
 				continue
 			}
-			if st.Step == 4 && !jsonv.Equal(d.Value, jsonv.FromGo(halves[h.name].Narrow)) {
+			if st.Step == 4 && !jsonv.Equal(dropNonce(d.Value), dropNonce(jsonv.FromGo(halves[h.name].Narrow))) {
 				return nil, nil, fmt.Errorf("%s/%s changed in %s between steps 2 and 4: plan again", b.Target, h.name, b.Target)
 			}
 		}
@@ -1760,7 +1770,7 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 			if err != nil {
 				return nil, nil, err
 			}
-			diff := Diff(d.Value, jsonv.FromGo(h.doc))
+			diff := Diff(p.nonceless(d.Value), p.nonceless(jsonv.FromGo(h.doc)))
 			if diff == nil {
 				diff = []any{}
 			}

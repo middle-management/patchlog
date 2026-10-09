@@ -91,3 +91,40 @@ func TestFullImportRequiredNonces(t *testing.T) {
 		t.Fatal("full history not imported with its ids")
 	}
 }
+
+// §C.7: only the lines a full-history import writes are checked. History
+// imported before the target required nonces is present, so importing it
+// again writes nothing, and nonced revisions on top fast-forward.
+func TestFullImportRequiredNoncesPresent(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("matches", nil)
+	src.create("matches", "derby", map[string]any{"score": "0-0"})
+	f := &fixture{src: src}
+	export := func() []byte {
+		b, _, _ := f.export(t, bundle.ExportOptions{Select: []string{"matches/derby"}})
+		return b
+	}
+	dst := newDeployment(t, cmsOrigin)
+	dst.ns("matches", nil)
+	b1 := export()
+	importB(t, dst, b1, bundle.ImportOptions{})
+	h := must(dst.c.NSHead(ctx, "matches"))
+	must(dst.c.PatchConfig(ctx, "matches", h.Config, ops(op("add", "/nonce", "required"))))
+
+	if rep := importB(t, dst, b1, bundle.ImportOptions{}); len(rep.Batches) != 0 {
+		t.Fatalf("re-import wrote %+v", rep.Batches)
+	}
+	src.append("matches", "derby", op("replace", "/score", "1-0"), op("add", "/$nonce", seal.NewNonce()))
+	importB(t, dst, export(), bundle.ImportOptions{})
+	if dst.head("matches", "derby").ID != src.head("matches", "derby").ID {
+		t.Fatal("not fast-forwarded")
+	}
+	// One without a nonce is still refused before it is written.
+	src.append("matches", "derby", op("replace", "/score", "2-0"))
+	_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(export()), bundle.ImportOptions{Mode: bundle.Atomic})
+	var ae *bundle.AccessError
+	if !errors.As(err, &ae) || !strings.Contains(err.Error(), src.head("matches", "derby").ID) {
+		t.Fatalf("unnonced fast-forward: %v", err)
+	}
+}

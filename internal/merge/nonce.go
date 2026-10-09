@@ -1,6 +1,8 @@
 package merge
 
 import (
+	"context"
+
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/seal"
 )
@@ -11,12 +13,41 @@ import (
 // (§C.7).
 func (p *Plan) nonces() bool { return p.TargetLevel == "sealed" || p.TargetNonce }
 
+// noncePlan is a plan that knows only whether target needs a fresh $nonce
+// (nonces), for steps built before the target can classify them: the
+// planned second half of a split node (stepPlan).
+func noncePlan(ctx context.Context, c *client.Client, target string) (*Plan, error) {
+	p := &Plan{}
+	var err error
+	if p.TargetLevel, err = c.EncryptionLevel(ctx, target); err != nil {
+		return nil, err
+	}
+	th, err := c.NSHead(ctx, target)
+	if err != nil {
+		return nil, err
+	}
+	tdoc, err := c.NSDoc(ctx, target, th.ID)
+	if err != nil {
+		return nil, err
+	}
+	p.TargetNonce = tdoc.Value["nonce"] == "required"
+	return p, nil
+}
+
 // nonceless returns doc without its top-level $nonce where the target
 // needs a fresh one, so a diff for it leaves the nonce out (§F.3 Nonces);
 // doc itself otherwise.
 func (p *Plan) nonceless(doc any) any {
+	if !p.nonces() {
+		return doc
+	}
+	return dropNonce(doc)
+}
+
+// dropNonce returns doc without its top-level $nonce, if it has one.
+func dropNonce(doc any) any {
 	m, ok := doc.(map[string]any)
-	if _, has := m["$nonce"]; !ok || !has || !p.nonces() {
+	if _, has := m["$nonce"]; !ok || !has {
 		return doc
 	}
 	out := make(map[string]any, len(m))
