@@ -61,8 +61,9 @@ import (
 //
 // Every answer computed, including the one a redirect names, is kept for
 // refsKeepFor and answered 200 at its at however far the namespaces move
-// meanwhile (the combined at moves with any of them). A purge drops kept
-// answers that carry a tag it purges (Index.refsPurged, from Apply).
+// meanwhile (the combined at moves with any of them), as long as the reader
+// may still see every namespace it covers. A purge drops kept answers that
+// carry a tag it purges (Index.refsPurged, from Apply).
 
 // Keeping answers (refsKept).
 const (
@@ -134,26 +135,29 @@ func (ix *Index) refsNamespaces() []string {
 	return nss
 }
 
-// refsReader runs the read check of every namespace served (access): a
-// namespace the reader may not read is left out, and if that leaves none,
-// the first refusal is the answer.
+// refsReader runs the read check of every namespace served (refsAccess):
+// a namespace the reader may not read is left out, and if that leaves
+// none, the answer is a refusal that names none of them (one the reader
+// can't see is like one the service doesn't follow): 401 if any refusal
+// is, else 403.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, error) {
 	rd := &refsReader{public: true, allow: map[string]func(string) bool{}}
 	var (
 		v          *grant.Verified
 		markers    []string
 		restricted bool
-		denied     error
+		refused    int
 	)
+	g, _ := ix.checker.Decode(bearer(r)) // nil: no usable grant
 	for _, ns := range ix.refsNamespaces() {
 		if _, purged, _ := ix.state(ns); purged || ix.keys.Skipped(ns) != "" {
 			continue
 		}
-		a, err := ix.access(ctx, ns, r)
+		a, err := ix.refsAccess(ctx, ns, r, g)
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
-			if denied == nil {
-				denied = err
+			if refused != 401 {
+				refused = ae.Status
 			}
 			continue
 		}
@@ -173,8 +177,12 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, 
 			rd.allow[ns] = func(name string) bool { return ix.checker.AllowsRead(a.v, name) }
 		}
 	}
-	if len(rd.nss) == 0 && denied != nil {
-		return nil, denied
+	switch {
+	case len(rd.nss) > 0 || refused == 0:
+	case refused == 401:
+		return nil, &grant.AuthError{Status: 401, Msg: "missing or unverifiable grant"}
+	default:
+		return nil, &grant.AuthError{Status: 403, Msg: "the grant reads no namespace the service follows"}
 	}
 	var subjects []string
 	if v != nil {
@@ -182,6 +190,25 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, 
 	}
 	rd.gs = grantcheck.SubjectSetID(subjects)
 	return rd, nil
+}
+
+// refsAccess is access to ns with the bearer decoded once (g; nil if there
+// is none or it doesn't decode): a private namespace is refused without
+// verifying a grant that doesn't name it, which §C.2 refuses first anyway.
+func (ix *Index) refsAccess(ctx context.Context, ns string, r *http.Request, g *grant.Grant) (*access, error) {
+	cfg, err := ix.checker.Config(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case cfg.Read == "public":
+		return &access{public: true, all: true}, nil
+	case g == nil:
+		return nil, &grant.AuthError{Status: 401, Msg: "no usable grant"}
+	case !g.NamesNS(ns):
+		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not apply to the namespace"}
+	}
+	return ix.access(ctx, ns, r)
 }
 
 // combinedAt is the combined checkpoint of §B.5 over cps (ns → ns_id).
@@ -283,7 +310,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	// bound to it (§E.2.6), and with ?min= only the current at is.
 	canonical := at != "" && len(rq.mins) == 0 && r.URL.RequestURI() == target(at)
 	if canonical {
-		if st, ok := ix.refsStored(ctx, target(at)); ok {
+		if st, ok := ix.refsStored(ctx, rd, target(at)); ok {
 			ix.writeRefs(w, rd, at, st)
 			return
 		}
@@ -309,12 +336,22 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 
 var errRefsKeys = errors.New("the index cannot obtain the key that seals results of a namespace asked")
 
-// refsStored returns the answer kept or stored at url.
-func (ix *Index) refsStored(ctx context.Context, url string) (derived.Stored, bool) {
-	if st, ok := ix.refs.get(url, ix.opt.Now()); ok {
-		return st, true
+// refsStored returns the answer kept or stored at url while rd may still
+// see every namespace it covers (its idx: tags). A namespace that turned
+// private, or that the index left, moves no gs: public ones add no marker.
+func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (derived.Stored, bool) {
+	st, ok := ix.refs.get(url, ix.opt.Now())
+	if !ok {
+		if st, ok = ix.sealed.Get(ctx, url); !ok {
+			return st, false
+		}
 	}
-	return ix.sealed.Get(ctx, url)
+	for _, t := range strings.Split(st.Tags, ",") {
+		if ns, ok := strings.CutPrefix(t, "idx:"); ok && !slices.Contains(rd.nss, ns) {
+			return derived.Stored{}, false
+		}
+	}
+	return st, true
 }
 
 // refsAnswer computes the answer at the current combined checkpoint, keeps
@@ -342,7 +379,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	}
 	at := combinedAt(cps)
 	view := target(at)
-	if st, ok := ix.refsStored(ctx, view); ok {
+	if st, ok := ix.refsStored(ctx, rd, view); ok {
 		return st, at, nil
 	}
 	nss := make([]string, 0, len(cps))

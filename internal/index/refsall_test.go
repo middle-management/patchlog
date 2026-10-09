@@ -246,12 +246,14 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	y.caughtUp("pa")
 	y.caughtUp("pb")
 	for _, tok := range []string{"", "garbage"} {
-		if r := y.raw("/_refs"+q, tok); r.status != 401 || r.header.Get("WWW-Authenticate") != "Bearer" {
-			t.Errorf("token %q: %d", tok, r.status)
+		if r := y.raw("/_refs"+q, tok); r.status != 401 || r.header.Get("WWW-Authenticate") != "Bearer" || r.body["message"] != "missing or unverifiable grant" {
+			t.Errorf("token %q: %d %v", tok, r.status, r.body)
 		}
 	}
-	if r := y.raw("/_refs"+q, other); r.status != 403 {
-		t.Errorf("a grant for no namespace followed: %d", r.status)
+	// Refusals name no namespace: one the reader can't see is like one the
+	// service doesn't follow.
+	if r := y.raw("/_refs"+q, other); r.status != 403 || r.body["message"] != "the grant reads no namespace the service follows" {
+		t.Errorf("a grant for no namespace followed: %d %v", r.status, r.body)
 	}
 	get := func(path, secret string) *http.Response {
 		req := must(http.NewRequest("GET", y.http.URL+path, nil))
@@ -272,6 +274,53 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}
 	if res.StatusCode != 200 || res.Header.Get("CDN-Cache-Control") != "max-age=31536000" {
 		t.Errorf("through the edge: %d %v", res.StatusCode, res.Header)
+	}
+}
+
+// An answer is served at its at only while the reader may still see every
+// namespace it covers: a namespace that turns private moves no subject set
+// (public ones add no marker), so the at URL alone doesn't say.
+func TestRefsAfterPrivate(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
+	for _, ns := range []string{"schemas", "pub", "pub2", "pa"} {
+		doc := map[string]any{"read": "public", "keys": []any{admin.Entry("*")}}
+		if ns == "pa" {
+			doc = map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), issuer.Entry("read")}}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", []string{"schemas", "pub", "pub2", "pa"}, []string{"read", "create", "config"})))
+	sch := must(w.CreateDoc(ctx, "schemas", "page", pageSchema(true)))
+	x := "/r/target/x"
+	for _, d := range []struct{ ns, name, ref string }{{"pub", "p1", x}, {"pub2", "q1", "/r/target/y"}, {"pa", "a1", x}} {
+		must(w.CreateDoc(ctx, d.ns, d.name, map[string]any{"$schema": "/r/schemas/page/rev/" + sch.ID, "related": []any{d.ref}}))
+	}
+	nss := []string{"pub", "pub2", "pa"}
+	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"})))
+	idx := startSvc(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: nss, now: s.Now})
+	for _, ns := range nss {
+		idx.caughtUp(ns)
+	}
+	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"pa"}, []string{"read"}, map[string]any{"groups": []any{"editors"}})
+	q := "?to=" + url.QueryEscape(x)
+	_, _, anonLoc := idx.refsPointer(q, "")
+	_, _, bobLoc := idx.refsPointer(q, bob)
+	if a, b := refsAllHits(idx.search(anonLoc, "")), refsAllHits(idx.search(bobLoc, bob)); a != "pub/p1" || b != "pa/a1 pub/p1" {
+		t.Fatalf("before: %q %q", a, b)
+	}
+
+	must(w.PatchConfig(ctx, "pub", must(w.NSHead(ctx, "pub")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+	idx.caughtUp("pub")
+	for _, c := range []struct{ loc, token, want string }{{anonLoc, "", ""}, {bobLoc, bob, "pa/a1"}} {
+		if r := idx.raw(c.loc, c.token); r.status != 302 {
+			t.Errorf("%s after pub went private: %d %v", c.loc, r.status, r.body)
+		}
+		if got := refsAllHits(idx.search("/_refs"+q, c.token)); got != c.want {
+			t.Errorf("current answer for %q: %q", c.token, got)
+		}
 	}
 }
 
@@ -382,5 +431,28 @@ func TestRefsAcrossSealed(t *testing.T) {
 	}
 	if got := refsAllHits(idx.search("/_refs?to="+url.QueryEscape(x), "")); got != "e/d plain/p" {
 		t.Errorf("after the purge: %s", got)
+	}
+
+	// A stored answer is not served once a namespace it covers turns
+	// private, though the anonymous subject set stays the same.
+	must(createNonced(w, "sec", "s2", doc))
+	idx.caughtUp("sec")
+	f = idx.fetch("/_refs?to="+url.QueryEscape(x), "")
+	if got := refsAllHits(decodeJSON(t, f.body)); got != "e/d plain/p sec/s2" {
+		t.Fatalf("with s2: %s", got)
+	}
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+	idx.caughtUp("sec")
+	idx.stop()
+	idx = startSvcWith(t, ic, opts, withKey)
+	idx.caughtUp("sec")
+	if _, ok := idx.ix.SealedViews()[f.path]; !ok {
+		t.Fatal("the answer with s2 is not stored")
+	}
+	if r := idx.raw(f.path, ""); r.status != 302 {
+		t.Errorf("after sec went private: %d %v", r.status, r.body)
+	}
+	if got := refsAllHits(idx.search("/_refs?to="+url.QueryEscape(x), "")); got != "e/d plain/p" {
+		t.Errorf("after sec went private: %s", got)
 	}
 }
