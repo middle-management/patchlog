@@ -31,7 +31,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
 | Edge grants as cookies: `POST /edge-grants`, withdrawn with `DELETE /edge-grants`, verified by the origin without an edge | §C.5, §9 | ✅ |
-| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3, kept by branches and remote branches, added by undo, merges, imports, schema import and release tools | §C.7 | ✅ |
+| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
@@ -273,9 +273,9 @@ verifies grants, and the origin must know which deployment it is in:
   and the origin checks their grants itself: writes, batches, config writes, purges, `POST
   /ns/{ns}/keys`, event streams (SSE), error answers such as `401`/`403`, and schema revisions
   read under `schemaReads` by a reader of a referrer (§6.1). Those carry the grant in
-  `Authorization`, so an edge that knows only prefixes forwards them undecided, and they are
-  served `private, max-age=300` and `no-store` for shared caches. Public and sealed reads never
-  need the header.
+  `Authorization`, or none for a revision a public referrer pins (v0.49), so an edge that
+  knows only prefixes forwards them undecided, and they are served `private, max-age=300` and
+  `no-store` for shared caches. Public and sealed reads never need the header.
 
   `patchlog index` and `patchlog tree` take the same two flags for their private listings
   (§A.4, §B.11.5): without `-edge-secret` those are `no-store` at the edge, with it they need the
@@ -296,8 +296,11 @@ A grant with roles needs one role that lists `read` and qualifies: none of its r
 `/resource` or `/now`, and they pass now for the principal. Roles are alternatives, so one is
 enough, with the blocks and key scope on top; a role that tests `/resource` never qualifies,
 even next to blocks that fix it. The answer is all or nothing: if any namespace the grant names
-doesn't exist or refuses it, no cookie is set, and the request is `401` if any namespace's
-answer is, else `403` (`410` if the only refusals are purged namespaces). Cookies are
+doesn't exist, is purged or refuses it, no cookie is set, and the request is `401` if any
+namespace's answer is, else `403`. A purged namespace is decided last, once the grant verifies
+and may read there, so the answer is `410 purged`, with the `head` of the first one the grant
+names, only if every refusal is a purge (v0.49). While authentication is disabled (`-dev`),
+issuance is `404 not_offered`. Cookies are
 `Secure`, `HttpOnly`, named `__Secure-pl-eg-…` per prefix, with `Path` the prefix, which covers
 what lies below it by whole segments (`/ns/{ns}` covers the namespace URL itself and
 `/ns/{ns}/…`, not `/ns/{ns}-x`), and last until the grant's `exp` or 15 minutes, whichever is
@@ -312,9 +315,11 @@ with `-cors-credentials-origin` (repeatable), which names the origin from that l
 `Access-Control-Allow-Credentials: true` and `Vary: Origin`, even when `-cors-origin` is `*`, and
 makes the cookies `SameSite=None` (otherwise `Lax`). `DELETE /edge-grants?prefix=…` (v0.48;
 `prefix` repeatable, as `prefixes` returned them) withdraws them at sign-out: `204`,
-`no-store`, an expired cookie of the same name and attributes per prefix, no grant needed. Only
-credentialed origins may preflight it, so another site can't sign a reader out. It clears the
-browser's copies only; a copied cookie lasts until it expires.
+`no-store`, an expired cookie of the same name and attributes per prefix (a repeated one once),
+no grant needed, and the same with authentication disabled, so sign-out works either way. No
+`prefix`, or one of another form, is `400 bad_input`; `prefix` is the core's one repeatable
+parameter (§7). Only credentialed origins may preflight it, so another site can't sign a reader
+out. It clears the browser's copies only; a copied cookie lasts until it expires.
 
 **Bypassing it.** The origins answer directly on 9080 (core), 9081 (search) and 9082 (tree).
 `make cdn-restart` restarts Varnish, which reloads the VCL and empties the cache.
@@ -798,7 +803,8 @@ and, under "Filters", the `schema`, facet and range filters (`/league=cup`, `/ki
 or the raw `facet[/league]=cup`), `sort`, `counts` and `limit`, and shows each hit's resource,
 `$schema`, score, facets and revision, with the checkpoint (`at`) the index redirected the query to
 (the browser follows that redirect through the proxy). A resource name opens in the Resource tab;
-a facet chip or count adds a filter; "More results" follows `next`. "Wait for my last write" sends
+a facet chip or count adds a filter; "More results" follows `next` (for a `ref=` query without `q`
+or `sort`, the result's `at` URL with `after` set to it). "Wait for my last write" sends
 `min=` with the `X-Namespace-Revision` of the last write the page made to that namespace, so the
 results include it (§A.5). Sealed results (§E.2.6), whole or per hit, are decrypted with the keys the
 playground holds; an end-to-end namespace has no server index, and the tab says so. Without
@@ -858,10 +864,12 @@ res, err  = c.Redo(ctx, "docs", g)              // undoes the latest undo of g
 st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each item's Target to pass to Undo
 ```
 
-- **Finding it.** `GET /ns/{ns}/gestures/{gesture}` where offered; otherwise (sealed and e2e
-  namespaces, older deployments, grants without unrestricted read, or `UndoScanLog()`) the namespace
-  log, all of it page by page or after `UndoSince(nsID)`, for entries with the gesture by the same
-  author (`UndoAuthor`, by default the author of its first revision found). Each resource's log is
+- **Finding it.** `GET /ns/{ns}/gestures/{gesture}` where offered, also to grants limited to
+  some resources; otherwise (sealed and e2e namespaces, older deployments, or `UndoScanLog()`)
+  the namespace log, which needs unrestricted read (§C.5), so a grant limited to some resources
+  can't undo in sealed and e2e namespaces. The log is read all of it page by page or after
+  `UndoSince(nsID)`, for entries with the gesture by the same author (`UndoAuthor`, by default
+  the author of its first revision found). Each resource's log is
   read from its head just before the gesture in that log (or its head as of `UndoSince`), else from
   genesis, and from the pruning horizon when that is later.
 - **The inverse**, per resource, the gesture's own entries newest first: a revision becomes the patch
@@ -871,9 +879,11 @@ st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each ite
   `"delete"`. Edits others made to other paths, also between the gesture's saves, are kept. `$nonce`
   is never restored: each patch set gets a fresh one in sealed namespaces, in namespaces that
   require nonces (§C.7; a tombstone's inverse is then a restore with a lone fresh `$nonce`), and
-  where the document has one. Whether nonces are required is read from the namespace document,
-  which needs unrestricted read; for a reader limited to some resources, only the last rule
-  applies.
+  where the document has one, each only on a patch set whose resulting document is an object.
+  Whether nonces are required is read from the namespace document, which needs unrestricted
+  read: a grant limited to some resources can't read it, so in a private namespace it adds a
+  fresh `$nonce` to every patch set (§C.7, v0.49, `client.NeedsNonce`), and the namespace's
+  encryption level counts as unknown.
   The sets are joined and split again within the namespace's `opsPerSet` and `patchSetSize`.
 - **The guard.** The log after the gesture's last entry in each resource: a write overlapping the
   gesture's paths, a delete, a restore or an undo of the gesture is a conflict, returned as
@@ -925,16 +935,31 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   it are advisory (use `?min=` and expect races). A database from before this version is rebuilt
   from the logs on start. In a branch's preview index targets match as written.
   A document that references itself is a hit of its own query with `"self": true`, so a delete
-  guard can leave it out.
+  guard can leave it out. A `ref` query without `q` or `sort` pages by resource name (v0.49):
+  `after` is a name, any string serving as the bound, and `next` is the `after` of the following
+  page, to set on the `at` URL; other queries page by offset, with `next` the next page's URL.
 - `GET /_refs?to=/r/logic/route-3` (v0.48) asks every namespace the index follows that the reader
-  may read, `to` in any form `?ref=` takes. It redirects to `/_refs/at/{at}/g/{gs}?to=…`, where
-  `at` is a combined checkpoint over only the namespaces the answer covers, which the body's
-  `namespaces` lists, so writes elsewhere don't move it, and `gs` keys the reader's subject set.
-  `min` takes `{ns}:{ns_id}`, repeatable, and is `400` for a namespace the answer doesn't cover.
-  Hits are `?ref=` hits with their `ns`, filtered per resource, in namespace then resource order,
-  paged with `limit` and `after`. Hits from sealed and e2e namespaces are sealed per entry, and
-  e2e namespaces whose keys the index doesn't hold are left out. Answers are kept as above.
-  Delete guards built on it remain advisory.
+  may read, branch previews included, `to` in any form `?ref=` takes. It redirects to
+  `/_refs/at/{at}/g/{gs}?to=…`, where `at` is a combined checkpoint over only the namespaces the
+  answer covers, which the body's `namespaces` lists, so writes elsewhere don't move it.
+  - `gs` keys what the answer depends on, over markers alone (v0.49): `reads:{ns}` for each
+    private namespace the grant reads unrestricted (one read role without `/resource` rules is
+    enough), and `reads:{ns}:scope:{digest}` for one it reads in part, the digest covering the
+    rules that limit it there and the `/principal` values they refer to; rules on `/now` there
+    make the namespace unreadable. Readers with no marker, anonymous ones included, share the
+    empty set's `gs`.
+  - It leaves out namespaces the index hasn't reached yet, purged ones, and sealed or e2e ones
+    whose keys it doesn't hold. `min` takes `{ns}:{ns_id}`, repeatable, and is `400` for a
+    namespace the answer doesn't cover; on an `at` URL, a kept answer whose `at` already
+    includes every `min` is `200`, otherwise it waits and redirects (`503` if not in time).
+    Only a reader who may see none of the namespaces gets `401` or `403`. A namespace document
+    the index can't read is `502` for a namespace the grant names; any other is left out, as a
+    private one.
+  - Hits are `?ref=` hits with their `ns`, filtered per resource, in byte order of namespace,
+    then resource name. A page holds `limit` hits after `after`, given as `{ns}/{name}`, and
+    `next` is the following page's `after`, to set on the `at` URL. Hits from sealed and e2e
+    namespaces are sealed per entry, and such answers are served only at their canonical URL.
+    Answers are kept as above. Delete guards built on it remain advisory.
 - Schema documents (whose `$schema` is a dialect URL) are indexed too: `?schema=https://json-schema.org/draft/2020-12/schema`
   lists them, and the revision paths of `$ref` keywords at schema positions (fragment dropped; not
   those inside `const`, `enum`, `default` or `examples`) count as references, so
@@ -942,11 +967,14 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
 - Hits carry their facet and sort values under the field's path (always a list; sort values as
   written), and `?fields=/name,/title` adds those indexed fields, `text` ones included, so a list
   renders without fetching every document. A path is checked against the `x-index` marks of the
-  schemas the namespace's documents use, not against the data, so whether a query fails never
-  depends on it: a marked path no document has values at is accepted and left out of hits, an
-  unmarked one is `400`, and a schema that can't be read for now is `502`. In sealed namespaces
-  they are sealed with the rest of the hit. A database from before this version is rebuilt from
-  the logs on start.
+  schemas the namespace's documents use (an `x-index` reachable from a schema's root along the
+  path, through `$ref`, `$dynamicRef`, the object and array keywords and every branch of
+  `allOf`, `anyOf`, `oneOf`, `if`, `then` and `else`, never through `not`, `propertyNames` or
+  `unevaluated*`, array items at their array's path; §A.4), not against the data, so whether a
+  query fails never depends on it: a marked path no document has values at is accepted and left
+  out of hits, an unmarked one is `400`, and a schema that can't be read for now is `502`. In
+  sealed namespaces they are sealed with the rest of the hit. A database from before this
+  version is rebuilt from the logs on start.
 - In private namespaces the reader's grant is checked locally. Results are routed under
   `/g/{subject-set}/…` and filtered to the resources the grant can read.
 
@@ -1049,8 +1077,13 @@ PATCH /r/matches-r7/derby  {"$schema": "/r/schemas/team/rev/X", …}
   that revision by path, `/r/{N}/{name}/rev/{id}`, even if it doesn't name `N` (cached
   `private`). Nothing else opens: not the head, log or other revisions, not a document that
   isn't a schema, not a draft in a branch. Only the listed namespace's own resources count as
-  referrers, among the namespaces the grant names. Setting it needs a `*` key; it is `422` in
-  sealed and e2e namespaces, and branch creation drops it.
+  referrers. A referrer in a listed namespace that is public, and neither sealed nor e2e,
+  opens the revision to every request, with or without a grant, which is then ignored (v0.49);
+  any other counts only for a grant that names its namespace, verifies there and may read it.
+  Whether a revision is open is kept per revision path until a write to an open listed
+  namespace or a change of configuration or namespaces, so anonymous reads don't scan those
+  namespaces each time. Setting it needs a `*` key; it is `422` in sealed and e2e namespaces,
+  and branch creation drops it.
 - **`in_use`.** A reference (every revision a branch wrote counts, not only its head; tombstoned
   documents too) is satisfied by any available copy: in `N`, or for a branch in a candidate
   serving it. A resource or namespace purge that would remove the last such copy, in any
@@ -1260,10 +1293,11 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
 
 - **Source side (A).** `POST /ns/{ns}/branches` with `{ "remote": { "origin", "ns" }, "at" }`
   registers (`If-None-Match: *`) or renews (`If-Match` with the latest entry's `ns_id`, same
-  `at`). It needs unrestricted `read` (§C.5) and `export`, is checked as an `export` envelope, is
-  rate-limited, appends a remote `branch` entry, is listed in `/branches` while unexpired, and
-  protects the head as of `at` from pruning for the registration lifetime
-  (`limits.remoteRegistration`, default `P30D`).
+  `at`). It needs unrestricted `read` (§C.5), checked as gate step 1 checks verbs, in a public
+  namespace too (v0.49), and `export`, is checked as an `export` envelope, is rate-limited,
+  appends a remote `branch` entry, is listed in `/branches` while unexpired, and protects the
+  head as of `at` from pruning for the registration lifetime (`limits.remoteRegistration`,
+  default `P30D`). In a purged namespace it is `410 purged`, with `head` (§8.5).
 - **Branch side (B): mirrored up front.** Before the write transaction, B fetches A's
   namespace log up to `at`, `/heads` as of `at`, every resource's log and the `$schema`/`$ref`
   closure, and verifies them all by recomputing ids; `/heads` must agree with the log. It then
@@ -1282,12 +1316,16 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   every base in A's chain: a base that answers `401`/`403`/`404` is `422`. A base that is a
   remote branch at A is refused (`422`).
 - **Schemas** are mirrored under the same paths into a non-branch namespace of that name on B,
-  created if missing with the branch's `read`, `keys` and `roles`, and the `nonce` setting of
-  its source at A (§C.7; `optional` if B can't read it). A path whose chain neither contains A's
-  nor is a prefix of it is `409 name_conflict`; a prefix is extended.
-- **Required nonces (§C.7).** A branch of a base that requires nonces must be created with
-  `"nonce": "required"` (`422` otherwise), or merging it back would fail; the shadow records
-  what A required at creation.
+  created if missing with the branch's `read`, `keys` and `roles`. Such a namespace starts
+  `optional` (§C.7), since its mirrored history keeps its ids, and takes its source's `nonce`
+  setting at A with a config write by the creating operator once that history is in, so later
+  writes there stay exportable; it stays `optional` if B can't read the source's namespace
+  document. A path whose chain neither contains A's nor is a prefix of it is
+  `409 name_conflict`; a prefix is extended.
+- **Required nonces (§C.7).** A branch of a base whose current namespace document requires
+  nonces when the branch is created must be created with `"nonce": "required"` (`422`
+  otherwise), or merging it back would fail. A remote branch isn't a dependent at A, so A may
+  start requiring nonces later; B's history must then be re-authored to merge.
 - **Encryption (§G.5.2).** B refuses a branch less protected than A's namespace as B reads it: a
   private base needs a private or sealed branch, a sealed base a sealed one (it may be public),
   an e2e base an e2e one; a base whose namespace document B can't read is refused (`422`), since its level can't be told. For a sealed base, B fetches keys with its own grant, whose `enc` names
@@ -1401,11 +1439,16 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
   before sealing, each on its own; ranges never are.
 - **`POST /ns/{ns}/keys`** `{ "epochs"?: [e…], "resources"?: [name…] }` → `{ "keys": [ { kid,
   resource?, key } ] }`, `Cache-Control: no-store`. It needs a verified grant with `read`
-  (also for a `read: "public"` sealed namespace); with `-dev` anyone gets epoch keys. A grant
-  that reads the namespace unrestricted (§C.5; with roles, through one without `/resource`
-  rules that passes) gets `K_e` (and `resources` is ignored); any other, restricted by rules on
-  `/resource` or a key with `readScope: "resource"`, gets `K_r` for each requested resource it
-  may read. Unlike the other `/ns/{ns}` URLs, it serves such grants.
+  (also for a `read: "public"` sealed namespace); with `-dev` anyone gets epoch keys. It
+  refuses as other reads do (§7): `401` without a usable grant, `403` for a grant that doesn't
+  name the namespace (ignored, so `401`, in a public one), `404` without `read`. A grant that
+  reads the namespace unrestricted (§C.5; with roles, through one without `/resource` rules
+  that passes) gets `K_e` (and `resources` is ignored); one restricted by rules on `/resource`
+  or a key with `readScope: "resource"` gets `K_r` for each requested resource it may read.
+  Unlike the other `/ns/{ns}` URLs, it serves such grants. Any other `read` grant, whose rules
+  refuse an unrestricted read and that has no read role referring to `/resource`, is `403`
+  (§E.2.3, v0.49). A purged namespace answers `410 purged`, with `head`, only after all of
+  that (§8.5).
   Epochs run from the one in force at the root block's `nbf` (without `nbf`: the first), capped
   to the last `encryption.historyEpochs`, up to the current one, never one that started at or
   after the grant's effective `exp`; requested epochs outside that are omitted. A root block
@@ -1414,11 +1457,13 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
   can't carry `enc`.
 - **`$nonce`.** Every create, append and restore patch set must end up setting `/$nonce` to 128
   fresh random bits (26 base32 characters, `seal.HasFreshNonce`) that differ from the previous
-  document's, or it is `422 invalid` — so schemas of sealed namespaces must allow `$nonce`. A
-  restore with `[]` is exempt: its id hashes the (public) tombstone id and `[]`, so it reveals
-  nothing, and the document it brings back was written with a nonce. Not where the namespace
-  also requires nonces (§C.7): there such a restore sends a lone fresh `$nonce`, and a write
-  without one is `422` with `code: "nonce"`, which comes before `invalid`.
+  document's, or it is `422` with `code: "nonce"` at gate step 3 (v0.49; it was `invalid`), the
+  code a namespace that requires nonces gives (§C.7); a failed `test` or patch is still
+  reported first, as `invalid`. Validation leaves the fresh top-level `$nonce` out (§6.2 step
+  5), so closed schemas needn't declare it. A restore with `[]` is exempt: its id hashes the
+  (public) tombstone id and `[]`, so it reveals nothing, and the document it brings back was
+  written with a nonce. Not where the namespace also requires nonces (§C.7): there such a
+  restore sends a lone fresh `$nonce`.
 - **Rotation.** A config write incrementing `encryption.epoch` (a `*` key, §7.4) rotates;
   earlier revisions keep their epoch and bytes. `-rotate-epochs 24h` rotates every sealed,
   unfrozen namespace whose epoch is that old, as `system:rotate` (`Engine.RotateEpoch`,
@@ -1544,6 +1589,14 @@ under `problems`. `-catalog` is repeatable (or comma-separated): each catalog ge
 service and database (`-db` with `{catalog}` replaced, or `-{catalog}` added before the
 extension) behind one origin, and `/_status` covers them all (`?catalog=` for one).
 
+Listings are kept like the search index's results (§A.4, §B.5, v0.49): every listing computed,
+the one at the `at` a redirect names included, is kept in memory for about a minute (at most
+64 MiB per catalog), and an `at` URL answers `200` while its listing is kept, so one redirect
+suffices at any write rate. They are keyed by their URL and by what the reader reads whole, so a
+reader whose namespace-wide reads changed since (a public namespace turned private) isn't served
+one kept from before; listings that depend on the individual reader aren't kept, and sealed ones
+are served only at their canonical URL. A purge drops the kept listings that show what it purged.
+
 With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 - `POST /grants` with `{ "node", "want": ["create"], "to": [folders] }` creates a folder
   (§B.11.4): `move` on every folder in `to`; the grant fixes the name and parents and, unless
@@ -1662,7 +1715,14 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
   written, and submits the rest directly; a failed submit lists its items as a dry run does. In
   a namespace the import creates, it dry-runs the first item of the first batch once the
   namespace exists, so a server that would give the revisions other ids stops it before
-  anything is written there. `-dry-run` dry-runs every batch and writes nothing.
+  anything is written there. A later batch that moves heads the target had (a fast-forward, a
+  resolved conflict, a restore; not a snapshot's diffs upstream, which no live reference sees)
+  is dry-run before its submit, its blobs sent first, since a failure after it would leave
+  those heads moved (§G.4.4, v0.49); fresh imports make no extra dry runs. `-dry-run`
+  dry-runs each existing namespace's first batch and those later ones, but for one that goes
+  on with a chain an earlier batch cut, reporting failures that only need earlier batches
+  written as deferred; it uploads no blobs (they show as deferred `blob` failures) and writes
+  nothing.
 - **Timings.** The summary's `time` line, and `timings` in `-json`, show where the time went:
   planning, blobs, batch requests (mostly the server's time), paced waits and waits after
   `429`s.
@@ -1853,9 +1913,20 @@ namespace document, its log, events and long-polls, `/heads`, `/branches`, `/gra
 some resources gets `404` there, as for any read it may not make, so it can't list the names
 and heads its reads hide; a resource's own URLs, its event stream included, need read on that
 resource only. Branching, remote registration and a batch's source check need unrestricted
-read too. A purged namespace answers `410` with `code: "purged"` on `/r/{ns}/…`,
-`/ns/{ns}/grants/…`, `/ns/{ns}/gestures/…` and `/heads` at any revision, after the read check;
-`/ns/{ns}` and its log stay readable, and the log's `purge-ns` entry says what happened.
+read too; branching and registration check it as gate step 1 checks verbs, in a public
+namespace too (v0.49): the grant must allow `read`, read unrestricted and pass its rules on
+`/action`, `/principal` and `/now` with `/action` `read`, rules on `/doc` left to step 6.
+
+A purged namespace (§8.5, §12) answers `410` with `code: "purged"` and `head`, the `ns_id` of
+its `purge-ns` entry, which is the log's last (v0.49), so a consumer needn't re-read
+`/ns/{ns}`: on `/r/{ns}/…`, `/ns/{ns}/grants/…`, `/ns/{ns}/gestures/…` (sealed and e2e
+namespaces included), `POST /ns/{ns}/keys` and `/heads` at any revision, after the read check,
+the grant's rules included; and on every write, after authorisation and rate limits and before
+any other check: resource writes, batches (one with a config change after its items'
+authorisation), blob uploads and copies, purges, prunes, config writes, namespace purges,
+branching from it and remote registration. `/ns/{ns}` and its log stay readable, and the log's
+`purge-ns` entry says what happened. The name stays reserved: creating a namespace or branch
+under it is `412`, also a retry of the request that created a branch since purged.
 
 `requireAt`: `at` must have been the head of its namespace at some point within `maxLag` before
 the grant was issued, issuance taken as `max(nbf, exp − maxTtl)` of the root block (`nbf` when
@@ -2121,7 +2192,8 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   and the last page has none. It answers any reader, listing only entries of resources its
   grant may read (a cursor naming another resource is `404`; v0.46, before it needed
   unrestricted read), answers `404 not_offered` in sealed and e2e namespaces after
-  authorisation, leaves out purged resources, and in a branch lists only the
+  authorisation (`410 purged` first in a purged one, v0.49), leaves out purged resources, and
+  in a branch lists only the
   branch's own rows, not what it reads through from its base (ask the base). Merges carry each
   fast-forwarded or replayed revision's gestures in their steps (§F.3), and remote branches
   mirror them; squashes don't. The client library sends them with `client.WithGesture`,
@@ -2130,10 +2202,11 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   (`Gestures` for batches) and lists with `Gestures`/`GesturesPage`; `client.NewGesture` makes
   an id.
 - **Query parameters** (§7): every core endpoint accepts only those the spec defines for it
-  (`since`, `live`, `cursor`, `after`, `dry-run=1`, `force=1`, each on its own routes), and
-  answers anything else, a repeated parameter or another flag value with `400 bad_input`,
-  `no-store`, before authentication.
-- **`GET /`** answers `{ "spec": "0.48", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+  (`since`, `live`, `cursor`, `after`, `dry-run=1`, `force=1`, each on its own routes, and
+  `prefix` on `DELETE /edge-grants`, the one that may repeat), and answers anything else, a
+  repeated parameter or another flag value with `400 bad_input`, `no-store`, before
+  authentication.
+- **`GET /`** answers `{ "spec": "0.49", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace
@@ -2150,10 +2223,11 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   resource, so a write, or a batch with an item for one, answers `410` like every URL of the
   resource, before the frozen check (purges are allowed in frozen namespaces). A retried
   batch whose config change is stale by then answers `410` too, not the config's `412`, which
-  would tell the client its change didn't apply when it did.
+  would tell the client its change didn't apply when it did. Nor does it apply in a purged
+  namespace, where every write is `410 purged`, with `head`, at that point (§8.5, v0.49).
 - **Blobs before a restore** (§7.8): a tombstoned resource accepts uploads (only a purged one
-  is `410`), so a restore can reference blobs uploaded after the delete, by a grant that may
-  only restore.
+  is `410`, and any upload to a purged namespace `410 purged`), so a restore can reference
+  blobs uploaded after the delete, by a grant that may only restore.
 - **A forced schema purge** (`POST …/purge?force=1`, §6.1) needs a deployment operator key, or in
   a branch a `*` key of the branch; its entries say `"forced": true`.
 
