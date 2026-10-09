@@ -32,9 +32,22 @@ func (s *Server) edgeCred(r *http.Request) *http.Request {
 	return r.WithContext(context.WithValue(r.Context(), edgeGrantKey{}, eg))
 }
 
+// referrerCache sets Cache-Control for a schema revision served under
+// schemaReads to a reader of a referrer (§6.1, core.Rev.Referrer). An
+// edge that knows only prefixes forwards such a read undecided, without
+// its verification, so it isn't refused for lacking it (edgeAllow): it is
+// private, and no shared cache stores it.
+func referrerCache(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "private, max-age=300")
+	edge.NoStore(w.Header())
+}
+
 // edgeGrants is POST /edge-grants (§C.5): with the grant in
 // Authorization, 200 with { prefixes, exp } and one Set-Cookie per
-// prefix, Path the prefix, Secure, HttpOnly, named per prefix. no-store.
+// prefix: Path the prefix (/r/{ns}/{name}, /r/{ns}, /ns/{ns}, covering
+// what lies below), Secure, HttpOnly, SameSite as the Cookies say (None
+// with credentialed origins, else Lax), named per prefix, until the
+// grant's exp or MaxGrantTTL, whichever is sooner. no-store.
 func (s *Server) edgeGrants(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	c := creds(r)

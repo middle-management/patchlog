@@ -599,7 +599,9 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 			w.Write([]byte(rev.JWE))
 		}
 	case rev.Status == 200:
-		if !s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...) {
+		if rev.Referrer {
+			referrerCache(w)
+		} else if !s.cache(w, r, ccImmutable, rev.Public, resTags(ns, name)...) {
 			return
 		}
 		w.Header().Set("ETag", quote(id))

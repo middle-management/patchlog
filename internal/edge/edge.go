@@ -94,9 +94,20 @@ func (v *Verifier) Allow(r *http.Request, public bool) bool {
 // It is only called for responses Allow admitted.
 func (v *Verifier) Private(h http.Header, lifetime string) {
 	if v == nil {
-		h.Set("CDN-Cache-Control", "no-store")
-		h.Set("Surrogate-Control", "no-store")
+		NoStore(h)
 		return
 	}
 	h.Set("CDN-Cache-Control", lifetime)
+}
+
+// NoStore sets the edge directives of a private response no shared cache
+// may store: every private response without a Verifier, and, whether or
+// not there is one, a read an edge that knows only prefixes forwards
+// undecided rather than refusing it, such as a schemaReads read under a
+// grant in Authorization (§6.1). Allow doesn't gate such a read: the
+// origin decides it from the grant, and no edge keeps a copy it would
+// serve by prefix.
+func NoStore(h http.Header) {
+	h.Set("CDN-Cache-Control", "no-store")
+	h.Set("Surrogate-Control", "no-store")
 }

@@ -45,6 +45,28 @@ func TestEdgeGrantCookies(t *testing.T) {
 			t.Fatalf("%s: %v", tc.path, got)
 		}
 	}
+	// A namespace prefix covers the namespace URL itself and what lies
+	// below, segment by segment (§C.5).
+	for _, tc := range []struct {
+		path string
+		ok   bool
+	}{{"/ns/ns", true}, {"/ns/ns/log", true}, {"/ns/ns/rev/x/heads", true}, {"/ns/ns2", false}, {"/ns", false}} {
+		if Covers("/ns/ns", tc.path) != tc.ok {
+			t.Fatalf("/ns/ns covers %s: %v", tc.path, !tc.ok)
+		}
+	}
+	// SameSite is the deployment's: None with credentialed origins.
+	c.SameSite = http.SameSiteNoneMode
+	if ck := c.Issue(Claims{Prefix: "/ns/ns", NS: "ns", Sub: "user:li", Exp: exp.Unix()}, now); ck.SameSite != http.SameSiteNoneMode || ck.Path != "/ns/ns" {
+		t.Fatalf("cookie %+v", ck)
+	}
+	// A read an edge forwards undecided is no-store for shared caches,
+	// with or without a Verifier.
+	h := http.Header{}
+	NoStore(h)
+	if h.Get("CDN-Cache-Control") != "no-store" || h.Get("Surrogate-Control") != "no-store" {
+		t.Fatalf("no-store %v", h)
+	}
 	// The key derived from an edge secret is the Verifier's.
 	v, _ := New([]byte("s3cret"), "")
 	if string(v.CookieKey()) != string(KeyFromSecret([]byte("s3cret"))) || (*Verifier)(nil).CookieKey() != nil {

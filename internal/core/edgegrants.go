@@ -13,12 +13,17 @@ import (
 // POST /edge-grants exchanges a grant with read for edge grants, one per
 // namespace the grant's ns names, each scoped to the smallest prefix the
 // grant allows: /r/{ns}/{name} when its read rules fix /resource, else
-// /r/{ns} and /ns/{ns}. The edge evaluates no rules, so a grant whose
-// read rules (its blocks', its key scope's, and those of the roles that
-// allow read) refer to /resource without fixing it, or to /now, gets none
-// (403), as does "*" and a grant without read in a namespace it names.
-// Rules over /principal and /action are constant for the edge grant's
-// reads, and are evaluated here.
+// /r/{ns} and /ns/{ns}. The edge evaluates no rules, so the grant's blocks
+// and its key's scope may refer to /resource only to fix it, and never to
+// /now. A grant with roles needs a role that lists read and qualifies: its
+// rules refer to neither /resource nor /now. Roles are alternatives, so
+// one is enough; a role whose rules test /resource doesn't qualify, even
+// when the blocks fix it. The rules that remain, over /principal and
+// /action, are constant for the edge grant's reads, and must pass here.
+// Anything else is 403, as are "*" and a grant without read in a
+// namespace it names. The answer is all or nothing: a namespace that
+// doesn't exist or refuses the grant refuses the request, 401 if any
+// would be 401, so it doesn't reveal which exist.
 //
 // The server turns them into cookies (internal/edge); a read under one
 // comes back as Credentials.Edge, which reader honours for that namespace
@@ -77,37 +82,22 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, cred Credentials) (*EdgeGr
 		}
 	}
 	err = e.read(ctx, func(t *tx) error {
+		var refused *Error
 		for _, ns := range root.NS {
 			if !g.NamesNS(ns) {
 				continue // a narrowing block leaves it out
 			}
-			n := t.nsByName(ns)
-			if n == nil {
-				return t.absentNS(ns, cred)
+			eg, err := t.edgeGrant(g, ns, cred)
+			if err != nil {
+				if refused == nil || refusalRank(err) < refusalRank(refused) {
+					refused = err
+				}
+				continue
 			}
-			cfg := t.config(n.configSeq)
-			a, aerr := t.verifyGrant(g, ns, n, cfg, nil)
-			if aerr != nil {
-				return aerr
-			}
-			if n.purged {
-				return gone()
-			}
-			ok, roles := a.verified.Allows("read")
-			if !ok {
-				return forbidden("the grant does not allow read in " + ns)
-			}
-			res, safe := edgeReadScope(a, roles)
-			if !safe {
-				return forbidden("the grant's read rules refer to /resource without fixing it, or to /now, which an edge can't evaluate (§C.5): " + ns)
-			}
-			if a.verified.Key.ReadScopeResource && res == "" {
-				return forbidden("the key's readScope needs a grant fixing /resource (§C.4)")
-			}
-			if !t.canRead(n, cfg, a, res) {
-				return forbidden("the grant's rules refuse reading " + ns)
-			}
-			out.Grants = append(out.Grants, EdgeGrant{NS: ns, Resource: res, Sub: a.principal.ID})
+			out.Grants = append(out.Grants, *eg)
+		}
+		if refused != nil {
+			return refused
 		}
 		return nil
 	})
@@ -120,18 +110,84 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, cred Credentials) (*EdgeGr
 	return out, nil
 }
 
-// edgeReadScope classifies the rules that decide a's reads: its blocks',
-// its key scope's and those of roles (the roles allowing read). It
-// returns the resource they fix, "" for none, and false if a rule refers
-// to /resource without fixing it, to /now or to the whole envelope, or if
-// rules fix different resources.
-func edgeReadScope(a *actor, roles []string) (string, bool) {
-	lists := [][]any{a.verified.KeyRules, a.verified.BlockRules}
-	for _, r := range roles {
-		lists = append(lists, a.verified.RoleRules(r))
+// refusalRank orders the refusals of an all-or-nothing answer (§C.5): 401
+// if any namespace's is, then 403, then the rest (410 for a purged one).
+func refusalRank(err *Error) int {
+	switch err.Status {
+	case 401:
+		return 0
+	case 403:
+		return 1
 	}
+	return 2
+}
+
+// edgeGrant decides g's edge grant in namespace ns (§C.5).
+func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*EdgeGrant, *Error) {
+	n := t.nsByName(ns)
+	if n == nil {
+		return nil, t.absentNS(ns, cred)
+	}
+	a, err := t.verifyGrant(g, ns, n, t.config(n.configSeq), nil)
+	if err != nil {
+		return nil, err
+	}
+	if n.purged {
+		return nil, gone()
+	}
+	ok, roles := a.verified.Allows("read")
+	if !ok {
+		return nil, forbidden("the grant does not allow read in " + ns)
+	}
+	res, safe := edgeReadScope(a)
+	if !safe {
+		return nil, forbidden("the grant's read rules refer to /resource without fixing it, or to /now, which an edge can't evaluate (§C.5): " + ns)
+	}
+	if a.verified.Key.ReadScopeResource && res == "" {
+		return nil, forbidden("the key's readScope needs a grant fixing /resource (§C.4)")
+	}
+	if a.verified.HasRoles() {
+		var q []string
+		for _, r := range roles {
+			if edgeRole(a.verified.RoleRules(r)) {
+				q = append(q, r)
+			}
+		}
+		if len(q) == 0 {
+			return nil, forbidden("no role of the grant that allows read qualifies for an edge grant: each has a rule referring to /resource or /now (§C.5): " + ns)
+		}
+		roles = q
+	}
+	// The blocks, the key scope and one qualifying role must pass now, for
+	// the principal: they decide every read under the prefix alike.
+	if t.grantRules(a, "read", roles, t.basicEnvelope("read", res, a), false) != nil {
+		return nil, forbidden("the grant's rules refuse reading " + ns)
+	}
+	return &EdgeGrant{NS: ns, Resource: res, Sub: a.principal.ID}, nil
+}
+
+// edgeRole reports whether a role's rules qualify it for an edge grant
+// (§C.5): none refers to /resource, /now or the whole envelope.
+func edgeRole(rules []any) bool {
+	for _, rv := range rules {
+		r, err := compileCached(rv)
+		if err != nil {
+			return false
+		}
+		if refs := r.Refs(); refs["resource"] || refs["now"] || refs["*"] {
+			return false
+		}
+	}
+	return true
+}
+
+// edgeReadScope classifies the rules of a's blocks and key scope, which
+// apply on top of its roles. It returns the resource they fix, "" for
+// none, and false if a rule refers to /resource without fixing it, to
+// /now or to the whole envelope, or if rules fix different resources.
+func edgeReadScope(a *actor) (string, bool) {
 	fixed := ""
-	for _, l := range lists {
+	for _, l := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
 		for _, rv := range l {
 			r, err := compileCached(rv)
 			if err != nil {
