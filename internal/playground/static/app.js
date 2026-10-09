@@ -702,7 +702,12 @@ async function writeRes(kind) {
   let r;
   if (kind === 'create') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-None-Match': '*', Gesture: gesture }, body: patch });
   else if (kind === 'append') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body: patch });
-  else if (kind === 'restore') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body: $('restoreEditor').checked ? patch : '[]' });
+  else if (kind === 'restore') {
+    // A restore that would be [] sends just a fresh nonce where nonces are required (§8.2, §C.7).
+    const lone = $('addNonce').checked && (S.nsDoc || {}).nonce === 'required';
+    const body = $('restoreEditor').checked ? patch : lone ? fmtPatch(withNonce([])) : '[]';
+    r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body });
+  }
   else if (kind === 'delete') r = await api('DELETE', rpath(), { headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture } });
   if (r && r.ok) noteGesture(r.hdr('Gesture') || gesture);
   if (r && (r.status === 201 || (kind === 'delete' && r.ok))) { S.ifDirty = false; await afterWrite(); }
@@ -1170,8 +1175,9 @@ async function undoReadRes(ns, site) {
   return { head, headKind, start, entries };
 }
 
-/* undoPlan plans the undo of gesture g in ns (§11.2): o = { author, level, limits, scanLog }. It returns
- * { gesture, author, source, resources, conflicts, items }; an undo that can't be done throws with .impossible. */
+/* undoPlan plans the undo of gesture g in ns (§11.2): o = { author, level, nonce (the namespace document's, §C.7),
+ * limits, scanLog }. It returns { gesture, author, source, resources, conflicts, items }; an undo that can't be done
+ * throws with .impossible. */
 async function undoPlan(ns, g, o = {}) {
   if (o.level === 'e2e') throw Object.assign(new Error('undo in an e2e namespace folds and seals the inverse client-side: use the Go client (client.Undo with UndoE2E); the playground does it for plaintext and sealed (E2) namespaces'), { refused: true });
   let found = null, source = 'gestures';
@@ -1199,7 +1205,7 @@ async function undoPlan(ns, g, o = {}) {
     let r;
     try {
       r = planUndoResource({ name: site.resource, head: rr.head, headKind: rr.headKind, start: rr.start, entries: rr.entries, gesture: g, author: found.author,
-        nonce: o.level === 'sealed', maxOps: lim.opsPerSet, maxBytes: lim.patchSetSize });
+        nonce: o.level === 'sealed' || o.nonce === 'required', maxOps: lim.opsPerSet, maxBytes: lim.patchSetSize });
     } catch (err) { if (err.pruned) err.impossible = 'pruned'; if (err.impossible) err.resource = site.resource; throw err; }
     if (!r) continue;
     plan.resources.push(r);
@@ -1314,7 +1320,7 @@ async function undoAction(target, label) {
   if (!GESTURE_RE.test(target || '')) return toast('A gesture id is 26 base32 characters');
   U.busy = true;
   try {
-    const res = await asUser(() => undoRun(S.ns, target, { level: S.nsLevel, limits: (S.nsDoc || {}).limits }));
+    const res = await asUser(() => undoRun(S.ns, target, { level: S.nsLevel, nonce: (S.nsDoc || {}).nonce, limits: (S.nsDoc || {}).limits }));
     renderUndoOut(label, res);
     if (res.ok) await afterWrite();
   } catch (err) {
@@ -1848,10 +1854,10 @@ function withNonce(ops) {
   return ops.filter((o) => !(o && o.path === '/$nonce' && (o.op === 'add' || o.op === 'replace'))).concat([{ op: 'add', path: '/$nonce', value: Z.newNonce() }]);
 }
 
-/* syncSealBoxes presets the write options for the selected namespace's level. */
+/* syncSealBoxes presets the write options for the selected namespace's level, and its nonce setting (§C.7). */
 function syncSealBoxes() {
   const sealed = S.nsLevel === 'sealed' || S.nsLevel === 'e2e';
-  $('addNonce').checked = sealed;
+  $('addNonce').checked = sealed || (S.nsDoc || {}).nonce === 'required';
   $('sealE2E').checked = S.nsLevel === 'e2e';
   $('sealE2E').disabled = S.nsLevel !== 'e2e';
 }
@@ -2072,8 +2078,8 @@ function renderBlobs(doc) {
 }
 
 /* attachFile uploads the chosen file as a blob of the selected resource (PUT …/blob/{bid}, §7.8) and inserts
- * its reference into the patch set in the editor. Sealed namespaces get a Blob-Nonce (§C.7); e2e ones get the
- * file encrypted here first (§E.3.1), with the key in the reference. */
+ * its reference into the patch set in the editor. Sealed namespaces, and those that require nonces, get a Blob-Nonce
+ * (§C.7, §7.8); e2e ones get the file encrypted here first (§E.3.1), with the key in the reference. */
 async function attachFile() {
   if (!S.ns || !S.res) return toast('Select a namespace and a resource name');
   const f = $('attachFile').files[0];
@@ -2092,7 +2098,7 @@ async function attachFile() {
       const e = await Z.encryptBlob(type, data, !!enc.pad);
       body = e.sealed; ct = Z.BLOB_TYPE; ref = e.ref;
     } else {
-      if (level === 'sealed') nonce = Z.newNonce();
+      if (level === 'sealed' || (info.doc || {}).nonce === 'required') nonce = Z.newNonce();
       ref = { $blob: await Z.blobID(type, nonce, data), type, size: data.length };
       if (nonce) ref.nonce = nonce;
     }
@@ -2925,6 +2931,7 @@ async function catCreateFolder() {
   const parent = $('catFParent').value;
   if (parent) { const p = { href: hrefOf(parent) }; if ($('catFOrder').value.trim()) p.order = $('catFOrder').value.trim(); doc.parents = [p]; }
   if (acc.v) doc.$access = acc.v;
+  if ((C.doc || {}).nonce === 'required') doc.$nonce = Z.newNonce();
   const r = await catWrite('New folder', 'PATCH', name, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: doc }] });
   if (r.ok) { C.sel = name; $('catFName').value = ''; renderCatalog(); }
 }
@@ -2976,6 +2983,8 @@ async function catMove() {
     });
     ops = [{ op: Array.isArray(n.doc.parents) ? 'replace' : 'add', path: '/parents', value: parents }];
   }
+  // A fresh nonce where the catalog requires them, or the node has one (§C.7).
+  if ((C.doc || {}).nonce === 'required' || '$nonce' in n.doc) ops = withNonce(ops);
   await catWrite('Move', 'PATCH', n.name, { ct: PJ, headers: { 'If-Match': quoteId(n.head) }, body: ops });
 }
 

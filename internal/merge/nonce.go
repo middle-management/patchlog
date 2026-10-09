@@ -34,6 +34,21 @@ func noncePlan(ctx context.Context, c *client.Client, target string) (*Plan, err
 	return p, nil
 }
 
+// stateNonce returns patches, a write to a document of the release tool's
+// state namespace ns (a stored plan or a lock), with a fresh $nonce added
+// at the end where one is needed (§C.7): ns requires nonces, or the
+// document as last read had one (had), which is all a merge service that
+// can't read the namespace document has to go by. It reports whether it
+// added one.
+func stateNonce(ctx context.Context, c *client.Client, ns string, had bool, patches []any) ([]any, bool) {
+	if !had {
+		if req, err := c.NonceRequired(ctx, ns); err != nil || !req {
+			return patches, false
+		}
+	}
+	return append(patches, map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()}), true
+}
+
 // nonceless returns doc without its top-level $nonce where the target
 // needs a fresh one, so a diff for it leaves the nonce out (§F.3 Nonces);
 // doc itself otherwise.

@@ -36,6 +36,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Branch is one listed branch: the branch namespace and the base revision
@@ -347,21 +348,41 @@ func Load(ctx context.Context, c *client.Client, link string) (*Loaded, error) {
 
 // Write stores doc as a new revision of the release document at ref,
 // replacing its whole content in one patch set with If-Match: parent (or
-// creating it if parent is ""). It returns the new revision.
+// creating it if parent is ""). The patch set adds a fresh $nonce where
+// one is needed (needsNonce). It returns the new revision.
 func Write(ctx context.Context, c *client.Client, ref Ref, parent string, doc *Doc) (string, error) {
 	if err := doc.Validate(); err != nil {
 		return "", err
 	}
 	val := jsonv.FromGo(doc.Value())
+	patches := []any{map[string]any{"op": "replace", "path": "", "value": val}}
+	if parent == "" {
+		patches = client.GenesisPatches(val)
+	}
+	if needsNonce(ctx, c, ref.NS, doc) {
+		patches = append(patches, map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()})
+	}
 	var res *client.WriteResult
 	var err error
 	if parent == "" {
-		res, err = c.CreateDoc(ctx, ref.NS, ref.Name, val)
+		res, err = c.Create(ctx, ref.NS, ref.Name, patches)
 	} else {
-		res, err = c.Append(ctx, ref.NS, ref.Name, parent, []any{map[string]any{"op": "replace", "path": "", "value": val}})
+		res, err = c.Append(ctx, ref.NS, ref.Name, parent, patches)
 	}
 	if err != nil {
 		return "", fmt.Errorf("release: writing %s: %w", ref.Live(), err)
 	}
 	return res.ID, nil
+}
+
+// needsNonce reports whether a write of doc to ns adds a fresh $nonce
+// (§C.7): ns requires nonces, or doc was read with one (kept in Extra),
+// which is all a writer that can't read the namespace document has to go
+// by. The fresh one replaces the old, which is never written back as is.
+func needsNonce(ctx context.Context, c *client.Client, ns string, doc *Doc) bool {
+	if _, had := doc.Extra["$nonce"]; had {
+		return true
+	}
+	req, err := c.NonceRequired(ctx, ns)
+	return err == nil && req
 }

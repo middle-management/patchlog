@@ -164,10 +164,10 @@
         <button id="btnAppend" class="primary" title="If-Match: head">Append</button>
         <button id="btnDelete" title="DELETE, If-Match">Delete</button>
         <button id="btnRestore" title="PATCH with If-Match: tombstone">Restore</button>
-        <label class="check"><input type="checkbox" id="restoreEditor"> restore with editor patches (else <code>[]</code>)</label>
+        <label class="check"><input type="checkbox" id="restoreEditor"> restore with editor patches (else <code>[]</code>, or a lone fresh <code>$nonce</code> where required)</label>
       </div>
       <div class="row">
-        <label class="check" title="Sealed and e2e namespaces refuse patch sets without a fresh $nonce (&sect;C.7, &sect;E.2.5)"><input type="checkbox" id="addNonce"> append a fresh <code>$nonce</code></label>
+        <label class="check" title="Sealed and e2e namespaces refuse patch sets without a fresh $nonce, and namespaces with &quot;nonce&quot;: &quot;required&quot; documents without one (&sect;C.7, &sect;E.2.5)"><input type="checkbox" id="addNonce"> append a fresh <code>$nonce</code></label>
         <label class="check" title="E3: seal the patch set in this browser under the namespace's current epoch key, bound to {ns, name, parent} (&sect;E.3.1)"><input type="checkbox" id="sealE2E"> seal client-side (e2e)</label>
         <button id="resendSealed" class="tiny" hidden title="Resend the exact ciphertext of the last sealed write, so a retry keeps its id (&sect;E.3.1)">resend last ciphertext</button>
       </div>

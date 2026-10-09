@@ -77,6 +77,10 @@ FUNCTIONS
   S.ns = 's';
   const e = await undoRun('s', input.gs, { level: 'sealed' });
   out.sealedE = { ok: !!e.ok, source: e.ok ? e.plan.source : '', steps: e.ok ? e.plan.items[0].steps : null, err: e.refused || e.impossible || '' };
+  // F: a namespace that came to require nonces after the gesture: the set gets a fresh one, though the document has none.
+  S.ns = 'n';
+  const f = await undoRun('n', input.gn, { nonce: 'required' });
+  out.nonceF = { ok: !!f.ok, steps: f.ok ? f.plan.items[0].steps : null, err: f.refused || f.impossible || '' };
   // The stack, rebuilt from the namespace log.
   S.ns = 'docs';
   const st = undoStackFrom(await undoNSLog('docs'), 'alice');
@@ -170,6 +174,15 @@ func TestUndoWithNode(t *testing.T) {
 		}
 		return d.Value.(map[string]any)["$nonce"].(string)
 	}()
+	// F: a namespace that comes to require nonces after the gesture (§C.7).
+	check(alice.CreateNamespace(ctx, "n", map[string]any{}))
+	w, err = alice.CreateDoc(ctx, "n", "a", map[string]any{"t": 1})
+	check(w, err)
+	gn := client.NewGesture()
+	check(alice.Append(ctx, "n", "a", w.ID, ops(op("replace", "/t", 2)), client.WithGesture(gn)))
+	nh, err := alice.NSHead(ctx, "n")
+	check(nh, err)
+	check(alice.PatchConfig(ctx, "n", nh.Config, ops(op("add", "/nonce", "required"))))
 	s.Clock.Advance(10 * time.Minute)
 	check(alice.Prune(ctx, "docs", "p", client.PruneRequest{Horizon: horizon}))
 	fk, err := alice.FetchKeys(ctx, "s", nil, nil)
@@ -194,7 +207,7 @@ func TestUndoWithNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	in, _ := json.Marshal(map[string]any{"base": s.URL, "author": "alice", "key": base64.RawURLEncoding.EncodeToString(fk[0].Key),
-		"g": g, "gd": gd, "gp": gp, "gm": gm, "gs": gs})
+		"g": g, "gd": gd, "gp": gp, "gm": gm, "gs": gs, "gn": gn})
 	inPath := filepath.Join(dir, "input.json")
 	if err := os.WriteFile(inPath, in, 0o644); err != nil {
 		t.Fatal(err)
@@ -234,6 +247,11 @@ func TestUndoWithNode(t *testing.T) {
 			OK          bool
 			Source, Err string
 			Steps       []any
+		}
+		NonceF struct {
+			OK    bool
+			Err   string
+			Steps []any
 		}
 		Stack struct{ Done, Undone []string }
 		E2E   string
@@ -298,6 +316,12 @@ func TestUndoWithNode(t *testing.T) {
 	}
 	if sd, _ := doc("s", "a"); sd["t"] != float64(1) || !seal.ValidNonce(sd["$nonce"].(string)) || sd["$nonce"] == oldNonce {
 		t.Errorf("s/a after the undo: %v", sd)
+	}
+	if !out.NonceF.OK || len(out.NonceF.Steps) != 1 || !strings.Contains(string(jsonv.Canonical(jsonv.FromGo(out.NonceF.Steps))), `"path":"/$nonce"`) {
+		t.Errorf("nonce F %+v", out.NonceF)
+	}
+	if nd, _ := doc("n", "a"); nd["t"] != float64(1) || !seal.ValidNonce(nd["$nonce"].(string)) {
+		t.Errorf("n/a after the undo: %v", nd)
 	}
 	// gd conflicted and gp was impossible, so both stand; g was undone and
 	// redone; gm was undone.

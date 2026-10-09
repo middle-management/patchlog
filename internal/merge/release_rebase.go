@@ -331,7 +331,9 @@ func squashDrafts(ctx context.Context, c *client.Client, p *Plan, drafts map[str
 				if err != nil {
 					return err
 				}
-				diff := Diff(bd.Value, doc)
+				// Where the target needs a fresh $nonce, Resolve adds
+				// one in place of both sides' (§F.3 Nonces, §C.7).
+				diff := Diff(p.nonceless(bd.Value), p.nonceless(doc))
 				if diff == nil {
 					diff = []any{}
 				}

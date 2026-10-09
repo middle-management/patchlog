@@ -12,6 +12,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/schemaimport"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/server"
 )
 
@@ -148,6 +149,48 @@ func TestSchemaImportPlanFiles(t *testing.T) {
 	item := ch["batches"].([]any)[0].(map[string]any)["items"].([]any)[0].(map[string]any)
 	if item["resource"] != "person" || item["ifMatch"] == nil {
 		t.Errorf("append item %v", item)
+	}
+}
+
+// §C.7: for a namespace that requires nonces, the planned items each add a
+// fresh $nonce, so the browser's batch is written at the predicted ids.
+func TestSchemaImportPlanRequiredNonces(t *testing.T) {
+	t.Parallel()
+	e := newSIEnv(t, false, Options{})
+	ctx := context.Background()
+	c := e.s.Client(t, client.WithAuthor("a"))
+	if _, err := c.CreateNamespace(ctx, "schemas", map[string]any{"read": "public", "nonce": "required"}); err != nil {
+		t.Fatal(err)
+	}
+	code, out := e.plan(map[string]any{"ns": "schemas", "files": files("person.json", personJSON, "address.json", addressJSON)})
+	if code != 200 {
+		t.Fatalf("%d %v", code, out)
+	}
+	b := out["batches"].([]any)[0].(map[string]any)
+	body, _ := json.Marshal(map[string]any{"items": b["items"]})
+	hr, _ := http.NewRequest("POST", e.s.URL+"/ns/schemas/batch", bytes.NewReader(body))
+	hr.Header.Set("Content-Type", "application/json")
+	hr.Header.Set("X-Author", "a")
+	res, err := http.DefaultClient.Do(hr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
+	if res.StatusCode != 201 {
+		t.Fatalf("batch: %d", res.StatusCode)
+	}
+	for i, x := range b["items"].([]any) {
+		name := x.(map[string]any)["resource"].(string)
+		h, d, err := c.Load(ctx, "schemas", name)
+		if err != nil || h.ID != b["ids"].([]any)[i] {
+			t.Fatalf("%s: head %+v %v, predicted %v", name, h, err, b["ids"].([]any)[i])
+		}
+		if n, _ := d.Value.(map[string]any)["$nonce"].(string); !seal.ValidNonce(n) {
+			t.Errorf("%s: $nonce %q", name, n)
+		}
+	}
+	if code, again := e.plan(map[string]any{"ns": "schemas", "files": files("person.json", personJSON, "address.json", addressJSON)}); code != 200 || again["changed"] != false {
+		t.Fatalf("re-plan: %d %v", code, again)
 	}
 }
 
