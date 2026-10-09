@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net/url"
 	"sort"
@@ -35,7 +34,8 @@ import (
 //	                    score (with q), then resource name
 //	counts=/path        facet counts over all hits (repeatable)
 //	fields=/a,/b        also show those indexed fields in hits, "text" ones included; a path
-//	                    no schema marks with x-index in the namespace is 400 (§A.4)
+//	                    no schema of the namespace's documents marks with x-index is 400,
+//	                    one a hit has no values at is left out of it (§A.4, checkFields)
 //	limit=n             page size, 1–100 (default 20)
 //	after=n             continue after the first n hits (from "next")
 //	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, or
@@ -583,15 +583,6 @@ func (ix *Index) attachRefs(ctx context.Context, tx *sql.Tx, ns string, rf *RefF
 
 // run executes q against ns inside tx. allow filters hits (nil = all).
 func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(resource string) bool) (*Result, error) {
-	for _, f := range q.Fields {
-		ok, err := ix.indexedField(ctx, tx, ns, f)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, &FieldError{Path: f}
-		}
-	}
 	fs := q.filters()
 	drive, err := ix.driver(ctx, tx, ns, q, fs)
 	if err != nil {
@@ -659,18 +650,6 @@ type FieldError struct{ Path string }
 
 func (e *FieldError) Error() string {
 	return "fields: " + e.Path + " is not a field any schema indexed in the namespace marks with x-index"
-}
-
-// indexedField reports whether some document of ns has indexed rows at path.
-func (ix *Index) indexedField(ctx context.Context, tx *sql.Tx, ns, path string) (bool, error) {
-	var one int
-	err := tx.QueryRowContext(ctx, `SELECT 1 WHERE EXISTS (SELECT 1 FROM facet WHERE ns = ? AND path = ?)
-		OR EXISTS (SELECT 1 FROM "sort" WHERE ns = ? AND path = ?)
-		OR EXISTS (SELECT 1 FROM "text" WHERE ns = ? AND path = ?)`, ns, path, ns, path, ns, path).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	return err == nil, err
 }
 
 // attachSorts gives each hit its sort values as written, for the paths

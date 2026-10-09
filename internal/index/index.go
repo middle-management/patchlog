@@ -104,7 +104,8 @@ type Options struct {
 	// lifetimes. Nil: there is none, and private responses are no-store
 	// for shared caches.
 	Edge *edge.Verifier
-	// Now is the clock for grant checks (default time.Now).
+	// Now is the clock for grant checks and kept results (default
+	// time.Now).
 	Now func() time.Time
 	// CheckerTTL is how long namespace documents are cached for grant
 	// checks before head pointers are re-read (default 30s).
@@ -135,6 +136,7 @@ type Index struct {
 	roots   map[string]bool
 	keys    *derived.Keys  // encryption of followed namespaces
 	sealed  *derived.Cache // sealed results
+	kept    *kept          // results kept past their checkpoint (kept.go)
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -181,7 +183,7 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		return nil, err
 	}
 	ix := &Index{
-		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db),
+		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db), kept: newKept(opt.Now),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		schemas: NewSchemaCache(opt.Client),
@@ -545,7 +547,10 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		return err
 	}
 	// Purge before the new checkpoint is out, so nobody who learns of it
-	// can still be served what it removed. Purgers don't block.
+	// can still be served what it removed. Purgers don't block. Kept
+	// results go first, after the commit: one read before it is then not
+	// kept (kept.generation).
+	ix.kept.purge(b.NS, tags)
 	if len(tags) > 0 {
 		ix.opt.Purger.PurgeTags(tags)
 	}
@@ -564,7 +569,8 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		ix.opt.OnApply(b)
 	}
 	// Housekeeping, once the checkpoint is out: only the current
-	// checkpoint's results are served, so older stored ones go.
+	// checkpoint's sealed results are stored, so older ones go (kept ones
+	// stay kept a while, in memory).
 	if err := ix.sealed.Retire(ctx, ix.db, b.NS, b.NewCheckpoint); err != nil {
 		ix.opt.Logf("index: retiring sealed results of %s: %v", b.NS, err)
 	}

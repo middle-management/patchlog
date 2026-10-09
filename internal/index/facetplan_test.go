@@ -584,17 +584,9 @@ func oldCandidateSQL(fts bool, ns string, q *Query) (string, []any) {
 	return sb.String(), args
 }
 
-// oldRun is run of v0.15.2.
+// oldRun is run of v0.15.2, less its check of fields, which reads the
+// schemas now (checkFields, in query).
 func (ix *Index) oldRun(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow func(resource string) bool) (*Result, error) {
-	for _, f := range q.Fields {
-		ok, err := ix.indexedField(ctx, tx, ns, f)
-		if err != nil {
-			return nil, err
-		}
-		if !ok {
-			return nil, &FieldError{Path: f}
-		}
-	}
 	stmt, args := oldCandidateSQL(ix.fts, ns, q)
 	rows, err := tx.QueryContext(ctx, stmt, args...)
 	if err != nil {
