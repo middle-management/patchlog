@@ -137,7 +137,7 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 		}
 	}
 	if key == nil {
-		return nil, unauth("unknown key %q", root.Kid)
+		return nil, unauth("no key can verify the grant")
 	}
 	if len(key.Pub) != ed25519.PublicKeySize {
 		return nil, unauth("bad root signature")

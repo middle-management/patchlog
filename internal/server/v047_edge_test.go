@@ -117,6 +117,15 @@ func TestV047EdgeGrantsAllOrNothing(t *testing.T) {
 			t.Errorf("%v: cookies set on a refusal: %v", c.ns, r.H.Values("Set-Cookie"))
 		}
 	}
+	// A namespace that doesn't list the key and one that doesn't exist
+	// answer alike, so the 401 doesn't reveal which exist (§C.4, §C.5).
+	if a, b := issue("sec3"), issue("nope"); a.Code != 401 || string(a.Body) != string(b.Body) {
+		t.Errorf("unlisted key %d %s, missing namespace %d %s", a.Code, a.Body, b.Code, b.Body)
+	}
+	if a, b := e.do(req{method: "GET", path: "/ns/sec3", bearer: e.grant(f.issuer, "user:bob", []string{"sec3"}, []string{"read"})}),
+		e.do(req{method: "GET", path: "/ns/nope", bearer: e.grant(f.issuer, "user:bob", []string{"nope"}, []string{"read"})}); a.Code != 401 || string(a.Body) != string(b.Body) {
+		t.Errorf("GET: unlisted key %d %s, missing namespace %d %s", a.Code, a.Body, b.Code, b.Body)
+	}
 }
 
 // v0.47 §C.5: cookie attributes. Path is the prefix without its trailing
