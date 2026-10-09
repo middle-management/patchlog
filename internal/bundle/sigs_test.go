@@ -721,7 +721,7 @@ func TestImportSignsItsOwnStepsNotTheOriginals(t *testing.T) {
 	for _, req := range cap.reqs {
 		steps += checkBatch(t, req, clienttest.Origin, signers[0], forbidden)
 	}
-	if steps < 2*2 { // the dry run and the submit each carry both steps
+	if steps < 2 { // the submit carries both steps (a namespace the import creates has no dry run)
 		t.Fatalf("saw %d signed steps in %d batches", steps, len(cap.reqs))
 	}
 

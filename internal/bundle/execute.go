@@ -19,6 +19,7 @@ import (
 type limits struct {
 	items, size       int
 	nsRate, principal float64
+	resource          float64 // ratePerResource, which an allowance doesn't replace
 	blobGrace         time.Duration
 	// allowance is the rate of the importer's allowance's bucket, which
 	// replaces the principal and namespace buckets (§6.6); 0 without one.
@@ -35,7 +36,7 @@ type limits struct {
 const allowanceMargin = time.Minute
 
 func defaultLimits() limits {
-	return limits{items: 1000, size: 16 << 20, nsRate: 500, principal: 50, blobGrace: 24 * time.Hour}
+	return limits{items: 1000, size: 16 << 20, nsRate: 500, principal: 50, resource: 10, blobGrace: 24 * time.Hour}
 }
 
 var sizeRE = regexp.MustCompile(`^(\d+)\s*(B|KiB|MiB|GiB)?$`)
@@ -82,6 +83,11 @@ func limitsOf(doc, al map[string]any) limits {
 	if r, ok := m["ratePerPrincipal"].(map[string]any); ok {
 		if x, ok := r["rate"].(float64); ok && x > 0 {
 			l.principal = x
+		}
+	}
+	if r, ok := m["ratePerResource"].(map[string]any); ok {
+		if x, ok := r["rate"].(float64); ok && x > 0 {
+			l.resource = x
 		}
 	}
 	if s, ok := m["blobGrace"].(string); ok {
@@ -320,21 +326,60 @@ func (im *importer) call(ctx context.Context, ns string, req client.BatchRequest
 	for attempt := 0; ; attempt++ {
 		at := im.opt.Now()
 		res, err := im.c.Batch(ctx, ns, req, dry)
-		if err == nil {
-			im.drew(ns, at, len(req.Items))
+		im.timed(&im.rep.Timings.Batches, at)
+		im.rep.Timings.Requests++
+		if dry {
+			im.rep.Timings.DryRuns++
+		}
+		if err == nil || blobsOnly(err) {
+			resources := make([]string, len(req.Items))
+			for i, it := range req.Items {
+				resources[i] = it.Resource
+			}
+			im.drew(ns, at, len(req.Items), resources...)
 		}
 		if err == nil || !client.Retryable(err) || attempt >= im.opt.MaxRetries || ctx.Err() != nil {
 			return res, err
 		}
-		wait := backoff
-		if ae, ok := client.AsAPIError(err); ok && ae.RetryAfter > 0 {
-			wait = ae.RetryAfter
-		}
-		backoff *= 2
-		if err := im.opt.Sleep(ctx, wait); err != nil {
+		if err := im.wait(ctx, err, backoff); err != nil {
 			return nil, err
 		}
+		backoff *= 2
 	}
+}
+
+// wait waits before retrying a request that failed with err: a 429's
+// retryAfter, else backoff.
+func (im *importer) wait(ctx context.Context, err error, backoff time.Duration) error {
+	if ae, ok := client.AsAPIError(err); ok && ae.RetryAfter > 0 {
+		backoff = ae.RetryAfter
+	}
+	if client.IsRateLimited(err) {
+		im.rep.Timings.RateLimited += backoff.Seconds()
+	}
+	return im.opt.Sleep(ctx, backoff)
+}
+
+// timed adds the time since t0 to a timing.
+func (im *importer) timed(s *float64, t0 time.Time) {
+	*s += im.opt.Now().Sub(t0).Seconds()
+}
+
+// blobsOnly reports a batch refused only for blobs that aren't available
+// to it (code "blob", §7.8): at step 4 of §6.2, after the request drew its
+// tokens (§6.6).
+func blobsOnly(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	if !ok || ae.Code != "batch" {
+		return false
+	}
+	items := ae.Items()
+	for _, it := range items {
+		if it["code"] != "blob" {
+			return false
+		}
+	}
+	return len(items) > 0
 }
 
 // deferrable codes: dry-run failures that are expected while an earlier
@@ -385,7 +430,7 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 	}
 	b.rep.Failures = failures
 	if len(failures) == 0 {
-		b.rep.DryRun, b.dryOK = "ok", true
+		b.rep.DryRun = "ok"
 		return nil
 	}
 	if allBlob && b.rep.ViaSource > 0 && !im.opt.DryRun {
@@ -468,9 +513,13 @@ func (im *importer) execute(ctx context.Context) error {
 	}
 
 	// Dry-run the first batch of every namespace before anything is
-	// written. A namespace that depends on earlier batches may fail only
-	// because they haven't committed; it is dry-run again before its
-	// submit.
+	// written: one that would fail stops the import with nothing written.
+	// A namespace that depends on earlier batches may fail only because
+	// they haven't committed; its submit tells. Later batches aren't
+	// dry-run: a batch is atomic, so a submit that fails writes nothing
+	// (§7.5), as its dry run would have failed, and a dry run draws the
+	// tokens a submit does (§6.6).
+	im.timed(&im.rep.Timings.Planning, im.start)
 	pending := map[string]bool{}
 	for _, n := range im.order {
 		b := n.batches[0]
@@ -484,9 +533,15 @@ func (im *importer) execute(ctx context.Context) error {
 			}
 			if !im.opt.DryRun {
 				// Blobs first (§G.4.4): uploads change no head, so they
-				// come before the dry run, which checks them too.
+				// come before the dry run, which checks them too. A
+				// backfill paces its dry runs as its batches (§G.4.4).
 				if err := im.prepare(ctx, b, lims[n], deferOK); err != nil {
 					return err
+				}
+				if im.opt.Mode == Backfill {
+					if err := im.pace(ctx, n.ns, lims[n], ""); err != nil {
+						return err
+					}
 				}
 			} else if err := im.dryRun(ctx, b, deferOK); err != nil {
 				// A dry-run-only import uploads none (§G.4.4).
@@ -525,29 +580,32 @@ func (im *importer) execute(ctx context.Context) error {
 				im.rep.Notes = append(im.rep.Notes, fmt.Sprintf("the importer's allowance in %s ends at %s (§6.6): batches %d to %d fit the namespace's own limits, paced at %g items/s (%s)",
 					n.ns, l.until.Format(time.RFC3339), i+1, len(n.batches), rate, by))
 			}
-			b, start := n.batches[i], im.opt.Now()
-			// Blobs first (§G.4.4), again if they may have expired since.
-			if !b.dryOK {
-				if err := im.prepare(ctx, b, lims[n], false); err != nil {
-					return err
-				}
-			} else if err := im.sendBlobs(ctx, b, lims[n]); err != nil {
-				return err
-			}
-			req, expected := im.request(b)
-			if im.signErr != nil {
-				return fmt.Errorf("import: %w", im.signErr)
-			}
-			res, err := im.call(ctx, n.ns, req, false)
+			b := n.batches[i]
+			res, expected, err := im.submit(ctx, b, lims[n])
 			if err != nil {
 				b.rep.Error = err.Error()
+				var failures []string
 				if ae, ok := client.AsAPIError(err); ok {
 					switch {
 					case ae.Status == 413 && im.opt.Mode == Atomic:
-						return &TooLargeError{NS: n.ns, Items: len(req.Items), Size: b.size, Err: err}
+						return &TooLargeError{NS: n.ns, Items: len(b.parts), Size: b.size, Err: err}
 					case ae.Status == 412:
 						return fmt.Errorf("import: the target moved while importing into %s (%w); import again: classification by ancestry picks up what is left", n.ns, err)
 					}
+					// The failing items, as a dry run lists them.
+					for _, it := range ae.Items() {
+						name := ""
+						if k, ok := it["index"].(float64); ok && int(k) < len(b.parts) {
+							name = b.parts[int(k)].it.name
+						}
+						code, _ := it["code"].(string)
+						msg, _ := it["message"].(string)
+						failures = append(failures, fmt.Sprintf("%s: %v %s %s", name, it["status"], code, msg))
+					}
+				}
+				if len(failures) > 0 {
+					b.rep.Failures = append(b.rep.Failures, failures...)
+					return fmt.Errorf("import: batch %d/%d into %s fails: %s (%w)", i+1, len(n.batches), n.ns, strings.Join(failures, "; "), err)
 				}
 				return fmt.Errorf("import: batch %d/%d into %s: %w", i+1, len(n.batches), n.ns, err)
 			}
@@ -561,7 +619,13 @@ func (im *importer) execute(ctx context.Context) error {
 				im.opt.Progress(b.rep)
 			}
 			if im.opt.Mode == Backfill {
-				if err := im.pace(ctx, n.ns, lims[n], len(req.Items), start); err != nil {
+				// A chain cut between this batch and the next draws on its
+				// resource's bucket again.
+				cut := ""
+				if p := b.parts[len(b.parts)-1]; p.to < len(p.it.steps) {
+					cut = p.it.name
+				}
+				if err := im.pace(ctx, n.ns, lims[n], cut); err != nil {
 					return err
 				}
 			}
@@ -570,44 +634,88 @@ func (im *importer) execute(ctx context.Context) error {
 	return nil
 }
 
-// pace waits after a backfill's batch into ns, begun at start, until the
-// bucket it paces by (limits.rate) has refilled what the batch drew, less
-// the time the batch took. Without an allowance that is its items, at Pace
-// of the rate. An allowance's bucket is paced at its full rate, so there it
-// counts every draw since the last batch (drew), as the bucket does: a dry
-// run draws as a submit does (§6.6, §7.5), a blob upload or copy a token
-// (§7.8), and the bucket refills between them, up to full. A 429 the
-// pacing doesn't avoid is retried after its Retry-After (call).
-func (im *importer) pace(ctx context.Context, ns string, l limits, items int, start time.Time) error {
-	rate, _ := l.rate(im.opt.Pace)
-	wait := time.Duration(float64(items)/rate*float64(time.Second)) - im.opt.Now().Sub(start)
-	if l.allowance > 0 {
-		var owed float64
-		var last time.Time
-		for _, d := range im.draws[ns] {
-			owed = max(0, owed-d.at.Sub(last).Seconds()*rate) + float64(d.tokens)
-			last = d.at
+// submit submits a batch, its blobs sent first (§G.4.4), again if they
+// may have expired since its dry run. A batch that fails only for blobs it
+// left to its local source, which doesn't make them available
+// (sourceHas), is submitted again with them sent, as prepare does after a
+// dry run: it wrote nothing (§7.5).
+func (im *importer) submit(ctx context.Context, b *batch, l limits) (*client.BatchResult, []string, error) {
+	if err := im.sendBlobs(ctx, b, l); err != nil {
+		return nil, nil, err
+	}
+	req, expected := im.request(b)
+	if im.signErr != nil {
+		return nil, nil, fmt.Errorf("import: %w", im.signErr)
+	}
+	res, err := im.call(ctx, b.n.ns, req, false)
+	if err != nil && b.rep.ViaSource > 0 && blobsOnly(err) {
+		if err := im.sendAll(ctx, b, l); err != nil {
+			return nil, nil, err
 		}
-		wait = time.Duration(owed/rate*float64(time.Second)) - im.opt.Now().Sub(last)
+		res, err = im.call(ctx, b.n.ns, req, false)
+	}
+	return res, expected, err
+}
+
+// pace waits after a backfill's batch request into ns until the buckets it
+// draws on have refilled what the import drew there since it last paced
+// (drew): every batch request, dry runs included (§6.6, §7.5), and a token
+// for every blob upload or copy (§7.8). It counts on no burst: a bucket is
+// taken to hold none to spare at the first draw, and refills between
+// draws. The bucket it paces by
+// (limits.rate) refills at Pace of the lower of the namespace's and the
+// principal's rates, or at an allowance's full rate, which holds up no
+// other writer (§G.4.4). cut, if not "", is a resource the next batch
+// writes again, whose own bucket an allowance doesn't replace: the
+// import's draws on it are repaid at ratePerResource too. A 429 the pacing
+// doesn't avoid is retried after its retryAfter (call).
+func (im *importer) pace(ctx context.Context, ns string, l limits, cut string) error {
+	rate, _ := l.rate(im.opt.Pace)
+	wait := im.owed(ns, rate, "")
+	if cut != "" {
+		wait = max(wait, im.owed(ns, l.resource, cut))
 	}
 	delete(im.draws, ns)
 	if wait <= 0 {
 		return nil
 	}
+	im.rep.Timings.Paced += wait.Seconds()
 	return im.opt.Sleep(ctx, wait)
 }
 
+// owed is how long from now a bucket that refills at rate takes to refill
+// the import's draws on it in ns since it last paced: on resource's own
+// bucket if resource isn't "".
+func (im *importer) owed(ns string, rate float64, resource string) time.Duration {
+	var owed float64
+	var last time.Time
+	for _, d := range im.draws[ns] {
+		tokens := d.tokens
+		if resource != "" {
+			if !slices.Contains(d.resources, resource) {
+				continue
+			}
+			tokens = 1
+		}
+		owed = max(0, owed-d.at.Sub(last).Seconds()*rate) + float64(tokens)
+		last = d.at
+	}
+	return time.Duration(owed/rate*float64(time.Second)) - im.opt.Now().Sub(last)
+}
+
 // draw is what an import drew from a target namespace's rate buckets, and
-// when (pace).
+// when (pace): tokens from the principal and namespace buckets, or the
+// allowance's, and one from each resource's own.
 type draw struct {
-	at     time.Time
-	tokens int
+	at        time.Time
+	tokens    int
+	resources []string
 }
 
 // drew records tokens drawn from ns's buckets by a request sent at at.
-func (im *importer) drew(ns string, at time.Time, tokens int) {
+func (im *importer) drew(ns string, at time.Time, tokens int, resources ...string) {
 	if im.draws == nil {
 		im.draws = map[string][]draw{}
 	}
-	im.draws[ns] = append(im.draws[ns], draw{at, tokens})
+	im.draws[ns] = append(im.draws[ns], draw{at, tokens, resources})
 }

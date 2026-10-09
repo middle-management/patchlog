@@ -76,14 +76,16 @@ type ImportOptions struct {
 	// Mode is required: Atomic or Backfill.
 	Mode ImportMode
 	// Pace is the fraction of the namespace rate a backfill uses (default
-	// 0.5). The rate is the target namespace's ratePerNamespace, capped by
-	// ratePerPrincipal (the importer's own bucket, which would answer 429
-	// first). An importer with an allowance in the target namespace (§6.6;
-	// its sub and kid as client.Principal reads them) goes by that
-	// instead: batches of the allowance's itemsPerBatch and batchSize where
-	// it sets them, paced at the full rate of its bucket where it has one,
-	// which holds up no other writer. From a minute before the allowance's
-	// until, the rest are split again and paced by the namespace's limits.
+	// 0.5), counting every request, dry runs included (§G.4.4). The rate is
+	// the target namespace's ratePerNamespace, capped by ratePerPrincipal
+	// (the importer's own bucket, which would answer 429 first). An
+	// importer with an allowance in the target namespace (§6.6; its sub and
+	// kid as client.Principal reads them) goes by that instead: batches of
+	// the allowance's itemsPerBatch and batchSize where it sets them, paced
+	// at the full rate of its bucket where it has one, which holds up no
+	// other writer. From a minute before the allowance's until, the rest
+	// are split again and paced by the namespace's limits. Either way a
+	// chain cut between batches goes no faster than ratePerResource.
 	Pace float64
 	// DryRun classifies, checks and dry-runs every batch that can be
 	// dry-run, and writes nothing.
@@ -187,7 +189,7 @@ type BatchReport struct {
 	Steps     int            `json:"steps"`
 	Size      int            `json:"size"` // bytes of canonical patch sets
 	Source    map[string]any `json:"source"`
-	DryRun    string         `json:"dryRun,omitempty"` // ok, deferred, failed
+	DryRun    string         `json:"dryRun,omitempty"` // ok, deferred, failed; "" if not dry-run (only a namespace's first batch is)
 	Status    int            `json:"status,omitempty"` // submit status
 	NSID      string         `json:"ns_id,omitempty"`
 	Error     string         `json:"error,omitempty"`
@@ -218,6 +220,26 @@ type Report struct {
 	Order        []string        `json:"order"`
 	Batches      []*BatchReport  `json:"batches"`
 	Notes        []string        `json:"notes,omitempty"`
+	Timings      Timings         `json:"timings"`
+}
+
+// Timings say where an import's time went, in seconds.
+type Timings struct {
+	Total float64 `json:"total"`
+	// Planning is the time before the first batch request or blob upload:
+	// reading the bundle and the target, classifying and splitting.
+	Planning float64 `json:"planning"`
+	// Blobs is the time blob uploads and copies took (§G.4.4).
+	Blobs float64 `json:"blobs"`
+	// Batches is the time Requests batch requests took, DryRuns of them dry
+	// runs: mostly the server's.
+	Batches  float64 `json:"batches"`
+	Requests int     `json:"requests"`
+	DryRuns  int     `json:"dryRuns"`
+	// Paced is the time a backfill waited between batches (§G.4.4), and
+	// RateLimited the time spent waiting after 429s (§6.6).
+	Paced       float64 `json:"paced"`
+	RateLimited float64 `json:"rateLimited"`
 }
 
 // Doc returns the report of a source document.
@@ -263,7 +285,8 @@ type TooLargeError struct {
 func (e *TooLargeError) Error() string {
 	return fmt.Sprintf("import: the atomic batch into %s (%d items, %d bytes of patch sets) is over the namespace's batch limits (%v). "+
 		"An import that must land at once runs as one batch under an allowance (§6.6): an administrator adds "+
-		`{"sub", "kid", "bucket": {"rate", "burst"}, "itemsPerBatch", "batchSize"} for the importer's principal to /allowances of %s. `+
+		`{"sub", "kid", "bucket": {"rate", "burst"}, "itemsPerBatch", "batchSize"} for the importer's principal to /allowances of %s, `+
+		"within the deployment maximums (1000 items and 16 MiB unless raised with patchlog serve -max-items-per-batch and -max-batch-size). "+
 		"Otherwise import in backfill mode (-pace), which splits the import into batches that fit and is not atomic.",
 		e.NS, e.Items, e.Size, e.Err, e.NS)
 }
@@ -335,7 +358,6 @@ type batch struct {
 	parts []part
 	size  int
 	rep   *BatchReport
-	dryOK bool
 }
 
 type part struct {
@@ -351,7 +373,8 @@ type importer struct {
 	docs   map[string]*bdoc
 	keys   []string
 	rep    *Report
-	local  bool // the bundle's origin is the target's own
+	local  bool      // the bundle's origin is the target's own
+	start  time.Time // when the import began (Timings)
 
 	origin  string // the target deployment's origin, for signing
 	signErr error  // a step that request couldn't sign
@@ -413,12 +436,13 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 	if opt.Now == nil {
 		opt.Now = time.Now
 	}
-	im := &importer{c: c, opt: opt, docs: map[string]*bdoc{}, up: map[string]*upPlan{},
+	im := &importer{c: c, opt: opt, docs: map[string]*bdoc{}, up: map[string]*upPlan{}, start: opt.Now(),
 		points: map[string]map[string]point{}, schemas: map[string]any{}, nodes: map[string]*node{}, listed: map[string]*listing{}}
 	if err := im.load(open); err != nil {
 		return nil, err
 	}
 	im.rep = &Report{Origin: im.h.Origin, Digest: im.digest, Mode: opt.Mode, DryRun: opt.DryRun}
+	defer im.timed(&im.rep.Timings.Total, im.start)
 	to, err := c.Origin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("import: target origin: %w", err)
@@ -430,6 +454,12 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 		im.rep.Notes = append(im.rep.Notes, "the bundle comes from this deployment: batch sources carry no origin, so the server checks source.at against source.ns (§7.5)")
 	}
 	if err := im.checkAccess(ctx); err != nil {
+		// Its reads are the import's first requests to the target
+		// namespaces (existing).
+		if client.IsAuth(err) {
+			err = fmt.Errorf("%w; the import's grant needs read and write (create, append, …) in every target namespace, from a key it lists, "+
+				"and an allowance there for speed (§6.6); an operator grant only creates namespaces (§C.4), so create missing ones first", err)
+		}
 		return im.rep, err
 	}
 	if err := im.check(ctx); err != nil {

@@ -14,7 +14,7 @@ type APIError struct {
 	Status     int            // HTTP status
 	Code       string         // §12 code, e.g. "stale", "gone", "pruned"
 	Body       map[string]any // the whole error body (may be nil)
-	RetryAfter time.Duration  // from Retry-After (429), zero if absent
+	RetryAfter time.Duration  // from a 429's retryAfter, else Retry-After; zero if absent
 	Method     string
 	Path       string
 }
@@ -95,7 +95,11 @@ func (e *APIError) Items() []map[string]any {
 func (r *response) apiError() *APIError {
 	e := &APIError{Status: r.status, Body: r.obj(), Method: r.method, Path: r.path}
 	e.Code = str(e.Body, "code")
-	if ra := r.header.Get("Retry-After"); ra != "" {
+	// A 429's body gives the wait in decimal seconds; Retry-After only in
+	// whole ones, rounded up (§6.6).
+	if s, ok := e.Body["retryAfter"].(float64); ok && s >= 0 && r.status == 429 {
+		e.RetryAfter = time.Duration(s * float64(time.Second))
+	} else if ra := r.header.Get("Retry-After"); ra != "" {
 		if n, err := strconv.Atoi(ra); err == nil && n >= 0 {
 			e.RetryAfter = time.Duration(n) * time.Second
 		} else if t, err := time.Parse(time.RFC1123, ra); err == nil {

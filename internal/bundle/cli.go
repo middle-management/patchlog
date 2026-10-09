@@ -327,9 +327,10 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	nsSpec := fs.String("ns", "", "target namespaces: name, or src=dst to map a source namespace (comma-separated)")
 	in := fs.String("i", "", "bundle file")
 	dry := fs.Bool("dry-run", false, "classify, check and dry-run every batch; write nothing")
-	atomic := fs.Bool("atomic", false, "one batch per namespace (large imports need an allowance, §6.6)")
-	pace := fs.String("pace", "", "backfill: split batches to fit the limits and pace them at this fraction of the namespace rate, e.g. 0.5; "+
-		"an allowance of the importer's own in a namespace sets its batches and full rate there instead (§6.6)")
+	atomic := fs.Bool("atomic", false, "one batch per namespace; over the namespace's limits it needs an allowance there, up to the deployment "+
+		"maximums (patchlog serve -max-items-per-batch, -max-batch-size; by default 1000 items, 16 MiB) (§6.6)")
+	pace := fs.String("pace", "", "backfill: split batches to fit the limits and pace them, dry runs included, at this fraction of the lower of "+
+		"the namespace's and the importer's rate, e.g. 0.5; an allowance of the importer's own in a namespace sets its batches and full rate there instead (§6.6)")
 	bearer := fs.String("bearer", "", "grant sent as Authorization: Bearer")
 	author := fs.String("author", "", "X-Author (development servers only)")
 	create := fs.Bool("create", true, "create missing target and upstream namespaces")
@@ -449,7 +450,10 @@ func printReport(w io.Writer, r *Report) {
 		fmt.Fprintf(w, "  create namespace %s\n", ns)
 	}
 	for _, b := range r.Batches {
-		fmt.Fprintf(w, "  batch %d/%d into %s: %d items, %d steps, %d bytes, dry run %s", b.Part, b.Parts, b.NS, len(b.Resources), b.Steps, b.Size, b.DryRun)
+		fmt.Fprintf(w, "  batch %d/%d into %s: %d items, %d steps, %d bytes", b.Part, b.Parts, b.NS, len(b.Resources), b.Steps, b.Size)
+		if b.DryRun != "" {
+			fmt.Fprintf(w, ", dry run %s", b.DryRun)
+		}
 		if b.NSID != "" {
 			fmt.Fprintf(w, ", committed %s", b.NSID)
 		}
@@ -461,6 +465,9 @@ func printReport(w io.Writer, r *Report) {
 	for _, n := range r.Notes {
 		fmt.Fprintf(w, "  note: %s\n", n)
 	}
+	t := r.Timings
+	fmt.Fprintf(w, "  time %.1fs: planning %.1fs, blobs %.1fs, batch requests %.1fs (%d of them, %d dry runs; mostly the server's time), paced %.1fs, after 429s %.1fs\n",
+		t.Total, t.Planning, t.Blobs, t.Batches, t.Requests, t.DryRuns, t.Paced, t.RateLimited)
 	if u := r.Unresolved(); len(u) > 0 {
 		fmt.Fprintf(w, "%d unresolved conflicts: resolve each with -resolve ns/name=skip|take|replay\n", len(u))
 	}

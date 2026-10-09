@@ -20,10 +20,12 @@ import (
 
 // headsTransport counts an importer's head lookups (GET /r/{ns}/{name})
 // and listing pages (GET /ns/{ns}/rev/{id}/heads), and with block answers
-// the pages 503, which leaves the import to its lookups. With race set,
-// it runs race once, before the first batch (dry: dry run) is sent.
+// the pages 503, which leaves the import to its lookups; with purged, every
+// page after the first 410, as a namespace purged while it is listed does
+// (§8.5). With race set, it runs race once, before the first batch (dry:
+// dry run) is sent.
 type headsTransport struct {
-	block          bool
+	block, purged  bool
 	lookups, pages atomic.Int64
 	dry            bool
 	race           func()
@@ -33,9 +35,13 @@ type headsTransport struct {
 func (h *headsTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	switch {
 	case r.Method == "GET" && strings.HasSuffix(r.URL.Path, "/heads"):
-		h.pages.Add(1)
+		n := h.pages.Add(1)
 		if h.block {
 			return &http.Response{StatusCode: 503, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("{}")), Request: r}, nil
+		}
+		if h.purged && n > 1 {
+			return &http.Response{StatusCode: 410, Header: http.Header{"Content-Type": {"application/json"}},
+				Body: io.NopCloser(strings.NewReader(`{"code":"purged"}`)), Request: r}, nil
 		}
 	case r.Method == "GET" && strings.HasPrefix(r.URL.Path, "/r/") && strings.Count(r.URL.Path, "/") == 3:
 		h.lookups.Add(1)
@@ -43,6 +49,13 @@ func (h *headsTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 		h.once.Do(h.race)
 	}
 	return http.DefaultTransport.RoundTrip(r)
+}
+
+// reportJSON is an import's report without its timings, to compare
+// imports by.
+func reportJSON(rep *bundle.Report) []byte {
+	rep.Timings = bundle.Timings{}
+	return must(json.MarshalIndent(rep, "", " "))
 }
 
 // importer is a client of d whose requests go through h.
@@ -166,7 +179,7 @@ func testHeadsListing(t *testing.T, mode string, sealed, branch bool) {
 				delete(br.Source, "ids")
 			}
 		}
-		return rep, must(json.MarshalIndent(rep, "", " "))
+		return rep, reportJSON(rep)
 	}
 	looked, listed := &headsTransport{block: true}, &headsTransport{}
 	_, want := run(looked)
@@ -251,7 +264,7 @@ func TestHeadsPartialListing(t *testing.T) {
 				if err != nil {
 					t.Fatalf("import: %v", err)
 				}
-				return must(json.MarshalIndent(rep, "", " "))
+				return reportJSON(rep)
 			}
 			looked, listed := &headsTransport{block: true}, &headsTransport{}
 			if want, got := run(looked), run(listed); string(got) != string(want) {
@@ -261,6 +274,39 @@ func TestHeadsPartialListing(t *testing.T) {
 				t.Fatalf("not a partial listing: %d pages and %d lookups, against %d lookups", listed.pages.Load(), listed.lookups.Load(), looked.lookups.Load())
 			}
 		})
+	}
+}
+
+// A listing that answers 410 is of a namespace purged since its document
+// was read (§8.5): it is dropped, and every name looked up one by one, as
+// for a frozen namespace, which then answers 410 for each. Here the second
+// page answers 410 and the target isn't purged, so the lookups classify as
+// they do without a listing.
+func TestHeadsListingPurged(t *testing.T) {
+	t.Parallel()
+	src, dst := newDeployment(t, stagingOrigin, pageSize(3)), newDeployment(t, cmsOrigin, pageSize(3))
+	src.ns("m", nil)
+	for i := 0; i < 30; i++ {
+		src.create("m", fmt.Sprintf("d%02d", i), map[string]any{"v": i})
+	}
+	b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"m"}})
+	importB(t, dst, b, bundle.ImportOptions{})
+	src.append("m", "d00", op("replace", "/v", "src"))
+	b, _ = exportFrom(t, src, bundle.ExportOptions{Select: []string{"m"}})
+	run := func(h *headsTransport) []byte {
+		rep, err := bundle.Import(ctx, dst.importer(h), bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic, DryRun: true})
+		noErr(t, err)
+		if d := rep.Doc("m/d00"); d.Class != "fast-forward" {
+			t.Fatalf("d00: %+v", d)
+		}
+		return reportJSON(rep)
+	}
+	looked, purged := &headsTransport{block: true}, &headsTransport{purged: true}
+	if want, got := run(looked), run(purged); string(got) != string(want) {
+		t.Fatalf("listed:\n%s\nlooked up:\n%s", got, want)
+	}
+	if purged.pages.Load() != 2 || purged.lookups.Load() != looked.lookups.Load() {
+		t.Fatalf("%d pages and %d lookups, want 2 and %d", purged.pages.Load(), purged.lookups.Load(), looked.lookups.Load())
 	}
 }
 
@@ -299,7 +345,7 @@ func TestHeadsListingLarge(t *testing.T) {
 			run := func(h *headsTransport) []byte {
 				rep, err := bundle.Import(ctx, dst.importer(h), bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic, DryRun: true})
 				noErr(t, err)
-				return must(json.MarshalIndent(rep, "", " "))
+				return reportJSON(rep)
 			}
 			looked, listed := &headsTransport{block: true}, &headsTransport{}
 			if want, got := run(looked), run(listed); string(got) != string(want) {
@@ -378,7 +424,7 @@ func TestHeadsListingE2E(t *testing.T) {
 				t.Fatalf("%s: %+v, want %s", name, d, class)
 			}
 		}
-		return must(json.MarshalIndent(rep, "", " "))
+		return reportJSON(rep)
 	}
 	looked, listed := &headsTransport{block: true}, &headsTransport{}
 	if want, got := run(looked), run(listed); string(got) != string(want) {
