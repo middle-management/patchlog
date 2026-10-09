@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.16.0
 
 Implements spec **v0.49**. v0.47 settles all sixteen of the reference's v0.46 notes, most as
 the reference did them; v0.48 adds withdrawing edge-grant cookies, references across
