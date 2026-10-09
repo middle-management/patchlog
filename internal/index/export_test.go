@@ -18,6 +18,11 @@ func (ix *Index) SealedViews() map[string]string {
 	return out
 }
 
+// ExpireGrantChecks drops the namespace documents the grant checker has
+// cached (tests): the next check reads them from the core again, as one
+// after CheckerTTL would.
+func (ix *Index) ExpireGrantChecks() { ix.checker.Invalidate() }
+
 // CountRows counts every row the index holds for ns (tests).
 func (ix *Index) CountRows(ns string) int {
 	total := 0

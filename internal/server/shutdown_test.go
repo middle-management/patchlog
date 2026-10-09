@@ -203,7 +203,7 @@ func TestShutdownWriteInFlightCompletes(t *testing.T) {
 	if !<-done {
 		t.Fatal("shutdown not clean")
 	}
-	if _, err := http.Get(s.srv.URL + "/r/docs/a"); err == nil {
+	if _, err := httpClient.Get(s.srv.URL + "/r/docs/a"); err == nil {
 		t.Fatal("still serving after shutdown")
 	}
 

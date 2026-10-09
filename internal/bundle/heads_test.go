@@ -48,7 +48,7 @@ func (h *headsTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	case r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/batch") && h.race != nil && (r.URL.Query().Get("dry-run") == "1") == h.dry:
 		h.once.Do(h.race)
 	}
-	return http.DefaultTransport.RoundTrip(r)
+	return transport.RoundTrip(r)
 }
 
 // reportJSON is an import's report without its timings, to compare

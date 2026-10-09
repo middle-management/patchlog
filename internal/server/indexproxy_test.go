@@ -64,7 +64,7 @@ func TestIndexProxy(t *testing.T) {
 	req, _ := http.NewRequest("GET", front.URL+"/playground/index/demo?q=derby&min=demo:1aaa", nil)
 	req.Header.Set("Authorization", "Bearer tok")
 	req.Header.Set("Cookie", "session=secret")
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +83,7 @@ func TestIndexProxy(t *testing.T) {
 		t.Fatalf("headers: %v", res.Header)
 	}
 
-	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	noFollow := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	for path, want := range map[string]string{
 		"/playground/index/demo?q=a+b&min=1aaa": "/playground/index/demo/at/1aaa?q=a+b",
 		"/playground/index/g/1xyz/demo":         "/playground/index/g/1xyz/demo/at/1aaa",
@@ -101,7 +101,7 @@ func TestIndexProxy(t *testing.T) {
 
 	// HEAD and the status document are allowed.
 	for _, p := range []string{"/playground/index/demo/at/1aaa?q=x", "/playground/index/_status"} {
-		res, err = http.Head(front.URL + p)
+		res, err = httpClient.Head(front.URL + p)
 		if err != nil || res.StatusCode != 200 {
 			t.Fatalf("HEAD %s: %v %v", p, err, res)
 		}
@@ -111,7 +111,7 @@ func TestIndexProxy(t *testing.T) {
 	n := len(*seen)
 	for _, m := range []string{"POST", "PUT", "PATCH", "DELETE"} {
 		req, _ := http.NewRequest(m, front.URL+"/playground/index/demo", strings.NewReader(`{}`))
-		res, err := http.DefaultClient.Do(req)
+		res, err := httpClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,7 +125,7 @@ func TestIndexProxy(t *testing.T) {
 	}
 
 	// The prefix itself tells the playground the proxy is there.
-	res, err = http.Get(front.URL + "/playground/index/")
+	res, err = httpClient.Get(front.URL + "/playground/index/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +147,7 @@ func TestIndexProxyBasePath(t *testing.T) {
 	}
 	front := httptest.NewServer(h)
 	defer front.Close()
-	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	noFollow := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	res, err := noFollow.Get(front.URL + "/playground/index/demo?q=x")
 	if err != nil {
 		t.Fatal(err)

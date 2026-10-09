@@ -20,7 +20,7 @@ func (e *tenv) openSSE(path string, hdr map[string]string) (<-chan sseEvent, *ht
 	for k, v := range hdr {
 		hr.Header.Set(k, v)
 	}
-	r, err := http.DefaultClient.Do(hr)
+	r, err := httpClient.Do(hr)
 	if err != nil {
 		cancel()
 		e.t.Fatal(err)

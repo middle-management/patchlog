@@ -119,7 +119,7 @@ func TestConcurrentFetch(t *testing.T) {
 
 	run := func(conc int, fail *failing) (*revFetches, string) {
 		t.Helper()
-		rf := &revFetches{prefix: "/r/matches/", delay: 5 * time.Millisecond, rt: http.DefaultTransport, paths: map[string]int{}}
+		rf := &revFetches{prefix: "/r/matches/", delay: 5 * time.Millisecond, rt: transport, paths: map[string]int{}}
 		var rt http.RoundTripper = rf
 		if fail != nil {
 			fail.rt, rt = rf, fail
@@ -201,7 +201,7 @@ func TestFetchConcurrencyShared(t *testing.T) {
 		batches[ns] = &follow.Batch{Origin: origin, NS: ns, Units: units, NewCheckpoint: head}
 	}
 
-	rf := &revFetches{prefix: "/r/", delay: 20 * time.Millisecond, rt: http.DefaultTransport, paths: map[string]int{}}
+	rf := &revFetches{prefix: "/r/", delay: 20 * time.Millisecond, rt: transport, paths: map[string]int{}}
 	s := startSvcWith(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "cups"}, noRun: true, hc: &http.Client{Transport: rf}},
 		func(o *index.Options) { o.FetchConcurrency = limit })
 	// Both at once, as their followers would.

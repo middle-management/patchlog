@@ -82,7 +82,7 @@ func TestTelemetry(t *testing.T) {
 	pf, _ := http.NewRequest("OPTIONS", ts.URL+"/r/docs/a", nil)
 	pf.Header.Set("Origin", "https://app.example")
 	pf.Header.Set("Access-Control-Request-Method", "PATCH")
-	res, err := http.DefaultClient.Do(pf)
+	res, err := httpClient.Do(pf)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +142,7 @@ func TestTelemetry(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	q, _ := http.NewRequestWithContext(ctx, "GET", ts.URL+"/ns/docs/events", nil)
-	res, err = http.DefaultClient.Do(q)
+	res, err = httpClient.Do(q)
 	if err != nil {
 		t.Fatal(err)
 	}

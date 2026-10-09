@@ -297,7 +297,10 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 
 	// If the namespace document of one the grant names can't be read, the
 	// answer is 502; one it doesn't name is left out, as a private one.
+	// A document the index checked within CheckerTTL is still used, so its
+	// cache is expired first: the index has to read pb's again.
 	failPB.Store(true)
+	idx.ix.ExpireGrantChecks()
 	if r := idx.raw("/_refs"+q, bob); r.status != 502 {
 		t.Errorf("bob without pb's document: %d %v", r.status, r.body)
 	}

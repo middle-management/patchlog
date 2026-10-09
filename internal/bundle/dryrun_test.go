@@ -50,7 +50,7 @@ func (l *requestLog) RoundTrip(r *http.Request) (*http.Response, error) {
 		l.seq = append(l.seq, kind)
 		l.mu.Unlock()
 	}
-	return http.DefaultTransport.RoundTrip(r)
+	return transport.RoundTrip(r)
 }
 
 // twoPerBatch is a deployment whose bulk namespace takes two items a batch.
@@ -108,7 +108,7 @@ func TestImportUpdateDryRuns(t *testing.T) {
 
 	// Into an empty namespace: only its first batch.
 	dst := twoPerBatch(t)
-	rt := &countingTransport{rt: http.DefaultTransport}
+	rt := &countingTransport{rt: transport}
 	rep := must(backfillVia(dst, first, rt, false))
 	if got := dryRuns(rep); got != "ok,," || rep.Timings.DryRuns != 1 || rt.dry.Load() != 1 || rt.submits.Load() != 3 {
 		t.Fatalf("import: dry runs %q, %d dry, %d submits", got, rt.dry.Load(), rt.submits.Load())
@@ -116,12 +116,12 @@ func TestImportUpdateDryRuns(t *testing.T) {
 
 	// a0, a1 and a4 fast-forward, a6 to a8 are created: [a0 a1], dry-run
 	// first as the namespace exists, [a4 a6], which moves a4, and [a7 a8].
-	rt = &countingTransport{rt: http.DefaultTransport}
+	rt = &countingTransport{rt: transport}
 	rep = must(backfillVia(dst, second, rt, true))
 	if got := dryRuns(rep); got != "ok,ok," || rt.dry.Load() != 2 || rt.submits.Load() != 0 {
 		t.Fatalf("-dry-run: dry runs %q, %d dry, %d submits", got, rt.dry.Load(), rt.submits.Load())
 	}
-	rt = &countingTransport{rt: http.DefaultTransport}
+	rt = &countingTransport{rt: transport}
 	rep = must(backfillVia(dst, second, rt, false))
 	if got := dryRuns(rep); got != "ok,ok," || rep.Timings.DryRuns != 2 || rt.dry.Load() != 2 || rt.submits.Load() != 3 {
 		t.Fatalf("update: dry runs %q, %d dry, %d submits", got, rt.dry.Load(), rt.submits.Load())
@@ -130,9 +130,9 @@ func TestImportUpdateDryRuns(t *testing.T) {
 
 	// Other ids from the second batch on: its dry run stops the import.
 	dst = twoPerBatch(t)
-	must(backfillVia(dst, first, http.DefaultTransport, false))
+	must(backfillVia(dst, first, transport, false))
 	before := dst.head("bulk", "a4").ID
-	lt := &laterIDs{idTransport: idTransport{countingTransport: countingTransport{rt: http.DefaultTransport}, other: true}}
+	lt := &laterIDs{idTransport: idTransport{countingTransport: countingTransport{rt: transport}, other: true}}
 	lt.skip.Store(2)
 	rep, err := backfillVia(dst, second, lt, false)
 	if err == nil || !strings.Contains(err.Error(), "a4: would produce") || lt.submits.Load() != 1 {
@@ -153,11 +153,11 @@ func TestImportUpdateDryRuns(t *testing.T) {
 	}
 	dst = twoPerBatch(t)
 	dst.ns("bulk-upstream", map[string]any{"read": "public", "limits": map[string]any{"itemsPerBatch": 2}})
-	must(backfillVia(dst, snapshot(), http.DefaultTransport, false))
+	must(backfillVia(dst, snapshot(), transport, false))
 	for _, i := range []int{0, 1, 4} {
 		src.append("bulk", fmt.Sprintf("a%d", i), op("replace", "/i", 10+i))
 	}
-	rep = must(backfillVia(dst, snapshot(), http.DefaultTransport, false))
+	rep = must(backfillVia(dst, snapshot(), transport, false))
 	var got []string
 	for _, br := range rep.Batches {
 		got = append(got, fmt.Sprintf("%s:%v", br.NS, br.DryRun))
@@ -188,7 +188,7 @@ func TestImportBlobsBeforeDryRun(t *testing.T) {
 	src.append("bulk", "a2", op("add", "/blob", rz))
 	second, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"bulk"}})
 	dst := twoPerBatch(t)
-	must(backfillVia(dst, first, http.DefaultTransport, false))
+	must(backfillVia(dst, first, transport, false))
 
 	// [a0 a1] and [a2]: a dry-run import dry-runs both, uploading nothing,
 	// and a0's and a2's blobs are missing.
