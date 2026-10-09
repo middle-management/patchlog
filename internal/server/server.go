@@ -81,6 +81,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("POST /ns/{ns}/purge", s.nsPurge)
 	m.HandleFunc("POST /ns/{ns}/keys", s.nsKeys)
 	m.HandleFunc("POST /edge-grants", s.edgeGrants)
+	m.HandleFunc("DELETE /edge-grants", s.withdrawEdgeGrants)
 	return s
 }
 
@@ -127,6 +128,7 @@ var queryParams = map[string]map[string]string{
 	"POST /ns/{ns}/batch":             {"dry-run": flag},                       // §7.5
 	"POST /ns/{ns}/purge":             {"force": flag},                         // §8.5
 	"GET " + core.DefaultJWKSPath:     nil,                                     // §C.4: not checked
+	"DELETE /edge-grants":             nil,                                     // §C.5: prefix repeats; withdrawPrefixes checks it
 }
 
 // checkQuery answers 400 bad_input for a query parameter the route doesn't

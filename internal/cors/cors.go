@@ -124,6 +124,12 @@ func Wrap(h http.Handler, c Config) http.Handler {
 		// Origin, or it would vary by origin without saying so.
 		allowed := credOrigin || origin != "" && (anyOrigin || slices.Contains(c.Origins, origin)) ||
 			len(c.Origins) > 0 && !echo
+		// DELETE /edge-grants withdraws edge-grant cookies: only the
+		// credentialed origins they are issued to may preflight it, so
+		// another site can't sign a reader out (§C.5).
+		if r.Method == http.MethodOptions && r.URL.Path == "/edge-grants" && r.Header.Get("Access-Control-Request-Method") == http.MethodDelete {
+			allowed = credOrigin
+		}
 		if allowed {
 			switch {
 			case credOrigin:
