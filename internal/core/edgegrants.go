@@ -171,7 +171,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*EdgeGrant,
 	// A purged namespace is decided last, once the grant verifies and may
 	// read there, as its URLs answer 410 after the read check (§8.5).
 	if n.purged {
-		return nil, purgedNS()
+		return nil, t.purgedNS(n)
 	}
 	return &EdgeGrant{NS: ns, Resource: res, Sub: a.principal.ID}, nil
 }
