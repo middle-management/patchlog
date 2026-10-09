@@ -90,6 +90,9 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		telemetry.SetRoute(r, "/_status")
 		ix.serveStatus(w)
 		return
+	case segs[0] == "_refs": // across namespaces (refsall.go)
+		ix.serveRefs(w, r, segs)
+		return
 	case len(segs) == 1 && segs[0] != "":
 		ns = segs[0]
 		telemetry.SetRoute(r, "/{ns}")

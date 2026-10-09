@@ -132,6 +132,7 @@ type Index struct {
 	origin  string
 	checker *grantcheck.Checker
 	schemas *SchemaCache
+	refs    refsKept // answers of /_refs (refsall.go)
 	roots   map[string]bool
 	keys    *derived.Keys  // encryption of followed namespaces
 	sealed  *derived.Cache // sealed results
@@ -544,6 +545,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	ix.refsPurged(ctx, b.NS, tags)
 	// Purge before the new checkpoint is out, so nobody who learns of it
 	// can still be served what it removed. Purgers don't block.
 	if len(tags) > 0 {
