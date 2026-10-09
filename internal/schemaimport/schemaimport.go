@@ -22,8 +22,9 @@
 //
 // A resource whose head already holds the converted content is reused as is,
 // so a re-run with unchanged sources writes nothing. In a namespace that
-// requires nonces (§C.7) every write adds a fresh $nonce, which the predicted
-// ids include; a head's $nonce is no part of its content.
+// requires nonces (§C.7), or whose document the caller can't read, every
+// write adds a fresh $nonce, which the predicted ids include; a head's
+// $nonce is no part of its content.
 package schemaimport
 
 import (
@@ -172,7 +173,7 @@ type planner struct {
 	warnings  map[string]*warning
 	warnOrder []string
 	notes     []string // conversion lines that aren't per-location warnings
-	nonce     bool     // the namespace requires nonces (§C.7)
+	nonce     bool     // the namespace requires nonces, or c can't read its document (§C.7)
 }
 
 type warning struct {
@@ -219,9 +220,7 @@ func Plan(ctx context.Context, c *client.Client, sources []string, opt Options) 
 	bundles := p.bundles()
 	res := &Result{NS: opt.NS}
 	if c != nil {
-		// A namespace document the caller can't read leaves it to each
-		// resource's head (plan).
-		p.nonce, _ = c.NonceRequired(ctx, opt.NS)
+		p.nonce = c.NeedsNonce(ctx, opt.NS)
 	}
 	if err := p.build(ctx, c, bundles, res); err != nil {
 		return nil, err
@@ -802,10 +801,9 @@ func (p *planner) rewriterFor(d *doc, ns string, stub bool) refRewriter {
 }
 
 // plan decides a resource's action from its head and predicts its id. The
-// patch set adds a fresh $nonce where the namespace requires nonces (nonce,
-// §C.7) or the live head has one, which is all a caller that can't read the
-// namespace document has to go by; the head's $nonce is left out when
-// comparing it with the content.
+// patch set adds a fresh $nonce where the namespace requires nonces or the
+// caller can't read its document (nonce, §C.7), or the live head has one;
+// the head's $nonce is left out when comparing it with the content.
 func plan(ctx context.Context, c *client.Client, ns string, r *Resource, nonce bool) error {
 	r.Action = Create
 	if c != nil {

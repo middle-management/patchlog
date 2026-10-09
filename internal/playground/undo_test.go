@@ -79,8 +79,12 @@ FUNCTIONS
   out.sealedE = { ok: !!e.ok, source: e.ok ? e.plan.source : '', steps: e.ok ? e.plan.items[0].steps : null, err: e.refused || e.impossible || '' };
   // F: a namespace that came to require nonces after the gesture: the set gets a fresh one, though the document has none.
   S.ns = 'n';
-  const f = await undoRun('n', input.gn, { nonce: 'required' });
+  const f = await undoRun('n', input.gn, { nonce: needsNonce((await api('GET', '/ns/n')).json) });
   out.nonceF = { ok: !!f.ok, steps: f.ok ? f.plan.items[0].steps : null, err: f.refused || f.impossible || '' };
+  // G: a grant that can't read the namespace document doesn't know the setting: the set gets one all the same.
+  S.ns = 'o';
+  const gg = await undoRun('o', input.go, { nonce: needsNonce(null) });
+  out.nonceG = { ok: !!gg.ok, steps: gg.ok ? gg.plan.items[0].steps : null, err: gg.refused || gg.impossible || '' };
   // The stack, rebuilt from the namespace log.
   S.ns = 'docs';
   const st = undoStackFrom(await undoNSLog('docs'), 'alice');
@@ -183,6 +187,12 @@ func TestUndoWithNode(t *testing.T) {
 	nh, err := alice.NSHead(ctx, "n")
 	check(nh, err)
 	check(alice.PatchConfig(ctx, "n", nh.Config, ops(op("add", "/nonce", "required"))))
+	// G: one that doesn't require them, whose document the browser couldn't read.
+	check(alice.CreateNamespace(ctx, "o", map[string]any{}))
+	w, err = alice.CreateDoc(ctx, "o", "a", map[string]any{"t": 1})
+	check(w, err)
+	gO := client.NewGesture()
+	check(alice.Append(ctx, "o", "a", w.ID, ops(op("replace", "/t", 2)), client.WithGesture(gO)))
 	s.Clock.Advance(10 * time.Minute)
 	check(alice.Prune(ctx, "docs", "p", client.PruneRequest{Horizon: horizon}))
 	fk, err := alice.FetchKeys(ctx, "s", nil, nil)
@@ -197,7 +207,8 @@ func TestUndoWithNode(t *testing.T) {
 	var fns []string
 	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead", "openEntries", "openSealed", "readDoc", "foldTarget",
 		"undoPtr", "undoPtrStr", "ptrGet", "sameAt", "hasPrefix", "widenWrite", "coverPaths", "pathsOverlap", "foldUndo", "moveBack", "invertRev",
-		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoReadRes", "undoPlan", "undoImpossible", "undoRun", "undoLatest"} {
+		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoReadRes", "undoPlan", "undoImpossible", "undoRun", "undoLatest",
+		"needsNonce"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}
 	src := strings.Replace(undoHarness, "FUNCTIONS", "const GESTURE_RE = /^[a-z2-7]{26}$/;\n"+strings.Join(fns, "\n"), 1)
@@ -207,7 +218,7 @@ func TestUndoWithNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	in, _ := json.Marshal(map[string]any{"base": s.URL, "author": "alice", "key": base64.RawURLEncoding.EncodeToString(fk[0].Key),
-		"g": g, "gd": gd, "gp": gp, "gm": gm, "gs": gs, "gn": gn})
+		"g": g, "gd": gd, "gp": gp, "gm": gm, "gs": gs, "gn": gn, "go": gO})
 	inPath := filepath.Join(dir, "input.json")
 	if err := os.WriteFile(inPath, in, 0o644); err != nil {
 		t.Fatal(err)
@@ -248,7 +259,7 @@ func TestUndoWithNode(t *testing.T) {
 			Source, Err string
 			Steps       []any
 		}
-		NonceF struct {
+		NonceF, NonceG struct {
 			OK    bool
 			Err   string
 			Steps []any
@@ -322,6 +333,12 @@ func TestUndoWithNode(t *testing.T) {
 	}
 	if nd, _ := doc("n", "a"); nd["t"] != float64(1) || !seal.ValidNonce(nd["$nonce"].(string)) {
 		t.Errorf("n/a after the undo: %v", nd)
+	}
+	if !out.NonceG.OK || len(out.NonceG.Steps) != 1 || !strings.Contains(string(jsonv.Canonical(jsonv.FromGo(out.NonceG.Steps))), `"path":"/$nonce"`) {
+		t.Errorf("nonce G %+v", out.NonceG)
+	}
+	if od, _ := doc("o", "a"); od["t"] != float64(1) || !seal.ValidNonce(od["$nonce"].(string)) {
+		t.Errorf("o/a after the undo: %v", od)
 	}
 	// gd conflicted and gp was impossible, so both stand; g was undone and
 	// redone; gm was undone.

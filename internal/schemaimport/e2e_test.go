@@ -194,6 +194,48 @@ func TestImportRequiredNonces(t *testing.T) {
 	}
 }
 
+// §C.7: an importer whose grant can't read the namespace document (its
+// rules refer to /resource, §C.5) doesn't know the setting, so in a
+// private namespace every write adds a fresh $nonce: one that requires
+// them takes it, and so does one that doesn't.
+func TestImportUnreadableNonces(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	fs := newFixtureServer(t)
+	fs.set("/c/solo.json", `{ "type": "string", "maxLength": 20 }`)
+	s := clienttest.New(t, clienttest.Options{Auth: true})
+	k := clienttest.NewKey("k")
+	for _, setting := range []string{"required", "optional"} {
+		t.Run(setting, func(t *testing.T) {
+			t.Parallel()
+			ns := "schemas-" + setting
+			admin := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
+			if _, err := admin.CreateNamespace(ctx, ns, map[string]any{"read": "grant", "nonce": setting, "keys": []any{k.Entry("*")}}); err != nil {
+				t.Fatal(err)
+			}
+			c := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:importer", []string{ns}, []string{"read", "create", "append"},
+				map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "solo"}}})))
+			if _, err := c.NonceRequired(ctx, ns); err == nil {
+				t.Fatal("the importer reads the namespace document")
+			}
+			res, err := schemaimport.Plan(ctx, c, []string{fs.URL + "/c/solo.json"}, schemaimport.Options{NS: ns, Name: "solo"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := res.Write(ctx, c); err != nil {
+				t.Fatal(err)
+			}
+			h, d, err := c.Load(ctx, ns, "solo")
+			if err != nil || h.ID != byName(t, res, "solo").ID {
+				t.Fatalf("head %+v %v", h, err)
+			}
+			if n, _ := d.Value.(map[string]any)["$nonce"].(string); !seal.ValidNonce(n) {
+				t.Fatalf("$nonce %q", n)
+			}
+		})
+	}
+}
+
 // Beyond the namespace's batch limits, the writes go in dependency-ordered
 // chunks.
 func TestImportChunked(t *testing.T) {

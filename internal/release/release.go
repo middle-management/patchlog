@@ -376,13 +376,12 @@ func Write(ctx context.Context, c *client.Client, ref Ref, parent string, doc *D
 }
 
 // needsNonce reports whether a write of doc to ns adds a fresh $nonce
-// (§C.7): ns requires nonces, or doc was read with one (kept in Extra),
-// which is all a writer that can't read the namespace document has to go
-// by. The fresh one replaces the old, which is never written back as is.
+// (§C.7): doc was read with one (kept in Extra), which the fresh one
+// replaces, since the old is never written back as is, or ns requires
+// nonces, or c can't read its namespace document (client.NeedsNonce).
 func needsNonce(ctx context.Context, c *client.Client, ns string, doc *Doc) bool {
 	if _, had := doc.Extra["$nonce"]; had {
 		return true
 	}
-	req, err := c.NonceRequired(ctx, ns)
-	return err == nil && req
+	return c.NeedsNonce(ctx, ns)
 }

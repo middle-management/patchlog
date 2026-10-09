@@ -81,3 +81,38 @@ func TestWriteRequiredNonces(t *testing.T) {
 		t.Fatalf("release %+v", got.Doc)
 	}
 }
+
+// §C.7: a writer whose grant can't read the namespace document doesn't
+// know the setting, so in a private namespace it gives a release document
+// it creates a fresh $nonce: one that requires them takes it, and so does
+// one that doesn't.
+func TestWriteUnreadableNonces(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	k := clienttest.NewKey("k")
+	for _, setting := range []string{"required", "optional"} {
+		t.Run(setting, func(t *testing.T) {
+			t.Parallel()
+			ns := "releases-" + setting
+			admin := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
+			if _, err := admin.CreateNamespace(ctx, ns, map[string]any{"read": "grant", "nonce": setting, "keys": []any{k.Entry("*")}}); err != nil {
+				t.Fatal(err)
+			}
+			li := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:li", []string{ns}, []string{"read", "create", "append"},
+				map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "release-9"}}})))
+			doc := &release.Doc{Name: "release-9", Branches: map[string]release.Branch{"matches": {NS: "matches-r9"}}}
+			id, err := release.Write(ctx, li, release.Ref{NS: ns, Name: "release-9"}, "", doc)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d, err := li.Doc(ctx, ns, "release-9", id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if n, _ := d.Value.(map[string]any)["$nonce"].(string); !seal.ValidNonce(n) {
+				t.Fatalf("$nonce %q", n)
+			}
+		})
+	}
+}
