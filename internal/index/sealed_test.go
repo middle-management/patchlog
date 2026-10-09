@@ -209,6 +209,14 @@ func TestSealedNamespace(t *testing.T) {
 	if got := strings.Join(resources(decodeJSON(t, must(derived.OpenView(string(f2.body), epochKeys(t, w, "sec"), derived.View{NS: "sec", Target: f2.path})))), ","); got != "a,b" {
 		t.Fatalf("after rotation %s", got)
 	}
+	// Kept, the result at the previous checkpoint is still served there,
+	// unchanged, at its canonical URL only (B9).
+	if again := x.fetch(f.path, ""); again.path != f.path || string(again.body) != string(f.body) {
+		t.Fatalf("kept result: %s, changed %v", again.path, string(again.body) != string(f.body))
+	}
+	if r := x.raw("/sec/at/"+at+"?q=secret&counts=/tag", ""); r.status != 302 || r.header.Get("Location") != f.path {
+		t.Fatalf("non-canonical, kept: %d %s", r.status, r.header.Get("Location"))
+	}
 
 	// A purge removes the resource's rows and every sealed result showing it.
 	before := x.ix.CountRows("sec")
@@ -220,6 +228,11 @@ func TestSealedNamespace(t *testing.T) {
 	for v, tags := range x.ix.SealedViews() {
 		if strings.Contains(tags, "r:sec/a") || v == f2.path {
 			t.Fatalf("stored view %s (%s) survived the purge", v, tags)
+		}
+	}
+	for _, p := range []string{f.path, f2.path} {
+		if r := x.raw(p, ""); r.status != 302 {
+			t.Fatalf("kept result %s survived the purge: %d", p, r.status)
 		}
 	}
 	f3 := x.fetch("/sec?q=secret", "")

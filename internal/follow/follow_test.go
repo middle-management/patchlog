@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -296,6 +298,51 @@ func TestRootErrors(t *testing.T) {
 	}
 	if k := rec.kinds("main"); fmt.Sprint(k) != "[config config purge-ns]" {
 		t.Fatalf("kinds %v", k)
+	}
+}
+
+// TestSnapshotOfPurged: /heads of a purged namespace is 410 purged (§8.5);
+// a consumer starting from a snapshot learns of the purge there (§10), gets
+// the purge-ns entry as from the log, and stops with ErrPurged.
+func TestSnapshotOfPurged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	// The core's answer since v0.47, whether or not this one gives it yet.
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond, Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/ns/main/rev/") && strings.HasSuffix(r.URL.Path, "/heads") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusGone)
+				w.Write([]byte(`{"code":"purged","message":"namespace purged"}`))
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}})
+	c := s.Client(t, client.WithAuthor("admin"))
+	must(c.CreateNamespace(ctx, "main", map[string]any{"read": "public"}))
+	must(c.CreateDoc(ctx, "main", "a", map[string]any{"n": 0}))
+	must(c.PatchConfig(ctx, "main", must(c.NSHead(ctx, "main")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	purged := must(c.PurgeNamespace(ctx, "main", must(c.NSHead(ctx, "main")).ID))
+
+	cp := &follow.MemoryCheckpoints{}
+	rec := &recorder{cp: cp}
+	var states []follow.State
+	err := follow.New(c, "main", cp, rec, follow.WithSnapshot(), follow.WithMaxUnits(0),
+		follow.WithOnState(func(s follow.State) { states = append(states, s) })).Run(ctx)
+	if !errors.Is(err, follow.ErrPurged) {
+		t.Fatalf("Run: %v", err)
+	}
+	bs := rec.snapshot()
+	if len(bs) != 1 || !bs[0].Snapshot || bs[0].NewCheckpoint != purged || len(bs[0].Units) != 1 || !bs[0].Units[0].Synthetic ||
+		bs[0].Units[0].Entry.Kind != "purge-ns" || bs[0].Units[0].Entry.ID != purged || !bs[0].Coalesce().PurgedNS {
+		t.Fatalf("batches %+v", bs)
+	}
+	if got := must(cp.Load(ctx, clienttest.Origin, "main")); got != purged {
+		t.Errorf("checkpoint %s, want %s", got, purged)
+	}
+	if len(states) != 1 || !states[0].Purged {
+		t.Errorf("states %+v", states)
 	}
 }
 

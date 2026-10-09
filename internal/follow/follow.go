@@ -74,9 +74,12 @@ type Unit struct {
 	// Entry is the namespace entry. For a batch, Entry.Entries holds its
 	// config entry (first, if any) and resource entries. For synthetic
 	// units from a /heads snapshot, Entry has Resource, Kind ("head",
-	// "tombstone" or "purge") and Target, and no ID.
+	// "tombstone" or "purge") and Target, and no ID; a namespace purged by
+	// then has no listing, and gives one unit with only Kind "purge-ns"
+	// and ID, its head, which is its purge-ns entry.
 	Entry client.NSEntry
-	// Synthetic marks a unit made from a /heads listing.
+	// Synthetic marks a unit made from a /heads listing (or in place of
+	// one).
 	Synthetic bool
 	// Config is the namespace document in force after this unit, set when
 	// the unit changes the configuration (a config entry, or a batch with
@@ -149,6 +152,8 @@ func WithBranches() Option { return func(o *options) { o.branches = true } }
 
 // WithSnapshot makes a consumer with an empty checkpoint start from the
 // /heads listing at the current head instead of replaying from "" (§10).
+// A purged namespace has none (410 purged): the consumer gets its purge-ns
+// entry instead, and Run ends with ErrPurged.
 func WithSnapshot() Option { return func(o *options) { o.snapshot = true } }
 
 // AsBranch makes a consumer that follows a branch directly (not through
@@ -187,7 +192,8 @@ func New(c *client.Client, ns string, cp Checkpoint, h Handler, opts ...Option) 
 }
 
 // ErrPurged is returned by Run when the followed namespace was purged
-// (after its purge-ns unit was applied).
+// (after its purge-ns unit was applied, from the log or in place of a
+// /heads listing).
 var ErrPurged = errors.New("follow: namespace purged")
 
 // Run follows until ctx is done (returning ctx.Err()), the namespace is
@@ -336,6 +342,9 @@ func (n *nsFollower) bootstrapBranch(ctx context.Context) error {
 
 func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *client.NSEntry) error {
 	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.Heads(ctx, n.ns, at) })
+	if isPurged(err) {
+		return n.deliverPurged(ctx)
+	}
 	if err != nil {
 		return err
 	}
@@ -352,6 +361,32 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *clien
 		units = append(units, Unit{Entry: e, Synthetic: true})
 	}
 	return n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: units, From: n.cur, NewCheckpoint: at, Snapshot: true})
+}
+
+// deliverPurged stands in for the /heads listing of a purged namespace,
+// which is 410 purged at any revision (§8.5): the namespace's log ends with
+// its purge-ns entry, which is how a consumer learns of it otherwise (§10),
+// and nothing is written after it, so the head is that entry. It is
+// delivered as a synthetic purge-ns unit at the head, and Run ends with
+// ErrPurged.
+func (n *nsFollower) deliverPurged(ctx context.Context) error {
+	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
+	if err != nil {
+		return err
+	}
+	head := v.(*client.NSHead).ID
+	u := Unit{Entry: client.NSEntry{ID: head, Kind: "purge-ns"}, Synthetic: true}
+	if err := n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: []Unit{u}, From: n.cur, NewCheckpoint: head, Snapshot: true}); err != nil {
+		return err
+	}
+	n.f.state(State{NS: n.ns, Purged: true})
+	return ErrPurged
+}
+
+// isPurged reports the 410 of a purged namespace's URLs (§8.5).
+func isPurged(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	return ok && ae.Status == 410 && ae.Code == "purged"
 }
 
 // catchUp replays the immutable range from the checkpoint to the head,

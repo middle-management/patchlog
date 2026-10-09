@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -40,15 +41,19 @@ var validNS = client.ValidNSName
 //	GET /{ns}?…                   302 → /{ns}/at/{checkpoint}?…            (head pointer)
 //	GET /{ns}/at/{ns_id}?…        200 { at, ns, hits, next?, counts? }       (immutable,
 //	                              tagged idx:{ns} and r:{ns}/{name} per hit)
-//	                              302 → current checkpoint if ns_id is not current
+//	                              302 → current checkpoint if ns_id is neither
+//	                              current nor kept for this query
 //	GET /g/{gs}/{ns}?…            private namespaces: as above, keyed by the
 //	GET /g/{gs}/{ns}/at/{ns_id}?… reader's subject set gs (§B.11.5)
 //
-// Only the current checkpoint's results are kept: the index holds current
-// state only (§A.3), so every older ns_id is one "the service no longer
-// keeps results for" and is redirected (head-pointer class) to the current
-// one (§A.4). A result served at an ns_id never changes while it is served,
-// and a purge removes it from caches through its r: tags.
+// The index holds current state only (§A.3), so results are computed at the
+// current checkpoint, and a redirect to it computes the result there. Every
+// result computed is kept for a while (kept.go), and an older ns_id is
+// answered 200 while its result for the query is kept; otherwise it is one
+// "the service no longer keeps results for" and is redirected
+// (head-pointer class) to the current one (§A.4). A result served at an
+// ns_id never changes while it is served, and a purge removes it from
+// caches, and from the kept results, through its r: tags.
 //
 // Private namespaces need Authorization: Bearer <grant>; a request without
 // the right gs is redirected to it.
@@ -67,7 +72,8 @@ var validNS = client.ValidNSName
 // Sealed results are produced once per view (so per epoch: a rotation
 // moves the checkpoint), stored in the database with their cache tags, and
 // served unchanged, across restarts, until a purge with one of those tags
-// or the next checkpoint retires them (derived.Cache).
+// or the next checkpoint retires them (derived.Cache); kept, they are
+// served at their at for a while longer.
 //
 //	GET /_status                  each followed namespace's encryption level and
 //	                              epoch, whether results are sealed, and why a
@@ -316,11 +322,43 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached the namespace yet")
 		return
 	}
+	// target is the canonical URL of this query's result at an ns_id: what
+	// redirects name, what results are kept under, and in a sealed or e2e
+	// namespace the view a result is bound to (§E.2.6).
+	target := func(id string) string { return base(a, ns) + "/at/" + id + encodeQuery(vals, "min") }
+	if isAt && (at == cur || len(q.Mins) == 0) {
+		// A kept result answers its at however far the checkpoint has
+		// moved since (B9); with ?min=, only the current one, which min
+		// was waited for.
+		if st, bound, ok := ix.kept.get(target(at)); ok {
+			if bound && r.URL.RequestURI() != target(at) {
+				setPtrHeaders()
+				redirect(w, target(at))
+				return
+			}
+			ix.writeStored(w, a, at, st)
+			return
+		}
+	}
 	if !isAt || at != cur {
-		// Head pointer, or a stale ns_id: redirect to the current checkpoint
-		// (§A.7's second question resolved as redirect, as §A.4 shows).
+		// Head pointer, or an ns_id whose result isn't kept: redirect to the
+		// current checkpoint (§A.7's second question resolved as redirect,
+		// as §A.4 shows), with the result computed there and kept, so the
+		// redirect is answered even if the checkpoint moves on before it is
+		// followed. If it can't be computed, the at URL says why.
+		to := cur
+		if _, _, kept := ix.kept.get(target(cur)); !kept {
+			if info, key, err := ix.keys.Current(ctx, ns); err == nil {
+				var fe *FieldError
+				if _, got, err := ix.answer(ctx, a, ns, vals, q, info, key); err == nil {
+					to = got
+				} else if !errors.As(err, &fe) && !errors.Is(err, errCounts) {
+					ix.opt.Logf("index: query %s: %v", r.URL, err)
+				}
+			}
+		}
 		setPtrHeaders()
-		redirect(w, base(a, ns)+"/at/"+cur+encodeQuery(vals, "min"))
+		redirect(w, target(to))
 		return
 	}
 
@@ -331,47 +369,69 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeErr(w, http.StatusServiceUnavailable, "keys", "the index cannot obtain the key that seals results of this namespace")
 		return
 	}
-	var view derived.View
 	if info.Protected() {
-		// view binds the result to its URL (§E.2.6): only the canonical
-		// form is served.
-		view = derived.View{NS: ns, Target: base(a, ns) + "/at/" + at + encodeQuery(vals, "min")}
-		if r.URL.RequestURI() != view.Target {
+		// Only the canonical form of a sealed result's URL is served.
+		if r.URL.RequestURI() != target(at) {
 			setPtrHeaders()
-			redirect(w, view.Target)
+			redirect(w, target(at))
 			return
 		}
-		if !a.all && len(q.Counts) > 0 {
-			writeErr(w, http.StatusBadRequest, "bad_input", "counts over a sealed namespace need a grant that reads the whole namespace")
-			return
-		}
-		if st, ok := ix.sealed.Get(ctx, view.Target); ok {
-			ix.writeSealed(w, a, at, st)
+		gen := ix.kept.generation(ns)
+		if st, ok := ix.sealed.Get(ctx, target(at)); ok {
+			ix.writeStored(w, a, at, ix.kept.put(target(at), ns, gen, true, st))
 			return
 		}
 	}
-
-	var allow func(string) bool
-	if !a.all {
-		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
-	}
-	res, got, err := ix.query(ctx, ns, at, q, allow)
+	st, got, err := ix.answer(ctx, a, ns, vals, q, info, key)
 	var fe *FieldError
-	if errors.As(err, &fe) {
+	switch {
+	case errors.As(err, &fe):
 		writeErr(w, http.StatusBadRequest, "bad_input", fe.Error())
 		return
-	}
-	if err != nil {
+	case errors.Is(err, errCounts):
+		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
+		return
+	case errors.Is(err, errSchemas):
+		ix.opt.Logf("index: query %s: %v", r.URL, err)
+		writeErr(w, http.StatusBadGateway, "upstream", errSchemas.Error())
+		return
+	case err != nil:
 		ix.opt.Logf("index: query %s: %v", r.URL, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
 		return
 	}
 	if got != at {
-		// The checkpoint moved between the check and the read transaction.
+		// The checkpoint moved between the check and the read transaction;
+		// the result is kept at the new one.
 		setPtrHeaders()
-		redirect(w, base(a, ns)+"/at/"+got+encodeQuery(vals, "min"))
+		redirect(w, target(got))
 		return
 	}
+	ix.writeStored(w, a, at, st)
+}
+
+// errCounts refuses counts over a sealed namespace to a reader whose grant
+// restricts resources (400): counts aggregate over resources, and such a
+// reader may hold only per-resource keys.
+var errCounts = errors.New("counts over a sealed namespace need a grant that reads the whole namespace")
+
+// answer runs q at the current checkpoint in one read transaction, builds
+// its result, sealed in a sealed or e2e namespace, keeps it (and stores a
+// sealed one), and returns the result kept with the checkpoint it is at.
+func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info, key derived.Key) (derived.Stored, string, error) {
+	if info.Protected() && !a.all && len(q.Counts) > 0 {
+		return derived.Stored{}, "", errCounts
+	}
+	var allow func(string) bool
+	if !a.all {
+		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
+	}
+	gen := ix.kept.generation(ns)
+	res, at, err := ix.query(ctx, ns, q, allow)
+	if err != nil {
+		return derived.Stored{}, "", err
+	}
+	view := derived.View{NS: ns, Target: base(a, ns) + "/at/" + at + encodeQuery(vals, "min")}
 	body := map[string]any{"at": at, "ns": ns}
 	hits := make([]any, 0, len(res.Hits))
 	for _, h := range res.Hits {
@@ -411,9 +471,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			}
 			jwe, err := derived.SealItem(key, view, h.Resource, values)
 			if err != nil {
-				ix.opt.Logf("index: sealing a hit: %v", err)
-				writeErr(w, http.StatusInternalServerError, "internal", "sealing failed")
-				return
+				return derived.Stored{}, "", fmt.Errorf("sealing a hit: %w", err)
 			}
 			m = map[string]any{"resource": m["resource"], "id": m["id"], "url": m["url"], "sealed": jwe}
 		}
@@ -431,23 +489,19 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if res.Counts != nil {
 		body["counts"] = res.Counts
 	}
-	tags := resultTags(ns, res)
+	st := derived.Stored{JSON: true, Tags: resultTags(ns, res)}
+	if info.Protected() && a.all {
+		var jwe string
+		jwe, err = derived.SealView(key, view, body)
+		st.Body, st.JSON = []byte(jwe), false
+	} else {
+		st.Body, err = derived.Marshal(body)
+	}
+	if err != nil {
+		return derived.Stored{}, "", fmt.Errorf("encoding a result: %w", err)
+	}
 	if info.Protected() {
-		var b []byte
-		if a.all {
-			jwe, err := derived.SealView(key, view, body)
-			if err != nil {
-				ix.opt.Logf("index: sealing a result: %v", err)
-				writeErr(w, http.StatusInternalServerError, "internal", "sealing failed")
-				return
-			}
-			b = []byte(jwe)
-		} else if b, err = derived.Marshal(body); err != nil {
-			writeErr(w, http.StatusInternalServerError, "internal", "encoding failed")
-			return
-		}
-		st, err := ix.sealed.Put(ctx, view.Target, ns, at, derived.Stored{Body: b, JSON: !a.all, Tags: tags})
-		if err != nil {
+		if st, err = ix.sealed.Put(ctx, view.Target, ns, at, st); err != nil {
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}
 		if now, err := ix.committed(ctx, ns); err == nil && now != at {
@@ -457,11 +511,8 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 				ix.opt.Logf("index: retiring sealed results of %s: %v", ns, err)
 			}
 		}
-		ix.writeSealed(w, a, at, st)
-		return
 	}
-	ix.setResultHeaders(w, a, at, tags)
-	writeJSON(w, http.StatusOK, body)
+	return ix.kept.put(view.Target, ns, gen, info.Protected(), st), at, nil
 }
 
 func (ix *Index) setResultHeaders(w http.ResponseWriter, a *access, at, tags string) {
@@ -475,10 +526,10 @@ func (ix *Index) setResultHeaders(w http.ResponseWriter, a *access, at, tags str
 	w.Header().Set("X-Namespace-Revision", at)
 }
 
-// writeSealed writes a stored sealed result: the JWE (application/jose),
-// or for a resource-restricted reader the JSON with per-hit sealed values,
-// with the Cache-Tag it was stored with.
-func (ix *Index) writeSealed(w http.ResponseWriter, a *access, at string, st derived.Stored) {
+// writeStored writes a result as stored or kept: JSON, or in a sealed or
+// e2e namespace the JWE (application/jose), or for a resource-restricted
+// reader the JSON with per-hit sealed values, with its Cache-Tag.
+func (ix *Index) writeStored(w http.ResponseWriter, a *access, at string, st derived.Stored) {
 	ix.setResultHeaders(w, a, at, st.Tags)
 	if st.JSON {
 		w.Header().Set("Content-Type", "application/json")
@@ -525,23 +576,24 @@ func resultTags(ns string, res *Result) string {
 	return strings.Join(tags, ",")
 }
 
-// query runs q in one read transaction and returns the checkpoint it read
-// at; if that isn't at, the result is nil and the caller redirects.
-func (ix *Index) query(ctx context.Context, ns, at string, q *Query, allow func(string) bool) (*Result, string, error) {
+// query runs q in one read transaction, at the checkpoint the database
+// holds, and returns the result with that checkpoint. Its fields are
+// checked against the schemas of the namespace's documents there.
+func (ix *Index) query(ctx context.Context, ns string, q *Query, allow func(string) bool) (*Result, string, error) {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, "", err
 	}
 	defer tx.Rollback()
-	var got string
-	if err := tx.QueryRowContext(ctx, `SELECT ns_id FROM checkpoints WHERE origin = ? AND ns = ?`, ix.origin, ns).Scan(&got); err != nil {
+	var at string
+	if err := tx.QueryRowContext(ctx, `SELECT ns_id FROM checkpoints WHERE origin = ? AND ns = ?`, ix.origin, ns).Scan(&at); err != nil {
 		return nil, "", err
 	}
-	if got != at {
-		return nil, got, nil
+	if err := ix.checkFields(ctx, tx, ns, q.Fields); err != nil {
+		return nil, "", err
 	}
 	res, err := ix.run(ctx, tx, ns, q, allow)
-	return res, got, err
+	return res, at, err
 }
 
 // committed returns the checkpoint of ns the database holds ("" if none):
