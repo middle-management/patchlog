@@ -264,3 +264,53 @@ func TestCredentialOrigins(t *testing.T) {
 		t.Fatalf("listed origin: %v", w.Header())
 	}
 }
+
+// DELETE /edge-grants withdraws edge-grant cookies (§C.5): its preflight is
+// allowed only for the credentialed origins they are issued to, so another
+// site can't sign a reader out. Issuance's POST, and DELETE elsewhere, are
+// as before.
+func TestWithdrawPreflight(t *testing.T) {
+	preflight := func(h http.Handler, path, origin, method string) http.Header {
+		r := httptest.NewRequest("OPTIONS", path, nil)
+		r.Header.Set("Origin", origin)
+		r.Header.Set("Access-Control-Request-Method", method)
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		if w.Code != 204 {
+			t.Fatalf("preflight %d", w.Code)
+		}
+		return w.Header()
+	}
+	for _, c := range []Config{
+		{Origins: []string{"*"}, CredentialOrigins: []string{"https://app.example"}},
+		{CredentialOrigins: []string{"https://app.example"}},
+		{Origins: []string{"https://app.example", "https://other.example"}, Credentials: true},
+	} {
+		h := Wrap(api(), c)
+		w := preflight(h, "/edge-grants", "https://app.example", "DELETE")
+		if w.Get("Access-Control-Allow-Origin") != "https://app.example" || w.Get("Access-Control-Allow-Credentials") != "true" || w.Get("Access-Control-Allow-Methods") != Methods {
+			t.Fatalf("%+v: credentialed origin %v", c, w)
+		}
+		if c.Credentials {
+			continue // other.example is credentialed too
+		}
+		w = preflight(h, "/edge-grants", "https://other.example", "DELETE")
+		if w.Get("Access-Control-Allow-Origin") != "" || w.Get("Access-Control-Allow-Methods") != "" {
+			t.Fatalf("%+v: other origin %v", c, w)
+		}
+		if len(c.Origins) == 0 {
+			continue
+		}
+		for _, q := range [][2]string{{"/edge-grants", "POST"}, {"/r/ns/a", "DELETE"}} {
+			if w = preflight(h, q[0], "https://other.example", q[1]); w.Get("Access-Control-Allow-Methods") != Methods {
+				t.Fatalf("%+v: %s %s from another origin refused: %v", c, q[1], q[0], w)
+			}
+		}
+	}
+	// Without credentialed origins, no origin may.
+	for _, c := range []Config{{Origins: []string{"*"}}, {Origins: []string{"https://app.example"}}} {
+		if w := preflight(Wrap(api(), c), "/edge-grants", "https://app.example", "DELETE"); w.Get("Access-Control-Allow-Origin") != "" || w.Get("Access-Control-Allow-Methods") != "" {
+			t.Fatalf("%+v: %v", c, w)
+		}
+	}
+}
