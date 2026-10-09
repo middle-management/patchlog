@@ -1,6 +1,6 @@
 # Patch Log — Specification
 
-Status: draft v0.47 · 2026-10-09. See the change log at the end.
+Status: draft v0.48 · 2026-10-09. See the change log at the end.
 
 **Scope.** The core (§1–§13) specifies identity, validation, rules, the HTTP API, caching, deletion, namespaces, atomic batches and branches for collaboratively edited JSON documents. It is implementation-neutral. The addenda cover the rest:
 
@@ -405,7 +405,7 @@ a frozen namespace: `409` (§8.4)
   -
 the precondition itself: `428` or `412`
 
-- **Apply** the patches to the parent's document, with operation validation. A delete skips steps 3–5: it has no patches, and what it removes isn't validated. `test` ops are evaluated, and a failing `test` is `422`.
+- **Apply** the patches to the parent's document, with operation validation. A delete skips steps 3–5: it has no patches, and what it removes isn't validated. `test` ops are evaluated, and a failing `test` is `422`. In a namespace that requires nonces, a resource create, append or restore is then checked for a fresh `$nonce` (§C.7): `422 nonce`. Deletes, and config, branch and prune writes, are exempt.
 
 - **Limits** (§6.6) and **blob references** (§7.8): every reference in the resulting document is well-formed and names a blob available to the resource, `422` otherwise.
 
@@ -555,7 +555,7 @@ In order, these say:
 
 - every document is typed with a revision of the match schema
 
-- once typed, `$schema` can't be removed, including by a root replace. A restore written as a root `replace` overlaps `/$schema` even when it keeps it, so it is refused too; where such rules apply, restore with `[]` (§8.2)
+- once typed, `$schema` can't be removed, including by a root replace. A restore written as a root `replace` overlaps `/$schema` even when it keeps it, so it is refused too; where such rules apply, restore with `[]` (§8.2), or a lone fresh `$nonce` where one is required
 
 - only the `ops` group may delete or purge
 
@@ -581,7 +581,7 @@ Without the `editor` role, a principal may only create, edit, restore or delete 
 
 ### 6.5 Reserved keys and extension keywords
 
-- **Reserved keys.** Top-level document keys starting with `$`, other than `$schema`, are reserved for conventions (e.g. `$access` and the optional `$parents` in Addendum B, `$nonce` in §C.7). The core stores them like any other data and never interprets them, except that a fresh `$nonce` is left out of `writes` (§6.4.1). Namespace rules may constrain them.
+- **Reserved keys.** Top-level document keys starting with `$`, other than `$schema`, are reserved for conventions (e.g. `$access` and the optional `$parents` in Addendum B, `$nonce` in §C.7). The core stores them like any other data and never interprets them, except that a fresh `$nonce` is left out of `writes` (§6.4.1) and can be required (§C.7). Namespace rules may constrain them.
 
 - **`$blob`** is reserved at any depth, not only at the top level: an object whose `$blob` member is a string is a blob reference (§7.8), and must be well-formed (`422`). Schema documents aren't searched for references.
 
@@ -700,7 +700,7 @@ Sizes are integers in bytes, counts are integers, durations are ISO 8601 duratio
 
 ## 7. HTTP API
 
-Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.47", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
+Resource URL: `/r/{ns}/{name}`. Namespace URL: `/ns/{ns}`. `GET /` answers `{ "spec": "0.48", "auth": "grants" }`, the version of this spec the deployment implements, as dotted decimal numbers compared component by component (`0.38`, `0.38.1`), and whether authentication is on (`grants`) or `disabled` (§1). Addendum C adds `jwks_uri` (§C.4), and Addendum G `origin` (§G.1). An endpoint of this API accepts only the query parameters this spec defines for it, each at most once, and flags such as `force` and `dry-run` only the value `1`; anything else, a repeated parameter included, is `400` (`bad_input`, not cached), a request-shape error (§6.2), so a client can't mistake a parameter of its own, such as `limit`, for one the server honours, nor `dry-run=true` be ignored and the write made. Services of the addenda define their own. An edge that verifies signed-URL grants (§C.5) strips their parameters before forwarding. Ids appear in text form (§3.2), and in headers as quoted strong ETags, e.g. `"1q3fa9…"`.
 
 **Browsers.** Writes (`PATCH`, `PUT`, `POST`, `DELETE`), and any request with `Authorization`, `If-Match`, `Source-Authorization`, `Signature` or a JSON Patch `Content-Type`, aren't simple requests, so browsers send a CORS preflight, cached per URL. A deployment serving browsers answers preflights with those methods and headers, plus `Gesture`, `Undoes`, `Blob-Nonce`, `Blob-From`, `If-None-Match`, `Range`, `If-Range` and `Last-Event-ID`, allowed; exposes `ETag`, `Location`, `Retry-After`, `Content-Range`, `Gesture`, `Undoes`, `X-Revision`, `X-Namespace-Revision`, `X-Config-Revision`, `X-Cursor` and `X-Log-Next`; and sets `Access-Control-Max-Age`. Responses that vary by origin carry `Vary: Origin`. A deployment that allows every origin sends `Access-Control-Allow-Origin: *` and its exposed headers on every response, with or without `Origin`, so a CDN can cache one answer for all. Reads of public namespaces should be sent without `Authorization`: long-poll URLs are new every interval (§7.7), and every revision behind a head redirect has its own URL, so each would need a preflight. `EventSource` can't send `Authorization`, so SSE in browsers uses edge grants as cookies (§C.5), which need `Access-Control-Allow-Credentials` and a named origin, or a streaming `fetch`.
 
@@ -753,7 +753,7 @@ Writes are **never** unconditional: a write without a precondition is `428`. The
 |---|---|---|---|
 | **Create:** `PATCH /r/{ns}/{name}`, `Content-Type: application/json-patch+json` | `If-None-Match: *` | `201` with `Location: …/rev/{id}` and `ETag: "{id}"` | `412` if the resource exists (body `{ head }`) · `422` · `410` if purged |
 | **Append:** `PATCH /r/{ns}/{name}` | `If-Match: "{parent}"` | `201` with `Location` and `ETag` | `412` + `{ head }` if parent ≠ head · `422` · `410` if tombstoned and `parent` ≠ tombstone · `403` if tombstoned and the grant can't restore (§6.2) · `410` if purged |
-| **Restore:** `PATCH` on a tombstoned resource | `If-Match: "{tombstone}"` | `201`. The patches apply to the last live document; `[]` restores it unchanged | as for append |
+| **Restore:** `PATCH` on a tombstoned resource | `If-Match: "{tombstone}"` | `201`. The patches apply to the last live document; `[]` restores it unchanged, or a lone fresh `$nonce` where one is required (§C.7) | as for append |
 | **Delete:** `DELETE /r/{ns}/{name}` | `If-Match: "{head}"` | `200` + `{ tombstone }` | `412` + `{ head }` · `410` if already tombstoned |
 | **Purge:** `POST /r/{ns}/{name}/purge` | `If-Match: "{head or tombstone}"` | `204` | `412` · `409 in_use` (§6.1) |
 | **Upload a blob:** `PUT /r/{ns}/{name}/blob/{bid}` (§7.8) | none | `201` with `ETag: "{bid}"` | in the order of §7.8: `401`/`403` · `429` · `410` if the resource or namespace is purged · `409 frozen` · for a copy, `400`, `422 blob`, then `404` · `400`/`415` · `413` · `422 blob_mismatch` |
@@ -828,11 +828,11 @@ If that entry was written by the **same principal**, respond `200` with it inste
 
 - **Envelope.** Config writes are checked with a `config` envelope (§6.4.1). Key-scope and grant rules apply to them.
 
-- **Keys, roles, revocations, limits and exposure.** Writes covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption`, `/signatures` or `/schemaReads`, and writes that set `read` to `public`, additionally require a grant chained to a key with `can: ["*"]`. A role definition changes what every outstanding grant naming it can do (§C.1.1), so it is guarded like a key. Making a namespace public or changing its encryption exposes everything in it, so those are guarded too. Making `read` stricter needs no `*` key.
+- **Keys, roles, revocations, limits and exposure.** Writes covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption`, `/signatures`, `/nonce` or `/schemaReads`, and writes that set `read` to `public`, additionally require a grant chained to a key with `can: ["*"]`. A role definition changes what every outstanding grant naming it can do (§C.1.1), so it is guarded like a key. Making a namespace public or changing its encryption exposes everything in it, so those are guarded too. Making `read` stricter needs no `*` key.
 
 - **Validation.** The namespace document is validated against the built-in namespace-document schema of the deployment's version. Rules and patterns must be well-formed and within limits. The members this spec defines are validated strictly:
 
-  - **Core:** `read`, `keys`, `roles`, `revoked`, `rules`, `limits`, `allowances`, `retention`, `encryption`, `maxLag`, `base`, `frozen`, `successor`, `drafts`, `signatures` (§C.3.1) and `schemaReads` (§6.1), `{ "for": [names or prefixes] }`.
+  - **Core:** `read`, `keys`, `roles`, `revoked`, `rules`, `limits`, `allowances`, `retention`, `encryption`, `maxLag`, `base`, `frozen`, `successor`, `drafts`, `signatures` (§C.3.1), `nonce` (§C.7) and `schemaReads` (§6.1), `{ "for": [names or prefixes] }`.
 
   - **Addendum B:** `catalog`, `{ "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer }`, and `catalogs`, `{ "<catalog>": { "place"?: [subjects] } }`, where subjects are `group:…` or `user:…`.
 
@@ -860,7 +860,7 @@ If that entry was written by the **same principal**, respond `200` with it inste
 
   - A branch of a namespace whose `read` isn't `public` MUST NOT become `public` (`422`), because a branch is a copy (§7.6).
 
-  - A branch MUST NOT have a lower `encryption.level` than its base (`422`), for the same reason.
+  - A branch MUST NOT have a lower `encryption.level` than its base (`422`), for the same reason, nor turn off a `nonce` requirement its base has (§C.7).
 
   - `drafts: { "for": [ … ] }` (optional) lists the other namespaces whose writes may resolve schema paths into this branch, with their branches (§6.1): names, or prefixes ending in `*`. Without it, a branch's drafts serve only itself and its own branches, so nobody can come to depend on them uninvited. Narrowing it is subject to the `in_use` rule of §6.1. A bare `"*"` serves every namespace. `drafts` is `422` in a namespace that isn't a local branch, or that is end-to-end encrypted, where it could have no effect.
 
@@ -878,7 +878,7 @@ Content-Type: application/json
     { "resource": "derby", "ifMatch": "1a…", "steps": [ [ …patches ], [ …patches ] ] },   // two revisions
     { "resource": "final", "ifNoneMatch": "*", "steps": [ [ { "op": "add", "path": "", "value": { … } } ] ] },
     { "resource": "cup",   "ifMatch": "1c…", "steps": [ "delete" ] },
-    { "resource": "semi",  "ifMatch": "1d…", "steps": [ "delete", [] ] } ],                // delete, then restore
+    { "resource": "semi",  "ifMatch": "1d…", "steps": [ "delete", [] ] } ],                // delete, then restore (a fresh $nonce instead of [] where required)
   "config": { "ifMatch": "1k…", "patches": [ … ] },     // optional
   "source": { "ns": "release-7", "at": "1n…" } }        // optional provenance; may name another deployment (Addendum G)
 ```
@@ -963,7 +963,7 @@ If-None-Match: *
 
   - The caller needs **unrestricted** `read` on the base (§C.5). Otherwise a reader limited to some resources could branch the namespace and read the rest through the branch. Bases whose read access is decided per document (§C.5.1) should grant `branch` only to a service that creates branches for editors limited to some documents (§F.8).
 
-  - `patches` covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption`, `/signatures` or `/schemaReads` need a grant chained to a `*` key **of the base**. Every `*` key of the base is kept in the branch and can't be removed from it, so the base's administrators can always freeze and purge its branches.
+  - `patches` covering or overlapping `/keys`, `/roles`, `/revoked`, `/limits`, `/allowances`, `/merge`, `/retention`, `/encryption`, `/signatures`, `/nonce` or `/schemaReads` need a grant chained to a `*` key **of the base**. Every `*` key of the base is kept in the branch and can't be removed from it, so the base's administrators can always freeze and purge its branches.
 
   - The base's rules evaluate a `branch` envelope. Its `resource` is the new namespace's name, its `doc` is the new namespace document, and its `writes` come from `patches`. A base can therefore decide who may branch it, how branches are named (e.g. `^release-`), and what they may change.
 
@@ -1130,7 +1130,7 @@ The checks run in this order:
   - Caching is immutable, with the resource's tags (§9). In sealed namespaces the URL also names an epoch (§E.2.2).
 
 -
-**Encryption.** In sealed namespaces (`level: "sealed"`), writers MUST give the blobs they create a nonce (§C.7). Blobs carried over from another namespace keep their ids, nonce or not, as imports and copies require. Like `$nonce`, this is the writer's obligation, and the server doesn't check it. The server seals blobs on delivery (§E.2.2). At E3 clients encrypt each blob under a key of their own that travels in the sealed reference, and declare in plaintext which blobs each revision references (§E.3.1).
+**Encryption.** In sealed namespaces (`level: "sealed"`), and in those that require nonces, writers MUST give the blobs they create a nonce (§C.7). Blobs carried over from another namespace keep their ids, nonce or not, as imports and copies require. Like an optional `$nonce`, this is the writer's obligation, and the server doesn't check it. The server seals blobs on delivery (§E.2.2). At E3 clients encrypt each blob under a key of their own that travels in the sealed reference, and declare in plaintext which blobs each revision references (§E.3.1).
 
 -
 **Why per resource.** Read access, sealing keys, cache tags, purge and its propagation to branches all follow the resource's URL, so blobs need no rules of their own. The cost is that the same bytes in two resources are two attachments, which storage may keep once (§D.2).
@@ -1151,7 +1151,7 @@ The checks run in this order:
 
 - The chain continues from the tombstone. The first revision after it applies its patches to the last live document.
 
-- `[]` restores the document exactly as it was.
+- `[]` restores the document exactly as it was. Where nonces are required (§C.7), the restore sends just a fresh `$nonce` instead.
 
 - To recreate from scratch, restore with a root `replace`. Namespace rules decide whether that is allowed (§6.4.4).
 
@@ -1490,9 +1490,9 @@ A client keeps its own undo stack for the edits it just made. Gestures (§7.2) m
 -
 **The inverse.** For each resource, walk the gesture's own entries newest first, and turn each into steps of one batch item (§7.5):
 
-  - a revision: the patch set that turns its document back into its parent's, limited to the paths it wrote (§6.4.1), with a write inside an array widened to the whole array, as for merges (§F.3), since inserts and moves shift indices. A `move` whose two ends are unchanged since is inverted as a `move` back, not by copying its subtree twice. A fresh `$nonce` is added where §C.7 asks for one, never an old one restored.
+  - a revision: the patch set that turns its document back into its parent's, limited to the paths it wrote (§6.4.1), with a write inside an array widened to the whole array, as for merges (§F.3), since inserts and moves shift indices. A `move` whose two ends are unchanged since is inverted as a `move` back, not by copying its subtree twice. A fresh `$nonce` is added where §C.7 asks for one, never an old one restored; where nonces are required, every patch-set step of an inverse adds one, including one before a `"delete"`.
 
-  - a tombstone: a restore with `[]` (§8.2), which brings back the last live document.
+  - a tombstone: a restore with `[]` (§8.2), or with just a fresh `$nonce` where one is required, which brings back the last live document.
 
   - a restore: the inverse of its patches, then `"delete"`.
 
@@ -1547,6 +1547,7 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 | `blob` | 422 | A blob reference is malformed, names a blob that isn't available, or doesn't match it; a copy names another id (§7.8); or an E3 declared list has duplicates or a blob that isn't sealed (§E.3.1) |
 | `blob_mismatch` | 422 | An uploaded blob doesn't hash to its id (§7.8) |
 | `signature` | 422 | An author signature failed verification, or is missing where the namespace requires one (§C.3.1) |
+| `nonce` | 422 | A resource write whose resulting document lacks a `$nonce` of the fresh form, differing from its parent's, in a namespace that requires one (§C.7) |
 | `not_offered` | 404 | An optional endpoint this namespace doesn't offer, such as `/gestures` in a sealed namespace (§7.4) |
 | `source` | 422 | A batch's local `source.at` isn't in the chain of `source.ns`, for a caller who may read it (§7.5) |
 
@@ -1571,8 +1572,6 @@ These steps undo the gesture and nothing else: edits others made to other paths,
 - **Test vectors:** an addendum of test vectors for the byte-exact definitions (§1, Conformance), before two implementations diverge.
 
 - **Blobs:** resumable or chunked uploads for very large blobs? Ranges of sealed blobs (§E.2.2)?
-
-- **Required nonces:** should a namespace be able to require a fresh `$nonce` in every patch set (`"nonce": "required"`), as sealed namespaces must (§C.7), since a SHOULD the server can't check is easy to miss?
 
 - **Scoped branches:** a branch whose read-through is limited to the resources its creator could read at `at`, so editors limited to some documents could branch without a service (§F.8).
 
@@ -1661,6 +1660,16 @@ Served on the indexing service's own origin, e.g. `https://search.example/`.
 
   - `?ref=/r/{ns2}/{name}/rev/{id}%23{entry}`: only those naming that entry and pinned to that revision.
 
+**Across namespaces.** `GET /_refs?to=<reference>`, with `to` in any of the forms above, asks every namespace the service follows whose results the reader's subject set may see; no namespace name starts with `_` (§3.6), so the path can't collide with one.
+
+  - It redirects to `/_refs/at/{at}/g/{gs}?to=…`, with `gs` as in §B.11.5, and `at` the combined checkpoint (§B.5) over only the namespaces that subject set may see, so edits elsewhere never move it.
+
+  - It takes `?min={ns}:{ns_id}`, repeatable; a `min` for a namespace the reader can't see is `400`, as for one the service doesn't follow.
+
+  - Hits carry `ns` beside the fields of a `ref` hit, and are filtered per item as catalog listings are (§B.11.5). Hits from sealed namespaces are sealed as in §E.2.6, and end-to-end namespaces are left out unless the service holds their keys.
+
+  - It is tagged `idx:{ns}` for every namespace in `at`, and `r:{ns}/{name}` per hit. Like any index answer it is advisory: a delete guard built on it can race a write (below).
+
 Each hit of a `ref` query carries `refs: [{ "path", "ref" }]`, the locations and the strings that matched, as written. Hits of other queries don't. A document that references itself is a hit of its own query, with `"self": true`, so a delete guard can leave it out. A reference changes only when its referrer is written, so the tags above keep cached results correct.
 
 -
@@ -1700,8 +1709,6 @@ Hits carry the plain document URL (`/r/{ns}/{name}/rev/{id}`). Documents are ser
 - Should untyped documents appear in a plain listing, even though they aren't searchable?
 
 - Should queries on a stale `ns_id` redirect to the current checkpoint (as above) or return `404`?
-
-- Should one request find references across every namespace a service follows, e.g. `GET /refs?to=…` with per-namespace read checks? It would need a combined checkpoint, as §B.5 uses, and a path that can't collide with a namespace name. Until then, ask each namespace.
 
 ---
 
@@ -2536,6 +2543,8 @@ A signature is checked along one chain, every link of which is immutable or in a
 
     - Cookies fixed to single resources add up; a reader of many documents is better served by a namespace-wide grant, or by a proxy (§C.6).
 
+    - **Withdrawing them.** A browser sends a cookie only under its path, so `/edge-grants` never receives them. `DELETE /edge-grants?prefix=…`, `prefix` repeatable and taken from the `prefixes` issuance returned, answers `204`, `no-store`, with an expired `Set-Cookie` of the same name and attributes for each prefix named. It needs no grant, since it only narrows. Only `DELETE` is accepted, and its preflight is allowed only for the credentialed origins of issuance, so another site can't sign a reader out. A client calls it at sign-out, or before another user signs in on the same browser. It removes the browser's copies only: a copied cookie stays valid until it expires, which is why lifetimes are short.
+
 The edge verifies the edge grant on every request, and it is not part of the cache key. Downstream caching is `private` (§9). The edge grant's lifetime is the revocation latency, so keep it short (5–15 minutes). No edge grant is issued before the grant's `nbf`, and none outlives its `exp`.
 
 - **Per document, not per field.** Never filter fields per reader: that multiplies cached copies and defeats caching. Keep sensitive fields in a separate resource in a private namespace, and link to it.
@@ -2586,6 +2595,20 @@ The edge verifies the edge grant on every request, and it is not part of the cac
 - **Guessing from ids.** A revision id is a hash of its parent id and its patch set. Parent ids are public: they appear in URLs, redirects, events and logs, and no encryption level hides them (§E.4). So anyone can confirm a guess of a low-entropy patch set (`replace /score "2-1"`, an email address) against the next id. A nonce only in genesis doesn't help, because the guesser starts from the parent, not from genesis.
 
 - **A nonce in every patch set.** In private namespaces with guessable content, every patch set SHOULD `add` `/$nonce` with 128 fresh random bits, base32 (26 characters). `add` works whether or not the key exists yet. Every id then depends on a secret the guesser lacks. Such a write is left out of `writes` (§6.4.1), so path rules and merges ignore it, and validation doesn't see the key (§6.2).
+
+- **Requiring it.** A namespace MAY set `"nonce": "required"` (default `"optional"`), so the server checks what clients would otherwise forget. Then, at gate step 3 (§6.2), the document a resource create, append or restore results in MUST have a top-level `$nonce` of the fresh form that differs from the parent's, or from the last live document's for a restore; otherwise the write is `422` with `code: "nonce"`. The server can't tell a fresh value from an old one coming back; differing from the parent is what it checks.
+
+  - Deletes, and config, branch and prune writes, are exempt. A restore that would be `[]` sends just a fresh nonce, and so does a step that keeps a document unchanged.
+
+  - The check applies to every patch set, whatever its origin. History written where nonces weren't required, such as a branch made before the setting or a full history from another deployment, can't be fast-forwarded or imported in full into such a namespace; it can be re-authored with a fresh `$nonce` per step, or imported as a snapshot. So set it when the namespace is created. Merge tools that build a resolution or squash set (§F.3) add a fresh `$nonce` to it where required.
+
+  - A branch copies it and can't turn it off (`422`). Setting or changing it needs a `*` key (§7.4). It is `422` in an end-to-end namespace, where ids are over ciphertext with a random IV already, and a namespace that requires nonces can't become end-to-end, so neither can its branches.
+
+  - A remote branch of a base that requires nonces MUST be created requiring them too, or merging it back would fail (§G.3). Schema namespaces mirrored for it take their source's setting, so their histories, which keep their ids, pass.
+
+  - The upstream namespace of a snapshot import (§G.4.4) takes its target's setting, since the target fast-forwards from it.
+
+  - Writers MUST also give the blobs they create a nonce there, as in sealed namespaces (§7.8); the server doesn't check that.
 
 - **Blobs.** A blob id is a hash of its bytes (§3.7), so the same applies. In private namespaces with guessable blobs, uploads SHOULD carry a `Blob-Nonce`, and in sealed namespaces writers MUST give the blobs they create one (§7.8).
 
@@ -3429,7 +3452,7 @@ Tombstones are entries like any other, and a `"delete"` step reproduces them (§
 
 - Per resource, the pair comes from the most recent such batch that has an entry for it.
 
-- A resource deliberately kept at the base's version is still recorded in the batch with an empty step `[]`, but only when the base's head is a live document. That writes a revision with identical content, so consumers see a head change and nothing different. In sealed namespaces the step is a fresh `$nonce` add (E2, §C.7) or a sealed empty set (E3). Where the base's head is a tombstone or absent, `[]` would restore or fail, so such a resource can't be recorded this way: it stays unmerged and is offered again.
+- A resource deliberately kept at the base's version is still recorded in the batch with an empty step `[]`, but only when the base's head is a live document. That writes a revision with identical content, so consumers see a head change and nothing different. In sealed namespaces, and those that require nonces, the step is a fresh `$nonce` add (§C.7), and at E3 a sealed empty set. Where the base's head is a tombstone or absent, `[]` would restore or fail, so such a resource can't be recorded this way: it stays unmerged and is offered again.
 
 - `source` is asserted, not verified (§7.5), so only batches without `origin`, whose `source.ns` is the branch, whose `source.at` is in the branch's chain, and whose recorded grant (§C.3) has a root `sub` and `kid` listed in the base's `merge.authors`, count. The merger checks the chain itself, as the janitor does (§F.6), since the server checks it only for callers who may read the branch (§7.5). The base declares them in its namespace document, e.g. `"merge": { "authors": [{ "sub": "svc:merge", "kid": "ops-2026" }] }`. A catalog's merge batches are submitted by the merge service under grants the catalog service signs for it (§F.8), so one entry for the merge service and the catalog's merge key covers them; changing `/merge` needs a `*` key (§7.4). Merges by anyone else, such as an editor merging by hand, aren't tracked this way, so a branch merged like that should be rebased (§F.5) before it is merged again. The dry run lists, per resource, which batch and author its pair came from. Rebasing (§F.5) remains an alternative.
 
@@ -3739,7 +3762,7 @@ Remote read-through runs in the receiving deployment's server. Export and import
 
 ## G.1 Principles
 
-- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.47", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
+- **Every deployment has one canonical origin.** It is published at `GET /` as `{ "origin": "https://cms.example", "spec": "0.48", "auth": "grants", "jwks_uri": "https://cms.example/.well-known/patchlog-keys" }`, in the form of §C.3, next to the spec version the core publishes there (§7.4).
 
 - **Ids travel, trust doesn't.** Content that comes **with its history** can be verified by anyone by recomputing ids (invariant 4), given a trusted starting point: an `ns_id` or revision id obtained from the source itself. Integrity then needs no trusted transport, cache or mirror. Snapshots, headers and listings not covered by ids are only as trustworthy as their channel.
 
@@ -3955,7 +3978,7 @@ Each document is exported in one of two modes:
 
 - **Import snapshot documents through an upstream namespace.** The target keeps one namespace per source namespace for them, e.g. `matches-upstream`, written only by imports.
 
-- **Upstream first.** Each import appends to each snapshot document there one revision: `diff(previous snapshot, new snapshot)`, or a genesis the first time. For a deleted document it appends a tombstone. An empty diff writes nothing. The upstream chain is exactly the sequence of snapshots as imported, and its ids depend only on that sequence, except in a sealed target: there each generated patch set carries a fresh `$nonce` (§C.7), so the ids differ from one import to the next. Diffs ignore `$nonce`, so an unchanged snapshot still writes nothing.
+- **Upstream first.** Each import appends to each snapshot document there one revision: `diff(previous snapshot, new snapshot)`, or a genesis the first time. For a deleted document it appends a tombstone. An empty diff writes nothing. The upstream chain is exactly the sequence of snapshots as imported, and its ids depend only on that sequence, except in a sealed target, or where the upstream namespace requires nonces as its target does: there each generated patch set carries a fresh `$nonce` (§C.7), so the ids differ from one import to the next. Diffs ignore `$nonce`, so an unchanged snapshot still writes nothing.
 
 - **Then the target, as a merge from upstream.** The first time, the target fast-forwards and so shares the upstream ids. Later, the base is the upstream revision recorded in the previous import batch's `source.ids`, and the upstream revisions after it are replayed onto the target's head. They conflict where they overlap the target's own changes (the array rule of §F.3). A deletion conflicts if the target changed the document.
 
@@ -3977,7 +4000,7 @@ Each document is exported in one of two modes:
 
 - **Partial failure.** A failure part-way can leave dependencies updated. New resources are unused, but updated heads take effect, and live references see them. So promotions that change existing dependencies should be dry-run end to end first.
 
-- **Today's rules judge old history.** A full-history import replays every step through the target's **current** gate (§6.2), as the importer, at the current `now`. Rules on `/principal`, `/now`, `writes` or, for replayed deletes, `/doc` may reject history that was valid at the source. Such imports need an importer whose roles satisfy those rules, or snapshot mode.
+- **Today's rules judge old history.** A full-history import replays every step through the target's **current** gate (§6.2), as the importer, at the current `now`. Rules on `/principal`, `/now`, `writes` or, for replayed deletes, `/doc` may reject history that was valid at the source, and so may a target that requires nonces (§C.7). Such imports need an importer whose roles satisfy those rules, or snapshot mode.
 
 Tooling is non-normative. For example:
 
@@ -4359,3 +4382,5 @@ A read-only mirror is a remote branch that is never written. A mirror that track
 - **Also:** "live" branches exclude frozen ones (§6.6); the gestures listing answers limited readers for their own resources (§7.4); merged gestures count for their source author (§11.2); presence is out of scope (§11); consumers may start from heads (§10); `roles: []` grants nothing (§C.1.1); filtering proxies can't hide timing (§C.6); nonce refreshes never conflict in merges (§F.3); a `$schema`-keeping rule needs `[]` restores (§6.4.4); Addendum D is the Bun prototype, and the reference implementation's changelog replaces its status table.
 
 - **v0.47:** clarifications from implementing v0.46. A `schemaReads` referrer is defined, and such reads reach the origin (§6.1); edge-grant cookies cover the namespace URL, name their `SameSite` and lifetime, are issued all or nothing, and treat roles as alternatives (§C.5); `/ns/{ns}` URLs other than the gestures listing, `/branches` and remote registration included, need unrestricted `read`, now defined once (§C.5); `/heads` of a purged namespace is `410` (§8.5); dry runs draw rate tokens, `429` bodies carry a decimal `retryAfter`, and backfills pace below their own principal's rate (§6.6, §G.4.4); allowances match `sub` alone without authentication; operator grants to missing namespaces, branch-own keys after a base removal, index hit values, placement titles and undoing carried gestures are specified.
+
+- **v0.48:** from Doors. `DELETE /edge-grants?prefix=…` withdraws edge-grant cookies at sign-out (§C.5); `GET /_refs?to=…` answers "who uses this?" across every namespace an index follows that the reader may see, at a combined checkpoint keyed by subject set (§A.4). A namespace may require a fresh `$nonce` in every resulting document (`"nonce": "required"`, `422 nonce`, §C.7); history written without nonces then can't be fast-forwarded or imported in full into it, so it is meant to be set at creation.
