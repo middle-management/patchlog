@@ -37,7 +37,10 @@ import (
 //	                    no schema of the namespace's documents marks with x-index is 400,
 //	                    one a hit has no values at is left out of it (§A.4, checkFields)
 //	limit=n             page size, 1–100 (default 20)
-//	after=n             continue after the first n hits (from "next")
+//	after=n             continue after the first n hits (from "next"); a ref query
+//	after=name          without q or sort, in resource order, pages as /_refs does
+//	                    (§A.4): after is a resource name, a plain bound, and "next"
+//	                    is the after of the following page
 //	min=ns_id           read-your-writes (§A.5): an ns_id of the queried namespace, or
 //	min=ns:ns_id        ns:ns_id for any namespace the service follows; repeatable, and
 //	                    every one must be reached
@@ -53,6 +56,8 @@ type Query struct {
 	Fields []string
 	Limit  int
 	After  int
+	// AfterName is after for a query that pages by name (ByName).
+	AfterName string
 	// Mins are the ?min= values; NS is "" for a bare ns_id (the queried
 	// namespace).
 	Mins []MinRef
@@ -234,7 +239,9 @@ func ParseQuery(v url.Values) (*Query, error) {
 		}
 		q.Limit = n
 	}
-	if s := v.Get("after"); s != "" {
+	if s := v.Get("after"); s != "" && q.ByName() {
+		q.AfterName = s
+	} else if s != "" {
 		n, err := strconv.Atoi(s)
 		if err != nil || n < 0 {
 			return nil, fmt.Errorf("after must be a non-negative integer")
@@ -243,6 +250,11 @@ func ParseQuery(v url.Values) (*Query, error) {
 	}
 	return q, nil
 }
+
+// ByName reports whether q pages by resource name, as /_refs does (§A.4):
+// a ref query without q or sort, whose hits are in resource order. Its
+// after is a bare resource name, a plain bound.
+func (q *Query) ByName() bool { return q.Ref != nil && len(q.words) == 0 && len(q.Sorts) == 0 }
 
 // words splits q into search words: whitespace-separated, keeping only
 // words with a letter or digit; a trailing * marks a prefix.
@@ -513,6 +525,11 @@ func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (stri
 		sb.WriteString(` AND (d.schema = ? OR substr(d.schema, 1, ?) = ?)`)
 		args = append(args, q.Schema, len(pre), pre)
 	}
+	if q.AfterName != "" && len(q.Counts) == 0 {
+		// With counts, which count every hit, run skips those up to after.
+		sb.WriteString(` AND d.resource > ?`)
+		args = append(args, q.AfterName)
+	}
 	for i, f := range fs {
 		if i != drive {
 			sb.WriteString(` AND EXISTS (SELECT 1 FROM ` + f.table + ` ` + f.a + ` INDEXED BY ` + f.pk + ` WHERE ` + f.a + `.ns = d.ns AND ` + f.a + `.resource = d.resource AND ` + f.pkCond() + `)`)
@@ -610,7 +627,7 @@ func (ix *Index) run(ctx context.Context, tx *sql.Tx, ns string, q *Query, allow
 		}
 		n++
 		switch {
-		case n <= q.After:
+		case n <= q.After, q.AfterName != "" && h.Resource <= q.AfterName:
 		case len(res.Hits) < q.Limit:
 			res.Hits = append(res.Hits, h)
 		default:

@@ -32,7 +32,7 @@ func hops(base, path string, max int) (int, int, string, error) {
 
 // TestKeptAt (B9): a result stays answerable at its at after the checkpoint
 // moves on, showing what it showed there, until a purge of a resource it
-// shows, or of any with counts, or keepFor, drops it; its at is then
+// shows, or of any with counts, or kept.For, drops it; its at is then
 // redirected to the current one.
 func TestKeptAt(t *testing.T) {
 	t.Parallel()
@@ -81,12 +81,12 @@ func TestKeptAt(t *testing.T) {
 		}
 	}
 
-	// keepFor later, nothing is kept.
+	// kept.For later, nothing is kept.
 	mu.Lock()
 	now = now.Add(2 * time.Minute)
 	mu.Unlock()
 	if r := s.raw(locs["?q=cup"], ""); r.status != 302 {
-		t.Errorf("after keepFor: %d", r.status)
+		t.Errorf("after kept.For: %d", r.status)
 	}
 }
 

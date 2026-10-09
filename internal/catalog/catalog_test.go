@@ -722,13 +722,18 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 	if r := w.do("GET", loc, fan, nil); !strings.Contains(r.header.Get("Cache-Tag"), "ns:matches") || !strings.Contains(r.header.Get("Cache-Tag"), "r:matches/derby") {
 		t.Errorf("private listing tags %s", r.header.Get("Cache-Tag"))
 	}
-	// A content change moves the private listing to a new at.
+	// A content change moves the private listing to a new at; the old one
+	// is still answered for a while (kept, §A.4 "Bounded redirects").
 	w.patch("matches", "derby", map[string]any{"op": "add", "path": "/x", "value": 1})
 	w.caughtUp()
-	if r := w.do("GET", loc, fan, nil); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/cat/at/"+w.svc.Tree().At()+"/g/") {
-		t.Errorf("private listing after a content change: %d %s", r.status, r.header.Get("Location"))
+	if r := w.do("GET", loc, fan, nil); r.status != 200 || r.body["at"] != cp {
+		t.Errorf("private listing after a content change: %d %v", r.status, r.body)
 	}
+	old := loc
 	b, loc = get("/cat/children?of=season", fan)
+	if loc == old || !strings.HasPrefix(loc, "/cat/at/"+w.svc.Tree().At()+"/g/") {
+		t.Errorf("private listing after a content change: %s", loc)
+	}
 	// fan-club (reader) sees season's items but not the embargoed folder.
 	if got := names(b["children"]); got != "matches.derby,matches.shared" {
 		t.Errorf("fan sees %s", got)

@@ -61,6 +61,7 @@ import (
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/kept"
 )
 
 // Purger purges the index service's own cache tags (§A.1: a purge "also
@@ -123,6 +124,9 @@ type Options struct {
 	FetchConcurrency int
 }
 
+// keepBytes bounds the results kept past their checkpoint (package kept).
+const keepBytes = 64 << 20
+
 // Index is a running indexing service.
 type Index struct {
 	opt     Options
@@ -133,11 +137,11 @@ type Index struct {
 	origin  string
 	checker *grantcheck.Checker
 	schemas *SchemaCache
-	refs    refsKept // answers of /_refs (refsall.go)
+	refs    *kept.Store // answers of /_refs, kept past their at (refsall.go)
 	roots   map[string]bool
 	keys    *derived.Keys  // encryption of followed namespaces
 	sealed  *derived.Cache // sealed results
-	kept    *kept          // results kept past their checkpoint (kept.go)
+	kept    *kept.Store    // results kept past their checkpoint
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -184,7 +188,8 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		return nil, err
 	}
 	ix := &Index{
-		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db), kept: newKept(opt.Now),
+		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db),
+		kept: kept.New(opt.Now, keepBytes), refs: kept.New(opt.Now, refsKeepBytes),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		schemas: NewSchemaCache(opt.Client),
@@ -551,8 +556,8 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// Purge before the new checkpoint is out, so nobody who learns of it
 	// can still be served what it removed. Purgers don't block. Kept
 	// results go first, after the commit: one read before it that carries
-	// a tag it purges is then not kept (kept.generation).
-	ix.kept.purge(b.NS, tags)
+	// a tag it purges is then not kept (kept.Store.Generation).
+	ix.kept.Purge(b.NS, tags)
 	if len(tags) > 0 {
 		ix.opt.Purger.PurgeTags(tags)
 	}

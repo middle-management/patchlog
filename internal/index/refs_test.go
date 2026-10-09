@@ -32,6 +32,7 @@ func pageSchema(related bool) map[string]any {
 			"trigger": map[string]any{"type": "string", "x-ref": map[string]any{"key": "/triggers"}},
 			"body":    map[string]any{"type": "string"},
 			"copy":    map[string]any{"type": "object"},
+			"kind":    map[string]any{"type": "string", "x-index": "facet"},
 		},
 	}
 }
@@ -80,11 +81,11 @@ func TestReferenceQueries(t *testing.T) {
 		}
 		return must(c.CreateDoc(ctx, "pages", name, f))
 	}
-	mk("a", p1, map[string]any{"title": "A", "related": []any{live, "/r/logic/route-4"}, "hero": pinned, "trigger": entry,
+	mk("a", p1, map[string]any{"title": "A", "kind": "x", "related": []any{live, "/r/logic/route-4"}, "hero": pinned, "trigger": entry,
 		"body": "see " + live + " and " + pinned, "copy": map[string]any{"related": []any{live}}})
 	mk("b", p1, map[string]any{"title": "B", "related": []any{"/r/logic/route-4"}})
 	mk("c", "", map[string]any{"title": "C untyped", "related": []any{live}, "hero": pinned}) // no $schema: no references
-	mk("d", po, map[string]any{"title": "D", "related": []any{live}})
+	mk("d", po, map[string]any{"title": "D", "kind": "x", "related": []any{live}})
 	mk("e", p2, map[string]any{"title": "E, schema head without x-ref", "related": []any{live}})
 	mk("f", p1, map[string]any{"title": "F", "related": []any{"/r/pages/a", "/r/logic/route-5/rev/1" + strings.Repeat("a", 32)}})
 
@@ -125,6 +126,31 @@ func TestReferenceQueries(t *testing.T) {
 	x.expect("/pages?ref="+enc(live)+"&schema="+enc("/r/schemas/page"), "a")
 	x.expect("/pages?ref="+enc(live)+"&q=D", "d")
 	x.expect("/pages?ref="+enc("/r/logic/route-4")+"&sort=/title&limit=1", "a")
+
+	// Without q or sort, a ref query pages as /_refs does (§A.4): after is
+	// a bare resource name, a plain bound, and next the after of the
+	// following page. Counts still count every hit. Queries with q or sort
+	// keep their offsets.
+	route4 := "/pages?ref=" + enc("/r/logic/route-4")
+	if b := x.expect(route4+"&limit=1", "a"); b["next"] != "a" {
+		t.Errorf("next %v", b["next"])
+	}
+	if b := x.expect(route4+"&limit=1&after=a", "b"); b["next"] != nil {
+		t.Errorf("next on the last page %v", b["next"])
+	}
+	x.expect("/pages?ref="+enc(live)+"&after=a0", "d")
+	if b := x.expect("/pages?ref="+enc(live)+"&after=a&counts=/kind", "d"); fmt.Sprint(b["counts"]) != "map[/kind:[map[count:2 value:x]]]" {
+		t.Errorf("counts after a: %v", b["counts"])
+	}
+	if b := x.expect(route4+"&sort=/title&limit=1", "a"); !strings.Contains(fmt.Sprint(b["next"]), "after=1") {
+		t.Errorf("next with sort %v", b["next"])
+	}
+	x.expect(route4+"&sort=/title&after=1", "b")
+	for _, q := range []string{route4 + "&sort=/title&after=a", route4 + "&q=B&after=a", route4 + "&after=a&after=b"} {
+		if r := x.raw(q, ""); r.status != 400 {
+			t.Errorf("%s: %d", q, r.status)
+		}
+	}
 
 	// Without ref, hits carry no refs.
 	if _, ok := x.search("/pages?q=A", "")["hits"].([]any)[0].(map[string]any)["refs"]; ok {

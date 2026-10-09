@@ -288,10 +288,15 @@ func testTreeListings(t *testing.T) {
 	if tags["r:cat/derbies"] || tags["r:cat/root"] {
 		t.Errorf("listing tags nodes it doesn't show: %s", r.header.Get("Cache-Tag"))
 	}
-	// A stale checkpoint redirects to the current one.
+	// Once the checkpoint moves on, a listing computed at an at is still
+	// answered there for a while (kept, §A.4 "Bounded redirects"); a stale
+	// at whose listing nobody asked for redirects to the current one.
 	w.folder(t, "extra", "Extra", "root@b0")
 	x.caughtUp("cat")
-	if r := x.raw("/cat/at/"+cp+"/children?of=season", ""); r.status != 302 || !strings.Contains(r.header.Get("Location"), x.s.At()) || x.s.At() == cp {
+	if r := x.raw("/cat/at/"+cp+"/children?of=season", ""); r.status != 200 || r.body["at"] != cp || x.s.At() == cp {
+		t.Errorf("kept at: %d %v", r.status, r.header)
+	}
+	if r := x.raw("/cat/at/"+cp+"/children?of=root", ""); r.status != 302 || r.header.Get("Location") != "/cat/at/"+x.s.At()+"/children?of=root" {
 		t.Errorf("stale at: %d %v", r.status, r.header)
 	}
 	// A content change alone moves the combined checkpoint too.
