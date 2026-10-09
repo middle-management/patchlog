@@ -3,6 +3,7 @@ package follow_test
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -303,17 +304,43 @@ func TestRootErrors(t *testing.T) {
 
 // TestSnapshotOfPurged: /heads of a purged namespace is 410 purged (§8.5);
 // a consumer starting from a snapshot learns of the purge there (§10), gets
-// the purge-ns entry as from the log, and stops with ErrPurged.
+// the purge-ns entry as from the log, and stops with ErrPurged. The 410
+// names that entry as head (v0.49), so /ns/{ns} isn't read again for it;
+// it is from a core whose 410 doesn't.
 func TestSnapshotOfPurged(t *testing.T) {
 	t.Parallel()
+	for _, withHead := range []bool{true, false} {
+		t.Run(fmt.Sprintf("head=%v", withHead), func(t *testing.T) {
+			t.Parallel()
+			testSnapshotOfPurged(t, withHead)
+		})
+	}
+}
+
+func testSnapshotOfPurged(t *testing.T, withHead bool) {
 	ctx := context.Background()
-	// The core's answer since v0.47, whether or not this one gives it yet.
+	var (
+		mu      sync.Mutex
+		purged  string
+		nsReads int
+	)
+	// The core's answer, with head or without, whether or not this one
+	// gives it yet.
 	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond, Wrap: func(h http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+			if r.URL.Path == "/ns/main" {
+				nsReads++
+			}
 			if strings.HasPrefix(r.URL.Path, "/ns/main/rev/") && strings.HasSuffix(r.URL.Path, "/heads") {
+				body := map[string]any{"code": "purged", "message": "namespace purged"}
+				if withHead {
+					body["head"] = purged
+				}
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusGone)
-				w.Write([]byte(`{"code":"purged","message":"namespace purged"}`))
+				json.NewEncoder(w).Encode(body)
 				return
 			}
 			h.ServeHTTP(w, r)
@@ -323,7 +350,10 @@ func TestSnapshotOfPurged(t *testing.T) {
 	must(c.CreateNamespace(ctx, "main", map[string]any{"read": "public"}))
 	must(c.CreateDoc(ctx, "main", "a", map[string]any{"n": 0}))
 	must(c.PatchConfig(ctx, "main", must(c.NSHead(ctx, "main")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
-	purged := must(c.PurgeNamespace(ctx, "main", must(c.NSHead(ctx, "main")).ID))
+	id := must(c.PurgeNamespace(ctx, "main", must(c.NSHead(ctx, "main")).ID))
+	mu.Lock()
+	purged, nsReads = id, 0
+	mu.Unlock()
 
 	cp := &follow.MemoryCheckpoints{}
 	rec := &recorder{cp: cp}
@@ -343,6 +373,13 @@ func TestSnapshotOfPurged(t *testing.T) {
 	}
 	if len(states) != 1 || !states[0].Purged {
 		t.Errorf("states %+v", states)
+	}
+	// /ns/main is read for the head to start from, and again only after a
+	// 410 without head.
+	mu.Lock()
+	defer mu.Unlock()
+	if want := map[bool]int{true: 1, false: 2}[withHead]; nsReads != want {
+		t.Errorf("/ns/main read %d times, want %d", nsReads, want)
 	}
 }
 
