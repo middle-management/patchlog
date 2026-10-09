@@ -560,7 +560,8 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if err := t.authorize(a, "branch", br.Name); err != nil {
 		return nil, err
 	}
-	if !t.readsNS(base, bcfg, a, true) {
+	// A public base answers readsNS for anyone; the grant still needs it.
+	if !t.readsNS(base, bcfg, a, true) || !a.unrestrictedRead() {
 		return nil, forbidden("branching needs unrestricted read on the base (§C.5)")
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {

@@ -1,9 +1,12 @@
 package server
 
 import (
+	"errors"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // v0.47 §C.5 "The stream is metadata": /ns/{ns} and everything under it
@@ -85,6 +88,68 @@ func TestV047UnrestrictedRead(t *testing.T) {
 	}
 	expect(t, e.branch("sec", map[string]any{"name": "sec-r"}, roles), 201)
 	expect(t, e.register("sec", "rel-r", at, "", roles), 201)
+}
+
+// v0.47 §C.5, §E.2.3: only a grant that reads the namespace unrestricted
+// gets epoch keys. A read role whose rule refers to /resource but passes
+// without it (hiding b) doesn't count, even beside an unrestricted role
+// that fails for the principal; such a grant gets per-resource keys.
+func TestV047SealedKeysRoles(t *testing.T) {
+	t.Parallel()
+	e := newSealedAuthEnv(t)
+	k := newKey("k")
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public", "keys": []any{k.entry("*")}, "roles": map[string]any{
+		"notB":  map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "b"}}}},
+		"staff": map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/principal/id", "value": "user:staff"}}},
+	}}))
+	star := e.grant(k, "user:admin", []string{"s"}, []string{"create", "read"})
+	e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": "a"})), star)
+	b := e.wr("s", "b", "", withNonce(addRoot(map[string]any{"v": "b"})), star)
+	docB := string(e.get("/r/s/b/rev/" + b).Body)
+
+	roles := map[string]any{"roles": []any{"notB", "staff"}}
+	x := e.grant(k, "user:x", []string{"s"}, nil, roles)
+	keys, r := e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, x)
+	expect(t, r, 200)
+	if len(keys) != 1 || keys["s#1 a"] == nil {
+		t.Fatalf("restricted role: %s", r.Body)
+	}
+	if _, err := seal.OpenExpect(docB, keys["s#1 a"], "s#1", seal.ResourcePL("s", "b", b, "doc")); !errors.Is(err, seal.ErrDecrypt) {
+		t.Fatalf("K_a opened b: %v", err)
+	}
+	// Roles are alternatives: staff's passes, so it reads unrestricted.
+	keys, r = e.keysOf("s", nil, e.grant(k, "user:staff", []string{"s"}, nil, roles))
+	expect(t, r, 200)
+	if len(keys) != 1 || keys["s#1"] == nil {
+		t.Fatalf("unrestricted role: %s", r.Body)
+	}
+	open(t, docB, resKey(t, keys["s#1"], "s", "b"), "s#1", seal.ResourcePL("s", "b", b, "doc"))
+	// Without a role that may pass per resource, it reads nothing.
+	_, r = e.keysOf("s", nil, e.grant(k, "user:x", []string{"s"}, nil, map[string]any{"roles": []any{"staff"}}))
+	expect(t, r, 404)
+}
+
+// v0.47 §7.6: branching needs unrestricted read on the base (§C.5) even
+// when the base is public, so a grant limited to some resources, by a
+// role or its key's readScope, may not branch it.
+func TestV047BranchPublicBase(t *testing.T) {
+	t.Parallel()
+	rk := newKey("rk")
+	rkEntry := rk.entry("read", "branch")
+	rkEntry["readScope"] = "resource"
+	f := newAuthFixture(t, map[string]any{"read": "public", "roles": map[string]any{
+		"one":      map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}},
+		"all":      map[string]any{"can": []any{"read"}},
+		"brancher": map[string]any{"can": []any{"branch"}},
+	}})
+	e := f.tenv
+	expect(t, e.patchNS("sec", ops(op("add", "/keys/-", rkEntry)), f.adminG), 201)
+	oneRole := e.grant(f.admin, "user:o", []string{"sec"}, nil, map[string]any{"roles": []any{"one", "brancher"}})
+	expectCode(t, e.branch("sec", map[string]any{"name": "sec-o"}, oneRole), 403, "forbidden")
+	scoped := e.grant(rk, "user:s", []string{"sec"}, []string{"read", "branch"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
+	expectCode(t, e.branch("sec", map[string]any{"name": "sec-s"}, scoped), 403, "forbidden")
+	allRole := e.grant(f.admin, "user:a", []string{"sec", "sec-a"}, nil, map[string]any{"roles": []any{"one", "all", "brancher"}})
+	expect(t, e.branch("sec", map[string]any{"name": "sec-a"}, allRole), 201)
 }
 
 // v0.47 §8.5: once a namespace is purged, every /r/{ns}/… URL,

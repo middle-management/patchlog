@@ -437,13 +437,14 @@ type KeysRequest struct {
 
 // Keys answers POST /ns/{ns}/keys. It needs a verified grant with read on
 // the namespace (with authentication disabled, anyone gets raw epoch keys).
-// A grant restricted to resources (rules on /resource, or a key with
-// readScope "resource") gets K_r for each requested resource it may read;
-// any other gets K_e. Epochs run from the one in force at the root block's
-// nbf (without nbf: the first, capped to the last historyEpochs) to the
-// current one, and never include an epoch that started after the grant's
-// effective exp (§E.2.3). Keys are HPKE-wrapped to the root block's enc if
-// it has one, and raw base64url otherwise.
+// A grant that reads the namespace unrestricted (§C.5: with roles, through
+// one without /resource rules that passes) gets K_e; any other, restricted
+// by rules on /resource or a key with readScope "resource", gets K_r for
+// each requested resource it may read. Epochs run from the one in force at
+// the root block's nbf (without nbf: the first, capped to the last
+// historyEpochs) to the current one, and never include an epoch that
+// started after the grant's effective exp (§E.2.3). Keys are HPKE-wrapped
+// to the root block's enc if it has one, and raw base64url otherwise.
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) ([]map[string]any, error) {
 	var out []map[string]any
 	err := e.read(ctx, func(t *tx) error {
@@ -484,9 +485,20 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			out, err = t.keysE2E(n, cfg, a, kr)
 			return err
 		}
-		perResource := !a.unrestrictedRead()
-		if !perResource && t.grantRules(a, "read", nil, t.basicEnvelope("read", "", a), false) != nil {
-			return notFound()
+		// K_e only through rules none of which refers to /resource (§C.5).
+		// Roles are alternatives: if the unrestricted ones fail, a read role
+		// that refers to /resource may still pass per resource; without
+		// one, the grant reads nothing.
+		perResource := false
+		if a.verified != nil {
+			roles, ok := a.unrestrictedRoles()
+			if ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) != nil {
+				if _, all := a.verified.Allows("read"); len(roles) == len(all) {
+					return notFound()
+				}
+				ok = false
+			}
+			perResource = !ok
 		}
 		if cfg.level != levelSealed {
 			return invalid("the namespace is not sealed")
