@@ -31,7 +31,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
 | Edge grants as cookies: `POST /edge-grants`, withdrawn with `DELETE /edge-grants`, verified by the origin without an edge | §C.5, §9 | ✅ |
-| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3, kept by branches and remote branches, added by undo, merges and imports | §C.7 | ✅ (`schema import` and release documents don't add a `$nonce` yet) |
+| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3, kept by branches and remote branches, added by undo, merges, imports, schema import and release tools | §C.7 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |

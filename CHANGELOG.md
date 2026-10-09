@@ -87,7 +87,10 @@ namespaces and namespaces that require nonces. Fixes implementer reports B7, B8 
   (new for resolution and squash sets), and squash diffs leave `$nonce` out. Snapshot imports
   create the upstream namespace with its target's setting and nonce the patch sets they
   generate; a full-history import whose revisions lack nonces is refused before anything is
-  written (use snapshot mode). `schema import` and release documents don't add one yet.
+  written (use snapshot mode). `schema import`, release documents (`internal/release`), the
+  release tool's stored plans and locks, and the playground (editor restores, catalog folders
+  and moves, undo, blob uploads) add one too where required, or where the document they write
+  over already has one when they can't read the namespace document.
 
 **Faster bundle imports, again (B7).** A backfill dry-ran every batch before submitting it,
 and a dry run draws the tokens its submit does (§6.6), so each batch paid twice, half of it
