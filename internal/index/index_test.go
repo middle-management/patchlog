@@ -161,7 +161,12 @@ type resp struct {
 	body   map[string]any
 }
 
-var noFollow = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+// transport is the tests' connection pool, a clone of http.DefaultTransport:
+// httptest.Server.Close closes the default one's idle connections, which
+// breaks a request a parallel test is starting on it.
+var transport = http.DefaultTransport.(*http.Transport).Clone()
+
+var noFollow = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 func (s *svc) raw(path, token string) resp {
 	s.t.Helper()
@@ -481,7 +486,7 @@ func TestBatchIsOneUnit(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	w := setup(t)
-	ft := &failing{path: "/r/matches/b/", rt: http.DefaultTransport}
+	ft := &failing{path: "/r/matches/b/", rt: transport}
 	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, noRun: true, hc: &http.Client{Transport: ft}})
 	origin := must(w.c.Origin(ctx))
 

@@ -159,7 +159,7 @@ func (w *relWorld) startCatalog() {
 }
 
 func (w *relWorld) granter() merge.MergeGranter {
-	return &merge.HTTPGranter{URLs: map[string]string{"cat-season": w.svcURL}, Bearer: w.mergeBearer(), Approver: w.annaBearer()}
+	return &merge.HTTPGranter{URLs: map[string]string{"cat-season": w.svcURL}, Bearer: w.mergeBearer(), Approver: w.annaBearer(), HTTP: httpClient}
 }
 
 // mergeBearer is the merge service's identity grant for the catalog.
@@ -754,6 +754,11 @@ func (nopRoleView) Resolve(context.Context, *grant.Verified) ([]string, tree.Vis
 	return nil, nil, nil
 }
 
+// httpClient has its own connection pool, a clone of http.DefaultTransport:
+// httptest.Server.Close closes the default one's idle connections, which
+// breaks a request a parallel test is starting on it.
+var httpClient = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
+
 func getJSON(t *testing.T, url, bearer string) (int, map[string]any) {
 	t.Helper()
 	req, err := http.NewRequest("GET", url, nil)
@@ -763,7 +768,7 @@ func getJSON(t *testing.T, url, bearer string) (int, map[string]any) {
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

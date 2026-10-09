@@ -56,7 +56,7 @@ func TestTreeProxy(t *testing.T) {
 	req, _ := http.NewRequest("GET", front.URL+"/playground/tree/cat/roots?min=cat:1x", nil)
 	req.Header.Set("Authorization", "Bearer tok")
 	req.Header.Set("Cookie", "session=secret")
-	res, err := http.DefaultClient.Do(req)
+	res, err := httpClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +73,7 @@ func TestTreeProxy(t *testing.T) {
 		t.Fatalf("headers: %v", res.Header)
 	}
 
-	noFollow := &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	noFollow := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	for path, want := range map[string]string{
 		"/playground/tree/cat/abs":       "/playground/tree/cat/at/1bbb/roots",
 		"/playground/tree/cat/elsewhere": "https://example.com/x",
@@ -89,7 +89,7 @@ func TestTreeProxy(t *testing.T) {
 	}
 
 	// HEAD is allowed.
-	res, err = http.Head(front.URL + "/playground/tree/cat/at/1aaa/children?of=root")
+	res, err = httpClient.Head(front.URL + "/playground/tree/cat/at/1aaa/children?of=root")
 	if err != nil || res.StatusCode != 200 {
 		t.Fatalf("HEAD: %v %v", err, res)
 	}
@@ -98,7 +98,7 @@ func TestTreeProxy(t *testing.T) {
 	n := len(*seen)
 	for _, m := range []string{"POST", "PUT", "PATCH", "DELETE"} {
 		req, _ := http.NewRequest(m, front.URL+"/playground/tree/grants", strings.NewReader(`{}`))
-		res, err := http.DefaultClient.Do(req)
+		res, err := httpClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -112,7 +112,7 @@ func TestTreeProxy(t *testing.T) {
 	}
 
 	// The prefix itself tells the playground the proxy is there.
-	res, err = http.Get(front.URL + "/playground/tree/")
+	res, err = httpClient.Get(front.URL + "/playground/tree/")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -177,7 +177,7 @@ func TestTreeProxyMapping(t *testing.T) {
 	front := httptest.NewServer(h)
 	defer front.Close()
 	get := func(path string) (int, map[string]any, string) {
-		res, err := http.Get(front.URL + path)
+		res, err := httpClient.Get(front.URL + path)
 		if err != nil {
 			t.Fatal(err)
 		}

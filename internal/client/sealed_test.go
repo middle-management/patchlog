@@ -220,5 +220,5 @@ func (s *swapper) client() *http.Client { return &http.Client{Transport: s} }
 func (s *swapper) RoundTrip(r *http.Request) (*http.Response, error) {
 	r2 := r.Clone(r.Context())
 	r2.URL.Path = strings.Replace(r.URL.Path, "/rev/"+s.from, "/rev/"+s.to, 1)
-	return http.DefaultTransport.RoundTrip(r2)
+	return s.c.HTTP.Client().Transport.RoundTrip(r2)
 }

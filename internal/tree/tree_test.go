@@ -125,7 +125,11 @@ type resp struct {
 	body   map[string]any
 }
 
-var noRedirect = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+// noRedirect has its own connection pool, a clone of http.DefaultTransport:
+// httptest.Server.Close closes the default one's idle connections, which
+// breaks a request a parallel test is starting on it.
+var noRedirect = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone(),
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 
 func (s *svc) raw(path, token string) resp {
 	s.t.Helper()

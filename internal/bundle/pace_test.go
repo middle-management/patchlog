@@ -71,7 +71,7 @@ func (s *slowBatches) RoundTrip(r *http.Request) (*http.Response, error) {
 // returns its report, the waits and its requests.
 func backfill(t *testing.T, dst *deployment, clk *testClock, who string, b []byte, took time.Duration) (*bundle.Report, []time.Duration, *slowBatches) {
 	t.Helper()
-	rt := &slowBatches{countingTransport: countingTransport{rt: http.DefaultTransport}, clock: clk, took: took}
+	rt := &slowBatches{countingTransport: countingTransport{rt: transport}, clock: clk, took: took}
 	c := must(client.New(dst.url, client.WithAuthor(who), client.WithHTTPClient(&http.Client{Transport: rt})))
 	var sleeps []time.Duration
 	rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 0.5,

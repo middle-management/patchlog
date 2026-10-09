@@ -112,7 +112,7 @@ func TestSchemaImportPlanFiles(t *testing.T) {
 	hr, _ := http.NewRequest("POST", e.s.URL+"/ns/schemas/batch", bytes.NewReader(body))
 	hr.Header.Set("Content-Type", "application/json")
 	hr.Header.Set("X-Author", "a")
-	res, err := http.DefaultClient.Do(hr)
+	res, err := e.s.HTTP.Client().Do(hr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestSchemaImportPlanRequiredNonces(t *testing.T) {
 	hr, _ := http.NewRequest("POST", e.s.URL+"/ns/schemas/batch", bytes.NewReader(body))
 	hr.Header.Set("Content-Type", "application/json")
 	hr.Header.Set("X-Author", "a")
-	res, err := http.DefaultClient.Do(hr)
+	res, err := e.s.HTTP.Client().Do(hr)
 	if err != nil {
 		t.Fatal(err)
 	}

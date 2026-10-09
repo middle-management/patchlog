@@ -180,7 +180,17 @@ func (r *resp) Str(k string) string { s, _ := r.Obj()[k].(string); return s }
 
 func (r *resp) String() string { return string(r.Body) }
 
-var client = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+// transport is the tests' connection pool, a clone of http.DefaultTransport:
+// httptest.Server.Close closes the default one's idle connections, which
+// breaks a request a parallel test is starting on it ("transport connection
+// broken: http: CloseIdleConnections called").
+var transport = http.DefaultTransport.(*http.Transport).Clone()
+
+// client doesn't follow redirects; httpClient does, as http.DefaultClient.
+var (
+	client     = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	httpClient = &http.Client{Transport: transport}
+)
 
 func (e *tenv) do(q req) *resp {
 	e.t.Helper()

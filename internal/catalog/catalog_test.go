@@ -292,7 +292,17 @@ type resp struct {
 	body   map[string]any
 }
 
-var noRedirect = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+// transport is the tests' connection pool, a clone of http.DefaultTransport:
+// httptest.Server.Close closes the default one's idle connections, which
+// breaks a request a parallel test is starting on it.
+var transport = http.DefaultTransport.(*http.Transport).Clone()
+
+// noRedirect doesn't follow redirects; httpClient does, as
+// http.DefaultClient.
+var (
+	noRedirect = &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	httpClient = &http.Client{Transport: transport}
+)
 
 func (w *world) do(method, path, token string, body any) resp {
 	w.t.Helper()
@@ -503,7 +513,7 @@ func testIssueRefusesWhenBehind(t *testing.T) {
 	body := must(json.Marshal(map[string]any{"item": "/r/matches/derby", "want": toAny("read")}))
 	req := must(http.NewRequest("POST", srv.URL+"/grants", bytes.NewReader(body)))
 	req.Header.Set("Authorization", "Bearer "+w.caller("user:anna", "translators"))
-	r := must(http.DefaultClient.Do(req))
+	r := must(httpClient.Do(req))
 	r.Body.Close()
 	if r.StatusCode != 503 || r.Header.Get("Retry-After") == "" {
 		t.Errorf("issuing while behind: %d", r.StatusCode)

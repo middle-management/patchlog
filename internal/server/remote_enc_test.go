@@ -319,7 +319,9 @@ func TestRemoteBranchUnknownLevel(t *testing.T) {
 				w.Write([]byte(`{"code":"forbidden"}`))
 				return
 			}
-			httputil.NewSingleHostReverseProxy(mustURL(t, a.srv.URL)).ServeHTTP(w, r)
+			rp := httputil.NewSingleHostReverseProxy(mustURL(t, a.srv.URL))
+			rp.Transport = transport
+			rp.ServeHTTP(w, r)
 		}))
 		t.Cleanup(p.Close)
 		rt.set(p.URL, "")

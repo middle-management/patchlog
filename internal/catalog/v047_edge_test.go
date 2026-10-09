@@ -48,7 +48,7 @@ func TestReadGrantsForEdgeGrants(t *testing.T) {
 	}
 	req := must(http.NewRequest("POST", w.s.URL+"/edge-grants", nil))
 	req.Header.Set("Authorization", "Bearer "+g)
-	res := must(http.DefaultClient.Do(req))
+	res := must(httpClient.Do(req))
 	var body struct{ Prefixes []string }
 	err := json.NewDecoder(res.Body).Decode(&body)
 	res.Body.Close()

@@ -192,6 +192,9 @@ func (s *Server) AuthProxy(t testing.TB, mode string) string {
 		t.Fatal(err)
 	}
 	rp := httputil.NewSingleHostReverseProxy(u)
+	// The server's own pool, not http.DefaultTransport's, whose idle
+	// connections any test server closing closes.
+	rp.Transport = s.HTTP.Client().Transport
 	rp.ModifyResponse = func(r *http.Response) error {
 		if r.Request.URL.Path != "/" || r.StatusCode != 200 {
 			return nil

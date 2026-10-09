@@ -15,6 +15,11 @@ import (
 	"github.com/middle-management/patchlog/internal/core"
 )
 
+// transport is the tests' connection pool, a clone of http.DefaultTransport:
+// httptest.Server.Close closes the default one's idle connections, which
+// breaks a request a parallel test is starting on it.
+var transport = http.DefaultTransport.(*http.Transport).Clone()
+
 // countingTransport counts the requests a client sends, and the 429s. It
 // times the batch requests, and counts the dry runs and submits that
 // succeed; limited is set by a 429 until the importer's next wait, which
@@ -134,12 +139,12 @@ func BenchmarkImport(b *testing.B) {
 								dst.ns("data-upstream", allowance)
 							}
 						case "/again":
-							if err := imp(&countingTransport{rt: http.DefaultTransport}); err != nil {
+							if err := imp(&countingTransport{rt: transport}); err != nil {
 								b.Fatal(err)
 							}
 							p, l = 0, 0
 						}
-						rt := &countingTransport{rt: http.DefaultTransport}
+						rt := &countingTransport{rt: transport}
 						b.StartTimer()
 						t0 := time.Now()
 						err := imp(rt)

@@ -141,7 +141,7 @@ func TestVisibilityPinned(t *testing.T) {
 	w := setup(t)
 	w.seed()
 	ctx := context.Background()
-	rt := &holdRT{ns: "matches", base: http.DefaultTransport}
+	rt := &holdRT{ns: "matches", base: transport}
 	w.svcClient = w.s.Client(t, client.WithHTTPClient(&http.Client{Transport: rt}),
 		client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches"}, []string{"read"},
 			map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))

@@ -594,7 +594,7 @@ func TestImportCreatedIDs(t *testing.T) {
 			t.Parallel()
 			imp := func(other bool) (*deployment, *bundle.Report, []time.Duration, *idTransport, error) {
 				dst, clk := newDeployment(t, cmsOrigin), newTestClock()
-				rt := &idTransport{countingTransport: countingTransport{rt: http.DefaultTransport}, other: other}
+				rt := &idTransport{countingTransport: countingTransport{rt: transport}, other: other}
 				c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: rt})))
 				var sleeps []time.Duration
 				rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: mode, Pace: 1, CreateNamespaces: true, Now: clk.Now,

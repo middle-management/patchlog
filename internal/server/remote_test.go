@@ -50,7 +50,7 @@ func withRemote(rt *route, mod ...func(*core.RemoteOptions)) envOpt {
 			}
 			rt.mu.Lock()
 			defer rt.mu.Unlock()
-			return core.RemoteEndpoint{BaseURL: rt.url, Bearer: rt.bearer}, nil
+			return core.RemoteEndpoint{BaseURL: rt.url, Bearer: rt.bearer, HTTPClient: httpClient}, nil
 		}}
 		for _, m := range mod {
 			m(&o.Remote)
