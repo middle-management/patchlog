@@ -187,6 +187,18 @@ func TestSealedCatalog(t *testing.T) {
 		}
 	}
 
+	// Kept once the checkpoint moves on (§A.4 "Bounded redirects"), bound
+	// to its URL: served there alone, unchanged.
+	rf := x.fetch("/cat/roots", full)
+	must(w.CreateDoc(ctx, "matches", "cup", map[string]any{"title": "cup"}))
+	x.caughtUp("matches")
+	if again := x.fetch(rf.path, full); again.path != rf.path || string(again.body) != string(rf.body) || strings.Contains(rf.path, x.s.At()) {
+		t.Fatalf("kept sealed listing at %s: %s", again.path, again.body)
+	}
+	if r := x.raw(rf.path+"?", full); r.status != 302 || r.header.Get("Location") != rf.path {
+		t.Errorf("another form of a kept sealed listing: %d %s", r.status, r.header.Get("Location"))
+	}
+
 	// Status.
 	st := x.raw("/_status", "").body
 	if fmt.Sprint(st["namespaces"]) != "[map[epoch:1 level:sealed ns:cat sealed:true skipped:false] map[ns:matches sealed:false skipped:false]]" {

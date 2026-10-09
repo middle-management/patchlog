@@ -588,6 +588,44 @@ func (ch *Checker) ReadsAll(v *grant.Verified) bool {
 	return true
 }
 
+// ReadsUnrestricted reports whether a verified grant reads the namespace
+// unrestricted (§C.5) and may read it now: its key has no readScope, no
+// rule of its blocks or key scope refers to /resource, they pass, and, if
+// it carries roles, so does some role that lists read and has no rule
+// referring to /resource. Unlike ReadsAll, its other roles don't count:
+// roles are alternatives (§C.1.1).
+func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
+	ok, roles := v.Allows("read")
+	if !ok || v.Key.ReadScopeResource {
+		return false
+	}
+	env := ReadEnvelope(v, "", ch.now())
+	if !ch.passWhole(v.KeyRules, env) || !ch.passWhole(v.BlockRules, env) {
+		return false
+	}
+	if !v.HasRoles() {
+		return true
+	}
+	for _, role := range roles {
+		if ch.passWhole(v.RoleRules(role), env) {
+			return true
+		}
+	}
+	return false
+}
+
+// passWhole reports whether rules rs pass against env without referring to
+// /resource (or the whole envelope).
+func (ch *Checker) passWhole(rs []any, env map[string]any) bool {
+	for _, rv := range rs {
+		r, err := ch.compile(rv)
+		if err != nil || r.Refs()["resource"] || r.Refs()["*"] || !r.Eval(env) {
+			return false
+		}
+	}
+	return true
+}
+
 func (ch *Checker) compile(v any) (*rules.Rule, error) {
 	k := string(jsonv.Canonical(v))
 	if r, ok := ch.rules.Load(k); ok {

@@ -48,7 +48,7 @@ var validNS = client.ValidNSName
 //
 // The index holds current state only (§A.3), so results are computed at the
 // current checkpoint, and a redirect to it computes the result there. Every
-// result computed is kept for a while (kept.go), and an older ns_id is
+// result computed is kept for a while (package kept), and an older ns_id is
 // answered 200 while its result for the query is kept; otherwise it is one
 // "the service no longer keeps results for" and is redirected
 // (head-pointer class) to the current one (§A.4). A result served at an
@@ -330,7 +330,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// A kept result answers its at however far the checkpoint has
 		// moved since (B9); with ?min=, only the current one, which min
 		// was waited for.
-		if st, bound, ok := ix.kept.get(target(at)); ok {
+		if st, bound, ok := ix.kept.Get(target(at)); ok {
 			if bound && r.URL.RequestURI() != target(at) {
 				setPtrHeaders()
 				redirect(w, target(at))
@@ -347,7 +347,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// redirect is answered even if the checkpoint moves on before it is
 		// followed. If it can't be computed, the at URL says why.
 		to := cur
-		if _, _, kept := ix.kept.get(target(cur)); !kept {
+		if _, _, ok := ix.kept.Get(target(cur)); !ok {
 			if info, key, err := ix.keys.Current(ctx, ns); err == nil {
 				var fe *FieldError
 				if _, got, err := ix.answer(ctx, a, ns, vals, q, info, key); err == nil {
@@ -376,9 +376,10 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			redirect(w, target(at))
 			return
 		}
-		gen := ix.kept.generation(ns)
+		gen := ix.kept.Generation(ns)
 		if st, ok := ix.sealed.Get(ctx, target(at)); ok {
-			ix.writeStored(w, a, at, ix.kept.put(target(at), ns, gen, true, st))
+			st, _ = ix.kept.Put(target(at), ns, gen, true, st)
+			ix.writeStored(w, a, at, st)
 			return
 		}
 	}
@@ -426,7 +427,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	if !a.all {
 		allow = func(resource string) bool { return ix.checker.AllowsRead(a.v, resource) }
 	}
-	gen := ix.kept.generation(ns)
+	gen := ix.kept.Generation(ns)
 	res, at, err := ix.query(ctx, ns, q, allow)
 	if err != nil {
 		return derived.Stored{}, "", err
@@ -478,7 +479,10 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		hits = append(hits, m)
 	}
 	body["hits"] = hits
-	if res.More {
+	if res.More && q.ByName() {
+		// As /_refs pages (§A.4): the after of the following page.
+		body["next"] = res.Hits[len(res.Hits)-1].Resource
+	} else if res.More {
 		nv := url.Values{}
 		for k, v := range vals {
 			nv[k] = v
@@ -512,7 +516,8 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			}
 		}
 	}
-	return ix.kept.put(view.Target, ns, gen, info.Protected(), st), at, nil
+	st, _ = ix.kept.Put(view.Target, ns, gen, info.Protected(), st)
+	return st, at, nil
 }
 
 func (ix *Index) setResultHeaders(w http.ResponseWriter, a *access, at, tags string) {

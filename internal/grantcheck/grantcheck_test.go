@@ -140,6 +140,24 @@ func TestCheckRead(t *testing.T) {
 		t.Error("prefixed role reads only some")
 	}
 
+	// ReadsUnrestricted (§C.5): one read role without rules on /resource
+	// is enough, if it and the grant's own rules pass now.
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+		want  bool
+	}{
+		{"reader and prefixed", map[string]any{"roles": []any{"reader", "prefixed"}}, true},
+		{"prefixed", map[string]any{"roles": []any{"prefixed"}}, false},
+		{"reader, a rule that fails", map[string]any{"roles": []any{"reader"}, "rules": []any{map[string]any{"op": "test", "path": "/principal/id", "value": "user:ann"}}}, false},
+		{"rule on /resource", map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "a"}}}}, false},
+	} {
+		v := must(f.ch.Verify(ctx, "sec", f.grant(f.issuer, "user:bob", []string{"sec"}, nil, tc.extra)))
+		if got := f.ch.ReadsUnrestricted(v); got != tc.want {
+			t.Errorf("ReadsUnrestricted %s: %v", tc.name, got)
+		}
+	}
+
 	// Revocation: takes effect once the checker sees the new head.
 	tok := f.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"})
 	g := must(grant.Decode(tok, 0))

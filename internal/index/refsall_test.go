@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,25 +49,44 @@ func (s *svc) refsPointer(query, token string) (at, gs, loc string) {
 func TestRefsAcrossNamespaces(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	// With failPB set, pb's namespace document can't be read.
+	var failPB atomic.Bool
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond, Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if failPB.Load() && r.URL.Path == "/ns/pb" {
+				http.Error(w, "unavailable", http.StatusInternalServerError)
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}})
 	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
+	onlyB1 := map[string]any{"op": "test", "path": "/resource", "value": "b1"}
+	isNow := map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}
 	for _, ns := range []string{"schemas", "pub", "pa", "pb"} {
 		doc := map[string]any{"read": "public", "keys": []any{admin.Entry("*")}}
 		if ns == "pa" || ns == "pb" {
 			doc = map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), issuer.Entry("read")}}
+		}
+		if ns == "pb" {
+			doc["roles"] = map[string]any{
+				"reader": map[string]any{"can": []any{"read"}},
+				"timed":  map[string]any{"can": []any{"read"}, "rules": []any{onlyB1, isNow}},
+				"editor": map[string]any{"can": []any{"append"}, "rules": []any{onlyB1}},
+			}
 		}
 		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
 	}
 	w := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", []string{"schemas", "pub", "pa", "pb"}, []string{"read", "create", "append", "purge"})))
 	sch := must(w.CreateDoc(ctx, "schemas", "page", pageSchema(true)))
 	x := "/r/target/x"
-	mk := func(ns, name string, f map[string]any) {
+	mk := func(ns, name string, f map[string]any) string {
 		f["$schema"] = "/r/schemas/page/rev/" + sch.ID
-		must(w.CreateDoc(ctx, ns, name, f))
+		return must(w.CreateDoc(ctx, ns, name, f)).NSID
 	}
 	mk("pub", "p1", map[string]any{"related": []any{x}})
 	mk("pub", "p2", map[string]any{"related": []any{"/r/target/y"}})
-	mk("pa", "a1", map[string]any{"related": []any{x, "/r/pa/a1"}})
+	a1 := mk("pa", "a1", map[string]any{"related": []any{x, "/r/pa/a1"}})
 	mk("pa", "a2", map[string]any{"trigger": x + "#t-1"})
 	mk("pb", "b1", map[string]any{"related": []any{x}})
 	mk("pb", "b2", map[string]any{"related": []any{"/r/target/y", x}})
@@ -125,6 +145,31 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	if got := refsAllHits(idx.search(liLoc, li)); got != "pb/b1 pub/p1" || liGs == bobGs {
 		t.Errorf("li: %s (gs %s)", got, liGs)
 	}
+	// gs is over markers of what the answer depends on alone: readers of
+	// the same namespaces share it whatever their subjects and groups, and
+	// so do readers limited by the same rules, unless the /principal
+	// values those refer to differ.
+	carl := issuer.Grant(t, s.Now(), "user:carl", []string{"pa"}, []string{"read"}, map[string]any{"groups": []any{"writers"}})
+	if _, gs, _ := idx.refsPointer(q, carl); gs != amyGs {
+		t.Errorf("carl reads what amy does, under gs %s, not %s", gs, amyGs)
+	}
+	lu := issuer.Grant(t, s.Now(), "user:lu", []string{"pb"}, []string{"read"}, map[string]any{"groups": []any{"x"},
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "b1"}}})
+	if _, gs, _ := idx.refsPointer(q, lu); gs != liGs {
+		t.Errorf("lu has li's rules, under gs %s, not %s", gs, liGs)
+	}
+	byGroups := func(sub string, groups ...any) string {
+		return issuer.Grant(t, s.Now(), sub, []string{"pb"}, []string{"read"}, map[string]any{"groups": groups, "rules": []any{
+			map[string]any{"op": "test", "path": "/resource", "value": "b1"},
+			map[string]any{"op": "test", "path": "/principal/groups", "schema": map[string]any{"contains": map[string]any{"const": "editors"}}},
+		}})
+	}
+	_, gs1, _ := idx.refsPointer(q, byGroups("user:g1", "editors"))
+	_, gs2, _ := idx.refsPointer(q, byGroups("user:g2", "editors"))
+	_, gs3, loc3 := idx.refsPointer(q, byGroups("user:g3", "editors", "x"))
+	if gs1 != gs2 || gs1 == gs3 || gs1 == liGs || refsAllHits(idx.search(loc3, byGroups("user:g3", "editors", "x"))) != "pb/b1 pub/p1" {
+		t.Errorf("rules on /principal/groups: gs %s %s %s", gs1, gs2, gs3)
+	}
 	// Without a grant, or with one that reads nothing private here, the
 	// public answer: public caching, tagged with the public namespace.
 	_, anonGs, anonLoc := idx.refsPointer(q, "")
@@ -138,6 +183,28 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	other := issuer.Grant(t, s.Now(), "user:zed", []string{"elsewhere"}, []string{"read"}, editors)
 	if _, gs, _ := idx.refsPointer(q, other); gs != anonGs || anonGs == amyGs {
 		t.Errorf("a grant reading nothing private: gs %s, anonymous %s", gs, anonGs)
+	}
+	// A namespace read in part by rules on /now counts as unreadable: an
+	// answer at an at can't change.
+	soon := issuer.Grant(t, s.Now(), "user:soon", []string{"pb"}, []string{"read"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "value": "b1"},
+		map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}},
+	}})
+	if _, gs, loc := idx.refsPointer(q, soon); gs != anonGs || refsAllHits(idx.search(loc, soon)) != "pub/p1" {
+		t.Errorf("rules on /now: %s", loc)
+	}
+	// One read role without rules on /resource reads pb whole (§C.5),
+	// whatever the grant's other roles, so rules on /now elsewhere don't
+	// make it unreadable: such a grant shares a plain reader's answer.
+	_, pbGs, _ := idx.refsPointer(q, issuer.Grant(t, s.Now(), "user:pbr", []string{"pb"}, []string{"read"}))
+	for name, g := range map[string]string{
+		"reader and timed": issuer.Grant(t, s.Now(), "user:r1", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "timed"}}),
+		"reader and editor, a rule on /now": issuer.Grant(t, s.Now(), "user:r2", []string{"pb"}, nil,
+			map[string]any{"roles": []any{"reader", "editor"}, "rules": []any{isNow}}),
+	} {
+		if _, gs, loc := idx.refsPointer(q, g); gs != pbGs || refsAllHits(idx.search(loc, g)) != "pb/b1 pb/b2 pub/p1" {
+			t.Errorf("%s: %s", name, loc)
+		}
 	}
 
 	// A write in pb moves bob's at, not amy's.
@@ -171,45 +238,82 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	if newAt == amyAt || refsAllHits(idx.search(newLoc, amy)) != "pa/a1 pa/a2 pa/a4 pub/p1" {
 		t.Fatalf("after a write in pa: %s", newLoc)
 	}
-	if r := idx.raw(amyLoc, amy); r.status != 200 || refsAllHits(r.body) != "pa/a1 pa/a2 pub/p1" {
+	r = idx.raw(amyLoc, amy)
+	if r.status != 200 || refsAllHits(r.body) != "pa/a1 pa/a2 pub/p1" {
 		t.Errorf("kept answer: %d %v", r.status, r.body)
+	}
+	// It is answered with a min it already includes: its checkpoint of
+	// that namespace, or one before it.
+	paAt := r.body["namespaces"].(map[string]any)["pa"].(string)
+	for _, m := range []string{paAt, a1} {
+		if r := idx.raw(amyLoc+"&min=pa:"+m, amy); r.status != 200 || refsAllHits(r.body) != "pa/a1 pa/a2 pub/p1" || r.body["at"] != amyAt {
+			t.Errorf("kept answer with min pa:%s: %d %v", m, r.status, r.body)
+		}
 	}
 	for _, p := range []string{
 		"/_refs/at/" + idx.ix.Checkpoint("pa") + "/g/" + amyGs + q, // never computed
-		"/_refs/at/" + amyAt + "/g/" + amyGs + "?to=" + x,          // not canonical
 		"/_refs/at/" + amyAt + "/g/" + amyGs + q + "&min=pa:" + idx.ix.Checkpoint("pa"),
 	} {
 		if r := idx.raw(p, amy); r.status != 302 || r.header.Get("Location") != newLoc {
 			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
 		}
 	}
+	// The query in another form is the same query: a client adds after to
+	// an at URL (below).
+	if r := idx.raw("/_refs/at/"+amyAt+"/g/"+amyGs+"?to="+x, amy); r.status != 200 || refsAllHits(r.body) != "pa/a1 pa/a2 pub/p1" {
+		t.Errorf("not canonical: %d %v", r.status, r.body)
+	}
 	// Someone else's subject set redirects to one's own, at the same at.
 	if r := idx.raw(bobLoc, amy); r.status != 302 || r.header.Get("Location") != "/_refs/at/"+bobAt+"/g/"+amyGs+q {
 		t.Errorf("foreign gs: %d %s", r.status, r.header.Get("Location"))
 	}
 
-	// Pages: in namespace, then resource order.
+	// Pages: in namespace, then resource order; next is the after of the
+	// following page, {ns}/{name}, at the same at.
 	var pages []string
-	b := idx.search("/_refs"+q+"&limit=2", bob)
+	_, _, loc := idx.refsPointer(q+"&limit=2", bob)
+	b := idx.search(loc, bob)
 	for {
 		pages = append(pages, refsAllHits(b))
 		next, ok := b["next"].(string)
 		if !ok {
 			break
 		}
-		if !strings.HasPrefix(next, "/_refs/at/"+b["at"].(string)+"/g/") {
-			t.Fatalf("next %s", next)
+		r := idx.raw(loc+"&after="+url.QueryEscape(next), bob)
+		if r.status != 200 || r.body["at"] != b["at"] {
+			t.Fatalf("after %s: %d %v", next, r.status, r.body)
 		}
-		b = idx.search(next, bob)
+		b = r.body
 	}
 	if got := strings.Join(pages, " | "); got != "pa/a1 pa/a2 | pa/a4 pb/b1 | pb/b2 pb/b3 | pub/p1" {
 		t.Errorf("pages %s", got)
 	}
+	// after is a plain bound, compared as the pair split at its first /.
+	for after, want := range map[string]string{"pa/a2": "pa/a4 pb/b1", "pa/": "pa/a1 pa/a2", "pab/x": "pb/b1 pb/b2", "pb/b0": "pb/b1 pb/b2", "zz/": ""} {
+		if got := refsAllHits(idx.search("/_refs"+q+"&limit=2&after="+url.QueryEscape(after), bob)); got != want {
+			t.Errorf("after %s: %s, want %s", after, got, want)
+		}
+	}
+
+	// If the namespace document of one the grant names can't be read, the
+	// answer is 502; one it doesn't name is left out, as a private one.
+	failPB.Store(true)
+	if r := idx.raw("/_refs"+q, bob); r.status != 502 {
+		t.Errorf("bob without pb's document: %d %v", r.status, r.body)
+	}
+	if got := refsAllHits(idx.search("/_refs"+q, amy)); got != "pa/a1 pa/a2 pa/a4 pub/p1" {
+		t.Errorf("amy without pb's document: %s", got)
+	}
+	if got := refsAllHits(idx.search("/_refs"+q, "")); got != "pub/p1" {
+		t.Errorf("anonymous without pb's document: %s", got)
+	}
+	failPB.Store(false)
 
 	// Bad input.
 	for _, p := range []string{
 		"/_refs", "/_refs?to=garbage", "/_refs" + q + "&to=" + url.QueryEscape("/r/target/y"), "/_refs" + q + "&q=x",
-		"/_refs" + q + "&limit=0", "/_refs/at/zzz/g/" + amyGs + q,
+		"/_refs" + q + "&limit=0", "/_refs" + q + "&limit=101", "/_refs/at/zzz/g/" + amyGs + q,
+		"/_refs" + q + "&after=pa", "/_refs" + q + "&after=pa/a1&after=pa/a2",
 	} {
 		if r := idx.raw(p, amy); r.status != 400 {
 			t.Errorf("%s: %d", p, r.status)
@@ -274,6 +378,41 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}
 	if res.StatusCode != 200 || res.Header.Get("CDN-Cache-Control") != "max-age=31536000" {
 		t.Errorf("through the edge: %d %v", res.StatusCode, res.Header)
+	}
+}
+
+// The answer covers only the namespaces the index has reached (§A.4
+// "Coverage"): a min naming another is 400, as for one it doesn't follow.
+func TestRefsUnreached(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond, Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Nobody reads late's log or heads: the index never reaches it.
+			if strings.HasPrefix(r.URL.Path, "/ns/late/rev/") && (strings.HasSuffix(r.URL.Path, "/log") || strings.HasSuffix(r.URL.Path, "/heads")) {
+				http.Error(w, "unavailable", http.StatusServiceUnavailable)
+				return
+			}
+			h.ServeHTTP(w, r)
+		})
+	}})
+	c := s.Client(t, client.WithAuthor("admin"))
+	for _, ns := range []string{"schemas", "pub", "late"} {
+		must(c.CreateNamespace(ctx, ns, map[string]any{"read": "public"}))
+	}
+	sch := must(c.CreateDoc(ctx, "schemas", "page", pageSchema(true)))
+	x := "/r/target/x"
+	doc := map[string]any{"$schema": "/r/schemas/page/rev/" + sch.ID, "related": []any{x}}
+	must(c.CreateDoc(ctx, "pub", "p", doc))
+	late := must(c.CreateDoc(ctx, "late", "l", doc)).NSID
+	idx := startSvc(t, c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"pub", "late"}})
+	idx.caughtUp("pub")
+	q := "/_refs?to=" + url.QueryEscape(x)
+	if b := idx.search(q, ""); refsAllHits(b) != "pub/p" || fmt.Sprint(b["namespaces"]) != fmt.Sprint(map[string]any{"pub": idx.ix.Checkpoint("pub")}) {
+		t.Errorf("answer %v", b)
+	}
+	if r := idx.raw(q+"&min=late:"+late, ""); r.status != 400 {
+		t.Errorf("min of an unreached namespace: %d %v", r.status, r.body)
 	}
 }
 
@@ -375,6 +514,13 @@ func TestRefsAcrossSealed(t *testing.T) {
 	b := decodeJSON(t, f.body)
 	if fmt.Sprint(b["namespaces"]) != fmt.Sprint(map[string]any{"e": idx.ix.Checkpoint("e"), "plain": idx.ix.Checkpoint("plain"), "sec": idx.ix.Checkpoint("sec")}) || refsAllHits(b) != "e/d plain/p sec/s" {
 		t.Fatalf("answer %s", f.body)
+	}
+	// Sealed hits are bound to the URL redirects give: the answer is
+	// served there alone, also with a min it includes.
+	for _, p := range []string{f.path + "&min=plain:" + idx.ix.Checkpoint("plain"), strings.Replace(f.path, url.QueryEscape(x), x, 1)} {
+		if r := idx.raw(p, ""); r.status != 302 || r.header.Get("Location") != f.path {
+			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
+		}
 	}
 	hits := b["hits"].([]any)
 	if p := hits[1].(map[string]any); fmt.Sprint(p["refs"]) != "[map[path:/related/0 ref:"+x+"]]" {

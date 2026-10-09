@@ -61,6 +61,7 @@ import (
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/pointer"
 )
 
@@ -103,7 +104,8 @@ type Options struct {
 	SelfPlacing bool
 	// MinWait bounds how long ?min= waits (default 2s).
 	MinWait time.Duration
-	// Now is the clock for grant checks (default time.Now).
+	// Now is the clock for grant checks and kept listings (default
+	// time.Now).
 	Now func() time.Time
 	// CheckerTTL is how long namespace documents are cached for grant
 	// checks (default 30s).
@@ -148,6 +150,7 @@ type Service struct {
 	checker *grantcheck.Checker
 	keys    *derived.Keys  // encryption of followed namespaces
 	sealed  *derived.Cache // sealed listings
+	kept    *kept.Store    // listings kept past their at
 
 	wmu sync.Mutex // serialises applies across followers
 
@@ -209,7 +212,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		return nil, err
 	}
 	s := &Service{
-		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db),
+		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db), kept: kept.New(opt.Now, keepBytes),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		cur:     map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
@@ -611,7 +614,10 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		return err
 	}
 	// Purge before the new checkpoint is out, so nobody who learns of it
-	// can still be served what it removed. Purgers don't block.
+	// can still be served what it removed. Purgers don't block. Kept
+	// listings go first: one read before it that carries a tag it purges
+	// is then not kept (kept.Store.Generation).
+	s.kept.Purge(s.opt.Catalog, res.tags)
 	if len(res.tags) > 0 {
 		s.opt.Purger.PurgeTags(res.tags)
 	}

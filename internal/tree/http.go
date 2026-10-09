@@ -53,6 +53,8 @@ const (
 	maxSubtreeNodes = 5000
 	maxManifest     = 10000
 	maxTags         = 200
+	// keepBytes bounds the listings kept past their at (package kept).
+	keepBytes = 64 << 20
 )
 
 // RoleView lets readers see nodes through roles (§B.11.5); the catalog
@@ -121,6 +123,19 @@ func (v *viewer) wide(nss []string) bool {
 		}
 	}
 	return true
+}
+
+// shape is what a listing at a URL depends on besides the URL: what the
+// reader reads whole. A public namespace that turns private moves neither
+// the anonymous URL space nor a gs, so a kept listing is served only to
+// readers of the shape it was computed for.
+func (v *viewer) shape() string {
+	nss := make([]string, 0, len(v.contentAll))
+	for ns := range v.contentAll {
+		nss = append(nss, ns)
+	}
+	sort.Strings(nss)
+	return strconv.FormatBool(v.catAll) + " " + strings.Join(nss, ",")
 }
 
 func (v *viewer) node(g *Graph, n *Node) bool {
@@ -332,9 +347,14 @@ var ops = map[string]bool{
 // grants on the catalog and every trusted namespace are served unfiltered
 // listings under /g/all/ (§B.11.5, viewer).
 //
-// The service keeps no results: it answers 200 only at the current at,
-// and redirects every other at to the current one (§B.5 "only if it is
-// current or that exact result was stored").
+// Every listing computed, including the one a redirect names, is kept for
+// a while (package kept), under its URL and what the reader reads whole
+// (viewer.shape), and answered 200 at its at however far the checkpoint
+// moves meanwhile, so one redirect suffices (§A.4 "Bounded redirects",
+// §B.5 "only if it is current or that exact result was stored"); any other
+// at is redirected to the current one. A purge drops the kept listings
+// that carry a tag it purges. Listings whose answer depends on more than
+// the reader's URL space (perReader) aren't kept.
 //
 // ?min= waits until the service has applied an ns_id (§A.5): {ns}:{ns_id}
 // for the catalog or a followed content namespace, repeatable, or a bare
@@ -491,11 +511,45 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteError(w, http.StatusServiceUnavailable, "behind", "the tree service has not reached the catalog yet")
 		return
 	}
+	// canon is the canonical URL of this listing at an at: what redirects
+	// name, what listings are kept under (with the reader's shape), and
+	// in a sealed or e2e catalog the view a listing is bound to (§E.2.6).
+	canon := func(at string) string { return target(at) + encodeQuery(vals, "min") }
+	keyOf := func(at string) string { return canon(at) + "\n" + v.shape() }
+	keep := !perReader(op, v)
 	var cur string
 	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
-	if !isAt || at != cur || gs != v.gs || (v.anon && gs != "") {
+	own := isAt && gs == v.gs && !(v.anon && gs != "")
+	if own && keep && (at == cur || len(vals["min"]) == 0) {
+		// A kept listing answers its at however far the checkpoint has
+		// moved since; with ?min=, only the current one, which min was
+		// waited for.
+		if st, bound, ok := s.kept.Get(keyOf(at)); ok {
+			if bound && r.URL.RequestURI() != canon(at) {
+				setPtr()
+				redirect(w, canon(at))
+				return
+			}
+			s.writeListing(w, v, at, st)
+			return
+		}
+	}
+	if !own || at != cur {
+		// Head pointer, another URL space, or an at whose listing isn't
+		// kept: redirect to the current at, with the listing computed
+		// there and kept, so the redirect is answered even if the
+		// checkpoint moves on before it is followed. If it can't be
+		// computed, the at URL says why.
+		to := cur
+		if _, _, ok := s.kept.Get(keyOf(cur)); keep && !ok {
+			if info, key, err := s.keys.Current(ctx, cat); err == nil {
+				if l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key); err == nil && l.status == http.StatusOK {
+					to = l.at
+				}
+			}
+		}
 		setPtr()
-		redirect(w, target(cur)+encodeQuery(vals, "min"))
+		redirect(w, canon(to))
 		return
 	}
 
@@ -507,39 +561,66 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals listings of the catalog")
 		return
 	}
-	var view derived.View
-	perEntry := false
-	if info.Protected() {
-		// view binds the listing to its URL (§E.2.6): only the canonical
-		// form is served.
-		view = derived.View{NS: cat, Target: target(at) + encodeQuery(vals, "min")}
-		if r.URL.RequestURI() != view.Target {
-			setPtr()
-			redirect(w, view.Target)
-			return
-		}
-		perEntry = !v.catAll
-		if st, ok := s.sealed.Get(ctx, view.Target); ok && !perReader(op, v) {
-			s.writeListing(w, v, at, st)
-			return
+	if info.Protected() && r.URL.RequestURI() != canon(at) {
+		// Only the canonical form of a sealed listing's URL is served.
+		setPtr()
+		redirect(w, canon(at))
+		return
+	}
+	l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key)
+	switch {
+	case err != nil:
+		s.opt.Logf("tree: sealing a listing: %v", err)
+		WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
+	case l.status != http.StatusOK:
+		WriteError(w, l.status, codeFor(l.status), l.msg)
+	case l.at != at:
+		// The checkpoint moved since the check: the listing is kept at
+		// the new one.
+		setPtr()
+		redirect(w, canon(l.at))
+	default:
+		s.writeListing(w, v, at, l.st)
+	}
+}
+
+// computed is a listing computed at an at, or why there is none (status,
+// msg).
+type computed struct {
+	st     derived.Stored
+	at     string
+	status int
+	msg    string
+}
+
+// listing computes the listing of op for v at the current at, sealed in a
+// sealed or e2e catalog, stores a sealed one and keeps it (unless
+// perReader), and returns it with the at it is at. canon gives its URL at
+// an at, keyOf what it is kept under.
+func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
+	cat := s.opt.Catalog
+	keep := !perReader(op, v)
+	gen := s.kept.Generation(cat)
+	if info.Protected() && keep {
+		at := s.At()
+		if st, ok := s.sealed.Get(ctx, canon(at)); ok {
+			st, _ = s.kept.Put(keyOf(at), cat, gen, true, st)
+			return &computed{st: st, at: at, status: http.StatusOK}, nil
 		}
 	}
-
 	var (
-		status = http.StatusOK
-		body   any
-		tags   tagSet
-		errMsg string
-		got    string
-		nss    []string
-		serr   error
+		l    = &computed{}
+		body any
+		tags tagSet
+		nss  []string
+		view derived.View
+		serr error
 	)
+	perEntry := info.Protected() && !v.catAll
 	s.View(func(g *Graph, curMap map[string]string) {
-		got, nss = CombinedAt(g, curMap)
-		if got != at {
-			return
-		}
-		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: at}
+		l.at, nss = CombinedAt(g, curMap)
+		view = derived.View{NS: cat, Target: canon(l.at)}
+		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at}
 		if perEntry {
 			q.sealTitle = func(name, title string) string {
 				jwe, err := derived.SealItem(key, view, name, map[string]any{"title": title})
@@ -549,56 +630,43 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 				return jwe
 			}
 		}
-		body, status, errMsg = q.run(op)
+		body, l.status, l.msg = q.run(op)
 		tags = q.tags
 	})
-	if got != at {
-		setPtr()
-		redirect(w, target(got)+encodeQuery(vals, "min"))
-		return
+	if l.status != http.StatusOK {
+		return l, nil
 	}
-	if status != http.StatusOK {
-		WriteError(w, status, codeFor(status), errMsg)
-		return
+	l.st = derived.Stored{JSON: true, Tags: tags.header(cat, nss)}
+	if serr == nil && info.Protected() && !perEntry {
+		var jwe string
+		jwe, serr = derived.SealView(key, view, body)
+		l.st.Body, l.st.JSON = []byte(jwe), false
+	} else if serr == nil {
+		l.st.Body, serr = derived.Marshal(body)
+	}
+	if serr != nil {
+		return nil, serr
+	}
+	if !keep {
+		// Neither stored nor kept: whether it may be served depends on
+		// the reader.
+		return l, nil
 	}
 	if info.Protected() {
-		var b []byte
-		if serr == nil {
-			if perEntry {
-				b, serr = derived.Marshal(body)
-			} else {
-				var jwe string
-				jwe, serr = derived.SealView(key, view, body)
-				b = []byte(jwe)
-			}
-		}
-		if serr != nil {
-			s.opt.Logf("tree: sealing a listing: %v", serr)
-			WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
-			return
-		}
-		st := derived.Stored{Body: b, JSON: perEntry, Tags: tags.header(cat, nss)}
-		if perReader(op, v) {
-			// Not stored: whether it may be served depends on the reader.
-			s.writeListing(w, v, at, st)
-			return
-		}
-		st, err := s.sealed.Put(ctx, view.Target, cat, at, st)
-		if err != nil {
+		var err error
+		if l.st, err = s.sealed.Put(ctx, view.Target, cat, l.at, l.st); err != nil {
 			s.opt.Logf("tree: storing a sealed listing: %v", err)
 		}
-		if cur := s.At(); cur != at {
+		if cur := s.At(); cur != l.at {
 			// An apply (maybe a purge) committed meanwhile: don't keep a
 			// listing it may have retired.
 			if err := s.sealed.Retire(ctx, s.db, cat, cur); err != nil {
 				s.opt.Logf("tree: retiring sealed listings: %v", err)
 			}
 		}
-		s.writeListing(w, v, at, st)
-		return
 	}
-	s.setListingHeaders(w, v, at, tags.header(cat, nss))
-	WriteJSON(w, http.StatusOK, body)
+	l.st, _ = s.kept.Put(keyOf(l.at), cat, gen, info.Protected(), l.st)
+	return l, nil
 }
 
 // perReader reports whether an answer to op may be served depends

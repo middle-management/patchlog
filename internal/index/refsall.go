@@ -1,19 +1,17 @@
 package index
 
 import (
-	"container/list"
 	"context"
 	"crypto/sha256"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"slices"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/derived"
@@ -22,6 +20,8 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pointer"
+	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -34,24 +34,33 @@ import (
 //	                                      302 → the current at if this one is neither
 //	                                      current nor kept
 //
-// to takes any form ?ref= does. The query asks every namespace the index
-// serves (roots, and with Branches the branches it reached) that the reader
-// may read, except purged ones and those it skips (an e2e namespace whose
-// keys it doesn't hold, §E.3.2). Each hit is a ?ref= hit with its ns; hits
-// come in namespace, then resource order, paged with limit and after as
-// other queries are. ?min={ns}:{ns_id}, repeatable, waits as elsewhere
-// (§A.5); a min for a namespace the answer doesn't cover is 400.
+// to takes any form ?ref= does. The answer covers every namespace the
+// index serves (roots, and with Branches the branches it reached) that it
+// has reached and the reader may read, except purged ones and those it
+// skips (a sealed or e2e namespace whose keys it can't obtain, §E.3.2).
+// Each hit is a ?ref= hit with its ns; hits come in byte order of
+// namespace, then resource name. A page holds at most limit hits (default
+// and maximum as for other queries), strictly after after, {ns}/{name}
+// compared as the pair split at its first "/"; next is the after of the
+// following page. ?min={ns}:{ns_id}, repeatable, waits as elsewhere
+// (§A.5); a min for a namespace the answer doesn't cover is 400. On an at
+// URL, an at whose answer is kept and includes every min is answered
+// there.
 //
-// gs keys the reader's subject set as for private namespaces (§B.11.5):
-// its groups, and for every private namespace it reads, a marker of how:
-// reads:{ns}, or for a grant that reads only some of its resources (whose
-// hits are filtered per resource) reads:{ns}:scope:{digest}, and then the
-// subject too. A reader that reads no private namespace gets the public
-// answer, whose gs is that of the empty subject set. at is the
-// combined checkpoint (§B.5), text(trunc160(sha256(canonical({ ns: ns_id,
-// … })))), over the namespaces the answer covers that the index has
-// reached; namespaces lists them. So writes in namespaces the reader can't
-// see never move it.
+// gs is computed as for subject sets (§B.11.5), over markers of what the
+// answer depends on: for every private namespace the reader reads
+// unrestricted (§C.5), reads:{ns}, or for a grant that reads only some of
+// its resources (whose hits are filtered per resource)
+// reads:{ns}:scope:{digest}, digest covering the rules its reads there are
+// judged by and the /principal values they refer to (readsScope); a
+// namespace where those rules refer to /now counts as unreadable. A
+// reader with no marker gets the public answer, whose gs is that of the
+// empty set. at is the combined checkpoint (§B.5),
+// text(trunc160(sha256(canonical({ ns: ns_id, … })))), over the
+// namespaces the answer covers; namespaces lists them. So writes in
+// namespaces the reader can't see never move it. If the namespace document
+// of one the grant names can't be read, the answer is 502; one the grant
+// doesn't name is then left out, as a private one.
 //
 // Hits from sealed and e2e namespaces carry ns, resource, id and url in the
 // clear and the rest as "sealed": a JWE under the resource's K_r, pl { ns,
@@ -60,30 +69,32 @@ import (
 // so it is sealed once.
 //
 // Every answer computed, including the one a redirect names, is kept for
-// refsKeepFor and answered 200 at its at however far the namespaces move
+// kept.For and answered 200 at its at however far the namespaces move
 // meanwhile (the combined at moves with any of them), as long as the reader
 // may still see every namespace it covers. A purge drops kept answers that
 // carry a tag it purges (Index.refsPurged, from Apply).
 
-// Keeping answers (refsKept).
+// Keeping answers (Index.refs): at most refsKeepBytes, all in one scope,
+// since a purge of any namespace may drop any answer.
 const (
-	refsKeepFor   = time.Minute
 	refsKeepBytes = 16 << 20
+	refsScope     = "_refs"
 )
 
 // refsQuery is a parsed GET /_refs query.
 type refsQuery struct {
-	ref          *RefFilter
-	mins         []MinRef
-	limit, after int
+	ref                *RefFilter
+	mins               []MinRef
+	limit              int
+	afterNS, afterName string // after, split at its first "/"
 }
 
 func parseRefsQuery(v url.Values) (*refsQuery, error) {
 	pv := url.Values{}
 	for k, vals := range v {
 		switch k {
-		case "to":
-		case "min", "limit", "after":
+		case "to", "after":
+		case "min", "limit":
 			pv[k] = vals
 		default:
 			return nil, fmt.Errorf("unknown parameter %q", k)
@@ -91,6 +102,9 @@ func parseRefsQuery(v url.Values) (*refsQuery, error) {
 	}
 	if len(v["to"]) != 1 {
 		return nil, errors.New("to is required, once")
+	}
+	if len(v["after"]) > 1 {
+		return nil, errors.New("after given more than once")
 	}
 	ref, err := ParseRefFilter(v.Get("to"))
 	if err != nil {
@@ -105,7 +119,14 @@ func parseRefsQuery(v url.Values) (*refsQuery, error) {
 			return nil, errors.New("min must be {ns}:{ns_id}")
 		}
 	}
-	return &refsQuery{ref: ref, mins: q.Mins, limit: q.Limit, after: q.After}, nil
+	rq := &refsQuery{ref: ref, mins: q.Mins, limit: q.Limit}
+	if s := v.Get("after"); s != "" {
+		var ok bool
+		if rq.afterNS, rq.afterName, ok = strings.Cut(s, "/"); !ok {
+			return nil, errors.New("after must be {ns}/{name}")
+		}
+	}
+	return rq, nil
 }
 
 // refsReader is who asks: the namespaces its subject set may see and how.
@@ -135,47 +156,52 @@ func (ix *Index) refsNamespaces() []string {
 	return nss
 }
 
-// refsReader runs the read check of every namespace served (refsAccess):
-// a namespace the reader may not read is left out, and if that leaves
-// none, the answer is a refusal that names none of them (one the reader
-// can't see is like one the service doesn't follow): 401 if any refusal
-// is, else 403.
+// refsReader runs the read check of every namespace the answer may cover
+// (refsAccess): a namespace the reader may not read is left out, and if
+// that leaves none, the answer is a refusal that names none of them (one
+// the reader can't see is like one the service doesn't follow): 401 if any
+// refusal is, else 403.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, error) {
 	rd := &refsReader{public: true, allow: map[string]func(string) bool{}}
 	var (
-		v          *grant.Verified
-		markers    []string
-		restricted bool
-		refused    int
+		markers []string
+		refused int
 	)
+	refuse := func(status int) {
+		if refused != 401 {
+			refused = status
+		}
+	}
 	g, _ := ix.checker.Decode(bearer(r)) // nil: no usable grant
 	for _, ns := range ix.refsNamespaces() {
-		if _, purged, _ := ix.state(ns); purged || ix.keys.Skipped(ns) != "" {
+		if cur, purged, _ := ix.state(ns); cur == "" || purged || ix.keys.Skipped(ns) != "" {
 			continue
 		}
 		a, err := ix.refsAccess(ctx, ns, r, g)
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
-			if refused != 401 {
-				refused = ae.Status
-			}
+			refuse(ae.Status)
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
+		if !a.public {
+			// a.all (ReadsAll) also counts the grant's roles that don't
+			// read the namespace whole; one that does is enough (§C.5).
+			marker := "reads:" + ns
+			if !a.all && !ix.checker.ReadsUnrestricted(a.v) {
+				digest, ok := readsScope(a.v)
+				if !ok {
+					refuse(403)
+					continue
+				}
+				marker += ":scope:" + digest
+				rd.allow[ns] = func(name string) bool { return ix.checker.AllowsRead(a.v, name) }
+			}
+			rd.public, markers = false, append(markers, marker)
+		}
 		rd.nss = append(rd.nss, ns)
-		if a.public {
-			continue
-		}
-		rd.public, v = false, a.v
-		if a.all {
-			markers = append(markers, "reads:"+ns)
-		} else {
-			restricted = true
-			markers = append(markers, "reads:"+ns+":scope:"+scopeDigest(a.v))
-			rd.allow[ns] = func(name string) bool { return ix.checker.AllowsRead(a.v, name) }
-		}
 	}
 	switch {
 	case len(rd.nss) > 0 || refused == 0:
@@ -184,31 +210,73 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, 
 	default:
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant reads no namespace the service follows"}
 	}
-	var subjects []string
-	if v != nil {
-		subjects = append(grantcheck.SubjectSet(v, restricted), markers...)
-	}
-	rd.gs = grantcheck.SubjectSetID(subjects)
+	rd.gs = grantcheck.SubjectSetID(markers)
 	return rd, nil
 }
 
 // refsAccess is access to ns with the bearer decoded once (g; nil if there
 // is none or it doesn't decode): a private namespace is refused without
 // verifying a grant that doesn't name it, which §C.2 refuses first anyway.
+// The namespace document decides; if it can't be read, that is an error
+// for one the grant names, and one it doesn't is refused as if private.
 func (ix *Index) refsAccess(ctx context.Context, ns string, r *http.Request, g *grant.Grant) (*access, error) {
+	named := g != nil && g.NamesNS(ns)
 	cfg, err := ix.checker.Config(ctx, ns)
-	if err != nil {
+	if err != nil && named {
 		return nil, err
 	}
 	switch {
-	case cfg.Read == "public":
+	case err == nil && cfg.Read == "public":
 		return &access{public: true, all: true}, nil
 	case g == nil:
 		return nil, &grant.AuthError{Status: 401, Msg: "no usable grant"}
-	case !g.NamesNS(ns):
+	case !named:
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not apply to the namespace"}
 	}
 	return ix.access(ctx, ns, r)
+}
+
+// readsScope digests what the reads of a grant that reads a namespace only
+// in part depend on (§A.4): the rules they are judged by there (its key's
+// scope, its blocks' and those of its roles that grant read, §C.5) and the
+// /principal values those refer to, so readers with the same rules and
+// values share answers. It reports false if a rule refers to /now (or the
+// whole envelope): the namespace then counts as unreadable, since an answer
+// at a given at can't change.
+func readsScope(v *grant.Verified) (string, bool) {
+	lists := [][]any{v.KeyRules, v.BlockRules}
+	roles := map[string]any{}
+	_, readers := v.Allows("read")
+	for _, role := range readers {
+		roles[role] = v.RoleRules(role)
+		lists = append(lists, v.RoleRules(role))
+	}
+	env := map[string]any{"principal": v.Principal.Envelope()}
+	principal := map[string]any{}
+	for _, l := range lists {
+		for _, rv := range l {
+			r, err := rules.Compile(rv)
+			if err != nil {
+				return "", false // it refuses every read anyway
+			}
+			for _, p := range r.RefPaths() {
+				switch {
+				case len(p) == 0 || p[0] == "now":
+					return "", false
+				case p[0] == "principal":
+					if x, ok := pointer.Get(env, p); ok {
+						principal[p.String()] = x
+					}
+				}
+			}
+		}
+	}
+	x := map[string]any{
+		"readScope": v.Key.ReadScopeResource, "keyRules": v.KeyRules, "blockRules": v.BlockRules,
+		"roles": roles, "principal": principal,
+	}
+	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(x)))
+	return ids.FromBytes(sum[:ids.Size]).String(), true
 }
 
 // combinedAt is the combined checkpoint of §B.5 over cps (ns → ns_id).
@@ -299,23 +367,29 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			return
 		}
 	}
+	// target is the canonical URL of the answer at an at: what redirects
+	// name, what answers are kept under, and the view a sealed hit is
+	// bound to (§E.2.6), so an answer with one is served there alone.
+	target := func(at string) string { return "/_refs/at/" + at + "/g/" + rd.gs + encodeQuery(vals, "min") }
+	if at != "" {
+		// An at that already includes every min answers (§A.4).
+		if st, bound, ok := ix.refsStored(ctx, rd, target(at)); ok && ix.refsIncludes(ctx, st, rq.mins) {
+			if bound && r.URL.RequestURI() != target(at) {
+				setPtr()
+				redirect(w, target(at))
+				return
+			}
+			ix.writeRefs(w, rd, at, st)
+			return
+		}
+	}
 	if !ix.waitMins(ctx, rq.mins) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
 		return
 	}
-	target := func(at string) string { return "/_refs/at/" + at + "/g/" + rd.gs + encodeQuery(vals, "min") }
-	// Only the canonical form of an at URL is answered: a sealed hit is
-	// bound to it (§E.2.6), and with ?min= only the current at is.
-	canonical := at != "" && len(rq.mins) == 0 && r.URL.RequestURI() == target(at)
-	if canonical {
-		if st, ok := ix.refsStored(ctx, rd, target(at)); ok {
-			ix.writeRefs(w, rd, at, st)
-			return
-		}
-	}
-	st, cur, err := ix.refsAnswer(ctx, rd, rq, vals, target)
+	st, cur, bound, err := ix.refsAnswer(ctx, rd, rq, target)
 	if err != nil {
 		if errors.Is(err, errRefsKeys) {
 			w.Header().Set("Retry-After", "5")
@@ -326,7 +400,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
 		return
 	}
-	if !canonical || at != cur {
+	if at != cur || bound && r.URL.RequestURI() != target(at) {
 		setPtr()
 		redirect(w, target(cur))
 		return
@@ -334,53 +408,89 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	ix.writeRefs(w, rd, cur, st)
 }
 
+// refsIncludes reports whether an answer's at includes every min: its
+// checkpoint of min's namespace is min or, as the core's log says, after
+// it (since=min is accepted only if min is in the chain up to it, §7.1).
+func (ix *Index) refsIncludes(ctx context.Context, st derived.Stored, mins []MinRef) bool {
+	if len(mins) == 0 {
+		return true
+	}
+	var body struct {
+		Namespaces map[string]string `json:"namespaces"`
+	}
+	if err := json.Unmarshal(st.Body, &body); err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for _, m := range mins {
+		id, ok := body.Namespaces[m.NS]
+		if !ok {
+			return false
+		}
+		if id == m.ID {
+			continue
+		}
+		if _, _, err := ix.c.NSLogPage(ctx, m.NS, id, m.ID); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 var errRefsKeys = errors.New("the index cannot obtain the key that seals results of a namespace asked")
 
-// refsStored returns the answer kept or stored at url while rd may still
-// see every namespace it covers (its idx: tags). A namespace that turned
-// private, or that the index left, moves no gs: public ones add no marker.
-func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (derived.Stored, bool) {
-	st, ok := ix.refs.get(url, ix.opt.Now())
+// refsStored returns the answer kept or stored at url, and whether it is
+// bound to url (it has sealed hits), while rd may still see every
+// namespace it covers (its idx: tags). A namespace that turned private, or
+// that the index left, moves no gs: public ones add no marker.
+func (ix *Index) refsStored(ctx context.Context, rd *refsReader, url string) (derived.Stored, bool, bool) {
+	st, bound, ok := ix.refs.Get(url)
 	if !ok {
 		if st, ok = ix.sealed.Get(ctx, url); !ok {
-			return st, false
+			return st, false, false
 		}
+		bound = true
 	}
 	for _, t := range strings.Split(st.Tags, ",") {
 		if ns, ok := strings.CutPrefix(t, "idx:"); ok && !slices.Contains(rd.nss, ns) {
-			return derived.Stored{}, false
+			return derived.Stored{}, false, false
 		}
 	}
-	return st, true
+	return st, bound, true
 }
 
 // refsAnswer computes the answer at the current combined checkpoint, keeps
-// it, and returns it with that checkpoint. An answer read before a purge
-// that is applied before it is kept is computed again (refsKept.put).
-func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, vals url.Values, target func(string) string) (derived.Stored, string, error) {
+// it, and returns it with that checkpoint and whether it is bound to its
+// URL. An answer read before a purge of what it shows, which is then not
+// kept, is computed again.
+func (ix *Index) refsAnswer(ctx context.Context, rd *refsReader, rq *refsQuery, target func(string) string) (derived.Stored, string, bool, error) {
 	for try := 0; ; try++ {
-		gens := ix.refs.generations(rd.nss)
-		st, at, err := ix.refsCompute(ctx, rd, rq, vals, target)
-		if err != nil || ix.refs.put(target(at), rd.nss, gens, ix.opt.Now(), &st) || try == 2 {
-			return st, at, err
+		gen := ix.refs.Generation(refsScope)
+		st, at, bound, err := ix.refsCompute(ctx, rd, rq, target)
+		if err != nil {
+			return st, at, bound, err
+		}
+		if st, ok := ix.refs.Put(target(at), refsScope, gen, bound, st); ok || try == 2 {
+			return st, at, bound, nil
 		}
 	}
 }
 
-func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery, vals url.Values, target func(string) string) (derived.Stored, string, error) {
+func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery, target func(string) string) (derived.Stored, string, bool, error) {
 	tx, err := ix.db.BeginTx(ctx, nil)
 	if err != nil {
-		return derived.Stored{}, "", err
+		return derived.Stored{}, "", false, err
 	}
 	defer tx.Rollback()
 	cps, err := ix.refsCheckpoints(ctx, tx, rd.nss)
 	if err != nil {
-		return derived.Stored{}, "", err
+		return derived.Stored{}, "", false, err
 	}
 	at := combinedAt(cps)
 	view := target(at)
-	if st, ok := ix.refsStored(ctx, rd, view); ok {
-		return st, at, nil
+	if st, bound, ok := ix.refsStored(ctx, rd, view); ok {
+		return st, at, bound, nil
 	}
 	nss := make([]string, 0, len(cps))
 	for ns := range cps {
@@ -389,40 +499,43 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	sort.Strings(nss)
 
 	// The page: each namespace's referrers in resource order (refs_t,
-	// as ?ref= reads them), the reader's per-resource filter applied.
-	q := &Query{Ref: rq.ref}
-	fs := q.filters()
+	// as ?ref= reads them) from after on, the reader's per-resource filter
+	// applied.
 	var hits []Hit
 	var hitNS []string
-	n, more := 0, false
+	more := false
 	for _, ns := range nss {
-		stmt, args := ix.candidateSQL(ns, q, fs, 0)
+		if ns < rq.afterNS {
+			continue
+		}
+		q := &Query{Ref: rq.ref}
+		if ns == rq.afterNS {
+			q.AfterName = rq.afterName
+		}
+		stmt, args := ix.candidateSQL(ns, q, q.filters(), 0)
 		rows, err := tx.QueryContext(ctx, stmt, args...)
 		if err != nil {
-			return derived.Stored{}, "", err
+			return derived.Stored{}, "", false, err
 		}
 		allow := rd.allow[ns]
 		for rows.Next() {
 			var h Hit
 			if err := rows.Scan(&h.docid, &h.Resource, &h.ID, &h.Schema, &h.Score); err != nil {
 				rows.Close()
-				return derived.Stored{}, "", err
+				return derived.Stored{}, "", false, err
 			}
 			if allow != nil && !allow(h.Resource) {
 				continue
 			}
-			n++
-			if n > rq.after {
-				if len(hits) == rq.limit {
-					more = true
-					break
-				}
-				hits, hitNS = append(hits, h), append(hitNS, ns)
+			if len(hits) == rq.limit {
+				more = true
+				break
 			}
+			hits, hitNS = append(hits, h), append(hitNS, ns)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {
-			return derived.Stored{}, "", err
+			return derived.Stored{}, "", false, err
 		}
 		if more {
 			break
@@ -437,13 +550,13 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 			j++
 		}
 		if err := ix.attachFacets(ctx, tx, ns, hits[i:j]); err != nil {
-			return derived.Stored{}, "", err
+			return derived.Stored{}, "", false, err
 		}
 		if err := ix.attachSorts(ctx, tx, ns, hits[i:j]); err != nil {
-			return derived.Stored{}, "", err
+			return derived.Stored{}, "", false, err
 		}
 		if err := ix.attachRefs(ctx, tx, ns, rq.ref, hits[i:j]); err != nil {
-			return derived.Stored{}, "", err
+			return derived.Stored{}, "", false, err
 		}
 		withHits, i = append(withHits, ns), j
 	}
@@ -454,7 +567,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 		info, key, err := ix.keys.Current(ctx, ns)
 		if err != nil {
 			ix.opt.Logf("index: keys of %s: %v", ns, err)
-			return derived.Stored{}, "", errRefsKeys
+			return derived.Stored{}, "", false, errRefsKeys
 		}
 		if info.Protected() {
 			keys[ns] = key
@@ -489,7 +602,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 			// its resource's key.
 			jwe, err := derived.SealItem(key, derived.View{NS: ns, Target: view}, h.Resource, m)
 			if err != nil {
-				return derived.Stored{}, "", fmt.Errorf("sealing a hit: %w", err)
+				return derived.Stored{}, "", false, fmt.Errorf("sealing a hit: %w", err)
 			}
 			m = map[string]any{"sealed": jwe}
 		}
@@ -500,16 +613,12 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 	}
 	body := map[string]any{"at": at, "namespaces": cps, "hits": out}
 	if more {
-		nv := url.Values{}
-		for k, v := range vals {
-			nv[k] = v
-		}
-		nv.Set("after", strconv.Itoa(rq.after+len(hits)))
-		body["next"] = "/_refs/at/" + at + "/g/" + rd.gs + encodeQuery(nv, "min")
+		// The after of the following page.
+		body["next"] = hitNS[len(hits)-1] + "/" + hits[len(hits)-1].Resource
 	}
 	b, err := derived.Marshal(body)
 	if err != nil {
-		return derived.Stored{}, "", err
+		return derived.Stored{}, "", false, err
 	}
 	st := derived.Stored{Body: b, JSON: true, Tags: strings.Join(tags, ",")}
 	if len(keys) > 0 {
@@ -525,7 +634,7 @@ func (ix *Index) refsCompute(ctx context.Context, rd *refsReader, rq *refsQuery,
 			}
 		}
 	}
-	return st, at, nil
+	return st, at, len(keys) > 0, nil
 }
 
 // queryer runs queries (a *sql.DB or *sql.Tx).
@@ -577,111 +686,9 @@ func (ix *Index) refsPurged(ctx context.Context, ns string, tags []string) {
 	if len(tags) == 0 {
 		return
 	}
-	ix.refs.purge(ns, tags)
+	ix.refs.Purge(refsScope, tags)
 	tags = slices.DeleteFunc(slices.Clone(tags), func(t string) bool { return t == countsTag(ns) })
 	if err := ix.sealed.Purge(ctx, ix.db, tags); err != nil {
 		ix.opt.Logf("index: purging sealed results of /_refs: %v", err)
 	}
-}
-
-// refsKept keeps answers in memory, under their at URLs, for refsKeepFor
-// and at most refsKeepBytes, oldest out first. The zero value is ready.
-type refsKept struct {
-	mu     sync.Mutex
-	m      map[string]*list.Element // URL → *refsEntry
-	order  list.List                // oldest first
-	size   int
-	purges map[string]uint64 // ns → purges applied so far
-}
-
-type refsEntry struct {
-	url  string
-	tags []string
-	exp  time.Time
-	st   derived.Stored
-}
-
-func (e *refsEntry) bytes() int { return len(e.url) + len(e.st.Body) + len(e.st.Tags) }
-
-// generations are the purges applied so far to each of nss.
-func (k *refsKept) generations(nss []string) []uint64 {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	gens := make([]uint64, len(nss))
-	for i, ns := range nss {
-		gens[i] = k.purges[ns]
-	}
-	return gens
-}
-
-func (k *refsKept) get(url string, now time.Time) (derived.Stored, bool) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.expire(now)
-	if el, ok := k.m[url]; ok {
-		return el.Value.(*refsEntry).st, true
-	}
-	return derived.Stored{}, false
-}
-
-// put keeps *st as url's answer unless one is kept already (then *st
-// becomes that one: the first writer wins) or one of nss had a purge since
-// gens; it reports whether *st is kept.
-func (k *refsKept) put(url string, nss []string, gens []uint64, now time.Time, st *derived.Stored) bool {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	k.expire(now)
-	if el, ok := k.m[url]; ok {
-		*st = el.Value.(*refsEntry).st
-		return true
-	}
-	for i, ns := range nss {
-		if k.purges[ns] != gens[i] {
-			return false
-		}
-	}
-	if k.m == nil {
-		k.m = map[string]*list.Element{}
-	}
-	e := &refsEntry{url: url, tags: strings.Split(st.Tags, ","), exp: now.Add(refsKeepFor), st: *st}
-	k.m[url] = k.order.PushBack(e)
-	k.size += e.bytes()
-	for k.size > refsKeepBytes {
-		k.remove(k.order.Front())
-	}
-	return true
-}
-
-// purge drops the answers carrying any of tags, and makes answers read
-// before it unkeepable.
-func (k *refsKept) purge(ns string, tags []string) {
-	k.mu.Lock()
-	defer k.mu.Unlock()
-	if k.purges == nil {
-		k.purges = map[string]uint64{}
-	}
-	k.purges[ns]++
-	set := map[string]bool{}
-	for _, t := range tags {
-		set[t] = true
-	}
-	for el := k.order.Front(); el != nil; {
-		next := el.Next()
-		if slices.ContainsFunc(el.Value.(*refsEntry).tags, func(t string) bool { return set[t] }) {
-			k.remove(el)
-		}
-		el = next
-	}
-}
-
-func (k *refsKept) expire(now time.Time) {
-	for el := k.order.Front(); el != nil && !now.Before(el.Value.(*refsEntry).exp); el = k.order.Front() {
-		k.remove(el)
-	}
-}
-
-func (k *refsKept) remove(el *list.Element) {
-	e := k.order.Remove(el).(*refsEntry)
-	delete(k.m, e.url)
-	k.size -= e.bytes()
 }

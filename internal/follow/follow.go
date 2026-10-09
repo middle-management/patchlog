@@ -343,7 +343,7 @@ func (n *nsFollower) bootstrapBranch(ctx context.Context) error {
 func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *client.NSEntry) error {
 	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.Heads(ctx, n.ns, at) })
 	if isPurged(err) {
-		return n.deliverPurged(ctx)
+		return n.deliverPurged(ctx, err)
 	}
 	if err != nil {
 		return err
@@ -366,15 +366,22 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *clien
 // deliverPurged stands in for the /heads listing of a purged namespace,
 // which is 410 purged at any revision (§8.5): the namespace's log ends with
 // its purge-ns entry, which is how a consumer learns of it otherwise (§10),
-// and nothing is written after it, so the head is that entry. It is
-// delivered as a synthetic purge-ns unit at the head, and Run ends with
+// and nothing is written after it, so the head is that entry. The 410
+// names it as head; from a core that doesn't, it is read from /ns/{ns}. It
+// is delivered as a synthetic purge-ns unit at the head, and Run ends with
 // ErrPurged.
-func (n *nsFollower) deliverPurged(ctx context.Context) error {
-	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
-	if err != nil {
-		return err
+func (n *nsFollower) deliverPurged(ctx context.Context, gone error) error {
+	var head string
+	if ae, ok := client.AsAPIError(gone); ok {
+		head = ae.Head()
 	}
-	head := v.(*client.NSHead).ID
+	if head == "" {
+		v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.NSHead(ctx, n.ns) })
+		if err != nil {
+			return err
+		}
+		head = v.(*client.NSHead).ID
+	}
 	u := Unit{Entry: client.NSEntry{ID: head, Kind: "purge-ns"}, Synthetic: true}
 	if err := n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: []Unit{u}, From: n.cur, NewCheckpoint: head, Snapshot: true}); err != nil {
 		return err

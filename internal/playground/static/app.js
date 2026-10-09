@@ -3352,6 +3352,16 @@ async function srGet(path, ns) {
   return { r, view, body };
 }
 
+/* srNextPath is the URL of the page after a result at view: next itself, or for a ref query without q or sort, which
+ * pages by name (§A.4), view with next as its after. */
+function srNextPath(view, next) {
+  if (next.startsWith('/')) return INDEX + next;
+  const [p, qs] = view.split('?');
+  const u = new URLSearchParams(qs || '');
+  u.set('after', next);
+  return `${INDEX}${p}?${u}`;
+}
+
 /* runSearch queries the namespace in the page's fields, or fetches the next page of the last result. */
 async function runSearch(more) {
   if (SR.busy) return;
@@ -3363,7 +3373,7 @@ async function runSearch(more) {
   if (!ns) return toast('Pick a namespace');
   if (!NODE_RE.test(ns)) return toast('Not a namespace name');
   let path;
-  if (more) path = INDEX + SR.next;
+  if (more) path = srNextPath(SR.view, SR.next);
   else {
     let p;
     try { p = srParams(ns); } catch (err) { return srMessage('err', err.message); }
