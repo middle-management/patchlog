@@ -133,8 +133,9 @@ func serve(args []string) {
 	indexURL := fs.String("index-url", "", "search index (Addendum A) the playground reads through a read-only proxy at "+server.IndexProxyPrefix+", e.g. http://index:8081; one index serves several namespaces")
 	schemaFetch := fs.Bool("schema-fetch", false, "let the playground's schema import fetch http(s) URLs (off: it takes uploaded files only); private, loopback and link-local addresses are refused unless the host is in -schema-fetch-hosts")
 	schemaHosts := fs.String("schema-fetch-hosts", "", "comma-separated hosts -schema-fetch is limited to, e.g. www.schemastore.org,raw.githubusercontent.com (also trusted with private addresses)")
-	maxItems := fs.Int("max-items-per-batch", 0, "deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it (§6.6)")
-	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB)")
+	maxItems := fs.Int("max-items-per-batch", 0, "deployment maximum items per batch (default: the namespace default, 1000); allowances may go up to it, "+
+		"so an atomic import of more items needs it raised (§6.6)")
+	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB); allowances may go up to it (§6.6)")
 	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
 	maxBlobPending := fs.String("max-blob-pending", "", "deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)")
 	logPageSize := fs.Int("log-page-size", 0, "log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)")

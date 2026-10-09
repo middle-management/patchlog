@@ -75,7 +75,7 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 			err := im.retry(ctx, func() error {
 				at := im.opt.Now()
 				bid, err := im.c.UploadBlob(ctx, it.ns, it.name, line.Type, line.Nonce, line.Data)
-				im.blobDrew(it.ns, at, err)
+				im.blobDrew(it.ns, it.name, at, err)
 				if err == nil && bid != nd.bid {
 					err = fmt.Errorf("uploaded as %s", bid)
 				}
@@ -118,8 +118,7 @@ var errViaSource = errors.New("import: the batch's source doesn't make its blobs
 // prepare sends a batch's blobs and dry-runs it. If the dry run fails only
 // for blobs left to the batch's local source (the importer can't read the
 // source unrestricted, so it makes none available, §7.5), they are copied
-// or uploaded after all, for that namespace from then on, and the batch is
-// dry-run again.
+// or uploaded after all (sendAll), and the batch is dry-run again.
 func (im *importer) prepare(ctx context.Context, b *batch, l limits, deferOK bool) error {
 	if err := im.sendBlobs(ctx, b, l); err != nil {
 		return err
@@ -128,14 +127,20 @@ func (im *importer) prepare(ctx context.Context, b *batch, l limits, deferOK boo
 	if !errors.Is(err, errViaSource) {
 		return err
 	}
+	if err := im.sendAll(ctx, b, l); err != nil {
+		return err
+	}
+	return im.dryRun(ctx, b, deferOK)
+}
+
+// sendAll sends the blobs a batch left to its local source after all, for
+// its namespace from then on.
+func (im *importer) sendAll(ctx context.Context, b *batch, l limits) error {
 	if im.noSource == nil {
 		im.noSource = map[string]bool{}
 	}
 	im.noSource[b.n.ns] = true
-	if err := im.sendBlobs(ctx, b, l); err != nil {
-		return err
-	}
-	return im.dryRun(ctx, b, deferOK)
+	return im.sendBlobs(ctx, b, l)
 }
 
 // copyBlob copies a blob within the deployment (§7.8 Copying) and reports
@@ -145,17 +150,19 @@ func (im *importer) copyBlob(ctx context.Context, ns, name, bid, fromNS, fromNam
 	return im.retry(ctx, func() error {
 		at := im.opt.Now()
 		err := im.c.CopyBlob(ctx, ns, name, bid, fromNS, fromName, "")
-		im.blobDrew(ns, at, err)
+		im.blobDrew(ns, name, at, err)
 		return err
 	}) == nil
 }
 
-// blobDrew records the token a blob upload or copy into ns, sent at at,
-// drew (§6.6, §7.8): any the server didn't refuse with 429, since a copy
-// whose source it refuses has drawn all the same.
-func (im *importer) blobDrew(ns string, at time.Time, err error) {
+// blobDrew records the token a blob upload or copy into ns/name, sent at
+// at, drew (§6.6, §7.8): any the server didn't refuse with 429, since a
+// copy whose source it refuses has drawn all the same. It also counts the
+// time it took.
+func (im *importer) blobDrew(ns, name string, at time.Time, err error) {
+	im.timed(&im.rep.Timings.Blobs, at)
 	if !client.IsRateLimited(err) {
-		im.drew(ns, at, 1)
+		im.drew(ns, at, 1, name)
 	}
 }
 
@@ -167,13 +174,9 @@ func (im *importer) retry(ctx context.Context, fn func() error) error {
 		if err == nil || !client.Retryable(err) || attempt >= im.opt.MaxRetries || ctx.Err() != nil {
 			return err
 		}
-		wait := backoff
-		if ae, ok := client.AsAPIError(err); ok && ae.RetryAfter > 0 {
-			wait = ae.RetryAfter
-		}
-		backoff *= 2
-		if err := im.opt.Sleep(ctx, wait); err != nil {
+		if err := im.wait(ctx, err, backoff); err != nil {
 			return err
 		}
+		backoff *= 2
 	}
 }
