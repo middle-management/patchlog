@@ -365,6 +365,12 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 	return grant.Verify(g, env)
 }
 
+// Decode decodes a bearer token as Verify does, without verifying it, so a
+// caller checking many namespaces can see which ones it names first.
+func (ch *Checker) Decode(token string) (*grant.Grant, error) {
+	return grant.Decode(token, ch.maxGrant)
+}
+
 // unreadable reports a namespace document the checker can't fetch because
 // the namespace doesn't exist or the origin refuses the checker (§7 answers
 // both alike), so no key can verify a grant for it.
