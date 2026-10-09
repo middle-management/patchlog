@@ -85,6 +85,9 @@ FUNCTIONS
   S.ns = 'o';
   const gg = await undoRun('o', input.go, { nonce: needsNonce(null) });
   out.nonceG = { ok: !!gg.ok, steps: gg.ok ? gg.plan.items[0].steps : null, err: gg.refused || gg.impossible || '' };
+  // H: there, an array has no member to add: its inverse goes without one.
+  const hh = await undoRun('o', input.ga, { nonce: needsNonce(null) });
+  out.nonceH = { ok: !!hh.ok, steps: hh.ok ? hh.plan.items[0].steps : null, err: hh.refused || hh.impossible || '' };
   // The stack, rebuilt from the namespace log.
   S.ns = 'docs';
   const st = undoStackFrom(await undoNSLog('docs'), 'alice');
@@ -193,6 +196,10 @@ func TestUndoWithNode(t *testing.T) {
 	check(w, err)
 	gO := client.NewGesture()
 	check(alice.Append(ctx, "o", "a", w.ID, ops(op("replace", "/t", 2)), client.WithGesture(gO)))
+	w, err = alice.Create(ctx, "o", "arr", client.GenesisPatches([]any{1, 2}))
+	check(w, err)
+	gA := client.NewGesture()
+	check(alice.Append(ctx, "o", "arr", w.ID, ops(op("add", "/-", 3)), client.WithGesture(gA)))
 	s.Clock.Advance(10 * time.Minute)
 	check(alice.Prune(ctx, "docs", "p", client.PruneRequest{Horizon: horizon}))
 	fk, err := alice.FetchKeys(ctx, "s", nil, nil)
@@ -218,7 +225,7 @@ func TestUndoWithNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	in, _ := json.Marshal(map[string]any{"base": s.URL, "author": "alice", "key": base64.RawURLEncoding.EncodeToString(fk[0].Key),
-		"g": g, "gd": gd, "gp": gp, "gm": gm, "gs": gs, "gn": gn, "go": gO})
+		"g": g, "gd": gd, "gp": gp, "gm": gm, "gs": gs, "gn": gn, "go": gO, "ga": gA})
 	inPath := filepath.Join(dir, "input.json")
 	if err := os.WriteFile(inPath, in, 0o644); err != nil {
 		t.Fatal(err)
@@ -259,7 +266,7 @@ func TestUndoWithNode(t *testing.T) {
 			Source, Err string
 			Steps       []any
 		}
-		NonceF, NonceG struct {
+		NonceF, NonceG, NonceH struct {
 			OK    bool
 			Err   string
 			Steps []any
@@ -339,6 +346,12 @@ func TestUndoWithNode(t *testing.T) {
 	}
 	if od, _ := doc("o", "a"); od["t"] != float64(1) || !seal.ValidNonce(od["$nonce"].(string)) {
 		t.Errorf("o/a after the undo: %v", od)
+	}
+	if !out.NonceH.OK || len(out.NonceH.Steps) != 1 || strings.Contains(string(jsonv.Canonical(jsonv.FromGo(out.NonceH.Steps))), `"path":"/$nonce"`) {
+		t.Errorf("nonce H %+v", out.NonceH)
+	}
+	if _, d, err := alice.Load(ctx, "o", "arr"); err != nil || !jsonv.Equal(d.Value, jsonv.FromGo([]any{1, 2})) {
+		t.Errorf("o/arr after the undo: %v %v", d, err)
 	}
 	// gd conflicted and gp was impossible, so both stand; g was undone and
 	// redone; gm was undone.

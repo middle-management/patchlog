@@ -695,7 +695,7 @@ async function writeRes(kind) {
   if (usesPatch && $('addNonce').checked) {
     const p = tryParse(patch);
     if (!p.ok || !Array.isArray(p.v)) return toast('The patch set is not a JSON array');
-    patch = fmtPatch(withNonce(p.v));
+    if (nonceFits(kind, p.v)) patch = fmtPatch(withNonce(p.v));
   }
   // Every save is one user action, with its own Gesture (§7.2, §11.2 Recording), unless "same gesture" is on.
   const gesture = takeGesture();
@@ -704,7 +704,7 @@ async function writeRes(kind) {
   else if (kind === 'append') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body: patch });
   else if (kind === 'restore') {
     // A restore that would be [] sends just a fresh nonce where nonces are, or may be, required (§8.2, §C.7).
-    const lone = $('addNonce').checked && needsNonce(S.nsDoc);
+    const lone = $('addNonce').checked && needsNonce(S.nsDoc) && nonceFits(kind, []);
     const body = $('restoreEditor').checked ? patch : lone ? fmtPatch(withNonce([])) : '[]';
     r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body });
   }
@@ -714,6 +714,19 @@ async function writeRes(kind) {
   else if (r && r.status === 200) toast('200: idempotent retry, entry already in the log');
 }
 async function afterWrite() { await refreshNS(); await refreshRes(); }
+
+/* nonceFits reports whether the editor's patch set ops, written as kind over the document shown (the head's, or the
+ * last live one for a restore), results in an object, which a $nonce needs (§C.7), as writeSealed checks; true when
+ * that isn't known, so the server tells. */
+function nonceFits(kind, ops) {
+  const st = S.resState || {};
+  const base = kind === 'create' ? undefined : kind === 'restore' ? st.lastDoc : st.doc;
+  if (kind !== 'create' && base === undefined) return true;
+  try {
+    const d = Z.applyPatch(base, kind !== 'create', ops).doc;
+    return !!d && typeof d === 'object' && !Array.isArray(d);
+  } catch (_) { return true; }
+}
 
 async function purgeRes() {
   if (!S.ns || !S.res) return toast('Select a namespace and a resource name');
@@ -1022,8 +1035,10 @@ function planUndoResource(o) {
   if (out.conflicts.length) return out;
   const fin = folded[folded.length - 1].post;
   const st = { doc: JSON.parse(JSON.stringify(fin.doc === undefined ? null : fin.doc)), exists: fin.exists, deleted: fin.deleted };
-  const nonce = o.nonce || !!(st.doc && typeof st.doc === 'object' && !Array.isArray(st.doc) && '$nonce' in st.doc);
-  const withN = (ops) => (nonce ? ops.concat([{ op: 'add', path: '/$nonce', value: Z.newNonce() }]) : ops);
+  const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  const nonce = o.nonce || (isObj(st.doc) && '$nonce' in st.doc);
+  // Only where the patch set results in an object, as st.doc is when it is flushed: no other root has a member to add (§C.7).
+  const withN = (ops) => (nonce && isObj(st.doc) ? ops.concat([{ op: 'add', path: '/$nonce', value: Z.newNonce() }]) : ops);
   let pending = [], restore = false;
   const flush = () => {
     const ops = pending, rs = restore;

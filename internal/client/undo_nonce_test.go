@@ -75,6 +75,8 @@ func TestUndoRequiredNonces(t *testing.T) {
 // private namespace every patch-set step of its inverse adds a fresh
 // $nonce, though the document has none: one that came to require them
 // takes the undo, and so does one that doesn't, with the nonce to spare.
+// An inverse that results in an array has no member to add, so where
+// nonces are optional it is written without one.
 func TestUndoUnreadableNonces(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -87,13 +89,16 @@ func TestUndoUnreadableNonces(t *testing.T) {
 			admin := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
 			must(admin.CreateNamespace(ctx, ns, map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
 			li := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:li", []string{ns}, []string{"read", "create", "append"},
-				map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})))
+				map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"a", "arr"}}}}})))
 			if _, err := li.NonceRequired(ctx, ns); err == nil {
 				t.Fatal("li reads the namespace document")
 			}
 			w := must(li.CreateDoc(ctx, ns, "a", map[string]any{"n": 1}))
 			g := client.NewGesture()
 			must(li.Append(ctx, ns, "a", w.ID, ops(op("replace", "/n", 2)), client.WithGesture(g)))
+			w = must(li.Create(ctx, ns, "arr", client.GenesisPatches([]any{1, 2})))
+			gArr := client.NewGesture()
+			must(li.Append(ctx, ns, "arr", w.ID, ops(op("add", "/-", 3)), client.WithGesture(gArr)))
 			if setting == "required" {
 				cfg := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{ns}, []string{"read", "config"})))
 				must(cfg.PatchConfig(ctx, ns, must(cfg.NSHead(ctx, ns)).Config, ops(op("add", "/nonce", "required"))))
@@ -106,6 +111,16 @@ func TestUndoUnreadableNonces(t *testing.T) {
 			must(li.Undo(ctx, ns, g))
 			doc, _ := docOf(t, li, ns, "a")
 			sameDoc(t, "undone append", doc, map[string]any{"n": 1})
+
+			if setting == "optional" {
+				plan = must(li.PlanUndo(ctx, ns, gArr))
+				if st := plan.Resources[0].Steps; len(st) != 1 || strings.Contains(string(jsonv.Canonical(jsonv.FromGo(st[0].Patches))), `"path":"/$nonce"`) {
+					t.Fatalf("array inverse %+v", st)
+				}
+				must(li.Undo(ctx, ns, gArr))
+				_, d := must2(li.Load(ctx, ns, "arr"))
+				sameDoc(t, "undone array append", d.Value, []any{1, 2})
+			}
 		})
 	}
 }

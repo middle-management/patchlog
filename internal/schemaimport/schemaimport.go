@@ -23,8 +23,8 @@
 // A resource whose head already holds the converted content is reused as is,
 // so a re-run with unchanged sources writes nothing. In a namespace that
 // requires nonces (§C.7), or whose document the caller can't read, every
-// write adds a fresh $nonce, which the predicted ids include; a head's
-// $nonce is no part of its content.
+// write of an object schema adds a fresh $nonce, which the predicted ids
+// include; a head's $nonce is no part of its content.
 package schemaimport
 
 import (
@@ -802,8 +802,9 @@ func (p *planner) rewriterFor(d *doc, ns string, stub bool) refRewriter {
 
 // plan decides a resource's action from its head and predicts its id. The
 // patch set adds a fresh $nonce where the namespace requires nonces or the
-// caller can't read its document (nonce, §C.7), or the live head has one;
-// the head's $nonce is left out when comparing it with the content.
+// caller can't read its document (nonce, §C.7), or the live head has one,
+// if the content is an object: a boolean schema has no member to add; the
+// head's $nonce is left out when comparing it with the content.
 func plan(ctx context.Context, c *client.Client, ns string, r *Resource, nonce bool) error {
 	r.Action = Create
 	if c != nil {
@@ -835,7 +836,7 @@ func plan(ctx context.Context, c *client.Client, ns string, r *Resource, nonce b
 	} else {
 		r.Patches = []any{map[string]any{"op": "replace", "path": "", "value": r.Content}}
 	}
-	if nonce {
+	if _, obj := r.Content.(map[string]any); nonce && obj {
 		r.Patches = append(r.Patches, map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()})
 	}
 	id, err := client.ExpectedRevision(r.Parent, r.Patches)

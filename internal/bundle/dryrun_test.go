@@ -85,8 +85,11 @@ func dryRuns(rep *bundle.Report) string {
 // namespace makes one dry run however many batches it takes; one that
 // fast-forwards documents dry-runs every batch that does, and a server
 // that would give such a batch other ids stops the import before it moves
-// their heads. (BenchmarkImport's pace1 variants count the dry runs of
-// imports into a fresh deployment.)
+// their heads. A -dry-run import dry-runs the same batches, so a promotion
+// can be checked end to end. A snapshot's next diffs upstream aren't
+// dry-run but in the first batch, its merges into the target are.
+// (BenchmarkImport's pace1 variants count the dry runs of imports into a
+// fresh deployment.)
 func TestImportUpdateDryRuns(t *testing.T) {
 	t.Parallel()
 	src := newDeployment(t, stagingOrigin)
@@ -114,6 +117,11 @@ func TestImportUpdateDryRuns(t *testing.T) {
 	// a0, a1 and a4 fast-forward, a6 to a8 are created: [a0 a1], dry-run
 	// first as the namespace exists, [a4 a6], which moves a4, and [a7 a8].
 	rt = &countingTransport{rt: http.DefaultTransport}
+	rep = must(backfillVia(dst, second, rt, true))
+	if got := dryRuns(rep); got != "ok,ok," || rt.dry.Load() != 2 || rt.submits.Load() != 0 {
+		t.Fatalf("-dry-run: dry runs %q, %d dry, %d submits", got, rt.dry.Load(), rt.submits.Load())
+	}
+	rt = &countingTransport{rt: http.DefaultTransport}
 	rep = must(backfillVia(dst, second, rt, false))
 	if got := dryRuns(rep); got != "ok,ok," || rep.Timings.DryRuns != 2 || rt.dry.Load() != 2 || rt.submits.Load() != 3 {
 		t.Fatalf("update: dry runs %q, %d dry, %d submits", got, rt.dry.Load(), rt.submits.Load())
@@ -135,6 +143,30 @@ func TestImportUpdateDryRuns(t *testing.T) {
 	}
 	if dst.head("bulk", "a4").ID != before || dst.head("bulk", "a6").State != client.NotFound {
 		t.Fatal("written with ids the bundle doesn't know")
+	}
+
+	// Snapshots of a0 to a8, then of a0, a1 and a4 changed again: [a0 a1]
+	// and [a4] upstream, then into the target.
+	snapshot := func() []byte {
+		b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"bulk"}, Mode: bundle.Snapshot})
+		return b
+	}
+	dst = twoPerBatch(t)
+	dst.ns("bulk-upstream", map[string]any{"read": "public", "limits": map[string]any{"itemsPerBatch": 2}})
+	must(backfillVia(dst, snapshot(), http.DefaultTransport, false))
+	for _, i := range []int{0, 1, 4} {
+		src.append("bulk", fmt.Sprintf("a%d", i), op("replace", "/i", 10+i))
+	}
+	rep = must(backfillVia(dst, snapshot(), http.DefaultTransport, false))
+	var got []string
+	for _, br := range rep.Batches {
+		got = append(got, fmt.Sprintf("%s:%v", br.NS, br.DryRun))
+	}
+	if want := "bulk-upstream:ok bulk-upstream: bulk:ok bulk:ok"; strings.Join(got, " ") != want {
+		t.Fatalf("snapshot: dry runs %s, want %s", strings.Join(got, " "), want)
+	}
+	if dst.doc("bulk", "a4")["i"] != float64(14) {
+		t.Fatalf("a4 %v", dst.doc("bulk", "a4"))
 	}
 }
 
@@ -158,15 +190,17 @@ func TestImportBlobsBeforeDryRun(t *testing.T) {
 	dst := twoPerBatch(t)
 	must(backfillVia(dst, first, http.DefaultTransport, false))
 
-	// [a0 a1] and [a2]: a dry-run import dry-runs the first, uploading
-	// nothing, and a0's blob is missing.
+	// [a0 a1] and [a2]: a dry-run import dry-runs both, uploading nothing,
+	// and a0's and a2's blobs are missing.
 	rl := &requestLog{}
 	rep := must(backfillVia(dst, second, rl, true))
-	if got := strings.Join(rl.seq, " "); got != "dry" {
+	if got := strings.Join(rl.seq, " "); got != "dry dry" {
 		t.Fatalf("dry-run import sent %s", got)
 	}
-	if br := rep.Batches[0]; br.DryRun != "deferred" || br.Uploaded != 0 || len(br.Failures) == 0 || !strings.HasPrefix(br.Failures[0], "a0: 422 blob") {
-		t.Fatalf("batch %+v", br)
+	for i, name := range []string{"a0", "a2"} {
+		if br := rep.Batches[i]; br.DryRun != "deferred" || br.Uploaded != 0 || len(br.Failures) == 0 || !strings.HasPrefix(br.Failures[0], name+": 422 blob") {
+			t.Fatalf("batch %+v", br)
+		}
 	}
 
 	// An import sends each batch's blobs before its dry run.

@@ -555,6 +555,26 @@ func (im *importer) execute(ctx context.Context) error {
 		pending[n.ns] = true
 	}
 	if im.opt.DryRun {
+		// The batches that would move heads the target had are dry-run
+		// too, so a promotion can be checked end to end (§G.4.4 Partial
+		// failure), but for one that goes on with a chain an earlier batch
+		// cut, which needs that batch written. Failures that mean only
+		// that earlier batches haven't committed are deferred.
+		for _, n := range im.order {
+			for _, b := range n.batches[1:] {
+				if !b.updates() || b.parts[0].from > 0 {
+					continue
+				}
+				if err := im.dryRun(ctx, b, true); err != nil {
+					return err
+				}
+				if im.opt.Mode == Backfill {
+					if err := im.pace(ctx, n.ns, lims[n], ""); err != nil {
+						return err
+					}
+				}
+			}
+		}
 		return nil // the report lists conflicts and dry-run results
 	}
 
@@ -593,7 +613,13 @@ func (im *importer) execute(ctx context.Context) error {
 					return err
 				}
 				if im.opt.Mode == Backfill {
-					if err := im.pace(ctx, n.ns, lims[n], ""); err != nil {
+					// The submit draws again on the bucket of a chain the
+					// batch goes on with.
+					cut := ""
+					if p := b.parts[0]; p.from > 0 {
+						cut = p.it.name
+					}
+					if err := im.pace(ctx, n.ns, lims[n], cut); err != nil {
 						return err
 					}
 				}
@@ -672,14 +698,16 @@ func (im *importer) probe(ctx context.Context, n *node, l limits) error {
 }
 
 // updates reports whether a batch writes to a resource the target had: a
-// fast-forward, a resolved conflict, a restore, or a snapshot's next diff
-// upstream. Its new heads take effect at once, and a failure part-way
-// through the import leaves them changed (§G.4.4 Partial failure), so
-// such a batch is dry-run before its submit, its blobs sent first; creates
-// rely on their own failure report (§7.5).
+// fast-forward, a resolved conflict or a restore. Its new heads take
+// effect at once, and a failure part-way through the import leaves them
+// changed (§G.4.4 Partial failure), so such a batch is dry-run before its
+// submit, its blobs sent first; creates rely on their own failure report
+// (§7.5). So does a snapshot's next diff upstream: live references don't
+// see upstream heads, only pinned revisions (§G.4.4), and the next import
+// picks up one whose target batch didn't follow.
 func (b *batch) updates() bool {
 	for _, p := range b.parts {
-		if !p.it.ifNone {
+		if !p.it.ifNone && !p.it.upstream {
 			return true
 		}
 	}

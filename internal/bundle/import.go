@@ -87,8 +87,9 @@ type ImportOptions struct {
 	// are split again and paced by the namespace's limits. Either way a
 	// chain cut between batches goes no faster than ratePerResource.
 	Pace float64
-	// DryRun classifies, checks and dry-runs every batch that can be
-	// dry-run, and writes nothing.
+	// DryRun classifies, checks and dry-runs each namespace's first batch
+	// and every later one that moves heads the target had, but for one
+	// that goes on with a chain an earlier batch cut, and writes nothing.
 	DryRun bool
 	// NSMap maps source namespaces to target namespaces (default: the
 	// same name, §G.1). Schema namespaces must not be mapped, since
@@ -189,7 +190,7 @@ type BatchReport struct {
 	Steps     int            `json:"steps"`
 	Size      int            `json:"size"` // bytes of canonical patch sets
 	Source    map[string]any `json:"source"`
-	DryRun    string         `json:"dryRun,omitempty"` // ok, deferred, failed; "" if not dry-run (only a namespace's first batch is; its first item if the import creates it)
+	DryRun    string         `json:"dryRun,omitempty"` // ok, deferred, failed; "" if not dry-run (only a namespace's first batch is, its first item if the import creates it, and those that move heads the target had)
 	Status    int            `json:"status,omitempty"` // submit status
 	NSID      string         `json:"ns_id,omitempty"`
 	Error     string         `json:"error,omitempty"`

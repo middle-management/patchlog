@@ -29,7 +29,7 @@ package client
 //     namespaces, in those that require nonces or whose document the grant
 //     can't read, so it doesn't know the setting, a tombstone's restore
 //     then being a lone fresh $nonce, and where the current document has
-//     one (§C.7).
+//     one (§C.7), if the document it results in is an object.
 //   - The guard. The log after the gesture's last entry in each resource is
 //     compared with the paths the gesture wrote: an overlapping write, a
 //     delete, a restore or an undo of the gesture is a conflict
@@ -985,8 +985,8 @@ func (c *Client) planResource(ctx context.Context, env *undoEnv, author string, 
 			needNonce = true
 		}
 	}
-	b := &stepBuilder{env: env, nonce: needNonce}
 	st := final.clone()
+	b := &stepBuilder{env: env, nonce: needNonce, st: &st}
 	for i := len(own) - 1; i >= 0; i-- {
 		fe := own[i]
 		switch {
@@ -1161,6 +1161,7 @@ func moveBack(fe *foldedEntry, st *undoState, paths []pointer.Pointer) ([]any, b
 type stepBuilder struct {
 	env     *undoEnv
 	nonce   bool
+	st      *undoState // the inverse so far: what the pending ops result in
 	pending []any
 	restore bool // the next patch set restores: [] is needed even if empty
 	steps   []Step
@@ -1196,9 +1197,12 @@ func (b *stepBuilder) flush() {
 	b.steps = append(b.steps, PatchStep(b.withNonce(cur)))
 }
 
+// withNonce adds a fresh $nonce to a patch set where nonces are needed, if
+// the document it results in is an object: no other root has a member to
+// add (§C.7).
 func (b *stepBuilder) withNonce(ops []any) []any {
 	out := append([]any{}, ops...)
-	if b.nonce {
+	if _, obj := b.st.doc.(map[string]any); b.nonce && obj {
 		out = append(out, map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()})
 	}
 	return out
