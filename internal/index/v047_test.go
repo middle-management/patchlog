@@ -131,7 +131,7 @@ func TestPurgedBranchHeads(t *testing.T) {
 	x := startSvc(t, c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"main"}, untyped: true, branches: true})
 	x.caughtUp("main")
 	waitFor(t, "the branch's purge", func() bool { return x.ix.Checkpoint("rel") == purged })
-	if r := x.raw("/rel", ""); r.status != 410 {
+	if r := x.raw("/rel", ""); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged {
 		t.Errorf("purged branch: %d %v", r.status, r.body)
 	}
 	x.expect("/main", "a")

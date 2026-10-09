@@ -565,35 +565,39 @@ func (ch *Checker) allowsRead(v *grant.Verified, resource string) (bool, string)
 	return true, ""
 }
 
-// ReadsAll reports whether a verified grant may read every resource of the
-// namespace: no rule of its blocks, key scope or effective roles refers to
-// /resource, and its key has no readScope (as the core decides for
-// branching, §7.6). Such readers can share namespace-wide caches.
-func (ch *Checker) ReadsAll(v *grant.Verified) bool {
+// ReadsPerResource reports whether a verified grant's reads may differ
+// between resources of a namespace: its key has a readScope, or a rule of
+// its key scope, its blocks or a role that lists read refers to /resource
+// (or to the whole envelope). A grant whose reads can't reads every
+// resource or none, so one that doesn't read the namespace unrestricted
+// (ReadsUnrestricted) reads none of it.
+func (ch *Checker) ReadsPerResource(v *grant.Verified) bool {
 	if v.Key.ReadScopeResource {
-		return false
+		return true
 	}
+	_, roles := v.Allows("read")
 	lists := [][]any{v.KeyRules, v.BlockRules}
-	for _, r := range v.EffectiveRoles {
+	for _, r := range roles {
 		lists = append(lists, v.RoleRules(r))
 	}
 	for _, l := range lists {
 		for _, rv := range l {
 			r, err := ch.compile(rv)
 			if err != nil || r.Refs()["resource"] || r.Refs()["*"] {
-				return false
+				return true
 			}
 		}
 	}
-	return true
+	return false
 }
 
 // ReadsUnrestricted reports whether a verified grant reads the namespace
 // unrestricted (§C.5) and may read it now: its key has no readScope, no
 // rule of its blocks or key scope refers to /resource, they pass, and, if
 // it carries roles, so does some role that lists read and has no rule
-// referring to /resource. Unlike ReadsAll, its other roles don't count:
-// roles are alternatives (§C.1.1).
+// referring to /resource. Its other roles don't count: roles are
+// alternatives (§C.1.1). Such readers read every resource, so they can
+// share namespace-wide caches.
 func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 	ok, roles := v.Allows("read")
 	if !ok || v.Key.ReadScopeResource {

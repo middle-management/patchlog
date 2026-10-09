@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Index and tree services: a purged namespace or catalog answers `410 purged` with `head`**,
+  its `purge-ns` entry, as the core does (§8.5, §12), after the read check; it was `410 gone`
+  before any check.
+- **Index and tree services read namespaces unrestricted as §C.5 defines** (B8): one read role
+  without rules on `/resource` is enough, so a grant with a rule-free reader role and a role
+  testing `/resource` by pattern shares a plain reader's subject set and unfiltered answers,
+  where it was filtered per item. `grantcheck.ReadsAll` is gone.
+
 ## v0.16.0
 
 Implements spec **v0.49**. v0.47 settles all sixteen of the reference's v0.46 notes, most as

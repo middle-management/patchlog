@@ -166,8 +166,10 @@ func Bearer(r *http.Request) string {
 // read permissions for every node and item they list):
 //
 //   - catalog structure: everyone if the catalog is public, otherwise a
-//     grant for the catalog namespace that reads the whole namespace, or
-//     (filtered per node) one whose rules restrict /resource;
+//     grant for the catalog namespace that reads the whole namespace
+//     (unrestricted, §C.5: one read role without rules on /resource is
+//     enough, roles being alternatives), or (filtered per node) one whose
+//     rules restrict /resource;
 //   - items' heads: public content namespaces, or content namespaces the
 //     same grant reads as a whole;
 //   - with a RoleView (the catalog), listings are filtered by the reader's
@@ -223,7 +225,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 	switch {
 	case catPublic:
 		v.catAll = true
-	case readsCat && s.checker.ReadsAll(vg) && s.checker.AllowsRead(vg, ""):
+	case s.checker.ReadsUnrestricted(vg):
 		v.catAll = true
 		markers = append(markers, "catalog:all")
 	case readsCat:
@@ -244,7 +246,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		if err != nil {
 			continue
 		}
-		if ok, _ := cv.Allows("read"); ok && s.checker.ReadsAll(cv) && s.checker.AllowsRead(cv, "") {
+		if ok, _ := cv.Allows("read"); ok && s.checker.ReadsUnrestricted(cv) {
 			v.contentAll[ns] = true
 			markers = append(markers, "reads:"+real)
 			exp = grantExp(cv, exp)
@@ -456,10 +458,6 @@ func WriteAuthError(w http.ResponseWriter, err error, logf func(string, ...any))
 func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs string, isAt bool) {
 	ctx := r.Context()
 	cat := s.opt.Catalog
-	if _, purged, _ := s.state(); purged {
-		WriteError(w, http.StatusGone, "gone", "catalog purged")
-		return
-	}
 	if reason := s.keys.Skipped(cat); reason != "" {
 		w.Header().Set("Retry-After", "60")
 		WriteError(w, http.StatusServiceUnavailable, "skipped", "the service does not consume the catalog: "+reason)
@@ -482,6 +480,14 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	if !s.opt.Edge.Allow(r, v.anon) {
 		w.Header().Set("Cache-Control", "no-store")
 		WriteError(w, http.StatusForbidden, edge.Code, edge.Message)
+		return
+	}
+	// A purged catalog answers as the core's URLs of it do, after the read
+	// check: 410 purged with head, its purge-ns entry (§8.5, §12), the
+	// log's last, where the checkpoint stopped.
+	if head, purged, _ := s.state(); purged {
+		w.Header().Set("Cache-Control", "no-store")
+		WriteJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "catalog purged", "head": head})
 		return
 	}
 	setPtr := func() {

@@ -187,10 +187,8 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, 
 			return nil, err
 		}
 		if !a.public {
-			// a.all (ReadsAll) also counts the grant's roles that don't
-			// read the namespace whole; one that does is enough (§C.5).
 			marker := "reads:" + ns
-			if !a.all && !ix.checker.ReadsUnrestricted(a.v) {
+			if !a.all {
 				digest, ok := readsScope(a.v)
 				if !ok {
 					refuse(403)

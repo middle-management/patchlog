@@ -650,8 +650,15 @@ func TestPurgeNamespace(t *testing.T) {
 	cfg := must(w.c.NSHead(ctx, "matches")).Config
 	must(w.c.PatchConfig(ctx, "matches", cfg, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
 	head := must(w.c.NSHead(ctx, "matches")).ID
-	must(w.c.PurgeNamespace(ctx, "matches", head))
+	purged := must(w.c.PurgeNamespace(ctx, "matches", head))
 	waitFor(t, "purge-ns", func() bool { return s.raw("/matches", "").status == 410 })
+	// 410 purged with head, the purge-ns entry, as the core answers (§8.5,
+	// §12), at any URL of the namespace.
+	for _, u := range []string{"/matches?q=larsson", "/matches/at/" + head, "/matches/at/" + purged + "?q=x"} {
+		if r := s.raw(u, ""); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged || r.header.Get("Cache-Control") != "no-store" {
+			t.Errorf("%s: %d %v %v", u, r.status, r.body, r.header)
+		}
+	}
 	s.mu.Lock()
 	purges := fmt.Sprint(s.purges)
 	s.mu.Unlock()
@@ -661,8 +668,8 @@ func TestPurgeNamespace(t *testing.T) {
 	// The purged state survives a restart.
 	s.stop()
 	s2 := startSvc(t, w.c, svcOpts{db: s.dbPath, ns: []string{"matches"}, untyped: true, noRun: true})
-	if r := s2.raw("/matches?q=larsson", ""); r.status != 410 {
-		t.Errorf("after restart: %d", r.status)
+	if r := s2.raw("/matches?q=larsson", ""); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged {
+		t.Errorf("after restart: %d %v", r.status, r.body)
 	}
 	if got := s2.ix.CountRows("matches"); got != 0 {
 		t.Errorf("%d rows left", got)

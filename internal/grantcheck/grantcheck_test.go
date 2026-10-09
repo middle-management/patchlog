@@ -130,32 +130,33 @@ func TestCheckRead(t *testing.T) {
 		}
 	}
 
-	// ReadsAll.
-	v := must(f.ch.Verify(ctx, "sec", f.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"})))
-	if !f.ch.ReadsAll(v) {
-		t.Error("plain reader should read all")
-	}
-	v = must(f.ch.Verify(ctx, "sec", f.grant(f.issuer, "user:bob", []string{"sec"}, nil, map[string]any{"roles": []any{"prefixed"}})))
-	if f.ch.ReadsAll(v) {
-		t.Error("prefixed role reads only some")
-	}
-
 	// ReadsUnrestricted (§C.5): one read role without rules on /resource
-	// is enough, if it and the grant's own rules pass now.
+	// is enough, if it and the grant's own rules pass now. ReadsPerResource:
+	// whether reads can differ between resources (a grant whose reads
+	// can't, and that doesn't read unrestricted, reads nothing).
 	for _, tc := range []struct {
-		name  string
-		extra map[string]any
-		want  bool
+		name        string
+		extra       map[string]any
+		want, perRs bool
 	}{
-		{"reader and prefixed", map[string]any{"roles": []any{"reader", "prefixed"}}, true},
-		{"prefixed", map[string]any{"roles": []any{"prefixed"}}, false},
-		{"reader, a rule that fails", map[string]any{"roles": []any{"reader"}, "rules": []any{map[string]any{"op": "test", "path": "/principal/id", "value": "user:ann"}}}, false},
-		{"rule on /resource", map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "a"}}}}, false},
+		{"plain", map[string]any{"can": []any{"read"}}, true, false},
+		{"reader and prefixed", map[string]any{"roles": []any{"reader", "prefixed"}}, true, true},
+		{"prefixed", map[string]any{"roles": []any{"prefixed"}}, false, true},
+		{"reader, a rule that fails", map[string]any{"roles": []any{"reader"}, "rules": []any{map[string]any{"op": "test", "path": "/principal/id", "value": "user:ann"}}}, false, false},
+		{"rule on /resource", map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"not": map[string]any{"op": "test", "path": "/resource", "value": "a"}}}}, false, true},
 	} {
 		v := must(f.ch.Verify(ctx, "sec", f.grant(f.issuer, "user:bob", []string{"sec"}, nil, tc.extra)))
 		if got := f.ch.ReadsUnrestricted(v); got != tc.want {
 			t.Errorf("ReadsUnrestricted %s: %v", tc.name, got)
 		}
+		if got := f.ch.ReadsPerResource(v); got != tc.perRs {
+			t.Errorf("ReadsPerResource %s: %v", tc.name, got)
+		}
+	}
+	// A scoped key reads per resource, whatever the grant's rules.
+	v := must(f.ch.Verify(ctx, "sec", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}, map[string]any{"attrs": map[string]any{"level": 1}})))
+	if f.ch.ReadsUnrestricted(v) || !f.ch.ReadsPerResource(v) {
+		t.Error("a key with readScope reads unrestricted")
 	}
 
 	// Revocation: takes effect once the checker sees the new head.

@@ -161,8 +161,11 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
-	a := &access{v: v, all: ix.checker.ReadsAll(v)}
-	if a.all && !ix.checker.AllowsRead(v, "") {
+	// A grant that reads the namespace unrestricted (§C.5) reads every
+	// resource; one whose reads can't differ between resources and that
+	// doesn't reads none.
+	a := &access{v: v, all: ix.checker.ReadsUnrestricted(v)}
+	if !a.all && !ix.checker.ReadsPerResource(v) {
 		return nil, &grant.AuthError{Status: 403, Msg: "a grant or key rule refuses the read"}
 	}
 	// §B.11.5: results are keyed by the reader's subject set. Readers of the
@@ -227,10 +230,6 @@ func encodeQuery(v url.Values, drop ...string) string {
 
 func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string, isAt bool) {
 	ctx := r.Context()
-	if _, purged, _ := ix.state(ns); purged {
-		writeErr(w, http.StatusGone, "gone", "namespace purged")
-		return
-	}
 	if reason := ix.keys.Skipped(ns); reason != "" {
 		w.Header().Set("Retry-After", "60")
 		writeErr(w, http.StatusServiceUnavailable, "skipped", "the index does not consume this namespace: "+reason)
@@ -263,6 +262,14 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	if !ix.opt.Edge.Allow(r, a.public) {
 		w.Header().Set("Cache-Control", "no-store")
 		writeErr(w, http.StatusForbidden, edge.Code, edge.Message)
+		return
+	}
+	// A purged namespace answers as the core's URLs of it do, after the
+	// read check: 410 purged with head, its purge-ns entry (§8.5, §12),
+	// the log's last, where the checkpoint stopped.
+	if head, purged, _ := ix.state(ns); purged {
+		w.Header().Set("Cache-Control", "no-store")
+		writeJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "namespace purged", "head": head})
 		return
 	}
 	setPtrHeaders := func() {
