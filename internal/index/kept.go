@@ -32,8 +32,16 @@ type kept struct {
 	m       map[string]*list.Element // URL → *keptEntry
 	order   *list.List               // oldest first
 	size    int
-	purges  map[string]uint64 // ns → purges applied so far
+	gens    map[string]uint64      // ns → purges applied so far
+	purges  map[string][]keptPurge // ns → its purges of the last keepFor, oldest first
 	maxSize int
+}
+
+// keptPurge is a purge applied to a namespace, with the tags it purged:
+// put checks the results read before it against them, for keepFor.
+type keptPurge struct {
+	exp  time.Time
+	tags []string
 }
 
 type keptEntry struct {
@@ -45,16 +53,18 @@ type keptEntry struct {
 }
 
 func newKept(now func() time.Time) *kept {
-	return &kept{now: now, m: map[string]*list.Element{}, order: list.New(), purges: map[string]uint64{}, maxSize: keepBytes}
+	return &kept{now: now, m: map[string]*list.Element{}, order: list.New(), gens: map[string]uint64{}, purges: map[string][]keptPurge{}, maxSize: keepBytes}
 }
 
 // generation is the number of purges applied to ns so far. A result is
-// kept only if it is unchanged from before the result's read transaction
-// until put, so no result read before a purge outlives it.
+// kept unless a purge applied between the generation taken before its read
+// transaction and put purged one of its tags, so no result read before a
+// purge outlives it if the purge would have dropped it, kept; results that
+// show none of what is purged are kept however often ns is purged.
 func (k *kept) generation(ns string) uint64 {
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	return k.purges[ns]
+	return k.gens[ns]
 }
 
 // get returns the result kept for url, and whether it is bound to url.
@@ -70,9 +80,10 @@ func (k *kept) get(url string) (derived.Stored, bool, bool) {
 	return e.st, e.bound, true
 }
 
-// put keeps st as url's result unless one is kept already, or ns had a purge
-// since generation gen, and returns the result kept for url (st if none):
-// the first writer wins, so every reader of url gets the same bytes.
+// put keeps st as url's result unless one is kept already, or a purge of ns
+// since generation gen purged one of st's tags, and returns the result kept
+// for url (st if none): the first writer wins, so every reader of url gets
+// the same bytes.
 func (k *kept) put(url, ns string, gen uint64, bound bool, st derived.Stored) derived.Stored {
 	k.mu.Lock()
 	defer k.mu.Unlock()
@@ -80,10 +91,11 @@ func (k *kept) put(url, ns string, gen uint64, bound bool, st derived.Stored) de
 	if el, ok := k.m[url]; ok {
 		return el.Value.(*keptEntry).st
 	}
-	if k.purges[ns] != gen {
+	tags := splitTags(st.Tags)
+	if k.purgedSince(ns, gen, tags) {
 		return st
 	}
-	e := &keptEntry{url: url, ns: ns, tags: splitTags(st.Tags), exp: k.now().Add(keepFor), bound: bound, st: st}
+	e := &keptEntry{url: url, ns: ns, tags: tags, exp: k.now().Add(keepFor), bound: bound, st: st}
 	k.m[url] = k.order.PushBack(e)
 	k.size += e.bytes()
 	for k.size > k.maxSize {
@@ -93,14 +105,21 @@ func (k *kept) put(url, ns string, gen uint64, bound bool, st derived.Stored) de
 }
 
 // purge drops ns's results carrying any of tags, after the apply that
-// purges them commits and before its checkpoint is published.
+// purges them commits and before its checkpoint is published, and records
+// the purge for put.
 func (k *kept) purge(ns string, tags []string) {
 	if len(tags) == 0 {
 		return
 	}
 	k.mu.Lock()
 	defer k.mu.Unlock()
-	k.purges[ns]++
+	now := k.now()
+	ps := k.purges[ns]
+	for len(ps) > 0 && !now.Before(ps[0].exp) {
+		ps = ps[1:]
+	}
+	k.purges[ns] = append(ps, keptPurge{exp: now.Add(keepFor), tags: tags})
+	k.gens[ns]++
 	for el := k.order.Front(); el != nil; {
 		next := el.Next()
 		e := el.Value.(*keptEntry)
@@ -112,6 +131,24 @@ func (k *kept) purge(ns string, tags []string) {
 		}
 		el = next
 	}
+}
+
+// purgedSince reports whether a purge of ns since generation gen purged one
+// of tags, or may have: one recorded no longer (keepFor) is taken to.
+func (k *kept) purgedSince(ns string, gen uint64, tags map[string]bool) bool {
+	n := k.gens[ns] - gen // purges since gen, the last n
+	ps := k.purges[ns]
+	if n > uint64(len(ps)) {
+		return true
+	}
+	for _, p := range ps[uint64(len(ps))-n:] {
+		for _, t := range p.tags {
+			if tags[t] {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // expire drops the results kept longer than keepFor (the oldest first).

@@ -548,8 +548,8 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	}
 	// Purge before the new checkpoint is out, so nobody who learns of it
 	// can still be served what it removed. Purgers don't block. Kept
-	// results go first, after the commit: one read before it is then not
-	// kept (kept.generation).
+	// results go first, after the commit: one read before it that carries
+	// a tag it purges is then not kept (kept.generation).
 	ix.kept.purge(b.NS, tags)
 	if len(tags) > 0 {
 		ix.opt.Purger.PurgeTags(tags)

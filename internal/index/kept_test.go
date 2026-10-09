@@ -92,31 +92,65 @@ func TestKeptAt(t *testing.T) {
 
 // TestHopsUnderWrites (B9): under a steady write rate, a query from the head
 // pointer is answered at the at it is redirected to, however often the
-// checkpoint moves meanwhile: one redirect, never a chase (§A.4).
+// checkpoint moves meanwhile: one redirect, never a chase (§A.4). So too
+// under a stream of purges (as a §8.6 retention sweep makes) of resources
+// the result doesn't show.
 func TestHopsUnderWrites(t *testing.T) {
 	t.Parallel()
-	w := setup(t)
-	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}})
-	w.doc(t, "derby", w.match, map[string]any{"title": "The Derby", "status": "done"})
-	s.caughtUp("matches")
+	t.Run("writes", func(t *testing.T) {
+		t.Parallel()
+		w := setup(t)
+		s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}})
+		w.doc(t, "derby", w.match, map[string]any{"title": "The Derby", "status": "done"})
+		s.caughtUp("matches")
+		// 40 writes a second; the core's clock moves a second each, so its
+		// rate buckets (§6.6) refill.
+		q := []string{"?q=derby", "?facet[/status]=done", "?sort=/title&limit=5", "?schema=" + url.QueryEscape(w.match)}
+		hopsUnder(t, s, 4, q, 25*time.Millisecond, 0, func(ctx context.Context, i int) error {
+			w.s.Clock.Advance(time.Second)
+			_, err := w.c.CreateDoc(ctx, "matches", fmt.Sprintf("m%d", i), map[string]any{"$schema": w.match, "title": "Match", "status": "planned"})
+			return err
+		})
+	})
+	t.Run("purges", func(t *testing.T) {
+		t.Parallel()
+		w := setup(t)
+		s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}})
+		w.doc(t, "derby", w.match, map[string]any{"title": "The Derby", "status": "done"})
+		ids := make([]string, 300)
+		for i := range ids {
+			w.s.Clock.Advance(time.Second)
+			ids[i] = w.doc(t, fmt.Sprintf("m%d", i), w.match, map[string]any{"title": "Match", "status": "planned"}).ID
+		}
+		s.caughtUp("matches")
+		// Up to 200 purges a second, each of a document neither query shows.
+		hopsUnder(t, s, 8, []string{"?q=derby", "?facet[/status]=done"}, 5*time.Millisecond, len(ids), func(ctx context.Context, i int) error {
+			w.s.Clock.Advance(time.Second)
+			_, err := w.c.Purge(ctx, "matches", fmt.Sprintf("m%d", i), ids[i], false)
+			return err
+		})
+	})
+}
 
+// hopsUnder runs write every tick, n times (0: until the readers are done),
+// while each reader follows queries from the head pointer, 40 and on until
+// the checkpoint has moved 10 times, and checks that every follow took one
+// redirect.
+func hopsUnder(t *testing.T, s *svc, readers int, q []string, every time.Duration, n int, write func(ctx context.Context, i int) error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var writes sync.WaitGroup
 	writes.Add(1)
 	go func() {
 		defer writes.Done()
-		// 40 writes a second; the core's clock moves a second each, so its
-		// rate buckets (§6.6) refill.
-		tick := time.NewTicker(25 * time.Millisecond)
+		tick := time.NewTicker(every)
 		defer tick.Stop()
-		for i := 0; ; i++ {
+		for i := 0; n == 0 || i < n; i++ {
 			select {
 			case <-ctx.Done():
 				return
 			case <-tick.C:
 			}
-			w.s.Clock.Advance(time.Second)
-			if _, err := w.c.CreateDoc(ctx, "matches", fmt.Sprintf("m%d", i), map[string]any{"$schema": w.match, "title": "Match", "status": "planned"}); err != nil && ctx.Err() == nil {
+			if err := write(ctx, i); err != nil && ctx.Err() == nil {
 				t.Error(err)
 				return
 			}
@@ -124,16 +158,13 @@ func TestHopsUnderWrites(t *testing.T) {
 	}()
 	defer func() { cancel(); writes.Wait() }()
 
-	// Each reader follows 40 queries, and on until the checkpoint has moved
-	// 10 times.
 	start := len(s.batches())
 	deadline := time.Now().Add(30 * time.Second)
-	q := []string{"?q=derby", "?facet[/status]=done", "?sort=/title&limit=5", "?schema=" + url.QueryEscape(w.match)}
 	var mu sync.Mutex
 	hist := map[int]int{}
 	ats := map[string]bool{}
 	var wg sync.WaitGroup
-	for r := range 4 {
+	for r := range readers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

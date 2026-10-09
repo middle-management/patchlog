@@ -23,10 +23,15 @@ func TestKeptStore(t *testing.T) {
 	if got := k.put("/a/at/1?q=x", "a", gen, false, st("two", "idx:a,r:a/x")); string(got.Body) != "one" {
 		t.Errorf("second put returned %s", got.Body)
 	}
-	// After a purge in the namespace, a result read before it isn't kept.
-	k.purge("a", []string{"r:a/y"})
-	if got := k.put("/a/at/2?q=x", "a", gen, false, st("late", "idx:a")); string(got.Body) != "late" || has("/a/at/2?q=x") {
-		t.Error("kept a result read before a purge")
+	// A result read before purges isn't kept if one in its namespace
+	// purged a tag it carries; one that shows none of what they purged is.
+	k.purge("a", []string{"r:a/y", "idx:a:counts"})
+	k.purge("b", []string{"idx:b", "ns:b"})
+	if got := k.put("/a/at/2?q=x", "a", gen, false, st("late", "idx:a,r:a/y")); string(got.Body) != "late" || has("/a/at/2?q=x") {
+		t.Error("kept a result read before a purge of what it shows")
+	}
+	if k.put("/a/at/2?q=z", "a", gen, false, st("z", "idx:a,r:a/z")); !has("/a/at/2?q=z") {
+		t.Error("a result read before a purge of what it doesn't show isn't kept")
 	}
 	// A purge drops the namespace's results carrying a tag it purges.
 	k.put("/b/at/1?q=x", "b", k.generation("b"), true, st("b", "idx:b,r:b/x"))
@@ -50,5 +55,13 @@ func TestKeptStore(t *testing.T) {
 	now = now.Add(keepFor)
 	if has("/c/at/9") || k.size != 0 || k.order.Len() != 0 {
 		t.Errorf("expired results kept: %d bytes", k.size)
+	}
+	// A result read before a purge recorded no longer isn't kept.
+	gen = k.generation("a")
+	k.purge("a", []string{"r:a/y"})
+	now = now.Add(keepFor)
+	k.purge("a", []string{"r:a/y"})
+	if k.put("/a/at/4?q=z", "a", gen, false, st("z", "idx:a,r:a/z")); has("/a/at/4?q=z") || len(k.purges["a"]) != 1 {
+		t.Errorf("kept a result read before a purge no longer recorded (%d recorded)", len(k.purges["a"]))
 	}
 }
