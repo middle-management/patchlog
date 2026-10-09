@@ -2,9 +2,11 @@ package server
 
 import (
 	"crypto/ed25519"
+	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/edge"
@@ -88,5 +90,29 @@ func TestEdgeGrantsWithdraw(t *testing.T) {
 	// Only DELETE, besides issuance's POST.
 	for _, m := range []string{"GET", "HEAD", "PUT", "PATCH"} {
 		expect(t, e.do(req{method: m, path: "/edge-grants?prefix=/r/sec"}), 405)
+	}
+}
+
+// As many prefixes as a query holds (url.ParseQuery takes 10,000
+// parameters; more is 400): repeats are withdrawn once, in the order first
+// named.
+func TestEdgeGrantsWithdrawMany(t *testing.T) {
+	t.Parallel()
+	const n = 10000
+	vs := make([]string, n)
+	for i := range vs {
+		vs[i] = fmt.Sprintf("prefix=/r/a/n%d", i%(n/2))
+	}
+	got, err := withdrawPrefixes(strings.Join(vs, "&"))
+	if err != nil || len(got) != n/2 {
+		t.Fatalf("%d prefixes, %v", len(got), err)
+	}
+	for i, p := range got {
+		if p != fmt.Sprintf("/r/a/n%d", i) {
+			t.Fatalf("prefix %d is %s", i, p)
+		}
+	}
+	if _, err := withdrawPrefixes(strings.Join(append(vs, "prefix=/r/a"), "&")); err == nil {
+		t.Fatal("10,001 parameters accepted")
 	}
 }

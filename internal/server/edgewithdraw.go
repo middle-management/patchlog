@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"slices"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -39,6 +38,7 @@ func withdrawPrefixes(raw string) ([]string, error) {
 		return nil, badInput("malformed query string")
 	}
 	var out []string
+	seen := map[string]bool{}
 	for k, vs := range q {
 		if k != "prefix" {
 			return nil, badInput(fmt.Sprintf("unknown query parameter %q (§7)", k))
@@ -47,7 +47,8 @@ func withdrawPrefixes(raw string) ([]string, error) {
 			if !edgePrefix(p) {
 				return nil, badInput(fmt.Sprintf("prefix %q isn't one issuance returns: /r/{ns}/{name}, /r/{ns} or /ns/{ns} (§C.5)", p))
 			}
-			if !slices.Contains(out, p) {
+			if !seen[p] {
+				seen[p] = true
 				out = append(out, p)
 			}
 		}
