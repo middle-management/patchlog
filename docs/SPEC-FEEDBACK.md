@@ -1,66 +1,132 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.46**. This file
-collects what the reference does that the text doesn't yet describe.
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.48**. This file collects what
+the reference does that the text doesn't yet describe.
 
 ## Open
 
-From implementing v0.46. Each gives what the reference chose.
+From implementing v0.47 and v0.48. Each gives what the reference chose.
 
-1. **"Counts as a referrer" for `schemaReads` reads** (§6.1). Read as: an unpurged resource
-   of a listed namespace whose head (or last live document, if tombstoned) reaches the
-   revision through `$schema` and the `$ref` closure. Narrowings: only the listed
-   namespace's own resources (not what a branch reads through); a schema document's own
-   `$ref`s don't count (as for refusals); only namespaces the grant names are considered.
-   *Propose:* define it in those terms.
-2. **`schemaReads` reads behind a verifying edge.** An edge that knows only prefixes can't
-   decide a read of `N` under a grant for `L`, so such reads must reach the origin.
-   *Propose:* say so (they're served `private`).
-3. **Edge-grant cookie paths.** Cookies are scoped to `/r/{ns}` and `/ns/{ns}`, which by
-   RFC 6265 path matching also covers `GET /ns/{ns}` itself; the text writes `/ns/{ns}/…`.
-   *Question:* is the namespace head covered?
-4. **Edge-grant failures.** If any namespace a grant names doesn't exist or fails
-   verification, the whole request answers `401`/`403` rather than skipping it, which would
-   reveal existence.
-5. **Edge grants and roles.** A grant is refused if any read-allowing role has a rule an edge
-   can't evaluate, though roles are alternatives. Conservative; *question:* is that the
-   intent?
-6. **Edge-grant lifetime and cookies.** Lifetime is min(grant `exp`, 15 min). `SameSite` is
-   `None` when credentialed origins are configured, else `Lax`; the text names neither.
-7. **Operator grants to a namespace that doesn't exist** are `401`, except a forced purge
-   (`404`). *Propose:* state it next to the list of what operator grants authorise.
-8. **Keys following the base:** a kid the branch added itself, which the base later adds and
-   then removes, falls back to the branch's own entry. The text covers only kids copied at
-   creation.
-9. **Index hit values** are lists under the field's path (`"/tags": ["a"]`), and a path both
-   facet and sort shows its facet values. `fields` names a path some document has rows at; a
-   path a schema marks but no document has yet is `400`. *Propose:* give the format.
-10. **Catalog titles:** a placement's own `title` wins over the item's head title.
-11. **Merged gestures and undo** (§11.2): `Undo` with the source author's name plans
-    against the merger's entries in the base. *Propose:* say that undoing a carried gesture
-    is the source author's to do.
-12. **Dry runs draw rate tokens** (§6.6, §7.5). Rate limits are checked in step 1, and a dry
-    run runs steps 1–6, so it draws what the submit will. §G.4.4's dry-run-then-submit
-    therefore costs each batch twice. Retry-After is whole seconds (at least 1), so under a
-    fast allowance a 429 costs a second when the deficit refills in milliseconds. *Propose:*
-    say whether dry runs draw, and count them in §G.4.4's pacing if they do.
-13. **Backfill pacing** (§G.4.4) is "a fraction of the namespace rate", but the importer's
-    own `ratePerPrincipal` (a tenth of the namespace's by default) answers 429 first. The
-    reference paces at a fraction of the lower of the two, and under an allowance at the
-    allowance's full rate, since its bucket holds up no other writer; §G.4.4 mentions
-    allowances only for one atomic batch. *Propose:* say both.
-14. **Allowances with authentication disabled** (§6.6, §1): an allowance names a root `sub`
-    and `kid`, but there is no `kid` then. The reference matches `sub` (the author) alone,
-    first entry wins. *Propose:* specify it, since clients predicting their allowance need it.
-15. **`/heads` and the namespace log for readers limited per resource** (§7.4): the reference
-    checks `read` on the namespace (resource `""`), so a grant whose rules hide some
-    resources still lists their names and heads, where `GET /r/{ns}/{name}` is `404`.
-    `/grants` and branching require unrestricted read (§7.4, §7.6). *Propose:* require
-    unrestricted read for listings, or filter them.
-16. **`/heads` of a purged namespace** (§8.5): every `/r/{ns}/…` is `410`, but the listing
-    isn't covered; the reference lists formerly existing resources as `purge`, and nothing
-    says the namespace is purged short of its log (or `frozen`, which the importer uses).
-    *Propose:* `410`, or a `purged` marker.
+1. **`purged` in §12, and on writes** (§8.5, §12). §12 lists `gone` (410) but not `purged`,
+   and the text doesn't say what writes in a purged namespace get. The reference answers
+   `purged` to resource writes, purges, prunes and batches with items, and `gone` to
+   namespace-level writes (`PATCH /ns/{ns}`, a namespace purge, branching, registration,
+   config-only batches). *Propose:* add `purged` to §12, and name the code for writes.
+2. **`POST /ns/{ns}/keys` and unrestricted read** (§C.5, §E.2.3). It is under `/ns/{ns}/`,
+   which §C.5 now reserves for unrestricted readers except the gestures listing, yet §E.2.3
+   serves restricted grants their `K_r` there, as the reference does. *Propose:* name it as a
+   second exception.
+3. **Unrestricted read for branching and registration** (§7.6, §G.3). The reference checks the
+   read rules as gate step 1 does, leaving rules over `/doc` and the rest of the envelope to
+   step 6; otherwise a grant limited by `/doc` rules, as §G.3 suggests, could never register.
+   *Propose:* say that this check is step 1's.
+4. **Referrer reads in a public listed namespace** (§6.1). The reference counts any grant
+   naming a public listed namespace as able to read its referrers, unverified, since public
+   reads ignore grants (§7), while a referrer read with no grant is `401`. *Propose:* say
+   whether a referrer read needs a grant that verifies in the listed namespace.
+5. **The form of edge-grant prefixes** (§C.5). The text writes prefixes as `/r/{ns}/…` and
+   `Path` as the prefix without `/…`, so `prefixes`, which `DELETE /edge-grants` takes back,
+   could be either. The reference uses the cookie paths (`/r/{ns}/{name}`, `/r/{ns}`,
+   `/ns/{ns}`) and refuses other shapes with `400`. *Propose:* give the form.
+6. **`DELETE /edge-grants` details** (§C.5, §7). The reference answers no `prefix` with
+   `400 bad_input`, withdraws a repeated one once, and answers `204` with authentication
+   disabled too, where issuance is `404 not_offered`; `prefix` is the first repeatable core
+   parameter, against §7's "each at most once". *Propose:* state these, and the §7 exception.
+7. **All or nothing with a purged namespace** (§C.5). The text ranks `401` over `403`; the
+   reference ranks a purged namespace's `410 gone` last, so it is the answer only when every
+   refusal is one. *Propose:* say where it falls.
+8. **`$nonce` in schema documents** (§6.1, §6.5, §C.7). §6.5 makes any unknown keyword
+   invalid, so a schema document couldn't carry the top-level `$nonce` that a namespace
+   requiring nonces (or a sealed one) needs. The reference treats a fresh-form top-level
+   `$nonce` as mechanics, not a keyword. *Propose:* say so in §6.1 or §6.5.
+9. **Requiring nonces with branches in place** (§C.7, §7.6). Turning it on at a base whose
+   branches lack it isn't refused, unlike raising encryption above them (`409`); they may keep
+   it off, and drop it once the base does, since "can't turn it off" is judged against the
+   base's current setting. *Question:* refuse it, or is "set it at creation" enough?
+10. **Remote branches and mirrored schemas** (§C.7, §G.3). A remote branch created without the
+    setting of a base that requires nonces is `422`, not given it; its shadow keeps the base's
+    setting at creation. Mirrored schema namespaces take their source's current setting,
+    `optional` if B can't read it. *Propose:* say which setting (current, or as of `at`), and
+    what applies when it can't be read.
+11. **`invalid` or `nonce` first** (§E.2.5, §C.7). A namespace both sealed and requiring
+    nonces could refuse a missing nonce either way; the reference answers `422 nonce`.
+    *Propose:* state the precedence.
+12. **Undo needs the setting** (§11.2, §C.7). The setting is in the namespace document, which
+    now needs unrestricted read; a reader limited to some resources goes by whether the
+    current document has a `$nonce`, which misses tombstones of documents written before the
+    setting. *Propose:* expose it to such readers, e.g. in the gestures listing.
+13. **Dry runs in imports** (§G.4.4). "Dry run, then resolve conflicts" and "Blobs first" read
+    as a dry run per batch. Since batches are atomic and a dry run draws what its submit does
+    (§6.6), the reference dry-runs only each existing namespace's first batch, and a created
+    one's first item. *Propose:* say so.
+14. **Imports into missing namespaces under authentication** (§G.4.4, §C.4). One bearer can't
+    both create namespaces (an operator grant) and write them (a namespace grant, `401` for a
+    namespace that doesn't exist yet). *Propose:* note that the operator creates them first,
+    listing the importer's key and allowance.
+15. **Bounded index redirects** (§A.4). "Redirects to the current checkpoint" has readers
+    chase it under steady writes. The reference computes and keeps (a minute) the result at
+    the `at` a redirect names, so one redirect suffices at any write rate, `/_refs` too; §B.5
+    words this for the tree ("if that exact result was stored"). *Propose:* a service SHOULD
+    compute or keep that result.
+16. **What "marks with `x-index`" means** (§A.4). The reference counts an `x-index` reachable
+    from the schema along the path, whatever the data: through `$ref`, `allOf`/`anyOf`/`oneOf`
+    and `if`/`then`/`else`, not `not`, `unevaluated*` or `propertyNames`; array items at their
+    array's path. *Propose:* define it, so implementations agree on which paths are `400`.
+17. **`/_refs` answers** (§A.4). Paging, order and body are unspecified. The reference orders
+    hits by namespace, then resource, pages with `limit`/`after`/`next` as `?ref=` does, adds
+    `namespaces: { ns: ns_id }` (what `at` covers), sends `at` as `X-Namespace-Revision`,
+    seals per entry, and redirects an `at` URL with `?min=` to the current `at`. *Propose:*
+    specify them.
+18. **`gs` for `/_refs`** (§A.4, §B.11.5). §B.11.5's subjects don't say which namespaces a
+    grant reads, or reads only in part; the reference adds `reads:{ns}` and
+    `reads:{ns}:scope:{digest}` markers. A reader of no private namespace gets the empty set's
+    `gs`, still under `/g/`. *Propose:* `gs` keys all the answer depends on. *Question:* a
+    public form without `/g/`?
+19. **What `/_refs` covers** (§A.4). Left out: namespaces not reached yet, purged ones, and
+    sealed or e2e ones whose keys the service lacks (a `min` naming one is `400`); branch
+    previews count, so a referrer can show in base and branch. Only a reader who sees no
+    namespace gets `401`/`403`; an unreadable namespace document is `502`. *Question:* follow
+    only roots?
+20. **`/heads` of a purged namespace** (§8.5, §10). A consumer that gets `410 purged` there
+    has to re-read `/ns/{ns}` and assume its head is the `purge-ns` entry. *Propose:* carry
+    that entry's `ns_id` in the `410` body, and say that nothing follows `purge-ns` in a log.
+
+## Settled in v0.48
+
+None of the reference's notes; v0.48 (from Doors) took up two questions the text itself had
+left open: `"nonce": "required"` (D15, §C.7) and references across namespaces (D19,
+`GET /_refs`, §A.4).
+
+## Settled in v0.47
+
+All sixteen v0.46 notes. Adopted as the reference did them:
+- **`schemaReads` referrers** (1) are defined as proposed (§6.1).
+- **Referrer reads behind a verifying edge** (2) reach the origin, which serves them
+  `private`.
+- **Edge-grant cookie paths** (3) cover the namespace URL itself.
+- **Edge-grant failures** (4): all or nothing, `401` if any namespace's answer is, else `403`.
+- **Edge-grant lifetime and cookies** (6): the sooner of `exp` and 15 minutes; `SameSite=None`
+  with credentialed origins, else `Lax`.
+- **Operator grants to a missing namespace** (7): `401`, a forced purge `404`; the `ns`
+  check's `403` comes first, and a purged namespace is `410`.
+- **Keys following the base** (8): a branch's own `kid` applies again once the base removes
+  it; one copied at creation never does.
+- **Catalog titles** (10): a placement's own `title` wins.
+- **Merged gestures and undo** (11): undoing a carried gesture is the source author's to do.
+- **Dry runs draw rate tokens** (12), `429` bodies carry a decimal `retryAfter`, and §G.4.4
+  counts dry runs in a backfill's pacing.
+- **Backfill pacing** (13): a fraction of the lower of the namespace's and the importer's
+  rate, or an allowance's full rate; per-resource buckets still apply.
+- **Allowances without authentication** (14) match `sub` alone, the first entry winning.
+- **Listings for readers limited per resource** (15): `/ns/{ns}` and everything under it but
+  the gestures listing need unrestricted read, now defined once (§C.5).
+- **`/heads` of a purged namespace** (16) is `410 purged`; the log's `purge-ns` entry says so.
+
+Decided against the reference, which now follows the text:
+- **Edge grants and roles** (5): roles are alternatives, so one qualifying read role is
+  enough, with the blocks and key scope on top (this fixes implementer report B8).
+- **Index hit values** (9) are as the reference gave them, but `fields=` is checked against
+  schema marks, not the data: a marked path no hit has values at is left out, not `400`.
 
 ## Settled in v0.46
 

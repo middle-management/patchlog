@@ -1,5 +1,150 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.48**. v0.47 settles all sixteen of the reference's v0.46 notes, most as
+the reference did them; v0.48 adds withdrawing edge-grant cookies, references across
+namespaces and namespaces that require nonces. Fixes implementer reports B7, B8 and B9.
+
+**Changes to check before upgrading (v0.47):**
+- **`/ns/{ns}` URLs need unrestricted read** (§C.5): the namespace document, its log, events
+  and long-polls, `/heads`, `/branches` and `/grants/…`, everything under `/ns/{ns}` but the
+  gestures listing. A grant that reads only some resources (a key with `readScope`, or a rule
+  referring to `/resource` in its blocks, its key's scope or every read role it carries) now
+  gets `404` there, as for any read it may not make. `/grants/…` was `403`; the others
+  answered it, listing names and heads its reads hide. A resource's own event stream needs
+  `read` on that resource only, so per-resource grants can now follow it. Roles are
+  alternatives, so one read role without `/resource` rules is enough, also for branching,
+  remote registration and a batch's source check, which refused a grant with any role testing
+  `/resource`.
+- **A purged namespace answers `410` with `code: "purged"`** (was `gone`) on `/r/{ns}/…`,
+  `/ns/{ns}/grants/…` and `/ns/{ns}/gestures/…`, and on `/heads` at any revision, which listed
+  the resources before; after the read check, cached with the long class (§8.5, §9).
+  `/ns/{ns}` and its log stay readable: the log's `purge-ns` entry says what happened.
+- **Edge grants for grants with roles** (`POST /edge-grants`): one role that lists `read` and
+  qualifies (none of its rules refers to `/resource` or `/now`, and they pass now for the
+  principal) is enough; the grant's blocks and key scope apply on top and may fix `/resource`.
+  A role whose own rules test `/resource` never qualifies, even one fixing it, which 0.15.4
+  accepted. The answer is all or nothing: any refused namespace refuses the request, `401` if
+  any would be `401`, else `403` (`410` if the only refusals are purged namespaces), where the
+  first refused namespace used to decide.
+- **`429` bodies carry `retryAfter`**, the wait in seconds as a decimal (§6.6); `Retry-After`
+  stays whole seconds, rounded up. `client.APIError.RetryAfter` prefers the body's.
+- `GET /` answers `"spec": "0.48"`.
+
+**Also in v0.47:**
+- **`schemaReads` referrer reads reach the origin** (§6.1): a schema revision read by a
+  reader of a referrer, with the grant in `Authorization`, is served whether or not the
+  request carries the edge's verification, `private, max-age=300` and `no-store` for shared
+  caches, since an edge that knows only prefixes forwards it undecided. Behind
+  `-edge-secret` it was `403 edge_required`.
+- **`fields=` follows the schemas** (§A.4): a path is checked against the `x-index` marks of
+  the schemas the namespace's documents use, not against indexed values, so whether a query
+  fails never depends on the data. A marked path no document has values at is accepted and
+  left out of hits; an unmarked one is `400`; a schema that can't be read for now is `502`.
+- **A read under an edge-grant cookie checks its `exp`**, so an event stream opened under one
+  (the browser case: `EventSource` can't send `Authorization`) ends there; it kept serving
+  past the grant's expiry.
+- **A `401` no longer shows which namespaces exist:** a grant whose key a namespace doesn't
+  list said `unknown key "<kid>"`, where a namespace that doesn't exist says `no key can
+  verify the grant`; both now say the latter, also in `POST /edge-grants`' all-or-nothing
+  answer (§C.4, §C.5).
+- The text now says what the reference already did: operator grants to a missing namespace
+  (`401`, a forced purge `404`), a branch's own `kid` applying again once its base removes the
+  same `kid`, index hit values, placement titles over item titles, undoing carried gestures,
+  dry runs drawing rate tokens, and allowances matching `sub` alone without authentication.
+
+**New (v0.48):**
+- **`DELETE /edge-grants?prefix=…`** withdraws edge-grant cookies at sign-out (§C.5): `prefix`
+  repeatable, as issuance returned them (`/r/{ns}/{name}`, `/r/{ns}`, `/ns/{ns}`). It answers
+  `204`, `no-store`, with an expired `Set-Cookie` of the same name and attributes per prefix (a
+  repeated one once), and needs no grant. Another parameter, a bad prefix or none is
+  `400 bad_input`. Its CORS preflight is allowed only for credentialed origins, so another
+  site can't sign a reader out.
+- **`GET /_refs?to=<reference>`** in the index (§A.4) answers "who uses this?" across every
+  namespace the index follows that the reader may read, `to` in any form `?ref=` takes. It
+  redirects to `/_refs/at/{at}/g/{gs}?to=…`: `at` is a combined checkpoint over only the
+  namespaces the answer covers (the body's `namespaces`), so writes elsewhere don't move it,
+  and `gs` keys the reader's subject set. `?min={ns}:{ns_id}` is repeatable, and `400` for a
+  namespace the answer doesn't cover. Hits carry `ns` beside the `?ref=` fields, are filtered
+  per resource, come in namespace then resource order and page with `limit`/`after`. Hits from
+  sealed and e2e namespaces are sealed per entry; e2e namespaces whose keys the index doesn't
+  hold are left out. Answers are tagged `idx:{ns}` and `r:{ns}/{name}`, kept a minute as
+  B9's results are, and dropped by purges.
+- **Namespaces that require nonces** (§C.7): `"nonce": "optional" | "required"`, guarded like
+  `keys` (in a branch, a `*` key of the base). Where it is required, gate step 3 refuses a
+  resource create, append or restore whose resulting document lacks a fresh-form `$nonce`
+  differing from its parent's (the last live document's for a restore) with `422 nonce`, item
+  by item in batches and dry runs, whatever the patch set's origin; a `[]` restore sends a
+  lone fresh `$nonce` instead. Deletes and config, branch and prune writes are exempt. A
+  branch copies the setting and can't turn it off; it is `422` in an e2e namespace. A remote
+  branch of such a base must be created requiring nonces (`422` otherwise), and schema
+  namespaces mirrored for it take their source's setting. A schema document may carry a
+  top-level fresh `$nonce`.
+- **Tools add the nonces:** undo and redo give every patch-set step of an inverse a fresh
+  `$nonce` where nonces are required (a tombstone's inverse is a lone-nonce restore); merge
+  plans add one to kept-at-base steps, resolution and squash sets there and in sealed targets
+  (new for resolution and squash sets), and squash diffs leave `$nonce` out. Snapshot imports
+  create the upstream namespace with its target's setting and nonce the patch sets they
+  generate; a full-history import whose revisions lack nonces is refused before anything is
+  written (use snapshot mode). `schema import` and release documents don't add one yet.
+
+**Faster bundle imports, again (B7).** A backfill dry-ran every batch before submitting it,
+and a dry run draws the tokens its submit does (§6.6), so each batch paid twice, half of it
+in `429` waits:
+- **Dry runs:** an import dry-runs only the first batch of each existing target namespace,
+  before anything is written, and submits the rest directly: a batch is atomic, so a failed
+  submit writes nothing either, and it lists its items as a dry run did. In a namespace the
+  import creates, the first item of the first batch is dry-run once the namespace exists, so
+  a server that would give the revisions other ids stops the import before anything is
+  written there. `-dry-run` still dry-runs every batch. A batch that fails only for blobs left
+  to its local source is sent again with them uploaded.
+- **Pacing** counts every draw (dry runs, submits, blob uploads) with or without an
+  allowance, paces the first batches' dry runs too, and repays a chain cut between batches at
+  `ratePerResource`, which an allowance doesn't replace (§G.4.4). After a `429` the importer
+  waits by the body's `retryAfter`.
+- At `-pace 1` a 1,000-item batch takes about 20 s instead of about 39 s, with no `429`s;
+  under a 1,000/s allowance about 1.5 s instead of about 2 s. The reported import (64,887 documents
+  in 145 batches into an empty deployment at `-pace 1`, no allowance) drew 894 tokens a batch
+  at the principal's 50/s and took 55 min; it now takes about 22 min plus blob uploads. That
+  is the floor the default `ratePerPrincipal` sets (64,887 / 50 = 1,298 s): only an allowance
+  or a higher `ratePerPrincipal` lowers it, and under a 1,000/s allowance the import takes a
+  few minutes.
+- The report gains `timings` (planning, blobs, batch requests, paced, after `429`s), which
+  the CLI prints as a `time` line. `TooLargeError`, `import -h` and `serve -h` name the
+  deployment maximums (`serve -max-items-per-batch`, `-max-batch-size`), and a `401` or `403`
+  on the first read of a target namespace says what grant the import needs: read and write in
+  every target namespace; an operator grant only creates namespaces, so create missing ones
+  first.
+- Planning drops a `/heads` listing that answers `410` (a purged namespace) and looks the
+  names up, as for a frozen one. `BenchmarkImport` runs against the default limits, adds 6 KB
+  documents and reports per batch the batch requests' time, paced waits and `429` waits.
+
+**Edge grants for catalog readers (B8).** A catalog read grant for a reader holding a
+rule-free reader role and roles that test `/resource` by pattern was `403` at
+`POST /edge-grants`; with roles as alternatives (above) it gets the item's prefix.
+
+**Index answers stay at their checkpoint (B9).** A query redirected to `/{ns}/at/{current}`
+was redirected again whenever a write moved the checkpoint before the reader followed it, so
+under steady writes readers chased it. The redirect now computes the result at the checkpoint
+it names and keeps it, as every result computed or served is kept: in memory, for a minute, at
+most 64 MiB, keyed by the result's URL (namespace, `at`, query and the reader's subject set,
+and for a sealed namespace the view the result is bound to). A kept result answers its `at`
+with `200` however far the checkpoint has moved, so a query takes one redirect from the head
+pointer and at most two from a stale `at`; the query's cost moves to the redirect. A purge
+drops the kept results showing what it purged.
+- Measured (`TestHopsUnderWrites`): at 40 writes/s and 4 readers, 2.7% of follows took two
+  redirects on 0.15.4; with 20,000 documents, 200 writes/s and 16 readers, 8% were still
+  redirected after five. Now every follow takes exactly one, also while purges of documents
+  the queries don't show are applied.
+- 0.15.4 redirected more than 0.15.2 because B6 made queries far cheaper: readers make many
+  more follows, each racing the same checkpoint rate. Apply batch sizes didn't change.
+- **Consumers learn a purge from `/heads`** (v0.47 §8.5, §10): `internal/follow` takes its
+  `410 purged` (when starting from a snapshot, or for a branch purged before it got there) as
+  the namespace's `purge-ns` entry at its head, reports the purge and ends with `ErrPurged`.
+  The follower was restarted, or the branch reported failing, indefinitely; the index now
+  answers `410` for such a branch.
+
 ## v0.15.4
 
 **Faster bundle imports.** A backfill spent nearly all its time sleeping: it paces at half
