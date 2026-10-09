@@ -1717,7 +1717,9 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
   (schemas included), not by live references. Each request waits at its namespace's gate until
   the allowance's bucket has refilled what the requests before it drew. A request in flight
   counts as drawing no earlier than now, and a namespace has no more batches in flight than the
-  allowance's burst holds the draws of. Without an allowance, batches go one at a time.
+  allowance's burst holds the draws of, nor, where the allowance ends, than its rate draws in
+  half the minute before `until`. The first failure stops the rest. Without an allowance,
+  batches go one at a time.
 - **Re-runs.** An import into a target that already has the bundle reads what it can't predict
   only: an upstream head that is the genesis of the rewritten snapshot is taken as unchanged
   without reading it, and an upstream chain is read only for a fast-forward that needs it.

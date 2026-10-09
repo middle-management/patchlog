@@ -15,6 +15,8 @@ import (
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // batchLog records the batch requests a client sends (not dry runs): their
@@ -25,11 +27,12 @@ type batchLog struct {
 	rt   http.RoundTripper
 	fail func(ns string, resources []string) bool
 
-	mu      sync.Mutex
-	batches []loggedBatch
-	now     int
-	max     int
-	n429    int
+	mu       sync.Mutex
+	batches  []loggedBatch
+	now      int
+	max      int
+	n429     int
+	failedAt int // the tick of the request fail answered
 }
 
 type loggedBatch struct {
@@ -57,6 +60,10 @@ func (l *batchLog) RoundTrip(r *http.Request) (*http.Response, error) {
 		b.resources = append(b.resources, it.Resource)
 	}
 	if l.fail != nil && l.fail(ns, b.resources) {
+		l.mu.Lock()
+		l.now++
+		l.failedAt = l.now
+		l.mu.Unlock()
 		return &http.Response{StatusCode: 422, Header: http.Header{"Content-Type": {"application/json"}}, Request: r,
 			Body: io.NopCloser(strings.NewReader(`{"code":"invalid","message":"refused by the test"}`))}, nil
 	}
@@ -292,20 +299,72 @@ func TestImportConcurrentDraws(t *testing.T) {
 	}
 }
 
+// fastClock runs a hundred times faster than time, for server and importer
+// alike: concurrent batches' waits overlap as they would.
+type fastClock struct{ t0, start time.Time }
+
+func newFastClock() *fastClock {
+	return &fastClock{t0: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), start: time.Now()}
+}
+
+func (c *fastClock) Now() time.Time { return c.t0.Add(100 * time.Since(c.start)) }
+
+func (c *fastClock) Sleep(ctx context.Context, d time.Duration) error {
+	t := time.NewTimer(d / 100)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-t.C:
+		return nil
+	}
+}
+
 // A batch that fails stops the import: the batches in flight finish, and
-// none starts after, nor any batch of a namespace that depends on the
-// failed one's.
+// no other request is sent after it, not by a batch waiting at its gate,
+// nor into a namespace that depends on the failed one's.
 func TestImportConcurrentFailure(t *testing.T) {
 	t.Parallel()
-	b := contentBundle(t, contentShape{layouts: 4, pages: 20, items: 30, comments: 10, verifications: 2})
+	src := newDeployment(t, stagingOrigin, fastLimits)
+	src.ns("a", nil)
+	for i := 0; i < 80; i++ {
+		src.create("a", fmt.Sprintf("d%03d", i), map[string]any{"i": i})
+	}
+	b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"a"}})
+	clk := newFastClock()
+	dst := newDeployment(t, cmsOrigin, func(o *core.Options) { o.Now = clk.Now })
+	// A batch of 10 a second: batches wait at the gate.
+	dst.ns("a", map[string]any{"read": "public", "allowances": []any{map[string]any{"sub": "alice", "kid": "any",
+		"bucket": map[string]any{"rate": 1, "burst": 100}, "itemsPerBatch": 10}}})
+	log := &batchLog{rt: transport, fail: func(ns string, resources []string) bool { return slices.Contains(resources, "d030") }}
+	c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: log})))
+	_, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 1, Concurrency: 4,
+		Now: clk.Now, Sleep: clk.Sleep})
+	if err == nil || !strings.Contains(err.Error(), "refused by the test") {
+		t.Fatalf("import: %v", err)
+	}
+	if log.failedAt == 0 {
+		t.Fatal("no batch failed")
+	}
+	for _, x := range log.batches {
+		if x.start > log.failedAt {
+			t.Fatalf("a batch with %v sent after the failure", x.resources)
+		}
+		if x.end == 0 {
+			t.Fatalf("a batch with %v still in flight", x.resources)
+		}
+	}
+
+	// A namespace that depends on the failed one's gets no batch.
+	content := contentBundle(t, contentShape{layouts: 4, pages: 20, items: 30, comments: 10, verifications: 2})
 	allowance := map[string]any{"read": "public", "allowances": []any{map[string]any{"sub": "alice", "kid": "any",
 		"bucket": map[string]any{"rate": 1e6, "burst": 1e6}, "itemsPerBatch": 4}}}
-	dst := newDeployment(t, cmsOrigin, fastLimits)
-	log := &batchLog{rt: transport, fail: func(ns string, resources []string) bool {
+	dst = newDeployment(t, cmsOrigin, fastLimits)
+	log = &batchLog{rt: transport, fail: func(ns string, resources []string) bool {
 		return ns == "cat-demo-upstream" && slices.Contains(resources, "item-20")
 	}}
-	c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: log})))
-	_, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 1, CreateNamespaces: true,
+	c = must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: log})))
+	_, err = bundle.Import(ctx, c, bundle.BytesOpener(content), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 1, CreateNamespaces: true,
 		Concurrency: 4, NamespaceDoc: func(string, string) any { return allowance }})
 	if err == nil || !strings.Contains(err.Error(), "refused by the test") {
 		t.Fatalf("import: %v", err)
@@ -314,8 +373,64 @@ func TestImportConcurrentFailure(t *testing.T) {
 		if x.ns != "demo-schemas" && x.ns != "cat-demo-upstream" {
 			t.Fatalf("a batch into %s after the failure", x.ns)
 		}
-		if x.end == 0 {
-			t.Fatalf("a batch into %s still in flight", x.ns)
+	}
+}
+
+// An allowance that ends during a concurrent backfill: batches wait at the
+// gate no longer than half the margin before its until, so each one goes
+// out while the allowance holds, none answered 413 for the namespace's own
+// limits (§6.6). At 0.5/s that leaves no room for two batches of 10: they
+// go one at a time, and those after the allowance ends are split to fit
+// the namespace's limits. At 2/s six wait at once; each is sent in time.
+func TestImportConcurrentAllowanceEnds(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin, fastLimits)
+	src.ns("data", nil)
+	for i := 0; i < 100; i++ {
+		src.create("data", fmt.Sprintf("d%03d", i), map[string]any{"i": i})
+	}
+	b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"data"}})
+	for _, tc := range []struct {
+		rate float64
+		ends time.Duration
+	}{{0.5, 100 * time.Second}, {2, 90 * time.Second}} {
+		t.Run(fmt.Sprint("rate", tc.rate), func(t *testing.T) {
+			t.Parallel()
+			clk := newFastClock()
+			dst := newDeployment(t, cmsOrigin, func(o *core.Options) { o.Now = clk.Now })
+			dst.ns("data", map[string]any{"read": "public", "limits": map[string]any{"itemsPerBatch": 3},
+				"allowances": []any{map[string]any{"sub": "alice", "kid": "any", "until": clk.Now().Add(tc.ends).Format(time.RFC3339),
+					"bucket": map[string]any{"rate": tc.rate, "burst": 1000}, "itemsPerBatch": 10}}})
+			log := &batchLog{rt: transport}
+			c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: log})))
+			rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 1, Concurrency: 8,
+				Now: clk.Now, Sleep: clk.Sleep})
+			if err != nil {
+				t.Fatalf("import: %v", err)
+			}
+			sizes := batchSizes(rep)
+			if sizes[0] != 10 || tc.rate < 1 && (sizes[len(sizes)-1] > 3 || log.max > 1) {
+				t.Fatalf("batches %v, %d in flight at most", sizes, log.max)
+			}
+		})
+	}
+}
+
+// A namespace holding a schema and snapshot documents typed by it: the
+// schema goes first, before the upstream namespace whose documents name it
+// (§G.4.4 Order), though the two form a cycle.
+func TestImportSchemaWithSnapshots(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("forms", nil)
+	s := src.create("forms", "s", map[string]any{"$schema": schema.Dialect2020, "type": "object"})
+	src.create("forms", "d", map[string]any{"$schema": rev("forms", "s", s), "title": "D"})
+	b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"forms/d"}, Mode: bundle.Snapshot})
+	for _, mode := range []bundle.ImportMode{bundle.Atomic, bundle.Backfill} {
+		dst := newDeployment(t, cmsOrigin)
+		rep := importB(t, dst, b, bundle.ImportOptions{Mode: mode, Pace: 1})
+		if !slices.Equal(rep.Order, []string{"forms", "forms-upstream"}) || dst.head("forms", "d").State != client.Live {
+			t.Fatalf("%s: order %v", mode, rep.Order)
 		}
 	}
 }

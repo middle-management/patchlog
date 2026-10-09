@@ -332,9 +332,11 @@ func (im *importer) call(ctx context.Context, ns string, req client.BatchRequest
 		}
 		at := im.opt.Now()
 		var res *client.BatchResult
-		im.io(func() { res, err = im.c.Batch(ctx, ns, req, dry) })
+		var end time.Time
+		im.batching.begin(at)
+		im.io(func() { res, err = im.c.Batch(ctx, ns, req, dry); end = im.opt.Now() })
 		done()
-		im.timed(&im.rep.Timings.Batches, at)
+		im.batching.end(end, &im.rep.Timings.Batches)
 		im.rep.Timings.Requests++
 		if dry {
 			im.rep.Timings.DryRuns++
@@ -837,10 +839,7 @@ func (im *importer) pace(ctx context.Context, ns string, l limits, cut string) e
 	if wait <= 0 {
 		return nil
 	}
-	im.rep.Timings.Paced += wait.Seconds()
-	var err error
-	im.io(func() { err = im.opt.Sleep(ctx, wait) })
-	return err
+	return im.sleepUntil(ctx, im.opt.Now().Add(wait))
 }
 
 // owed is how long from now a bucket that refills at rate takes to refill

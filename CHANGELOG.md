@@ -15,11 +15,17 @@ requests instead of 13,875.
   waits at its namespace's gate until the allowance's bucket has refilled what the requests
   before it drew. A request in flight counts as drawing no earlier than now, so the server
   handling requests out of order doesn't overdraw the bucket. A namespace has only as many
-  batches in flight as the allowance's burst holds the draws of. Without an allowance, batches
-  go one at a time as before.
+  batches in flight as the allowance's burst holds the draws of, and, where the allowance ends,
+  as its rate draws in half the minute before its `until`, so every batch is sent while it
+  holds. The first failure stops the rest: batches waiting to send send nothing. The timings
+  count wall time covered, not the sum of overlapping waits and requests. Without an
+  allowance, batches go one at a time as before.
 - **Ordering by pins.** Within a namespace, items follow the documents they pin (schemas
-  included), not live references, which name no revision that must exist. In a reference cycle
-  of namespaces, upstream namespaces now go first (§G.4.4 "Upstream first"); they went by name.
+  included), not live references, which name no revision that must exist. An upstream
+  namespace no longer depends on a target namespace that holds only snapshot documents (its
+  pins of them point upstream once rewritten), so the two no longer form a cycle. Within a
+  cycle, what upstream namespaces need of it (schemas, full documents) goes first, then the
+  upstream namespaces (§G.4.4 "Upstream first"); they went by name.
 - **Re-runs read nothing they can predict.** An upstream head that is the genesis revision of
   the rewritten snapshot, as an earlier import wrote it, is that snapshot: neither its document
   nor its chain is read. A chain is read only when a fast-forward needs it, and not for a target

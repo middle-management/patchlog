@@ -73,15 +73,20 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 					nd.bid, it.d.ns, line.Type, SealedBlobType)
 			}
 			err := im.retry(ctx, func() error {
-				done, err := im.admit(ctx, it.ns, 1)
+				done, err := im.admit(ctx, it.ns, 1, it.name)
 				if err != nil {
 					return err
 				}
 				at := im.opt.Now()
 				var bid string
-				im.io(func() { bid, err = im.c.UploadBlob(ctx, it.ns, it.name, line.Type, line.Nonce, line.Data) })
+				var end time.Time
+				im.uploading.begin(at)
+				im.io(func() {
+					bid, err = im.c.UploadBlob(ctx, it.ns, it.name, line.Type, line.Nonce, line.Data)
+					end = im.opt.Now()
+				})
 				done()
-				im.blobDrew(it.ns, it.name, at, err)
+				im.blobDrew(it.ns, it.name, at, end, err)
 				if err == nil && bid != nd.bid {
 					err = fmt.Errorf("uploaded as %s", bid)
 				}
@@ -154,24 +159,26 @@ func (im *importer) sendAll(ctx context.Context, b *batch, l limits) error {
 // rank than the target, answers 404, and the caller falls back.
 func (im *importer) copyBlob(ctx context.Context, ns, name, bid, fromNS, fromName string) bool {
 	return im.retry(ctx, func() error {
-		done, err := im.admit(ctx, ns, 1)
+		done, err := im.admit(ctx, ns, 1, name)
 		if err != nil {
 			return err
 		}
 		at := im.opt.Now()
-		im.io(func() { err = im.c.CopyBlob(ctx, ns, name, bid, fromNS, fromName, "") })
+		var end time.Time
+		im.uploading.begin(at)
+		im.io(func() { err = im.c.CopyBlob(ctx, ns, name, bid, fromNS, fromName, ""); end = im.opt.Now() })
 		done()
-		im.blobDrew(ns, name, at, err)
+		im.blobDrew(ns, name, at, end, err)
 		return err
 	}) == nil
 }
 
 // blobDrew records the token a blob upload or copy into ns/name, sent at
-// at, drew (§6.6, §7.8): any the server didn't refuse with 429, since a
-// copy whose source it refuses has drawn all the same. It also counts the
-// time it took.
-func (im *importer) blobDrew(ns, name string, at time.Time, err error) {
-	im.timed(&im.rep.Timings.Blobs, at)
+// at and answered at end, drew (§6.6, §7.8): any the server didn't refuse
+// with 429, since a copy whose source it refuses has drawn all the same.
+// It also counts the time it took.
+func (im *importer) blobDrew(ns, name string, at, end time.Time, err error) {
+	im.uploading.end(end, &im.rep.Timings.Blobs)
 	if !client.IsRateLimited(err) && im.gates[ns] == nil {
 		im.drew(ns, at, 1, name) // a gate recorded it as it admitted it
 	}

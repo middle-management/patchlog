@@ -422,6 +422,10 @@ type importer struct {
 	mu         sync.Mutex
 	concurrent bool
 	gates      map[string]*gate // target ns → its concurrent batches' pacing
+	run        *runner          // while batches run concurrently
+	// Wall time covered by paced waits, batch requests and blob requests,
+	// which overlap when batches run concurrently.
+	paced, batching, uploading span
 
 	// noSource marks target namespaces whose batches' local source didn't
 	// make their blobs available (the importer can't read the source
@@ -1712,10 +1716,13 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 func (im *importer) buildNodes(items []*item) {
 	srcOfTarget := map[string]string{}
 	upOf := map[string]string{}
+	full := map[string]bool{} // source namespaces with full documents
 	for _, d := range im.docs {
 		srcOfTarget[d.ns] = d.tns
 		if d.info.History == Snapshot {
 			upOf[d.ns] = im.upstreamNS(d.ns)
+		} else {
+			full[d.ns] = true
 		}
 	}
 	for _, it := range items {
@@ -1726,7 +1733,11 @@ func (im *importer) buildNodes(items []*item) {
 		}
 		n.items = append(n.items, it)
 		for ns := range it.d.refNS {
-			if t, ok := srcOfTarget[ns]; ok {
+			// An upstream document's pins of snapshot documents point
+			// upstream once rewritten, and its live references don't
+			// order: of a namespace with only snapshot documents it
+			// needs the upstream.
+			if t, ok := srcOfTarget[ns]; ok && (!it.upstream || full[ns]) {
 				n.deps[t] = true
 			}
 			if u, ok := upOf[ns]; ok {
@@ -1793,7 +1804,8 @@ func orderItems(items []*item) []*item {
 
 // tarjanOrder returns the nodes in reverse topological order of their
 // dependencies (dependencies first), strongly connected components kept
-// together, upstream namespaces first within one, ties broken by name.
+// together, within one upstream namespaces first but for what they need
+// of it, ties broken by name.
 func tarjanOrder(nodes map[string]*node) []*node {
 	names := make([]string, 0, len(nodes))
 	for n := range nodes {
@@ -1835,11 +1847,30 @@ func tarjanOrder(nodes map[string]*node) []*node {
 					break
 				}
 			}
-			// Upstream namespaces first (§G.4.4), then by name.
+			// Upstream namespaces first (§G.4.4), but for what they
+			// need of the component (schemas, full documents), then by
+			// name.
+			needed := map[string]bool{}
+			for _, w := range comp {
+				if nodes[w].upstream {
+					for d := range nodes[w].deps {
+						needed[d] = needed[d] || !nodes[d].upstream
+					}
+				}
+			}
+			rank := func(n *node) int {
+				switch {
+				case needed[n.ns]:
+					return 0
+				case n.upstream:
+					return 1
+				}
+				return 2
+			}
 			sort.Slice(comp, func(i, j int) bool {
 				a, b := nodes[comp[i]], nodes[comp[j]]
-				if a.upstream != b.upstream {
-					return a.upstream
+				if ra, rb := rank(a), rank(b); ra != rb {
+					return ra < rb
 				}
 				return a.ns < b.ns
 			})

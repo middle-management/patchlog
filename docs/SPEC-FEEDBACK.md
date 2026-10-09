@@ -61,11 +61,12 @@ From implementing v0.49. Each gives what the reference chose.
     submits several batches at once under an allowance: a namespace's batches once those of the
     namespaces it depends on have committed, and within a namespace a batch after those holding
     documents it pins. It orders items by pinned references (schemas included), not by live
-    ones, which name no revision that must exist. In a cycle of namespaces it puts upstream
-    namespaces first. It paces each request before it is sent, counting one in flight as
-    drawing no earlier than now: the server draws when it handles a request, possibly after
-    later ones. *Propose:* say that dependency order is per batch, that live references don't
-    order, and that "Upstream first" holds within a cycle.
+    ones, which name no revision that must exist; so an upstream namespace doesn't depend on a
+    target holding only snapshot documents. Within a cycle of namespaces it puts what upstream
+    namespaces need first (schemas, full documents), then them. It paces each request before
+    it is sent, counting one in flight as drawing no earlier than now: the server draws when
+    it handles a request, possibly after later ones. *Propose:* say that dependency order is
+    per batch, that live references don't order, and how "Upstream first" holds in a cycle.
 13. **A whole-document genesis as a snapshot** (D.4). An intermediate snapshot falls after 64 KiB
     of patch sets, which a large create's genesis is by itself, doubling its writes for a copy
     of what the genesis holds. The reference counts a genesis that adds the whole document as a
