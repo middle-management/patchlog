@@ -190,6 +190,11 @@ type Rev struct {
 	// served as the revision (Status 200), or with the 410 of a tombstone
 	// horizon (Code "tombstone"), whose snapshot is the last live document.
 	Snapshot bool
+	// Referrer is set for a schema revision served under schemaReads to a
+	// reader of a referrer (§6.1). The grant is in Authorization and no
+	// edge cookie covers the path, so an edge forwards the read undecided:
+	// it is served private, and no shared cache stores it.
+	Referrer bool
 }
 
 // ResourceRev serves the document at a revision.
@@ -208,17 +213,19 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return t.absentNS(ns, cred)
 		}
 		rid, perr := ids.Parse(id)
+		referrer := false
 		if _, err := t.reader(n, cred, name); err != nil {
 			// A schema revision n opens with schemaReads, to a reader of
 			// a document that pins it (§6.1, §7); nothing else of n.
 			if perr != nil || !t.schemaReadsRev(n, name, rid, cred) {
 				return err
 			}
+			referrer = true
 		}
 		if n.purged {
 			return purgedRead(t.cachePublic(n))
 		}
-		out = &Rev{Public: t.cachePublic(n)}
+		out = &Rev{Public: t.cachePublic(n), Referrer: referrer}
 		public = t.config(n.configSeq).Read == "public"
 		if perr != nil {
 			out.Status = 404
