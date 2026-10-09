@@ -33,6 +33,9 @@ var refStringRE = regexp.MustCompile(`^/r/([a-z0-9][a-z0-9_-]{0,63})/([a-z0-9][a
 // The fragment must be a non-empty RFC 3986 fragment; it is returned
 // percent-decoded in Entry. Only NS, Name, Rev, Entry and Raw are set.
 func ParseRefString(s string) (Ref, bool) {
+	if !strings.HasPrefix(s, "/r/") {
+		return Ref{}, false // most strings: no need for the expression
+	}
 	m := refStringRE.FindStringSubmatch(s)
 	if m == nil {
 		return Ref{}, false

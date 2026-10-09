@@ -115,3 +115,43 @@ func TestCanonicalRoundTripRange(t *testing.T) {
 		}
 	}
 }
+
+func TestCanonicalOfAndIsValue(t *testing.T) {
+	for _, tc := range []struct {
+		v  any
+		ok bool
+	}{
+		{nil, true},
+		{map[string]any{"b": []any{1.5, "x", true, nil}, "a": map[string]any{}}, true},
+		{[]any{float64(MaxSafeInteger)}, true},
+		{[]any{float64(MaxSafeInteger + 1)}, false},
+		{[]any{math.Inf(1)}, false},
+		{[]any{"\xff"}, false},
+		{map[string]any{"\xff": 1.0}, false},
+		{[]any{1}, false}, // an int is not a value of the model
+		{[]string{"a"}, false},
+		{map[string]any{"a": struct{}{}}, false},
+	} {
+		if got := IsValue(tc.v); got != tc.ok {
+			t.Errorf("IsValue(%#v) = %v, want %v", tc.v, got, tc.ok)
+		}
+		canon, ok := CanonicalOf(tc.v)
+		if ok != tc.ok {
+			t.Errorf("CanonicalOf(%#v) ok = %v, want %v", tc.v, ok, tc.ok)
+			continue
+		}
+		if ok && string(canon) != string(Canonical(tc.v)) {
+			t.Errorf("CanonicalOf(%#v) = %s, want %s", tc.v, canon, Canonical(tc.v))
+		}
+	}
+	deep := any("x")
+	for i := 0; i < maxParseDepth+1; i++ {
+		deep = []any{deep}
+	}
+	if IsValue(deep) {
+		t.Error("IsValue accepts a value nested deeper than Parse does")
+	}
+	if _, ok := CanonicalOf(deep); ok {
+		t.Error("CanonicalOf accepts a value nested deeper than Parse does")
+	}
+}

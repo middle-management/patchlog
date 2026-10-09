@@ -7,12 +7,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/annot"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/pointer"
@@ -120,6 +124,14 @@ type ImportOptions struct {
 	MaxRetries int
 	// Progress, if set, is told about each batch as it is submitted.
 	Progress func(b *BatchReport)
+	// Concurrency is how many batches a backfill under an allowance
+	// submits at once (default 4; 1 submits one at a time), or fewer: as
+	// many as the allowance's burst holds the draws of. Dependency order
+	// holds all the same (§G.4.4): a namespace's batches start once those
+	// of the namespaces it depends on have committed, and a batch waits
+	// for one in flight that it goes on with or whose documents it pins.
+	// Paced batches, without an allowance, go one at a time.
+	Concurrency int
 	// AllowLessProtected is the operator's explicit override, for this
 	// import, of the refusal to import a private or sealed namespace into a
 	// public target (§G.5.1).
@@ -306,7 +318,7 @@ type bdoc struct {
 	lines         []*Line
 	idx           map[string]int
 	snap          *Line
-	refKeys       map[string]bool // over-approximated references (source keys)
+	pinKeys       map[string]bool // over-approximated pinned references, schemas' included (source keys)
 	refNS         map[string]bool
 	rep           *DocReport
 	requiresBad   bool             // requires isn't in the target's chain (the target moved on)
@@ -322,6 +334,7 @@ type item struct {
 	ifNone   bool
 	steps    []client.Step
 	expected []string
+	sizes    []int      // per step, its patch set's canonical size (stepSizes)
 	sameIDs  bool       // the ids are the source's (fast-forward): source.ids follows them
 	srcID    string     // source.ids member otherwise
 	blobs    [][]string // per step, the blobs it may bring in (blobs.go)
@@ -335,13 +348,16 @@ type upPlan struct {
 	it       *item // nil if unchanged
 	head     string
 	headDel  bool
-	chain    []chainEntry // the upstream chain after this import (truncated at a horizon)
+	added    []chainEntry // what this import adds to the chain
+	chain    []chainEntry // the upstream chain after this import (truncated at a horizon), once loaded (upChain)
+	loaded   bool
 	newDoc   any
 }
 
 type chainEntry struct {
 	id   string
 	step client.Step
+	size int // the step's canonical size, -1 until known
 }
 
 type point struct{ baseU, baseT string }
@@ -361,6 +377,7 @@ type batch struct {
 	parts []part
 	size  int
 	rep   *BatchReport
+	keys  map[string]bool // its items' source documents (keysOf)
 }
 
 type part struct {
@@ -400,6 +417,12 @@ type importer struct {
 
 	sent  map[string]time.Time // "ns/name/bid" → when the blob was last uploaded or copied there
 	draws map[string][]draw    // target ns → what the import drew there since its last paced batch
+	// mu guards the importer's state while batches run concurrently
+	// (concurrent.go), when concurrent is set.
+	mu         sync.Mutex
+	concurrent bool
+	gates      map[string]*gate // target ns → its concurrent batches' pacing
+
 	// noSource marks target namespaces whose batches' local source didn't
 	// make their blobs available (the importer can't read the source
 	// unrestricted, §7.5): their blobs are copied or uploaded instead.
@@ -424,6 +447,9 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 	if opt.MaxRetries <= 0 {
 		opt.MaxRetries = 5
 	}
+	if opt.Concurrency <= 0 {
+		opt.Concurrency = defaultConcurrency
+	}
 	if opt.Sleep == nil {
 		opt.Sleep = func(ctx context.Context, d time.Duration) error {
 			t := time.NewTimer(d)
@@ -440,7 +466,7 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 		opt.Now = time.Now
 	}
 	im := &importer{c: c, opt: opt, docs: map[string]*bdoc{}, up: map[string]*upPlan{}, start: opt.Now(),
-		points: map[string]map[string]point{}, schemas: map[string]any{}, nodes: map[string]*node{}, listed: map[string]*listing{}}
+		points: map[string]map[string]point{}, schemas: map[string]any{}, nodes: map[string]*node{}, listed: map[string]*listing{}, gates: map[string]*gate{}}
 	if err := im.load(open); err != nil {
 		return nil, err
 	}
@@ -490,12 +516,14 @@ func (im *importer) load(open Opener) error {
 	if err != nil {
 		return err
 	}
+	rd.parallel(runtime.GOMAXPROCS(0))
+	defer rd.Close()
 	im.h = rd.Header()
 	targets := map[string]string{}
 	for k, info := range im.h.Docs {
 		ns, name, _ := SplitKey(k)
 		d := &bdoc{key: k, ns: ns, name: name, tns: im.mapNS(ns), info: info, requires: im.h.Requires[k],
-			idx: map[string]int{}, refKeys: map[string]bool{}, refNS: map[string]bool{}, blobs: map[string]*Line{}, refd: map[string]bool{}}
+			idx: map[string]int{}, pinKeys: map[string]bool{}, refNS: map[string]bool{}, blobs: map[string]*Line{}, refd: map[string]bool{}}
 		d.rep = &DocReport{Doc: k, Target: Key(d.tns, name), History: info.History, BundleHead: info.Head}
 		im.docs[k] = d
 		if prev, ok := targets[d.tns]; ok && prev != ns {
@@ -568,12 +596,15 @@ func (im *importer) load(open Opener) error {
 }
 
 // scanRefs over-approximates what a document references, for ordering
-// only: every string of the reference form (including $schema and $ref).
+// only: every string of the reference form (including $schema and $ref),
+// and those of them that pin a revision.
 func (im *importer) scanRefs(d *bdoc, v any) {
-	walkStrings(v, "", func(_, s string) {
+	walkStrings(v, func(_ *strPath, s string) {
 		if r, ok := annot.ParseRefString(s); ok {
 			d.refNS[r.NS] = true
-			d.refKeys[Key(r.NS, r.Name)] = true
+			if r.Rev != "" {
+				d.pinKeys[Key(r.NS, r.Name)] = true
+			}
 		}
 	})
 }
@@ -741,39 +772,75 @@ func stepsOfLog(es []client.LogEntry) []client.Step {
 	return out
 }
 
-// expectedIDs chains the ids steps produce on parent ("" = genesis).
-func expectedIDs(parent string, steps []client.Step) ([]string, error) {
+// expectedIDs chains the ids steps produce on parent ("" = genesis), and
+// sizes them: each step's patch set's canonical length (0 for a delete),
+// by which batches are split. Each patch set is serialised once.
+func expectedIDs(parent string, steps []client.Step) ([]string, []int, error) {
 	out := make([]string, 0, len(steps))
+	sizes := make([]int, len(steps))
 	prev := parent
-	for _, s := range steps {
+	for i, s := range steps {
 		var id string
 		var err error
 		if s.Delete {
 			id, err = client.ExpectedTombstone(prev)
 		} else {
 			if s.Patches == nil {
-				return nil, fmt.Errorf("a patch set the import needs was pruned")
+				return nil, nil, fmt.Errorf("a patch set the import needs was pruned")
 			}
-			id, err = client.ExpectedRevision(prev, s.Patches)
+			var canon []byte
+			if canon, err = canonical(s.Patches); err == nil {
+				sizes[i] = len(canon)
+				id, err = revisionID(prev, canon)
+			}
 		}
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		out = append(out, id)
 		prev = id
 	}
-	return out, nil
+	return out, sizes, nil
 }
 
-func stepSize(s client.Step) int {
-	if s.Delete {
-		return 0
+// canonical serialises a patch set (§3.3).
+func canonical(patches any) ([]byte, error) {
+	if canon, ok := jsonv.CanonicalOf(patches); ok {
+		return canon, nil
 	}
-	v, err := client.ToValue(s.Patches)
+	v, err := client.Value(patches)
 	if err != nil {
-		return 0
+		return nil, err
 	}
-	return len(jsonv.Canonical(v))
+	return jsonv.Canonical(v), nil
+}
+
+// revisionID is the id of the revision of canonical patches on parent ("" =
+// genesis, §3.3).
+func revisionID(parent string, canon []byte) (string, error) {
+	if parent == "" {
+		return ids.Revision(nil, canon).String(), nil
+	}
+	p, err := ids.Parse(parent)
+	if err != nil {
+		return "", err
+	}
+	return ids.Revision(&p, canon).String(), nil
+}
+
+// stepSizes are the canonical sizes of an item's steps, computed once.
+func (it *item) stepSizes() []int {
+	if it.sizes == nil {
+		it.sizes = make([]int, len(it.steps))
+		for i, s := range it.steps {
+			if !s.Delete {
+				if canon, err := canonical(s.Patches); err == nil {
+					it.sizes[i] = len(canon)
+				}
+			}
+		}
+	}
+	return it.sizes
 }
 
 // takeSteps turn the target's document into the bundle's version; in a
@@ -902,11 +969,14 @@ func (im *importer) plan(ctx context.Context) error {
 		im.rep.Docs = append(im.rep.Docs, d.rep)
 	}
 	for _, it := range items {
-		exp, err := expectedIDs(it.ifMatch, it.steps)
-		if err != nil {
-			return fmt.Errorf("import: %s/%s: %w", it.ns, it.name, err)
+		if it.expected == nil {
+			exp, sizes, err := expectedIDs(it.ifMatch, it.steps)
+			if err != nil {
+				return fmt.Errorf("import: %s/%s: %w", it.ns, it.name, err)
+			}
+			it.expected, it.sizes = exp, sizes
 		}
-		it.expected = exp
+		exp := it.expected
 		it.blobs = make([][]string, len(it.steps))
 		for i, st := range it.steps {
 			it.blobs[i] = stepBlobs(st)
@@ -1099,35 +1169,66 @@ func (im *importer) snapshotOrder(ctx context.Context) ([]*bdoc, map[string][]an
 	deps := map[string][]string{}
 	var snaps []*bdoc
 	for _, k := range im.keys {
-		d := im.docs[k]
-		if d.info.History != Snapshot {
-			continue
+		if d := im.docs[k]; d.info.History == Snapshot {
+			snaps = append(snaps, d)
 		}
-		snaps = append(snaps, d)
+	}
+	// Each document's walk on its own, on parallel workers (the schema
+	// loader one at a time), then their findings in key order.
+	type found struct {
+		refs       []annot.Ref
+		undeclared []UndeclaredRef
+		err        error
+	}
+	results := make([]found, len(snaps))
+	var mu sync.Mutex
+	loader := im.schemaLoader(ctx)
+	load := func(ref schema.Ref) (any, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		return loader(ref)
+	}
+	eachParallel(len(snaps), func(i int) {
+		d, f := snaps[i], &results[i]
 		if d.snap.Deleted {
-			continue
+			return
 		}
-		rs, err := annot.FindRefs(d.snap.Doc, im.schemaLoader(ctx))
-		if err != nil {
-			return nil, nil, fmt.Errorf("import: %s: x-ref walk: %w", k, err)
+		if f.refs, f.err = annot.FindRefs(d.snap.Doc, load); f.err != nil {
+			return
 		}
-		refs[k] = rs
 		declared := map[string]bool{}
-		for _, r := range rs {
+		for _, r := range f.refs {
 			declared[r.Pointer] = true
-			if t := im.rewriteTarget(r); t != nil && t != d {
-				deps[k] = append(deps[k], t.key)
-			}
 		}
-		walkStrings(d.snap.Doc, "", func(ptr, s string) {
+		walkStrings(d.snap.Doc, func(at *strPath, s string) {
 			r, ok := annot.ParseRefString(s)
-			if !ok || r.Rev == "" || declared[ptr] || ptr == "/$schema" {
+			if !ok || r.Rev == "" {
+				return
+			}
+			ptr := at.String()
+			if declared[ptr] || ptr == "/$schema" {
 				return
 			}
 			t := im.docs[Key(r.NS, r.Name)]
 			bundled := t != nil && t.info.History == Snapshot && t.snap != nil && t.snap.Snapshot == r.Rev
-			im.rep.Undeclared = append(im.rep.Undeclared, UndeclaredRef{Doc: k, Pointer: ptr, Value: s, Bundled: bundled})
+			f.undeclared = append(f.undeclared, UndeclaredRef{Doc: d.key, Pointer: ptr, Value: s, Bundled: bundled})
 		})
+	})
+	for i, d := range snaps {
+		f := results[i]
+		if f.err != nil {
+			return nil, nil, fmt.Errorf("import: %s: x-ref walk: %w", d.key, f.err)
+		}
+		if d.snap.Deleted {
+			continue
+		}
+		refs[d.key] = f.refs
+		for _, r := range f.refs {
+			if t := im.rewriteTarget(r); t != nil && t != d {
+				deps[d.key] = append(deps[d.key], t.key)
+			}
+		}
+		im.rep.Undeclared = append(im.rep.Undeclared, f.undeclared...)
 	}
 	// Depth-first topological order. Pinned references can't form a cycle
 	// (a revision's id covers the ids it pins), so a cycle means a bundle
@@ -1160,6 +1261,24 @@ func (im *importer) snapshotOrder(ctx context.Context) ([]*bdoc, map[string][]an
 	return out, refs, nil
 }
 
+// eachParallel calls f for 0 to n-1, on as many goroutines as there are
+// processors.
+func eachParallel(n int, f func(i int)) {
+	workers := min(n, runtime.GOMAXPROCS(0))
+	var next atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := int(next.Add(1)) - 1; i < n; i = int(next.Add(1)) - 1 {
+				f(i)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
 // rewriteTarget returns the bundled snapshot document a pinned reference
 // points at, if it is exactly its snapshot.
 func (im *importer) rewriteTarget(r annot.Ref) *bdoc {
@@ -1174,9 +1293,12 @@ func (im *importer) rewriteTarget(r annot.Ref) *bdoc {
 }
 
 // rewrite replaces pinned references to snapshot documents with the
-// matching upstream revision path, keeping any #{id} fragment (§G.4.4).
+// matching upstream revision path, keeping any #{id} fragment (§G.4.4). It
+// rewrites the snapshot line's document in place, which nothing reads
+// after (planUpstream calls it once per document): a copy of each would
+// double what the import holds.
 func (im *importer) rewrite(d *bdoc, refs []annot.Ref) (any, error) {
-	doc := jsonv.Clone(d.snap.Doc)
+	doc := d.snap.Doc
 	for _, r := range refs {
 		t := im.rewriteTarget(r)
 		if t == nil {
@@ -1251,9 +1373,43 @@ func (im *importer) upstreamChain(ctx context.Context, ns, name, head string) ([
 	out := make([]chainEntry, len(es))
 	steps := stepsOfLog(es)
 	for i, e := range es {
-		out[i] = chainEntry{id: e.ID, step: steps[i]}
+		out[i] = chainEntry{id: e.ID, step: steps[i], size: -1}
 	}
 	return out, nil
+}
+
+// genesisEntry is the genesis revision of doc as an upstream chain's first
+// entry; not ok for a deleted snapshot (nil) or a sealed upstream, whose
+// genesis carries a fresh nonce (§E.2.5).
+func genesisEntry(doc any, sealed bool) (chainEntry, bool) {
+	if doc == nil || sealed {
+		return chainEntry{}, false
+	}
+	st := client.PatchStep(client.GenesisPatches(doc))
+	canon, err := canonical(st.Patches)
+	if err != nil {
+		return chainEntry{}, false
+	}
+	id, err := revisionID("", canon)
+	return chainEntry{id: id, step: st, size: len(canon)}, err == nil
+}
+
+// upChain is the upstream chain after this import: the target's up to the
+// previous head, read once and only when a fast-forward needs it, then
+// what the import adds.
+func (im *importer) upChain(ctx context.Context, u *upPlan) ([]chainEntry, error) {
+	if !u.loaded {
+		if u.prev != "" {
+			old, err := im.upstreamChain(ctx, u.ns, u.name, u.prev)
+			if err != nil {
+				return nil, err
+			}
+			u.chain = old
+		}
+		u.chain = append(u.chain, u.added...)
+		u.loaded = true
+	}
+	return u.chain, nil
 }
 
 // planUpstream plans one revision on the snapshot document's upstream
@@ -1269,15 +1425,32 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 		return nil, err
 	}
 	var prevDoc any
-	switch uh.State {
-	case client.Purged:
+	if uh.State == client.Purged {
 		u.purged = true
 		ur.Class = "purged"
 		d.rep.Conflicts = append(d.rep.Conflicts, conflict(ConflictPurged, "purged in the upstream namespace "+u.ns))
 		d.rep.Resolution = ResolveSkip
 		return nil, nil
+	}
+	var nd any
+	if !d.snap.Deleted {
+		if nd, err = im.rewrite(d, refs); err != nil {
+			return nil, err
+		}
+		u.newDoc = nd
+	}
+	switch uh.State {
 	case client.Live:
 		u.prev, u.prevLive = uh.ID, true
+		if g, ok := genesisEntry(nd, im.sealedT[u.ns]); ok && g.id == uh.ID {
+			// The head is the genesis revision of the rewritten snapshot, as
+			// an earlier import of it wrote: the document is the snapshot,
+			// and the chain that one revision. Neither needs reading.
+			u.chain, u.loaded = []chainEntry{g}, true
+			u.head = u.prev
+			ur.Previous, ur.Class, ur.Head = u.prev, "unchanged", u.head
+			return nil, nil
+		}
 		doc, err := im.c.Doc(ctx, u.ns, u.name, uh.ID)
 		if err != nil {
 			return nil, err
@@ -1290,11 +1463,6 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 		}
 	}
 	ur.Previous = u.prev
-	if u.prev != "" {
-		if u.chain, err = im.upstreamChain(ctx, u.ns, u.name, u.prev); err != nil {
-			return nil, err
-		}
-	}
 	var steps []client.Step
 	if d.snap.Deleted {
 		if u.prevLive {
@@ -1305,11 +1473,6 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 			ur.Class = "unchanged"
 		}
 	} else {
-		nd, err := im.rewrite(d, refs)
-		if err != nil {
-			return nil, err
-		}
-		u.newDoc = nd
 		if im.sealedT[u.ns] {
 			// The upstream's own $nonce isn't part of the snapshot (§E.2.5).
 			prevDoc, nd = withoutNonce(prevDoc), withoutNonce(nd)
@@ -1337,16 +1500,17 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 		// the sequence of snapshots (§E.2.5, §G.4.4).
 		steps = nonced(steps)
 	}
-	exp, err := expectedIDs(u.prev, steps)
+	exp, sizes, err := expectedIDs(u.prev, steps)
 	if err != nil {
 		return nil, err
 	}
 	for i, s := range steps {
-		u.chain = append(u.chain, chainEntry{id: exp[i], step: s})
+		u.added = append(u.added, chainEntry{id: exp[i], step: s, size: sizes[i]})
 	}
 	u.head, u.headDel = exp[len(exp)-1], steps[len(steps)-1].Delete
 	ur.Head = u.head
-	u.it = &item{d: d, ns: u.ns, name: u.name, upstream: true, ifMatch: u.prev, ifNone: u.prev == "", steps: steps, srcID: d.snap.Snapshot}
+	u.it = &item{d: d, ns: u.ns, name: u.name, upstream: true, ifMatch: u.prev, ifNone: u.prev == "", steps: steps, srcID: d.snap.Snapshot,
+		expected: exp, sizes: sizes}
 	return u.it, nil
 }
 
@@ -1406,21 +1570,30 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 	}
 	B := th.ID
 	r.TargetHead = B
-	cidx := map[string]int{}
-	for i, e := range u.chain {
-		cidx[e.id] = i
-	}
-	ff := func(class string, after int, parent string) (*item, error) {
-		steps := make([]client.Step, 0, len(u.chain)-after-1)
-		for _, e := range u.chain[after+1:] {
+	// ff fast-forwards the target along entries of the upstream chain.
+	ff := func(class string, entries []chainEntry, parent string) (*item, error) {
+		// The same steps on the same parent: the upstream chain's ids.
+		n := len(entries)
+		it := &item{d: d, ns: d.tns, name: d.name, ifMatch: parent, ifNone: parent == "", sameIDs: true,
+			steps: make([]client.Step, 0, n), expected: make([]string, 0, n), sizes: make([]int, 0, n)}
+		for _, e := range entries {
 			if !e.step.Delete && e.step.Patches == nil {
 				r.Conflicts = append(r.Conflicts, conflict(merge.ConflictPruned, "upstream history the fast-forward needs was pruned"))
 				return nil, nil
 			}
-			steps = append(steps, e.step)
+			if e.size < 0 {
+				it.expected, it.sizes = nil, nil // computed in plan
+			}
+			it.steps = append(it.steps, e.step)
+			if it.expected != nil {
+				it.expected, it.sizes = append(it.expected, e.id), append(it.sizes, e.size)
+			}
+		}
+		if len(it.steps) == 0 {
+			it.expected, it.sizes = nil, nil
 		}
 		r.Class = class
-		return &item{d: d, ns: d.tns, name: d.name, ifMatch: parent, ifNone: parent == "", steps: steps, sameIDs: true}, nil
+		return it, nil
 	}
 	switch {
 	case th.State == client.Purged:
@@ -1437,14 +1610,29 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 			r.Note = "deleted at the source and absent in the target"
 			return nil, nil
 		}
-		if len(u.chain) > 0 && u.chain[0].step.Patches == nil && !u.chain[0].step.Delete {
+		chain, err := im.upChain(ctx, u)
+		if err != nil {
+			return nil, err
+		}
+		if len(chain) > 0 && chain[0].step.Patches == nil && !chain[0].step.Delete {
 			r.Conflicts = append(r.Conflicts, conflict(merge.ConflictPruned, "the upstream chain's early history was pruned"))
 			return nil, nil
 		}
-		return ff("create", -1, "")
+		return ff("create", chain, "")
+	case B == u.prev:
+		// Where the previous import left both: on with what this one adds.
+		return ff("fast-forward", u.added, B)
+	}
+	chain, err := im.upChain(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	cidx := map[string]int{}
+	for i, e := range chain {
+		cidx[e.id] = i
 	}
 	if i, ok := cidx[B]; ok {
-		return ff("fast-forward", i, B)
+		return ff("fast-forward", chain[i+1:], B)
 	}
 	pts, err := im.mergePoints(ctx, d.tns)
 	if err != nil {
@@ -1460,7 +1648,7 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 		return nil, nil
 	case havePt && inChain:
 		r.Ancestor = pt.baseU
-		for _, e := range u.chain[bi+1:] {
+		for _, e := range chain[bi+1:] {
 			incoming = append(incoming, e.step)
 		}
 		ancDoc, _, err := im.targetState(ctx, u.ns, u.name, pt.baseU)
@@ -1566,9 +1754,10 @@ func (im *importer) buildNodes(items []*item) {
 	}
 }
 
-// orderItems puts items whose documents are referenced by others in the
-// same namespace first (e.g. schema resources before documents using them,
-// §6.1: items may reference schema revisions created by earlier items).
+// orderItems puts items whose documents others in the same namespace pin
+// first (e.g. schema resources before documents using them, §6.1: items
+// may reference schema revisions created by earlier items). Live
+// references don't order them: they name no revision that must exist.
 func orderItems(items []*item) []*item {
 	sort.Slice(items, func(i, j int) bool { return items[i].name < items[j].name })
 	byKey := map[string]*item{}
@@ -1583,8 +1772,8 @@ func orderItems(items []*item) []*item {
 			return // done, or a cycle: break it here
 		}
 		state[it] = 1
-		deps := make([]string, 0, len(it.d.refKeys))
-		for k := range it.d.refKeys {
+		deps := make([]string, 0, len(it.d.pinKeys))
+		for k := range it.d.pinKeys {
 			deps = append(deps, k)
 		}
 		sort.Strings(deps)
@@ -1604,7 +1793,7 @@ func orderItems(items []*item) []*item {
 
 // tarjanOrder returns the nodes in reverse topological order of their
 // dependencies (dependencies first), strongly connected components kept
-// together, ties broken by name.
+// together, upstream namespaces first within one, ties broken by name.
 func tarjanOrder(nodes map[string]*node) []*node {
 	names := make([]string, 0, len(nodes))
 	for n := range nodes {
@@ -1646,7 +1835,14 @@ func tarjanOrder(nodes map[string]*node) []*node {
 					break
 				}
 			}
-			sort.Strings(comp)
+			// Upstream namespaces first (§G.4.4), then by name.
+			sort.Slice(comp, func(i, j int) bool {
+				a, b := nodes[comp[i]], nodes[comp[j]]
+				if a.upstream != b.upstream {
+					return a.upstream
+				}
+				return a.ns < b.ns
+			})
 			for _, w := range comp {
 				out = append(out, nodes[w])
 			}

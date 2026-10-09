@@ -25,7 +25,7 @@ func ExpectedRevision(parent string, patches any) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	v, err := ToValue(patches)
+	v, err := Value(patches)
 	if err != nil {
 		return "", err
 	}

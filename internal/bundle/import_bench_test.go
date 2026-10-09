@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -118,10 +119,13 @@ func BenchmarkImport(b *testing.B) {
 							o.Now = func() time.Time { return time.Now().Add(time.Duration(skew.Load())) }
 						})
 						var p, l time.Duration
+						var mu sync.Mutex // concurrent batches wait at once
 						imp := func(rt *countingTransport) error {
 							c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: rt})))
 							_, err := bundle.Import(ctx, c, bundle.BytesOpener(buf.Bytes()), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 1, CreateNamespaces: true,
 								Sleep: func(_ context.Context, d time.Duration) error {
+									mu.Lock()
+									defer mu.Unlock()
 									if rt.limited.Swap(false) {
 										l += d
 									} else {

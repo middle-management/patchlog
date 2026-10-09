@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -686,12 +687,12 @@ func (p *ExportPlan) process(ctx context.Context, d *PlannedDoc) error {
 		}
 	} else if p.opt.UntypedRefs {
 		var ferr error
-		walkStrings(head, "", func(ptr, s string) {
+		walkStrings(head, func(at *strPath, s string) {
 			if ferr != nil {
 				return
 			}
 			if r, ok := annot.ParseRefString(s); ok {
-				ferr = p.need(ctx, d, Target{r.NS, r.Name, r.Rev}, r.Rev != "" && d.Mode == Full, "untyped reference at "+ptr)
+				ferr = p.need(ctx, d, Target{r.NS, r.Name, r.Rev}, r.Rev != "" && d.Mode == Full, "untyped reference at "+at.String())
 			}
 		})
 		if ferr != nil {
@@ -895,14 +896,31 @@ func Export(ctx context.Context, c *client.Client, w io.Writer, opt ExportOption
 	return p, s, err
 }
 
-// walkStrings calls fn for every string in v with its JSON Pointer.
-func walkStrings(v any, ptr string, fn func(ptr, s string)) {
+// walkStrings calls fn for every string in v, members in name order, with
+// where it is.
+func walkStrings(v any, fn func(p *strPath, s string)) {
+	var p strPath
+	p.walk(v, fn)
+}
+
+// strPath is where walkStrings is in a value: the member names and array
+// indexes from the root, made a JSON Pointer only when asked for.
+type strPath struct{ toks []ptrTok }
+
+type ptrTok struct {
+	key string
+	idx int // an array index, or -1 for the member key
+}
+
+func (p *strPath) walk(v any, fn func(p *strPath, s string)) {
 	switch x := v.(type) {
 	case string:
-		fn(ptr, x)
+		fn(p, x)
 	case []any:
 		for i, e := range x {
-			walkStrings(e, fmt.Sprintf("%s/%d", ptr, i), fn)
+			p.toks = append(p.toks, ptrTok{idx: i})
+			p.walk(e, fn)
+			p.toks = p.toks[:len(p.toks)-1]
 		}
 	case map[string]any:
 		keys := make([]string, 0, len(x))
@@ -911,9 +929,34 @@ func walkStrings(v any, ptr string, fn func(ptr, s string)) {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			walkStrings(x[k], ptr+"/"+escapePtr(k), fn)
+			p.toks = append(p.toks, ptrTok{key: k, idx: -1})
+			p.walk(x[k], fn)
+			p.toks = p.toks[:len(p.toks)-1]
 		}
 	}
+}
+
+// String is the JSON Pointer of the location.
+func (p *strPath) String() string {
+	var b strings.Builder
+	for _, t := range p.toks {
+		b.WriteByte('/')
+		if t.idx >= 0 {
+			b.WriteString(strconv.Itoa(t.idx))
+		} else {
+			b.WriteString(escapePtr(t.key))
+		}
+	}
+	return b.String()
+}
+
+// Last is the location's last member name, "" for an array element or the
+// root.
+func (p *strPath) Last() string {
+	if n := len(p.toks); n > 0 && p.toks[n-1].idx < 0 {
+		return p.toks[n-1].key
+	}
+	return ""
 }
 
 func escapePtr(s string) string {

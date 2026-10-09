@@ -688,6 +688,13 @@ func TestCLI(t *testing.T) {
 	if dst2.head("staging", "cup").ID != f.cup || dst2.head("schemas", "match").ID != f.matchV2 {
 		t.Fatal("mapped import")
 	}
+	// A namespace that $schema paths name can't be renamed: they would
+	// name another.
+	errb.Reset()
+	if code := bundle.CLI(ctx, "import", []string{"-api", dst2.url, "-ns", "schemas=forms", "-i", full, "-author", "alice", "-atomic"}, &out, &errb); code != 1 ||
+		!strings.Contains(errb.String(), "can't be renamed") {
+		t.Fatalf("renaming the schemas: %d %s", code, errb.String())
+	}
 }
 
 func TestSnapshotDeletion(t *testing.T) {

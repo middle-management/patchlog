@@ -40,7 +40,7 @@ func SignSteps(k sig.Key, origin, ns, name, parent string, steps []client.Step) 
 			if s.Patches == nil {
 				return nil, fmt.Errorf("merge: signing %s/%s: step %d has no patch set", ns, name, i)
 			}
-			v, err := client.ToValue(s.Patches)
+			v, err := client.Value(s.Patches)
 			if err != nil {
 				return nil, fmt.Errorf("merge: signing %s/%s: step %d: %w", ns, name, i, err)
 			}

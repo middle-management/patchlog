@@ -10,7 +10,9 @@ import (
 // Intermediate snapshots (D.4) fall every SnapshotEveryRevisions patch
 // sets, counted on the resource row by step 7, across the steps of a batch
 // item too, and counted from the revisions again when the row doesn't have
-// the counts (a database from before them).
+// the counts (a database from before them). A genesis that adds the whole
+// document is a snapshot of it: the count starts after it, and a document
+// read there is cut from it.
 func TestSnapshotCounts(t *testing.T) {
 	t.Parallel()
 	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
@@ -71,7 +73,7 @@ func TestSnapshotCounts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	want("a", 3, 6)
+	want("a", 4, 7)
 	// Counts unknown: counted from the revisions since the last snapshot.
 	if err := e.update(ctx, func(t *tx) error {
 		_, err := t.Exec(`UPDATE resources SET snap_revs = NULL, snap_bytes = NULL`)
@@ -84,7 +86,7 @@ func TestSnapshotCounts(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	want("a", 3, 6, 9, 12)
+	want("a", 4, 7, 10)
 
 	// A batch item's steps, and its other item's single step.
 	r := who
@@ -101,6 +103,19 @@ func TestSnapshotCounts(t *testing.T) {
 	}, nil, nil, false); err != nil {
 		t.Fatal(err)
 	}
-	want("b", 3, 6)
+	want("b", 4, 7)
 	want("c")
+	// Read at its genesis, a document is the genesis's value.
+	var doc []byte
+	if err := e.read(ctx, func(t *tx) error {
+		e.docs.flush()
+		var err error
+		doc, err = t.docBytesAt(t.rev(t.resource(t.nsByName("n").id, "c").headSeq.Int64))
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if string(doc) != `{"n":0}` {
+		t.Fatalf("c at its genesis: %s", doc)
+	}
 }

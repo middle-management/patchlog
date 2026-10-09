@@ -173,7 +173,7 @@ func patchBlobs(s client.Step, tests bool) []string {
 	if s.Delete || s.Patches == nil {
 		return nil
 	}
-	v, err := client.ToValue(s.Patches)
+	v, err := client.Value(s.Patches)
 	if err != nil {
 		return nil
 	}

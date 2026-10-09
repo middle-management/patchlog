@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
+	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
@@ -758,13 +760,19 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 
 	// Step 6: rules.
+	readsPatches := map[string]bool{}
 	for _, s := range st {
 		for _, step := range s.steps {
 			check := t.checkRules
 			if step.sealed {
 				check = func(cfg *Config, a *actor, env map[string]any, _ bool) *Error { return t.checkRulesE2E(cfg, a, env) }
 			}
-			if err := check(cfg, a, t.stepEnvelope(s, step, a), false); err != nil {
+			reads, ok := readsPatches[step.action]
+			if !ok {
+				reads = rulesRead(cfg, a, step.action, "patches")
+				readsPatches[step.action] = reads
+			}
+			if err := check(cfg, a, t.stepEnvelope(s, step, a, reads), false); err != nil {
 				fs = append(fs, itemErr{s.index, err})
 				break
 			}
@@ -1282,6 +1290,24 @@ func patchErr(err error) *Error {
 	return invalid(err.Error())
 }
 
+// genesisPrefix begins the canonical form of a patch set that adds a whole
+// document (§3.3); the document's own canonical form follows it.
+var genesisPrefix = []byte(`[{"op":"add","path":"","value":`)
+
+// genesisDocCanon is the canonical form of the document a step's lone
+// whole-document add makes, cut from its patch set's (a create, as an
+// import's are), or nil for any other step.
+func genesisDocCanon(step *stepState) []byte {
+	ops, _ := step.raw.([]any)
+	if len(ops) != 1 {
+		return nil
+	}
+	if op, _ := ops[0].(map[string]any); len(op) != 3 || !bytes.HasPrefix(step.canon, genesisPrefix) || !bytes.HasSuffix(step.canon, []byte("}]")) {
+		return nil
+	}
+	return step.canon[len(genesisPrefix) : len(step.canon)-2 : len(step.canon)-2]
+}
+
 // checkLimits is step 4 (§6.6).
 func checkLimits(l Limits, s *itemState) *Error {
 	for _, step := range s.steps {
@@ -1298,7 +1324,9 @@ func checkLimits(l Limits, s *itemState) *Error {
 		if ops, ok := step.raw.([]any); ok && len(ops) > l.OpsPerSet {
 			return limitErr(422, "too many operations")
 		}
-		step.docCanon = jsonv.Canonical(step.doc)
+		if step.docCanon = genesisDocCanon(step); step.docCanon == nil {
+			step.docCanon = jsonv.Canonical(step.doc)
+		}
 		if len(step.docCanon) > l.DocumentSize {
 			return limitErr(413, "document too large")
 		}
@@ -1483,8 +1511,44 @@ func (t *tx) schemaRevIn(n *nsRow, ref schema.Ref) (any, error) {
 	return d, nil
 }
 
-// stepEnvelope builds the change envelope of §6.4.1 for one step.
-func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor) map[string]any {
+// rulesRead reports whether a rule deciding a's verb in cfg may read the
+// change envelope's member m (§6.4.1): one of the namespace's rules, or of
+// the grant's key, block and role rules.
+func rulesRead(cfg *Config, a *actor, verb, m string) bool {
+	reads := func(r *rules.Rule) bool {
+		refs := r.Refs()
+		return refs[m] || refs["*"]
+	}
+	for _, r := range cfg.Rules {
+		if reads(r) {
+			return true
+		}
+	}
+	if a == nil || a.verified == nil {
+		return false
+	}
+	v := a.verified
+	lists := [][]any{v.KeyRules, v.BlockRules}
+	if v.HasRoles() {
+		_, roles := v.Allows(verb)
+		for _, role := range roles {
+			lists = append(lists, v.RoleRules(role))
+		}
+	}
+	for _, l := range lists {
+		for _, rv := range l {
+			if r, err := compileCached(rv); err != nil || reads(r) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// stepEnvelope builds the change envelope of §6.4.1 for one step. Its
+// patches are a copy of the step's, parsed again only if a rule reads them
+// (withPatches); otherwise the member is absent, which no rule sees.
+func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor, withPatches bool) map[string]any {
 	env := t.basicEnvelope(step.action, s.Resource, a)
 	w := make([]any, len(step.writes))
 	for i, x := range step.writes {
@@ -1500,7 +1564,9 @@ func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor) map[string]an
 		env["patches"] = []any{}
 	} else {
 		env["doc"] = step.doc
-		env["patches"] = jsonv.MustParse(step.canon)
+		if withPatches {
+			env["patches"] = jsonv.MustParse(step.canon)
+		}
 	}
 	return env
 }
@@ -1816,6 +1882,14 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 				canon = jsonv.Canonical(step.doc)
 			}
 			t.cacheDoc(step.id, canon)
+			if step.parentID == nil && genesisDocCanon(step) != nil {
+				// A genesis that adds the whole document holds it as a
+				// snapshot would (docBytesAt reads it as one): the count
+				// starts after it, and a copy would double a create's
+				// writes.
+				it.snapRevs, it.snapBytes = 0, 0
+				continue
+			}
 			// An intermediate snapshot once enough patch sets have
 			// accumulated since the last one (D.4), so no read folds more.
 			it.snapRevs++

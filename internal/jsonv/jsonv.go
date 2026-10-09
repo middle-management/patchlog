@@ -365,6 +365,78 @@ func Canonical(v any) []byte {
 	return out
 }
 
+// CanonicalOf is Canonical of a value IsValue accepts, checked as it is
+// written in one pass; ok is false, and nothing returned, for any other.
+func CanonicalOf(v any) (canon []byte, ok bool) {
+	b := canonBufs.Get().(*bytes.Buffer)
+	b.Reset()
+	if ok = writeChecked(b, v, 0); ok {
+		canon = bytes.Clone(b.Bytes())
+	}
+	if b.Cap() <= maxPooledCanon {
+		canonBufs.Put(b)
+	}
+	return canon, ok
+}
+
+func writeChecked(b *bytes.Buffer, v any, depth int) bool {
+	switch x := v.(type) {
+	case nil, bool:
+		writeCanonical(b, x)
+	case float64:
+		if math.IsInf(x, 0) || math.IsNaN(x) || UnsafeInteger(x) {
+			return false
+		}
+		b.WriteString(FormatNumber(x))
+	case string:
+		if !utf8.ValidString(x) {
+			return false
+		}
+		writeString(b, x)
+	case []any:
+		if depth >= maxParseDepth {
+			return false
+		}
+		b.WriteByte('[')
+		for i, e := range x {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			if !writeChecked(b, e, depth+1) {
+				return false
+			}
+		}
+		b.WriteByte(']')
+	case map[string]any:
+		if depth >= maxParseDepth {
+			return false
+		}
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			if !utf8.ValidString(k) {
+				return false
+			}
+			keys = append(keys, k)
+		}
+		sortUTF16(keys)
+		b.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				b.WriteByte(',')
+			}
+			writeString(b, k)
+			b.WriteByte(':')
+			if !writeChecked(b, x[k], depth+1) {
+				return false
+			}
+		}
+		b.WriteByte('}')
+	default:
+		return false
+	}
+	return true
+}
+
 // maxPooledCanon bounds the buffers kept for reuse (documents are at most a
 // few MiB, §6.6).
 const maxPooledCanon = 8 << 20
@@ -603,6 +675,45 @@ func Equal(a, b any) bool {
 		for k, v := range x {
 			w, ok := y[k]
 			if !ok || !Equal(v, w) {
+				return false
+			}
+		}
+		return true
+	}
+	return false
+}
+
+// IsValue reports whether v is already a value of the model, one Parse
+// could have returned: nil, bool, finite float64 (no integer outside
+// ±(2^53−1)), valid UTF-8 strings, and []any and map[string]any of
+// values, nested at most as deep as Parse allows. A value a client builds
+// from parsed values needs no round trip through JSON text.
+func IsValue(v any) bool { return isValue(v, 0) }
+
+func isValue(v any, depth int) bool {
+	switch x := v.(type) {
+	case nil, bool:
+		return true
+	case float64:
+		return !math.IsInf(x, 0) && !math.IsNaN(x) && !UnsafeInteger(x)
+	case string:
+		return utf8.ValidString(x)
+	case []any:
+		if depth >= maxParseDepth {
+			return false
+		}
+		for _, e := range x {
+			if !isValue(e, depth+1) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		if depth >= maxParseDepth {
+			return false
+		}
+		for k, e := range x {
+			if !utf8.ValidString(k) || !isValue(e, depth+1) {
 				return false
 			}
 		}

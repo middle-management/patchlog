@@ -502,7 +502,7 @@ func (s Step) WithGesture(gesture, undoes string) Step {
 func (s Step) value() (any, error) {
 	var body any = "delete"
 	if !s.Delete {
-		p, err := ToValue(s.Patches)
+		p, err := Value(s.Patches)
 		if err != nil {
 			return nil, err
 		}

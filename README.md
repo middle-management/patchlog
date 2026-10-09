@@ -1710,6 +1710,17 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
   bucket's full rate, which holds up no other writer, until a minute before the allowance's
   `until`. A chain cut between two batches is also paced at `ratePerResource`, which an
   allowance doesn't replace. A `429` is waited out by its body's `retryAfter`.
+- **Concurrent batches.** Under an allowance a backfill submits up to `-concurrency` batches at
+  once (default 4), in dependency order all the same: a namespace's batches start once those of
+  the namespaces it depends on have committed, and within a namespace a batch waits for one in
+  flight that it goes on with or whose documents it pins. Items are ordered by what they pin
+  (schemas included), not by live references. Each request waits at its namespace's gate until
+  the allowance's bucket has refilled what the requests before it drew. A request in flight
+  counts as drawing no earlier than now, and a namespace has no more batches in flight than the
+  allowance's burst holds the draws of. Without an allowance, batches go one at a time.
+- **Re-runs.** An import into a target that already has the bundle reads what it can't predict
+  only: an upstream head that is the genesis of the rewritten snapshot is taken as unchanged
+  without reading it, and an upstream chain is read only for a fast-forward that needs it.
 - **Dry runs.** A batch is atomic, and a dry run draws the tokens its submit does (§6.6), so an
   import dry-runs only the first batch of each existing target namespace, before anything is
   written, and submits the rest directly; a failed submit lists its items as a dry run does. In
@@ -2038,7 +2049,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
 - **Documents are cached by revision id**, since an id determines its document everywhere
   (§3.3). Head snapshots are kept only for documents up to 16 KiB. An intermediate snapshot is
   written after every 100 revisions or 64 KiB of patch sets, so every read folds from the nearest
-  snapshot and never folds more than that (D.4).
+  snapshot and never folds more than that (D.4). A genesis that adds the whole document counts
+  as its snapshot: the count starts after it, and a read there cuts the document from its
+  canonical patch set.
 - **Namespace-document members** (§7.4). A namespace document may hold only the members the
   spec defines: `read`, `keys`, `roles`, `revoked`, `rules`, `limits`, `allowances`,
   `retention`, `encryption`, `maxLag`, `base`, `frozen`, `successor`, `drafts`, `signatures`,

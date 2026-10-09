@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,8 +69,8 @@ func splitList(s string) []string {
 
 // connect makes a client; identity unwraps the keys of sealed namespaces
 // (§E.2.3) that the grant's enc names.
-func connect(api, bearer, author string, identity *ecdh.PrivateKey) (*client.Client, error) {
-	opts := []client.Option{client.WithKeys(client.NewKeys(identity))}
+func connect(api, bearer, author string, identity *ecdh.PrivateKey, more ...client.Option) (*client.Client, error) {
+	opts := append([]client.Option{client.WithKeys(client.NewKeys(identity))}, more...)
 	if bearer != "" {
 		opts = append(opts, client.WithBearer(bearer))
 	}
@@ -245,8 +246,16 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 // single plain name that isn't in the bundle maps the bundle's one
 // document namespace (a namespace no $schema or $ref names) to it, e.g.
 // to import into a branch first (§G.4.4).
-func namespaceMap(h *Header, schemaNS map[string]bool, spec string) (map[string]string, error) {
+func namespaceMap(h *Header, schemaNamespaces func() (map[string]bool, error), spec string) (map[string]string, error) {
 	m := map[string]string{}
+	var schemaNS map[string]bool
+	needSchemaNS := func() error {
+		var err error
+		if schemaNS == nil {
+			schemaNS, err = schemaNamespaces()
+		}
+		return err
+	}
 	inBundle := map[string]bool{}
 	for ns := range h.At {
 		inBundle[ns] = true
@@ -256,6 +265,11 @@ func namespaceMap(h *Header, schemaNS map[string]bool, spec string) (map[string]
 			if !inBundle[src] {
 				return nil, fmt.Errorf("import: -ns %s: the bundle has no namespace %s", s, src)
 			}
+			if src != dst {
+				if err := needSchemaNS(); err != nil {
+					return nil, err
+				}
+			}
 			if schemaNS[src] && src != dst {
 				return nil, fmt.Errorf("import: -ns %s: %s holds schemas that $schema/$ref paths name, so it can't be renamed", s, src)
 			}
@@ -264,6 +278,9 @@ func namespaceMap(h *Header, schemaNS map[string]bool, spec string) (map[string]
 		}
 		if inBundle[s] {
 			continue
+		}
+		if err := needSchemaNS(); err != nil {
+			return nil, err
 		}
 		var docNS []string
 		for ns := range inBundle {
@@ -279,22 +296,38 @@ func namespaceMap(h *Header, schemaNS map[string]bool, spec string) (map[string]
 	return m, nil
 }
 
-// schemaNamespaces lists the namespaces named by $schema or $ref paths in a
-// bundle.
-func schemaNamespaces(open Opener) (map[string]bool, *Header, error) {
+// bundleHeader reads a bundle's header.
+func bundleHeader(open Opener) (*Header, error) {
 	r, err := open()
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer r.Close()
 	rd, err := NewReader(r)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
+	return rd.Header(), nil
+}
+
+// schemaNamespaces lists the namespaces named by $schema or $ref paths in a
+// bundle, which reads all of it: only a -ns that renames needs them.
+func schemaNamespaces(open Opener) (map[string]bool, error) {
+	r, err := open()
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	rd, err := NewReader(r)
+	if err != nil {
+		return nil, err
+	}
+	rd.parallel(runtime.GOMAXPROCS(0))
+	defer rd.Close()
 	out := map[string]bool{}
 	note := func(v any) {
-		walkStrings(v, "", func(ptr, s string) {
-			if strings.HasSuffix(ptr, "/$schema") || strings.HasSuffix(ptr, "/$ref") {
+		walkStrings(v, func(at *strPath, s string) {
+			if k := at.Last(); k == "$schema" || k == "$ref" {
 				if r, ok := schema.ParseRef(s); ok {
 					out[r.NS] = true
 				}
@@ -304,10 +337,10 @@ func schemaNamespaces(open Opener) (map[string]bool, *Header, error) {
 	for {
 		l, err := rd.Next()
 		if err == io.EOF {
-			return out, rd.Header(), nil
+			return out, nil
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, err
 		}
 		if l.IsBlob() || l.IsGrant() {
 			continue
@@ -340,12 +373,17 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.Var(&resolves, "resolve", "resolve a conflict: ns/name=skip|take|replay (repeatable)")
 	idFile := fs.String("identity", "", "private key (JWK): opens a sealed bundle, and unwraps the keys of sealed targets (§G.5.1.1, §E.2.3)")
 	allowLess := fs.Bool("allow-less-protected", false, "operator override: import private or sealed namespaces into public targets (§G.5.1)")
+	concurrency := fs.Int("concurrency", defaultConcurrency, "backfill under an allowance: batches submitted at once, in dependency order all the same, "+
+		"or fewer: as many as the allowance's burst holds the draws of; 1 submits one at a time")
 	signKey := signKeyFlag(fs)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if *in == "" {
 		return fmt.Errorf("import: -i is required")
+	}
+	if *concurrency < 1 {
+		return fmt.Errorf("import: -concurrency must be at least 1")
 	}
 	signer, err := parseSignKey(*signKey)
 	if err != nil {
@@ -355,7 +393,8 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	if err != nil {
 		return err
 	}
-	opt := ImportOptions{DryRun: *dry, CreateNamespaces: *create, UpstreamSuffix: *suffix, Resolutions: map[string]Resolution{}, AllowLessProtected: *allowLess, Signer: signer}
+	opt := ImportOptions{DryRun: *dry, CreateNamespaces: *create, UpstreamSuffix: *suffix, Resolutions: map[string]Resolution{}, AllowLessProtected: *allowLess, Signer: signer,
+		Concurrency: *concurrency}
 	switch {
 	case *atomic && *pace != "":
 		return fmt.Errorf("import: choose one of -atomic and -pace")
@@ -380,14 +419,14 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		opt.Resolutions[k] = res
 	}
 	open := UnsealOpener(FileOpener(*in), identity)
-	schemaNS, h, err := schemaNamespaces(open)
+	h, err := bundleHeader(open)
 	if err != nil {
 		return err
 	}
-	if opt.NSMap, err = namespaceMap(h, schemaNS, *nsSpec); err != nil {
+	if opt.NSMap, err = namespaceMap(h, func() (map[string]bool, error) { return schemaNamespaces(open) }, *nsSpec); err != nil {
 		return err
 	}
-	c, err := connect(*api, *bearer, *author, identity)
+	c, err := connect(*api, *bearer, *author, identity, client.WithIdleConns(opt.Concurrency))
 	if err != nil {
 		return err
 	}

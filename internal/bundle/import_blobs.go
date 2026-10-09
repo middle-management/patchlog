@@ -73,8 +73,14 @@ func (im *importer) sendBlobs(ctx context.Context, b *batch, l limits) error {
 					nd.bid, it.d.ns, line.Type, SealedBlobType)
 			}
 			err := im.retry(ctx, func() error {
+				done, err := im.admit(ctx, it.ns, 1)
+				if err != nil {
+					return err
+				}
 				at := im.opt.Now()
-				bid, err := im.c.UploadBlob(ctx, it.ns, it.name, line.Type, line.Nonce, line.Data)
+				var bid string
+				im.io(func() { bid, err = im.c.UploadBlob(ctx, it.ns, it.name, line.Type, line.Nonce, line.Data) })
+				done()
 				im.blobDrew(it.ns, it.name, at, err)
 				if err == nil && bid != nd.bid {
 					err = fmt.Errorf("uploaded as %s", bid)
@@ -148,8 +154,13 @@ func (im *importer) sendAll(ctx context.Context, b *batch, l limits) error {
 // rank than the target, answers 404, and the caller falls back.
 func (im *importer) copyBlob(ctx context.Context, ns, name, bid, fromNS, fromName string) bool {
 	return im.retry(ctx, func() error {
+		done, err := im.admit(ctx, ns, 1)
+		if err != nil {
+			return err
+		}
 		at := im.opt.Now()
-		err := im.c.CopyBlob(ctx, ns, name, bid, fromNS, fromName, "")
+		im.io(func() { err = im.c.CopyBlob(ctx, ns, name, bid, fromNS, fromName, "") })
+		done()
 		im.blobDrew(ns, name, at, err)
 		return err
 	}) == nil
@@ -161,8 +172,8 @@ func (im *importer) copyBlob(ctx context.Context, ns, name, bid, fromNS, fromNam
 // time it took.
 func (im *importer) blobDrew(ns, name string, at time.Time, err error) {
 	im.timed(&im.rep.Timings.Blobs, at)
-	if !client.IsRateLimited(err) {
-		im.drew(ns, at, 1, name)
+	if !client.IsRateLimited(err) && im.gates[ns] == nil {
+		im.drew(ns, at, 1, name) // a gate recorded it as it admitted it
 	}
 }
 

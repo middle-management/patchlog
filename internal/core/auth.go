@@ -635,6 +635,16 @@ type bucket struct {
 	last   time.Time
 }
 
+// refill adds what a bucket refilled since it was last drawn on, up to its
+// burst. A request that read the clock before another drew on the bucket
+// finds it there already: time doesn't run backwards for a bucket.
+func (b *bucket) refill(now time.Time, r Rate) {
+	if el := now.Sub(b.last); el > 0 {
+		b.tokens = math.Min(r.Burst, b.tokens+el.Seconds()*r.Rate)
+		b.last = now
+	}
+}
+
 func newRateLimiter() *rateLimiter { return &rateLimiter{b: map[string]*bucket{}} }
 
 type draw struct {
@@ -659,8 +669,7 @@ func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, string
 			b = &bucket{tokens: d.rate.Burst, last: now}
 			rl.b[d.key] = b
 		}
-		b.tokens = math.Min(d.rate.Burst, b.tokens+now.Sub(b.last).Seconds()*d.rate.Rate)
-		b.last = now
+		b.refill(now, d.rate)
 		bs[i] = b
 		if b.tokens < 1 {
 			w := time.Duration((1 - b.tokens) / d.rate.Rate * float64(time.Second))
@@ -744,8 +753,7 @@ func (rl *rateLimiter) charge(now time.Time, d draw) {
 		b = &bucket{tokens: d.rate.Burst, last: now}
 		rl.b[d.key] = b
 	}
-	b.tokens = math.Min(d.rate.Burst, b.tokens+now.Sub(b.last).Seconds()*d.rate.Rate)
-	b.last = now
+	b.refill(now, d.rate)
 	b.tokens -= d.cost
 }
 

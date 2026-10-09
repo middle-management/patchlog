@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+Bundle import speed. On a synthetic copy of a CMS deployment's content (6,900 snapshot documents,
+121 MB, 350 layouts of 100–450 KB; `BenchmarkImportContent`), a `patchlog import` under a
+10,000/s allowance into a fresh SQLite target took 58.6 s with v0.16.1 and takes 18.0 s: planning
+27.8 s → 6.0 s. A re-run into a target that has it all took 26.7 s and takes 5.7 s, with 75
+requests instead of 13,875.
+
+- **Concurrent batches** (`-concurrency`, `ImportOptions.Concurrency`, default 4). A backfill
+  under an allowance submits several batches at once, still in dependency order (§G.4.4): a
+  namespace's batches start once those of the namespaces it depends on have committed, and a
+  batch waits for one in flight that it goes on with or whose documents it pins. Each request
+  waits at its namespace's gate until the allowance's bucket has refilled what the requests
+  before it drew. A request in flight counts as drawing no earlier than now, so the server
+  handling requests out of order doesn't overdraw the bucket. A namespace has only as many
+  batches in flight as the allowance's burst holds the draws of. Without an allowance, batches
+  go one at a time as before.
+- **Ordering by pins.** Within a namespace, items follow the documents they pin (schemas
+  included), not live references, which name no revision that must exist. In a reference cycle
+  of namespaces, upstream namespaces now go first (§G.4.4 "Upstream first"); they went by name.
+- **Re-runs read nothing they can predict.** An upstream head that is the genesis revision of
+  the rewritten snapshot, as an earlier import wrote it, is that snapshot: neither its document
+  nor its chain is read. A chain is read only when a fast-forward needs it, and not for a target
+  where the previous import left both.
+- **Planning.** Patch sets the import already holds as values no longer go through JSON text
+  and back for revision ids, sizes and blob scans; each is serialised once. Request bodies are
+  written as canonical JSON instead of by reflection. Bundle lines are parsed, and snapshot
+  documents' x-ref walks run, on parallel workers. Snapshot documents are rewritten in place
+  instead of copied, and reference scans don't format a pointer for every string.
+- `patchlog import` reads only the bundle's header before importing, unless `-ns` renames a
+  namespace; it read the whole bundle once more first.
+- **Server: a create's document isn't serialised twice.** The stored document is cut from its
+  patch set's canonical form, and the rules envelope parses the patch set again only when a rule
+  reads `patches`. Request bodies from clients are parsed as before.
+- **Server: a genesis that adds the whole document is its snapshot** (D.4). It no longer gets an
+  intermediate snapshot of its own, which doubled a large create's writes; the count of patch
+  sets towards the next starts after it, and a read at the genesis cuts the document from it.
+- **Server: rate buckets don't refill backwards.** A request that read the clock before another
+  drew on the same bucket took tokens off it as negative time; concurrent requests could be
+  answered `429` early.
+- `BenchmarkImportContent` imports the synthetic content bundle (`PATCHLOG_CONTENT_SCALE`
+  scales it), reporting planning, batch and total time, requests and peak heap.
+
 ## v0.16.1
 
 - **Index and tree services: a purged namespace or catalog answers `410 purged` with `head`**,

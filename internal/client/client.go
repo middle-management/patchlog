@@ -394,12 +394,30 @@ func encodeJSON(v any) ([]byte, error) {
 	case nil:
 		return nil, errors.New("client: nil body")
 	}
+	if canon, ok := jsonv.CanonicalOf(v); ok {
+		// Already a value of the model, as a parsed document is: its
+		// canonical form is its JSON, and much cheaper than reflection.
+		return canon, nil
+	}
 	return json.Marshal(v)
 }
 
 // ToValue converts v (anything encoding/json marshals, or raw JSON bytes) to
-// the jsonv value model, rejecting non-I-JSON input as the server would.
+// the jsonv value model, rejecting non-I-JSON input as the server would. A
+// value already of the model is copied.
 func ToValue(v any) (any, error) {
+	if jsonv.IsValue(v) && v != nil {
+		return jsonv.Clone(v), nil
+	}
+	return Value(v)
+}
+
+// Value is ToValue without the copy: v itself when it is already a value of
+// the model, which the caller must then not modify.
+func Value(v any) (any, error) {
+	if jsonv.IsValue(v) && v != nil {
+		return v, nil
+	}
 	b, err := encodeJSON(v)
 	if err != nil {
 		return nil, err

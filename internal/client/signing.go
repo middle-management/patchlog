@@ -45,7 +45,7 @@ func SignWrite(k sig.Key, origin, ns, name, parent string, patches any, del bool
 		}
 		return k.SignTombstone(origin, ns, name, *p), nil
 	}
-	v, err := ToValue(patches)
+	v, err := Value(patches)
 	if err != nil {
 		return "", err
 	}
@@ -104,7 +104,7 @@ func (c *Client) signBatch(ctx context.Context, ns string, items []BatchItem) ([
 				}
 				id = ids.Tombstone(*parent)
 			} else {
-				v, err := ToValue(s.Patches)
+				v, err := Value(s.Patches)
 				if err != nil {
 					return nil, fmt.Errorf("client: batch item %s: %w", it.Resource, err)
 				}

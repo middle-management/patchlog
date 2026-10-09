@@ -964,6 +964,21 @@ type Reader struct {
 	lineNo int
 	digest string
 	done   bool
+	// Parsing lines ahead on other goroutines (parallel), if started:
+	// each line's result in order, and a channel that stops them.
+	ahead   chan chan parsedLine
+	stop    chan struct{}
+	stopped bool
+	failed  error // where parsing ahead stopped
+}
+
+// parsedLine is a line parsed ahead: its value, canonical form and line,
+// or why it isn't one; io.EOF after the last.
+type parsedLine struct {
+	lineNo int
+	canon  []byte
+	l      *Line
+	err    error
 }
 
 // NewReader reads and checks the header.
@@ -1019,28 +1034,135 @@ func (r *Reader) Next() (*Line, error) {
 	if r.done {
 		return nil, io.EOF
 	}
-	v, canon, err := r.next()
-	if err == io.EOF {
+	var p parsedLine
+	switch {
+	case r.failed != nil:
+		// Parsing ahead stopped at it.
+		return nil, r.failed
+	case r.ahead != nil:
+		p = <-<-r.ahead
+		r.lineNo = p.lineNo
+		if p.err != nil && p.err != io.EOF {
+			r.failed = p.err
+		}
+	default:
+		p = r.parse()
+	}
+	if p.err == io.EOF {
 		d, ferr := r.c.finish()
 		if ferr != nil {
+			if r.ahead != nil {
+				r.failed = ferr // nothing more comes from parsing ahead
+			}
 			return nil, ferr
 		}
 		r.digest, r.done = d, true
 		return nil, io.EOF
 	}
-	if err != nil {
-		return nil, err
-	}
-	l, err := parseLine(v, r.h.Authors)
-	if err != nil {
-		return nil, &Error{Line: r.lineNo, Msg: err.Error()}
+	if p.err != nil {
+		return nil, p.err
 	}
 	r.c.n = r.lineNo - 1
-	if err := r.c.line(l); err != nil {
+	if err := r.c.line(p.l); err != nil {
 		return nil, err
 	}
-	r.c.digestLine(canon)
-	return l, nil
+	r.c.digestLine(p.canon)
+	return p.l, nil
+}
+
+// parse reads and parses the next line.
+func (r *Reader) parse() parsedLine {
+	v, canon, err := r.next()
+	if err != nil {
+		return parsedLine{err: err}
+	}
+	return parseAt(r.lineNo, v, canon, r.h.Authors)
+}
+
+func parseAt(lineNo int, v any, canon []byte, authors bool) parsedLine {
+	l, err := parseLine(v, authors)
+	if err != nil {
+		return parsedLine{lineNo: lineNo, err: &Error{Line: lineNo, Msg: err.Error()}}
+	}
+	return parsedLine{lineNo: lineNo, canon: canon, l: l}
+}
+
+// parallel parses lines ahead on workers goroutines, which Next takes in
+// order and checks as it does one at a time: the parsing and canonical
+// forms are most of reading a large bundle. Close stops them.
+func (r *Reader) parallel(workers int) {
+	if r.ahead != nil || r.done || workers < 2 {
+		return
+	}
+	ahead, stop := make(chan chan parsedLine, 4*workers), make(chan struct{})
+	r.ahead, r.stop = ahead, stop
+	authors := r.h.Authors
+	type job struct {
+		lineNo int
+		b      []byte
+		out    chan parsedLine
+	}
+	jobs := make(chan job, 4*workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			for j := range jobs {
+				v, perr := jsonv.Parse(j.b)
+				if perr != nil {
+					j.out <- parsedLine{lineNo: j.lineNo, err: &Error{Line: j.lineNo, Msg: "not I-JSON: " + perr.Error()}}
+					continue
+				}
+				j.out <- parseAt(j.lineNo, v, jsonv.Canonical(v), authors)
+			}
+		}()
+	}
+	br, lineNo := r.br, r.lineNo // the reading goroutine's from now on
+	go func() {
+		defer close(jobs)
+		send := func(out chan parsedLine) bool {
+			select {
+			case ahead <- out:
+				return true
+			case <-stop:
+				return false
+			}
+		}
+		for {
+			b, err := br.ReadBytes('\n')
+			if len(b) == 0 && err != nil {
+				out := make(chan parsedLine, 1)
+				out <- parsedLine{lineNo: lineNo, err: err}
+				send(out)
+				return
+			}
+			if err != nil && err != io.EOF {
+				out := make(chan parsedLine, 1)
+				out <- parsedLine{lineNo: lineNo, err: err}
+				send(out)
+				return
+			}
+			lineNo++
+			if len(bytes.TrimSpace(b)) == 0 {
+				continue
+			}
+			j := job{lineNo: lineNo, b: b, out: make(chan parsedLine, 1)}
+			if !send(j.out) {
+				return
+			}
+			select {
+			case jobs <- j:
+			case <-stop:
+				return
+			}
+		}
+	}()
+}
+
+// Close stops parsing ahead (parallel); the underlying reader isn't closed.
+func (r *Reader) Close() {
+	if r.stop != nil && !r.stopped {
+		close(r.stop)
+		r.stopped = true
+	}
 }
 
 // Digest is the bundle digest; it is set once Next has returned io.EOF.

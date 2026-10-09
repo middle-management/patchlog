@@ -1,7 +1,9 @@
 package core
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -407,6 +409,21 @@ func (t *tx) docAt(r *revRow) (any, error) {
 	return jsonv.MustParse(b), nil
 }
 
+// wholeDocument is the document a stored patch set adds as a whole, a
+// lone add at "" (a create's, §3.3), cut from its canonical form; nil for
+// any other patch set.
+func wholeDocument(canon []byte) []byte {
+	if !bytes.HasPrefix(canon, genesisPrefix) || !bytes.HasSuffix(canon, []byte("}]")) {
+		return nil
+	}
+	// The op has no member after value: what follows the prefix is one
+	// value.
+	if v := canon[len(genesisPrefix) : len(canon)-2]; json.Valid(v) {
+		return v
+	}
+	return nil
+}
+
 func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 	// Cached documents are used only for rows that still have their patch
 	// set: an id shared with another resource must not revive a pruned or
@@ -453,9 +470,15 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 		}
 		cur = t.rev(cur.parentSeq.Int64)
 	}
+	if g := len(stack) - 1; base == nil && g >= 0 && !stack[g].parentSeq.Valid {
+		// A genesis that adds the whole document is its snapshot (D.4).
+		if b := wholeDocument(t.patchesOf(stack[g])); b != nil {
+			base, stack = b, stack[:g]
+		}
+	}
 	var doc any
 	exists := base != nil
-	if exists {
+	if exists && len(stack) > 0 {
 		doc = jsonv.MustParse(base)
 	}
 	for i := len(stack) - 1; i >= 0; i-- {

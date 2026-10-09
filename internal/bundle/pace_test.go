@@ -74,7 +74,9 @@ func backfill(t *testing.T, dst *deployment, clk *testClock, who string, b []byt
 	rt := &slowBatches{countingTransport: countingTransport{rt: transport}, clock: clk, took: took}
 	c := must(client.New(dst.url, client.WithAuthor(who), client.WithHTTPClient(&http.Client{Transport: rt})))
 	var sleeps []time.Duration
-	opt := bundle.ImportOptions{Mode: bundle.Backfill, Pace: 0.5,
+	// One batch at a time, as the waits these tests expect are paced
+	// (concurrent batches have their own tests).
+	opt := bundle.ImportOptions{Mode: bundle.Backfill, Pace: 0.5, Concurrency: 1,
 		Sleep: func(_ context.Context, d time.Duration) error { sleeps = append(sleeps, d); clk.add(d); return nil },
 		Now:   clk.Now}
 	for _, o := range opts {
@@ -210,7 +212,7 @@ func TestBackfillAllowanceGrant(t *testing.T) {
 
 	imp := s.Client(t, client.WithBearer(ops.Grant(t, s.Now(), "svc:importer", []string{"bulk"}, can)))
 	var sleeps []time.Duration
-	rep = must(bundle.Import(ctx, imp, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Now: s.Now,
+	rep = must(bundle.Import(ctx, imp, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Now: s.Now, Concurrency: 1,
 		Sleep: func(_ context.Context, d time.Duration) error { sleeps = append(sleeps, d); return nil }}))
 	if got := batchSizes(rep); !slices.Equal(got, []int{5, 2}) || rep.Batches[0].PacedBy != "allowance" || rep.Batches[1].NSID == "" {
 		t.Fatalf("batches %v %+v", got, rep.Batches[0])

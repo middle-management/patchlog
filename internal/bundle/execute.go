@@ -22,8 +22,9 @@ type limits struct {
 	resource          float64 // ratePerResource, which an allowance doesn't replace
 	blobGrace         time.Duration
 	// allowance is the rate of the importer's allowance's bucket, which
-	// replaces the principal and namespace buckets (§6.6); 0 without one.
-	allowance float64
+	// replaces the principal and namespace buckets (§6.6), and burst its
+	// burst; 0 without one.
+	allowance, burst float64
 	// With an allowance, own are the namespace's own limits, which apply
 	// once it ends at until (zero: it doesn't end).
 	own   *limits
@@ -113,6 +114,7 @@ func limitsOf(doc, al map[string]any) limits {
 		if x, ok := b["rate"].(float64); ok && x > 0 {
 			l.allowance = x
 		}
+		l.burst, _ = b["burst"].(float64)
 	}
 	return l
 }
@@ -184,8 +186,8 @@ func (im *importer) split(n *node, l limits) {
 		b := &batch{n: n}
 		for _, it := range n.items {
 			b.parts = append(b.parts, part{it: it, from: 0, to: len(it.steps)})
-			for _, s := range it.steps {
-				b.size += stepSize(s)
+			for _, sz := range it.stepSizes() {
+				b.size += sz
 			}
 		}
 		n.batches = []*batch{b}
@@ -247,7 +249,7 @@ func splitParts(n *node, parts []part, l limits) []*batch {
 			}
 			end, sz := start, 0
 			for end < p.to {
-				s := stepSize(it.steps[end])
+				s := it.stepSizes()[end]
 				if cur.size+sz+s > l.size && (end > start || len(cur.parts) > 0) {
 					break
 				}
@@ -321,17 +323,23 @@ func (im *importer) batchReport(b *batch, part, parts int) *BatchReport {
 
 // call runs a batch or dry run, retrying after 429, 5xx and transport
 // errors. Retrying a submit is safe (§7.5 idempotent retry).
-func (im *importer) call(ctx context.Context, ns string, req client.BatchRequest, dry bool) (*client.BatchResult, error) {
+func (im *importer) call(ctx context.Context, ns string, req client.BatchRequest, dry bool, cut ...string) (*client.BatchResult, error) {
 	backoff := 500 * time.Millisecond
 	for attempt := 0; ; attempt++ {
+		done, err := im.admit(ctx, ns, len(req.Items), cut...)
+		if err != nil {
+			return nil, err
+		}
 		at := im.opt.Now()
-		res, err := im.c.Batch(ctx, ns, req, dry)
+		var res *client.BatchResult
+		im.io(func() { res, err = im.c.Batch(ctx, ns, req, dry) })
+		done()
 		im.timed(&im.rep.Timings.Batches, at)
 		im.rep.Timings.Requests++
 		if dry {
 			im.rep.Timings.DryRuns++
 		}
-		if err == nil || blobsOnly(err) {
+		if im.gates[ns] == nil && (err == nil || blobsOnly(err)) {
 			resources := make([]string, len(req.Items))
 			for i, it := range req.Items {
 				resources[i] = it.Resource
@@ -357,7 +365,9 @@ func (im *importer) wait(ctx context.Context, err error, backoff time.Duration) 
 	if client.IsRateLimited(err) {
 		im.rep.Timings.RateLimited += backoff.Seconds()
 	}
-	return im.opt.Sleep(ctx, backoff)
+	var err2 error
+	im.io(func() { err2 = im.opt.Sleep(ctx, backoff) })
+	return err2
 }
 
 // timed adds the time since t0 to a timing.
@@ -393,7 +403,7 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 	if im.signErr != nil {
 		return fmt.Errorf("import: %w", im.signErr)
 	}
-	res, err := im.call(ctx, b.n.ns, req, true)
+	res, err := im.call(ctx, b.n.ns, req, true, cutChains(b)...)
 	if err != nil {
 		b.rep.DryRun = "failed"
 		b.rep.Error = err.Error()
@@ -580,9 +590,33 @@ func (im *importer) execute(ctx context.Context) error {
 		return nil // the report lists conflicts and dry-run results
 	}
 
+	run := im.newRunner()
+	if err := im.submitAll(ctx, run, lims); err != nil {
+		run.stop()
+		return err
+	}
+	return run.stop()
+}
+
+// submitAll submits every node's batches in order, as many at once as the
+// node allows (concurrent.go), each dry-run first if it updates.
+func (im *importer) submitAll(ctx context.Context, run *runner, lims map[*node]limits) error {
 	for _, n := range im.order {
+		// Its dependencies' batches have committed (§G.4.4 Order); a
+		// namespace whose batches go one at a time waits for all.
+		if err := run.waitFor(func(f *flight) bool { return n.deps[f.n.ns] }); err != nil {
+			return err
+		}
+		if im.opt.Mode != Backfill || lims[n].allowance == 0 || im.opt.Concurrency < 2 {
+			if err := run.slot(1); err != nil {
+				return err
+			}
+		}
 		if n.missing {
-			cr, err := im.c.CreateNamespace(ctx, n.ns, im.nsDoc(ctx, n))
+			var cr *client.ConfigResult
+			var err error
+			doc := im.nsDoc(ctx, n)
+			im.io(func() { cr, err = im.c.CreateNamespace(ctx, n.ns, doc) })
 			if err != nil && !client.IsStale(err) {
 				return fmt.Errorf("import: creating namespace %s: %w", n.ns, err)
 			}
@@ -596,11 +630,37 @@ func (im *importer) execute(ctx context.Context) error {
 				return err
 			}
 		}
+		g, conc := im.gateFor(n, lims[n])
+		if g != nil {
+			im.gates[n.ns] = g
+		} else if err := run.slot(1); err != nil {
+			return err
+		}
 		for i := 0; i < len(n.batches); i++ {
+			b := n.batches[i]
+			max := 1
+			if im.gates[n.ns] != nil {
+				max = conc
+			}
+			if err := run.waitFor(func(f *flight) bool { return f.n == n && im.after(b, f.b) }); err != nil {
+				return err
+			}
+			if err := run.slot(max); err != nil {
+				return err
+			}
 			if l := lims[n]; im.opt.Mode == Backfill && l.ended(im.opt.Now()) {
 				// The rest fit the namespace's own limits, and are paced
 				// as they say. They fit the allowance's too, which the
 				// server goes by until its until.
+				if err := run.waitFor(func(f *flight) bool { return f.n == n }); err != nil {
+					return err
+				}
+				if g := im.gates[n.ns]; g != nil {
+					// The concurrent batches were paced as they went; the
+					// rest pace after each batch, from what they draw.
+					delete(im.gates, n.ns)
+					delete(im.draws, n.ns)
+				}
 				own := *l.own
 				own.items, own.size = min(own.items, l.items), min(own.size, l.size)
 				lims[n] = own
@@ -608,72 +668,88 @@ func (im *importer) execute(ctx context.Context) error {
 				rate, by := lims[n].rate(im.opt.Pace)
 				im.rep.Notes = append(im.rep.Notes, fmt.Sprintf("the importer's allowance in %s ends at %s (§6.6): batches %d to %d fit the namespace's own limits, paced at %g items/s (%s)",
 					n.ns, l.until.Format(time.RFC3339), i+1, len(n.batches), rate, by))
+				b, max = n.batches[i], 1
 			}
-			b := n.batches[i]
-			if b.rep.DryRun != "ok" && b.updates() {
-				if err := im.prepare(ctx, b, lims[n], false); err != nil {
-					return err
-				}
-				if im.opt.Mode == Backfill {
-					// The submit draws again on the bucket of a chain the
-					// batch goes on with.
-					cut := ""
-					if p := b.parts[0]; p.from > 0 {
-						cut = p.it.name
-					}
-					if err := im.pace(ctx, n.ns, lims[n], cut); err != nil {
-						return err
-					}
-				}
+			l, i := lims[n], i
+			if err := run.start(n, b, max, func() error { return im.submitBatch(ctx, n, i, l) }); err != nil {
+				return err
 			}
-			res, expected, err := im.submit(ctx, b, lims[n])
-			if err != nil {
-				b.rep.Error = err.Error()
-				var failures []string
-				if ae, ok := client.AsAPIError(err); ok {
-					switch {
-					case ae.Status == 413 && im.opt.Mode == Atomic:
-						return &TooLargeError{NS: n.ns, Items: len(b.parts), Size: b.size, Err: err}
-					case ae.Status == 412:
-						return fmt.Errorf("import: the target moved while importing into %s (%w); import again: classification by ancestry picks up what is left", n.ns, err)
-					}
-					// The failing items, as a dry run lists them.
-					for _, it := range ae.Items() {
-						name := ""
-						if k, ok := it["index"].(float64); ok && int(k) < len(b.parts) {
-							name = b.parts[int(k)].it.name
-						}
-						code, _ := it["code"].(string)
-						msg, _ := it["message"].(string)
-						failures = append(failures, fmt.Sprintf("%s: %v %s %s", name, it["status"], code, msg))
-					}
-				}
-				if len(failures) > 0 {
-					b.rep.Failures = append(b.rep.Failures, failures...)
-					return fmt.Errorf("import: batch %d/%d into %s fails: %s (%w)", i+1, len(n.batches), n.ns, strings.Join(failures, "; "), err)
-				}
-				return fmt.Errorf("import: batch %d/%d into %s: %w", i+1, len(n.batches), n.ns, err)
+		}
+	}
+	return nil
+}
+
+// submitBatch submits a node's batch i, dry-run first if it updates, and
+// checks the ids it produced. A concurrent batch's requests wait at its
+// namespace's gate (admit); any other batch paces after each (pace).
+func (im *importer) submitBatch(ctx context.Context, n *node, i int, l limits) error {
+	b := n.batches[i]
+	gated := im.gates[n.ns] != nil
+	if b.rep.DryRun != "ok" && b.updates() {
+		if err := im.prepare(ctx, b, l, false); err != nil {
+			return err
+		}
+		if !gated && im.opt.Mode == Backfill {
+			// The submit draws again on the bucket of a chain the
+			// batch goes on with.
+			cut := ""
+			if p := b.parts[0]; p.from > 0 {
+				cut = p.it.name
 			}
-			b.rep.Status, b.rep.NSID = res.Status, res.NSID
-			for j, it := range res.Items {
-				if j < len(expected) && (len(it.IDs) == 0 || it.IDs[len(it.IDs)-1] != expected[j]) {
-					return fmt.Errorf("import: %s/%s produced %v, expected %s", n.ns, it.Resource, it.IDs, expected[j])
-				}
+			if err := im.pace(ctx, n.ns, l, cut); err != nil {
+				return err
 			}
-			if im.opt.Progress != nil {
-				im.opt.Progress(b.rep)
+		}
+	}
+	res, expected, err := im.submit(ctx, b, l)
+	if err != nil {
+		b.rep.Error = err.Error()
+		var failures []string
+		if ae, ok := client.AsAPIError(err); ok {
+			switch {
+			case ae.Status == 413 && im.opt.Mode == Atomic:
+				return &TooLargeError{NS: n.ns, Items: len(b.parts), Size: b.size, Err: err}
+			case ae.Status == 412:
+				return fmt.Errorf("import: the target moved while importing into %s (%w); import again: classification by ancestry picks up what is left", n.ns, err)
 			}
-			if im.opt.Mode == Backfill {
-				// A chain cut between this batch and the next draws on its
-				// resource's bucket again.
-				cut := ""
-				if p := b.parts[len(b.parts)-1]; p.to < len(p.it.steps) {
-					cut = p.it.name
+			// The failing items, as a dry run lists them.
+			for _, it := range ae.Items() {
+				name := ""
+				if k, ok := it["index"].(float64); ok && int(k) < len(b.parts) {
+					name = b.parts[int(k)].it.name
 				}
-				if err := im.pace(ctx, n.ns, lims[n], cut); err != nil {
-					return err
-				}
+				code, _ := it["code"].(string)
+				msg, _ := it["message"].(string)
+				failures = append(failures, fmt.Sprintf("%s: %v %s %s", name, it["status"], code, msg))
 			}
+		}
+		if len(failures) > 0 {
+			b.rep.Failures = append(b.rep.Failures, failures...)
+			return fmt.Errorf("import: batch %d/%d into %s fails: %s (%w)", i+1, len(n.batches), n.ns, strings.Join(failures, "; "), err)
+		}
+		return fmt.Errorf("import: batch %d/%d into %s: %w", i+1, len(n.batches), n.ns, err)
+	}
+	b.rep.Status, b.rep.NSID = res.Status, res.NSID
+	for j, it := range res.Items {
+		if j < len(expected) && (len(it.IDs) == 0 || it.IDs[len(it.IDs)-1] != expected[j]) {
+			return fmt.Errorf("import: %s/%s produced %v, expected %s", n.ns, it.Resource, it.IDs, expected[j])
+		}
+	}
+	if im.opt.Progress != nil {
+		im.opt.Progress(b.rep)
+	}
+	if im.opt.Mode == Backfill {
+		// A chain cut between this batch and the next draws on its
+		// resource's bucket again.
+		cut := ""
+		if p := b.parts[len(b.parts)-1]; p.to < len(p.it.steps) {
+			cut = p.it.name
+		}
+		if gated {
+			return nil
+		}
+		if err := im.pace(ctx, n.ns, l, cut); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -687,8 +763,8 @@ func (im *importer) execute(ctx context.Context) error {
 func (im *importer) probe(ctx context.Context, n *node, l limits) error {
 	b := n.batches[0]
 	p := &batch{n: n, parts: b.parts[:1], rep: b.rep}
-	for _, s := range p.parts[0].it.steps[p.parts[0].from:p.parts[0].to] {
-		p.size += stepSize(s)
+	for _, sz := range p.parts[0].it.stepSizes()[p.parts[0].from:p.parts[0].to] {
+		p.size += sz
 	}
 	if err := im.prepare(ctx, p, l, false); err != nil {
 		return err
@@ -729,12 +805,12 @@ func (im *importer) submit(ctx context.Context, b *batch, l limits) (*client.Bat
 	if im.signErr != nil {
 		return nil, nil, fmt.Errorf("import: %w", im.signErr)
 	}
-	res, err := im.call(ctx, b.n.ns, req, false)
+	res, err := im.call(ctx, b.n.ns, req, false, cutChains(b)...)
 	if err != nil && b.rep.ViaSource > 0 && blobsOnly(err) {
 		if err := im.sendAll(ctx, b, l); err != nil {
 			return nil, nil, err
 		}
-		res, err = im.call(ctx, b.n.ns, req, false)
+		res, err = im.call(ctx, b.n.ns, req, false, cutChains(b)...)
 	}
 	return res, expected, err
 }
@@ -762,16 +838,25 @@ func (im *importer) pace(ctx context.Context, ns string, l limits, cut string) e
 		return nil
 	}
 	im.rep.Timings.Paced += wait.Seconds()
-	return im.opt.Sleep(ctx, wait)
+	var err error
+	im.io(func() { err = im.opt.Sleep(ctx, wait) })
+	return err
 }
 
 // owed is how long from now a bucket that refills at rate takes to refill
 // the import's draws on it in ns since it last paced: on resource's own
 // bucket if resource isn't "".
 func (im *importer) owed(ns string, rate float64, resource string) time.Duration {
+	return owedOf(im.draws[ns], im.opt.Now(), rate, resource)
+}
+
+// owedOf is how long from now a bucket that refills at rate, holding none
+// to spare at the first of draws, takes to refill them: resource's own
+// bucket if resource isn't "", which each draw naming it drew a token from.
+func owedOf(draws []draw, now time.Time, rate float64, resource string) time.Duration {
 	var owed float64
 	var last time.Time
-	for _, d := range im.draws[ns] {
+	for _, d := range draws {
 		tokens := d.tokens
 		if resource != "" {
 			if !slices.Contains(d.resources, resource) {
@@ -782,7 +867,7 @@ func (im *importer) owed(ns string, rate float64, resource string) time.Duration
 		owed = max(0, owed-d.at.Sub(last).Seconds()*rate) + float64(tokens)
 		last = d.at
 	}
-	return time.Duration(owed/rate*float64(time.Second)) - im.opt.Now().Sub(last)
+	return time.Duration(owed/rate*float64(time.Second)) - now.Sub(last)
 }
 
 // draw is what an import drew from a target namespace's rate buckets, and
