@@ -73,7 +73,8 @@ func (c *Client) NSDoc(ctx context.Context, ns, nsID string) (*NSDoc, error) {
 // NonceRequired reports whether namespace ns requires nonces (§C.7): its
 // document in force says "nonce": "required", and every resource create,
 // append or restore must then add a fresh $nonce. An error means the
-// document couldn't be read, as for a reader whose grant is restricted.
+// document couldn't be read, as for a reader whose grant is restricted;
+// writers go by NeedsNonce.
 func (c *Client) NonceRequired(ctx context.Context, ns string) (bool, error) {
 	h, err := c.NSHead(ctx, ns)
 	if err != nil {
@@ -84,6 +85,17 @@ func (c *Client) NonceRequired(ctx context.Context, ns string) (bool, error) {
 		return false, err
 	}
 	return d.Value["nonce"] == "required", nil
+}
+
+// NeedsNonce reports whether a writer to ns adds a fresh $nonce to every
+// patch set (§C.7): ns requires nonces, or its document can't be read, as
+// under a grant whose rules refer to /resource (§C.5), so the writer
+// doesn't know the setting. A public namespace's document is always
+// readable, so that happens only in private ones, where an extra nonce is
+// harmless.
+func (c *Client) NeedsNonce(ctx context.Context, ns string) bool {
+	req, err := c.NonceRequired(ctx, ns)
+	return err != nil || req
 }
 
 // NSEntry is one entry of a namespace log (§7.4), with the fields of §3.5.

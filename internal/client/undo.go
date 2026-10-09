@@ -26,9 +26,10 @@ package client
 //     then "delete"; a genesis "delete". Consecutive patch sets are joined
 //     and split again to stay within opsPerSet and patchSetSize (§6.6).
 //     $nonce is never restored: every patch set gets a fresh one in sealed
-//     namespaces and those that require nonces, a tombstone's restore then
-//     being a lone fresh $nonce, and where the current document has one
-//     (§C.7).
+//     namespaces, in those that require nonces or whose document the grant
+//     can't read, so it doesn't know the setting, a tombstone's restore
+//     then being a lone fresh $nonce, and where the current document has
+//     one (§C.7), if the document it results in is an object.
 //   - The guard. The log after the gesture's last entry in each resource is
 //     compared with the paths the gesture wrote: an overlapping write, a
 //     delete, a restore or an undo of the gesture is a conflict
@@ -582,7 +583,7 @@ type undoEnv struct {
 	level       string // "", "at-rest", "sealed", "e2e"
 	maxOps      int
 	maxBytes    int
-	nonces      bool // the namespace requires nonces (§C.7)
+	nonces      bool // the namespace requires nonces, or its document can't be read (§C.7)
 	cfg         *undoConfig
 }
 
@@ -597,6 +598,12 @@ func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConf
 		return nil, fmt.Errorf("client: invalid undo gesture id %q", cfg.gesture)
 	}
 	level, err := c.EncryptionLevel(ctx, ns)
+	if IsNotFound(err) || IsAuth(err) {
+		// A grant whose rules refer to /resource can't read the namespace
+		// document (§C.5): its level and nonce setting are unknown, and
+		// every patch set adds a fresh $nonce (undoLimits).
+		level, err = "", nil
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -637,9 +644,10 @@ func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConf
 
 // undoLimits reads opsPerSet and patchSetSize from the namespace document
 // (§6.6), with the defaults when it doesn't say or can't be read, and
-// whether it requires nonces (§C.7).
+// whether patch sets add a fresh $nonce: it requires nonces, or it can't
+// be read (§C.7, NeedsNonce).
 func (c *Client) undoLimits(ctx context.Context, ns string, cfg *undoConfig) (ops, size int, nonces bool) {
-	ops, size = 1000, 256<<10
+	ops, size, nonces = 1000, 256<<10, true
 	if h, err := c.NSHead(ctx, ns); err == nil {
 		if d, err := c.NSDoc(ctx, ns, h.ID); err == nil {
 			nonces = d.Value["nonce"] == "required"
@@ -977,8 +985,8 @@ func (c *Client) planResource(ctx context.Context, env *undoEnv, author string, 
 			needNonce = true
 		}
 	}
-	b := &stepBuilder{env: env, nonce: needNonce}
 	st := final.clone()
+	b := &stepBuilder{env: env, nonce: needNonce, st: &st}
 	for i := len(own) - 1; i >= 0; i-- {
 		fe := own[i]
 		switch {
@@ -1153,6 +1161,7 @@ func moveBack(fe *foldedEntry, st *undoState, paths []pointer.Pointer) ([]any, b
 type stepBuilder struct {
 	env     *undoEnv
 	nonce   bool
+	st      *undoState // the inverse so far: what the pending ops result in
 	pending []any
 	restore bool // the next patch set restores: [] is needed even if empty
 	steps   []Step
@@ -1188,9 +1197,12 @@ func (b *stepBuilder) flush() {
 	b.steps = append(b.steps, PatchStep(b.withNonce(cur)))
 }
 
+// withNonce adds a fresh $nonce to a patch set where nonces are needed, if
+// the document it results in is an object: no other root has a member to
+// add (§C.7).
 func (b *stepBuilder) withNonce(ops []any) []any {
 	out := append([]any{}, ops...)
-	if b.nonce {
+	if _, obj := b.st.doc.(map[string]any); b.nonce && obj {
 		out = append(out, map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()})
 	}
 	return out

@@ -336,7 +336,9 @@ func TestBackfillAllowanceEnds(t *testing.T) {
 // batch, which an allowance doesn't replace (§6.6): a backfill paces those
 // batches at ratePerResource, however fast its allowance, and no request is
 // answered 429. Only the first batch is dry-run, and the report says where
-// the time went.
+// the time went. A later import that fast-forwards the chain dry-runs
+// every batch, and paces each dry run by that bucket too, since the submit
+// draws on it again.
 func TestBackfillResourceRate(t *testing.T) {
 	t.Parallel()
 	src := newDeployment(t, stagingOrigin, fastLimits)
@@ -375,6 +377,29 @@ func TestBackfillResourceRate(t *testing.T) {
 	}
 	if dst.head("data", "long").ID != src.head("data", "long").ID {
 		t.Fatal("not imported with its ids")
+	}
+
+	for i := 0; i < 6; i++ {
+		src.append("data", "long", op("replace", "/v", strings.Repeat("y", 500)+fmt.Sprint(i)))
+	}
+	b, _ = exportFrom(t, src, bundle.ExportOptions{Select: []string{"data"}})
+	clk.add(time.Second)
+	rep, sleeps, rt = backfill(t, dst, clk, "alice", b, 0)
+	if len(rep.Batches) != 6 || rt.rejected.Load() != 0 || rt.dry.Load() != 6 || dryRuns(rep) != "ok,ok,ok,ok,ok,ok" {
+		t.Fatalf("update: batches %v, %d 429s, dry runs %q", batchSizes(rep), rt.rejected.Load(), dryRuns(rep))
+	}
+	// A token after the first dry run and the last batch, a tenth of a
+	// second after every other request.
+	want = []time.Duration{time.Millisecond}
+	for range 10 {
+		want = append(want, 100*time.Millisecond)
+	}
+	want = append(want, time.Millisecond)
+	if !slices.Equal(sleeps, want) {
+		t.Fatalf("update: sleeps %v, want %v", sleeps, want)
+	}
+	if dst.head("data", "long").ID != src.head("data", "long").ID {
+		t.Fatal("update not imported with its ids")
 	}
 }
 

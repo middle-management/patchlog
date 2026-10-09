@@ -695,7 +695,7 @@ async function writeRes(kind) {
   if (usesPatch && $('addNonce').checked) {
     const p = tryParse(patch);
     if (!p.ok || !Array.isArray(p.v)) return toast('The patch set is not a JSON array');
-    patch = fmtPatch(withNonce(p.v));
+    if (nonceFits(kind, p.v)) patch = fmtPatch(withNonce(p.v));
   }
   // Every save is one user action, with its own Gesture (§7.2, §11.2 Recording), unless "same gesture" is on.
   const gesture = takeGesture();
@@ -703,8 +703,8 @@ async function writeRes(kind) {
   if (kind === 'create') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-None-Match': '*', Gesture: gesture }, body: patch });
   else if (kind === 'append') r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body: patch });
   else if (kind === 'restore') {
-    // A restore that would be [] sends just a fresh nonce where nonces are required (§8.2, §C.7).
-    const lone = $('addNonce').checked && (S.nsDoc || {}).nonce === 'required';
+    // A restore that would be [] sends just a fresh nonce where nonces are, or may be, required (§8.2, §C.7).
+    const lone = $('addNonce').checked && needsNonce(S.nsDoc) && nonceFits(kind, []);
     const body = $('restoreEditor').checked ? patch : lone ? fmtPatch(withNonce([])) : '[]';
     r = await api('PATCH', rpath(), { ct: PJ, headers: { 'If-Match': normIf($('ifMatch').value), Gesture: gesture }, body });
   }
@@ -714,6 +714,19 @@ async function writeRes(kind) {
   else if (r && r.status === 200) toast('200: idempotent retry, entry already in the log');
 }
 async function afterWrite() { await refreshNS(); await refreshRes(); }
+
+/* nonceFits reports whether the editor's patch set ops, written as kind over the document shown (the head's, or the
+ * last live one for a restore), results in an object, which a $nonce needs (§C.7), as writeSealed checks; true when
+ * that isn't known, so the server tells. */
+function nonceFits(kind, ops) {
+  const st = S.resState || {};
+  const base = kind === 'create' ? undefined : kind === 'restore' ? st.lastDoc : st.doc;
+  if (kind !== 'create' && base === undefined) return true;
+  try {
+    const d = Z.applyPatch(base, kind !== 'create', ops).doc;
+    return !!d && typeof d === 'object' && !Array.isArray(d);
+  } catch (_) { return true; }
+}
 
 async function purgeRes() {
   if (!S.ns || !S.res) return toast('Select a namespace and a resource name');
@@ -1022,8 +1035,10 @@ function planUndoResource(o) {
   if (out.conflicts.length) return out;
   const fin = folded[folded.length - 1].post;
   const st = { doc: JSON.parse(JSON.stringify(fin.doc === undefined ? null : fin.doc)), exists: fin.exists, deleted: fin.deleted };
-  const nonce = o.nonce || !!(st.doc && typeof st.doc === 'object' && !Array.isArray(st.doc) && '$nonce' in st.doc);
-  const withN = (ops) => (nonce ? ops.concat([{ op: 'add', path: '/$nonce', value: Z.newNonce() }]) : ops);
+  const isObj = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+  const nonce = o.nonce || (isObj(st.doc) && '$nonce' in st.doc);
+  // Only where the patch set results in an object, as st.doc is when it is flushed: no other root has a member to add (§C.7).
+  const withN = (ops) => (nonce && isObj(st.doc) ? ops.concat([{ op: 'add', path: '/$nonce', value: Z.newNonce() }]) : ops);
   let pending = [], restore = false;
   const flush = () => {
     const ops = pending, rs = restore;
@@ -1175,7 +1190,7 @@ async function undoReadRes(ns, site) {
   return { head, headKind, start, entries };
 }
 
-/* undoPlan plans the undo of gesture g in ns (§11.2): o = { author, level, nonce (the namespace document's, §C.7),
+/* undoPlan plans the undo of gesture g in ns (§11.2): o = { author, level, nonce (patch sets add one: needsNonce, §C.7),
  * limits, scanLog }. It returns { gesture, author, source, resources, conflicts, items }; an undo that can't be done
  * throws with .impossible. */
 async function undoPlan(ns, g, o = {}) {
@@ -1205,7 +1220,7 @@ async function undoPlan(ns, g, o = {}) {
     let r;
     try {
       r = planUndoResource({ name: site.resource, head: rr.head, headKind: rr.headKind, start: rr.start, entries: rr.entries, gesture: g, author: found.author,
-        nonce: o.level === 'sealed' || o.nonce === 'required', maxOps: lim.opsPerSet, maxBytes: lim.patchSetSize });
+        nonce: o.level === 'sealed' || !!o.nonce, maxOps: lim.opsPerSet, maxBytes: lim.patchSetSize });
     } catch (err) { if (err.pruned) err.impossible = 'pruned'; if (err.impossible) err.resource = site.resource; throw err; }
     if (!r) continue;
     plan.resources.push(r);
@@ -1320,7 +1335,7 @@ async function undoAction(target, label) {
   if (!GESTURE_RE.test(target || '')) return toast('A gesture id is 26 base32 characters');
   U.busy = true;
   try {
-    const res = await asUser(() => undoRun(S.ns, target, { level: S.nsLevel, nonce: (S.nsDoc || {}).nonce, limits: (S.nsDoc || {}).limits }));
+    const res = await asUser(() => undoRun(S.ns, target, { level: S.nsLevel, nonce: needsNonce(S.nsDoc), limits: (S.nsDoc || {}).limits }));
     renderUndoOut(label, res);
     if (res.ok) await afterWrite();
   } catch (err) {
@@ -1854,10 +1869,15 @@ function withNonce(ops) {
   return ops.filter((o) => !(o && o.path === '/$nonce' && (o.op === 'add' || o.op === 'replace'))).concat([{ op: 'add', path: '/$nonce', value: Z.newNonce() }]);
 }
 
+/* needsNonce reports whether writes to a namespace whose document is doc add a fresh $nonce to every patch set
+ * (§C.7): it requires them, or doc is null because the grant can't read it (§C.5), so the setting is unknown. A
+ * public namespace's document is always readable: that happens only in private ones, where a nonce is harmless. */
+function needsNonce(doc) { return !doc || doc.nonce === 'required'; }
+
 /* syncSealBoxes presets the write options for the selected namespace's level, and its nonce setting (§C.7). */
 function syncSealBoxes() {
   const sealed = S.nsLevel === 'sealed' || S.nsLevel === 'e2e';
-  $('addNonce').checked = sealed || (S.nsDoc || {}).nonce === 'required';
+  $('addNonce').checked = sealed || (!!S.ns && needsNonce(S.nsDoc));
   $('sealE2E').checked = S.nsLevel === 'e2e';
   $('sealE2E').disabled = S.nsLevel !== 'e2e';
 }
@@ -2078,8 +2098,8 @@ function renderBlobs(doc) {
 }
 
 /* attachFile uploads the chosen file as a blob of the selected resource (PUT …/blob/{bid}, §7.8) and inserts
- * its reference into the patch set in the editor. Sealed namespaces, and those that require nonces, get a Blob-Nonce
- * (§C.7, §7.8); e2e ones get the file encrypted here first (§E.3.1), with the key in the reference. */
+ * its reference into the patch set in the editor. Sealed namespaces, and those that require nonces or may (needsNonce),
+ * get a Blob-Nonce (§C.7, §7.8); e2e ones get the file encrypted here first (§E.3.1), with the key in the reference. */
 async function attachFile() {
   if (!S.ns || !S.res) return toast('Select a namespace and a resource name');
   const f = $('attachFile').files[0];
@@ -2098,7 +2118,7 @@ async function attachFile() {
       const e = await Z.encryptBlob(type, data, !!enc.pad);
       body = e.sealed; ct = Z.BLOB_TYPE; ref = e.ref;
     } else {
-      if (level === 'sealed' || (info.doc || {}).nonce === 'required') nonce = Z.newNonce();
+      if (level === 'sealed' || needsNonce(info.doc)) nonce = Z.newNonce();
       ref = { $blob: await Z.blobID(type, nonce, data), type, size: data.length };
       if (nonce) ref.nonce = nonce;
     }
@@ -2302,7 +2322,7 @@ async function runSelfTest() {
 const TREE = '/playground/tree';
 const NODE_RE = /^[a-z0-9][a-z0-9_-]*$/;
 const C = {
-  ns: '', head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {},
+  ns: '', head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {}, nonces: false,
   source: '', proxy: null, proxyCatalogs: [], listing: null, at: '', view: '', note: '', problems: null, sel: '', min: [], loading: false, gen: 0,
   catalogs: null, discovering: false, // discovered catalog namespaces: [{ ns, mode }], null until found
 };
@@ -2389,7 +2409,7 @@ async function loadCatalog() {
   C.ns = ns; C.loading = true;
   renderCatStatus();
   // Everything is read into x and published at once, so a slower earlier load can't overwrite a newer one.
-  const x = { head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {} };
+  const x = { head: '', config: '', doc: null, nodes: new Map(), trust: [], mode: 'tree', contentDocs: {}, contentHeads: {}, nonces: false };
   // 1. The catalog namespace itself, from the core.
   const nd = await nsHeadDoc(ns);
   if (gen !== C.gen) return;
@@ -2398,6 +2418,8 @@ async function loadCatalog() {
     return renderCatalog();
   }
   x.head = nd.head; x.config = nd.config; x.doc = nd.doc || {};
+  // Writes add a fresh nonce in a sealed catalog (§E.2.5), and where it requires them, or its document didn't open (§C.7).
+  x.nonces = !!nd.sealed || needsNonce(nd.doc);
   const cat = x.doc.catalog || {};
   x.trust = Array.isArray(cat.trust) ? cat.trust.filter((t) => typeof t === 'string') : [];
   x.mode = cat.mode === 'dag' ? 'dag' : 'tree';
@@ -2931,7 +2953,7 @@ async function catCreateFolder() {
   const parent = $('catFParent').value;
   if (parent) { const p = { href: hrefOf(parent) }; if ($('catFOrder').value.trim()) p.order = $('catFOrder').value.trim(); doc.parents = [p]; }
   if (acc.v) doc.$access = acc.v;
-  if ((C.doc || {}).nonce === 'required') doc.$nonce = Z.newNonce();
+  if (C.nonces) doc.$nonce = Z.newNonce();
   const r = await catWrite('New folder', 'PATCH', name, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: doc }] });
   if (r.ok) { C.sel = name; $('catFName').value = ''; renderCatalog(); }
 }
@@ -2983,8 +3005,8 @@ async function catMove() {
     });
     ops = [{ op: Array.isArray(n.doc.parents) ? 'replace' : 'add', path: '/parents', value: parents }];
   }
-  // A fresh nonce where the catalog requires them, or the node has one (§C.7).
-  if ((C.doc || {}).nonce === 'required' || '$nonce' in n.doc) ops = withNonce(ops);
+  // A fresh nonce where the catalog needs them, or the node has one (§C.7).
+  if (C.nonces || '$nonce' in n.doc) ops = withNonce(ops);
   await catWrite('Move', 'PATCH', n.name, { ct: PJ, headers: { 'If-Match': quoteId(n.head) }, body: ops });
 }
 

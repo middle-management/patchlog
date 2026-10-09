@@ -164,3 +164,44 @@ func TestRequiredNoncesReleaseState(t *testing.T) {
 		t.Fatalf("season title %v", got)
 	}
 }
+
+// §C.7, §F.9: a merge service whose grant can't read the state namespace's
+// document (its rules refer to /resource, §C.5) doesn't know the setting,
+// so in a private namespace the stored plan gets a fresh $nonce when
+// created, and at every save: one that requires them takes it, and so
+// does one that doesn't.
+func TestUnreadableNoncesReleaseState(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{Auth: true})
+	k := clienttest.NewKey("k")
+	plan := merge.PlanName("release-9")
+	for _, setting := range []string{"required", "optional"} {
+		t.Run(setting, func(t *testing.T) {
+			t.Parallel()
+			ns := "state-" + setting
+			must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns,
+				map[string]any{"read": "grant", "nonce": setting, "keys": []any{k.Entry("*")}}))
+			svc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:merge", []string{ns}, []string{"read", "create", "append"},
+				map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": plan}}})))
+			if _, err := svc.NonceRequired(ctx, ns); err == nil {
+				t.Fatal("the merge service reads the namespace document")
+			}
+			o := merge.ReleaseOptions{Release: "/r/releases/release-9", StateNS: ns}
+			noErr(t, merge.SaveReleasePlan(ctx, svc, o, &merge.ReleasePlan{Release: o.Release, Name: "release-9", State: merge.ReleasePlanned}))
+			rp := must(merge.LoadReleasePlan(ctx, svc, o))
+			rp.Notes = []string{"saved again"}
+			noErr(t, merge.SaveReleasePlan(ctx, svc, o, rp))
+			h := must(svc.Head(ctx, ns, plan))
+			log := must(svc.Log(ctx, ns, plan, h.ID, ""))
+			if len(log) != 2 {
+				t.Fatalf("plan log %+v", log)
+			}
+			for _, e := range log {
+				d := must(svc.Doc(ctx, ns, plan, e.ID))
+				if n, _ := d.Value.(map[string]any)["$nonce"].(string); !seal.ValidNonce(n) {
+					t.Fatalf("rev %s: $nonce %q", e.ID, n)
+				}
+			}
+		})
+	}
+}
