@@ -105,7 +105,9 @@ type ImportOptions struct {
 	// NamespaceDoc is the namespace document for a namespace created by
 	// the import; upstreamOf is the target namespace an upstream namespace
 	// serves, "" otherwise. Default: {} for document namespaces, and for
-	// upstream namespaces the read mode of the namespace they serve.
+	// upstream namespaces the read mode of the namespace they serve. Its
+	// limits and allowances split and pace the batches into the namespace,
+	// as an existing namespace's own do (Pace).
 	NamespaceDoc func(ns, upstreamOf string) any
 	// Sleep waits between paced batches and retries (default: a timer).
 	Sleep func(ctx context.Context, d time.Duration) error

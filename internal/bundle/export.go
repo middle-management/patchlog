@@ -85,9 +85,9 @@ type ExportOptions struct {
 	// Bearer, HTTP and Identity are for reading the grants of sealed
 	// namespaces (§C.3.1), which the client doesn't: Bearer is the grant
 	// the exporter's client sends, HTTP the transport (default
-	// http.DefaultClient), and Identity unwraps the epoch keys the grant's
-	// enc names (§E.2.3). Without Bearer a sealed grant is read without
-	// credentials, which works only where the namespace is public.
+	// telemetry.DefaultClient), and Identity unwraps the epoch keys the
+	// grant's enc names (§E.2.3). Without Bearer a sealed grant is read
+	// without credentials, which works only where the namespace is public.
 	Bearer   string
 	HTTP     *http.Client
 	Identity *ecdh.PrivateKey

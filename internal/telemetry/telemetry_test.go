@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -254,5 +256,55 @@ func TestClientPropagation(t *testing.T) {
 	}
 	if !strings.Contains(traceparent, tid.String()) {
 		t.Fatalf("traceparent %q", traceparent)
+	}
+}
+
+// DefaultClient, as every Transport given no base, goes over the package's
+// own pool, a clone of http.DefaultTransport: closing the default one's
+// idle connections leaves its own alone. Its requests are traced.
+func TestDefaultClient(t *testing.T) {
+	rec, _ := install(t)
+	base := DefaultClient.Transport.(*transport).baseRT()
+	if base == http.DefaultTransport || base != Transport(nil).(*transport).baseRT() {
+		t.Fatal("DefaultClient doesn't go over the package's own pool")
+	}
+	if ht, ok := base.(*http.Transport); !ok || ht.Proxy == nil || ht.TLSHandshakeTimeout != http.DefaultTransport.(*http.Transport).TLSHandshakeTimeout {
+		t.Fatalf("base %T isn't a clone of http.DefaultTransport", base)
+	}
+	var conns atomic.Int32
+	var traceparent atomic.Value
+	backend := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		traceparent.Store(r.Header.Get("Traceparent"))
+	}))
+	backend.Config.ConnState = func(_ net.Conn, s http.ConnState) {
+		if s == http.StateNew {
+			conns.Add(1)
+		}
+	}
+	backend.Start()
+	defer backend.Close()
+	for range 2 {
+		res, err := DefaultClient.Get(backend.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		io.Copy(io.Discard, res.Body)
+		res.Body.Close()
+		http.DefaultTransport.(*http.Transport).CloseIdleConnections()
+	}
+	if n := conns.Load(); n != 1 {
+		t.Fatalf("%d connections: closing http.DefaultTransport's idle ones closed DefaultClient's", n)
+	}
+	if tp, _ := traceparent.Load().(string); tp == "" {
+		t.Fatal("no traceparent sent")
+	}
+	spans := 0
+	for _, s := range rec.Ended() {
+		if s.SpanKind() == trace.SpanKindClient {
+			spans++
+		}
+	}
+	if spans != 2 {
+		t.Fatalf("%d client spans", spans)
 	}
 }

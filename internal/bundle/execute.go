@@ -484,12 +484,14 @@ func (im *importer) execute(ctx context.Context) error {
 			return err
 		}
 		n.missing = !ok
-		l := defaultLimits()
-		if ok {
-			l = limitsOf(doc, allowanceOf(doc, sub, kid, im.opt.Now()))
-		} else {
+		if !ok {
+			// One the import creates goes by the limits and allowances of
+			// the document it is created with.
+			v, _ := client.ToValue(im.nsDoc(ctx, n))
+			doc, _ = v.(map[string]any)
 			im.rep.Create = append(im.rep.Create, n.ns)
 		}
+		l := limitsOf(doc, allowanceOf(doc, sub, kid, im.opt.Now()))
 		lims[n] = l
 		im.split(n, l)
 		for i, b := range n.batches {

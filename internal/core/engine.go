@@ -152,7 +152,7 @@ type Options struct {
 // this deployment reaches the deployments holding their bases.
 type RemoteOptions struct {
 	// Resolve maps a base's origin to the endpoint requests go to. Nil
-	// means the origin itself, http.DefaultClient and no bearer grant.
+	// means the origin itself, telemetry.DefaultClient and no bearer grant.
 	Resolve func(origin string) (RemoteEndpoint, error)
 	// IgnorePurges records purges in a base's log as notices only
 	// (RemoteNotices) instead of applying them (§G.3 SHOULD follow).
@@ -173,7 +173,7 @@ type RemoteOptions struct {
 // RemoteEndpoint is where and how a remote origin is reached.
 type RemoteEndpoint struct {
 	BaseURL    string       // e.g. https://cms.example; defaults to the origin
-	HTTPClient *http.Client // nil: http.DefaultClient
+	HTTPClient *http.Client // nil: telemetry.DefaultClient
 	Bearer     string       // grant for the base namespace (read, and export to register)
 	// Identity unwraps the keys of a sealed base (Addendum E.2) that the
 	// base wraps to the grant's enc (§E.2.3, §G.5). Nil: raw keys only.

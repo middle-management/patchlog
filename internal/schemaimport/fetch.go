@@ -45,7 +45,7 @@ type fetcher struct {
 }
 
 func newFetcher(opt Options) *fetcher {
-	f := &fetcher{files: opt.Files, noDisk: opt.NoDisk, hc: opt.HTTPClient, timeout: opt.Timeout, maxDocs: opt.MaxDocs, maxBytes: opt.MaxBytes}
+	f := &fetcher{files: opt.Files, noDisk: opt.NoDisk, hc: telemetry.Client(opt.HTTPClient), timeout: opt.Timeout, maxDocs: opt.MaxDocs, maxBytes: opt.MaxBytes}
 	if f.timeout <= 0 {
 		f.timeout = DefaultTimeout
 	}
@@ -55,13 +55,6 @@ func newFetcher(opt Options) *fetcher {
 	if f.maxBytes <= 0 {
 		f.maxBytes = DefaultMaxBytes
 	}
-	if f.hc == nil {
-		f.hc = &http.Client{Transport: http.DefaultTransport.(*http.Transport).Clone()}
-	} else {
-		cp := *f.hc
-		f.hc = &cp
-	}
-	f.hc.Transport = telemetry.Transport(f.hc.Transport)
 	f.hc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= 5 {
 			return errors.New("too many redirects")

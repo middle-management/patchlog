@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `bundle import` into a namespace it creates splits and paces batches by the `limits` and the
+  importer's `allowances` entry of the document it creates it with, not the §6.6 defaults.
+- Outgoing HTTP without a configured client (remote branches, sealed grant export, release
+  granters, CDN purges, schema fetches, `patchlog health`, `internal/client`) goes over one
+  shared clone of `http.DefaultTransport`, never the default transport itself.
+
 ## v0.16.0
 
 Implements spec **v0.49**. v0.47 settles all sixteen of the reference's v0.46 notes, most as

@@ -65,11 +65,11 @@ func SetAttributes(r *http.Request, kv ...attribute.KeyValue) {
 	}
 }
 
-// Transport returns a RoundTripper over base (nil: http.DefaultTransport)
-// that, while telemetry is on, makes client spans and http.client metrics
-// and injects the trace context (W3C traceparent, baggage) into outgoing
-// requests; while it is off it is base. It decides per request, so clients
-// built before Setup are covered.
+// Transport returns a RoundTripper over base (nil: the package's own pool,
+// defaultTransport) that, while telemetry is on, makes client spans and
+// http.client metrics and injects the trace context (W3C traceparent,
+// baggage) into outgoing requests; while it is off it is base. It decides
+// per request, so clients built before Setup are covered.
 func Transport(base http.RoundTripper) http.RoundTripper {
 	if _, ok := base.(*transport); ok {
 		return base
@@ -88,9 +88,21 @@ type otelRT struct {
 	rt http.RoundTripper
 }
 
+// defaultTransport is the base of every Transport given none, so of
+// DefaultClient too: a clone of http.DefaultTransport (same proxy, TLS and
+// timeouts) with a connection pool of its own, so that whatever closes or
+// reconfigures the default one (httptest.Server.Close closes its idle
+// connections) doesn't break requests in flight here.
+var defaultTransport = func() http.RoundTripper {
+	if t, ok := http.DefaultTransport.(*http.Transport); ok {
+		return t.Clone()
+	}
+	return http.DefaultTransport
+}()
+
 func (t *transport) baseRT() http.RoundTripper {
 	if t.base == nil {
-		return http.DefaultTransport
+		return defaultTransport
 	}
 	return t.base
 }
@@ -131,6 +143,6 @@ func Client(c *http.Client) *http.Client {
 	return &out
 }
 
-// DefaultClient is http.DefaultClient with Transport: for code that would
-// otherwise use http.DefaultClient.
+// DefaultClient is http.DefaultClient with Transport over the package's
+// own pool: for code that would otherwise use http.DefaultClient.
 var DefaultClient = Client(nil)
