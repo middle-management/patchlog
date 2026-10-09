@@ -76,11 +76,11 @@ func (e *Engine) Gestures(ctx context.Context, ns, gesture, since string, cred C
 				return v
 			}
 		}
-		if t.nsLevel(n) >= levelSealed {
-			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
-		}
 		if n.purged {
 			return t.purgedNS(n)
+		}
+		if t.nsLevel(n) >= levelSealed {
+			return apiErr(404, "not_offered", "message", "gestures aren't listed in sealed or end-to-end namespaces: their logs carry them (§7.4)")
 		}
 		var after int64
 		if since != "" {

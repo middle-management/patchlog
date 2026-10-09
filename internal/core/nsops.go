@@ -844,6 +844,10 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 		// as of its lock (D.8 purge propagation).
 		n = t.nsByIDLocked(n.id, lockExclusive)
 	}
+	// A branch purged since its base listed it is skipped (§8.5).
+	if n.purged {
+		return ids.ID{}
+	}
 	// Branches first: a branch reading the resource through must still see
 	// it, so that it records its own purge entry.
 	for _, b := range t.branchesOf(n) {

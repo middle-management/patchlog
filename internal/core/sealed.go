@@ -472,16 +472,16 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 				return notFound()
 			}
 		}
-		// 410 after the read check, as every URL of a purged namespace
-		// (§8.5).
-		if n.purged {
-			return t.purgedNS(n)
-		}
 		if cfg.level == levelE2E {
 			// The relay is a read of the keyring (§E.3.2); per-resource
 			// keys don't exist at E3.
 			if a.verified != nil && t.grantRules(a, "read", nil, t.basicEnvelope("read", KeyringName, a), false) != nil {
 				return notFound()
+			}
+			// 410 after the read check, as every URL of a purged
+			// namespace (§8.5).
+			if n.purged {
+				return t.purgedNS(n)
 			}
 			var err error
 			out, err = t.keysE2E(n, cfg, a, kr)
@@ -501,6 +501,9 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 				ok = false
 			}
 			perResource = !ok
+		}
+		if n.purged {
+			return t.purgedNS(n)
 		}
 		if cfg.level != levelSealed {
 			return invalid("the namespace is not sealed")

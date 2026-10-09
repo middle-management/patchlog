@@ -135,14 +135,42 @@ func TestV049PurgedGateOrder(t *testing.T) {
 	expectPurged(t, change(f.issuerG), head)
 	expectCode(t, change(f.issuerG), 429, "rate")
 
-	// /ns/{ns}/keys: 401 without a grant, 404 without read, then 410.
+	// /ns/{ns}/keys: 401 without a grant, 404 without read or with rules
+	// refusing it, then 410.
 	keys := func(bearer string) *resp { return e.do(req{method: "POST", path: "/ns/sec/keys", bearer: bearer}) }
 	expectCode(t, keys(""), 401, "unauthenticated")
 	expectCode(t, keys(e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"})), 404, "not_found")
+	expectCode(t, keys(e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "append"}, refusesReads)), 404, "not_found")
 	expectPurged(t, keys(f.adminG), head)
 	if e.nsHead("sec", f.adminG) != head {
 		t.Fatal("an entry followed purge-ns")
 	}
+}
+
+// refusesReads is a grant's rules passing appends only.
+var refusesReads = map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/action", "value": "append"}}}
+
+// v0.49 §8.5: in sealed and end-to-end namespaces too, /ns/{ns}/keys and
+// the gestures listing, which a live one doesn't offer, answer 410 after
+// the read check, a grant's rules included.
+func TestV049PurgedEncrypted(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t)
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+	expect(t, e.write("PATCH", "s", "a", "", withNonce(addRoot(map[string]any{}))), 201)
+	expect(t, e.patchNS("s", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, e.do(req{method: "POST", path: "/ns/s/purge", ifMatch: e.nsHead("s"), author: "admin"}), 204)
+	head := e.nsHead("s")
+	expectPurged(t, e.get("/ns/s/gestures/"+gA), head)
+	expectPurged(t, e.do(req{method: "POST", path: "/ns/s/keys"}), head)
+
+	f := newE2E(t)
+	expect(t, f.patchNS("e", ops(op("add", "/frozen", true)), f.adminG), 201)
+	expect(t, f.do(req{method: "POST", path: "/ns/e/purge", ifMatch: f.nsHead("e", f.adminG), bearer: f.adminG}), 204)
+	head = f.nsHead("e", f.adminG)
+	keys := func(bearer string) *resp { return f.do(req{method: "POST", path: "/ns/e/keys", bearer: bearer}) }
+	expectCode(t, keys(f.grant(f.writer, "user:r", []string{"e"}, []string{"read", "append"}, refusesReads)), 404, "not_found")
+	expectPurged(t, keys(f.readerG), head)
 }
 
 // v0.49 §8.5, §7.6: a purged namespace's name stays reserved: creating a
