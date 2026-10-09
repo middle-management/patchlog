@@ -30,7 +30,7 @@ func TestBlobUploadPurgedNamespaceAfterAuth(t *testing.T) {
 	bid := blobID("text/plain", "", data)
 	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data), 401, "unauthenticated")
 	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data, reader), 403, "forbidden")
-	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data, admin), 410, "gone")
+	expectCode(t, e.putBlobAs("gone", "a", bid, "text/plain", "", data, admin), 410, "purged")
 }
 
 // §7.8 Copying: a request with a body, or a Blob-From that can't be

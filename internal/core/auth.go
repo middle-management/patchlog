@@ -500,6 +500,18 @@ func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error
 	return t.readerCheck(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) })
 }
 
+// nsReader is reader for /ns/{ns} and the URLs under it, but the gestures
+// listing (anyReader): they need unrestricted read (readsNS, §C.5). A
+// grant that may read only some resources gets the answer of any read it
+// may not make.
+func (t *tx) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
+	cfg := t.config(n.configSeq)
+	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
+		return t.edgeReader(n, cred.Edge, "")
+	}
+	return t.readerCheck(n, cred, func(a *actor) bool { return t.readsNS(n, cfg, a, false) })
+}
+
 // anyReader is reader for a request that answers any reader of the
 // namespace, filtered to what it may read (the gestures listing, §7.4):
 // a grant with read, whatever its rules say about resources.
@@ -550,29 +562,73 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 	return a, nil
 }
 
-// unrestrictedRead reports whether an actor may read every resource of a
-// namespace: no rule of its blocks, key scope or roles refers to /resource,
-// and the key has no readScope (§7.6).
+// readsNS reports whether a reads namespace n unrestricted (§C.5 "The
+// stream is metadata"): anyone does in a public namespace or with
+// authentication disabled, and otherwise a grant that may read there
+// through rules none of which refers to /resource (unrestrictedRoles).
+// /ns/{ns} and everything under it but the gestures listing need it, as
+// do a batch's source check (§7.5), branching (§7.6) and remote branch
+// registration (§G.3): a grant whose rules hide some resources could
+// otherwise list their names and heads, or read them through a branch.
+// Branching and registration check read as step 1 does (stepOne, §6.2):
+// rules over the rest of the envelope apply to their own at step 6.
+func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
+	if cfg.Read == "public" || t.e.opt.AuthDisabled {
+		return true
+	}
+	if a == nil {
+		return false
+	}
+	if a.verified == nil {
+		return true // a namespace's edge grant (edgeReader)
+	}
+	roles, ok := a.unrestrictedRoles()
+	return ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), stepOne) == nil
+}
+
+// unrestrictedRoles reports whether a grant's rules leave every resource
+// readable (§C.5): its key has no readScope, no rule of its blocks or key
+// scope refers to /resource, and, if it carries roles, some role listing
+// read has no rule that does. Those roles are returned, nil for a grant
+// without roles; roles are alternatives (§C.1.1), so one is enough.
+func (a *actor) unrestrictedRoles() ([]string, bool) {
+	v := a.verified
+	if v.Key.ReadScopeResource || refersToResource(v.KeyRules) || refersToResource(v.BlockRules) {
+		return nil, false
+	}
+	ok, roles := v.Allows("read")
+	if !ok || !v.HasRoles() {
+		return nil, ok
+	}
+	var out []string
+	for _, r := range roles {
+		if !refersToResource(v.RoleRules(r)) {
+			out = append(out, r)
+		}
+	}
+	return out, len(out) > 0
+}
+
+// unrestrictedRead is unrestrictedRoles' answer alone, true for an actor
+// without a grant.
 func (a *actor) unrestrictedRead() bool {
 	if a.verified == nil {
 		return true
 	}
-	if a.verified.Key.ReadScopeResource {
-		return false
-	}
-	lists := [][]any{a.verified.KeyRules, a.verified.BlockRules}
-	for _, r := range a.verified.EffectiveRoles {
-		lists = append(lists, a.verified.RoleRules(r))
-	}
-	for _, l := range lists {
-		for _, rv := range l {
-			r, err := compileCached(rv)
-			if err != nil || r.Refs()["resource"] || r.Refs()["*"] {
-				return false
-			}
+	_, ok := a.unrestrictedRoles()
+	return ok
+}
+
+// refersToResource reports whether a rule of rs refers to /resource, or
+// to the whole envelope. A rule that doesn't compile counts.
+func refersToResource(rs []any) bool {
+	for _, rv := range rs {
+		r, err := compileCached(rv)
+		if err != nil || r.Refs()["resource"] || r.Refs()["*"] {
+			return true
 		}
 	}
-	return true
+	return false
 }
 
 // rateLimiter holds the token buckets of §6.6.
@@ -667,7 +723,10 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 	return draw{"b\x00" + a.bucketKey, cfg.Limits.BlobRate, float64(size), "blobRate"}
 }
 
-// admit draws tokens, or answers 429 with Retry-After (§6.6).
+// admit draws tokens, or answers 429 (§6.6): Retry-After in whole seconds,
+// rounded up, and in the body retryAfter, the wait in seconds as a decimal
+// (rounded up to the millisecond), which a client under a fast allowance
+// waits by instead.
 func (t *tx) admit(draws []draw) *Error {
 	wait, hit, ok := t.e.rate.admit(t.now, draws)
 	if !ok {
@@ -675,7 +734,7 @@ func (t *tx) admit(draws []draw) *Error {
 		if secs < 1 {
 			secs = 1
 		}
-		e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", secs)
+		e := apiErr(429, "rate", "message", "rate limit exceeded", "limit", hit, "retryAfter", math.Ceil(wait.Seconds()*1000)/1000)
 		e.Header = map[string][]string{"Retry-After": {fmt.Sprint(secs)}}
 		return e
 	}

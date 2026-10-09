@@ -261,11 +261,7 @@ func (bs *batchSource) blob(t *tx, name string, bid ids.ID) *blobRow {
 // (§7.6), with the request's own grant or any in Source-Authorization.
 func (t *tx) sourceUnrestricted(n *nsRow, req Request) bool {
 	for _, cred := range req.anyCreds() {
-		a, err := t.reader(n, cred, "")
-		if err != nil {
-			continue
-		}
-		if a == nil || t.config(n.configSeq).Read == "public" || a.unrestrictedRead() {
+		if _, err := t.nsReader(n, cred); err == nil {
 			return true
 		}
 	}
@@ -810,7 +806,10 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 	}
 	// 2. A purged namespace or resource, after authorisation and the rate
 	// limits (§7.8).
-	if n.purged || t.resolve(n, name, nil).state == Purged {
+	if n.purged {
+		return nil, purgedNS()
+	}
+	if t.resolve(n, name, nil).state == Purged {
 		return nil, gone()
 	}
 	// 3. A frozen namespace.
@@ -1165,6 +1164,9 @@ func (e *Engine) openBlob(ctx context.Context, ns, name, bidText string, cred Cr
 		}
 		if _, err := t.reader(n, cred, name); err != nil {
 			return err
+		}
+		if n.purged {
+			return purgedRead(t.cachePublic(n))
 		}
 		out = &Blob{Public: t.cachePublic(n)}
 		bid, perr := ids.Parse(bidText)

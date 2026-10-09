@@ -418,8 +418,9 @@ type Error struct {
 	Body   map[string]any
 	Header http.Header
 	// Public, when set, carries a namespace's cache visibility with a
-	// not_found: unknown ids are answered with §9's short class, which the
-	// server derives from it. Write responses leave it unset (no-store).
+	// not_found or a namespace purge's 410: unknown ids are answered with
+	// §9's short class and purges with its long one, which the server
+	// derives from it. Write responses leave it unset (no-store).
 	Public *bool
 }
 

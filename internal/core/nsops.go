@@ -563,8 +563,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if err := t.authorize(a, "branch", br.Name); err != nil {
 		return nil, err
 	}
-	if !t.canRead(base, bcfg, a, "") || !a.unrestrictedRead() {
-		return nil, forbidden("branching needs unrestricted read on the base")
+	// A public base answers readsNS for anyone; the grant still needs it.
+	if !t.readsNS(base, bcfg, a, true) || !a.unrestrictedRead() {
+		return nil, forbidden("branching needs unrestricted read on the base (§C.5)")
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
 		return nil, err
@@ -728,7 +729,7 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		}
 		// 410 after authorisation, like every write (§6.2).
 		if n.purged {
-			return gone()
+			return purgedNS()
 		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
@@ -1030,7 +1031,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		}
 		// 410 after authorisation, like every write (§6.2).
 		if n.purged {
-			return gone()
+			return purgedNS()
 		}
 		if n.isBranch() {
 			return invalid("branches don't prune (§8.6)")

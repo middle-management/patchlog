@@ -1518,8 +1518,8 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 }
 
 // RegisterRemote registers a remote branch with its base, or renews its
-// registration (§G.3). It needs read and export at the base, through the
-// endpoint's bearer grant.
+// registration (§G.3). It needs unrestricted read and export at the base,
+// through the endpoint's bearer grant.
 func (e *Engine) RegisterRemote(ctx context.Context, ns string) error {
 	var b *remoteBase
 	if err := e.read(ctx, func(t *tx) error {
