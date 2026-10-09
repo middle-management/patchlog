@@ -124,9 +124,10 @@ func TestV047SealedKeysRoles(t *testing.T) {
 		t.Fatalf("unrestricted role: %s", r.Body)
 	}
 	open(t, docB, resKey(t, keys["s#1"], "s", "b"), "s#1", seal.ResourcePL("s", "b", b, "doc"))
-	// Without a role that may pass per resource, it reads nothing.
+	// Without a role that may pass per resource, it doesn't read the
+	// namespace unrestricted: 403 (v0.49 §E.2.3).
 	_, r = e.keysOf("s", nil, e.grant(k, "user:x", []string{"s"}, nil, map[string]any{"roles": []any{"staff"}}))
-	expect(t, r, 404)
+	expectCode(t, r, 403, "forbidden")
 }
 
 // v0.47 §7.6: branching needs unrestricted read on the base (§C.5) even

@@ -625,28 +625,38 @@ func TestSealedRotateOnRevoke(t *testing.T) {
 }
 
 // $nonce is required in every patch set of a sealed namespace (§E.2.5).
+// The server enforces it at gate step 3 with 422 nonce, the code of a
+// namespace that requires nonces, so a missing nonce gets one code either
+// way; a failed test or patch application is reported first, as invalid
+// (v0.49 §C.7).
 func TestSealedNonce(t *testing.T) {
 	t.Parallel()
 	e := newSealedEnv(t)
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
-	expectCode(t, e.write("PATCH", "s", "a", "", addRoot(map[string]any{"v": 1.0})), 422, "invalid")
+	expectCode(t, e.write("PATCH", "s", "a", "", addRoot(map[string]any{"v": 1.0})), 422, "nonce")
 	bad := append(addRoot(map[string]any{"v": 1.0}), op("add", "/$nonce", "short"))
-	expectCode(t, e.write("PATCH", "s", "a", "", bad), 422, "invalid")
+	expectCode(t, e.write("PATCH", "s", "a", "", bad), 422, "nonce")
 	undone := append(withNonce(addRoot(map[string]any{"v": 1.0})), op("remove", "/$nonce"))
-	expectCode(t, e.write("PATCH", "s", "a", "", undone), 422, "invalid")
+	expectCode(t, e.write("PATCH", "s", "a", "", undone), 422, "nonce")
 	n := seal.NewNonce()
 	a1 := e.wr("s", "a", "", append(addRoot(map[string]any{"v": 1.0}), op("add", "/$nonce", n)))
 	// The same nonce again is stale.
-	expectCode(t, e.write("PATCH", "s", "a", a1, ops(op("replace", "/v", 2.0), op("add", "/$nonce", n))), 422, "invalid")
-	expectCode(t, e.write("PATCH", "s", "a", a1, ops(op("replace", "/v", 2.0))), 422, "invalid")
+	expectCode(t, e.write("PATCH", "s", "a", a1, ops(op("replace", "/v", 2.0), op("add", "/$nonce", n))), 422, "nonce")
+	expectCode(t, e.write("PATCH", "s", "a", a1, ops(op("replace", "/v", 2.0))), 422, "nonce")
+	// A failed test or patch application comes first.
+	expectCode(t, e.write("PATCH", "s", "a", a1, ops(op("test", "/v", 9.0))), 422, "invalid")
+	expectCode(t, e.write("PATCH", "s", "a", a1, ops(op("replace", "/missing", 2.0))), 422, "invalid")
 	a2 := e.wr("s", "a", a1, withNonce(ops(op("replace", "/v", 2.0))))
 	tomb := e.del("s", "a", a2)
-	expectCode(t, e.write("PATCH", "s", "a", tomb, ops(op("replace", "/v", 3.0))), 422, "invalid")
+	expectCode(t, e.write("PATCH", "s", "a", tomb, ops(op("replace", "/v", 3.0))), 422, "nonce")
 	e.wr("s", "a", tomb, []any{})
 	// Batches too.
 	r := e.do(req{method: "POST", path: "/ns/s/batch", author: "alice", body: map[string]any{"items": []any{
 		map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"v": 1.0})}}}}})
-	expect(t, r, 422)
+	expectCode(t, r, 422, "batch")
+	if !strings.Contains(r.String(), `"code":"nonce"`) {
+		t.Fatalf("batch %s", r.Body)
+	}
 	// Unsealed namespaces don't need one.
 	e.mkNS("p", atRest(map[string]any{"read": "public"}))
 	e.create("p", "a", map[string]any{"v": 1.0})

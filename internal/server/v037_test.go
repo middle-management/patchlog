@@ -257,7 +257,7 @@ func tamperPaths(t *testing.T, a *tenv, rewrite func(path string, body []byte) [
 	p := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hr, _ := http.NewRequest(r.Method, a.srv.URL+r.URL.RequestURI(), r.Body)
 		hr.Header = r.Header.Clone()
-		res, err := http.DefaultClient.Do(hr)
+		res, err := client.Do(hr)
 		if err != nil {
 			w.WriteHeader(502)
 			return

@@ -69,6 +69,9 @@ type readCache struct {
 	revs  map[string]revEntry
 	heads map[string]headEntry
 	bytes int
+
+	// refs keeps schemaReads' open referrers by path (openrefs.go).
+	refs openRefs
 }
 
 // public marks an answer of a public namespace, which the transaction-free
