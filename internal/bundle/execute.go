@@ -520,7 +520,9 @@ func (im *importer) execute(ctx context.Context) error {
 	// batch is atomic, so one the server refuses writes nothing (§7.5),
 	// but the ids it gives a batch's revisions are checked against the
 	// bundle's only once it has written them. A namespace the import
-	// creates has its first item dry-run once it exists (probe).
+	// creates has its first item dry-run once it exists (probe), and a
+	// batch that moves heads the target had is dry-run before its submit
+	// (updates).
 	im.timed(&im.rep.Timings.Planning, im.start)
 	pending := map[string]bool{}
 	for _, n := range im.order {
@@ -586,6 +588,16 @@ func (im *importer) execute(ctx context.Context) error {
 					n.ns, l.until.Format(time.RFC3339), i+1, len(n.batches), rate, by))
 			}
 			b := n.batches[i]
+			if b.rep.DryRun != "ok" && b.updates() {
+				if err := im.prepare(ctx, b, lims[n], false); err != nil {
+					return err
+				}
+				if im.opt.Mode == Backfill {
+					if err := im.pace(ctx, n.ns, lims[n], ""); err != nil {
+						return err
+					}
+				}
+			}
 			res, expected, err := im.submit(ctx, b, lims[n])
 			if err != nil {
 				b.rep.Error = err.Error()
@@ -657,6 +669,21 @@ func (im *importer) probe(ctx context.Context, n *node, l limits) error {
 		return im.pace(ctx, n.ns, l, "")
 	}
 	return nil
+}
+
+// updates reports whether a batch writes to a resource the target had: a
+// fast-forward, a resolved conflict, a restore, or a snapshot's next diff
+// upstream. Its new heads take effect at once, and a failure part-way
+// through the import leaves them changed (§G.4.4 Partial failure), so
+// such a batch is dry-run before its submit, its blobs sent first; creates
+// rely on their own failure report (§7.5).
+func (b *batch) updates() bool {
+	for _, p := range b.parts {
+		if !p.it.ifNone {
+			return true
+		}
+	}
+	return false
 }
 
 // submit submits a batch, its blobs sent first (§G.4.4), again if they
