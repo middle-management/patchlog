@@ -61,10 +61,19 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		})
 	}})
 	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
+	onlyB1 := map[string]any{"op": "test", "path": "/resource", "value": "b1"}
+	isNow := map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}
 	for _, ns := range []string{"schemas", "pub", "pa", "pb"} {
 		doc := map[string]any{"read": "public", "keys": []any{admin.Entry("*")}}
 		if ns == "pa" || ns == "pb" {
 			doc = map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), issuer.Entry("read")}}
+		}
+		if ns == "pb" {
+			doc["roles"] = map[string]any{
+				"reader": map[string]any{"can": []any{"read"}},
+				"timed":  map[string]any{"can": []any{"read"}, "rules": []any{onlyB1, isNow}},
+				"editor": map[string]any{"can": []any{"append"}, "rules": []any{onlyB1}},
+			}
 		}
 		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
 	}
@@ -183,6 +192,19 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}})
 	if _, gs, loc := idx.refsPointer(q, soon); gs != anonGs || refsAllHits(idx.search(loc, soon)) != "pub/p1" {
 		t.Errorf("rules on /now: %s", loc)
+	}
+	// One read role without rules on /resource reads pb whole (§C.5),
+	// whatever the grant's other roles, so rules on /now elsewhere don't
+	// make it unreadable: such a grant shares a plain reader's answer.
+	_, pbGs, _ := idx.refsPointer(q, issuer.Grant(t, s.Now(), "user:pbr", []string{"pb"}, []string{"read"}))
+	for name, g := range map[string]string{
+		"reader and timed": issuer.Grant(t, s.Now(), "user:r1", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "timed"}}),
+		"reader and editor, a rule on /now": issuer.Grant(t, s.Now(), "user:r2", []string{"pb"}, nil,
+			map[string]any{"roles": []any{"reader", "editor"}, "rules": []any{isNow}}),
+	} {
+		if _, gs, loc := idx.refsPointer(q, g); gs != pbGs || refsAllHits(idx.search(loc, g)) != "pb/b1 pb/b2 pub/p1" {
+			t.Errorf("%s: %s", name, loc)
+		}
 	}
 
 	// A write in pb moves bob's at, not amy's.

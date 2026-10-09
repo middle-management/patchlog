@@ -48,14 +48,15 @@ import (
 // there.
 //
 // gs is computed as for subject sets (§B.11.5), over markers of what the
-// answer depends on: for every private namespace the reader reads,
-// reads:{ns}, or for a grant that reads only some of its resources (whose
-// hits are filtered per resource) reads:{ns}:scope:{digest}, digest
-// covering the rules its reads there are judged by and the /principal
-// values they refer to (readsScope); a namespace where those rules refer
-// to /now counts as unreadable. A reader with no marker gets the public
-// answer, whose gs is that of the empty set. at is the combined checkpoint
-// (§B.5), text(trunc160(sha256(canonical({ ns: ns_id, … })))), over the
+// answer depends on: for every private namespace the reader reads
+// unrestricted (§C.5), reads:{ns}, or for a grant that reads only some of
+// its resources (whose hits are filtered per resource)
+// reads:{ns}:scope:{digest}, digest covering the rules its reads there are
+// judged by and the /principal values they refer to (readsScope); a
+// namespace where those rules refer to /now counts as unreadable. A
+// reader with no marker gets the public answer, whose gs is that of the
+// empty set. at is the combined checkpoint (§B.5),
+// text(trunc160(sha256(canonical({ ns: ns_id, … })))), over the
 // namespaces the answer covers; namespaces lists them. So writes in
 // namespaces the reader can't see never move it. If the namespace document
 // of one the grant names can't be read, the answer is 502; one the grant
@@ -186,8 +187,10 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, 
 			return nil, err
 		}
 		if !a.public {
+			// a.all (ReadsAll) also counts the grant's roles that don't
+			// read the namespace whole; one that does is enough (§C.5).
 			marker := "reads:" + ns
-			if !a.all {
+			if !a.all && !ix.checker.ReadsUnrestricted(a.v) {
 				digest, ok := readsScope(a.v)
 				if !ok {
 					refuse(403)
