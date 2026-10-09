@@ -438,13 +438,14 @@ type KeysRequest struct {
 // Keys answers POST /ns/{ns}/keys. It needs a verified grant with read on
 // the namespace (with authentication disabled, anyone gets raw epoch keys).
 // A grant that reads the namespace unrestricted (§C.5: with roles, through
-// one without /resource rules that passes) gets K_e; any other, restricted
-// by rules on /resource or a key with readScope "resource", gets K_r for
-// each requested resource it may read. Epochs run from the one in force at
-// the root block's nbf (without nbf: the first, capped to the last
-// historyEpochs) to the current one, and never include an epoch that
-// started after the grant's effective exp (§E.2.3). Keys are HPKE-wrapped
-// to the root block's enc if it has one, and raw base64url otherwise.
+// one without /resource rules that passes) gets K_e; one restricted by
+// rules on /resource or a key with readScope "resource" gets K_r for each
+// requested resource it may read; any other is 403. Epochs run from the
+// one in force at the root block's nbf (without nbf: the first, capped to
+// the last historyEpochs) to the current one, and never include an epoch
+// that started after the grant's effective exp (§E.2.3). Keys are
+// HPKE-wrapped to the root block's enc if it has one, and raw base64url
+// otherwise.
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) ([]map[string]any, error) {
 	var out []map[string]any
 	err := e.read(ctx, func(t *tx) error {
@@ -456,24 +457,14 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			return notFound()
 		}
 		cfg := t.config(n.configSeq)
-		var a *actor
-		if t.e.opt.AuthDisabled {
-			a, _ = t.authenticate(n.name, n, cfg, cred, nil)
-		} else {
-			if cred.Bearer == "" {
-				return apiErr(401, "unauthenticated", "message", "missing grant")
-			}
-			var aerr *Error
-			a, aerr = t.authenticate(n.name, n, cfg, cred, nil)
-			if aerr != nil {
-				if aerr.Status == 401 || aerr.Status == 413 {
-					return aerr
-				}
-				return notFound()
-			}
-			if !a.verified.Can["read"] {
-				return notFound()
-			}
+		// Refused as other reads are (§7): 401 without a usable grant, 403
+		// for one that doesn't name a namespace that isn't public, and 404
+		// for one that doesn't verify or has no read.
+		a, aerr := t.readerCheck(n, cred, func(a *actor) bool {
+			return t.e.opt.AuthDisabled || a != nil && a.verified.Can["read"]
+		})
+		if aerr != nil {
+			return aerr
 		}
 		if cfg.level == levelE2E {
 			// The relay is a read of the keyring (§E.3.2); per-resource
@@ -488,13 +479,14 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		// K_e only through rules none of which refers to /resource (§C.5).
 		// Roles are alternatives: if the unrestricted ones fail, a read role
 		// that refers to /resource may still pass per resource; without
-		// one, the grant reads nothing.
+		// one, the grant doesn't read the namespace unrestricted, and is
+		// 403 (§E.2.3).
 		perResource := false
 		if a.verified != nil {
 			roles, ok := a.unrestrictedRoles()
 			if ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) != nil {
 				if _, all := a.verified.Allows("read"); len(roles) == len(all) {
-					return notFound()
+					return forbidden("epoch keys need unrestricted read on the namespace (§C.5, §E.2.3)")
 				}
 				ok = false
 			}
@@ -785,7 +777,9 @@ func (e *Engine) rotateLoop(maxAge time.Duration) {
 // from the nonce of the document it applies to. A restore with an empty
 // patch set is exempt: its id is the hash of the tombstone id and "[]", both
 // public, so it reveals nothing about the document it brings back, which
-// was itself written with a nonce.
+// was itself written with a nonce. It runs at gate step 3 once the patch
+// set has applied, as checkRequiredNonces does, and answers 422 nonce as
+// it does, so a missing nonce gets one code either way (§C.7).
 func checkNonces(s *itemState) *Error {
 	for _, st := range s.steps {
 		if st.del {
@@ -795,11 +789,11 @@ func checkNonces(s *itemState) *Error {
 			continue
 		}
 		if !seal.HasFreshNonce(st.raw) {
-			return invalid("sealed namespaces need a fresh $nonce in every patch set: add /$nonce with 128 random bits as 26 base32 characters (§C.7, §E.2.5)")
+			return apiErr(422, "nonce", "message", "sealed namespaces need a fresh $nonce in every patch set: add /$nonce with 128 random bits as 26 base32 characters (§C.7, §E.2.5)")
 		}
 		m, _ := st.doc.(map[string]any)
 		if n, _ := m["$nonce"].(string); n == "" || n == st.prevNonce {
-			return invalid("the $nonce was used before; sealed namespaces need a fresh one in every patch set (§E.2.5)")
+			return apiErr(422, "nonce", "message", "the $nonce was used before; sealed namespaces need a fresh one in every patch set (§E.2.5)")
 		}
 	}
 	return nil

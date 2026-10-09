@@ -2,6 +2,7 @@ package core
 
 import (
 	"sort"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -21,20 +22,24 @@ import (
 //   - a revision path /r/N/{name}/rev/{id}, and nothing else of N, may be
 //     read under a grant that may read a resource of a listed namespace
 //     that references it (schemaReadsRev), even one that doesn't name N
-//     (§7).
+//     (§7). A referrer in a listed namespace open to everyone (public, and
+//     neither sealed nor end-to-end) counts for every request, with or
+//     without a grant; a grant is then ignored, as for public reads.
 //
 // A referrer, as the refusals of §6.1 count references, is an unpurged
 // resource of the listed namespace whose head, or last live document if
 // tombstoned, names the revision by $schema or reaches it through the $ref
 // closure of that schema, resolved structurally as schemaUses does. Only
 // the listed namespace's own resources count: what a branch reads through
-// from its base is the base's to open. The namespaces considered are those
-// the grant names; a "*" grant considers every namespace schemaReads lists.
+// from its base is the base's to open. The namespaces considered are the
+// open ones schemaReads lists, and those the grant names, where it must
+// verify as a read of the referrer would (§C.2); a "*" grant names every
+// namespace schemaReads lists.
 
 // schemaReadsRev reports whether cred may read revision rid of resource
 // name in n by path under n's schemaReads (§6.1).
 func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials) bool {
-	if cred.Bearer == "" || n.purged || n.isBranch() || n.isShadow() {
+	if n.purged || n.isBranch() || n.isShadow() {
 		return false
 	}
 	cfg := t.config(n.configSeq)
@@ -54,9 +59,13 @@ func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials)
 	if err != nil || !schema.IsSchemaDoc(d) {
 		return false
 	}
-	g, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
-	if err != nil {
-		return false
+	// A grant that can't be used is ignored, as for public reads (§7):
+	// open referrers still count.
+	var g *grant.Grant
+	if cred.Bearer != "" {
+		if x, err := grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize); err == nil {
+			g = x
+		}
 	}
 	path := "/r/" + n.name + "/" + name + "/rev/" + rid.String()
 	t.noLock++
@@ -70,21 +79,21 @@ func (t *tx) schemaReadsRev(n *nsRow, name string, rid ids.ID, cred Credentials)
 	return false
 }
 
-// schemaReadsCandidates lists the namespaces whose readers schemaReads of
-// n may open n's schemas to that grant g names: n, and those matching
-// schemaReads.for.
+// schemaReadsCandidates lists the namespaces whose referrers may open n's
+// schemas under schemaReads to a request with grant g, nil without a
+// usable one: of n and those matching schemaReads.for, the ones g names
+// and the ones open to everyone.
 func (t *tx) schemaReadsCandidates(n *nsRow, cfg *Config, g *grant.Grant) []*nsRow {
-	names := map[string]bool{}
-	star := false
-	for _, s := range g.Blocks[0].NS {
-		if s == "*" {
-			star = true
-		} else if s == n.name || DraftsMatch(cfg.SchemaReadsFor, s) {
-			names[s] = true
+	names := map[string]bool{n.name: true}
+	scan := false
+	for _, p := range cfg.SchemaReadsFor {
+		if strings.HasSuffix(p, "*") {
+			scan = true
+		} else {
+			names[p] = true
 		}
 	}
-	if star {
-		names[n.name] = true
+	if scan {
 		rows, err := t.Query(`SELECT name FROM namespaces WHERE purged = 0 AND name NOT LIKE '~%'`)
 		t.must(err)
 		for rows.Next() {
@@ -99,22 +108,31 @@ func (t *tx) schemaReadsCandidates(n *nsRow, cfg *Config, g *grant.Grant) []*nsR
 	}
 	var out []*nsRow
 	for _, s := range sortedKeys(names) {
-		if !g.NamesNS(s) {
+		l := t.nsByName(s)
+		if l == nil || l.purged || l.isShadow() {
 			continue
 		}
-		if l := t.nsByName(s); l != nil && !l.purged && !l.isShadow() {
+		if g != nil && g.NamesNS(s) || openToAll(t.config(l.configSeq)) {
 			out = append(out, l)
 		}
 	}
 	return out
 }
 
+// openToAll reports whether anyone may read the content of a namespace
+// with this document: it is public, and neither sealed nor end-to-end.
+func openToAll(c *Config) bool { return c.Read == "public" && c.level < levelSealed }
+
 // refersIn reports whether g may read a resource of l that references
-// path (§6.1): see the package comment above.
+// path (§6.1): see the package comment above. In a namespace open to
+// everyone g is ignored, and may be nil.
 func (t *tx) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string]bool) bool {
 	lcfg := t.config(l.configSeq)
 	var a *actor
-	if lcfg.Read != "public" {
+	if !openToAll(lcfg) {
+		if g == nil || !g.NamesNS(l.name) {
+			return false
+		}
 		var err *Error
 		if a, err = t.verifyGrant(g, l.name, l, lcfg, nil); err != nil || !a.verified.Can["read"] {
 			return false
@@ -169,7 +187,7 @@ func (t *tx) refersIn(l *nsRow, g *grant.Grant, path string, closures map[string
 			continue
 		}
 		seen[nm] = true
-		if lcfg.Read != "public" && !t.canRead(l, lcfg, a, nm) {
+		if a != nil && t.grantRules(a, "read", nil, t.basicEnvelope("read", nm, a), false) != nil {
 			continue
 		}
 		res := t.resource(l.id, nm)

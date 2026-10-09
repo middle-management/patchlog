@@ -570,10 +570,13 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 // do a batch's source check (§7.5), branching (§7.6) and remote branch
 // registration (§G.3): a grant whose rules hide some resources could
 // otherwise list their names and heads, or read them through a branch.
-// Branching and registration check read as step 1 does (stepOne, §6.2):
-// rules over the rest of the envelope apply to their own at step 6.
+// Branching and registration check it as step 1 checks verbs (stepOne,
+// §6.2, §C.5), in a public namespace too: the grant must read n
+// unrestricted and allow read, and its rules that refer only to /action,
+// /principal or /now must pass with /action read; rules over the rest of
+// the envelope apply to their own write at step 6.
 func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
-	if cfg.Read == "public" || t.e.opt.AuthDisabled {
+	if cfg.Read == "public" && !stepOne || t.e.opt.AuthDisabled {
 		return true
 	}
 	if a == nil {
@@ -607,16 +610,6 @@ func (a *actor) unrestrictedRoles() ([]string, bool) {
 		}
 	}
 	return out, len(out) > 0
-}
-
-// unrestrictedRead is unrestrictedRoles' answer alone, true for an actor
-// without a grant.
-func (a *actor) unrestrictedRead() bool {
-	if a.verified == nil {
-		return true
-	}
-	_, ok := a.unrestrictedRoles()
-	return ok
 }
 
 // refersToResource reports whether a rule of rs refers to /resource, or

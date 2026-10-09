@@ -105,6 +105,9 @@ func TestNonceRequiredFastForward(t *testing.T) {
 	expect(t, e.branch("m", map[string]any{"name": "mb"}, "alice"), 201)
 	step := ops(op("replace", "/v", 2.0))
 	e.appendRev("mb", "d", d1, step)
+	// The branch first (§7.4).
+	expectCode(t, e.patchNS("m", ops(op("add", "/nonce", "required")), ""), 409, "in_use")
+	expect(t, e.patchNS("mb", ops(op("add", "/nonce", "required")), ""), 201)
 	expect(t, e.patchNS("m", ops(op("add", "/nonce", "required")), ""), 201)
 	body := map[string]any{"source": map[string]any{"ns": "mb", "at": e.nsHead("mb")},
 		"items": []any{map[string]any{"resource": "d", "ifMatch": d1, "steps": []any{step}}}}
@@ -116,8 +119,6 @@ func TestNonceRequiredFastForward(t *testing.T) {
 	// Re-authored with a fresh $nonce, it goes in.
 	body["items"] = []any{map[string]any{"resource": "d", "ifMatch": d1, "steps": []any{withNonce(step)}}}
 	expect(t, e.batchReq("m", body, "alice"), 201)
-	// The branch never required nonces: a config write that leaves the
-	// setting off turns nothing off (§7.6).
 	expect(t, e.patchNS("mb", ops(op("add", "/frozen", true)), ""), 201)
 }
 

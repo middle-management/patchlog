@@ -639,7 +639,13 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 					m.level = levelE2E // unknown: the strictest
 				}
 			}
-			lv.nonce = d.Value["nonce"] == "required" && m.level != levelE2E
+			// The nonce setting is the base's current one, not the one at
+			// at: merging back must pass there now (§C.7).
+			nonce, err := c.NonceRequired(ctx, base.NS)
+			if err != nil {
+				return nil, fetchErr("/ns/"+base.NS, err)
+			}
+			lv.nonce = nonce && m.level != levelE2E
 		}
 		if next == nil {
 			break
@@ -1228,10 +1234,11 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 // mirrorSchemas mirrors the schema closure into namespaces of this
 // deployment that aren't branches, under the same paths, so $schema
 // resolves here (§G.3). A namespace that doesn't exist is created with the
-// branch's read mode, keys and roles, and its source's nonce setting
-// (§C.7). A path whose chain neither contains the base's nor is a prefix of
-// it is 409 name_conflict. The entries it writes record the creating
-// operator as author and its grant (§7.4).
+// branch's read mode, keys and roles, and takes its source's nonce setting
+// once its history is in (requireNonces, §C.7). A path whose chain neither
+// contains the base's nor is a prefix of it is 409 name_conflict. The
+// entries it writes record the creating operator as author and its grant
+// (§7.4).
 func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author int64) *Error {
 	type change struct {
 		name string
@@ -1251,16 +1258,13 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 		if nsName == branch || n != nil && (n.isBranch() || n.purged) {
 			return conflict(byNS[nsName][0], "the schema namespace here is a branch or purged")
 		}
-		if n == nil {
+		created := n == nil
+		if created {
 			doc := map[string]any{"read": cfg.Read}
 			for _, k := range []string{"keys", "roles", "encryption"} {
 				if v, ok := cfg.Doc[k]; ok {
 					doc[k] = jsonv.Clone(v)
 				}
-			}
-			if m.schemaNonce[nsName] {
-				// Its source's setting, not the branch's (§C.7).
-				doc["nonce"] = "required"
 			}
 			n, _, _ = t.insertNamespace(nsName, []any{map[string]any{"op": "add", "path": "", "value": doc}}, doc, false, author)
 		}
@@ -1307,6 +1311,9 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 			t.must(err)
 		}
 		t.tags = append(t.tags, "ns:"+n.name)
+		if created && m.schemaNonce[nsName] {
+			t.requireNonces(n, author)
+		}
 	}
 	return nil
 }

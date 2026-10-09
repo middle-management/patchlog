@@ -22,8 +22,11 @@ import (
 // /action, are constant for the edge grant's reads, and must pass here.
 // Anything else is 403, as are "*" and a grant without read in a
 // namespace it names. The answer is all or nothing: a namespace that
-// doesn't exist or refuses the grant refuses the request, 401 if any
-// would be 401, so it doesn't reveal which exist.
+// doesn't exist, is purged or refuses the grant refuses the request, 401
+// if any would be 401, else 403 if any would be 403, so it doesn't reveal
+// which exist, and 410 purged only when every one refused is purged and
+// the grant verifies and may read there. With authentication disabled it
+// is 404 not_offered (§12).
 //
 // The server turns them into cookies (internal/edge); a read under one
 // comes back as Credentials.Edge, which reader honours for that namespace
@@ -113,13 +116,16 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, cred Credentials) (*EdgeGr
 }
 
 // refusalRank orders the refusals of an all-or-nothing answer (§C.5): 401
-// if any namespace's is, then 403, then the rest (410 for a purged one).
+// if any namespace's is, then 403, then the rest, and 410 for a purged one
+// only when every refusal is.
 func refusalRank(err *Error) int {
 	switch err.Status {
 	case 401:
 		return 0
 	case 403:
 		return 1
+	case 410:
+		return 3
 	}
 	return 2
 }
@@ -133,9 +139,6 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*EdgeGrant,
 	a, err := t.verifyGrant(g, ns, n, t.config(n.configSeq), nil)
 	if err != nil {
 		return nil, err
-	}
-	if n.purged {
-		return nil, gone()
 	}
 	ok, roles := a.verified.Allows("read")
 	if !ok {
@@ -164,6 +167,11 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*EdgeGrant,
 	// the principal: they decide every read under the prefix alike.
 	if t.grantRules(a, "read", roles, t.basicEnvelope("read", res, a), false) != nil {
 		return nil, forbidden("the grant's rules refuse reading " + ns)
+	}
+	// A purged namespace is decided last, once the grant verifies and may
+	// read there, as its URLs answer 410 after the read check (§8.5).
+	if n.purged {
+		return nil, purgedNS()
 	}
 	return &EdgeGrant{NS: ns, Resource: res, Sub: a.principal.ID}, nil
 }

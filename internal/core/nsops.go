@@ -274,6 +274,9 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 			return nil, apiErr(409, "in_use", "dependents", anyStrings(deps), "message", "raise the encryption level of these branches first")
 		}
 	}
+	if err := t.checkNonceDependents(n, cur, cfg); err != nil {
+		return nil, err
+	}
 	if n.isBranch() {
 		// A remote base's keys don't reach across (§7.6): the loop stops
 		// at the shadow, which has none.
@@ -563,8 +566,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	if err := t.authorize(a, "branch", br.Name); err != nil {
 		return nil, err
 	}
-	// A public base answers readsNS for anyone; the grant still needs it.
-	if !t.readsNS(base, bcfg, a, true) || !a.unrestrictedRead() {
+	if !t.readsNS(base, bcfg, a, true) {
 		return nil, forbidden("branching needs unrestricted read on the base (§C.5)")
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
