@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/verify"
 )
@@ -286,8 +287,12 @@ func (im *importer) bumpEpochs(ctx context.Context, ns, config string) error {
 	return nil
 }
 
-// withoutNonce leaves a document's $nonce out of a comparison.
+// withoutNonce leaves a document's $nonce out of a comparison. A document
+// held as its canonical form (snapDoc) is parsed: its members are read.
 func withoutNonce(v any) any {
+	if r, ok := v.(jsonv.Raw); ok {
+		v = jsonv.MustParse(r)
+	}
 	m, ok := v.(map[string]any)
 	if !ok {
 		return v
@@ -315,6 +320,7 @@ func nonced(steps []client.Step) []client.Step {
 		if s.Delete {
 			continue
 		}
+		noRawPatchSet(s.Patches)
 		ps, _ := s.Patches.([]any)
 		out[i].Patches = append(append([]any{}, ps...), map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()})
 	}

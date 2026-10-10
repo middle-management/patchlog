@@ -36,6 +36,15 @@ takes 17.2 s; of the whole bundle, 109.9 s, 50.8 s and 44.1 s.
   database is 32% smaller, the write-locked phase uses 16% less CPU and the batches take 14% less
   time; cold reads of such documents are faster. Databases from earlier versions keep their heads
   rows until the head moves, and earlier versions read the new ones, folding from the genesis.
+- **Snapshot documents held as their canonical bytes.** The importer kept every snapshot document
+  as a parsed tree for the whole import, 1.3 to 5 times the size of its canonical form, though
+  after planning it only serialised it again. It now keeps the canonical bytes, which the bundle
+  reader computes for the digest anyway, and parses a document again only where planning reads
+  it; batch requests are the same, byte for byte. x-ref and x-index walks no longer copy the
+  instance location at every member. On the whole bundle (`BenchmarkImportDemoPlay`, two runs
+  each, alternating), planning took 11.9–15.7 s and takes 5.8–6.3 s, the import 44.8–49.1 s and
+  35.1–37.3 s, and the benchmark process's peak heap, its server's included, went from 3.3–3.4
+  GiB to 2.4–2.5 GiB; on its content, planning from 7.3–11.6 s to 2.7–3.8 s.
 - **Server: schemas resolved once per write.** A batch's documents typed by the same schemas
   resolved and parsed each for every document and `$ref`; a transaction now keeps what it
   resolved, per writer. Parsed schema revisions are kept by id apart from the document cache,

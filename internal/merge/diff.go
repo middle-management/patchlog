@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"fmt"
 	"sort"
 	"strconv"
 
@@ -17,10 +18,24 @@ import (
 // elements in between (recursing into each pair), then remove the surplus
 // elements of a or add the extra elements of b. Anything else that differs,
 // including a change of type, is a replace.
+//
+// A value held as its canonical form (jsonv.Raw) is diffed as the value it
+// holds: Diff expands it first, so that it compares its members and
+// elements rather than replacing it whole.
 func Diff(a, b any) []any {
 	var out []any
-	diffRec(pointer.Pointer{}, a, b, &out)
+	diffRec(pointer.Pointer{}, expanded(a), expanded(b), &out)
 	return out
+}
+
+// expanded is v with every jsonv.Raw in it parsed; one that doesn't parse
+// breaks Raw's contract.
+func expanded(v any) any {
+	x, err := jsonv.Expand(v)
+	if err != nil {
+		panic(fmt.Sprintf("merge: Diff of a jsonv.Raw that is not a value: %v", err))
+	}
+	return x
 }
 
 func diffOp(op string, p pointer.Pointer, v any, withValue bool) map[string]any {

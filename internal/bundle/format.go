@@ -220,6 +220,14 @@ type Line struct {
 	Snapshot string // the source id: head revision, or tombstone if Deleted
 	Doc      any
 	Deleted  bool
+	// docCanon is Doc's canonical form, for a Reader asked to keep it
+	// (keepDocCanon): an importer holds it instead of Doc, a fraction of
+	// the memory (snapDoc). It is the "doc" member's part of the line's
+	// canonical form, which the Reader computes for the digest anyway
+	// (docPart), and aliases that buffer: a fresh allocation per line
+	// (jsonv.Canonical's result), which nothing writes to or reuses. If
+	// that buffer were ever pooled, docPart would have to copy.
+	docCanon jsonv.Raw
 
 	// Blob lines (§G.4.1): a blob an exported document references.
 	Blob  string // the blob id (§3.7)
@@ -964,6 +972,9 @@ type Reader struct {
 	lineNo int
 	digest string
 	done   bool
+	// docCanon: keep each snapshot document's canonical form on its line
+	// (keepDocCanon).
+	docCanon bool
 	// Parsing lines ahead on other goroutines (parallel), if started:
 	// each line's result in order, and a channel that stops them.
 	ahead   chan chan parsedLine
@@ -1003,6 +1014,14 @@ func NewReader(r io.Reader) (*Reader, error) {
 
 // Header is the bundle's header.
 func (r *Reader) Header() *Header { return r.h }
+
+// keepDocCanon makes the Reader keep each snapshot document's canonical
+// form on its line (Line.docCanon), which an importer holds instead of the
+// parsed document (importer.load). Call it before Next and parallel. The
+// other readers (Verify, archive restore, the CLI's scans of a bundle)
+// keep no lines and don't ask: it would keep each line's canonical buffer
+// alive for as long as the line.
+func (r *Reader) keepDocCanon() { r.docCanon = true }
 
 func (r *Reader) next() (any, []byte, error) {
 	for {
@@ -1076,15 +1095,37 @@ func (r *Reader) parse() parsedLine {
 	if err != nil {
 		return parsedLine{err: err}
 	}
-	return parseAt(r.lineNo, v, canon, r.h.Authors)
+	return parseAt(r.lineNo, v, canon, r.h.Authors, r.docCanon)
 }
 
-func parseAt(lineNo int, v any, canon []byte, authors bool) parsedLine {
+// parseAt parses the line v, whose canonical form is canon; with docCanon,
+// a snapshot line keeps its document's (Line.docCanon).
+func parseAt(lineNo int, v any, canon []byte, authors, docCanon bool) parsedLine {
 	l, err := parseLine(v, authors)
 	if err != nil {
 		return parsedLine{lineNo: lineNo, err: &Error{Line: lineNo, Msg: err.Error()}}
 	}
+	if docCanon && l.IsSnapshot() && !l.Deleted {
+		l.docCanon = docPart(l, canon)
+	}
 	return parsedLine{lineNo: lineNo, canon: canon, l: l}
+}
+
+// docPart is the canonical form of a snapshot line's document: the part
+// of the line's canonical form canon that it is, without copying. Members
+// sorted, a snapshot line with a document is
+// {"doc":D,"ns":…,"resource":…,"snapshot":…}, since parseLine refuses any
+// other member; the prefix, the separator and the tail are all checked, and
+// the document is serialised again if they don't match. The result's
+// capacity ends with it, so nothing appended to it could reach the tail.
+func docPart(l *Line, canon []byte) jsonv.Raw {
+	const head = `{"doc":`
+	tail := jsonv.Canonical(map[string]any{"ns": l.NS, "resource": l.Resource, "snapshot": l.Snapshot})
+	n := len(canon) - len(tail)
+	if n > len(head) && bytes.HasPrefix(canon, []byte(head)) && canon[n] == ',' && bytes.Equal(canon[n+1:], tail[1:]) {
+		return jsonv.Raw(canon[len(head):n:n])
+	}
+	return jsonv.Raw(jsonv.Canonical(l.Doc))
 }
 
 // parallel parses lines ahead on workers goroutines, which Next takes in
@@ -1096,7 +1137,7 @@ func (r *Reader) parallel(workers int) {
 	}
 	ahead, stop := make(chan chan parsedLine, 4*workers), make(chan struct{})
 	r.ahead, r.stop = ahead, stop
-	authors := r.h.Authors
+	authors, docCanon := r.h.Authors, r.docCanon
 	type job struct {
 		lineNo int
 		b      []byte
@@ -1111,7 +1152,7 @@ func (r *Reader) parallel(workers int) {
 					j.out <- parsedLine{lineNo: j.lineNo, err: &Error{Line: j.lineNo, Msg: "not I-JSON: " + perr.Error()}}
 					continue
 				}
-				j.out <- parseAt(j.lineNo, v, jsonv.Canonical(v), authors)
+				j.out <- parseAt(j.lineNo, v, jsonv.Canonical(v), authors, docCanon)
 			}
 		}()
 	}

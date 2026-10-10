@@ -84,7 +84,7 @@ func (im *importer) leaveOut() {
 		case Snapshot:
 			deleted = d.snap != nil && d.snap.Deleted
 			if !im.held[k] {
-				d.snap, d.blobs = nil, nil
+				d.snap, d.blobs, d.snapBlobs = nil, nil, nil
 			}
 		case Full:
 			i, ok := d.idx[d.info.Head]

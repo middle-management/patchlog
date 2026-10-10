@@ -325,9 +325,20 @@ func instPointer(key []tok) string {
 	return p.String()
 }
 
+// appendKey extends an instance location key by one token. The walks'
+// keys are a stack: a child's key shares its parent's backing array, and
+// the next sibling's overwrites the token after the parent's key, once
+// the walk under the previous one has returned. A walk never writes below
+// its own key's length, so a key stays as it was while its walk runs; a
+// key kept past it (an item of out) must be a copy (keepKey). Copying the
+// whole key at every member and element was most of an x-ref walk's cost.
 func appendKey(key []tok, t tok) []tok {
-	out := make([]tok, 0, len(key)+1)
-	return append(append(out, key...), t)
+	return append(key, t)
+}
+
+// keepKey is a copy of key to keep past its walk (appendKey).
+func keepKey(key []tok) []tok {
+	return append([]tok(nil), key...)
 }
 
 // lookup resolves the subschema value at l.
@@ -480,7 +491,7 @@ func (c *collector) walk(l loc, inst any, key []tok, depth int, refs map[string]
 		c.seen[dk] = true
 		c.out = append(c.out, item{
 			a:   Annotation{Keyword: k, Value: obj[k], Pointer: ptrStr, Instance: inst, SchemaPath: sp},
-			key: key,
+			key: keepKey(key),
 		})
 	}
 

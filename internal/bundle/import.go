@@ -151,6 +151,12 @@ type ImportOptions struct {
 	// batches' source names (§G.4.4), where they verify against the source
 	// (VerifyWith).
 	Signer *sig.Key
+
+	// keepTrees keeps the snapshot documents as the trees the Reader
+	// parses, as imports did before they kept their canonical forms
+	// (Line.docCanon). Tests only (KeepSnapshotTrees): the golden test
+	// checks that both send the same requests.
+	keepTrees bool
 }
 
 // DocReport is one bundled document, classified.
@@ -329,6 +335,13 @@ type bdoc struct {
 	requiresBad   bool             // requires isn't in the target's chain (the target moved on)
 	blobs         map[string]*Line // its blob lines, by blob id (§G.4.1)
 	refd          map[string]bool  // blobs its lines read so far reference
+	// The snapshot document is gone once planUpstream has replaced it with
+	// its rewritten form (snapDoc). snapBlobs, when load keeps the
+	// document's canonical form, are the blobs its genesis revision brings
+	// (stepBlobs of it), as load found them, rewritten or not (a rewrite
+	// changes strings that pin, never a blob reference); nil otherwise.
+	snapGone  bool
+	snapBlobs []string
 }
 
 type item struct {
@@ -356,13 +369,17 @@ type upPlan struct {
 	added    []chainEntry // what this import adds to the chain
 	chain    []chainEntry // the upstream chain after this import (truncated at a horizon), once loaded (upChain)
 	loaded   bool
-	newDoc   any
+	newDoc   any // the rewritten snapshot, parsed, only for a take (planSnapshotTarget)
 }
 
 type chainEntry struct {
 	id   string
 	step client.Step
 	size int // the step's canonical size, -1 until known
+	// The blobs the step may bring in (stepBlobs), if hasBlobs: an upstream
+	// item and the target's fast-forward share the step, and its blobs.
+	blobs    []string
+	hasBlobs bool
 }
 
 type point struct{ baseU, baseT string }
@@ -551,6 +568,9 @@ func (im *importer) load(open Opener) error {
 	if err != nil {
 		return err
 	}
+	if !im.opt.keepTrees {
+		rd.keepDocCanon()
+	}
 	rd.parallel(runtime.GOMAXPROCS(0))
 	defer rd.Close()
 	im.h = rd.Header()
@@ -601,8 +621,23 @@ func (im *importer) load(open Opener) error {
 			d.snap = l
 			if !l.Deleted {
 				im.scanRefs(d, l.Doc)
-				for _, r := range docBlobs(l.Doc) {
-					d.refd[r.bid] = true
+				refs := blobRefs(l.Doc)
+				if !schemaDoc(l.Doc) { // docBlobs
+					for _, r := range refs {
+						d.refd[r.bid] = true
+					}
+				}
+				if l.docCanon != nil {
+					// The import holds the document's canonical form instead
+					// of its tree, which takes 1.3 to 5 times the memory: the
+					// steps that read it parse it again (snapDoc). Then the
+					// blobs a genesis revision of it brings need no parse
+					// (planUpstream).
+					d.snapBlobs = make([]string, len(refs))
+					for i, r := range refs {
+						d.snapBlobs[i] = r.bid
+					}
+					l.Doc = nil
 				}
 			}
 		} else {
@@ -633,6 +668,51 @@ func (im *importer) load(open Opener) error {
 		}
 	}
 	return nil
+}
+
+// snapHeld is the snapshot document as the import holds it: its canonical
+// form (jsonv.Raw), which load keeps, or with keepTrees the Reader's tree.
+// It fails for a deleted or left-out snapshot, and once planUpstream has
+// replaced the document with its rewritten form (dropSnap), rather than
+// answer null: a document of JSON null is held as one.
+func (d *bdoc) snapHeld() (any, error) {
+	l := d.snap
+	switch {
+	case l == nil || l.Deleted:
+		return nil, fmt.Errorf("%s: no snapshot document (deleted or left out)", d.key)
+	case l.docCanon != nil:
+		return l.docCanon, nil
+	case d.snapGone:
+		return nil, fmt.Errorf("%s: the snapshot document is no longer held: planning replaced it with its rewritten form", d.key)
+	}
+	return l.Doc, nil
+}
+
+// snapDoc is the snapshot document as a tree, for the planning steps that
+// read it: parsed again from its canonical form, a copy of its own for
+// each call, which they hold one at a time; or with keepTrees the line's
+// tree.
+func (d *bdoc) snapDoc() (any, error) {
+	v, err := d.snapHeld()
+	if err != nil {
+		return nil, err
+	}
+	return parsedDoc(v)
+}
+
+// dropSnap lets go of the snapshot document, which its rewritten form
+// replaces (rewrite): snapDoc fails from then on.
+func (d *bdoc) dropSnap() {
+	d.snap.Doc, d.snap.docCanon, d.snapGone = nil, nil, true
+}
+
+// parsedDoc is a document as a tree: one held as its canonical form
+// (jsonv.Raw) parsed, any other as it is.
+func parsedDoc(v any) (any, error) {
+	if r, ok := v.(jsonv.Raw); ok {
+		return jsonv.Parse(r)
+	}
+	return v, nil
 }
 
 // scanRefs over-approximates what a document pins, for ordering only:
@@ -853,8 +933,12 @@ func expectedIDs(parent string, steps []client.Step) ([]string, []int, error) {
 	return out, sizes, nil
 }
 
-// canonical serialises a patch set (§3.3).
+// canonical serialises a patch set (§3.3), which is never a jsonv.Raw
+// itself (errRawPatchSet).
 func canonical(patches any) ([]byte, error) {
+	if _, ok := patches.(jsonv.Raw); ok {
+		return nil, errRawPatchSet
+	}
 	if canon, ok := jsonv.CanonicalOf(patches); ok {
 		return canon, nil
 	}
@@ -863,6 +947,23 @@ func canonical(patches any) ([]byte, error) {
 		return nil, err
 	}
 	return jsonv.Canonical(v), nil
+}
+
+// errRawPatchSet refuses a patch set that is a jsonv.Raw itself. The
+// import never makes one: a snapshot document held as its canonical form
+// is a value inside a patch set (client.GenesisPatches), whose ops stay
+// readable. The code that reads a patch set's ops would find none in one
+// (nonced, patchBlobs and sealedBlobs, sides, canonical), and nonced runs
+// before the ids are computed, so the id checks wouldn't catch a document
+// written without them.
+var errRawPatchSet = errors.New("import: a patch set held as canonical bytes (only a value inside one may be)")
+
+// noRawPatchSet panics on a patch set that is a jsonv.Raw (errRawPatchSet),
+// for code without an error to return: the import's own steps never are.
+func noRawPatchSet(patches any) {
+	if _, ok := patches.(jsonv.Raw); ok {
+		panic(errRawPatchSet)
+	}
 }
 
 // revisionID is the id of the revision of canonical patches on parent ("" =
@@ -945,6 +1046,12 @@ func toPointers(ss []string) []pointer.Pointer {
 // cases.
 func sides(anc any, ancExists bool, incoming, own []client.Step, ownDeleted bool) []merge.Conflict {
 	var out []merge.Conflict
+	// merge.Writes reads the values the ops write, and an upstream
+	// genesis holds its document as its canonical form.
+	incoming, err := expandSteps(incoming)
+	if err != nil {
+		return []merge.Conflict{conflict(merge.ConflictUnreadable, fmt.Sprintf("writes could not be computed: %v", err))}
+	}
 	iw, err1 := merge.Writes(anc, ancExists, incoming)
 	ow, err2 := merge.Writes(anc, ancExists, own)
 	if err1 != nil || err2 != nil {
@@ -969,6 +1076,22 @@ func sides(anc any, ancExists bool, incoming, own []client.Step, ownDeleted bool
 		out = append(out, conflict(merge.ConflictOverlap, "both sides wrote these paths since the common ancestor", ov...))
 	}
 	return out
+}
+
+// expandSteps are steps whose patch sets hold no jsonv.Raw, for code that
+// reads their values. A patch set that is a Raw itself is refused
+// (errRawPatchSet).
+func expandSteps(ss []client.Step) ([]client.Step, error) {
+	out := append([]client.Step(nil), ss...)
+	for i := range out {
+		noRawPatchSet(out[i].Patches)
+		p, err := jsonv.Expand(out[i].Patches)
+		if err != nil {
+			return nil, err
+		}
+		out[i].Patches = p
+	}
+	return out, nil
 }
 
 // --- planning --------------------------------------------------------------
@@ -1045,9 +1168,13 @@ func (im *importer) plan(ctx context.Context) error {
 			it.expected, it.sizes = exp, sizes
 		}
 		exp := it.expected
-		it.blobs = make([][]string, len(it.steps))
-		for i, st := range it.steps {
-			it.blobs[i] = stepBlobs(st)
+		if it.blobs == nil {
+			// Unless planUpstream knew them: an upstream item's, and a
+			// fast-forward's along what it adds.
+			it.blobs = make([][]string, len(it.steps))
+			for i, st := range it.steps {
+				it.blobs[i] = stepBlobs(st)
+			}
 		}
 		if !it.upstream {
 			it.d.rep.Steps = len(it.steps)
@@ -1264,14 +1391,19 @@ func (im *importer) snapshotOrder(ctx context.Context) ([]*bdoc, map[string][]an
 		if d.snap.Deleted {
 			return
 		}
-		if f.refs, f.err = annot.FindRefs(d.snap.Doc, load); f.err != nil {
+		doc, err := d.snapDoc()
+		if err != nil {
+			f.err = err
+			return
+		}
+		if f.refs, f.err = annot.FindRefs(doc, load); f.err != nil {
 			return
 		}
 		declared := map[string]bool{}
 		for _, r := range f.refs {
 			declared[r.Pointer] = true
 		}
-		walkStrings(d.snap.Doc, func(at *strPath, s string) {
+		walkStrings(doc, func(at *strPath, s string) {
 			r, ok := annot.ParseRefString(s)
 			if !ok || r.Rev == "" {
 				return
@@ -1367,11 +1499,15 @@ func (im *importer) rewriteTarget(r annot.Ref) *bdoc {
 
 // rewrite replaces pinned references to snapshot documents with the
 // matching upstream revision path, keeping any #{id} fragment (§G.4.4). It
-// rewrites the snapshot line's document in place, which nothing reads
-// after (planUpstream calls it once per document): a copy of each would
-// double what the import holds.
+// returns the rewritten document as the import holds documents (snapHeld):
+// its canonical form, the line's own without parsing it if nothing is
+// rewritten; or with keepTrees the line's tree, rewritten in place.
+// planUpstream calls it once per document, and a rewritten document
+// replaces the line's (dropSnap): a copy of each would double what the
+// import holds.
 func (im *importer) rewrite(d *bdoc, refs []annot.Ref) (any, error) {
-	doc := d.snap.Doc
+	var doc any
+	parsed := false
 	for _, r := range refs {
 		t := im.rewriteTarget(r)
 		if t == nil {
@@ -1380,6 +1516,13 @@ func (im *importer) rewrite(d *bdoc, refs []annot.Ref) (any, error) {
 		up := im.up[t.key]
 		if up == nil || up.head == "" {
 			return nil, fmt.Errorf("pinned reference %s at %s: no upstream revision for %s", r.Raw, r.Pointer, t.key)
+		}
+		if !parsed {
+			var err error
+			if doc, err = d.snapDoc(); err != nil {
+				return nil, err
+			}
+			parsed = true
 		}
 		frag := ""
 		if i := strings.IndexByte(r.Raw, '#'); i >= 0 {
@@ -1391,6 +1534,14 @@ func (im *importer) rewrite(d *bdoc, refs []annot.Ref) (any, error) {
 			return nil, err
 		}
 		d.rep.Rewritten = append(d.rep.Rewritten, RewrittenRef{Pointer: r.Pointer, From: r.Raw, To: to})
+	}
+	if !parsed {
+		return d.snapHeld()
+	}
+	canon := d.snap.docCanon != nil
+	d.dropSnap()
+	if canon {
+		return jsonv.Raw(jsonv.Canonical(doc)), nil
 	}
 	return doc, nil
 }
@@ -1451,11 +1602,13 @@ func (im *importer) upstreamChain(ctx context.Context, ns, name, head string) ([
 	return out, nil
 }
 
-// genesisEntry is the genesis revision of doc as an upstream chain's first
-// entry; not ok for a deleted snapshot (nil) or a sealed upstream, whose
-// genesis carries a fresh nonce (§E.2.5).
-func genesisEntry(doc any, sealed bool) (chainEntry, bool) {
-	if doc == nil || sealed {
+// genesisEntry is the genesis revision of doc, d's snapshot document as
+// rewritten (as held: snapHeld), as an upstream chain's first entry, with
+// its blobs if load found them; not ok for a deleted snapshot or a sealed
+// upstream, whose genesis carries a fresh nonce (§E.2.5). A document of
+// JSON null has one too.
+func genesisEntry(d *bdoc, doc any, sealed bool) (chainEntry, bool) {
+	if d.snap.Deleted || sealed {
 		return chainEntry{}, false
 	}
 	st := client.PatchStep(client.GenesisPatches(doc))
@@ -1464,7 +1617,7 @@ func genesisEntry(doc any, sealed bool) (chainEntry, bool) {
 		return chainEntry{}, false
 	}
 	id, err := revisionID("", canon)
-	return chainEntry{id: id, step: st, size: len(canon)}, err == nil
+	return chainEntry{id: id, step: st, size: len(canon), blobs: d.snapBlobs, hasBlobs: d.snapBlobs != nil}, err == nil
 }
 
 // upChain is the upstream chain after this import: the target's up to the
@@ -1505,17 +1658,26 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 		d.rep.Resolution = ResolveSkip
 		return nil, nil
 	}
+	sealed := im.sealedT[u.ns]
+	// The rewritten snapshot as the import holds it: its canonical form,
+	// which a genesis revision's patch set holds and a batch request sends
+	// as it is (jsonv.Raw), or with keepTrees its tree.
 	var nd any
 	if !d.snap.Deleted {
 		if nd, err = im.rewrite(d, refs); err != nil {
 			return nil, err
 		}
-		u.newDoc = nd
+		if im.opt.Resolutions[d.key] == ResolveTake {
+			// Only a take reads it again (takeSteps).
+			if u.newDoc, err = parsedDoc(nd); err != nil {
+				return nil, err
+			}
+		}
 	}
 	switch uh.State {
 	case client.Live:
 		u.prev, u.prevLive = uh.ID, true
-		if g, ok := genesisEntry(nd, im.sealedT[u.ns]); ok && g.id == uh.ID {
+		if g, ok := genesisEntry(d, nd, sealed); ok && g.id == uh.ID {
 			// The head is the genesis revision of the rewritten snapshot, as
 			// an earlier import of it wrote: the document is the snapshot,
 			// and the chain that one revision. Neither needs reading.
@@ -1537,6 +1699,7 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 	}
 	ur.Previous = u.prev
 	var steps []client.Step
+	var blobs [][]string // the steps' blobs (stepBlobs), if known without reading them
 	if d.snap.Deleted {
 		if u.prevLive {
 			steps, ur.Class = []client.Step{client.DeleteStep()}, "delete"
@@ -1546,17 +1709,38 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 			ur.Class = "unchanged"
 		}
 	} else {
-		if im.sealedT[u.ns] {
+		// The snapshot as a tree, for a diff or without its $nonce.
+		var ndv any
+		if u.prev != "" || sealed {
+			if ndv, err = parsedDoc(nd); err != nil {
+				return nil, err
+			}
+		}
+		if sealed {
 			// The upstream's own $nonce isn't part of the snapshot (§E.2.5).
-			prevDoc, nd = withoutNonce(prevDoc), withoutNonce(nd)
+			prevDoc, ndv = withoutNonce(prevDoc), withoutNonce(ndv)
 		}
 		switch {
 		case u.prev == "":
-			steps, ur.Class = []client.Step{client.PatchStep(client.GenesisPatches(nd))}, "create"
+			gd := nd // the genesis revision's document
+			_, canon := nd.(jsonv.Raw)
+			switch {
+			case !sealed:
+				if d.snapBlobs != nil {
+					blobs = [][]string{d.snapBlobs}
+				}
+			case canon:
+				// Without its $nonce, held as canonical as any other.
+				gd = jsonv.Raw(jsonv.Canonical(ndv))
+				blobs = [][]string{stepBlobs(client.PatchStep(client.GenesisPatches(ndv)))} // nonced adds none
+			default:
+				gd = ndv
+			}
+			steps, ur.Class = []client.Step{client.PatchStep(client.GenesisPatches(gd))}, "create"
 		case !u.prevLive:
-			steps, ur.Class = []client.Step{client.PatchStep(orEmpty(merge.Diff(prevDoc, nd)))}, "restore"
+			steps, ur.Class = []client.Step{client.PatchStep(orEmpty(merge.Diff(prevDoc, ndv)))}, "restore"
 		default:
-			if diff := merge.Diff(prevDoc, nd); len(diff) > 0 {
+			if diff := merge.Diff(prevDoc, ndv); len(diff) > 0 {
 				steps, ur.Class = []client.Step{client.PatchStep(diff)}, "append"
 			} else {
 				ur.Class = "unchanged"
@@ -1568,7 +1752,7 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 		ur.Head = u.head
 		return nil, nil
 	}
-	if im.sealedT[u.ns] {
+	if sealed {
 		// A sealed upstream chain then depends on its nonces too, not only on
 		// the sequence of snapshots (§E.2.5, §G.4.4).
 		steps = nonced(steps)
@@ -1577,13 +1761,19 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 	if err != nil {
 		return nil, err
 	}
+	if blobs == nil {
+		blobs = make([][]string, len(steps))
+		for i, s := range steps {
+			blobs[i] = stepBlobs(s)
+		}
+	}
 	for i, s := range steps {
-		u.added = append(u.added, chainEntry{id: exp[i], step: s, size: sizes[i]})
+		u.added = append(u.added, chainEntry{id: exp[i], step: s, size: sizes[i], blobs: blobs[i], hasBlobs: true})
 	}
 	u.head, u.headDel = exp[len(exp)-1], steps[len(steps)-1].Delete
 	ur.Head = u.head
 	u.it = &item{d: d, ns: u.ns, name: u.name, upstream: true, ifMatch: u.prev, ifNone: u.prev == "", steps: steps, srcID: d.snap.Snapshot,
-		expected: exp, sizes: sizes}
+		expected: exp, sizes: sizes, blobs: blobs}
 	return u.it, nil
 }
 
@@ -1648,7 +1838,7 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 		// The same steps on the same parent: the upstream chain's ids.
 		n := len(entries)
 		it := &item{d: d, ns: d.tns, name: d.name, ifMatch: parent, ifNone: parent == "", sameIDs: true,
-			steps: make([]client.Step, 0, n), expected: make([]string, 0, n), sizes: make([]int, 0, n)}
+			steps: make([]client.Step, 0, n), expected: make([]string, 0, n), sizes: make([]int, 0, n), blobs: make([][]string, 0, n)}
 		for _, e := range entries {
 			if !e.step.Delete && e.step.Patches == nil {
 				r.Conflicts = append(r.Conflicts, conflict(merge.ConflictPruned, "upstream history the fast-forward needs was pruned"))
@@ -1657,13 +1847,19 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 			if e.size < 0 {
 				it.expected, it.sizes = nil, nil // computed in plan
 			}
+			if !e.hasBlobs {
+				it.blobs = nil // computed in plan
+			}
 			it.steps = append(it.steps, e.step)
 			if it.expected != nil {
 				it.expected, it.sizes = append(it.expected, e.id), append(it.sizes, e.size)
 			}
+			if it.blobs != nil {
+				it.blobs = append(it.blobs, e.blobs)
+			}
 		}
 		if len(it.steps) == 0 {
-			it.expected, it.sizes = nil, nil
+			it.expected, it.sizes, it.blobs = nil, nil, nil
 		}
 		r.Class = class
 		return it, nil

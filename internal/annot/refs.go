@@ -209,7 +209,7 @@ func (w *refWalker) walk(l loc, inst any, key []tok, depth int, refs map[string]
 				dk := r.Pointer + "\x00" + strconv.FormatBool(r.Pinned) + "\x00" + r.Key
 				if !w.seen[dk] {
 					w.seen[dk] = true
-					w.out = append(w.out, refItem{r: r, key: key})
+					w.out = append(w.out, refItem{r: r, key: keepKey(key)})
 				}
 			}
 		}

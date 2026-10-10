@@ -1,11 +1,13 @@
 package bundle
 
 import (
+	"bytes"
 	"mime"
 	"sort"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
@@ -65,14 +67,30 @@ type blobRef struct {
 // docBlobs lists the blob references of a document, in document order,
 // each blob once. Schema documents have none (§7.8).
 func docBlobs(doc any) []blobRef {
-	if m, ok := doc.(map[string]any); ok {
-		if s, ok := m["$schema"].(string); ok && schema.IsDialect(s) {
-			return nil
-		}
+	if schemaDoc(doc) {
+		return nil
 	}
+	return blobRefs(doc)
+}
+
+// schemaDoc reports a schema document, whose references aren't blobs
+// (§7.8).
+func schemaDoc(doc any) bool {
+	m, ok := doc.(map[string]any)
+	if !ok {
+		return false
+	}
+	s, ok := m["$schema"].(string)
+	return ok && schema.IsDialect(s)
+}
+
+// blobRefs lists the blob references in v, in document order, each blob
+// once, a schema document's too: for a document, the blobs its genesis
+// revision brings (stepBlobs of client.GenesisPatches(v)).
+func blobRefs(v any) []blobRef {
 	var out []blobRef
 	seen := map[string]bool{}
-	walkBlobs(doc, func(r blobRef) {
+	walkBlobs(v, func(r blobRef) {
 		if !seen[r.bid] {
 			seen[r.bid] = true
 			out = append(out, r)
@@ -84,6 +102,12 @@ func docBlobs(doc any) []blobRef {
 // walkBlobs calls fn for every well-formed-looking blob reference in v.
 func walkBlobs(v any, fn func(blobRef)) {
 	switch x := v.(type) {
+	case jsonv.Raw:
+		// A snapshot document held as its canonical form (snapDoc): a
+		// reference has a "$blob" member, which canonical JSON writes so.
+		if bytes.Contains(x, []byte(`"$blob"`)) {
+			walkBlobs(jsonv.MustParse(x), fn)
+		}
 	case []any:
 		for _, e := range x {
 			walkBlobs(e, fn)
@@ -126,6 +150,7 @@ func normType(s string) string {
 // list of its sealed op. ok is false for a patch set without one (a
 // restore with [] keeps the previous list).
 func sealedBlobs(patches any) (bids []string, ok bool) {
+	noRawPatchSet(patches)
 	ops, _ := patches.([]any)
 	for _, o := range ops {
 		m, _ := o.(map[string]any)

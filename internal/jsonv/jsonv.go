@@ -4,6 +4,8 @@
 //
 // Values are plain Go values: nil, bool, float64, string, []any and
 // map[string]any. Numbers are IEEE doubles, which is what JCS serialises.
+// The bundle importer also holds values as their canonical bytes (Raw,
+// whose contract says which functions take one).
 package jsonv
 
 import (
@@ -431,6 +433,11 @@ func writeChecked(b *bytes.Buffer, v any, depth int) bool {
 			}
 		}
 		b.WriteByte('}')
+	case Raw:
+		if x == nil {
+			return false
+		}
+		b.Write(x) // canonical already, by its contract
 	default:
 		return false
 	}
@@ -495,6 +502,11 @@ func writeCanonical(b *bytes.Buffer, v any) {
 			writeCanonical(b, x[k])
 		}
 		b.WriteByte('}')
+	case Raw:
+		if x == nil {
+			panic("jsonv: nil Raw")
+		}
+		b.Write(x) // canonical already, by its contract
 	default:
 		panic(fmt.Sprintf("jsonv: unsupported type %T", v))
 	}
@@ -642,8 +654,15 @@ func cutByte(s string, c byte) (string, string, bool) {
 	return s, "", false
 }
 
-// Equal is RFC 6902 value equality: numbers by value, objects unordered.
+// Equal is RFC 6902 value equality: numbers by value, objects unordered. A
+// Raw is compared as the value it holds.
 func Equal(a, b any) bool {
+	if r, ok := a.(Raw); ok {
+		a = r.parsed()
+	}
+	if r, ok := b.(Raw); ok {
+		b = r.parsed()
+	}
 	switch x := a.(type) {
 	case nil:
 		return b == nil
@@ -686,14 +705,18 @@ func Equal(a, b any) bool {
 // IsValue reports whether v is already a value of the model, one Parse
 // could have returned: nil, bool, finite float64 (no integer outside
 // ±(2^53−1)), valid UTF-8 strings, and []any and map[string]any of
-// values, nested at most as deep as Parse allows. A value a client builds
-// from parsed values needs no round trip through JSON text.
+// values, nested at most as deep as Parse allows; or a non-nil Raw, which
+// holds one in canonical form, taken on its contract (it isn't parsed, and
+// its own nesting isn't counted). A value a client builds from parsed
+// values needs no round trip through JSON text.
 func IsValue(v any) bool { return isValue(v, 0) }
 
 func isValue(v any, depth int) bool {
 	switch x := v.(type) {
 	case nil, bool:
 		return true
+	case Raw:
+		return x != nil
 	case float64:
 		return !math.IsInf(x, 0) && !math.IsNaN(x) && !UnsafeInteger(x)
 	case string:
@@ -722,7 +745,7 @@ func isValue(v any, depth int) bool {
 	return false
 }
 
-// Clone deep-copies a value.
+// Clone deep-copies a value. A Raw is shared: it is never modified.
 func Clone(v any) any {
 	switch x := v.(type) {
 	case []any:
@@ -742,10 +765,12 @@ func Clone(v any) any {
 }
 
 // Depth is the nesting depth of v: 0 for scalars, 1 for an empty or flat
-// container, and so on.
+// container, and so on; a Raw's is that of the value it holds.
 func Depth(v any) int {
 	d := 0
 	switch x := v.(type) {
+	case Raw:
+		return Depth(x.parsed())
 	case []any:
 		for _, e := range x {
 			if c := Depth(e); c > d {
@@ -774,7 +799,8 @@ func MustParse(data []byte) any {
 }
 
 // FromGo converts a value built from Go literals (ints, []string,
-// map[string]string, …) into the model by a canonical round trip.
+// map[string]string, …) into the model by a canonical round trip. A Raw
+// becomes the value it holds.
 func FromGo(v any) any {
 	return normalize(v)
 }
@@ -811,6 +837,8 @@ func normalize(v any) any {
 			c[k] = e
 		}
 		return c
+	case Raw:
+		return x.parsed()
 	}
 	panic(fmt.Sprintf("jsonv: cannot normalise %T", v))
 }
