@@ -333,6 +333,22 @@ INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 -- The namespace entries recording a grant, for GET /ns/{ns}/grants/{gid}
 -- (§C.3.1, grants.go).
 CREATE INDEX IF NOT EXISTS ns_log_by_grant ON ns_log (grant_id, ns, seq) WHERE grant_id IS NOT NULL;
+-- Large values (patch sets, documents, namespace entries' bodies, blob
+-- bytes) are compressed with lz4 where the server has it (PostgreSQL 14
+-- built with lz4) rather than pglz, its default, which compresses several
+-- times slower: on an import pglz took most of the time of inserting
+-- revisions. It applies to values written from then on; reads take either.
+-- A column already set is left alone, so its table isn't locked again.
+DO $$ DECLARE c record; BEGIN
+  IF EXISTS (SELECT 1 FROM pg_settings WHERE name = 'default_toast_compression' AND 'lz4' = ANY (enumvals)) THEN
+    FOR c IN SELECT a.attrelid::regclass AS t, a.attname AS col FROM pg_attribute a
+             WHERE (a.attrelid, a.attname) IN (('revisions'::regclass, 'patches'), ('heads'::regclass, 'doc'), ('snapshots'::regclass, 'doc'),
+                                               ('ns_log'::regclass, 'body'), ('blob_bytes'::regclass, 'data'))
+               AND a.attcompression <> 'l' LOOP
+      EXECUTE format('ALTER TABLE %s ALTER COLUMN %I SET COMPRESSION lz4', c.t, c.col);
+    END LOOP;
+  END IF;
+END $$;
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.

@@ -81,6 +81,11 @@ From implementing v0.49. Each gives what the reference chose.
     canonical JSON. Earlier versions can't read such rows. *Propose:* allow a stored form
     other than canonical JSON in D.2 as long as nothing observable changes, and say that D.8's
     exact bytes are what reads serve, not necessarily what is stored.
+15. **TOAST compression on Postgres** (D.8 sizing). Postgres compresses values over about 2 KB
+    with pglz by default, which took most of the time of inserting revisions on an import. The
+    reference sets lz4 on the columns holding patch sets, documents, namespace entries' bodies
+    and blob bytes where the server has it (PostgreSQL 14+), which is as small and several
+    times faster. *Propose:* say so in D.8 next to the TOAST note.
 
 ## Settled in v0.49
 

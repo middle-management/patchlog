@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- **Postgres: large values compressed with lz4.** Patch sets, documents, namespace entries'
+  bodies and blob bytes were compressed with pglz, Postgres's default, which took most of the
+  time of inserting revisions. The schema now sets lz4 on those columns where the server has it
+  (PostgreSQL 14 or later built with lz4), for databases created before too, once, when opened;
+  values written earlier stay as they are, and reads take either. On the synthetic Demo Play
+  bundle into Postgres 16 (default settings, fsync on, 10,000/s allowance), inserting revisions
+  took 16.3 s and takes 6.9 s, and `patchlog import` of the whole bundle took 39.7 s and takes
+  26.6 s (batches 24.2 s to 19.0 s, of which the allowance's pacing is now 6.5 s); of its
+  content, 19.6 s and 12.0 s.
+
 ## v0.17.0
 
 Bundle import on the shape of a measured deployment. `BenchmarkImportDemoPlay` builds a
