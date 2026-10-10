@@ -7,7 +7,9 @@ synthetic copy from the measurements' document counts and sizes per namespace an
 documents, 1,149 of them schemas in the same namespace as snapshot documents, 48,532 data rows
 most typed by them, 18 blobs. Under a 10,000/s allowance into a fresh SQLite target, `patchlog
 import` of its content (16,355 documents) took 58.6 s with v0.16.1, 23.3 s with v0.16.2 and
-takes 17.2 s; of the whole bundle, 109.9 s, 50.8 s and 44.1 s.
+takes 16.4 s, the importer's peak RSS 2.3 GB, 1.7 GB and 0.7 GB; of the whole bundle, 109.9 s,
+50.8 s and 39.7 s (31.8 s with `-store-compression zstd`), RSS 3.2 GB, 2.8 GB and 1.5 GB. A
+re-run of the whole bundle into the target that has it took 100 s, 12.8 s and takes 10.3 s.
 
 - **Pacing by the allowance's burst.** Concurrent batches waited at the gate as if the bucket held
   nothing to spare, each for the draws of all those in flight: 28.5 s of waits on the whole
@@ -55,7 +57,7 @@ takes 17.2 s; of the whole bundle, 109.9 s, 50.8 s and 44.1 s.
   it; batch requests are the same, byte for byte. x-ref and x-index walks no longer copy the
   instance location at every member. On the whole bundle (`BenchmarkImportDemoPlay`, two runs
   each, alternating), planning took 11.9–15.7 s and takes 5.8–6.3 s, the import 44.8–49.1 s and
-  35.1–37.3 s, and the benchmark process's peak heap, its server's included, went from 3.3–3.4
+  35.1–37.3 s, and the benchmark process's peak heap, its server's included, went from 3.2–3.3
   GiB to 2.4–2.5 GiB; on its content, planning from 7.3–11.6 s to 2.7–3.8 s.
 - **Server: schemas resolved once per write.** A batch's documents typed by the same schemas
   resolved and parsed each for every document and `$ref`; a transaction now keeps what it
