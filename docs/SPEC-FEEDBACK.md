@@ -61,8 +61,9 @@ From implementing v0.49. Each gives what the reference chose.
     submits several batches at once under an allowance: a namespace's batches once those of the
     namespaces it depends on have committed, and within a namespace a batch after those holding
     documents it pins. It orders items by pinned references (schemas included), not by live
-    ones, which name no revision that must exist; so an upstream namespace doesn't depend on a
-    target holding only snapshot documents. Within a cycle of namespaces it puts what upstream
+    ones, which name no revision that must exist, and orders namespaces the same way: a pin of
+    a full document needs its namespace, a snapshot document's pin of a bundled snapshot
+    document its upstream namespace. Within a cycle of namespaces it puts what upstream
     namespaces need first (schemas, full documents), then them. It paces each request before
     it is sent, counting one in flight as drawing no earlier than now: the server draws when
     it handles a request, possibly after later ones. *Propose:* say that dependency order is

@@ -319,7 +319,6 @@ type bdoc struct {
 	idx           map[string]int
 	snap          *Line
 	pinKeys       map[string]bool // over-approximated pinned references, schemas' included (source keys)
-	refNS         map[string]bool
 	rep           *DocReport
 	requiresBad   bool             // requires isn't in the target's chain (the target moved on)
 	blobs         map[string]*Line // its blob lines, by blob id (§G.4.1)
@@ -527,7 +526,7 @@ func (im *importer) load(open Opener) error {
 	for k, info := range im.h.Docs {
 		ns, name, _ := SplitKey(k)
 		d := &bdoc{key: k, ns: ns, name: name, tns: im.mapNS(ns), info: info, requires: im.h.Requires[k],
-			idx: map[string]int{}, pinKeys: map[string]bool{}, refNS: map[string]bool{}, blobs: map[string]*Line{}, refd: map[string]bool{}}
+			idx: map[string]int{}, pinKeys: map[string]bool{}, blobs: map[string]*Line{}, refd: map[string]bool{}}
 		d.rep = &DocReport{Doc: k, Target: Key(d.tns, name), History: info.History, BundleHead: info.Head}
 		im.docs[k] = d
 		if prev, ok := targets[d.tns]; ok && prev != ns {
@@ -599,16 +598,13 @@ func (im *importer) load(open Opener) error {
 	return nil
 }
 
-// scanRefs over-approximates what a document references, for ordering
-// only: every string of the reference form (including $schema and $ref),
-// and those of them that pin a revision.
+// scanRefs over-approximates what a document pins, for ordering only:
+// every string of the reference form that names a revision (including
+// $schema and $ref).
 func (im *importer) scanRefs(d *bdoc, v any) {
 	walkStrings(v, func(_ *strPath, s string) {
-		if r, ok := annot.ParseRefString(s); ok {
-			d.refNS[r.NS] = true
-			if r.Rev != "" {
-				d.pinKeys[Key(r.NS, r.Name)] = true
-			}
+		if r, ok := annot.ParseRefString(s); ok && r.Rev != "" {
+			d.pinKeys[Key(r.NS, r.Name)] = true
 		}
 	})
 }
@@ -1709,22 +1705,15 @@ func (im *importer) planSnapshotTarget(ctx context.Context, d *bdoc) (*item, err
 // --- ordering ------------------------------------------------------------------
 
 // buildNodes groups items by target namespace and orders the namespaces
-// dependencies first (§G.4.4): what a namespace's documents reference
-// (schemas, pinned and live references, as over-approximated by scanning
-// their strings) comes before it, and a namespace's upstream before it.
-// Strongly connected namespaces (reference cycles) go next to each other.
+// dependencies first (§G.4.4): what a namespace's documents pin (schemas
+// included, as over-approximated by scanning their strings) comes before
+// it, and a namespace's upstream before it. A pin of a full document needs
+// that document's namespace; a snapshot document's pin of a bundled
+// snapshot document points upstream once rewritten, and needs that
+// upstream namespace. Live references don't order: they name no revision
+// that must exist. Strongly connected namespaces (pin cycles) go next to
+// each other.
 func (im *importer) buildNodes(items []*item) {
-	srcOfTarget := map[string]string{}
-	upOf := map[string]string{}
-	full := map[string]bool{} // source namespaces with full documents
-	for _, d := range im.docs {
-		srcOfTarget[d.ns] = d.tns
-		if d.info.History == Snapshot {
-			upOf[d.ns] = im.upstreamNS(d.ns)
-		} else {
-			full[d.ns] = true
-		}
-	}
 	for _, it := range items {
 		n := im.nodes[it.ns]
 		if n == nil {
@@ -1732,22 +1721,19 @@ func (im *importer) buildNodes(items []*item) {
 			im.nodes[it.ns] = n
 		}
 		n.items = append(n.items, it)
-		for ns := range it.d.refNS {
-			// An upstream document's pins of snapshot documents point
-			// upstream once rewritten, and its live references don't
-			// order: of a namespace with only snapshot documents it
-			// needs the upstream.
-			if t, ok := srcOfTarget[ns]; ok && (!it.upstream || full[ns]) {
-				n.deps[t] = true
-			}
-			if u, ok := upOf[ns]; ok {
-				n.deps[u] = true
+		for k := range it.d.pinKeys {
+			t := im.docs[k]
+			switch {
+			case t == nil || t == it.d:
+				// Not a document this import brings.
+			case t.info.History == Snapshot && it.d.info.History == Snapshot:
+				n.deps[im.upstreamNS(t.ns)] = true
+			default:
+				n.deps[t.tns] = true
 			}
 		}
-		if !it.upstream {
-			if u, ok := upOf[it.d.ns]; ok {
-				n.deps[u] = true
-			}
+		if !it.upstream && it.d.info.History == Snapshot {
+			n.deps[im.upstreamNS(it.d.ns)] = true
 		}
 	}
 	for _, n := range im.nodes {

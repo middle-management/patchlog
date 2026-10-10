@@ -198,17 +198,19 @@ type Engine struct {
 	hub       *hub
 	rate      *rateLimiter
 	docs      *docCache
-	ids       idCache
-	deks      *dekCache
-	ekeys     epochKeyCache
-	cfgMu     sync.Mutex
-	cfgCache  map[int64]*Config
-	stmts     stmtCache
-	rc        readCache
-	bearers   grantCache
-	stop      chan struct{}
-	bg        sync.WaitGroup
-	closeOnce sync.Once
+	// schemaDocs are parsed schema revisions (schemaRevIn).
+	schemaDocs *parsedCache
+	ids        idCache
+	deks       *dekCache
+	ekeys      epochKeyCache
+	cfgMu      sync.Mutex
+	cfgCache   map[int64]*Config
+	stmts      stmtCache
+	rc         readCache
+	bearers    grantCache
+	stop       chan struct{}
+	bg         sync.WaitGroup
+	closeOnce  sync.Once
 	// grantRoots are the root sub and kid of stored grants (grantref.go).
 	grantRoots grantRootCache
 	// retentionSkipped remembers retention rules already logged as
@@ -296,18 +298,19 @@ func Open(opt Options) (*Engine, error) {
 		opt.RetentionInterval = time.Hour
 	}
 	e := &Engine{
-		db:        db,
-		pg:        pg,
-		opt:       opt,
-		blobs:     blobs,
-		validator: schema.NewValidator(),
-		hub:       newHub(),
-		rate:      newRateLimiter(),
-		docs:      newDocCache(4096),
-		deks:      newDEKCache(4096),
-		cfgCache:  map[int64]*Config{},
-		stop:      make(chan struct{}),
-		started:   opt.Now().UTC(),
+		db:         db,
+		pg:         pg,
+		opt:        opt,
+		blobs:      blobs,
+		validator:  schema.NewValidator(),
+		hub:        newHub(),
+		rate:       newRateLimiter(),
+		docs:       newDocCache(4096),
+		schemaDocs: newParsedCache(4096),
+		deks:       newDEKCache(4096),
+		cfgCache:   map[int64]*Config{},
+		stop:       make(chan struct{}),
+		started:    opt.Now().UTC(),
 	}
 	if err := e.checkKeyStore(); err != nil {
 		db.Close()
@@ -472,6 +475,9 @@ type tx struct {
 	// deps, when set, records what a write's check phase read that a
 	// concurrent write could change (D.3 re-check).
 	deps *writeDeps
+	// schemas are the schema paths resolved in this transaction, per
+	// writer (loadSchema).
+	schemas map[schemaKey]schemaLoaded
 	// rateDrawn, when set, records that a write drew its rate-limit tokens,
 	// so a transaction run again doesn't draw them twice.
 	rateDrawn *bool
@@ -739,6 +745,7 @@ func (e *Engine) invalidate(inv invalidation, seen bool) {
 	}
 	if inv.flushDocs {
 		e.docs.flush()
+		e.schemaDocs.flush()
 	}
 	for _, ns := range inv.nss {
 		e.hub.publish(ns)
@@ -1194,6 +1201,43 @@ type docCache struct {
 
 func newDocCache(max int) *docCache { return &docCache{max: max, m: map[ids.ID][]byte{}} }
 
+// parsedCache keeps parsed schema revisions by id (schemaRevIn), shared and
+// never modified: writes typed by the same schemas parse them once.
+type parsedCache struct {
+	mu  sync.Mutex
+	max int
+	m   map[ids.ID]any
+}
+
+func newParsedCache(max int) *parsedCache { return &parsedCache{max: max, m: map[ids.ID]any{}} }
+
+func (c *parsedCache) get(id ids.ID) (any, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	v, ok := c.m[id]
+	return v, ok
+}
+
+func (c *parsedCache) flush() {
+	c.mu.Lock()
+	c.m = map[ids.ID]any{}
+	c.mu.Unlock()
+}
+
+func (c *parsedCache) put(id ids.ID, v any) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.m) >= c.max {
+		for k := range c.m { // random eviction
+			delete(c.m, k)
+			if len(c.m) < c.max*3/4 {
+				break
+			}
+		}
+	}
+	c.m[id] = v
+}
+
 func (c *docCache) get(id ids.ID) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1234,4 +1278,4 @@ func (c *docCache) flush() {
 
 // FlushCaches drops in-memory document caches, so reads fold from storage
 // (tests, and after restoring archived history).
-func (e *Engine) FlushCaches() { e.docs.flush() }
+func (e *Engine) FlushCaches() { e.docs.flush(); e.schemaDocs.flush() }

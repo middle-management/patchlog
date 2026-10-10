@@ -183,8 +183,12 @@ func TestImportConcurrent(t *testing.T) {
 	}
 	in := func(ns string) func(loggedBatch) bool { return func(b loggedBatch) bool { return b.ns == ns } }
 	other := func(ns string) func(loggedBatch) bool { return func(b loggedBatch) bool { return b.ns != ns } }
+	// A target after its upstream; layouts pin items, which they name
+	// upstream once rewritten; comments name pages live, which doesn't
+	// order them.
 	for _, dep := range [][2]string{
-		{"demo-upstream", "demo"}, {"cat-demo-upstream", "cat-demo"}, {"cat-demo", "demo"}, {"demo", "demo-comments"},
+		{"demo-upstream", "demo"}, {"cat-demo-upstream", "cat-demo"}, {"cat-demo-upstream", "demo-upstream"}, {"cat-demo-upstream", "demo"},
+		{"demo-comments-upstream", "demo-comments"},
 	} {
 		if !before(in(dep[0]), in(dep[1])) {
 			t.Errorf("a batch into %s started before those into %s ended", dep[1], dep[0])

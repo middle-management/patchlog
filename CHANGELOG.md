@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased
+
+Bundle import on the shape of a measured deployment. `BenchmarkImportDemoPlay` builds a
+synthetic copy from the measurements' document counts and sizes per namespace and kind: 64,887
+documents, 1,149 of them schemas in the same namespace as snapshot documents, 48,532 data rows
+typed by them, 18 blobs. Under a 10,000/s allowance into a fresh SQLite target, `patchlog import`
+of its content (16,355 documents) took 58.6 s with v0.16.1, 23.3 s with v0.16.2 and takes 17.5 s;
+of the whole bundle, 109.9 s, 50.8 s and 42.3 s.
+
+- **Pacing by the allowance's burst.** Concurrent batches waited at the gate as if the bucket held
+  nothing to spare, each for the draws of all those in flight: 28.5 s of waits on the whole
+  bundle, now 2.5 s. The gate takes the bucket to hold what answered requests left (from one
+  token when it starts, refilling to the burst), and sends a request once it holds a token more
+  than all those in flight draw.
+- **Namespaces ordered by pins.** Dependencies between namespaces come from pinned references
+  only, as within a namespace: a pin of a full document needs its namespace, a snapshot
+  document's pin of a bundled snapshot document its upstream namespace. Live references, which
+  name no revision that must exist, made one cycle of a deployment's main namespaces, their data
+  and both upstreams, which then went one after another.
+- **Server: schemas resolved once per write.** A batch's documents typed by the same schemas
+  resolved and parsed each for every document and `$ref`; a transaction now keeps what it
+  resolved, per writer. Parsed schema revisions are kept by id apart from the document cache,
+  which a large write fills with its own documents.
+
 ## v0.16.2
 
 Bundle import speed. On a synthetic copy of a CMS deployment's content (6,900 snapshot documents,

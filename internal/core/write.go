@@ -1431,19 +1431,45 @@ func schemaErr(err error, path string) *Error {
 // write's own earlier items, in the path's namespace, or, in a write to a
 // branch, among the drafts in branches of that namespace (loadDraft). A
 // path naming a branch is ErrBranch, whatever the drafts.
+//
+// Within a transaction, which reads one snapshot, a path resolves the same
+// way for the same writer (sc) every time: the result is kept for the
+// transaction (t.schemas), so a batch's documents typed by the same schemas
+// resolve and parse each once, not once for every document and $ref.
 func (t *tx) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (any, error) {
 	if d, ok := pending[ref.Path()]; ok {
 		return d, nil
 	}
 	t.deps.addSchema(ref)
+	key := schemaKey{sc, ref.Path()}
+	if r, ok := t.schemas[key]; ok {
+		return r.doc, r.err
+	}
 	d, err := t.loadSchemaIn(ref, sc)
-	if err == nil || errors.Is(err, schema.ErrBranch) {
-		return d, err
+	if err != nil && !errors.Is(err, schema.ErrBranch) {
+		if dd, ok := t.loadDraft(ref, sc); ok {
+			d, err = dd, nil
+		} else {
+			d = nil
+		}
 	}
-	if dd, ok := t.loadDraft(ref, sc); ok {
-		return dd, nil
+	if t.schemas == nil {
+		t.schemas = map[schemaKey]schemaLoaded{}
 	}
-	return nil, err
+	t.schemas[key] = schemaLoaded{d, err}
+	return d, err
+}
+
+// schemaKey and schemaLoaded are a transaction's resolved schema paths
+// (loadSchema).
+type schemaKey struct {
+	sc   *schemaCtx
+	path string
+}
+
+type schemaLoaded struct {
+	doc any
+	err error
 }
 
 // loadSchemaIn resolves a schema revision path in its own namespace. The
@@ -1504,9 +1530,20 @@ func (t *tx) schemaRevIn(n *nsRow, ref schema.Ref) (any, error) {
 	if row == nil || row.kind == kindTombstone {
 		return nil, schema.ErrUnavailable
 	}
+	// A revision with its patch set is the document its id determines:
+	// parsed once, kept apart from the document cache, which a large write
+	// fills with its own (docBytesAt).
+	if row.patches.Valid {
+		if d, ok := t.e.schemaDocs.get(row.id); ok {
+			return d, nil
+		}
+	}
 	d, err := t.docAt(row)
 	if err != nil {
 		return nil, schema.ErrUnavailable
+	}
+	if row.patches.Valid {
+		t.e.schemaDocs.put(row.id, d)
 	}
 	return d, nil
 }

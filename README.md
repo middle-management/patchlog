@@ -1713,10 +1713,10 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
 - **Concurrent batches.** Under an allowance a backfill submits up to `-concurrency` batches at
   once (default 4), in dependency order all the same: a namespace's batches start once those of
   the namespaces it depends on have committed, and within a namespace a batch waits for one in
-  flight that it goes on with or whose documents it pins. Items are ordered by what they pin
-  (schemas included), not by live references. Each request waits at its namespace's gate until
-  the allowance's bucket has refilled what the requests before it drew. A request in flight
-  counts as drawing no earlier than now, and a namespace has no more batches in flight than the
+  flight that it goes on with or whose documents it pins. Items and namespaces are ordered by
+  what they pin (schemas included), not by live references. Each request waits at its
+  namespace's gate until the allowance's bucket, as answered requests left it, holds a token
+  more than the requests in flight draw. A namespace has no more batches in flight than the
   allowance's burst holds the draws of, nor, where the allowance ends, than its rate draws in
   half the minute before `until`. The first failure stops the rest. Without an allowance,
   batches go one at a time.
