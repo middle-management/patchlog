@@ -163,6 +163,7 @@ func (t *tx) recheckIn(p *writePlan, d *writeDeps, nss map[int64]*nsRow) (*nsRow
 		}
 	}
 	sc := &schemaCtx{a: p.a, target: target, creds: p.req.anyCreds()}
+	t.prefetchSchemas(d.schemas)
 	for _, ref := range d.schemas {
 		if _, err := t.loadSchema(ref, sc, nil); err != nil {
 			return nil, false

@@ -96,6 +96,9 @@ func (c *stmtCache) close() {
 // statement caching to pgx, which prepares each query once per connection.
 
 func (t *tx) QueryRow(q string, args ...any) *sql.Row {
+	if h := t.e.onStatement; h != nil {
+		h(q, args)
+	}
 	if t.e.pg {
 		return t.Tx.QueryRow(rebind(q), pgArgs(args)...)
 	}
@@ -106,6 +109,9 @@ func (t *tx) QueryRow(q string, args ...any) *sql.Row {
 }
 
 func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
+	if h := t.e.onStatement; h != nil {
+		h(q, args)
+	}
 	if t.e.pg {
 		return t.Tx.Query(rebind(q), pgArgs(args)...)
 	}
@@ -116,6 +122,9 @@ func (t *tx) Query(q string, args ...any) (*sql.Rows, error) {
 }
 
 func (t *tx) Exec(q string, args ...any) (sql.Result, error) {
+	if h := t.e.onStatement; h != nil {
+		h(q, args)
+	}
 	t.wrote()
 	if t.e.pg {
 		return t.Tx.Exec(rebind(q), pgArgs(args)...)

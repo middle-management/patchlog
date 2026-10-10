@@ -742,6 +742,8 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// is looked up among drafts in branches of that namespace.
 	pending := map[string]any{}
 	sc := &schemaCtx{a: a, target: n, creds: req.anyCreds()}
+	pns := t.pendingNS(n)
+	t.prefetchSchemas(pinnedSchemas(st, pns))
 	for _, s := range st {
 		for _, step := range s.steps {
 			if step.del || step.sealed {
@@ -753,7 +755,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 				break
 			}
 			step.typed = typed
-			if k := t.pendingKey(n, s.Resource, step.id); k != "" {
+			if k := pendingKey(pns, s.Resource, step.id); k != "" {
 				pending[k] = step.doc
 			}
 		}
@@ -1394,13 +1396,44 @@ func (t *tx) validateDoc(doc any, sc *schemaCtx, pending map[string]any) (string
 			if err != nil {
 				return "", schemaErr(err, r.Path())
 			}
-			queue = append(queue, schema.Refs(d)...)
+			queue = append(queue, t.schemaRefs(r, d, sc, pending)...)
 		}
 	}
 	if err := t.e.validator.Validate(doc, load); err != nil {
 		return "", schemaErr(err, s)
 	}
 	return s, nil
+}
+
+// pinnedSchemas lists the schema revisions that the documents of a write's
+// steps pin by $schema, for step 5 to read them ahead (prefetchSchemas),
+// leaving out the paths of the write's own documents (pendingKey under
+// pns): loadSchema finds those among them, without reading their
+// namespace, when they come first. A schema document's $refs, and the
+// $ref closures, are resolved as they are reached (validateDoc).
+func pinnedSchemas(st []*itemState, pns string) []schema.Ref {
+	own := map[string]bool{}
+	for _, s := range st {
+		for _, step := range s.steps {
+			if !step.del && !step.sealed {
+				own[pendingKey(pns, s.Resource, step.id)] = true
+			}
+		}
+	}
+	var refs []schema.Ref
+	for _, s := range st {
+		for _, step := range s.steps {
+			if step.del || step.sealed {
+				continue
+			}
+			m, _ := step.doc.(map[string]any)
+			sv, _ := m["$schema"].(string)
+			if r, ok := schema.ParseRef(sv); ok && !own[r.Path()] {
+				refs = append(refs, r)
+			}
+		}
+	}
+	return refs
 }
 
 func schemaErr(err error, path string) *Error {
@@ -1462,7 +1495,7 @@ func (t *tx) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (
 	if t.schemas == nil {
 		t.schemas = map[schemaKey]schemaLoaded{}
 	}
-	t.schemas[key] = schemaLoaded{d, err}
+	t.schemas[key] = schemaLoaded{doc: d, err: err}
 	return d, err
 }
 
@@ -1476,6 +1509,25 @@ type schemaKey struct {
 type schemaLoaded struct {
 	doc any
 	err error
+	// refs is schema.Refs(doc), once hasRefs (schemaRefs).
+	refs    []schema.Ref
+	hasRefs bool
+}
+
+// schemaRefs is schema.Refs of d, the schema loadSchema resolved ref to,
+// kept with it for the transaction (t.schemas): every document typed by a
+// schema walks its $ref closure (validateDoc).
+func (t *tx) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string]any) []schema.Ref {
+	key := schemaKey{sc, ref.Path()}
+	l, ok := t.schemas[key]
+	if _, own := pending[key.path]; own || !ok {
+		return schema.Refs(d)
+	}
+	if !l.hasRefs {
+		l.refs, l.hasRefs = schema.Refs(d), true
+		t.schemas[key] = l
+	}
+	return l.refs
 }
 
 // loadSchemaIn resolves a schema revision path in its own namespace. The
@@ -1484,7 +1536,7 @@ type schemaLoaded struct {
 // namespaces (§7.5). A revision it can't read there is ErrForbidden, which
 // falls through to drafts in a branch (loadSchema), as an absent one does.
 func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
-	n := t.nsByName(ref.NS)
+	n := t.schemaNS(ref.NS)
 	if n == nil || n.purged {
 		return nil, schema.ErrUnavailable
 	}
@@ -1518,6 +1570,115 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 		return nil, schema.ErrForbidden
 	}
 	return d, nil
+}
+
+// schemaNS is nsByName for the namespace of a schema path (loadSchemaIn),
+// which the transaction remembers (memo.schemaNS): a batch whose documents
+// are typed by many schemas of one namespace reads its row once, not once
+// per schema.
+func (t *tx) schemaNS(name string) *nsRow {
+	if n, ok := t.memo.schemaNS[name]; ok {
+		// Taking the lock (a row read while namespaces weren't locked,
+		// noLock) forgets the row, which is then read again under it.
+		t.lockNS(n.id, lockShared)
+		if n, ok := t.memo.schemaNS[name]; ok {
+			t.deps.addNS(&n)
+			return &n
+		}
+	}
+	n := t.nsByName(name)
+	if n != nil {
+		t.memoSchemaNS(n)
+	}
+	return n
+}
+
+func (t *tx) memoSchemaNS(n *nsRow) {
+	if t.memo.schemaNS == nil {
+		t.memo.schemaNS = map[string]nsRow{}
+	}
+	t.memo.schemaNS[n.name] = *n
+}
+
+// prefetchSchemas reads ahead what resolving refs, schema revision paths,
+// reads in storage (loadSchemaIn): the rows of their namespaces in one
+// statement, then for each namespace the rows of the resources they name
+// and of those resources' heads in two more (prefetchHeads). On Postgres
+// every namespace's lock is taken first, shared as nsByName takes it and
+// in ascending key order, and the rows are read once all are held
+// (pglock.go). loadSchemaIn then answers a path whose revision is its
+// resource's head from the transaction's memo; an older revision is looked
+// up in the resource's ancestry, and a schema's $ref closure resolved, as
+// before. (A batch whose documents were typed by a thousand schemas of one
+// namespace read three rows for each, a statement each: the namespace's,
+// the resource's and its head's.)
+func (t *tx) prefetchSchemas(refs []schema.Ref) {
+	byNS := map[string]map[string]bool{}
+	for _, r := range refs {
+		if byNS[r.NS] == nil {
+			byNS[r.NS] = map[string]bool{}
+		}
+		byNS[r.NS][r.Name] = true
+	}
+	if len(byNS) == 0 {
+		return
+	}
+	nsNames := sortedKeys(byNS)
+	if t.locking() {
+		want := map[int32]lockMode{}
+		var unknown []string
+		for _, name := range nsNames {
+			if v, ok := t.e.ids.nss.Load(name); ok {
+				want[lockKey(v.(int64))] = lockShared
+			} else {
+				unknown = append(unknown, name)
+			}
+		}
+		if len(unknown) > 0 {
+			rows, err := t.Query(`SELECT ns, name FROM namespaces WHERE `+t.e.inArray("name", "text"), t.e.arrayArg(unknown))
+			t.must(err)
+			for rows.Next() {
+				var id int64
+				var name string
+				t.must(rows.Scan(&id, &name))
+				want[lockKey(id)] = lockShared
+				if !t.dirty {
+					t.e.ids.nss.Store(name, id)
+				}
+			}
+			t.must(rows.Err())
+			rows.Close()
+		}
+		t.lockAll(want)
+	}
+	var read []string
+	for _, name := range nsNames {
+		if _, ok := t.memo.schemaNS[name]; !ok {
+			read = append(read, name)
+		}
+	}
+	if len(read) > 0 {
+		rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE `+t.e.inArray("name", "text"), t.e.arrayArg(read))
+		t.must(err)
+		for rows.Next() {
+			n, err := scanNS(rows)
+			t.must(err)
+			if !n.isShadow() { // never a path's (nsByName)
+				t.memoSchemaNS(n)
+			}
+		}
+		t.must(rows.Err())
+		rows.Close()
+	}
+	for _, name := range nsNames {
+		n := t.schemaNS(name) // as loadSchemaIn reads it (writeDeps)
+		// loadSchemaIn reads no resource of a namespace that is unknown,
+		// purged, a branch or e2e.
+		if n == nil || n.purged || n.isBranch() || t.isE2E(n) {
+			continue
+		}
+		t.prefetchHeads(n, sortedKeys(byNS[name]), nil)
+	}
 }
 
 // schemaRevIn loads revision ref.Rev of resource ref.Name in n, a

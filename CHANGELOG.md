@@ -11,6 +11,17 @@
   took 16.3 s and takes 6.9 s, and `patchlog import` of the whole bundle took 39.7 s and takes
   26.6 s (batches 24.2 s to 19.0 s, of which the allowance's pacing is now 6.5 s); of its
   content, 19.6 s and 12.0 s.
+- **A batch's schemas read ahead.** A write resolved each distinct schema path its documents
+  name with three statements of its own, for the namespace, the resource and its head: a batch
+  of the synthetic Demo Play bundle, whose data rows are typed by 1,149 schemas of one
+  namespace, resolved about 260 on average. Step 5 now reads the revisions the documents pin by
+  `$schema` ahead: the rows of their namespaces in one statement (on Postgres once their locks
+  are held, taken in key order), then each namespace's resources and heads in two more, and the
+  transaction keeps those namespace rows. Importing the whole bundle into Postgres ran 1.10
+  million statements and runs 0.91 million (64,717 reads of a namespace by name are 428, 64,447
+  of a resource by name 185, 64,289 of a revision 27, beside 333 new ones reading several at
+  once); the server's CPU time in batches went from 19.3 s to 15.1 s, on SQLite from 25.8 s to
+  22.4 s.
 
 ## v0.17.0
 

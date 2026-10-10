@@ -14,12 +14,13 @@ import (
 //     transactions that hadn't written yet, so never a row of their own
 //     that a rollback could take back. (Neither is ever deleted.)
 //   - resource and revision rows, which the check and the insert each read
-//     several times, and resources found missing (and, in a read
-//     transaction, namespace rows: a branch page resolves through its
-//     bases name by name). A transaction keeps them (tx.memo) until it
-//     writes or takes another lock: on Postgres a write transaction sees
-//     each statement's own snapshot, and what it reads after a lock must
-//     be as of that lock (pglock.go).
+//     several times, and resources found missing (and namespace rows: in
+//     a read transaction, as a branch page resolves through its bases
+//     name by name; in any, the namespaces of the schema paths a batch's
+//     documents name, schemaNS). A transaction keeps them (tx.memo) until
+//     it writes or takes another lock: on Postgres a write transaction
+//     sees each statement's own snapshot, and what it reads after a lock
+//     must be as of that lock (pglock.go).
 
 // idCache maps immutable names to ids and back.
 type idCache struct {
@@ -28,8 +29,8 @@ type idCache struct {
 	nss         sync.Map // string -> int64
 }
 
-// memo is a transaction's resource and revision rows, and in a read
-// transaction its namespace rows. A resource found
+// memo is a transaction's resource and revision rows, and namespace rows
+// (in a read transaction, or for schema resolution). A resource found
 // missing is remembered too (nil): a create looks its resource up again
 // and again.
 type memo struct {
@@ -46,6 +47,14 @@ type memo struct {
 	// under it: its own config writes, freezes, purges and appends, and on
 	// Postgres other writers' appends between its statements.
 	ns map[int64]nsRow
+	// schemaNS is namespace rows by name for schema resolution (schemaNS),
+	// in a write transaction too: on Postgres, of a row read once its
+	// namespace's lock is held, other writers change only the head, which
+	// their appends move under the lock shared (pglock.go) and schema
+	// resolution never reads; in SQLite a write transaction is the only
+	// writer. What the transaction writes itself, or a lock it takes,
+	// forgets the row like any other.
+	schemaNS map[string]nsRow
 }
 
 type headAtKey struct{ res, asOf int64 }

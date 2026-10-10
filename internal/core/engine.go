@@ -246,6 +246,11 @@ type Engine struct {
 	// afterWriteLock, if set, is called by resource writes and batches
 	// once they hold the write lock, with the namespace (tests).
 	afterWriteLock func(ns string)
+	// onStatement, if set, is called with every statement a transaction
+	// runs through tx's QueryRow, Query and Exec, as written, and its
+	// arguments (tests that count statements). It is set right after Open,
+	// with no background loop running.
+	onStatement func(q string, args []any)
 	// Group commit (groupcommit.go): the queues, and for tests, noSolo
 	// queues even a write that finds its namespace idle, groupStart is
 	// called in a group's transaction once it holds its locks, and

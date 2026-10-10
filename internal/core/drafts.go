@@ -309,16 +309,25 @@ func (t *tx) loadDraft(ref schema.Ref, sc *schemaCtx) (any, bool) {
 	return nil, false
 }
 
-// pendingKey is the schema path under which a step's document written in
-// namespace n may be referenced by later items of the same write (§7.5):
-// its own path, or in a local branch the path of its root, as a draft
-// serving the branch itself (§6.1). "" if none.
-func (t *tx) pendingKey(n *nsRow, resource string, id ids.ID) string {
-	ns := n.name
-	if n.isBranch() {
-		if ns = t.draftRoot(n); ns == "" || t.isE2E(n) {
-			return ""
-		}
+// pendingNS is the namespace of the schema paths under which the documents
+// a write's steps write in namespace n may be referenced by later items of
+// the same write (§7.5): n itself, or in a local branch its root, as
+// drafts serving the branch itself (§6.1). "" if none.
+func (t *tx) pendingNS(n *nsRow) string {
+	if !n.isBranch() {
+		return n.name
+	}
+	if ns := t.draftRoot(n); ns != "" && !t.isE2E(n) {
+		return ns
+	}
+	return ""
+}
+
+// pendingKey is the schema path of a step's document under pendingNS ns,
+// or "" if ns is.
+func pendingKey(ns, resource string, id ids.ID) string {
+	if ns == "" {
+		return ""
 	}
 	return "/r/" + ns + "/" + resource + "/rev/" + id.String()
 }
