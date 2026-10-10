@@ -1,9 +1,12 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
@@ -118,4 +121,91 @@ func TestSnapshotCounts(t *testing.T) {
 	if string(doc) != `{"n":0}` {
 		t.Fatalf("c at its genesis: %s", doc)
 	}
+}
+
+// A whole-document genesis is its own snapshot (D.4): a create stores its
+// document once, in its patch set, with no heads row, and a read cuts it
+// from there; the head moving on writes a heads row again.
+func TestGenesisHead(t *testing.T) {
+	t.Parallel()
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	mkNS(t, e, "n", map[string]any{"read": "public"})
+	ctx := context.Background()
+	headRow := func(name string) bool {
+		t.Helper()
+		var n int
+		if err := e.read(ctx, func(t *tx) error {
+			return t.QueryRow(`SELECT COUNT(*) FROM heads h JOIN resources r ON r.res = h.res WHERE r.name = ?`, name).Scan(&n)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return n > 0
+	}
+	docAt := func(name, id string) string {
+		t.Helper()
+		e.FlushCaches()
+		rev, err := e.ResourceRev(ctx, "n", name, id, Credentials{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return string(rev.Doc)
+	}
+	a0, err := put(e, "n", "a", "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headRow("a") || docAt("a", a0) != `{"n":0}` {
+		t.Fatalf("a created: heads row %v, document %s", headRow("a"), docAt("a", a0))
+	}
+	a1, err := put(e, "n", "a", a0, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !headRow("a") || docAt("a", a1) != `{"n":1}` || docAt("a", a0) != `{"n":0}` {
+		t.Fatal("a appended")
+	}
+	// A create and a delete in one item: the tombstone's document is the
+	// genesis's.
+	r := who
+	r.NS = "n"
+	res, err := e.Batch(ctx, r, []Item{{Resource: "b", IfNoneMatch: true, Steps: []Step{
+		{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"s": "x\"]}"}}}}, {Delete: true}}}}, nil, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if headRow("b") || docAt("b", res.Items[0].IDs[0]) != `{"s":"x\"]}"}` {
+		t.Fatalf("b: heads row %v", headRow("b"))
+	}
+}
+
+// valueEnd finds the end of the value a canonical whole-document genesis
+// adds as json.Valid would tell it: a patch set with anything after the
+// value, another op or member, is not a whole document.
+func FuzzWholeDocument(f *testing.F) {
+	for _, s := range []string{`{"a":[1,{"b":"]}"}]}`, `"x\\\"}]"`, `1`, `null`, `[]`, `{}`, `"\\\\"`, `{"a":"é"}`} {
+		f.Add(`[{"op":"add","path":"","value":` + s + `}]`)
+		f.Add(`[{"op":"add","path":"","value":` + s + `},{"op":"add","path":"/z","value":` + s + `}]`)
+		f.Add(`[{"op":"add","path":"","value":` + s + `,"x":1}]`)
+	}
+	f.Fuzz(func(t *testing.T, in string) {
+		v, err := jsonv.Parse([]byte(in))
+		if err != nil {
+			return
+		}
+		canon := jsonv.Canonical(v)
+		want := []byte(nil)
+		if bytes.HasPrefix(canon, genesisPrefix) && bytes.HasSuffix(canon, []byte("}]")) {
+			if v := canon[len(genesisPrefix) : len(canon)-2]; json.Valid(v) {
+				want = v
+			}
+		}
+		if got := wholeDocument(canon); !bytes.Equal(got, want) || (got == nil) != (want == nil) {
+			t.Fatalf("%s: %q, want %q", canon, got, want)
+		}
+	})
 }

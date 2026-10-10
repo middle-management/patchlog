@@ -28,6 +28,14 @@ takes 17.2 s; of the whole bundle, 109.9 s, 50.8 s and 44.1 s.
   documents and by name for live references, and requires a left-out snapshot document that
   they pin to be in its upstream namespace as the bundle has it. Staged imports, the namespaces
   others reference first, leave the target as one whole import does.
+- **Server: a create stores its document once.** A resource whose head is its whole-document
+  genesis, as after every create and every snapshot an import writes (upstream and target), kept
+  the document twice: in its patch set and in `heads`. Reads cut it from the patch set, before
+  looking for a heads row, with a scan for the value's end instead of a validation, and writes
+  store no heads row for it. On the full synthetic bundle (in-process, file-backed SQLite) the
+  database is 32% smaller, the write-locked phase uses 16% less CPU and the batches take 14% less
+  time; cold reads of such documents are faster. Databases from earlier versions keep their heads
+  rows until the head moves, and earlier versions read the new ones, folding from the genesis.
 - **Server: schemas resolved once per write.** A batch's documents typed by the same schemas
   resolved and parsed each for every document and `$ref`; a transaction now keeps what it
   resolved, per writer. Parsed schema revisions are kept by id apart from the document cache,

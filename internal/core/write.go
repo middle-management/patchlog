@@ -1960,7 +1960,8 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		// heads caches the last live document, which reads and restores
 		// need, but only for small documents (D.4): rewriting a large one on
 		// every save costs its whole size each time. Larger ones fold from
-		// snapshots.
+		// snapshots. Nor for a whole-document genesis, which is its own
+		// snapshot (docBytesAt): a create stores its document once.
 		var doc []byte
 		switch {
 		case it.e2e:
@@ -1972,7 +1973,8 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		default:
 			doc = jsonv.Canonical(final.doc)
 		}
-		if !it.e2e && len(doc) <= t.e.opt.HeadSnapshotMax {
+		genesis := it.lastLive != nil && it.lastLive.parentID == nil && genesisDocCanon(it.lastLive) != nil
+		if !it.e2e && !genesis && len(doc) <= t.e.opt.HeadSnapshotMax {
 			heads = append(heads, []any{it.res, it.lastLiveSeq, t.putDoc("heads", it.res, it.lastLiveSeq, doc)})
 		} else if it.own != nil {
 			dropHeads = append(dropHeads, []any{it.res})

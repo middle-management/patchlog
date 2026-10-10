@@ -418,10 +418,48 @@ func wholeDocument(canon []byte) []byte {
 	}
 	// The op has no member after value: what follows the prefix is one
 	// value.
-	if v := canon[len(genesisPrefix) : len(canon)-2]; json.Valid(v) {
+	if v := canon[len(genesisPrefix) : len(canon)-2]; valueEnd(v) == len(v) {
 		return v
 	}
 	return nil
+}
+
+// valueEnd is the offset just past the JSON value b starts with, or -1.
+// b is canonical JSON the server stored, so it needs only to find where
+// the value ends, by nesting and strings, not to validate it; a scalar is
+// checked whole.
+func valueEnd(b []byte) int {
+	if len(b) == 0 {
+		return -1
+	}
+	if c := b[0]; c != '{' && c != '[' && c != '"' {
+		if json.Valid(b) {
+			return len(b)
+		}
+		return -1
+	}
+	depth := 0
+	for i := 0; i < len(b); i++ {
+		switch b[i] {
+		case '"':
+			for i++; i < len(b) && b[i] != '"'; i++ {
+				if b[i] == '\\' {
+					i++
+				}
+			}
+			if i >= len(b) {
+				return -1
+			}
+		case '[', '{':
+			depth++
+		case ']', '}':
+			depth--
+		}
+		if depth == 0 {
+			return i + 1
+		}
+	}
+	return -1
 }
 
 func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
@@ -439,6 +477,14 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 			if b, ok := t.e.docs.get(cur.id); ok && cur.patches.Valid {
 				base = b
 				break
+			}
+			// A genesis that adds the whole document is its snapshot (D.4),
+			// and has no heads row of its own (insertItemsBy).
+			if !cur.parentSeq.Valid && cur.patches.Valid {
+				if b := wholeDocument(t.patchesOf(cur)); b != nil {
+					base = b
+					break
+				}
 			}
 			// A heads row may belong to another resource than cur (a
 			// branch's head whose last live document is the base's): its
@@ -469,12 +515,6 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 			break
 		}
 		cur = t.rev(cur.parentSeq.Int64)
-	}
-	if g := len(stack) - 1; base == nil && g >= 0 && !stack[g].parentSeq.Valid {
-		// A genesis that adds the whole document is its snapshot (D.4).
-		if b := wholeDocument(t.patchesOf(stack[g])); b != nil {
-			base, stack = b, stack[:g]
-		}
 	}
 	var doc any
 	exists := base != nil
