@@ -313,6 +313,12 @@ func withoutNonce(v any) any {
 // a sealed namespace (§E.2.5), or one that requires nonces (§C.7), both
 // marked in sealedT. Full-history lines are never changed: their ids are
 // the source's.
+// newNonce is the source of the $nonce values nonced adds; tests that
+// compare the requests of two imports make it deterministic
+// (export_test.go), since other users of crypto/rand in the process, such
+// as a database driver's authentication, would shift a shared source.
+var newNonce = seal.NewNonce
+
 func nonced(steps []client.Step) []client.Step {
 	out := make([]client.Step, len(steps))
 	for i, s := range steps {
@@ -322,7 +328,7 @@ func nonced(steps []client.Step) []client.Step {
 		}
 		noRawPatchSet(s.Patches)
 		ps, _ := s.Patches.([]any)
-		out[i].Patches = append(append([]any{}, ps...), map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()})
+		out[i].Patches = append(append([]any{}, ps...), map[string]any{"op": "add", "path": seal.NoncePath, "value": newNonce()})
 	}
 	return out
 }

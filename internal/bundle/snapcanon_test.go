@@ -184,7 +184,8 @@ type goldenStep struct {
 // whole, with take and replay resolutions, into a namespace that requires
 // nonces and a sealed one, signed, and a re-run.
 // Not parallel: the nonces the imports generate come from the same
-// deterministic source in both (cryptotest.SetGlobalRandom).
+// deterministic sequence in both (DeterministicNonces; the rest of the
+// importer's randomness from cryptotest.SetGlobalRandom).
 func TestImportSnapshotCanonical(t *testing.T) {
 	g := &goldenSet{t: t, blob: []byte("blob one"), blb2: []byte("blob two")}
 	g.schemaID = must(client.ExpectedRevision("", client.GenesisPatches(g.schema())))
@@ -257,6 +258,7 @@ func TestImportSnapshotCanonical(t *testing.T) {
 				bundle.KeepSnapshotTrees(&opt)
 			}
 			cryptotest.SetGlobalRandom(t, 7)
+			bundle.DeterministicNonces(t, uint64(7+len(steps))) // each import its own
 			log.take()
 			rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), opt)
 			if err != nil {
