@@ -36,6 +36,18 @@ takes 17.2 s; of the whole bundle, 109.9 s, 50.8 s and 44.1 s.
   database is 32% smaller, the write-locked phase uses 16% less CPU and the batches take 14% less
   time; cold reads of such documents are faster. Databases from earlier versions keep their heads
   rows until the head moves, and earlier versions read the new ones, folding from the genesis.
+- **Server: compressed patch sets, opt-in (SQLite).** `patchlog serve -store-compression zstd`
+  stores the patch sets of namespaces without encryption zstd-compressed, from 1 KiB and when
+  that saves an eighth. They are compressed in the write's check phase, outside the write lock;
+  ids, limits and reads stay over the canonical JSON, and heads, snapshots and encrypted
+  namespaces are never compressed. On the full synthetic bundle (in-process, file-backed
+  SQLite, on top of the change above) the database is 62% smaller, the write-locked phase uses
+  17% less CPU and the batches take 12% less time; an uncached read of a created document takes
+  47% longer at 15 KiB, 23% at 100 KiB. The synthetic content sets the ratio; real content may
+  compress less. It is off by default because it is a one-way format change: earlier versions
+  answer 500 for every resource with a compressed patch set, and turning it off again doesn't
+  decompress them. The first start with it on records it in the database, and a start without
+  it then logs that. Postgres refuses it: TOAST compresses there.
 - **Snapshot documents held as their canonical bytes.** The importer kept every snapshot document
   as a parsed tree for the whole import, 1.3 to 5 times the size of its canonical form, though
   after planning it only serialised it again. It now keeps the canonical bytes, which the bundle

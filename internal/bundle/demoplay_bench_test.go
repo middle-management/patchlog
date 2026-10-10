@@ -342,6 +342,10 @@ func demoPlay(b *testing.B, data bool) []byte {
 // requests sent and the peak heap of the process, the server's included:
 //
 //	go test ./internal/bundle -run '^$' -bench ImportDemoPlay -benchtime 1x
+//
+// PATCHLOG_DEMOPLAY_NOAGAIN=1 skips the /again variants, and
+// PATCHLOG_BENCH_DB_DIR stores the deployment in a SQLite file there
+// (newDeployment).
 func BenchmarkImportDemoPlay(b *testing.B) {
 	allowance := map[string]any{"read": "public", "allowances": []any{map[string]any{"sub": "alice", "kid": "any",
 		"bucket": map[string]any{"rate": 10000, "burst": 20000}}}}
@@ -349,6 +353,11 @@ func BenchmarkImportDemoPlay(b *testing.B) {
 		name := map[bool]string{false: "content", true: "full"}[data]
 		for _, variant := range []string{"", "/again"} {
 			b.Run(name+variant, func(b *testing.B) {
+				if variant != "" && os.Getenv("PATCHLOG_DEMOPLAY_NOAGAIN") != "" {
+					// -bench 'ImportDemoPlay/full$' also matches full/again,
+					// whose untimed first import a CPU profile would count.
+					b.Skip("PATCHLOG_DEMOPLAY_NOAGAIN")
+				}
 				b.StopTimer()
 				bb := demoPlay(b, data)
 				var planning, batches, total float64

@@ -31,6 +31,9 @@ package core
 // reads handle a mix (a namespace being encrypted, rows restored from an
 // archive). Ids are computed over the plaintext canonical patches as always.
 // The in-memory document cache keeps plaintext: the origin is trusted.
+// The plaintext of an encrypted row is canonical JSON, never a compressed
+// patch set (0x02, compress.go), which only namespaces without encryption
+// store.
 
 import (
 	"bufio"
@@ -319,12 +322,18 @@ func (t *tx) deleteDEKs(where string, args ...any) {
 
 // --- stored values ----------------------------------------------------------
 
-// putPatches is the stored form of a revision's canonical patch set.
-func (t *tx) putPatches(res int64, id ids.ID, canon []byte) any {
-	if t.resLevel(res) < levelAtRest {
-		return t.e.blobArg(canon)
+// putPatches is the stored form of a revision's canonical patch set:
+// packed, its compressed form if the check phase made one (packPlan, never
+// in an encrypted namespace), else canon itself or its encryption.
+func (t *tx) putPatches(res int64, id ids.ID, canon, packed []byte) any {
+	if t.resLevel(res) >= levelAtRest {
+		// What is sealed is canonical JSON (§E.1).
+		return sealRow(t.dek(res, true), revAAD(res, id), canon)
 	}
-	return sealRow(t.dek(res, true), revAAD(res, id), canon)
+	if packed != nil {
+		return packed // a BLOB, in SQLite too
+	}
+	return t.e.blobArg(canon)
 }
 
 // putDoc is the stored form of a document in heads or snapshots.
@@ -345,13 +354,21 @@ func (t *tx) docOf(table string, res, seq int64, raw string) []byte {
 	return t.openValue(res, raw, func() []byte { return docAAD(table, res, seq) })
 }
 
+// openValue returns the canonical JSON of a stored value: decrypted if it
+// is encrypted, then decompressed if it is compressed (compress.go).
 func (t *tx) openValue(res int64, raw string, aad func() []byte) []byte {
-	if !isSealed(raw) {
-		return []byte(raw)
+	b := []byte(raw)
+	if isSealed(raw) {
+		var err error
+		if b, err = openRow(t.dek(res, false), aad(), b); err != nil {
+			panic(encUnavailable(fmt.Sprintf("an encrypted row of resource %d does not decrypt: %v", res, err)))
+		}
 	}
-	b, err := openRow(t.dek(res, false), aad(), []byte(raw))
-	if err != nil {
-		panic(encUnavailable(fmt.Sprintf("an encrypted row of resource %d does not decrypt: %v", res, err)))
+	if isPacked(b) {
+		var err error
+		if b, err = t.e.comp.unpack(b); err != nil {
+			panic(fmt.Errorf("a compressed row of resource %d does not decompress: %w", res, err))
+		}
 	}
 	return b
 }
@@ -457,7 +474,9 @@ func (t *tx) encryptResource(res int64) {
 	}
 	rows.Close()
 	for _, r := range revs {
-		_, err := t.Exec(`UPDATE revisions SET patches = ? WHERE seq = ?`, t.putPatches(res, ids.FromBytes(r.id), []byte(r.val)), r.seq)
+		// A compressed patch set is sealed decompressed (compress.go).
+		canon := t.openValue(res, r.val, nil)
+		_, err := t.Exec(`UPDATE revisions SET patches = ? WHERE seq = ?`, t.putPatches(res, ids.FromBytes(r.id), canon, nil), r.seq)
 		t.must(err)
 	}
 	for _, table := range []string{"heads", "snapshots"} {
@@ -477,7 +496,7 @@ func (t *tx) encryptResource(res int64) {
 		}
 		rows.Close()
 		for _, d := range docs {
-			_, err := t.Exec(`UPDATE `+table+` SET doc = ? WHERE res = ? AND seq = ?`, t.putDoc(table, res, d.seq, []byte(d.val)), res, d.seq)
+			_, err := t.Exec(`UPDATE `+table+` SET doc = ? WHERE res = ? AND seq = ?`, t.putDoc(table, res, d.seq, t.openValue(res, d.val, nil)), res, d.seq)
 			t.must(err)
 		}
 	}

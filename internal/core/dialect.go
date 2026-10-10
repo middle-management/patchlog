@@ -22,7 +22,8 @@ import (
 //     the smallint flag columns the two schemas share;
 //   - values that are canonical JSON or, encrypted at rest, binary
 //     (revisions.patches, heads.doc, snapshots.doc, grants.blocks): TEXT
-//     or BLOB in SQLite's dynamic typing, bytea on Postgres (blobArg);
+//     or BLOB in SQLite's dynamic typing, bytea on Postgres (blobArg). A
+//     compressed patch set (SQLite only, compress.go) is a BLOB;
 //   - array arguments, which SQLite reads as JSON (inArray);
 //   - constraint violations (isConflict);
 //   - transactions and write serialisation (engine.go).

@@ -546,7 +546,7 @@ func (e *Engine) RestoreResource(ctx context.Context, ns, name string, entries f
 				out.Skipped++
 				return nil
 			}
-			_, err = t.Exec(`UPDATE revisions SET patches = ? WHERE seq = ?`, t.putPatches(own.id, row.id, canon), row.seq)
+			_, err = t.Exec(`UPDATE revisions SET patches = ? WHERE seq = ?`, t.putPatches(own.id, row.id, canon, nil), row.seq)
 			t.must(err)
 			out.Restored++
 			return nil

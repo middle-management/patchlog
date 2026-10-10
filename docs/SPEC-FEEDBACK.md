@@ -73,6 +73,14 @@ From implementing v0.49. Each gives what the reference chose.
     of what the genesis holds. The reference counts a genesis that adds the whole document as a
     snapshot: the count starts after it, and a read there cuts the document from its canonical
     patch set. *Propose:* say so in D.4.
+14. **Compressed patch sets** (D.2, D.8 "Exact bytes"). The reference can store, on SQLite and
+    as an opt-in (`-store-compression zstd`), the patch set of a namespace without encryption as
+    `0x02` followed by a zstd frame of its canonical JSON, compressed before the write lock;
+    ids, limits and D.4's 64 KiB stay over the canonical bytes, which reads decompress and
+    serve. Encrypted namespaces never compress, so the plaintext of a sealed row stays
+    canonical JSON. Earlier versions can't read such rows. *Propose:* allow a stored form
+    other than canonical JSON in D.2 as long as nothing observable changes, and say that D.8's
+    exact bytes are what reads serve, not necessarily what is stored.
 
 ## Settled in v0.49
 

@@ -1152,7 +1152,7 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		case e.Kind == "tombstone":
 			kind = kindTombstone
 		case e.HasPatches:
-			patches = t.putPatches(res, id, jsonv.Canonical(e.Patches))
+			patches = t.putPatches(res, id, jsonv.Canonical(e.Patches), nil)
 		}
 		if kind == kindRev && !ch.opaque {
 			if dm, ok := doc.(map[string]any); ok {

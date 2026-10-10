@@ -19,6 +19,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
 
 // clock is an injectable clock (Options.Now).
@@ -103,6 +104,7 @@ func newEnvWith(t *testing.T, sopts []Option, opts ...envOpt) *tenv {
 	if o.Path == "" {
 		o.Path = pgtest.DB(t)
 	}
+	testenv.StoreCompression(&o)
 	switch {
 	case o.BlobDir == tableBlobs:
 		o.BlobDir = ""

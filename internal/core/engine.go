@@ -146,6 +146,25 @@ type Options struct {
 	// are due. Zero means ten seconds; negative disables the loop
 	// (Repurge still sends them).
 	RepurgeInterval time.Duration
+	// StoreCompression is "zstd" to store the patch sets of namespaces
+	// without encryption compressed (compress.go), or "" or "off" (the
+	// default) to store canonical JSON. SQLite only: Open refuses it on
+	// Postgres, which compresses large values itself (TOAST). Patch sets
+	// are compressed in a write's check phase, outside the write lock;
+	// heads and snapshots, and encrypted namespaces, are never compressed.
+	//
+	// Turning it on is a format change with no way back: versions without
+	// it answer 500 for every resource with a compressed patch set (reads,
+	// writes and retention alike), and turning it off again only stops
+	// compressing new patch sets. The first Open with it on records that
+	// in the database (a meta table); an Open with it off then logs that
+	// the database may hold compressed patch sets, which it reads.
+	StoreCompression string
+	// StoreCompressMin is the smallest canonical patch set compressed, in
+	// bytes (default 1024). A compressed one is kept only if it is at
+	// least an eighth smaller. Negative compresses every patch set, even
+	// if it doesn't shrink, for tests of the compressed form.
+	StoreCompressMin int
 }
 
 // RemoteOptions configure the branch side of remote branches (§G.3): how
@@ -202,6 +221,7 @@ type Engine struct {
 	schemaDocs *parsedCache
 	ids        idCache
 	deks       *dekCache
+	comp       storeCodec // compressed patch sets (compress.go)
 	ekeys      epochKeyCache
 	cfgMu      sync.Mutex
 	cfgCache   map[int64]*Config
@@ -241,8 +261,15 @@ type Engine struct {
 	firstEntry   time.Time
 }
 
+// testOptions, if set, adjusts the options of every engine opened (the
+// package's own tests, compress_test.go).
+var testOptions func(*Options)
+
 // Open opens or creates the database.
 func Open(opt Options) (*Engine, error) {
+	if testOptions != nil {
+		testOptions(&opt)
+	}
 	if opt.Limits == (Limits{}) {
 		opt.Limits = DefaultLimits()
 	}
@@ -285,6 +312,9 @@ func Open(opt Options) (*Engine, error) {
 	if opt.GroupCommitWait == 0 {
 		opt.GroupCommitWait = defaultGroupCommitWait
 	}
+	if err := checkStoreCompression(&opt); err != nil {
+		return nil, err
+	}
 	db, pg, err := openDB(opt.Path)
 	if err != nil {
 		return nil, err
@@ -313,6 +343,11 @@ func Open(opt Options) (*Engine, error) {
 		started:    opt.Now().UTC(),
 	}
 	if err := e.checkKeyStore(); err != nil {
+		db.Close()
+		return nil, err
+	}
+	if err := e.openStoreCodec(); err != nil {
+		e.comp.close()
 		db.Close()
 		return nil, err
 	}
@@ -374,7 +409,9 @@ func (e *Engine) Close() error {
 	e.bg.Wait()
 	e.resign()
 	e.stmts.close()
-	return e.db.Close()
+	err := e.db.Close()
+	e.comp.close()
+	return err
 }
 
 // Ping checks that the database is reachable (the /_ready check).

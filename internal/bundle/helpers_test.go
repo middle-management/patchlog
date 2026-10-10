@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/bundle"
@@ -27,6 +29,12 @@ type nopPurger struct{}
 
 func (nopPurger) PurgeTags([]string) {}
 
+// benchDBDirEnv names a directory: deployments (newDeployment) on SQLite
+// then store in a database file there rather than in memory, as a server
+// does, for benchmarks that measure storage (BenchmarkImportDemoPlay). The
+// files are left for the caller to inspect and remove.
+const benchDBDirEnv = "PATCHLOG_BENCH_DB_DIR"
+
 // deployment is an in-process server with its own origin (clienttest has
 // a fixed origin, and two deployments need two).
 type deployment struct {
@@ -41,6 +49,16 @@ func newDeployment(t testing.TB, origin string, opts ...func(*core.Options)) *de
 	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: origin, AuthDisabled: true, Purger: nopPurger{}}
 	for _, f := range opts {
 		f(&o)
+	}
+	if dir := os.Getenv(benchDBDirEnv); dir != "" && o.Path == ":memory:" {
+		// A SQLite file, as a server has, for measurements.
+		f, err := os.CreateTemp(dir, "deployment-*.db")
+		if err != nil {
+			t.Fatal(err)
+		}
+		f.Close()
+		os.Remove(f.Name())
+		o.Path = filepath.Clean(f.Name())
 	}
 	testenv.Apply(&o)
 	e, err := core.Open(o)

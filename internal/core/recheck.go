@@ -197,6 +197,10 @@ func (e *Engine) checkOutside(ctx context.Context, req Request, items []Item, so
 		plan, res = p, r
 		return err
 	})
+	if err == nil {
+		// After the read transaction too: compressing is CPU only.
+		e.packPlan(plan)
+	}
 	return plan, deps, res, err
 }
 

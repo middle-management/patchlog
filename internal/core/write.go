@@ -207,6 +207,9 @@ type stepState struct {
 	// of the last live document instead.
 	declared  []ids.ID
 	keepsList bool
+	// packed is canon compressed, if the check phase compressed it
+	// (packPlan, compress.go).
+	packed []byte
 }
 
 type itemState struct {
@@ -378,6 +381,9 @@ type writePlan struct {
 	// re-check of blob availability needs (recheck.go).
 	req    Request
 	source any
+	// level is the encryption level the write was checked under, which
+	// the re-check confirms (the namespace's config_seq).
+	level int
 }
 
 // checkItems runs steps 1–6 of §6.2 for a resource write or batch. It
@@ -801,7 +807,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		return nil, result, nil
 	}
 
-	return &writePlan{n: n, a: a, st: st, cplan: cplan, src: src, isBatch: isBatch, result: result, req: req, source: source}, nil, nil
+	return &writePlan{n: n, a: a, st: st, cplan: cplan, src: src, isBatch: isBatch, result: result, req: req, source: source, level: cfg.level}, nil, nil
 }
 
 // insertPlan is step 7: insert a checked write atomically with its
@@ -1862,7 +1868,7 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			if step.del {
 				kind = kindTombstone
 			} else {
-				patches = t.putPatches(it.res, step.id, step.canon)
+				patches = t.putPatches(it.res, step.id, step.canon, step.packed)
 				if step.typed != "" {
 					typed = step.typed
 				}
@@ -1928,9 +1934,14 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 				continue
 			}
 			// An intermediate snapshot once enough patch sets have
-			// accumulated since the last one (D.4), so no read folds more.
+			// accumulated since the last one (D.4), so no read folds more:
+			// their bytes as stored, a compressed one's decompressed.
 			it.snapRevs++
-			it.snapBytes += int64(storedLen(row[5]))
+			if step.packed != nil {
+				it.snapBytes += int64(len(step.canon))
+			} else {
+				it.snapBytes += int64(storedLen(row[5]))
+			}
 			if it.snapRevs >= int64(t.e.opt.SnapshotEveryRevisions) || it.snapBytes >= int64(t.e.opt.SnapshotEveryBytes) {
 				snaps = append(snaps, []any{seq, it.res, t.putDoc("snapshots", it.res, seq, canon)})
 				it.snapRevs, it.snapBytes = 0, 0
@@ -1994,11 +2005,12 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 }
 
 // countSinceSnapshot counts res's revisions since its last snapshot, and
-// the bytes of their stored patch sets.
+// the bytes of their stored patch sets, a compressed one's decompressed
+// (as step 7 counts them).
 func (t *tx) countSinceSnapshot(res int64) (revs, size int64) {
 	t.must(t.QueryRow(`SELECT COUNT(*), COALESCE(SUM(octet_length(patches)), 0) FROM revisions
 		WHERE res = ? AND kind = 0 AND seq > (SELECT COALESCE(MAX(seq), 0) FROM snapshots WHERE res = ?)`, res, res).Scan(&revs, &size))
-	return revs, size
+	return revs, size + t.packedExtra(res)
 }
 
 // snapCounts returns a resource row's snapshot counts, counted from its

@@ -162,6 +162,7 @@ func serve(args []string) {
 	rotateOnRevoke := fs.Bool("rotate-on-revoke", false, "rotate a sealed namespace's epoch right after a config write that revokes a grant or removes or changes a key (§E.2.4)")
 	groupCommit := fs.Int("group-commit", 32, "Postgres: at most this many concurrent resource writes and batches of one namespace committed in one transaction (group commit, D.8); 1 or less commits every write on its own")
 	groupWait := fs.Duration("group-commit-wait", 200*time.Microsecond, "Postgres: at most how long a group waits for writes of its namespace still being checked (0: no wait)")
+	storeCompression := fs.String("store-compression", "off", "zstd: store the patch sets of namespaces without encryption, from 1 KiB, compressed (SQLite only). A format change: earlier versions can't read a database once it holds compressed patch sets, and turning it off again doesn't decompress them")
 	var purgeURLs multi
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
@@ -267,7 +268,7 @@ func serve(args []string) {
 	}
 	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: *jwksURI,
 		Limits: core.DefaultLimits(), Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
-		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait}
+		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait, StoreCompression: *storeCompression}
 	if opt.GroupCommit < 1 {
 		opt.GroupCommit = 1 // off
 	}

@@ -10,15 +10,50 @@
 // with PATCHLOG_TEST_PG (pgtest). The server package's own tests assert
 // single raw answers and leave it alone; its paging tests set the page size
 // themselves.
+//
+//	PATCHLOG_TEST_STORE_COMPRESSION=zstd PATCHLOG_TEST_STORE_COMPRESS_MIN=-1 go test ./...
+//
+// opens the SQLite engines of those tests, and of the server package's,
+// with stored patch sets compressed (core.Options.StoreCompression): from
+// a minimum size (default: the option's), or with -1 every patch set,
+// whether it shrinks or not. On Postgres, which refuses the option, it
+// does nothing.
 package testenv
 
 import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/middle-management/patchlog/internal/core"
 )
+
+// The store compression knobs.
+const (
+	StoreCompressionEnv = "PATCHLOG_TEST_STORE_COMPRESSION"
+	StoreCompressMinEnv = "PATCHLOG_TEST_STORE_COMPRESS_MIN"
+)
+
+// StoreCompression sets o's store compression from
+// PATCHLOG_TEST_STORE_COMPRESSION and PATCHLOG_TEST_STORE_COMPRESS_MIN, for
+// a SQLite engine whose test doesn't set it. A minimum of -1 compresses
+// every patch set, whether it shrinks or not; one that isn't an integer
+// panics.
+func StoreCompression(o *core.Options) {
+	v := os.Getenv(StoreCompressionEnv)
+	if v == "" || o.StoreCompression != "" || strings.HasPrefix(o.Path, "postgres") {
+		return
+	}
+	o.StoreCompression = v
+	if m := os.Getenv(StoreCompressMinEnv); m != "" && o.StoreCompressMin == 0 {
+		n, err := strconv.Atoi(m)
+		if err != nil {
+			panic(fmt.Sprintf("%s=%q: want an integer", StoreCompressMinEnv, m))
+		}
+		o.StoreCompressMin = n
+	}
+}
 
 // LogPageSizeEnv names the log page size test servers use.
 const LogPageSizeEnv = "PATCHLOG_TEST_LOG_PAGE_SIZE"
@@ -41,6 +76,7 @@ func LogPageSize() int {
 // Apply sets the knobs on o, before core.Open. A log page size a test sets
 // itself (anything but the default) wins over the environment.
 func Apply(o *core.Options) {
+	StoreCompression(o)
 	n := LogPageSize()
 	if n == 0 {
 		return
