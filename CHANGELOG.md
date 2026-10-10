@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.18.0
 
 Server time per write. On the synthetic Demo Play bundle under a 10,000/s allowance, `patchlog
 import` of its content takes 10.8 s into Postgres 16 (default settings, fsync on) and 11.1 s
