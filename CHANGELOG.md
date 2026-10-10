@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+Server time per write. On the synthetic Demo Play bundle under a 10,000/s allowance, `patchlog
+import` of its content takes 10.8 s into Postgres 16 (default settings, fsync on) and 11.1 s
+into SQLite, against 19.6 s and 16.4 s with v0.17.0; of the whole bundle, 24.4 s and 28.5 s,
+against 39.7 s on both. Into Postgres the whole bundle's batches now take about as long as the
+allowance paces them.
+
 - **Postgres: large values compressed with lz4.** Patch sets, documents, namespace entries'
   bodies and blob bytes were compressed with pglz, Postgres's default, which took most of the
   time of inserting revisions. The schema now sets lz4 on those columns where the server has it
