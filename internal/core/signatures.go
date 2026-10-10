@@ -154,7 +154,7 @@ func (t *tx) checkItemSignatures(n *nsRow, s *itemState, signers []sig.Signer, r
 			}
 			id = ids.Tombstone(*parent)
 		} else {
-			id = ids.Revision(parent, s.canon(j))
+			id = s.revID(j, parent)
 		}
 		parent = &id
 	}

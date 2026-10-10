@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pointer"
 )
 
 func run(t *testing.T, doc, patch string, exists bool, opt Options) (any, []string, error) {
@@ -349,6 +350,40 @@ func TestApplyInPlaceMatchesCopy(t *testing.T) {
 		copied, inPlace, exists = c, p, true
 		if a, b := string(jsonv.Canonical(copied)), string(jsonv.Canonical(inPlace)); a != b {
 			t.Fatalf("step %d:\n copy     %s\n in place %s", i, a, b)
+		}
+	}
+}
+
+// ShareLast puts the last op's value into the result itself and copies the
+// others, which a later op may change: applying never changes the ops, and
+// the result is the one a copying apply gives.
+func TestShareLast(t *testing.T) {
+	for _, s := range []string{
+		`[{"op":"add","path":"","value":{"a":{"x":[1,2]}}}]`,
+		`[{"op":"add","path":"/a","value":{"x":[1]}},{"op":"add","path":"/a/x/-","value":2},{"op":"replace","path":"/b","value":{"y":3}}]`,
+		`[{"op":"add","path":"/a","value":{"x":[1]}},{"op":"copy","from":"/a","path":"/c"},{"op":"add","path":"/c/x/0","value":{"z":0}}]`,
+	} {
+		pv := jsonv.MustParse([]byte(s))
+		before := jsonv.Clone(pv)
+		ops, err := Parse(pv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		doc := jsonv.MustParse([]byte(`{"b":0}`))
+		want, _, err := Apply(doc, true, ops, Options{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		got, _, err := Apply(jsonv.Clone(doc), true, ops, Options{ShareLast: true, InPlace: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !jsonv.Equal(got, want) || !jsonv.Equal(pv, before) {
+			t.Fatalf("%s: %s, want %s; ops now %s", s, jsonv.Canonical(got), jsonv.Canonical(want), jsonv.Canonical(pv))
+		}
+		last := ops[len(ops)-1]
+		if v, _ := pointer.Get(got, last.Path); reflect.ValueOf(v).Pointer() != reflect.ValueOf(last.Value).Pointer() {
+			t.Errorf("%s: the last value was copied", s)
 		}
 	}
 }

@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"fmt"
 	"math"
 	"regexp"
@@ -34,60 +35,136 @@ func fromScratch(s *stepState) bool {
 	return false
 }
 
-// canonStringLen is the length of s as canonical JSON, quotes included.
-func canonStringLen(s string) int {
-	n := 2
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == '"', c == '\\', c == '\b', c == '\f', c == '\n', c == '\r', c == '\t':
-			n += 2
-		case c < 0x20:
-			n += 6
-		default:
-			n++
-		}
-	}
-	return n
+// docShape is what step 4 measures of a resulting document (§6.6), read
+// from its canonical form in one pass (shapeOf) rather than by walking the
+// document once for each: its nesting depth (jsonv.Depth), the first
+// string, member name or pointer over valueSize or pathSize, and whether
+// any object has a $blob member (hasBlobMember).
+type docShape struct {
+	depth int
+	bad   *Error
+	blobs bool
 }
 
-// checkValuesAndPaths enforces valueSize and pathSize on a document (§6.6):
-// the largest string, member names included, and the longest JSON Pointer to
-// any value, both measured as canonical JSON.
-func checkValuesAndPaths(l Limits, doc any) *Error {
-	var bad *Error
-	var walk func(v any, path int)
-	// path is the canonical JSON length of the pointer to v, without quotes.
-	walk = func(v any, path int) {
-		if bad != nil {
+// shapeOf measures a document from its canonical form (§3.1), which step 4
+// computes for documentSize anyway. valueSize and pathSize measure strings
+// and pointers as canonical JSON: a string's length there is the length of
+// its token, quotes included, and the "~" and "/" of a member name, which
+// a pointer escapes as two characters, appear in its token as themselves.
+//
+// It reports what a depth-first walk of the document finds visiting
+// members in canonical order: the first value whose pointer or string is
+// too long, below which the walk goes no further, unless a later member
+// name of an object the walk is in is too long, which is reported instead.
+func shapeOf(l Limits, canon []byte) docShape {
+	s := shapeScan{l: l, b: canon}
+	if len(canon) > 0 {
+		s.value(0, 0)
+	}
+	return s.docShape
+}
+
+// shapeScan is shapeOf's state: the canonical form and the offset reached.
+type shapeScan struct {
+	docShape
+	l Limits
+	b []byte
+	i int
+}
+
+// value scans the value at s.i, nested in depth containers, whose pointer
+// is path bytes long as canonical JSON without its quotes. The walk of
+// shapeOf reaches it only if nothing was found too long before it.
+func (s *shapeScan) value(path, depth int) {
+	walked := s.bad == nil
+	if walked && path+2 > s.l.PathSize {
+		s.bad = limitErr(413, fmt.Sprintf("a path is longer than %d bytes", s.l.PathSize))
+		walked = false
+	}
+	switch s.b[s.i] {
+	case '"':
+		if n := s.str(); walked && n > s.l.ValueSize {
+			s.bad = limitErr(413, fmt.Sprintf("a string is longer than %d bytes", s.l.ValueSize))
+		}
+	case '[':
+		s.depth = max(s.depth, depth+1)
+		s.i++
+		if s.b[s.i] == ']' {
+			s.i++
 			return
 		}
-		if path+2 > l.PathSize {
-			bad = limitErr(413, fmt.Sprintf("a path is longer than %d bytes", l.PathSize))
+		for k := 0; ; k++ {
+			s.value(path+1+decimalLen(k), depth+1)
+			s.i++ // ',' or ']'
+			if s.b[s.i-1] == ']' {
+				return
+			}
+		}
+	case '{':
+		s.depth = max(s.depth, depth+1)
+		s.i++
+		if s.b[s.i] == '}' {
+			s.i++
 			return
 		}
-		switch x := v.(type) {
-		case string:
-			if canonStringLen(x) > l.ValueSize {
-				bad = limitErr(413, fmt.Sprintf("a string is longer than %d bytes", l.ValueSize))
+		// The walk measures the names of an object it reaches until one is
+		// too long, whatever its members' values hold.
+		names := walked
+		for {
+			start := s.i
+			n := s.str()
+			name := s.b[start:s.i]
+			if names && n > s.l.ValueSize {
+				s.bad = limitErr(413, fmt.Sprintf("a member name is longer than %d bytes", s.l.ValueSize))
+				names = false
 			}
-		case []any:
-			for i, e := range x {
-				walk(e, path+1+len(strconv.Itoa(i)))
+			if string(name) == `"$blob"` {
+				s.blobs = true
 			}
-		case map[string]any:
-			for k, e := range x {
-				n := canonStringLen(k)
-				if n > l.ValueSize {
-					bad = limitErr(413, fmt.Sprintf("a member name is longer than %d bytes", l.ValueSize))
-					return
-				}
-				// "~" and "/" are escaped as two characters in a pointer.
-				walk(e, path+1+n-2+strings.Count(k, "~")+strings.Count(k, "/"))
+			s.i++ // ':'
+			s.value(path+1+n-2+bytes.Count(name, []byte("~"))+bytes.Count(name, []byte("/")), depth+1)
+			s.i++ // ',' or '}'
+			if s.b[s.i-1] == '}' {
+				return
 			}
+		}
+	default:
+		// A number or a literal: canonical JSON has no space after it.
+		for s.i < len(s.b) && s.b[s.i] != ',' && s.b[s.i] != ']' && s.b[s.i] != '}' {
+			s.i++
 		}
 	}
-	walk(doc, 0)
-	return bad
+}
+
+// str skips the string token at s.i and returns its length. Canonical JSON
+// escapes a quote inside a string with a backslash, and a backslash with
+// another.
+func (s *shapeScan) str() int {
+	start := s.i
+	j := start + 1
+	for {
+		j += bytes.IndexByte(s.b[j:], '"')
+		k := j
+		for s.b[k-1] == '\\' {
+			k--
+		}
+		if (j-k)%2 == 0 {
+			break
+		}
+		j++
+	}
+	s.i = j + 1
+	return s.i - start
+}
+
+// decimalLen is the number of digits of k >= 0.
+func decimalLen(k int) int {
+	n := 1
+	for k >= 10 {
+		k /= 10
+		n++
+	}
+	return n
 }
 
 var blobTypeRe = regexp.MustCompile(`^[a-z0-9][a-z0-9!#$&^_.+-]*/[a-z0-9][a-z0-9!#$&^_.+-]*$`)

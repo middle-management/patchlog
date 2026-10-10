@@ -22,6 +22,18 @@
   of a resource by name 185, 64,289 of a revision 27, beside 333 new ones reading several at
   once); the server's CPU time in batches went from 19.3 s to 15.1 s, on SQLite from 25.8 s to
   22.4 s.
+- **Server: a write's check does each thing once.** Step 3 copied every create's whole document
+  out of its patch set, and an append's parent document after parsing it, and hashed each
+  revision id again after the idempotent-retry lookup had; step 4 walked each resulting document
+  for its depth, again for its strings and pointers and again for `$blob` members, and the blob
+  check (on SQLite twice, before the write lock and in it) once more. A create's document is now
+  its patch set's value, an append applies to the parent's document as parsed, each id is hashed
+  once, and the limits are read in one pass from the document's canonical form, which step 4
+  computes for `documentSize` anyway. Ids, stored bytes and the limits' answers are unchanged,
+  except that of several strings or pointers over `valueSize` or `pathSize` the one reported no
+  longer depends on map order. On the full synthetic bundle (in-process) the check phase uses
+  27% less CPU on SQLite (15.1 s to 11.0 s) and 25% less on Postgres (18.5 s to 13.9 s), where
+  the benchmark's peak heap went from 4.2 GiB to 3.3 GiB.
 
 ## v0.17.0
 

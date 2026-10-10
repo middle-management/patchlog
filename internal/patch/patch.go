@@ -40,6 +40,12 @@ type Options struct {
 	// InPlace applies the ops to doc itself instead of a copy, for callers
 	// that own it (folding a log). On an error doc may be half changed.
 	InPlace bool
+	// ShareLast puts the last op's value into the result as it is, not a
+	// copy, for callers that change neither the ops' values nor the result
+	// afterwards (the write gate): a whole-document add then copies
+	// nothing. Earlier ops' values are still copied, since a later op may
+	// change them.
+	ShareLast bool
 }
 
 // Parse validates the structure of a patch set.
@@ -123,10 +129,11 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 		default:
 			return nil, nil, fail(op.PathText, fmt.Sprintf("unknown op %q", op.Op))
 		}
+		share := opt.ShareLast && i == len(ops)-1
 
 		switch op.Op {
 		case "add":
-			nd, w, err := addAt(cur, have, op.Path, jsonv.Clone(op.Value))
+			nd, w, err := addAt(cur, have, op.Path, copyUnless(share, op.Value))
 			if err != nil {
 				return nil, nil, fail(op.PathText, err.Error())
 			}
@@ -150,7 +157,7 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 					return nil, nil, fail(op.PathText, err.Error())
 				}
 			}
-			nd, w, err := addAt(base, have, op.Path, jsonv.Clone(op.Value))
+			nd, w, err := addAt(base, have, op.Path, copyUnless(share, op.Value))
 			if err != nil {
 				return nil, nil, fail(op.PathText, err.Error())
 			}
@@ -224,6 +231,14 @@ func Apply(doc any, exists bool, ops []Op, opt Options) (any, []pointer.Pointer,
 		return nil, nil, &Error{Index: len(ops), Message: "no document"}
 	}
 	return cur, writes, nil
+}
+
+// copyUnless is v, or a copy of it unless it is shared (ShareLast).
+func copyUnless(shared bool, v any) any {
+	if shared {
+		return v
+	}
+	return jsonv.Clone(v)
 }
 
 func isNonce(p pointer.Pointer, v any) bool {

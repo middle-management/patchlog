@@ -312,7 +312,10 @@ func (t *tx) checkBlobs(n *nsRow, s *itemState, a *actor, bs *batchSource) *Erro
 			}
 			continue
 		}
-		refs := blobRefsOf(step.doc)
+		var refs []blobRef
+		if !step.noBlobs {
+			refs = blobRefsOf(step.doc)
+		}
 		step.blobs = map[ids.ID]*blobRow{}
 		for _, r := range refs {
 			src, ok := step.blobs[r.bid]

@@ -158,7 +158,7 @@ func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 			default:
 				ss.action = "append"
 			}
-			ss.canon = jsonv.Canonical(step.Patches)
+			ss.canon = s.canon(j)
 			if ss.action == "restore" && string(ss.canon) == "[]" {
 				ss.keepsList = true
 			} else {
@@ -181,7 +181,7 @@ func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 					return err
 				}
 			}
-			ss.id = ids.Revision(parentID, ss.canon)
+			ss.id = s.revID(j, parentID)
 			ss.writes = []string{}
 			ss.sealed = true
 			tomb = false

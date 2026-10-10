@@ -202,6 +202,9 @@ type stepState struct {
 	// blobs are the blobs the resulting document references, with where
 	// each is available from (step 4, §7.8), for step 7 to attach.
 	blobs map[ids.ID]*blobRow
+	// noBlobs marks a resulting document that checkLimits found without a
+	// $blob member: it references no blobs (§6.5).
+	noBlobs bool
 	// declared is a sealed step's declared blob list (§E.3.1), in the order
 	// sent; keepsList marks a sealed restore with [], which keeps the list
 	// of the last live document instead.
@@ -226,6 +229,18 @@ type itemState struct {
 	// computed (canon): the retry lookup, the batch size and step 3 each
 	// need them, and a create's is its whole document.
 	canons [][]byte
+	// revs are the steps' revision ids, each with the parent it was
+	// computed on (revID): the retry lookup, signatures and step 3 each
+	// need them, and on the same parents once the precondition holds.
+	revs []revMemo
+}
+
+// revMemo is a step's revision id on one parent (revID).
+type revMemo struct {
+	set    bool
+	root   bool // computed with no parent (a create)
+	parent ids.ID
+	id     ids.ID
 }
 
 // canon returns the canonical form of step j's patch set.
@@ -237,6 +252,23 @@ func (s *itemState) canon(j int) []byte {
 		s.canons[j] = jsonv.Canonical(s.Steps[j].Patches)
 	}
 	return s.canons[j]
+}
+
+// revID returns the revision id of step j's patch set on parent, nil for
+// a create (§3.3), hashing it again only for a different parent.
+func (s *itemState) revID(j int, parent *ids.ID) ids.ID {
+	if s.revs == nil {
+		s.revs = make([]revMemo, len(s.Steps))
+	}
+	m := &s.revs[j]
+	if m.set && m.root == (parent == nil) && (parent == nil || *parent == m.parent) {
+		return m.id
+	}
+	*m = revMemo{set: true, root: parent == nil, id: ids.Revision(parent, s.canon(j))}
+	if parent != nil {
+		m.parent = *parent
+	}
+	return m.id
 }
 
 // itemErr is a failure of one item at one step.
@@ -998,7 +1030,7 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 			}
 			id = ids.Tombstone(*parent)
 		} else {
-			id = ids.Revision(parent, s.canon(j))
+			id = s.revID(j, parent)
 		}
 		out = append(out, id)
 		p := id
@@ -1220,9 +1252,16 @@ func doubleDelete() *Error {
 }
 
 // applySteps is step 3: apply each step's patches in turn.
+//
+// Nothing changes a step's document once it is applied, nor a patch set of
+// the request, so a patch set's last value goes into the document as it is
+// (patch.Options ShareLast): a create's whole-document add copies nothing.
+// Each later step applies to a copy of the document before it; the first
+// applies in place to the parent's, which is parsed for this item alone.
 func (t *tx) applySteps(s *itemState) *Error {
 	var doc any
 	exists := false
+	owned := true // doc is no step's yet: nil, or the parent's parsed here
 	var parentID *ids.ID
 	tomb := false
 	if s.parent != nil {
@@ -1270,19 +1309,21 @@ func (t *tx) applySteps(s *itemState) *Error {
 			if err != nil {
 				return patchErr(err)
 			}
-			nd, writes, err := patch.Apply(doc, exists, ops, patch.Options{ResourceEnvelope: true})
+			if m, ok := doc.(map[string]any); ok && exists {
+				// Before the patches apply: in place, they change doc.
+				ss.prevNonce, _ = m["$nonce"].(string)
+			}
+			nd, writes, err := patch.Apply(doc, exists, ops, patch.Options{ResourceEnvelope: true, InPlace: owned, ShareLast: true})
 			if err != nil {
 				return patchErr(err)
 			}
-			if m, ok := doc.(map[string]any); ok && exists {
-				ss.prevNonce, _ = m["$nonce"].(string)
-			}
 			ss.canon = s.canon(j)
-			ss.id = ids.Revision(parentID, ss.canon)
+			ss.id = s.revID(j, parentID)
 			ss.doc = nd
 			ss.writes = patch.WritesStrings(writes)
 			doc, exists, tomb = nd, true, false
 		}
+		owned = false
 		id := ss.id
 		parentID = &id
 		s.steps = append(s.steps, ss)
@@ -1338,7 +1379,8 @@ func checkLimits(l Limits, s *itemState) *Error {
 		if len(step.docCanon) > l.DocumentSize {
 			return limitErr(413, "document too large")
 		}
-		if jsonv.Depth(step.doc) > l.NestingDepth {
+		sh := shapeOf(l, step.docCanon)
+		if sh.depth > l.NestingDepth {
 			return limitErr(422, "document nested too deeply")
 		}
 		if step.sealed {
@@ -1349,8 +1391,14 @@ func checkLimits(l Limits, s *itemState) *Error {
 			}
 			continue
 		}
-		if err := checkValuesAndPaths(l, step.doc); err != nil {
-			return err
+		if sh.bad != nil {
+			return sh.bad
+		}
+		// Without a $blob member a document has no blob references, nor
+		// any to look up (checkBlobs).
+		step.noBlobs = !sh.blobs
+		if step.noBlobs {
+			continue
 		}
 		if err := checkBlobRefs(l, step.doc); err != nil {
 			return err
