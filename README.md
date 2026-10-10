@@ -1679,6 +1679,7 @@ patchlog export -ns matches -mode history -o matches.jsonl  # with schemas and x
 patchlog bundle verify -i matches.jsonl                      # recompute every id
 patchlog import -ns matches -i matches.jsonl -dry-run -atomic
 patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split and paced
+patchlog import -i all.jsonl -only demo-schemas -pace 1       # part of a bundle: the rest later
 ```
 
 - **History bundles** keep ids, so importing one reproduces the source's ids exactly.
@@ -1736,6 +1737,15 @@ patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split a
   on with a chain an earlier batch cut, reporting failures that only need earlier batches
   written as deferred; it uploads no blobs (they show as deferred `blob` failures) and writes
   nothing.
+- **Part of a bundle.** `-only ns,…` imports only those source namespaces (`-ns` still maps
+  names). The others' documents are left out as `external` dependencies are (§G.4.1): before
+  writing anything the import checks that the target has what its documents reference in
+  them, as the bundle has it, by id for a full document's pinned revisions and by name for a
+  live reference, and that the upstream namespace of a left-out snapshot document they pin
+  holds that snapshot, which their pins are rewritten to. So a bundle can be imported a few
+  namespaces at a time, by one process or several at once, those the others reference first,
+  and the target ends as one whole import leaves it; only the namespaces imported (and their
+  upstream namespaces) are created.
 - **Timings.** The summary's `time` line, and `timings` in `-json`, show where the time went:
   planning, blobs, batch requests (mostly the server's time), paced waits and waits after
   `429`s.

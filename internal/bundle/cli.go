@@ -358,6 +358,8 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs.SetOutput(stderr)
 	api := fs.String("api", "http://localhost:8080", "target deployment base URL")
 	nsSpec := fs.String("ns", "", "target namespaces: name, or src=dst to map a source namespace (comma-separated)")
+	only := fs.String("only", "", "import only these source namespaces of the bundle (comma-separated): what their documents reference in the others "+
+		"must be in the target already, as the bundle has it, which is checked first (§G.4.1 external)")
 	in := fs.String("i", "", "bundle file")
 	dry := fs.Bool("dry-run", false, "classify, check and dry-run every batch; write nothing")
 	atomic := fs.Bool("atomic", false, "one batch per namespace; over the namespace's limits it needs an allowance there, up to the deployment "+
@@ -394,7 +396,7 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 		return err
 	}
 	opt := ImportOptions{DryRun: *dry, CreateNamespaces: *create, UpstreamSuffix: *suffix, Resolutions: map[string]Resolution{}, AllowLessProtected: *allowLess, Signer: signer,
-		Concurrency: *concurrency}
+		Concurrency: *concurrency, Only: splitList(*only)}
 	switch {
 	case *atomic && *pace != "":
 		return fmt.Errorf("import: choose one of -atomic and -pace")

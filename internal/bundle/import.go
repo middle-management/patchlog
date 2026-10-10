@@ -99,6 +99,11 @@ type ImportOptions struct {
 	// same name, §G.1). Schema namespaces must not be mapped, since
 	// $schema paths name them.
 	NSMap map[string]string
+	// Only, if set, are the source namespaces to import (partial.go): the
+	// others' documents are left out as external dependencies are
+	// (§G.4.1), and the target must have what the imported documents
+	// reference in them, as the bundle has it, which is checked first.
+	Only []string
 	// UpstreamSuffix names the upstream namespace of a source namespace
 	// (default "-upstream": matches → matches-upstream).
 	UpstreamSuffix string
@@ -231,6 +236,7 @@ type Report struct {
 	DryRun       bool            `json:"dryRun"`
 	Docs         []*DocReport    `json:"docs"`
 	Undeclared   []UndeclaredRef `json:"undeclared,omitempty"`
+	Only         []string        `json:"only,omitempty"` // the source namespaces imported, if not all (ImportOptions.Only)
 	Create       []string        `json:"createNamespaces,omitempty"`
 	Order        []string        `json:"order"`
 	Batches      []*BatchReport  `json:"batches"`
@@ -390,10 +396,21 @@ type importer struct {
 	h      *Header
 	digest string
 	docs   map[string]*bdoc
-	keys   []string
+	keys   []string // the documents the import brings, in order
 	rep    *Report
-	local  bool      // the bundle's origin is the target's own
-	start  time.Time // when the import began (Timings)
+
+	// A partial import (partial.go): the source namespaces it brings; what
+	// its documents reference of those it leaves out (source key → the
+	// pinned revisions, "" for a live reference); the snapshot documents
+	// left out that they pin; and how many it leaves out.
+	only     map[string]bool
+	outRefs  map[string]map[string]bool
+	held     map[string]bool
+	heldKeys []string
+	left     int
+
+	local bool      // the bundle's origin is the target's own
+	start time.Time // when the import began (Timings)
 
 	origin  string // the target deployment's origin, for signing
 	signErr error  // a step that request couldn't sign
@@ -470,10 +487,25 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 	}
 	im := &importer{c: c, opt: opt, docs: map[string]*bdoc{}, up: map[string]*upPlan{}, start: opt.Now(),
 		points: map[string]map[string]point{}, schemas: map[string]any{}, nodes: map[string]*node{}, listed: map[string]*listing{}, gates: map[string]*gate{}}
+	if len(opt.Only) > 0 {
+		im.only, im.outRefs, im.held = map[string]bool{}, map[string]map[string]bool{}, map[string]bool{}
+		for _, ns := range opt.Only {
+			im.only[ns] = true
+		}
+	}
 	if err := im.load(open); err != nil {
 		return nil, err
 	}
+	im.leaveOut()
 	im.rep = &Report{Origin: im.h.Origin, Digest: im.digest, Mode: opt.Mode, DryRun: opt.DryRun}
+	if im.only != nil {
+		for ns := range im.only {
+			im.rep.Only = append(im.rep.Only, ns)
+		}
+		sort.Strings(im.rep.Only)
+		im.rep.Notes = append(im.rep.Notes, fmt.Sprintf("imports namespaces %s only, leaving out %d documents; checked in the target first: the %d of them its documents reference",
+			strings.Join(im.rep.Only, ", "), im.left, len(im.outRefs)+len(im.held)))
+	}
 	defer im.timed(&im.rep.Timings.Total, im.start)
 	to, err := c.Origin(ctx)
 	if err != nil {
@@ -522,6 +554,11 @@ func (im *importer) load(open Opener) error {
 	rd.parallel(runtime.GOMAXPROCS(0))
 	defer rd.Close()
 	im.h = rd.Header()
+	for ns := range im.only {
+		if _, ok := im.h.At[ns]; !ok {
+			return fmt.Errorf("import: the bundle has no namespace %s to import", ns)
+		}
+	}
 	targets := map[string]string{}
 	for k, info := range im.h.Docs {
 		ns, name, _ := SplitKey(k)
@@ -602,9 +639,17 @@ func (im *importer) load(open Opener) error {
 // every string of the reference form that names a revision (including
 // $schema and $ref).
 func (im *importer) scanRefs(d *bdoc, v any) {
+	brought := im.only != nil && im.only[d.ns] // a partial import's (partial.go)
 	walkStrings(v, func(_ *strPath, s string) {
-		if r, ok := annot.ParseRefString(s); ok && r.Rev != "" {
+		r, ok := annot.ParseRefString(s)
+		if !ok {
+			return
+		}
+		if r.Rev != "" {
 			d.pinKeys[Key(r.NS, r.Name)] = true
+		}
+		if brought {
+			im.noteOut(r)
 		}
 	})
 }
@@ -661,6 +706,11 @@ func (im *importer) check(ctx context.Context) error {
 		}
 		d.requiresBad = !ok
 	}
+	out, err := im.checkOut(ctx)
+	if err != nil {
+		return err
+	}
+	problems = append(problems, out...)
 	for _, e := range im.h.External {
 		ext, _ := ParseExternal(e)
 		tns := im.mapNS(ext.NS)
@@ -945,16 +995,30 @@ func (im *importer) plan(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var held []string
 	for _, d := range order {
 		it, err := im.planUpstream(ctx, d, refs[d.key])
 		if err != nil {
 			return fmt.Errorf("import: %s upstream: %w", d.key, err)
 		}
+		if im.held[d.key] {
+			// Left out, and pinned: its upstream must hold it already.
+			if p := im.heldProblem(d, it); p != "" {
+				held = append(held, p)
+			}
+			continue
+		}
 		if it != nil {
 			items = append(items, it)
 		}
 	}
+	if len(held) > 0 {
+		return &CheckError{Problems: held}
+	}
 	for _, d := range order {
+		if im.held[d.key] {
+			continue
+		}
 		it, err := im.planSnapshotTarget(ctx, d)
 		if err != nil {
 			return fmt.Errorf("import: %s: %w", d.key, err)
@@ -1173,6 +1237,9 @@ func (im *importer) snapshotOrder(ctx context.Context) ([]*bdoc, map[string][]an
 			snaps = append(snaps, d)
 		}
 	}
+	for _, k := range im.heldKeys {
+		snaps = append(snaps, im.docs[k])
+	}
 	// Each document's walk on its own, on parallel workers (the schema
 	// loader one at a time), then their findings in key order.
 	type found struct {
@@ -1228,7 +1295,9 @@ func (im *importer) snapshotOrder(ctx context.Context) ([]*bdoc, map[string][]an
 				deps[d.key] = append(deps[d.key], t.key)
 			}
 		}
-		im.rep.Undeclared = append(im.rep.Undeclared, f.undeclared...)
+		if !im.held[d.key] {
+			im.rep.Undeclared = append(im.rep.Undeclared, f.undeclared...)
+		}
 	}
 	// Depth-first topological order. Pinned references can't form a cycle
 	// (a revision's id covers the ids it pins), so a cycle means a bundle

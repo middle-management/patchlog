@@ -139,7 +139,8 @@ func (im *importer) checkAccess(ctx context.Context) error {
 	}
 	targets := map[string]target{}
 	snapshots := map[string]bool{}
-	for _, d := range im.docs {
+	for _, k := range im.keys {
+		d := im.docs[k]
 		targets[d.tns] = target{src: d.ns}
 		if d.info.History == Snapshot {
 			targets[im.upstreamNS(d.ns)] = target{src: d.ns, upstream: true}
@@ -155,12 +156,7 @@ func (im *importer) checkAccess(ctx context.Context) error {
 	// An e2e namespace's blob lines carry the writers' ciphertext: the
 	// sealed type and no nonce, since declared lists carry only ids
 	// (§E.3.1, §G.5.1). Any other is refused before anything is uploaded.
-	keys := make([]string, 0, len(im.docs))
-	for k := range im.docs {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
+	for _, k := range im.keys {
 		d := im.docs[k]
 		if im.h.AccessOf(d.ns) != AccessE2E {
 			continue

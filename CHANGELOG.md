@@ -20,6 +20,14 @@ takes 17.2 s; of the whole bundle, 109.9 s, 50.8 s and 44.1 s.
   document's pin of a bundled snapshot document its upstream namespace. Live references, which
   name no revision that must exist, made one cycle of a deployment's main namespaces, their data
   and both upstreams, which then went one after another.
+- **Part of a bundle: `patchlog import -only ns,…`** imports only those source namespaces; `-ns`
+  only maps names, so an import of part of a bundle needed a sub-bundle cut out of it, and asked
+  for namespaces it then didn't write (a `403` on one it may not create). The others' documents
+  are left out as `external` dependencies are (§G.4.1): before writing anything the import checks
+  the target for what its documents reference in them, by id for pinned revisions of full
+  documents and by name for live references, and requires a left-out snapshot document that
+  they pin to be in its upstream namespace as the bundle has it. Staged imports, the namespaces
+  others reference first, leave the target as one whole import does.
 - **Server: schemas resolved once per write.** A batch's documents typed by the same schemas
   resolved and parsed each for every document and `$ref`; a transaction now keeps what it
   resolved, per writer. Parsed schema revisions are kept by id apart from the document cache,

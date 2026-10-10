@@ -6,7 +6,7 @@ package main
 //	patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
 //	                [-recipient key.jwk]... [-plaintext] [-identity id.jwk]
 //	patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
-//	                [-identity id.jwk] [-allow-less-protected]
+//	                [-only NS[,NS]] [-identity id.jwk] [-allow-less-protected]
 //	patchlog bundle verify -i file.jsonl [-identity id.jwk]
 //	patchlog bundle keygen -o id.jwk
 //

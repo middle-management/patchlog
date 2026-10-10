@@ -124,7 +124,9 @@ func (im *importer) listing(ctx context.Context, ns string) *listing {
 
 // lookups lists the resources whose heads the import looks up in each
 // target namespace, in byte order: its documents, and the upstream
-// resources of its snapshot documents.
+// resources of its snapshot documents; in a partial import also those
+// left out that its documents reference, and the upstream resources of
+// those they pin (partial.go).
 func (im *importer) lookups() map[string][]string {
 	if im.want != nil {
 		return im.want
@@ -137,6 +139,15 @@ func (im *importer) lookups() map[string][]string {
 			u := im.upstreamNS(d.ns)
 			im.want[u] = append(im.want[u], d.name)
 		}
+	}
+	for k := range im.outRefs {
+		d := im.docs[k]
+		im.want[d.tns] = append(im.want[d.tns], d.name)
+	}
+	for _, k := range im.heldKeys {
+		d := im.docs[k]
+		u := im.upstreamNS(d.ns)
+		im.want[u] = append(im.want[u], d.name)
 	}
 	for _, names := range im.want {
 		sort.Strings(names)
