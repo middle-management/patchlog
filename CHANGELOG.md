@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.17.0
 
 Bundle import on the shape of a measured deployment. `BenchmarkImportDemoPlay` builds a
 synthetic copy from the measurements' document counts and sizes per namespace and kind: 64,887
