@@ -234,6 +234,23 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			im.rep.Notes = append(im.rep.Notes, msg+"; imported anyway, as the operator overrode it")
 		}
 	}
+	// The upstream namespaces of the snapshot documents a partial import
+	// holds (partial.go) aren't targets, but their chains are compared as
+	// a target's are: without the $nonce a sealed or nonce-requiring one
+	// gives each patch set.
+	for _, k := range im.heldKeys {
+		u := im.upstreamNS(im.docs[k].ns)
+		if _, ok := targets[u]; ok {
+			continue
+		}
+		have, _, nonce, ok, err := im.existing(ctx, u)
+		if err != nil {
+			return fmt.Errorf("import: upstream namespace %s: %w", u, err)
+		}
+		if ok && (have == AccessSealed || nonce) {
+			im.sealedT[u] = true
+		}
+	}
 	np, err := im.requireNonces(ctx, nonces)
 	if err != nil {
 		return err

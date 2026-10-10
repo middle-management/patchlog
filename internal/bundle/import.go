@@ -995,8 +995,12 @@ func (im *importer) plan(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	pinned := im.heldPinned(refs)
 	var held []string
 	for _, d := range order {
+		if im.held[d.key] && !pinned[d.key] {
+			continue // nothing the import writes is rewritten to it
+		}
 		it, err := im.planUpstream(ctx, d, refs[d.key])
 		if err != nil {
 			return fmt.Errorf("import: %s upstream: %w", d.key, err)

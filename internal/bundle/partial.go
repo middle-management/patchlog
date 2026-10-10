@@ -14,11 +14,13 @@ import (
 // dependencies are (§G.4.1): it writes nothing of them, and before writing
 // anything checks that the target has what the documents it imports
 // reference in them, as the bundle has it: by id for a full document's
-// pinned revisions, by name for a live reference. A snapshot document
-// that imported snapshot documents pin is rewritten to its upstream
-// revision (§G.4.4), so the import plans its upstream resource as a whole
-// import would, and requires that to write nothing: the target holds that
-// snapshot already, from an import of its namespace. A pin of a snapshot
+// pinned revisions, by name for a live reference (a document the target
+// has deleted or purged since stays so, as a whole import leaves it). A
+// snapshot document that imported snapshot documents pin through their
+// declared references is rewritten to its upstream revision (§G.4.4), so
+// the import plans its upstream resource as a whole import would, and
+// requires that to write nothing: the target holds that snapshot already,
+// from an import of its namespace. A pin of a snapshot
 // document from a full document isn't rewritten, by a whole import either,
 // and isn't checked.
 //
@@ -42,10 +44,11 @@ func (im *importer) noteOut(r annot.Ref) {
 
 // leaveOut narrows a loaded bundle to the namespaces of Only: the import
 // plans and writes only their documents (keys), and holds the snapshot
-// documents left out that they pin (held), directly or through each
-// other. It drops the others' snapshots, which nothing reads, and the
-// live references to documents the bundle has deleted, which a whole
-// import would delete as well.
+// documents left out that their strings pin (held), directly or through
+// each other, of which planning keeps those their declared references
+// pin (heldPinned). It drops the others' snapshots, which nothing reads,
+// and the live references to documents the bundle has deleted, which a
+// whole import would delete as well.
 func (im *importer) leaveOut() {
 	if im.only == nil {
 		return
@@ -122,16 +125,16 @@ func (im *importer) checkOut(ctx context.Context) ([]string, error) {
 		}
 		sort.Strings(revs)
 		for _, rev := range revs {
+			// A document the target deleted or purged since stays so, as a
+			// whole import leaves it (present, or purged and skipped).
 			switch {
-			case rev == "":
-				if th.State != client.Live {
-					problems = append(problems, fmt.Sprintf("%s, which the import leaves out, is %s in the target: imported documents name it", at, stateWord(th.State)))
-				}
+			case th.State == client.NotFound && rev == "":
+				problems = append(problems, fmt.Sprintf("%s, which the import leaves out, is missing in the target: imported documents name it", at))
 				continue
-			case th.ID == rev:
+			case th.State == client.NotFound:
+				problems = append(problems, fmt.Sprintf("%s, which the import leaves out, is missing in the target: imported documents pin its revision %s", at, rev))
 				continue
-			case th.State == client.NotFound || th.State == client.Purged:
-				problems = append(problems, fmt.Sprintf("%s, which the import leaves out, is %s in the target: imported documents pin its revision %s", at, stateWord(th.State), rev))
+			case th.State == client.Purged || rev == "" || th.ID == rev:
 				continue
 			}
 			if _, err := im.c.Doc(ctx, t.tns, t.name, rev); err != nil {
@@ -144,6 +147,31 @@ func (im *importer) checkOut(ctx context.Context) ([]string, error) {
 		}
 	}
 	return problems, nil
+}
+
+// heldPinned are the held documents (leaveOut) that pinned references the
+// import rewrites point at (§G.4.4): the declared references (refs, by
+// snapshotOrder) of the snapshot documents it brings, and of the held
+// documents those point at, in turn. Their upstream resources must hold
+// them already; strings that pin the others aren't rewritten, by a whole
+// import either.
+func (im *importer) heldPinned(refs map[string][]annot.Ref) map[string]bool {
+	pinned := map[string]bool{}
+	var follow func(d *bdoc)
+	follow = func(d *bdoc) {
+		for _, r := range refs[d.key] {
+			if t := im.rewriteTarget(r); t != nil && im.held[t.key] && !pinned[t.key] {
+				pinned[t.key] = true
+				follow(t)
+			}
+		}
+	}
+	for _, k := range im.keys {
+		if d := im.docs[k]; d.info.History == Snapshot {
+			follow(d)
+		}
+	}
+	return pinned
 }
 
 // heldProblem is the problem of a held snapshot document (leaveOut) whose
@@ -160,11 +188,4 @@ func (im *importer) heldProblem(d *bdoc, it *item) string {
 	}
 	return fmt.Sprintf("%s, which the import leaves out, isn't in %s as the bundle has it (%s): imported snapshot documents pin it, "+
 		"so import namespace %s first, or with them", d.key, ur.Target, what, d.ns)
-}
-
-func stateWord(s client.State) string {
-	if s == client.NotFound {
-		return "missing"
-	}
-	return s.String()
 }
