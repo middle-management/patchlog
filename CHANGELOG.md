@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.16.2
 
 Bundle import speed. On a synthetic copy of a CMS deployment's content (6,900 snapshot documents,
 121 MB, 350 layouts of 100–450 KB; `BenchmarkImportContent`), a `patchlog import` under a
