@@ -5,15 +5,16 @@
 Bundle import on the shape of a measured deployment. `BenchmarkImportDemoPlay` builds a
 synthetic copy from the measurements' document counts and sizes per namespace and kind: 64,887
 documents, 1,149 of them schemas in the same namespace as snapshot documents, 48,532 data rows
-typed by them, 18 blobs. Under a 10,000/s allowance into a fresh SQLite target, `patchlog import`
-of its content (16,355 documents) took 58.6 s with v0.16.1, 23.3 s with v0.16.2 and takes 17.5 s;
-of the whole bundle, 109.9 s, 50.8 s and 42.3 s.
+most typed by them, 18 blobs. Under a 10,000/s allowance into a fresh SQLite target, `patchlog
+import` of its content (16,355 documents) took 58.6 s with v0.16.1, 23.3 s with v0.16.2 and
+takes 17.2 s; of the whole bundle, 109.9 s, 50.8 s and 44.1 s.
 
 - **Pacing by the allowance's burst.** Concurrent batches waited at the gate as if the bucket held
   nothing to spare, each for the draws of all those in flight: 28.5 s of waits on the whole
   bundle, now 2.5 s. The gate takes the bucket to hold what answered requests left (from one
-  token when it starts, refilling to the burst), and sends a request once it holds a token more
-  than all those in flight draw.
+  token when it starts, refilling to the burst), and sends a request once the server admits it
+  and those in flight in whatever order it handles them: once the bucket holds a token more
+  than they all draw but the least.
 - **Namespaces ordered by pins.** Dependencies between namespaces come from pinned references
   only, as within a namespace: a pin of a full document needs its namespace, a snapshot
   document's pin of a bundled snapshot document its upstream namespace. Live references, which

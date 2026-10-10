@@ -3,6 +3,7 @@ package bundle
 import (
 	"context"
 	"errors"
+	"math"
 	"slices"
 	"sync"
 	"time"
@@ -18,9 +19,10 @@ import (
 //
 // Concurrent batches aren't paced after each submit (pace): each request
 // waits at the namespace's gate before it is sent, until the allowance's
-// bucket has refilled what the requests before it drew, and a chain cut
-// between batches waits on its resource's bucket too, which the
-// allowance doesn't replace (§6.6).
+// bucket, as the requests answered so far left it, holds enough that the
+// server admits it and those in flight in whatever order it handles them,
+// and a chain cut between batches waits on its resource's bucket too,
+// which the allowance doesn't replace (§6.6).
 //
 // The importer's state is guarded by one lock, im.mu, held while a batch
 // is planned, checked and reported, and released only around requests
@@ -177,12 +179,15 @@ func (im *importer) after(b, inFlight *batch) bool {
 // answered (the server drew no later, so the bucket holds at least that),
 // starting from a single token when the gate was made, as pace takes it
 // to hold none to spare; and those in flight to be drawn at any moment.
-// A request is sent once the bucket holds a token more than all those in
-// flight draw: however they land around it, it is admitted. A namespace
-// has only as many batches in flight as the burst holds the draws of
-// (gateFor), so the bucket always fills to that. A chain cut between
-// batches draws on its resource's own bucket too, at ratePerResource,
-// which is paced as pace does, holding none to spare.
+// Whichever of the requests in flight the server handles last finds the
+// bucket less what all the others drew, so a request is sent once the
+// bucket holds a token more than it and those in flight draw but the
+// least of them (wait). Then each is admitted however they land, and so
+// are those sent later: an answer takes its draw off both sides. A
+// namespace has only as many batches in flight as the burst holds the
+// draws of (gateFor), so the bucket always fills to that. A chain cut
+// between batches draws on its resource's own bucket too, at
+// ratePerResource, which is paced as pace does, holding none to spare.
 type gate struct {
 	rate, burst, resource float64
 	// level is what the requests answered so far left in the bucket, and
@@ -209,20 +214,25 @@ func (b bucketLevel) at(t time.Time, rate, burst float64) float64 {
 	return min(burst, b.tokens+t.Sub(b.last).Seconds()*rate)
 }
 
-// wait is how long from now until the bucket holds a token more than the
-// requests in flight draw.
-func (g *gate) wait(now time.Time) time.Duration {
-	need := 1.0
+// wait is how long from now until the bucket holds enough for a request
+// drawing tokens and those in flight to be admitted in any order: a token
+// more than they draw but the least of them, which the one handled last
+// doesn't find taken.
+func (g *gate) wait(now time.Time, tokens int) time.Duration {
+	sum, least := float64(tokens), float64(tokens)
 	for _, d := range g.draws {
-		need += float64(d.tokens)
+		sum += float64(d.tokens)
+		least = min(least, float64(d.tokens))
 	}
-	// More than the burst can't be: gateFor has fewer batches in flight.
-	need = min(need, g.burst)
+	// More than the burst can't be: gateFor has fewer batches in flight,
+	// each with one request at a time.
+	need := min(1+sum-least, g.burst)
 	have := g.level.at(now, g.rate, g.burst)
 	if have >= need {
 		return 0
 	}
-	return time.Duration((need - have) / g.rate * float64(time.Second))
+	// Rounded up: a nanosecond early would find it a fraction short.
+	return time.Duration(math.Ceil((need - have) / g.rate * float64(time.Second)))
 }
 
 type gateDraw struct {
@@ -318,7 +328,7 @@ func (im *importer) admit(ctx context.Context, ns string, tokens int, resources 
 		}
 	}
 	now := im.opt.Now()
-	wait := g.wait(now)
+	wait := g.wait(now, tokens)
 	for _, r := range cut {
 		wait = max(wait, g.owed(now, g.resource, r))
 	}

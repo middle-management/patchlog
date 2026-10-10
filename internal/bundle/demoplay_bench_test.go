@@ -23,9 +23,10 @@ import (
 
 // A synthetic copy of a deployment whose import was measured (Demo Play,
 // 2026-10-09): its namespaces, document kinds, and their sizes as bundle
-// lines (median, 95th percentile and largest, in bytes), at full scale
-// 64,887 documents and 378 MB, of which its content (all but demo-data)
-// 16,355 documents and 141 MB.
+// lines (median, 95th percentile and largest, in bytes). At full scale it
+// has the deployment's 64,887 documents in about 294 MB (the deployment's
+// bundle: 378 MB), of which its content (all but demo-data) 16,355
+// documents in about 120 MB (141 MB).
 //
 //   - demo-schemas: 11 schemas (full; one has two revisions) and 3 other
 //     documents.
@@ -304,10 +305,11 @@ var (
 	demoPlayCache = map[string][]byte{}
 )
 
-// demoPlay returns the bundle (content, or full with data), generated once;
-// PATCHLOG_DEMOPLAY_SCALE scales it, and PATCHLOG_DEMOPLAY_OUT, if set,
-// names a directory to write it to (content.jsonl, full.jsonl) for runs of
-// patchlog import.
+// demoPlay returns the bundle (content, or full with data), generated once
+// and kept until another is asked for, which the heap it reports would
+// count; PATCHLOG_DEMOPLAY_SCALE scales it, and PATCHLOG_DEMOPLAY_OUT, if
+// set, names a directory to write it to (content.jsonl, full.jsonl) for
+// runs of patchlog import.
 func demoPlay(b *testing.B, data bool) []byte {
 	demoPlayMu.Lock()
 	defer demoPlayMu.Unlock()
@@ -319,6 +321,7 @@ func demoPlay(b *testing.B, data bool) []byte {
 	if bb, ok := demoPlayCache[key]; ok {
 		return bb
 	}
+	clear(demoPlayCache)
 	t0 := time.Now()
 	bb := demoPlayBundle(b, scale, data)
 	sum := must(bundle.Verify(bytes.NewReader(bb)))
@@ -346,6 +349,7 @@ func BenchmarkImportDemoPlay(b *testing.B) {
 		name := map[bool]string{false: "content", true: "full"}[data]
 		for _, variant := range []string{"", "/again"} {
 			b.Run(name+variant, func(b *testing.B) {
+				b.StopTimer()
 				bb := demoPlay(b, data)
 				var planning, batches, total float64
 				var reqs int64

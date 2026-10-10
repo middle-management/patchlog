@@ -184,8 +184,7 @@ func TestImportConcurrent(t *testing.T) {
 	in := func(ns string) func(loggedBatch) bool { return func(b loggedBatch) bool { return b.ns == ns } }
 	other := func(ns string) func(loggedBatch) bool { return func(b loggedBatch) bool { return b.ns != ns } }
 	// A target after its upstream; layouts pin items, which they name
-	// upstream once rewritten; comments name pages live, which doesn't
-	// order them.
+	// upstream once rewritten.
 	for _, dep := range [][2]string{
 		{"demo-upstream", "demo"}, {"cat-demo-upstream", "cat-demo"}, {"cat-demo-upstream", "demo-upstream"}, {"cat-demo-upstream", "demo"},
 		{"demo-comments-upstream", "demo-comments"},
@@ -235,9 +234,52 @@ func TestImportConcurrent(t *testing.T) {
 	}
 }
 
+// Namespaces are ordered by what their documents pin (§G.4.4), whatever
+// their names: pages pin an item, a snapshot whose revision its upstream
+// namespace holds, so the items' upstream goes before the pages'. Notes
+// name a page live, which needs no revision of it, so they go first by
+// name.
+func TestImportOrderByPins(t *testing.T) {
+	t.Parallel()
+	h := bundle.Header{Origin: stagingOrigin, Created: "2026-10-01T00:00:00Z", At: map[string]string{}, Docs: map[string]bundle.DocInfo{},
+		Access: map[string]string{}}
+	snapID := func(ns, name string) string { return fakeID(ns + "/" + name) }
+	docs := []struct {
+		ns, name string
+		doc      map[string]any
+	}{
+		{"b-notes", "note", map[string]any{"on": "/r/c-pages/page"}},
+		{"c-pages", "page", map[string]any{"item": rev("z-items", "item", snapID("z-items", "item"))}},
+		{"z-items", "item", map[string]any{"title": "an item"}},
+	}
+	for _, d := range docs {
+		h.At[d.ns], h.Access[d.ns] = fakeID("at "+d.ns), bundle.AccessPublic
+		h.Docs[bundle.Key(d.ns, d.name)] = bundle.DocInfo{History: bundle.Snapshot, Head: snapID(d.ns, d.name)}
+	}
+	var buf bytes.Buffer
+	w := must(bundle.NewWriter(&buf, h))
+	for _, d := range docs {
+		noErr(t, w.SnapshotDoc(d.ns, d.name, snapID(d.ns, d.name), json.RawMessage(must(json.Marshal(d.doc))), false))
+	}
+	must(w.Close())
+	dst := newDeployment(t, cmsOrigin, fastLimits)
+	rep, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(buf.Bytes()), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 1,
+		CreateNamespaces: true, Sleep: func(context.Context, time.Duration) error { return nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := []string{"b-notes-upstream", "b-notes", "z-items-upstream", "c-pages-upstream", "c-pages", "z-items"}; !slices.Equal(rep.Order, want) {
+		t.Fatalf("order %v, want %v", rep.Order, want)
+	}
+	if got := dst.doc("b-notes", "note")["on"]; got != "/r/c-pages/page" {
+		t.Fatalf("the note names %v", got)
+	}
+}
+
 // A concurrent import paces every request at the allowance's rate: its
-// blob uploads, dry runs and submits, each admitted once the bucket has
-// refilled what those before it drew, so none is answered 429 (§6.6). A
+// blob uploads, dry runs and submits, each sent once the bucket holds
+// enough for it and those in flight in any order, so none is answered 429
+// (§6.6). A
 // namespace has as many batches in flight as the allowance's burst holds
 // the draws of; where it holds no more than one batch's, the import goes
 // one batch at a time.
