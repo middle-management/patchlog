@@ -132,7 +132,12 @@ func (c *Client) With(opts ...Option) *Client {
 	for _, o := range opts {
 		o(n)
 	}
-	n.hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	// The shared HTTP client already refuses redirects (New); setting that
+	// again would race with its requests in flight. Only a client an
+	// option swapped in needs it.
+	if n.hc != c.hc {
+		n.hc.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	}
 	return n
 }
 
