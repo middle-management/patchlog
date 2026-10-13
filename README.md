@@ -33,7 +33,7 @@ and serves immutable, CDN-cacheable revisions.
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
-| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), drawing on each grant's rate limits, withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`) | §C.5, §9 | ✅ |
+| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), drawing on each grant's rate limits, withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
@@ -291,9 +291,12 @@ cookie, on every request.
   `no-store` whatever the headers say. Public and sealed reads ignore them.
 
   `patchlog index` and `patchlog tree` take the same three flags for their private listings
-  (§A.4, §B.11.5), under the same rules. They read callers only from `Authorization`, so their
-  private listings are `no-store` at the edge too: a service would need edge grants of its own
-  (§C.5 "Format"), which neither mints. Their private head pointers stay `no-store` either way.
+  (§A.4, §B.11.5), under the same rules: a listing read with a grant in `Authorization` is
+  `no-store` at the edge. The catalog service (`tree -access`) mints edge grants of its own for
+  its listings (v0.51, [Tree and catalog](#tree-and-catalog-addendum-b)), so a listing read
+  under one of its cookies, which the edge checked with the service's kid, gets edge lifetimes;
+  the search index and the plain tree service mint none. Private head pointers stay `no-store`
+  either way.
 
 ```sh
 head -c 32 /dev/urandom | base64 > edge.secret   # shared with the edge's configuration
@@ -386,7 +389,12 @@ gives a default so an edge can be written once. The reference issues exactly tha
   `head -c 32 /dev/urandom | base64 > edge-grant.key` makes one), and the edge then needs that
   file. Without `-edge-grant-key` it is HMAC-SHA256 keyed with the edge secret (the
   `-edge-secret` file's content, trimmed the same way) over the ASCII text
-  `patchlog edge grants v1`.
+  `patchlog edge grants v1`. The catalog service's kid is its own `-edge-grant-kid` (default
+  `catalog-{catalog}`), which vouches only for `/{catalog}/g/{gs}`, `gs` an id or `all`, and
+  its key is its own `-edge-grant-key` file's bytes, never derived from the edge secret (see
+  [Tree and catalog](#tree-and-catalog-addendum-b)). An edge in front of both holds both keys,
+  and makes the same checks with whichever kid a cookie names, so neither's cookies cover the
+  other's URLs.
 
 On every request, cache hits included, before serving it or forwarding it as verified, an edge
 MUST check (§C.5):
@@ -1828,8 +1836,67 @@ whole is served unfiltered listings under `/{catalog}/g/all/at/{at}/…`, shared
 readers, with a private `max-age` no longer than that grant's expiry. Reading only some of them as
 a whole doesn't change the URL space (the listing is then the subject set's), but still admits
 `problems`, `orphans` and manifests covering only those, served `private` with a `max-age` no
-longer than the grants, `no-store` for shared caches, and never stored sealed. There are no CDN
-edge grants: the service decides `all` per request.
+longer than the grants, `no-store` for shared caches, and never stored sealed. Without edge
+grants, the service decides `all` per request.
+
+**Edge grants for listings** (v0.51, §B.11.5, §C.5). A listing read with a grant in
+`Authorization` belongs to one credential, so it is never cached at the edge; the catalog
+service mints cookies of its own, bound to a subject set, so an edge can cache a listing for
+everyone who shares it. `POST /edge-grants` on the service's origin follows the core's issuance:
+the grant in `Authorization`, or 1 to 50 as `{ "grants": [ … ] }` in an `application/json` body
+(`415` otherwise; `400` with `Authorization` too, an empty list or another member), all or
+nothing (`401` if any grant is, else `403`), answering `{ "prefixes": [...], "exp" }`
+(`no-store`) with one `Secure`, `HttpOnly` cookie per prefix, named and formatted as the core's.
+Each grant is resolved as a listing resolves its reader: its prefix is `/{catalog}/g/{gs}`, the
+subject set its listings are served under, lasting until that grant's `exp` or 15 minutes,
+whichever is sooner; or `/{catalog}/g/all` for a reader with namespace-wide read on the catalog
+and every content namespace it trusts, lasting until the earliest of those grants. A prefix
+several grants give gets one cookie, lasting as long as the longest, and `exp` is the earliest.
+While the core runs with authentication disabled it is `404 not_offered`, before the body is
+read; so is it on the plain tree service, whose listings depend on more than a subject set.
+`DELETE /edge-grants?prefix=…` withdraws them, as the core's does for its own prefixes (`prefix`
+repeatable, each `/{catalog}/g/{gs}`, `400` otherwise; `204` with expired cookies, no grant
+needed). Credentialed CORS is the core's: pages listed with `-cors-credentials-origin` call it
+with `credentials: "include"`, the cookies are then `SameSite=None` (otherwise `Lax`), and only
+those origins may preflight the `DELETE`. Cookies are signed with `-edge-grant-key FILE`, a key
+of the service's own that the origin never holds (refused if it is the one the origin derives
+from `-edge-secret`; without the flag, a random key per process, so cookies don't survive a
+restart), named `-edge-grant-kid` (default `catalog-{catalog}`), which may not be the origin's
+kid, `-origin-edge-grant-kid` (default `origin`).
+
+A `GET` or `HEAD` without `Authorization` that carries one of these cookies, covering its path
+and passing the six checks an edge makes (see
+[Private namespaces and the edge](#private-namespaces-and-the-edge), with the service's kid),
+is read as that subject set, with no grant. The cookie covers
+the subject set's listings at every `at`, not the head pointer: a reader follows the pointer with
+its grant once, or starts from any `at` under the prefix, which redirects to the current one. A
+read under a cookie gets edge lifetimes only when a verifying edge (`-edge-secret`) checked it
+and says so, with the prefix in `-edge-prefix-header`, exactly as for the core's private reads;
+otherwise it is `no-store` at the edge, and so is everything else private. Namespace-wide reads
+don't come with a subject set's cookie, so its `problems`, `orphans` and manifests are `403`
+unless the namespaces they cover are public. A cookie carries only `kid`, `p` and `exp`, so the
+service keeps the subjects behind each `gs` it minted a cookie for (`edge_subjects`, across
+restarts and `-rebuild`, until the last such cookie expires); a `gs` it doesn't know, such as
+one another instance with its own database minted, is `401`, and the reader exchanges again
+there. A user's direct `$access` entries count as they were at the exchange.
+
+A `g/all` cookie was checked against the content namespaces the catalog trusted when it was
+issued, and covers every later `at`, so the service answers `403` at an `at` that includes a
+namespace trusted since, until the reader exchanges again (a kept listing from before is still
+served). The service records when it came to trust each namespace (`meta` `trusted:{ns}`; a new
+or rebuilt database records its start) and when it first issued a `g/all` cookie with each
+`exp`, and refuses a namespace trusted no earlier than that issue. Without that record (another
+instance's cookie, or one from before a restart) it is conservative: it takes the cookie as
+issued at its `exp` less 15 minutes, so a cookie that a grant's earlier `exp` cut short is also
+refused at an `at` including a namespace trusted in the minutes before its issue. Two cookies
+with the same `exp` are the same bytes, so an exchange that would repeat one issued before a
+namespace became trusted gets an `exp` a second earlier.
+
+```sh
+head -c 32 /dev/urandom | base64 > catalog-edge-grant.key   # the edge holds it too, under catalog-cat
+patchlog tree -catalog cat -access -key SEED -kid catalog-01 \
+  -edge-grant-key catalog-edge-grant.key -edge-secret edge.secret -cors-credentials-origin https://app.example
+```
 
 Read-your-writes: after its own write, a client relists with `?min={ns}:{ns_id}` from the write's
 `X-Namespace-Revision` (repeatable, the catalog or any content namespace it trusts), which is a new

@@ -17,6 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/catalog"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -58,6 +59,11 @@ type world struct {
 
 	svcClient *client.Client
 	sealed    bool // both namespaces are sealed (Addendum E.2)
+
+	// The service's own edge grants and the verifying edge in front of
+	// it, if set before start (§B.11.5, §9).
+	edgeGrants *edge.Cookies
+	edge       *edge.Verifier
 }
 
 func toAny(xs ...string) []any {
@@ -184,7 +190,8 @@ func (w *world) start() {
 	svc, err := catalog.Open(context.Background(), catalog.Options{
 		Tree: tree.Options{Client: w.svcClient, Catalog: "cat", DB: w.db, Now: w.s.Now, CheckerTTL: time.Millisecond,
 			Logf:          func(f string, a ...any) { w.t.Logf(f, a...) },
-			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}},
+			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
+			EdgeGrants:    w.edgeGrants, Edge: w.edge},
 		Key: w.cat.Priv, Kid: "catalog-01",
 		MergeKey: w.mergeKey.Priv, MergeKid: "catalog-merge", MergeService: "svc:merge",
 	})

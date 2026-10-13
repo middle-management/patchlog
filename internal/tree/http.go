@@ -65,6 +65,10 @@ type RoleView interface {
 	// reader's listings (§B.11.5) and the reader's visibility. Resolve runs
 	// outside the graph lock; the Visibility's methods run under it.
 	Resolve(ctx context.Context, v *grant.Verified) (subjects []string, vis Visibility, err error)
+	// ForSubjects is the visibility of a subject set as Resolve keyed it,
+	// for a reader whose edge grant is bound to it (§B.11.5): the cookie
+	// carries no grant, only the subject set's prefix.
+	ForSubjects(subjects []string) Visibility
 }
 
 // Visibility decides, under the graph lock, what a reader may see.
@@ -108,6 +112,14 @@ type viewer struct {
 	wideGrant map[string]bool // namespaces read namespace-wide through a grant, not because they are public ("" the catalog)
 	wideExp   time.Time
 	priv      bool
+	// For an edge grant (edgegrants.go): subjects are what gs is over, as
+	// RoleView.Resolve keyed them, and idExp the expiry of the grant
+	// verified for the catalog namespace. notBefore, set for a read under
+	// a g/all cookie, is the earliest that cookie may have been issued
+	// (allNotBefore).
+	subjects  []string
+	idExp     time.Time
+	notBefore time.Time
 }
 
 // wide reports whether the viewer reads the catalog and every namespace of
@@ -185,7 +197,21 @@ func Bearer(r *http.Request) string {
 // a RoleView, a reader with a grant is routed under /g/{gs}/, where gs
 // keys everything its listings depend on: its groups and markers for how
 // much of the catalog and which content namespaces it reads as a whole.
+//
+// A GET or HEAD without Authorization that carries an edge grant the
+// service minted, covering its path, is read as that grant's subject set
+// (edgeViewer, §B.11.5).
 func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) {
+	if s.opt.EdgeGrants != nil && r.Header.Get("Authorization") == "" {
+		if cl := s.opt.EdgeGrants.FromRequest(r, s.opt.Now()); cl != nil {
+			return s.edgeViewer(ctx, cl)
+		}
+	}
+	return s.grantViewer(ctx, Bearer(r))
+}
+
+// grantViewer is the viewer of a reader presenting token ("" for none).
+func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error) {
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
@@ -201,7 +227,6 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		}
 	})
 	sort.Strings(trust)
-	token := Bearer(r)
 	v := &viewer{contentAll: map[string]bool{}, contentRead: map[string]func(string) bool{}}
 	if token == "" {
 		if !catPublic {
@@ -220,6 +245,7 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		return nil, err
 	}
 	exp := grantExp(vg, time.Time{})
+	v.idExp = exp
 	var markers []string
 	readsCat, _ := vg.Allows("read")
 	switch {
@@ -283,12 +309,11 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 				v.wideGrant[ns] = true
 			}
 		}
-		var subjects []string
-		subjects, v.vis, err = s.opt.RoleView.Resolve(ctx, vg)
+		v.subjects, v.vis, err = s.opt.RoleView.Resolve(ctx, vg)
 		if err != nil {
 			return nil, err
 		}
-		v.gs = grantcheck.SubjectSetID(subjects)
+		v.gs = grantcheck.SubjectSetID(v.subjects)
 		return v, nil
 	}
 	if !v.catAll && v.catRead == nil {
@@ -391,6 +416,9 @@ var ops = map[string]bool{
 // tags, and served unchanged, across restarts, until a purge with one of
 // those tags or a new at retires them (derived.Cache).
 //
+//	POST   /edge-grants             the service's own edge grants, with
+//	DELETE /edge-grants?prefix=…    Options.EdgeGrants (edgegrants.go)
+//
 //	GET /_status    each followed namespace's encryption level and epoch,
 //	                whether listings are sealed, and why a namespace is
 //	                skipped (or its documents not read); "catalogs" names
@@ -398,6 +426,10 @@ var ops = map[string]bool{
 func (s *Service) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
 
 func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/edge-grants" {
+		s.serveEdgeGrants(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		WriteError(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")
@@ -547,6 +579,13 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	keep := !perReader(op, v)
 	var cur string
 	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
+	if ns := s.trustedSince(v, at, cur); ns != "" {
+		// A g/all edge grant covers every later at, but not one that
+		// includes a namespace it wasn't checked against (§B.11.5).
+		w.Header().Set("Cache-Control", "no-store")
+		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates the catalog's trust in "+ns+": exchange the grants again")
+		return
+	}
 	own := isAt && gs == v.gs && !(v.anon && gs != "")
 	mins := len(vals["min"]) > 0
 	canonical := r.URL.RequestURI() == canon(at)

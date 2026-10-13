@@ -27,6 +27,9 @@ import (
 //	                                 liveness of every resource of the trusted namespaces
 //	self_parents(ns, name, parents)  $parents of content documents (§B.9, -self-placing)
 //	sealed_views, sealed_view_tags   sealed listings of a sealed/e2e catalog (derived.Cache)
+//	edge_subjects(gs, subjects, exp) the subjects of each subject set the service minted edge
+//	                                 grants for, until the last of them expires (edgegrants.go);
+//	                                 meta "trusted:{ns}" is when it came to trust ns
 var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
 	`CREATE INDEX IF NOT EXISTS seen_by_id ON seen (ns_id)`,
@@ -43,6 +46,7 @@ var createStmts = []string{
 		PRIMARY KEY (ns, name)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS self_parents (ns TEXT NOT NULL, name TEXT NOT NULL, parents TEXT NOT NULL,
 		PRIMARY KEY (ns, name)) WITHOUT ROWID`,
+	`CREATE TABLE IF NOT EXISTS edge_subjects (gs TEXT PRIMARY KEY, subjects TEXT NOT NULL, exp INTEGER NOT NULL)`,
 }
 
 var dropStmts = []string{

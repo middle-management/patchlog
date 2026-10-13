@@ -57,9 +57,13 @@
 // head is), so after creating a document it placed, or restoring one, a
 // client passes min for both.
 //
-// There are no CDN edge grants in this implementation: read grants are
-// ordinary core grants fixed to one resource, which the origin accepts as
-// they are and POST /edge-grants (§C.5) exchanges for cookies.
+// Read grants are ordinary core grants fixed to one resource, which the
+// origin accepts as they are and its POST /edge-grants (§C.5) exchanges
+// for cookies. Listings have edge grants of the service's own, with
+// tree.Options.EdgeGrants: its POST /edge-grants exchanges a caller's
+// grants for a cookie bound to its subject set, /{catalog}/g/{gs}, or to
+// /{catalog}/g/all for a reader of every namespace as a whole, under a
+// key and kid of its own (§B.11.5; package tree, edgegrants.go).
 package catalog
 
 import (
@@ -188,7 +192,9 @@ func (s *Service) Run(ctx context.Context) error { return s.t.Run(ctx) }
 // Close closes the database.
 func (s *Service) Close() error { return s.t.Close() }
 
-// Handler serves the tree listings plus POST /grants and POST /read-grants.
+// Handler serves the tree listings (with /edge-grants, given
+// tree.Options.EdgeGrants) plus POST /grants, POST /read-grants and POST
+// /merge-grants.
 func (s *Service) Handler() http.Handler {
 	th := s.t.Handler()
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -626,6 +632,25 @@ func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tre
 		keyed = append(keyed, user)
 	}
 	return keyed, &visibility{s: s, subs: Subjects(v), groups: v.Principal.Groups}, nil
+}
+
+// ForSubjects implements tree.RoleView for a reader whose edge grant is
+// bound to a subject set (§B.11.5): the subjects Resolve keyed it by, and
+// the groups among them as /principal/groups, which is all visibility
+// reads of a caller. A user subject is among them only if the catalog had
+// direct entries for that user when the edge grant was minted; one it has
+// come to have since doesn't count until the reader exchanges again, as
+// for every listing cached for the subject set.
+func (s *Service) ForSubjects(subjects []string) tree.Visibility {
+	subs := map[string]bool{}
+	var groups []string
+	for _, subj := range subjects {
+		subs[subj] = true
+		if g, ok := strings.CutPrefix(subj, grantcheck.GroupPrefix); ok {
+			groups = append(groups, g)
+		}
+	}
+	return &visibility{s: s, subs: subs, groups: groups}
 }
 
 // readRoles are the roles through which the catalog's key may grant read

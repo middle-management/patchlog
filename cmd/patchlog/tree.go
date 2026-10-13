@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -8,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -26,7 +28,8 @@ import (
 //
 //	patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME] [-release /r/{ns}/{release}]
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]
-//	              [-merge-key SEED -merge-kid KID -merge-service SUB [-merge-ttl 5m]]]
+//	              [-merge-key SEED -merge-kid KID -merge-service SUB [-merge-ttl 5m]]
+//	              [-edge-grant-key FILE] [-edge-grant-kid KID] [-origin-edge-grant-kid KID]]
 //	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
 //
 // The service follows the catalog namespace and every namespace in its
@@ -49,6 +52,19 @@ import (
 // tagged r:{ns}/{name} and ns:{ns}. Read-your-writes: ?min={ns}:{ns_id},
 // repeatable, which always redirects (§A.5). Cache purges go to the CDN at
 // -purge-url (repeatable), and are logged if it is unset.
+//
+// With -access the service also mints edge grants of its own for its
+// listings (§B.11.5, §C.5): POST /edge-grants exchanges a caller's grants
+// for a cookie bound to its subject set, /{catalog}/g/{gs}, or to
+// /{catalog}/g/all for a reader of the catalog and every trusted namespace
+// as a whole, and DELETE /edge-grants?prefix=… withdraws them. They are
+// signed with -edge-grant-key, a key of the service's own that the origin
+// never holds (without it, a random one per process), named
+// -edge-grant-kid (default catalog-{catalog}), which must not be the
+// origin's kid (-origin-edge-grant-kid, default origin): each key vouches
+// only for its own prefixes. A read under one, without Authorization, is
+// the subject set's, and gets edge lifetimes behind a verifying edge
+// (-edge-secret) that checked it with the service's kid.
 //
 // Encrypted namespaces (Addendum E) work as for patchlog index: -enc-key is
 // the service's X25519 private key; listings of a sealed or e2e catalog are
@@ -83,6 +99,9 @@ func treeCmd(args []string) {
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
+	edgeGrantKey := fs.String("edge-grant-key", "", "file holding the key the catalog service signs its own edge-grant cookies with (§B.11.5, §C.5), for -access: a key of its own that the origin never holds, so neither the origin's -edge-grant-key nor one derived from -edge-secret (at least 16 bytes); without it, a random one per process, so cookies don't survive a restart or reach another instance")
+	edgeGrantKid := fs.String("edge-grant-kid", "", "the name (kid) of the service's edge-grant key, which its cookies carry and a verifying edge looks the key up by (§C.5 \"Format\"), for -access; default catalog-{catalog}. It must not be the origin's kid (-origin-edge-grant-kid): each key vouches only for its own prefixes, the service's for /{catalog}/g/{gs}")
+	originKid := fs.String("origin-edge-grant-kid", edge.DefaultKid, "the origin's edge-grant kid (its -edge-grant-kid), which -edge-grant-kid must differ from")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
@@ -116,6 +135,14 @@ func treeCmd(args []string) {
 		topt.Purger = purger
 	}
 	topt.Edge = edgeVerifier(*edgeSecret, *edgeHeader, *edgePrefixHeader)
+	switch {
+	case *access:
+		if topt.EdgeGrants, err = serviceEdgeGrantCookies(catalogs[0], *edgeGrantKid, *originKid, *edgeGrantKey, topt.Edge, corsFlags); err != nil {
+			log.Fatal(err)
+		}
+	case *edgeGrantKey != "" || *edgeGrantKid != "":
+		log.Fatal("tree: -edge-grant-key and -edge-grant-kid need -access: only a catalog service mints edge grants (§B.11.5)")
+	}
 
 	ctx, sigs := shutdownSignals("patchlog tree")
 	if *rel != "" {
@@ -210,6 +237,39 @@ func treeCmd(args []string) {
 	ls.Shutdown()
 	stopRun()
 	<-runDone
+}
+
+// serviceEdgeGrantCookies returns the catalog service's own edge-grant
+// cookies (§B.11.5, §C.5 "Format"): signed with the key in keyFile, else
+// with a random one, named kid (catalog-{catalog} if empty), which must
+// not be the origin's, originKid, nor the key the origin derives from the
+// edge secret. They are SameSite=None when pages on other origins may
+// call with credentials (-cors-credentials-origin), else Lax.
+func serviceEdgeGrantCookies(cat, kid, originKid, keyFile string, ev *edge.Verifier, c *corsFlags) (*edge.Cookies, error) {
+	if kid == "" {
+		kid = "catalog-" + cat
+	}
+	if kid == originKid {
+		return nil, fmt.Errorf("-edge-grant-kid %q is the origin's: the service's key is its own, and vouches only for its own prefixes (§C.5)", kid)
+	}
+	var key []byte
+	if keyFile != "" {
+		b, err := os.ReadFile(keyFile)
+		if err != nil {
+			return nil, fmt.Errorf("-edge-grant-key: %v", err)
+		}
+		if key = []byte(strings.TrimSpace(string(b))); len(key) < 16 {
+			return nil, errors.New("-edge-grant-key: the key must be at least 16 bytes")
+		}
+		if derived := ev.CookieKey(); derived != nil && bytes.Equal(key, derived) {
+			return nil, errors.New("-edge-grant-key: that is the key the origin derives from -edge-secret; the service's key is one the origin never holds (§C.5)")
+		}
+	}
+	ck := edge.NewCookies(kid, key)
+	if co, err := c.credentialOrigins(); err == nil && (len(co) > 0 || *c.credentials) {
+		ck.SameSite = http.SameSiteNoneMode
+	}
+	return ck, nil
 }
 
 // splitCatalogs flattens repeated and comma-separated -catalog values,

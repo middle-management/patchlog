@@ -290,3 +290,59 @@ func TestParsePrefix(t *testing.T) {
 		}
 	}
 }
+
+// TestServiceKeys (§C.5 "Format", §B.11.5): each key vouches only for its
+// own prefixes. A service's key (Vouches) vouches for prefixes under its
+// root and never for a core one, the origin's never for a service's, so a
+// cookie one mints covers none of the other's URLs, at an edge holding
+// both keys or at either minter, even with both under the same key bytes.
+func TestServiceKeys(t *testing.T) {
+	now := time.Date(2026, 10, 13, 12, 0, 0, 0, time.UTC)
+	exp := now.Add(MaxGrantTTL).Unix()
+	origin := NewCookies("", testKey)
+	svc := NewCookies("catalog-cat", testKey)
+	svc.Vouches = func(p string) bool { return strings.HasPrefix(p, "/cat/g/") && strings.Count(p, "/") == 3 }
+	// A Vouches that would allow core prefixes is overruled.
+	greedy := NewCookies("greedy", testKey)
+	greedy.Vouches = func(string) bool { return true }
+	for _, tc := range []struct {
+		c      *Cookies
+		prefix string
+		ok     bool
+	}{
+		{origin, "/r/demo", true}, {origin, "/cat/g/all", false},
+		{svc, "/cat/g/all", true}, {svc, "/cat/g/x/at", false}, {svc, "/r/demo", false}, {svc, "/ns/demo", false},
+		{greedy, "/cat/g/all", true}, {greedy, "/r/demo/derby", false}, {greedy, "/r", false}, {greedy, "/ns/demo", false}, {greedy, "/rx/demo", true},
+	} {
+		if got := tc.c.VouchesFor(tc.prefix); got != tc.ok {
+			t.Errorf("%s vouches for %s: %v", tc.c.Kid(), tc.prefix, got)
+		}
+	}
+	read := func(c *Cookies, ck *http.Cookie, path string) bool {
+		r := httptest.NewRequest("GET", path, nil)
+		r.AddCookie(&http.Cookie{Name: ck.Name, Value: ck.Value})
+		_, ok := c.Check(r, now)
+		return ok
+	}
+	svcCk := svc.Issue(Claims{Prefix: "/cat/g/all", Exp: exp}, now)
+	coreCk := origin.Issue(Claims{Prefix: "/r/demo", Exp: exp}, now)
+	if !read(svc, svcCk, "/cat/g/all/at/x/children") || !read(origin, coreCk, "/r/demo/derby") {
+		t.Fatal("a cookie doesn't cover its own minter's URLs")
+	}
+	if read(origin, svcCk, "/cat/g/all/at/x/children") || read(svc, coreCk, "/r/demo/derby") {
+		t.Error("a cookie verified under the other minter's key")
+	}
+	// Minted for the other's prefix, a cookie doesn't verify even under its
+	// own key: the kid doesn't vouch for it.
+	if read(svc, svc.Issue(Claims{Prefix: "/r/demo", Exp: exp}, now), "/r/demo/derby") ||
+		read(origin, origin.Issue(Claims{Prefix: "/cat/g/all", Exp: exp}, now), "/cat/g/all/at/x/children") {
+		t.Error("a key vouched for the other's prefix")
+	}
+	if svc.MaxTTL() != MaxGrantTTL {
+		t.Errorf("max TTL %v", svc.MaxTTL())
+	}
+	svc.TTL = 5 * time.Minute
+	if svc.MaxTTL() != 5*time.Minute || !svc.Lifetime(now, time.Time{}).Equal(now.Add(5*time.Minute)) {
+		t.Errorf("max TTL %v", svc.MaxTTL())
+	}
+}

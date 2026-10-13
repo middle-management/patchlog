@@ -112,11 +112,12 @@ type Options struct {
 	CheckerTTL time.Duration
 	// Purger receives cache-tag purges (default: log).
 	Purger Purger
-	// Edge is the verifying edge in front of the service (§9): listings for
-	// readers with a grant get edge lifetimes only when it verified the
-	// read itself, carrying its secret and a prefix covering the URL and no
-	// other credential. Other such listings, and all of them when nil, are
-	// no-store for shared caches. They are served either way.
+	// Edge is the verifying edge in front of the service (§9): private
+	// listings get edge lifetimes only when it verified the read itself,
+	// carrying its secret and a prefix covering the URL and no other
+	// credential, which only a read under the service's own edge grant
+	// (EdgeGrants) can be. Other such listings, and all of them when nil,
+	// are no-store for shared caches. They are served either way.
 	Edge *edge.Verifier
 	// Logf logs (default log.Printf).
 	Logf func(format string, args ...any)
@@ -128,6 +129,12 @@ type Options struct {
 	Hook Hook
 	// RoleView, if set, lets readers see nodes through roles (§B.11.5).
 	RoleView RoleView
+	// EdgeGrants, if set, mints and verifies the service's own edge grants
+	// (§B.11.5, §C.5; edgegrants.go): cookies for /{catalog}/g/{gs},
+	// under a key and kid of the service's own, never the origin's. Open
+	// sets its Vouches to those prefixes. It needs a RoleView: only a
+	// catalog service's listings depend on the subject set alone.
+	EdgeGrants *edge.Cookies
 	// Branches makes the service a release preview (§B.5, §F.9): it maps
 	// a namespace (the catalog, or a content namespace it trusts) to the
 	// release's branch of it, which is followed in its place. Documents
@@ -164,6 +171,15 @@ type Service struct {
 	purged  map[string]bool
 	changed chan struct{}
 
+	// trusted is when each namespace the catalog trusts became trusted,
+	// as far as the service knows (meta "trusted:{ns}"), guarded by mu;
+	// kept with EdgeGrants only (edgegrants.go).
+	trusted map[string]time.Time
+
+	emu       sync.Mutex
+	edgeSubs  map[string]edgeSubjects // gs → its subjects, for its edge grants
+	allIssued map[int64]time.Time     // exp → the first issue of a g/all edge grant expiring then
+
 	fmu     sync.Mutex
 	runCtx  context.Context
 	running map[string]context.CancelFunc
@@ -188,6 +204,14 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 			return nil, fmt.Errorf("tree: invalid preview branch %q for %q", br, ns)
 		}
 		seenBr[br] = true
+	}
+	if opt.EdgeGrants != nil && opt.RoleView == nil {
+		return nil, errors.New("tree: edge grants are bound to a subject set (§B.11.5), which only a catalog service's listings depend on alone")
+	}
+	if opt.EdgeGrants != nil && (opt.Catalog == "r" || opt.Catalog == "ns") {
+		// A service's prefixes lie under a root of its own, which never
+		// overlaps /r/ or /ns/ (§C.5 "Format").
+		return nil, fmt.Errorf("tree: catalog %q can't have edge grants: /%s/g/{gs} would overlap the core's prefixes", opt.Catalog, opt.Catalog)
 	}
 	if opt.MinWait == 0 {
 		opt.MinWait = 2 * time.Second
@@ -221,6 +245,9 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
 		cur:     map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
 		running: map[string]context.CancelFunc{},
+	}
+	if opt.EdgeGrants != nil {
+		opt.EdgeGrants.Vouches = func(p string) bool { _, ok := s.edgeGS(p); return ok }
 	}
 	if err := s.init(ctx); err != nil {
 		db.Close()
@@ -289,7 +316,10 @@ func (s *Service) init(ctx context.Context) error {
 		s.purged[ns] = true
 	}
 	rows.Close()
-	return s.reload(ctx)
+	if err := s.reload(ctx); err != nil {
+		return err
+	}
+	return s.loadTrusted(ctx)
 }
 
 // reload rebuilds the graph from the database, fixes any drift in the
@@ -630,6 +660,9 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		s.purged[b.NS] = true
 	}
 	trustChanged := !sameSet(oldTrust, s.g.Trust)
+	if trustChanged {
+		s.noteTrust(context.WithoutCancel(ctx))
+	}
 	s.mu.Unlock()
 
 	if len(res.tags) > 0 {
