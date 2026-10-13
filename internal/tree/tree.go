@@ -51,6 +51,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"sync"
 	"time"
 
@@ -177,10 +178,12 @@ type Service struct {
 
 	wmu sync.Mutex // serialises applies across followers
 
-	mu      sync.RWMutex // guards g, cur, purged
-	g       *Graph
-	cur     map[string]string
-	purged  map[string]bool
+	mu  sync.RWMutex // guards g, cur, purged
+	g   *Graph
+	cur map[string]string
+	// purged is when the service applied the purge of each namespace it
+	// holds as purged (meta "purged:{ns}", Unix nanoseconds; trustList).
+	purged  map[string]time.Time
 	changed chan struct{}
 
 	// trusted is when each namespace the catalog trusts became trusted,
@@ -263,7 +266,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db), kept: kept.New(opt.Now, keepBytes),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
-		cur:     map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
+		cur:     map[string]string{}, purged: map[string]time.Time{}, changed: make(chan struct{}),
 		running: map[string]context.CancelFunc{},
 	}
 	if opt.EdgeGrants != nil {
@@ -323,19 +326,37 @@ func (s *Service) init(ctx context.Context) error {
 		s.cur[s.logical(ns)] = id
 	}
 	rows.Close()
-	rows, err = s.db.QueryContext(ctx, `SELECT substr(k, 8) FROM meta WHERE k LIKE 'purged:%'`)
+	rows, err = s.db.QueryContext(ctx, `SELECT substr(k, 8), v FROM meta WHERE k LIKE 'purged:%'`)
 	if err != nil {
 		return err
 	}
+	var undated []string
 	for rows.Next() {
-		var ns string
-		if err := rows.Scan(&ns); err != nil {
+		var ns, v string
+		if err := rows.Scan(&ns, &v); err != nil {
 			rows.Close()
 			return err
 		}
-		s.purged[ns] = true
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && v != "1" {
+			s.purged[ns] = time.Unix(0, n)
+		} else {
+			undated = append(undated, ns)
+		}
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// A purge recorded by an earlier release has no time ("1"): it counts
+	// as applied now, the later, so edge copies from before it have
+	// expired before trustList counts it (more refusals, never fewer).
+	for _, ns := range undated {
+		now := s.opt.Now()
+		s.purged[ns] = now
+		if _, err := s.db.ExecContext(ctx, `UPDATE meta SET v = ? WHERE k = ?`, strconv.FormatInt(now.UnixNano(), 10), "purged:"+ns); err != nil {
+			return err
+		}
+	}
 	if err := s.reload(ctx); err != nil {
 		return err
 	}
@@ -438,7 +459,8 @@ func (s *Service) View(fn func(g *Graph, cur map[string]string)) {
 func (s *Service) state() (cur string, purged bool, changed <-chan struct{}) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.cur[s.opt.Catalog], s.purged[s.opt.Catalog], s.changed
+	_, purged = s.purged[s.opt.Catalog]
+	return s.cur[s.opt.Catalog], purged, s.changed
 }
 
 // Run follows the catalog and its trusted namespaces until ctx is done.
@@ -497,7 +519,7 @@ func (s *Service) ensureFollowers() {
 
 func (s *Service) follow(ctx context.Context, ns string) {
 	s.mu.RLock()
-	purged := s.purged[ns]
+	_, purged := s.purged[ns]
 	s.mu.RUnlock()
 	if purged {
 		s.opt.Logf("tree: %s was purged; not following", ns)
@@ -672,6 +694,21 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		s.mu.Unlock()
 		return err
 	}
+	// A namespace the catalog no longer trusts leaves every cached listing
+	// of the catalog (ns:{catalog}, which every listing carries), with
+	// edge grants: a g/all cookie issued from now on isn't checked against
+	// it, and an edge serves the g/all listings it holds to every g/all
+	// cookie (§B.11.5). Not ns:{ns}, which would evict all every service
+	// caches of the namespace. Should the purge not land, their edge
+	// lifetime is capped (cdnAll).
+	if s.opt.EdgeGrants != nil {
+		for ns := range oldTrust {
+			if !s.g.Trust[ns] {
+				res.tags = append(res.tags, "ns:"+s.actual(s.opt.Catalog))
+				break
+			}
+		}
+	}
 	// Purge before the new checkpoint is out, so nobody who learns of it
 	// can still be served what it removed. Purgers don't block. Kept
 	// listings go first: one read before it that carries a tag it purges
@@ -682,7 +719,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	}
 	s.cur[b.NS] = b.NewCheckpoint
 	if co.PurgedNS {
-		s.purged[b.NS] = true
+		s.purged[b.NS] = res.purgedAt
 	}
 	trustChanged := !sameSet(oldTrust, s.g.Trust)
 	if trustChanged {
@@ -721,7 +758,8 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 }
 
 type applyResult struct {
-	tags []string
+	tags     []string
+	purgedAt time.Time // when the purge of the batch's namespace was applied
 }
 
 func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc, retitle map[[2]string]string) (*applyResult, error) {
@@ -866,7 +904,8 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			}
 		}
 		if co.PurgedNS {
-			if err := saveMeta(ctx, tx, "purged:"+ns, "1"); err != nil {
+			res.purgedAt = s.opt.Now()
+			if err := saveMeta(ctx, tx, "purged:"+ns, strconv.FormatInt(res.purgedAt.UnixNano(), 10)); err != nil {
 				return nil, err
 			}
 			if _, err := tx.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "config:"+ns); err != nil {
@@ -880,7 +919,8 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		}
 	}
 	if b.NS == cat && co.PurgedNS {
-		if err := saveMeta(ctx, tx, "purged:"+cat, "1"); err != nil {
+		res.purgedAt = s.opt.Now()
+		if err := saveMeta(ctx, tx, "purged:"+cat, strconv.FormatInt(res.purgedAt.UnixNano(), 10)); err != nil {
 			return nil, err
 		}
 	}
@@ -1004,7 +1044,7 @@ func (s *Service) ensureContent(ctx context.Context, ns string) error {
 	defer s.wmu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if s.cur[ns] != cp || s.g.Content[ns] != nil || s.purged[ns] {
+	if _, purged := s.purged[ns]; s.cur[ns] != cp || s.g.Content[ns] != nil || purged {
 		return nil
 	}
 	tx, err := s.db.BeginTx(ctx, nil)

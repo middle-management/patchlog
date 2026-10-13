@@ -48,7 +48,10 @@ func New(e *core.Engine, opts ...Option) *Server {
 		o(s)
 	}
 	if s.cookies == nil {
-		s.cookies = edge.NewCookies(edge.DefaultKid, s.edge.CookieKey())
+		// Never the key derived from the edge secret, which the services
+		// that hold the secret for their own edge lifetimes could derive
+		// too (edge.Verifier.CookieKey): a random key of this process.
+		s.cookies = edge.NewCookies(edge.DefaultKid, nil)
 	}
 	m := s.mux
 	m.HandleFunc("GET /{$}", s.root)

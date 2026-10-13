@@ -109,7 +109,8 @@ func usage() {
   patchlog grant narrow -grant TOKEN -block JSON [-seal]
   patchlog grant seal -grant TOKEN      (grants are Biscuit v3 tokens)
   patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false] [-purge-url URL]... [-edge-secret FILE]
-  patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-access -key SEED -kid KID] [-bearer T] [-author A] [-self-placing] [-purge-url URL]... [-edge-secret FILE]
+  patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-access -key SEED -kid KID [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-origin-edge-grant-kid KID[,KID]]... [-exchange-rate RATE,BURST]]
+                [-bearer T] [-author A] [-self-placing] [-purge-url URL]... [-edge-secret FILE]
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
@@ -174,15 +175,18 @@ func serve(args []string) {
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
 	var edgeGrantKeys multi
-	fs.Var(&edgeGrantKeys, "edge-grant-key", "[KID=]FILE: a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes -edge-grant-kid) (§C.5); FILE "+edgeSecretKey+" is the key derived from -edge-secret, and a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, the key derived from -edge-secret, or else a random one per process, so cookies don't survive a restart or reach another instance")
-	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key given as a plain -edge-grant-key FILE or derived from -edge-secret, which the cookies carry and a verifying edge looks the key up by (§C.5 \"Format\")")
+	fs.Var(&edgeGrantKeys, "edge-grant-key", "[KID=]FILE: a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes -edge-grant-kid) (§C.5); a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, a random key per process, so cookies don't survive a restart, reach another instance or verify at an edge: an edge verifying cookies needs key files. FILE "+edgeSecretKey+" is the key derived from -edge-secret, for migrating to key files only: every holder of the edge secret, services included, can derive it and mint cookies with it")
+	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key given as a plain -edge-grant-key FILE, or of the random one without -edge-grant-key, which the cookies carry and a verifying edge looks the key up by (§C.5 \"Format\")")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
 	ev := edgeVerifier(*edgeSecret, *edgeHeader, *edgePrefixHeader)
-	cookies, err := edgeGrantCookies(*edgeGrantKid, edgeGrantKeys, ev, corsFlags)
+	cookies, warn, err := edgeGrantCookies(*edgeGrantKid, edgeGrantKeys, ev, corsFlags)
 	if err != nil {
 		log.Fatal(err)
+	}
+	for _, w := range warn {
+		log.Print("warning: " + w)
 	}
 	if len(edgeGrantKeys) > 0 {
 		log.Printf("edge grants: minted under kid %s, accepted under %s", cookies.Kid(), strings.Join(cookies.Kids(), ", "))
@@ -409,28 +413,33 @@ func parseRate(s string) (core.Rate, error) {
 	return core.Rate{Rate: r, Burst: b}, nil
 }
 
-// edgeSecretKey, as the FILE of -edge-grant-key, is the key derived from
-// -edge-secret, so a deployment on it can rotate to key files without
-// making clients exchange again (§C.5 "Format"). A file of that name is
-// given as ./edge-secret.
+// edgeSecretKey, as the FILE of the origin's -edge-grant-key, is the key
+// derived from -edge-secret (edge.KeyFromSecret), for migrating a
+// deployment that minted under it to key files without making clients
+// exchange again (§C.5 "Format"). Every holder of the edge secret can
+// derive it, the services that take -edge-secret for their own edge
+// lifetimes included, and mint core cookies with it, so the origin holds
+// it only when named so. A file of that name is given as ./edge-secret.
 const edgeSecretKey = "edge-secret"
 
-// edgeGrantCookies returns the edge-grant cookies of POST /edge-grants
-// (§C.5): under the -edge-grant-key flags, [KID=]FILE, a plain FILE named
-// kid, minting with the last and accepting all, so keys rotate (§C.5
-// "Format"); without one, under the key derived from -edge-secret, else a
-// random one, named kid. A flag is KID=FILE only when no '/' comes before
-// its first '=', so a path holding '=' is a plain FILE; FILE edgeSecretKey
-// is the derived key. They are SameSite=None when pages on other origins
-// may call with credentials (-cors-credentials-origin), else Lax.
-func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsFlags) (*edge.Cookies, error) {
-	if kid == "" {
-		return nil, errors.New("-edge-grant-kid: empty")
-	}
-	var ck *edge.Cookies
-	if len(keyFlags) == 0 {
-		ck = edge.NewCookies(kid, ev.CookieKey())
-	}
+// edgeGrantKey is one -edge-grant-key flag's key and the kid naming it.
+type edgeGrantKey struct {
+	kid, file string
+	key       []byte
+}
+
+// derived reports the key derived from the edge secret (FILE
+// edgeSecretKey).
+func (k edgeGrantKey) derived() bool { return k.file == edgeSecretKey }
+
+// readEdgeGrantKeys reads the keys of -edge-grant-key flags, [KID=]FILE, a
+// plain FILE named kid, in the order given. A flag is KID=FILE only when
+// no '/' comes before its first '=', so a path holding '=' is a plain
+// FILE. A key is its file's bytes, surrounding whitespace trimmed, at
+// least 16; FILE edgeSecretKey is the key derived from ev's secret, which
+// only the origin may hold (origin false refuses it).
+func readEdgeGrantKeys(kid string, keyFlags []string, ev *edge.Verifier, origin bool) ([]edgeGrantKey, error) {
+	var out []edgeGrantKey
 	for _, f := range keyFlags {
 		k, file, ok := strings.Cut(f, "=")
 		if !ok || strings.ContainsAny(k, "/"+string(filepath.Separator)) {
@@ -439,31 +448,80 @@ func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsF
 		if k == "" || file == "" {
 			return nil, fmt.Errorf("-edge-grant-key %q: want KID=FILE or FILE", f)
 		}
-		var key []byte
-		if file == edgeSecretKey {
-			if key = ev.CookieKey(); key == nil {
+		gk := edgeGrantKey{kid: k, file: file}
+		switch {
+		case gk.derived() && !origin:
+			return nil, fmt.Errorf("-edge-grant-key %s: the key derived from -edge-secret is never a service's: the origin may hold it (a file of that name is ./%s)", f, edgeSecretKey)
+		case gk.derived():
+			if gk.key = ev.CookieKey(); gk.key == nil {
 				return nil, fmt.Errorf("-edge-grant-key %s: the key derived from -edge-secret needs -edge-secret (a file of that name is ./%s)", f, edgeSecretKey)
 			}
-		} else {
+		default:
 			b, err := os.ReadFile(file)
 			if err != nil {
 				return nil, fmt.Errorf("-edge-grant-key: %v", err)
 			}
-			key = []byte(strings.TrimSpace(string(b)))
-			if len(key) < 16 {
+			gk.key = []byte(strings.TrimSpace(string(b)))
+			if len(gk.key) < 16 {
 				return nil, fmt.Errorf("-edge-grant-key %s: the key must be at least 16 bytes", file)
 			}
 		}
+		out = append(out, gk)
+	}
+	return out, nil
+}
+
+// cookiesOf returns the edge-grant cookies of keys, oldest first: minting
+// with the last and accepting all, so keys rotate (edge.Cookies.AddKey).
+// They are SameSite=None when pages on other origins may call with
+// credentials (-cors-credentials-origin), else Lax.
+func cookiesOf(keys []edgeGrantKey, c *corsFlags) (*edge.Cookies, error) {
+	var ck *edge.Cookies
+	for _, k := range keys {
 		if ck == nil {
-			ck = edge.NewCookies(k, key)
-		} else if err := ck.AddKey(k, key); err != nil {
-			return nil, fmt.Errorf("-edge-grant-key %s: %v", f, err)
+			ck = edge.NewCookies(k.kid, k.key)
+		} else if err := ck.AddKey(k.kid, k.key); err != nil {
+			return nil, fmt.Errorf("-edge-grant-key %s: %v", k.file, err)
 		}
 	}
 	if co, err := c.credentialOrigins(); err == nil && (len(co) > 0 || *c.credentials) {
 		ck.SameSite = http.SameSiteNoneMode
 	}
 	return ck, nil
+}
+
+// edgeGrantCookies returns the edge-grant cookies of POST /edge-grants
+// (§C.5): under the -edge-grant-key flags (readEdgeGrantKeys), minting
+// with the last and accepting all, so keys rotate (§C.5 "Format");
+// without one, under a random key of this process, named kid, which no
+// edge can verify. It never falls back on the key derived from the edge
+// secret, which every service holding the secret could derive too:
+// FILE edgeSecretKey opts in to it, for migration only. warn says what
+// the operator should know of the choice: a verifying edge without key
+// files, or the derived key held.
+func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsFlags) (ck *edge.Cookies, warn []string, err error) {
+	if kid == "" {
+		return nil, nil, errors.New("-edge-grant-kid: empty")
+	}
+	keys, err := readEdgeGrantKeys(kid, keyFlags, ev, true)
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(keys) == 0 {
+		keys = []edgeGrantKey{{kid: kid}} // a random key (edge.NewCookies)
+		if ev != nil {
+			warn = append(warn, "edge grants: -edge-secret without -edge-grant-key: cookies are signed with a random key of this process, so they verify only at this instance, not after a restart, and no edge can verify them; "+
+				"with several origin instances, cookies one mints are refused by the others, so give every instance the same -edge-grant-key key files. "+
+				"An edge verifying cookies needs those key files too, and must drop the key derived from the edge secret: it is no longer used by default, since every service holding the secret could derive it")
+		}
+	}
+	for _, k := range keys {
+		if k.derived() {
+			warn = append(warn, fmt.Sprintf("edge grants: -edge-grant-key %s=%s holds the key derived from -edge-secret: every holder of the edge secret, the catalog service and the search index included, can derive it and mint cookies for any namespace with it. Use it only to migrate to key files, and drop it once its cookies have expired (§C.5)", k.kid, edgeSecretKey))
+		}
+	}
+	ck, err = cookiesOf(keys, c)
+	return ck, warn, err
 }
 
 // edgeVerifier returns the verifying edge of -edge-secret, or nil.

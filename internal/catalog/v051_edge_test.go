@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +19,10 @@ import (
 
 // edgeKey is the catalog service's own edge-grant key in these tests.
 var edgeKey = []byte("the catalog service's own edge-grant key")
+
+// allCDN is the edge lifetime of a g/all listing: as long as a g/all
+// cookie lives, 15 minutes, and a minute for edges' clocks.
+const allCDN = "max-age=960"
 
 // exchange posts to the service's /edge-grants: with token in
 // Authorization, or with body (marshalled, as contentType), and returns
@@ -355,7 +360,7 @@ func TestServiceEdgeGrantForAll(t *testing.T) {
 	if r.status != 200 || prefixes(r) != "/cat/g/all" || len(cks) != 1 {
 		t.Fatalf("later: %d %v", r.status, r.body)
 	}
-	if r := w.withCookie(now, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != "max-age=31536000" {
+	if r := w.withCookie(now, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != allCDN {
 		t.Errorf("an at including teams after the old cookie expired: %d %v", r.status, r.header)
 	}
 }
@@ -448,8 +453,73 @@ func TestServiceEdgeGrantForAllSharedKey(t *testing.T) {
 		t.Fatalf("later: %d %v", r.status, r.body)
 	}
 	_, now := w.follow("/cat/children?of=season", later)
-	if r := w.withCookie(now, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != "max-age=31536000" {
+	if r := w.withCookie(now, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != allCDN {
 		t.Errorf("an at including teams 16 minutes on: %d %v", r.status, r.header)
+	}
+}
+
+// TestServiceEdgeGrantForAllUntrust (§B.11.5): every g/all cookie unlocks
+// every g/all listing an edge holds, so when the catalog stops trusting a
+// namespace, which a g/all cookie issued from then on isn't checked
+// against, the service purges ns:{catalog}, the tag of every listing of
+// the catalog; not ns:{ns}, which would evict all that every service
+// caches of the namespace. Should that purge be lost, a g/all listing lives
+// at the edge no longer than a g/all cookie, and a minute for edges'
+// clocks; the service itself refuses the new cookie there.
+func TestServiceEdgeGrantForAllUntrust(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	ctx := context.Background()
+	op := w.s.Client(t, client.WithBearer(w.s.OperatorGrant(t, "teams")))
+	must(op.CreateNamespace(ctx, "teams", map[string]any{"read": "grant", "keys": []any{w.opsKey.Entry("*")}}))
+	w.svcClient = w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches", "teams"}, []string{"read"},
+		map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+	w.edgeGrants = edge.NewCookies("catalog-cat", edgeKey)
+	w.edgeOwnKey = true
+	secret := []byte("edge secret shared with the service")
+	w.edge = must(edge.New(secret, "", ""))
+	verified := map[string]string{edge.DefaultHeader: string(secret), edge.DefaultPrefixHeader: "/cat/g/all"}
+	w.start()
+	w.caughtUp()
+	w.s.Clock.Advance(time.Second)
+
+	wide := w.opsKey.Grant(t, w.s.Now(), "user:nw", []string{"cat", "matches"}, []string{"read"},
+		map[string]any{"exp": w.s.Now().Add(time.Hour).Format(time.RFC3339)})
+	r, cks := w.exchange(wide, nil, "")
+	if r.status != 200 || prefixes(r) != "/cat/g/all" || len(cks) != 1 {
+		t.Fatalf("namespace-wide reader: %d %v", r.status, r.body)
+	}
+	_, loc := w.follow("/cat/children?of=season", wide)
+	if r := w.withCookie(loc, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != allCDN ||
+		!slices.Contains(strings.Split(r.header.Get("Cache-Tag"), ","), "ns:cat") {
+		t.Errorf("g/all behind the edge: %d %v", r.status, r.header)
+	}
+	if w.purged("ns:cat") {
+		t.Fatal("ns:cat purged before the catalog stopped trusting matches")
+	}
+
+	// The catalog trusts teams instead of matches.
+	w.s.Clock.Advance(time.Second)
+	opc := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"config"})))
+	must(opc.PatchConfig(ctx, "cat", must(w.ops.NSHead(ctx, "cat")).Config,
+		[]any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{"teams"}}}))
+	waitFor(t, "teams to be followed", func() bool { return w.svc.Tree().Checkpoint("teams") != "" })
+	waitFor(t, "the purge of ns:cat", func() bool { return w.purged("ns:cat") })
+	if w.purged("ns:matches") || w.purged("ns:teams") {
+		t.Error("a content namespace's tag purged")
+	}
+	// A reader with no read on matches now gets a g/all cookie, the same
+	// name and path; the service refuses it at the at including matches.
+	w.s.Clock.Advance(time.Second)
+	narrow := w.opsKey.Grant(t, w.s.Now(), "user:x", []string{"cat", "teams"}, []string{"read"},
+		map[string]any{"exp": w.s.Now().Add(time.Hour).Format(time.RFC3339)})
+	r, cks2 := w.exchange(narrow, nil, "")
+	if r.status != 200 || prefixes(r) != "/cat/g/all" || len(cks2) != 1 || cks2[0].Name != cks[0].Name {
+		t.Fatalf("a reader without matches: %d %v", r.status, r.body)
+	}
+	if r := w.withCookie(loc, cks2[0], verified); r.status != 403 {
+		t.Errorf("the at including matches under the new cookie: %d %v", r.status, r.body)
 	}
 }
 
