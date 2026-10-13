@@ -79,6 +79,9 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 	}
 	g := t.e.bearers.get(cred.Bearer)
 	if g == nil {
+		g = t.decoded[cred.Bearer]
+	}
+	if g == nil {
 		var err error
 		g, err = grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
 		if errors.Is(err, grant.ErrTooLarge) {

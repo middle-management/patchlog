@@ -932,7 +932,7 @@ namespaces only.
 
 The plan endpoint, `POST /playground/schema-import/plan`, takes `{ns, sources: [url…], files:
 [{name, content}…], name?}` and writes nothing. It reads the current heads in process through the
-API handler with the request's own headers (`Authorization`, `X-Author`, an edge secret), so a
+API handler with the request's own headers (`Authorization`, `X-Author`), so a
 caller plans against what their grant may read; a caller who can't read the namespace gets the
 API's own refusal before anything is fetched. It answers `entries`, `resources` (with the
 converted `content`), `bundled`, `warnings` and `batches` (`items` in the batch wire format, and

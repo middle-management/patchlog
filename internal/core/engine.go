@@ -514,6 +514,10 @@ type tx struct {
 	// for an in_use answer's referencing list (§6.1, the rule for other
 	// namespaces of §7.5).
 	reqCreds []Credentials
+	// decoded are bearer grants this transaction already decoded and
+	// hasn't verified (decodeGrant), so a request naming many namespaces
+	// decodes each grant once (POST /edge-grants).
+	decoded map[string]*grant.Grant
 	// deps, when set, records what a write's check phase read that a
 	// concurrent write could change (D.3 re-check).
 	deps *writeDeps

@@ -27,7 +27,7 @@ import (
 //	patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME] [-release /r/{ns}/{release}]
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]
 //	              [-merge-key SEED -merge-kid KID -merge-service SUB [-merge-ttl 5m]]]
-//	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+//	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
 //
 // The service follows the catalog namespace and every namespace in its
 // catalog.trust. -bearer is its own grant, which needs read on all of them.

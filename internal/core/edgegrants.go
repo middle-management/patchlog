@@ -111,6 +111,12 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	}
 	out := &EdgeGrants{Now: e.now()}
 	err := e.read(ctx, func(t *tx) error {
+		t.decoded = map[string]*grant.Grant{}
+		for i, g := range gs {
+			if g != nil {
+				t.decoded[bearers[i]] = g
+			}
+		}
 		var refused *Error
 		refuse := func(err *Error) {
 			if refused == nil || refusalRank(err) < refusalRank(refused) {
@@ -120,6 +126,9 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 		var draws []draw
 		names := 0
 		for i, g := range gs {
+			if refused != nil && refusalRank(refused) == 0 {
+				break // 401 ranks first, so nothing after it changes the answer
+			}
 			if g == nil {
 				refuse(bad[i])
 				continue
@@ -188,6 +197,9 @@ func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials) ([]EdgeGrant, int, d
 		if err != nil {
 			if refused == nil || refusalRank(err) < refusalRank(refused) {
 				refused = err
+			}
+			if refusalRank(refused) == 0 {
+				break // 401 ranks first: the request is refused whatever follows
 			}
 			continue
 		}

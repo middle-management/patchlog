@@ -24,7 +24,7 @@ import (
 //
 //	patchlog index [-api http://localhost:8080] [-db index.db] [-addr :8081] -ns matches,docs
 //	               [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
-//	               [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME]]
+//	               [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
 //
 // Results at /{ns}/at/{ns_id} are immutable and tagged idx:{ns} and
 // r:{ns}/{name} per hit; only the current checkpoint's results are kept.

@@ -519,3 +519,31 @@ func TestV050EdgeGrantsRateLimits(t *testing.T) {
 	expect(t, e.do(req{method: "POST", path: "/edge-grants", bearer: al}), 200)
 	expectRate("allowance", e.do(req{method: "POST", path: "/edge-grants", bearer: al}), "allowance")
 }
+
+// A refused exchange stays cheap, though it draws nothing (§C.5, §6.6):
+// fifty grants of a key no namespace lists, each naming as many unknown
+// namespaces as 8 KiB holds, are decoded once each, and the first 401
+// ends the walk, since nothing after it changes the answer. Decoding each
+// grant again per namespace took seconds.
+func TestV050EdgeGrantsRefusedCheaply(t *testing.T) {
+	t.Parallel()
+	e := newAuthFixture(t, nil).tenv
+	k := newKey("stranger")
+	nss := make([]string, 840)
+	for i := range nss {
+		nss[i] = fmt.Sprintf("n%d", i)
+	}
+	gs := make([]string, 50)
+	for i := range gs {
+		gs[i] = e.grant(k, fmt.Sprintf("user:x%d", i), nss, []string{"read"})
+	}
+	if len(gs[0]) > 8<<10 {
+		t.Fatalf("grant of %d bytes", len(gs[0]))
+	}
+	start := time.Now()
+	r := e.issueGrants(gs...)
+	if took := time.Since(start); r.Code != 401 || took > 5*time.Second {
+		t.Fatalf("%d in %v", r.Code, took)
+	}
+	expectNoCookies(t, "stranger", r)
+}

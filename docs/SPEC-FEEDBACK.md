@@ -131,7 +131,7 @@ Adopted with more than the reference did, which now follows the text:
 - **Writers limited to some resources** (7): intended. There is no sealed gestures listing;
   such a writer scans the logs of the documents it knows the action touched, and learns the
   level from what it reads (§11.2). The client's undo takes those documents
-  (`UndoResources`).
+  (`UndoResources`), except at E3, where it refuses (Open 15).
 - **`min` on `at` URLs** (8) always redirects, dropping `min`, so a `200` is served only at a
   URL without it (§A.5).
 - **The canonical query form** (9): parameters sorted by name, then value, every byte but
@@ -147,7 +147,8 @@ Adopted with more than the reference did, which now follows the text:
 - **Catalog decisions** (Doors S19, F13): they depend on the content namespace too, so
   read-your-writes passes `min` for both; answers carry the combined `checkpoint` they were
   decided at; `/read-grants` answers "may this reader read all of these?" (§B.11.4,
-  §B.11.5). A service may mint edge grants for derived output under its own `kid` (§C.5).
+  §B.11.5). A service may mint edge grants for derived output under its own `kid` (§C.5),
+  which the reference's services don't (Open 5).
 - **Renamed imports** (Doors F14): an import may map a set of namespaces to new names,
   rewriting references and recomputing ids (§G.4.4). Configuration in bundles stays open
   (§G.7).

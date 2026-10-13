@@ -75,8 +75,9 @@ URLs and renamed imports. Addendum D, the Bun prototype, has left the spec.
 - **Catalog decisions carry `checkpoint`**, the combined checkpoint they were decided at (the
   listings' `at`), in `POST /grants`, `/read-grants` and `/merge-grants` answers and in
   refusals that hold at it, so clients key cached decisions by it. `/read-grants` decides
-  every item at one checkpoint: a reader may read all the items it named if no entry has a
-  4xx `error`; public items count as readable (Doors S19, F13).
+  every item at one checkpoint: a reader may read all the items it named if no entry has an
+  `error` (public items count as readable); a `4xx` entry is a refusal, and a `5xx` one is
+  undecided, so the client asks again (Doors S19, F13).
 - **Renamed imports** clone a set of namespaces, on another deployment or the same one:
   full-history documents are rewritten step by step with new ids, never fast-forwarded, with
   `source.ids` recording the source ids; pins take the new ids, in the order they need them;
@@ -88,20 +89,20 @@ URLs and renamed imports. Addendum D, the Bun prototype, has left the spec.
 - **Undo for writers limited to some resources** (§11.2): `client.UndoResources(names…)` undoes,
   redoes and rebuilds the stack from those documents' logs; `UndoPlan.Level` is learned from
   what is read (a JWE log means sealed); e2e is refused (`ErrUndoE2ELimited`), since sealing
-  needs the namespace document. The playground's Undo and Redo do the same for the open
+  needs the namespace document, and so is a gesture that may reach below a pruning horizon,
+  which resource logs can't show. The playground's Undo and Redo do the same for the open
   resource.
 - `derived.CanonicalQuery` builds the canonical form; the index's and tree's `next` URLs use
   it, so they answer without a redirect. The playground's Search tab sends one `sort`.
 - The Varnish VCL strips `X-Edge-Verified` and `X-Edge-Prefix` from requests.
 
 **Fixes:**
+- `POST /edge-grants` decodes each grant once, however many namespaces it names, and stops at
+  the first `401`, so a refused exchange of fifty large grants stays cheap.
 - Index and tree: a non-sealed `at` URL in a non-canonical form was answered `200` there.
 - The index no longer checks a `min` against the core's log before waiting for it.
 - `import -ns` with a single plain name finds schema namespaces named by `$ref` values with a
   `#fragment`.
-- Undo from resource logs whose gesture may reach below a pruning horizon is refused as
-  impossible (`pruned`) instead of being undone in part.
-- Playground: undo reads an e2e resource's head instead of requesting `/rev//log`.
 
 **Docs:** v0.15.0's upgrade notes now name `?min` on `POST /grants` and `/read-grants` (Doors
 S14).
