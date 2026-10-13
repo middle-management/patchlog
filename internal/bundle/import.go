@@ -109,9 +109,9 @@ type ImportOptions struct {
 	Only []string
 	// UpstreamSuffix names the upstream namespace of a source namespace
 	// (default "-upstream": matches → matches-upstream), or of the
-	// namespace a renamed one becomes (matches=cup → cup-upstream). A
-	// name that isn't valid, such as one over the 64 characters of §3.6,
-	// is a CheckError (§G.4.4).
+	// namespace a renamed one becomes (matches=cup → cup-upstream). An
+	// upstream the import uses whose name isn't valid, such as one over
+	// the 64 characters of §3.6, is a CheckError (§G.4.4).
 	UpstreamSuffix string
 	// Resolutions resolve conflicting documents, by source key "ns/name".
 	Resolutions map[string]Resolution
@@ -721,15 +721,21 @@ func (im *importer) load(open Opener) error {
 	return nil
 }
 
-// checkUpstreams checks the names of the upstream namespaces, once the
-// renames that name some of them are known. A renamed namespace's is
-// {dst}-upstream, which must fit the name limit of §3.6 (§G.4.4): one
-// that doesn't is a check problem, before anything is written.
+// checkUpstreams checks the names of the upstream namespaces the import
+// uses, once the renames that name some of them are known: those of the
+// snapshot documents it brings (keys) and holds (heldKeys), as
+// checkAccess reads them. A renamed namespace's is {dst}-upstream, which
+// must fit the name limit of §3.6 (§G.4.4): one that doesn't is a check
+// problem, before anything is written. These problems are reported
+// alone: the other step-1 checks read the upstream namespaces, which a
+// name the server refuses can't be.
 func (im *importer) checkUpstreams() error {
 	srcs := map[string]bool{}
-	for _, d := range im.docs {
-		if d.info.History == Snapshot {
-			srcs[d.ns] = true
+	for _, ks := range [][]string{im.keys, im.heldKeys} {
+		for _, k := range ks {
+			if d := im.docs[k]; d.info.History == Snapshot {
+				srcs[d.ns] = true
+			}
 		}
 	}
 	var problems []string
@@ -747,7 +753,11 @@ func (im *importer) checkUpstreams() error {
 		}
 		why := "isn't a valid namespace name (§3.6): choose another upstream suffix"
 		if len(u) > maxNSName {
-			why = fmt.Sprintf("is %d characters, over the %d a namespace name may have (§3.6, §G.4.4): choose a shorter name, or a shorter upstream suffix", len(u), maxNSName)
+			shorter := "choose a shorter name"
+			if _, ok := im.renames[ns]; !ok {
+				shorter = "map it to a shorter name (-ns src=dst)"
+			}
+			why = fmt.Sprintf("is %d characters, over the %d a namespace name may have (§3.6, §G.4.4): %s, or a shorter upstream suffix", len(u), maxNSName, shorter)
 		}
 		problems = append(problems, what+" "+why)
 	}

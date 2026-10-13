@@ -1929,7 +1929,7 @@ patchlog import -i all.jsonl -atomic -ns demo-schemas=demo2-schemas,demo=demo2  
   unmapped namespaces that reference a renamed one are rewritten too, in their own namespace.
   Snapshot documents are rewritten as well, and go through `{dst}-upstream`, a name that must fit
   the 64 characters of §3.6: one that doesn't is refused before anything is written, as is any
-  upstream name that isn't valid. The new ids are computed before anything is
+  upstream name the import uses that isn't valid. The new ids are computed before anything is
   written, and a batch goes once those of the revisions it pins have committed, checking the
   ids it produced, so dependents are written with the ids their dependencies returned. A
   re-run of the same bundle computes the same ids and writes nothing; where nonces make them
