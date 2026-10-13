@@ -43,9 +43,10 @@ import (
 //
 // Listings live at /{catalog}/at/{at}/… where at is the combined checkpoint
 // over the catalog and every followed content namespace (§B.5); they are
-// immutable and tagged r:{ns}/{name} and ns:{ns}. Read-your-writes:
-// ?min={ns}:{ns_id}, repeatable. Cache purges go to the CDN at -purge-url
-// (repeatable), and are logged if it is unset.
+// immutable, answered only at the canonical form of their query (§A.5), and
+// tagged r:{ns}/{name} and ns:{ns}. Read-your-writes: ?min={ns}:{ns_id},
+// repeatable, which always redirects (§A.5). Cache purges go to the CDN at
+// -purge-url (repeatable), and are logged if it is unset.
 //
 // Encrypted namespaces (Addendum E) work as for patchlog index: -enc-key is
 // the service's X25519 private key; listings of a sealed or e2e catalog are

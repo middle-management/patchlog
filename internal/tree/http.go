@@ -18,6 +18,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/telemetry"
@@ -359,7 +360,16 @@ var ops = map[string]bool{
 //
 // ?min= waits until the service has applied an ns_id (§A.5): {ns}:{ns_id}
 // for the catalog or a followed content namespace, repeatable, or a bare
-// {ns_id} of any of them.
+// {ns_id} of any of them. It always redirects (§A.5): an at URL whose
+// listing already includes every min (the current at, or a kept one whose
+// checkpoints show it does, atIncludes) to itself without min, anything
+// else, once every min is reached, to the current at.
+//
+// Redirects name the query in its canonical form (§A.5,
+// derived.CanonicalQuery), and so does a children listing's next; an at
+// URL is answered 200 only in that form and without min, and one in
+// another form is redirected to it. Every parameter but min is
+// single-valued: given more than once, it is 400 bad_input.
 //
 // A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles are
 // the only values a listing takes from documents' content (names, heads,
@@ -368,8 +378,7 @@ var ops = map[string]bool{
 // the catalog. A reader of the whole catalog gets the listing sealed as
 // one JWE under the catalog's current epoch key, Content-Type
 // application/jose, pl { ns, view } where view is the listing's request
-// target (/{catalog}/at/{at}[/g/{gs}]/{op}?{query}; an at URL whose query
-// isn't in the canonical form the redirects give is redirected to it). A
+// target (/{catalog}/at/{at}[/g/{gs}]/{op}?{query}, the canonical form). A
 // reader whose grant restricts catalog resources (or who sees nodes only
 // through roles) gets JSON in which every node with a title carries
 // "sealed": JWE of { title } under that catalog resource's K_r, pl { ns,
@@ -468,6 +477,16 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	vals := r.URL.Query()
+	// Every parameter but min is single-valued, read as its first value,
+	// and the canonical form sorts a repeated one's values (§A.5): a
+	// repeat would change what a redirect means, so it is refused.
+	for k, vs := range vals {
+		if len(vs) > 1 && k != "min" {
+			w.Header().Set("Cache-Control", "no-store")
+			WriteError(w, http.StatusBadRequest, "bad_input", k+" given more than once")
+			return
+		}
+	}
 	base := "/" + cat + "/at/"
 	target := func(cp string) string {
 		if v.anon {
@@ -510,21 +529,33 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteError(w, http.StatusServiceUnavailable, "behind", "the tree service has not reached the catalog yet")
 		return
 	}
-	// canon is the canonical URL of this listing at an at: what redirects
-	// name, what listings are kept under (with the reader's shape), and
-	// in a sealed or e2e catalog the view a listing is bound to (§E.2.6).
-	canon := func(at string) string { return target(at) + encodeQuery(vals, "min") }
+	// canon is the canonical URL of this listing at an at (§A.5): what
+	// redirects name, what listings are kept under (with the reader's
+	// shape), and in a sealed or e2e catalog the view a listing is bound
+	// to (§E.2.6). Only it is answered 200: another form of it, or one
+	// with min, is redirected.
+	canon := func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
 	keyOf := func(at string) string { return canon(at) + "\n" + v.shape() }
 	keep := !perReader(op, v)
 	var cur string
 	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
 	own := isAt && gs == v.gs && !(v.anon && gs != "")
-	if own && keep && (at == cur || len(vals["min"]) == 0) {
+	mins := len(vals["min"]) > 0
+	canonical := r.URL.RequestURI() == canon(at)
+	if own && mins && at != cur && s.atIncludes(ctx, at, vals["min"], keyOf(at), keep) {
+		// min always redirects (§A.5): an older at that already includes
+		// every min to itself without it. The current at needs no
+		// judging: the redirect to the current at below names the same
+		// URL, with the listing computed and kept there first.
+		setPtr()
+		redirect(w, canon(at))
+		return
+	}
+	if own && keep && !mins {
 		// A kept listing answers its at however far the checkpoint has
-		// moved since; with ?min=, only the current one, which min was
-		// waited for.
-		if st, bound, ok := s.kept.Get(keyOf(at)); ok {
-			if bound && r.URL.RequestURI() != canon(at) {
+		// moved since.
+		if st, _, ok := s.kept.Get(keyOf(at)); ok {
+			if !canonical {
 				setPtr()
 				redirect(w, canon(at))
 				return
@@ -533,12 +564,12 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			return
 		}
 	}
-	if !own || at != cur {
-		// Head pointer, another URL space, or an at whose listing isn't
-		// kept: redirect to the current at, with the listing computed
-		// there and kept, so the redirect is answered even if the
-		// checkpoint moves on before it is followed. If it can't be
-		// computed, the at URL says why.
+	if !own || at != cur || mins {
+		// Head pointer, another URL space, an at whose listing isn't
+		// kept, or a min waited for (§A.5): redirect to the current at,
+		// with the listing computed there and kept, so the redirect is
+		// answered even if the checkpoint moves on before it is followed.
+		// If it can't be computed, the at URL says why.
 		to := cur
 		if _, _, ok := s.kept.Get(keyOf(cur)); keep && !ok {
 			if info, key, err := s.keys.Current(ctx, cat); err == nil {
@@ -551,6 +582,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		redirect(w, canon(to))
 		return
 	}
+	if !canonical {
+		setPtr()
+		redirect(w, canon(at))
+		return
+	}
 
 	info, key, err := s.keys.Current(ctx, cat)
 	if err != nil {
@@ -558,12 +594,6 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
 		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals listings of the catalog")
-		return
-	}
-	if info.Protected() && r.URL.RequestURI() != canon(at) {
-		// Only the canonical form of a sealed listing's URL is served.
-		setPtr()
-		redirect(w, canon(at))
 		return
 	}
 	l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key)
@@ -616,8 +646,10 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		serr error
 	)
 	perEntry := info.Protected() && !v.catAll
+	var cps map[string]string
 	s.View(func(g *Graph, curMap map[string]string) {
 		l.at, nss = CombinedAt(g, curMap)
+		cps = checkpointsOf(g, curMap)
 		view = derived.View{NS: cat, Target: canon(l.at)}
 		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at}
 		if perEntry {
@@ -665,7 +697,95 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		}
 	}
 	l.st, _ = s.kept.Put(keyOf(l.at), cat, gen, info.Protected(), l.st)
+	s.recordAt(l.at, cps)
 	return l, nil
+}
+
+// atRecord is what a combined at is over: each namespace's checkpoint, by
+// the name listings and min use (in a release preview, the base's).
+type atRecord struct {
+	cps map[string]string
+	exp time.Time
+}
+
+// checkpointsOf is the checkpoints CombinedAt hashes, keyed as cur is.
+func checkpointsOf(g *Graph, cur map[string]string) map[string]string {
+	cps := map[string]string{}
+	if id := cur[g.Catalog]; id != "" {
+		cps[g.Catalog] = id
+	}
+	for ns := range g.Trust {
+		if id := cur[ns]; id != "" {
+			cps[ns] = id
+		}
+	}
+	return cps
+}
+
+// recordAt records the checkpoints behind at, a listing of which was just
+// kept, for as long as kept listings are (kept.For), so atIncludes can
+// judge a min on an older at.
+func (s *Service) recordAt(at string, cps map[string]string) {
+	now := s.opt.Now()
+	s.amu.Lock()
+	defer s.amu.Unlock()
+	if s.ats == nil {
+		s.ats = map[string]atRecord{}
+	}
+	if _, ok := s.ats[at]; !ok {
+		for a, rec := range s.ats {
+			if now.After(rec.exp) {
+				delete(s.ats, a)
+			}
+		}
+	}
+	s.ats[at] = atRecord{cps: cps, exp: now.Add(kept.For)}
+}
+
+// atIncludes reports whether the listing at an older at already includes
+// every min of vals (§A.5 "min always redirects"), once AwaitMins has
+// waited for them. It is judged only while the listing is kept (key, if
+// keep) and its checkpoints are recorded (recordAt): each {ns}:{ns_id}
+// must be ns's checkpoint there or one the core's log places before it
+// (since=min is accepted only if min is in the chain up to it, §7.1), and
+// a bare ns_id, whose namespace isn't named, never counts. An at it can't
+// judge redirects to the current one.
+func (s *Service) atIncludes(ctx context.Context, at string, vals []string, key string, keep bool) bool {
+	if !keep {
+		return false
+	}
+	if _, _, ok := s.kept.Get(key); !ok {
+		return false
+	}
+	s.amu.Lock()
+	rec, ok := s.ats[at]
+	s.amu.Unlock()
+	if !ok {
+		return false
+	}
+	mins, err := parseMins(vals)
+	if err != nil {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for _, m := range mins {
+		if m.ns == "" {
+			return false
+		}
+		ns := s.logical(m.ns)
+		id, ok := rec.cps[ns]
+		if !ok {
+			return false
+		}
+		if id == m.id {
+			continue
+		}
+		if _, _, err := s.c.NSLogPage(ctx, s.actual(ns), id, m.id); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // perReader reports whether an answer to op may be served depends
@@ -925,21 +1045,6 @@ func (s *Service) reached(ctx context.Context, m minRef) bool {
 	return s.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns = ? AND ns_id = ?`, m.ns, m.id).Scan(&one) == nil
 }
 
-// encodeQuery encodes the query canonically (sorted keys) without drop.
-func encodeQuery(v url.Values, drop ...string) string {
-	c := url.Values{}
-	for k, vals := range v {
-		c[k] = vals
-	}
-	for _, d := range drop {
-		delete(c, d)
-	}
-	if s := c.Encode(); s != "" {
-		return "?" + s
-	}
-	return ""
-}
-
 func redirect(w http.ResponseWriter, loc string) {
 	w.Header().Set("Location", loc)
 	w.WriteHeader(http.StatusFound)
@@ -1161,7 +1266,7 @@ func (q *query) children() (any, int, string) {
 			nv.Set("unordered", "1")
 		}
 		nv.Set("name", last.Node.Name)
-		body["next"] = "?" + nv.Encode()
+		body["next"] = derived.CanonicalQuery(nv)
 	}
 	return body, http.StatusOK, ""
 }

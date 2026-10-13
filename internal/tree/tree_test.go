@@ -835,7 +835,7 @@ func TestManyTag(t *testing.T) {
 	must(w.c.Batch(context.Background(), "cat", client.BatchRequest{Items: items}, false))
 	x := startSvc(t, w.c, svcOpts{})
 	x.caughtUp("cat", "matches")
-	r := x.raw("/cat/at/"+x.s.At()+"/children?of=root&limit=1000", "")
+	r := x.raw("/cat/at/"+x.s.At()+"/children?limit=1000&of=root", "")
 	if r.status != 200 || r.header.Get("Cache-Tag") != "ns:cat,ns:matches,rs:cat" {
 		t.Fatalf("large listing: %d %s", r.status, r.header.Get("Cache-Tag"))
 	}

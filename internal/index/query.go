@@ -30,8 +30,9 @@ import (
 //	                    path are ORed, different paths ANDed
 //	gt|ge|lt|le[/path]=v range filter on an x-index "sort" field: a number compares with
 //	                    numbers, anything else with strings (RFC 3339 date-times normalised)
-//	sort=/path | -/path order by a "sort" field (repeatable; missing values last); default:
-//	                    score (with q), then resource name
+//	sort=/a,-/b         order by "sort" fields, keys comma-separated, - for descending
+//	                    (once, §A.5; missing values last); default: score (with q),
+//	                    then resource name
 //	counts=/path        facet counts over all hits (repeatable)
 //	fields=/a,/b        also show those indexed fields in hits, "text" ones included; a path
 //	                    no schema of the namespace's documents marks with x-index is 400,
@@ -152,7 +153,12 @@ func ParseQuery(v url.Values) (*Query, error) {
 				q.Mins = append(q.Mins, m)
 			}
 		case "sort":
-			for _, s := range vals {
+			// One parameter, keys comma-separated: the canonical form
+			// sorts repeated values (§A.5), so their order can't matter.
+			if len(vals) > 1 {
+				return nil, fmt.Errorf("sort given more than once; separate keys with commas (sort=-/kickoff,/title)")
+			}
+			for _, s := range strings.Split(vals[0], ",") {
 				sk := sortKey{path: s}
 				if strings.HasPrefix(s, "-") {
 					sk = sortKey{path: s[1:], desc: true}

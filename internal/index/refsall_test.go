@@ -242,12 +242,12 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	if r.status != 200 || refsAllHits(r.body) != "pa/a1 pa/a2 pub/p1" {
 		t.Errorf("kept answer: %d %v", r.status, r.body)
 	}
-	// It is answered with a min it already includes: its checkpoint of
-	// that namespace, or one before it.
+	// With a min it already includes, its checkpoint of that namespace or
+	// one before it, it redirects to itself without min (§A.5).
 	paAt := r.body["namespaces"].(map[string]any)["pa"].(string)
 	for _, m := range []string{paAt, a1} {
-		if r := idx.raw(amyLoc+"&min=pa:"+m, amy); r.status != 200 || refsAllHits(r.body) != "pa/a1 pa/a2 pub/p1" || r.body["at"] != amyAt {
-			t.Errorf("kept answer with min pa:%s: %d %v", m, r.status, r.body)
+		if r := idx.raw(amyLoc+"&min=pa:"+m, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
+			t.Errorf("kept answer with min pa:%s: %d %s", m, r.status, r.header.Get("Location"))
 		}
 	}
 	for _, p := range []string{
@@ -258,14 +258,25 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
 		}
 	}
-	// The query in another form is the same query: a client adds after to
-	// an at URL (below).
-	if r := idx.raw("/_refs/at/"+amyAt+"/g/"+amyGs+"?to="+x, amy); r.status != 200 || refsAllHits(r.body) != "pa/a1 pa/a2 pub/p1" {
-		t.Errorf("not canonical: %d %v", r.status, r.body)
+	// The query in another form redirects to the canonical one, at the
+	// same at (§A.5).
+	if r := idx.raw("/_refs/at/"+amyAt+"/g/"+amyGs+"?to="+x, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
+		t.Errorf("not canonical: %d %s", r.status, r.header.Get("Location"))
 	}
 	// Someone else's subject set redirects to one's own, at the same at.
 	if r := idx.raw(bobLoc, amy); r.status != 302 || r.header.Get("Location") != "/_refs/at/"+bobAt+"/g/"+amyGs+q {
 		t.Errorf("foreign gs: %d %s", r.status, r.header.Get("Location"))
+	}
+	// With min, it goes into one's own straight away, without min (§A.5):
+	// to the same at if its kept answer includes min, or else to the
+	// current one.
+	for p, want := range map[string]string{
+		"/_refs/at/" + amyAt + "/g/" + bobGs + q + "&min=pa:" + a1: amyLoc,
+		bobLoc + "&min=pa:" + a1:                                   newLoc,
+	} {
+		if r := idx.raw(p, amy); r.status != 302 || r.header.Get("Location") != want {
+			t.Errorf("foreign gs, with min: %s: %d %s, want %s", p, r.status, r.header.Get("Location"), want)
+		}
 	}
 
 	// Pages: in namespace, then resource order; next is the after of the
@@ -279,7 +290,16 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		if !ok {
 			break
 		}
-		r := idx.raw(loc+"&after="+url.QueryEscape(next), bob)
+		// after appended to the at URL redirects once to the canonical
+		// form; a client that builds it so (sorted, %-encoded) gets 200.
+		u := must(url.Parse(loc))
+		v := u.Query()
+		v.Set("after", next)
+		canon := u.Path + derived.CanonicalQuery(v)
+		if r := idx.raw(loc+"&after="+url.QueryEscape(next), bob); r.status != 302 || r.header.Get("Location") != canon {
+			t.Fatalf("after %s appended: %d %s, want %s", next, r.status, r.header.Get("Location"), canon)
+		}
+		r := idx.raw(canon, bob)
 		if r.status != 200 || r.body["at"] != b["at"] {
 			t.Fatalf("after %s: %d %v", next, r.status, r.body)
 		}
@@ -296,7 +316,8 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}
 
 	// If the namespace document of one the grant names can't be read, the
-	// answer is 502; one it doesn't name is left out, as a private one.
+	// answer is 502; any other is left out, as one the reader can't see
+	// (§A.4).
 	// A document the index checked within CheckerTTL is still used, so its
 	// cache is expired first: the index has to read pb's again.
 	failPB.Store(true)

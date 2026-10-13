@@ -42,9 +42,12 @@ import (
 // and maximum as for other queries), strictly after after, {ns}/{name}
 // compared as the pair split at its first "/"; next is the after of the
 // following page. ?min={ns}:{ns_id}, repeatable, waits as elsewhere
-// (§A.5); a min for a namespace the answer doesn't cover is 400. On an at
-// URL, an at whose answer is kept and includes every min is answered
-// there.
+// (§A.5); a min for a namespace the answer doesn't cover is 400. min always
+// redirects (§A.5): once every min is reached, on an at URL whose answer
+// is kept and includes every min, to that URL without min, otherwise to
+// the current at, in the reader's subject set either way. Redirects name the query in its canonical form (§A.5,
+// derived.CanonicalQuery), and an at URL in another form is redirected to
+// it.
 //
 // gs is computed as for subject sets (§B.11.5), over markers of what the
 // answer depends on: for every private namespace the reader reads
@@ -58,8 +61,8 @@ import (
 // text(trunc160(sha256(canonical({ ns: ns_id, … })))), over the
 // namespaces the answer covers; namespaces lists them. So writes in
 // namespaces the reader can't see never move it. If the namespace document
-// of one the grant names can't be read, the answer is 502; one the grant
-// doesn't name is then left out, as a private one.
+// of one the grant names can't be read, the answer is 502; any other is
+// left out, as one the reader can't see.
 //
 // Hits from sealed and e2e namespaces carry ns, resource, id and url in the
 // clear and the rest as "sealed": a JWE under the resource's K_r, pl { ns,
@@ -346,9 +349,11 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			w.Header().Set("Surrogate-Control", "no-store")
 		}
 	}
-	if at != "" && gs != rd.gs {
+	// Another subject set's URL space: redirected into the reader's. With
+	// min, the redirects below land there, without min (§A.5).
+	if at != "" && gs != rd.gs && len(rq.mins) == 0 {
 		setPtr()
-		redirect(w, "/_refs/at/"+at+"/g/"+rd.gs+encodeQuery(vals))
+		redirect(w, "/_refs/at/"+at+"/g/"+rd.gs+derived.CanonicalQuery(vals))
 		return
 	}
 	for _, m := range rq.mins {
@@ -358,14 +363,24 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			return
 		}
 	}
-	// target is the canonical URL of the answer at an at: what redirects
-	// name, what answers are kept under, and the view a sealed hit is
-	// bound to (§E.2.6), so an answer with one is served there alone.
-	target := func(at string) string { return "/_refs/at/" + at + "/g/" + rd.gs + encodeQuery(vals, "min") }
+	// target is the canonical URL of the answer at an at (§A.5): what
+	// redirects name, what answers are kept under, and the view a sealed
+	// hit is bound to (§E.2.6). Only it is answered 200: another form of
+	// it, or one with min, is redirected.
+	target := func(at string) string { return "/_refs/at/" + at + "/g/" + rd.gs + derived.CanonicalQuery(vals, "min") }
+	// min is waited for first, so no min is judged against the core's log
+	// before the index has reached it.
+	if !ix.waitMins(ctx, rq.mins) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "1")
+		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
+		return
+	}
 	if at != "" {
-		// An at that already includes every min answers (§A.4).
-		if st, bound, ok := ix.refsStored(ctx, rd, target(at)); ok && ix.refsIncludes(ctx, st, rq.mins) {
-			if bound && r.URL.RequestURI() != target(at) {
+		if st, _, ok := ix.refsStored(ctx, rd, target(at)); ok && ix.refsIncludes(ctx, st, rq.mins) {
+			// A kept answer, whose at already includes every min:
+			// answered there, at its canonical URL without min (§A.5).
+			if r.URL.RequestURI() != target(at) {
 				setPtr()
 				redirect(w, target(at))
 				return
@@ -374,13 +389,9 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 			return
 		}
 	}
-	if !ix.waitMins(ctx, rq.mins) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Retry-After", "1")
-		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
-		return
-	}
-	st, cur, bound, err := ix.refsAnswer(ctx, rd, rq, target)
+	// Any other at, one kept answers no longer cover, isn't judged: with
+	// or without min, it is redirected to the current one.
+	st, cur, _, err := ix.refsAnswer(ctx, rd, rq, target)
 	if err != nil {
 		if errors.Is(err, errRefsKeys) {
 			w.Header().Set("Retry-After", "5")
@@ -391,7 +402,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		writeErr(w, http.StatusInternalServerError, "internal", "query failed")
 		return
 	}
-	if at != cur || bound && r.URL.RequestURI() != target(at) {
+	if at != cur || r.URL.RequestURI() != target(at) {
 		setPtr()
 		redirect(w, target(cur))
 		return

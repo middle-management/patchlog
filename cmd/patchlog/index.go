@@ -28,9 +28,11 @@ import (
 //
 // Results at /{ns}/at/{ns_id} are immutable and tagged idx:{ns} and
 // r:{ns}/{name} per hit; only the current checkpoint's results are kept.
-// Read-your-writes: ?min={ns_id} or ?min={ns}:{ns_id}, repeatable. Cache
-// purges go to the CDN at -purge-url (repeatable), and are logged if it is
-// unset.
+// Read-your-writes: ?min={ns_id} or ?min={ns}:{ns_id}, repeatable, which
+// always redirects (§A.5). Results are answered only at the canonical form
+// of their query (§A.5); a multi-key sort is one parameter,
+// sort=-/kickoff,/title. Cache purges go to the CDN at -purge-url
+// (repeatable), and are logged if it is unset.
 //
 // Encrypted namespaces (Addendum E): sealed ones are read with keys from
 // POST /ns/{ns}/keys with -bearer's grant; -enc-key is the service's X25519
