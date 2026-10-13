@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **Weak ETags.** A reverse proxy that compresses responses (nginx `gzip`, Caddy `encode`, a
+  CDN) turns the server's strong ETags into weak ones, `W/"…"`, around the same id. The
+  playground kept the `W/"` in the ids it read, so its namespace logs and listings asked for
+  `/ns/{ns}/rev/W/"…` and got `400 non-canonical URL`, and the Go client (`patchlog import`,
+  export, follow) did the same. Both now take the id either way. Conditional reads already
+  matched weak validators.
+
 ## v0.18.0
 
 Server time per write. On the synthetic Demo Play bundle under a 10,000/s allowance, `patchlog

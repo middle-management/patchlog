@@ -316,8 +316,12 @@ func (r *response) obj() map[string]any {
 	return m
 }
 
-// etag returns the unquoted strong ETag.
-func (r *response) etag() string { return strings.Trim(r.header.Get("ETag"), `"`) }
+// etag returns the id an ETag carries, unquoted: the server's are strong,
+// but a proxy that compresses responses makes them weak (W/"…"), around the
+// same id.
+func (r *response) etag() string {
+	return strings.Trim(strings.TrimPrefix(r.header.Get("ETag"), "W/"), `"`)
+}
 
 // request describes one call.
 type request struct {

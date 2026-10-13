@@ -345,9 +345,12 @@ function wrap(e) {
     finalPath: e.finalPath, redirected: e.redirected, neterr: e.neterr, bin: e.bin,
     jose: !!(e.resHeaders && /^application\/jose\b/i.test(e.resHeaders.get('Content-Type') || '')),
     hdr: (k) => (e.resHeaders ? e.resHeaders.get(k) : null),
-    etag() { const v = this.hdr('ETag'); return v ? v.replace(/^"|"$/g, '') : ''; },
+    etag() { return etagID(this.hdr('ETag')); },
   };
 }
+/* etagID is the id an ETag carries, unquoted: the server's are strong, but a proxy that compresses responses
+ * makes them weak (W/"…"), around the same id, which would otherwise end up in URLs and preconditions. */
+function etagID(v) { return v ? v.trim().replace(/^W\//, '').replace(/^"|"$/g, '') : ''; }
 
 /* ------------------------------------------------------------------ *
  * connection bar
