@@ -1925,8 +1925,11 @@ patchlog import -i all.jsonl -atomic -ns demo-schemas=demo2-schemas,demo=demo2  
   source ids; a test op tests for the rewritten value, and a reference whose position a later
   schema declares is rewritten by a `replace` op added to that step. In a sealed target, or one
   that requires nonces, rewritten steps get a fresh `$nonce`. A document whose steps change
-  nothing keeps its ids, since ids don't include the namespace. Snapshot documents are
-  rewritten too, and go through `{dst}-upstream`. The new ids are computed before anything is
+  nothing keeps its ids, since ids don't include the namespace. Documents of the bundle's
+  unmapped namespaces that reference a renamed one are rewritten too, in their own namespace.
+  Snapshot documents are rewritten as well, and go through `{dst}-upstream`, a name that must fit
+  the 64 characters of §3.6: one that doesn't is refused before anything is written, as is any
+  upstream name that isn't valid. The new ids are computed before anything is
   written, and a batch goes once those of the revisions it pins have committed, checking the
   ids it produced, so dependents are written with the ids their dependencies returned. A
   re-run of the same bundle computes the same ids and writes nothing; where nonces make them

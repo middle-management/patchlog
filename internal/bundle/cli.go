@@ -378,7 +378,8 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	bearer := fs.String("bearer", "", "grant sent as Authorization: Bearer")
 	author := fs.String("author", "", "X-Author (development servers only)")
 	create := fs.Bool("create", true, "create missing target and upstream namespaces")
-	suffix := fs.String("upstream-suffix", "-upstream", "suffix of upstream namespaces for snapshot documents")
+	suffix := fs.String("upstream-suffix", "-upstream", "suffix of upstream namespaces for snapshot documents, after the new name of a renamed namespace (-ns src=dst: dst-upstream); "+
+		"an upstream name over the 64 characters of a namespace name is refused before anything is written (§3.6, §G.4.4)")
 	asJSON := fs.Bool("json", false, "print the report as JSON")
 	var resolves multiFlag
 	fs.Var(&resolves, "resolve", "resolve a conflict: ns/name=skip|take|replay (repeatable)")
