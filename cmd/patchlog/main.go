@@ -510,8 +510,9 @@ func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsF
 	if len(keys) == 0 {
 		keys = []edgeGrantKey{{kid: kid}} // a random key (edge.NewCookies)
 		if ev != nil {
-			warn = append(warn, "edge grants: -edge-secret without -edge-grant-key: cookies are signed with a random key of this process, so they verify only at this origin and no edge can verify them; "+
-				"an edge verifying cookies needs -edge-grant-key key files, which it holds too. The key derived from the edge secret is no longer used by default: every service holding the secret could derive it")
+			warn = append(warn, "edge grants: -edge-secret without -edge-grant-key: cookies are signed with a random key of this process, so they verify only at this instance, not after a restart, and no edge can verify them; "+
+				"with several origin instances, cookies one mints are refused by the others, so give every instance the same -edge-grant-key key files. "+
+				"An edge verifying cookies needs those key files too, and must drop the key derived from the edge secret: it is no longer used by default, since every service holding the secret could derive it")
 		}
 	}
 	for _, k := range keys {

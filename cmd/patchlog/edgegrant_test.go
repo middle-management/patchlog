@@ -120,6 +120,12 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 		if got := strings.Join(warn, "\n"); (v != nil) != strings.Contains(got, "-edge-grant-key") {
 			t.Errorf("no key, edge %v: warnings %q", v != nil, got)
 		}
+		// Several origin instances no longer share a key, and an edge must
+		// stop deriving one.
+		if got := strings.Join(warn, "\n"); v != nil && (!strings.Contains(got, "only at this instance") ||
+			!strings.Contains(got, "several origin instances") || !strings.Contains(got, "must drop the key derived from the edge secret")) {
+			t.Errorf("no key, edge: warnings %q", got)
+		}
 	}
 	// Given -edge-grant-key, the derived key isn't held, unless named by
 	// FILE edge-secret: then a cookie minted under it alone verifies once

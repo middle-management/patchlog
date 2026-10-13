@@ -2,6 +2,7 @@ package catalog_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"strings"
@@ -72,8 +73,11 @@ func (w *world) purge(ns string) string {
 // sealed or not, POST /edge-grants answers 410 purged with head after the
 // read check, as its listings do; for a sealed one the core makes that
 // check (its documents are 410). A read under a cookie minted before the
-// purge is 410 purged too: the cookie stood for a subject set that could
-// read, and is never sent to the core as an anonymous read.
+// purge is 410 purged too, never sent to the core as an anonymous read:
+// with head under a g/all cookie, whose exchange read the catalog, and
+// without under a subject set's, which a grant without read on the
+// catalog may have got (RoleView), as the core shows a purged catalog's
+// head only to its readers.
 func TestPurgedCatalogEdgeGrants(t *testing.T) {
 	t.Parallel()
 	for _, sealed := range []bool{false, true} {
@@ -109,12 +113,20 @@ func TestPurgedCatalogEdgeGrants(t *testing.T) {
 			if r, _ := w.exchange(other, nil, ""); r.status != 403 {
 				t.Errorf("a grant for matches only: %d %v", r.status, r.body)
 			}
-			for _, name := range []string{"all", "bob"} {
+			if byName["all prefix"].Name != "/cat/g/all" || byName["bob prefix"].Name == "/cat/g/all" {
+				t.Fatalf("prefixes: all %s, bob %s", byName["all prefix"].Name, byName["bob prefix"].Name)
+			}
+			for name, want := range map[string]any{"all": head, "bob": nil} {
 				path := byName[name+" prefix"].Name + "/at/" + head + "/roots"
-				if r := w.withCookie(path, byName[name], nil); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != head ||
-					r.header.Get("WWW-Authenticate") != "" {
+				if r := w.withCookie(path, byName[name], nil); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != want ||
+					r.header.Get("WWW-Authenticate") != "" || r.header.Get("Cache-Control") != "no-store" {
 					t.Errorf("%s: a cookie from before the purge: %d %v %v", name, r.status, r.body, r.header)
 				}
+			}
+			// bob's subject set has no read on the catalog: a grant of its
+			// own, as a bearer, gets no head from the core either.
+			if r := w.do("GET", "/cat/roots", bob, nil); sealed && r.status != 403 {
+				t.Errorf("bob as a bearer: %d %v", r.status, r.body)
 			}
 		})
 	}
@@ -124,7 +136,14 @@ func TestPurgedCatalogEdgeGrants(t *testing.T) {
 // namespace has no live items, so every reader reads it whole, sealed or
 // not (its documents are 410 once a sealed one is purged): a reader of the
 // catalog and every other trusted namespace keeps the unfiltered g/all
-// listings and edge grants, and so does a reader that never read it.
+// listings and edge grants, and so does a reader that never read it. With
+// edge grants, only once an edge's g/all listings from before the purge,
+// which show its last items to every g/all cookie, have surely expired:
+// until a g/all listing's edge lifetime has passed since the service
+// applied the purge, which a restart keeps, each reader's grant is
+// checked as before, and a sealed one is read whole by nobody. A purge
+// recorded by an earlier release, without a time, counts as applied when
+// the service starts.
 func TestPurgedContentKeepsAll(t *testing.T) {
 	t.Parallel()
 	for _, sealed := range []bool{false, true} {
@@ -135,23 +154,54 @@ func TestPurgedContentKeepsAll(t *testing.T) {
 			w.seed()
 			w.start()
 			w.caughtUp()
-			full := w.opsKey.Grant(t, w.s.Now(), "user:r", []string{"cat", "matches"}, []string{"read"})
-			catOnly := w.opsKey.Grant(t, w.s.Now(), "user:c", []string{"cat"}, []string{"read"})
-			if r := w.do("GET", "/cat/roots", full, nil); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/cat/g/all/") {
-				t.Fatalf("before the purge: %d %v", r.status, r.header.Get("Location"))
+			grants := func() map[string]string {
+				return map[string]string{
+					"full":         w.opsKey.Grant(t, w.s.Now(), "user:r", []string{"cat", "matches"}, []string{"read"}),
+					"catalog only": w.opsKey.Grant(t, w.s.Now(), "user:c", []string{"cat"}, []string{"read"}),
+				}
 			}
-			if r := w.do("GET", "/cat/roots", catOnly, nil); r.status != 302 || strings.HasPrefix(r.header.Get("Location"), "/cat/g/all/") {
-				t.Fatalf("a reader of the catalog only before the purge: %d %v", r.status, r.header.Get("Location"))
+			isAll := func(tok string) bool {
+				r := w.do("GET", "/cat/roots", tok, nil)
+				if r.status != 302 {
+					t.Fatalf("roots: %d %v", r.status, r.body)
+				}
+				return strings.HasPrefix(r.header.Get("Location"), "/cat/g/all/")
+			}
+			// within checks who gets g/all while the edge may still hold
+			// listings from before the purge.
+			within := func(when string) {
+				t.Helper()
+				for name, tok := range grants() {
+					want := name == "full" && !sealed
+					if got := isAll(tok); got != want {
+						t.Errorf("%s: %s: g/all %v, want %v", when, name, got, want)
+					}
+					if r, cks := w.exchange(tok, nil, ""); r.status != 200 || (prefixes(r) == "/cat/g/all") != want || len(cks) != 1 {
+						t.Errorf("%s: %s: exchange: %d %v", when, name, r.status, r.body)
+					}
+				}
+			}
+			for name, tok := range grants() {
+				if got := isAll(tok); got != (name == "full") {
+					t.Fatalf("%s before the purge: g/all %v", name, got)
+				}
 			}
 			w.purge("matches")
 			// The engine's clock stands still: a cookie issued at the very
 			// instant the service came to trust a namespace counts as
 			// issued before it.
 			w.s.Clock.Advance(time.Second)
-			for name, tok := range map[string]string{"full": full, "catalog only": catOnly} {
-				r := w.do("GET", "/cat/roots", tok, nil)
-				if loc := r.header.Get("Location"); r.status != 302 || !strings.HasPrefix(loc, "/cat/g/all/") {
-					t.Errorf("%s after the purge: %d %v", name, r.status, loc)
+			within("right after the purge")
+			// The time of the purge survives a restart.
+			w.s.Clock.Advance(10 * time.Minute)
+			w.stop()
+			w.start()
+			within("10 minutes on, restarted")
+			// A g/all listing lives 16 minutes at an edge.
+			w.s.Clock.Advance(6 * time.Minute)
+			for name, tok := range grants() {
+				if !isAll(tok) {
+					t.Errorf("%s 16 minutes after the purge: no g/all", name)
 					continue
 				}
 				if r, _ := w.follow("/cat/problems", tok); r.status != 200 {
@@ -165,6 +215,25 @@ func TestPurgedContentKeepsAll(t *testing.T) {
 				_, loc := w.follow("/cat/roots", tok)
 				if r := w.withCookie(loc, cks[0], nil); r.status != 200 {
 					t.Errorf("%s: g/all under the cookie: %d %v", name, r.status, r.body)
+				}
+			}
+
+			// A purge recorded without a time, by an earlier release.
+			w.stop()
+			db, err := sql.Open("sqlite", w.db)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res, err := db.Exec(`UPDATE meta SET v = '1' WHERE k = 'purged:matches'`); err != nil || must(res.RowsAffected()) != 1 {
+				t.Fatalf("recording the purge as an earlier release: %v", err)
+			}
+			db.Close()
+			w.start()
+			within("restarted on a purge without a time")
+			w.s.Clock.Advance(16*time.Minute + time.Second)
+			for name, tok := range grants() {
+				if !isAll(tok) {
+					t.Errorf("%s 16 minutes after the restart: no g/all", name)
 				}
 			}
 		})

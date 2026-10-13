@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -460,8 +461,9 @@ func TestServiceEdgeGrantForAllSharedKey(t *testing.T) {
 // TestServiceEdgeGrantForAllUntrust (§B.11.5): every g/all cookie unlocks
 // every g/all listing an edge holds, so when the catalog stops trusting a
 // namespace, which a g/all cookie issued from then on isn't checked
-// against, the service purges ns:{ns}, the tag of every listing whose
-// checkpoint covers it. Should that purge be lost, a g/all listing lives
+// against, the service purges ns:{catalog}, the tag of every listing of
+// the catalog; not ns:{ns}, which would evict all that every service
+// caches of the namespace. Should that purge be lost, a g/all listing lives
 // at the edge no longer than a g/all cookie, and a minute for edges'
 // clocks; the service itself refuses the new cookie there.
 func TestServiceEdgeGrantForAllUntrust(t *testing.T) {
@@ -490,11 +492,11 @@ func TestServiceEdgeGrantForAllUntrust(t *testing.T) {
 	}
 	_, loc := w.follow("/cat/children?of=season", wide)
 	if r := w.withCookie(loc, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != allCDN ||
-		!strings.Contains(r.header.Get("Cache-Tag"), "ns:matches") {
+		!slices.Contains(strings.Split(r.header.Get("Cache-Tag"), ","), "ns:cat") {
 		t.Errorf("g/all behind the edge: %d %v", r.status, r.header)
 	}
-	if w.purged("ns:matches") {
-		t.Fatal("ns:matches purged before the catalog stopped trusting it")
+	if w.purged("ns:cat") {
+		t.Fatal("ns:cat purged before the catalog stopped trusting matches")
 	}
 
 	// The catalog trusts teams instead of matches.
@@ -503,9 +505,9 @@ func TestServiceEdgeGrantForAllUntrust(t *testing.T) {
 	must(opc.PatchConfig(ctx, "cat", must(w.ops.NSHead(ctx, "cat")).Config,
 		[]any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{"teams"}}}))
 	waitFor(t, "teams to be followed", func() bool { return w.svc.Tree().Checkpoint("teams") != "" })
-	waitFor(t, "the purge of ns:matches", func() bool { return w.purged("ns:matches") })
-	if w.purged("ns:teams") {
-		t.Error("ns:teams purged: it was trusted, not dropped")
+	waitFor(t, "the purge of ns:cat", func() bool { return w.purged("ns:cat") })
+	if w.purged("ns:matches") || w.purged("ns:teams") {
+		t.Error("a content namespace's tag purged")
 	}
 	// A reader with no read on matches now gets a g/all cookie, the same
 	// name and path; the service refuses it at the at including matches.

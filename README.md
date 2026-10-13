@@ -411,13 +411,15 @@ gives a default so an edge can be written once. The reference issues exactly tha
   `origin`) for a plain `FILE`. Each key is its file's bytes with surrounding whitespace
   trimmed, used as they are, not decoded (at least 16; `head -c 32 /dev/urandom | base64 >
   edge-grant.key` makes one), and the edge then needs those files. Without `-edge-grant-key` the
-  key is a random one of the origin process, which no edge holds. The key derived from the edge
+  key is a random one of the origin process, which no edge holds and no other origin instance
+  either: with several instances, a cookie one mints is refused by the others, so give every
+  instance the same key files. The key derived from the edge
   secret, HMAC-SHA256 keyed with the edge secret (the `-edge-secret` file's content, trimmed the
   same way) over the ASCII text `patchlog edge grants v1`, is held only when named as `FILE`
   `edge-secret`, for migration (below).
-  The catalog service's kid is its own `-edge-grant-kid` (default `catalog-{catalog}`), which
-  vouches only for `/{catalog}/g/{gs}`, `gs` an id or `all`, and its key is its own
-  `-edge-grant-key` file's bytes, never derived from the edge secret (see
+  The catalog service's kids and keys are its own `-edge-grant-key [KID=]FILE` flags (a plain
+  `FILE` named by its `-edge-grant-kid`, default `catalog-{catalog}`), which vouch only for
+  `/{catalog}/g/{gs}`, `gs` an id or `all`, never the key derived from the edge secret (see
   [Tree and catalog](#tree-and-catalog-addendum-b)). An edge in front of both holds both keys,
   and makes the same checks with whichever kid a cookie names, so neither's cookies cover the
   other's URLs.
@@ -451,6 +453,15 @@ any namespace. `serve` logs a warning while it holds it; drop it once its cookie
 patchlog serve -edge-secret edge.secret -edge-grant-key origin=edge-secret -edge-grant-key k1=k1.key …
 patchlog serve -edge-secret edge.secret -edge-grant-key k1=k1.key …   # 15 minutes later
 ```
+
+**Every edge must drop the derived key too.** An edge built on the earlier default derives the
+`origin` key from the edge secret, and serves cached private `/r/` and `/ns/` responses to any
+cookie that passes its checks without asking the origin, so while it holds that key, the catalog
+service, the search index or anything else holding the edge secret can mint cookies it accepts
+and read what it caches. Without the opt-in above the origin no longer mints under the derived
+key, so edges drop it as soon as every origin instance runs this release (cookies minted under it
+before are refused at the origin from then on); with the opt-in, edges drop it 15 minutes after
+the origin does.
 
 The edge secret itself still has one value, so replacing it makes clients exchange again. In Go,
 `edge.Cookies` holds the keys: `edge.NewCookies` and then `AddKey` for each newer one; `Kid`
@@ -677,6 +688,10 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   idle_in_transaction_session_timeout = '60s'`).
 - **Per instance:** rate-limit buckets (§6.6), so each instance enforces the limits on what it
   serves (D.8), and the in-memory caches above.
+- **Edge-grant keys.** Without `-edge-grant-key`, each instance signs edge-grant cookies with a
+  random key of its own, so a cookie one instance mints is refused by the others: behind a load
+  balancer, give every instance the same `-edge-grant-key` files (see
+  [Private namespaces and the edge](#private-namespaces-and-the-edge)).
 - **Clocks.** Long-poll cursors are interval numbers counted from each instance's own clock
   (§7.7), so keep the instances' clocks synchronised (NTP) to well within the long-poll interval
   (20 s by default), e.g. under a second. Skew never repeats a URL (the `204` rule), but
@@ -2005,10 +2020,17 @@ read an `at` including it. A namespace that was public when a `g/all` cookie was
 turned private since is still read whole under it until it expires, as under a grant revoked
 since: the cookie's lifetime is the revocation latency (§C.5). A purged content namespace has no
 live items, so every reader reads it whole, sealed or not (a sealed one's documents are `410` once
-it is purged, so no grant could be checked against them): it never takes `g/all` away. Once the
+it is purged, so no grant could be checked against them): it doesn't take `g/all` away for good.
+With edge grants, though, an edge may still hold `g/all` listings from before the purge, showing
+its last items, until the purge of `ns:{ns}` lands, and serves them to every `g/all` cookie; so
+the service counts it as read whole only once those copies have surely expired, a `g/all`
+listing's edge lifetime (below) after it applied the purge (`meta` `purged:{ns}`). Until then
+each reader's grant is checked as before: on an unsealed namespace, read whole or not; a sealed
+one is read whole by nobody, so for those 16 minutes nobody gets `g/all` from it. Once the
 catalog itself is purged, an exchange is `410 purged` with `head` after the read check, which the
 core makes for a sealed catalog, as its listings are, and a read under a cookie minted before the
-purge is `410 purged` too.
+purge is `410 purged` too: with `head` under a `g/all` cookie, whose exchange read the catalog,
+and without under a subject set's, which a grant without read on the catalog may have got.
 
 An edge can't make that check: it serves a listing it holds to every `g/all` cookie that passes
 its six checks. So a `g/all` listing at an `at` including a recently trusted namespace is
@@ -2019,11 +2041,15 @@ minutes after. Either way a minute more is allowed for edges' clocks.
 Untrusting works the other way round: a `g/all` cookie issued after the catalog stops trusting a
 namespace isn't checked against it, but an edge would serve it the `g/all` listings it holds that
 show that namespace's items. So when the trust list loses a namespace the service purges
-`ns:{ns}` through `-purge-url`, the tag of every listing whose checkpoint covers it, and refuses
-such a cookie at those `at`s itself. Should a purge be lost, or race an edge filling its cache, a
-`g/all` listing's edge lifetime (`CDN-Cache-Control`) is no longer than a `g/all` cookie lives, 15
-minutes, and a minute for edges' clocks: an untrusted namespace leaves the edge's `g/all` listings
-within the revocation latency of a cookie.
+`ns:{catalog}` through `-purge-url`, the tag of every listing of the catalog (the namespace's own
+`ns:{ns}` would evict everything every service caches of it), and refuses such a cookie at those
+`at`s itself. Should a purge be lost, or race an edge filling its cache, a `g/all` listing's edge
+lifetime (`CDN-Cache-Control`) is no longer than a `g/all` cookie lives, 15 minutes, and a minute
+for edges' clocks: an untrusted namespace leaves the edge's `g/all` listings within the revocation
+latency of a cookie. That cap holds for listings an edge cached from this release on: earlier
+releases gave `g/all` listings a year, so after upgrading the catalog service, purge
+`ns:{catalog}` at the edge once. Without `-purge-url` purges are only logged, and the cap alone
+bounds them.
 
 ```sh
 head -c 32 /dev/urandom | base64 > catalog-edge-grant.key   # the edge holds it too, under catalog-cat

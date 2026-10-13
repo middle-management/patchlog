@@ -18,6 +18,8 @@ import (
 //	seen(ns, ns_id)                  every ns_id applied, for ?min= (§A.5)
 //	meta(k, v)                       "config": the catalog namespace document; "config:{ns}": a
 //	                                 content namespace's document as of its checkpoint; "purged:{ns}"
+//	                                 when the service applied ns's purge (Unix nanoseconds; "1"
+//	                                 from earlier releases)
 //	nodes(href, name, kind, item, item_head, title, state, …)
 //	                                 one row per node (explicit, or implicit from $parents);
 //	                                 raw parents/$access kept to rebuild the graph on start

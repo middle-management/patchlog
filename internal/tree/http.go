@@ -351,13 +351,23 @@ func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error
 // no live items, so every reader reads it whole, as if it were public,
 // sealed or not: a sealed one's documents are 410 once purged (§8.5), and
 // no grant can be checked against them, which would otherwise end
-// unfiltered listings and g/all edge grants for good (§B.11.5).
+// unfiltered listings and g/all edge grants for good (§B.11.5). With edge
+// grants, only once an edge's copies of g/all listings from before the
+// purge, which show its last items to every g/all cookie, have surely
+// expired: cdnAll after the service applied it, should the purge of
+// ns:{ns} be lost or late (Apply). Until then each reader's grant is
+// checked as before, and a sealed one is read whole by nobody.
 func (s *Service) trustList() (trust []string, gone map[string]bool) {
 	gone = map[string]bool{}
+	var hold time.Duration
+	if s.opt.EdgeGrants != nil {
+		hold = s.cdnAll()
+	}
+	now := s.opt.Now()
 	s.View(func(g *Graph, _ map[string]string) {
 		for ns := range g.Trust {
 			trust = append(trust, ns)
-			if s.purged[ns] {
+			if at, ok := s.purged[ns]; ok && !now.Before(at.Add(hold)) {
 				gone[ns] = true
 			}
 		}
@@ -558,12 +568,17 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	if client.IsPurged(err) {
 		// A purged sealed catalog's document is 410 too (§8.5): the core
 		// makes the read check before answering it, as below. An edge
-		// grant that passed the service's checks stands for a subject set
-		// that could read when it was minted, as the grant it was
-		// exchanged for: the core would take the read as anonymous.
+		// grant that passed the service's checks stands for the grant it
+		// was exchanged for, which the core would take as an anonymous
+		// read: 410 purged. A g/all one's grant read the catalog, so it
+		// gets head; a subject set's may not have (RoleView issues one to
+		// any grant verifying for the catalog), and gets none, since the
+		// core shows a sealed purged catalog's head only to its readers.
 		var head string
-		if s.edgeClaims(r) != nil {
-			if head = s.purgedHead(err); head != "" {
+		if cl := s.edgeClaims(r); cl != nil {
+			if gs, _ := s.edgeGS(cl.Prefix); gs != AllSubjects {
+				err = nil
+			} else if head = s.purgedHead(err); head != "" {
 				err = nil
 			}
 		} else {
@@ -597,8 +612,12 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	}
 	// A purged catalog answers as the core's URLs of it do, after the read
 	// check: 410 purged with head, its purge-ns entry (§8.5, §12), the
-	// log's last, where the checkpoint stopped.
+	// log's last, where the checkpoint stopped; none under a subject
+	// set's edge grant, as above.
 	if head, purged, _ := s.state(); purged {
+		if cl := s.edgeClaims(r); cl != nil && v.gs != AllSubjects {
+			head = ""
+		}
 		writePurged(w, head)
 		return
 	}
@@ -725,10 +744,14 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 }
 
 // writePurged writes the 410 of a purged catalog, with head its purge-ns
-// entry's ns_id (§8.5, §12).
+// entry's ns_id (§8.5, §12), or none if head is "".
 func writePurged(w http.ResponseWriter, head string) {
 	w.Header().Set("Cache-Control", "no-store")
-	WriteJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "catalog purged", "head": head})
+	body := map[string]any{"code": "purged", "message": "catalog purged"}
+	if head != "" {
+		body["head"] = head
+	}
+	WriteJSON(w, http.StatusGone, body)
 }
 
 // purgedHead is the head of the catalog's purge, its purge-ns entry's
@@ -969,9 +992,12 @@ func (s *Service) setListingHeaders(w http.ResponseWriter, r *http.Request, v *v
 // cookie lives, and edgeClockSkew. An edge serves the g/all listings it
 // holds to every g/all cookie, including one issued after the catalog
 // stopped trusting a namespace a listing shows, which the service purges
-// (ns:{ns}, Apply); should that purge be lost, or race a fill, the
+// (ns:{catalog}, Apply); should that purge be lost, or race a fill, the
 // listing outlives the change by no more than a cookie issued before it
-// (§B.11.5, §C.5: the cookie's lifetime is the revocation latency).
+// (§B.11.5, §C.5: the cookie's lifetime is the revocation latency). A
+// purged namespace counts as read whole that long after the purge
+// (trustList), for the same reason. Listings an edge cached from earlier
+// releases, with a year, are purged once by the operator (README).
 func (s *Service) cdnAll() time.Duration {
 	return s.opt.EdgeGrants.MaxTTL() + edgeClockSkew
 }

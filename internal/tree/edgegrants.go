@@ -55,8 +55,10 @@ import (
 // every cookie issued before that namespace was trusted has expired
 // (edgeHold). The other way round, a g/all cookie issued after the
 // catalog stops trusting a namespace isn't checked against it, so the
-// service purges ns:{ns}, the tag of every listing covering it (Apply),
-// and no edge keeps a g/all listing longer than a cookie lives (cdnAll).
+// service purges ns:{catalog}, the tag of every listing of the catalog
+// (Apply), and no edge keeps a g/all listing longer than a cookie lives
+// (cdnAll); a purged namespace counts as read whole by every reader only
+// once that long has passed since its purge (trustList).
 
 // maxEdgeGrants is how many grants one exchange takes in its body (§C.5).
 const maxEdgeGrants = 50

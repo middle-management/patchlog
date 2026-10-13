@@ -167,7 +167,9 @@ func (c *Cookies) key(kid string) []byte {
 // edge configured with the secret can derive it, but so can every other
 // holder of the secret, the services that take it for their own edge
 // lifetimes included: a cookie under it may have been minted by any of
-// them. A deployment mints with it only to migrate to key files.
+// them. A deployment mints with it only to migrate to key files, and an
+// edge holds it no longer than the origin does: an edge still deriving it
+// serves its cached private responses to cookies any of them can mint.
 func KeyFromSecret(secret []byte) []byte {
 	m := hmac.New(sha256.New, secret)
 	m.Write([]byte("patchlog edge grants v1"))
