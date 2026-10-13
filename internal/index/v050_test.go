@@ -2,9 +2,11 @@ package index_test
 
 import (
 	"context"
+	"net/http"
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,11 +120,76 @@ func TestMinAlwaysRedirectsPrivate(t *testing.T) {
 	if !strings.HasPrefix(atLoc, "/g/") || !strings.HasSuffix(atLoc, "/sec/at/"+at+"?limit=5") {
 		t.Fatalf("at URL %s", atLoc)
 	}
-	for _, p := range []string{atLoc + "&min=" + wr.NSID, gsLoc + "&min=sec:" + wr.NSID} {
+	// From another URL space too (the anonymous at URL, the public
+	// pointer), min goes straight to the reader's own at URL, without min.
+	for _, p := range []string{atLoc + "&min=" + wr.NSID, gsLoc + "&min=sec:" + wr.NSID, "/sec/at/" + at + "?limit=5&min=" + wr.NSID, "/sec?limit=5&min=" + wr.NSID} {
 		r := x.raw(p, bob)
 		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-cache" {
 			t.Errorf("%s: %d %s %v", p, r.status, r.header.Get("Location"), r.header)
 		}
+	}
+}
+
+// TestMinRedirectAnswered (§A.4 "Bounded redirects", §A.5): the current
+// at with a min it includes redirects to itself without min, with the
+// result computed and kept there first, so the redirect is answered after
+// the checkpoint moves on before it is followed.
+func TestMinRedirectAnswered(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}})
+	first := w.doc(t, "derby", w.match, map[string]any{"title": "The Derby"}).NSID
+	for i, m := range []string{"", "matches:" + first} {
+		at := s.caughtUp("matches")
+		if m == "" {
+			m = at
+		}
+		q := "?limit=" + string(rune('1'+i)) + "&q=derby"
+		loc := "/matches/at/" + at + q
+		r := s.raw(loc+"&min="+url.QueryEscape(m), "")
+		if r.status != 302 || r.header.Get("Location") != loc {
+			t.Fatalf("min=%s: %d %s, want %s", m, r.status, r.header.Get("Location"), loc)
+		}
+		w.doc(t, "derby"+string(rune('a'+i)), w.match, map[string]any{"title": "Derby"})
+		if cur := s.caughtUp("matches"); cur == at {
+			t.Fatal("the checkpoint didn't move")
+		}
+		if r := s.raw(loc, ""); r.status != 200 || r.body["at"] != at {
+			t.Errorf("min=%s: redirect target after the checkpoint moved: %d %s", m, r.status, r.header.Get("Location"))
+		}
+	}
+}
+
+// logSince counts namespace-log requests whose since is id.
+type logSince struct {
+	id string
+	rt http.RoundTripper
+	n  atomic.Int32
+}
+
+func (f *logSince) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasSuffix(r.URL.Path, "/log") && strings.Contains(r.URL.RawQuery, f.id) {
+		f.n.Add(1)
+	}
+	return f.rt.RoundTrip(r)
+}
+
+// TestMinJudgedAfterWait (§A.5): a min the index hasn't reached is waited
+// for before the core's log is asked anything about it, so an unreached
+// min costs the wait's own one check, not more calls ahead of it.
+func TestMinJudgedAfterWait(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.doc(t, "derby", w.match, map[string]any{"title": "The Derby"})
+	schemasAt := must(w.c.NSHead(context.Background(), "schemas")).ID
+	ls := &logSince{id: schemasAt, rt: transport}
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, minWait: 100 * time.Millisecond, hc: &http.Client{Transport: ls}})
+	at := s.caughtUp("matches")
+	if r := s.raw("/matches/at/"+at+"?q=derby&min="+schemasAt, ""); r.status != 503 || r.body["code"] != "behind" {
+		t.Fatalf("unreached min: %d %v", r.status, r.body)
+	}
+	if n := ls.n.Load(); n != 1 {
+		t.Errorf("%d namespace-log calls for an unreached min, want 1", n)
 	}
 }
 

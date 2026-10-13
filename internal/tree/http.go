@@ -369,7 +369,8 @@ var ops = map[string]bool{
 // Redirects name the query in its canonical form (§A.5,
 // derived.CanonicalQuery), and so does a children listing's next; an at
 // URL is answered 200 only in that form and without min, and one in
-// another form is redirected to it.
+// another form is redirected to it. Every parameter but min is
+// single-valued: given more than once, it is 400 bad_input.
 //
 // A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles are
 // the only values a listing takes from documents' content (names, heads,
@@ -477,6 +478,16 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	vals := r.URL.Query()
+	// Every parameter but min is single-valued, read as its first value,
+	// and the canonical form sorts a repeated one's values (§A.5): a
+	// repeat would change what a redirect means, so it is refused.
+	for k, vs := range vals {
+		if len(vs) > 1 && k != "min" {
+			w.Header().Set("Cache-Control", "no-store")
+			WriteError(w, http.StatusBadRequest, "bad_input", k+" given more than once")
+			return
+		}
+	}
 	base := "/" + cat + "/at/"
 	target := func(cp string) string {
 		if v.anon {
@@ -538,9 +549,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	own := isAt && gs == v.gs && !(v.anon && gs != "")
 	mins := len(vals["min"]) > 0
 	canonical := r.URL.RequestURI() == canon(at)
-	if own && mins && s.atIncludes(ctx, at, cur, vals["min"], keyOf(at), keep) {
-		// min always redirects (§A.5): an at that already includes every
-		// min to itself without it.
+	if own && mins && at != cur && s.atIncludes(ctx, at, vals["min"], keyOf(at), keep) {
+		// min always redirects (§A.5): an older at that already includes
+		// every min to itself without it. The current at needs no
+		// judging: the redirect to the current at below names the same
+		// URL, with the listing computed and kept there first.
 		setPtr()
 		redirect(w, canon(at))
 		return
@@ -736,18 +749,15 @@ func (s *Service) recordAt(at string, cps map[string]string) {
 	s.ats[at] = atRecord{cps: cps, exp: now.Add(kept.For)}
 }
 
-// atIncludes reports whether the listing at at already includes every min
-// of vals (§A.5 "min always redirects"), once AwaitMins has waited for
-// them: the current at, cur, does. An older at is judged only while its
-// listing is kept (key, if keep) and its checkpoints are recorded
-// (recordAt): each {ns}:{ns_id} must be ns's checkpoint there or one the
-// core's log places before it (since=min is accepted only if min is in
-// the chain up to it, §7.1), and a bare ns_id, whose namespace isn't
-// named, never counts. An at it can't judge redirects to the current one.
-func (s *Service) atIncludes(ctx context.Context, at, cur string, vals []string, key string, keep bool) bool {
-	if at == cur {
-		return true
-	}
+// atIncludes reports whether the listing at an older at already includes
+// every min of vals (§A.5 "min always redirects"), once AwaitMins has
+// waited for them. It is judged only while the listing is kept (key, if
+// keep) and its checkpoints are recorded (recordAt): each {ns}:{ns_id}
+// must be ns's checkpoint there or one the core's log places before it
+// (since=min is accepted only if min is in the chain up to it, §7.1), and
+// a bare ns_id, whose namespace isn't named, never counts. An at it can't
+// judge redirects to the current one.
+func (s *Service) atIncludes(ctx context.Context, at string, vals []string, key string, keep bool) bool {
 	if !keep {
 		return false
 	}

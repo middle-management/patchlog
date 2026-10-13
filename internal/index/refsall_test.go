@@ -267,6 +267,17 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	if r := idx.raw(bobLoc, amy); r.status != 302 || r.header.Get("Location") != "/_refs/at/"+bobAt+"/g/"+amyGs+q {
 		t.Errorf("foreign gs: %d %s", r.status, r.header.Get("Location"))
 	}
+	// With min, it goes into one's own straight away, without min (§A.5):
+	// to the same at if its kept answer includes min, or else to the
+	// current one.
+	for p, want := range map[string]string{
+		"/_refs/at/" + amyAt + "/g/" + bobGs + q + "&min=pa:" + a1: amyLoc,
+		bobLoc + "&min=pa:" + a1:                                   newLoc,
+	} {
+		if r := idx.raw(p, amy); r.status != 302 || r.header.Get("Location") != want {
+			t.Errorf("foreign gs, with min: %s: %d %s, want %s", p, r.status, r.header.Get("Location"), want)
+		}
+	}
 
 	// Pages: in namespace, then resource order; next is the after of the
 	// following page, {ns}/{name}, at the same at.
@@ -305,7 +316,8 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}
 
 	// If the namespace document of one the grant names can't be read, the
-	// answer is 502; one it doesn't name is left out, as a private one.
+	// answer is 502; any other is left out, as one the reader can't see
+	// (§A.4).
 	// A document the index checked within CheckerTTL is still used, so its
 	// cache is expired first: the index has to read pb's again.
 	failPB.Store(true)

@@ -1665,7 +1665,8 @@ suffices at any write rate. They are keyed by their URL and by what the reader r
 reader whose namespace-wide reads changed since (a public namespace turned private) isn't served
 one kept from before; listings that depend on the individual reader aren't kept. Every listing is
 served only at its canonical URL, the query in the search index's canonical form (v0.50, §A.5),
-and other forms are redirected to it; a `children` listing's `next` is in that form. A purge drops
+and other forms are redirected to it; a `children` listing's `next` is in that form. Since that
+form sorts repeated values, a parameter other than `min` given more than once is `400`. A purge drops
 the kept listings that show what it purged.
 
 With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):

@@ -58,12 +58,13 @@ var validNS = client.ValidNSName
 // Redirects name the query in its canonical form (§A.5,
 // derived.CanonicalQuery), and an at URL is answered 200 only in that form
 // and without min: one in another form is redirected to it. A request with
-// ?min= is always redirected (§A.5): an at URL whose result already
-// includes every min to itself without min, anything else, once every min
-// is reached, to the current checkpoint.
+// ?min= is always redirected (§A.5): once every min is reached, an at URL
+// whose kept result already includes every min to itself without min,
+// anything else to the current checkpoint.
 //
 // Private namespaces need Authorization: Bearer <grant>; a request without
-// the right gs is redirected to it.
+// the right gs is redirected to it (with min, by the redirect above, into
+// the reader's URL space).
 //
 // Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). A result
 // has one source, so a reader of the whole namespace gets it sealed as one
@@ -275,8 +276,9 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
-	// The reader's URL space: public, or keyed by its subject set.
-	if gs != a.gs {
+	// The reader's URL space: public, or keyed by its subject set. With
+	// min, the redirects below land there, without min (§A.5).
+	if gs != a.gs && len(q.Mins) == 0 {
 		target := base(a, ns)
 		if isAt {
 			target += "/at/" + at
@@ -298,13 +300,6 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// what redirects name, what results are kept under, and in a sealed or
 	// e2e namespace the view a result is bound to (§E.2.6).
 	target := func(id string) string { return base(a, ns) + "/at/" + id + derived.CanonicalQuery(vals, "min") }
-	// min always redirects (§A.5): an at that already includes every min
-	// to itself without min, before any wait.
-	if isAt && len(q.Mins) > 0 && ix.atIncludes(ctx, ns, at, q.Mins, target(at)) {
-		setPtrHeaders()
-		redirect(w, target(at))
-		return
-	}
 	if !ix.waitMins(ctx, q.Mins) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
@@ -330,8 +325,17 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached the namespace yet")
 		return
 	}
+	// min always redirects (§A.5): an older at whose kept result already
+	// includes every min to itself without min. The current at needs no
+	// judging: the redirect to the current checkpoint below names the same
+	// URL, with the result computed and kept there first.
+	if isAt && len(q.Mins) > 0 && at != cur && ix.atIncludes(ctx, ns, at, q.Mins, target(at)) {
+		setPtrHeaders()
+		redirect(w, target(at))
+		return
+	}
 	// Only the canonical form of an at URL is answered (§A.5), and never
-	// one with min (above).
+	// one with min.
 	canonical := r.URL.RequestURI() == target(at)
 	if isAt && len(q.Mins) == 0 {
 		// A kept result answers its at however far the checkpoint has
@@ -623,45 +627,32 @@ func (ix *Index) committed(ctx context.Context, ns string) (string, error) {
 // of the namespace.
 func countsTag(ns string) string { return "idx:" + ns + ":counts" }
 
-// atIncludes reports whether a result of ns at at, which url names,
-// already includes every min (§A.5 "min always redirects"): each names
-// ns (a min of another followed namespace never is: the result reflects
-// ns alone) and is at itself, or an ns_id the core's log places before at
-// (since=min is accepted only if min is in the chain up to at, §7.1). Only
-// an at the index answers counts, the current one or one whose result is
-// kept: any other is one it no longer keeps results for, which redirects
-// to the current checkpoint anyway (§A.4).
+// atIncludes reports whether the kept result of ns at an older at, which
+// url names, already includes every min (§A.5 "min always redirects"),
+// once waitMins has waited for them: each names ns (a min of another
+// followed namespace never is: the result reflects ns alone) and is at
+// itself, or an ns_id the core's log places before at (since=min is
+// accepted only if min is in the chain up to at, §7.1). Only a kept
+// result counts: an at whose result isn't kept is one the index no longer
+// keeps results for, which redirects to the current checkpoint anyway
+// (§A.4), and a redirect to it would not be answered (bounded redirects).
 func (ix *Index) atIncludes(ctx context.Context, ns, at string, mins []MinRef, url string) bool {
 	for _, m := range mins {
 		if m.NS != ns {
 			return false
 		}
 	}
-	// Every min applied, then at still the committed checkpoint: at is
-	// past them (seen is committed with each apply).
-	seen := true
-	for _, m := range mins {
-		if m.ID != at && !ix.seen(ctx, ns, m.ID) {
-			seen = false
-		}
-	}
-	cur, err := ix.committed(ctx, ns)
-	switch {
-	case err != nil:
+	if _, _, ok := ix.kept.Get(url); !ok {
 		return false
-	case cur == at && seen:
-		return true
-	case cur != at:
-		if _, _, ok := ix.kept.Get(url); !ok {
-			return false
-		}
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
+	done := map[string]bool{at: true}
 	for _, m := range mins {
-		if m.ID == at {
+		if done[m.ID] {
 			continue
 		}
+		done[m.ID] = true
 		if _, _, err := ix.c.NSLogPage(ctx, ns, at, m.ID); err != nil {
 			return false
 		}

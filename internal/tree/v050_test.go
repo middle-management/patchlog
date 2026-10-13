@@ -2,6 +2,8 @@ package tree_test
 
 import (
 	"context"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -112,5 +114,65 @@ func TestCanonicalURLs(t *testing.T) {
 	}
 	if len(pages) < 2 {
 		t.Errorf("children pages %v", pages)
+	}
+}
+
+// TestMinRedirectAnswered (§A.4 "Bounded redirects", §B.5): the current at
+// with a min it includes redirects to itself without min, with the listing
+// computed and kept there first, so the redirect is answered after the
+// checkpoint moves on before it is followed.
+func TestMinRedirectAnswered(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := setup(t)
+	w.seed(t)
+	x := startSvc(t, w.c, svcOpts{})
+	x.caughtUp("cat", "matches")
+	at, catAt := x.s.At(), x.s.Checkpoint("cat")
+	for i, p := range []string{"/roots?min=cat:" + catAt, "/children?min=" + catAt + "&of=season"} {
+		r := x.raw("/cat/at/"+at+p, "")
+		loc := r.header.Get("Location")
+		if r.status != 302 || !strings.HasPrefix(loc, "/cat/at/"+at+"/") || strings.Contains(loc, "min=") {
+			t.Fatalf("%s: %d %s", p, r.status, loc)
+		}
+		must(w.c.CreateDoc(ctx, "cat", "extra"+strconv.Itoa(i), map[string]any{"title": "Extra", "parents": parents()}))
+		x.caughtUp("cat")
+		if r := x.raw(loc, ""); r.status != 200 || r.body["at"] != at {
+			t.Errorf("%s: redirect target after the checkpoint moved: %d %s", p, r.status, r.header.Get("Location"))
+		}
+		at, catAt = x.s.At(), x.s.Checkpoint("cat")
+	}
+}
+
+// TestRepeatedParams (§A.5): every listing parameter but min is
+// single-valued, and the canonical form sorts a repeated one's values, so
+// a repeat would change what a redirect means: it is refused, on the head
+// pointer and on an at URL alike.
+func TestRepeatedParams(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed(t)
+	x := startSvc(t, w.c, svcOpts{})
+	x.caughtUp("cat", "matches")
+	at := x.s.At()
+	for _, c := range []struct{ param, path string }{
+		{"of", "/children?of=season&of=root"},
+		{"item", "/where?item=/r/matches/derby&item=/r/matches/opener"},
+		{"limit", "/children?of=season&limit=1&limit=2"},
+		{"name", "/children?of=season&name=a&name=b"},
+		{"after", "/children?of=season&after=a0&after=a1"},
+		{"unordered", "/children?of=season&unordered=1&unordered=0"},
+		{"depth", "/subtree?of=season&depth=1&depth=2"},
+	} {
+		for _, p := range []string{"/cat" + c.path, "/cat/at/" + at + c.path} {
+			r := x.raw(p, "")
+			if msg, _ := r.body["message"].(string); r.status != 400 || r.body["code"] != "bad_input" || !strings.Contains(msg, c.param) {
+				t.Errorf("%s: %d %v", p, r.status, r.body)
+			}
+		}
+	}
+	// min is repeatable.
+	if r := x.raw("/cat/at/"+at+"/roots?min=cat:"+x.s.Checkpoint("cat")+"&min=matches:"+x.s.Checkpoint("matches"), ""); r.status != 302 {
+		t.Errorf("repeated min: %d %v", r.status, r.body)
 	}
 }
