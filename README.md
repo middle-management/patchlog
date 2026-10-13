@@ -1932,7 +1932,7 @@ Once nothing is refused, an exchange draws one token, however many grants it car
 `exchangeRate` bucket of each distinct principal among them (keyed by principal and kid, as the
 core keys write buckets), and is `429` (`code: "rate"`, `limit: "exchangeRate"`, `Retry-After`)
 while any is empty (v0.52, §6.6). The buckets are the process's own, 10/s with a burst of 100,
-set with `-exchange-rate` and `-exchange-burst`. Like the core's, it takes no query parameters
+set with `-exchange-rate RATE,BURST`, as `serve` takes it. Like the core's, it takes no query parameters
 (`400`).
 Each grant is resolved as a listing resolves its reader: its prefix is `/{catalog}/g/{gs}`, the
 subject set its listings are served under, lasting until that grant's `exp` or 15 minutes,
@@ -2631,7 +2631,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `prefix` on `DELETE /edge-grants`, the one that may repeat), and answers anything else, a
   repeated parameter or another flag value with `400 bad_input`, `no-store`, before
   authentication.
-- **`GET /`** answers `{ "spec": "0.50", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.52", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace

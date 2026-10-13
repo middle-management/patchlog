@@ -29,7 +29,7 @@ import (
 //	patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-bearer GRANT] [-author NAME] [-release /r/{ns}/{release}]
 //	              [-self-placing] [-access -key SEED -kid KID [-ttl 15m] [-admin-group catalog-admins]
 //	              [-merge-key SEED -merge-kid KID -merge-service SUB [-merge-ttl 5m]]
-//	              [-edge-grant-key FILE] [-edge-grant-kid KID] [-origin-edge-grant-kid KID] [-exchange-rate 10 -exchange-burst 100]]
+//	              [-edge-grant-key FILE] [-edge-grant-kid KID] [-origin-edge-grant-kid KID] [-exchange-rate RATE,BURST]]
 //	              [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
 //
 // The service follows the catalog namespace and every namespace in its
@@ -63,8 +63,8 @@ import (
 // -edge-grant-kid (default catalog-{catalog}), which must not be the
 // origin's kid (-origin-edge-grant-kid, default origin): each key vouches
 // only for its own prefixes. Each exchange draws one token from the
-// exchangeRate bucket of each principal it names (-exchange-rate,
-// -exchange-burst; 429 when empty). A read under one, without
+// exchangeRate bucket of each principal it names (-exchange-rate
+// RATE,BURST; 429 when empty). A read under one, without
 // Authorization, is the subject set's, and gets edge lifetimes behind a
 // verifying edge (-edge-secret) that checked it with the service's kid.
 // A catalog named r or ns mints none: its prefixes would overlap the
@@ -106,8 +106,7 @@ func treeCmd(args []string) {
 	edgeGrantKey := fs.String("edge-grant-key", "", "file holding the key the catalog service signs its own edge-grant cookies with (§B.11.5, §C.5), for -access: a key of its own that the origin never holds, so neither the origin's -edge-grant-key nor one derived from -edge-secret (at least 16 bytes); without it, a random one per process, so cookies don't survive a restart or reach another instance")
 	edgeGrantKid := fs.String("edge-grant-kid", "", "the name (kid) of the service's edge-grant key, which its cookies carry and a verifying edge looks the key up by (§C.5 \"Format\"), for -access; default catalog-{catalog}. It must not be the origin's kid (-origin-edge-grant-kid): each key vouches only for its own prefixes, the service's for /{catalog}/g/{gs}")
 	originKid := fs.String("origin-edge-grant-kid", edge.DefaultKid, "the origin's edge-grant kid (its -edge-grant-kid), which -edge-grant-kid must differ from")
-	exchangeRate := fs.Float64("exchange-rate", tree.DefaultExchangeRate.Rate, "exchangeRate (§6.6, §C.5): edge-grant exchanges per second each principal may make at the service's POST /edge-grants, for -access; per process")
-	exchangeBurst := fs.Float64("exchange-burst", tree.DefaultExchangeRate.Burst, "the burst of -exchange-rate")
+	exchangeRate := fs.String("exchange-rate", "", "exchangeRate (§6.6, §C.5): edge-grant exchanges each principal may make at the service's POST /edge-grants, for -access, as RATE,BURST, e.g. 10,100 (the default); per process")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
@@ -151,7 +150,14 @@ func treeCmd(args []string) {
 		}
 		// A random key is this process's alone (tree.Options).
 		topt.EdgeGrantsOwnKey = *edgeGrantKey == ""
-		topt.ExchangeRate = tree.Rate{Rate: *exchangeRate, Burst: *exchangeBurst}
+		topt.ExchangeRate = tree.DefaultExchangeRate
+		if *exchangeRate != "" {
+			r, err := parseRate(*exchangeRate)
+			if err != nil {
+				log.Fatalf("tree: -exchange-rate: %v", err)
+			}
+			topt.ExchangeRate = tree.Rate{Rate: r.Rate, Burst: r.Burst}
+		}
 	case *edgeGrantKey != "" || *edgeGrantKid != "":
 		log.Fatal("tree: -edge-grant-key and -edge-grant-kid need -access: only a catalog service mints edge grants (§B.11.5)")
 	}

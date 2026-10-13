@@ -1,5 +1,80 @@
 # Changelog
 
+## Unreleased
+
+Implements spec **v0.52**. v0.51 settles all fifteen of the reference's v0.50 notes, most as
+the reference did them; v0.52, from Doors, gives edge-grant exchanges a rate bucket of their
+own.
+
+**Changes to check before upgrading:**
+- **Exchanges draw on `exchangeRate`** (v0.52, §6.6, §C.5): each `POST /edge-grants` draws one
+  token from the `exchangeRate` bucket of each distinct principal among its grants, however
+  many grants it carries, and none from write buckets or allowances; `429` with
+  `limit: "exchangeRate"` when one is empty. It is deployment only, default 10/s with a burst of
+  100: `serve -exchange-rate RATE,BURST`, and `tree -exchange-rate` for the catalog service's
+  own exchange. A namespace document setting it is `422`.
+- **The prefix cap** (v0.51): an exchange that would issue more than 100 distinct prefixes is
+  `400 bad_input`, once nothing is refused; a namespace-wide grant counts two prefixes per
+  namespace. It was `403` for more than 100 names.
+- **Edge headers:** `X-Edge-Verified` and `X-Edge-Prefix` give edge lifetimes only as exactly
+  one header line without a comma, and an edge secret containing a comma is refused (§9).
+- **Listing URLs put the subject set first** (§A.4, §B.11.5): catalog listings are
+  `/{catalog}/g/{gs}/at/{at}/…`, private index results `/{ns}/g/{gs}/at/{ns_id}?…` and
+  `/_refs/g/{gs}/at/{at}?to=…`. The old forms redirect (`301`) to the new.
+- **Catalog `checkpoint`** is `{ ns: ns_id, … }`: the catalog's and each named item's
+  namespace's `ns_id`s a decision was made at, not the combined checkpoint string (§B.11.4).
+- **A `min` naming a namespace the reader can't see** gets the same `400` as one the service
+  doesn't follow, on index, `/_refs` and tree URLs, so it doesn't reveal which private
+  namespaces are indexed (§A.5).
+- **A purged sealed namespace** answers `410 purged` with `head` for its documents, log,
+  events and long-polls; it was `500 encryption_unavailable` (§8.5). Followers, the index,
+  tree, catalog, janitor, merge and remote branches take that `410` as the purge.
+- **`POST /ns/{ns}/keys`** is `404 not_offered` in a namespace that isn't sealed (was
+  `422 invalid`). At E3 it relays a grant's own keyring entries to any grant that reads the
+  namespace, a limited one included, without a read of the `keyring` resource.
+  `core.Engine.Keys` returns `*core.KeysAnswer`.
+- **Undo from resource logs** reports a gesture found in no named document as impossible
+  (`pruned`) when one of them has a pruning horizon (§11.2).
+- **Imports:** an upstream namespace with an invalid name, usually a renamed namespace's
+  over-long `{dst}-upstream`, is a check failure at step 1, before anything is written
+  (§G.4.4).
+- `-edge-grant-key` takes `KID=FILE` only when no `/` comes before its first `=`; a file named
+  `edge-secret` in the working directory is given as `./edge-secret`.
+- `GET /` answers `"spec": "0.52"`.
+
+**New (v0.51):**
+- **Key rotation:** `serve -edge-grant-key [KID=]FILE`, repeatable; the origin mints with the
+  last and accepts all, so a key is rotated by adding the next to the edges, then to the
+  origin, and dropping the old one once its cookies have expired, without clients exchanging
+  again. `-edge-grant-key [KID=]edge-secret` names the key derived from `-edge-secret`, to move
+  off it the same way. `edge.Cookies.AddKey`, `Kid` and `Kids` (§C.5).
+- **The catalog service mints its own edge grants** for private listings (§B.11.5): `POST
+  /edge-grants` on the tree service, following §C.5's issuance rules, gives cookies for
+  `/{catalog}/g/{gs}` under a key of its own (`tree -edge-grant-key`, `-edge-grant-kid`,
+  default `catalog-{catalog}`), which vouches only for its own prefixes. A read under one,
+  without `Authorization`, is the subject set's, and gets edge lifetimes only behind a
+  verifying edge. A `g/all` cookie is refused at an `at` that includes a namespace the catalog
+  came to trust after it was issued, and such listings are `no-store` at the edge while an
+  older `g/all` cookie may be live. `edge.Cookies.Vouches` sets which prefixes a service's key
+  vouches for.
+- **`/keys` names `epoch`, `level` and `pad`** (§E.2.3), so a writer limited to some resources
+  seals at E2 and E3 without the namespace document: E2E writes, `PruneE2E`, `UploadBlob` and
+  undo take them from `/keys` (`client.FetchKeysAnswer`, `client.IsNotOffered`). Undo by such a
+  writer now works at E3 with `UndoE2E`.
+- Behind a tree service that serves several catalogs, a `min` naming a namespace only another
+  of its catalogs follows is waited for there, then redirects to the current `at` (§A.5).
+- `client.IsPurged`, and `grantcheck.Checker.PurgedRead` for a purged sealed namespace's read
+  check.
+
+**Fixes:**
+- The catalog grant service answers `410 gone` for items of a purged sealed content namespace,
+  or catalog, instead of `502`; remote branches no longer re-apply a sealed base's purge on
+  every sync; the janitor keeps sweeping when one of its bases is purged.
+- An exchange over the prefix cap no longer builds every edge grant before answering `400`.
+- A limited writer's E3 fold no longer fails on an unpadded revision.
+- Playground: a purged sealed namespace shows as purged; limited-grant undo asks `/keys` for
+  the level.
+
 ## v0.19.0
 
 Implements spec **v0.50**, which settles all fifteen of the reference's v0.49 notes and takes

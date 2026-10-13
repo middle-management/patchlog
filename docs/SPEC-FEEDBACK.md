@@ -1,105 +1,110 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.50**. This file collects what
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.52**. This file collects what
 the reference does that the text doesn't yet describe.
 
 ## Open
 
-From implementing v0.50. Each gives what the reference chose.
+From implementing v0.51 and v0.52. Each gives what the reference chose.
 
-1. **Grants in the body of `POST /edge-grants`** (§C.5). The text doesn't say what
-   `Content-Type` the body form needs. A `text/plain` form from another site goes without a
-   CORS preflight, so it could post `{ "grants": [T] }` with an attacker's grant and replace a
-   reader's cookie for the same prefix, since cookie names come from the prefix alone. The
-   reference requires `application/json` (`415` otherwise), and answers `404 not_offered`
-   before looking at the body while authentication is disabled. *Propose:* require a
-   non-simple content type, as `DELETE /edge-grants` relies on preflights.
-2. **The cookie's claims** (§C.5 "Format"). The reference refuses claims with members other
-   than `kid`, `p` and `exp`, or that aren't canonical JSON byte for byte. It holds one key
-   and one `kid` (`-edge-grant-kid`), so replacing either invalidates every cookie until
-   clients exchange again. Without `sub`, it attributes a cookie read to `edge:` plus the
-   prefix. *Question:* may a minter add members, and is rotation (several `kid`s at once)
-   expected of an origin?
-3. **Edge verification headers** (§9). Several `X-Edge-Prefix` values, or one an intermediary
-   joined with commas, aren't addressed; the reference requires exactly one value and treats
-   anything else as unverified (`no-store`). It doesn't require the cookie it verifies itself
-   to match the prefix, since it authorises the read from the cookie anyway. *Propose:* say
-   "exactly one prefix".
-4. **What check 2 refuses** (§C.5, §3.6, §7). "`400` anyway (§7)", but neither §7 nor §3.6
-   says an empty segment (a trailing `/`) or a dot segment is `400`; the reference answers
-   `400` for both, `//` and `%` included. As written the rule also fails `/` itself, which the
-   origin serves (harmlessly: no prefix covers it). *Propose:* state it in §3.6 or §7, and
-   exempt `/`.
-5. **Services and §9** (§9, §B.11.5). The reference applies §9 to an index's or tree
-   service's own origin too: no refusal, lifetimes only for reads an edge verified. Services
-   read callers from `Authorization`, so their private listings are always `no-store` at the
-   edge; they could be cached only under cookies a service mints with its own `kid`, bound to
-   a `gs`, which §B.11.5 doesn't describe. *Question:* is that the intended path for cached
-   private listings?
-6. **Issuance and rate limits** (§C.5, §6.6). "Its own principal's rate limits", but limits are
-   per namespace and a grant may name several. The reference draws one token per grant under
-   the first namespace it issues, from the bucket writes use, and only once nothing is
-   refused. Its buckets admit while one token is left and may go into debt, as writes of
-   several items do, so two grants of one principal pass under a burst of 1. *Question:*
-   which namespace's limits, and does a request drawing `n` tokens need `n`?
-7. **Counting names** (§C.5). The reference counts each grant's distinct fixed names once,
-   not names times namespaces, so one grant of 60 names over two namespaces gives 120 cookies
-   and passes. Every literal of every fixing rule must be a valid name, even one the
-   intersection removes. *Propose:* say which count is meant.
-8. **A purged sealed namespace's log** (§8.5, §E.2). "`/ns/{ns}` and its log stay readable",
-   but a namespace purge destroys the epoch keys, so sealed delivery can't seal the log: the
-   reference answers `500 encryption_unavailable` there. *Question:* is a purged sealed
-   namespace's log served from its stored sealed copies, or as the structural log in the
-   clear?
-9. **A remote branch of a purged base** (§G.3). The reference names the first purged
-   namespace found, A before its bases, and answers `410` for any `at`, one A doesn't know
-   included, as for a local branch, by reading A's `/heads` first. A base further up can only
-   be purged after A, so that case reports A. *Propose:* say both.
-10. **Repeatable parameters** (§A.4, §A.5). Canonical URLs sort a repeated parameter's values,
-    which changes the meaning of any parameter whose values are ordered or read first-wins.
-    The reference's multi-key `sort` is now one comma-separated parameter (`400` if
-    repeated), and a tree listing parameter other than `min` given twice is `400`.
-    *Propose:* say repeatable parameters are order-insensitive and a single-valued one given
-    twice is `400`.
-11. **`min` on an `at` the service no longer keeps** (§A.5, §A.4). "To the same URL without
-    it", which then redirects to the current checkpoint, two hops against the bounded-redirect
-    SHOULD; the reference goes to the current checkpoint in one. It can judge whether an older
-    combined `at` (tree, `/_refs`) includes a `min` only while it keeps that `at`'s
-    per-namespace checkpoints, and never for a bare `{ns_id}`; on a single-namespace index
-    URL, a `min` naming another namespace is never included. *Propose:* "or to the current
-    checkpoint, if the service can't judge `at`".
-12. **"May this reader read all of these?"** (§B.11.5). "If a grant comes back for every
-    item", but public items get `"public": true` and no grant, and per-item `5xx` entries
-    (`behind` when the catalog lags, `upstream`) are undecided. The reference counts public
-    items as readable, a `4xx` entry as a refusal and a `5xx` one as "ask again", and caps a
-    request at 100 items. *Propose:* "a grant, or public, for every item", and allow a limit.
-13. **Which refusals carry `checkpoint`** (§B.11.4). The reference adds it to `403`, `404`,
-    `409` and `410` decided at it, but not to refusals decided from state it doesn't pin (a
-    `409` for a name the core has and the service hasn't seen, a catalog key missing at the
-    head). Keying cached decisions by the combined checkpoint drops them on any write to any
-    trusted namespace, though a decision depends on the catalog and the item's own namespace
-    only. The change log says decisions "carry their `at`"; the text names `checkpoint`.
-    *Propose:* say which refusals carry it.
-14. **Renamed imports** (§G.4.4). Several points the text leaves open, as the reference does
-    them:
-    - a mapping onto a branch whose base chain reaches `src` keeps references and ids;
-    - a renamed namespace's upstream is `{dst}-upstream`;
-    - an incremental document that would change is refused, since `requires` is a source id;
-    - a pin whose new id can't be known (external, left out, a snapshot's revision) is refused,
-      and so is a schema whose `$id` names its own revision path;
-    - documents of unmapped namespaces that reference a renamed one are rewritten too;
-    - a reference declared only by a later revision's schema is rewritten there by an added
-      `replace`;
-    - with fresh nonces ids differ between runs, so a re-run recognises its earlier writes by
-      the import batches' `source.ids`.
-    *Propose:* say which of these are intended.
-15. **Undo by writers limited to some resources** (§11.2). At E3 such a writer can't learn the
-    current epoch or pad, which are in the namespace document, so the reference refuses. A
-    gesture a merge carried counts for the merger, since only the namespace log shows the batch
-    counted as a merge. Resource logs carry no markers, so a gesture that may reach below a
-    pruning horizon is refused as impossible, and `UndoSince` is dropped, since `/heads` needs
-    unrestricted read. Plain and at-rest can't be told apart from reads. *Question:* how does
-    such a writer learn the epoch and pad, and are the others intended?
+1. **The prefix cap and the rate draw** (§C.5). "Once nothing is refused, the request draws
+   one token", but the text doesn't say whether the `400` for more than 100 distinct prefixes
+   counts as a refusal. The reference treats it as one and draws nothing. *Propose:* say so, or
+   rank the cap after the draw.
+2. **Undoing a genesis** (§11.2). "Impossible when the gesture's oldest entry lies at or before
+   the oldest log entry it can read" makes a document's genesis impossible to undo even when
+   nothing is pruned, since a log read from genesis has the genesis as its oldest entry. The
+   reference exempts a log read from genesis. A gesture lying wholly below one named document's
+   horizon but visible in another is undone in the other only, since resource logs carry no
+   markers. *Propose:* "…at or before the oldest entry it can read after a pruning horizon",
+   and say whether such a partial undo is acceptable.
+3. **`/keys` for limited writers at E3** (§E.2.3, §E.3.2). That `/keys` relays a limited
+   grant's own keyring entries, wrapped to its `enc`, without a read of the `keyring` resource,
+   is only implied by "a writer limited to some resources needs [them] to seal". The reference
+   does so. *Propose:* say it outright.
+4. **What a catalog decision depends on** (§B.11.4). "The catalog's and the item's own
+   namespace's entries, which are all it depends on", but a folder move's no-widening check
+   reads `includes` from every trusted content namespace, and a folder's visibility needs a role
+   in some trusted content namespace. Following the text, those decisions carry only the
+   catalog's entry, so a cached one isn't invalidated by a `/roles` or `includes` change
+   elsewhere. *Question:* should `checkpoint` name every namespace a decision read?
+5. **`min` on a namespace whose items the reader can't see** (§A.5). Only a namespace the URL's
+   `at` doesn't cover is `400`. In tree listings every followed namespace is covered, so for a
+   content namespace whose items the reader can't see, `302` versus `503` reveals whether an
+   `ns_id` is in its chain. The reference judges it normally. *Question:* intended?
+6. **Subject-set cookies** (§B.11.5, §C.5). A cookie for `/{catalog}/g/{gs}` can't carry the
+   subjects (the default format allows only `kid`, `p` and `exp`), so a service needs state
+   mapping `gs` to subjects. The reference keeps it; `problems`, `orphans` and manifests, which
+   need namespace-wide `read`, stay `403` under such a cookie. *Propose:* say so, or let a
+   service's format carry more.
+7. **`g/all` and trust changes** (§B.11.5). "`403` at an `at` that includes a namespace it
+   didn't check at issuance" needs the issue time, which the cookie doesn't carry. The reference
+   records issues in memory, and otherwise takes `exp` less 15 minutes, so with a shared key only
+   full-length cookies read a newly trusted namespace for 15 minutes; such listings are
+   `no-store` at the edge meanwhile. A namespace turning private under a live `g/all` cookie is
+   left to the revocation latency. *Question:* should a service's cookie carry an issue time?
+8. **`exchangeRate` at a service** (§6.6, §C.5). The bucket is the origin's; the reference's
+   catalog service keeps one too, per process, so a principal draws on each instance's.
+   *Question:* should services have it, and must it be shared across instances?
+9. **A purged sealed namespace and `min`** (§8.5, §A.5). A service can't judge a `min` against
+   a purged sealed namespace's log, which is `410`; the reference redirects to the current
+   checkpoint. Its read check for such a namespace goes through the gestures listing, the one
+   URL that still answers a limited reader. *Propose:* say how a service checks read on a
+   purged sealed namespace.
+
+## Settled in v0.51 and v0.52
+
+All fifteen v0.50 notes. As the reference did them:
+- **Grants in the body of `POST /edge-grants`** (1) need `Content-Type: application/json`
+  (`415` otherwise), and issuance is `404 not_offered` before the body is read while
+  authentication is disabled (§C.5).
+- **The cookie's claims** (2) are exactly `kid`, `p` and `exp`, canonical byte for byte; a
+  value with more is ignored. Cookie reads have no principal, so a deployment attributes them
+  to the prefix (§C.5).
+- **Edge verification headers** (3): each is one header line without a comma; the origin
+  authorises from the cookie or grant, and the headers decide only lifetimes (§9, §C.5).
+- **What check 2 refuses** (4): §7 now says a path with an empty, `.` or `..` segment, or a
+  percent-escape, is `400`, `/` itself excepted.
+- **A remote branch of a purged base** (9) reports the first purged namespace found, A's
+  before its bases', for any `at`, before `at` is checked (§G.3).
+- **Repeatable parameters** (10) are sets; a single-valued one given twice is `400`, and an
+  ordered list is one value (§A.5).
+- **`min` on an `at` the service can't judge** (11) goes to the current checkpoint in one
+  hop; a `min` naming a namespace the service doesn't follow, or the reader can't see, is
+  `400` (§A.5).
+- **"May this reader read all of these?"** (12): every item back with a grant, as
+  `"public": true`, or with its key; `4xx` refused, `5xx` undecided; a cap is allowed
+  (§B.11.5).
+- **Renamed imports** (14), as the reference does them, with one addition: a renamed
+  namespace's `{dst}-upstream` must fit the name limit, `422` at step 1 otherwise (§G.4.4).
+
+Adopted with more than the reference did, which now follows the text:
+- **Key rotation** (2): origins and edges SHOULD accept several keys and mint with the newest;
+  `-edge-grant-key` is now repeatable (§C.5).
+- **Services and §9** (5): services apply §9 to their own origin. Private listings are cached
+  at the edge under cookies the service mints with a key of its own for
+  `/{catalog}/g/{gs}`, at an exchange endpoint of its own, so listing URLs now put the subject
+  set first: `/{catalog}/g/{gs}/at/{at}/…`, `/{ns}/g/{gs}/at/{ns_id}`, `/_refs/g/{gs}/at/{at}`
+  (§A.4, §B.11.5). The tree service now mints and verifies them.
+- **Undo by writers limited to some resources** (15): `/keys` names `epoch`, `level` and
+  `pad`, and is `404 not_offered` where nothing is sealed, so such a writer can seal and undo at
+  E3 (§E.2.3, §11.2). It credits carried gestures to the merger, and reports an undo as
+  impossible when the gesture's oldest entry lies at or before the oldest log entry it can read.
+
+Decided against the reference, which now follows the text:
+- **Issuance and rate limits** (6, v0.52, from Doors): exchanges draw on a bucket of their own,
+  `exchangeRate` (deployment only, 10/s, burst 100), one token per request from each distinct
+  principal's bucket however many grants it carries, and never on a write bucket; `429` with
+  `limit: "exchangeRate"` otherwise (§6.6, §C.5). The reference drew one token per grant from
+  the principal's write bucket.
+- **The 100 cap** (7) counts distinct prefixes, and an exchange over it is `400`, once the
+  grants have verified (§C.5); the reference counted names and answered `403`.
+- **A purged sealed namespace's log** (8) is `410 purged` with `head`, its events and
+  long-polls too, rather than in the clear; `GET /ns/{ns}` still redirects (§8.5). The
+  reference answered `500` there.
+- **Catalog `checkpoint`** (13) is `{ ns: ns_id, … }`: the catalog's and each named item's
+  namespace's `ns_id`s, which are all a decision depends on, not the combined checkpoint
+  (§B.11.4).
 
 ## Settled in v0.50
 
