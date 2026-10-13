@@ -41,8 +41,24 @@ own.
 - **Imports:** an upstream namespace with an invalid name, usually a renamed namespace's
   over-long `{dst}-upstream`, is a check failure at step 1, before anything is written
   (§G.4.4).
+- **`serve` no longer derives the edge-grant cookie key from `-edge-secret`.** The catalog
+  service and the search index hold that secret for their own edge lifetimes, so they could
+  derive the key and mint core cookies. Without `-edge-grant-key`, each `serve` process signs
+  with its own random key: cookies verify only at the instance that minted them, not after a
+  restart, and no edge can verify them; `serve` warns when `-edge-secret` is set without key
+  files. Origins with several instances, and edges that verify cookies, need the same
+  `-edge-grant-key` key files. Cookies signed under the derived key stop verifying, and clients
+  exchange again. `-edge-grant-key KID=edge-secret` still holds the derived key, with a warning,
+  for migrating only: every edge must drop it 15 minutes after the origin does, since anything
+  holding the edge secret can mint cookies it accepts.
+- **The catalog service's `g/all` listings** get an edge lifetime of the cookie lifetime plus a
+  minute (`CDN-Cache-Control: max-age=960`), not a year, and when the catalog's trust list loses
+  a namespace the service purges `ns:{catalog}` through `-purge-url`. Purge `ns:{catalog}` at the
+  edge once after upgrading, for listings cached before.
 - `-edge-grant-key` takes `KID=FILE` only when no `/` comes before its first `=`; a file named
-  `edge-secret` in the working directory is given as `./edge-secret`.
+  `edge-secret` in the working directory is given as `./edge-secret`. `tree`'s
+  `-edge-grant-key`, `-edge-grant-kid`, `-origin-edge-grant-kid` and `-exchange-rate` without
+  `-access` are fatal.
 - `GET /` answers `"spec": "0.52"`.
 
 **New (v0.51):**
@@ -50,7 +66,9 @@ own.
   last and accepts all, so a key is rotated by adding the next to the edges, then to the
   origin, and dropping the old one once its cookies have expired, without clients exchanging
   again. `-edge-grant-key [KID=]edge-secret` names the key derived from `-edge-secret`, to move
-  off it the same way. `edge.Cookies.AddKey`, `Kid` and `Kids` (§C.5).
+  off it (above). `edge.Cookies.AddKey`, `Kid` and `Kids` (§C.5). The catalog service's
+  `tree -edge-grant-key [KID=]FILE` rotates the same way, and `-origin-edge-grant-kid` takes
+  every origin kid (repeatable or comma-separated), none of which a service kid may be.
 - **The catalog service mints its own edge grants** for private listings (§B.11.5): `POST
   /edge-grants` on the tree service, following §C.5's issuance rules, gives cookies for
   `/{catalog}/g/{gs}` under a key of its own (`tree -edge-grant-key`, `-edge-grant-kid`,
@@ -70,6 +88,13 @@ own.
   check.
 
 **Fixes:**
+- A `min` naming a purged sealed namespace (index, or another catalog of a tree service) is
+  decided by the core's read check, never `502`. The catalog service's `POST /edge-grants`, and
+  reads under its cookies, answer `410 purged` for a purged catalog, sealed or not (a subject
+  set's cookie without `head`), not `502` or `401`. A purged content namespace no longer ends
+  `g/all` listings: 16 minutes after the purge, it counts as read whole by every reader.
+- `client.With` no longer sets the redirect policy of the HTTP client it shares, which raced
+  with requests in flight.
 - The catalog grant service answers `410 gone` for items of a purged sealed content namespace,
   or catalog, instead of `502`; remote branches no longer re-apply a sealed base's purge on
   every sync; the janitor keeps sweeping when one of its bases is purged.
