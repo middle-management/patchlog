@@ -113,9 +113,10 @@ type Options struct {
 	// Purger receives cache-tag purges (default: log).
 	Purger Purger
 	// Edge is the verifying edge in front of the service (§9): listings for
-	// readers with a grant are served only to requests carrying its
-	// secret, with edge lifetimes. Nil: there is none, and those listings
-	// are no-store for shared caches.
+	// readers with a grant get edge lifetimes only when it verified the
+	// read itself, carrying its secret and a prefix covering the URL and no
+	// other credential. Other such listings, and all of them when nil, are
+	// no-store for shared caches. They are served either way.
 	Edge *edge.Verifier
 	// Logf logs (default log.Printf).
 	Logf func(format string, args ...any)

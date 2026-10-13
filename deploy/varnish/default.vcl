@@ -114,6 +114,11 @@ sub vcl_recv {
 		set req.backend_hint = core;
 	}
 	unset req.http.X-Cache;
+	# This CDN verifies no edge grants, so it never vouches for a read: a
+	# client's own edge verification headers (§9, §C.5) don't reach an
+	# origin, whatever secret it is configured with.
+	unset req.http.X-Edge-Verified;
+	unset req.http.X-Edge-Prefix;
 
 	if (req.method == "PURGE" || req.method == "BAN") {
 		call purge_tags;

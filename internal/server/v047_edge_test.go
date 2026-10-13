@@ -2,6 +2,8 @@ package server
 
 import (
 	"crypto/ed25519"
+	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"testing"
@@ -133,7 +135,7 @@ func TestV047EdgeGrantsAllOrNothing(t *testing.T) {
 // SameSite is None when the deployment names credentialed origins.
 func TestV047EdgeGrantCookies(t *testing.T) {
 	t.Parallel()
-	ck := edge.NewCookies([]byte("0123456789abcdef0123456789abcdef"))
+	ck := edge.NewCookies("", []byte("0123456789abcdef0123456789abcdef"))
 	ck.SameSite = http.SameSiteNoneMode
 	var priv ed25519.PrivateKey
 	e := newEnvWith(t, []Option{WithEdgeGrants(ck)}, withAuth(&priv))
@@ -206,11 +208,12 @@ func TestV047EdgeCookieStreamEndsAtExp(t *testing.T) {
 // v0.47 §6.1: a schemaReads read is made with the grant in Authorization,
 // since no edge cookie covers it. An edge that knows only prefixes
 // forwards it undecided, so the origin serves it without the edge's
-// verification, private and no-store for shared caches; other private
-// reads still need the verification.
+// verification, private and no-store for shared caches. v0.50 §9: so is
+// any read with a grant in Authorization, whatever the edge's headers say;
+// only a cookie read the edge verified gets its lifetime.
 func TestV047SchemaReadsBehindEdge(t *testing.T) {
 	t.Parallel()
-	v, err := edge.New([]byte("s3cret"), "")
+	v, err := edge.New([]byte("s3cret"), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -226,28 +229,37 @@ func TestV047SchemaReadsBehindEdge(t *testing.T) {
 	sRef := "/r/schemas/s/rev/" + s
 	e.create("content", "doc", map[string]any{"$schema": sRef, "v": 1.0}, cg)
 	reader := e.grant(rk, "user:li", []string{"content"}, []string{"read"})
-	verified := map[string]string{edge.DefaultHeader: "s3cret"}
+	verified := map[string]string{edge.DefaultHeader: "s3cret", edge.DefaultPrefixHeader: "/r/schemas"}
 
-	for _, hdr := range []map[string]string{nil, verified} {
-		r := e.do(req{method: "GET", path: sRef, bearer: reader, hdr: hdr})
+	noStore := func(what string, r *resp) {
+		t.Helper()
 		expect(t, r, 200)
 		if r.H.Get("Cache-Control") != "private, max-age=300" || r.H.Get("CDN-Cache-Control") != "no-store" || r.H.Get("Surrogate-Control") != "no-store" {
-			t.Fatalf("referrer read (%v): %v", hdr, r.H)
+			t.Fatalf("%s: %v", what, r.H)
 		}
 	}
-	// A reader of schemas reads it as any private read: through the edge,
-	// with its lifetime.
-	expectCode(t, e.do(req{method: "GET", path: sRef, bearer: sg}), 403, edge.Code)
-	r := e.do(req{method: "GET", path: sRef, bearer: sg, hdr: verified})
+	for _, hdr := range []map[string]string{nil, verified} {
+		noStore(fmt.Sprintf("referrer read (%v)", hdr), e.do(req{method: "GET", path: sRef, bearer: reader, hdr: hdr}))
+		// A reader of schemas with its grant in Authorization: served,
+		// no-store, with or without the edge's headers.
+		noStore(fmt.Sprintf("schemas reader (%v)", hdr), e.do(req{method: "GET", path: sRef, bearer: sg, hdr: hdr}))
+	}
+	// With an edge cookie the edge verified: its lifetime.
+	g := e.do(req{method: "POST", path: "/edge-grants", bearer: sg})
+	expect(t, g, 200)
+	h := cookieHdr(edgeCookies(t, g)["/r/schemas"])
+	maps.Copy(h, verified)
+	r := e.do(req{method: "GET", path: sRef, hdr: h})
 	expect(t, r, 200)
-	if r.H.Get("CDN-Cache-Control") != "max-age=86400, s-maxage=31536000, immutable" {
-		t.Fatalf("schemas reader: %v", r.H)
+	if r.H.Get("CDN-Cache-Control") != "max-age=86400, s-maxage=31536000, immutable" || r.H.Get("Surrogate-Control") != "" {
+		t.Fatalf("schemas reader's cookie: %v", r.H)
 	}
 	// An edge cookie of the referrer's namespace doesn't cover the path.
-	g := e.do(req{method: "POST", path: "/edge-grants", bearer: reader})
+	g = e.do(req{method: "POST", path: "/edge-grants", bearer: reader})
 	expect(t, g, 200)
-	h := cookieHdr(edgeCookies(t, g)["/r/content"])
+	h = cookieHdr(edgeCookies(t, g)["/r/content"])
 	h[edge.DefaultHeader] = "s3cret"
+	h[edge.DefaultPrefixHeader] = "/r/content"
 	expect(t, e.do(req{method: "GET", path: "/r/content/doc", hdr: h}), 302)
 	expect(t, e.do(req{method: "GET", path: sRef, hdr: h}), 401)
 }

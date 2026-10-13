@@ -2,6 +2,10 @@ package server
 
 import (
 	"crypto/ed25519"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"maps"
 	"net/http"
 	"strconv"
 	"strings"
@@ -303,11 +307,12 @@ func TestV046EdgeGrants(t *testing.T) {
 	expect(t, e.do(req{method: "GET", path: "/r/sec/a", hdr: cookieHdr(rc)}), 401)
 }
 
-// Behind a verifying edge, a cookie read gets the edge's lifetimes, and is
-// refused around the edge (§9).
+// Behind a verifying edge, a cookie read the edge verified gets its
+// lifetimes; around the edge, the origin verifies the cookie itself and
+// answers no-store (v0.50 §9, §C.5).
 func TestV046EdgeGrantsBehindEdge(t *testing.T) {
 	t.Parallel()
-	v, err := edge.New([]byte("s3cret"), "")
+	v, err := edge.New([]byte("s3cret"), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -321,12 +326,37 @@ func TestV046EdgeGrantsBehindEdge(t *testing.T) {
 	r := e.do(req{method: "POST", path: "/edge-grants", bearer: e.grant(k, "user:bob", []string{"sec"}, []string{"read"})})
 	expect(t, r, 200)
 	c := edgeCookies(t, r)["/r/sec"]
-	expectCode(t, e.do(req{method: "GET", path: "/r/sec/a/rev/" + a, hdr: cookieHdr(c)}), 403, edge.Code)
+	path := "/r/sec/a/rev/" + a
+	// Around the edge, or relayed without the prefix it checked: served,
+	// no-store.
+	for _, hdr := range []map[string]string{{}, {edge.DefaultHeader: "s3cret"}, {edge.DefaultPrefixHeader: "/r/sec"}} {
+		h := cookieHdr(c)
+		maps.Copy(h, hdr)
+		rev := e.do(req{method: "GET", path: path, hdr: h})
+		expect(t, rev, 200)
+		if rev.H.Get("Cache-Control") != "private, max-age=300" || rev.H.Get("CDN-Cache-Control") != "no-store" || rev.H.Get("Surrogate-Control") != "no-store" {
+			t.Fatalf("%v: cache %v", hdr, rev.H)
+		}
+	}
 	h := cookieHdr(c)
 	h[edge.DefaultHeader] = "s3cret"
-	rev := e.do(req{method: "GET", path: "/r/sec/a/rev/" + a, hdr: h})
+	h[edge.DefaultPrefixHeader] = "/r/sec"
+	rev := e.do(req{method: "GET", path: path, hdr: h})
 	expect(t, rev, 200)
 	if rev.H.Get("Cache-Control") != "private, max-age=300" || rev.H.Get("CDN-Cache-Control") != "max-age=86400, s-maxage=31536000, immutable" {
 		t.Fatalf("cache %v", rev.H)
+	}
+	// A cookie under another kid, as a service's, or in the v0.49 format,
+	// authorises nothing at the origin (§C.5 "Format").
+	key := edge.KeyFromSecret([]byte("s3cret"))
+	exp := strconv.FormatInt(t0.Add(time.Minute).Unix(), 10)
+	old := base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"p":"/r/sec","ns":"sec","sub":"user:bob","exp":` + exp + `}`))
+	m := hmac.New(sha256.New, key)
+	m.Write([]byte(old))
+	for _, ck := range []*http.Cookie{
+		edge.NewCookies("tree", key).Issue(edge.Claims{Prefix: "/r/sec", Exp: t0.Add(time.Minute).Unix()}, t0),
+		{Name: c.Name, Value: old + "." + base64.RawURLEncoding.EncodeToString(m.Sum(nil))},
+	} {
+		expect(t, e.do(req{method: "GET", path: path, hdr: cookieHdr(ck)}), 401)
 	}
 }

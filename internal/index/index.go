@@ -101,9 +101,10 @@ type Options struct {
 	// Purger receives cache tag purges; default: log.
 	Purger Purger
 	// Edge is the verifying edge in front of the service (§9): private
-	// results are served only to requests carrying its secret, with edge
-	// lifetimes. Nil: there is none, and private responses are no-store
-	// for shared caches.
+	// results it verified itself, carrying its secret and a prefix covering
+	// the URL and no other credential, get edge lifetimes. Other private
+	// results, and all of them when nil, are no-store for shared caches.
+	// They are served either way.
 	Edge *edge.Verifier
 	// Now is the clock for grant checks and kept results (default
 	// time.Now).

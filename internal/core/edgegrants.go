@@ -33,13 +33,14 @@ import (
 // and, if fixed, that resource only.
 
 // EdgeGrant is one namespace's edge grant: reads of NS, fixed to Resource
-// if set, for Sub.
+// if set. It names no principal (§C.5 "Format").
 type EdgeGrant struct {
 	NS       string
 	Resource string
-	Sub      string
-	// Exp is when a verified edge grant expires (zero when issuing).
-	Exp time.Time
+	// Prefix and Exp are a verified edge grant's prefix and expiry (zero
+	// when issuing).
+	Prefix string
+	Exp    time.Time
 }
 
 // Prefixes are the URL prefixes the edge grant covers (§C.5).
@@ -173,7 +174,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*EdgeGrant,
 	if n.purged {
 		return nil, t.purgedNS(n)
 	}
-	return &EdgeGrant{NS: ns, Resource: res, Sub: a.principal.ID}, nil
+	return &EdgeGrant{NS: ns, Resource: res}, nil
 }
 
 // edgeRole reports whether a role's rules qualify it for an edge grant
@@ -237,8 +238,9 @@ func fixesResource(rv any) (string, bool) {
 // edgeReader decides a read under an edge grant (§C.5): of its namespace,
 // and if fixed of its resource only. The edge grant was issued for a grant
 // with unrestricted read there, or read of that resource, so the actor
-// stands for it without rules. Each read checks its exp, so an event
-// stream opened under it ends there, as under the grant.
+// stands for it without rules. It carries no subject, so the actor is
+// named, and its bucket keyed, by the prefix. Each read checks its exp, so
+// an event stream opened under it ends there, as under the grant.
 func (t *tx) edgeReader(n *nsRow, eg *EdgeGrant, resource string) (*actor, *Error) {
 	if !eg.Exp.IsZero() && !t.now.Before(eg.Exp) {
 		return nil, apiErr(401, "unauthenticated", "message", "the edge grant has expired")
@@ -249,5 +251,5 @@ func (t *tx) edgeReader(n *nsRow, eg *EdgeGrant, resource string) (*actor, *Erro
 	if eg.Resource != "" && eg.Resource != resource {
 		return nil, notFound()
 	}
-	return &actor{principal: grant.Principal{ID: eg.Sub}, bucketKey: eg.Sub}, nil
+	return &actor{principal: grant.Principal{ID: "edge:" + eg.Prefix}, bucketKey: "edge:" + eg.Prefix}, nil
 }

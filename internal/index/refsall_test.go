@@ -347,8 +347,10 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}
 
 	// An index of private namespaces only: a reader needs a grant, and
-	// behind a verifying edge (§9) the answer comes through it.
-	ev := must(edge.New([]byte("s3cret"), ""))
+	// behind a verifying edge (§9) the answer is served with or without its
+	// headers, no-store for shared caches since the grant is in
+	// Authorization.
+	ev := must(edge.New([]byte("s3cret"), "", ""))
 	y := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "y.db"), ns: []string{"pa", "pb"}, now: s.Now}, func(o *indexOpts) { o.Edge = ev })
 	y.caughtUp("pa")
 	y.caughtUp("pb")
@@ -367,20 +369,20 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer "+bob)
 		if secret != "" {
 			req.Header.Set(edge.DefaultHeader, secret)
+			req.Header.Set(edge.DefaultPrefixHeader, "/_refs")
 		}
 		res := must(noFollow.Do(req))
 		res.Body.Close()
 		return res
 	}
-	if res := get("/_refs"+q, ""); res.StatusCode != 403 {
-		t.Errorf("without the edge: %d", res.StatusCode)
-	}
-	res := get("/_refs"+q, "s3cret")
-	for res.StatusCode == 302 {
-		res = get(res.Header.Get("Location"), "s3cret")
-	}
-	if res.StatusCode != 200 || res.Header.Get("CDN-Cache-Control") != "max-age=31536000" {
-		t.Errorf("through the edge: %d %v", res.StatusCode, res.Header)
+	for _, secret := range []string{"", "s3cret"} {
+		res := get("/_refs"+q, secret)
+		for res.StatusCode == 302 {
+			res = get(res.Header.Get("Location"), secret)
+		}
+		if res.StatusCode != 200 || res.Header.Get("CDN-Cache-Control") != "no-store" || res.Header.Get("Surrogate-Control") != "no-store" {
+			t.Errorf("secret %q: %d %v", secret, res.StatusCode, res.Header)
+		}
 	}
 }
 

@@ -58,6 +58,7 @@ func indexCmd(args []string) {
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
+	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
@@ -101,7 +102,7 @@ func indexCmd(args []string) {
 	if purger != nil {
 		opt.Purger = purger
 	}
-	opt.Edge = edgeVerifier(*edgeSecret, *edgeHeader)
+	opt.Edge = edgeVerifier(*edgeSecret, *edgeHeader, *edgePrefixHeader)
 	// The core may still be starting: retry reading its origin.
 	var ix *index.Index
 	for {

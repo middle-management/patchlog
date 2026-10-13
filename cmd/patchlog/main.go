@@ -167,12 +167,14 @@ func serve(args []string) {
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
-	edgeGrantKey := fs.String("edge-grant-key", "", "file holding the key edge-grant cookies of POST /edge-grants are signed with (§C.5); default: derived from -edge-secret, or else random per process, so cookies don't survive a restart or reach another instance")
+	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
+	edgeGrantKey := fs.String("edge-grant-key", "", "file holding the key edge-grant cookies of POST /edge-grants are signed with (§C.5); without it, the key derived from -edge-secret, or else a random one per process, so cookies don't survive a restart or reach another instance")
+	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key, which the cookies carry and a verifying edge looks the key up by (§C.5 \"Format\")")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
-	ev := edgeVerifier(*edgeSecret, *edgeHeader)
-	cookies := edgeGrantCookies(*edgeGrantKey, ev, corsFlags)
+	ev := edgeVerifier(*edgeSecret, *edgeHeader, *edgePrefixHeader)
+	cookies := edgeGrantCookies(*edgeGrantKid, *edgeGrantKey, ev, corsFlags)
 	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
 	if err != nil {
 		log.Fatal(err)
@@ -317,8 +319,9 @@ func serve(args []string) {
 const purgeURLUsage = "CDN URL that cache-tag purges are sent to, as PURGE with X-Purge-Tags (repeatable; e.g. http://cdn:8080/ for deploy/varnish). Unset: purges are only logged"
 
 const (
-	edgeSecretUsage = "file holding the secret a grant-verifying edge sends in -edge-header (§9): private reads without it are refused (403 edge_required), verified ones get edge lifetimes. Unset: no verifying edge, and private responses are CDN-Cache-Control: no-store"
-	edgeHeaderUsage = "request header carrying -edge-secret"
+	edgeSecretUsage       = "file holding the secret a grant-verifying edge sends in -edge-header, with the prefix of the edge grant it checked in -edge-prefix-header (§9): private reads it verified, with no Authorization, get edge lifetimes; every other private response is CDN-Cache-Control: no-store, and is served all the same. Unset: no verifying edge, and private responses are CDN-Cache-Control: no-store"
+	edgeHeaderUsage       = "request header carrying -edge-secret"
+	edgePrefixHeaderUsage = "request header carrying the prefix of the edge grant the edge verified (§9)"
 )
 
 // corsFlags are the -cors-* flags every server takes.
@@ -376,11 +379,14 @@ func (c *corsFlags) credentialOrigins() ([]string, error) {
 }
 
 // edgeGrantCookies returns the edge-grant cookies of POST /edge-grants
-// (§C.5): signed with -edge-grant-key, or the key derived from
-// -edge-secret, or a random one. They are SameSite=None when pages on
-// other origins may call with credentials (-cors-credentials-origin),
-// else Lax.
-func edgeGrantCookies(keyFile string, ev *edge.Verifier, c *corsFlags) *edge.Cookies {
+// (§C.5): signed with -edge-grant-key, else with the key derived from
+// -edge-secret, else with a random one, named kid. They are SameSite=None
+// when pages on other origins may call with credentials
+// (-cors-credentials-origin), else Lax.
+func edgeGrantCookies(kid, keyFile string, ev *edge.Verifier, c *corsFlags) *edge.Cookies {
+	if kid == "" {
+		log.Fatal("-edge-grant-kid: empty")
+	}
 	key := ev.CookieKey()
 	if keyFile != "" {
 		b, err := os.ReadFile(keyFile)
@@ -391,7 +397,7 @@ func edgeGrantCookies(keyFile string, ev *edge.Verifier, c *corsFlags) *edge.Coo
 			log.Fatal("-edge-grant-key: the key must be at least 16 bytes")
 		}
 	}
-	ck := edge.NewCookies(key)
+	ck := edge.NewCookies(kid, key)
 	if co, err := c.credentialOrigins(); err == nil && (len(co) > 0 || *c.credentials) {
 		ck.SameSite = http.SameSiteNoneMode
 	}
@@ -399,15 +405,15 @@ func edgeGrantCookies(keyFile string, ev *edge.Verifier, c *corsFlags) *edge.Coo
 }
 
 // edgeVerifier returns the verifying edge of -edge-secret, or nil.
-func edgeVerifier(file, header string) *edge.Verifier {
+func edgeVerifier(file, header, prefixHeader string) *edge.Verifier {
 	if file == "" {
 		return nil
 	}
-	v, err := edge.Load(file, header)
+	v, err := edge.Load(file, header, prefixHeader)
 	if err != nil {
 		log.Fatalf("-edge-secret: %v", err)
 	}
-	log.Printf("verifying edge: private reads need %s", v.Header())
+	log.Printf("verifying edge: edge lifetimes for private reads with %s and %s", v.Header(), v.PrefixHeader())
 	return v
 }
 
