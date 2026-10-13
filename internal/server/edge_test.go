@@ -183,7 +183,8 @@ func TestTrailingSlashBadInput(t *testing.T) {
 	e := newEnv(t)
 	e.mkNS("demo", map[string]any{"read": "public"})
 	e.create("demo", "x", map[string]any{})
-	for _, p := range []string{"/r/demo/x/", "/ns/demo/", "/r/demo/", "/r/demo//x", "/r/demo/x/log/", "/edge-grants/"} {
+	for _, p := range []string{"/r/demo/x/", "/ns/demo/", "/r/demo/", "/r/demo//x", "/r/demo/x/log/", "/edge-grants/",
+		"/r/demo/./x", "/r/demo/x/.", "/r/demo/../demo/x", "/r/demo/%78"} {
 		expectCode(t, e.get(p), 400, "bad_input")
 	}
 	expect(t, e.get("/"), 200)

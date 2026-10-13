@@ -76,12 +76,22 @@ type EdgeGrants struct {
 	Now    time.Time
 }
 
+// EdgeGrantsOffered is nil unless authentication is disabled, where
+// issuance is 404 not_offered whatever the request (§C.5, §12): the
+// server asks it before reading a body.
+func (e *Engine) EdgeGrantsOffered() error {
+	if e.opt.AuthDisabled {
+		return apiErr(404, "not_offered", "message", "edge grants need authentication (§1)")
+	}
+	return nil
+}
+
 // IssueEdgeGrants decides POST /edge-grants for bearers, the grants
 // exchanged, as they would follow "Bearer " (§C.5). None is 401; the
 // server keeps their number within MaxEdgeGrants.
 func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGrants, error) {
-	if e.opt.AuthDisabled {
-		return nil, apiErr(404, "not_offered", "message", "edge grants need authentication (§1)")
+	if err := e.EdgeGrantsOffered(); err != nil {
+		return nil, err
 	}
 	if len(bearers) == 0 {
 		return nil, apiErr(401, "unauthenticated", "message", "missing grant")

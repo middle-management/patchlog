@@ -238,6 +238,21 @@ func TestCheck(t *testing.T) {
 	}
 }
 
+// CanonicalPath is check 2 of §C.5, which an edge embedding Check tests
+// first to answer 400, and the origin's own rule (server.ServeHTTP).
+func TestCanonicalPath(t *testing.T) {
+	for path, want := range map[string]bool{
+		"/r/demo/derby": true, "/ns/demo": true, "/r/demo/derby/rev/x/log": true, "/r/demo/a.b": true, "/r/demo/..x": true,
+		"/": false, "": false, "r/demo": false, "/r/demo/": false, "/r//demo": false, "//r/demo": false,
+		"/r/./demo": false, "/r/demo/.": false, "/r/../demo": false, "/r/demo/..": false,
+		"/r/demo/%64erby": false, "/r/demo%2Fderby": false, "/r/demo/derby%": false,
+	} {
+		if got := CanonicalPath(path); got != want {
+			t.Errorf("CanonicalPath(%q) = %v, want %v", path, got, want)
+		}
+	}
+}
+
 // ParsePrefix accepts the core prefixes with names valid under §3.6, as
 // core judges them.
 func TestParsePrefix(t *testing.T) {

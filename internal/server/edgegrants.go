@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -59,6 +60,10 @@ func referrerCache(w http.ResponseWriter) {
 // prefixes are in the order the grants first give them. no-store.
 func (s *Server) edgeGrants(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
+	if err := s.e.EdgeGrantsOffered(); err != nil {
+		writeErr(w, err) // whatever the body (§C.5)
+		return
+	}
 	bearers, err := s.edgeGrantBearers(r)
 	if err != nil {
 		writeErr(w, err)
@@ -97,7 +102,10 @@ func (s *Server) edgeGrants(w http.ResponseWriter, r *http.Request) {
 // those of a body { "grants": [ … ] }, 1 to core.MaxEdgeGrants tokens as
 // they would follow "Bearer ", which takes no Authorization (400
 // otherwise); without a body, the grant in Authorization, if any. A
-// cookie never authorises issuing another.
+// cookie never authorises issuing another. The body must be
+// application/json (415 otherwise): a cross-site form can send text/plain
+// without a CORS preflight, and would set cookies of its own grant in the
+// reader's browser.
 func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 	// Room for every grant at the largest grant size, as base64 with its
 	// optional prefix and padding, quoted, and some whitespace.
@@ -115,6 +123,9 @@ func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 	if r.Header.Get("Authorization") != "" {
 		return nil, badInput("grants in the body take no Authorization (§C.5)")
 	}
+	if mediaType(r) != "application/json" {
+		return nil, &core.Error{Status: 415, Body: map[string]any{"code": "bad_input", "message": "use application/json"}}
+	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
 	v, err := readJSON(r, max)
 	if err != nil {
@@ -130,6 +141,7 @@ func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 		if out[i], ok = g.(string); !ok {
 			return nil, badInput("each grant is a string: the token as it would follow \"Bearer \" (§C.5)")
 		}
+		out[i] = strings.TrimSpace(out[i]) // as in Authorization (creds)
 	}
 	return out, nil
 }

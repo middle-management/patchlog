@@ -240,10 +240,13 @@ func Covers(prefix, path string) bool {
 	return prefix != "" && (path == prefix || strings.HasPrefix(path, prefix+"/"))
 }
 
-// canonicalPath reports whether an escaped path has no empty, "." or ".."
-// segment and no percent-escape (§C.5): the cache keys the raw URL, and
-// core names never need one (§3.6).
-func canonicalPath(path string) bool {
+// CanonicalPath reports whether an escaped path has no empty, "." or ".."
+// segment and no percent-escape, check 2 of §C.5 (400 otherwise): the
+// cache keys the raw URL, and core names never need one (§3.6). "/" fails
+// it, having an empty segment; no prefix covers it anyway. An edge
+// embedding Check answers 400 for a request whose path fails it, which
+// Check alone reports only as no covering cookie.
+func CanonicalPath(path string) bool {
 	if !strings.HasPrefix(path, "/") || strings.Contains(path, "%") {
 		return false
 	}
@@ -268,8 +271,9 @@ func canonicalPath(path string) bool {
 //
 // One covering cookie is enough: Check returns its p. A deployment may
 // embed it in an edge, which then forwards a passing request with the
-// secret and p in its verification headers (§9), and a request failing
-// check 2 answers 400.
+// secret and p in its verification headers (§9). Check answers a request
+// failing check 2 as one without a covering cookie: the edge answers it
+// 400 by testing CanonicalPath first.
 func (c *Cookies) Check(r *http.Request, now time.Time) (p string, ok bool) {
 	cl := c.check(r, now)
 	if cl == nil {
@@ -283,7 +287,7 @@ func (c *Cookies) check(r *http.Request, now time.Time) *Claims {
 		return nil
 	}
 	path := r.URL.EscapedPath()
-	if !canonicalPath(path) {
+	if !CanonicalPath(path) {
 		return nil
 	}
 	for _, ck := range r.Cookies() {

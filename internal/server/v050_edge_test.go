@@ -72,6 +72,11 @@ func TestV050EdgeGrantsBodyShape(t *testing.T) {
 		{"not a grant", req{body: map[string]any{"grants": []any{reader, "x"}}}, 401, "unauthenticated"},
 		{"empty token", req{body: map[string]any{"grants": []any{""}}}, 401, "unauthenticated"},
 		{"no body, no Authorization", req{}, 401, "unauthenticated"},
+		// A cross-site form posts text/plain without a preflight.
+		{"text/plain", req{body: map[string]any{"grants": []any{reader}}, ct: "text/plain"}, 415, "bad_input"},
+		{"form", req{raw: `{"grants":["` + reader + `"]}`, ct: "application/x-www-form-urlencoded"}, 415, "bad_input"},
+		{"text/plain form shape", req{raw: `{"grants":["` + reader + `"]}` + "\r\n", ct: "text/plain", hdr: map[string]string{"Origin": "https://evil.example"}}, 415, "bad_input"},
+		{"no Content-Type", req{raw: `{"grants":["` + reader + `"]}`, ct: " "}, 415, "bad_input"},
 	} {
 		c.q.method, c.q.path = "POST", "/edge-grants"
 		r := e.do(c.q)
@@ -85,6 +90,8 @@ func TestV050EdgeGrantsBodyShape(t *testing.T) {
 		e.do(req{method: "POST", path: "/edge-grants", bearer: reader}),
 		e.issueGrants(reader),
 		e.issueGrants("biscuit:" + reader),
+		e.issueGrants(" " + reader + "\n"), // trimmed, as in Authorization
+		e.do(req{method: "POST", path: "/edge-grants", raw: `{"grants":["` + reader + `"]}`, ct: "Application/JSON; charset=utf-8"}),
 		e.do(req{method: "POST", path: "/edge-grants", body: map[string]any{"grants": many[:50]}}),
 	} {
 		expect(t, r, 200)

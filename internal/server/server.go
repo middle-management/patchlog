@@ -88,12 +88,11 @@ func New(e *core.Engine, opts ...Option) *Server {
 
 // ServeHTTP enforces canonical URLs (§3.6) before routing: no
 // percent-escape and no empty, "." or ".." segment, a trailing "/"
-// included, as an edge checks them (§C.5). No route but "/" ends in "/".
+// included, with the rule an edge checks them by (edge.CanonicalPath,
+// §C.5). No route but "/" ends in "/".
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
-	if strings.Contains(r.RequestURI, "%") && strings.Contains(strings.SplitN(r.RequestURI, "?", 2)[0], "%") ||
-		strings.Contains(path, "//") || strings.Contains(path, "/./") || strings.Contains(path, "/../") ||
-		strings.HasSuffix(path, "/.") || strings.HasSuffix(path, "/..") || path != "/" && strings.HasSuffix(path, "/") {
+	if strings.Contains(strings.SplitN(r.RequestURI, "?", 2)[0], "%") || path != "/" && !edge.CanonicalPath(path) {
 		writeErr(w, &core.Error{Status: 400, Body: map[string]any{"code": "bad_input", "message": "non-canonical URL"}})
 		return
 	}

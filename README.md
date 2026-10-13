@@ -299,11 +299,15 @@ patchlog serve -edge-secret edge.secret           # the edge sends X-Edge-Verifi
 
 **Edge grants as cookies** (§C.5). `POST /edge-grants` with a grant in `Authorization`, or up
 to 50 grants as `{ "grants": [ … ] }` in the body (v0.50; each the token as it would follow
-`Bearer `), answers `{ "prefixes": [...], "exp" }` (`no-store`) and sets one cookie per prefix:
-`/r/{ns}` and `/ns/{ns}` per namespace a grant names, or `/r/{ns}/{name}`, one per name, when
-its read rules fix `/resource`. A body with `Authorization`, an empty list or more than 50,
-anything but strings, or any other member is `400 bad_input`; a body too large is `413 limit`.
-While authentication is disabled (`-dev`), issuance is `404 not_offered`.
+`Bearer `, surrounding whitespace ignored), answers `{ "prefixes": [...], "exp" }`
+(`no-store`) and sets one cookie per prefix: `/r/{ns}` and `/ns/{ns}` per namespace a grant
+names, or `/r/{ns}/{name}`, one per name, when its read rules fix `/resource`. A body with
+`Authorization`, an empty list or more than 50, anything but strings, or any other member is
+`400 bad_input`; a body too large is `413 limit`. The body must be `application/json`
+(`415 bad_input` otherwise), so that a page on another site needs a CORS preflight to send one:
+a `text/plain` form needs none, and could otherwise set cookies of its own grant in a reader's
+browser. While authentication is disabled (`-dev`), issuance is `404 not_offered`, whatever
+the request.
 
 Rules **fix** `/resource` (v0.50) when a rule of the blocks or the key's scope, at top level or
 inside `all`, tests it against one name (`test` with `value`, or `compare` with `eq` and a
@@ -402,7 +406,9 @@ without an edge, `no-store` at the edge if it is private; one that fails check 2
 the origin anyway (which v0.50 extends from dot segments, `//` and `%` to a trailing `/`). The
 origin decides a request carrying `Authorization` from that grant alone, ignoring its cookies,
 and never gives it an edge lifetime. In Go, `edge.Cookies.Check` makes the six checks in this
-order and returns the `p` to forward; the origin checks cookies with it too.
+order and returns the `p` to forward; it answers a request failing check 2 as one without a
+covering cookie, so an edge tests `edge.CanonicalPath` first to answer `400`. The origin checks
+cookies with `Check`, and its URLs with `CanonicalPath`.
 
 For example (pinned by `TestCookieVector` in `internal/edge`), the edge secret
 `example edge secret` gives the key

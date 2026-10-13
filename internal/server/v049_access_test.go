@@ -262,6 +262,17 @@ func TestV049EdgeGrantsAuthDisabled(t *testing.T) {
 	e.mkNS("pub", map[string]any{"read": "public"})
 	expectCode(t, e.do(req{method: "POST", path: "/edge-grants"}), 404, "not_offered")
 	expectCode(t, e.do(req{method: "POST", path: "/edge-grants", hdr: map[string]string{"Authorization": "Bearer x"}}), 404, "not_offered")
+	// v0.50: whatever the body, which the server doesn't read then.
+	for _, q := range []req{
+		{raw: `{"grants": [`},
+		{body: map[string]any{"grants": []any{}}},
+		{body: map[string]any{"grants": []any{"x"}}, bearer: "x"},
+		{body: map[string]any{"grants": []any{"x"}}, ct: "text/plain"},
+		{raw: `{"grants": ["` + strings.Repeat("A", 600<<10) + `"]}`},
+	} {
+		q.method, q.path = "POST", "/edge-grants"
+		expectCode(t, e.do(q), 404, "not_offered")
+	}
 	r := e.do(req{method: "DELETE", path: "/edge-grants?prefix=/r/pub&prefix=/r/pub"})
 	expect(t, r, 204)
 	if cs := (&http.Response{Header: r.H}).Cookies(); len(cs) != 1 || cs[0].Path != "/r/pub" || cs[0].MaxAge >= 0 {
