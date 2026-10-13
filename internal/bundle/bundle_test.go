@@ -688,12 +688,30 @@ func TestCLI(t *testing.T) {
 	if dst2.head("staging", "cup").ID != f.cup || dst2.head("schemas", "match").ID != f.matchV2 {
 		t.Fatal("mapped import")
 	}
-	// A namespace that $schema paths name can't be renamed: they would
-	// name another.
+	// A namespace that $schema paths name is renamed with them (§G.4.4):
+	// the schema whose $ref names it changes, so it gets new ids, and so
+	// does the document whose $schema pins it; the one that references
+	// nothing keeps its id.
 	errb.Reset()
-	if code := bundle.CLI(ctx, "import", []string{"-api", dst2.url, "-ns", "schemas=forms", "-i", full, "-author", "alice", "-atomic"}, &out, &errb); code != 1 ||
-		!strings.Contains(errb.String(), "can't be renamed") {
+	out.Reset()
+	if code := bundle.CLI(ctx, "import", []string{"-api", dst2.url, "-ns", "schemas=forms", "-i", full, "-author", "alice", "-atomic", "-json"}, &out, &errb); code != 0 {
 		t.Fatalf("renaming the schemas: %d %s", code, errb.String())
+	}
+	var rrep bundle.Report
+	noErr(t, json.Unmarshal(out.Bytes(), &rrep))
+	if rrep.Renamed["schemas"] != "forms" || !rrep.Doc("schemas/match").Renamed || rrep.Doc("schemas/common").Renamed {
+		t.Fatalf("renamed report %s", out.String())
+	}
+	match := dst2.head("forms", "match").ID
+	if dst2.head("forms", "common").ID != f.common || match == f.matchV2 {
+		t.Fatalf("forms: common %s, match %s", dst2.head("forms", "common").ID, match)
+	}
+	if got := dst2.doc("matches", "cup")["$schema"]; got != rev("forms", "match", match) {
+		t.Fatalf("cup's $schema %v", got)
+	}
+	props := dst2.doc("forms", "match")["properties"].(map[string]any)
+	if got := props["title"].(map[string]any)["$ref"]; got != rev("forms", "common", f.common) {
+		t.Fatalf("match's $ref %v", got)
 	}
 }
 

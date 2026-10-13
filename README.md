@@ -1828,9 +1828,11 @@ patchlog bundle verify -i matches.jsonl                      # recompute every i
 patchlog import -ns matches -i matches.jsonl -dry-run -atomic
 patchlog import -ns matches -i matches.jsonl -pace 0.5       # backfill: split and paced
 patchlog import -i all.jsonl -only demo-schemas -pace 1       # part of a bundle: the rest later
+patchlog import -i all.jsonl -atomic -ns demo-schemas=demo2-schemas,demo=demo2   # clone under new names
 ```
 
-- **History bundles** keep ids, so importing one reproduces the source's ids exactly.
+- **History bundles** keep ids, so importing one reproduces the source's ids exactly, but for
+  documents a renamed import rewrites (Renaming, below).
 - **Authors** (`-authors`, `"authors": true`) adds each history line's author, creation time,
   signature, and its `gesture` and `undoes` (§G.4.1). Imports write the gestures with the
   revisions (batch step objects, §7.5), so undo history survives the move; authors and times
@@ -1894,6 +1896,36 @@ patchlog import -i all.jsonl -only demo-schemas -pace 1       # part of a bundle
   namespaces at a time, by one process or several at once, those the others reference first,
   and the target ends as one whole import leaves it; only the namespaces imported (and their
   upstream namespaces) are created.
+- **Renaming** (§G.4.4). `-ns src=dst` maps source namespaces to new names together, to clone
+  a set of them, on another deployment or the same one. Every reference to a renamed namespace
+  is rewritten where it is declared, in every document the import brings: `$schema`, `$ref`
+  (keeping its `#fragment`), and pinned and live `x-ref` values, as the source's schemas
+  declare them; pins of revisions that get new ids take them. A full-history document whose
+  steps change is new content: its steps are rewritten one by one and written with new ids,
+  never fast-forwarded, its signatures left behind, and its batches' `source.ids` record the
+  source ids; a test op tests for the rewritten value, and a reference whose position a later
+  schema declares is rewritten by a `replace` op added to that step. In a sealed target, or one
+  that requires nonces, rewritten steps get a fresh `$nonce`. A document whose steps change
+  nothing keeps its ids, since ids don't include the namespace. Snapshot documents are
+  rewritten too, and go through `{dst}-upstream`. The new ids are computed before anything is
+  written, and a batch goes once those of the revisions it pins have committed, checking the
+  ids it produced, so dependents are written with the ids their dependencies returned. A
+  re-run of the same bundle computes the same ids and writes nothing; where nonces make them
+  differ, it finds what the earlier run wrote from its batches' `source.ids`, in the clone's
+  chain even if the clone was edited since, and goes on from there, also where a run that
+  stopped part-way left off. Strings of the reference form where nothing declares a reference
+  can't be found: the dry run and the report list them, and they stay (`rewrittenFrom` names
+  the revision whose schema later declares the position, from which the import rewrites it).
+  Refused before anything is written: an incremental document (`requires`) that would change,
+  read from its base in the target (one that only holds undeclared references keeps its ids
+  and imports as without renaming); a pin whose new id the import can't know (an `external`
+  pinned into a renamed namespace, a schema's path included, a document `-only` leaves out
+  that may change, a snapshot's revision); and a schema whose `$id` names its own revision
+  path. A single plain `-ns NAME` that isn't in the bundle is a mapping too, and renames
+  unless `NAME` is a branch of the bundle's namespace. Catalog placement names (`<ns>.<name>`) aren't
+  renamed, and namespace configuration isn't in the bundle (§G.7): create the renamed targets
+  with their roles, rules and keys first. A mapping onto a branch whose base chain reaches the
+  source namespace (importing into a branch first) renames nothing: references and ids stay.
 - **Timings.** The summary's `time` line, and `timings` in `-json`, show where the time went:
   planning, blobs, batch requests (mostly the server's time), paced waits and waits after
   `429`s.

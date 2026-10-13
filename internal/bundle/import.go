@@ -96,8 +96,11 @@ type ImportOptions struct {
 	// that goes on with a chain an earlier batch cut, and writes nothing.
 	DryRun bool
 	// NSMap maps source namespaces to target namespaces (default: the
-	// same name, §G.1). Schema namespaces must not be mapped, since
-	// $schema paths name them.
+	// same name, §G.1). A mapping to another name renames (rename.go,
+	// §G.4.4): references to the namespace are rewritten in every document
+	// the import brings, and documents that change get new ids. One onto a
+	// branch whose base chain reaches the source namespace, as an import
+	// into a branch first is (§F.3), keeps references and ids.
 	NSMap map[string]string
 	// Only, if set, are the source namespaces to import (partial.go): the
 	// others' documents are left out as external dependencies are
@@ -105,7 +108,8 @@ type ImportOptions struct {
 	// reference in them, as the bundle has it, which is checked first.
 	Only []string
 	// UpstreamSuffix names the upstream namespace of a source namespace
-	// (default "-upstream": matches → matches-upstream).
+	// (default "-upstream": matches → matches-upstream), or of the
+	// namespace a renamed one becomes (matches=cup → cup-upstream).
 	UpstreamSuffix string
 	// Resolutions resolve conflicting documents, by source key "ns/name".
 	Resolutions map[string]Resolution
@@ -164,7 +168,7 @@ type DocReport struct {
 	Doc        string           `json:"doc"`    // source "ns/name"
 	Target     string           `json:"target"` // target "ns/name"
 	History    string           `json:"history"`
-	Class      string           `json:"class"` // create, fast-forward, present, behind, replay, take, conflict, skipped, purged, absent
+	Class      string           `json:"class"` // create, fast-forward, resume, present, behind, replay, take, conflict, skipped, purged, absent
 	TargetHead string           `json:"targetHead,omitempty"`
 	BundleHead string           `json:"bundleHead"`
 	Ancestor   string           `json:"ancestor,omitempty"`
@@ -175,7 +179,12 @@ type DocReport struct {
 	Resolution Resolution       `json:"resolution,omitempty"`
 	Upstream   *UpstreamReport  `json:"upstream,omitempty"`
 	Rewritten  []RewrittenRef   `json:"rewritten,omitempty"`
-	Note       string           `json:"note,omitempty"`
+	// Renamed: a renamed import rewrote this full-history document, which
+	// it writes with new ids (Expected), never fast-forwarding the
+	// bundle's; resume goes on along its rewritten history from an earlier
+	// run that stopped part-way (§G.4.4 Renaming).
+	Renamed bool   `json:"renamed,omitempty"`
+	Note    string `json:"note,omitempty"`
 }
 
 // UpstreamReport is what an import appends to a snapshot document's
@@ -187,15 +196,20 @@ type UpstreamReport struct {
 	Head     string `json:"head,omitempty"`     // the upstream head after it
 }
 
-// RewrittenRef is a pinned reference rewritten to an upstream revision path.
+// RewrittenRef is a reference rewritten: a pinned one to an upstream
+// revision path, or one a renamed import rewrites (§G.4.4).
 type RewrittenRef struct {
 	Pointer string `json:"pointer"`
 	From    string `json:"from"`
 	To      string `json:"to"`
+	// Rev is the source revision of a full-history document whose step
+	// writes it.
+	Rev string `json:"rev,omitempty"`
 }
 
-// UndeclaredRef is a string in a snapshot document that looks like a pinned
-// reference but isn't declared with x-ref, so it can't be rewritten.
+// UndeclaredRef is a string that looks like a reference but isn't declared
+// ($schema, $ref or x-ref), so it can't be rewritten: one in a snapshot
+// document that pins, or one a renamed import would have rewritten.
 type UndeclaredRef struct {
 	Doc     string `json:"doc"`
 	Pointer string `json:"pointer"`
@@ -203,6 +217,17 @@ type UndeclaredRef struct {
 	// Bundled: it points at a snapshot document of this bundle, so it
 	// would have needed rewriting.
 	Bundled bool `json:"bundled,omitempty"`
+	// Renamed: it names a renamed namespace, or pins a revision that gets
+	// a new id, so it would have needed rewriting (§G.4.4 Renaming).
+	Renamed bool `json:"renamed,omitempty"`
+	// Rev is the source revision of a full-history document whose step
+	// writes it.
+	Rev string `json:"rev,omitempty"`
+	// RewrittenFrom is the source revision from which a renamed import
+	// rewrites it after all, by a replace op of its own, since that
+	// revision's schema declares its position; "" if it never does. The
+	// revisions before it keep it as it is.
+	RewrittenFrom string `json:"rewrittenFrom,omitempty"`
 }
 
 // BatchReport is one batch, dry-run or submitted.
@@ -243,11 +268,13 @@ type Report struct {
 	Docs         []*DocReport    `json:"docs"`
 	Undeclared   []UndeclaredRef `json:"undeclared,omitempty"`
 	Only         []string        `json:"only,omitempty"` // the source namespaces imported, if not all (ImportOptions.Only)
-	Create       []string        `json:"createNamespaces,omitempty"`
-	Order        []string        `json:"order"`
-	Batches      []*BatchReport  `json:"batches"`
-	Notes        []string        `json:"notes,omitempty"`
-	Timings      Timings         `json:"timings"`
+	// Renamed are the mappings that rename (§G.4.4), source to target.
+	Renamed map[string]string `json:"renamed,omitempty"`
+	Create  []string          `json:"createNamespaces,omitempty"`
+	Order   []string          `json:"order"`
+	Batches []*BatchReport    `json:"batches"`
+	Notes   []string          `json:"notes,omitempty"`
+	Timings Timings           `json:"timings"`
 }
 
 // Timings say where an import's time went, in seconds.
@@ -331,6 +358,8 @@ type bdoc struct {
 	idx           map[string]int
 	snap          *Line
 	pinKeys       map[string]bool // over-approximated pinned references, schemas' included (source keys)
+	refNS         map[string]bool // the namespaces its strings of the reference form name (mayChange)
+	rw            *rewritten      // as a renamed import writes it, nil if it keeps its ids (rename.go)
 	rep           *DocReport
 	requiresBad   bool             // requires isn't in the target's chain (the target moved on)
 	blobs         map[string]*Line // its blob lines, by blob id (§G.4.1)
@@ -354,6 +383,7 @@ type item struct {
 	expected []string
 	sizes    []int      // per step, its patch set's canonical size (stepSizes)
 	sameIDs  bool       // the ids are the source's (fast-forward): source.ids follows them
+	srcIDs   []string   // per step, the source id, for a renamed document's steps (rename.go)
 	srcID    string     // source.ids member otherwise
 	blobs    [][]string // per step, the blobs it may bring in (blobs.go)
 }
@@ -413,8 +443,10 @@ type importer struct {
 	h      *Header
 	digest string
 	docs   map[string]*bdoc
-	keys   []string // the documents the import brings, in order
-	rep    *Report
+	// targets are the bundle's namespaces by target namespace.
+	targets map[string]string
+	keys    []string // the documents the import brings, in order
+	rep     *Report
 
 	// A partial import (partial.go): the source namespaces it brings; what
 	// its documents reference of those it leaves out (source key → the
@@ -425,6 +457,14 @@ type importer struct {
 	held     map[string]bool
 	heldKeys []string
 	left     int
+
+	// A renamed import (rename.go): the mappings that rename, source to
+	// target namespace, and the full-history documents it may rewrite.
+	// blind are the documents it can't read for want of a schema, a
+	// problem check reports first if the schema is a missing external.
+	renames   map[string]string
+	potential map[string]bool
+	blind     []string
 
 	local bool      // the bundle's origin is the target's own
 	start time.Time // when the import began (Timings)
@@ -441,6 +481,7 @@ type importer struct {
 	// §G.5.1 (access.go).
 	create  map[string]any  // target ns → the document it is created with
 	sealedT map[string]bool // target ns is (or is created) sealed
+	nonces  map[string]bool // target ns requires nonces (nonce.go)
 	bump    map[string]int  // new e2e target → the epoch to move it to
 
 	// Target heads (heads.go): the resources looked up per namespace, and
@@ -534,7 +575,14 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 		im.local = true
 		im.rep.Notes = append(im.rep.Notes, "the bundle comes from this deployment: batch sources carry no origin, so the server checks source.at against source.ns (§7.5)")
 	}
-	if err := im.checkAccess(ctx); err != nil {
+	err = im.resolveRenames(ctx)
+	if err == nil {
+		err = im.checkUpstreams()
+	}
+	if err == nil {
+		err = im.checkAccess(ctx)
+	}
+	if err != nil {
 		// Its reads are the import's first requests to the target
 		// namespaces (existing).
 		if client.IsAuth(err) {
@@ -543,7 +591,18 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 		}
 		return im.rep, err
 	}
+	// What a renamed import can't rewrite first: the target's lack of
+	// what it would rewrite is a consequence.
+	if err := im.rename(ctx); err != nil {
+		return im.rep, err
+	}
 	if err := im.check(ctx); err != nil {
+		return im.rep, err
+	}
+	if len(im.blind) > 0 {
+		return im.rep, &CheckError{Problems: im.blind}
+	}
+	if err := im.checkNonces(ctx); err != nil {
 		return im.rep, err
 	}
 	if err := im.plan(ctx); err != nil {
@@ -580,10 +639,11 @@ func (im *importer) load(open Opener) error {
 		}
 	}
 	targets := map[string]string{}
+	im.targets = targets
 	for k, info := range im.h.Docs {
 		ns, name, _ := SplitKey(k)
 		d := &bdoc{key: k, ns: ns, name: name, tns: im.mapNS(ns), info: info, requires: im.h.Requires[k],
-			idx: map[string]int{}, pinKeys: map[string]bool{}, blobs: map[string]*Line{}, refd: map[string]bool{}}
+			idx: map[string]int{}, pinKeys: map[string]bool{}, refNS: map[string]bool{}, blobs: map[string]*Line{}, refd: map[string]bool{}}
 		d.rep = &DocReport{Doc: k, Target: Key(d.tns, name), History: info.History, BundleHead: info.Head}
 		im.docs[k] = d
 		if prev, ok := targets[d.tns]; ok && prev != ns {
@@ -656,13 +716,19 @@ func (im *importer) load(open Opener) error {
 		im.keys = append(im.keys, k)
 	}
 	sort.Strings(im.keys)
+	return nil
+}
+
+// checkUpstreams checks the names of the upstream namespaces, once the
+// renames that name some of them are known.
+func (im *importer) checkUpstreams() error {
 	for _, d := range im.docs {
 		if d.info.History == Snapshot {
 			u := im.upstreamNS(d.ns)
 			if !client.ValidNSName(u) {
 				return fmt.Errorf("import: upstream namespace name %q is invalid", u)
 			}
-			if src, ok := targets[u]; ok {
+			if src, ok := im.targets[u]; ok {
 				return fmt.Errorf("import: %s is both the upstream of %s and the target of %s", u, d.ns, src)
 			}
 		}
@@ -728,6 +794,7 @@ func (im *importer) scanRefs(d *bdoc, v any) {
 		if r.Rev != "" {
 			d.pinKeys[Key(r.NS, r.Name)] = true
 		}
+		d.refNS[r.NS] = true
 		if brought {
 			im.noteOut(r)
 		}
@@ -741,7 +808,14 @@ func (im *importer) mapNS(ns string) string {
 	return ns
 }
 
-func (im *importer) upstreamNS(srcNS string) string { return srcNS + im.opt.UpstreamSuffix }
+// upstreamNS is the upstream namespace of a source namespace's snapshot
+// documents: that of the namespace it is renamed to, if it is (§G.4.4).
+func (im *importer) upstreamNS(srcNS string) string {
+	if dst, ok := im.renames[srcNS]; ok {
+		return dst + im.opt.UpstreamSuffix
+	}
+	return srcNS + im.opt.UpstreamSuffix
+}
 
 // --- checks against the target -------------------------------------------
 
@@ -1125,6 +1199,12 @@ func (im *importer) plan(ctx context.Context) error {
 			continue // nothing the import writes is rewritten to it
 		}
 		it, err := im.planUpstream(ctx, d, refs[d.key])
+		var ce *CheckError
+		if errors.As(err, &ce) {
+			// A reference a renamed import can't rewrite (rename.go).
+			held = append(held, ce.Problems...)
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("import: %s upstream: %w", d.key, err)
 		}
@@ -1191,12 +1271,19 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 	if err != nil {
 		return nil, err
 	}
-	B, H := th.ID, d.info.Head
+	// H is the bundle's head, and W the head the import writes: H, or a
+	// renamed document's rewritten head (rename.go), which classifies it
+	// along its rewritten history, never the bundle's (§G.4.4 Renaming).
+	B, H, W := th.ID, d.info.Head, d.head()
 	r.TargetHead = B
 	mk := func(class string, after int, parent string) *item {
 		r.Class = class
-		it := &item{d: d, ns: d.tns, name: d.name, ifMatch: parent, ifNone: parent == "", sameIDs: true,
-			steps: stepsOfLines(d.lines[after+1:])}
+		it := &item{d: d, ns: d.tns, name: d.name, ifMatch: parent, ifNone: parent == "", sameIDs: d.rw == nil,
+			steps: d.stepsFrom(after + 1)}
+		if rw := d.rw; rw != nil {
+			// New ids, computed by rename; source.ids records the source's.
+			it.expected, it.sizes, it.srcIDs = rw.ids[after+1:], rw.sizes[after+1:], lineIDs(d.lines[after+1:])
+		}
 		return it
 	}
 	switch {
@@ -1206,7 +1293,7 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 		r.Resolution = ResolveSkip // nothing can be written; reported only
 		r.Note = "purged in the target: not imported"
 		return nil, nil
-	case B == H:
+	case B == W:
 		r.Class = "present"
 		return nil, nil
 	case th.State == client.NotFound:
@@ -1215,13 +1302,16 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 		}
 		return mk("create", -1, ""), nil
 	}
-	if i, ok := d.idx[B]; ok {
+	if i, ok := d.position(B); ok {
+		if d.rw != nil {
+			return mk("resume", i, B), nil
+		}
 		return mk("fast-forward", i, B), nil
 	}
 	if B == d.requires && !d.requiresBad {
 		return mk("fast-forward", -1, B), nil
 	}
-	behind, err := im.inChain(ctx, d.tns, d.name, B, H)
+	behind, err := im.inChain(ctx, d.tns, d.name, B, W)
 	if err != nil {
 		return nil, err
 	}
@@ -1264,8 +1354,8 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 	}
 	anc, ai := "", -2
 	for i := len(d.lines) - 1; i >= 0; i-- {
-		if _, ok := tidx[d.lines[i].ID]; ok {
-			anc, ai = d.lines[i].ID, i
+		if _, ok := tidx[d.idAt(i)]; ok {
+			anc, ai = d.idAt(i), i
 			break
 		}
 	}
@@ -1277,7 +1367,7 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 	var incoming []client.Step
 	if anc != "" {
 		r.Ancestor = anc
-		incoming = stepsOfLines(d.lines[ai+1:])
+		incoming = d.stepsFrom(ai + 1)
 		ancDoc, _, err := im.targetState(ctx, d.tns, d.name, anc)
 		if err != nil {
 			return nil, err
@@ -1306,9 +1396,14 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 		if err != nil {
 			return nil, err
 		}
-		bdoc, blive, err := im.bundleState(ctx, d, H)
-		if err != nil {
-			return nil, err
+		var bdoc any
+		var blive bool
+		if rw := d.rw; rw != nil {
+			bdoc, blive = rw.doc, rw.live // the rewritten document
+		} else {
+			if bdoc, blive, err = im.bundleState(ctx, d, H); err != nil {
+				return nil, err
+			}
 		}
 		steps := im.takeSteps(d.tns, tdoc, tlive, bdoc, blive)
 		if len(steps) == 0 {
@@ -1405,16 +1500,22 @@ func (im *importer) snapshotOrder(ctx context.Context) ([]*bdoc, map[string][]an
 		}
 		walkStrings(doc, func(at *strPath, s string) {
 			r, ok := annot.ParseRefString(s)
-			if !ok || r.Rev == "" {
+			if !ok {
+				return
+			}
+			t := im.docs[Key(r.NS, r.Name)]
+			// One a renamed import would have rewritten (rename.go).
+			_, renamed := im.renames[r.NS]
+			renamed = renamed || (r.Rev != "" && t != nil && t.rw != nil)
+			if r.Rev == "" && !renamed {
 				return
 			}
 			ptr := at.String()
 			if declared[ptr] || ptr == "/$schema" {
 				return
 			}
-			t := im.docs[Key(r.NS, r.Name)]
 			bundled := t != nil && t.info.History == Snapshot && t.snap != nil && t.snap.Snapshot == r.Rev
-			f.undeclared = append(f.undeclared, UndeclaredRef{Doc: d.key, Pointer: ptr, Value: s, Bundled: bundled})
+			f.undeclared = append(f.undeclared, UndeclaredRef{Doc: d.key, Pointer: ptr, Value: s, Bundled: bundled, Renamed: renamed})
 		})
 	})
 	for i, d := range snaps {
@@ -1505,35 +1606,82 @@ func (im *importer) rewriteTarget(r annot.Ref) *bdoc {
 // planUpstream calls it once per document, and a rewritten document
 // replaces the line's (dropSnap): a copy of each would double what the
 // import holds.
+//
+// A renamed import (rename.go) also rewrites the document's other declared
+// references to renamed namespaces, and pins of revisions that get new
+// ids, its $schema included. One it can't rewrite is a CheckError.
 func (im *importer) rewrite(d *bdoc, refs []annot.Ref) (any, error) {
 	var doc any
 	parsed := false
+	parse := func() error {
+		if parsed {
+			return nil
+		}
+		var err error
+		doc, err = d.snapDoc()
+		parsed = err == nil
+		return err
+	}
+	var problems []string
 	for _, r := range refs {
 		t := im.rewriteTarget(r)
-		if t == nil {
+		to := ""
+		switch {
+		case t != nil:
+			up := im.up[t.key]
+			if up == nil || up.head == "" {
+				return nil, fmt.Errorf("pinned reference %s at %s: no upstream revision for %s", r.Raw, r.Pointer, t.key)
+			}
+			frag := ""
+			if i := strings.IndexByte(r.Raw, '#'); i >= 0 {
+				frag = r.Raw[i:]
+			}
+			to = "/r/" + up.ns + "/" + up.name + "/rev/" + up.head + frag
+		case len(im.renames) > 0:
+			var problem string
+			if to, _, problem = im.renamedRef(r.Raw); problem != "" {
+				problems = append(problems, fmt.Sprintf("%s: the reference %s at %s can't be rewritten: %s", d.key, r.Raw, r.Pointer, problem))
+				continue
+			}
+			if to == r.Raw {
+				continue
+			}
+		default:
 			continue
 		}
-		up := im.up[t.key]
-		if up == nil || up.head == "" {
-			return nil, fmt.Errorf("pinned reference %s at %s: no upstream revision for %s", r.Raw, r.Pointer, t.key)
+		if err := parse(); err != nil {
+			return nil, err
 		}
-		if !parsed {
-			var err error
-			if doc, err = d.snapDoc(); err != nil {
-				return nil, err
-			}
-			parsed = true
-		}
-		frag := ""
-		if i := strings.IndexByte(r.Raw, '#'); i >= 0 {
-			frag = r.Raw[i:]
-		}
-		to := "/r/" + up.ns + "/" + up.name + "/rev/" + up.head + frag
 		var err error
 		if doc, err = setAt(doc, r.Pointer, to); err != nil {
 			return nil, err
 		}
 		d.rep.Rewritten = append(d.rep.Rewritten, RewrittenRef{Pointer: r.Pointer, From: r.Raw, To: to})
+	}
+	if len(im.renames) > 0 {
+		// Its $schema, which x-ref walks don't report.
+		v := doc
+		if !parsed {
+			var err error
+			if v, err = d.snapDoc(); err != nil {
+				return nil, err
+			}
+		}
+		m, _ := v.(map[string]any)
+		if s, ok := m["$schema"].(string); ok && !schema.IsDialect(s) {
+			to, _, problem := im.renamedRef(s)
+			switch {
+			case problem != "":
+				problems = append(problems, fmt.Sprintf("%s: its $schema %s can't be rewritten: %s", d.key, s, problem))
+			case to != s:
+				doc, parsed = v, true
+				m["$schema"] = to
+				d.rep.Rewritten = append(d.rep.Rewritten, RewrittenRef{Pointer: "/$schema", From: s, To: to})
+			}
+		}
+	}
+	if len(problems) > 0 {
+		return nil, &CheckError{Problems: problems}
 	}
 	if !parsed {
 		return d.snapHeld()

@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"runtime"
 	"sort"
@@ -27,7 +28,7 @@ const CLIUsage = `  patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode 
           [-recipient key.jwk]... [-plaintext] [-identity id.jwk]
   patchlog import -api URL -ns TARGET[,src=dst] -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T] [-author A]
           [-resolve ns/name=skip|take|replay]... [-create=false] [-json] [-identity id.jwk] [-allow-less-protected]
-          [-sign-key kid:seed]
+          [-sign-key kid:seed]    (src=dst renames: references to src are rewritten, and documents that change get new ids, §G.4.4)
   patchlog bundle verify -i file.jsonl [-identity id.jwk] [-json] [-signatures]
           [-source URL [-bearer T] [-author A]]    (-source checks signer keys against the source's namespace log, §C.3.1)
   patchlog bundle keygen -o id.jwk      (prints the public key, for -recipient and a grant's enc)`
@@ -242,10 +243,12 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 }
 
 // namespaceMap interprets -ns for an import: "name" imports the bundle's
-// namespace of that name as is; "src=dst" maps a source namespace; a
+// namespace of that name as is; "src=dst" maps a source namespace, which
+// renames it unless dst is a branch of it (ImportOptions.NSMap, §G.4.4); a
 // single plain name that isn't in the bundle maps the bundle's one
 // document namespace (a namespace no $schema or $ref names) to it, e.g.
-// to import into a branch first (§G.4.4).
+// to import into a branch first. That is a src=dst mapping too: it
+// renames unless the name is a branch of that namespace (§G.4.4).
 func namespaceMap(h *Header, schemaNamespaces func() (map[string]bool, error), spec string) (map[string]string, error) {
 	m := map[string]string{}
 	var schemaNS map[string]bool
@@ -260,18 +263,19 @@ func namespaceMap(h *Header, schemaNamespaces func() (map[string]bool, error), s
 	for ns := range h.At {
 		inBundle[ns] = true
 	}
+	mappable := maps.Clone(inBundle) // and the namespaces of external dependencies
+	for _, e := range h.External {
+		if ext, ok := ParseExternal(e); ok {
+			mappable[ext.NS] = true
+		}
+	}
 	for _, s := range splitList(spec) {
 		if src, dst, ok := strings.Cut(s, "="); ok {
-			if !inBundle[src] {
+			if !mappable[src] {
 				return nil, fmt.Errorf("import: -ns %s: the bundle has no namespace %s", s, src)
 			}
-			if src != dst {
-				if err := needSchemaNS(); err != nil {
-					return nil, err
-				}
-			}
-			if schemaNS[src] && src != dst {
-				return nil, fmt.Errorf("import: -ns %s: %s holds schemas that $schema/$ref paths name, so it can't be renamed", s, src)
+			if !client.ValidNSName(dst) {
+				return nil, fmt.Errorf("import: -ns %s: invalid target namespace %q", s, dst)
 			}
 			m[src] = dst
 			continue
@@ -311,7 +315,8 @@ func bundleHeader(open Opener) (*Header, error) {
 }
 
 // schemaNamespaces lists the namespaces named by $schema or $ref paths in a
-// bundle, which reads all of it: only a -ns that renames needs them.
+// bundle, which reads all of it: only a -ns of one plain name that isn't
+// in the bundle needs them.
 func schemaNamespaces(open Opener) (map[string]bool, error) {
 	r, err := open()
 	if err != nil {
@@ -328,7 +333,7 @@ func schemaNamespaces(open Opener) (map[string]bool, error) {
 	note := func(v any) {
 		walkStrings(v, func(at *strPath, s string) {
 			if k := at.Last(); k == "$schema" || k == "$ref" {
-				if r, ok := schema.ParseRef(s); ok {
+				if r, _, err := schema.SplitRef(s); err == nil { // a $ref may have a #fragment
 					out[r.NS] = true
 				}
 			}
@@ -357,7 +362,11 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	api := fs.String("api", "http://localhost:8080", "target deployment base URL")
-	nsSpec := fs.String("ns", "", "target namespaces: name, or src=dst to map a source namespace (comma-separated)")
+	nsSpec := fs.String("ns", "", "target namespaces: name, or src=dst to map a source namespace (comma-separated). src=dst renames, to clone a set of "+
+		"namespaces together: references to src ($schema, $ref, x-ref) are rewritten where they are declared in every document, and documents that change "+
+		"get new ids; undeclared ones are listed, not rewritten. Onto a branch of src it keeps references and ids. A single plain name that isn't in "+
+		"the bundle maps its one document namespace to it, so it renames too, unless it is a branch of that namespace. Catalog placement names aren't "+
+		"renamed, and namespace configuration isn't in the bundle: create renamed targets with theirs first (§G.4.4, §G.7)")
 	only := fs.String("only", "", "import only these source namespaces of the bundle (comma-separated): what their documents reference in the others "+
 		"must be in the target already, as the bundle has it, which is checked first (§G.4.1 external)")
 	in := fs.String("i", "", "bundle file")
@@ -473,6 +482,9 @@ func printReport(w io.Writer, r *Report) {
 		if d.Resolution != "" {
 			line += " resolved: " + string(d.Resolution)
 		}
+		if d.Renamed {
+			line += " (rewritten: new ids)"
+		}
 		fmt.Fprintln(w, line)
 		for _, c := range d.Conflicts {
 			fmt.Fprintf(w, "      conflict %s: %s %s\n", c.Kind, c.Message, strings.Join(c.Paths, " "))
@@ -485,7 +497,17 @@ func printReport(w io.Writer, r *Report) {
 		}
 	}
 	for _, u := range r.Undeclared {
-		fmt.Fprintf(w, "  undeclared pinned string in %s at %s: %s (not rewritten)\n", u.Doc, u.Pointer, u.Value)
+		switch {
+		case u.Renamed && u.RewrittenFrom != "":
+			fmt.Fprintf(w, "  undeclared reference in %s at %s, written by %s: %s (renamed, not rewritten before %s, which declares it)\n",
+				u.Doc, u.Pointer, u.Rev, u.Value, u.RewrittenFrom)
+		case u.Renamed && u.Rev != "":
+			fmt.Fprintf(w, "  undeclared reference in %s at %s, written by %s: %s (renamed, not rewritten)\n", u.Doc, u.Pointer, u.Rev, u.Value)
+		case u.Renamed:
+			fmt.Fprintf(w, "  undeclared reference in %s at %s: %s (renamed, not rewritten)\n", u.Doc, u.Pointer, u.Value)
+		default:
+			fmt.Fprintf(w, "  undeclared pinned string in %s at %s: %s (not rewritten)\n", u.Doc, u.Pointer, u.Value)
+		}
 	}
 	for _, ns := range r.Create {
 		fmt.Fprintf(w, "  create namespace %s\n", ns)
