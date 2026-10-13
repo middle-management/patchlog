@@ -498,7 +498,8 @@ func fetchLevel(ctx context.Context, c *client.Client, origin, ns, at string, ma
 				}
 			}
 		case "purge-ns":
-			// The log's last entry (§8.5): at is the purge itself.
+			// The log's last entry (§8.5): at is the purge itself. A's
+			// /heads answers that first, so this is a backstop.
 			return nil, nil, purgedBase(origin, ns, en.ID)
 		}
 	}
@@ -643,11 +644,18 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 	}
 	m := &remoteMirror{base: base, read: "grant"}
 	// A 410 purged for a namespace's URLs names it (levelErr). A's own
-	// purge is found before any base's: its /heads is read with its
-	// level, and a base can't be purged while A, its dependent, lives
-	// (§8.5), so the first one found is named.
+	// purge is found before any base's: a base can't be purged while A,
+	// its dependent, lives (§8.5), so the first one found is named.
 	mapErrs := []func(string, error) *Error{levelErr(base.Origin, base.NS, fetchErr)}
-	var heads []client.HeadItem
+	// The listing the spec reads (§G.3), checked against the logs below.
+	// It comes first: for a purged A it is 410 purged at any revision,
+	// once A's read check passes and before any other answer (§8.5), so a
+	// purged base is 410 as for a local branch (§7.6) even with an at A
+	// doesn't know, or a log A can't deliver.
+	heads, err := c.Heads(ctx, base.NS, base.At)
+	if err != nil {
+		return nil, mapErrs[0]("/ns/"+base.NS+"/rev/"+base.At+"/heads", err)
+	}
 	ns, at := base.NS, base.At
 	for {
 		mapErr := mapErrs[len(mapErrs)-1]
@@ -685,12 +693,6 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 				return nil, mapErr("/ns/"+base.NS, err)
 			}
 			lv.nonce = nonce && m.level != levelE2E
-			// The listing the spec reads (§G.3), checked against the
-			// logs below: 410 purged if A's namespace was purged after
-			// at.
-			if heads, err = c.Heads(ctx, base.NS, base.At); err != nil {
-				return nil, mapErr("/ns/"+base.NS+"/rev/"+base.At+"/heads", err)
-			}
 		}
 		if next == nil {
 			break

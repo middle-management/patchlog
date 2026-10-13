@@ -7,7 +7,10 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
+
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // expectPurgedBase expects the 410 "purged" of a remote branch whose base,
@@ -32,18 +35,31 @@ func (e *tenv) purgeNSAs(ns, bearer string) string {
 
 // v0.50 §G.3, §12: a remote branch of a purged base is 410 "purged", with
 // origin, ns and head naming the purged namespace at A and its purge-ns
-// entry, whether at is the purge itself (B finds it in the log) or comes
-// before it (A's /heads answers 410). Nothing is written on B, and a name
-// taken on B is still 412 before anything is fetched.
+// entry, for any at, as for a local branch of it (§7.6): the purge itself,
+// one before it, and one A doesn't know or that isn't in its chain (A's
+// /heads is 410 at any revision, §8.5). Nothing is written on B, and a
+// name taken on B is still 412 before anything is fetched.
 func TestV050RemoteBranchOfPurgedBase(t *testing.T) {
 	t.Parallel()
 	a, b, rt := pair(t, nil, nil)
 	f := populateA(t, a)
+	notInChain := a.nsHead("schemas")
 	head := a.nsPurge("main")
-	for name, at := range map[string]string{"at the purge": head, "before the purge": f.at} {
-		expectPurgedBase(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), "main", head)
+	for _, c := range []struct{ name, at string }{
+		{"at the purge", head},
+		{"before the purge", f.at},
+		{"unknown", hashID(t, "", nil)},
+		{"not in its chain", notInChain},
+	} {
+		// The local branch answers the same.
+		expectPurged(t, a.branch("main", map[string]any{"name": "loc", "at": c.at, "patches": []any{}}, "admin"), head)
+		r := b.mkRemote("rel", remoteGenesis("main", c.at, nil))
+		if r.Code != 410 {
+			t.Fatalf("%s: %d %s", c.name, r.Code, r.Body)
+		}
+		expectPurgedBase(t, r, "main", head)
 		if b.get("/ns/rel").Code != 404 || b.get("/ns/schemas").Code != 404 {
-			t.Fatalf("%s: written on B", name)
+			t.Fatalf("%s: written on B", c.name)
 		}
 	}
 	b.mkNS("taken", map[string]any{"read": "public"})
@@ -115,6 +131,39 @@ func TestV050RemoteBranchOfPurgedBaseReadCheck(t *testing.T) {
 	expectCode(t, b.mkRemote("rel", genesis), 422, "invalid")
 	rt.set(a.srv.URL, a.grant(kA, "svc:b", []string{"p"}, []string{"read"}))
 	expectPurgedBase(t, b.mkRemote("rel", genesis), "p", head)
+	expect(t, b.get("/ns/rel"), 404)
+}
+
+// v0.50 §G.3: a purged sealed base is 410 purged too, from A's /heads,
+// which B reads before the logs it would need A's keys for.
+func TestV050RemoteBranchOfPurgedSealedBase(t *testing.T) {
+	t.Parallel()
+	var aPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA), withAuth(&aPriv), withKeyStore(newKeyStore(t)), withEncTuning)
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{kA.entry("*")}}))
+	root := a.grant(kA, "user:root", []string{"s"}, allVerbs)
+	a.wr("s", "x", "", withNonce(addRoot(map[string]any{"v": encMarker})), root)
+	at := a.nsHead("s", root)
+	head := a.purgeNSAs("s", root)
+
+	bJWK, bPriv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	id := bPriv
+	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"s"}, []string{"read", "export"}, map[string]any{"enc": bJWK})}
+	b := newEnv(t, withOrigin(originB), withRemote(rt, withRemoteIdentity(&mu, &id)), withKeyStore(newKeyStore(t)), withEncTuning)
+	sealed := map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}}
+	for name, at := range map[string]string{"at the purge": head, "before the purge": at} {
+		r := b.mkRemote("rel", remoteGenesis("s", at, sealed))
+		if r.Code != 410 {
+			t.Fatalf("%s: %d %s", name, r.Code, r.Body)
+		}
+		expectPurgedBase(t, r, "s", head)
+	}
 	expect(t, b.get("/ns/rel"), 404)
 }
 

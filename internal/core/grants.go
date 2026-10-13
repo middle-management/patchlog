@@ -27,15 +27,15 @@ import (
 //
 // It needs unrestricted read on the namespace, as every /ns/{ns} URL but
 // the gestures listing does (§C.5). A purged namespace answers 410
-// "purged" once the read check passes, an unknown grant id included,
-// since the content the grant's signatures cover is gone (§8.5). A grant id names its root block, and the stored
-// form doesn't change once recorded, so the answer is immutable. Sealed
-// namespaces seal it like a log entry, under the
-// epoch key, with pl { ns, grant: gid } (§E.2.2): sealed once, stored in
-// the sealed table and served identically forever. The epoch is the one
-// sealing the namespace's first entry recording it, or the current one for
-// a grant only its bases record. End-to-end namespaces serve it in the
-// clear, as their logs are, but marked Private: Cache-Control private
+// "purged" once the read check passes, an unknown grant id included, since
+// the content the grant's signatures cover is gone (§8.5). A grant id
+// names its root block, and the stored form doesn't change once recorded,
+// so the answer is immutable. Sealed namespaces seal it like a log entry,
+// under the epoch key, with pl { ns, grant: gid } (§E.2.2): sealed once,
+// stored in the sealed table and served identically forever. The epoch is
+// the one sealing the namespace's first entry recording it, or the current
+// one for a grant only its bases record. End-to-end namespaces serve it in
+// the clear, as their logs are, but marked Private: Cache-Control private
 // instead of the immutable class (§9), since a grant shows more than a log
 // entry does.
 
