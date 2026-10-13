@@ -1222,6 +1222,18 @@ async function undoReadRes(ns, site) {
   return { head, headKind, start, entries, horizon: since && since !== site.hint ? since : '', level: e2e ? 'e2e' : told && sealed ? 'sealed' : '' };
 }
 
+/* undoKeysLevel asks POST /ns/{ns}/keys for the level of a namespace whose document the grant can't read (§E.2.3):
+ * '' where it isn't offered (404 not_offered: the namespace isn't sealed), else the level a 200 names. null where
+ * /keys refuses (403, 404, or 422 at E3 without enc) or names no level, as a deployment before v0.51. */
+async function undoKeysLevel(ns) {
+  const r = await api('POST', `/ns/${ns}/keys`, { body: { epochs: [] }, auto: true, label: 'undo' });
+  const j = r.json || {};
+  if (r.status === 404 && j.code === 'not_offered') return '';
+  if (r.status === 200) return typeof j.level === 'string' && j.level ? j.level : null;
+  if ([403, 404, 422].includes(r.status)) return null;
+  throw new Error(`POST /ns/${ns}/keys answered ${r.status}`);
+}
+
 /* undoPlan plans the undo of gesture g in ns (§11.2): o = { author, level, nonce (patch sets add one: needsNonce, §C.7),
  * limits, scanLog, resources (the documents the action touched, scanned where neither the listing nor the namespace
  * log can be read, §C.5) }. It returns { gesture, author, source, level, resources, conflicts, items }; an undo that
@@ -1248,22 +1260,39 @@ async function undoPlan(ns, g, o = {}) {
   }
   if (!found.sites.length) throw Object.assign(new Error('the gesture ' + g + ' has no revisions here' + (o.author ? ' by ' + o.author : '')), { refused: true });
   const plan = { gesture: g, author: found.author, source, level: o.level || '', resources: [], conflicts: [], items: [] };
+  // A grant that can't read the namespace document asks /keys for the level (§E.2.3, §11.2), and learns it from the
+  // logs it reads only where /keys refuses or doesn't say.
+  let learn = !o.level;
+  if (source === 'resources' && !o.level) {
+    const kl = await undoKeysLevel(ns);
+    if (kl !== null) { plan.level = kl; learn = false; }
+  }
+  const e2eRefusal = () => Object.assign(new Error('undo in an e2e namespace folds and seals the inverse client-side: use the Go client (client.Undo with UndoE2E), which learns the epoch and pad from /keys for a grant limited to some resources (§E.2.3); the playground does it for plaintext and sealed (E2) namespaces'), { refused: true });
+  if (plan.level === 'e2e') throw e2eRefusal();
   const lim = o.limits || {};
+  const unseen = [];
+  let others = false;
   for (const site of found.sites) {
     const rr = await undoReadRes(ns, site);
-    if (!o.level && rr.level) plan.level = rr.level;
-    if (plan.level === 'e2e') throw Object.assign(new Error('undo in an e2e namespace needs its namespace document (the current epoch and pad), which this grant can\'t read'), { refused: true });
+    if (learn && rr.level) plan.level = rr.level;
+    if (plan.level === 'e2e') throw e2eRefusal();
+    const first = rr.entries.findIndex((e) => e.gesture === g && (!found.author || e.author === found.author));
+    // Entries of the gesture by other authors only: it isn't the author's here.
+    if (first < 0 && rr.entries.some((e) => e.gesture === g)) { others = true; continue; }
+    // Without markers, the undo is impossible when the gesture's oldest entry lies at or before the oldest entry read
+    // after a pruning horizon, since its first entry read is that one, so it may continue below (§11.2). A log read
+    // from genesis has nothing before it. One with no entry of the gesture may hold it wholly below the horizon,
+    // which is decided once every document is read.
+    if (!site.markers.length && rr.horizon && first === 0) {
+      throw Object.assign(new Error(`the gesture's revision ${short(rr.entries[0].id)} is the first after the pruning horizon of ${site.resource}, and may continue below it`), { impossible: 'pruned', resource: site.resource });
+    }
+    if (!site.markers.length && rr.horizon && first < 0) unseen.push(site.resource);
     // From resource logs the author, unless given, is that of the first entry with the gesture.
     if (!found.author) found.author = plan.author = (rr.entries.find((e) => e.gesture === g) || {}).author || '';
     if (!found.author) continue;
     const ids = new Set(rr.entries.map((e) => e.id));
     const lost = site.markers.find((m) => !ids.has(m));
     if (lost) throw Object.assign(new Error(`the gesture's entry ${short(lost)} lies below the pruning horizon of ${site.resource}`), { impossible: 'pruned', resource: site.resource });
-    // Without markers, a gesture whose first revision read follows the horizon may continue below it.
-    const e0 = rr.entries[0];
-    if (!site.markers.length && rr.horizon && e0 && e0.gesture === g && e0.author === found.author) {
-      throw Object.assign(new Error(`the gesture's revision ${short(e0.id)} follows the pruning horizon of ${site.resource}, and may continue below it`), { impossible: 'pruned', resource: site.resource });
-    }
     let r;
     try {
       r = planUndoResource({ name: site.resource, head: rr.head, headKind: rr.headKind, start: rr.start, entries: rr.entries, gesture: g, author: found.author,
@@ -1273,6 +1302,11 @@ async function undoPlan(ns, g, o = {}) {
     plan.resources.push(r);
     plan.conflicts.push(...r.conflicts);
     if (!r.conflicts.length && r.steps.length) plan.items.push({ resource: r.resource, ifMatch: r.head, steps: r.steps });
+  }
+  // Found in no document named, by anyone, the gesture may lie wholly below a pruning horizon (§11.2); found in
+  // another, it didn't touch that one as far as can be told, and the document is left out.
+  if (source === 'resources' && !plan.resources.length && unseen.length && !others) {
+    throw Object.assign(new Error(`no entry of the gesture follows the pruning horizon of ${unseen[0]}, and it may lie wholly below it`), { impossible: 'pruned', resource: unseen[0] });
   }
   if (source === 'resources' && !plan.resources.length) throw Object.assign(new Error('the gesture ' + g + ' has no revisions in ' + found.sites.map((x) => x.resource).join(', ') + (o.author ? ' by ' + o.author : '')), { refused: true });
   return plan;

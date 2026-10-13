@@ -346,11 +346,10 @@ func TestSealedReadGrant(t *testing.T) {
 	if keys, r := e.keysOf("sp", nil, e.grant(k, "user:r", []string{"sp"}, []string{"read"})); r.Code != 200 || keys["sp#1"] == nil {
 		t.Fatalf("keys %d %v", r.Code, keys)
 	}
-	// A non-sealed namespace has no keys.
+	// A non-sealed namespace has no keys: not offered (§E.2.3).
 	e.mkNS("plain", atRest(map[string]any{"read": "grant", "keys": []any{k.entry("*")}}))
-	if _, r := e.keysOf("plain", nil, e.grant(k, "user:r", []string{"plain"}, []string{"read"})); r.Code != 422 {
-		t.Fatalf("keys of an at-rest namespace %d", r.Code)
-	}
+	_, r = e.keysOf("plain", nil, e.grant(k, "user:r", []string{"plain"}, []string{"read"}))
+	expectCode(t, r, 404, "not_offered")
 }
 
 // POST /ns/{ns}/keys: epoch keys, per-resource keys, epoch ranges, wrapping.

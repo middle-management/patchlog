@@ -155,6 +155,11 @@ func IsPurged(err error) bool { return statusIs(err, 410, "purged") }
 // IsNotFound reports a 404 (unknown, or not readable by the caller, §7).
 func IsNotFound(err error) bool { return statusIs(err, 404) }
 
+// IsNotOffered reports a 404 not_offered: the deployment or namespace
+// doesn't offer the endpoint, such as /keys of a namespace that isn't
+// sealed (§E.2.3) or gesture listings of a sealed one (§7.4).
+func IsNotOffered(err error) bool { return statusIs(err, 404, "not_offered") }
+
 // IsInUse reports a 409 in_use: a purge of the last copy of a referenced
 // schema revision, a namespace with dependents, or a config write that
 // would break either (§6.1, §7.4, §8.5).

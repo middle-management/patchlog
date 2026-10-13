@@ -435,6 +435,17 @@ type KeysRequest struct {
 	Resources []string
 }
 
+// KeysAnswer is what POST /ns/{ns}/keys answers (§E.2.3): the keys, and
+// the current epoch, the level ("sealed" or "e2e") and pad, which a writer
+// limited to some resources needs to seal (§E.3.1) and can't read in the
+// namespace document (§C.5).
+type KeysAnswer struct {
+	Keys  []map[string]any
+	Epoch int
+	Level string
+	Pad   bool
+}
+
 // Keys answers POST /ns/{ns}/keys. It needs a verified grant with read on
 // the namespace (with authentication disabled, anyone gets raw epoch keys).
 // A grant that reads the namespace unrestricted (§C.5: with roles, through
@@ -445,9 +456,13 @@ type KeysRequest struct {
 // the last historyEpochs) to the current one, and never include an epoch
 // that started after the grant's effective exp (§E.2.3). Keys are
 // HPKE-wrapped to the root block's enc if it has one, and raw base64url
-// otherwise.
-func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) ([]map[string]any, error) {
+// otherwise. At E3 any grant with read, whatever its rules, gets the
+// keyring entries wrapped to its enc (§E.3.2). A namespace that isn't
+// sealed is 404 not_offered, once the read check passes: there is nothing
+// to seal (§E.2.3).
+func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) (*KeysAnswer, error) {
 	var out []map[string]any
+	var ans *KeysAnswer
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -463,10 +478,15 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		if aerr != nil {
 			return aerr
 		}
+		perResource, refused := t.keysReadScope(a)
 		if cfg.level == levelE2E {
-			// The relay is a read of the keyring (§E.3.2); per-resource
-			// keys don't exist at E3.
-			if a.verified != nil && t.grantRules(a, "read", nil, t.basicEnvelope("read", KeyringName, a), false) != nil {
+			// The server only relays the keyring entries a key holder
+			// wrapped to the grant's enc (§E.3.2), so a grant that reads
+			// the namespace gets its own, unrestricted or limited to some
+			// resources: such a writer needs them, and the epoch and pad,
+			// to seal (§E.2.3, §E.3.1). Per-resource keys don't exist at
+			// E3. A grant whose rules refuse every read reads nothing.
+			if refused {
 				return notFound()
 			}
 			// 410 once the read check passes, as every URL of a
@@ -474,31 +494,21 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			if n.purged {
 				return t.purgedNS(n)
 			}
-			var err error
-			out, err = t.keysE2E(n, cfg, a, kr)
-			return err
-		}
-		// K_e only through rules none of which refers to /resource (§C.5).
-		// Roles are alternatives: if the unrestricted ones fail, a read role
-		// that refers to /resource may still pass per resource; without
-		// one, the grant doesn't read the namespace unrestricted, and is
-		// 403 (§E.2.3).
-		perResource := false
-		if a.verified != nil {
-			roles, ok := a.unrestrictedRoles()
-			if ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) != nil {
-				if _, all := a.verified.Allows("read"); len(roles) == len(all) {
-					return forbidden("epoch keys need unrestricted read on the namespace (§C.5, §E.2.3)")
-				}
-				ok = false
+			keys, err := t.keysE2E(n, cfg, a, kr)
+			if err != nil {
+				return err
 			}
-			perResource = !ok
+			ans = &KeysAnswer{Keys: keys, Epoch: cfg.Epoch, Level: levelNames[cfg.level], Pad: cfg.Pad}
+			return nil
+		}
+		if refused {
+			return forbidden("epoch keys need unrestricted read on the namespace (§C.5, §E.2.3)")
 		}
 		if n.purged {
 			return t.purgedNS(n)
 		}
 		if cfg.level != levelSealed {
-			return invalid("the namespace is not sealed")
+			return apiErr(404, "not_offered", "message", "the namespace is not sealed: there are no keys, and nothing to seal (§E.2.3)")
 		}
 		epochs := t.grantEpochs(n, cfg, a)
 		if kr.Epochs != nil {
@@ -565,9 +575,29 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 				}
 			}
 		}
+		ans = &KeysAnswer{Keys: out, Epoch: cfg.Epoch, Level: levelNames[cfg.level], Pad: cfg.Pad}
 		return nil
 	})
-	return out, err
+	return ans, err
+}
+
+// keysReadScope classifies a grant for /keys (§C.5, §E.2.3). K_e only
+// through rules none of which refers to /resource. Roles are
+// alternatives: if the unrestricted ones fail, a read role that refers to
+// /resource may still pass per resource (perResource); without one, the
+// grant doesn't read the namespace unrestricted (refused).
+func (t *tx) keysReadScope(a *actor) (perResource, refused bool) {
+	if a == nil || a.verified == nil {
+		return false, false
+	}
+	roles, ok := a.unrestrictedRoles()
+	if ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) != nil {
+		if _, all := a.verified.Allows("read"); len(roles) == len(all) {
+			return false, true
+		}
+		ok = false
+	}
+	return !ok, false
 }
 
 func recipientOf(a *actor) *ecdh.PublicKey {
