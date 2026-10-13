@@ -29,8 +29,9 @@ func fakeIndex(t *testing.T) (*httptest.Server, *[]string) {
 			q.Del("min")
 			w.Header().Set("Location", r.URL.Path+"/at/1aaa?"+q.Encode())
 			w.WriteHeader(http.StatusFound)
-		case r.URL.Path == "/g/1xyz/demo":
-			w.Header().Set("Location", "http://"+r.Host+"/g/1xyz/demo/at/1aaa")
+		case r.URL.Path == "/sec":
+			// A private namespace: the subject set before the checkpoint (§A.4).
+			w.Header().Set("Location", "http://"+r.Host+"/sec/g/1xyz/at/1aaa")
 			w.WriteHeader(http.StatusFound)
 		case r.URL.Path == "/elsewhere":
 			w.Header().Set("Location", "https://example.com/x")
@@ -86,7 +87,7 @@ func TestIndexProxy(t *testing.T) {
 	noFollow := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	for path, want := range map[string]string{
 		"/playground/index/demo?q=a+b&min=1aaa": "/playground/index/demo/at/1aaa?q=a+b",
-		"/playground/index/g/1xyz/demo":         "/playground/index/g/1xyz/demo/at/1aaa",
+		"/playground/index/sec":                 "/playground/index/sec/g/1xyz/at/1aaa",
 		"/playground/index/elsewhere":           "https://example.com/x",
 	} {
 		res, err := noFollow.Get(front.URL + path)

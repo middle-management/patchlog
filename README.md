@@ -787,7 +787,7 @@ What is instrumented:
 - **HTTP servers** (`serve` with its playground and proxies, `index`, `tree`/catalog): a server
   span per request named `{method} {route}`, with the route the matched pattern, never the
   path's ids or names: `GET /r/{ns}/{name}/rev/{id}`, `POST /ns/{ns}/batch`, the index's
-  `GET /{ns}`, `GET /g/{gs}/{ns}/at/{at}`, the tree's `GET /{catalog}/at/{at}/children`, the
+  `GET /{ns}`, `GET /{ns}/g/{gs}/at/{at}`, the tree's `GET /{catalog}/at/{at}/children`, the
   catalog's `POST /grants`, `GET /playground/`; requests without one (a CORS preflight, a 404)
   are named by the method alone. Attributes are the HTTP semantic conventions (`http.route`,
   `http.response.status_code`, `url.path`, `client.address`, …) and `patchlog.ns` on the core's
@@ -1049,14 +1049,16 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   It always redirects (v0.50, §A.5), so a `200` never carries `min`: an `at` URL whose result
   already includes every `min` (the current one, or a kept one whose `at` the log places at or
   after them) to itself without `min`, anything else, once `min` is reached, to the current
-  checkpoint. A `min` naming another namespace the index follows is never included in a
-  result of `{ns}`.
+  checkpoint. A `min` naming another namespace, which a result of `{ns}` never includes, goes
+  straight to the current checkpoint once reached, in one hop, if the index follows it and the
+  reader's grant may read it (v0.51, §A.5); any other is `400`.
 - Redirects give the query in one canonical form (v0.50, §A.5): parameters sorted by name, then
   value, as UTF-8 bytes, and every byte but letters, digits and `-._~` percent-encoded in
   uppercase hex (a space is `%20`, never `+`). An `at` URL is answered `200` only in that form,
-  and redirected to it otherwise; `next` URLs are built in it. Since that form sorts repeated
-  values, a multi-key sort is one parameter with comma-separated keys,
-  `sort=-/kickoff,/title`; a repeated `sort` is `400`.
+  and redirected to it otherwise; `next` URLs are built in it. Repeatable parameters (`min`,
+  `facet[…]`, `counts`, range filters) are sets (v0.51): sorted, a value given twice kept once.
+  A parameter that may not repeat, given twice, is `400`, and a multi-key sort is one parameter
+  with comma-separated keys, `sort=-/kickoff,/title`.
 - `?ref=` answers "who uses this?" (§A.4): the documents of `{ns}` that reference a resource through
   a schema's `x-ref`, found by walking each typed document with the schema revision it pins, with
   no `x-index` needed. `?ref=/r/logic/route-3` matches any form, `/r/logic/route-3/rev/{id}` only
@@ -1071,8 +1073,10 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   page, to set on the `at` URL; other queries page by offset, with `next` the next page's URL.
 - `GET /_refs?to=/r/logic/route-3` (v0.48) asks every namespace the index follows that the reader
   may read, branch previews included, `to` in any form `?ref=` takes. It redirects to
-  `/_refs/at/{at}/g/{gs}?to=…`, where `at` is a combined checkpoint over only the namespaces the
-  answer covers, which the body's `namespaces` lists, so writes elsewhere don't move it.
+  `/_refs/g/{gs}/at/{at}?to=…` (the subject set first since v0.51; the old
+  `/_refs/at/{at}/g/{gs}` is moved there with a `301`), where `at` is a combined checkpoint over
+  only the namespaces the answer covers, which the body's `namespaces` lists, so writes
+  elsewhere don't move it.
   - `gs` keys what the answer depends on, over markers alone (v0.49): `reads:{ns}` for each
     private namespace the grant reads unrestricted (one read role without `/resource` rules is
     enough), and `reads:{ns}:scope:{digest}` for one it reads in part, the digest covering the
@@ -1109,8 +1113,10 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   out of hits, an unmarked one is `400`, and a schema that can't be read for now is `502`. In
   sealed namespaces they are sealed with the rest of the hit. A database from before this
   version is rebuilt from the logs on start.
-- In private namespaces the reader's grant is checked locally. Results are routed under
-  `/g/{subject-set}/…` and filtered to the resources the grant can read.
+- In private namespaces the reader's grant is checked locally. Results are routed to
+  `/{ns}/g/{subject-set}/at/{ns_id}?…`, the subject set before the checkpoint (v0.51, §A.4), and
+  filtered to the resources the grant can read. The URLs before v0.51,
+  `/g/{subject-set}/{ns}[/at/{ns_id}]`, are moved permanently (`301`) to the new ones.
 
 ### Merge, rebase and cleanup (Addendum F)
 
@@ -1723,8 +1729,10 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
 
 `patchlog tree -catalog cat` follows a catalog namespace and the content namespaces it trusts, and
 serves folder listings (`children`, `ancestors`, `subtree`, `roots`, `orphans`, `problems`,
-`where`, `manifest`) at URLs pinned to the catalog's `ns_id`. Cycles and depth over 64 show up
-under `problems`. `-catalog` is repeatable (or comma-separated): each catalog gets its own
+`where`, `manifest`) at URLs pinned to its combined checkpoint: `/{catalog}/at/{at}/…` for
+anonymous readers of a public catalog, `/{catalog}/g/{gs}/at/{at}/…` for readers with a grant,
+the subject set before the checkpoint (v0.51, §B.11.5); the old `/{catalog}/at/{at}/g/{gs}/…` is
+moved there with a `301`. Cycles and depth over 64 show up under `problems`. `-catalog` is repeatable (or comma-separated): each catalog gets its own
 service and database (`-db` with `{catalog}` replaced, or `-{catalog}` added before the
 extension) behind one origin, and `/_status` covers them all (`?catalog=` for one).
 
@@ -1735,9 +1743,9 @@ suffices at any write rate. They are keyed by their URL and by what the reader r
 reader whose namespace-wide reads changed since (a public namespace turned private) isn't served
 one kept from before; listings that depend on the individual reader aren't kept. Every listing is
 served only at its canonical URL, the query in the search index's canonical form (v0.50, §A.5),
-and other forms are redirected to it; a `children` listing's `next` is in that form. Since that
-form sorts repeated values, a parameter other than `min` given more than once is `400`. A purge drops
-the kept listings that show what it purged.
+and other forms are redirected to it; a `children` listing's `next` is in that form. `min` is a
+set (v0.51), and a parameter other than `min` given more than once is `400`. A purge drops the
+kept listings that show what it purged.
 
 With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 - `POST /grants` with `{ "node", "want": ["create"], "to": [folders] }` creates a folder
@@ -1764,26 +1772,36 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   `409`. The catalog key's entry in content namespaces lists `restore` for this (§B.11.3):
   `"can": ["read", "create", "append", "restore"]`.
 - `POST /read-grants` returns resource-scoped read grants, and the keys of catalog nodes (and of an
-  item's placement) visible to the caller: `{ "checkpoint", "grants": [...] }`, one entry per item
-  in request order, each with `grant` and `exp`, `public: true` (no grant needed), or `error`
-  (`{ status, code, message }`); a catalog node gets keys and no grant. It decides every item at
-  one combined checkpoint: if the checkpoint moved while it decided, it decides again, up to three
-  times, then answers `503 behind` with `Retry-After`. So "may this reader read all of these?" is
-  one call: it may if no entry has `error` (a public item counts as readable), and may not if an
-  entry's error is a refusal (a `4xx` status); an entry whose error is a `5xx` (`503 behind` when
-  the catalog lags its `maxLag`, `502 upstream`) is undecided, and the client asks again. It takes
-  1 to 100 items (`400` otherwise).
-- Decisions carry `checkpoint`, the combined checkpoint (§B.5, the same value as listings' `at`)
-  they were decided at, so a client that caches decisions keys them by it (§B.11.4): the answers of
-  `POST /grants`, `POST /read-grants` and `POST /merge-grants`, and the bodies of refusals that are
-  decisions (`403`, `404`, `409`, `410`: `{ code, message, checkpoint }`). A refusal decided from
-  state the checkpoint doesn't pin carries none: a `409` for a name the core has but the service
-  hasn't seen yet, a `403` because the catalog key is missing at the head, a merge batch's stale
-  precondition. The grants' own `at` stays the catalog's `ns_id`, which `requireAt` can check. What
-  a decision reads is as of that checkpoint, as for listings: the roles, their definitions, the
-  catalog key, includes and place lists, and for `/read-grants` whether a namespace is public and
-  its encryption. So a `/roles` or `read` change the service hasn't reached yet doesn't change a
-  decision.
+  item's placement) visible to the caller: `{ "grants": [...] }`, one entry per item in request
+  order, each with `grant` and `exp`, `public: true` (an item in a public namespace that isn't
+  sealed: no grant needed), or `error` (`{ status, code, message }`), and its `checkpoint`
+  (below); a sealed item also gets its keys, and a catalog node keys and no grant. It decides
+  every item at one combined checkpoint: if the checkpoint moved while it decided, it decides
+  again, up to three times, then answers `503 behind` with `Retry-After`. So "may this reader
+  read all of these?" is one call (v0.51, §B.11.5): it may iff every item comes back with a
+  grant, as `public: true`, or, for a sealed item or a catalog node, with its keys, that is if
+  no entry has `error`; it may not if an entry's error is a refusal (a `4xx` status); an entry
+  whose error is a `5xx` (`503 behind` when the catalog lags its `maxLag`, `503 keys`,
+  `502 upstream`) is undecided, and the client asks again. It takes 1 to 100 items (`400`
+  otherwise).
+- Decisions carry `checkpoint`, `{ ns: ns_id, … }`: the `ns_id`s of the catalog and of each named
+  item's namespace they were decided at, which are all a decision depends on (v0.51, §B.11.4), so
+  a client that caches a decision keys it by them, and a write to another namespace the catalog
+  trusts doesn't drop it. It goes beside each grant, never inside it: in the answers of
+  `POST /grants` and `POST /merge-grants` (for a merge batch, the namespaces of the items its
+  placements name), in each entry of `POST /read-grants` (for a catalog node, the catalog's, and
+  for a placement node also its item's namespace's), and in the bodies of refusals that are
+  decisions (`403`, `404`, `409`, `410`: `{ code, message, checkpoint }`). One map per entry,
+  rather than one for a whole `/read-grants` answer, keys each item by only its own namespaces
+  and leaves out the entries that have none. A refusal decided from state the checkpoint doesn't
+  pin carries none: a `409` for a name the core has but the service hasn't seen yet, a `403`
+  because the catalog key is missing at the head, a merge batch's stale precondition, a `5xx`;
+  so does a public item of a namespace the catalog doesn't follow, read at the head. It isn't
+  listings' combined `at`, and the grants' own `at` stays the catalog's `ns_id`, which
+  `requireAt` can check. What a decision reads is as of that checkpoint, as for listings: the
+  roles, their definitions, the catalog key, includes and place lists, and for `/read-grants`
+  whether a namespace is public and its encryption. So a `/roles` or `read` change the service
+  hasn't reached yet doesn't change a decision.
 
 Listings are filtered by the caller's subject set (§B.11.5). A node is visible when the walk up
 collects, through a subject the catalog key may assert, a role granting `read` without conditions:
@@ -1806,7 +1824,7 @@ listing at a given `at` never changes when a `/roles` change lands later. `probl
 namespaces they cover (`403` otherwise), for a manifest those of the items it pins, for `problems`
 and `orphans` every trusted one; a public namespace counts as read namespace-wide; in the plain
 tree service too. A reader whose grant reads the catalog and every trusted content namespace as a
-whole is served unfiltered listings under `/{catalog}/at/{at}/g/all/…`, shared by all such
+whole is served unfiltered listings under `/{catalog}/g/all/at/{at}/…`, shared by all such
 readers, with a private `max-age` no longer than that grant's expiry. Reading only some of them as
 a whole doesn't change the URL space (the listing is then the subject set's), but still admits
 `problems`, `orphans` and manifests covering only those, served `private` with a `max-age` no
@@ -1819,7 +1837,8 @@ URL past any cached head pointer and waits for the service to catch up (`503` wi
 otherwise), instead of fetching with `no-store` (§B.5, §A.5). As in the search index, `min`
 always redirects (v0.50): an `at` URL whose listing already includes every `min` (the current
 `at`, or a kept one whose checkpoints show it) to itself without `min`, anything else to the
-current `at`. A bare `{ns_id}` never counts as included in an older `at`. `POST /grants` and
+current `at`. A bare `{ns_id}` never counts as included in an older `at`. Every namespace the
+service follows is in `at`, so a `min` naming one it doesn't follow is `400`. `POST /grants` and
 `POST /read-grants` take `?min` the same way; a decision on an item also depends on its content
 namespace (whether the item exists), so after creating a document it placed, or restoring one, a
 client passes `min` for both (§B.11.4).

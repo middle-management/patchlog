@@ -84,10 +84,11 @@ type MergeGrant struct {
 	ApprovedBy string `json:"approvedBy"`
 	// Checks reports, per resource, what was checked.
 	Checks []MergeCheck `json:"checks"`
-	// Checkpoint is the combined checkpoint (§B.5) the batch was checked
-	// at, as for POST /grants (§B.11.4); it shadows Issued's, which is the
-	// same.
-	Checkpoint string `json:"checkpoint"`
+	// Checkpoint is what the batch was checked at, as for POST /grants
+	// (§B.11.4, checkpointAt): the catalog's ns_id and those of the
+	// namespaces of the items its placements name. It shadows Issued's,
+	// which is the same.
+	Checkpoint map[string]string `json:"checkpoint"`
 }
 
 // MergeCheck is the decision for one item.
@@ -154,9 +155,11 @@ type mergeItem struct {
 // IssueMerge checks a catalog merge batch, for the merge service v and the
 // approver av, and signs one grant covering it with the merge key, or for
 // a batch changing $access answers Admin (§F.8). The checks are taken at
-// one combined checkpoint, with place lists and includes as of it, which
-// the answer carries as checkpoint and so do its 403s (decidedAt); the
-// 409s for stale preconditions are the core's, not decisions at it.
+// one checkpoint, with place lists and includes as of it, which the
+// answer carries as checkpoint (checkpointAt: the catalog and the
+// namespaces of the items the batch's placements name), and so do its
+// 403s (decidedAt); the 409s for stale preconditions are the core's, not
+// decisions at it.
 func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch map[string]any) (*MergeGrant, error) {
 	cat := s.t.Catalog()
 	if s.opt.MergeKey == nil {
@@ -294,13 +297,21 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 		latest[ns] = cfg
 	}
 
-	var cp, combined string
+	// The items the batch names are its placements' (checkpointAt).
+	var nss []string
+	for _, mi := range items {
+		if ns, _, ok := tree.SplitPlacement(mi.name); ok && !contains(nss, ns) {
+			nss = append(nss, ns)
+		}
+	}
+	var cp string
+	var checkpoint map[string]string
 	var checks []MergeCheck
 	needsAdmin := false
 	err = nil
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
-		combined, _ = tree.CombinedAt(g, cur)
+		checkpoint = checkpointAt(g, cur, nss...)
 		// Place lists and includes as of the checkpoint (configAt,
 		// includesAt), as for POST /grants.
 		placeOK := map[string]bool{}
@@ -475,9 +486,9 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 	if err != nil {
 		// The checks above are decisions at the checkpoint: their 403s
 		// carry it (decidedAt).
-		return nil, decidedAt(err, combined)
+		return nil, decidedAt(err, checkpoint)
 	}
-	out := &MergeGrant{ApprovedBy: av.Principal.ID, Checks: checks, Checkpoint: combined}
+	out := &MergeGrant{ApprovedBy: av.Principal.ID, Checks: checks, Checkpoint: checkpoint}
 	if needsAdmin {
 		// $access needs the admin group, which the merge key may never
 		// assert: checked here as a dry run, submitted under an admin's
@@ -504,7 +515,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 			return nil, forbidden("the merge key may not %s in %s", a, cat)
 		}
 	}
-	p := &plan{ns: cat, resource: "", can: can, rules: []any{map[string]any{"any": alts}}, cp: cp, combined: combined, key: key}
+	p := &plan{ns: cat, resource: "", can: can, rules: []any{map[string]any{"any": alts}}, cp: cp, checkpoint: checkpoint, key: key}
 	is, err := s.mintMerge(ctx, v, av, p)
 	if err != nil {
 		return nil, err
@@ -559,7 +570,7 @@ func (s *Service) mintMerge(ctx context.Context, v, av *grant.Verified, p *plan)
 	if err != nil {
 		return nil, err
 	}
-	return &Issued{Grant: g.Encode(), NS: p.ns, Can: p.can, Exp: exp.Format(time.RFC3339Nano), At: at, Checkpoint: p.combined}, nil
+	return &Issued{Grant: g.Encode(), NS: p.ns, Can: p.can, Exp: exp.Format(time.RFC3339Nano), At: at, Checkpoint: p.checkpoint}, nil
 }
 
 func (mi *mergeItem) addAction(a string) {

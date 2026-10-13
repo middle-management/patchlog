@@ -284,7 +284,7 @@ func TestReferencePrivate(t *testing.T) {
 	}
 	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"sec"}, []string{"read"})
 	r := x.raw("/sec"+q, bob)
-	if r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/g/") || !strings.HasSuffix(r.header.Get("Location"), "/sec"+q) {
+	if r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/sec/g/") || !strings.HasSuffix(r.header.Get("Location"), "/at/"+x.ix.Checkpoint("sec")+q) {
 		t.Fatalf("pointer: %d %v", r.status, r.header)
 	}
 	b := x.search("/sec"+q, bob)
@@ -292,7 +292,7 @@ func TestReferencePrivate(t *testing.T) {
 		t.Errorf("refs %v", got)
 	}
 	// Private results are not served to shared caches.
-	if cc := x.raw(strings.Replace(r.header.Get("Location"), "/sec", "/sec/at/"+x.ix.Checkpoint("sec"), 1), bob).header.Get("Cache-Control"); !strings.Contains(cc, "private") {
+	if cc := x.raw(r.header.Get("Location"), bob).header.Get("Cache-Control"); !strings.Contains(cc, "private") {
 		t.Errorf("Cache-Control %q", cc)
 	}
 }

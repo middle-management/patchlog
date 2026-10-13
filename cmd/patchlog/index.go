@@ -26,8 +26,9 @@ import (
 //	               [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false]
 //	               [-enc-key B64URL | -enc-key-file PATH] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]]
 //
-// Results at /{ns}/at/{ns_id} are immutable and tagged idx:{ns} and
-// r:{ns}/{name} per hit; only the current checkpoint's results are kept.
+// Results at /{ns}/at/{ns_id}, or /{ns}/g/{gs}/at/{ns_id} for a private
+// namespace (§A.4), are immutable and tagged idx:{ns} and r:{ns}/{name} per
+// hit; only the current checkpoint's results are kept.
 // Read-your-writes: ?min={ns_id} or ?min={ns}:{ns_id}, repeatable, which
 // always redirects (§A.5). Results are answered only at the canonical form
 // of their query (§A.5); a multi-key sort is one parameter,

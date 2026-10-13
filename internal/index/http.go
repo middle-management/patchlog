@@ -42,8 +42,12 @@ var validNS = client.ValidNSName
 //	                              tagged idx:{ns} and r:{ns}/{name} per hit)
 //	                              302 → current checkpoint if ns_id is neither
 //	                              current nor kept for this query
-//	GET /g/{gs}/{ns}?…            private namespaces: as above, keyed by the
-//	GET /g/{gs}/{ns}/at/{ns_id}?… reader's subject set gs (§B.11.5)
+//	GET /{ns}/g/{gs}/at/{ns_id}?… private namespaces: as above, keyed by the
+//	                              reader's subject set gs (§A.4, §B.11.5), the
+//	                              subject set before the checkpoint
+//
+// The forms before v0.51, /g/{gs}/{ns}?… and /g/{gs}/{ns}/at/{ns_id}?…,
+// are moved permanently (301) to /{ns}?… and /{ns}/g/{gs}/at/{ns_id}?….
 //
 // The index holds current state only (§A.3), so results are computed at the
 // current checkpoint, and a redirect to it computes the result there. Every
@@ -69,7 +73,7 @@ var validNS = client.ValidNSName
 // has one source, so a reader of the whole namespace gets it sealed as one
 // JWE under the namespace's current epoch key, Content-Type
 // application/jose, pl { ns, view } where view is the result's request
-// target (/[g/{gs}/]{ns}/at/{ns_id}?{query}, the canonical form). A reader
+// target (/{ns}[/g/{gs}]/at/{ns_id}?{query}, the canonical form). A reader
 // whose grant restricts resources may hold only per-resource keys, so it
 // gets JSON { at, ns, hits, next? } in which each hit keeps resource, id
 // and url in the clear and carries its score, schema and facets as
@@ -111,12 +115,20 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(segs) == 3 && segs[1] == "at":
 		ns, at, isAt = segs[0], segs[2], true
 		telemetry.SetRoute(r, "/{ns}/at/{at}")
-	case len(segs) == 3 && segs[0] == "g":
-		gs, ns = segs[1], segs[2]
+	case len(segs) == 5 && segs[1] == "g" && segs[3] == "at":
+		ns, gs, at, isAt = segs[0], segs[2], segs[4], true
+		telemetry.SetRoute(r, "/{ns}/g/{gs}/at/{at}")
+	case len(segs) == 3 && segs[0] == "g" && validNS(segs[2]) && oldForm(segs[1]):
+		// Before v0.51 (§A.4): /g/{gs}/{ns}, now the head pointer /{ns}.
 		telemetry.SetRoute(r, "/g/{gs}/{ns}")
-	case len(segs) == 5 && segs[0] == "g" && segs[3] == "at":
-		gs, ns, at, isAt = segs[1], segs[2], segs[4], true
+		moved(w, r, "/"+segs[2])
+		return
+	case len(segs) == 5 && segs[0] == "g" && segs[3] == "at" && validNS(segs[2]) && oldForm(segs[1], segs[4]):
+		// Before v0.51: /g/{gs}/{ns}/at/{at}. A namespace named g has
+		// /g/g/{gs}/at/{at}, matched above: no subject set is "g".
 		telemetry.SetRoute(r, "/g/{gs}/{ns}/at/{at}")
+		moved(w, r, "/"+segs[2]+"/g/"+segs[1]+"/at/"+segs[4])
+		return
 	default:
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
 		return
@@ -215,7 +227,7 @@ func base(a *access, ns string) string {
 	if a.public {
 		return "/" + ns
 	}
-	return "/g/" + a.gs + "/" + ns
+	return "/" + ns + "/g/" + a.gs
 }
 
 func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string, isAt bool) {
@@ -269,24 +281,40 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
-	// The reader's URL space: public, or keyed by its subject set. With
-	// min, the redirects below land there, without min (§A.5).
-	if gs != a.gs && len(q.Mins) == 0 {
-		target := base(a, ns)
-		if isAt {
-			target += "/at/" + at
-		}
+	// The reader's URL space: public, or keyed by its subject set. The
+	// head pointer /{ns} is everyone's, and redirects there below; an at
+	// URL of another space is redirected to the same at in the reader's.
+	// With min, the redirects below land there, without min (§A.5).
+	if isAt && gs != a.gs && len(q.Mins) == 0 {
 		setPtrHeaders()
-		redirect(w, target+derived.CanonicalQuery(vals))
+		redirect(w, base(a, ns)+"/at/"+at+derived.CanonicalQuery(vals))
 		return
 	}
+	// A min naming another namespace, which this URL's at doesn't cover,
+	// goes to the current checkpoint once reached (atIncludes judges only
+	// ns), in one hop, if the service follows it and the reader may see
+	// it; any other is 400 (§A.5).
 	for i, m := range q.Mins {
-		if m.NS == "" {
+		switch {
+		case m.NS == "":
 			q.Mins[i].NS = ns
-		} else if !ix.known(m.NS) {
+		case m.NS == ns:
+		case !ix.known(m.NS):
 			w.Header().Set("Cache-Control", "no-store")
 			writeErr(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow")
 			return
+		default:
+			if _, err := ix.access(ctx, m.NS, r); err != nil {
+				var ae *grant.AuthError
+				w.Header().Set("Cache-Control", "no-store")
+				if !errors.As(err, &ae) {
+					ix.opt.Logf("index: access check for %s: %v", m.NS, err)
+					writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
+					return
+				}
+				writeErr(w, http.StatusBadRequest, "bad_input", "min names a namespace the reader can't see")
+				return
+			}
 		}
 	}
 	// target is the canonical URL of this query's result at an ns_id (§A.5):
@@ -721,6 +749,33 @@ func (ix *Index) seen(ctx context.Context, ns, id string) bool {
 func redirect(w http.ResponseWriter, loc string) {
 	w.Header().Set("Location", loc)
 	w.WriteHeader(http.StatusFound)
+}
+
+// oldForm reports whether the subject set and checkpoints of a URL of a
+// form before v0.51 are well formed, so that, with a valid namespace name,
+// the URL moved names nothing but them.
+func oldForm(gs string, ats ...string) bool {
+	if _, err := ids.Parse(gs); err != nil {
+		return false
+	}
+	for _, at := range ats {
+		if _, err := ids.Parse(at); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// moved answers a URL of a form before v0.51 (§A.4) with a permanent
+// redirect to path, the same query kept: the redirect depends on the URL
+// alone, so it reveals nothing, and the URL it names checks the reader.
+func moved(w http.ResponseWriter, r *http.Request, path string) {
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Location", path)
+	w.WriteHeader(http.StatusMovedPermanently)
 }
 
 func writeErr(w http.ResponseWriter, status int, code, msg string) {

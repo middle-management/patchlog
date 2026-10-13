@@ -39,17 +39,19 @@
 // don't matter for the catalog's API: it is only proof of identity.
 //
 // Decisions (POST /grants, POST /read-grants, POST /merge-grants) are
-// taken at one combined checkpoint (§B.5, listings' at), which answers
-// carry as checkpoint, and so do refusals that are decisions (403, 404,
-// 409, 410), so a client that caches decisions keys them by it; the
-// grants' own at stays the catalog's ns_id (§B.11.4). A refusal decided
-// from state the checkpoint doesn't pin (the core's head of a name the
-// service hasn't seen yet, the signing key at the head, a merge batch's
-// stale precondition) carries none (decidedAt). What a decision reads is
-// as of that checkpoint, as for visibility: the roles, their definitions,
-// the catalog's key, includes and place lists (configAt, includesAt), and
-// for /read-grants whether a namespace is public and its encryption
-// (exposureAt). POST /grants and POST /read-grants take ?min for the
+// taken at one checkpoint, which answers carry beside each grant as
+// checkpoint, { ns: ns_id }: the ns_ids of the catalog and of each named
+// item's namespace there (§B.11.4, checkpointAt), which are all a
+// decision depends on, not the combined checkpoint of listings (§B.5).
+// So do refusals that are decisions (403, 404, 409, 410), so a client that
+// caches decisions keys them by it; the grants' own at stays the
+// catalog's ns_id. A refusal decided from state the checkpoint doesn't
+// pin (the core's head of a name the service hasn't seen yet, the signing
+// key at the head, a merge batch's stale precondition) carries none
+// (decidedAt). What a decision reads is as of that checkpoint, as for
+// visibility: the roles, their definitions, the catalog's key, includes
+// and place lists (configAt, includesAt), and for /read-grants whether a
+// namespace is public and its encryption (exposureAt). POST /grants and POST /read-grants take ?min for the
 // catalog or any content namespace it trusts: a decision on an item also
 // depends on its content namespace (whether the item exists, where its
 // head is), so after creating a document it placed, or restoring one, a

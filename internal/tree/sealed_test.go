@@ -104,7 +104,7 @@ func TestSealedCatalog(t *testing.T) {
 	if ct := f.header.Get("Content-Type"); ct != seal.ContentType || strings.Contains(string(f.body), "zqx") {
 		t.Fatalf("sealed listing %q %s", ct, f.body)
 	}
-	if !strings.HasPrefix(f.path, "/cat/at/"+x.s.At()+"/g/") {
+	if !strings.HasPrefix(f.path, "/cat/g/") || !strings.Contains(f.path, "/at/"+x.s.At()+"/") {
 		t.Fatalf("served at %s", f.path)
 	}
 	h := must(seal.ParseHeader(string(f.body)))

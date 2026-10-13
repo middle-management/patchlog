@@ -77,7 +77,7 @@ type Visibility interface {
 }
 
 // AllSubjects is the subject set segment of unfiltered listings,
-// /{catalog}/at/{at}/g/all/… (§B.11.5).
+// /{catalog}/g/all/at/{at}/… (§B.11.5).
 const AllSubjects = "all"
 
 // viewer is the outcome of the read check for one request.
@@ -332,11 +332,15 @@ var ops = map[string]bool{
 
 // Handler returns the query API (§B.5):
 //
-//	GET /{catalog}/{op}?…                   302 → /{catalog}/at/{at}[/g/{gs}]/{op}?…  (head pointer)
+//	GET /{catalog}/{op}?…                   302 → /{catalog}[/g/{gs}]/at/{at}/{op}?…  (head pointer)
 //	GET /{catalog}/at/{at}/{op}?…            200, public readers                     (immutable)
-//	GET /{catalog}/at/{at}/g/{gs}/{op}?…     200, readers with a grant, keyed by subject set (§B.11.5)
+//	GET /{catalog}/g/{gs}/at/{at}/{op}?…     200, readers with a grant, keyed by subject set (§B.11.5)
 //
-// at is the combined checkpoint (CombinedAt). op is one of
+// at is the combined checkpoint (CombinedAt). The subject set comes before
+// it, so one edge grant for the prefix /{catalog}/g/{gs} covers every
+// checkpoint (§B.11.5); the form before v0.51,
+// /{catalog}/at/{at}/g/{gs}/{op}?…, is moved permanently (301) to it. op
+// is one of
 // children?of=&after=&limit=, ancestors?of=, subtree?of=&depth=, roots,
 // orphans, problems, where?item=, manifest?of=.
 //
@@ -378,7 +382,7 @@ var ops = map[string]bool{
 // the catalog. A reader of the whole catalog gets the listing sealed as
 // one JWE under the catalog's current epoch key, Content-Type
 // application/jose, pl { ns, view } where view is the listing's request
-// target (/{catalog}/at/{at}[/g/{gs}]/{op}?{query}, the canonical form). A
+// target (/{catalog}[/g/{gs}]/at/{at}/{op}?{query}, the canonical form). A
 // reader whose grant restricts catalog resources (or who sees nodes only
 // through roles) gets JSON in which every node with a title carries
 // "sealed": JWE of { title } under that catalog resource's K_r, pl { ns,
@@ -412,8 +416,13 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		op = segs[1]
 	case len(segs) == 4 && segs[0] == cat && segs[1] == "at":
 		at, op, isAt = segs[2], segs[3], true
-	case len(segs) == 6 && segs[0] == cat && segs[1] == "at" && segs[3] == "g":
-		at, gs, op, isAt = segs[2], segs[4], segs[5], true
+	case len(segs) == 6 && segs[0] == cat && segs[1] == "g" && segs[3] == "at":
+		gs, at, op, isAt = segs[2], segs[4], segs[5], true
+	case len(segs) == 6 && segs[0] == cat && segs[1] == "at" && segs[3] == "g" && oldForm(segs[2], segs[4], segs[5]):
+		// Before v0.51 (§B.11.5): the subject set now comes first.
+		telemetry.SetRoute(r, "/{catalog}/at/{at}/g/{gs}/{op}")
+		moved(w, r, "/"+cat+"/g/"+segs[4]+"/at/"+segs[2]+"/"+segs[5])
+		return
 	default:
 		WriteError(w, http.StatusNotFound, "not_found", "not found")
 		return
@@ -425,7 +434,7 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// The listing is one of a fixed set: it stays in the route.
 	switch {
 	case gs != "":
-		telemetry.SetRoute(r, "/{catalog}/at/{at}/g/{gs}/"+op)
+		telemetry.SetRoute(r, "/{catalog}/g/{gs}/at/{at}/"+op)
 	case isAt:
 		telemetry.SetRoute(r, "/{catalog}/at/{at}/"+op)
 	default:
@@ -487,12 +496,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			return
 		}
 	}
-	base := "/" + cat + "/at/"
 	target := func(cp string) string {
 		if v.anon {
-			return base + cp + "/" + op
+			return "/" + cat + "/at/" + cp + "/" + op
 		}
-		return base + cp + "/g/" + v.gs + "/" + op
+		return "/" + cat + "/g/" + v.gs + "/at/" + cp + "/" + op
 	}
 	// A purged catalog answers as the core's URLs of it do, after the read
 	// check: 410 purged with head, its purge-ns entry (§8.5, §12), the
@@ -1048,6 +1056,30 @@ func (s *Service) reached(ctx context.Context, m minRef) bool {
 func redirect(w http.ResponseWriter, loc string) {
 	w.Header().Set("Location", loc)
 	w.WriteHeader(http.StatusFound)
+}
+
+// oldForm reports whether the segments of a listing URL of a form before
+// v0.51 are well formed, so the URL moved names nothing but them.
+func oldForm(at, gs, op string) bool {
+	_, err := ids.Parse(at)
+	if gs != AllSubjects {
+		if _, gerr := ids.Parse(gs); gerr != nil {
+			err = gerr
+		}
+	}
+	return err == nil && ops[op]
+}
+
+// moved answers a URL of a form before v0.51 (§B.11.5) with a permanent
+// redirect to path, the same query kept: the redirect depends on the URL
+// alone, so it reveals nothing, and the URL it names checks the reader.
+func moved(w http.ResponseWriter, r *http.Request, path string) {
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Location", path)
+	w.WriteHeader(http.StatusMovedPermanently)
 }
 
 // WriteError writes an error body.

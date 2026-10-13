@@ -21,8 +21,9 @@ const indexResponseTimeout = 2 * time.Minute
 //
 //   - GET and HEAD /playground/index/{path}?{query} go to {target}/{path}?{query}
 //     (see serviceProxy for what is and isn't forwarded).
-//   - The index's checkpoint redirects (302 /{ns}?… → /{ns}/at/{ns_id}?…, also
-//     for ?min= waits and under /g/{subject set}/) come back under the prefix.
+//   - The index's checkpoint redirects (302 /{ns}?… → /{ns}/at/{ns_id}?…, or
+//     /{ns}/g/{subject set}/at/{ns_id}?…, also for ?min= waits) come back
+//     under the prefix.
 //     The "next" links in a result body are paths of the index itself, which
 //     a client prefixes with IndexProxyPrefix.
 //   - GET /playground/index/ itself answers {"proxy":"index"} so a client

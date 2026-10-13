@@ -723,9 +723,10 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 
 	fan := w.caller("user:fred", "fan-club")
 	b, loc := get("/cat/children?of=season", fan)
-	// §B.11.5: /{catalog}/at/{at}/g/{gs}/…, at the combined checkpoint (§B.5).
+	// §B.11.5: /{catalog}/g/{gs}/at/{at}/…, the subject set first (v0.51),
+	// at the combined checkpoint (§B.5).
 	cp := w.svc.Tree().At()
-	if !strings.HasPrefix(loc, "/cat/at/"+cp+"/g/") || cp == w.svc.Tree().Checkpoint("cat") {
+	if !strings.HasPrefix(loc, "/cat/g/") || !strings.Contains(loc, "/at/"+cp+"/children?") || cp == w.svc.Tree().Checkpoint("cat") {
 		t.Errorf("listing url %s", loc)
 	}
 	// A private listing at an at is immutable too, tagged per item and per namespace.
@@ -741,7 +742,7 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 	}
 	old := loc
 	b, loc = get("/cat/children?of=season", fan)
-	if loc == old || !strings.HasPrefix(loc, "/cat/at/"+w.svc.Tree().At()+"/g/") {
+	if loc == old || !strings.HasPrefix(loc, "/cat/g/") || !strings.Contains(loc, "/at/"+w.svc.Tree().At()+"/") {
 		t.Errorf("private listing after a content change: %s", loc)
 	}
 	// fan-club (reader) sees season's items but not the embargoed folder.

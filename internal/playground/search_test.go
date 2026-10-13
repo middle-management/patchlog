@@ -21,7 +21,7 @@ func TestSearchNextPathWithNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	src := "const INDEX = '/playground/index';\n" + jsFunction(t, js, "canonQuery") + "\n" + jsFunction(t, js, "srNextPath") + `
-console.log(srNextPath('/g/1abc/pa/at/1def?limit=2&ref=%2Fr%2Ft%2Fx', 'a'));
+console.log(srNextPath('/pa/g/1abc/at/1def?limit=2&ref=%2Fr%2Ft%2Fx', 'a'));
 console.log(srNextPath('/pa/at/1def?after=a&limit=2&ref=%2Fr%2Ft%2Fx', 'b'));
 console.log(srNextPath('/pa/at/1def?q=x', '/pa/at/1def?after=20&q=x'));
 console.log(srNextPath('/pa/at/1def?ref=%2Fr%2Ft%2Fx', "it's a (b)*! ~å"));
@@ -31,7 +31,7 @@ console.log(canonQuery(new URLSearchParams('z=1&a=b&a=a&q=two+words&%C3%A5=1&%C3
 		t.Fatalf("%v: %s", err, out)
 	}
 	want := []string{
-		"/playground/index/g/1abc/pa/at/1def?after=a&limit=2&ref=%2Fr%2Ft%2Fx",
+		"/playground/index/pa/g/1abc/at/1def?after=a&limit=2&ref=%2Fr%2Ft%2Fx",
 		"/playground/index/pa/at/1def?after=b&limit=2&ref=%2Fr%2Ft%2Fx",
 		"/playground/index/pa/at/1def?after=20&q=x",
 		"/playground/index/pa/at/1def?after=it%27s%20a%20%28b%29%2A%21%20~%C3%A5&ref=%2Fr%2Ft%2Fx",

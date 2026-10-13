@@ -114,15 +114,13 @@ func TestMinAlwaysRedirectsPrivate(t *testing.T) {
 		t.Fatalf("result at %v, want %s", b["at"], at)
 	}
 	r := x.raw("/sec?limit=5", bob)
-	gsLoc := r.header.Get("Location")
-	r = x.raw(gsLoc, bob)
 	atLoc := r.header.Get("Location")
-	if !strings.HasPrefix(atLoc, "/g/") || !strings.HasSuffix(atLoc, "/sec/at/"+at+"?limit=5") {
+	if !strings.HasPrefix(atLoc, "/sec/g/") || !strings.HasSuffix(atLoc, "/at/"+at+"?limit=5") {
 		t.Fatalf("at URL %s", atLoc)
 	}
-	// From another URL space too (the anonymous at URL, the public
-	// pointer), min goes straight to the reader's own at URL, without min.
-	for _, p := range []string{atLoc + "&min=" + wr.NSID, gsLoc + "&min=sec:" + wr.NSID, "/sec/at/" + at + "?limit=5&min=" + wr.NSID, "/sec?limit=5&min=" + wr.NSID} {
+	// From another URL space too (the anonymous at URL), and from the
+	// pointer, min goes straight to the reader's own at URL, without min.
+	for _, p := range []string{atLoc + "&min=" + wr.NSID, "/sec?limit=5&min=sec:" + wr.NSID, "/sec/at/" + at + "?limit=5&min=" + wr.NSID, "/sec?limit=5&min=" + wr.NSID} {
 		r := x.raw(p, bob)
 		if r.status != 302 || r.header.Get("Location") != atLoc || r.header.Get("Cache-Control") != "private, no-cache" {
 			t.Errorf("%s: %d %s %v", p, r.status, r.header.Get("Location"), r.header)
@@ -283,7 +281,7 @@ func TestKeptAfterPrivate(t *testing.T) {
 		t.Errorf("anonymous after it turned private: %d %v", r.status, r.body)
 	}
 	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"pub"}, []string{"read"})
-	if r := x.raw(loc, bob); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/g/") {
+	if r := x.raw(loc, bob); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/pub/g/") {
 		t.Errorf("grant reader after it turned private: %d %s", r.status, r.header.Get("Location"))
 	}
 }

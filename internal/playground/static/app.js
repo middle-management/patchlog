@@ -2519,7 +2519,7 @@ function treeMins(ns, trust) {
   return [ns, ...trust].filter((n) => WRITES.has(n)).map((n) => `${n}:${WRITES.get(n).id}`);
 }
 
-/* treeGet fetches a tree service listing through the proxy, following its redirect to /at/{at}/…,
+/* treeGet fetches a tree service listing through the proxy, following its redirect to [/g/{gs}]/at/{at}/…,
  * retrying while the service is behind ?min, and opening sealed views (§E.2.6). It uses the HTTP cache:
  * listings at an at never change, and the redirect to the current at is a head pointer, which a browser may
  * serve stale for a few seconds. So after its own write the page relists with ?min= from the write's

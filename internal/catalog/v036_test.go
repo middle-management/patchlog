@@ -192,7 +192,7 @@ func TestUnfilteredListings(t *testing.T) {
 	exp := w.s.Now().Add(90 * time.Second)
 	wide := w.opsKey.Grant(t, w.s.Now(), "user:nw", []string{"cat", "matches"}, []string{"read"}, map[string]any{"exp": exp.Format(time.RFC3339)})
 	r, loc = w.follow("/cat/children?of=season", wide)
-	if !strings.Contains(loc, "/g/all/children") || childNames(r.body) != "matches.derby,matches.shared,rumours" {
+	if !strings.HasPrefix(loc, "/cat/g/all/at/") || childNames(r.body) != "matches.derby,matches.shared,rumours" {
 		t.Errorf("namespace-wide reader: %s %v", loc, r.body)
 	}
 	cc := r.header.Get("Cache-Control")

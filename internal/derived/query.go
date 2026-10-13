@@ -12,8 +12,9 @@ import (
 // parameters of v but drop, sorted by name, then value, comparing their
 // decoded UTF-8 bytes, each name and value with every byte other than
 // ALPHA, DIGIT, "-", ".", "_" and "~" percent-encoded in uppercase hex (a
-// space is %20, never +); "" if none is left. The order of a parameter's
-// values is lost, so a repeatable parameter must not depend on it.
+// space is %20, never +); "" if none is left. Repeatable parameters are
+// sets (§A.5): the order of a parameter's values is lost, so it must not
+// depend on it, and a value given twice appears once.
 func CanonicalQuery(v url.Values, drop ...string) string {
 	type param struct{ k, v string }
 	var ps []param
@@ -34,6 +35,7 @@ func CanonicalQuery(v url.Values, drop ...string) string {
 		}
 		return ps[i].v < ps[j].v
 	})
+	ps = slices.Compact(ps)
 	var b strings.Builder
 	for i, p := range ps {
 		if i == 0 {

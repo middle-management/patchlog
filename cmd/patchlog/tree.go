@@ -41,8 +41,10 @@ import (
 // Callers of POST /grants and of private listings present an ordinary core
 // grant for the catalog namespace as their identity.
 //
-// Listings live at /{catalog}/at/{at}/… where at is the combined checkpoint
-// over the catalog and every followed content namespace (§B.5); they are
+// Listings live at /{catalog}/at/{at}/…, or for a reader with a grant at
+// /{catalog}/g/{gs}/at/{at}/…, the subject set first (§B.11.5), where at
+// is the combined checkpoint over the catalog and every followed content
+// namespace (§B.5); they are
 // immutable, answered only at the canonical form of their query (§A.5), and
 // tagged r:{ns}/{name} and ns:{ns}. Read-your-writes: ?min={ns}:{ns_id},
 // repeatable, which always redirects (§A.5). Cache purges go to the CDN at

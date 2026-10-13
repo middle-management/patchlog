@@ -749,8 +749,21 @@ func TestPrivateCatalog(t *testing.T) {
 	catOnly := reader.Grant(t, s.Now(), "user:bob", []string{"cat"}, []string{"read"}, map[string]any{"groups": []any{"eds"}})
 	r := x.raw("/cat/children?of=top", catOnly)
 	loc := r.header.Get("Location")
-	if r.status != 302 || !strings.Contains(loc, "/g/") || r.header.Get("Cache-Control") != "private, no-cache" {
+	if r.status != 302 || !strings.HasPrefix(loc, "/cat/g/") || r.header.Get("Cache-Control") != "private, no-cache" {
 		t.Fatalf("pointer: %d %v", r.status, r.header)
+	}
+	// The subject set comes before the checkpoint (§B.11.5, v0.51); the
+	// form before is moved there.
+	if p := strings.Split(loc, "/"); len(p) != 7 || p[4] != "at" || p[6] != "children?of=top" {
+		t.Errorf("listing URL %s", loc)
+	} else if r := x.raw("/cat/at/"+p[5]+"/g/"+p[3]+"/children?of=top", ""); r.status != 301 || r.header.Get("Location") != loc {
+		t.Errorf("old form: %d %s", r.status, r.header.Get("Location"))
+	} else {
+		for _, old := range []string{"/cat/at/" + p[5] + "/g/zzz/children", "/cat/at/zzz/g/" + p[3] + "/children", "/cat/at/" + p[5] + "/g/" + p[3] + "/nope"} {
+			if r := x.raw(old, ""); r.status != 404 || r.header.Get("Location") != "" {
+				t.Errorf("malformed old form %s: %d %s", old, r.status, r.header.Get("Location"))
+			}
+		}
 	}
 	b := x.get("/cat/children?of=top", catOnly)
 	if names(b["children"]) != "sec.a,hidden" || b["children"].([]any)[0].(map[string]any)["head"] != nil {
