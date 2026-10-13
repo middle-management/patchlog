@@ -435,6 +435,17 @@ type KeysRequest struct {
 	Resources []string
 }
 
+// KeysAnswer is what POST /ns/{ns}/keys answers (§E.2.3): the keys, and
+// the current epoch, the level ("sealed" or "e2e") and pad, which a writer
+// limited to some resources needs to seal (§E.3.1) and can't read in the
+// namespace document (§C.5).
+type KeysAnswer struct {
+	Keys  []map[string]any
+	Epoch int
+	Level string
+	Pad   bool
+}
+
 // Keys answers POST /ns/{ns}/keys. It needs a verified grant with read on
 // the namespace (with authentication disabled, anyone gets raw epoch keys).
 // A grant that reads the namespace unrestricted (§C.5: with roles, through
@@ -445,9 +456,11 @@ type KeysRequest struct {
 // the last historyEpochs) to the current one, and never include an epoch
 // that started after the grant's effective exp (§E.2.3). Keys are
 // HPKE-wrapped to the root block's enc if it has one, and raw base64url
-// otherwise.
-func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) ([]map[string]any, error) {
+// otherwise. A namespace that isn't sealed is 404 not_offered, once the
+// read check passes: there is nothing to seal (§E.2.3).
+func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) (*KeysAnswer, error) {
 	var out []map[string]any
+	var ans *KeysAnswer
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
 		if n == nil {
@@ -474,9 +487,12 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			if n.purged {
 				return t.purgedNS(n)
 			}
-			var err error
-			out, err = t.keysE2E(n, cfg, a, kr)
-			return err
+			keys, err := t.keysE2E(n, cfg, a, kr)
+			if err != nil {
+				return err
+			}
+			ans = &KeysAnswer{Keys: keys, Epoch: cfg.Epoch, Level: levelNames[cfg.level], Pad: cfg.Pad}
+			return nil
 		}
 		// K_e only through rules none of which refers to /resource (§C.5).
 		// Roles are alternatives: if the unrestricted ones fail, a read role
@@ -498,7 +514,7 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			return t.purgedNS(n)
 		}
 		if cfg.level != levelSealed {
-			return invalid("the namespace is not sealed")
+			return apiErr(404, "not_offered", "message", "the namespace is not sealed: there are no keys, and nothing to seal (§E.2.3)")
 		}
 		epochs := t.grantEpochs(n, cfg, a)
 		if kr.Epochs != nil {
@@ -565,9 +581,10 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 				}
 			}
 		}
+		ans = &KeysAnswer{Keys: out, Epoch: cfg.Epoch, Level: levelNames[cfg.level], Pad: cfg.Pad}
 		return nil
 	})
-	return out, err
+	return ans, err
 }
 
 func recipientOf(a *actor) *ecdh.PublicKey {

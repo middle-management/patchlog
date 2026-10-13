@@ -401,6 +401,7 @@ const undoLimitedHarness = undoPrelude + `
   out.e2e = sum(await undoRun('le', input.ge, o({ resources: ['a'] })));
   S.ns = 'lp';
   out.pruned = sum(await undoRun('lp', input.gp, o({ resources: ['a'] })));
+  out.below = sum(await undoRun('lp', input.gw, o({ resources: ['a'] })));
   out.after = sum(await undoRun('lp', input.gp2, o({ resources: ['a'] })));
   process.stdout.write(JSON.stringify(out));
 })().catch((e) => { console.error(e); process.exit(1); });
@@ -411,9 +412,11 @@ const undoLimitedHarness = undoPrelude + `
 // document. In a sealed namespace it scans the logs of the documents it
 // knows the action touched, learns the level from the JWEs it reads and
 // adds fresh nonces; without them it refuses instead of failing on a 403;
-// redo finds the undo in those logs; in an e2e namespace it refuses. A
-// gesture whose first revision read follows a pruning horizon may continue
-// below it, and is impossible rather than undone in part.
+// redo finds the undo in those logs; in an e2e namespace it refuses, and
+// names the Go client. The undo is impossible rather than done in part
+// when the gesture's oldest entry lies at or before the oldest entry read
+// after a pruning horizon: its first revision read is that one, so it may
+// continue below, or none follows, so it may lie wholly below (§11.2).
 func TestUndoLimitedWithNode(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
@@ -464,7 +467,9 @@ func TestUndoLimitedWithNode(t *testing.T) {
 	// after another revision.
 	wp, err := li.Create(ctx, "lp", "a", nonced(client.GenesisPatches(map[string]any{"n": 0, "p": 0, "r": 0})...))
 	check(wp, err)
-	gp, gp2 := client.NewGesture(), client.NewGesture()
+	gp, gp2, gw := client.NewGesture(), client.NewGesture(), client.NewGesture()
+	wp, err = li.Append(ctx, "lp", "a", wp.ID, nonced(op("add", "/w", 1)), client.WithGesture(gw))
+	check(wp, err)
 	wp, err = li.Append(ctx, "lp", "a", wp.ID, nonced(op("replace", "/n", 1)), client.WithGesture(gp))
 	check(wp, err)
 	horizon := wp.ID
@@ -481,15 +486,15 @@ func TestUndoLimitedWithNode(t *testing.T) {
 	}
 
 	b := runUndoHarness(t, node, undoLimitedHarness, map[string]any{"base": s.URL, "author": "user:li", "bearer": liGrant,
-		"key": base64.RawURLEncoding.EncodeToString(fk[0].Key), "nsKeys": map[string]any{"lp": base64.RawURLEncoding.EncodeToString(fkp[0].Key)}, "g": g, "gb": gb, "ge": ge, "gp": gp, "gp2": gp2})
+		"key": base64.RawURLEncoding.EncodeToString(fk[0].Key), "nsKeys": map[string]any{"lp": base64.RawURLEncoding.EncodeToString(fkp[0].Key)}, "g": g, "gb": gb, "ge": ge, "gp": gp, "gp2": gp2, "gw": gw})
 	type res struct {
 		OK                                  bool
 		Gesture, Source, Level, Author, Err string
 		Steps                               []any
 	}
 	var out struct {
-		Bare, Only, Undo, Redo, E2E, Pruned, After res
-		Latest                                     string
+		Bare, Only, Undo, Redo, E2E, Pruned, Below, After res
+		Latest                                            string
 	}
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatalf("node output %s: %v", b, err)
@@ -518,11 +523,14 @@ func TestUndoLimitedWithNode(t *testing.T) {
 			t.Errorf("ls/%s after the undo and the redo: %v %v", name, d, err)
 		}
 	}
-	if out.E2E.OK || !strings.Contains(out.E2E.Err, "namespace document") {
+	if out.E2E.OK || !strings.Contains(out.E2E.Err, "Go client") {
 		t.Errorf("e2e %+v", out.E2E)
 	}
 	if out.Pruned.OK || out.Pruned.Err != "pruned" {
 		t.Errorf("a gesture straddling the horizon %+v", out.Pruned)
+	}
+	if out.Below.OK || out.Below.Err != "pruned" {
+		t.Errorf("a gesture wholly below the horizon %+v", out.Below)
 	}
 	if !out.After.OK || out.After.Level != "sealed" {
 		t.Errorf("a gesture after the horizon %+v", out.After)

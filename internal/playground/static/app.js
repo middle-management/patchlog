@@ -1240,18 +1240,21 @@ async function undoPlan(ns, g, o = {}) {
   for (const site of found.sites) {
     const rr = await undoReadRes(ns, site);
     if (!o.level && rr.level) plan.level = rr.level;
-    if (plan.level === 'e2e') throw Object.assign(new Error('undo in an e2e namespace needs its namespace document (the current epoch and pad), which this grant can\'t read'), { refused: true });
+    if (plan.level === 'e2e') throw Object.assign(new Error('undo in an e2e namespace folds and seals the inverse client-side: use the Go client (client.Undo with UndoE2E), which learns the epoch and pad from /keys for a grant limited to some resources (§E.2.3); the playground does it for plaintext and sealed (E2) namespaces'), { refused: true });
+    // Without markers, the undo is impossible when the gesture's oldest entry lies at or before the oldest entry read
+    // after a pruning horizon: its first entry read is that one, so it may continue below, or none follows the horizon,
+    // so it may lie wholly below (§11.2). A log read from genesis has nothing before it.
+    const first = rr.entries.findIndex((e) => e.gesture === g && (!found.author || e.author === found.author));
+    if (!site.markers.length && rr.horizon && first <= 0) {
+      throw Object.assign(new Error(first === 0 ? `the gesture's revision ${short(rr.entries[0].id)} is the first after the pruning horizon of ${site.resource}, and may continue below it`
+        : `no entry of the gesture follows the pruning horizon of ${site.resource}, and it may lie wholly below it`), { impossible: 'pruned', resource: site.resource });
+    }
     // From resource logs the author, unless given, is that of the first entry with the gesture.
     if (!found.author) found.author = plan.author = (rr.entries.find((e) => e.gesture === g) || {}).author || '';
     if (!found.author) continue;
     const ids = new Set(rr.entries.map((e) => e.id));
     const lost = site.markers.find((m) => !ids.has(m));
     if (lost) throw Object.assign(new Error(`the gesture's entry ${short(lost)} lies below the pruning horizon of ${site.resource}`), { impossible: 'pruned', resource: site.resource });
-    // Without markers, a gesture whose first revision read follows the horizon may continue below it.
-    const e0 = rr.entries[0];
-    if (!site.markers.length && rr.horizon && e0 && e0.gesture === g && e0.author === found.author) {
-      throw Object.assign(new Error(`the gesture's revision ${short(e0.id)} follows the pruning horizon of ${site.resource}, and may continue below it`), { impossible: 'pruned', resource: site.resource });
-    }
     let r;
     try {
       r = planUndoResource({ name: site.resource, head: rr.head, headKind: rr.headKind, start: rr.start, entries: rr.entries, gesture: g, author: found.author,

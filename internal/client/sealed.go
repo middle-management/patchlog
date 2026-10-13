@@ -155,9 +155,31 @@ type KeyEntry struct {
 	Wrapped  seal.WrappedKey
 }
 
+// KeysAnswer is a POST /ns/{ns}/keys answer (§E.2.3): the keys, and the
+// namespace's current epoch, level ("sealed" or "e2e") and pad, which a
+// writer limited to some resources needs to seal (§E.3.1) and can't read
+// in the namespace document (§C.5).
+type KeysAnswer struct {
+	Keys  []KeyEntry
+	Epoch int
+	Level string
+	Pad   bool
+}
+
 // FetchKeys calls POST /ns/{ns}/keys (§E.2.3). epochs nil asks for every
 // epoch the grant may have; resources are for per-resource grants.
 func (c *Client) FetchKeys(ctx context.Context, ns string, epochs []int, resources []string) ([]KeyEntry, error) {
+	a, err := c.FetchKeysAnswer(ctx, ns, epochs, resources)
+	if err != nil {
+		return nil, err
+	}
+	return a.Keys, nil
+}
+
+// FetchKeysAnswer is FetchKeys with the whole answer. Empty epochs ask for
+// no keys, only the epoch, level and pad. A namespace that isn't sealed is
+// 404 not_offered (IsNotOffered): there is nothing to seal.
+func (c *Client) FetchKeysAnswer(ctx context.Context, ns string, epochs []int, resources []string) (*KeysAnswer, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, err
 	}
@@ -179,8 +201,13 @@ func (c *Client) FetchKeys(ctx context.Context, ns string, epochs []int, resourc
 	if r.status != 200 {
 		return nil, r.apiError()
 	}
-	arr, _ := r.obj()["keys"].([]any)
-	var out []KeyEntry
+	obj := r.obj()
+	out := &KeysAnswer{Level: str(obj, "level")}
+	if f, ok := obj["epoch"].(float64); ok {
+		out.Epoch = int(f)
+	}
+	out.Pad, _ = obj["pad"].(bool)
+	arr, _ := obj["keys"].([]any)
 	for _, x := range arr {
 		m, _ := x.(map[string]any)
 		e := KeyEntry{Kid: str(m, "kid"), Resource: str(m, "resource")}
@@ -193,7 +220,7 @@ func (c *Client) FetchKeys(ctx context.Context, ns string, epochs []int, resourc
 		} else if e.Wrapped.Kid != e.Kid || e.Wrapped.Resource != e.Resource {
 			return nil, fmt.Errorf("client: %s: wrapped key mismatch", e.Kid)
 		}
-		out = append(out, e)
+		out.Keys = append(out.Keys, e)
 	}
 	return out, nil
 }

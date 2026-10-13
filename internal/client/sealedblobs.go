@@ -305,7 +305,7 @@ func (c *Client) openBlob(ctx context.Context, ns, name, bid string, sealed []by
 // put in the document (§E.3.1). The blob stays pending until a sealed write
 // whose declared list names it.
 func (x *E2E) UploadBlob(ctx context.Context, ns, name, typ string, data []byte) (map[string]any, error) {
-	cfg, err := x.config(ctx, ns)
+	cfg, err := x.writeConfig(ctx, ns)
 	if err != nil {
 		return nil, err
 	}

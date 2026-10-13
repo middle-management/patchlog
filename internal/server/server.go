@@ -1836,7 +1836,8 @@ func (s *Server) resourceEvents(w http.ResponseWriter, r *http.Request) {
 
 // nsKeys answers POST /ns/{ns}/keys (§E.2.3): { "epochs"?: [e…],
 // "resources"?: [name…] } → { "keys": [ { kid, resource?, key | suite,
-// wrapped } ] }, never cached.
+// wrapped } ], "epoch", "level", "pad" }, never cached. A namespace that
+// isn't sealed is 404 not_offered.
 func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	ns := r.PathValue("ns")
@@ -1888,14 +1889,14 @@ func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	keys, err := s.e.Keys(r.Context(), ns, creds(r), kr)
+	ans, err := s.e.Keys(r.Context(), ns, creds(r), kr)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	out := make([]any, len(keys))
-	for i, k := range keys {
+	out := make([]any, len(ans.Keys))
+	for i, k := range ans.Keys {
 		out[i] = k
 	}
-	writeJSON(w, 200, map[string]any{"keys": out})
+	writeJSON(w, 200, map[string]any{"keys": out, "epoch": ans.Epoch, "level": ans.Level, "pad": ans.Pad})
 }

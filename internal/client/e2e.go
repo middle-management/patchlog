@@ -36,6 +36,11 @@ package client
 // private key) from POST /ns/{ns}/keys, which relays the keyring entries
 // wrapped for the grant's enc, else from the namespace's own keyring
 // resource (not one read through from a base: its keys are the base's).
+// Writes seal under the current epoch, with the pad setting, both from the
+// namespace document, or, for a writer limited to some resources that
+// can't read it (§C.5), from what POST /ns/{ns}/keys names beside the keys
+// (§E.2.3). The relay is a read of the keyring, so such a grant needs
+// enc and a read of "keyring" too.
 //
 // Padding (§E.2.2, §E.3.1). In a namespace with "encryption": { "pad":
 // true } writes pad the plaintext of every sealed patch set (and prune
@@ -43,7 +48,8 @@ package client
 // fold flags a patch set that isn't padded when the namespace that sealed
 // it padded at the time, like a failed validation. Turning pad on doesn't
 // flag what was sealed before: the namespace log tells which configuration
-// each revision was written under.
+// each revision was written under. A grant that can't read that log flags
+// nothing for padding.
 //
 // Merge and rebase (§F.8) read a branch's changes as plaintext with
 // OpenLog and write them under the target's keys with SealPatches.
@@ -296,6 +302,28 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 	return out, nil
 }
 
+// writeConfig is config for sealing: where the namespace document can't be
+// read, as by a writer limited to some resources (§C.5), the current epoch
+// and pad come from POST /ns/{ns}/keys instead (§E.2.3, §E.3.1). Bases are
+// then unknown, which only reads need (chain), and keep needing the
+// document.
+func (x *E2E) writeConfig(ctx context.Context, ns string) (*e2eConfig, error) {
+	cfg, err := x.config(ctx, ns)
+	if !nsUnreadable(err) {
+		return cfg, err
+	}
+	a, kerr := x.c.FetchKeysAnswer(ctx, ns, []int{}, nil)
+	switch {
+	case IsNotOffered(kerr):
+		return nil, fmt.Errorf("client: namespace %s is not e2e (it isn't sealed)", ns)
+	case kerr != nil:
+		return nil, fmt.Errorf("client: namespace %s: sealing needs the current epoch and pad, which neither its document (%w) nor /keys (%w) gives this grant", ns, err, kerr)
+	case a.Level != "e2e":
+		return nil, fmt.Errorf("client: namespace %s is not e2e (encryption.level %q)", ns, a.Level)
+	}
+	return &e2eConfig{Epoch: max(a.Epoch, 1), Pad: a.Pad}, nil
+}
+
 // --- writes ---------------------------------------------------------------
 
 // SealPatches seals patches for a write to ns/name on parent ("" for
@@ -318,7 +346,7 @@ func (x *E2E) SealPatchesBlobs(ctx context.Context, ns, name, parent string, pat
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := x.config(ctx, ns)
+	cfg, err := x.writeConfig(ctx, ns)
 	if err != nil {
 		return nil, err
 	}
@@ -712,6 +740,12 @@ func (x *E2E) paddedAt(ctx context.Context, ns, id string) (bool, error) {
 		}
 	}
 	h, err := x.c.NSHead(ctx, ns)
+	if nsUnreadable(err) {
+		// A writer limited to some resources (§C.5) can't tell which
+		// configuration a revision was written under, so it flags
+		// nothing: /keys gives only the current pad.
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
@@ -1122,7 +1156,7 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 	if err != nil {
 		return nil, err
 	}
-	cfg, err := x.config(ctx, ns)
+	cfg, err := x.writeConfig(ctx, ns)
 	if err != nil {
 		return nil, err
 	}

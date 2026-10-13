@@ -161,10 +161,11 @@ func TestUndoLimitedWriter(t *testing.T) {
 	}
 }
 
-// §11.2, §C.5, §E.3: sealing an e2e inverse needs the current epoch and
-// pad, which only the namespace document gives, so a writer limited to
-// some resources is refused once it learns the level from the resource
-// log, with or without an E2E view.
+// §11.2, §C.5, §E.2.3: sealing an e2e inverse needs the current epoch and
+// pad, which a writer limited to some resources learns from /keys. One
+// that may not read the keyring, which the relay reads, gets a 404 there,
+// so it is refused once it learns the level from the resource log, with or
+// without an E2E view (TestUndoLimitedKeys has one that may).
 func TestUndoLimitedWriterE2E(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -200,9 +201,10 @@ func TestUndoLimitedWriterE2E(t *testing.T) {
 
 // §11.2 When undo is impossible, §8.6: resource logs carry no markers, so
 // a limited writer can't see a gesture's revisions below a pruning horizon.
-// One whose first revision read directly follows the horizon may continue
-// below it, and is refused as impossible rather than undone in part; one
-// after other entries is undone as usual.
+// One whose oldest entry lies at or before the oldest entry read after the
+// horizon, its first entry read being that one or none following it, may
+// continue or lie wholly below it, and is refused as impossible rather
+// than undone in part; one after other entries is undone as usual.
 func TestUndoLimitedPruned(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -226,6 +228,8 @@ func TestUndoLimitedPruned(t *testing.T) {
 			only := map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}}
 			li := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:li", []string{ns}, []string{"read", "create", "append"}, only)), client.WithKeys(client.NewKeys(nil)))
 			w := must(li.Create(ctx, ns, "a", nonced(client.GenesisPatches(map[string]any{"n": 0, "p": 0, "q": 0, "r": 0}))))
+			gw := client.NewGesture()
+			w = must(li.Append(ctx, ns, "a", w.ID, nonced(ops(op("add", "/w", 1))), client.WithGesture(gw)))
 			g := client.NewGesture()
 			w = must(li.Append(ctx, ns, "a", w.ID, nonced(ops(op("replace", "/n", 1))), client.WithGesture(g)))
 			w = must(li.Append(ctx, ns, "a", w.ID, nonced(ops(op("replace", "/p", 1))), client.WithGesture(g)))
@@ -246,12 +250,17 @@ func TestUndoLimitedPruned(t *testing.T) {
 			if !errors.As(err, &ie) || ie.Reason != "pruned" || ie.Resource != "a" {
 				t.Fatalf("a gesture straddling the horizon: %v", err)
 			}
+			for _, opts := range [][]client.UndoOption{{client.UndoResources("a")}, {client.UndoResources("a"), client.UndoAuthor("user:li")}} {
+				if _, err := li.Undo(ctx, ns, gw, with(opts...)...); !errors.As(err, &ie) || ie.Reason != "pruned" || ie.Resource != "a" {
+					t.Fatalf("a gesture wholly below the horizon: %v", err)
+				}
+			}
 			got, _ := docOf(t, li, ns, "a")
-			sameDoc(t, "after the refusal", got, map[string]any{"n": 1, "p": 1, "q": 1, "r": 2})
+			sameDoc(t, "after the refusal", got, map[string]any{"n": 1, "p": 1, "q": 1, "r": 2, "w": 1})
 
 			must(li.Undo(ctx, ns, g2, with(client.UndoResources("a"))...))
 			got, _ = docOf(t, li, ns, "a")
-			sameDoc(t, "after the horizon", got, map[string]any{"n": 1, "p": 1, "q": 1, "r": 1})
+			sameDoc(t, "after the horizon", got, map[string]any{"n": 1, "p": 1, "q": 1, "r": 1, "w": 1})
 		})
 	}
 }
