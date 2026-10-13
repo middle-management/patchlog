@@ -76,7 +76,8 @@ and serves immutable, CDN-cacheable revisions.
   cookies and verifies them itself, and checks grants on every read. Both §9 deployments are
   supported: behind a grant-verifying edge (`-edge-secret`) private content gets edge
   lifetimes, otherwise it is `no-store` for shared caches (see
-  [Private namespaces and the edge](#private-namespaces-and-the-edge)).
+  [Private namespaces and the edge](#private-namespaces-and-the-edge), which also gives the
+  cookie format and what such an edge must check).
 - Author signatures (§C.3.1): a signature whose kid the grant's root `signers` lists is
   verified at the gate (`422 signature`); others are stored unverified. See
   [Author signatures](#author-signatures).
@@ -320,6 +321,60 @@ no grant needed, and the same with authentication disabled, so sign-out works ei
 `prefix`, or one of another form, is `400 bad_input`; `prefix` is the core's one repeatable
 parameter (§7). Only credentialed origins may preflight it, so another site can't sign a reader
 out. It clears the browser's copies only; a copied cookie lasts until it expires.
+
+**Verifying edge grants at an edge.** §C.5 leaves the cookie's format to the deployment; this
+is the reference's (`internal/edge/grants.go`), which an edge in front of `patchlog serve
+-edge-secret` verifies as the origin does:
+
+- **Key:** with `-edge-grant-key FILE`, the file's bytes with surrounding whitespace trimmed,
+  used as they are, not decoded (at least 16; `head -c 32 /dev/urandom | base64 >
+  edge-grant.key` makes one). Otherwise HMAC-SHA256 keyed with the edge secret (the
+  `-edge-secret` file's content, trimmed the same way) over the ASCII text `patchlog edge grants
+  v1`, so an edge that holds the secret derives the same key.
+- **Name:** `__Secure-pl-eg-` and the first 8 bytes of the prefix's SHA-256, in lowercase hex.
+- **Value:** `base64url(claims) "." base64url(HMAC-SHA256(key, first part))`, both unpadded,
+  the MAC over the first part's text as sent, so a verifier never re-encodes the claims. They
+  are JSON: `{"v":1,"p":prefix,"ns":ns,"r":resource,"sub":subject,"exp":Unix seconds}`, with
+  `r` only when the grant fixes a resource.
+
+The origin checks the namespace and resource of every read against `ns` and `r`; an edge that
+serves a cached copy doesn't ask it, so it checks all of these on every request, cache hits
+included:
+
+1. It is a `GET` or `HEAD` without `Authorization`. A request with `Authorization` is decided
+   from its grant, whatever cookies it carries, and is never served from the cache.
+2. A cookie whose name starts with `__Secure-pl-eg-` has a MAC that verifies under the key
+   (compared in constant time), and its claims decode with `v` 1 and non-empty `p` and `ns`.
+3. Its name is the one derived from `p`.
+4. The current time is before `exp` (Unix seconds; the origin refuses from `exp` on).
+5. `p` is a prefix the origin issues for `ns` and `r`: `/r/{ns}/{r}` when `r` is set, else
+   `/r/{ns}` or `/ns/{ns}`.
+6. The request path, as received and still percent-encoded, is `p` or starts with `p` followed
+   by `/`. Prefixes cover whole segments: `/r/demo` covers `/r/demo/derby`, not the branch
+   `/r/demo-x`.
+7. The path has no empty, `.` or `..` segment, and no percent-encoded `.`, `/` or `\` (`%2E`,
+   `%2F`, `%5C`, in either case). The cache keys the raw URL, so `/r/demo/derby/../other`
+   passes check 6 for a cookie fixed to `derby`; something that normalises the path downstream
+   would then read `other`.
+
+A request that passes goes to the origin with its cookies and the edge secret; the origin
+verifies the cookie again and decides the read, and the secret gives the response its edge
+lifetime. A request that fails is handled as one without an edge grant: forwarded without the
+secret, and never answered from a copy cached for verified requests, which the edge keeps
+apart from public copies. The cookie carries no grant id, so it stays good until `exp`, at most
+15 minutes after issue, at the edge and the origin alike: a revoked key or a changed role
+doesn't end it sooner.
+
+For example (pinned by `TestCookieVector` in `internal/edge`), the edge secret `example edge
+secret` gives the key `3dba7ab1a5240f2d1e3f4922b87f24be07b3e95885e0f515c57d6ac5c13dd708`
+(hex), and the edge grant for `user:li` on `/r/demo/derby` until 1790000900
+(2026-09-21T14:28:20Z) is this cookie:
+
+```
+__Secure-pl-eg-4390e78526d94754=eyJ2IjoxLCJwIjoiL3IvZGVtby9kZXJieSIsIm5zIjoiZGVtbyIsInIiOiJkZXJieSIsInN1YiI6InVzZXI6bGkiLCJleHAiOjE3OTAwMDA5MDB9._U1WpIxTk-e-oRCQqufab2XM3CXgRG2eiR78olNgx6Q
+```
+
+whose claims are `{"v":1,"p":"/r/demo/derby","ns":"demo","r":"derby","sub":"user:li","exp":1790000900}`.
 
 **Bypassing it.** The origins answer directly on 9080 (core), 9081 (search) and 9082 (tree).
 `make cdn-restart` restarts Varnish, which reloads the VCL and empties the cache.

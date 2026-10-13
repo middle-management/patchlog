@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- **Docs:** the README gives the edge-grant cookie format, its key and an example, and what
+  an edge in front of the origin must check on every request (Doors S17). v0.15.0's upgrade
+  notes now name `?min` on the catalog's grant endpoints (Doors S14).
+
 ## v0.18.1
 
 - **Weak ETags.** A reverse proxy that compresses responses (nginx `gzip`, Caddy `encode`, a
@@ -540,6 +546,11 @@ Doors reported, and adds OpenTelemetry.
   `422 limit`; frozen branches no longer count toward the limit (Doors B3).
 - **CORS:** `-cors-origin '*'` with credentials no longer echoes an arbitrary origin;
   credentialed origins are listed with `-cors-credentials-origin`.
+- **Catalog `?min`:** `POST /grants` and `POST /read-grants` now honour `?min` (§B.11),
+  which earlier versions accepted and ignored. The service waits up to 2 s for it, then
+  answers `503 behind` with `Retry-After: 1`; a malformed `min`, or one naming a namespace
+  the service doesn't follow, is `400`. A client that already sent `min` must retry a `503`
+  (Doors S14).
 - **Tree database** gains an `items.title` column, and **index database** a `sort.raw`
   column; both are added or rebuilt on start.
 - `GET /` answers `"spec": "0.46"`.
