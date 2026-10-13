@@ -15,6 +15,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/tree"
 )
@@ -37,22 +38,28 @@ type Request struct {
 	To   []string `json:"to,omitempty"`
 }
 
-// Issued is an issued grant.
+// Issued is an issued grant. At is the grant's own at, the catalog's
+// ns_id; Checkpoint is the combined checkpoint (§B.5, listings' at) it was
+// decided at, by which a client that caches decisions keys them
+// (§B.11.4).
 type Issued struct {
-	Grant    string         `json:"grant"`
-	NS       string         `json:"ns"`
-	Resource string         `json:"resource"`
-	Can      []string       `json:"can"`
-	Roles    []string       `json:"roles,omitempty"`
-	Exp      string         `json:"exp"`
-	At       map[string]any `json:"at"`
+	Grant      string         `json:"grant"`
+	NS         string         `json:"ns"`
+	Resource   string         `json:"resource"`
+	Can        []string       `json:"can"`
+	Roles      []string       `json:"roles,omitempty"`
+	Exp        string         `json:"exp"`
+	At         map[string]any `json:"at"`
+	Checkpoint string         `json:"checkpoint"`
 }
 
-// Error is a refusal with an HTTP status.
+// Error is a refusal with an HTTP status. A refusal that is a decision
+// carries the combined checkpoint it was decided at (decidedAt).
 type Error struct {
-	Status int
-	Code   string
-	Msg    string
+	Status     int
+	Code       string
+	Msg        string
+	Checkpoint string
 }
 
 func (e *Error) Error() string { return fmt.Sprintf("%d %s: %s", e.Status, e.Code, e.Msg) }
@@ -69,12 +76,33 @@ func upstream(err error) error {
 	return &Error{Status: 502, Code: "upstream", Msg: err.Error()}
 }
 
-// plan is a decision, made under the graph lock at a checkpoint.
+// decidedAt marks a refusal that is a decision (403, 404, 409, 410) with
+// the combined checkpoint it was decided at, so a client that caches
+// refusals keys them as it keys grants (§B.11.4). Plans defer it once
+// their View has run; other errors pass unchanged.
+func decidedAt(err error, combined string) error {
+	var ce *Error
+	if combined == "" || !errors.As(err, &ce) || ce.Checkpoint != "" {
+		return err
+	}
+	switch ce.Status {
+	case 403, 404, 409, 410:
+		ce.Checkpoint = combined
+	}
+	return err
+}
+
+// plan is a decision, made under the graph lock at a checkpoint: cp is
+// the catalog's ns_id there (the grant's at), combined the combined
+// checkpoint (§B.5) the answer reports. key is the signing key's entry as
+// of the head, which the core checks the grant against (maxTtl,
+// requireAt, groups; §C.4); the decision itself uses the entry as of the
+// checkpoint (configAt).
 type plan struct {
 	ns, resource string
 	can, roles   []string
 	rules        []any
-	cp           string
+	cp, combined string
 	key          *grant.Key
 }
 
@@ -115,11 +143,33 @@ type ReadGrantsRequest struct {
 	Items []string `json:"items"`
 }
 
+// maxReadGrants is the most items one POST /read-grants may list (400
+// bad_input above it): the service's limit, since every item is decided
+// at one checkpoint and a longer list is likelier to need a retry.
 const maxReadGrants = 100
+
+// readGrantRetries is how often POST /read-grants decides its items again
+// when the checkpoint moved while it decided them, before it answers 503
+// behind.
+const readGrantRetries = 3
 
 // serveReadGrants issues one read grant per item, fixed to that resource
 // (§B.11.5). Items of public namespaces need none; refusals are reported
-// per item.
+// per item:
+//
+//	{ "checkpoint": "…", "grants": [
+//	  { "item", "grant", "exp", "keys"?, "keysWithheld"? },
+//	  { "item", "public": true, "keys"? },
+//	  { "item", "error": { "status", "code", "message" } } ] }
+//
+// with one entry per item, in request order. It answers for every item at
+// once, all decided at one combined checkpoint (§B.5), which the answer
+// carries (§B.11.4): it notes the checkpoint before and after deciding,
+// and decides again if it moved, up to readGrantRetries times, then
+// answers 503 behind with Retry-After. So "may this reader read all of
+// these?" is one call: it may if no entry has an error. A public item
+// counts as readable, though it gets no grant; a catalog node gets keys
+// and no grant (§B.11.5).
 //
 // Keys (§B.11.5, §E.2.6). For an item of a sealed content namespace the
 // answer also carries the item's per-resource keys K_r, which open its
@@ -162,6 +212,23 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, badInput("items must list 1 to %d items", maxReadGrants))
 		return
 	}
+	for try := 0; try <= readGrantRetries; try++ {
+		before := s.t.At()
+		out := s.decideReads(ctx, v, req.Items)
+		if f := s.afterDecide.Load(); f != nil {
+			(*f)(try)
+		}
+		if s.t.At() == before {
+			tree.WriteJSON(w, http.StatusOK, map[string]any{"checkpoint": before, "grants": out})
+			return
+		}
+	}
+	writeErr(w, errf(503, "behind", "the catalog service's checkpoint kept moving while it decided the items"))
+}
+
+// decideReads decides POST /read-grants' items (serveReadGrants), one
+// entry per item, in order.
+func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []string) []any {
 	lagOK := map[string]bool{}
 	cat := s.t.Catalog()
 	keys := s.t.Keys()
@@ -188,7 +255,7 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 		return ok, nil
 	}
 	out := []any{}
-	for _, item := range req.Items {
+	for _, item := range items {
 		e := map[string]any{"item": item}
 		ns, name, ok := tree.ParseHref(item)
 		var err error
@@ -252,7 +319,7 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, e)
 	}
-	tree.WriteJSON(w, http.StatusOK, map[string]any{"grants": out})
+	return out
 }
 
 // keyOf names a resource whose per-resource keys an answer carries.
@@ -313,6 +380,10 @@ func writeErr(w http.ResponseWriter, err error) {
 	if errors.As(err, &ce) {
 		if ce.Status == 503 {
 			w.Header().Set("Retry-After", "1")
+		}
+		if ce.Checkpoint != "" {
+			tree.WriteJSON(w, ce.Status, map[string]any{"code": ce.Code, "message": ce.Msg, "checkpoint": ce.Checkpoint})
+			return
 		}
 		tree.WriteError(w, ce.Status, ce.Code, ce.Msg)
 		return
@@ -408,8 +479,10 @@ func parentHrefsRule(list []string) any {
 // planContent decides content verbs (read, append, create, …) on an item
 // from the caller's effective roles at its placement, collected only
 // through subjects the catalog's key in the content namespace may assert
-// (§B.11.4); restore is planRestore's.
-func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (*plan, error) {
+// (§B.11.4); restore is planRestore's. The roles, their definitions and
+// the catalog's key are those as of the checkpoint the decision reports
+// (configAt), as for visibility.
+func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (_ *plan, err error) {
 	for _, w := range want {
 		if !grant.IsVerb(w) {
 			return nil, badInput("unknown verb %q", w)
@@ -433,33 +506,42 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		}
 		return s.planRestore(ctx, v, ns, name, item)
 	}
-	cfg, err := s.t.Checker().Config(ctx, ns)
+	latest, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
 		return nil, upstream(err)
 	}
-	key := findKey(cfg.Keys, s.opt.Kid)
-	if key == nil {
+	signer := findKey(latest.Keys, s.opt.Kid)
+	if signer == nil {
 		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
 	}
-	// Effective roles are collected only through subjects the catalog's
-	// key in the content namespace may assert (§B.11.4 Resolve).
-	subs := assertable(key, Subjects(v))
 	pl := ns + "." + name
 	var (
+		cfg             *grantcheck.Config
+		key             *grant.Key
 		trusted, placed bool
 		state, itemSt   int
 		roles           map[string]bool
-		cp              string
+		cp, combined    string
 	)
+	defer func() { err = decidedAt(err, combined) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		cp = cur[cat]
+		combined, _ = tree.CombinedAt(g, cur)
+		cfg = s.configAt(g, ns, latest)
+		if key = findKey(cfg.Keys, s.opt.Kid); key == nil {
+			return
+		}
 		trusted = g.Trust[ns]
 		if n := g.Node(pl); n != nil && !n.Self {
 			placed, state, itemSt = true, n.State, n.ItemState
 		}
-		roles = s.rolesFor(pl, subs)
-		cp = cur[cat]
+		// Effective roles are collected only through subjects the catalog's
+		// key in the content namespace may assert (§B.11.4 Resolve).
+		roles = s.rolesFor(pl, assertable(key, Subjects(v)))
 	})
 	switch {
+	case key == nil:
+		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
 	case !trusted:
 		return nil, forbidden("namespace %s is not trusted by catalog %s", ns, cat)
 	case !placed:
@@ -518,7 +600,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		}
 	}
 	sort.Strings(final)
-	return &plan{ns: ns, resource: name, can: can, roles: final, rules: []any{resourceRule(name)}, cp: cp, key: key}, nil
+	return &plan{ns: ns, resource: name, can: can, roles: final, rules: []any{resourceRule(name)}, cp: cp, combined: combined, key: signer}, nil
 }
 
 // planRestore decides a restore (§B.11.4): it brings back a deleted item
@@ -541,11 +623,23 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 //     with includes as for moves (§B.11.7). Such an item is restored by
 //     a catalog admin, who skips that check as for moves;
 //   - then 409 for a live item.
-func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, item string) (*plan, error) {
+//
+// Each refusal carries the checkpoint it holds at (decidedAt). The item's
+// state is read from the database, which changes with the checkpoint
+// under the graph lock, so what is read held at some checkpoint between
+// the ones before and after the read: a name the service has seen is
+// never unknown again, so 404 holds at the one before, and a purge is
+// permanent, so 410 holds at the one after.
+func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, item string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	pl := ns + "." + name
 	trusted := false
-	s.t.View(func(g *tree.Graph, _ map[string]string) { trusted = g.Trust[ns] })
+	var cp, combined string
+	defer func() { err = decidedAt(err, combined) }()
+	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		trusted = g.Trust[ns]
+		combined, _ = tree.CombinedAt(g, cur)
+	})
 	if !trusted {
 		// The service follows only trusted namespaces: it knows nothing of
 		// this one's items.
@@ -559,28 +653,35 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 	case tree.ItemUnknown:
 		return nil, errf(404, "not_found", "%s has never existed", item)
 	case tree.ItemPurged:
+		combined = s.t.At()
 		return nil, errf(410, "gone", "%s was purged: there is nothing to restore", item)
 	}
-	cfg, err := s.t.Checker().Config(ctx, ns)
+	latest, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
 		return nil, upstream(err)
 	}
-	key := findKey(cfg.Keys, s.opt.Kid)
-	if key == nil {
+	signer := findKey(latest.Keys, s.opt.Kid)
+	if signer == nil {
 		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
 	}
-	subs := assertable(key, Subjects(v))
 	admin := s.isAdmin(v)
-	incs := map[string]Includes{ns: ParseIncludes(cfg.Doc)}
 	var (
+		cfg         *grantcheck.Config
+		key         *grant.Key
 		placed      bool
 		roles       map[string]bool
-		cp          string
 		wSubj, wRol string
 		widens      bool
 	)
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
+		combined, _ = tree.CombinedAt(g, cur)
+		cfg = s.configAt(g, ns, latest)
+		if key = findKey(cfg.Keys, s.opt.Kid); key == nil {
+			return
+		}
+		subs := assertable(key, Subjects(v))
+		incs := map[string]Includes{ns: ParseIncludes(cfg.Doc)}
 		n := g.Node(pl)
 		placed = n != nil && !n.Self
 		if placed {
@@ -610,6 +711,9 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 			}
 		}
 	})
+	if key == nil {
+		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
+	}
 	if itemSt == tree.ItemPurged {
 		return nil, errf(410, "gone", "%s was purged: there is nothing to restore", item)
 	}
@@ -638,7 +742,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 	case itemSt == tree.ItemLive:
 		return nil, conflict("%s is not deleted", item)
 	}
-	return &plan{ns: ns, resource: name, can: []string{"restore"}, roles: kept, rules: []any{resourceRule(name)}, cp: cp, key: key}, nil
+	return &plan{ns: ns, resource: name, can: []string{"restore"}, roles: kept, rules: []any{resourceRule(name)}, cp: cp, combined: combined, key: signer}, nil
 }
 
 // folders resolves a to list to distinct folder names.
@@ -727,7 +831,7 @@ func powerOn(g *tree.Graph, folder string, subs map[string]bool, power string, a
 // walk-up, but tree powers on it come only from its own $access, which
 // needs the admin group, as any $access does: the grant refuses a document
 // with $access unless the caller is an admin.
-func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node string, to []string) (*plan, error) {
+func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node string, to []string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
 	if !ok || strings.Contains(name, ".") || !client.ValidResourceName(name) {
@@ -737,19 +841,25 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	if err != nil {
 		return nil, err
 	}
-	key, err := s.catalogKey(ctx)
+	latest, signer, err := s.catalogKey(ctx)
 	if err != nil {
 		return nil, err
 	}
-	if !key.IsStar() && !contains(key.Can, "create") {
-		return nil, forbidden("the catalog's key may not create in %s", cat)
-	}
 	subs := Subjects(v)
 	admin := s.isAdmin(v)
-	var cp string
-	err = nil
+	var cp, combined string
+	defer func() { err = decidedAt(err, combined) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
+		combined, _ = tree.CombinedAt(g, cur)
+		switch key := s.keyAt(g, cat, latest); {
+		case key == nil:
+			err = s.noCatalogKey()
+			return
+		case !key.IsStar() && !contains(key.Can, "create"):
+			err = forbidden("the catalog's key may not create in %s", cat)
+			return
+		}
 		for _, f := range tos {
 			if !liveFolder(g, f) {
 				err = errf(422, "not_folder", "%s is not a live folder of %s", f, cat)
@@ -775,7 +885,7 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	if !admin {
 		rules = append(rules, map[string]any{"op": "test", "path": "/doc/$access", "exists": false})
 	}
-	return &plan{ns: cat, resource: name, can: []string{"create"}, rules: rules, cp: cp, key: key}, nil
+	return &plan{ns: cat, resource: name, can: []string{"create"}, rules: rules, cp: cp, combined: combined, key: signer}, nil
 }
 
 func (s *Service) isAdmin(v *grant.Verified) bool {
@@ -787,16 +897,29 @@ func (s *Service) isAdmin(v *grant.Verified) bool {
 	return false
 }
 
-func (s *Service) catalogKey(ctx context.Context) (*grant.Key, error) {
+// catalogKey is the catalog namespace's document at the head and the
+// catalog's key in it, which signs organising grants (plan.key).
+func (s *Service) catalogKey(ctx context.Context) (*grantcheck.Config, *grant.Key, error) {
 	cfg, err := s.t.Checker().Config(ctx, s.t.Catalog())
 	if err != nil {
-		return nil, upstream(err)
+		return nil, nil, upstream(err)
 	}
 	key := findKey(cfg.Keys, s.opt.Kid)
 	if key == nil {
-		return nil, forbidden("the catalog namespace does not list the catalog's key %q", s.opt.Kid)
+		return nil, nil, s.noCatalogKey()
 	}
-	return key, nil
+	return cfg, key, nil
+}
+
+func (s *Service) noCatalogKey() error {
+	return forbidden("the catalog namespace does not list the catalog's key %q", s.opt.Kid)
+}
+
+// keyAt is the catalog's key in ns as of the checkpoint g reflects
+// (configAt), which decides; nil if ns doesn't list it there. Call it
+// under View.
+func (s *Service) keyAt(g *tree.Graph, ns string, latest *grantcheck.Config) *grant.Key {
+	return findKey(s.configAt(g, ns, latest).Keys, s.opt.Kid)
 }
 
 // planPlace decides a placement (§B.11.4): the caller is in the content
@@ -808,7 +931,7 @@ func (s *Service) catalogKey(ctx context.Context) (*grant.Key, error) {
 // fresh random $nonce (§C.7, §B.11.4), so its revision ids can't be used to
 // confirm guesses of its content; the grant's rules fix only /resource and
 // /doc/parents, so a $nonce is always allowed.
-func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string, to []string) (*plan, error) {
+func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string, to []string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	ns, name, ok := tree.ParseHref(item)
 	if !ok || ns == cat {
@@ -828,17 +951,27 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 	}
 	subs := Subjects(v)
 	admin := s.isAdmin(v)
-	if !inPlaceList(ccfg.Doc, cat, subs) {
-		return nil, forbidden("namespace %s does not let you place its items in %s (catalogs.%s.place)", ns, cat, cat)
-	}
-	key, err := s.catalogKey(ctx)
+	latest, signer, err := s.catalogKey(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var cp string
-	err = nil
+	var (
+		key          *grant.Key
+		cp, combined string
+	)
+	defer func() { err = decidedAt(err, combined) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
+		combined, _ = tree.CombinedAt(g, cur)
+		// The place list and the key as of the checkpoint (configAt).
+		if !inPlaceList(s.configAt(g, ns, ccfg).Doc, cat, subs) {
+			err = forbidden("namespace %s does not let you place its items in %s (catalogs.%s.place)", ns, cat, cat)
+			return
+		}
+		if key = s.keyAt(g, cat, latest); key == nil {
+			err = s.noCatalogKey()
+			return
+		}
 		if !g.Trust[ns] {
 			err = errf(422, "untrusted", "namespace %s is not trusted by catalog %s", ns, cat)
 			return
@@ -885,7 +1018,7 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		}
 		verb = "restore"
 	}
-	return &plan{ns: cat, resource: pl, can: []string{verb}, rules: []any{resourceRule(pl), parentsRule(cat, tos)}, cp: cp, key: key}, nil
+	return &plan{ns: cat, resource: pl, can: []string{verb}, rules: []any{resourceRule(pl), parentsRule(cat, tos)}, cp: cp, combined: combined, key: signer}, nil
 }
 
 func inPlaceList(doc map[string]any, cat string, subs map[string]bool) bool {
@@ -904,7 +1037,7 @@ func inPlaceList(doc map[string]any, cat string, subs map[string]bool) bool {
 // parent the node leaves and on every target folder, and no widening of
 // anyone's effective roles in the moved subtree unless the caller is a
 // catalog admin.
-func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, to []string) (*plan, error) {
+func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, to []string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
 	if !ok {
@@ -914,7 +1047,7 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 	if err != nil {
 		return nil, err
 	}
-	key, err := s.catalogKey(ctx)
+	latest, signer, err := s.catalogKey(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -926,10 +1059,18 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 			return nil, err
 		}
 	}
-	var cp string
-	err = nil
+	var cp, combined string
+	defer func() { err = decidedAt(err, combined) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
+		combined, _ = tree.CombinedAt(g, cur)
+		if s.keyAt(g, cat, latest) == nil {
+			err = s.noCatalogKey()
+			return
+		}
+		if !admin {
+			incs = s.includesAt(g, incs)
+		}
 		n := g.Node(name)
 		if n == nil || n.Self {
 			err = errf(404, "not_found", "no node %s in %s", name, cat)
@@ -968,7 +1109,7 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 	if err != nil {
 		return nil, err
 	}
-	return &plan{ns: cat, resource: name, can: []string{"append"}, cp: cp, key: key, rules: []any{
+	return &plan{ns: cat, resource: name, can: []string{"append"}, cp: cp, combined: combined, key: signer, rules: []any{
 		resourceRule(name), parentsRule(cat, tos),
 		map[string]any{"op": "writes", "within": []any{"/parents"}}}}, nil
 }
@@ -1033,6 +1174,22 @@ func (s *Service) includesOfTrusted(ctx context.Context) (map[string]Includes, e
 	return out, nil
 }
 
+// includesAt is the includes of every content namespace g trusts, as of
+// the checkpoint it reflects (Graph.Content), so a decision reflects the
+// checkpoint it reports; latest (includesOfTrusted) stands in where the
+// graph has no document. Call it under View.
+func (s *Service) includesAt(g *tree.Graph, latest map[string]Includes) map[string]Includes {
+	out := map[string]Includes{}
+	for ns := range g.Trust {
+		if c := g.Content[ns]; c != nil {
+			out[ns] = ParseIncludes(c.Doc)
+		} else if inc, ok := latest[ns]; ok {
+			out[ns] = inc
+		}
+	}
+	return out
+}
+
 // present reports whether role r counts as present before the move at
 // node d, given the roles before (§B.11.4: it, or a role including it,
 // was present). For a placement, includes are read from its item's own
@@ -1095,7 +1252,7 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[stri
 
 // planUnplace decides deleting a placement: a role with move on every
 // current parent (§B.11.4).
-func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node string) (*plan, error) {
+func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
 	if !ok {
@@ -1104,18 +1261,23 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 	if !strings.Contains(name, ".") {
 		return nil, errf(422, "not_placement", "only placements can be unplaced; %s is a folder", name)
 	}
-	key, err := s.catalogKey(ctx)
+	latest, signer, err := s.catalogKey(ctx)
 	if err != nil {
 		return nil, err
 	}
 	subs := Subjects(v)
 	var (
-		cp    string
-		hrefs []string
+		cp, combined string
+		hrefs        []string
 	)
-	err = nil
+	defer func() { err = decidedAt(err, combined) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
+		combined, _ = tree.CombinedAt(g, cur)
+		if s.keyAt(g, cat, latest) == nil {
+			err = s.noCatalogKey()
+			return
+		}
 		n := g.Node(name)
 		if n == nil || n.Self {
 			err = errf(404, "not_found", "no placement %s in %s", name, cat)
@@ -1134,7 +1296,7 @@ func (s *Service) planUnplace(ctx context.Context, v *grant.Verified, node strin
 	}
 	// §B.11.4: the grant fixes /doc/parents (the document being deleted)
 	// to the parents checked, so the placement can't be moved first.
-	return &plan{ns: cat, resource: name, can: []string{"delete"}, rules: []any{resourceRule(name), parentHrefsRule(hrefs)}, cp: cp, key: key}, nil
+	return &plan{ns: cat, resource: name, can: []string{"delete"}, rules: []any{resourceRule(name), parentHrefsRule(hrefs)}, cp: cp, combined: combined, key: signer}, nil
 }
 
 // checkLag refuses to issue from a checkpoint older than the catalog's
@@ -1216,7 +1378,7 @@ func (s *Service) mint(ctx context.Context, v *grant.Verified, p *plan, lagOK ma
 		return nil, err
 	}
 	return &Issued{Grant: g.Encode(), NS: p.ns, Resource: p.resource, Can: p.can, Roles: p.roles,
-		Exp: exp.Format(time.RFC3339Nano), At: at}, nil
+		Exp: exp.Format(time.RFC3339Nano), At: at, Checkpoint: p.combined}, nil
 }
 
 func toAny(xs []string) []any {

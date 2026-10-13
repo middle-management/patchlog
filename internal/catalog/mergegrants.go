@@ -83,6 +83,10 @@ type MergeGrant struct {
 	ApprovedBy string `json:"approvedBy"`
 	// Checks reports, per resource, what was checked.
 	Checks []MergeCheck `json:"checks"`
+	// Checkpoint is the combined checkpoint (§B.5) the batch was checked
+	// at, as for POST /grants (§B.11.4); it shadows Issued's, which is the
+	// same.
+	Checkpoint string `json:"checkpoint"`
 }
 
 // MergeCheck is the decision for one item.
@@ -285,12 +289,13 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 		placeOK[ns] = inPlaceList(cfg.Doc, cat, subs)
 	}
 
-	var cp string
+	var cp, combined string
 	var checks []MergeCheck
 	needsAdmin := false
 	err = nil
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
+		combined, _ = tree.CombinedAt(g, cur)
 		changes := map[string]any{}
 		for _, mi := range items {
 			n := g.Node(mi.name)
@@ -456,7 +461,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 	if err != nil {
 		return nil, err
 	}
-	out := &MergeGrant{ApprovedBy: av.Principal.ID, Checks: checks}
+	out := &MergeGrant{ApprovedBy: av.Principal.ID, Checks: checks, Checkpoint: combined}
 	if needsAdmin {
 		// $access needs the admin group, which the merge key may never
 		// assert: checked here as a dry run, submitted under an admin's
@@ -483,7 +488,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 			return nil, forbidden("the merge key may not %s in %s", a, cat)
 		}
 	}
-	p := &plan{ns: cat, resource: "", can: can, rules: []any{map[string]any{"any": alts}}, cp: cp, key: key}
+	p := &plan{ns: cat, resource: "", can: can, rules: []any{map[string]any{"any": alts}}, cp: cp, combined: combined, key: key}
 	is, err := s.mintMerge(ctx, v, av, p)
 	if err != nil {
 		return nil, err
@@ -538,7 +543,7 @@ func (s *Service) mintMerge(ctx context.Context, v, av *grant.Verified, p *plan)
 	if err != nil {
 		return nil, err
 	}
-	return &Issued{Grant: g.Encode(), NS: p.ns, Can: p.can, Exp: exp.Format(time.RFC3339Nano), At: at}, nil
+	return &Issued{Grant: g.Encode(), NS: p.ns, Can: p.can, Exp: exp.Format(time.RFC3339Nano), At: at, Checkpoint: p.combined}, nil
 }
 
 func (mi *mergeItem) addAction(a string) {

@@ -55,6 +55,11 @@ func testMergeGrants(t *testing.T) {
 	if r.body["approvedBy"] != "user:anna" {
 		t.Fatalf("approvedBy %v", r.body)
 	}
+	// As for POST /grants, the combined checkpoint it was decided at
+	// (§B.11.4).
+	if r.body["checkpoint"] != w.svc.Tree().At() {
+		t.Errorf("merge grant checkpoint %v, now %s", r.body["checkpoint"], w.svc.Tree().At())
+	}
 	g := must(grant.Decode(r.body["grant"].(string), 0))
 	root := g.Blocks[0]
 	if root.Kid != "catalog-merge" || root.Sub != "svc:merge" || root.Attrs["approvedBy"] != "user:anna" || len(root.Groups) != 0 {
