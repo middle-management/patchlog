@@ -48,6 +48,9 @@ type Limits struct {
 	BlobPending int
 	BlobGrace   time.Duration
 	BlobRate    Rate
+	// ExchangeRate is the bucket of edge-grant exchanges per principal
+	// (§C.5), apart from every write bucket. Deployment only.
+	ExchangeRate Rate
 }
 
 // Rate is a token bucket: Rate tokens per second, Burst the bucket size.
@@ -82,6 +85,7 @@ func DefaultLimits() Limits {
 		BlobPending:          256 << 20,
 		BlobGrace:            24 * time.Hour,
 		BlobRate:             Rate{8 << 20, 256 << 20},
+		ExchangeRate:         Rate{10, 100},
 	}
 }
 
@@ -108,7 +112,7 @@ var limitFields = map[string]func(*Limits) *int{
 }
 
 // deploymentOnlyLimits are limits of §6.6 that only a deployment sets.
-var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "branchDepth": true}
+var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "branchDepth": true, "exchangeRate": true}
 
 var rateFields = map[string]func(*Limits) *Rate{
 	"ratePerResource":  func(l *Limits) *Rate { return &l.RatePerResource },

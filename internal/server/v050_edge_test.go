@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/grant"
 )
 
 // issueGrants posts grants to POST /edge-grants in the body (§C.5).
@@ -278,8 +280,9 @@ func TestV050EdgeGrantsAllOrNothing(t *testing.T) {
 // (value, or compare eq a literal) or a finite set (a schema of only
 // enum, or compare in a literal array); several such rules fix it to the
 // names all allow, one prefix per name. Any other reference to /resource,
-// an empty set, an invalid name, or more than 100 names over all grants of
-// the request is 403.
+// an empty set or an invalid name is 403. v0.51: an exchange that would
+// issue more than 100 distinct prefixes is 400, once the grants have
+// verified.
 func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, nil)
@@ -350,7 +353,9 @@ func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 		{"inside not", []any{map[string]any{"not": test("a")}}, ""},
 		{"inside if", []any{map[string]any{"if": []any{bob}, "then": []any{test("a")}}}, ""},
 		{"all beside a fixing rule refers otherwise", []any{all(enum("a"), map[string]any{"not": test("b")})}, ""},
-		{"101 names", []any{enum(names("n", 101)...)}, ""},
+		// An invalid literal is 403 however many names the rest give.
+		{"101 names and an invalid one", []any{enum(append(names("n", 101), "no/slash")...)}, ""},
+		{"101 names, an invalid one intersected away", []any{enum(names("n", 101)...), enum(append(names("n", 101), "..")...)}, ""},
 	} {
 		r := issue(sec, c.rules...)
 		if c.prefixes == "" {
@@ -386,28 +391,42 @@ func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 		t.Errorf("two namespaces: %s", got)
 	}
 
-	// The cap counts names over all grants of the request, not names
-	// times namespaces.
+	// v0.51: the cap counts distinct prefixes over all grants of the
+	// request, two for a namespace-wide grant, and is 400.
 	g := func(ns []string, vs []any) string {
 		return e.grant(f.issuer, "user:bob", ns, []string{"read"}, map[string]any{"rules": []any{enum(vs...)}})
 	}
+	wide := e.grant(f.issuer, "user:bob", sec, []string{"read"})
 	for _, c := range []struct {
 		name   string
 		grants []string
 		status int
 		n      int
 	}{
+		{"101 names", []string{g(sec, names("n", 101))}, 400, 0},
 		{"50 and 50", []string{g(sec, names("a", 50)), g(sec, names("b", 50))}, 200, 100},
-		{"60 in two namespaces", []string{g([]string{"sec", "sec2"}, names("a", 60))}, 200, 120},
-		{"the same 60 twice", []string{g(sec, names("a", 60)), g(sec, names("a", 60))}, 403, 0},
-		{"60 and 60", []string{g(sec, names("a", 60)), g(sec, names("b", 60))}, 403, 0},
-		{"100 and 1", []string{g(sec, names("a", 100)), g(sec, names("b", 1))}, 403, 0},
-		{"100 and namespace-wide", []string{g(sec, names("a", 100)), e.grant(f.issuer, "user:bob", sec, []string{"read"})}, 200, 102},
+		{"50 in two namespaces", []string{g([]string{"sec", "sec2"}, names("a", 50))}, 200, 100},
+		{"60 in two namespaces", []string{g([]string{"sec", "sec2"}, names("a", 60))}, 400, 0},
+		{"the same 60 twice", []string{g(sec, names("a", 60)), g(sec, names("a", 60))}, 200, 60},
+		{"overlapping 60s", []string{g(sec, names("a", 60)), g(sec, names("a", 80))}, 200, 80},
+		{"60 and 60", []string{g(sec, names("a", 60)), g(sec, names("b", 60))}, 400, 0},
+		{"100 and 1", []string{g(sec, names("a", 100)), g(sec, names("b", 1))}, 400, 0},
+		{"98 and namespace-wide", []string{g(sec, names("a", 98)), wide}, 200, 100},
+		{"98 and namespace-wide twice", []string{g(sec, names("a", 98)), wide, wide}, 200, 100},
+		{"99 and namespace-wide", []string{g(sec, names("a", 99)), wide}, 400, 0},
+		{"100 and namespace-wide", []string{g(sec, names("a", 100)), wide}, 400, 0},
+		// A refusal outranks the cap: it applies once the grants verify.
+		{"over the cap and a 401", []string{g(sec, names("a", 101)), "x"}, 401, 0},
+		{"over the cap and a 403", []string{g(sec, names("a", 101)), e.grant(f.issuer, "user:bob", sec, []string{"append"})}, 403, 0},
+		{"over the cap and an invalid name", []string{g(sec, names("a", 101)), g(sec, []any{"a", "no/slash"})}, 403, 0},
 	} {
 		r := e.issueGrants(c.grants...)
 		if r.Code != c.status {
 			t.Errorf("%s: want %d: %d %s", c.name, c.status, r.Code, r.Body)
 			continue
+		}
+		if c.status == 400 && r.Str("code") != "bad_input" {
+			t.Errorf("%s: %s", c.name, r.Body)
 		}
 		if n := len(strings.Fields(prefixesOf(t, r))); c.status == 200 && (n != c.n || len(r.H.Values("Set-Cookie")) != c.n) {
 			t.Errorf("%s: %d prefixes, want %d", c.name, n, c.n)
@@ -465,17 +484,19 @@ func TestV050EdgeGrantsKeyScopeSet(t *testing.T) {
 	}
 }
 
-// v0.50 §C.5, §6.6: each grant counts toward its own principal's rate
-// limits, one token, as a write does: from its principal's bucket, or its
-// allowance's. The tokens are drawn only when nothing is refused, all at
-// once, and a 429 draws none.
+// v0.52 §C.5, §6.6 (v0.50 drew one token per grant from the write
+// bucket): once nothing is refused, the request draws one token, however
+// many grants it carries, from the exchangeRate bucket of each distinct
+// principal among them, and from no write bucket or allowance. It is 429
+// exchangeRate while any of those buckets is empty, and draws nothing
+// then, nor on a refusal.
 func TestV050EdgeGrantsRateLimits(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, map[string]any{
 		"limits": map[string]any{"ratePerPrincipal": map[string]any{"rate": 0.001, "burst": 1}},
 		"allowances": []any{map[string]any{
-			"sub": "user:al", "kid": "issuer", "bucket": map[string]any{"rate": 0.001, "burst": 2}}},
-	})
+			"sub": "user:al", "kid": "issuer", "bucket": map[string]any{"rate": 0.001, "burst": 1}}},
+	}, withExchangeRate(core.Rate{Rate: 0.001, Burst: 2}))
 	e := f.tenv
 	g := func(sub string) string {
 		return e.grant(f.issuer, sub, []string{"sec"}, []string{"read", "create"})
@@ -490,34 +511,83 @@ func TestV050EdgeGrantsRateLimits(t *testing.T) {
 		}
 		expectNoCookies(t, name, r)
 	}
+	exchange := func(bearer string) *resp {
+		return e.do(req{method: "POST", path: "/edge-grants", bearer: bearer})
+	}
+	write := func(name, bearer string) *resp {
+		return e.do(req{method: "PATCH", path: "/r/sec/" + name, ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: bearer})
+	}
+
+	// Exchanges and writes don't share a bucket: two exchanges empty the
+	// exchange bucket and leave the write bucket full, and a write empties
+	// the write bucket and leaves the exchange bucket full.
 	bob := g("user:bob")
-	expect(t, e.do(req{method: "POST", path: "/edge-grants", bearer: bob}), 200)
-	expectRate("again", e.do(req{method: "POST", path: "/edge-grants", bearer: bob}), "ratePerPrincipal")
-	// The same bucket as writes.
-	expectRate("a write after", e.do(req{method: "PATCH", path: "/r/sec/x", ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: bob}), "ratePerPrincipal")
+	expect(t, exchange(bob), 200)
+	expect(t, exchange(bob), 200)
+	expectRate("a third exchange", exchange(bob), "exchangeRate")
+	expect(t, write("bob", bob), 201)
+	expectRate("a second write", write("bob2", bob), "ratePerPrincipal")
 	carol := g("user:carol")
-	expect(t, e.do(req{method: "PATCH", path: "/r/sec/y", ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: carol}), 201)
-	expectRate("an exchange after a write", e.do(req{method: "POST", path: "/edge-grants", bearer: carol}), "ratePerPrincipal")
+	expect(t, write("carol", carol), 201)
+	expect(t, exchange(carol), 200)
+	expect(t, exchange(carol), 200)
+	expectRate("a third exchange after a write", exchange(carol), "exchangeRate")
 
-	// Grants of several principals draw on their own buckets.
-	expect(t, e.issueGrants(g("user:dan"), g("user:eve")), 200)
-	// A 429 for one grant refuses the request and draws nothing.
-	frank := g("user:frank")
-	expectRate("one exhausted", e.issueGrants(frank, bob), "ratePerPrincipal")
-	// A refusal draws nothing either.
-	expect(t, e.issueGrants(frank, "x"), 401)
-	expect(t, e.issueGrants(frank), 200)
-	// Two grants of one principal draw together, as a write of two items:
-	// admitted with one token, then the bucket is in debt.
+	// Several grants of one principal draw one token: after three in one
+	// request, one more exchange is admitted.
+	dan := g("user:dan")
+	danRead := e.grant(f.issuer, "user:dan", []string{"sec"}, []string{"read"})
+	expect(t, e.issueGrants(dan, danRead, dan), 200)
+	expect(t, exchange(danRead), 200)
+	expectRate("dan's third", exchange(dan), "exchangeRate")
+
+	// Several principals each draw one, from their own buckets.
+	eve, frank := g("user:eve"), g("user:frank")
+	expect(t, e.issueGrants(eve, frank), 200)
+	expect(t, exchange(eve), 200)
+	expect(t, exchange(frank), 200)
+	expectRate("eve's third", exchange(eve), "exchangeRate")
+	// An empty bucket of one refuses the request, and draws on no other.
 	gil := g("user:gil")
-	expect(t, e.issueGrants(gil, e.grant(f.issuer, "user:gil", []string{"sec"}, []string{"read"})), 200)
-	expectRate("in debt", e.issueGrants(gil), "ratePerPrincipal")
+	expectRate("eve empty", e.issueGrants(gil, eve), "exchangeRate")
+	expect(t, exchange(gil), 200)
+	expect(t, exchange(gil), 200)
+	expectRate("gil's third", exchange(gil), "exchangeRate")
 
-	// An allowance's bucket replaces the principal's.
+	// A refusal draws nothing: neither a 401 nor a 403, nor an exchange
+	// over the 100-prefix cap (400).
+	hank := g("user:hank")
+	expect(t, e.issueGrants(hank, "x"), 401)
+	expect(t, e.issueGrants(hank, e.grant(f.issuer, "user:hank", []string{"sec"}, []string{"create"})), 403)
+	expect(t, e.issueGrants(hank, e.grant(f.issuer, "user:hank", []string{"sec"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": edgeNames("n", 101)}}}})), 400)
+	expect(t, exchange(hank), 200)
+	expect(t, exchange(hank), 200)
+	expectRate("hank's third", exchange(hank), "exchangeRate")
+
+	// An allowance's bucket is a write bucket: exchanges don't draw on it.
 	al := g("user:al")
-	expect(t, e.do(req{method: "POST", path: "/edge-grants", bearer: al}), 200)
-	expect(t, e.do(req{method: "POST", path: "/edge-grants", bearer: al}), 200)
-	expectRate("allowance", e.do(req{method: "POST", path: "/edge-grants", bearer: al}), "allowance")
+	expect(t, exchange(al), 200)
+	expect(t, exchange(al), 200)
+	expectRate("al's third exchange", exchange(al), "exchangeRate")
+	expect(t, write("al", al), 201)
+	expectRate("al's second write", write("al2", al), "allowance")
+
+	// Buckets are keyed as write buckets are, by the root sub and the key
+	// that signed the root block: a narrowing block draws on the same.
+	root, err := grant.Mint(map[string]any{"kid": "issuer", "sub": "user:ivy", "ns": []any{"sec"}, "can": []any{"read", "create"},
+		"exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)}, f.issuer.priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nar, err := root.Narrow(map[string]any{"via": "svc:reader", "can": []any{"read"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ivy, narrowed := root.Encode(), nar.Encode()
+	expect(t, exchange(ivy), 200)
+	expect(t, exchange(narrowed), 200)
+	expectRate("ivy narrowed", exchange(narrowed), "exchangeRate")
 }
 
 // A refused exchange stays cheap, though it draws nothing (§C.5, §6.6):

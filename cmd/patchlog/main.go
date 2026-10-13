@@ -1,6 +1,6 @@
 // Command patchlog runs the patch-log server and mints grants.
 //
-//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key FILE] [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
+//	patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h] [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register] [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
 //	patchlog keygen
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
@@ -11,13 +11,17 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
+	"math"
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -98,7 +102,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, `usage:
   patchlog serve [-addr :8080] [-db patchlog.db|postgres://…] [-blob-dir DIR] [-origin URL] [-dev] [-playground=false] [-tree-url [CATALOG=]URL]... [-index-url URL] [-schema-fetch [-schema-fetch-hosts H,H]] [-operator-key PUB]... [-operator-key-history KID=PUB,FROM[,UNTIL]]... [-jwks-uri URL] [-archive file:///dir] [-archive-root file:///dir]... [-retention-interval 1h]
                  [-remote-bearer ORIGIN=GRANT]... [-remote-url ORIGIN=URL]... [-remote-ignore-purges] [-remote-follow-interval 5m] [-remote-register]
-                 [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key FILE] [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
+                 [-master-key FILE [-master-key-create]] [-purge-url URL]... [-edge-secret FILE [-edge-header NAME] [-edge-prefix-header NAME]] [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-cors-credentials-origin ORIGIN]...
   patchlog version
   patchlog keygen
   patchlog grant mint -key SEED -block JSON [-seal]
@@ -139,6 +143,7 @@ func serve(args []string) {
 	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
 	maxBlobPending := fs.String("max-blob-pending", "", "deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)")
 	logPageSize := fs.Int("log-page-size", 0, "log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)")
+	exchangeRate := fs.String("exchange-rate", "", "edge-grant exchanges per principal (§6.6, §C.5, deployment only), as RATE,BURST, e.g. 10,100 (the default): each POST /edge-grants draws one token from the bucket of each principal whose grants it carries, and none from their write buckets")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
 	var opHistory multi
@@ -168,13 +173,20 @@ func serve(args []string) {
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
-	edgeGrantKey := fs.String("edge-grant-key", "", "file holding the key edge-grant cookies of POST /edge-grants are signed with (§C.5); without it, the key derived from -edge-secret, or else a random one per process, so cookies don't survive a restart or reach another instance")
-	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key, which the cookies carry and a verifying edge looks the key up by (§C.5 \"Format\")")
+	var edgeGrantKeys multi
+	fs.Var(&edgeGrantKeys, "edge-grant-key", "[KID=]FILE: a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes -edge-grant-kid) (§C.5); FILE "+edgeSecretKey+" is the key derived from -edge-secret, and a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, the key derived from -edge-secret, or else a random one per process, so cookies don't survive a restart or reach another instance")
+	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key given as a plain -edge-grant-key FILE or derived from -edge-secret, which the cookies carry and a verifying edge looks the key up by (§C.5 \"Format\")")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
 	ev := edgeVerifier(*edgeSecret, *edgeHeader, *edgePrefixHeader)
-	cookies := edgeGrantCookies(*edgeGrantKid, *edgeGrantKey, ev, corsFlags)
+	cookies, err := edgeGrantCookies(*edgeGrantKid, edgeGrantKeys, ev, corsFlags)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if len(edgeGrantKeys) > 0 {
+		log.Printf("edge grants: minted under kid %s, accepted under %s", cookies.Kid(), strings.Join(cookies.Kids(), ", "))
+	}
 	remote, err := remoteOptions(remoteBearers, remoteURLs, remoteIDs)
 	if err != nil {
 		log.Fatal(err)
@@ -212,6 +224,13 @@ func serve(args []string) {
 	}
 	if *logPageSize > 0 {
 		max.LogPageSize = *logPageSize
+	}
+	if *exchangeRate != "" {
+		r, err := parseRate(*exchangeRate)
+		if err != nil {
+			log.Fatalf("-exchange-rate: %v", err)
+		}
+		max.ExchangeRate = r
 	}
 	if *maxBatch != "" {
 		n, err := core.ParseSize(*maxBatch)
@@ -319,7 +338,7 @@ func serve(args []string) {
 const purgeURLUsage = "CDN URL that cache-tag purges are sent to, as PURGE with X-Purge-Tags (repeatable; e.g. http://cdn:8080/ for deploy/varnish). Unset: purges are only logged"
 
 const (
-	edgeSecretUsage       = "file holding the secret a grant-verifying edge sends in -edge-header, with the prefix of the edge grant it checked in -edge-prefix-header (§9): private reads it verified, with no Authorization, get edge lifetimes; every other private response is CDN-Cache-Control: no-store, and is served all the same. Unset: no verifying edge, and private responses are CDN-Cache-Control: no-store"
+	edgeSecretUsage       = "file holding the secret a grant-verifying edge sends in -edge-header, with the prefix of the edge grant it checked in -edge-prefix-header (§9), each as one header line without a comma (so the secret has none): private reads it verified, with no Authorization, get edge lifetimes; every other private response is CDN-Cache-Control: no-store, and is served all the same. Unset: no verifying edge, and private responses are CDN-Cache-Control: no-store"
 	edgeHeaderUsage       = "request header carrying -edge-secret"
 	edgePrefixHeaderUsage = "request header carrying the prefix of the edge grant the edge verified (§9)"
 )
@@ -378,30 +397,73 @@ func (c *corsFlags) credentialOrigins() ([]string, error) {
 	return out, nil
 }
 
+// parseRate parses a token bucket given as RATE,BURST (§6.6): tokens a
+// second, positive, and the bucket's size, at least 1.
+func parseRate(s string) (core.Rate, error) {
+	rs, bs, ok := strings.Cut(s, ",")
+	r, err1 := strconv.ParseFloat(strings.TrimSpace(rs), 64)
+	b, err2 := strconv.ParseFloat(strings.TrimSpace(bs), 64)
+	if !ok || err1 != nil || err2 != nil || !(r > 0) || !(b >= 1) || math.IsInf(r, 0) || math.IsInf(b, 0) {
+		return core.Rate{}, fmt.Errorf("%q: want RATE,BURST, a positive rate a second and a burst of at least 1", s)
+	}
+	return core.Rate{Rate: r, Burst: b}, nil
+}
+
+// edgeSecretKey, as the FILE of -edge-grant-key, is the key derived from
+// -edge-secret, so a deployment on it can rotate to key files without
+// making clients exchange again (§C.5 "Format"). A file of that name is
+// given as ./edge-secret.
+const edgeSecretKey = "edge-secret"
+
 // edgeGrantCookies returns the edge-grant cookies of POST /edge-grants
-// (§C.5): signed with -edge-grant-key, else with the key derived from
-// -edge-secret, else with a random one, named kid. They are SameSite=None
-// when pages on other origins may call with credentials
-// (-cors-credentials-origin), else Lax.
-func edgeGrantCookies(kid, keyFile string, ev *edge.Verifier, c *corsFlags) *edge.Cookies {
+// (§C.5): under the -edge-grant-key flags, [KID=]FILE, a plain FILE named
+// kid, minting with the last and accepting all, so keys rotate (§C.5
+// "Format"); without one, under the key derived from -edge-secret, else a
+// random one, named kid. A flag is KID=FILE only when no '/' comes before
+// its first '=', so a path holding '=' is a plain FILE; FILE edgeSecretKey
+// is the derived key. They are SameSite=None when pages on other origins
+// may call with credentials (-cors-credentials-origin), else Lax.
+func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsFlags) (*edge.Cookies, error) {
 	if kid == "" {
-		log.Fatal("-edge-grant-kid: empty")
+		return nil, errors.New("-edge-grant-kid: empty")
 	}
-	key := ev.CookieKey()
-	if keyFile != "" {
-		b, err := os.ReadFile(keyFile)
-		if err != nil {
-			log.Fatalf("-edge-grant-key: %v", err)
+	var ck *edge.Cookies
+	if len(keyFlags) == 0 {
+		ck = edge.NewCookies(kid, ev.CookieKey())
+	}
+	for _, f := range keyFlags {
+		k, file, ok := strings.Cut(f, "=")
+		if !ok || strings.ContainsAny(k, "/"+string(filepath.Separator)) {
+			k, file = kid, f
 		}
-		if key = []byte(strings.TrimSpace(string(b))); len(key) < 16 {
-			log.Fatal("-edge-grant-key: the key must be at least 16 bytes")
+		if k == "" || file == "" {
+			return nil, fmt.Errorf("-edge-grant-key %q: want KID=FILE or FILE", f)
+		}
+		var key []byte
+		if file == edgeSecretKey {
+			if key = ev.CookieKey(); key == nil {
+				return nil, fmt.Errorf("-edge-grant-key %s: the key derived from -edge-secret needs -edge-secret (a file of that name is ./%s)", f, edgeSecretKey)
+			}
+		} else {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				return nil, fmt.Errorf("-edge-grant-key: %v", err)
+			}
+			key = []byte(strings.TrimSpace(string(b)))
+			if len(key) < 16 {
+				return nil, fmt.Errorf("-edge-grant-key %s: the key must be at least 16 bytes", file)
+			}
+		}
+		if ck == nil {
+			ck = edge.NewCookies(k, key)
+		} else if err := ck.AddKey(k, key); err != nil {
+			return nil, fmt.Errorf("-edge-grant-key %s: %v", f, err)
 		}
 	}
-	ck := edge.NewCookies(kid, key)
 	if co, err := c.credentialOrigins(); err == nil && (len(co) > 0 || *c.credentials) {
 		ck.SameSite = http.SameSiteNoneMode
 	}
-	return ck
+	return ck, nil
 }
 
 // edgeVerifier returns the verifying edge of -edge-secret, or nil.

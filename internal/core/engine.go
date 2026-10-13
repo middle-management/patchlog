@@ -299,6 +299,14 @@ func Open(opt Options) (*Engine, error) {
 	// Options from before blobs (§7.8) leave their limits zero.
 	defaultBlobLimits(&opt.Limits, DefaultLimits())
 	defaultBlobLimits(&opt.Maximums, opt.Limits)
+	// And from before exchangeRate (§6.6, §C.5), which only the deployment
+	// sets: the Maximums' is the one in force.
+	if opt.Limits.ExchangeRate == (Rate{}) {
+		opt.Limits.ExchangeRate = DefaultLimits().ExchangeRate
+	}
+	if opt.Maximums.ExchangeRate == (Rate{}) {
+		opt.Maximums.ExchangeRate = opt.Limits.ExchangeRate
+	}
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
 	}
