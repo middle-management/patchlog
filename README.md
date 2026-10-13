@@ -1127,7 +1127,8 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   after them) to itself without `min`, anything else, once `min` is reached, to the current
   checkpoint. A `min` naming another namespace, which a result of `{ns}` never includes, goes
   straight to the current checkpoint once reached, in one hop, if the index follows it and the
-  reader's grant may read it (v0.51, §A.5); any other is `400`.
+  reader may see it (it is public, or the reader's grant reads it) (v0.51, §A.5); any other is
+  `400`.
 - Redirects give the query in one canonical form (v0.50, §A.5): parameters sorted by name, then
   value, as UTF-8 bytes, and every byte but letters, digits and `-._~` percent-encoded in
   uppercase hex (a space is `%20`, never `+`). An `at` URL is answered `200` only in that form,
@@ -1862,8 +1863,8 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   `"can": ["read", "create", "append", "restore"]`.
 - `POST /read-grants` returns resource-scoped read grants, and the keys of catalog nodes (and of an
   item's placement) visible to the caller: `{ "grants": [...] }`, one entry per item in request
-  order, each with `grant` and `exp`, `public: true` (an item in a public namespace that isn't
-  sealed: no grant needed), or `error` (`{ status, code, message }`), and its `checkpoint`
+  order, each with `grant` and `exp`, `public: true` (an item in a public namespace: no grant
+  needed; a sealed one also gets its keys), or `error` (`{ status, code, message }`), and its `checkpoint`
   (below); a sealed item also gets its keys, and a catalog node keys and no grant. It decides
   every item at one combined checkpoint: if the checkpoint moved while it decided, it decides
   again, up to three times, then answers `503 behind` with `Retry-After`. So "may this reader

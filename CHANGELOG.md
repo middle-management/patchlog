@@ -23,6 +23,9 @@ own.
   `/_refs/g/{gs}/at/{at}?to=…`. The old forms redirect (`301`) to the new.
 - **Catalog `checkpoint`** is `{ ns: ns_id, … }`: the catalog's and each named item's
   namespace's `ns_id`s a decision was made at, not the combined checkpoint string (§B.11.4).
+  `POST /read-grants` has no top-level `checkpoint` any more: each entry of `grants` carries its
+  own, and refusals not decided at a checkpoint, `5xx` entries and public items of namespaces
+  the service doesn't follow have none.
 - **A `min` naming a namespace the reader can't see** gets the same `400` as one the service
   doesn't follow, on index, `/_refs` and tree URLs, so it doesn't reveal which private
   namespaces are indexed (§A.5).
@@ -58,7 +61,7 @@ own.
   older `g/all` cookie may be live. `edge.Cookies.Vouches` sets which prefixes a service's key
   vouches for.
 - **`/keys` names `epoch`, `level` and `pad`** (§E.2.3), so a writer limited to some resources
-  seals at E2 and E3 without the namespace document: E2E writes, `PruneE2E`, `UploadBlob` and
+  learns the level at E2 and E3 and seals at E3 without the namespace document: E2E writes, `PruneE2E`, `UploadBlob` and
   undo take them from `/keys` (`client.FetchKeysAnswer`, `client.IsNotOffered`). Undo by such a
   writer now works at E3 with `UndoE2E`.
 - Behind a tree service that serves several catalogs, a `min` naming a namespace only another
@@ -70,7 +73,6 @@ own.
 - The catalog grant service answers `410 gone` for items of a purged sealed content namespace,
   or catalog, instead of `502`; remote branches no longer re-apply a sealed base's purge on
   every sync; the janitor keeps sweeping when one of its bases is purged.
-- An exchange over the prefix cap no longer builds every edge grant before answering `400`.
 - A limited writer's E3 fold no longer fails on an unpadded revision.
 - Playground: a purged sealed namespace shows as purged; limited-grant undo asks `/keys` for
   the level.

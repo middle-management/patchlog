@@ -85,11 +85,12 @@ Adopted with more than the reference did, which now follows the text:
   at the edge under cookies the service mints with a key of its own for
   `/{catalog}/g/{gs}`, at an exchange endpoint of its own, so listing URLs now put the subject
   set first: `/{catalog}/g/{gs}/at/{at}/…`, `/{ns}/g/{gs}/at/{ns_id}`, `/_refs/g/{gs}/at/{at}`
-  (§A.4, §B.11.5). The tree service now mints and verifies them.
+  (§A.4, §B.11.5). The catalog service (`tree -access`) now mints and verifies them.
 - **Undo by writers limited to some resources** (15): `/keys` names `epoch`, `level` and
   `pad`, and is `404 not_offered` where nothing is sealed, so such a writer can seal and undo at
   E3 (§E.2.3, §11.2). It credits carried gestures to the merger, and reports an undo as
-  impossible when the gesture's oldest entry lies at or before the oldest log entry it can read.
+  impossible when the gesture may reach below a pruning horizon; a log read from genesis has
+  nothing before it, so the reference reads the rule as applying after a horizon only (Open 2).
 
 Decided against the reference, which now follows the text:
 - **Issuance and rate limits** (6, v0.52, from Doors): exchanges draw on a bucket of their own,
