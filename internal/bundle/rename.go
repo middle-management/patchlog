@@ -46,7 +46,11 @@ import (
 // anywhere else can't be found, so it stays, and the report lists it
 // (UndeclaredRef.Renamed), as for pinned strings in snapshot documents.
 // Catalog placement names (<ns>.<name>) aren't renamed, and a namespace's
-// configuration isn't in the bundle (§G.7).
+// configuration isn't in the bundle (§G.7). Documents of the bundle's
+// unmapped namespaces that reference a renamed one are rewritten too, in
+// their own namespace. A renamed namespace's snapshot documents go
+// through {dst}-upstream (upstreamNS), whose name checkUpstreams checks
+// against §3.6 first.
 //
 // Refused before anything is written (CheckError): an incremental
 // document (requires) that changes, read from the target's revision of

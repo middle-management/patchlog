@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/annot"
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -299,6 +301,21 @@ func TestRenamedImportNonces(t *testing.T) {
 			t.Fatalf("revision %s has no $nonce", id)
 		}
 	}
+	// What a re-run recognises its earlier writes by: the source ids, in
+	// the import batches' source.ids.
+	n := 0
+	for _, br := range rep.Batches {
+		if br.NS != "c-data" {
+			continue
+		}
+		n++
+		if ids, _ := br.Source["ids"].(map[string]any); ids["a"] != s.a3 || ids["b"] != s.b2 {
+			t.Fatalf("c-data batch source %v", br.Source)
+		}
+	}
+	if n == 0 {
+		t.Fatalf("no c-data batch: %+v", rep.Batches)
+	}
 	b := d.chain("c-data", "b")
 	if got := d.doc("c-refs", "r")["pin"]; got != rev("c-data", "a", a[2]) {
 		t.Fatalf("c-refs/r pins %v", got)
@@ -423,6 +440,17 @@ func TestRenamedImportRefusals(t *testing.T) {
 	// new id isn't known.
 	extSchemas, _ := exportFrom(t, d, bundle.ExportOptions{Select: []string{"s-data"}, External: []string{"s-schemas"}})
 
+	// (d) A full-history document's pin of a snapshot document's revision,
+	// which gets the id of its upstream chain: refused where the snapshot's
+	// namespace is renamed, also from a namespace that isn't (§G.4.4: the
+	// documents of unmapped namespaces that reference a renamed one are
+	// rewritten too).
+	d.create("s-refs", "q", map[string]any{"$schema": rev("s-schemas", "item", s.item), "title": "Q", "pin": rev("s-snap", "p", s.p)})
+	pinsSnap, _ := exportFrom(t, d, bundle.ExportOptions{Select: []string{"s-schemas", "s-data", "s-refs"}, External: []string{"s-snap"}})
+	pinsSnap = withSnapshots(t, pinsSnap, s.snap, "s-snap")
+	snapPin := "the reference " + rev("s-snap", "p", s.p) + " at /pin in revision " + d.head("s-refs", "q").ID + " can't be rewritten: it pins revision " + s.p +
+		" of s-snap/p, a snapshot document's, whose revisions get the ids of its upstream chain, so its new id isn't known"
+
 	for _, tc := range []struct {
 		name string
 		b    []byte
@@ -430,6 +458,8 @@ func TestRenamedImportRefusals(t *testing.T) {
 		want string
 	}{
 		{"incremental", inc, bundle.ImportOptions{NSMap: cloneMap}, "is incremental (requires " + s.a2},
+		// Its base isn't in the target at all: no id to go on from.
+		{"incremental, no base", inc, bundle.ImportOptions{NSMap: cloneMap}, "s-data/a is incremental (requires " + s.a2 + "), which c-data/a doesn't hold under that id"},
 		{"external schema", extSchemas, bundle.ImportOptions{NSMap: cloneMap},
 			"its schema " + rev("s-schemas", "item", s.item) + " can't be rewritten: it pins revision " + s.item + " of s-schemas/item, which the bundle doesn't carry (external)"},
 		// Not renamed, the schema is a missing external, as without renaming.
@@ -438,6 +468,8 @@ func TestRenamedImportRefusals(t *testing.T) {
 		{"external pin", ext, bundle.ImportOptions{NSMap: cloneMap}, "pins revision " + s.a3 + " of s-data/a, which the bundle doesn't carry"},
 		{"left out", s.full, bundle.ImportOptions{NSMap: cloneMap, Only: []string{"s-refs"}}, "which the import leaves out (-only)"},
 		{"schema $id", crafted.Bytes(), bundle.ImportOptions{NSMap: cloneMap}, "whose $id names its own revision path"},
+		{"snapshot pin", pinsSnap, bundle.ImportOptions{NSMap: cloneMap}, snapPin},
+		{"snapshot pin, unmapped", pinsSnap, bundle.ImportOptions{NSMap: map[string]string{"s-snap": "c-snap"}}, snapPin},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dst := newDeployment(t, cmsOrigin)
@@ -454,7 +486,11 @@ func TestRenamedImportRefusals(t *testing.T) {
 			if !errors.As(err, &ce) || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("import: %v, want a CheckError containing %q", err, tc.want)
 			}
-			for _, ns := range []string{"c-schemas", "c-data", "c-refs"} {
+			targets := []string{"c-schemas", "c-data", "c-refs", "c-snap", "c-snap-upstream"}
+			if tc.name == "snapshot pin, unmapped" {
+				targets = append(targets, "s-schemas", "s-data", "s-refs")
+			}
+			for _, ns := range targets {
 				if tc.name == "external schema" && ns == "c-schemas" {
 					continue
 				}
@@ -466,29 +502,125 @@ func TestRenamedImportRefusals(t *testing.T) {
 	}
 }
 
-// §G.4.4 Renaming: a mapping onto a branch of the source namespace, as an
-// import into a branch first, renames nothing: references stay, and the
-// branch fast-forwards with the source's ids.
+// §G.4.4 Renaming: a mapping onto a branch whose base chain reaches the
+// source namespace, as an import into a branch first, renames nothing:
+// references stay, and the branch fast-forwards with the source's ids. A
+// branch of a branch counts; a branch of another namespace doesn't, and is
+// renamed onto.
 func TestRenamedImportOntoBranch(t *testing.T) {
 	t.Parallel()
 	s := newCloneSource(t)
-	dst := newDeployment(t, cmsOrigin)
-	importB(t, dst, s.full, bundle.ImportOptions{})
-	must(dst.c.CreateBranch(ctx, "s-data", client.BranchRequest{Name: "wip"}))
 	a4 := s.d.append("s-data", "a", op("replace", "/pin", rev("s-data", "b", s.b1)), op("replace", "/live", "/r/s-data/a"))
 	b, _ := exportFrom(t, s.d, bundle.ExportOptions{Select: []string{"s-data"}})
-	rep := importB(t, dst, b, bundle.ImportOptions{NSMap: map[string]string{"s-data": "wip"}})
-	if len(rep.Renamed) != 0 {
-		t.Fatalf("renamed %v", rep.Renamed)
+	for _, tc := range []struct {
+		name    string
+		chain   []string // the branches to create, each of the one before, from the first
+		renamed bool
+	}{
+		{"branch", []string{"s-data", "wip"}, false},
+		{"branch of a branch", []string{"s-data", "wip", "wip2"}, false},
+		{"branch of another namespace", []string{"s-schemas", "other"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dst := newDeployment(t, cmsOrigin)
+			if tc.renamed {
+				// s-data/a's $schema pins s-schemas/item, which the target
+				// needs: only the schemas are there before.
+				importB(t, dst, s.schema, bundle.ImportOptions{})
+			} else {
+				importB(t, dst, s.full, bundle.ImportOptions{})
+			}
+			for i := 1; i < len(tc.chain); i++ {
+				must(dst.c.CreateBranch(ctx, tc.chain[i-1], client.BranchRequest{Name: tc.chain[i]}))
+			}
+			onto := tc.chain[len(tc.chain)-1]
+			rep := importB(t, dst, b, bundle.ImportOptions{NSMap: map[string]string{"s-data": onto}})
+			got := dst.doc(onto, "a")
+			if tc.renamed {
+				// b1 references nothing renamed, so keeps its id.
+				if rep.Renamed["s-data"] != onto || !rep.Doc("s-data/a").Renamed || dst.head(onto, "a").ID == a4 ||
+					got["pin"] != rev(onto, "b", s.b1) || got["live"] != "/r/"+onto+"/a" {
+					t.Fatalf("renamed %v, %s/a %+v: %v", rep.Renamed, onto, rep.Doc("s-data/a"), got)
+				}
+				return
+			}
+			if len(rep.Renamed) != 0 {
+				t.Fatalf("renamed %v", rep.Renamed)
+			}
+			if d := rep.Doc("s-data/a"); d.Class != "fast-forward" || d.Renamed || dst.head(onto, "a").ID != a4 {
+				t.Fatalf("%s/a %+v", onto, d)
+			}
+			if got["pin"] != rev("s-data", "b", s.b1) || got["live"] != "/r/s-data/a" {
+				t.Fatalf("%s/a %v", onto, got)
+			}
+			for _, ns := range tc.chain[:len(tc.chain)-1] {
+				if dst.head(ns, "a").ID != s.a3 {
+					t.Fatalf("the branch's base %s changed", ns)
+				}
+			}
+		})
 	}
-	if d := rep.Doc("s-data/a"); d.Class != "fast-forward" || d.Renamed || dst.head("wip", "a").ID != a4 {
-		t.Fatalf("wip/a %+v", d)
+}
+
+// §G.4.4 Renaming, onto a remote branch (§G.3) of the bundle's origin:
+// one whose base is src, or whose base.chain reaches it, is a branch of
+// src, so mapping onto it isn't a rename; one of another namespace is.
+func TestRenamedImportOntoRemoteBranch(t *testing.T) {
+	t.Parallel()
+	s := newCloneSource(t)
+	at := must(s.d.c.NSHead(ctx, "s-data")).ID
+	a4 := s.d.append("s-data", "a", op("replace", "/pin", rev("s-data", "b", s.b1)), op("replace", "/live", "/r/s-data/a"))
+	b, _ := exportFrom(t, s.d, bundle.ExportOptions{Select: []string{"s-data"}})
+	must(s.d.c.CreateBranch(ctx, "s-data", client.BranchRequest{Name: "wip", At: at}))
+	wipAt := must(s.d.c.NSHead(ctx, "wip")).ID
+	schemasAt := must(s.d.c.NSHead(ctx, "s-schemas")).ID
+	remote := func(o *core.Options) {
+		o.Remote = core.RemoteOptions{FollowInterval: -1, Resolve: func(origin string) (core.RemoteEndpoint, error) {
+			if origin != stagingOrigin {
+				return core.RemoteEndpoint{}, errors.New("unknown origin " + origin)
+			}
+			return core.RemoteEndpoint{BaseURL: s.d.url}, nil
+		}}
 	}
-	if got := dst.doc("wip", "a"); got["pin"] != rev("s-data", "b", s.b1) || got["live"] != "/r/s-data/a" {
-		t.Fatalf("wip/a %v", got)
-	}
-	if dst.head("s-data", "a").ID != s.a3 {
-		t.Fatal("the branch's base changed")
+	for _, tc := range []struct {
+		name, base, at string
+		chain          []string // rel's base.chain, as the target records it
+		renamed        bool
+	}{
+		{"remote branch", "s-data", at, []string{"s-data"}, false},
+		{"remote branch of a branch", "wip", wipAt, []string{"wip", "s-data"}, false},
+		{"remote branch of another namespace", "s-schemas", schemasAt, []string{"s-schemas"}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dst := newDeployment(t, cmsOrigin, remote)
+			// s-data/a's $schema pins s-schemas/item, which the target needs.
+			importB(t, dst, s.schema, bundle.ImportOptions{})
+			dst.ns("rel", map[string]any{"read": "public", "base": map[string]any{"origin": stagingOrigin, "ns": tc.base, "at": tc.at}})
+			base, _ := dst.nsDoc("rel")["base"].(map[string]any)
+			if chain, _ := base["chain"].([]any); !slices.EqualFunc(chain, tc.chain, func(x any, ns string) bool { return x == ns }) {
+				t.Fatalf("rel's base %v", base)
+			}
+			rep := importB(t, dst, b, bundle.ImportOptions{NSMap: map[string]string{"s-data": "rel"}})
+			got := dst.doc("rel", "a")
+			if tc.renamed {
+				if rep.Renamed["s-data"] != "rel" || !rep.Doc("s-data/a").Renamed || dst.head("rel", "a").ID == a4 ||
+					got["pin"] != rev("rel", "b", s.b1) || got["live"] != "/r/rel/a" {
+					t.Fatalf("renamed %v, rel/a %+v: %v", rep.Renamed, rep.Doc("s-data/a"), got)
+				}
+				return
+			}
+			if len(rep.Renamed) != 0 {
+				t.Fatalf("renamed %v", rep.Renamed)
+			}
+			if d := rep.Doc("s-data/a"); d.Class != "fast-forward" || d.Renamed || dst.head("rel", "a").ID != a4 {
+				t.Fatalf("rel/a %+v", d)
+			}
+			if got["pin"] != rev("s-data", "b", s.b1) || got["live"] != "/r/s-data/a" {
+				t.Fatalf("rel/a %v", got)
+			}
+		})
 	}
 }
 
@@ -599,5 +731,183 @@ func TestRenamedImportDeclaredLater(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("rewritten %+v", rep.Doc("x/d").Rewritten)
+	}
+	// The source's step changes only $schema: the rewritten one has a
+	// replace op of its own added for /note.
+	entries := must(dst.c.Log(ctx, "y", "d", "", ""))
+	want := jsonv.FromGo([]any{
+		map[string]any{"op": "replace", "path": "/$schema", "value": rev("y", "refs", refs)},
+		map[string]any{"op": "replace", "path": "/note", "value": "/r/y/other"},
+	})
+	if len(entries) != 2 || !jsonv.Equal(entries[1].Patches, want) {
+		t.Fatalf("rewritten step %s", jsonv.Canonical(entries[len(entries)-1].Patches))
+	}
+}
+
+// §G.4.4 Renaming: documents of the bundle's unmapped namespaces that
+// reference a renamed one are rewritten too, full-history ones step by
+// step with new ids and snapshot ones through their own upstream
+// namespace, and keep their namespace; those that don't reference it keep
+// their ids.
+func TestRenamedImportUnmapped(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	for _, ns := range []string{"x", "z", "w"} {
+		src.ns(ns, nil)
+	}
+	sch := src.create("x", "s", map[string]any{"$schema": schema.Dialect2020, "type": "object", "properties": map[string]any{
+		"live": map[string]any{"type": "string", "x-ref": map[string]any{}},
+		"pin":  map[string]any{"type": "string", "x-ref": map[string]any{"pinned": true}},
+	}})
+	tg := src.create("x", "t", map[string]any{"title": "T"})
+	f1 := src.create("z", "f", map[string]any{"$schema": rev("x", "s", sch), "title": "F"})
+	f2 := src.append("z", "f", op("add", "/live", "/r/x/t"), op("add", "/pin", rev("x", "t", tg)))
+	q := src.create("z", "q", map[string]any{"title": "Q"})
+	src.create("w", "p", map[string]any{"$schema": rev("x", "s", sch), "live": "/r/x/t"})
+	full, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"x", "z"}})
+	snap, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"w"}, Mode: bundle.Snapshot})
+	b := withSnapshots(t, full, snap, "w")
+
+	dst := newDeployment(t, cmsOrigin)
+	rep := importB(t, dst, b, bundle.ImportOptions{NSMap: map[string]string{"x": "y"}})
+	if len(rep.Renamed) != 1 || rep.Renamed["x"] != "y" {
+		t.Fatalf("renamed %v", rep.Renamed)
+	}
+	// x's documents reference nothing renamed: they keep their ids.
+	if dst.head("y", "s").ID != sch || dst.head("y", "t").ID != tg {
+		t.Fatalf("y/s %s, y/t %s", dst.head("y", "s").ID, dst.head("y", "t").ID)
+	}
+	if _, err := dst.c.NSHead(ctx, "x"); !client.IsNotFound(err) {
+		t.Fatalf("x written: %v", err)
+	}
+	schemaRef := rev("y", "s", sch)
+	chain := dst.chain("z", "f")
+	if r := rep.Doc("z/f"); !r.Renamed || r.Target != "z/f" || len(chain) != 2 || chain[0] == f1 || chain[1] == f2 {
+		t.Fatalf("z/f %+v, chain %v", r, chain)
+	}
+	if got := dst.at("z", "f", chain[0])["$schema"]; got != schemaRef {
+		t.Fatalf("z/f's genesis $schema %v", got)
+	}
+	want := map[string]any{"$schema": schemaRef, "title": "F", "live": "/r/y/t", "pin": rev("y", "t", tg)}
+	if got := dst.doc("z", "f"); !jsonv.Equal(jsonv.FromGo(got), jsonv.FromGo(want)) {
+		t.Fatalf("z/f %v, want %v", got, want)
+	}
+	if r := rep.Doc("z/q"); r.Renamed || dst.head("z", "q").ID != q {
+		t.Fatalf("z/q %+v", r)
+	}
+	// The unmapped snapshot document goes through its own namespace's
+	// upstream.
+	if got := dst.doc("w", "p"); got["$schema"] != schemaRef || got["live"] != "/r/y/t" {
+		t.Fatalf("w/p %v", got)
+	}
+	if up := dst.head("w-upstream", "p"); up.State != client.Live || up.ID != dst.head("w", "p").ID {
+		t.Fatalf("w-upstream/p %+v", up)
+	}
+	for _, ns := range []string{"y-upstream", "x-upstream"} {
+		if _, err := dst.c.NSHead(ctx, ns); !client.IsNotFound(err) {
+			t.Fatalf("%s written: %v", ns, err)
+		}
+	}
+}
+
+// §G.4.4 Renaming: a renamed namespace's upstream is {dst}-upstream, which
+// must fit the name limit of §3.6: one that doesn't is refused at step 1,
+// before anything is written, a dry run included; one that fits exactly
+// imports, and so does a bundle without snapshot documents, which needs
+// no upstream namespace. A source namespace too long for its own upstream
+// imports once renamed to a shorter name.
+func TestRenamedImportUpstreamName(t *testing.T) {
+	t.Parallel()
+	s := newCloneSource(t)
+	long, fits := strings.Repeat("c", 64), strings.Repeat("c", 64-len("-upstream"))
+	mapped := func(ns, to string) map[string]string {
+		m := maps.Clone(cloneMap)
+		m[ns] = to
+		return m
+	}
+	for _, dry := range []bool{true, false} {
+		dst := newDeployment(t, cmsOrigin)
+		_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(s.merged), bundle.ImportOptions{NSMap: mapped("s-snap", long), Mode: bundle.Atomic, CreateNamespaces: true, DryRun: dry})
+		want := "s-snap is renamed to " + long + ", whose upstream namespace for its snapshot documents, " + long + "-upstream, is 73 characters, over the 64 a namespace name may have (§3.6, §G.4.4)"
+		var ce *bundle.CheckError
+		if !errors.As(err, &ce) || len(ce.Problems) != 1 || !strings.Contains(err.Error(), want) {
+			t.Fatalf("dry run %v: import: %v, want a CheckError containing %q", dry, err, want)
+		}
+		for _, ns := range []string{"c-schemas", "c-data", "c-refs", long} {
+			if _, err := dst.c.NSHead(ctx, ns); !client.IsNotFound(err) {
+				t.Fatalf("dry run %v: %s written: %v", dry, ns, err)
+			}
+		}
+	}
+
+	dst := newDeployment(t, cmsOrigin)
+	importB(t, dst, s.merged, bundle.ImportOptions{NSMap: mapped("s-snap", fits)})
+	if up := dst.head(fits+"-upstream", "p"); up.State != client.Live || up.ID != dst.head(fits, "p").ID {
+		t.Fatalf("%s-upstream/p %+v", fits, up)
+	}
+
+	dst = newDeployment(t, cmsOrigin)
+	importB(t, dst, s.full, bundle.ImportOptions{NSMap: mapped("s-data", long)})
+	if got := dst.doc(long, "a")["live"]; got != "/r/"+long+"/b" {
+		t.Fatalf("%s/a live %v", long, got)
+	}
+
+	// Only the upstream namespaces the import uses are checked: a partial
+	// import that leaves out the renamed s-snap, and holds none of its
+	// documents, writes no upstream for it.
+	dst = newDeployment(t, cmsOrigin)
+	importB(t, dst, s.merged, bundle.ImportOptions{NSMap: mapped("s-snap", long), Only: []string{"s-schemas", "s-data", "s-refs"}})
+	if dst.doc("c-data", "a")["live"] != "/r/c-data/b" {
+		t.Fatal("c-data/a not imported")
+	}
+	if _, err := dst.c.NSHead(ctx, long); !client.IsNotFound(err) {
+		t.Fatalf("%s written: %v", long, err)
+	}
+	// One it holds, as a snapshot document it brings pins it, is checked
+	// under its upstream path (partial.go): its name is checked too.
+	s.d.ns("s-snap2", nil)
+	s.d.create("s-snap2", "q", map[string]any{"$schema": rev("s-schemas", "item", s.item), "title": "Q", "pin": rev("s-snap", "p", s.p)})
+	snaps, _ := exportFrom(t, s.d, bundle.ExportOptions{Select: []string{"s-snap", "s-snap2"}, Mode: bundle.Snapshot})
+	dst = newDeployment(t, cmsOrigin)
+	importB(t, dst, s.full, bundle.ImportOptions{})
+	_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(snaps), bundle.ImportOptions{NSMap: map[string]string{"s-snap": long},
+		Only: []string{"s-snap2"}, Mode: bundle.Atomic, CreateNamespaces: true})
+	var ce *bundle.CheckError
+	if !errors.As(err, &ce) || len(ce.Problems) != 1 || !strings.Contains(ce.Problems[0], "s-snap is renamed to "+long+", whose upstream namespace") {
+		t.Fatalf("held: import: %v, want a CheckError for s-snap's upstream", err)
+	}
+	for _, ns := range []string{"s-snap2", "s-snap2-upstream"} {
+		if _, err := dst.c.NSHead(ctx, ns); !client.IsNotFound(err) {
+			t.Fatalf("held: %s written: %v", ns, err)
+		}
+	}
+	importB(t, dst, snaps, bundle.ImportOptions{NSMap: map[string]string{"s-snap": fits}, Only: []string{"s-snap"}})
+	importB(t, dst, snaps, bundle.ImportOptions{NSMap: map[string]string{"s-snap": fits}, Only: []string{"s-snap2"}})
+	if q := dst.doc("s-snap2", "q"); q["title"] != "Q" || !strings.HasPrefix(q["pin"].(string), "/r/"+fits+"-upstream/p/rev/") {
+		t.Fatalf("held: s-snap2/q %v", q)
+	}
+
+	// Not renamed, a source namespace's own upstream name is checked the
+	// same way.
+	src := newDeployment(t, stagingOrigin)
+	ns := strings.Repeat("s", 60)
+	src.ns(ns, nil)
+	src.create(ns, "p", map[string]any{"title": "P"})
+	snap, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{ns}, Mode: bundle.Snapshot})
+	dst = newDeployment(t, cmsOrigin)
+	_, err = bundle.Import(ctx, dst.c, bundle.BytesOpener(snap), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true})
+	want := "the upstream namespace of " + ns + "'s snapshot documents, " + ns + "-upstream, is 69 characters"
+	if !errors.As(err, &ce) || !strings.Contains(err.Error(), want) {
+		t.Fatalf("import: %v, want a CheckError containing %q", err, want)
+	}
+	if _, err := dst.c.NSHead(ctx, ns); !client.IsNotFound(err) {
+		t.Fatalf("%s written: %v", ns, err)
+	}
+	if !strings.Contains(err.Error(), "map it to a shorter name (-ns src=dst), or a shorter upstream suffix") {
+		t.Fatalf("import: %v, want the hint to rename", err)
+	}
+	importB(t, dst, snap, bundle.ImportOptions{NSMap: map[string]string{ns: "short"}})
+	if dst.head("short-upstream", "p").State != client.Live || dst.doc("short", "p")["title"] != "P" {
+		t.Fatal("short/p not imported through short-upstream")
 	}
 }

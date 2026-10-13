@@ -109,7 +109,9 @@ type ImportOptions struct {
 	Only []string
 	// UpstreamSuffix names the upstream namespace of a source namespace
 	// (default "-upstream": matches → matches-upstream), or of the
-	// namespace a renamed one becomes (matches=cup → cup-upstream).
+	// namespace a renamed one becomes (matches=cup → cup-upstream). An
+	// upstream the import uses whose name isn't valid, such as one over
+	// the 64 characters of §3.6, is a CheckError (§G.4.4).
 	UpstreamSuffix string
 	// Resolutions resolve conflicting documents, by source key "ns/name".
 	Resolutions map[string]Resolution
@@ -719,22 +721,54 @@ func (im *importer) load(open Opener) error {
 	return nil
 }
 
-// checkUpstreams checks the names of the upstream namespaces, once the
-// renames that name some of them are known.
+// checkUpstreams checks the names of the upstream namespaces the import
+// uses, once the renames that name some of them are known: those of the
+// snapshot documents it brings (keys) and holds (heldKeys), as
+// checkAccess reads them. A renamed namespace's is {dst}-upstream, which
+// must fit the name limit of §3.6 (§G.4.4): one that doesn't is a check
+// problem, before anything is written. These problems are reported
+// alone: the other step-1 checks read the upstream namespaces, which a
+// name the server refuses can't be.
 func (im *importer) checkUpstreams() error {
-	for _, d := range im.docs {
-		if d.info.History == Snapshot {
-			u := im.upstreamNS(d.ns)
-			if !client.ValidNSName(u) {
-				return fmt.Errorf("import: upstream namespace name %q is invalid", u)
-			}
-			if src, ok := im.targets[u]; ok {
-				return fmt.Errorf("import: %s is both the upstream of %s and the target of %s", u, d.ns, src)
+	srcs := map[string]bool{}
+	for _, ks := range [][]string{im.keys, im.heldKeys} {
+		for _, k := range ks {
+			if d := im.docs[k]; d.info.History == Snapshot {
+				srcs[d.ns] = true
 			}
 		}
 	}
+	var problems []string
+	for _, ns := range sortedSet(srcs) {
+		u := im.upstreamNS(ns)
+		if src, ok := im.targets[u]; ok {
+			return fmt.Errorf("import: %s is both the upstream of %s and the target of %s", u, ns, src)
+		}
+		if client.ValidNSName(u) {
+			continue
+		}
+		what := fmt.Sprintf("the upstream namespace of %s's snapshot documents, %s,", ns, u)
+		if dst, ok := im.renames[ns]; ok {
+			what = fmt.Sprintf("%s is renamed to %s, whose upstream namespace for its snapshot documents, %s,", ns, dst, u)
+		}
+		why := "isn't a valid namespace name (§3.6): choose another upstream suffix"
+		if len(u) > maxNSName {
+			shorter := "choose a shorter name"
+			if _, ok := im.renames[ns]; !ok {
+				shorter = "map it to a shorter name (-ns src=dst)"
+			}
+			why = fmt.Sprintf("is %d characters, over the %d a namespace name may have (§3.6, §G.4.4): %s, or a shorter upstream suffix", len(u), maxNSName, shorter)
+		}
+		problems = append(problems, what+" "+why)
+	}
+	if len(problems) > 0 {
+		return &CheckError{Problems: problems}
+	}
 	return nil
 }
+
+// maxNSName is the longest namespace name (§3.6).
+const maxNSName = 64
 
 // snapHeld is the snapshot document as the import holds it: its canonical
 // form (jsonv.Raw), which load keeps, or with keepTrees the Reader's tree.
