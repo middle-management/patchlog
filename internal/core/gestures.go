@@ -35,7 +35,8 @@ import (
 //     gestures and learns nothing of others. It isn't offered in sealed
 //     or e2e namespaces: 404 with code
 //     "not_offered", after authorisation, as a deployment without the
-//     endpoint answers 404. Their logs are the place to look (§11.2).
+//     endpoint answers 404. Their logs are the place to look (§11.2). A
+//     purged namespace answers 410 before it (§8.5).
 
 // GesturePage is a page of GET /ns/{ns}/gestures/{gesture} (§7.4).
 type GesturePage struct {

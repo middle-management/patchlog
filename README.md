@@ -1361,6 +1361,10 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   shadow: read-through, foreign parents and logs work unchanged. History A pruned is mirrored
   from the horizon, whose document is kept as a snapshot (only as trustworthy as the channel,
   §8.6). A failed fetch or verification is `502` with `code: "remote"`, and nothing is written.
+  A base that is purged at A, or has a purged base in its chain, is `410 purged` instead, with
+  `origin`, `ns` and `head` naming the purged namespace at A and its `purge-ns` entry (the
+  first one found, A before its bases; v0.50), once B's grant passes A's read check there. A
+  purged schema namespace B would mirror isn't in the chain: `422 schema_unavailable` with `ref`.
 - **A base that is itself a branch.** Its read-through heads aren't in its own log, so B
   follows its `base` and `at` (proved by the id of its configuration genesis) recursively,
   fetches each base's log up to that `at`, and verifies every read-through head and its

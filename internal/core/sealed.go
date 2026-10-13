@@ -469,8 +469,8 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			if a.verified != nil && t.grantRules(a, "read", nil, t.basicEnvelope("read", KeyringName, a), false) != nil {
 				return notFound()
 			}
-			// 410 after the read check, as every URL of a purged
-			// namespace (§8.5).
+			// 410 once the read check passes, as every URL of a
+			// purged namespace (§8.5).
 			if n.purged {
 				return t.purgedNS(n)
 			}
