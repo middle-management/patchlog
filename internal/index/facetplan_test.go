@@ -395,12 +395,16 @@ func randomQuery(r *rand.Rand) url.Values {
 		x := ranges[r.IntN(len(ranges))]
 		v.Add(x[0], x[1])
 	}
+	var sorts []string
 	for range r.IntN(3) {
 		s := []string{"/s", "/t", "/u", "/a"}[r.IntN(4)]
 		if r.IntN(2) == 0 {
 			s = "-" + s
 		}
-		v.Add("sort", s)
+		sorts = append(sorts, s)
+	}
+	if len(sorts) > 0 {
+		v.Set("sort", strings.Join(sorts, ","))
 	}
 	if r.IntN(5) == 0 {
 		v.Set("q", []string{"alpha", "alph*", "beta gamma", "ärlig", "nothing"}[r.IntN(5)])

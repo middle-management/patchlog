@@ -15,6 +15,7 @@ import (
 	"os"
 	"reflect"
 	"strconv"
+	"strings"
 	"sync/atomic"
 	"testing"
 )
@@ -91,8 +92,8 @@ func randomQueryExt(r *rand.Rand) url.Values {
 		v.Add("facet[/b]", "x")
 	}
 	if r.IntN(8) == 0 {
-		v.Add("sort", "/s")
-		v.Add("sort", "-/s")
+		// keys after those randomQuery chose, one comma-separated sort
+		v.Set("sort", strings.TrimPrefix(v.Get("sort")+",/s,-/s", ","))
 	}
 	if r.IntN(8) == 0 {
 		v.Set("ref", []string{"/r/a/r001/rev/" + revA, "/r/a/r001%23e1", "/r/t/one/rev/" + revA + "%23e1"}[r.IntN(3)])

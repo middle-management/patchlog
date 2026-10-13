@@ -55,6 +55,13 @@ var validNS = client.ValidNSName
 // ns_id never changes while it is served, and a purge removes it from
 // caches, and from the kept results, through its r: tags.
 //
+// Redirects name the query in its canonical form (§A.5,
+// derived.CanonicalQuery), and an at URL is answered 200 only in that form
+// and without min: one in another form is redirected to it. A request with
+// ?min= is always redirected (§A.5): an at URL whose result already
+// includes every min to itself without min, anything else, once every min
+// is reached, to the current checkpoint.
+//
 // Private namespaces need Authorization: Bearer <grant>; a request without
 // the right gs is redirected to it.
 //
@@ -62,8 +69,7 @@ var validNS = client.ValidNSName
 // has one source, so a reader of the whole namespace gets it sealed as one
 // JWE under the namespace's current epoch key, Content-Type
 // application/jose, pl { ns, view } where view is the result's request
-// target (/[g/{gs}/]{ns}/at/{ns_id}?{query}; an at URL whose query isn't in
-// the canonical form the redirects give is redirected to it). A reader
+// target (/[g/{gs}/]{ns}/at/{ns_id}?{query}, the canonical form). A reader
 // whose grant restricts resources may hold only per-resource keys, so it
 // gets JSON { at, ns, hits, next? } in which each hit keeps resource, id
 // and url in the clear and carries its score, schema and facets as
@@ -212,22 +218,6 @@ func base(a *access, ns string) string {
 	return "/g/" + a.gs + "/" + ns
 }
 
-// encodeQuery encodes the query canonically (sorted keys), without min.
-func encodeQuery(v url.Values, drop ...string) string {
-	c := url.Values{}
-	for k, vals := range v {
-		c[k] = vals
-	}
-	for _, d := range drop {
-		delete(c, d)
-	}
-	s := c.Encode()
-	if s == "" {
-		return ""
-	}
-	return "?" + s
-}
-
 func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string, isAt bool) {
 	ctx := r.Context()
 	if reason := ix.keys.Skipped(ns); reason != "" {
@@ -292,7 +282,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			target += "/at/" + at
 		}
 		setPtrHeaders()
-		redirect(w, target+encodeQuery(vals))
+		redirect(w, target+derived.CanonicalQuery(vals))
 		return
 	}
 	for i, m := range q.Mins {
@@ -303,6 +293,17 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			writeErr(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow")
 			return
 		}
+	}
+	// target is the canonical URL of this query's result at an ns_id (§A.5):
+	// what redirects name, what results are kept under, and in a sealed or
+	// e2e namespace the view a result is bound to (§E.2.6).
+	target := func(id string) string { return base(a, ns) + "/at/" + id + derived.CanonicalQuery(vals, "min") }
+	// min always redirects (§A.5): an at that already includes every min
+	// to itself without min, before any wait.
+	if isAt && len(q.Mins) > 0 && ix.atIncludes(ctx, ns, at, q.Mins, target(at)) {
+		setPtrHeaders()
+		redirect(w, target(at))
+		return
 	}
 	if !ix.waitMins(ctx, q.Mins) {
 		w.Header().Set("Cache-Control", "no-store")
@@ -329,16 +330,14 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached the namespace yet")
 		return
 	}
-	// target is the canonical URL of this query's result at an ns_id: what
-	// redirects name, what results are kept under, and in a sealed or e2e
-	// namespace the view a result is bound to (§E.2.6).
-	target := func(id string) string { return base(a, ns) + "/at/" + id + encodeQuery(vals, "min") }
-	if isAt && (at == cur || len(q.Mins) == 0) {
+	// Only the canonical form of an at URL is answered (§A.5), and never
+	// one with min (above).
+	canonical := r.URL.RequestURI() == target(at)
+	if isAt && len(q.Mins) == 0 {
 		// A kept result answers its at however far the checkpoint has
-		// moved since (B9); with ?min=, only the current one, which min
-		// was waited for.
-		if st, bound, ok := ix.kept.Get(target(at)); ok {
-			if bound && r.URL.RequestURI() != target(at) {
+		// moved since (B9).
+		if st, _, ok := ix.kept.Get(target(at)); ok {
+			if !canonical {
 				setPtrHeaders()
 				redirect(w, target(at))
 				return
@@ -347,12 +346,13 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			return
 		}
 	}
-	if !isAt || at != cur {
-		// Head pointer, or an ns_id whose result isn't kept: redirect to the
-		// current checkpoint (§A.7's second question resolved as redirect,
-		// as §A.4 shows), with the result computed there and kept, so the
-		// redirect is answered even if the checkpoint moves on before it is
-		// followed. If it can't be computed, the at URL says why.
+	if !isAt || at != cur || len(q.Mins) > 0 {
+		// Head pointer, an ns_id whose result isn't kept, or a min waited
+		// for: redirect to the current checkpoint (§A.7's second question
+		// resolved as redirect, as §A.4 shows; §A.5), with the result
+		// computed there and kept, so the redirect is answered even if the
+		// checkpoint moves on before it is followed. If it can't be
+		// computed, the at URL says why.
 		to := cur
 		if _, _, ok := ix.kept.Get(target(cur)); !ok {
 			if info, key, err := ix.keys.Current(ctx, ns); err == nil {
@@ -368,6 +368,11 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		redirect(w, target(to))
 		return
 	}
+	if !canonical {
+		setPtrHeaders()
+		redirect(w, target(at))
+		return
+	}
 
 	info, key, err := ix.keys.Current(ctx, ns)
 	if err != nil {
@@ -377,12 +382,6 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return
 	}
 	if info.Protected() {
-		// Only the canonical form of a sealed result's URL is served.
-		if r.URL.RequestURI() != target(at) {
-			setPtrHeaders()
-			redirect(w, target(at))
-			return
-		}
 		gen := ix.kept.Generation(ns)
 		if st, ok := ix.sealed.Get(ctx, target(at)); ok {
 			st, _ = ix.kept.Put(target(at), ns, gen, true, st)
@@ -439,7 +438,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	if err != nil {
 		return derived.Stored{}, "", err
 	}
-	view := derived.View{NS: ns, Target: base(a, ns) + "/at/" + at + encodeQuery(vals, "min")}
+	view := derived.View{NS: ns, Target: base(a, ns) + "/at/" + at + derived.CanonicalQuery(vals, "min")}
 	body := map[string]any{"at": at, "ns": ns}
 	hits := make([]any, 0, len(res.Hits))
 	for _, h := range res.Hits {
@@ -495,7 +494,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 			nv[k] = v
 		}
 		nv.Set("after", strconv.Itoa(q.After+len(res.Hits)))
-		body["next"] = base(a, ns) + "/at/" + at + encodeQuery(nv, "min")
+		body["next"] = base(a, ns) + "/at/" + at + derived.CanonicalQuery(nv, "min")
 	}
 	if res.Counts != nil {
 		body["counts"] = res.Counts
@@ -623,6 +622,52 @@ func (ix *Index) committed(ctx context.Context, ns string) (string, error) {
 // countsTag tags results with facet counts, which can reflect any resource
 // of the namespace.
 func countsTag(ns string) string { return "idx:" + ns + ":counts" }
+
+// atIncludes reports whether a result of ns at at, which url names,
+// already includes every min (§A.5 "min always redirects"): each names
+// ns (a min of another followed namespace never is: the result reflects
+// ns alone) and is at itself, or an ns_id the core's log places before at
+// (since=min is accepted only if min is in the chain up to at, §7.1). Only
+// an at the index answers counts, the current one or one whose result is
+// kept: any other is one it no longer keeps results for, which redirects
+// to the current checkpoint anyway (§A.4).
+func (ix *Index) atIncludes(ctx context.Context, ns, at string, mins []MinRef, url string) bool {
+	for _, m := range mins {
+		if m.NS != ns {
+			return false
+		}
+	}
+	// Every min applied, then at still the committed checkpoint: at is
+	// past them (seen is committed with each apply).
+	seen := true
+	for _, m := range mins {
+		if m.ID != at && !ix.seen(ctx, ns, m.ID) {
+			seen = false
+		}
+	}
+	cur, err := ix.committed(ctx, ns)
+	switch {
+	case err != nil:
+		return false
+	case cur == at && seen:
+		return true
+	case cur != at:
+		if _, _, ok := ix.kept.Get(url); !ok {
+			return false
+		}
+	}
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+	for _, m := range mins {
+		if m.ID == at {
+			continue
+		}
+		if _, _, err := ix.c.NSLogPage(ctx, ns, at, m.ID); err != nil {
+			return false
+		}
+	}
+	return true
+}
 
 // waitMins waits, within one MinWait budget, until every min is reached.
 func (ix *Index) waitMins(ctx context.Context, mins []MinRef) bool {

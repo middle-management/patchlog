@@ -855,7 +855,8 @@ forwarded, cookies and the service's CORS headers dropped, redirects rewritten u
 one URL; it waits up to two minutes for an answer, since a `?min=` query waits for the index to
 catch up. The tab picks a namespace (the ones the index's `/_status` lists, or any name), takes `q`
 and, under "Filters", the `schema`, facet and range filters (`/league=cup`, `/kickoff>=2026-10-10`,
-or the raw `facet[/league]=cup`), `sort`, `counts` and `limit`, and shows each hit's resource,
+or the raw `facet[/league]=cup`), `sort` (keys comma-separated, sent as one parameter), `counts`
+and `limit`, and shows each hit's resource,
 `$schema`, score, facets and revision, with the checkpoint (`at`) the index redirected the query to
 (the browser follows that redirect through the proxy). A resource name opens in the Resource tab;
 a facet chip or count adds a filter; "More results" follows `next` (for a `ref=` query without `q`
@@ -980,7 +981,17 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   current checkpoint. So a query takes one redirect from the head pointer, and at most two from
   an older `at`, at any write rate. A purge drops the kept results that show what it purged.
 - `?min={ns_id}` waits for your own write to be indexed, and answers 503 if it isn't in time.
-  With it, an older `at` redirects to the current checkpoint even while its result is kept.
+  It always redirects (v0.50, §A.5), so a `200` never carries `min`: an `at` URL whose result
+  already includes every `min` (the current one, or a kept one whose `at` the log places at or
+  after them) to itself without `min`, anything else, once `min` is reached, to the current
+  checkpoint. A `min` naming another namespace the index follows is never included in a
+  result of `{ns}`.
+- Redirects give the query in one canonical form (v0.50, §A.5): parameters sorted by name, then
+  value, as UTF-8 bytes, and every byte but letters, digits and `-._~` percent-encoded in
+  uppercase hex (a space is `%20`, never `+`). An `at` URL is answered `200` only in that form,
+  and redirected to it otherwise; `next` URLs are built in it. Since that form sorts repeated
+  values, a multi-key sort is one parameter with comma-separated keys,
+  `sort=-/kickoff,/title`; a repeated `sort` is `400`.
 - `?ref=` answers "who uses this?" (§A.4): the documents of `{ns}` that reference a resource through
   a schema's `x-ref`, found by walking each typed document with the schema revision it pins, with
   no `x-index` needed. `?ref=/r/logic/route-3` matches any form, `/r/logic/route-3/rev/{id}` only
@@ -1005,16 +1016,19 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
     empty set's `gs`.
   - It leaves out namespaces the index hasn't reached yet, purged ones, and sealed or e2e ones
     whose keys it doesn't hold. `min` takes `{ns}:{ns_id}`, repeatable, and is `400` for a
-    namespace the answer doesn't cover; on an `at` URL, a kept answer whose `at` already
-    includes every `min` is `200`, otherwise it waits and redirects (`503` if not in time).
+    namespace the answer doesn't cover. It always redirects (v0.50): on an `at` URL whose
+    kept answer already includes every `min`, to that URL without `min`; otherwise it waits
+    (`503` if not in time) and redirects to the current `at`.
     Only a reader who may see none of the namespaces gets `401` or `403`. A namespace document
-    the index can't read is `502` for a namespace the grant names; any other is left out, as a
-    private one.
+    the index can't read is `502` for a namespace the grant names; any other is left out, as
+    one the reader can't see.
   - Hits are `?ref=` hits with their `ns`, filtered per resource, in byte order of namespace,
     then resource name. A page holds `limit` hits after `after`, given as `{ns}/{name}`, and
     `next` is the following page's `after`, to set on the `at` URL. Hits from sealed and e2e
-    namespaces are sealed per entry, and such answers are served only at their canonical URL.
-    Answers are kept as above. Delete guards built on it remain advisory.
+    namespaces are sealed per entry. Answers, like every result, are served only at their
+    canonical URL, so `after` set on an `at` URL takes one redirect unless the client builds
+    the canonical form itself. Answers are kept as above. Delete guards built on it remain
+    advisory.
 - Schema documents (whose `$schema` is a dialect URL) are indexed too: `?schema=https://json-schema.org/draft/2020-12/schema`
   lists them, and the revision paths of `$ref` keywords at schema positions (fragment dropped; not
   those inside `const`, `enum`, `default` or `examples`) count as references, so
@@ -1649,8 +1663,10 @@ the one at the `at` a redirect names included, is kept in memory for about a min
 64 MiB per catalog), and an `at` URL answers `200` while its listing is kept, so one redirect
 suffices at any write rate. They are keyed by their URL and by what the reader reads whole, so a
 reader whose namespace-wide reads changed since (a public namespace turned private) isn't served
-one kept from before; listings that depend on the individual reader aren't kept, and sealed ones
-are served only at their canonical URL. A purge drops the kept listings that show what it purged.
+one kept from before; listings that depend on the individual reader aren't kept. Every listing is
+served only at its canonical URL, the query in the search index's canonical form (v0.50, §A.5),
+and other forms are redirected to it; a `children` listing's `next` is in that form. A purge drops
+the kept listings that show what it purged.
 
 With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 - `POST /grants` with `{ "node", "want": ["create"], "to": [folders] }` creates a folder
@@ -1710,7 +1726,10 @@ edge grants: the service decides `all` per request.
 Read-your-writes: after its own write, a client relists with `?min={ns}:{ns_id}` from the write's
 `X-Namespace-Revision` (repeatable, the catalog or any content namespace it trusts), which is a new
 URL past any cached head pointer and waits for the service to catch up (`503` with `Retry-After`
-otherwise), instead of fetching with `no-store` (§B.5, §A.5).
+otherwise), instead of fetching with `no-store` (§B.5, §A.5). As in the search index, `min`
+always redirects (v0.50): an `at` URL whose listing already includes every `min` (the current
+`at`, or a kept one whose checkpoints show it) to itself without `min`, anything else to the
+current `at`. A bare `{ns_id}` never counts as included in an older `at`.
 - `POST /merge-grants` checks a catalog branch's merge batch for the approver and signs one grant
   covering exactly that batch with the merge key, for the merge service only (`-merge-key`,
   `-merge-kid`, `-merge-service`, `-merge-ttl`; without a merge key it is refused); see

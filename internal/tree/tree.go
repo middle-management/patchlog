@@ -152,6 +152,9 @@ type Service struct {
 	sealed  *derived.Cache // sealed listings
 	kept    *kept.Store    // listings kept past their at
 
+	amu sync.Mutex
+	ats map[string]atRecord // the checkpoints behind the ats of kept listings (atIncludes)
+
 	wmu sync.Mutex // serialises applies across followers
 
 	mu      sync.RWMutex // guards g, cur, purged

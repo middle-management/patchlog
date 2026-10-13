@@ -3318,7 +3318,9 @@ function srParams(ns) {
   if (q) p.set('q', q);
   if ($('srSchema').value.trim()) p.set('schema', $('srSchema').value.trim());
   for (const [k, v] of srFilters($('srFilters').value)) p.append(k, v);
-  for (const s of $('srSort').value.split(',').map((x) => x.trim()).filter(Boolean)) p.append('sort', s);
+  // One sort, keys comma-separated: the canonical form sorts repeated values (§A.5).
+  const sorts = $('srSort').value.split(',').map((x) => x.trim()).filter(Boolean);
+  if (sorts.length) p.set('sort', sorts.join(','));
   for (const c of $('srCounts').value.split(',').map((x) => x.trim()).filter(Boolean)) p.append('counts', c);
   if ($('srLimit').value.trim()) p.set('limit', $('srLimit').value.trim());
   const w = WRITES.get(ns);
@@ -3355,14 +3357,28 @@ async function srGet(path, ns) {
   return { r, view, body };
 }
 
+/* canonQuery is the canonical form of a query (§A.5): parameters sorted by name, then value, comparing UTF-8 bytes,
+ * and every byte but ALPHA, DIGIT and -._~ percent-encoded in uppercase hex, so a URL built with it needs no redirect. */
+function canonQuery(params) {
+  const te = new TextEncoder();
+  const cmp = (a, b) => {
+    const x = te.encode(a), y = te.encode(b);
+    for (let i = 0; i < x.length && i < y.length; i++) if (x[i] !== y[i]) return x[i] - y[i];
+    return x.length - y.length;
+  };
+  const esc = (s) => encodeURIComponent(s).replace(/[!'()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase());
+  const ps = [...params].sort((a, b) => cmp(a[0], b[0]) || cmp(a[1], b[1]));
+  return ps.length ? '?' + ps.map(([k, v]) => esc(k) + '=' + esc(v)).join('&') : '';
+}
+
 /* srNextPath is the URL of the page after a result at view: next itself, or for a ref query without q or sort, which
- * pages by name (§A.4), view with next as its after. */
+ * pages by name (§A.4), view with next as its after, in the canonical form. */
 function srNextPath(view, next) {
   if (next.startsWith('/')) return INDEX + next;
   const [p, qs] = view.split('?');
   const u = new URLSearchParams(qs || '');
   u.set('after', next);
-  return `${INDEX}${p}?${u}`;
+  return INDEX + p + canonQuery(u);
 }
 
 /* runSearch queries the namespace in the page's fields, or fetches the next page of the last result. */
