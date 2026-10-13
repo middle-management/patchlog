@@ -8,6 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"math"
 	"net/http"
 	"regexp"
@@ -36,6 +37,8 @@ import (
 // key checks a request as Check does; without one the origin checks it
 // itself. The key is the deployment's: given on its own, or derived from
 // the edge secret (KeyFromSecret), so the edge and the origin share it.
+// Cookies may hold several keys, minting with the newest and accepting
+// any, so a key is rotated without making clients exchange again (§C.5).
 
 // CookiePrefix starts the name of every edge-grant cookie. The __Secure-
 // prefix makes browsers refuse it without Secure.
@@ -58,15 +61,21 @@ type Claims struct {
 	Exp    int64
 }
 
-// Cookies issues and verifies edge-grant cookies under one key.
+// Cookies issues edge-grant cookies under the newest of its keys and
+// verifies them under any it holds (§C.5 "Format").
 type Cookies struct {
-	kid string
-	key []byte
+	keys []cookieKey // oldest first: the last mints
 	// SameSite is the cookies' SameSite attribute: None when pages on
 	// other origins call with credentials (§C.5), else Lax.
 	SameSite http.SameSite
 	// TTL caps an edge grant's lifetime (MaxGrantTTL if zero).
 	TTL time.Duration
+}
+
+// cookieKey is a key and the kid naming it.
+type cookieKey struct {
+	kid string
+	key []byte
 }
 
 // NewCookies returns a Cookies with key, named kid (DefaultKid if empty),
@@ -82,11 +91,51 @@ func NewCookies(kid string, key []byte) *Cookies {
 			panic(err)
 		}
 	}
-	return &Cookies{kid: kid, key: append([]byte(nil), key...), SameSite: http.SameSiteLaxMode}
+	return &Cookies{keys: []cookieKey{{kid, append([]byte(nil), key...)}}, SameSite: http.SameSiteLaxMode}
 }
 
-// Kid names the key the cookies are issued and verified under.
-func (c *Cookies) Kid() string { return c.kid }
+// AddKey adds key, named kid, as the newest: c mints with it from then on
+// and still accepts the cookies of the keys it held before (§C.5
+// "Format"). A key is rotated by adding the next one to the edges first,
+// then to the minter, and dropping the old one once its cookies have
+// expired, MaxGrantTTL after the minter took the next. AddKey is for
+// setting c up, before it is in use. An empty kid or key, or a kid c
+// holds already, is an error.
+func (c *Cookies) AddKey(kid string, key []byte) error {
+	switch {
+	case kid == "":
+		return errors.New("edge-grant key: empty kid")
+	case len(key) == 0:
+		return fmt.Errorf("edge-grant key %q: empty", kid)
+	case c.key(kid) != nil:
+		return fmt.Errorf("edge-grant key %q: held already", kid)
+	}
+	c.keys = append(c.keys, cookieKey{kid, append([]byte(nil), key...)})
+	return nil
+}
+
+// Kid names the newest key, which the cookies are issued under.
+func (c *Cookies) Kid() string { return c.keys[len(c.keys)-1].kid }
+
+// Kids name the keys the cookies are verified under, oldest first, so
+// the last is Kid.
+func (c *Cookies) Kids() []string {
+	out := make([]string, len(c.keys))
+	for i, k := range c.keys {
+		out[i] = k.kid
+	}
+	return out
+}
+
+// key is the key named kid, nil if c holds none.
+func (c *Cookies) key(kid string) []byte {
+	for _, k := range c.keys {
+		if k.kid == kid {
+			return k.key
+		}
+	}
+	return nil
+}
 
 // KeyFromSecret derives the edge-grant key from the edge secret, so a
 // verifying edge configured with the secret can verify the cookies.
@@ -127,14 +176,15 @@ func Name(prefix string) string {
 }
 
 // Issue returns the Set-Cookie of an edge grant issued at now, under c's
-// key and kid (cl.Kid is ignored).
+// newest key and its kid (cl.Kid is ignored).
 func (c *Cookies) Issue(cl Claims, now time.Time) *http.Cookie {
+	k := c.keys[len(c.keys)-1]
 	p := base64.RawURLEncoding.EncodeToString(jsonv.Canonical(map[string]any{
-		"exp": float64(cl.Exp), "kid": c.kid, "p": cl.Prefix,
+		"exp": float64(cl.Exp), "kid": k.kid, "p": cl.Prefix,
 	}))
 	return &http.Cookie{
 		Name:     Name(cl.Prefix),
-		Value:    p + "." + base64.RawURLEncoding.EncodeToString(c.mac(p)),
+		Value:    p + "." + base64.RawURLEncoding.EncodeToString(mac(k.key, p)),
 		Path:     cl.Prefix,
 		Expires:  time.Unix(cl.Exp, 0).UTC(),
 		MaxAge:   int(time.Unix(cl.Exp, 0).Sub(now).Seconds()),
@@ -144,9 +194,9 @@ func (c *Cookies) Issue(cl Claims, now time.Time) *http.Cookie {
 	}
 }
 
-// mac is HMAC-SHA256 under c's key of a value's first part.
-func (c *Cookies) mac(p string) []byte {
-	m := hmac.New(sha256.New, c.key)
+// mac is HMAC-SHA256 under key of a value's first part.
+func mac(key []byte, p string) []byte {
+	m := hmac.New(sha256.New, key)
 	m.Write([]byte(p))
 	return m.Sum(nil)
 }
@@ -162,7 +212,7 @@ func parse(value string) (*Claims, string, []byte, error) {
 	if !ok {
 		return nil, "", nil, errBadCookie
 	}
-	mac, err := base64.RawURLEncoding.Strict().DecodeString(macText)
+	sum, err := base64.RawURLEncoding.Strict().DecodeString(macText)
 	if err != nil {
 		return nil, "", nil, errBadCookie
 	}
@@ -181,17 +231,18 @@ func parse(value string) (*Claims, string, []byte, error) {
 	if len(m) != 3 || !kidOK || !pOK || !expOK || exp != math.Trunc(exp) || math.Abs(exp) > jsonv.MaxSafeInteger {
 		return nil, "", nil, errBadCookie
 	}
-	return &Claims{Kid: kid, Prefix: prefix, Exp: int64(exp)}, p, mac, nil
+	return &Claims{Kid: kid, Prefix: prefix, Exp: int64(exp)}, p, sum, nil
 }
 
-// verify checks parsed claims at now: c's kid, which vouches only for the
-// core prefixes, and a valid MAC, compared in constant time (check 4 of
-// §C.5); exp in the future (check 5).
-func (c *Cookies) verify(cl *Claims, p string, mac []byte, now time.Time) error {
-	if _, _, ok := ParsePrefix(cl.Prefix); !ok || cl.Kid != c.kid {
+// verify checks parsed claims at now: a kid c holds, which vouches only
+// for the core prefixes, and a valid MAC under its key, compared in
+// constant time (check 4 of §C.5); exp in the future (check 5).
+func (c *Cookies) verify(cl *Claims, p string, sum []byte, now time.Time) error {
+	key := c.key(cl.Kid)
+	if _, _, ok := ParsePrefix(cl.Prefix); !ok || key == nil {
 		return errBadCookie
 	}
-	if !hmac.Equal(mac, c.mac(p)) {
+	if !hmac.Equal(sum, mac(key, p)) {
 		return errBadCookie
 	}
 	if now.Unix() >= cl.Exp {
@@ -201,13 +252,13 @@ func (c *Cookies) verify(cl *Claims, p string, mac []byte, now time.Time) error 
 }
 
 // Verify checks a cookie value at now (§C.5 "Format"): its claims, its kid
-// and prefix, its MAC and its expiry.
+// (any c holds) and prefix, its MAC under that kid's key and its expiry.
 func (c *Cookies) Verify(value string, now time.Time) (*Claims, error) {
-	cl, p, mac, err := parse(value)
+	cl, p, sum, err := parse(value)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.verify(cl, p, mac, now); err != nil {
+	if err := c.verify(cl, p, sum, now); err != nil {
 		return nil, err
 	}
 	return cl, nil
@@ -265,7 +316,7 @@ func CanonicalPath(path string) bool {
 //  1. the method is GET or HEAD;
 //  2. the path has no empty, "." or ".." segment and no percent-escape;
 //  3. a cookie whose name is derived from its own p (others are ignored);
-//  4. c's kid, which vouches for p, and a valid MAC;
+//  4. a kid c holds, which vouches for p, and a valid MAC;
 //  5. exp is in the future;
 //  6. p covers the path segment by segment.
 //
@@ -294,11 +345,11 @@ func (c *Cookies) check(r *http.Request, now time.Time) *Claims {
 		if !strings.HasPrefix(ck.Name, CookiePrefix) {
 			continue
 		}
-		cl, p, mac, err := parse(ck.Value)
+		cl, p, sum, err := parse(ck.Value)
 		if err != nil || ck.Name != Name(cl.Prefix) {
 			continue
 		}
-		if c.verify(cl, p, mac, now) != nil || !Covers(cl.Prefix, path) {
+		if c.verify(cl, p, sum, now) != nil || !Covers(cl.Prefix, path) {
 			continue
 		}
 		return cl

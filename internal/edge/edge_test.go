@@ -7,9 +7,9 @@ import (
 )
 
 // §9: a private response gets edge lifetimes only for a read the edge
-// verified itself: the secret, exactly one prefix covering the URL, and
-// no other credential. Everything else private is no-store, with or
-// without a Verifier.
+// verified itself: the secret and a prefix covering the URL, each as
+// exactly one header line without a comma, and no other credential.
+// Everything else private is no-store, with or without a Verifier.
 func TestVerifierPrivate(t *testing.T) {
 	v, err := New([]byte("s3cret"), "", "")
 	if err != nil {
@@ -32,6 +32,14 @@ func TestVerifierPrivate(t *testing.T) {
 		{"prefix only", "/r/demo/derby", http.Header{"X-Edge-Prefix": {"/r/demo"}}, false},
 		{"empty prefix", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret"}, "X-Edge-Prefix": {""}}, false},
 		{"two prefixes", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret"}, "X-Edge-Prefix": {"/r/demo", "/r/demo/derby"}}, false},
+		// Each header is exactly one line without a comma (§9, §C.5).
+		{"the same prefix twice", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret"}, "X-Edge-Prefix": {"/r/demo", "/r/demo"}}, false},
+		{"prefixes in one line", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret"}, "X-Edge-Prefix": {"/r/demo,/r/demo/derby"}}, false},
+		{"a prefix and a comma", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret"}, "X-Edge-Prefix": {"/r/demo/derby,"}}, false},
+		{"the secret twice", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret", "s3cret"}, "X-Edge-Prefix": {"/r/demo"}}, false},
+		{"the secret and another", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret", "x"}, "X-Edge-Prefix": {"/r/demo"}}, false},
+		{"secrets in one line", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret, s3cret"}, "X-Edge-Prefix": {"/r/demo"}}, false},
+		{"the secret and a comma", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret,"}, "X-Edge-Prefix": {"/r/demo"}}, false},
 		{"another resource", "/r/demo/derby", http.Header{"X-Edge-Verified": {"s3cret"}, "X-Edge-Prefix": {"/r/demo/other"}}, false},
 		{"not by segment", "/r/demo-x/a", http.Header{"X-Edge-Verified": {"s3cret"}, "X-Edge-Prefix": {"/r/demo"}}, false},
 		{"another kind", "/ns/demo", http.Header{"X-Edge-Verified": {"s3cret"}, "X-Edge-Prefix": {"/r/demo"}}, false},
@@ -76,7 +84,8 @@ func TestVerifierPrivate(t *testing.T) {
 	if !v.VerifiedRead(r) {
 		t.Error("not verified with the configured headers")
 	}
-	for _, tc := range [][3]string{{"", "", ""}, {"s", "x-a", "X-A"}} {
+	// A secret with a comma could never come as one line without one.
+	for _, tc := range [][3]string{{"", "", ""}, {"s", "x-a", "X-A"}, {"s3,cret", "", ""}} {
 		if _, err := New([]byte(tc[0]), tc[1], tc[2]); err == nil {
 			t.Errorf("New(%q, %q, %q) accepted", tc[0], tc[1], tc[2])
 		}

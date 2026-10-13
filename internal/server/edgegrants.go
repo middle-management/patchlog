@@ -15,10 +15,11 @@ import (
 )
 
 // WithEdgeGrants enables POST /edge-grants (§C.5): grants are exchanged
-// for edge grants as cookies, issued and verified with c. Without it the
-// origin still issues them, named edge.DefaultKid, under a key derived
-// from the edge secret (WithEdge) if there is one, else a random key of
-// this process.
+// for edge grants as cookies, issued with c's newest key and verified
+// with any it holds, so its keys rotate (edge.Cookies.AddKey). Without
+// it the origin still issues them, named edge.DefaultKid, under a key
+// derived from the edge secret (WithEdge) if there is one, else a random
+// key of this process.
 func WithEdgeGrants(c *edge.Cookies) Option { return func(s *Server) { s.cookies = c } }
 
 type edgeGrantKey struct{}

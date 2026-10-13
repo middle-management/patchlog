@@ -290,3 +290,83 @@ func TestParsePrefix(t *testing.T) {
 		}
 	}
 }
+
+// Cookies hold several keys, mint with the newest and accept any (§C.5
+// "Format"): a key is rotated by adding the next to the edges, then to
+// the minter, and dropping the old one once its cookies have expired,
+// and no client exchanges again.
+func TestCookiesRotate(t *testing.T) {
+	now := time.Unix(1790000000, 0)
+	next := []byte("the next key, 32 bytes long.....")
+	cl := Claims{Prefix: "/r/demo/derby", Exp: 1790000900}
+	old := NewCookies("k1", testKey)
+	if old.Kid() != "k1" || strings.Join(old.Kids(), " ") != "k1" {
+		t.Fatalf("kids %q %v", old.Kid(), old.Kids())
+	}
+	before := old.Issue(cl, now)
+
+	// The edges first: they hold both keys, and still accept the old
+	// cookies, which the minter goes on minting until it takes the next.
+	edge := NewCookies("k1", testKey)
+	if err := edge.AddKey("k2", next); err != nil {
+		t.Fatal(err)
+	}
+	if edge.Kid() != "k2" || strings.Join(edge.Kids(), " ") != "k1 k2" {
+		t.Fatalf("kids %q %v", edge.Kid(), edge.Kids())
+	}
+	if _, err := edge.Verify(before.Value, now); err != nil {
+		t.Fatalf("old cookie at the edge: %v", err)
+	}
+
+	// Then the minter, which mints with the newest and accepts both.
+	minter := NewCookies("k1", testKey)
+	if err := minter.AddKey("k2", next); err != nil {
+		t.Fatal(err)
+	}
+	after := minter.Issue(cl, now)
+	if got, err := minter.Verify(after.Value, now); err != nil || got.Kid != "k2" {
+		t.Fatalf("new cookie: %v %v", got, err)
+	}
+	if after.Name != before.Name || after.Value == before.Value {
+		t.Fatalf("cookies %s=%s and %s=%s", before.Name, before.Value, after.Name, after.Value)
+	}
+	for name, c := range map[string]*Cookies{"edge": edge, "minter": minter} {
+		for _, ck := range []*http.Cookie{before, after} {
+			r := httptest.NewRequest("GET", "/r/demo/derby", nil)
+			r.AddCookie(&http.Cookie{Name: ck.Name, Value: ck.Value})
+			if p, ok := c.Check(r, now); !ok || p != "/r/demo/derby" {
+				t.Errorf("%s: check %s: %q %v", name, ck.Value, p, ok)
+			}
+		}
+	}
+	// An edge holding only the old key refuses the new cookies, which is
+	// why the edges take the next key first.
+	if _, err := old.Verify(after.Value, now); err == nil {
+		t.Error("new cookie verified under the old key alone")
+	}
+	// Once the old cookies have expired, the old key is dropped: its
+	// cookies no longer verify, the next key's still do.
+	dropped := NewCookies("k2", next)
+	if _, err := dropped.Verify(before.Value, now); err == nil {
+		t.Error("old cookie verified after the old key was dropped")
+	}
+	if _, err := dropped.Verify(after.Value, now); err != nil {
+		t.Errorf("new cookie after the old key was dropped: %v", err)
+	}
+	// A kid names one key: a cookie naming k1 signed with k2's key fails.
+	forged := sign(next, `{"exp":1790000900,"kid":"k1","p":"/r/demo/derby"}`)
+	if _, err := minter.Verify(forged, now); err == nil {
+		t.Error("k1 cookie verified under k2's key")
+	}
+	for _, tc := range []struct {
+		kid string
+		key []byte
+	}{{"", next}, {"k3", nil}, {"k1", next}, {"k2", testKey}} {
+		if err := minter.AddKey(tc.kid, tc.key); err == nil {
+			t.Errorf("AddKey(%q, %q) accepted", tc.kid, tc.key)
+		}
+	}
+	if minter.Kid() != "k2" || len(minter.Kids()) != 2 {
+		t.Errorf("kids after refused adds: %v", minter.Kids())
+	}
+}
