@@ -6,7 +6,10 @@ canonical text of the specification is maintained outside this repository;
 text doesn't yet describe are collected for its writer in
 [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) — when the two disagree, the
 reference and this README are what implementations are measured against, and the
-mirror follows.
+mirror follows. References to D.x (storage layout, write path, snapshots, Postgres) are to
+Addendum D of spec v0.49 and earlier, the Bun prototype's notes, which v0.50 moved out of the
+spec into the prototype's `PROTOTYPE.md`; this implementation still follows them, as its own
+choices under §5.
 
 Each resource is an append-only log of content-addressed JSON Patch sets. The server
 validates documents that opt in with `$schema`, enforces namespace rules and grants,
@@ -39,7 +42,7 @@ and serves immutable, CDN-cacheable revisions.
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
 | Bundles: history and snapshot export and import, sealed bundles, access levels, e2e ciphertext | §G.4, §G.5.1 | ✅ (`patchlog export/import`) |
-| Storage layout | Addendum D.2 | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
+| Storage layout | §5 (D.2) | ✅ SQLite (pure Go, `modernc.org/sqlite`) |
 | Encryption at rest, cryptographic purge | Addendum E.1 | ✅ (local master key file; KMS adapters to come) |
 | Sealed for delivery: epoch keys, JWE responses, `POST /ns/{ns}/keys`, rotation, `$nonce` | Addendum E.2 | ✅ (client library decrypts; other consumers don't re-seal yet) |
 | End-to-end: sealed patch sets, header checks, blind rules, fold reads, keyring relay, sealed prune snapshots | Addendum E.3 | ✅ (client library seals, folds, validates and administers keyrings; merge refuses; export and remote branches carry ciphertext) |
@@ -458,7 +461,7 @@ go build -tags grpcnotrace -o patchlog ./cmd/patchlog   # the tag only trims the
 ./patchlog serve -db prod.db -origin https://cms.example -operator-key <PUBLIC>
 ```
 
-### Postgres (Addendum D.8)
+### Postgres (D.8)
 
 SQLite is the default. Give `-db` a Postgres URL instead of a file (or set `PATCHLOG_DB`, which
 keeps the password out of the process arguments), and the core stores everything there:
@@ -2430,7 +2433,7 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `prefix` on `DELETE /edge-grants`, the one that may repeat), and answers anything else, a
   repeated parameter or another flag value with `400 bad_input`, `no-store`, before
   authentication.
-- **`GET /`** answers `{ "spec": "0.49", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /`** answers `{ "spec": "0.50", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace

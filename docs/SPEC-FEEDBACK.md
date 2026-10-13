@@ -1,91 +1,160 @@
 # Reference-implementation notes for the spec writer
 
-`docs/SPEC.md` mirrors the canonical specification, now at **v0.49**. This file collects what
+`docs/SPEC.md` mirrors the canonical specification, now at **v0.50**. This file collects what
 the reference does that the text doesn't yet describe.
 
 ## Open
 
-From implementing v0.49. Each gives what the reference chose.
+From implementing v0.50. Each gives what the reference chose.
 
-1. **Which `head` edge-grant issuance's `410` carries** (§8.5, §C.5). The all-or-nothing answer
-   is `410 purged` only when every refused namespace is purged, but a grant may name several,
-   each with its own `purge-ns` entry. The reference gives the `head` of the first one the
-   grant's root block names. *Propose:* say which, or add `ns` to the body.
-2. **Retrying the creation of a branch since purged** (§7.6, §8.5). §7.6 answers a retry by the
-   same principal with the same `at` and `patches` `200`, and §8.5 keeps a purged name
-   reserved. The reference answers `412`, to the creator too: the branch the retry would name
-   no longer exists. *Propose:* say that the retry rule doesn't outlive a purge.
-3. **A remote branch of a purged base** (§G.3, §8.5). Creating a remote branch on B whose base
-   on A, or a base of it, is purged answers `410` with `code: "gone"`: it isn't a write to a
-   purged namespace on B. *Question:* should it be `purged`, with A's `purge-ns` entry as
-   `head`, as for a local branch of a purged base?
-4. **What "after the read check" covers** (§8.5, §7.4, §E.2.3). The reference answers a purged
-   namespace's `410` only once the grant's rules have been applied too: `404` for a grant whose
-   rules refuse the read (at E3, the keyring's), `403` at `/keys` for one that reads neither
-   unrestricted nor per resource. The gestures listing of a purged sealed or e2e namespace is
-   `410`, not `404 not_offered`. *Propose:* say the full read check, and `purged` first.
-5. **Upstream appends as "existing dependencies"** (§G.4.4). Batches that change existing
-   dependencies are dry-run first. The reference dry-runs later batches that move heads the
-   target had (fast-forwards, resolved conflicts, restores), but not a snapshot's next diffs
-   upstream: live references see only pinned upstream revisions, not its heads, and the next
-   import picks up a diff whose target batch didn't follow. *Propose:* say they aren't.
-6. **Dry-running a promotion end to end** (§G.4.4 "Partial failure"). A dry run sees only what
-   is committed, so a later batch that depends on earlier, unsubmitted ones can't be checked
-   alone. The reference's `-dry-run` dry-runs each later batch that moves heads the target
-   had, reports failures that only need earlier batches written as deferred, and skips one
-   that goes on with a chain an earlier batch cut. *Question:* is that "end to end", or should
-   a tool submit such a promotion as one batch where the limits allow?
-7. **Writers limited to some resources** (§11.2, §C.5, §C.7, §E.2). They can't read the
-   namespace document, so they don't know its encryption level either; the reference takes it
-   as unknown and adds nonces. In sealed and e2e namespaces they can't undo at all: there is
-   no gestures listing, and the namespace log needs unrestricted read. *Question:* intended?
-   If not, a gestures listing sealed like log ranges would serve them.
-8. **Sealed answers at an `at` URL with `?min=`** (§A.4, §E.2.6). §A.4 answers `200` on an
-   `at` URL whose `at` already includes every `min`, but §E.2.6 binds a sealed answer's `view`
-   to the URL "as the redirect gave it", which has no `min`. The reference redirects such a
-   request to that URL. *Question:* is that what §A.4 means for sealed answers?
-9. **The canonical query form** (§A.4, §E.2.6). With `next` a bare `after` for `/_refs` and for
-   name-paged `?ref=` queries, a client building the next page rarely orders the query as the
-   service's redirect would, so a sealed page costs one more redirect. The reference's
-   canonical form sorts the query's keys. *Propose:* state the canonical form.
-10. **Namespaces whose documents `/_refs` can't read** (§A.4). The text gives `502` when the
-    grant names the namespace; the reference leaves any other such namespace out, as one the
-    reader can't see. *Propose:* say so.
-11. **Kept listings when reads change** (§A.4, §B.5). In a tree service, a content namespace
-    turning private changes neither the anonymous URL space nor `gs`, so a kept listing could
-    reach a reader who may no longer read it. The reference also keys kept listings by what
-    the reader reads whole, and doesn't serve one kept from before. *Propose:* say that a kept
-    result mustn't outlive the reads it was computed for.
+1. **Grants in the body of `POST /edge-grants`** (§C.5). The text doesn't say what
+   `Content-Type` the body form needs. A `text/plain` form from another site goes without a
+   CORS preflight, so it could post `{ "grants": [T] }` with an attacker's grant and replace a
+   reader's cookie for the same prefix, since cookie names come from the prefix alone. The
+   reference requires `application/json` (`415` otherwise), and answers `404 not_offered`
+   before looking at the body while authentication is disabled. *Propose:* require a
+   non-simple content type, as `DELETE /edge-grants` relies on preflights.
+2. **The cookie's claims** (§C.5 "Format"). The reference refuses claims with members other
+   than `kid`, `p` and `exp`, or that aren't canonical JSON byte for byte. It holds one key
+   and one `kid` (`-edge-grant-kid`), so replacing either invalidates every cookie until
+   clients exchange again. Without `sub`, it attributes a cookie read to `edge:` plus the
+   prefix. *Question:* may a minter add members, and is rotation (several `kid`s at once)
+   expected of an origin?
+3. **Edge verification headers** (§9). Several `X-Edge-Prefix` values, or one an intermediary
+   joined with commas, aren't addressed; the reference requires exactly one value and treats
+   anything else as unverified (`no-store`). It doesn't require the cookie it verifies itself
+   to match the prefix, since it authorises the read from the cookie anyway. *Propose:* say
+   "exactly one prefix".
+4. **What check 2 refuses** (§C.5, §3.6, §7). "`400` anyway (§7)", but neither §7 nor §3.6
+   says an empty segment (a trailing `/`) or a dot segment is `400`; the reference answers
+   `400` for both, `//` and `%` included. As written the rule also fails `/` itself, which the
+   origin serves (harmlessly: no prefix covers it). *Propose:* state it in §3.6 or §7, and
+   exempt `/`.
+5. **Services and §9** (§9, §B.11.5). The reference applies §9 to an index's or tree
+   service's own origin too: no refusal, lifetimes only for reads an edge verified. Services
+   read callers from `Authorization`, so their private listings are always `no-store` at the
+   edge; they could be cached only under cookies a service mints with its own `kid`, bound to
+   a `gs`, which §B.11.5 doesn't describe. *Question:* is that the intended path for cached
+   private listings?
+6. **Issuance and rate limits** (§C.5, §6.6). "Its own principal's rate limits", but limits are
+   per namespace and a grant may name several. The reference draws one token per grant under
+   the first namespace it issues, from the bucket writes use, and only once nothing is
+   refused. Its buckets admit while one token is left and may go into debt, as writes of
+   several items do, so two grants of one principal pass under a burst of 1. *Question:*
+   which namespace's limits, and does a request drawing `n` tokens need `n`?
+7. **Counting names** (§C.5). The reference counts each grant's distinct fixed names once,
+   not names times namespaces, so one grant of 60 names over two namespaces gives 120 cookies
+   and passes. Every literal of every fixing rule must be a valid name, even one the
+   intersection removes. *Propose:* say which count is meant.
+8. **A purged sealed namespace's log** (§8.5, §E.2). "`/ns/{ns}` and its log stay readable",
+   but a namespace purge destroys the epoch keys, so sealed delivery can't seal the log: the
+   reference answers `500 encryption_unavailable` there. *Question:* is a purged sealed
+   namespace's log served from its stored sealed copies, or as the structural log in the
+   clear?
+9. **A remote branch of a purged base** (§G.3). The reference names the first purged
+   namespace found, A before its bases, and answers `410` for any `at`, one A doesn't know
+   included, as for a local branch, by reading A's `/heads` first. A base further up can only
+   be purged after A, so that case reports A. *Propose:* say both.
+10. **Repeatable parameters** (§A.4, §A.5). Canonical URLs sort a repeated parameter's values,
+    which changes the meaning of any parameter whose values are ordered or read first-wins.
+    The reference's multi-key `sort` is now one comma-separated parameter (`400` if
+    repeated), and a tree listing parameter other than `min` given twice is `400`.
+    *Propose:* say repeatable parameters are order-insensitive and a single-valued one given
+    twice is `400`.
+11. **`min` on an `at` the service no longer keeps** (§A.5, §A.4). "To the same URL without
+    it", which then redirects to the current checkpoint, two hops against the bounded-redirect
+    SHOULD; the reference goes to the current checkpoint in one. It can judge whether an older
+    combined `at` (tree, `/_refs`) includes a `min` only while it keeps that `at`'s
+    per-namespace checkpoints, and never for a bare `{ns_id}`; on a single-namespace index
+    URL, a `min` naming another namespace is never included. *Propose:* "or to the current
+    checkpoint, if the service can't judge `at`".
+12. **"May this reader read all of these?"** (§B.11.5). "If a grant comes back for every
+    item", but public items get `"public": true` and no grant, and per-item `5xx` entries
+    (`behind` when the catalog lags, `upstream`) are undecided. The reference counts public
+    items as readable, a `4xx` entry as a refusal and a `5xx` one as "ask again", and caps a
+    request at 100 items. *Propose:* "a grant, or public, for every item", and allow a limit.
+13. **Which refusals carry `checkpoint`** (§B.11.4). The reference adds it to `403`, `404`,
+    `409` and `410` decided at it, but not to refusals decided from state it doesn't pin (a
+    `409` for a name the core has and the service hasn't seen, a catalog key missing at the
+    head). Keying cached decisions by the combined checkpoint drops them on any write to any
+    trusted namespace, though a decision depends on the catalog and the item's own namespace
+    only. The change log says decisions "carry their `at`"; the text names `checkpoint`.
+    *Propose:* say which refusals carry it.
+14. **Renamed imports** (§G.4.4). Several points the text leaves open, as the reference does
+    them:
+    - a mapping onto a branch whose base chain reaches `src` keeps references and ids;
+    - a renamed namespace's upstream is `{dst}-upstream`;
+    - an incremental document that would change is refused, since `requires` is a source id;
+    - a pin whose new id can't be known (external, left out, a snapshot's revision) is refused,
+      and so is a schema whose `$id` names its own revision path;
+    - documents of unmapped namespaces that reference a renamed one are rewritten too;
+    - a reference declared only by a later revision's schema is rewritten there by an added
+      `replace`;
+    - with fresh nonces ids differ between runs, so a re-run recognises its earlier writes by
+      the import batches' `source.ids`.
+    *Propose:* say which of these are intended.
+15. **Undo by writers limited to some resources** (§11.2). At E3 such a writer can't learn the
+    current epoch or pad, which are in the namespace document, so the reference refuses. A
+    gesture a merge carried counts for the merger, since only the namespace log shows the batch
+    counted as a merge. Resource logs carry no markers, so a gesture that may reach below a
+    pruning horizon is refused as impossible, and `UndoSince` is dropped, since `/heads` needs
+    unrestricted read. Plain and at-rest can't be told apart from reads. *Question:* how does
+    such a writer learn the epoch and pad, and are the others intended?
 
-12. **Batches in flight at once** (§G.4.4 "Submit batches in dependency order"). The reference
-    submits several batches at once under an allowance: a namespace's batches once those of the
-    namespaces it depends on have committed, and within a namespace a batch after those holding
-    documents it pins. It orders items by pinned references (schemas included), not by live
-    ones, which name no revision that must exist, and orders namespaces the same way: a pin of
-    a full document needs its namespace, a snapshot document's pin of a bundled snapshot
-    document its upstream namespace. Within a cycle of namespaces it puts what upstream
-    namespaces need first (schemas, full documents), then them. It paces each request before
-    it is sent, counting one in flight as drawing no earlier than now: the server draws when
-    it handles a request, possibly after later ones. *Propose:* say that dependency order is
-    per batch, that live references don't order, and how "Upstream first" holds in a cycle.
-13. **A whole-document genesis as a snapshot** (D.4). An intermediate snapshot falls after 64 KiB
-    of patch sets, which a large create's genesis is by itself, doubling its writes for a copy
-    of what the genesis holds. The reference counts a genesis that adds the whole document as a
-    snapshot: the count starts after it, and a read there cuts the document from its canonical
-    patch set. *Propose:* say so in D.4.
-14. **Compressed patch sets** (D.2, D.8 "Exact bytes"). The reference can store, on SQLite and
-    as an opt-in (`-store-compression zstd`), the patch set of a namespace without encryption as
-    `0x02` followed by a zstd frame of its canonical JSON, compressed before the write lock;
-    ids, limits and D.4's 64 KiB stay over the canonical bytes, which reads decompress and
-    serve. Encrypted namespaces never compress, so the plaintext of a sealed row stays
-    canonical JSON. Earlier versions can't read such rows. *Propose:* allow a stored form
-    other than canonical JSON in D.2 as long as nothing observable changes, and say that D.8's
-    exact bytes are what reads serve, not necessarily what is stored.
-15. **TOAST compression on Postgres** (D.8 sizing). Postgres compresses values over about 2 KB
-    with pglz by default, which took most of the time of inserting revisions on an import. The
-    reference sets lz4 on the columns holding patch sets, documents, namespace entries' bodies
-    and blob bytes where the server has it (PostgreSQL 14+), which is as small and several
-    times faster. *Propose:* say so in D.8 next to the TOAST note.
+## Settled in v0.50
+
+All fifteen v0.49 notes, and Doors' S15–S19 and F12–F14. As the reference did them:
+- **Retrying the creation of a branch since purged** (2): the retry rule lasts until the
+  branch is purged, `412` after (§7.6).
+- **What "after the read check" covers** (4): the full read check, rules included, and
+  `purged` before any other answer, `not_offered` included (§8.5).
+- **Upstream appends** (5) aren't changes to existing dependencies (§G.4.4).
+- **Namespaces whose documents `/_refs` can't read** (10) are left out (§A.4).
+- **Kept listings** (11) mustn't outlive the reads they were computed for (§A.4).
+- **Batches in flight** (12): dependency order is per batch, live references don't order,
+  what upstream namespaces need comes first in a cycle, and a request counts as drawing when
+  it is sent (§G.4.4).
+- **Compressed patch sets** (14): how things are stored is the implementation's choice, as
+  long as reads serve the exact canonical bytes and ids and limits are computed over them
+  (§5).
+- **A whole-document genesis as a snapshot** (13) and **TOAST compression on Postgres** (15)
+  left with Addendum D, which is now the prototype's `PROTOTYPE.md`: both are the
+  implementation's choice.
+- **Schema revisions a public referrer pins** (Doors S18) are public; §6.1 says so.
+
+Adopted with more than the reference did, which now follows the text:
+- **Edge-grant issuance's `410`** (1) carries `ns` as well as `head`: the first refused
+  namespace in the order the grants and their root blocks list them (§C.5, §12).
+- **Dry-running a promotion** (6): where the limits allow, a promotion within one namespace
+  goes as one batch; otherwise dry runs reach as far as the reference's deferred and
+  skipped batches (§G.4.4).
+- **Writers limited to some resources** (7): intended. There is no sealed gestures listing;
+  such a writer scans the logs of the documents it knows the action touched, and learns the
+  level from what it reads (§11.2). The client's undo takes those documents
+  (`UndoResources`).
+- **`min` on `at` URLs** (8) always redirects, dropping `min`, so a `200` is served only at a
+  URL without it (§A.5).
+- **The canonical query form** (9): parameters sorted by name, then value, every byte but
+  unreserved ones percent-encoded in uppercase hex; services answer `200` only at that form
+  (§A.5).
+- **Edges** (Doors S15, S16, S17): only reads an edge verified get edge lifetimes, and the
+  edge says which prefix it verified (`X-Edge-Prefix`). Reads with a grant in
+  `Authorization` and referrer schema reads are `no-store` and need no edge, so the origin
+  no longer refuses unverified private reads (`403 edge_required` is gone). A default cookie
+  format with a `kid`, and what an edge MUST check (§9, §C.5).
+- **Several grants per exchange** (Doors F12): `{ "grants": [ … ] }`, and rules fixing
+  `/resource` to a finite set, one cookie per name, at most 100 names (§C.5).
+- **Catalog decisions** (Doors S19, F13): they depend on the content namespace too, so
+  read-your-writes passes `min` for both; answers carry the combined `checkpoint` they were
+  decided at; `/read-grants` answers "may this reader read all of these?" (§B.11.4,
+  §B.11.5). A service may mint edge grants for derived output under its own `kid` (§C.5).
+- **Renamed imports** (Doors F14): an import may map a set of namespaces to new names,
+  rewriting references and recomputing ids (§G.4.4). Configuration in bundles stays open
+  (§G.7).
+
+Decided against the reference, which now follows the text:
+- **A remote branch of a purged base** (3) is `410 purged`, not `gone`, with `origin`, `ns`
+  and `head` naming the purged namespace on the base's deployment (§G.3, §12).
 
 ## Settled in v0.49
 

@@ -2,9 +2,109 @@
 
 ## Unreleased
 
-- **Docs:** the README gives the edge-grant cookie format, its key and an example, and what
-  an edge in front of the origin must check on every request (Doors S17). v0.15.0's upgrade
-  notes now name `?min` on `POST /grants` and `/read-grants` (Doors S14).
+Implements spec **v0.50**, which settles all fifteen of the reference's v0.49 notes and takes
+up Doors' S15–S19 and F12–F14: edges, purged namespaces, catalog decisions, canonical query
+URLs and renamed imports. Addendum D, the Bun prototype, has left the spec.
+
+**Changes to check before upgrading:**
+- **Private reads are no longer refused behind `-edge-secret`** (§9): `serve`, `index` and
+  `tree` serve them with or without the edge's headers, and a private long-poll waits as any
+  other; `403 edge_required` is gone (Doors S15). A private response gets edge lifetimes
+  (`CDN-Cache-Control`) only when the edge verified it itself: `X-Edge-Verified` carries the
+  secret, `X-Edge-Prefix` carries exactly one prefix that covers the URL, and the request has
+  no `Authorization` or `Source-Authorization`. Everything else private is
+  `CDN-Cache-Control: no-store` and `Surrogate-Control: no-store`, including reads with a grant
+  in `Authorization` behind a verifying edge, which got lifetimes before (Doors S16). A
+  verifying edge must now send the prefix it checked (`-edge-prefix-header`, default
+  `X-Edge-Prefix`) and strip both headers from client requests.
+- **Edge-grant cookies use §C.5's default format:** canonical JSON claims
+  `{"exp","kid","p"}` (no `v`, `ns`, `r` or `sub`), the `kid` set with `-edge-grant-kid`
+  (default `origin`). Cookies issued by earlier versions stop verifying at upgrade and count
+  as absent until clients exchange their grants again, at most 15 minutes. An edge that
+  copied the old format must switch (Doors S17).
+- **`POST /edge-grants`** ranks a `"*"` grant and one that doesn't decode with the other
+  refusals of the request, so `"*"` beside a namespace where the grant fails verification is
+  `401`, not `403`. Each grant now draws one token from its principal's rate limits
+  (`ratePerPrincipal`, or an allowance's bucket), the bucket writes use, so a busy exchanger
+  can get `429`. Grants in the body need `Content-Type: application/json` (`415` otherwise), so
+  a cross-site form can't set cookies. Its `410 purged` carries `ns` as well as `head`.
+- **A path ending in `/`** (other than `/`) is `400 bad_input`, as dot segments and escapes
+  are (§C.5).
+- **A remote branch whose base, or a base in its chain, is purged** at the source is
+  `410 purged` (was `gone`), with `origin`, `ns` and `head` naming the purged namespace there,
+  for any `at` (§G.3, §12). A schema revision it would mirror that is purged at the source is
+  `422 schema_unavailable` with `ref` (was `410`).
+- **`min` always redirects** (§A.5) in the index, `/_refs` and tree services: a request with
+  `?min=` is never answered `200`. After the wait, an `at` URL whose kept result already
+  includes every `min` redirects to itself without `min`, anything else to the current
+  checkpoint. `/_refs` answered such a kept result `200`.
+- **Canonical query URLs** (§A.5): index, `/_refs` and tree `at` URLs are answered `200` only
+  in the canonical form, for every namespace, not only sealed ones, and any other form is
+  redirected to it. Parameters are sorted by name, then value, and everything but letters,
+  digits and `-._~` is percent-encoded in uppercase hex (a space is `%20`). Kept and sealed
+  results stored under other forms are computed again.
+- **Index sort:** several keys are one comma-separated parameter, `sort=-/kickoff,/title`; a
+  repeated `sort` is `400`. In tree services, any listing parameter but `min` given twice is
+  `400` (the first value was used).
+- **`POST /read-grants`** answers `{ "checkpoint", "grants": [ … ] }` and may answer
+  `503 behind` while the catalog service's checkpoint keeps moving. Catalog decisions read
+  roles, their definitions, the catalog key, includes, place lists and namespaces' read and
+  encryption settings as of the checkpoint they report, so a `/roles` change applies to new
+  grants once the service has followed it, as for listings (§B.11.4, §B.11.5).
+- **`patchlog import -ns src=dst` renames** (§G.4.4): references to `src` are rewritten and
+  documents that change get new ids. It copied bodies unchanged and refused namespaces that
+  schemas name. A mapping onto a branch of `src` keeps references and ids. A renamed
+  namespace's snapshot documents go through `{dst}-upstream`. Import reports gain the doc
+  class `resume`, `renamed` flags and entries.
+- **Undo** (client): where the gesture listing and the namespace log can't be read, `PlanUndo`,
+  `Undo`, `Redo` and `UndoStack` return `client.ErrNeedResources` unless `UndoResources` names
+  the documents to scan.
+- `GET /` answers `"spec": "0.50"`.
+
+**New (v0.50):**
+- **Several grants per exchange:** `POST /edge-grants` takes up to 50 grants as
+  `{ "grants": [ … ] }` with no `Authorization`. A prefix several grants give gets one cookie,
+  lasting as long as the longest; the body's `exp` is the earliest (Doors F12).
+- **Finite sets of resources:** a rule testing `/resource` with a `schema` of only `enum`, or
+  `compare` with `in` and a literal array, at top level or inside `all`, fixes it to those
+  names, one cookie each; `compare` with `eq` counts as `value`, several fixing rules
+  intersect, and more than 100 names over a request is `403` (Doors F12).
+- **`edge.Cookies.Check` and `edge.CanonicalPath`** make §C.5's six MUST checks, for an edge
+  written in Go; `edge.ParsePrefix` parses the core prefixes. The README gives the default
+  format, the checks and an example cookie, which `TestCookieVector` pins.
+- **Catalog decisions carry `checkpoint`**, the combined checkpoint they were decided at (the
+  listings' `at`), in `POST /grants`, `/read-grants` and `/merge-grants` answers and in
+  refusals that hold at it, so clients key cached decisions by it. `/read-grants` decides
+  every item at one checkpoint: a reader may read all the items it named if no entry has a
+  4xx `error`; public items count as readable (Doors S19, F13).
+- **Renamed imports** clone a set of namespaces, on another deployment or the same one:
+  full-history documents are rewritten step by step with new ids, never fast-forwarded, with
+  `source.ids` recording the source ids; pins take the new ids, in the order they need them;
+  rewritten steps get fresh nonces where the target requires them; a re-run writes nothing, and
+  one that stopped part-way resumes. References at undeclared positions are reported, not
+  rewritten. Refused before anything is written: an incremental document that would change, a
+  pin whose new id can't be known, and a schema whose `$id` names its own revision path.
+  Catalog placement names aren't renamed, and configuration isn't in the bundle (Doors F14).
+- **Undo for writers limited to some resources** (§11.2): `client.UndoResources(names…)` undoes,
+  redoes and rebuilds the stack from those documents' logs; `UndoPlan.Level` is learned from
+  what is read (a JWE log means sealed); e2e is refused (`ErrUndoE2ELimited`), since sealing
+  needs the namespace document. The playground's Undo and Redo do the same for the open
+  resource.
+- `derived.CanonicalQuery` builds the canonical form; the index's and tree's `next` URLs use
+  it, so they answer without a redirect. The playground's Search tab sends one `sort`.
+- The Varnish VCL strips `X-Edge-Verified` and `X-Edge-Prefix` from requests.
+
+**Fixes:**
+- Index and tree: a non-sealed `at` URL in a non-canonical form was answered `200` there.
+- The index no longer checks a `min` against the core's log before waiting for it.
+- `import -ns` with a single plain name finds schema namespaces named by `$ref` values with a
+  `#fragment`.
+- Undo from resource logs whose gesture may reach below a pruning horizon is refused as
+  impossible (`pruned`) instead of being undone in part.
+- Playground: undo reads an e2e resource's head instead of requesting `/rev//log`.
+
+**Docs:** v0.15.0's upgrade notes now name `?min` on `POST /grants` and `/read-grants` (Doors
+S14).
 
 ## v0.18.1
 
