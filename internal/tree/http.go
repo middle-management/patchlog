@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -65,6 +67,10 @@ type RoleView interface {
 	// reader's listings (§B.11.5) and the reader's visibility. Resolve runs
 	// outside the graph lock; the Visibility's methods run under it.
 	Resolve(ctx context.Context, v *grant.Verified) (subjects []string, vis Visibility, err error)
+	// ForSubjects is the visibility of a subject set as Resolve keyed it,
+	// for a reader whose edge grant is bound to it (§B.11.5): the cookie
+	// carries no grant, only the subject set's prefix.
+	ForSubjects(subjects []string) Visibility
 }
 
 // Visibility decides, under the graph lock, what a reader may see.
@@ -77,7 +83,7 @@ type Visibility interface {
 }
 
 // AllSubjects is the subject set segment of unfiltered listings,
-// /{catalog}/at/{at}/g/all/… (§B.11.5).
+// /{catalog}/g/all/at/{at}/… (§B.11.5).
 const AllSubjects = "all"
 
 // viewer is the outcome of the read check for one request.
@@ -108,6 +114,20 @@ type viewer struct {
 	wideGrant map[string]bool // namespaces read namespace-wide through a grant, not because they are public ("" the catalog)
 	wideExp   time.Time
 	priv      bool
+	// For an edge grant (edgegrants.go): subjects are what gs is over, as
+	// RoleView.Resolve keyed them, and idExp the expiry of the grant
+	// verified for the catalog namespace. notBefore, set for a read under
+	// a g/all cookie, is the earliest that cookie may have been issued
+	// (allNotBefore).
+	subjects  []string
+	idExp     time.Time
+	notBefore time.Time
+	// bucket keys the exchangeRate bucket of the grant's principal, as
+	// the core keys write buckets: principal and kid (§C.5, §6.6).
+	bucket string
+	// noEdge keeps a listing out of shared caches whoever reads it
+	// (edgeHold).
+	noEdge bool
 }
 
 // wide reports whether the viewer reads the catalog and every namespace of
@@ -185,7 +205,21 @@ func Bearer(r *http.Request) string {
 // a RoleView, a reader with a grant is routed under /g/{gs}/, where gs
 // keys everything its listings depend on: its groups and markers for how
 // much of the catalog and which content namespaces it reads as a whole.
+//
+// A GET or HEAD without Authorization that carries an edge grant the
+// service minted, covering its path, is read as that grant's subject set
+// (edgeViewer, §B.11.5).
 func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) {
+	if s.opt.EdgeGrants != nil && r.Header.Get("Authorization") == "" {
+		if cl := s.opt.EdgeGrants.FromRequest(r, s.opt.Now()); cl != nil {
+			return s.edgeViewer(ctx, cl)
+		}
+	}
+	return s.grantViewer(ctx, Bearer(r))
+}
+
+// grantViewer is the viewer of a reader presenting token ("" for none).
+func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error) {
 	// In a release preview every check is on the branch read in place of
 	// a namespace: a viewer sees only branches it can read (§B.5).
 	cat := s.actual(s.opt.Catalog)
@@ -201,7 +235,6 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 		}
 	})
 	sort.Strings(trust)
-	token := Bearer(r)
 	v := &viewer{contentAll: map[string]bool{}, contentRead: map[string]func(string) bool{}}
 	if token == "" {
 		if !catPublic {
@@ -219,7 +252,9 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 	if err != nil {
 		return nil, err
 	}
+	v.bucket = vg.Principal.ID + "\x00" + vg.Key.Kid
 	exp := grantExp(vg, time.Time{})
+	v.idExp = exp
 	var markers []string
 	readsCat, _ := vg.Allows("read")
 	switch {
@@ -283,12 +318,11 @@ func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) 
 				v.wideGrant[ns] = true
 			}
 		}
-		var subjects []string
-		subjects, v.vis, err = s.opt.RoleView.Resolve(ctx, vg)
+		v.subjects, v.vis, err = s.opt.RoleView.Resolve(ctx, vg)
 		if err != nil {
 			return nil, err
 		}
-		v.gs = grantcheck.SubjectSetID(subjects)
+		v.gs = grantcheck.SubjectSetID(v.subjects)
 		return v, nil
 	}
 	if !v.catAll && v.catRead == nil {
@@ -332,11 +366,15 @@ var ops = map[string]bool{
 
 // Handler returns the query API (§B.5):
 //
-//	GET /{catalog}/{op}?…                   302 → /{catalog}/at/{at}[/g/{gs}]/{op}?…  (head pointer)
+//	GET /{catalog}/{op}?…                   302 → /{catalog}[/g/{gs}]/at/{at}/{op}?…  (head pointer)
 //	GET /{catalog}/at/{at}/{op}?…            200, public readers                     (immutable)
-//	GET /{catalog}/at/{at}/g/{gs}/{op}?…     200, readers with a grant, keyed by subject set (§B.11.5)
+//	GET /{catalog}/g/{gs}/at/{at}/{op}?…     200, readers with a grant, keyed by subject set (§B.11.5)
 //
-// at is the combined checkpoint (CombinedAt). op is one of
+// at is the combined checkpoint (CombinedAt). The subject set comes before
+// it, so one edge grant for the prefix /{catalog}/g/{gs} covers every
+// checkpoint (§B.11.5); the form before v0.51,
+// /{catalog}/at/{at}/g/{gs}/{op}?…, is moved permanently (301) to it. op
+// is one of
 // children?of=&after=&limit=, ancestors?of=, subtree?of=&depth=, roots,
 // orphans, problems, where?item=, manifest?of=.
 //
@@ -378,7 +416,7 @@ var ops = map[string]bool{
 // the catalog. A reader of the whole catalog gets the listing sealed as
 // one JWE under the catalog's current epoch key, Content-Type
 // application/jose, pl { ns, view } where view is the listing's request
-// target (/{catalog}/at/{at}[/g/{gs}]/{op}?{query}, the canonical form). A
+// target (/{catalog}[/g/{gs}]/at/{at}/{op}?{query}, the canonical form). A
 // reader whose grant restricts catalog resources (or who sees nodes only
 // through roles) gets JSON in which every node with a title carries
 // "sealed": JWE of { title } under that catalog resource's K_r, pl { ns,
@@ -387,6 +425,9 @@ var ops = map[string]bool{
 // tags, and served unchanged, across restarts, until a purge with one of
 // those tags or a new at retires them (derived.Cache).
 //
+//	POST   /edge-grants             the service's own edge grants, with
+//	DELETE /edge-grants?prefix=…    Options.EdgeGrants (edgegrants.go)
+//
 //	GET /_status    each followed namespace's encryption level and epoch,
 //	                whether listings are sealed, and why a namespace is
 //	                skipped (or its documents not read); "catalogs" names
@@ -394,6 +435,10 @@ var ops = map[string]bool{
 func (s *Service) Handler() http.Handler { return http.HandlerFunc(s.serveHTTP) }
 
 func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/edge-grants" {
+		s.serveEdgeGrants(w, r)
+		return
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		w.Header().Set("Allow", "GET, HEAD")
 		WriteError(w, http.StatusMethodNotAllowed, "bad_input", "method not allowed")
@@ -412,8 +457,13 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		op = segs[1]
 	case len(segs) == 4 && segs[0] == cat && segs[1] == "at":
 		at, op, isAt = segs[2], segs[3], true
-	case len(segs) == 6 && segs[0] == cat && segs[1] == "at" && segs[3] == "g":
-		at, gs, op, isAt = segs[2], segs[4], segs[5], true
+	case len(segs) == 6 && segs[0] == cat && segs[1] == "g" && segs[3] == "at":
+		gs, at, op, isAt = segs[2], segs[4], segs[5], true
+	case len(segs) == 6 && segs[0] == cat && segs[1] == "at" && segs[3] == "g" && oldForm(segs[2], segs[4], segs[5]):
+		// Before v0.51 (§B.11.5): the subject set now comes first.
+		telemetry.SetRoute(r, "/{catalog}/at/{at}/g/{gs}/{op}")
+		moved(w, r, "/"+cat+"/g/"+segs[4]+"/at/"+segs[2]+"/"+segs[5])
+		return
 	default:
 		WriteError(w, http.StatusNotFound, "not_found", "not found")
 		return
@@ -425,7 +475,7 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	// The listing is one of a fixed set: it stays in the route.
 	switch {
 	case gs != "":
-		telemetry.SetRoute(r, "/{catalog}/at/{at}/g/{gs}/"+op)
+		telemetry.SetRoute(r, "/{catalog}/g/{gs}/at/{at}/"+op)
 	case isAt:
 		telemetry.SetRoute(r, "/{catalog}/at/{at}/"+op)
 	default:
@@ -497,12 +547,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			return
 		}
 	}
-	base := "/" + cat + "/at/"
 	target := func(cp string) string {
 		if v.anon {
-			return base + cp + "/" + op
+			return "/" + cat + "/at/" + cp + "/" + op
 		}
-		return base + cp + "/g/" + v.gs + "/" + op
+		return "/" + cat + "/g/" + v.gs + "/at/" + cp + "/" + op
 	}
 	// A purged catalog answers as the core's URLs of it do, after the read
 	// check: 410 purged with head, its purge-ns entry (§8.5, §12), the
@@ -513,7 +562,10 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	setPtr := func() {
-		if v.anon {
+		// An anonymous reader's redirect out of a subject set's URL space
+		// is no shared cache's either: there, the edge serves what it
+		// holds to readers with that subject set's edge grant (§B.11.5).
+		if v.anon && gs == "" {
 			w.Header().Set("Cache-Control", ccHeadPointer)
 			w.Header().Set("Cache-Tag", "ns:"+cat)
 		} else {
@@ -525,7 +577,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
-	if status, code, msg := s.AwaitMins(ctx, vals["min"]); status != 0 {
+	if status, code, msg := s.awaitMins(ctx, vals["min"], Bearer(r)); status != 0 {
 		w.Header().Set("Cache-Control", "no-store")
 		if status == http.StatusServiceUnavailable {
 			w.Header().Set("Retry-After", "1")
@@ -549,6 +601,14 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	keep := !perReader(op, v)
 	var cur string
 	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
+	if ns := s.trustedSince(v, at, cur); ns != "" {
+		// A g/all edge grant covers every later at, but not one that
+		// includes a namespace it wasn't checked against (§B.11.5).
+		w.Header().Set("Cache-Control", "no-store")
+		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates the catalog's trust in "+ns+": exchange the grants again")
+		return
+	}
+	v.noEdge = s.edgeHold(v, at, cur)
 	own := isAt && gs == v.gs && !(v.anon && gs != "")
 	mins := len(vals["min"]) > 0
 	canonical := r.URL.RequestURI() == canon(at)
@@ -833,6 +893,9 @@ func (s *Service) setListingHeaders(w http.ResponseWriter, r *http.Request, v *v
 		w.Header().Set("Cache-Control", ccPrivateList)
 		s.opt.Edge.Private(w.Header(), r, cdnListing)
 	}
+	if v.noEdge {
+		edge.NoStore(w.Header())
+	}
 	w.Header().Set("Cache-Tag", tags)
 	w.Header().Set("X-Namespace-Revision", at)
 }
@@ -955,6 +1018,21 @@ type minRef struct{ ns, id string }
 // namespace the service doesn't follow, 503 (with Retry-After) while it is
 // behind. Services of the addenda use it for the endpoints that take min.
 func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, code, msg string) {
+	return s.awaitMins(ctx, vals, "")
+}
+
+// minElsewhere is the 400 for a min naming a namespace that neither the
+// service nor, behind Multi, another catalog's follows, or that the
+// reader can't see: one message, so it doesn't tell which namespaces
+// exist.
+const minElsewhere = "min names a namespace the service does not follow or the reader can't see"
+
+// awaitMins is AwaitMins for a reader presenting token ("" for none).
+// Behind Multi, a min naming a namespace that another catalog's service
+// follows, and that the reader may see (public, or its grant reads it),
+// is waited for there: this catalog's at doesn't cover it, so the
+// listing then redirects to the current at in one hop (§A.5, §B.5).
+func (s *Service) awaitMins(ctx context.Context, vals []string, token string) (status int, code, msg string) {
 	mins, err := parseMins(vals)
 	if err != nil {
 		return http.StatusBadRequest, "bad_input", err.Error()
@@ -963,18 +1041,76 @@ func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, cod
 	for _, ns := range s.followed() {
 		followed[ns] = true
 	}
-	for i, m := range mins {
+	var own []minRef
+	other := map[*Service][]minRef{}
+	for _, m := range mins {
 		// A preview's readers write to the branches, so min names them.
 		m.ns = s.logical(m.ns)
-		mins[i] = m
-		if m.ns != "" && !followed[m.ns] {
-			return http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow"
+		if m.ns == "" || followed[m.ns] {
+			own = append(own, m)
+			continue
 		}
+		o := s.sibling(m.ns)
+		if o == nil {
+			return http.StatusBadRequest, "bad_input", minElsewhere
+		}
+		switch ok, err := o.sees(ctx, m.ns, token); {
+		case err != nil:
+			s.opt.Logf("tree: access check for %s: %v", m.ns, err)
+			return http.StatusBadGateway, "upstream", "cannot read a namespace configuration"
+		case !ok:
+			return http.StatusBadRequest, "bad_input", minElsewhere
+		}
+		other[o] = append(other[o], m)
 	}
-	if !s.waitMins(ctx, mins) {
+	ctx, cancel := context.WithTimeout(ctx, s.opt.MinWait)
+	defer cancel()
+	if !s.waitMins(ctx, own) {
 		return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
 	}
+	for o, ms := range other {
+		if !o.waitMins(ctx, ms) {
+			return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
+		}
+	}
 	return 0, "", ""
+}
+
+// sibling is the service of another catalog behind the same Multi that
+// follows ns, if any.
+func (s *Service) sibling(ns string) *Service {
+	for _, o := range s.siblings {
+		if slices.Contains(o.followed(), ns) {
+			return o
+		}
+	}
+	return nil
+}
+
+// sees reports whether the bearer of token ("" for none) may see ns:
+// it is public, or the grant reads it, in whole or in part. A namespace
+// document that can't be read is an error.
+func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
+	cfg, err := s.checker.Config(ctx, s.actual(ns))
+	if err != nil {
+		return false, err
+	}
+	if cfg.Read == "public" {
+		return true, nil
+	}
+	if token == "" {
+		return false, nil
+	}
+	v, err := s.checker.Verify(ctx, s.actual(ns), token)
+	var ae *grant.AuthError
+	switch {
+	case errors.As(err, &ae):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	ok, _ := v.Allows("read")
+	return ok, nil
 }
 
 func parseMins(vals []string) ([]minRef, error) {
@@ -1058,6 +1194,30 @@ func (s *Service) reached(ctx context.Context, m minRef) bool {
 func redirect(w http.ResponseWriter, loc string) {
 	w.Header().Set("Location", loc)
 	w.WriteHeader(http.StatusFound)
+}
+
+// oldForm reports whether the segments of a listing URL of a form before
+// v0.51 are well formed, so the URL moved names nothing but them.
+func oldForm(at, gs, op string) bool {
+	_, err := ids.Parse(at)
+	if gs != AllSubjects {
+		if _, gerr := ids.Parse(gs); gerr != nil {
+			err = gerr
+		}
+	}
+	return err == nil && ops[op]
+}
+
+// moved answers a URL of a form before v0.51 (§B.11.5) with a permanent
+// redirect to path, the same query kept: the redirect depends on the URL
+// alone, so it reveals nothing, and the URL it names checks the reader.
+func moved(w http.ResponseWriter, r *http.Request, path string) {
+	if r.URL.RawQuery != "" {
+		path += "?" + r.URL.RawQuery
+	}
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Location", path)
+	w.WriteHeader(http.StatusMovedPermanently)
 }
 
 // WriteError writes an error body.

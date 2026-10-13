@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +13,26 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
 )
+
+// checkpointOf is the checkpoint a decision on items of nss reports, as
+// the service has them now (§B.11.4, v0.51): { ns: ns_id } of the catalog
+// and of nss.
+func (w *world) checkpointOf(nss ...string) map[string]any {
+	cp := map[string]any{"cat": w.svc.Tree().Checkpoint("cat")}
+	for _, ns := range nss {
+		cp[ns] = w.svc.Tree().Checkpoint(ns)
+	}
+	return cp
+}
+
+// entry is the i-th entry of a POST /read-grants answer.
+func entry(r resp, i int) map[string]any {
+	gs, _ := r.body["grants"].([]any)
+	if i >= len(gs) {
+		return nil
+	}
+	return gs[i].(map[string]any)
+}
 
 // listingAt is the at of the current listing of season for token: the
 // combined checkpoint (§B.5).
@@ -27,8 +48,9 @@ func (w *world) listingAt(token string) string {
 }
 
 // TestDecisionCheckpoint: answers of POST /grants and POST /read-grants
-// carry checkpoint, the combined checkpoint they were decided at, the
-// same value as listings' at, which isn't the grants' own at (the
+// carry checkpoint beside each grant, { ns: ns_id } of the catalog and of
+// the item's namespace as they were decided at (v0.51), which is neither
+// listings' at (the combined checkpoint) nor the grants' own at (the
 // catalog's ns_id); refusals that are decisions carry it too (§B.11.4).
 func TestDecisionCheckpoint(t *testing.T) {
 	t.Parallel()
@@ -39,19 +61,20 @@ func TestDecisionCheckpoint(t *testing.T) {
 	bob := w.caller("user:bob", "match-desk")
 	at := w.listingAt(bob)
 
+	cp := w.checkpointOf("matches")
 	r := w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
 	catID := r.body["at"].(map[string]any)["id"]
-	if r.body["checkpoint"] != at || at == catID || catID != w.svc.Tree().Checkpoint("cat") {
-		t.Errorf("checkpoint %v, listing at %s, grant at %v", r.body["checkpoint"], at, catID)
+	if !reflect.DeepEqual(r.body["checkpoint"], cp) || at == catID || catID != w.svc.Tree().Checkpoint("cat") {
+		t.Errorf("checkpoint %v, want %v; listing at %s, grant at %v", r.body["checkpoint"], cp, at, catID)
 	}
 
-	// /read-grants: one checkpoint for the answer, one entry per item in
-	// request order; the reader may read them all iff no entry has an
-	// error.
+	// /read-grants: one entry per item in request order, each with the
+	// checkpoint it was decided at (a catalog folder: the catalog's
+	// alone); the reader may read them all iff no entry has an error.
 	items := toAny("/r/matches/rumour1", "/r/matches/derby", "/r/cat/season", "/r/matches/ghost")
 	rg := w.do("POST", "/read-grants", bob, map[string]any{"items": items})
-	if rg.status != 200 || rg.body["checkpoint"] != at {
-		t.Fatalf("read-grants: %d %v (at %s)", rg.status, rg.body, at)
+	if _, has := rg.body["checkpoint"]; rg.status != 200 || has {
+		t.Fatalf("read-grants: %d %v", rg.status, rg.body)
 	}
 	gs := rg.body["grants"].([]any)
 	if len(gs) != len(items) {
@@ -66,6 +89,13 @@ func TestDecisionCheckpoint(t *testing.T) {
 		_, hasGrant := e["grant"]
 		if hasErr != (want == "error") || hasGrant != (want == "grant") {
 			t.Errorf("entry %d: %v (want %q)", i, e, want)
+		}
+		wantCP := cp
+		if i == 2 {
+			wantCP = w.checkpointOf()
+		}
+		if !reflect.DeepEqual(e["checkpoint"], wantCP) {
+			t.Errorf("entry %d: checkpoint %v, want %v", i, e["checkpoint"], wantCP)
 		}
 	}
 	rg = w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/shared", "/r/cat/season")})
@@ -94,20 +124,20 @@ func TestDecisionCheckpoint(t *testing.T) {
 		{"not a folder", map[string]any{"node": "nf", "want": toAny("create"), "to": toAny("matches.derby")}, 422, false},
 	} {
 		r := w.issue(bob, c.req, c.status)
-		if got, has := r.body["checkpoint"]; has != c.cp || has && got != at {
-			t.Errorf("%s: %d %v (at %s)", c.name, r.status, r.body, at)
+		if got, has := r.body["checkpoint"]; has != c.cp || has && !reflect.DeepEqual(got, cp) {
+			t.Errorf("%s: %d %v (checkpoint %v)", c.name, r.status, r.body, cp)
 		}
 	}
 
-	// A write to a content namespace moves the checkpoint, not the
-	// grants' at.
+	// A write to the item's namespace moves its entry of the checkpoint,
+	// not the catalog's, nor the grants' at.
 	w.doc("matches", "later", map[string]any{"title": "later"})
 	w.caughtUp()
-	at2 := w.listingAt(bob)
+	cp2 := w.checkpointOf("matches")
 	r = w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
-	if at2 == at || r.body["checkpoint"] != at2 || r.body["at"].(map[string]any)["id"] != catID {
-		t.Errorf("after a content write: checkpoint %v, listing at %s (was %s), grant at %v (was %v)",
-			r.body["checkpoint"], at2, at, r.body["at"], catID)
+	if reflect.DeepEqual(cp2, cp) || cp2["cat"] != cp["cat"] || !reflect.DeepEqual(r.body["checkpoint"], cp2) || r.body["at"].(map[string]any)["id"] != catID {
+		t.Errorf("after a content write: checkpoint %v, want %v (was %v), grant at %v (was %v)",
+			r.body["checkpoint"], cp2, cp, r.body["at"], catID)
 	}
 
 	// A purged item's restore: 410, at the checkpoint after the purge.
@@ -120,8 +150,8 @@ func TestDecisionCheckpoint(t *testing.T) {
 	must(purger.Purge(ctx, "matches", "doomed", must(w.ops.Head(ctx, "matches", "doomed")).ID, false))
 	w.caughtUp()
 	r = w.issue(bob, map[string]any{"item": "/r/matches/doomed", "want": toAny("restore")}, 410)
-	if at3 := w.listingAt(bob); r.body["checkpoint"] != at3 || at3 != w.svc.Tree().At() {
-		t.Errorf("purged: %v (listing at %s, now %s)", r.body, at3, w.svc.Tree().At())
+	if cp3 := w.checkpointOf("matches"); !reflect.DeepEqual(r.body["checkpoint"], cp3) {
+		t.Errorf("purged: %v (now %v)", r.body, cp3)
 	}
 }
 
@@ -165,12 +195,13 @@ func TestReadGrantsOneCheckpoint(t *testing.T) {
 	if r.status != 200 || tries.Load() != 2 {
 		t.Fatalf("read-grants with a write mid-decision: %d %v after %d tries", r.status, r.body, tries.Load())
 	}
-	if r.body["checkpoint"] != w.svc.Tree().At() {
-		t.Errorf("checkpoint %v, now %s", r.body["checkpoint"], w.svc.Tree().At())
-	}
-	// Every grant is of the catalog checkpoint after the write.
+	// Every entry is decided at the catalog checkpoint after the write,
+	// the refusal of rumour1 too.
 	for i, x := range r.body["grants"].([]any) {
 		e := x.(map[string]any)
+		if cp := w.checkpointOf("matches"); !reflect.DeepEqual(e["checkpoint"], cp) {
+			t.Errorf("%v: checkpoint %v, now %v", e["item"], e["checkpoint"], cp)
+		}
 		if i == 2 {
 			if e["error"] == nil {
 				t.Errorf("rumour1: %v", e)
@@ -235,11 +266,11 @@ func TestDecisionsPinned(t *testing.T) {
 		return err == nil && fmt.Sprint(c.Roles["reader"].Can) == "[append]"
 	})
 	// Decided at the same checkpoint, the same way.
-	if r := w.issue(fan, read, 200); r.body["checkpoint"] != at || fmt.Sprint(r.body["roles"]) != "[reader]" {
+	if r := w.issue(fan, read, 200); !reflect.DeepEqual(r.body["checkpoint"], at) || fmt.Sprint(r.body["roles"]) != "[reader]" {
 		t.Errorf("grant before the service reaches the change: %v (at %v)", r.body, at)
 	}
 	rg := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby")})
-	if e := rg.body["grants"].([]any)[0].(map[string]any); rg.body["checkpoint"] != at || e["grant"] == nil {
+	if e := entry(rg, 0); !reflect.DeepEqual(e["checkpoint"], at) || e["grant"] == nil {
 		t.Errorf("read-grants before the service reaches the change: %v (at %v)", rg.body, at)
 	}
 
@@ -254,7 +285,7 @@ func TestDecisionsPinned(t *testing.T) {
 	})
 	rumour := map[string]any{"items": toAny("/r/matches/rumour1")}
 	rg = w.do("POST", "/read-grants", fan, rumour)
-	if e := rg.body["grants"].([]any)[0].(map[string]any); rg.body["checkpoint"] != at || e["error"] == nil || e["public"] != nil {
+	if e := entry(rg, 0); !reflect.DeepEqual(e["checkpoint"], at) || e["error"] == nil || e["public"] != nil {
 		t.Errorf("read-grants for rumour1 before the service reaches public: %v (at %v)", rg.body, at)
 	}
 
@@ -270,19 +301,19 @@ func TestDecisionsPinned(t *testing.T) {
 	if r := w.issue(desk, map[string]any{"item": "/r/matches/unseen", "want": toAny("create")}, 409); r.body["checkpoint"] != nil {
 		t.Errorf("create refused from the core's head: %v", r.body)
 	}
-	if r := w.issue(desk, map[string]any{"item": "/r/matches/derby", "want": toAny("create")}, 409); r.body["checkpoint"] != w.svc.Tree().At() {
-		t.Errorf("create refused from the checkpoint: %v (now %s)", r.body, w.svc.Tree().At())
+	if r := w.issue(desk, map[string]any{"item": "/r/matches/derby", "want": toAny("create")}, 409); !reflect.DeepEqual(r.body["checkpoint"], w.checkpointOf("matches")) {
+		t.Errorf("create refused from the checkpoint: %v (now %v)", r.body, w.checkpointOf("matches"))
 	}
 
 	// Once applied, a new checkpoint, and the refusal carries it.
 	rt.hold.Store(false)
 	w.caughtUp()
 	r := w.issue(fan, read, 403)
-	if r.body["checkpoint"] == at || r.body["checkpoint"] != w.svc.Tree().At() {
+	if reflect.DeepEqual(r.body["checkpoint"], at) || !reflect.DeepEqual(r.body["checkpoint"], w.checkpointOf("matches")) {
 		t.Errorf("refusal after the change: %v (was %v)", r.body, at)
 	}
 	rg = w.do("POST", "/read-grants", fan, rumour)
-	if e := rg.body["grants"].([]any)[0].(map[string]any); rg.body["checkpoint"] != w.svc.Tree().At() || e["public"] != true {
+	if e := entry(rg, 0); !reflect.DeepEqual(e["checkpoint"], w.checkpointOf("matches")) || e["public"] != true {
 		t.Errorf("read-grants for rumour1 once matches is public: %v", rg.body)
 	}
 }

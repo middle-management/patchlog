@@ -27,8 +27,8 @@ import (
 
 // References across namespaces (§A.4 "Across namespaces"):
 //
-//	GET /_refs?to=<reference>             302 → /_refs/at/{at}/g/{gs}?to=…      (head pointer)
-//	GET /_refs/at/{at}/g/{gs}?to=…        200 { at, namespaces, hits, next? }  (immutable,
+//	GET /_refs?to=<reference>             302 → /_refs/g/{gs}/at/{at}?to=…      (head pointer)
+//	GET /_refs/g/{gs}/at/{at}?to=…        200 { at, namespaces, hits, next? }  (immutable,
 //	                                      tagged idx:{ns} per namespace in at and
 //	                                      r:{ns}/{name} per hit)
 //	                                      302 → the current at if this one is neither
@@ -295,15 +295,21 @@ func combinedAt(cps map[string]string) string {
 	return ids.FromBytes(sum[:ids.Size]).String()
 }
 
-// serveRefs answers /_refs and /_refs/at/{at}/g/{gs} (segs, from "_refs").
+// serveRefs answers /_refs and /_refs/g/{gs}/at/{at} (segs, from "_refs"),
+// the subject set before the checkpoint (§A.4). The form before v0.51,
+// /_refs/at/{at}/g/{gs}, is moved permanently to it.
 func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string) {
 	var at, gs string
 	switch {
 	case len(segs) == 1:
 		telemetry.SetRoute(r, "/_refs")
-	case len(segs) == 5 && segs[1] == "at" && segs[3] == "g":
-		at, gs = segs[2], segs[4]
+	case len(segs) == 5 && segs[1] == "at" && segs[3] == "g" && oldForm(segs[4], segs[2]):
 		telemetry.SetRoute(r, "/_refs/at/{at}/g/{gs}")
+		moved(w, r, "/_refs/g/"+segs[4]+"/at/"+segs[2])
+		return
+	case len(segs) == 5 && segs[1] == "g" && segs[3] == "at":
+		gs, at = segs[2], segs[4]
+		telemetry.SetRoute(r, "/_refs/g/{gs}/at/{at}")
 		if _, err := ids.Parse(at); err != nil {
 			writeErr(w, http.StatusBadRequest, "bad_input", "malformed at")
 			return
@@ -359,13 +365,13 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	// min, the redirects below land there, without min (§A.5).
 	if at != "" && gs != rd.gs && len(rq.mins) == 0 {
 		setPtr()
-		redirect(w, "/_refs/at/"+at+"/g/"+rd.gs+derived.CanonicalQuery(vals))
+		redirect(w, "/_refs/g/"+rd.gs+"/at/"+at+derived.CanonicalQuery(vals))
 		return
 	}
 	for _, m := range rq.mins {
 		if !slices.Contains(rd.nss, m.NS) {
 			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow or the reader can't read")
+			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
 			return
 		}
 	}
@@ -373,7 +379,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	// redirects name, what answers are kept under, and the view a sealed
 	// hit is bound to (§E.2.6). Only it is answered 200: another form of
 	// it, or one with min, is redirected.
-	target := func(at string) string { return "/_refs/at/" + at + "/g/" + rd.gs + derived.CanonicalQuery(vals, "min") }
+	target := func(at string) string { return "/_refs/g/" + rd.gs + "/at/" + at + derived.CanonicalQuery(vals, "min") }
 	// min is waited for first, so no min is judged against the core's log
 	// before the index has reached it.
 	if !ix.waitMins(ctx, rq.mins) {

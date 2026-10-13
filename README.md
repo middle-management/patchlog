@@ -33,7 +33,7 @@ and serves immutable, CDN-cacheable revisions.
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
-| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`) | §C.5, §9 | ✅ |
+| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge (a sealed namespace's documents, log, long-polls and events then answer `410 purged` with `head`, which followers, services, the janitor and remote branches take as the purge) | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
@@ -294,9 +294,12 @@ cookie, on every request.
   gestures listing are `no-store` whatever the headers say. Public and sealed reads ignore them.
 
   `patchlog index` and `patchlog tree` take the same three flags for their private listings
-  (§A.4, §B.11.5), under the same rules. They read callers only from `Authorization`, so their
-  private listings are `no-store` at the edge too: a service would need edge grants of its own
-  (§C.5 "Format"), which neither mints. Their private head pointers stay `no-store` either way.
+  (§A.4, §B.11.5), under the same rules: a listing read with a grant in `Authorization` is
+  `no-store` at the edge. The catalog service (`tree -access`) mints edge grants of its own for
+  its listings (v0.51, [Tree and catalog](#tree-and-catalog-addendum-b)), so a listing read
+  under one of its cookies, which the edge checked with the service's kid, gets edge lifetimes;
+  the search index and the plain tree service mint none. Private head pointers stay `no-store`
+  either way.
 
 ```sh
 head -c 32 /dev/urandom | base64 > edge.secret   # shared with the edge's configuration
@@ -405,6 +408,12 @@ gives a default so an edge can be written once. The reference issues exactly tha
   edge-grant.key` makes one), and the edge then needs those files. Without `-edge-grant-key` the
   key, named `-edge-grant-kid`, is HMAC-SHA256 keyed with the edge secret (the `-edge-secret`
   file's content, trimmed the same way) over the ASCII text `patchlog edge grants v1`.
+  The catalog service's kid is its own `-edge-grant-kid` (default `catalog-{catalog}`), which
+  vouches only for `/{catalog}/g/{gs}`, `gs` an id or `all`, and its key is its own
+  `-edge-grant-key` file's bytes, never derived from the edge secret (see
+  [Tree and catalog](#tree-and-catalog-addendum-b)). An edge in front of both holds both keys,
+  and makes the same checks with whichever kid a cookie names, so neither's cookies cover the
+  other's URLs.
 
 **Rotating the edge-grant key** (§C.5 "Format", v0.51). The origin and its edges hold several
 keys at once, each named by its `kid`, and the origin mints with the newest, so a key is
@@ -840,7 +849,7 @@ What is instrumented:
 - **HTTP servers** (`serve` with its playground and proxies, `index`, `tree`/catalog): a server
   span per request named `{method} {route}`, with the route the matched pattern, never the
   path's ids or names: `GET /r/{ns}/{name}/rev/{id}`, `POST /ns/{ns}/batch`, the index's
-  `GET /{ns}`, `GET /g/{gs}/{ns}/at/{at}`, the tree's `GET /{catalog}/at/{at}/children`, the
+  `GET /{ns}`, `GET /{ns}/g/{gs}/at/{at}`, the tree's `GET /{catalog}/at/{at}/children`, the
   catalog's `POST /grants`, `GET /playground/`; requests without one (a CORS preflight, a 404)
   are named by the method alone. Attributes are the HTTP semantic conventions (`http.route`,
   `http.response.status_code`, `url.path`, `client.address`, …) and `patchlog.ns` on the core's
@@ -1102,14 +1111,16 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   It always redirects (v0.50, §A.5), so a `200` never carries `min`: an `at` URL whose result
   already includes every `min` (the current one, or a kept one whose `at` the log places at or
   after them) to itself without `min`, anything else, once `min` is reached, to the current
-  checkpoint. A `min` naming another namespace the index follows is never included in a
-  result of `{ns}`.
+  checkpoint. A `min` naming another namespace, which a result of `{ns}` never includes, goes
+  straight to the current checkpoint once reached, in one hop, if the index follows it and the
+  reader's grant may read it (v0.51, §A.5); any other is `400`.
 - Redirects give the query in one canonical form (v0.50, §A.5): parameters sorted by name, then
   value, as UTF-8 bytes, and every byte but letters, digits and `-._~` percent-encoded in
   uppercase hex (a space is `%20`, never `+`). An `at` URL is answered `200` only in that form,
-  and redirected to it otherwise; `next` URLs are built in it. Since that form sorts repeated
-  values, a multi-key sort is one parameter with comma-separated keys,
-  `sort=-/kickoff,/title`; a repeated `sort` is `400`.
+  and redirected to it otherwise; `next` URLs are built in it. Repeatable parameters (`min`,
+  `facet[…]`, `counts`, range filters) are sets (v0.51): sorted, a value given twice kept once.
+  A parameter that may not repeat, given twice, is `400`, and a multi-key sort is one parameter
+  with comma-separated keys, `sort=-/kickoff,/title`.
 - `?ref=` answers "who uses this?" (§A.4): the documents of `{ns}` that reference a resource through
   a schema's `x-ref`, found by walking each typed document with the schema revision it pins, with
   no `x-index` needed. `?ref=/r/logic/route-3` matches any form, `/r/logic/route-3/rev/{id}` only
@@ -1124,8 +1135,10 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   page, to set on the `at` URL; other queries page by offset, with `next` the next page's URL.
 - `GET /_refs?to=/r/logic/route-3` (v0.48) asks every namespace the index follows that the reader
   may read, branch previews included, `to` in any form `?ref=` takes. It redirects to
-  `/_refs/at/{at}/g/{gs}?to=…`, where `at` is a combined checkpoint over only the namespaces the
-  answer covers, which the body's `namespaces` lists, so writes elsewhere don't move it.
+  `/_refs/g/{gs}/at/{at}?to=…` (the subject set first since v0.51; the old
+  `/_refs/at/{at}/g/{gs}` is moved there with a `301`), where `at` is a combined checkpoint over
+  only the namespaces the answer covers, which the body's `namespaces` lists, so writes
+  elsewhere don't move it.
   - `gs` keys what the answer depends on, over markers alone (v0.49): `reads:{ns}` for each
     private namespace the grant reads unrestricted (one read role without `/resource` rules is
     enough), and `reads:{ns}:scope:{digest}` for one it reads in part, the digest covering the
@@ -1162,8 +1175,10 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   out of hits, an unmarked one is `400`, and a schema that can't be read for now is `502`. In
   sealed namespaces they are sealed with the rest of the hit. A database from before this
   version is rebuilt from the logs on start.
-- In private namespaces the reader's grant is checked locally. Results are routed under
-  `/g/{subject-set}/…` and filtered to the resources the grant can read.
+- In private namespaces the reader's grant is checked locally. Results are routed to
+  `/{ns}/g/{subject-set}/at/{ns_id}?…`, the subject set before the checkpoint (v0.51, §A.4), and
+  filtered to the resources the grant can read. The URLs before v0.51,
+  `/g/{subject-set}/{ns}[/at/{ns_id}]`, are moved permanently (`301`) to the new ones.
 
 ### Merge, rebase and cleanup (Addendum F)
 
@@ -1777,8 +1792,10 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
 
 `patchlog tree -catalog cat` follows a catalog namespace and the content namespaces it trusts, and
 serves folder listings (`children`, `ancestors`, `subtree`, `roots`, `orphans`, `problems`,
-`where`, `manifest`) at URLs pinned to the catalog's `ns_id`. Cycles and depth over 64 show up
-under `problems`. `-catalog` is repeatable (or comma-separated): each catalog gets its own
+`where`, `manifest`) at URLs pinned to its combined checkpoint: `/{catalog}/at/{at}/…` for
+anonymous readers of a public catalog, `/{catalog}/g/{gs}/at/{at}/…` for readers with a grant,
+the subject set before the checkpoint (v0.51, §B.11.5); the old `/{catalog}/at/{at}/g/{gs}/…` is
+moved there with a `301`. Cycles and depth over 64 show up under `problems`. `-catalog` is repeatable (or comma-separated): each catalog gets its own
 service and database (`-db` with `{catalog}` replaced, or `-{catalog}` added before the
 extension) behind one origin, and `/_status` covers them all (`?catalog=` for one).
 
@@ -1789,9 +1806,9 @@ suffices at any write rate. They are keyed by their URL and by what the reader r
 reader whose namespace-wide reads changed since (a public namespace turned private) isn't served
 one kept from before; listings that depend on the individual reader aren't kept. Every listing is
 served only at its canonical URL, the query in the search index's canonical form (v0.50, §A.5),
-and other forms are redirected to it; a `children` listing's `next` is in that form. Since that
-form sorts repeated values, a parameter other than `min` given more than once is `400`. A purge drops
-the kept listings that show what it purged.
+and other forms are redirected to it; a `children` listing's `next` is in that form. `min` is a
+set (v0.51), and a parameter other than `min` given more than once is `400`. A purge drops the
+kept listings that show what it purged.
 
 With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
 - `POST /grants` with `{ "node", "want": ["create"], "to": [folders] }` creates a folder
@@ -1818,26 +1835,36 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   `409`. The catalog key's entry in content namespaces lists `restore` for this (§B.11.3):
   `"can": ["read", "create", "append", "restore"]`.
 - `POST /read-grants` returns resource-scoped read grants, and the keys of catalog nodes (and of an
-  item's placement) visible to the caller: `{ "checkpoint", "grants": [...] }`, one entry per item
-  in request order, each with `grant` and `exp`, `public: true` (no grant needed), or `error`
-  (`{ status, code, message }`); a catalog node gets keys and no grant. It decides every item at
-  one combined checkpoint: if the checkpoint moved while it decided, it decides again, up to three
-  times, then answers `503 behind` with `Retry-After`. So "may this reader read all of these?" is
-  one call: it may if no entry has `error` (a public item counts as readable), and may not if an
-  entry's error is a refusal (a `4xx` status); an entry whose error is a `5xx` (`503 behind` when
-  the catalog lags its `maxLag`, `502 upstream`) is undecided, and the client asks again. It takes
-  1 to 100 items (`400` otherwise).
-- Decisions carry `checkpoint`, the combined checkpoint (§B.5, the same value as listings' `at`)
-  they were decided at, so a client that caches decisions keys them by it (§B.11.4): the answers of
-  `POST /grants`, `POST /read-grants` and `POST /merge-grants`, and the bodies of refusals that are
-  decisions (`403`, `404`, `409`, `410`: `{ code, message, checkpoint }`). A refusal decided from
-  state the checkpoint doesn't pin carries none: a `409` for a name the core has but the service
-  hasn't seen yet, a `403` because the catalog key is missing at the head, a merge batch's stale
-  precondition. The grants' own `at` stays the catalog's `ns_id`, which `requireAt` can check. What
-  a decision reads is as of that checkpoint, as for listings: the roles, their definitions, the
-  catalog key, includes and place lists, and for `/read-grants` whether a namespace is public and
-  its encryption. So a `/roles` or `read` change the service hasn't reached yet doesn't change a
-  decision.
+  item's placement) visible to the caller: `{ "grants": [...] }`, one entry per item in request
+  order, each with `grant` and `exp`, `public: true` (an item in a public namespace that isn't
+  sealed: no grant needed), or `error` (`{ status, code, message }`), and its `checkpoint`
+  (below); a sealed item also gets its keys, and a catalog node keys and no grant. It decides
+  every item at one combined checkpoint: if the checkpoint moved while it decided, it decides
+  again, up to three times, then answers `503 behind` with `Retry-After`. So "may this reader
+  read all of these?" is one call (v0.51, §B.11.5): it may iff every item comes back with a
+  grant, as `public: true`, or, for a sealed item or a catalog node, with its keys, that is if
+  no entry has `error`; it may not if an entry's error is a refusal (a `4xx` status); an entry
+  whose error is a `5xx` (`503 behind` when the catalog lags its `maxLag`, `503 keys`,
+  `502 upstream`) is undecided, and the client asks again. It takes 1 to 100 items (`400`
+  otherwise).
+- Decisions carry `checkpoint`, `{ ns: ns_id, … }`: the `ns_id`s of the catalog and of each named
+  item's namespace they were decided at, which are all a decision depends on (v0.51, §B.11.4), so
+  a client that caches a decision keys it by them, and a write to another namespace the catalog
+  trusts doesn't drop it. It goes beside each grant, never inside it: in the answers of
+  `POST /grants` and `POST /merge-grants` (for a merge batch, the namespaces of the items its
+  placements name), in each entry of `POST /read-grants` (for a catalog node, the catalog's, and
+  for a placement node also its item's namespace's), and in the bodies of refusals that are
+  decisions (`403`, `404`, `409`, `410`: `{ code, message, checkpoint }`). One map per entry,
+  rather than one for a whole `/read-grants` answer, keys each item by only its own namespaces
+  and leaves out the entries that have none. A refusal decided from state the checkpoint doesn't
+  pin carries none: a `409` for a name the core has but the service hasn't seen yet, a `403`
+  because the catalog key is missing at the head, a merge batch's stale precondition, a `5xx`;
+  so does a public item of a namespace the catalog doesn't follow, read at the head. It isn't
+  listings' combined `at`, and the grants' own `at` stays the catalog's `ns_id`, which
+  `requireAt` can check. What a decision reads is as of that checkpoint, as for listings: the
+  roles, their definitions, the catalog key, includes and place lists, and for `/read-grants`
+  whether a namespace is public and its encryption. So a `/roles` or `read` change the service
+  hasn't reached yet doesn't change a decision.
 
 Listings are filtered by the caller's subject set (§B.11.5). A node is visible when the walk up
 collects, through a subject the catalog key may assert, a role granting `read` without conditions:
@@ -1860,12 +1887,89 @@ listing at a given `at` never changes when a `/roles` change lands later. `probl
 namespaces they cover (`403` otherwise), for a manifest those of the items it pins, for `problems`
 and `orphans` every trusted one; a public namespace counts as read namespace-wide; in the plain
 tree service too. A reader whose grant reads the catalog and every trusted content namespace as a
-whole is served unfiltered listings under `/{catalog}/at/{at}/g/all/…`, shared by all such
+whole is served unfiltered listings under `/{catalog}/g/all/at/{at}/…`, shared by all such
 readers, with a private `max-age` no longer than that grant's expiry. Reading only some of them as
 a whole doesn't change the URL space (the listing is then the subject set's), but still admits
 `problems`, `orphans` and manifests covering only those, served `private` with a `max-age` no
-longer than the grants, `no-store` for shared caches, and never stored sealed. There are no CDN
-edge grants: the service decides `all` per request.
+longer than the grants, `no-store` for shared caches, and never stored sealed. Without edge
+grants, the service decides `all` per request.
+
+**Edge grants for listings** (v0.51, §B.11.5, §C.5). A listing read with a grant in
+`Authorization` belongs to one credential, so it is never cached at the edge; the catalog
+service mints cookies of its own, bound to a subject set, so an edge can cache a listing for
+everyone who shares it. `POST /edge-grants` on the service's origin follows the core's issuance:
+the grant in `Authorization`, or 1 to 50 as `{ "grants": [ … ] }` in an `application/json` body
+(`415` otherwise; `400` with `Authorization` too, an empty list or another member), all or
+nothing (`401` if any grant is, else `403`), answering `{ "prefixes": [...], "exp" }`
+(`no-store`) with one `Secure`, `HttpOnly` cookie per prefix, named and formatted as the core's.
+Once nothing is refused, an exchange draws one token, however many grants it carries, from the
+`exchangeRate` bucket of each distinct principal among them (keyed by principal and kid, as the
+core keys write buckets), and is `429` (`code: "rate"`, `limit: "exchangeRate"`, `Retry-After`)
+while any is empty (v0.52, §6.6). The buckets are the process's own, 10/s with a burst of 100,
+set with `-exchange-rate` and `-exchange-burst`. Like the core's, it takes no query parameters
+(`400`).
+Each grant is resolved as a listing resolves its reader: its prefix is `/{catalog}/g/{gs}`, the
+subject set its listings are served under, lasting until that grant's `exp` or 15 minutes,
+whichever is sooner; or `/{catalog}/g/all` for a reader with namespace-wide read on the catalog
+and every content namespace it trusts, lasting until the earliest of those grants. A prefix
+several grants give gets one cookie, lasting as long as the longest, and `exp` is the earliest.
+While the core runs with authentication disabled it is `404 not_offered`, before the body is
+read; so is it on the plain tree service, whose listings depend on more than a subject set.
+`DELETE /edge-grants?prefix=…` withdraws them, as the core's does for its own prefixes (`prefix`
+repeatable, each `/{catalog}/g/{gs}`, `400` otherwise; `204` with expired cookies, no grant
+needed). Credentialed CORS is the core's: pages listed with `-cors-credentials-origin` call it
+with `credentials: "include"`, the cookies are then `SameSite=None` (otherwise `Lax`), and only
+those origins may preflight the `DELETE`. Cookies are signed with `-edge-grant-key FILE`, a key
+of the service's own that the origin never holds (refused if it is the one the origin derives
+from `-edge-secret`; without the flag, a random key per process, so cookies don't survive a
+restart), named `-edge-grant-kid` (default `catalog-{catalog}`), which may not be the origin's
+kid, `-origin-edge-grant-kid` (default `origin`). A catalog named `r` or `ns` mints none, since
+its prefixes would overlap the core's (the service still runs; naming a key or kid for it is an
+error).
+
+A `GET` or `HEAD` without `Authorization` that carries one of these cookies, covering its path
+and passing the six checks an edge makes (see
+[Private namespaces and the edge](#private-namespaces-and-the-edge), with the service's kid),
+is read as that subject set, with no grant. The cookie covers
+the subject set's listings at every `at`, not the head pointer: a reader follows the pointer with
+its grant once, or starts from any `at` under the prefix, which redirects to the current one. A
+read under a cookie gets edge lifetimes only when a verifying edge (`-edge-secret`) checked it
+and says so, with the prefix in `-edge-prefix-header`, exactly as for the core's private reads;
+otherwise it is `no-store` at the edge, and so is everything else private. Namespace-wide reads
+don't come with a subject set's cookie, so its `problems`, `orphans` and manifests are `403`
+unless the namespaces they cover are public. A cookie carries only `kid`, `p` and `exp`, so the
+service keeps the subjects behind each `gs` it minted a cookie for (`edge_subjects`, across
+restarts and `-rebuild`, until the last such cookie expires); a `gs` it doesn't know, such as
+one another instance with its own database minted, is `401`, and the reader exchanges again
+there. A user's direct `$access` entries count as they were at the exchange.
+
+A `g/all` cookie was checked against the content namespaces the catalog trusted when it was
+issued, and covers every later `at`, so the service answers `403` at an `at` that includes a
+namespace trusted since, until the reader exchanges again (a kept listing from before is still
+served). The service records when it came to trust each namespace (`meta` `trusted:{ns}`; a new
+or rebuilt database records its start). A cookie carries only `kid`, `p` and `exp`, so every
+`g/all` cookie with one `exp` is the same bytes, and when one was issued can be known only where
+nothing else holds the key: with a random key (no `-edge-grant-key`), the service records when
+it first issued a `g/all` cookie with each `exp` and refuses a namespace trusted no earlier than
+that (an exchange that would repeat a cookie issued before a namespace became trusted gets an
+`exp` a second earlier). With `-edge-grant-key`, which a restart or another instance shares, it
+is conservative: a cookie counts as issued at its `exp` less 15 minutes, so for 15 minutes after
+a namespace becomes trusted (or a new database starts) only cookies lasting the full 15 minutes
+read an `at` including it. A namespace that was public when a `g/all` cookie was issued and has
+turned private since is still read whole under it until it expires, as under a grant revoked
+since: the cookie's lifetime is the revocation latency (§C.5).
+
+An edge can't make that check: it serves a listing it holds to every `g/all` cookie that passes
+its six checks. So a `g/all` listing at an `at` including a recently trusted namespace is
+`no-store` at the edge, whoever reads it, while a `g/all` cookie issued before that namespace was
+trusted may be live: with a random key, while one the service issued is; with a key file, for 15
+minutes after. Either way a minute more is allowed for edges' clocks.
+
+```sh
+head -c 32 /dev/urandom | base64 > catalog-edge-grant.key   # the edge holds it too, under catalog-cat
+patchlog tree -catalog cat -access -key SEED -kid catalog-01 \
+  -edge-grant-key catalog-edge-grant.key -edge-secret edge.secret -cors-credentials-origin https://app.example
+```
 
 Read-your-writes: after its own write, a client relists with `?min={ns}:{ns_id}` from the write's
 `X-Namespace-Revision` (repeatable, the catalog or any content namespace it trusts), which is a new
@@ -1873,7 +1977,12 @@ URL past any cached head pointer and waits for the service to catch up (`503` wi
 otherwise), instead of fetching with `no-store` (§B.5, §A.5). As in the search index, `min`
 always redirects (v0.50): an `at` URL whose listing already includes every `min` (the current
 `at`, or a kept one whose checkpoints show it) to itself without `min`, anything else to the
-current `at`. A bare `{ns_id}` never counts as included in an older `at`. `POST /grants` and
+current `at`. A bare `{ns_id}` never counts as included in an older `at`. Every namespace a
+catalog's service follows is in its `at`. A tree service serving several catalogs keeps an `at`
+per catalog, so a `min` naming a namespace that only another of its catalogs follows, and that
+the reader may see (public, or its grant reads it), is waited for there and redirects to the
+current `at` in one hop (§A.5); a `min` naming a namespace no catalog of the service follows, or
+one the reader can't see, is `400`, with one message for both. `POST /grants` and
 `POST /read-grants` take `?min` the same way; a decision on an item also depends on its content
 namespace (whether the item exists), so after creating a document it placed, or restoring one, a
 client passes `min` for both (§B.11.4).

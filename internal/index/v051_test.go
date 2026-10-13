@@ -3,70 +3,103 @@ package index_test
 import (
 	"context"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
-	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// TestSealedPurged (§8.5, §10): a sealed namespace's log, long-polls and
-// documents are 410 purged once it is purged, with head its purge-ns
-// entry. An indexer following it takes that as the purge, at that head,
-// and so does one started after the purge; both then answer the purge's
-// 410 as for any purged namespace.
-func TestSealedPurged(t *testing.T) {
+// TestMinOtherNamespace (§A.5, v0.51): a min naming a namespace that a
+// result's at doesn't cover, but that the service follows and the reader
+// may see, redirects to the current checkpoint in one hop, without min; a
+// min naming a namespace the reader can't see, or one the service doesn't
+// follow, is 400. min is a set: given twice, it counts once. A
+// single-valued parameter given twice is 400.
+func TestMinOtherNamespace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
-	k := clienttest.NewKey("k")
-	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "sec"))).CreateNamespace(ctx, "sec",
-		map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}))
-	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"sec"}, []string{"read", "create", "config", "purge-ns"})),
-		client.WithKeys(client.NewKeys(nil)))
-	must(createNonced(w, "sec", "a", map[string]any{"title": "secret"}))
-	jwk, priv, err := seal.GenerateRecipient()
-	if err != nil {
-		t.Fatal(err)
-	}
-	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"sec"}, []string{"read"}, map[string]any{"enc": jwk})),
-		client.WithKeys(client.NewKeys(priv)))
-	withKey := func(o *indexOpts) { o.Recipient = priv }
-	start := func() *svc {
-		return startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"sec"}, untyped: true, now: s.Now}, withKey)
-	}
-	x := start()
-	x.caughtUp("sec")
-
-	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
-	purged := must(w.PurgeNamespace(ctx, "sec", must(w.NSHead(ctx, "sec")).ID))
-	if _, err := ic.NSLog(ctx, "sec", purged, ""); !client.IsPurged(err) {
-		t.Fatalf("the sealed log after the purge: %v", err)
-	}
-	// The index can't read the configuration any more: the core makes the
-	// read check, and answers the 410 only to a grant that passes it.
-	reader := k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"})
-	writer := k.Grant(t, s.Now(), "user:n", []string{"sec"}, []string{"create"})
-	// A grant that reads one resource passes the index's read check too,
-	// as for a namespace purged at rest.
-	fixed := k.Grant(t, s.Now(), "user:f", []string{"sec"}, []string{"read"},
-		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
-	for name, x := range map[string]*svc{"following": x, "started after": start()} {
-		waitFor(t, name+": the purge", func() bool { return x.ix.Checkpoint("sec") == purged })
-		for _, tok := range []string{reader, fixed} {
-			if r := x.raw("/sec?q=secret", tok); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged {
-				t.Errorf("%s: %d %v", name, r.status, r.body)
-			}
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
+	for _, ns := range []string{"pa", "pb", "pub"} {
+		doc := map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), issuer.Entry("read")}}
+		if ns == "pub" {
+			doc["read"] = "public"
 		}
-		for tok, want := range map[string]int{"": 401, writer: 403} {
-			if r := x.raw("/sec?q=secret", tok); r.status != want {
-				t.Errorf("%s: token %.10q: %d %v, want %d", name, tok, r.status, r.body, want)
-			}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	nss := []string{"pa", "pb", "pub"}
+	root := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", nss, []string{"read", "create", "append"})))
+	for _, ns := range nss {
+		must(root.CreateDoc(ctx, ns, "a", map[string]any{"title": ns}))
+	}
+	x := startSvc(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: nss, untyped: true, now: s.Now})
+	for _, ns := range nss {
+		x.caughtUp(ns)
+	}
+	amy := issuer.Grant(t, s.Now(), "user:amy", []string{"pa"}, []string{"read"})
+	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"pa", "pb"}, []string{"read"})
+	old := map[string]string{}
+	for tok, name := range map[string]string{amy: "amy", bob: "bob"} {
+		r := x.raw("/pa?limit=5", tok)
+		if loc := r.header.Get("Location"); r.status != 302 || !strings.HasPrefix(loc, "/pa/g/") {
+			t.Fatalf("%s: %d %s", name, r.status, loc)
 		}
-		// Left out of /_refs, as any purged namespace.
-		if r := x.raw("/_refs?to=%2Fr%2Fsec%2Fa", reader); r.status != 302 {
-			t.Errorf("%s: /_refs: %d %v", name, r.status, r.body)
+		old[name] = r.header.Get("Location")
+	}
+	// pa moves on: its current checkpoint is no longer the one of the URLs
+	// above, whose results are kept.
+	must(root.CreateDoc(ctx, "pa", "b", map[string]any{"title": "pa"}))
+	cur := x.caughtUp("pa")
+	pubAt := must(root.CreateDoc(ctx, "pub", "b", map[string]any{"title": "pub"})).NSID
+	pbAt := must(root.CreateDoc(ctx, "pb", "b", map[string]any{"title": "pb"})).NSID
+	x.caughtUp("pub")
+	x.caughtUp("pb")
+	current := func(loc string) string {
+		i := strings.Index(loc, "/at/")
+		return loc[:i] + "/at/" + cur + "?limit=5"
+	}
+	for _, c := range []struct {
+		who, tok, url, want string
+	}{
+		// A followed namespace the reader may see: one hop to the current
+		// checkpoint, from the at URL and from the pointer.
+		{"amy", amy, old["amy"] + "&min=pub:" + pubAt, current(old["amy"])},
+		{"amy", amy, "/pa?limit=5&min=pub:" + pubAt, current(old["amy"])},
+		{"bob", bob, old["bob"] + "&min=pb:" + pbAt, current(old["bob"])},
+		// A set: the same min twice is one.
+		{"bob", bob, old["bob"] + "&min=pb:" + pbAt + "&min=pb:" + pbAt, current(old["bob"])},
+	} {
+		if r := x.raw(c.url, c.tok); r.status != 302 || r.header.Get("Location") != c.want {
+			t.Errorf("%s %s: %d %s, want %s", c.who, c.url, r.status, r.header.Get("Location"), c.want)
 		}
+	}
+	for _, c := range []struct {
+		who, tok, url string
+	}{
+		// pb is followed, but amy's grant doesn't read it.
+		{"amy", amy, old["amy"] + "&min=pb:" + pbAt},
+		{"amy", amy, "/pa?limit=5&min=pb:" + pbAt},
+		// zz isn't followed.
+		{"bob", bob, old["bob"] + "&min=zz:" + pbAt},
+		// limit may not repeat (§7, §A.5).
+		{"bob", bob, "/pa?limit=5&limit=5"},
+	} {
+		if r := x.raw(c.url, c.tok); r.status != 400 || r.body["code"] != "bad_input" || r.header.Get("Cache-Control") != "no-store" {
+			t.Errorf("%s %s: %d %v", c.who, c.url, r.status, r.body)
+		}
+	}
+	// One answer for a namespace the reader can't see and one the index
+	// doesn't follow, so a min can't probe which private namespaces are
+	// indexed, even anonymously on a public result.
+	pubOld := x.raw("/pub?limit=5", "").header.Get("Location")
+	if !strings.HasPrefix(pubOld, "/pub/at/") {
+		t.Fatalf("public pointer: %q", pubOld)
+	}
+	hidden, unknown := x.raw(pubOld+"&min=pb:"+pbAt, ""), x.raw(pubOld+"&min=zz:"+pbAt, "")
+	if hidden.status != 400 || unknown.status != 400 || hidden.body["message"] != unknown.body["message"] || hidden.body["code"] != unknown.body["code"] {
+		t.Errorf("hidden %d %v, unknown %d %v", hidden.status, hidden.body, unknown.status, unknown.body)
 	}
 }

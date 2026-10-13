@@ -754,6 +754,8 @@ func (nopRoleView) Resolve(context.Context, *grant.Verified) ([]string, tree.Vis
 	return nil, nil, nil
 }
 
+func (nopRoleView) ForSubjects([]string) tree.Visibility { return nil }
+
 // httpClient has its own connection pool, a clone of http.DefaultTransport:
 // httptest.Server.Close closes the default one's idle connections, which
 // breaks a request a parallel test is starting on it.

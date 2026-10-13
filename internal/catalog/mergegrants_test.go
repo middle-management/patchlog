@@ -2,6 +2,7 @@ package catalog_test
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -55,10 +56,11 @@ func testMergeGrants(t *testing.T) {
 	if r.body["approvedBy"] != "user:anna" {
 		t.Fatalf("approvedBy %v", r.body)
 	}
-	// As for POST /grants, the combined checkpoint it was decided at
-	// (§B.11.4).
-	if r.body["checkpoint"] != w.svc.Tree().At() {
-		t.Errorf("merge grant checkpoint %v, now %s", r.body["checkpoint"], w.svc.Tree().At())
+	// As for POST /grants, the checkpoint it was decided at: the
+	// catalog's ns_id and those of the namespaces of the items its
+	// placements name (§B.11.4, v0.51).
+	if cp := w.checkpointOf("matches"); !reflect.DeepEqual(r.body["checkpoint"], cp) {
+		t.Errorf("merge grant checkpoint %v, now %v", r.body["checkpoint"], cp)
 	}
 	g := must(grant.Decode(r.body["grant"].(string), 0))
 	root := g.Blocks[0]
@@ -102,8 +104,8 @@ func testMergeGrants(t *testing.T) {
 	}
 	// A refusal of the checks, a decision at the checkpoint, carries it
 	// (§B.11.4).
-	if r.body["checkpoint"] != w.svc.Tree().At() {
-		t.Errorf("widening move refused at %v, now %s", r.body["checkpoint"], w.svc.Tree().At())
+	if cp := w.checkpointOf("matches"); !reflect.DeepEqual(r.body["checkpoint"], cp) {
+		t.Errorf("widening move refused at %v, now %v", r.body["checkpoint"], cp)
 	}
 	// A change of $access: refused for non-admins; for an admin, checked
 	// and answered admin, with no grant (§F.8: submitted under the admin's).
@@ -115,6 +117,10 @@ func testMergeGrants(t *testing.T) {
 	r = ask(w.caller("user:chief", "catalog-admins"), access)
 	if r.status != 200 || r.body["admin"] != true || r.body["grant"] != nil {
 		t.Fatalf("$access by an admin: %d %v", r.status, r.body)
+	}
+	// A batch of folders names no item: the catalog's ns_id alone.
+	if cp := w.checkpointOf(); !reflect.DeepEqual(r.body["checkpoint"], cp) {
+		t.Errorf("folder batch checkpoint %v, now %v", r.body["checkpoint"], cp)
 	}
 	// Without powers on the folder: refused.
 	if r = ask(w.caller("user:bo", "fan-club"), batch(map[string]any{"resource": "matches.shared", "ifMatch": head("matches.shared"), "steps": []any{"delete"}})); r.status != 403 {

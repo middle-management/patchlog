@@ -36,10 +36,10 @@ func (s *svc) refsPointer(query, token string) (at, gs, loc string) {
 	r := s.raw("/_refs"+query, token)
 	loc = r.header.Get("Location")
 	p := strings.Split(strings.SplitN(loc, "?", 2)[0], "/")
-	if r.status != 302 || len(p) != 6 || p[1] != "_refs" || p[2] != "at" || p[4] != "g" {
+	if r.status != 302 || len(p) != 6 || p[1] != "_refs" || p[2] != "g" || p[4] != "at" {
 		s.t.Fatalf("GET /_refs%s: %d %q %v", query, r.status, loc, r.body)
 	}
-	return p[3], p[5], loc
+	return p[5], p[3], loc
 }
 
 // GET /_refs asks every namespace the index follows that the reader may
@@ -251,8 +251,8 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 		}
 	}
 	for _, p := range []string{
-		"/_refs/at/" + idx.ix.Checkpoint("pa") + "/g/" + amyGs + q, // never computed
-		"/_refs/at/" + amyAt + "/g/" + amyGs + q + "&min=pa:" + idx.ix.Checkpoint("pa"),
+		"/_refs/g/" + amyGs + "/at/" + idx.ix.Checkpoint("pa") + q, // never computed
+		"/_refs/g/" + amyGs + "/at/" + amyAt + q + "&min=pa:" + idx.ix.Checkpoint("pa"),
 	} {
 		if r := idx.raw(p, amy); r.status != 302 || r.header.Get("Location") != newLoc {
 			t.Errorf("%s: %d %s", p, r.status, r.header.Get("Location"))
@@ -260,18 +260,18 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	}
 	// The query in another form redirects to the canonical one, at the
 	// same at (§A.5).
-	if r := idx.raw("/_refs/at/"+amyAt+"/g/"+amyGs+"?to="+x, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
+	if r := idx.raw("/_refs/g/"+amyGs+"/at/"+amyAt+"?to="+x, amy); r.status != 302 || r.header.Get("Location") != amyLoc {
 		t.Errorf("not canonical: %d %s", r.status, r.header.Get("Location"))
 	}
 	// Someone else's subject set redirects to one's own, at the same at.
-	if r := idx.raw(bobLoc, amy); r.status != 302 || r.header.Get("Location") != "/_refs/at/"+bobAt+"/g/"+amyGs+q {
+	if r := idx.raw(bobLoc, amy); r.status != 302 || r.header.Get("Location") != "/_refs/g/"+amyGs+"/at/"+bobAt+q {
 		t.Errorf("foreign gs: %d %s", r.status, r.header.Get("Location"))
 	}
 	// With min, it goes into one's own straight away, without min (§A.5):
 	// to the same at if its kept answer includes min, or else to the
 	// current one.
 	for p, want := range map[string]string{
-		"/_refs/at/" + amyAt + "/g/" + bobGs + q + "&min=pa:" + a1: amyLoc,
+		"/_refs/g/" + bobGs + "/at/" + amyAt + q + "&min=pa:" + a1: amyLoc,
 		bobLoc + "&min=pa:" + a1:                                   newLoc,
 	} {
 		if r := idx.raw(p, amy); r.status != 302 || r.header.Get("Location") != want {
@@ -336,17 +336,21 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	// Bad input.
 	for _, p := range []string{
 		"/_refs", "/_refs?to=garbage", "/_refs" + q + "&to=" + url.QueryEscape("/r/target/y"), "/_refs" + q + "&q=x",
-		"/_refs" + q + "&limit=0", "/_refs" + q + "&limit=101", "/_refs/at/zzz/g/" + amyGs + q,
+		"/_refs" + q + "&limit=0", "/_refs" + q + "&limit=101", "/_refs/g/" + amyGs + "/at/zzz" + q,
 		"/_refs" + q + "&after=pa", "/_refs" + q + "&after=pa/a1&after=pa/a2",
 	} {
 		if r := idx.raw(p, amy); r.status != 400 {
 			t.Errorf("%s: %d", p, r.status)
 		}
 	}
-	for _, p := range []string{"/_refs/x", "/_refs/at/" + amyAt + q, "/_refs/at/" + amyAt + "/g/zzz" + q} {
+	for _, p := range []string{"/_refs/x", "/_refs/at/" + amyAt + q, "/_refs/g/" + amyGs + q, "/_refs/g/zzz/at/" + amyAt + q, "/_refs/at/" + amyAt + "/g/zzz" + q} {
 		if r := idx.raw(p, amy); r.status != 404 {
 			t.Errorf("%s: %d", p, r.status)
 		}
+	}
+	// The form before v0.51 is moved to the subject set first (§A.4).
+	if r := idx.raw("/_refs/at/"+amyAt+"/g/"+amyGs+q, ""); r.status != 301 || r.header.Get("Location") != amyLoc {
+		t.Errorf("old form: %d %s", r.status, r.header.Get("Location"))
 	}
 
 	// A purge drops the kept answers that show the resource.

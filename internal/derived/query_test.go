@@ -26,6 +26,8 @@ func TestCanonicalQuery(t *testing.T) {
 		{"utf-8 bytes order", "q=%C3%A5&q=z", nil, "?q=z&q=%C3%A5"},
 		{"empty value", "unordered", nil, "?unordered="},
 		{"drop", "min=1&q=x&min=2", []string{"min"}, "?q=x"},
+		// Repeatable parameters are sets (§A.5, v0.51).
+		{"a value once", "min=b:2&min=a:1&min=b:2", nil, "?min=a%3A1&min=b%3A2"},
 	} {
 		v, err := url.ParseQuery(c.in)
 		if err != nil {

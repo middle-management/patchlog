@@ -17,6 +17,7 @@ import (
 	"github.com/middle-management/patchlog/internal/catalog"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -58,6 +59,15 @@ type world struct {
 
 	svcClient *client.Client
 	sealed    bool // both namespaces are sealed (Addendum E.2)
+
+	// The service's own edge grants and the verifying edge in front of
+	// it, if set before start (§B.11.5, §9).
+	edgeGrants *edge.Cookies
+	edge       *edge.Verifier
+	// edgeOwnKey says edgeGrants' key is the service's alone, and
+	// exchangeRate is its exchangeRate bucket (tree.Options).
+	edgeOwnKey   bool
+	exchangeRate tree.Rate
 }
 
 func toAny(xs ...string) []any {
@@ -184,7 +194,8 @@ func (w *world) start() {
 	svc, err := catalog.Open(context.Background(), catalog.Options{
 		Tree: tree.Options{Client: w.svcClient, Catalog: "cat", DB: w.db, Now: w.s.Now, CheckerTTL: time.Millisecond,
 			Logf:          func(f string, a ...any) { w.t.Logf(f, a...) },
-			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}},
+			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
+			EdgeGrants:    w.edgeGrants, Edge: w.edge, EdgeGrantsOwnKey: w.edgeOwnKey, ExchangeRate: w.exchangeRate},
 		Key: w.cat.Priv, Kid: "catalog-01",
 		MergeKey: w.mergeKey.Priv, MergeKid: "catalog-merge", MergeService: "svc:merge",
 	})
@@ -723,9 +734,10 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 
 	fan := w.caller("user:fred", "fan-club")
 	b, loc := get("/cat/children?of=season", fan)
-	// §B.11.5: /{catalog}/at/{at}/g/{gs}/…, at the combined checkpoint (§B.5).
+	// §B.11.5: /{catalog}/g/{gs}/at/{at}/…, the subject set first (v0.51),
+	// at the combined checkpoint (§B.5).
 	cp := w.svc.Tree().At()
-	if !strings.HasPrefix(loc, "/cat/at/"+cp+"/g/") || cp == w.svc.Tree().Checkpoint("cat") {
+	if !strings.HasPrefix(loc, "/cat/g/") || !strings.Contains(loc, "/at/"+cp+"/children?") || cp == w.svc.Tree().Checkpoint("cat") {
 		t.Errorf("listing url %s", loc)
 	}
 	// A private listing at an at is immutable too, tagged per item and per namespace.
@@ -741,7 +753,7 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 	}
 	old := loc
 	b, loc = get("/cat/children?of=season", fan)
-	if loc == old || !strings.HasPrefix(loc, "/cat/at/"+w.svc.Tree().At()+"/g/") {
+	if loc == old || !strings.HasPrefix(loc, "/cat/g/") || !strings.Contains(loc, "/at/"+w.svc.Tree().At()+"/") {
 		t.Errorf("private listing after a content change: %s", loc)
 	}
 	// fan-club (reader) sees season's items but not the embargoed folder.

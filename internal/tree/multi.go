@@ -3,6 +3,7 @@ package tree
 import (
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 
@@ -24,7 +25,9 @@ import (
 //	GET /_status?catalog={catalog} that catalog's status alone
 //
 // Anything else is 404. Grants (§B.11) are not routed: a catalog service
-// serves exactly one catalog.
+// serves exactly one catalog. A min naming a namespace another catalog's
+// service follows is waited for there, and redirects to the current at
+// (§A.5, awaitMins).
 func Multi(svcs ...*Service) (http.Handler, error) {
 	by := map[string]*Service{}
 	var cats []string
@@ -37,6 +40,9 @@ func Multi(svcs ...*Service) (http.Handler, error) {
 		cats = append(cats, c)
 	}
 	sort.Strings(cats)
+	for _, s := range svcs {
+		s.siblings = slices.DeleteFunc(slices.Clone(svcs), func(o *Service) bool { return o == s })
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		first, _, _ := strings.Cut(strings.TrimPrefix(r.URL.Path, "/"), "/")
 		if first == "_status" && r.URL.Path == "/_status" {

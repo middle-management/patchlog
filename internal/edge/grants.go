@@ -33,7 +33,11 @@ import (
 //
 // unpadded, where c is the canonical JSON (§3.1) of { "exp", "kid", "p" }:
 // Unix seconds, the key's name and the prefix. The origin's key vouches
-// only for the core prefixes (ParsePrefix). A verifying edge holding the
+// only for the core prefixes (ParsePrefix); a service's key, with
+// Cookies.Vouches set, only for prefixes under a root of its own, never
+// under /r/ or /ns/, such as a catalog service's /{catalog}/g/{gs}
+// (§B.11.5). So a cookie one mints never covers the other's URLs, even
+// under the other's key. A verifying edge holding the
 // key checks a request as Check does; without one the origin checks it
 // itself. The key is the deployment's: given on its own, or derived from
 // the edge secret (KeyFromSecret), so the edge and the origin share it.
@@ -74,6 +78,12 @@ type Cookies struct {
 	SameSite http.SameSite
 	// TTL caps an edge grant's lifetime (MaxGrantTTL if zero).
 	TTL time.Duration
+	// Vouches, if set, reports whether the key vouches for a prefix: a
+	// service's key, for prefixes under a root of its own (§C.5
+	// "Format"). A prefix under /r/ or /ns/ is never one of them,
+	// whatever Vouches says. Unset, the key is the origin's, which
+	// vouches only for the core prefixes (ParsePrefix).
+	Vouches func(prefix string) bool
 }
 
 // cookieKey is a key and the kid naming it.
@@ -160,14 +170,30 @@ func (v *Verifier) CookieKey() []byte {
 	return append([]byte(nil), v.cookieKey...)
 }
 
+// VouchesFor reports whether c's key vouches for a prefix (§C.5
+// "Format"): a core prefix for the origin's key, one Vouches allows, and
+// not under /r/ or /ns/, for a service's.
+func (c *Cookies) VouchesFor(p string) bool {
+	if c.Vouches == nil {
+		_, _, ok := ParsePrefix(p)
+		return ok
+	}
+	return !Covers("/r", p) && !Covers("/ns", p) && c.Vouches(p)
+}
+
+// MaxTTL is the longest an edge grant c issues lives: the TTL, at most
+// MaxGrantTTL.
+func (c *Cookies) MaxTTL() time.Duration {
+	if c.TTL <= 0 || c.TTL > MaxGrantTTL {
+		return MaxGrantTTL
+	}
+	return c.TTL
+}
+
 // Lifetime is how long an edge grant issued at now for a grant expiring at
 // exp (zero: no exp) lives: at most the TTL, never past exp.
 func (c *Cookies) Lifetime(now, exp time.Time) time.Time {
-	ttl := c.TTL
-	if ttl <= 0 || ttl > MaxGrantTTL {
-		ttl = MaxGrantTTL
-	}
-	out := now.Add(ttl)
+	out := now.Add(c.MaxTTL())
 	if !exp.IsZero() && exp.Before(out) {
 		out = exp
 	}
@@ -241,11 +267,11 @@ func parse(value string) (*Claims, string, []byte, error) {
 }
 
 // verify checks parsed claims at now: a kid c holds, which vouches only
-// for the core prefixes, and a valid MAC under its key, compared in
-// constant time (check 4 of §C.5); exp in the future (check 5).
+// for its own prefixes (VouchesFor), and a valid MAC under its key,
+// compared in constant time (check 4 of §C.5); exp in the future (check 5).
 func (c *Cookies) verify(cl *Claims, p string, sum []byte, now time.Time) error {
 	key := c.key(cl.Kid)
-	if _, _, ok := ParsePrefix(cl.Prefix); !ok || key == nil {
+	if !c.VouchesFor(cl.Prefix) || key == nil {
 		return errBadCookie
 	}
 	if !hmac.Equal(sum, mac(key, p)) {
@@ -322,7 +348,7 @@ func CanonicalPath(path string) bool {
 //  1. the method is GET or HEAD;
 //  2. the path has no empty, "." or ".." segment and no percent-escape;
 //  3. a cookie whose name is derived from its own p (others are ignored);
-//  4. a kid c holds, which vouches for p, and a valid MAC;
+//  4. a kid c holds, which vouches for p (VouchesFor), and a valid MAC;
 //  5. exp is in the future;
 //  6. p covers the path segment by segment.
 //
