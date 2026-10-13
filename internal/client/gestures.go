@@ -45,7 +45,9 @@ type GestureEntry struct {
 // immutable: a later read may find more. A deployment that doesn't offer
 // the endpoint, or a sealed or e2e namespace, answers 404 (IsNotFound); a
 // grant limited to some resources gets only their entries (§C.5). Clients
-// then scan the logs they follow instead (§11.2).
+// then scan the logs they follow instead (§11.2): the namespace log, or,
+// for a grant limited to some resources, the logs of the documents it
+// knows the action touched (UndoResources).
 func (c *Client) GesturesPage(ctx context.Context, ns, gesture, after string) (entries []GestureEntry, next string, err error) {
 	if err := checkNS(ns); err != nil {
 		return nil, "", err

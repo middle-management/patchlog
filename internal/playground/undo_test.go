@@ -18,10 +18,11 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// undoHarness runs app.js's undo procedure (extracted, with api over fetch
-// and the sealed-content key stubbed with the namespace's epoch key)
-// against a live server, scenario by scenario.
-const undoHarness = `
+// undoPrelude runs app.js's undo procedure (extracted, with api over fetch,
+// sending input.bearer if given, and the sealed-content key stubbed with
+// the namespace's epoch key) against a live server; the scenarios follow
+// it (undoHarness, undoLimitedHarness).
+const undoPrelude = `
 const fs = require('fs');
 require(process.argv[2]);
 const input = JSON.parse(fs.readFileSync(process.argv[3], 'utf8'));
@@ -33,6 +34,7 @@ const S = { ns: '', nsLogErr: '' };
 const KEY = Z.unb64u(input.key);
 async function api(method, path, o = {}) {
   const headers = { 'X-Author': input.author };
+  if (input.bearer) headers.Authorization = 'Bearer ' + input.bearer;
   let body = o.body;
   if (body !== undefined) { if (typeof body !== 'string') body = JSON.stringify(body); headers['Content-Type'] = 'application/json'; }
   const res = await fetch(input.base + path, { method, headers, body, redirect: 'follow' });
@@ -50,6 +52,10 @@ async function decrypted(r, ns, resource, want) {
   catch (err) { return { value: null, error: err.message }; }
 }
 FUNCTIONS
+`
+
+// undoHarness runs the scenarios of TestUndoWithNode.
+const undoHarness = undoPrelude + `
 (async () => {
   const out = {};
   const g = input.g;
@@ -207,37 +213,8 @@ func TestUndoWithNode(t *testing.T) {
 		t.Fatalf("keys %v %v", fk, err)
 	}
 
-	js, err := assets.ReadFile("static/app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var fns []string
-	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead", "openEntries", "openSealed", "readDoc", "foldTarget",
-		"undoPtr", "undoPtrStr", "ptrGet", "sameAt", "hasPrefix", "widenWrite", "coverPaths", "pathsOverlap", "foldUndo", "moveBack", "invertRev",
-		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoReadRes", "undoPlan", "undoImpossible", "undoRun", "undoLatest",
-		"needsNonce"} {
-		fns = append(fns, jsFunction(t, js, f))
-	}
-	src := strings.Replace(undoHarness, "FUNCTIONS", "const GESTURE_RE = /^[a-z2-7]{26}$/;\n"+strings.Join(fns, "\n"), 1)
-	dir := t.TempDir()
-	hp := filepath.Join(dir, "harness.js")
-	if err := os.WriteFile(hp, []byte(src), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	in, _ := json.Marshal(map[string]any{"base": s.URL, "author": "alice", "key": base64.RawURLEncoding.EncodeToString(fk[0].Key),
+	b := runUndoHarness(t, node, undoHarness, map[string]any{"base": s.URL, "author": "alice", "key": base64.RawURLEncoding.EncodeToString(fk[0].Key),
 		"g": g, "gd": gd, "gp": gp, "gm": gm, "gs": gs, "gn": gn, "go": gO, "ga": gA})
-	inPath := filepath.Join(dir, "input.json")
-	if err := os.WriteFile(inPath, in, 0o644); err != nil {
-		t.Fatal(err)
-	}
-	sealJS, _ := filepath.Abs("static/seal.js")
-	cmd := exec.Command(node, hp, sealJS, inPath)
-	var stderr bytes.Buffer
-	cmd.Stderr = &stderr
-	b, err := cmd.Output()
-	if err != nil {
-		t.Fatalf("node: %v\n%s", err, stderr.String())
-	}
 	var out struct {
 		PlanA struct {
 			Source, Author string
@@ -361,6 +338,158 @@ func TestUndoWithNode(t *testing.T) {
 	}
 	if !strings.Contains(out.E2E, "Go client") {
 		t.Errorf("e2e refusal %q", out.E2E)
+	}
+}
+
+// runUndoHarness runs a harness (undoPrelude and scenarios) with app.js's
+// undo functions under node, and returns what it prints.
+func runUndoHarness(t *testing.T, node, harness string, input map[string]any) []byte {
+	t.Helper()
+	js, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fns []string
+	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead", "openEntries", "openSealed", "readDoc", "foldTarget",
+		"undoPtr", "undoPtrStr", "ptrGet", "sameAt", "hasPrefix", "widenWrite", "coverPaths", "pathsOverlap", "foldUndo", "moveBack", "invertRev",
+		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoNSLogOr", "undoReadRes", "undoPlan", "undoImpossible", "undoRun",
+		"undoLatest", "needsNonce"} {
+		fns = append(fns, jsFunction(t, js, f))
+	}
+	src := strings.Replace(harness, "FUNCTIONS", "const GESTURE_RE = /^[a-z2-7]{26}$/;\n"+strings.Join(fns, "\n"), 1)
+	dir := t.TempDir()
+	hp := filepath.Join(dir, "harness.js")
+	if err := os.WriteFile(hp, []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	in, _ := json.Marshal(input)
+	inPath := filepath.Join(dir, "input.json")
+	if err := os.WriteFile(inPath, in, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	sealJS, _ := filepath.Abs("static/seal.js")
+	cmd := exec.Command(node, hp, sealJS, inPath)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	b, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("node: %v\n%s", err, stderr.String())
+	}
+	return b
+}
+
+// undoLimitedHarness runs the scenarios of TestUndoLimitedWithNode.
+const undoLimitedHarness = undoPrelude + `
+(async () => {
+  const out = {};
+  const o = (x) => Object.assign({ nonce: needsNonce(null) }, x);
+  const sum = (u) => ({ ok: !!u.ok, gesture: u.gesture || '', source: u.ok ? u.plan.source : '', level: u.ok ? u.plan.level : '', author: u.ok ? u.plan.author : '',
+    steps: u.ok ? u.plan.items.map((it) => it.steps) : null, err: u.refused || u.impossible || '' });
+  S.ns = 'ls';
+  out.bare = sum(await undoRun('ls', input.g, o({})));
+  out.only = sum(await undoRun('ls', input.gb, o({ resources: ['a'] })));
+  out.undo = sum(await undoRun('ls', input.g, o({ resources: ['a', 'b'] })));
+  const latest = await undoLatest('ls', input.g, input.author, ['a', 'b']);
+  out.latest = latest ? latest.gesture : '';
+  out.redo = sum(await undoRun('ls', out.latest, o({ author: input.author, resources: ['a', 'b'] })));
+  S.ns = 'le';
+  out.e2e = sum(await undoRun('le', input.ge, o({ resources: ['a'] })));
+  process.stdout.write(JSON.stringify(out));
+})().catch((e) => { console.error(e); process.exit(1); });
+`
+
+// §11.2 Finding a gesture, §C.5: the playground's undo for a grant limited
+// to some resources, which reads neither the namespace log nor its
+// document. In a sealed namespace it scans the logs of the documents it
+// knows the action touched, learns the level from the JWEs it reads and
+// adds fresh nonces; without them it refuses instead of failing on a 403;
+// redo finds the undo in those logs; in an e2e namespace it refuses.
+func TestUndoLimitedWithNode(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: newTestKeyStore(t), LogPageSize: 3})
+	k := clienttest.NewKey("k")
+	opc := func(ns string) *client.Client { return s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))) }
+	check := func(_ any, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	check(opc("ls").CreateNamespace(ctx, "ls", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}))
+	check(opc("le").CreateNamespace(ctx, "le", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "e2e"}}))
+	only := map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"a", "b"}}}}}
+	liGrant := k.Grant(t, s.Now(), "user:li", []string{"ls", "le"}, []string{"read", "create", "append"}, only)
+	li := s.Client(t, client.WithBearer(liGrant), client.WithKeys(client.NewKeys(nil)))
+	op := func(o, path string, v any) map[string]any { return map[string]any{"op": o, "path": path, "value": v} }
+	nonced := func(p ...any) []any { return append(p, op("add", "/$nonce", seal.NewNonce())) }
+	wa, err := li.Create(ctx, "ls", "a", nonced(client.GenesisPatches(map[string]any{"n": 1})...))
+	check(wa, err)
+	wb, err := li.Create(ctx, "ls", "b", nonced(client.GenesisPatches(map[string]any{"n": 1})...))
+	check(wb, err)
+	g := client.NewGesture()
+	check(li.Append(ctx, "ls", "a", wa.ID, nonced(op("replace", "/n", 2)), client.WithGesture(g)))
+	wb, err = li.Append(ctx, "ls", "b", wb.ID, nonced(op("replace", "/n", 2)), client.WithGesture(g))
+	check(wb, err)
+	gb := client.NewGesture()
+	check(li.Append(ctx, "ls", "b", wb.ID, nonced(op("add", "/x", 1)), client.WithGesture(gb)))
+	fk, err := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"ls"}, []string{"read"}))).FetchKeys(ctx, "ls", nil, nil)
+	if err != nil || len(fk) != 1 || fk[0].Key == nil {
+		t.Fatalf("keys %v %v", fk, err)
+	}
+	// le: an e2e gesture by the admin on a, which li can read.
+	jwk, priv, _ := seal.GenerateRecipient()
+	x := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"le"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": jwk}))).E2E(priv)
+	check(x.InitKeyring(ctx, "le"))
+	we, err := x.CreateDocSealed(ctx, "le", "a", map[string]any{"n": 0})
+	check(we, err)
+	ge := client.NewGesture()
+	check(x.AppendSealed(ctx, "le", "a", we.ID, []any{op("replace", "/n", 1)}, client.WithGesture(ge)))
+
+	b := runUndoHarness(t, node, undoLimitedHarness, map[string]any{"base": s.URL, "author": "user:li", "bearer": liGrant,
+		"key": base64.RawURLEncoding.EncodeToString(fk[0].Key), "g": g, "gb": gb, "ge": ge})
+	type res struct {
+		OK                                  bool
+		Gesture, Source, Level, Author, Err string
+		Steps                               []any
+	}
+	var out struct {
+		Bare, Only, Undo, Redo, E2E res
+		Latest                      string
+	}
+	if err := json.Unmarshal(b, &out); err != nil {
+		t.Fatalf("node output %s: %v", b, err)
+	}
+	if out.Bare.OK || !strings.Contains(out.Bare.Err, "open the document") {
+		t.Errorf("without resources %+v", out.Bare)
+	}
+	if out.Only.OK || !strings.Contains(out.Only.Err, "no revisions in a") {
+		t.Errorf("a gesture only in a resource not named %+v", out.Only)
+	}
+	if u := out.Undo; !u.OK || u.Source != "resources" || u.Level != "sealed" || u.Author != "user:li" || len(u.Steps) != 2 ||
+		!strings.Contains(string(jsonv.Canonical(jsonv.FromGo(u.Steps))), `"path":"/$nonce"`) {
+		t.Errorf("undo %+v", u)
+	}
+	if out.Latest != out.Undo.Gesture || !out.Redo.OK || out.Redo.Source != "resources" || len(out.Redo.Steps) != 2 {
+		t.Errorf("redo %q %+v", out.Latest, out.Redo)
+	}
+	for _, name := range []string{"a", "b"} {
+		lg, err := li.Log(ctx, "ls", name, "", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, d, err := li.Load(ctx, "ls", name)
+		if err != nil || d.Value.(map[string]any)["n"] != float64(2) || !seal.ValidNonce(d.Value.(map[string]any)["$nonce"].(string)) ||
+			lg[len(lg)-1].Undoes != out.Undo.Gesture || lg[len(lg)-2].Undoes != g {
+			t.Errorf("ls/%s after the undo and the redo: %v %v", name, d, err)
+		}
+	}
+	if out.E2E.OK || !strings.Contains(out.E2E.Err, "namespace document") {
+		t.Errorf("e2e %+v", out.E2E)
 	}
 }
 

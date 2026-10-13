@@ -16,6 +16,12 @@ package client
 //     latest point known to precede the gesture there (the resource's
 //     previous head in the scanned namespace log, its head as of UndoSince,
 //     else genesis), or from its pruning horizon when that is later.
+//     A writer limited to some resources can't read the namespace log
+//     (§C.5): it names the documents it knows the action touched
+//     (UndoResources), whose logs are read whole instead, and without them
+//     gets ErrNeedResources. Such a writer can't read the namespace
+//     document either, so it learns the encryption level from what it
+//     reads: a resource log of JWEs is sealed (UndoPlan.Level).
 //   - The inverse. For each resource, the gesture's own entries, newest
 //     first, become steps of one batch item (§7.5): a revision the patch
 //     set that sets the paths it wrote (§6.4.1, widened to the whole array
@@ -42,16 +48,21 @@ package client
 //   - E3 (UndoE2E). Documents and logs are folded client-side through the
 //     E2E view, the guard compares decrypted entries, every resulting
 //     document is validated before sealing, and each step is sealed bound
-//     to the id the step before produces.
+//     to the id the step before produces. Sealing needs the current epoch
+//     and pad from the namespace document, so a writer that can't read it
+//     is refused (ErrUndoE2ELimited).
 //
-// Redo undoes the undo. UndoStack rebuilds an author's stack from the log.
+// Redo undoes the undo. UndoStack rebuilds an author's stack from the log,
+// or from the logs UndoResources names.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
@@ -70,18 +81,31 @@ var ErrNothingToUndo = errors.New("client: the gesture's inverse writes nothing"
 // ErrNotUndone reports a Redo of a gesture nobody undid.
 var ErrNotUndone = errors.New("client: the gesture isn't undone")
 
+// ErrNeedResources reports an undo, redo or stack where the gesture
+// listing isn't offered or readable and the namespace log can't be read,
+// as for a writer limited to some resources (§C.5), without UndoResources
+// naming the documents to scan instead (§11.2 Finding a gesture). It wraps
+// the error the namespace log read gave.
+var ErrNeedResources = errors.New("client: the gesture listing isn't offered and the namespace log can't be read: name the documents the action touched (UndoResources)")
+
+// ErrUndoE2ELimited reports an undo in an e2e namespace by a writer that
+// can't read the namespace document (§C.5): sealing the inverse needs the
+// current epoch and pad, which only that document gives (§E.3).
+var ErrUndoE2ELimited = errors.New("client: undo in an e2e namespace needs its namespace document (the current epoch and pad), which this grant can't read")
+
 // UndoOption configures PlanUndo, Undo, Redo and UndoStack.
 type UndoOption func(*undoConfig)
 
 type undoConfig struct {
-	author   string
-	since    string
-	scanLog  bool
-	e2e      *E2E
-	retries  int
-	gesture  string
-	maxOps   int
-	maxBytes int
+	author    string
+	since     string
+	scanLog   bool
+	e2e       *E2E
+	retries   int
+	gesture   string
+	maxOps    int
+	maxBytes  int
+	resources []string
 }
 
 // UndoAuthor names the author whose gesture it is: only that author's
@@ -94,12 +118,29 @@ func UndoAuthor(author string) UndoOption { return func(c *undoConfig) { c.autho
 // the namespace log scan, and the point each resource's log is read from.
 // A gesture with revisions before it is undone only in part, and Undoes
 // naming a gesture before it counts as naming a missing one. By default
-// the whole log is searched, page by page.
+// the whole log is searched, page by page. It needs the namespace log:
+// the logs UndoResources names are read whole.
 func UndoSince(nsID string) UndoOption { return func(c *undoConfig) { c.since = nsID } }
 
 // UndoScanLog skips GET /ns/{ns}/gestures/{gesture} and scans the
-// namespace log, as in sealed namespaces.
+// namespace log, as in sealed namespaces, or the logs UndoResources names
+// where the namespace log can't be read.
 func UndoScanLog() UndoOption { return func(c *undoConfig) { c.scanLog = true } }
+
+// UndoResources names the documents the caller knows the action touched,
+// from its own undo stack or the writes it made with the gesture. Where
+// the gesture listing isn't offered or readable and the namespace log
+// can't be read, as for a writer limited to some resources (§C.5), their
+// logs are scanned for the gesture instead, each read whole (from its
+// pruning horizon when it has one), and the entries found there are the
+// gesture (§11.2 Finding a gesture). Without it that case is
+// ErrNeedResources. Revisions of the gesture in documents not named, or
+// below a pruning horizon, are left out. A gesture a merge carried in
+// counts for whoever wrote it there, since only the namespace log shows
+// the merge (§F.3).
+func UndoResources(names ...string) UndoOption {
+	return func(c *undoConfig) { c.resources = append([]string(nil), names...) }
+}
 
 // UndoE2E undoes in an e2e namespace (E3) through x: logs are opened and
 // folded client-side and the inverse is sealed under the namespace's keys.
@@ -233,9 +274,16 @@ type UndoPlan struct {
 	NS string
 	// Gesture is the gesture undone, Author its author.
 	Gesture, Author string
-	// Source says how the gesture was found: "gestures" (the endpoint) or
-	// "log" (the namespace log scan).
-	Source    string
+	// Source says how the gesture was found: "gestures" (the endpoint),
+	// "log" (the namespace log scan) or "resources" (the logs UndoResources
+	// names).
+	Source string
+	// Level is the namespace's encryption level ("", "at-rest", "sealed",
+	// "e2e") from its document, or, for a grant that can't read that
+	// (§C.5), as learned from what it read (§11.2): "sealed" when the
+	// resource log is a list of JWEs, else "" (plain or at rest, which undo
+	// treats alike).
+	Level     string
 	Resources []UndoResource
 	// Conflicts, if any, stop the undo (Err).
 	Conflicts []UndoConflict
@@ -312,7 +360,9 @@ func (c *Client) PlanUndo(ctx context.Context, ns, gesture string, opts ...UndoO
 
 // Redo redoes gesture: it undoes the latest undo of it (§11.2 Redo), by
 // UndoAuthor if given, else by anyone. Undoing the undo's own gesture
-// with Undo does the same. A gesture nobody undid is ErrNotUndone.
+// with Undo does the same. A gesture nobody undid is ErrNotUndone. Where
+// neither the listing nor the namespace log can be read, the undo is
+// looked for in the logs UndoResources names (else ErrNeedResources).
 func (c *Client) Redo(ctx context.Context, ns, gesture string, opts ...UndoOption) (*UndoResult, error) {
 	cfg := undoOptions(opts)
 	undo, err := c.latestUndo(ctx, ns, gesture, cfg)
@@ -349,6 +399,9 @@ func (c *Client) latestUndo(ctx context.Context, ns, gesture string, cfg *undoCo
 		}
 	}
 	recs, err := c.scanGestures(ctx, ns, cfg.since, false)
+	if nsUnreadable(err) {
+		recs, err = c.scanGesturesIn(ctx, ns, cfg.resources, err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -424,6 +477,11 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 	if cfg.since != "" {
 		since = map[string]string{}
 		heads, err := c.Heads(ctx, ns, cfg.since)
+		if nsUnreadable(err) && len(cfg.resources) > 0 {
+			// The namespace can't be read as of a revision (§C.5): the
+			// named resources' logs are read whole.
+			heads, err = nil, nil
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -482,6 +540,9 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 	}
 	f.source = "log"
 	h, err := c.NSHead(ctx, ns)
+	if nsUnreadable(err) {
+		return c.findInResources(ctx, ns, gesture, cfg, err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -492,6 +553,9 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 		merges = c.newMergeResolver(ctx, ns, h.ID)
 	}
 	log, err := c.NSLog(ctx, ns, h.ID, cfg.since)
+	if nsUnreadable(err) {
+		return c.findInResources(ctx, ns, gesture, cfg, err)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -555,6 +619,91 @@ func (c *Client) findGesture(ctx context.Context, ns, gesture string, cfg *undoC
 	return f, nil
 }
 
+// nsUnreadable reports a failed namespace read that a grant limited to
+// some resources gets (§C.5).
+func nsUnreadable(err error) bool { return err != nil && (IsAuth(err) || IsNotFound(err)) }
+
+// findInResources finds the gesture in the logs of the resources the
+// caller named, for a grant that can't read the namespace log (§11.2
+// Finding a gesture, §C.5): each is a site read whole, with no markers,
+// and planning drops those without an entry of the gesture by its
+// author. The author, unless named, is that of the first entry with the
+// gesture, in the order the resources are named. cause is the namespace
+// log's error, wrapped in ErrNeedResources when none are named.
+func (c *Client) findInResources(ctx context.Context, ns, gesture string, cfg *undoConfig, cause error) (*gestureFind, error) {
+	if len(cfg.resources) == 0 {
+		return nil, fmt.Errorf("%w: %w", ErrNeedResources, cause)
+	}
+	f := &gestureFind{author: cfg.author, source: "resources"}
+	seen := map[string]bool{}
+	for _, name := range cfg.resources {
+		if err := checkRes(ns, name); err != nil {
+			return nil, err
+		}
+		if !seen[name] {
+			seen[name] = true
+			f.sites = append(f.sites, &gestureSite{resource: name})
+		}
+	}
+	for _, s := range f.sites {
+		if f.author != "" {
+			break
+		}
+		log, err := c.wholeLog(ctx, ns, s.resource)
+		if err != nil {
+			return nil, err
+		}
+		for _, e := range log {
+			if e.Gesture == gesture {
+				f.author = e.Author
+				break
+			}
+		}
+	}
+	if f.author == "" {
+		return nil, ErrGestureNotFound
+	}
+	return f, nil
+}
+
+// wholeLog reads a resource's log up to its head, from genesis or from its
+// pruning horizon; a purged resource has none.
+func (c *Client) wholeLog(ctx context.Context, ns, name string) ([]LogEntry, error) {
+	head, err := c.Head(ctx, ns, name)
+	if err != nil {
+		return nil, err
+	}
+	switch head.State {
+	case Purged:
+		return nil, nil
+	case NotFound:
+		return nil, &APIError{Status: 404, Code: "not_found", Method: "GET", Path: "/r/" + ns + "/" + name}
+	}
+	log, _, err := c.logFrom(ctx, ns, name, head.ID, "")
+	return log, err
+}
+
+// logFrom reads a resource's log after since up to id, from its pruning
+// horizon instead when that is later, and from genesis when since is no
+// longer an ancestor; it returns the since it read from.
+func (c *Client) logFrom(ctx context.Context, ns, name, id, since string) ([]LogEntry, string, error) {
+	for tries := 0; ; tries++ {
+		log, err := c.Log(ctx, ns, name, id, since)
+		if err == nil {
+			return log, since, nil
+		}
+		if h := Horizon(err); IsPruned(err) && h != "" && h != since && tries < 3 {
+			since = h
+			continue
+		}
+		if IsNotFound(err) && since != "" && tries < 3 {
+			since = ""
+			continue
+		}
+		return nil, since, err
+	}
+}
+
 // --- planning --------------------------------------------------------------
 
 // undoState is a resource's state while folding: the document (the last
@@ -584,7 +733,10 @@ type undoEnv struct {
 	maxOps      int
 	maxBytes    int
 	nonces      bool // the namespace requires nonces, or its document can't be read (§C.7)
-	cfg         *undoConfig
+	// learn is set while the level is unknown because the namespace
+	// document can't be read: the first resource read tells (§11.2).
+	learn bool
+	cfg   *undoConfig
 }
 
 func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConfig) (*UndoPlan, error) {
@@ -598,11 +750,13 @@ func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConf
 		return nil, fmt.Errorf("client: invalid undo gesture id %q", cfg.gesture)
 	}
 	level, err := c.EncryptionLevel(ctx, ns)
+	learn := false
 	if IsNotFound(err) || IsAuth(err) {
 		// A grant whose rules refer to /resource can't read the namespace
-		// document (§C.5): its level and nonce setting are unknown, and
-		// every patch set adds a fresh $nonce (undoLimits).
-		level, err = "", nil
+		// document (§C.5): its nonce setting is unknown, and every patch
+		// set adds a fresh $nonce (undoLimits); its level is learned from
+		// the first resource log read (readResource).
+		level, err, learn = "", nil, true
 	}
 	if err != nil {
 		return nil, err
@@ -610,7 +764,7 @@ func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConf
 	if level == "e2e" && cfg.e2e == nil {
 		return nil, fmt.Errorf("client: undo in the e2e namespace %s needs UndoE2E: the inverse is folded and sealed client-side", ns)
 	}
-	env := &undoEnv{ns: ns, gesture: gesture, level: level, cfg: cfg}
+	env := &undoEnv{ns: ns, gesture: gesture, level: level, learn: learn, cfg: cfg}
 	env.maxOps, env.maxBytes, env.nonces = c.undoLimits(ctx, ns, cfg)
 	if level == "e2e" {
 		// Sealing grows a patch set by about half (§6.6 Values).
@@ -620,13 +774,14 @@ func (c *Client) planUndo(ctx context.Context, ns, gesture string, cfg *undoConf
 	if err != nil {
 		return nil, err
 	}
-	plan := &UndoPlan{NS: ns, Gesture: gesture, Author: f.author, Source: f.source,
+	plan := &UndoPlan{NS: ns, Gesture: gesture, Author: f.author, Source: f.source, Level: level,
 		Batch: BatchRequest{Gesture: cfg.gesture, Undoes: gesture}}
 	for _, s := range f.sites {
 		r, conflicts, item, err := c.planResource(ctx, env, f.author, s)
 		if err != nil {
 			return nil, err
 		}
+		plan.Level = env.level
 		plan.Conflicts = append(plan.Conflicts, conflicts...)
 		if r == nil {
 			continue
@@ -687,25 +842,21 @@ func (c *Client) readResource(ctx context.Context, env *undoEnv, s *gestureSite)
 	case NotFound:
 		return nil, undoState{}, nil, nil, &APIError{Status: 404, Code: "not_found", Method: "GET", Path: "/r/" + env.ns + "/" + name}
 	}
-	since := s.hint
-	var log []LogEntry
-	for tries := 0; ; tries++ {
-		log, err = c.Log(ctx, env.ns, name, head.ID, since)
-		if err == nil {
-			break
-		}
-		if h := Horizon(err); IsPruned(err) && h != "" && h != since && tries < 3 {
-			since = h
-			continue
-		}
-		if IsNotFound(err) && since != "" && tries < 3 {
-			since = ""
-			continue
-		}
+	log, since, err := c.logFrom(ctx, env.ns, name, head.ID, s.hint)
+	if err != nil {
 		if IsPruned(err) {
 			return nil, undoState{}, nil, nil, env.impossible(name, "pruned", err)
 		}
 		return nil, undoState{}, nil, nil, err
+	}
+	if env.learn {
+		env.learn = false
+		if env.level, err = c.logLevel(ctx, env.ns, name, head.ID, since); err != nil {
+			return nil, undoState{}, nil, nil, err
+		}
+		if env.level == "e2e" {
+			return nil, undoState{}, nil, nil, fmt.Errorf("%w (%s)", ErrUndoE2ELimited, env.ns)
+		}
 	}
 	var start undoState
 	if since != "" {
@@ -725,6 +876,42 @@ func (c *Client) readResource(ctx context.Context, env *undoEnv, s *gestureSite)
 		}
 	}
 	return head, start, log, flags, nil
+}
+
+// logLevel learns a namespace's encryption level from one page of a
+// resource log after since up to id, for a grant that can't read the
+// namespace document (§11.2 Finding a gesture): a list of JWEs is sealed
+// (§E.2), entries whose patch set is one sealed op are e2e (§E.3), and
+// anything else is "" (plain or at rest, which undo treats alike).
+func (c *Client) logLevel(ctx context.Context, ns, name, id, since string) (string, error) {
+	var q url.Values
+	if since != "" {
+		q = url.Values{"since": {since}}
+	}
+	r, err := c.do(ctx, "GET", "/r/"+ns+"/"+name+"/rev/"+id+"/log", q, nil)
+	if err != nil {
+		return "", err
+	}
+	if r.status != 200 {
+		return "", r.apiError()
+	}
+	if isJOSE(r) {
+		return "sealed", nil
+	}
+	arr, _ := r.value().([]any)
+	for _, x := range arr {
+		switch e := x.(type) {
+		case string:
+			return "sealed", nil
+		case map[string]any:
+			if ps, _ := e["patches"].([]any); len(ps) == 1 {
+				if op, _ := ps[0].(map[string]any); op["op"] == "sealed" {
+					return "e2e", nil
+				}
+			}
+		}
+	}
+	return "", nil
 }
 
 func (c *Client) undoDoc(ctx context.Context, env *undoEnv, name, id string) (any, error) {
@@ -1269,7 +1456,8 @@ type GestureRecord struct {
 	Undoes    string
 	Resources []string
 	// FirstNSID and LastNSID are the namespace entries of its first and
-	// last writes, Created the time of its last.
+	// last writes ("" when read from resource logs, UndoResources),
+	// Created the time of its last.
 	FirstNSID, LastNSID, Created string
 	first, last                  int
 }
@@ -1294,29 +1482,9 @@ func (c *Client) scanGestures(ctx context.Context, ns, since string, attribute b
 	if err != nil {
 		return nil, err
 	}
-	ix := &gestureIndex{by: map[string]*GestureRecord{}, ids: map[string]bool{}}
+	ix := newGestureIndex()
 	add := func(i int, e NSEntry, author, res string, g StepGesture) {
-		if g.Gesture == "" {
-			return
-		}
-		k := author + "\n" + g.Gesture
-		r := ix.by[k]
-		if r == nil {
-			r = &GestureRecord{Gesture: g.Gesture, Author: author, FirstNSID: e.ID, first: i}
-			ix.by[k] = r
-			ix.list = append(ix.list, r)
-			ix.ids[g.Gesture] = true
-		}
-		if r.Undoes == "" {
-			r.Undoes = g.Undoes
-		}
-		r.LastNSID, r.Created, r.last = e.ID, e.Created, i
-		for _, x := range r.Resources {
-			if x == res {
-				return
-			}
-		}
-		r.Resources = append(r.Resources, res)
+		ix.add(i, e.ID, e.Created, author, res, g)
 	}
 	var merges *mergeResolver
 	if attribute {
@@ -1347,6 +1515,93 @@ func (c *Client) scanGestures(ctx context.Context, ns, since string, attribute b
 		}
 	}
 	return ix, nil
+}
+
+func newGestureIndex() *gestureIndex {
+	return &gestureIndex{by: map[string]*GestureRecord{}, ids: map[string]bool{}}
+}
+
+// add records the write at position i (nsID, created) of author's gesture
+// g in resource res.
+func (ix *gestureIndex) add(i int, nsID, created, author, res string, g StepGesture) {
+	if g.Gesture == "" {
+		return
+	}
+	k := author + "\n" + g.Gesture
+	r := ix.by[k]
+	if r == nil {
+		r = &GestureRecord{Gesture: g.Gesture, Author: author, FirstNSID: nsID, first: i}
+		ix.by[k] = r
+		ix.list = append(ix.list, r)
+		ix.ids[g.Gesture] = true
+	}
+	if r.Undoes == "" {
+		r.Undoes = g.Undoes
+	}
+	r.LastNSID, r.Created, r.last = nsID, created, i
+	for _, x := range r.Resources {
+		if x == res {
+			return
+		}
+	}
+	r.Resources = append(r.Resources, res)
+}
+
+// scanGesturesIn groups the writes in the logs of resources by author and
+// gesture, for a grant that can't read the namespace log (§11.2, §C.5).
+// Each log is read whole (from its pruning horizon when it has one), and
+// the logs are merged by created time, each kept in its chain order. A
+// gesture a merge carried in counts for whoever wrote it here, since only
+// the namespace log's batch entry shows a merge (§F.3). cause is the
+// namespace log's error, wrapped in ErrNeedResources when none are named.
+func (c *Client) scanGesturesIn(ctx context.Context, ns string, resources []string, cause error) (*gestureIndex, error) {
+	if len(resources) == 0 {
+		return nil, fmt.Errorf("%w: %w", ErrNeedResources, cause)
+	}
+	var names []string
+	var logs [][]LogEntry
+	seen := map[string]bool{}
+	for _, name := range resources {
+		if err := checkRes(ns, name); err != nil {
+			return nil, err
+		}
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		log, err := c.wholeLog(ctx, ns, name)
+		if err != nil {
+			return nil, err
+		}
+		names, logs = append(names, name), append(logs, log)
+	}
+	ix := newGestureIndex()
+	pos := make([]int, len(logs))
+	for i := 0; ; i++ {
+		next := -1
+		for k, log := range logs {
+			if pos[k] < len(log) && (next < 0 || createdBefore(log[pos[k]].Created, logs[next][pos[next]].Created)) {
+				next = k
+			}
+		}
+		if next < 0 {
+			return ix, nil
+		}
+		e := logs[next][pos[next]]
+		pos[next]++
+		ix.add(i, "", e.Created, e.Author, names[next], StepGesture{e.Gesture, e.Undoes})
+	}
+}
+
+// createdBefore orders two created times (RFC 3339), as text when either
+// doesn't parse.
+func createdBefore(a, b string) bool {
+	ta, errA := time.Parse(time.RFC3339Nano, a)
+	tb, errB := time.Parse(time.RFC3339Nano, b)
+	if errA != nil || errB != nil {
+		return a < b
+	}
+	return ta.Before(tb)
 }
 
 // StackItem is one action on an author's undo stack (§11.2 Redo).
@@ -1387,9 +1642,17 @@ type UndoStack struct {
 // §F.3: no origin, source.at in the branch's chain, and the merger's grant
 // listed in merge.authors of ns's document. Otherwise, or when the branch
 // can't be read, it counts for whoever wrote the batch.
+//
+// A grant that can't read the namespace log (§C.5) rebuilds the stack
+// from the logs UndoResources names (else ErrNeedResources): their
+// gestures only, ordered by created time, each counting for whoever wrote
+// it there.
 func (c *Client) UndoStack(ctx context.Context, ns, author string, opts ...UndoOption) (*UndoStack, error) {
 	cfg := undoOptions(opts)
 	ix, err := c.scanGestures(ctx, ns, cfg.since, true)
+	if nsUnreadable(err) {
+		ix, err = c.scanGesturesIn(ctx, ns, cfg.resources, err)
+	}
 	if err != nil {
 		return nil, err
 	}

@@ -921,12 +921,22 @@ st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each ite
 
 - **Finding it.** `GET /ns/{ns}/gestures/{gesture}` where offered, also to grants limited to
   some resources; otherwise (sealed and e2e namespaces, older deployments, or `UndoScanLog()`)
-  the namespace log, which needs unrestricted read (§C.5), so a grant limited to some resources
-  can't undo in sealed and e2e namespaces. The log is read all of it page by page or after
+  the namespace log. The log is read all of it page by page or after
   `UndoSince(nsID)`, for entries with the gesture by the same author (`UndoAuthor`, by default
   the author of its first revision found). Each resource's log is
   read from its head just before the gesture in that log (or its head as of `UndoSince`), else from
   genesis, and from the pruning horizon when that is later.
+- **Writers limited to some resources** (v0.50) can't read the namespace log (§C.5). Where no
+  listing answers them either (sealed and e2e namespaces), they name the documents they know the
+  action touched, `UndoResources("a", "b")`, whose logs are read whole (from the pruning horizon
+  when there is one) and scanned for the gesture (`plan.Source == "resources"`); without it the
+  undo is `client.ErrNeedResources` rather than a raw `403`. `Redo` and `UndoStack` take it the
+  same way (the stack is then ordered by `created` across those logs). Revisions of the gesture in
+  documents not named are left out, and a gesture a merge carried in counts for the merger who
+  wrote it there, since only the namespace log shows the merge (§F.3). The level is learned from
+  what is read (`plan.Level`): a resource log of JWEs is sealed. In an e2e namespace sealing the
+  inverse needs the current epoch and pad from the namespace document, so such a writer is
+  refused (`client.ErrUndoE2ELimited`).
 - **The inverse**, per resource, the gesture's own entries newest first: a revision becomes the patch
   set that sets the paths it wrote back to its parent's values (writes to array elements widened to
   the whole array, as merges do; a revision of moves only is moved back when both ends are unchanged);
@@ -937,8 +947,8 @@ st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each ite
   where the document has one, each only on a patch set whose resulting document is an object.
   Whether nonces are required is read from the namespace document, which needs unrestricted
   read: a grant limited to some resources can't read it, so in a private namespace it adds a
-  fresh `$nonce` to every patch set (§C.7, v0.49, `client.NeedsNonce`), and the namespace's
-  encryption level counts as unknown.
+  fresh `$nonce` to every patch set (§C.7, v0.49, `client.NeedsNonce`), and learns the
+  namespace's encryption level from the resource logs it reads (see above).
   The sets are joined and split again within the namespace's `opsPerSet` and `patchSetSize`.
 - **The guard.** The log after the gesture's last entry in each resource: a write overlapping the
   gesture's paths, a delete, a restore or an undo of the gesture is a conflict, returned as
@@ -954,14 +964,16 @@ st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each ite
 - **Encryption.** Plaintext and sealed (E2, with `client.WithKeys`) namespaces work as they are; e2e
   ones (E3) need `UndoE2E(x)`: logs are opened and folded through the E2E view, the guard compares
   decrypted entries, every resulting document is validated, and each step is sealed bound to the id of
-  the step before. Without it an e2e namespace is refused.
+  the step before. Without it an e2e namespace is refused, and so is a writer that can't read the
+  namespace document.
 
 The playground's **Undo / redo** card (Namespace tab) does the same in the browser for plaintext and
 sealed namespaces: it rebuilds the stack of the author in the connection bar (or another one typed in)
 from the namespace log, offers Undo/Redo for the last actions (and for any gesture id, or "Undo this
 gesture" in History), and shows conflicts (red, with the later entries and paths; nothing written)
 apart from "undo impossible" (pruned, blob, invalid). It refuses to write undos in e2e namespaces and
-points to the Go client.
+points to the Go client. For a grant that can't read the namespace log, undo and redo scan the log
+of the open resource instead, learning from it whether the namespace is sealed.
 
 ### Search index (Addendum A)
 
