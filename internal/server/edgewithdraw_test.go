@@ -17,7 +17,7 @@ import (
 // each prefix named, and needs no grant.
 func TestEdgeGrantsWithdraw(t *testing.T) {
 	t.Parallel()
-	ck := edge.NewCookies(nil)
+	ck := edge.NewCookies("", nil)
 	ck.SameSite = http.SameSiteNoneMode // as with credentialed origins
 	var priv ed25519.PrivateKey
 	e := newEnvWith(t, []Option{WithEdgeGrants(ck)}, withAuth(&priv))

@@ -15,7 +15,6 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
-	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -258,12 +257,6 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
 		return
 	}
-	// Behind a verifying edge, private reads must come through it (§9).
-	if !ix.opt.Edge.Allow(r, a.public) {
-		w.Header().Set("Cache-Control", "no-store")
-		writeErr(w, http.StatusForbidden, edge.Code, edge.Message)
-		return
-	}
 	// A purged namespace answers as the core's URLs of it do, after the
 	// read check: 410 purged with head, its purge-ns entry (§8.5, §12),
 	// the log's last, where the checkpoint stopped.
@@ -343,7 +336,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 				redirect(w, target(at))
 				return
 			}
-			ix.writeStored(w, a, at, st)
+			ix.writeStored(w, r, a, at, st)
 			return
 		}
 	}
@@ -386,7 +379,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		gen := ix.kept.Generation(ns)
 		if st, ok := ix.sealed.Get(ctx, target(at)); ok {
 			st, _ = ix.kept.Put(target(at), ns, gen, true, st)
-			ix.writeStored(w, a, at, st)
+			ix.writeStored(w, r, a, at, st)
 			return
 		}
 	}
@@ -415,7 +408,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		redirect(w, target(got))
 		return
 	}
-	ix.writeStored(w, a, at, st)
+	ix.writeStored(w, r, a, at, st)
 }
 
 // errCounts refuses counts over a sealed namespace to a reader whose grant
@@ -527,12 +520,14 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 	return st, at, nil
 }
 
-func (ix *Index) setResultHeaders(w http.ResponseWriter, a *access, at, tags string) {
+// setResultHeaders sets a result's headers: a private one gets edge
+// lifetimes only for a read the verifying edge verified (§9).
+func (ix *Index) setResultHeaders(w http.ResponseWriter, r *http.Request, a *access, at, tags string) {
 	if a.public {
 		w.Header().Set("Cache-Control", ccImmutable)
 	} else {
 		w.Header().Set("Cache-Control", ccPrivateImm)
-		ix.opt.Edge.Private(w.Header(), cdnImmutable)
+		ix.opt.Edge.Private(w.Header(), r, cdnImmutable)
 	}
 	w.Header().Set("Cache-Tag", tags)
 	w.Header().Set("X-Namespace-Revision", at)
@@ -541,8 +536,8 @@ func (ix *Index) setResultHeaders(w http.ResponseWriter, a *access, at, tags str
 // writeStored writes a result as stored or kept: JSON, or in a sealed or
 // e2e namespace the JWE (application/jose), or for a resource-restricted
 // reader the JSON with per-hit sealed values, with its Cache-Tag.
-func (ix *Index) writeStored(w http.ResponseWriter, a *access, at string, st derived.Stored) {
-	ix.setResultHeaders(w, a, at, st.Tags)
+func (ix *Index) writeStored(w http.ResponseWriter, r *http.Request, a *access, at string, st derived.Stored) {
+	ix.setResultHeaders(w, r, a, at, st.Tags)
 	if st.JSON {
 		w.Header().Set("Content-Type", "application/json")
 	} else {

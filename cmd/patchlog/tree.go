@@ -79,6 +79,7 @@ func treeCmd(args []string) {
 	fs.Var(&purgeURLs, "purge-url", purgeURLUsage)
 	edgeSecret := fs.String("edge-secret", "", edgeSecretUsage)
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
+	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
@@ -111,7 +112,7 @@ func treeCmd(args []string) {
 	if purger != nil {
 		topt.Purger = purger
 	}
-	topt.Edge = edgeVerifier(*edgeSecret, *edgeHeader)
+	topt.Edge = edgeVerifier(*edgeSecret, *edgeHeader, *edgePrefixHeader)
 
 	ctx, sigs := shutdownSignals("patchlog tree")
 	if *rel != "" {

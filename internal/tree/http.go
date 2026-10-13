@@ -14,7 +14,6 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
-	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -476,12 +475,6 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		}
 		return base + cp + "/g/" + v.gs + "/" + op
 	}
-	// Behind a verifying edge, private reads must come through it (§9).
-	if !s.opt.Edge.Allow(r, v.anon) {
-		w.Header().Set("Cache-Control", "no-store")
-		WriteError(w, http.StatusForbidden, edge.Code, edge.Message)
-		return
-	}
 	// A purged catalog answers as the core's URLs of it do, after the read
 	// check: 410 purged with head, its purge-ns entry (§8.5, §12), the
 	// log's last, where the checkpoint stopped.
@@ -536,7 +529,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 				redirect(w, canon(at))
 				return
 			}
-			s.writeListing(w, v, at, st)
+			s.writeListing(w, r, v, at, st)
 			return
 		}
 	}
@@ -586,7 +579,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		setPtr()
 		redirect(w, canon(l.at))
 	default:
-		s.writeListing(w, v, at, l.st)
+		s.writeListing(w, r, v, at, l.st)
 	}
 }
 
@@ -683,7 +676,9 @@ func perReader(op string, v *viewer) bool {
 	return !v.anon && v.gs != AllSubjects && v.wideNS != nil && (op == "problems" || op == "orphans" || op == "manifest")
 }
 
-func (s *Service) setListingHeaders(w http.ResponseWriter, v *viewer, at, tags string) {
+// setListingHeaders sets a listing's headers: one for readers with a grant
+// gets edge lifetimes only for a read the verifying edge verified (§9).
+func (s *Service) setListingHeaders(w http.ResponseWriter, r *http.Request, v *viewer, at, tags string) {
 	switch {
 	case v.priv:
 		// Admitted through namespace-wide grants the subject set doesn't
@@ -703,10 +698,10 @@ func (s *Service) setListingHeaders(w http.ResponseWriter, v *viewer, at, tags s
 		// admitted with (§B.11.5).
 		secs := max(int(v.exp.Sub(s.opt.Now())/time.Second), 0)
 		w.Header().Set("Cache-Control", "private, max-age="+strconv.Itoa(secs))
-		s.opt.Edge.Private(w.Header(), "max-age="+strconv.Itoa(secs))
+		s.opt.Edge.Private(w.Header(), r, "max-age="+strconv.Itoa(secs))
 	default:
 		w.Header().Set("Cache-Control", ccPrivateList)
-		s.opt.Edge.Private(w.Header(), cdnListing)
+		s.opt.Edge.Private(w.Header(), r, cdnListing)
 	}
 	w.Header().Set("Cache-Tag", tags)
 	w.Header().Set("X-Namespace-Revision", at)
@@ -715,8 +710,8 @@ func (s *Service) setListingHeaders(w http.ResponseWriter, v *viewer, at, tags s
 // writeListing writes a stored sealed listing: the JWE (application/jose),
 // or the JSON with per-node sealed titles, with the Cache-Tag it was
 // stored with.
-func (s *Service) writeListing(w http.ResponseWriter, v *viewer, at string, st derived.Stored) {
-	s.setListingHeaders(w, v, at, st.Tags)
+func (s *Service) writeListing(w http.ResponseWriter, r *http.Request, v *viewer, at string, st derived.Stored) {
+	s.setListingHeaders(w, r, v, at, st.Tags)
 	if st.JSON {
 		w.Header().Set("Content-Type", "application/json")
 	} else {

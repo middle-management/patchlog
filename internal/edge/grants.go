@@ -1,56 +1,66 @@
 package edge
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
+	"math"
 	"net/http"
+	"regexp"
 	"strings"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // Edge grants as cookies (§C.5 "Issuing them").
 //
-// POST /edge-grants exchanges a verified grant with read for one edge grant
-// per namespace it names, each fixed to a path prefix: /r/{ns}/{name} for a
-// grant whose read rules fix /resource, else /r/{ns} and /ns/{ns}. Each is
-// a cookie whose Path is the prefix, so a browser sends it only there,
-// named per prefix so the cookies of several namespaces and documents
-// coexist. The format is this deployment's:
+// POST /edge-grants exchanges verified grants with read for edge grants,
+// one per namespace each names, fixed to path prefixes: /r/{ns}/{name}, one
+// per name, for a grant whose read rules fix /resource, else /r/{ns} and
+// /ns/{ns}. Each prefix is a cookie whose Path is the prefix, so a browser
+// sends it only there, named per prefix so the cookies of several
+// namespaces and documents coexist. The format is the spec's default (§C.5 "Format"), so an edge
+// can be written once:
 //
-//	base64url(JSON claims) "." base64url(HMAC-SHA256(key, first part))
+//	name:  CookiePrefix + hex(sha256(p)[:8])
+//	value: base64url(c) "." base64url(HMAC-SHA256(key, base64url(c)))
 //
-// with claims { "v": 1, "p": prefix, "ns", "r"?: resource, "sub", "exp":
-// Unix seconds }. A verifying edge holding the key checks it as the origin
-// does (Cookies.Verify); without one the origin verifies it itself. The
-// key is the deployment's: derived from the edge secret (KeyFromSecret),
-// so the edge and the origin share it, or given on its own.
+// unpadded, where c is the canonical JSON (§3.1) of { "exp", "kid", "p" }:
+// Unix seconds, the key's name and the prefix. The origin's key vouches
+// only for the core prefixes (ParsePrefix). A verifying edge holding the
+// key checks a request as Check does; without one the origin checks it
+// itself. The key is the deployment's: given on its own, or derived from
+// the edge secret (KeyFromSecret), so the edge and the origin share it.
 
 // CookiePrefix starts the name of every edge-grant cookie. The __Secure-
 // prefix makes browsers refuse it without Secure.
 const CookiePrefix = "__Secure-pl-eg-"
 
+// DefaultKid names the origin's edge-grant key unless the deployment names
+// it otherwise.
+const DefaultKid = "origin"
+
 // MaxGrantTTL is the longest an edge grant lives: its lifetime is the
 // revocation latency (§C.5, 5–15 minutes).
 const MaxGrantTTL = 15 * time.Minute
 
-// Claims are what an edge grant says: GET and HEAD under Prefix are
-// authorised for Sub until Exp, in namespace NS, fixed to Resource if set.
+// Claims are what an edge grant says (§C.5 "Format"): GET and HEAD under
+// Prefix are authorised until Exp (Unix seconds), vouched for by the key
+// named Kid. They carry no subject and no grant id.
 type Claims struct {
-	V        int    `json:"v"`
-	Prefix   string `json:"p"`
-	NS       string `json:"ns"`
-	Resource string `json:"r,omitempty"`
-	Sub      string `json:"sub"`
-	Exp      int64  `json:"exp"`
+	Kid    string
+	Prefix string
+	Exp    int64
 }
 
 // Cookies issues and verifies edge-grant cookies under one key.
 type Cookies struct {
+	kid string
 	key []byte
 	// SameSite is the cookies' SameSite attribute: None when pages on
 	// other origins call with credentials (§C.5), else Lax.
@@ -59,17 +69,24 @@ type Cookies struct {
 	TTL time.Duration
 }
 
-// NewCookies returns a Cookies with key, or with a random one if key is
-// empty: edge grants then verify only in this process.
-func NewCookies(key []byte) *Cookies {
+// NewCookies returns a Cookies with key, named kid (DefaultKid if empty),
+// or with a random key if key is empty: edge grants then verify only in
+// this process.
+func NewCookies(kid string, key []byte) *Cookies {
+	if kid == "" {
+		kid = DefaultKid
+	}
 	if len(key) == 0 {
 		key = make([]byte, 32)
 		if _, err := rand.Read(key); err != nil {
 			panic(err)
 		}
 	}
-	return &Cookies{key: append([]byte(nil), key...), SameSite: http.SameSiteLaxMode}
+	return &Cookies{kid: kid, key: append([]byte(nil), key...), SameSite: http.SameSiteLaxMode}
 }
+
+// Kid names the key the cookies are issued and verified under.
+func (c *Cookies) Kid() string { return c.kid }
 
 // KeyFromSecret derives the edge-grant key from the edge secret, so a
 // verifying edge configured with the secret can verify the cookies.
@@ -109,16 +126,15 @@ func Name(prefix string) string {
 	return CookiePrefix + hex.EncodeToString(sum[:8])
 }
 
-// Issue returns the Set-Cookie of an edge grant issued at now.
+// Issue returns the Set-Cookie of an edge grant issued at now, under c's
+// key and kid (cl.Kid is ignored).
 func (c *Cookies) Issue(cl Claims, now time.Time) *http.Cookie {
-	cl.V = 1
-	body, _ := json.Marshal(cl)
-	p := base64.RawURLEncoding.EncodeToString(body)
-	m := hmac.New(sha256.New, c.key)
-	m.Write([]byte(p))
+	p := base64.RawURLEncoding.EncodeToString(jsonv.Canonical(map[string]any{
+		"exp": float64(cl.Exp), "kid": c.kid, "p": cl.Prefix,
+	}))
 	return &http.Cookie{
 		Name:     Name(cl.Prefix),
-		Value:    p + "." + base64.RawURLEncoding.EncodeToString(m.Sum(nil)),
+		Value:    p + "." + base64.RawURLEncoding.EncodeToString(c.mac(p)),
 		Path:     cl.Prefix,
 		Expires:  time.Unix(cl.Exp, 0).UTC(),
 		MaxAge:   int(time.Unix(cl.Exp, 0).Sub(now).Seconds()),
@@ -128,60 +144,170 @@ func (c *Cookies) Issue(cl Claims, now time.Time) *http.Cookie {
 	}
 }
 
-var errBadCookie = errors.New("edge grant: malformed or badly signed")
-
-// Verify checks a cookie value's signature and expiry at now.
-func (c *Cookies) Verify(value string, now time.Time) (*Claims, error) {
-	p, sigText, ok := strings.Cut(value, ".")
-	if !ok {
-		return nil, errBadCookie
-	}
-	sig, err := base64.RawURLEncoding.DecodeString(sigText)
-	if err != nil {
-		return nil, errBadCookie
-	}
+// mac is HMAC-SHA256 under c's key of a value's first part.
+func (c *Cookies) mac(p string) []byte {
 	m := hmac.New(sha256.New, c.key)
 	m.Write([]byte(p))
-	if !hmac.Equal(sig, m.Sum(nil)) {
-		return nil, errBadCookie
+	return m.Sum(nil)
+}
+
+var errBadCookie = errors.New("edge grant: malformed or badly signed")
+
+// parse splits a cookie value into its claims, not yet verified, the text
+// the MAC is over and the MAC. The claims are exactly kid and p, strings,
+// and exp, an integer, as canonical JSON (§3.1); both parts are unpadded
+// base64url.
+func parse(value string) (*Claims, string, []byte, error) {
+	p, macText, ok := strings.Cut(value, ".")
+	if !ok {
+		return nil, "", nil, errBadCookie
 	}
-	body, err := base64.RawURLEncoding.DecodeString(p)
+	mac, err := base64.RawURLEncoding.Strict().DecodeString(macText)
 	if err != nil {
-		return nil, errBadCookie
+		return nil, "", nil, errBadCookie
 	}
-	var cl Claims
-	if err := json.Unmarshal(body, &cl); err != nil || cl.V != 1 || cl.Prefix == "" || cl.NS == "" {
-		return nil, errBadCookie
+	body, err := base64.RawURLEncoding.Strict().DecodeString(p)
+	if err != nil {
+		return nil, "", nil, errBadCookie
+	}
+	v, err := jsonv.Parse(body)
+	if err != nil || !bytes.Equal(jsonv.Canonical(v), body) {
+		return nil, "", nil, errBadCookie
+	}
+	m, _ := v.(map[string]any)
+	kid, kidOK := m["kid"].(string)
+	prefix, pOK := m["p"].(string)
+	exp, expOK := m["exp"].(float64)
+	if len(m) != 3 || !kidOK || !pOK || !expOK || exp != math.Trunc(exp) || math.Abs(exp) > jsonv.MaxSafeInteger {
+		return nil, "", nil, errBadCookie
+	}
+	return &Claims{Kid: kid, Prefix: prefix, Exp: int64(exp)}, p, mac, nil
+}
+
+// verify checks parsed claims at now: c's kid, which vouches only for the
+// core prefixes, and a valid MAC, compared in constant time (check 4 of
+// §C.5); exp in the future (check 5).
+func (c *Cookies) verify(cl *Claims, p string, mac []byte, now time.Time) error {
+	if _, _, ok := ParsePrefix(cl.Prefix); !ok || cl.Kid != c.kid {
+		return errBadCookie
+	}
+	if !hmac.Equal(mac, c.mac(p)) {
+		return errBadCookie
 	}
 	if now.Unix() >= cl.Exp {
-		return nil, errors.New("edge grant: expired")
+		return errors.New("edge grant: expired")
 	}
-	return &cl, nil
+	return nil
+}
+
+// Verify checks a cookie value at now (§C.5 "Format"): its claims, its kid
+// and prefix, its MAC and its expiry.
+func (c *Cookies) Verify(value string, now time.Time) (*Claims, error) {
+	cl, p, mac, err := parse(value)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.verify(cl, p, mac, now); err != nil {
+		return nil, err
+	}
+	return cl, nil
+}
+
+var (
+	nsNameRe  = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)   // §3.6, as core.ValidNSName
+	resNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`) // §3.6, as core.ValidResourceName
+)
+
+// ParsePrefix parses a core prefix, the only ones the origin's key vouches
+// for (§C.5): /r/{ns}/{name}, /r/{ns} or /ns/{ns}, with names valid under
+// §3.6. resource is "" for a namespace-wide prefix.
+func ParsePrefix(p string) (ns, resource string, ok bool) {
+	s := strings.Split(p, "/")
+	switch {
+	case len(s) == 3 && s[0] == "" && (s[1] == "r" || s[1] == "ns") && nsNameRe.MatchString(s[2]):
+		return s[2], "", true
+	case len(s) == 4 && s[0] == "" && s[1] == "r" && nsNameRe.MatchString(s[2]) && resNameRe.MatchString(s[3]):
+		return s[2], s[3], true
+	}
+	return "", "", false
 }
 
 // Covers reports whether a request path lies under prefix: the prefix
 // itself or below it, segment by segment (as a cookie's Path matches,
-// RFC 6265 §5.1.4).
+// RFC 6265 §5.1.4), so /r/demo covers neither /r/demo-x/… nor /r/demox.
+// An empty prefix covers nothing.
 func Covers(prefix, path string) bool {
-	return path == prefix || strings.HasPrefix(path, prefix+"/")
+	return prefix != "" && (path == prefix || strings.HasPrefix(path, prefix+"/"))
 }
 
-// FromRequest returns the claims of the first edge-grant cookie of r that
-// verifies at now and covers r's path, or nil.
-func (c *Cookies) FromRequest(r *http.Request, now time.Time) *Claims {
-	if c == nil {
+// CanonicalPath reports whether an escaped path has no empty, "." or ".."
+// segment and no percent-escape, check 2 of §C.5 (400 otherwise): the
+// cache keys the raw URL, and core names never need one (§3.6). "/" fails
+// it, having an empty segment; no prefix covers it anyway. An edge
+// embedding Check answers 400 for a request whose path fails it, which
+// Check alone reports only as no covering cookie.
+func CanonicalPath(path string) bool {
+	if !strings.HasPrefix(path, "/") || strings.Contains(path, "%") {
+		return false
+	}
+	for _, seg := range strings.Split(path[1:], "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+// Check makes the checks an edge MUST make on every request, cache hits
+// included, before serving it or forwarding it as verified (§C.5 "What
+// an edge MUST check"), in order:
+//
+//  1. the method is GET or HEAD;
+//  2. the path has no empty, "." or ".." segment and no percent-escape;
+//  3. a cookie whose name is derived from its own p (others are ignored);
+//  4. c's kid, which vouches for p, and a valid MAC;
+//  5. exp is in the future;
+//  6. p covers the path segment by segment.
+//
+// One covering cookie is enough: Check returns its p. A deployment may
+// embed it in an edge, which then forwards a passing request with the
+// secret and p in its verification headers (§9). Check answers a request
+// failing check 2 as one without a covering cookie: the edge answers it
+// 400 by testing CanonicalPath first.
+func (c *Cookies) Check(r *http.Request, now time.Time) (p string, ok bool) {
+	cl := c.check(r, now)
+	if cl == nil {
+		return "", false
+	}
+	return cl.Prefix, true
+}
+
+func (c *Cookies) check(r *http.Request, now time.Time) *Claims {
+	if c == nil || (r.Method != http.MethodGet && r.Method != http.MethodHead) {
 		return nil
 	}
 	path := r.URL.EscapedPath()
+	if !CanonicalPath(path) {
+		return nil
+	}
 	for _, ck := range r.Cookies() {
 		if !strings.HasPrefix(ck.Name, CookiePrefix) {
 			continue
 		}
-		cl, err := c.Verify(ck.Value, now)
-		if err != nil || ck.Name != Name(cl.Prefix) || !Covers(cl.Prefix, path) {
+		cl, p, mac, err := parse(ck.Value)
+		if err != nil || ck.Name != Name(cl.Prefix) {
+			continue
+		}
+		if c.verify(cl, p, mac, now) != nil || !Covers(cl.Prefix, path) {
 			continue
 		}
 		return cl
 	}
 	return nil
+}
+
+// FromRequest returns the claims of the first edge-grant cookie of r that
+// passes Check at now, or nil.
+func (c *Cookies) FromRequest(r *http.Request, now time.Time) *Claims {
+	return c.check(r, now)
 }

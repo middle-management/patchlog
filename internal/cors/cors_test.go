@@ -156,7 +156,7 @@ func TestParse(t *testing.T) {
 }
 
 // Every request header the servers read is allowed, X-Author (serve -dev)
-// included; the edge's verification header never is. The lists cover what
+// included; the edge's verification headers never are (§9). The lists cover what
 // §7 "Browsers" requires: the methods and headers that make requests
 // non-simple, plus Gesture, Undoes (§7.2), Blob-Nonce and Blob-From,
 // allowed; the headers clients read, Gesture, Undoes and X-Log-Next (§7.1
@@ -168,8 +168,10 @@ func TestHeaderLists(t *testing.T) {
 			t.Errorf("%s not allowed", h)
 		}
 	}
-	if slices.Contains(allowed, "X-Edge-Verified") {
-		t.Error("edge header allowed")
+	for _, h := range []string{"X-Edge-Verified", "X-Edge-Prefix"} {
+		if slices.Contains(allowed, h) {
+			t.Errorf("edge header %s allowed", h)
+		}
 	}
 	methods := strings.Split(Methods, ", ")
 	for _, m := range []string{"GET", "HEAD", "PATCH", "PUT", "POST", "DELETE"} {

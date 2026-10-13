@@ -107,9 +107,11 @@ func TestPrivateNamespace(t *testing.T) {
 		t.Errorf("public url for a private ns: %d %s", r.status, r.header.Get("Location"))
 	}
 
-	// Behind a verifying edge (§9), private reads need its secret, and
-	// verified results get edge lifetimes.
-	ev, err := edge.New([]byte("s3cret"), "")
+	// Behind a verifying edge (§9), private reads are served with or
+	// without its headers; a reader's grant in Authorization makes them
+	// no-store for shared caches either way. Only a read the edge verified
+	// itself, with no other credential, gets edge lifetimes.
+	ev, err := edge.New([]byte("s3cret"), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,22 +123,21 @@ func TestPrivateNamespace(t *testing.T) {
 		req.Header.Set("Authorization", "Bearer "+bob)
 		if secret != "" {
 			req.Header.Set(edge.DefaultHeader, secret)
+			req.Header.Set(edge.DefaultPrefixHeader, "/g")
 		}
 		res := must(noFollow.Do(req))
 		res.Body.Close()
 		return res
 	}
-	for _, secret := range []string{"", "wrong"} {
-		if res := get("/sec?q=secret", secret); res.StatusCode != 403 || res.Header.Get("Cache-Control") != "no-store" {
+	for _, secret := range []string{"", "wrong", "s3cret"} {
+		res := get("/sec?q=secret", secret)
+		for res.StatusCode == 302 {
+			res = get(res.Header.Get("Location"), secret)
+		}
+		if res.StatusCode != 200 || !strings.HasPrefix(res.Header.Get("Cache-Control"), "private") ||
+			res.Header.Get("CDN-Cache-Control") != "no-store" || res.Header.Get("Surrogate-Control") != "no-store" {
 			t.Errorf("secret %q: %d %v", secret, res.StatusCode, res.Header)
 		}
-	}
-	res := get("/sec?q=secret", "s3cret")
-	for res.StatusCode == 302 {
-		res = get(res.Header.Get("Location"), "s3cret")
-	}
-	if res.StatusCode != 200 || res.Header.Get("CDN-Cache-Control") != "max-age=31536000" {
-		t.Errorf("verified: %d %v", res.StatusCode, res.Header)
 	}
 }
 

@@ -1,13 +1,17 @@
 // Package edge decides how private responses are cached at the edge (§9).
 //
 // Private content may be cached at the edge only behind an edge that
-// verifies grants. Such an edge proves it verified a request by sending a
-// shared secret in a header (DefaultHeader). An origin configured with the
-// secret (a Verifier) serves private reads only to requests that carry it,
-// and gives those responses edge lifetimes. Without a Verifier (no CDN, or
-// one that doesn't verify grants) private responses are marked
-// CDN-Cache-Control: no-store and Surrogate-Control: no-store, so no shared
-// cache stores them.
+// verifies edge grants (§C.5). Such an edge says what it verified in two
+// headers it adds and strips from incoming requests: a secret it shares
+// with the origin (DefaultHeader) and the prefix of the edge grant it
+// checked (DefaultPrefixHeader). An origin configured with the secret (a
+// Verifier) gives edge lifetimes only to a private read the edge verified
+// itself: the secret matches, the prefix covers the URL, and the request
+// carries no other credential. Every other private response, and every
+// one without a Verifier (no CDN, or one that doesn't verify grants), is
+// marked CDN-Cache-Control: no-store and Surrogate-Control: no-store, so
+// no shared cache stores it. Private reads are served either way: the
+// origin verifies the grant or the cookie itself.
 package edge
 
 import (
@@ -20,43 +24,50 @@ import (
 	"strings"
 )
 
-// DefaultHeader is the request header a verifying edge carries the secret in.
-const DefaultHeader = "X-Edge-Verified"
-
-// Code and Message are the 403 an origin with a Verifier answers to a
-// private read that didn't come through the edge.
+// DefaultHeader is the request header a verifying edge carries the secret
+// in, and DefaultPrefixHeader the one it carries the prefix of the edge
+// grant it checked in (§9, §C.5).
 const (
-	Code    = "edge_required"
-	Message = "private reads are served only through the verifying edge"
+	DefaultHeader       = "X-Edge-Verified"
+	DefaultPrefixHeader = "X-Edge-Prefix"
 )
 
-// Verifier checks that a request came through the verifying edge. A nil
-// *Verifier means there is none.
+// Verifier recognises reads the verifying edge verified. A nil *Verifier
+// means there is none.
 type Verifier struct {
-	sum       [32]byte
-	header    string
-	cookieKey []byte // edge-grant cookies (KeyFromSecret)
+	sum          [32]byte
+	header       string
+	prefixHeader string
+	cookieKey    []byte // edge-grant cookies (KeyFromSecret)
 }
 
-// New returns a Verifier for secret in header (DefaultHeader if empty).
-func New(secret []byte, header string) (*Verifier, error) {
+// New returns a Verifier for secret in header and the verified prefix in
+// prefixHeader (DefaultHeader and DefaultPrefixHeader if empty).
+func New(secret []byte, header, prefixHeader string) (*Verifier, error) {
 	if len(secret) == 0 {
 		return nil, errors.New("empty edge secret")
 	}
 	if header == "" {
 		header = DefaultHeader
 	}
-	return &Verifier{sum: sha256.Sum256(secret), header: http.CanonicalHeaderKey(header), cookieKey: KeyFromSecret(secret)}, nil
+	if prefixHeader == "" {
+		prefixHeader = DefaultPrefixHeader
+	}
+	header, prefixHeader = http.CanonicalHeaderKey(header), http.CanonicalHeaderKey(prefixHeader)
+	if header == prefixHeader {
+		return nil, errors.New("the edge's secret and prefix headers must differ")
+	}
+	return &Verifier{sum: sha256.Sum256(secret), header: header, prefixHeader: prefixHeader, cookieKey: KeyFromSecret(secret)}, nil
 }
 
 // Load reads the secret from a file (surrounding whitespace, such as a
 // trailing newline, is ignored) and returns its Verifier.
-func Load(file, header string) (*Verifier, error) {
+func Load(file, header, prefixHeader string) (*Verifier, error) {
 	b, err := os.ReadFile(file)
 	if err != nil {
 		return nil, err
 	}
-	v, err := New([]byte(strings.TrimSpace(string(b))), header)
+	v, err := New([]byte(strings.TrimSpace(string(b))), header, prefixHeader)
 	if err != nil {
 		return nil, fmt.Errorf("%s: %w", file, err)
 	}
@@ -65,6 +76,9 @@ func Load(file, header string) (*Verifier, error) {
 
 // Header is the request header the secret is expected in.
 func (v *Verifier) Header() string { return v.header }
+
+// PrefixHeader is the request header the verified prefix is expected in.
+func (v *Verifier) PrefixHeader() string { return v.prefixHeader }
 
 // Verified reports whether r carries the secret. The comparison is of
 // SHA-256 digests in constant time, so neither the secret's bytes nor its
@@ -81,19 +95,31 @@ func (v *Verifier) Verified(r *http.Request) bool {
 	return subtle.ConstantTimeCompare(sum[:], v.sum[:]) == 1
 }
 
-// Allow reports whether a response may be served to r: public (and sealed)
-// responses always, private ones without a Verifier (the origin checked the
-// grant itself) or when r came through the edge.
-func (v *Verifier) Allow(r *http.Request, public bool) bool {
-	return public || v == nil || v.Verified(r)
+// VerifiedRead reports whether the edge verified r itself, so that a
+// private response to it may have edge lifetimes (§9): r carries the
+// secret and exactly one prefix, the prefix covers r's path, and r carries
+// no other credential, neither Authorization nor Source-Authorization (the
+// reference defines no signed-URL parameters). A read the edge only
+// relayed, one with a grant the origin verifies itself and one fetched
+// around the edge get no lifetimes.
+func (v *Verifier) VerifiedRead(r *http.Request) bool {
+	if !v.Verified(r) {
+		return false
+	}
+	ps := r.Header.Values(v.prefixHeader)
+	if len(ps) != 1 || !Covers(ps[0], r.URL.EscapedPath()) {
+		return false
+	}
+	return len(r.Header.Values("Authorization")) == 0 && len(r.Header.Values("Source-Authorization")) == 0
 }
 
-// Private sets the edge directives of a private response: lifetime (a
-// Cache-Control value such as "max-age=0, s-maxage=1") as CDN-Cache-Control
-// behind a verifying edge, and no-store for every shared cache otherwise.
-// It is only called for responses Allow admitted.
-func (v *Verifier) Private(h http.Header, lifetime string) {
-	if v == nil {
+// Private sets the edge directives of a private response to r: lifetime
+// (a Cache-Control value such as "max-age=0, s-maxage=1") as
+// CDN-Cache-Control for a read the verifying edge verified (VerifiedRead),
+// and no-store for every shared cache otherwise, with or without a
+// Verifier (§9).
+func (v *Verifier) Private(h http.Header, r *http.Request, lifetime string) {
+	if !v.VerifiedRead(r) {
 		NoStore(h)
 		return
 	}
@@ -101,12 +127,10 @@ func (v *Verifier) Private(h http.Header, lifetime string) {
 }
 
 // NoStore sets the edge directives of a private response no shared cache
-// may store: every private response without a Verifier, and, whether or
-// not there is one, a read an edge that knows only prefixes forwards
-// undecided rather than refusing it, such as a schemaReads read under a
-// grant in Authorization (§6.1). Allow doesn't gate such a read: the
-// origin decides it from the grant, and no edge keeps a copy it would
-// serve by prefix.
+// may store (§9): every private response but a read the verifying edge
+// verified, such as a read with a grant in Authorization, which belongs to
+// one credential, or a schemaReads read opened by a referrer (§6.1), which
+// depends on the referrer.
 func NoStore(h http.Header) {
 	h.Set("CDN-Cache-Control", "no-store")
 	h.Set("Surrogate-Control", "no-store")

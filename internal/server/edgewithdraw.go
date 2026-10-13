@@ -4,9 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strings"
 
-	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/edge"
 )
 
 // withdrawEdgeGrants is DELETE /edge-grants?prefix=… (§C.5 "Withdrawing
@@ -44,7 +43,7 @@ func withdrawPrefixes(raw string) ([]string, error) {
 			return nil, badInput(fmt.Sprintf("unknown query parameter %q (§7)", k))
 		}
 		for _, p := range vs {
-			if !edgePrefix(p) {
+			if _, _, ok := edge.ParsePrefix(p); !ok {
 				return nil, badInput(fmt.Sprintf("prefix %q isn't one issuance returns: /r/{ns}/{name}, /r/{ns} or /ns/{ns} (§C.5)", p))
 			}
 			if !seen[p] {
@@ -57,16 +56,4 @@ func withdrawPrefixes(raw string) ([]string, error) {
 		return nil, badInput("prefix is required (§C.5)")
 	}
 	return out, nil
-}
-
-// edgePrefix reports whether p is /r/{ns}/{name}, /r/{ns} or /ns/{ns}.
-func edgePrefix(p string) bool {
-	s := strings.Split(p, "/")
-	switch {
-	case len(s) == 3 && s[0] == "" && (s[1] == "r" || s[1] == "ns"):
-		return core.ValidNSName(s[2])
-	case len(s) == 4 && s[0] == "" && s[1] == "r":
-		return core.ValidNSName(s[2]) && core.ValidResourceName(s[3])
-	}
-	return false
 }

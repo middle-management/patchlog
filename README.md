@@ -30,12 +30,12 @@ and serves immutable, CDN-cacheable revisions.
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
-| Edge grants as cookies: `POST /edge-grants`, withdrawn with `DELETE /edge-grants`, verified by the origin without an edge | §C.5, §9 | ✅ |
+| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), drawing on each grant's rate limits, withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`) | §C.5, §9 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
-| Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only with `-edge-secret`) |
+| Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only for reads a verifying edge vouches for, with `-edge-secret`) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
 | Bundles: history and snapshot export and import, sealed bundles, access levels, e2e ciphertext | §G.4, §G.5.1 | ✅ (`patchlog export/import`) |
@@ -72,10 +72,11 @@ and serves immutable, CDN-cacheable revisions.
   download resumes, but a range can't be opened on its own. A branch keeps its stored sealings
   of a base's blobs after the base prunes them (it stops serving them; deleting them is a MAY
   of §E.2.2 not done).
-- A CDN edge that verifies edge grants (§C.5): none is included. The origin issues them as
-  cookies and verifies them itself, and checks grants on every read. Both §9 deployments are
-  supported: behind a grant-verifying edge (`-edge-secret`) private content gets edge
-  lifetimes, otherwise it is `no-store` for shared caches (see
+- A CDN edge that verifies edge grants (§C.5): none is included, though `edge.Cookies.Check`
+  makes its checks in Go. The origin issues edge grants as cookies and verifies them itself,
+  and checks grants on every read. Both §9 deployments are supported: behind a grant-verifying
+  edge (`-edge-secret`) private reads it verified get edge lifetimes, and everything else
+  private is `no-store` for shared caches (see
   [Private namespaces and the edge](#private-namespaces-and-the-edge), which also gives the
   cookie format and what such an edge must check).
 - Author signatures (§C.3.1): a signature whose kid the grant's root `signers` lists is
@@ -254,136 +255,181 @@ after it commits (§9), so no public copy outlives the change at the edge.
 
 #### Private namespaces and the edge
 
-§9 caches private (non-public, non-sealed) content at the edge only behind an edge that
-verifies grants, and the origin must know which deployment it is in:
+§9 caches private (non-public, non-sealed) content at the edge only for reads that an edge
+verifying edge grants (§C.5) has verified itself, and the origin must know which deployment it
+is in. Private reads are served either way: the origin checks the grant, or the edge-grant
+cookie, on every request.
 
 - **Without a verifying edge** (the default, and the compose stack: Varnish verifies nothing),
   private responses carry `Cache-Control: private, …` plus `CDN-Cache-Control: no-store` and
-  `Surrogate-Control: no-store`, so no shared cache stores them. The origin checks the grant on
-  every request. Public and sealed responses are unchanged.
-- **With a verifying edge**, give `patchlog serve` the secret the edge sends once it has verified
-  a request: `-edge-secret FILE` (the file's content, surrounding whitespace ignored), in the
-  header `-edge-header` (default `X-Edge-Verified`). Private reads that don't carry it are
-  refused with `403 {"code":"edge_required"}` (`no-store`); the secret is compared in constant
-  time. Verified private responses get the §9 edge lifetimes in `CDN-Cache-Control`. The edge
-  must strip the header from client requests and set it itself.
+  `Surrogate-Control: no-store`, so no shared cache stores them. Public and sealed responses
+  are unchanged.
+- **With a verifying edge**, give `patchlog serve` the secret it shares with the edge:
+  `-edge-secret FILE` (the file's content, surrounding whitespace ignored). Once the edge has
+  checked a request's edge grant (below), it forwards it with the secret in `-edge-header`
+  (default `X-Edge-Verified`) and the grant's prefix `p` in `-edge-prefix-header` (default
+  `X-Edge-Prefix`), and it strips both headers from client requests. A private response gets
+  the §9 edge lifetime in `CDN-Cache-Control`, and no `Surrogate-Control`, only when all of
+  these hold (v0.50):
+  - the secret matches, compared in constant time;
+  - exactly one prefix is present, and it covers the URL by whole segments: the path is the
+    prefix or starts with it followed by `/`;
+  - the request carries no other credential: no `Authorization` and no
+    `Source-Authorization` (the reference defines no signed-URL parameters).
 
-  What is gated: every cacheable read of a private namespace (resource and namespace heads,
-  revisions, logs, heads pages, branch lists, unknown-id `404`s, `410`s, long-polls, which are
-  refused before they wait). Not gated, because no shared cache ever stores them (`no-store`)
-  and the origin checks their grants itself: writes, batches, config writes, purges, `POST
-  /ns/{ns}/keys`, event streams (SSE), error answers such as `401`/`403`, and schema revisions
-  read under `schemaReads` by a reader of a referrer (§6.1). Those carry the grant in
-  `Authorization`, or none for a revision a public referrer pins (v0.49), so an edge that
-  knows only prefixes forwards them undecided, and they are served `private, max-age=300` and
-  `no-store` for shared caches. Public and sealed reads never need the header.
+  Every other private response is `no-store` for shared caches, as without an edge, and is
+  served all the same: a read with a grant in `Authorization`, which the origin verifies
+  itself and which belongs to one credential; a schema revision read under `schemaReads` by a
+  reader of a referrer (§6.1), which depends on the referrer; a read the edge only relayed; and
+  one sent around the edge. So a response fetched around the edge is never one the edge would
+  cache, and a client works the same either way. (Up to v0.49 a private read without the secret
+  was refused with `403 edge_required`, a long-poll before it waited.) Writes, event streams,
+  error answers such as `401`/`403`, `POST /ns/{ns}/keys` and the gestures listing are
+  `no-store` whatever the headers say. Public and sealed reads ignore them.
 
-  `patchlog index` and `patchlog tree` take the same two flags for their private listings
-  (§A.4, §B.11.5): without `-edge-secret` those are `no-store` at the edge, with it they need the
-  header and get their edge lifetime. Their private head pointers depend on the caller's grant
-  and stay `no-store` either way.
+  `patchlog index` and `patchlog tree` take the same three flags for their private listings
+  (§A.4, §B.11.5), under the same rules. They read callers only from `Authorization`, so their
+  private listings are `no-store` at the edge too: a service would need edge grants of its own
+  (§C.5 "Format"), which neither mints. Their private head pointers stay `no-store` either way.
 
 ```sh
 head -c 32 /dev/urandom | base64 > edge.secret   # shared with the edge's configuration
-patchlog serve -edge-secret edge.secret           # the edge sends X-Edge-Verified: <secret>
+patchlog serve -edge-secret edge.secret           # the edge sends X-Edge-Verified and X-Edge-Prefix
 ```
 
-**Edge grants as cookies** (§C.5). `POST /edge-grants` with a grant in `Authorization` answers
-`{ "prefixes": [...], "exp" }` (`no-store`) and sets one cookie per prefix: `/r/{ns}` and
-`/ns/{ns}` per namespace the grant names, or `/r/{ns}/{name}` when its read rules fix
-`/resource`. `"*"` and a grant without `read` are `403`, and so is one whose blocks or key
-scope refer to `/resource` without fixing it, or to `/now`, since the edge evaluates no rules.
-A grant with roles needs one role that lists `read` and qualifies: none of its rules refers to
-`/resource` or `/now`, and they pass now for the principal. Roles are alternatives, so one is
-enough, with the blocks and key scope on top; a role that tests `/resource` never qualifies,
-even next to blocks that fix it. The answer is all or nothing: if any namespace the grant names
-doesn't exist, is purged or refuses it, no cookie is set, and the request is `401` if any
-namespace's answer is, else `403`. A purged namespace is decided last, once the grant verifies
-and may read there, so the answer is `410 purged`, with the `head` of the first one the grant
-names, only if every refusal is a purge (v0.49). While authentication is disabled (`-dev`),
-issuance is `404 not_offered`. Cookies are
-`Secure`, `HttpOnly`, named `__Secure-pl-eg-…` per prefix, with `Path` the prefix, which covers
-what lies below it by whole segments (`/ns/{ns}` covers the namespace URL itself and
-`/ns/{ns}/…`, not `/ns/{ns}-x`), and last until the grant's `exp` or 15 minutes, whichever is
-sooner. A read under one checks its expiry, so an event stream opened under a cookie ends
+**Edge grants as cookies** (§C.5). `POST /edge-grants` with a grant in `Authorization`, or up
+to 50 grants as `{ "grants": [ … ] }` in the body (v0.50; each the token as it would follow
+`Bearer `, surrounding whitespace ignored), answers `{ "prefixes": [...], "exp" }`
+(`no-store`) and sets one cookie per prefix: `/r/{ns}` and `/ns/{ns}` per namespace a grant
+names, or `/r/{ns}/{name}`, one per name, when its read rules fix `/resource`. A body with
+`Authorization`, an empty list or more than 50, anything but strings, or any other member is
+`400 bad_input`; a body too large is `413 limit`. The body must be `application/json`
+(`415 bad_input` otherwise), so that a page on another site needs a CORS preflight to send one:
+a `text/plain` form needs none, and could otherwise set cookies of its own grant in a reader's
+browser. While authentication is disabled (`-dev`), issuance is `404 not_offered`, whatever
+the request.
+
+Rules **fix** `/resource` (v0.50) when a rule of the blocks or the key's scope, at top level or
+inside `all`, tests it against one name (`test` with `value`, or `compare` with `eq` and a
+literal) or a finite set (`test` with a `schema` of only `enum`, or `compare` with `in` and a
+literal array). Several such rules fix it to the names all of them allow, so
+`{"op":"test","path":"/resource","schema":{"enum":["a","b"]}}` gives `/r/{ns}/a` and
+`/r/{ns}/b` in each namespace the grant names. An empty set, a name not valid under §3.6, or
+more than 100 names over all the grants of one request (each grant's set counted once, however
+many namespaces it names) is `403`. `"*"` and a grant without `read` are `403`, and so is one
+whose blocks or key scope refer to `/resource` any other way, or to `/now`, since the edge
+evaluates no rules. A grant with roles needs one role that lists `read` and qualifies: none of
+its rules refers to `/resource` or `/now`, and they pass now for the principal. Roles are
+alternatives, so one is enough, with the blocks and key scope on top; a role that tests
+`/resource` never qualifies, even next to blocks that fix it. The answer is all or nothing
+across every grant: if any namespace a grant names doesn't exist, is purged or refuses it, no
+cookie is set, and the request is `401` if any namespace's answer is, else `403`. A purged
+namespace is decided last, once the grant verifies and may read there, so the answer is
+`410 purged` only if every refusal is a purge, with `ns` and `head` naming the first one
+refused in the order of the grants and their root blocks (v0.50). Only then does each grant
+draw one token from its principal's rate limits (§6.6), `ratePerPrincipal` or the bucket of its
+allowance, under the limits of the first namespace it is issued in, as a write does; the tokens
+are drawn all at once, so a `429` (with `Retry-After` and `retryAfter`) answers the whole
+request and draws nothing.
+
+Cookies are `Secure`, `HttpOnly`, named `__Secure-pl-eg-…` per prefix, with `Path` the prefix,
+which covers what lies below it by whole segments (`/ns/{ns}` covers the namespace URL itself
+and `/ns/{ns}/…`, not `/ns/{ns}-x`), and last until the grant's `exp` or 15 minutes, whichever
+is sooner. Prefixes come in the order the grants first give them; a prefix several grants give
+gets one cookie, lasting as long as the longest, and the body's `exp` is the earliest of the
+cookies'. A read under one checks its expiry, so an event stream opened under a cookie ends
 there. One authorises `GET` and `HEAD` under its prefix only, on requests without
-`Authorization`; never writes, `/edge-grants` or the services. The origin verifies them itself
-(an HMAC over prefix, namespace, resource, subject and expiry), so they work without a verifying
-edge; behind one, reads still need `-edge-header`, and the key is derived from `-edge-secret` so
-the edge can verify the same cookies. `-edge-grant-key FILE` sets the key otherwise (default:
-random per process). Pages on another origin call it with `credentials: "include"`: list them
-with `-cors-credentials-origin` (repeatable), which names the origin from that list with
-`Access-Control-Allow-Credentials: true` and `Vary: Origin`, even when `-cors-origin` is `*`, and
-makes the cookies `SameSite=None` (otherwise `Lax`). `DELETE /edge-grants?prefix=…` (v0.48;
-`prefix` repeatable, as `prefixes` returned them) withdraws them at sign-out: `204`,
+`Authorization`; never writes or `/edge-grants`, and the origin's cookies never cover a
+service's URLs. The origin verifies them itself, making the checks an edge makes (below), so
+they work without a verifying edge, `no-store` at the edge. A cookie names no principal, so the
+origin attributes a read under one to `edge:` and its prefix. They are signed with the key in
+`-edge-grant-key FILE` if given; otherwise with the key derived from `-edge-secret`, so an edge
+holding the secret derives the same key; with neither flag, with a random key per process, so
+cookies don't survive a restart or reach another instance. `-edge-grant-kid` (default `origin`)
+names that key in the cookies. Pages on another origin call it with `credentials: "include"`:
+list them with `-cors-credentials-origin` (repeatable), which names the origin from that list
+with `Access-Control-Allow-Credentials: true` and `Vary: Origin`, even when `-cors-origin` is
+`*`, and makes the cookies `SameSite=None` (otherwise `Lax`). `DELETE /edge-grants?prefix=…`
+(v0.48; `prefix` repeatable, as `prefixes` returned them) withdraws them at sign-out: `204`,
 `no-store`, an expired cookie of the same name and attributes per prefix (a repeated one once),
 no grant needed, and the same with authentication disabled, so sign-out works either way. No
 `prefix`, or one of another form, is `400 bad_input`; `prefix` is the core's one repeatable
 parameter (§7). Only credentialed origins may preflight it, so another site can't sign a reader
 out. It clears the browser's copies only; a copied cookie lasts until it expires.
 
-**Verifying edge grants at an edge.** §C.5 leaves the cookie's format to the deployment; this
-is the reference's (`internal/edge/grants.go`), which an edge in front of `patchlog serve
--edge-secret` verifies as the origin does:
+A cookie carries no grant id, so revocation reaches it only when it expires, at most 15 minutes
+after issue, at the edge and the origin alike: a revoked grant, a key removed from the
+namespace's `keys` or a changed role doesn't end it sooner; only replacing the edge-grant key
+does. A branch serves the revisions it reads through under its own URLs (§7.6), so its cookies
+never need the base's. Cookies fixed to single resources add up, and browsers keep about
+150–180 per host, evicting the oldest: a reader of many documents is better served by a
+namespace-wide grant, if it may read the whole namespace, or by a proxy (§C.6).
 
-- **Key:** with `-edge-grant-key FILE`, the file's bytes with surrounding whitespace trimmed,
-  used as they are, not decoded (at least 16; `head -c 32 /dev/urandom | base64 >
-  edge-grant.key` makes one). Otherwise HMAC-SHA256 keyed with the edge secret (the
-  `-edge-secret` file's content, trimmed the same way) over the ASCII text `patchlog edge grants
-  v1`, so an edge that holds the secret derives the same key.
-- **Name:** `__Secure-pl-eg-` and the first 8 bytes of the prefix's SHA-256, in lowercase hex.
-- **Value:** `base64url(claims) "." base64url(HMAC-SHA256(key, first part))`, both unpadded,
-  the MAC over the first part's text as sent, so a verifier never re-encodes the claims. They
-  are JSON: `{"v":1,"p":prefix,"ns":ns,"r":resource,"sub":subject,"exp":Unix seconds}`, with
-  `r` only when the grant fixes a resource.
+**Verifying edge grants at an edge.** §C.5 leaves the cookie's format to the deployment, but
+gives a default so an edge can be written once. The reference issues exactly that
+(`internal/edge/grants.go`):
 
-The origin checks the namespace and resource of every read against `ns` and `r`; an edge that
-serves a cached copy doesn't ask it, so it checks all of these on every request, cache hits
-included:
+- **Name:** `__Secure-pl-eg-` followed by the first 8 bytes of `sha256(p)` in lowercase hex
+  (16 characters), where `p` is the cookie's path prefix.
+- **Value:** `base64url(c) "." base64url(HMAC-SHA256(key, base64url(c)))`, without padding,
+  where `c` is the canonical JSON (§3.1) of `{"exp":…,"kid":…,"p":…}`: exactly those three
+  members, the expiry in seconds since the epoch, the key's name and the prefix. The MAC is
+  over the first part's text as sent, so a verifier never re-encodes the claims.
+- **Kid and key:** `kid` names the key, which the minter and the edges hold. Each key vouches
+  only for its own prefixes: the origin's for `/r/{ns}/{name}`, `/r/{ns}` and `/ns/{ns}` with
+  names valid under §3.6, a service's for prefixes under a root of its own. The origin's kid is
+  `-edge-grant-kid` (default `origin`). Its key is the `-edge-grant-key` file's bytes with
+  surrounding whitespace trimmed, used as they are, not decoded (at least 16;
+  `head -c 32 /dev/urandom | base64 > edge-grant.key` makes one), and the edge then needs that
+  file. Without `-edge-grant-key` it is HMAC-SHA256 keyed with the edge secret (the
+  `-edge-secret` file's content, trimmed the same way) over the ASCII text
+  `patchlog edge grants v1`.
 
-1. It is a `GET` or `HEAD` without `Authorization`. A request with `Authorization` is decided
-   from its grant, whatever cookies it carries, and is never served from the cache.
-2. A cookie whose name starts with `__Secure-pl-eg-` has a MAC that verifies under the key
-   (compared in constant time), and its claims decode with `v` 1 and non-empty `p` and `ns`.
-3. Its name is the one derived from `p`.
-4. The current time is before `exp` (Unix seconds; the origin refuses from `exp` on).
-5. `p` is a prefix the origin issues for `ns` and `r`: `/r/{ns}/{r}` when `r` is set, else
-   `/r/{ns}` or `/ns/{ns}`.
-6. The request path, as received and still percent-encoded, is `p` or starts with `p` followed
-   by `/`. Prefixes cover whole segments: `/r/demo` covers `/r/demo/derby`, not the branch
-   `/r/demo-x`.
-7. The path has no empty, `.` or `..` segment, and no percent-encoded `.`, `/` or `\` (`%2E`,
-   `%2F`, `%5C`, in either case). The cache keys the raw URL, so `/r/demo/derby/../other`
-   passes check 6 for a cookie fixed to `derby`; something that normalises the path downstream
-   would then read `other`.
+On every request, cache hits included, before serving it or forwarding it as verified, an edge
+MUST check (§C.5):
 
-A request that passes goes to the origin with its cookies and the edge secret; the origin
-verifies the cookie again and decides the read, and the secret gives the response its edge
-lifetime. A request that fails is handled as one without an edge grant: forwarded without the
-secret, and never answered from a copy cached for verified requests, which the edge keeps
-apart from public copies. The cookie carries no grant id, so it stays good until `exp`, at most
-15 minutes after issue, at the edge and the origin alike: a revoked key or a changed role
-doesn't end it sooner.
+1. the method is `GET` or `HEAD`;
+2. the path has no empty, `.` or `..` segment and no percent-escape (`400` otherwise), since
+   the cache is keyed on the raw URL; core names never need one (§3.6);
+3. a cookie whose name is derived from its own `p`, as above; others are ignored;
+4. a `kid` it holds, that vouches for `p`, and a valid MAC;
+5. `exp` is in the future;
+6. `p` covers the path segment by segment: the path is `p` or starts with `p/`, so `/r/demo`
+   covers neither `/r/demo-x/…` nor `/r/demox`.
 
-For example (pinned by `TestCookieVector` in `internal/edge`), the edge secret `example edge
-secret` gives the key `3dba7ab1a5240f2d1e3f4922b87f24be07b3e95885e0f515c57d6ac5c13dd708`
-(hex), and the edge grant for `user:li` on `/r/demo/derby` until 1790000900
-(2026-09-21T14:28:20Z) is this cookie:
+A browser sends every cookie whose path covers the URL, so a request may carry several: one
+that passes all six checks is enough. A request that passes is answered from the copy cached
+for verified requests, or on a miss forwarded with `X-Edge-Verified` carrying the secret and
+`X-Edge-Prefix` the `p` it checked; the cookie is never part of the cache key. A request that
+fails any check is forwarded without those headers, and the origin answers it as it would
+without an edge, `no-store` at the edge if it is private; one that fails check 2 is `400` at
+the origin anyway (which v0.50 extends from dot segments, `//` and `%` to a trailing `/`). The
+origin decides a request carrying `Authorization` from that grant alone, ignoring its cookies,
+and never gives it an edge lifetime. In Go, `edge.Cookies.Check` makes the six checks in this
+order and returns the `p` to forward; it answers a request failing check 2 as one without a
+covering cookie, so an edge tests `edge.CanonicalPath` first to answer `400`. The origin checks
+cookies with `Check`, and its URLs with `CanonicalPath`.
+
+For example (pinned by `TestCookieVector` in `internal/edge`), the edge secret
+`example edge secret` gives the key
+`3dba7ab1a5240f2d1e3f4922b87f24be07b3e95885e0f515c57d6ac5c13dd708` (hex), and the edge grant
+of kid `origin` on `/r/demo/derby` until 1790000900 (2026-09-21T14:28:20Z) is this cookie:
 
 ```
-__Secure-pl-eg-4390e78526d94754=eyJ2IjoxLCJwIjoiL3IvZGVtby9kZXJieSIsIm5zIjoiZGVtbyIsInIiOiJkZXJieSIsInN1YiI6InVzZXI6bGkiLCJleHAiOjE3OTAwMDA5MDB9._U1WpIxTk-e-oRCQqufab2XM3CXgRG2eiR78olNgx6Q
+__Secure-pl-eg-4390e78526d94754=eyJleHAiOjE3OTAwMDA5MDAsImtpZCI6Im9yaWdpbiIsInAiOiIvci9kZW1vL2RlcmJ5In0.qn5oOZCcn6Au_LourbFpV2VbJ3u-XeiQlwNKAj43Lhw
 ```
 
-whose claims are `{"v":1,"p":"/r/demo/derby","ns":"demo","r":"derby","sub":"user:li","exp":1790000900}`.
+whose claims are `{"exp":1790000900,"kid":"origin","p":"/r/demo/derby"}`.
 
-**Bypassing it.** The origins answer directly on 9080 (core), 9081 (search) and 9082 (tree).
+**Bypassing the CDN.** The origins answer directly on 9080 (core), 9081 (search) and 9082 (tree).
 `make cdn-restart` restarts Varnish, which reloads the VCL and empties the cache.
 
 **Limitations.**
 
 - **No edge grants (§C.5).** A real deployment's edge verifies an edge grant on every request to
   a non-public namespace and serves the cached copy to anyone who holds one. This CDN verifies
-  nothing, so compose runs the origins without `-edge-secret`: private responses come with
+  nothing, so compose runs the origins without `-edge-secret`, and the VCL strips
+  `X-Edge-Verified` and `X-Edge-Prefix` from requests: private responses come with
   `CDN-Cache-Control: no-store` and pass (`X-Cache: PASS`). The VCL also refuses to cache
   responses marked `Cache-Control: private` whatever `CDN-Cache-Control` says (belt and braces;
   the only exception is a response that also says `Vary: Authorization`, which is cached per
@@ -2345,7 +2391,7 @@ internal/core       storage and semantics (gate, batches, branches, purge, prune
 internal/server     HTTP API
 internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
 internal/cdnpurge   HTTP cache-tag purges to a CDN (-purge-url)
-internal/edge       the verifying edge's secret, private edge directives and edge-grant cookies (§9, §C.5)
+internal/edge       the verifying edge's headers, private edge directives, edge-grant cookies and an edge's checks (§9, §C.5)
 internal/telemetry  OpenTelemetry from OTEL_* (off by default), HTTP handler and transport
 deploy/varnish      the compose stack's local CDN (Varnish VCL)
 ```

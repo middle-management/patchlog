@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/derived"
-	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -332,12 +331,6 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		writeErr(w, http.StatusBadGateway, "upstream", "cannot read a namespace configuration")
 		return
 	}
-	// Behind a verifying edge, private reads must come through it (§9).
-	if !ix.opt.Edge.Allow(r, rd.public) {
-		w.Header().Set("Cache-Control", "no-store")
-		writeErr(w, http.StatusForbidden, edge.Code, edge.Message)
-		return
-	}
 	setPtr := func() {
 		// The pointer names the reader's subject set: shared caches key
 		// it by Authorization, and keep none of a private one.
@@ -377,7 +370,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 				redirect(w, target(at))
 				return
 			}
-			ix.writeRefs(w, rd, at, st)
+			ix.writeRefs(w, r, rd, at, st)
 			return
 		}
 	}
@@ -403,7 +396,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		redirect(w, target(cur))
 		return
 	}
-	ix.writeRefs(w, rd, cur, st)
+	ix.writeRefs(w, r, rd, cur, st)
 }
 
 // refsIncludes reports whether an answer's at includes every min: its
@@ -660,12 +653,12 @@ func (ix *Index) refsCheckpoints(ctx context.Context, q queryer, nss []string) (
 	return cps, rows.Err()
 }
 
-func (ix *Index) writeRefs(w http.ResponseWriter, rd *refsReader, at string, st derived.Stored) {
+func (ix *Index) writeRefs(w http.ResponseWriter, r *http.Request, rd *refsReader, at string, st derived.Stored) {
 	if rd.public {
 		w.Header().Set("Cache-Control", ccImmutable)
 	} else {
 		w.Header().Set("Cache-Control", ccPrivateImm)
-		ix.opt.Edge.Private(w.Header(), cdnImmutable)
+		ix.opt.Edge.Private(w.Header(), r, cdnImmutable)
 	}
 	if st.Tags != "" {
 		w.Header().Set("Cache-Tag", st.Tags)

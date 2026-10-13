@@ -696,24 +696,31 @@ func (t *tx) rateLimit(n *nsRow, cfg *Config, a *actor, resources []string, item
 // writeDraws are the draws of a write (rateLimit).
 func (t *tx) writeDraws(n *nsRow, cfg *Config, a *actor, resources []string, items int) []draw {
 	l := cfg.Limits
-	var draws []draw
-	if al := t.allowanceOf(cfg, a); al != nil && al.Rate.Rate > 0 {
-		// An allowance's own bucket replaces the principal and namespace
-		// buckets; per-resource buckets still apply (§6.6).
-		draws = append(draws, draw{"a\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.Rate, float64(items), "allowance"})
-	} else {
-		pr := l.RatePerPrincipal
-		if a.keyRate != nil && a.keyRate.Rate < pr.Rate {
-			pr = Rate{a.keyRate.Rate, math.Min(a.keyRate.Burst, pr.Burst)}
-		}
-		draws = append(draws,
-			draw{"p\x00" + a.bucketKey, pr, float64(items), "ratePerPrincipal"},
-			draw{"n\x00" + n.name, l.RatePerNamespace, float64(items), "ratePerNamespace"})
+	// An allowance's own bucket replaces the principal and namespace
+	// buckets; per-resource buckets still apply (§6.6).
+	d := t.principalDraw(n, cfg, a, float64(items))
+	draws := []draw{d}
+	if d.name != "allowance" {
+		draws = append(draws, draw{"n\x00" + n.name, l.RatePerNamespace, float64(items), "ratePerNamespace"})
 	}
 	for _, r := range resources {
 		draws = append(draws, draw{"r\x00" + n.name + "\x00" + r + "\x00" + a.bucketKey, l.RatePerResource, 1, "ratePerResource"})
 	}
 	return draws
+}
+
+// principalDraw is the draw of cost tokens from the principal's bucket in
+// n, lowered to its key's rate, or from its allowance's bucket if that
+// has a rate (§6.6).
+func (t *tx) principalDraw(n *nsRow, cfg *Config, a *actor, cost float64) draw {
+	if al := t.allowanceOf(cfg, a); al != nil && al.Rate.Rate > 0 {
+		return draw{"a\x00" + n.name + "\x00" + al.Sub + "\x00" + al.Kid, al.Rate, cost, "allowance"}
+	}
+	pr := cfg.Limits.RatePerPrincipal
+	if a.keyRate != nil && a.keyRate.Rate < pr.Rate {
+		pr = Rate{a.keyRate.Rate, math.Min(a.keyRate.Burst, pr.Burst)}
+	}
+	return draw{"p\x00" + a.bucketKey, pr, cost, "ratePerPrincipal"}
 }
 
 // blobDraw is the draw of an upload's bytes from the principal's blobRate

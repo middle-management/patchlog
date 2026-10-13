@@ -16,6 +16,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -64,6 +65,7 @@ type svcOpts struct {
 	catalog     string
 	selfPlacing bool
 	now         func() time.Time
+	edge        *edge.Verifier
 }
 
 func startSvc(t *testing.T, core *client.Client, o svcOpts) *svc {
@@ -76,7 +78,7 @@ func startSvc(t *testing.T, core *client.Client, o svcOpts) *svc {
 	}
 	s := &svc{t: t, core: core, done: make(chan struct{})}
 	opt := tree.Options{
-		Client: core, Catalog: o.catalog, DB: o.db, SelfPlacing: o.selfPlacing, Purger: s, Now: o.now,
+		Client: core, Catalog: o.catalog, DB: o.db, SelfPlacing: o.selfPlacing, Purger: s, Now: o.now, Edge: o.edge,
 		CheckerTTL: time.Millisecond, MinWait: 30 * time.Second,
 		Logf:          func(f string, a ...any) { t.Logf(f, a...) },
 		OnApply:       func(b *follow.Batch) { s.mu.Lock(); s.nbatch++; s.mu.Unlock() },
