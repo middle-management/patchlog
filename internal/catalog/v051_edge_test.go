@@ -13,6 +13,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // edgeKey is the catalog service's own edge-grant key in these tests.
@@ -237,7 +238,9 @@ func TestServiceEdgeGrants(t *testing.T) {
 // trusts exchanges for a cookie bound to all, expiring with the earliest
 // of those grants. It covers every later at, so once the catalog trusts
 // another namespace the cookie wasn't checked against, a read at an at
-// including it is 403, until the reader exchanges again.
+// including it is 403, until the reader exchanges again. An edge can't
+// tell the cookies apart, so while such a cookie is live no shared cache
+// keeps a g/all listing at such an at.
 func TestServiceEdgeGrantForAll(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -248,6 +251,10 @@ func TestServiceEdgeGrantForAll(t *testing.T) {
 	w.svcClient = w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches", "teams"}, []string{"read"},
 		map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
 	w.edgeGrants = edge.NewCookies("catalog-cat", edgeKey)
+	w.edgeOwnKey = true
+	secret := []byte("edge secret shared with the service")
+	w.edge = must(edge.New(secret, "", ""))
+	verified := map[string]string{edge.DefaultHeader: string(secret), edge.DefaultPrefixHeader: "/cat/g/all"}
 	w.start()
 	w.caughtUp()
 	// The engine's clock stands still: a cookie issued at the very instant
@@ -277,6 +284,11 @@ func TestServiceEdgeGrantForAll(t *testing.T) {
 	}
 	if r := w.withCookie(strings.Replace(loc, "children?of=season", "problems", 1), all, nil); r.status != 200 {
 		t.Errorf("problems under the cookie: %d %v", r.status, r.body)
+	}
+	// Behind a verifying edge, edge lifetimes: every namespace was trusted
+	// before any g/all cookie was issued.
+	if r := w.withCookie(loc, all, verified); r.status != 200 || !strings.HasPrefix(r.header.Get("CDN-Cache-Control"), "max-age=") {
+		t.Errorf("g/all behind the edge: %d %v", r.status, r.header)
 	}
 
 	// The catalog comes to trust teams, after the cookie's issue.
@@ -319,6 +331,183 @@ func TestServiceEdgeGrantForAll(t *testing.T) {
 	// The old cookie still can't read there.
 	if r := w.withCookie(now, all, nil); r.status != 403 {
 		t.Errorf("the old cookie at the current at: %d", r.status)
+	}
+	// An edge would serve what it holds to the old cookie too, so while
+	// that is live nothing at an at including teams is kept at the edge,
+	// for the new cookie or a grant; the at from before is.
+	if r := w.withCookie(now, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != "no-store" || r.header.Get("Surrogate-Control") != "no-store" {
+		t.Errorf("an at including teams behind the edge: %d %v", r.status, r.header)
+	}
+	if r := w.withCookie(strings.Replace(now, "children?of=season", "problems", 1), cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != "no-store" {
+		t.Errorf("problems at an at including teams behind the edge: %d %v", r.status, r.header)
+	}
+	if r := w.doWith("GET", now, wider, nil, verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != "no-store" {
+		t.Errorf("an at including teams with a grant: %d %v", r.status, r.header)
+	}
+	if r := w.withCookie(loc, all, verified); r.status != 200 || !strings.HasPrefix(r.header.Get("CDN-Cache-Control"), "max-age=") {
+		t.Errorf("the at before teams behind the edge: %d %v", r.status, r.header)
+	}
+	// Once the old cookie has expired, at an edge's lagging clock too, a
+	// g/all listing including teams is kept at the edge again.
+	w.s.Clock.Advance(exp.Sub(w.s.Now()) + time.Minute + time.Second)
+	later := w.opsKey.Grant(t, w.s.Now(), "user:nw", []string{"cat", "matches", "teams"}, []string{"read"}, map[string]any{"exp": w.s.Now().Add(time.Hour).Format(time.RFC3339)})
+	r, cks = w.exchange(later, nil, "")
+	if r.status != 200 || prefixes(r) != "/cat/g/all" || len(cks) != 1 {
+		t.Fatalf("later: %d %v", r.status, r.body)
+	}
+	if r := w.withCookie(now, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != "max-age=31536000" {
+		t.Errorf("an at including teams after the old cookie expired: %d %v", r.status, r.header)
+	}
+}
+
+// TestServiceEdgeGrantForAllSharedKey (§B.11.5): with a key the service
+// doesn't hold alone (a key file, which a restart or another instance
+// shares), every g/all cookie with one exp is the same bytes whoever was
+// issued it, so the service never takes its issue from its own record: a
+// cookie counts as issued at its exp less 15 minutes. One issued before
+// the catalog trusted a namespace stays refused at an at including it
+// after a restart, even once a reader who reads that namespace is issued
+// the same bytes; and the edge keeps no g/all listing including it for 15
+// minutes, and a minute for edges' clocks.
+func TestServiceEdgeGrantForAllSharedKey(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	ctx := context.Background()
+	op := w.s.Client(t, client.WithBearer(w.s.OperatorGrant(t, "teams")))
+	must(op.CreateNamespace(ctx, "teams", map[string]any{"read": "grant", "keys": []any{w.opsKey.Entry("*")}}))
+	w.svcClient = w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches", "teams"}, []string{"read"},
+		map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+	w.edgeGrants = edge.NewCookies("catalog-cat", edgeKey)
+	secret := []byte("edge secret shared with the service")
+	w.edge = must(edge.New(secret, "", ""))
+	verified := map[string]string{edge.DefaultHeader: string(secret), edge.DefaultPrefixHeader: "/cat/g/all"}
+	w.start()
+	w.caughtUp()
+	// A new database records its start as when matches became trusted:
+	// until 15 minutes later, a short cookie counts as issued before it.
+	w.s.Clock.Advance(17 * time.Minute)
+
+	exp := w.s.Now().Add(2 * time.Minute)
+	a := w.opsKey.Grant(t, w.s.Now(), "user:a", []string{"cat", "matches"}, []string{"read"}, map[string]any{"exp": exp.Format(time.RFC3339)})
+	r, cks := w.exchange(a, nil, "")
+	if r.status != 200 || prefixes(r) != "/cat/g/all" || len(cks) != 1 {
+		t.Fatalf("a: %d %v", r.status, r.body)
+	}
+	old := cks[0]
+	_, loc := w.follow("/cat/children?of=season", a)
+	if r := w.withCookie(loc, old, verified); r.status != 200 || !strings.HasPrefix(r.header.Get("CDN-Cache-Control"), "max-age=") {
+		t.Errorf("g/all behind the edge: %d %v", r.status, r.header)
+	}
+
+	w.s.Clock.Advance(time.Second)
+	opc := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"config"})))
+	cfg := must(w.ops.NSHead(ctx, "cat")).Config
+	must(opc.PatchConfig(ctx, "cat", cfg, []any{map[string]any{"op": "add", "path": "/catalog/trust/-", "value": "teams"}}))
+	w.caughtUp()
+	waitFor(t, "teams to be followed", func() bool { return w.svc.Tree().Checkpoint("teams") != "" })
+	w.s.Clock.Advance(time.Second)
+	cur := strings.Replace(loc, "/at/"+gsAt(loc)+"/", "/at/"+w.svc.Tree().At()+"/", 1)
+	if r := w.withCookie(cur, old, nil); r.status != 403 {
+		t.Errorf("the old cookie at an at including teams: %d", r.status)
+	}
+	// A cookie lasting the full 15 minutes was issued after teams: it
+	// reads there, though the edge keeps nothing there yet.
+	long := w.opsKey.Grant(t, w.s.Now(), "user:c", []string{"cat", "matches", "teams"}, []string{"read"}, map[string]any{"exp": w.s.Now().Add(time.Hour).Format(time.RFC3339)})
+	r, cks = w.exchange(long, nil, "")
+	if r.status != 200 || prefixes(r) != "/cat/g/all" {
+		t.Fatalf("c: %d %v", r.status, r.body)
+	}
+	if r := w.withCookie(cur, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != "no-store" {
+		t.Errorf("a full-length cookie at an at including teams: %d %v", r.status, r.header)
+	}
+
+	// After a restart, a reader of teams whose grant expires with a's is
+	// issued the same bytes, which still don't read there.
+	w.stop()
+	w.start()
+	w.caughtUp()
+	b := w.opsKey.Grant(t, w.s.Now(), "user:b", []string{"cat", "matches", "teams"}, []string{"read"}, map[string]any{"exp": exp.Format(time.RFC3339)})
+	r, cks = w.exchange(b, nil, "")
+	if r.status != 200 || prefixes(r) != "/cat/g/all" || len(cks) != 1 {
+		t.Fatalf("b: %d %v", r.status, r.body)
+	}
+	if cks[0].Value != old.Value {
+		t.Errorf("b's cookie isn't a's bytes")
+	}
+	if r := w.withCookie(cur, old, nil); r.status != 403 {
+		t.Errorf("the old cookie at an at including teams after a restart: %d %v", r.status, r.body)
+	}
+
+	// Once 15 minutes and a minute have passed since teams was trusted,
+	// the edge keeps g/all listings including it.
+	w.s.Clock.Advance(edge.MaxGrantTTL + time.Minute + time.Second)
+	later := w.opsKey.Grant(t, w.s.Now(), "user:c", []string{"cat", "matches", "teams"}, []string{"read"}, map[string]any{"exp": w.s.Now().Add(time.Hour).Format(time.RFC3339)})
+	r, cks = w.exchange(later, nil, "")
+	if r.status != 200 || prefixes(r) != "/cat/g/all" {
+		t.Fatalf("later: %d %v", r.status, r.body)
+	}
+	_, now := w.follow("/cat/children?of=season", later)
+	if r := w.withCookie(now, cks[0], verified); r.status != 200 || r.header.Get("CDN-Cache-Control") != "max-age=31536000" {
+		t.Errorf("an at including teams 16 minutes on: %d %v", r.status, r.header)
+	}
+}
+
+// TestServiceEdgeGrantExchangeRate (§C.5, §6.6, v0.52): once nothing is
+// refused, an exchange draws one token, however many grants it carries,
+// from the exchangeRate bucket of each distinct principal among them, and
+// is 429 rate while any is empty, drawing none. A refused exchange draws
+// nothing. The exchange takes no query parameters (§7).
+func TestServiceEdgeGrantExchangeRate(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.edgeGrants = edge.NewCookies("catalog-cat", edgeKey)
+	w.exchangeRate = tree.Rate{Rate: 1, Burst: 2}
+	w.start()
+	w.caughtUp()
+	fan, fiona := w.caller("user:fred", "fan-club"), w.caller("user:fiona", "fan-club")
+
+	for i := range 3 {
+		if r, _ := w.exchange("", map[string]any{"grants": toAny(fan, "biscuit:nonsense")}, "application/json"); r.status != 401 {
+			t.Fatalf("refused %d: %d", i, r.status)
+		}
+	}
+	for i := range 2 {
+		if r, cks := w.exchange(fan, nil, ""); r.status != 200 || len(cks) != 1 {
+			t.Fatalf("fan %d: %d %v", i, r.status, r.body)
+		}
+	}
+	r, cks := w.exchange(fan, nil, "")
+	if r.status != 429 || r.body["code"] != "rate" || r.body["limit"] != "exchangeRate" || r.header.Get("Retry-After") != "1" ||
+		r.header.Get("Cache-Control") != "no-store" || len(cks) != 0 {
+		t.Errorf("fan's third: %d %v %v", r.status, r.header, r.body)
+	}
+	// Two grants of one principal draw one token; with an empty bucket
+	// among them, none.
+	if r, _ := w.exchange("", map[string]any{"grants": toAny(fiona, fiona)}, "application/json"); r.status != 200 {
+		t.Errorf("fiona twice: %d %v", r.status, r.body)
+	}
+	if r, cks := w.exchange("", map[string]any{"grants": toAny(fiona, fan)}, "application/json"); r.status != 429 || len(cks) != 0 {
+		t.Errorf("fiona and fan: %d %v", r.status, r.body)
+	}
+	if r, _ := w.exchange(fiona, nil, ""); r.status != 200 {
+		t.Errorf("fiona's last token: %d %v", r.status, r.body)
+	}
+	if r, _ := w.exchange(fiona, nil, ""); r.status != 429 {
+		t.Errorf("fiona, empty: %d %v", r.status, r.body)
+	}
+	w.s.Clock.Advance(time.Second)
+	if r, _ := w.exchange(fan, nil, ""); r.status != 200 {
+		t.Errorf("fan a second later: %d %v", r.status, r.body)
+	}
+
+	req := must(http.NewRequest("POST", w.http.URL+"/edge-grants?x=1", nil))
+	req.Header.Set("Authorization", "Bearer "+fiona)
+	res := must(noRedirect.Do(req))
+	res.Body.Close()
+	if res.StatusCode != 400 || len(res.Cookies()) != 0 || res.Header.Get("Cache-Control") != "no-store" {
+		t.Errorf("a query parameter: %d", res.StatusCode)
 	}
 }
 

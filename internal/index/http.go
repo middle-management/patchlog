@@ -35,6 +35,11 @@ const (
 
 var validNS = client.ValidNSName
 
+// minElsewhere is the 400 for a min naming a namespace the index doesn't
+// follow, or one the reader can't see (§A.5): one message for both, so it
+// doesn't tell which private namespaces exist and are indexed.
+const minElsewhere = "min names a namespace the service does not follow or the reader can't see"
+
 // Handler returns the query API (§A.4):
 //
 //	GET /{ns}?…                   302 → /{ns}/at/{checkpoint}?…            (head pointer)
@@ -293,7 +298,8 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// A min naming another namespace, which this URL's at doesn't cover,
 	// goes to the current checkpoint once reached (atIncludes judges only
 	// ns), in one hop, if the service follows it and the reader may see
-	// it; any other is 400 (§A.5).
+	// it; any other is 400 (§A.5), with one message either way, as in
+	// /_refs, so a min doesn't tell which private namespaces are indexed.
 	for i, m := range q.Mins {
 		switch {
 		case m.NS == "":
@@ -301,7 +307,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		case m.NS == ns:
 		case !ix.known(m.NS):
 			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow")
+			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
 			return
 		default:
 			if _, err := ix.access(ctx, m.NS, r); err != nil {
@@ -312,7 +318,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 					writeErr(w, http.StatusBadGateway, "upstream", "cannot read the namespace configuration")
 					return
 				}
-				writeErr(w, http.StatusBadRequest, "bad_input", "min names a namespace the reader can't see")
+				writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
 				return
 			}
 		}

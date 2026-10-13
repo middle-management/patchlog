@@ -64,6 +64,10 @@ type world struct {
 	// it, if set before start (§B.11.5, §9).
 	edgeGrants *edge.Cookies
 	edge       *edge.Verifier
+	// edgeOwnKey says edgeGrants' key is the service's alone, and
+	// exchangeRate is its exchangeRate bucket (tree.Options).
+	edgeOwnKey   bool
+	exchangeRate tree.Rate
 }
 
 func toAny(xs ...string) []any {
@@ -191,7 +195,7 @@ func (w *world) start() {
 		Tree: tree.Options{Client: w.svcClient, Catalog: "cat", DB: w.db, Now: w.s.Now, CheckerTTL: time.Millisecond,
 			Logf:          func(f string, a ...any) { w.t.Logf(f, a...) },
 			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
-			EdgeGrants:    w.edgeGrants, Edge: w.edge},
+			EdgeGrants:    w.edgeGrants, Edge: w.edge, EdgeGrantsOwnKey: w.edgeOwnKey, ExchangeRate: w.exchangeRate},
 		Key: w.cat.Priv, Kid: "catalog-01",
 		MergeKey: w.mergeKey.Priv, MergeKid: "catalog-merge", MergeService: "svc:merge",
 	})

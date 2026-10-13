@@ -365,7 +365,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	for _, m := range rq.mins {
 		if !slices.Contains(rd.nss, m.NS) {
 			w.Header().Set("Cache-Control", "no-store")
-			writeErr(w, http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow or the reader can't read")
+			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
 			return
 		}
 	}

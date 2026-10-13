@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/edge"
@@ -45,10 +48,88 @@ import (
 // instance with its own database, is 401, and the reader exchanges again
 // here. A g/all cookie is checked against every content namespace the
 // catalog trusts at issue, and covers every later at, so a read at an at
-// that includes a namespace trusted since is 403 (trustedSince).
+// that includes a namespace trusted since is 403 (trustedSince). The
+// edge can't make that check, and serves a cached listing to every g/all
+// cookie, so no shared cache keeps a g/all listing at such an at until
+// every cookie issued before that namespace was trusted has expired
+// (edgeHold).
 
 // maxEdgeGrants is how many grants one exchange takes in its body (§C.5).
 const maxEdgeGrants = 50
+
+// edgeClockSkew is how far an edge's clock may lag the service's: a
+// cookie the service holds expired may still pass an edge's checks that
+// long (edgeHold).
+const edgeClockSkew = time.Minute
+
+// Rate is a token bucket (§6.6): Rate refills it per second, up to Burst.
+type Rate struct{ Rate, Burst float64 }
+
+// DefaultExchangeRate is exchangeRate's default (§6.6): 10/s, burst 100.
+var DefaultExchangeRate = Rate{Rate: 10, Burst: 100}
+
+// exchangeBuckets are the exchangeRate buckets of the service's exchange
+// (§C.5, §6.6), one per principal, keyed as the core keys write buckets:
+// the principal and the kid of its grant's key. They are the process's
+// own: each instance of the service draws on its own.
+type exchangeBuckets struct {
+	mu sync.Mutex
+	b  map[string]*tokenBucket
+}
+
+type tokenBucket struct {
+	tokens float64
+	last   time.Time
+}
+
+// maxIdleBuckets is how many buckets are held before full ones are
+// dropped: a full bucket is the same as none.
+const maxIdleBuckets = 4096
+
+// admit draws one token from the bucket of each key if each holds one,
+// and otherwise draws none and returns the wait until the emptiest
+// refills one.
+func (e *exchangeBuckets) admit(now time.Time, r Rate, keys []string) (time.Duration, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.b == nil {
+		e.b = map[string]*tokenBucket{}
+	}
+	refill := func(b *tokenBucket) {
+		if el := now.Sub(b.last); el > 0 {
+			b.tokens = math.Min(r.Burst, b.tokens+el.Seconds()*r.Rate)
+			b.last = now
+		}
+	}
+	if len(e.b) > maxIdleBuckets {
+		for k, b := range e.b {
+			if refill(b); b.tokens >= r.Burst {
+				delete(e.b, k)
+			}
+		}
+	}
+	var wait time.Duration
+	bs := make([]*tokenBucket, len(keys))
+	for i, k := range keys {
+		b := e.b[k]
+		if b == nil {
+			b = &tokenBucket{tokens: r.Burst, last: now}
+			e.b[k] = b
+		}
+		refill(b)
+		bs[i] = b
+		if b.tokens < 1 {
+			wait = max(wait, time.Duration((1-b.tokens)/r.Rate*float64(time.Second)))
+		}
+	}
+	if wait > 0 {
+		return wait, false
+	}
+	for _, b := range bs {
+		b.tokens--
+	}
+	return 0, true
+}
 
 // edgeSubjects is a subject set behind a gs, and the expiry of the last
 // edge grant the service minted for it.
@@ -108,9 +189,13 @@ func (s *Service) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // those grants. A prefix several grants give gets one cookie, lasting as
 // long as the longest, and exp is the earliest. It answers all or
 // nothing: if any grant is refused, the request is 401 if any is 401,
-// else 403, and 502 if a namespace document can't be read. While the
-// core's authentication is disabled (§1), it is 404 not_offered, before
-// the body is read. Cookies are Secure, HttpOnly and SameSite as
+// else 403, and 502 if a namespace document can't be read. Once nothing
+// is refused, it draws one token from the exchangeRate bucket of each
+// distinct principal among the grants (ExchangeRate, §6.6), and is 429
+// (code "rate", limit "exchangeRate", with Retry-After) while any is
+// empty. While the core's authentication is disabled (§1), it is 404
+// not_offered, before the body is read; it takes no query parameter
+// (400, as the core's, §7). Cookies are Secure, HttpOnly and SameSite as
 // EdgeGrants says (None with credentialed origins, -cors-credentials-
 // origin, else Lax).
 func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
@@ -123,6 +208,10 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	if root.AuthDisabled() {
 		WriteError(w, http.StatusNotFound, "not_offered", "the core runs with authentication disabled: there are no edge grants (§C.5)")
+		return
+	}
+	if r.URL.RawQuery != "" {
+		WriteError(w, http.StatusBadRequest, "bad_input", "POST /edge-grants takes no query parameters (§7)")
 		return
 	}
 	bearers, status, msg := edgeGrantBearers(r)
@@ -164,6 +253,20 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	case upErr != nil:
 		WriteAuthError(w, upErr, s.opt.Logf)
+		return
+	}
+	// One token per request, from each distinct principal's bucket,
+	// however many grants it carries (§C.5, v0.52).
+	var keys []string
+	for _, v := range vs {
+		if !slices.Contains(keys, v.bucket) {
+			keys = append(keys, v.bucket)
+		}
+	}
+	if wait, ok := s.exchanges.admit(now, s.opt.ExchangeRate, keys); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(max(int(math.Ceil(wait.Seconds())), 1)))
+		WriteJSON(w, http.StatusTooManyRequests, map[string]any{"code": "rate", "message": "rate limit exceeded",
+			"limit": "exchangeRate", "retryAfter": math.Ceil(wait.Seconds()*1000) / 1000})
 		return
 	}
 	var prefixes []string
@@ -302,11 +405,16 @@ func (s *Service) withdrawEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // subject set's URL space). Under g/all, the catalog and every trusted
 // content namespace are read whole, and listings are kept no longer than
 // the cookie; at an at including a namespace trusted since its issue the
-// read is 403 (serve, trustedSince). A subject set the service doesn't
-// know is 401.
+// read is 403 (serve, trustedSince). A namespace that was public at issue
+// and has turned private since is still read whole under it until it
+// expires, as under a grant revoked since: the cookie's lifetime is the
+// revocation latency (§C.5). A subject set the service doesn't know is
+// 401.
 func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, error) {
 	gs, _ := s.edgeGS(cl.Prefix)
-	cfg, err := s.checker.Config(ctx, s.opt.Catalog)
+	// As grantViewer; a catalog service is never a release preview (Open),
+	// so actual is the namespace itself.
+	cfg, err := s.checker.Config(ctx, s.actual(s.opt.Catalog))
 	if err != nil {
 		return nil, err
 	}
@@ -343,7 +451,7 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 	}
 	v.catAll, v.wideCat, v.subjects = catPublic, catPublic, subs
 	for _, ns := range trust {
-		if c, err := s.checker.Config(ctx, ns); err == nil && c.Read == "public" {
+		if c, err := s.checker.Config(ctx, s.actual(ns)); err == nil && c.Read == "public" {
 			v.contentAll[ns], v.wideNS[ns] = true, true
 		}
 	}
@@ -410,8 +518,12 @@ func (s *Service) subjectsOf(ctx context.Context, gs string) ([]string, bool) {
 // Two cookies with the same prefix and exp are the same bytes, so while
 // one with exp was issued no later than a namespace the catalog trusts
 // now became trusted, a new one would be refused with it: it gets the
-// second before instead.
+// second before instead. Without EdgeGrantsOwnKey nothing is recorded,
+// since a record wouldn't be relied on.
 func (s *Service) allExp(now, exp time.Time) time.Time {
+	if !s.opt.EdgeGrantsOwnKey {
+		return exp
+	}
 	s.mu.RLock()
 	var latest time.Time
 	for _, t := range s.trusted {
@@ -426,7 +538,8 @@ func (s *Service) allExp(now, exp time.Time) time.Time {
 		s.allIssued = map[int64]time.Time{}
 	}
 	for e := range s.allIssued {
-		if e <= now.Unix() {
+		// Kept as long as an edge may still take it (edgeHold).
+		if !now.Before(time.Unix(e, 0).Add(edgeClockSkew)) {
 			delete(s.allIssued, e)
 		}
 	}
@@ -443,36 +556,35 @@ func (s *Service) allExp(now, exp time.Time) time.Time {
 }
 
 // allNotBefore is the earliest a g/all edge grant expiring at exp may have
-// been issued: its first issue recorded by this process (allExp), or,
-// without a record (another instance's, or before a restart), exp less
-// the cookies' longest lifetime. That is conservative: a cookie capped by
-// an earlier grant's exp counts as issued earlier than it was, so it is
-// refused at an at that includes a namespace trusted in the last minutes
-// before its issue too, and its reader exchanges again here.
+// been issued. A cookie carries only kid, p and exp, so every g/all cookie
+// with that exp is the same bytes, whoever it was issued to and whenever:
+// the process's record of the first issue (allExp) is relied on only
+// with EdgeGrantsOwnKey, when no cookie under the key was minted before
+// Open or by another instance. Otherwise, and without a record, it is exp
+// less the cookies' longest lifetime. That is conservative: a cookie
+// capped by an earlier grant's exp counts as issued earlier than it was,
+// so it is refused at an at that includes a namespace trusted in the last
+// minutes before its issue too, and its reader exchanges again once the
+// namespace has been trusted that long.
 func (s *Service) allNotBefore(exp int64) time.Time {
-	s.emu.Lock()
-	t, ok := s.allIssued[exp]
-	s.emu.Unlock()
-	if ok {
-		return t
+	if s.opt.EdgeGrantsOwnKey {
+		s.emu.Lock()
+		t, ok := s.allIssued[exp]
+		s.emu.Unlock()
+		if ok {
+			return t
+		}
 	}
 	return time.Unix(exp, 0).Add(-s.opt.EdgeGrants.MaxTTL())
 }
 
-// trustedSince names a content namespace that a listing at at, for v
-// under a g/all edge grant, would include but that grant wasn't checked
-// against, because the catalog came to trust it no earlier than
-// v.notBefore (§B.11.5), or "" if there is none or v isn't under a g/all
-// edge grant. At the very instant of its issue, it can't be told whether
-// the exchange read the trust list before or after: that counts as after.
-// The namespaces of at are those of the current at, cur, or those
-// recorded for a kept one (recordAt); any other at is redirected to cur.
-// A namespace at includes that the catalog no longer trusts counts as
-// trusted since, since when it became trusted is no longer known.
-func (s *Service) trustedSince(v *viewer, at, cur string) string {
-	if v.notBefore.IsZero() {
-		return ""
-	}
+// atTrust is when the catalog came to trust each content namespace that a
+// listing at at includes (ok false for one without a record): those of
+// the current at, cur, or those recorded for a kept one (recordAt); any
+// other at is redirected to cur. A namespace at includes that the catalog
+// no longer trusts has no record: when it became trusted is no longer
+// known.
+func (s *Service) atTrust(at, cur string) []trustTime {
 	var nss []string
 	s.amu.Lock()
 	rec, ok := s.ats[at]
@@ -491,12 +603,86 @@ func (s *Service) trustedSince(v *viewer, at, cur string) string {
 		}
 	}
 	sort.Strings(nss)
-	for _, ns := range nss {
-		if since, ok := s.trusted[ns]; !ok || !since.Before(v.notBefore) {
-			return ns
+	out := make([]trustTime, len(nss))
+	for i, ns := range nss {
+		since, ok := s.trusted[ns]
+		out[i] = trustTime{ns, since, ok}
+	}
+	return out
+}
+
+// trustTime is when the catalog came to trust ns, if ok.
+type trustTime struct {
+	ns    string
+	since time.Time
+	ok    bool
+}
+
+// trustedSince names a content namespace that a listing at at, for v
+// under a g/all edge grant, would include but that grant wasn't checked
+// against, because the catalog came to trust it no earlier than
+// v.notBefore (§B.11.5), or "" if there is none or v isn't under a g/all
+// edge grant. At the very instant of its issue, it can't be told whether
+// the exchange read the trust list before or after: that counts as after.
+// A namespace without a record (atTrust) counts as trusted since.
+func (s *Service) trustedSince(v *viewer, at, cur string) string {
+	if v.notBefore.IsZero() {
+		return ""
+	}
+	for _, t := range s.atTrust(at, cur) {
+		if !t.ok || !t.since.Before(v.notBefore) {
+			return t.ns
 		}
 	}
 	return ""
+}
+
+// edgeHold reports whether no shared cache may keep v's listing at at,
+// because at includes a namespace the catalog came to trust so recently
+// that a g/all edge grant issued before it may still be live (§B.11.5).
+// The service refuses such a cookie there (trustedSince), but an edge
+// serves a listing it holds to every cookie passing its six checks, and
+// can't tell a cookie checked against that namespace from one that
+// wasn't. So while an earlier g/all cookie may be live, at the service's
+// clock and at an edge's lagging by up to edgeClockSkew, a g/all listing
+// including the namespace is no-store at the edge, whoever reads it.
+// With EdgeGrantsOwnKey the service knows every g/all cookie it issued
+// (allExp), and holds only while one issued no later than the namespace
+// became trusted is live; otherwise, for the cookies' longest lifetime
+// after it. A namespace without a record (atTrust) counts as just
+// trusted.
+func (s *Service) edgeHold(v *viewer, at, cur string) bool {
+	if s.opt.EdgeGrants == nil || v.gs != AllSubjects {
+		return false
+	}
+	now := s.opt.Now()
+	var issued []time.Time // the first issues of the g/all cookies that may be live
+	if s.opt.EdgeGrantsOwnKey {
+		s.emu.Lock()
+		for e, t := range s.allIssued {
+			if now.Before(time.Unix(e, 0).Add(edgeClockSkew)) {
+				issued = append(issued, t)
+			}
+		}
+		s.emu.Unlock()
+	}
+	// A cookie issued at since lives until since+MaxTTL at the latest, a
+	// second more for exp's truncation.
+	window := s.opt.EdgeGrants.MaxTTL() + time.Second + edgeClockSkew
+	for _, t := range s.atTrust(at, cur) {
+		if !s.opt.EdgeGrantsOwnKey {
+			if !t.ok || now.Before(t.since.Add(window)) {
+				return true
+			}
+			continue
+		}
+		for _, i := range issued {
+			if !t.ok || !i.After(t.since) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // loadTrusted reads when the catalog came to trust each namespace (meta

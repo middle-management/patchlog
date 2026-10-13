@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -120,6 +122,12 @@ type viewer struct {
 	subjects  []string
 	idExp     time.Time
 	notBefore time.Time
+	// bucket keys the exchangeRate bucket of the grant's principal, as
+	// the core keys write buckets: principal and kid (§C.5, §6.6).
+	bucket string
+	// noEdge keeps a listing out of shared caches whoever reads it
+	// (edgeHold).
+	noEdge bool
 }
 
 // wide reports whether the viewer reads the catalog and every namespace of
@@ -244,6 +252,7 @@ func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error
 	if err != nil {
 		return nil, err
 	}
+	v.bucket = vg.Principal.ID + "\x00" + vg.Key.Kid
 	exp := grantExp(vg, time.Time{})
 	v.idExp = exp
 	var markers []string
@@ -543,7 +552,10 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	setPtr := func() {
-		if v.anon {
+		// An anonymous reader's redirect out of a subject set's URL space
+		// is no shared cache's either: there, the edge serves what it
+		// holds to readers with that subject set's edge grant (§B.11.5).
+		if v.anon && gs == "" {
 			w.Header().Set("Cache-Control", ccHeadPointer)
 			w.Header().Set("Cache-Tag", "ns:"+cat)
 		} else {
@@ -555,7 +567,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
-	if status, code, msg := s.AwaitMins(ctx, vals["min"]); status != 0 {
+	if status, code, msg := s.awaitMins(ctx, vals["min"], Bearer(r)); status != 0 {
 		w.Header().Set("Cache-Control", "no-store")
 		if status == http.StatusServiceUnavailable {
 			w.Header().Set("Retry-After", "1")
@@ -586,6 +598,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteError(w, http.StatusForbidden, "forbidden", "the edge grant for all predates the catalog's trust in "+ns+": exchange the grants again")
 		return
 	}
+	v.noEdge = s.edgeHold(v, at, cur)
 	own := isAt && gs == v.gs && !(v.anon && gs != "")
 	mins := len(vals["min"]) > 0
 	canonical := r.URL.RequestURI() == canon(at)
@@ -870,6 +883,9 @@ func (s *Service) setListingHeaders(w http.ResponseWriter, r *http.Request, v *v
 		w.Header().Set("Cache-Control", ccPrivateList)
 		s.opt.Edge.Private(w.Header(), r, cdnListing)
 	}
+	if v.noEdge {
+		edge.NoStore(w.Header())
+	}
 	w.Header().Set("Cache-Tag", tags)
 	w.Header().Set("X-Namespace-Revision", at)
 }
@@ -992,6 +1008,21 @@ type minRef struct{ ns, id string }
 // namespace the service doesn't follow, 503 (with Retry-After) while it is
 // behind. Services of the addenda use it for the endpoints that take min.
 func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, code, msg string) {
+	return s.awaitMins(ctx, vals, "")
+}
+
+// minElsewhere is the 400 for a min naming a namespace that neither the
+// service nor, behind Multi, another catalog's follows, or that the
+// reader can't see: one message, so it doesn't tell which namespaces
+// exist.
+const minElsewhere = "min names a namespace the service does not follow or the reader can't see"
+
+// awaitMins is AwaitMins for a reader presenting token ("" for none).
+// Behind Multi, a min naming a namespace that another catalog's service
+// follows, and that the reader may see (public, or its grant reads it),
+// is waited for there: this catalog's at doesn't cover it, so the
+// listing then redirects to the current at in one hop (§A.5, §B.5).
+func (s *Service) awaitMins(ctx context.Context, vals []string, token string) (status int, code, msg string) {
 	mins, err := parseMins(vals)
 	if err != nil {
 		return http.StatusBadRequest, "bad_input", err.Error()
@@ -1000,18 +1031,76 @@ func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, cod
 	for _, ns := range s.followed() {
 		followed[ns] = true
 	}
-	for i, m := range mins {
+	var own []minRef
+	other := map[*Service][]minRef{}
+	for _, m := range mins {
 		// A preview's readers write to the branches, so min names them.
 		m.ns = s.logical(m.ns)
-		mins[i] = m
-		if m.ns != "" && !followed[m.ns] {
-			return http.StatusBadRequest, "bad_input", "min names a namespace the service does not follow"
+		if m.ns == "" || followed[m.ns] {
+			own = append(own, m)
+			continue
 		}
+		o := s.sibling(m.ns)
+		if o == nil {
+			return http.StatusBadRequest, "bad_input", minElsewhere
+		}
+		switch ok, err := o.sees(ctx, m.ns, token); {
+		case err != nil:
+			s.opt.Logf("tree: access check for %s: %v", m.ns, err)
+			return http.StatusBadGateway, "upstream", "cannot read a namespace configuration"
+		case !ok:
+			return http.StatusBadRequest, "bad_input", minElsewhere
+		}
+		other[o] = append(other[o], m)
 	}
-	if !s.waitMins(ctx, mins) {
+	ctx, cancel := context.WithTimeout(ctx, s.opt.MinWait)
+	defer cancel()
+	if !s.waitMins(ctx, own) {
 		return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
 	}
+	for o, ms := range other {
+		if !o.waitMins(ctx, ms) {
+			return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
+		}
+	}
 	return 0, "", ""
+}
+
+// sibling is the service of another catalog behind the same Multi that
+// follows ns, if any.
+func (s *Service) sibling(ns string) *Service {
+	for _, o := range s.siblings {
+		if slices.Contains(o.followed(), ns) {
+			return o
+		}
+	}
+	return nil
+}
+
+// sees reports whether the bearer of token ("" for none) may see ns:
+// it is public, or the grant reads it, in whole or in part. A namespace
+// document that can't be read is an error.
+func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
+	cfg, err := s.checker.Config(ctx, s.actual(ns))
+	if err != nil {
+		return false, err
+	}
+	if cfg.Read == "public" {
+		return true, nil
+	}
+	if token == "" {
+		return false, nil
+	}
+	v, err := s.checker.Verify(ctx, s.actual(ns), token)
+	var ae *grant.AuthError
+	switch {
+	case errors.As(err, &ae):
+		return false, nil
+	case err != nil:
+		return false, err
+	}
+	ok, _ := v.Allows("read")
+	return ok, nil
 }
 
 func parseMins(vals []string) ([]minRef, error) {

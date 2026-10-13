@@ -91,4 +91,15 @@ func TestMinOtherNamespace(t *testing.T) {
 			t.Errorf("%s %s: %d %v", c.who, c.url, r.status, r.body)
 		}
 	}
+	// One answer for a namespace the reader can't see and one the index
+	// doesn't follow, so a min can't probe which private namespaces are
+	// indexed, even anonymously on a public result.
+	pubOld := x.raw("/pub?limit=5", "").header.Get("Location")
+	if !strings.HasPrefix(pubOld, "/pub/at/") {
+		t.Fatalf("public pointer: %q", pubOld)
+	}
+	hidden, unknown := x.raw(pubOld+"&min=pb:"+pbAt, ""), x.raw(pubOld+"&min=zz:"+pbAt, "")
+	if hidden.status != 400 || unknown.status != 400 || hidden.body["message"] != unknown.body["message"] || hidden.body["code"] != unknown.body["code"] {
+		t.Errorf("hidden %d %v, unknown %d %v", hidden.status, hidden.body, unknown.status, unknown.body)
+	}
 }

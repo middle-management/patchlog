@@ -135,6 +135,18 @@ type Options struct {
 	// sets its Vouches to those prefixes. It needs a RoleView: only a
 	// catalog service's listings depend on the subject set alone.
 	EdgeGrants *edge.Cookies
+	// EdgeGrantsOwnKey says EdgeGrants' key was made for this Service
+	// alone (a random one, -edge-grant-key not given): no cookie under it
+	// was minted before Open or by another instance, so the record of
+	// when each g/all cookie was first issued is exact. Otherwise a g/all
+	// cookie counts as issued at its exp less the longest lifetime
+	// (allNotBefore).
+	EdgeGrantsOwnKey bool
+	// ExchangeRate is the exchangeRate bucket each principal draws one
+	// token from per exchange at POST /edge-grants (§C.5, §6.6; default
+	// DefaultExchangeRate). It is a deployment's limit, so the service
+	// has its own, per process.
+	ExchangeRate Rate
 	// Branches makes the service a release preview (§B.5, §F.9): it maps
 	// a namespace (the catalog, or a content namespace it trusts) to the
 	// release's branch of it, which is followed in its place. Documents
@@ -179,6 +191,11 @@ type Service struct {
 	emu       sync.Mutex
 	edgeSubs  map[string]edgeSubjects // gs → its subjects, for its edge grants
 	allIssued map[int64]time.Time     // exp → the first issue of a g/all edge grant expiring then
+	exchanges exchangeBuckets         // exchangeRate, per principal
+
+	// siblings are the services of the other catalogs behind the same
+	// Multi, set before it serves (awaitMins).
+	siblings []*Service
 
 	fmu     sync.Mutex
 	runCtx  context.Context
@@ -221,6 +238,9 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	}
 	if opt.CheckerTTL == 0 {
 		opt.CheckerTTL = 30 * time.Second
+	}
+	if opt.ExchangeRate.Rate <= 0 || opt.ExchangeRate.Burst < 1 {
+		opt.ExchangeRate = DefaultExchangeRate
 	}
 	if opt.Logf == nil {
 		opt.Logf = log.Printf

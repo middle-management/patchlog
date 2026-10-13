@@ -33,7 +33,7 @@ and serves immutable, CDN-cacheable revisions.
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
-| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), drawing on each grant's rate limits, withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
+| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), drawing on each grant's rate limits, withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`), each exchange drawing one `exchangeRate` token per principal (v0.52) | §C.5, §9, §B.11.5 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
@@ -1847,6 +1847,12 @@ the grant in `Authorization`, or 1 to 50 as `{ "grants": [ … ] }` in an `appli
 (`415` otherwise; `400` with `Authorization` too, an empty list or another member), all or
 nothing (`401` if any grant is, else `403`), answering `{ "prefixes": [...], "exp" }`
 (`no-store`) with one `Secure`, `HttpOnly` cookie per prefix, named and formatted as the core's.
+Once nothing is refused, an exchange draws one token, however many grants it carries, from the
+`exchangeRate` bucket of each distinct principal among them (keyed by principal and kid, as the
+core keys write buckets), and is `429` (`code: "rate"`, `limit: "exchangeRate"`, `Retry-After`)
+while any is empty (v0.52, §6.6). The buckets are the process's own, 10/s with a burst of 100,
+set with `-exchange-rate` and `-exchange-burst`. Like the core's, it takes no query parameters
+(`400`).
 Each grant is resolved as a listing resolves its reader: its prefix is `/{catalog}/g/{gs}`, the
 subject set its listings are served under, lasting until that grant's `exp` or 15 minutes,
 whichever is sooner; or `/{catalog}/g/all` for a reader with namespace-wide read on the catalog
@@ -1862,7 +1868,9 @@ those origins may preflight the `DELETE`. Cookies are signed with `-edge-grant-k
 of the service's own that the origin never holds (refused if it is the one the origin derives
 from `-edge-secret`; without the flag, a random key per process, so cookies don't survive a
 restart), named `-edge-grant-kid` (default `catalog-{catalog}`), which may not be the origin's
-kid, `-origin-edge-grant-kid` (default `origin`).
+kid, `-origin-edge-grant-kid` (default `origin`). A catalog named `r` or `ns` mints none, since
+its prefixes would overlap the core's (the service still runs; naming a key or kid for it is an
+error).
 
 A `GET` or `HEAD` without `Authorization` that carries one of these cookies, covering its path
 and passing the six checks an edge makes (see
@@ -1884,13 +1892,23 @@ A `g/all` cookie was checked against the content namespaces the catalog trusted 
 issued, and covers every later `at`, so the service answers `403` at an `at` that includes a
 namespace trusted since, until the reader exchanges again (a kept listing from before is still
 served). The service records when it came to trust each namespace (`meta` `trusted:{ns}`; a new
-or rebuilt database records its start) and when it first issued a `g/all` cookie with each
-`exp`, and refuses a namespace trusted no earlier than that issue. Without that record (another
-instance's cookie, or one from before a restart) it is conservative: it takes the cookie as
-issued at its `exp` less 15 minutes, so a cookie that a grant's earlier `exp` cut short is also
-refused at an `at` including a namespace trusted in the minutes before its issue. Two cookies
-with the same `exp` are the same bytes, so an exchange that would repeat one issued before a
-namespace became trusted gets an `exp` a second earlier.
+or rebuilt database records its start). A cookie carries only `kid`, `p` and `exp`, so every
+`g/all` cookie with one `exp` is the same bytes, and when one was issued can be known only where
+nothing else holds the key: with a random key (no `-edge-grant-key`), the service records when
+it first issued a `g/all` cookie with each `exp` and refuses a namespace trusted no earlier than
+that (an exchange that would repeat a cookie issued before a namespace became trusted gets an
+`exp` a second earlier). With `-edge-grant-key`, which a restart or another instance shares, it
+is conservative: a cookie counts as issued at its `exp` less 15 minutes, so for 15 minutes after
+a namespace becomes trusted (or a new database starts) only cookies lasting the full 15 minutes
+read an `at` including it. A namespace that was public when a `g/all` cookie was issued and has
+turned private since is still read whole under it until it expires, as under a grant revoked
+since: the cookie's lifetime is the revocation latency (§C.5).
+
+An edge can't make that check: it serves a listing it holds to every `g/all` cookie that passes
+its six checks. So a `g/all` listing at an `at` including a recently trusted namespace is
+`no-store` at the edge, whoever reads it, while a `g/all` cookie issued before that namespace was
+trusted may be live: with a random key, while one the service issued is; with a key file, for 15
+minutes after. Either way a minute more is allowed for edges' clocks.
 
 ```sh
 head -c 32 /dev/urandom | base64 > catalog-edge-grant.key   # the edge holds it too, under catalog-cat
@@ -1904,8 +1922,12 @@ URL past any cached head pointer and waits for the service to catch up (`503` wi
 otherwise), instead of fetching with `no-store` (§B.5, §A.5). As in the search index, `min`
 always redirects (v0.50): an `at` URL whose listing already includes every `min` (the current
 `at`, or a kept one whose checkpoints show it) to itself without `min`, anything else to the
-current `at`. A bare `{ns_id}` never counts as included in an older `at`. Every namespace the
-service follows is in `at`, so a `min` naming one it doesn't follow is `400`. `POST /grants` and
+current `at`. A bare `{ns_id}` never counts as included in an older `at`. Every namespace a
+catalog's service follows is in its `at`. A tree service serving several catalogs keeps an `at`
+per catalog, so a `min` naming a namespace that only another of its catalogs follows, and that
+the reader may see (public, or its grant reads it), is waited for there and redirects to the
+current `at` in one hop (§A.5); a `min` naming a namespace no catalog of the service follows, or
+one the reader can't see, is `400`, with one message for both. `POST /grants` and
 `POST /read-grants` take `?min` the same way; a decision on an item also depends on its content
 namespace (whether the item exists), so after creating a document it placed, or restoring one, a
 client passes `min` for both (§B.11.4).

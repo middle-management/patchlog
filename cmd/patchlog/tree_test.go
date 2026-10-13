@@ -68,4 +68,18 @@ func TestServiceEdgeGrantCookies(t *testing.T) {
 	if ck, err := serviceEdgeGrantCookies("cat", "cat-2026", edge.DefaultKid, own, ev, cf); err != nil || ck.Kid() != "cat-2026" || ck.SameSite != http.SameSiteNoneMode {
 		t.Errorf("own key: %v %v", ck, err)
 	}
+	// A catalog named r or ns gets none, so the service still starts
+	// (tree.Open refuses edge grants for it, which the open loop would
+	// retry for ever); naming a key or kid for it is an error.
+	for _, cat := range []string{"r", "ns"} {
+		if ck, err := serviceEdgeGrantCookies(cat, "", edge.DefaultKid, "", nil, cf); ck != nil || err != nil {
+			t.Errorf("catalog %s: %v %v", cat, ck, err)
+		}
+		if _, err := serviceEdgeGrantCookies(cat, "", edge.DefaultKid, own, nil, cf); err == nil {
+			t.Errorf("catalog %s with a key: accepted", cat)
+		}
+		if _, err := serviceEdgeGrantCookies(cat, "k", edge.DefaultKid, "", nil, cf); err == nil {
+			t.Errorf("catalog %s with a kid: accepted", cat)
+		}
+	}
 }

@@ -7,7 +7,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -111,5 +114,77 @@ func TestMulti(t *testing.T) {
 		if r := x.raw(p, ""); r.status != 404 {
 			t.Errorf("%s: %d", p, r.status)
 		}
+	}
+}
+
+// TestMultiMinElsewhere (§A.5, §B.5): behind Multi, a min naming a
+// namespace that only another catalog's service follows isn't covered by
+// this catalog's at; if the reader may see it, it is waited for there and
+// the listing redirects to this catalog's current at in one hop, without
+// min. A namespace no catalog follows, and one the reader can't see, are
+// 400 with one message.
+func TestMultiMinElsewhere(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	admin, reader := clienttest.NewKey("admin"), clienttest.NewKey("reader")
+	nss := []string{"a", "b", "c", "cat", "topics"}
+	for _, ns := range nss {
+		doc := map[string]any{"read": "public", "keys": []any{admin.Entry("*"), reader.Entry("read")}}
+		switch ns {
+		case "b":
+			doc["read"] = "grant"
+		case "cat":
+			doc["catalog"] = map[string]any{"trust": []any{"a"}}
+		case "topics":
+			doc["catalog"] = map[string]any{"trust": []any{"b", "c"}}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	root := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", nss, []string{"read", "create", "append"})))
+	must(root.CreateDoc(ctx, "cat", "top", map[string]any{"title": "Top", "parents": []any{}}))
+	svcClient := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:tree", nss, []string{"read"})))
+	cat := startSvc(t, svcClient, svcOpts{now: s.Now})
+	topics := startSvc(t, svcClient, svcOpts{catalog: "topics", db: filepath.Join(t.TempDir(), "topics.db"), now: s.Now})
+	cat.caughtUp("cat", "a")
+	topics.caughtUp("topics", "b", "c")
+	cw := must(root.CreateDoc(ctx, "c", "x", map[string]any{"t": 1})).NSID
+	// Served alone, cat knows nothing of c.
+	if r := cat.raw("/cat/roots?min=c:"+cw, ""); r.status != 400 {
+		t.Errorf("min for c without Multi: %d", r.status)
+	}
+	m := httptest.NewServer(must(tree.Multi(cat.s, topics.s)))
+	defer m.Close()
+	x := &svc{t: t, http: m}
+
+	// c is public and followed by topics only: waited for there.
+	want := "/cat/at/" + cat.s.At() + "/roots"
+	if r := x.raw("/cat/roots?min=c:"+cw, ""); r.status != 302 || r.header.Get("Location") != want {
+		t.Errorf("min for topics' public c: %d %s, want %s", r.status, r.header.Get("Location"), want)
+	}
+	if got := topics.s.Checkpoint("c"); got != cw {
+		t.Errorf("redirected before topics reached c: %s, want %s", got, cw)
+	}
+	// From an at URL too: one hop to the current at.
+	old := "/cat/at/" + cat.s.At() + "/roots"
+	must(root.CreateDoc(ctx, "a", "y", map[string]any{"t": 1}))
+	cat.caughtUp("a")
+	want = "/cat/at/" + cat.s.At() + "/roots"
+	if r := x.raw(old+"?min=c:"+cw, ""); r.status != 302 || r.header.Get("Location") != want {
+		t.Errorf("min for c from an at: %d %s, want %s", r.status, r.header.Get("Location"), want)
+	}
+	// b is private: a reader whose grant reads it is redirected; one
+	// without a grant for it gets the same 400 as for a namespace no
+	// catalog follows.
+	bw := must(root.CreateDoc(ctx, "b", "x", map[string]any{"t": 1})).NSID
+	bReader := reader.Grant(t, s.Now(), "user:bea", []string{"cat", "b"}, []string{"read"})
+	if r := x.raw("/cat/roots?min=b:"+bw, bReader); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/cat/g/") ||
+		!strings.HasSuffix(r.header.Get("Location"), "/at/"+cat.s.At()+"/roots") {
+		t.Errorf("min for b with a grant for it: %d %s", r.status, r.header.Get("Location"))
+	}
+	hidden, unknown := x.raw("/cat/roots?min=b:"+bw, ""), x.raw("/cat/roots?min=zz:"+bw, "")
+	if hidden.status != 400 || unknown.status != 400 || hidden.body["message"] != unknown.body["message"] ||
+		hidden.header.Get("Cache-Control") != "no-store" {
+		t.Errorf("hidden %d %v, unknown %d %v", hidden.status, hidden.body, unknown.status, unknown.body)
 	}
 }
