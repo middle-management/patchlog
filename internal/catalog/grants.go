@@ -79,7 +79,11 @@ func upstream(err error) error {
 // decidedAt marks a refusal that is a decision (403, 404, 409, 410) with
 // the combined checkpoint it was decided at, so a client that caches
 // refusals keys them as it keys grants (§B.11.4). Plans defer it once
-// their View has run; other errors pass unchanged.
+// their View has run; other errors pass unchanged. A refusal decided from
+// state the checkpoint doesn't pin, such as the core's head of a name
+// (a 409 for a name the service hasn't seen yet) or the signing key at
+// the head, isn't decided at it: the plan clears combined before it
+// returns one, so it carries no checkpoint, as before its View ran.
 func decidedAt(err error, combined string) error {
 	var ce *Error
 	if combined == "" || !errors.As(err, &ce) || ce.Checkpoint != "" {
@@ -167,9 +171,13 @@ const readGrantRetries = 3
 // carries (§B.11.4): it notes the checkpoint before and after deciding,
 // and decides again if it moved, up to readGrantRetries times, then
 // answers 503 behind with Retry-After. So "may this reader read all of
-// these?" is one call: it may if no entry has an error. A public item
-// counts as readable, though it gets no grant; a catalog node gets keys
-// and no grant (§B.11.5).
+// these?" is one call: it may if no entry has an error, and may not if an
+// entry's error is a refusal (a 4xx status); an entry whose error is a 5xx
+// (503 behind from checkLag, 502 upstream) is undecided, and the client
+// asks again. A public item counts as readable, though it gets no grant;
+// a catalog node gets keys and no grant (§B.11.5). Whether a namespace is
+// public, and its encryption, are read as of the checkpoint too
+// (exposureAt).
 //
 // Keys (§B.11.5, §E.2.6). For an item of a sealed content namespace the
 // answer also carries the item's per-resource keys K_r, which open its
@@ -231,7 +239,6 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []string) []any {
 	lagOK := map[string]bool{}
 	cat := s.t.Catalog()
-	keys := s.t.Keys()
 	var enc *ecdh.PublicKey
 	if len(v.Grant.Blocks) > 0 {
 		enc = v.Grant.Blocks[0].Enc
@@ -269,13 +276,11 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 			}
 			want = []keyOf{{cat, name}}
 		default:
-			public := false
+			var public bool
+			var in derived.Info
 			if ok {
-				if cfg, cerr := s.t.Checker().Config(ctx, ns); cerr == nil && cfg.Read == "public" {
-					public = true
-				}
+				public, in = s.exposureAt(ctx, ns)
 			}
-			in, _ := keys.Info(ctx, ns)
 			if public && !in.Protected() {
 				e["public"] = true
 				out = append(out, e)
@@ -320,6 +325,31 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 		out = append(out, e)
 	}
 	return out
+}
+
+// exposureAt is whether ns is public and its encryption, as of the
+// checkpoint the service is at (Graph.Content, configAt), so that one
+// checkpoint gives one answer for an item (§B.11.4); the grant checker's
+// and the key tracker's copies at the head stand in for a namespace the
+// service doesn't follow, which has no state at a checkpoint.
+func (s *Service) exposureAt(ctx context.Context, ns string) (public bool, in derived.Info) {
+	held := false
+	s.t.View(func(g *tree.Graph, _ map[string]string) {
+		c := g.Content[ns]
+		if c == nil {
+			return
+		}
+		held, in = true, derived.InfoOf(c.Doc)
+		if cfg := s.parsed(c).cfg; cfg != nil {
+			public = cfg.Read == "public"
+		}
+	})
+	if held {
+		return public, in
+	}
+	cfg, err := s.t.Checker().Config(ctx, ns)
+	in, _ = s.t.Keys().Info(ctx, ns)
+	return err == nil && cfg.Read == "public", in
 }
 
 // keyOf names a resource whose per-resource keys an answer carries.
@@ -557,6 +587,8 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 			return nil, upstream(err)
 		}
 		if h.State != client.NotFound {
+			// The core is ahead of the checkpoint (decidedAt).
+			combined = ""
 			return nil, conflict("%s exists or existed", item)
 		}
 	case state != tree.StateLive:
@@ -662,6 +694,8 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 	}
 	signer := findKey(latest.Keys, s.opt.Kid)
 	if signer == nil {
+		// Decided at the head, as in planContent (decidedAt).
+		combined = ""
 		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
 	}
 	admin := s.isAdmin(v)
@@ -879,6 +913,8 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 		return nil, upstream(herr)
 	}
 	if h.State != client.NotFound {
+		// The core is ahead of the checkpoint (decidedAt).
+		combined = ""
 		return nil, conflict("%s exists or existed in %s", name, cat)
 	}
 	rules := []any{resourceRule(name), parentsRule(cat, tos)}
@@ -995,13 +1031,17 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 	}
 	verb := "create"
 	h, herr := s.t.Client().Head(ctx, cat, pl)
+	// The 409s below are decided from the core's head of the placement,
+	// which may be ahead of the checkpoint (decidedAt); the service's own
+	// view of it is the 409 in the View above.
+	ahead := func(err error) error { combined = ""; return err }
 	switch {
 	case herr != nil:
 		return nil, upstream(herr)
 	case h.State == client.Live:
-		return nil, conflict("%s is already placed in %s; move it instead", item, cat)
+		return nil, ahead(conflict("%s is already placed in %s; move it instead", item, cat))
 	case h.State == client.Purged:
-		return nil, conflict("the placement %s was purged", pl)
+		return nil, ahead(conflict("the placement %s was purged", pl))
 	case h.State == client.Tombstoned:
 		// Re-placing restores the old placement (§B.11.4): the grant carries
 		// only restore, never create or append, and the client restores
@@ -1014,7 +1054,7 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		// placement the restore sees the last live document at step 3, as
 		// any restore does.
 		if !key.IsStar() && !contains(key.Can, "restore") {
-			return nil, conflict("the placement %s was deleted and the catalog's key may not restore it", pl)
+			return nil, ahead(conflict("the placement %s was deleted and the catalog's key may not restore it", pl))
 		}
 		verb = "restore"
 	}

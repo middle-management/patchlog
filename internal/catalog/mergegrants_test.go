@@ -45,7 +45,7 @@ func testMergeGrants(t *testing.T) {
 		map[string]any{"resource": "matches.newx", "ifNoneMatch": "*", "steps": []any{newx}},
 	)
 	// Only the merge service gets merge grants.
-	if r := w.do("POST", "/merge-grants", desk, b); r.status != 403 {
+	if r := w.do("POST", "/merge-grants", desk, b); r.status != 403 || r.body["checkpoint"] != nil {
 		t.Fatalf("merge grant to someone else: %d %v", r.status, r.body)
 	}
 	r := ask(desk, b)
@@ -100,6 +100,11 @@ func testMergeGrants(t *testing.T) {
 	if msg, _ := r.body["message"].(string); r.status != 403 || !strings.Contains(msg, "would give") {
 		t.Fatalf("widening move: %d %v", r.status, r.body)
 	}
+	// A refusal of the checks, a decision at the checkpoint, carries it
+	// (§B.11.4).
+	if r.body["checkpoint"] != w.svc.Tree().At() {
+		t.Errorf("widening move refused at %v, now %s", r.body["checkpoint"], w.svc.Tree().At())
+	}
 	// A change of $access: refused for non-admins; for an admin, checked
 	// and answered admin, with no grant (§F.8: submitted under the admin's).
 	access := batch(map[string]any{"resource": "season", "ifMatch": head("season"),
@@ -115,8 +120,9 @@ func testMergeGrants(t *testing.T) {
 	if r = ask(w.caller("user:bo", "fan-club"), batch(map[string]any{"resource": "matches.shared", "ifMatch": head("matches.shared"), "steps": []any{"delete"}})); r.status != 403 {
 		t.Fatalf("unplace without move: %d %v", r.status, r.body)
 	}
-	// A stale precondition is refused before anything is signed.
-	if r = ask(desk, batch(map[string]any{"resource": "matches.shared", "ifMatch": head("season"), "steps": []any{"delete"}})); r.status != 409 {
+	// A stale precondition is refused before anything is signed; the
+	// core's, not a decision at a checkpoint, it carries none.
+	if r = ask(desk, batch(map[string]any{"resource": "matches.shared", "ifMatch": head("season"), "steps": []any{"delete"}})); r.status != 409 || r.body["checkpoint"] != nil {
 		t.Fatalf("stale: %d %v", r.status, r.body)
 	}
 

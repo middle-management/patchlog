@@ -109,6 +109,20 @@ func TestDecisionCheckpoint(t *testing.T) {
 		t.Errorf("after a content write: checkpoint %v, listing at %s (was %s), grant at %v (was %v)",
 			r.body["checkpoint"], at2, at, r.body["at"], catID)
 	}
+
+	// A purged item's restore: 410, at the checkpoint after the purge.
+	ctx := context.Background()
+	w.doc("matches", "doomed", map[string]any{"title": "doomed"})
+	w.doc("cat", "matches.doomed", map[string]any{"parents": parents("season")})
+	w.caughtUp()
+	must(w.ops.Delete(ctx, "matches", "doomed", must(w.ops.Head(ctx, "matches", "doomed")).ID))
+	purger := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"read", "purge"})))
+	must(purger.Purge(ctx, "matches", "doomed", must(w.ops.Head(ctx, "matches", "doomed")).ID, false))
+	w.caughtUp()
+	r = w.issue(bob, map[string]any{"item": "/r/matches/doomed", "want": toAny("restore")}, 410)
+	if at3 := w.listingAt(bob); r.body["checkpoint"] != at3 || at3 != w.svc.Tree().At() {
+		t.Errorf("purged: %v (listing at %s, now %s)", r.body, at3, w.svc.Tree().At())
+	}
 }
 
 // TestReadGrantsOneCheckpoint: POST /read-grants decides every item at
@@ -229,12 +243,79 @@ func TestDecisionsPinned(t *testing.T) {
 		t.Errorf("read-grants before the service reaches the change: %v (at %v)", rg.body, at)
 	}
 
+	// matches turns public, which the checker sees but the service
+	// hasn't applied: /read-grants still decides rumour1, which fred
+	// can't read, as at the checkpoint it reports.
+	cfg = must(w.ops.NSHead(ctx, "matches")).Config
+	must(opm.PatchConfig(ctx, "matches", cfg, []any{map[string]any{"op": "add", "path": "/read", "value": "public"}}))
+	waitFor(t, "the checker to see matches public", func() bool {
+		c, err := w.svc.Tree().Checker().Config(ctx, "matches")
+		return err == nil && c.Read == "public"
+	})
+	rumour := map[string]any{"items": toAny("/r/matches/rumour1")}
+	rg = w.do("POST", "/read-grants", fan, rumour)
+	if e := rg.body["grants"].([]any)[0].(map[string]any); rg.body["checkpoint"] != at || e["error"] == nil || e["public"] != nil {
+		t.Errorf("read-grants for rumour1 before the service reaches public: %v (at %v)", rg.body, at)
+	}
+
+	// A create refused from the core's head, which is ahead of the
+	// checkpoint (the service hasn't seen the document), carries no
+	// checkpoint; one the service has seen carries it.
+	desk := w.caller("user:bob", "match-desk")
+	must(w.ops.CreateDoc(ctx, "cat", "matches.unseen", map[string]any{"parents": parents("season")}))
+	waitFor(t, "the service to apply the placement", func() bool {
+		return w.svc.Tree().Checkpoint("cat") == must(w.ops.NSHead(ctx, "cat")).ID
+	})
+	must(w.ops.CreateDoc(ctx, "matches", "unseen", map[string]any{"title": "unseen"}))
+	if r := w.issue(desk, map[string]any{"item": "/r/matches/unseen", "want": toAny("create")}, 409); r.body["checkpoint"] != nil {
+		t.Errorf("create refused from the core's head: %v", r.body)
+	}
+	if r := w.issue(desk, map[string]any{"item": "/r/matches/derby", "want": toAny("create")}, 409); r.body["checkpoint"] != w.svc.Tree().At() {
+		t.Errorf("create refused from the checkpoint: %v (now %s)", r.body, w.svc.Tree().At())
+	}
+
 	// Once applied, a new checkpoint, and the refusal carries it.
 	rt.hold.Store(false)
 	w.caughtUp()
 	r := w.issue(fan, read, 403)
 	if r.body["checkpoint"] == at || r.body["checkpoint"] != w.svc.Tree().At() {
 		t.Errorf("refusal after the change: %v (was %v)", r.body, at)
+	}
+	rg = w.do("POST", "/read-grants", fan, rumour)
+	if e := rg.body["grants"].([]any)[0].(map[string]any); rg.body["checkpoint"] != w.svc.Tree().At() || e["public"] != true {
+		t.Errorf("read-grants for rumour1 once matches is public: %v", rg.body)
+	}
+}
+
+// TestHeadKeyRefusal: a refusal because the catalog's key is missing from
+// the content namespace at the head is decided at the head, not at a
+// checkpoint, so it carries none, for restore as for other verbs
+// (§B.11.4).
+func TestHeadKeyRefusal(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	ctx := context.Background()
+	rt := &holdRT{ns: "matches", base: transport}
+	w.svcClient = w.s.Client(t, client.WithHTTPClient(&http.Client{Transport: rt}),
+		client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches"}, []string{"read"},
+			map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+	w.start()
+	w.caughtUp()
+	bob := w.caller("user:bob", "match-desk")
+	rt.hold.Store(true)
+	opm := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"config"})))
+	cfg := must(w.ops.NSHead(ctx, "matches")).Config
+	must(opm.PatchConfig(ctx, "matches", cfg, []any{map[string]any{"op": "remove", "path": "/keys/2"}}))
+	waitFor(t, "the checker to drop the catalog's key", func() bool {
+		c, err := w.svc.Tree().Checker().Config(ctx, "matches")
+		return err == nil && len(c.Keys) == 2
+	})
+	for _, want := range []string{"read", "restore"} {
+		r := w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny(want)}, 403)
+		if msg, _ := r.body["message"].(string); !strings.Contains(msg, "catalog's key") || r.body["checkpoint"] != nil {
+			t.Errorf("%s with the key missing at the head: %v", want, r.body)
+		}
 	}
 }
 

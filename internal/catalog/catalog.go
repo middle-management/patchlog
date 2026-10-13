@@ -42,13 +42,18 @@
 // taken at one combined checkpoint (§B.5, listings' at), which answers
 // carry as checkpoint, and so do refusals that are decisions (403, 404,
 // 409, 410), so a client that caches decisions keys them by it; the
-// grants' own at stays the catalog's ns_id (§B.11.4). The roles, their
-// definitions and the catalog's key are read as of that checkpoint
-// (configAt), as for visibility. Decisions take ?min for the catalog or
-// any content namespace it trusts: a decision on an item also depends on
-// its content namespace (whether the item exists, where its head is), so
-// after creating a document it placed, or restoring one, a client passes
-// min for both.
+// grants' own at stays the catalog's ns_id (§B.11.4). A refusal decided
+// from state the checkpoint doesn't pin (the core's head of a name the
+// service hasn't seen yet, the signing key at the head, a merge batch's
+// stale precondition) carries none (decidedAt). What a decision reads is
+// as of that checkpoint, as for visibility: the roles, their definitions,
+// the catalog's key, includes and place lists (configAt, includesAt), and
+// for /read-grants whether a namespace is public and its encryption
+// (exposureAt). POST /grants and POST /read-grants take ?min for the
+// catalog or any content namespace it trusts: a decision on an item also
+// depends on its content namespace (whether the item exists, where its
+// head is), so after creating a document it placed, or restoring one, a
+// client passes min for both.
 //
 // There are no CDN edge grants in this implementation: read grants are
 // ordinary core grants fixed to one resource, which the origin accepts as

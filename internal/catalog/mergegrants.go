@@ -10,6 +10,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/tree"
@@ -152,7 +153,10 @@ type mergeItem struct {
 
 // IssueMerge checks a catalog merge batch, for the merge service v and the
 // approver av, and signs one grant covering it with the merge key, or for
-// a batch changing $access answers Admin (§F.8).
+// a batch changing $access answers Admin (§F.8). The checks are taken at
+// one combined checkpoint, with place lists and includes as of it, which
+// the answer carries as checkpoint and so do its 403s (decidedAt); the
+// 409s for stale preconditions are the core's, not decisions at it.
 func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch map[string]any) (*MergeGrant, error) {
 	cat := s.t.Catalog()
 	if s.opt.MergeKey == nil {
@@ -272,21 +276,22 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 			return nil, err
 		}
 	}
-	// Place lists of the content namespaces new placements bring in.
-	placeOK := map[string]bool{}
+	// The documents of the content namespaces new placements bring in,
+	// whose place lists are read as of the checkpoint below (configAt).
+	latest := map[string]*grantcheck.Config{}
 	for _, mi := range items {
 		ns, _, ok := tree.SplitPlacement(mi.name)
 		if !ok || mi.beforeLive || mi.after == nil {
 			continue
 		}
-		if _, done := placeOK[ns]; done {
+		if _, done := latest[ns]; done {
 			continue
 		}
 		cfg, err := s.t.Checker().Config(ctx, ns)
 		if err != nil {
 			return nil, upstream(err)
 		}
-		placeOK[ns] = inPlaceList(cfg.Doc, cat, subs)
+		latest[ns] = cfg
 	}
 
 	var cp, combined string
@@ -296,6 +301,15 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		combined, _ = tree.CombinedAt(g, cur)
+		// Place lists and includes as of the checkpoint (configAt,
+		// includesAt), as for POST /grants.
+		placeOK := map[string]bool{}
+		for ns, cfg := range latest {
+			placeOK[ns] = inPlaceList(s.configAt(g, ns, cfg).Doc, cat, subs)
+		}
+		if !admin {
+			incs = s.includesAt(g, incs)
+		}
 		changes := map[string]any{}
 		for _, mi := range items {
 			n := g.Node(mi.name)
@@ -459,7 +473,9 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 		}
 	})
 	if err != nil {
-		return nil, err
+		// The checks above are decisions at the checkpoint: their 403s
+		// carry it (decidedAt).
+		return nil, decidedAt(err, combined)
 	}
 	out := &MergeGrant{ApprovedBy: av.Principal.ID, Checks: checks, Checkpoint: combined}
 	if needsAdmin {
