@@ -1,7 +1,11 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/base64"
+	"fmt"
+	"io"
 	"net/http"
 	"time"
 
@@ -45,27 +49,87 @@ func referrerCache(w http.ResponseWriter) {
 }
 
 // edgeGrants is POST /edge-grants (§C.5): with the grant in
-// Authorization, 200 with { prefixes, exp } and one Set-Cookie per
-// prefix: Path the prefix (/r/{ns}/{name}, /r/{ns}, /ns/{ns}, covering
-// what lies below), Secure, HttpOnly, SameSite as the Cookies say (None
-// with credentialed origins, else Lax), named per prefix, until the
-// grant's exp or MaxGrantTTL, whichever is sooner. no-store.
+// Authorization, or several in the body (edgeGrantBearers), 200 with
+// { prefixes, exp } and one Set-Cookie per prefix: Path the prefix
+// (/r/{ns}/{name}, /r/{ns}, /ns/{ns}, covering what lies below), Secure,
+// HttpOnly, SameSite as the Cookies say (None with credentialed origins,
+// else Lax), named per prefix. Each grant's cookies last until its exp or
+// MaxGrantTTL, whichever is sooner; a prefix several grants give gets one
+// cookie, lasting as long as the longest, and exp is the earliest. The
+// prefixes are in the order the grants first give them. no-store.
 func (s *Server) edgeGrants(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
-	c := creds(r)
-	c.Edge = nil // a cookie never authorises issuing another
-	res, err := s.e.IssueEdgeGrants(r.Context(), core.Credentials{Bearer: c.Bearer})
+	bearers, err := s.edgeGrantBearers(r)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	exp := s.cookies.Lifetime(res.Now, res.Exp)
+	res, err := s.e.IssueEdgeGrants(r.Context(), bearers)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	prefixes := []string{}
+	exps := map[string]time.Time{}
 	for _, g := range res.Grants {
+		exp := s.cookies.Lifetime(res.Now, g.Exp)
 		for _, p := range g.Prefixes() {
-			http.SetCookie(w, s.cookies.Issue(edge.Claims{Prefix: p, Exp: exp.Unix()}, res.Now))
-			prefixes = append(prefixes, p)
+			old, ok := exps[p]
+			if !ok {
+				prefixes = append(prefixes, p)
+			}
+			if !ok || exp.After(old) {
+				exps[p] = exp
+			}
 		}
 	}
-	writeJSON(w, 200, map[string]any{"prefixes": prefixes, "exp": exp.UTC().Format(time.RFC3339)})
+	var first time.Time
+	for _, p := range prefixes {
+		http.SetCookie(w, s.cookies.Issue(edge.Claims{Prefix: p, Exp: exps[p].Unix()}, res.Now))
+		if first.IsZero() || exps[p].Before(first) {
+			first = exps[p]
+		}
+	}
+	writeJSON(w, 200, map[string]any{"prefixes": prefixes, "exp": first.UTC().Format(time.RFC3339)})
+}
+
+// edgeGrantBearers are the grants POST /edge-grants exchanges (§C.5):
+// those of a body { "grants": [ … ] }, 1 to core.MaxEdgeGrants tokens as
+// they would follow "Bearer ", which takes no Authorization (400
+// otherwise); without a body, the grant in Authorization, if any. A
+// cookie never authorises issuing another.
+func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
+	// Room for every grant at the largest grant size, as base64 with its
+	// optional prefix and padding, quoted, and some whitespace.
+	max := core.MaxEdgeGrants*(len("biscuit:")+base64.URLEncoding.EncodedLen(s.e.Limits().GrantSize)+4) + 4096
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(max)+1))
+	if err != nil {
+		return nil, badInput("could not read body")
+	}
+	if len(body) == 0 {
+		if c := creds(r); c.Bearer != "" {
+			return []string{c.Bearer}, nil
+		}
+		return nil, nil
+	}
+	if r.Header.Get("Authorization") != "" {
+		return nil, badInput("grants in the body take no Authorization (§C.5)")
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	v, err := readJSON(r, max)
+	if err != nil {
+		return nil, err
+	}
+	m, _ := v.(map[string]any)
+	gs, ok := m["grants"].([]any)
+	if !ok || len(m) != 1 || len(gs) < 1 || len(gs) > core.MaxEdgeGrants {
+		return nil, badInput(fmt.Sprintf("body must be { grants: [ … ] }, 1 to %d grants (§C.5)", core.MaxEdgeGrants))
+	}
+	out := make([]string, len(gs))
+	for i, g := range gs {
+		if out[i], ok = g.(string); !ok {
+			return nil, badInput("each grant is a string: the token as it would follow \"Bearer \" (§C.5)")
+		}
+	}
+	return out, nil
 }

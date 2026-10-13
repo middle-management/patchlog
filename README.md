@@ -30,7 +30,7 @@ and serves immutable, CDN-cacheable revisions.
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
-| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants`, withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`) | §C.5, §9 | ✅ |
+| Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), drawing on each grant's rate limits, withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`) | §C.5, §9 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
@@ -297,43 +297,61 @@ head -c 32 /dev/urandom | base64 > edge.secret   # shared with the edge's config
 patchlog serve -edge-secret edge.secret           # the edge sends X-Edge-Verified and X-Edge-Prefix
 ```
 
-**Edge grants as cookies** (§C.5). `POST /edge-grants` with a grant in `Authorization` answers
-`{ "prefixes": [...], "exp" }` (`no-store`) and sets one cookie per prefix: `/r/{ns}` and
-`/ns/{ns}` per namespace the grant names, or `/r/{ns}/{name}` when its read rules fix
-`/resource`. `"*"` and a grant without `read` are `403`, and so is one whose blocks or key
-scope refer to `/resource` without fixing it, or to `/now`, since the edge evaluates no rules.
-A grant with roles needs one role that lists `read` and qualifies: none of its rules refers to
-`/resource` or `/now`, and they pass now for the principal. Roles are alternatives, so one is
-enough, with the blocks and key scope on top; a role that tests `/resource` never qualifies,
-even next to blocks that fix it. The answer is all or nothing: if any namespace the grant names
-doesn't exist, is purged or refuses it, no cookie is set, and the request is `401` if any
-namespace's answer is, else `403`. A purged namespace is decided last, once the grant verifies
-and may read there, so the answer is `410 purged`, with the `head` of the first one the grant
-names, only if every refusal is a purge (v0.49). While authentication is disabled (`-dev`),
-issuance is `404 not_offered`. Cookies are
-`Secure`, `HttpOnly`, named `__Secure-pl-eg-…` per prefix, with `Path` the prefix, which covers
-what lies below it by whole segments (`/ns/{ns}` covers the namespace URL itself and
-`/ns/{ns}/…`, not `/ns/{ns}-x`), and last until the grant's `exp` or 15 minutes, whichever is
-sooner. A read under one checks its expiry, so an event stream opened under a cookie ends
+**Edge grants as cookies** (§C.5). `POST /edge-grants` with a grant in `Authorization`, or up
+to 50 grants as `{ "grants": [ … ] }` in the body (v0.50; each the token as it would follow
+`Bearer `), answers `{ "prefixes": [...], "exp" }` (`no-store`) and sets one cookie per prefix:
+`/r/{ns}` and `/ns/{ns}` per namespace a grant names, or `/r/{ns}/{name}`, one per name, when
+its read rules fix `/resource`. A body with `Authorization`, an empty list or more than 50,
+anything but strings, or any other member is `400 bad_input`; a body too large is `413 limit`.
+While authentication is disabled (`-dev`), issuance is `404 not_offered`.
+
+Rules **fix** `/resource` (v0.50) when a rule of the blocks or the key's scope, at top level or
+inside `all`, tests it against one name (`test` with `value`, or `compare` with `eq` and a
+literal) or a finite set (`test` with a `schema` of only `enum`, or `compare` with `in` and a
+literal array). Several such rules fix it to the names all of them allow, so
+`{"op":"test","path":"/resource","schema":{"enum":["a","b"]}}` gives `/r/{ns}/a` and
+`/r/{ns}/b` in each namespace the grant names. An empty set, a name not valid under §3.6, or
+more than 100 names over all the grants of one request (each grant's set counted once, however
+many namespaces it names) is `403`. `"*"` and a grant without `read` are `403`, and so is one
+whose blocks or key scope refer to `/resource` any other way, or to `/now`, since the edge
+evaluates no rules. A grant with roles needs one role that lists `read` and qualifies: none of
+its rules refers to `/resource` or `/now`, and they pass now for the principal. Roles are
+alternatives, so one is enough, with the blocks and key scope on top; a role that tests
+`/resource` never qualifies, even next to blocks that fix it. The answer is all or nothing
+across every grant: if any namespace a grant names doesn't exist, is purged or refuses it, no
+cookie is set, and the request is `401` if any namespace's answer is, else `403`. A purged
+namespace is decided last, once the grant verifies and may read there, so the answer is
+`410 purged` only if every refusal is a purge, with `ns` and `head` naming the first one
+refused in the order of the grants and their root blocks (v0.50). Only then does each grant
+draw one token from its principal's rate limits (§6.6), `ratePerPrincipal` or the bucket of its
+allowance, under the limits of the first namespace it is issued in, as a write does; the tokens
+are drawn all at once, so a `429` (with `Retry-After` and `retryAfter`) answers the whole
+request and draws nothing.
+
+Cookies are `Secure`, `HttpOnly`, named `__Secure-pl-eg-…` per prefix, with `Path` the prefix,
+which covers what lies below it by whole segments (`/ns/{ns}` covers the namespace URL itself
+and `/ns/{ns}/…`, not `/ns/{ns}-x`), and last until the grant's `exp` or 15 minutes, whichever
+is sooner. Prefixes come in the order the grants first give them; a prefix several grants give
+gets one cookie, lasting as long as the longest, and the body's `exp` is the earliest of the
+cookies'. A read under one checks its expiry, so an event stream opened under a cookie ends
 there. One authorises `GET` and `HEAD` under its prefix only, on requests without
 `Authorization`; never writes or `/edge-grants`, and the origin's cookies never cover a
 service's URLs. The origin verifies them itself, making the checks an edge makes (below), so
-they work without a verifying edge, `no-store` at the edge. A cookie names no principal, so
-the origin attributes a read under one to `edge:` and its prefix. They are signed with the key
-in `-edge-grant-key FILE` if given; otherwise with the key derived from `-edge-secret`, so an
-edge holding the secret derives the same key; with neither flag, with a random key per process,
-so cookies don't survive a restart or reach another instance. `-edge-grant-kid` (default
-`origin`) names that key in the cookies. Pages on another origin call it with
-`credentials: "include"`: list them with `-cors-credentials-origin` (repeatable), which names
-the origin from that list with `Access-Control-Allow-Credentials: true` and `Vary: Origin`,
-even when `-cors-origin` is `*`, and makes the cookies `SameSite=None` (otherwise `Lax`).
-`DELETE /edge-grants?prefix=…` (v0.48; `prefix` repeatable, as `prefixes` returned them)
-withdraws them at sign-out: `204`, `no-store`, an expired cookie of the same name and
-attributes per prefix (a repeated one once), no grant needed, and the same with authentication
-disabled, so sign-out works either way. No `prefix`, or one of another form, is
-`400 bad_input`; `prefix` is the core's one repeatable parameter (§7). Only credentialed
-origins may preflight it, so another site can't sign a reader out. It clears the browser's
-copies only; a copied cookie lasts until it expires.
+they work without a verifying edge, `no-store` at the edge. A cookie names no principal, so the
+origin attributes a read under one to `edge:` and its prefix. They are signed with the key in
+`-edge-grant-key FILE` if given; otherwise with the key derived from `-edge-secret`, so an edge
+holding the secret derives the same key; with neither flag, with a random key per process, so
+cookies don't survive a restart or reach another instance. `-edge-grant-kid` (default `origin`)
+names that key in the cookies. Pages on another origin call it with `credentials: "include"`:
+list them with `-cors-credentials-origin` (repeatable), which names the origin from that list
+with `Access-Control-Allow-Credentials: true` and `Vary: Origin`, even when `-cors-origin` is
+`*`, and makes the cookies `SameSite=None` (otherwise `Lax`). `DELETE /edge-grants?prefix=…`
+(v0.48; `prefix` repeatable, as `prefixes` returned them) withdraws them at sign-out: `204`,
+`no-store`, an expired cookie of the same name and attributes per prefix (a repeated one once),
+no grant needed, and the same with authentication disabled, so sign-out works either way. No
+`prefix`, or one of another form, is `400 bad_input`; `prefix` is the core's one repeatable
+parameter (§7). Only credentialed origins may preflight it, so another site can't sign a reader
+out. It clears the browser's copies only; a copied cookie lasts until it expires.
 
 A cookie carries no grant id, so revocation reaches it only when it expires, at most 15 minutes
 after issue, at the edge and the origin alike: a revoked grant, a key removed from the

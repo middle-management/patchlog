@@ -273,7 +273,8 @@ func TestV049EdgeGrantsAuthDisabled(t *testing.T) {
 // v0.49 §C.5: issuance answers all or nothing, and decides a purged
 // namespace last: 401 if any namespace would be 401, else 403 if any would
 // be 403, and 410 purged only when every one refused is purged and the
-// grant verifies and may read there.
+// grant verifies and may read there. v0.50 §C.5, §12: the 410 names in ns
+// and head the first refused namespace in the grant's root block.
 func TestV049EdgeGrantsPurged(t *testing.T) {
 	t.Parallel()
 	f := newAuthFixture(t, nil)
@@ -283,9 +284,11 @@ func TestV049EdgeGrantsPurged(t *testing.T) {
 	for _, ns := range []string{"p1", "p2", "sec2"} {
 		e.mkNS(ns, map[string]any{"read": "grant", "keys": []any{f.admin.entry("*"), f.issuer.entry("read", "append")}})
 	}
+	heads := map[string]string{}
 	for _, ns := range []string{"p1", "p2"} {
 		expect(t, e.patchNS(ns, ops(op("add", "/frozen", true)), admin), 201)
 		expect(t, e.do(req{method: "POST", path: "/ns/" + ns + "/purge", ifMatch: e.nsHead(ns, admin), bearer: admin}), 204)
+		heads[ns] = e.nsHead(ns, admin)
 	}
 	read := []string{"read"}
 	now := map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}}
@@ -293,19 +296,22 @@ func TestV049EdgeGrantsPurged(t *testing.T) {
 		name   string
 		g      string
 		status int
+		ns     string // of a 410
 	}{
-		{"purged", e.grant(f.issuer, "user:bob", []string{"p1"}, read), 410},
-		{"both purged", e.grant(f.issuer, "user:bob", []string{"p1", "p2"}, read), 410},
-		{"one issues", e.grant(f.issuer, "user:bob", []string{"p1", "sec"}, read), 410},
-		{"no read", e.grant(f.issuer, "user:bob", []string{"p1"}, []string{"append"}), 403},
-		{"a rule on /now", e.grant(f.issuer, "user:bob", []string{"p1"}, read, now), 403},
-		{"another refuses", e.grant(f.issuer, "user:bob", []string{"p1", "sec2"}, []string{"append"}), 403},
-		{"one missing", e.grant(f.issuer, "user:bob", []string{"p1", "nope"}, read), 401},
-		{"doesn't verify", e.grant(newKey("issuer"), "user:bob", []string{"p1"}, read), 401},
+		{"purged", e.grant(f.issuer, "user:bob", []string{"p1"}, read), 410, "p1"},
+		{"both purged", e.grant(f.issuer, "user:bob", []string{"p1", "p2"}, read), 410, "p1"},
+		{"both purged, other order", e.grant(f.issuer, "user:bob", []string{"p2", "p1"}, read), 410, "p2"},
+		{"one issues", e.grant(f.issuer, "user:bob", []string{"p1", "sec"}, read), 410, "p1"},
+		{"one issues first", e.grant(f.issuer, "user:bob", []string{"sec", "p2"}, read), 410, "p2"},
+		{"no read", e.grant(f.issuer, "user:bob", []string{"p1"}, []string{"append"}), 403, ""},
+		{"a rule on /now", e.grant(f.issuer, "user:bob", []string{"p1"}, read, now), 403, ""},
+		{"another refuses", e.grant(f.issuer, "user:bob", []string{"p1", "sec2"}, []string{"append"}), 403, ""},
+		{"one missing", e.grant(f.issuer, "user:bob", []string{"p1", "nope"}, read), 401, ""},
+		{"doesn't verify", e.grant(newKey("issuer"), "user:bob", []string{"p1"}, read), 401, ""},
 	} {
 		r := e.do(req{method: "POST", path: "/edge-grants", bearer: c.g})
-		if r.Code != c.status || c.status == 410 && r.Str("code") != "purged" {
-			t.Errorf("%s: want %d: %d %s", c.name, c.status, r.Code, r.Body)
+		if r.Code != c.status || c.status == 410 && (r.Str("code") != "purged" || r.Str("ns") != c.ns || r.Str("head") != heads[c.ns]) {
+			t.Errorf("%s: want %d %s: %d %s", c.name, c.status, c.ns, r.Code, r.Body)
 		}
 		if len(r.H.Values("Set-Cookie")) > 0 {
 			t.Errorf("%s: cookies set on a refusal: %v", c.name, r.H.Values("Set-Cookie"))

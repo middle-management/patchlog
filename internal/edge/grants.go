@@ -19,12 +19,12 @@ import (
 
 // Edge grants as cookies (§C.5 "Issuing them").
 //
-// POST /edge-grants exchanges a verified grant with read for one edge grant
-// per namespace it names, each fixed to a path prefix: /r/{ns}/{name} for a
-// grant whose read rules fix /resource, else /r/{ns} and /ns/{ns}. Each is
-// a cookie whose Path is the prefix, so a browser sends it only there,
-// named per prefix so the cookies of several namespaces and documents
-// coexist. The format is the spec's default (§C.5 "Format"), so an edge
+// POST /edge-grants exchanges verified grants with read for edge grants,
+// one per namespace each names, fixed to path prefixes: /r/{ns}/{name}, one
+// per name, for a grant whose read rules fix /resource, else /r/{ns} and
+// /ns/{ns}. Each prefix is a cookie whose Path is the prefix, so a browser
+// sends it only there, named per prefix so the cookies of several
+// namespaces and documents coexist. The format is the spec's default (§C.5 "Format"), so an edge
 // can be written once:
 //
 //	name:  CookiePrefix + hex(sha256(p)[:8])
