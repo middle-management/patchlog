@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.19.0
 
 Implements spec **v0.50**, which settles all fifteen of the reference's v0.49 notes and takes
 up Doors' S15–S19 and F12–F14: edges, purged namespaces, catalog decisions, canonical query
