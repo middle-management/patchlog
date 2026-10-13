@@ -10,6 +10,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/tree"
@@ -83,6 +84,10 @@ type MergeGrant struct {
 	ApprovedBy string `json:"approvedBy"`
 	// Checks reports, per resource, what was checked.
 	Checks []MergeCheck `json:"checks"`
+	// Checkpoint is the combined checkpoint (§B.5) the batch was checked
+	// at, as for POST /grants (§B.11.4); it shadows Issued's, which is the
+	// same.
+	Checkpoint string `json:"checkpoint"`
 }
 
 // MergeCheck is the decision for one item.
@@ -148,7 +153,10 @@ type mergeItem struct {
 
 // IssueMerge checks a catalog merge batch, for the merge service v and the
 // approver av, and signs one grant covering it with the merge key, or for
-// a batch changing $access answers Admin (§F.8).
+// a batch changing $access answers Admin (§F.8). The checks are taken at
+// one combined checkpoint, with place lists and includes as of it, which
+// the answer carries as checkpoint and so do its 403s (decidedAt); the
+// 409s for stale preconditions are the core's, not decisions at it.
 func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch map[string]any) (*MergeGrant, error) {
 	cat := s.t.Catalog()
 	if s.opt.MergeKey == nil {
@@ -268,29 +276,40 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 			return nil, err
 		}
 	}
-	// Place lists of the content namespaces new placements bring in.
-	placeOK := map[string]bool{}
+	// The documents of the content namespaces new placements bring in,
+	// whose place lists are read as of the checkpoint below (configAt).
+	latest := map[string]*grantcheck.Config{}
 	for _, mi := range items {
 		ns, _, ok := tree.SplitPlacement(mi.name)
 		if !ok || mi.beforeLive || mi.after == nil {
 			continue
 		}
-		if _, done := placeOK[ns]; done {
+		if _, done := latest[ns]; done {
 			continue
 		}
 		cfg, err := s.t.Checker().Config(ctx, ns)
 		if err != nil {
 			return nil, upstream(err)
 		}
-		placeOK[ns] = inPlaceList(cfg.Doc, cat, subs)
+		latest[ns] = cfg
 	}
 
-	var cp string
+	var cp, combined string
 	var checks []MergeCheck
 	needsAdmin := false
 	err = nil
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
+		combined, _ = tree.CombinedAt(g, cur)
+		// Place lists and includes as of the checkpoint (configAt,
+		// includesAt), as for POST /grants.
+		placeOK := map[string]bool{}
+		for ns, cfg := range latest {
+			placeOK[ns] = inPlaceList(s.configAt(g, ns, cfg).Doc, cat, subs)
+		}
+		if !admin {
+			incs = s.includesAt(g, incs)
+		}
 		changes := map[string]any{}
 		for _, mi := range items {
 			n := g.Node(mi.name)
@@ -454,9 +473,11 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 		}
 	})
 	if err != nil {
-		return nil, err
+		// The checks above are decisions at the checkpoint: their 403s
+		// carry it (decidedAt).
+		return nil, decidedAt(err, combined)
 	}
-	out := &MergeGrant{ApprovedBy: av.Principal.ID, Checks: checks}
+	out := &MergeGrant{ApprovedBy: av.Principal.ID, Checks: checks, Checkpoint: combined}
 	if needsAdmin {
 		// $access needs the admin group, which the merge key may never
 		// assert: checked here as a dry run, submitted under an admin's
@@ -483,7 +504,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 			return nil, forbidden("the merge key may not %s in %s", a, cat)
 		}
 	}
-	p := &plan{ns: cat, resource: "", can: can, rules: []any{map[string]any{"any": alts}}, cp: cp, key: key}
+	p := &plan{ns: cat, resource: "", can: can, rules: []any{map[string]any{"any": alts}}, cp: cp, combined: combined, key: key}
 	is, err := s.mintMerge(ctx, v, av, p)
 	if err != nil {
 		return nil, err
@@ -538,7 +559,7 @@ func (s *Service) mintMerge(ctx context.Context, v, av *grant.Verified, p *plan)
 	if err != nil {
 		return nil, err
 	}
-	return &Issued{Grant: g.Encode(), NS: p.ns, Can: p.can, Exp: exp.Format(time.RFC3339Nano), At: at}, nil
+	return &Issued{Grant: g.Encode(), NS: p.ns, Can: p.can, Exp: exp.Format(time.RFC3339Nano), At: at, Checkpoint: p.combined}, nil
 }
 
 func (mi *mergeItem) addAction(a string) {

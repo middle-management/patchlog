@@ -38,6 +38,23 @@
 // the identity provider's; there is no groups namespace). The grant's verbs
 // don't matter for the catalog's API: it is only proof of identity.
 //
+// Decisions (POST /grants, POST /read-grants, POST /merge-grants) are
+// taken at one combined checkpoint (§B.5, listings' at), which answers
+// carry as checkpoint, and so do refusals that are decisions (403, 404,
+// 409, 410), so a client that caches decisions keys them by it; the
+// grants' own at stays the catalog's ns_id (§B.11.4). A refusal decided
+// from state the checkpoint doesn't pin (the core's head of a name the
+// service hasn't seen yet, the signing key at the head, a merge batch's
+// stale precondition) carries none (decidedAt). What a decision reads is
+// as of that checkpoint, as for visibility: the roles, their definitions,
+// the catalog's key, includes and place lists (configAt, includesAt), and
+// for /read-grants whether a namespace is public and its encryption
+// (exposureAt). POST /grants and POST /read-grants take ?min for the
+// catalog or any content namespace it trusts: a decision on an item also
+// depends on its content namespace (whether the item exists, where its
+// head is), so after creating a document it placed, or restoring one, a
+// client passes min for both.
+//
 // There are no CDN edge grants in this implementation: read grants are
 // ordinary core grants fixed to one resource, which the origin accepts as
 // they are and POST /edge-grants (§C.5) exchanges for cookies.
@@ -53,6 +70,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
@@ -112,6 +130,10 @@ type Service struct {
 	// derived from (readRolesOf).
 	rrMu    sync.Mutex
 	rrCache map[string]rrEntry
+
+	// afterDecide, if set (tests), runs after each try of POST
+	// /read-grants decides its items, before the checkpoint is checked.
+	afterDecide atomic.Pointer[func(try int)]
 }
 
 // Open opens the catalog service.
@@ -628,30 +650,63 @@ var (
 	ptrGroups    = pointer.Pointer{"principal", "groups"}
 )
 
-// rrEntry is a cached readRoles with the document it was derived from.
+// rrEntry is a content namespace's document as of the checkpoint, parsed
+// (cfg, nil if malformed), with the readRoles derived from it.
 type rrEntry struct {
-	cfg *tree.NSConfig
+	doc *tree.NSConfig
+	cfg *grantcheck.Config
 	rr  *readRoles
 }
 
-// readRolesOf is the readRoles of a content namespace's document as of
-// the checkpoint (Graph.Content), cached by the document's identity: a
-// new document is a new *tree.NSConfig.
-func (s *Service) readRolesOf(c *tree.NSConfig) *readRoles {
+// parsed is a content namespace's document as of the checkpoint
+// (Graph.Content), parsed, cached by the document's identity: a new
+// document is a new *tree.NSConfig. Callers must not change what it
+// returns.
+func (s *Service) parsed(c *tree.NSConfig) rrEntry {
 	s.rrMu.Lock()
 	e, ok := s.rrCache[c.NS]
 	s.rrMu.Unlock()
-	if ok && e.cfg == c {
-		return e.rr
+	if ok && e.doc == c {
+		return e
 	}
-	rr := &readRoles{roles: map[string]*readRole{}}
+	e = rrEntry{doc: c, rr: &readRoles{roles: map[string]*readRole{}}}
 	if cfg, err := grantcheck.ParseConfig(c.NS, "", c.Doc); err == nil {
-		rr = s.readRoles(cfg)
+		e.cfg, e.rr = cfg, s.readRoles(cfg)
 	}
 	s.rrMu.Lock()
-	s.rrCache[c.NS] = rrEntry{c, rr}
+	s.rrCache[c.NS] = e
 	s.rrMu.Unlock()
-	return rr
+	return e
+}
+
+// readRolesOf is the readRoles of a content namespace's document as of
+// the checkpoint (Graph.Content).
+func (s *Service) readRolesOf(c *tree.NSConfig) *readRoles { return s.parsed(c).rr }
+
+// configAt is ns's document as of the checkpoint g reflects, so a
+// decision reflects the checkpoint it reports, as visibility does
+// (§B.11.4, §B.11.5): Graph.Content for a content namespace, Graph.Config
+// for the catalog. latest, the grant checker's copy at the head, stands in
+// where the graph has no valid document, and gives a branch its keys,
+// which follow its base (§C.4). Call it under View; don't change what it
+// returns.
+func (s *Service) configAt(g *tree.Graph, ns string, latest *grantcheck.Config) *grantcheck.Config {
+	var cfg *grantcheck.Config
+	switch {
+	case ns == g.Catalog && g.Config != nil:
+		cfg, _ = grantcheck.ParseConfig(ns, "", g.Config)
+	case ns != g.Catalog && g.Content[ns] != nil:
+		cfg = s.parsed(g.Content[ns]).cfg
+	}
+	if cfg == nil {
+		return latest
+	}
+	if cfg.Base != "" {
+		c := *cfg
+		c.Keys = latest.Keys
+		cfg = &c
+	}
+	return cfg
 }
 
 func (s *Service) readRoles(cfg *grantcheck.Config) *readRoles {

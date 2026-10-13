@@ -1745,7 +1745,26 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   `409`. The catalog key's entry in content namespaces lists `restore` for this (§B.11.3):
   `"can": ["read", "create", "append", "restore"]`.
 - `POST /read-grants` returns resource-scoped read grants, and the keys of catalog nodes (and of an
-  item's placement) visible to the caller.
+  item's placement) visible to the caller: `{ "checkpoint", "grants": [...] }`, one entry per item
+  in request order, each with `grant` and `exp`, `public: true` (no grant needed), or `error`
+  (`{ status, code, message }`); a catalog node gets keys and no grant. It decides every item at
+  one combined checkpoint: if the checkpoint moved while it decided, it decides again, up to three
+  times, then answers `503 behind` with `Retry-After`. So "may this reader read all of these?" is
+  one call: it may if no entry has `error` (a public item counts as readable), and may not if an
+  entry's error is a refusal (a `4xx` status); an entry whose error is a `5xx` (`503 behind` when
+  the catalog lags its `maxLag`, `502 upstream`) is undecided, and the client asks again. It takes
+  1 to 100 items (`400` otherwise).
+- Decisions carry `checkpoint`, the combined checkpoint (§B.5, the same value as listings' `at`)
+  they were decided at, so a client that caches decisions keys them by it (§B.11.4): the answers of
+  `POST /grants`, `POST /read-grants` and `POST /merge-grants`, and the bodies of refusals that are
+  decisions (`403`, `404`, `409`, `410`: `{ code, message, checkpoint }`). A refusal decided from
+  state the checkpoint doesn't pin carries none: a `409` for a name the core has but the service
+  hasn't seen yet, a `403` because the catalog key is missing at the head, a merge batch's stale
+  precondition. The grants' own `at` stays the catalog's `ns_id`, which `requireAt` can check. What
+  a decision reads is as of that checkpoint, as for listings: the roles, their definitions, the
+  catalog key, includes and place lists, and for `/read-grants` whether a namespace is public and
+  its encryption. So a `/roles` or `read` change the service hasn't reached yet doesn't change a
+  decision.
 
 Listings are filtered by the caller's subject set (§B.11.5). A node is visible when the walk up
 collects, through a subject the catalog key may assert, a role granting `read` without conditions:
@@ -1781,7 +1800,10 @@ URL past any cached head pointer and waits for the service to catch up (`503` wi
 otherwise), instead of fetching with `no-store` (§B.5, §A.5). As in the search index, `min`
 always redirects (v0.50): an `at` URL whose listing already includes every `min` (the current
 `at`, or a kept one whose checkpoints show it) to itself without `min`, anything else to the
-current `at`. A bare `{ns_id}` never counts as included in an older `at`.
+current `at`. A bare `{ns_id}` never counts as included in an older `at`. `POST /grants` and
+`POST /read-grants` take `?min` the same way; a decision on an item also depends on its content
+namespace (whether the item exists), so after creating a document it placed, or restoring one, a
+client passes `min` for both (§B.11.4).
 - `POST /merge-grants` checks a catalog branch's merge batch for the approver and signs one grant
   covering exactly that batch with the merge key, for the merge service only (`-merge-key`,
   `-merge-kid`, `-merge-service`, `-merge-ttl`; without a merge key it is refused); see
