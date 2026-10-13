@@ -37,8 +37,12 @@ import (
 // only then does the request draw one token, however many grants it
 // carries, from the exchangeRate bucket of each distinct principal among
 // them, and from no write bucket (§6.6), so a reader's exchanges and
-// writes never wait on each other. With authentication disabled it is
-// 404 not_offered (§12).
+// writes never wait on each other. The 400 is a refusal too and draws
+// nothing: a token would save no work, since a 429 is decided only once
+// every grant has verified, and the prefixes are counted only up to the
+// cap, so an exchange over it costs no more than its grants'
+// verification. With authentication disabled it is 404 not_offered
+// (§12).
 //
 // The server turns them into cookies (internal/edge); a read under one
 // comes back as Credentials.Edge, which reader honours for that namespace
@@ -115,6 +119,7 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 		gs[i] = g
 	}
 	out := &EdgeGrants{Now: e.now()}
+	col := &edgeCollect{seen: map[string]bool{}}
 	err := e.read(ctx, func(t *tx) error {
 		t.decoded = map[string]*grant.Grant{}
 		for i, g := range gs {
@@ -138,12 +143,11 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 				refuse(bad[i])
 				continue
 			}
-			egs, bucket, err := t.edgeGrantsOf(g, Credentials{Bearer: bearers[i]})
+			bucket, err := t.edgeGrantsOf(g, Credentials{Bearer: bearers[i]}, col)
 			if err != nil {
 				refuse(err)
 				continue
 			}
-			out.Grants = append(out.Grants, egs...)
 			if !seen[bucket] {
 				seen[bucket] = true
 				buckets = append(buckets, bucket)
@@ -154,9 +158,10 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 		}
 		// The cap counts distinct prefixes once the grants have verified, so
 		// a refusal outranks it (§C.5); it draws nothing.
-		if n := len(edgePrefixes(out.Grants)); n > maxEdgePrefixes {
-			return badInput(fmt.Sprintf("the grants would issue %d distinct prefixes, more than %d (§C.5)", n, maxEdgePrefixes))
+		if col.over {
+			return badInput(fmt.Sprintf("the grants would issue more than %d distinct prefixes (§C.5)", maxEdgePrefixes))
 		}
+		out.Grants = col.grants
 		// One token for the request from each principal's exchangeRate
 		// bucket, all at once: one 429 for the request (§6.6, §C.5).
 		draws := make([]draw, len(buckets))
@@ -174,36 +179,50 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	return out, nil
 }
 
-// edgePrefixes are the distinct prefixes of edge grants, in the order
-// they first give them.
-func edgePrefixes(egs []EdgeGrant) []string {
-	var out []string
-	seen := map[string]bool{}
-	for _, eg := range egs {
-		for _, p := range eg.Prefixes() {
-			if !seen[p] {
-				seen[p] = true
-				out = append(out, p)
+// edgeCollect gathers an exchange's edge grants, in the order of the
+// grants and their root blocks, while they give at most maxEdgePrefixes
+// distinct prefixes (§C.5). Past that it only records that the cap is
+// exceeded: a grant naming many namespaces and fixing /resource to many
+// names gives their product, which the 400 needs no more of.
+type edgeCollect struct {
+	grants []EdgeGrant
+	seen   map[string]bool // the prefixes of grants
+	over   bool
+}
+
+// add adds eg, unless its prefixes would exceed the cap; it reports
+// whether c is still within it.
+func (c *edgeCollect) add(eg EdgeGrant) bool {
+	if c.over {
+		return false
+	}
+	for _, p := range eg.Prefixes() {
+		if !c.seen[p] {
+			if len(c.seen) == maxEdgePrefixes {
+				c.over = true
+				return false
 			}
+			c.seen[p] = true
 		}
 	}
-	return out
+	c.grants = append(c.grants, eg)
+	return true
 }
 
 // edgeGrantsOf decides the edge grants of g, presented as cred, in the
-// order its root block names namespaces (§C.5). It returns them, each
-// with g's exp; the key of g's principal's buckets, as a write's are
-// keyed (§6.6); and the first refusal of the lowest rank.
-func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials) ([]EdgeGrant, string, *Error) {
+// order its root block names namespaces (§C.5), and adds them to col,
+// each with g's exp. It returns the key of g's principal's buckets, as a
+// write's are keyed (§6.6), and the first refusal of the lowest rank.
+func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
 	var exp time.Time
 	for _, b := range g.Blocks {
 		if b.Exp != nil && (exp.IsZero() || b.Exp.Before(exp)) {
 			exp = *b.Exp
 		}
 	}
-	var out []EdgeGrant
 	var bucket string
 	var refused *Error
+	issued := false
 	for _, ns := range g.Blocks[0].NS {
 		var err *Error
 		var iss *edgeIssue
@@ -224,16 +243,20 @@ func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials) ([]EdgeGrant, string
 			}
 			continue
 		}
-		bucket = iss.bucket
-		for _, eg := range iss.grants {
-			eg.Exp = exp
-			out = append(out, eg)
+		bucket, issued = iss.bucket, true
+		if iss.names == nil {
+			col.add(EdgeGrant{NS: ns, Exp: exp})
+		}
+		for _, name := range iss.names {
+			if !col.add(EdgeGrant{NS: ns, Resource: name, Exp: exp}) {
+				break
+			}
 		}
 	}
-	if refused == nil && len(out) == 0 {
+	if refused == nil && !issued {
 		refused = forbidden("the grant names no namespace an edge grant can be issued for")
 	}
-	return out, bucket, refused
+	return bucket, refused
 }
 
 // refusalRank orders the refusals of an all-or-nothing answer (§C.5): 401
@@ -252,10 +275,10 @@ func refusalRank(err *Error) int {
 }
 
 // edgeIssue is a grant's edge grants in one namespace: one per name its
-// rules fix /resource to, else one namespace-wide; and the key of its
-// principal's buckets (actor.bucketKey).
+// rules fix /resource to, else (names nil) one namespace-wide; and the
+// key of its principal's buckets (actor.bucketKey).
 type edgeIssue struct {
-	grants []EdgeGrant
+	names  []string
 	bucket string
 }
 
@@ -299,14 +322,11 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 	// name fixed passes every one of them, so the first stands for all:
 	// testing each would cost the square of their number, which the cap,
 	// coming after, no longer bounds (§C.5).
-	iss := &edgeIssue{bucket: a.bucketKey}
-	if names == nil {
-		iss.grants = []EdgeGrant{{NS: ns}}
+	first := ""
+	if names != nil {
+		first = names[0]
 	}
-	for _, name := range names {
-		iss.grants = append(iss.grants, EdgeGrant{NS: ns, Resource: name})
-	}
-	if t.grantRules(a, "read", roles, t.basicEnvelope("read", iss.grants[0].Resource, a), false) != nil {
+	if t.grantRules(a, "read", roles, t.basicEnvelope("read", first, a), false) != nil {
 		return nil, forbidden("the grant's rules refuse reading " + ns)
 	}
 	// A purged namespace is decided last, once the grant verifies and may
@@ -317,7 +337,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 		pe.Body["ns"] = ns
 		return nil, pe
 	}
-	return iss, nil
+	return &edgeIssue{names: names, bucket: a.bucketKey}, nil
 }
 
 // edgeRole reports whether a role's rules qualify it for an edge grant

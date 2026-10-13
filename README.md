@@ -334,7 +334,10 @@ A purged namespace is decided last, once the grant verifies and may read there, 
 in the order of the grants and their root blocks (v0.50). Only then, once nothing is refused, is
 an exchange that would issue more than 100 distinct prefixes `400 bad_input` (v0.51; up to
 v0.50, more than 100 names were `403`): prefixes several grants give count once, and a
-namespace-wide grant counts two per namespace, `/r/{ns}` and `/ns/{ns}`. And only then does the
+namespace-wide grant counts two per namespace, `/r/{ns}` and `/ns/{ns}`. That `400` is a
+refusal too and draws no token: a `429` is decided only once every grant has verified, so a
+token would save no work, and prefixes are counted only up to the cap, so an exchange over it
+costs no more than verifying its grants. And only then does the
 request draw one token, however many grants it carries, from the `exchangeRate` bucket (§6.6) of
 each distinct principal among them, keyed as write buckets are (the root `sub` and the key that
 signed the root block), and from no write bucket or allowance, so a reader's exchanges and
@@ -357,7 +360,10 @@ they work without a verifying edge, `no-store` at the edge. A cookie names no pr
 origin attributes a read under one to `edge:` and its prefix. They are signed with the last
 `-edge-grant-key [KID=]FILE` given, and cookies signed with any of them are accepted, so the key
 rotates (below; v0.51 made the flag repeatable); a plain `FILE` is named by `-edge-grant-kid`
-(default `origin`). Without one, they are signed with the key derived from `-edge-secret`, named
+(default `origin`). An argument is `KID=FILE` only when no `/` comes before its first `=`, so a
+path holding `=` is a plain `FILE` (give `edge=v2.key` in the working directory as
+`./edge=v2.key`), and `FILE` `edge-secret` is the key derived from `-edge-secret` (a file of that
+name is `./edge-secret`). Without one, they are signed with the key derived from `-edge-secret`, named
 by `-edge-grant-kid`, so an edge holding the secret derives the same key; with neither flag,
 with a random key per process, so cookies don't survive a restart or reach another instance.
 Pages on another origin call it with `credentials: "include"`: list them with
@@ -418,10 +424,20 @@ rotated without making clients exchange again:
    took the next one, drop the old key from the origin (`-edge-grant-key k2=k2.key`), then from
    the edges.
 
-The key derived from `-edge-secret` is held only without `-edge-grant-key`, so moving from it to
-key files makes clients exchange again, as replacing a key used to. In Go, `edge.Cookies` holds
-the keys: `edge.NewCookies` and then `AddKey` for each newer one; `Kid` names the one it mints
-with and `Check` and `Verify` accept any.
+A deployment on the key derived from `-edge-secret` moves to key files the same way, naming the
+derived key `edge-secret` (with `-edge-secret` still given) so the origin holds it next to the
+first file until its cookies expire:
+
+```sh
+patchlog serve -edge-secret edge.secret -edge-grant-key origin=edge-secret -edge-grant-key k1=k1.key …
+patchlog serve -edge-secret edge.secret -edge-grant-key k1=k1.key …   # 15 minutes later
+```
+
+The edge secret itself still has one value, so replacing it makes clients exchange again. In Go,
+`edge.Cookies` holds the keys: `edge.NewCookies` and then `AddKey` for each newer one; `Kid`
+names the one it mints with and `Check` and `Verify` accept any. Every key one holds vouches for
+the core prefixes, so it holds the origin's keys only; a service minting cookies for a root of
+its own keeps its key in an `edge.Cookies` of its own.
 
 On every request, cache hits included, before serving it or forwarding it as verified, an edge
 MUST check (§C.5):

@@ -19,6 +19,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -173,7 +174,7 @@ func serve(args []string) {
 	edgeHeader := fs.String("edge-header", edge.DefaultHeader, edgeHeaderUsage)
 	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
 	var edgeGrantKeys multi
-	fs.Var(&edgeGrantKeys, "edge-grant-key", "[KID=]FILE: a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes -edge-grant-kid) (§C.5); repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, the key derived from -edge-secret, or else a random one per process, so cookies don't survive a restart or reach another instance")
+	fs.Var(&edgeGrantKeys, "edge-grant-key", "[KID=]FILE: a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes -edge-grant-kid) (§C.5); FILE "+edgeSecretKey+" is the key derived from -edge-secret, and a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, the key derived from -edge-secret, or else a random one per process, so cookies don't survive a restart or reach another instance")
 	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key given as a plain -edge-grant-key FILE or derived from -edge-secret, which the cookies carry and a verifying edge looks the key up by (§C.5 \"Format\")")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
@@ -408,12 +409,20 @@ func parseRate(s string) (core.Rate, error) {
 	return core.Rate{Rate: r, Burst: b}, nil
 }
 
+// edgeSecretKey, as the FILE of -edge-grant-key, is the key derived from
+// -edge-secret, so a deployment on it can rotate to key files without
+// making clients exchange again (§C.5 "Format"). A file of that name is
+// given as ./edge-secret.
+const edgeSecretKey = "edge-secret"
+
 // edgeGrantCookies returns the edge-grant cookies of POST /edge-grants
 // (§C.5): under the -edge-grant-key flags, [KID=]FILE, a plain FILE named
 // kid, minting with the last and accepting all, so keys rotate (§C.5
 // "Format"); without one, under the key derived from -edge-secret, else a
-// random one, named kid. They are SameSite=None when pages on other
-// origins may call with credentials (-cors-credentials-origin), else Lax.
+// random one, named kid. A flag is KID=FILE only when no '/' comes before
+// its first '=', so a path holding '=' is a plain FILE; FILE edgeSecretKey
+// is the derived key. They are SameSite=None when pages on other origins
+// may call with credentials (-cors-credentials-origin), else Lax.
 func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsFlags) (*edge.Cookies, error) {
 	if kid == "" {
 		return nil, errors.New("-edge-grant-kid: empty")
@@ -424,19 +433,26 @@ func edgeGrantCookies(kid string, keyFlags []string, ev *edge.Verifier, c *corsF
 	}
 	for _, f := range keyFlags {
 		k, file, ok := strings.Cut(f, "=")
-		if !ok {
+		if !ok || strings.ContainsAny(k, "/"+string(filepath.Separator)) {
 			k, file = kid, f
 		}
 		if k == "" || file == "" {
 			return nil, fmt.Errorf("-edge-grant-key %q: want KID=FILE or FILE", f)
 		}
-		b, err := os.ReadFile(file)
-		if err != nil {
-			return nil, fmt.Errorf("-edge-grant-key: %v", err)
-		}
-		key := []byte(strings.TrimSpace(string(b)))
-		if len(key) < 16 {
-			return nil, fmt.Errorf("-edge-grant-key %s: the key must be at least 16 bytes", file)
+		var key []byte
+		if file == edgeSecretKey {
+			if key = ev.CookieKey(); key == nil {
+				return nil, fmt.Errorf("-edge-grant-key %s: the key derived from -edge-secret needs -edge-secret (a file of that name is ./%s)", f, edgeSecretKey)
+			}
+		} else {
+			b, err := os.ReadFile(file)
+			if err != nil {
+				return nil, fmt.Errorf("-edge-grant-key: %v", err)
+			}
+			key = []byte(strings.TrimSpace(string(b)))
+			if len(key) < 16 {
+				return nil, fmt.Errorf("-edge-grant-key %s: the key must be at least 16 bytes", file)
+			}
 		}
 		if ck == nil {
 			ck = edge.NewCookies(k, key)

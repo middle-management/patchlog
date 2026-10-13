@@ -358,6 +358,14 @@ func TestCookiesRotate(t *testing.T) {
 	if _, err := minter.Verify(forged, now); err == nil {
 		t.Error("k1 cookie verified under k2's key")
 	}
+	// Every key held is the origin's, vouching for the core prefixes only:
+	// a prefix under a service's root fails under each (§C.5 "Format").
+	for kid, key := range map[string][]byte{"k1": testKey, "k2": next} {
+		svc := sign(key, `{"exp":1790000900,"kid":"`+kid+`","p":"/tree/x"}`)
+		if _, err := minter.Verify(svc, now); err == nil {
+			t.Errorf("a service prefix verified under %s", kid)
+		}
+	}
 	for _, tc := range []struct {
 		kid string
 		key []byte

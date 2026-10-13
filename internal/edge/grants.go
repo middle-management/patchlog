@@ -39,6 +39,9 @@ import (
 // the edge secret (KeyFromSecret), so the edge and the origin share it.
 // Cookies may hold several keys, minting with the newest and accepting
 // any, so a key is rotated without making clients exchange again (§C.5).
+// Every key it holds vouches for the core prefixes, so it holds one
+// minter's keys only: a service minting for prefixes under a root of its
+// own needs a Cookies of its own, or its key would vouch for /r/ and /ns/.
 
 // CookiePrefix starts the name of every edge-grant cookie. The __Secure-
 // prefix makes browsers refuse it without Secure.
@@ -62,7 +65,8 @@ type Claims struct {
 }
 
 // Cookies issues edge-grant cookies under the newest of its keys and
-// verifies them under any it holds (§C.5 "Format").
+// verifies them under any it holds (§C.5 "Format"). They are the origin's
+// keys, each vouching for the core prefixes only (ParsePrefix).
 type Cookies struct {
 	keys []cookieKey // oldest first: the last mints
 	// SameSite is the cookies' SameSite attribute: None when pages on
@@ -100,7 +104,9 @@ func NewCookies(kid string, key []byte) *Cookies {
 // then to the minter, and dropping the old one once its cookies have
 // expired, MaxGrantTTL after the minter took the next. AddKey is for
 // setting c up, before it is in use. An empty kid or key, or a kid c
-// holds already, is an error.
+// holds already, is an error. key vouches for the core prefixes, as
+// every key c holds does, so it is one of the origin's keys, never a
+// service's (§C.5: each key vouches only for its own prefixes).
 func (c *Cookies) AddKey(kid string, key []byte) error {
 	switch {
 	case kid == "":

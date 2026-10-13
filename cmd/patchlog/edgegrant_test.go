@@ -30,7 +30,9 @@ func TestParseRate(t *testing.T) {
 // -edge-grant-key is repeatable, [KID=]FILE, a plain FILE named by
 // -edge-grant-kid: cookies are minted under the last and accepted under
 // any (§C.5 "Format"). Without one, the key derived from -edge-secret is
-// named -edge-grant-kid, as before.
+// named -edge-grant-kid, as before; FILE edge-secret holds it next to
+// key files, so a deployment on it rotates to them. A path with '=' in
+// it is a plain FILE unless no '/' comes before the '='.
 func TestEdgeGrantKeyFlags(t *testing.T) {
 	dir := t.TempDir()
 	file := func(name, key string) string {
@@ -43,6 +45,7 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 	k1 := file("k1", "the first key, sixteen bytes or more")
 	k2 := file("k2", "the second key, sixteen bytes or more")
 	short := file("short", "too short")
+	eq := file("edge=v3.key", "the third key, sixteen bytes or more")
 	cors := addCORSFlags(flag.NewFlagSet("t", flag.ContinueOnError))
 	now := time.Unix(1790000000, 0)
 	cl := edge.Claims{Prefix: "/r/demo", Exp: now.Add(time.Minute).Unix()}
@@ -59,6 +62,8 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 		{"rotating", "origin", []string{"k1=" + k1, "k2=" + k2}, "k2", "k1 k2"},
 		{"plain then named", "origin", []string{k1, "k2=" + k2}, "k2", "origin k2"},
 		{"named then plain", "origin", []string{"k2=" + k2, k1}, "origin", "k2 origin"},
+		{"a plain path with =", "origin", []string{eq}, "origin", "origin"},
+		{"a named path with =", "origin", []string{"k3=" + eq}, "k3", "k3"},
 	} {
 		ck, err := edgeGrantCookies(c.kid, c.keys, nil, cors)
 		if err != nil {
@@ -103,9 +108,34 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 	if got, want := ck.Issue(cl, now).Value, edge.NewCookies("o1", edge.KeyFromSecret([]byte("s3cret"))).Issue(cl, now).Value; got != want {
 		t.Errorf("derived key: %s, want %s", got, want)
 	}
-	// Given -edge-grant-key, the derived key isn't held.
+	// Given -edge-grant-key, the derived key isn't held, unless named by
+	// FILE edge-secret: then a cookie minted under it alone verifies once
+	// a key file is added as the newest, and drops with it.
 	if ck, err := edgeGrantCookies("origin", []string{k1}, ev, cors); err != nil || len(ck.Kids()) != 1 {
 		t.Errorf("with an edge secret: %v %v", ck, err)
+	}
+	for _, c := range []struct {
+		name, kid string
+		keys      []string
+		accepts   string
+	}{
+		{"derived, plain", "o1", []string{"edge-secret", "k2=" + k2}, "o1 k2"},
+		{"derived, named", "origin", []string{"o1=edge-secret", "k2=" + k2}, "o1 k2"},
+	} {
+		rot, err := edgeGrantCookies(c.kid, c.keys, ev, cors)
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if rot.Kid() != "k2" || strings.Join(rot.Kids(), " ") != c.accepts {
+			t.Errorf("%s: mints %s, accepts %v", c.name, rot.Kid(), rot.Kids())
+		}
+		if _, err := rot.Verify(ck.Issue(cl, now).Value, now); err != nil {
+			t.Errorf("%s: the derived key's cookie: %v", c.name, err)
+		}
+	}
+	if _, err := edgeGrantCookies("origin", []string{"./edge-secret"}, ev, cors); err == nil || !strings.Contains(err.Error(), "no such file") {
+		t.Errorf("./edge-secret is a file: %v", err)
 	}
 
 	for _, c := range []struct {
@@ -120,6 +150,8 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 		{"a kid twice", "origin", []string{"k1=" + k1, "k1=" + k2}},
 		{"a plain file and its kid", "origin", []string{k1, "origin=" + k2}},
 		{"two plain files", "origin", []string{k1, k2}},
+		{"the derived key without -edge-secret", "origin", []string{"edge-secret"}},
+		{"a relative path with = and no /", "origin", []string{filepath.Base(eq)}},
 	} {
 		if ck, err := edgeGrantCookies(c.kid, c.keys, nil, cors); err == nil {
 			t.Errorf("%s: accepted, kids %v", c.name, ck.Kids())
