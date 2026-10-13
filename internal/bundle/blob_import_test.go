@@ -109,6 +109,7 @@ func TestBundleBlobs(t *testing.T) {
 	// A dry run uploads nothing, and defers the blob failures.
 	dst := newDeployment(t, cmsOrigin)
 	dst.ns("m", nil)
+	empty := must(dst.c.NSHead(ctx, "m")).ID // m before anything is imported
 	rep := importB(t, dst, full, bundle.ImportOptions{DryRun: true})
 	if rep.Batches[0].DryRun != "deferred" {
 		t.Fatalf("dry run %+v", rep.Batches[0])
@@ -170,12 +171,15 @@ func TestBundleBlobs(t *testing.T) {
 
 	// A new target replays the whole upstream chain: the blob of an earlier
 	// snapshot, which this bundle doesn't carry, comes from the upstream
-	// resource.
+	// resource. The target is a branch of m from before the first import,
+	// which has no s: a mapping onto a branch of the source namespace
+	// renames nothing, so the upstream namespace stays m-upstream (§G.4.4).
 	rv := src.upload("m", "s", "text/plain", "", []byte("blob v"))
 	src.append("m", "s", op("replace", "/t", rv))
 	buf.Reset()
 	_, _, err = bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"m/s"}, Mode: bundle.Snapshot})
 	noErr(t, err)
+	must(dst.c.CreateBranch(ctx, "m", client.BranchRequest{Name: "m3", At: empty}))
 	rep = importB(t, dst, buf.Bytes(), bundle.ImportOptions{NSMap: map[string]string{"m": "m3"}})
 	if u, c := sentBlobs(rep); u != 2 || c != 1 {
 		t.Fatalf("snapshot import into a new target uploaded %d, copied %d", u, c)

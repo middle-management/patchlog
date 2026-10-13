@@ -296,9 +296,14 @@ func (im *importer) request(b *batch) (client.BatchRequest, []string) {
 			}
 		}
 		req.Items = append(req.Items, bi)
-		if it.sameIDs {
+		switch {
+		case it.sameIDs:
 			ids[it.name] = it.expected[p.to-1]
-		} else {
+		case it.srcIDs != nil:
+			// A renamed document's step: the source id it stands for
+			// (§G.4.4 Renaming).
+			ids[it.name] = it.srcIDs[p.to-1]
+		default:
 			ids[it.name] = it.srcID
 		}
 		expected = append(expected, it.expected[p.to-1])

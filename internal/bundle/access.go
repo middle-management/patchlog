@@ -252,11 +252,7 @@ func (im *importer) checkAccess(ctx context.Context) error {
 			im.sealedT[u] = true
 		}
 	}
-	np, err := im.requireNonces(ctx, nonces)
-	if err != nil {
-		return err
-	}
-	problems = append(problems, np...)
+	im.requireNonces(nonces)
 	if len(problems) > 0 {
 		return &AccessError{Problems: problems}
 	}
