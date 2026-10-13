@@ -11,6 +11,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -186,5 +187,61 @@ func TestMultiMinElsewhere(t *testing.T) {
 	if hidden.status != 400 || unknown.status != 400 || hidden.body["message"] != unknown.body["message"] ||
 		hidden.header.Get("Cache-Control") != "no-store" {
 		t.Errorf("hidden %d %v, unknown %d %v", hidden.status, hidden.body, unknown.status, unknown.body)
+	}
+}
+
+// TestMultiMinPurgedSealed (§A.5, §8.5): behind Multi, a min naming a
+// purged sealed namespace that another catalog's service follows, whose
+// document is 410 purged, is judged by the core's read check: a reader
+// who passes is redirected to the current at, any other gets the 400 of a
+// namespace no catalog follows. Never a 502.
+func TestMultiMinPurgedSealed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	nss := []string{"a", "cat", "sec", "topics"}
+	for _, ns := range nss {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		switch ns {
+		case "sec":
+			doc["read"], doc["encryption"] = "grant", map[string]any{"level": "sealed"}
+		case "cat":
+			doc["catalog"] = map[string]any{"trust": []any{"a"}}
+		case "topics":
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", nss, []string{"read", "create", "config", "purge-ns"})),
+		client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "top", map[string]any{"title": "Top", "parents": []any{}}))
+	createNonced(t, w, "sec", "x", map[string]any{"t": 1})
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", nss, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	cat := startSvc(t, sc, svcOpts{now: s.Now})
+	topics := startSvc(t, sc, svcOpts{catalog: "topics", db: filepath.Join(t.TempDir(), "topics.db"), now: s.Now})
+	cat.caughtUp("cat", "a")
+	topics.caughtUp("topics", "sec")
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	purged := must(w.PurgeNamespace(ctx, "sec", must(w.NSHead(ctx, "sec")).ID))
+	waitFor(t, "the purge", func() bool { return topics.s.Checkpoint("sec") == purged })
+	m := httptest.NewServer(must(tree.Multi(cat.s, topics.s)))
+	defer m.Close()
+	x := &svc{t: t, http: m}
+
+	reader := k.Grant(t, s.Now(), "user:r", []string{"cat", "sec"}, []string{"read"})
+	if r := x.raw("/cat/roots?min=sec:"+purged, reader); r.status != 302 || !strings.HasSuffix(r.header.Get("Location"), "/at/"+cat.s.At()+"/roots") {
+		t.Errorf("a reader of sec: %d %v %s", r.status, r.body, r.header.Get("Location"))
+	}
+	catOnly := k.Grant(t, s.Now(), "user:c", []string{"cat"}, []string{"read"})
+	for name, tok := range map[string]string{"anonymous": "", "a grant for cat only": catOnly} {
+		hidden, unknown := x.raw("/cat/roots?min=sec:"+purged, tok), x.raw("/cat/roots?min=zz:"+purged, tok)
+		if hidden.status != 400 || hidden.body["message"] != unknown.body["message"] || hidden.header.Get("Cache-Control") != "no-store" {
+			t.Errorf("%s: %d %v, unknown %d %v", name, hidden.status, hidden.body, unknown.status, unknown.body)
+		}
 	}
 }

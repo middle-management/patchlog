@@ -9,6 +9,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // TestMinOtherNamespace (§A.5, v0.51): a min naming a namespace that a
@@ -101,5 +102,50 @@ func TestMinOtherNamespace(t *testing.T) {
 	hidden, unknown := x.raw(pubOld+"&min=pb:"+pbAt, ""), x.raw(pubOld+"&min=zz:"+pbAt, "")
 	if hidden.status != 400 || unknown.status != 400 || hidden.body["message"] != unknown.body["message"] || hidden.body["code"] != unknown.body["code"] {
 		t.Errorf("hidden %d %v, unknown %d %v", hidden.status, hidden.body, unknown.status, unknown.body)
+	}
+}
+
+// TestMinPurgedSealed (§A.5, §8.5): a min naming a purged sealed namespace,
+// whose document is 410 purged, is judged by the core's read check: a
+// reader who passes goes to the current checkpoint, any other gets the
+// same 400 as for a namespace the index doesn't follow. Never a 502.
+func TestMinPurgedSealed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "sec"))).CreateNamespace(ctx, "sec",
+		map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "pa"))).CreateNamespace(ctx, "pa",
+		map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	nss := []string{"pa", "sec"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", nss, []string{"read", "create", "config", "purge-ns"})),
+		client.WithKeys(client.NewKeys(nil)))
+	must(createNonced(w, "sec", "a", map[string]any{"title": "secret"}))
+	must(w.CreateDoc(ctx, "pa", "a", map[string]any{"title": "pa"}))
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}, map[string]any{"enc": jwk})),
+		client.WithKeys(client.NewKeys(priv)))
+	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: nss, untyped: true, now: s.Now},
+		func(o *indexOpts) { o.Recipient = priv })
+	x.caughtUp("sec")
+	cur := x.caughtUp("pa")
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	purged := must(w.PurgeNamespace(ctx, "sec", must(w.NSHead(ctx, "sec")).ID))
+	waitFor(t, "the purge", func() bool { return x.ix.Checkpoint("sec") == purged })
+
+	reader := k.Grant(t, s.Now(), "user:r", nss, []string{"read"})
+	r := x.raw("/pa?q=pa&min=sec:"+purged, reader)
+	if loc := r.header.Get("Location"); r.status != 302 || !strings.HasPrefix(loc, "/pa/g/") || !strings.Contains(loc, "/at/"+cur+"?") {
+		t.Errorf("a reader of sec: %d %v %s", r.status, r.body, loc)
+	}
+	// A grant that doesn't read sec: the 400 of a namespace not followed.
+	paOnly := k.Grant(t, s.Now(), "user:p", []string{"pa"}, []string{"read"})
+	hidden, unknown := x.raw("/pa?q=pa&min=sec:"+purged, paOnly), x.raw("/pa?q=pa&min=zz:"+purged, paOnly)
+	if hidden.status != 400 || hidden.body["code"] != "bad_input" || hidden.body["message"] != unknown.body["message"] {
+		t.Errorf("a grant for pa only: %d %v, unknown %d %v", hidden.status, hidden.body, unknown.status, unknown.body)
 	}
 }

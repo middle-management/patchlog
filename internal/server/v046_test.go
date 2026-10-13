@@ -347,7 +347,10 @@ func TestV046EdgeGrantsBehindEdge(t *testing.T) {
 		t.Fatalf("cache %v", rev.H)
 	}
 	// A cookie under another kid, as a service's, or in the v0.49 format,
-	// authorises nothing at the origin (§C.5 "Format").
+	// authorises nothing at the origin (§C.5 "Format"); nor does one under
+	// the origin's kid and the key derived from the edge secret, which
+	// every holder of the secret, services included, can derive: without
+	// -edge-grant-key the origin's key is a random one of its own.
 	key := edge.KeyFromSecret([]byte("s3cret"))
 	exp := strconv.FormatInt(t0.Add(time.Minute).Unix(), 10)
 	old := base64.RawURLEncoding.EncodeToString([]byte(`{"v":1,"p":"/r/sec","ns":"sec","sub":"user:bob","exp":` + exp + `}`))
@@ -355,6 +358,7 @@ func TestV046EdgeGrantsBehindEdge(t *testing.T) {
 	m.Write([]byte(old))
 	for _, ck := range []*http.Cookie{
 		edge.NewCookies("tree", key).Issue(edge.Claims{Prefix: "/r/sec", Exp: t0.Add(time.Minute).Unix()}, t0),
+		edge.NewCookies(edge.DefaultKid, key).Issue(edge.Claims{Prefix: "/r/sec", Exp: t0.Add(time.Minute).Unix()}, t0),
 		{Name: c.Name, Value: old + "." + base64.RawURLEncoding.EncodeToString(m.Sum(nil))},
 	} {
 		expect(t, e.do(req{method: "GET", path: path, hdr: cookieHdr(ck)}), 401)

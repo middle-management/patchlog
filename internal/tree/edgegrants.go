@@ -16,6 +16,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -52,7 +53,10 @@ import (
 // edge can't make that check, and serves a cached listing to every g/all
 // cookie, so no shared cache keeps a g/all listing at such an at until
 // every cookie issued before that namespace was trusted has expired
-// (edgeHold).
+// (edgeHold). The other way round, a g/all cookie issued after the
+// catalog stops trusting a namespace isn't checked against it, so the
+// service purges ns:{ns}, the tag of every listing covering it (Apply),
+// and no edge keeps a g/all listing longer than a cookie lives (cdnAll).
 
 // maxEdgeGrants is how many grants one exchange takes in its body (§C.5).
 const maxEdgeGrants = 50
@@ -189,7 +193,9 @@ func (s *Service) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // those grants. A prefix several grants give gets one cookie, lasting as
 // long as the longest, and exp is the earliest. It answers all or
 // nothing: if any grant is refused, the request is 401 if any is 401,
-// else 403, and 502 if a namespace document can't be read. Once nothing
+// else 403, and 502 if a namespace document can't be read; once none is,
+// a purged catalog is 410 purged with head, as its listings are (§8.5: a
+// purged sealed catalog's read check is the core's). Once nothing
 // is refused, it draws one token from the exchangeRate bucket of each
 // distinct principal among the grants (ExchangeRate, §6.6), and is 429
 // (code "rate", limit "exchangeRate", with Retry-After) while any is
@@ -232,9 +238,19 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		vs      []*viewer
 		refusal *grant.AuthError
 		upErr   error
+		purged  string
 	)
 	for _, b := range bearers {
 		v, err := s.grantViewer(ctx, b)
+		if client.IsPurged(err) {
+			// A purged sealed catalog's document is 410 (§8.5): the core
+			// makes the read check, as for a listing (serve).
+			var head string
+			if head, err = s.checker.PurgedRead(ctx, s.actual(s.opt.Catalog), b); err == nil {
+				purged = head
+				continue
+			}
+		}
 		var ae *grant.AuthError
 		switch {
 		case errors.As(err, &ae):
@@ -253,6 +269,15 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	case upErr != nil:
 		WriteAuthError(w, upErr, s.opt.Logf)
+		return
+	}
+	// A purged catalog has no listings to cover: 410 purged with head
+	// after the read check, as its listings answer (§8.5, serve).
+	if head, ok, _ := s.state(); ok {
+		purged = head
+	}
+	if purged != "" {
+		writePurged(w, purged)
 		return
 	}
 	// One token per request, from each distinct principal's bucket,
@@ -408,10 +433,19 @@ func (s *Service) withdrawEdgeGrants(w http.ResponseWriter, r *http.Request) {
 // read is 403 (serve, trustedSince). A namespace that was public at issue
 // and has turned private since is still read whole under it until it
 // expires, as under a grant revoked since: the cookie's lifetime is the
-// revocation latency (§C.5). A subject set the service doesn't know is
-// 401.
+// revocation latency (§C.5). A purged namespace is read whole by every
+// reader (trustList). A subject set the service doesn't know is 401,
+// before the catalog's document is read: the 410 of a purged sealed
+// catalog's is the read's error, which serve answers 410 purged.
 func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, error) {
 	gs, _ := s.edgeGS(cl.Prefix)
+	var subs []string
+	if gs != AllSubjects {
+		var ok bool
+		if subs, ok = s.subjectsOf(ctx, gs); !ok {
+			return nil, &grant.AuthError{Status: 401, Msg: "an edge grant for a subject set this service doesn't know: exchange the grant again"}
+		}
+	}
 	// As grantViewer; a catalog service is never a release preview (Open),
 	// so actual is the namespace itself.
 	cfg, err := s.checker.Config(ctx, s.actual(s.opt.Catalog))
@@ -423,16 +457,21 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 	if gs == AllSubjects {
 		notBefore = s.allNotBefore(cl.Exp)
 	}
-	var trust, checked []string
-	s.View(func(g *Graph, _ map[string]string) {
-		for ns := range g.Trust {
-			trust = append(trust, ns)
-			if since, ok := s.trusted[ns]; ok && since.Before(notBefore) {
-				checked = append(checked, ns)
-			}
+	var checked []string
+	trust, gone := s.trustList()
+	s.mu.RLock()
+	for _, ns := range trust {
+		if since, ok := s.trusted[ns]; ok && since.Before(notBefore) {
+			checked = append(checked, ns)
 		}
-	})
+	}
+	s.mu.RUnlock()
 	v := &viewer{gs: gs, contentAll: map[string]bool{}, wideNS: map[string]bool{}, wideGrant: map[string]bool{}}
+	// A purged namespace is read whole by every reader, as under a grant
+	// (trustList).
+	for ns := range gone {
+		v.contentAll[ns], v.wideNS[ns] = true, true
+	}
 	if gs == AllSubjects {
 		// What the cookie was checked against: the catalog, and every
 		// namespace trusted before its issue. A listing at an at
@@ -445,12 +484,11 @@ func (s *Service) edgeViewer(ctx context.Context, cl *edge.Claims) (*viewer, err
 		v.exp, v.wideExp, v.notBefore = time.Unix(cl.Exp, 0), time.Unix(cl.Exp, 0), notBefore
 		return v, nil
 	}
-	subs, ok := s.subjectsOf(ctx, gs)
-	if !ok {
-		return nil, &grant.AuthError{Status: 401, Msg: "an edge grant for a subject set this service doesn't know: exchange the grant again"}
-	}
 	v.catAll, v.wideCat, v.subjects = catPublic, catPublic, subs
 	for _, ns := range trust {
+		if gone[ns] {
+			continue
+		}
 		if c, err := s.checker.Config(ctx, s.actual(ns)); err == nil && c.Read == "public" {
 			v.contentAll[ns], v.wideNS[ns] = true, true
 		}
@@ -650,7 +688,9 @@ func (s *Service) trustedSince(v *viewer, at, cur string) string {
 // (allExp), and holds only while one issued no later than the namespace
 // became trusted is live; otherwise, for the cookies' longest lifetime
 // after it. A namespace without a record (atTrust) counts as just
-// trusted.
+// trusted. A namespace the catalog stopped trusting needs no hold here: a
+// g/all cookie is refused at every at including it (trustedSince), and
+// what an edge holds from before is purged (Apply) or expires (cdnAll).
 func (s *Service) edgeHold(v *viewer, at, cur string) bool {
 	if s.opt.EdgeGrants == nil || v.gs != AllSubjects {
 		return false

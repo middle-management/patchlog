@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -68,6 +70,27 @@ type world struct {
 	// exchangeRate is its exchangeRate bucket (tree.Options).
 	edgeOwnKey   bool
 	exchangeRate tree.Rate
+	// purges are the cache tags the service purged, in order.
+	pmu    sync.Mutex
+	purges [][]string
+}
+
+func (w *world) PurgeTags(tags []string) {
+	w.pmu.Lock()
+	w.purges = append(w.purges, tags)
+	w.pmu.Unlock()
+}
+
+// purged reports whether the service purged tag.
+func (w *world) purged(tag string) bool {
+	w.pmu.Lock()
+	defer w.pmu.Unlock()
+	for _, ts := range w.purges {
+		if slices.Contains(ts, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func toAny(xs ...string) []any {
@@ -195,7 +218,7 @@ func (w *world) start() {
 		Tree: tree.Options{Client: w.svcClient, Catalog: "cat", DB: w.db, Now: w.s.Now, CheckerTTL: time.Millisecond,
 			Logf:          func(f string, a ...any) { w.t.Logf(f, a...) },
 			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
-			EdgeGrants:    w.edgeGrants, Edge: w.edge, EdgeGrantsOwnKey: w.edgeOwnKey, ExchangeRate: w.exchangeRate},
+			EdgeGrants:    w.edgeGrants, Edge: w.edge, EdgeGrantsOwnKey: w.edgeOwnKey, ExchangeRate: w.exchangeRate, Purger: w},
 		Key: w.cat.Priv, Kid: "catalog-01",
 		MergeKey: w.mergeKey.Priv, MergeKid: "catalog-merge", MergeService: "svc:merge",
 	})

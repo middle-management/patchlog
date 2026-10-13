@@ -672,6 +672,18 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		s.mu.Unlock()
 		return err
 	}
+	// A namespace the catalog no longer trusts leaves every cached listing
+	// whose checkpoint covers it (ns:{ns}), with edge grants: a g/all
+	// cookie issued from now on isn't checked against it, and an edge
+	// serves the g/all listings it holds to every g/all cookie (§B.11.5).
+	// Should the purge not land, their edge lifetime is capped (cdnAll).
+	if s.opt.EdgeGrants != nil {
+		for ns := range oldTrust {
+			if !s.g.Trust[ns] {
+				res.tags = append(res.tags, "ns:"+s.actual(ns))
+			}
+		}
+	}
 	// Purge before the new checkpoint is out, so nobody who learns of it
 	// can still be served what it removed. Purgers don't block. Kept
 	// listings go first: one read before it that carries a tag it purges

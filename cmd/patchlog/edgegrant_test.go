@@ -29,10 +29,12 @@ func TestParseRate(t *testing.T) {
 
 // -edge-grant-key is repeatable, [KID=]FILE, a plain FILE named by
 // -edge-grant-kid: cookies are minted under the last and accepted under
-// any (§C.5 "Format"). Without one, the key derived from -edge-secret is
-// named -edge-grant-kid, as before; FILE edge-secret holds it next to
-// key files, so a deployment on it rotates to them. A path with '=' in
-// it is a plain FILE unless no '/' comes before the '='.
+// any (§C.5 "Format"). Without one, a random key named -edge-grant-kid,
+// never the key derived from -edge-secret, which every service holding
+// the secret could derive and mint core cookies with; FILE edge-secret
+// opts in to it next to key files, with a warning, so a deployment on it
+// rotates to them. A path with '=' in it is a plain FILE unless no '/'
+// comes before the '='.
 func TestEdgeGrantKeyFlags(t *testing.T) {
 	dir := t.TempDir()
 	file := func(name, key string) string {
@@ -65,7 +67,7 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 		{"a plain path with =", "origin", []string{eq}, "origin", "origin"},
 		{"a named path with =", "origin", []string{"k3=" + eq}, "k3", "k3"},
 	} {
-		ck, err := edgeGrantCookies(c.kid, c.keys, nil, cors)
+		ck, _, err := edgeGrantCookies(c.kid, c.keys, nil, cors)
 		if err != nil {
 			t.Errorf("%s: %v", c.name, err)
 			continue
@@ -80,11 +82,11 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 
 	// The key is the file's bytes, trimmed: a cookie minted under k1 by a
 	// deployment holding it alone verifies after k2 is added as the newest.
-	before, err := edgeGrantCookies("origin", []string{"k1=" + k1}, nil, cors)
+	before, _, err := edgeGrantCookies("origin", []string{"k1=" + k1}, nil, cors)
 	if err != nil {
 		t.Fatal(err)
 	}
-	after, err := edgeGrantCookies("origin", []string{"k1=" + k1, "k2=" + k2}, nil, cors)
+	after, _, err := edgeGrantCookies("origin", []string{"k1=" + k1, "k2=" + k2}, nil, cors)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,24 +97,46 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 		t.Errorf("key not the trimmed file: %s", got)
 	}
 
-	// Without -edge-grant-key, the key derived from -edge-secret, named
-	// -edge-grant-kid.
+	// Without -edge-grant-key, a random key named -edge-grant-kid, with
+	// or without -edge-secret: never the key derived from the secret, so a
+	// cookie minted with it is refused. With -edge-secret, a warning says
+	// an edge verifying cookies needs key files.
 	ev, err := edge.New([]byte("s3cret"), "", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	ck, err := edgeGrantCookies("o1", nil, ev, cors)
-	if err != nil || ck.Kid() != "o1" || len(ck.Kids()) != 1 {
-		t.Fatalf("derived: %v %v", ck, err)
-	}
-	if got, want := ck.Issue(cl, now).Value, edge.NewCookies("o1", edge.KeyFromSecret([]byte("s3cret"))).Issue(cl, now).Value; got != want {
-		t.Errorf("derived key: %s, want %s", got, want)
+	derived := edge.NewCookies("o1", edge.KeyFromSecret([]byte("s3cret")))
+	for _, v := range []*edge.Verifier{nil, ev} {
+		ck, warn, err := edgeGrantCookies("o1", nil, v, cors)
+		if err != nil || ck.Kid() != "o1" || len(ck.Kids()) != 1 {
+			t.Fatalf("no key, edge %v: %v %v", v != nil, ck, err)
+		}
+		if _, err := ck.Verify(derived.Issue(cl, now).Value, now); err == nil {
+			t.Errorf("no key, edge %v: a cookie under the derived key verifies", v != nil)
+		}
+		if again, _, _ := edgeGrantCookies("o1", nil, v, cors); again.Issue(cl, now).Value == ck.Issue(cl, now).Value {
+			t.Errorf("no key, edge %v: the key isn't random", v != nil)
+		}
+		if got := strings.Join(warn, "\n"); (v != nil) != strings.Contains(got, "-edge-grant-key") {
+			t.Errorf("no key, edge %v: warnings %q", v != nil, got)
+		}
 	}
 	// Given -edge-grant-key, the derived key isn't held, unless named by
 	// FILE edge-secret: then a cookie minted under it alone verifies once
-	// a key file is added as the newest, and drops with it.
-	if ck, err := edgeGrantCookies("origin", []string{k1}, ev, cors); err != nil || len(ck.Kids()) != 1 {
-		t.Errorf("with an edge secret: %v %v", ck, err)
+	// a key file is added as the newest, and drops with it. Holding it
+	// warns that every holder of the edge secret can mint with it.
+	if ck, warn, err := edgeGrantCookies("origin", []string{k1}, ev, cors); err != nil || len(ck.Kids()) != 1 || len(warn) != 0 {
+		t.Errorf("with an edge secret: %v %v %q", ck, err, warn)
+	}
+	ck, warn, err := edgeGrantCookies("o1", []string{"edge-secret"}, ev, cors)
+	if err != nil || ck.Kid() != "o1" || len(ck.Kids()) != 1 {
+		t.Fatalf("derived: %v %v", ck, err)
+	}
+	if got, want := ck.Issue(cl, now).Value, derived.Issue(cl, now).Value; got != want {
+		t.Errorf("derived key: %s, want %s", got, want)
+	}
+	if len(warn) != 1 || !strings.Contains(warn[0], "migrate") {
+		t.Errorf("derived key: warnings %q", warn)
 	}
 	for _, c := range []struct {
 		name, kid string
@@ -122,7 +146,7 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 		{"derived, plain", "o1", []string{"edge-secret", "k2=" + k2}, "o1 k2"},
 		{"derived, named", "origin", []string{"o1=edge-secret", "k2=" + k2}, "o1 k2"},
 	} {
-		rot, err := edgeGrantCookies(c.kid, c.keys, ev, cors)
+		rot, _, err := edgeGrantCookies(c.kid, c.keys, ev, cors)
 		if err != nil {
 			t.Errorf("%s: %v", c.name, err)
 			continue
@@ -134,7 +158,7 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 			t.Errorf("%s: the derived key's cookie: %v", c.name, err)
 		}
 	}
-	if _, err := edgeGrantCookies("origin", []string{"./edge-secret"}, ev, cors); err == nil || !strings.Contains(err.Error(), "no such file") {
+	if _, _, err := edgeGrantCookies("origin", []string{"./edge-secret"}, ev, cors); err == nil || !strings.Contains(err.Error(), "no such file") {
 		t.Errorf("./edge-secret is a file: %v", err)
 	}
 
@@ -153,7 +177,7 @@ func TestEdgeGrantKeyFlags(t *testing.T) {
 		{"the derived key without -edge-secret", "origin", []string{"edge-secret"}},
 		{"a relative path with = and no /", "origin", []string{filepath.Base(eq)}},
 	} {
-		if ck, err := edgeGrantCookies(c.kid, c.keys, nil, cors); err == nil {
+		if ck, _, err := edgeGrantCookies(c.kid, c.keys, nil, cors); err == nil {
 			t.Errorf("%s: accepted, kids %v", c.name, ck.Kids())
 		}
 	}

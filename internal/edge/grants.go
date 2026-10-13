@@ -39,13 +39,18 @@ import (
 // (§B.11.5). So a cookie one mints never covers the other's URLs, even
 // under the other's key. A verifying edge holding the
 // key checks a request as Check does; without one the origin checks it
-// itself. The key is the deployment's: given on its own, or derived from
-// the edge secret (KeyFromSecret), so the edge and the origin share it.
-// Cookies may hold several keys, minting with the newest and accepting
+// itself. The key is the minter's, given on its own, which the edge holds
+// too. KeyFromSecret derives one from the edge secret, but every holder of
+// the secret can derive it, the services that hold it for their own edge
+// lifetimes included, so the reference mints with it only where a
+// deployment opts in, to migrate to keys of their own.
+//
+// A Cookies may hold several keys, minting with the newest and accepting
 // any, so a key is rotated without making clients exchange again (§C.5).
-// Every key it holds vouches for the core prefixes, so it holds one
-// minter's keys only: a service minting for prefixes under a root of its
-// own needs a Cookies of its own, or its key would vouch for /r/ and /ns/.
+// Every key one Cookies holds vouches for the same prefixes (VouchesFor):
+// the core prefixes when Vouches is nil, else Vouches' prefixes outside
+// /r and /ns. So one Cookies holds one minter's keys: the origin's in one,
+// a service's, with Vouches set to its prefixes, in another.
 
 // CookiePrefix starts the name of every edge-grant cookie. The __Secure-
 // prefix makes browsers refuse it without Secure.
@@ -69,8 +74,10 @@ type Claims struct {
 }
 
 // Cookies issues edge-grant cookies under the newest of its keys and
-// verifies them under any it holds (§C.5 "Format"). They are the origin's
-// keys, each vouching for the core prefixes only (ParsePrefix).
+// verifies them under any it holds (§C.5 "Format"). They are one minter's
+// keys, and all vouch for the same prefixes (VouchesFor): the core ones
+// (ParsePrefix) when Vouches is nil, as the origin's do, else those
+// Vouches allows outside /r and /ns, as a service's do.
 type Cookies struct {
 	keys []cookieKey // oldest first: the last mints
 	// SameSite is the cookies' SameSite attribute: None when pages on
@@ -114,9 +121,11 @@ func NewCookies(kid string, key []byte) *Cookies {
 // then to the minter, and dropping the old one once its cookies have
 // expired, MaxGrantTTL after the minter took the next. AddKey is for
 // setting c up, before it is in use. An empty kid or key, or a kid c
-// holds already, is an error. key vouches for the core prefixes, as
-// every key c holds does, so it is one of the origin's keys, never a
-// service's (§C.5: each key vouches only for its own prefixes).
+// holds already, is an error. key vouches for the same prefixes as every
+// key c holds (VouchesFor), so AddKey rotates the keys of whichever
+// minter c belongs to: the origin's next key goes in the origin's
+// Cookies, a service's in the service's (§C.5: each key vouches only for
+// its own prefixes).
 func (c *Cookies) AddKey(kid string, key []byte) error {
 	switch {
 	case kid == "":
@@ -153,8 +162,12 @@ func (c *Cookies) key(kid string) []byte {
 	return nil
 }
 
-// KeyFromSecret derives the edge-grant key from the edge secret, so a
-// verifying edge configured with the secret can verify the cookies.
+// KeyFromSecret derives an edge-grant key from the edge secret: HMAC-
+// SHA256 keyed with the secret over "patchlog edge grants v1". A verifying
+// edge configured with the secret can derive it, but so can every other
+// holder of the secret, the services that take it for their own edge
+// lifetimes included: a cookie under it may have been minted by any of
+// them. A deployment mints with it only to migrate to key files.
 func KeyFromSecret(secret []byte) []byte {
 	m := hmac.New(sha256.New, secret)
 	m.Write([]byte("patchlog edge grants v1"))
@@ -162,7 +175,13 @@ func KeyFromSecret(secret []byte) []byte {
 }
 
 // CookieKey is the edge-grant key derived from v's secret (KeyFromSecret),
-// nil without a Verifier.
+// nil without a Verifier. Every holder of the edge secret can derive it,
+// the catalog service and the search index included, and mint core
+// cookies with it, so the origin never signs with it by default: only
+// when the deployment names it (patchlog serve -edge-grant-key
+// KID=edge-secret), to migrate to key files of the origin's own. A
+// service's key must never be it (§C.5: each key vouches only for its own
+// prefixes).
 func (v *Verifier) CookieKey() []byte {
 	if v == nil {
 		return nil

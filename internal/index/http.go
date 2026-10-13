@@ -320,7 +320,15 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
 			return
 		default:
-			if _, err := ix.access(ctx, m.NS, r); err != nil {
+			_, err := ix.access(ctx, m.NS, r)
+			if client.IsPurged(err) {
+				// A purged sealed namespace's document is 410 (§8.5):
+				// the core makes the read check, as for ns above, and a
+				// reader who passes goes to the current checkpoint, which
+				// has reached the purge.
+				_, err = ix.checker.PurgedRead(ctx, m.NS, bearer(r))
+			}
+			if err != nil {
 				var ae *grant.AuthError
 				w.Header().Set("Cache-Control", "no-store")
 				if !errors.As(err, &ae) {

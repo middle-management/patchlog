@@ -302,8 +302,9 @@ cookie, on every request.
   either way.
 
 ```sh
-head -c 32 /dev/urandom | base64 > edge.secret   # shared with the edge's configuration
-patchlog serve -edge-secret edge.secret           # the edge sends X-Edge-Verified and X-Edge-Prefix
+head -c 32 /dev/urandom | base64 > edge.secret       # shared with the edge's configuration
+head -c 32 /dev/urandom | base64 > edge-grant.key    # the origin's cookie key, which the edge holds too
+patchlog serve -edge-secret edge.secret -edge-grant-key edge-grant.key   # the edge sends X-Edge-Verified and X-Edge-Prefix
 ```
 
 **Edge grants as cookies** (§C.5). `POST /edge-grants` with a grant in `Authorization`, or up
@@ -366,9 +367,13 @@ rotates (below; v0.51 made the flag repeatable); a plain `FILE` is named by `-ed
 (default `origin`). An argument is `KID=FILE` only when no `/` comes before its first `=`, so a
 path holding `=` is a plain `FILE` (give `edge=v2.key` in the working directory as
 `./edge=v2.key`), and `FILE` `edge-secret` is the key derived from `-edge-secret` (a file of that
-name is `./edge-secret`). Without one, they are signed with the key derived from `-edge-secret`, named
-by `-edge-grant-kid`, so an edge holding the secret derives the same key; with neither flag,
-with a random key per process, so cookies don't survive a restart or reach another instance.
+name is `./edge-secret`; see the warning below). Without one, they are signed with a random key per
+process, named by `-edge-grant-kid`, so cookies don't survive a restart, reach another instance or
+verify at an edge, which only the origin can then check: an edge that verifies cookies needs
+`-edge-grant-key` key files, which it holds too. With `-edge-secret` and no `-edge-grant-key`,
+`serve` logs a warning saying so. (Earlier releases signed with the key derived from the edge
+secret by default. The catalog service and the search index hold that secret too, for their own
+edge lifetimes, so either could derive the key and mint core cookies for any namespace.)
 Pages on another origin call it with `credentials: "include"`: list them with
 `-cors-credentials-origin` (repeatable), which names the origin from that list with
 `Access-Control-Allow-Credentials: true` and `Vary: Origin`, even when `-cors-origin` is `*`,
@@ -406,8 +411,10 @@ gives a default so an edge can be written once. The reference issues exactly tha
   `origin`) for a plain `FILE`. Each key is its file's bytes with surrounding whitespace
   trimmed, used as they are, not decoded (at least 16; `head -c 32 /dev/urandom | base64 >
   edge-grant.key` makes one), and the edge then needs those files. Without `-edge-grant-key` the
-  key, named `-edge-grant-kid`, is HMAC-SHA256 keyed with the edge secret (the `-edge-secret`
-  file's content, trimmed the same way) over the ASCII text `patchlog edge grants v1`.
+  key is a random one of the origin process, which no edge holds. The key derived from the edge
+  secret, HMAC-SHA256 keyed with the edge secret (the `-edge-secret` file's content, trimmed the
+  same way) over the ASCII text `patchlog edge grants v1`, is held only when named as `FILE`
+  `edge-secret`, for migration (below).
   The catalog service's kid is its own `-edge-grant-kid` (default `catalog-{catalog}`), which
   vouches only for `/{catalog}/g/{gs}`, `gs` an id or `all`, and its key is its own
   `-edge-grant-key` file's bytes, never derived from the edge secret (see
@@ -433,9 +440,12 @@ rotated without making clients exchange again:
    took the next one, drop the old key from the origin (`-edge-grant-key k2=k2.key`), then from
    the edges.
 
-A deployment on the key derived from `-edge-secret` moves to key files the same way, naming the
-derived key `edge-secret` (with `-edge-secret` still given) so the origin holds it next to the
-first file until its cookies expire:
+A deployment on the key derived from `-edge-secret` (the default of earlier releases) moves to key files
+the same way, naming the derived key `edge-secret` (with `-edge-secret` still given) so the origin
+holds it next to the first file until its cookies expire. **That key is for migration only:** every
+holder of the edge secret can derive it, the catalog service and the search index included, which
+take `-edge-secret` for their own edge lifetimes, and so can mint cookies the origin accepts for
+any namespace. `serve` logs a warning while it holds it; drop it once its cookies have expired:
 
 ```sh
 patchlog serve -edge-secret edge.secret -edge-grant-key origin=edge-secret -edge-grant-key k1=k1.key …
@@ -444,9 +454,11 @@ patchlog serve -edge-secret edge.secret -edge-grant-key k1=k1.key …   # 15 min
 
 The edge secret itself still has one value, so replacing it makes clients exchange again. In Go,
 `edge.Cookies` holds the keys: `edge.NewCookies` and then `AddKey` for each newer one; `Kid`
-names the one it mints with and `Check` and `Verify` accept any. Every key one holds vouches for
-the core prefixes, so it holds the origin's keys only; a service minting cookies for a root of
-its own keeps its key in an `edge.Cookies` of its own.
+names the one it mints with and `Check` and `Verify` accept any. Every key one `edge.Cookies`
+holds vouches for the same prefixes, the core ones unless `Vouches` is set, so one minter's keys
+go in one `edge.Cookies`, and `AddKey` rotates that minter's keys: a service keeps its own, with
+`Vouches` set to its prefixes. The catalog service rotates its key the same way (`tree
+-edge-grant-key KID=FILE`, repeatable; see [Tree and catalog](#tree-and-catalog-addendum-b)).
 
 On every request, cache hits included, before serving it or forwarding it as verified, an edge
 MUST check (§C.5):
@@ -1127,7 +1139,9 @@ curl -L 'localhost:8081/matches?q=derby*&facet[/league]=allsvenskan&sort=-/kicko
   after them) to itself without `min`, anything else, once `min` is reached, to the current
   checkpoint. A `min` naming another namespace, which a result of `{ns}` never includes, goes
   straight to the current checkpoint once reached, in one hop, if the index follows it and the
-  reader's grant may read it (v0.51, §A.5); any other is `400`.
+  reader's grant may read it (v0.51, §A.5); any other is `400`. For a purged sealed namespace,
+  whose namespace documents are `410` (§8.5), the core makes that read check, as for the
+  namespace's own queries; it is never a `502`.
 - Redirects give the query in one canonical form (v0.50, §A.5): parameters sorted by name, then
   value, as UTF-8 bytes, and every byte but letters, digits and `-._~` percent-encoded in
   uppercase hex (a space is `%20`, never `+`). An `at` URL is answered `200` only in that form,
@@ -1945,13 +1959,19 @@ read; so is it on the plain tree service, whose listings depend on more than a s
 repeatable, each `/{catalog}/g/{gs}`, `400` otherwise; `204` with expired cookies, no grant
 needed). Credentialed CORS is the core's: pages listed with `-cors-credentials-origin` call it
 with `credentials: "include"`, the cookies are then `SameSite=None` (otherwise `Lax`), and only
-those origins may preflight the `DELETE`. Cookies are signed with `-edge-grant-key FILE`, a key
-of the service's own that the origin never holds (refused if it is the one the origin derives
-from `-edge-secret`; without the flag, a random key per process, so cookies don't survive a
-restart), named `-edge-grant-kid` (default `catalog-{catalog}`), which may not be the origin's
-kid, `-origin-edge-grant-kid` (default `origin`). A catalog named `r` or `ns` mints none, since
-its prefixes would overlap the core's (the service still runs; naming a key or kid for it is an
-error).
+those origins may preflight the `DELETE`. Cookies are signed with the last
+`-edge-grant-key [KID=]FILE` given, a key of the service's own that the origin never holds
+(refused if it is the key derived from `-edge-secret`, or `FILE` `edge-secret`; without the flag,
+a random key per process, so cookies don't survive a restart), and accepted under any of them, so
+the service's key rotates as the origin's does: add the next key to the edges, then to the
+service as the last flag, and drop the old one 15 minutes later. The flag takes the arguments
+`serve`'s does; a plain `FILE` is named `-edge-grant-kid` (default `catalog-{catalog}`). No kid of
+the service's may be one of the origin's, which `-origin-edge-grant-kid` lists (repeatable or
+comma-separated, default `origin`): every `KID` of the origin's `-edge-grant-key` flags and its
+`-edge-grant-kid`. Keep that list in step with the origin's rotation, adding a kid when the origin
+takes it, since an edge looks keys up by kid. The edge-grant flags and `-exchange-rate` need
+`-access`. A catalog named `r` or `ns` mints none, since its prefixes would overlap the core's (the
+service still runs; naming a key or kid for it is an error).
 
 A `GET` or `HEAD` without `Authorization` that carries one of these cookies, covering its path
 and passing the six checks an edge makes (see
@@ -1983,7 +2003,12 @@ is conservative: a cookie counts as issued at its `exp` less 15 minutes, so for 
 a namespace becomes trusted (or a new database starts) only cookies lasting the full 15 minutes
 read an `at` including it. A namespace that was public when a `g/all` cookie was issued and has
 turned private since is still read whole under it until it expires, as under a grant revoked
-since: the cookie's lifetime is the revocation latency (§C.5).
+since: the cookie's lifetime is the revocation latency (§C.5). A purged content namespace has no
+live items, so every reader reads it whole, sealed or not (a sealed one's documents are `410` once
+it is purged, so no grant could be checked against them): it never takes `g/all` away. Once the
+catalog itself is purged, an exchange is `410 purged` with `head` after the read check, which the
+core makes for a sealed catalog, as its listings are, and a read under a cookie minted before the
+purge is `410 purged` too.
 
 An edge can't make that check: it serves a listing it holds to every `g/all` cookie that passes
 its six checks. So a `g/all` listing at an `at` including a recently trusted namespace is
@@ -1991,10 +2016,20 @@ its six checks. So a `g/all` listing at an `at` including a recently trusted nam
 trusted may be live: with a random key, while one the service issued is; with a key file, for 15
 minutes after. Either way a minute more is allowed for edges' clocks.
 
+Untrusting works the other way round: a `g/all` cookie issued after the catalog stops trusting a
+namespace isn't checked against it, but an edge would serve it the `g/all` listings it holds that
+show that namespace's items. So when the trust list loses a namespace the service purges
+`ns:{ns}` through `-purge-url`, the tag of every listing whose checkpoint covers it, and refuses
+such a cookie at those `at`s itself. Should a purge be lost, or race an edge filling its cache, a
+`g/all` listing's edge lifetime (`CDN-Cache-Control`) is no longer than a `g/all` cookie lives, 15
+minutes, and a minute for edges' clocks: an untrusted namespace leaves the edge's `g/all` listings
+within the revocation latency of a cookie.
+
 ```sh
 head -c 32 /dev/urandom | base64 > catalog-edge-grant.key   # the edge holds it too, under catalog-cat
 patchlog tree -catalog cat -access -key SEED -kid catalog-01 \
-  -edge-grant-key catalog-edge-grant.key -edge-secret edge.secret -cors-credentials-origin https://app.example
+  -edge-grant-key catalog-edge-grant.key -origin-edge-grant-kid k1,k2 \
+  -edge-secret edge.secret -purge-url http://cdn/purge -cors-credentials-origin https://app.example
 ```
 
 Read-your-writes: after its own write, a client relists with `?min={ns}:{ns_id}` from the write's
@@ -2006,7 +2041,8 @@ always redirects (v0.50): an `at` URL whose listing already includes every `min`
 current `at`. A bare `{ns_id}` never counts as included in an older `at`. Every namespace a
 catalog's service follows is in its `at`. A tree service serving several catalogs keeps an `at`
 per catalog, so a `min` naming a namespace that only another of its catalogs follows, and that
-the reader may see (public, or its grant reads it), is waited for there and redirects to the
+the reader may see (public, or its grant reads it; the core's read check decides for a purged
+sealed namespace, whose documents are `410`), is waited for there and redirects to the
 current `at` in one hop (§A.5); a `min` naming a namespace no catalog of the service follows, or
 one the reader can't see, is `400`, with one message for both. `POST /grants` and
 `POST /read-grants` take `?min` the same way; a decision on an item also depends on its content

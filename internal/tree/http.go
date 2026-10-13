@@ -196,7 +196,8 @@ func Bearer(r *http.Request) string {
 //     subject set alone (§B.11.5): what its roles make visible, under
 //     /g/{gs}/ with gs over the subjects. A reader whose grants read the
 //     catalog and every trusted content namespace as a whole (or that are
-//     public) gets unfiltered listings instead, under /g/all/, shared by
+//     public, or purged: trustList) gets unfiltered listings instead,
+//     under /g/all/, shared by
 //     every such reader, and kept no longer than the earliest of those
 //     grants. Namespace-wide reads of only some of them don't count: the
 //     listing is then the subject set's.
@@ -210,12 +211,19 @@ func Bearer(r *http.Request) string {
 // service minted, covering its path, is read as that grant's subject set
 // (edgeViewer, §B.11.5).
 func (s *Service) viewer(ctx context.Context, r *http.Request) (*viewer, error) {
-	if s.opt.EdgeGrants != nil && r.Header.Get("Authorization") == "" {
-		if cl := s.opt.EdgeGrants.FromRequest(r, s.opt.Now()); cl != nil {
-			return s.edgeViewer(ctx, cl)
-		}
+	if cl := s.edgeClaims(r); cl != nil {
+		return s.edgeViewer(ctx, cl)
 	}
 	return s.grantViewer(ctx, Bearer(r))
+}
+
+// edgeClaims is the edge grant the service minted that a GET or HEAD
+// without Authorization carries, covering its path, if any.
+func (s *Service) edgeClaims(r *http.Request) *edge.Claims {
+	if s.opt.EdgeGrants == nil || r.Header.Get("Authorization") != "" {
+		return nil
+	}
+	return s.opt.EdgeGrants.FromRequest(r, s.opt.Now())
 }
 
 // grantViewer is the viewer of a reader presenting token ("" for none).
@@ -228,13 +236,7 @@ func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error
 		return nil, err
 	}
 	catPublic := cfg.Read == "public"
-	var trust []string
-	s.View(func(g *Graph, _ map[string]string) {
-		for ns := range g.Trust {
-			trust = append(trust, ns)
-		}
-	})
-	sort.Strings(trust)
+	trust, gone := s.trustList()
 	v := &viewer{contentAll: map[string]bool{}, contentRead: map[string]func(string) bool{}}
 	if token == "" {
 		if !catPublic {
@@ -242,6 +244,10 @@ func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error
 		}
 		v.anon, v.catAll = true, true
 		for _, ns := range trust {
+			if gone[ns] {
+				v.contentAll[ns] = true
+				continue
+			}
 			if c, err := s.checker.Config(ctx, s.actual(ns)); err == nil && c.Read == "public" {
 				v.contentAll[ns] = true
 			}
@@ -268,6 +274,10 @@ func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error
 		markers = append(markers, "catalog:scope:"+ScopeDigest(vg))
 	}
 	for _, ns := range trust {
+		if gone[ns] {
+			v.contentAll[ns] = true
+			continue
+		}
 		real := s.actual(ns)
 		c, err := s.checker.Config(ctx, real)
 		if err != nil {
@@ -313,6 +323,9 @@ func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error
 		// Filtered by the subject set alone (§B.11.5).
 		v.catAll, v.catRead = catPublic, nil
 		for ns := range v.contentAll {
+			if gone[ns] {
+				continue
+			}
 			if c, err := s.checker.Config(ctx, s.actual(ns)); err != nil || c.Read != "public" {
 				delete(v.contentAll, ns)
 				v.wideGrant[ns] = true
@@ -331,6 +344,26 @@ func (s *Service) grantViewer(ctx context.Context, token string) (*viewer, error
 	subjects := grantcheck.SubjectSet(vg, false)
 	v.gs = grantcheck.SubjectSetID(append(subjects, markers...))
 	return v, nil
+}
+
+// trustList is every content namespace the catalog trusts, sorted, and
+// gone, those of them the service holds as purged. A purged namespace has
+// no live items, so every reader reads it whole, as if it were public,
+// sealed or not: a sealed one's documents are 410 once purged (§8.5), and
+// no grant can be checked against them, which would otherwise end
+// unfiltered listings and g/all edge grants for good (§B.11.5).
+func (s *Service) trustList() (trust []string, gone map[string]bool) {
+	gone = map[string]bool{}
+	s.View(func(g *Graph, _ map[string]string) {
+		for ns := range g.Trust {
+			trust = append(trust, ns)
+			if s.purged[ns] {
+				gone[ns] = true
+			}
+		}
+	})
+	sort.Strings(trust)
+	return trust, gone
 }
 
 // grantExp is the earlier of exp (zero: none) and the earliest expiry of
@@ -524,11 +557,20 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	v, err := s.viewer(ctx, r)
 	if client.IsPurged(err) {
 		// A purged sealed catalog's document is 410 too (§8.5): the core
-		// makes the read check before answering it, as below.
+		// makes the read check before answering it, as below. An edge
+		// grant that passed the service's checks stands for a subject set
+		// that could read when it was minted, as the grant it was
+		// exchanged for: the core would take the read as anonymous.
 		var head string
-		if head, err = s.checker.PurgedRead(ctx, s.actual(cat), Bearer(r)); err == nil {
-			w.Header().Set("Cache-Control", "no-store")
-			WriteJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "catalog purged", "head": head})
+		if s.edgeClaims(r) != nil {
+			if head = s.purgedHead(err); head != "" {
+				err = nil
+			}
+		} else {
+			head, err = s.checker.PurgedRead(ctx, s.actual(cat), Bearer(r))
+		}
+		if err == nil {
+			writePurged(w, head)
 			return
 		}
 	}
@@ -557,8 +599,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	// check: 410 purged with head, its purge-ns entry (§8.5, §12), the
 	// log's last, where the checkpoint stopped.
 	if head, purged, _ := s.state(); purged {
-		w.Header().Set("Cache-Control", "no-store")
-		WriteJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "catalog purged", "head": head})
+		writePurged(w, head)
 		return
 	}
 	setPtr := func() {
@@ -681,6 +722,27 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	default:
 		s.writeListing(w, r, v, at, l.st)
 	}
+}
+
+// writePurged writes the 410 of a purged catalog, with head its purge-ns
+// entry's ns_id (§8.5, §12).
+func writePurged(w http.ResponseWriter, head string) {
+	w.Header().Set("Cache-Control", "no-store")
+	WriteJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "catalog purged", "head": head})
+}
+
+// purgedHead is the head of the catalog's purge, its purge-ns entry's
+// ns_id (§8.5): the service's checkpoint once it holds the catalog as
+// purged, else the head of err, the 410 purged of the catalog's document
+// ("" if it has none).
+func (s *Service) purgedHead(err error) string {
+	if head, purged, _ := s.state(); purged {
+		return head
+	}
+	if ae, ok := client.AsAPIError(err); ok {
+		return ae.Head()
+	}
+	return ""
 }
 
 // computed is a listing computed at an at, or why there is none (status,
@@ -889,6 +951,9 @@ func (s *Service) setListingHeaders(w http.ResponseWriter, r *http.Request, v *v
 		secs := max(int(v.exp.Sub(s.opt.Now())/time.Second), 0)
 		w.Header().Set("Cache-Control", "private, max-age="+strconv.Itoa(secs))
 		s.opt.Edge.Private(w.Header(), r, "max-age="+strconv.Itoa(secs))
+	case v.gs == AllSubjects && s.opt.EdgeGrants != nil:
+		w.Header().Set("Cache-Control", ccPrivateList)
+		s.opt.Edge.Private(w.Header(), r, "max-age="+strconv.Itoa(int(s.cdnAll()/time.Second)))
 	default:
 		w.Header().Set("Cache-Control", ccPrivateList)
 		s.opt.Edge.Private(w.Header(), r, cdnListing)
@@ -898,6 +963,17 @@ func (s *Service) setListingHeaders(w http.ResponseWriter, r *http.Request, v *v
 	}
 	w.Header().Set("Cache-Tag", tags)
 	w.Header().Set("X-Namespace-Revision", at)
+}
+
+// cdnAll is the longest an edge keeps a g/all listing: as long as a g/all
+// cookie lives, and edgeClockSkew. An edge serves the g/all listings it
+// holds to every g/all cookie, including one issued after the catalog
+// stopped trusting a namespace a listing shows, which the service purges
+// (ns:{ns}, Apply); should that purge be lost, or race a fill, the
+// listing outlives the change by no more than a cookie issued before it
+// (§B.11.5, §C.5: the cookie's lifetime is the revocation latency).
+func (s *Service) cdnAll() time.Duration {
+	return s.opt.EdgeGrants.MaxTTL() + edgeClockSkew
 }
 
 // writeListing writes a stored sealed listing: the JWE (application/jose),
@@ -1088,10 +1164,20 @@ func (s *Service) sibling(ns string) *Service {
 }
 
 // sees reports whether the bearer of token ("" for none) may see ns:
-// it is public, or the grant reads it, in whole or in part. A namespace
-// document that can't be read is an error.
+// it is public, or the grant reads it, in whole or in part. A purged sealed
+// namespace's document is 410 (§8.5): the core makes the read check
+// instead (PurgedRead). Any other namespace document that can't be read is
+// an error.
 func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
 	cfg, err := s.checker.Config(ctx, s.actual(ns))
+	if client.IsPurged(err) {
+		_, err = s.checker.PurgedRead(ctx, s.actual(ns), token)
+		var ae *grant.AuthError
+		if errors.As(err, &ae) {
+			return false, nil
+		}
+		return err == nil, err
+	}
 	if err != nil {
 		return false, err
 	}
