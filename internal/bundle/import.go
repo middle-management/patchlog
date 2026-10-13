@@ -223,6 +223,11 @@ type UndeclaredRef struct {
 	// Rev is the source revision of a full-history document whose step
 	// writes it.
 	Rev string `json:"rev,omitempty"`
+	// RewrittenFrom is the source revision from which a renamed import
+	// rewrites it after all, by a replace op of its own, since that
+	// revision's schema declares its position; "" if it never does. The
+	// revisions before it keep it as it is.
+	RewrittenFrom string `json:"rewrittenFrom,omitempty"`
 }
 
 // BatchReport is one batch, dry-run or submitted.
@@ -455,8 +460,11 @@ type importer struct {
 
 	// A renamed import (rename.go): the mappings that rename, source to
 	// target namespace, and the full-history documents it may rewrite.
+	// blind are the documents it can't read for want of a schema, a
+	// problem check reports first if the schema is a missing external.
 	renames   map[string]string
 	potential map[string]bool
+	blind     []string
 
 	local bool      // the bundle's origin is the target's own
 	start time.Time // when the import began (Timings)
@@ -590,6 +598,9 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 	}
 	if err := im.check(ctx); err != nil {
 		return im.rep, err
+	}
+	if len(im.blind) > 0 {
+		return im.rep, &CheckError{Problems: im.blind}
 	}
 	if err := im.checkNonces(ctx); err != nil {
 		return im.rep, err

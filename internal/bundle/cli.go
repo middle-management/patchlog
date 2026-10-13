@@ -247,7 +247,8 @@ func cliExport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 // renames it unless dst is a branch of it (ImportOptions.NSMap, §G.4.4); a
 // single plain name that isn't in the bundle maps the bundle's one
 // document namespace (a namespace no $schema or $ref names) to it, e.g.
-// to import into a branch first (§G.4.4).
+// to import into a branch first. That is a src=dst mapping too: it
+// renames unless the name is a branch of that namespace (§G.4.4).
 func namespaceMap(h *Header, schemaNamespaces func() (map[string]bool, error), spec string) (map[string]string, error) {
 	m := map[string]string{}
 	var schemaNS map[string]bool
@@ -363,7 +364,8 @@ func cliImport(ctx context.Context, args []string, stdout, stderr io.Writer) err
 	api := fs.String("api", "http://localhost:8080", "target deployment base URL")
 	nsSpec := fs.String("ns", "", "target namespaces: name, or src=dst to map a source namespace (comma-separated). src=dst renames, to clone a set of "+
 		"namespaces together: references to src ($schema, $ref, x-ref) are rewritten where they are declared in every document, and documents that change "+
-		"get new ids; undeclared ones are listed, not rewritten. Onto a branch of src it keeps references and ids. Catalog placement names aren't "+
+		"get new ids; undeclared ones are listed, not rewritten. Onto a branch of src it keeps references and ids. A single plain name that isn't in "+
+		"the bundle maps its one document namespace to it, so it renames too, unless it is a branch of that namespace. Catalog placement names aren't "+
 		"renamed, and namespace configuration isn't in the bundle: create renamed targets with theirs first (§G.4.4, §G.7)")
 	only := fs.String("only", "", "import only these source namespaces of the bundle (comma-separated): what their documents reference in the others "+
 		"must be in the target already, as the bundle has it, which is checked first (§G.4.1 external)")
@@ -496,6 +498,9 @@ func printReport(w io.Writer, r *Report) {
 	}
 	for _, u := range r.Undeclared {
 		switch {
+		case u.Renamed && u.RewrittenFrom != "":
+			fmt.Fprintf(w, "  undeclared reference in %s at %s, written by %s: %s (renamed, not rewritten before %s, which declares it)\n",
+				u.Doc, u.Pointer, u.Rev, u.Value, u.RewrittenFrom)
 		case u.Renamed && u.Rev != "":
 			fmt.Fprintf(w, "  undeclared reference in %s at %s, written by %s: %s (renamed, not rewritten)\n", u.Doc, u.Pointer, u.Rev, u.Value)
 		case u.Renamed:

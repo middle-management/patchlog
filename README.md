@@ -1818,13 +1818,18 @@ patchlog import -i all.jsonl -atomic -ns demo-schemas=demo2-schemas,demo=demo2  
   written, and a batch goes once those of the revisions it pins have committed, checking the
   ids it produced, so dependents are written with the ids their dependencies returned. A
   re-run of the same bundle computes the same ids and writes nothing; where nonces make them
-  differ, it finds what the earlier run wrote from its batches' `source.ids`, and goes on from
-  where a run that stopped part-way left off. Strings of the reference form where nothing
-  declares a reference can't be found: the dry run and the report list them, and they stay.
-  Refused before anything is written: an incremental document (`requires`) that would change;
-  a pin into a renamed namespace (or of a document that changes) whose revision the import
-  doesn't write (an `external`, a document `-only` leaves out, a snapshot's); and a schema
-  whose `$id` names its own revision path. Catalog placement names (`<ns>.<name>`) aren't
+  differ, it finds what the earlier run wrote from its batches' `source.ids`, in the clone's
+  chain even if the clone was edited since, and goes on from there, also where a run that
+  stopped part-way left off. Strings of the reference form where nothing declares a reference
+  can't be found: the dry run and the report list them, and they stay (`rewrittenFrom` names
+  the revision whose schema later declares the position, from which the import rewrites it).
+  Refused before anything is written: an incremental document (`requires`) that would change,
+  read from its base in the target (one that only holds undeclared references keeps its ids
+  and imports as without renaming); a pin whose new id the import can't know (an `external`
+  pinned into a renamed namespace, a schema's path included, a document `-only` leaves out
+  that may change, a snapshot's revision); and a schema whose `$id` names its own revision
+  path. A single plain `-ns NAME` that isn't in the bundle is a mapping too, and renames
+  unless `NAME` is a branch of the bundle's namespace. Catalog placement names (`<ns>.<name>`) aren't
   renamed, and namespace configuration isn't in the bundle (§G.7): create the renamed targets
   with their roles, rules and keys first. A mapping onto a branch whose base chain reaches the
   source namespace (importing into a branch first) renames nothing: references and ids stay.

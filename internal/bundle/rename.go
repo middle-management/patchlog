@@ -2,7 +2,10 @@ package bundle
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -46,13 +49,15 @@ import (
 // configuration isn't in the bundle (§G.7).
 //
 // Refused before anything is written (CheckError): an incremental
-// document (requires) that may change, whose base the target holds under
-// ids this import doesn't know (one that doesn't change keeps its ids, and
-// requires works as without renaming, as for a branch bundle onto its
-// base); a pin into a renamed namespace, or of a document that changes,
-// whose revision the import doesn't write (external, left out by -only,
-// or a snapshot's), whose new id isn't known; and a schema whose $id
-// names its own revision path, which can't be rewritten with it (§6.1).
+// document (requires) that changes, read from the target's revision of
+// requires, or that may change and whose base the target doesn't hold
+// under the source id (one that doesn't change keeps its ids, and requires
+// works as without renaming, as for a branch bundle onto its base); a pin
+// into a renamed namespace, or of a document that changes, whose revision
+// the import doesn't write (external, left out by -only, or a
+// snapshot's), whose new id isn't known, a schema's path included; and a
+// schema whose $id names its own revision path, which can't be rewritten
+// with it (§6.1).
 
 // rewritten is a full-history document as a renamed import writes it:
 // per line of the bundle, the rewritten step and the id it produces.
@@ -346,9 +351,9 @@ func (im *importer) renamedRef(s string) (out string, wait bool, problem string)
 
 // rename computes how a renamed import writes the full-history documents
 // it brings (d.rw), and checks what it can't rewrite. Nothing is read
-// from the target but schemas and, in a sealed target or one that
-// requires nonces, what an earlier run of the same import wrote there
-// (resume).
+// from the target but schemas, an incremental document's base and, in a
+// sealed target or one that requires nonces, what an earlier run of the
+// same import wrote there (resume).
 //
 // A first pass replays each document that may change (mayChange) and
 // finds, per step, the references that may need rewriting where they are
@@ -394,14 +399,41 @@ func (im *importer) rename(ctx context.Context) error {
 		if d.info.History != Full || !im.potential[k] {
 			continue
 		}
+		var base any
+		baseLive := false
 		if d.requires != "" {
-			// Its lines go on from a revision the target holds under ids
-			// this import doesn't know, if an earlier one rewrote it.
-			problems = append(problems, fmt.Sprintf("%s is incremental (requires %s), and a renamed import can't rewrite it: "+
-				"import a whole bundle of it (exported without requires) under the new names", k, d.requires))
+			// Its lines go on from the target's revision of the source id,
+			// which only an import that kept its ids wrote there.
+			var err error
+			base, baseLive, err = im.targetState(ctx, d.tns, d.name, d.requires)
+			if client.IsNotFound(err) || client.IsGone(err) || client.IsPruned(err) {
+				problems = append(problems, fmt.Sprintf("%s is incremental (requires %s), which %s doesn't hold under that id, and a renamed import may rewrite it: "+
+					"import a whole bundle of it (exported without requires) under the new names", k, d.requires, d.rep.Target))
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("import: %s: requires %s: %w", k, d.requires, err)
+			}
+		}
+		steps, id, und, probs, err := im.scanRenames(d, base, baseLive, loader)
+		var ue *schema.UnavailableError
+		if errors.As(err, &ue) {
+			// A schema neither the bundle nor the target holds: one whose
+			// new id isn't known, if renaming would rewrite its path, or
+			// else a missing external, which check reports.
+			if r, ok := annot.ParseRefString(ue.Ref); ok && r.Rev != "" && im.mayRename(ue.Ref) {
+				_, renamed := im.renames[r.NS]
+				why := im.pinProblem(r, renamed)
+				if why == "" {
+					why = "which neither the bundle nor the target holds"
+				}
+				problems = append(problems, fmt.Sprintf("%s: its schema %s can't be rewritten: %s", k, ue.Ref, why))
+			} else {
+				im.blind = append(im.blind, fmt.Sprintf("%s: its schema %s is neither in the bundle nor in the target, so the references a renamed import "+
+					"would rewrite in it can't be found", k, ue.Ref))
+			}
 			continue
 		}
-		steps, id, und, probs, err := im.scanRenames(d, loader)
 		if err != nil {
 			return err
 		}
@@ -447,6 +479,12 @@ func (im *importer) rename(ctx context.Context) error {
 		}
 	}
 	for _, d := range docs {
+		if d.requires != "" && changed[d.key] {
+			// Its rewritten lines would go on from the target's revision of
+			// the source id, which a whole renamed import rewrites (§G.4.4).
+			problems = append(problems, fmt.Sprintf("%s is incremental (requires %s), and a renamed import would rewrite it: "+
+				"import a whole bundle of it (exported without requires) under the new names", d.key, d.requires))
+		}
 		if id := scans[d.key].id; id != "" {
 			_, renamed := im.renames[d.ns]
 			if renamed || changed[d.key] {
@@ -458,11 +496,13 @@ func (im *importer) rename(ctx context.Context) error {
 	if len(problems) > 0 {
 		return &CheckError{Problems: problems}
 	}
+	var kept []UndeclaredRef
 	for _, u := range undeclared {
 		if r, _ := annot.ParseRefString(u.Value); im.renames[r.NS] != "" || (r.Rev != "" && changed[Key(r.NS, r.Name)]) {
-			im.rep.Undeclared = append(im.rep.Undeclared, u)
+			kept = append(kept, u)
 		}
 	}
+	defer func() { im.rep.Undeclared = append(im.rep.Undeclared, kept...) }()
 
 	// The second pass.
 	var states []*renameState
@@ -506,6 +546,18 @@ func (im *importer) rename(ctx context.Context) error {
 		}
 		st.d.rw.doc, st.d.rw.live = st.dst, st.dstLive
 	}
+	// An undeclared reference that a later step rewrites after all, where
+	// its schema comes to declare the position.
+	for i, u := range kept {
+		d := im.docs[u.Doc]
+		at := d.idx[u.Rev]
+		for _, rr := range d.rep.Rewritten {
+			if j, ok := d.idx[rr.Rev]; ok && j > at && rr.Pointer == u.Pointer && rr.From == u.Value {
+				kept[i].RewrittenFrom = rr.Rev
+				break
+			}
+		}
+	}
 	return nil
 }
 
@@ -523,11 +575,13 @@ func sortedSet(m map[string]bool) []string {
 // step, the references that may need rewriting (stepRefs); a schema's
 // $id, if it has one; the strings that may need rewriting where they
 // aren't declared; and the pins that can't be rewritten (pinProblem).
-func (im *importer) scanRenames(d *bdoc, load schema.Loader) (steps []*stepRefs, id string, und []UndeclaredRef, problems []string, err error) {
+// An incremental document's lines go on from base, the target's document
+// at requires (live: not a tombstone's last live one). A schema it can't
+// load is a *schema.UnavailableError.
+func (im *importer) scanRenames(d *bdoc, base any, baseLive bool, load schema.Loader) (steps []*stepRefs, id string, und []UndeclaredRef, problems []string, err error) {
 	steps = make([]*stepRefs, len(d.lines))
 	seen := map[string]bool{} // undeclared pointer and value, and pins with problems
-	var doc any
-	live := false
+	doc, live := base, baseLive
 	for i, l := range d.lines {
 		if l.Kind != "rev" {
 			live = false
@@ -545,6 +599,9 @@ func (im *importer) scanRenames(d *bdoc, load schema.Loader) (steps []*stepRefs,
 		}
 		decl, sid, err := declaredRefs(after, load)
 		if err != nil {
+			if ue := (*schema.UnavailableError)(nil); errors.As(err, &ue) {
+				return nil, "", nil, nil, ue
+			}
 			return nil, "", nil, nil, fmt.Errorf("import: %s: x-ref walk at %s: %w", d.key, l.ID, err)
 		}
 		if sid != "" && id == "" {
@@ -736,14 +793,23 @@ func (im *importer) renameStep(st *renameState) (wait bool, err error) {
 			return false, err
 		}
 		srcOps, _ := ps.([]any)
-		ops, _ := jsonv.Clone(srcOps).([]any)
+		// The rewritten patch set shares what it doesn't change with the
+		// bundle's line, which the import holds anyway: only the ops it
+		// changes, and the containers on the way to what they change, are
+		// copies.
+		ops := slices.Clone(srcOps)
+		own := map[int]bool{}
 		if sr != nil {
 			for _, lf := range sr.leaves {
 				if !lf.declared || to[lf.s] == lf.s {
 					continue
 				}
 				m := ops[lf.op].(map[string]any)
-				if m["value"], err = setAt(m["value"], lf.at, to[lf.s]); err != nil {
+				if !own[lf.op] {
+					m = maps.Clone(m)
+					ops[lf.op], own[lf.op] = m, true
+				}
+				if m["value"], err = withAt(m["value"], lf.at, to[lf.s]); err != nil {
 					return false, err
 				}
 				refs = append(refs, RewrittenRef{Pointer: lf.to, From: lf.s, To: to[lf.s], Rev: l.ID})
@@ -816,6 +882,49 @@ func (im *importer) renameStep(st *renameState) (wait bool, err error) {
 	return false, nil
 }
 
+// withAt is v with the value at ptr replaced by x, v itself unchanged: the
+// containers on the way are copied, the rest shared.
+func withAt(v any, ptr string, x any) (any, error) {
+	p, err := pointer.Parse(ptr)
+	if err != nil {
+		return nil, err
+	}
+	var with func(v any, p pointer.Pointer) (any, error)
+	with = func(v any, p pointer.Pointer) (any, error) {
+		if len(p) == 0 {
+			return x, nil
+		}
+		switch c := v.(type) {
+		case map[string]any:
+			e, ok := c[p[0]]
+			if !ok {
+				break
+			}
+			n, err := with(e, p[1:])
+			if err != nil {
+				return nil, err
+			}
+			out := maps.Clone(c)
+			out[p[0]] = n
+			return out, nil
+		case []any:
+			i, ok := pointer.ArrayIndex(p[0])
+			if !ok || i >= len(c) {
+				break
+			}
+			n, err := with(c[i], p[1:])
+			if err != nil {
+				return nil, err
+			}
+			out := slices.Clone(c)
+			out[i] = n
+			return out, nil
+		}
+		return nil, fmt.Errorf("pointer %s: no such location", ptr)
+	}
+	return with(v, p)
+}
+
 // getAt is the value at a JSON Pointer in doc.
 func getAt(doc any, ptr string) (any, bool) {
 	p, err := pointer.Parse(ptr)
@@ -828,7 +937,8 @@ func getAt(doc any, ptr string) (any, bool) {
 // fixTests makes the test ops of a rewritten patch set (ops, the source's
 // srcOps) compare with the rewritten document: a test that holds in the
 // source tests for what the rewritten document holds there, applying the
-// ops one at a time to both.
+// ops one at a time to both. A test op it changes is replaced by a copy:
+// ops shares the others with srcOps.
 func fixTests(src any, srcExists bool, dst any, dstExists bool, srcOps, ops []any) error {
 	has := false
 	for _, o := range ops {
@@ -847,8 +957,10 @@ func fixTests(src any, srcExists bool, dst any, dstExists bool, srcOps, ops []an
 			path, _ := m["path"].(string)
 			sv, ok1 := getAt(s, path)
 			dv, ok2 := getAt(d, path)
-			if sm, _ := srcOps[j].(map[string]any); ok1 && ok2 && jsonv.Equal(sv, sm["value"]) {
-				m["value"] = jsonv.Clone(dv)
+			if sm, _ := srcOps[j].(map[string]any); ok1 && ok2 && jsonv.Equal(sv, sm["value"]) && !jsonv.Equal(dv, m["value"]) {
+				c := maps.Clone(m)
+				c["value"] = jsonv.Clone(dv)
+				ops[j] = c
 			}
 			continue
 		}
@@ -877,12 +989,14 @@ func applyOne(doc any, exists bool, op any) (any, error) {
 // resume takes the start of a rewritten document from the target, where an
 // earlier run of the same renamed import wrote it: in a sealed target, or
 // one that requires nonces, rewritten steps carry fresh nonces, so their
-// ids differ from one run to the next. The target's head must be the
-// revision that the latest import batch from the bundle's namespace
-// recorded for a source id of the bundle (source.ids, mergePoints), and
-// its chain from genesis that long: those revisions stand for the
-// bundle's lines up to that source id, the documents that pin them take
-// their ids, and the next steps go on from them.
+// ids differ from one run to the next. The revision that the latest import
+// batch from the bundle's namespace recorded for a source id of the bundle
+// (source.ids, mergePoints) must be in the target's chain, its head or
+// before it if the clone was edited since, and its chain from genesis that
+// long: those revisions stand for the bundle's lines up to that source id,
+// the documents that pin them take their ids, and the next steps go on
+// from them. The document is then classified against the target as any
+// other (planFull), with that revision as the common ancestor.
 func (im *importer) resume(ctx context.Context, st *renameState) error {
 	d := st.d
 	th, err := im.head(ctx, d.tns, d.name)
@@ -897,14 +1011,17 @@ func (im *importer) resume(ctx context.Context, st *renameState) error {
 		return err
 	}
 	pt, ok := pts[d.key]
-	if !ok || pt.baseT != th.ID {
+	if !ok {
 		return nil
 	}
 	k, in := d.idx[pt.baseU]
 	if !in {
 		return nil
 	}
-	es, err := im.c.Log(ctx, d.tns, d.name, th.ID, "")
+	if ok, err := im.inChain(ctx, d.tns, d.name, th.ID, pt.baseT); err != nil || !ok {
+		return err
+	}
+	es, err := im.c.Log(ctx, d.tns, d.name, pt.baseT, "")
 	if client.IsPruned(err) || client.IsNotFound(err) {
 		return nil
 	}

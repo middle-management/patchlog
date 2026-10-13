@@ -16,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // cloneSource is a source deployment with a set of namespaces to clone
@@ -314,6 +315,80 @@ func TestRenamedImportNonces(t *testing.T) {
 	if len(again.Batches) != 0 || !slices.Equal(d.chain("c-data", "a"), a) {
 		t.Fatalf("a re-run writes %d batches", len(again.Batches))
 	}
+
+	// The clone edited since: a newer bundle still finds what the first
+	// run wrote, in the clone's chain under its head, as the common
+	// ancestor, and the documents that pin it stay present.
+	local := must(d.c.Append(ctx, "c-data", "a", a[2], ops(op("add", "/extra", "local"), op("add", "/$nonce", seal.NewNonce())))).ID
+	s.d.append("s-data", "a", op("replace", "/title", "A4"))
+	newer, _ := exportFrom(t, s.d, bundle.ExportOptions{Select: []string{"s-schemas", "s-data", "s-refs"}})
+	rep = importB(t, d, newer, bundle.ImportOptions{NSMap: cloneMap, Resolutions: map[string]bundle.Resolution{"s-data/a": bundle.ResolveReplay}})
+	if r := rep.Doc("s-data/a"); r.Class != "replay" || r.Ancestor != a[2] || r.TargetHead != local {
+		t.Fatalf("s-data/a after a local edit %+v", r)
+	}
+	for _, k := range []string{"s-data/b", "s-refs/r"} {
+		if r := rep.Doc(k); r.Class != "present" {
+			t.Errorf("%s %s %+v, want present", k, r.Class, r.Conflicts)
+		}
+	}
+	if got := d.doc("c-data", "a"); got["title"] != "A4" || got["extra"] != "local" {
+		t.Fatalf("c-data/a %v", got)
+	}
+}
+
+// §G.4.4 Renaming, an incremental bundle (requires): a document that would
+// change is refused (decision (c)); one whose only mention of a renamed
+// namespace is undeclared changes nothing, keeps its ids, and imports from
+// its base in the target, the undeclared reference listed.
+func TestRenamedImportIncremental(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name, path string
+		refused    bool
+	}{
+		{"declared", "/note", true},
+		{"undeclared", "/other", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			src := newDeployment(t, stagingOrigin)
+			src.ns("k", nil)
+			src.ns("x", nil)
+			refs := src.create("k", "refs", map[string]any{"$schema": schema.Dialect2020, "type": "object",
+				"properties": map[string]any{"note": map[string]any{"type": "string", "x-ref": map[string]any{}}}})
+			src.create("x", "other", map[string]any{})
+			g := src.create("x", "d", map[string]any{"$schema": rev("k", "refs", refs), "t": "a"})
+			// The base, imported under the new name: nothing in it names x,
+			// so it keeps its ids.
+			whole, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"k", "x"}})
+			dst := newDeployment(t, cmsOrigin)
+			importB(t, dst, whole, bundle.ImportOptions{NSMap: map[string]string{"x": "y"}})
+			if dst.head("y", "d").ID != g {
+				t.Fatalf("y/d %s, want the source's %s", dst.head("y", "d").ID, g)
+			}
+			r2 := src.append("x", "d", op("add", tc.path, "/r/x/other"))
+			inc, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"x/d"}, Requires: map[string]string{"x/d": g}})
+			opt := bundle.ImportOptions{NSMap: map[string]string{"x": "y"}, Mode: bundle.Atomic}
+			if tc.refused {
+				_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(inc), opt)
+				var ce *bundle.CheckError
+				if !errors.As(err, &ce) || !strings.Contains(err.Error(), "x/d is incremental (requires "+g+"), and a renamed import would rewrite it") {
+					t.Fatalf("import: %v", err)
+				}
+				if dst.head("y", "d").ID != g {
+					t.Fatal("written")
+				}
+				return
+			}
+			rep := importB(t, dst, inc, opt)
+			if r := rep.Doc("x/d"); r.Renamed || r.Class != "fast-forward" || dst.head("y", "d").ID != r2 {
+				t.Fatalf("x/d %+v", r)
+			}
+			if len(rep.Undeclared) != 1 || rep.Undeclared[0].Pointer != "/other" || !rep.Undeclared[0].Renamed || rep.Undeclared[0].Rev != r2 {
+				t.Fatalf("undeclared %+v", rep.Undeclared)
+			}
+		})
+	}
 }
 
 // §G.4.4 Renaming: what a renamed import can't rewrite is refused before
@@ -343,6 +418,11 @@ func TestRenamedImportRefusals(t *testing.T) {
 	_, err = w.Close()
 	noErr(t, err)
 
+	// (d) A schema in a renamed namespace that the bundle doesn't carry: on
+	// a deployment where it was cloned earlier, with new ids, its path's
+	// new id isn't known.
+	extSchemas, _ := exportFrom(t, d, bundle.ExportOptions{Select: []string{"s-data"}, External: []string{"s-schemas"}})
+
 	for _, tc := range []struct {
 		name string
 		b    []byte
@@ -350,15 +430,23 @@ func TestRenamedImportRefusals(t *testing.T) {
 		want string
 	}{
 		{"incremental", inc, bundle.ImportOptions{NSMap: cloneMap}, "is incremental (requires " + s.a2},
+		{"external schema", extSchemas, bundle.ImportOptions{NSMap: cloneMap},
+			"its schema " + rev("s-schemas", "item", s.item) + " can't be rewritten: it pins revision " + s.item + " of s-schemas/item, which the bundle doesn't carry (external)"},
+		// Not renamed, the schema is a missing external, as without renaming.
+		{"missing external", extSchemas, bundle.ImportOptions{NSMap: map[string]string{"s-data": "c-data"}},
+			"external s-schemas/item/rev/" + s.item + ": revision " + s.item + " is not in the target"},
 		{"external pin", ext, bundle.ImportOptions{NSMap: cloneMap}, "pins revision " + s.a3 + " of s-data/a, which the bundle doesn't carry"},
 		{"left out", s.full, bundle.ImportOptions{NSMap: cloneMap, Only: []string{"s-refs"}}, "which the import leaves out (-only)"},
 		{"schema $id", crafted.Bytes(), bundle.ImportOptions{NSMap: cloneMap}, "whose $id names its own revision path"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dst := newDeployment(t, cmsOrigin)
-			if tc.name == "incremental" {
+			switch tc.name {
+			case "incremental":
 				// The base is there, under the source's ids.
 				importB(t, dst, s.full, bundle.ImportOptions{})
+			case "external schema":
+				importB(t, dst, s.schema, bundle.ImportOptions{NSMap: cloneMap})
 			}
 			tc.opt.Mode, tc.opt.CreateNamespaces = bundle.Atomic, true
 			_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(tc.b), tc.opt)
@@ -367,6 +455,9 @@ func TestRenamedImportRefusals(t *testing.T) {
 				t.Fatalf("import: %v, want a CheckError containing %q", err, tc.want)
 			}
 			for _, ns := range []string{"c-schemas", "c-data", "c-refs"} {
+				if tc.name == "external schema" && ns == "c-schemas" {
+					continue
+				}
 				if _, err := dst.c.NSHead(ctx, ns); !client.IsNotFound(err) {
 					t.Fatalf("%s written: %v", ns, err)
 				}
@@ -492,7 +583,7 @@ func TestRenamedImportDeclaredLater(t *testing.T) {
 	b, _ := exportFrom(t, src, bundle.ExportOptions{Select: []string{"x"}})
 	dst := newDeployment(t, cmsOrigin)
 	rep := importB(t, dst, b, bundle.ImportOptions{NSMap: map[string]string{"x": "y"}})
-	if len(rep.Undeclared) != 1 || rep.Undeclared[0].Pointer != "/note" || !rep.Undeclared[0].Renamed {
+	if u := rep.Undeclared; len(u) != 1 || u[0].Pointer != "/note" || !u[0].Renamed || u[0].RewrittenFrom != r2 {
 		t.Fatalf("undeclared %+v", rep.Undeclared)
 	}
 	chain := dst.chain("y", "d")
