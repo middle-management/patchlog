@@ -1011,6 +1011,10 @@ func (s *Server) nsRevLog(w http.ResponseWriter, r *http.Request) {
 	}
 	lg, err := s.e.NamespaceLog(r.Context(), ns, id, r.URL.Query().Get("since"), s.e.Limits().LogPageSize, creds(r))
 	if err != nil {
+		// A purged sealed namespace's 410 is long, as any purge (§8.5, §9).
+		if s.writeErrShort(w, r, err) {
+			return
+		}
 		writeErr(w, err)
 		return
 	}

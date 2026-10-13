@@ -546,10 +546,15 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		content = cfg
 		if content == nil && (b.Snapshot || !s.hasContent(b.NS)) {
 			d, err := s.c.NSDoc(ctx, fb.NS, b.NewCheckpoint)
-			if err != nil {
+			switch {
+			case client.IsPurged(err):
+				// A sealed namespace purged since: its documents are 410
+				// (§8.5), and the follower delivers the purge next.
+			case err != nil:
 				return fmt.Errorf("tree: reading the document of %s at %s: %w", fb.NS, b.NewCheckpoint, err)
+			default:
+				content = d
 			}
-			content = d
 		}
 	}
 	// Item titles (§B.5): read from the heads of items in namespaces that
@@ -934,6 +939,11 @@ func (s *Service) ensureContent(ctx context.Context, ns string) error {
 		return nil
 	}
 	doc, err := s.c.NSDoc(ctx, s.actual(ns), cp)
+	if client.IsPurged(err) {
+		// A sealed namespace purged since: its follower learns of it
+		// from the same 410 (§8.5).
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("tree: reading the document of %s at %s: %w", s.actual(ns), cp, err)
 	}

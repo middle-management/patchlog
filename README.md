@@ -35,7 +35,7 @@ and serves immutable, CDN-cacheable revisions.
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
 | Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`) | §C.5, §9 | ✅ |
 | Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
-| Tombstone, restore, purge (with propagation), freeze, namespace purge | §8.1–§8.5 | ✅ |
+| Tombstone, restore, purge (with propagation), freeze, namespace purge (a sealed namespace's documents, log, long-polls and events then answer `410 purged` with `head`, which followers, services, the janitor and remote branches take as the purge) | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
 | Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only for reads a verifying edge vouches for, with `-edge-secret`) |
@@ -1534,10 +1534,11 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   served).
 - **Purges.** B follows A's log (`-remote-follow-interval`, or `Engine.SyncRemotes`) and on
   `purge`/`purge-ns` applies §8.3 locally to the names concerned: its own chains, its own
-  branches and cache tags. With `-remote-ignore-purges` they are recorded as notices only
-  (`Engine.RemoteNotices`). A purge on B also removes the shadows' copies. When A's base is a
-  branch, B follows only that branch's log: A's purges in its bases propagate to it as purge
-  entries there.
+  branches and cache tags. A sealed base's purge arrives instead as the `410 purged` of its log,
+  applied as its `purge-ns` entry at the `410`'s `head` (§8.5). With `-remote-ignore-purges`
+  they are recorded as notices only (`Engine.RemoteNotices`). A purge on B also removes the
+  shadows' copies. When A's base is a branch, B follows only that branch's log: A's purges in
+  its bases propagate to it as purge entries there.
 - **Registration.** With `-remote-register`, B registers after creating the branch and renews
   seven days before expiry.
 - **Origins.** Both deployments need canonical origins (`-origin`), in https. Plain http is
@@ -2202,7 +2203,12 @@ after authorisation and rate limits and before any other check: resource writes,
 with a config change after its items' authorisation), blob uploads and copies, purges, prunes,
 config writes, namespace purges, branching from it and remote registration. A remote branch of
 it on another deployment is `410 purged` too, also naming `origin` and `ns` (§G.3). `/ns/{ns}`
-and its log stay readable, and the log's `purge-ns` entry says what happened. The name stays
+and its log stay readable, and the log's `purge-ns` entry says what happened, except in a
+sealed namespace (v0.51): the purge destroys the epoch keys that seal its namespace documents
+and log, so `/ns/{ns}/rev/{id}`, `/ns/{ns}/rev/{id}/log`, long-polls, `/ns/{ns}/events` and a
+resource's events answer `410 purged` with `head` too, after the read check and at any id or
+`since`, rather than in the clear. `GET /ns/{ns}` still redirects, to the purge's revision,
+which is `410`, and its `head` is how a consumer learns of the purge. The name stays
 reserved: creating a namespace or branch under it is `412`, also a retry of the request that
 created a branch since purged.
 

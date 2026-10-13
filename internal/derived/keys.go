@@ -248,7 +248,8 @@ func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey
 // can, else why not; permanent means retrying won't help without a new
 // configuration (an e2e namespace and no recipient key). partial (an e2e
 // namespace whose documents can't be read, which a tree service may still
-// follow for heads) is reported when allowPartial and is not a skip.
+// follow for heads) is reported when allowPartial and is not a skip. A
+// purged namespace is consumed: its follower learns of the purge.
 func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason string, permanent bool) {
 	in, err := k.Info(ctx, ns)
 	switch {
@@ -266,7 +267,14 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 		}
 		reason, permanent = "e2e namespace and no keyring recipient key configured", true
 	case in.Protected():
-		if _, err := k.EpochKey(ctx, ns, in.Epoch); err != nil {
+		_, err := k.EpochKey(ctx, ns, in.Epoch)
+		if client.IsPurged(err) {
+			// Its keys are destroyed with its content (§8.5): the
+			// follower learns of the purge, and nothing is left to seal.
+			k.setReason(ns, "", false)
+			return "", false
+		}
+		if err != nil {
 			reason = "cannot obtain the epoch key to seal derived views: " + err.Error()
 		}
 	}

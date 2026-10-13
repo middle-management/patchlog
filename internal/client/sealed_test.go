@@ -152,6 +152,49 @@ func testSealedTransparent(t *testing.T) {
 	}
 }
 
+// Once a sealed namespace is purged, its documents, log, long-polls and
+// events are 410 purged, which IsPurged reports, with Head the purge-ns
+// entry (§8.5); its head pointer still reads. At rest only, they read in
+// the clear.
+func TestSealedPurged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("alice"), client.WithKeys(client.NewKeys(nil)))
+	heads := map[string]string{}
+	for ns, level := range map[string]string{"s": "sealed", "r": "at-rest"} {
+		must(c.CreateNamespace(ctx, ns, map[string]any{"read": "public", "encryption": map[string]any{"level": level}}))
+		must(c.Create(ctx, ns, "a", nonced(client.GenesisPatches(map[string]any{"n": 0}))))
+		must(c.PatchConfig(ctx, ns, must(c.NSHead(ctx, ns)).Config, ops(op("add", "/frozen", true))))
+		heads[ns] = must(c.PurgeNamespace(ctx, ns, must(c.NSHead(ctx, ns)).ID))
+	}
+	head := heads["s"]
+	if h := must(c.NSHead(ctx, "s")); h.ID != head {
+		t.Fatalf("head %s, want the purge %s", h.ID, head)
+	}
+	purged := func(what string, err error) {
+		t.Helper()
+		ae, _ := client.AsAPIError(err)
+		if !client.IsPurged(err) || !client.IsGone(err) || ae.Head() != head {
+			t.Errorf("%s: %v", what, err)
+		}
+	}
+	_, err := c.NSDoc(ctx, "s", head)
+	purged("document", err)
+	_, err = c.NSLog(ctx, "s", head, "")
+	purged("log", err)
+	_, err = c.LongPoll(ctx, "s", "", "")
+	purged("long-poll", err)
+	purged("events", c.NSEvents(ctx, "s", "", func(client.NSEntry) error { return nil }))
+
+	if d := must(c.NSDoc(ctx, "r", heads["r"])); d.Value["frozen"] != true {
+		t.Fatalf("at-rest document %s", d.Raw)
+	}
+	if lg := must(c.NSLog(ctx, "r", heads["r"], "")); lg[len(lg)-1].Kind != "purge-ns" {
+		t.Fatalf("at-rest log %+v", lg)
+	}
+}
+
 // Keys wrapped to the grant's enc are unwrapped with the recipient key, and
 // per-resource grants get only their resources' keys.
 func TestSealedWrappedAndPerResource(t *testing.T) {

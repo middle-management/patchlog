@@ -1499,13 +1499,25 @@ func (e *Engine) SyncRemotes(ctx context.Context) error {
 
 // followRemote applies the purges in a base's log after the checkpoint
 // (§G.3: on purge or purge-ns, §8.3 applies locally to the branch's own
-// chains for that name, its own branches and its cache tags).
+// chains for that name, its own branches and its cache tags). A sealed
+// base's purge arrives as the 410 purged of its log, whose head is the
+// purge-ns entry (§8.5).
 func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	c, _, err := e.remoteClient(b.origin)
 	if err != nil {
 		return err
 	}
 	entries, head, err := verify.Namespace(ctx, c, b.ns, b.checkpoint)
+	if h, ok := purgedAt(err); ok && h != "" {
+		// A sealed base's log is 410 once it is purged, with head its
+		// purge-ns entry, which stands in for the entries (§8.5, §10),
+		// unless the checkpoint is there already: every later sync gets
+		// the same 410.
+		if h == b.checkpoint {
+			return nil
+		}
+		entries, head, err = []client.NSEntry{{ID: h, Kind: "purge-ns"}}, h, nil
+	}
 	if err != nil {
 		return err
 	}

@@ -488,6 +488,12 @@ func (x *relCtx) branches(ctx context.Context) error {
 		b := &ReleaseBranch{Key: k, NS: br, Target: tg[k]}
 		x.rp.Branches = append(x.rp.Branches, b)
 		doc, cfgID, err := x.nsDoc(ctx, br)
+		if client.IsPurged(err) {
+			// A sealed branch's document, once it is purged (§8.5): the
+			// 410 is how the planner learns of the purge.
+			x.conflict(RCPurged, k, br, "", br+" is purged")
+			continue
+		}
 		if err != nil {
 			return fmt.Errorf("merge: branch %s: %w", br, err)
 		}
@@ -539,6 +545,11 @@ func (x *relCtx) branches(ctx context.Context) error {
 			return err
 		}
 		log, err := x.c.NSLog(ctx, br, h.ID, "")
+		if client.IsPurged(err) {
+			// Purged since its document was read (§8.5).
+			x.conflict(RCPurged, k, br, "", br+" is purged")
+			continue
+		}
 		if err != nil {
 			return err
 		}

@@ -352,6 +352,11 @@ function wrap(e) {
  * makes them weak (W/"…"), around the same id, which would otherwise end up in URLs and preconditions. */
 function etagID(v) { return v ? v.trim().replace(/^W\//, '').replace(/^"|"$/g, '') : ''; }
 
+/* purgedHead is the head a 410 purged names, the purge-ns entry's ns_id (§8.5), '' for any other answer. A purged
+ * sealed namespace's documents and log are 410 purged too, and GET /ns/{ns} redirects to one, so this is how the page
+ * learns of that purge. */
+function purgedHead(r) { return r && r.status === 410 && r.json && r.json.code === 'purged' && typeof r.json.head === 'string' ? r.json.head : ''; }
+
 /* ------------------------------------------------------------------ *
  * connection bar
  * ------------------------------------------------------------------ */
@@ -382,7 +387,7 @@ function renderNsSelect() {
 
 function resetNsState() {
   Object.assign(S, { nsHead: '', config: '', nsDoc: null, nsErr: null, nsLog: [], heads: [], headsNext: '', branches: [],
-    resState: null, hist: [], selRev: '', cfgDirty: false, ifDirty: false, nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null, nsLogErr: '' });
+    resState: null, hist: [], selRev: '', cfgDirty: false, ifDirty: false, nsLevel: '', nsRaw: '', nsSeal: null, nsLogSeal: null, nsLogErr: '', nsPurged: false });
 }
 
 async function selectNS(name, o = {}) {
@@ -418,6 +423,12 @@ async function refreshNS() {
     nsInfoCache.set(ns, { level: S.nsLevel, doc: S.nsDoc });
     syncSealBoxes();
     if (S.nsLevel === 'e2e') loadKeyring(); else if (KR.ns !== ns) { KR.ns = ns; KR.doc = null; renderKeyring(); }
+  } else if (purgedHead(r)) {
+    // A purged sealed namespace (§8.5): its documents, log and events are 410 purged, and the 410's head, its
+    // purge-ns entry, is all there is to show.
+    Object.assign(S, { nsHead: purgedHead(r), nsPurged: true, nsLevel: 'sealed', nsDoc: null, config: '', heads: [], branches: [] });
+    S.nsLog = [{ kind: 'purge-ns', id: S.nsHead }];
+    renderNsAll(); updateLiveUrls(); return;
   } else {
     S.nsErr = r; S.nsDoc = null; S.nsHead = ''; S.config = '';
     // Fall back to the log, which 302s to the range and reveals the head in its final URL.
@@ -468,7 +479,7 @@ function renderNsStatus() {
   const kv = h('dl', { class: 'kv' },
     h('dt', {}, 'ns_id (head)'), h('dd', {}, idEl(S.nsHead)),
     h('dt', {}, 'config id'), h('dd', {}, S.config ? idEl(S.config) : h('span', { class: 'muted' }, 'unknown')),
-    h('dt', {}, 'readable'), h('dd', {}, S.nsDoc ? 'document, log, heads' : 'log only (document not readable)'));
+    h('dt', {}, 'readable'), h('dd', {}, S.nsPurged ? 'nothing: purged, its documents and log are 410 (§8.5)' : S.nsDoc ? 'document, log, heads' : 'log only (document not readable)'));
   if (d.base) kv.append(h('dt', {}, 'base'), h('dd', {}, `${d.base.ns} @ `, idEl(d.base.at)));
   if (d.successor) kv.append(h('dt', {}, 'successor'), h('dd', {}, d.successor));
   if (S.nsLevel) {
@@ -482,6 +493,7 @@ function renderNsStatus() {
     h('div', { class: 'state-line' }, h('b', {}, S.ns),
       d.read ? h('span', { class: 'badge ' + (d.read === 'public' ? 'info' : '') }, 'read: ' + d.read) : null,
       d.frozen ? h('span', { class: 'badge warn' }, 'frozen') : null,
+      S.nsPurged ? h('span', { class: 'badge err' }, 'purged') : null,
       d.base ? h('span', { class: 'badge' }, 'branch') : null,
       S.nsLevel === 'sealed' || S.nsLevel === 'e2e' ? h('span', { class: 'badge tomb' }, S.nsLevel === 'e2e' ? 'E3 end-to-end' : 'E2 sealed') : null),
     kv,

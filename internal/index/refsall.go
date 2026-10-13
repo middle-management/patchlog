@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
@@ -180,6 +181,11 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, 
 			continue
 		}
 		a, err := ix.refsAccess(ctx, ns, r, g)
+		if client.IsPurged(err) {
+			// A sealed namespace purged before the index learnt of it:
+			// its document is 410 (§8.5), and it is left out as above.
+			continue
+		}
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
 			refuse(ae.Status)

@@ -472,6 +472,16 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	v, err := s.viewer(ctx, r)
+	if client.IsPurged(err) {
+		// A purged sealed catalog's document is 410 too (§8.5): the core
+		// makes the read check before answering it, as below.
+		var head string
+		if head, err = s.checker.PurgedRead(ctx, s.actual(cat), Bearer(r)); err == nil {
+			w.Header().Set("Cache-Control", "no-store")
+			WriteJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "catalog purged", "head": head})
+			return
+		}
+	}
 	if err != nil {
 		WriteAuthError(w, err, s.opt.Logf)
 		return

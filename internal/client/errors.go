@@ -146,6 +146,12 @@ func IsGone(err error) bool {
 // horizon. Horizon(err) names it.
 func IsPruned(err error) bool { return statusIs(err, 410, "pruned") }
 
+// IsPurged reports the 410 purged of a purged namespace's URLs and writes
+// (§8.5), which IsGone reports too. Head(err) names its purge-ns entry,
+// the log's last. A sealed namespace's documents and log are among those
+// URLs once it is purged, so this is how a consumer of one learns of it.
+func IsPurged(err error) bool { return statusIs(err, 410, "purged") }
+
 // IsNotFound reports a 404 (unknown, or not readable by the caller, §7).
 func IsNotFound(err error) bool { return statusIs(err, 404) }
 

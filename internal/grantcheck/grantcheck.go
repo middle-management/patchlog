@@ -365,6 +365,32 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 	return grant.Verify(g, env)
 }
 
+// PurgedRead runs the read check of a purged sealed namespace, whose
+// namespace documents answer 410 purged once its epoch keys are destroyed
+// (§8.5), so the checker can't read the configuration it would check
+// against. The core checks instead, with token, the reader's bearer ("" for
+// none), on its gestures listing, whose check is any read (§7.4), as the
+// services' own is for a grant that reads some resources only: its 410
+// purged comes right after that check, before not_offered, and gives head,
+// the purge-ns entry's ns_id. A refusal is a *grant.AuthError, 401 or 403
+// (for the core's 403 or 404, as Verify refuses a grant without read). Any
+// other answer is an error.
+func (ch *Checker) PurgedRead(ctx context.Context, ns, token string) (head string, err error) {
+	_, _, err = ch.c.With(client.WithBearer(token)).GesturesPage(ctx, ns, client.NewGesture(), "")
+	ae, ok := client.AsAPIError(err)
+	switch {
+	case err == nil:
+		return "", fmt.Errorf("grantcheck: %s is not purged", ns)
+	case client.IsPurged(err) && ae.Head() != "":
+		return ae.Head(), nil
+	case ok && ae.Status == 401:
+		return "", &grant.AuthError{Status: 401, Msg: "no usable grant"}
+	case ok && (ae.Status == 403 || ae.Status == 404):
+		return "", &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
+	}
+	return "", err
+}
+
 // Decode decodes a bearer token as Verify does, without verifying it, so a
 // caller checking many namespaces can see which ones it names first.
 func (ch *Checker) Decode(token string) (*grant.Grant, error) {
