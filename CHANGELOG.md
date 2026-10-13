@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.18.1
 
 - **Weak ETags.** A reverse proxy that compresses responses (nginx `gzip`, Caddy `encode`, a
   CDN) turns the server's strong ETags into weak ones, `W/"…"`, around the same id. The
