@@ -1,0 +1,75 @@
+package tree_test
+
+import (
+	"context"
+	"path/filepath"
+	"testing"
+	"time"
+
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/keystore"
+)
+
+// TestSealedPurged (§8.5, §10): a sealed namespace's log, long-polls and
+// documents are 410 purged once it is purged, with head its purge-ns
+// entry. The tree service takes that as the purge, at that head, for a
+// trusted content namespace and for the catalog, following or started
+// after the purge. Listings go on without the purged content namespace;
+// the purged catalog answers 410 purged after the read check, which the
+// core makes, as the service can't read the catalog's document any more.
+func TestSealedPurged(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat", "sec"}, []string{"read", "create", "config", "purge-ns"})),
+		client.WithKeys(client.NewKeys(nil)))
+	createNonced(t, w, "cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	createNonced(t, w, "sec", "a", map[string]any{"title": "A"})
+	createNonced(t, w, "cat", "sec.a", map[string]any{"parents": parents("root")})
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat", "sec"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	start := func() *svc { return startSvc(t, sc, svcOpts{now: s.Now, db: filepath.Join(t.TempDir(), "tree.db")}) }
+	x := start()
+	x.caughtUp("cat", "sec")
+	purge := func(ns string) string {
+		must(w.PatchConfig(ctx, ns, must(w.NSHead(ctx, ns)).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+		return must(w.PurgeNamespace(ctx, ns, must(w.NSHead(ctx, ns)).ID))
+	}
+	full := k.Grant(t, s.Now(), "user:r", []string{"cat", "sec"}, []string{"read"})
+
+	// The content namespace: purged, and the catalog's listings go on.
+	secHead := purge("sec")
+	waitFor(t, "the content purge", func() bool { return x.s.Checkpoint("sec") == secHead })
+	if r := x.raw("/cat/roots", full); r.status != 302 {
+		t.Fatalf("listing after the content purge: %d %v", r.status, r.body)
+	}
+
+	// The catalog.
+	catHead := purge("cat")
+	other := k.Grant(t, s.Now(), "user:o", []string{"sec"}, []string{"read"})
+	writer := k.Grant(t, s.Now(), "user:n", []string{"cat"}, []string{"create"})
+	for name, x := range map[string]*svc{"following": x, "started after": start()} {
+		// One started after learns no trust from a catalog it can't read.
+		waitFor(t, name+": the purge", func() bool { return x.s.Checkpoint("cat") == catHead })
+		if r := x.raw("/cat/roots", full); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != catHead || r.header.Get("Cache-Control") != "no-store" {
+			t.Errorf("%s: %d %v %v", name, r.status, r.body, r.header)
+		}
+		for tok, want := range map[string]int{"": 401, other: 403, writer: 403} {
+			if r := x.raw("/cat/roots", tok); r.status != want {
+				t.Errorf("%s: token %.10q: %d %v, want %d", name, tok, r.status, r.body, want)
+			}
+		}
+	}
+}

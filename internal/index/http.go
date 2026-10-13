@@ -232,6 +232,16 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		return
 	}
 	a, err := ix.access(ctx, ns, r)
+	if client.IsPurged(err) {
+		// A purged sealed namespace's document is 410 too (§8.5): the
+		// core makes the read check before answering it, as below.
+		var head string
+		if head, err = ix.checker.PurgedRead(ctx, ns, bearer(r)); err == nil {
+			w.Header().Set("Cache-Control", "no-store")
+			writeJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "namespace purged", "head": head})
+			return
+		}
+	}
 	if err != nil {
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {

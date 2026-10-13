@@ -33,7 +33,8 @@ func nfNS(public bool) *Error {
 // grant's rules included, and before any other answer (not_offered and
 // the 404 of an unknown id included); and of every write to it. Code
 // "purged", with head, the ns_id of its purge-ns entry, the log's last.
-// /ns/{ns} and its log stay readable.
+// /ns/{ns} and its log stay readable, except in a sealed namespace
+// (sealedPurged).
 func (t *tx) purgedNS(n *nsRow) *Error {
 	return apiErr(410, "purged", "head", t.nsLogID(n.headSeq.Int64).String())
 }
@@ -46,6 +47,14 @@ func (t *tx) purgedRead(n *nsRow) *Error {
 	e.Public = &public
 	return e
 }
+
+// sealedPurged reports a purged namespace whose namespace documents and
+// log ranges are sealed (§E.2.2): the purge destroyed the epoch keys that
+// seal them, so they, events and long-polls included, answer purgedRead
+// rather than in the clear, which would show authors and timing to anyone
+// the keys kept out (§8.5). /ns/{ns} still redirects, to a revision that
+// is 410, and the 410's head tells a consumer of the purge.
+func (t *tx) sealedPurged(n *nsRow) bool { return n.purged && t.isSealedNS(n) }
 
 // listHeads lists every resource of n as of asOf (nil = now), including
 // read-through ones, sorted by name in ascending byte order (§7.4), by Go's
@@ -472,7 +481,8 @@ func (e *Engine) NamespaceHead(ctx context.Context, ns string, cred Credentials)
 	return out, err
 }
 
-// NamespaceRev returns the namespace document in force at an ns_id.
+// NamespaceRev returns the namespace document in force at an ns_id; in a
+// purged sealed namespace it is 410 purged at any (§8.5).
 func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credentials) (*NSInfo, error) {
 	var out *NSInfo
 	var job *sealJob
@@ -484,6 +494,10 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 		}
 		if _, err := t.nsReader(n, cred); err != nil {
 			return err
+		}
+		// At any revision, before the 404 of an unknown one (§8.5).
+		if t.sealedPurged(n) {
+			return t.purgedRead(n)
 		}
 		id, perr := ids.Parse(nsID)
 		if perr != nil {
@@ -517,7 +531,7 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 // answers at most limit entries after since (0: all), oldest first, and
 // sets More when the range goes on (§7.1 Paging, §7.7). In a sealed
 // namespace the answer is one JWE for the page actually served, pl.range
-// [since, Last] (§E.2.2).
+// [since, Last] (§E.2.2), and once it is purged, 410 purged (§8.5).
 func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials) (*Log, error) {
 	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false, "")
 }
@@ -555,6 +569,11 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			}
 		} else if _, err := t.nsReader(n, cred); err != nil {
 			return err
+		}
+		// Every range, page and event, before the 404 of an id or since
+		// not in the chain (§8.5).
+		if t.sealedPurged(n) {
+			return t.purgedRead(n)
 		}
 		out = &Log{Public: t.cachePublic(n)}
 		toSeq := n.headSeq.Int64

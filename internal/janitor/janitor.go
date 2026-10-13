@@ -296,6 +296,9 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 		return d, err
 	}
 	doc, err := j.c.NSDoc(ctx, ns, head.ID)
+	if client.IsPurged(err) {
+		return purgedSince(d, err), nil
+	}
 	if err != nil {
 		return d, err
 	}
@@ -309,6 +312,9 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 		return d, nil
 	}
 	log, err := j.c.NSLog(ctx, ns, head.ID, "")
+	if client.IsPurged(err) {
+		return purgedSince(d, err), nil
+	}
 	if err != nil {
 		return d, err
 	}
@@ -461,6 +467,17 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 	return d, nil
 }
 
+// purgedSince is the decision on a sealed branch purged since it was
+// listed, whose document and log answer 410 purged, with head its purge-ns
+// entry (§8.5): kept, as there is nothing left to purge.
+func purgedSince(d Decision, gone error) Decision {
+	d.Reason = "already purged"
+	if ae, ok := client.AsAPIError(gone); ok {
+		d.Purge = ae.Head()
+	}
+	return d
+}
+
 // isDocEntry reports head, tombstone and batch entries: the ones that change
 // documents. Config, prune and (propagated) purge entries don't count. In
 // an e2e branch (e2e) neither do entries for its keyring resource, which is
@@ -585,6 +602,10 @@ func (j *Janitor) verifySuperseded(ctx context.Context, base, ns, succ string, b
 		return false, "", err
 	}
 	sdoc, err := j.c.NSDoc(ctx, succ, sh.ID)
+	if client.IsPurged(err) {
+		// A sealed successor's document, once it is purged (§8.5).
+		return false, "successor " + succ + " is purged", nil
+	}
 	if err != nil {
 		return false, "", err
 	}

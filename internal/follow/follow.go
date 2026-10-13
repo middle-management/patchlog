@@ -76,7 +76,9 @@ type Unit struct {
 	// units from a /heads snapshot, Entry has Resource, Kind ("head",
 	// "tombstone" or "purge") and Target, and no ID; a namespace purged by
 	// then has no listing, and gives one unit with only Kind "purge-ns"
-	// and ID, its head, which is its purge-ns entry.
+	// and ID, its head, which is its purge-ns entry. So does a sealed
+	// namespace once it is purged, whose log is 410 too (§8.5), in place
+	// of the entries it no longer serves.
 	Entry client.NSEntry
 	// Synthetic marks a unit made from a /heads listing (or in place of
 	// one).
@@ -179,7 +181,8 @@ func WithBackoff(min, max time.Duration) Option {
 func WithOnError(f func(ns string, err error)) Option { return func(o *options) { o.onError = f } }
 
 // WithOnState receives lifecycle changes: frozen/successor from config
-// changes, and purged from purge-ns entries.
+// changes, and purged from purge-ns entries, or from the 410 purged that
+// stands in for them (§8.5).
 func WithOnState(f func(State)) Option { return func(o *options) { o.onState = f } }
 
 // New returns a follower of namespace ns.
@@ -193,7 +196,7 @@ func New(c *client.Client, ns string, cp Checkpoint, h Handler, opts ...Option) 
 
 // ErrPurged is returned by Run when the followed namespace was purged
 // (after its purge-ns unit was applied, from the log or in place of a
-// /heads listing).
+// /heads listing or of a sealed namespace's log).
 var ErrPurged = errors.New("follow: namespace purged")
 
 // Run follows until ctx is done (returning ctx.Err()), the namespace is
@@ -333,6 +336,10 @@ func (n *nsFollower) bootstrapBranch(ctx context.Context) error {
 		}
 		return entries[0], nil
 	})
+	if client.IsPurged(err) {
+		// A sealed branch's log, once it is purged (§8.5).
+		return n.deliverPurged(ctx, err)
+	}
 	if err != nil {
 		return err
 	}
@@ -342,7 +349,7 @@ func (n *nsFollower) bootstrapBranch(ctx context.Context) error {
 
 func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *client.NSEntry) error {
 	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.Heads(ctx, n.ns, at) })
-	if isPurged(err) {
+	if client.IsPurged(err) {
 		return n.deliverPurged(ctx, err)
 	}
 	if err != nil {
@@ -351,7 +358,9 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *clien
 	var units []Unit
 	if genesis != nil {
 		u := Unit{Entry: *genesis}
-		if err := n.attachConfig(ctx, &u); err != nil {
+		if err := n.attachConfig(ctx, &u); client.IsPurged(err) {
+			return n.deliverPurged(ctx, err)
+		} else if err != nil {
 			return err
 		}
 		units = append(units, u)
@@ -363,13 +372,14 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *clien
 	return n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: units, From: n.cur, NewCheckpoint: at, Snapshot: true})
 }
 
-// deliverPurged stands in for the /heads listing of a purged namespace,
-// which is 410 purged at any revision (§8.5): the namespace's log ends with
-// its purge-ns entry, which is how a consumer learns of it otherwise (§10),
-// and nothing is written after it, so the head is that entry. The 410
-// names it as head; from a core that doesn't, it is read from /ns/{ns}. It
-// is delivered as a synthetic purge-ns unit at the head, and Run ends with
-// ErrPurged.
+// deliverPurged stands in for what a purged namespace no longer serves: its
+// /heads listing, 410 purged at any revision, and, in a sealed namespace,
+// its log, long-polls, events and documents too (§8.5). The namespace's
+// log ends with its purge-ns entry, which is how a consumer learns of it
+// otherwise (§10), and nothing is written after it, so the head is that
+// entry. The 410 names it as head; from a core that doesn't, it is read
+// from /ns/{ns}. It is delivered as a synthetic purge-ns unit at the head,
+// unless the checkpoint is there already, and Run ends with ErrPurged.
 func (n *nsFollower) deliverPurged(ctx context.Context, gone error) error {
 	var head string
 	if ae, ok := client.AsAPIError(gone); ok {
@@ -382,18 +392,14 @@ func (n *nsFollower) deliverPurged(ctx context.Context, gone error) error {
 		}
 		head = v.(*client.NSHead).ID
 	}
-	u := Unit{Entry: client.NSEntry{ID: head, Kind: "purge-ns"}, Synthetic: true}
-	if err := n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: []Unit{u}, From: n.cur, NewCheckpoint: head, Snapshot: true}); err != nil {
-		return err
+	if head != n.cur {
+		u := Unit{Entry: client.NSEntry{ID: head, Kind: "purge-ns"}, Synthetic: true}
+		if err := n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: []Unit{u}, From: n.cur, NewCheckpoint: head, Snapshot: true}); err != nil {
+			return err
+		}
 	}
 	n.f.state(State{NS: n.ns, Purged: true})
 	return ErrPurged
-}
-
-// isPurged reports the 410 of a purged namespace's URLs (§8.5).
-func isPurged(err error) bool {
-	ae, ok := client.AsAPIError(err)
-	return ok && ae.Status == 410 && ae.Code == "purged"
 }
 
 // catchUp replays the immutable range from the checkpoint to the head,
@@ -414,6 +420,11 @@ func (n *nsFollower) catchUp(ctx context.Context) error {
 			es, next, err := n.f.c.NSLogPage(ctx, n.ns, head.ID, n.cur)
 			return page{es, next}, err
 		})
+		if client.IsPurged(err) {
+			// A sealed namespace's log, once it is purged: the 410's
+			// head stands in for its purge-ns entry (§8.5, §10).
+			return n.deliverPurged(ctx, err)
+		}
 		if err != nil {
 			return err
 		}
@@ -441,6 +452,11 @@ func (n *nsFollower) followLongPoll(ctx context.Context) error {
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
+			}
+			if client.IsPurged(err) {
+				// Purged since: a sealed namespace's long-poll is 410
+				// rather than its purge-ns entry (§8.5).
+				return n.deliverPurged(ctx, err)
 			}
 			if !client.Retryable(err) {
 				return err
@@ -472,8 +488,13 @@ func (n *nsFollower) followSSE(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if errors.Is(err, errStop) {
+		if errors.Is(err, errStop) || errors.Is(err, ErrPurged) {
 			return ErrPurged
+		}
+		if client.IsPurged(err) {
+			// A sealed namespace's events are 410 once it is purged,
+			// and its stream ends without the purge-ns entry (§8.5).
+			return n.deliverPurged(ctx, err)
 		}
 		if err != nil {
 			var ae *client.APIError
@@ -510,7 +531,15 @@ func (n *nsFollower) deliver(ctx context.Context, entries []client.NSEntry) erro
 			return fmt.Errorf("follow: %s: entry %s does not follow %s (prev %s)", n.ns, e.ID, n.cur, e.Prev)
 		}
 		u := Unit{Entry: e}
-		if err := n.attachConfig(ctx, &u); err != nil {
+		if err := n.attachConfig(ctx, &u); client.IsPurged(err) {
+			// A sealed namespace purged since the entries were read: its
+			// documents are 410 too. What came before is delivered, and
+			// the purge stands in for the rest (§8.5).
+			if err := flush(); err != nil {
+				return err
+			}
+			return n.deliverPurged(ctx, err)
+		} else if err != nil {
 			return err
 		}
 		group = append(group, u)
