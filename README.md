@@ -1407,6 +1407,11 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   shadow: read-through, foreign parents and logs work unchanged. History A pruned is mirrored
   from the horizon, whose document is kept as a snapshot (only as trustworthy as the channel,
   §8.6). A failed fetch or verification is `502` with `code: "remote"`, and nothing is written.
+  A base that is purged at A, or has a purged base in its chain, is `410 purged` instead, with
+  `origin`, `ns` and `head` naming the purged namespace at A and its `purge-ns` entry (the
+  first one found, A before its bases; v0.50), for any `at`, as for a local branch, once B's
+  grant passes A's read check there: B reads A's `/heads` first. A purged schema namespace B
+  would mirror isn't in the chain: `422 schema_unavailable` with `ref`.
 - **A base that is itself a branch.** Its read-through heads aren't in its own log, so B
   follows its `base` and `at` (proved by the id of its configuration genesis) recursively,
   fetches each base's log up to that `at`, and verifies every read-through head and its
@@ -2044,13 +2049,16 @@ namespace too (v0.49): the grant must allow `read`, read unrestricted and pass i
 A purged namespace (§8.5, §12) answers `410` with `code: "purged"` and `head`, the `ns_id` of
 its `purge-ns` entry, which is the log's last (v0.49), so a consumer needn't re-read
 `/ns/{ns}`: on `/r/{ns}/…`, `/ns/{ns}/grants/…`, `/ns/{ns}/gestures/…` (sealed and e2e
-namespaces included), `POST /ns/{ns}/keys` and `/heads` at any revision, after the read check,
-the grant's rules included; and on every write, after authorisation and rate limits and before
-any other check: resource writes, batches (one with a config change after its items'
-authorisation), blob uploads and copies, purges, prunes, config writes, namespace purges,
-branching from it and remote registration. `/ns/{ns}` and its log stay readable, and the log's
-`purge-ns` entry says what happened. The name stays reserved: creating a namespace or branch
-under it is `412`, also a retry of the request that created a branch since purged.
+namespaces included), `POST /ns/{ns}/keys` and `/heads` at any revision, as soon as the full
+read check passes, the grant's rules included, and before any other answer to a well-formed
+request (`not_offered` and the `404` of an unknown id included; v0.50); and on every write,
+after authorisation and rate limits and before any other check: resource writes, batches (one
+with a config change after its items' authorisation), blob uploads and copies, purges, prunes,
+config writes, namespace purges, branching from it and remote registration. A remote branch of
+it on another deployment is `410 purged` too, also naming `origin` and `ns` (§G.3). `/ns/{ns}`
+and its log stay readable, and the log's `purge-ns` entry says what happened. The name stays
+reserved: creating a namespace or branch under it is `412`, also a retry of the request that
+created a branch since purged.
 
 `requireAt`: `at` must have been the head of its namespace at some point within `maxLag` before
 the grant was issued, issuance taken as `max(nbf, exp − maxTtl)` of the root block (`nbf` when

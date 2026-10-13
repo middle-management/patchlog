@@ -186,16 +186,47 @@ func fetchErr(what string, err error) *Error {
 
 // schemaFetchErr maps a failed fetch of a referenced schema revision from
 // its namespace at the base (§G.3): a revision that doesn't resolve there,
-// as with a draft in a branch (§6.1), can't be mirrored, and creation fails
-// with 422.
+// as with a draft in a branch (§6.1), or that is purged there, can't be
+// mirrored, and creation fails with 422 (§12: unknown, purged or
+// unreadable). A schema namespace isn't in the base's chain, so its purge
+// is no purged base (purgedBase).
 func schemaFetchErr(ref schema.Ref) func(string, error) *Error {
 	return func(what string, err error) *Error {
-		if ae, ok := client.AsAPIError(err); ok && ae.Status == 404 {
+		if ae, ok := client.AsAPIError(err); ok && (ae.Status == 404 || ae.Status == 410 && ae.Code != "pruned") {
 			return apiErr(422, "schema_unavailable", "ref", ref.Path(), "message",
-				ref.Path()+" doesn't resolve in "+ref.NS+" at the base (a draft in a branch there, §6.1, or unreadable); "+
+				ref.Path()+" doesn't resolve in "+ref.NS+" at the base (a draft in a branch there, §6.1, purged, or unreadable); "+
 					"a remote branch mirrors schema revisions only from their own namespace (§G.3)")
 		}
 		return fetchErr(what, err)
+	}
+}
+
+// purgedBase is the 410 of a remote branch whose base, or a base in its
+// chain, is purged (§G.3, §8.5): origin, ns and head name the purged
+// namespace and its purge-ns entry there (§12).
+func purgedBase(origin, ns, head string) *Error {
+	return apiErr(410, "purged", "origin", origin, "ns", ns, "head", head, "message",
+		"the remote base, or a base in its chain, is purged: "+origin+"/ns/"+ns+" (§G.3, §8.5)")
+}
+
+// purgedAt reports the head of a 410 purged the base answered for one of a
+// namespace's URLs (§8.5).
+func purgedAt(err error) (string, bool) {
+	if ae, ok := client.AsAPIError(err); ok && ae.Status == 410 && ae.Code == "purged" {
+		return ae.Head(), true
+	}
+	return "", false
+}
+
+// levelErr is mapErr for the URLs of ns, a namespace of the base's chain:
+// the base's 410 purged for one of them names ns as the purged base
+// (§G.3), which mapErr would answer as a purged resource.
+func levelErr(origin, ns string, mapErr func(string, error) *Error) func(string, error) *Error {
+	return func(what string, err error) *Error {
+		if head, ok := purgedAt(err); ok {
+			return purgedBase(origin, ns, head)
+		}
+		return mapErr(what, err)
 	}
 }
 
@@ -290,7 +321,8 @@ func (c *remoteChain) docAt(i int) (any, error) {
 var errStop = errors.New("stop")
 
 // fetchChain fetches and verifies a resource's chain up to target. mapErr
-// maps a failed fetch (fetchErr, or unreadableBase for a base's base).
+// maps a failed fetch (the level's levelErr over fetchErr, or over
+// unreadableBase for a base's base, or schemaFetchErr).
 // opaque fetches e2e content (§E.3), verified over its ciphertext.
 func fetchChain(ctx context.Context, c *client.Client, ns, name, target string, opaque bool, mapErr func(string, error) *Error) (*remoteChain, *Error) {
 	what := "/r/" + ns + "/" + name
@@ -431,8 +463,9 @@ type remoteMirror struct {
 // fetchLevel fetches and verifies a namespace's log up to at, and its
 // configuration genesis. next is its base, if it is a branch. Members of
 // the base's namespace documents this deployment doesn't define are
-// ignored (§7.4, §G.3): nothing of them is copied.
-func fetchLevel(ctx context.Context, c *client.Client, ns, at string, mapErr func(string, error) *Error) (*remoteLevel, *BaseRef, *Error) {
+// ignored (§7.4, §G.3): nothing of them is copied. A log that ends at a
+// purge-ns entry is a purged base at origin (§G.3).
+func fetchLevel(ctx context.Context, c *client.Client, origin, ns, at string, mapErr func(string, error) *Error) (*remoteLevel, *BaseRef, *Error) {
 	// The namespace log up to at, verified from its first entry: at is the
 	// trusted starting point (§G.1).
 	log, err := c.NSLog(ctx, ns, at, "")
@@ -465,7 +498,9 @@ func fetchLevel(ctx context.Context, c *client.Client, ns, at string, mapErr fun
 				}
 			}
 		case "purge-ns":
-			return nil, nil, gone("message", "the remote base (or a base of it) is purged: /ns/"+ns)
+			// The log's last entry (§8.5): at is the purge itself. A's
+			// /heads answers that first, so this is a backstop.
+			return nil, nil, purgedBase(origin, ns, en.ID)
 		}
 	}
 	// A branch's base and at are in its configuration genesis, which a
@@ -608,11 +643,23 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		return nil, remoteErr("the deployment reached for %s publishes the origin %q", base.Origin, root.Origin)
 	}
 	m := &remoteMirror{base: base, read: "grant"}
-	mapErrs := []func(string, error) *Error{fetchErr}
+	// A 410 purged for a namespace's URLs names it (levelErr). A's own
+	// purge is found before any base's: a base can't be purged while A,
+	// its dependent, lives (§8.5), so the first one found is named.
+	mapErrs := []func(string, error) *Error{levelErr(base.Origin, base.NS, fetchErr)}
+	// The listing the spec reads (§G.3), checked against the logs below.
+	// It comes first: for a purged A it is 410 purged at any revision,
+	// once A's read check passes and before any other answer (§8.5), so a
+	// purged base is 410 as for a local branch (§7.6) even with an at A
+	// doesn't know, or a log A can't deliver.
+	heads, err := c.Heads(ctx, base.NS, base.At)
+	if err != nil {
+		return nil, mapErrs[0]("/ns/"+base.NS+"/rev/"+base.At+"/heads", err)
+	}
 	ns, at := base.NS, base.At
 	for {
 		mapErr := mapErrs[len(mapErrs)-1]
-		lv, next, ferr := fetchLevel(ctx, c, ns, at, mapErr)
+		lv, next, ferr := fetchLevel(ctx, c, base.Origin, ns, at, mapErr)
 		if ferr != nil {
 			return nil, ferr
 		}
@@ -643,7 +690,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 			// at: merging back must pass there now (§C.7).
 			nonce, err := c.NonceRequired(ctx, base.NS)
 			if err != nil {
-				return nil, fetchErr("/ns/"+base.NS, err)
+				return nil, mapErr("/ns/"+base.NS, err)
 			}
 			lv.nonce = nonce && m.level != levelE2E
 		}
@@ -656,7 +703,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 			return nil, limitErr(422, fmt.Sprintf("branch depth exceeded: the remote base's chain has more than %d namespaces", e.opt.Maximums.BranchDepth))
 		}
 		ns, at = next.NS, next.At
-		mapErrs = append(mapErrs, unreadableBase(ns))
+		mapErrs = append(mapErrs, levelErr(base.Origin, ns, unreadableBase(ns)))
 	}
 	opaque := m.level == levelE2E
 	if opaque {
@@ -675,10 +722,6 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		}
 	}
 	// The listing the spec reads must agree with the logs (§G.3).
-	heads, err := c.Heads(ctx, base.NS, base.At)
-	if err != nil {
-		return nil, fetchErr("/ns/"+base.NS+"/rev/"+base.At+"/heads", err)
-	}
 	if len(heads) != len(visible) {
 		return nil, unverified("/heads lists %d resources, the namespace logs %d", len(heads), len(visible))
 	}

@@ -624,8 +624,9 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 	gcanon := jsonv.Canonical(genesis)
 	cfgID := ids.Revision(nil, gcanon)
 	if ex := t.nsByName(br.Name); ex != nil {
-		// Idempotent retry: same principal, same at and patches. A purged
-		// branch's name stays reserved, for its creator too (§8.5).
+		// Idempotent retry: same principal, same at and patches, until
+		// the branch is purged; after that it is 412 too: its name stays
+		// reserved, for its creator too (§7.6, §8.5).
 		var author, gseq int64
 		var gid []byte
 		qerr := t.QueryRow(`SELECT seq, author, id FROM ns_config WHERE ns = ? AND parent_seq IS NULL`, ex.id).Scan(&gseq, &author, &gid)

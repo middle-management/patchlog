@@ -29,9 +29,11 @@ func nfNS(public bool) *Error {
 
 // purgedNS is the 410 of a purged namespace n (§8.5): of every /r/{ns}/…
 // URL, /ns/{ns}/grants/…, /ns/{ns}/gestures/…, /ns/{ns}/keys and /heads at
-// any revision, and of every write to it, code "purged", with head, the
-// ns_id of its purge-ns entry, the log's last. /ns/{ns} and its log stay
-// readable.
+// any revision, as soon as the full read check for the URL passes, the
+// grant's rules included, and before any other answer (not_offered and
+// the 404 of an unknown id included); and of every write to it. Code
+// "purged", with head, the ns_id of its purge-ns entry, the log's last.
+// /ns/{ns} and its log stay readable.
 func (t *tx) purgedNS(n *nsRow) *Error {
 	return apiErr(410, "purged", "head", t.nsLogID(n.headSeq.Int64).String())
 }
