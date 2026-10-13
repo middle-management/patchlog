@@ -20,7 +20,8 @@ import (
 
 // undoPrelude runs app.js's undo procedure (extracted, with api over fetch,
 // sending input.bearer if given, and the sealed-content key stubbed with
-// the namespace's epoch key) against a live server; the scenarios follow
+// the namespace's epoch key, input.key or input.nsKeys[ns]) against a live
+// server; the scenarios follow
 // it (undoHarness, undoLimitedHarness).
 const undoPrelude = `
 const fs = require('fs');
@@ -32,6 +33,7 @@ const short = (id) => id || '';
 const httpFail = (r) => new Error('HTTP ' + r.status + (r.json && r.json.code ? ' ' + r.json.code : ''));
 const S = { ns: '', nsLogErr: '' };
 const KEY = Z.unb64u(input.key);
+const NS_KEYS = Object.fromEntries(Object.entries(input.nsKeys || {}).map(([ns, k]) => [ns, Z.unb64u(k)]));
 async function api(method, path, o = {}) {
   const headers = { 'X-Author': input.author };
   if (input.bearer) headers.Authorization = 'Bearer ' + input.bearer;
@@ -46,7 +48,10 @@ async function api(method, path, o = {}) {
     jose: /^application\/jose\b/i.test(res.headers.get('Content-Type') || ''), hdr: (k) => res.headers.get(k),
     etag() { const v = res.headers.get('ETag'); return v ? v.replace(/^"|"$/g, '') : ''; } };
 }
-async function contentKey(kid, resource) { return resource ? Z.resourceKey(KEY, Z.parseKid(kid).ns, resource) : KEY; }
+async function contentKey(kid, resource) {
+  const ns = Z.parseKid(kid).ns, key = NS_KEYS[ns] || KEY;
+  return resource ? Z.resourceKey(key, ns, resource) : key;
+}
 async function decrypted(r, ns, resource, want) {
   try { const d = await openSealed(ns, r.text.trim(), resource, want); return { value: d.value, kid: d.kid }; }
   catch (err) { return { value: null, error: err.message }; }
@@ -394,6 +399,9 @@ const undoLimitedHarness = undoPrelude + `
   out.redo = sum(await undoRun('ls', out.latest, o({ author: input.author, resources: ['a', 'b'] })));
   S.ns = 'le';
   out.e2e = sum(await undoRun('le', input.ge, o({ resources: ['a'] })));
+  S.ns = 'lp';
+  out.pruned = sum(await undoRun('lp', input.gp, o({ resources: ['a'] })));
+  out.after = sum(await undoRun('lp', input.gp2, o({ resources: ['a'] })));
   process.stdout.write(JSON.stringify(out));
 })().catch((e) => { console.error(e); process.exit(1); });
 `
@@ -403,7 +411,9 @@ const undoLimitedHarness = undoPrelude + `
 // document. In a sealed namespace it scans the logs of the documents it
 // knows the action touched, learns the level from the JWEs it reads and
 // adds fresh nonces; without them it refuses instead of failing on a 403;
-// redo finds the undo in those logs; in an e2e namespace it refuses.
+// redo finds the undo in those logs; in an e2e namespace it refuses. A
+// gesture whose first revision read follows a pruning horizon may continue
+// below it, and is impossible rather than undone in part.
 func TestUndoLimitedWithNode(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
@@ -422,8 +432,9 @@ func TestUndoLimitedWithNode(t *testing.T) {
 	}
 	check(opc("ls").CreateNamespace(ctx, "ls", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}))
 	check(opc("le").CreateNamespace(ctx, "le", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "e2e"}}))
+	check(opc("lp").CreateNamespace(ctx, "lp", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}))
 	only := map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"a", "b"}}}}}
-	liGrant := k.Grant(t, s.Now(), "user:li", []string{"ls", "le"}, []string{"read", "create", "append"}, only)
+	liGrant := k.Grant(t, s.Now(), "user:li", []string{"ls", "le", "lp"}, []string{"read", "create", "append"}, only)
 	li := s.Client(t, client.WithBearer(liGrant), client.WithKeys(client.NewKeys(nil)))
 	op := func(o, path string, v any) map[string]any { return map[string]any{"op": o, "path": path, "value": v} }
 	nonced := func(p ...any) []any { return append(p, op("add", "/$nonce", seal.NewNonce())) }
@@ -449,17 +460,36 @@ func TestUndoLimitedWithNode(t *testing.T) {
 	check(we, err)
 	ge := client.NewGesture()
 	check(x.AppendSealed(ctx, "le", "a", we.ID, []any{op("replace", "/n", 1)}, client.WithGesture(ge)))
+	// lp: li's gesture gp on a straddles the pruning horizon; gp2 comes
+	// after another revision.
+	wp, err := li.Create(ctx, "lp", "a", nonced(client.GenesisPatches(map[string]any{"n": 0, "p": 0, "r": 0})...))
+	check(wp, err)
+	gp, gp2 := client.NewGesture(), client.NewGesture()
+	wp, err = li.Append(ctx, "lp", "a", wp.ID, nonced(op("replace", "/n", 1)), client.WithGesture(gp))
+	check(wp, err)
+	horizon := wp.ID
+	wp, err = li.Append(ctx, "lp", "a", wp.ID, nonced(op("replace", "/p", 1)), client.WithGesture(gp))
+	check(wp, err)
+	wp, err = li.Append(ctx, "lp", "a", wp.ID, nonced(op("replace", "/r", 1)))
+	check(wp, err)
+	check(li.Append(ctx, "lp", "a", wp.ID, nonced(op("replace", "/r", 2)), client.WithGesture(gp2)))
+	s.Clock.Advance(10 * time.Minute)
+	check(s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:op", []string{"lp"}, []string{"read", "prune"}))).Prune(ctx, "lp", "a", client.PruneRequest{Horizon: horizon}))
+	fkp, err := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"lp"}, []string{"read"}))).FetchKeys(ctx, "lp", nil, nil)
+	if err != nil || len(fkp) != 1 || fkp[0].Key == nil {
+		t.Fatalf("keys %v %v", fkp, err)
+	}
 
 	b := runUndoHarness(t, node, undoLimitedHarness, map[string]any{"base": s.URL, "author": "user:li", "bearer": liGrant,
-		"key": base64.RawURLEncoding.EncodeToString(fk[0].Key), "g": g, "gb": gb, "ge": ge})
+		"key": base64.RawURLEncoding.EncodeToString(fk[0].Key), "nsKeys": map[string]any{"lp": base64.RawURLEncoding.EncodeToString(fkp[0].Key)}, "g": g, "gb": gb, "ge": ge, "gp": gp, "gp2": gp2})
 	type res struct {
 		OK                                  bool
 		Gesture, Source, Level, Author, Err string
 		Steps                               []any
 	}
 	var out struct {
-		Bare, Only, Undo, Redo, E2E res
-		Latest                      string
+		Bare, Only, Undo, Redo, E2E, Pruned, After res
+		Latest                                     string
 	}
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatalf("node output %s: %v", b, err)
@@ -490,6 +520,15 @@ func TestUndoLimitedWithNode(t *testing.T) {
 	}
 	if out.E2E.OK || !strings.Contains(out.E2E.Err, "namespace document") {
 		t.Errorf("e2e %+v", out.E2E)
+	}
+	if out.Pruned.OK || out.Pruned.Err != "pruned" {
+		t.Errorf("a gesture straddling the horizon %+v", out.Pruned)
+	}
+	if !out.After.OK || out.After.Level != "sealed" {
+		t.Errorf("a gesture after the horizon %+v", out.After)
+	}
+	if _, d, err := li.Load(ctx, "lp", "a"); err != nil || d.Value.(map[string]any)["n"] != float64(1) || d.Value.(map[string]any)["r"] != float64(1) {
+		t.Errorf("lp/a after the refusal and the undo: %v %v", d, err)
 	}
 }
 

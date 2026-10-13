@@ -1157,18 +1157,19 @@ async function undoNSLog(ns) {
   return nsLogRead(ns, r);
 }
 
-/* undoNSLogOr reads the namespace log, or returns null where a grant limited to some resources can't (§C.5) and
- * resources names the documents to scan instead (§11.2 Finding a gesture); without them that is refused. */
+/* undoNSLogOr reads the namespace log, or returns null where a grant limited to some resources can't (§C.5: 403 or
+ * 404; a 401 is an unusable grant) and resources names the documents to scan instead (§11.2 Finding a gesture);
+ * without them that is refused. */
 async function undoNSLogOr(ns, resources) {
   try { return await undoNSLog(ns); } catch (err) {
-    if (![401, 403, 404].includes(err.status)) throw err;
+    if (![403, 404].includes(err.status)) throw err;
     if (!(resources || []).length) throw Object.assign(new Error(`the gesture listing isn't offered and the namespace log answered ${err.status}: open the document the action touched, whose log is scanned instead (§11.2)`), { refused: true });
     return null;
   }
 }
 
-/* undoReadRes reads a resource's head, its log after the site's hint (or its pruning horizon) and the document
- * there, decrypting E2 entries. */
+/* undoReadRes reads a resource's head, its log after the site's hint (or its pruning horizon, then named as horizon)
+ * and the document there, decrypting E2 entries. */
 async function undoReadRes(ns, site) {
   const name = site.resource;
   const hr = await api('GET', `/r/${ns}/${name}`, { auto: true, label: 'undo' });
@@ -1191,10 +1192,12 @@ async function undoReadRes(ns, site) {
   if (!L) throw new Error('could not read the log of ' + name);
   if (L.err) throw new Error(`the log of ${name} is incomplete: ${L.err}`);
   let entries = L.arr;
-  // What is read tells the level to a grant that can't read the namespace document (§11.2): a JWE is sealed.
+  // What is read tells the level to a grant that can't read the namespace document (§11.2): a patch set of one
+  // sealed op is e2e, delivered as a JWE or not, since E3 includes E2's delivery format; else a JWE is sealed.
   const sealed = entries.length > 0 && typeof entries[0] === 'string';
   if (sealed) entries = await openEntries(ns, name, entries, head, since);
   const e2e = entries.some((e) => e && Array.isArray(e.patches) && e.patches.length === 1 && e.patches[0] && e.patches[0].op === 'sealed');
+  const told = entries.some((e) => e && e.kind !== 'tombstone' && Array.isArray(e.patches) && e.patches.length > 0);
   let start = { doc: null, exists: false, deleted: false };
   if (since) {
     const r = await api('GET', `/r/${ns}/${name}/rev/${since}`, { auto: true, label: 'undo' });
@@ -1204,7 +1207,7 @@ async function undoReadRes(ns, site) {
     if (d.doc == null) throw new Error(`the document at ${short(since)} did not open` + (d.seal && d.seal.error ? ': ' + d.seal.error : ''));
     start = { doc: d.doc, exists: true, deleted: false };
   }
-  return { head, headKind, start, entries, level: sealed ? 'sealed' : e2e ? 'e2e' : '' };
+  return { head, headKind, start, entries, horizon: since && since !== site.hint ? since : '', level: e2e ? 'e2e' : told && sealed ? 'sealed' : '' };
 }
 
 /* undoPlan plans the undo of gesture g in ns (§11.2): o = { author, level, nonce (patch sets add one: needsNonce, §C.7),
@@ -1244,6 +1247,11 @@ async function undoPlan(ns, g, o = {}) {
     const ids = new Set(rr.entries.map((e) => e.id));
     const lost = site.markers.find((m) => !ids.has(m));
     if (lost) throw Object.assign(new Error(`the gesture's entry ${short(lost)} lies below the pruning horizon of ${site.resource}`), { impossible: 'pruned', resource: site.resource });
+    // Without markers, a gesture whose first revision read follows the horizon may continue below it.
+    const e0 = rr.entries[0];
+    if (!site.markers.length && rr.horizon && e0 && e0.gesture === g && e0.author === found.author) {
+      throw Object.assign(new Error(`the gesture's revision ${short(e0.id)} follows the pruning horizon of ${site.resource}, and may continue below it`), { impossible: 'pruned', resource: site.resource });
+    }
     let r;
     try {
       r = planUndoResource({ name: site.resource, head: rr.head, headKind: rr.headKind, start: rr.start, entries: rr.entries, gesture: g, author: found.author,

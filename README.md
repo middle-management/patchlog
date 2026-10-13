@@ -930,13 +930,17 @@ st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each ite
   listing answers them either (sealed and e2e namespaces), they name the documents they know the
   action touched, `UndoResources("a", "b")`, whose logs are read whole (from the pruning horizon
   when there is one) and scanned for the gesture (`plan.Source == "resources"`); without it the
-  undo is `client.ErrNeedResources` rather than a raw `403`. `Redo` and `UndoStack` take it the
-  same way (the stack is then ordered by `created` across those logs). Revisions of the gesture in
-  documents not named are left out, and a gesture a merge carried in counts for the merger who
-  wrote it there, since only the namespace log shows the merge (§F.3). The level is learned from
-  what is read (`plan.Level`): a resource log of JWEs is sealed. In an e2e namespace sealing the
-  inverse needs the current epoch and pad from the namespace document, so such a writer is
-  refused (`client.ErrUndoE2ELimited`).
+  undo is `client.ErrNeedResources` rather than a raw `403` (a `401`, an unusable grant, stays
+  one). `UndoSince` is dropped for them, since `/heads` needs unrestricted read. `Redo` and
+  `UndoStack` take it the same way (the stack is then ordered by `created` across those logs).
+  Revisions of the gesture in documents not named are left out, and a gesture a merge carried in
+  counts for the merger who wrote it there, since only the namespace log shows the merge (§F.3).
+  Without markers, a gesture whose first revision read directly follows a pruning horizon may
+  continue below it, so its undo is impossible (`pruned`) rather than done in part. The level is
+  learned from what is read (`plan.Level`): entries whose patch set is one `sealed` op are e2e,
+  else a resource log delivered as JWEs is sealed. In an e2e namespace sealing the inverse needs
+  the current epoch and pad from the namespace document, so such a writer is refused
+  (`client.ErrUndoE2ELimited`).
 - **The inverse**, per resource, the gesture's own entries newest first: a revision becomes the patch
   set that sets the paths it wrote back to its parent's values (writes to array elements widened to
   the whole array, as merges do; a revision of moves only is moved back when both ends are unchanged);
