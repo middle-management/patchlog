@@ -1481,10 +1481,11 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
   served).
 - **Purges.** B follows A's log (`-remote-follow-interval`, or `Engine.SyncRemotes`) and on
   `purge`/`purge-ns` applies §8.3 locally to the names concerned: its own chains, its own
-  branches and cache tags. With `-remote-ignore-purges` they are recorded as notices only
-  (`Engine.RemoteNotices`). A purge on B also removes the shadows' copies. When A's base is a
-  branch, B follows only that branch's log: A's purges in its bases propagate to it as purge
-  entries there.
+  branches and cache tags. A sealed base's purge arrives instead as the `410 purged` of its log,
+  applied as its `purge-ns` entry at the `410`'s `head` (§8.5). With `-remote-ignore-purges`
+  they are recorded as notices only (`Engine.RemoteNotices`). A purge on B also removes the
+  shadows' copies. When A's base is a branch, B follows only that branch's log: A's purges in
+  its bases propagate to it as purge entries there.
 - **Registration.** With `-remote-register`, B registers after creating the branch and renews
   seven days before expiry.
 - **Origins.** Both deployments need canonical origins (`-origin`), in https. Plain http is
@@ -2149,7 +2150,12 @@ after authorisation and rate limits and before any other check: resource writes,
 with a config change after its items' authorisation), blob uploads and copies, purges, prunes,
 config writes, namespace purges, branching from it and remote registration. A remote branch of
 it on another deployment is `410 purged` too, also naming `origin` and `ns` (§G.3). `/ns/{ns}`
-and its log stay readable, and the log's `purge-ns` entry says what happened. The name stays
+and its log stay readable, and the log's `purge-ns` entry says what happened, except in a
+sealed namespace (v0.51): the purge destroys the epoch keys that seal its namespace documents
+and log, so `/ns/{ns}/rev/{id}`, `/ns/{ns}/rev/{id}/log`, long-polls, `/ns/{ns}/events` and a
+resource's events answer `410 purged` with `head` too, after the read check and at any id or
+`since`, rather than in the clear. `GET /ns/{ns}` still redirects, to the purge's revision,
+which is `410`, and its `head` is how a consumer learns of the purge. The name stays
 reserved: creating a namespace or branch under it is `412`, also a retry of the request that
 created a branch since purged.
 

@@ -176,7 +176,7 @@ func testFollowSealedPurged(t *testing.T, mode string) {
 	cp.Save(clienttest.Origin, "main", early)
 	late := run(cp)
 	ended("catch-up", late, head)
-	if bs := late.rec.snapshot(); len(bs) != 1 || bs[0].From != early || !bs[0].Snapshot || !bs[0].Units[0].Synthetic {
+	if bs := late.rec.snapshot(); len(bs) != 1 || bs[0].From != early || bs[0].Snapshot || !bs[0].Units[0].Synthetic {
 		t.Fatalf("catch-up batches %+v", bs)
 	}
 

@@ -76,6 +76,17 @@ func upstream(err error) error {
 	return &Error{Status: 502, Code: "upstream", Msg: err.Error()}
 }
 
+// configErr answers a namespace document the checker couldn't read: 410
+// gone for a purged sealed namespace, whose documents are 410 purged once
+// the purge destroys their epoch keys (§8.5), as for a purged item, since
+// nothing in it can be granted any more; 502 otherwise.
+func configErr(ns string, err error) error {
+	if client.IsPurged(err) {
+		return errf(410, "gone", "namespace %s is purged", ns)
+	}
+	return upstream(err)
+}
+
 // decidedAt marks a refusal that is a decision (403, 404, 409, 410) with
 // the combined checkpoint it was decided at, so a client that caches
 // refusals keys them as it keys grants (§B.11.4). Plans defer it once
@@ -538,7 +549,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 	}
 	latest, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
-		return nil, upstream(err)
+		return nil, configErr(ns, err)
 	}
 	signer := findKey(latest.Keys, s.opt.Kid)
 	if signer == nil {
@@ -690,7 +701,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 	}
 	latest, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
-		return nil, upstream(err)
+		return nil, configErr(ns, err)
 	}
 	signer := findKey(latest.Keys, s.opt.Kid)
 	if signer == nil {
@@ -938,7 +949,7 @@ func (s *Service) isAdmin(v *grant.Verified) bool {
 func (s *Service) catalogKey(ctx context.Context) (*grantcheck.Config, *grant.Key, error) {
 	cfg, err := s.t.Checker().Config(ctx, s.t.Catalog())
 	if err != nil {
-		return nil, nil, upstream(err)
+		return nil, nil, configErr(s.t.Catalog(), err)
 	}
 	key := findKey(cfg.Keys, s.opt.Kid)
 	if key == nil {
@@ -983,7 +994,7 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 	}
 	ccfg, err := s.t.Checker().Config(ctx, ns)
 	if err != nil {
-		return nil, upstream(err)
+		return nil, configErr(ns, err)
 	}
 	subs := Subjects(v)
 	admin := s.isAdmin(v)
@@ -1206,6 +1217,12 @@ func (s *Service) includesOfTrusted(ctx context.Context) (map[string]Includes, e
 	out := map[string]Includes{}
 	for _, ns := range trust {
 		cfg, err := s.t.Checker().Config(ctx, ns)
+		if client.IsPurged(err) {
+			// A purged sealed namespace's document is 410 (§8.5): its
+			// items are purged, and it declares no includes any more.
+			out[ns] = ParseIncludes(nil)
+			continue
+		}
 		if err != nil {
 			return nil, upstream(err)
 		}

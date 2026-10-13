@@ -61,7 +61,8 @@ type Batch struct {
 	// NewCheckpoint is the ns_id to record once the units are processed.
 	NewCheckpoint string
 	// Snapshot marks a batch built from a /heads listing (snapshot
-	// bootstrap or a new branch): its units are synthetic, and the
+	// bootstrap or a new branch), or in place of one for a namespace
+	// purged by then: its units are synthetic, and the
 	// consumer should treat it as the complete state as of NewCheckpoint
 	// (dropping anything it holds for the namespace not listed, if it
 	// holds anything).
@@ -379,7 +380,10 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *clien
 // otherwise (§10), and nothing is written after it, so the head is that
 // entry. The 410 names it as head; from a core that doesn't, it is read
 // from /ns/{ns}. It is delivered as a synthetic purge-ns unit at the head,
-// unless the checkpoint is there already, and Run ends with ErrPurged.
+// unless the checkpoint is there already, and Run ends with ErrPurged. The
+// batch is a Snapshot only in place of a bootstrap's listing: after a
+// checkpoint it follows what was delivered, as the purge-ns entry would,
+// so a consumer marks what it holds as purged rather than dropping it.
 func (n *nsFollower) deliverPurged(ctx context.Context, gone error) error {
 	var head string
 	if ae, ok := client.AsAPIError(gone); ok {
@@ -394,7 +398,7 @@ func (n *nsFollower) deliverPurged(ctx context.Context, gone error) error {
 	}
 	if head != n.cur {
 		u := Unit{Entry: client.NSEntry{ID: head, Kind: "purge-ns"}, Synthetic: true}
-		if err := n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: []Unit{u}, From: n.cur, NewCheckpoint: head, Snapshot: true}); err != nil {
+		if err := n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: []Unit{u}, From: n.cur, NewCheckpoint: head, Snapshot: n.cur == ""}); err != nil {
 			return err
 		}
 	}

@@ -361,7 +361,10 @@ type ancestry struct {
 var ErrConflicts = errors.New("merge: unresolved conflicts")
 
 // NewPlan collects the resources branch changed and classifies them against
-// target (usually the branch's base).
+// target (usually the branch's base). A purged branch's resources classify
+// as Purged, but a sealed one's log is 410 purged once it is purged (§8.5),
+// so there is nothing to classify: its error is one client.IsPurged
+// reports, as is Rebase's.
 func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt Options) (*Plan, error) {
 	if opt.MaxRetries <= 0 {
 		opt.MaxRetries = 3

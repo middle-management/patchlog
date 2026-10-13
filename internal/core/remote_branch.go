@@ -1510,7 +1510,12 @@ func (e *Engine) followRemote(ctx context.Context, b *remoteBase) error {
 	entries, head, err := verify.Namespace(ctx, c, b.ns, b.checkpoint)
 	if h, ok := purgedAt(err); ok && h != "" {
 		// A sealed base's log is 410 once it is purged, with head its
-		// purge-ns entry, which stands in for the entries (§8.5, §10).
+		// purge-ns entry, which stands in for the entries (§8.5, §10),
+		// unless the checkpoint is there already: every later sync gets
+		// the same 410.
+		if h == b.checkpoint {
+			return nil
+		}
 		entries, head, err = []client.NSEntry{{ID: h, Kind: "purge-ns"}}, h, nil
 	}
 	if err != nil {

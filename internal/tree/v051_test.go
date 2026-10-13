@@ -9,6 +9,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // TestSealedPurged (§8.5, §10): a sealed namespace's log, long-polls and
@@ -52,6 +53,10 @@ func TestSealedPurged(t *testing.T) {
 	// The content namespace: purged, and the catalog's listings go on.
 	secHead := purge("sec")
 	waitFor(t, "the content purge", func() bool { return x.s.Checkpoint("sec") == secHead })
+	// Its items are purged, not never seen, as from the purge-ns entry.
+	if st, _, err := x.s.ItemState(ctx, "sec", "a"); err != nil || st != tree.ItemPurged {
+		t.Fatalf("item state of sec.a after the purge: %d %v", st, err)
+	}
 	if r := x.raw("/cat/roots", full); r.status != 302 {
 		t.Fatalf("listing after the content purge: %d %v", r.status, r.body)
 	}
@@ -60,11 +65,17 @@ func TestSealedPurged(t *testing.T) {
 	catHead := purge("cat")
 	other := k.Grant(t, s.Now(), "user:o", []string{"sec"}, []string{"read"})
 	writer := k.Grant(t, s.Now(), "user:n", []string{"cat"}, []string{"create"})
+	// A grant that reads some items only passes the service's read check
+	// too, as for a catalog purged at rest.
+	fixed := k.Grant(t, s.Now(), "user:f", []string{"cat"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "root"}}})
 	for name, x := range map[string]*svc{"following": x, "started after": start()} {
 		// One started after learns no trust from a catalog it can't read.
 		waitFor(t, name+": the purge", func() bool { return x.s.Checkpoint("cat") == catHead })
-		if r := x.raw("/cat/roots", full); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != catHead || r.header.Get("Cache-Control") != "no-store" {
-			t.Errorf("%s: %d %v %v", name, r.status, r.body, r.header)
+		for _, tok := range []string{full, fixed} {
+			if r := x.raw("/cat/roots", tok); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != catHead || r.header.Get("Cache-Control") != "no-store" {
+				t.Errorf("%s: %d %v %v", name, r.status, r.body, r.header)
+			}
 		}
 		for tok, want := range map[string]int{"": 401, other: 403, writer: 403} {
 			if r := x.raw("/cat/roots", tok); r.status != want {

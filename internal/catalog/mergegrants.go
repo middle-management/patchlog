@@ -289,7 +289,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 		}
 		cfg, err := s.t.Checker().Config(ctx, ns)
 		if err != nil {
-			return nil, upstream(err)
+			return nil, configErr(ns, err)
 		}
 		latest[ns] = cfg
 	}
@@ -517,7 +517,7 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 func (s *Service) mergeKey(ctx context.Context) (*grant.Key, error) {
 	cfg, err := s.t.Checker().Config(ctx, s.t.Catalog())
 	if err != nil {
-		return nil, upstream(err)
+		return nil, configErr(s.t.Catalog(), err)
 	}
 	key := findKey(cfg.Keys, s.opt.MergeKid)
 	if key == nil {

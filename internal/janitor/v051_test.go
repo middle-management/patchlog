@@ -1,7 +1,10 @@
 package janitor_test
 
 import (
+	"context"
+	"errors"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
@@ -46,12 +49,45 @@ func TestSealedPurged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantKeep(t, d, "already purged")
-	if d.Purge != head {
-		t.Fatalf("decision %+v, want the purge %s", d, head)
+	wantKeep(t, d, "already purged (purge-ns "+head+")")
+	if d.Purge != "" {
+		t.Fatalf("decision %+v: the janitor purged nothing", d)
 	}
 	ds, err := j.Sweep(ctx)
 	if err != nil || len(ds) != 1 || ds[0].NS != "old" {
 		t.Fatalf("sweep %+v %v", ds, err)
+	}
+
+	// A base that is a purged sealed namespace ends its follower at once,
+	// its long-poll being 410 (§8.5): Run goes on sweeping the others.
+	must(c.CreateNamespace(ctx, "gone", map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed"}}))
+	must(c.PatchConfig(ctx, "gone", must(c.NSHead(ctx, "gone")).Config, []any{op("add", "/frozen", true)}))
+	must(c.PurgeNamespace(ctx, "gone", must(c.NSHead(ctx, "gone")).ID))
+	rctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	sweeps := make(chan struct{}, 16)
+	j = janitor.New(c, janitor.Options{Bases: []string{"gone", "matches"}, Now: s.Clock.Now, Interval: 20 * time.Millisecond,
+		OnDecision: func(d janitor.Decision) {
+			if d.NS == "old" {
+				select {
+				case sweeps <- struct{}{}:
+				default:
+				}
+			}
+		}})
+	ran := make(chan error, 1)
+	go func() { ran <- j.Run(rctx) }()
+	for n := 0; n < 3; n++ {
+		select {
+		case <-sweeps:
+		case err := <-ran:
+			t.Fatalf("Run ended after %d sweeps: %v", n, err)
+		case <-rctx.Done():
+			t.Fatal("no sweeps")
+		}
+	}
+	cancel()
+	if err := <-ran; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run: %v", err)
 	}
 }

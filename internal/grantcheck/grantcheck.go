@@ -369,16 +369,14 @@ func (ch *Checker) Verify(ctx context.Context, ns, token string) (*grant.Verifie
 // namespace documents answer 410 purged once its epoch keys are destroyed
 // (§8.5), so the checker can't read the configuration it would check
 // against. The core checks instead, with token, the reader's bearer ("" for
-// none): its 410 purged comes after its full read check and gives head,
-// the purge-ns entry's ns_id; a refusal is a *grant.AuthError, 401 or 403
+// none), on its gestures listing, whose check is any read (§7.4), as the
+// services' own is for a grant that reads some resources only: its 410
+// purged comes right after that check, before not_offered, and gives head,
+// the purge-ns entry's ns_id. A refusal is a *grant.AuthError, 401 or 403
 // (for the core's 403 or 404, as Verify refuses a grant without read). Any
 // other answer is an error.
 func (ch *Checker) PurgedRead(ctx context.Context, ns, token string) (head string, err error) {
-	c := ch.c.With(client.WithBearer(token))
-	h, err := c.NSHead(ctx, ns)
-	if err == nil {
-		_, err = c.NSDoc(ctx, ns, h.ID)
-	}
+	_, _, err = ch.c.With(client.WithBearer(token)).GesturesPage(ctx, ns, client.NewGesture(), "")
 	ae, ok := client.AsAPIError(err)
 	switch {
 	case err == nil:

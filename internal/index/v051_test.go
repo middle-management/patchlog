@@ -48,10 +48,16 @@ func TestSealedPurged(t *testing.T) {
 	// read check, and answers the 410 only to a grant that passes it.
 	reader := k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"})
 	writer := k.Grant(t, s.Now(), "user:n", []string{"sec"}, []string{"create"})
+	// A grant that reads one resource passes the index's read check too,
+	// as for a namespace purged at rest.
+	fixed := k.Grant(t, s.Now(), "user:f", []string{"sec"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
 	for name, x := range map[string]*svc{"following": x, "started after": start()} {
 		waitFor(t, name+": the purge", func() bool { return x.ix.Checkpoint("sec") == purged })
-		if r := x.raw("/sec?q=secret", reader); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged {
-			t.Errorf("%s: %d %v", name, r.status, r.body)
+		for _, tok := range []string{reader, fixed} {
+			if r := x.raw("/sec?q=secret", tok); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged {
+				t.Errorf("%s: %d %v", name, r.status, r.body)
+			}
 		}
 		for tok, want := range map[string]int{"": 401, writer: 403} {
 			if r := x.raw("/sec?q=secret", tok); r.status != want {
