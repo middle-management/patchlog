@@ -2,8 +2,12 @@ package client_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,8 +22,8 @@ import (
 // 404 not_offered where the namespace isn't sealed, else the level, and the
 // current epoch and pad. At E3 it then writes, prunes, undoes and redoes
 // through an E2E view, under the epoch current then and padded as the
-// namespace says. Undo reports as impossible a gesture whose oldest entry
-// lies at or before the oldest entry it can read after a pruning horizon,
+// namespace says, without reading the keyring. Undo reports as impossible
+// a gesture whose oldest entry lies at or before the oldest entry it can read after a pruning horizon,
 // the gesture's first entry read being that one or none following it.
 func TestUndoLimitedKeys(t *testing.T) {
 	t.Parallel()
@@ -32,7 +36,7 @@ func TestUndoLimitedKeys(t *testing.T) {
 	k := clienttest.NewKey("k")
 	jwk, priv, _ := seal.GenerateRecipient()
 	liPub := priv.PublicKey()
-	only := map[string]any{"enc": jwk, "rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"a", "b", "keyring"}}}}}
+	only := map[string]any{"enc": jwk, "rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"a", "b"}}}}}
 	rights := []string{"read", "create", "append", "prune"}
 	limited := func(ns string) *client.Client {
 		li := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:li", []string{ns}, rights, only)), client.WithKeys(client.NewKeys(priv)))
@@ -76,7 +80,8 @@ func TestUndoLimitedKeys(t *testing.T) {
 		t.Fatalf("sealed plan %+v", plan)
 	}
 
-	// E3, padded: li may read the keyring, which the relay reads.
+	// E3, padded: the relay gives li its own keyring entries, though it
+	// can't read the keyring.
 	mkNS("ke", map[string]any{"level": "e2e", "pad": true})
 	adminJWK, adminPriv, _ := seal.GenerateRecipient()
 	ac := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"ke"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": adminJWK})))
@@ -175,4 +180,102 @@ func sealedKid(t *testing.T, c *client.Client, ns, name, id string) string {
 	}
 	t.Fatalf("%s not in the log", id)
 	return ""
+}
+
+// §E.2.3, §E.3: what a limited writer does with a /keys answer it can't
+// use. One without a level, as a deployment before v0.51 gives, leaves the
+// level to be learned from the resource log, so an e2e undo is refused and
+// a sealed one still plans as sealed, and an e2e write says /keys doesn't
+// tell. Errors other than a refusal, such as a 500, are returned as they
+// are. The epoch it names is raised to the newest one relayed to the
+// grant, since at E3 the server is outside the trust boundary.
+func TestUndoLimitedKeysAnswers(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	var mode atomic.Value
+	mode.Store("")
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			m := mode.Load().(string)
+			if m == "" || r.Method != "POST" || !strings.HasSuffix(r.URL.Path, "/keys") {
+				h.ServeHTTP(w, r)
+				return
+			}
+			if m == "500" {
+				http.Error(w, `{"code":"internal"}`, 500)
+				return
+			}
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, r)
+			var body map[string]any
+			if rec.Code != 200 || json.Unmarshal(rec.Body.Bytes(), &body) != nil {
+				w.WriteHeader(rec.Code)
+				w.Write(rec.Body.Bytes())
+				return
+			}
+			switch m {
+			case "old":
+				delete(body, "epoch")
+				delete(body, "level")
+				delete(body, "pad")
+			case "stale":
+				body["epoch"] = 1
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			json.NewEncoder(w).Encode(body)
+		})
+	}})
+	k := clienttest.NewKey("k")
+	jwk, priv, _ := seal.GenerateRecipient()
+	only := map[string]any{"enc": jwk, "rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}}
+	mkNS := func(ns string, enc map[string]any) *client.Client {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": enc}))
+		return s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:li", []string{ns}, []string{"read", "create", "append"}, only)), client.WithKeys(client.NewKeys(priv)))
+	}
+
+	li := mkNS("as", map[string]any{"level": "sealed"})
+	w := must(li.Create(ctx, "as", "a", nonced(client.GenesisPatches(map[string]any{"n": 0}))))
+	g := client.NewGesture()
+	must(li.Append(ctx, "as", "a", w.ID, nonced(ops(op("replace", "/n", 1))), client.WithGesture(g)))
+	mode.Store("old")
+	if plan := must(li.PlanUndo(ctx, "as", g, client.UndoResources("a"))); plan.Level != "sealed" {
+		t.Fatalf("sealed plan from an older /keys %+v", plan)
+	}
+
+	mode.Store("")
+	li = mkNS("ae", map[string]any{"level": "e2e"})
+	adminJWK, adminPriv, _ := seal.GenerateRecipient()
+	ac := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"ae"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": adminJWK})))
+	ax := ac.E2E(adminPriv)
+	must(ax.InitKeyring(ctx, "ae", priv.PublicKey()))
+	lx := li.E2E(priv)
+	w = must(lx.CreateDocSealed(ctx, "ae", "a", map[string]any{"n": 0}))
+	g = client.NewGesture()
+	w = must(lx.AppendSealed(ctx, "ae", "a", w.ID, ops(op("replace", "/n", 1)), client.WithGesture(g)))
+	e2e := []client.UndoOption{client.UndoResources("a"), client.UndoE2E(lx)}
+
+	mode.Store("old")
+	if _, err := li.Undo(ctx, "ae", g, e2e...); !errors.Is(err, client.ErrUndoE2ELimited) {
+		t.Fatalf("e2e undo with an older /keys: %v", err)
+	}
+	if _, err := lx.AppendSealed(ctx, "ae", "a", w.ID, ops(op("replace", "/n", 2))); err == nil || strings.Contains(err.Error(), "not e2e") {
+		t.Fatalf("e2e write with an older /keys: %v", err)
+	}
+
+	mode.Store("500")
+	var ae *client.APIError
+	if _, err := li.PlanUndo(ctx, "ae", g, e2e...); !errors.As(err, &ae) || ae.Status != 500 || errors.Is(err, client.ErrUndoE2ELimited) {
+		t.Fatalf("undo with a failing /keys: %v", err)
+	}
+
+	mode.Store("")
+	if e := must(ax.RotateEpoch(ctx, "ae", priv.PublicKey())); e != 2 {
+		t.Fatalf("epoch %d", e)
+	}
+	mode.Store("stale")
+	w = must(lx.AppendSealed(ctx, "ae", "a", w.ID, ops(op("replace", "/n", 2))))
+	if kid := sealedKid(t, ac, "ae", "a", w.ID); kid != "ae#2" {
+		t.Fatalf("sealed under %s with a stale epoch from /keys", kid)
+	}
 }

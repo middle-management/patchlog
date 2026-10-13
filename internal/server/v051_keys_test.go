@@ -10,8 +10,10 @@ import (
 // §E.2.3, §C.5: POST /ns/{ns}/keys names the current epoch, the level and
 // pad, which a writer limited to some resources needs to seal (§E.3.1) and
 // can't read in the namespace document. Keys stay wrapped to the grant's
-// enc, and the answer is no-store. A namespace that isn't sealed is 404
-// not_offered: there is nothing to seal.
+// enc, and the answer is no-store. At E3 the relay gives such a writer
+// its own keyring entries without a read of the keyring (§E.3.2). A
+// namespace that isn't sealed is 404 not_offered: there is nothing to
+// seal.
 func TestKeysLimitedWriter(t *testing.T) {
 	t.Parallel()
 	e := newSealedAuthEnv(t)
@@ -91,9 +93,10 @@ func TestKeysLimitedWriter(t *testing.T) {
 	_, r = e.keysOf("s", nil, li)
 	answer(r, 2, "sealed", false)
 
-	// E3: the relay is a read of the keyring, so a writer limited to some
-	// resources that may read it gets its wrapped keys with the epoch and
-	// pad; one that may not is 404, as before.
+	// E3: the server only relays what a key holder wrapped to the grant's
+	// enc, so a writer limited to some resources gets its own entries with
+	// the epoch and pad, without reading the keyring. A grant without enc
+	// is 422, and one whose rules refuse every read 404.
 	e.mkNS("x", map[string]any{"read": "grant", "keys": []any{k.entry("*")}, "encryption": map[string]any{"level": "e2e", "pad": true}})
 	k1 := seal.NewKey()
 	kr, err := seal.BuildKeyring("x", 1, k1, []*ecdh.PublicKey{pub})
@@ -101,7 +104,10 @@ func TestKeysLimitedWriter(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.create("x", "keyring", kr.Value(), e.grant(k, "user:admin", []string{"x"}, []string{"read", "create"}))
-	li = e.grant(k, "user:li", []string{"x"}, rights, only("a", "keyring"))
+	li = e.grant(k, "user:li", []string{"x"}, rights, only("a"))
+	if r := e.get("/r/x/keyring", li); r.Code != 404 {
+		t.Fatalf("the limited writer reads the keyring: %d", r.Code)
+	}
 	keys, r = e.keysOf("x", nil, li)
 	answer(r, 1, "e2e", true)
 	if len(keys) != 1 {
@@ -113,6 +119,15 @@ func TestKeysLimitedWriter(t *testing.T) {
 	if got, err := seal.UnwrapKey(priv, w); err != nil || string(got) != string(k1) {
 		t.Fatalf("unwrap %v", err)
 	}
-	_, r = e.keysOf("x", nil, e.grant(k, "user:li", []string{"x"}, rights, only("a")))
+	keys, r = e.keysOf("x", map[string]any{"epochs": []any{}}, li)
+	answer(r, 1, "e2e", true)
+	if len(keys) != 0 {
+		t.Fatalf("e2e keys without epochs %s", r.Body)
+	}
+	noEnc := map[string]any{"rules": only("a")["rules"]}
+	_, r = e.keysOf("x", nil, e.grant(k, "user:li", []string{"x"}, rights, noEnc))
+	expectCode(t, r, 422, "invalid")
+	refuses := map[string]any{"enc": jwk, "rules": []any{map[string]any{"op": "test", "path": "/action", "value": "append"}}}
+	_, r = e.keysOf("x", nil, e.grant(k, "user:w", []string{"x"}, rights, refuses))
 	expectCode(t, r, 404, "not_found")
 }

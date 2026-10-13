@@ -39,8 +39,7 @@ package client
 // Writes seal under the current epoch, with the pad setting, both from the
 // namespace document, or, for a writer limited to some resources that
 // can't read it (§C.5), from what POST /ns/{ns}/keys names beside the keys
-// (§E.2.3). The relay is a read of the keyring, so such a grant needs
-// enc and a read of "keyring" too.
+// (§E.2.3), which relays keys to such a grant when it carries enc.
 //
 // Padding (§E.2.2, §E.3.1). In a namespace with "encryption": { "pad":
 // true } writes pad the plaintext of every sealed patch set (and prune
@@ -306,22 +305,34 @@ func (x *E2E) config(ctx context.Context, ns string) (*e2eConfig, error) {
 // read, as by a writer limited to some resources (§C.5), the current epoch
 // and pad come from POST /ns/{ns}/keys instead (§E.2.3, §E.3.1). Bases are
 // then unknown, which only reads need (chain), and keep needing the
-// document.
+// document. The server is outside the trust boundary at E3, so the epoch
+// it names is raised to the newest one relayed to this grant: a server
+// can't have it seal under an epoch older than one it holds a key for,
+// though it can still withhold a newer one.
 func (x *E2E) writeConfig(ctx context.Context, ns string) (*e2eConfig, error) {
 	cfg, err := x.config(ctx, ns)
 	if !nsUnreadable(err) {
 		return cfg, err
 	}
-	a, kerr := x.c.FetchKeysAnswer(ctx, ns, []int{}, nil)
+	a, kerr := x.c.FetchKeysAnswer(ctx, ns, nil, nil)
 	switch {
 	case IsNotOffered(kerr):
 		return nil, fmt.Errorf("client: namespace %s is not e2e (it isn't sealed)", ns)
 	case kerr != nil:
 		return nil, fmt.Errorf("client: namespace %s: sealing needs the current epoch and pad, which neither its document (%w) nor /keys (%w) gives this grant", ns, err, kerr)
+	case a.Level == "" || a.Epoch < 1:
+		// A deployment before v0.51 names neither (§E.2.3).
+		return nil, fmt.Errorf("client: namespace %s: sealing needs the current epoch and pad, which neither its document (%w) nor /keys gives this grant", ns, err)
 	case a.Level != "e2e":
 		return nil, fmt.Errorf("client: namespace %s is not e2e (encryption.level %q)", ns, a.Level)
 	}
-	return &e2eConfig{Epoch: max(a.Epoch, 1), Pad: a.Pad}, nil
+	epoch := a.Epoch
+	for _, k := range a.Keys {
+		if kns, e, perr := seal.ParseKid(k.Kid); perr == nil && kns == ns && e > epoch {
+			epoch = e
+		}
+	}
+	return &e2eConfig{Epoch: epoch, Pad: a.Pad}, nil
 }
 
 // --- writes ---------------------------------------------------------------

@@ -456,8 +456,10 @@ type KeysAnswer struct {
 // the last historyEpochs) to the current one, and never include an epoch
 // that started after the grant's effective exp (§E.2.3). Keys are
 // HPKE-wrapped to the root block's enc if it has one, and raw base64url
-// otherwise. A namespace that isn't sealed is 404 not_offered, once the
-// read check passes: there is nothing to seal (§E.2.3).
+// otherwise. At E3 any grant with read, whatever its rules, gets the
+// keyring entries wrapped to its enc (§E.3.2). A namespace that isn't
+// sealed is 404 not_offered, once the read check passes: there is nothing
+// to seal (§E.2.3).
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) (*KeysAnswer, error) {
 	var out []map[string]any
 	var ans *KeysAnswer
@@ -476,10 +478,15 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		if aerr != nil {
 			return aerr
 		}
+		perResource, refused := t.keysReadScope(a)
 		if cfg.level == levelE2E {
-			// The relay is a read of the keyring (§E.3.2); per-resource
-			// keys don't exist at E3.
-			if a.verified != nil && t.grantRules(a, "read", nil, t.basicEnvelope("read", KeyringName, a), false) != nil {
+			// The server only relays the keyring entries a key holder
+			// wrapped to the grant's enc (§E.3.2), so a grant that reads
+			// the namespace gets its own, unrestricted or limited to some
+			// resources: such a writer needs them, and the epoch and pad,
+			// to seal (§E.2.3, §E.3.1). Per-resource keys don't exist at
+			// E3. A grant whose rules refuse every read reads nothing.
+			if refused {
 				return notFound()
 			}
 			// 410 once the read check passes, as every URL of a
@@ -494,21 +501,8 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			ans = &KeysAnswer{Keys: keys, Epoch: cfg.Epoch, Level: levelNames[cfg.level], Pad: cfg.Pad}
 			return nil
 		}
-		// K_e only through rules none of which refers to /resource (§C.5).
-		// Roles are alternatives: if the unrestricted ones fail, a read role
-		// that refers to /resource may still pass per resource; without
-		// one, the grant doesn't read the namespace unrestricted, and is
-		// 403 (§E.2.3).
-		perResource := false
-		if a.verified != nil {
-			roles, ok := a.unrestrictedRoles()
-			if ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) != nil {
-				if _, all := a.verified.Allows("read"); len(roles) == len(all) {
-					return forbidden("epoch keys need unrestricted read on the namespace (§C.5, §E.2.3)")
-				}
-				ok = false
-			}
-			perResource = !ok
+		if refused {
+			return forbidden("epoch keys need unrestricted read on the namespace (§C.5, §E.2.3)")
 		}
 		if n.purged {
 			return t.purgedNS(n)
@@ -585,6 +579,25 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		return nil
 	})
 	return ans, err
+}
+
+// keysReadScope classifies a grant for /keys (§C.5, §E.2.3). K_e only
+// through rules none of which refers to /resource. Roles are
+// alternatives: if the unrestricted ones fail, a read role that refers to
+// /resource may still pass per resource (perResource); without one, the
+// grant doesn't read the namespace unrestricted (refused).
+func (t *tx) keysReadScope(a *actor) (perResource, refused bool) {
+	if a == nil || a.verified == nil {
+		return false, false
+	}
+	roles, ok := a.unrestrictedRoles()
+	if ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) != nil {
+		if _, all := a.verified.Allows("read"); len(roles) == len(all) {
+			return false, true
+		}
+		ok = false
+	}
+	return !ok, false
 }
 
 func recipientOf(a *actor) *ecdh.PublicKey {

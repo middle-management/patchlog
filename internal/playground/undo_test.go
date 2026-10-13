@@ -357,7 +357,7 @@ func runUndoHarness(t *testing.T, node, harness string, input map[string]any) []
 	var fns []string
 	for _, f := range []string{"logPages", "pageEndErr", "jweID", "readLogRange", "nsLogRead", "openEntries", "openSealed", "readDoc", "foldTarget",
 		"undoPtr", "undoPtrStr", "ptrGet", "sameAt", "hasPrefix", "widenWrite", "coverPaths", "pathsOverlap", "foldUndo", "moveBack", "invertRev",
-		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoNSLogOr", "undoReadRes", "undoPlan", "undoImpossible", "undoRun",
+		"planUndoResource", "undoSites", "undoStackFrom", "undoGestureList", "undoNSLog", "undoNSLogOr", "undoReadRes", "undoKeysLevel", "undoPlan", "undoImpossible", "undoRun",
 		"undoLatest", "needsNonce"} {
 		fns = append(fns, jsFunction(t, js, f))
 	}
@@ -403,6 +403,8 @@ const undoLimitedHarness = undoPrelude + `
   out.pruned = sum(await undoRun('lp', input.gp, o({ resources: ['a'] })));
   out.below = sum(await undoRun('lp', input.gw, o({ resources: ['a'] })));
   out.after = sum(await undoRun('lp', input.gp2, o({ resources: ['a'] })));
+  out.other = sum(await undoRun('lp', input.gx, o({ resources: ['a', 'b'] })));
+  out.belowB = sum(await undoRun('lp', input.gq, o({ resources: ['a', 'b'] })));
   process.stdout.write(JSON.stringify(out));
 })().catch((e) => { console.error(e); process.exit(1); });
 `
@@ -410,13 +412,14 @@ const undoLimitedHarness = undoPrelude + `
 // §11.2 Finding a gesture, §C.5: the playground's undo for a grant limited
 // to some resources, which reads neither the namespace log nor its
 // document. In a sealed namespace it scans the logs of the documents it
-// knows the action touched, learns the level from the JWEs it reads and
-// adds fresh nonces; without them it refuses instead of failing on a 403;
-// redo finds the undo in those logs; in an e2e namespace it refuses, and
-// names the Go client. The undo is impossible rather than done in part
-// when the gesture's oldest entry lies at or before the oldest entry read
-// after a pruning horizon: its first revision read is that one, so it may
-// continue below, or none follows, so it may lie wholly below (§11.2).
+// knows the action touched, learns the level from /keys (§E.2.3) and adds
+// fresh nonces; without them it refuses instead of failing on a 403; redo
+// finds the undo in those logs; in an e2e namespace it refuses, and names
+// the Go client. The undo is impossible rather than done in part when the
+// gesture's first revision read follows a pruning horizon, so it may
+// continue below, or when it is found in no document named and one has a
+// horizon, so it may lie wholly below (§11.2). A document with a horizon
+// and no entry of a gesture found in another is left out.
 func TestUndoLimitedWithNode(t *testing.T) {
 	t.Parallel()
 	node, err := exec.LookPath("node")
@@ -477,24 +480,36 @@ func TestUndoLimitedWithNode(t *testing.T) {
 	check(wp, err)
 	wp, err = li.Append(ctx, "lp", "a", wp.ID, nonced(op("replace", "/r", 1)))
 	check(wp, err)
-	check(li.Append(ctx, "lp", "a", wp.ID, nonced(op("replace", "/r", 2)), client.WithGesture(gp2)))
+	wp, err = li.Append(ctx, "lp", "a", wp.ID, nonced(op("replace", "/r", 2)), client.WithGesture(gp2))
+	check(wp, err)
+	// lp/b: li's gesture gq, pruned at b's head, lies wholly below it.
+	gq, gx := client.NewGesture(), client.NewGesture()
+	wq, err := li.Create(ctx, "lp", "b", nonced(client.GenesisPatches(map[string]any{"q": 0})...))
+	check(wq, err)
+	wq, err = li.Append(ctx, "lp", "b", wq.ID, nonced(op("replace", "/q", 1)), client.WithGesture(gq))
+	check(wq, err)
 	s.Clock.Advance(10 * time.Minute)
-	check(s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:op", []string{"lp"}, []string{"read", "prune"}))).Prune(ctx, "lp", "a", client.PruneRequest{Horizon: horizon}))
+	pc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:op", []string{"lp"}, []string{"read", "prune"})))
+	check(pc.Prune(ctx, "lp", "a", client.PruneRequest{Horizon: horizon}))
+	check(pc.Prune(ctx, "lp", "b", client.PruneRequest{Horizon: wq.ID}))
+	// gx, on a only after b's prune, is undone though b, named too, has
+	// no entry of it after its horizon.
+	check(li.Append(ctx, "lp", "a", wp.ID, nonced(op("add", "/v", 1)), client.WithGesture(gx)))
 	fkp, err := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"lp"}, []string{"read"}))).FetchKeys(ctx, "lp", nil, nil)
 	if err != nil || len(fkp) != 1 || fkp[0].Key == nil {
 		t.Fatalf("keys %v %v", fkp, err)
 	}
 
 	b := runUndoHarness(t, node, undoLimitedHarness, map[string]any{"base": s.URL, "author": "user:li", "bearer": liGrant,
-		"key": base64.RawURLEncoding.EncodeToString(fk[0].Key), "nsKeys": map[string]any{"lp": base64.RawURLEncoding.EncodeToString(fkp[0].Key)}, "g": g, "gb": gb, "ge": ge, "gp": gp, "gp2": gp2, "gw": gw})
+		"key": base64.RawURLEncoding.EncodeToString(fk[0].Key), "nsKeys": map[string]any{"lp": base64.RawURLEncoding.EncodeToString(fkp[0].Key)}, "g": g, "gb": gb, "ge": ge, "gp": gp, "gp2": gp2, "gw": gw, "gq": gq, "gx": gx})
 	type res struct {
 		OK                                  bool
 		Gesture, Source, Level, Author, Err string
 		Steps                               []any
 	}
 	var out struct {
-		Bare, Only, Undo, Redo, E2E, Pruned, Below, After res
-		Latest                                            string
+		Bare, Only, Undo, Redo, E2E, Pruned, Below, After, Other, BelowB res
+		Latest                                                           string
 	}
 	if err := json.Unmarshal(b, &out); err != nil {
 		t.Fatalf("node output %s: %v", b, err)
@@ -534,6 +549,12 @@ func TestUndoLimitedWithNode(t *testing.T) {
 	}
 	if !out.After.OK || out.After.Level != "sealed" {
 		t.Errorf("a gesture after the horizon %+v", out.After)
+	}
+	if !out.Other.OK || len(out.Other.Steps) != 1 {
+		t.Errorf("a gesture beside a document pruned at its head %+v", out.Other)
+	}
+	if out.BelowB.OK || out.BelowB.Err != "pruned" {
+		t.Errorf("a gesture wholly below the horizon of one of two documents %+v", out.BelowB)
 	}
 	if _, d, err := li.Load(ctx, "lp", "a"); err != nil || d.Value.(map[string]any)["n"] != float64(1) || d.Value.(map[string]any)["r"] != float64(1) {
 		t.Errorf("lp/a after the refusal and the undo: %v %v", d, err)

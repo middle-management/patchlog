@@ -987,14 +987,21 @@ st, err  := c.UndoStack(ctx, "docs", "alice")   // st.Done / st.Undone, each ite
   counts for the merger who wrote it there, since only the namespace log shows the merge (§F.3).
   Without markers, the undo is impossible (`pruned`) rather than done in part when the
   gesture's oldest entry in a named document lies at or before the oldest entry it can read
-  after a pruning horizon: the gesture's first entry read is that one, so it may continue
-  below, or none follows the horizon, so it may lie wholly below (§11.2, v0.51; a log read from
-  genesis has nothing before it). The level comes from `POST /ns/{ns}/keys` (`plan.Level`;
+  after a pruning horizon (§11.2, v0.51): the gesture's first entry read is that one, so it may
+  continue below, or the gesture is found in no named document, by anyone, and one has a
+  horizon, so it may lie wholly below. That covers a gesture never in those documents too,
+  such as a mistyped id, since nothing tells them apart. A named document with a horizon and no
+  entry of a gesture found in another is left out, as one the gesture didn't touch, so the
+  `UndoStack`-then-`Undo` flow over every document followed keeps working after retention
+  prunes one; a gesture lying wholly below the horizon there is then undone in the others only.
+  A log read from genesis has nothing before it, so a genesis read from there is undone (the
+  reference's reading of §11.2). The level comes from `POST /ns/{ns}/keys` (`plan.Level`;
   `404 not_offered` is a namespace that isn't sealed), and at E3 the current epoch and pad
   sealing the inverse needs, so such a writer undoes there with `UndoE2E` (§E.2.3, v0.51).
-  Where `/keys` refuses too, as for a grant that can't read the keyring, the level is learned
-  from what is read: entries whose patch set is one `sealed` op are e2e, else a resource log
-  delivered as JWEs is sealed; an e2e undo is then refused (`client.ErrUndoE2ELimited`).
+  Where `/keys` refuses (`403`, `404`, or `422` for a grant without `enc` at E3) or names no
+  level, as a deployment before v0.51, the level is learned from what is read: entries whose
+  patch set is one `sealed` op are e2e, else a resource log delivered as JWEs is sealed; an
+  e2e undo is then refused (`client.ErrUndoE2ELimited`). Other `/keys` errors are returned.
 - **The inverse**, per resource, the gesture's own entries newest first: a revision becomes the patch
   set that sets the paths it wrote back to its parent's values (writes to array elements widened to
   the whole array, as merges do; a revision of moves only is moved back when both ends are unchanged);
@@ -1032,8 +1039,9 @@ gesture" in History), and shows conflicts (red, with the later entries and paths
 apart from "undo impossible" (pruned, blob, invalid). It refuses to write undos in e2e namespaces and
 points to the Go client, which undoes there for grants limited to some resources too. For a grant
 that can't read the namespace log, undo and redo scan the log of the open resource instead,
-learning from it whether the namespace is sealed, and refuse as impossible a gesture whose first
-entry read follows a pruning horizon, or that has none after it.
+asking `/keys` whether the namespace is sealed (learning it from the log where `/keys` doesn't
+say), and refuse as impossible a gesture whose first entry read follows a pruning horizon, or
+that is found in none of them while one has a horizon.
 
 ### Search index (Addendum A)
 
@@ -1685,8 +1693,11 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   epoch keys and public X25519 JWKs only). It is the only plaintext resource: written by key
   holders with ordinary writes, checked like any document plus `seal.ParseKeyring`, `ns` equal
   to the namespace and `current` not after `encryption.epoch`.
-- **`POST /ns/{ns}/keys`** relays only wrapped keys: it needs a verified grant that may read
-  the resource `keyring` and whose root block carries `enc` (else `422`; non-readers `404`), and
+- **`POST /ns/{ns}/keys`** relays only wrapped keys: it needs a verified grant with `read`
+  whose root block carries `enc` (else `422`; non-readers, and grants whose rules refuse every
+  read, `404`). A grant limited to some resources gets its own entries too, without reading the
+  keyring: a key holder chose to wrap them to its `enc`, and it needs them to seal (§E.2.3,
+  §E.3.2, v0.51; before, the relay needed a read of `keyring`, which §E.3.2 doesn't say). It
   returns `{ "keys": [ { kid, suite, wrapped } ], "epoch", "level": "e2e", "pad" }` — that recipient's keyring entries (by
   `seal.RecipientID` of `enc`) for the epochs the grant is entitled to (the E2 rule: from the
   epoch in force at `nbf`, capped by `historyEpochs`, none begun at or after `exp`). Per-resource
@@ -1723,9 +1734,11 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   `RotateEpoch` writes the keyring and the epoch bump in one batch. Keys come from `/keys`,
   falling back to the keyring resource. `client.EncryptionLevel(ns)` reports a namespace's level.
   A writer limited to some resources, which can't read the namespace document (§C.5), seals
-  under the epoch and `pad` `/keys` names (`client.FetchKeysAnswer`); its grant needs `enc` and
-  a read of `keyring`, which the relay reads. It then can't tell which configuration older
-  revisions were written under, so its folds flag nothing for padding.
+  under the epoch and `pad` `/keys` names (`client.FetchKeysAnswer`); its grant needs `enc`. The
+  server is outside the trust boundary at E3, so the epoch is raised to the newest one relayed
+  to the grant: a server can't make it seal under an epoch older than one it holds a key for,
+  though it can withhold a newer one. It then can't tell which configuration older revisions
+  were written under, so its folds flag nothing for padding.
 - **Refusals.** The merge tool refuses e2e namespaces (§F.8: merges re-encrypt, never
   fast-forward); `patchlog export` refuses snapshots of them (full history carries the
   ciphertext, §G.5.1).
