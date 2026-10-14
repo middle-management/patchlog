@@ -582,7 +582,12 @@ type tx struct {
 	// the chains it appended to, which it knows while it holds their log
 	// locks.
 	logHeads map[int64]logHead
-	noLock   int
+	// cancelDue, when set (a group commit's transaction), cancels its ctx
+	// right before the commit if every request of the group is cancelled:
+	// commitGroup learns of that through context.AfterFunc, whose
+	// functions run in goroutines that may not have run yet.
+	cancelDue func()
+	noLock    int
 	// sharedNS is the namespace a resource write or batch appends to
 	// holding its lock only shared (pglock.go); 0 if none.
 	sharedNS int64
@@ -727,6 +732,24 @@ func (e *Engine) updateOnce(ctx context.Context, f func(t *tx) error, want map[i
 		// long older transactions hold back the log they follow (tailer.go).
 		_, err := t.Tx.Exec(`UPDATE cache_gen SET gen = gen + 1 WHERE id = 1`)
 		t.must(err)
+	}
+	// A write whose ctx is done rolls back, also while database/sql's
+	// transaction context, derived from ctx, isn't cancelled yet: a
+	// context.WithCancel context is cancelled only after its parent's Done
+	// is closed, and Commit checks that context alone (SQLite's driver then
+	// commits under context.Background; Postgres's checks ctx). So a write
+	// cancelled before it reaches its commit, as by a graceful shutdown's
+	// timeout (lifecycle), doesn't commit; one cancelled while it commits
+	// may, and is answered as committed (or, on Postgres, as cancelled
+	// with its outcome unknown, which the idempotent retry settles, §7.2).
+	if t.cancelDue != nil {
+		t.cancelDue()
+	}
+	if ctx.Err() != nil {
+		sqlTx.Rollback()
+		e.removeFiles(t.newFiles)
+		// Reported as ctx's error (ctxErr).
+		return nil, sql.ErrTxDone
 	}
 	e.rc.begin(inv)
 	committing = true

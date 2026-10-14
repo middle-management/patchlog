@@ -809,8 +809,9 @@ On SIGTERM or SIGINT a server shuts down in phases:
    their wait had run out. Every other request in flight, writes included, is waited for, up to
    `-shutdown-timeout` (default 30s).
 4. **Cancel**, only if that timeout expires: the remaining requests' contexts are cancelled, so
-   their transactions roll back (nothing of a cancelled write is stored, and the chains stay
-   intact), and their handlers get 2 s more to return.
+   their transactions roll back (nothing of a write cancelled before its commit is stored, and
+   the chains stay intact; one cancelled while it commits may still be stored, and a client
+   retrying it unchanged finds it, §7.2), and their handlers get 2 s more to return.
 5. **Close.** Only then does the core stop its background jobs (retention, remote follows,
    epoch rotation), resign leadership and close the database, and the CDN purger flush its queue
    (up to 5 s); the index and tree stop following and close their databases. The database is

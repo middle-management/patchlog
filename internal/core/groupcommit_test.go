@@ -1310,6 +1310,49 @@ func TestPGGroupCommitCancelOneOfGroup(t *testing.T) {
 	}
 }
 
+// A group whose requests are all cancelled right before its commit rolls
+// back, also while the context.AfterFunc functions that cancel the group's
+// context haven't run yet (lagCtx holds them back): every request returns
+// its cancellation and nothing is written. A graceful shutdown's timeout
+// cancels a group's requests so (lifecycle).
+func TestPGGroupCommitCancelledBeforeCommit(t *testing.T) {
+	e := groupEngine(t)
+	mkNS(t, e, "n", map[string]any{"read": "public"})
+	const n = 2
+	ctxs := make([]*lagCtx, n)
+	for i := range n {
+		ctxs[i] = newLagCtx()
+		defer ctxs[i].release()
+	}
+	lags := ctxs[0].lags(t)
+	sizes := groupSizes(e)
+	var once sync.Once
+	e.opt.BeforeCommit = func(context.Context) {
+		once.Do(func() {
+			for _, c := range ctxs {
+				c.cancel()
+			}
+		})
+	}
+	holdChecked(t, e, n, nil)
+	res, errs := concurrently(n, func(i int) (*WriteResult, error) {
+		return writeCtx(ctxs[i], e, "n", fmt.Sprint("c", i), i)
+	})
+	lags()
+	if got := sizes(); len(got) != 1 || got[0] != n {
+		t.Fatalf("group attempts %v, want one of %d", got, n)
+	}
+	for i, err := range errs {
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("write %d: %+v, %v", i, res[i], err)
+		}
+	}
+	if xids := checkChain(t, e, "n"); len(xids) != 1 {
+		t.Fatalf("%d entries, want 1 (nothing written)", len(xids))
+	}
+	within(t, 5*time.Second, "the namespace's state is dropped", func() bool { return idle(e) })
+}
+
 // A group whose COMMIT fails (a deferred trigger raising once): every write
 // is answered alone and commits once.
 func TestPGGroupCommitFailedCommit(t *testing.T) {

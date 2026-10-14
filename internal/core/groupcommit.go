@@ -301,7 +301,8 @@ func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 	observeGroup(len(group))
 	// No single request's cancellation aborts the group, but once every
 	// one of its requests is cancelled (a shutdown timeout), so is it,
-	// even while it waits for a lock (acquire).
+	// even while it waits for a lock (acquire), and it doesn't commit
+	// (cancelDue).
 	ctx, cancel := context.WithCancel(context.WithoutCancel(group[0].ctx))
 	defer cancel()
 	var left atomic.Int64
@@ -320,6 +321,14 @@ func (e *Engine) commitGroup(ns string, group []*groupWrite) {
 			w.res, w.alone = nil, false
 		}
 		t.logHeads = map[int64]logHead{}
+		t.cancelDue = func() {
+			for _, w := range group {
+				if w.ctx.Err() == nil {
+					return
+				}
+			}
+			cancel()
+		}
 		want := map[int32]lockMode{}
 		for _, w := range group {
 			want[lockKey(w.plan.n.id)] = lockShared
