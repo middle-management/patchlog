@@ -51,6 +51,13 @@ From implementing v0.51 and v0.52. Each gives what the reference chose.
    checkpoint. Its read check for such a namespace goes through the gestures listing, the one
    URL that still answers a limited reader. *Propose:* say how a service checks read on a
    purged sealed namespace.
+10. **Restores and creates in a purged namespace** (§B.11.4, §8.5). §B.11.4 lists "a name
+    that never existed is `404`, and a purged item `410`" without saying which wins in a purged
+    namespace. Neither the core, which answers `410 purged` for every name there (§8.5), nor a
+    service started after the purge can tell a name that never existed from a purged one, so the
+    reference answers `410` for any name of a purged namespace. A create grant there is still
+    `409` "exists or existed", as §B.11.4 states, though the core would refuse the write with
+    `410`. *Propose:* say that any name of a purged namespace is `410`, for restores and creates.
 
 ## Settled in v0.51 and v0.52
 

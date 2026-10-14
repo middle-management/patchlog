@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+**Fixes:**
+- **Restores in a purged namespace** (tree/catalog, §B.11.4, §8.5): a service started after a
+  trusted content namespace was purged, sealed or not, answered a catalog restore of one of its
+  items `404` "has never existed" instead of `410`, because it holds no rows for most of those
+  items. Any name the service holds no row for, in a namespace it holds as purged, is now
+  purged, as the core answers `410 purged` for every name there. So a restore of a name that
+  never existed in a purged namespace is `410` too, also on a service that followed the purge;
+  in a namespace that isn't purged it is still `404`. Late-started, restarted and following
+  services give the same answers and checkpoints, and their placements dangle as `purged`, not
+  `missing`, in `/problems`, also after a restart.
+- **Listings that change at an unchanged `at`:** a start that finds the derived rows drifted
+  from what the graph gives now purges `ns:{catalog}` (stored sealed and kept listings, and
+  through `-purge-url`), since edges cache listings at an `at` as immutable. The first start
+  after upgrading does this once for a service that showed a purged namespace's never-seen
+  names as `missing`.
+
 ## v0.20.0
 
 Implements spec **v0.52**. v0.51 settles all fifteen of the reference's v0.50 notes, most as
