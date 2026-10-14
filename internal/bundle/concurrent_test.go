@@ -347,13 +347,41 @@ func TestImportConcurrentDraws(t *testing.T) {
 
 // fastClock runs a hundred times faster than time, for server and importer
 // alike: concurrent batches' waits overlap as they would.
-type fastClock struct{ t0, start time.Time }
+type fastClock struct {
+	t0     time.Time
+	mu     sync.Mutex
+	start  time.Time
+	paused bool
+}
 
 func newFastClock() *fastClock {
 	return &fastClock{t0: time.Date(2026, 10, 8, 12, 0, 0, 0, time.UTC), start: time.Now()}
 }
 
-func (c *fastClock) Now() time.Time { return c.t0.Add(100 * time.Since(c.start)) }
+// newPausedClock is a fastClock that stays at t0 until run: setting a
+// deployment up takes real time on a loaded machine, which a running
+// clock would multiply a hundredfold into a window the test depends on.
+func newPausedClock() *fastClock {
+	c := newFastClock()
+	c.paused = true
+	return c
+}
+
+// run starts a paused clock from t0.
+func (c *fastClock) run() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.start, c.paused = time.Now(), false
+}
+
+func (c *fastClock) Now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.paused {
+		return c.t0
+	}
+	return c.t0.Add(100 * time.Since(c.start))
+}
 
 func (c *fastClock) Sleep(ctx context.Context, d time.Duration) error {
 	t := time.NewTimer(d / 100)
@@ -442,13 +470,16 @@ func TestImportConcurrentAllowanceEnds(t *testing.T) {
 	}{{0.5, 100 * time.Second}, {2, 90 * time.Second}} {
 		t.Run(fmt.Sprint("rate", tc.rate), func(t *testing.T) {
 			t.Parallel()
-			clk := newFastClock()
+			// The allowance's window is a second of real time: the clock
+			// starts only once the deployment is set up.
+			clk := newPausedClock()
 			dst := newDeployment(t, cmsOrigin, func(o *core.Options) { o.Now = clk.Now })
 			dst.ns("data", map[string]any{"read": "public", "limits": map[string]any{"itemsPerBatch": 3},
 				"allowances": []any{map[string]any{"sub": "alice", "kid": "any", "until": clk.Now().Add(tc.ends).Format(time.RFC3339),
 					"bucket": map[string]any{"rate": tc.rate, "burst": 1000}, "itemsPerBatch": 10}}})
 			log := &batchLog{rt: transport}
 			c := must(client.New(dst.url, client.WithAuthor("alice"), client.WithHTTPClient(&http.Client{Transport: log})))
+			clk.run()
 			rep, err := bundle.Import(ctx, c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Backfill, Pace: 1, Concurrency: 8,
 				Now: clk.Now, Sleep: clk.Sleep})
 			if err != nil {
