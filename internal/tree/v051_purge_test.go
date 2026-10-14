@@ -2,7 +2,9 @@ package tree_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
 
@@ -100,5 +102,99 @@ func TestSealedPurged(t *testing.T) {
 				t.Errorf("%s: token %.10q: %d %v, want %d", name, tok, r.status, r.body, want)
 			}
 		}
+	}
+}
+
+// TestReloadDriftPurges (§B.5, §8.5): a start that finds the derived rows
+// drifted, as when an earlier release held the placement of a name of a
+// purged namespace it never saw as missing, changes listings at an
+// unchanged checkpoint, which cached listings take never to go stale. So
+// it purges every listing of the catalog (ns:{catalog}), stored sealed
+// ones too. A start without drift purges nothing.
+func TestReloadDriftPurges(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"cat", "sec"} {
+		doc := map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"sec"}, "mode": "dag"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat", "sec"}, []string{"read", "create", "config", "purge-ns"})),
+		client.WithKeys(client.NewKeys(nil)))
+	createNonced(t, w, "cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	createNonced(t, w, "sec", "a", map[string]any{"title": "A"})
+	createNonced(t, w, "cat", "sec.a", map[string]any{"parents": parents("root")})
+	createNonced(t, w, "cat", "sec.never", map[string]any{"parents": parents("root")})
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat", "sec"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	path := filepath.Join(t.TempDir(), "tree.db")
+	start := func() *svc { return startSvc(t, sc, svcOpts{now: s.Now, db: path}) }
+	purges := func(x *svc) [][]string {
+		x.mu.Lock()
+		defer x.mu.Unlock()
+		return append([][]string(nil), x.purges...)
+	}
+	x := start()
+	x.caughtUp("cat", "sec")
+	must(w.PatchConfig(ctx, "sec", must(w.NSHead(ctx, "sec")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	secHead := must(w.PurgeNamespace(ctx, "sec", must(w.NSHead(ctx, "sec")).ID))
+	waitFor(t, "the content purge", func() bool { return x.s.Checkpoint("sec") == secHead })
+	full := k.Grant(t, s.Now(), "user:r", []string{"cat", "sec"}, []string{"read"})
+	r := x.raw("/cat/roots", full)
+	if r.status != 302 {
+		t.Fatalf("listing: %d %v", r.status, r.body)
+	}
+	if r := x.raw(r.header.Get("Location"), full); r.status != 200 {
+		t.Fatalf("listing at: %d %v", r.status, r.body)
+	}
+	x.stop()
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	stored := func() int {
+		var n int
+		if err := db.QueryRow(`SELECT count(*) FROM sealed_views`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	if stored() == 0 {
+		t.Fatal("no stored sealed listing")
+	}
+
+	y := start()
+	if p := purges(y); len(p) != 0 {
+		t.Errorf("a start without drift purged %v", p)
+	}
+	y.stop()
+	if stored() == 0 {
+		t.Error("a start without drift dropped the stored sealed listings")
+	}
+
+	// An earlier release held sec.never's placement as missing.
+	if res, err := db.Exec(`UPDATE nodes SET dangling = 'missing' WHERE name = 'sec.never'`); err != nil || must(res.RowsAffected()) != 1 {
+		t.Fatalf("recording the placement as an earlier release: %v", err)
+	}
+	z := start()
+	if p := purges(z); !reflect.DeepEqual(p, [][]string{{"ns:cat"}}) {
+		t.Errorf("a start with drift purged %v, want ns:cat", p)
+	}
+	z.s.View(func(g *tree.Graph, _ map[string]string) {
+		if n := g.Node("sec.never"); n == nil || n.Dangling != "purged" {
+			t.Errorf("the placement of sec.never: %+v", n)
+		}
+	})
+	z.stop()
+	if n := stored(); n != 0 {
+		t.Errorf("%d stored sealed listings after a start with drift", n)
 	}
 }

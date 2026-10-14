@@ -244,16 +244,17 @@ func TestPurgedContentKeepsAll(t *testing.T) {
 }
 
 // TestPurgedContentLateStart (§8.5, §B.11.4): a service that starts after
-// a trusted content namespace was purged, sealed or not, never sees its
-// items: a sealed one's log is 410 purged, and an at-rest one's replay
-// ends with the purge-ns entry, which drops what came before it. It
-// answers as one that followed the purge, and so after a restart: a
-// restore of an item of the namespace is 410, deleted or live when it was
-// purged, and so is one of a name the service never saw, placed or not,
-// since every name of a purged namespace is 410 at the core. Other grants
-// and read grants on them are refused as before, and their placements
-// dangle as purged, not missing. A name that never existed in a namespace
-// that isn't purged is still 404.
+// a trusted content namespace was purged, sealed or not, holds rows for
+// some of its items at most: a sealed one's log is 410 purged, and an
+// at-rest one's replay drops what comes before the purge-ns entry in its
+// batch. It answers as one that followed the purge, and so after a
+// restart: a restore of an item of the namespace is 410, deleted or live
+// when it was purged, and so is one of a name the service never saw,
+// placed or not, since every name of a purged namespace is 410 at the
+// core. Other grants and read grants on them are refused as before, and
+// their placements dangle as purged, not missing. A name that never
+// existed in a trusted namespace that isn't purged is still 404, on every
+// one of them.
 func TestPurgedContentLateStart(t *testing.T) {
 	t.Parallel()
 	for _, sealed := range []bool{false, true} {
@@ -263,8 +264,24 @@ func TestPurgedContentLateStart(t *testing.T) {
 			w.seed()
 			w.doc("cat", "matches.final", map[string]any{"parents": parents("season")})
 			ctx := context.Background()
+			var copts []client.Option
+			if sealed {
+				copts = append(copts, client.WithKeys(client.NewKeys(nil)))
+			}
+			// teams, a second trusted namespace, is never purged.
+			op := w.s.Client(t, client.WithBearer(w.s.OperatorGrant(t, "teams")))
+			must(op.CreateNamespace(ctx, "teams", map[string]any{"read": "grant", "keys": []any{w.opsKey.Entry("*")}}))
+			opc := w.s.Client(t, append(copts, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"read", "config"})))...)
+			must(opc.PatchConfig(ctx, "cat", must(w.ops.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/catalog/trust/-", "value": "teams"}}))
+			w.svcClient = w.s.Client(t, append(copts, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches", "teams"}, []string{"read"},
+				map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))...)
+			caughtUp := func() {
+				t.Helper()
+				w.caughtUp()
+				waitFor(t, "teams to be followed", func() bool { return w.svc.Tree().Checkpoint("teams") != "" })
+			}
 			w.start()
-			w.caughtUp()
+			caughtUp()
 			must(w.ops.Delete(ctx, "matches", "derby", must(w.ops.Head(ctx, "matches", "derby")).ID))
 			w.caughtUp()
 			bob := w.caller("user:bob", "match-desk")
@@ -275,13 +292,16 @@ func TestPurgedContentLateStart(t *testing.T) {
 			w.issue(bob, restore("derby"), 200)
 			w.purge("matches")
 
-			full := w.opsKey.Grant(t, w.s.Now(), "user:r", []string{"cat", "matches"}, []string{"read"})
+			full := w.opsKey.Grant(t, w.s.Now(), "user:r", []string{"cat", "matches", "teams"}, []string{"read"})
 			// answers are the service's decisions on the purged
 			// namespace's items: restores of a deleted item, a live one,
-			// a placed name that never existed and an unplaced one.
+			// a placed name that never existed and an unplaced one; and
+			// on a name that never existed in teams, which isn't purged.
 			answers := func(name string) map[string]string {
 				t.Helper()
 				out := map[string]string{}
+				r := w.issue(bob, map[string]any{"item": "/r/teams/ghost", "want": toAny("restore")}, 404)
+				out["restore teams ghost"] = fmt.Sprint(r.body["code"], r.body["message"], r.body["checkpoint"])
 				for _, it := range []string{"derby", "shared", "final", "ghost"} {
 					r := w.issue(bob, restore(it), 410)
 					out["restore "+it] = fmt.Sprint(r.body["code"], r.body["message"], r.body["checkpoint"])
@@ -293,7 +313,7 @@ func TestPurgedContentLateStart(t *testing.T) {
 					r := w.do("POST", "/grants", bob, req)
 					out[fmt.Sprint(req["want"], req["item"])] = fmt.Sprint(r.status, r.body)
 				}
-				r := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/shared", "/r/matches/ghost")})
+				r = w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/shared", "/r/matches/ghost")})
 				out["read-grants"] = fmt.Sprint(r.status, r.body)
 				if !sealed {
 					// A sealed catalog's listings are sealed.
@@ -313,13 +333,13 @@ func TestPurgedContentLateStart(t *testing.T) {
 			w.stop()
 			w.db = filepath.Join(t.TempDir(), "late.db")
 			w.start()
-			w.caughtUp()
+			caughtUp()
 			if got := answers("started after"); !reflect.DeepEqual(got, want) {
 				t.Errorf("started after the purge:\n%v\nwant\n%v", got, want)
 			}
 			w.stop()
 			w.start()
-			w.caughtUp()
+			caughtUp()
 			if got := answers("started after, restarted"); !reflect.DeepEqual(got, want) {
 				t.Errorf("started after the purge, restarted:\n%v\nwant\n%v", got, want)
 			}
