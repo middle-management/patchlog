@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.20.0
 
 Implements spec **v0.52**. v0.51 settles all fifteen of the reference's v0.50 notes, most as
 the reference did them; v0.52, from Doors, gives edge-grant exchanges a rate bucket of their
