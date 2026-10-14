@@ -2,6 +2,8 @@ package tree_test
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -47,5 +49,31 @@ func TestDBPathOpensThatFile(t *testing.T) {
 	}
 	if got := r.Checkpoint("matches"); got != matches {
 		t.Errorf("reopened: matches checkpoint %q, want %q", got, matches)
+	}
+}
+
+// A graph that an earlier release kept at the path cut at its '#' (or
+// '?', or with its %XX decoded) is refused, not replayed into a new
+// database at the full path, which would lose edge_subjects too.
+func TestDBLegacyPathRefused(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed(t)
+	dir := t.TempDir()
+	path, old := filepath.Join(dir, "t.db#x"), filepath.Join(dir, "t.db")
+	s := startSvc(t, w.c, svcOpts{db: old})
+	s.caughtUp("cat", "matches")
+	s.stop()
+
+	r, err := tree.Open(context.Background(), tree.Options{Client: w.c, Catalog: "cat", DB: path, Logf: t.Logf})
+	if err == nil {
+		r.Close()
+		t.Fatal("opened a new database beside the legacy one")
+	}
+	if !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), old) {
+		t.Errorf("error %q names not both %s and %s", err, path, old)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("%s: %v", path, err)
 	}
 }

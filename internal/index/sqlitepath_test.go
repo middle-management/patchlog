@@ -1,10 +1,15 @@
 package index_test
 
 import (
+	"context"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/middle-management/patchlog/internal/index"
 )
 
 // The index opens its database at exactly Options.DB, '#' and '?' in it
@@ -40,5 +45,31 @@ func TestDBPathOpensThatFile(t *testing.T) {
 	}
 	if s.ix.CountRows("matches") == 0 {
 		t.Error("reopened: no rows")
+	}
+}
+
+// An index that an earlier release kept at the path cut at its '?' (or
+// '#', or with its %XX decoded) is refused, not replayed into a new
+// database at the full path.
+func TestDBLegacyPathRefused(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed(t)
+	dir := t.TempDir()
+	path, old := filepath.Join(dir, "i.db?x"), filepath.Join(dir, "i.db")
+	s := startSvc(t, w.c, svcOpts{db: old, ns: []string{"matches"}, untyped: true})
+	s.caughtUp("matches")
+	s.stop()
+
+	ix, err := index.Open(context.Background(), index.Options{Client: w.c, DB: path, Namespaces: []string{"matches"}, Logf: t.Logf})
+	if err == nil {
+		ix.Close()
+		t.Fatal("opened a new database beside the legacy one")
+	}
+	if !strings.Contains(err.Error(), path) || !strings.Contains(err.Error(), old) {
+		t.Errorf("error %q names not both %s and %s", err, path, old)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("%s: %v", path, err)
 	}
 }
