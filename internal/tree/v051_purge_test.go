@@ -11,6 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -155,7 +156,7 @@ func TestReloadDriftPurges(t *testing.T) {
 		t.Fatalf("listing at: %d %v", r.status, r.body)
 	}
 	x.stop()
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqlitedsn.DSN(path, ""))
 	if err != nil {
 		t.Fatal(err)
 	}

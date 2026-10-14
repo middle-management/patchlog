@@ -7,13 +7,15 @@ import (
 	"testing"
 
 	_ "modernc.org/sqlite"
+
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Stored views survive a new Cache on the same database (a restart), and
 // go by tag (Purge) or when their scope's at moves on (Retire).
 func TestCachePersists(t *testing.T) {
 	ctx := context.Background()
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "c.db"))
+	db, err := sql.Open("sqlite", sqlitedsn.DSN(filepath.Join(t.TempDir(), "c.db"), ""))
 	if err != nil {
 		t.Fatal(err)
 	}

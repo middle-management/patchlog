@@ -42,3 +42,13 @@ func (ix *Index) DropRefsForTest() (int, error) {
 	_, err := ix.db.Exec(`DROP TABLE refs`)
 	return 0, err
 }
+
+// Pragma returns the value of PRAGMA name on a connection of the index's
+// database (tests).
+func (ix *Index) Pragma(name string) string {
+	var v string
+	if err := ix.db.QueryRow(`PRAGMA ` + name).Scan(&v); err != nil {
+		panic(err)
+	}
+	return v
+}

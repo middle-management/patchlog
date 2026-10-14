@@ -9,6 +9,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 var schemaAt_0f182dd = []string{
@@ -57,7 +58,7 @@ func TestOldSchemasIndexedBy(t *testing.T) {
 	for name, stmts := range map[string][]string{"0f182dd": schemaAt_0f182dd, "8e09906": schemaAt_8e09906, "596f067": schemaAt_596f067} {
 		t.Run(name, func(t *testing.T) {
 			path := filepath.Join(t.TempDir(), "i.db")
-			db, err := sql.Open("sqlite", "file:"+path)
+			db, err := sql.Open("sqlite", sqlitedsn.DSN(path, ""))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -70,7 +71,7 @@ func TestOldSchemasIndexedBy(t *testing.T) {
 				t.Fatal(err)
 			}
 			db.Close()
-			db, err = sql.Open("sqlite", "file:"+path)
+			db, err = sql.Open("sqlite", sqlitedsn.DSN(path, ""))
 			if err != nil {
 				t.Fatal(err)
 			}

@@ -64,6 +64,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/pointer"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Purger purges the tree service's own cache tags.
@@ -255,9 +256,14 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tree: reading the core's origin: %w", err)
 	}
+	// A database that an earlier release kept under another name (see
+	// sqlitedsn.Legacy) must be moved first, not replayed into a new one.
+	if err := sqlitedsn.CheckLegacy(opt.DB); err != nil {
+		return nil, fmt.Errorf("tree: %w", err)
+	}
 	// secure_delete: rows deleted by a purge are overwritten, not left in
 	// free pages (see the package doc).
-	dsn := "file:" + opt.DB + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)"
+	dsn := sqlitedsn.DSN(opt.DB, "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
