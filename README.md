@@ -1882,7 +1882,9 @@ With `-access -key SEED -kid KID` it also issues grants from the tree (§B.11):
   item or moving folders afterwards changes nothing; they stay those of its deletion even if it was
   unplaced and placed again, but it must still be placed. The grant carries `can: ["restore"]` only;
   used on an item that is live again, the write is an append and the core refuses it. The answers,
-  in order: a name that never existed `404`; a purged item `410`; `403` for a caller without a role
+  in order: a name that never existed `404`; a purged item `410`, as is any name of a purged
+  namespace, which the core answers `410 purged` for too (§8.5), even one the service never saw,
+  such as when it started after the purge; `403` for a caller without a role
   granting `read` on the item (in its frozen rows if deleted, its current ones if live), without one
   granting `restore`, whose item has no placement, or whose restore would widen: the roles the item
   would have after it, from its current placement, exceed its frozen rows for some subject, judged
@@ -2048,8 +2050,10 @@ lifetime (`CDN-Cache-Control`) is no longer than a `g/all` cookie lives, 15 minu
 for edges' clocks: an untrusted namespace leaves the edge's `g/all` listings within the revocation
 latency of a cookie. That cap holds for listings an edge cached from this release on: earlier
 releases gave `g/all` listings a year, so after upgrading the catalog service, purge
-`ns:{catalog}` at the edge once. Without `-purge-url` purges are only logged, and the cap alone
-bounds them.
+`ns:{catalog}` at the edge once. A start that finds its derived rows drifted, such as placements
+of a purged namespace's names that an earlier release held as missing, purges `ns:{catalog}` too,
+stored sealed listings with it, as its listings then change at an unchanged `at`. Without
+`-purge-url` purges are only logged, and the cap alone bounds them.
 
 ```sh
 head -c 32 /dev/urandom | base64 > catalog-edge-grant.key   # the edge holds it too, under catalog-cat

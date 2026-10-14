@@ -373,6 +373,15 @@ func (s *Service) reload(ctx context.Context) error {
 		return fmt.Errorf("tree: loading the graph: %w", err)
 	}
 	changed := g.analyze()
+	// Drift changes listings at an unchanged combined checkpoint, which
+	// cached listings take never to go stale (apply's cache tags), as for
+	// placements of a purged namespace's names that an earlier release
+	// held as missing (itemStateTitle): every listing of the catalog
+	// carries ns:{catalog}, so they all go, stored sealed ones too.
+	var tags []string
+	if len(changed) > 0 {
+		tags = []string{"ns:" + s.actual(s.opt.Catalog)}
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -388,8 +397,15 @@ func (s *Service) reload(ctx context.Context) error {
 			return err
 		}
 	}
+	if err := s.sealed.Purge(ctx, tx, tags); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
+	}
+	s.kept.Purge(s.opt.Catalog, tags)
+	if len(tags) > 0 {
+		s.opt.Purger.PurgeTags(tags)
 	}
 	s.g = g
 	return nil
@@ -927,7 +943,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 
 	// Cache tags (§B.5). Every change a listing depends on moves the
 	// combined checkpoint, so cached listings never go stale and need no
-	// purge; purges remove content: a purged resource from every cached
+	// purge (but for drift a start finds, reload); purges remove content: a purged resource from every cached
 	// listing showing it (r:{ns}/{name}, and rs:{catalog} for listings too
 	// large to name all they show), a purged namespace from every cached
 	// listing whose checkpoint covers it (ns:{ns}).
@@ -1063,7 +1079,8 @@ func (s *Service) ensureContent(ctx context.Context, ns string) error {
 }
 
 // ItemState returns the recorded state and head of a content resource
-// (ItemUnknown if the service has never seen it).
+// (ItemUnknown if the service has never seen it, ItemPurged if it hasn't
+// and the service holds its namespace as purged, §8.5).
 func (s *Service) ItemState(ctx context.Context, ns, name string) (int, string, error) {
 	return itemState(ctx, s.db, ns, name)
 }

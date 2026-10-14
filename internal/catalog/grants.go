@@ -722,7 +722,10 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 // The answers come in this order, so they reveal nothing to callers
 // without read beyond what names and purges already do (§E.4):
 //
-//   - 404 for a name that never existed, 410 for a purged item;
+//   - 404 for a name that never existed, 410 for a purged item: any name
+//     of a namespace the service holds as purged, which is 410 at the
+//     core too, even one it never saw, as when it started after the purge
+//     (tree.ItemState, §8.5);
 //   - 403 for a caller without a role granting read on the item (in its
 //     frozen rows if deleted, its current ones if live), without a role
 //     granting restore, whose item has no placement, or whose restore

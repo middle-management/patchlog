@@ -26,7 +26,9 @@ import (
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head, title)
-//	                                 liveness of every resource of the trusted namespaces
+//	                                 liveness of every resource of the trusted namespaces seen;
+//	                                 a name without a row in a namespace with "purged:{ns}" is
+//	                                 purged (itemStateTitle)
 //	self_parents(ns, name, parents)  $parents of content documents (§B.9, -self-placing)
 //	sealed_views, sealed_view_tags   sealed listings of a sealed/e2e catalog (derived.Cache)
 //	edge_subjects(gs, subjects, exp) the subjects of each subject set the service minted edge
@@ -272,9 +274,15 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		if n.ItemNS == "" {
 			continue
 		}
-		st, head, title, err := itemStateTitle(ctx, q, n.ItemNS, n.ItemName)
+		// The purged namespaces are s.purged, which mirrors the committed
+		// "purged:{ns}" rows, so no query per name the service never saw
+		// (itemStateTitle).
+		st, head, title, err := itemRow(ctx, q, n.ItemNS, n.ItemName)
 		if err != nil {
 			return nil, err
+		}
+		if _, purged := s.purged[n.ItemNS]; purged && st == ItemUnknown {
+			st = ItemPurged
 		}
 		g.setItem(name, st, head, title)
 	}
@@ -297,8 +305,34 @@ func itemState(ctx context.Context, q queryer, ns, name string) (int, string, er
 	return st, head, err
 }
 
-// itemStateTitle is itemState with the item's title (§B.5).
+// itemStateTitle is itemState with the item's title (§B.5). A name the
+// service holds no row for is purged in a namespace it holds as purged
+// ("purged:{ns}"), not unknown: every name of a purged namespace is 410
+// purged at the core (§8.5), which keeps no list of them a service could
+// read, and one that started after the purge may hold rows for some of
+// its names at most (a sealed one's log is 410 too, and an at-rest one's
+// replay drops what comes before the purge-ns entry in its batch,
+// follow.Coalesce). So a service that started after the purge answers as
+// one that followed it, and so does one that followed it for names it
+// never saw (§B.11.4).
 func itemStateTitle(ctx context.Context, q queryer, ns, name string) (int, string, string, error) {
+	st, head, title, err := itemRow(ctx, q, ns, name)
+	if err != nil || st != ItemUnknown {
+		return st, head, title, err
+	}
+	var one int
+	err = q.QueryRowContext(ctx, `SELECT 1 FROM meta WHERE k = ?`, "purged:"+ns).Scan(&one)
+	switch {
+	case err == nil:
+		return ItemPurged, "", "", nil
+	case errors.Is(err, sql.ErrNoRows):
+		return ItemUnknown, "", "", nil
+	}
+	return 0, "", "", err
+}
+
+// itemRow reads a name's items row: ItemUnknown without one.
+func itemRow(ctx context.Context, q queryer, ns, name string) (int, string, string, error) {
 	var st int
 	var head, title sql.NullString
 	err := q.QueryRowContext(ctx, `SELECT state, head, title FROM items WHERE ns = ? AND name = ?`, ns, name).Scan(&st, &head, &title)
