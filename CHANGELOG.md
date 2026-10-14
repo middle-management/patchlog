@@ -3,6 +3,15 @@
 ## Unreleased
 
 **Fixes:**
+- **Writes cancelled before their commit** (shutdown timeout): a write cancelled right before
+  its commit, as at `-shutdown-timeout`, could still commit and be answered `201` on SQLite,
+  and on Postgres for a group commit whose requests were all cancelled: database/sql checks a
+  transaction context that learns of the cancellation a moment later, the SQLite driver commits
+  regardless, and a group's context learned of it late too. Its client lost the response when
+  the shutdown closed the connection, which an idempotent retry finds (§7.2). Such a write now
+  rolls back. One cancelled while it commits may still commit and is answered as committed (on
+  Postgres, as cancelled with its outcome unknown); the README's graceful shutdown section says
+  so.
 - **Restores in a purged namespace** (tree/catalog, §B.11.4, §8.5): a service started after a
   trusted content namespace was purged, sealed or not, answered a catalog restore of one of its
   items `404` "has never existed" instead of `410`, because it holds no rows for most of those
