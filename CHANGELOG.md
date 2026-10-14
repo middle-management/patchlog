@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.20.1
 
 **Changes to check before upgrading:**
 - **SQLite database paths with `#`, `?` or `%`** (the core's `-db`, the index and tree/catalog
