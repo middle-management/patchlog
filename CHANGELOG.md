@@ -2,7 +2,24 @@
 
 ## Unreleased
 
+**Changes to check before upgrading:**
+- **SQLite database paths with `#`, `?` or `%`** (the core's `-db`, the index and tree/catalog
+  services' databases): earlier releases opened another file for such a path. With `#` or `?`
+  it was the file named by the path up to that character, so two paths that agree up to there
+  shared one file; with `%XX` escapes it was the file with them decoded (`%2F` as `/`, so
+  possibly in another directory), the name ending at a `%00`. This release opens exactly the
+  path given. When there is no file there but there is one at the old name, it refuses to start
+  and names both: stop the old release cleanly, move that file with its `-wal` and `-shm` files
+  to the full path (a copy for each, where two shared one), then start again. Started on an
+  empty database instead, the core's blob sweep would delete the blob files, whose directory
+  (`<db>.blobs`, or `-blob-dir`) is already at the full path.
+
 **Fixes:**
+- **SQLite database paths with `#`, `?` or `%`:** the core, the index and the tree/catalog
+  services built SQLite connection strings by appending the path unescaped, so SQLite cut it at
+  `#` or `?` and decoded `%XX` in it, a `?` also cost the database its WAL journal mode, and a
+  path starting with `//` failed to open. Paths are now escaped, so the database opens at
+  exactly the path given with every setting applied (see "Changes to check before upgrading").
 - **Writes cancelled before their commit** (shutdown timeout): a write cancelled right before
   its commit, as at `-shutdown-timeout`, could still commit and be answered `201` on SQLite,
   and on Postgres for a group commit whose requests were all cancelled: database/sql checks a
