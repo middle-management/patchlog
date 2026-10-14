@@ -1063,7 +1063,8 @@ func (s *Service) ensureContent(ctx context.Context, ns string) error {
 }
 
 // ItemState returns the recorded state and head of a content resource
-// (ItemUnknown if the service has never seen it).
+// (ItemUnknown if the service has never seen it, ItemPurged if it hasn't
+// and the service holds its namespace as purged, §8.5).
 func (s *Service) ItemState(ctx context.Context, ns, name string) (int, string, error) {
 	return itemState(ctx, s.db, ns, name)
 }

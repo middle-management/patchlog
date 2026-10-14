@@ -5,12 +5,15 @@ import (
 	"database/sql"
 	"fmt"
 	"net/http"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // A trusted content namespace that is purged leaves the catalog's grants
@@ -235,6 +238,90 @@ func TestPurgedContentKeepsAll(t *testing.T) {
 				if !isAll(tok) {
 					t.Errorf("%s 16 minutes after the restart: no g/all", name)
 				}
+			}
+		})
+	}
+}
+
+// TestPurgedContentLateStart (§8.5, §B.11.4): a service that starts after
+// a trusted content namespace was purged, sealed or not, never sees its
+// items: a sealed one's log is 410 purged, and an at-rest one's replay
+// ends with the purge-ns entry, which drops what came before it. It
+// answers as one that followed the purge, and so after a restart: a
+// restore of an item of the namespace is 410, deleted or live when it was
+// purged, and so is one of a name the service never saw, placed or not,
+// since every name of a purged namespace is 410 at the core. Other grants
+// and read grants on them are refused as before, and their placements
+// dangle as purged, not missing. A name that never existed in a namespace
+// that isn't purged is still 404.
+func TestPurgedContentLateStart(t *testing.T) {
+	t.Parallel()
+	for _, sealed := range []bool{false, true} {
+		t.Run(fmt.Sprint("sealed=", sealed), func(t *testing.T) {
+			t.Parallel()
+			w := setupWith(t, sealed)
+			w.seed()
+			w.doc("cat", "matches.final", map[string]any{"parents": parents("season")})
+			ctx := context.Background()
+			w.start()
+			w.caughtUp()
+			must(w.ops.Delete(ctx, "matches", "derby", must(w.ops.Head(ctx, "matches", "derby")).ID))
+			w.caughtUp()
+			bob := w.caller("user:bob", "match-desk")
+			restore := func(item string) map[string]any {
+				return map[string]any{"item": "/r/matches/" + item, "want": toAny("restore")}
+			}
+			w.issue(bob, restore("ghost"), 404)
+			w.issue(bob, restore("derby"), 200)
+			w.purge("matches")
+
+			full := w.opsKey.Grant(t, w.s.Now(), "user:r", []string{"cat", "matches"}, []string{"read"})
+			// answers are the service's decisions on the purged
+			// namespace's items: restores of a deleted item, a live one,
+			// a placed name that never existed and an unplaced one.
+			answers := func(name string) map[string]string {
+				t.Helper()
+				out := map[string]string{}
+				for _, it := range []string{"derby", "shared", "final", "ghost"} {
+					r := w.issue(bob, restore(it), 410)
+					out["restore "+it] = fmt.Sprint(r.body["code"], r.body["message"], r.body["checkpoint"])
+				}
+				for _, req := range []map[string]any{
+					{"item": "/r/matches/shared", "want": toAny("append")},
+					{"item": "/r/matches/final", "want": toAny("create")},
+				} {
+					r := w.do("POST", "/grants", bob, req)
+					out[fmt.Sprint(req["want"], req["item"])] = fmt.Sprint(r.status, r.body)
+				}
+				r := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/shared", "/r/matches/ghost")})
+				out["read-grants"] = fmt.Sprint(r.status, r.body)
+				if !sealed {
+					// A sealed catalog's listings are sealed.
+					r, _ := w.follow("/cat/problems", full)
+					out["problems"] = fmt.Sprint(r.status, r.body)
+				}
+				w.svc.Tree().View(func(g *tree.Graph, _ map[string]string) {
+					for _, it := range []string{"derby", "shared", "rumour1", "other", "final"} {
+						if n := g.Node("matches." + it); n == nil || n.Dangling != "purged" {
+							t.Errorf("%s: the placement of %s: %+v", name, it, n)
+						}
+					}
+				})
+				return out
+			}
+			want := answers("following")
+			w.stop()
+			w.db = filepath.Join(t.TempDir(), "late.db")
+			w.start()
+			w.caughtUp()
+			if got := answers("started after"); !reflect.DeepEqual(got, want) {
+				t.Errorf("started after the purge:\n%v\nwant\n%v", got, want)
+			}
+			w.stop()
+			w.start()
+			w.caughtUp()
+			if got := answers("started after, restarted"); !reflect.DeepEqual(got, want) {
+				t.Errorf("started after the purge, restarted:\n%v\nwant\n%v", got, want)
 			}
 		})
 	}

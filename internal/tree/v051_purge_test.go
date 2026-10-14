@@ -57,6 +57,24 @@ func TestSealedPurged(t *testing.T) {
 	if st, _, err := x.s.ItemState(ctx, "sec", "a"); err != nil || st != tree.ItemPurged {
 		t.Fatalf("item state of sec.a after the purge: %d %v", st, err)
 	}
+	// One started after the purge never sees its items, nor its log: every
+	// name of the purged namespace is purged, as at the core, and so is a
+	// name the following one never saw. Its placements dangle as purged.
+	y := start()
+	waitFor(t, "started after: the content purge", func() bool { return y.s.Checkpoint("sec") == secHead })
+	for name, x := range map[string]*svc{"following": x, "started after": y} {
+		for _, item := range []string{"a", "never"} {
+			if st, _, err := x.s.ItemState(ctx, "sec", item); err != nil || st != tree.ItemPurged {
+				t.Errorf("%s: item state of sec.%s after the purge: %d %v", name, item, st, err)
+			}
+		}
+		x.s.View(func(g *tree.Graph, _ map[string]string) {
+			if n := g.Node("sec.a"); n == nil || n.Dangling != "purged" {
+				t.Errorf("%s: the placement of sec.a: %+v", name, n)
+			}
+		})
+	}
+	y.stop()
 	if r := x.raw("/cat/roots", full); r.status != 302 {
 		t.Fatalf("listing after the content purge: %d %v", r.status, r.body)
 	}
