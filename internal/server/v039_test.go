@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 const (
@@ -326,7 +327,7 @@ func TestV039GestureMigration(t *testing.T) {
 
 	dsn := path
 	if driver == "sqlite" {
-		dsn = "file:" + path
+		dsn = sqlitedsn.DSN(path, "")
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {

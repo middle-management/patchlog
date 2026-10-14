@@ -13,6 +13,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -223,7 +224,7 @@ func TestPurgedContentKeepsAll(t *testing.T) {
 
 			// A purge recorded without a time, by an earlier release.
 			w.stop()
-			db, err := sql.Open("sqlite", w.db)
+			db, err := sql.Open("sqlite", sqlitedsn.DSN(w.db, ""))
 			if err != nil {
 				t.Fatal(err)
 			}

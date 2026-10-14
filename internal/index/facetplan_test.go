@@ -19,6 +19,7 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Issue B6: facet, range and ref queries read their candidates from the
@@ -269,7 +270,7 @@ func TestPlans(t *testing.T) {
 // core, keeping untyped documents.
 func openTestIndex(t *testing.T, noFTS bool) *Index {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+filepath.Join(t.TempDir(), "i.db")+"?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)")
+	db, err := sql.Open("sqlite", sqlitedsn.DSN(filepath.Join(t.TempDir(), "i.db"), "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)"))
 	if err != nil {
 		t.Fatal(err)
 	}

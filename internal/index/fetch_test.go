@@ -14,6 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/index"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // revFetches counts GET /r/{ns}/…/rev/… requests of one namespace, per
@@ -50,7 +51,7 @@ func (f *revFetches) RoundTrip(r *http.Request) (*http.Response, error) {
 // dumpIndex returns every row the index holds, in a stable order.
 func dumpIndex(t *testing.T, path string) string {
 	t.Helper()
-	db := must(sql.Open("sqlite", "file:"+path))
+	db := must(sql.Open("sqlite", sqlitedsn.DSN(path, "")))
 	defer db.Close()
 	var b strings.Builder
 	for _, q := range []string{

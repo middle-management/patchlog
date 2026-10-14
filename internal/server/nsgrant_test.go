@@ -14,6 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // grantRef is the grant reference §7.4 serves for a token: "sub kid id".
@@ -236,7 +237,7 @@ func TestNSLogGrantMigration(t *testing.T) {
 	// Back to the old layout: ns_log.kid instead of ns_log.grant_id.
 	dsn := path
 	if driver == "sqlite" {
-		dsn = "file:" + path
+		dsn = sqlitedsn.DSN(path, "")
 	}
 	db, err := sql.Open(driver, dsn)
 	if err != nil {

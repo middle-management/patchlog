@@ -62,6 +62,7 @@ import (
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/kept"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Purger purges the index service's own cache tags (§A.1: a purge "also
@@ -183,7 +184,7 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 	}
 	// secure_delete: rows deleted by a purge are overwritten, not left in
 	// free pages (see the package doc).
-	dsn := "file:" + opt.DB + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)"
+	dsn := sqlitedsn.DSN(opt.DB, "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err

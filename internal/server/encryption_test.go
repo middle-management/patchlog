@@ -18,6 +18,7 @@ import (
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/core"
 	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Encryption at rest (Addendum E.1).
@@ -63,7 +64,7 @@ func atRest(doc map[string]any) map[string]any {
 // connection of its own.
 func checkpoint(t *testing.T, path string) {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)")
+	db, err := sql.Open("sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +111,7 @@ func assertNoPlaintext(t *testing.T, path string) {
 
 func queryInt(t *testing.T, path, q string, args ...any) int {
 	t.Helper()
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)")
+	db, err := sql.Open("sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)"))
 	if err != nil {
 		t.Fatal(err)
 	}

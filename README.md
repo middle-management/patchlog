@@ -2754,6 +2754,7 @@ internal/schema     $schema resolution and JSON Schema validation
 internal/schemaimport external JSON Schemas into a namespace, refs pinned (schema import)
 internal/grant      grants, keys, roles and verification (Addendum C)
 internal/core       storage and semantics (gate, batches, branches, purge, prune)
+internal/sqlitedsn  SQLite DSNs: a database path escaped, so the driver opens that file
 internal/server     HTTP API
 internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
 internal/cdnpurge   HTTP cache-tag purges to a CDN (-purge-url)

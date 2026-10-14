@@ -20,6 +20,7 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // The benchmark dataset of issue B6: one namespace of 48.7k items shaped
@@ -71,7 +72,7 @@ func benchDB(tb testing.TB) string {
 // openBare opens an index database as Open does, without a core.
 func openBare(tb testing.TB, path string) *Index {
 	tb.Helper()
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)"
+	dsn := sqlitedsn.DSN(path, "_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=secure_delete(ON)")
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		tb.Fatal(err)

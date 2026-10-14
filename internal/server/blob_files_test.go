@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Blob bytes in files (core/blobstore.go). Like every server test, these
@@ -240,7 +241,7 @@ func TestBlobFilesLegacyRows(t *testing.T) {
 		t.Fatalf("blob directory %s, want next to the database", e.blobStats().Dir)
 	}
 	// As an earlier version stored it.
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)")
+	db, err := sql.Open("sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)"))
 	if err != nil {
 		t.Fatal(err)
 	}

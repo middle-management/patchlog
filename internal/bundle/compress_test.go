@@ -15,6 +15,7 @@ import (
 	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/server"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // Store compression (core.Options.StoreCompression) applies only to
@@ -66,7 +67,7 @@ func TestStoreCompressionLevels(t *testing.T) {
 		t.Fatalf("sealed doc %v", doc)
 	}
 
-	db, err := sql.Open("sqlite", "file:"+path+"?_pragma=busy_timeout(10000)")
+	db, err := sql.Open("sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)"))
 	noErr(t, err)
 	defer db.Close()
 	forms := map[string]map[string]int{}
