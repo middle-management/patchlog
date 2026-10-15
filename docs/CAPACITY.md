@@ -32,7 +32,7 @@ At that size, server X answers, at the origin (before any CDN):
 | Appends to a large document | p50 7 ms at 16 KiB, 15 ms at 1 MiB, 25 ms at 3.5 MiB |
 | A consumer's full catch-up of the large namespace | log: 4M entries in 2.4 min; `/heads`: 1M in 37 s; fetching 1M documents 8 at a time: ~10 min |
 | Long-poll followers of one **private** namespace | 5,000 followers: ~5 s of core CPU and ~5 s to deliver each write (no CDN collapse, see below) |
-| Long-poll followers of one **public** namespace, behind the CDN | 5,000 followers: 0.01 s of core CPU, all delivered in 0.4 s (measured on SQLite; collapse doesn't depend on the backend) |
+| Long-poll followers of one **public** namespace, behind the CDN | 5,000 followers: 0.01 s of core CPU, all delivered in 0.25 s (0.4 s on SQLite) |
 
 What the data size costs and what it doesn't: none of the per-request numbers above depends on
 the namespace's size (pages and reads use indexes; see the fixes under Unreleased in the CHANGELOG), so a
@@ -40,7 +40,28 @@ namespace of 1M documents and 5M revisions answers like a small one. What grows 
 storage (about 1.2 KB a revision on Postgres, 620 B on SQLite, for these small documents), full
 scans (catch-up, bootstrap, bundle export), and memory (below).
 
-<!-- comparison -->
+### What limits server X
+
+The same data measured again (grants unless noted; reads from 8 concurrent clients, writes to
+the large namespace from 32):
+
+| Core | Reads, uncached grants | Reads, cached grants | Writes, one namespace | Writes, 1,000 namespaces | Bootstrap fetches |
+|---|---|---|---|---|---|
+| 2 vCPU, authentication off | 1,840/s, p50 3.9 ms | — | 750/s, p50 41 ms | 460/s | 1,920/s |
+| 2 vCPU | 1,030/s, p50 6.6 ms | 1,630/s, p50 4.6 ms | 590/s, p50 52 ms | 420/s | 1,620/s |
+| 1 vCPU | 1,130/s, p50 5.3 ms | 2,070/s, p50 3.3 ms | 790/s, p50 40 ms | 400/s | 1,220/s |
+| 2 × 1 vCPU, writes routed by namespace | 1,110/s, p50 6.4 ms | 1,510/s, p50 4.8 ms | 700/s, p50 45 ms | 380/s | 1,440/s |
+
+- **The core isn't server X's bottleneck; Postgres is.** Halving the core changes little, and a
+  second instance adds nothing: the 2-vCPU Postgres (at ~1.3 vCPU and 3.4 GB under these loads)
+  and its round trips set the pace. On server X, give Postgres the CPU first; core instances pay
+  off once the core's own CPU is the limit (grant checks at fleet scale, large documents,
+  uncollapsed followers that are CPU-bound rather than database-bound).
+- **Grants cost ~40% of read throughput when the grant isn't cached** (1,030/s against 1,840/s
+  without authentication), mostly verification: with grants in the core's bearer cache reads
+  are within ~10% of unauthenticated ones.
+- Write throughput into one namespace doesn't depend on the core's size here: the namespace's
+  log (one append at a time, grouped) and Postgres set it.
 
 ## Long-poll followers and the CDN
 
@@ -64,10 +85,13 @@ log again:
 | 5,000 | 0.39 s, 0.01 CPU-s | 0.69 s, 2.0 CPU-s | 4.4–5.2 s, 5–6.5 CPU-s |
 
 CPU-s is the core's CPU time per write delivered. Uncollapsed, a write costs about **1 ms of
-core CPU per private follower** on server X (0.4 ms per public follower on SQLite), plus a log
-query per follower in Postgres. So 5,000 private followers of a namespace saturate server X's
-core at about **0.4 writes/s** to that namespace. Planning rule without a verifying edge:
-`followers × writes/s × 1 ms ≤ the core's CPU`.
+core CPU per private follower** on server X (0.4 ms per public follower on SQLite), and a log
+query per follower in Postgres, which is what bounds it: 5,000 private followers took 4.4 s
+with a 1-vCPU core, 5.2 s with 2 vCPU and 5.4 s with two 1-vCPU instances. So 5,000 private
+followers of a namespace keep up with about **0.2 writes/s** to it on server X, whatever the
+core's size. Planning rule without a verifying edge: `followers × writes/s ≤ ~1,000/s` on
+server X. Through the CDN, public, the same 5,000 followers cost 0.01 CPU-s and were delivered
+in 0.25 s on server X too.
 
 ## Limits, by kind
 
@@ -76,7 +100,7 @@ core at about **0.4 writes/s** to that namespace. Planning rule without a verify
 | Limit | Measured | Lever |
 |---|---|---|
 | **One log per namespace.** Every write appends to its namespace's hash chain (§3.5), so writes to one namespace commit one at a time (on Postgres, one group of up to 32 at a time). | One namespace: ~590 single writes/s on server X from 32 writers; 700–1,000/s on SQLite (4 vCPU). | Spread write-heavy data over namespaces: writes to different namespaces run in parallel, across instances too. A sign-in storm writing per-user items belongs in many namespaces, not one. |
-| **§6.6 size limits**: documents 4 MiB, patch sets 256 KiB, 1,000 ops a set, 1,000 items and 16 MiB a batch, 1,000 entries a log page. The deployment maximums equal the defaults; namespaces can only lower them. | | Documents near the limit are slow to write (next row); batches are imports, not interactive writes. |
+| **§6.6 size limits**: documents 1 MiB by default (4 MiB a namespace may set, the deployment maximum; §6.6 says 4 MiB), patch sets 256 KiB, 1,000 ops a set, 1,000 items and 16 MiB a batch, 1,000 entries a log page. The other deployment maximums equal the defaults. | | Large documents are slow to write (next row); batches are imports, not interactive writes. `serve -max-document-size` raises the document maximum. |
 | **Whole-document work on every write**: the result is canonicalised, checked against the limits and validated against its `$schema` in full; a small patch to a large document costs the document's size. | Append p50: 7 ms at 16 KiB, 15 ms at 1 MiB, 25 ms at 3.5 MiB (server X); 1.7 / 7 / 19 ms on SQLite. | Keep frequently edited documents small: split large aggregates into resources. |
 | **Default rates** (§6.6), per instance: 50 items/s a principal (burst 100), 500 items/s a namespace (burst 1,000), 10/s a resource (burst 20). | 500/s a namespace is ~85% of server X's single-namespace ceiling. | Allowances (§6.6) replace a principal's and its namespace's buckets, for loaders and importers. The per-resource rate always applies. |
 | **Followers are cheap only through the CDN** (§7.7, §9). SSE streams (§7.3) can't be collapsed. | See the table above. | Devices long-poll; services that need every entry use the log and checkpoints (§10). |
@@ -87,7 +111,8 @@ core at about **0.4 writes/s** to that namespace. Planning rule without a verify
 | Gap | Effect | Fix |
 |---|---|---|
 | **Bearer cache of 1,024 grants** per instance (`maxGrantCacheEntries`), emptied when full. | A fleet with more than 1,024 active tokens verifies its grant (Biscuit decode, Ed25519) on every request: reads p50 6.6 ms against 4.6 ms with cached grants, 1,030/s against 1,630/s. | A larger, byte-bounded cache (tens of thousands of grants), evicting gradually. |
-| **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: ~1 ms of core CPU per follower per write. | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
+| **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: ~1 ms of core CPU and a Postgres query per follower per write. | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
+| **Long-polls don't collapse at the origin either**: every woken waiter of a namespace reads the same log range again, in its own transaction. | Private followers are Postgres-bound: ~1,000 follower-deliveries/s on server X, independent of the core's size. | Read the range once per (namespace, `since`) wake-up and share it among the waiters, each still checked against its grant (the grant check is in memory when its grant is cached). This is the largest single gain for private fleets, before or besides a verifying edge. |
 | **Log pages bound entries, not items.** A batch entry carries its items inline. | A page of 1,000 batch entries of 1,000 items holds 1M items. | Bound pages by resource entries or bytes too. |
 | **Rate-limit buckets are never evicted**: one per (namespace, resource, principal) written, per instance. | Memory grows with distinct resources written until restart. | Drop buckets that are full again (idle longer than burst / rate). |
 | **The document cache is bounded by count** (4,096 documents), not bytes; the 64 MiB read cache empties itself when full. | Up to 16 GiB of 4 MiB documents; hit rates collapse past 64 MiB. | Byte budgets and gradual eviction. |
@@ -95,7 +120,7 @@ core at about **0.4 writes/s** to that namespace. Planning rule without a verify
 | **No read replicas, and one `-db` for everything** (the core runs migrations, the tailer and leader jobs, so it can't run on a read-only database). | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: ~11 min on server X (fetches at 1,600/s); 2.6 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
-| **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.7–1.8 GB in these runs (steady 0.8 GB), unexplained without a profile. | Run with `GOMEMLIMIT` under container limits; add an opt-in pprof listener. |
+| **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.5–1.8 GB on the instance that served the full scans of the large namespace (steady 0.5–0.8 GB); the second instance, which didn't, peaked at 0.2 GB. | Run with `GOMEMLIMIT` under container limits; profile the scans (an opt-in pprof listener would help). |
 
 Fixed in this branch, and so not limits any more: namespace log pages scanned and sorted the
 whole namespace, and the config-retry lookup the whole log (now indexed; CHANGELOG, Unreleased);
@@ -106,11 +131,11 @@ a consumer's snapshot bootstrap held the whole `/heads` listing in memory and on
 
 | Resource | Measured | Notes |
 |---|---|---|
-| **Core CPU** | Grant checks, canonicalisation, validation, folds, page serialisation and uncollapsed followers are core CPU. | Scales with instances (see the comparison above). |
+| **Core CPU** | Grant checks, canonicalisation, validation, folds and page serialisation are core CPU. On server X a 1-vCPU core kept up with everything measured. | Scales with instances once it is the limit (it wasn't on server X). |
 | **Postgres round trips** | A single write is ~13 statements; on server X one writer did 125 writes/s (7.5 ms each), neither container saturated. | Keep the core near Postgres (sub-millisecond); concurrency, not speed, is what instances add. |
-| **Postgres CPU and memory** | ~1.3 of 2 vCPU and 3.4 of 4 GB under the read measurements. | The busier side on server X. |
+| **Postgres CPU and memory** | ~1.3 of 2 vCPU and 3.4 of 4 GB under the read measurements; the limit on server X. | Size Postgres first; a read replica takes bulk reads and private followers' log reads (the gap above). |
 | **Storage** | 6.2 GB on Postgres, 3.1 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
-| **Memory** | Core: 0.8 GB steady, 1.7–1.8 GB peak. | Give containers `GOMEMLIMIT`. |
+| **Memory** | Core: 0.5–0.8 GB steady, 1.5–1.8 GB peak during full scans. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves catch-ups. |
 | **Upgrades** | The new namespace-log indexes build in the migration, blocking writes a few seconds per 5M log entries. | `CREATE INDEX CONCURRENTLY` beforehand (README). |
 
 ## Recommended changes to limits
@@ -118,9 +143,9 @@ a consumer's snapshot bootstrap held the whole `/heads` listing in memory and on
 - **Bearer cache**: 1,024 → a byte budget of tens of thousands of grants (gap above).
 - **Document and read caches**: byte budgets with gradual eviction.
 - **Log pages**: bound items or bytes as well as entries.
-- **`documentSize`**: a default of 1 MiB, with a deployment flag allowing up to 4 MiB. Appends at
-  3.5 MiB are 3–4× slower than at 16 KiB, and every revision of a large document weighs on the
-  caches; today the default is also the maximum.
+- **`documentSize`: done.** 1 MiB by default, 4 MiB a namespace may set (`serve -document-size`,
+  `-max-document-size`). Appends at 3.5 MiB are 3–4× slower than at 16 KiB, and every revision of
+  a large document weighs on the caches.
 - **Keep**: the rates (500/s a namespace is just under one namespace's ceiling on server X),
   `itemsPerBatch` 1,000 (imports; give importers allowances), the snapshot cadence, the
   long-poll interval and the log page size.
