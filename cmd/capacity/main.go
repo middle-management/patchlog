@@ -17,11 +17,13 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"math/rand/v2"
+	"net/http"
 	"os"
 	"sort"
 	"strings"
@@ -30,6 +32,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/grant"
 )
 
 const author = "capacity"
@@ -51,6 +54,8 @@ type config struct {
 	pid         int
 	only        string
 	appendBatch int
+	operator    string
+	readers     int
 }
 
 func main() {
@@ -71,16 +76,28 @@ func main() {
 	flag.StringVar(&c.liveURL, "live-url", "", "where long-poll followers connect: a CDN in front of -url (default -url itself)")
 	flag.StringVar(&c.waiters, "waiters", "100,1000,5000", "long-poll followers of one namespace to measure ('' to skip)")
 	flag.IntVar(&c.pid, "pid", 0, "the core's process id, to report the CPU time it spends per measurement (Linux)")
+	flag.StringVar(&c.operator, "operator-seed", "", "grants profile: the private seed of the core's -operator-key (patchlog keygen); namespaces are then read: grant, and every request carries a signed grant (§C)")
+	flag.IntVar(&c.readers, "readers", 5000, "grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)")
 	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, live")
 	flag.Parse()
 	if c.revs < c.docs {
 		fail(errors.New("-revs must be at least -docs"))
 	}
-	cl, err := client.New(c.url, client.WithAuthor(author), client.WithIdleConns(64))
-	if err != nil {
-		fail(err)
+	r := &runner{c: c, ctx: context.Background(), res: map[string]any{}, hc: sharedHTTP(512)}
+	r.cl = r.newClient(c.url, "")
+	if c.operator != "" {
+		op, err := grant.ParsePrivateKey(c.operator)
+		if err != nil {
+			fail(fmt.Errorf("-operator-seed: %w", err))
+		}
+		r.op = op
+		r.keyPub, r.key = grant.GenerateKey()
+		r.writers = map[string]*client.Client{}
+		r.readerPools = map[string][]*client.Client{}
+		r.res["profile"] = "grants"
+	} else {
+		r.res["profile"] = "public"
 	}
-	r := &runner{c: c, cl: cl, ctx: context.Background(), res: map[string]any{}}
 	r.run()
 }
 
@@ -90,10 +107,19 @@ func fail(err error) {
 }
 
 type runner struct {
-	c   config
-	cl  *client.Client
-	ctx context.Context
-	res map[string]any
+	c  config
+	cl *client.Client
+	hc *http.Client
+	// the grants profile: the operator key, the namespaces' key, and
+	// clients by namespace
+	op          ed25519.PrivateKey
+	key         ed25519.PrivateKey
+	keyPub      string
+	mu          sync.Mutex
+	writers     map[string]*client.Client
+	readerPools map[string][]*client.Client
+	ctx         context.Context
+	res         map[string]any
 	// what the scans found in the large namespace
 	heads   []client.HeadItem
 	entries []string // namespace entry ids, in log order
@@ -109,11 +135,94 @@ func (r *runner) record(name string, v any) {
 	r.logf("%-28s %s", name, b)
 }
 
-// nsDoc is a public namespace whose allowance frees the loader from the
-// default rates.
-func nsDoc() map[string]any {
-	return map[string]any{"read": "public", "allowances": []any{map[string]any{
-		"sub": author, "kid": "capacity", "bucket": map[string]any{"rate": 1e9, "burst": 1e9}}}}
+// sharedHTTP is the HTTP client every harness client shares, so clients
+// of many grants share connections.
+func sharedHTTP(conns int) *http.Client {
+	t := http.DefaultTransport.(*http.Transport).Clone()
+	t.MaxIdleConns, t.MaxIdleConnsPerHost = conns, conns
+	return &http.Client{Transport: t}
+}
+
+// newClient is a client of url with the shared connections, carrying
+// token if given.
+func (r *runner) newClient(url, token string) *client.Client {
+	opts := []client.Option{client.WithHTTPClient(r.hc), client.WithAuthor(author)}
+	if token != "" {
+		opts = append(opts, client.WithBearer(token))
+	}
+	return must(client.New(url, opts...))
+}
+
+// The loader's principal in the grants profile, and its key's kid.
+const loaderSub, keyKid = "user:capacity", "cap"
+
+// nsDoc is the document of the namespaces the harness creates: public, or
+// in the grants profile read: grant with the harness's key. Either way an
+// allowance frees the loader from the default rates.
+func (r *runner) nsDoc() map[string]any {
+	bucket := map[string]any{"rate": 1e9, "burst": 1e9}
+	if r.op == nil {
+		return map[string]any{"read": "public", "allowances": []any{map[string]any{"sub": author, "kid": "capacity", "bucket": bucket}}}
+	}
+	return map[string]any{"read": "grant",
+		"keys":       []any{map[string]any{"kid": keyKid, "alg": "ed25519", "pub": r.keyPub, "can": []any{"read", "create", "append"}}},
+		"allowances": []any{map[string]any{"sub": loaderSub, "kid": keyKid, "bucket": bucket}}}
+}
+
+func (r *runner) mint(signer ed25519.PrivateKey, root map[string]any) string {
+	root["exp"] = time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	g, err := grant.Mint(root, signer)
+	if err != nil {
+		fail(err)
+	}
+	return g.Encode()
+}
+
+// createNS creates ns: in the grants profile with an operator grant.
+func (r *runner) createNS(ns string) {
+	c := r.cl
+	if r.op != nil {
+		c = r.newClient(r.c.url, r.mint(r.op, map[string]any{"kid": "operator", "sub": "op:capacity", "ns": []any{ns}, "can": []any{"config"}}))
+	}
+	must(c.CreateNamespace(r.ctx, ns, r.nsDoc()))
+}
+
+// w is the loader's client for ns: its grant may read, create and append
+// there.
+func (r *runner) w(ns string) *client.Client {
+	if r.op == nil {
+		return r.cl
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	c := r.writers[ns]
+	if c == nil {
+		c = r.newClient(r.c.url, r.mint(r.key, map[string]any{"kid": keyKid, "sub": loaderSub, "ns": []any{ns}, "can": []any{"read", "create", "append"}}))
+		r.writers[ns] = c
+	}
+	return c
+}
+
+// rd is a reader's client for ns, one of -readers readers each with a
+// grant of its own (read, unrestricted), as a fleet of devices has.
+func (r *runner) rd(ns string) *client.Client {
+	return r.readerOf(ns, r.c.readers)
+}
+
+func (r *runner) readerOf(ns string, n int) *client.Client {
+	if r.op == nil {
+		return r.cl
+	}
+	k := fmt.Sprintf("%s/%d", ns, n)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	pool := r.readerPools[k]
+	if len(pool) < n {
+		c := r.newClient(r.c.url, r.mint(r.key, map[string]any{"kid": keyKid, "sub": fmt.Sprintf("user:reader-%d", len(pool)), "ns": []any{ns}, "can": []any{"read"}}))
+		r.readerPools[k] = append(pool, c)
+		return c
+	}
+	return pool[rand.IntN(n)]
 }
 
 func (r *runner) run() {
@@ -163,7 +272,7 @@ func (r *runner) run() {
 
 // exists reports whether ns exists already.
 func (r *runner) exists(ns string) bool {
-	_, err := r.cl.NSHead(r.ctx, ns)
+	_, err := r.w(ns).NSHead(r.ctx, ns)
 	return err == nil
 }
 
@@ -186,7 +295,7 @@ func (r *runner) seedBig() {
 		r.logf("%s exists; not seeding it", ns)
 		return
 	}
-	must(r.cl.CreateNamespace(r.ctx, ns, nsDoc()))
+	r.createNS(ns)
 	heads := make([]string, r.c.docs)
 	t0 := time.Now()
 	var done atomic.Int64
@@ -207,7 +316,7 @@ func (r *runner) seedBig() {
 						// One append on its own: a single write, not a batch.
 						it := items[0]
 						w, err := retry(func() (*client.WriteResult, error) {
-							return r.cl.Append(r.ctx, ns, it.Resource, it.IfMatch, it.Steps[0].Patches)
+							return r.w(ns).Append(r.ctx, ns, it.Resource, it.IfMatch, it.Steps[0].Patches)
 						})
 						if err != nil {
 							fail(fmt.Errorf("seeding %s: %w", ns, err))
@@ -215,7 +324,7 @@ func (r *runner) seedBig() {
 						after(from, client.BatchItemResult{Resource: it.Resource, IDs: []string{w.ID}})
 					} else {
 						res, err := retry(func() (*client.BatchResult, error) {
-							return r.cl.Batch(r.ctx, ns, client.BatchRequest{Items: items}, false)
+							return r.w(ns).Batch(r.ctx, ns, client.BatchRequest{Items: items}, false)
 						})
 						if err != nil {
 							fail(fmt.Errorf("seeding %s: %w", ns, err))
@@ -278,14 +387,14 @@ func (r *runner) seedSmall() {
 		if r.exists(ns) {
 			continue
 		}
-		must(r.cl.CreateNamespace(r.ctx, ns, nsDoc()))
+		r.createNS(ns)
 		var items []client.BatchItem
 		for j := 0; j < r.c.smallDocs; j++ {
 			items = append(items, client.BatchItem{Resource: docName(j), IfNoneMatch: true,
 				Steps: []client.Step{client.PatchStep(client.GenesisPatches(r.body(j, 0)))}})
 		}
 		if len(items) > 0 {
-			must(r.cl.Batch(r.ctx, ns, client.BatchRequest{Items: items}, false))
+			must(r.w(ns).Batch(r.ctx, ns, client.BatchRequest{Items: items}, false))
 		}
 		made++
 	}
@@ -299,12 +408,12 @@ func (r *runner) seedSmall() {
 // before fetching any document.
 func (r *runner) scans() {
 	ns := r.c.big
-	head := must(r.cl.NSHead(r.ctx, ns)).ID
+	head := must(r.w(ns).NSHead(r.ctx, ns)).ID
 	t0 := time.Now()
 	pages, after := 0, ""
 	r.heads = r.heads[:0]
 	for {
-		items, next, err := r.cl.HeadsPage(r.ctx, ns, head, after)
+		items, next, err := r.w(ns).HeadsPage(r.ctx, ns, head, after)
 		if err != nil {
 			fail(err)
 		}
@@ -324,7 +433,7 @@ func (r *runner) scans() {
 	r.entries = r.entries[:0]
 	units := 0
 	for {
-		es, _, err := r.cl.NSLogPage(r.ctx, ns, head, since)
+		es, _, err := r.w(ns).NSLogPage(r.ctx, ns, head, since)
 		if err != nil {
 			fail(err)
 		}
@@ -347,45 +456,54 @@ func (r *runner) scans() {
 // namespace.
 func (r *runner) reads() {
 	ns := r.c.big
-	head := must(r.cl.NSHead(r.ctx, ns)).ID
+	head := must(r.w(ns).NSHead(r.ctx, ns)).ID
 	pick := func() client.HeadItem { return r.heads[rand.IntN(len(r.heads))] }
 	r.record("read_head_doc", r.measure(8, func() error {
 		h := pick()
-		_, err := r.cl.Doc(r.ctx, ns, h.Resource, h.Target)
+		_, err := r.rd(ns).Doc(r.ctx, ns, h.Resource, h.Target)
 		return err
 	}))
+	if r.op != nil {
+		// The same reads from 16 readers, whose grants stay in the core's
+		// bearer cache.
+		r.record("read_head_doc_cached_grants", r.measure(8, func() error {
+			h := pick()
+			_, err := r.readerOf(ns, 16).Doc(r.ctx, ns, h.Resource, h.Target)
+			return err
+		}))
+	}
 	r.record("read_head_pointer", r.measure(8, func() error {
-		_, err := r.cl.Head(r.ctx, ns, pick().Resource)
+		_, err := r.rd(ns).Head(r.ctx, ns, pick().Resource)
 		return err
 	}))
 	r.record("read_old_revision", r.measure(8, func() error {
 		h := pick()
 		// The resource's log, then its first revision: a fold from the
 		// genesis (or the nearest snapshot), uncached.
-		lg, _, err := r.cl.LogPage(r.ctx, ns, h.Resource, h.Target, "")
+		lg, _, err := r.rd(ns).LogPage(r.ctx, ns, h.Resource, h.Target, "")
 		if err != nil || len(lg) == 0 {
 			return err
 		}
-		_, err = r.cl.Doc(r.ctx, ns, h.Resource, lg[0].ID)
+		_, err = r.rd(ns).Doc(r.ctx, ns, h.Resource, lg[0].ID)
 		return err
 	}))
 	r.record("ns_log_page_random", r.measure(8, func() error {
-		_, _, err := r.cl.NSLogPage(r.ctx, ns, head, r.entries[rand.IntN(len(r.entries))])
+		_, _, err := r.w(ns).NSLogPage(r.ctx, ns, head, r.entries[rand.IntN(len(r.entries))])
 		return err
 	}))
 	r.record("heads_page_random", r.measure(8, func() error {
-		_, _, err := r.cl.HeadsPage(r.ctx, ns, head, pick().Resource)
+		_, _, err := r.w(ns).HeadsPage(r.ctx, ns, head, pick().Resource)
 		return err
 	}))
 	if r.c.small > 0 {
 		r.record("read_small_ns_doc", r.measure(8, func() error {
 			ns := fmt.Sprintf("cap-%04d", 1+rand.IntN(r.c.small))
 			name := docName(rand.IntN(max(1, r.c.smallDocs)))
-			h, err := r.cl.Head(r.ctx, ns, name)
+			h, err := r.rd(ns).Head(r.ctx, ns, name)
 			if err != nil || h.ID == "" {
 				return err
 			}
-			_, err = r.cl.Doc(r.ctx, ns, name, h.ID)
+			_, err = r.rd(ns).Doc(r.ctx, ns, name, h.ID)
 			return err
 		}))
 	}
@@ -422,7 +540,7 @@ func (r *runner) writes() {
 		r.record(fmt.Sprintf("append_big_c%d", c), r.measure(c, func() error {
 			i := take()
 			h := headOf(i)
-			w, err := r.cl.Append(r.ctx, ns, h.Resource, h.Target, []any{map[string]any{"op": "replace", "path": "/n", "value": -1}})
+			w, err := r.w(ns).Append(r.ctx, ns, h.Resource, h.Target, []any{map[string]any{"op": "replace", "path": "/n", "value": -1}})
 			if err == nil {
 				moved(i, w.ID)
 			}
@@ -433,11 +551,11 @@ func (r *runner) writes() {
 		r.record("append_small_ns_c32", r.measure(32, func() error {
 			ns := fmt.Sprintf("cap-%04d", 1+rand.IntN(r.c.small))
 			name := docName(rand.IntN(r.c.smallDocs))
-			h, err := r.cl.Head(r.ctx, ns, name)
+			h, err := r.w(ns).Head(r.ctx, ns, name)
 			if err != nil {
 				return err
 			}
-			_, err = r.cl.Append(r.ctx, ns, name, h.ID, []any{map[string]any{"op": "replace", "path": "/n", "value": -1}})
+			_, err = r.w(ns).Append(r.ctx, ns, name, h.ID, []any{map[string]any{"op": "replace", "path": "/n", "value": -1}})
 			if ae, ok := client.AsAPIError(err); ok && (ae.Status == 412 || ae.Status == 429) {
 				return nil // two writers met on one document, or its rate
 			}
@@ -456,7 +574,7 @@ func (r *runner) writes() {
 			items = append(items, client.BatchItem{Resource: h.Resource, IfMatch: h.Target,
 				Steps: []client.Step{client.PatchStep([]any{map[string]any{"op": "replace", "path": "/n", "value": -2}})}})
 		}
-		res, err := r.cl.Batch(r.ctx, ns, client.BatchRequest{Items: items}, false)
+		res, err := r.w(ns).Batch(r.ctx, ns, client.BatchRequest{Items: items}, false)
 		if err == nil {
 			for k, it := range res.Items {
 				moved(took[k], last(it.IDs))
@@ -484,7 +602,7 @@ func (r *runner) bootstrap() {
 			defer wg.Done()
 			for i := range jobs {
 				h := r.heads[i]
-				if _, err := r.cl.Doc(r.ctx, r.c.big, h.Resource, h.Target); err != nil {
+				if _, err := r.rd(r.c.big).Doc(r.ctx, r.c.big, h.Resource, h.Target); err != nil {
 					fail(err)
 				}
 			}
@@ -510,7 +628,7 @@ func (r *runner) largeDocs() {
 	}
 	ns := r.c.big + "-large"
 	if !r.exists(ns) {
-		must(r.cl.CreateNamespace(r.ctx, ns, nsDoc()))
+		r.createNS(ns)
 	}
 	out := map[string]any{}
 	for _, s := range strings.Split(r.c.large, ",") {
@@ -527,7 +645,7 @@ func (r *runner) largeDocs() {
 		}
 		doc["items"] = items
 		name := fmt.Sprintf("large-%d-%d", size, time.Now().UnixNano())
-		w, err := r.cl.CreateDoc(r.ctx, ns, name, doc)
+		w, err := r.w(ns).CreateDoc(r.ctx, ns, name, doc)
 		if err != nil {
 			fail(fmt.Errorf("creating a %d-byte document: %w", size, err))
 		}
@@ -535,7 +653,7 @@ func (r *runner) largeDocs() {
 		var lat []time.Duration
 		for i := 1; i <= 60; i++ {
 			t := time.Now()
-			w, err := r.cl.Append(r.ctx, ns, name, id, []any{map[string]any{"op": "replace", "path": "/n", "value": i}})
+			w, err := r.w(ns).Append(r.ctx, ns, name, id, []any{map[string]any{"op": "replace", "path": "/n", "value": i}})
 			if ae, ok := client.AsAPIError(err); ok && ae.Status == 429 {
 				time.Sleep(200 * time.Millisecond) // the resource's rate (10/s)
 				i--
@@ -564,8 +682,8 @@ func (r *runner) live() {
 	}
 	ns := r.c.big + "-live"
 	if !r.exists(ns) {
-		must(r.cl.CreateNamespace(r.ctx, ns, nsDoc()))
-		must(r.cl.CreateDoc(r.ctx, ns, "doc", map[string]any{"n": 0}))
+		r.createNS(ns)
+		must(r.w(ns).CreateDoc(r.ctx, ns, "doc", map[string]any{"n": 0}))
 	}
 	url := r.c.liveURL
 	if url == "" {
@@ -577,8 +695,16 @@ func (r *runner) live() {
 		if _, err := fmt.Sscan(s, &w); err != nil {
 			fail(fmt.Errorf("-waiters: %w", err))
 		}
-		lc := must(client.New(url, client.WithIdleConns(w+16)))
-		head := must(r.cl.NSHead(r.ctx, ns)).ID
+		hc := sharedHTTP(w + 16)
+		lcs := make([]*client.Client, w)
+		for i := range lcs {
+			opts := []client.Option{client.WithHTTPClient(hc)}
+			if r.op != nil {
+				opts = append(opts, client.WithBearer(r.mint(r.key, map[string]any{"kid": keyKid, "sub": fmt.Sprintf("user:device-%d", i), "ns": []any{ns}, "can": []any{"read"}})))
+			}
+			lcs[i] = must(client.New(url, opts...))
+		}
+		head := must(r.w(ns).NSHead(r.ctx, ns)).ID
 		ctx, cancel := context.WithTimeout(r.ctx, 2*time.Minute)
 		var parked atomic.Int64
 		got := make([]time.Time, w)
@@ -591,7 +717,7 @@ func (r *runner) live() {
 				since, cursor := head, ""
 				parked.Add(1)
 				for ctx.Err() == nil {
-					res, err := lc.LongPoll(ctx, ns, since, cursor)
+					res, err := lcs[i].LongPoll(ctx, ns, since, cursor)
 					if err != nil {
 						if errs.Add(1) == 1 {
 							r.logf("long-poll: %v", err)
@@ -613,8 +739,8 @@ func (r *runner) live() {
 		time.Sleep(2 * time.Second) // their requests reach the origin, or the CDN's waiting list
 		cpu0 := r.cpu()
 		t0 := time.Now()
-		h := must(r.cl.Head(r.ctx, ns, "doc"))
-		must(r.cl.Append(r.ctx, ns, "doc", h.ID, []any{map[string]any{"op": "replace", "path": "/n", "value": t0.UnixMilli()}}))
+		h := must(r.w(ns).Head(r.ctx, ns, "doc"))
+		must(r.w(ns).Append(r.ctx, ns, "doc", h.ID, []any{map[string]any{"op": "replace", "path": "/n", "value": t0.UnixMilli()}}))
 		wg.Wait()
 		cancel()
 		cpu := r.cpu() - cpu0
