@@ -18,6 +18,8 @@ package main
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -35,7 +37,10 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 )
 
-const author = "capacity"
+// author names the loader in -dev (X-Author); it is also the loader's
+// principal in the grants profile, so a namespace seeded in either is
+// measured with the loader's allowance in the other.
+const author = "user:capacity"
 
 type config struct {
 	url         string
@@ -91,7 +96,11 @@ func main() {
 			fail(fmt.Errorf("-operator-seed: %w", err))
 		}
 		r.op = op
-		r.keyPub, r.key = grant.GenerateKey()
+		// The namespaces' key follows from the operator's, so a later run
+		// with the same seed measures namespaces an earlier one created.
+		seed := sha256.Sum256([]byte("capacity namespace key\x00" + c.operator))
+		r.key = ed25519.NewKeyFromSeed(seed[:])
+		r.keyPub = base64.RawURLEncoding.EncodeToString(r.key.Public().(ed25519.PublicKey))
 		r.writers = map[string]*client.Client{}
 		r.readerPools = map[string][]*client.Client{}
 		r.res["profile"] = "grants"
@@ -154,7 +163,7 @@ func (r *runner) newClient(url, token string) *client.Client {
 }
 
 // The loader's principal in the grants profile, and its key's kid.
-const loaderSub, keyKid = "user:capacity", "cap"
+const loaderSub, keyKid = author, "cap"
 
 // nsDoc is the document of the namespaces the harness creates: public, or
 // in the grants profile read: grant with the harness's key. Either way an
@@ -162,7 +171,7 @@ const loaderSub, keyKid = "user:capacity", "cap"
 func (r *runner) nsDoc() map[string]any {
 	bucket := map[string]any{"rate": 1e9, "burst": 1e9}
 	if r.op == nil {
-		return map[string]any{"read": "public", "allowances": []any{map[string]any{"sub": author, "kid": "capacity", "bucket": bucket}}}
+		return map[string]any{"read": "public", "allowances": []any{map[string]any{"sub": author, "kid": keyKid, "bucket": bucket}}}
 	}
 	return map[string]any{"read": "grant",
 		"keys":       []any{map[string]any{"kid": keyKid, "alg": "ed25519", "pub": r.keyPub, "can": []any{"read", "create", "append"}}},
