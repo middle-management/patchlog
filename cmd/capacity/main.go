@@ -777,6 +777,10 @@ func (r *runner) live() {
 			time.Sleep(10 * time.Millisecond)
 		}
 		time.Sleep(2 * time.Second) // their requests reach the origin, or the CDN's waiting list
+		// Then until the core has admitted them all (with grants, each
+		// first request verifies its grant): its CPU time settles, so
+		// what follows is what the write costs.
+		r.settle()
 		cpu0 := r.cpu()
 		t0 := time.Now()
 		h := must(r.w(ns).Head(r.ctx, ns, "doc"))
@@ -802,6 +806,21 @@ func (r *runner) live() {
 		out[fmt.Sprint(w)] = res
 	}
 	r.record("long_poll_fanout", out)
+}
+
+// settle waits until the core's CPU time grows by less than 20 ms in
+// half a second (at most a minute), when -pid is given.
+func (r *runner) settle() {
+	if r.c.pid == "" {
+		return
+	}
+	for deadline := time.Now().Add(time.Minute); time.Now().Before(deadline); {
+		c := r.cpu()
+		time.Sleep(500 * time.Millisecond)
+		if r.cpu()-c < 0.02 {
+			return
+		}
+	}
 }
 
 // cpu is the core's user and system CPU time so far, in seconds (0

@@ -31,7 +31,7 @@ At that size, server X answers, at the origin (before any CDN):
 | A batch of 1,000 appends | 1.4 s |
 | Appends to a large document | p50 7 ms at 16 KiB, 15 ms at 1 MiB, 25 ms at 3.5 MiB |
 | A consumer's full catch-up of the large namespace | log: 4M entries in 2.4 min; `/heads`: 1M in 37 s; fetching 1M documents 8 at a time: ~10 min |
-| Long-poll followers of one **private** namespace | 5,000 followers: ~5 s of core CPU and ~5 s to deliver each write (no CDN collapse, see below) |
+| Long-poll followers of one **private** namespace | 5,000 followers: 0.3–1 s of core CPU and 0.35–0.7 s to deliver each write, the waiters sharing one read at the origin (no CDN collapse, see below; 3.7–4.1 s of CPU before) |
 | Long-poll followers of one **public** namespace, behind the CDN | 5,000 followers: 0.01 s of core CPU, all delivered in 0.25 s (0.4 s on SQLite) |
 
 What the data size costs and what it doesn't: none of the per-request numbers above depends on
@@ -75,23 +75,34 @@ whatever the number of followers. Measured with the repository's Varnish configu
 That holds for **public** namespaces only. A private namespace's long-poll answers are
 `CDN-Cache-Control: no-store` unless the CDN verifies edge grants (§C.5, `-edge-secret`), and
 no edge that does is included (only the checks, in Go: `edge.Cookies.Check`). Without one,
-every follower is an origin request, and every write wakes all of them, each of which reads the
-log again:
+every follower is an origin request, and every write wakes all of them.
 
-| Followers of one namespace | public, via CDN | public, direct (SQLite, 4 vCPU) | private, via CDN or direct (Postgres, server X) |
-|---|---|---|---|
-| 100 | 7 ms to deliver, ~0 CPU | 35 ms, 0.07 CPU-s | 0.1–0.2 s, 0.1 CPU-s |
-| 1,000 | 46 ms, ~0 CPU | 0.18 s, 0.5 CPU-s | 0.7–0.8 s, 0.8 CPU-s |
-| 5,000 | 0.39 s, 0.01 CPU-s | 0.69 s, 2.0 CPU-s | 4.4–5.2 s, 5–6.5 CPU-s |
+**Origin-side collapse.** The origin shares those reads (`internal/core/live.go`): a waiter's
+first read is checked as any read is, and while that decision holds (no configuration change,
+purge or other change to what reads may return since, the grant not expired, no rule reading
+`/now`) its later reads skip the check and are shared with every waiter woken by the same commit:
+one log read per namespace, `since` and commit, whatever the number of waiters. Before it, each
+woken waiter read the log in a transaction of its own.
 
-CPU-s is the core's CPU time per write delivered. Uncollapsed, a write costs about **1 ms of
-core CPU per private follower** on server X (0.4 ms per public follower on SQLite), and a log
-query per follower in Postgres, which is what bounds it: 5,000 private followers took 4.4 s
-with a 1-vCPU core, 5.2 s with 2 vCPU and 5.4 s with two 1-vCPU instances. So 5,000 private
-followers of a namespace keep up with about **0.2 writes/s** to it on server X, whatever the
-core's size. Planning rule without a verifying edge: `followers × writes/s ≤ ~1,000/s` on
-server X. Through the CDN, public, the same 5,000 followers cost 0.01 CPU-s and were delivered
-in 0.25 s on server X too.
+| Followers of one namespace | public, via CDN | private, direct, before | private, direct, origin collapse | private, via Varnish, origin collapse |
+|---|---|---|---|---|
+| 100 | 7 ms, ~0 CPU-s | 0.3–0.4 s, 0.06–0.07 CPU-s | 0.03–0.5 s, 0.02–0.03 CPU-s | 0.24–0.41 s, 0.02–0.03 CPU-s |
+| 1,000 | 46 ms, ~0 CPU-s | 0.63–0.71 s, 0.7–0.8 CPU-s | **0.08 s, 0.10–0.12 CPU-s** | 0.53–0.60 s, 0.08–0.11 CPU-s |
+| 5,000 | 0.25–0.39 s, 0.01 CPU-s | 3.1 s, 3.7–4.1 CPU-s | **0.35–0.69 s, 0.33–0.98 CPU-s** | 2.8–3.0 s, 1.25–2.2 CPU-s |
+
+Private columns: server X (Postgres, the core at 2 vCPU), grants, two runs each, the core idle
+before the write; the time is until every follower had the write, CPU-s the core's CPU time for
+it. The public column is SQLite and server X. With the collapse, a write costs about **0.1–0.2 ms
+of core CPU per private follower** (1 ms before: a transaction and a log query each), so server
+X delivers roughly 5,000–15,000 follower-writes a second, against ~1,000 before. Through
+Varnish, the rest is Varnish passing 5,000 private connections on the same host. The
+repository's VCL no longer queues a long-poll with credentials behind an identical one in flight
+(`hash_ignore_busy`): it held them until the next write and then sent them to the origin a few
+at a time, as new requests that share nothing.
+
+Planning rule for private followers without a verifying edge: `followers × writes/s` up to
+~5,000/s on server X; and every follower is a connection the origin holds open (the CDN in front
+holds them when it verifies edge grants).
 
 ## Limits, by kind
 
@@ -103,7 +114,7 @@ in 0.25 s on server X too.
 | **§6.6 size limits**: documents 1 MiB by default (4 MiB a namespace may set, the deployment maximum; §6.6 says 4 MiB), patch sets 256 KiB, 1,000 ops a set, 1,000 items and 16 MiB a batch, 1,000 entries a log page. The other deployment maximums equal the defaults. | | Large documents are slow to write (next row); batches are imports, not interactive writes. `serve -max-document-size` raises the document maximum. |
 | **Whole-document work on every write**: the result is canonicalised, checked against the limits and validated against its `$schema` in full; a small patch to a large document costs the document's size. | Append p50: 7 ms at 16 KiB, 15 ms at 1 MiB, 25 ms at 3.5 MiB (server X); 1.7 / 7 / 19 ms on SQLite. | Keep frequently edited documents small: split large aggregates into resources. |
 | **Default rates** (§6.6), per instance: 50 items/s a principal (burst 100), 500 items/s a namespace (burst 1,000), 10/s a resource (burst 20). | 500/s a namespace is ~85% of server X's single-namespace ceiling. | Allowances (§6.6) replace a principal's and its namespace's buckets, for loaders and importers. The per-resource rate always applies. |
-| **Followers are cheap only through the CDN** (§7.7, §9). SSE streams (§7.3) can't be collapsed. | See the table above. | Devices long-poll; services that need every entry use the log and checkpoints (§10). |
+| **Followers are cheapest through the CDN** (§7.7, §9): there they cost the origin nothing per follower; at the origin, a connection each and a shared read per write. SSE streams (§7.3) are collapsed neither at the CDN nor at the origin. | See the table above. | Devices long-poll; services that need every entry use the log and checkpoints (§10). |
 | **Consumers read over HTTP**: a consumer catches up from the log and fetches each changed document (§10). | Catch-up of 4M entries: 2.4 min; bootstrap of 1M documents: ~11 min on server X. | Consumer throughput is the consumer's (gaps below); the origin side scales with instances. |
 
 ### Gaps in this implementation
@@ -111,8 +122,7 @@ in 0.25 s on server X too.
 | Gap | Effect | Fix |
 |---|---|---|
 | **Bearer cache of 1,024 grants** per instance (`maxGrantCacheEntries`), emptied when full. | A fleet with more than 1,024 active tokens verifies its grant (Biscuit decode, Ed25519) on every request: reads p50 6.6 ms against 4.6 ms with cached grants, 1,030/s against 1,630/s. | A larger, byte-bounded cache (tens of thousands of grants), evicting gradually. |
-| **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: ~1 ms of core CPU and a Postgres query per follower per write. | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
-| **Long-polls don't collapse at the origin either**: every woken waiter of a namespace reads the same log range again, in its own transaction. | Private followers are Postgres-bound: ~1,000 follower-deliveries/s on server X, independent of the core's size. | Read the range once per (namespace, `since`) wake-up and share it among the waiters, each still checked against its grant (the grant check is in memory when its grant is cached). This is the largest single gain for private fleets, before or besides a verifying edge. |
+| **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request; the origin shares their reads (above), ~0.1–0.2 ms of core CPU per follower per write. | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **Log pages bound entries, not items.** A batch entry carries its items inline. | A page of 1,000 batch entries of 1,000 items holds 1M items. | Bound pages by resource entries or bytes too. |
 | **Rate-limit buckets are never evicted**: one per (namespace, resource, principal) written, per instance. | Memory grows with distinct resources written until restart. | Drop buckets that are full again (idle longer than burst / rate). |
 | **The document cache is bounded by count** (4,096 documents), not bytes; the 64 MiB read cache empties itself when full. | Up to 16 GiB of 4 MiB documents; hit rates collapse past 64 MiB. | Byte budgets and gradual eviction. |
@@ -122,7 +132,8 @@ in 0.25 s on server X too.
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.5–1.8 GB on the instance that served the full scans of the large namespace (steady 0.5–0.8 GB); the second instance, which didn't, peaked at 0.2 GB. | Run with `GOMEMLIMIT` under container limits; profile the scans (an opt-in pprof listener would help). |
 
-Fixed in this branch, and so not limits any more: namespace log pages scanned and sorted the
+Fixed in this branch, and so not limits any more: long-polls of a namespace each read the log
+on their own when woken (now shared, above); namespace log pages scanned and sorted the
 whole namespace, and the config-retry lookup the whole log (now indexed; CHANGELOG, Unreleased);
 a consumer's snapshot bootstrap held the whole `/heads` listing in memory and one transaction
 (now paged and resumable).
