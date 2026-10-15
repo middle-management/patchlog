@@ -147,7 +147,7 @@ func (p *Preview) Run(ctx context.Context) error {
 		if err := p.apply(ctx, b); err != nil {
 			return err
 		}
-		cps.Save(b.Origin, b.NS, b.NewCheckpoint)
+		cps.SaveBatch(b.Origin, b.NS, b)
 		return nil
 	})
 	opts := []follow.Option{

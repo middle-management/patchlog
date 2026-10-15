@@ -177,7 +177,9 @@ type Service struct {
 	amu sync.Mutex
 	ats map[string]atRecord // the checkpoints behind the ats of kept listings (atIncludes)
 
-	wmu sync.Mutex // serialises applies across followers
+	wmu     sync.Mutex // serialises applies across followers
+	pmu     sync.Mutex
+	pending map[string][]follow.Unit // pages of unfinished snapshots (stage)
 
 	mu  sync.RWMutex // guards g, cur, purged
 	g   *Graph
@@ -613,6 +615,13 @@ type prep struct {
 // fetched outside the locks, then applied to the graph, the derived rows,
 // the hook's tables and the checkpoint in one transaction (§A.1, §B.11.7).
 func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
+	if fb.Snapshot {
+		whole, ok := s.stage(fb)
+		if !ok {
+			return nil
+		}
+		fb = whole
+	}
 	// In a release preview the followed namespace is a branch, and the
 	// graph is keyed by the namespace it stands for (Options.Branches): b
 	// is the batch under that name, fb the batch as followed.
@@ -638,7 +647,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	var content *client.NSDoc
 	if !isCat && !co.PurgedNS && s.opt.RoleView != nil {
 		content = cfg
-		if content == nil && (b.Snapshot || !s.hasContent(b.NS)) {
+		if content == nil && (b.Replaces() || !s.hasContent(b.NS)) {
 			d, err := s.c.NSDoc(ctx, fb.NS, b.NewCheckpoint)
 			switch {
 			case client.IsPurged(err):
@@ -779,6 +788,37 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	return nil
 }
 
+// stage collects the pages of a snapshot listed by pages
+// (follow.Batch.Partial) and returns it whole at its last page, as one
+// Snapshot batch: listings are cached by the combined checkpoint, which
+// moves only once the snapshot is complete, so its pages can't change
+// what listings show one by one. The units are a page's names, kinds and
+// heads, held as the graph holds every item anyway; nothing is applied or
+// recorded before the last page, so a restart starts the snapshot again.
+func (s *Service) stage(b *follow.Batch) (*follow.Batch, bool) {
+	s.pmu.Lock()
+	defer s.pmu.Unlock()
+	if b.Replaces() {
+		delete(s.pending, b.NS)
+	}
+	if b.Partial() {
+		if s.pending == nil {
+			s.pending = map[string][]follow.Unit{}
+		}
+		s.pending[b.NS] = append(s.pending[b.NS], b.Units...)
+		return nil, false
+	}
+	earlier, ok := s.pending[b.NS]
+	if !ok {
+		return b, true
+	}
+	delete(s.pending, b.NS)
+	whole := *b
+	whole.Units = append(earlier, b.Units...)
+	whole.After, whole.More = "", ""
+	return &whole, true
+}
+
 type applyResult struct {
 	tags     []string
 	purgedAt time.Time // when the purge of the batch's namespace was applied
@@ -796,7 +836,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	defer tx.Rollback()
 
 	if b.NS == cat {
-		if b.Snapshot || co.PurgedNS {
+		if b.Replaces() || co.PurgedNS {
 			for name := range g.explicit {
 				g.removeExplicit(name)
 				changed[name] = true
@@ -845,8 +885,8 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		}
 	} else {
 		ns := b.NS
-		if b.Snapshot || co.PurgedNS {
-			if b.Snapshot {
+		if b.Replaces() || co.PurgedNS {
+			if b.Replaces() {
 				if _, err := tx.ExecContext(ctx, `DELETE FROM items WHERE ns = ?`, ns); err != nil {
 					return nil, err
 				}
@@ -1000,7 +1040,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	if err := s.sealed.Purge(ctx, tx, res.tags); err != nil {
 		return nil, err
 	}
-	if err := s.cps.Save(ctx, tx, b.Origin, s.actual(b.NS), b.NewCheckpoint); err != nil {
+	if err := s.cps.SaveBatch(ctx, tx, b.Origin, s.actual(b.NS), b); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {

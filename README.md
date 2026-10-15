@@ -2588,7 +2588,12 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   other, and every e2e fold (the client's `DocE2E`, and so merge and rebase, PruneE2E, derived
   views; the playground) fetches `/rev/{H}` when it starts at the horizon. Every reader follows pages and treats a page that stops short of the range's id without
   `X-Log-Next` as an error: `client.Log`, `NSLog` (one page each: `LogPage`, `NSLogPage`) and e2e
-  folds, and so `follow` (catch-up delivers and checkpoints page by page, §10), the index (`?min`
+  folds, and so `follow` (catch-up delivers and checkpoints page by page, §10; a snapshot
+  bootstrap, `WithSnapshot` or a new branch, delivers its `/heads` listing a page per batch, the
+  first replacing what the consumer holds and the last carrying the checkpoint, and a consumer
+  whose checkpoints record the pages in between, `SQLCheckpoints.SaveBatch`, resumes after the
+  last one recorded when restarted; the tree service applies a listing whole, at its last page,
+  since its listings are cached by checkpoint), the index (`?min`
   checks only the first page), tree and catalog, merge, rebase, release and janitor tooling,
   bundle export and import (whether `requires` is in the target's chain takes one page), remote
   branches mirroring and following their bases (§G.3), and the playground (namespace logs,

@@ -48,7 +48,7 @@ func (r *recorder) Apply(_ context.Context, b *follow.Batch) error {
 		return errors.New("transient")
 	}
 	r.batches = append(r.batches, b)
-	r.cp.Save(b.Origin, b.NS, b.NewCheckpoint)
+	r.cp.SaveBatch(b.Origin, b.NS, b)
 	return nil
 }
 
@@ -405,7 +405,7 @@ func (h *sqlHandler) Apply(ctx context.Context, b *follow.Batch) error {
 			return err
 		}
 	}
-	if err := h.cp.Save(ctx, tx, b.Origin, b.NS, b.NewCheckpoint); err != nil {
+	if err := h.cp.SaveBatch(ctx, tx, b.Origin, b.NS, b); err != nil {
 		return err
 	}
 	return tx.Commit()

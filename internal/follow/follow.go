@@ -66,8 +66,33 @@ type Batch struct {
 	// consumer should treat it as the complete state as of NewCheckpoint
 	// (dropping anything it holds for the namespace not listed, if it
 	// holds anything).
+	//
+	// A listing longer than a page (§7.1 Paging) comes as several Snapshot
+	// batches, one per page, all at the same NewCheckpoint: the first has
+	// After "" and the last More "". Only the first replaces what the
+	// consumer holds (Replaces); each later one adds to it. Until the
+	// last, the snapshot isn't complete: NewCheckpoint is where it will
+	// be, not one reached, so a consumer records it as progress (Partial;
+	// SQLCheckpoints.SaveBatch does) rather than as its checkpoint, and
+	// doesn't serve the namespace as of it yet. A follower that restarts
+	// meanwhile resumes after the last page recorded, when its Checkpoint
+	// is a Resumer, and from the first page otherwise.
 	Snapshot bool
+	// After is the /heads cursor this page of a snapshot starts after,
+	// "" for the first page (and for every batch that isn't a snapshot).
+	After string
+	// More is the cursor of the page after this one, "" for the last page
+	// of a snapshot (and for every batch that isn't one).
+	More string
 }
+
+// Partial reports whether b is a page of a snapshot that further pages
+// complete: b.NewCheckpoint isn't reached yet.
+func (b *Batch) Partial() bool { return b.More != "" }
+
+// Replaces reports whether b replaces what the consumer holds for the
+// namespace: a snapshot, or its first page.
+func (b *Batch) Replaces() bool { return b.Snapshot && b.After == "" }
 
 // Unit is one unit of processing (§10): a single namespace entry, or a
 // batch entry whose sub-entries must be applied together.
@@ -249,7 +274,13 @@ func (n *nsFollower) run(ctx context.Context) error {
 		if !isBranch && (n.ns != f.ns || f.opt.isBranch) {
 			isBranch = true
 		}
-		if isBranch {
+		resumed, err := n.resumeSnapshot(ctx, isBranch || f.opt.snapshot)
+		if err != nil {
+			return err
+		}
+		if resumed {
+			// Delivered the rest of a snapshot a restart interrupted.
+		} else if isBranch {
 			if err := n.bootstrapBranch(ctx); err != nil {
 				return err
 			}
@@ -310,7 +341,36 @@ func (n *nsFollower) bootstrapSnapshot(ctx context.Context) error {
 		return err
 	}
 	head := v.(*client.NSHead)
-	return n.deliverHeads(ctx, head.ID, nil)
+	return n.deliverHeads(ctx, head.ID, "", nil)
+}
+
+// resumeSnapshot delivers the rest of a snapshot bootstrap that a restart
+// interrupted after some of its pages (Batch.Partial), if the Checkpoint
+// recorded one (Resumer) and a bootstrap is still due. A listing the
+// origin no longer serves at that position (a 4xx other than a purge) is
+// left, and the bootstrap starts again from its first page.
+func (n *nsFollower) resumeSnapshot(ctx context.Context, due bool) (bool, error) {
+	rs, ok := n.f.cp.(Resumer)
+	if !ok || !due {
+		return false, nil
+	}
+	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
+		at, after, err := rs.LoadBootstrap(ctx, n.origin, n.ns)
+		return [2]string{at, after}, err
+	})
+	if err != nil {
+		return false, err
+	}
+	p := v.([2]string)
+	if p[0] == "" || p[1] == "" {
+		return false, nil
+	}
+	err = n.deliverHeads(ctx, p[0], p[1], nil)
+	if ae, ok := client.AsAPIError(err); ok && n.cur == "" && ae.Status >= 400 && ae.Status < 500 && !client.IsPurged(err) {
+		n.f.report(n.ns, fmt.Errorf("follow: resuming the snapshot at %s: %w; starting it again", p[0], err))
+		return false, nil
+	}
+	return err == nil, err
 }
 
 // bootstrapBranch delivers a new branch's first entry (its config genesis)
@@ -345,32 +405,58 @@ func (n *nsFollower) bootstrapBranch(ctx context.Context) error {
 		return err
 	}
 	genesis := v.(client.NSEntry)
-	return n.deliverHeads(ctx, genesis.ID, &genesis)
+	return n.deliverHeads(ctx, genesis.ID, "", &genesis)
 }
 
-func (n *nsFollower) deliverHeads(ctx context.Context, at string, genesis *client.NSEntry) error {
-	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.Heads(ctx, n.ns, at) })
-	if client.IsPurged(err) {
-		return n.deliverPurged(ctx, err)
+// deliverHeads delivers the /heads listing at at, from the page after
+// after ("" for the first), each page as a Snapshot batch of its own once
+// the one before it is applied (Batch.Partial), so a listing of any length
+// costs a page of memory and a page per Apply. genesis, a new branch's
+// config genesis, goes first, in the first page's batch.
+func (n *nsFollower) deliverHeads(ctx context.Context, at, after string, genesis *client.NSEntry) error {
+	type page struct {
+		items []client.HeadItem
+		next  string
 	}
-	if err != nil {
-		return err
-	}
-	var units []Unit
-	if genesis != nil {
-		u := Unit{Entry: *genesis}
-		if err := n.attachConfig(ctx, &u); client.IsPurged(err) {
+	for {
+		v, err := n.f.retryValue(ctx, n.ns, func() (any, error) {
+			items, next, err := n.f.c.HeadsPage(ctx, n.ns, at, after)
+			return page{items, next}, err
+		})
+		if client.IsPurged(err) {
 			return n.deliverPurged(ctx, err)
-		} else if err != nil {
+		}
+		if err != nil {
 			return err
 		}
-		units = append(units, u)
+		p := v.(page)
+		var units []Unit
+		if genesis != nil {
+			u := Unit{Entry: *genesis}
+			if err := n.attachConfig(ctx, &u); client.IsPurged(err) {
+				return n.deliverPurged(ctx, err)
+			} else if err != nil {
+				return err
+			}
+			units = append(units, u)
+			genesis = nil
+		}
+		for _, it := range p.items {
+			e := client.NSEntry{Resource: it.Resource, Kind: it.Kind, Target: it.Target}
+			units = append(units, Unit{Entry: e, Synthetic: true})
+		}
+		if p.next == after && after != "" {
+			return fmt.Errorf("follow: %s: /heads at %s doesn't move past %q", n.ns, at, after)
+		}
+		b := &Batch{Origin: n.origin, NS: n.ns, Units: units, From: n.cur, NewCheckpoint: at, Snapshot: true, After: after, More: p.next}
+		if err := n.apply(ctx, b); err != nil {
+			return err
+		}
+		if p.next == "" {
+			return nil
+		}
+		after = p.next
 	}
-	for _, it := range v.([]client.HeadItem) {
-		e := client.NSEntry{Resource: it.Resource, Kind: it.Kind, Target: it.Target}
-		units = append(units, Unit{Entry: e, Synthetic: true})
-	}
-	return n.apply(ctx, &Batch{Origin: n.origin, NS: n.ns, Units: units, From: n.cur, NewCheckpoint: at, Snapshot: true})
 }
 
 // deliverPurged stands in for what a purged namespace no longer serves: its
@@ -607,7 +693,9 @@ func (n *nsFollower) apply(ctx context.Context, b *Batch) error {
 			return err
 		}
 	}
-	n.cur = b.NewCheckpoint
+	if !b.Partial() {
+		n.cur = b.NewCheckpoint
+	}
 	observeApplied(b)
 	for _, u := range b.Units {
 		if u.Config != nil {

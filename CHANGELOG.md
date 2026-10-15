@@ -18,6 +18,19 @@
 - **Idempotent retries of config writes and batches with a config change** looked up the
   first namespace entry under a configuration by scanning all of `ns_log` (about 400 ms at 5
   million entries, growing with the table); `(ns, config_seq, seq)` makes it one index probe.
+- **Snapshot bootstraps of large namespaces** (`follow.WithSnapshot`, new branches followed by
+  the index, the janitor and release previews): the follower read the whole `/heads` listing
+  into memory and delivered it as one batch, which a consumer applied in one transaction with a
+  document fetch per resource before anything was recorded, so a namespace of millions of
+  resources needed memory for all of them and an interruption started over. The listing now
+  comes a page per batch (`Batch.After`, `More`; `Replaces` for the first page, `Partial` for
+  every page but the last), the checkpoint with the last page. `SQLCheckpoints.SaveBatch` (and
+  `MemoryCheckpoints.SaveBatch`) record the pages in between in a table of their own
+  (`checkpoints_bootstrap`, created by `Init`), and a follower restarted meanwhile resumes after
+  the last page recorded (`Resumer`), or starts again from the first page if the origin no
+  longer lists from there. The index serves the namespace only once the last page is applied,
+  as before; the tree service holds the pages and applies the listing whole at its last page,
+  since its listings are cached by checkpoint.
 
 ## v0.20.1
 
