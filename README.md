@@ -2598,6 +2598,21 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   bundle export and import (whether `requires` is in the target's chain takes one page), remote
   branches mirroring and following their bases (§G.3), and the playground (namespace logs,
   histories and e2e folds; each sealed page is opened as its own range).
+- **Long-poll reads are shared** (§7.7, `internal/core/live.go`). A write wakes every long-poll
+  waiting on its namespace, and each would read the log after its `since` again: thousands of
+  identical transactions for a private namespace that thousands of devices follow, which a CDN
+  can't collapse unless it verifies edge grants (§C.5). So a long-poll's first read is checked as
+  any read, and while that decision holds its later reads skip the check and are shared: the
+  waiters woken by one commit that read the same `since` and page make one read, and its answer
+  serves those that ask after it is done, until the namespace's next commit. The decision holds
+  while the read cache's meta counter (configuration, purges, prunes, restores, key destruction;
+  on Postgres while the tailer is fresh) hasn't moved, before the grant's earliest `exp`, and only
+  for grants whose key, block and role rules don't read `/now` (nor the whole envelope); edge
+  grants and resource long-polls are read on their own, as before. On server X
+  ([docs/CAPACITY.md](docs/CAPACITY.md)) one write to 5,000 private followers went from 3.7–4.1 s
+  of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
+  waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
+  flight.
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
   batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
   principal and namespace buckets, and a key scope's lower rate) and batch limits, until the

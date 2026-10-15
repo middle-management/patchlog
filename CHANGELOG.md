@@ -16,6 +16,20 @@
   million namespace entries; to avoid that, create them beforehand with
   `CREATE INDEX CONCURRENTLY` under the same names (see the README's Postgres section).
 
+**Improvements:**
+- **Long-polls of a namespace share their reads** (§7.7, README design notes): a write woke every
+  waiting long-poll, and each read the log again in a transaction of its own, so a private
+  namespace followed by thousands of devices (which a CDN can't collapse without verifying edge
+  grants) cost a transaction and a log query per follower per write. A long-poll's read check now
+  stands for its later reads while the configuration and its grant are unchanged and its rules
+  don't read `/now`, and those reads are shared by the waiters woken by the same commit. One
+  write to 5,000 private followers: 3.7–4.1 s of core CPU before, 0.3–1 s now, delivered in
+  0.35–0.7 s instead of 3.1 s (docs/CAPACITY.md).
+- **The local CDN's VCL** lets long-polls with credentials (`Authorization` or cookies) skip
+  Varnish's waiting list: a private namespace's long-poll was held behind an identical one in
+  flight until the next write, then sent to the origin with the rest a few at a time. Identical
+  long-poll misses without credentials (devices following a public namespace) still collapse.
+
 **Fixes:**
 - **Namespace log pages in long namespaces:** a page (ranges, long-polls, event streams) had no
   index to read a namespace's entries in order, so Postgres could read the whole namespace and

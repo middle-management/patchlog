@@ -33,6 +33,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -229,6 +231,13 @@ type Engine struct {
 	stmts      stmtCache
 	rc         readCache
 	bearers    grantCache
+	// liveReads shares long-poll reads of a namespace log among their
+	// waiters (live.go), and liveDone keeps their recent answers;
+	// liveJoins counts the reads asked of them, and liveShared those made.
+	liveReads  singleflight.Group
+	liveDone   liveDone
+	liveJoins  atomic.Int64
+	liveShared atomic.Int64
 	stop       chan struct{}
 	bg         sync.WaitGroup
 	closeOnce  sync.Once
