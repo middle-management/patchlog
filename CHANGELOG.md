@@ -3,6 +3,13 @@
 ## Unreleased
 
 **Changes to check before upgrading:**
+- **`documentSize` defaults to 1 MiB** (was §6.6's 4 MiB), measured in
+  [docs/CAPACITY.md](docs/CAPACITY.md): an append re-serialises and validates the whole
+  document, 3–4 times slower at 3.5 MiB than at 16 KiB. 4 MiB stays the deployment maximum
+  (`serve -max-document-size` changes it), and a namespace may set `limits.documentSize` up to
+  it. **In namespaces holding documents over 1 MiB, appends to them are `413` until the
+  namespace sets `documentSize`** (or the deployment runs with `serve -document-size 4MiB`, the
+  old default). Bundle imports and remote branches of such documents need the same.
 - **New indexes on the namespace log** (`ns_log_ns_seq` on `(ns, seq)`, `ns_log_ns_config` on
   `(ns, config_seq, seq)`), built on the first start, on SQLite and Postgres. On Postgres the
   build runs in the schema migration and blocks writes until it commits, a few seconds per 5

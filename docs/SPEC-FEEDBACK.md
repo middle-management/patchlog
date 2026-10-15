@@ -58,6 +58,14 @@ From implementing v0.51 and v0.52. Each gives what the reference chose.
     reference answers `410` for any name of a purged namespace. A create grant there is still
     `409` "exists or existed", as §B.11.4 states, though the core would refuse the write with
     `410`. *Propose:* say that any name of a purged namespace is `410`, for restores and creates.
+11. **The `documentSize` default** (§6.6). Every write re-serialises, checks and validates the
+    whole document, so a small append costs the document's size: measured at 1M documents and
+    5M revisions, an append's p50 is 7 ms at 16 KiB, 15 ms at 1 MiB and 25 ms at 3.5 MiB
+    (docs/CAPACITY.md), and every revision of a large document weighs on caches sized in
+    documents. The reference defaults `documentSize` to 1 MiB and keeps 4 MiB as the deployment
+    maximum a namespace may set (`serve -document-size`, `-max-document-size`). *Propose:* a
+    1 MiB default, and say that a namespace may raise a limit up to the deployment maximum where
+    the deployment's maximum exceeds the default (§6.6 now reads as defaults namespaces lower).
 
 ## Settled in v0.51 and v0.52
 

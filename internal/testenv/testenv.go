@@ -85,7 +85,7 @@ func Apply(o *core.Options) {
 		// What core.Open would default them to.
 		o.Maximums = o.Limits
 		if o.Maximums == (core.Limits{}) {
-			o.Maximums = core.DefaultLimits()
+			o.Maximums = core.DefaultMaximums()
 		}
 	}
 	if l := o.Maximums.LogPageSize; l == 0 || l == core.DefaultLimits().LogPageSize {

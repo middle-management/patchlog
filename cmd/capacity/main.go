@@ -196,12 +196,17 @@ func (r *runner) mint(signer ed25519.PrivateKey, root map[string]any) string {
 }
 
 // createNS creates ns: in the grants profile with an operator grant.
-func (r *runner) createNS(ns string) {
+// limits, if given, are the namespace's (§6.6).
+func (r *runner) createNS(ns string, limits ...map[string]any) {
 	c := r.pubs[r.home(ns)]
 	if r.op != nil {
 		c = r.newClient(r.home(ns), r.mint(r.op, map[string]any{"kid": "operator", "sub": "op:capacity", "ns": []any{ns}, "can": []any{"config"}}))
 	}
-	must(c.CreateNamespace(r.ctx, ns, r.nsDoc()))
+	doc := r.nsDoc()
+	if len(limits) > 0 {
+		doc["limits"] = limits[0]
+	}
+	must(c.CreateNamespace(r.ctx, ns, doc))
 }
 
 // home is the instance a namespace's writes go to.
@@ -658,7 +663,7 @@ func (r *runner) largeDocs() {
 	}
 	ns := r.c.big + "-large"
 	if !r.exists(ns) {
-		r.createNS(ns)
+		r.createNS(ns, map[string]any{"documentSize": 4 << 20}) // the deployment maximum by default; 1 MiB is the default
 	}
 	out := map[string]any{}
 	for _, s := range strings.Split(r.c.large, ",") {

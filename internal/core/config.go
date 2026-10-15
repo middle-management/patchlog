@@ -56,12 +56,17 @@ type Limits struct {
 // Rate is a token bucket: Rate tokens per second, Burst the bucket size.
 type Rate struct{ Rate, Burst float64 }
 
-// DefaultLimits are the defaults of §6.6, also used as deployment maximums.
+// DefaultLimits are the defaults of §6.6, also used as deployment maximums
+// (DefaultMaximums), but for documentSize: 1 MiB, where §6.6 says 4 MiB.
+// Every write re-serialises and checks the whole document, so an append to
+// a 3.5 MiB document costs 3-4 times one to a 16 KiB document
+// (docs/CAPACITY.md); a namespace that needs larger documents sets
+// documentSize, up to the deployment maximum.
 func DefaultLimits() Limits {
 	return Limits{
 		PatchSetSize:         256 << 10,
 		OpsPerSet:            1000,
-		DocumentSize:         4 << 20,
+		DocumentSize:         1 << 20,
 		ValueSize:            64 << 10,
 		PathSize:             2 << 10,
 		NestingDepth:         64,
@@ -87,6 +92,18 @@ func DefaultLimits() Limits {
 		BlobRate:             Rate{8 << 20, 256 << 20},
 		ExchangeRate:         Rate{10, 100},
 	}
+}
+
+// MaxDocumentSize is the deployment maximum documentSize by default: the
+// §6.6 default, which namespaces may set.
+const MaxDocumentSize = 4 << 20
+
+// DefaultMaximums are the deployment maximums by default: the defaults,
+// but for documentSize, which namespaces may raise to MaxDocumentSize.
+func DefaultMaximums() Limits {
+	l := DefaultLimits()
+	l.DocumentSize = MaxDocumentSize
+	return l
 }
 
 // limitFields maps namespace-document names under "limits" to fields.

@@ -106,7 +106,7 @@ func New(t testing.TB, opt Options) *Server {
 	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
 		Archiver: opt.Archiver, RetentionInterval: -1}
 	if opt.LogPageSize > 0 {
-		o.Maximums = core.DefaultLimits()
+		o.Maximums = core.DefaultMaximums()
 		o.Maximums.LogPageSize = opt.LogPageSize
 	}
 	testenv.Apply(&o)

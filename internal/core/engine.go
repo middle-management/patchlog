@@ -64,7 +64,8 @@ type Options struct {
 	// Limits are the namespace defaults of §6.6.
 	Limits Limits
 	// Maximums are the deployment maximums; a namespace can set its limits
-	// up to them (and allowances too). Zero means equal to Limits.
+	// up to them (and allowances too). Zero means equal to Limits, or
+	// DefaultMaximums when Limits is zero too.
 	Maximums Limits
 	// LongPollInterval is the interval of §7.7 (default 20s).
 	LongPollInterval time.Duration
@@ -277,6 +278,9 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if opt.Limits == (Limits{}) {
 		opt.Limits = DefaultLimits()
+		if opt.Maximums == (Limits{}) {
+			opt.Maximums = DefaultMaximums()
+		}
 	}
 	if opt.HeadSnapshotMax == 0 {
 		opt.HeadSnapshotMax = 16 << 10

@@ -2608,7 +2608,8 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,
   `rulesPerNamespace`, `rulesPerGrant`, `grantSize`, `itemsPerBatch`, `batchSize`,
   `branchesPerNamespace`, `keepPerResource`, `blobsPerDocument`, `blobSize`, `blobPending`
-  (integers, sizes in bytes, lower only), `ratePerResource`, `ratePerPrincipal`,
+  (integers, sizes in bytes, up to the deployment maximums, which equal the defaults but for
+  `documentSize`), `ratePerResource`, `ratePerPrincipal`,
   `ratePerNamespace`, `blobRate` (`{ rate, burst }`, `blobRate` in bytes), `retryWindow`,
   `remoteRegistration` and `blobGrace` (ISO 8601 durations; `blobGrace` at least `retryWindow`).
   Sizes written with units (`"64 MiB"`), unknown or v0.20 names (`liveBranches`,
@@ -2619,6 +2620,13 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   objects must be well-formed and name available blobs that match their type, size and nonce
   (`422`, `code: "blob"`). Allowances may also set `blobRate` and `blobPending`; the deployment
   maximums are set with `serve -max-blob-size` and `-max-blob-pending`.
+- **`documentSize` is 1 MiB by default**, where §6.6 says 4 MiB, and a namespace may set it up to
+  the deployment maximum, 4 MiB unless `serve -max-document-size` says otherwise;
+  `serve -document-size` changes the default (at most the maximum). Every write re-serialises,
+  checks and validates the whole document, so an append to a 3.5 MiB document costs 3–4 times one
+  to a 16 KiB document, and large documents weigh on the caches ([docs/CAPACITY.md](docs/CAPACITY.md)).
+  A namespace holding larger documents sets `"limits": { "documentSize": 4194304 }`; until it
+  does, appends that leave a document over 1 MiB, and creates over it, are `413`.
 - **Batch sources** (§7.5, §7.8): a local `source.at` is checked against `source.ns`'s chain
   (`422`, `code: "source"`) at step 4, before blob references, only when the caller may read
   `source.ns` unrestricted (with `Source-Authorization`, if given); then the blobs attached to
