@@ -499,6 +499,31 @@ func (r *runner) reads() {
 		return err
 	}))
 	if r.op != nil {
+		// A fleet in its steady state: every one of the -readers readers
+		// has made a request before, then reads come from any of them.
+		// Whether their grants are still verified depends on the core's
+		// bearer cache holding the whole fleet.
+		jobs := make(chan struct{})
+		var wg sync.WaitGroup
+		for w := 0; w < 8; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range jobs {
+					r.readerOf(ns, r.c.readers).Head(r.ctx, ns, pick().Resource)
+				}
+			}()
+		}
+		for i := 0; i < r.c.readers; i++ {
+			jobs <- struct{}{}
+		}
+		close(jobs)
+		wg.Wait()
+		r.record("read_head_doc_fleet_warm", r.measure(8, func() error {
+			h := pick()
+			_, err := r.rd(ns).Doc(r.ctx, ns, h.Resource, h.Target)
+			return err
+		}))
 		// The same reads from 16 readers, whose grants stay in the core's
 		// bearer cache.
 		r.record("read_head_doc_cached_grants", r.measure(8, func() error {

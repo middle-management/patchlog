@@ -16,3 +16,4 @@ containers.
 | `pg-grants-core1vcpu.json` | grants, the core at 1 vCPU / 2 GB |
 | `pg-grants-core2x1vcpu.json` | grants, two core instances at 1 vCPU / 2 GB, writes routed by namespace |
 | `pg-grants-serverX-private-longpoll-{direct,cdn}-{before,after}.json` | grants, server X, private long-poll fan-out before and after the origin shares the waiters' reads, straight to the core and through Varnish (with the updated VCL); the core idle before each write |
+| `pg-grants-serverX-reads-caches-{before,after}.json` | grants, server X, reads before and after the bearer, document and read caches were bounded by bytes (`read_head_doc_fleet_warm`: 5,000 readers that have each made a request before) |

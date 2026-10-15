@@ -121,18 +121,22 @@ holds them when it verifies edge grants).
 
 | Gap | Effect | Fix |
 |---|---|---|
-| **Bearer cache of 1,024 grants** per instance (`maxGrantCacheEntries`), emptied when full. | A fleet with more than 1,024 active tokens verifies its grant (Biscuit decode, Ed25519) on every request: reads p50 6.6 ms against 4.6 ms with cached grants, 1,030/s against 1,630/s. | A larger, byte-bounded cache (tens of thousands of grants), evicting gradually. |
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request; the origin shares their reads (above), ~0.1–0.2 ms of core CPU per follower per write. | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **Log pages bound entries, not items.** A batch entry carries its items inline. | A page of 1,000 batch entries of 1,000 items holds 1M items. | Bound pages by resource entries or bytes too. |
 | **Rate-limit buckets are never evicted**: one per (namespace, resource, principal) written, per instance. | Memory grows with distinct resources written until restart. | Drop buckets that are full again (idle longer than burst / rate). |
-| **The document cache is bounded by count** (4,096 documents), not bytes; the 64 MiB read cache empties itself when full. | Up to 16 GiB of 4 MiB documents; hit rates collapse past 64 MiB. | Byte budgets and gradual eviction. |
 | **The compiled-schema cache is never evicted.** | Memory grows with distinct schema revisions used. | Bound it. |
 | **No read replicas, and one `-db` for everything** (the core runs migrations, the tailer and leader jobs, so it can't run on a read-only database). | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: ~11 min on server X (fetches at 1,600/s); 2.6 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.5–1.8 GB on the instance that served the full scans of the large namespace (steady 0.5–0.8 GB); the second instance, which didn't, peaked at 0.2 GB. | Run with `GOMEMLIMIT` under container limits; profile the scans (an opt-in pprof listener would help). |
 
-Fixed in this branch, and so not limits any more: long-polls of a namespace each read the log
+Fixed in this branch, and so not limits any more: the bearer grant cache held 1,024 grants and
+emptied itself when full, so a fleet of 5,000 devices with grants of their own verified on
+nearly every request (now 65,536, least recently used out first: the warm fleet's reads went
+from 1,490/s, p50 4.9 ms, to 1,710–1,770/s, p50 3.2–4.4 ms on server X, where Postgres rather
+than verification is the bottleneck); the document cache was bounded by count (4,096 documents,
+up to 16 GiB of 4 MiB ones; now 256 MiB) and the read cache emptied itself when full (now evicts
+a quarter); long-polls of a namespace each read the log
 on their own when woken (now shared, above); namespace log pages scanned and sorted the
 whole namespace, and the config-retry lookup the whole log (now indexed; CHANGELOG, Unreleased);
 a consumer's snapshot bootstrap held the whole `/heads` listing in memory and one transaction
@@ -146,13 +150,15 @@ a consumer's snapshot bootstrap held the whole `/heads` listing in memory and on
 | **Postgres round trips** | A single write is ~13 statements; on server X one writer did 125 writes/s (7.5 ms each), neither container saturated. | Keep the core near Postgres (sub-millisecond); concurrency, not speed, is what instances add. |
 | **Postgres CPU and memory** | ~1.3 of 2 vCPU and 3.4 of 4 GB under the read measurements; the limit on server X. | Size Postgres first; a read replica takes bulk reads and private followers' log reads (the gap above). |
 | **Storage** | 6.2 GB on Postgres, 3.1 GB on SQLite for 5M revisions of ~500-byte documents. | Linear in revisions; pruning (§8.6) bounds it. |
-| **Memory** | Core: 0.5–0.8 GB steady, 1.5–1.8 GB peak during full scans. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves catch-ups. |
+| **Memory** | Core: 0.5–0.8 GB steady, 1.5–1.8 GB peak during full scans. The caches are bounded: up to 256 MiB of documents, 64 MiB of read-cache revisions and 65,536 grants (a few hundred MB at most) by default. | Give containers `GOMEMLIMIT`, 2 GB+ for an instance that serves catch-ups; size the caches with `serve -doc-cache-size`, `-read-cache-size` and `-grant-cache`. |
 | **Upgrades** | The new namespace-log indexes build in the migration, blocking writes a few seconds per 5M log entries. | `CREATE INDEX CONCURRENTLY` beforehand (README). |
 
 ## Recommended changes to limits
 
-- **Bearer cache**: 1,024 → a byte budget of tens of thousands of grants (gap above).
-- **Document and read caches**: byte budgets with gradual eviction.
+- **Bearer cache: done.** 65,536 grants, at most 32 MiB of tokens, least recently used out first
+  (`serve -grant-cache`).
+- **Document and read caches: done.** 256 MiB and 64 MiB, evicting gradually
+  (`serve -doc-cache-size`, `-read-cache-size`).
 - **Log pages**: bound items or bytes as well as entries.
 - **`documentSize`: done.** 1 MiB by default, 4 MiB a namespace may set (`serve -document-size`,
   `-max-document-size`). Appends at 3.5 MiB are 3–4× slower than at 16 KiB, and every revision of
