@@ -65,10 +65,11 @@ type readCache struct {
 	fresh   func() bool
 	headTTL time.Duration
 
-	mu    sync.Mutex
-	revs  map[string]revEntry
-	heads map[string]headEntry
-	bytes int
+	mu       sync.Mutex
+	revs     map[string]revEntry
+	heads    map[string]headEntry
+	bytes    int
+	maxBytes int // Options.ReadCacheBytes
 
 	// refs keeps schemaReads' open referrers by path (openrefs.go).
 	refs openRefs
@@ -89,10 +90,12 @@ type headEntry struct {
 	at       time.Time
 }
 
-// Bounds on what is kept; past them the maps start over.
+// Bounds on what is kept: the entries, and the revisions' bytes by
+// default (Options.ReadCacheBytes). Past either, entries are evicted until
+// both are within three quarters (room).
 const (
-	maxReadCacheEntries = 1 << 16
-	maxReadCacheBytes   = 64 << 20
+	maxReadCacheEntries   = 1 << 16
+	defaultReadCacheBytes = 64 << 20
 )
 
 // gens is a pair of counter values loaded before a transaction, and when.
@@ -195,11 +198,19 @@ func (c *readCache) putRev(g gens, ns, name, id string, doc []byte, public bool)
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if len(doc) > c.limit()/4 {
+		return // it would push out a quarter of the cache
+	}
+	k := revKey(ns, name, id)
+	if old, ok := c.revs[k]; ok {
+		c.bytes -= len(old.doc)
+		delete(c.revs, k)
+	}
 	c.room(len(doc))
 	if c.revs == nil {
 		c.revs = map[string]revEntry{}
 	}
-	c.revs[revKey(ns, name, id)] = revEntry{meta: g.meta, public: public, doc: doc}
+	c.revs[k] = revEntry{meta: g.meta, public: public, doc: doc}
 	c.bytes += len(doc)
 }
 
@@ -216,10 +227,37 @@ func (c *readCache) putHead(g gens, ns, name string, h Head, public bool) {
 	c.heads[headKey(ns, name)] = headEntry{meta: g.meta, ns: g.ns, public: public, head: h, at: g.at}
 }
 
-// room starts over when an entry of n bytes would exceed the bounds.
+func (c *readCache) limit() int {
+	if c.maxBytes > 0 {
+		return c.maxBytes
+	}
+	return defaultReadCacheBytes
+}
+
+// room makes room for an entry of n bytes: past either bound it evicts
+// entries until both are within three quarters, revisions first, in map
+// order (which is random). Evicting all, as it did, emptied a cache whose
+// working set outgrew it on every fill.
 func (c *readCache) room(n int) {
-	if len(c.revs)+len(c.heads) >= maxReadCacheEntries || c.bytes+n > maxReadCacheBytes {
-		c.revs, c.heads, c.bytes = nil, nil, 0
+	maxB := c.limit()
+	if len(c.revs)+len(c.heads) < maxReadCacheEntries && c.bytes+n <= maxB {
+		return
+	}
+	within := func() bool {
+		return len(c.revs)+len(c.heads) <= maxReadCacheEntries*3/4 && c.bytes+n <= maxB*3/4
+	}
+	for k, e := range c.revs {
+		if within() {
+			return
+		}
+		delete(c.revs, k)
+		c.bytes -= len(e.doc)
+	}
+	for k := range c.heads {
+		if within() {
+			return
+		}
+		delete(c.heads, k)
 	}
 }
 

@@ -2613,6 +2613,17 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
   waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
   flight.
+- **In-memory caches, per instance**, each bounded and evicting gradually:
+  - **Verified bearer grants**, by token: 65,536 by default (`serve -grant-cache`), at most
+    32 MiB of tokens, the least recently used out first. A request whose grant isn't kept
+    decodes and verifies it (signatures, revocations), so a fleet of devices with grants of their
+    own should fit (docs/CAPACITY.md). Only grants whose signature chain verified are kept.
+  - **Documents by revision id**: 256 MiB by default (`serve -doc-cache-size`), the least recently
+    used out first; a document over a quarter of it isn't kept. Bounded by count before, 4,096
+    documents of up to 4 MiB could hold 16 GiB.
+  - **The read cache** (revisions and head pointers served without a transaction): 64 MiB of
+    revisions by default (`serve -read-cache-size`) and 65,536 entries; past either, entries are
+    evicted until both are within three quarters, where it used to start over empty.
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
   batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
   principal and namespace buckets, and a key scope's lower rate) and batch limits, until the

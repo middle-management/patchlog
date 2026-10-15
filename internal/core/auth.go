@@ -109,40 +109,44 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 // memory. A decoded grant can be several times larger than its token (an
 // 8 KiB token of empty JSON arrays decodes to about 100 KB), so the cache
 // is bounded by the total length of its tokens as well as by their number.
+// It keeps the most recently used: a fleet of devices each polling with a
+// grant of its own (docs/CAPACITY.md) keeps its working set verified,
+// where a cache that started over when full verified every request once
+// the fleet outgrew it.
 type grantCache struct {
-	mu    sync.Mutex
-	m     map[string]*grant.Grant
-	bytes int // the total length of the tokens in m
+	mu  sync.Mutex
+	lru lru[string, *grant.Grant] // cost: the token's length
 }
 
-// Past either bound the cache starts over.
+// The bounds by default (Options.GrantCacheEntries): typical tokens are a
+// few hundred bytes, so 65,536 grants, and at most 32 MiB of tokens.
 const (
-	maxGrantCacheEntries = 1024
-	maxGrantCacheBytes   = 1 << 20
+	defaultGrantCacheEntries = 1 << 16
+	maxGrantCacheBytes       = 32 << 20
 )
 
 // get returns the verified grant of token, or nil.
 func (c *grantCache) get(token string) *grant.Grant {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.m[token]
+	g, _ := c.lru.get(token)
+	return g
 }
 
 // put keeps g, decoded from token, if its signature chain has verified.
 func (c *grantCache) put(token string, g *grant.Grant) {
-	if !g.ChainVerified() || len(token) > maxGrantCacheBytes {
+	if !g.ChainVerified() {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.m[token]; ok {
+	if c.lru.maxEntries == 0 {
+		c.lru.maxEntries, c.lru.maxBytes = defaultGrantCacheEntries, maxGrantCacheBytes
+	}
+	if _, ok := c.lru.get(token); ok {
 		return
 	}
-	if c.m == nil || len(c.m) >= maxGrantCacheEntries || c.bytes+len(token) > maxGrantCacheBytes {
-		c.m, c.bytes = map[string]*grant.Grant{}, 0
-	}
-	c.m[token] = g
-	c.bytes += len(token)
+	c.lru.put(token, g, len(token))
 }
 
 func nsNotNamed(ns string) *Error {

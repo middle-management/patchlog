@@ -143,6 +143,9 @@ func serve(args []string) {
 	maxBatch := fs.String("max-batch-size", "", "deployment maximum batch size, e.g. \"64 MiB\" (default: the namespace default, 16 MiB); allowances may go up to it (§6.6)")
 	docSize := fs.String("document-size", "", "default documentSize of namespaces that don't set one, e.g. \"4 MiB\" (default 1 MiB, where §6.6 says 4 MiB; see docs/CAPACITY.md), at most -max-document-size")
 	maxDocSize := fs.String("max-document-size", "", "deployment maximum documentSize, which namespaces may set in their limits, e.g. \"8 MiB\" (default 4 MiB, §6.6's default)")
+	grantCache := fs.Int("grant-cache", 0, "verified bearer grants kept per instance, the least recently used evicted (default 65536; every request whose grant isn't kept verifies it, docs/CAPACITY.md)")
+	docCache := fs.String("doc-cache-size", "", "documents kept in memory by revision id, e.g. \"1 GiB\" (default 256 MiB)")
+	readCache := fs.String("read-cache-size", "", "revisions the read cache keeps, served without a transaction, e.g. \"256 MiB\" (default 64 MiB)")
 	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
 	maxBlobPending := fs.String("max-blob-pending", "", "deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)")
 	logPageSize := fs.Int("log-page-size", 0, "log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)")
@@ -259,6 +262,20 @@ func serve(args []string) {
 		}
 		*f.dst = n
 	}
+	var cacheBytes [2]int
+	for i, f := range []struct{ flag, v string }{{"-doc-cache-size", *docCache}, {"-read-cache-size", *readCache}} {
+		if f.v == "" {
+			continue
+		}
+		n, err := core.ParseSize(f.v)
+		if err != nil {
+			log.Fatalf("%s: %v", f.flag, err)
+		}
+		cacheBytes[i] = n
+	}
+	if *grantCache < 0 {
+		log.Fatal("-grant-cache must be positive")
+	}
 	limits := core.DefaultLimits()
 	if *docSize != "" {
 		n, err := core.ParseSize(*docSize)
@@ -308,7 +325,7 @@ func serve(args []string) {
 		}
 	}
 	opt := core.Options{Path: *db, BlobDir: *blobDir, Origin: *origin, AuthDisabled: *dev, OperatorKeys: keys, OperatorKeyHistory: history, JWKSURI: *jwksURI,
-		Limits: limits, Maximums: max, Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
+		Limits: limits, Maximums: max, GrantCacheEntries: *grantCache, DocCacheBytes: cacheBytes[0], ReadCacheBytes: cacheBytes[1], Archiver: arch, RetentionInterval: *retention, Remote: remote, KeyStore: ks,
 		RotateEpochs: *rotateEpochs, RotateOnRevoke: *rotateOnRevoke, GroupCommit: *groupCommit, GroupCommitWait: *groupWait, StoreCompression: *storeCompression}
 	if opt.GroupCommit < 1 {
 		opt.GroupCommit = 1 // off

@@ -30,6 +30,13 @@
   flight until the next write, then sent to the origin with the rest a few at a time. Identical
   long-poll misses without credentials (devices following a public namespace) still collapse.
 
+- **Caches bounded by bytes, evicting gradually** (README design notes): the bearer grant cache
+  keeps 65,536 verified grants (was 1,024, emptied when full, so a fleet of devices with grants
+  of their own verified on nearly every request), the least recently used out first
+  (`serve -grant-cache`); the document cache 256 MiB (was 4,096 documents, up to 16 GiB of
+  4 MiB ones; `serve -doc-cache-size`); the read cache 64 MiB, now evicting a quarter rather
+  than everything when full (`serve -read-cache-size`).
+
 **Fixes:**
 - **Namespace log pages in long namespaces:** a page (ranges, long-polls, event streams) had no
   index to read a namespace's entries in order, so Postgres could read the whole namespace and
