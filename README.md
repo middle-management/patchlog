@@ -2624,6 +2624,11 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   - **The read cache** (revisions and head pointers served without a transaction): 64 MiB of
     revisions by default (`serve -read-cache-size`) and 65,536 entries; past either, entries are
     evicted until both are within three quarters, where it used to start over empty.
+  - **Compiled schemas** by revision path: the 512 most recently used, and the 2,048 schema
+    documents they were compiled from; one evicted is compiled again when next used.
+  - **Rate-limit buckets** (§6.6): one per namespace, principal and (namespace, resource,
+    principal) written. A bucket that has refilled to its burst is the same as a new one, so they
+    are swept once a minute when there are more than 1,024.
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
   batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
   principal and namespace buckets, and a key scope's lower rate) and batch limits, until the

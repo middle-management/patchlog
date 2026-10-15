@@ -219,7 +219,7 @@ func TestGrantCacheVerifiedOnly(t *testing.T) {
 	cached := func() (int, int) {
 		e.bearers.mu.Lock()
 		defer e.bearers.mu.Unlock()
-		return e.bearers.lru.len(), e.bearers.lru.bytes
+		return e.bearers.lru.Len(), e.bearers.lru.Bytes()
 	}
 	before, _ := cached()
 
@@ -270,8 +270,8 @@ func TestGrantCacheVerifiedOnly(t *testing.T) {
 	for i := 0; i < 40; i++ {
 		c.put(tok(i), g)
 		c.get(tok(0))
-		if c.lru.bytes > maxGrantCacheBytes || c.lru.len() == 0 {
-			t.Fatalf("%d tokens of %d bytes kept", c.lru.len(), c.lru.bytes)
+		if c.lru.Bytes() > maxGrantCacheBytes || c.lru.Len() == 0 {
+			t.Fatalf("%d tokens of %d bytes kept", c.lru.Len(), c.lru.Bytes())
 		}
 	}
 	if c.get(tok(0)) == nil || c.get(tok(1)) != nil || c.get(tok(39)) == nil {

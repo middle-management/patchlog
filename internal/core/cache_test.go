@@ -3,42 +3,10 @@ package core
 import (
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
 )
-
-// lru keeps the most recently used entries within both bounds; replacing
-// an entry counts its new cost; an entry over a quarter of the bytes isn't
-// kept.
-func TestLRU(t *testing.T) {
-	c := lru[string, int]{maxEntries: 3, maxBytes: 100}
-	c.put("a", 1, 10)
-	c.put("b", 2, 10)
-	c.put("c", 3, 10)
-	c.get("a")
-	c.put("d", 4, 10) // evicts b, the least recently used
-	if _, ok := c.get("b"); ok || c.len() != 3 {
-		t.Fatalf("after a fourth entry: b kept %v, %d entries", ok, c.len())
-	}
-	c.put("a", 5, 20)
-	if v, _ := c.get("a"); v != 5 || c.bytes != 40 {
-		t.Fatalf("replaced: %d, %d bytes", v, c.bytes)
-	}
-	c.put("big", 6, 26)
-	if _, ok := c.get("big"); ok {
-		t.Fatal("an entry over a quarter of the bytes is kept")
-	}
-	c.put("e", 7, 25)
-	c.put("f", 8, 25)
-	c.put("g", 9, 25)
-	if c.bytes > 100 || c.len() > 3 {
-		t.Fatalf("over the bounds: %d entries, %d bytes", c.len(), c.bytes)
-	}
-	c.flush()
-	if c.len() != 0 || c.bytes != 0 {
-		t.Fatal("flush kept entries")
-	}
-}
 
 // The document cache is bounded by bytes: large documents don't pile up
 // past it, whatever their number.
@@ -49,8 +17,8 @@ func TestDocCacheBytes(t *testing.T) {
 		copy(id[:], fmt.Sprintf("%020d", i))
 		c.put(id, make([]byte, 100<<10))
 	}
-	if c.lru.bytes > 1<<20 || c.lru.len() != 10 {
-		t.Fatalf("%d documents, %d bytes", c.lru.len(), c.lru.bytes)
+	if c.lru.Bytes() > 1<<20 || c.lru.Len() != 10 {
+		t.Fatalf("%d documents, %d bytes", c.lru.Len(), c.lru.Bytes())
 	}
 }
 
@@ -75,5 +43,30 @@ func TestReadCacheRoom(t *testing.T) {
 	c.putRev(g, "n", "huge", "r", make([]byte, 300<<10), true)
 	if _, ok := c.revs[revKey("n", "huge", "r")]; ok {
 		t.Fatal("a revision over a quarter of the bytes is kept")
+	}
+}
+
+// The rate limiter drops buckets that have refilled to their burst, which
+// are the same as new ones, and keeps those still refilling.
+func TestRateLimiterSweep(t *testing.T) {
+	rl := newRateLimiter()
+	now := time.Unix(1e9, 0)
+	r := Rate{Rate: 10, Burst: 20}
+	for i := 0; i < sweepAbove+10; i++ {
+		if _, _, ok := rl.admit(now, []draw{{key: fmt.Sprint(i), rate: r, cost: 20}}); !ok {
+			t.Fatal("refused")
+		}
+	}
+	// One bucket is drawn deep into debt (a large batch), so it hasn't
+	// refilled when the sweep runs; the rest have.
+	later := now.Add(2 * time.Second)
+	rl.admit(later, []draw{{key: "0", rate: r, cost: 2000}})
+	rl.admit(later.Add(time.Minute+time.Second), []draw{{key: "new", rate: r, cost: 1}})
+	if _, ok := rl.b["0"]; !ok || len(rl.b) != 2 {
+		t.Fatalf("%d buckets after a sweep, the indebted one kept: %v", len(rl.b), ok)
+	}
+	// A dropped bucket comes back full, as if never dropped.
+	if _, _, ok := rl.admit(later.Add(time.Minute+time.Second), []draw{{key: "5", rate: r, cost: 20}}); !ok {
+		t.Fatal("a swept bucket isn't full")
 	}
 }

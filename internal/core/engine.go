@@ -38,6 +38,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
@@ -386,7 +387,7 @@ func Open(opt Options) (*Engine, error) {
 		started:    opt.Now().UTC(),
 	}
 	e.rc.maxBytes = opt.ReadCacheBytes
-	e.bearers.lru.maxEntries, e.bearers.lru.maxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
+	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {
 		db.Close()
 		return nil, err
@@ -1308,7 +1309,7 @@ func formatTime(ms int64) string {
 // 16 GiB.
 type docCache struct {
 	mu  sync.Mutex
-	lru lru[ids.ID, []byte]
+	lru lru.Cache[ids.ID, []byte]
 }
 
 // maxDocCacheEntries bounds the documents kept whatever their size, for
@@ -1320,7 +1321,7 @@ const (
 )
 
 func newDocCache(bytes int) *docCache {
-	return &docCache{lru: lru[ids.ID, []byte]{maxEntries: maxDocCacheEntries, maxBytes: bytes}}
+	return &docCache{lru: lru.Cache[ids.ID, []byte]{MaxEntries: maxDocCacheEntries, MaxBytes: bytes}}
 }
 
 // parsedCache keeps parsed schema revisions by id (schemaRevIn), shared and
@@ -1363,13 +1364,13 @@ func (c *parsedCache) put(id ids.ID, v any) {
 func (c *docCache) get(id ids.ID) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.lru.get(id)
+	return c.lru.Get(id)
 }
 
 func (c *docCache) put(id ids.ID, b []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.lru.put(id, b, len(b))
+	c.lru.Put(id, b, len(b))
 }
 
 // cacheDoc caches a document by revision id: at once in a read transaction,
@@ -1385,7 +1386,7 @@ func (t *tx) cacheDoc(id ids.ID, doc []byte) {
 
 func (c *docCache) flush() {
 	c.mu.Lock()
-	c.lru.flush()
+	c.lru.Flush()
 	c.mu.Unlock()
 }
 

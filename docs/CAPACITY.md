@@ -123,8 +123,6 @@ holds them when it verifies edge grants).
 |---|---|---|
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request; the origin shares their reads (above), ~0.1–0.2 ms of core CPU per follower per write. | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
 | **Log pages bound entries, not items.** A batch entry carries its items inline. | A page of 1,000 batch entries of 1,000 items holds 1M items. | Bound pages by resource entries or bytes too. |
-| **Rate-limit buckets are never evicted**: one per (namespace, resource, principal) written, per instance. | Memory grows with distinct resources written until restart. | Drop buckets that are full again (idle longer than burst / rate). |
-| **The compiled-schema cache is never evicted.** | Memory grows with distinct schema revisions used. | Bound it. |
 | **No read replicas, and one `-db` for everything** (the core runs migrations, the tailer and leader jobs, so it can't run on a read-only database). | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: ~11 min on server X (fetches at 1,600/s); 2.6 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
@@ -136,7 +134,9 @@ nearly every request (now 65,536, least recently used out first: the warm fleet'
 from 1,490/s, p50 4.9 ms, to 1,710–1,770/s, p50 3.2–4.4 ms on server X, where Postgres rather
 than verification is the bottleneck); the document cache was bounded by count (4,096 documents,
 up to 16 GiB of 4 MiB ones; now 256 MiB) and the read cache emptied itself when full (now evicts
-a quarter); long-polls of a namespace each read the log
+a quarter); rate-limit buckets, one per (namespace, resource, principal) written, were never
+dropped (now swept once full again, which is the same as new), and compiled schemas and their
+documents were kept forever (now the 512 and 2,048 most recently used); long-polls of a namespace each read the log
 on their own when woken (now shared, above); namespace log pages scanned and sorted the
 whole namespace, and the config-retry lookup the whole log (now indexed; CHANGELOG, Unreleased);
 a consumer's snapshot bootstrap held the whole `/heads` listing in memory and one transaction

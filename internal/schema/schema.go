@@ -18,6 +18,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 	"golang.org/x/text/language"
@@ -196,12 +197,25 @@ func RefPath(err error) string {
 var printer = message.NewPrinter(language.English)
 
 // Validator compiles and caches schemas by revision path. Safe for concurrent use.
+//
+// Both caches keep the most recently used: compiled schemas, and the
+// checked schema documents they were compiled from (a schema's $ref
+// closure). A schema evicted is loaded and compiled again when next used.
+// They were unbounded, so a deployment whose schemas get new revisions
+// kept every revision it ever validated against until restart.
 type Validator struct {
 	mu       sync.Mutex
-	compiled map[string]*jsonschema.Schema // revision path -> compiled root
-	docs     map[string]any                // revision path -> checked schema document
-	meta     *jsonschema.Schema            // draft 2020-12 meta-schema
+	compiled lru.Cache[string, *jsonschema.Schema] // revision path -> compiled root
+	docs     lru.Cache[string, any]                // revision path -> checked schema document
+	meta     *jsonschema.Schema                    // draft 2020-12 meta-schema
 }
+
+// The schemas kept: compiled, and their documents (a compiled schema's
+// closure may span several).
+const (
+	maxCompiledSchemas = 512
+	maxSchemaDocs      = 2048
+)
 
 // NewValidator returns an empty Validator.
 func NewValidator() *Validator {
@@ -211,8 +225,8 @@ func NewValidator() *Validator {
 		panic("schema: compiling bundled meta-schema: " + err.Error())
 	}
 	return &Validator{
-		compiled: map[string]*jsonschema.Schema{},
-		docs:     map[string]any{},
+		compiled: lru.Cache[string, *jsonschema.Schema]{MaxEntries: maxCompiledSchemas},
+		docs:     lru.Cache[string, any]{MaxEntries: maxSchemaDocs},
 		meta:     meta,
 	}
 }
@@ -316,7 +330,7 @@ func (v *Validator) validateSchemaDocument(doc any, load Loader) error {
 func (v *Validator) compile(ref Ref, load Loader) (*jsonschema.Schema, error) {
 	path := ref.Path()
 	v.mu.Lock()
-	sch := v.compiled[path]
+	sch, _ := v.compiled.Get(path)
 	v.mu.Unlock()
 	if sch != nil {
 		return sch, nil
@@ -331,10 +345,10 @@ func (v *Validator) compile(ref Ref, load Loader) (*jsonschema.Schema, error) {
 		return nil, &SchemaError{Msg: err.Error()}
 	}
 	v.mu.Lock()
-	if prev := v.compiled[path]; prev != nil {
+	if prev, _ := v.compiled.Get(path); prev != nil {
 		sch = prev
 	} else {
-		v.compiled[path] = sch
+		v.compiled.Put(path, sch, 1)
 	}
 	v.mu.Unlock()
 	return sch, nil
@@ -360,7 +374,7 @@ func (v *Validator) urlLoader(load Loader, loadErr *error) urlLoaderFunc {
 			return fail(&RefError{Msg: fmt.Sprintf("reference %q is not a schema revision path", path)})
 		}
 		v.mu.Lock()
-		doc, cached := v.docs[path]
+		doc, cached := v.docs.Get(path)
 		v.mu.Unlock()
 		if cached {
 			return doc, nil
@@ -385,10 +399,10 @@ func (v *Validator) urlLoader(load Loader, loadErr *error) urlLoaderFunc {
 		}
 		doc = jsonv.Clone(doc)
 		v.mu.Lock()
-		if prev, ok := v.docs[path]; ok {
+		if prev, ok := v.docs.Get(path); ok {
 			doc = prev
 		} else {
-			v.docs[path] = doc
+			v.docs.Put(path, doc, 1)
 		}
 		v.mu.Unlock()
 		return doc, nil

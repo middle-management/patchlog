@@ -2,6 +2,7 @@ package schema
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -528,5 +529,34 @@ func TestBadRefFragments(t *testing.T) {
 	}
 	if _, ok := ParseRef(pathAddress + "#"); ok {
 		t.Error("ParseRef accepted a fragment")
+	}
+}
+
+// The compiled schemas and their documents are bounded: past the bound the
+// least recently used go, and a schema evicted is compiled again when next
+// used (from its document, loaded again if that went too).
+func TestValidatorCachesBounded(t *testing.T) {
+	v := NewValidator()
+	load := func(ref Ref) (any, error) {
+		return jsonv.MustParse([]byte(`{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"object","required":["n"]}`)), nil
+	}
+	path := func(i int) string { return fmt.Sprintf("/r/schemas/s%d/rev/%s", i, rev('a')) }
+	n := maxCompiledSchemas + 50
+	for i := 0; i < n; i++ {
+		if err := v.Validate(map[string]any{"$schema": path(i), "n": 1.0}, load); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v.compiled.Len() > maxCompiledSchemas || v.docs.Len() > maxSchemaDocs {
+		t.Fatalf("%d compiled, %d documents kept", v.compiled.Len(), v.docs.Len())
+	}
+	if _, ok := v.compiled.Get(path(0)); ok {
+		t.Fatal("the least recently used schema kept")
+	}
+	if err := v.Validate(map[string]any{"$schema": path(0)}, load); err == nil {
+		t.Fatal("an evicted schema no longer validates")
+	}
+	if _, ok := v.compiled.Get(path(0)); !ok {
+		t.Fatal("an evicted schema wasn't compiled again")
 	}
 }

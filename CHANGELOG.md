@@ -35,7 +35,9 @@
   of their own verified on nearly every request), the least recently used out first
   (`serve -grant-cache`); the document cache 256 MiB (was 4,096 documents, up to 16 GiB of
   4 MiB ones; `serve -doc-cache-size`); the read cache 64 MiB, now evicting a quarter rather
-  than everything when full (`serve -read-cache-size`).
+  than everything when full (`serve -read-cache-size`). Compiled schemas, kept forever before,
+  are the 512 most recently used (and 2,048 schema documents), and rate-limit buckets, one per
+  resource and principal written and never dropped before, are swept once refilled.
 
 **Fixes:**
 - **Namespace log pages in long namespaces:** a page (ranges, long-polls, event streams) had no
