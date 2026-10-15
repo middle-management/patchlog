@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+**Changes to check before upgrading:**
+- **New indexes on the namespace log** (`ns_log_ns_seq` on `(ns, seq)`, `ns_log_ns_config` on
+  `(ns, config_seq, seq)`), built on the first start, on SQLite and Postgres. On Postgres the
+  build runs in the schema migration and blocks writes until it commits, a few seconds per 5
+  million namespace entries; to avoid that, create them beforehand with
+  `CREATE INDEX CONCURRENTLY` under the same names (see the README's Postgres section).
+
+**Fixes:**
+- **Namespace log pages in long namespaces:** a page (ranges, long-polls, event streams) had no
+  index to read a namespace's entries in order, so Postgres could read the whole namespace and
+  sort it for every page, and SQLite did: O(namespace) per page rather than O(page). With
+  `(ns, seq)` it reads the page's rows (a page of a 5,000-entry namespace among 5 million
+  entries: 3.7 ms to 0.35 ms on Postgres).
+- **Idempotent retries of config writes and batches with a config change** looked up the
+  first namespace entry under a configuration by scanning all of `ns_log` (about 400 ms at 5
+  million entries, growing with the table); `(ns, config_seq, seq)` makes it one index probe.
+
 ## v0.20.1
 
 **Changes to check before upgrading:**

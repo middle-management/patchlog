@@ -682,6 +682,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   entry, and the leader sends it again once `RepurgeDelay` has passed (default three tail
   intervals plus two minutes, covering the cache staleness bound, replica lag and the response
   deadline), then deletes the row. SQLite deployments do the same.
+- **Upgrading adds indexes.** A start that finds `ns_log` without `ns_log_ns_seq (ns, seq)` or
+  `ns_log_ns_config (ns, config_seq, seq)` builds them inside the schema migration, which blocks
+  writes until it commits: a few seconds per 5 million namespace entries (about 4 s for the
+  first on a local `postgres:16`). To build them without blocking, create them beforehand with
+  `CREATE INDEX CONCURRENTLY` under the same names; the migration then finds them.
 - **Keep transactions short.** The tailer can't move past the oldest running transaction in the
   database (its `xmin`), so one left open holds back every instance's wake-ups: set
   `idle_in_transaction_session_timeout` (e.g. `ALTER ROLE patchlog SET
@@ -2570,7 +2575,8 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   costs its own rows, however long the range: a resource's chain is its rows in seq order, so a
   page is one `seq > ? … LIMIT` query per ancestry segment it reaches, after a query or two per
   segment to place `since` and look for pruned patch sets, which only exist at or below a
-  resource's horizon (or in a purged one); a namespace page is one `LIMIT` query. The rows a
+  resource's horizon (or in a purged one); a namespace page is one `LIMIT` query, over the index
+  `ns_log (ns, seq)`, so it reads the page's rows however long the namespace. The rows a
   page reads are checked to chain (each one's parent is the row before it), so a broken chain is
   a `500`, never a range with rows that aren't ancestors. Long-polls (§7.7) answer pages of the
   same size and shape, without `X-Log-Next` (their header names the next `since`), and `/heads`

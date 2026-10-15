@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/pgtest"
@@ -154,5 +155,51 @@ func TestLogPageBrokenChain(t *testing.T) {
 	// A page that doesn't reach the break still answers.
 	if lg, err := e.ResourceLog(ctx, "n", "a", head, "", 2, Credentials{}); err != nil || lg.Status != 200 || len(lg.Entries) != 2 {
 		t.Fatalf("page before the break: %v %+v", err, lg)
+	}
+}
+
+// A namespace log page and the config-retry lookup read ns_log through
+// their own indexes, not the whole namespace or table (ns_log_ns_seq,
+// ns_log_ns_config). Planned on SQLite, whose planner doesn't depend on
+// statistics; on Postgres the indexes exist, the plan depends on the data.
+func TestNSLogQueriesUseIndexes(t *testing.T) {
+	t.Parallel()
+	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.pg {
+		var n int
+		if err := e.db.QueryRow(`SELECT count(*) FROM pg_indexes WHERE tablename = 'ns_log' AND indexname IN ('ns_log_ns_seq', 'ns_log_ns_config')`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 2 {
+			t.Fatalf("ns_log indexes: %d of 2", n)
+		}
+		return
+	}
+	for _, c := range []struct{ q, index string }{
+		{`SELECT seq, id, prev_seq, body FROM ns_log WHERE ns = 1 AND seq > 0 AND seq <= 100 ORDER BY seq LIMIT 10`, "ns_log_ns_seq"},
+		{`SELECT MIN(seq) FROM ns_log WHERE ns = 1 AND config_seq = 1`, "ns_log_ns_config"},
+	} {
+		rows, err := e.db.Query(`EXPLAIN QUERY PLAN ` + c.q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			plan = append(plan, detail)
+		}
+		rows.Close()
+		if p := strings.Join(plan, "; "); !strings.Contains(p, c.index) || strings.Contains(p, "TEMP B-TREE") {
+			t.Errorf("%s: plan %q, want %s without a sort", c.q, p, c.index)
+		}
 	}
 }
