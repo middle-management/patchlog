@@ -24,6 +24,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"hash/fnv"
 	"math/rand/v2"
 	"net/http"
 	"os"
@@ -56,7 +57,7 @@ type config struct {
 	out         string
 	liveURL     string
 	waiters     string
-	pid         int
+	pid         string
 	only        string
 	appendBatch int
 	operator    string
@@ -65,7 +66,7 @@ type config struct {
 
 func main() {
 	var c config
-	flag.StringVar(&c.url, "url", "http://localhost:8080", "the core (serve -dev)")
+	flag.StringVar(&c.url, "url", "http://localhost:8080", "the core; several instances of one deployment comma-separated: a namespace's writes go to one of them by a hash of its name (README: one writer per namespace), reads and followers to each in turn")
 	flag.StringVar(&c.big, "ns", "cap-big", "the large namespace")
 	flag.IntVar(&c.docs, "docs", 1_000_000, "documents in the large namespace")
 	flag.IntVar(&c.revs, "revs", 5_000_000, "revisions in the large namespace (at least -docs)")
@@ -80,7 +81,7 @@ func main() {
 	flag.StringVar(&c.out, "json", "", "also write the results to this file")
 	flag.StringVar(&c.liveURL, "live-url", "", "where long-poll followers connect: a CDN in front of -url (default -url itself)")
 	flag.StringVar(&c.waiters, "waiters", "100,1000,5000", "long-poll followers of one namespace to measure ('' to skip)")
-	flag.IntVar(&c.pid, "pid", 0, "the core's process id, to report the CPU time it spends per measurement (Linux)")
+	flag.StringVar(&c.pid, "pid", "", "the core's process ids, comma-separated, to report the CPU time they spend per measurement and their memory (Linux)")
 	flag.StringVar(&c.operator, "operator-seed", "", "grants profile: the private seed of the core's -operator-key (patchlog keygen); namespaces are then read: grant, and every request carries a signed grant (§C)")
 	flag.IntVar(&c.readers, "readers", 5000, "grants profile: distinct reader grants the reads draw from (past the core's 1,024 cached bearers, most reads verify their grant)")
 	flag.StringVar(&c.only, "only", "", "run only these phases, comma-separated: seed, scans, reads, writes, bootstrap, large, live")
@@ -89,7 +90,12 @@ func main() {
 		fail(errors.New("-revs must be at least -docs"))
 	}
 	r := &runner{c: c, ctx: context.Background(), res: map[string]any{}, hc: sharedHTTP(512)}
-	r.cl = r.newClient(c.url, "")
+	r.urls = strings.Split(c.url, ",")
+	r.pubs = map[string]*client.Client{}
+	for _, u := range r.urls {
+		r.pubs[u] = r.newClient(u, "")
+	}
+	r.cl = r.pubs[r.urls[0]]
 	if c.operator != "" {
 		op, err := grant.ParsePrivateKey(c.operator)
 		if err != nil {
@@ -116,9 +122,11 @@ func fail(err error) {
 }
 
 type runner struct {
-	c  config
-	cl *client.Client
-	hc *http.Client
+	c    config
+	cl   *client.Client
+	urls []string
+	pubs map[string]*client.Client // without a grant, by instance
+	hc   *http.Client
 	// the grants profile: the operator key, the namespaces' key, and
 	// clients by namespace
 	op          ed25519.PrivateKey
@@ -189,24 +197,31 @@ func (r *runner) mint(signer ed25519.PrivateKey, root map[string]any) string {
 
 // createNS creates ns: in the grants profile with an operator grant.
 func (r *runner) createNS(ns string) {
-	c := r.cl
+	c := r.pubs[r.home(ns)]
 	if r.op != nil {
-		c = r.newClient(r.c.url, r.mint(r.op, map[string]any{"kid": "operator", "sub": "op:capacity", "ns": []any{ns}, "can": []any{"config"}}))
+		c = r.newClient(r.home(ns), r.mint(r.op, map[string]any{"kid": "operator", "sub": "op:capacity", "ns": []any{ns}, "can": []any{"config"}}))
 	}
 	must(c.CreateNamespace(r.ctx, ns, r.nsDoc()))
+}
+
+// home is the instance a namespace's writes go to.
+func (r *runner) home(ns string) string {
+	h := fnv.New32a()
+	h.Write([]byte(ns))
+	return r.urls[h.Sum32()%uint32(len(r.urls))]
 }
 
 // w is the loader's client for ns: its grant may read, create and append
 // there.
 func (r *runner) w(ns string) *client.Client {
 	if r.op == nil {
-		return r.cl
+		return r.pubs[r.home(ns)]
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	c := r.writers[ns]
 	if c == nil {
-		c = r.newClient(r.c.url, r.mint(r.key, map[string]any{"kid": keyKid, "sub": loaderSub, "ns": []any{ns}, "can": []any{"read", "create", "append"}}))
+		c = r.newClient(r.home(ns), r.mint(r.key, map[string]any{"kid": keyKid, "sub": loaderSub, "ns": []any{ns}, "can": []any{"read", "create", "append"}}))
 		r.writers[ns] = c
 	}
 	return c
@@ -220,14 +235,14 @@ func (r *runner) rd(ns string) *client.Client {
 
 func (r *runner) readerOf(ns string, n int) *client.Client {
 	if r.op == nil {
-		return r.cl
+		return r.pubs[r.urls[rand.IntN(len(r.urls))]]
 	}
 	k := fmt.Sprintf("%s/%d", ns, n)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	pool := r.readerPools[k]
 	if len(pool) < n {
-		c := r.newClient(r.c.url, r.mint(r.key, map[string]any{"kid": keyKid, "sub": fmt.Sprintf("user:reader-%d", len(pool)), "ns": []any{ns}, "can": []any{"read"}}))
+		c := r.newClient(r.urls[len(pool)%len(r.urls)], r.mint(r.key, map[string]any{"kid": keyKid, "sub": fmt.Sprintf("user:reader-%d", len(pool)), "ns": []any{ns}, "can": []any{"read"}}))
 		r.readerPools[k] = append(pool, c)
 		return c
 	}
@@ -259,14 +274,20 @@ func (r *runner) run() {
 	if on("live") {
 		r.live()
 	}
-	if r.c.pid != 0 {
-		if b, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", r.c.pid)); err == nil {
-			for _, l := range strings.Split(string(b), "\n") {
-				if f := strings.Fields(l); len(f) >= 2 && (f[0] == "VmHWM:" || f[0] == "VmRSS:") {
-					var kb float64
-					fmt.Sscan(f[1], &kb)
-					r.record("origin_"+strings.ToLower(strings.TrimSuffix(f[0], ":"))+"_mb", kb/1024)
+	for k, pid := range r.pids() {
+		b, err := os.ReadFile("/proc/" + pid + "/status")
+		if err != nil {
+			continue
+		}
+		for _, l := range strings.Split(string(b), "\n") {
+			if f := strings.Fields(l); len(f) >= 2 && (f[0] == "VmHWM:" || f[0] == "VmRSS:") {
+				var kb float64
+				fmt.Sscan(f[1], &kb)
+				name := "origin"
+				if k > 0 {
+					name += fmt.Sprint(k + 1)
 				}
+				r.record(name+"_"+strings.ToLower(strings.TrimSuffix(f[0], ":"))+"_mb", kb/1024)
 			}
 		}
 	}
@@ -694,11 +715,16 @@ func (r *runner) live() {
 		r.createNS(ns)
 		must(r.w(ns).CreateDoc(r.ctx, ns, "doc", map[string]any{"n": 0}))
 	}
-	url := r.c.liveURL
-	if url == "" {
-		url = r.c.url
+	via := func(i int) string {
+		if r.c.liveURL != "" {
+			return r.c.liveURL
+		}
+		return r.urls[i%len(r.urls)]
 	}
-	out := map[string]any{"via": url}
+	out := map[string]any{"via": r.c.liveURL}
+	if r.c.liveURL == "" {
+		out["via"] = r.c.url
+	}
 	for _, s := range strings.Split(r.c.waiters, ",") {
 		var w int
 		if _, err := fmt.Sscan(s, &w); err != nil {
@@ -711,7 +737,7 @@ func (r *runner) live() {
 			if r.op != nil {
 				opts = append(opts, client.WithBearer(r.mint(r.key, map[string]any{"kid": keyKid, "sub": fmt.Sprintf("user:device-%d", i), "ns": []any{ns}, "can": []any{"read"}})))
 			}
-			lcs[i] = must(client.New(url, opts...))
+			lcs[i] = must(client.New(via(i), opts...))
 		}
 		head := must(r.w(ns).NSHead(r.ctx, ns)).ID
 		ctx, cancel := context.WithTimeout(r.ctx, 2*time.Minute)
@@ -765,7 +791,7 @@ func (r *runner) live() {
 			sort.Slice(lat, func(i, j int) bool { return lat[i] < lat[j] })
 			res["all_delivered_ms"] = float64(lat[len(lat)-1].Microseconds()) / 1000
 		}
-		if r.c.pid != 0 {
+		if r.c.pid != "" {
 			res["origin_cpu_seconds"] = cpu
 		}
 		out[fmt.Sprint(w)] = res
@@ -776,20 +802,29 @@ func (r *runner) live() {
 // cpu is the core's user and system CPU time so far, in seconds (0
 // without -pid).
 func (r *runner) cpu() float64 {
-	if r.c.pid == 0 {
-		return 0
+	var total float64
+	for _, pid := range r.pids() {
+		b, err := os.ReadFile("/proc/" + pid + "/stat")
+		if err != nil {
+			continue
+		}
+		// The fields after the command name (which may hold spaces):
+		// utime and stime are the 12th and 13th, in clock ticks (100 a
+		// second).
+		f := strings.Fields(string(b[strings.LastIndexByte(string(b), ')')+1:]))
+		var u, s float64
+		fmt.Sscan(f[11], &u)
+		fmt.Sscan(f[12], &s)
+		total += (u + s) / 100
 	}
-	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", r.c.pid))
-	if err != nil {
-		return 0
+	return total
+}
+
+func (r *runner) pids() []string {
+	if r.c.pid == "" {
+		return nil
 	}
-	// The fields after the command name (which may hold spaces): utime
-	// and stime are the 12th and 13th, in clock ticks (100 a second).
-	f := strings.Fields(string(b[strings.LastIndexByte(string(b), ')')+1:]))
-	var u, s float64
-	fmt.Sscan(f[11], &u)
-	fmt.Sscan(f[12], &s)
-	return (u + s) / 100
+	return strings.Split(r.c.pid, ",")
 }
 
 // measure runs fn -samples times from c concurrent callers.
