@@ -122,13 +122,14 @@ holds them when it verifies edge grants).
 | Gap | Effect | Fix |
 |---|---|---|
 | **No edge that verifies edge grants** is included. | Private long-polls don't collapse at the CDN: every follower is an origin connection and request; the origin shares their reads (above), ~0.1–0.2 ms of core CPU per follower per write. | An edge (Varnish VMOD, Fastly or Cloudflare worker) with `edge.Cookies.Check`'s checks; the origin already issues the cookies. |
-| **Log pages bound entries, not items.** A batch entry carries its items inline. | A page of 1,000 batch entries of 1,000 items holds 1M items. | Bound pages by resource entries or bytes too. |
 | **No read replicas, and one `-db` for everything** (the core runs migrations, the tailer and leader jobs, so it can't run on a read-only database). | Consumers' scans and private reads load the primary. | Route bulk reads (catch-up, bootstrap, export) and private reads to a replica, with misses of new revisions falling back to the primary; decisions stay on the primary. |
 | **Consumers** (index, tree): one SQLite writer per process, 8 document fetches at a time (the tree service: one), no sharding but by namespace lists. | Bootstrap of 1M documents: ~11 min on server X (fetches at 1,600/s); 2.6 min on SQLite. | More fetch concurrency, pipelining pages; split namespaces over processes. |
 | **A namespace purge is one transaction.** | Long lock and transaction for large namespaces. | Purge in chunks. |
 | **No profiling endpoint; the core sets no memory limit.** | Peak RSS 1.5–1.8 GB on the instance that served the full scans of the large namespace (steady 0.5–0.8 GB); the second instance, which didn't, peaked at 0.2 GB. | Run with `GOMEMLIMIT` under container limits; profile the scans (an opt-in pprof listener would help). |
 
-Fixed in this branch, and so not limits any more: the bearer grant cache held 1,024 grants and
+Fixed in this branch, and so not limits any more: namespace log pages bounded entries but not
+items, so a page of 1,000 batch entries of 1,000 items held a million (now at most the page size
+in resource entries too, a batch counting as its items); the bearer grant cache held 1,024 grants and
 emptied itself when full, so a fleet of 5,000 devices with grants of their own verified on
 nearly every request (now 65,536, least recently used out first: the warm fleet's reads went
 from 1,490/s, p50 4.9 ms, to 1,710–1,770/s, p50 3.2–4.4 ms on server X, where Postgres rather

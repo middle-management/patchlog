@@ -39,6 +39,12 @@
   are the 512 most recently used (and 2,048 schema documents), and rate-limit buckets, one per
   resource and principal written and never dropped before, are swept once refilled.
 
+- **Namespace log pages bound items too**: a page holds at most the log page size in resource
+  entries as well as in entries, a batch entry counting as its items (it carries them), ending
+  before an entry that would take it past and always holding one. A page of 1,000 batch entries
+  of 1,000 items held a million. Ranges, long-polls and event streams' catch-up; readers follow
+  `X-Log-Next` as before.
+
 **Fixes:**
 - **Namespace log pages in long namespaces:** a page (ranges, long-polls, event streams) had no
   index to read a namespace's entries in order, so Postgres could read the whole namespace and

@@ -2568,7 +2568,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   documents, so an import from an older deployment brings no such members (§G.4); a remote
   branch's shadow keeps only the `encryption` fields this version defines of an e2e base's.
 - **Paged log ranges** (§7.1). `…/rev/{id}/log?since=` (resources and namespaces) answers at most
-  the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first; a
+  the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first, and
+  a namespace page at most as many resource entries, a batch entry counting as its items: it
+  ends before an entry that would take it past, but always holds one; a
   range that goes on carries `X-Log-Next: {id}`, the page's last entry and the `since` of the
   next page, an immutable range up to the same id, so every page caches as immutable. Errors are
   the range's on every page: a range crossing a pruning horizon is `410` on all of them. A page

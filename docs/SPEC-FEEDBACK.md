@@ -66,6 +66,12 @@ From implementing v0.51 and v0.52. Each gives what the reference chose.
     maximum a namespace may set (`serve -document-size`, `-max-document-size`). *Propose:* a
     1 MiB default, and say that a namespace may raise a limit up to the deployment maximum where
     the deployment's maximum exceeds the default (§6.6 now reads as defaults namespaces lower).
+12. **Log pages of batch entries** (§6.6, §7.1). The log page size counts entries, and a batch
+    entry carries its items, so a page of 1,000 batch entries of 1,000 items holds a million. The
+    reference also bounds a namespace page by resource entries, a batch counting as its items: a
+    page ends before an entry that would take it past the page size, and always holds one entry,
+    so a batch larger than a page is a page of its own. *Propose:* say the page size bounds
+    resource entries too, or that a page may be shorter for that reason.
 
 ## Settled in v0.51 and v0.52
 

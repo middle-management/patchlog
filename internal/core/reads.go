@@ -629,11 +629,27 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			grantID []byte
 			noAuth  sql.NullInt64
 			meta    sql.NullString
+			m       map[string]any // body, parsed
 		}
+		// A page holds at most limit entries, and at most limit resource
+		// entries, a batch entry counting as its items (it carries them):
+		// it ends before an entry that would take it past, though it
+		// always holds one. Without that, a page of 1,000 batch entries of
+		// 1,000 items each held a million.
 		var rs []raw
+		units := 0
 		for rows.Next() {
 			var r raw
 			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta))
+			r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
+			u := 1
+			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
+				u = len(es)
+			}
+			if limit > 0 && len(rs) > 0 && units+u > limit {
+				break
+			}
+			units += u
 			rs = append(rs, r)
 		}
 		rows.Close()
@@ -643,7 +659,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// first entry's: a query for each made a page N+1.
 		pageIDs := make(map[int64]string, len(rs))
 		for _, r := range rs {
-			m := jsonv.MustParse([]byte(r.body)).(map[string]any)
+			m := r.m
 			m["id"] = ids.FromBytes(r.id).String()
 			pageIDs[r.seq] = m["id"].(string)
 			if r.prev != nil {
