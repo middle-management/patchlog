@@ -77,7 +77,7 @@ func newQueue(t *testing.T, db *sql.DB, p repurge.Purger, opt repurge.Options) *
 		t.Fatal(err)
 	}
 	q := repurge.New(db, p, opt)
-	t.Cleanup(q.Close)
+	t.Cleanup(q.Stop)
 	return q
 }
 
@@ -202,7 +202,7 @@ func TestSendMany(t *testing.T) {
 	}
 }
 
-// The loop sends due rows every Interval, and stops at Close: rows queued
+// The loop sends due rows every Interval, and stops at Stop: rows queued
 // before a stop are sent by the next start, from the database.
 func TestLoopAndRestart(t *testing.T) {
 	t.Parallel()
@@ -222,8 +222,8 @@ func TestLoopAndRestart(t *testing.T) {
 
 	// Queued, then stopped before it is due.
 	add(t, db, q, true, "ns:b")
-	q.Close()
-	q.Close() // idempotent
+	q.Stop()
+	q.Stop() // idempotent
 	c.Advance(time.Minute)
 	if got := r.take(); len(got) != 0 {
 		t.Errorf("sent %v", got)
@@ -240,14 +240,39 @@ func TestLoopAndRestart(t *testing.T) {
 	}
 }
 
-// Close without Start returns; a negative Interval runs no loop.
+// Stop without Start returns; a negative Interval runs no loop.
 func TestNoLoop(t *testing.T) {
 	t.Parallel()
 	db := open(t, filepath.Join(t.TempDir(), "s.db"))
-	repurge.New(db, &rec{}, repurge.Options{}).Close()
+	repurge.New(db, &rec{}, repurge.Options{}).Stop()
 	q := newQueue(t, db, &rec{}, repurge.Options{Interval: -1})
 	q.Start()
-	q.Close()
+	q.Stop()
+}
+
+// A stopped loop starts again (a release preview whose switch failed),
+// and sends what came due meanwhile; Start on a running loop is a no-op.
+func TestStopAndStart(t *testing.T) {
+	t.Parallel()
+	db := open(t, filepath.Join(t.TempDir(), "s.db"))
+	c := &clock{t: time.Unix(1_700_000_000, 0)}
+	r := &rec{}
+	q := newQueue(t, db, r, repurge.Options{Delay: time.Minute, Interval: time.Millisecond, Now: c.Now})
+	q.Start()
+	q.Start()
+	q.Stop() // the loop has returned: nothing sends until Start
+	add(t, db, q, true, "ns:a")
+	c.Advance(time.Minute)
+	if got := r.take(); len(got) != 0 || queued(t, db) != 1 {
+		t.Fatalf("sent while stopped: %v", got)
+	}
+	q.Start()
+	waitFor(t, "the second purge of ns:a after Start", func() bool { return queued(t, db) == 0 })
+	if got := r.take(); !reflect.DeepEqual(got, [][]string{{"ns:a"}}) {
+		t.Errorf("sent %v", got)
+	}
+	q.Stop()
+	q.Stop()
 }
 
 func waitFor(t *testing.T, what string, cond func() bool) {

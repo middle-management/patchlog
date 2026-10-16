@@ -240,7 +240,7 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 
 // Close stops sending second purges and closes the database.
 func (ix *Index) Close() error {
-	ix.repurge.Close()
+	ix.repurge.Stop()
 	return ix.db.Close()
 }
 

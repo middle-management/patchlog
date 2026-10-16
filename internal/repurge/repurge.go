@@ -76,16 +76,17 @@ type Options struct {
 
 // Queue is a service's queue of second purges.
 type Queue struct {
-	db     *sql.DB
-	p      Purger
-	opt    Options
-	ctx    context.Context // done at Close
-	cancel context.CancelFunc
-	wg     sync.WaitGroup
+	db  *sql.DB
+	p   Purger
+	opt Options
+
+	mu   sync.Mutex         // guards stop and done
+	stop context.CancelFunc // ends the running loop; nil when none runs
+	done chan struct{}      // closed when that loop has returned
 }
 
 // New returns the queue of second purges kept in db (its table made by
-// Init) and sent to p. Call Close when done.
+// Init) and sent to p. Call Stop when done.
 func New(db *sql.DB, p Purger, opt Options) *Queue {
 	if opt.Delay == 0 {
 		opt.Delay = DefaultDelay
@@ -99,9 +100,7 @@ func New(db *sql.DB, p Purger, opt Options) *Queue {
 	if opt.Logf == nil {
 		opt.Logf = log.Printf
 	}
-	q := &Queue{db: db, p: p, opt: opt}
-	q.ctx, q.cancel = context.WithCancel(context.Background())
-	return q
+	return &Queue{db: db, p: p, opt: opt}
 }
 
 var createStmts = []string{
@@ -217,35 +216,48 @@ func (q *Queue) delete(ctx context.Context, ids []any) error {
 	return err
 }
 
-// Start runs Send every Interval until Close, unless the second purge or
-// the loop is disabled.
+// Start runs Send every Interval until Stop, unless the second purge or
+// the loop is disabled, or it runs already. A stopped loop starts again.
 func (q *Queue) Start() {
 	if q.opt.Delay < 0 || q.opt.Interval < 0 {
 		return
 	}
-	q.wg.Add(1)
-	go q.loop()
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stop != nil {
+		return
+	}
+	ctx, stop := context.WithCancel(context.Background())
+	q.stop, q.done = stop, make(chan struct{})
+	go q.loop(ctx, q.done)
 }
 
-func (q *Queue) loop() {
-	defer q.wg.Done()
+func (q *Queue) loop(ctx context.Context, done chan struct{}) {
+	defer close(done)
 	tk := time.NewTicker(q.opt.Interval)
 	defer tk.Stop()
 	for {
 		select {
-		case <-q.ctx.Done():
+		case <-ctx.Done():
 			return
 		case <-tk.C:
-			if _, err := q.Send(q.ctx); err != nil && q.ctx.Err() == nil {
+			if _, err := q.Send(ctx); err != nil && ctx.Err() == nil {
 				q.opt.Logf("%s: cdn repurge: %v", q.opt.Name, err)
 			}
 		}
 	}
 }
 
-// Close stops the loop and waits for it, before the service closes its
-// database. Rows not yet due stay queued for the next start.
-func (q *Queue) Close() {
-	q.cancel()
-	q.wg.Wait()
+// Stop stops the loop and waits for it, before the service closes its
+// database or another opens it (a release preview's switch). Rows not yet
+// due stay queued for the next start.
+func (q *Queue) Stop() {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if q.stop == nil {
+		return
+	}
+	q.stop()
+	<-q.done
+	q.stop, q.done = nil, nil
 }

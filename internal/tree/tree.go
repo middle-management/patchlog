@@ -444,7 +444,7 @@ func (s *Service) reload(ctx context.Context) error {
 
 // Close stops sending second purges and closes the database.
 func (s *Service) Close() error {
-	s.repurge.Close()
+	s.repurge.Stop()
 	return s.db.Close()
 }
 

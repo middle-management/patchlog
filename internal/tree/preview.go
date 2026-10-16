@@ -225,12 +225,18 @@ func (p *Preview) switchTo(ctx context.Context, rev string) error {
 		return nil
 	}
 	// Requests are held (mu) while the service is replaced: its followers
-	// stop, and a new service rebuilds the database from the new branches.
+	// and its loop of second purges stop, and a new service rebuilds the
+	// database from the new branches. The new one sends the queued second
+	// purges (a rebuild keeps them); the old loop's deletes, under the old
+	// write lock, could commit inside the new one's transactions, which
+	// SQLite fails, and both would send the same rows.
 	p.stopLocked()
+	p.svc.repurge.Stop()
 	o := p.opt
 	o.Branches, o.Rebuild = aliases, true
 	svc, err := Open(ctx, o)
 	if err != nil {
+		p.svc.repurge.Start()
 		p.startLocked() // keep previewing the old revision meanwhile
 		return fmt.Errorf("tree: previewing %s at %s: %w", p.ref.Live(), rev, err)
 	}
