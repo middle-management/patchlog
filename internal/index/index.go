@@ -106,11 +106,13 @@ type Options struct {
 	// RepurgeDelay is how long after a cache tag purge it is sent again,
 	// queued with the apply that commits it (package repurge, D.8, as the
 	// core's RepurgeDelay): longer than a response under way at the
-	// commit can take to reach the CDN. Zero means two minutes
-	// (repurge.DefaultDelay); negative disables the second purge.
+	// commit can take to reach the CDN, which is the CDN's first-byte
+	// timeout, as the index sets no response deadline. Zero means two
+	// minutes (repurge.DefaultDelay); negative disables the second purge.
 	RepurgeDelay time.Duration
 	// RepurgeInterval is how often second purges that are due are sent.
-	// Zero means ten seconds; negative disables the loop.
+	// Zero means ten seconds; negative disables the loop, and second
+	// purges stay queued until a start with it.
 	RepurgeInterval time.Duration
 	// Edge is the verifying edge in front of the service (§9): private
 	// results it verified itself, carrying its secret and a prefix covering
@@ -118,8 +120,8 @@ type Options struct {
 	// results, and all of them when nil, are no-store for shared caches.
 	// They are served either way.
 	Edge *edge.Verifier
-	// Now is the clock for grant checks and kept results (default
-	// time.Now).
+	// Now is the clock for grant checks, kept results and the due times
+	// of second purges (default time.Now).
 	Now func() time.Time
 	// CheckerTTL is how long namespace documents are cached for grant
 	// checks before head pointers are re-read (default 30s).

@@ -1,5 +1,5 @@
-// Package repurge is the second CDN purge of the index and tree services
-// (D.8), as the core's (internal/core/repurge.go).
+// Package repurge is the second CDN purge of a derived service (D.8), as
+// the core's (internal/core/repurge.go).
 //
 // A service sends its cache-tag purges (§A.1, §B.5) right after the
 // transaction that needs them commits. But a request that read before the
@@ -30,14 +30,13 @@ import (
 	"time"
 )
 
-// DefaultDelay is how long after a purge it is sent again unless set. It
-// covers the time a response under way when the purge's transaction
-// commits can still take to reach the CDN: a CDN takes it only within its
-// time to first byte (75 s in deploy/varnish), the core's proxy to the
-// index within two minutes (indexResponseTimeout), and the core's
-// RepurgeDelay allows two minutes for the same response deadline. The
-// services read one database of their own, so there is no cache staleness
-// or replica lag to add.
+// DefaultDelay is how long after a purge it is sent again unless set:
+// longer than a response under way when the purge's transaction commits
+// can still take to reach the CDN, which takes it only within its
+// first-byte timeout (75 s in deploy/varnish). A derived service sets no
+// response deadline of its own, so a CDN that waits longer needs a longer
+// delay. It reads one database of its own, so there is no cache staleness
+// or replica lag to add, as the core's RepurgeDelay does.
 const DefaultDelay = 2 * time.Minute
 
 // DefaultInterval is how often due second purges are looked for unless set.
@@ -60,7 +59,8 @@ type Options struct {
 	// DefaultDelay; negative disables the second purge.
 	Delay time.Duration
 	// Interval is how often the loop sends the due ones. Zero means
-	// DefaultInterval; negative disables the loop (Send still sends them).
+	// DefaultInterval; negative disables the loop: Add still queues, and
+	// only a call of Send sends them.
 	Interval time.Duration
 	// Now is the clock of due times (default time.Now).
 	Now func() time.Time
@@ -68,7 +68,7 @@ type Options struct {
 	// lock, so they never commit between the first read and first write of
 	// one of its deferred transactions, which SQLite would then fail.
 	Lock sync.Locker
-	// Name prefixes log lines ("index", "tree").
+	// Name prefixes log lines ("index").
 	Name string
 	// Logf logs (default log.Printf).
 	Logf func(format string, args ...any)

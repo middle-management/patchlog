@@ -242,6 +242,15 @@ X-Purge-Tags: r:demo/derby ns:demo
 sent asynchronously by [internal/cdnpurge](internal/cdnpurge): tags are queued (bounded),
 coalesced, batched (64 tags or 2 KiB per request), retried with backoff and flushed on shutdown
 for up to 5 s. The write path never waits for the CDN; a purge the CDN never takes is logged.
+Each purge is sent a second time, since a response that read before it may reach the CDN after
+it, and would then keep what it removed for a year: the core queues it with the write that
+commits it (see [Second CDN purge](#postgres-d8)), and so does the index, in its own database
+(`cdn_repurge`), in the transaction that applies a resource purge or purge-ns. It sends it again
+two minutes later (`RepurgeDelay` of `index.Options`), once a response under way at the commit
+has reached the CDN: the index sets no response deadline of its own, and a CDN takes a response
+only within its first-byte timeout (75 s in the compose stack's Varnish). A loop sends the due
+ones every 10 s (`RepurgeInterval`) until the index closes; a queued purge survives a restart, a
+crash and `-rebuild`.
 The VCL accepts `PURGE` or `BAN` from loopback and private (Docker) addresses only. That
 includes the host through the published port, and machines on a private LAN, since compose
 publishes on all interfaces: fine for development, not for exposure. It bans every object whose `Cache-Tag` lists any
@@ -681,7 +690,8 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   archive, a remote base's purges) also queues it in `cdn_repurge`, keyed on its namespace
   entry, and the leader sends it again once `RepurgeDelay` has passed (default three tail
   intervals plus two minutes, covering the cache staleness bound, replica lag and the response
-  deadline), then deletes the row. SQLite deployments do the same.
+  deadline), then deletes the row. SQLite deployments do the same, and so does the index for its
+  own purges (see [Purging](#the-local-cdn-9)).
 - **Upgrading adds indexes.** A start that finds `ns_log` without `ns_log_ns_seq (ns, seq)` or
   `ns_log_ns_config (ns, config_seq, seq)` builds them inside the schema migration, which blocks
   writes until it commits: a few seconds per 5 million namespace entries (about 4 s for the
@@ -819,8 +829,9 @@ On SIGTERM or SIGINT a server shuts down in phases:
    retrying it unchanged finds it, §7.2), and their handlers get 2 s more to return.
 5. **Close.** Only then does the core stop its background jobs (retention, remote follows,
    epoch rotation), resign leadership and close the database, and the CDN purger flush its queue
-   (up to 5 s); the index and tree stop following and close their databases. The database is
-   never closed under a running handler.
+   (up to 5 s); the index and tree stop following (the index also stops resending purges; those
+   not yet due are sent after the next start) and close their databases. The database is never
+   closed under a running handler.
 
 Each phase is logged, with the requests waited for or cancelled (method, path, age). A second
 signal exits at once (exit status 1). Give the process manager's grace period more than
@@ -2810,6 +2821,7 @@ internal/sqlitedsn  SQLite DSNs: a database path escaped, so the driver opens th
 internal/server     HTTP API
 internal/lifecycle  /_health and /_ready, phased graceful shutdown (serve, index, tree)
 internal/cdnpurge   HTTP cache-tag purges to a CDN (-purge-url)
+internal/repurge    the index's second CDN purges, queued with its commits (D.8)
 internal/edge       the verifying edge's headers, private edge directives, edge-grant cookies and an edge's checks (§9, §C.5)
 internal/telemetry  OpenTelemetry from OTEL_* (off by default), HTTP handler and transport
 deploy/varnish      the compose stack's local CDN (Varnish VCL)
