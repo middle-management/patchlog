@@ -107,8 +107,8 @@ type Options struct {
 	SelfPlacing bool
 	// MinWait bounds how long ?min= waits (default 2s).
 	MinWait time.Duration
-	// Now is the clock for grant checks and kept listings (default
-	// time.Now).
+	// Now is the clock for grant checks, kept listings and the due times
+	// of second purges (default time.Now).
 	Now func() time.Time
 	// CheckerTTL is how long namespace documents are cached for grant
 	// checks (default 30s).
@@ -118,11 +118,13 @@ type Options struct {
 	// RepurgeDelay is how long after a cache-tag purge it is sent again,
 	// queued with the transaction that commits it (package repurge, D.8,
 	// as the core's RepurgeDelay): longer than a response under way at
-	// the commit can take to reach the CDN. Zero means two minutes
-	// (repurge.DefaultDelay); negative disables the second purge.
+	// the commit can take to reach the CDN, which is the CDN's first-byte
+	// timeout, as the service sets no response deadline. Zero means two
+	// minutes (repurge.DefaultDelay); negative disables the second purge.
 	RepurgeDelay time.Duration
 	// RepurgeInterval is how often second purges that are due are sent.
-	// Zero means ten seconds; negative disables the loop.
+	// Zero means ten seconds; negative disables the loop, and second
+	// purges stay queued until a start with it.
 	RepurgeInterval time.Duration
 	// Edge is the verifying edge in front of the service (§9): private
 	// listings get edge lifetimes only when it verified the read itself,

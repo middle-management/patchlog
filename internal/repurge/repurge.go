@@ -68,7 +68,7 @@ type Options struct {
 	// lock, so they never commit between the first read and first write of
 	// one of its deferred transactions, which SQLite would then fail.
 	Lock sync.Locker
-	// Name prefixes log lines ("index").
+	// Name prefixes log lines ("index", "tree").
 	Name string
 	// Logf logs (default log.Printf).
 	Logf func(format string, args ...any)
