@@ -367,15 +367,19 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// The committed checkpoint only moves forward, so every redirect does.
 	// Whether ns is purged is read with it: a purge-ns committed since the
 	// check above (it may be the min waited for) is answered as there.
-	cur, purged, err := ix.committed(ctx, ns)
-	if err != nil {
-		ix.opt.Logf("index: checkpoint of %s: %v", ns, err)
-		writeErr(w, http.StatusInternalServerError, "internal", "cannot read the checkpoint")
-		return
-	}
-	if purged {
-		writePurged(w, cur)
-		return
+	cur := head
+	if len(q.Mins) > 0 {
+		// Nothing waited since the read above without min.
+		cur, purged, err = ix.committed(ctx, ns)
+		if err != nil {
+			ix.opt.Logf("index: checkpoint of %s: %v", ns, err)
+			writeErr(w, http.StatusInternalServerError, "internal", "cannot read the checkpoint")
+			return
+		}
+		if purged {
+			writePurged(w, cur)
+			return
+		}
 	}
 	if cur == "" {
 		w.Header().Set("Cache-Control", "no-store")

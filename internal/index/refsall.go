@@ -669,7 +669,7 @@ type queryer interface {
 // refsCheckpoints reads the committed checkpoints of nss (those reached),
 // leaving out purged namespaces, in one read, as of one commit.
 func (ix *Index) refsCheckpoints(ctx context.Context, q queryer, nss []string) (map[string]string, error) {
-	rows, err := q.QueryContext(ctx, `SELECT ns, ns_id FROM checkpoints WHERE origin = ? AND ns NOT IN (SELECT ns FROM ns_state WHERE purged = 1)`, ix.origin)
+	rows, err := q.QueryContext(ctx, `SELECT ns, ns_id FROM checkpoints c WHERE origin = ? AND NOT EXISTS (SELECT 1 FROM ns_state s WHERE s.ns = c.ns AND s.purged = 1)`, ix.origin)
 	if err != nil {
 		return nil, err
 	}

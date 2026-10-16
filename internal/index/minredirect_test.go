@@ -169,8 +169,15 @@ func TestPurgeNSDuringPublish(t *testing.T) {
 	// the ask comes later, it is answered as in the window below).
 	late.armed.Store(true)
 	purged := must(w.c.PurgeNamespace(ctx, "matches", frozen))
-	waited := make(chan *http.Response, 1)
-	go func() { waited <- must(noFollow.Get(s.http.URL + "/matches?q=larsson&min=" + purged)) }()
+	type answer struct {
+		r   *http.Response
+		err error
+	}
+	waited := make(chan answer, 1)
+	go func() {
+		r, err := noFollow.Get(s.http.URL + "/matches?q=larsson&min=" + purged)
+		waited <- answer{r, err}
+	}()
 	never := must(w.c.NSHead(ctx, "schemas")).ID // not in matches' log
 	released := false
 	defer func() {
@@ -215,7 +222,11 @@ func TestPurgeNSDuringPublish(t *testing.T) {
 	released = true
 	waitFor(t, "the purge-ns to be published", func() bool { return s.ix.Checkpoint("matches") == purged })
 	check("after the publish")
-	r := <-waited
+	a := <-waited
+	if a.err != nil {
+		t.Fatalf("min of the purge-ns asked at once: %v", a.err)
+	}
+	r := a.r
 	defer r.Body.Close()
 	var body map[string]any
 	json.NewDecoder(r.Body).Decode(&body)
