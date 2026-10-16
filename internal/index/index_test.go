@@ -661,6 +661,9 @@ func TestPurgeNamespace(t *testing.T) {
 			t.Errorf("%s: %d %v %v", u, r.status, r.body, r.header)
 		}
 	}
+	// The 410 follows the commit; the tags are purged after it, before the
+	// purge is published in memory (Index.Apply).
+	waitFor(t, "the purge-ns to be published", func() bool { return s.ix.Checkpoint("matches") == purged })
 	s.mu.Lock()
 	purges := fmt.Sprint(s.purges)
 	s.mu.Unlock()

@@ -61,7 +61,7 @@ func (ix *Index) Pragma(name string) string {
 // once min is in the seen rows committed with it, can end before
 // Checkpoint has moved.
 func (ix *Index) Committed(ns string) string {
-	id, err := ix.committed(context.Background(), ns)
+	id, _, err := ix.committed(context.Background(), ns)
 	if err != nil {
 		panic(err)
 	}

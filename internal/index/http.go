@@ -3,7 +3,6 @@ package index
 import (
 	"context"
 	"crypto/sha256"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -254,8 +253,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		// core makes the read check before answering it, as below.
 		var head string
 		if head, err = ix.checker.PurgedRead(ctx, ns, bearer(r)); err == nil {
-			w.Header().Set("Cache-Control", "no-store")
-			writeJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "namespace purged", "head": head})
+			writePurged(w, head)
 			return
 		}
 	}
@@ -277,10 +275,19 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	}
 	// A purged namespace answers as the core's URLs of it do, after the
 	// read check: 410 purged with head, its purge-ns entry (§8.5, §12),
-	// the log's last, where the checkpoint stopped.
-	if head, purged, _ := ix.state(ns); purged {
-		w.Header().Set("Cache-Control", "no-store")
-		writeJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "namespace purged", "head": head})
+	// the log's last, where the checkpoint stopped. The committed state
+	// decides, as for redirects below: Apply purges the namespace's cache
+	// tags after its commit and only then publishes the purge in memory,
+	// and a result served in between, empty at the purge-ns entry, would
+	// outlive the purge in caches.
+	head, purged, err := ix.committed(ctx, ns)
+	if err != nil {
+		ix.opt.Logf("index: checkpoint of %s: %v", ns, err)
+		writeErr(w, http.StatusInternalServerError, "internal", "cannot read the checkpoint")
+		return
+	}
+	if purged {
+		writePurged(w, head)
 		return
 	}
 	setPtrHeaders := func() {
@@ -358,10 +365,16 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// sat between the two (e.g. in a slow purger), and sent ?min= readers
 	// to a checkpoint behind min, which seen (committed with it) had passed.
 	// The committed checkpoint only moves forward, so every redirect does.
-	cur, err := ix.committed(ctx, ns)
+	// Whether ns is purged is read with it: a purge-ns committed since the
+	// check above (it may be the min waited for) is answered as there.
+	cur, purged, err := ix.committed(ctx, ns)
 	if err != nil {
 		ix.opt.Logf("index: checkpoint of %s: %v", ns, err)
 		writeErr(w, http.StatusInternalServerError, "internal", "cannot read the checkpoint")
+		return
+	}
+	if purged {
+		writePurged(w, cur)
 		return
 	}
 	if cur == "" {
@@ -563,7 +576,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		if st, err = ix.sealed.Put(ctx, view.Target, ns, at, st); err != nil {
 			ix.opt.Logf("index: storing a sealed result: %v", err)
 		}
-		if now, err := ix.committed(ctx, ns); err == nil && now != at {
+		if now, _, err := ix.committed(ctx, ns); err == nil && now != at {
 			// An apply (maybe a purge) committed meanwhile: don't keep a
 			// result it may have retired.
 			if err := ix.sealed.Retire(ctx, ix.db, ns, now); err != nil {
@@ -658,16 +671,18 @@ func (ix *Index) query(ctx context.Context, ns string, q *Query, allow func(stri
 	return res, at, err
 }
 
-// committed returns the checkpoint of ns the database holds ("" if none):
-// what queries read. It is at or past the in-memory one (Checkpoint), which
-// Apply publishes after its commit.
-func (ix *Index) committed(ctx context.Context, ns string) (string, error) {
-	var id string
-	err := ix.db.QueryRowContext(ctx, `SELECT ns_id FROM checkpoints WHERE origin = ? AND ns = ?`, ix.origin, ns).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	return id, err
+// committed returns the checkpoint of ns the database holds ("" if none),
+// what queries read, and whether ns is purged there, in one read, so both
+// as of one commit. Both are at or ahead of the in-memory ones
+// (Index.state), which Apply publishes after its commit.
+func (ix *Index) committed(ctx context.Context, ns string) (string, bool, error) {
+	var (
+		id     string
+		purged bool
+	)
+	err := ix.db.QueryRowContext(ctx, `SELECT coalesce((SELECT ns_id FROM checkpoints WHERE origin = ? AND ns = ?), ''), coalesce((SELECT purged FROM ns_state WHERE ns = ?), 0)`,
+		ix.origin, ns, ns).Scan(&id, &purged)
+	return id, purged, err
 }
 
 // countsTag tags results with facet counts, which can reflect any resource
@@ -768,6 +783,13 @@ func (ix *Index) seen(ctx context.Context, ns, id string) bool {
 	var one int
 	err := ix.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns = ? AND ns_id = ?`, ns, id).Scan(&one)
 	return err == nil
+}
+
+// writePurged answers 410 purged with head, the namespace's purge-ns entry,
+// as the core does (§8.5, §12).
+func writePurged(w http.ResponseWriter, head string) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusGone, map[string]any{"code": "purged", "message": "namespace purged", "head": head})
 }
 
 func redirect(w http.ResponseWriter, loc string) {

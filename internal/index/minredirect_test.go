@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -123,6 +124,104 @@ func TestMinDuringPublish(t *testing.T) {
 	close(gate.release)
 	released = true
 	s.caughtUp("matches")
+}
+
+// lateLog holds each response to GET {path} for delay while armed: the
+// index learns of new entries of that log late.
+type lateLog struct {
+	path  string
+	delay time.Duration
+	armed atomic.Bool
+	rt    http.RoundTripper
+}
+
+func (l *lateLog) RoundTrip(r *http.Request) (*http.Response, error) {
+	resp, err := l.rt.RoundTrip(r)
+	if l.armed.Load() && r.URL.Path == l.path {
+		time.Sleep(l.delay)
+	}
+	return resp, err
+}
+
+// TestPurgeNSDuringPublish: while a purge-ns apply has committed, and
+// purged the namespace's cache tags, but not yet published its checkpoint,
+// the namespace answers as it does once that is out: 410 purged with head
+// the purge-ns entry at every URL, with any ?min= too, never a result,
+// which caches would keep past the purge; and /_refs leaves it out (§8.5,
+// §12, §A.4). A ?min= of the purge-ns asked before the apply is answered
+// so too once its wait ends.
+func TestPurgeNSDuringPublish(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := setup(t)
+	w.seed(t)
+	gate := &gatePurger{tag: "idx:matches", entered: make(chan struct{}), release: make(chan struct{})}
+	late := &lateLog{path: "/ns/matches/log", delay: 300 * time.Millisecond, rt: transport}
+	s := startSvcWith(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, untyped: true, minWait: 10 * time.Second, hc: &http.Client{Transport: late}},
+		func(o *index.Options) { o.Purger = gate })
+	old := s.caughtUp("matches")
+	s.expect("/matches?q=larsson", "cup", "derby")
+
+	must(w.c.PatchConfig(ctx, "matches", must(w.c.NSHead(ctx, "matches")).Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	frozen := s.caughtUp("matches")
+	// The index learns of the purge-ns late, so the ?min= of it asked
+	// at once waits for its apply (the delay only makes that likely: if
+	// the ask comes later, it is answered as in the window below).
+	late.armed.Store(true)
+	purged := must(w.c.PurgeNamespace(ctx, "matches", frozen))
+	waited := make(chan *http.Response, 1)
+	go func() { waited <- must(noFollow.Get(s.http.URL + "/matches?q=larsson&min=" + purged)) }()
+	never := must(w.c.NSHead(ctx, "schemas")).ID // not in matches' log
+	released := false
+	defer func() {
+		if !released {
+			close(gate.release)
+		}
+	}()
+	select {
+	case <-gate.entered:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the purge-ns was not applied")
+	}
+	late.armed.Store(false)
+	if s.ix.Committed("matches") != purged || s.ix.Checkpoint("matches") == purged {
+		t.Fatalf("not between the commit and the publish: committed %s, published %s, purge-ns %s",
+			s.ix.Committed("matches"), s.ix.Checkpoint("matches"), purged)
+	}
+	refs := "/_refs?to=" + url.QueryEscape("/r/matches/derby")
+	check := func(when string) {
+		t.Helper()
+		for _, u := range []string{
+			"/matches?q=larsson",
+			"/matches?q=larsson&min=" + purged,
+			"/matches?q=larsson&min=" + never, // 410 at once, not 503 after the wait
+			"/matches/at/" + old + "?q=larsson",
+			"/matches/at/" + frozen + "?q=larsson",
+			"/matches/at/" + purged + "?q=larsson",
+		} {
+			if r := s.raw(u, ""); r.status != 410 || r.body["code"] != "purged" || r.body["head"] != purged || r.header.Get("Cache-Control") != "no-store" {
+				t.Errorf("%s: %s: %d %v %v", when, u, r.status, r.body, r.header)
+			}
+		}
+		if b := s.search(refs, ""); len(b["namespaces"].(map[string]any)) != 0 {
+			t.Errorf("%s: /_refs covers %v", when, b["namespaces"])
+		}
+		if r := s.raw(refs+"&min=matches:"+purged, ""); r.status != 400 {
+			t.Errorf("%s: /_refs with min of the purge: %d %v", when, r.status, r.body)
+		}
+	}
+	check("before the publish")
+	close(gate.release)
+	released = true
+	waitFor(t, "the purge-ns to be published", func() bool { return s.ix.Checkpoint("matches") == purged })
+	check("after the publish")
+	r := <-waited
+	defer r.Body.Close()
+	var body map[string]any
+	json.NewDecoder(r.Body).Decode(&body)
+	if r.StatusCode != 410 || body["code"] != "purged" || body["head"] != purged {
+		t.Errorf("min of the purge-ns asked at once: %d %v %s", r.StatusCode, body, r.Header.Get("Location"))
+	}
 }
 
 // TestMinAfterWriteConcurrent: write, then at once query with the write's

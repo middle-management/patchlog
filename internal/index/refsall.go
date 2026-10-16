@@ -160,11 +160,12 @@ func (ix *Index) refsNamespaces() []string {
 }
 
 // refsReader runs the read check of every namespace the answer may cover
-// (refsAccess): a namespace the reader may not read is left out, and if
-// that leaves none, the answer is a refusal that names none of them (one
-// the reader can't see is like one the service doesn't follow): 401 if any
-// refusal is, else 403.
-func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, error) {
+// (refsAccess), those in reached (refsCheckpoints, which leaves purged
+// ones out) and not skipped: a namespace the reader may not read is left
+// out, and if that leaves none, the answer is a refusal that names none of
+// them (one the reader can't see is like one the service doesn't follow):
+// 401 if any refusal is, else 403.
+func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[string]string) (*refsReader, error) {
 	rd := &refsReader{public: true, allow: map[string]func(string) bool{}}
 	var (
 		markers []string
@@ -177,7 +178,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request) (*refsReader, 
 	}
 	g, _ := ix.checker.Decode(bearer(r)) // nil: no usable grant
 	for _, ns := range ix.refsNamespaces() {
-		if cur, purged, _ := ix.state(ns); cur == "" || purged || ix.keys.Skipped(ns) != "" {
+		if _, ok := reached[ns]; !ok || ix.keys.Skipped(ns) != "" {
 			continue
 		}
 		a, err := ix.refsAccess(ctx, ns, r, g)
@@ -329,7 +330,16 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		writeErr(w, http.StatusBadRequest, "bad_input", err.Error())
 		return
 	}
-	rd, err := ix.refsReader(ctx, r)
+	// The namespaces the answer may cover: reached and not purged as
+	// committed, as its checkpoints are read. Apply publishes a purge-ns in
+	// memory only after purging the namespace's cache tags (see serve).
+	reached, err := ix.refsCheckpoints(ctx, ix.db, ix.refsNamespaces())
+	if err != nil {
+		ix.opt.Logf("index: checkpoints for /_refs: %v", err)
+		writeErr(w, http.StatusInternalServerError, "internal", "cannot read the checkpoints")
+		return
+	}
+	rd, err := ix.refsReader(ctx, r, reached)
 	if err != nil {
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
@@ -656,9 +666,10 @@ type queryer interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// refsCheckpoints reads the committed checkpoints of nss (those reached).
+// refsCheckpoints reads the committed checkpoints of nss (those reached),
+// leaving out purged namespaces, in one read, as of one commit.
 func (ix *Index) refsCheckpoints(ctx context.Context, q queryer, nss []string) (map[string]string, error) {
-	rows, err := q.QueryContext(ctx, `SELECT ns, ns_id FROM checkpoints WHERE origin = ?`, ix.origin)
+	rows, err := q.QueryContext(ctx, `SELECT ns, ns_id FROM checkpoints WHERE origin = ? AND ns NOT IN (SELECT ns FROM ns_state WHERE purged = 1)`, ix.origin)
 	if err != nil {
 		return nil, err
 	}
