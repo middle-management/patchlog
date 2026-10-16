@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.21.0
 
 **Changes to check before upgrading:**
 - **`documentSize` defaults to 1 MiB** (was §6.6's 4 MiB), measured in
@@ -15,6 +15,16 @@
   build runs in the schema migration and blocks writes until it commits, a few seconds per 5
   million namespace entries; to avoid that, create them beforehand with
   `CREATE INDEX CONCURRENTLY` under the same names (see the README's Postgres section).
+- **SQLite database paths with `#`, `?` or `%`** (the core's `-db`, the index and tree/catalog
+  services' databases): earlier releases opened another file for such a path. With `#` or `?`
+  it was the file named by the path up to that character, so two paths that agree up to there
+  shared one file; with `%XX` escapes it was the file with them decoded (`%2F` as `/`, so
+  possibly in another directory), the name ending at a `%00`. This release opens exactly the
+  path given. When there is no file there but there is one at the old name, it refuses to start
+  and names both: stop the old release cleanly, move that file with its `-wal` and `-shm` files
+  to the full path (a copy for each, where two shared one), then start again. Started on an
+  empty database instead, the core's blob sweep would delete the blob files, whose directory
+  (`<db>.blobs`, or `-blob-dir`) is already at the full path.
 
 **Improvements:**
 - **Long-polls of a namespace share their reads** (§7.7, README design notes): a write woke every
@@ -29,7 +39,6 @@
   Varnish's waiting list: a private namespace's long-poll was held behind an identical one in
   flight until the next write, then sent to the origin with the rest a few at a time. Identical
   long-poll misses without credentials (devices following a public namespace) still collapse.
-
 - **Caches bounded by bytes, evicting gradually** (README design notes): the bearer grant cache
   keeps 65,536 verified grants (was 1,024, emptied when full, so a fleet of devices with grants
   of their own verified on nearly every request), the least recently used out first
@@ -38,7 +47,6 @@
   than everything when full (`serve -read-cache-size`). Compiled schemas, kept forever before,
   are the 512 most recently used (and 2,048 schema documents), and rate-limit buckets, one per
   resource and principal written and never dropped before, are swept once refilled.
-
 - **Namespace log pages bound items too**: a page holds at most the log page size in resource
   entries as well as in entries, a batch entry counting as its items (it carries them), ending
   before an entry that would take it past and always holding one. A page of 1,000 batch entries
@@ -67,22 +75,6 @@
   longer lists from there. The index serves the namespace only once the last page is applied,
   as before; the tree service holds the pages and applies the listing whole at its last page,
   since its listings are cached by checkpoint.
-
-## v0.20.1
-
-**Changes to check before upgrading:**
-- **SQLite database paths with `#`, `?` or `%`** (the core's `-db`, the index and tree/catalog
-  services' databases): earlier releases opened another file for such a path. With `#` or `?`
-  it was the file named by the path up to that character, so two paths that agree up to there
-  shared one file; with `%XX` escapes it was the file with them decoded (`%2F` as `/`, so
-  possibly in another directory), the name ending at a `%00`. This release opens exactly the
-  path given. When there is no file there but there is one at the old name, it refuses to start
-  and names both: stop the old release cleanly, move that file with its `-wal` and `-shm` files
-  to the full path (a copy for each, where two shared one), then start again. Started on an
-  empty database instead, the core's blob sweep would delete the blob files, whose directory
-  (`<db>.blobs`, or `-blob-dir`) is already at the full path.
-
-**Fixes:**
 - **SQLite database paths with `#`, `?` or `%`:** the core, the index and the tree/catalog
   services built SQLite connection strings by appending the path unescaped, so SQLite cut it at
   `#` or `?` and decoded `%XX` in it, a `?` also cost the database its WAL journal mode, and a
