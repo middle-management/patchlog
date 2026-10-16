@@ -682,6 +682,11 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   entry, and the leader sends it again once `RepurgeDelay` has passed (default three tail
   intervals plus two minutes, covering the cache staleness bound, replica lag and the response
   deadline), then deletes the row. SQLite deployments do the same.
+- **Upgrading adds indexes.** A start that finds `ns_log` without `ns_log_ns_seq (ns, seq)` or
+  `ns_log_ns_config (ns, config_seq, seq)` builds them inside the schema migration, which blocks
+  writes until it commits: a few seconds per 5 million namespace entries (about 4 s for the
+  first on a local `postgres:16`). To build them without blocking, create them beforehand with
+  `CREATE INDEX CONCURRENTLY` under the same names; the migration then finds them.
 - **Keep transactions short.** The tailer can't move past the oldest running transaction in the
   database (its `xmin`), so one left open holds back every instance's wake-ups: set
   `idle_in_transaction_session_timeout` (e.g. `ALTER ROLE patchlog SET
@@ -2563,14 +2568,17 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   documents, so an import from an older deployment brings no such members (§G.4); a remote
   branch's shadow keeps only the `encryption` fields this version defines of an e2e base's.
 - **Paged log ranges** (§7.1). `…/rev/{id}/log?since=` (resources and namespaces) answers at most
-  the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first; a
+  the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first, and
+  a namespace page at most as many resource entries, a batch entry counting as its items: it
+  ends before an entry that would take it past, but always holds one; a
   range that goes on carries `X-Log-Next: {id}`, the page's last entry and the `since` of the
   next page, an immutable range up to the same id, so every page caches as immutable. Errors are
   the range's on every page: a range crossing a pruning horizon is `410` on all of them. A page
   costs its own rows, however long the range: a resource's chain is its rows in seq order, so a
   page is one `seq > ? … LIMIT` query per ancestry segment it reaches, after a query or two per
   segment to place `since` and look for pruned patch sets, which only exist at or below a
-  resource's horizon (or in a purged one); a namespace page is one `LIMIT` query. The rows a
+  resource's horizon (or in a purged one); a namespace page is one `LIMIT` query, over the index
+  `ns_log (ns, seq)`, so it reads the page's rows however long the namespace. The rows a
   page reads are checked to chain (each one's parent is the row before it), so a broken chain is
   a `500`, never a range with rows that aren't ancestors. Long-polls (§7.7) answer pages of the
   same size and shape, without `X-Log-Next` (their header names the next `since`), and `/heads`
@@ -2582,11 +2590,47 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   other, and every e2e fold (the client's `DocE2E`, and so merge and rebase, PruneE2E, derived
   views; the playground) fetches `/rev/{H}` when it starts at the horizon. Every reader follows pages and treats a page that stops short of the range's id without
   `X-Log-Next` as an error: `client.Log`, `NSLog` (one page each: `LogPage`, `NSLogPage`) and e2e
-  folds, and so `follow` (catch-up delivers and checkpoints page by page, §10), the index (`?min`
+  folds, and so `follow` (catch-up delivers and checkpoints page by page, §10; a snapshot
+  bootstrap, `WithSnapshot` or a new branch, delivers its `/heads` listing a page per batch, the
+  first replacing what the consumer holds and the last carrying the checkpoint, and a consumer
+  whose checkpoints record the pages in between, `SQLCheckpoints.SaveBatch`, resumes after the
+  last one recorded when restarted; the tree service applies a listing whole, at its last page,
+  since its listings are cached by checkpoint), the index (`?min`
   checks only the first page), tree and catalog, merge, rebase, release and janitor tooling,
   bundle export and import (whether `requires` is in the target's chain takes one page), remote
   branches mirroring and following their bases (§G.3), and the playground (namespace logs,
   histories and e2e folds; each sealed page is opened as its own range).
+- **Long-poll reads are shared** (§7.7, `internal/core/live.go`). A write wakes every long-poll
+  waiting on its namespace, and each would read the log after its `since` again: thousands of
+  identical transactions for a private namespace that thousands of devices follow, which a CDN
+  can't collapse unless it verifies edge grants (§C.5). So a long-poll's first read is checked as
+  any read, and while that decision holds its later reads skip the check and are shared: the
+  waiters woken by one commit that read the same `since` and page make one read, and its answer
+  serves those that ask after it is done, until the namespace's next commit. The decision holds
+  while the read cache's meta counter (configuration, purges, prunes, restores, key destruction;
+  on Postgres while the tailer is fresh) hasn't moved, before the grant's earliest `exp`, and only
+  for grants whose key, block and role rules don't read `/now` (nor the whole envelope); edge
+  grants and resource long-polls are read on their own, as before. On server X
+  ([docs/CAPACITY.md](docs/CAPACITY.md)) one write to 5,000 private followers went from 3.7–4.1 s
+  of core CPU to 0.3–1 s. The local CDN's VCL lets a long-poll with credentials skip Varnish's
+  waiting list (`hash_ignore_busy`), so a private one isn't held behind an identical request in
+  flight.
+- **In-memory caches, per instance**, each bounded and evicting gradually:
+  - **Verified bearer grants**, by token: 65,536 by default (`serve -grant-cache`), at most
+    32 MiB of tokens, the least recently used out first. A request whose grant isn't kept
+    decodes and verifies it (signatures, revocations), so a fleet of devices with grants of their
+    own should fit (docs/CAPACITY.md). Only grants whose signature chain verified are kept.
+  - **Documents by revision id**: 256 MiB by default (`serve -doc-cache-size`), the least recently
+    used out first; a document over a quarter of it isn't kept. Bounded by count before, 4,096
+    documents of up to 4 MiB could hold 16 GiB.
+  - **The read cache** (revisions and head pointers served without a transaction): 64 MiB of
+    revisions by default (`serve -read-cache-size`) and 65,536 entries; past either, entries are
+    evicted until both are within three quarters, where it used to start over empty.
+  - **Compiled schemas** by revision path: the 512 most recently used, and the 2,048 schema
+    documents they were compiled from; one evicted is compiled again when next used.
+  - **Rate-limit buckets** (§6.6): one per namespace, principal and (namespace, resource,
+    principal) written. A bucket that has refilled to its burst is the same as a new one, so they
+    are swept once a minute when there are more than 1,024.
 - **Allowances** (§6.6): `allowances: [{ sub, kid, bucket: { rate, burst }, itemsPerBatch,
   batchSize, until? }]` in a namespace document gives one principal its own bucket (replacing the
   principal and namespace buckets, and a key scope's lower rate) and batch limits, until the
@@ -2597,7 +2641,8 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `patchSetSize`, `opsPerSet`, `documentSize`, `valueSize`, `pathSize`, `nestingDepth`,
   `rulesPerNamespace`, `rulesPerGrant`, `grantSize`, `itemsPerBatch`, `batchSize`,
   `branchesPerNamespace`, `keepPerResource`, `blobsPerDocument`, `blobSize`, `blobPending`
-  (integers, sizes in bytes, lower only), `ratePerResource`, `ratePerPrincipal`,
+  (integers, sizes in bytes, up to the deployment maximums, which equal the defaults but for
+  `documentSize`), `ratePerResource`, `ratePerPrincipal`,
   `ratePerNamespace`, `blobRate` (`{ rate, burst }`, `blobRate` in bytes), `retryWindow`,
   `remoteRegistration` and `blobGrace` (ISO 8601 durations; `blobGrace` at least `retryWindow`).
   Sizes written with units (`"64 MiB"`), unknown or v0.20 names (`liveBranches`,
@@ -2608,6 +2653,13 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   objects must be well-formed and name available blobs that match their type, size and nonce
   (`422`, `code: "blob"`). Allowances may also set `blobRate` and `blobPending`; the deployment
   maximums are set with `serve -max-blob-size` and `-max-blob-pending`.
+- **`documentSize` is 1 MiB by default**, where §6.6 says 4 MiB, and a namespace may set it up to
+  the deployment maximum, 4 MiB unless `serve -max-document-size` says otherwise;
+  `serve -document-size` changes the default (at most the maximum). Every write re-serialises,
+  checks and validates the whole document, so an append to a 3.5 MiB document costs 3–4 times one
+  to a 16 KiB document, and large documents weigh on the caches ([docs/CAPACITY.md](docs/CAPACITY.md)).
+  A namespace holding larger documents sets `"limits": { "documentSize": 4194304 }`; until it
+  does, appends that leave a document over 1 MiB, and creates over it, are `413`.
 - **Batch sources** (§7.5, §7.8): a local `source.at` is checked against `source.ns`'s chain
   (`422`, `code: "source"`) at step 4, before blob references, only when the caller may read
   `source.ns` unrestricted (with `Source-Authorization`, if given); then the blobs attached to

@@ -155,8 +155,9 @@ func TestPrivateNamespace(t *testing.T) {
 	}
 }
 
-func TestBranchPreviewIndex(t *testing.T) {
-	t.Parallel()
+func TestBranchPreviewIndex(t *testing.T) { t.Parallel(); testBranchPreviewIndex(t) }
+
+func testBranchPreviewIndex(t *testing.T) {
 	ctx := context.Background()
 	w := setup(t)
 	w.seed(t)

@@ -219,7 +219,7 @@ func TestGrantCacheVerifiedOnly(t *testing.T) {
 	cached := func() (int, int) {
 		e.bearers.mu.Lock()
 		defer e.bearers.mu.Unlock()
-		return len(e.bearers.m), e.bearers.bytes
+		return e.bearers.lru.Len(), e.bearers.lru.Bytes()
 	}
 	before, _ := cached()
 
@@ -263,13 +263,19 @@ func TestGrantCacheVerifiedOnly(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// The total token length stays within its bound.
+	// The total token length stays within its bound, the least recently
+	// used tokens going first.
 	var c grantCache
-	for i := 0; i < 20; i++ {
-		c.put(fmt.Sprintf("%d%s", i, strings.Repeat("x", 200<<10)), g)
-		if c.bytes > maxGrantCacheBytes || len(c.m) == 0 {
-			t.Fatalf("%d tokens of %d bytes kept", len(c.m), c.bytes)
+	tok := func(i int) string { return fmt.Sprintf("%d%s", i, strings.Repeat("x", 2<<20)) }
+	for i := 0; i < 40; i++ {
+		c.put(tok(i), g)
+		c.get(tok(0))
+		if c.lru.Bytes() > maxGrantCacheBytes || c.lru.Len() == 0 {
+			t.Fatalf("%d tokens of %d bytes kept", c.lru.Len(), c.lru.Bytes())
 		}
+	}
+	if c.get(tok(0)) == nil || c.get(tok(1)) != nil || c.get(tok(39)) == nil {
+		t.Fatal("not the least recently used evicted")
 	}
 	unverified, err := grant.Decode(reader.Bearer, 0)
 	if err != nil {

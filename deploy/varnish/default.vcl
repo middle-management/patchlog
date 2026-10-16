@@ -136,6 +136,17 @@ sub vcl_recv {
 	if (req.url ~ "^/(r|ns)/[^?]*/events(\?|$)" || req.http.Accept ~ "text/event-stream") {
 		return (pass);
 	}
+	# A long-poll carrying credentials may be a private namespace's, which
+	# this CDN doesn't cache (it verifies no edge grants). Don't queue it
+	# behind an identical one in flight (the waiting list): that one is a
+	# long-poll too, held until the next write, and the queue then goes on
+	# to the origin as new requests, a few at a time. It is still answered
+	# from a cached copy when there is one (a public namespace's); the
+	# origin shares the waiters' reads (core/live.go). Without credentials
+	# (devices following a public namespace), identical misses collapse.
+	if (req.url ~ "[?&]live=long-poll(&|$)" && (req.http.Authorization || req.http.Cookie)) {
+		set req.hash_ignore_busy = true;
+	}
 	# Unlike builtin.vcl, don't pass requests with Authorization or cookies:
 	# the response decides (vcl_backend_response).
 	return (hash);

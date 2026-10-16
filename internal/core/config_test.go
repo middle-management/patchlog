@@ -18,3 +18,25 @@ func TestValidRemoteOrigin(t *testing.T) {
 		}
 	}
 }
+
+// documentSize is 1 MiB by default, and a namespace may set it up to the
+// deployment maximum, 4 MiB by default (docs/CAPACITY.md).
+func TestDocumentSizeDefaultAndMaximum(t *testing.T) {
+	if got := DefaultLimits().DocumentSize; got != 1<<20 {
+		t.Fatalf("default documentSize %d", got)
+	}
+	if got := DefaultMaximums().DocumentSize; got != 4<<20 {
+		t.Fatalf("maximum documentSize %d", got)
+	}
+	c, err := parseConfig(map[string]any{"read": "public"}, DefaultLimits(), DefaultMaximums())
+	if err != nil || c.Limits.DocumentSize != 1<<20 {
+		t.Fatalf("unset: %v %v", c, err)
+	}
+	c, err = parseConfig(map[string]any{"read": "public", "limits": map[string]any{"documentSize": float64(4 << 20)}}, DefaultLimits(), DefaultMaximums())
+	if err != nil || c.Limits.DocumentSize != 4<<20 {
+		t.Fatalf("4 MiB: %v %v", c, err)
+	}
+	if _, err := parseConfig(map[string]any{"read": "public", "limits": map[string]any{"documentSize": float64(4<<20 + 1)}}, DefaultLimits(), DefaultMaximums()); err == nil {
+		t.Fatal("over the maximum accepted")
+	}
+}

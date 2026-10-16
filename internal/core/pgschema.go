@@ -157,6 +157,13 @@ CREATE TABLE IF NOT EXISTS ns_log (
   UNIQUE (ns, prev_seq)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS one_ns_first ON ns_log (ns) WHERE prev_seq IS NULL;
+-- A namespace's entries in order, for log pages, long-polls and event
+-- streams (§7.1, reads.go), and the first entry under a configuration, for
+-- idempotent retries of config writes and batches (nsops.go, write.go).
+-- Without them a page could scan the whole namespace and sort it, and the
+-- retry lookup the whole table.
+CREATE INDEX IF NOT EXISTS ns_log_ns_seq ON ns_log (ns, seq);
+CREATE INDEX IF NOT EXISTS ns_log_ns_config ON ns_log (ns, config_seq, seq);
 
 CREATE TABLE IF NOT EXISTS head_history (
   res        bigint NOT NULL REFERENCES resources,

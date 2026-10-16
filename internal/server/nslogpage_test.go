@@ -15,8 +15,8 @@ import (
 // every size, from every since and up to every id, as a range, a long-poll
 // answer, an event catch-up and over HTTP, is a slice of the whole chain,
 // in which each entry's prev is the entry before it. In plain and sealed
-// namespaces and their branches, across a batch, a config change, a
-// tombstone, a purge and a prune.
+// namespaces and their branches, across a batch (which counts as its items
+// toward a page), a config change, a tombstone, a purge and a prune.
 func TestNSLogPagePrev(t *testing.T) {
 	t.Parallel()
 	e := newSealedEnv(t, withLogPageSize(3))
@@ -83,13 +83,27 @@ func TestNSLogPagePrev(t *testing.T) {
 			}
 			return all[k-1]["id"].(string)
 		}
+		// pageLen is how many of all[k:end] a page of lim holds: at most
+		// lim entries and lim resource entries, a batch counting as its
+		// items, and at least one entry (core.namespaceLog).
+		pageLen := func(k, end, lim int) int {
+			n, units := 0, 0
+			for i := k; i < end; i++ {
+				u := 1
+				if es, ok := all[i]["entries"].([]any); ok && len(es) > 1 {
+					u = len(es)
+				}
+				if lim > 0 && n > 0 && (n == lim || units+u > lim) {
+					break
+				}
+				n, units = n+1, units+u
+			}
+			return n
+		}
 		for k := 0; k < len(all); k++ {
 			for end := k + 1; end <= len(all); end++ {
 				for _, lim := range []int{1, 2, 3, 0} {
-					n := end - k
-					if lim > 0 && lim < n {
-						n = lim
-					}
+					n := pageLen(k, end, lim)
 					lg, err := e.e.NamespaceLog(ctx, ns, all[end-1]["id"].(string), since(k), lim, core.Credentials{})
 					if err != nil {
 						t.Fatal(err)
@@ -100,7 +114,7 @@ func TestNSLogPagePrev(t *testing.T) {
 					}
 				}
 			}
-			n := min(2, len(all)-k)
+			n := pageLen(k, len(all), 2)
 			lp, err := e.e.NamespaceLog(ctx, ns, "", since(k), 2, core.Credentials{})
 			if err != nil {
 				t.Fatal(err)
@@ -123,7 +137,7 @@ func TestNSLogPagePrev(t *testing.T) {
 		}
 		k := 0
 		for _, p := range e.pages("/ns/"+ns+"/rev/"+head+"/log", "") {
-			n := min(3, len(all)-k)
+			n := pageLen(k, len(all), 3)
 			body := p.body
 			if sealed {
 				body = open(t, string(p.body), key, kid, seal.RangePL(ns, since(k), all[k+n-1]["id"].(string)))

@@ -12,6 +12,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -105,7 +106,7 @@ func New(t testing.TB, opt Options) *Server {
 	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
 		Archiver: opt.Archiver, RetentionInterval: -1}
 	if opt.LogPageSize > 0 {
-		o.Maximums = core.DefaultLimits()
+		o.Maximums = core.DefaultMaximums()
 		o.Maximums.LogPageSize = opt.LogPageSize
 	}
 	testenv.Apply(&o)
@@ -142,17 +143,19 @@ func New(t testing.TB, opt Options) *Server {
 	return s
 }
 
-// pagesServed counts log range answers that continued (X-Log-Next).
+// pagesServed counts log range answers that continued (X-Log-Next), and
+// /heads pages after the first.
 var pagesServed atomic.Int64
 
 // CountPages wraps a server's handler to count the log range answers it
-// serves that continue on another page (X-Log-Next, §7.1), for Paged.
-// Servers from New are wrapped already.
+// serves that continue on another page (X-Log-Next, §7.1), and the /heads
+// pages it serves after a listing's first (?after=), for Paged. Servers
+// from New are wrapped already.
 func CountPages(h http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		h.ServeHTTP(w, r)
 		// The header map outlives the answer.
-		if w.Header().Get("X-Log-Next") != "" {
+		if w.Header().Get("X-Log-Next") != "" || strings.HasSuffix(r.URL.Path, "/heads") && r.URL.Query().Has("after") {
 			pagesServed.Add(1)
 		}
 	})
@@ -161,15 +164,16 @@ func CountPages(h http.Handler) http.Handler {
 // Paged runs a test's flows with a log page size of n (§6.6): every test
 // server they start (New, or a handler wrapped by CountPages and an engine
 // set up with testenv.Apply) answers at most n entries per log range page,
-// so every client on the way must follow X-Log-Next (§7.1 Paging). It
-// fails unless some range did span pages.
+// so every client on the way must follow X-Log-Next (§7.1 Paging), and as
+// many resources per /heads page. It fails unless some range or listing
+// did span pages.
 func Paged(t *testing.T, n int, run func(*testing.T)) {
 	t.Helper()
 	t.Setenv(testenv.LogPageSizeEnv, strconv.Itoa(n))
 	before := pagesServed.Load()
 	run(t)
 	if !t.Failed() && pagesServed.Load() == before {
-		t.Fatalf("no log range spanned pages of %d", n)
+		t.Fatalf("no log range or listing spanned pages of %d", n)
 	}
 }
 

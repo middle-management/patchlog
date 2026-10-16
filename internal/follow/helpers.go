@@ -13,11 +13,50 @@ import (
 
 // --- checkpoints -----------------------------------------------------------
 
+// Resumer is a Checkpoint that also keeps how far a snapshot bootstrap
+// listed by pages got (Batch.Partial), so a follower that restarts before
+// its last page resumes after the last page applied rather than from the
+// first. MemoryCheckpoints and SQLCheckpoints are Resumers.
+type Resumer interface {
+	// LoadBootstrap returns the position (ns_id) of an unfinished
+	// snapshot and the cursor of its next page, "" and "" if none.
+	LoadBootstrap(ctx context.Context, origin, ns string) (at, after string, err error)
+}
+
 // MemoryCheckpoints is an in-memory Checkpoint store, for tests and
 // consumers whose derived data is itself in memory.
 type MemoryCheckpoints struct {
 	mu sync.Mutex
 	m  map[[3]string]string
+	bs map[[2]string][2]string // unfinished snapshots: at, after
+}
+
+// SaveBatch records what applying b reaches: its checkpoint, or for a page
+// of a snapshot that later pages complete, how far the snapshot got.
+func (m *MemoryCheckpoints) SaveBatch(origin, ns string, b *Batch) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	k := [2]string{origin, ns}
+	if b.Partial() {
+		if m.bs == nil {
+			m.bs = map[[2]string][2]string{}
+		}
+		m.bs[k] = [2]string{b.NewCheckpoint, b.More}
+		return
+	}
+	delete(m.bs, k)
+	if m.m == nil {
+		m.m = map[[3]string]string{}
+	}
+	m.m[[3]string{origin, ns}] = b.NewCheckpoint
+}
+
+// LoadBootstrap implements Resumer.
+func (m *MemoryCheckpoints) LoadBootstrap(_ context.Context, origin, ns string) (string, string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	p := m.bs[[2]string{origin, ns}]
+	return p[0], p[1], nil
 }
 
 // Load returns the saved ns_id, "" if none.
@@ -45,6 +84,10 @@ type Execer interface {
 // SQLCheckpoints stores checkpoints in a table
 //
 //	checkpoints(origin TEXT, ns TEXT, ns_id TEXT, PRIMARY KEY (origin, ns))
+//
+// and unfinished snapshot bootstraps (Resumer) in another, named after it
+//
+//	checkpoints_bootstrap(origin TEXT, ns TEXT, at_id TEXT, after_name TEXT, PRIMARY KEY (origin, ns))
 //
 // Save takes the caller's transaction, so the checkpoint commits with the
 // derived data (§A.1). Queries use ? placeholders (SQLite, MySQL) unless
@@ -82,8 +125,48 @@ func (s SQLCheckpoints) Init(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.DB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+t+` (origin TEXT NOT NULL, ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (origin, ns))`)
+	if _, err = s.DB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+t+` (origin TEXT NOT NULL, ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (origin, ns))`); err != nil {
+		return err
+	}
+	_, err = s.DB.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS `+t+`_bootstrap (origin TEXT NOT NULL, ns TEXT NOT NULL, at_id TEXT NOT NULL, after_name TEXT NOT NULL, PRIMARY KEY (origin, ns))`)
 	return err
+}
+
+// LoadBootstrap implements Resumer.
+func (s SQLCheckpoints) LoadBootstrap(ctx context.Context, origin, ns string) (string, string, error) {
+	t, err := s.table()
+	if err != nil {
+		return "", "", err
+	}
+	var at, after string
+	err = s.DB.QueryRowContext(ctx, `SELECT at_id, after_name FROM `+t+`_bootstrap WHERE origin = `+s.ph(1)+` AND ns = `+s.ph(2), origin, ns).Scan(&at, &after)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", nil
+	}
+	return at, after, err
+}
+
+// SaveBatch records through tx what applying b reaches: b.NewCheckpoint
+// (Save), or for a page of a snapshot that later pages complete
+// (Batch.Partial), how far the snapshot got, which LoadBootstrap returns
+// until its last page is saved. Use it in place of Save in the
+// transaction that applies b.
+func (s SQLCheckpoints) SaveBatch(ctx context.Context, tx Execer, origin, ns string, b *Batch) error {
+	t, err := s.table()
+	if err != nil {
+		return err
+	}
+	if b.Partial() {
+		_, err = tx.ExecContext(ctx, `INSERT INTO `+t+`_bootstrap (origin, ns, at_id, after_name) VALUES (`+s.ph(1)+`, `+s.ph(2)+`, `+s.ph(3)+`, `+s.ph(4)+`)
+			ON CONFLICT (origin, ns) DO UPDATE SET at_id = excluded.at_id, after_name = excluded.after_name`, origin, ns, b.NewCheckpoint, b.More)
+		return err
+	}
+	if b.Snapshot {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM `+t+`_bootstrap WHERE origin = `+s.ph(1)+` AND ns = `+s.ph(2), origin, ns); err != nil {
+			return err
+		}
+	}
+	return s.Save(ctx, tx, origin, ns, b.NewCheckpoint)
 }
 
 // Load returns the saved ns_id, "" if none.

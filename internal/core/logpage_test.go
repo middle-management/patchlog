@@ -2,6 +2,8 @@ package core
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/pgtest"
@@ -154,5 +156,120 @@ func TestLogPageBrokenChain(t *testing.T) {
 	// A page that doesn't reach the break still answers.
 	if lg, err := e.ResourceLog(ctx, "n", "a", head, "", 2, Credentials{}); err != nil || lg.Status != 200 || len(lg.Entries) != 2 {
 		t.Fatalf("page before the break: %v %+v", err, lg)
+	}
+}
+
+// A namespace log page and the config-retry lookup read ns_log through
+// their own indexes, not the whole namespace or table (ns_log_ns_seq,
+// ns_log_ns_config). Planned on SQLite, whose planner doesn't depend on
+// statistics; on Postgres the indexes exist, the plan depends on the data.
+func TestNSLogQueriesUseIndexes(t *testing.T) {
+	t.Parallel()
+	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.pg {
+		var n int
+		if err := e.db.QueryRow(`SELECT count(*) FROM pg_indexes WHERE tablename = 'ns_log' AND indexname IN ('ns_log_ns_seq', 'ns_log_ns_config')`).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		if n != 2 {
+			t.Fatalf("ns_log indexes: %d of 2", n)
+		}
+		return
+	}
+	for _, c := range []struct{ q, index string }{
+		{`SELECT seq, id, prev_seq, body FROM ns_log WHERE ns = 1 AND seq > 0 AND seq <= 100 ORDER BY seq LIMIT 10`, "ns_log_ns_seq"},
+		{`SELECT MIN(seq) FROM ns_log WHERE ns = 1 AND config_seq = 1`, "ns_log_ns_config"},
+	} {
+		rows, err := e.db.Query(`EXPLAIN QUERY PLAN ` + c.q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var plan []string
+		for rows.Next() {
+			var id, parent, notused int
+			var detail string
+			if err := rows.Scan(&id, &parent, &notused, &detail); err != nil {
+				t.Fatal(err)
+			}
+			plan = append(plan, detail)
+		}
+		rows.Close()
+		if p := strings.Join(plan, "; "); !strings.Contains(p, c.index) || strings.Contains(p, "TEMP B-TREE") {
+			t.Errorf("%s: plan %q, want %s without a sort", c.q, p, c.index)
+		}
+	}
+}
+
+// A namespace log page holds at most the page size in resource entries
+// too, a batch entry counting as its items: it ends before an entry that
+// would take it past, but always holds one, so a batch larger than a page
+// is a page of its own. Paging through still serves every entry once.
+func TestNSLogPageItems(t *testing.T) {
+	t.Parallel()
+	lim := DefaultLimits()
+	fast := Rate{1e9, 1e9}
+	lim.RatePerResource, lim.RatePerPrincipal, lim.RatePerNamespace = fast, fast, fast
+	e, err := Open(Options{Path: pgtest.FreshDB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Limits: lim, Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	ctx := context.Background()
+	mkNS(t, e, "n", map[string]any{"read": "public"})
+	n := 0
+	batch := func(k int) {
+		var items []Item
+		for i := 0; i < k; i++ {
+			n++
+			items = append(items, Item{Resource: fmt.Sprintf("b%d", n), IfNoneMatch: true,
+				Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}}}})
+		}
+		if _, err := e.Batch(ctx, Request{NS: "n", Cred: Credentials{Author: "a"}}, items, nil, nil, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	single := func() {
+		n++
+		if _, err := put(e, "n", fmt.Sprintf("s%d", n), "", 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// After the config genesis (1): a single (1), a batch of 3, a single,
+	// a batch of 6 (larger than a page of 4), a single.
+	single()
+	batch(3)
+	single()
+	batch(6)
+	single()
+	var pages [][]int
+	total, since := 0, ""
+	for {
+		lg, err := e.NamespaceLog(ctx, "n", "", since, 4, Credentials{})
+		if err != nil || lg.Status != 200 {
+			t.Fatalf("page after %q: %+v %v", since, lg, err)
+		}
+		var sizes []int
+		for _, m := range lg.Entries {
+			k := 1
+			if es, ok := m["entries"].([]any); ok {
+				k = len(es)
+			}
+			sizes = append(sizes, k)
+			total++
+		}
+		pages = append(pages, sizes)
+		if !lg.More {
+			break
+		}
+		since = lg.Last
+	}
+	if got := fmt.Sprint(pages); got != "[[1 1] [3 1] [6] [1]]" || total != 6 {
+		t.Fatalf("pages %s, %d entries", got, total)
 	}
 }

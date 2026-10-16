@@ -1,0 +1,48 @@
+{
+  "long_poll_fanout": {
+    "100": {
+      "all_delivered_ms": 111.163,
+      "delivered": 100,
+      "errors": 0,
+      "latency": {
+        "max_ms": 111.163,
+        "n": 100,
+        "p50_ms": 73.455,
+        "p95_ms": 107.469,
+        "p99_ms": 110.912
+      },
+      "origin_cpu_seconds": 0.07000000000000028
+    },
+    "1000": {
+      "all_delivered_ms": 1156.953,
+      "delivered": 1000,
+      "errors": 0,
+      "latency": {
+        "max_ms": 1156.953,
+        "n": 1000,
+        "p50_ms": 841.947,
+        "p95_ms": 1139.713,
+        "p99_ms": 1152.31
+      },
+      "origin_cpu_seconds": 0.7999999999999972
+    },
+    "5000": {
+      "all_delivered_ms": 4295.926,
+      "delivered": 5000,
+      "errors": 0,
+      "latency": {
+        "max_ms": 4295.926,
+        "n": 5000,
+        "p50_ms": 2298.43,
+        "p95_ms": 4134.562,
+        "p99_ms": 4284.247
+      },
+      "origin_cpu_seconds": 4.140000000000001
+    },
+    "via": "http://127.0.0.1:8080"
+  },
+  "origin_vmhwm_mb": 410.0546875,
+  "origin_vmrss_mb": 302.76953125,
+  "profile": "grants",
+  "total_seconds": 17.859826472
+}

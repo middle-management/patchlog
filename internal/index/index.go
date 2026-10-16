@@ -506,9 +506,10 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		return err
 	}
 	defer tx.Rollback()
-	if b.Snapshot || co.PurgedNS {
-		// A snapshot is the complete state; a purge-ns drops everything
-		// (Coalesce keeps only the changes after it).
+	if b.Replaces() || co.PurgedNS {
+		// A snapshot is the complete state (its later pages add to the
+		// first); a purge-ns drops everything (Coalesce keeps only the
+		// changes after it).
 		if err := ix.dropNS(ctx, tx, b.NS); err != nil {
 			return err
 		}
@@ -525,8 +526,10 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			}
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO seen (ns, ns_id) VALUES (?, ?)`, b.NS, b.NewCheckpoint); err != nil {
-		return err
+	if !b.Partial() {
+		if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO seen (ns, ns_id) VALUES (?, ?)`, b.NS, b.NewCheckpoint); err != nil {
+			return err
+		}
 	}
 	if co.PurgedNS {
 		if _, err := tx.ExecContext(ctx, `INSERT INTO ns_state (ns, purged) VALUES (?, 1) ON CONFLICT (ns) DO UPDATE SET purged = 1`, b.NS); err != nil {
@@ -553,13 +556,23 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := ix.sealed.Purge(ctx, tx, tags); err != nil {
 		return err
 	}
-	if err := ix.cps.Save(ctx, tx, b.Origin, b.NS, b.NewCheckpoint); err != nil {
+	if err := ix.cps.SaveBatch(ctx, tx, b.Origin, b.NS, b); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
 	ix.refsPurged(ctx, b.NS, tags)
+	if b.Partial() {
+		// A page of a snapshot later pages complete: the index doesn't
+		// reflect the namespace as of b.NewCheckpoint yet, so the
+		// checkpoint isn't published (and nothing is purged: a snapshot
+		// has no purges, Coalesce marks none in synthetic units).
+		if ix.opt.OnApply != nil {
+			ix.opt.OnApply(b)
+		}
+		return nil
+	}
 	// Purge before the new checkpoint is out, so nobody who learns of it
 	// can still be served what it removed. Purgers don't block. Kept
 	// results go first, after the commit: one read before it that carries

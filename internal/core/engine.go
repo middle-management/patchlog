@@ -33,9 +33,12 @@ import (
 	"sync/atomic"
 	"time"
 
+	"golang.org/x/sync/singleflight"
+
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/schema"
 )
 
@@ -64,8 +67,17 @@ type Options struct {
 	// Limits are the namespace defaults of §6.6.
 	Limits Limits
 	// Maximums are the deployment maximums; a namespace can set its limits
-	// up to them (and allowances too). Zero means equal to Limits.
+	// up to them (and allowances too). Zero means equal to Limits, or
+	// DefaultMaximums when Limits is zero too.
 	Maximums Limits
+	// GrantCacheEntries bounds the verified bearer grants kept by token
+	// (default 65,536; auth.go), DocCacheBytes the documents kept by
+	// revision id (default 256 MiB), and ReadCacheBytes the answers the
+	// read cache keeps (default 64 MiB; readcache.go). All three evict
+	// gradually, the first two the least recently used.
+	GrantCacheEntries int
+	DocCacheBytes     int
+	ReadCacheBytes    int
 	// LongPollInterval is the interval of §7.7 (default 20s).
 	LongPollInterval time.Duration
 	// Now overrides the clock (tests).
@@ -228,6 +240,13 @@ type Engine struct {
 	stmts      stmtCache
 	rc         readCache
 	bearers    grantCache
+	// liveReads shares long-poll reads of a namespace log among their
+	// waiters (live.go), and liveDone keeps their recent answers;
+	// liveJoins counts the reads asked of them, and liveShared those made.
+	liveReads  singleflight.Group
+	liveDone   liveDone
+	liveJoins  atomic.Int64
+	liveShared atomic.Int64
 	stop       chan struct{}
 	bg         sync.WaitGroup
 	closeOnce  sync.Once
@@ -277,9 +296,21 @@ func Open(opt Options) (*Engine, error) {
 	}
 	if opt.Limits == (Limits{}) {
 		opt.Limits = DefaultLimits()
+		if opt.Maximums == (Limits{}) {
+			opt.Maximums = DefaultMaximums()
+		}
 	}
 	if opt.HeadSnapshotMax == 0 {
 		opt.HeadSnapshotMax = 16 << 10
+	}
+	if opt.GrantCacheEntries <= 0 {
+		opt.GrantCacheEntries = defaultGrantCacheEntries
+	}
+	if opt.DocCacheBytes <= 0 {
+		opt.DocCacheBytes = defaultDocCacheBytes
+	}
+	if opt.ReadCacheBytes <= 0 {
+		opt.ReadCacheBytes = defaultReadCacheBytes
 	}
 	if opt.SnapshotEveryRevisions == 0 {
 		opt.SnapshotEveryRevisions = 100
@@ -348,13 +379,15 @@ func Open(opt Options) (*Engine, error) {
 		validator:  schema.NewValidator(),
 		hub:        newHub(),
 		rate:       newRateLimiter(),
-		docs:       newDocCache(4096),
+		docs:       newDocCache(opt.DocCacheBytes),
 		schemaDocs: newParsedCache(4096),
 		deks:       newDEKCache(4096),
 		cfgCache:   map[int64]*Config{},
 		stop:       make(chan struct{}),
 		started:    opt.Now().UTC(),
 	}
+	e.rc.maxBytes = opt.ReadCacheBytes
+	e.bearers.lru.MaxEntries, e.bearers.lru.MaxBytes = opt.GrantCacheEntries, maxGrantCacheBytes
 	if err := e.checkKeyStore(); err != nil {
 		db.Close()
 		return nil, err
@@ -1270,13 +1303,26 @@ func formatTime(ms int64) string {
 
 // docCache caches documents by revision id: an id determines its document
 // everywhere (§3.3). Values are canonical bytes.
+// docCache keeps canonical documents by revision id, bounded by their
+// total size (Options.DocCacheBytes) as well as their number, evicting the
+// least recently used: a count alone let 4,096 documents of 4 MiB hold
+// 16 GiB.
 type docCache struct {
 	mu  sync.Mutex
-	max int
-	m   map[ids.ID][]byte
+	lru lru.Cache[ids.ID, []byte]
 }
 
-func newDocCache(max int) *docCache { return &docCache{max: max, m: map[ids.ID][]byte{}} }
+// maxDocCacheEntries bounds the documents kept whatever their size, for
+// the map's own overhead; defaultDocCacheBytes is Options.DocCacheBytes'
+// default.
+const (
+	maxDocCacheEntries   = 1 << 20
+	defaultDocCacheBytes = 256 << 20
+)
+
+func newDocCache(bytes int) *docCache {
+	return &docCache{lru: lru.Cache[ids.ID, []byte]{MaxEntries: maxDocCacheEntries, MaxBytes: bytes}}
+}
 
 // parsedCache keeps parsed schema revisions by id (schemaRevIn), shared and
 // never modified: writes typed by the same schemas parse them once.
@@ -1318,22 +1364,13 @@ func (c *parsedCache) put(id ids.ID, v any) {
 func (c *docCache) get(id ids.ID) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	b, ok := c.m[id]
-	return b, ok
+	return c.lru.Get(id)
 }
 
 func (c *docCache) put(id ids.ID, b []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(c.m) >= c.max {
-		for k := range c.m { // random eviction
-			delete(c.m, k)
-			if len(c.m) < c.max*3/4 {
-				break
-			}
-		}
-	}
-	c.m[id] = b
+	c.lru.Put(id, b, len(b))
 }
 
 // cacheDoc caches a document by revision id: at once in a read transaction,
@@ -1349,7 +1386,7 @@ func (t *tx) cacheDoc(id ids.ID, doc []byte) {
 
 func (c *docCache) flush() {
 	c.mu.Lock()
-	c.m = map[ids.ID][]byte{}
+	c.lru.Flush()
 	c.mu.Unlock()
 }
 

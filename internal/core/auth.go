@@ -11,6 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/rules"
 )
 
@@ -109,40 +110,44 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 // memory. A decoded grant can be several times larger than its token (an
 // 8 KiB token of empty JSON arrays decodes to about 100 KB), so the cache
 // is bounded by the total length of its tokens as well as by their number.
+// It keeps the most recently used: a fleet of devices each polling with a
+// grant of its own (docs/CAPACITY.md) keeps its working set verified,
+// where a cache that started over when full verified every request once
+// the fleet outgrew it.
 type grantCache struct {
-	mu    sync.Mutex
-	m     map[string]*grant.Grant
-	bytes int // the total length of the tokens in m
+	mu  sync.Mutex
+	lru lru.Cache[string, *grant.Grant] // cost: the token's length
 }
 
-// Past either bound the cache starts over.
+// The bounds by default (Options.GrantCacheEntries): typical tokens are a
+// few hundred bytes, so 65,536 grants, and at most 32 MiB of tokens.
 const (
-	maxGrantCacheEntries = 1024
-	maxGrantCacheBytes   = 1 << 20
+	defaultGrantCacheEntries = 1 << 16
+	maxGrantCacheBytes       = 32 << 20
 )
 
 // get returns the verified grant of token, or nil.
 func (c *grantCache) get(token string) *grant.Grant {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.m[token]
+	g, _ := c.lru.Get(token)
+	return g
 }
 
 // put keeps g, decoded from token, if its signature chain has verified.
 func (c *grantCache) put(token string, g *grant.Grant) {
-	if !g.ChainVerified() || len(token) > maxGrantCacheBytes {
+	if !g.ChainVerified() {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if _, ok := c.m[token]; ok {
+	if c.lru.MaxEntries == 0 {
+		c.lru.MaxEntries, c.lru.MaxBytes = defaultGrantCacheEntries, maxGrantCacheBytes
+	}
+	if _, ok := c.lru.Get(token); ok {
 		return
 	}
-	if c.m == nil || len(c.m) >= maxGrantCacheEntries || c.bytes+len(token) > maxGrantCacheBytes {
-		c.m, c.bytes = map[string]*grant.Grant{}, 0
-	}
-	c.m[token] = g
-	c.bytes += len(token)
+	c.lru.Put(token, g, len(token))
 }
 
 func nsNotNamed(ns string) *Error {
@@ -627,15 +632,35 @@ func refersToResource(rs []any) bool {
 	return false
 }
 
-// rateLimiter holds the token buckets of §6.6.
+// rateLimiter holds the token buckets of §6.6: one per namespace, per
+// principal, per (namespace, resource, principal) written, and so on. A
+// bucket that has refilled to its burst is the same as one never drawn on
+// (admit creates them full), so sweep drops those, at most once a minute
+// once there are many: buckets were never dropped, and memory grew with
+// every resource and principal written until restart.
 type rateLimiter struct {
-	mu sync.Mutex
-	b  map[string]*bucket
+	mu    sync.Mutex
+	b     map[string]*bucket
+	swept time.Time
 }
 
 type bucket struct {
 	tokens float64
 	last   time.Time
+	rate   Rate // the rate last drawn under, for sweep
+}
+
+// sweepAbove is how many buckets there are before admit sweeps.
+const sweepAbove = 1024
+
+// sweep drops the buckets that have refilled to their burst by now.
+func (rl *rateLimiter) sweep(now time.Time) {
+	for k, b := range rl.b {
+		if b.rate.Rate > 0 && b.tokens+now.Sub(b.last).Seconds()*b.rate.Rate >= b.rate.Burst {
+			delete(rl.b, k)
+		}
+	}
+	rl.swept = now
 }
 
 // refill adds what a bucket refilled since it was last drawn on, up to its
@@ -663,6 +688,9 @@ type draw struct {
 func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, string, bool) {
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
+	if len(rl.b) > sweepAbove && now.Sub(rl.swept) > time.Minute {
+		rl.sweep(now)
+	}
 	var wait time.Duration
 	var hit string
 	bs := make([]*bucket, len(draws))
@@ -672,6 +700,7 @@ func (rl *rateLimiter) admit(now time.Time, draws []draw) (time.Duration, string
 			b = &bucket{tokens: d.rate.Burst, last: now}
 			rl.b[d.key] = b
 		}
+		b.rate = d.rate
 		b.refill(now, d.rate)
 		bs[i] = b
 		if b.tokens < 1 {
@@ -763,6 +792,7 @@ func (rl *rateLimiter) charge(now time.Time, d draw) {
 		b = &bucket{tokens: d.rate.Burst, last: now}
 		rl.b[d.key] = b
 	}
+	b.rate = d.rate
 	b.refill(now, d.rate)
 	b.tokens -= d.cost
 }

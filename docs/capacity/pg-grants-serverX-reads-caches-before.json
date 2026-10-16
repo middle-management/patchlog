@@ -1,0 +1,99 @@
+{
+  "heads_page_random": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 227.048,
+    "n": 2000,
+    "p50_ms": 94.927,
+    "p95_ms": 151.491,
+    "p99_ms": 183.952,
+    "per_second": 81.01519719408333
+  },
+  "ns_log_page_random": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 5689.825,
+    "n": 2000,
+    "p50_ms": 74.93,
+    "p95_ms": 139.254,
+    "p99_ms": 187.385,
+    "per_second": 95.99943418855084
+  },
+  "origin_vmhwm_mb": 1464.2890625,
+  "origin_vmrss_mb": 92.31640625,
+  "profile": "grants",
+  "read_head_doc": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 40.908,
+    "n": 2000,
+    "p50_ms": 5.665,
+    "p95_ms": 10.881,
+    "p99_ms": 16.094,
+    "per_second": 1274.148655978688
+  },
+  "read_head_doc_cached_grants": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 42.616,
+    "n": 2000,
+    "p50_ms": 3.967,
+    "p95_ms": 6.817,
+    "p99_ms": 8.643,
+    "per_second": 1866.0178246519715
+  },
+  "read_head_doc_fleet_warm": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 22.884,
+    "n": 2000,
+    "p50_ms": 4.878,
+    "p95_ms": 9.948,
+    "p99_ms": 13.83,
+    "per_second": 1486.774918912058
+  },
+  "read_head_pointer": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 18.334,
+    "n": 2000,
+    "p50_ms": 3.062,
+    "p95_ms": 6.061,
+    "p99_ms": 9,
+    "per_second": 2368.6053011397585
+  },
+  "read_old_revision": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 32.666,
+    "n": 2000,
+    "p50_ms": 12.327,
+    "p95_ms": 19.104,
+    "p99_ms": 24.08,
+    "per_second": 618.7718419402338
+  },
+  "read_small_ns_doc": {
+    "concurrency": 8,
+    "errors": 0,
+    "max_ms": 29.811,
+    "n": 2000,
+    "p50_ms": 9.099,
+    "p95_ms": 16.002,
+    "p99_ms": 20.751,
+    "per_second": 830.077422433494
+  },
+  "scan_heads": {
+    "pages": 1000,
+    "resources": 1000000,
+    "resources_per_second": 31289.880426160948,
+    "seconds": 31.959214493
+  },
+  "scan_log": {
+    "entries": 4025081,
+    "entries_per_second": 37111.283382547044,
+    "pages": 4026,
+    "resource_entries": 5104001,
+    "seconds": 108.459762992
+  },
+  "total_seconds": 199.474347023
+}

@@ -1607,8 +1607,13 @@ func (s *Server) nsLive(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(302)
 		return
 	}
+	// The request's read check, while it holds, stands for its later
+	// reads, which are then shared with the other waiters (core/live.go).
+	var pass *core.LivePass
 	s.longPoll(w, r, ns, "X-Namespace-Revision", []string{"ns:" + ns}, func(ctx context.Context, since string) (*core.Log, error) {
-		return s.e.NamespaceLog(ctx, ns, "", since, lim, creds(r))
+		lg, p, err := s.e.NamespaceLiveLog(ctx, ns, since, lim, creds(r), pass)
+		pass = p
+		return lg, err
 	})
 }
 

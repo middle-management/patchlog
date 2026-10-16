@@ -533,7 +533,7 @@ func (e *Engine) NamespaceRev(ctx context.Context, ns, nsID string, cred Credent
 // namespace the answer is one JWE for the page actually served, pl.range
 // [since, Last] (§E.2.2), and once it is purged, 410 purged (§8.5).
 func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials) (*Log, error) {
-	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false, "")
+	return e.namespaceLog(ctx, ns, nsID, since, limit, cred, false, "", nil)
 }
 
 // NamespaceEvents is NamespaceLog from the current head for event streams,
@@ -541,7 +541,7 @@ func (e *Engine) NamespaceLog(ctx context.Context, ns, nsID, since string, limit
 // sealed namespace each entry is sealed on its own, as the range (prev, id]
 // (EntryJWEs).
 func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit int, cred Credentials) (*Log, error) {
-	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, "")
+	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, "", nil)
 }
 
 // ResourceEvents is NamespaceEvents for the event stream of resource name
@@ -551,24 +551,35 @@ func (e *Engine) NamespaceEvents(ctx context.Context, ns, since string, limit in
 // the whole page. With since "" it answers no entries and Last the
 // namespace head, where the stream starts following.
 func (e *Engine) ResourceEvents(ctx context.Context, ns, name, since string, limit int, cred Credentials) (*Log, error) {
-	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name)
+	return e.namespaceLog(ctx, ns, "", since, limit, cred, true, name, nil)
 }
 
-func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool, resource string) (*Log, error) {
+func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit int, cred Credentials, perEntry bool, resource string, live *liveRead) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
 	var nsRowID int64
 	err := e.read(ctx, func(t *tx) error {
 		n := t.nsByName(ns)
-		if n == nil {
+		switch {
+		case live != nil && live.shared:
+			// The waiters' passes stand for their read checks (live.go).
+			if n == nil {
+				return errNotShared
+			}
+		case n == nil:
 			return t.absentNS(ns, cred)
-		}
-		if resource != "" {
+		case resource != "":
 			if _, err := t.reader(n, cred, resource); err != nil {
 				return err
 			}
-		} else if _, err := t.nsReader(n, cred); err != nil {
-			return err
+		default:
+			a, err := t.nsReader(n, cred)
+			if err != nil {
+				return err
+			}
+			if live != nil {
+				live.decided(t, n, cred, a)
+			}
 		}
 		// Every range, page and event, before the 404 of an id or since
 		// not in the chain (§8.5).
@@ -618,11 +629,27 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 			grantID []byte
 			noAuth  sql.NullInt64
 			meta    sql.NullString
+			m       map[string]any // body, parsed
 		}
+		// A page holds at most limit entries, and at most limit resource
+		// entries, a batch entry counting as its items (it carries them):
+		// it ends before an entry that would take it past, though it
+		// always holds one. Without that, a page of 1,000 batch entries of
+		// 1,000 items each held a million.
 		var rs []raw
+		units := 0
 		for rows.Next() {
 			var r raw
 			t.must(rows.Scan(&r.seq, &r.id, &r.prev, &r.body, &r.author, &r.created, &r.grantID, &r.noAuth, &r.meta))
+			r.m = jsonv.MustParse([]byte(r.body)).(map[string]any)
+			u := 1
+			if es, ok := r.m["entries"].([]any); ok && len(es) > 1 {
+				u = len(es)
+			}
+			if limit > 0 && len(rs) > 0 && units+u > limit {
+				break
+			}
+			units += u
 			rs = append(rs, r)
 		}
 		rows.Close()
@@ -632,7 +659,7 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 		// first entry's: a query for each made a page N+1.
 		pageIDs := make(map[int64]string, len(rs))
 		for _, r := range rs {
-			m := jsonv.MustParse([]byte(r.body)).(map[string]any)
+			m := r.m
 			m["id"] = ids.FromBytes(r.id).String()
 			pageIDs[r.seq] = m["id"].(string)
 			if r.prev != nil {

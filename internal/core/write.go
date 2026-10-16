@@ -1420,8 +1420,9 @@ func (t *tx) validateDoc(doc any, sc *schemaCtx, pending map[string]any) (string
 	}
 	s, _ := sv.(string)
 	load := func(ref schema.Ref) (any, error) { return t.loadSchema(ref, sc, pending) }
-	// The validator caches compiled schemas forever, so availability and
-	// read permission are checked here for the whole $ref closure.
+	// The validator keeps compiled schemas across writes and writers, so
+	// availability and read permission are checked here for the whole
+	// $ref closure.
 	// A schema document (a dialect $schema) starts the closure at its own
 	// $refs, so a cached revision the writer may not read is still refused,
 	// and the error names the revision that didn't resolve, not the dialect.

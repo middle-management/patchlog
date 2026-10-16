@@ -791,7 +791,7 @@ func (j *Janitor) Run(ctx context.Context) error {
 	}
 	wake := make(chan struct{}, 1)
 	h := follow.HandlerFunc(func(_ context.Context, b *follow.Batch) error {
-		cp.Save(b.Origin, b.NS, b.NewCheckpoint)
+		cp.SaveBatch(b.Origin, b.NS, b)
 		select {
 		case wake <- struct{}{}:
 		default:

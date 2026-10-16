@@ -1,5 +1,73 @@
 # Changelog
 
+## Unreleased
+
+**Changes to check before upgrading:**
+- **`documentSize` defaults to 1 MiB** (was §6.6's 4 MiB), measured in
+  [docs/CAPACITY.md](docs/CAPACITY.md): an append re-serialises and validates the whole
+  document, 3–4 times slower at 3.5 MiB than at 16 KiB. 4 MiB stays the deployment maximum
+  (`serve -max-document-size` changes it), and a namespace may set `limits.documentSize` up to
+  it. **In namespaces holding documents over 1 MiB, appends to them are `413` until the
+  namespace sets `documentSize`** (or the deployment runs with `serve -document-size 4MiB`, the
+  old default). Bundle imports and remote branches of such documents need the same.
+- **New indexes on the namespace log** (`ns_log_ns_seq` on `(ns, seq)`, `ns_log_ns_config` on
+  `(ns, config_seq, seq)`), built on the first start, on SQLite and Postgres. On Postgres the
+  build runs in the schema migration and blocks writes until it commits, a few seconds per 5
+  million namespace entries; to avoid that, create them beforehand with
+  `CREATE INDEX CONCURRENTLY` under the same names (see the README's Postgres section).
+
+**Improvements:**
+- **Long-polls of a namespace share their reads** (§7.7, README design notes): a write woke every
+  waiting long-poll, and each read the log again in a transaction of its own, so a private
+  namespace followed by thousands of devices (which a CDN can't collapse without verifying edge
+  grants) cost a transaction and a log query per follower per write. A long-poll's read check now
+  stands for its later reads while the configuration and its grant are unchanged and its rules
+  don't read `/now`, and those reads are shared by the waiters woken by the same commit. One
+  write to 5,000 private followers: 3.7–4.1 s of core CPU before, 0.3–1 s now, delivered in
+  0.35–0.7 s instead of 3.1 s (docs/CAPACITY.md).
+- **The local CDN's VCL** lets long-polls with credentials (`Authorization` or cookies) skip
+  Varnish's waiting list: a private namespace's long-poll was held behind an identical one in
+  flight until the next write, then sent to the origin with the rest a few at a time. Identical
+  long-poll misses without credentials (devices following a public namespace) still collapse.
+
+- **Caches bounded by bytes, evicting gradually** (README design notes): the bearer grant cache
+  keeps 65,536 verified grants (was 1,024, emptied when full, so a fleet of devices with grants
+  of their own verified on nearly every request), the least recently used out first
+  (`serve -grant-cache`); the document cache 256 MiB (was 4,096 documents, up to 16 GiB of
+  4 MiB ones; `serve -doc-cache-size`); the read cache 64 MiB, now evicting a quarter rather
+  than everything when full (`serve -read-cache-size`). Compiled schemas, kept forever before,
+  are the 512 most recently used (and 2,048 schema documents), and rate-limit buckets, one per
+  resource and principal written and never dropped before, are swept once refilled.
+
+- **Namespace log pages bound items too**: a page holds at most the log page size in resource
+  entries as well as in entries, a batch entry counting as its items (it carries them), ending
+  before an entry that would take it past and always holding one. A page of 1,000 batch entries
+  of 1,000 items held a million. Ranges, long-polls and event streams' catch-up; readers follow
+  `X-Log-Next` as before.
+
+**Fixes:**
+- **Namespace log pages in long namespaces:** a page (ranges, long-polls, event streams) had no
+  index to read a namespace's entries in order, so Postgres could read the whole namespace and
+  sort it for every page, and SQLite did: O(namespace) per page rather than O(page). With
+  `(ns, seq)` it reads the page's rows (a page of a 5,000-entry namespace among 5 million
+  entries: 3.7 ms to 0.35 ms on Postgres).
+- **Idempotent retries of config writes and batches with a config change** looked up the
+  first namespace entry under a configuration by scanning all of `ns_log` (about 400 ms at 5
+  million entries, growing with the table); `(ns, config_seq, seq)` makes it one index probe.
+- **Snapshot bootstraps of large namespaces** (`follow.WithSnapshot`, new branches followed by
+  the index, the janitor and release previews): the follower read the whole `/heads` listing
+  into memory and delivered it as one batch, which a consumer applied in one transaction with a
+  document fetch per resource before anything was recorded, so a namespace of millions of
+  resources needed memory for all of them and an interruption started over. The listing now
+  comes a page per batch (`Batch.After`, `More`; `Replaces` for the first page, `Partial` for
+  every page but the last), the checkpoint with the last page. `SQLCheckpoints.SaveBatch` (and
+  `MemoryCheckpoints.SaveBatch`) record the pages in between in a table of their own
+  (`checkpoints_bootstrap`, created by `Init`), and a follower restarted meanwhile resumes after
+  the last page recorded (`Resumer`), or starts again from the first page if the origin no
+  longer lists from there. The index serves the namespace only once the last page is applied,
+  as before; the tree service holds the pages and applies the listing whole at its last page,
+  since its listings are cached by checkpoint.
+
 ## v0.20.1
 
 **Changes to check before upgrading:**

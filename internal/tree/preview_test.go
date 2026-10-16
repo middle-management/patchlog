@@ -17,8 +17,9 @@ import (
 // TestPreviewFollowsRelease: a long-running preview follows the release
 // document's log (§B.5, §10), so a revision listing other branches (a
 // rebase's successors) takes effect without a restart.
-func TestPreviewFollowsRelease(t *testing.T) {
-	t.Parallel()
+func TestPreviewFollowsRelease(t *testing.T) { t.Parallel(); testPreviewFollowsRelease(t) }
+
+func testPreviewFollowsRelease(t *testing.T) {
 	w := setup(t)
 	ctx := context.Background()
 	w.seed(t)
