@@ -616,8 +616,10 @@ func TestMinAndStale(t *testing.T) {
 		t.Fatalf("ns:min: %d %v", r.status, r.header)
 	}
 
-	// Stale ns_id: 302 to the current checkpoint.
-	cur := s.ix.Checkpoint("matches")
+	// Stale ns_id: 302 to the current checkpoint. min waited for the
+	// commit, which redirects go by; Checkpoint follows it just after
+	// (Index.Apply), so wait until it has too.
+	cur := s.caughtUp("matches")
 	r = s.raw("/matches/at/"+first+"?q=derby", "")
 	if r.status != 302 || r.header.Get("Location") != "/matches/at/"+cur+"?q=derby" {
 		t.Fatalf("stale: %d %s", r.status, r.header.Get("Location"))
@@ -683,7 +685,14 @@ func TestMinSeveralNamespaces(t *testing.T) {
 	ctx := context.Background()
 	w := setup(t)
 	must(w.c.CreateNamespace(ctx, "fixtures", map[string]any{"read": "public"}))
-	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "fixtures"}, minWait: 30 * time.Second})
+	// fixtures' documents are fetched late, so its write is applied after
+	// matches' (an untyped document, it would usually go first): the check
+	// below then tells whether the wait covered fixtures, not the order the
+	// two were applied in. The delay only sharpens the check: if matches
+	// is applied slower than that, a wait that skipped fixtures may pass
+	// it, but a correct wait never fails it.
+	rf := &revFetches{prefix: "/r/fixtures/", delay: 500 * time.Millisecond, rt: transport, paths: map[string]int{}}
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches", "fixtures"}, minWait: 30 * time.Second, hc: &http.Client{Transport: rf}})
 	s.caughtUp("matches")
 	s.caughtUp("fixtures")
 	a := w.doc(t, "derby", w.match, map[string]any{"title": "The Derby"})
@@ -692,8 +701,10 @@ func TestMinSeveralNamespaces(t *testing.T) {
 	if r.status != 302 {
 		t.Fatalf("min over two namespaces: %d %v", r.status, r.body)
 	}
-	if s.ix.Checkpoint("fixtures") != b.NSID {
-		t.Errorf("fixtures checkpoint %s, want %s", s.ix.Checkpoint("fixtures"), b.NSID)
+	// The wait covered fixtures too: what it waits for is committed with
+	// the checkpoint, which Checkpoint follows just after (Index.Apply).
+	if got := s.ix.Committed("fixtures"); got != b.NSID {
+		t.Errorf("fixtures checkpoint %s, want %s", got, b.NSID)
 	}
 	s.expect(r.header.Get("Location"), "derby")
 

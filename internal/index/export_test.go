@@ -1,5 +1,7 @@
 package index
 
+import "context"
+
 // SealedViews returns the stored sealed results, view → Cache-Tag (tests).
 func (ix *Index) SealedViews() map[string]string {
 	rows, err := ix.db.Query(`SELECT view, tags FROM sealed_views`)
@@ -51,4 +53,17 @@ func (ix *Index) Pragma(name string) string {
 		panic(err)
 	}
 	return v
+}
+
+// Committed returns the checkpoint of ns the database holds ("" if none),
+// which redirects go by (tests). Checkpoint, the one in memory, follows
+// it just after each commit (Index.Apply), so a ?min= wait, which ends
+// once min is in the seen rows committed with it, can end before
+// Checkpoint has moved.
+func (ix *Index) Committed(ns string) string {
+	id, err := ix.committed(context.Background(), ns)
+	if err != nil {
+		panic(err)
+	}
+	return id
 }
