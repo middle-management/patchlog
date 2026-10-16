@@ -75,6 +75,12 @@
   longer lists from there. The index serves the namespace only once the last page is applied,
   as before; the tree service holds the pages and applies the listing whole at its last page,
   since its listings are cached by checkpoint.
+- **A purged namespace in the index right after its purge** (§8.5, §12): between committing a
+  purge-ns and publishing it in memory, the index decided whether the namespace was purged from
+  memory but redirected by the committed checkpoint, so its head pointer sent readers to
+  `/{ns}/at/{purge-ns}`, which answered an empty `200` cached as immutable and tagged `idx:{ns}`
+  after that tag's purge had gone out, and `/_refs` still covered the namespace. Both now go by
+  the committed state, so the namespace is `410 purged` at every URL from the commit on.
 - **SQLite database paths with `#`, `?` or `%`:** the core, the index and the tree/catalog
   services built SQLite connection strings by appending the path unescaped, so SQLite cut it at
   `#` or `?` and decoded `%XX` in it, a `?` also cost the database its WAL journal mode, and a
