@@ -11,6 +11,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/tree"
 )
@@ -111,7 +112,8 @@ func TestSealedPurged(t *testing.T) {
 // purged namespace it never saw as missing, changes listings at an
 // unchanged checkpoint, which cached listings take never to go stale. So
 // it purges every listing of the catalog (ns:{catalog}), stored sealed
-// ones too. A start without drift purges nothing.
+// ones too, and queues its second purge with the fix (package repurge).
+// A start without drift purges nothing.
 func TestReloadDriftPurges(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -189,6 +191,11 @@ func TestReloadDriftPurges(t *testing.T) {
 	if p := purges(z); !reflect.DeepEqual(p, [][]string{{"ns:cat"}}) {
 		t.Errorf("a start with drift purged %v, want ns:cat", p)
 	}
+	// Queued after the second purge of sec's purge-ns.
+	queued := [][]string{{"ns:sec", "rs:cat"}, {"ns:cat"}}
+	if q := z.s.QueuedRepurges(); !reflect.DeepEqual(q, queued) {
+		t.Errorf("second purges queued %v, want %v", q, queued)
+	}
 	z.s.View(func(g *tree.Graph, _ map[string]string) {
 		if n := g.Node("sec.never"); n == nil || n.Dangling != "purged" {
 			t.Errorf("the placement of sec.never: %+v", n)
@@ -197,5 +204,13 @@ func TestReloadDriftPurges(t *testing.T) {
 	z.stop()
 	if n := stored(); n != 0 {
 		t.Errorf("%d stored sealed listings after a start with drift", n)
+	}
+
+	// The next start sends them once due, and nothing else.
+	a := startSvc(t, sc, svcOpts{now: s.Now, db: path}, func(o *tree.Options) { o.RepurgeInterval = time.Millisecond })
+	s.Clock.Advance(repurge.DefaultDelay)
+	waitFor(t, "the second purges", func() bool { return len(a.s.QueuedRepurges()) == 0 })
+	if p := purges(a); !reflect.DeepEqual(p, queued) {
+		t.Errorf("the next start purged %v, want %v", p, queued)
 	}
 }

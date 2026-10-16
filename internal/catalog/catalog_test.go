@@ -70,6 +70,9 @@ type world struct {
 	// exchangeRate is its exchangeRate bucket (tree.Options).
 	edgeOwnKey   bool
 	exchangeRate tree.Rate
+	// repurgeDelay and repurgeInterval are the service's second CDN
+	// purge (tree.Options), if set before start.
+	repurgeDelay, repurgeInterval time.Duration
 	// purges are the cache tags the service purged, in order.
 	pmu    sync.Mutex
 	purges [][]string
@@ -218,7 +221,8 @@ func (w *world) start() {
 		Tree: tree.Options{Client: w.svcClient, Catalog: "cat", DB: w.db, Now: w.s.Now, CheckerTTL: time.Millisecond,
 			Logf:          func(f string, a ...any) { w.t.Logf(f, a...) },
 			FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
-			EdgeGrants:    w.edgeGrants, Edge: w.edge, EdgeGrantsOwnKey: w.edgeOwnKey, ExchangeRate: w.exchangeRate, Purger: w},
+			EdgeGrants:    w.edgeGrants, Edge: w.edge, EdgeGrantsOwnKey: w.edgeOwnKey, ExchangeRate: w.exchangeRate, Purger: w,
+			RepurgeDelay: w.repurgeDelay, RepurgeInterval: w.repurgeInterval},
 		Key: w.cat.Priv, Kid: "catalog-01",
 		MergeKey: w.mergeKey.Priv, MergeKid: "catalog-merge", MergeService: "svc:merge",
 	})

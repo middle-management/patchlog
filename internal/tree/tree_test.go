@@ -68,7 +68,7 @@ type svcOpts struct {
 	edge        *edge.Verifier
 }
 
-func startSvc(t *testing.T, core *client.Client, o svcOpts) *svc {
+func startSvc(t *testing.T, core *client.Client, o svcOpts, mods ...func(*tree.Options)) *svc {
 	t.Helper()
 	if o.catalog == "" {
 		o.catalog = "cat"
@@ -80,9 +80,15 @@ func startSvc(t *testing.T, core *client.Client, o svcOpts) *svc {
 	opt := tree.Options{
 		Client: core, Catalog: o.catalog, DB: o.db, SelfPlacing: o.selfPlacing, Purger: s, Now: o.now, Edge: o.edge,
 		CheckerTTL: time.Millisecond, MinWait: 30 * time.Second,
-		Logf:          func(f string, a ...any) { t.Logf(f, a...) },
-		OnApply:       func(b *follow.Batch) { s.mu.Lock(); s.nbatch++; s.mu.Unlock() },
-		FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
+		// Second purges are queued but not sent unless a test turns the
+		// loop on (repurge_test.go): the purges tests count are first ones.
+		RepurgeInterval: -1,
+		Logf:            func(f string, a ...any) { t.Logf(f, a...) },
+		OnApply:         func(b *follow.Batch) { s.mu.Lock(); s.nbatch++; s.mu.Unlock() },
+		FollowOptions:   []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
+	}
+	for _, m := range mods {
+		m(&opt)
 	}
 	s.s = must(tree.Open(context.Background(), opt))
 	s.http = httptest.NewServer(s.s.Handler())

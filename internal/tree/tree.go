@@ -64,6 +64,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/pointer"
+	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
@@ -114,6 +115,15 @@ type Options struct {
 	CheckerTTL time.Duration
 	// Purger receives cache-tag purges (default: log).
 	Purger Purger
+	// RepurgeDelay is how long after a cache-tag purge it is sent again,
+	// queued with the transaction that commits it (package repurge, D.8,
+	// as the core's RepurgeDelay): longer than a response under way at
+	// the commit can take to reach the CDN. Zero means two minutes
+	// (repurge.DefaultDelay); negative disables the second purge.
+	RepurgeDelay time.Duration
+	// RepurgeInterval is how often second purges that are due are sent.
+	// Zero means ten seconds; negative disables the loop.
+	RepurgeInterval time.Duration
 	// Edge is the verifying edge in front of the service (§9): private
 	// listings get edge lifetimes only when it verified the read itself,
 	// carrying its secret and a prefix covering the URL and no other
@@ -173,6 +183,7 @@ type Service struct {
 	keys    *derived.Keys  // encryption of followed namespaces
 	sealed  *derived.Cache // sealed listings
 	kept    *kept.Store    // listings kept past their at
+	repurge *repurge.Queue // second CDN purges
 
 	amu sync.Mutex
 	ats map[string]atRecord // the checkpoints behind the ats of kept listings (atIncludes)
@@ -277,6 +288,8 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		cur:     map[string]string{}, purged: map[string]time.Time{}, changed: make(chan struct{}),
 		running: map[string]context.CancelFunc{},
 	}
+	s.repurge = repurge.New(db, opt.Purger, repurge.Options{Delay: opt.RepurgeDelay, Interval: opt.RepurgeInterval,
+		Now: opt.Now, Lock: &s.wmu, Name: "tree", Logf: opt.Logf})
 	if opt.EdgeGrants != nil {
 		opt.EdgeGrants.Vouches = func(p string) bool { _, ok := s.edgeGS(p); return ok }
 	}
@@ -284,6 +297,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		db.Close()
 		return nil, err
 	}
+	s.repurge.Start()
 	return s, nil
 }
 
@@ -314,6 +328,9 @@ func (s *Service) init(ctx context.Context) error {
 		}
 	}
 	if err := s.sealed.Init(ctx); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
+	}
+	if err := repurge.Init(ctx, s.db); err != nil {
 		return fmt.Errorf("tree: schema: %w", err)
 	}
 	if s.opt.Hook != nil {
@@ -408,6 +425,10 @@ func (s *Service) reload(ctx context.Context) error {
 	if err := s.sealed.Purge(ctx, tx, tags); err != nil {
 		return err
 	}
+	// The second purge, durable with the commit (package repurge).
+	if err := s.repurge.Add(ctx, tx, tags); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return err
 	}
@@ -419,8 +440,11 @@ func (s *Service) reload(ctx context.Context) error {
 	return nil
 }
 
-// Close closes the database.
-func (s *Service) Close() error { return s.db.Close() }
+// Close stops sending second purges and closes the database.
+func (s *Service) Close() error {
+	s.repurge.Close()
+	return s.db.Close()
+}
 
 // actual is the namespace followed for ns: its branch in a release preview
 // (Options.Branches), otherwise ns.
@@ -725,21 +749,6 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		s.mu.Unlock()
 		return err
 	}
-	// A namespace the catalog no longer trusts leaves every cached listing
-	// of the catalog (ns:{catalog}, which every listing carries), with
-	// edge grants: a g/all cookie issued from now on isn't checked against
-	// it, and an edge serves the g/all listings it holds to every g/all
-	// cookie (§B.11.5). Not ns:{ns}, which would evict all every service
-	// caches of the namespace. Should the purge not land, their edge
-	// lifetime is capped (cdnAll).
-	if s.opt.EdgeGrants != nil {
-		for ns := range oldTrust {
-			if !s.g.Trust[ns] {
-				res.tags = append(res.tags, "ns:"+s.actual(s.opt.Catalog))
-				break
-			}
-		}
-	}
 	// Purge before the new checkpoint is out, so nobody who learns of it
 	// can still be served what it removed. Purgers don't block. Kept
 	// listings go first: one read before it that carries a tag it purges
@@ -827,6 +836,7 @@ type applyResult struct {
 func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc, retitle map[[2]string]string) (*applyResult, error) {
 	g := s.g
 	cat := s.opt.Catalog
+	oldTrust := g.Trust // setConfig replaces it
 	res := &applyResult{}
 	changed := map[string]bool{}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -1038,6 +1048,26 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 	}
 	// Stored sealed listings go by the same tags as cached copies.
 	if err := s.sealed.Purge(ctx, tx, res.tags); err != nil {
+		return nil, err
+	}
+	// A namespace the catalog no longer trusts leaves every cached listing
+	// of the catalog (ns:{catalog}, which every listing carries), with
+	// edge grants: a g/all cookie issued from now on isn't checked against
+	// it, and an edge serves the g/all listings it holds to every g/all
+	// cookie (§B.11.5). Not ns:{ns}, which would evict all every service
+	// caches of the namespace. Should the purge not land, their edge
+	// lifetime is capped (cdnAll).
+	if s.opt.EdgeGrants != nil {
+		for ns := range oldTrust {
+			if !g.Trust[ns] {
+				res.tags = append(res.tags, "ns:"+s.actual(cat))
+				break
+			}
+		}
+	}
+	// The second purge, durable with the commit (package repurge): a read
+	// before the commit may reach the CDN after the first.
+	if err := s.repurge.Add(ctx, tx, res.tags); err != nil {
 		return nil, err
 	}
 	if err := s.cps.SaveBatch(ctx, tx, b.Origin, s.actual(b.NS), b); err != nil {

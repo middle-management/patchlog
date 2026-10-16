@@ -34,6 +34,7 @@ import (
 //	edge_subjects(gs, subjects, exp) the subjects of each subject set the service minted edge
 //	                                 grants for, until the last of them expires (edgegrants.go);
 //	                                 meta "trusted:{ns}" is when it came to trust ns
+//	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
 var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
 	`CREATE INDEX IF NOT EXISTS seen_by_id ON seen (ns_id)`,
