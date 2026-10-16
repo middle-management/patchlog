@@ -90,9 +90,12 @@ func startSvcWith(t *testing.T, core *client.Client, o svcOpts, mods ...func(*in
 	opt := index.Options{
 		Client: core, DB: o.db, Namespaces: o.ns, UntypedListing: o.untyped, Rebuild: o.rebuild, Branches: o.branches, NoFTS: o.noFTS,
 		MinWait: o.minWait, Purger: s, Now: o.now, CheckerTTL: time.Millisecond,
-		Logf:          func(f string, a ...any) { t.Logf(f, a...) },
-		OnApply:       func(b *follow.Batch) { s.mu.Lock(); s.batch = append(s.batch, b); s.mu.Unlock() },
-		FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
+		// Second purges are queued but not sent unless a test turns the
+		// loop on (repurge_test.go): the purges tests count are first ones.
+		RepurgeInterval: -1,
+		Logf:            func(f string, a ...any) { t.Logf(f, a...) },
+		OnApply:         func(b *follow.Batch) { s.mu.Lock(); s.batch = append(s.batch, b); s.mu.Unlock() },
+		FollowOptions:   []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)},
 	}
 	for _, m := range mods {
 		m(&opt)

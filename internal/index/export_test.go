@@ -67,3 +67,16 @@ func (ix *Index) Committed(ns string) string {
 	}
 	return id
 }
+
+// Repurge sends the second purges that are due (tests).
+func (ix *Index) Repurge(ctx context.Context) (int, error) { return ix.repurge.Send(ctx) }
+
+// QueuedRepurges returns the tags of the queued second purges, the oldest
+// first (tests).
+func (ix *Index) QueuedRepurges() [][]string {
+	out, err := ix.repurge.Queued(context.Background())
+	if err != nil {
+		panic(err)
+	}
+	return out
+}

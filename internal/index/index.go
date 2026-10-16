@@ -15,6 +15,7 @@
 //	refs(ns, resource, schema, path, ref, target_ns, target, rev, entry)  x-ref references (§A.2, §A.3);
 //	                                      path is the full instance pointer, indices included
 //	sealed_views, sealed_view_tags   sealed results of sealed/e2e namespaces (derived.Cache)
+//	cdn_repurge(id, tags, due)       second CDN purges (package repurge), kept by a rebuild
 //
 // Paths are instance pointers with array indices removed ("/players/2/name"
 // is stored as "/players/name"), so they name a field of the schema rather
@@ -62,6 +63,7 @@ import (
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/kept"
+	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
@@ -101,6 +103,15 @@ type Options struct {
 	MinWait time.Duration
 	// Purger receives cache tag purges; default: log.
 	Purger Purger
+	// RepurgeDelay is how long after a cache tag purge it is sent again,
+	// queued with the apply that commits it (package repurge, D.8, as the
+	// core's RepurgeDelay): longer than a response under way at the
+	// commit can take to reach the CDN. Zero means two minutes
+	// (repurge.DefaultDelay); negative disables the second purge.
+	RepurgeDelay time.Duration
+	// RepurgeInterval is how often second purges that are due are sent.
+	// Zero means ten seconds; negative disables the loop.
+	RepurgeInterval time.Duration
 	// Edge is the verifying edge in front of the service (§9): private
 	// results it verified itself, carrying its secret and a prefix covering
 	// the URL and no other credential, get edge lifetimes. Other private
@@ -144,6 +155,7 @@ type Index struct {
 	keys    *derived.Keys  // encryption of followed namespaces
 	sealed  *derived.Cache // sealed results
 	kept    *kept.Store    // results kept past their checkpoint
+	repurge *repurge.Queue // second CDN purges
 
 	fetches *semaphore.Weighted // FetchConcurrency, shared by every follower's Apply
 	wmu     sync.Mutex          // serialises Apply across followers
@@ -203,6 +215,8 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		fetches: semaphore.NewWeighted(int64(opt.FetchConcurrency)),
 		roots:   map[string]bool{}, cur: map[string]string{}, purged: map[string]bool{}, changed: make(chan struct{}),
 	}
+	ix.repurge = repurge.New(db, opt.Purger, repurge.Options{Delay: opt.RepurgeDelay, Interval: opt.RepurgeInterval,
+		Now: opt.Now, Lock: &ix.wmu, Name: "index", Logf: opt.Logf})
 	for _, ns := range opt.Namespaces {
 		if !client.ValidNSName(ns) {
 			db.Close()
@@ -218,11 +232,15 @@ func Open(ctx context.Context, opt Options) (*Index, error) {
 		db.Close()
 		return nil, err
 	}
+	ix.repurge.Start()
 	return ix, nil
 }
 
-// Close closes the database.
-func (ix *Index) Close() error { return ix.db.Close() }
+// Close stops sending second purges and closes the database.
+func (ix *Index) Close() error {
+	ix.repurge.Close()
+	return ix.db.Close()
+}
 
 // FTS reports whether the text table is FTS5 (false: the LIKE fallback).
 func (ix *Index) FTS() bool { return ix.fts }
@@ -310,6 +328,9 @@ func (ix *Index) initSchema(ctx context.Context) error {
 		}
 	}
 	if err := ix.sealed.Init(ctx); err != nil {
+		return fmt.Errorf("index: schema: %w", err)
+	}
+	if err := repurge.Init(ctx, ix.db); err != nil {
 		return fmt.Errorf("index: schema: %w", err)
 	}
 	// An existing text table decides the mode; otherwise try FTS5.
@@ -554,6 +575,11 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		tags = append(tags, countsTag(b.NS))
 	}
 	if err := ix.sealed.Purge(ctx, tx, tags); err != nil {
+		return err
+	}
+	// The second purge of the tags, durable with the commit (package
+	// repurge): a read before the commit may reach the CDN after the first.
+	if err := ix.repurge.Add(ctx, tx, tags); err != nil {
 		return err
 	}
 	if err := ix.cps.SaveBatch(ctx, tx, b.Origin, b.NS, b); err != nil {
