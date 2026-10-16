@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+**Fixes:**
+- **A second CDN purge from the index and the tree/catalog services** (D.8, as the core's): a
+  request in flight when an apply committed a purge could hand the CDN a result or listing it
+  read before the commit, immutable and tagged with what was just purged, after that purge had
+  gone out, and the CDN kept it for a year. The transaction that commits a purge now also queues
+  it in `cdn_repurge` in the service's own database, and the service sends it again two minutes
+  later (`RepurgeDelay` of `index.Options` and `tree.Options`, longer than a CDN's first-byte
+  timeout, 75 s in `deploy/varnish`, since the services set no response deadline of their own;
+  `RepurgeInterval`, 10 s), so a crash or restart loses no second purge, and `-rebuild` keeps
+  the queue. This covers resource purges and purge-ns in both services, the `ns:{catalog}` purge
+  for drift that a tree start or a failed apply's reload fixes, and the catalog's
+  `ns:{catalog}` purge when its trust list loses a namespace, which used to be added after the
+  commit.
+
 ## v0.21.0
 
 **Changes to check before upgrading:**
