@@ -297,17 +297,31 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				r.Header.Set("Destination", u.EscapedPath())
 			}
 		}
-	case "PUT":
-		// x/net/webdav ignores the preconditions of a PUT: If-None-Match:
-		// * creates only, and the revision If-Match (or an If header's
-		// entity tag) names is the base of the edit (§11 submit).
-		st.noneMatch = r.Header.Get("If-None-Match") == "*"
+	case "PUT", "DELETE":
+		// x/net/webdav ignores the preconditions of a PUT and a DELETE:
+		// If-None-Match: * creates only, and the revision If-Match (or an
+		// If header's entity tag) names is the base of the edit (§11
+		// submit), or the revision a DELETE deletes. An If list of entity
+		// tags only it would take for lock tokens, and fail (412): those
+		// lists are this server's to check.
+		if h := r.Header.Get("If"); h != "" {
+			rest, tag := splitIf(h)
+			if rest == "" {
+				r.Header.Del("If")
+			} else {
+				r.Header.Set("If", rest)
+			}
+			st.ifMatch = tag
+		}
+		if r.Method == "PUT" {
+			st.noneMatch = r.Header.Get("If-None-Match") == "*"
+		}
 		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
 		case im == "*":
 			st.matchAny = true
 		case im != "":
 			st.ifMatch = revOfETag(strings.TrimSpace(strings.Split(im, ",")[0]))
-		default:
+		case st.ifMatch == "":
 			st.ifMatch = ifHeaderETag(r.Header.Get("If"))
 		}
 	}
@@ -375,6 +389,90 @@ func ifHeaderETag(h string) string {
 		}
 	}
 	return ""
+}
+
+// splitIf takes out of an If header (RFC 4918 §10.4) its untagged lists
+// that hold entity tags only (with the always true Not <DAV:no-lock>),
+// and returns the rest and the first such entity tag's revision. One that
+// doesn't parse is left whole, for x/net/webdav to refuse.
+func splitIf(h string) (rest, rev string) {
+	var keep []string
+	i := 0
+	skip := func() {
+		for i < len(h) && (h[i] == ' ' || h[i] == '\t') {
+			i++
+		}
+	}
+	upto := func(c byte) (string, bool) {
+		j := strings.IndexByte(h[i:], c)
+		if j < 0 {
+			return "", false
+		}
+		s := h[i : i+j+1]
+		i += j + 1
+		return s, true
+	}
+	for skip(); i < len(h); skip() {
+		start := i
+		tagged := false
+		if h[i] == '<' {
+			if _, ok := upto('>'); !ok {
+				return h, ""
+			}
+			tagged = true
+			skip()
+		}
+		if i >= len(h) || h[i] != '(' {
+			return h, ""
+		}
+		i++
+		tags, other := []string{}, false
+		for skip(); i < len(h) && h[i] != ')'; skip() {
+			not := false
+			if strings.HasPrefix(h[i:], "Not") {
+				not = true
+				i += 3
+				skip()
+			}
+			if i >= len(h) {
+				return h, ""
+			}
+			switch h[i] {
+			case '<':
+				tok, ok := upto('>')
+				if !ok {
+					return h, ""
+				}
+				if !not || tok != "<DAV:no-lock>" {
+					other = true
+				}
+			case '[':
+				tag, ok := upto(']')
+				if !ok {
+					return h, ""
+				}
+				if not {
+					other = true
+				} else {
+					tags = append(tags, tag[1:len(tag)-1])
+				}
+			default:
+				return h, ""
+			}
+		}
+		if i >= len(h) {
+			return h, ""
+		}
+		i++
+		if tagged || other || len(tags) == 0 {
+			keep = append(keep, h[start:i])
+			continue
+		}
+		if rev == "" {
+			rev = revOfETag(tags[0])
+		}
+	}
+	return strings.Join(keep, " "), rev
 }
 
 // authenticate returns the request's principal, or the answer refusing
@@ -669,11 +767,51 @@ type principal struct {
 	dropped bool
 	ns      map[string]nsInfo
 	cats    map[string]*catGraph
+	deletes map[string]ownDelete // by ns/name: its latest DELETEs
+}
+
+// ownDelete is a tombstone a principal's DELETE wrote.
+type ownDelete struct {
+	tomb string
+	at   time.Time
+}
+
+// maxDeletes bounds the DELETEs a principal remembers.
+const maxDeletes = 64
+
+// noteDelete remembers that the principal tombstoned ns/name as tomb.
+func (p *principal) noteDelete(ns, name, tomb string, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.deletes) >= maxDeletes {
+		var old string
+		for k, d := range p.deletes {
+			if old == "" || d.at.Before(p.deletes[old].at) {
+				old = k
+			}
+		}
+		delete(p.deletes, old)
+	}
+	p.deletes[ns+"/"+name] = ownDelete{tomb: tomb, at: now}
+}
+
+// deletedOwn reports whether tomb, ns/name's head, is the principal's own
+// DELETE.
+func (p *principal) deletedOwn(ns, name, tomb string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.deletes[ns+"/"+name].tomb == tomb
+}
+
+func (p *principal) forgetDelete(ns, name string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.deletes, ns+"/"+name)
 }
 
 func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
 	return &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
-		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, used: s.opt.Now()}
+		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, deletes: map[string]ownDelete{}, used: s.opt.Now()}
 }
 
 // reqState is one request's view, in its context: the principal, what
@@ -690,12 +828,15 @@ type reqState struct {
 	err    *davError
 
 	hdr       http.Header // the request's
-	ifMatch   string      // the revision a PUT's If-Match or If header names
+	ifMatch   string      // the revision a PUT's or DELETE's If-Match or If header names
 	matchAny  bool        // If-Match: *
 	noneMatch bool        // If-None-Match: *
-	bodyErr   error       // reading the request body failed
-	noETag    bool        // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
-	serve     *stagedServe
+	// placeholder: the PUT's preconditions found an empty placeholder
+	// (scratch) at its document path, which exists for If-Match: *.
+	placeholder bool
+	bodyErr     error // reading the request body failed
+	noETag      bool  // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
+	serve       *stagedServe
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog

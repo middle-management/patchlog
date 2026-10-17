@@ -2154,8 +2154,9 @@ API, and keeps nothing but memory caches.
   (below), kept for a day apart from the principal, within 128 MiB for all users, where the grant
   root keeping the most gives way first, so one user's uploads don't push out another's records
   (a write keeps the bytes it sent only where they read otherwise rendered, and not when much
-  larger than the rendering, as white space padding would be). A restart loses all of it. Rendered documents are cached by revision id for everyone, and handed to a principal
-  only after it read the head, or the listing, with its own grant.
+  larger than the rendering, as white space padding would be). A restart loses all of it.
+  Rendered documents are cached by revision id for everyone, and handed to a principal only after
+  it read the head, or the listing, with its own grant.
 - `-password-file` and `-bearer-file` readable by others than their owner log a warning.
 - Behind a reverse proxy, the proxy must pass the client's `Host` on (nginx: `proxy_set_header Host
   $host`), or set `X-Forwarded-Host`: MOVE and COPY name their destination by the host the client
@@ -2212,7 +2213,9 @@ here that tombstones the document.
   request has 10 minutes to arrive.
 - A new name is created (`If-None-Match: *` upstream); a tombstoned one is restored, so a name
   keeps one chain (§8.2); a purged one is `403`. A PUT's own `If-None-Match: *` (create only) is
-  `412` over an existing file, and `If-Match: *` (edit only) over a missing one.
+  `412` over an existing file, and `If-Match: *` (edit only) over a missing one; an empty
+  placeholder (below) exists for both. An `If` header's lists of entity tags only (no lock token,
+  or the always true `Not <DAV:no-lock>`) are this server's to check, as `If-Match`.
 - An existing document gets the user's edit rebased on its head (§11 submit): the diff
   (`merge.Diff`) from the version the user edited, the base, to what they wrote, applied to the
   current head and appended with `If-Match` on it. The base is one of the versions the user may
@@ -2257,6 +2260,8 @@ here that tombstones the document.
   write of the user's.
 - A save that deletes the original before writing the new version (DELETE, then a PUT or a MOVE
   onto the name) restores it with the user's edit rebased on the last live document, as above.
+  If that write is refused (a `409`, a `422`), the user's own DELETE is undone: the document is
+  restored as it was, as a refused PUT leaves it.
 - `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
   the namespace requires nonces or its document can't be read (§C.7).
 - The core's refusals come back as such: `422` with its validation errors (schema, rules,
@@ -2267,9 +2272,10 @@ here that tombstones the document.
   Retry-After. A core that can't be reached is `502` (the details are logged).
 - An empty write (a LOCK of a new name, Finder's 0-byte PUT) makes an empty placeholder until
   content arrives; it never truncates a live document.
-- DELETE tombstones (§8.1). A MOVE between two documents is `403`: names are identity (§3.6), so
-  there is no rename. COPY to a new name creates it from the content, and COPY over a document
-  edits it.
+- DELETE tombstones (§8.1); with `If-Match` (or an `If` header's entity tag) naming another
+  revision than the head, it is `412`. A MOVE between two documents is `403`: names are identity
+  (§3.6), so there is no rename. COPY to a new name creates it from the content, and COPY over a
+  document edits it.
 
 **Temporary and backup files.** Names that aren't `{name}.json`, such as vim's `.x.json.swp`,
 `x.json~` and `4913`, gedit's `.goutputstream-*`, macOS's `.DS_Store` and `._x.json`, or
@@ -2315,7 +2321,10 @@ the user's grant doesn't read, aren't shown.
   so no placement dangles), an existing one after the placement, so a placement the core refuses
   (a frozen catalog, a grant that doesn't write the catalog) leaves the item as it was. An item
   placed elsewhere in the catalog is `409` before anything is written: move its placement instead.
-  A COPY of a document from a flat directory into a folder places it the same way.
+  An existing item takes the PUT's preconditions (`If-None-Match: *` is `412`), and its edit is
+  checked before the placement is made: from a user who knows no version of it, a file whose
+  content differs is `409`, rather than replacing a document they never saw under a name that
+  looked new. A COPY of a document from a flat directory into a folder places it the same way.
 - Writes through a placement go only to items in a namespace the catalog trusts (`catalog.trust`,
   §B.3) or that is served with `-ns`, never to a catalog's own nodes (`403`): a local mode's grant
   may reach namespaces the server wasn't set up to serve.

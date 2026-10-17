@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -239,8 +240,11 @@ func (st *reqState) mkFolder(ctx context.Context, t target) error {
 // instead. A new item is written first (§B.7: content first, so a
 // placement never dangles); an existing one after its placement, so a
 // placement the core refuses (a frozen catalog, a grant that doesn't
-// write it) leaves the item as it was.
-func (st *reqState) place(ctx context.Context, t target, v any, body []byte) (string, bool, error) {
+// write it) leaves the item as it was. An existing item takes the PUT's
+// preconditions (pre), and its edit is checked before the placement is
+// made: one the principal knows no version of is refused when v differs
+// from it, since the new file name made it look like a create.
+func (st *reqState) place(ctx context.Context, t target, v any, body []byte, pre bool) (string, bool, error) {
 	cg, err := st.graph(ctx, t.ns)
 	if err != nil {
 		return "", false, err
@@ -254,12 +258,28 @@ func (st *reqState) place(ctx context.Context, t target, v any, body []byte) (st
 	}
 	node := map[string]any{"parents": parentsOf(t.ns, t.parent)}
 	if h.State == client.Live {
+		if pre && st.noneMatch {
+			return "", false, fail(http.StatusPreconditionFailed, "%s/%s exists (If-None-Match: *)", t.docNS, t.docName)
+		}
+		cur, err := st.s.doc(ctx, st.p, t.docNS, t.docName, h.ID)
+		if err != nil {
+			return "", false, upstream(err)
+		}
+		if !cur.sealed {
+			out, based, err := st.rebased(ctx, t.docNS, t.docName, v, cur.value)
+			if err != nil {
+				return "", false, upstream(err)
+			}
+			if !based && !jsonv.Equal(out, dropNonce(cur.value)) {
+				return "", false, fail(http.StatusConflict, "%s/%s exists, with other content, and you haven't opened it here; open it (in %s/) and save your changes there, then copy it into this folder", t.docNS, t.docName, t.docNS)
+			}
+		}
 		if err := st.createNode(ctx, t.ns, t.node, node); err != nil {
 			return "", false, err
 		}
-		return st.commitDoc(ctx, t.docNS, t.docName, v, body, false)
+		return st.commitDoc(ctx, t.docNS, t.docName, v, body, pre)
 	}
-	rev, exact, err := st.commitDoc(ctx, t.docNS, t.docName, v, body, false)
+	rev, exact, err := st.commitDoc(ctx, t.docNS, t.docName, v, body, pre)
 	if err != nil {
 		return "", false, err
 	}
@@ -340,7 +360,7 @@ func (st *reqState) unplace(ctx context.Context, t target) error {
 			st.scratchRemove(name)
 		}
 	}
-	return st.deleteDoc(ctx, t.ns, t.node)
+	return st.deleteDoc(ctx, t.ns, t.node, "")
 }
 
 // isCatalogMove reports whether moving src to dst moves a catalog node

@@ -161,6 +161,7 @@ func TestCatalogDeletePut(t *testing.T) {
 	}
 	// An existing item, placed again (its placement was deleted): edited
 	// and placed; the placement is restored on its chain.
+	e.expect(e.do("GET", "/matches/derby.json", ""), 200, "GET the item")
 	e.expect(e.do("PUT", "/cat/root/derbies/matches.derby.json", `{"title": "Derby 2"}`), 201, "PUT existing item")
 	_, doc = e.load("matches", "derby")
 	sameJSON(t, doc, map[string]any{"title": "Derby 2"})
@@ -232,6 +233,7 @@ func TestCatalogPlacementWrites(t *testing.T) {
 	e.create("matches", "final", map[string]any{"title": "Final", "score": "2-1"})
 	nh := must(e.c.NSHead(e.ctx, "cat"))
 	must(e.c.PatchConfig(e.ctx, "cat", nh.Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	e.expect(e.do("GET", "/matches/final.json", ""), 200, "GET the item")
 	e.expect(e.do("PUT", "/cat/root/season/matches.final.json", `{"title": "Final (draft)"}`), 423, "PUT a placement in a frozen catalog")
 	_, doc = e.load("matches", "final")
 	sameJSON(t, doc, map[string]any{"title": "Final", "score": "2-1"})
@@ -301,4 +303,29 @@ func TestCatalogRequests(t *testing.T) {
 	if l := e.propfind("/cat/root/season/"); l["/cat/root/season/new/"].dir != true {
 		t.Fatalf("after MKCOL %v", names(l, "/cat/root/season/"))
 	}
+}
+
+// A PUT of a new placement whose item exists edits the item, so it takes
+// the PUT's preconditions (If-None-Match: * is 412, and nothing is
+// placed), and, as a file the user never opened, it is refused when its
+// content differs, rather than replacing what the user never saw.
+func TestCatalogPlacementOfExisting(t *testing.T) {
+	t.Parallel()
+	e := catalogEnv(t)
+	e.create("matches", "cup", map[string]any{"title": "Cup", "score": "3-0"})
+	e.expect(e.do("PUT", "/cat/root/empty/matches.cup.json", `{"title": "Cup (old copy)"}`, "If-None-Match", "*"), 412, "create-only PUT of a placement of an existing item")
+	e.expect(e.do("PUT", "/cat/root/empty/matches.cup.json", `{"title": "Cup (old copy)"}`), 409, "PUT of a placement of an item never opened")
+	_, doc := e.load("matches", "cup")
+	sameJSON(t, doc, map[string]any{"title": "Cup", "score": "3-0"})
+	if h, _ := e.load("cat", "matches.cup"); h.State != client.NotFound {
+		t.Fatalf("a refused PUT placed the item: %v", h.State)
+	}
+	// The same content places it; an edit of a version the user read is
+	// rebased as usual.
+	buf := e.expect(e.do("GET", "/matches/cup.json", ""), 200, "GET").body
+	e.theirs("matches", "cup", replace("/score", "3-1"))
+	e.expect(e.do("PUT", "/cat/root/empty/matches.cup.json", edit(t, buf, `"Cup"`, `"The cup"`)), 201, "PUT of a placement of an item opened")
+	_, doc = e.load("matches", "cup")
+	sameJSON(t, doc, map[string]any{"title": "The cup", "score": "3-1"})
+	sameJSON(t, e.parentsOf("matches.cup"), parents("cat", "empty"))
 }

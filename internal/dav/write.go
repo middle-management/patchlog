@@ -90,7 +90,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			rev, exact = r, x
 			return retry, err
 		}
-		if pre && st.matchAny {
+		if pre && st.matchAny && !st.placeholder {
 			return false, fail(http.StatusPreconditionFailed, "%s/%s doesn't exist (If-Match: *)", ns, name)
 		}
 		var res *client.WriteResult
@@ -104,10 +104,14 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			ps = withNonce(in, client.GenesisPatches(doc))
 			res, err = st.p.c.Create(ctx, ns, name, ps)
 		} else {
-			if parent, ps, err = st.restorePatches(ctx, in, ns, name, h, v); err != nil {
-				return false, err
+			if parent, ps, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
+				res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
 			}
-			res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
+			if refused(err) && st.p.deletedOwn(ns, name, h.ID) {
+				// A save that deletes the original before writing the
+				// new version: refused, it leaves the document as it was.
+				return false, st.undelete(ctx, in, ns, name, h.ID, err)
+			}
 		}
 		if client.IsStale(err) || client.IsGone(err) {
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile; reload it", ns, name)
@@ -618,10 +622,41 @@ func (st *reqState) retrying(ctx context.Context, attempt func() (retry bool, er
 	}
 }
 
-// deleteDoc tombstones ns/name (§8.1). The principal's records of it stay:
-// a save that deletes the original before writing the new version
-// restores it from them (restorePatches).
-func (st *reqState) deleteDoc(ctx context.Context, ns, name string) error {
+// refused reports a write refused for what it holds: a conflict, or the
+// core's 422 or 413.
+func refused(err error) bool {
+	var de *davError
+	if errors.As(err, &de) {
+		return de.status == http.StatusConflict
+	}
+	ae, ok := client.AsAPIError(err)
+	return ok && (ae.Status == http.StatusUnprocessableEntity || ae.Status == http.StatusRequestEntityTooLarge)
+}
+
+// undelete restores ns/name, tombstoned by the principal's own DELETE as
+// tomb, as it was (an empty patch set on the last live document, §8.2),
+// after the write meant to restore it was refused with err, which it
+// returns, saying so.
+func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb string, err error) error {
+	if _, rerr := st.p.c.Restore(ctx, ns, name, tomb, withNonce(in, []any{})); rerr != nil {
+		st.s.opt.Logf("dav: %s/%s: restoring it as it was after a refused save: %v", ns, name, rerr)
+		return err
+	}
+	st.p.forgetDelete(ns, name)
+	de, ok := upstream(err).(*davError)
+	if !ok {
+		return err
+	}
+	out := *de
+	out.msg += " (the original, deleted before this write, is restored as it was)"
+	return &out
+}
+
+// deleteDoc tombstones ns/name (§8.1), if its head is ifMatch when that
+// is given (412 otherwise). The principal's records of it stay: a save
+// that deletes the original before writing the new version restores it
+// from them (restorePatches), or as it was if that write is refused.
+func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) error {
 	if st.s.nsInfo(ctx, st.p, ns).sealed {
 		return fail(http.StatusNotImplemented, "%s is sealed or end-to-end (Addendum E); it isn't written over WebDAV", ns)
 	}
@@ -633,9 +668,15 @@ func (st *reqState) deleteDoc(ctx context.Context, ns, name string) error {
 		if h.State != client.Live {
 			return false, errNotExist
 		}
-		_, err = st.p.c.Delete(ctx, ns, name, h.ID)
+		if ifMatch != "" && h.ID != ifMatch {
+			return false, fail(http.StatusPreconditionFailed, "%s/%s changed since %s (If-Match); reload it", ns, name, ifMatch)
+		}
+		res, err := st.p.c.Delete(ctx, ns, name, h.ID)
 		if client.IsStale(err) {
 			return true, nil
+		}
+		if err == nil {
+			st.p.noteDelete(ns, name, res.ID, st.s.opt.Now())
 		}
 		return false, err
 	})

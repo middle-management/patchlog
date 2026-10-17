@@ -485,10 +485,13 @@ func (st *reqState) preconditions(ctx context.Context, t target) error {
 	if !st.noneMatch && !st.matchAny {
 		return nil
 	}
-	_, err := st.stat(ctx, t)
+	fi, err := st.stat(ctx, t)
 	if err != nil && !errors.Is(err, errNotExist) {
 		return err
 	}
+	// An empty placeholder at a document's path (a LOCK of a new name)
+	// exists, as listed, though the core has no document there yet.
+	st.placeholder = err == nil && t.isDoc() && fi.rev == ""
 	switch {
 	case st.noneMatch && err == nil:
 		return fail(http.StatusPreconditionFailed, "%s exists (If-None-Match: *)", t.path)
@@ -563,14 +566,18 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		if _, live, err := st.docAt(ctx, t); err != nil {
 			return err
 		} else if live {
-			return st.deleteDoc(ctx, t.docNS, t.docName)
+			return st.deleteDoc(ctx, t.docNS, t.docName, st.ifMatch)
 		}
 	case kFolder, kPlacement:
 		if t.kind == kPlacement {
-			if _, live, err := st.docAt(ctx, t); err != nil {
+			hd, live, err := st.docAt(ctx, t)
+			if err != nil {
 				return err
 			} else if !live {
 				break
+			}
+			if st.ifMatch != "" && hd.rev != st.ifMatch {
+				return fail(http.StatusPreconditionFailed, "%s/%s changed since %s (If-Match); reload it", hd.ns, hd.name, st.ifMatch)
 			}
 		}
 		return st.unplace(ctx, t)
@@ -694,7 +701,7 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 	var rev string
 	var exact bool
 	if t.kind == kNewPlacement {
-		rev, exact, err = st.place(ctx, t, v, body)
+		rev, exact, err = st.place(ctx, t, v, body, true)
 	} else {
 		rev, exact, err = st.commitDoc(ctx, t.docNS, t.docName, v, body, true)
 	}

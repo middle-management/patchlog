@@ -1,6 +1,7 @@
 package dav_test
 
 import (
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -517,4 +518,96 @@ func TestSaveMergedRevalidates(t *testing.T) {
 		t.Fatalf("GET %q", g.body)
 	}
 	e.expect(e.do("GET", "/docs/x.json", "", "If-None-Match", tag), 304, "GET again")
+}
+
+// A delete-then-write save whose write is refused (a conflict) doesn't
+// leave the document deleted: the user's own DELETE moments before is
+// undone, as a plain PUT refused leaves the document as it was.
+func TestSaveDeleteThenWriteRefused(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
+	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
+	e.theirs("docs", "x", replace("/a", "theirs"))
+	e.expect(e.do("PUT", "/docs/.x.json.tmp", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT temporary file")
+	e.expect(e.do("DELETE", "/docs/x.json", ""), 204, "DELETE original")
+	r := e.expect(e.do("MOVE", "/docs/.x.json.tmp", "", "Destination", "/docs/x.json"), 409, "MOVE onto it")
+	if !strings.Contains(r.body, "restored") {
+		t.Fatalf("409 %q", r.body)
+	}
+	h, doc := e.load("docs", "x")
+	if h.State != client.Live {
+		t.Fatalf("after a refused delete-then-write save the document is %v", h.State)
+	}
+	sameJSON(t, doc, map[string]any{"a": "theirs", "b": "1"})
+	// Someone else's DELETE isn't undone.
+	e.create("docs", "y", map[string]any{"a": "1", "b": "1"})
+	buf = e.expect(e.do("GET", "/docs/y.json", ""), 200, "GET").body
+	e.theirs("docs", "y", replace("/a", "theirs"))
+	h, _ = e.load("docs", "y")
+	must(e.c.Delete(e.ctx, "docs", "y", h.ID))
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT over someone else's DELETE")
+	if h, _ := e.load("docs", "y"); h.State != client.Tombstoned {
+		t.Fatalf("someone else's DELETE undone: %v", h.State)
+	}
+}
+
+// DELETE honours If-Match (or an If header's entity tag): deleting the
+// version a client saw doesn't tombstone one someone else changed since.
+func TestDeleteIfMatch(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.create("docs", "x", map[string]any{"a": "1"})
+	g := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
+	e.theirs("docs", "x", replace("/a", "theirs"))
+	e.expect(e.do("DELETE", "/docs/x.json", "", "If-Match", g.header.Get("ETag")), 412, "DELETE If-Match an old revision")
+	e.expect(e.do("DELETE", "/docs/x.json", "", "If", "(["+g.header.Get("ETag")+"])"), 412, "DELETE If an old revision")
+	if h, _ := e.load("docs", "x"); h.State != client.Live {
+		t.Fatalf("the document is %v", h.State)
+	}
+	h, _ := e.load("docs", "x")
+	e.expect(e.do("DELETE", "/docs/x.json", "", "If-Match", `"`+h.ID+`"`), 204, "DELETE If-Match the head")
+	if h, _ := e.load("docs", "x"); h.State != client.Tombstoned {
+		t.Fatalf("the document is %v", h.State)
+	}
+	e.create("docs", "y", map[string]any{"a": "1"})
+	e.expect(e.do("DELETE", "/docs/y.json", "", "If-Match", "*"), 204, "DELETE If-Match *")
+}
+
+// An If header that names only an entity tag (no lock token), or the
+// always true Not <DAV:no-lock> with one, names the base as If-Match
+// does: x/net/webdav would take it for a lock token and fail it (412).
+func TestSaveIfHeaderETag(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	for i, f := range []string{"([%s])", "(Not <DAV:no-lock> [%s])"} {
+		n := "x" + strconv.Itoa(i)
+		r0 := e.create("docs", n, map[string]any{"a": "1", "b": "1"})
+		e.theirs("docs", n, replace("/b", "theirs"))
+		text := rendered(map[string]any{"a": "mine", "b": "1"})
+		e.expect(e.do("PUT", "/docs/"+n+".json", text, "If", fmt.Sprintf(f, `"`+r0+`"`)), 201, "PUT If: "+f)
+		_, doc := e.load("docs", n)
+		sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
+	}
+	// With a lock token in another list, the lock is still checked.
+	e.create("docs", "l", map[string]any{"a": "1"})
+	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>me</D:owner></D:lockinfo>`
+	tok := e.expect(e.do("LOCK", "/docs/l.json", lock, "Timeout", "Second-60"), 200, "LOCK").header.Get("Lock-Token")
+	h, _ := e.load("docs", "l")
+	e.expect(e.do("PUT", "/docs/l.json", `{"a": "2"}`, "If", `(["`+h.ID+`"])`), 423, "PUT of a locked file with an entity tag only")
+	e.expect(e.do("PUT", "/docs/l.json", `{"a": "2"}`, "If", "("+tok+`) (["`+h.ID+`"])`), 201, "PUT with the token")
+}
+
+// If-Match: * and If-None-Match: * decide once whether the file exists:
+// an empty placeholder (after a LOCK of a new name) exists for both, so
+// If-Match: * writes over it, as over any file listed.
+func TestSavePreconditionsPlaceholder(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>me</D:owner></D:lockinfo>`
+	tok := e.expect(e.do("LOCK", "/docs/new.json", lock, "Timeout", "Second-60"), 201, "LOCK a new name").header.Get("Lock-Token")
+	e.expect(e.do("PUT", "/docs/new.json", `{"v": 1}`, "If-None-Match", "*", "If", "("+tok+")"), 412, "create-only over the placeholder")
+	e.expect(e.do("PUT", "/docs/new.json", `{"v": 1}`, "If-Match", "*", "If", "("+tok+")"), 201, "edit-only over the placeholder")
+	_, doc := e.load("docs", "new")
+	sameJSON(t, doc, map[string]any{"v": 1})
 }
