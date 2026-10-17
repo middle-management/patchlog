@@ -798,17 +798,17 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
 
 ### Health checks and graceful shutdown
 
-`serve`, `index` and `tree` answer two paths ahead of their own routes. Both are
+`serve`, `index`, `tree` and `dav` answer two paths ahead of their own routes. Both are
 `Cache-Control: no-store` and `CDN-Cache-Control: no-store`, and the compose CDN passes them, so
 a probe always reaches the origin itself:
 
 | Path | Answer |
 | --- | --- |
 | `GET /_health` | Liveness and drain state: `200 {"status":"ok"}` while serving, `503 {"status":"draining"}` from the moment shutdown starts. It touches no database, so frequent probes are cheap. Use it for load-balancer and CDN probes and container healthchecks. |
-| `GET /_ready` | Readiness: `503 {"status":"draining"}` while draining, `503 {"status":"unavailable","error":…}` when the core can't reach its database (a ping with a 2 s timeout), else `200 {"status":"ok"}`. The index and tree keep local SQLite databases they opened at start, so for them it is the drain state alone. |
+| `GET /_ready` | Readiness: `503 {"status":"draining"}` while draining, `503 {"status":"unavailable","error":…}` when the core can't reach its database (a ping with a 2 s timeout), else `200 {"status":"ok"}`. The index and tree keep local SQLite databases they opened at start, and `dav` keeps none, so for them it is the drain state alone. |
 
 The paths start with `_`, which no namespace or catalog name can (§3.6), so they never shadow
-the index's `/{ns}` or the tree's `/{catalog}`; they sit beside the services' `/_status`.
+the index's `/{ns}`, the tree's `/{catalog}` or a `dav` directory; they sit beside the services' `/_status`.
 `patchlog health [URL]` (default `http://localhost:8080/_health`; `:8081` is short for
 `http://localhost:8081/_health`) exits 0 on a 200 and 1 otherwise, so the image needs no curl or
 wget for healthchecks.
@@ -2113,6 +2113,148 @@ Note: the §B.11.3 example key rule `not writes overlaps /$access` refuses every
 genesis writes `""`. Scope it to non-create actions and require `/doc/$access` to be absent on
 create.
 
+### WebDAV (prototype)
+
+`patchlog dav` serves namespaces as a network drive, for file managers and editors. It is an API
+consumer like the index and tree services: it reads and writes the core only through its public
+API, and keeps nothing but memory caches.
+
+```sh
+# Local mode: one grant for every request; WebDAV clients log in with any user name and the password.
+./patchlog dav -api http://localhost:8080 -ns docs,matches -catalog cat-season \
+  -bearer-file editor.grant -password-file dav.password      # http://127.0.0.1:8090/
+
+# Gateway mode: each request's Basic password is the user's own grant, sent upstream.
+./patchlog dav -api https://cms.example -ns docs -catalog cat-season -gateway \
+  -addr :8443 -tls-cert dav.crt -tls-key dav.key
+```
+
+- **Local mode** (the default) sends `-bearer` (or `-bearer-file`) with every request to the core,
+  or `-author NAME` to a `-dev` one. WebDAV clients log in with HTTP Basic: any user name, and the
+  password of `-password-file` or a random one logged at start, compared in constant time. It is
+  meant for one person on their own machine: the default `-addr` is `127.0.0.1:8090`, and plain
+  HTTP on any other address logs a warning.
+- **Gateway mode** (`-gateway`) has no grant of its own: a request's Basic password is the grant,
+  sent upstream as `Authorization: Bearer` (the user name is ignored), so the core decides what
+  each user may read and write, and the revisions are the grant's subject's. A password that
+  isn't a well-formed, unexpired grant is `401` at once; the core verifies the rest, and its `401`
+  comes back as a `401` with the Basic challenge, so clients ask again. Grants must not cross
+  plain HTTP: it refuses to start on an address other than loopback without `-tls-cert` and
+  `-tls-key`, unless `-insecure`. Both modes take `-tls-cert` and `-tls-key`.
+- What the server keeps per user, temporary files, what each user was served and locks, is per
+  principal (a hash of the upstream grant) and never shared; a gateway keeps at most 256
+  principals, dropping idle ones after an hour. Rendered documents are cached by revision id for
+  everyone, and handed to a principal only after it read the head, or the listing, with its own
+  grant.
+
+**Mounting.** macOS Finder: Go → Connect to Server (⌘K), `http://127.0.0.1:8090/` (`https://…`
+for a gateway), as a registered user with any name and the password (the grant). Finder writes
+only to servers with locks, which are served (in memory). Windows: File Explorer → This PC → Map
+network drive, or `net use Z: https://dav.example/ /user:me PASSWORD`; its WebClient service sends
+Basic credentials only over HTTPS by default (`BasicAuthLevel` 1), so serve with `-tls-cert` and
+`-tls-key` (for `http://localhost`, `BasicAuthLevel` 2 in the registry allows it). GNOME Files:
+Other Locations → Connect to Server, `dav://127.0.0.1:8090/` (`davs://` with TLS), or
+`gio mount dav://127.0.0.1:8090/`.
+
+**Layout.**
+
+```
+/                                                 a directory per -ns and -catalog
+/docs/                                            a flat namespace: its live resources
+/docs/derby.json                                  the document /r/docs/derby
+/cat-season/                                      a catalog: its root folders and placements
+/cat-season/root/season-2026/                     folder season-2026, in folder root
+/cat-season/root/season-2026/matches.derby.json   placement matches.derby: /r/matches/derby
+```
+
+- A flat namespace lists its live resources (the `/heads` of its current `ns_id`) as
+  `{name}.json`. Only resource names map to documents (§3.6: lowercase letters, digits, `.`, `_`
+  and `-`): `Notes.json` is a temporary file (below).
+- A file reads as its document's canonical form (§3.1) indented by two spaces, keys sorted, with a
+  final newline: the same bytes for the same revision, so the ETag is the revision id and saving a
+  file unchanged writes nothing. Its size is that rendering's (listings read every document, a
+  few at a time, cached by revision id), its type `application/json`, and its Last-Modified the
+  revision's creation time for revisions this server wrote, else when the user was first shown
+  it (the core serves documents without one).
+- Every listing reads the heads again: nothing is pushed, and nothing is stale beyond a request.
+
+**Saving.**
+
+- A written file is buffered whole (`-max-file-size`, default 16 MiB) and committed once complete.
+  It must be a JSON document (I-JSON, a UTF-8 byte order mark aside), else `400`, and nothing is
+  written.
+- A new name is created (`If-None-Match: *`); a tombstoned one is restored with the whole document,
+  so a name keeps one chain (§8.2); a purged one is `403`.
+- An existing document gets the diff (`merge.Diff`) from what the user last got (GET) or wrote for
+  it to what they wrote now, appended with `If-Match` on the current head (§11 submit). Edits
+  others made since to other paths are kept: the patch set holds only the user's changes. Where
+  the user's changes overlap theirs (the same value, a value inside one the other replaced or
+  removed, or anything in an array the other changed: writes compared as merges compare them,
+  §F.3), the save is `409 Conflict` and nothing is written; reload and edit again. A head that
+  moves meanwhile (`412`) is read again, the edit checked again and resent, up to five times.
+  Without a record of what the user got (after a restart, or a PUT without a GET), the head is
+  the base, so the file as written wins.
+- `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
+  the namespace requires nonces or its document can't be read (§C.7).
+- The core's refusals come back as such: `422` with its validation errors (schema, rules,
+  `nonce`, signature), one per line; `413` for a patch set over `patchSetSize`; `423` for a frozen
+  namespace (with its `successor`); `401` and `403` (but in local mode a `401` refuses the
+  server's own grant, not the user's password, so it is `502` rather than a new login prompt). A
+  `429` is waited out when its Retry-After is at most 2 s, and is otherwise `503` with
+  Retry-After.
+- An empty write (a LOCK of a new name, Finder's 0-byte PUT) makes an empty placeholder until
+  content arrives; it never truncates a live document.
+- DELETE tombstones (§8.1). Directories can't be made or deleted in a flat namespace or at the
+  root (`403`). A MOVE between two documents is `403`: names are identity (§3.6), so there is no
+  rename. COPY to a new name creates it from the content, and COPY over a document edits it.
+
+**Temporary and backup files.** Names that aren't `{name}.json`, such as vim's `.x.json.swp`,
+`x.json~` and `4913`, gedit's `.goutputstream-*`, macOS's `.DS_Store` and `._x.json`, or
+`Untitled`, are scratch files: kept in memory per user and directory (at most 256 files and
+32 MiB a user, 256 MiB in all, then `507`), listed beside the documents so editors see what they
+wrote, and dropped after an hour untouched, or when the server stops. They never reach the core.
+
+- A MOVE of a scratch file onto `{name}.json`, the atomic save of gedit, VS Code and most editors,
+  commits its content exactly as a PUT would (an edit, a create or a restore), then drops it.
+- A MOVE of `{name}.json` to a scratch name, an editor moving the original aside as a backup
+  before writing the new version, copies it: the document stays, and the write that follows is an
+  edit of it.
+
+**Catalogs** (Addendum B). The tree is built from the catalog namespace's documents, read from
+the core on every request, so a write shows in the next listing (parsed with `tree.BuildGraph`).
+A catalog's directory holds its roots (nodes without parents); folders are directories named by
+node name; placements are files `{ns}.{name}.json` whose content is their item `/r/{ns}/{name}`,
+read and edited as in the flat view. A node with several parents (a DAG) is under each; cyclic
+nodes and placements whose item isn't live aren't shown.
+
+- MKCOL makes a folder, `{ "parents": [{ "href": "/r/{catalog}/{folder}" }] }`, or with
+  `"parents": []` at the catalog's root. A name the catalog already has elsewhere is `409` (move
+  that one instead); a name with a dot or capitals is `403`.
+- A MOVE of a folder or placement to another folder replaces only its `parents` entry for the
+  folder it left with one for the folder it enters (one write with `If-Match`, §B.2 "Move"; the
+  entry's `order` doesn't come along), and a MOVE to the catalog's root removes the entry.
+  Renaming is `403`, and a folder can't go into itself (`409`).
+- A DELETE of a placement unplaces it: the item stays in its namespace (§B.7). A node in several
+  folders is unlinked from that one only, as one link of a file with several; in its only folder
+  it is deleted. A folder is deleted only when nothing is in it (`409` naming what is); deletes
+  never recurse.
+- A PUT of a new `{ns}.{name}.json` in a folder creates the item if it doesn't exist (else edits
+  it), then the placement, with that folder as its parent. An item placed elsewhere in the catalog
+  is `409` before anything is written: move its placement instead. A COPY of a document from a
+  flat directory into a folder places it the same way.
+- The documents it creates carry `parents` only: a catalog whose rules want more (`$schema`, an
+  `order`, no new roots, §B.6) refuses them with `422`.
+
+**Not in the prototype.** The catalog's trust list, access by subject set (`$access`, §B.11) and
+the tree service: users see what their grant reads, as the core lists it. Blobs as files:
+documents with `$blob` references read and edit as JSON. Sealed (E.2) and end-to-end (E.3)
+namespaces: listed read-only, with size 0, and their files are `501`. History (revisions and
+logs as directories), live invalidation, and batches: each file is its own write, so saving
+several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5) can't list a
+namespace, whose `/heads` needs unrestricted read, but can open its files by path. PROPFIND with
+`Depth: infinity` is `403` (`propfind-finite-depth`), and one without Depth lists one level. Dead
+properties (PROPPATCH) are accepted and not kept.
+
 ### Bundles (§G.4)
 
 ```sh
@@ -2804,6 +2946,7 @@ internal/release     release documents (§F.9)
 internal/janitor     branch cleanup with claim verification (§F.6)
 internal/tree        tree service: folders, placements, links, manifests (§B.2–§B.9)
 internal/catalog     tree-derived access and grant issuing (§B.11)
+internal/dav         WebDAV for file managers and editors: namespaces and catalogs as files, saves as diffs (a prototype)
 internal/bundle      bundle format, export and import (§G.4)
 internal/archive     file:// archives for pruning and offline restore (§8.6)
 internal/pgtest      a fresh Postgres database per test (PATCHLOG_TEST_PG)

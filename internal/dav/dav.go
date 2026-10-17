@@ -270,8 +270,8 @@ func (s *Server) authenticate(r *http.Request) (*principal, string) {
 	p := s.principals[id]
 	if p == nil {
 		p = s.newPrincipal(id, s.opt.Client.With(client.WithBearer(pw)))
-		s.principals[id] = p
 		s.evictLocked()
+		s.principals[id] = p
 	}
 	p.used = now
 	s.mu.Unlock()
@@ -279,10 +279,10 @@ func (s *Server) authenticate(r *http.Request) (*principal, string) {
 	return p, ""
 }
 
-// evictLocked drops the least recently seen principals over
-// MaxPrincipals, with their scratch files.
+// evictLocked drops the least recently seen principals, with their
+// scratch files, to make room for one more.
 func (s *Server) evictLocked() {
-	for len(s.principals) > s.opt.MaxPrincipals {
+	for len(s.principals) >= s.opt.MaxPrincipals {
 		var old *principal
 		for _, p := range s.principals {
 			if old == nil || p.used.Before(old.used) {
@@ -412,17 +412,22 @@ func state(ctx context.Context) *reqState {
 }
 
 // record keeps err for errWriter if it is a davError, and returns it.
-// Another failure (no such file) leaves the answer to the handler.
+// Another failure (no such file) leaves the answer to the handler. In
+// local mode the core's 401 refuses the server's own grant, not the
+// user's password, so it is a 502 rather than a new login prompt.
 func (st *reqState) record(err error) error {
 	if err == nil {
 		return nil
 	}
 	var de *davError
-	if errors.As(err, &de) {
-		st.err = de
-	} else {
+	if !errors.As(err, &de) {
 		st.err = nil
+		return err
 	}
+	if de.status == http.StatusUnauthorized && !st.s.opt.Gateway {
+		de = fail(http.StatusBadGateway, "the core refused this server's grant (-bearer): %s", de.msg)
+	}
+	st.err = de
 	return err
 }
 

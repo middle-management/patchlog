@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,7 +16,7 @@ import (
 // authEnv: a core with authentication, namespace docs readable with a
 // grant of key k, and a WebDAV server in gateway mode, or in local mode
 // with user:svc's grant and the password "s3cret".
-func authEnv(t *testing.T, gateway bool) (*env, clienttest.Key) {
+func authEnv(t *testing.T, gateway bool, with ...func(*dav.Options)) (*env, clienttest.Key) {
 	t.Helper()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
@@ -28,6 +29,9 @@ func authEnv(t *testing.T, gateway bool) (*env, clienttest.Key) {
 	if !gateway {
 		opt.Client = s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:svc", []string{"docs"}, writer)))
 		opt.Password, e.pw = "s3cret", "s3cret"
+	}
+	for _, f := range with {
+		f(&opt)
 	}
 	srv, err := dav.New(opt)
 	if err != nil {
@@ -108,4 +112,44 @@ func TestLocalMode(t *testing.T) {
 		t.Fatalf("entry %+v", en)
 	}
 	sameStrings(t, "listing", names(e.propfind("/docs/"), "/docs/"), []string{"a.json"})
+
+	// The core refusing the server's grant isn't the user's password: 502.
+	bad := clienttest.NewKey("k").Grant(t, e.s.Now(), "user:svc", []string{"docs"}, []string{"read"})
+	srv := must(dav.New(dav.Options{Client: e.s.Client(t, client.WithBearer(bad)), Namespaces: []string{"docs"}, Password: "s3cret", Logf: t.Logf}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	e2 := &env{t: t, ctx: e.ctx, s: e.s, c: e.c, dav: hs, pw: "s3cret"}
+	r := e2.expect(e2.do("PROPFIND", "/docs/", "", "Depth", "1"), 502, "PROPFIND with a refused grant")
+	if r.header.Get("WWW-Authenticate") != "" || !strings.Contains(r.body, "-bearer") {
+		t.Fatalf("502 %v %q", r.header, r.body)
+	}
+}
+
+// A gateway keeps MaxPrincipals principals, dropping the least recently
+// seen with its scratch files.
+func TestGatewayEviction(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	now := time.Now()
+	e, k := authEnv(t, true, func(o *dav.Options) {
+		o.MaxPrincipals = 2
+		// Every reading a millisecond later: no two requests tie.
+		o.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); now = now.Add(time.Millisecond); return now }
+	})
+	g := map[string]string{}
+	for _, u := range []string{"a", "b", "c"} {
+		g[u] = k.Grant(t, e.s.Now(), "user:"+u, []string{"docs"}, []string{"read"})
+	}
+	e.expect(e.doAs(g["a"], "PUT", "/docs/.scratch", "a"), 201, "a's scratch")
+	e.expect(e.doAs(g["b"], "PUT", "/docs/.scratch", "b"), 201, "b's scratch")
+	e.expect(e.doAs(g["a"], "GET", "/docs/.scratch", ""), 200, "a again")
+	e.expect(e.doAs(g["c"], "PUT", "/docs/.scratch", "c"), 201, "c's scratch")
+	for _, u := range []string{"a", "c"} {
+		if r := e.expect(e.doAs(g[u], "GET", "/docs/.scratch", ""), 200, u+" kept"); r.body != u {
+			t.Fatalf("%s's scratch %q", u, r.body)
+		}
+	}
+	// b comes back as a new principal, without its scratch file (and a,
+	// now the least recently seen, goes).
+	e.expect(e.doAs(g["b"], "GET", "/docs/.scratch", ""), 404, "b, dropped")
 }
