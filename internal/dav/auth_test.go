@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -273,4 +274,182 @@ func TestGatewayPartialGrant(t *testing.T) {
 		t.Fatalf("PROPFIND /secret/: %d %s", r.status, r.body)
 	}
 	sameStrings(t, "cat/root", names(g.propfind("/cat/root/"), "/cat/root/"), []string{"docs.a.json"})
+}
+
+// A grant the core refuses for its key's scope (a lifetime over the
+// key's maxTtl, a sub outside its pattern) reads as 404 there, as a
+// namespace the grant can't see: that isn't an acceptance. Nothing is
+// kept for it, in a namespace that isn't public or one that is.
+func TestGatewayScopeRefused(t *testing.T) {
+	t.Parallel()
+	e, _ := authEnv(t, true)
+	k2, k3 := clienttest.NewKey("k2"), clienttest.NewKey("k3")
+	for _, ns := range []string{"scoped", "pub"} {
+		ttl := k2.Entry("read", "create", "append")
+		ttl["maxTtl"] = "PT15M"
+		subs := k3.Entry("read", "create", "append")
+		subs["sub"] = "partner:.*"
+		read := "grant"
+		if ns == "pub" {
+			read = "public"
+		}
+		op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, ns)))
+		must(op.CreateNamespace(e.ctx, ns, map[string]any{"read": read, "keys": []any{ttl, subs}}))
+	}
+	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"scoped", "pub"}, Gateway: true, Logf: t.Logf}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	g := &env{t: t, ctx: e.ctx, s: e.s, c: e.c, dav: hs}
+	for _, ns := range []string{"scoped", "pub"} {
+		for what, tok := range map[string]string{
+			"over maxTtl":          k2.Grant(t, e.s.Now(), "user:mallory", []string{ns}, []string{"read"}),
+			"outside the sub rule": k3.Grant(t, e.s.Now(), "user:mallory", []string{ns}, []string{"read"}),
+		} {
+			r := g.doAs(tok, "PUT", "/"+ns+"/.junk", "x")
+			if r.status != 401 || !strings.HasPrefix(r.header.Get("WWW-Authenticate"), "Basic") {
+				t.Errorf("%s, %s: %d %s", ns, what, r.status, r.body)
+			}
+		}
+	}
+	// Within the key's scope, it is accepted.
+	ok := k2.Grant(t, e.s.Now(), "user:alice", []string{"scoped"}, []string{"read"}, map[string]any{"exp": e.s.Now().Add(10 * time.Minute).Format(time.RFC3339)})
+	g.expect(g.doAs(ok, "PUT", "/scoped/.swp", "x"), 201, "a grant within the key's scope")
+}
+
+// Asked again, a grant the key's scope no longer covers is refused, and
+// what was kept for it goes, as for a revoked one.
+func TestGatewayReverify(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	now := time.Now()
+	clock := func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	k := clienttest.NewKey("k")
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+	cr := must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	admin := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"docs"}, []string{"read", "create", "append", "config"})))
+	srv := must(dav.New(dav.Options{Client: s.Client(t), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf, Now: clock, VerifyEvery: time.Minute}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	e := &env{t: t, ctx: ctx, s: s, c: admin, dav: hs}
+	alice := k.Grant(t, s.Now(), "user:alice", []string{"docs"}, []string{"read"})
+	bob := k.Grant(t, s.Now(), "user:bob", []string{"docs"}, []string{"read"})
+	e.expect(e.doAs(alice, "PUT", "/docs/.swp", "alice"), 201, "alice's scratch")
+	e.expect(e.doAs(bob, "PUT", "/docs/.swp", "bob"), 201, "bob's scratch")
+	ent := k.Entry("*")
+	ent["sub"] = "user:(admin|bob)"
+	must(admin.PatchConfig(ctx, "docs", cr.Config, []any{map[string]any{"op": "replace", "path": "/keys/0", "value": ent}}))
+	mu.Lock()
+	now = now.Add(2 * time.Minute)
+	mu.Unlock()
+	e.expect(e.doAs(alice, "GET", "/docs/.swp", ""), 401, "alice, out of the key's scope")
+	if r := e.expect(e.doAs(bob, "GET", "/docs/.swp", ""), 200, "bob, in it"); r.body != "bob" {
+		t.Fatalf("bob's scratch %q", r.body)
+	}
+}
+
+// A namespace made public is public at once to verification: a forged
+// grant, which its reads ignore, isn't taken as accepted for the minute
+// the gateway took it for private.
+func TestGatewayPublicityChange(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	k := clienttest.NewKey("k")
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+	cr := must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	admin := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"docs"}, []string{"read", "config"})))
+	srv := must(dav.New(dav.Options{Client: s.Client(t), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	e := &env{t: t, ctx: ctx, s: s, c: admin, dav: hs}
+	alice := k.Grant(t, s.Now(), "user:alice", []string{"docs"}, []string{"read"})
+	e.expect(e.doAs(alice, "PROPFIND", "/", "", "Depth", "0"), 207, "alice")
+	must(admin.PatchConfig(ctx, "docs", cr.Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "public"}}))
+	for i := 0; i < 3; i++ {
+		forged := clienttest.NewKey("x").Grant(t, s.Now(), "user:mallory"+strconv.Itoa(i), []string{"docs"}, []string{"read"})
+		e.expect(e.doAs(forged, "PUT", "/docs/.junk", "x"), 401, "a forged grant after the namespace turned public")
+	}
+	carol := k.Grant(t, s.Now(), "user:carol", []string{"docs"}, []string{"read"})
+	e.expect(e.doAs(carol, "PUT", "/docs/.swp", "x"), 201, "a valid one")
+}
+
+// A grant root is the namespace that verified it with its key's kid and
+// the subject: a key of the same kid in another served namespace mints
+// grants of another root, which don't push out the first one's
+// principals nor fill its scratch quota.
+func TestGatewayRootPerNamespace(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	evil := clienttest.NewKey("k")
+	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "other")))
+	must(op.CreateNamespace(e.ctx, "other", map[string]any{"read": "grant", "keys": []any{evil.Entry("*")}}))
+	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"docs", "other"}, Gateway: true, Logf: t.Logf,
+		MaxPrincipalsPerRoot: 2, ScratchBytes: 1 << 20, MaxFileSize: 1 << 20}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	g := &env{t: t, ctx: e.ctx, s: e.s, c: e.c, dav: hs}
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append"})
+	g.expect(g.doAs(alice, "PUT", "/docs/.a.json.swp", "alice's unsaved work"), 201, "alice's swap")
+	for i := 0; i < 3; i++ {
+		tok := evil.Grant(t, e.s.Now().Add(time.Duration(i)*time.Second), "user:alice", []string{"other"}, []string{"read"})
+		g.expect(g.doAs(tok, "PUT", "/other/.fill", strings.Repeat("F", 400<<10)), 201, "the other namespace's alice")
+	}
+	if r := g.expect(g.doAs(alice, "GET", "/docs/.a.json.swp", ""), 200, "alice's swap, kept"); r.body != "alice's unsaved work" {
+		t.Fatalf("alice's swap %q", r.body)
+	}
+}
+
+// Before a grant is verified, the gateway says nothing of what it serves,
+// and a self-signed grant naming every namespace costs the core a few
+// requests, not one per namespace served; a refused grant presented again
+// soon costs none.
+func TestGatewayPreauth(t *testing.T) {
+	t.Parallel()
+	var calls atomic.Int64
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true, Wrap: func(h http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			h.ServeHTTP(w, r)
+		})
+	}})
+	ctx := context.Background()
+	k := clienttest.NewKey("k")
+	var nss []string
+	for i := 0; i < 6; i++ {
+		ns := "ns" + strconv.Itoa(i)
+		nss = append(nss, ns)
+		op := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
+		must(op.CreateNamespace(ctx, ns, map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	}
+	srv := must(dav.New(dav.Options{Client: s.Client(t), Namespaces: nss, Catalogs: []string{"secret-cat"}, Gateway: true, Logf: t.Logf}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	e := &env{t: t, ctx: ctx, s: s, dav: hs}
+	self := clienttest.NewKey("x").Grant(t, s.Now(), "x", []string{"nope"}, []string{"read"})
+	r := e.expect(e.doAs(self, "GET", "/", ""), 401, "a self-signed grant naming nothing served")
+	if strings.Contains(r.body, "ns0") || strings.Contains(r.body, "secret-cat") {
+		t.Fatalf("401 %q", r.body)
+	}
+	star := func(i int) string {
+		return clienttest.NewKey("x").Grant(t, s.Now(), "x"+strconv.Itoa(i), []string{"*"}, []string{"read"})
+	}
+	e.expect(e.doAs(star(-1), "GET", "/", ""), 401, "warm the publicity cache")
+	calls.Store(0)
+	for i := 0; i < 10; i++ {
+		e.expect(e.doAs(star(i), "GET", "/", ""), 401, "a forged grant naming everything")
+	}
+	if n := calls.Load(); n > 30 {
+		t.Fatalf("10 forged grants: %d requests to the core", n)
+	}
+	again := star(99)
+	e.expect(e.doAs(again, "GET", "/", ""), 401, "a forged grant")
+	calls.Store(0)
+	for i := 0; i < 5; i++ {
+		e.expect(e.doAs(again, "GET", "/", ""), 401, "the same forged grant again")
+	}
+	if n := calls.Load(); n != 0 {
+		t.Fatalf("a refused grant again: %d requests to the core", n)
+	}
 }

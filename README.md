@@ -2138,18 +2138,25 @@ API, and keeps nothing but memory caches.
 - **Gateway mode** (`-gateway`) has no grant of its own: a request's Basic password is the grant,
   sent upstream as `Authorization: Bearer` (the user name is ignored), so the core decides what
   each user may read and write, and the revisions are the grant's subject's. Nothing is kept for
-  a grant before the core has accepted it: a read of a served namespace the grant names, where
-  the core answers `401` to a grant none of its keys verifies (in a public namespace, whose reads
-  ignore a bad grant, the grant is verified against the namespace document's keys instead, as
-  consumers verify them). It is asked again every 5 minutes, so a revoked grant loses what was
-  kept for it. A grant the core doesn't accept is `401` with the Basic challenge, so clients ask
-  again. Grants must not cross plain HTTP: it refuses to start on an address other than loopback
-  without `-tls-cert` and `-tls-key`, unless `-insecure`, and warns when `-api` is plain HTTP to
-  another host. Both modes take `-tls-cert` and `-tls-key`.
+  a grant before the core has accepted it: a read of a served namespace the grant names (its
+  gestures listing, §7.4, which needs only `read`; of the first three it names), which the core
+  answers to a grant one of its keys verifies, in the key's scope, with `read` there; its `401`,
+  or its `404` (a grant a key's scope refuses reads as a namespace it can't see, §7), is no
+  acceptance. In a public namespace, whose reads ignore a bad grant, the grant is verified
+  against the namespace document's keys instead, as consumers verify them, key scope included;
+  whether a namespace is public is asked again whenever a stale answer would let a grant through.
+  It is asked again every 5 minutes, so a revoked grant, or one its key's scope no longer covers,
+  loses what was kept for it. A grant the core doesn't accept is `401` with the Basic challenge,
+  so clients ask again, and says nothing of what is served; it is refused for 30 s without asking
+  the core again, and at most 8 grants are verified at once. Grants must not cross plain HTTP:
+  it refuses to start on an address other than loopback without `-tls-cert` and `-tls-key`,
+  unless `-insecure`, and warns when `-api` is plain HTTP to another host. Both modes take
+  `-tls-cert` and `-tls-key`.
 - What the server keeps per user is per principal (a hash of the upstream grant) and never shared:
   temporary files and locks, dropped with the principal (in a gateway, after an hour idle, or to
-  make room: at most 256 principals, and 8 per grant root, the authority block's `kid` and `sub`,
-  so tokens attenuated from one grant offline push out only their own; never one with a request
+  make room: at most 256 principals, and 8 per grant root, the namespace that verified the grant
+  with its authority block's `kid` and `sub` (a kid names a key of one namespace's document), so
+  tokens attenuated from one grant offline push out only their own; never one with a request
   in flight); and the versions of each document it was served or wrote, the bases of its saves
   (below), kept for a day apart from the principal, within 128 MiB for all users, where the grant
   root keeping the most gives way first, so one user's uploads don't push out another's records

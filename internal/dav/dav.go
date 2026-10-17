@@ -96,9 +96,10 @@ type Options struct {
 	RecordIdle  time.Duration
 	// MaxPrincipals bounds the principals a gateway keeps state for, the
 	// least recently seen without a request in flight dropped first
-	// (default 256); MaxPrincipalsPerRoot those of one grant root, its
-	// authority block's kid and sub, so tokens attenuated from one grant
-	// offline can't push out others' (default 8).
+	// (default 256); MaxPrincipalsPerRoot those of one grant root (the
+	// namespace that verified it, its authority block's kid and sub), so
+	// tokens attenuated from one grant offline can't push out others'
+	// (default 8).
 	MaxPrincipals, MaxPrincipalsPerRoot int
 	// VerifyEvery is how often a gateway asks the core again whether a
 	// principal's grant is accepted (default 5 minutes).
@@ -135,6 +136,9 @@ type Server struct {
 	anon      *client.Client // without a grant
 	checker   *grantcheck.Checker
 	verifying singleflight.Group
+	verifySem chan struct{} // verifications in flight
+	refusedMu sync.Mutex
+	refused   lru.Cache[string, time.Time] // grants the core refused lately, by hash
 
 	mu           sync.Mutex
 	principals   map[string]*principal // gateway mode, by grant hash
@@ -228,6 +232,8 @@ func New(opt Options) (*Server, error) {
 	if opt.Gateway {
 		s.anon = opt.Client.With(client.WithBearer(""))
 		s.checker = grantcheck.New(s.anon, grantcheck.WithClock(opt.Now))
+		s.verifySem = make(chan struct{}, maxVerifying)
+		s.refused.MaxEntries = 1 << 12
 	} else {
 		s.local = s.newPrincipal("local", opt.Client, &account{root: "local"})
 		s.local.verified = s.start
@@ -481,7 +487,8 @@ func splitIf(h string) (rest, rev string) {
 // authenticate returns the request's principal, or the answer refusing
 // it. Local mode compares the Basic password in constant time. Gateway
 // mode takes it as the grant; nothing is kept for a grant before the core
-// has accepted it (verify), again every VerifyEvery.
+// has accepted it (verify), again every VerifyEvery. A grant refused is
+// refused for refusedFor without asking again.
 func (s *Server) authenticate(r *http.Request) (*principal, *davError) {
 	_, pw, ok := r.BasicAuth()
 	if !ok {
@@ -516,20 +523,48 @@ func (s *Server) authenticate(r *http.Request) (*principal, *davError) {
 		return p, nil
 	}
 	s.mu.Unlock()
+	s.refusedMu.Lock()
+	at, refused := s.refused.Get(id)
+	s.refusedMu.Unlock()
+	if refused && now.Sub(at) < refusedFor {
+		return nil, fail(http.StatusUnauthorized, "the core doesn't accept the grant")
+	}
 
 	c := s.opt.Client.With(client.WithBearer(pw))
-	_, err, _ = s.verifying.Do(id, func() (any, error) {
+	v, err, _ := s.verifying.Do(id, func() (any, error) {
 		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), 30*time.Second)
 		defer cancel()
-		return nil, s.verify(ctx, c, g, pw)
+		select {
+		case s.verifySem <- struct{}{}:
+		case <-ctx.Done():
+			return "", &davError{status: http.StatusServiceUnavailable, msg: "too many logins at once; try again", header: http.Header{"Retry-After": {"5"}}}
+		}
+		defer func() { <-s.verifySem }()
+		return s.verify(ctx, c, g, pw)
 	})
-	p, de := s.admit(id, rootOf(g), c, err)
+	var de *davError
+	if errors.As(err, &de) && de.status == http.StatusUnauthorized {
+		s.refusedMu.Lock()
+		s.refused.Put(id, now, 1)
+		s.refusedMu.Unlock()
+	}
+	ns, _ := v.(string)
+	p, de := s.admit(id, rootOf(ns, g), c, err)
 	if de != nil {
 		return nil, de
 	}
 	s.sweep()
 	return p, nil
 }
+
+// maxVerifying bounds the grants being verified at once, maxVerifyNS the
+// namespaces asked for one grant, and refusedFor how long a refused grant
+// is refused without asking the core again.
+const (
+	maxVerifying = 8
+	maxVerifyNS  = 3
+	refusedFor   = 30 * time.Second
+)
 
 // admit returns the principal of a grant (id, its root, its client) the
 // core accepted, or refused with err: then what was kept for it goes
@@ -569,10 +604,12 @@ func (s *Server) admit(id, root string, c *client.Client, err error) (*principal
 }
 
 // rootOf is a grant's root: who its authority block was signed for, by
-// which key. Tokens attenuated from one grant (Addendum C) share it.
-func rootOf(g *grant.Grant) string {
+// which key of namespace ns, the one that verified it (a kid names a key
+// of one namespace's document, §C.1). Tokens attenuated from one grant
+// (Addendum C) share it.
+func rootOf(ns string, g *grant.Grant) string {
 	b := g.Blocks[0]
-	return b.Kid + "\x00" + b.Sub
+	return ns + "\x00" + b.Kid + "\x00" + b.Sub
 }
 
 // release ends a request of p.
@@ -592,13 +629,10 @@ type publicity struct {
 }
 
 // verify asks whether the core accepts grant g (token, sent by c) before a
-// gateway keeps anything for it: a read of a served namespace the grant
-// names. A namespace that isn't public answers 401 to a grant none of its
-// keys verifies (§C.2); a public one ignores a bad grant on reads, so
-// there the grant is verified as consumers verify them (grantcheck, with
-// the keys of the namespace document, §C.6). One namespace accepting it is
+// gateway keeps anything for it, in the served namespaces it names (the
+// first maxVerifyNS of them), and returns the one that accepted it. One is
 // enough: another may not exist yet.
-func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, token string) error {
+func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, token string) (string, error) {
 	var named []string
 	for _, ns := range s.namespaces() {
 		if g.NamesNS(ns) {
@@ -606,50 +640,100 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, t
 		}
 	}
 	if len(named) == 0 {
-		return fail(http.StatusUnauthorized, "the grant names none of the namespaces served here (%s)", strings.Join(s.namespaces(), ", "))
+		var nss []string
+		for _, b := range g.Blocks {
+			nss = append(nss, b.NS...)
+		}
+		s.opt.Logf("dav: a grant for %q names none of the namespaces served (%q)", g.Blocks[0].Sub, nss)
+		return "", fail(http.StatusUnauthorized, "the grant names none of the namespaces served here")
+	}
+	if len(named) > maxVerifyNS {
+		named = named[:maxVerifyNS]
 	}
 	why := "no key of a namespace it names verifies it"
 	for _, ns := range named {
-		pub, err := s.isPublic(ctx, ns)
+		ok, reason, err := s.verifyIn(ctx, c, ns, token)
 		if err != nil {
-			return upstream(err)
+			return "", upstream(err)
 		}
-		if pub {
-			_, err := s.checker.Verify(ctx, ns, token)
-			var ae *grant.AuthError
-			switch {
-			case err == nil, errors.As(err, &ae) && ae.Status == http.StatusForbidden:
-				// Verified; what the grant allows is the core's to decide.
-				return nil
-			case ae != nil:
-				why = ae.Msg
-				continue
-			}
-			return upstream(err)
+		if ok {
+			return ns, nil
 		}
-		_, err = c.NSHead(ctx, ns)
-		ae, isAPI := client.AsAPIError(err)
-		switch {
-		case err == nil, client.IsNotFound(err):
-			// 404: verified, without read here (§7 hides the rest).
-			return nil
-		case isAPI && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden):
-			why = apiText(ae)
-			continue
+		if reason != "" {
+			why = reason
 		}
-		return upstream(err)
 	}
-	return fail(http.StatusUnauthorized, "the core doesn't accept the grant: %s", why)
+	return "", fail(http.StatusUnauthorized, "the core doesn't accept the grant: %s", why)
+}
+
+// verifyIn asks whether namespace ns accepts a grant (token, sent by c),
+// or why not. A namespace that isn't public answers its gestures listing
+// (§7.4, which needs only read, whatever the grant's rules say of
+// resources) to a grant its keys verify, in scope, and allow read; it
+// answers 401 to a grant none of its keys verifies, and 404 to the rest,
+// as to a namespace it hides (§7), which isn't an acceptance. A public
+// one ignores a bad grant on reads, so there the grant is verified as
+// consumers verify them (grantcheck, with the keys of the namespace
+// document, §C.6), key scope included. Whether ns is public is asked
+// again when the answer may be out of date: after a private namespace
+// accepted the grant (which a public one would, any grant), and after a
+// public one's document couldn't verify it.
+func (s *Server) verifyIn(ctx context.Context, c *client.Client, ns, token string) (bool, string, error) {
+	pub, err := s.isPublic(ctx, ns, false)
+	if err != nil {
+		return false, "", err
+	}
+	fresh := false
+	if !pub {
+		if ok, why, err := s.askCore(ctx, c, ns); err != nil || !ok {
+			return false, why, err
+		}
+		if pub, err = s.isPublic(ctx, ns, true); err != nil || !pub {
+			return err == nil, "", err
+		}
+		fresh = true
+	}
+	_, err = s.checker.Verify(ctx, ns, token)
+	var ae *grant.AuthError
+	switch {
+	case err == nil:
+		return true, "", nil
+	case !errors.As(err, &ae):
+		return false, "", err
+	case fresh:
+		return false, ae.Msg, nil
+	}
+	if pub, err = s.isPublic(ctx, ns, true); err != nil || pub {
+		return false, ae.Msg, err
+	}
+	return s.askCore(ctx, c, ns)
+}
+
+// askCore reads ns's gestures listing with c, for verifyIn.
+func (s *Server) askCore(ctx context.Context, c *client.Client, ns string) (bool, string, error) {
+	_, _, err := c.GesturesPage(ctx, ns, client.NewGesture(), "")
+	ae, isAPI := client.AsAPIError(err)
+	switch {
+	case err == nil, client.IsNotOffered(err), client.IsPurged(err):
+		// Answered after the read check: not offered in a sealed
+		// namespace, a purged one gone.
+		return true, "", nil
+	case isAPI && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden):
+		return false, apiText(ae), nil
+	case isAPI && ae.Status == http.StatusNotFound:
+		return false, fmt.Sprintf("%s doesn't let it read (a key's scope refuses it, or it lacks read there), or doesn't exist", ns), nil
+	}
+	return false, "", err
 }
 
 // isPublic reports whether ns is read without a grant, asked of the core
-// at most once a minute.
-func (s *Server) isPublic(ctx context.Context, ns string) (bool, error) {
+// at most once a minute, unless fresh.
+func (s *Server) isPublic(ctx context.Context, ns string, fresh bool) (bool, error) {
 	now := s.opt.Now()
 	s.mu.Lock()
 	pi, ok := s.public[ns]
 	s.mu.Unlock()
-	if ok && now.Sub(pi.at) < time.Minute {
+	if ok && !fresh && now.Sub(pi.at) < time.Minute {
 		return pi.public, nil
 	}
 	_, err := s.anon.NSHead(ctx, ns)
