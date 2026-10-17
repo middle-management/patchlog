@@ -339,10 +339,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st.ifMatch = tag
 		}
 		if r.Method == "PUT" {
-			// A create-only PUT of a document the principal just moved
-			// aside (vim's backup on davfs2, which then believes the name
-			// free) is the edit of it.
-			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !p.takeAside(st.path, s.opt.Now(), s.opt.ScratchIdle)
+			// The write that follows a document's move aside (vim's backup)
+			// is the edit of it, even create-only (davfs2 then believes the
+			// name free).
+			aside := p.takeAside(st.path, s.opt.Now(), s.opt.ScratchIdle)
+			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
 		}
 		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
 		case im == "*":

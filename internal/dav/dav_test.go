@@ -679,8 +679,13 @@ func TestVimOnDavfs2(t *testing.T) {
 	_, doc := e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"a": "vim", "b": "theirs"})
 	sameJSON(t, e.lastEntry("docs", "x").Patches, []any{replace("/a", "vim")})
-	// Once only: the next create-only PUT is refused again.
+	// Once only: the next create-only PUT is refused again, as after a
+	// write that followed the move aside without the header.
 	e.expect(e.do("PUT", "/docs/x.json", `{"a": "again"}`, "If-None-Match", "*"), 412, "PUT create-only again")
+	e.expect(e.do("MOVE", "/docs/x.json", "", "Destination", "/docs/x.json~", "Overwrite", "T"), 201, "MOVE to backup")
+	body = e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
+	e.expect(e.do("PUT", "/docs/x.json", edit(t, body, `"a": "vim"`, `"a": "vim 2"`)), 201, "PUT")
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "again"}`, "If-None-Match", "*"), 412, "PUT create-only after it")
 }
 
 // Folders are made only where they can hold documents (catalogs) and

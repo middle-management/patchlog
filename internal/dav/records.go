@@ -94,7 +94,7 @@ func keepRaw(body, rendered []byte) []byte {
 func (s *Server) storeLocked(root string) *recStore {
 	rs := s.recRoots[root]
 	if rs == nil {
-		rs = &recStore{}
+		rs = &recStore{used: s.opt.Now()}
 		rs.docs.MaxEntries, rs.docs.MaxBytes = 1<<16, s.opt.RecordBytes
 		rs.forgotten.MaxEntries = maxForgotten
 		rs.docs.OnEvict = func(k string, _ docRecs) { rs.forgotten.Put(k, true, 1) }
@@ -225,8 +225,8 @@ func (s *Server) trimRecordsLocked() {
 	}
 }
 
-// sweepRecordsLocked forgets the roots that have no records left and
-// recorded nothing for RecordIdle.
+// sweepRecordsLocked forgets the roots that recorded nothing for
+// RecordIdle, whose records have aged out.
 func (s *Server) sweepRecordsLocked(now time.Time) {
 	for root, rs := range s.recRoots {
 		if now.Sub(rs.used) > s.opt.RecordIdle {
@@ -243,6 +243,7 @@ func (s *Server) refuse(p *principal, ns, name string) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	st := s.storeLocked(p.acct.root)
+	st.used = s.opt.Now()
 	d, ok := st.docs.Get(k)
 	if !ok {
 		_, d.lost = st.forgotten.Get(k)

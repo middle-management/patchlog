@@ -268,14 +268,15 @@ func (st *reqState) place(ctx context.Context, t target, v any, body []byte, pre
 		if err != nil {
 			return "", false, upstream(err)
 		}
-		if !cur.sealed {
-			out, based, err := st.rebased(ctx, t.docNS, t.docName, v, cur.value)
-			if err != nil {
-				return "", false, upstream(err)
-			}
-			if !based && !jsonv.Equal(out, dropNonce(cur.value)) {
-				return "", false, fail(http.StatusConflict, "%s/%s exists, with other content, and you haven't opened it here; open it (in %s/) and save your changes there, then copy it into this folder", t.docNS, t.docName, t.docNS)
-			}
+		if cur.sealed {
+			return "", false, fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E); it isn't written over WebDAV", t.docNS, t.docName)
+		}
+		out, based, err := st.rebased(ctx, t.docNS, t.docName, v, cur.value)
+		if err != nil {
+			return "", false, upstream(err)
+		}
+		if !based && !jsonv.Equal(out, dropNonce(cur.value)) {
+			return "", false, fail(http.StatusConflict, "%s/%s exists, with other content, and you haven't opened it here; open it (in %s/) and save your changes there, then copy it into this folder", t.docNS, t.docName, t.docNS)
 		}
 		if err := st.createNode(ctx, t.ns, t.node, node); err != nil {
 			return "", false, err
