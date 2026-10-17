@@ -23,6 +23,7 @@
 package dav
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"crypto/subtle"
@@ -34,6 +35,7 @@ import (
 	"net/url"
 	"path"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,6 +103,9 @@ type Options struct {
 	// tokens attenuated from one grant offline can't push out others'
 	// (default 8).
 	MaxPrincipals, MaxPrincipalsPerRoot int
+	// MaxLocks bounds one principal's locks (default 256), and four times
+	// that one grant root's.
+	MaxLocks int
 	// VerifyEvery is how often a gateway asks the core again whether a
 	// principal's grant is accepted (default 5 minutes).
 	VerifyEvery time.Duration
@@ -119,8 +124,15 @@ type Options struct {
 }
 
 // maxXMLBody bounds a request body other than a PUT's (PROPFIND, PROPPATCH
-// and LOCK carry XML; x/net/webdav decodes it whole).
-const maxXMLBody = 1 << 20
+// and LOCK carry XML, of a few hundred bytes from the clients): x/net/webdav
+// decodes it whole, a value per element, and answers each property back,
+// so a PROPPATCH of a mebibyte of empty properties took gigabytes. One over
+// heavyBody is handled maxHeavy at a time over the server, once read.
+const (
+	maxXMLBody = 64 << 10
+	heavyBody  = 4 << 10
+	maxHeavy   = 4
+)
 
 // Server is the WebDAV handler.
 type Server struct {
@@ -158,6 +170,7 @@ type Server struct {
 	sem      chan struct{}
 	group    singleflight.Group
 	inflight *semaphore.Weighted
+	heavy    chan struct{} // requests with a body over heavyBody being handled
 	gen      atomic.Uint64 // writes through this server: catalog reads older are stale
 }
 
@@ -192,6 +205,7 @@ func New(opt Options) (*Server, error) {
 	def(&opt.RecordBytes, max(128<<20, 8*opt.MaxFileSize))
 	def(&opt.MaxPrincipals, 256)
 	def(&opt.MaxPrincipalsPerRoot, 8)
+	def(&opt.MaxLocks, 256)
 	def(&opt.Retries, 5)
 	defDur(&opt.ScratchIdle, time.Hour)
 	defDur(&opt.RecordIdle, 24*time.Hour)
@@ -209,7 +223,8 @@ func New(opt Options) (*Server, error) {
 	}
 	s := &Server{opt: opt, flat: map[string]bool{}, cats: map[string]bool{}, principals: map[string]*principal{},
 		accounts: map[string]*account{}, public: map[string]publicity{}, recRoots: map[string]*recStore{},
-		sem: make(chan struct{}, opt.FetchConcurrency), inflight: semaphore.NewWeighted(int64(opt.InflightBytes))}
+		sem: make(chan struct{}, opt.FetchConcurrency), inflight: semaphore.NewWeighted(int64(opt.InflightBytes)),
+		heavy: make(chan struct{}, maxHeavy)}
 	s.start = opt.Now()
 	s.docs.MaxEntries, s.docs.MaxBytes = 1<<20, opt.CacheBytes
 	s.seen.MaxEntries = 1 << 17
@@ -288,6 +303,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, `<?xml version="1.0" encoding="utf-8"?><D:error xmlns:D="DAV:"><D:propfind-finite-depth/></D:error>`)
 			return
 		}
+	case "LOCK":
+		// A lock lasts at most ScratchIdle (boundedLS), which the answer
+		// says: x/net/webdav answers with the Timeout asked for.
+		r.Header.Set("Timeout", lockTimeout(r.Header.Get("Timeout"), s.opt.ScratchIdle))
 	case "MOVE", "COPY":
 		// RFC 4918 §10.6: no Overwrite header means T; x/net/webdav takes
 		// it as F for MOVE.
@@ -334,19 +353,50 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st.ifMatch = ifHeaderETag(r.Header.Get("If"))
 		}
 	}
-	if r.Body != nil {
-		var body io.ReadCloser = r.Body
-		if r.Method != "PUT" {
-			body = http.MaxBytesReader(w, r.Body, maxXMLBody)
+	switch {
+	case r.Body != nil && r.Method == "PUT":
+		r.Body = &bodyReader{ReadCloser: r.Body, st: st}
+	case r.Body != nil:
+		// Read whole first, so a slow body holds no slot.
+		b, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxXMLBody))
+		var mbe *http.MaxBytesError
+		switch {
+		case errors.As(err, &mbe):
+			http.Error(w, fmt.Sprintf("a request body other than a PUT's is at most %d bytes", maxXMLBody), http.StatusRequestEntityTooLarge)
+			return
+		case err != nil:
+			http.Error(w, "the request body didn't arrive whole", http.StatusBadRequest)
+			return
 		}
-		r.Body = &bodyReader{ReadCloser: body, st: st}
+		r.Body = io.NopCloser(bytes.NewReader(b))
+		if len(b) > heavyBody {
+			select {
+			case s.heavy <- struct{}{}:
+				defer func() { <-s.heavy }()
+			case <-r.Context().Done():
+				return
+			}
+		}
 	}
-	h := &webdav.Handler{FileSystem: s.fs, LockSystem: p.locks, Logger: func(r *http.Request, err error) {
+	h := &webdav.Handler{FileSystem: s.fs, LockSystem: &boundedLS{LockSystem: p.locks, st: st}, Logger: func(r *http.Request, err error) {
 		if err != nil && !errors.Is(err, errNotExist) {
 			s.opt.Logf("dav: %s %s: %v", r.Method, r.URL.Path, err)
 		}
 	}}
 	h.ServeHTTP(&errWriter{ResponseWriter: w, st: st, realm: s.realm()}, r.WithContext(context.WithValue(r.Context(), stateKey{}, st)))
+}
+
+// lockTimeout is a LOCK's Timeout header (RFC 4918 §10.7) within max: its
+// first value, Infinite or none (infinite) as max.
+func lockTimeout(h string, max time.Duration) string {
+	limit := "Second-" + strconv.Itoa(int(max/time.Second))
+	first := strings.TrimSpace(strings.Split(h, ",")[0])
+	if n, ok := strings.CutPrefix(first, "Second-"); ok {
+		if secs, err := strconv.ParseUint(n, 10, 32); err == nil && time.Duration(secs)*time.Second <= max {
+			return first
+		}
+	}
+	return limit
 }
 
 // bodyReader keeps the first error reading a request body: a PUT whose body
@@ -832,7 +882,36 @@ type account struct {
 	principals int // under Server.mu
 
 	mu           sync.Mutex
-	files, bytes int // scratch
+	files, bytes int   // scratch
+	locks        int   // its principals' locks
+	inflight     int64 // bytes of written files being buffered
+}
+
+// hold reserves n bytes of written files being buffered, within max.
+func (a *account) hold(n, max int64) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.inflight+n > max {
+		return false
+	}
+	a.inflight += n
+	return true
+}
+
+func (a *account) release(n int64) {
+	a.mu.Lock()
+	a.inflight -= n
+	a.mu.Unlock()
+}
+
+// rootInflight is how many bytes of written files one grant root's
+// requests buffer at once: in a gateway, a share of InflightBytes, so
+// one user's stalled uploads don't refuse everyone's writes.
+func (s *Server) rootInflight() int64 {
+	if !s.opt.Gateway {
+		return int64(s.opt.InflightBytes)
+	}
+	return int64(max(s.opt.MaxFileSize, s.opt.InflightBytes/4))
 }
 
 // principal is what the server keeps for one upstream grant: its client,
@@ -854,6 +933,7 @@ type principal struct {
 	dropped bool
 	ns      map[string]nsInfo
 	cats    map[string]*catGraph
+	locked  map[string]time.Time // its locks' tokens, and when they expire
 	deletes map[string]ownDelete // by ns/name: its latest DELETEs
 	aside   map[string]time.Time // documents' paths moved aside to a backup, and when
 }
@@ -923,7 +1003,7 @@ func (p *principal) forgetDelete(ns, name string) {
 
 func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
 	return &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
-		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, deletes: map[string]ownDelete{}, aside: map[string]time.Time{},
+		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, locked: map[string]time.Time{}, deletes: map[string]ownDelete{}, aside: map[string]time.Time{},
 		used: s.opt.Now()}
 }
 

@@ -453,3 +453,91 @@ func TestGatewayPreauth(t *testing.T) {
 		t.Fatalf("a refused grant again: %d requests to the core", n)
 	}
 }
+
+// Locks are bounded: an owner is at most 1 KiB, a lock's timeout at most
+// the scratch idle time (Infinite too), and a principal holds at most
+// MaxLocks of them, so a read-only grant can't pin memory with them.
+func TestGatewayLockBounds(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true, func(o *dav.Options) { o.MaxLocks = 3 })
+	reader := k.Grant(t, e.s.Now(), "user:mallory", []string{"docs"}, []string{"read"})
+	for i := 0; i < 5; i++ {
+		e.create("docs", "f"+strconv.Itoa(i), map[string]any{"v": i})
+	}
+	lock := func(owner string) string {
+		return `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>` + owner + `</D:owner></D:lockinfo>`
+	}
+	e.expect(e.doAs(reader, "LOCK", "/docs/f0.json", lock(strings.Repeat("A", 2048)), "Timeout", "Infinite", "Depth", "0"), 400, "LOCK with a 2 KiB owner")
+	r := e.expect(e.doAs(reader, "LOCK", "/docs/f0.json", lock("me"), "Timeout", "Infinite", "Depth", "0"), 200, "LOCK")
+	if !strings.Contains(r.body, "Second-3600") {
+		t.Fatalf("LOCK Infinite: %s", r.body)
+	}
+	tok := r.header.Get("Lock-Token")
+	for i := 1; i < 3; i++ {
+		e.expect(e.doAs(reader, "LOCK", "/docs/f"+strconv.Itoa(i)+".json", lock("me"), "Depth", "0"), 200, "LOCK")
+	}
+	e.expect(e.doAs(reader, "LOCK", "/docs/f3.json", lock("me"), "Depth", "0"), 507, "a lock over MaxLocks")
+	e.expect(e.doAs(reader, "UNLOCK", "/docs/f0.json", "", "Lock-Token", tok), 204, "UNLOCK")
+	e.expect(e.doAs(reader, "LOCK", "/docs/f3.json", lock("me"), "Depth", "0"), 200, "LOCK after an UNLOCK")
+}
+
+// One grant root holds at most a share of the bytes buffered for writes
+// at once: stalled uploads of one user don't make every other user's
+// saves a 503.
+func TestGatewayInflightShare(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true, func(o *dav.Options) {
+		o.MaxFileSize = 1 << 20
+		o.InflightBytes = 2 << 20
+	})
+	now := e.s.Now()
+	mallory := k.Grant(t, now, "user:mallory", []string{"docs"}, []string{"read"})
+	alice := k.Grant(t, now, "user:alice", []string{"docs"}, []string{"read", "create", "append"})
+	var pws []*io.PipeWriter
+	done := make(chan struct{}, 2)
+	defer func() {
+		for _, pw := range pws {
+			pw.CloseWithError(io.ErrUnexpectedEOF)
+		}
+		for range pws {
+			<-done
+		}
+	}()
+	for i := 0; i < 2; i++ {
+		pr, pw := io.Pipe()
+		pws = append(pws, pw)
+		req := must(http.NewRequest("PUT", e.dav.URL+"/docs/.slow"+strconv.Itoa(i), pr))
+		req.SetBasicAuth("u", mallory)
+		go func() {
+			defer func() { done <- struct{}{} }()
+			if res, err := http.DefaultClient.Do(req); err == nil {
+				io.Copy(io.Discard, res.Body)
+				res.Body.Close()
+			}
+		}()
+		go pw.Write([]byte(strings.Repeat("A", 1<<20-1)))
+	}
+	time.Sleep(300 * time.Millisecond)
+	e.expect(e.doAs(alice, "PUT", "/docs/n.json", `{"pad": "`+strings.Repeat("x", 40000)+`"}`), 201, "alice's PUT while mallory stalls")
+}
+
+// Request bodies other than a PUT's are at most 64 KiB: x/net/webdav
+// decodes them whole, a property at a time, and a PROPPATCH of 1 MiB of
+// empty properties took gigabytes to answer.
+func TestXMLBodyBound(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	reader := k.Grant(t, e.s.Now(), "user:mallory", []string{"docs"}, []string{"read"})
+	e.expect(e.doAs(reader, "PUT", "/docs/.x", "x"), 201, "scratch")
+	pp := func(n int) string {
+		var b strings.Builder
+		b.WriteString(`<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>`)
+		for b.Len() < n {
+			b.WriteString("<a/>")
+		}
+		b.WriteString(`</D:prop></D:set></D:propertyupdate>`)
+		return b.String()
+	}
+	e.expect(e.doAs(reader, "PROPPATCH", "/docs/.x", pp(100<<10)), 413, "PROPPATCH of 100 KiB")
+	e.expect(e.doAs(reader, "PROPPATCH", "/docs/.x", pp(32<<10)), 207, "PROPPATCH of 32 KiB")
+}

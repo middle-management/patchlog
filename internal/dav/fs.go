@@ -795,7 +795,8 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 
 // writeFile buffers a written file whole; Close commits it, to the core
 // for a document name, to the scratch store for any other. The buffers of
-// every request together hold at most InflightBytes (503 beyond).
+// every request together hold at most InflightBytes, those of one grant
+// root's at most rootInflight (503 beyond).
 type writeFile struct {
 	st      *reqState
 	ctx     context.Context
@@ -816,12 +817,19 @@ func (w *writeFile) Write(p []byte) (int, error) {
 		w.err = w.st.record(fail(http.StatusRequestEntityTooLarge, "a file is at most %d bytes", w.st.s.opt.MaxFileSize))
 		return 0, w.err
 	}
-	if !w.st.s.inflight.TryAcquire(int64(len(p))) {
+	n := int64(len(p))
+	if !w.st.s.inflight.TryAcquire(n) {
 		w.err = w.st.record(&davError{status: http.StatusServiceUnavailable, msg: "the server is receiving too many files at once; try again",
 			header: http.Header{"Retry-After": {"2"}}})
 		return 0, w.err
 	}
-	w.held += int64(len(p))
+	if !w.st.p.acct.hold(n, w.st.s.rootInflight()) {
+		w.st.s.inflight.Release(n)
+		w.err = w.st.record(&davError{status: http.StatusServiceUnavailable, msg: "you are sending too many files at once; try again",
+			header: http.Header{"Retry-After": {"2"}}})
+		return 0, w.err
+	}
+	w.held += n
 	return w.buf.Write(p)
 }
 
@@ -830,7 +838,10 @@ func (w *writeFile) Close() error {
 		return nil
 	}
 	w.closed = true
-	defer w.st.s.inflight.Release(w.held)
+	defer func() {
+		w.st.s.inflight.Release(w.held)
+		w.st.p.acct.release(w.held)
+	}()
 	switch {
 	case w.err != nil:
 		return w.err

@@ -292,9 +292,9 @@ func (st *reqState) scratchUnder(dir string) []string {
 	return out
 }
 
-// dropScratch drops every scratch file of a principal being forgotten,
-// returning their bytes; nothing is stored for it afterwards (a request
-// still in flight gets a 503).
+// dropScratch drops every scratch file and lock of a principal being
+// forgotten, returning the files' bytes; nothing is stored for it
+// afterwards (a request still in flight gets a 503).
 func (p *principal) dropScratch() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -302,8 +302,9 @@ func (p *principal) dropScratch() int {
 	p.acct.mu.Lock()
 	p.acct.files -= len(p.scratch)
 	p.acct.bytes -= n
+	p.acct.locks -= len(p.locked)
 	p.acct.mu.Unlock()
-	p.scratch, p.sbytes, p.dropped = map[string]*scratchFile{}, 0, true
+	p.scratch, p.sbytes, p.dropped, p.locked = map[string]*scratchFile{}, 0, true, map[string]time.Time{}
 	return n
 }
 

@@ -2153,15 +2153,17 @@ API, and keeps nothing but memory caches.
   unless `-insecure`, and warns when `-api` is plain HTTP to another host. Both modes take
   `-tls-cert` and `-tls-key`.
 - What the server keeps per user is per principal (a hash of the upstream grant) and never shared:
-  temporary files and locks, dropped with the principal (in a gateway, after an hour idle, or to
-  make room: at most 256 principals, and 8 per grant root, the namespace that verified the grant
-  with its authority block's `kid` and `sub` (a kid names a key of one namespace's document), so
-  tokens attenuated from one grant offline push out only their own; never one with a request
-  in flight); and the versions of each document it was served or wrote, the bases of its saves
-  (below), kept for a day apart from the principal, within 128 MiB for all users, where the grant
-  root keeping the most gives way first, so one user's uploads don't push out another's records
-  (a write keeps the bytes it sent only where they read otherwise rendered, and not when much
-  larger than the rendering, as white space padding would be). A restart loses all of it.
+  temporary files and locks (a lock lasts at most an hour, `Infinite` too, its owner is at most
+  1 KiB, and a principal holds at most 256, a grant root 1024, then `507`), dropped with the
+  principal (in a gateway, after an hour idle, or to make room: at most 256 principals, and 8 per
+  grant root, the namespace that verified the grant with its authority block's `kid` and `sub` (a
+  kid names a key of one namespace's document), so tokens attenuated from one grant offline push
+  out only their own; never one with a request in flight); and the versions of each document it
+  was served or wrote, the bases of its saves (below), kept for a day apart from the principal,
+  within 128 MiB for all users, where the grant root keeping the most gives way first, so one
+  user's uploads don't push out another's records (a write keeps the bytes it sent only where
+  they read otherwise rendered, and not when much larger than the rendering, as white space
+  padding would be). A restart loses all of it.
   Rendered documents are cached by revision id for everyone, and handed to a principal only after
   it read the head, or the listing, with its own grant.
 - `-password-file` and `-bearer-file` readable by others than their owner log a warning.
@@ -2217,10 +2219,12 @@ here that tombstones the document.
 **Saving.**
 
 - A written file is buffered whole (`-max-file-size`, default 16 MiB, and at most 8 times that
-  over every request at once, else `503`) and committed once complete; a body cut short writes
-  nothing. It must be a JSON document (I-JSON, a UTF-8 byte order mark aside), else `400`, and
-  nothing is written. Other request bodies (PROPFIND, PROPPATCH, LOCK) are at most 1 MiB. A
-  request has 10 minutes to arrive.
+  over every request at once, in a gateway a quarter of that, or one file, for one grant root's,
+  else `503`) and committed once complete; a body cut short writes nothing. It must be a JSON
+  document (I-JSON, a UTF-8 byte order mark aside), else `400`, and nothing is written. Other
+  request bodies (PROPFIND, PROPPATCH, LOCK) are at most 64 KiB (`413`), read whole before they
+  are handled, and those over 4 KiB are handled four at a time over the server: x/net/webdav
+  decodes them a value per element. A request has 10 minutes to arrive.
 - A new name is created (`If-None-Match: *` upstream); a tombstoned one is restored, so a name
   keeps one chain (§8.2); a purged one is `403`. A PUT's own `If-None-Match: *` (create only) is
   `412` over an existing file, and `If-Match: *` (edit only) over a missing one; an empty
