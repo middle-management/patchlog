@@ -11,14 +11,15 @@
   indented, with the revision id as ETag. A save is rebased (§11 submit): the diff from the
   version the user had (`If-Match`, or the closest one they were served or wrote) is appended
   to the head with `If-Match`, so others' edits are kept and overlapping ones are a `409`,
-  never an overwrite (writes inside an array count for the whole array, §F.3). Editors' swap,
-  backup and temp files and macOS's `._*` and `.DS_Store` stay in memory per user, so atomic
-  saves and backup renames are edits, not deletes. In catalogs MKCOL makes a folder, MOVE
-  replaces one `parents` entry and DELETE unplaces. Local mode sends one `-bearer` grant behind
-  a password; gateway mode (`-gateway`) sends each request's Basic password upstream as its
-  grant, keeps nothing for a grant the core hasn't accepted, and needs TLS beyond loopback. Not
-  yet: blobs as files, sealed and end-to-end namespaces (read-only), history, live
-  invalidation, batches.
+  never an overwrite (writes inside an array count for the whole array, §F.3); a save that
+  would change a value one of the versions the user may have edited disagrees on is a `409` too,
+  and the reload it asks for becomes the base. Editors' swap, backup and temp files and macOS's
+  `._*` and `.DS_Store` stay in memory per user, so atomic saves and backup renames are edits,
+  not deletes. In catalogs MKCOL makes a folder, MOVE replaces one `parents` entry and DELETE
+  unplaces. Local mode sends one `-bearer` grant behind a password; gateway mode (`-gateway`)
+  sends each request's Basic password upstream as its grant, keeps nothing for a grant the core
+  hasn't accepted, and needs TLS beyond loopback. Not yet: blobs as files, sealed and end-to-end
+  namespaces (read-only), history, live invalidation, batches.
 
 **Fixes:**
 - **A second CDN purge from the index and the tree/catalog services** (D.8, as the core's): a

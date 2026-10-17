@@ -115,7 +115,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 		if err != nil {
 			return false, err
 		}
-		rev, exact = res.ID, st.wrote(ns, name, parent, ps, res, v, body)
+		rev, exact = res.ID, st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, v, body)
 		return false, nil
 	})
 	return rev, exact, err
@@ -126,7 +126,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 // base the principal had, the edit from it is rebased on the last live
 // document, as a save over a live one is: a save that deletes the
 // original before writing (an editor's, or a client's that creates only)
-// keeps others' edits. Without one, or the last document gone (§8.6),
+// keeps others' edits. Without one, or the last document pruned (§8.6),
 // the root is replaced.
 func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, v any) (any, []any, error) {
 	whole := func() (any, []any, error) {
@@ -140,25 +140,26 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 		return whole()
 	}
 	last, err := st.s.doc(ctx, st.p, ns, name, h.Last)
-	if err != nil || last.sealed {
+	switch {
+	case pruned(err):
+		return whole()
+	case err != nil:
+		return nil, nil, err
+	case last.sealed:
 		return whole()
 	}
-	base, ok, err := st.base(ctx, ns, name, v)
+	out, based, err := st.rebased(ctx, ns, name, v, last.value)
 	if err != nil {
 		return nil, nil, err
 	}
-	if !ok {
+	if !based {
 		return whole()
-	}
-	out, clash := rebase(base, v, last.value)
-	if len(clash) > 0 {
-		return nil, nil, conflict(ns, name, clash)
 	}
 	return last.value, withNonce(in, merge.Diff(dropNonce(last.value), out)), nil
 }
 
 // edit appends the principal's edit of ns/name on head: the edit from its
-// base to v, rebased on the head (rebase). Changes others made since the
+// base to v, rebased on the head (rebased). Changes others made since the
 // base are kept; where they overlap the edit's and v doesn't already
 // agree with the head, the save is 409 and nothing is written, never an
 // overwrite. retry: the head moved (412), read it again.
@@ -170,28 +171,22 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	if cur.sealed {
 		return "", false, false, fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E); it isn't written over WebDAV", ns, name)
 	}
-	base, ok, err := st.base(ctx, ns, name, v)
+	out, _, err := st.rebased(ctx, ns, name, v, cur.value)
 	if err != nil {
 		return "", false, false, err
 	}
-	if !ok {
-		// Nothing known of what the saver had: the head, so the file as
-		// written wins.
-		base = cur.value
-	}
-	out, clash := rebase(base, v, cur.value)
-	if len(clash) > 0 {
-		return "", false, false, conflict(ns, name, clash)
-	}
 	ps := merge.Diff(dropNonce(cur.value), out)
 	if len(ps) == 0 {
-		// It already reads so.
+		// It already reads so: nothing is written, so it is no write of
+		// the principal's (an undo would take it for one), but the
+		// principal has the head now, as written if exactly so.
 		exact := jsonv.Equal(cur.value, v)
 		if exact {
-			st.s.remember(st.p, ns, name, record{rev: head, raw: body, exact: true})
+			st.s.remember(st.p, ns, name, record{rev: head, raw: keepRaw(body, cur.rendered)}, false)
 		}
 		return head, exact, false, nil
 	}
+	paths := writesOf(dropNonce(cur.value), ps)
 	ps = withNonce(in, ps)
 	res, err := st.p.c.Append(ctx, ns, name, head, ps)
 	switch {
@@ -200,11 +195,12 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	case client.IsGone(err):
 		return "", false, false, fail(http.StatusConflict, "%s/%s was deleted meanwhile", ns, name)
 	case isPatchFailure(err):
+		st.s.refuse(st.p, ns, name)
 		return "", false, false, fail(http.StatusConflict, "your edit no longer applies to %s/%s, which someone else changed: %s; reload it and edit again", ns, name, apiText(errAPI(err)))
 	case err != nil:
 		return "", false, false, err
 	}
-	return res.ID, st.wrote(ns, name, cur.value, ps, res, v, body), false, nil
+	return res.ID, st.wrote(ns, name, cur.value, ps, paths, res, v, body), false, nil
 }
 
 func conflict(ns, name string, clash []string) error {
@@ -217,71 +213,228 @@ func errAPI(err error) *client.APIError {
 	return ae
 }
 
+// pruned reports a revision the core no longer serves: 404, or 410
+// (pruned, §8.6, or the resource's chain gone).
+func pruned(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	return ok && (ae.Status == http.StatusNotFound || ae.Status == http.StatusGone)
+}
+
 // candidate is a version a save may have been edited from.
 type candidate struct {
 	doc   any
+	seq   uint64
 	wrote bool
+	paths []pointer.Pointer
 }
 
-// base returns what v, a save of ns/name, was edited from, false if
-// nothing is known: the revision the PUT's If-Match (or If header) names,
-// else one of the principal's records (records.go). That is the record
-// closest to v, the one its edit changes the fewest paths of, the newest
-// of equals: an editor's buffer is the version it opened or last saved
-// plus the user's edit, while another program's GET (a preview, a second
-// window) or another client's save moves on without it. A v equal to an
-// older version is a save of it unchanged, or, when the principal wrote
-// since, an undo of what it wrote: then the newest write is the base.
-func (st *reqState) base(ctx context.Context, ns, name string, v any) (any, bool, error) {
-	recs := st.s.recordsOf(st.p, ns, name)
+// candidates returns the versions a save of ns/name may have been edited
+// from, oldest first, and whether records of it were lost (records.go).
+// That is the revision the PUT's If-Match (or If header) names, and the
+// writes of the principal's it holds merged (whose tag a client may learn
+// from a listing, or a HEAD after the PUT); else the principal's records.
+// A revision pruned since (§8.6) is no candidate; one that can't be read
+// otherwise (a 429, a 5xx) fails the save, and an If-Match no readable
+// revision answers to is a 412.
+func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidate, bool, error) {
+	d := st.s.recordsOf(st.p, ns, name)
 	var cs []candidate
-	add := func(r record) {
-		if r.wrote() {
-			if d, err := jsonv.Parse(trimBOM(r.raw)); err == nil {
-				cs = append(cs, candidate{doc: d, wrote: true})
+	add := func(r record) (bool, error) {
+		c := candidate{seq: r.seq, wrote: r.wrote, paths: r.paths}
+		var err error
+		switch {
+		case r.doc != nil:
+			c.doc, err = jsonv.Parse(r.doc)
+		case r.raw != nil:
+			c.doc, err = jsonv.Parse(trimBOM(r.raw))
+		default:
+			e, err := st.s.doc(ctx, st.p, ns, name, r.rev)
+			switch {
+			case pruned(err):
+				return false, nil
+			case err != nil:
+				return false, err
+			case e.sealed:
+				return false, nil
 			}
-			return
+			c.doc = e.value
 		}
-		// A revision that can't be read any more (pruned, §8.6) is no
-		// candidate.
-		if e, err := st.s.doc(ctx, st.p, ns, name, r.rev); err == nil && !e.sealed {
-			cs = append(cs, candidate{doc: e.value})
+		if err != nil {
+			// What this server parsed before: not expected to fail.
+			return false, nil
 		}
+		cs = append(cs, c)
+		return true, nil
 	}
-	if st.ifMatch != "" {
-		// What the client says it had; a write of its own the revision
-		// holds merged (whose tag a client may learn from a listing).
-		add(record{rev: st.ifMatch})
-		for _, r := range recs {
-			if r.wrote() && r.rev == st.ifMatch {
-				add(r)
+	if st.ifMatch == "" {
+		for _, r := range d.rs {
+			if _, err := add(r); err != nil {
+				return nil, false, err
 			}
 		}
+		return cs, d.lost, nil
 	}
-	if len(cs) == 0 {
-		for _, r := range recs {
-			add(r)
+	// What the client says it had, as recent as the principal's newest
+	// record of it.
+	named := record{rev: st.ifMatch}
+	for _, r := range d.rs {
+		if r.rev == st.ifMatch && !r.wrote {
+			named.seq = r.seq
 		}
 	}
-	if len(cs) == 0 {
-		return nil, false, ctx.Err()
+	ok, err := add(named)
+	if err != nil {
+		return nil, false, err
+	}
+	for _, r := range d.rs {
+		if r.wrote && r.rev == st.ifMatch {
+			got, err := add(r)
+			if err != nil {
+				return nil, false, err
+			}
+			ok = ok || got
+		}
+	}
+	if !ok {
+		return nil, false, fail(http.StatusPreconditionFailed, "%s/%s has no revision %s (If-Match) to rebase the save on; reload it and edit again", ns, name, st.ifMatch)
+	}
+	sort.SliceStable(cs, func(i, j int) bool { return cs[i].seq < cs[j].seq })
+	return cs, false, nil
+}
+
+// rebased returns v, a save of ns/name, rebased on head (§11 submit), and
+// whether a base of the principal's was known (else the head is the
+// base, and the file as written wins).
+//
+// The base is the candidate (candidates) closest to v, the one its edit
+// changes the fewest paths of: an editor's buffer is the version it
+// opened or last saved plus the user's edit, while another program's GET
+// (a preview, a second window) moves on without it. A v equal to an older
+// version is a save of it unchanged, or, when the principal wrote since
+// and v reverts just what that write changed, an undo of it: then that
+// write is the base. Of equally close candidates, the newest whose
+// rebase neither clashes nor is unsafe is taken.
+//
+// What isn't guessed: the result may change a path of head only where
+// every candidate agrees with head (unsafe), so whichever one the client
+// really had, no edit someone else made since is undone or overwritten
+// unseen. A save that can't be rebased so is a 409, which asks for a
+// reload (refuse); so is one whose records were lost.
+func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any) (any, bool, error) {
+	cs, lost, err := st.candidates(ctx, ns, name)
+	if err != nil {
+		return nil, false, err
 	}
 	mine := dropNonce(v)
-	best, dist := 0, -1
+	if lost {
+		if jsonv.Equal(mine, dropNonce(head)) {
+			return dropNonce(head), true, nil
+		}
+		st.s.refuse(st.p, ns, name)
+		return nil, false, fail(http.StatusConflict, "%s/%s: this server no longer has the version you edited, so it can't tell your changes from others'; reload it and edit again", ns, name)
+	}
+	if len(cs) == 0 {
+		out, _ := rebase(head, v, head)
+		return out, false, nil
+	}
+	dist := make([]int, len(cs))
+	least := -1
 	for i, c := range cs {
 		b := dropNonce(c.doc)
-		if d := len(writesOf(b, merge.Diff(b, mine))); dist < 0 || d <= dist {
-			best, dist = i, d
+		if dist[i] = len(writesOf(b, merge.Diff(b, mine))); least < 0 || dist[i] < least {
+			least = dist[i]
 		}
 	}
-	if dist == 0 {
-		for i := len(cs) - 1; i > best; i-- {
-			if cs[i].wrote {
-				return cs[i].doc, true, nil
+	var tied []int // newest first
+	for i := len(cs) - 1; i >= 0; i-- {
+		if dist[i] == least {
+			tied = append(tied, i)
+		}
+	}
+	if least == 0 {
+		for i := len(cs) - 1; i >= 0 && cs[i].seq > cs[tied[0]].seq; i-- {
+			if undoes(cs[i], mine) {
+				tied = []int{i}
+				break
 			}
 		}
 	}
-	return cs[best].doc, true, nil
+	var why []string
+	for _, i := range tied {
+		out, clash := rebase(cs[i].doc, v, head)
+		if len(clash) == 0 {
+			if clash = unsafe(out, head, cs); len(clash) == 0 {
+				return out, true, nil
+			}
+		}
+		if why == nil {
+			why = clash
+		}
+	}
+	st.s.refuse(st.p, ns, name)
+	return nil, true, conflict(ns, name, why)
+}
+
+// undoes reports whether mine reverts write w of the principal's: what
+// differs from it is only what w changed.
+func undoes(w candidate, mine any) bool {
+	if !w.wrote || len(w.paths) == 0 {
+		return false
+	}
+	b := dropNonce(w.doc)
+	for _, o := range writesOf(b, merge.Diff(b, mine)) {
+		in := false
+		for _, p := range w.paths {
+			if o.HasPrefix(p) {
+				in = true
+				break
+			}
+		}
+		if !in {
+			return false
+		}
+	}
+	return true
+}
+
+// unsafe returns the paths where out changes head and a candidate holds
+// another value than head, which someone else wrote since: had the client
+// that candidate, the save would undo that write unseen, or overwrite it
+// with a change of its own without a conflict. A value the principal
+// wrote since (a later write of its own there, which head still holds) is
+// its own to change again.
+func unsafe(out, head any, cs []candidate) []string {
+	head, out = dropNonce(head), dropNonce(out)
+	var bad []string
+	for _, q := range writesOf(head, merge.Diff(head, out)) {
+		for _, c := range cs {
+			if !agree(dropNonce(c.doc), head, q) && !ownSince(c, q, head, cs) {
+				p := q.String()
+				if p == "" {
+					p = "(the whole document)"
+				}
+				bad = append(bad, p)
+				break
+			}
+		}
+	}
+	return bad
+}
+
+// ownSince reports whether the principal wrote q after c, and head still
+// holds what it wrote.
+func ownSince(c candidate, q pointer.Pointer, head any, cs []candidate) bool {
+	for _, w := range cs {
+		if !w.wrote || w.seq <= c.seq || !agree(dropNonce(w.doc), head, q) {
+			continue
+		}
+		for _, p := range w.paths {
+			if p.Overlaps(q) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // rebase applies the edit from base to mine onto head (§11 submit): the
@@ -397,12 +550,13 @@ func graft(doc, src any, p pointer.Pointer) (any, bool) {
 	return doc, true
 }
 
-// wrote records a write of v, uploaded as body, as revision res.ID, and
-// reports whether that revision's document is exactly v. The revision's
-// document, the patches applied to parent as the core applies them, is
-// cached with its creation time from the log entry. A create or restore
-// replaces the whole document, so its parent is any object.
-func (st *reqState) wrote(ns, name string, parent any, ps []any, res *client.WriteResult, v any, body []byte) bool {
+// wrote records a write of v, uploaded as body, as revision res.ID, which
+// changed paths, and reports whether that revision's document is exactly
+// v. The revision's document, the patches applied to parent as the core
+// applies them, is cached with its creation time from the log entry. A
+// create or restore replaces the whole document, so its parent is any
+// object.
+func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer.Pointer, res *client.WriteResult, v any, body []byte) bool {
 	var doc any
 	if ops, err := patch.Parse(ps); err == nil {
 		doc, _, err = patch.Apply(parent, true, ops, patch.Options{})
@@ -411,14 +565,21 @@ func (st *reqState) wrote(ns, name string, parent any, ps []any, res *client.Wri
 		}
 	}
 	exact := doc != nil && jsonv.Equal(doc, v)
-	st.s.remember(st.p, ns, name, record{rev: res.ID, raw: body, exact: exact})
+	r := record{rev: res.ID, wrote: true, paths: paths}
+	var e *docEntry
 	if doc != nil {
-		e := &docEntry{value: doc, rendered: render(doc)}
+		e = &docEntry{value: doc, rendered: render(doc)}
 		if res.Entry != nil {
 			e.created, _ = time.Parse(time.RFC3339Nano, res.Entry.Created)
 		}
 		st.s.keep(docKey(ns, name, res.ID), e)
 	}
+	if exact {
+		r.raw = keepRaw(body, e.rendered)
+	} else {
+		r.doc = jsonv.Canonical(v)
+	}
+	st.s.remember(st.p, ns, name, r, false)
 	return exact
 }
 

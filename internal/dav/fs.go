@@ -467,8 +467,13 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	}
 	if st.method == "GET" && t.path == st.path {
 		// What the client now has is a base of its next save, once the
-		// body is sent (a 304 sends none).
+		// body is sent (a 304 sends none). A client whose copy is suspect
+		// gets the document whatever its validators say.
 		st.serve = &stagedServe{ns: hd.ns, name: hd.name, rev: hd.rev}
+		if st.hdr != nil && st.s.stale(st.p, hd.ns, hd.name, hd.rev) {
+			st.hdr.Del("If-None-Match")
+			st.hdr.Del("If-Modified-Since")
+		}
 	}
 	return &memFile{Reader: bytes.NewReader(st.repr(hd)), fi: fi}, nil
 }

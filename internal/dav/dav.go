@@ -89,8 +89,9 @@ type Options struct {
 	// RecordBytes bounds the versions remembered as principals' bases (the
 	// revisions they were served, the content they wrote), for every
 	// principal together (default the larger of 128 MiB and 8 times
-	// MaxFileSize). RecordIdle drops a document's versions untouched that
-	// long (default a day). They outlive the principal's scratch files.
+	// MaxFileSize); over it, the grant root keeping the most gives way
+	// first. RecordIdle drops a document's versions untouched that long
+	// (default a day). They outlive the principal's scratch files.
 	RecordBytes int
 	RecordIdle  time.Duration
 	// MaxPrincipals bounds the principals a gateway keeps state for, the
@@ -142,9 +143,11 @@ type Server struct {
 	lastSweep    time.Time
 	scratchTotal atomic.Int64 // every principal's scratch bytes
 
-	recMu   sync.Mutex
-	records lru.Cache[string, []record]  // by principal and ns/name
-	seen    lru.Cache[string, time.Time] // by principal and ns/name@rev: first shown
+	recMu    sync.Mutex
+	recRoots map[string]*recStore         // by grant root
+	recBytes int                          // what every root's records cost
+	recSeq   uint64                       // records made
+	seen     lru.Cache[string, time.Time] // by principal and ns/name@rev: first shown
 
 	docMu    sync.Mutex
 	docs     lru.Cache[string, *docEntry] // by ns/name@rev
@@ -201,11 +204,10 @@ func New(opt Options) (*Server, error) {
 		opt.Logf = func(string, ...any) {}
 	}
 	s := &Server{opt: opt, flat: map[string]bool{}, cats: map[string]bool{}, principals: map[string]*principal{},
-		accounts: map[string]*account{}, public: map[string]publicity{},
+		accounts: map[string]*account{}, public: map[string]publicity{}, recRoots: map[string]*recStore{},
 		sem: make(chan struct{}, opt.FetchConcurrency), inflight: semaphore.NewWeighted(int64(opt.InflightBytes))}
 	s.start = opt.Now()
 	s.docs.MaxEntries, s.docs.MaxBytes = 1<<20, opt.CacheBytes
-	s.records.MaxEntries, s.records.MaxBytes = 1<<17, opt.RecordBytes
 	s.seen.MaxEntries = 1 << 17
 	for _, ns := range opt.Namespaces {
 		if !client.ValidNSName(ns) {
@@ -264,7 +266,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release(p)
-	st := &reqState{s: s, p: p, method: r.Method, path: slashClean(r.URL.Path), depth: r.Header.Get("Depth")}
+	st := &reqState{s: s, p: p, method: r.Method, path: slashClean(r.URL.Path), depth: r.Header.Get("Depth"), hdr: r.Header}
 	switch r.Method {
 	case "PROPFIND":
 		switch st.depth {
@@ -631,6 +633,9 @@ func (s *Server) sweep() {
 	for _, p := range ps {
 		s.scratchTotal.Add(-int64(p.expireScratch(now.Add(-s.opt.ScratchIdle))))
 	}
+	s.recMu.Lock()
+	s.sweepRecordsLocked(now)
+	s.recMu.Unlock()
 }
 
 // account is what the principals of one grant root share: their number
@@ -684,11 +689,12 @@ type reqState struct {
 	depth  string
 	err    *davError
 
-	ifMatch   string // the revision a PUT's If-Match or If header names
-	matchAny  bool   // If-Match: *
-	noneMatch bool   // If-None-Match: *
-	bodyErr   error  // reading the request body failed
-	noETag    bool   // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
+	hdr       http.Header // the request's
+	ifMatch   string      // the revision a PUT's If-Match or If header names
+	matchAny  bool        // If-Match: *
+	noneMatch bool        // If-None-Match: *
+	bodyErr   error       // reading the request body failed
+	noETag    bool        // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
 	serve     *stagedServe
 
 	lists  map[string]*listing     // by directory path

@@ -2151,8 +2151,10 @@ API, and keeps nothing but memory caches.
   make room: at most 256 principals, and 8 per grant root, the authority block's `kid` and `sub`,
   so tokens attenuated from one grant offline push out only their own; never one with a request
   in flight); and the versions of each document it was served or wrote, the bases of its saves
-  (below), kept for a day apart from the principal, within 128 MiB for all users. A restart loses
-  all of it. Rendered documents are cached by revision id for everyone, and handed to a principal
+  (below), kept for a day apart from the principal, within 128 MiB for all users, where the grant
+  root keeping the most gives way first, so one user's uploads don't push out another's records
+  (a write keeps the bytes it sent only where they read otherwise rendered, and not when much
+  larger than the rendering, as white space padding would be). A restart loses all of it. Rendered documents are cached by revision id for everyone, and handed to a principal
   only after it read the head, or the listing, with its own grant.
 - `-password-file` and `-bearer-file` readable by others than their owner log a warning.
 - Behind a reverse proxy, the proxy must pass the client's `Host` on (nginx: `proxy_set_header Host
@@ -2213,28 +2215,46 @@ here that tombstones the document.
   `412` over an existing file, and `If-Match: *` (edit only) over a missing one.
 - An existing document gets the user's edit rebased on its head (§11 submit): the diff
   (`merge.Diff`) from the version the user edited, the base, to what they wrote, applied to the
-  current head and appended with `If-Match` on it. The base is the revision the PUT's `If-Match`
-  (or an `If` header's entity tag) names; else, of the versions this user was served (a GET's body;
-  a `304` sends none) or wrote in the last day, the one closest to what was written (the fewest
-  changed paths), the newest of equals: an editor's buffer is what it opened or last saved plus
-  the user's edit, while a preview pane's or a second window's GET moves on without it. A file
-  equal to an older version is a save of it unchanged, or, when the user wrote since, an undo of
-  that save. Edits others made since the base are kept: the patch set holds only the user's
+  current head and appended with `If-Match` on it. The base is one of the versions the user may
+  have edited: the revision the PUT's `If-Match` (or an `If` header's entity tag) names, with the
+  user's own writes that revision holds merged; else the versions this user was served (a GET's
+  body; a `304` sends none) or wrote in the last day, at most 16 a document (over that, the oldest
+  but the first goes: the version an editor opened stays while a preview reads others'
+  revisions). Of those, it is the one closest to what was written (the fewest changed paths): an
+  editor's buffer is what it opened or last saved plus the user's edit, while a preview pane's or
+  a second window's GET moves on without it. A file equal to an older version is a save of it
+  unchanged, or, when the user wrote since and the file reverts just what that save changed, an
+  undo of it. Edits others made since the base are kept: the patch set holds only the user's
   changes. Writes count whole arrays (an edit anywhere in an element is an edit of the array, from
   the outermost: elements have no identity, so an index one side names is another element after
   the other's insert or delete; §F.3's array rule). Where the user's writes overlap others' since
   the base and what the user wrote differs from the head there, the save is `409 Conflict` and
-  nothing is written; reload and edit again. A change both made, or a value reloaded since, is no
-  conflict. A head that moves meanwhile (`412`) is read again, the edit checked again and resent,
-  up to five times.
+  nothing is written. A change both made, or a value reloaded since, is no conflict.
+- The base isn't guessed: a save may change the head only where every version the user may have
+  edited agrees with the head (or holds what the user wrote there since), so whichever one their
+  program had, no edit someone else made in between is undone or overwritten unseen. Where they
+  can't be told apart, as the version an editor opened and a newer one a preview read (a one-byte
+  `Range` read counts) when the edit covers what changed in between, the save is a `409` too. A
+  `409` asks for a reload: the user's next GET of the document sends it whatever its validators
+  say (a cached copy may be what the editor had), and drops the versions recorded before the
+  `409`, so the reloaded one is the base of the edit after it. A version that can't be read again
+  for a save (a `429`, a `5xx`) fails it (`503`, `502`) rather than leaving it without a base; one
+  pruned since (§8.6) is none, and an `If-Match` naming no revision that can be read is `412`. A
+  head that moves meanwhile (`412`) is read again, the edit checked again and resent, up to five
+  times.
 - With nothing known of the base (a PUT without `If-Match` from a user never served the document,
   after a restart, or once a day has passed), the head is the base, so the file as written wins.
-  Within one user, the closest version decides: two programs saving the same value, the last
-  wins, and an undo of a save combined with new edits is taken as edits of the older version (the
-  undone change stays).
+  Versions the bounds pushed out are remembered as lost: then a save that changes the document is
+  a `409` until a reload, rather than rebased on what is left. Within one user, the closest
+  version decides: two programs saving the same value, the last wins, and an undo of a save
+  combined with new edits is taken as edits of the older version (the undone change stays).
 - A PUT answers with the revision as its ETag only when that revision holds exactly what was sent;
-  one merged with others' edits, or given a `$nonce`, gets none (RFC 9110 §9.3.4), so no cache
-  keeps what it sent under the merged revision's tag.
+  one merged with others' edits, or given a `$nonce`, gets none (RFC 9110 §9.3.4), and the user's
+  next GET of it sends it whatever its validators say: a client may still file what it sent under
+  the merged revision's tag, which a HEAD or a listing shows (davfs2 asks with a HEAD after such a
+  PUT), and would keep showing it after a `304`. A client that reads the tag from a listing and
+  never GETs again keeps its copy. A save that writes nothing (the file already reads so) is no
+  write of the user's.
 - A save that deletes the original before writing the new version (DELETE, then a PUT or a MOVE
   onto the name) restores it with the user's edit rebased on the last live document, as above.
 - `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
