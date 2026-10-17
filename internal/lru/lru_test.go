@@ -48,3 +48,28 @@ func TestCacheEntriesOnly(t *testing.T) {
 		t.Fatal("the latest entry evicted")
 	}
 }
+
+// RemoveOldest and Remove drop entries without OnEvict, which reports
+// only the entries Put evicts for the bounds.
+func TestCacheRemove(t *testing.T) {
+	var evicted []string
+	c := Cache[string, int]{MaxEntries: 2, OnEvict: func(k string, _ int) { evicted = append(evicted, k) }}
+	c.Put("a", 1, 5)
+	c.Put("b", 2, 7)
+	c.Put("c", 3, 9) // evicts a
+	if len(evicted) != 1 || evicted[0] != "a" {
+		t.Fatalf("evicted %v", evicted)
+	}
+	if k, v, n, ok := c.RemoveOldest(); !ok || k != "b" || v != 2 || n != 7 {
+		t.Fatalf("RemoveOldest: %q %d %d %v", k, v, n, ok)
+	}
+	if !c.Remove("c") || c.Remove("c") || c.Len() != 0 || c.Bytes() != 0 {
+		t.Fatalf("Remove: %d entries, %d bytes", c.Len(), c.Bytes())
+	}
+	if _, _, _, ok := c.RemoveOldest(); ok {
+		t.Fatal("RemoveOldest of an empty cache")
+	}
+	if len(evicted) != 1 {
+		t.Fatalf("evicted %v", evicted)
+	}
+}
