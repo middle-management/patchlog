@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -82,8 +83,10 @@ func (st *reqState) resolve(ctx context.Context, name string) (target, error) {
 	t.ns = segs[0]
 	if len(segs) > 1 && st.isScratchDir(t.dir) {
 		// In a scratch directory, every name is scratch: a macOS app's
-		// safe save writes {name}.json there before moving it out.
-		return st.scratchAt(t, false), nil
+		// safe save writes {name}.json there before moving it out. In a
+		// file manager's folder not yet named, the .json names a person
+		// gives are refused, as anywhere else.
+		return st.scratchAt(t, !st.inAppDir(t.dir), nil), nil
 	}
 	switch {
 	case len(segs) == 1 && st.s.flat[t.ns]:
@@ -91,12 +94,15 @@ func (st *reqState) resolve(ctx context.Context, name string) (target, error) {
 	case len(segs) == 1 && st.s.cats[t.ns]:
 		t.kind = kCatDir
 	case len(segs) == 1:
-		t = st.scratchAt(t, true)
+		t = st.scratchAt(t, true, nil)
 	case st.s.flat[t.ns] && len(segs) == 2:
 		if res, ok := resourceOf(segs[1]); ok {
 			t.kind, t.docNS, t.docName = kDoc, t.ns, res
 		} else {
-			t = st.scratchAt(t, true)
+			t = st.scratchAt(t, true, func(orig string) bool {
+				h, err := st.head(ctx, t.ns, orig)
+				return err == nil && h.State == client.Live
+			})
 		}
 	case st.s.cats[t.ns]:
 		return st.resolveCatalog(ctx, t, segs[1:])
@@ -108,18 +114,81 @@ func (st *reqState) resolve(ctx context.Context, name string) (target, error) {
 
 // scratchAt makes t a scratch path; named, a name a person may have given
 // it: a .json name (any case) that doesn't start with a dot is refused,
-// since it would be kept only in memory and vanish (Finder's "x
-// copy.json", a Save As "Report.json"). Editors' and the system's own
-// files start with a dot or end otherwise (.x.json.swp, ._x.json,
-// x.json~, 4913).
-func (st *reqState) scratchAt(t target, named bool) target {
+// since it would be kept only in memory and vanish (a Save As
+// "Report.json"), but for the name a file manager gives a copy of a
+// document beside it (Finder's Duplicate "x copy.json"), which the rename
+// that follows commits: beside reports whether the document a copy's
+// name names is in t's directory. Editors' and the system's own files
+// start with a dot or end otherwise (.x.json.swp, ._x.json, x.json~,
+// 4913).
+func (st *reqState) scratchAt(t target, named bool, beside func(orig string) bool) target {
 	t.kind = kScratch
 	f, ok := st.scratchPeek(t.path)
 	t.sdir = ok && f.dir
 	if named && !ok && !strings.HasPrefix(t.base, ".") && strings.HasSuffix(strings.ToLower(t.base), ".json") {
-		t.kind = kBadName
+		if orig, isCopy := copyOf(t.base); !isCopy || beside == nil || !beside(orig) {
+			t.kind = kBadName
+		}
 	}
 	return t
+}
+
+// copyNames are the names file managers give a copy of x.json made beside
+// it: Finder's "x copy.json", "x copy 2.json" and "x 2.json" (Keep Both);
+// Explorer's "x - Copy.json", "x - Copy (2).json", "Copy of x.json" and
+// "x (1).json"; GNOME's "x (copy).json", "x (another copy).json", "x (3rd
+// copy).json".
+var copyNames = regexp.MustCompile(`^(?:(?i:copy of )(.+)|(.+?)(?:(?i: copy)(?: \d+)?|(?i: - copy)(?: \(\d+\))?| \((?i:copy|another copy|\d+(?:st|nd|rd|th) copy)\)| \(\d+\)| \d+))\.json$`)
+
+// copyOf returns the resource name of the document a copy's name names.
+func copyOf(base string) (string, bool) {
+	m := copyNames.FindStringSubmatch(base)
+	if m == nil {
+		return "", false
+	}
+	orig := m[1] + m[2]
+	return orig, client.ValidResourceName(orig)
+}
+
+// appDir reports a directory name apps save through (macOS's safe save
+// "(A Document Being Saved By TextEdit)", .TemporaryItems, any name
+// starting with a dot), rather than one a person gave.
+func appDir(base string) bool {
+	return strings.HasPrefix(base, ".") || strings.HasPrefix(base, "(A Document Being Saved By ")
+}
+
+// newFolderNames are the names file managers give a folder they make,
+// before it is named: Finder's "untitled folder", Explorer's "New
+// folder", GNOME's "Untitled Folder", numbered.
+var newFolderNames = regexp.MustCompile(`^(?i:untitled folder|new folder)(?: \d+| \(\d+\))?$`)
+
+// inAppDir reports whether dir, a scratch directory, is or is in one apps
+// save through.
+func (st *reqState) inAppDir(dir string) bool {
+	for d := dir; d != "/" && st.isScratchDir(d); d = path.Dir(d) {
+		if appDir(path.Base(d)) {
+			return true
+		}
+	}
+	return false
+}
+
+// mayScratchDir refuses a scratch directory at t (MKCOL, or a scratch
+// directory moved there) where a person named it: outside a catalog,
+// documents saved in it would be kept in memory only. Apps' directories
+// are made anywhere, and in a catalog folder a file manager's new folder,
+// to be named.
+func (st *reqState) mayScratchDir(t target) error {
+	switch {
+	case appDir(t.base), st.isScratchDir(t.dir) && st.inAppDir(t.dir):
+		return nil
+	case st.s.cats[t.ns] && t.dir != "/" && !st.isScratchDir(t.dir):
+		if newFolderNames.MatchString(t.base) {
+			return nil
+		}
+		return fail(http.StatusForbidden, "%q isn't a folder name: a catalog folder's name is a resource name without a dot, of lowercase letters, digits, \"_\" and \"-\" (§3.6, §B.2)", t.base)
+	}
+	return fail(http.StatusForbidden, "folders are made only in catalogs: %s can't hold one (a folder there would keep what is saved in it in memory only)", t.dir)
 }
 
 // badName is the refusal of a kBadName.
@@ -526,6 +595,9 @@ func (st *reqState) mkdir(ctx context.Context, name string) error {
 	case kScratch:
 		// Not a catalog folder: a scratch directory (an app's safe save,
 		// a file manager's "untitled folder" before it is named).
+		if err := st.mayScratchDir(t); err != nil {
+			return err
+		}
 		return st.scratchMkdir(t.path)
 	}
 	return fail(http.StatusForbidden, "%s names a document, not a directory", t.path)
@@ -626,7 +698,13 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		if hd.e.sealed {
 			return fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E)", hd.ns, hd.name)
 		}
-		return st.scratchPut(dst.path, st.repr(hd))
+		if err := st.scratchPut(dst.path, st.repr(hd)); err != nil {
+			return err
+		}
+		// The client takes the name for free now, and may create it
+		// only (davfs2's If-None-Match: *): that write is the edit.
+		st.p.setAside(src.path, st.s.opt.Now())
+		return nil
 	case live || src.kind == kFolder:
 		if st.isCatalogMove(src, dst) {
 			return st.move(ctx, src, dst)
@@ -646,6 +724,9 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 			st.scratchUnmark(dst.path)
 			return nil
 		case kScratch:
+			if err := st.mayScratchDir(dst); err != nil {
+				return err
+			}
 			return st.scratchRename(src.path, dst.path)
 		}
 		return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)

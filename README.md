@@ -2187,9 +2187,12 @@ here that tombstones the document.
 
 - A flat namespace lists its live resources (the `/heads` of its current `ns_id`) as
   `{name}.json`. Only resource names map to documents (§3.6: lowercase letters, digits, `.`, `_`
-  and `-`). A `.json` name that doesn't start with a dot and names no document (`Notes.JSON`,
-  Finder's Duplicate `x copy.json`, a Save As `Report.json`) is refused with `403`: kept in memory
-  only, it would vanish.
+  and `-`). A `.json` name that doesn't start with a dot and names no document (`Notes.JSON`, a
+  Save As `Report.json`) is refused with `403`: kept in memory only, it would vanish. The names
+  file managers give a copy made beside a document are scratch files instead (Finder's Duplicate
+  `x copy.json`, `x copy 2.json` and Keep Both's `x 2.json`; Explorer's `x - Copy.json`, `Copy of
+  x.json` and `x (1).json`; GNOME's `x (copy).json`), so a copy renamed to a document name starts
+  a document from a template; one not renamed vanishes with the other scratch files.
 - A file reads as its document's canonical form (§3.1) indented by two spaces, keys sorted, with a
   final newline: the same bytes for the same revision, so the ETag is the revision id and saving a
   file unchanged writes nothing. A revision that holds exactly what a user wrote reads back to
@@ -2290,12 +2293,16 @@ fail on them (Finder reads a `507` as a full disk).
   commits its content exactly as a PUT would (an edit, a create or a restore), then drops it.
 - A MOVE of `{name}.json` to a scratch name, an editor moving the original aside as a backup
   before writing the new version, copies it: the document stays, and the write that follows is an
-  edit of it.
-- MKCOL where a catalog folder can't be (a flat namespace, the root, a name that isn't a folder
-  name) makes a scratch directory, where every name is a scratch file: macOS apps save through
-  one (`(A Document Being Saved By TextEdit)`, `.TemporaryItems`), and file managers make
-  `untitled folder` before it is named. Its files go with it, after an hour untouched or when it
-  is deleted. In a catalog, moving one onto a folder name makes that folder.
+  edit of it, even one that creates only (davfs2's `If-None-Match: *`, as it takes the name for
+  free after the MOVE).
+- MKCOL where a catalog folder can't be makes a scratch directory, where every name is a scratch
+  file, for apps that save through one, anywhere (a name starting with a dot, as
+  `.TemporaryItems`, or macOS's `(A Document Being Saved By TextEdit)`), and in a catalog for a
+  file manager's new folder before it is named (`untitled folder`, `New folder`, numbered), where
+  the `.json` names a person gives are refused as elsewhere. Any other MKCOL there is `403`, as is
+  a MOVE giving a scratch directory another name: a person's folder in a flat namespace or at the
+  root would keep what is saved in it in memory only. Its files go with it, after an hour
+  untouched or when it is deleted. In a catalog, moving one onto a folder name makes that folder.
 
 **Catalogs** (Addendum B). The tree is built from the catalog namespace's documents, read from
 the core (parsed with `tree.BuildGraph`). A catalog's directory holds its roots (nodes without
@@ -2306,8 +2313,9 @@ the user's grant doesn't read, aren't shown.
 
 - MKCOL makes a folder, `{ "parents": [{ "href": "/r/{catalog}/{folder}" }] }`, or with
   `"parents": []` at the catalog's root. A name the catalog already has elsewhere is `409` (move
-  that one instead). A name that isn't a folder name (a dot, capitals, a space) makes a scratch
-  directory; MOVE it onto a folder name to make the folder, as Finder's New Folder does.
+  that one instead). A name that isn't a folder name (a dot, capitals, a space) is `403`, but for
+  a file manager's new folder, a scratch directory until named: MOVE it onto a folder name to make
+  the folder, as Finder's New Folder does.
 - A MOVE of a folder or placement to another folder replaces only its `parents` entry for the
   folder it left with one for the folder it enters (one write with `If-Match`, §B.2 "Move"; the
   entry's `order` doesn't come along), and a MOVE to the catalog's root removes the entry.

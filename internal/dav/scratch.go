@@ -10,15 +10,15 @@ import (
 )
 
 // Scratch files: names that aren't documents, such as editors' swap,
-// backup and temporary files, .DS_Store and ._* (AppleDouble), and empty
-// files a client creates under a document name before writing it (LOCK,
-// a 0-byte PUT); and scratch directories, made where a catalog folder
-// can't be (a flat namespace, the root, a name that isn't a folder name),
-// as macOS apps save through one and file managers make "untitled
-// folder" before it is named. They live in memory, per principal and
-// path, bounded per grant root, and expire when left untouched for
-// ScratchIdle. They are never written to the core: moving one onto a
-// document name is how editors save.
+// backup and temporary files, .DS_Store and ._* (AppleDouble), the copies
+// file managers make beside a document, and empty files a client creates
+// under a document name before writing it (LOCK, a 0-byte PUT); and
+// scratch directories, which apps save through (a dot, macOS's "(A
+// Document Being Saved By …)"), and file managers make in a catalog as
+// "untitled folder" before it is named (mayScratchDir). They live in
+// memory, per principal and path, bounded per grant root, and expire when
+// left untouched for ScratchIdle. They are never written to the core:
+// moving one onto a document name is how editors save.
 
 type scratchFile struct {
 	data []byte

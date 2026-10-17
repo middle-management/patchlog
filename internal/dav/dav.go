@@ -314,7 +314,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st.ifMatch = tag
 		}
 		if r.Method == "PUT" {
-			st.noneMatch = r.Header.Get("If-None-Match") == "*"
+			// A create-only PUT of a document the principal just moved
+			// aside (vim's backup on davfs2, which then believes the name
+			// free) is the edit of it.
+			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !p.takeAside(st.path, s.opt.Now(), s.opt.ScratchIdle)
 		}
 		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
 		case im == "*":
@@ -768,6 +771,31 @@ type principal struct {
 	ns      map[string]nsInfo
 	cats    map[string]*catGraph
 	deletes map[string]ownDelete // by ns/name: its latest DELETEs
+	aside   map[string]time.Time // documents' paths moved aside to a backup, and when
+}
+
+// setAside remembers that the principal moved the document at name aside
+// (a backup's MOVE, which copies it): its client takes the name for free.
+func (p *principal) setAside(name string, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k := range p.aside {
+		if len(p.aside) < maxDeletes {
+			break
+		}
+		delete(p.aside, k)
+	}
+	p.aside[name] = now
+}
+
+// takeAside reports, once, whether the principal moved the document at
+// name aside within idle.
+func (p *principal) takeAside(name string, now time.Time, idle time.Duration) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	at, ok := p.aside[name]
+	delete(p.aside, name)
+	return ok && now.Sub(at) <= idle
 }
 
 // ownDelete is a tombstone a principal's DELETE wrote.
@@ -811,7 +839,8 @@ func (p *principal) forgetDelete(ns, name string) {
 
 func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
 	return &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
-		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, deletes: map[string]ownDelete{}, used: s.opt.Now()}
+		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, deletes: map[string]ownDelete{}, aside: map[string]time.Time{},
+		used: s.opt.Now()}
 }
 
 // reqState is one request's view, in its context: the principal, what

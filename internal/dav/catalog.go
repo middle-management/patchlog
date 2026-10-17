@@ -198,7 +198,10 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 		t.kind, t.node = kNewFolder, last
 		return t, nil
 	}
-	return st.scratchAt(t, true), nil
+	return st.scratchAt(t, true, func(orig string) bool {
+		n := cg.under(orig, parent)
+		return n != nil && n.Kind == tree.KindPlacement
+	}), nil
 }
 
 // parentsOf is the parents value placing a node in folder: one live link

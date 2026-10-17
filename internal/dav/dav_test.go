@@ -5,6 +5,7 @@ import (
 	"io"
 	"net"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -506,21 +507,20 @@ func TestSealed(t *testing.T) {
 	e.expect(e.do("PUT", "/sec/y.json", `{"new": true}`), 501, "PUT new in a sealed namespace")
 }
 
-// A .json name a person gives a file that names no document (Finder's
-// Duplicate "x copy.json", a Save As "Report.json", capitals) is refused:
-// kept in memory only, it would vanish within the hour. Editors' and the
-// system's own names stay scratch files.
+// A .json name a person gives a file that names no document (a Save As
+// "Report.json", capitals, a copy's name without the original beside it)
+// is refused: kept in memory only, it would vanish within the hour.
+// Editors' and the system's own names stay scratch files.
 func TestRefusedNames(t *testing.T) {
 	t.Parallel()
 	e := catalogEnv(t)
 	e.create("matches", "x", map[string]any{"a": "1"})
-	for _, p := range []string{"/matches/Report.json", "/matches/Notes.JSON", "/matches/x copy.json", "/Report.json", "/cat/root/season/Report.json", "/cat/root/season/matches.X.json"} {
+	for _, p := range []string{"/matches/Report.json", "/matches/Notes.JSON", "/matches/y copy.json", "/Report.json", "/cat/root/season/Report.json", "/cat/root/season/matches.X.json"} {
 		r := e.expect(e.do("PUT", p, `{"a": "2"}`), 403, "PUT "+p)
 		if !strings.Contains(r.body, "names no document") {
 			t.Fatalf("PUT %s: %q", p, r.body)
 		}
 	}
-	e.expect(e.do("COPY", "/matches/x.json", "", "Destination", "/matches/x copy.json"), 403, "Finder's Duplicate")
 	e.expect(e.do("PUT", "/matches/.x.json.tmp", `{"a": "3"}`), 201, "temporary file")
 	e.expect(e.do("MOVE", "/matches/.x.json.tmp", "", "Destination", "/matches/Report.json"), 403, "MOVE to a refused name")
 	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
@@ -656,4 +656,83 @@ func TestUnreachableCore(t *testing.T) {
 	if !strings.Contains(strings.Join(logged, "\n"), addr) {
 		t.Fatalf("logged %q", logged)
 	}
+}
+
+// vim (or emacs) on davfs2: the original is renamed to the backup, which
+// copies it here (the document stays), then davfs2, which believes the
+// name is free, creates it with LOCK and PUT, both If-None-Match: *. That
+// PUT is the edit of the document moved aside, not a 412 (davfs2 would
+// move the edit into its lost+found).
+func TestVimOnDavfs2(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
+	body := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
+	e.theirs("docs", "x", replace("/b", "theirs"))
+	e.expect(e.do("MOVE", "/docs/x.json", "", "Destination", "/docs/x.json~", "Overwrite", "T"), 201, "MOVE to backup")
+	lk := e.expect(e.do("LOCK", "/docs/x.json", `<?xml version="1.0"?><lockinfo xmlns="DAV:"><lockscope><exclusive/></lockscope><locktype><write/></locktype><owner>davfs2</owner></lockinfo>`,
+		"If-None-Match", "*", "Depth", "0"), 200, "LOCK create")
+	tok := lk.header.Get("Lock-Token")
+	e.expect(e.do("PUT", "/docs/x.json", edit(t, body, `"a": "1"`, `"a": "vim"`), "If-None-Match", "*", "If", "("+tok+")"), 201, "PUT create-only")
+	e.expect(e.do("UNLOCK", "/docs/x.json", "", "Lock-Token", tok), 204, "UNLOCK")
+	e.expect(e.do("DELETE", "/docs/x.json~", ""), 204, "DELETE backup")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"a": "vim", "b": "theirs"})
+	sameJSON(t, e.lastEntry("docs", "x").Patches, []any{replace("/a", "vim")})
+	// Once only: the next create-only PUT is refused again.
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "again"}`, "If-None-Match", "*"), 412, "PUT create-only again")
+}
+
+// Folders are made only where they can hold documents (catalogs) and
+// where apps save through them (a name starting with a dot, TextEdit's
+// "(A Document Being Saved By …)"): a person's folder in a flat namespace
+// or at the root would keep what is saved into it in memory only. In a
+// catalog, a file manager's "untitled folder" waits to be named, and holds
+// no documents meanwhile.
+func TestFoldersWhereNoFolderCanBe(t *testing.T) {
+	t.Parallel()
+	e := catalogEnv(t)
+	for _, p := range []string{"/matches/untitled folder", "/matches/archive", "/untitled folder", "/New folder", "/cat/root/Draft Ideas"} {
+		e.expect(e.do("MKCOL", p, ""), 403, "MKCOL "+p)
+	}
+	e.expect(e.do("MKCOL", "/matches/.hidden", ""), 201, "MKCOL a dot folder")
+	e.expect(e.do("MOVE", "/matches/.hidden", "", "Destination", "/matches/archive"), 403, "MOVE it to a person's name")
+	e.expect(e.do("PUT", "/matches/.hidden/q3.json", `{"draft": true}`), 201, "PUT in an app's folder")
+	e.expect(e.do("MKCOL", "/cat/root/untitled folder", ""), 201, "New Folder in a catalog")
+	e.expect(e.do("PUT", "/cat/root/untitled folder/matches.q3.json", `{"draft": true}`), 403, "PUT a document in it")
+	e.expect(e.do("PUT", "/cat/root/untitled folder/Report.json", `{"draft": true}`), 403, "PUT a .json in it")
+	e.expect(e.do("MOVE", "/cat/root/untitled folder", "", "Destination", "/cat/root/Draft Ideas"), 403, "MOVE it to a name that isn't a folder's")
+	e.expect(e.do("MOVE", "/cat/root/untitled folder", "", "Destination", "/cat/root/drafts"), 201, "MOVE it to a folder name")
+	sameJSON(t, e.parentsOf("drafts"), parents("cat", "root"))
+	e.expect(e.do("PUT", "/cat/root/drafts/matches.q3.json", `{"draft": true}`), 201, "PUT a placement in the folder")
+	if h, _ := e.load("matches", "q3"); h.State != client.Live {
+		t.Fatalf("matches/q3 %v", h.State)
+	}
+}
+
+// Duplicating a document in place, then renaming the copy, is how a
+// file manager starts a document from a template: the copy names file
+// managers give (Finder's "x copy.json", Explorer's "x - Copy.json", Keep
+// Both's "x (1).json", ...) of a document beside them are scratch files,
+// committed by the rename. Other .json names a person gives are refused.
+func TestDuplicateThenRename(t *testing.T) {
+	t.Parallel()
+	e := catalogEnv(t)
+	e.create("matches", "template", map[string]any{"a": "1"})
+	for i, n := range []string{"template copy.json", "template copy 2.json", "template - Copy.json", "template - Copy (2).json", "Copy of template.json",
+		"template (1).json", "template 2.json", "template (copy).json", "template (another copy).json", "template (3rd copy).json"} {
+		p := "/matches/" + url.PathEscape(n)
+		e.expect(e.do("COPY", "/matches/template.json", "", "Destination", p), 201, "COPY to "+n)
+		dst := "/matches/new" + strconv.Itoa(i) + ".json"
+		e.expect(e.do("MOVE", p, "", "Destination", dst), 201, "MOVE "+n)
+		_, doc := e.load("matches", "new"+strconv.Itoa(i))
+		sameJSON(t, doc, map[string]any{"a": "1"})
+	}
+	for _, n := range []string{"Template copy.json", "other copy.json", "season 2026.json"} {
+		e.expect(e.do("PUT", "/matches/"+url.PathEscape(n), `{}`), 403, "PUT "+n)
+	}
+	e.expect(e.do("COPY", "/cat/root/season/matches.derby.json", "", "Destination", "/cat/root/season/matches.derby%20copy.json"), 201, "Duplicate a placement")
+	e.expect(e.do("MOVE", "/cat/root/season/matches.derby%20copy.json", "", "Destination", "/cat/root/season/matches.derby2.json"), 201, "rename it")
+	_, doc := e.load("matches", "derby2")
+	sameJSON(t, doc, map[string]any{"title": "Derby"})
 }
