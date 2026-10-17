@@ -22,9 +22,15 @@ type davError struct {
 	status int
 	msg    string
 	header http.Header
+	cause  error // logged, not answered
 }
 
-func (e *davError) Error() string { return fmt.Sprintf("%d %s", e.status, e.msg) }
+func (e *davError) Error() string {
+	if e.cause != nil {
+		return fmt.Sprintf("%d %s: %v", e.status, e.msg, e.cause)
+	}
+	return fmt.Sprintf("%d %s", e.status, e.msg)
+}
 
 func fail(status int, format string, args ...any) *davError {
 	return &davError{status: status, msg: fmt.Sprintf(format, args...)}
@@ -33,8 +39,9 @@ func fail(status int, format string, args ...any) *davError {
 // upstream maps an error of the core (§12) to what the WebDAV client gets:
 // 401, 403 and 404 pass through, 409 frozen is 423 (a frozen namespace
 // takes no writes, §8.4), 413 stays, the other 422s keep their errors,
-// 429 is 503 with Retry-After, and anything else the core or the network
-// failed with is 502. Writes map 412, 410 and patch failures themselves.
+// 429 is 503 with Retry-After, and anything else the core failed with is
+// 502. A failure to reach the core is 502 too, its details (the core's
+// address) only logged. Writes map 412, 410 and patch failures themselves.
 func upstream(err error) error {
 	if err == nil {
 		return nil
@@ -52,11 +59,11 @@ func upstream(err error) error {
 		return fail(http.StatusNotImplemented, "the content is sealed (Addendum E); sealed and end-to-end namespaces aren't served over WebDAV")
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return fail(http.StatusServiceUnavailable, "%v", err)
+		return &davError{status: http.StatusServiceUnavailable, msg: "the request was canceled or timed out", cause: err}
 	}
 	ae, ok := client.AsAPIError(err)
 	if !ok {
-		return fail(http.StatusBadGateway, "%v", err)
+		return &davError{status: http.StatusBadGateway, msg: "the core can't be reached", cause: err}
 	}
 	msg := apiText(ae)
 	switch {
@@ -142,6 +149,12 @@ func (w *errWriter) WriteHeader(code int) {
 	}
 	w.wrote = true
 	e := w.st.err
+	if code == http.StatusOK || code == http.StatusPartialContent {
+		w.st.served()
+	}
+	if w.st.noETag {
+		w.Header().Del("ETag")
+	}
 	if code < 400 || e == nil {
 		if code == http.StatusUnauthorized {
 			w.Header().Set("WWW-Authenticate", w.realm)
@@ -153,6 +166,7 @@ func (w *errWriter) WriteHeader(code int) {
 	for _, k := range []string{"ETag", "Last-Modified", "Content-Length", "Lock-Token"} {
 		h.Del(k)
 	}
+	w.st.serve = nil
 	for k, v := range e.header {
 		h[k] = v
 	}

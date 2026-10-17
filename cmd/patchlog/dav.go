@@ -9,6 +9,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -77,6 +78,9 @@ func davCmd(args []string) {
 		if !tls && !loopback(*addr) && !*insecure {
 			log.Fatalf("dav: -gateway on %s, not a loopback address, needs -tls-cert and -tls-key (grants must not cross plain HTTP), or -insecure", *addr)
 		}
+		if plainRemote(*api) {
+			log.Printf("patchlog dav: warning: -api %s is plain HTTP to another host: every user's grant crosses the network to it in the clear", *api)
+		}
 	} else {
 		grant := *bearer
 		if *bearerFile != "" {
@@ -110,7 +114,9 @@ func davCmd(args []string) {
 	}
 
 	ctx, sigs := shutdownSignals("patchlog dav")
-	hs := &http.Server{Addr: *addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second}
+	// A request (a written file, at most -max-file-size) has ten minutes
+	// to arrive, and an idle connection two before it is closed.
+	hs := &http.Server{Addr: *addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 2 * time.Minute}
 	ls := sdFlags.server("patchlog dav", hs, nil)
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -153,12 +159,33 @@ func loopback(addr string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// plainRemote reports a base URL of plain HTTP to a host other than this
+// one.
+func plainRemote(api string) bool {
+	u, err := url.Parse(api)
+	if err != nil || u.Scheme != "http" {
+		return false
+	}
+	if u.Hostname() == "localhost" {
+		return false
+	}
+	ip := net.ParseIP(u.Hostname())
+	return ip == nil || !ip.IsLoopback()
+}
+
+// loose reports a file others than its owner may read, as ssh does of a
+// private key.
+func loose(fi os.FileInfo) bool { return fi.Mode().Perm()&0o077 != 0 }
+
 // readSecret reads a grant or password from a file, without surrounding
 // white space.
 func readSecret(flagName, file string) string {
 	b, err := os.ReadFile(file)
 	if err != nil {
 		log.Fatalf("dav: %s: %v", flagName, err)
+	}
+	if fi, err := os.Stat(file); err == nil && loose(fi) {
+		log.Printf("patchlog dav: warning: %s %s may be read by others (mode %v); chmod 600 it", flagName, file, fi.Mode().Perm())
 	}
 	s := strings.TrimSpace(string(b))
 	if s == "" {

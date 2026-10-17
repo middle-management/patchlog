@@ -1,6 +1,10 @@
 package main
 
-import "testing"
+import (
+	"os"
+	"path/filepath"
+	"testing"
+)
 
 // Gateway mode refuses plain HTTP except on loopback addresses.
 func TestDavLoopback(t *testing.T) {
@@ -10,6 +14,36 @@ func TestDavLoopback(t *testing.T) {
 	} {
 		if got := loopback(addr); got != want {
 			t.Errorf("loopback(%q) = %v", addr, got)
+		}
+	}
+}
+
+// Gateway mode warns of grants sent upstream over plain HTTP to another
+// host; secret files others may read are warned of.
+func TestDavWarnings(t *testing.T) {
+	for api, want := range map[string]bool{
+		"http://localhost:8080": false, "http://127.0.0.1:8080": false, "http://[::1]:8080": false, "https://cms.example": false,
+		"http://cms.example": true, "http://10.0.0.5:8080": true, "http://core:8080": true,
+	} {
+		if got := plainRemote(api); got != want {
+			t.Errorf("plainRemote(%q) = %v", api, got)
+		}
+	}
+	dir := t.TempDir()
+	for mode, want := range map[os.FileMode]bool{0o600: false, 0o400: false, 0o640: true, 0o644: true} {
+		f := filepath.Join(dir, mode.String())
+		if err := os.WriteFile(f, []byte("secret"), mode); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(f, mode); err != nil {
+			t.Fatal(err)
+		}
+		fi, err := os.Stat(f)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := loose(fi); got != want {
+			t.Errorf("loose(%v) = %v", mode, got)
 		}
 	}
 }

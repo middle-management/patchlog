@@ -2133,19 +2133,31 @@ API, and keeps nothing but memory caches.
   or `-author NAME` to a `-dev` one. WebDAV clients log in with HTTP Basic: any user name, and the
   password of `-password-file` or a random one logged at start, compared in constant time. It is
   meant for one person on their own machine: the default `-addr` is `127.0.0.1:8090`, and plain
-  HTTP on any other address logs a warning.
+  HTTP on any other address logs a warning. Every program and device that logs in is one user
+  (one principal) to the server: what it keeps per user below is shared between them.
 - **Gateway mode** (`-gateway`) has no grant of its own: a request's Basic password is the grant,
   sent upstream as `Authorization: Bearer` (the user name is ignored), so the core decides what
-  each user may read and write, and the revisions are the grant's subject's. A password that
-  isn't a well-formed, unexpired grant is `401` at once; the core verifies the rest, and its `401`
-  comes back as a `401` with the Basic challenge, so clients ask again. Grants must not cross
-  plain HTTP: it refuses to start on an address other than loopback without `-tls-cert` and
-  `-tls-key`, unless `-insecure`. Both modes take `-tls-cert` and `-tls-key`.
-- What the server keeps per user, temporary files, what each user was served and locks, is per
-  principal (a hash of the upstream grant) and never shared; a gateway keeps at most 256
-  principals, dropping idle ones after an hour. Rendered documents are cached by revision id for
-  everyone, and handed to a principal only after it read the head, or the listing, with its own
-  grant.
+  each user may read and write, and the revisions are the grant's subject's. Nothing is kept for
+  a grant before the core has accepted it: a read of a served namespace the grant names, where
+  the core answers `401` to a grant none of its keys verifies (in a public namespace, whose reads
+  ignore a bad grant, the grant is verified against the namespace document's keys instead, as
+  consumers verify them). It is asked again every 5 minutes, so a revoked grant loses what was
+  kept for it. A grant the core doesn't accept is `401` with the Basic challenge, so clients ask
+  again. Grants must not cross plain HTTP: it refuses to start on an address other than loopback
+  without `-tls-cert` and `-tls-key`, unless `-insecure`, and warns when `-api` is plain HTTP to
+  another host. Both modes take `-tls-cert` and `-tls-key`.
+- What the server keeps per user is per principal (a hash of the upstream grant) and never shared:
+  temporary files and locks, dropped with the principal (in a gateway, after an hour idle, or to
+  make room: at most 256 principals, and 8 per grant root, the authority block's `kid` and `sub`,
+  so tokens attenuated from one grant offline push out only their own; never one with a request
+  in flight); and the versions of each document it was served or wrote, the bases of its saves
+  (below), kept for a day apart from the principal, within 128 MiB for all users. A restart loses
+  all of it. Rendered documents are cached by revision id for everyone, and handed to a principal
+  only after it read the head, or the listing, with its own grant.
+- `-password-file` and `-bearer-file` readable by others than their owner log a warning.
+- Behind a reverse proxy, the proxy must pass the client's `Host` on (nginx: `proxy_set_header Host
+  $host`), or set `X-Forwarded-Host`: MOVE and COPY name their destination by the host the client
+  used, and another host's is refused (`502`).
 
 **Mounting.** macOS Finder: Go → Connect to Server (⌘K), `http://127.0.0.1:8090/` (`https://…`
 for a gateway), as a registered user with any name and the password (the grant). Finder writes
@@ -2154,7 +2166,10 @@ network drive, or `net use Z: https://dav.example/ /user:me PASSWORD`; its WebCl
 Basic credentials only over HTTPS by default (`BasicAuthLevel` 1), so serve with `-tls-cert` and
 `-tls-key` (for `http://localhost`, `BasicAuthLevel` 2 in the registry allows it). GNOME Files:
 Other Locations → Connect to Server, `dav://127.0.0.1:8090/` (`davs://` with TLS), or
-`gio mount dav://127.0.0.1:8090/`.
+`gio mount dav://127.0.0.1:8090/`. rclone: pass `--ignore-size`. A save merged with others' edits,
+or given a `$nonce`, reads back other than it was sent, and rclone deletes a file whose size
+differs from its upload, as it does after a failed upload (a `409` conflict, a `422` refusal);
+here that tombstones the document.
 
 **Layout.**
 
@@ -2169,31 +2184,59 @@ Other Locations → Connect to Server, `dav://127.0.0.1:8090/` (`davs://` with T
 
 - A flat namespace lists its live resources (the `/heads` of its current `ns_id`) as
   `{name}.json`. Only resource names map to documents (§3.6: lowercase letters, digits, `.`, `_`
-  and `-`): `Notes.json` is a temporary file (below).
+  and `-`). A `.json` name that doesn't start with a dot and names no document (`Notes.JSON`,
+  Finder's Duplicate `x copy.json`, a Save As `Report.json`) is refused with `403`: kept in memory
+  only, it would vanish.
 - A file reads as its document's canonical form (§3.1) indented by two spaces, keys sorted, with a
   final newline: the same bytes for the same revision, so the ETag is the revision id and saving a
-  file unchanged writes nothing. Its size is that rendering's (listings read every document, a
-  few at a time, cached by revision id), its type `application/json`, and its Last-Modified the
-  revision's creation time for revisions this server wrote, else when the user was first shown
-  it (the core serves documents without one).
-- Every listing reads the heads again: nothing is pushed, and nothing is stale beyond a request.
+  file unchanged writes nothing. A revision that holds exactly what a user wrote reads back to
+  that user as they wrote it, so a client checking the size of its upload finds it. Its size is
+  that representation's (listings read every document, a few at a time, cached by revision id:
+  `-cache-size` must hold every document of the served namespaces, or each listing reads them all
+  again), its type `application/json`, and its Last-Modified the revision's creation time for
+  revisions this server wrote, else when the user was first shown it (the core serves documents
+  without one), which starts over when the server does.
+- Each listing of a flat namespace reads its heads again; a catalog's tree, and its items' heads,
+  are read again after 5 seconds, or at once after a write through this server. Nothing is pushed.
+- A root listing names the served namespaces without reading them, so a grant that reads only
+  some of them mounts all the same; the others answer `403` when opened.
 
 **Saving.**
 
-- A written file is buffered whole (`-max-file-size`, default 16 MiB) and committed once complete.
-  It must be a JSON document (I-JSON, a UTF-8 byte order mark aside), else `400`, and nothing is
-  written.
-- A new name is created (`If-None-Match: *`); a tombstoned one is restored with the whole document,
-  so a name keeps one chain (§8.2); a purged one is `403`.
-- An existing document gets the diff (`merge.Diff`) from what the user last got (GET) or wrote for
-  it to what they wrote now, appended with `If-Match` on the current head (§11 submit). Edits
-  others made since to other paths are kept: the patch set holds only the user's changes. Where
-  the user's changes overlap theirs (the same value, a value inside one the other replaced or
-  removed, or anything in an array the other changed: writes compared as merges compare them,
-  §F.3), the save is `409 Conflict` and nothing is written; reload and edit again. A head that
-  moves meanwhile (`412`) is read again, the edit checked again and resent, up to five times.
-  Without a record of what the user got (after a restart, or a PUT without a GET), the head is
-  the base, so the file as written wins.
+- A written file is buffered whole (`-max-file-size`, default 16 MiB, and at most 8 times that
+  over every request at once, else `503`) and committed once complete; a body cut short writes
+  nothing. It must be a JSON document (I-JSON, a UTF-8 byte order mark aside), else `400`, and
+  nothing is written. Other request bodies (PROPFIND, PROPPATCH, LOCK) are at most 1 MiB. A
+  request has 10 minutes to arrive.
+- A new name is created (`If-None-Match: *` upstream); a tombstoned one is restored, so a name
+  keeps one chain (§8.2); a purged one is `403`. A PUT's own `If-None-Match: *` (create only) is
+  `412` over an existing file, and `If-Match: *` (edit only) over a missing one.
+- An existing document gets the user's edit rebased on its head (§11 submit): the diff
+  (`merge.Diff`) from the version the user edited, the base, to what they wrote, applied to the
+  current head and appended with `If-Match` on it. The base is the revision the PUT's `If-Match`
+  (or an `If` header's entity tag) names; else, of the versions this user was served (a GET's body;
+  a `304` sends none) or wrote in the last day, the one closest to what was written (the fewest
+  changed paths), the newest of equals: an editor's buffer is what it opened or last saved plus
+  the user's edit, while a preview pane's or a second window's GET moves on without it. A file
+  equal to an older version is a save of it unchanged, or, when the user wrote since, an undo of
+  that save. Edits others made since the base are kept: the patch set holds only the user's
+  changes. Writes count whole arrays (an edit anywhere in an element is an edit of the array, from
+  the outermost: elements have no identity, so an index one side names is another element after
+  the other's insert or delete; §F.3's array rule). Where the user's writes overlap others' since
+  the base and what the user wrote differs from the head there, the save is `409 Conflict` and
+  nothing is written; reload and edit again. A change both made, or a value reloaded since, is no
+  conflict. A head that moves meanwhile (`412`) is read again, the edit checked again and resent,
+  up to five times.
+- With nothing known of the base (a PUT without `If-Match` from a user never served the document,
+  after a restart, or once a day has passed), the head is the base, so the file as written wins.
+  Within one user, the closest version decides: two programs saving the same value, the last
+  wins, and an undo of a save combined with new edits is taken as edits of the older version (the
+  undone change stays).
+- A PUT answers with the revision as its ETag only when that revision holds exactly what was sent;
+  one merged with others' edits, or given a `$nonce`, gets none (RFC 9110 §9.3.4), so no cache
+  keeps what it sent under the merged revision's tag.
+- A save that deletes the original before writing the new version (DELETE, then a PUT or a MOVE
+  onto the name) restores it with the user's edit rebased on the last live document, as above.
 - `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
   the namespace requires nonces or its document can't be read (§C.7).
 - The core's refusals come back as such: `422` with its validation errors (schema, rules,
@@ -2201,35 +2244,44 @@ Other Locations → Connect to Server, `dav://127.0.0.1:8090/` (`davs://` with T
   namespace (with its `successor`); `401` and `403` (but in local mode a `401` refuses the
   server's own grant, not the user's password, so it is `502` rather than a new login prompt). A
   `429` is waited out when its Retry-After is at most 2 s, and is otherwise `503` with
-  Retry-After.
+  Retry-After. A core that can't be reached is `502` (the details are logged).
 - An empty write (a LOCK of a new name, Finder's 0-byte PUT) makes an empty placeholder until
   content arrives; it never truncates a live document.
-- DELETE tombstones (§8.1). Directories can't be made or deleted in a flat namespace or at the
-  root (`403`). A MOVE between two documents is `403`: names are identity (§3.6), so there is no
-  rename. COPY to a new name creates it from the content, and COPY over a document edits it.
+- DELETE tombstones (§8.1). A MOVE between two documents is `403`: names are identity (§3.6), so
+  there is no rename. COPY to a new name creates it from the content, and COPY over a document
+  edits it.
 
 **Temporary and backup files.** Names that aren't `{name}.json`, such as vim's `.x.json.swp`,
 `x.json~` and `4913`, gedit's `.goutputstream-*`, macOS's `.DS_Store` and `._x.json`, or
 `Untitled`, are scratch files: kept in memory per user and directory (at most 256 files and
-32 MiB a user, 256 MiB in all, then `507`), listed beside the documents so editors see what they
-wrote, and dropped after an hour untouched, or when the server stops. They never reach the core.
+folders and 32 MiB a grant root, 256 MiB in all, then `507`), listed beside the documents so
+editors see what they wrote, and dropped after an hour untouched, or when the server stops. They
+never reach the core. Over the bounds, `._*`, `.DS_Store` and `Thumbs.db` make room for others,
+least recently used first, or are dropped rather than refused, so copying many files in doesn't
+fail on them (Finder reads a `507` as a full disk).
 
 - A MOVE of a scratch file onto `{name}.json`, the atomic save of gedit, VS Code and most editors,
   commits its content exactly as a PUT would (an edit, a create or a restore), then drops it.
 - A MOVE of `{name}.json` to a scratch name, an editor moving the original aside as a backup
   before writing the new version, copies it: the document stays, and the write that follows is an
   edit of it.
+- MKCOL where a catalog folder can't be (a flat namespace, the root, a name that isn't a folder
+  name) makes a scratch directory, where every name is a scratch file: macOS apps save through
+  one (`(A Document Being Saved By TextEdit)`, `.TemporaryItems`), and file managers make
+  `untitled folder` before it is named. Its files go with it, after an hour untouched or when it
+  is deleted. In a catalog, moving one onto a folder name makes that folder.
 
 **Catalogs** (Addendum B). The tree is built from the catalog namespace's documents, read from
-the core on every request, so a write shows in the next listing (parsed with `tree.BuildGraph`).
-A catalog's directory holds its roots (nodes without parents); folders are directories named by
-node name; placements are files `{ns}.{name}.json` whose content is their item `/r/{ns}/{name}`,
-read and edited as in the flat view. A node with several parents (a DAG) is under each; cyclic
-nodes and placements whose item isn't live aren't shown.
+the core (parsed with `tree.BuildGraph`). A catalog's directory holds its roots (nodes without
+parents); folders are directories named by node name; placements are files `{ns}.{name}.json`
+whose content is their item `/r/{ns}/{name}`, read and edited as in the flat view. A node with
+several parents (a DAG) is under each; cyclic nodes and placements whose item isn't live, or that
+the user's grant doesn't read, aren't shown.
 
 - MKCOL makes a folder, `{ "parents": [{ "href": "/r/{catalog}/{folder}" }] }`, or with
   `"parents": []` at the catalog's root. A name the catalog already has elsewhere is `409` (move
-  that one instead); a name with a dot or capitals is `403`.
+  that one instead). A name that isn't a folder name (a dot, capitals, a space) makes a scratch
+  directory; MOVE it onto a folder name to make the folder, as Finder's New Folder does.
 - A MOVE of a folder or placement to another folder replaces only its `parents` entry for the
   folder it left with one for the folder it enters (one write with `If-Match`, §B.2 "Move"; the
   entry's `order` doesn't come along), and a MOVE to the catalog's root removes the entry.
@@ -2239,21 +2291,26 @@ nodes and placements whose item isn't live aren't shown.
   it is deleted. A folder is deleted only when nothing is in it (`409` naming what is); deletes
   never recurse.
 - A PUT of a new `{ns}.{name}.json` in a folder creates the item if it doesn't exist (else edits
-  it), then the placement, with that folder as its parent. An item placed elsewhere in the catalog
-  is `409` before anything is written: move its placement instead. A COPY of a document from a
-  flat directory into a folder places it the same way.
+  it), and the placement, with that folder as its parent: a new item first (§B.7: content first,
+  so no placement dangles), an existing one after the placement, so a placement the core refuses
+  (a frozen catalog, a grant that doesn't write the catalog) leaves the item as it was. An item
+  placed elsewhere in the catalog is `409` before anything is written: move its placement instead.
+  A COPY of a document from a flat directory into a folder places it the same way.
+- Writes through a placement go only to items in a namespace the catalog trusts (`catalog.trust`,
+  §B.3) or that is served with `-ns`, never to a catalog's own nodes (`403`): a local mode's grant
+  may reach namespaces the server wasn't set up to serve.
 - The documents it creates carry `parents` only: a catalog whose rules want more (`$schema`, an
   `order`, no new roots, §B.6) refuses them with `422`.
 
-**Not in the prototype.** The catalog's trust list, access by subject set (`$access`, §B.11) and
-the tree service: users see what their grant reads, as the core lists it. Blobs as files:
-documents with `$blob` references read and edit as JSON. Sealed (E.2) and end-to-end (E.3)
-namespaces: listed read-only, with size 0, and their files are `501`. History (revisions and
-logs as directories), live invalidation, and batches: each file is its own write, so saving
-several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5) can't list a
-namespace, whose `/heads` needs unrestricted read, but can open its files by path. PROPFIND with
-`Depth: infinity` is `403` (`propfind-finite-depth`), and one without Depth lists one level. Dead
-properties (PROPPATCH) are accepted and not kept.
+**Not in the prototype.** The catalog's trust list beyond bounding writes, access by subject set
+(`$access`, §B.11) and the tree service: users see what their grant reads, as the core lists it.
+Blobs as files: documents with `$blob` references read and edit as JSON. Sealed (E.2) and
+end-to-end (E.3) namespaces: listed read-only, with size 0, and their files are `501`. History
+(revisions and logs as directories), live invalidation, and batches: each file is its own write,
+so saving several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5)
+can't list a namespace, whose `/heads` needs unrestricted read, but can open its files by path.
+PROPFIND with `Depth: infinity` is `403` (`propfind-finite-depth`), and one without Depth lists
+one level. Dead properties (PROPPATCH) are accepted and not kept.
 
 ### Bundles (§G.4)
 

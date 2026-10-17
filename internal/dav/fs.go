@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"errors"
 	"io"
 	"io/fs"
 	"mime"
@@ -35,7 +36,8 @@ const (
 	kPlacement                // a catalog placement {ns}.{name}.json under the folder it names
 	kNewFolder                // a folder name that isn't under that folder (MKCOL)
 	kNewPlacement             // a placement file name that isn't under that folder (PUT)
-	kScratch                  // any other name in a directory: a scratch file
+	kScratch                  // any other name in a directory: a scratch file or directory
+	kBadName                  // a .json name a person gave that names no document: refused
 )
 
 // target is a resolved path.
@@ -50,10 +52,11 @@ type target struct {
 	// kNewPlacement, and parent the folder its path puts it in ("" for
 	// the catalog's root).
 	node, parent string
+	sdir         bool // a kScratch that is a scratch directory
 }
 
 func (t target) isDir() bool {
-	return t.kind == kRoot || t.kind == kNSDir || t.kind == kCatDir || t.kind == kFolder
+	return t.kind == kRoot || t.kind == kNSDir || t.kind == kCatDir || t.kind == kFolder || t.kind == kScratch && t.sdir
 }
 
 // isDoc: the path names a document's file (which may not be live).
@@ -77,18 +80,23 @@ func (st *reqState) resolve(ctx context.Context, name string) (target, error) {
 	}
 	segs := strings.Split(name[1:], "/")
 	t.ns = segs[0]
+	if len(segs) > 1 && st.isScratchDir(t.dir) {
+		// In a scratch directory, every name is scratch: a macOS app's
+		// safe save writes {name}.json there before moving it out.
+		return st.scratchAt(t, false), nil
+	}
 	switch {
 	case len(segs) == 1 && st.s.flat[t.ns]:
 		t.kind = kNSDir
 	case len(segs) == 1 && st.s.cats[t.ns]:
 		t.kind = kCatDir
 	case len(segs) == 1:
-		t.kind = kScratch
+		t = st.scratchAt(t, true)
 	case st.s.flat[t.ns] && len(segs) == 2:
 		if res, ok := resourceOf(segs[1]); ok {
 			t.kind, t.docNS, t.docName = kDoc, t.ns, res
 		} else {
-			t.kind = kScratch
+			t = st.scratchAt(t, true)
 		}
 	case st.s.cats[t.ns]:
 		return st.resolveCatalog(ctx, t, segs[1:])
@@ -98,9 +106,33 @@ func (st *reqState) resolve(ctx context.Context, name string) (target, error) {
 	return t, nil
 }
 
+// scratchAt makes t a scratch path; named, a name a person may have given
+// it: a .json name (any case) that doesn't start with a dot is refused,
+// since it would be kept only in memory and vanish (Finder's "x
+// copy.json", a Save As "Report.json"). Editors' and the system's own
+// files start with a dot or end otherwise (.x.json.swp, ._x.json,
+// x.json~, 4913).
+func (st *reqState) scratchAt(t target, named bool) target {
+	t.kind = kScratch
+	f, ok := st.scratchPeek(t.path)
+	t.sdir = ok && f.dir
+	if named && !ok && !strings.HasPrefix(t.base, ".") && strings.HasSuffix(strings.ToLower(t.base), ".json") {
+		t.kind = kBadName
+	}
+	return t
+}
+
+// badName is the refusal of a kBadName.
+func (st *reqState) badName(t target) error {
+	if st.s.cats[t.ns] {
+		return fail(http.StatusForbidden, "%q names no document: in a catalog folder a file is a placement, {ns}.{name}.json, and a folder a resource name without a dot (§3.6, §B.2); a file named otherwise would only be kept in memory for a while, so it is refused", t.base)
+	}
+	return fail(http.StatusForbidden, "%q names no document: a document's file is {name}.json, a resource name of lowercase letters, digits, \".\", \"_\" and \"-\" (§3.6); a file named otherwise would only be kept in memory for a while, so it is refused", t.base)
+}
+
 // fileInfo is a file or directory as the handler sees it. A document's
 // ETag is its revision id; a written file's is the revision its close
-// committed.
+// committed, if that holds exactly what was written.
 type fileInfo struct {
 	name  string
 	size  int64
@@ -145,7 +177,7 @@ func (st *reqState) dirInfo(name string) *fileInfo {
 }
 
 func (st *reqState) docInfo(name string, hd headDoc) *fileInfo {
-	fi := &fileInfo{name: name, size: int64(len(hd.e.rendered)), rev: hd.rev, mode: 0o644, ctype: "application/json",
+	fi := &fileInfo{name: name, size: int64(len(st.repr(hd))), rev: hd.rev, mode: 0o644, ctype: "application/json",
 		mod: st.s.modTime(st.p, docKey(hd.ns, hd.name, hd.rev), hd.e)}
 	if hd.e.sealed {
 		fi.mode = 0o444
@@ -154,6 +186,9 @@ func (st *reqState) docInfo(name string, hd headDoc) *fileInfo {
 }
 
 func scratchInfo(name string, f *scratchFile) *fileInfo {
+	if f.dir {
+		return &fileInfo{name: name, dir: true, mode: fs.ModeDir | 0o755, mod: f.mod}
+	}
 	ct := mime.TypeByExtension(path.Ext(name))
 	if ct == "" {
 		ct = "application/octet-stream"
@@ -169,8 +204,9 @@ type listing struct {
 }
 
 // list reads directory t: its documents, folders and placements as the
-// core has them now (each request reads them again), and the principal's
-// scratch files in it.
+// core has them now (each request reads a flat namespace again; a
+// catalog's tree is kept CatalogTTL), and the principal's scratch files
+// in it.
 func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 	if l := st.lists[t.path]; l != nil {
 		return l, nil
@@ -184,6 +220,7 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 	}
 	var files []headDoc
 	var names []string
+	head := st.p.c.Head
 	switch t.kind {
 	case kRoot:
 		for _, ns := range st.s.namespaces() {
@@ -212,6 +249,7 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 		if err != nil {
 			return nil, err
 		}
+		head = cg.itemHead(st.p)
 		for _, n := range cg.children(t.node) {
 			if n.Kind == kindFolder {
 				add(st.dirInfo(n.Name))
@@ -228,7 +266,7 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 		for i, f := range files {
 			byRes[f.ns+"/"+f.name] = names[i]
 		}
-		docs, err := st.s.fetchHeads(ctx, st.p, files)
+		docs, err := st.s.fetchHeads(ctx, st.p, files, head)
 		if err != nil {
 			return nil, err
 		}
@@ -249,6 +287,23 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 	return l, nil
 }
 
+// head reads ns/name's head once per request (until it writes).
+func (st *reqState) head(ctx context.Context, ns, name string) (*client.Head, error) {
+	k := ns + "/" + name
+	if h := st.heads[k]; h != nil {
+		return h, nil
+	}
+	h, err := st.p.c.Head(ctx, ns, name)
+	if err != nil {
+		return nil, err
+	}
+	if st.heads == nil {
+		st.heads = map[string]*client.Head{}
+	}
+	st.heads[k] = h
+	return h, nil
+}
+
 // docAt returns the live document a document path names, from the
 // directory's listing if the request read it, else from its head.
 func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) {
@@ -256,7 +311,7 @@ func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) 
 		hd, ok := l.docs[t.base]
 		return hd, ok, nil
 	}
-	h, err := st.p.c.Head(ctx, t.docNS, t.docName)
+	h, err := st.head(ctx, t.docNS, t.docName)
 	if err != nil || h.State != client.Live {
 		return headDoc{}, false, err
 	}
@@ -278,6 +333,11 @@ func (st *reqState) stat(ctx context.Context, t target) (*fileInfo, error) {
 		if st.method == "PROPFIND" && st.depth != "0" && t.path == st.path {
 			if _, err := st.list(ctx, t); err != nil {
 				return nil, err
+			}
+		}
+		if t.kind == kScratch {
+			if f, ok := st.scratchGet(t.path); ok {
+				return scratchInfo(t.base, f), nil
 			}
 		}
 		return st.dirInfo(t.base), nil
@@ -307,15 +367,34 @@ func (st *reqState) stat(ctx context.Context, t target) (*fileInfo, error) {
 // context.
 type davFS struct{ s *Server }
 
+// fail records err for the answer, or, for an entry of a PROPFIND listing
+// other than the one requested (props open each), skips that entry
+// (handlePropfindError): the multistatus has begun, and an error there
+// would cut it short.
+func (st *reqState) fail(name string, err error) error {
+	err = upstream(err)
+	var de *davError
+	if st.method == "PROPFIND" && slashClean(name) != st.path && errors.As(err, &de) {
+		st.s.opt.Logf("dav: PROPFIND %s: %s left out: %v", st.path, name, err)
+		return skipped{err}
+	}
+	return st.record(err)
+}
+
+// skipped is an error x/net/webdav's PROPFIND leaves an entry out for.
+type skipped struct{ error }
+
+func (skipped) Is(target error) bool { return target == fs.ErrPermission }
+
 func (d *davFS) Stat(ctx context.Context, name string) (os.FileInfo, error) {
 	st := state(ctx)
 	t, err := st.resolve(ctx, name)
 	if err != nil {
-		return nil, st.record(upstream(err))
+		return nil, st.fail(name, err)
 	}
 	fi, err := st.stat(ctx, t)
 	if err != nil {
-		return nil, st.record(upstream(err))
+		return nil, st.fail(name, err)
 	}
 	return fi, nil
 }
@@ -324,7 +403,7 @@ func (d *davFS) OpenFile(ctx context.Context, name string, flag int, perm os.Fil
 	st := state(ctx)
 	f, err := st.open(ctx, name, flag)
 	if err != nil {
-		return nil, st.record(upstream(err))
+		return nil, st.fail(name, err)
 	}
 	return f, nil
 }
@@ -340,11 +419,20 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		switch {
 		case t.kind == kMissing:
 			return nil, errNotExist
+		case t.kind == kBadName:
+			return nil, st.badName(t)
 		case t.isDir():
 			return nil, fail(http.StatusMethodNotAllowed, "%s is a directory", t.path)
+		}
+		if err := st.preconditions(ctx, t); err != nil {
+			return nil, err
+		}
+		switch {
 		case t.isDoc():
-			w := &writeFile{st: st, ctx: ctx, t: t}
-			return w, nil
+			if err := st.writable(ctx, t); err != nil {
+				return nil, err
+			}
+			return &writeFile{st: st, ctx: ctx, t: t}, nil
 		}
 		return &writeFile{st: st, ctx: ctx, t: t, scratch: true}, nil
 	}
@@ -353,11 +441,9 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		return nil, err
 	}
 	if fi.dir {
-		l, err := st.list(ctx, t)
-		if err != nil {
-			return nil, err
-		}
-		return &dirFile{fi: fi, infos: l.infos}, nil
+		// Listed when read (Readdir), not when opened: a PROPFIND opens
+		// every entry it lists for its properties.
+		return &dirFile{st: st, ctx: ctx, t: t, fi: fi}, nil
 	}
 	if fi.rev == "" {
 		f, ok := st.scratchGet(t.path)
@@ -379,16 +465,37 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		}
 		return &memFile{Reader: bytes.NewReader(nil), fi: fi}, nil
 	}
-	if st.method == "GET" {
-		// What the principal now has is the base of its next save.
-		st.p.setServed(hd.ns, hd.name, &served{rev: hd.rev}, 0)
+	if st.method == "GET" && t.path == st.path {
+		// What the client now has is a base of its next save, once the
+		// body is sent (a 304 sends none).
+		st.serve = &stagedServe{ns: hd.ns, name: hd.name, rev: hd.rev}
 	}
-	return &memFile{Reader: bytes.NewReader(hd.e.rendered), fi: fi}, nil
+	return &memFile{Reader: bytes.NewReader(st.repr(hd)), fi: fi}, nil
+}
+
+// preconditions checks a PUT's If-None-Match: * (create only) and
+// If-Match: * (edit only), which x/net/webdav doesn't, against what the
+// path holds now; a document's write checks them again (commitDoc).
+func (st *reqState) preconditions(ctx context.Context, t target) error {
+	if !st.noneMatch && !st.matchAny {
+		return nil
+	}
+	_, err := st.stat(ctx, t)
+	if err != nil && !errors.Is(err, errNotExist) {
+		return err
+	}
+	switch {
+	case st.noneMatch && err == nil:
+		return fail(http.StatusPreconditionFailed, "%s exists (If-None-Match: *)", t.path)
+	case st.matchAny && err != nil:
+		return fail(http.StatusPreconditionFailed, "%s doesn't exist (If-Match: *)", t.path)
+	}
+	return nil
 }
 
 func (d *davFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error {
 	st := state(ctx)
-	return st.record(upstream(st.mkdir(ctx, name)))
+	return st.fail(name, st.mkdir(ctx, name))
 }
 
 func (st *reqState) mkdir(ctx context.Context, name string) error {
@@ -406,16 +513,19 @@ func (st *reqState) mkdir(ctx context.Context, name string) error {
 		return os.ErrExist
 	case kNewFolder:
 		return st.mkFolder(ctx, t)
+	case kBadName:
+		return st.badName(t)
+	case kScratch:
+		// Not a catalog folder: a scratch directory (an app's safe save,
+		// a file manager's "untitled folder" before it is named).
+		return st.scratchMkdir(t.path)
 	}
-	if st.s.cats[t.ns] && t.ns != t.base {
-		return fail(http.StatusForbidden, "a folder's name is a resource name without a dot (§3.6, §B.2): lowercase letters, digits, _ and -")
-	}
-	return fail(http.StatusForbidden, "directories are made only in catalogs (Addendum B); the root lists the served namespaces, and a flat namespace holds documents only")
+	return fail(http.StatusForbidden, "%s names a document, not a directory", t.path)
 }
 
 func (d *davFS) RemoveAll(ctx context.Context, name string) error {
 	st := state(ctx)
-	return st.record(upstream(st.removeAll(ctx, name)))
+	return st.fail(name, st.removeAll(ctx, name))
 }
 
 func (st *reqState) removeAll(ctx context.Context, name string) error {
@@ -428,7 +538,7 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		// The handler clears an existing destination before moving or
 		// copying onto it: a document or catalog node there is written
 		// over (an edit, a move), never deleted first.
-		if t.isDir() || t.kind == kPlacement {
+		if t.kind != kScratch && t.isDir() || t.kind == kPlacement {
 			return nil
 		}
 		if t.kind == kDoc {
@@ -468,7 +578,7 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 
 func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
 	st := state(ctx)
-	return st.record(upstream(st.rename(ctx, oldName, newName)))
+	return st.fail(oldName, st.rename(ctx, oldName, newName))
 }
 
 // rename is a MOVE: the handler has cleared an existing destination
@@ -492,6 +602,8 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	switch {
 	case src.kind == kMissing || dst.kind == kMissing:
 		return errNotExist
+	case dst.kind == kBadName:
+		return st.badName(dst)
 	case live && (dst.kind == kScratch || dst.kind == kNewFolder):
 		// An editor moving the original aside as a backup before writing
 		// the new version: the backup is a copy, the document stays.
@@ -502,12 +614,29 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		if hd.e.sealed {
 			return fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E)", hd.ns, hd.name)
 		}
-		return st.scratchPut(dst.path, hd.e.rendered)
+		return st.scratchPut(dst.path, st.repr(hd))
 	case live || src.kind == kFolder:
 		if st.isCatalogMove(src, dst) {
 			return st.move(ctx, src, dst)
 		}
 		return fail(http.StatusForbidden, "names are identity (§3.6, §B.1): a document can't be renamed or moved to another namespace; copy it to a new name and delete the old one")
+	case src.kind == kScratch && src.sdir:
+		switch dst.kind {
+		case kNewFolder:
+			// A folder made as "untitled folder", then named: the
+			// catalog folder it is named.
+			if err := st.mkFolder(ctx, dst); err != nil {
+				return err
+			}
+			if err := st.scratchRename(src.path, dst.path); err != nil {
+				return err
+			}
+			st.scratchUnmark(dst.path)
+			return nil
+		case kScratch:
+			return st.scratchRename(src.path, dst.path)
+		}
+		return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
 	case src.isDir():
 		return fail(http.StatusForbidden, "%s can't be moved", src.path)
 	}
@@ -519,77 +648,87 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	case dst.isDoc():
 		// The atomic save: a temporary file moved over the document is
 		// a write of its content.
-		if err := st.commit(ctx, dst, f.data); err != nil {
+		if err := st.writable(ctx, dst); err != nil {
+			return err
+		}
+		if _, _, err := st.commitRev(ctx, dst, f.data); err != nil {
 			return err
 		}
 		st.scratchRemove(src.path)
 		return nil
 	case dst.kind == kScratch || dst.kind == kNewFolder:
-		st.scratchRename(src.path, dst.path)
-		return nil
+		return st.scratchRename(src.path, dst.path)
 	}
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
 }
 
-// commit writes body to the document a path names: an edit, a create or a
-// restore, or for a new placement also the placement (§B.2). An empty
-// body creates nothing: a client making a file before writing it (LOCK,
-// Finder's 0-byte PUT) gets a placeholder, and a live document isn't
-// truncated.
-func (st *reqState) commit(ctx context.Context, t target, body []byte) error {
-	_, err := st.commitRev(ctx, t, body)
-	return err
-}
-
-func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (string, error) {
+// commitRev writes body to the document a path names: an edit, a create
+// or a restore, or for a new placement also the placement (§B.2). It
+// returns the revision now holding it, and whether that holds exactly
+// body. An empty body creates nothing: a client making a file before
+// writing it (LOCK, Finder's 0-byte PUT) gets a placeholder, and a live
+// document isn't truncated.
+func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (string, bool, error) {
 	defer st.changed()
 	if len(bytes.TrimSpace(trimBOM(body))) == 0 {
 		if t.kind != kNewPlacement {
 			hd, live, err := st.docAt(ctx, t)
 			if err != nil {
-				return "", err
+				return "", false, err
 			}
 			if live {
-				return hd.rev, nil
+				return hd.rev, false, nil
 			}
 		}
-		return "", st.scratchPut(t.path, nil)
+		return "", true, st.scratchPut(t.path, nil)
 	}
 	v, err := parseBody(body)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	var rev string
+	var exact bool
 	if t.kind == kNewPlacement {
-		rev, err = st.place(ctx, t, v)
+		rev, exact, err = st.place(ctx, t, v, body)
 	} else {
-		rev, err = st.commitDoc(ctx, t.docNS, t.docName, v)
+		rev, exact, err = st.commitDoc(ctx, t.docNS, t.docName, v, body, true)
 	}
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	st.scratchRemove(t.path)
-	return rev, nil
+	return rev, exact, nil
 }
 
 // writeFile buffers a written file whole; Close commits it, to the core
-// for a document name, to the scratch store for any other.
+// for a document name, to the scratch store for any other. The buffers of
+// every request together hold at most InflightBytes (503 beyond).
 type writeFile struct {
 	st      *reqState
 	ctx     context.Context
 	t       target
 	scratch bool
 	buf     bytes.Buffer
+	held    int64
 	err     error
 	closed  bool
 	rev     string
 }
 
 func (w *writeFile) Write(p []byte) (int, error) {
+	if w.err != nil {
+		return 0, w.err
+	}
 	if w.buf.Len()+len(p) > w.st.s.opt.MaxFileSize {
 		w.err = w.st.record(fail(http.StatusRequestEntityTooLarge, "a file is at most %d bytes", w.st.s.opt.MaxFileSize))
 		return 0, w.err
 	}
+	if !w.st.s.inflight.TryAcquire(int64(len(p))) {
+		w.err = w.st.record(&davError{status: http.StatusServiceUnavailable, msg: "the server is receiving too many files at once; try again",
+			header: http.Header{"Retry-After": {"2"}}})
+		return 0, w.err
+	}
+	w.held += int64(len(p))
 	return w.buf.Write(p)
 }
 
@@ -598,14 +737,26 @@ func (w *writeFile) Close() error {
 		return nil
 	}
 	w.closed = true
-	if w.err != nil {
+	defer w.st.s.inflight.Release(w.held)
+	switch {
+	case w.err != nil:
 		return w.err
-	}
-	if w.scratch {
+	case w.st.bodyErr != nil:
+		// Cut short: nothing of it is written.
+		return w.st.record(&davError{status: http.StatusBadRequest, msg: "the request body didn't arrive whole; nothing was written", cause: w.st.bodyErr})
+	case w.scratch:
 		return w.st.record(w.st.scratchPut(w.t.path, bytes.Clone(w.buf.Bytes())))
 	}
-	rev, err := w.st.commitRev(w.ctx, w.t, w.buf.Bytes())
-	w.rev = rev
+	rev, exact, err := w.st.commitRev(w.ctx, w.t, bytes.Clone(w.buf.Bytes()))
+	if exact {
+		w.rev = rev
+	} else {
+		// Merged, reformatted or given a $nonce: the revision isn't what
+		// the client sent, so it gets no validator for it (RFC 9110
+		// §9.3.4); a cache would keep what it sent under the revision's
+		// tag.
+		w.st.noETag = true
+	}
 	return w.st.record(upstream(err))
 }
 
@@ -617,25 +768,17 @@ func (w *writeFile) info() *fileInfo {
 	return &fileInfo{name: w.t.base, size: int64(w.buf.Len()), mod: w.st.s.opt.Now(), mode: 0o644, w: w}
 }
 
-// memFile is a file read from memory: a document's rendering or a scratch
-// file. Dead properties (PROPPATCH, as Windows and macOS send after
-// writing) are accepted and not kept.
-type memFile struct {
-	*bytes.Reader
-	fi *fileInfo
-}
-
-func (f *memFile) Close() error                       { return nil }
-func (f *memFile) Write([]byte) (int, error)          { return 0, os.ErrPermission }
-func (f *memFile) Readdir(int) ([]os.FileInfo, error) { return nil, os.ErrInvalid }
-func (f *memFile) Stat() (os.FileInfo, error)         { return f.fi, nil }
+// noDeadProps implements webdav.DeadPropsHolder for files and
+// directories: dead properties (PROPPATCH, as Windows and macOS send after
+// writing or making a folder) are accepted and not kept.
+type noDeadProps struct{}
 
 // DeadProps implements webdav.DeadPropsHolder: none are kept.
-func (f *memFile) DeadProps() (map[xml.Name]webdav.Property, error) { return nil, nil }
+func (noDeadProps) DeadProps() (map[xml.Name]webdav.Property, error) { return nil, nil }
 
 // Patch implements webdav.DeadPropsHolder: every change succeeds and is
 // dropped.
-func (f *memFile) Patch(ps []webdav.Proppatch) ([]webdav.Propstat, error) {
+func (noDeadProps) Patch(ps []webdav.Proppatch) ([]webdav.Propstat, error) {
 	st := webdav.Propstat{Status: http.StatusOK}
 	for _, p := range ps {
 		for _, prop := range p.Props {
@@ -645,10 +788,28 @@ func (f *memFile) Patch(ps []webdav.Proppatch) ([]webdav.Propstat, error) {
 	return []webdav.Propstat{st}, nil
 }
 
-// dirFile is a directory's listing.
+// memFile is a file read from memory: a document's rendering or a scratch
+// file.
+type memFile struct {
+	*bytes.Reader
+	noDeadProps
+	fi *fileInfo
+}
+
+func (f *memFile) Close() error                       { return nil }
+func (f *memFile) Write([]byte) (int, error)          { return 0, os.ErrPermission }
+func (f *memFile) Readdir(int) ([]os.FileInfo, error) { return nil, os.ErrInvalid }
+func (f *memFile) Stat() (os.FileInfo, error)         { return f.fi, nil }
+
+// dirFile is a directory, listed on its first Readdir.
 type dirFile struct {
+	noDeadProps
+	st    *reqState
+	ctx   context.Context
+	t     target
 	fi    *fileInfo
 	infos []os.FileInfo
+	read  bool
 	pos   int
 }
 
@@ -658,6 +819,13 @@ func (f *dirFile) Seek(int64, int) (int64, error) { return 0, nil }
 func (f *dirFile) Write([]byte) (int, error)      { return 0, os.ErrPermission }
 func (f *dirFile) Stat() (os.FileInfo, error)     { return f.fi, nil }
 func (f *dirFile) Readdir(n int) ([]os.FileInfo, error) {
+	if !f.read {
+		l, err := f.st.list(f.ctx, f.t)
+		if err != nil {
+			return nil, f.st.fail(f.t.path, err)
+		}
+		f.infos, f.read = l.infos, true
+	}
 	rest := f.infos[f.pos:]
 	if n <= 0 {
 		f.pos = len(f.infos)

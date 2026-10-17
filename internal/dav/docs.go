@@ -89,21 +89,13 @@ func (s *Server) keep(k string, e *docEntry) {
 	s.docMu.Unlock()
 }
 
-// modTime is a document's Last-Modified: its creation time where known,
-// else when the principal was first shown it.
-func (s *Server) modTime(p *principal, k string, e *docEntry) time.Time {
-	if !e.created.IsZero() {
-		return e.created
-	}
-	return p.firstSeen(k, s.opt.Now())
-}
-
 // nsInfo is what writes to a namespace need from its document: whether
-// it is sealed or end-to-end (not served for writing here), and whether
-// writes add a fresh $nonce (§C.7).
+// it is sealed or end-to-end (not served for writing here), whether
+// writes add a fresh $nonce (§C.7), and a catalog's trust list (§B.3).
 type nsInfo struct {
 	sealed bool
 	nonce  bool
+	trust  []string
 	at     time.Time
 }
 
@@ -134,6 +126,13 @@ func (s *Server) nsInfo(ctx context.Context, p *principal, ns string) nsInfo {
 		lv, _ := enc["level"].(string)
 		in.sealed = lv == "sealed" || lv == "e2e"
 		in.nonce = d.Value["nonce"] == "required"
+		cat, _ := d.Value["catalog"].(map[string]any)
+		ts, _ := cat["trust"].([]any)
+		for _, t := range ts {
+			if t, ok := t.(string); ok {
+				in.trust = append(in.trust, t)
+			}
+		}
 	}
 	p.mu.Lock()
 	p.ns[ns] = in
@@ -148,16 +147,20 @@ type headDoc struct {
 }
 
 // fetchHeads reads the documents of live heads, FetchConcurrency at a
-// time; heads whose rev is "" are read first (client.Head). Resources that
-// turn out not to be live are left out.
-func (s *Server) fetchHeads(ctx context.Context, p *principal, items []headDoc) ([]headDoc, error) {
+// time; heads whose rev is "" are read first (head). Resources that turn
+// out not to be live, or that p may not read (a placement's item in a
+// namespace its grant doesn't read, §B.3), are left out.
+func (s *Server) fetchHeads(ctx context.Context, p *principal, items []headDoc, head func(context.Context, string, string) (*client.Head, error)) ([]headDoc, error) {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(s.opt.FetchConcurrency)
 	out := make([]headDoc, len(items))
 	for i, it := range items {
 		g.Go(func() error {
 			if it.rev == "" {
-				h, err := p.c.Head(gctx, it.ns, it.name)
+				h, err := head(gctx, it.ns, it.name)
+				if hidden(err) {
+					return nil
+				}
 				if err != nil {
 					return err
 				}
@@ -167,6 +170,9 @@ func (s *Server) fetchHeads(ctx context.Context, p *principal, items []headDoc) 
 				it.rev = h.ID
 			}
 			e, err := s.doc(gctx, p, it.ns, it.name, it.rev)
+			if hidden(err) {
+				return nil
+			}
 			if err != nil {
 				return err
 			}
@@ -185,6 +191,13 @@ func (s *Server) fetchHeads(ctx context.Context, p *principal, items []headDoc) 
 		}
 	}
 	return live, nil
+}
+
+// hidden reports a read the core refuses or no longer serves: 403, 404
+// or 410 (deleted since the listing).
+func hidden(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	return ok && (ae.Status == 403 || ae.Status == 404 || ae.Status == 410)
 }
 
 // liveHeads lists ns's live resources with p's grant (§7.4 /heads).

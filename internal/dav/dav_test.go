@@ -1,6 +1,10 @@
 package dav_test
 
 import (
+	"fmt"
+	"io"
+	"net"
+	"net/http/httptest"
 	"strconv"
 	"strings"
 	"sync"
@@ -60,11 +64,14 @@ func TestListAndGet(t *testing.T) {
 
 // A PUT of a new name creates it; a PUT of an edit appends the diff from
 // what was served, so the log holds the minimal patch set; a save of
-// unchanged content writes nothing; invalid JSON writes nothing.
+// unchanged content writes nothing; invalid JSON writes nothing. The
+// writer reads a revision that holds exactly what it wrote as it wrote
+// it, so its size checks out (others read the rendering).
 func TestPutCreateEdit(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"docs"}, nil, nil)
-	r := e.expect(e.do("PUT", "/docs/new.json", `{"b": 1, "a": [1, 2], "keep": {"x": true}}`), 201, "PUT new")
+	upload := `{"b": 1, "a": [1, 2], "keep": {"x": true}}`
+	r := e.expect(e.do("PUT", "/docs/new.json", upload), 201, "PUT new")
 	h, doc := e.load("docs", "new")
 	sameJSON(t, doc, map[string]any{"b": 1, "a": []any{1, 2}, "keep": map[string]any{"x": true}})
 	if r.header.Get("ETag") != `"`+h.ID+`"` {
@@ -73,9 +80,15 @@ func TestPutCreateEdit(t *testing.T) {
 	if en := e.lastEntry("docs", "new"); en.Author != "dav" {
 		t.Fatalf("author %q", en.Author)
 	}
+	if l := e.propfind("/docs/"); l["/docs/new.json"].size != strconv.Itoa(len(upload)) || l["/docs/new.json"].etag != `"`+h.ID+`"` {
+		t.Fatalf("listed after PUT %+v, want size %d", l["/docs/new.json"], len(upload))
+	}
 
 	got := e.expect(e.do("GET", "/docs/new.json", ""), 200, "GET").body
-	edited := strings.Replace(strings.Replace(got, "    2\n", "    3\n", 1), `"b": 1,`, `"b": 1, "c": "new",`, 1)
+	if got != upload {
+		t.Fatalf("GET after PUT %q, want what was put", got)
+	}
+	edited := strings.Replace(strings.Replace(got, "[1, 2]", "[1, 3]", 1), `"b": 1,`, `"b": 1, "c": "new",`, 1)
 	r = e.expect(e.do("PUT", "/docs/new.json", edited), 201, "PUT edit")
 	en := e.lastEntry("docs", "new")
 	sameJSON(t, en.Patches, []any{
@@ -163,6 +176,27 @@ func TestMergeAndConflict(t *testing.T) {
 	h, _ = e.load("docs", "x")
 	e.expect(e.do("PUT", "/docs/x.json", strings.Replace(served, `"b"`, `"B"`, 1)), 409, "PUT into an array they changed")
 	if h2, doc := e.load("docs", "x"); h2.ID != h.ID {
+		t.Fatalf("a conflicting save wrote: %v", doc)
+	}
+
+	// They delete an element and append another, the array's length the
+	// same: our edit inside the third element names an index that holds
+	// their new one now.
+	item := func(id string) map[string]any { return map[string]any{"id": id, "done": false} }
+	e.create("docs", "todo", map[string]any{"items": []any{item("i1"), item("i2"), item("i3")}})
+	served = e.expect(e.do("GET", "/docs/todo.json", ""), 200, "GET").body
+	h, _ = e.load("docs", "todo")
+	must(e.c.Append(e.ctx, "docs", "todo", h.ID, []any{
+		map[string]any{"op": "remove", "path": "/items/1"},
+		map[string]any{"op": "add", "path": "/items/-", "value": item("i4")},
+	}))
+	h, _ = e.load("docs", "todo")
+	i := strings.LastIndex(served, `"done": false`)
+	r = e.expect(e.do("PUT", "/docs/todo.json", served[:i]+`"done": true`+served[i+len(`"done": false`):]), 409, "PUT into an element they moved")
+	if !strings.Contains(r.body, "/items") {
+		t.Fatalf("conflict text %q", r.body)
+	}
+	if h2, doc := e.load("docs", "todo"); h2.ID != h.ID {
 		t.Fatalf("a conflicting save wrote: %v", doc)
 	}
 }
@@ -272,9 +306,8 @@ func TestScratchFiles(t *testing.T) {
 	e.create("docs", "x", map[string]any{"v": 1})
 	e.expect(e.do("PUT", "/docs/._x.json", "\x00\x05\x16\x07apple"), 201, "AppleDouble")
 	e.expect(e.do("PUT", "/docs/.DS_Store", "Bud1"), 201, ".DS_Store")
-	e.expect(e.do("PUT", "/docs/Notes.JSON", `{"not": "a resource name"}`), 201, "uppercase name")
 	e.expect(e.do("PUT", "/.DS_Store", "Bud1"), 201, ".DS_Store at the root")
-	sameStrings(t, "listing", names(e.propfind("/docs/"), "/docs/"), []string{".DS_Store", "._x.json", "Notes.JSON", "x.json"})
+	sameStrings(t, "listing", names(e.propfind("/docs/"), "/docs/"), []string{".DS_Store", "._x.json", "x.json"})
 	if b := e.expect(e.do("GET", "/docs/.DS_Store", ""), 200, "GET .DS_Store").body; b != "Bud1" {
 		t.Fatalf(".DS_Store %q", b)
 	}
@@ -314,8 +347,7 @@ func TestCopyMoveLock(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"v": 1})
 	sameJSON(t, e.lastEntry("docs", "b").Patches, []any{map[string]any{"op": "replace", "path": "/v", "value": 1}})
 
-	e.expect(e.do("MKCOL", "/docs/sub", ""), 403, "MKCOL in a flat namespace")
-	e.expect(e.do("MKCOL", "/new", ""), 403, "MKCOL at the root")
+	e.expect(e.do("MKCOL", "/docs/a.json", ""), 403, "MKCOL of a document name")
 	e.expect(e.do("DELETE", "/docs", ""), 403, "DELETE a namespace")
 	e.expect(e.do("PUT", "/docs/sub/x.json", "{}"), 409, "PUT below a missing directory")
 
@@ -339,9 +371,19 @@ func TestCopyMoveLock(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"locked": true})
 	// PROPPATCH (Windows sets file times) succeeds and keeps nothing.
 	pp := `<?xml version="1.0" encoding="utf-8"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>Wed, 01 Jan 2026 00:00:00 GMT</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>`
-	if r := e.expect(e.do("PROPPATCH", "/docs/a.json", pp), 207, "PROPPATCH"); !strings.Contains(r.body, "200") {
-		t.Fatalf("PROPPATCH %s", r.body)
+	for _, p := range []string{"/docs/a.json", "/docs/", "/"} {
+		if r := e.expect(e.do("PROPPATCH", p, pp), 207, "PROPPATCH "+p); !strings.Contains(r.body, "200 OK") || strings.Contains(r.body, "403") {
+			t.Fatalf("PROPPATCH %s: %s", p, r.body)
+		}
 	}
+
+	// Behind a proxy that passes its own Host on: a Destination naming
+	// the host the client used (X-Forwarded-Host) is this server.
+	e.expect(e.do("PUT", "/docs/.p.tmp", `{"v": 3}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/docs/.p.tmp", "", "Destination", "http://dav.example/docs/p.json"), 502, "MOVE to another host")
+	e.expect(e.do("MOVE", "/docs/.p.tmp", "", "Destination", "http://dav.example/docs/p.json", "X-Forwarded-Host", "dav.example"), 201, "MOVE through a proxy")
+	_, doc = e.load("docs", "p")
+	sameJSON(t, doc, map[string]any{"v": 3})
 }
 
 // A namespace that requires nonces (§C.7) gets a fresh $nonce with every
@@ -462,4 +504,156 @@ func TestSealed(t *testing.T) {
 	e.expect(e.do("GET", "/sec/x.json", ""), 501, "GET sealed")
 	e.expect(e.do("PUT", "/sec/x.json", `{"secret": false}`), 501, "PUT sealed")
 	e.expect(e.do("PUT", "/sec/y.json", `{"new": true}`), 501, "PUT new in a sealed namespace")
+}
+
+// A .json name a person gives a file that names no document (Finder's
+// Duplicate "x copy.json", a Save As "Report.json", capitals) is refused:
+// kept in memory only, it would vanish within the hour. Editors' and the
+// system's own names stay scratch files.
+func TestRefusedNames(t *testing.T) {
+	t.Parallel()
+	e := catalogEnv(t)
+	e.create("matches", "x", map[string]any{"a": "1"})
+	for _, p := range []string{"/matches/Report.json", "/matches/Notes.JSON", "/matches/x copy.json", "/Report.json", "/cat/root/season/Report.json", "/cat/root/season/matches.X.json"} {
+		r := e.expect(e.do("PUT", p, `{"a": "2"}`), 403, "PUT "+p)
+		if !strings.Contains(r.body, "names no document") {
+			t.Fatalf("PUT %s: %q", p, r.body)
+		}
+	}
+	e.expect(e.do("COPY", "/matches/x.json", "", "Destination", "/matches/x copy.json"), 403, "Finder's Duplicate")
+	e.expect(e.do("PUT", "/matches/.x.json.tmp", `{"a": "3"}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/matches/.x.json.tmp", "", "Destination", "/matches/Report.json"), 403, "MOVE to a refused name")
+	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
+	e.expect(e.do("LOCK", "/matches/Report.json", lock), 403, "LOCK of a refused name")
+	for _, p := range []string{"/matches/x.json~", "/matches/._x.json", "/matches/.x.json.swp", "/matches/4913", "/matches/x.json___jb_tmp___", "/matches/Untitled"} {
+		e.expect(e.do("PUT", p, "scratch"), 201, "PUT "+p)
+	}
+	sameStrings(t, "listing", names(e.propfind("/matches/"), "/matches/"), []string{"._x.json", ".x.json.swp", ".x.json.tmp", "4913", "Untitled", "derby.json", "x.json", "x.json___jb_tmp___", "x.json~"})
+}
+
+// Directories a flat namespace or the root can't hold as documents are
+// scratch directories: a macOS app's safe save writes the new version in
+// one and moves it out; a file manager's "untitled folder" holds files
+// for a while. Deleting one drops what is in it.
+func TestScratchDirs(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.create("docs", "x", map[string]any{"title": "A"})
+	served := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
+
+	dir := "/docs/(A Document Being Saved By TextEdit)"
+	e.expect(e.do("MKCOL", dir, ""), 201, "MKCOL")
+	e.expect(e.do("MKCOL", dir, ""), 405, "MKCOL again")
+	e.expect(e.do("PUT", dir+"/x.json", edit(t, served, `"A"`, `"B"`)), 201, "PUT in it")
+	sameStrings(t, "temporary directory", names(e.propfind(dir+"/"), dir+"/"), []string{"x.json"})
+	e.expect(e.do("MOVE", dir+"/x.json", "", "Destination", "/docs/x.json"), 204, "MOVE out over the document")
+	e.expect(e.do("DELETE", dir, ""), 204, "DELETE the directory")
+	sameJSON(t, e.lastEntry("docs", "x").Patches, []any{replace("/title", "B")})
+	sameStrings(t, "docs", names(e.propfind("/docs/"), "/docs/"), []string{"x.json"})
+
+	e.expect(e.do("MKCOL", "/.TemporaryItems", ""), 201, "MKCOL at the root")
+	e.expect(e.do("MKCOL", "/.TemporaryItems/folders.501", ""), 201, "MKCOL in it")
+	e.expect(e.do("PUT", "/.TemporaryItems/folders.501/f", "x"), 201, "PUT deeper")
+	sameStrings(t, "root", names(e.propfind("/"), "/"), []string{".TemporaryItems/", "docs/"})
+	e.expect(e.do("MOVE", "/.TemporaryItems", "", "Destination", "/.Trash"), 201, "MOVE a directory")
+	if b := e.expect(e.do("GET", "/.Trash/folders.501/f", ""), 200, "GET moved").body; b != "x" {
+		t.Fatalf("moved file %q", b)
+	}
+	e.expect(e.do("DELETE", "/.Trash", ""), 204, "DELETE")
+	e.expect(e.do("GET", "/.Trash/folders.501/f", ""), 404, "GET after DELETE")
+	e.expect(e.do("PUT", "/.Trash/f", "x"), 409, "PUT below a deleted directory")
+	if heads := must(e.c.Heads(e.ctx, "docs", must(e.c.NSHead(e.ctx, "docs")).ID)); len(heads) != 1 {
+		t.Fatalf("heads %+v", heads)
+	}
+}
+
+// Over the bounds, the files macOS and Windows write beside others (._*,
+// .DS_Store, Thumbs.db) make room, least recently used first, or are
+// dropped, rather than failing a copy with 507 (a full disk to Finder);
+// editors' temporary files still get the 507.
+func TestJunkFiles(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.ScratchFiles = 3 })
+	e.expect(e.do("PUT", "/docs/.x.json.swp", "swap"), 201, "swap file")
+	for i := 0; i < 5; i++ {
+		e.expect(e.do("PUT", "/docs/._f"+strconv.Itoa(i)+".json", "apple"), 201, "AppleDouble")
+	}
+	sameStrings(t, "listing", names(e.propfind("/docs/"), "/docs/"), []string{"._f3.json", "._f4.json", ".x.json.swp"})
+	e.expect(e.do("PUT", "/docs/.y.json.swp", "swap"), 201, "a swap file pushes out junk")
+	e.expect(e.do("PUT", "/docs/.z.json.swp", "swap"), 201, "and again")
+	e.expect(e.do("PUT", "/docs/.w.json.swp", "swap"), 507, "but not another editor's file")
+	e.expect(e.do("PUT", "/docs/.DS_Store", "Bud1"), 201, "junk that doesn't fit is dropped")
+	sameStrings(t, "listing", names(e.propfind("/docs/"), "/docs/"), []string{".x.json.swp", ".y.json.swp", ".z.json.swp"})
+}
+
+// A PUT whose body is cut short writes nothing, though x/net/webdav
+// closes (commits) the file all the same.
+func TestCutShortBody(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.create("docs", "n", 1.0)
+	h, _ := e.load("docs", "n")
+	srv := e.dav.Config.Handler
+	req := httptest.NewRequest("PUT", "/docs/n.json", io.MultiReader(strings.NewReader("1234"), errReader{io.ErrUnexpectedEOF}))
+	req.SetBasicAuth("u", e.pw)
+	w := httptest.NewRecorder()
+	srv.ServeHTTP(w, req)
+	if w.Code < 400 {
+		t.Fatalf("cut short: %d %s", w.Code, w.Body)
+	}
+	if h2, doc := e.load("docs", "n"); h2.ID != h.ID {
+		t.Fatalf("a cut-short body was written: %v", doc)
+	}
+}
+
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+// Request bodies are bounded: XML ones (PROPFIND, PROPPATCH, LOCK) at a
+// mebibyte, the written files buffered at once at InflightBytes (503).
+func TestBodyLimits(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.InflightBytes = 64 })
+	big := `<?xml version="1.0"?><D:propfind xmlns:D="DAV:"><D:prop>` + strings.Repeat("<D:a/>", 1<<18) + `</D:prop></D:propfind>`
+	if r := e.do("PROPFIND", "/docs/", big, "Depth", "0"); r.status != 400 && r.status != 413 {
+		t.Fatalf("a 1.5 MiB PROPFIND body: %d", r.status)
+	}
+	e.expect(e.do("PUT", "/docs/x.json", `{"v": 1}`), 201, "a small file")
+	r := e.expect(e.do("PUT", "/docs/y.json", `{"v": "`+strings.Repeat("x", 100)+`"}`), 503, "more than InflightBytes")
+	if r.header.Get("Retry-After") == "" {
+		t.Fatalf("503 without Retry-After: %v", r.header)
+	}
+	if h, _ := e.load("docs", "y"); h.State != client.NotFound {
+		t.Fatal("a refused file was written")
+	}
+}
+
+// A core that can't be reached is a 502 whose text doesn't show where the
+// core is (the log does).
+func TestUnreachableCore(t *testing.T) {
+	t.Parallel()
+	ln := must(net.Listen("tcp", "127.0.0.1:0"))
+	addr := ln.Addr().String()
+	ln.Close()
+	c := must(client.New("http://" + addr + "/internal-prefix"))
+	var logged []string
+	var mu sync.Mutex
+	srv := must(dav.New(dav.Options{Client: c, Namespaces: []string{"docs"}, Password: "pw", Logf: func(f string, a ...any) {
+		mu.Lock()
+		logged = append(logged, fmt.Sprintf(f, a...))
+		mu.Unlock()
+	}}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	e := &env{t: t, dav: hs, pw: "pw"}
+	r := e.expect(e.do("GET", "/docs/x.json", ""), 502, "GET")
+	if strings.Contains(r.body, addr) || strings.Contains(r.body, "internal-prefix") || !strings.Contains(r.body, "can't be reached") {
+		t.Fatalf("502 text %q", r.body)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(strings.Join(logged, "\n"), addr) {
+		t.Fatalf("logged %q", logged)
+	}
 }

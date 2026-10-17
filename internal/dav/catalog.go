@@ -3,9 +3,12 @@ package dav
 import (
 	"context"
 	"net/http"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/tree"
@@ -15,34 +18,65 @@ import (
 // node name, placements files {ns}.{name}.json holding their item's
 // document, and a node with several parents (a DAG) is under each. The
 // tree is built from the catalog namespace's documents as the core has
-// them (tree.BuildGraph), so a write shows in the next listing; the
-// catalog's trust list, access ($access, §B.11) and the tree service
-// aren't consulted.
+// them (tree.BuildGraph), kept per principal for CatalogTTL or until this
+// server writes; the catalog's access ($access, §B.11) and the tree
+// service aren't consulted, and its trust list (§B.3) only bounds where
+// placements write.
 
 const kindFolder = tree.KindFolder
 
 // catGraph is a catalog's live nodes: their documents and heads, and the
-// graph the tree service would build of them (§B.5).
+// graph the tree service would build of them (§B.5), as one principal
+// read them, with the heads of their items as read since.
 type catGraph struct {
 	cat   string
 	g     *tree.Graph
 	heads map[string]string
+	at    time.Time
+	gen   uint64
+
+	mu    sync.Mutex
+	items map[string]*client.Head // by ns/name
 }
 
-// graph reads catalog cat once per request.
+// graph returns catalog cat as the principal read it at most CatalogTTL
+// ago, and not before this server's last write.
 func (st *reqState) graph(ctx context.Context, cat string) (*catGraph, error) {
 	if cg := st.graphs[cat]; cg != nil {
 		return cg, nil
 	}
+	now, gen := st.s.opt.Now(), st.s.gen.Load()
+	st.p.mu.Lock()
+	cg := st.p.cats[cat]
+	st.p.mu.Unlock()
+	if cg == nil || cg.gen != gen || now.Sub(cg.at) >= st.s.opt.CatalogTTL {
+		var err error
+		if cg, err = st.readGraph(ctx, cat); err != nil {
+			return nil, err
+		}
+		cg.at, cg.gen = now, gen
+		st.p.mu.Lock()
+		st.p.cats[cat] = cg
+		st.p.mu.Unlock()
+	}
+	if st.graphs == nil {
+		st.graphs = map[string]*catGraph{}
+	}
+	st.graphs[cat] = cg
+	return cg, nil
+}
+
+// readGraph reads catalog cat's live nodes.
+func (st *reqState) readGraph(ctx context.Context, cat string) (*catGraph, error) {
 	hs, err := st.s.liveHeads(ctx, st.p, cat)
 	if err != nil {
 		return nil, err
 	}
-	docs, err := st.s.fetchHeads(ctx, st.p, hs)
+	docs, err := st.s.fetchHeads(ctx, st.p, hs, st.p.c.Head)
 	if err != nil {
 		return nil, err
 	}
-	cg := &catGraph{cat: cat, heads: map[string]string{}}
+	cg := &catGraph{cat: cat, heads: map[string]string{}, items: map[string]*client.Head{}}
 	nodes := map[string]any{}
 	for _, hd := range docs {
 		if hd.e.sealed {
@@ -52,11 +86,29 @@ func (st *reqState) graph(ctx context.Context, cat string) (*catGraph, error) {
 		nodes[hd.name] = hd.e.value
 	}
 	cg.g = tree.BuildGraph(cat, nil, nodes)
-	if st.graphs == nil {
-		st.graphs = map[string]*catGraph{}
-	}
-	st.graphs[cat] = cg
 	return cg, nil
+}
+
+// itemHead reads the head of a placement's item with p's client, once per
+// graph.
+func (cg *catGraph) itemHead(p *principal) func(context.Context, string, string) (*client.Head, error) {
+	return func(ctx context.Context, ns, name string) (*client.Head, error) {
+		k := ns + "/" + name
+		cg.mu.Lock()
+		h := cg.items[k]
+		cg.mu.Unlock()
+		if h != nil {
+			return h, nil
+		}
+		h, err := p.c.Head(ctx, ns, name)
+		if err != nil {
+			return nil, err
+		}
+		cg.mu.Lock()
+		cg.items[k] = h
+		cg.mu.Unlock()
+		return h, nil
+	}
 }
 
 // shown reports whether a node appears in the tree: not on a cycle (§B.5)
@@ -143,10 +195,9 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 	}
 	if folderName(last) {
 		t.kind, t.node = kNewFolder, last
-	} else {
-		t.kind = kScratch
+		return t, nil
 	}
-	return t, nil
+	return st.scratchAt(t, true), nil
 }
 
 // parentsOf is the parents value placing a node in folder: one live link
@@ -182,26 +233,58 @@ func (st *reqState) mkFolder(ctx context.Context, t target) error {
 }
 
 // place writes v as the document of a placement's item, created if it
-// doesn't exist (else edited), then creates the placement in t.parent
-// (§B.2, §B.7: content first). An item placed elsewhere in the catalog is
-// a 409, before anything is written: one placement per item per catalog,
-// so it is moved instead.
-func (st *reqState) place(ctx context.Context, t target, v any) (string, error) {
+// doesn't exist (else edited), and creates the placement in t.parent
+// (§B.2). An item placed elsewhere in the catalog is a 409, before
+// anything is written: one placement per item per catalog, so it is moved
+// instead. A new item is written first (§B.7: content first, so a
+// placement never dangles); an existing one after its placement, so a
+// placement the core refuses (a frozen catalog, a grant that doesn't
+// write it) leaves the item as it was.
+func (st *reqState) place(ctx context.Context, t target, v any, body []byte) (string, bool, error) {
 	cg, err := st.graph(ctx, t.ns)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if n := cg.g.Node(t.node); n != nil {
-		return "", fail(http.StatusConflict, "%s/%s is already placed in catalog %s (in %s); move it here instead", t.docNS, t.docName, t.ns, cg.where(n))
+		return "", false, fail(http.StatusConflict, "%s/%s is already placed in catalog %s (in %s); move it here instead", t.docNS, t.docName, t.ns, cg.where(n))
 	}
-	rev, err := st.commitDoc(ctx, t.docNS, t.docName, v)
+	h, err := st.p.c.Head(ctx, t.docNS, t.docName)
 	if err != nil {
-		return "", err
+		return "", false, upstream(err)
 	}
-	if err := st.createNode(ctx, t.ns, t.node, map[string]any{"parents": parentsOf(t.ns, t.parent)}); err != nil {
-		return "", err
+	node := map[string]any{"parents": parentsOf(t.ns, t.parent)}
+	if h.State == client.Live {
+		if err := st.createNode(ctx, t.ns, t.node, node); err != nil {
+			return "", false, err
+		}
+		return st.commitDoc(ctx, t.docNS, t.docName, v, body, false)
 	}
-	return rev, nil
+	rev, exact, err := st.commitDoc(ctx, t.docNS, t.docName, v, body, false)
+	if err != nil {
+		return "", false, err
+	}
+	if err := st.createNode(ctx, t.ns, t.node, node); err != nil {
+		return "", false, err
+	}
+	return rev, exact, nil
+}
+
+// writable refuses a write through a placement to an item this server
+// doesn't write: one in a catalog (a node document, which takes only the
+// writes of MKCOL, MOVE and DELETE here), or in a namespace neither served
+// (-ns) nor trusted by the catalog (§B.3), which a local mode's grant may
+// reach though the server wasn't set up to serve it.
+func (st *reqState) writable(ctx context.Context, t target) error {
+	if t.kind != kPlacement && t.kind != kNewPlacement {
+		return nil
+	}
+	if st.s.cats[t.docNS] || t.docNS == t.ns {
+		return fail(http.StatusForbidden, "%s.%s is a catalog's node; its file isn't written here (folders are made, moved and deleted as directories)", t.docNS, t.docName)
+	}
+	if st.s.flat[t.docNS] || slices.Contains(st.s.nsInfo(ctx, st.p, t.ns).trust, t.docNS) {
+		return nil
+	}
+	return fail(http.StatusForbidden, "catalog %s doesn't trust namespace %s (§B.3), and it isn't served here (-ns): its documents aren't written through the catalog", t.ns, t.docNS)
 }
 
 // createNode creates catalog node name with doc (If-None-Match: *), or

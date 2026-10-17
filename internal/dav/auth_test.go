@@ -2,7 +2,10 @@ package dav_test
 
 import (
 	"context"
+	"io"
+	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -152,4 +155,122 @@ func TestGatewayEviction(t *testing.T) {
 	// b comes back as a new principal, without its scratch file (and a,
 	// now the least recently seen, goes).
 	e.expect(e.doAs(g["b"], "GET", "/docs/.scratch", ""), 404, "b, dropped")
+}
+
+// A gateway keeps nothing for a grant before the core accepts it: a grant
+// signed by a key no namespace trusts gets no scratch file and pushes no
+// one's state out. In a public namespace, whose reads ignore a bad grant,
+// the grant is verified against the namespace's keys.
+func TestGatewayVerifies(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true, func(o *dav.Options) { o.MaxPrincipals = 2 })
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append"})
+	e.expect(e.doAs(alice, "PUT", "/docs/.x.json.swp", "swap"), 201, "alice's swap file")
+	for i := 0; i < 4; i++ {
+		forged := clienttest.NewKey("x"+strconv.Itoa(i)).Grant(t, e.s.Now(), "user:mallory", []string{"docs"}, []string{"read"})
+		r := e.doAs(forged, "PUT", "/.junk", "x")
+		if r.status != 401 || !strings.HasPrefix(r.header.Get("WWW-Authenticate"), "Basic") {
+			t.Fatalf("forged grant %d: %d %s", i, r.status, r.body)
+		}
+	}
+	e.expect(e.doAs(alice, "GET", "/docs/.x.json.swp", ""), 200, "alice's swap file, kept")
+	e.expect(e.doAs(k.Grant(t, e.s.Now(), "user:bob", []string{"other"}, []string{"read"}), "GET", "/", ""), 401, "a grant naming no served namespace")
+
+	// A public namespace.
+	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "pub")))
+	must(op.CreateNamespace(e.ctx, "pub", map[string]any{"read": "public", "keys": []any{k.Entry("*")}}))
+	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"pub"}, Gateway: true, Logf: t.Logf}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	g := &env{t: t, ctx: e.ctx, s: e.s, c: e.c, dav: hs}
+	forged := clienttest.NewKey("k").Grant(t, e.s.Now(), "user:mallory", []string{"pub"}, []string{"read"})
+	g.expect(g.doAs(forged, "PUT", "/pub/.junk", "x"), 401, "a forged grant for a public namespace")
+	carol := k.Grant(t, e.s.Now(), "user:carol", []string{"pub"}, []string{"read", "create"})
+	g.expect(g.doAs(carol, "PUT", "/pub/.swp", "x"), 201, "a valid one")
+	g.expect(g.doAs(carol, "PUT", "/pub/a.json", `{"by": "carol"}`), 201, "and its write")
+}
+
+// Tokens of one grant root (attenuated offline, or minted again) share
+// MaxPrincipalsPerRoot, so many of them push out only their own; a
+// principal with a request in flight isn't pushed out, nor its scratch
+// bytes lost to the server's budget.
+func TestGatewayBounds(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true, func(o *dav.Options) {
+		o.MaxPrincipals, o.MaxPrincipalsPerRoot = 3, 2
+		o.ScratchTotal, o.ScratchBytes, o.MaxFileSize = 3<<20, 2<<20, 2<<20
+	})
+	now := e.s.Now()
+	bob := k.Grant(t, now, "user:bob", []string{"docs"}, []string{"read"})
+	e.expect(e.doAs(bob, "PUT", "/docs/.bob", "b"), 201, "bob's scratch")
+	var alices []string
+	for i := 0; i < 3; i++ {
+		a := k.Grant(t, now.Add(time.Duration(i)*time.Second), "user:alice", []string{"docs"}, []string{"read"})
+		alices = append(alices, a)
+		e.expect(e.doAs(a, "PUT", "/docs/.alice", "a"+strconv.Itoa(i)), 201, "alice's scratch")
+	}
+	e.expect(e.doAs(bob, "GET", "/docs/.bob", ""), 200, "bob's, kept")
+	e.expect(e.doAs(alices[2], "GET", "/docs/.alice", ""), 200, "alice's latest, kept")
+
+	// p's PUT is in flight while two others come and go.
+	p := k.Grant(t, now, "user:p", []string{"docs"}, []string{"read"})
+	pr, pw := io.Pipe()
+	req := must(http.NewRequest("PUT", e.dav.URL+"/docs/.big", pr))
+	req.SetBasicAuth("u", p)
+	done := make(chan int)
+	go func() {
+		res, err := http.DefaultClient.Do(req)
+		if err != nil {
+			done <- -1
+			return
+		}
+		res.Body.Close()
+		done <- res.StatusCode
+	}()
+	pw.Write([]byte(strings.Repeat("A", 1000)))
+	for _, u := range []string{"user:q", "user:r", "user:s"} {
+		e.doAs(k.Grant(t, now, u, []string{"docs"}, []string{"read"}), "GET", "/docs/.none", "")
+	}
+	pw.Write([]byte(strings.Repeat("A", 2<<20-1000)))
+	pw.Close()
+	if st := <-done; st != 201 {
+		t.Fatalf("p's PUT: %d", st)
+	}
+	e.expect(e.doAs(p, "GET", "/docs/.big", ""), 200, "p's file")
+	e.expect(e.doAs(p, "DELETE", "/docs/.big", ""), 204, "p's file deleted")
+	e.expect(e.doAs(k.Grant(t, now, "user:t", []string{"docs"}, []string{"read"}), "PUT", "/docs/.x", strings.Repeat("B", 2<<20)), 201, "the budget is whole")
+}
+
+// A root listing names the served namespaces without reading them, so a
+// grant that reads only some of them still mounts; the others refuse when
+// opened. A catalog folder leaves out the placements whose items the
+// grant doesn't read.
+func TestGatewayPartialGrant(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	for _, ns := range []string{"secret", "cat"} {
+		op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, ns)))
+		doc := map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}
+		if ns == "cat" {
+			doc["catalog"] = map[string]any{"trust": []any{"docs", "secret"}, "mode": "dag"}
+		}
+		must(op.CreateNamespace(e.ctx, ns, doc))
+	}
+	w := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"secret", "cat"}, []string{"read", "create"})))
+	e.create("docs", "a", map[string]any{"v": 1})
+	must(w.CreateDoc(e.ctx, "secret", "s", map[string]any{"v": 2}))
+	must(w.CreateDoc(e.ctx, "cat", "root", map[string]any{"parents": []any{}}))
+	for _, n := range []string{"docs.a", "secret.s"} {
+		must(w.CreateDoc(e.ctx, "cat", n, map[string]any{"parents": parents("cat", "root")}))
+	}
+	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"docs", "secret"}, Catalogs: []string{"cat"}, Gateway: true, Logf: t.Logf}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	g := &env{t: t, ctx: e.ctx, s: e.s, c: e.c, dav: hs, pw: k.Grant(t, e.s.Now(), "user:alice", []string{"docs", "cat"}, []string{"read"})}
+	sameStrings(t, "root", names(g.propfind("/"), "/"), []string{"cat/", "docs/", "secret/"})
+	sameStrings(t, "docs", names(g.propfind("/docs/"), "/docs/"), []string{"a.json"})
+	if r := g.do("PROPFIND", "/secret/", "", "Depth", "1"); r.status != 403 {
+		t.Fatalf("PROPFIND /secret/: %d %s", r.status, r.body)
+	}
+	sameStrings(t, "cat/root", names(g.propfind("/cat/root/"), "/cat/root/"), []string{"docs.a.json"})
 }
