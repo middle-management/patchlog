@@ -2,6 +2,24 @@
 
 ## Unreleased
 
+**New:**
+- **`patchlog dav`: namespaces and catalogs over WebDAV (a prototype)** (`internal/dav`), so
+  file managers and editors (Finder, Explorer, GNOME Files, vim, VS Code) open and save
+  documents as files, through the core's public API only. Flat namespaces (`-ns`) are
+  directories of `{name}.json`; catalogs (`-catalog`, Addendum B) are folder trees whose
+  placements `{ns}.{name}.json` hold their item. A file reads as its document's canonical form,
+  indented, with the revision id as ETag. A save is rebased (§11 submit): the diff from the
+  version the user had (`If-Match`, or the closest one they were served or wrote) is appended
+  to the head with `If-Match`, so others' edits are kept and overlapping ones are a `409`,
+  never an overwrite (writes inside an array count for the whole array, §F.3). Editors' swap,
+  backup and temp files and macOS's `._*` and `.DS_Store` stay in memory per user, so atomic
+  saves and backup renames are edits, not deletes. In catalogs MKCOL makes a folder, MOVE
+  replaces one `parents` entry and DELETE unplaces. Local mode sends one `-bearer` grant behind
+  a password; gateway mode (`-gateway`) sends each request's Basic password upstream as its
+  grant, keeps nothing for a grant the core hasn't accepted, and needs TLS beyond loopback. Not
+  yet: blobs as files, sealed and end-to-end namespaces (read-only), history, live
+  invalidation, batches.
+
 **Fixes:**
 - **A second CDN purge from the index and the tree/catalog services** (D.8, as the core's): a
   request in flight when an apply committed a purge could hand the CDN a result or listing it
