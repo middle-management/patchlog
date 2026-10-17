@@ -110,7 +110,7 @@ func (st *reqState) scratchList(dir string) map[string]*scratchFile {
 	return out
 }
 
-// scratchUnder reports whether the principal has scratch files below dir.
+// scratchUnder lists the principal's scratch files below dir.
 func (st *reqState) scratchUnder(dir string) []string {
 	p := st.p
 	p.mu.Lock()
