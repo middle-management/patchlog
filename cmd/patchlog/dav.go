@@ -1,0 +1,177 @@
+package main
+
+import (
+	"crypto/rand"
+	"encoding/base32"
+	"errors"
+	"flag"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/dav"
+)
+
+// davCmd serves namespaces over WebDAV (a prototype, internal/dav):
+//
+//	patchlog dav -api URL [-addr 127.0.0.1:8090] -ns NS[,NS…] [-catalog NS[,NS…]]
+//	             [-bearer GRANT | -bearer-file FILE] [-author NAME] [-password-file FILE]
+//	             [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]
+//
+// Local mode (the default) sends -bearer's grant with every request to the
+// core; WebDAV clients log in with HTTP Basic, any user name and the
+// password of -password-file, or a random one logged at start. Gateway
+// mode sends each request's Basic password upstream as its grant
+// (Authorization: Bearer); grants must not cross plain HTTP, so it needs
+// TLS on any address but loopback unless -insecure.
+func davCmd(args []string) {
+	fs := flag.NewFlagSet("dav", flag.ExitOnError)
+	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")
+	addr := fs.String("addr", "127.0.0.1:8090", "listen address of the WebDAV server")
+	var nss, cats multi
+	fs.Var(&nss, "ns", "flat namespace to serve, a directory of {name}.json files (repeatable or comma-separated)")
+	fs.Var(&cats, "catalog", "catalog namespace to serve as a folder tree (Addendum B; repeatable or comma-separated)")
+	bearer := fs.String("bearer", "", "local mode: the grant every request is sent with (Authorization: Bearer)")
+	bearerFile := fs.String("bearer-file", "", "local mode: file holding -bearer")
+	author := fs.String("author", "", "X-Author for a -dev server (local mode)")
+	passwordFile := fs.String("password-file", "", "local mode: file holding the Basic password WebDAV clients log in with (any user name); default a random one, logged at start")
+	gateway := fs.Bool("gateway", false, "gateway mode: each request's Basic password is the grant sent upstream; the user name is ignored")
+	insecure := fs.Bool("insecure", false, "gateway mode: allow plain HTTP on an address other than loopback, so grants cross the network in the clear")
+	tlsCert := fs.String("tls-cert", "", "serve HTTPS with this certificate (PEM), with -tls-key")
+	tlsKey := fs.String("tls-key", "", "the private key of -tls-cert (PEM)")
+	fetchConc := fs.Int("fetch-concurrency", 8, "how many documents are read from the core at once")
+	cacheSize := fs.String("cache-size", "64 MiB", "rendered documents kept in memory by revision id")
+	maxFile := fs.String("max-file-size", "16 MiB", "largest file written (buffered whole) or kept as a temporary file")
+	sdFlags := addShutdownFlags(fs)
+	fs.Parse(args)
+
+	flat, catalogs := splitCatalogs(nss), splitCatalogs(cats)
+	if len(flat)+len(catalogs) == 0 {
+		log.Fatal("dav: -ns or -catalog is required")
+	}
+	if (*tlsCert == "") != (*tlsKey == "") {
+		log.Fatal("dav: -tls-cert and -tls-key go together")
+	}
+	tls := *tlsCert != ""
+	cache, err := core.ParseSize(*cacheSize)
+	if err != nil {
+		log.Fatalf("dav: -cache-size: %v", err)
+	}
+	maxSize, err := core.ParseSize(*maxFile)
+	if err != nil {
+		log.Fatalf("dav: -max-file-size: %v", err)
+	}
+	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, Gateway: *gateway, FetchConcurrency: *fetchConc,
+		CacheBytes: cache, MaxFileSize: maxSize, Logf: log.Printf}
+	copts := []client.Option{client.WithIdleConns(*fetchConc)}
+	if *gateway {
+		if *bearer != "" || *bearerFile != "" || *passwordFile != "" || *author != "" {
+			log.Fatal("dav: -gateway takes each request's grant; -bearer, -bearer-file, -password-file and -author are for local mode")
+		}
+		if !tls && !loopback(*addr) && !*insecure {
+			log.Fatalf("dav: -gateway on %s, not a loopback address, needs -tls-cert and -tls-key (grants must not cross plain HTTP), or -insecure", *addr)
+		}
+	} else {
+		grant := *bearer
+		if *bearerFile != "" {
+			if grant != "" {
+				log.Fatal("dav: -bearer and -bearer-file are exclusive")
+			}
+			grant = readSecret("-bearer-file", *bearerFile)
+		}
+		if grant != "" {
+			copts = append(copts, client.WithBearer(grant))
+		}
+		if *author != "" {
+			copts = append(copts, client.WithAuthor(*author))
+		}
+		if *passwordFile != "" {
+			opt.Password = readSecret("-password-file", *passwordFile)
+		} else {
+			opt.Password = randomPassword()
+			log.Printf("patchlog dav: WebDAV password (any user name): %s", opt.Password)
+		}
+		if !tls && !loopback(*addr) {
+			log.Printf("patchlog dav: warning: serving plain HTTP on %s: the WebDAV password crosses the network in the clear", *addr)
+		}
+	}
+	if opt.Client, err = client.New(*api, copts...); err != nil {
+		log.Fatal(err)
+	}
+	srv, err := dav.New(opt)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	ctx, sigs := shutdownSignals("patchlog dav")
+	hs := &http.Server{Addr: *addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second}
+	ls := sdFlags.server("patchlog dav", hs, nil)
+	ln, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	mode, scheme := "local", "http"
+	if *gateway {
+		mode = "gateway"
+	}
+	if tls {
+		scheme = "https"
+	}
+	log.Printf("patchlog dav: %s mode, serving %s of %s at %s://%s/", mode, strings.Join(append(flat, catalogs...), ","), *api, scheme, ln.Addr())
+	go func() {
+		var err error
+		if tls {
+			err = ls.HTTP.ServeTLS(ln, *tlsCert, *tlsKey)
+		} else {
+			err = ls.HTTP.Serve(ln)
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+	<-ctx.Done()
+	forceOnSecond(sigs)
+	ls.Shutdown()
+}
+
+// loopback reports whether a listen address is a loopback one only.
+func loopback(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+// readSecret reads a grant or password from a file, without surrounding
+// white space.
+func readSecret(flagName, file string) string {
+	b, err := os.ReadFile(file)
+	if err != nil {
+		log.Fatalf("dav: %s: %v", flagName, err)
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		log.Fatalf("dav: %s: %s is empty", flagName, file)
+	}
+	return s
+}
+
+// randomPassword is 128 random bits in lowercase base32.
+func randomPassword() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("dav: random: %v", err))
+	}
+	return strings.ToLower(base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(b))
+}
