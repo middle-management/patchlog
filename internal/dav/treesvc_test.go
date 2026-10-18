@@ -1068,9 +1068,8 @@ func TestTreeServiceMinRefusedPerNamespace(t *testing.T) {
 	ann := k.Grant(t, s.Now(), "user:ann", all, []string{"read", "create", "append", "delete"})
 	limited := k.Grant(t, s.Now(), "user:ann", all, []string{"read"}, map[string]any{"rules": []any{
 		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby"}}}}})
-	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
-	sameStrings(t, "the limited grant's Season", names(g.propfindAs(limited, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
-	// The tree service refuses mins naming ghost, which it can't follow.
+	// ghost, which the tree service can't follow, isn't waited for, and
+	// mins naming it are refused.
 	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
 		req := must(http.NewRequest("GET", tr.http.URL+"/cat/children?of=season&min=ghost:"+tr.s.Checkpoint("matches"), nil))
 		req.Header.Set("Authorization", "Bearer "+ann)
@@ -1084,6 +1083,8 @@ func TestTreeServiceMinRefusedPerNamespace(t *testing.T) {
 		}
 	}
 
+	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	sameStrings(t, "the limited grant's Season", names(g.propfindAs(limited, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 	tr.paused.Store(true)
 	g.expect(g.doAs(ann, "PUT", "/cat/Season/derby.json", `{"title": "Derby!"}`), 201, "ann's PUT of derby.json")
 	g.expect(g.doAs(ann, "PUT", "/cat/Season/g.json", `{"text": "edited"}`), 201, "ann's PUT of g.json, an item of ghost")
