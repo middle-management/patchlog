@@ -519,7 +519,7 @@ func (st *reqState) answered(status int) {
 		st.sc.moveProps(st.path, to)
 	case st.method == "GET" && status == http.StatusNotFound:
 		for _, g := range st.gone {
-			st.s.reloaded(st.p, g.ns, g.name)
+			st.s.reloaded(st.p, g.ns, g.name, st.tk.id)
 		}
 		st.s.forgetPath(st.p, st.path)
 	}

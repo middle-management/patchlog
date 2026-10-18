@@ -233,11 +233,23 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 // within ownDeleteUndo and the file didn't move away ($successor, §8.1);
 // a 409 when the principal has a base from before someone else's delete
 // (§11.3), whose reload (a GET finding the file gone) lets the write
-// make a new file; else nil: a new file.
+// make a new file; else nil: a new file, but not by a token refused a
+// save of it that hasn't read it since (refusedSave).
 func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
+	last, err := st.tombLast(ctx, ns, name, h)
+	if err == nil && last == nil {
+		// A new file, written over the tombstone: not by a token refused
+		// a save of it and that hasn't read it since.
+		err = st.refusedSave(ns, name)
+	}
+	return last, err
+}
+
+// tombLast is tombBase but for refusedSave.
+func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	own := st.p.deletedOwn(ns, name, h.ID, st.s.opt.Now())
 	if !own && !st.s.ownEntry(st.p, ns, name, h.ID) && st.hasBase(ns, name) {
-		st.s.refuse(st.p, ns, name)
+		st.refuse(ns, name)
 		return nil, fail(http.StatusConflict, "%s/%s was deleted by someone else since you opened it (§11.3, §H.4): your save isn't written over the delete; reload it (it reads as gone), and save it again to make it anew", ns, name)
 	}
 	if !own || h.Last == "" || h.Successor != "" {
@@ -322,7 +334,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	case client.IsGone(err) && !client.IsPurged(err):
 		return "", false, false, fail(http.StatusConflict, "%s/%s was deleted meanwhile", ns, name)
 	case isPatchFailure(err):
-		st.s.refuse(st.p, ns, name)
+		st.refuse(ns, name)
 		return "", false, false, fail(http.StatusConflict, "your edit no longer applies to %s/%s, which someone else changed: %s; reload it and edit again", ns, name, apiText(errAPI(err)))
 	case err != nil:
 		return "", false, false, err
@@ -482,7 +494,7 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 	}
 	if gone {
 		if ae, ok := client.AsAPIError(goneErr); ok && ae.Status == http.StatusGone {
-			st.s.refuse(st.p, ns, name)
+			st.refuse(ns, name)
 			return nil, false, fail(http.StatusConflict, "%s/%s: revision %s, the version you edited (If-Match), is no longer kept (pruned, §8.6), so your changes can't be told from others'; reload it and edit again", ns, name, st.ifMatch)
 		}
 	}
@@ -524,8 +536,23 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 // the principal's own save combined with a new edit and a second
 // program's edit from the version before that save do, the save isn't
 // applied as either. A save that can't be rebased so is a 409, which asks
-// for a reload (refuse); so is one whose records were lost.
+// for a reload (refuse); so is one whose records were lost, and one that
+// writes by a token refused a save of it that hasn't read it since
+// (refusedSave).
 func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev string, head any) (any, bool, error) {
+	out, atHead, err := st.rebasedOn(ctx, ns, name, v, headRev, head)
+	if err == nil && !jsonv.Equal(out, files.Bare(head)) {
+		// A save that writes: not by a token refused a save of it and
+		// that hasn't read it since.
+		if err = st.refusedSave(ns, name); err != nil {
+			return nil, false, err
+		}
+	}
+	return out, atHead, err
+}
+
+// rebasedOn is rebased but for refusedSave.
+func (st *reqState) rebasedOn(ctx context.Context, ns, name string, v any, headRev string, head any) (any, bool, error) {
 	cs, lost, err := st.candidates(ctx, ns, name)
 	if err != nil {
 		return nil, false, err
@@ -538,7 +565,7 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev
 		if jsonv.Equal(mine, head) {
 			return head, true, nil
 		}
-		st.s.refuse(st.p, ns, name)
+		st.refuse(ns, name)
 		return nil, false, lostBase(ns, name)
 	}
 	if len(cs) == 0 {
@@ -589,7 +616,7 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev
 		if len(clash) == 0 {
 			if clash = unsafe(out, head, cs); len(clash) == 0 {
 				if amb := ambiguous(cs, dist, sp, i, mine, head, out); amb != nil {
-					st.s.refuse(st.p, ns, name)
+					st.refuse(ns, name)
 					return nil, false, fail(http.StatusConflict, "%s/%s: your save reads as an edit of more than one version you were served or wrote, which give different results at %s (an undo of a save of yours combined with a new edit, and another program's edit from the version before that save, look alike; §H.4); reload it and save again", ns, name, strings.Join(amb, ", "))
 				}
 				return out, jsonv.Equal(cs[i].doc, head), nil
@@ -599,7 +626,7 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev
 			why = clash
 		}
 	}
-	st.s.refuse(st.p, ns, name)
+	st.refuse(ns, name)
 	if foreign {
 		return nil, false, fail(http.StatusConflict, "%s/%s was deleted or restored by someone else since you opened it (§11.3): your changes aren't merged over that; reload it and edit again", ns, name)
 	}
@@ -671,7 +698,7 @@ func (st *reqState) spans(ctx context.Context, ns, name, headRev string, cs []ca
 	// its range.
 	sort.SliceStable(revs, func(i, j int) bool { return seqOf(cs, revs[i]) < seqOf(cs, revs[j]) })
 	gone := func() error {
-		st.s.refuse(st.p, ns, name)
+		st.refuse(ns, name)
 		return fail(http.StatusConflict, "%s/%s: its history since the version you edited is no longer kept (pruned, §8.6), so your changes can't be told from others'; reload it and edit again", ns, name)
 	}
 	for _, from := range revs {

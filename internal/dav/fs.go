@@ -346,7 +346,7 @@ func (st *reqState) replaced(ctx context.Context, t target) error {
 	if same {
 		return nil
 	}
-	st.s.refuse(st.p, ns, name)
+	st.refuse(ns, name)
 	now := "names no file now"
 	if t.kind != kNewNode {
 		now = fmt.Sprintf("names %s/%s now", t.docNS, t.docName)
@@ -831,7 +831,7 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		if st.method == "GET" {
 			st.serve = &stagedServe{ns: hd.ns, name: hd.name, rev: hd.rev, path: t.path}
 		}
-		if st.hdr != nil && st.s.stale(st.p, hd.ns, hd.name, hd.rev) {
+		if st.hdr != nil && st.s.stale(st.p, hd.ns, hd.name, hd.rev, st.tk.id) {
 			st.hdr.Del("If-None-Match")
 			st.hdr.Del("If-Modified-Since")
 		}

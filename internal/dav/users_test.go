@@ -867,3 +867,36 @@ func TestGatewayOperatorKeyInNamespace(t *testing.T) {
 		}
 	}
 }
+
+// A refused save asks for a reload (§H.4), and the user's records are
+// their tokens': any program's read drops what was recorded before the
+// refusal. But the program refused keeps what it had and may retry the
+// refused upload on its own (an rclone mount's write-back, 10 s, 20 s, 40 s
+// later), the same bytes: until that token reads the file itself, its
+// saves without a base are refused again, not rebased on what another
+// token of the user read, which would overwrite the edit the refusal was
+// about. Once it reloads, its save goes through.
+func TestGatewayRetryAfterOtherRead(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	writer := []string{"read", "create", "append", "restore", "delete"}
+	mount := k.Grant(t, e.s.Now(), "user:bob", []string{"docs"}, writer)
+	other := k.Grant(t, e.s.Now().Add(time.Second), "user:bob", []string{"docs"}, writer)
+	e.create("docs", "a", map[string]any{"score": "0-0", "title": "T"})
+	e.expect(e.doAs(mount, "GET", "/docs/a.json", ""), 200, "bob's mount opens a.json")
+	h, _ := e.load("docs", "a")
+	must(e.c.Append(e.ctx, "docs", "a", h.ID, []any{replace("/score", "1-0")}))
+	refused := rendered(map[string]any{"score": "8-8", "title": "T"})
+	e.expect(e.doAs(mount, "PUT", "/docs/a.json", refused), 409, "the mount's upload, from 0-0")
+	e.expect(e.doAs(other, "GET", "/docs/a.json", ""), 200, "another program of bob's reads a.json")
+	e.expect(e.doAs(mount, "PUT", "/docs/a.json", refused), 409, "the mount's retry of the bytes refused")
+	_, doc := e.load("docs", "a")
+	sameJSON(t, doc, map[string]any{"score": "1-0", "title": "T"})
+	// The other program's own save, from what it read, goes through.
+	e.expect(e.doAs(other, "PUT", "/docs/a.json", rendered(map[string]any{"score": "1-0", "title": "T2"})), 201, "the other program's save")
+	// The mount reloads, and saves.
+	buf := e.expect(e.doAs(mount, "GET", "/docs/a.json", ""), 200, "the mount reloads").body
+	e.expect(e.doAs(mount, "PUT", "/docs/a.json", strings.Replace(buf, `"1-0"`, `"8-8"`, 1)), 201, "the mount's save after its reload")
+	_, doc = e.load("docs", "a")
+	sameJSON(t, doc, map[string]any{"score": "8-8", "title": "T2"})
+}

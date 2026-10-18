@@ -1,6 +1,8 @@
 package dav
 
 import (
+	"net/http"
+	"slices"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/lru"
@@ -62,10 +64,14 @@ type docRecs struct {
 	// until a reload, a save that changes it is refused rather than
 	// rebased on what is left.
 	lost bool
+	// unread are the user's tokens (by id) whose save of the document
+	// was refused and that haven't read it since, at most maxUnread
+	// (refusedSave).
+	unread []string
 }
 
 func (d docRecs) cost() int {
-	n := 64
+	n := 64 + 32*len(d.unread)
 	for _, r := range d.rs {
 		n += r.cost()
 	}
@@ -235,7 +241,7 @@ func (s *Server) remember(p *principal, ns, name string, r record, reload bool) 
 	// A read after a refused save is the reload it asked for: what was
 	// recorded before the refusal goes.
 	reloaded := reload && old.reload > 0
-	d := docRecs{reload: old.reload, lost: old.lost, rs: make([]record, 0, len(old.rs)+1)}
+	d := docRecs{reload: old.reload, lost: old.lost, unread: old.unread, rs: make([]record, 0, len(old.rs)+1)}
 	if reloaded {
 		d.reload, d.lost = 0, false
 	}
@@ -347,9 +353,18 @@ func (s *Server) forgetPath(p *principal, path string) {
 	s.storeLocked(p).paths.Remove(path)
 }
 
+// maxUnread bounds the tokens a document's records keep as refused and
+// not read since.
+const maxUnread = 8
+
+// refuse marks the principal's records of ns/name refused (Server.refuse)
+// by the request's token.
+func (st *reqState) refuse(ns, name string) { st.s.refuse(st.p, ns, name, st.tk.id) }
+
 // refuse marks p's records of ns/name as refused: the save was a 409,
-// which asks for a reload.
-func (s *Server) refuse(p *principal, ns, name string) {
+// which asks for a reload, by token by, which must read the document
+// itself before it saves it again without a base (refusedSave).
+func (s *Server) refuse(p *principal, ns, name, by string) {
 	k := recKey(ns, name)
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
@@ -362,17 +377,68 @@ func (s *Server) refuse(p *principal, ns, name string) {
 	}
 	s.recSeq++
 	d.reload = s.recSeq
+	if !slices.Contains(d.unread, by) {
+		d.unread = append(slices.Clip(d.unread), by)
+		if len(d.unread) > maxUnread {
+			d.unread = d.unread[1:]
+		}
+	}
 	before := st.docs.Bytes()
 	st.docs.Put(k, d, d.cost())
 	s.recBytes += st.docs.Bytes() - before
 	s.trimRecordsLocked()
 }
 
+// readBy notes that token by of p's read ns/name whole (served), or found
+// it gone (reloaded): the reload a refusal of its save asked for.
+func (s *Server) readBy(p *principal, ns, name, by string) {
+	k := recKey(ns, name)
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	st := s.storeLocked(p)
+	d, ok := st.docs.Get(k)
+	if !ok || !slices.Contains(d.unread, by) {
+		return
+	}
+	d.unread = slices.DeleteFunc(slices.Clone(d.unread), func(t string) bool { return t == by })
+	before := st.docs.Bytes()
+	st.docs.Put(k, d, d.cost())
+	s.recBytes += st.docs.Bytes() - before
+}
+
+// refusedSave is the refusal of a save of ns/name without a base (no
+// If-Match) by a token whose save of it was refused (409) and that hasn't
+// read it since; nil otherwise. The user's records are their tokens', and
+// the reload a refusal asks for drops what was recorded before it, by
+// whichever program reads the document; but the program refused still
+// holds what it had, and may retry the refused upload on its own, the
+// same bytes, as an rclone mount's write-back does (10 s, 20 s, 40 s…
+// later). Rebased on what the other program read, that retry would be
+// written over the edit the refusal was about (§H.4). A token is the
+// program's as far as this server knows: two programs logging in with
+// the same grant (local mode's one password) are one, and the other's
+// read is that one's reload.
+func (st *reqState) refusedSave(ns, name string) error {
+	if st.ifMatch != "" || st.matchAny {
+		return nil
+	}
+	st.s.recMu.Lock()
+	d, _ := st.s.storeLocked(st.p).docs.Get(recKey(ns, name))
+	refused := slices.Contains(d.unread, st.tk.id)
+	st.s.recMu.Unlock()
+	if !refused {
+		return nil
+	}
+	st.refuse(ns, name)
+	return fail(http.StatusConflict, "%s/%s: a save of it by this login was refused, and the login hasn't read it since: someone else changed it since the version this save was made from (a client retrying its upload, maybe), so it isn't written over their changes; reload it here and save your edit again, or name the version you edited (If-Match)", ns, name)
+}
+
 // reloaded forgets p's records of ns/name, gone in the core, if a save of
 // it was refused (refuse) since they were made: a GET found it gone, the
 // reload that refusal asked for, so the next write makes it anew
 // (tombBase) rather than meeting the refusal again.
-func (s *Server) reloaded(p *principal, ns, name string) {
+func (s *Server) reloaded(p *principal, ns, name, by string) {
+	s.readBy(p, ns, name, by)
 	k := recKey(ns, name)
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
@@ -382,7 +448,12 @@ func (s *Server) reloaded(p *principal, ns, name string) {
 		return
 	}
 	before := st.docs.Bytes()
-	st.docs.Remove(k)
+	if len(d.unread) > 0 {
+		// Other tokens refused, which haven't found it gone.
+		st.docs.Put(k, docRecs{unread: d.unread}, docRecs{unread: d.unread}.cost())
+	} else {
+		st.docs.Remove(k)
+	}
 	st.forgotten.Remove(k)
 	s.recBytes += st.docs.Bytes() - before
 }
@@ -393,9 +464,9 @@ func (s *Server) reloaded(p *principal, ns, name string) {
 // own that rev holds other than written (merged, or given a $nonce),
 // which the client may have filed under rev's tag (davfs2 asks for it
 // with a HEAD after a PUT without one).
-func (s *Server) stale(p *principal, ns, name, rev string) bool {
+func (s *Server) stale(p *principal, ns, name, rev, by string) bool {
 	d := s.recordsOf(p, ns, name)
-	if d.reload > 0 || d.lost {
+	if d.reload > 0 || d.lost || slices.Contains(d.unread, by) {
 		return true
 	}
 	if n := len(d.rs); n > 0 {
@@ -440,6 +511,7 @@ func (st *reqState) served() {
 	if sv := st.serve; sv != nil {
 		st.serve = nil
 		st.s.remember(st.p, sv.ns, sv.name, record{rev: sv.rev}, true)
+		st.s.readBy(st.p, sv.ns, sv.name, st.tk.id)
 		st.s.notePath(st.p, sv.path, sv.ns, sv.name)
 	}
 }

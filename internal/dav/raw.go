@@ -341,14 +341,27 @@ func (st *reqState) rawRestorePatches(ctx context.Context, in nsInfo, ns, name s
 // principal's after it, which writes nothing (false), as a JSON file's
 // unchanged save (edit). The principal's own writes since are its own to
 // replace, so its consecutive saves never conflict, whatever their sizes:
-// a version is never picked by how close its reference is to body's.
+// a version is never picked by how close its reference is to body's. One
+// that writes by a token refused a save of it that hasn't read it since
+// is a 409 too (refusedSave).
 func (st *reqState) rawBase(ctx context.Context, ns, name string, body []byte, headRev string) (bool, error) {
+	write, err := st.rawBaseOf(ctx, ns, name, body, headRev)
+	if err == nil && write {
+		// Not by a token refused a save of it and that hasn't read it
+		// since.
+		err = st.refusedSave(ns, name)
+	}
+	return write && err == nil, err
+}
+
+// rawBaseOf is rawBase but for refusedSave.
+func (st *reqState) rawBaseOf(ctx context.Context, ns, name string, body []byte, headRev string) (bool, error) {
 	cs, lost, err := st.candidates(ctx, ns, name)
 	switch {
 	case err != nil:
 		return false, err
 	case lost:
-		st.s.refuse(st.p, ns, name)
+		st.refuse(ns, name)
 		return false, lostBase(ns, name)
 	case len(cs) == 0:
 		return true, nil
@@ -377,7 +390,7 @@ func (st *reqState) rawBase(ctx context.Context, ns, name string, body []byte, h
 			}
 		}
 	}
-	st.s.refuse(st.p, ns, name)
+	st.refuse(ns, name)
 	if foreign {
 		return false, fail(http.StatusConflict, "%s/%s was deleted or restored by someone else since you opened it (§11.3): your save isn't written over that; reload it and save again", ns, name)
 	}
