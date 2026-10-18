@@ -2178,10 +2178,50 @@ network drive, or `net use Z: https://dav.example/ /user:me PASSWORD`; its WebCl
 Basic credentials only over HTTPS by default (`BasicAuthLevel` 1), so serve with `-tls-cert` and
 `-tls-key` (for `http://localhost`, `BasicAuthLevel` 2 in the registry allows it). GNOME Files:
 Other Locations → Connect to Server, `dav://127.0.0.1:8090/` (`davs://` with TLS), or
-`gio mount dav://127.0.0.1:8090/`. rclone: pass `--ignore-size`. A save merged with others' edits,
-or given a `$nonce`, reads back other than it was sent, and rclone deletes a file whose size
-differs from its upload, as it does after a failed upload (a `409` conflict, a `422` refusal);
-here that tombstones the document.
+`gio mount dav://127.0.0.1:8090/`. rclone needs `--ignore-size`, and for copies `--ignore-times`
+too: see **rclone** below.
+
+**rclone.** A remote of vendor `other`:
+
+```sh
+rclone config create pl webdav url=http://127.0.0.1:8090/ vendor=other user=me \
+  pass="$(cat dav.password)" --obscure
+
+rclone copy --ignore-size --ignore-times ./docs pl:docs     # upload: every file, every time
+rclone copy --ignore-times pl:docs ./docs                   # download: likewise
+rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size # a mount
+```
+
+- The server keeps no modification times rclone can set, and no hashes, so rclone tells files
+  apart by size alone (`rclone backend features pl:` shows `"Precision": 3153600000000000000`,
+  rclone's "not supported", and no `Hashes`). A file reads as its document rendered, which is
+  not always the size it was uploaded with: a save merged with others' edits, or given a
+  `$nonce`, reads back larger or smaller. So:
+- **Copies and syncs to the server take `--ignore-size` and `--ignore-times` (`-I`).** Every
+  file is sent on each run; one that is unchanged writes nothing (its diff is empty), a changed
+  one is an edit rebased as any save is (below), so others' edits since are kept. With
+  `--ignore-size` alone, rclone skips every file that already exists ("Sizes identical",
+  "Unchanged skipping") and exits 0: edits are silently not sent. Without `--ignore-size`, rclone
+  checks the size of each upload, and a save merged with others' edits fails ("corrupted on
+  transfer: sizes differ") and is deleted ("Removing failed copy"): the document is tombstoned,
+  or in a catalog folder the placement unplaced (its item keeps the merged edit), and each of
+  rclone's retries restores it and deletes it again; without `--ignore-times` too, an edit that
+  keeps the size isn't sent.
+- **Copies from the server take `--ignore-times`**, else a document someone changed without
+  changing its size isn't fetched.
+- **A mount takes `--ignore-size`** (`--vfs-cache-mode writes` or `full`): the upload of a save
+  merged with others' edits is then done, not deleted. Without it, the mount deletes the
+  document, and keeps retrying the upload, each time restoring it with an empty patch set and
+  deleting it again. Without a cache (`--vfs-cache-mode off`) rclone saves over a file as DELETE
+  then MOVE of a temporary file onto the name; a MOVE the server refuses (a file that isn't JSON,
+  a conflict) restores the document (below), and the program saving gets an I/O error.
+- `rclone sync` deletes what the source doesn't have: here, a tombstone per document. Renames
+  (`moveto` to another name) are refused: names are identity. `moveto` of a flat file into a
+  catalog folder, under its own name `{ns}.{name}.json`, places the document; it stays in the
+  flat directory. rclone sends a MKCOL for the parent folder before each upload: `405`, as a
+  folder that exists is, and not logged. `rclone mkdir` in a frozen catalog fails at once
+  (`403`). `rclone deletefile` of a placement whose item isn't live finds no file (the listing
+  hides it): `curl -X DELETE` its path instead (below).
 
 **Layout.**
 
@@ -2226,7 +2266,8 @@ here that tombstones the document.
   are handled, and those over 4 KiB are handled four at a time over the server: x/net/webdav
   decodes them a value per element. A request has 10 minutes to arrive.
 - A new name is created (`If-None-Match: *` upstream); a tombstoned one is restored, so a name
-  keeps one chain (§8.2); a purged one is `403`. A PUT's own `If-None-Match: *` (create only) is
+  keeps one chain (§8.2), with the diff from its last live document (rebased as an edit is, below);
+  a purged one is `403`. A PUT's own `If-None-Match: *` (create only) is
   `412` over an existing file, and `If-Match: *` (edit only) over a missing one; an empty
   placeholder (below) exists for both. An `If` header's lists of entity tags only (no lock token,
   or the always true `Not <DAV:no-lock>`) are this server's to check, as `If-Match`.
@@ -2260,7 +2301,8 @@ here that tombstones the document.
   head that moves meanwhile (`412`) is read again, the edit checked again and resent, up to five
   times.
 - With nothing known of the base (a PUT without `If-Match` from a user never served the document,
-  after a restart, or once a day has passed), the head is the base, so the file as written wins.
+  after a restart, or once a day has passed), the head (of a tombstoned document, its last live
+  one) is the base, so the file as written wins, as the diff from it.
   Versions the bounds pushed out are remembered as lost: then a save that changes the document is
   a `409` until a reload, rather than rebased on what is left. Within one user, the closest
   version decides: two programs saving the same value, the last wins, and an undo of a save
@@ -2272,29 +2314,37 @@ here that tombstones the document.
   PUT), and would keep showing it after a `304`. A client that reads the tag from a listing and
   never GETs again keeps its copy. A save that writes nothing (the file already reads so) is no
   write of the user's.
-- A save that deletes the original before writing the new version (DELETE, then a PUT or a MOVE
-  onto the name) restores it with the user's edit rebased on the last live document, as above.
-  If that write is refused (a `409`, a `422`), the user's own DELETE is undone: the document is
-  restored as it was, as a refused PUT leaves it.
+- A save that deletes the original before writing the new version (DELETE, then a PUT, a COPY or
+  a MOVE onto the name) restores it with the user's edit rebased on the last live document, as
+  above. If that write fails, whatever refuses it (a `409` conflict, a `422`, a body that isn't
+  JSON or is over `-max-file-size`, a frozen namespace, a precondition), the user's own DELETE is
+  undone: the document is restored as it was (an empty patch set, if the user's tombstone is
+  still its head), as a failed PUT leaves it, and the answer says so. So is a placement the
+  user's DELETE unplaced before a write to its path.
 - `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
   the namespace requires nonces or its document can't be read (§C.7).
-- The core's refusals come back as such: `422` with its validation errors (schema, rules,
-  `nonce`, signature), one per line; `413` for a patch set over `patchSetSize`; `423` for a frozen
-  namespace (with its `successor`); `401` and `403` (but in local mode a `401` refuses the
-  server's own grant, not the user's password, so it is `502` rather than a new login prompt). A
-  `429` is waited out when its Retry-After is at most 2 s, and is otherwise `503` with
-  Retry-After. A core that can't be reached is `502` (the details are logged).
+- The core's refusals come back as such, with its code and message as the text (the status is
+  the answer's own): `422` with its validation errors (schema, rules, `nonce`, signature), one per
+  line; `413` for a patch set over `patchSetSize` (a create's over `documentSize`) or a document
+  over `documentSize`, with the sizes of what was sent, as the core measures them, and the limits
+  the namespace sets; `403` for a frozen namespace (with its `successor`): frozen is for good,
+  and clients retry a `423` as a lock that may go (rclone 30 times, for 45 seconds); `401` and
+  `403` (but in local mode a `401` refuses the server's own grant, not the user's password, so it
+  is `502` rather than a new login prompt). A `429` is waited out when its Retry-After is at most
+  2 s, and is otherwise `503` with Retry-After. A core that can't be reached is `502` (the
+  details are logged).
 - An empty write (a LOCK of a new name, Finder's 0-byte PUT) makes an empty placeholder until
   content arrives; it never truncates a live document.
 - DELETE tombstones (§8.1); with `If-Match` (or an `If` header's entity tag) naming another
   revision than the head, it is `412`. A MOVE between two documents is `403`: names are identity
   (§3.6), so there is no rename. COPY to a new name creates it from the content, and COPY over a
-  document edits it.
+  document edits it. MKCOL of a folder that exists is `405` (not logged), and below a file `409`.
 
 **Temporary and backup files.** Names that aren't `{name}.json`, such as vim's `.x.json.swp`,
 `x.json~` and `4913`, gedit's `.goutputstream-*`, macOS's `.DS_Store` and `._x.json`, or
 `Untitled`, are scratch files: kept in memory per user and directory (at most 256 files and
-folders and 32 MiB a grant root, 256 MiB in all, then `507`), listed beside the documents so
+folders and 32 MiB a grant root, 256 MiB in all, then `507`; in a gateway, only in the served
+namespaces the user's grant names, else `403`), listed beside the documents so
 editors see what they wrote, and dropped after an hour untouched, or when the server stops. They
 never reach the core. Over the bounds, `._*`, `.DS_Store` and `Thumbs.db` make room for others,
 least recently used first, or are dropped rather than refused, so copying many files in doesn't
@@ -2330,15 +2380,24 @@ the user's grant doesn't read, aren't shown.
 - A MOVE of a folder or placement to another folder replaces only its `parents` entry for the
   folder it left with one for the folder it enters (one write with `If-Match`, §B.2 "Move"; the
   entry's `order` doesn't come along), and a MOVE to the catalog's root removes the entry.
-  Renaming is `403`, and a folder can't go into itself (`409`).
+  Renaming is `403` (a folder's: make one of the new name and move what is in it there), and a
+  folder can't go into itself (`409`). A MOVE of a flat directory's `{name}.json` into a folder
+  as `{ns}.{name}.json` places that document, as a COPY does (it stays in the flat directory,
+  and nothing is written to it); a MOVE of a placement onto its item's file in the flat
+  directory unplaces it.
 - A DELETE of a placement unplaces it: the item stays in its namespace (§B.7). A node in several
   folders is unlinked from that one only, as one link of a file with several; in its only folder
   it is deleted. A folder is deleted only when nothing is in it (`409` naming what is); deletes
-  never recurse.
+  never recurse. A placement whose item isn't live (dangling, §B.3) isn't listed, but the `409`
+  of its folder names it, and a DELETE of its path unplaces it; one whose item the user's grant
+  doesn't read is named as such.
 - A PUT of a new `{ns}.{name}.json` in a folder creates the item if it doesn't exist (else edits
   it), and the placement, with that folder as its parent: a new item first (§B.7: content first,
-  so no placement dangles), an existing one after the placement, so a placement the core refuses
-  (a frozen catalog, a grant that doesn't write the catalog) leaves the item as it was. An item
+  so no placement dangles), once a dry run of the placement (§7.5) says the core takes it, an
+  existing one after the placement, so a placement the core refuses (a frozen catalog, a grant
+  that doesn't write the catalog, the catalog's rules) writes nothing, and leaves an existing
+  item as it was. (A placement refused still, the catalog having changed between the dry run and
+  the write, deletes the item just created again.) An item
   placed elsewhere in the catalog is `409` before anything is written: move its placement instead.
   An existing item takes the PUT's preconditions (`If-None-Match: *` is `412`), and its edit is
   checked before the placement is made: from a user who knows no version of it, a file whose
