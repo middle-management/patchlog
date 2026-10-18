@@ -344,6 +344,67 @@ func TestFileTreeSealedCatalog(t *testing.T) {
 	}
 }
 
+// §A.4, §H.3: a listing is stored and kept for the shape of reader it was
+// computed for. A public content namespace that turns private before the
+// service's at moves gives anonymous readers of that at no heads, urls or
+// file metadata of its items, also when a trusted sealed namespace makes
+// the service store listings (§E.2.6).
+func TestFileTreeShape(t *testing.T) {
+	t.Parallel()
+	for _, withSealed := range []bool{false, true} {
+		t.Run(map[bool]string{false: "plain", true: "sealed trusted"}[withSealed], func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			ks := must(keystore.New(keystore.Generate()))
+			s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+			k := clienttest.NewKey("k")
+			trust, followed := []string{"pub"}, []string{"cat", "pub"}
+			docs := map[string]map[string]any{"pub": {"read": "public", "keys": []any{k.Entry("*")}}}
+			if withSealed {
+				trust, followed = []string{"pub", "files"}, []string{"cat", "files", "pub"}
+				docs["files"] = map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}}
+			}
+			docs["cat"] = map[string]any{"read": "public", "keys": []any{k.Entry("*")}, "catalog": filesCatalog(trust...)}
+			for ns, doc := range docs {
+				must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+			}
+			svcJWK, svcPriv, err := seal.GenerateRecipient()
+			if err != nil {
+				t.Fatal(err)
+			}
+			all := []string{"cat", "files", "pub"}
+			w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"})))
+			must(w.CreateDoc(ctx, "cat", "root", map[string]any{"parents": []any{}}))
+			must(w.CreateDoc(ctx, "pub", "plan", map[string]any{"title": "Plan k4wq"}))
+			must(w.CreateDoc(ctx, "cat", "pub.plan", map[string]any{"title": "plan.json", "parents": parents("root@a0")}))
+			sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"}, map[string]any{"enc": svcJWK})),
+				client.WithKeys(client.NewKeys(svcPriv)))
+			x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.Recipient = svcPriv })
+			x.caughtUp(followed...)
+			r := x.raw("/cat/children?of=root", "")
+			loc := r.header.Get("Location")
+			if e := entriesOf(t, x.get(loc, ""))["pub.plan"]; e["head"] == nil || fileOf(e) == nil {
+				t.Fatalf("public item %v", e)
+			}
+			// The followers stop, so the at stays where it is.
+			x.cancel()
+			<-x.done
+			h := must(w.NSHead(ctx, "pub"))
+			must(w.PatchConfig(ctx, "pub", h.Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}))
+			r = x.raw(loc, "")
+			e := entriesOf(t, r.body)["pub.plan"]
+			if r.status != 200 || e == nil {
+				t.Fatalf("listing once private: %d %v", r.status, r.body)
+			}
+			for _, k := range []string{"head", "url", "file"} {
+				if _, has := e[k]; has {
+					t.Errorf("an anonymous reader gets %s of an item now private: %v", k, e)
+				}
+			}
+		})
+	}
+}
+
 // §2.1, §C.4: a read grant from a key with readScope "resource" that
 // doesn't fix /resource is refused, by the core and by the service alike:
 // listings show it no item's head or file metadata.

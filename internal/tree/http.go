@@ -663,10 +663,10 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	// canon is the canonical URL of this listing at an at (§A.5): what
-	// redirects name, what listings are kept under (with the reader's
-	// shape), and in a sealed or e2e catalog the view a listing is bound
-	// to (§E.2.6). Only it is answered 200: another form of it, or one
-	// with min, is redirected.
+	// redirects name, what listings are kept and stored under (with the
+	// reader's shape, keyOf), and in a sealed or e2e catalog the view a
+	// listing is bound to (§E.2.6). Only it is answered 200: another form
+	// of it, or one with min, is redirected.
 	canon := func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
 	keyOf := func(at string) string { return canon(at) + "\n" + v.shape() }
 	keep := !perReader(op, v)
@@ -791,7 +791,9 @@ type computed struct {
 // listing computes the listing of op for v at the current at, sealed in a
 // sealed or e2e catalog, stores a sealed one and keeps it (unless
 // perReader), and returns it with the at it is at. canon gives its URL at
-// an at, keyOf what it is kept under.
+// an at, the view it is bound to, and keyOf what it is stored and kept
+// under: the URL and the reader's shape, since a namespace that turns
+// private moves no URL (viewer.shape).
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
@@ -802,7 +804,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	sealed := info.Protected() || fs.seals()
 	if sealed && keep {
 		at := s.At()
-		if st, ok := s.sealed.Get(ctx, canon(at)); ok {
+		if st, ok := s.sealed.Get(ctx, keyOf(at)); ok {
 			st, _ = s.kept.Put(keyOf(at), cat, gen, true, st)
 			return &computed{st: st, at: at, status: http.StatusOK}, nil
 		}
@@ -855,7 +857,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	}
 	if sealed {
 		var err error
-		if l.st, err = s.sealed.Put(ctx, view.Target, cat, l.at, l.st); err != nil {
+		if l.st, err = s.sealed.Put(ctx, keyOf(l.at), cat, l.at, l.st); err != nil {
 			s.opt.Logf("tree: storing a sealed listing: %v", err)
 		}
 		if cur := s.At(); cur != l.at {
