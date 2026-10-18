@@ -525,6 +525,98 @@ func TestCaughtNotAfterUntrust(t *testing.T) {
 	}
 }
 
+// A catch-up report of a follower stopped since (ensureFollowers, at the
+// end of the apply that untrusted its namespace) is dropped, also once
+// the namespace is trusted again (§B.5, §H.3): its head was read before
+// what was placed in between, and taken, it would mark the namespace
+// caught while its new follower is still replaying that, and listings
+// would answer 200 short of those items. TestCaughtNotAfterUntrust with
+// the held head answered only after late is trusted again.
+func TestCaughtNotFromStoppedFollower(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("tester"))
+	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "late", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "cat", map[string]any{"read": "public", "catalog": map[string]any{"trust": []any{"matches", "late"}, "mode": "dag"}}))
+	w := &world{s: s, c: c}
+	w.folder(t, "root", "Root")
+	w.folder(t, "season", "Season", "root")
+	w.content(t, "matches", "m1")
+	w.place(t, "matches.m1", "season@a0")
+	w.content(t, "late", "l1")
+	w.place(t, "late.l1", "season@a1")
+	var armed, held, release, returned, holdLog atomic.Bool
+	var heads atomic.Int64
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		if armed.Load() && req.Method == http.MethodGet && req.URL.Path == "/ns/late" && heads.Add(1) == 2 {
+			// The catch-up's head, read now (H1, before l2), and handed
+			// to the follower only once released, by then stopped.
+			res, err := base.RoundTrip(req.WithContext(context.WithoutCancel(req.Context())))
+			held.Store(true)
+			for !release.Load() {
+				time.Sleep(5 * time.Millisecond)
+			}
+			returned.Store(true)
+			return res, err
+		}
+		if holdLog.Load() && strings.HasPrefix(req.URL.Path, "/ns/late/") && (strings.HasSuffix(req.URL.Path, "/log") || strings.HasSuffix(req.URL.Path, "/events") || strings.Contains(req.URL.Path, "/poll")) {
+			for holdLog.Load() {
+				select {
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		}
+		return base.RoundTrip(req)
+	})
+	t.Cleanup(func() { release.Store(true); holdLog.Store(false) })
+	core := s.Client(t, client.WithAuthor("tree"), client.WithHTTPClient(&http.Client{Transport: rt}))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, core, svcOpts{db: db})
+	x.caughtUp("cat", "matches", "late")
+	waitFor(t, "a whole listing", func() bool {
+		r := x.listing("/cat/children?of=season")
+		return r.status == http.StatusOK && names(r.body["children"]) == "matches.m1,late.l1"
+	})
+	x.stop()
+	armed.Store(true)
+	y := startSvc(t, core, svcOpts{db: db})
+	waitFor(t, "late's catch-up head read", held.Load)
+	// Untrusted: its follower is stopped (still holding H1).
+	h := must(c.NSHead(ctx, "cat"))
+	must(c.PatchConfig(ctx, "cat", h.Config, []any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{"matches"}}}))
+	y.caughtUp("cat")
+	// Meanwhile l2 is written and placed; then late is trusted again, and
+	// its new follower can't replay the log yet.
+	w.content(t, "late", "l2")
+	w.place(t, "late.l2", "season@a2")
+	holdLog.Store(true)
+	h = must(c.NSHead(ctx, "cat"))
+	must(c.PatchConfig(ctx, "cat", h.Config, []any{map[string]any{"op": "add", "path": "/catalog/trust/-", "value": "late"}}))
+	y.caughtUp("cat")
+	if r := y.listing("/cat/children?of=season"); r.status != http.StatusServiceUnavailable {
+		t.Fatalf("before the stopped follower's report: %d %s, want 503", r.status, names(r.body["children"]))
+	}
+	// The stopped follower's report arrives now.
+	release.Store(true)
+	waitFor(t, "the held head answered", returned.Load)
+	time.Sleep(200 * time.Millisecond)
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if r := y.listing("/cat/children?of=season"); r.status != http.StatusServiceUnavailable {
+			t.Fatalf("a listing while late, trusted again, is caught up with: %d %s (late.l2 missing), want 503 behind", r.status, names(r.body["children"]))
+		}
+	}
+	holdLog.Store(false)
+	y.caughtUp("late")
+	if got := names(y.listing("/cat/children?of=season").body["children"]); got != "matches.m1,late.l1,late.l2" {
+		t.Fatalf("once caught up with late: %s", got)
+	}
+}
+
 // A catch-up recorded of a namespace the catalog doesn't trust (left by a
 // stop between the apply that untrusted it and the record's DELETE) is
 // dropped at start: trusted again, the namespace is waited for while its

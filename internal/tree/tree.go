@@ -605,10 +605,14 @@ func (s *Service) setUnfollowed(ns, why string) {
 // follower is stopped only after the apply that untrusted it
 // (forgetUntrusted), and a report on its way meanwhile would mark it
 // caught, so that trusted again it wasn't waited for while its follower
-// replays what was placed in between.
+// replays what was placed in between. So is a report of a follower
+// stopped (ctx, cancelled by ensureFollowers at the end of that apply,
+// before the catalog's next apply can trust the namespace again), which
+// may come once it is trusted again, with a head read before what was
+// placed in between, while the new follower is still catching up.
 func (s *Service) onCatchUp(ctx context.Context, ns, head string, done bool) {
 	s.mu.Lock()
-	if ns != s.opt.Catalog && !s.g.Trust[ns] {
+	if ctx.Err() != nil || ns != s.opt.Catalog && !s.g.Trust[ns] {
 		s.mu.Unlock()
 		return
 	}
@@ -971,8 +975,8 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	}
 	s.cur[b.NS] = b.NewCheckpoint
 	// The catch-up's head reached: caught up as this checkpoint is out
-	// (if still trusted, onCatchUp).
-	caughtNow := !s.caught[b.NS] && s.target[b.NS] == b.NewCheckpoint && (b.NS == s.opt.Catalog || s.g.Trust[b.NS])
+	// (if still trusted, and by a follower not stopped since, onCatchUp).
+	caughtNow := !s.caught[b.NS] && s.target[b.NS] == b.NewCheckpoint && (b.NS == s.opt.Catalog || s.g.Trust[b.NS]) && ctx.Err() == nil
 	if caughtNow {
 		s.caught[b.NS] = true
 	}

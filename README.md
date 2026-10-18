@@ -1988,8 +1988,8 @@ configured, refused or absent at the core) isn't waited for until the core serve
 `?min=` naming it is `400`; one whose epoch key can't be fetched for the moment (the core
 unreachable, a `5xx`, a `429`), sealed or end-to-end (its relay's keys and its keyring both),
 is skipped but still waited for. A namespace the catalog stops
-trusting loses its catch-up, also one its follower reports after that, and one recorded before a
-stop, so trusted again it is waited for again.
+trusting loses its catch-up, also one its follower reports after that (once stopped, also after
+it is trusted again), and one recorded before a stop, so trusted again it is waited for again.
 
 Listings are kept like the search index's results (§A.4, §B.5, v0.49): every listing computed,
 the one at the `at` a redirect names included, is kept in memory for about a minute (at most

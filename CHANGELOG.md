@@ -262,7 +262,8 @@ service's listings.
   (`client.E2E.Key` answers such a failure of the relay's keys and the keyring with it, not
   `ErrNoKeys`), is skipped but still waited for. A
   namespace the catalog stops trusting loses its catch-up, also one its follower reports after
-  that apply, and a record of one left by a stop, so trusted again it is waited for again. A
+  that apply (stopped, also after it is trusted again), and a record of one left by a stop, so
+  trusted again it is waited for again. A
   catalog trusting a large new namespace now lists nothing until the service has caught up with
   it.
 - **Stored listings of the tree service are keyed by the reader's shape** (§A.4, §E.2.6), as
