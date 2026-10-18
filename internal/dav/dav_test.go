@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -447,12 +448,15 @@ func TestNonceRequired(t *testing.T) {
 }
 
 // Limits (§6.6): a patch set over patchSetSize is 413, a rate limit with
-// a long wait is 503 with Retry-After.
+// a long wait is 503 with Retry-After. A 413 names the limit and the
+// sizes, measured and in force (§H.4 "Answers"), whether the core refused
+// the write or the gateway, knowing the limit, didn't send it.
 func TestLimits(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"small", "slow"}, nil, map[string]map[string]any{
+	e := newEnv(t, []string{"small", "slow", "tiny"}, nil, map[string]map[string]any{
 		"small": {"limits": map[string]any{"patchSetSize": 1024}},
 		"slow":  {"limits": map[string]any{"ratePerResource": map[string]any{"rate": 0.001, "burst": 1.0}}},
+		"tiny":  {"limits": map[string]any{"documentSize": 2048}},
 	})
 	e.create("small", "x", map[string]any{"v": 1})
 	e.do("GET", "/small/x.json", "")
@@ -463,15 +467,27 @@ func TestLimits(t *testing.T) {
 	if p := e.lastEntry("small", "x").Patches.([]any); len(p) != 1 || p[0].(map[string]any)["path"] != "" {
 		t.Fatalf("not a root replace: %v", p)
 	}
-	// One merged with others' edits is a 413, which says what the core
-	// doesn't: the sizes, and the limit the namespace sets (§6.6); not
-	// the status again.
+	// One merged with others' edits is a 413 naming the limit, the patch
+	// set's size as canonical JSON and the limit in force (§6.6); not the
+	// status again.
 	e.create("small", "y", map[string]any{"v": 1, "w": 1})
 	e.do("GET", "/small/y.json", "")
 	e.theirs("small", "y", replace("/w", 2))
 	r := e.expect(e.do("PUT", "/small/y.json", `{"v": 1, "w": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 413, "PUT over patchSetSize, merged")
-	if strings.HasPrefix(r.body, "413") || !strings.Contains(r.body, "patch set too large") || !strings.Contains(r.body, "patch set is 2039 bytes") ||
-		!strings.Contains(r.body, "patchSetSize 1024") || !strings.Contains(r.body, "merged") {
+	if !strings.HasPrefix(r.body, "too large: patchSetSize 2039 > 1024 (§6.6): patch set too large") || !strings.Contains(r.body, "merged") {
+		t.Fatalf("413 text %q", r.body)
+	}
+	// The core's refusals give their limit and sizes (§12): a create, its
+	// patch set counting against documentSize, and a save whose document
+	// would grow past it, which the gateway doesn't measure.
+	r = e.expect(e.do("PUT", "/tiny/x.json", `{"big": "`+strings.Repeat("x", 3000)+`"}`), 413, "create over documentSize")
+	if !strings.HasPrefix(r.body, "too large: documentSize 3043 > 2048 (§6.6): patch set too large") || strings.Contains(r.body, "merged") {
+		t.Fatalf("413 text %q", r.body)
+	}
+	e.create("tiny", "y", map[string]any{"a": strings.Repeat("x", 1500)})
+	e.do("GET", "/tiny/y.json", "")
+	r = e.expect(e.do("PUT", "/tiny/y.json", `{"a": "`+strings.Repeat("x", 1500)+`", "b": "`+strings.Repeat("y", 1000)+`"}`), 413, "edit over documentSize")
+	if !strings.HasPrefix(r.body, "too large: documentSize 2515 > 2048 (§6.6): document too large") {
 		t.Fatalf("413 text %q", r.body)
 	}
 	e.expect(e.do("PUT", "/slow/x.json", `{"v": 1}`), 201, "first write")
@@ -978,14 +994,20 @@ func TestFileSizes(t *testing.T) {
 	}
 	e.expect(e.do("COPY", "/docs/big.pdf", "", "Destination", "/docs/big2.pdf"), 201, "COPY it")
 	e.create("docs", "x", map[string]any{"v": "1"})
+	// The 413s name the bound, as the core names its limits (§H.4
+	// "Answers"): the bytes read when the bound was passed, at least, and
+	// the bound.
 	r := e.expect(e.do("PUT", "/docs/x.json", `{"v": "`+big+`"}`), 413, "PUT a JSON file over -max-file-size")
-	if !strings.Contains(r.body, "JSON file") {
+	if !regexp.MustCompile(`^too large: -max-file-size [0-9]+ > 1024 .*JSON file`).MatchString(r.body) {
 		t.Fatalf("413 %q", r.body)
 	}
-	e.expect(e.do("PUT", "/docs/.x.swp", big), 413, "PUT a temporary file over -max-file-size")
+	r = e.expect(e.do("PUT", "/docs/.x.swp", big), 413, "PUT a temporary file over -max-file-size")
+	if !regexp.MustCompile(`^too large: -max-file-size [0-9]+ > 1024 `).MatchString(r.body) {
+		t.Fatalf("413 %q", r.body)
+	}
 	s := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize, o.MaxRawSize = 1024, 2048 })
 	r = s.expect(s.do("PUT", "/docs/big.pdf", big), 413, "PUT a raw file over -max-raw-size")
-	if !strings.Contains(r.body, "raw file") {
+	if !regexp.MustCompile(`^too large: -max-raw-size [0-9]+ > 2048 .*raw file`).MatchString(r.body) {
 		t.Fatalf("413 %q", r.body)
 	}
 }

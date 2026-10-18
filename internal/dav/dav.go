@@ -408,7 +408,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		var mbe *http.MaxBytesError
 		switch {
 		case errors.As(err, &mbe):
-			http.Error(w, fmt.Sprintf("a request body other than a PUT's is at most %d bytes", maxXMLBody), http.StatusRequestEntityTooLarge)
+			http.Error(w, fmt.Sprintf("too large: a request body other than a PUT's is at most %d bytes (a PROPFIND, PROPPATCH or LOCK body)", maxXMLBody), http.StatusRequestEntityTooLarge)
 			return
 		case err != nil:
 			http.Error(w, "the request body didn't arrive whole", http.StatusBadRequest)

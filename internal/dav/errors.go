@@ -37,12 +37,58 @@ func fail(status int, format string, args ...any) *davError {
 	return &davError{status: status, msg: fmt.Sprintf(format, args...)}
 }
 
+// overLimit is the 413 of a limit exceeded (§H.4 "Answers"): the limit's
+// key, what was measured and the limit in force, then why, as in "too
+// large: documentSize 1048577 > 1048576 (§6.6): document too large". The
+// gateway's own bounds take this shape too, named by their flags
+// (-max-file-size, -max-raw-size). Where reading stopped at the bound,
+// measured is a lower bound, as in the core's refusals (§6.6).
+func overLimit(key string, measured, max int64, format string, args ...any) *davError {
+	e := fail(http.StatusRequestEntityTooLarge, "too large: %s %d > %d", key, measured, max)
+	if format != "" {
+		e.msg += " " + fmt.Sprintf(format, args...)
+	}
+	return e
+}
+
+// limitRefusal is the core's refusal for a limit (413, or 422 with code
+// limit, §6.6, §12; a batch's first item so refused, §7.5) as the 413 of
+// §H.4's answers, with the limit, the sizes the core gave and its
+// message, then more (merged); nil for any other error. A limit without
+// sizes (a duration, a rate) is named alone; a 413 without a limit (a
+// core before §6.6 named them) keeps the core's text.
+func limitRefusal(ae *client.APIError, more string) *davError {
+	if ae.Status != http.StatusRequestEntityTooLarge && ae.Status != http.StatusUnprocessableEntity {
+		return nil
+	}
+	key, measured, max, sizes, ok := ae.Limit()
+	var e *davError
+	switch {
+	case ok && sizes:
+		e = overLimit(key, measured, max, "(§6.6)")
+	case ok:
+		e = fail(http.StatusRequestEntityTooLarge, "over a limit: %s (§6.6)", key)
+	case ae.Status == http.StatusRequestEntityTooLarge:
+		e = fail(http.StatusRequestEntityTooLarge, "%s", apiText(ae))
+	default:
+		return nil
+	}
+	if ok {
+		if m, _ := ae.Body["message"].(string); m != "" {
+			e.msg += ": " + m
+		}
+	}
+	e.msg += more
+	return e
+}
+
 // upstream maps an error of the core (§12) to what the WebDAV client gets
 // (§H.4 "Answers"): 401, 403 and 404 pass through, 409 frozen is 403
 // naming the successor (a frozen namespace takes no writes, §8.4, for
 // good: clients retry a 423, as a lock that may go), 410 purged stays
 // (§8.5) and another 410 (deleted meanwhile, pruned) is a 409 asking for
-// a reload, 413 stays and so does a 422 limit, as 413 (§6.6), the other
+// a reload, a limit refused (413, or 422 code limit) is 413 with the
+// limit and sizes the core gave (limitRefusal, §6.6), the other
 // 422s keep their errors, 429 is 503 with Retry-After, and anything else
 // the core failed with is 502. A failure to reach the core is 502 too,
 // its details (the core's address) only logged. Writes map 412 and patch
@@ -72,9 +118,12 @@ func upstream(err error) error {
 	if !ok {
 		return &davError{status: http.StatusBadGateway, msg: "the core can't be reached", cause: err}
 	}
+	if e := limitRefusal(ae, ""); e != nil {
+		return e
+	}
 	msg := apiText(ae)
 	switch {
-	case ae.Status == 400, ae.Status == 401, ae.Status == 403, ae.Status == 404, ae.Status == 413:
+	case ae.Status == 400, ae.Status == 401, ae.Status == 403, ae.Status == 404:
 		return fail(ae.Status, "%s", msg)
 	case ae.Status == 409 && ae.Code == "frozen":
 		e := fail(http.StatusForbidden, "%s: the namespace takes no writes (§8.4)", msg)
@@ -89,8 +138,6 @@ func upstream(err error) error {
 		return fail(http.StatusGone, "%s: the namespace was purged (§8.5)", msg)
 	case ae.Status == 410:
 		return fail(http.StatusConflict, "the core answered 410: %s; reload it", msg)
-	case ae.Status == 422 && ae.Code == "limit":
-		return fail(http.StatusRequestEntityTooLarge, "%s (§6.6)", msg)
 	case ae.Status == 422:
 		return fail(http.StatusUnprocessableEntity, "%s", msg)
 	case ae.Status == 429:

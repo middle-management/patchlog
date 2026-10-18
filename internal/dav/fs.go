@@ -1297,7 +1297,7 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) {
 	if r := hd.m.raw; r != nil {
 		if r.size > int64(st.s.opt.MaxRawSize) {
-			return nil, fail(http.StatusRequestEntityTooLarge, "%s/%s is %d bytes, and a raw file copied here whole is at most %d bytes", hd.ns, hd.name, r.size, st.s.opt.MaxRawSize)
+			return nil, overLimit("-max-raw-size", r.size, int64(st.s.opt.MaxRawSize), "(this gateway's bound on a raw file, which it copies here whole): %s/%s", hd.ns, hd.name)
 		}
 		b, err := st.p.c.GetBlob(ctx, hd.ns, hd.name, r.bid, r.nonce)
 		if err != nil {
@@ -1499,12 +1499,14 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
-	if w.buf.Len()+len(p) > w.max {
-		what := "a JSON file or a temporary file"
+	if n := w.buf.Len() + len(p); n > w.max {
+		// The body read so far: a lower bound, as in the core's refusals
+		// of a body it stopped reading (§6.6).
+		key, what := "-max-file-size", "a JSON file or a temporary file"
 		if w.max == w.st.s.opt.MaxRawSize && !w.scratch {
-			what = "a raw file"
+			key, what = "-max-raw-size", "a raw file"
 		}
-		w.err = w.st.record(fail(http.StatusRequestEntityTooLarge, "%s is at most %d bytes here", what, w.max))
+		w.err = w.st.record(overLimit(key, int64(n), int64(w.max), "(this gateway's bound on %s, which it buffers whole; it stopped reading there)", what))
 		return 0, w.err
 	}
 	n := int64(len(p))

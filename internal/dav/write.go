@@ -3,7 +3,6 @@ package dav
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -156,11 +155,15 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			}
 			ps = withNonce(in, doc, client.GenesisPatches(doc))
 			res, err = st.p.c.Create(ctx, ns, name, ps)
-			err = tooLarge(err, in, parent, ps, true, true)
+			err = tooLarge(err, true)
 		} else if parent, ps, out, atBase, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
 			// Over opsPerSet or patchSetSize, a restore from the version
 			// the client had is written whole, as an edit is (§H.4).
-			whole := atBase && overSet(in, ps)
+			over := setOver(in, ps)
+			if over != nil && !atBase {
+				return false, over
+			}
+			whole := over != nil
 			if whole {
 				ps = wholeDoc(in, parent, out)
 			}
@@ -169,7 +172,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 				ps = wholeDoc(in, parent, out)
 				res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
 			}
-			err = tooLarge(err, in, parent, ps, false, atBase)
+			err = tooLarge(err, atBase)
 			if err == nil {
 				st.p.markOwn(ns, name, res.ID)
 			}
@@ -270,7 +273,8 @@ func (st *reqState) hasBase(ns, name string) bool {
 // overwrite. A patch set over opsPerSet or patchSetSize (§6.6) is sent as
 // a root replace instead, which may be as large as documentSize, if the
 // base is the head (§H.4): it then writes nothing of others' over; a
-// merged one is 413. retry: the head moved (412), read it again.
+// merged one is 413, unsent where the gateway knows the limit (setOver).
+// retry: the head moved (412), read it again.
 func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, v any, body []byte) (string, bool, bool, error) {
 	cur, err := st.s.doc(ctx, st.p, ns, name, head)
 	switch {
@@ -298,7 +302,11 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	}
 	paths := writesOf(files.Bare(cur.value), ps)
 	ps = withNonce(in, out, ps)
-	whole := atHead && overSet(in, ps)
+	over := setOver(in, ps)
+	if over != nil && !atHead {
+		return "", false, false, over
+	}
+	whole := over != nil
 	if whole {
 		ps = wholeDoc(in, cur.value, out)
 	}
@@ -307,7 +315,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 		ps = wholeDoc(in, cur.value, out)
 		res, err = st.p.c.Append(ctx, ns, name, head, ps)
 	}
-	err = tooLarge(err, in, cur.value, ps, false, atHead)
+	err = tooLarge(err, atHead)
 	switch {
 	case client.IsStale(err):
 		return "", false, true, nil
@@ -322,11 +330,20 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	return res.ID, st.wrote(ns, name, cur.value, ps, paths, res, v, body, rendersAs(v)), false, nil
 }
 
-// overSet reports a patch set over the opsPerSet or patchSetSize the
-// namespace sets (§6.6); the deployment's, which this server doesn't
+// setOver is the 413 of a patch set over the opsPerSet or patchSetSize
+// the namespace sets (§6.6), measured as the core measures them (§3.1),
+// for a save merged with others' edits, which isn't written whole (§H.4)
+// and isn't sent; nil if it is within them. One from the head is written
+// whole instead. The deployment's limits, which this server doesn't
 // know, the core's refusal tells (setTooLarge).
-func overSet(in nsInfo, ps []any) bool {
-	return in.opsPerSet > 0 && len(ps) > in.opsPerSet || in.patchSetSize > 0 && len(jsonv.Canonical(ps)) > in.patchSetSize
+func setOver(in nsInfo, ps []any) error {
+	if in.opsPerSet > 0 && len(ps) > in.opsPerSet {
+		return overLimit("opsPerSet", int64(len(ps)), int64(in.opsPerSet), "(§6.6): too many operations%s", mergedNote)
+	}
+	if n := len(jsonv.Canonical(ps)); in.patchSetSize > 0 && n > in.patchSetSize {
+		return overLimit("patchSetSize", int64(n), int64(in.patchSetSize), "(§6.6): patch set too large%s", mergedNote)
+	}
+	return nil
 }
 
 // setTooLarge reports the core's refusal of a patch set over patchSetSize
@@ -1024,53 +1041,28 @@ func (st *reqState) retrying(ctx context.Context, attempt func() (retry bool, er
 	}
 }
 
-// tooLarge is the core's refusal of a write of patch set ps on parent for
-// a limit (§6.6: 413, or 422 code limit) as 413 (§H.4 "Answers"), with
-// what the core doesn't say: the sizes it measured, and the limits the
-// namespace sets, else that the deployment's apply. A create's patch set
-// counts against documentSize, not patchSetSize. A save merged with
-// others' edits (merged) isn't written whole, which only a save from the
-// head may be (§H.4), so it says to reload. Other errors pass.
-func tooLarge(err error, in nsInfo, parent any, ps []any, create, atHead bool) error {
+// tooLarge is the core's refusal of a write for a limit (§6.6: 413, or
+// 422 code limit) as 413 (§H.4 "Answers"), with the limit and the sizes
+// the core gave (limitRefusal). A save merged with others' edits (not
+// atHead) isn't written whole, which only a save from the head may be
+// (§H.4), so it says to reload. Other errors pass.
+func tooLarge(err error, atHead bool) error {
 	ae, ok := client.AsAPIError(err)
-	if !ok || ae.Status != http.StatusRequestEntityTooLarge && (ae.Status != http.StatusUnprocessableEntity || ae.Code != "limit") {
+	if !ok {
 		return err
 	}
-	var b strings.Builder
-	b.WriteString(apiText(ae))
-	fmt.Fprintf(&b, ": the patch set is %d bytes", len(jsonv.Canonical(ps)))
-	if ops, perr := patch.Parse(ps); perr == nil {
-		if ae.Status == http.StatusUnprocessableEntity {
-			fmt.Fprintf(&b, " in %d operations", len(ops))
-		}
-		if doc, _, aerr := patch.Apply(parent, true, ops, patch.Options{}); aerr == nil {
-			fmt.Fprintf(&b, " and the document %d bytes", len(jsonv.Canonical(doc)))
-		}
-	}
-	b.WriteString(", as canonical JSON (§3.1); ")
-	if create {
-		b.WriteString("a create's patch set counts against documentSize; ")
-	}
-	var set []string
-	if in.patchSetSize > 0 {
-		set = append(set, fmt.Sprintf("patchSetSize %d", in.patchSetSize))
-	}
-	if in.opsPerSet > 0 {
-		set = append(set, fmt.Sprintf("opsPerSet %d", in.opsPerSet))
-	}
-	if in.docSize > 0 {
-		set = append(set, fmt.Sprintf("documentSize %d", in.docSize))
-	}
-	if len(set) > 0 {
-		b.WriteString("the namespace sets " + strings.Join(set, " and ") + " (§6.6)")
-	} else {
-		b.WriteString("the namespace sets no size limits, so the deployment's apply (§6.6; by default patchSetSize 262144, opsPerSet 1000 and documentSize 1048576)")
-	}
+	more := ""
 	if !atHead {
-		b.WriteString("; your save was merged with others' edits made since your version, so it isn't written whole (§H.4): reload it and save again")
+		more = mergedNote
 	}
-	return fail(http.StatusRequestEntityTooLarge, "%s", b.String())
+	if e := limitRefusal(ae, more); e != nil {
+		return e
+	}
+	return err
 }
+
+// mergedNote ends a 413 of a save merged with others' edits.
+const mergedNote = "; your save was merged with others' edits made since your version, so it isn't written whole (§H.4): reload it and save again"
 
 // undelete restores ns/name, tombstoned by the principal's own DELETE as
 // tomb, as it was (an empty patch set on the last live document, §8.2,

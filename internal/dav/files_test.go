@@ -639,7 +639,7 @@ func TestRawSaves(t *testing.T) {
 	e.expectLive("docs", "f.md", h, "after the conflict")
 
 	r := e.expect(e.do("PUT", "/small/big.md", "123456789"), 413, "PUT over blobSize")
-	if !strings.Contains(r.body, "blobSize") || uploads.Load() != 0 {
+	if !strings.HasPrefix(r.body, "too large: blobSize 9 > 8 (§6.6, §7.8)") || uploads.Load() != 0 {
 		t.Fatalf("413 %q after %d uploads", r.body, uploads.Load())
 	}
 }

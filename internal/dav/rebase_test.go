@@ -220,7 +220,7 @@ func TestOversizeSave(t *testing.T) {
 	e.theirs("lim", "merged", replace("/w", "theirs"))
 	h, _ := e.load("lim", "merged")
 	r := e.expect(e.do("PUT", "/lim/merged.json", edit(t, buf, `"v": "1"`, `"v": "`+big+`"`)), 413, "PUT over patchSetSize, merged")
-	if !strings.Contains(r.body, "merged") || !strings.Contains(r.body, "patchSetSize 1024") {
+	if !strings.HasPrefix(r.body, "too large: patchSetSize 2041 > 1024 (§6.6)") || !strings.Contains(r.body, "merged") {
 		t.Fatalf("413 %q", r.body)
 	}
 	e.expectLive("lim", "merged", h, "after a 413")
@@ -251,7 +251,7 @@ func TestOversizeSave(t *testing.T) {
 		many[k] = "2"
 	}
 	r = e.expect(e.do("PUT", "/dflt/ops.json", rendered(many)), 413, "PUT over opsPerSet, merged")
-	if !strings.Contains(r.body, "too many operations") || !strings.Contains(r.body, "in 1001 operations") || !strings.Contains(r.body, "merged") {
+	if !strings.HasPrefix(r.body, "too large: opsPerSet 1001 > 1000 (§6.6): too many operations") || !strings.Contains(r.body, "merged") {
 		t.Fatalf("413 %q", r.body)
 	}
 

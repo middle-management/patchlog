@@ -154,7 +154,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 		return "", false, notOffered(ns)
 	}
 	if in.blobSize > 0 && len(body) > in.blobSize {
-		return "", false, fail(http.StatusRequestEntityTooLarge, "the file is %d bytes, over the blobSize of %d bytes namespace %s sets (§6.6, §7.8); nothing was uploaded", len(body), in.blobSize, ns)
+		return "", false, overLimit("blobSize", int64(len(body)), int64(in.blobSize), "(§6.6, §7.8): the file is larger than namespace %s's blobs may be; nothing was uploaded", ns)
 	}
 	if o.fname == "" {
 		o.fname = name
