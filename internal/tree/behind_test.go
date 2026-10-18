@@ -11,8 +11,10 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/tree"
 )
 
 // A listing is 503 behind until the service holds a checkpoint of every
@@ -246,6 +248,55 @@ func TestListingsSkipKeyless(t *testing.T) {
 	}
 	if r := x.raw("/cat/children?of=root&min=vault:"+x.s.Checkpoint("pub"), ""); r.status != http.StatusBadRequest {
 		t.Fatalf("a min naming vault, skipped for its keys: %d %v", r.status, r.body)
+	}
+}
+
+// Caught up as the checkpoint reaching the catch-up's head is published,
+// not a moment later: a listing made as soon as the service holds that
+// checkpoint (here from its OnApply, which runs before the follower
+// returns from the catch-up) isn't 503 behind.
+func TestListingsCaughtUpWithCheckpoint(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed(t)
+	head := must(w.c.NSHead(context.Background(), "matches")).ID
+	var hold atomic.Bool
+	hold.Store(true)
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		for hold.Load() && strings.HasPrefix(req.URL.Path, "/ns/matches/") && strings.HasSuffix(req.URL.Path, "/log") {
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		return base.RoundTrip(req)
+	})
+	core := w.s.Client(t, client.WithAuthor("tree"), client.WithHTTPClient(&http.Client{Transport: rt}))
+	var url atomic.Pointer[string]
+	var status atomic.Int64
+	x := startSvc(t, core, svcOpts{}, func(o *tree.Options) {
+		prev := o.OnApply
+		o.OnApply = func(b *follow.Batch) {
+			prev(b)
+			if u := url.Load(); u != nil && b.NS == "matches" && b.NewCheckpoint == head {
+				res, err := noRedirect.Get(*u + "/cat/children?of=season")
+				if err == nil {
+					res.Body.Close()
+					status.Store(int64(res.StatusCode))
+				}
+			}
+		}
+	})
+	t.Cleanup(func() { hold.Store(false) })
+	x.caughtUp("cat")
+	url.Store(&x.http.URL)
+	hold.Store(false)
+	x.caughtUp("matches")
+	waitFor(t, "the listing from OnApply", func() bool { return status.Load() != 0 })
+	if st := status.Load(); st != http.StatusFound && st != http.StatusOK {
+		t.Fatalf("a listing as the checkpoint reaching the catch-up's head is out: %d", st)
 	}
 }
 
