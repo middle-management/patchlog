@@ -765,9 +765,13 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 			if err := st.writable(ctx, t); err != nil {
 				return nil, err
 			}
-			return &writeFile{st: st, ctx: ctx, t: t}, nil
+			max, err := st.maxWrite(ctx, t)
+			if err != nil {
+				return nil, err
+			}
+			return &writeFile{st: st, ctx: ctx, t: t, max: max}, nil
 		}
-		return &writeFile{st: st, ctx: ctx, t: t, scratch: true}, nil
+		return &writeFile{st: st, ctx: ctx, t: t, scratch: true, max: st.s.opt.MaxFileSize}, nil
 	}
 	fi, err := st.stat(ctx, t)
 	if errors.Is(err, errNotExist) && st.method == "GET" && t.path == st.path && t.docName != "" {
@@ -784,7 +788,7 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	if fi.dir {
 		// Listed when read (Readdir), not when opened: a PROPFIND opens
 		// every entry it lists for its properties.
-		return &dirFile{st: st, ctx: ctx, t: t, fi: fi}, nil
+		return &dirFile{deadProps: deadProps{st, t.path}, st: st, ctx: ctx, t: t, fi: fi}, nil
 	}
 	served := (st.method == "GET" || st.method == "HEAD") && t.path == st.path
 	if served && st.resp != nil {
@@ -797,7 +801,7 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		if !ok {
 			return nil, errNotExist
 		}
-		return &memFile{Reader: bytes.NewReader(f.data), fi: fi}, nil
+		return &memFile{deadProps: deadProps{st, t.path}, Reader: bytes.NewReader(f.data), fi: fi}, nil
 	}
 	hd, live, err := st.docAt(ctx, t)
 	if err != nil {
@@ -825,9 +829,9 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 			st.ctype = r.typ
 			st.copySrc = &blobSrc{ns: hd.ns, name: hd.name, ref: *r}
 		}
-		return st.rawFile(ctx, hd, fi)
+		return st.rawFile(ctx, hd, fi, t.path)
 	}
-	f := &docFile{st: st, ctx: ctx, hd: hd, fi: fi}
+	f := &docFile{deadProps: deadProps{st, t.path}, st: st, ctx: ctx, hd: hd, fi: fi}
 	if served {
 		// Read now, so a failure is the answer.
 		if err := f.load(); err != nil {
@@ -1292,11 +1296,11 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 
 // fileBytes returns live file hd's content as its reader gets it: a JSON
 // file's representation (repr), or a raw file's bytes, read whole from its
-// blob, at most MaxFileSize of them (413 beyond).
+// blob, at most MaxRawSize of them (413 beyond).
 func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) {
 	if r := hd.m.raw; r != nil {
-		if r.size > int64(st.s.opt.MaxFileSize) {
-			return nil, fail(http.StatusRequestEntityTooLarge, "%s/%s is %d bytes, and a file kept or copied here whole is at most %d bytes", hd.ns, hd.name, r.size, st.s.opt.MaxFileSize)
+		if r.size > int64(st.s.opt.MaxRawSize) {
+			return nil, fail(http.StatusRequestEntityTooLarge, "%s/%s is %d bytes, and a raw file copied here whole is at most %d bytes", hd.ns, hd.name, r.size, st.s.opt.MaxRawSize)
 		}
 		b, err := st.p.c.GetBlob(ctx, hd.ns, hd.name, r.bid, r.nonce)
 		if err != nil {
@@ -1456,15 +1460,37 @@ func newKind(name string, body []byte) (bool, any) {
 	return true, nil
 }
 
-// writeFile buffers a written file whole; Close commits it, to the core
-// for a document name, to the scratch store for any other. The buffers of
-// every request together hold at most InflightBytes, those of one grant
-// root's at most rootInflight (503 beyond).
+// maxWrite is how large a file written to document path t may be: a
+// JSON file MaxFileSize (one live, a {name}.json only JSON can be, one the
+// principal deleted moments ago, which the write restores, §H.6), any
+// other MaxRawSize, a file that may be raw (§H.1).
+func (st *reqState) maxWrite(ctx context.Context, t target) (int, error) {
+	if t.kind == kDoc && (t.rawName == "" || st.p.deletedOwn(t.docNS, t.docName, "", st.s.opt.Now())) {
+		return st.s.opt.MaxFileSize, nil
+	}
+	if t.kind == kDoc || t.kind == kPlacement {
+		hd, live, err := st.docAt(ctx, t)
+		if err != nil {
+			return 0, err
+		}
+		if live && hd.m.raw == nil {
+			return st.s.opt.MaxFileSize, nil
+		}
+	}
+	return st.s.opt.MaxRawSize, nil
+}
+
+// writeFile buffers a written file whole, at most max bytes; Close
+// commits it, to the core for a document name, to the scratch store for
+// any other. The buffers of every request together hold at most
+// InflightBytes, those of one grant root's at most rootInflight (503
+// beyond).
 type writeFile struct {
 	st      *reqState
 	ctx     context.Context
 	t       target
 	scratch bool
+	max     int
 	buf     bytes.Buffer
 	held    int64
 	err     error
@@ -1476,8 +1502,12 @@ func (w *writeFile) Write(p []byte) (int, error) {
 	if w.err != nil {
 		return 0, w.err
 	}
-	if w.buf.Len()+len(p) > w.st.s.opt.MaxFileSize {
-		w.err = w.st.record(fail(http.StatusRequestEntityTooLarge, "a file is at most %d bytes", w.st.s.opt.MaxFileSize))
+	if w.buf.Len()+len(p) > w.max {
+		what := "a JSON file or a temporary file"
+		if w.max == w.st.s.opt.MaxRawSize && !w.scratch {
+			what = "a raw file"
+		}
+		w.err = w.st.record(fail(http.StatusRequestEntityTooLarge, "%s is at most %d bytes here", what, w.max))
 		return 0, w.err
 	}
 	n := int64(len(p))
@@ -1544,17 +1574,24 @@ func (w *writeFile) info() *fileInfo {
 	return &fileInfo{name: w.t.base, size: int64(w.buf.Len()), mod: w.st.s.opt.Now(), mode: 0o644, w: w}
 }
 
-// noDeadProps implements webdav.DeadPropsHolder for files and
-// directories: dead properties (PROPPATCH, as Windows and macOS send after
-// writing or making a folder) are accepted and not kept.
-type noDeadProps struct{}
+// deadProps implements webdav.DeadPropsHolder for files and directories:
+// their dead properties (PROPPATCH, as Windows and macOS send after
+// writing or making a folder), kept for the principal by path in bounded
+// memory (§H.8 "kept in the gateway", principal.patchProps), never
+// written to the core.
+type deadProps struct {
+	st   *reqState
+	path string
+}
 
-// DeadProps implements webdav.DeadPropsHolder: none are kept.
-func (noDeadProps) DeadProps() (map[xml.Name]webdav.Property, error) { return nil, nil }
+// DeadProps implements webdav.DeadPropsHolder.
+func (d deadProps) DeadProps() (map[xml.Name]webdav.Property, error) {
+	return d.st.p.deadProps(d.path), nil
+}
 
-// Patch implements webdav.DeadPropsHolder: every change succeeds and is
-// dropped.
-func (noDeadProps) Patch(ps []webdav.Proppatch) ([]webdav.Propstat, error) {
+// Patch implements webdav.DeadPropsHolder: every change is kept.
+func (d deadProps) Patch(ps []webdav.Proppatch) ([]webdav.Propstat, error) {
+	d.st.p.patchProps(d.path, ps, d.st.s.opt.Now())
 	st := webdav.Propstat{Status: http.StatusOK}
 	for _, p := range ps {
 		for _, prop := range p.Props {
@@ -1567,7 +1604,7 @@ func (noDeadProps) Patch(ps []webdav.Proppatch) ([]webdav.Propstat, error) {
 // memFile is a scratch file, read from memory.
 type memFile struct {
 	*bytes.Reader
-	noDeadProps
+	deadProps
 	fi *fileInfo
 }
 
@@ -1580,7 +1617,7 @@ func (f *memFile) Stat() (os.FileInfo, error)         { return f.fi, nil }
 // its document when first read or sought, not when opened, as a PROPFIND
 // opens every file it lists for its properties.
 type docFile struct {
-	noDeadProps
+	deadProps
 	st  *reqState
 	ctx context.Context
 	hd  headDoc
@@ -1619,7 +1656,7 @@ func (f *docFile) Stat() (os.FileInfo, error)         { return f.fi, nil }
 
 // dirFile is a directory, listed on its first Readdir.
 type dirFile struct {
-	noDeadProps
+	deadProps
 	st    *reqState
 	ctx   context.Context
 	t     target

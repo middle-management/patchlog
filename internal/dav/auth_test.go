@@ -487,7 +487,7 @@ func TestGatewayLockBounds(t *testing.T) {
 func TestGatewayInflightShare(t *testing.T) {
 	t.Parallel()
 	e, k := authEnv(t, true, func(o *dav.Options) {
-		o.MaxFileSize = 1 << 20
+		o.MaxFileSize, o.MaxRawSize = 1<<20, 1<<20
 		o.InflightBytes = 2 << 20
 	})
 	now := e.s.Now()

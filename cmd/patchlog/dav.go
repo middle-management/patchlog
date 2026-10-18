@@ -50,7 +50,8 @@ func davCmd(args []string) {
 	tlsKey := fs.String("tls-key", "", "the private key of -tls-cert (PEM)")
 	fetchConc := fs.Int("fetch-concurrency", 8, "how many documents are read from the core at once")
 	cacheSize := fs.String("cache-size", "64 MiB", "rendered documents kept in memory by revision id")
-	maxFile := fs.String("max-file-size", "16 MiB", "largest file written (buffered whole) or kept as a temporary file")
+	maxFile := fs.String("max-file-size", "16 MiB", "largest JSON file written (buffered whole) or file kept as a temporary file")
+	maxRaw := fs.String("max-raw-size", "64 MiB", "largest raw file written (buffered whole): the deployment's blobSize, 64 MiB by default")
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
 
@@ -70,8 +71,12 @@ func davCmd(args []string) {
 	if err != nil {
 		log.Fatalf("dav: -max-file-size: %v", err)
 	}
+	maxRawSize, err := core.ParseSize(*maxRaw)
+	if err != nil {
+		log.Fatalf("dav: -max-raw-size: %v", err)
+	}
 	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, CaseSensitive: *caseSensitive, Gateway: *gateway, FetchConcurrency: *fetchConc,
-		CacheBytes: cache, MaxFileSize: maxSize, Logf: log.Printf}
+		CacheBytes: cache, MaxFileSize: maxSize, MaxRawSize: maxRawSize, Logf: log.Printf}
 	copts := []client.Option{client.WithIdleConns(*fetchConc)}
 	if *gateway {
 		if *bearer != "" || *bearerFile != "" || *passwordFile != "" || *author != "" {
@@ -123,7 +128,7 @@ func davCmd(args []string) {
 	}
 
 	ctx, sigs := shutdownSignals("patchlog dav")
-	// A request (a written file, at most -max-file-size) has ten minutes
+	// A request (a written file, at most -max-raw-size) has ten minutes
 	// to arrive, and an idle connection two before it is closed.
 	hs := &http.Server{Addr: *addr, Handler: srv, ReadHeaderTimeout: 10 * time.Second, ReadTimeout: 10 * time.Minute, IdleTimeout: 2 * time.Minute}
 	ls := sdFlags.server("patchlog dav", hs, nil)

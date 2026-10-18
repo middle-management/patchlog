@@ -388,7 +388,8 @@ func TestCopyMoveLock(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/locked.json", ""), 400, "empty PUT")
 	_, doc = e.load("docs", "locked")
 	sameJSON(t, doc, map[string]any{"locked": true})
-	// PROPPATCH (Windows sets file times) succeeds and keeps nothing.
+	// PROPPATCH (Windows sets file times) succeeds, kept in memory
+	// (TestDeadProps).
 	pp := `<?xml version="1.0" encoding="utf-8"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>Wed, 01 Jan 2026 00:00:00 GMT</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>`
 	for _, p := range []string{"/docs/a.json", "/docs/", "/"} {
 		if r := e.expect(e.do("PROPPATCH", p, pp), 207, "PROPPATCH "+p); !strings.Contains(r.body, "200 OK") || strings.Contains(r.body, "403") {
@@ -877,4 +878,114 @@ func TestRootAndFlatFolders(t *testing.T) {
 	}
 	e.expect(e.do("PUT", "/docs/.github/ci.yml", "on: push\n"), 409, "PUT below a folder that wasn't made")
 	e.expect(e.do("MKCOL", "/docs/(A Document Being Saved By TextEdit)", ""), 201, "MKCOL an app's folder")
+}
+
+// A DELETE that passes destroys the locks on its path (RFC 4918 §9.6.1),
+// and a MOVE moves none with its source (§9.9.4): neither is left to
+// answer 423 for a lock the client can't hold. A MOVE or COPY of a file
+// the client holds locked, sent with that lock's token, is taken: the
+// token is its source's, and the destination needs none unless it is
+// locked.
+func TestLockLifecycle(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>me</D:owner></D:lockinfo>`
+	take := func(p string) string {
+		t.Helper()
+		r := e.do("LOCK", p, lock, "Timeout", "Second-1800")
+		if r.status != 200 && r.status != 201 {
+			t.Fatalf("LOCK %s: %d %s", p, r.status, r.body)
+		}
+		return r.header.Get("Lock-Token")
+	}
+	tok := take("/docs/l.md")
+	e.expect(e.do("PUT", "/docs/l.md", "locked", "If", "("+tok+")"), 201, "PUT with the token")
+	e.expect(e.do("DELETE", "/docs/l.md", "", "If", "("+tok+")"), 204, "DELETE with the token")
+	e.expect(e.do("PUT", "/docs/l.md", "again"), 201, "PUT without a token after the DELETE")
+	take("/docs/l.md")
+
+	e.expect(e.do("PUT", "/docs/m.md", "move me"), 201, "PUT m.md")
+	tok = take("/docs/m.md")
+	e.expect(e.do("MOVE", "/docs/m.md", "", "Destination", "/docs/m2.md"), 423, "MOVE without the token")
+	e.expect(e.do("MOVE", "/docs/m.md", "", "Destination", "/docs/m2.md", "If", "("+tok+")"), 201, "MOVE with the token")
+	if _, data := e.rawOf("docs", "m2.md"); string(data) != "move me" {
+		t.Fatalf("m2.md %q", data)
+	}
+	e.expect(e.do("PUT", "/docs/m.md", "new"), 201, "PUT to the moved file's name without a token")
+	e.expect(e.do("PUT", "/docs/m2.md", "edited"), 201, "PUT the moved file without a token")
+
+	e.expect(e.do("PUT", "/docs/c.md", "copy me"), 201, "PUT c.md")
+	tok = take("/docs/c.md")
+	other := take("/docs/c2.md")
+	e.expect(e.do("COPY", "/docs/c.md", "", "Destination", "/docs/c3.md", "If", "("+tok+")"), 201, "COPY with the source's token")
+	e.expect(e.do("COPY", "/docs/c.md", "", "Destination", "/docs/c2.md", "If", "("+tok+")"), 412, "COPY onto a file locked with another token")
+	e.expect(e.do("COPY", "/docs/c.md", "", "Destination", "/docs/c2.md", "If", "("+tok+" "+other+")"), 204, "COPY onto it, a list naming both tokens")
+	if _, data := e.rawOf("docs", "c3.md"); string(data) != "copy me" {
+		t.Fatalf("c3.md %q", data)
+	}
+}
+
+// Dead properties (PROPPATCH, as Windows sets file times) are kept per
+// user in the server's memory (§H.8), read back by PROPFIND, moved with a
+// MOVE and dropped with a DELETE; never written to the core.
+func TestDeadProps(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.expect(e.do("PUT", "/docs/notes.md", "hello\n"), 201, "PUT")
+	set := `<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:x"><D:set><D:prop><Z:color>red</Z:color></D:prop></D:set></D:propertyupdate>`
+	get := `<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:Z="urn:x"><D:prop><Z:color/></D:prop></D:propfind>`
+	color := func(e *env, p string) string {
+		t.Helper()
+		r := e.expect(e.do("PROPFIND", p, get, "Depth", "0"), 207, "PROPFIND "+p)
+		if strings.Contains(r.body, "404") {
+			return ""
+		}
+		i := strings.Index(r.body, ">red<")
+		if i < 0 {
+			t.Fatalf("PROPFIND %s: %s", p, r.body)
+		}
+		return "red"
+	}
+	if r := e.expect(e.do("PROPPATCH", "/docs/notes.md", set), 207, "PROPPATCH"); !strings.Contains(r.body, "200 OK") {
+		t.Fatalf("PROPPATCH %s", r.body)
+	}
+	if c := color(e, "/docs/notes.md"); c != "red" {
+		t.Fatalf("color %q", c)
+	}
+	if c := color(e.another(), "/docs/notes.md"); c != "" {
+		t.Fatalf("another user's color %q", c)
+	}
+	e.expect(e.do("MOVE", "/docs/notes.md", "", "Destination", "/docs/plan.md"), 201, "MOVE")
+	if c := color(e, "/docs/plan.md"); c != "red" {
+		t.Fatalf("moved color %q", c)
+	}
+	e.expect(e.do("DELETE", "/docs/plan.md", ""), 204, "DELETE")
+	e.expect(e.do("PUT", "/docs/plan.md", "new\n"), 201, "PUT anew")
+	if c := color(e, "/docs/plan.md"); c != "" {
+		t.Fatalf("color after the DELETE %q", c)
+	}
+}
+
+// A raw file may be as large as -max-raw-size (default 64 MiB, the core's
+// default blobSize), a JSON file and a temporary file as -max-file-size.
+func TestFileSizes(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize = 1024 })
+	big := strings.Repeat("x", 4096)
+	e.expect(e.do("PUT", "/docs/big.pdf", big), 201, "PUT a raw file over -max-file-size")
+	if _, data := e.rawOf("docs", "big.pdf"); len(data) != len(big) {
+		t.Fatalf("big.pdf %d bytes", len(data))
+	}
+	e.expect(e.do("COPY", "/docs/big.pdf", "", "Destination", "/docs/big2.pdf"), 201, "COPY it")
+	e.create("docs", "x", map[string]any{"v": "1"})
+	r := e.expect(e.do("PUT", "/docs/x.json", `{"v": "`+big+`"}`), 413, "PUT a JSON file over -max-file-size")
+	if !strings.Contains(r.body, "JSON file") {
+		t.Fatalf("413 %q", r.body)
+	}
+	e.expect(e.do("PUT", "/docs/.x.swp", big), 413, "PUT a temporary file over -max-file-size")
+	s := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize, o.MaxRawSize = 1024, 2048 })
+	r = s.expect(s.do("PUT", "/docs/big.pdf", big), 413, "PUT a raw file over -max-raw-size")
+	if !strings.Contains(r.body, "raw file") {
+		t.Fatalf("413 %q", r.body)
+	}
 }

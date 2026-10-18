@@ -1,12 +1,15 @@
 package dav
 
 import (
+	"encoding/xml"
 	"net/http"
 	"os"
 	"path"
 	"sort"
 	"strings"
 	"time"
+
+	"golang.org/x/net/webdav"
 )
 
 // Scratch files: names that aren't documents, such as editors' swap,
@@ -334,6 +337,107 @@ func (st *reqState) scratchUnder(dir string) []string {
 	return out
 }
 
+// maxPropBytes bounds a principal's dead properties (PROPPATCH), their
+// names and values: over it, those of the path touched least recently go
+// first. They are cosmetic (Windows' file times), so dropping them is
+// better than refusing a client's write over them.
+const maxPropBytes = 1 << 20
+
+// propSet is one path's dead properties, what they cost, and when they
+// were last set.
+type propSet struct {
+	props map[xml.Name]webdav.Property
+	bytes int
+	at    time.Time
+}
+
+func propCost(p webdav.Property) int {
+	return len(p.XMLName.Space) + len(p.XMLName.Local) + len(p.Lang) + len(p.InnerXML) + 64
+}
+
+// deadProps returns the principal's dead properties of path.
+func (p *principal) deadProps(path string) map[xml.Name]webdav.Property {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ps := p.props[path]
+	if ps == nil {
+		return nil
+	}
+	out := make(map[xml.Name]webdav.Property, len(ps.props))
+	for k, v := range ps.props {
+		out[k] = v
+	}
+	return out
+}
+
+// patchProps applies a PROPPATCH's changes to the principal's dead
+// properties of path, within maxPropBytes.
+func (p *principal) patchProps(path string, patches []webdav.Proppatch, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.dropped {
+		return
+	}
+	ps := p.props[path]
+	if ps == nil {
+		ps = &propSet{props: map[xml.Name]webdav.Property{}}
+		p.props[path] = ps
+	}
+	for _, pp := range patches {
+		for _, prop := range pp.Props {
+			if old, ok := ps.props[prop.XMLName]; ok {
+				ps.bytes -= propCost(old)
+				p.pbytes -= propCost(old)
+				delete(ps.props, prop.XMLName)
+			}
+			if !pp.Remove {
+				ps.props[prop.XMLName] = prop
+				ps.bytes += propCost(prop)
+				p.pbytes += propCost(prop)
+			}
+		}
+	}
+	ps.at = now
+	for p.pbytes > maxPropBytes {
+		old := ""
+		for k, o := range p.props {
+			if old == "" || o.at.Before(p.props[old].at) {
+				old = k
+			}
+		}
+		p.pbytes -= p.props[old].bytes
+		delete(p.props, old)
+	}
+	if len(ps.props) == 0 {
+		delete(p.props, path)
+	}
+}
+
+// moveProps moves the principal's dead properties of the paths at or
+// below from to below to (a MOVE that passed, RFC 4918 §9.9.1), or drops
+// them, to "" (a DELETE that passed).
+func (p *principal) moveProps(from, to string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	moved := map[string]*propSet{}
+	for k, ps := range p.props {
+		if rest, ok := strings.CutPrefix(k, from); ok && (rest == "" || strings.HasPrefix(rest, "/")) {
+			delete(p.props, k)
+			if to != "" {
+				moved[to+rest] = ps
+			} else {
+				p.pbytes -= ps.bytes
+			}
+		}
+	}
+	for k, ps := range moved {
+		if old := p.props[k]; old != nil {
+			p.pbytes -= old.bytes
+		}
+		p.props[k] = ps
+	}
+}
+
 // dropScratch drops every scratch file and lock of a principal being
 // forgotten, returning the files' bytes; nothing is stored for it
 // afterwards (a request still in flight gets a 503).
@@ -346,7 +450,8 @@ func (p *principal) dropScratch() int {
 	p.acct.bytes -= n
 	p.acct.locks -= len(p.locked)
 	p.acct.mu.Unlock()
-	p.scratch, p.sbytes, p.dropped, p.locked = map[string]*scratchFile{}, 0, true, map[string]time.Time{}
+	p.scratch, p.sbytes, p.dropped, p.locked = map[string]*scratchFile{}, 0, true, map[string]heldLock{}
+	p.props, p.pbytes = map[string]*propSet{}, 0
 	return n
 }
 
@@ -368,5 +473,11 @@ func (p *principal) expireScratch(before time.Time) int {
 	p.acct.files -= files
 	p.acct.bytes -= n
 	p.acct.mu.Unlock()
+	for k, ps := range p.props {
+		if ps.at.Before(before) {
+			p.pbytes -= ps.bytes
+			delete(p.props, k)
+		}
+	}
 	return n
 }

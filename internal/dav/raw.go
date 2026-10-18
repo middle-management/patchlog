@@ -21,7 +21,7 @@ import (
 // through the core as the handler reads, from where it last sought, never
 // a redirect to the core's origin.
 type rawFile struct {
-	noDeadProps
+	deadProps
 	st       *reqState
 	ctx      context.Context
 	ns, name string
@@ -32,11 +32,11 @@ type rawFile struct {
 	pos      int64
 }
 
-// rawFile returns live raw file hd to read. A GET of the whole file opens
-// the blob at once, so a core that can't serve it is the answer, rather
-// than a body cut short.
-func (st *reqState) rawFile(ctx context.Context, hd headDoc, fi *fileInfo) (*rawFile, error) {
-	f := &rawFile{st: st, ctx: ctx, ns: hd.ns, name: hd.name, ref: *hd.m.raw, fi: fi}
+// rawFile returns live raw file hd, at path, to read. A GET of the whole
+// file opens the blob at once, so a core that can't serve it is the
+// answer, rather than a body cut short.
+func (st *reqState) rawFile(ctx context.Context, hd headDoc, fi *fileInfo, path string) (*rawFile, error) {
+	f := &rawFile{deadProps: deadProps{st, path}, st: st, ctx: ctx, ns: hd.ns, name: hd.name, ref: *hd.m.raw, fi: fi}
 	if st.method == "GET" && st.hdr != nil && st.hdr.Get("Range") == "" && st.hdr.Get("If-None-Match") == "" && st.hdr.Get("If-Modified-Since") == "" {
 		if err := f.open(); err != nil {
 			return nil, err

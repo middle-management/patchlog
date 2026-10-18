@@ -42,7 +42,7 @@ func guardEnv(t *testing.T, c *clock) *env {
 	return newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{
 		"cat": {"catalog": treeCatalog("docs")},
 	}, func(_ *clienttest.Options, o *dav.Options) {
-		o.MaxFileSize = 1024
+		o.MaxFileSize, o.MaxRawSize = 1024, 1024
 		o.Now = c.now
 	})
 }

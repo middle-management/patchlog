@@ -89,10 +89,16 @@ type Options struct {
 	// (default 64 MiB); the files' sizes and types are kept apart
 	// (maxMetas).
 	CacheBytes int
-	// MaxFileSize bounds a written file, buffered whole (default 16 MiB).
+	// MaxFileSize bounds a written JSON file and a scratch file, buffered
+	// whole (default 16 MiB).
 	MaxFileSize int
+	// MaxRawSize bounds a written raw file (§H.1), buffered whole (default
+	// 64 MiB, the core's default blobSize, §6.6; a namespace's smaller
+	// blobSize refuses one before it is uploaded).
+	MaxRawSize int
 	// InflightBytes bounds the written files buffered at once, over every
-	// request (default 8 times MaxFileSize; 503 beyond).
+	// request (default the larger of 8 times MaxFileSize and twice
+	// MaxRawSize; 503 beyond).
 	InflightBytes int
 	// ScratchFiles and ScratchBytes bound one grant root's scratch files
 	// (default 256 and 32 MiB); ScratchTotal all of them (default 256
@@ -216,7 +222,8 @@ func New(opt Options) (*Server, error) {
 	def(&opt.FetchConcurrency, 8)
 	def(&opt.CacheBytes, 64<<20)
 	def(&opt.MaxFileSize, 16<<20)
-	def(&opt.InflightBytes, 8*opt.MaxFileSize)
+	def(&opt.MaxRawSize, max(64<<20, opt.MaxFileSize))
+	def(&opt.InflightBytes, max(8*opt.MaxFileSize, 2*opt.MaxRawSize))
 	def(&opt.ScratchFiles, 256)
 	def(&opt.ScratchBytes, 32<<20)
 	def(&opt.ScratchTotal, 256<<20)
@@ -456,6 +463,13 @@ func (st *reqState) answered(status int) {
 		}
 	case st.method == "DELETE" && status == http.StatusNotFound:
 		st.p.takeRefusedSave(st.path, now)
+	case (st.method == "DELETE" || st.method == "MOVE") && status < 300:
+		st.p.unlockUnder(st.path, now)
+		to := ""
+		if st.method == "MOVE" {
+			to = st.dst
+		}
+		st.p.moveProps(st.path, to)
 	case st.method == "GET" && status == http.StatusNotFound:
 		for _, g := range st.gone {
 			st.s.reloaded(st.p, g.ns, g.name)
@@ -1031,7 +1045,7 @@ func (s *Server) rootInflight() int64 {
 	if !s.opt.Gateway {
 		return int64(s.opt.InflightBytes)
 	}
-	return int64(max(s.opt.MaxFileSize, s.opt.InflightBytes/4))
+	return int64(max(s.opt.MaxFileSize, s.opt.MaxRawSize, s.opt.InflightBytes/4))
 }
 
 // principal is what the server keeps for one upstream grant: its client,
@@ -1056,7 +1070,9 @@ type principal struct {
 	dropped bool
 	ns      map[string]nsInfo
 	cats    map[string]*catGraph
-	locked  map[string]time.Time  // its locks' tokens, and when they expire
+	locked  map[string]heldLock   // by token: its locks
+	props   map[string]*propSet   // by path: its dead properties (PROPPATCH)
+	pbytes  int                   // what props cost
 	deletes map[string]ownDelete  // by ns/name: its latest DELETEs
 	trees   map[string]treeDelete // by path: the files of trees its latest DELETEs removed
 	aside   map[string]time.Time  // documents' paths moved aside to a backup, and when
@@ -1316,7 +1332,7 @@ func (p *principal) guarded(path string, now time.Time) bool {
 
 func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
 	p := &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
-		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, locked: map[string]time.Time{}, deletes: map[string]ownDelete{},
+		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, locked: map[string]heldLock{}, props: map[string]*propSet{}, deletes: map[string]ownDelete{},
 		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now()}
 	p.own.MaxEntries = maxOwn
 	return p
