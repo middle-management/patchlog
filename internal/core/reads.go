@@ -427,7 +427,9 @@ type Log struct {
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
 // empty it serves from the current head (for long-poll and SSE). Either
 // way it answers at most limit entries after since (0: all), oldest first,
-// and sets More when the range goes on (§7.1 Paging, §7.7).
+// and sets More when the range goes on (§7.1 Paging, §7.7). A page (limit
+// > 0) also holds no more patch set bytes than logPageBytes, though always
+// one entry; namespace logs carry no patch sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
@@ -475,7 +477,11 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			}
 			sinceID = &sid
 		}
-		entries, more, err := t.logBetween(to, sinceID, limit)
+		maxBytes := 0
+		if limit > 0 {
+			maxBytes = e.opt.Maximums.LogPageBytes
+		}
+		entries, more, err := t.logBetween(to, sinceID, limit, maxBytes)
 		if err != nil {
 			var pe *prunedError
 			switch {

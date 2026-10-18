@@ -149,6 +149,7 @@ func serve(args []string) {
 	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
 	maxBlobPending := fs.String("max-blob-pending", "", "deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)")
 	logPageSize := fs.Int("log-page-size", 0, "log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)")
+	logPageBytes := fs.String("log-page-bytes", "", "bytes of patch sets per resource log page (§6.6 logPageBytes, deployment only), e.g. \"16 MiB\" (the default): a resource log range, long-poll answer or event-stream catch-up page ends before an entry that would take it past, though it always holds one (§7.1, §7.7)")
 	exchangeRate := fs.String("exchange-rate", "", "edge-grant exchanges per principal (§6.6, §C.5, deployment only), as RATE,BURST, e.g. 10,100 (the default): each POST /edge-grants draws one token from the bucket of each principal whose grants it carries, and none from their write buckets")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
@@ -233,6 +234,16 @@ func serve(args []string) {
 	}
 	if *logPageSize > 0 {
 		max.LogPageSize = *logPageSize
+	}
+	if *logPageBytes != "" {
+		n, err := core.ParseSize(*logPageBytes)
+		if err == nil && n <= 0 {
+			err = errors.New("must be positive")
+		}
+		if err != nil {
+			log.Fatalf("-log-page-bytes: %v", err)
+		}
+		max.LogPageBytes = n
 	}
 	if *exchangeRate != "" {
 		r, err := parseRate(*exchangeRate)

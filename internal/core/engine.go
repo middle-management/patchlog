@@ -338,6 +338,13 @@ func Open(opt Options) (*Engine, error) {
 	if opt.Maximums.ExchangeRate == (Rate{}) {
 		opt.Maximums.ExchangeRate = opt.Limits.ExchangeRate
 	}
+	// And from before logPageBytes (§6.6), deployment only too.
+	if opt.Limits.LogPageBytes == 0 {
+		opt.Limits.LogPageBytes = DefaultLimits().LogPageBytes
+	}
+	if opt.Maximums.LogPageBytes == 0 {
+		opt.Maximums.LogPageBytes = opt.Limits.LogPageBytes
+	}
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
 	}
