@@ -1,7 +1,11 @@
 package tree_test
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
+	"errors"
+	"io"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -14,6 +18,7 @@ import (
 	"github.com/middle-management/patchlog/internal/follow"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -304,3 +309,214 @@ func TestListingsCaughtUpWithCheckpoint(t *testing.T) {
 type roundTrip func(*http.Request) (*http.Response, error)
 
 func (f roundTrip) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// A sealed trusted namespace whose epoch key can't be fetched for the
+// moment (the core's /keys cut off: a transport error, a 5xx, a 429) is
+// skipped, nothing of it consumed, but still waited for (Addendum E,
+// §B.5, §H.3): listings are 503 behind, never 200 without its items, as
+// they are for one skipped for the service's keys as configured
+// (TestListingsSkipKeyless); once the key comes, it is caught up with.
+func TestListingsTransientKeyError(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for ns, doc := range map[string]map[string]any{
+		"vault": {"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}},
+		"pub":   {"read": "grant", "keys": []any{k.Entry("*")}},
+		"cat":   {"read": "public", "keys": []any{k.Entry("*")}, "catalog": map[string]any{"trust": []any{"pub", "vault"}, "mode": "dag"}},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	all := []string{"cat", "pub", "vault"}
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(wr.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(wr.CreateDoc(ctx, "pub", "plan", map[string]any{"title": "plan"}))
+	createNonced(t, wr, "vault", "v", map[string]any{"title": "v"})
+	must(wr.CreateDoc(ctx, "cat", "pub.plan", map[string]any{"parents": parents("root@a0")}))
+	must(wr.CreateDoc(ctx, "cat", "vault.v", map[string]any{"parents": parents("root@a1")}))
+	// The core's /ns/vault/keys asked for epoch keys is cut off after its
+	// first answer (the client's own, reading vault's document), until
+	// failing is cleared.
+	var failing, failed atomic.Bool
+	var asked atomic.Int64
+	failing.Store(true)
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		if req.Method == http.MethodPost && req.URL.Path == "/ns/vault/keys" && req.Body != nil {
+			b, _ := io.ReadAll(req.Body)
+			req.Body.Close()
+			req.Body = io.NopCloser(bytes.NewReader(b))
+			if strings.Contains(string(b), "epochs") && asked.Add(1) > 1 && failing.Load() {
+				failed.Store(true)
+				return nil, errors.New("connection reset by peer")
+			}
+		}
+		return base.RoundTrip(req)
+	})
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"})), client.WithKeys(client.NewKeys(nil)),
+		client.WithHTTPClient(&http.Client{Transport: rt}))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	t.Cleanup(func() { failing.Store(false) })
+	x.caughtUp("cat", "pub")
+	waitFor(t, "vault's epoch key asked for", failed.Load)
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if r := x.listing("/cat/children?of=root"); r.status != http.StatusServiceUnavailable {
+			t.Fatalf("a listing while vault's epoch key can't be fetched for the moment: %d %s, want 503 behind", r.status, names(r.body["children"]))
+		}
+	}
+	failing.Store(false)
+	x.caughtUp("vault")
+	if got := names(x.listing("/cat/children?of=root").body["children"]); got != "pub.plan,vault.v" {
+		t.Fatalf("once vault's key came: %s", got)
+	}
+}
+
+// A namespace the catalog stops trusting loses its caught mark, so that
+// trusted again it is waited for while its follower replays what was
+// placed in between (§B.5, §H.3), even when its follower, stopped only
+// after the apply that untrusted it, reports its catch-up done after
+// that apply: the report is dropped. Here late's follower, restarted on
+// the same database, has read late's head when late is untrusted.
+func TestCaughtNotAfterUntrust(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("tester"))
+	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "late", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "cat", map[string]any{"read": "public", "catalog": map[string]any{"trust": []any{"matches", "late"}, "mode": "dag"}}))
+	w := &world{s: s, c: c}
+	w.folder(t, "root", "Root")
+	w.folder(t, "season", "Season", "root")
+	w.content(t, "matches", "m1")
+	w.place(t, "matches.m1", "season@a0")
+	w.content(t, "late", "l1")
+	w.place(t, "late.l1", "season@a1")
+	var armed, held, release, returned, holdLog atomic.Bool
+	var heads atomic.Int64
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		if armed.Load() && req.Method == http.MethodGet && req.URL.Path == "/ns/late" && heads.Add(1) == 2 {
+			// The first is keys.Check's, the second the catch-up's head:
+			// held, then answered though the follower is stopped meanwhile.
+			held.Store(true)
+			for !release.Load() {
+				time.Sleep(5 * time.Millisecond)
+			}
+			res, err := base.RoundTrip(req.WithContext(context.WithoutCancel(req.Context())))
+			returned.Store(true)
+			return res, err
+		}
+		if holdLog.Load() && strings.HasPrefix(req.URL.Path, "/ns/late/") && (strings.HasSuffix(req.URL.Path, "/log") || strings.HasSuffix(req.URL.Path, "/events") || strings.Contains(req.URL.Path, "/poll")) {
+			for holdLog.Load() {
+				select {
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		}
+		return base.RoundTrip(req)
+	})
+	t.Cleanup(func() { release.Store(true); holdLog.Store(false) })
+	core := s.Client(t, client.WithAuthor("tree"), client.WithHTTPClient(&http.Client{Transport: rt}))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, core, svcOpts{db: db})
+	x.caughtUp("cat", "matches", "late")
+	waitFor(t, "a whole listing", func() bool {
+		r := x.listing("/cat/children?of=season")
+		return r.status == http.StatusOK && names(r.body["children"]) == "matches.m1,late.l1"
+	})
+	x.stop()
+	armed.Store(true)
+	y := startSvc(t, core, svcOpts{db: db})
+	waitFor(t, "late's catch-up head asked for", held.Load)
+	h := must(c.NSHead(ctx, "cat"))
+	must(c.PatchConfig(ctx, "cat", h.Config, []any{map[string]any{"op": "replace", "path": "/catalog/trust", "value": []any{"matches"}}}))
+	y.caughtUp("cat")
+	release.Store(true)
+	waitFor(t, "the held head answered", returned.Load)
+	time.Sleep(200 * time.Millisecond)
+	w.content(t, "late", "l2")
+	w.place(t, "late.l2", "season@a2")
+	holdLog.Store(true)
+	h = must(c.NSHead(ctx, "cat"))
+	must(c.PatchConfig(ctx, "cat", h.Config, []any{map[string]any{"op": "add", "path": "/catalog/trust/-", "value": "late"}}))
+	y.caughtUp("cat")
+	for deadline := time.Now().Add(time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if r := y.listing("/cat/children?of=season"); r.status != http.StatusServiceUnavailable {
+			t.Fatalf("a listing while late, trusted again, is caught up with: %d %s (late.l2 missing), want 503 behind", r.status, names(r.body["children"]))
+		}
+	}
+	holdLog.Store(false)
+	y.caughtUp("late")
+	if got := names(y.listing("/cat/children?of=season").body["children"]); got != "matches.m1,late.l1,late.l2" {
+		t.Fatalf("once caught up with late: %s", got)
+	}
+}
+
+// A catch-up recorded of a namespace the catalog doesn't trust (left by a
+// stop between the apply that untrusted it and the record's DELETE) is
+// dropped at start: trusted again, the namespace is waited for while its
+// follower replays it (§B.5, §H.3).
+func TestCaughtRecordOfUntrustedDropped(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("tester"))
+	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "late", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "cat", map[string]any{"read": "public", "catalog": map[string]any{"trust": []any{"matches"}, "mode": "dag"}}))
+	w := &world{s: s, c: c}
+	w.folder(t, "root", "Root")
+	w.folder(t, "season", "Season", "root")
+	w.content(t, "matches", "m1")
+	w.place(t, "matches.m1", "season@a0")
+	w.content(t, "late", "l1")
+	w.place(t, "late.l1", "season@a1")
+	var holdLog atomic.Bool
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		if holdLog.Load() && strings.HasPrefix(req.URL.Path, "/ns/late/") && (strings.HasSuffix(req.URL.Path, "/log") || strings.HasSuffix(req.URL.Path, "/events") || strings.Contains(req.URL.Path, "/poll")) {
+			for holdLog.Load() {
+				select {
+				case <-req.Context().Done():
+					return nil, req.Context().Err()
+				case <-time.After(5 * time.Millisecond):
+				}
+			}
+		}
+		return base.RoundTrip(req)
+	})
+	t.Cleanup(func() { holdLog.Store(false) })
+	core := s.Client(t, client.WithAuthor("tree"), client.WithHTTPClient(&http.Client{Transport: rt}))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, core, svcOpts{db: db})
+	x.caughtUp("cat", "matches")
+	x.stop()
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	if _, err := sq.Exec(`INSERT INTO meta (k, v) VALUES ('caught:late', 'x')`); err != nil {
+		t.Fatal(err)
+	}
+	if err := sq.Close(); err != nil {
+		t.Fatal(err)
+	}
+	holdLog.Store(true)
+	y := startSvc(t, core, svcOpts{db: db})
+	y.caughtUp("cat", "matches")
+	h := must(c.NSHead(ctx, "cat"))
+	must(c.PatchConfig(ctx, "cat", h.Config, []any{map[string]any{"op": "add", "path": "/catalog/trust/-", "value": "late"}}))
+	y.caughtUp("cat")
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if r := y.listing("/cat/children?of=season"); r.status != http.StatusServiceUnavailable {
+			t.Fatalf("a listing while late, trusted with a stale caught record, is caught up with: %d %s, want 503 behind", r.status, names(r.body["children"]))
+		}
+	}
+	holdLog.Store(false)
+	y.caughtUp("late")
+	if got := names(y.listing("/cat/children?of=season").body["children"]); got != "matches.m1,late.l1" {
+		t.Fatalf("once caught up with late: %s", got)
+	}
+}

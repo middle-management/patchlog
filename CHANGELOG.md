@@ -157,7 +157,7 @@ service's listings.
     folder's emptiness is the node documents', and a folder is deleted, or a file in several
     folders unlinked from one, only while still named as the path named it. A grant limited to
     some resources edits the files it lists and reads; a new file or folder, a move or a delete
-    by it, which the node documents decide, is `403`. A user's listings after their own writes,
+    by it, which the node documents decide, is `403`, a move before anything is written. A user's listings after their own writes,
     through any of their tokens, wait for the entries those produced (`?min=`, keyed by the
     writes' `X-Namespace-Revision`) until a listing that waited came back, for at most 10
     minutes, each up to `-tree-wait`, then read the node documents (a token that can't read
@@ -248,8 +248,12 @@ service's listings.
   namespace missing, so folders listed empty, which a sync tool mirrors as deleted files. Caught
   up means to the head the namespace's follower read when it started, not a first log page
   (`follow.WithOnCatchUp`), recorded so that a restart on the same database doesn't wait again.
-  A trusted namespace it can't follow (purged, skipped for its keys, refused or absent at the
-  core) isn't waited for, until the core serves it again, and a `?min=` naming it is `400`. A
+  A trusted namespace it can't follow (purged, skipped for its keys as configured, refused or
+  absent at the core) isn't waited for, until the core serves it again, and a `?min=` naming it
+  is `400`; one whose epoch key can't be fetched for the moment (a transport error, a `5xx`, a
+  `429`: `derived.Retryable`; `Keys.Check` reports it) is skipped but still waited for. A
+  namespace the catalog stops trusting loses its catch-up, also one its follower reports after
+  that apply, and a record of one left by a stop, so trusted again it is waited for again. A
   catalog trusting a large new namespace now lists nothing until the service has caught up with
   it.
 - **Stored listings of the tree service are keyed by the reader's shape** (§A.4, §E.2.6), as

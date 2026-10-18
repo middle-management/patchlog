@@ -1019,8 +1019,20 @@ func TestTreeServiceRenamedElsewhere(t *testing.T) {
 // behind on kept and waited for until reached, then dropped too; later
 // listings send none, and a grant of the user's limited to some
 // resources, which can't read the node documents, lists and reads again.
+// A listing whose answer takes longer than TreeWait (a loaded machine;
+// here forced, slow) keeps every entry, so each step is checked at the
+// first listing the tree service answered in time, within a few.
 func TestTreeServiceMinRefusedPerNamespace(t *testing.T) {
 	t.Parallel()
+	for _, slow := range []bool{false, true} {
+		t.Run(fmt.Sprintf("slow=%v", slow), func(t *testing.T) {
+			t.Parallel()
+			minRefusedPerNamespace(t, slow)
+		})
+	}
+}
+
+func minRefusedPerNamespace(t *testing.T, slow bool) {
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
 	k := clienttest.NewKey("k")
@@ -1050,10 +1062,15 @@ func TestTreeServiceMinRefusedPerNamespace(t *testing.T) {
 	tr.caughtUp("cat", "matches")
 	var mu sync.Mutex
 	var sent []string // every ?min= value sent
+	var delayed atomic.Bool
 	front := newTestServer(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		sent = append(sent, r.URL.Query()["min"]...)
 		mu.Unlock()
+		if slow && strings.Contains(strings.Join(r.URL.Query()["min"], " "), "ghost:") && delayed.CompareAndSwap(false, true) {
+			// The first listing naming ghost answered after TreeWait.
+			time.Sleep(time.Second)
+		}
 		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(rw, r)
 	}))
 	sentSince := func(n int) []string {
@@ -1091,29 +1108,51 @@ func TestTreeServiceMinRefusedPerNamespace(t *testing.T) {
 	if h, doc := g.load("ghost", "g"); h.State != client.Live || doc.(map[string]any)["text"] != "edited" {
 		t.Fatalf("ghost/g: %v %v", h.State, doc)
 	}
+	of := func(ns string, got []string) bool {
+		return slices.ContainsFunc(got, func(m string) bool { return strings.HasPrefix(m, ns+":") })
+	}
 	clk.add(6 * time.Second) // past slowFor, which the PUT's listing set
 	n := count()
 	g.propfindAs(ann, "/cat/Season/")
-	if got := sentSince(n); !slices.ContainsFunc(got, func(m string) bool { return strings.HasPrefix(m, "ghost:") }) {
+	if got := sentSince(n); !of("ghost", got) {
 		t.Fatalf("the first listing after the writes sent %q", got)
 	}
-	// ghost's is dropped; matches', which the tree service hasn't
-	// reached, is waited for still.
-	clk.add(6 * time.Second)
-	n = count()
-	g.propfindAs(ann, "/cat/Season/")
-	got := sentSince(n)
-	if slices.ContainsFunc(got, func(m string) bool { return strings.HasPrefix(m, "ghost:") }) || !slices.ContainsFunc(got, func(m string) bool { return strings.HasPrefix(m, "matches:") }) {
-		t.Fatalf("the next listing sent %q, want matches' min only", got)
+	// ghost's is dropped once a listing got the tree service's 400 for it;
+	// matches', which the tree service hasn't reached, is waited for
+	// still.
+	for i := 0; ; i++ {
+		clk.add(6 * time.Second) // past slowFor, which a listing that waited set
+		n = count()
+		g.propfindAs(ann, "/cat/Season/")
+		got := sentSince(n)
+		if !of("ghost", got) {
+			if !of("matches", got) {
+				t.Fatalf("a listing after ghost's was dropped sent %q, want matches' min", got)
+			}
+			break
+		}
+		if i == 4 {
+			t.Fatalf("ghost's min still sent after %d listings: %q", i+2, got)
+		}
 	}
 	tr.paused.Store(false)
 	tr.caughtUp("cat", "matches")
-	clk.add(6 * time.Second)
-	g.propfindAs(ann, "/cat/Season/") // reaches matches'
-	n = count()
-	sameStrings(t, "ann's Season once caught up", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
-	if got := sentSince(n); len(got) > 0 {
-		t.Fatalf("a listing after every write was reached or refused sent %q", got)
+	// A listing reaches matches'; the next sends none.
+	for i := 0; ; i++ {
+		clk.add(6 * time.Second)
+		n = count()
+		got := names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/")
+		sent := sentSince(n)
+		if of("ghost", sent) {
+			t.Fatalf("a listing sent ghost's min again: %q", sent)
+		}
+		if len(sent) == 0 {
+			sameStrings(t, "ann's Season once caught up", got, []string{"derby.json"})
+			break
+		}
+		if i == 4 {
+			t.Fatalf("a listing after every write was reached or refused sent %q", sent)
+		}
 	}
 	g.expect(g.doAs(limited, "PROPFIND", "/cat/Season/", "", "Depth", "1"), 207, "the limited grant's PROPFIND")
 	if r := g.expect(g.doAs(limited, "GET", "/cat/Season/derby.json", ""), 200, "the limited grant's GET"); !strings.Contains(r.body, "Derby!") {
@@ -1244,6 +1283,37 @@ func TestTreeServiceLimitedGrantWrites(t *testing.T) {
 		if r := g.expect(g.doAs(ann, c.method, c.path, c.body, "Destination", "/cat/Season/d2.json"), 403, "ann's "+c.method+" "+c.path); !strings.Contains(r.body, "node documents") {
 			t.Fatalf("%s: 403 %q", c.method, r.body)
 		}
+	}
+	if h, _ := g.load("matches", "derby"); h.State != client.Live {
+		t.Fatalf("derby is %v", h.State)
+	}
+}
+
+// A MOVE of a tree's file by a grant limited to some resources, which
+// can't delete it there (the node documents decide, §H.5, §H.7 "Limited
+// grants"), is refused before anything is written: onto another listed
+// file (a temporary file renamed over), the destination keeps its
+// content; to a new name in a flat namespace it can write, no copy is
+// made. The source stays either way.
+func TestTreeServiceLimitedGrantMoveWritesNothing(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"matches"} })
+	g.propfindAs(a.k.Grant(t, a.s.Now(), "user:admin", a.both, []string{"read"}), "/cat/")
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby", "matches.cup", "cup", "moved"}}}}})
+	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+	cupBefore, _ := g.load("matches", "cup")
+	for _, dst := range []string{"/cat/Season/cup.json", "/matches/moved.json"} {
+		if r := g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", dst, "Overwrite", "T"), 403, "ann's MOVE of derby.json to "+dst); !strings.Contains(r.body, "node documents") {
+			t.Fatalf("MOVE to %s: 403 %q", dst, r.body)
+		}
+	}
+	if cupAfter, doc := g.load("matches", "cup"); cupAfter.ID != cupBefore.ID {
+		t.Fatalf("matches/cup changed by a refused MOVE: %s -> %s, now %v", cupBefore.ID, cupAfter.ID, doc)
+	}
+	if h, _ := g.load("matches", "moved"); h.State != client.NotFound {
+		t.Fatalf("matches/moved made by a refused MOVE: %v", h.State)
 	}
 	if h, _ := g.load("matches", "derby"); h.State != client.Live {
 		t.Fatalf("derby is %v", h.State)

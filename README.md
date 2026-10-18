@@ -1969,9 +1969,12 @@ are `503 behind`, with `Retry-After`, until the service has caught up with the c
 every namespace it trusts (started with a fresh database, rebuilt, or trusting one lately), to
 the head each one's follower read when it started, not just a first log page, rather than show
 every placement of a namespace not yet followed as missing; once caught up, a restart on the
-same database doesn't wait again. One it can't follow (purged, skipped for its keys, refused or
-absent at the core) isn't waited for until the core serves it again, and a `?min=` naming it is
-`400`.
+same database doesn't wait again. One it can't follow (purged, skipped for its keys as
+configured, refused or absent at the core) isn't waited for until the core serves it again, and a
+`?min=` naming it is `400`; one whose epoch key can't be fetched for the moment (the core
+unreachable, a `5xx`, a `429`) is skipped but still waited for. A namespace the catalog stops
+trusting loses its catch-up, also one its follower reports after that, and one recorded before a
+stop, so trusted again it is waited for again.
 
 Listings are kept like the search index's results (§A.4, §B.5, v0.49): every listing computed,
 the one at the `at` a redirect names included, is kept in memory for about a minute (at most
@@ -2833,7 +2836,8 @@ only.
   the tree service with the tree's settings (`catalog.files`, `catalog.trust`) as last read with any
   grant, this server's own at start included; until some grant read them, the tree answers `404`.
   Such a grant edits the files it lists and reads; a new file or folder, a move or a delete, which
-  the node documents decide, is `403`, saying so. The tree service unreachable is
+  the node documents decide, is `403`, saying so, a move before anything is written (onto another
+  file, or to another tree or namespace, the copy is the first write). The tree service unreachable is
   `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
   `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
   as the core's are (in local mode a `401` refuses `-bearer`: `502`, naming the tree service). A

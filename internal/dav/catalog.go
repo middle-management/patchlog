@@ -1411,11 +1411,15 @@ func (st *reqState) copyOfFile(ctx context.Context, src target) (headDoc, []byte
 // taken as a PUT's (§H.4), so dst keeps its history, then a delete of src
 // as a DELETE deletes it. This is how "write a temporary file, rename it
 // over" saves land. One document shown in both places isn't moved onto
-// itself.
+// itself, and one whose source the grant can't delete (sourceDeletable)
+// is refused before anything is written.
 func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	st.onto = dst.path
 	if src.docNS == dst.docNS && src.docName == dst.docName {
 		return fail(http.StatusForbidden, "%s and %s are one document, %s/%s, shown in two places; delete the one you don't want", src.path, dst.path, src.docNS, src.docName)
+	}
+	if err := st.sourceDeletable(ctx, src); err != nil {
+		return err
 	}
 	if err := st.writable(ctx, dst); err != nil {
 		return err
@@ -1434,6 +1438,20 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	return st.deleteSource(ctx, src, dst, hd.rev, "")
 }
 
+// sourceDeletable refuses, before a MOVE writes anything, one whose
+// source is a tree's file the grant can't delete: a delete in a tree is
+// made from the node documents (writeTree), which a grant limited to some
+// resources doesn't read (§H.7 "Limited grants"), and a copy written
+// before that 403 would leave the destination replaced and the source
+// there, a refused request with a lasting effect.
+func (st *reqState) sourceDeletable(ctx context.Context, src target) error {
+	if src.kind != kPlacement {
+		return nil
+	}
+	_, _, err := st.writeTree(ctx, src.ns)
+	return err
+}
+
 // notMoved refuses a MOVE whose copy wrote nothing to the core (an empty
 // placeholder), whose source isn't deleted for it.
 func notMoved(src, dst target) error {
@@ -1445,8 +1463,12 @@ func notMoved(src, dst target) error {
 // resource with src's content (a raw file's blob copied with Blob-From
 // where its rank allows, §7.8), then a delete of src; where its item is
 // deleted, its last revision first takes $successor naming the copy
-// (§8.1), unless its root isn't an object.
+// (§8.1), unless its root isn't an object. One whose source the grant
+// can't delete (sourceDeletable) is refused before anything is written.
 func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
+	if err := st.sourceDeletable(ctx, src); err != nil {
+		return err
+	}
 	if err := st.writable(ctx, dst); err != nil {
 		return err
 	}

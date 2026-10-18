@@ -418,6 +418,13 @@ func (s *Service) init(ctx context.Context) error {
 	if err := s.reload(ctx); err != nil {
 		return err
 	}
+	// A catch-up recorded of a namespace the catalog doesn't trust (its
+	// DELETE in forgetUntrusted failed, or the service stopped between the
+	// apply that untrusted it and that DELETE) is dropped, so that trusted
+	// again it is waited for (more 503s, never a listing short of files).
+	s.mu.Lock()
+	s.forgetUntrusted(ctx)
+	s.mu.Unlock()
 	return s.loadTrusted(ctx)
 }
 
@@ -593,9 +600,18 @@ func (s *Service) setUnfollowed(ns, why string) {
 // again (unfollowed cleared), and listings wait for it until it is caught
 // up (behind); once the checkpoint reaches that head (target), the
 // service has caught up with ns: Apply marks it so as it publishes that
-// checkpoint, and done marks it where nothing was left to apply.
+// checkpoint, and done marks it where nothing was left to apply. A
+// report for a namespace the catalog no longer trusts is dropped: its
+// follower is stopped only after the apply that untrusted it
+// (forgetUntrusted), and a report on its way meanwhile would mark it
+// caught, so that trusted again it wasn't waited for while its follower
+// replays what was placed in between.
 func (s *Service) onCatchUp(ctx context.Context, ns, head string, done bool) {
 	s.mu.Lock()
+	if ns != s.opt.Catalog && !s.g.Trust[ns] {
+		s.mu.Unlock()
+		return
+	}
 	if !done {
 		delete(s.unfollowed, ns)
 		s.target[ns] = head
@@ -735,10 +751,17 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		// catalog, whose listings can't be sealed); skip it and say why. A
 		// content namespace is followed for heads even if its e2e
 		// documents can't be read.
-		// Skipped, it isn't waited for (behind) until its keys come and
-		// the core serves its head again (onCatchUp).
-		if reason, permanent := s.keys.Check(ctx, real, ns != s.opt.Catalog); reason != "" {
-			s.setUnfollowed(ns, reason)
+		// Skipped for its keys as configured, it isn't waited for (behind)
+		// until its keys come and the core serves its head again
+		// (onCatchUp). Skipped because its epoch key couldn't be fetched
+		// for the moment (the core briefly unreachable, a 5xx, a 429:
+		// retry), it is still waited for, as a namespace being caught up
+		// with is: listings are 503 behind, never short of its items, and
+		// a ?min= naming it waits.
+		if reason, permanent, retry := s.keys.Check(ctx, real, ns != s.opt.Catalog); reason != "" {
+			if !retry {
+				s.setUnfollowed(ns, reason)
+			}
 			if permanent {
 				s.opt.Logf("tree: skipping %s: %s", real, reason)
 				return
@@ -947,8 +970,9 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		s.opt.Purger.PurgeTags(res.tags)
 	}
 	s.cur[b.NS] = b.NewCheckpoint
-	// The catch-up's head reached: caught up as this checkpoint is out.
-	caughtNow := !s.caught[b.NS] && s.target[b.NS] == b.NewCheckpoint
+	// The catch-up's head reached: caught up as this checkpoint is out
+	// (if still trusted, onCatchUp).
+	caughtNow := !s.caught[b.NS] && s.target[b.NS] == b.NewCheckpoint && (b.NS == s.opt.Catalog || s.g.Trust[b.NS])
 	if caughtNow {
 		s.caught[b.NS] = true
 	}
