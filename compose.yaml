@@ -11,14 +11,22 @@
 #                                     playground's Search tab reads it through the core's
 #                                     read-only proxy at /playground/index/ (-index-url)
 #   http://localhost:8082             tree service (Addendum B), e.g. /cat/roots (the
-#                                     catalog cat, a tree) and /topics/roots (topics,
-#                                     a DAG); the playground reads it through the
-#                                     core's read-only proxy at /playground/tree/
-#                                     (-tree-url) and switches between the two
+#                                     catalog cat, a tree), /topics/roots (topics,
+#                                     a DAG) and /drive/roots (drive, a file tree);
+#                                     the playground reads it through the core's
+#                                     read-only proxy at /playground/tree/
+#                                     (-tree-url) and switches between them
 #
 # The origins, bypassing the CDN (debugging):
 #
 #   http://localhost:9080 core · http://localhost:9081 search · http://localhost:9082 tree
+#
+# Not behind the CDN:
+#
+#   http://localhost:8090             WebDAV gateway (patchlog dav, README "WebDAV"):
+#                                     demo and files as flat directories, drive as a
+#                                     file tree. Log in with any user name and the
+#                                     password patchlog-dev (dav below)
 #
 # `make cdn-check` shows caching and purging at work; send `X-Cache-Debug: 1`
 # to see a response's cache tags and edge TTL.
@@ -26,8 +34,9 @@
 # Data (databases, blob files, archives, the at-rest master key) lives in
 # the `data` volume; `docker compose down -v` wipes it.
 #
-# Health and shutdown: the core, index and tree answer GET /_health (200
-# while serving, 503 once shutdown starts) and /_ready. Their healthchecks
+# Health and shutdown: the core, index, tree and dav answer GET /_health
+# (200 while serving, 503 once shutdown starts; no login) and /_ready. Their
+# healthchecks
 # run `patchlog health`, so the image needs no curl or wget. On `docker
 # compose stop` / `down` they drain: long-polls and event streams end at
 # once, other requests get up to -shutdown-timeout (20s) before they are
@@ -76,8 +85,9 @@ services:
       # The playground's Catalog tab reads the tree service through a
       # same-origin, GET-only proxy at /playground/tree/. The tree service
       # starts after the core (it waits for the seed), so the proxy answers
-      # 502 until it is up. It serves both catalogs; a catalog served
-      # elsewhere would be mapped with another -tree-url CATALOG=URL.
+      # 502 until it is up. It serves every catalog (cat, topics, drive); a
+      # catalog served elsewhere would be mapped with another -tree-url
+      # CATALOG=URL.
       - -tree-url=http://tree:8082
       # The Search tab reads the index the same way, at /playground/index/.
       # It follows demo; like the tree service it starts after the seed.
@@ -106,9 +116,10 @@ services:
       timeout: 3s
       retries: 30
 
-  # One-shot: creates the demo namespaces (among them two catalogs, cat as a
-  # tree and topics as a DAG, a sealed and an e2e namespace), schemas and a
-  # few documents. Talks to the core directly.
+  # One-shot: creates the demo namespaces (among them three catalogs, cat as a
+  # tree, topics as a DAG and drive as a file tree of the namespace files, a
+  # sealed and an e2e namespace), schemas and a few documents and files.
+  # Talks to the core directly.
   seed:
     image: curlimages/curl:8.16.0
     entrypoint: ["sh", "/deploy/seed.sh"]
@@ -134,11 +145,13 @@ services:
       seed:
         condition: service_completed_successfully
 
-  # One tree service for both catalogs, each at /{catalog}/… with its own
-  # database (tree-cat.db, tree-topics.db).
+  # One tree service for the three catalogs, each at /{catalog}/… with its
+  # own database (tree-cat.db, tree-topics.db, tree-drive.db). drive is a
+  # file tree (§H.2), so its listings carry each file's size, type and time
+  # (§H.3), which the WebDAV gateway lists folders from.
   tree:
     <<: *patchlog
-    command: [tree, -api=http://patchlog:8080, -catalog=cat, -catalog=topics, "-db=/data/tree-{catalog}.db", -addr=:8082, -purge-url=http://cdn:8080/, -shutdown-timeout=20s]
+    command: [tree, -api=http://patchlog:8080, -catalog=cat, -catalog=topics, -catalog=drive, "-db=/data/tree-{catalog}.db", -addr=:8082, -purge-url=http://cdn:8080/, -shutdown-timeout=20s]
     ports:
       - "${TREE_DIRECT_PORT:-9082}:8082"
     healthcheck:
@@ -156,6 +169,39 @@ services:
     depends_on:
       seed:
         condition: service_completed_successfully
+
+  # The WebDAV gateway (README "WebDAV"), a network drive for file managers,
+  # editors and rclone: demo and files as flat directories of their
+  # documents, and drive as a file tree whose folders the tree service
+  # lists. Local mode against the -dev core: no grant, its writes by
+  # X-Author dav. WebDAV clients log in with any user name and the password
+  # in the dav-password config below: patchlog-dev, or DAV_PASSWORD's. It
+  # is a development password, published in this file: like the rest of
+  # this stack, keep the port to yourself. Plain HTTP, and not through the
+  # CDN, which has nothing to cache for WebDAV clients. It keeps nothing but
+  # memory caches: a restart loses locks and temporary files, not files.
+  dav:
+    <<: *patchlog
+    command: [dav, -api=http://patchlog:8080, -ns=demo, -ns=files, -catalog=drive, -tree-url=http://tree:8082, -addr=:8090, -password-file=/run/dav.password, -author=dav, -shutdown-timeout=20s]
+    configs:
+      # Copied into the container, readable by its user (patchlog, 10001)
+      # only, so dav doesn't warn of a password file others may read.
+      - source: dav-password
+        target: /run/dav.password
+        uid: "10001"
+        mode: 0400
+    ports:
+      - "${DAV_PORT:-8090}:8090"
+    healthcheck:
+      test: ["CMD", "patchlog", "health", "http://localhost:8090/_health"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+      tree:
+        condition: service_healthy
 
   # The local CDN: one varnishd with a listener per origin (the VCL picks
   # the backend by listener name). It resolves the origins' host names when
@@ -209,3 +255,8 @@ services:
 
 volumes:
   data:
+
+configs:
+  # The WebDAV gateway's password (dav above). Development only.
+  dav-password:
+    content: ${DAV_PASSWORD:-patchlog-dev}
