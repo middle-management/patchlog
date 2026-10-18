@@ -947,6 +947,12 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		// only (davfs2's If-None-Match: *): that write is the edit.
 		st.p.setAside(src.path, st.s.opt.Now())
 		return nil
+	case live && st.deletedPath(dst):
+		// A DELETE, then a MOVE onto the name (rclone's mount without a
+		// cache saves through a temporary file so): a write to the path
+		// of a file the user deleted moments ago restores it (§H.6), with
+		// the content moved there, keeping its history.
+		return st.moveOnto(ctx, src, dst)
 	case live && tree:
 		return st.moveFile(ctx, src, dst)
 	case src.kind == kFolder:
@@ -1005,6 +1011,21 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		return st.scratchRename(src.path, dst.path)
 	}
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
+}
+
+// deletedPath reports whether t is the path of a file the principal's
+// DELETE removed within ownDeleteUndo (§H.6 "Delete, then write"): a flat
+// namespace's resource, or a tree's file in the same folder.
+func (st *reqState) deletedPath(t target) bool {
+	now := st.s.opt.Now()
+	switch t.kind {
+	case kDoc, kRaw:
+		return st.p.deletedOwn(t.docNS, t.docName, "", now) || t.rawName != "" && st.p.deletedOwn(t.docNS, t.rawName, "", now)
+	case kNewNode:
+		d, ok := st.p.treeDeleted(t.path, now)
+		return ok && d.cat == t.ns && d.parent == t.parent
+	}
+	return false
 }
 
 // moveFlat is a MOVE of live file src of a flat namespace where no tree
