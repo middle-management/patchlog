@@ -946,6 +946,72 @@ func TestGatewayRetryKeepsOthersBase(t *testing.T) {
 	}
 }
 
+// A retry refused by its own rebase asks the user for no reload either
+// (refuse): the token is already to read the file itself, so the reload
+// its first refusal asked for is the editor's read, R2, which a re-armed
+// reload would drop at the editor's program's next read (R3), and the
+// editor's save from R2 would be rebased on R3 alone, writing back the
+// score and note the third party changed after R2 (§H.4). The third
+// party's second change makes the mount's retry clash, a JSON file's
+// (with If-Match R1 or without) or a raw file's (any change of its
+// bytes): the editor's save keeps it, or, a raw file's, is 409 as
+// without the retry.
+func TestGatewayRetryClashKeepsOthersBase(t *testing.T) {
+	t.Parallel()
+	for _, kind := range []string{"json", "if-match", "raw"} {
+		for _, retry := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/retry=%v", kind, retry), func(t *testing.T) {
+				e, k := authEnv(t, true)
+				writer := []string{"read", "create", "append", "restore", "delete"}
+				mount := k.Grant(t, e.s.Now(), "user:bob", []string{"docs"}, writer)
+				editor := k.Grant(t, e.s.Now().Add(time.Second), "user:bob", []string{"docs"}, writer)
+				if kind == "raw" {
+					e.rawDoc("docs", "a.txt", "text/plain", []byte("one"), nil)
+					set := func(b string) {
+						h, _ := e.load("docs", "a.txt")
+						bid := must(e.c.UploadBlob(e.ctx, "docs", "a.txt", "text/plain", "", []byte(b)))
+						must(e.c.Append(e.ctx, "docs", "a.txt", h.ID, []any{replace("/$blob", bid), replace("/size", len(b))}))
+					}
+					e.expect(e.doAs(mount, "GET", "/docs/a.txt", ""), 200, "the mount opens a.txt (R1)")
+					set("theirs")
+					e.expect(e.doAs(mount, "PUT", "/docs/a.txt", "mine"), 409, "the mount's upload, from R1")
+					e.expect(e.doAs(editor, "GET", "/docs/a.txt", ""), 200, "the editor opens a.txt (R2)")
+					set("theirs2")
+					if retry {
+						e.expect(e.doAs(mount, "PUT", "/docs/a.txt", "mine"), 409, "the mount's retry")
+					}
+					e.expect(e.doAs(editor, "GET", "/docs/a.txt", ""), 200, "the editor's program reads a.txt again (R3)")
+					e.expect(e.doAs(editor, "PUT", "/docs/a.txt", "theirs, edited"), 409, "the editor's save from R2, whose bytes changed since")
+					if _, data := e.rawOf("docs", "a.txt"); string(data) != "theirs2" {
+						t.Fatalf("a.txt reads %q", data)
+					}
+					return
+				}
+				e.create("docs", "a", map[string]any{"score": "0-0", "title": "T", "note": "n"})
+				r1 := e.expect(e.doAs(mount, "GET", "/docs/a.json", ""), 200, "the mount opens a.json (R1)").header.Get("ETag")
+				var tag []string
+				if kind == "if-match" {
+					tag = []string{"If-Match", r1}
+				}
+				h, _ := e.load("docs", "a")
+				must(e.c.Append(e.ctx, "docs", "a", h.ID, []any{replace("/score", "1-0")}))
+				refused := rendered(map[string]any{"score": "8-8", "title": "T", "note": "n"})
+				e.expect(e.doAs(mount, "PUT", "/docs/a.json", refused, tag...), 409, "the mount's upload, from R1")
+				buf := e.expect(e.doAs(editor, "GET", "/docs/a.json", ""), 200, "the editor opens a.json (R2)").body
+				h, _ = e.load("docs", "a")
+				must(e.c.Append(e.ctx, "docs", "a", h.ID, []any{replace("/score", "2-0"), replace("/note", "n2")}))
+				if retry {
+					e.expect(e.doAs(mount, "PUT", "/docs/a.json", refused, tag...), 409, "the mount's retry, which clashes on /score")
+				}
+				e.expect(e.doAs(editor, "GET", "/docs/a.json", ""), 200, "the editor's program reads a.json again (R3)")
+				e.expect(e.doAs(editor, "PUT", "/docs/a.json", strings.Replace(buf, `"T"`, `"T2"`, 1)), 201, "the editor's save of its title edit from R2")
+				_, doc := e.load("docs", "a")
+				sameJSON(t, doc, map[string]any{"score": "2-0", "title": "T2", "note": "n2"})
+			})
+		}
+	}
+}
+
 // A token refused a save, which must read the file itself before its
 // next save without a base (refusedSave), gets it in full from a
 // conditional GET, whatever its validators say (§H.1, §H.4), after

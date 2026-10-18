@@ -173,7 +173,8 @@ service's listings.
     the save differently, or a path that came to name another file; after a `409`, a save
     without a base by the same login is refused again until that login reads the file (an
     rclone mount retrying its upload isn't rebased on another program's read), its conditional
-    GET answered in full, and those refusals ask no reload of the user's other programs, whose
+    GET answered in full, and those refusals, and any other of that login's before its read (a
+    retry whose rebase clashes, a raw file's), ask no reload of the user's other programs, whose
     records stay; lost records are a `409` until the reload it asks for; a raw file is
     checked
     against every version the user had, conflicts as a whole when someone else changed its bytes

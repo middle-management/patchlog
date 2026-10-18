@@ -2642,7 +2642,10 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   and taken as the latter the undo was dropped. A `409` asks for a reload: the
   user's next GET of the whole document sends it whatever its validators say (a cached copy may
   be what the editor had), and drops the versions recorded before the `409`, so the reloaded one
-  is the base of the edit after it; a range read isn't that reload. A version that can't be read
+  is the base of the edit after it; a range read isn't that reload. A `409` to a login that
+  must read the file itself first (refused a save of it, or verified as another user, since it
+  last read it: a retry, whatever refuses it) asks for none again, so another program's next
+  read keeps the version it has open. A version that can't be read
   again for a save (a `429`, a `5xx`) fails it (`503`, `502`) rather than leaving it without a
   base. One the core no longer has (pruned, §8.6), named by `If-Match` or recorded, or whose
   history since is pruned, can't be compared: `409`, asking for a reload. An `If-Match` naming

@@ -372,7 +372,16 @@ func (st *reqState) refuse(ns, name string) { st.s.refuse(st.p, ns, name, st.tk.
 
 // refuse marks p's records of ns/name as refused: the save was a 409,
 // which asks for a reload, by token by, which must read the document
-// itself before it saves it again without a base (refusedSave).
+// itself before it saves it again without a base (refusedSave). A token
+// already to read it (unread) asks for none again: it hasn't read since,
+// so the reload its earlier refusal asked for is still due, or was
+// another of the user's programs' read, which holds the version it read.
+// A refused retry of its upload (an rclone mount's own, the same bytes,
+// whose rebase clashes as before, or a raw file's) or a switched token's
+// refusal re-arming the user's reload would make that program's next
+// read drop that version, and its next save without If-Match would then
+// be rebased on that read alone, over what a third party changed since
+// (§H.4).
 func (s *Server) refuse(p *principal, ns, name, by string) {
 	k := recKey(ns, name)
 	s.recMu.Lock()
@@ -383,6 +392,8 @@ func (s *Server) refuse(p *principal, ns, name, by string) {
 	if !ok {
 		_, d.lost = st.forgotten.Get(k)
 		st.forgotten.Remove(k)
+	} else if slices.Contains(d.unread, by) {
+		return
 	}
 	s.recSeq++
 	d.reload = s.recSeq
