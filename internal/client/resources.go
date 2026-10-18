@@ -2,9 +2,13 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -65,6 +69,14 @@ type Doc struct {
 	ID    string
 	Raw   []byte // canonical bytes as served
 	Value any    // parsed (jsonv model)
+	// Modified is the revision's created time, from Last-Modified (to the
+	// second), zero if the server sent none. Digest is Raw's sha-256 in
+	// the RFC 9530 form /heads entries use (HeadItem.Digest, ReprDigest),
+	// from Repr-Digest; "" if the server sent none, as for a sealed
+	// document, whose header would describe the JWE. Both are reference
+	// extensions beyond the spec (README).
+	Modified time.Time
+	Digest   string
 }
 
 // Doc fetches the document at revision id (immutable). A tombstone id, a
@@ -93,7 +105,37 @@ func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
 	if err != nil {
 		return nil, fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
 	}
-	return &Doc{ID: id, Raw: body, Value: v}, nil
+	d := &Doc{ID: id, Raw: body, Value: v}
+	if t, err := http.ParseTime(r.header.Get("Last-Modified")); err == nil {
+		d.Modified = t
+	}
+	if !isJOSE(r) {
+		d.Digest = reprSHA256(r.header.Get("Repr-Digest"))
+	}
+	return d, nil
+}
+
+// ReprDigest is the sha-256 of b in the RFC 9530 form, sha-256=:<base64>:,
+// as Doc.Digest and HeadItem.Digest give it: a document's Raw bytes hash
+// to its head's digest.
+func ReprDigest(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha-256=:" + base64.StdEncoding.EncodeToString(sum[:]) + ":"
+}
+
+// reprSHA256 is the sha-256 member of a Repr-Digest field (RFC 9530, a
+// structured dictionary) in ReprDigest's form, or "" if it has none.
+func reprSHA256(field string) string {
+	for _, m := range strings.Split(field, ",") {
+		k, v, _ := strings.Cut(strings.TrimSpace(m), "=")
+		if k != "sha-256" || len(v) < 2 || v[0] != ':' || v[len(v)-1] != ':' {
+			continue
+		}
+		if b, err := base64.StdEncoding.DecodeString(v[1 : len(v)-1]); err == nil && len(b) == sha256.Size {
+			return "sha-256=" + v
+		}
+	}
+	return ""
 }
 
 // Load reads the head and, if live, the document at it (§11 load).
