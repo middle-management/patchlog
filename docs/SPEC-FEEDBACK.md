@@ -73,47 +73,78 @@ From implementing v0.51 and v0.52. Each gives what the reference chose.
     so a batch larger than a page is a page of its own. *Propose:* say the page size bounds
     resource entries too, or that a page may be shorter for that reason.
 
-From building a WebDAV gateway on the client API (`patchlog dav`) and testing it with rclone,
-FUSE and editors: what would make file-style and sync clients thin. 13–15 are implemented as
-reference extensions (README); the others are proposals only.
+From implementing v0.53 and v0.54.
 
-13. **A revision's time on its read** (§7.1). `/r/{ns}/{name}/rev/{id}` carries no time, so a
-    client that shows files has to take mtimes from the log or make them up, and editors warn
-    "changed on disk" when they move. The reference sends `Last-Modified` with the revision's
-    `created` (immutable; §E.2.2 keeps timing in the clear at E2, though there it shows times the
-    sealed logs serve sealed, and §E.2.5's edge grants are how to hide them), and answers
-    `If-Modified-Since`. *Propose:* say `Last-Modified` is the revision's `created`.
-14. **Size, time and digest in `/heads`** (§7.4). An entry is `{resource, kind, target}`, so a
-    listing that shows sizes costs a document fetch per entry. The reference adds `created`, and
-    for live heads in namespaces without E2 or E3 encryption `size` (bytes of the canonical
-    document) and `digest` (`sha-256=:…:` of them), stored at write time; a page never gains
-    them once served (rows written before the upgrade stay without), and loses them on a purge
-    or a raise to sealed. *Propose:* these optional fields, absent at E2/E3, where they would
-    leak length and content.
-15. **A document digest on its read** (§7.1). Revision ids hash patch sets, so two revisions
-    holding the same document can't be told apart without fetching both. The reference sends
-    `Repr-Digest` (RFC 9530) of the canonical document on plaintext revisions, none on JWEs.
-    *Propose:* `Repr-Digest` on plaintext revision reads.
-16. **A whole-document replace on an append** (§6.6). Creates, and restores whose first op
-    replaces the root, are bounded by `documentSize`; on an append a root `replace ""` is bounded
-    by `patchSetSize` (256 KiB). A client that saves whole files must diff even to overwrite a
-    document on purpose. *Propose:* bound a set whose only op replaces the root by
-    `documentSize`, on any write.
-17. **Raw file resources** (§3.7, §7.8). Documents are JSON, so a gateway can't store a Markdown
-    file or an image as itself. *Propose:* a document whose root is a blob reference may be read
-    as that blob at `/r/{ns}/{name}/raw`, with its type, under the document's read check;
-    writing one is uploading the blob and setting the reference.
-18. **A successor on a tombstone** (§8.1). There is no rename (one name, one chain), and a
-    delete followed by a create elsewhere leaves nothing to follow. *Propose:* `DELETE` may name
-    a successor resource, recorded in the tombstone and returned with the `410`, as a frozen
-    namespace names its successor (§8.4), so clients and catalogs can follow a move.
-19. **A rebased write** (§11). Every whole-file client (WebDAV, FUSE, sync tools, editors) needs
-    §11's submit with a base older than the head: diff base to new, refuse when that overlaps
-    what changed from base to head, else append. Done client-side it is easy to get wrong: two
-    review rounds of the gateway found ways it reverted others' edits. *Propose:* an opt-in write
-    that carries the new document and `Base: "{rev}"`; the origin diffs, applies §F.3's overlap
-    rule (writes inside an array count for the array), and appends to the head or answers `409`
-    with the overlapping paths, never merging values.
+13. **Moving a schema** (§6.5, §8.1). Only a fresh `$nonce` is exempt from a schema document's
+    keyword check, so a schema with `$successor` is refused as an unknown keyword, and a schema
+    resource can't be moved as §8.1 describes. The reference leaves it so. *Propose:* exempt a
+    well-formed `$successor` there too, or say schemas aren't moved.
+14. **`If-Modified-Since` where no `Last-Modified` is sent** (§7.1). The reference ignores it at
+    E2 and E3 (RFC 9110 §13.1.3): a `304` there would let a reader probe for the created time the
+    spec hides. *Propose:* say it applies only where `Last-Modified` is sent.
+15. **The reason given for E3** (§7.4, §E.4). "`created` is hidden in the sealed log" isn't so at
+    E3, whose resource and namespace logs serve `created` in the clear (§E.3.1, §F.8.1); the rule
+    holds there for the other reason (exact lengths defeat padding). *Propose:* give that reason
+    for E3.
+16. **`/raw`'s caching and read check** (§7.1). "As the document URL it stands for" leaves the
+    error answers open: the reference caches the `302`, the not-raw `404 not_found` and `404
+    not_offered` with the URL's class (head pointer or immutable) and the tag `r:{ns}/{name}`, and
+    uses the ordinary read check for both raw URLs (a `schemaReads` referrer opens revision paths
+    only). *Propose:* say both.
+17. **`logPageBytes` at E2** (§7.1, §E.2.2). Counting plaintext patch sets leaks exact sizes through
+    where pages end (`X-Log-Next`, the long-poll `X-Revision`) in padded namespaces. The reference
+    counts each entry's JWE as served (the stored one, or one sealed for the page), and stops its
+    scan early on stored plaintext, a lower bound unless a JWE is compressed, which a padded one
+    never is. *Propose:* say "as served" means the sealed bytes at E2.
+18. **Moves across bundles, renames and deployments** (§G.3, §G.4). A deleted resource's snapshot
+    line has no document (§G.4.3) and an upstream import appends only a tombstone, so `$successor`
+    travels in history bundles only (the v0.54 change log says it travels with them); a renamed
+    import (§G.4.4) doesn't rewrite a cross-namespace `/r/{ns2}/{name2}` and the closure (§G.4.2)
+    doesn't follow it; through a remote branch (§G.3) it resolves on the branch's deployment, not
+    the base's. *Propose:* say which of these a successor survives.
+19. **Moves by catalog-limited editors** (§B.11.4, §8.1). Their grants fix one name, so the
+    one-batch move (create the new resource, append to and delete the old) takes two requests or a
+    grant fixed to both names.
+20. **`gone` in §12** doesn't repeat §8.1's "outside sealed and end-to-end namespaces" for
+    `successor`; the reference follows §8.1.
+21. **Which writes count as whole documents** (§6.6). Worth saying that a root `replace` or `add`
+    followed by further operations still counts (the reference allows it), and a root `copy`,
+    `move` or `remove` doesn't.
+22. **Blob headers** (§7.8). Chromium's PDF viewer shows a PDF served with
+    `Content-Security-Policy: sandbox` as a blank page (Atlassian documents it for Jira 8.16+ and
+    exempts `application/pdf`), so raw PDFs don't display inline. The reference also sends both
+    headers on the request-shape `400`s answered before routing, whose body echoes a parameter's
+    name. *Propose:* state the PDF cost or allow an exemption (e.g. as an attachment), and say
+    "every response to a blob URL".
+23. **Trusting a `410`'s successor** (§8.1, §11). A conforming server names none in sealed or
+    end-to-end namespaces, so one there comes from the server (at E3 outside the trust boundary)
+    or a cache. The reference's E3 client reads `$successor` from the verified document at `last`
+    and ignores a `410`'s. *Propose:* say so in §11, and that sealed-namespace clients that don't
+    trust caches do the same before following one automatically.
+24. **Stored digests at rest** (§E.1, §7.4). A server that stores `/heads` `size` and `digest`
+    keeps a plaintext sha-256 of each head's document beside its encrypted content, as ids hash
+    patch sets (§C.7): a dump or backup, even one from before a purge, confirms a guess of a
+    document without a `$nonce`. The reference documents it; it also purges cached `/heads` pages
+    on a resource purge (a `heads:{ns}` tag), beyond §8.3. *Propose:* say this in §E.1, or
+    suggest computing digests at read time at rest.
+
+## Settled in v0.53 and v0.54
+
+v0.53 restructured the text without changing behaviour. v0.54 took up notes 13–19 from the
+WebDAV gateway, as follows:
+- **Revision times and digests** (13, 15): `Last-Modified` and `Repr-Digest` on revision reads,
+  outside E2 and E3. The reference had sent `Last-Modified` at E2 too, and no longer does.
+- **`/heads` fields** (14): `created`, `size` and `digest`, optional and stored at write time,
+  outside E2 and E3 (the reference had sent `created` there too); a raise to sealed purges
+  `ns:{ns}` (§9).
+- **Whole documents** (16): an append or restore whose first operation other than `test` is a root
+  `replace` or `add` is bounded by `documentSize`.
+- **Raw files** (17): a document whose root is only a blob reference is raw, served at `…/raw` as a
+  redirect outside E2 and E3; blob responses carry `nosniff` and a sandbox policy.
+- **Moves** (18): `$successor` in the last revision before the tombstone, not in the tombstone,
+  which the head's `410` returns outside E2 and E3 and validation leaves out.
+- **Rebased writes** (19): declined as a server feature; §11.3 gives the client procedure.
+- New besides: `logPageBytes` bounds log pages in bytes (§6.6, §7.1).
 
 ## Settled in v0.51 and v0.52
 
