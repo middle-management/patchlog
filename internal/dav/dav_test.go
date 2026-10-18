@@ -335,10 +335,11 @@ func TestScratchFiles(t *testing.T) {
 	sameStrings(t, "root", names(e.propfind("/"), "/"), []string{".DS_Store", "docs/"})
 }
 
-// Moving or copying between documents: a move between two names is 403
-// (names are identity), a copy to a new name creates it, a directory
-// can't be made or deleted in a flat namespace, and LOCK, then PUT with
-// the token, then UNLOCK creates a document (as Finder does).
+// Moving or copying between documents: a move a flat namespace can't
+// record with $successor is 403 (TestFlatMoves has the rest), a copy to a
+// new name creates it, a directory can't be made or deleted in a flat
+// namespace, and LOCK, then PUT with the token, then UNLOCK creates a
+// document (as Finder does).
 func TestCopyMoveLock(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"docs", "other"}, nil, nil)

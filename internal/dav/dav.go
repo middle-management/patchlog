@@ -414,16 +414,15 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // answered keeps what the request's answer, status, says of the
-// principal's saves for a DELETE that follows (refusedSave): a PUT of a
-// file, or a MOVE onto an existing one (onto), refused without writing to
-// the core sets a guard, but for one that put back the principal's own
+// principal's saves for a DELETE that follows (refusedSaveFor): a PUT of
+// a file, or a MOVE onto an existing one (onto), refused without writing
+// to the core sets a guard, but for one that put back the principal's own
 // DELETE (undoOwnDelete), which a DELETE after it leaves deleted as the
 // principal chose, and one a frozen namespace refused, which takes no
 // DELETE either (§8.4); a DELETE that found nothing (a refused create's
-// cleanup) uses one up. A GET answered whole of a file the core has gone
-// is the reload a refused save over someone else's delete asked for
-// (tombBase). It runs before the answer goes out, so the client's next
-// request finds it.
+// cleanup) uses one up. A GET finding a file gone (404) is the reload a
+// refused save over someone else's delete asked for (tombBase). It runs
+// before the answer goes out, so the client's next request finds it.
 func (st *reqState) answered(status int) {
 	now := st.s.opt.Now()
 	guardOn := ""
