@@ -2329,7 +2329,8 @@ core only through its public API, and keeps nothing but memory caches.
   verified the others is verified in another, and is another user; a token verified again as
   another user, the namespace that verified it refusing it now, whether kept meanwhile or not,
   has its saves without a base of every document its old user had records of refused until it
-  reloads). Temporary files, locks and dead properties, which may hold what one token read (a
+  reads that document itself: another token's read isn't its reload, and the new user's other
+  tokens aren't refused). Temporary files, locks and dead properties, which may hold what one token read (a
   document's backup copy, an editor's swap file with its text), carry over between the tokens
   the issuer minted with the same rights (the root block's `ns`, `can`, `roles`, `rules`,
   `groups` and `attrs`, whatever its times), but a token minted limited to some resources
@@ -2429,7 +2430,8 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   write the server's version into the mounted file, `rclone cat pl:docs/x.json > ~/pl/docs/x.json`
   (the shell empties the mounted file before rclone reads, so the refused version isn't sent
   again): that upload writes nothing, and you edit again from there. A login refused a save must
-  read the file itself before its next save without a base is taken, so another program's read
+  read the file itself (its conditional GET is answered in full) before its next save without a
+  base is taken, and its retries ask no reload of anyone else's, so another program's read
   doesn't let the mount's retries through, but only one with another grant: a program logging in
   with the mount's own (local mode's one password, or a gateway user's grant given to both) is
   the same login, and its read (`rclone cat` to the terminal, a browser) is the reload the `409`
@@ -2628,7 +2630,9 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   after a restart, or once a day has passed), the head is the base, so the file as written wins,
   as the diff from it; over a tombstoned document, a file made anew (above).
   Versions the bounds pushed out are remembered as lost: then a save that changes the document is
-  a `409` until a reload, rather than rebased on what is left. Within one user, two programs
+  a `409`, rather than rebased on what is left, until the reload that `409` asks for; a read before
+  it isn't that reload, since another program of the user's may still have the version pushed out
+  open, and its save would be rebased on that read. Within one user, two programs
   saving the same value, the last wins; two editing from one version, the second save is a `409`
   (above) until it reloads.
 - A PUT answers with the revision as its ETag only when that revision holds exactly what was sent

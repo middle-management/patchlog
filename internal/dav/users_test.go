@@ -584,12 +584,14 @@ func TestGatewaySwitchAfterSweep(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"v": 1, "w": 2})
 }
 
-// A token verified again as another user has every document its old user
-// had records of marked lost, those the new user has records of too:
-// here alice's token for docs only, a user apart since alpha verified her
-// full token first, read the head. The full token's save from before,
-// verified again by docs as that user, is a 409, not a rebase from the
-// version the other token read.
+// A token verified again as another user must read every document its
+// old user had records of before saving it without a base, those the new
+// user has records of too: here alice's token for docs only, a user apart
+// since alpha verified her full token first, read the head. The full
+// token's save from before, verified again by docs as that user, is a
+// 409, not a rebase from the version the other token read, and so is its
+// save after the other token reads the file again: that read isn't the
+// full token's reload. The docs-only token's own saves go through.
 func TestGatewayLoseRecordsKnown(t *testing.T) {
 	t.Parallel()
 	clk := &testClock{t: time.Now()}
@@ -614,13 +616,19 @@ func TestGatewayLoseRecordsKnown(t *testing.T) {
 	e.expect(e.doAs(alice, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 409, "the full token's save from before")
 	_, doc := e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"v": 1, "w": 2})
-	// The docs-only token reloads, and saves.
-	buf = e.expect(e.doAs(aliceDocs, "GET", "/docs/x.json", ""), 200, "the reload").body
-	e.doAs(aliceDocs, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 3`, 1))
-	e.expect(e.doAs(aliceDocs, "GET", "/docs/x.json", ""), 200, "a reload after the refusal")
-	e.expect(e.doAs(aliceDocs, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 3`, 1)), 201, "the save after reloading")
+	// The docs-only token reads, and saves.
+	docsBuf := e.expect(e.doAs(aliceDocs, "GET", "/docs/x.json", ""), 200, "the docs token's GET").body
+	e.expect(e.doAs(aliceDocs, "PUT", "/docs/x.json", strings.Replace(docsBuf, `"v": 1`, `"v": 3`, 1)), 201, "the docs token's save from its GET")
 	_, doc = e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"v": 3, "w": 2})
+	e.expect(e.doAs(alice, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 409, "the full token's save from before, after the docs token's reads")
+	_, doc = e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": 3, "w": 2})
+	// The full token reloads, and saves.
+	buf = e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "the full token's reload").body
+	e.expect(e.doAs(alice, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 3`, `"v": 4`, 1)), 201, "the full token's save after its reload")
+	_, doc = e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": 4, "w": 2})
 }
 
 // Narrowing is offline and free, so making room among a user's scopes
@@ -899,4 +907,149 @@ func TestGatewayRetryAfterOtherRead(t *testing.T) {
 	e.expect(e.doAs(mount, "PUT", "/docs/a.json", strings.Replace(buf, `"1-0"`, `"8-8"`, 1)), 201, "the mount's save after its reload")
 	_, doc = e.load("docs", "a")
 	sameJSON(t, doc, map[string]any{"score": "8-8", "title": "T2"})
+}
+
+// A retry refused (refusedSave) asks the user for no reload: re-arming
+// the user's would make another program's next read of the file drop
+// the records older than the retry, the version that program has open
+// among them, and its next save without If-Match would be rebased on
+// that read alone, writing back what a third party changed since its
+// version (§H.4). Here the editor opens R2 after the mount's refusal and
+// edits the title; a third party sets note; the mount retries (409); the
+// editor's program reads the file again (a preview); the editor's save
+// from R2 keeps the third party's note, with or without the retry.
+func TestGatewayRetryKeepsOthersBase(t *testing.T) {
+	t.Parallel()
+	for _, retry := range []bool{false, true} {
+		t.Run(fmt.Sprintf("retry=%v", retry), func(t *testing.T) {
+			e, k := authEnv(t, true)
+			writer := []string{"read", "create", "append", "restore", "delete"}
+			mount := k.Grant(t, e.s.Now(), "user:bob", []string{"docs"}, writer)
+			editor := k.Grant(t, e.s.Now().Add(time.Second), "user:bob", []string{"docs"}, writer)
+			e.create("docs", "a", map[string]any{"score": "0-0", "title": "T", "note": "n"})
+			e.expect(e.doAs(mount, "GET", "/docs/a.json", ""), 200, "the mount opens a.json (R1)")
+			h, _ := e.load("docs", "a")
+			must(e.c.Append(e.ctx, "docs", "a", h.ID, []any{replace("/score", "1-0")}))
+			refused := rendered(map[string]any{"score": "8-8", "title": "T", "note": "n"})
+			e.expect(e.doAs(mount, "PUT", "/docs/a.json", refused), 409, "the mount's upload, from R1")
+			buf := e.expect(e.doAs(editor, "GET", "/docs/a.json", ""), 200, "the editor opens a.json (R2)").body
+			h, _ = e.load("docs", "a")
+			must(e.c.Append(e.ctx, "docs", "a", h.ID, []any{replace("/note", "n2")}))
+			if retry {
+				e.expect(e.doAs(mount, "PUT", "/docs/a.json", refused), 409, "the mount's retry")
+			}
+			e.expect(e.doAs(editor, "GET", "/docs/a.json", ""), 200, "the editor's program reads a.json again (R3)")
+			e.expect(e.doAs(editor, "PUT", "/docs/a.json", strings.Replace(buf, `"T"`, `"T2"`, 1)), 201, "the editor's save of its title edit from R2")
+			_, doc := e.load("docs", "a")
+			sameJSON(t, doc, map[string]any{"score": "1-0", "title": "T2", "note": "n2"})
+		})
+	}
+}
+
+// A token refused a save, which must read the file itself before its
+// next save without a base (refusedSave), gets it in full from a
+// conditional GET, whatever its validators say (§H.1, §H.4), after
+// another token of the user read it too: that GET is its reload, and its
+// save of the head it read goes through.
+func TestGatewayRefusedConditionalGET(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	writer := []string{"read", "create", "append", "restore", "delete"}
+	mount := k.Grant(t, e.s.Now(), "user:bob", []string{"docs"}, writer)
+	other := k.Grant(t, e.s.Now().Add(time.Second), "user:bob", []string{"docs"}, writer)
+	e.create("docs", "a", map[string]any{"score": "0-0", "title": "T"})
+	e.expect(e.doAs(mount, "GET", "/docs/a.json", ""), 200, "the mount opens a.json")
+	h, _ := e.load("docs", "a")
+	must(e.c.Append(e.ctx, "docs", "a", h.ID, []any{replace("/score", "1-0")}))
+	e.expect(e.doAs(mount, "PUT", "/docs/a.json", rendered(map[string]any{"score": "8-8", "title": "T"})), 409, "the mount's upload, from 0-0")
+	etag := e.expect(e.doAs(other, "GET", "/docs/a.json", ""), 200, "another program of bob's reads a.json").header.Get("ETag")
+	if etag == "" {
+		t.Fatal("no ETag")
+	}
+	r := e.expect(e.doAs(mount, "GET", "/docs/a.json", "", "If-None-Match", etag), 200, "the refused mount's conditional GET")
+	if r.body != rendered(map[string]any{"score": "1-0", "title": "T"}) {
+		t.Fatalf("the mount's GET %q", r.body)
+	}
+	e.expect(e.doAs(mount, "PUT", "/docs/a.json", rendered(map[string]any{"score": "1-0", "title": "T2"})), 201, "the mount's save of the head it read")
+	_, doc := e.load("docs", "a")
+	sameJSON(t, doc, map[string]any{"score": "1-0", "title": "T2"})
+}
+
+// A token verified again as another user must read each document its
+// old user had records of before saving it without a base (loseRecords),
+// but only that token: the new user's other tokens, which never were
+// someone else, save from what they read as the new user, a GET made
+// after the switch or before it, with no refusal (§H.4, §H.7).
+func TestGatewaySwitchOthersSave(t *testing.T) {
+	t.Parallel()
+	for _, before := range []bool{false, true} {
+		t.Run(fmt.Sprintf("read before the switch=%v", before), func(t *testing.T) {
+			clk := &testClock{t: time.Now()}
+			e, k := authEnv(t, true, func(o *dav.Options) {
+				o.Namespaces = []string{"alpha", "docs"}
+				o.Now, o.VerifyEvery = clk.now, time.Minute
+			})
+			writer := []string{"read", "create", "append", "restore", "delete", "config"}
+			op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+			must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+			alice := k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
+			aliceDocs := k.Grant(t, e.s.Now().Add(time.Second), "user:alice", []string{"docs"}, writer)
+			e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+			e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "alice's GET, verified by alpha")
+			var buf string
+			if before {
+				buf = e.expect(e.doAs(aliceDocs, "GET", "/docs/x.json", ""), 200, "the docs token reads x before the switch").body
+			}
+			ac := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"alpha"}, writer)))
+			nh := must(ac.NSHead(e.ctx, "alpha"))
+			must(ac.PatchConfig(e.ctx, "alpha", nh.Config, []any{map[string]any{"op": "replace", "path": "/keys", "value": []any{clienttest.NewKey("k2").Entry("*")}}}))
+			clk.add(2 * time.Minute)
+			e.expect(e.doAs(alice, "PROPFIND", "/docs/", "", "Depth", "1"), 207, "alice's full token, verified again by docs (a switch)")
+			if !before {
+				buf = e.expect(e.doAs(aliceDocs, "GET", "/docs/x.json", ""), 200, "the docs token opens x after the switch").body
+			}
+			e.expect(e.doAs(aliceDocs, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 3`, 1)), 201, "the docs token's save from what it read")
+			_, doc := e.load("docs", "x")
+			sameJSON(t, doc, map[string]any{"v": 3, "w": 1})
+		})
+	}
+}
+
+// A switched token refused room as its new user (503: here the new
+// user's 8 scopes of tokens as issued each keep a swap file) is admitted
+// as nobody, and marks nothing: its retries (Retry-After) don't undo
+// what the new user's other tokens read meanwhile, whose saves from it
+// go through (§H.4, §H.7).
+func TestGatewaySwitchRefusedRoom(t *testing.T) {
+	t.Parallel()
+	clk := &testClock{t: time.Now()}
+	e, k := authEnv(t, true, func(o *dav.Options) {
+		o.Namespaces = []string{"alpha", "docs"}
+		o.Now, o.VerifyEvery = clk.now, time.Minute
+	})
+	writer := []string{"read", "create", "append", "restore", "delete", "config"}
+	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
+	e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+	e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "alice's GET, verified by alpha")
+	var docsToks []string
+	for i := 0; i < 8; i++ {
+		tok := k.Grant(t, e.s.Now(), "user:alice", []string{"docs"}, writer, map[string]any{"attrs": map[string]any{"n": i}})
+		e.expect(e.doAs(tok, "PUT", fmt.Sprintf("/docs/.s%d.swp", i), "swap"), 201, "a docs-only token's swap file")
+		docsToks = append(docsToks, tok)
+	}
+	ac := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"alpha"}, writer)))
+	nh := must(ac.NSHead(e.ctx, "alpha"))
+	must(ac.PatchConfig(e.ctx, "alpha", nh.Config, []any{map[string]any{"op": "replace", "path": "/keys", "value": []any{clienttest.NewKey("k2").Entry("*")}}}))
+	clk.add(2 * time.Minute)
+	e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 503, "alice's full token, verified again by docs: no scope for it")
+	d := docsToks[0]
+	buf := e.expect(e.doAs(d, "GET", "/docs/x.json", ""), 200, "a docs token reads x").body
+	e.expect(e.doAs(d, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 201, "its save")
+	buf = e.expect(e.doAs(d, "GET", "/docs/x.json", ""), 200, "it reads its save").body
+	e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 503, "the full token's retry")
+	e.expect(e.doAs(d, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 2`, `"v": 3`, 1)), 201, "the docs token's save from what it read, after the retry")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": 3, "w": 1})
 }

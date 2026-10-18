@@ -172,7 +172,9 @@ service's listings.
     restore by someone else in between, a pruned base, lost records, versions that would apply
     the save differently, or a path that came to name another file; after a `409`, a save
     without a base by the same login is refused again until that login reads the file (an
-    rclone mount retrying its upload isn't rebased on another program's read); a raw file is
+    rclone mount retrying its upload isn't rebased on another program's read), its conditional
+    GET answered in full, and those refusals ask no reload of the user's other programs, whose
+    records stay; lost records are a `409` until the reload it asks for; a raw file is
     checked
     against every version the user had, conflicts as a whole when someone else changed its bytes
     since, and sets its reference's members one by one. A JSON patch set over `opsPerSet` or
@@ -210,7 +212,8 @@ service's listings.
     same token, kept past the token, and for its kid and sub), never the token, so every token
     of one person, minted again or attenuated offline, shares their records, guards, own
     tombstones and the writes their tree listings wait for; a token verified again as another
-    user has every document its old user had records of marked lost for the new one. Scratch
+    user (once admitted as that user) must read every document its old user had records of
+    itself before saving it without a base, the new user's other tokens unaffected. Scratch
     files, locks and dead properties are shared by the tokens the issuer minted with the same
     rights (the root block's `ns`, `can`, `roles`, `rules`, `groups`, `attrs`), and a token
     minted limited to some resources or attenuated offline (another ns, can, rules, a via) has

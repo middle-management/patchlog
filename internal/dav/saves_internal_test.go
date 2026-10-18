@@ -2,6 +2,7 @@ package dav
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -106,11 +107,12 @@ func TestGuards(t *testing.T) {
 	}
 }
 
-// loseRecords marks lost, for the user a token was verified again as,
-// every document the old user had records of, or had lost them of: those
-// the new user has records of too, and more than the 4096 documents its
-// forgotten marks hold (an rclone copy reads each), the most recently
-// used and the least alike.
+// loseRecords marks unread by the token, for the user it was verified
+// again as, every document the old user had records of, or had lost them
+// of: those the new user has records of too, and more than the 4096
+// documents its forgotten marks hold (an rclone copy reads each), the
+// most recently used and the least alike. Only that token's: the new
+// user's records stay as they were, not lost.
 func TestLoseRecordsBounds(t *testing.T) {
 	c, err := client.New("http://127.0.0.1:1")
 	if err != nil {
@@ -129,16 +131,16 @@ func TestLoseRecordsBounds(t *testing.T) {
 	s.storeLocked(from).forgotten.Put(recKey("docs", "gone"), true, 1)
 	s.recMu.Unlock()
 	s.remember(to, "docs", "d7", record{rev: "other"}, false)
-	s.loseRecords(from.id, to)
+	s.loseRecords(from.id, to, "tok")
 	for _, name := range []string{fmt.Sprintf("d%d", n-1), fmt.Sprintf("d%d", n-50), "d0", "d7", "gone"} {
-		if d := s.recordsOf(to, "docs", name); !d.lost {
-			t.Errorf("%s isn't lost for to: %+v", name, d)
+		if d := s.recordsOf(to, "docs", name); !slices.Equal(d.unread, []string{"tok"}) || d.lost {
+			t.Errorf("%s isn't unread by the token alone for to: %+v", name, d)
 		}
 	}
 	if d := s.recordsOf(to, "docs", "d7"); len(d.rs) != 1 || d.rs[0].rev != "other" {
 		t.Errorf("to's own records of d7: %+v", d)
 	}
-	if d := s.recordsOf(to, "docs", "never"); d.lost || len(d.rs) > 0 {
+	if d := s.recordsOf(to, "docs", "never"); d.lost || len(d.rs) > 0 || len(d.unread) > 0 {
 		t.Errorf("a document from never recorded: %+v", d)
 	}
 }

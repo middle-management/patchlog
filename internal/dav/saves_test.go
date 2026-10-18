@@ -492,6 +492,30 @@ func TestSaveRecordsLost(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 }
 
+// Records lost to the bounds are a 409 until the reload that refusal asks
+// for (§H.4 "records evicted"), not until any read: in local mode every
+// program is one login, and the editor that opened the version pushed
+// out may still hold it after a preview read the file, its save then
+// rebased on the preview's read and written over others' edits.
+func TestSaveRecordsLostPreview(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) {
+		o.MaxFileSize = 16 << 10
+		o.RecordBytes = 64 << 10
+	})
+	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
+	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "the editor's GET").body
+	e.theirs("docs", "x", replace("/b", "theirs"))
+	big := `{"blob": "` + strings.Repeat("z", 14<<10) + `"}`
+	for i := 0; i < 8; i++ {
+		e.expect(e.do("PUT", "/docs/big"+strconv.Itoa(i)+".json", big), 201, "uploads")
+	}
+	e.expect(e.do("GET", "/docs/x.json", ""), 200, "a preview's GET")
+	e.expect(e.do("PUT", "/docs/x.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "the editor's save once its records are gone")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"a": "1", "b": "theirs"})
+}
+
 // A save that writes nothing (the file already reads so) isn't a write:
 // a later save of an older version unchanged isn't an undo of it, which
 // would revert the edit of someone else's it reproduced.

@@ -61,12 +61,17 @@ type docRecs struct {
 	// than it, so the version reloaded is the base of the edit after it.
 	reload uint64
 	// lost: records of the document were dropped to stay within bounds;
-	// until a reload, a save that changes it is refused rather than
-	// rebased on what is left.
+	// a save that changes it is refused rather than rebased on what is
+	// left, until the reload that refusal asks for (reload): a read
+	// before it isn't that reload, since another of the user's programs
+	// (one login in local mode) may still hold the version dropped, and
+	// would save it over others' edits rebased on that read.
 	lost bool
-	// unread are the user's tokens (by id) whose save of the document
-	// was refused and that haven't read it since, at most maxUnread
-	// (refusedSave).
+	// unread are the user's tokens (by id) that must read the document
+	// themselves before they save it without a base, at most maxUnread
+	// (refusedSave): one whose save of it was refused, or one verified
+	// as this user having been another (loseRecords), that hasn't read
+	// it since.
 	unread []string
 }
 
@@ -132,16 +137,19 @@ func (s *Server) storeLocked(p *principal) *recStore {
 }
 
 // loseRecords marks the documents user from (its id) has records of, or
-// had lost records of, as lost in to's records (§H.4 "records evicted"):
-// a token verified as to now, that was from's, may have them open, and
-// to's records don't hold what it opened, so its saves without a base are
-// refused until it reloads, those of documents to has records of too
-// (another of the person's tokens read them as to: other versions than
-// this one's client opened). The marks are records of their own, within
-// to's records' bounds as any, made least recently used first, so that
-// those bounds push out the documents from used longest ago first; one
-// pushed out is remembered as lost (forgotten).
-func (s *Server) loseRecords(from string, to *principal) {
+// had lost records of, as unread by token by in to's records (§H.4
+// "records evicted"): by, verified as to now, was from's, and may have
+// them open, while to's records don't hold what it opened, so its saves
+// of them without a base are refused until it reads them itself
+// (refusedSave), those of documents to has records of too (another of
+// the person's tokens read them as to: other versions than by's client
+// opened). Only by's: to's other tokens saving from what they read as
+// to, or never read, aren't refused, and their reads aren't by's reload.
+// The marks are records of their own, within to's records' bounds as
+// any, made least recently used first, so that those bounds push out the
+// documents from used longest ago first; one pushed out is remembered as
+// lost (forgotten), which a save is refused over until a reload.
+func (s *Server) loseRecords(from string, to *principal, by string) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	src := s.recRoots[from]
@@ -161,9 +169,10 @@ func (s *Server) loseRecords(from string, to *principal) {
 	for _, k := range keys {
 		d, ok := dst.docs.Get(k)
 		if !ok {
+			_, d.lost = dst.forgotten.Get(k)
 			dst.forgotten.Remove(k)
 		}
-		d.lost = true
+		d.unread = withUnread(d.unread, by)
 		dst.docs.Put(k, d, d.cost())
 	}
 	dst.used = s.opt.Now()
@@ -207,7 +216,7 @@ func (s *Server) recordsOf(p *principal, ns, name string) docRecs {
 		_, lost := rs.forgotten.Get(k)
 		return docRecs{lost: lost}
 	}
-	out := docRecs{reload: d.reload, lost: d.lost, rs: make([]record, 0, len(d.rs))}
+	out := docRecs{reload: d.reload, lost: d.lost, unread: d.unread, rs: make([]record, 0, len(d.rs))}
 	for _, r := range d.rs {
 		if !r.at.Before(cut) {
 			out.rs = append(out.rs, r)
@@ -353,8 +362,8 @@ func (s *Server) forgetPath(p *principal, path string) {
 	s.storeLocked(p).paths.Remove(path)
 }
 
-// maxUnread bounds the tokens a document's records keep as refused and
-// not read since.
+// maxUnread bounds the tokens a document's records keep as to read it
+// themselves (docRecs.unread).
 const maxUnread = 8
 
 // refuse marks the principal's records of ns/name refused (Server.refuse)
@@ -377,16 +386,24 @@ func (s *Server) refuse(p *principal, ns, name, by string) {
 	}
 	s.recSeq++
 	d.reload = s.recSeq
-	if !slices.Contains(d.unread, by) {
-		d.unread = append(slices.Clip(d.unread), by)
-		if len(d.unread) > maxUnread {
-			d.unread = d.unread[1:]
-		}
-	}
+	d.unread = withUnread(d.unread, by)
 	before := st.docs.Bytes()
 	st.docs.Put(k, d, d.cost())
 	s.recBytes += st.docs.Bytes() - before
 	s.trimRecordsLocked()
+}
+
+// withUnread returns unread with token by in it, the newest, at most
+// maxUnread, the oldest going first.
+func withUnread(unread []string, by string) []string {
+	if slices.Contains(unread, by) {
+		return unread
+	}
+	unread = append(slices.Clip(unread), by)
+	if len(unread) > maxUnread {
+		unread = unread[1:]
+	}
+	return unread
 }
 
 // readBy notes that token by of p's read ns/name whole (served), or found
@@ -407,17 +424,23 @@ func (s *Server) readBy(p *principal, ns, name, by string) {
 }
 
 // refusedSave is the refusal of a save of ns/name without a base (no
-// If-Match) by a token whose save of it was refused (409) and that hasn't
-// read it since; nil otherwise. The user's records are their tokens', and
-// the reload a refusal asks for drops what was recorded before it, by
-// whichever program reads the document; but the program refused still
-// holds what it had, and may retry the refused upload on its own, the
-// same bytes, as an rclone mount's write-back does (10 s, 20 s, 40 s…
-// later). Rebased on what the other program read, that retry would be
-// written over the edit the refusal was about (§H.4). A token is the
-// program's as far as this server knows: two programs logging in with
-// the same grant (local mode's one password) are one, and the other's
-// read is that one's reload.
+// If-Match) by a token that must read it itself first (docRecs.unread):
+// its save of it was refused (409), or it was verified as this user
+// having been another (loseRecords), and it hasn't read it since; nil
+// otherwise. The user's records are their tokens', and the reload a
+// refusal asks for drops what was recorded before it, by whichever
+// program reads the document; but the program refused still holds what
+// it had, and may retry the refused upload on its own, the same bytes,
+// as an rclone mount's write-back does (10 s, 20 s, 40 s… later).
+// Rebased on what the other program read, that retry would be written
+// over the edit the refusal was about (§H.4). A token is the program's as
+// far as this server knows: two programs logging in with the same grant
+// (local mode's one password) are one, and the other's read is that
+// one's reload. This refusal asks for no reload of the user's: the
+// token's own GET is the one it waits for, answered in full (stale), and
+// a retry re-arming the user's would make another program's next read
+// drop the version it has open, with its next save then rebased on that
+// read alone.
 func (st *reqState) refusedSave(ns, name string) error {
 	if st.ifMatch != "" || st.matchAny {
 		return nil
@@ -429,8 +452,7 @@ func (st *reqState) refusedSave(ns, name string) error {
 	if !refused {
 		return nil
 	}
-	st.refuse(ns, name)
-	return fail(http.StatusConflict, "%s/%s: a save of it by this login was refused, and the login hasn't read it since: someone else changed it since the version this save was made from (a client retrying its upload, maybe), so it isn't written over their changes; reload it here and save your edit again, or name the version you edited (If-Match)", ns, name)
+	return fail(http.StatusConflict, "%s/%s: this login hasn't read it since a save of it by this login was refused, or since it logged in as another user than before (§H.4, §H.7): someone else may have changed it since the version this save was made from (a client retrying its upload, maybe), so it isn't written over their changes; reload it here and save your edit again, or name the version you edited (If-Match)", ns, name)
 }
 
 // reloaded forgets p's records of ns/name, gone in the core, if a save of
@@ -460,7 +482,8 @@ func (s *Server) reloaded(p *principal, ns, name, by string) {
 
 // stale reports whether a GET of ns/name at rev must send it whatever the
 // client's validators say: a save of p's was refused (or its records
-// lost) and the reload is due, or p's newest record is a write of its
+// lost) and the reload is due, token by must read it itself
+// (refusedSave), or p's newest record is a write of its
 // own that rev holds other than written (merged, or given a $nonce),
 // which the client may have filed under rev's tag (davfs2 asks for it
 // with a HEAD after a PUT without one).

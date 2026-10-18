@@ -1147,15 +1147,14 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey 
 	// don't hold what this token's client may have open, so its saves
 	// without a base are refused until it reloads, rather than rebased on
 	// the head (§H.4); whether the token is still kept or went meanwhile
-	// (idUsers).
+	// (idUsers). Marked once it is admitted as that user, as idUsers is
+	// then: a token refused room meanwhile (503) is seen to switch again
+	// at its retry, and marks nothing before.
 	was := ""
 	if tk != nil {
 		was = tk.p.id
 	} else if u, ok := s.idUsers.Get(id); ok {
 		was = u.user
-	}
-	if was != "" && was != key {
-		s.loseRecords(was, p)
 	}
 	if tk != nil && tk.p != p {
 		s.dropTokenLocked(tk)
@@ -1179,6 +1178,9 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey 
 		tk = s.newToken(id, c, sc, named)
 		s.tokens[id] = tk
 		p.toks[tk] = true
+	}
+	if was != "" && was != key {
+		s.loseRecords(was, p, id)
 	}
 	s.idUsers.Put(id, idUser{user: key, vns: v.ns}, 1)
 	tk.verified, tk.vns = now, v.ns
