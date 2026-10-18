@@ -132,16 +132,24 @@ From implementing v0.55, in the core and the tree service.
 
 25. **`/principal` and operator grants** (§7.4, §C.4). §7.4 shows `/principal` to "any grant that
     verifies", operator grants included, but §C.4 makes "Any other request under one" `401`. The
-    reference answers `200`, with `can` the operator grant's block verbs and `roles` `[]`. A
-    gateway keys users by root `sub` and `kid` (§H.7), and `kid`s are free-form, so an operator
-    grant whose `kid` equals a namespace key's passed for that key's user, scratch files included,
-    though every core request under it is `401`; the answer doesn't say which kind of key verified
-    it. The reference's gateway reads the operator key history (`jwks_uri`, §C.4, no grant needed;
-    kept five minutes, the last read used if a read fails, and none read meaning closed) and refuses
-    a grant whose root `kid` is in it and whose chain verifies under that key. *Propose:* list
-    `/principal` among §C.4's exceptions, and say what `can` and `roles` mean there; and either add
+    reference answers `200`, with `can` the operator grant's block verbs and `roles` `[]`. A gateway
+    keys users by root `sub` and `kid` (§H.7), and `kid`s are free-form, so an operator grant whose
+    `kid` equals a namespace key's passed for that key's user, scratch files included, though every
+    core request under it is `401`; the answer doesn't say which kind of key verified it. The
+    reference's gateway reads the operator key history (`jwks_uri`, §C.4, no grant needed; kept five
+    minutes, the last read used if a read fails) and refuses a grant whose root `kid` is in it and
+    whose chain verifies under that key, unless the namespace lists the same key under that `kid`:
+    the core tries the namespace's keys first, so that grant is the namespace's. It tells by reading
+    the namespace head with the grant (`401` means no namespace key verifies it) or, in a public
+    namespace, whose reads ignore a grant, by checking the document's key; while no history has been
+    read, it asks this of every grant. Only a `200` JWK Set counts as a read: a `404` (a proxy that
+    doesn't route `/.well-known`), or a `200` body without a `keys` array (`{}`, a JSON error page),
+    had read as no operator keys, which let every operator grant through. *Propose:* list
+    `/principal` among §C.4's exceptions, and say what `can` and `roles` mean there; either add
     `"operator": true` to the answer, or say in §H.7 that a gateway tells the keys apart by the
-    history.
+    history; say whether a grant signed by an operator key that a namespace document also lists
+    under the same `kid` is a namespace grant; and say that a `jwks_uri` answer without a `keys`
+    array is a failed read, not an empty history.
 26. **`/principal` without authentication** (§1, §7.4). Not specified. The reference answers `200`
     without `principal` and `kid`, with `can` every verb, `roles` `[]` and `writer` as usual, and
     `404` for an absent namespace. *Propose:* say so.
@@ -315,12 +323,17 @@ From implementing v0.55, in the WebDAV gateway (Addendum H), tried with rclone, 
     it has no visible children, which lets a folder be deleted while placements of items the user
     can't read stay in it. The reference neither names nor deletes them, so they become orphans
     (§B.7). *Question:* intended, or should such a folder be `409` without naming them?
-51. **A partial move between namespaces** (§H.5). If the source's delete fails after the copy, the
-    client gets the error and the copy stays; there is no rollback. The reference deletes the source
-    only with `If-Match` naming the revision it copied (in a tree it checks the item's head before
-    the placement goes), so a source that changed since is `409` and stays. *Propose:* say that the
-    delete names the copied revision, that a failed delete leaves the copy, and that a changed
-    source is `409`.
+51. **A partial move** (§H.5). If the source's delete fails after the copy, the client gets the
+    error and the copy stays; there is no rollback. The reference deletes the source only with
+    `If-Match` naming the revision it copied (in a tree it checks the item's head before the
+    placement goes), so a source that changed since is `409` and stays. A grant that may write the
+    target but not delete the source turned a `MOVE` into a copy: one limited to some resources,
+    whose deletes in a tree are `403`, moving one listed file onto another overwrote the target and
+    then failed, leaving both. The reference now checks that a source in a tree can be deleted
+    before it writes anything; a flat source whose grant lacks `delete` can still be copied before
+    the core refuses the delete. *Propose:* say that the delete names the copied revision, that a
+    failed delete leaves the copy, that a changed source is `409`, and that a `MOVE` checks the
+    source can be deleted before writing the target, so a refused `MOVE` changes nothing.
 52. **Locks and dead properties** (§H.6, §H.8). `PROPPATCH` is "refused, or kept in the gateway";
     the reference first answered `200` and kept nothing, which is neither. It keeps values per user
     in memory (1 MiB per user, dropping the least recently set path's rather than refusing), moves
@@ -351,10 +364,15 @@ From implementing v0.55, in the WebDAV gateway (Addendum H), tried with rclone, 
     too, which repeat names the client sent, and answers `POST` to a file with `405` and `Allow`: a
     `POST` had served the bytes without them. *Propose:* say "every response", as 22 does for blob
     URLs.
-57. **Who owns `files.ns`** (§H.2, §H.5). A gateway deletes the item "where the tree owns
-    `files.ns`", but it can't see other catalogs to know whether any trusts the namespace. The
-    reference takes the tree to own it when the item is in `files.ns`. *Propose:* say how ownership
-    is known, or that "owns" means the item is in `files.ns`.
+57. **Who owns `files.ns`, and its flat view** (§H.2, §H.5). A gateway deletes the item "where the
+    tree owns `files.ns`", but it can't see other catalogs to know whether any trusts the namespace.
+    The reference takes the tree to own it when the item is in `files.ns`. Serving that namespace as
+    a writable flat folder beside the tree breaks the tree: a rename there is a copy and a delete
+    (§H.2), so an ordinary file-manager rename or delete tombstones the item and leaves its
+    placement dangling, and tree services don't follow `$successor`. The reference's compose stack
+    served it so; it now serves only the tree over it. *Propose:* say how ownership is known, or
+    that "owns" means the item is in `files.ns`; and that a gateway doesn't serve a tree-owned
+    `files.ns` as a writable flat folder.
 58. **New files: the dry run before the upload** (§H.4). §H.4 lists the upload of a raw file's blob
     first. The reference dry-runs the placement before the upload, so a refused placement uploads
     nothing. *Propose:* say that order.
@@ -365,19 +383,25 @@ From the second round on v0.55, in the WebDAV gateway and the tree service it li
     `GET /ns/{ns}/principal`)" is neither unique nor stable. A `kid` names a key in one namespace's
     document, so `(sub, kid)` is unique only within a namespace, and a gateway serving several, one
     of them controlled by another party, would merge different people into one user. The reference
-    keys users by the namespace that verified the grant as well. A grant that names several then
-    has several candidates, and the answer changes over time: a namespace created, or given the
-    key, later and sorting first made the same token, or the person's re-minted one, someone else,
-    which dropped their scratch files and records, and a save without a tag then reverted another
-    user's edit. The reference asks the namespace that accepted the token before, then the one that
-    first accepted a grant of its root `kid`, then the rest sorted; a token still verified as
-    someone else has its old user's documents marked lost for the new one, so its next save without
-    a tag is `409`. A token narrowed to drop the namespace that verified the person's other tokens
-    is another user. Asking several namespaces, a `401` is also all a gateway learns of an absent
-    one (only an operator grant gets the `404`, §7.4), which it can't tell from a revoked grant.
-    *Propose:* say that a user is the namespace, `sub` and `kid`, with the namespace that first
-    verified the `kid` where a grant names several, and that a token narrowed away from it is
-    another user; or return something stable for the key (a thumbprint) or the user in `/principal`.
+    keys users by the namespace that verified the grant as well. A grant that names several then has
+    several candidates, and the answer changes over time: a namespace created, or given the key,
+    later and sorting first made the same token, or the person's re-minted one, someone else, which
+    dropped their scratch files and records, and a save without a tag then reverted another user's
+    edit. The reference asks the namespace that accepted the token before, then the one that first
+    accepted a grant of its root `kid` (it keeps every served namespace that has, and never drops
+    the first), then the rest sorted. A token now verified as someone else must itself read again
+    each document its old user had, so its next save without a tag is `409`; marking those documents
+    lost for the whole new user had refused the new user's other tokens too. Who each token was
+    verified as is kept past the token, bounded per user: narrowing is offline and free, and each
+    narrowing is a new token the core accepts, so a table bounded only overall let one user push out
+    everyone's entries and hide later switches. A token narrowed to drop the namespace that verified
+    the person's other tokens is another user. Asking several namespaces, a `401` is also all a
+    gateway learns of an absent one (only an operator grant gets the `404`, §7.4), which it can't
+    tell from a revoked grant. *Propose:* say that a user is the namespace, `sub` and `kid`, with
+    the namespace that first verified the `kid` where a grant names several, and that a token
+    narrowed away from it is another user; or return something stable for the key (a thumbprint) or
+    the user in `/principal`. Say too that a token re-verified as another user reloads what it had
+    open, that token alone, and that what a gateway keeps past a token is bounded per user.
 60. **What a user's tokens share** (§H.6, §H.7). §H.6 serves scratch files "only to that user", and
     §H.7 keys all gateway state by user, but a user's tokens aren't equally able: one narrowed by
     `ns`, `can`, rules or `via` may read less than the one that wrote a swap file, or than the one
@@ -385,13 +409,22 @@ From the second round on v0.55, in the WebDAV gateway and the tree service it li
     `kid`" covers re-minted tokens, not narrowed ones. The reference found a token that had dropped
     a namespace reading the user's scratch files in it, and one narrowed by resource rules or `via`
     reading backups of documents the core refused it. It keeps what holds content (scratch files,
-    locks with their owner, dead properties) per user and scope, the scope being a digest of the
-    grant's narrowing blocks without `nbf` and `exp`, so tokens an issuer mints for a person share
-    one, and serves it only to a token whose grant names the namespace. What holds none (guards, a
-    user's own deletes, move-aside flags, records, the writes a listing waits for) stays per user,
-    and what was read (documents, catalog graphs, tree listings, writer blocks) per token.
-    *Propose:* say that scratch content is never served to a token narrower than the one that wrote
-    it, nor outside the namespaces its grant names, and that caches of what was read are per token.
+    locks with their owner, dead properties) per user and scope, and serves it only to a token whose
+    grant names the namespace. The scope is a digest of the root block's rights (all but `kid`,
+    `sub`, `nbf`, `exp`, `at`, `enc` and `signers`) and of the narrowing blocks without `nbf` and
+    `exp`, with `ns`, `can`, `roles` and `groups` taken as sets, so tokens an issuer mints for a
+    person share one in whatever order it lists them. It first left the root block out, so a token
+    issued with fewer rights, such as one limited to some resources, shared the scratch files of the
+    person's fuller one. A scope holding content is never dropped for room (a new scope is `503`
+    with `Retry-After`), and narrowed tokens' scopes are pooled per chain, the first narrowing they
+    descend from, 8 to a chain, so a delegate that narrows its token over and over fills only its
+    own chain. What holds none (guards, a user's own deletes, move-aside flags, records, the writes
+    a listing waits for) stays per user, and what was read (documents, catalog graphs, tree
+    listings, writer blocks) per token. *Propose:* say that scratch content is never served to a
+    token narrower than the one that wrote it, nor outside the namespaces its grant names, and that
+    caches of what was read are per token; say whether a root block with fewer rights, such as one
+    limited to some resources, is still "the same person" as a re-minted token, and that rights
+    compare as sets. Narrowed tokens' scratch files could be pooled per delegation chain.
 61. **Re-checking grants and the writer block** (§H.7, §7.4, §C.5). §H.7 has a gateway re-check a
     grant "at least as often as edge grants expire (§C.5)", but a deployment may set that lifetime
     below the 15-minute cap and a gateway can't learn it. `/principal` is `no-store`, and nothing
@@ -431,31 +464,42 @@ From the second round on v0.55, in the WebDAV gateway and the tree service it li
     The reference leaves them out of both when a tree service is configured, so the fallback lists
     a folder as the service does, and lists them without one. *Propose:* say that a gateway leaves
     out placements of namespaces the catalog doesn't trust.
-66. **A tree service that is behind** (§B.5, §H.3). Nothing says what a listing answers while the
-    service has the catalog but not a content namespace it trusts (a fresh database, a rebuild, a
-    namespace trusted lately). The reference answered `200` with every placement dangling, so
+66. **A tree service that is behind** (§B.5, §H.3, §10). Nothing says what a listing answers while
+    the service has the catalog but not a content namespace it trusts (a fresh database, a rebuild,
+    a namespace trusted lately). The reference answered `200` with every placement dangling, so
     folders listed empty, which a sync tool mirrors as every file deleted and a gateway took for
-    folders it could delete. Listings are now `503 behind` with `Retry-After`, naming the
-    namespace, until the service holds a checkpoint of the catalog and of each trusted namespace. A
-    trusted namespace it can't follow isn't waited for, or every listing would stay `503`: one
-    purged, one skipped for its keys (Addendum E), one the core refuses it (`401`, `403`) or
-    doesn't have (`404`); its placements dangle (§B.7). A catalog that trusts a large new namespace
-    is `503` until the service catches up. The gateway passes the `503` on and deletes no folder
-    meanwhile. *Propose:* say that a tree service answers `503` with `Retry-After` until it holds a
-    checkpoint of every namespace it follows, and what it does about trusted ones it can't follow.
+    folders it could delete. Listings are now `503 behind` with `Retry-After`, naming the namespace,
+    until the service has caught up with the catalog and each trusted namespace: until its follower
+    reaches the head it read when catch-up started. It first took the first checkpoint, one log page
+    in, as caught up, so a large namespace's folders listed with files missing. Writes during
+    catch-up don't move that head, so a busy namespace is caught up too, and a restart on the same
+    database doesn't wait again. A trusted namespace it can't follow as configured isn't waited for,
+    or every listing would stay `503`: one purged, one skipped for keys it can't have (Addendum E),
+    one the core refuses it (`401`, `403`) or doesn't have (`404`); its placements dangle (§B.7)
+    until the core serves it the namespace's head. A key fetch that failed for the moment (a
+    transport error, `5xx` or `429`) is still waited for: taken as unfollowable, it let listings go
+    on with that namespace's placements dangling. A catalog that trusts a large new namespace is
+    `503` until the service catches up. The gateway passes the `503` on and deletes no folder
+    meanwhile. *Propose:* say that a tree service answers `503` with `Retry-After` until it has
+    caught up with every namespace it follows, caught up meaning the head read when catch-up
+    started, not the first checkpoint (§10); and tell a trusted namespace that can't be followed as
+    configured, which isn't waited for, from a temporary key-fetch failure, which is.
 67. **Read-your-writes in a file tool** (§B.5, §A.5). §B.5 has a client add `?min={ns}:{ns_id}` from
     its write's `X-Namespace-Revision`, but not how a file tool keys mins to its writes or how long
     it keeps sending them. The reference notes every entry a write produced, the catalog's and a
-    content namespace's alike, and sends them as `?min` for the catalog and the namespaces it
-    trusts until a listing that carried them returns `200`. It first dropped them after 30
-    seconds, and a service lagging longer brought back a renamed file's old name and dropped its
-    new file, so a sync client deleted the one and uploaded the other again. A `min` the service
-    refuses (`400`) is dropped after one listing from the node documents. There is no way to ask
-    whether a listing already includes a `min` without waiting for it, so the gateway waits a few
-    seconds and then lists from the node documents; and since a `min` naming a namespace the reader
-    can't see is `400` (§A.5; compare 5), a write-only grant can't wait for its own writes.
-    *Propose:* say that a tool keeps each `min` until a listing that carried it returns, and how a
-    grant without `read` waits.
+    content namespace's alike, and sends them as `?min` for the catalog and the namespaces it trusts
+    until a listing that carried them returns `200`, for ten minutes at most. It first dropped them
+    after 30 seconds, and a service lagging longer brought back a renamed file's old name and
+    dropped its new file, so a sync client deleted the one and uploaded the other again. The tree
+    service answers `400` for a `min` naming a namespace it doesn't follow, one it can't follow
+    included, but not which `min` it refused, so the gateway then asks with each namespace's mins
+    separately, drops those refused or reached, and keeps the rest; it had dropped them all after
+    one listing from the node documents. There is no way to ask whether a listing already includes a
+    `min` without waiting for it, so the gateway waits a few seconds and then lists from the node
+    documents; and since a `min` naming a namespace the reader can't see is `400` (§A.5; compare 5),
+    a write-only grant can't wait for its own writes. *Propose:* say that a tool keeps each `min`
+    until a listing that carried it returns, and how a grant without `read` waits; and let a `400`
+    name the `min` refused, so a client needn't ask per namespace.
 68. **Writes against a lagging listing** (§H.3, §H.5). §H.3 lists a tree through the tree service,
     which lags the core and doesn't wait for other users' writes through the same gateway, and
     says nothing of writes taking names from it. Resolving a path to what its folder listed, a
@@ -503,6 +547,19 @@ From the second round on v0.55, in the WebDAV gateway and the tree service it li
     before any upload, and a flag's bound (`-max-file-size`, `-max-raw-size`) is named by the
     flag, the bytes read when it was passed being a lower bound, as in 32. *Propose:* say that a
     gateway names its own bounds in the same shape, with a key of its own.
+
+From two more rounds on v0.55, in the same gateway.
+
+72. **Whose read is the reload** (§H.4). "`409` until the user reloads it" doesn't say whose read
+    counts when several programs share a login, as every program does in local mode. When any read
+    by the user counted, a preview pane's read after an editor's `409` let the editor's retry, a
+    save without a base, overwrite others' edits; and a refused retry that re-armed the user's
+    reload made the next read by any program drop records another program still had open, whose
+    save then overwrote too. The reference asks the refused token itself to read the file in full (its
+    conditional `GET` is answered `200`, not `304`), and a refusal re-arms nothing for the user's
+    other tokens. Programs sharing one grant still can't be told apart. *Propose:* "`409` until the
+    reload that `409` asks for", a full read by the token refused, and say that programs sharing one
+    grant count as one.
 
 ## Settled in v0.55
 
