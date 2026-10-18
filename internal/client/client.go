@@ -105,6 +105,27 @@ func WithSourceAuthorization(grants ...string) Option {
 // WithAuthor sends X-Author on every request (development mode only, §7.2).
 func WithAuthor(name string) Option { return func(c *Client) { c.author = name } }
 
+// WithTransport sends requests through wrap of the transport they went
+// through (http.DefaultTransport for none), on a copy of the HTTP client:
+// to see the answers, such as the X-Namespace-Revision of the writes a
+// consumer makes, wherever in it they are made.
+func WithTransport(wrap func(http.RoundTripper) http.RoundTripper) Option {
+	return func(c *Client) {
+		cp := *c.hc
+		rt := cp.Transport
+		if rt == nil {
+			rt = http.DefaultTransport
+		}
+		cp.Transport = wrap(rt)
+		c.hc = &cp
+	}
+}
+
+// Bearer is the grant the client sends (WithBearer), "" for none: what a
+// consumer passes on to a service that checks the same grant, such as a
+// tree service (§B.5, §H.7).
+func (c *Client) Bearer() string { return c.bearer }
+
 // New returns a client for the deployment at baseURL (e.g.
 // "https://cms.example"). The origin (§G.1) is fetched lazily by Origin.
 // Requests go over telemetry's own connection pool, not
