@@ -41,7 +41,8 @@ type Head struct {
 	// Successor is, for a Tombstoned head, where the resource moved as the
 	// 410 names it (§8.1): a bare name in the same namespace or
 	// /r/{ns}/{name} (ResolveSuccessor). Servers name it only outside
-	// sealed and e2e namespaces; Moved reads the document at Last there.
+	// sealed and e2e namespaces; Moved reads the document at Last there,
+	// and E2E.Moved always does.
 	Successor string
 }
 
@@ -98,13 +99,17 @@ func ResolveSuccessor(ns, successor string) (ns2, name2 string, ok bool) {
 	return ns, successor, true
 }
 
-// Moved reports where a tombstoned resource moved (§8.1, §10): the
+// Moved reports where a tombstoned resource moved (§8.1, §11): the
 // successor h, its head, names, or, where the 410 carries none, as in
 // sealed namespaces, the $successor of the document at h.Last, read with
-// the client's keys. "" if h isn't tombstoned or nothing names one. An
-// e2e namespace's document is folded by E2E.Moved instead. A client
-// offers the successor as a link, and follows it on its own only into a
-// namespace it already trusts (§10).
+// the client's keys. "" if h isn't tombstoned or nothing names one. The
+// 410's successor is as authentic as any plaintext answer, the server's
+// or a cache's: a conforming server names none in a sealed namespace, so
+// a client that trusts caches there with no more than sealed content reads
+// the document itself (Doc, SuccessorOf). An e2e namespace's document is
+// folded by E2E.Moved instead, which ignores the 410's. A client offers
+// the successor as a link, and follows it on its own only into a namespace
+// it already trusts (§11).
 func (c *Client) Moved(ctx context.Context, ns, name string, h *Head) (string, error) {
 	if h == nil || h.State != Tombstoned {
 		return "", nil

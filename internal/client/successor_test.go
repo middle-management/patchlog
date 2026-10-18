@@ -75,6 +75,13 @@ func TestSuccessor(t *testing.T) {
 	if m := must(x.Moved(ctx, "e", "d", h)); m != "d2" {
 		t.Fatalf("e2e moved to %q", m)
 	}
+	// A successor in an e2e 410 is made up by the server or a cache: the
+	// verified document says where it moved.
+	forged := *h
+	forged.Successor = "/r/attacker/inbox"
+	if m := must(x.Moved(ctx, "e", "d", &forged)); m != "d2" {
+		t.Fatalf("e2e moved to %q, as a forged 410 says", m)
+	}
 	if _, err := x.Validate(ctx, map[string]any{"$schema": ref, "n": 2, "$successor": "/r/x/y", "$nonce": seal.NewNonce()}); err != nil {
 		t.Fatalf("E3 validation: %v", err)
 	}

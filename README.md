@@ -1841,7 +1841,8 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   the keyring's and snapshots included, carries `Last-Modified` or `Repr-Digest`
   (`If-Modified-Since` is ignored), `/heads` entries carry no `created`, `size` or `digest`,
   a tombstoned head's `410` names no `successor` (`client.E2E.Moved` folds the document at
-  `last` for its `$successor`), and `…/raw` is `404 not_offered` (§7.1, §7.4, §8.1).
+  `last` for its `$successor`, and ignores one a `410` names), and `…/raw` is `404
+  not_offered` (§7.1, §7.4, §8.1).
 - **The keyring.** The reserved resource `keyring` holds `seal.Keyring` in plaintext (wrapped
   epoch keys and public X25519 JWKs only). It is the only plaintext resource: written by key
   holders with ordinary writes, checked like any document plus `seal.ParseKeyring`, `ns` equal
@@ -2481,8 +2482,10 @@ older instance during one, lack them (see [Postgres](#postgres-d8)'s upgrade not
   included, and cached with the head. A `[]` restore brings the document back with its
   `$successor`; a client restoring a moved resource also removes it. Signatures, rules on
   `/doc`, merges, imports, bundles and remote branches carry it as any content. The Go client
-  reads it as `Head.Successor`; `Client.Moved` (and `E2E.Moved`) falls back to the document at
-  `last` where the `410` names none, and `client.ResolveSuccessor` resolves a bare name.
+  reads it as `Head.Successor`; `Client.Moved` falls back to the document at `last` where the
+  `410` names none, `E2E.Moved` always folds that document, verified, and ignores a successor
+  the `410` names (none comes from a conforming server at E3, which is outside the trust
+  boundary), and `client.ResolveSuccessor` resolves a bare name.
 - **Whole documents** (§6.6). An append or restore whose first operation other than `test` is
   a root `replace` or `add` may be as large as `documentSize`, as a create may, so a document is
   overwritten on purpose in one request (§11.3); at E3 every create and restore may, and no

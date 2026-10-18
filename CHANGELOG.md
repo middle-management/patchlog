@@ -56,8 +56,10 @@ raw documents, moves, whole-document appends and `logPageBytes` are new.
 - **Moves** (§8.1): a tombstoned head's `410` carries `successor`, copied from the last
   document's well-formed `$successor` (a bare name or `/r/{ns}/{name}`), outside sealed and e2e
   namespaces, read through branches and remote branches' mirrors. Client: `Head.Successor`,
-  `Client.Moved` and `E2E.Moved` (which read the document at `last` where the `410` names
-  none), `client.SuccessorOf`, `client.ResolveSuccessor`.
+  `Client.Moved` (which reads the document at `last` where the `410` names none),
+  `E2E.Moved` (which always folds that document and ignores a `410`'s successor, since the
+  server is outside the trust boundary at E3), `client.SuccessorOf`,
+  `client.ResolveSuccessor`.
 - **`serve -log-page-bytes`**, and `LogPageBytes` in `core.Limits` and `clienttest.Options`.
 
 **Fixes:**
