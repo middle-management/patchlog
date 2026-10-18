@@ -1910,7 +1910,11 @@ anonymous readers of a public catalog, `/{catalog}/g/{gs}/at/{at}/…` for reade
 the subject set before the checkpoint (v0.51, §B.11.5); the old `/{catalog}/at/{at}/g/{gs}/…` is
 moved there with a `301`. Cycles and depth over 64 show up under `problems`. `-catalog` is repeatable (or comma-separated): each catalog gets its own
 service and database (`-db` with `{catalog}` replaced, or `-{catalog}` added before the
-extension) behind one origin, and `/_status` covers them all (`?catalog=` for one).
+extension) behind one origin, and `/_status` covers them all (`?catalog=` for one). Listings
+are `503 behind`, with `Retry-After`, until the service holds a checkpoint of the catalog and of
+every namespace it trusts (started with a fresh database, or trusting one lately), rather than
+show every placement of a namespace not yet followed as missing; one it can't follow (purged,
+skipped for its keys, refused or absent at the core) isn't waited for.
 
 Listings are kept like the search index's results (§A.4, §B.5, v0.49): every listing computed,
 the one at the `at` a redirect names included, is kept in memory for about a minute (at most
@@ -2231,12 +2235,18 @@ core only through its public API, and keeps nothing but memory caches.
   sent upstream as `Authorization: Bearer` (the user name is ignored), so the core decides what
   each user may read and write, and the revisions are the grant's subject's. Nothing is kept for
   a grant before the core has accepted it: `GET /ns/{ns}/principal` (§7.4) in a served namespace
-  the grant names (the first of the first three, sorted, that accepts it), which checks only that
-  the grant names the namespace and verifies, key scope and revocation included, the same in a
-  public namespace (whose reads ignore a bad grant) as in a private one, so a grant limited to
-  some resources, or without `read`, is accepted too (§H.7 "Limited grants"). Its `401` is no
-  usable grant; a `410` there is a purged namespace, and a `404` one that doesn't exist (to an
-  operator grant): accepted nowhere else, the grant is answered `410` or `404` (§H.4 "Answers").
+  the grant names, at most three, until one accepts it: first the one that accepted this token
+  before, then the one that first accepted a grant of its root `kid`, then the rest, sorted, so a
+  namespace created or given the key later doesn't make the same person someone else. It checks
+  only that the grant names the namespace and verifies, key scope and revocation included, the
+  same in a public namespace (whose reads ignore a bad grant) as in a private one, so a grant
+  limited to some resources, or without `read`, is accepted too (§H.7 "Limited grants"). Its
+  `401` is no usable grant; a `410` there is a purged namespace, and a `404` one that doesn't
+  exist (to an operator grant): accepted nowhere else, the grant is answered `410` or `404` (§H.4
+  "Answers"). A grant an operator key signed (§C.4), which `/principal` verifies too and which
+  authorizes nothing this server does, is `401`: its root `kid` names a key of the deployment's
+  operator key history (`jwks_uri`, read without a grant and kept 5 minutes) under which its
+  signature verifies, so a namespace key that carries the same `kid` is never mistaken for it.
   It is asked again every 5 minutes (`VerifyEvery`, at most the 15 minutes edge grants live,
   §C.5.2), or at the next request after the core answered it `401`, so a revoked grant, or one
   its key's scope no longer covers, is refused within that time. A refused token loses its
@@ -2253,20 +2263,28 @@ core only through its public API, and keeps nothing but memory caches.
   key verified it (a kid names a key of one namespace's document, so the same kid in another
   served namespace is someone else's), never the token: every token of one person, minted again
   or attenuated offline, is the same user, whose own delete is theirs, not someone else's, and
-  whose records, guards, temporary files and locks carry over (a token attenuated to leave out
-  the namespace that verified the others is verified in another, and is another user). It keeps
+  whose records and guards carry over (a token attenuated to leave out the namespace that
+  verified the others is verified in another, and is another user; a token verified again as
+  another user, the namespace that verified it refusing it now, has its saves without a base
+  refused until it reloads). Temporary files, locks and dead properties, which may hold what one
+  token read (a document's backup copy, an editor's swap file with its text), carry over between
+  the tokens the issuer minted, but a token attenuated offline (a narrowing block with another
+  `ns`, `can`, `rules` or a `via`: a delegate) has its own, and no token reaches the temporary
+  files of a namespace its grant doesn't name (§H.6 "served only to that user"). It keeps
   temporary files and locks (a lock lasts at most an hour, `Infinite` too, its owner is at most
   1 KiB, and a user holds at most 256, then `507`), dropped with the user (in a gateway, after an
-  hour idle, or to make room: at most 256 users, `MaxPrincipals`, and 8 tokens a user,
-  `MaxTokensPerPrincipal`, so more tokens push out only that user's, which are verified again when
-  they come back; never one with a request in flight); and the versions of each document the user
-  was served or wrote, the bases of their saves (below), with the tombstones and restores they
-  wrote, kept for a day apart from the rest, within 128 MiB for all users, where the user keeping
-  the most gives way first, so one user's uploads don't push out another's records (a write
-  keeps the bytes it sent only where they read otherwise rendered, and not when much larger than
-  the rendering, as white space padding would be). A restart loses all of it. What is read with
+  hour idle, or to make room: at most 256 users, `MaxPrincipals`, and 8 tokens and 8 narrowings
+  a user, `MaxTokensPerPrincipal`, so more tokens push out only that user's, which are verified
+  again when they come back; never one with a request in flight); and the versions of each
+  document the user was served or wrote, the bases of their saves (below), with the tombstones
+  and restores they wrote, kept for a day apart from the rest, within 128 MiB for all users,
+  where the user keeping the most gives way first, so one user's uploads don't push out
+  another's records (a write keeps the bytes it sent only where they read otherwise rendered,
+  and not when much larger than the rendering, as white space padding would be). A restart
+  loses all of it. What is read with
   a grant is kept per token, since another token of the same user may read less: the writer
-  settings, namespace documents, catalog trees and tree-service listings below. Rendered
+  settings, namespace documents, catalog trees and tree-service listings below, the last two
+  within `-cache-size` over every token, the least recently used going first. Rendered
   documents are cached by revision id for everyone, and handed to a token only after it read the
   head, or the listing, with its own grant.
 - `-password-file` and `-bearer-file` readable by others than their owner log a warning.
@@ -2702,13 +2720,23 @@ only.
   takes them; `TreeService` and `TreeServices` in `dav.Options`), a folder is listed from the tree
   service's `children` listing, read with the request's grant passed through as its bearer (in local
   mode `-bearer`'s), which the tree service checks and filters the listing by (§B.11.5): every page
-  of it, at most 10 pages of 1000 entries, and a folder larger is `403`, never listed cut short. A
+  of it, at most 10 pages of 1000 entries, and a folder larger is `403`, never listed cut short;
+  its files are opened, written, moved and deleted by name all the same, found in the node
+  documents with only the items of the name asked for read. A
   file's ETag is its entry's `head`, and its size, type and time the `file` metadata the tree
   service adds (§H.3), so a folder lists in one request and no item is read for it; a placement
   whose `file` is sealed (an item of a sealed namespace) isn't listed, and one without `file`, or
   without its `modified`, is read from the core as above (an end-to-end namespace's item isn't
   listed). Names are given as above, the same duplicates, escapes and case folding, and a path
-  resolves to what its folder lists, every folder on it listed. Placements of a namespace the
+  resolves to what its folder lists, every folder on it listed. A write (PUT, DELETE, MOVE, COPY,
+  MKCOL) checks what the listing named against the node documents, read again if read before the
+  request: a name another user renamed or moved a moment ago, or a name a file was just given,
+  which the listing doesn't show yet (it doesn't wait for other users' writes), is resolved from
+  the node documents instead, as without a tree service, so a DELETE or MOVE of a renamed file's
+  old name is refused and touches nothing, and a PUT of a name a sibling has now is that
+  sibling's, never a second file by its name. A placement is deleted, and a node renamed or
+  moved, only as its document was read: changed since by another program, it is a `409` or `404`.
+  Placements of a namespace the
   catalog doesn't trust are dangling (§B.5): the tree service doesn't list them, and nor does this
   server, from the node documents either, where a catalog has a tree service. Implicit placements
   (§B.9, `-self-placing`), which no node holds, aren't listed. A catalog whose `catalog.title` is
@@ -2721,16 +2749,23 @@ only.
   and writes, which still read the node documents, are refused it. The tree service unreachable is
   `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
   `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
-  as the core's are (in local mode a `401` refuses `-bearer`: `502`, naming the tree service).
-- **Read-your-writes** through a tree service, which lags the core. For 30 seconds after a user's
-  write through this server (a new file or folder, a rename, a move, a delete, an edit, wherever it
-  is made, with any of their tokens), that user's listings of a tree carry `?min={ns}:{ns_id}` for
-  each namespace entry the write produced in the catalog or a namespace it trusts (the write's
-  `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5);
+  as the core's are (in local mode a `401` refuses `-bearer`: `502`, naming the tree service). A
+  tree service answers `503` behind until it holds a checkpoint of every namespace the catalog
+  trusts, not only of the catalog (started with a fresh database, rebuilt, or trusting one
+  lately), rather than list every folder empty; the gateway answers that `503` too.
+- **Read-your-writes** through a tree service, which lags the core. After a user's write through
+  this server (a new file or folder, a rename, a move, a delete, an edit, wherever it is made, with
+  any of their tokens), that user's listings of a tree carry `?min={ns}:{ns_id}` for each namespace
+  entry the write produced in the catalog or a namespace it trusts (the write's
+  `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5),
+  until a listing that carried them came back (at most the last 4 entries of 64 namespaces a user);
   other users' listings don't wait. If it hasn't caught up within `-tree-wait` (3 s; the tree
-  service's own `-min-wait`, 2 s, answers sooner), or refuses a `min`, the folder is listed from the
-  node documents instead, as without a tree service, and so are the user's listings of that tree for
-  5 seconds; a grant that can't read them gets `503` with `Retry-After`.
+  service's own `-min-wait`, 2 s, answers sooner), the folder is listed from the node documents
+  instead, as without a tree service, and so are the user's listings of that tree for 5 seconds,
+  however long the tree service lags: their new file stays listed, and a file they renamed doesn't
+  come back by its old name; a grant that can't read the node documents gets `503` with
+  `Retry-After`. A `min` the tree service refuses (`400`) is listed from the node documents once,
+  and not asked for again.
 - **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
   random base32 characters), and its placement titled with the name, under its folder: one
   `parents` entry, ordered after the folder's last ordered child, so new files list last, and
@@ -2767,9 +2802,10 @@ only.
   nothing, as is one whose item changes between that check and its delete: the placement is
   restored.
 - **Delete a folder**: only one without visible children (`409`, naming them, and nothing hidden
-  from the user); placements whose items are gone (dangling, §B.3) aren't contents, and are
-  deleted first; the user's scratch files in it go with it. Deletes never recurse, and the tree's
-  top isn't deleted (`403`).
+  from the user), as the node documents, read for it, have them, never a tree service's listing,
+  which lags (a file someone put in it a moment ago); placements whose items are gone (dangling,
+  §B.3) aren't contents, and are deleted first; the user's scratch files in it go with it. Deletes
+  never recurse, and the tree's top isn't deleted (`403`).
 - Writes through a placement go only to items in a namespace the catalog trusts (`catalog.trust`,
   §B.3) or that is served with `-ns`, never to a catalog's own nodes (`403`): a local mode's grant
   may reach namespaces the server wasn't set up to serve.

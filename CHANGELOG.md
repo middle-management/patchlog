@@ -145,16 +145,20 @@ service's listings.
     (§H.7).
   - **Listings through the tree service** (§H.3, §H.7; `-tree-url [CATALOG=]URL`, as `serve`'s,
     and `-tree-wait`): a tree's folder is listed from the tree service's `children`, every page
-    (a folder over 10 pages of 1000 is `403`, never cut short), with the request's grant passed
-    through as bearer, which the tree service filters by (§B.11.5), so a grant limited to some
-    resources lists a tree; sizes, types and times come from its `file` metadata and ETags from
-    its heads, so no item is read; names and path resolution are the node documents',
-    placements whose `file` is sealed aren't listed, and the tree service down is `502`/`503`,
-    never an empty folder. A user's listings after their own writes, through any of their
-    tokens, wait for the entries those produced (`?min=`, keyed by the writes'
-    `X-Namespace-Revision`) up to `-tree-wait`, then read the node documents. Without a tree
-    service, folders are listed from the node documents as before. Client:
-    `client.WithTransport`, `Client.Bearer`.
+    (a folder over 10 pages of 1000 is `403` as a listing, never cut short, and its files are
+    still reached by name, from the node documents), with the request's grant passed through as
+    bearer, which the tree service filters by (§B.11.5), so a grant limited to some resources
+    lists a tree; sizes, types and times come from its `file` metadata and ETags from its heads,
+    so no item is read; names and path resolution are the node documents', placements whose
+    `file` is sealed aren't listed, and the tree service down, or not caught up with a trusted
+    namespace, is `502`/`503`, never an empty folder. Writes check what a listing named against
+    the node documents and resolve the path from them where it lags (a name renamed, moved or
+    just given by another user), so a stale name is never deleted, moved or created twice, and a
+    folder's emptiness is the node documents'. A user's listings after their own writes,
+    through any of their tokens, wait for the entries those produced (`?min=`, keyed by the
+    writes' `X-Namespace-Revision`) until a listing that waited came back, each up to
+    `-tree-wait`, then read the node documents. Without a tree service, folders are listed from
+    the node documents as before. Client: `client.WithTransport`, `Client.Bearer`.
   - **Saves** (§H.4): the base is the revision `If-Match` (or the `If` header's first applicable
     entity tag) names, else the closest of the versions the user was served whole or wrote in
     the last day; the edit from it is rebased on the head, others' edits since kept, overlapping
@@ -178,8 +182,8 @@ service's listings.
     batch creating the new resource and deleting the old with `$successor`. A file moved to a
     scratch name stays (an editor's backup).
   - **Clients as they are** (§H.6): editors' and systems' own files (`.DS_Store`, `._*`, `*.swp`,
-    `*~`, `.goutputstream-*`, …) and apps' folders stay in memory per user, and nothing else can
-    be at the root; locks and dead properties are kept in memory, bounded, and a DELETE or MOVE
+    `*~`, `.goutputstream-*`, …) and apps' folders stay in memory per user and narrowing, reached
+    only by a token whose grant names their namespace, and nothing else can be at the root; locks and dead properties are kept in memory, bounded, and a DELETE or MOVE
     drops the locks on its path; a write to a path the user deleted within 30 seconds restores the file
     rebased on its last live document, and a refused one undoes that DELETE; a refused PUT, or a
     refused MOVE onto a file, sets a guard that refuses the user's DELETE of the path within 10
@@ -189,21 +193,32 @@ service's listings.
     mode (`-gateway`) sends each request's Basic password upstream as its grant and needs TLS
     beyond loopback. It verifies a grant with `GET /ns/{ns}/principal` in a served namespace the
     grant names, keeps nothing for one the core hasn't accepted (`401`; a purged namespace is
-    `410`, an absent one `404` to an operator grant), asks again every 5 minutes (at most the
-    15 minutes edge grants live) or after the core's `401`, and keys its state by the root `sub`
-    and `kid` `/principal` names (with the namespace that verified it), never the token, so
-    every token of one person, minted again or attenuated offline, shares their records,
-    guards, scratch files, locks, own tombstones and the writes their tree listings wait for. A
-    refused token loses its access and has the user's other tokens asked again; the user's
-    state stays for their accepted tokens. At most 256 users and 8 tokens a user
-    (`MaxPrincipals`, `MaxTokensPerPrincipal`). Writer settings (frozen, nonces, level, limits
-    in force) come from `/principal`'s writer block, which a grant limited to some resources
-    gets too, kept per token for 30 seconds and asked again after a refusal over one of them;
-    what is read with a grant (documents, catalog trees, tree-service listings) stays per token.
+    `410`, an absent one `404` to an operator grant; one an operator key signed `401`, told by
+    its signature under the operator key history at `jwks_uri`), asks again every 5 minutes (at
+    most the 15 minutes edge grants live) or after the core's `401`, and keys its state by the
+    root `sub` and `kid` `/principal` names (with the namespace that verified it, asked first
+    again for the same token and for its kid), never the token, so every token of one person,
+    minted again or attenuated offline, shares their records, guards, own tombstones and the
+    writes their tree listings wait for; scratch files, locks and dead properties are shared by
+    the tokens the issuer minted, and a token attenuated offline (another ns, can, rules, a
+    via) has its own. A refused token loses its access and has the user's other tokens asked
+    again; the user's state stays for their accepted tokens. At most 256 users, 8 tokens and 8
+    narrowings a user (`MaxPrincipals`, `MaxTokensPerPrincipal`). Writer settings (frozen,
+    nonces, level, limits in force) come from `/principal`'s writer block, which a grant
+    limited to some resources gets too, kept per token for 30 seconds and asked again after a
+    refusal over one of them; what is read with a grant (documents, catalog trees, tree-service
+    listings) stays per token, the trees and listings within `-cache-size` over every token.
   - Not yet: writes in a tree through the tree service alone, catalog-issued grants, text
     merges, history, live invalidation, batches.
 
 **Fixes:**
+- **A tree service's listings are `503 behind` until it holds a checkpoint of every namespace
+  the catalog trusts** (§B.5, §H.3), not only of the catalog. Started with a fresh database,
+  rebuilt, or trusting a namespace lately, it answered every folder with its placements of that
+  namespace missing, so folders listed empty, which a sync tool mirrors as deleted files. A
+  trusted namespace it can't follow (purged, skipped for its keys, refused or absent at the
+  core) isn't waited for. A catalog trusting a large new namespace now lists nothing until the
+  service has caught up with it.
 - **Stored listings of the tree service are keyed by the reader's shape** (§A.4, §E.2.6), as
   kept ones are: by URL and what the reader reads whole. A public namespace that turns private
   moves neither the anonymous URL space nor a `gs`, so until the service's `at` moved, readers
