@@ -232,8 +232,8 @@ curl -sI -H 'X-Cache-Debug: 1' http://localhost:8080/r/demo/derby -L | grep -i -
 
 **Purging.** `patchlog serve`, `index` and `tree` take `-purge-url URL` (repeatable; compose
 passes `http://cdn:8080/`). Without it purges are only logged, as before. With it, each tag purge
-(resource purge `r:{ns}/{name}`, namespace purge `ns:{ns}`, the services' `idx:{ns}` and listing
-tags) becomes
+(resource purge `r:{ns}/{name}` and `heads:{ns}`, namespace purge `ns:{ns}`, the services'
+`idx:{ns}` and listing tags) becomes
 
 ```
 PURGE / HTTP/1.1
@@ -704,10 +704,22 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   see [Reference extensions](#reference-extensions-beyond-the-spec)), on SQLite and Postgres.
   They are nullable without a default, so adding them changes only the catalog, instantly
   whatever the table's size, though on Postgres the `ALTER TABLE` waits for transactions
-  using `revisions` and holds back others while it does. Nothing is backfilled. Instances of
-  the previous release keep working against the migrated schema (they name their columns),
-  so a rolling upgrade is safe; heads they write, like those from before, are listed without
-  `size` and `digest` until written again.
+  using `revisions` and holds back others while it does. Nothing is backfilled. From then on
+  they take about 40 bytes (SQLite; 41 to 48 on Postgres) on each revision a write leaves as
+  a head outside sealed and e2e namespaces: for small documents written one revision at a time
+  that is nearly every revision, and grew the `revisions` table by about 40% (the whole
+  database by 9%) in a test of 20,000 such writes. Instances of the previous release keep
+  working against the migrated schema (they name their columns), so a rolling upgrade is
+  safe, with two leftovers. Heads they write, like those from before, are listed without
+  `size` and `digest` until written again. And a purge they run nulls only the patch sets: the
+  purged resource's two columns stay (never listed, since a purged resource is listed as a
+  purge, but in an encrypted-at-rest namespace a plaintext hash that destroying the data key
+  doesn't remove), and cached `/heads` pages aren't purged (`heads:{ns}`). Once no older
+  instance runs, clear the columns with `UPDATE revisions SET size = NULL, digest = NULL WHERE
+  digest IS NOT NULL AND res IN (SELECT res FROM resources WHERE state = 2)` (2: purged).
+  Responses cached before the upgrade, or served by an older instance during it, have none of
+  the extensions: `/heads` pages lack the new fields and revisions `Last-Modified` and
+  `Repr-Digest` until those copies expire or are purged, so clients treat them all as optional.
 - **Keep transactions short.** The tailer can't move past the oldest running transaction in the
   database (its `xmin`), so one left open holds back every instance's wake-ups: set
   `idle_in_transaction_session_timeout` (e.g. `ALTER ROLE patchlog SET
@@ -1696,7 +1708,10 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
     `…/rev/{id}/log?since={prev}`), whose plaintext is a one-element array.
   - Clear: URLs, status codes, `ETag`, `X-Revision`, `X-Config-Revision`, `X-Namespace-Revision`,
     `X-Cursor`, error bodies (including `410` bodies with `tombstone`/`last`/`horizon`), and the
-    metadata listings `/heads` and `/branches` (names and ids are in URLs anyway, §E.2.2).
+    metadata listings `/heads` and `/branches` (names and ids are in URLs anyway, §E.2.2). So
+    are revisions' `Last-Modified` and `/heads` entries' `created`, reference extensions that
+    show the created times the logs serve sealed (timing stays in the clear, §E.2.2; see
+    [Reference extensions](#reference-extensions-beyond-the-spec)).
     Write responses go only to the writer (`no-store`) and stay plaintext.
 - **Keys.** Each (namespace, epoch) has a 256-bit random epoch key, wrapped by the key store in
   `epoch_keys`. `encryption.epoch` starts at 1 (absent means 1; a new namespace or branch may
@@ -2379,15 +2394,21 @@ curl -L "$B/ns/matches/log"                 # the namespace log
 Three additions beyond spec v0.52, proposed to it, for file-style and sync clients (a WebDAV
 gateway, for one), which compare their copies with what a deployment holds without fetching
 documents. They are additive: a client that doesn't know them is unaffected, and one that
-does treats each as optional.
+does treats each as optional, as responses cached before an upgrade, or served by an older
+instance during one, lack them (see [Postgres](#postgres-d8)'s upgrade notes).
 
 - **`Last-Modified`** on every `200` of `GET` and `HEAD /r/{ns}/{name}/rev/{id}`: the
   revision's `created` time as an HTTP-date (to the second). A revision is immutable, so it
-  never changes. Sealed and e2e namespaces send it too (an e2e prune's snapshot is such a
-  `200`; other e2e revisions answer the fold redirect): timing is public at every level
-  (§E.4). Browsers may read it (it is CORS-safelisted). The origin doesn't evaluate
-  `If-Modified-Since`: `If-None-Match` with the id validates (`304`), and a CDN answers
-  `If-Modified-Since` from its own copy.
+  never changes, except that it is never later than the serving instance's clock (RFC 9110
+  §8.8.2.1): created times come from the writing instance's clock, or a remote base's
+  entries. Sealed and e2e namespaces send it too (an e2e prune's snapshot is such a `200`;
+  other e2e revisions answer the fold redirect). At e2e the log already serves created times
+  in the clear, but a sealed namespace's logs serve them sealed, so there this header and
+  `created` on `/heads` (below) show what they hide: the spec leaves timing in the clear at
+  E2 (§E.2.2, §E.4), and edge grants hide it from those who can't read (§E.2.5). Browsers may
+  read it (it is CORS-safelisted). `If-Modified-Since` no earlier than it is a `304` (CORS
+  allows the header), as is `If-None-Match` with the id, which decides when both are sent
+  (RFC 9110 §13.2.2).
 - **`Repr-Digest: sha-256=:<base64>:`** (RFC 9530) on the same `200`s of a plain document: the
   sha-256 of exactly the bytes served, the canonical document. Never with a JWE (sealed
   namespaces, e2e snapshots), whose plaintext digest would be what the sealing hides; an e2e
@@ -2402,24 +2423,33 @@ does treats each as optional.
   encryption, and its padding, hide: §E.2.2, §E.4), and never for tombstones. A branch lists
   its base's values for what it reads through (the same document), a remote branch its base's
   (§G.3). A head pruned since keeps them, as it keeps its target (`/rev/{target}` is then
-  `410`); a purge lists a purge, with none. The Go client has them as `HeadItem.Created`,
+  `410`); a purge lists a purge, with none, and purges the cached `/heads` pages of every
+  namespace it reaches, which carry `heads:{ns}` besides `ns:{ns}` (§9): the names and ids they
+  list survive a purge (§8.3), but a document's size and digest shouldn't. Browsers' copies
+  remain until their `max-age` expires. The Go client has them as `HeadItem.Created`,
   `Size` and `Digest`, a document's headers as `Doc.Modified` and `Doc.Digest`, and
   `client.ReprDigest(b)` computes the form to compare a copy with.
 
 `size` and `digest` are stored, not computed, so a listing reads no document: the write that
 leaves a revision as a resource's head stores its document's length and sha-256 with it
-(`revisions.size`, `digest`), from the canonical bytes the write already holds. That is step
-7 for every resource write and batch (group commits, merges, rebases and bundle imports write
-batches), and the chains remote branches and mirrored schemas insert (§G.3). Intermediate
-steps of a multi-step item, which no entry makes a head, tombstones and e2e content (the
-server has no document, §E.3) store none. Purges clear them with the patch sets; prunes keep
-them, as they keep ids, created times and gestures (§8.6), and a restore from an archive
-moves no head. Heads written before the upgrade, or by an older instance during a rolling
-one, have none: they are listed without `size` and `digest` until the resource is written
-again. Nothing fills them in later: a `/heads` page is immutable and cached for a year, so
-values appearing in a listing already served would give one URL two answers; a backfill
-would have to fold the document of every head at every `ns_id`, not just the current ones;
-and while older instances still write, no backfill could finish. `created` was always stored.
+(`revisions.size`, `digest`), from the canonical bytes the write already holds, and a read of
+that revision serves the stored digest as its `Repr-Digest` instead of hashing again. That is
+step 7 for every resource write and batch (group commits, merges, rebases and bundle imports
+write batches), and the chains remote branches and mirrored schemas insert (§G.3).
+Intermediate steps of a multi-step item, which no entry makes a head, tombstones, and
+sealed and e2e namespaces store none: they never list them, and a level can't be lowered
+(at e2e the server has no document anyway, §E.3). Purges clear them with the patch sets;
+prunes keep them, as they keep ids, created times and gestures (§8.6), and a restore from an
+archive moves no head. Heads written before the upgrade, or by an older instance during a
+rolling one, have none: they are listed without `size` and `digest` until the resource is
+written again. Nothing fills them in later: a `/heads` page is immutable and cached for a
+year, so a listing already served never gains them; a backfill would have to fold the
+document of every head at every `ns_id`, not just the current ones; and while older instances
+still write, no backfill could finish. They only go: a purge turns its entries into purges,
+and a namespace raised to sealed lists them on none of its pages from then on (copies cached
+before keep them, as the plaintext revisions cached before stay readable). `created` was
+always stored. In an encrypted-at-rest namespace the two columns are stored in the clear, as
+ids are, which hash plaintext patch sets too (§C.7).
 
 ## Grants
 
@@ -2593,7 +2623,8 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
   `ns_config.doc`, `revisions.signature/schema_ref`, `revisions.size/digest` (a head's
-  document, for `/heads`: see [Reference extensions](#reference-extensions-beyond-the-spec)),
+  document, for `/heads`, about 40 bytes a row: see
+  [Reference extensions](#reference-extensions-beyond-the-spec)),
   `resources.keep`, `heads.seq`, `deks`
   (wrapped data keys of encryption at rest, Addendum E.1), `epoch_keys`, `rev_epochs` and
   `sealed` (sealed namespaces, Addendum E.2); and
