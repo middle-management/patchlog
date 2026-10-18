@@ -162,7 +162,12 @@ func (st *reqState) scratchSet(name string, f *scratchFile) error {
 }
 
 // reserveLocked accounts for n bytes in place of old (nil: one more file)
-// within the bounds, which are the user's, over their scopes.
+// within the bounds, which are the user's, over their scopes: per scope,
+// a narrowing being free, one user would keep them as many times. So a
+// token's 507 depends on what the user's other scopes keep, which a token
+// that reads less can measure (the size of a backup copy in another
+// scope, the number of files there); a bound of their own per scope
+// would multiply what a user keeps instead.
 func (st *reqState) reserveLocked(old *scratchFile, n int) error {
 	s, sc := st.s, st.sc
 	delta, files := n, 1
@@ -349,9 +354,9 @@ func (st *reqState) scratchUnder(dir string) []string {
 	return out
 }
 
-// maxPropBytes bounds a scope's dead properties (PROPPATCH), their
-// names and values: over it, those of the path touched least recently go
-// first. They are cosmetic (Windows' file times), so dropping them is
+// maxPropBytes bounds a user's dead properties (PROPPATCH), over their
+// scopes, their names and values: over it, those of the path touched
+// least recently go first. They are cosmetic (Windows' file times), so dropping them is
 // better than refusing a client's write over them.
 const maxPropBytes = 1 << 20
 
@@ -383,7 +388,7 @@ func (sc *scope) deadProps(path string) map[xml.Name]webdav.Property {
 }
 
 // patchProps applies a PROPPATCH's changes to the scope's dead
-// properties of path, within maxPropBytes.
+// properties of path, within maxPropBytes over the user's scopes.
 func (sc *scope) patchProps(path string, patches []webdav.Proppatch, now time.Time) {
 	sc.p.mu.Lock()
 	defer sc.p.mu.Unlock()
@@ -410,19 +415,49 @@ func (sc *scope) patchProps(path string, patches []webdav.Proppatch, now time.Ti
 		}
 	}
 	ps.at = now
-	for sc.pbytes > maxPropBytes {
-		old := ""
-		for k, o := range sc.props {
-			if old == "" || o.at.Before(sc.props[old].at) {
-				old = k
-			}
-		}
-		sc.pbytes -= sc.props[old].bytes
-		delete(sc.props, old)
-	}
 	if len(ps.props) == 0 {
 		delete(sc.props, path)
 	}
+	// Within maxPropBytes over the user's scopes, as their scratch files
+	// and locks are: a narrowing is free, so per scope one user would keep
+	// it as many times. The path set least recently goes first, this
+	// scope's before another's, so another token's PROPPATCHes push out
+	// what one sets only when its own are gone.
+	total := 0
+	for _, o := range sc.p.scopes {
+		total += o.pbytes
+	}
+	for total > maxPropBytes {
+		from, old := sc, oldestKey(sc, path)
+		if old == "" {
+			for _, o := range sc.p.scopes {
+				if o == sc {
+					continue
+				}
+				if k := oldestKey(o, ""); k != "" && (old == "" || o.props[k].at.Before(from.props[old].at)) {
+					from, old = o, k
+				}
+			}
+		}
+		if old == "" {
+			from, old = sc, path
+		}
+		total -= from.props[old].bytes
+		from.pbytes -= from.props[old].bytes
+		delete(from.props, old)
+	}
+}
+
+// oldestKey is the path of sc's dead properties set least recently but
+// keep, "" if none.
+func oldestKey(sc *scope, keep string) string {
+	old := ""
+	for k, o := range sc.props {
+		if k != keep && (old == "" || o.at.Before(sc.props[old].at)) {
+			old = k
+		}
+	}
+	return old
 }
 
 // moveProps moves the scope's dead properties of the paths at or
@@ -448,6 +483,15 @@ func (sc *scope) moveProps(from, to string) {
 		}
 		sc.props[k] = ps
 	}
+}
+
+// holds reports whether the scope keeps a scratch file or a lock
+// unexpired at now: what dropping it would lose (scopeRoomLocked).
+func (sc *scope) holds(now time.Time) bool {
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	sc.expireLocksLocked(now)
+	return len(sc.scratch) > 0 || len(sc.locked) > 0
 }
 
 // drop drops every scratch file, lock and dead property of a scope

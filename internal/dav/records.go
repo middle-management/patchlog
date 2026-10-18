@@ -125,23 +125,44 @@ func (s *Server) storeLocked(p *principal) *recStore {
 	return rs
 }
 
-// loseRecords marks the documents user from has records of as lost in
-// to's records (§H.4 "records evicted"): a token verified as to now, that
-// was from's, may have them open, and to's records don't hold what it
-// opened, so its saves without a base are refused until it reloads.
-func (s *Server) loseRecords(from, to *principal) {
+// loseRecords marks the documents user from (its id) has records of, or
+// had lost records of, as lost in to's records (§H.4 "records evicted"):
+// a token verified as to now, that was from's, may have them open, and
+// to's records don't hold what it opened, so its saves without a base are
+// refused until it reloads, those of documents to has records of too
+// (another of the person's tokens read them as to: other versions than
+// this one's client opened). The marks are records of their own, within
+// to's records' bounds as any, made least recently used first, so that
+// those bounds push out the documents from used longest ago first; one
+// pushed out is remembered as lost (forgotten).
+func (s *Server) loseRecords(from string, to *principal) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	src := s.recRoots[from.id]
-	if src == nil {
+	src := s.recRoots[from]
+	dst := s.storeLocked(to)
+	if src == nil || src == dst {
 		return
 	}
-	dst := s.storeLocked(to)
-	for _, k := range src.docs.Keys() {
-		if _, ok := dst.docs.Get(k); !ok {
-			dst.forgotten.Put(k, true, 1)
-		}
+	lost, docs := src.forgotten.Keys(), src.docs.Keys() // most recently used first
+	keys := make([]string, 0, len(lost)+len(docs))
+	for i := len(lost) - 1; i >= 0; i-- {
+		keys = append(keys, lost[i])
 	}
+	for i := len(docs) - 1; i >= 0; i-- {
+		keys = append(keys, docs[i])
+	}
+	before := dst.docs.Bytes()
+	for _, k := range keys {
+		d, ok := dst.docs.Get(k)
+		if !ok {
+			dst.forgotten.Remove(k)
+		}
+		d.lost = true
+		dst.docs.Put(k, d, d.cost())
+	}
+	dst.used = s.opt.Now()
+	s.recBytes += dst.docs.Bytes() - before
+	s.trimRecordsLocked()
 }
 
 // markOwn remembers that user p wrote entry id of ns/name, a tombstone or

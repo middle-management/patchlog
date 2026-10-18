@@ -1,8 +1,11 @@
 package dav
 
 import (
+	"fmt"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/client"
 )
 
 // The base an If header names (§H.4): the first entity tag, not negated,
@@ -100,5 +103,42 @@ func TestGuards(t *testing.T) {
 	}
 	if g := p.guards["/c"][0]; !g.at.Equal(now.Add(10 * time.Microsecond)) {
 		t.Fatalf("the oldest kept is from %v", g.at.Sub(now))
+	}
+}
+
+// loseRecords marks lost, for the user a token was verified again as,
+// every document the old user had records of, or had lost them of: those
+// the new user has records of too, and more than the 4096 documents its
+// forgotten marks hold (an rclone copy reads each), the most recently
+// used and the least alike.
+func TestLoseRecordsBounds(t *testing.T) {
+	c, err := client.New("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{Client: c, Namespaces: []string{"docs"}, Gateway: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	from, to := s.newPrincipal("from"), s.newPrincipal("to")
+	const n = maxForgotten + 100
+	for i := 0; i < n; i++ {
+		s.remember(from, "docs", fmt.Sprintf("d%d", i), record{rev: "r"}, false)
+	}
+	s.recMu.Lock()
+	s.storeLocked(from).forgotten.Put(recKey("docs", "gone"), true, 1)
+	s.recMu.Unlock()
+	s.remember(to, "docs", "d7", record{rev: "other"}, false)
+	s.loseRecords(from.id, to)
+	for _, name := range []string{fmt.Sprintf("d%d", n-1), fmt.Sprintf("d%d", n-50), "d0", "d7", "gone"} {
+		if d := s.recordsOf(to, "docs", name); !d.lost {
+			t.Errorf("%s isn't lost for to: %+v", name, d)
+		}
+	}
+	if d := s.recordsOf(to, "docs", "d7"); len(d.rs) != 1 || d.rs[0].rev != "other" {
+		t.Errorf("to's own records of d7: %+v", d)
+	}
+	if d := s.recordsOf(to, "docs", "never"); d.lost || len(d.rs) > 0 {
+		t.Errorf("a document from never recorded: %+v", d)
 	}
 }

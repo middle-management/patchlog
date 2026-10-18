@@ -200,15 +200,19 @@ type Server struct {
 	refused   lru.Cache[string, refusal] // grants the core refused lately, by hash
 
 	mu           sync.Mutex
-	tokens       map[string]*token         // gateway mode, by grant hash
-	principals   map[string]*principal     // gateway mode, by user (userKey)
-	kidNS        lru.Cache[string, string] // gateway mode, by root kid: the namespace that first accepted a grant of it (verify)
+	tokens       map[string]*token           // gateway mode, by grant hash
+	principals   map[string]*principal       // gateway mode, by user (userKey)
+	kidNS        lru.Cache[string, []string] // gateway mode, by root kid and sub: the namespaces that accepted a grant of them, first first (verify)
+	idUsers      lru.Cache[string, idUser]   // gateway mode, by token id: who it was verified as last, kept past the token (admit)
 	lastSweep    time.Time
 	scratchTotal atomic.Int64 // every user's scratch bytes
 
-	opMu   sync.Mutex
-	opKeys []client.OperatorKey // the deployment's operator keys (operatorKeys), read at opAt
-	opAt   time.Time
+	opMu     sync.Mutex
+	opKeys   []client.OperatorKey // the deployment's operator keys (operatorKeys), read at opAt
+	opAt     time.Time
+	opRetry  time.Time // after a failed read, not read again before
+	opErr    error     // the failed read, while none was read
+	opFlight singleflight.Group
 
 	viewMu sync.Mutex
 	views  lru.Cache[string, tokenView] // by token id: catalogs' graphs and folders it read (views)
@@ -316,6 +320,7 @@ func New(opt Options) (*Server, error) {
 		s.verifySem = make(chan struct{}, maxVerifying)
 		s.refused.MaxEntries = 1 << 12
 		s.kidNS.MaxEntries = 1 << 12
+		s.idUsers.MaxEntries = 1 << 14
 	} else {
 		s.local = s.newToken("local", opt.Client, s.newScopeLocked(s.newPrincipal("local"), ""), nil)
 		s.local.verified = s.start
@@ -745,6 +750,10 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 			return tk, nil
 		}
 		prev = tk.vns
+	} else if u, ok := s.idUsers.Get(id); ok {
+		// Dropped since (idle, or to make room): verified again in the
+		// same order, and seen to have become someone else (admit).
+		prev = u.vns
 	}
 	s.mu.Unlock()
 	s.refusedMu.Lock()
@@ -777,7 +786,8 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 		named[n] = g.NamesNS(n)
 	}
 	vd, _ := v.(*verdict)
-	tk, de := s.admit(id, c, named, scopeOf(g), vd, err)
+	skey, narrowed := scopeOf(g)
+	tk, de := s.admit(id, c, named, skey, narrowed, vd, err)
 	if de != nil {
 		return nil, de
 	}
@@ -793,6 +803,13 @@ const (
 	maxVerifyNS  = 3
 	refusedFor   = 30 * time.Second
 )
+
+// maxKidNS bounds the namespaces kidNS keeps for one root kid and sub,
+// the oldest going first.
+const maxKidNS = 4
+
+// kidSub is kidNS's key for a root block's kid and sub.
+func kidSub(kid, sub string) string { return kid + "\x00" + sub }
 
 // refusal is a grant's refusal (verify), and when.
 type refusal struct {
@@ -830,19 +847,28 @@ type verdict struct {
 //
 // The namespace that accepts a grant is part of its user (userKey), so
 // the order they are asked in keeps a person one user: first prev, the
-// one that accepted this token before, then the one that first accepted
-// a grant of its root kid (kidNS), then the rest, sorted. A namespace
-// created later, or given the key later, that sorts first then doesn't
-// make the same token, or the same person's next one, someone else, with
-// none of their records, scratch files or locks.
+// one that accepted this token before, then those that accepted a grant
+// of its root kid and sub, first first (kidNS), then the rest, sorted. A
+// namespace created later, or given the key later, that sorts first then
+// doesn't make the same token, or the same person's next one, someone
+// else, with none of their records, scratch files or locks. kids are
+// per namespace document and free-form (§C.1), so the record is by kid
+// and sub, not kid alone, which another namespace's key named alike
+// (another person's) would take first; and since a namespace's key may
+// mint grants for any sub, it keeps a few namespaces, so one that
+// accepted a grant for the same kid and sub first, but that this grant
+// doesn't name or that refuses it, doesn't stand for the person's. The
+// preferred namespaces don't count against maxVerifyNS.
 //
 // A grant an operator key signed (§C.4) authorizes nothing this server
 // does, and is refused (401) where /principal accepts it
 // (operatorSigned): its root kid may name a namespace's key too, and
 // /principal, which verifies it against the operator keys, names that
 // kid, so it would be taken for that key's user, and reach their scratch
-// files. Where the namespace doesn't exist, its 404 is the answer, as
-// the core's to an operator grant.
+// files. One the namespace's own keys verify (an operator who listed
+// its key there, §C.4) is the namespace's, as the core serves it. Where
+// the namespace doesn't exist, its 404 is the answer, as the core's to an
+// operator grant.
 func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, prev string) (*verdict, error) {
 	var named []string
 	for _, ns := range s.namespaces() {
@@ -858,35 +884,41 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, p
 		s.opt.Logf("dav: a grant for %q names none of the namespaces served (%q)", g.Blocks[0].Sub, nss)
 		return nil, fail(http.StatusUnauthorized, "the grant names none of the namespaces served here")
 	}
-	kid := g.Blocks[0].Kid
+	kid, rk := g.Blocks[0].Kid, kidSub(g.Blocks[0].Kid, g.Blocks[0].Sub)
 	s.mu.Lock()
-	first, _ := s.kidNS.Get(kid)
+	recorded, _ := s.kidNS.Get(rk)
 	s.mu.Unlock()
-	order := make([]string, 0, len(named))
-	for _, ns := range append([]string{prev, first}, named...) {
+	var order []string
+	for _, ns := range append([]string{prev}, recorded...) {
 		if ns != "" && slices.Contains(named, ns) && !slices.Contains(order, ns) {
 			order = append(order, ns)
 		}
 	}
-	named = order
-	if len(named) > maxVerifyNS {
-		named = named[:maxVerifyNS]
+	rest := 0
+	for _, ns := range named {
+		if !slices.Contains(order, ns) && rest < maxVerifyNS {
+			order = append(order, ns)
+			rest++
+		}
 	}
 	why, purged, absent := "no key of a namespace it names verifies it", "", ""
-	for _, ns := range named {
+	for _, ns := range order {
 		info, err := c.NSPrincipal(ctx, ns)
 		ae, isAPI := client.AsAPIError(err)
 		switch {
 		case err == nil:
-			switch op, err := s.operatorSigned(ctx, g); {
+			switch op, err := s.operatorSigned(ctx, c, g, ns); {
 			case err != nil:
 				return nil, err
 			case op:
 				return nil, fail(http.StatusUnauthorized, "the grant is signed by an operator key (kid %q), which authorizes creating namespaces and forced purges (§C.4), nothing this server does: log in with a grant from a key a namespace's document lists", kid)
 			}
 			s.mu.Lock()
-			if _, ok := s.kidNS.Get(kid); !ok {
-				s.kidNS.Put(kid, ns, 1)
+			if nss, _ := s.kidNS.Get(rk); !slices.Contains(nss, ns) {
+				if len(nss) >= maxKidNS {
+					nss = nss[1:]
+				}
+				s.kidNS.Put(rk, append(slices.Clip(nss), ns), 1)
 			}
 			s.mu.Unlock()
 			return &verdict{ns: ns, info: info}, nil
@@ -915,19 +947,80 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, p
 
 // operatorKeysFor is how long the deployment's operator keys, as read
 // (operatorKeys), are used before they are read again; they are served
-// cacheable for minutes (§C.4).
-const operatorKeysFor = 5 * time.Minute
+// cacheable for minutes (§C.4). After a failed read they aren't read
+// again for operatorKeysRetry, or operatorKeysRetryNone while none was
+// read (the core is asked of each grant meanwhile, operatorSigned).
+const (
+	operatorKeysFor       = 5 * time.Minute
+	operatorKeysRetry     = 30 * time.Second
+	operatorKeysRetryNone = 5 * time.Second
+)
 
-// operatorSigned reports whether an operator key signed grant g (§C.4):
-// one of the deployment's operator key history (operatorKeys) whose kid
-// is g's root kid, and under whose public key g's signature chain
-// verifies. kids are never reused there, but a namespace document's key
-// may carry an operator key's kid (kids are free-form): only the
-// signature tells which of them signed g.
-func (s *Server) operatorSigned(ctx context.Context, g *grant.Grant) (bool, error) {
+// operatorSigned reports whether an operator key signed grant g (§C.4),
+// accepted by namespace ns's /principal, and the core doesn't serve it as
+// ns's own: an operator key of the deployment's history (operatorKeys)
+// whose kid is g's root kid, and under whose public key g's signature
+// chain verifies. kids are never reused there, but a namespace
+// document's key may carry an operator key's kid (kids are free-form):
+// only the signature tells which of them signed g. And the core verifies
+// a grant against the namespace's keys before the operator's
+// (core/principal.go), so one signed by an operator key the namespace
+// also lists under that kid (namespaceSigned) is the namespace's grant,
+// served as any other. While the key set can't be read, the core is
+// asked that of every grant (namespaceSigned).
+func (s *Server) operatorSigned(ctx context.Context, c *client.Client, g *grant.Grant, ns string) (bool, error) {
 	keys, err := s.operatorKeys(ctx)
 	if err != nil {
-		return false, err
+		own, nerr := s.namespaceSigned(ctx, c, g, ns)
+		if nerr != nil {
+			return false, err
+		}
+		return !own, nil
+	}
+	for _, k := range keys {
+		if k.Kid == g.Blocks[0].Kid && g.SignedBy(k.Pub) {
+			own, err := s.namespaceSigned(ctx, c, g, ns)
+			return !own, err
+		}
+	}
+	return false, nil
+}
+
+// namespaceSigned reports whether namespace ns's own keys verify grant g,
+// which c sends: an ordinary request under it is then served (§C.2 item
+// 1), where under an operator grant it is 401 (§C.4). The namespace's
+// head read with g: a 401 is a grant no key of ns verifies; any other
+// refusal (403, 404 for a grant limited to some resources, 410) comes
+// after verification. A public namespace's reads ignore a grant (§7):
+// there its document, which anyone reads, says whether a key it lists
+// under g's root kid signed g; read without a grant, it tells a public
+// namespace from another.
+func (s *Server) namespaceSigned(ctx context.Context, c *client.Client, g *grant.Grant, ns string) (bool, error) {
+	h, err := c.NSHead(ctx, ns)
+	switch ae, isAPI := client.AsAPIError(err); {
+	case err == nil:
+	case isAPI && ae.Status == http.StatusUnauthorized:
+		return false, nil
+	case isAPI && ae.Status < 500 && ae.Status != http.StatusTooManyRequests:
+		return true, nil
+	default:
+		return false, upstream(err)
+	}
+	d, err := s.anon.NSDoc(ctx, ns, h.ID)
+	switch ae, isAPI := client.AsAPIError(err); {
+	case err == nil:
+	case isAPI && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound):
+		// Not public: the head read with g verified it.
+		return true, nil
+	default:
+		return false, upstream(err)
+	}
+	if d.Value["read"] != "public" {
+		return true, nil
+	}
+	keys, err := grant.ParseKeys(d.Value["keys"])
+	if err != nil {
+		return false, nil
 	}
 	for _, k := range keys {
 		if k.Kid == g.Blocks[0].Kid && g.SignedBy(k.Pub) {
@@ -938,30 +1031,59 @@ func (s *Server) operatorSigned(ctx context.Context, g *grant.Grant) (bool, erro
 }
 
 // operatorKeys returns the deployment's operator key history (§C.4), read
-// without a grant at most operatorKeysFor ago; one that can't be read
-// again is used as last read, and with none read yet the verification
-// fails (502, 503) rather than take an operator's grant for a user's. A
-// core that publishes none (404) has none.
+// without a grant at most operatorKeysFor ago. A read older is made once
+// for every verification asking meanwhile (opFlight), outside opMu, while
+// those with keys read before use them; one that fails leaves those in
+// use and isn't tried again for operatorKeysRetry. With none read yet it
+// is an error, also for operatorKeysRetryNone without reading again, and
+// operatorSigned asks the core instead, rather than take an operator's
+// grant for a user's. The core answers its key set 200, an empty set when
+// it has none: any other answer, a 404 included (a proxy that doesn't
+// route /.well-known), is a failed read.
 func (s *Server) operatorKeys(ctx context.Context) ([]client.OperatorKey, error) {
 	now := s.opt.Now()
 	s.opMu.Lock()
-	defer s.opMu.Unlock()
-	if !s.opAt.IsZero() && now.Sub(s.opAt) < operatorKeysFor {
-		return s.opKeys, nil
+	keys, at, retry, last := s.opKeys, s.opAt, s.opRetry, s.opErr
+	s.opMu.Unlock()
+	fresh := !at.IsZero() && now.Sub(at) < operatorKeysFor
+	if fresh || now.Before(retry) {
+		if at.IsZero() {
+			return nil, last
+		}
+		return keys, nil
 	}
-	keys, err := s.anon.OperatorKeys(ctx)
-	switch ae, ok := client.AsAPIError(err); {
-	case err == nil:
-	case ok && ae.Status == http.StatusNotFound:
-		keys = nil
-	case !s.opAt.IsZero():
-		s.opt.Logf("dav: the deployment's operator keys couldn't be read again (%v); those read at %v are used", err, s.opAt)
-		return s.opKeys, nil
-	default:
-		return nil, upstream(err)
+	ch := s.opFlight.DoChan("op", func() (any, error) {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		defer cancel()
+		keys, err := s.anon.OperatorKeys(rctx)
+		now := s.opt.Now()
+		s.opMu.Lock()
+		defer s.opMu.Unlock()
+		if err == nil {
+			s.opKeys, s.opAt, s.opRetry, s.opErr = keys, now, time.Time{}, nil
+			return keys, nil
+		}
+		if !s.opAt.IsZero() {
+			s.opt.Logf("dav: the deployment's operator keys couldn't be read again (%v); those read at %v are used", err, s.opAt)
+			s.opRetry = now.Add(operatorKeysRetry)
+			return s.opKeys, nil
+		}
+		s.opRetry, s.opErr = now.Add(operatorKeysRetryNone), upstream(err)
+		return nil, s.opErr
+	})
+	if !at.IsZero() {
+		// Read again in the background: these serve meanwhile.
+		return keys, nil
 	}
-	s.opKeys, s.opAt = keys, now
-	return keys, nil
+	select {
+	case r := <-ch:
+		if r.Err != nil {
+			return nil, r.Err
+		}
+		return r.Val.([]client.OperatorKey), nil
+	case <-ctx.Done():
+		return nil, &davError{status: http.StatusServiceUnavailable, msg: "the deployment's operator keys are being read; try again", header: http.Header{"Retry-After": {"5"}}}
+	}
 }
 
 // userKey is who the state of a grant the core accepted (v) is kept for
@@ -975,16 +1097,24 @@ func userKey(v *verdict) string {
 	return v.ns + "\x00" + v.info.Kid + "\x00" + v.info.Sub
 }
 
+// idUser is who a token was verified as last (idUsers): its user
+// (userKey), and the namespace that verified it, kept past the token
+// itself, which goes when idle for VerifyEvery (sweep) or to make room,
+// so that coming back it is verified in the same order, and seen to have
+// become someone else.
+type idUser struct{ user, vns string }
+
 // admit returns the token of a grant (id, its client, the served
-// namespaces it names, its narrowing skey) the core accepted (v), its
-// user's state made only now, or refused with err: then the token goes,
-// and its user's other tokens are asked again at their next request,
-// since what refused it (a revoked root, a key withdrawn) may refuse them
-// too. The user's state stays: only a token the core accepts reaches it,
-// each asked again every VerifyEvery, and it is that person's, whose
-// grant minted again finds it (§H.7); it goes when idle (ScratchIdle,
-// RecordIdle) or to make room (MaxPrincipals), as any user's.
-func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey string, v *verdict, err error) (*token, *davError) {
+// namespaces it names, its narrowing skey, narrowed or not) the core
+// accepted (v), its user's state made only now, or refused with err: then
+// the token goes, and its user's other tokens are asked again at their
+// next request, since what refused it (a revoked root, a key withdrawn)
+// may refuse them too. The user's state stays: only a token the core
+// accepts reaches it, each asked again every VerifyEvery, and it is that
+// person's, whose grant minted again finds it (§H.7); it goes when idle
+// (ScratchIdle, RecordIdle) or to make room (MaxPrincipals), as any
+// user's.
+func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey string, narrowed bool, v *verdict, err error) (*token, *davError) {
 	now := s.opt.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1012,13 +1142,22 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey 
 		p = s.newPrincipal(key)
 		s.principals[key] = p
 	}
+	// Verified again as someone else: the namespace that accepted it
+	// before refuses it now, and another accepts it. That user's records
+	// don't hold what this token's client may have open, so its saves
+	// without a base are refused until it reloads, rather than rebased on
+	// the head (§H.4); whether the token is still kept or went meanwhile
+	// (idUsers).
+	was := ""
+	if tk != nil {
+		was = tk.p.id
+	} else if u, ok := s.idUsers.Get(id); ok {
+		was = u.user
+	}
+	if was != "" && was != key {
+		s.loseRecords(was, p)
+	}
 	if tk != nil && tk.p != p {
-		// Verified again as someone else: the namespace that accepted it
-		// before refuses it now, and another accepts it. That user's
-		// records don't hold what this token's client may have open, so
-		// its saves without a base are refused until it reloads, rather
-		// than rebased on the head (§H.4).
-		s.loseRecords(tk.p, p)
 		s.dropTokenLocked(tk)
 		tk = nil
 	}
@@ -1029,16 +1168,19 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey 
 		}
 		sc := p.scopes[skey]
 		if sc == nil {
-			if !s.scopeRoomLocked(p) {
-				return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many of your logins at once; try again",
-					header: http.Header{"Retry-After": {"5"}}}
+			if !s.scopeRoomLocked(p, narrowed) {
+				return nil, &davError{status: http.StatusServiceUnavailable,
+					msg:    fmt.Sprintf("your %d other logins of this kind (%s) each keep temporary files or locks, or are busy; try again once one of them is idle", s.opt.MaxTokensPerPrincipal, map[bool]string{true: "narrowed offline", false: "as issued"}[narrowed]),
+					header: http.Header{"Retry-After": {"60"}}}
 			}
 			sc = s.newScopeLocked(p, skey)
+			sc.narrowed = narrowed
 		}
 		tk = s.newToken(id, c, sc, named)
 		s.tokens[id] = tk
 		p.toks[tk] = true
 	}
+	s.idUsers.Put(id, idUser{user: key, vns: v.ns}, 1)
 	tk.verified, tk.vns = now, v.ns
 	tk.keepWriter(v.ns, v.info.Writer, now)
 	s.useLocked(tk, now)
@@ -1104,23 +1246,36 @@ func (s *Server) tokenRoomLocked(p *principal) bool {
 	return true
 }
 
-// scopeRoomLocked drops p's scopes to make room for one more: the least
-// recently used beyond MaxTokensPerPrincipal, never one with a request in
-// flight. False: there is no room.
-func (s *Server) scopeRoomLocked(p *principal) bool {
-	for len(p.scopes) >= s.opt.MaxTokensPerPrincipal {
+// scopeRoomLocked drops one of p's scopes to make room for one more,
+// narrowed offline or not: the least recently used of those alike beyond
+// MaxTokensPerPrincipal that holds no scratch file or lock and has no
+// request in flight (dead properties, cosmetic, may go with it). False:
+// there is no room. A scope with content isn't dropped to make room:
+// narrowing is offline and free, and whoever holds a token of the user's
+// (a delegate, the user's own devices) would drop the editor's swap
+// files, backup copies and locks with a few new narrowings; and those
+// can't make room among the scopes of tokens as issued.
+func (s *Server) scopeRoomLocked(p *principal, narrowed bool) bool {
+	for {
+		n := 0
 		var old *scope
 		for _, sc := range p.scopes {
-			if sc.inflight == 0 && (old == nil || sc.used.Before(old.used)) {
+			if sc.narrowed != narrowed {
+				continue
+			}
+			n++
+			if sc.inflight == 0 && !sc.holds(s.opt.Now()) && (old == nil || sc.used.Before(old.used)) {
 				old = sc
 			}
+		}
+		if n < s.opt.MaxTokensPerPrincipal {
+			return true
 		}
 		if old == nil {
 			return false
 		}
 		s.dropScopeLocked(old)
 	}
-	return true
 }
 
 // dropTokenLocked forgets token tk: its next request is verified again.
@@ -1290,17 +1445,20 @@ type principal struct {
 // scope is what a principal keeps for its tokens of one narrowing
 // (scopeOf), which may hold what one token read: their scratch files,
 // locks (their owners' XML) and dead properties, within the principal's
-// bounds, over its scopes. A token the issuer minted for the user shares
-// the user's root scope with every other; one narrowed offline (another
-// ns, can, rules, or a via: a delegate) has its own, so a scratch file
-// one wrote, such as a document's backup copy (§H.5) or an editor's swap
-// file holding its text, is never served to a token that may read less
-// (§H.6 "served only to that user"). What holds no content (guards,
-// deletes, moves aside, records) stays the user's.
+// bounds, over its scopes. Tokens the issuer minted for the user with
+// the same rights share one, whatever their times; one minted with less
+// (another ns, can, roles or rules: a grant limited to some resources,
+// §C.5.1) or narrowed offline (another ns, can, rules, or a via: a
+// delegate) has its own, so a scratch file one wrote, such as a
+// document's backup copy (§H.5) or an editor's swap file holding its
+// text, is never served to a token that may read less (§H.6 "served
+// only to that user"). What holds no content (guards, deletes, moves
+// aside, records) stays the user's.
 type scope struct {
-	p     *principal
-	key   string
-	locks webdav.LockSystem
+	p        *principal
+	key      string
+	narrowed bool // its grants have narrowing blocks (scopeOf)
+	locks    webdav.LockSystem
 
 	// under Server.mu
 	used     time.Time
@@ -1315,32 +1473,40 @@ type scope struct {
 	pbytes  int                 // what props cost
 }
 
-// scopeOf is the narrowing of grant g that its token's scope is kept by:
-// a digest of its narrowing blocks (§C.1) without nbf and exp, which
-// bound only when it is used, leaving out blocks that hold nothing else;
-// "" for a root block alone, whatever it says, as the issuer minted it
-// for the user (§H.7 "a reminted token is the same person").
-func scopeOf(g *grant.Grant) string {
+// scopeOf is the narrowing of grant g that its token's scope is kept by,
+// and whether g has narrowing blocks: a digest of what limits what g may
+// read (§C.1): the root block's ns, can, roles and rules, and groups and
+// attrs, which rules may test, without its kid and sub (the user's,
+// userKey), nbf, exp and at, which bound only when or as of when it is
+// used, and enc and signers, which don't limit reads; then each
+// narrowing block without nbf and exp, leaving out blocks that hold
+// nothing else. A token the issuer mints again with the same rights is
+// in the same scope (§H.7 "a reminted token is the same person"); one it
+// limited to some resources (rules on /resource, §C.5.1) isn't.
+func scopeOf(g *grant.Grant) (string, bool) {
 	h := sha256.New()
-	n := 0
-	for _, b := range g.Blocks[1:] {
-		m := make(map[string]any, len(b.Raw))
-		for k, v := range b.Raw {
-			if k != "nbf" && k != "exp" {
+	write := func(raw map[string]any, skip ...string) bool {
+		m := make(map[string]any, len(raw))
+		for k, v := range raw {
+			if !slices.Contains(skip, k) {
 				m[k] = v
 			}
 		}
 		if len(m) == 0 {
-			continue
+			return false
 		}
 		h.Write(jsonv.Canonical(m))
 		h.Write([]byte{0})
-		n++
+		return true
 	}
-	if n == 0 {
-		return ""
+	write(g.Blocks[0].Raw, "kid", "sub", "nbf", "exp", "at", "enc", "signers")
+	narrowed := false
+	for _, b := range g.Blocks[1:] {
+		if write(b.Raw, "nbf", "exp") {
+			narrowed = true
+		}
 	}
-	return hex.EncodeToString(h.Sum(nil)[:16])
+	return hex.EncodeToString(h.Sum(nil)[:16]), narrowed
 }
 
 // asideFor is how soon after the principal moved a document aside to a

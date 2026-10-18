@@ -2,9 +2,14 @@ package dav_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -31,8 +36,9 @@ func narrowed(t *testing.T, tok string, block map[string]any) string {
 // 30 s of another's DELETE restores the file (§H.6), rebased on what the
 // saver read, rather than being a 409 over "someone else's" delete; and
 // records and guards are shared. Scratch files and locks, which may hold
-// what one token read, are shared by the tokens the issuer minted, not
-// with one attenuated offline (a via: a delegate), which may read less.
+// what one token read, are shared by the tokens the issuer minted with
+// the same rights, not with one attenuated offline (a via: a delegate),
+// which may read less.
 // Another sub is another user, for whom that delete is someone else's.
 func TestGatewayUserTokens(t *testing.T) {
 	t.Parallel()
@@ -83,7 +89,7 @@ func TestGatewayUserTokens(t *testing.T) {
 	e.expect(e.doAs(bob, "PUT", "/docs/b.json", `{"v": 2}`), 409, "bob's save over alice's delete")
 
 	// Scratch files and locks are the user's, for the tokens the issuer
-	// minted; a token attenuated offline has its own.
+	// minted with the same rights; a token attenuated offline has its own.
 	e.expect(e.doAs(a1, "PUT", "/docs/.notes.swp", "alice's swap"), 201, "alice's swap file")
 	if r := e.expect(e.doAs(a2, "GET", "/docs/.notes.swp", ""), 200, "by another token of alice's"); r.body != "alice's swap" {
 		t.Fatalf("alice's swap file %q", r.body)
@@ -319,9 +325,12 @@ func TestGatewayScratchNamedNS(t *testing.T) {
 	if r := e.expect(e.doAs(full, "GET", "/priv/.plan.md.swp", ""), 200, "the token that kept it"); r.body != "private draft" {
 		t.Fatalf("alice's swap file %q", r.body)
 	}
-	if r := e.expect(e.doAs(full, "GET", "/docs/.notes.swp", ""), 200, "a swap file in docs, by another token of alice's"); r.body != "notes" {
+	// The token for docs reads its own; the full token, minted with other
+	// rights (ns), keeps its own scratch files (scope).
+	if r := e.expect(e.doAs(docsOnly, "GET", "/docs/.notes.swp", ""), 200, "a swap file in docs, by the token that kept it"); r.body != "notes" {
 		t.Fatalf("alice's swap file in docs %q", r.body)
 	}
+	e.expect(e.doAs(full, "GET", "/docs/.notes.swp", ""), 404, "the docs token's swap file, by the token minted for docs and priv")
 }
 
 // A document moved aside to a backup name (§H.5, vim's x~) is copied into
@@ -475,6 +484,386 @@ func TestGatewayViewsBounded(t *testing.T) {
 		n, b := dav.Views(srv)
 		if b > bound || n == 0 || n >= 40 {
 			t.Fatalf("tree service %q: %d views kept, costing %d, over 40 tokens (bound %d)", treeURL, n, b, bound)
+		}
+	}
+}
+
+// A grant the issuer minted limited to some resources (rules on /resource
+// in its root block, §C.5.1), for the same sub and kid, is the same user
+// but has scratch files of its own (scope): it isn't served the backup
+// copy a move aside made of a document the core refuses it. Minted again
+// with the same rights (other times), a token shares the user's.
+func TestGatewayIssuedLimitedScratch(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	now := e.s.Now()
+	writer := []string{"read", "create", "append", "restore", "delete"}
+	alice := k.Grant(t, now, "user:alice", []string{"docs"}, writer)
+	again := k.Grant(t, now.Add(time.Minute), "user:alice", []string{"docs"}, writer)
+	limited := k.Grant(t, now.Add(time.Second), "user:alice", []string{"docs"}, []string{"read"},
+		map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "public"}}})
+	e.create("docs", "secret", map[string]any{"salary": 123456})
+	e.create("docs", "public", map[string]any{"v": 1})
+	if r := e.doAs(limited, "GET", "/docs/secret.json", ""); r.status == 200 {
+		t.Fatalf("the limited grant read secret.json: %q", r.body)
+	}
+	e.expect(e.doAs(limited, "GET", "/docs/public.json", ""), 200, "the limited grant's GET of public.json")
+	e.expect(e.doAs(alice, "MOVE", "/docs/secret.json", "", "Destination", "/docs/secret.json~"), 201, "alice's backup move")
+	if r := e.doAs(limited, "GET", "/docs/secret.json~", ""); r.status == 200 {
+		t.Fatalf("the grant limited to public read secret's backup copy: %q", r.body)
+	}
+	if r := e.expect(e.doAs(again, "GET", "/docs/secret.json~", ""), 200, "the copy, by alice's token minted again"); !strings.Contains(r.body, "123456") {
+		t.Fatalf("the copy %q", r.body)
+	}
+}
+
+// kids are free-form and per namespace document (§C.1): bob's own key in
+// zeta also has kid "k", and a grant of it for sub user:alice (zeta's key
+// may mint any sub) logs in first. Neither takes the record of where
+// alice's grants verify (kidNS, by kid and sub, a few namespaces kept):
+// once alpha, which sorts first, is given her key, her token minted again
+// is still the user docs verified, with her swap file, and her save
+// without If-Match is rebased on what she read, not on the head.
+func TestGatewayStableUserKidSub(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true, func(o *dav.Options) { o.Namespaces = []string{"alpha", "docs", "zeta"} })
+	bobKey := clienttest.NewKey("k")
+	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "zeta")))
+	must(op.CreateNamespace(e.ctx, "zeta", map[string]any{"read": "grant", "keys": []any{bobKey.Entry("*")}}))
+	for _, sub := range []string{"user:bob", "user:alice"} {
+		tok := bobKey.Grant(t, e.s.Now(), sub, []string{"zeta"}, []string{"read", "create", "append"})
+		e.expect(e.doAs(tok, "PROPFIND", "/zeta/", "", "Depth", "1"), 207, "zeta's listing for "+sub+", before alice's")
+	}
+	writer := []string{"read", "create", "append", "restore", "delete"}
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
+	e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+	buf := e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "alice's GET (verified by docs)").body
+	e.expect(e.doAs(alice, "PUT", "/docs/.x.json.swp", "swap"), 201, "alice's swap file")
+	h, _ := e.load("docs", "x")
+	must(e.c.Append(e.ctx, "docs", "x", h.ID, []any{map[string]any{"op": "replace", "path": "/w", "value": 2}}))
+	op = e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	again := k.Grant(t, e.s.Now().Add(time.Second), "user:alice", []string{"alpha", "docs"}, writer)
+	if r := e.expect(e.doAs(again, "GET", "/docs/.x.json.swp", ""), 200, "alice's swap file by her token minted again"); r.body != "swap" {
+		t.Fatalf("alice's swap file %q", r.body)
+	}
+	e.expect(e.doAs(again, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 201, "alice's save, no If-Match")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": 2, "w": 2})
+}
+
+// A token dropped while idle (unused for VerifyEvery, sweep) and verified
+// again as another user (alpha, which verified it, dropped the key) has
+// the documents its old user had records of marked lost for the new one,
+// as one still kept does (TestGatewayStableUser): who each token was
+// verified as is kept past the token (idUsers), so its save from before
+// is a 409, not a rebase on the head.
+func TestGatewaySwitchAfterSweep(t *testing.T) {
+	t.Parallel()
+	clk := &testClock{t: time.Now()}
+	e, k := authEnv(t, true, func(o *dav.Options) {
+		o.Namespaces = []string{"alpha", "docs"}
+		o.Now, o.VerifyEvery = clk.now, time.Minute
+	})
+	writer := []string{"read", "create", "append", "restore", "delete", "config"}
+	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
+	bob := k.Grant(t, e.s.Now(), "user:bob", []string{"docs"}, writer)
+	e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+	buf := e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "alice's GET, verified by alpha").body
+	h, _ := e.load("docs", "x")
+	must(e.c.Append(e.ctx, "docs", "x", h.ID, []any{map[string]any{"op": "replace", "path": "/w", "value": 2}}))
+	ac := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"alpha"}, writer)))
+	nh := must(ac.NSHead(e.ctx, "alpha"))
+	must(ac.PatchConfig(e.ctx, "alpha", nh.Config, []any{map[string]any{"op": "replace", "path": "/keys", "value": []any{clienttest.NewKey("k2").Entry("*")}}}))
+	clk.add(2 * time.Minute)
+	e.expect(e.doAs(bob, "PROPFIND", "/docs/", "", "Depth", "1"), 207, "bob's listing, which sweeps alice's idle token")
+	e.expect(e.doAs(alice, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 409, "alice's save from before, verified again as another user")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": 1, "w": 2})
+}
+
+// A token verified again as another user has every document its old user
+// had records of marked lost, those the new user has records of too:
+// here alice's token for docs only, a user apart since alpha verified her
+// full token first, read the head. The full token's save from before,
+// verified again by docs as that user, is a 409, not a rebase from the
+// version the other token read.
+func TestGatewayLoseRecordsKnown(t *testing.T) {
+	t.Parallel()
+	clk := &testClock{t: time.Now()}
+	e, k := authEnv(t, true, func(o *dav.Options) {
+		o.Namespaces = []string{"alpha", "docs"}
+		o.Now, o.VerifyEvery = clk.now, time.Minute
+	})
+	writer := []string{"read", "create", "append", "restore", "delete", "config"}
+	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
+	aliceDocs := k.Grant(t, e.s.Now().Add(time.Second), "user:alice", []string{"docs"}, writer)
+	e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+	buf := e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "alice's GET, verified by alpha").body
+	h, _ := e.load("docs", "x")
+	must(e.c.Append(e.ctx, "docs", "x", h.ID, []any{map[string]any{"op": "replace", "path": "/w", "value": 2}}))
+	e.expect(e.doAs(aliceDocs, "GET", "/docs/x.json", ""), 200, "alice's docs-only token reads the head")
+	ac := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"alpha"}, writer)))
+	nh := must(ac.NSHead(e.ctx, "alpha"))
+	must(ac.PatchConfig(e.ctx, "alpha", nh.Config, []any{map[string]any{"op": "replace", "path": "/keys", "value": []any{clienttest.NewKey("k2").Entry("*")}}}))
+	clk.add(2 * time.Minute)
+	e.expect(e.doAs(alice, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 409, "the full token's save from before")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": 1, "w": 2})
+	// The docs-only token reloads, and saves.
+	buf = e.expect(e.doAs(aliceDocs, "GET", "/docs/x.json", ""), 200, "the reload").body
+	e.doAs(aliceDocs, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 3`, 1))
+	e.expect(e.doAs(aliceDocs, "GET", "/docs/x.json", ""), 200, "a reload after the refusal")
+	e.expect(e.doAs(aliceDocs, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 3`, 1)), 201, "the save after reloading")
+	_, doc = e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": 3, "w": 2})
+}
+
+// Narrowing is offline and free, so making room among a user's scopes
+// (MaxTokensPerPrincipal) never drops one that keeps scratch files or
+// locks, and narrowed tokens make room only among their own kind: eight
+// narrowings of a delegate's token leave alice's swap file and lock
+// alone; a ninth drops the least recently used narrowed scope that keeps
+// nothing; once every narrowed scope keeps a file, another narrowing is
+// a 503, and alice's files stay.
+func TestGatewayScopeChurn(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append", "restore", "delete"})
+	e.create("docs", "x", map[string]any{"v": 1})
+	e.expect(e.doAs(alice, "PUT", "/docs/.x.json.swp", "unsaved edits"), 201, "alice's swap file")
+	lock := `<?xml version="1.0"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>me</D:owner></D:lockinfo>`
+	lt := e.expect(e.doAs(alice, "LOCK", "/docs/x.json", lock, "Depth", "0"), 200, "alice's LOCK").header.Get("Lock-Token")
+	helper := narrowed(t, alice, map[string]any{"via": "svc:helper"})
+	var toks []string
+	for i := 0; i < 9; i++ {
+		tok := narrowed(t, helper, map[string]any{"via": fmt.Sprintf("svc:helper/%d", i)})
+		toks = append(toks, tok)
+		e.expect(e.doAs(tok, "GET", "/docs/x.json", ""), 200, "a further narrowing's GET")
+	}
+	if r := e.expect(e.doAs(alice, "GET", "/docs/.x.json.swp", ""), 200, "alice's swap file after 9 narrowings"); r.body != "unsaved edits" {
+		t.Fatalf("alice's swap file %q", r.body)
+	}
+	// Each narrowed scope kept (the last 8) keeps a file.
+	for i, tok := range toks[1:] {
+		e.expect(e.doAs(tok, "PUT", fmt.Sprintf("/docs/.n%d.swp", i), "n"), 201, "a narrowing's swap file")
+	}
+	r := e.expect(e.doAs(narrowed(t, helper, map[string]any{"via": "svc:helper/new"}), "GET", "/docs/x.json", ""), 503, "another narrowing, every narrowed scope keeping a file")
+	if r.header.Get("Retry-After") == "" {
+		t.Fatalf("503 without Retry-After: %v", r.header)
+	}
+	e.expect(e.doAs(toks[1], "GET", "/docs/.n0.swp", ""), 200, "a narrowing's swap file, kept")
+	if r := e.expect(e.doAs(alice, "GET", "/docs/.x.json.swp", ""), 200, "alice's swap file"); r.body != "unsaved edits" {
+		t.Fatalf("alice's swap file %q", r.body)
+	}
+	e.expect(e.doAs(alice, "UNLOCK", "/docs/x.json", "", "Lock-Token", lt), 204, "alice's UNLOCK of her lock")
+}
+
+// Dead properties are bounded per user over the user's scopes (1 MiB),
+// as scratch files and locks are, not per scope: four narrowings of one
+// token, each setting 900 kB, keep at most 1 MiB in all.
+func TestGatewayDeadPropsPerUser(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"docs"}, []string{"read"})
+	toks := []string{alice}
+	for i := 0; i < 3; i++ {
+		toks = append(toks, narrowed(t, alice, map[string]any{"via": fmt.Sprintf("dev%d", i)}))
+	}
+	value := strings.Repeat("v", 60000)
+	for j, tok := range toks {
+		e.create("docs", fmt.Sprintf("a%d", j), map[string]any{"v": j})
+		for i := 0; i < 15; i++ {
+			pp := fmt.Sprintf(`<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:x"><D:set><D:prop><Z:p%d>%s</Z:p%d></D:prop></D:set></D:propertyupdate>`, i, value, i)
+			e.expect(e.doAs(tok, "PROPPATCH", fmt.Sprintf("/docs/a%d.json", j), pp), 207, "PROPPATCH")
+		}
+	}
+	total := 0
+	for j, tok := range toks {
+		for i := 0; i < 15; i++ {
+			body := fmt.Sprintf(`<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:Z="urn:x"><D:prop><Z:p%d/></D:prop></D:propfind>`, i)
+			if r := e.expect(e.doAs(tok, "PROPFIND", fmt.Sprintf("/docs/a%d.json", j), body, "Depth", "0"), 207, "PROPFIND"); strings.Contains(r.body, value) {
+				total += len(value)
+			}
+		}
+	}
+	if total > 1<<20 || total == 0 {
+		t.Fatalf("one user keeps %d bytes of dead properties over 4 narrowings of one token", total)
+	}
+	// The last token's own, set last, are kept.
+	body := `<?xml version="1.0"?><D:propfind xmlns:D="DAV:" xmlns:Z="urn:x"><D:prop><Z:p14/></D:prop></D:propfind>`
+	if r := e.expect(e.doAs(toks[3], "PROPFIND", "/docs/a3.json", body, "Depth", "0"), 207, "PROPFIND"); !strings.Contains(r.body, value) {
+		t.Fatalf("the last set property is gone")
+	}
+}
+
+// opKeysFront is a core behind a proxy that rewrites the root document's
+// jwks_uri to keys, a key set host the test controls.
+func opKeysFront(t *testing.T, s *clienttest.Server, keys http.Handler) string {
+	t.Helper()
+	jwks := newTestServer(t, keys)
+	rp := httputil.NewSingleHostReverseProxy(must(url.Parse(s.URL)))
+	rp.Transport = s.HTTP.Client().Transport
+	rp.ModifyResponse = func(r *http.Response) error {
+		if r.Request.URL.Path != "/" || r.StatusCode != 200 {
+			return nil
+		}
+		b, _ := io.ReadAll(r.Body)
+		r.Body.Close()
+		b = []byte(strings.Replace(string(b), `"jwks_uri":`, `"jwks_uri":"`+jwks.URL+`/keys","was":`, 1))
+		r.Body = io.NopCloser(strings.NewReader(string(b)))
+		r.ContentLength = int64(len(b))
+		r.Header.Set("Content-Length", fmt.Sprint(len(b)))
+		return nil
+	}
+	return newTestServer(t, rp).URL
+}
+
+// The deployment's operator keys (§C.4) are read again once they are 5
+// minutes old: once for every verification asking meanwhile, which use
+// those read before until it is done, and, failed, not again for 30
+// seconds (logins don't each wait for a key set host that is down).
+func TestGatewayOperatorKeysRefresh(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	k := clienttest.NewKey("k")
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+	must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	var fetches atomic.Int64
+	var failing atomic.Bool
+	release := make(chan struct{})
+	var hold atomic.Bool
+	front := opKeysFront(t, s, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fetches.Add(1)
+		if hold.Load() {
+			<-release
+		}
+		if failing.Load() {
+			http.Error(w, "down", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/jwk-set+json")
+		io.WriteString(w, `{"keys":[]}`)
+	}))
+	clk := &testClock{t: time.Now()}
+	srv := must(dav.New(dav.Options{Client: must(client.New(front)), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf, Now: clk.now}))
+	e := &env{t: t, ctx: ctx, s: s, dav: newTestServer(t, srv)}
+	login := func(i int) resp {
+		return e.doAs(k.Grant(t, s.Now(), fmt.Sprintf("user:u%d", i), []string{"docs"}, []string{"read"}), "PROPFIND", "/docs/", "", "Depth", "1")
+	}
+	e.expect(login(0), 207, "the first login")
+	if n := fetches.Load(); n != 1 {
+		t.Fatalf("%d reads of the key set", n)
+	}
+	// 6 minutes on, the host down: one read, then none for 30 s.
+	clk.add(6 * time.Minute)
+	failing.Store(true)
+	for i := 1; i <= 5; i++ {
+		e.expect(login(i), 207, "a login with the key set down")
+	}
+	for deadline := time.Now().Add(10 * time.Second); fetches.Load() < 2; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the key set wasn't read again")
+		}
+	}
+	for i := 6; i <= 8; i++ {
+		e.expect(login(i), 207, "a login with the key set down")
+	}
+	if n := fetches.Load(); n != 2 {
+		t.Fatalf("%d reads of the key set, 8 logins with it down within 30 s of a failed read", n)
+	}
+	// 31 s on, the host hangs: logins don't wait for it, and it is read once.
+	clk.add(31 * time.Second)
+	hold.Store(true)
+	var wg sync.WaitGroup
+	for i := 10; i < 14; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if r := login(i); r.status != 207 {
+				t.Errorf("a login while the key set is read: %d %q", r.status, r.body)
+			}
+		}()
+	}
+	wg.Wait()
+	close(release)
+	for deadline := time.Now().Add(10 * time.Second); fetches.Load() < 3; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the key set wasn't read again")
+		}
+	}
+	e.expect(login(20), 207, "a login after the read")
+	if n := fetches.Load(); n != 3 {
+		t.Fatalf("%d reads of the key set, 5 logins while one hangs or just failed", n)
+	}
+}
+
+// A key set the core's jwks_uri doesn't serve (a 404: a proxy in front of
+// the core that doesn't route /.well-known) is a failed read, not "no
+// operator keys": with none read, the core is asked whether a namespace's
+// own keys verify each grant, so alice's grant (docs' key, whose kid is
+// the operator key's) is served, and an operator grant for her sub isn't.
+func TestGatewayOperatorKeys404(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	k := clienttest.NewKey("operator")
+	op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+	must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	rp := httputil.NewSingleHostReverseProxy(must(url.Parse(s.URL)))
+	rp.Transport = s.HTTP.Client().Transport
+	front := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/.well-known/") {
+			http.NotFound(w, r)
+			return
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	srv := must(dav.New(dav.Options{Client: must(client.New(front.URL)), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf}))
+	e := &env{t: t, ctx: ctx, s: s, dav: newTestServer(t, srv)}
+	alice := k.Grant(t, s.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append"})
+	e.expect(e.doAs(alice, "PUT", "/docs/.notes.md.swp", "alice's unsaved draft"), 201, "alice's swap file")
+	opAlice := clienttest.Mint(t, s.OperatorKey, map[string]any{"kid": "operator", "sub": "user:alice", "ns": []any{"docs"},
+		"can": []any{"read"}, "exp": s.Now().Add(time.Hour).Format(time.RFC3339)})
+	e.expect(e.doAs(opAlice, "GET", "/docs/.notes.md.swp", ""), 401, "the operator grant, the key set answered 404")
+}
+
+// An operator who lists its own key in a namespace document under the
+// same kid (§C.4) mints grants the core serves as that namespace's (it
+// verifies namespace keys first): the gateway serves them too. In a
+// public namespace, whose reads ignore a grant, the document says which
+// key signed it: an operator grant there whose kid a different key of the
+// namespace carries is refused.
+func TestGatewayOperatorKeyInNamespace(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	opKey := clienttest.Key{Kid: "operator", Priv: s.OperatorKey, Pub: base64.RawURLEncoding.EncodeToString(s.OperatorKey.Public().(ed25519.PublicKey))}
+	other := clienttest.NewKey("operator")
+	for ns, doc := range map[string]map[string]any{
+		"docs":  {"read": "grant", "keys": []any{opKey.Entry("*")}},
+		"pub":   {"read": "public", "keys": []any{opKey.Entry("*")}},
+		"pub2":  {"read": "public", "keys": []any{other.Entry("*")}},
+		"other": {"read": "grant", "keys": []any{other.Entry("*")}},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	srv := must(dav.New(dav.Options{Client: s.Client(t), Namespaces: []string{"docs", "other", "pub", "pub2"}, Gateway: true, Logf: t.Logf}))
+	e := &env{t: t, ctx: ctx, s: s, dav: newTestServer(t, srv)}
+	for _, ns := range []string{"docs", "pub"} {
+		tok := opKey.Grant(t, s.Now(), "user:ops", []string{ns}, []string{"read", "create", "append"})
+		must(s.Client(t, client.WithBearer(tok)).CreateDoc(ctx, ns, "x", map[string]any{"v": 1}))
+		e.expect(e.doAs(tok, "GET", "/"+ns+"/x.json", ""), 200, "a grant of the operator's key "+ns+" lists")
+	}
+	for _, ns := range []string{"other", "pub2"} {
+		tok := opKey.Grant(t, s.Now(), "user:ops", []string{ns}, []string{"read"})
+		if r := e.expect(e.doAs(tok, "PROPFIND", "/"+ns+"/", "", "Depth", "1"), 401, "an operator grant in "+ns+", whose key named operator is another"); !strings.Contains(r.body, "operator key") {
+			t.Fatalf("401 %q", r.body)
 		}
 	}
 }
