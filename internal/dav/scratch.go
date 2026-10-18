@@ -99,8 +99,25 @@ func (st *reqState) scratchMkdir(name string) error {
 	return st.scratchSet(name, &scratchFile{dir: true})
 }
 
+// mayKeep refuses a scratch file or directory at name in a served
+// namespace the principal's grant doesn't name: the server would keep it
+// there for a user who can't list the namespace, nor write to it.
+func (st *reqState) mayKeep(name string) error {
+	if st.p.named == nil {
+		return nil
+	}
+	ns, _, _ := strings.Cut(strings.TrimPrefix(name, "/"), "/")
+	if (st.s.flat[ns] || st.s.cats[ns]) && !st.p.named[ns] {
+		return fail(http.StatusForbidden, "your grant doesn't name namespace %s: nothing is kept there for you (temporary files included)", ns)
+	}
+	return nil
+}
+
 func (st *reqState) scratchSet(name string, f *scratchFile) error {
 	s, p := st.s, st.p
+	if err := st.mayKeep(name); err != nil {
+		return err
+	}
 	if len(f.data) > s.opt.MaxFileSize {
 		return fail(http.StatusRequestEntityTooLarge, "a file is at most %d bytes", s.opt.MaxFileSize)
 	}
@@ -226,6 +243,9 @@ func (st *reqState) scratchUnmark(name string) {
 // scratchRename moves a scratch file or directory, with everything in it;
 // it replaces what is at newName.
 func (st *reqState) scratchRename(oldName, newName string) error {
+	if err := st.mayKeep(newName); err != nil {
+		return err
+	}
 	p := st.p
 	p.mu.Lock()
 	defer p.mu.Unlock()

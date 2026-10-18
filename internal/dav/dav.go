@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"net/url"
 	"path"
@@ -380,7 +381,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	h := &webdav.Handler{FileSystem: s.fs, LockSystem: &boundedLS{LockSystem: p.locks, st: st}, Logger: func(r *http.Request, err error) {
-		if err != nil && !errors.Is(err, errNotExist) {
+		// Not logged: no such file, and a MKCOL of a directory that
+		// exists (405), which rclone sends before every upload.
+		if err != nil && !errors.Is(err, errNotExist) && !errors.Is(err, fs.ErrExist) {
 			s.opt.Logf("dav: %s %s: %v", r.Method, r.URL.Path, err)
 		}
 	}}
@@ -600,7 +603,11 @@ func (s *Server) authenticate(r *http.Request) (*principal, *davError) {
 		s.refusedMu.Unlock()
 	}
 	ns, _ := v.(string)
-	p, de := s.admit(id, rootOf(ns, g), c, err)
+	named := map[string]bool{}
+	for _, n := range s.namespaces() {
+		named[n] = g.NamesNS(n)
+	}
+	p, de := s.admit(id, rootOf(ns, g), c, named, err)
 	if de != nil {
 		return nil, de
 	}
@@ -617,10 +624,10 @@ const (
 	refusedFor   = 30 * time.Second
 )
 
-// admit returns the principal of a grant (id, its root, its client) the
-// core accepted, or refused with err: then what was kept for it goes
-// (revoked, or its key withdrawn).
-func (s *Server) admit(id, root string, c *client.Client, err error) (*principal, *davError) {
+// admit returns the principal of a grant (id, its root, its client, the
+// served namespaces it names) the core accepted, or refused with err:
+// then what was kept for it goes (revoked, or its key withdrawn).
+func (s *Server) admit(id, root string, c *client.Client, named map[string]bool, err error) (*principal, *davError) {
 	now := s.opt.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -647,6 +654,7 @@ func (s *Server) admit(id, root string, c *client.Client, err error) (*principal
 		}
 		a.principals++
 		p = s.newPrincipal(id, c, a)
+		p.named = named
 		s.principals[id] = p
 	}
 	p.verified, p.used = now, now
@@ -923,6 +931,9 @@ type principal struct {
 	c     *client.Client
 	locks webdav.LockSystem
 	acct  *account
+	// named: in a gateway, whether the grant names each served namespace
+	// (§C.2); nil in local mode, whose grant the operator chose them for.
+	named map[string]bool
 
 	// under Server.mu
 	used, verified time.Time
@@ -989,11 +1000,12 @@ func (p *principal) noteDelete(ns, name, tomb string, now time.Time) {
 }
 
 // deletedOwn reports whether tomb, ns/name's head, is the principal's own
-// DELETE.
+// DELETE; with tomb "", whether it deleted ns/name lately.
 func (p *principal) deletedOwn(ns, name, tomb string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.deletes[ns+"/"+name].tomb == tomb
+	d, ok := p.deletes[ns+"/"+name]
+	return ok && (tomb == "" || d.tomb == tomb)
 }
 
 func (p *principal) forgetDelete(ns, name string) {
@@ -1028,8 +1040,9 @@ type reqState struct {
 	// placeholder: the PUT's preconditions found an empty placeholder
 	// (scratch) at its document path, which exists for If-Match: *.
 	placeholder bool
-	bodyErr     error // reading the request body failed
-	noETag      bool  // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
+	bodyErr     error  // reading the request body failed
+	noETag      bool   // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
+	made        string // the revision commitDoc created or restored a document with
 	serve       *stagedServe
 
 	lists  map[string]*listing     // by directory path

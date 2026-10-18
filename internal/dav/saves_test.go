@@ -611,3 +611,54 @@ func TestSavePreconditionsPlaceholder(t *testing.T) {
 	_, doc := e.load("docs", "new")
 	sameJSON(t, doc, map[string]any{"v": 1})
 }
+
+// A save that deletes the original before writing the new version gets
+// it back whatever refuses the write that follows, not only a conflict: a
+// body that isn't JSON (rclone's mount without a cache renames over a
+// file as DELETE, then MOVE of a scratch file onto the name), one over
+// -max-file-size, a failed precondition. A placement unplaced by the
+// user's DELETE before a write to its path is placed back the same way.
+func TestSaveDeleteThenWriteFails(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{
+		"cat": {"catalog": map[string]any{"trust": []any{"docs"}}},
+	}, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize = 1024 })
+	for i, c := range []struct {
+		what   string
+		status int
+		write  func(p string) resp
+	}{
+		{"PUT of a body that isn't JSON", 400, func(p string) resp { return e.do("PUT", p, `{"v": 2`) }},
+		{"MOVE of a scratch file that isn't JSON", 400, func(p string) resp {
+			e.expect(e.do("PUT", "/docs/sedXYZ", `{"v": 2`), 201, "PUT scratch")
+			return e.do("MOVE", "/docs/sedXYZ", "", "Destination", p, "Overwrite", "F")
+		}},
+		{"PUT over -max-file-size", 413, func(p string) resp { return e.do("PUT", p, `{"v": "`+strings.Repeat("x", 2000)+`"}`) }},
+		{"PUT with If-Match: *", 412, func(p string) resp { return e.do("PUT", p, `{"v": 2}`, "If-Match", "*") }},
+	} {
+		name := "x" + strconv.Itoa(i)
+		e.create("docs", name, map[string]any{"v": 1})
+		e.expect(e.do("GET", "/docs/"+name+".json", ""), 200, "GET")
+		e.expect(e.do("DELETE", "/docs/"+name+".json", ""), 204, "DELETE")
+		r := e.expect(c.write("/docs/"+name+".json"), c.status, c.what)
+		if !strings.Contains(r.body, "restored as it was") {
+			t.Fatalf("%s: %q", c.what, r.body)
+		}
+		h, doc := e.load("docs", name)
+		if h.State != client.Live {
+			t.Fatalf("%s: the document is %v", c.what, h.State)
+		}
+		sameJSON(t, doc, map[string]any{"v": 1})
+		if en := e.lastEntry("docs", name); en.Kind != "rev" || len(en.Patches.([]any)) != 0 {
+			t.Fatalf("%s: restored with %+v", c.what, en)
+		}
+	}
+	e.create("docs", "p", map[string]any{"v": 1})
+	e.create("cat", "root", map[string]any{"parents": []any{}})
+	e.create("cat", "docs.p", map[string]any{"parents": parents("cat", "root")})
+	e.expect(e.do("DELETE", "/cat/root/docs.p.json", ""), 204, "DELETE placement")
+	e.expect(e.do("PUT", "/cat/root/docs.p.json", `{"v": 2`), 400, "PUT of a body that isn't JSON to its path")
+	sameJSON(t, e.parentsOf("docs.p"), parents("cat", "root"))
+	_, doc := e.load("docs", "p")
+	sameJSON(t, doc, map[string]any{"v": 1})
+}

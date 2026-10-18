@@ -58,7 +58,10 @@ func newEnv(t *testing.T, flat, catalogs []string, nsDocs map[string]map[string]
 			t.Fatal(err)
 		}
 	}
-	dopt.Client, dopt.Namespaces, dopt.Catalogs, dopt.Password, dopt.Logf = s.Client(t, client.WithAuthor("dav")), flat, catalogs, e.pw, t.Logf
+	dopt.Client, dopt.Namespaces, dopt.Catalogs, dopt.Password = s.Client(t, client.WithAuthor("dav")), flat, catalogs, e.pw
+	if dopt.Logf == nil {
+		dopt.Logf = t.Logf
+	}
 	srv, err := dav.New(dopt)
 	if err != nil {
 		t.Fatal(err)

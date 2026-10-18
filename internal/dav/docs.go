@@ -91,12 +91,15 @@ func (s *Server) keep(k string, e *docEntry) {
 
 // nsInfo is what writes to a namespace need from its document: whether
 // it is sealed or end-to-end (not served for writing here), whether
-// writes add a fresh $nonce (§C.7), and a catalog's trust list (§B.3).
+// writes add a fresh $nonce (§C.7), a catalog's trust list (§B.3), and
+// the size limits it sets (§6.6; 0 where it sets none, and the
+// deployment's apply), for messages.
 type nsInfo struct {
-	sealed bool
-	nonce  bool
-	trust  []string
-	at     time.Time
+	sealed                bool
+	nonce                 bool
+	trust                 []string
+	patchSetSize, docSize int
+	at                    time.Time
 }
 
 // nsInfo reads ns's document with p's grant, at most every 30 seconds. A
@@ -126,6 +129,13 @@ func (s *Server) nsInfo(ctx context.Context, p *principal, ns string) nsInfo {
 		lv, _ := enc["level"].(string)
 		in.sealed = lv == "sealed" || lv == "e2e"
 		in.nonce = d.Value["nonce"] == "required"
+		lim, _ := d.Value["limits"].(map[string]any)
+		if n, ok := lim["patchSetSize"].(float64); ok {
+			in.patchSetSize = int(n)
+		}
+		if n, ok := lim["documentSize"].(float64); ok {
+			in.docSize = int(n)
+		}
 		cat, _ := d.Value["catalog"].(map[string]any)
 		ts, _ := cat["trust"].([]any)
 		for _, t := range ts {

@@ -76,8 +76,8 @@ func TestGateway(t *testing.T) {
 		t.Fatalf("entry %+v %+v", en, en.Grant)
 	}
 	r := e.expect(e.doAs(bob, "PUT", "/docs/b.json", `{"by": "bob"}`), 403, "bob's PUT")
-	if !strings.Contains(r.body, "403") {
-		t.Fatalf("403 text %q", r.body)
+	if !strings.Contains(r.body, "forbidden") || !strings.Contains(r.body, "create") || strings.Contains(r.body, "403") {
+		t.Fatalf("403 text %q: the core's code and message, not its status again", r.body)
 	}
 	sameStrings(t, "bob's listing", names(e.propfindAs(bob, "/docs/"), "/docs/"), []string{"a.json"})
 
@@ -540,4 +540,64 @@ func TestXMLBodyBound(t *testing.T) {
 	}
 	e.expect(e.doAs(reader, "PROPPATCH", "/docs/.x", pp(100<<10)), 413, "PROPPATCH of 100 KiB")
 	e.expect(e.doAs(reader, "PROPPATCH", "/docs/.x", pp(32<<10)), 207, "PROPPATCH of 32 KiB")
+}
+
+// In a gateway, nothing is kept for a user in a served namespace their
+// grant doesn't name, which they can't list: scratch files and
+// directories there are refused, as in a catalog the core's refusal of
+// its tree refuses them.
+func TestGatewayScratchUnnamed(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true, func(o *dav.Options) { o.Namespaces = []string{"docs", "secret"} })
+	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "secret")))
+	must(op.CreateNamespace(e.ctx, "secret", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	carol := k.Grant(t, e.s.Now(), "user:carol", []string{"secret"}, []string{"read", "create", "append"})
+	e.expect(e.doAs(carol, "PROPFIND", "/docs/", "", "Depth", "1"), 403, "carol lists docs")
+	e.expect(e.doAs(carol, "PUT", "/docs/.scratch.swp", "x"), 403, "carol's scratch file in docs")
+	e.expect(e.doAs(carol, "MKCOL", "/docs/.TemporaryItems", ""), 403, "carol's scratch directory in docs")
+	e.expect(e.doAs(carol, "GET", "/docs/.scratch.swp", ""), 404, "carol's scratch file in docs, kept")
+	e.expect(e.doAs(carol, "PUT", "/secret/.scratch.swp", "x"), 201, "carol's scratch file in secret")
+	e.expect(e.doAs(carol, "MOVE", "/secret/.scratch.swp", "", "Destination", "/docs/.moved"), 403, "carol's scratch file moved to docs")
+	e.expect(e.doAs(carol, "PUT", "/.DS_Store", "x"), 201, "carol's scratch file at the root")
+}
+
+// In a gateway, a PUT of a new placement whose item doesn't exist is
+// checked by a dry run of the placement with the user's grant (§7.5)
+// before the item is created: a catalog the grant reads but can't write
+// (its role there allows only read) refuses it, and nothing is written;
+// one it writes takes it.
+func TestGatewayPlacementRefusedByGrant(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	ctx := context.Background()
+	k := clienttest.NewKey("k")
+	member := func(can ...any) map[string]any { return map[string]any{"member": map[string]any{"can": can}} }
+	for ns, doc := range map[string]map[string]any{
+		"matches": {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read", "create", "append")},
+		"cat":     {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read", "create", "append"), "catalog": map[string]any{"trust": []any{"matches"}}},
+		"ro":      {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read"), "catalog": map[string]any{"trust": []any{"matches"}}},
+	} {
+		op := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
+		must(op.CreateNamespace(ctx, ns, doc))
+	}
+	admin := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"matches", "cat", "ro"}, []string{"read", "create", "append"})))
+	for _, cat := range []string{"cat", "ro"} {
+		must(admin.CreateDoc(ctx, cat, "root", map[string]any{"parents": []any{}}))
+	}
+	srv := must(dav.New(dav.Options{Client: s.Client(t), Namespaces: []string{"matches"}, Catalogs: []string{"cat", "ro"}, Gateway: true, Logf: t.Logf}))
+	hs := httptest.NewServer(srv)
+	defer hs.Close()
+	e := &env{t: t, ctx: ctx, s: s, c: admin, dav: hs}
+	alice := k.Grant(t, s.Now(), "user:alice", []string{"matches", "cat", "ro"}, nil, map[string]any{"roles": []any{"member"}})
+	sameStrings(t, "ro", names(e.propfindAs(alice, "/ro/"), "/ro/"), []string{"root/"})
+	e.expect(e.doAs(alice, "PUT", "/ro/root/matches.refused.json", `{"title": "Refused"}`), 403, "PUT of a placement in a catalog the grant only reads")
+	if h, _ := e.load("matches", "refused"); h.State != client.NotFound {
+		t.Fatalf("a refused placement created its item: %v", h.State)
+	}
+	e.expect(e.doAs(alice, "PUT", "/cat/root/matches.taken.json", `{"title": "Taken"}`), 201, "PUT of a placement in a catalog the grant writes")
+	_, doc := e.load("matches", "taken")
+	sameJSON(t, doc, map[string]any{"title": "Taken"})
+	if en := e.lastEntry("cat", "matches.taken"); en.Grant == nil || en.Grant.Sub != "user:alice" {
+		t.Fatalf("placement entry %+v", en)
+	}
 }

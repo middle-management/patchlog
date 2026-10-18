@@ -228,8 +228,11 @@ func TestInvalid(t *testing.T) {
 	}
 }
 
-// DELETE tombstones (§8.1); a PUT of the name restores it with the whole
-// document, on the same chain (§8.2).
+// DELETE tombstones (§8.1); a PUT of the name restores it on the same
+// chain (§8.2), with the diff from the last live document, as a save over
+// a live one from a user who never read it is the diff from the head (a
+// whole new document would also count its full size against
+// patchSetSize).
 func TestDeleteRestore(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"docs"}, nil, nil)
@@ -246,7 +249,9 @@ func TestDeleteRestore(t *testing.T) {
 	if len(log) != 3 || log[1].Kind != "tombstone" || log[2].Parent != log[1].ID || log[2].Kind != "rev" {
 		t.Fatalf("log %+v", log)
 	}
-	sameJSON(t, log[2].Patches, []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"v": 2}}})
+	sameJSON(t, log[2].Patches, []any{map[string]any{"op": "replace", "path": "/v", "value": 2}})
+	_, doc := e.load("docs", "a")
+	sameJSON(t, doc, map[string]any{"v": 2})
 }
 
 // Editors' save sequences: vim's (swap file, the original moved aside as a
@@ -433,21 +438,29 @@ func TestLimits(t *testing.T) {
 	})
 	e.create("small", "x", map[string]any{"v": 1})
 	e.do("GET", "/small/x.json", "")
-	e.expect(e.do("PUT", "/small/x.json", `{"v": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 413, "PUT over patchSetSize")
+	// A 413 says what the core doesn't: the sizes, and the limit the
+	// namespace sets (§6.6); not the status again.
+	r := e.expect(e.do("PUT", "/small/x.json", `{"v": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 413, "PUT over patchSetSize")
+	if strings.HasPrefix(r.body, "413") || !strings.Contains(r.body, "patch set too large") || !strings.Contains(r.body, "patch set is 2039 bytes") || !strings.Contains(r.body, "patchSetSize 1024") {
+		t.Fatalf("413 text %q", r.body)
+	}
 	e.expect(e.do("PUT", "/slow/x.json", `{"v": 1}`), 201, "first write")
-	r := e.expect(e.do("PUT", "/slow/x.json", `{"v": 2}`), 503, "rate limited")
+	r = e.expect(e.do("PUT", "/slow/x.json", `{"v": 2}`), 503, "rate limited")
 	if r.header.Get("Retry-After") == "" {
 		t.Fatalf("503 without Retry-After: %v", r.header)
 	}
 
-	// A frozen namespace (§8.4) takes no writes: 423.
+	// A frozen namespace (§8.4) takes no writes, for good: 403, which
+	// clients don't retry (rclone retries a 423, a lock that may go, 30
+	// times over 45 seconds).
 	nh := must(e.c.NSHead(e.ctx, "small"))
 	must(e.c.PatchConfig(e.ctx, "small", nh.Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
-	r = e.expect(e.do("PUT", "/small/x.json", `{"v": 2}`), 423, "PUT to a frozen namespace")
-	if !strings.Contains(r.body, "frozen") {
-		t.Fatalf("423 text %q", r.body)
+	r = e.expect(e.do("PUT", "/small/x.json", `{"v": 2}`), 403, "PUT to a frozen namespace")
+	if !strings.Contains(r.body, "frozen") || strings.Contains(r.body, "409") {
+		t.Fatalf("403 text %q", r.body)
 	}
-	e.expect(e.do("DELETE", "/small/x.json", ""), 423, "DELETE in a frozen namespace")
+	e.expect(e.do("DELETE", "/small/x.json", ""), 403, "DELETE in a frozen namespace")
+	e.expect(e.do("PUT", "/small/new.json", `{"v": 1}`), 403, "create in a frozen namespace")
 }
 
 // A 429 with a short Retry-After is waited out (§6.6).
@@ -740,4 +753,39 @@ func TestDuplicateThenRename(t *testing.T) {
 	e.expect(e.do("MOVE", "/cat/root/season/matches.derby%20copy.json", "", "Destination", "/cat/root/season/matches.derby2.json"), 201, "rename it")
 	_, doc := e.load("matches", "derby2")
 	sameJSON(t, doc, map[string]any{"title": "Derby"})
+}
+
+// MKCOL of a directory that exists is 405 (RFC 4918 §9.3.1) and isn't
+// logged: rclone sends one for the parent before every upload. MKCOL
+// below a file is 409 saying so.
+func TestMkcolExisting(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var logged []string
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, nil, func(_ *clienttest.Options, o *dav.Options) {
+		o.Logf = func(format string, args ...any) {
+			mu.Lock()
+			logged = append(logged, fmt.Sprintf(format, args...))
+			mu.Unlock()
+		}
+	})
+	e.create("docs", "x", map[string]any{"v": 1})
+	e.create("cat", "root", map[string]any{"parents": []any{}})
+	e.create("cat", "docs.x", map[string]any{"parents": parents("cat", "root")})
+	e.expect(e.do("MKCOL", "/docs/.TemporaryItems", ""), 201, "MKCOL scratch directory")
+	for _, p := range []string{"/", "/docs/", "/docs", "/cat/", "/cat/root/", "/docs/.TemporaryItems"} {
+		e.expect(e.do("MKCOL", p, ""), 405, "MKCOL "+p)
+	}
+	for _, p := range []string{"/docs/x.json/sub", "/cat/root/docs.x.json/sub", "/cat/root/nowhere/sub"} {
+		if r := e.expect(e.do("MKCOL", p, ""), 409, "MKCOL below a file"); !strings.Contains(r.body, "isn't a folder") {
+			t.Fatalf("MKCOL %s: %q", p, r.body)
+		}
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, l := range logged {
+		if strings.Contains(l, "MKCOL") && strings.Contains(l, "exist") {
+			t.Fatalf("logged: %s", l)
+		}
+	}
 }

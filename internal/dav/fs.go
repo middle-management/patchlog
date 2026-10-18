@@ -425,6 +425,11 @@ func (st *reqState) stat(ctx context.Context, t target) (*fileInfo, error) {
 		if live {
 			return st.docInfo(t.base, hd), nil
 		}
+		if t.kind == kPlacement && st.method == "DELETE" && t.path == st.path {
+			// A placement whose item isn't live (dangling, §B.3): not
+			// listed, but there for its DELETE, which unplaces it.
+			return &fileInfo{name: t.base, mode: 0o644, mod: st.s.start}, nil
+		}
 	}
 	if f, ok := st.scratchGet(t.path); ok {
 		return scratchInfo(t.base, f), nil
@@ -494,7 +499,7 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 			return nil, fail(http.StatusMethodNotAllowed, "%s is a directory", t.path)
 		}
 		if err := st.preconditions(ctx, t); err != nil {
-			return nil, err
+			return nil, st.undoOwnDelete(ctx, t, err)
 		}
 		switch {
 		case t.isDoc():
@@ -585,7 +590,8 @@ func (st *reqState) mkdir(ctx context.Context, name string) error {
 	}
 	switch t.kind {
 	case kMissing:
-		return errNotExist
+		// RFC 4918 §9.3.1: 409, the parent not being a collection.
+		return fail(http.StatusConflict, "%s can't be made: %s isn't a folder here (a file, or nothing); make the folders above it first", t.path, t.dir)
 	case kRoot, kNSDir, kCatDir, kFolder:
 		return os.ErrExist
 	case kNewFolder:
@@ -642,14 +648,15 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		}
 	case kFolder, kPlacement:
 		if t.kind == kPlacement {
+			// A placement whose item isn't live (dangling, §B.3) isn't
+			// listed, but its path unplaces it: else it would keep its
+			// folder from being deleted, with nothing to show for it.
 			hd, live, err := st.docAt(ctx, t)
-			if err != nil {
+			switch {
+			case err != nil:
 				return err
-			} else if !live {
-				break
-			}
-			if st.ifMatch != "" && hd.rev != st.ifMatch {
-				return fail(http.StatusPreconditionFailed, "%s/%s changed since %s (If-Match); reload it", hd.ns, hd.name, st.ifMatch)
+			case st.ifMatch != "" && (!live || hd.rev != st.ifMatch):
+				return fail(http.StatusPreconditionFailed, "%s/%s changed since %s (If-Match); reload it", t.docNS, t.docName, st.ifMatch)
 			}
 		}
 		return st.unplace(ctx, t)
@@ -706,10 +713,26 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		st.p.setAside(src.path, st.s.opt.Now())
 		return nil
 	case live || src.kind == kFolder:
-		if st.isCatalogMove(src, dst) {
+		switch {
+		case st.isCatalogMove(src, dst):
 			return st.move(ctx, src, dst)
+		case live && src.kind == kDoc && (dst.kind == kNewPlacement || dst.kind == kPlacement) && dst.docNS == src.docNS && dst.docName == src.docName:
+			// A document of a flat directory into a catalog folder: the
+			// same document placed there, as a COPY places it. It stays
+			// in its namespace, so in the flat directory too.
+			return st.placeByMove(ctx, src, dst)
+		case live && src.kind == kPlacement && dst.kind == kDoc && dst.docNS == src.docNS && dst.docName == src.docName:
+			// A placement onto its own item's file in the flat directory:
+			// unplaced, as a DELETE of it does (§B.7); the item stays.
+			return st.unplace(ctx, src)
+		case src.kind == kFolder && dst.ns == src.ns && dst.base != src.base:
+			return fail(http.StatusForbidden, "folder names are identity (§3.6, §B.2): folder %s can't be renamed; make a folder %s, move what is in %s into it, then delete %s", src.node, dst.base, src.node, src.node)
+		case src.kind == kFolder:
+			return fail(http.StatusForbidden, "folder %s moves only between the folders of catalog %s", src.node, src.ns)
+		case src.kind == kPlacement && (dst.kind == kNewPlacement || dst.kind == kPlacement) && dst.ns == src.ns:
+			return fail(http.StatusForbidden, "names are identity (§3.6, §B.1): a placement is named by its item, %s.%s, and can't be renamed; move it to another folder under the same name", src.docNS, src.docName)
 		}
-		return fail(http.StatusForbidden, "names are identity (§3.6, §B.1): a document can't be renamed or moved to another namespace; copy it to a new name and delete the old one")
+		return fail(http.StatusForbidden, "names are identity (§3.6, §B.1): a document can't be renamed or moved to another namespace; copy it to a new name and delete the old one, or, into a catalog folder, under its own name {ns}.{name}.json")
 	case src.kind == kScratch && src.sdir:
 		switch dst.kind {
 		case kNewFolder:
@@ -745,7 +768,7 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 			return err
 		}
 		if _, _, err := st.commitRev(ctx, dst, f.data); err != nil {
-			return err
+			return st.undoOwnDelete(ctx, dst, upstream(err))
 		}
 		st.scratchRemove(src.path)
 		return nil
@@ -753,6 +776,26 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		return st.scratchRename(src.path, dst.path)
 	}
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
+}
+
+// placeByMove places the document of flat path src in catalog folder
+// dst, as a COPY would: its content written to the placement's path,
+// which edits nothing.
+func (st *reqState) placeByMove(ctx context.Context, src, dst target) error {
+	if err := st.writable(ctx, dst); err != nil {
+		return err
+	}
+	hd, live, err := st.docAt(ctx, src)
+	switch {
+	case err != nil:
+		return err
+	case !live:
+		return errNotExist
+	case hd.e.sealed:
+		return fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E)", hd.ns, hd.name)
+	}
+	_, _, err = st.commitRev(ctx, dst, st.repr(hd))
+	return err
 }
 
 // commitRev writes body to the document a path names: an edit, a create
@@ -843,13 +886,14 @@ func (w *writeFile) Close() error {
 		w.st.p.acct.release(w.held)
 	}()
 	switch {
-	case w.err != nil:
-		return w.err
-	case w.st.bodyErr != nil:
-		// Cut short: nothing of it is written.
-		return w.st.record(&davError{status: http.StatusBadRequest, msg: "the request body didn't arrive whole; nothing was written", cause: w.st.bodyErr})
-	case w.scratch:
+	case w.scratch && w.err == nil && w.st.bodyErr == nil:
 		return w.st.record(w.st.scratchPut(w.t.path, bytes.Clone(w.buf.Bytes())))
+	case w.scratch:
+		return w.st.record(w.failure())
+	case w.err != nil, w.st.bodyErr != nil:
+		// Nothing of it is written; a save that deleted the original
+		// first gets it back.
+		return w.st.record(w.st.undoOwnDelete(w.ctx, w.t, w.failure()))
 	}
 	rev, exact, err := w.st.commitRev(w.ctx, w.t, bytes.Clone(w.buf.Bytes()))
 	if exact {
@@ -861,7 +905,16 @@ func (w *writeFile) Close() error {
 		// tag.
 		w.st.noETag = true
 	}
-	return w.st.record(upstream(err))
+	return w.st.record(w.st.undoOwnDelete(w.ctx, w.t, upstream(err)))
+}
+
+// failure is why a written file isn't committed: a Write refused it (too
+// large, too many at once), or its body was cut short.
+func (w *writeFile) failure() error {
+	if w.err != nil {
+		return w.err
+	}
+	return &davError{status: http.StatusBadRequest, msg: "the request body didn't arrive whole; nothing was written", cause: w.st.bodyErr}
 }
 
 func (w *writeFile) Read([]byte) (int, error)           { return 0, os.ErrPermission }

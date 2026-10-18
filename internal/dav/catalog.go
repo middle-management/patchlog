@@ -2,6 +2,7 @@ package dav
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"slices"
 	"sort"
@@ -241,9 +242,12 @@ func (st *reqState) mkFolder(ctx context.Context, t target) error {
 // (§B.2). An item placed elsewhere in the catalog is a 409, before
 // anything is written: one placement per item per catalog, so it is moved
 // instead. A new item is written first (§B.7: content first, so a
-// placement never dangles); an existing one after its placement, so a
-// placement the core refuses (a frozen catalog, a grant that doesn't
-// write it) leaves the item as it was. An existing item takes the PUT's
+// placement never dangles), once a dry run of the placement (§7.5) says
+// the core takes it, so a placement it refuses (a frozen catalog, a grant
+// that doesn't write it, the catalog's rules) writes nothing; one refused
+// still, the catalog having changed in between, deletes the new item
+// again. An existing item is written after its placement, so a placement
+// the core refuses leaves it as it was. An existing item takes the PUT's
 // preconditions (pre), and its edit is checked before the placement is
 // made: one the principal knows no version of is refused when v differs
 // from it, since the new file name made it look like a create.
@@ -283,14 +287,77 @@ func (st *reqState) place(ctx context.Context, t target, v any, body []byte, pre
 		}
 		return st.commitDoc(ctx, t.docNS, t.docName, v, body, pre)
 	}
+	if err := st.probeNode(ctx, t.ns, t.node, node); err != nil {
+		return "", false, err
+	}
 	rev, exact, err := st.commitDoc(ctx, t.docNS, t.docName, v, body, pre)
 	if err != nil {
 		return "", false, err
 	}
 	if err := st.createNode(ctx, t.ns, t.node, node); err != nil {
+		if st.made != rev {
+			// An edit: someone else made the item meanwhile.
+			return "", false, err
+		}
+		if _, derr := st.p.c.Delete(ctx, t.docNS, t.docName, rev); derr != nil {
+			st.s.opt.Logf("dav: %s/%s: deleting the item created for a placement the core refused: %v", t.docNS, t.docName, derr)
+			return "", false, err
+		}
+		if de, ok := upstream(err).(*davError); ok {
+			out := *de
+			out.msg += fmt.Sprintf(" (%s/%s, created for it, is deleted again)", t.docNS, t.docName)
+			return "", false, &out
+		}
 		return "", false, err
 	}
 	return rev, exact, nil
+}
+
+// probeNode asks the core whether it takes catalog node name with doc, as
+// createNode writes it, in a dry run (§7.5), which writes nothing: a
+// frozen catalog, a grant that doesn't write it, or its rules refuse it
+// as they would the write.
+func (st *reqState) probeNode(ctx context.Context, cat, name string, doc map[string]any) error {
+	in := st.s.nsInfo(ctx, st.p, cat)
+	h, err := st.p.c.Head(ctx, cat, name)
+	if err != nil {
+		return upstream(err)
+	}
+	it := client.BatchItem{Resource: name}
+	switch h.State {
+	case client.Live:
+		return fail(http.StatusConflict, "%s is already in catalog %s", name, cat)
+	case client.Purged:
+		return fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", cat, name)
+	case client.Tombstoned:
+		it.IfMatch = h.ID
+		it.Steps = []client.Step{client.PatchStep(withNonce(in, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))}
+	default:
+		it.IfNoneMatch = true
+		it.Steps = []client.Step{client.PatchStep(withNonce(in, client.GenesisPatches(doc)))}
+	}
+	res, err := st.p.c.Batch(ctx, cat, client.BatchRequest{Items: []client.BatchItem{it}}, true)
+	if ae, ok := client.AsAPIError(err); ok && ae.Code == "batch" && len(ae.Items()) == 1 {
+		// A refusal of the item itself (a 403 of step 1), as a single
+		// write's.
+		err = itemError(ae.Items()[0])
+	}
+	if err != nil {
+		return upstream(err)
+	}
+	for _, r := range res.Items {
+		if status, _ := r.Raw["status"].(float64); status >= 300 {
+			return upstream(itemError(r.Raw))
+		}
+	}
+	return nil
+}
+
+// itemError is a batch item's failure (§7.5) as a single write's error.
+func itemError(m map[string]any) *client.APIError {
+	status, _ := m["status"].(float64)
+	code, _ := m["code"].(string)
+	return &client.APIError{Status: int(status), Code: code, Body: m}
 }
 
 // writable refuses a write through a placement to an item this server
@@ -355,7 +422,7 @@ func (st *reqState) unplace(ctx context.Context, t target) error {
 		if kids := cg.g.Children(t.node); len(kids) > 0 {
 			names := make([]string, 0, len(kids))
 			for _, k := range kids {
-				names = append(names, k.Node.Name)
+				names = append(names, k.Node.Name+st.hiddenWhy(ctx, cg, t, k.Node))
 			}
 			sort.Strings(names)
 			return fail(http.StatusConflict, "folder %s isn't empty (%s); deleting a folder doesn't delete what is in it (§B.7)", t.node, strings.Join(names, ", "))
@@ -365,6 +432,24 @@ func (st *reqState) unplace(ctx context.Context, t target) error {
 		}
 	}
 	return st.deleteDoc(ctx, t.ns, t.node, "")
+}
+
+// hiddenWhy says why node, in folder t, isn't listed there, for the
+// refusal of t's DELETE: a placement whose item isn't live, which a
+// DELETE of its path unplaces, or that the principal's grant doesn't
+// read. "" for one listed.
+func (st *reqState) hiddenWhy(ctx context.Context, cg *catGraph, t target, n *tree.Node) string {
+	if n.Kind != tree.KindPlacement || n.ItemNS == "" || n.Cyclic {
+		return ""
+	}
+	h, err := cg.itemHead(st.p)(ctx, n.ItemNS, n.ItemName)
+	switch {
+	case hidden(err):
+		return ": a placement of an item your grant doesn't read"
+	case err != nil, h.State == client.Live:
+		return ""
+	}
+	return fmt.Sprintf(": a placement of %s/%s, which isn't live; DELETE %s/%s.json unplaces it", n.ItemNS, n.ItemName, t.path, n.Name)
 }
 
 // isCatalogMove reports whether moving src to dst moves a catalog node

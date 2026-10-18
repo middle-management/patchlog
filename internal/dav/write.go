@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"sort"
 	"strings"
@@ -74,6 +75,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 	}
 	var rev string
 	var exact bool
+	st.made = ""
 	err := st.retrying(ctx, func() (bool, error) {
 		h, err := st.p.c.Head(ctx, ns, name)
 		if err != nil {
@@ -103,15 +105,10 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			}
 			ps = withNonce(in, client.GenesisPatches(doc))
 			res, err = st.p.c.Create(ctx, ns, name, ps)
-		} else {
-			if parent, ps, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
-				res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
-			}
-			if refused(err) && st.p.deletedOwn(ns, name, h.ID) {
-				// A save that deletes the original before writing the
-				// new version: refused, it leaves the document as it was.
-				return false, st.undelete(ctx, in, ns, name, h.ID, err)
-			}
+			err = tooLarge(err, in, parent, ps, true)
+		} else if parent, ps, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
+			res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
+			err = tooLarge(err, in, parent, ps, false)
 		}
 		if client.IsStale(err) || client.IsGone(err) {
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile; reload it", ns, name)
@@ -120,6 +117,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			return false, err
 		}
 		rev, exact = res.ID, st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, v, body)
+		st.made = rev
 		return false, nil
 	})
 	return rev, exact, err
@@ -130,8 +128,10 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 // base the principal had, the edit from it is rebased on the last live
 // document, as a save over a live one is: a save that deletes the
 // original before writing (an editor's, or a client's that creates only)
-// keeps others' edits. Without one, or the last document pruned (§8.6),
-// the root is replaced.
+// keeps others' edits. Without one, the last live document is the base,
+// so the file as written wins, as over a live one: either way the patch
+// set is the diff from the last live document, not a whole new one. With
+// the last document pruned (§8.6), the root is replaced.
 func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, v any) (any, []any, error) {
 	whole := func() (any, []any, error) {
 		doc := v
@@ -152,12 +152,9 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 	case last.sealed:
 		return whole()
 	}
-	out, based, err := st.rebased(ctx, ns, name, v, last.value)
+	out, _, err := st.rebased(ctx, ns, name, v, last.value)
 	if err != nil {
 		return nil, nil, err
-	}
-	if !based {
-		return whole()
 	}
 	return last.value, withNonce(in, merge.Diff(dropNonce(last.value), out)), nil
 }
@@ -193,6 +190,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	paths := writesOf(dropNonce(cur.value), ps)
 	ps = withNonce(in, ps)
 	res, err := st.p.c.Append(ctx, ns, name, head, ps)
+	err = tooLarge(err, in, cur.value, ps, false)
 	switch {
 	case client.IsStale(err):
 		return "", false, true, nil
@@ -622,21 +620,46 @@ func (st *reqState) retrying(ctx context.Context, attempt func() (retry bool, er
 	}
 }
 
-// refused reports a write refused for what it holds: a conflict, or the
-// core's 422 or 413.
-func refused(err error) bool {
-	var de *davError
-	if errors.As(err, &de) {
-		return de.status == http.StatusConflict
-	}
+// tooLarge is the core's 413 for a write of patch set ps on parent (§6.6)
+// with what the core doesn't say: the sizes it measured, and the limits
+// the namespace sets, else that the deployment's apply. A create's patch
+// set counts against documentSize, not patchSetSize. Other errors pass.
+func tooLarge(err error, in nsInfo, parent any, ps []any, create bool) error {
 	ae, ok := client.AsAPIError(err)
-	return ok && (ae.Status == http.StatusUnprocessableEntity || ae.Status == http.StatusRequestEntityTooLarge)
+	if !ok || ae.Status != http.StatusRequestEntityTooLarge {
+		return err
+	}
+	var b strings.Builder
+	b.WriteString(apiText(ae))
+	fmt.Fprintf(&b, ": the patch set is %d bytes", len(jsonv.Canonical(ps)))
+	if ops, perr := patch.Parse(ps); perr == nil {
+		if doc, _, aerr := patch.Apply(parent, true, ops, patch.Options{}); aerr == nil {
+			fmt.Fprintf(&b, " and the document %d bytes", len(jsonv.Canonical(doc)))
+		}
+	}
+	b.WriteString(", as canonical JSON (§3.1); ")
+	if create {
+		b.WriteString("a create's patch set counts against documentSize; ")
+	}
+	var set []string
+	if in.patchSetSize > 0 {
+		set = append(set, fmt.Sprintf("patchSetSize %d", in.patchSetSize))
+	}
+	if in.docSize > 0 {
+		set = append(set, fmt.Sprintf("documentSize %d", in.docSize))
+	}
+	if len(set) > 0 {
+		b.WriteString("the namespace sets " + strings.Join(set, " and ") + " (§6.6)")
+	} else {
+		b.WriteString("the namespace sets no size limits, so the deployment's apply (§6.6; by default patchSetSize 262144 and documentSize 1048576)")
+	}
+	return fail(http.StatusRequestEntityTooLarge, "%s", b.String())
 }
 
 // undelete restores ns/name, tombstoned by the principal's own DELETE as
-// tomb, as it was (an empty patch set on the last live document, §8.2),
-// after the write meant to restore it was refused with err, which it
-// returns, saying so.
+// tomb, as it was (an empty patch set on the last live document, §8.2,
+// with If-Match on tomb), after the write meant to restore it failed with
+// err, which it returns, saying so.
 func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb string, err error) error {
 	if _, rerr := st.p.c.Restore(ctx, ns, name, tomb, withNonce(in, []any{})); rerr != nil {
 		st.s.opt.Logf("dav: %s/%s: restoring it as it was after a refused save: %v", ns, name, rerr)
@@ -648,8 +671,42 @@ func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb stri
 		return err
 	}
 	out := *de
-	out.msg += " (the original, deleted before this write, is restored as it was)"
+	if note := " (the original, deleted before this write, is restored as it was)"; !strings.HasSuffix(out.msg, note) {
+		out.msg += note
+	}
 	return &out
+}
+
+// undoOwnDelete is the failure err of a write to the document at t, a
+// save that deleted the original before writing the new version (DELETE,
+// then a PUT, a COPY or a MOVE onto the name): whatever refused the
+// write (a conflict, a body that isn't JSON, one too large, a frozen
+// namespace, a precondition), the principal's own DELETE moments before
+// is undone, and the document restored as it was, as a failed PUT leaves
+// it. So is a placement's node the principal's DELETE removed (unplaced)
+// before the write to its path. Only the principal's own tombstone, still
+// the head, is restored (with If-Match on it).
+func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) error {
+	if err == nil || !t.isDoc() {
+		return err
+	}
+	type res struct{ ns, name string }
+	todo := []res{{t.docNS, t.docName}}
+	if t.kind == kNewPlacement {
+		todo = append(todo, res{t.ns, t.node})
+	}
+	for _, r := range todo {
+		if !st.p.deletedOwn(r.ns, r.name, "") {
+			continue
+		}
+		h, herr := st.p.c.Head(ctx, r.ns, r.name)
+		if herr != nil || h.State != client.Tombstoned || !st.p.deletedOwn(r.ns, r.name, h.ID) {
+			continue
+		}
+		err = st.undelete(ctx, st.s.nsInfo(ctx, st.p, r.ns), r.ns, r.name, h.ID, err)
+		st.changed()
+	}
+	return err
 }
 
 // deleteDoc tombstones ns/name (§8.1), if its head is ifMatch when that

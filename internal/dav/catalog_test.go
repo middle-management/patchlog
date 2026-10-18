@@ -234,7 +234,7 @@ func TestCatalogPlacementWrites(t *testing.T) {
 	nh := must(e.c.NSHead(e.ctx, "cat"))
 	must(e.c.PatchConfig(e.ctx, "cat", nh.Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
 	e.expect(e.do("GET", "/matches/final.json", ""), 200, "GET the item")
-	e.expect(e.do("PUT", "/cat/root/season/matches.final.json", `{"title": "Final (draft)"}`), 423, "PUT a placement in a frozen catalog")
+	e.expect(e.do("PUT", "/cat/root/season/matches.final.json", `{"title": "Final (draft)"}`), 403, "PUT a placement in a frozen catalog")
 	_, doc = e.load("matches", "final")
 	sameJSON(t, doc, map[string]any{"title": "Final", "score": "2-1"})
 }
@@ -328,4 +328,140 @@ func TestCatalogPlacementOfExisting(t *testing.T) {
 	_, doc = e.load("matches", "cup")
 	sameJSON(t, doc, map[string]any{"title": "The cup", "score": "3-1"})
 	sameJSON(t, e.parentsOf("matches.cup"), parents("cat", "empty"))
+}
+
+// A PUT of a new placement whose item doesn't exist writes nothing when
+// the core refuses the placement: a dry run of it (§7.5) comes before the
+// item is created, so a frozen catalog, or its rules, leave no unplaced
+// item behind, and the refusal isn't retried as a lock would be (403,
+// not 423).
+func TestCatalogRefusedPlacementWritesNothing(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"matches"}, []string{"cat", "ruled"}, map[string]map[string]any{
+		"cat": {"catalog": map[string]any{"trust": []any{"matches"}}},
+		"ruled": {"catalog": map[string]any{"trust": []any{"matches"}},
+			"rules": []any{map[string]any{"op": "test", "path": "/doc/order", "schema": map[string]any{"type": "string"}}}},
+	})
+	e.create("cat", "root", map[string]any{"parents": []any{}})
+	e.create("cat", "season", map[string]any{"parents": parents("cat", "root")})
+	e.create("ruled", "root", map[string]any{"parents": []any{}, "order": "a"})
+	r := e.expect(e.do("PUT", "/ruled/root/matches.ruled.json", `{"title": "Ruled"}`), 422, "PUT of a placement the catalog's rules refuse")
+	if !strings.Contains(r.body, "rule") {
+		t.Fatalf("422 text %q", r.body)
+	}
+	if h, _ := e.load("matches", "ruled"); h.State != client.NotFound {
+		t.Fatalf("a refused placement created its item: %v", h.State)
+	}
+	nh := must(e.c.NSHead(e.ctx, "cat"))
+	must(e.c.PatchConfig(e.ctx, "cat", nh.Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	e.expect(e.do("PUT", "/cat/root/season/matches.orphan.json", `{"title": "Orphan"}`), 403, "PUT of a placement in a frozen catalog")
+	if h, _ := e.load("matches", "orphan"); h.State != client.NotFound {
+		t.Fatalf("a refused placement created its item: %v", h.State)
+	}
+	e.expect(e.do("MKCOL", "/cat/root/frozen", ""), 403, "MKCOL in a frozen catalog")
+	// A tombstoned item, restored for a placement: refused, it stays so.
+	e.create("matches", "old", map[string]any{"title": "Old"})
+	h, _ := e.load("matches", "old")
+	must(e.c.Delete(e.ctx, "matches", "old", h.ID))
+	e.expect(e.do("PUT", "/cat/root/season/matches.old.json", `{"title": "Old again"}`), 403, "PUT of a placement in a frozen catalog")
+	if h, _ := e.load("matches", "old"); h.State != client.Tombstoned {
+		t.Fatalf("a refused placement restored its item: %v", h.State)
+	}
+}
+
+// A placement whose item isn't live (dangling, §B.3) isn't listed, but it
+// keeps its folder from being deleted: the 409 says so, and a DELETE of
+// its path unplaces it.
+func TestCatalogDanglingPlacement(t *testing.T) {
+	t.Parallel()
+	e := catalogEnv(t)
+	e.create("cat", "ghostdir", map[string]any{"parents": parents("cat", "root")})
+	e.create("matches", "ghost", map[string]any{"t": 1})
+	e.create("cat", "matches.ghost", map[string]any{"parents": parents("cat", "ghostdir")})
+	h, _ := e.load("matches", "ghost")
+	must(e.c.Delete(e.ctx, "matches", "ghost", h.ID))
+	sameStrings(t, "ghostdir", names(e.propfind("/cat/root/ghostdir/"), "/cat/root/ghostdir/"), nil)
+	r := e.expect(e.do("DELETE", "/cat/root/ghostdir", ""), 409, "DELETE of a folder holding a dangling placement")
+	if !strings.Contains(r.body, "isn't live") || !strings.Contains(r.body, "/cat/root/ghostdir/matches.ghost.json") {
+		t.Fatalf("409 text %q", r.body)
+	}
+	e.expect(e.do("DELETE", "/cat/root/ghostdir/matches.ghost.json", "", "If-Match", `"1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`), 412, "DELETE with If-Match of a dangling placement")
+	e.expect(e.do("DELETE", "/cat/root/ghostdir/matches.ghost.json", ""), 204, "DELETE of a dangling placement")
+	if h, _ := e.load("cat", "matches.ghost"); h.State != client.Tombstoned {
+		t.Fatalf("placement %v", h.State)
+	}
+	if h, _ := e.load("matches", "ghost"); h.State != client.Tombstoned {
+		t.Fatalf("item %v", h.State)
+	}
+	e.expect(e.do("DELETE", "/cat/root/ghostdir", ""), 204, "DELETE of the folder, now empty")
+}
+
+// A document moves from a flat directory into a catalog folder as a COPY
+// places it (the same document: it stays in the flat directory, and
+// nothing is written to it), and a placement moved onto its own item's
+// file is unplaced. Other moves keep names as identity, with messages
+// that fit: a folder isn't copied.
+func TestCatalogMoveBetweenViews(t *testing.T) {
+	t.Parallel()
+	e := catalogEnv(t)
+	first := e.create("matches", "cup", map[string]any{"title": "Cup"})
+	e.expect(e.do("MOVE", "/matches/cup.json", "", "Destination", "/cat/root/season/matches.cup.json"), 201, "MOVE into a folder")
+	sameJSON(t, e.parentsOf("matches.cup"), parents("cat", "season"))
+	if h, _ := e.load("matches", "cup"); h.ID != first {
+		t.Fatal("placing by MOVE wrote the item")
+	}
+	sameStrings(t, "matches", names(e.propfind("/matches/"), "/matches/"), []string{"cup.json", "derby.json"})
+	e.expect(e.do("MOVE", "/matches/cup.json", "", "Destination", "/cat/root/season/matches.cup.json"), 204, "MOVE into the folder it is in")
+	e.expect(e.do("MOVE", "/matches/cup.json", "", "Destination", "/cat/root/derbies/matches.cup.json"), 409, "MOVE into another folder")
+	sameJSON(t, e.parentsOf("matches.cup"), parents("cat", "season"))
+	e.expect(e.do("MOVE", "/cat/root/season/matches.cup.json", "", "Destination", "/matches/cup.json"), 204, "MOVE of a placement onto its item")
+	if h, _ := e.load("cat", "matches.cup"); h.State != client.Tombstoned {
+		t.Fatalf("placement %v", h.State)
+	}
+	if h, _ := e.load("matches", "cup"); h.ID != first {
+		t.Fatal("unplacing by MOVE wrote the item")
+	}
+
+	r := e.expect(e.do("MOVE", "/matches/cup.json", "", "Destination", "/cat/root/season/matches.other.json"), 403, "MOVE to another name")
+	if !strings.Contains(r.body, "names are identity") {
+		t.Fatalf("403 text %q", r.body)
+	}
+	r = e.expect(e.do("MOVE", "/cat/root/season", "", "Destination", "/cat/root/season2"), 403, "folder renamed")
+	if !strings.Contains(r.body, "make a folder season2") || strings.Contains(r.body, "copy") {
+		t.Fatalf("403 text %q", r.body)
+	}
+	r = e.expect(e.do("MOVE", "/cat/root/season", "", "Destination", "/matches/season"), 403, "folder out of its catalog")
+	if !strings.Contains(r.body, "only between the folders") {
+		t.Fatalf("403 text %q", r.body)
+	}
+}
+
+// A placement the core refuses after its dry run passed (the catalog
+// changed in between) deletes the item just created for it again: no
+// unplaced item is left behind.
+func TestCatalogPlacementRefusedAfterProbe(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"matches"}, []string{"cat"}, map[string]map[string]any{
+		"cat": {"catalog": map[string]any{"trust": []any{"matches"}}},
+	}, func(c *clienttest.Options, _ *dav.Options) {
+		c.Wrap = func(h http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == "PATCH" && r.URL.Path == "/r/cat/matches.race" {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					w.Write([]byte(`{"code": "forbidden", "message": "refused after the dry run"}`))
+					return
+				}
+				h.ServeHTTP(w, r)
+			})
+		}
+	})
+	e.create("cat", "root", map[string]any{"parents": []any{}})
+	r := e.expect(e.do("PUT", "/cat/root/matches.race.json", `{"title": "Race"}`), 403, "PUT of a placement refused after its dry run")
+	if !strings.Contains(r.body, "deleted again") {
+		t.Fatalf("403 text %q", r.body)
+	}
+	if h, _ := e.load("matches", "race"); h.State != client.Tombstoned {
+		t.Fatalf("the item created for a refused placement is %v", h.State)
+	}
 }

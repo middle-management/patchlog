@@ -37,11 +37,14 @@ func fail(status int, format string, args ...any) *davError {
 }
 
 // upstream maps an error of the core (§12) to what the WebDAV client gets:
-// 401, 403 and 404 pass through, 409 frozen is 423 (a frozen namespace
-// takes no writes, §8.4), 413 stays, the other 422s keep their errors,
-// 429 is 503 with Retry-After, and anything else the core failed with is
-// 502. A failure to reach the core is 502 too, its details (the core's
-// address) only logged. Writes map 412, 410 and patch failures themselves.
+// 401, 403 and 404 pass through, 409 frozen is 403 (a frozen namespace
+// takes no writes, §8.4, for good: clients retry a 423, as a lock that
+// may go), 413 stays, the other 422s keep their errors, 429 is 503 with
+// Retry-After, and anything else the core failed with is 502. A failure
+// to reach the core is 502 too, its details (the core's address) only
+// logged. Writes map 412, 410 and patch failures themselves. The text is
+// the core's code and message: the status is the answer's own, and the
+// core's is named only where it differs.
 func upstream(err error) error {
 	if err == nil {
 		return nil
@@ -70,24 +73,26 @@ func upstream(err error) error {
 	case ae.Status == 400, ae.Status == 401, ae.Status == 403, ae.Status == 404, ae.Status == 413:
 		return fail(ae.Status, "%s", msg)
 	case ae.Status == 409 && ae.Code == "frozen":
-		e := fail(http.StatusLocked, "%s", msg)
+		e := fail(http.StatusForbidden, "%s: the namespace takes no writes (§8.4)", msg)
 		if s := ae.Successor(); s != "" {
-			e.msg += " (successor: " + s + ")"
+			e.msg += "; its successor is " + s
 		}
 		return e
-	case ae.Status == 409, ae.Status == 410:
+	case ae.Status == 409:
 		return fail(http.StatusConflict, "%s", msg)
+	case ae.Status == 410:
+		return fail(http.StatusConflict, "the core answered 410: %s", msg)
 	case ae.Status == 422:
 		return fail(http.StatusUnprocessableEntity, "%s", msg)
 	case ae.Status == 429:
 		return busy(ae)
 	}
-	return fail(http.StatusBadGateway, "%s", msg)
+	return fail(http.StatusBadGateway, "the core answered %d: %s", ae.Status, msg)
 }
 
 // busy is the 503 a 429 turns into once waiting is no longer brief (§6.6).
 func busy(ae *client.APIError) *davError {
-	e := fail(http.StatusServiceUnavailable, "%s", apiText(ae))
+	e := fail(http.StatusServiceUnavailable, "the core answered 429: %s", apiText(ae))
 	secs := int(math.Ceil(ae.RetryAfter.Seconds()))
 	if secs < 1 {
 		secs = 1
@@ -96,16 +101,20 @@ func busy(ae *client.APIError) *davError {
 	return e
 }
 
-// apiText is an API error as text: status, code and message, then each
-// validation error (§12) on a line of its own.
+// apiText is an API error as text: its code and message (or, with
+// neither, its status), then each validation error (§12) on a line of its
+// own. The status is left to the answer's.
 func apiText(ae *client.APIError) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d", ae.Status)
-	if ae.Code != "" {
-		b.WriteString(" " + ae.Code)
-	}
+	b.WriteString(ae.Code)
 	if m, _ := ae.Body["message"].(string); m != "" {
-		b.WriteString(": " + m)
+		if b.Len() > 0 {
+			b.WriteString(": ")
+		}
+		b.WriteString(m)
+	}
+	if b.Len() == 0 {
+		fmt.Fprintf(&b, "%d %s", ae.Status, http.StatusText(ae.Status))
 	}
 	if p, _ := ae.Body["pointer"].(string); p != "" {
 		b.WriteString(" (at " + p + ")")
