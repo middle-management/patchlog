@@ -2,10 +2,13 @@ package core
 
 import (
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -211,12 +214,19 @@ type Rev struct {
 	// edge cookie covers the path, so an edge forwards the read undecided:
 	// it is served private, and no shared cache stores it.
 	Referrer bool
+	// Created is the revision's created time, set with every 200 (Doc,
+	// JWE or Snapshot): Last-Modified, a reference extension (README).
+	// Timing is public at every level (§E.4), and never changes.
+	Created time.Time
+	// Digest is the sha-256 of Doc, the bytes served, set with Doc and
+	// never with JWE: Repr-Digest (RFC 9530), a reference extension.
+	Digest []byte
 }
 
 // ResourceRev serves the document at a revision.
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
-	if doc := e.rc.rev(ns, name, id); doc != nil {
-		return &Rev{Status: 200, Doc: doc, Public: true}, nil
+	if c := e.rc.rev(ns, name, id); c != nil {
+		return c.answer(true), nil
 	}
 	g := e.rc.load(ns)
 	public, cached := false, false
@@ -250,8 +260,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		// May read: a plain document is the same for every reader
 		// (readcache.go). Sealed and e2e ones are never cached.
 		if !t.isSealedNS(n) && !t.e2eContent(n, name) {
-			if doc := e.rc.revFor(g, ns, name, id); doc != nil {
-				out.Status, out.Doc, cached = 200, doc, true
+			if c := e.rc.revFor(g, ns, name, id); c != nil {
+				out, cached = c.answer(out.Public), true
+				out.Referrer = referrer
 				return nil
 			}
 		}
@@ -269,6 +280,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			out.Status = 404
 			return nil
 		}
+		out.Created = time.UnixMilli(row.created)
 		e2e := t.e2eContent(n, name)
 		if e2e {
 			// A prune's sealed snapshot is served as /rev/{H}, never as a
@@ -329,7 +341,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
 		// A plain document (sealed ones have a job, e2e ones no document):
 		// immutable, and the same for every reader.
-		e.rc.putRev(g, ns, name, id, out.Doc, public)
+		d := revDoc{doc: out.Doc, created: out.Created.UnixMilli(), digest: sha256.Sum256(out.Doc)}
+		out.Digest = d.digest[:]
+		e.rc.putRev(g, ns, name, id, d, public)
 	}
 	return out, err
 }
@@ -749,6 +763,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	return out, err
 }
 
+// ReprDigest is the RFC 9530 form of a sha-256 digest, sha-256=:<base64>:,
+// as /heads entries and the Repr-Digest header give it.
+func ReprDigest(sum []byte) string {
+	return "sha-256=:" + base64.StdEncoding.EncodeToString(sum) + ":"
+}
+
 // HeadsPage is a page of GET /ns/{ns}/rev/{ns_id}/heads.
 type HeadsPage struct {
 	Items  []map[string]any `json:"items"`
@@ -782,6 +802,10 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		out = &HeadsPage{Items: []map[string]any{}, Public: t.cachePublic(n)}
 		page, next := t.pageHeads(n, &seq, after, e.opt.Maximums.LogPageSize)
 		out.Next = next
+		// Sizes and digests show what sealed and e2e namespaces hide:
+		// lengths, which their padding exists for, and a hash of content
+		// (§E.2.2, §E.4).
+		plain := t.nsLevel(n) < levelSealed
 		for _, h := range page {
 			kind := "head"
 			switch h.state {
@@ -793,6 +817,20 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			item := map[string]any{"resource": h.name, "kind": kind}
 			if h.row != nil {
 				item["target"] = h.row.id.String()
+			}
+			// Reference extensions (README): created, the target's
+			// created time as log entries give it (timing is public at
+			// every level, §E.4), but not a purged one's, which a remote
+			// branch's mirror doesn't know; and a live head's document's
+			// size and digest, as GET …/rev/{target} serves it, where the
+			// write stored them (headMeta). A pruned head keeps them, as
+			// it keeps its target.
+			if h.row != nil && h.state != Purged {
+				item["created"] = formatTime(h.row.created)
+				if h.state == Live && plain && h.row.size.Valid && len(h.row.digest) == sha256.Size {
+					item["size"] = float64(h.row.size.Int64)
+					item["digest"] = ReprDigest(h.row.digest)
+				}
 			}
 			out.Items = append(out.Items, item)
 		}

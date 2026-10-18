@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -1928,7 +1929,7 @@ func (t *tx) storeGrant(g *grant.Grant, encrypt bool) []byte {
 var (
 	insResources = bulkInsert("resources", "ns bigint, name text", "RETURNING res, name")
 	insRevisions = bulkInsert("revisions", "res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
-		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text", "RETURNING seq, res")
+		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text, size bigint, digest bytea", "RETURNING seq, res")
 	insRevEpochs = bulkInsert("rev_epochs", "seq bigint, epoch bigint", "")
 	insSnapshots = bulkInsert("snapshots", "seq bigint, res bigint, doc bytea", "ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc")
 	upsertHeads  = bulkInsert("heads", "res bigint, seq bigint, doc bytea", "ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc")
@@ -2093,7 +2094,17 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			}
 			// The step's gestures (§7.2), as the request resolved them.
 			gesture, undoes := nullStr(it.Steps[k].Gesture), nullStr(it.Steps[k].Undoes)
-			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli(), gesture, undoes})
+			var size, digest any
+			if k == len(it.steps)-1 && !step.del && !it.e2e {
+				// The head the write leaves (headMeta); e2e content has
+				// no document here (§E.3).
+				if step.docCanon == nil {
+					step.docCanon = jsonv.Canonical(step.doc)
+				}
+				sz, sum := headMeta(step.docCanon)
+				size, digest = sz, sum
+			}
+			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli(), gesture, undoes, size, digest})
 			stepItems = append(stepItems, it)
 		}
 		if len(rows) == 0 {
@@ -2106,9 +2117,10 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		})
 		for i, it := range stepItems {
 			step, row, seq := it.steps[k], rows[i], it.last
+			digest, _ := row[15].([]byte)
 			t.inserted(revRow{seq: seq, res: it.res, id: step.id, parentSeq: anyInt(row[2]), first: row[3] == 1, kind: row[4].(int),
 				patches: anyStr(row[5]), author: it.author, via: anyStr(it.via), grantID: it.grantID, signature: anyStr(row[9]), created: row[11].(int64),
-				gesture: anyStr(row[12]), undoes: anyStr(row[13])})
+				gesture: anyStr(row[12]), undoes: anyStr(row[13]), size: anyInt(row[14]), digest: digest})
 			if !step.del {
 				// The blobs the document references are attached with it
 				// (§7.8, step 7); a sealed step's are those its op declares,
@@ -2212,6 +2224,22 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		out[i] = histRow{it.res, it.last}
 	}
 	return out
+}
+
+// headMeta is what a revision a write leaves as a resource's head stores
+// of its document (revisions.size, digest): the length and sha-256 of its
+// canonical form, the bytes GET …/rev/{id} serves, which /heads lists (a
+// reference extension, README) without reading any document. Every path
+// that moves a head stores them where it has the document at hand: step 7
+// here, and the chains remote branches and mirrored schemas insert
+// (insertChain). e2e content has none (§E.3), nor do tombstones, nor rows
+// written before them or by an older instance, which are listed without
+// them until the next write: nothing fills them in later, so what a /heads
+// page lists of a head never changes once served. A purge clears them
+// with the content, and its entry lists a purge.
+func headMeta(doc []byte) (int64, []byte) {
+	sum := sha256.Sum256(doc)
+	return int64(len(doc)), sum[:]
 }
 
 // countSinceSnapshot counts res's revisions since its last snapshot, and

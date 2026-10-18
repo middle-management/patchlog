@@ -1,6 +1,7 @@
 package core
 
 import (
+	"crypto/sha256"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -80,7 +81,21 @@ type readCache struct {
 type revEntry struct {
 	meta   uint64
 	public bool
-	doc    []byte
+	revDoc
+}
+
+// revDoc is a plain revision's answer: its document, the revision's
+// created time (Unix ms) and the document's sha-256, hashed once when
+// cached (Rev.Created, Rev.Digest).
+type revDoc struct {
+	doc     []byte
+	created int64
+	digest  [sha256.Size]byte
+}
+
+// answer is the 200 serving d.
+func (d *revDoc) answer(public bool) *Rev {
+	return &Rev{Status: 200, Doc: d.doc, Created: time.UnixMilli(d.created), Digest: d.digest[:], Public: public}
 }
 
 type headEntry struct {
@@ -128,9 +143,9 @@ func headKey(ns, name string) string    { return ns + "\x00" + name }
 func (c *readCache) serving() bool { return c.fresh == nil || c.fresh() }
 
 // rev and head serve a public namespace's answer without a transaction.
-func (c *readCache) rev(ns, name, id string) []byte {
+func (c *readCache) rev(ns, name, id string) *revDoc {
 	if e, ok := c.revEntry(ns, name, id); ok && e.public {
-		return e.doc
+		return &e.revDoc
 	}
 	return nil
 }
@@ -144,9 +159,9 @@ func (c *readCache) head(ns, name string) (Head, bool) {
 
 // revFor and headFor serve any namespace's answer to a request whose read
 // check passed in a transaction begun after g was loaded.
-func (c *readCache) revFor(g gens, ns, name, id string) []byte {
+func (c *readCache) revFor(g gens, ns, name, id string) *revDoc {
 	if e, ok := c.revEntry(ns, name, id); ok && e.meta == g.meta {
-		return e.doc
+		return &e.revDoc
 	}
 	return nil
 }
@@ -192,13 +207,13 @@ func (c *readCache) unchanged(g gens, ns string) bool {
 	return c.meta.Load() == g.meta && (ns == "" || c.nsGen(ns).Load() == g.ns)
 }
 
-func (c *readCache) putRev(g gens, ns, name, id string, doc []byte, public bool) {
+func (c *readCache) putRev(g gens, ns, name, id string, d revDoc, public bool) {
 	if !g.stable() || !c.unchanged(g, "") {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if len(doc) > c.limit()/4 {
+	if len(d.doc) > c.limit()/4 {
 		return // it would push out a quarter of the cache
 	}
 	k := revKey(ns, name, id)
@@ -206,12 +221,12 @@ func (c *readCache) putRev(g gens, ns, name, id string, doc []byte, public bool)
 		c.bytes -= len(old.doc)
 		delete(c.revs, k)
 	}
-	c.room(len(doc))
+	c.room(len(d.doc))
 	if c.revs == nil {
 		c.revs = map[string]revEntry{}
 	}
-	c.revs[k] = revEntry{meta: g.meta, public: public, doc: doc}
-	c.bytes += len(doc)
+	c.revs[k] = revEntry{meta: g.meta, public: public, revDoc: d}
+	c.bytes += len(d.doc)
 }
 
 func (c *readCache) putHead(g gens, ns, name string, h Head, public bool) {

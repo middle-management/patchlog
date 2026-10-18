@@ -871,7 +871,8 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 			// Destroying the data key makes whatever survives of the
 			// rows and archives unreadable (§8.3, §E.1).
 			t.deleteDEKs(`res = ?`, res)
-			_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ?`, res)
+			// The documents' sizes and digests go with them (headMeta).
+			_, err := t.Exec(`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res = ?`, res)
 			t.must(err)
 			_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE res = ?`, statePurged, res)
 			t.must(err)
@@ -974,7 +975,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		t.deleteSealed(`ns = ?`, n.id)
 		t.deleteBlobEpochs(`ns = ?`, n.id)
 		t.deleteEpochKeys(n.id)
-		_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+		_, err := t.Exec(`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
 		_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
@@ -1244,6 +1245,9 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 		epochs = t.resourceBlobEpochs(n, own)
 	}
 	t.pruneBlobs(own.id, h.seq, kept)
+	// Only patch sets go: ids, created times, gestures and a head's size
+	// and digest (headMeta) are metadata the rows keep, so /heads at an
+	// earlier ns_id lists a pruned head as it did.
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
 	// Below the horizon only the documents kept above survive:

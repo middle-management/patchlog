@@ -139,7 +139,7 @@ func TestReadCacheAuthenticated(t *testing.T) {
 
 	// Mark the cached answers: what follows shows who is served from them.
 	g = e.rc.load("n")
-	e.rc.putRev(g, "n", "a", id, []byte(`"cached"`), false)
+	e.rc.putRev(g, "n", "a", id, revDoc{doc: []byte(`"cached"`)}, false)
 	h := *coldHead
 	h.Head = "cached"
 	e.rc.putHead(g, "n", "a", h, false)
@@ -187,7 +187,7 @@ func TestReadCacheAuthenticated(t *testing.T) {
 		t.Fatal(err)
 	}
 	g = e.rc.load("n")
-	e.rc.putRev(g, "n", "a", id, []byte(`"cached"`), false)
+	e.rc.putRev(g, "n", "a", id, revDoc{doc: []byte(`"cached"`)}, false)
 	revoke := []any{map[string]any{"op": "add", "path": "/revoked", "value": []any{rid.RevocationIDs()[0]}}}
 	if _, err := e.WriteConfig(ctx, Request{NS: "n", Cred: admin}, ConfigChange{Patches: revoke, IfMatch: cfg}); err != nil {
 		t.Fatal(err)

@@ -231,14 +231,19 @@ type revRow struct {
 	// gesture and undoes are the gesture ids it was written with (§7.2),
 	// metadata outside its id that pruning keeps (§8.6).
 	gesture, undoes sql.NullString
+	// size and digest are the length and sha-256 of the canonical document
+	// of a revision a write left as a head (headMeta), which /heads lists;
+	// NULL for any other row, and for rows from before them.
+	size   sql.NullInt64
+	digest []byte
 }
 
-const revCols = `seq, res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, created, gesture, undoes`
+const revCols = `seq, res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, created, gesture, undoes, size, digest`
 
 func scanRev(row interface{ Scan(...any) error }) (*revRow, error) {
 	r := &revRow{}
 	var id []byte
-	err := row.Scan(&r.seq, &r.res, &id, &r.parentSeq, &r.first, &r.kind, &r.patches, &r.author, &r.via, &r.grantID, &r.signature, &r.created, &r.gesture, &r.undoes)
+	err := row.Scan(&r.seq, &r.res, &id, &r.parentSeq, &r.first, &r.kind, &r.patches, &r.author, &r.via, &r.grantID, &r.signature, &r.created, &r.gesture, &r.undoes, &r.size, &r.digest)
 	r.id = ids.FromBytes(id)
 	return r, err
 }

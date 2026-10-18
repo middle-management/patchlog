@@ -60,8 +60,9 @@ const Headers = "Authorization, Content-Type, If-Match, If-None-Match, If-Range,
 // ones: at least those §7 "Browsers" lists, among them Gesture and Undoes
 // (what a write recorded, §7.2) and X-Log-Next, without
 // which a page can't follow a paged log range (§7.1) and must treat its
-// first page as truncated.
-const Exposed = "ETag, Location, Retry-After, Allow, WWW-Authenticate, Accept-Ranges, Content-Range, Gesture, Undoes, X-Namespace-Revision, X-Config-Revision, X-Revision, X-Cursor, X-Log-Next, X-E2E"
+// first page as truncated; and Repr-Digest, a revision's digest (a
+// reference extension; Last-Modified is safelisted).
+const Exposed = "ETag, Location, Retry-After, Allow, WWW-Authenticate, Accept-Ranges, Content-Range, Gesture, Undoes, X-Namespace-Revision, X-Config-Revision, X-Revision, X-Cursor, X-Log-Next, X-E2E, Repr-Digest"
 
 // Parse splits comma-separated origins, as given on the command line, and
 // checks them: each is "*" or a scheme://host[:port] without a path.

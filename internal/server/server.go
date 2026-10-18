@@ -577,6 +577,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 410, map[string]any{"code": "gone", "snapshot": rev.JWE})
 			return
 		}
+		revMeta(w, rev)
 		w.Header().Set("Content-Type", seal.ContentType)
 		w.WriteHeader(200)
 		if r.Method != http.MethodHead {
@@ -598,6 +599,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		if rev.JWE != "" {
 			body, ct = []byte(rev.JWE), seal.ContentType
 		}
+		revMeta(w, rev)
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(200)
 		if r.Method != http.MethodHead {
@@ -618,6 +620,19 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		// A purge is "long".
 		s.cache(w, r, ccLong, rev.Public)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
+	}
+}
+
+// revMeta sets the reference extensions of a revision's 200 (README):
+// Last-Modified, the revision's created time, which never changes; and
+// Repr-Digest (RFC 9530), the sha-256 of the bytes served, for a plain
+// document only, never a JWE (sealed and e2e namespaces, §E.2.2).
+func revMeta(w http.ResponseWriter, rev *core.Rev) {
+	if !rev.Created.IsZero() {
+		w.Header().Set("Last-Modified", rev.Created.UTC().Format(http.TimeFormat))
+	}
+	if rev.JWE == "" && len(rev.Digest) > 0 {
+		w.Header().Set("Repr-Digest", core.ReprDigest(rev.Digest))
 	}
 }
 

@@ -57,6 +57,8 @@ CREATE TABLE IF NOT EXISTS revisions (
   created    INTEGER NOT NULL,
   gesture    TEXT,                           -- §7.2, metadata, not hashed; its partial index is created after migrate (gestureIndexes)
   undoes     TEXT,
+  size       INTEGER,                        -- addition: for a revision a write left as a head, its canonical document's length and sha-256 (headMeta, /heads); NULL otherwise, and in rows from before
+  digest     BLOB,
   UNIQUE (res, id),
   UNIQUE (res, parent_seq)
 );
@@ -390,7 +392,8 @@ func migrate(db *sql.DB) error {
 		{"grants", "root_kid", "TEXT", "", backfillGrantRoots(func(int) string { return "?" })},
 		{"blob_bytes", "file", "TEXT", "", nil}, {"blob_epochs", "file", "TEXT", "", nil},
 		{"namespaces", "head_id", "BLOB", "", nil}, {"resources", "snap_revs", "INTEGER", "", nil}, {"resources", "snap_bytes", "INTEGER", "", nil},
-		{"revisions", "gesture", "TEXT", "", nil}, {"revisions", "undoes", "TEXT", "", nil}, {"ns_log", "gestures", "TEXT", "", nil}} {
+		{"revisions", "gesture", "TEXT", "", nil}, {"revisions", "undoes", "TEXT", "", nil}, {"ns_log", "gestures", "TEXT", "", nil},
+		{"revisions", "size", "INTEGER", "", nil}, {"revisions", "digest", "BLOB", "", nil}} {
 		var has bool
 		if err := db.QueryRowContext(ctx, `SELECT EXISTS (SELECT 1 FROM pragma_table_info(?) WHERE name = ?)`, c.table, c.col).Scan(&has); err != nil {
 			return err
