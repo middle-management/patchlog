@@ -44,25 +44,27 @@ import (
 // by their items' names (§H.2).
 //
 // The tree service lags the core. A listing by a user who wrote through
-// this server lately (minFor), with any of their tokens, asks for every
-// namespace entry their writes produced in the catalog and the namespaces
-// it trusts, the writes' X-Namespace-Revision (watchWrites), with ?min=
-// (§B.5 "Fresh listings after a write"), which the tree service waits
-// for; past TreeWait, or if it refuses them, the folder is listed from
-// the node documents instead, as without a tree service, for slowFor (a
-// 503 if the token's grant can't read them either). Other users' listings
-// don't wait. A listing is kept per token for CatalogTTL, as a catalog's
-// graph is: what one grant was shown is never shown to another, which may
-// read less (§H.7). The tree service unreachable or failing is a 502 or
-// 503, never an empty folder.
+// this server, with any of their tokens, asks for every namespace entry
+// their writes produced in the catalog and the namespaces it trusts, the
+// writes' X-Namespace-Revision (watchWrites), with ?min= (§B.5 "Fresh
+// listings after a write"), which the tree service waits for, until a
+// listing that asked for them came back: however long the tree service
+// lags, a user's own new file stays listed and a file they renamed
+// doesn't come back by its old name. Past TreeWait the folder is listed
+// from the node documents instead, as without a tree service, for slowFor
+// (a 503 if the token's grant can't read them either); entries the tree
+// service refuses to wait for (400) aren't asked for again. Other users'
+// listings don't wait, and writes check what such a listing named
+// against the node documents (resolveCatalog). A listing is kept per
+// token for CatalogTTL, as a catalog's graph is: what one grant was shown
+// is never shown to another, which may read less (§H.7). The tree service
+// unreachable, failing, or not caught up with a namespace the catalog
+// trusts is a 502 or 503, never an empty folder.
 
 const (
 	// treePage is the entries a listing page asks for, the tree
 	// service's most, and maxTreePages the pages one folder lists.
 	treePage, maxTreePages = 1000, 10
-	// minFor is how long a user's write through this server is waited for
-	// by their listings.
-	minFor = 30 * time.Second
 	// slowFor is how long a catalog whose tree service didn't reach the
 	// user's writes in time is listed from its node documents.
 	slowFor = 5 * time.Second
@@ -71,8 +73,12 @@ const (
 	maxWroteNS, maxWroteIDs = 64, 4
 )
 
-// errBehind: the tree service hasn't reached a user's writes in time.
-var errBehind = errors.New("dav: the tree service is behind the user's writes")
+// errBehind: the tree service hasn't reached a user's writes in time;
+// errMinsRefused: it refuses to wait for them (400).
+var (
+	errBehind      = errors.New("dav: the tree service is behind the user's writes")
+	errMinsRefused = errors.New("dav: the tree service refuses to wait for the user's writes")
+)
 
 // treeShared is what the server keeps of the tree service: its client,
 // and the catalogs' settings as last read with any grant (learn).
@@ -189,8 +195,9 @@ func (s *Server) learned(cat string) (catConf, bool) {
 
 // treeSvc is what a user (principal) keeps for listing through a tree
 // service: the namespace entries their writes through this server
-// produced lately, with any of their tokens, which their listings wait
-// for, and the catalogs whose tree service didn't reach them in time.
+// produced, with any of their tokens, which their listings wait for
+// until one that did came back (reached), and the catalogs whose tree
+// service didn't reach them in time.
 type treeSvc struct {
 	mu    sync.Mutex
 	wrote map[string][]wroteID // by namespace, oldest first
@@ -241,20 +248,12 @@ func (ts *treeSvc) noteWrite(ns, id string, now time.Time) {
 }
 
 // mins are the ?min= values of the entries the user's writes to the
-// namespaces nss produced within minFor of now (§B.5).
-func (ts *treeSvc) mins(nss []string, now time.Time) []string {
+// namespaces nss produced, not yet reached (§B.5).
+func (ts *treeSvc) mins(nss []string) []string {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	var out []string
 	for ns, ws := range ts.wrote {
-		for len(ws) > 0 && now.Sub(ws[0].at) > minFor {
-			ws = ws[1:]
-		}
-		if len(ws) == 0 {
-			delete(ts.wrote, ns)
-			continue
-		}
-		ts.wrote[ns] = ws
 		if slices.Contains(nss, ns) {
 			for _, w := range ws {
 				out = append(out, ns+":"+w.id)
@@ -263,6 +262,23 @@ func (ts *treeSvc) mins(nss []string, now time.Time) []string {
 	}
 	slices.Sort(out)
 	return out
+}
+
+// reached drops mins, the ?min= values of entries a listing of the tree
+// service included (or that it refuses to wait for): it never goes back
+// before them, so later listings show those writes without asking.
+func (ts *treeSvc) reached(mins []string) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for _, m := range mins {
+		ns, id, _ := strings.Cut(m, ":")
+		ws := slices.DeleteFunc(ts.wrote[ns], func(w wroteID) bool { return w.id == id })
+		if len(ws) == 0 {
+			delete(ts.wrote, ns)
+		} else {
+			ts.wrote[ns] = ws
+		}
+	}
 }
 
 // isSlow reports whether catalog cat is listed from its node documents
@@ -346,15 +362,22 @@ func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catCon
 		// it counts, changed).
 		return d, nil
 	}
-	mins := st.p.ts.mins(append([]string{cat}, c.trust...), now)
+	mins := st.p.ts.mins(append([]string{cat}, c.trust...))
 	if len(mins) > 0 && st.p.ts.isSlow(cat, now) {
 		return st.behindDir(ctx, cat, folder)
 	}
 	ents, err := st.svcList(ctx, cat, folder, mins)
-	if errors.Is(err, errBehind) {
+	switch {
+	case errors.Is(err, errBehind):
 		st.s.opt.Logf("dav: %s: the tree service hasn't reached %s within %v; folder %s is listed from the catalog's node documents", cat, strings.Join(mins, " "), st.s.opt.TreeWait, folder)
 		st.p.ts.setSlow(cat, now.Add(slowFor))
 		return st.behindDir(ctx, cat, folder)
+	case errors.Is(err, errMinsRefused):
+		st.s.opt.Logf("dav: %s: the tree service refuses to wait for %s; folder %s is listed from the catalog's node documents", cat, strings.Join(mins, " "), folder)
+		st.p.ts.reached(mins)
+		return st.behindDir(ctx, cat, folder)
+	case err == nil:
+		st.p.ts.reached(mins)
 	}
 	if err != nil {
 		if de := (*davError)(nil); errors.As(err, &de) && de.status == http.StatusNotFound && folder == c.files.root {
@@ -519,7 +542,9 @@ func (st *reqState) svcList(ctx context.Context, cat, folder string, mins []stri
 			return out, nil
 		}
 		if pages++; pages >= maxTreePages {
-			return nil, fail(http.StatusForbidden, "a folder of catalog %s holds more than %d files and folders, more than this server lists in one folder: split it into folders through another tool", cat, maxTreePages*st.s.ts.page)
+			e := fail(http.StatusForbidden, "a folder of catalog %s holds more than %d files and folders, more than this server lists in one folder: split it into folders through another tool (its files are opened, written and moved by name all the same)", cat, maxTreePages*st.s.ts.page)
+			e.tooBig = true
+			return nil, e
 		}
 		// The next page, at the checkpoint of this one (§B.5): its query
 		// is in canonical form, without min.
@@ -579,8 +604,10 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		return nil, nil, &davError{status: http.StatusBadGateway, msg: fmt.Sprintf("catalog %s's tree service answered with a listing that isn't JSON", cat), cause: jsonErr}
 	case res.StatusCode == http.StatusOK:
 		return &a, nil, nil
-	case withMins && (res.StatusCode == http.StatusServiceUnavailable && a.Code == "behind" || res.StatusCode == http.StatusBadRequest):
+	case withMins && res.StatusCode == http.StatusServiceUnavailable && a.Code == "behind":
 		return nil, nil, errBehind
+	case withMins && res.StatusCode == http.StatusBadRequest:
+		return nil, nil, errMinsRefused
 	case res.StatusCode == http.StatusNotFound:
 		return nil, nil, fail(http.StatusNotFound, "catalog %s's tree service: %s", cat, msg)
 	case res.StatusCode == http.StatusGone:

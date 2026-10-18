@@ -734,3 +734,279 @@ func TestTreeServicePages(t *testing.T) {
 		t.Fatalf("403 %q", r.body)
 	}
 }
+
+// testClock is a dav.Options.Now a test moves.
+type testClock struct {
+	mu sync.Mutex
+	t  time.Time
+}
+
+func (c *testClock) now() time.Time { c.mu.Lock(); defer c.mu.Unlock(); return c.t }
+func (c *testClock) add(d time.Duration) {
+	c.mu.Lock()
+	c.t = c.t.Add(d)
+	c.mu.Unlock()
+}
+
+// Through a tree service, which lags the core and doesn't wait for other
+// users' writes through this gateway (§B.5), a write checks what the
+// listing named against the node documents, so it does what it does
+// without a tree service: another user's DELETE or MOVE of a file's old
+// name, moments after its owner renamed it or moved it to another folder,
+// touches nothing (the name is no file's now); a PUT of the name a file
+// was just given is that file's, never a second file by its name (§H.2
+// "Siblings"); a MKCOL of a folder just made finds it there; and a DELETE
+// of a folder someone just put a file in is a 409 naming it (§H.5), never
+// the folder deleted over the file, which it would orphan.
+func TestTreeServiceStaleNameWrites(t *testing.T) {
+	t.Parallel()
+	for _, viaTree := range []bool{false, true} {
+		a := newAuthTree(t)
+		url := ""
+		if viaTree {
+			url = a.tr.http.URL
+		}
+		g := a.gateway(t, url, func(o *dav.Options) { o.TreeWait = 300 * time.Millisecond })
+		now := a.s.Now()
+		writer := []string{"read", "create", "append", "delete"}
+		ann := a.k.Grant(t, now, "user:ann", a.both, writer)
+		bob := a.k.Grant(t, now, "user:bob", a.both, writer)
+		w := fmt.Sprintf("tree service %v: ", viaTree)
+		g.expect(g.doAs(ann, "MKCOL", "/cat/Box", ""), 201, w+"ann's MKCOL of Box")
+		a.tr.caughtUp("cat", "matches")
+		sameStrings(t, w+"bob's top level", names(g.propfindAs(bob, "/cat/"), "/cat/"), []string{"Box/", "Hidden/", "Season/"})
+		sameStrings(t, w+"bob's Season", names(g.propfindAs(bob, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+		sameStrings(t, w+"bob's Box", names(g.propfindAs(bob, "/cat/Box/"), "/cat/Box/"), nil)
+
+		a.tr.paused.Store(true)
+		g.expect(g.doAs(ann, "MOVE", "/cat/Season/cup.json", "", "Destination", "/cat/Season/final.json"), 201, w+"ann renames cup.json")
+		g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", "/cat/Hidden/derby.json"), 201, w+"ann moves derby.json into Hidden")
+		g.expect(g.doAs(ann, "PUT", "/cat/Box/report.txt", "ann's report"), 201, w+"ann's PUT into Box")
+		g.expect(g.doAs(ann, "MKCOL", "/cat/Season/Sub", ""), 201, w+"ann's MKCOL of Season/Sub")
+
+		g.expect(g.doAs(bob, "DELETE", "/cat/Season/cup.json", ""), 404, w+"bob's DELETE of cup.json, renamed final.json")
+		if r := g.doAs(bob, "MOVE", "/cat/Season/cup.json", "", "Destination", "/cat/Season/bobs.json"); r.status < 400 {
+			t.Errorf("%sbob's MOVE of cup.json, renamed final.json: %d", w, r.status)
+		}
+		g.expect(g.doAs(bob, "DELETE", "/cat/Season/derby.json", ""), 404, w+"bob's DELETE of Season/derby.json, moved to Hidden")
+		if r := g.expect(g.doAs(bob, "DELETE", "/cat/Box/", ""), 409, w+"bob's DELETE of Box, holding ann's report.txt"); !strings.Contains(r.body, `"report.txt"`) {
+			t.Errorf("%s409 %q", w, r.body)
+		}
+		g.expect(g.doAs(bob, "MKCOL", "/cat/Season/Sub", ""), 405, w+"bob's MKCOL of Season/Sub, which ann made")
+		g.expect(g.doAs(bob, "PUT", "/cat/Season/final.json", `{"title": "Bob's"}`), 201, w+"bob's PUT of final.json")
+		a.tr.paused.Store(false)
+
+		e := &env{t: t, ctx: a.ctx, c: a.w}
+		if doc := e.nodeDoc("cat", "matches.cup"); doc["title"] != "final.json" {
+			t.Errorf("%sthe file ann renamed final.json is titled %v", w, doc["title"])
+		}
+		if ps := e.parentsOf("matches.derby"); len(ps) != 1 || !strings.HasSuffix(ps[0].(map[string]any)["href"].(string), "/hidden") {
+			t.Errorf("%sthe file ann moved to Hidden has parents %v", w, ps)
+		}
+		e.expectLive("matches", "derby", must(a.w.Head(a.ctx, "matches", "derby")), w+"ann's derby")
+		a.tr.caughtUp("cat", "matches")
+		sameStrings(t, w+"Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"Sub/", "final.json"})
+		sameStrings(t, w+"Box", names(g.propfindAs(ann, "/cat/Box/"), "/cat/Box/"), []string{"report.txt"})
+		if b := g.expect(g.doAs(ann, "GET", "/cat/Season/final.json", ""), 200, w+"GET final.json").body; !strings.Contains(b, "Bob's") {
+			t.Errorf("%sfinal.json %q, without bob's save", w, b)
+		}
+	}
+}
+
+// A tree service that has reached the catalog but not a namespace it
+// trusts (just started, rebuilt, or trusting it lately) answers 503
+// behind, which the gateway passes on with Retry-After, never a folder
+// shown empty (every placement there dangling), which a sync client
+// mirrors as deleted files; nor is a folder deleted as empty meanwhile.
+func TestTreeServiceBehindContent(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	var hold atomic.Bool
+	hold.Store(true)
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := rtFunc(func(req *http.Request) (*http.Response, error) {
+		for hold.Load() && strings.HasPrefix(req.URL.Path, "/ns/matches/") && (strings.Contains(req.URL.Path, "/log") || strings.HasSuffix(req.URL.Path, "/events")) {
+			select {
+			case <-req.Context().Done():
+				return nil, req.Context().Err()
+			case <-time.After(5 * time.Millisecond):
+			}
+		}
+		return base.RoundTrip(req)
+	})
+	core := e.s.Client(t, client.WithAuthor("tree"), client.WithHTTPClient(&http.Client{Transport: rt}))
+	svc := must(tree.Open(context.Background(), tree.Options{Client: core, Catalog: "cat", DB: filepath.Join(t.TempDir(), "tree.db"),
+		MinWait: 200 * time.Millisecond, RepurgeInterval: -1, Logf: t.Logf,
+		FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}}))
+	hs := httptest.NewServer(svc.Handler())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { svc.Run(ctx); close(done) }()
+	t.Cleanup(func() { hold.Store(false); cancel(); <-done; hs.Close(); svc.Close() })
+	h := must(e.c.NSHead(e.ctx, "cat"))
+	for deadline := time.Now().Add(10 * time.Second); svc.Checkpoint("cat") != h.ID; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the tree service didn't reach cat")
+		}
+	}
+	ts := treeDav(e, hs.URL)
+	r := ts.expect(ts.do("PROPFIND", "/cat/Season/", "", "Depth", "1"), 503, "PROPFIND of Season before the tree service reached matches")
+	if r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "matches") {
+		t.Fatalf("503 %v %q", r.header, r.body)
+	}
+	if r := ts.do("DELETE", "/cat/Season", ""); r.status < 400 {
+		t.Fatalf("DELETE of Season, which holds derby.json: %d", r.status)
+	}
+	e.nodeDoc("cat", "season")
+	hold.Store(false)
+	for deadline := time.Now().Add(10 * time.Second); svc.Checkpoint("matches") == ""; time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the tree service didn't reach matches")
+		}
+	}
+	sameStrings(t, "Season once caught up", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+}
+
+// A user's own writes through this server are waited for (?min=) by their
+// listings until one that waited came back, however long the tree
+// service lags (§B.5 "Fresh listings after a write"): their new file
+// stays listed, and the name they renamed a file away from doesn't come
+// back, the folder listed from the node documents meanwhile, so a sync
+// client neither uploads the file again nor deletes the old name, which
+// deleted the renamed file. Once a listing that waited came back, the
+// next doesn't wait.
+func TestTreeServiceOwnWritesUntilReached(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	tr := startTree(t, e.s, "cat")
+	tr.caughtUp("cat", "matches")
+	var mins atomic.Int64
+	front := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("min") {
+			mins.Add(1)
+		}
+		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(w, r)
+	}))
+	clk := &testClock{t: time.Now()}
+	ts := treeDav(e, front.URL, options(func(o *dav.Options) { o.TreeWait = 300 * time.Millisecond; o.Now = clk.now }))
+	ts.expect(ts.do("PUT", "/cat/Season/a.txt", "precious"), 201, "PUT a.txt")
+	tr.caughtUp("cat", "matches")
+	sameStrings(t, "Season", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"a.txt", "derby.json"})
+
+	tr.paused.Store(true)
+	ts.expect(ts.do("PUT", "/cat/Season/new.txt", "hello"), 201, "PUT new.txt")
+	ts.expect(ts.do("MOVE", "/cat/Season/a.txt", "", "Destination", "/cat/Season/b.txt"), 201, "MOVE a.txt to b.txt")
+	for _, d := range []time.Duration{0, 31 * time.Second, 10 * time.Minute} {
+		clk.add(d)
+		sameStrings(t, fmt.Sprintf("Season %v later, the tree service behind", d), names(ts.propfind("/cat/Season/"), "/cat/Season/"),
+			[]string{"b.txt", "derby.json", "new.txt"})
+	}
+	ts.expect(ts.do("PUT", "/cat/Season/new.txt", "hello"), 201, "PUT of new.txt again, as a sync client would")
+	ts.expect(ts.do("DELETE", "/cat/Season/a.txt", ""), 404, "DELETE of a.txt, renamed b.txt")
+	tr.paused.Store(false)
+	tr.caughtUp("cat", "matches")
+	clk.add(time.Minute) // past the folder's time listed from the node documents
+	sameStrings(t, "Season once caught up", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"b.txt", "derby.json", "new.txt"})
+	n := mins.Load()
+	tr.paused.Store(true)
+	clk.add(time.Minute)
+	sameStrings(t, "Season, the tree service behind again", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"b.txt", "derby.json", "new.txt"})
+	if mins.Load() != n {
+		t.Fatal("a listing waited for writes a listing that waited for them already showed")
+	}
+	if items := e.liveNames("matches"); len(items) != 3 {
+		t.Fatalf("matches holds %q: one item per file", items)
+	}
+}
+
+// A folder larger than a listing takes (maxTreePages pages) is refused
+// as a listing (403), never listed cut short; its files are opened,
+// written, moved and deleted by name all the same, found in the node
+// documents with only the items of the names asked for read, as they are
+// without a tree service.
+func TestTreeServiceBigFolderPaths(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	e.create("cat", "big", map[string]any{"title": "Big", "parents": parents("cat", "root")})
+	e.create("cat", "sub", map[string]any{"title": "Sub", "parents": parents("cat", "big")})
+	e.create("matches", "deep", map[string]any{"n": "deep"})
+	e.create("cat", "matches.deep", map[string]any{"title": "deep.json", "parents": parents("cat", "sub")})
+	var items, places []client.BatchItem
+	for i := 0; i < 21; i++ {
+		name := "big" + string(rune('a'+i))
+		items = append(items, client.BatchItem{Resource: name, IfNoneMatch: true,
+			Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"n": i}))}})
+		places = append(places, client.BatchItem{Resource: "matches." + name, IfNoneMatch: true,
+			Steps: []client.Step{client.PatchStep(client.GenesisPatches(map[string]any{"title": name + ".json", "parents": parents("cat", "big")}))}})
+	}
+	must(e.c.Batch(e.ctx, "matches", client.BatchRequest{Items: items}, false))
+	must(e.c.Batch(e.ctx, "cat", client.BatchRequest{Items: places}, false))
+	tr := startTree(t, e.s, "cat")
+	tr.caughtUp("cat", "matches")
+	ts := treeDav(e, tr.http.URL, func(_ *dav.Options, s *dav.Server) {
+		if s != nil {
+			dav.SetTreePage(s, 2)
+		}
+	})
+	ts.expect(ts.do("PROPFIND", "/cat/Big/", "", "Depth", "1"), 403, "PROPFIND of a folder over the bound")
+	if b := ts.expect(ts.do("GET", "/cat/Big/biga.json", ""), 200, "GET of a file in it").body; b != rendered(map[string]any{"n": 0}) {
+		t.Fatalf("biga.json %q", b)
+	}
+	ts.expect(ts.do("PROPFIND", "/cat/Big/bigb.json", "", "Depth", "0"), 207, "PROPFIND of a file in it")
+	if b := ts.expect(ts.do("GET", "/cat/Big/Sub/deep.json", ""), 200, "GET of a file in a folder in it").body; b != rendered(map[string]any{"n": "deep"}) {
+		t.Fatalf("deep.json %q", b)
+	}
+	ts.expect(ts.do("PUT", "/cat/Big/biga.json", `{"n": 100}`), 201, "PUT of a file in it")
+	if _, doc := e.load("matches", "biga"); doc.(map[string]any)["n"] != 100.0 {
+		t.Fatalf("biga after the PUT: %v", doc)
+	}
+	ts.expect(ts.do("PUT", "/cat/Big/new.json", `{"n": "new"}`), 201, "PUT of a new file in it")
+	if name, doc := e.titled("cat", "new.json"); !strings.HasSuffix(doc["parents"].([]any)[0].(map[string]any)["href"].(string), "/big") {
+		t.Fatalf("new.json, %s, is in %v", name, doc["parents"])
+	}
+	ts.expect(ts.do("MOVE", "/cat/Big/bigb.json", "", "Destination", "/cat/Big/renamed.json"), 201, "MOVE of a file in it")
+	if doc := e.nodeDoc("cat", "matches.bigb"); doc["title"] != "renamed.json" {
+		t.Fatalf("bigb's title %v", doc["title"])
+	}
+	ts.expect(ts.do("DELETE", "/cat/Big/bigc.json", ""), 204, "DELETE of a file in it")
+	e.expectTombstoned("cat", "matches.bigc", "bigc's placement")
+}
+
+// A file renamed by another program (not through this server), which
+// neither the tree service's listing nor the catalog read the token keeps
+// for CatalogTTL show yet: a DELETE of its old name finds its node changed
+// since that read (If-Match, 409), and a MOVE finds it renamed in the
+// node's document as the core has it now (404), so neither deletes,
+// renames or moves it.
+func TestTreeServiceRenamedElsewhere(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	e := &env{t: t, ctx: a.ctx, c: a.w}
+	for _, c := range []struct {
+		node, method, path string
+		status             int
+		says               string
+	}{
+		{"matches.derby", "DELETE", "/cat/Season/derby.json", 409, "changed by someone else"},
+		{"matches.cup", "MOVE", "/cat/Season/cup.json", 404, "renamed or moved"},
+	} {
+		g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.TreeWait, o.CatalogTTL = 300*time.Millisecond, time.Minute })
+		bob := a.k.Grant(t, a.s.Now(), "user:bob", a.both, []string{"read", "create", "append", "delete"})
+		a.tr.caughtUp("cat", "matches")
+		names(g.propfindAs(bob, "/cat/Season/"), "/cat/Season/")
+		a.tr.paused.Store(true)
+		// A request that reads the catalog for bob, kept for CatalogTTL.
+		g.expect(g.doAs(bob, "DELETE", "/cat/Season/none.json", ""), 404, "bob's DELETE of no file")
+		h, doc := e.load("cat", c.node)
+		title := strings.TrimSuffix(doc.(map[string]any)["title"].(string), ".json") + "-final.json"
+		must(a.w.Append(a.ctx, "cat", c.node, h.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": title}}))
+		r := g.expect(g.doAs(bob, c.method, c.path, "", "Destination", "/cat/Season/bobs.json"), c.status, "bob's "+c.method+" of a file renamed elsewhere")
+		if !strings.Contains(r.body, c.says) {
+			t.Fatalf("%d %q", r.status, r.body)
+		}
+		a.tr.paused.Store(false)
+		if doc := e.nodeDoc("cat", c.node); doc["title"] != title {
+			t.Fatalf("%s's title %v", c.node, doc["title"])
+		}
+	}
+}

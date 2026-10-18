@@ -1631,8 +1631,12 @@ type reqState struct {
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog
+	fresh  map[string]bool         // by catalog: its graph was read by the request (freshGraph)
 	dirs   map[string]*treeDir     // by catalog/folder node
 	heads  map[string]*client.Head // by ns/name
+	// byNodes: catalogs whose paths the request resolves from their node
+	// documents, a tree service's listing having disagreed (resolveCatalog)
+	byNodes map[string]bool
 }
 
 type stateKey struct{}
@@ -1677,7 +1681,7 @@ func (st *reqState) record(err error) error {
 // changed forgets what the request read, after it wrote, and makes other
 // requests' catalog reads stale.
 func (st *reqState) changed() {
-	st.lists, st.graphs, st.dirs, st.heads = nil, nil, nil, nil
+	st.lists, st.graphs, st.fresh, st.dirs, st.heads = nil, nil, nil, nil, nil
 	st.s.gen.Add(1)
 }
 

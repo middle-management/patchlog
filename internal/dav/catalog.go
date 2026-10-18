@@ -89,17 +89,29 @@ func (st *reqState) graph(ctx context.Context, cat string) (*catGraph, error) {
 	v, _ := st.s.view(st.tk, cat)
 	cg := v.cg
 	if cg == nil || cg.gen != gen || now.Sub(cg.at) >= st.s.opt.CatalogTTL {
-		var err error
-		if cg, err = st.readGraph(ctx, cat); err != nil {
-			return nil, err
-		}
-		cg.at, cg.gen = now, gen
-		st.s.keepView(st.tk, cat, tokenView{cg: cg}, 512*(len(cg.heads)+1))
+		return st.freshGraph(ctx, cat)
 	}
 	if st.graphs == nil {
-		st.graphs = map[string]*catGraph{}
+		st.graphs, st.fresh = map[string]*catGraph{}, map[string]bool{}
 	}
 	st.graphs[cat] = cg
+	return cg, nil
+}
+
+// freshGraph reads catalog cat again for the token, whatever it read
+// within CatalogTTL, and keeps it so for the request and after.
+func (st *reqState) freshGraph(ctx context.Context, cat string) (*catGraph, error) {
+	now, gen := st.s.opt.Now(), st.s.gen.Load()
+	cg, err := st.readGraph(ctx, cat)
+	if err != nil {
+		return nil, err
+	}
+	cg.at, cg.gen = now, gen
+	st.s.keepView(st.tk, cat, tokenView{cg: cg}, 512*(len(cg.heads)+1))
+	if st.graphs == nil {
+		st.graphs, st.fresh = map[string]*catGraph{}, map[string]bool{}
+	}
+	st.graphs[cat], st.fresh[cat] = cg, true
 	return cg, nil
 }
 
@@ -478,54 +490,153 @@ func (st *reqState) childFolder(cg *catGraph, folder, seg string) *tree.Node {
 // file there, else a scratch name (§H.6; a name a node has is the node's,
 // whatever it looks like), or a new node a title can name, or a name no
 // file or folder can have (titleWhy).
+//
+// Through a tree service, a path names what its folders list (treeDir),
+// which lags the core and isn't made to wait for other users' writes
+// through this server: a name another user renamed, moved or deleted a
+// moment ago is still listed, and one they just gave a file isn't yet. A
+// write (writes) checks what the listing named against the node
+// documents (agrees): every node it named still there, in that folder,
+// by that name, and no node of the core's by a name it didn't list.
+// Where they disagree, read again if read before the request, the path
+// is resolved from the node documents, as without a tree service: a DELETE or MOVE of a name renamed since is a 404, never the
+// renamed file's, and a PUT of a name a sibling has now is that
+// sibling's, never a second file by its name (§H.2 "Siblings"). A folder
+// over what a listing takes (tooBig) has its names found in its node
+// documents (nodeChild), a few of its items read, rather than refused.
 func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string) (target, error) {
 	c, err := st.treeConf(ctx, t.ns)
 	if err != nil {
 		return t, err
 	}
-	var cg *catGraph
-	if !st.s.viaService(t.ns, c) {
-		// The node documents: a path's folders above need none of their
-		// items read (childFolder). Through a tree service each folder is
-		// listed, so what a path names is what its folder lists.
-		if cg, _, err = st.tree(ctx, t.ns); err != nil {
-			return t, err
-		}
-	}
-	folder := c.files.root
-	for _, seg := range segs[:len(segs)-1] {
-		if cg != nil {
-			if n := st.childFolder(cg, folder, seg); n != nil {
-				folder = n.Name
-				continue
-			}
-		}
-		d, err := st.treeDir(ctx, t.ns, folder)
+	if st.byNodes[t.ns] {
+		cg, _, err := st.tree(ctx, t.ns)
 		if err != nil {
 			return t, err
 		}
-		e, _ := d.find(st.s, seg)
-		if e == nil || e.node.Kind != kindFolder {
-			t.kind = kMissing
+		return st.resolveIn(ctx, t, segs, c, func(ctx context.Context, folder, seg string, _ bool) (*treeEntry, bool, error) {
+			return st.nodeChild(ctx, cg, t.ns, folder, seg)
+		}, nil)
+	}
+	if !st.s.viaService(t.ns, c) {
+		// The node documents: a path's folders above need none of their
+		// items read (childFolder).
+		cg, _, err := st.tree(ctx, t.ns)
+		if err != nil {
+			return t, err
+		}
+		return st.resolveIn(ctx, t, segs, c, func(ctx context.Context, folder, seg string, last bool) (*treeEntry, bool, error) {
+			if !last {
+				if n := st.childFolder(cg, folder, seg); n != nil {
+					e := newTreeEntry(n, nil)
+					return &e, true, nil
+				}
+			}
+			d, err := st.treeDir(ctx, t.ns, folder)
+			if err != nil {
+				return nil, false, err
+			}
+			e, exact := d.find(st.s, seg)
+			return e, exact, nil
+		}, nil)
+	}
+	var steps []pathStep
+	r, err := st.resolveIn(ctx, t, segs, c, func(ctx context.Context, folder, seg string, _ bool) (*treeEntry, bool, error) {
+		d, err := st.treeDir(ctx, t.ns, folder)
+		var de *davError
+		if errors.As(err, &de) && de.tooBig {
+			cg, _, gerr := st.tree(ctx, t.ns)
+			if gerr != nil {
+				return nil, false, err
+			}
+			return st.nodeChild(ctx, cg, t.ns, folder, seg)
+		}
+		if err != nil {
+			return nil, false, err
+		}
+		e, exact := d.find(st.s, seg)
+		return e, exact, nil
+	}, &steps)
+	if err != nil || !st.writes() {
+		return r, err
+	}
+	cg, _, err := st.tree(ctx, t.ns)
+	var de *davError
+	switch {
+	case err != nil && errors.As(upstream(err), &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden):
+		// A grant that doesn't read the node documents (§H.7 "Limited
+		// grants") has only the listing to go by.
+		return r, nil
+	case err != nil || st.agrees(cg, steps):
+		return r, err
+	}
+	if !st.fresh[t.ns] {
+		// Read before the request, maybe before what the listing shows
+		// (another server's write): read again.
+		if cg, err = st.freshGraph(ctx, t.ns); err != nil {
+			return r, err
+		}
+		if st.agrees(cg, steps) {
+			return r, nil
+		}
+	}
+	if st.byNodes == nil {
+		st.byNodes = map[string]bool{}
+	}
+	st.byNodes[t.ns] = true
+	return st.resolveCatalog(ctx, t, segs)
+}
+
+// pathStep is one name a path's resolution looked up (resolveCatalog):
+// in folder parent, the node found (none: "") and the name it was found
+// by, before duplicates were numbered (nodeName), else the name asked
+// for.
+type pathStep struct {
+	parent, node, name string
+}
+
+// finder returns folder's child named seg, the path's last name or one
+// of its folders, and whether seg is its name, as listed, rather than
+// another case of it.
+type finder func(ctx context.Context, folder, seg string, last bool) (*treeEntry, bool, error)
+
+// resolveIn resolves segs below t.ns's files.root with find, recording
+// each name looked up in steps, if not nil.
+func (st *reqState) resolveIn(ctx context.Context, t target, segs []string, c catConf, find finder, steps *[]pathStep) (target, error) {
+	folder := c.files.root
+	for i, seg := range segs {
+		last := i == len(segs)-1
+		e, exact, err := find(ctx, folder, seg, last)
+		if err != nil {
+			return t, err
+		}
+		if steps != nil {
+			s := pathStep{parent: folder, name: seg}
+			if e != nil {
+				s.node, s.name = e.node.Name, nodeName(e.node)
+			}
+			*steps = append(*steps, s)
+		}
+		if !last {
+			if e == nil || e.node.Kind != kindFolder {
+				t.kind = kMissing
+				return t, nil
+			}
+			folder = e.node.Name
+			continue
+		}
+		t.parent = folder
+		if e != nil {
+			t.node, t.title, t.listedAs, t.otherCase = e.node.Name, e.name, nodeName(e.node), !exact
+			if e.node.Kind == kindFolder {
+				t.kind = kFolder
+			} else {
+				t.kind, t.docNS, t.docName = kPlacement, e.node.ItemNS, e.node.ItemName
+			}
 			return t, nil
 		}
-		folder = e.node.Name
 	}
 	last := segs[len(segs)-1]
-	t.parent = folder
-	d, err := st.treeDir(ctx, t.ns, folder)
-	if err != nil {
-		return t, err
-	}
-	if e, exact := d.find(st.s, last); e != nil {
-		t.node, t.title, t.otherCase = e.node.Name, e.name, !exact
-		if e.node.Kind == kindFolder {
-			t.kind = kFolder
-		} else {
-			t.kind, t.docNS, t.docName = kPlacement, e.node.ItemNS, e.node.ItemName
-		}
-		return t, nil
-	}
 	if scratchName(last) || st.isScratchDir(t.path) {
 		return st.scratchAt(t, false), nil
 	}
@@ -536,6 +647,91 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 	}
 	t.kind, t.title = kNewNode, title
 	return t, nil
+}
+
+// writes reports whether the request writes to the core where its paths
+// lead (a COPY's source is read for the copy, which a stale name would
+// misdirect too).
+func (st *reqState) writes() bool {
+	switch st.method {
+	case "PUT", "DELETE", "MOVE", "COPY", "MKCOL":
+		return true
+	}
+	return false
+}
+
+// agrees reports whether catalog graph cg holds what a path's resolution
+// looked up (steps) as a tree service listed it: each node found still
+// in its folder, by the name it was found by (nameKey), and, where none
+// was, no node in the folder whose name compares equal to the one asked
+// for (one hidden from the token, or dangling, is the node documents'
+// to rule out).
+func (st *reqState) agrees(cg *catGraph, steps []pathStep) bool {
+	for _, s := range steps {
+		key := st.s.nameKey(s.name)
+		if s.node == "" {
+			for _, n := range cg.children(s.parent) {
+				if st.s.nameKey(nodeName(n)) == key {
+					return false
+				}
+			}
+			continue
+		}
+		n := cg.g.Node(s.node)
+		if !listed(n) || !slices.Contains(cg.g.WalkableParents(n), s.parent) || st.s.nameKey(nodeName(n)) != key {
+			return false
+		}
+	}
+	return true
+}
+
+// nodeChild returns folder's child named seg in catalog cat as nodeDir
+// would list it, reading only the items of the children whose names
+// compare equal to seg (nameKey), which a folder of thousands needs: the
+// one such child shown to the token (a folder, or a placement whose item
+// is live, offered and readable with its grant, in a namespace the
+// catalog trusts). With several such, or none where seg may be a
+// duplicate's numbered name, the folder is listed whole (nodeDir).
+func (st *reqState) nodeChild(ctx context.Context, cg *catGraph, cat, folder, seg string) (*treeEntry, bool, error) {
+	c, err := st.treeConf(ctx, cat)
+	if err != nil {
+		return nil, false, err
+	}
+	key, viaTree := st.s.nameKey(seg), st.s.treeURL(cat) != ""
+	var found []treeEntry
+	for _, n := range cg.children(folder) {
+		if st.s.nameKey(nodeName(n)) != key {
+			continue
+		}
+		if n.Kind == kindFolder {
+			found = append(found, newTreeEntry(n, nil))
+			continue
+		}
+		if viaTree && !slices.Contains(c.trust, n.ItemNS) || st.s.nsInfo(ctx, st.tk, n.ItemNS).sealed {
+			continue
+		}
+		h, err := cg.itemHead(st.tk)(ctx, n.ItemNS, n.ItemName)
+		switch {
+		case hidden(err):
+		case err != nil:
+			return nil, false, err
+		case h.State == client.Live:
+			found = append(found, newTreeEntry(n, h))
+		}
+	}
+	if _, _, dup := dupOf(seg); len(found) > 1 || len(found) == 0 && dup {
+		d, err := st.nodeDir(ctx, cat, folder)
+		if err != nil {
+			return nil, false, err
+		}
+		e, exact := d.find(st.s, seg)
+		return e, exact, nil
+	}
+	if len(found) == 0 {
+		return nil, false, nil
+	}
+	e := found[0]
+	return &e, norm.NFC.String(seg) == e.name, nil
 }
 
 // treePath reports whether p, of at most maxRefusedPath bytes, may name a
@@ -818,9 +1014,12 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 // ifMatch (a DELETE's If-Match, the revision a MOVE copied), an item
 // whose head isn't that revision is a 412, before anything is written,
 // or, if it changed between the check and its delete, after its
-// placement is restored as it was. A node with several parents (a DAG)
-// is unlinked from this folder only. A principal's DELETE is remembered a
-// while, so its write of the path restores the file (§H.6).
+// placement is restored as it was. The placement is deleted only as the
+// node documents read had it (If-Match), which resolveCatalog checked the
+// path against: renamed or moved since by anyone, it is a 409, not
+// deleted. A node with several parents (a DAG) is unlinked from this
+// folder only. A principal's DELETE is remembered a while, so its write
+// of the path restores the file (§H.6).
 func (st *reqState) deleteFile(ctx context.Context, t target, ifMatch, successor string) error {
 	cg, f, err := st.tree(ctx, t.ns)
 	if err != nil {
@@ -836,9 +1035,9 @@ func (st *reqState) deleteFile(ctx context.Context, t target, ifMatch, successor
 	if n := cg.g.Node(t.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
 		return st.editParents(ctx, t.ns, t.node, t.parent, "", "")
 	}
-	ptomb, err := st.deleteDoc(ctx, t.ns, t.node, "")
+	ptomb, err := st.deleteDoc(ctx, t.ns, t.node, cg.heads[t.node])
 	if err != nil {
-		return err
+		return changedSince(t, err)
 	}
 	d := treeDelete{cat: t.ns, node: t.node, nodeTomb: ptomb, parent: t.parent, itemNS: t.docNS, itemName: t.docName}
 	if t.docNS == f.ns {
@@ -920,22 +1119,37 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 }
 
 // deleteFolder deletes folder t of a tree (§H.5 "Delete a folder"): only
-// one without visible children (treeDir), which a 409 names; deleting a
-// folder doesn't delete what is in it (§B.7). Placements whose items are
-// gone (dangling, §B.3) aren't contents, and are deleted first; those
-// whose items the request's grant can't read are neither named nor
-// deleted. A
-// node with several parents (a DAG) is unlinked from this folder only.
-// The scope's scratch files in it go with it.
+// one without visible children, which a 409 names; deleting a folder
+// doesn't delete what is in it (§B.7). Its children are those of the node
+// documents, read for this (freshGraph), as nodeDir lists them: never a
+// tree service's listing, which lags the core (a file someone put in the
+// folder a moment ago, or every file while the tree service catches up
+// with a namespace), and would have the folder deleted over a file it
+// orphans. Placements whose items are gone (dangling, §B.3) aren't
+// contents, and are deleted first; those whose items the request's grant
+// can't read are neither named nor deleted. The folder node is deleted as
+// read (If-Match), not if it was renamed or moved meanwhile; a child
+// placed while it is deleted is orphaned (§H.5), as one placed by another
+// program always may be. A node with several parents (a DAG) is unlinked
+// from this folder only. The scope's scratch files in it go with it.
 func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 	cg, _, err := st.tree(ctx, t.ns)
 	if err != nil {
 		return err
 	}
-	if n := cg.g.Node(t.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
+	if !st.fresh[t.ns] {
+		if cg, err = st.freshGraph(ctx, t.ns); err != nil {
+			return err
+		}
+	}
+	n := cg.g.Node(t.node)
+	if !listed(n) || !slices.Contains(cg.g.WalkableParents(n), t.parent) {
+		return fail(http.StatusNotFound, "folder %s was moved or deleted by someone else just now; reload its folder", t.path)
+	}
+	if len(cg.g.WalkableParents(n)) > 1 {
 		return st.editParents(ctx, t.ns, t.node, t.parent, "", "")
 	}
-	d, err := st.treeDir(ctx, t.ns, t.node)
+	d, err := st.nodeDir(ctx, t.ns, t.node)
 	if err != nil {
 		return err
 	}
@@ -962,8 +1176,44 @@ func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 	for _, name := range st.scratchUnder(t.path) {
 		st.scratchRemove(name)
 	}
-	_, err = st.deleteDoc(ctx, t.ns, t.node, "")
+	_, err = st.deleteDoc(ctx, t.ns, t.node, cg.heads[t.node])
+	return changedSince(t, err)
+}
+
+// changedSince is the answer for a DELETE of node t.node of a tree that
+// found it changed since the node documents were read (412, If-Match on
+// the head read): renamed or moved by someone else a moment ago, by
+// another program than this server, which the DELETE isn't made over;
+// err otherwise.
+func changedSince(t target, err error) error {
+	if de, ok := err.(*davError); ok && de.status == http.StatusPreconditionFailed {
+		return fail(http.StatusConflict, "%s was changed by someone else just now (renamed or moved, maybe), so it isn't deleted; reload its folder", t.path)
+	}
 	return err
+}
+
+// stillNamed reports whether node doc, src.node's document as the core
+// has it now, is still what src's path named: in folder src.parent, by
+// the name it was found by (listedAs, nameKey).
+func (st *reqState) stillNamed(src target, doc any) bool {
+	m, _ := doc.(map[string]any)
+	n := &tree.Node{Name: src.node, Kind: tree.KindPlacement, ItemNS: src.docNS, ItemName: src.docName}
+	if src.kind == kFolder {
+		n.Kind = kindFolder
+	}
+	n.Title, _ = m["title"].(string)
+	if st.s.nameKey(nodeName(n)) != st.s.nameKey(src.listedAs) {
+		return false
+	}
+	ps, _ := m["parents"].([]any)
+	for _, x := range ps {
+		p, _ := x.(map[string]any)
+		href, _ := p["href"].(string)
+		if ns, name, ok := tree.ParseHref(href); ok && ns == src.ns && name == src.parent {
+			return true
+		}
+	}
+	return false
 }
 
 // dangling reports whether placement n's item is gone (§B.3): tombstoned
@@ -992,8 +1242,11 @@ func (st *reqState) dangling(ctx context.Context, cg *catGraph, n *tree.Node) bo
 // head (again on the new head if it moved meanwhile, 412). dst is a new
 // name (kNewNode), or src's own under another case, which compares equal
 // (nameKey). A folder can't go into itself or a folder in it (403). In
-// its new folder the node gets an order after the last child there. The
-// scope's scratch files in a moved folder move with it.
+// its new folder the node gets an order after the last child there. A
+// node renamed or moved since its path was resolved, by anyone, is a
+// 404 (stillNamed), never renamed or moved again over that, nor given a
+// second parent. The scope's scratch files in a moved folder move with
+// it.
 func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 	cg, _, err := st.tree(ctx, src.ns)
 	if err != nil {
@@ -1025,6 +1278,9 @@ func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 		e, err := st.s.doc(ctx, st.tk, src.ns, src.node, h.ID)
 		if err != nil {
 			return false, err
+		}
+		if !st.stillNamed(src, e.value) {
+			return false, fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", src.path)
 		}
 		m, _ := e.value.(map[string]any)
 		var ps []any

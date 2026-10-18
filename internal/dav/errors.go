@@ -28,6 +28,9 @@ type davError struct {
 	// a nonce, a limit), which the token's copy of §7.4's writer block
 	// may have had out of date (record)
 	refresh bool
+	// tooBig: a folder holds more than a tree service listing takes
+	// (svcList), refused as a listing, not as a path (resolveCatalog)
+	tooBig bool
 }
 
 func (e *davError) Error() string {

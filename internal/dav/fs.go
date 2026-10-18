@@ -59,7 +59,11 @@ type target struct {
 	// kPlacement or kNewNode in; title is the name a kFolder or kPlacement
 	// is shown by there, or the title a kNewNode gets (in NFC).
 	node, parent, title string
-	sdir                bool // a kScratch that is a scratch directory
+	// listedAs is the name a kFolder or kPlacement was found by, before
+	// duplicates were numbered (nodeName): a write checks the node still
+	// has it (stillNamed)
+	listedAs string
+	sdir     bool // a kScratch that is a scratch directory
 	// otherCase: a kFolder or kPlacement named by another case of its
 	// name, which compares equal (nameKey) but isn't it
 	otherCase bool
