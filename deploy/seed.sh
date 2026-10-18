@@ -220,7 +220,8 @@ WebDAV gateway is a revision of /r/files/q3-summary.md.
 EOF
 cat >"$tmp/readme.txt" <<'EOF'
 This drive is the catalog drive (a file tree, spec Addendum H), served over
-WebDAV by `patchlog dav` at http://localhost:8090/drive/.
+WebDAV by `patchlog dav` (in the compose stack, /drive/ on DAV_PORT, 8090 by
+default).
 
 Folders are folder nodes of drive, and files its placements, named by their
 titles; each file's content is a document in the namespace files. Renaming

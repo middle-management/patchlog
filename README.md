@@ -135,6 +135,10 @@ packages.
 make up        # or: docker compose up --build -d
 ```
 
+It needs Docker Compose 2.23.1 or newer (`docker compose version`): `compose.yaml` gives the
+WebDAV gateway's password as a config with `content`, which older versions refuse, and with it
+the whole file.
+
 On hosts where Docker can't create network namespaces (a Fly.io sprite, some VMs and CI runners;
 `bind-mount /proc/…/ns/net …: permission denied`), use `make up-host`, which layers
 `compose.host.yaml` over it: host networking, the same ports, and no `docker exec` healthchecks.
@@ -155,7 +159,7 @@ search index, the tree service and the branch janitor, all behind a local CDN (V
 | http://localhost:8080/playground/tree/cat/roots | the same, through the core's read-only proxy (`-tree-url`) |
 | http://localhost:8080/playground/index/demo?q=derby | the search index, through the core's read-only proxy (`-index-url`) |
 | http://localhost:9080, :9081, :9082 | the core, search and tree origins directly, bypassing the CDN |
-| http://localhost:8090 | WebDAV gateway (`patchlog dav`): `demo` and `files` as flat directories, `drive` as a file tree; any user name, password `patchlog-dev` (see [WebDAV in the stack](#webdav-in-the-stack)) |
+| http://localhost:8090 | WebDAV gateway (`patchlog dav`): `demo` as a flat directory, `drive` as a file tree; any user name, password `patchlog-dev` (see [WebDAV in the stack](#webdav-in-the-stack)) |
 
 The seed creates `schemas`, `demo` (a few matches, with catalog roles), two catalogs of `demo`,
 `files` and `drive` (a file tree of `files`), `private` (sealed, E2) and `vault` (end-to-end, E3:
@@ -208,22 +212,32 @@ Spec v0.46 additions to the catalog and tree services:
 
 `dav` in compose.yaml is the WebDAV gateway (see [WebDAV](#webdav-prototype)) in local mode
 against the dev core, so its writes carry `X-Author: dav`. Open http://localhost:8090/ with any
-user name and the password `patchlog-dev`. It serves `demo` and `files` as flat directories of
-their documents, and `drive` as a file tree whose folders are listed by the tree service:
+user name and the password `patchlog-dev`. It serves `demo` as a flat directory of its
+documents, and `drive` as a file tree whose folders are listed by the tree service:
 
 ```
 /demo/derby.json …                    demo's matches, as JSON files
-/files/q3-summary.md …                the namespace files: drive's items, by resource name
 /drive/README.txt                     the file tree drive (§H.2): a raw document, text/plain
 /drive/Reports/Q3 summary.md          a raw document, text/markdown
 /drive/Reports/budget.json            a JSON document
 /drive/Photos/logo.png                a raw document, image/png
 ```
 
+drive's items live in the namespace `files`, which the gateway doesn't serve as a flat directory:
+there a rename is a copy and a delete (§H.2 "Flat view"), so renaming or deleting a file in it
+would take the file out of `/drive/`, leaving its placement dangling. `/demo/` is such a flat
+directory of `demo`, whose documents `cat` and `topics` place: renaming or deleting one there
+leaves their placements of it dangling the same way (a rename's new name, in `$successor`, §8.1,
+is not followed by them). Rename and move files in `/drive/`, which changes only their
+placements.
+
 The password is a compose config, `${DAV_PASSWORD:-patchlog-dev}`, which reaches the gateway as a
-file only the container's user can read (`DAV_PASSWORD=… docker compose up -d` changes it). It is a
-development password, published here, and the gateway speaks plain HTTP: keep port 8090 to your
-own machine, as with the rest of the stack.
+file only the container's user can read. It is read when the `dav` container is created (the
+first `up`, or after `down`): on a running stack, `DAV_PASSWORD=… docker compose up -d
+--force-recreate dav` changes it (a plain `up -d` keeps the old one). It is a development
+password, published here, and the gateway speaks plain HTTP: keep port 8090 to your own
+machine, as with the rest of the stack. The gateway keeps nothing but memory caches, so it
+doesn't mount the `data` volume, which holds the core's databases and master key.
 
 - **macOS Finder**: Go → Connect to Server (⌘K), `http://localhost:8090/`, then Connect as a
   Registered User with any name and `patchlog-dev`.

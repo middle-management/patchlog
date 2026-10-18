@@ -231,9 +231,12 @@ service's listings.
     refusal over one of them; what is read with a grant (documents, catalog trees, tree-service
     listings) stays per token, the trees and listings within `-cache-size` over every token.
   - **In the compose stack** (`dav`, http://localhost:8090/, any user name, password
-    `patchlog-dev` or `DAV_PASSWORD`'s, delivered as a compose config file): `demo` and `files`
-    as flat directories and `drive` as a file tree, listed by the stack's tree service, which
-    follows `drive` too. The seed creates `files` and `drive` (`catalog.files`, with folder and
+    `patchlog-dev` or `DAV_PASSWORD`'s, delivered as a compose config file read when the
+    container is created, so `up -d --force-recreate dav` changes it; this needs Docker Compose
+    2.23.1 or newer, for the whole stack): `demo` as a flat directory and `drive` as a file tree,
+    listed by the stack's tree service, which follows `drive` too. `files`, drive's content
+    namespace, isn't served flat, where a rename or delete would leave drive's placement
+    dangling; the gateway doesn't mount the data volume. The seed creates `files` and `drive` (`catalog.files`, with folder and
     placement schemas and `cat`'s rules plus §H.2's titles) with two folders, raw Markdown, text
     and PNG files and a JSON file. README "WebDAV in the stack" has Finder, Windows, rclone
     and davfs2 how-tos.

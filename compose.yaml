@@ -1,5 +1,7 @@
 # The whole stack in development mode (no authentication; X-Author names
-# the author). Start it with `docker compose up --build` or `make up`.
+# the author). Start it with `docker compose up --build` or `make up`;
+# it needs Docker Compose 2.23.1 or newer (the dav-password config's
+# `content`, below).
 #
 # Everything is served through a local CDN (Varnish, deploy/varnish), which
 # caches by the origins' Cache-Control / CDN-Cache-Control and is purged by
@@ -24,8 +26,8 @@
 # Not behind the CDN:
 #
 #   http://localhost:8090             WebDAV gateway (patchlog dav, README "WebDAV"):
-#                                     demo and files as flat directories, drive as a
-#                                     file tree. Log in with any user name and the
+#                                     demo as a flat directory, drive as a file
+#                                     tree. Log in with any user name and the
 #                                     password patchlog-dev (dav below)
 #
 # `make cdn-check` shows caching and purging at work; send `X-Cache-Debug: 1`
@@ -35,14 +37,13 @@
 # the `data` volume; `docker compose down -v` wipes it.
 #
 # Health and shutdown: the core, index, tree and dav answer GET /_health
-# (200 while serving, 503 once shutdown starts; no login) and /_ready. Their
-# healthchecks
-# run `patchlog health`, so the image needs no curl or wget. On `docker
-# compose stop` / `down` they drain: long-polls and event streams end at
-# once, other requests get up to -shutdown-timeout (20s) before they are
-# cancelled and roll back, and stop_grace_period (30s) leaves room for that
-# plus the engine's and the CDN purger's own shutdown before Docker kills
-# the process.
+# (200 while serving, 503 once shutdown starts; no login) and /_ready.
+# Their healthchecks run `patchlog health`, so the image needs no curl or
+# wget. On `docker compose stop` / `down` they drain: long-polls and event
+# streams end at once, other requests get up to -shutdown-timeout (20s)
+# before they are cancelled and roll back, and stop_grace_period (30s)
+# leaves room for that plus the engine's and the CDN purger's own shutdown
+# before Docker kills the process.
 
 x-patchlog: &patchlog
   build: .
@@ -171,18 +172,27 @@ services:
         condition: service_completed_successfully
 
   # The WebDAV gateway (README "WebDAV"), a network drive for file managers,
-  # editors and rclone: demo and files as flat directories of their
-  # documents, and drive as a file tree whose folders the tree service
-  # lists. Local mode against the -dev core: no grant, its writes by
-  # X-Author dav. WebDAV clients log in with any user name and the password
-  # in the dav-password config below: patchlog-dev, or DAV_PASSWORD's. It
-  # is a development password, published in this file: like the rest of
-  # this stack, keep the port to yourself. Plain HTTP, and not through the
-  # CDN, which has nothing to cache for WebDAV clients. It keeps nothing but
-  # memory caches: a restart loses locks and temporary files, not files.
+  # editors and rclone: demo as a flat directory of its documents, and
+  # drive as a file tree whose folders the tree service lists. files,
+  # drive's content namespace, isn't served flat: drive owns it (§H.2),
+  # and a rename or delete there (a copy and a delete, §H.2 "Flat view")
+  # would leave drive's placement dangling. Local mode against the -dev
+  # core: no grant, its writes by X-Author dav. WebDAV clients log in with
+  # any user name and the password in the dav-password config below:
+  # patchlog-dev, or DAV_PASSWORD's, read when the container is created
+  # (`DAV_PASSWORD=… docker compose up -d --force-recreate dav` changes
+  # it). It is a development password, published in this file: like the
+  # rest of this stack, keep the port to yourself. Plain HTTP, and not
+  # through the CDN, which has nothing to cache for WebDAV clients. It
+  # keeps nothing but memory caches (a restart loses locks and temporary
+  # files, not files), so it doesn't mount the data volume, which holds
+  # the core's databases and master key: /data is an empty tmpfs.
   dav:
     <<: *patchlog
-    command: [dav, -api=http://patchlog:8080, -ns=demo, -ns=files, -catalog=drive, -tree-url=http://tree:8082, -addr=:8090, -password-file=/run/dav.password, -author=dav, -shutdown-timeout=20s]
+    volumes: []
+    tmpfs:
+      - /data
+    command: [dav, -api=http://patchlog:8080, -ns=demo, -catalog=drive, -tree-url=http://tree:8082, -addr=:8090, -password-file=/run/dav.password, -author=dav, -shutdown-timeout=20s]
     configs:
       # Copied into the container, readable by its user (patchlog, 10001)
       # only, so dav doesn't warn of a password file others may read.
@@ -257,6 +267,8 @@ volumes:
   data:
 
 configs:
-  # The WebDAV gateway's password (dav above). Development only.
+  # The WebDAV gateway's password (dav above). Development only. A config's
+  # `content` needs Docker Compose 2.23.1 or newer; older ones refuse this
+  # whole file.
   dav-password:
     content: ${DAV_PASSWORD:-patchlog-dev}

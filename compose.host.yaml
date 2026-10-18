@@ -74,7 +74,7 @@ services:
   # until it listens).
   dav:
     <<: *host
-    command: [dav, -api=http://patchlog:9080, -ns=demo, -ns=files, -catalog=drive, -tree-url=http://tree:9082, "-addr=:${DAV_PORT:-8090}", -password-file=/run/dav.password, -author=dav, -shutdown-timeout=20s]
+    command: [dav, -api=http://patchlog:9080, -ns=demo, -catalog=drive, -tree-url=http://tree:9082, "-addr=:${DAV_PORT:-8090}", -password-file=/run/dav.password, -author=dav, -shutdown-timeout=20s]
     healthcheck:
       disable: true
     depends_on: !override
