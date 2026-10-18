@@ -281,6 +281,58 @@ func expectCode(t *testing.T, r *resp, status int, code string) {
 	}
 }
 
+// expectLimit checks a limit refusal (§6.6, §12): code "limit", limit
+// naming key, and measured and max. measured < 0 asks for any lower bound
+// above max (a body the server stopped reading), and max < 0 for no sizes,
+// as for durations and rates.
+func expectLimit(t *testing.T, r *resp, status int, key string, measured, max int64) {
+	t.Helper()
+	expectCode(t, r, status, "limit")
+	checkLimit(t, r.Obj(), key, measured, max)
+}
+
+// expectItemLimit checks a batch refusal whose first item failed a limit
+// (§7.5): its report carries the fields of the item's refusal.
+func expectItemLimit(t *testing.T, r *resp, status int, key string, measured, max int64) {
+	t.Helper()
+	expectCode(t, r, status, "batch")
+	items, _ := r.Obj()["items"].([]any)
+	if len(items) == 0 {
+		t.Fatalf("no items: %s", r.Body)
+	}
+	it, _ := items[0].(map[string]any)
+	if it["code"] != "limit" {
+		t.Fatalf("item code %v, want limit: %s", it["code"], r.Body)
+	}
+	checkLimit(t, it, key, measured, max)
+}
+
+func checkLimit(t *testing.T, m map[string]any, key string, measured, max int64) {
+	t.Helper()
+	if m["limit"] != key {
+		t.Fatalf("limit %v, want %q: %v", m["limit"], key, m)
+	}
+	gotM, hasM := m["measured"].(float64)
+	gotX, hasX := m["max"].(float64)
+	switch {
+	case max < 0:
+		if _, has := m["measured"]; has {
+			t.Fatalf("measured on a limit without sizes: %v", m)
+		}
+		if _, has := m["max"]; has {
+			t.Fatalf("max on a limit without sizes: %v", m)
+		}
+	case !hasM || !hasX:
+		t.Fatalf("no measured or max: %v", m)
+	case int64(gotX) != max:
+		t.Fatalf("max %v, want %d: %v", gotX, max, m)
+	case measured < 0 && gotM <= gotX:
+		t.Fatalf("measured %v, want a lower bound above max %v: %v", gotM, gotX, m)
+	case measured >= 0 && int64(gotM) != measured:
+		t.Fatalf("measured %v, want %d: %v", gotM, measured, m)
+	}
+}
+
 // --- dev-mode (auth disabled) shortcuts ----------------------------------
 
 func addRoot(doc any) []any { return []any{map[string]any{"op": "add", "path": "", "value": doc}} }

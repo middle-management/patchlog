@@ -1,8 +1,12 @@
 package tree
 
-import "context"
+import (
+	"context"
+	"strings"
+)
 
-// SealedViews returns the stored sealed listings, view → Cache-Tag (tests).
+// SealedViews returns the stored sealed listings, URL → Cache-Tag, the
+// tags of every reader shape stored at it (tests).
 func (s *Service) SealedViews() map[string]string {
 	rows, err := s.db.Query(`SELECT view, tags FROM sealed_views`)
 	if err != nil {
@@ -14,6 +18,10 @@ func (s *Service) SealedViews() map[string]string {
 		var v, t string
 		if err := rows.Scan(&v, &t); err != nil {
 			panic(err)
+		}
+		v, _, _ = strings.Cut(v, "\n")
+		if out[v] != "" {
+			t = out[v] + "," + t
 		}
 		out[v] = t
 	}

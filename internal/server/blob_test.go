@@ -196,14 +196,14 @@ func TestBlobUploadChecks(t *testing.T) {
 	expectCode(t, e.putBlobAs("c", "a", bid, "text/plain", "", []byte("other bytes")), 422, "blob_mismatch")
 	big := []byte(strings.Repeat("b", 1001))
 	r, _ := e.putBlob("c", "a", "text/plain", "", big)
-	expectCode(t, r, 413, "limit")
+	expectLimit(t, r, 413, "blobSize", 1001, 1000)
 	// blobPending: at least 4 KiB per blob, per uploader and namespace.
 	expect(t, e.putBlobAs("c", "a", bid, "text/plain", "", data), 201)
 	expect(t, e.putBlobAs("c", "a", bid, "text/plain", "", data), 201) // the same entry again
 	r, _ = e.putBlob("c", "b", "text/plain", "", []byte("two"))
 	expect(t, r, 201)
 	r, _ = e.putBlob("c", "b", "text/plain", "", []byte("three"))
-	expectCode(t, r, 413, "limit") // 3 × 4 KiB > 10000
+	expectLimit(t, r, 413, "blobPending", 3*4096, 10000) // 3 × 4 KiB > 10000
 	r, _ = e.putBlob("c", "b", "text/plain", "", []byte("three"), "bob")
 	expect(t, r, 201) // bob's own budget
 

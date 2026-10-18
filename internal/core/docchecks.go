@@ -83,13 +83,13 @@ type shapeScan struct {
 func (s *shapeScan) value(path, depth int) {
 	walked := s.bad == nil
 	if walked && path+2 > s.l.PathSize {
-		s.bad = limitErr(413, fmt.Sprintf("a path is longer than %d bytes", s.l.PathSize))
+		s.bad = limitErr(413, "pathSize", int64(path+2), int64(s.l.PathSize), fmt.Sprintf("a path is longer than %d bytes", s.l.PathSize))
 		walked = false
 	}
 	switch s.b[s.i] {
 	case '"':
 		if n := s.str(); walked && n > s.l.ValueSize {
-			s.bad = limitErr(413, fmt.Sprintf("a string is longer than %d bytes", s.l.ValueSize))
+			s.bad = limitErr(413, "valueSize", int64(n), int64(s.l.ValueSize), fmt.Sprintf("a string is longer than %d bytes", s.l.ValueSize))
 		}
 	case '[':
 		s.depth = max(s.depth, depth+1)
@@ -120,7 +120,7 @@ func (s *shapeScan) value(path, depth int) {
 			n := s.str()
 			name := s.b[start:s.i]
 			if names && n > s.l.ValueSize {
-				s.bad = limitErr(413, fmt.Sprintf("a member name is longer than %d bytes", s.l.ValueSize))
+				s.bad = limitErr(413, "valueSize", int64(n), int64(s.l.ValueSize), fmt.Sprintf("a member name is longer than %d bytes", s.l.ValueSize))
 				names = false
 			}
 			if string(name) == `"$blob"` {
@@ -220,7 +220,7 @@ func checkBlobRefs(l Limits, doc any) *Error {
 		return bad
 	}
 	if len(distinct) > l.BlobsPerDocument {
-		return limitErr(422, fmt.Sprintf("more than %d blobs referenced", l.BlobsPerDocument))
+		return limitErr(422, "blobsPerDocument", int64(len(distinct)), int64(l.BlobsPerDocument), fmt.Sprintf("more than %d blobs referenced", l.BlobsPerDocument))
 	}
 	return nil
 }

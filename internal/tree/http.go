@@ -452,11 +452,27 @@ var ops = map[string]bool{
 // another form is redirected to it. Every parameter but min is
 // single-valued: given more than once, it is 400 bad_input.
 //
+// File trees (§H.2, §H.3; files.go). A catalog whose catalog.files makes
+// it a file tree gives every placement entry with a head "file": { size,
+// type, modified } of that head, in the clear for items of a namespace
+// that is neither sealed nor e2e. For an item of a sealed (E2) namespace
+// it is "file": { "sealed": JWE of { file } } under the item's own K_r,
+// kid its namespace's current epoch, pl { ns, name, view } of the item, so
+// readers given K_r by /read-grants open it, whatever the catalog's level;
+// for an e2e item it is left out. A listing holding any sealed file is
+// stored and served unchanged like a sealed catalog's. While a sealed
+// namespace's key can't be had for the moment, listings are 503, no-store
+// (fileSealing). The "file": { "sealed" } form, and its nesting inside a
+// sealed catalog's whole-listing JWE below, are provisional: §E.2.6 has a
+// per-entry "sealed" member for values of one source (the catalog's
+// titles), and no form yet for values another namespace's resource gives.
+//
 // A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles are
-// the only values a listing takes from documents' content (names, heads,
-// hrefs, structure, order and cursors stay in the clear, and content
-// namespaces contribute nothing else), so a listing has one sealed source,
-// the catalog. A reader of the whole catalog gets the listing sealed as
+// the only values a listing takes from the catalog's content (names,
+// heads, hrefs, structure, order and cursors stay in the clear, and
+// content namespaces contribute nothing else but file metadata, sealed on
+// its own), so the catalog is the one source of what a listing seals
+// whole. A reader of the whole catalog gets the listing sealed as
 // one JWE under the catalog's current epoch key, Content-Type
 // application/jose, pl { ns, view } where view is the listing's request
 // target (/{catalog}[/g/{gs}]/at/{at}/{op}?{query}, the canonical form). A
@@ -652,10 +668,10 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		return
 	}
 	// canon is the canonical URL of this listing at an at (§A.5): what
-	// redirects name, what listings are kept under (with the reader's
-	// shape), and in a sealed or e2e catalog the view a listing is bound
-	// to (§E.2.6). Only it is answered 200: another form of it, or one
-	// with min, is redirected.
+	// redirects name, what listings are kept and stored under (with the
+	// reader's shape, keyOf), and in a sealed or e2e catalog the view a
+	// listing is bound to (§E.2.6). Only it is answered 200: another form
+	// of it, or one with min, is redirected.
 	canon := func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
 	keyOf := func(at string) string { return canon(at) + "\n" + v.shape() }
 	keep := !perReader(op, v)
@@ -728,6 +744,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	}
 	l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key)
 	switch {
+	case errors.Is(err, errFileKeys):
+		s.opt.Logf("tree: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals the file metadata of a trusted namespace")
 	case err != nil:
 		s.opt.Logf("tree: sealing a listing: %v", err)
 		WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
@@ -780,14 +801,23 @@ type computed struct {
 // listing computes the listing of op for v at the current at, sealed in a
 // sealed or e2e catalog, stores a sealed one and keeps it (unless
 // perReader), and returns it with the at it is at. canon gives its URL at
-// an at, keyOf what it is kept under.
+// an at, the view it is bound to, and keyOf what it is stored and kept
+// under: the URL and the reader's shape, since a namespace that turns
+// private moves no URL (viewer.shape).
 func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Values, canon, keyOf func(string) string, info derived.Info, key derived.Key) (*computed, error) {
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
 	gen := s.kept.Generation(cat)
-	if info.Protected() && keep {
+	fs, err := s.fileSealing(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// A listing that seals values, the catalog's or an item's file
+	// metadata, is sealed once and then served unchanged (§E.2.6).
+	sealed := info.Protected() || fs.seals()
+	if sealed && keep {
 		at := s.At()
-		if st, ok := s.sealed.Get(ctx, canon(at)); ok {
+		if st, ok := s.sealed.Get(ctx, keyOf(at)); ok {
 			st, _ = s.kept.Put(keyOf(at), cat, gen, true, st)
 			return &computed{st: st, at: at, status: http.StatusOK}, nil
 		}
@@ -806,7 +836,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		l.at, nss = CombinedAt(g, curMap)
 		cps = checkpointsOf(g, curMap)
 		view = derived.View{NS: cat, Target: canon(l.at)}
-		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at}
+		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
 		if perEntry {
 			q.sealTitle = func(name, title string) string {
 				jwe, err := derived.SealItem(key, view, name, map[string]any{"title": title})
@@ -838,9 +868,9 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		// the reader.
 		return l, nil
 	}
-	if info.Protected() {
+	if sealed {
 		var err error
-		if l.st, err = s.sealed.Put(ctx, view.Target, cat, l.at, l.st); err != nil {
+		if l.st, err = s.sealed.Put(ctx, keyOf(l.at), cat, l.at, l.st); err != nil {
 			s.opt.Logf("tree: storing a sealed listing: %v", err)
 		}
 		if cur := s.At(); cur != l.at {
@@ -851,7 +881,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			}
 		}
 	}
-	l.st, _ = s.kept.Put(keyOf(l.at), cat, gen, info.Protected(), l.st)
+	l.st, _ = s.kept.Put(keyOf(l.at), cat, gen, sealed, l.st)
 	s.recordAt(l.at, cps)
 	return l, nil
 }
@@ -1365,6 +1395,11 @@ type query struct {
 	// sealTitle, if set, seals a catalog node's title for per-entry
 	// sealing (§E.2.6): the entry carries "sealed" instead of "title".
 	sealTitle func(name, title string) string
+	// files says how placements carry file metadata in a file tree
+	// (§H.3), sealed under view; serr records a sealing failure.
+	files *fileSealing
+	view  derived.View
+	serr  *error
 }
 
 // title sets a node's title on an entry, in the clear or sealed.
@@ -1456,6 +1491,9 @@ func (q *query) entry(n *Node) map[string]any {
 			m["url"] = q.s.origin + q.g.ItemHref(n) + "/rev/" + n.ItemHead
 			if a := q.g.Actual(n.ItemNS); a != n.ItemNS {
 				m["branch"] = a
+			}
+			if f := q.file(n); f != nil {
+				m["file"] = f
 			}
 		}
 		if n.State == StateDangling {

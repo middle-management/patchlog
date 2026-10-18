@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -110,8 +109,8 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	bad := make([]*Error, len(bearers))
 	for i, b := range bearers {
 		g, err := grant.Decode(b, e.opt.Maximums.GrantSize)
-		if errors.Is(err, grant.ErrTooLarge) {
-			return nil, limitErr(413, "grant too large")
+		if e := grantTooLarge(err); e != nil {
+			return nil, e
 		}
 		if err != nil {
 			bad[i] = authErr(err) // ranked with the rest, in its place
@@ -421,41 +420,8 @@ func edgeReadScope(a *actor) ([]string, bool) {
 // literal array. It reports false for any other rule, or a name that
 // isn't valid (§3.6).
 func fixesResource(rv any) ([]string, bool) {
-	m, ok := rv.(map[string]any)
-	if !ok || len(m) != 3 || m["path"] != "/resource" {
-		return nil, false
-	}
-	var lits []any
-	literal := func(k string) (any, bool) {
-		o, ok := m[k].(map[string]any)
-		if !ok || len(o) != 1 {
-			return nil, false
-		}
-		v, ok := o["value"]
-		return v, ok
-	}
-	switch m["op"] {
-	case "test":
-		if v, ok := m["value"]; ok {
-			lits = []any{v}
-		} else if sch, ok := m["schema"].(map[string]any); ok && len(sch) == 1 {
-			if lits, ok = sch["enum"].([]any); !ok {
-				return nil, false
-			}
-		} else {
-			return nil, false
-		}
-	case "compare":
-		if v, ok := literal("eq"); ok {
-			lits = []any{v}
-		} else if v, ok := literal("in"); ok {
-			if lits, ok = v.([]any); !ok {
-				return nil, false
-			}
-		} else {
-			return nil, false
-		}
-	default:
+	lits, ok := grant.ResourceLiterals(rv)
+	if !ok {
 		return nil, false
 	}
 	names := []string{}

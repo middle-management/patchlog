@@ -120,7 +120,9 @@ type Verified struct {
 // Verify checks a decoded grant against the configuration in force (§C.2,
 // §C.4), in the order of §C.2: first that every block carrying ns names
 // env.NS (403, before anything is verified), then the signature chain,
-// times and revocation (401: no usable grant), then the key scope (403).
+// times and revocation (401: no usable grant), then the key scope (403),
+// readScope included, so the core and the services that verify grants
+// (grantcheck) refuse the same grants.
 func Verify(g *Grant, env Env) (*Verified, error) {
 	if g == nil || len(g.Blocks) == 0 {
 		return nil, unauth("missing grant")
@@ -296,7 +298,7 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 	if via == nil {
 		via = []string{}
 	}
-	return &Verified{
+	v := &Verified{
 		Grant: g,
 		Key:   key,
 		Principal: Principal{
@@ -313,7 +315,15 @@ func Verify(g *Grant, env Env) (*Verified, error) {
 		BlockRules:     blockRules,
 		KeyRules:       key.Rules,
 		roles:          env.Roles,
-	}, nil
+	}
+	if key.ReadScopeResource {
+		// The key's scope (§C.2 item 1, §C.4): every read grant it signs
+		// fixes /resource (§2.1), whatever the request.
+		if ok, _ := v.Allows("read"); ok && !v.FixesResource() {
+			return nil, forbid(`key %q has readScope "resource": a read grant it signs must fix /resource (§2.1, §C.4)`, key.Kid)
+		}
+	}
+	return v, nil
 }
 
 // HasRoles reports whether the grant carries roles (its root lists roles).

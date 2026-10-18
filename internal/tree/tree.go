@@ -31,11 +31,13 @@
 // ids), but its documents are not read, so it contributes no implicit
 // placements. GET /_status reports each namespace's state and why any is
 // skipped. Listings of a sealed or e2e catalog are served sealed (see
-// Handler); content namespaces contribute only names, heads and structure,
-// which stay in the clear (§E.2.6).
+// Handler); content namespaces contribute names, heads and structure,
+// which stay in the clear, and in a file tree the file metadata of their
+// items' heads, sealed per entry under the item's K_r for a sealed
+// namespace and left out for an e2e one (§E.2.6, §H.3, files.go).
 //
 // Stored plaintext. The database holds what the service derives from its
-// namespaces in the clear (titles, $parents, $access, and the catalog's
+// namespaces in the clear (titles, file metadata, $parents, $access, and the catalog's
 // acl/effective tables), as the origin does at E2: it is protected only by
 // the service's own storage, which must be encrypted at least like the
 // core at E1. A purge or purge-ns deletes the derived rows (with
@@ -319,14 +321,17 @@ func (s *Service) init(ctx context.Context) error {
 			return fmt.Errorf("tree: schema: %w", err)
 		}
 	}
-	// A database from before item titles (§B.5).
-	var hasTitle int
-	if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('items') WHERE name = 'title'`).Scan(&hasTitle); err != nil {
-		return fmt.Errorf("tree: schema: %w", err)
-	}
-	if hasTitle == 0 {
-		if _, err := s.db.ExecContext(ctx, `ALTER TABLE items ADD COLUMN title TEXT`); err != nil {
+	// A database from before item titles (§B.5), or created times and file
+	// metadata (§H.3), which backfillFiles fills in for a file tree.
+	for _, col := range []string{"title", "created", "file"} {
+		var has int
+		if err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM pragma_table_info('items') WHERE name = ?`, col).Scan(&has); err != nil {
 			return fmt.Errorf("tree: schema: %w", err)
+		}
+		if has == 0 {
+			if _, err := s.db.ExecContext(ctx, `ALTER TABLE items ADD COLUMN `+col+` TEXT`); err != nil {
+				return fmt.Errorf("tree: schema: %w", err)
+			}
 		}
 	}
 	if err := s.sealed.Init(ctx); err != nil {
@@ -519,6 +524,15 @@ func (s *Service) Run(ctx context.Context) error {
 	s.fmu.Lock()
 	s.runCtx = ctx
 	s.fmu.Unlock()
+	if err := s.backfillFiles(ctx); err != nil && ctx.Err() == nil {
+		// Made again beside the followers until it succeeds.
+		s.opt.Logf("tree: file metadata: %v; retrying", err)
+		s.fwg.Add(1)
+		go func() {
+			defer s.fwg.Done()
+			s.retryBackfill(ctx)
+		}()
+	}
 	s.ensureFollowers()
 	<-ctx.Done()
 	s.fwg.Wait()
@@ -629,12 +643,16 @@ func (s *Service) follow(ctx context.Context, ns string) {
 
 // prep is one coalesced change with its fetched content.
 type prep struct {
-	name   string
-	kind   string // head, tombstone or purge
-	head   string
-	doc    any
-	title  string // the item's title at the catalog's pointer (§B.5)
-	purged bool
+	name  string
+	kind  string // head, tombstone or purge
+	head  string
+	doc   any
+	title string // the item's title at the catalog's pointer (§B.5)
+	// created is the head's created as the log gives it, file its file
+	// metadata in a file tree (§H.3).
+	created string
+	file    *FileMeta
+	purged  bool
 }
 
 // Apply implements follow.Handler. The batch's units are coalesced and
@@ -689,7 +707,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	// Item titles (§B.5): read from the heads of items in namespaces that
 	// aren't sealed or end-to-end, when the catalog names a pointer.
 	s.mu.RLock()
-	tptr, hasTitle := s.g.TitlePtr, s.g.HasTitle
+	tptr, hasTitle, fileTree := s.g.TitlePtr, s.g.HasTitle, s.g.Files
 	s.mu.RUnlock()
 	var retitle map[[2]string]string
 	if isCat && cfg != nil {
@@ -707,18 +725,36 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 			titled = true
 		}
 	}
+	// File metadata (§H.3): every head of a content namespace in a file
+	// tree is read for it, with keys in a sealed one; at E3 it is left out.
+	filed := false
+	if !isCat && fileTree {
+		in, err := s.keys.Info(ctx, fb.NS)
+		if err != nil {
+			return fmt.Errorf("tree: the encryption of %s: %w", fb.NS, err)
+		}
+		filed = in.Level != derived.LevelE2E
+	}
 	var preps []prep
 	for _, ch := range co.Changes {
-		p := prep{name: ch.Resource, kind: ch.Kind, head: ch.Target, purged: ch.Purged}
-		if ch.Kind == "head" && (isCat || s.opt.SelfPlacing || titled) {
+		p := prep{name: ch.Resource, kind: ch.Kind, head: ch.Target, purged: ch.Purged, created: ch.Created}
+		if ch.Kind == "head" && (isCat || s.opt.SelfPlacing || titled || filed) {
 			doc, err := s.keys.FetchDoc(ctx, fb.NS, ch.Resource, ch.Target, func(f client.Flag) {
 				s.opt.Logf("tree: %s/%s: revision %s by %s is flagged and left out: %s", fb.NS, ch.Resource, f.ID, f.Author, f.Message)
 			})
 			switch {
 			case err == nil:
+				if doc.ID != ch.Target {
+					// The head since, the revision being pruned: the
+					// entry's created isn't its (follow.FetchDoc).
+					p.created = ""
+				}
 				p.head, p.doc = doc.ID, doc.Value
 				if titled {
 					p.title = titleAt(doc.Value, tptr)
+				}
+				if filed {
+					p.file = fileMetaOf(doc, p.created)
 				}
 			case errors.Is(err, derived.ErrSkip) && !isCat:
 				// A live item whose document isn't readable content (an
@@ -741,9 +777,26 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Whether the catalog is a file tree changes only under wmu: a content
+	// batch fetched before it changed is fetched again (the follower
+	// retries), and a catalog change reads the items for it here, where
+	// no other apply commits meanwhile (refile).
+	s.mu.RLock()
+	nowFiles := s.g.Files
+	s.mu.RUnlock()
+	if !isCat && nowFiles != fileTree {
+		return fmt.Errorf("tree: %s fetched while the catalog's catalog.files changed; fetching again", fb.NS)
+	}
+	var fr *refiling
+	if isCat && cfg != nil && isFileTree(cfg.Value) != nowFiles {
+		var err error
+		if fr, err = s.refile(ctx, !nowFiles); err != nil {
+			return err
+		}
+	}
 	s.mu.Lock()
 	oldTrust := s.g.Trust
-	res, err := s.applyLocked(context.WithoutCancel(ctx), b, co, preps, cfg, content, retitle)
+	res, err := s.applyLocked(context.WithoutCancel(ctx), b, co, preps, cfg, content, retitle, fr)
 	if err != nil {
 		if rerr := s.reload(context.Background()); rerr != nil {
 			s.opt.Logf("tree: reloading after a failed apply: %v", rerr)
@@ -835,7 +888,7 @@ type applyResult struct {
 	purgedAt time.Time // when the purge of the batch's namespace was applied
 }
 
-func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc, retitle map[[2]string]string) (*applyResult, error) {
+func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc, retitle map[[2]string]string, fr *refiling) (*applyResult, error) {
 	g := s.g
 	cat := s.opt.Catalog
 	oldTrust := g.Trust // setConfig replaces it
@@ -877,6 +930,14 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 					}
 				}
 			}
+			// catalog.files came or went: every live item's file
+			// metadata is set or dropped, and listings move to the new
+			// checkpoint.
+			if fr != nil {
+				if err := fr.apply(ctx, tx, g, changed); err != nil {
+					return nil, err
+				}
+			}
 		}
 		for _, p := range preps {
 			changed[p.name] = true
@@ -885,11 +946,11 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 				g.setExplicit(n)
 				if n.ItemNS != "" {
 					// A new placement: its item's state is in the items table.
-					st, head, title, err := itemStateTitle(ctx, tx, n.ItemNS, n.ItemName)
+					it, err := itemInfo(ctx, tx, n.ItemNS, n.ItemName)
 					if err != nil {
 						return nil, err
 					}
-					g.setItem(p.name, st, head, title)
+					g.setItem(p.name, it)
 				}
 			} else {
 				g.removeExplicit(p.name)
@@ -902,7 +963,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 				if _, err := tx.ExecContext(ctx, `DELETE FROM items WHERE ns = ?`, ns); err != nil {
 					return nil, err
 				}
-			} else if _, err := tx.ExecContext(ctx, `UPDATE items SET state = ?, head = NULL, title = NULL WHERE ns = ?`, ItemPurged, ns); err != nil {
+			} else if _, err := tx.ExecContext(ctx, `UPDATE items SET state = ?, head = NULL, title = NULL, created = NULL, file = NULL WHERE ns = ?`, ItemPurged, ns); err != nil {
 				return nil, err
 			}
 			if _, err := tx.ExecContext(ctx, `DELETE FROM self_parents WHERE ns = ?`, ns); err != nil {
@@ -915,7 +976,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			for _, m := range []map[string]*Node{g.explicit, g.self} {
 				for name, n := range m {
 					if n.ItemNS == ns {
-						g.setItem(name, st, "", "")
+						g.setItem(name, itemData{state: st})
 						changed[name] = true
 					}
 				}
@@ -935,22 +996,30 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			case "purge":
 				st, head = ItemPurged, ""
 			}
-			var headCol, titleCol any
-			title := p.title
+			var headCol, titleCol, createdCol, fileCol any
+			title, file := p.title, p.file
 			if head != "" {
 				headCol = head
 			}
-			if title != "" && st == ItemLive {
-				titleCol = title
-			} else {
-				title = ""
+			if st != ItemLive {
+				title, file = "", nil
 			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO items (ns, name, state, head, title) VALUES (?, ?, ?, ?, ?)
-				ON CONFLICT (ns, name) DO UPDATE SET state = excluded.state, head = excluded.head, title = excluded.title`, ns, p.name, st, headCol, titleCol); err != nil {
+			if title != "" {
+				titleCol = title
+			}
+			if p.created != "" && st == ItemLive {
+				createdCol = p.created
+			}
+			if file != nil {
+				fileCol = file.encode()
+			}
+			if _, err := tx.ExecContext(ctx, `INSERT INTO items (ns, name, state, head, title, created, file) VALUES (?, ?, ?, ?, ?, ?, ?)
+				ON CONFLICT (ns, name) DO UPDATE SET state = excluded.state, head = excluded.head, title = excluded.title,
+				created = excluded.created, file = excluded.file`, ns, p.name, st, headCol, titleCol, createdCol, fileCol); err != nil {
 				return nil, err
 			}
 			pl := ns + "." + p.name
-			if g.setItem(pl, st, head, title) {
+			if g.setItem(pl, itemData{state: st, head: head, title: title, file: file}) {
 				changed[pl] = true
 			}
 			if !s.opt.SelfPlacing {
@@ -966,7 +1035,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 					ON CONFLICT (ns, name) DO UPDATE SET parents = excluded.parents`, ns, p.name, canonJSON(m["$parents"])); err != nil {
 					return nil, err
 				}
-				sn.ItemState, sn.ItemHead, sn.ItemTitle = st, head, title
+				sn.ItemState, sn.ItemHead, sn.ItemTitle, sn.ItemFile = st, head, title, file
 				g.setSelf(sn)
 				changed[pl] = true
 			} else if g.self[pl] != nil {

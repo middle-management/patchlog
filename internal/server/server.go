@@ -79,6 +79,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /ns/{ns}/log", s.nsLive)
 	m.HandleFunc("GET /ns/{ns}/events", s.nsEvents)
 	m.HandleFunc("GET /ns/{ns}/gestures/{gesture}", s.nsGestures)
+	m.HandleFunc("GET /ns/{ns}/principal", s.nsPrincipal)
 	m.HandleFunc("GET /ns/{ns}/grants/{gid}", s.nsGrant)
 	m.HandleFunc("GET "+core.DefaultJWKSPath, s.operatorKeys)
 	m.HandleFunc("GET /ns/{ns}/branches", s.nsBranches)
@@ -356,20 +357,55 @@ func badInput(msg string) error {
 	return &core.Error{Status: 400, Body: map[string]any{"code": "bad_input", "message": msg}}
 }
 
-// readJSON reads and strictly parses an I-JSON body (§3.1).
-func readJSON(r *http.Request, max int) (any, error) {
-	body, err := io.ReadAll(io.LimitReader(r.Body, int64(max)+1))
+// bodyLimit is what the refusal of an oversized body names (§6.6): the
+// limit's key and its value. Without a key, the bound is no limit of §6.6.
+type bodyLimit struct {
+	key string
+	max int
+}
+
+// noLimit bounds a body that no limit of §6.6 covers.
+var noLimit = bodyLimit{}
+
+// readJSON reads and strictly parses an I-JSON body (§3.1) of at most
+// bound bytes. A longer one is 413 limit, naming lim, with measured the
+// bytes read, a lower bound (§6.6), or, for a body no limit covers, 400.
+func readJSON(r *http.Request, bound int, lim bodyLimit) (any, error) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, int64(bound)+1))
 	if err != nil {
 		return nil, badInput("could not read body")
 	}
-	if len(body) > max {
-		return nil, &core.Error{Status: 413, Body: map[string]any{"code": "limit", "message": "request too large"}}
+	if len(body) > bound {
+		return nil, tooLarge(len(body), lim)
 	}
 	v, err := jsonv.Parse(body)
 	if err != nil {
 		return nil, badInput(err.Error())
 	}
 	return v, nil
+}
+
+// tooLarge refuses a body the server stopped reading after n bytes.
+func tooLarge(n int, lim bodyLimit) error {
+	if lim.key == "" {
+		return badInput(fmt.Sprintf("the body is larger than %d bytes", n-1))
+	}
+	return &core.Error{Status: 413, Body: map[string]any{"code": "limit", "message": "request too large",
+		"limit": lim.key, "measured": int64(n), "max": int64(lim.max)}}
+}
+
+// patchBody bounds the body of a resource or namespace patch set, read
+// before step 1 of §6.2, so by the deployment's maximum (§6.6): four times
+// its larger bound, room for JSON text laid out at length. lim names
+// documentSize for resources, whose whole-document patch sets it bounds,
+// and patchSetSize for namespace documents and branches.
+func (s *Server) patchBody(resource bool) (int, bodyLimit) {
+	l := s.e.Limits()
+	lim := bodyLimit{"patchSetSize", l.PatchSetSize}
+	if resource {
+		lim = bodyLimit{"documentSize", l.DocumentSize}
+	}
+	return 4 * max(l.PatchSetSize, l.DocumentSize), lim
 }
 
 func mediaType(r *http.Request) string {
@@ -850,7 +886,8 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	body, err := readJSON(r, max(s.e.Limits().PatchSetSize, s.e.Limits().DocumentSize)*4)
+	bound, lim := s.patchBody(true)
+	body, err := readJSON(r, bound, lim)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -936,7 +973,7 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	body, err := readJSON(r, 1<<20)
+	body, err := readJSON(r, 1<<20, noLimit)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1211,6 +1248,27 @@ func (s *Server) nsGestures(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, entries)
 }
 
+// nsPrincipal is GET /ns/{ns}/principal (§7.4): what the grant in
+// Authorization is here, and what a writer needs from the namespace
+// document, with X-Config-Revision. Every answer, errors and the 410 of a
+// purged namespace included, is no-store: the origin answers it with the
+// grant, which no edge cookie covers (§C.5).
+func (s *Server) nsPrincipal(w http.ResponseWriter, r *http.Request) {
+	noStore(w)
+	ns := r.PathValue("ns")
+	if err := validNames(ns, ""); err != nil {
+		writeErr(w, err)
+		return
+	}
+	ans, err := s.e.Principal(r.Context(), ns, creds(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.Header().Set("X-Config-Revision", ans.Config)
+	writeJSON(w, 200, ans.Body)
+}
+
 func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 	ns, id := r.PathValue("ns"), r.PathValue("id")
 	if err := validNames(ns, ""); err != nil {
@@ -1269,7 +1327,8 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	body, err := readJSON(r, max(s.e.Limits().PatchSetSize, s.e.Limits().DocumentSize)*4)
+	bound, lim := s.patchBody(false)
+	body, err := readJSON(r, bound, lim)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1313,7 +1372,8 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	body, err := readJSON(r, max(s.e.Limits().PatchSetSize, s.e.Limits().DocumentSize)*4)
+	bound, lim := s.patchBody(false)
+	body, err := readJSON(r, bound, lim)
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -1392,12 +1452,12 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 	// Batch limits depend on the principal (§6.6): authenticate first, then
 	// stop reading a body larger than that principal's batchSize (§7.5).
 	req := core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}
-	max, err := s.e.BatchBodyLimit(r.Context(), req)
+	bound, size, err := s.e.BatchBodyLimit(r.Context(), req)
 	if err != nil {
 		writeErr(w, err)
 		return
 	}
-	body, err := readJSON(r, max)
+	body, err := readJSON(r, bound, bodyLimit{"batchSize", size})
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -2024,7 +2084,7 @@ func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	var kr core.KeysRequest
 	if r.ContentLength != 0 {
-		body, err := readJSON(r, 1<<20)
+		body, err := readJSON(r, 1<<20, noLimit)
 		if err != nil {
 			writeErr(w, err)
 			return

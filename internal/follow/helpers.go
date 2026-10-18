@@ -209,6 +209,12 @@ type Change struct {
 	// if a later entry is shown, so consumers still purge derived data and
 	// cache tags.
 	Purged bool
+	// Created is when Target was written, as the log gives it (§7.4): the
+	// entry's created, the batch entry's for a batch sub-entry, and a
+	// /heads row's for a synthetic unit; "" where it isn't given, as in
+	// /heads of a sealed or e2e namespace or for rows written before
+	// servers stored it.
+	Created string
 }
 
 // Coalesced is the result of Coalesce.
@@ -234,11 +240,11 @@ func Coalesce(units []Unit) Coalesced {
 	idx := map[string]int{}
 	var order []Change
 	purged := map[string]bool{}
-	add := func(e client.NSEntry, entryID string) {
+	add := func(e client.NSEntry, entryID, created string) {
 		if e.Kind == "purge" {
 			purged[e.Resource] = true
 		}
-		c := Change{Resource: e.Resource, Kind: e.Kind, Target: e.Target, EntryID: entryID}
+		c := Change{Resource: e.Resource, Kind: e.Kind, Target: e.Target, EntryID: entryID, Created: created}
 		if i, ok := idx[e.Resource]; ok {
 			order[i].Resource = "" // superseded
 		}
@@ -249,7 +255,7 @@ func Coalesce(units []Unit) Coalesced {
 		e := u.Entry
 		switch e.Kind {
 		case "head", "tombstone", "purge":
-			add(e, e.ID)
+			add(e, e.ID, e.Created)
 		case "batch":
 			for _, s := range e.Entries {
 				if s.Kind == "config" {
@@ -258,7 +264,11 @@ func Coalesce(units []Unit) Coalesced {
 					out.Others = append(out.Others, cfg)
 					continue
 				}
-				add(s, e.ID)
+				created := s.Created
+				if created == "" {
+					created = e.Created
+				}
+				add(s, e.ID, created)
 			}
 		case "purge-ns":
 			out.PurgedNS = true

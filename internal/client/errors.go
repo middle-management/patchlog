@@ -80,6 +80,36 @@ func (e *APIError) Referencing() []string { return strList(e.Body["referencing"]
 // Dependents lists the dependents of a 409 in_use (§7.4, §8.5).
 func (e *APIError) Dependents() []string { return strList(e.Body["dependents"]) }
 
+// Limit is what a limit refusal (413 or 422 limit, §6.6, §12) says: the
+// limit's key, and for sizes and counts the measured value and the limit in
+// force; hasSizes is false for durations and rates, which carry the key
+// alone. Where the server stopped reading an oversized body, measured is a
+// lower bound. For a batch it is the first item refused by a limit (§7.5).
+// ok is false for any other error.
+func (e *APIError) Limit() (key string, measured, max int64, hasSizes, ok bool) {
+	m := e.Body
+	if e.Code == "batch" {
+		m = nil
+		for _, it := range e.Items() {
+			if str(it, "code") == "limit" {
+				m = it
+				break
+			}
+		}
+	} else if e.Code != "limit" {
+		m = nil
+	}
+	if key = str(m, "limit"); key == "" {
+		return "", 0, 0, false, false
+	}
+	ms, mok := m["measured"].(float64)
+	mx, xok := m["max"].(float64)
+	if mok && xok {
+		return key, int64(ms), int64(mx), true, true
+	}
+	return key, 0, 0, false, true
+}
+
 // Items are the per-item failures of a batch error (§7.5).
 func (e *APIError) Items() []map[string]any {
 	a, _ := e.Body["items"].([]any)
@@ -167,6 +197,17 @@ func IsInUse(err error) bool { return statusIs(err, 409, "in_use") }
 
 // IsFrozen reports a write to a frozen namespace (409 frozen, §8.4).
 func IsFrozen(err error) bool { return statusIs(err, 409, "frozen") }
+
+// IsLimit reports a limit refusal (413 or 422 limit, §6.6), or a batch
+// one of whose items was refused by a limit; APIError.Limit says which.
+func IsLimit(err error) bool {
+	ae, ok := AsAPIError(err)
+	if !ok {
+		return false
+	}
+	_, _, _, _, ok = ae.Limit()
+	return ok
+}
 
 // IsRateLimited reports a 429; RetryAfter says how long to wait.
 func IsRateLimited(err error) bool { return statusIs(err, 429) }

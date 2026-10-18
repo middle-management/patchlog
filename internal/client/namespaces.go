@@ -91,8 +91,9 @@ func (c *Client) NonceRequired(ctx context.Context, ns string) (bool, error) {
 // patch set (§C.7): ns requires nonces, or its document can't be read, as
 // under a grant whose rules refer to /resource (§C.5), so the writer
 // doesn't know the setting. A public namespace's document is always
-// readable, so that happens only in private ones, where an extra nonce is
-// harmless.
+// readable, so that happens only in private ones, where §C.7 recommends a
+// nonce anyway: such a writer doesn't ask GET /ns/{ns}/principal (§7.4),
+// which NSPrincipal does for one that wants to know.
 func (c *Client) NeedsNonce(ctx context.Context, ns string) bool {
 	req, err := c.NonceRequired(ctx, ns)
 	return err != nil || req
