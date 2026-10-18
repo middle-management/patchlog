@@ -892,7 +892,10 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 			entry["forced"] = true
 		}
 		_, nsID = t.appendNS(n, entry, &res, &target, n.configSeq, author)
-		t.tags = append(t.tags, "r:"+n.name+"/"+name)
+		// And the /heads pages, which list a head's document's size and
+		// digest (NamespaceHeads): every branch the purge reaches purges
+		// its own.
+		t.tags = append(t.tags, "r:"+n.name+"/"+name, "heads:"+n.name)
 		t.flushDocs = true
 	}
 	// Sealed copies of its content go too (§E.2.2).

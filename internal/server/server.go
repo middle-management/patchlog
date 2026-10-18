@@ -569,7 +569,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", quote(id))
 		w.Header().Set("X-Revision", id)
 		w.Header().Set("X-E2E", "snapshot")
-		if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, quote(id)) {
+		if s.notModified(r, id, rev) {
 			w.WriteHeader(304)
 			return
 		}
@@ -577,7 +577,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 410, map[string]any{"code": "gone", "snapshot": rev.JWE})
 			return
 		}
-		revMeta(w, rev)
+		s.revMeta(w, rev)
 		w.Header().Set("Content-Type", seal.ContentType)
 		w.WriteHeader(200)
 		if r.Method != http.MethodHead {
@@ -591,7 +591,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("ETag", quote(id))
 		w.Header().Set("X-Revision", id)
-		if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, quote(id)) {
+		if s.notModified(r, id, rev) {
 			w.WriteHeader(304)
 			return
 		}
@@ -599,7 +599,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		if rev.JWE != "" {
 			body, ct = []byte(rev.JWE), seal.ContentType
 		}
-		revMeta(w, rev)
+		s.revMeta(w, rev)
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(200)
 		if r.Method != http.MethodHead {
@@ -624,16 +624,48 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 }
 
 // revMeta sets the reference extensions of a revision's 200 (README):
-// Last-Modified, the revision's created time, which never changes; and
-// Repr-Digest (RFC 9530), the sha-256 of the bytes served, for a plain
-// document only, never a JWE (sealed and e2e namespaces, §E.2.2).
-func revMeta(w http.ResponseWriter, rev *core.Rev) {
-	if !rev.Created.IsZero() {
-		w.Header().Set("Last-Modified", rev.Created.UTC().Format(http.TimeFormat))
+// Last-Modified (lastModified); and Repr-Digest (RFC 9530), the sha-256 of
+// the bytes served, for a plain document only, never a JWE (sealed and
+// e2e namespaces, §E.2.2).
+func (s *Server) revMeta(w http.ResponseWriter, rev *core.Rev) {
+	if lm, ok := s.lastModified(rev); ok {
+		w.Header().Set("Last-Modified", lm.Format(http.TimeFormat))
 	}
 	if rev.JWE == "" && len(rev.Digest) > 0 {
 		w.Header().Set("Repr-Digest", core.ReprDigest(rev.Digest))
 	}
+}
+
+// lastModified is a revision's Last-Modified: its created time to the
+// second, which never changes, but never later than now (RFC 9110
+// §8.8.2.1). Created times come from the writing instance's clock, or a
+// remote base's entries (§G.3), unchecked.
+func (s *Server) lastModified(rev *core.Rev) (time.Time, bool) {
+	if rev.Created.IsZero() {
+		return time.Time{}, false
+	}
+	lm, now := rev.Created.UTC().Truncate(time.Second), s.e.Now().UTC().Truncate(time.Second)
+	if lm.After(now) {
+		lm = now
+	}
+	return lm, true
+}
+
+// notModified tells whether a revision's answer is a 304: If-None-Match
+// names its id (an immutable ETag), or, without If-None-Match, a 200's
+// Last-Modified is no later than If-Modified-Since (RFC 9110 §13.1.3,
+// §13.2.2). Either is exact: a revision never changes.
+func (s *Server) notModified(r *http.Request, id string, rev *core.Rev) bool {
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		return strings.Contains(inm, quote(id))
+	}
+	ims := r.Header.Values("If-Modified-Since")
+	if rev.Status != 200 || len(ims) != 1 {
+		return false
+	}
+	since, err := http.ParseTime(ims[0])
+	lm, ok := s.lastModified(rev)
+	return err == nil && ok && !lm.After(since)
 }
 
 func (s *Server) resourceRevLog(w http.ResponseWriter, r *http.Request) {
@@ -1080,7 +1112,10 @@ func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	s.cache(w, r, ccImmutable, page.Public, "ns:"+ns)
+	// heads:{ns} too, which a resource purge purges: an entry's size and
+	// digest (a reference extension, README) are its document's, which a
+	// purge removes, unlike the names and ids the page also lists (§8.3).
+	s.cache(w, r, ccImmutable, page.Public, "ns:"+ns, "heads:"+ns)
 	out := map[string]any{"items": page.Items}
 	if page.Next != "" {
 		out["next"] = page.Next

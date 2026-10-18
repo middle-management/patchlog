@@ -70,11 +70,12 @@ type Doc struct {
 	Raw   []byte // canonical bytes as served
 	Value any    // parsed (jsonv model)
 	// Modified is the revision's created time, from Last-Modified (to the
-	// second), zero if the server sent none. Digest is Raw's sha-256 in
-	// the RFC 9530 form /heads entries use (HeadItem.Digest, ReprDigest),
-	// from Repr-Digest; "" if the server sent none, as for a sealed
-	// document, whose header would describe the JWE. Both are reference
-	// extensions beyond the spec (README).
+	// second, and no later than the server's clock), zero if the server
+	// sent none. Digest is Raw's sha-256 in the RFC 9530 form /heads
+	// entries use (HeadItem.Digest, ReprDigest), from Repr-Digest; "" if
+	// the server sent none, as for a sealed document, whose header would
+	// describe the JWE. Both are reference extensions beyond the spec
+	// (README), missing from responses cached before a server sent them.
 	Modified time.Time
 	Digest   string
 }

@@ -224,6 +224,9 @@ func TestHeadMetaEncrypted(t *testing.T) {
 	if r.H.Get("X-E2E") != "snapshot" || r.H.Get("Repr-Digest") != "" || r.H.Get("Last-Modified") != httpDate(t, created) {
 		t.Fatalf("e2e snapshot %v", r.H)
 	}
+	if c := f.do(req{method: "GET", path: "/r/e/p/rev/" + ids[1], bearer: f.readerG, hdr: map[string]string{"If-Modified-Since": r.H.Get("Last-Modified")}}); c.Code != 304 || len(c.Body) != 0 {
+		t.Fatalf("e2e snapshot If-Modified-Since: %d %v", c.Code, c.H)
+	}
 }
 
 // A namespace raised to sealed lists no size or digest from then on, on
@@ -273,6 +276,101 @@ func storedMeta(t *testing.T, path string) int {
 		t.Fatal(err)
 	}
 	return n
+}
+
+// A revision's 200 is a 304 for If-Modified-Since no earlier than its
+// Last-Modified, the created time to the second (RFC 9110 §13.1.3): it
+// never changes. If-None-Match decides when sent (§13.2.2), an
+// unparseable date is ignored, and a 410 never is a 304. Last-Modified is
+// never later than now (§8.8.2.1): an instance whose clock is behind the
+// writer's sends its own time, and so for a remote base's created times
+// (§G.3), which nothing checks.
+func TestRevIfModifiedSince(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t)
+	e.mkNS("n", map[string]any{"read": "public"})
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+	e.clock.Advance(1500 * time.Millisecond)
+	a := e.create("n", "a", map[string]any{"x": 1.0})
+	s := e.wr("s", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	e.clock.Advance(time.Hour)
+	for _, path := range []string{"/r/n/a/rev/" + a, "/r/s/x/rev/" + s} {
+		id := path[strings.LastIndex(path, "/")+1:]
+		lm := e.get(path).H.Get("Last-Modified")
+		at, err := http.ParseTime(lm)
+		if err != nil || at.Nanosecond() != 0 || !at.Equal(t0.Add(time.Second)) {
+			t.Fatalf("%s: Last-Modified %q", path, lm)
+		}
+		for _, method := range []string{"GET", "HEAD"} {
+			for _, ims := range []string{lm, at.Add(time.Hour).Format(http.TimeFormat)} {
+				r := e.do(req{method: method, path: path, hdr: map[string]string{"If-Modified-Since": ims}})
+				if r.Code != 304 || len(r.Body) != 0 || r.H.Get("ETag") != quote(id) || r.H.Get("Cache-Control") != ccImmutable ||
+					r.H.Get("Last-Modified") != "" || r.H.Get("Repr-Digest") != "" {
+					t.Fatalf("%s %s since %s: %d %v", method, path, ims, r.Code, r.H)
+				}
+			}
+			for _, h := range []map[string]string{
+				{"If-Modified-Since": at.Add(-time.Second).Format(http.TimeFormat)},
+				{"If-Modified-Since": "yesterday"},
+				{"If-Modified-Since": lm, "If-None-Match": `"other"`},
+			} {
+				if r := e.do(req{method: method, path: path, hdr: h}); r.Code != 200 || r.H.Get("Last-Modified") != lm {
+					t.Fatalf("%s %s %v: %d %v", method, path, h, r.Code, r.H)
+				}
+			}
+		}
+	}
+	tomb := e.del("n", "a", a)
+	if r := e.do(req{method: "GET", path: "/r/n/a/rev/" + tomb, hdr: map[string]string{"If-Modified-Since": e.clock.Now().Add(time.Hour).Format(http.TimeFormat)}}); r.Code != 410 {
+		t.Fatalf("tombstone: %d", r.Code)
+	}
+
+	// The reading instance's clock is behind the writer's.
+	e.clock.Advance(-48 * time.Hour)
+	now := e.clock.Now().UTC().Format(http.TimeFormat)
+	for i := 0; i < 2; i++ { // the second from the read cache
+		if r := e.get("/r/n/a/rev/" + a); r.H.Get("Last-Modified") != now {
+			t.Fatalf("Last-Modified %q at %s", r.H.Get("Last-Modified"), now)
+		}
+	}
+	if r := e.do(req{method: "GET", path: "/r/n/a/rev/" + a, hdr: map[string]string{"If-Modified-Since": now}}); r.Code != 304 {
+		t.Fatalf("since now: %d", r.Code)
+	}
+}
+
+// A resource purge purges the /heads pages of its namespace and of every
+// branch it reaches (heads:{ns}, which they carry with ns:{ns}): cached
+// copies would keep listing the purged head's size and digest, which the
+// origin no longer lists. Other writes don't purge them.
+func TestHeadMetaPurgeTags(t *testing.T) {
+	t.Parallel()
+	rec := &recPurger{}
+	e := newEnv(t, func(o *core.Options) { o.Purger = rec })
+	e.mkNS("n", map[string]any{"read": "public"})
+	a := e.create("n", "a", map[string]any{"x": 1.0})
+	b := e.create("n", "b", map[string]any{"y": 1.0})
+	at := e.nsHead("n")
+	if h := e.get("/ns/n/rev/" + at + "/heads"); h.H.Get("Cache-Tag") != "ns:n,heads:n" || h.H.Get("Surrogate-Key") != "ns:n heads:n" {
+		t.Fatalf("heads tags %v", h.H)
+	}
+	if e.headItems("n", at)["a"]["digest"] == nil {
+		t.Fatal("no digest")
+	}
+	expect(t, e.branch("n", map[string]any{"name": "br", "at": at, "patches": []any{}}, "alice"), 201)
+	e.appendRev("n", "b", b, ops(op("add", "/z", 2.0)))
+	if calls := rec.take(); purged(calls, "heads:n") || purged(calls, "heads:br") {
+		t.Fatalf("a write purged %v", calls)
+	}
+	expect(t, e.purge("n", "a", a, "admin"), 204)
+	calls := rec.take()
+	for _, tag := range []string{"r:n/a", "heads:n", "r:br/a", "heads:br"} {
+		if !purged(calls, tag) {
+			t.Errorf("purge: no %s in %v", tag, calls)
+		}
+	}
+	if it := e.headItems("n", at)["a"]; it["kind"] != "purge" || it["digest"] != nil {
+		t.Fatalf("purged %v", it)
+	}
 }
 
 // A database from before the extension (the columns dropped) is migrated:
