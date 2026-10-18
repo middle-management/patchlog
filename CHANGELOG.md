@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+**Changes to check before upgrading:**
+- **New columns `revisions.size` and `revisions.digest`**, added on the first start on SQLite and
+  Postgres (nullable, no default: instant on Postgres; nothing is backfilled). They take about 40
+  bytes per revision a write leaves as a head. Heads written before the upgrade, or by an older
+  instance during a rolling one, are listed without `size` and `digest` until written again; a
+  purge by an older instance leaves the columns and doesn't purge cached `/heads` pages (the
+  README gives the SQL to clear them). Responses cached before the upgrade lack the new fields
+  and headers, so clients treat all of them as optional.
+- **A resource purge also purges `heads:{ns}`**, a new tag on `/heads` pages, in every
+  namespace it reaches, besides `r:{ns}/{name}`.
+
+**New:**
+- **Reference extensions beyond spec v0.52, proposed to the spec** (README, "Reference
+  extensions beyond the spec"; SPEC-FEEDBACK 13–15). A revision's `200` carries
+  `Last-Modified`, its created time (also at E2, where timing stays in the clear, §E.2.2), and
+  `If-Modified-Since` no earlier than it gives a `304`; for plain documents it also carries
+  `Repr-Digest: sha-256=:…:` (RFC 9530) of the bytes served, never with a JWE. `/heads` entries
+  gain `created`, and live heads outside sealed and e2e namespaces `size` and `digest` of the
+  canonical document, stored at write time so a listing reads no document; branches list their
+  base's values for what they read through. The Go client exposes `HeadItem.Created`, `Size`
+  and `Digest`, `Doc.Modified` and `Digest`, and `client.ReprDigest`.
+
 **Fixes:**
 - **A second CDN purge from the index and the tree/catalog services** (D.8, as the core's): a
   request in flight when an apply committed a purge could hand the CDN a result or listing it

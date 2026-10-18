@@ -73,6 +73,48 @@ From implementing v0.51 and v0.52. Each gives what the reference chose.
     so a batch larger than a page is a page of its own. *Propose:* say the page size bounds
     resource entries too, or that a page may be shorter for that reason.
 
+From building a WebDAV gateway on the client API (`patchlog dav`) and testing it with rclone,
+FUSE and editors: what would make file-style and sync clients thin. 13–15 are implemented as
+reference extensions (README); the others are proposals only.
+
+13. **A revision's time on its read** (§7.1). `/r/{ns}/{name}/rev/{id}` carries no time, so a
+    client that shows files has to take mtimes from the log or make them up, and editors warn
+    "changed on disk" when they move. The reference sends `Last-Modified` with the revision's
+    `created` (immutable; §E.2.2 keeps timing in the clear at E2, though there it shows times the
+    sealed logs serve sealed, and §E.2.5's edge grants are how to hide them), and answers
+    `If-Modified-Since`. *Propose:* say `Last-Modified` is the revision's `created`.
+14. **Size, time and digest in `/heads`** (§7.4). An entry is `{resource, kind, target}`, so a
+    listing that shows sizes costs a document fetch per entry. The reference adds `created`, and
+    for live heads in namespaces without E2 or E3 encryption `size` (bytes of the canonical
+    document) and `digest` (`sha-256=:…:` of them), stored at write time; a page never gains
+    them once served (rows written before the upgrade stay without), and loses them on a purge
+    or a raise to sealed. *Propose:* these optional fields, absent at E2/E3, where they would
+    leak length and content.
+15. **A document digest on its read** (§7.1). Revision ids hash patch sets, so two revisions
+    holding the same document can't be told apart without fetching both. The reference sends
+    `Repr-Digest` (RFC 9530) of the canonical document on plaintext revisions, none on JWEs.
+    *Propose:* `Repr-Digest` on plaintext revision reads.
+16. **A whole-document replace on an append** (§6.6). Creates, and restores whose first op
+    replaces the root, are bounded by `documentSize`; on an append a root `replace ""` is bounded
+    by `patchSetSize` (256 KiB). A client that saves whole files must diff even to overwrite a
+    document on purpose. *Propose:* bound a set whose only op replaces the root by
+    `documentSize`, on any write.
+17. **Raw file resources** (§3.7, §7.8). Documents are JSON, so a gateway can't store a Markdown
+    file or an image as itself. *Propose:* a document whose root is a blob reference may be read
+    as that blob at `/r/{ns}/{name}/raw`, with its type, under the document's read check;
+    writing one is uploading the blob and setting the reference.
+18. **A successor on a tombstone** (§8.1). There is no rename (one name, one chain), and a
+    delete followed by a create elsewhere leaves nothing to follow. *Propose:* `DELETE` may name
+    a successor resource, recorded in the tombstone and returned with the `410`, as a frozen
+    namespace names its successor (§8.4), so clients and catalogs can follow a move.
+19. **A rebased write** (§11). Every whole-file client (WebDAV, FUSE, sync tools, editors) needs
+    §11's submit with a base older than the head: diff base to new, refuse when that overlaps
+    what changed from base to head, else append. Done client-side it is easy to get wrong: two
+    review rounds of the gateway found ways it reverted others' edits. *Propose:* an opt-in write
+    that carries the new document and `Base: "{rev}"`; the origin diffs, applies §F.3's overlap
+    rule (writes inside an array count for the array), and appends to the head or answers `409`
+    with the overlapping paths, never merging values.
+
 ## Settled in v0.51 and v0.52
 
 All fifteen v0.50 notes. As the reference did them:
