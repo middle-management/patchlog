@@ -1986,7 +1986,8 @@ every placement of a namespace not yet followed as missing; once caught up, a re
 same database doesn't wait again. One it can't follow (purged, skipped for its keys as
 configured, refused or absent at the core) isn't waited for until the core serves it again, and a
 `?min=` naming it is `400`; one whose epoch key can't be fetched for the moment (the core
-unreachable, a `5xx`, a `429`) is skipped but still waited for. A namespace the catalog stops
+unreachable, a `5xx`, a `429`), sealed or end-to-end (its relay's keys and its keyring both),
+is skipped but still waited for. A namespace the catalog stops
 trusting loses its catch-up, also one its follower reports after that, and one recorded before a
 stop, so trusted again it is waited for again.
 

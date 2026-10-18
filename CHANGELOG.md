@@ -258,7 +258,9 @@ service's listings.
   A trusted namespace it can't follow (purged, skipped for its keys as configured, refused or
   absent at the core) isn't waited for, until the core serves it again, and a `?min=` naming it
   is `400`; one whose epoch key can't be fetched for the moment (a transport error, a `5xx`, a
-  `429`: `derived.Retryable`; `Keys.Check` reports it) is skipped but still waited for. A
+  `429`: `derived.Retryable`, `client.Transient`; `Keys.Check` reports it), sealed or end-to-end
+  (`client.E2E.Key` answers such a failure of the relay's keys and the keyring with it, not
+  `ErrNoKeys`), is skipped but still waited for. A
   namespace the catalog stops trusting loses its catch-up, also one its follower reports after
   that apply, and a record of one left by a stop, so trusted again it is waited for again. A
   catalog trusting a large new namespace now lists nothing until the service has caught up with

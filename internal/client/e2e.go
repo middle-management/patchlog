@@ -189,7 +189,11 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// The relays first (§E.2.3): they need a read grant with enc.
+	// The relays first (§E.2.3): they need a read grant with enc. A
+	// fetch that failed for a reason asking again may mend (Transient),
+	// with no key found otherwise, is that failure, not ErrNoKeys: the key
+	// may be there (a service waiting for the namespace keeps waiting).
+	var failed error
 	relays := []string{ns}
 	if via != "" && via != ns {
 		relays = []string{via, ns}
@@ -197,6 +201,9 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	for _, relay := range relays {
 		got, err := x.c.FetchKeys(ctx, relay, []int{epoch}, nil)
 		if err != nil {
+			if Transient(err) {
+				failed = err
+			}
 			continue
 		}
 		for _, e := range got {
@@ -223,13 +230,19 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	// is the namespace's own: a branch without one reads its base's
 	// through, and those are the base's keys, not "{branch}#{e}".
 	kr, _, err := x.Keyring(ctx, ns)
-	if err == nil && kr.NS == ns {
+	switch {
+	case err == nil && kr.NS == ns:
 		for _, priv := range privs {
 			if key, err := kr.EpochKey(priv, epoch); err == nil {
 				x.AddKey(kid, key)
 				return key, nil
 			}
 		}
+	case Transient(err):
+		failed = err
+	}
+	if failed != nil {
+		return nil, fmt.Errorf("client: fetching the epoch key %s: %w", kid, failed)
 	}
 	return nil, fmt.Errorf("%w: %s", ErrNoKeys, kid)
 }

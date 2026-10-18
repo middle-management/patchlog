@@ -5,13 +5,8 @@ import (
 	"crypto/ecdh"
 	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
 	"sort"
 	"sync"
-	"syscall"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/follow"
@@ -298,16 +293,7 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 // 5xx or 429. Not the service's configuration: no key for its grant
 // (client.ErrNoKeys), none to unwrap one with, or a 4xx refusal.
 func Retryable(err error) bool {
-	if err == nil || errors.Is(err, client.ErrNoKeys) {
-		return false
-	}
-	if ae, ok := client.AsAPIError(err); ok {
-		return ae.Status >= 500 || ae.Status == http.StatusTooManyRequests
-	}
-	var ue *url.Error
-	var ne net.Error
-	return errors.As(err, &ue) || errors.As(err, &ne) || errors.Is(err, io.ErrUnexpectedEOF) ||
-		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, context.DeadlineExceeded)
+	return !errors.Is(err, client.ErrNoKeys) && client.Transient(err)
 }
 
 func (k *Keys) setReason(ns, reason string, skipped bool) {

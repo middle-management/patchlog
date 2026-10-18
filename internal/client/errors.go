@@ -4,8 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
+	"net/url"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -221,6 +225,23 @@ func Horizon(err error) string {
 		return ae.Horizon()
 	}
 	return ""
+}
+
+// Transient reports a failure that asking again may mend: no answer (the
+// core unreachable, the connection cut, the request timed out) or a 5xx
+// or 429. Not a refusal (another status), nor what an answer held (a
+// document that doesn't parse).
+func Transient(err error) bool {
+	if err == nil {
+		return false
+	}
+	if ae, ok := AsAPIError(err); ok {
+		return ae.Status >= 500 || ae.Status == 429
+	}
+	var ue *url.Error
+	var ne net.Error
+	return errors.As(err, &ue) || errors.As(err, &ne) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, syscall.ECONNRESET) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // Retryable reports whether an error is worth retrying unchanged: transport

@@ -373,6 +373,74 @@ func TestListingsTransientKeyError(t *testing.T) {
 	}
 }
 
+// TestListingsTransientKeyError for an end-to-end namespace the service
+// holds a keyring recipient key for: its epoch key comes through the
+// relay's POST /keys or the keyring (client.E2E), and those cut off for
+// the moment are a failure asking again may mend, not "no keys" (the
+// service's configuration): the namespace is still waited for, listings
+// 503 behind, never 200 without its items; once its key comes, it is
+// caught up with.
+func TestListingsTransientKeyErrorE2E(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for ns, doc := range map[string]map[string]any{
+		"secret": {"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "e2e"}},
+		"pub":    {"read": "grant", "keys": []any{k.Entry("*")}},
+		"cat":    {"read": "public", "keys": []any{k.Entry("*")}, "catalog": map[string]any{"trust": []any{"pub", "secret"}, "mode": "dag"}},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	svcJWK, svcPriv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	wJWK, wPriv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	all := []string{"cat", "pub", "secret"}
+	wr := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"}, map[string]any{"enc": wJWK})),
+		client.WithKeys(client.NewKeys(wPriv)))
+	x2 := wr.E2E(wPriv)
+	must(x2.InitKeyring(ctx, "secret", svcPriv.PublicKey()))
+	must(wr.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	must(wr.CreateDoc(ctx, "pub", "plan", map[string]any{"title": "plan"}))
+	must(x2.CreateDocSealed(ctx, "secret", "s1", map[string]any{"title": "e2e"}))
+	must(wr.CreateDoc(ctx, "cat", "pub.plan", map[string]any{"parents": parents("root@a0")}))
+	must(wr.CreateDoc(ctx, "cat", "secret.s1", map[string]any{"parents": parents("root@a1")}))
+	// secret's keys (the relay's POST /keys, the keyring) are cut off
+	// until failing is cleared.
+	var failing, failed atomic.Bool
+	failing.Store(true)
+	base := http.DefaultTransport.(*http.Transport).Clone()
+	rt := roundTrip(func(req *http.Request) (*http.Response, error) {
+		if failing.Load() && (req.URL.Path == "/ns/secret/keys" || strings.Contains(req.URL.Path, "secret") && strings.Contains(req.URL.Path, client.KeyringName)) {
+			failed.Store(true)
+			return nil, errors.New("connection reset by peer")
+		}
+		return base.RoundTrip(req)
+	})
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"}, map[string]any{"enc": svcJWK})),
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithHTTPClient(&http.Client{Transport: rt}))
+	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.Recipient = svcPriv })
+	t.Cleanup(func() { failing.Store(false) })
+	x.caughtUp("cat", "pub")
+	waitFor(t, "secret's epoch key asked for", failed.Load)
+	for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		if r := x.listing("/cat/children?of=root"); r.status != http.StatusServiceUnavailable {
+			t.Fatalf("a listing while secret's epoch key can't be fetched for the moment: %d %s, want 503 behind", r.status, names(r.body["children"]))
+		}
+	}
+	failing.Store(false)
+	x.caughtUp("secret")
+	if got := names(x.listing("/cat/children?of=root").body["children"]); got != "pub.plan,secret.s1" {
+		t.Fatalf("once secret's key came: %s", got)
+	}
+}
+
 // A namespace the catalog stops trusting loses its caught mark, so that
 // trusted again it is waited for while its follower replays what was
 // placed in between (§B.5, §H.3), even when its follower, stopped only
