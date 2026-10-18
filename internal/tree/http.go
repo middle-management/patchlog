@@ -460,7 +460,12 @@ var ops = map[string]bool{
 // kid its namespace's current epoch, pl { ns, name, view } of the item, so
 // readers given K_r by /read-grants open it, whatever the catalog's level;
 // for an e2e item it is left out. A listing holding any sealed file is
-// stored and served unchanged like a sealed catalog's.
+// stored and served unchanged like a sealed catalog's. While a sealed
+// namespace's key can't be had for the moment, listings are 503, no-store
+// (fileSealing). The "file": { "sealed" } form, and its nesting inside a
+// sealed catalog's whole-listing JWE below, are provisional: §E.2.6 has a
+// per-entry "sealed" member for values of one source (the catalog's
+// titles), and no form yet for values another namespace's resource gives.
 //
 // A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles are
 // the only values a listing takes from the catalog's content (names,
@@ -739,6 +744,11 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	}
 	l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key)
 	switch {
+	case errors.Is(err, errFileKeys):
+		s.opt.Logf("tree: %v", err)
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Retry-After", "5")
+		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals the file metadata of a trusted namespace")
 	case err != nil:
 		s.opt.Logf("tree: sealing a listing: %v", err)
 		WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
@@ -798,7 +808,10 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
 	gen := s.kept.Generation(cat)
-	fs := s.fileSealing(ctx)
+	fs, err := s.fileSealing(ctx)
+	if err != nil {
+		return nil, err
+	}
 	// A listing that seals values, the catalog's or an item's file
 	// metadata, is sealed once and then served unchanged (§E.2.6).
 	sealed := info.Protected() || fs.seals()

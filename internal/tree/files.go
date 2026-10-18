@@ -294,7 +294,7 @@ func (s *Service) retryBackfill(ctx context.Context) {
 // (§H.3): not at all outside a file tree; for items of a sealed (E2)
 // namespace sealed per entry under the item's K_r (§E.2.6), with that
 // namespace's current epoch key and padding; for items of an e2e one, or
-// one whose encryption or keys the service can't tell now, not at all;
+// one whose keys the service can't have (lastingly), not at all;
 // otherwise in the clear. Its keys are read before the graph is, never
 // under its lock.
 type fileSealing struct {
@@ -306,8 +306,17 @@ type fileSealing struct {
 // seals reports whether listings seal file metadata.
 func (fs *fileSealing) seals() bool { return fs != nil && len(fs.keys) > 0 }
 
-// fileSealing reads what listings need now to give file metadata.
-func (s *Service) fileSealing(ctx context.Context) *fileSealing {
+// errFileKeys is a sealed namespace's key, which seals its items' file
+// metadata, failing for now: the listing is 503, as for the catalog's own
+// key, rather than computed and kept without it at its at.
+var errFileKeys = errors.New("the key that seals file metadata")
+
+// fileSealing reads what listings need now to give file metadata. Only
+// sealed namespaces' epoch keys are asked for. A failure that lasts until
+// the configuration changes (no keys for the service's grant, a namespace
+// it can't read, absent or gone) leaves that namespace's file metadata
+// out; any other is errFileKeys.
+func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 	s.mu.RLock()
 	on := s.g.Files
 	var nss []string
@@ -319,21 +328,27 @@ func (s *Service) fileSealing(ctx context.Context) *fileSealing {
 	s.mu.RUnlock()
 	fs := &fileSealing{on: on, keys: map[string]derived.Key{}, omit: map[string]bool{}}
 	if !on {
-		return fs
+		return fs, nil
 	}
 	for _, ns := range nss {
-		in, key, err := s.keys.Current(ctx, ns)
+		in, err := s.keys.Info(ctx, ns)
+		var key derived.Key
+		if err == nil && in.Level == derived.LevelSealed {
+			_, key, err = s.keys.Current(ctx, ns)
+		}
 		switch {
-		case err != nil:
+		case err != nil && (errors.Is(err, client.ErrNoKeys) || client.IsNotFound(err) || client.IsAuth(err) || client.IsGone(err)):
 			s.opt.Logf("tree: file metadata of %s left out: %v", ns, err)
 			fs.omit[ns] = true
+		case err != nil:
+			return nil, fmt.Errorf("%w of %s: %w", errFileKeys, ns, err)
 		case in.Level == derived.LevelE2E:
 			fs.omit[ns] = true
 		case in.Level == derived.LevelSealed:
 			fs.keys[ns] = key
 		}
 	}
-	return fs
+	return fs, nil
 }
 
 // file is n's file metadata as a listing gives it (fileSealing), or nil.

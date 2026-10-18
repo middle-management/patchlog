@@ -3,6 +3,7 @@ package tree_test
 import (
 	"context"
 	"database/sql"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -510,4 +512,90 @@ func TestFileTreeRefileRetries(t *testing.T) {
 	if ft.failed.Load() != 2 {
 		t.Fatalf("%d failed reads", ft.failed.Load())
 	}
+}
+
+// §H.3, §E.2.6: while the key that seals a sealed namespace's file
+// metadata can't be had, a listing is 503, no-store, and kept nowhere, as
+// when the catalog's own key can't, rather than kept at its at without
+// file; once it can, the listing carries it. An e2e namespace's items get
+// none, and no key is asked for them.
+func TestFileTreeSealingKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for ns, doc := range map[string]map[string]any{
+		"files":  {"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}},
+		"secret": {"read": "grant", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "e2e"}},
+		"cat":    {"read": "grant", "keys": []any{k.Entry("*")}, "catalog": filesCatalog("files", "secret")},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	all := []string{"cat", "files", "secret"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"parents": []any{}}))
+	createNonced(t, w, "files", "notes", map[string]any{"n": 1})
+	must(w.CreateDoc(ctx, "cat", "files.notes", map[string]any{"parents": parents("root")}))
+	ft := &flaky{prefix: "/ns/files/keys"}
+	sc := s.Client(t, client.WithHTTPClient(&http.Client{Transport: ft}), client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"})),
+		client.WithKeys(client.NewKeys(nil)))
+	var mu sync.Mutex
+	var logs []string
+	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) {
+		o.Logf = func(f string, a ...any) {
+			mu.Lock()
+			logs = append(logs, fmt.Sprintf(f, a...))
+			mu.Unlock()
+			t.Logf(f, a...)
+		}
+	})
+	x.caughtUp("cat", "files", "secret")
+	reader := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
+	sealedFile := func() string {
+		t.Helper()
+		s, _ := fileOf(entriesOf(t, decode(t, x.fetch("/cat/children?of=root", reader).body))["files.notes"])["sealed"].(string)
+		return s
+	}
+	if sealedFile() == "" {
+		t.Fatal("no sealed file")
+	}
+
+	// A new epoch, whose key the service can't get for now when it lists.
+	must(w.PatchConfig(ctx, "files", must(w.NSHead(ctx, "files")).Config, []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": 2}}))
+	x.caughtUp("files")
+	ft.fail.Store(1 << 20)
+	r := x.raw("/cat/children?of=root", reader)
+	if loc := r.header.Get("Location"); r.status == 302 {
+		r = x.raw(loc, reader)
+	}
+	if r.status != 503 || r.header.Get("Cache-Control") != "no-store" || r.header.Get("Retry-After") == "" {
+		t.Fatalf("listing without the key: %d %v %v", r.status, r.header, r.body)
+	}
+	ft.fail.Store(0)
+	jwe := sealedFile()
+	if jwe == "" {
+		t.Fatal("no sealed file once the key is had")
+	}
+	if kid, _ := jwtHeader(t, jwe)["kid"].(string); kid != "files#2" {
+		t.Fatalf("sealed under %q", kid)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, l := range logs {
+		if strings.Contains(l, "file metadata of secret") {
+			t.Errorf("a key asked for an e2e namespace's file metadata: %s", l)
+		}
+	}
+}
+
+// jwtHeader is the protected header of a compact JWE.
+func jwtHeader(t *testing.T, jwe string) map[string]any {
+	t.Helper()
+	h, _, _ := strings.Cut(jwe, ".")
+	b, err := base64.RawURLEncoding.DecodeString(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return decode(t, b)
 }
