@@ -94,6 +94,28 @@ func within(t testing.TB, d time.Duration, what string, cond func() bool) time.D
 	return time.Since(start)
 }
 
+// servedFor polls seen, a read, until it sees a change committed before
+// since, and reports how long after since the last read that missed it
+// began (0 if none did). freshFor bounds reads begun, as the read cache
+// decides whether to serve as a read begins (readCache.serving): a read
+// begun within the bound may still return after it, so the time until a
+// read sees the change also counts a read's latency and the polling.
+func servedFor(t testing.TB, d time.Duration, what string, since time.Time, seen func() bool) time.Duration {
+	t.Helper()
+	var missed time.Duration
+	for {
+		begun := time.Now()
+		if seen() {
+			return missed
+		}
+		missed = begun.Sub(since)
+		if time.Since(since) > d {
+			t.Fatalf("%s: not within %v", what, d)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
 // Writers to different namespaces run in parallel, and so do writers of
 // different resources of one namespace, which hold its lock shared; a
 // config write, which takes it exclusively, waits for them.
@@ -496,12 +518,12 @@ func TestPGPurgeStopsOtherInstance(t *testing.T) {
 		t.Fatal(err)
 	}
 	purged := time.Now()
-	took := within(t, 5*time.Second, "b serving the purged revision", func() bool {
+	missed := servedFor(t, 5*time.Second, "b serving the purged revision", purged, func() bool {
 		rev, err := b.ResourceRev(ctx, "n", "r", id, who.Cred)
 		return err == nil && rev.Status == 410
 	})
-	if bound := b.freshFor(); took > bound {
-		t.Fatalf("b served the purged revision for %v, past %v", took, bound)
+	if bound := b.freshFor(); missed > bound {
+		t.Fatalf("b served the purged revision to a read begun %v after the purge, past %v", missed, bound)
 	}
 	t.Logf("b stopped serving the purged revision %v after the purge committed", time.Since(purged))
 }
@@ -527,12 +549,13 @@ func TestPGConfigOtherInstance(t *testing.T) {
 	if _, err := a.WriteConfig(ctx, r, ConfigChange{IfMatch: cfg, Patches: []any{map[string]any{"op": "replace", "path": "/read", "value": "grant"}}}); err != nil {
 		t.Fatal(err)
 	}
-	took := within(t, 5*time.Second, "b serving the namespace as public", func() bool {
+	changed := time.Now()
+	missed := servedFor(t, 5*time.Second, "b serving the namespace as public", changed, func() bool {
 		h, err := b.ResourceHead(ctx, "n", "r", who.Cred)
 		return err == nil && !h.Public
 	})
-	if bound := b.freshFor(); took > bound {
-		t.Fatalf("b served the namespace as public for %v, past %v", took, bound)
+	if bound := b.freshFor(); missed > bound {
+		t.Fatalf("b served the namespace as public to a read begun %v after the change, past %v", missed, bound)
 	}
 }
 

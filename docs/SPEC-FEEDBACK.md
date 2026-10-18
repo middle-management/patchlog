@@ -132,8 +132,16 @@ From implementing v0.55, in the core and the tree service.
 
 25. **`/principal` and operator grants** (§7.4, §C.4). §7.4 shows `/principal` to "any grant that
     verifies", operator grants included, but §C.4 makes "Any other request under one" `401`. The
-    reference answers `200`, with `can` the operator grant's block verbs and `roles` `[]`.
-    *Propose:* list `/principal` among §C.4's exceptions, and say what `can` and `roles` mean there.
+    reference answers `200`, with `can` the operator grant's block verbs and `roles` `[]`. A
+    gateway keys users by root `sub` and `kid` (§H.7), and `kid`s are free-form, so an operator
+    grant whose `kid` equals a namespace key's passed for that key's user, scratch files included,
+    though every core request under it is `401`; the answer doesn't say which kind of key verified
+    it. The reference's gateway reads the operator key history (`jwks_uri`, §C.4, no grant needed;
+    kept five minutes, the last read used if a read fails, and none read meaning closed) and refuses
+    a grant whose root `kid` is in it and whose chain verifies under that key. *Propose:* list
+    `/principal` among §C.4's exceptions, and say what `can` and `roles` mean there; and either add
+    `"operator": true` to the answer, or say in §H.7 that a gateway tells the keys apart by the
+    history.
 26. **`/principal` without authentication** (§1, §7.4). Not specified. The reference answers `200`
     without `principal` and `kid`, with `can` every verb, `roles` `[]` and `writer` as usual, and
     `404` for an absent namespace. *Propose:* say so.
@@ -166,11 +174,15 @@ From implementing v0.55, in the core and the tree service.
     `file`, which "stored once, served forever" would keep; stored listings are keyed by URL and
     reader shape, as kept ones are. *Propose:* define a per-member sealed form for values of another
     source and allow or forbid the nesting, and say that a stored view is per URL and reader shape.
-31. **`modified` where `created` is unknown, and which placements get `file`** (§H.3). The reference
-    leaves `modified` out and still gives `size` and `type`, and adds `file` to the placements of
-    every trusted namespace, implicit ones included, not only `files.ns`'s. *Propose:* say
-    "`modified`, the head's `created`, where known", and whether `file` is limited to placements of
-    `files.ns`.
+31. **`modified` where `created` is unknown, which placements get `file`, and why one lacks it**
+    (§H.3). The reference leaves `modified` out and still gives `size` and `type`, and adds `file`
+    to the placements of every trusted namespace, implicit ones included, not only `files.ns`'s. A
+    placement without `file` is either an end-to-end item or a head the service hasn't read yet, and
+    a tool has to read the namespace document to tell them apart: the reference's gateway leaves out
+    a placement in a sealed or end-to-end namespace that has none, and reads the item from the core
+    for any other entry without `file` or `modified`. *Propose:* say "`modified`, the head's
+    `created`, where known", whether `file` is limited to placements of `files.ns`, and give a
+    reason where `file` is absent, e.g. `"file": { "absent": "e2e" }`.
 32. **Limit refusals for bounds that aren't §6.6 keys** (§6.6, §12, §C.5.2). Prune and `/keys`
     bodies over 1 MiB are `400 bad_input`. A resource `PATCH` body over 4× the larger of
     `patchSetSize` and `documentSize` names `documentSize`, with the deployment maximum. A `POST
@@ -346,6 +358,151 @@ From implementing v0.55, in the WebDAV gateway (Addendum H), tried with rclone, 
 58. **New files: the dry run before the upload** (§H.4). §H.4 lists the upload of a raw file's blob
     first. The reference dry-runs the placement before the upload, so a refused placement uploads
     nothing. *Propose:* say that order.
+
+From the second round on v0.55, in the WebDAV gateway and the tree service it lists through.
+
+59. **Which namespace names a user** (§H.7, §C.1, §7.4). "Keyed by the root `sub` and `kid` (from
+    `GET /ns/{ns}/principal`)" is neither unique nor stable. A `kid` names a key in one namespace's
+    document, so `(sub, kid)` is unique only within a namespace, and a gateway serving several, one
+    of them controlled by another party, would merge different people into one user. The reference
+    keys users by the namespace that verified the grant as well. A grant that names several then
+    has several candidates, and the answer changes over time: a namespace created, or given the
+    key, later and sorting first made the same token, or the person's re-minted one, someone else,
+    which dropped their scratch files and records, and a save without a tag then reverted another
+    user's edit. The reference asks the namespace that accepted the token before, then the one that
+    first accepted a grant of its root `kid`, then the rest sorted; a token still verified as
+    someone else has its old user's documents marked lost for the new one, so its next save without
+    a tag is `409`. A token narrowed to drop the namespace that verified the person's other tokens
+    is another user. Asking several namespaces, a `401` is also all a gateway learns of an absent
+    one (only an operator grant gets the `404`, §7.4), which it can't tell from a revoked grant.
+    *Propose:* say that a user is the namespace, `sub` and `kid`, with the namespace that first
+    verified the `kid` where a grant names several, and that a token narrowed away from it is
+    another user; or return something stable for the key (a thumbprint) or the user in `/principal`.
+60. **What a user's tokens share** (§H.6, §H.7). §H.6 serves scratch files "only to that user", and
+    §H.7 keys all gateway state by user, but a user's tokens aren't equally able: one narrowed by
+    `ns`, `can`, rules or `via` may read less than the one that wrote a swap file, or than the one
+    whose move aside (§H.5) copied a document into the scratch store. "Keyed by the root `sub` and
+    `kid`" covers re-minted tokens, not narrowed ones. The reference found a token that had dropped
+    a namespace reading the user's scratch files in it, and one narrowed by resource rules or `via`
+    reading backups of documents the core refused it. It keeps what holds content (scratch files,
+    locks with their owner, dead properties) per user and scope, the scope being a digest of the
+    grant's narrowing blocks without `nbf` and `exp`, so tokens an issuer mints for a person share
+    one, and serves it only to a token whose grant names the namespace. What holds none (guards, a
+    user's own deletes, move-aside flags, records, the writes a listing waits for) stays per user,
+    and what was read (documents, catalog graphs, tree listings, writer blocks) per token.
+    *Propose:* say that scratch content is never served to a token narrower than the one that wrote
+    it, nor outside the namespaces its grant names, and that caches of what was read are per token.
+61. **Re-checking grants and the writer block** (§H.7, §7.4, §C.5). §H.7 has a gateway re-check a
+    grant "at least as often as edge grants expire (§C.5)", but a deployment may set that lifetime
+    below the 15-minute cap and a gateway can't learn it. `/principal` is `no-store`, and nothing
+    says how long a writer may rely on its writer block, or what becomes of a user's state when
+    one of their tokens is refused while others are still accepted. The reference re-checks a
+    grant every five minutes by default (a longer setting than the cap is refused), relies on a
+    writer block for 30 seconds or that interval if shorter, and refreshes it on `409 frozen`,
+    `422 nonce` or a limit refusal. A refused token leaves the user's state, and the others are
+    re-checked at their next request. *Propose:* state a maximum, such as five minutes, or expose
+    the lifetime in `/principal` or the deployment document; and say the rest.
+62. **Limited grants and the tree's settings** (§H.7, §7.4, §B.5). §H.7 says a grant limited to some
+    resources "learns what it needs to write from `GET /ns/{ns}/principal`", but the writer object
+    doesn't carry `catalog.files` (`ns`, `root`, `folder`, `placement`) or `catalog.trust`, which
+    live in the namespace document, which needs unrestricted read, and the tree service's listings
+    don't either. Such a grant can list a tree, but can't find `files.root`, say where a new file
+    is created (§H.4) or which namespaces the catalog trusts. The reference's gateway uses the
+    settings as last read with any grant, its own at start included: the one thing read with one
+    grant and used for another, settings and not content, with the core and the tree service still
+    checking every grant. A limited grant meets `404` for the tree until another has opened it,
+    and can't write in it. *Propose:* add `catalog.files` and `trust` to `/principal`'s writer
+    object, or give the tree service an endpoint for them.
+63. **`catalog.title` and untitled placements** (§B.5, §H.2). A listing entry's `title` is the
+    placement's own or, where the catalog sets `catalog.title`, the item's, but §H.2 shows a
+    placement without a `title` by its item's name, and entries don't say which they carry. The
+    reference lists a catalog that sets `catalog.title` from its node documents, not through the
+    tree service. *Propose:* a separate member (e.g. `itemTitle`), or say that `catalog.title` is
+    ignored, or refused, in a file tree.
+64. **Numbering duplicates from a listing** (§H.2, §B.5). "In order of the nodes' creation in the
+    catalog's log" can't be done from a `children` listing, whose entries carry no creation time or
+    sequence, so a tool reads each duplicate node's head and first log page from the core (two
+    requests each) every time the folder is listed. *Propose:* the tree service gives each node's
+    genesis `created` or a sequence, or numbers duplicates itself (see §H.9's question on flagging
+    collisions).
+65. **Untrusted placements** (§H.2, §H.3, §B.6). The tree service marks placements of namespaces the
+    catalog doesn't trust dangling and leaves them out, but §H.2 and §H.3 don't say whether a
+    gateway that builds folders from node documents must too, and the two sources can disagree.
+    The reference leaves them out of both when a tree service is configured, so the fallback lists
+    a folder as the service does, and lists them without one. *Propose:* say that a gateway leaves
+    out placements of namespaces the catalog doesn't trust.
+66. **A tree service that is behind** (§B.5, §H.3). Nothing says what a listing answers while the
+    service has the catalog but not a content namespace it trusts (a fresh database, a rebuild, a
+    namespace trusted lately). The reference answered `200` with every placement dangling, so
+    folders listed empty, which a sync tool mirrors as every file deleted and a gateway took for
+    folders it could delete. Listings are now `503 behind` with `Retry-After`, naming the
+    namespace, until the service holds a checkpoint of the catalog and of each trusted namespace. A
+    trusted namespace it can't follow isn't waited for, or every listing would stay `503`: one
+    purged, one skipped for its keys (Addendum E), one the core refuses it (`401`, `403`) or
+    doesn't have (`404`); its placements dangle (§B.7). A catalog that trusts a large new namespace
+    is `503` until the service catches up. The gateway passes the `503` on and deletes no folder
+    meanwhile. *Propose:* say that a tree service answers `503` with `Retry-After` until it holds a
+    checkpoint of every namespace it follows, and what it does about trusted ones it can't follow.
+67. **Read-your-writes in a file tool** (§B.5, §A.5). §B.5 has a client add `?min={ns}:{ns_id}` from
+    its write's `X-Namespace-Revision`, but not how a file tool keys mins to its writes or how long
+    it keeps sending them. The reference notes every entry a write produced, the catalog's and a
+    content namespace's alike, and sends them as `?min` for the catalog and the namespaces it
+    trusts until a listing that carried them returns `200`. It first dropped them after 30
+    seconds, and a service lagging longer brought back a renamed file's old name and dropped its
+    new file, so a sync client deleted the one and uploaded the other again. A `min` the service
+    refuses (`400`) is dropped after one listing from the node documents. There is no way to ask
+    whether a listing already includes a `min` without waiting for it, so the gateway waits a few
+    seconds and then lists from the node documents; and since a `min` naming a namespace the reader
+    can't see is `400` (§A.5; compare 5), a write-only grant can't wait for its own writes.
+    *Propose:* say that a tool keeps each `min` until a listing that carried it returns, and how a
+    grant without `read` waits.
+68. **Writes against a lagging listing** (§H.3, §H.5). §H.3 lists a tree through the tree service,
+    which lags the core and doesn't wait for other users' writes through the same gateway, and
+    says nothing of writes taking names from it. Resolving a path to what its folder listed, a
+    short lag was enough for a `DELETE` or `MOVE` of a name another user had just changed to
+    delete or re-parent that file, for a folder `DELETE` to take its emptiness from the listing
+    and orphan a file just put in it, and for a `PUT` to make a second file of a sibling's name.
+    The reference checks what the listing named against the node documents before every write:
+    each node still in its folder by that name, and no node by a name the listing lacked. Where
+    they disagree it reads the graph again, and then resolves the path from the node documents, as
+    without a tree service: the stale `DELETE` is `404`, the `PUT` an edit of the renamed file, a
+    `MKCOL` of an existing folder `405`. A `PUT` onto a name only a sibling hidden from the token
+    has makes the new file, so its existence isn't revealed. Against changes the graph doesn't
+    show either (another program's), a delete carries `If-Match` on the head it read (`409`), a
+    move checks the node's document still has the name and parent the path named (`404`), and a
+    folder's emptiness comes from the node documents, never the listing. A grant that can't read
+    them keeps the listing. *Propose:* say that writes resolve, or check, names against the node
+    documents, and take a folder's emptiness only from them.
+69. **Large folders and titled paths** (§B.5, §H.3). §B.5 pages `children` with no total and no
+    advice on how far to page or what to answer for an over-large folder; truncating is dangerous
+    for sync clients, since `rclone sync` deletes what it doesn't see. The reference lists up to
+    10 pages of 1,000 and answers `403` for a folder beyond that, never a cut-short one; a path in
+    or below it finds its name in the node documents, reading only the items whose names match (it
+    had refused every path there, `GET` and `PUT` included). And "a folder is then listed in one
+    request" holds for a listing, but a path of titles still takes one `children` listing per
+    folder on it. *Propose:* say what a tool answers for a folder it won't list whole, give
+    `children` a total, and add a lookup by title path to the tree service, filtered like
+    `children`, which would make a `GET` one request.
+70. **Refusals from the tree service** (§H.4, §B.5). §H.4's table has nothing for the tree
+    service's `401`, `403` or `503`, and where a gateway uses its own grant (local mode) it can't
+    tell the user's grant being refused from its own. The reference answers `502` for a service it
+    can't reach, `503` with the service's `Retry-After` for its `503` and `429`, and `410` for a
+    purge, and passes `401` and `403` through, the token being checked again at its next request
+    as after a core `401`. In local mode a tree-service `401` is `502` naming the service, since
+    it would be taken for the core refusing the gateway's grant. *Propose:* add the rows: a
+    refusal from the tree service is answered as the core's would be, except that one the user
+    can't fix names the service.
+71. **The gateway's own `413`s** (§H.4, §6.6). §H.4 answers a limit exceeded "with the limit and the
+    sizes the core gave", which says nothing of a bound the gateway has itself: its upload buffer,
+    a file-size flag, or a namespace limit it checks before sending (`blobSize` before an upload;
+    `opsPerSet` or `patchSetSize` for a save merged with others' edits). The reference reads
+    `limit`, `measured` and `max` from the core's `413`, or `422` with `code: "limit"`, and answers
+    in one shape, such as `too large: documentSize 1048577 > 1048576 (§6.6): document too large`;
+    a limit without sizes (a duration, a rate) is named alone, and a `413` naming no limit keeps
+    the core's text. Its own bounds take the shape: `too large: blobSize 9 > 8 (§6.6, §7.8)`
+    before any upload, and a flag's bound (`-max-file-size`, `-max-raw-size`) is named by the
+    flag, the bytes read when it was passed being a lower bound, as in 32. *Propose:* say that a
+    gateway names its own bounds in the same shape, with a key of its own.
 
 ## Settled in v0.55
 
