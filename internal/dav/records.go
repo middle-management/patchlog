@@ -7,32 +7,34 @@ import (
 	"github.com/middle-management/patchlog/internal/pointer"
 )
 
-// Records are the versions of a document a principal's clients may hold,
-// the candidates for the base of their next save (§11 submit): the
+// Records are the versions of a document a user's clients may hold, the
+// candidates for the base of their next save (§11 submit, §H.4): the
 // revisions GET sent them (a 304 sends none), and what they wrote, as
-// they wrote it. They are kept by principal id and document for
-// RecordIdle, apart from the principal's locks and scratch files, which
-// go sooner; a restart loses them. Each grant root's are kept apart:
-// over RecordBytes, the root keeping the most gives way first, so one
-// user's uploads don't push out another's records. Records dropped to
-// stay within bounds are remembered as lost, so a save isn't rebased on
-// what is left of them (base).
+// they wrote it. They are kept per user (§H.7), so whichever of the
+// user's tokens read or wrote a version, any of them saves from it, and
+// by document, for RecordIdle, apart from the user's locks and scratch
+// files, which go sooner; a restart loses them. Each user's are kept
+// apart: over RecordBytes, the user keeping the most gives way first, so
+// one user's uploads don't push out another's records. Records dropped
+// to stay within bounds are remembered as lost, so a save isn't rebased
+// on what is left of them (base). With them are the user's path records
+// and the tombstones and restores the user wrote (markOwn).
 
-// maxRecords bounds a principal's records of one document. Over it, the
+// maxRecords bounds a user's records of one document. Over it, the
 // oldest but the first goes (and never the latest write): the version an
 // editor opened stays while a preview reads the revisions others make.
 const maxRecords = 16
 
-// maxForgotten bounds the documents a root remembers having lost records
-// of.
+// maxForgotten bounds the documents a user's records remember having
+// lost records of.
 const maxForgotten = 4096
 
-// record is one version: rev's document as served, or as the principal
-// wrote it.
+// record is one version: rev's document as served, or as the user wrote
+// it.
 type record struct {
 	seq uint64 // the order of recording, over the server
 	rev string
-	// wrote: a write of the principal's that changed the document; paths
+	// wrote: a write of the user's that changed the document; paths
 	// are what it changed (writesOf).
 	wrote bool
 	paths []pointer.Pointer
@@ -41,7 +43,7 @@ type record struct {
 	// document.
 	doc []byte
 	// raw are the bytes uploaded, where rev holds exactly them and they
-	// read otherwise rendered: the principal's representation of rev (its
+	// read otherwise rendered: the user's representation of rev (its
 	// bytes, its size), as a client checking what it uploaded expects.
 	raw []byte
 	at  time.Time
@@ -49,11 +51,11 @@ type record struct {
 
 func (r record) cost() int { return 64 + len(r.doc) + len(r.raw) + 16*len(r.paths) }
 
-// docRecs is a principal's records of one document, oldest first.
+// docRecs is a user's records of one document, oldest first.
 type docRecs struct {
 	rs []record
 	// reload: a save was refused (409) when the records were at this seq;
-	// the principal's next read of the document drops the records older
+	// the user's next read of the document drops the records older
 	// than it, so the version reloaded is the base of the edit after it.
 	reload uint64
 	// lost: records of the document were dropped to stay within bounds;
@@ -70,15 +72,16 @@ func (d docRecs) cost() int {
 	return n
 }
 
-// recStore is one grant root's records.
+// recStore is one user's records.
 type recStore struct {
-	docs      lru.Cache[string, docRecs] // by principal id and ns/name
+	docs      lru.Cache[string, docRecs] // by ns/name
 	forgotten lru.Cache[string, bool]    // documents whose records the bounds dropped
-	paths     lru.Cache[string, pathRec] // by principal id and path
+	paths     lru.Cache[string, pathRec] // by path
+	own       lru.Cache[string, bool]    // by ns/name@id: the tombstones and restores the user wrote
 	used      time.Time
 }
 
-// pathRec is the document a principal last read whole or wrote under a
+// pathRec is the document a user last read whole or wrote under a
 // path (records are kept by document, and a path may come to name
 // another: a tree's title given to a new item, a raw x.json taking the
 // name of JSON document x), and when.
@@ -87,10 +90,14 @@ type pathRec struct {
 	at       time.Time
 }
 
-// maxPaths bounds the paths a grant root's principals' path records keep.
+// maxPaths bounds the paths a user's path records keep.
 const maxPaths = 1 << 16
 
-func recKey(p *principal, ns, name string) string { return p.id + "\x00" + ns + "/" + name }
+// maxOwn bounds the tombstones and restores a user's records remember
+// having written (ownEntry).
+const maxOwn = 1 << 12
+
+func recKey(ns, name string) string { return ns + "/" + name }
 
 // keepRaw returns the bytes a write uploaded, to read back as written, or
 // nil where the rendering reads the same, or where they are more than a
@@ -103,18 +110,41 @@ func keepRaw(body, rendered []byte) []byte {
 	return body
 }
 
-// storeLocked returns root's records, made if new.
-func (s *Server) storeLocked(root string) *recStore {
-	rs := s.recRoots[root]
+// storeLocked returns p's records, made if new.
+func (s *Server) storeLocked(p *principal) *recStore {
+	rs := s.recRoots[p.id]
 	if rs == nil {
 		rs = &recStore{used: s.opt.Now()}
 		rs.docs.MaxEntries, rs.docs.MaxBytes = 1<<16, s.opt.RecordBytes
 		rs.forgotten.MaxEntries = maxForgotten
 		rs.paths.MaxEntries = maxPaths
+		rs.own.MaxEntries = maxOwn
 		rs.docs.OnEvict = func(k string, _ docRecs) { rs.forgotten.Put(k, true, 1) }
-		s.recRoots[root] = rs
+		s.recRoots[p.id] = rs
 	}
 	return rs
+}
+
+// markOwn remembers that user p wrote entry id of ns/name, a tombstone or
+// a restore: one between a save's base and the head is no delete or
+// restore by someone else (§11.3, §H.4), whichever of p's tokens wrote it
+// (§H.7).
+func (s *Server) markOwn(p *principal, ns, name, id string) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	rs := s.storeLocked(p)
+	rs.used = s.opt.Now()
+	rs.own.Put(ns+"/"+name+"@"+id, true, 1)
+}
+
+// ownEntry reports whether user p wrote entry id of ns/name, as far as
+// its records remember (markOwn): one forgotten counts as someone else's,
+// which a save from before refuses (a reload settles it).
+func (s *Server) ownEntry(p *principal, ns, name, id string) bool {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	_, ok := s.storeLocked(p).own.Get(ns + "/" + name + "@" + id)
+	return ok
 }
 
 // recordsOf returns p's records of ns/name, without those older than
@@ -122,10 +152,10 @@ func (s *Server) storeLocked(root string) *recStore {
 // make it lost.
 func (s *Server) recordsOf(p *principal, ns, name string) docRecs {
 	cut := s.opt.Now().Add(-s.opt.RecordIdle)
-	k := recKey(p, ns, name)
+	k := recKey(ns, name)
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	rs := s.storeLocked(p.acct.root)
+	rs := s.storeLocked(p)
 	d, ok := rs.docs.Get(k)
 	if !ok {
 		_, lost := rs.forgotten.Get(k)
@@ -148,12 +178,12 @@ func (s *Server) remember(p *principal, ns, name string, r record, reload bool) 
 	if r.at.IsZero() {
 		r.at = now
 	}
-	k := recKey(p, ns, name)
+	k := recKey(ns, name)
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	s.recSeq++
 	r.seq = s.recSeq
-	st := s.storeLocked(p.acct.root)
+	st := s.storeLocked(p)
 	st.used = now
 	old, ok := st.docs.Get(k)
 	if !ok {
@@ -220,7 +250,7 @@ func dropMiddle(rs []record) []record {
 }
 
 // trimRecordsLocked drops records, least recently used first, from the
-// root keeping the most, until all of them fit RecordBytes.
+// user keeping the most, until all of them fit RecordBytes.
 func (s *Server) trimRecordsLocked() {
 	for s.recBytes > s.opt.RecordBytes {
 		var big *recStore
@@ -239,7 +269,7 @@ func (s *Server) trimRecordsLocked() {
 	}
 }
 
-// sweepRecordsLocked forgets the roots that recorded nothing for
+// sweepRecordsLocked forgets the users that recorded nothing for
 // RecordIdle, whose records have aged out.
 func (s *Server) sweepRecordsLocked(now time.Time) {
 	for root, rs := range s.recRoots {
@@ -254,7 +284,7 @@ func (s *Server) sweepRecordsLocked(now time.Time) {
 func (s *Server) notePath(p *principal, path, ns, name string) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	s.storeLocked(p.acct.root).paths.Put(p.id+"\x00"+path, pathRec{ns: ns, name: name, at: s.opt.Now()}, 1)
+	s.storeLocked(p).paths.Put(path, pathRec{ns: ns, name: name, at: s.opt.Now()}, 1)
 }
 
 // pathOf returns the document p last read whole or wrote under path,
@@ -262,7 +292,7 @@ func (s *Server) notePath(p *principal, path, ns, name string) {
 func (s *Server) pathOf(p *principal, path string) (string, string, bool) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	r, ok := s.storeLocked(p.acct.root).paths.Get(p.id + "\x00" + path)
+	r, ok := s.storeLocked(p).paths.Get(path)
 	if !ok || s.opt.Now().Sub(r.at) > s.opt.RecordIdle {
 		return "", "", false
 	}
@@ -274,16 +304,16 @@ func (s *Server) pathOf(p *principal, path string) (string, string, bool) {
 func (s *Server) forgetPath(p *principal, path string) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	s.storeLocked(p.acct.root).paths.Remove(p.id + "\x00" + path)
+	s.storeLocked(p).paths.Remove(path)
 }
 
 // refuse marks p's records of ns/name as refused: the save was a 409,
 // which asks for a reload.
 func (s *Server) refuse(p *principal, ns, name string) {
-	k := recKey(p, ns, name)
+	k := recKey(ns, name)
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	st := s.storeLocked(p.acct.root)
+	st := s.storeLocked(p)
 	st.used = s.opt.Now()
 	d, ok := st.docs.Get(k)
 	if !ok {
@@ -303,10 +333,10 @@ func (s *Server) refuse(p *principal, ns, name string) {
 // reload that refusal asked for, so the next write makes it anew
 // (tombBase) rather than meeting the refusal again.
 func (s *Server) reloaded(p *principal, ns, name string) {
-	k := recKey(p, ns, name)
+	k := recKey(ns, name)
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	st := s.storeLocked(p.acct.root)
+	st := s.storeLocked(p)
 	d, ok := st.docs.Get(k)
 	if !ok || d.reload == 0 {
 		return
@@ -340,7 +370,7 @@ func (s *Server) stale(p *principal, ns, name, rev string) bool {
 func (s *Server) exactOf(p *principal, ns, name, rev string) []byte {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
-	d, _ := s.storeLocked(p.acct.root).docs.Get(recKey(p, ns, name))
+	d, _ := s.storeLocked(p).docs.Get(recKey(ns, name))
 	for i := len(d.rs) - 1; i >= 0; i-- {
 		if d.rs[i].rev == rev && d.rs[i].raw != nil {
 			return d.rs[i].raw

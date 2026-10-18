@@ -130,7 +130,7 @@ func (st *reqState) resolveName(ctx context.Context, name string) (target, error
 		t.kind = kNSDir
 	case len(segs) == 1 && st.s.cats[t.ns]:
 		t.kind = kCatDir
-		if f := st.s.nsInfo(ctx, st.p, t.ns).files; f != nil {
+		if f := st.s.nsInfo(ctx, st.tk, t.ns).files; f != nil {
 			t.node = f.root
 		}
 	case len(segs) == 1:
@@ -210,7 +210,7 @@ func (st *reqState) flatOwner(ctx context.Context, ns, dir, base string) (headDo
 		if err != nil || h.State != client.Live {
 			return headDoc{}, false, err
 		}
-		m, err := st.s.meta(ctx, st.p, ns, name, h.ID)
+		m, err := st.s.meta(ctx, st.tk, ns, name, h.ID)
 		if hidden(err) || err == nil && m.sealed {
 			return headDoc{}, false, nil
 		}
@@ -395,17 +395,18 @@ func notOffered(ns string) error {
 	return fail(http.StatusNotFound, "namespace %s is sealed or end-to-end encrypted (Addendum E), and this server holds no keys, so it doesn't offer it (§H.7)", ns)
 }
 
-// offered returns why namespace ns isn't offered to the principal, or
-// nil: a sealed or end-to-end one isn't (notOffered, §H.7), nor a catalog
-// whose document makes no file tree (notTree, §H.2); one whose document
-// its grant can't read is (it then gets what the core answers), as is one
-// its grant doesn't name. A document that couldn't be read for now (a
-// 429, a 5xx) is the error.
+// offered returns why namespace ns isn't offered to the request's token,
+// or nil: a sealed or end-to-end one isn't (notOffered, §H.7; §7.4's
+// writer block says, to any grant the namespace verifies), nor a catalog
+// whose document makes no file tree (notTree, §H.2); one that refuses the
+// token's grant, or whose document it can't read, is (it then gets what
+// the core answers), as is one its grant doesn't name. An answer that
+// couldn't be had for now (a 429, a 5xx) is the error.
 func (st *reqState) offered(ctx context.Context, ns string) (why, err error) {
-	if st.p.named != nil && !st.p.named[ns] {
+	if st.tk.named != nil && !st.tk.named[ns] {
 		return nil, nil
 	}
-	in, err := st.s.nsInfoErr(ctx, st.p, ns)
+	in, err := st.s.nsInfoErr(ctx, st.tk, ns)
 	switch {
 	case err != nil:
 		return nil, err
@@ -527,11 +528,11 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 			}
 		}
 	case kNSDir:
-		hs, err := st.s.liveHeads(ctx, st.p, t.ns)
+		hs, err := st.s.liveHeads(ctx, st.tk, t.ns)
 		if err != nil {
 			return nil, err
 		}
-		if hs, err = st.s.fetchHeads(ctx, st.p, hs, st.p.c.Head, false); err != nil {
+		if hs, err = st.s.fetchHeads(ctx, st.tk, hs, st.tk.c.Head, false); err != nil {
 			return nil, err
 		}
 		l.res = map[string]headDoc{}
@@ -572,7 +573,7 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 		}
 		// fetchHeads leaves out what it can't read, so names pair up by
 		// resource (an item is placed once per catalog, §B.2).
-		docs, err := st.s.fetchHeads(ctx, st.p, files, nil, false)
+		docs, err := st.s.fetchHeads(ctx, st.tk, files, nil, false)
 		if err != nil {
 			return nil, err
 		}
@@ -602,7 +603,7 @@ func (st *reqState) head(ctx context.Context, ns, name string) (*client.Head, er
 	if h := st.heads[k]; h != nil {
 		return h, nil
 	}
-	h, err := st.p.c.Head(ctx, ns, name)
+	h, err := st.tk.c.Head(ctx, ns, name)
 	if err != nil {
 		return nil, err
 	}
@@ -623,14 +624,14 @@ func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) 
 		hd, ok := l.docs[t.shownAs()]
 		return hd, ok, nil
 	}
-	if t.kind == kPlacement && st.s.nsInfo(ctx, st.p, t.docNS).sealed {
+	if t.kind == kPlacement && st.s.nsInfo(ctx, st.tk, t.docNS).sealed {
 		return headDoc{}, false, nil
 	}
 	h, err := st.head(ctx, t.docNS, t.docName)
 	if err != nil || h.State != client.Live {
 		return headDoc{}, false, err
 	}
-	m, err := st.s.meta(ctx, st.p, t.docNS, t.docName, h.ID)
+	m, err := st.s.meta(ctx, st.tk, t.docNS, t.docName, h.ID)
 	if err != nil {
 		return headDoc{}, false, err
 	}
@@ -683,8 +684,8 @@ func (st *reqState) stat(ctx context.Context, t target) (*fileInfo, error) {
 	return nil, errNotExist
 }
 
-// davFS is the webdav.FileSystem; the principal comes with each request's
-// context.
+// davFS is the webdav.FileSystem; the token and its user come with each
+// request's context.
 type davFS struct{ s *Server }
 
 // fail records err for the answer, or, for an entry of a PROPFIND listing
@@ -991,8 +992,8 @@ func (st *reqState) afterRefusedSave(ctx context.Context, t target) error {
 		return nil
 	}
 	if t.kind == kDoc || t.kind == kRaw {
-		st.p.forgetNS(t.docNS)
-		if st.s.nsInfo(ctx, st.p, t.docNS).frozen {
+		st.tk.forgetNS(t.docNS)
+		if st.s.nsInfo(ctx, st.tk, t.docNS).frozen {
 			return nil
 		}
 	}
@@ -1182,20 +1183,20 @@ func (st *reqState) moveFlat(ctx context.Context, src, dst target) error {
 // $successor, isn't moved (403): it can be copied, then deleted.
 func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 	ns := src.ns
-	in := st.s.nsInfo(ctx, st.p, ns)
+	in := st.s.nsInfo(ctx, st.tk, ns)
 	if in.sealed {
 		return notOffered(ns)
 	}
 	sent := map[string]bool{} // blobs copied or uploaded to the new resource
 	return st.retrying(ctx, func() (bool, error) {
-		sh, err := st.p.c.Head(ctx, ns, src.docName)
+		sh, err := st.tk.c.Head(ctx, ns, src.docName)
 		if err != nil {
 			return false, err
 		}
 		if sh.State != client.Live {
 			return false, errNotExist
 		}
-		e, err := st.s.doc(ctx, st.p, ns, src.docName, sh.ID)
+		e, err := st.s.doc(ctx, st.tk, ns, src.docName, sh.ID)
 		switch {
 		case err != nil:
 			return false, err
@@ -1224,7 +1225,7 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 			typ := fileType(dst.base, r.typ)
 			if typ == r.typ {
 				if !sent[r.bid] {
-					if err := st.p.c.CopyBlob(ctx, ns, to, r.bid, ns, src.docName, ""); err != nil {
+					if err := st.tk.c.CopyBlob(ctx, ns, to, r.bid, ns, src.docName, ""); err != nil {
 						return false, err
 					}
 					sent[r.bid] = true
@@ -1244,14 +1245,14 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 					doc[k] = v
 				}
 				if bid := doc["$blob"].(string); !sent[bid] {
-					if _, err := st.p.c.UploadBlob(ctx, ns, to, typ, nonce, b); err != nil {
+					if _, err := st.tk.c.UploadBlob(ctx, ns, to, typ, nonce, b); err != nil {
 						return false, err
 					}
 					sent[bid] = true
 				}
 			}
 		}
-		th, err := st.p.c.Head(ctx, ns, to)
+		th, err := st.tk.c.Head(ctx, ns, to)
 		if err != nil {
 			return false, err
 		}
@@ -1269,7 +1270,7 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 			return false, fail(http.StatusConflict, "%s/%s was made by someone else meanwhile; %s isn't moved", ns, to, src.path)
 		}
 		succ := withNonce(in, e.value, []any{map[string]any{"op": "add", "path": "/$successor", "value": to}})
-		res, err := st.p.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{item, {Resource: src.docName, IfMatch: sh.ID,
+		res, err := st.tk.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{item, {Resource: src.docName, IfMatch: sh.ID,
 			Steps: []client.Step{client.PatchStep(succ), client.DeleteStep()}}}}, false)
 		err = batchErr(err)
 		if client.IsStale(err) {
@@ -1282,10 +1283,10 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		st.s.forgetPath(st.p, src.path)
 		st.s.notePath(st.p, dst.path, ns, to)
 		if len(res.Items) == 2 && len(res.Items[1].IDs) == 2 {
-			st.p.markOwn(ns, src.docName, res.Items[1].IDs[1])
+			st.s.markOwn(st.p, ns, src.docName, res.Items[1].IDs[1])
 		}
 		if th.State == client.Tombstoned && len(res.Items) > 0 && len(res.Items[0].IDs) == 1 {
-			st.p.markOwn(ns, to, res.Items[0].IDs[0])
+			st.s.markOwn(st.p, ns, to, res.Items[0].IDs[0])
 		}
 		return false, nil
 	})
@@ -1299,7 +1300,7 @@ func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) 
 		if r.size > int64(st.s.opt.MaxRawSize) {
 			return nil, overLimit("-max-raw-size", r.size, int64(st.s.opt.MaxRawSize), "(this gateway's bound on a raw file, which it copies here whole): %s/%s", hd.ns, hd.name)
 		}
-		b, err := st.p.c.GetBlob(ctx, hd.ns, hd.name, r.bid, r.nonce)
+		b, err := st.tk.c.GetBlob(ctx, hd.ns, hd.name, r.bid, r.nonce)
 		if err != nil {
 			return nil, err
 		}
@@ -1421,7 +1422,7 @@ func (st *reqState) kindOf(ctx context.Context, t target, body []byte) (bool, st
 		if err != nil || h.State != client.Live {
 			return false, t.docName, nil, err
 		}
-		m, err := st.s.meta(ctx, st.p, t.docNS, t.docName, h.ID)
+		m, err := st.s.meta(ctx, st.tk, t.docNS, t.docName, h.ID)
 		return err == nil && m.raw != nil, t.docName, nil, err
 	case kNewNode:
 		if d, ok := st.p.treeDeleted(t.path, st.s.opt.Now()); ok && d.cat == t.ns && d.parent == t.parent {
@@ -1434,7 +1435,7 @@ func (st *reqState) kindOf(ctx context.Context, t target, body []byte) (bool, st
 				rev = h.Last
 			}
 			if h.State == client.Live || h.State == client.Tombstoned && rev != "" {
-				if m, err := st.s.meta(ctx, st.p, d.itemNS, d.itemName, rev); err == nil {
+				if m, err := st.s.meta(ctx, st.tk, d.itemNS, d.itemName, rev); err == nil {
 					return m.raw != nil, "", nil, nil
 				}
 			}
@@ -1480,8 +1481,7 @@ func (st *reqState) maxWrite(ctx context.Context, t target) (int, error) {
 // writeFile buffers a written file whole, at most max bytes; Close
 // commits it, to the core for a document name, to the scratch store for
 // any other. The buffers of every request together hold at most
-// InflightBytes, those of one grant root's at most rootInflight (503
-// beyond).
+// InflightBytes, those of one user's at most userInflight (503 beyond).
 type writeFile struct {
 	st      *reqState
 	ctx     context.Context
@@ -1515,7 +1515,7 @@ func (w *writeFile) Write(p []byte) (int, error) {
 			header: http.Header{"Retry-After": {"2"}}})
 		return 0, w.err
 	}
-	if !w.st.p.acct.hold(n, w.st.s.rootInflight()) {
+	if !w.st.p.hold(n, w.st.s.userInflight()) {
 		w.st.s.inflight.Release(n)
 		w.err = w.st.record(&davError{status: http.StatusServiceUnavailable, msg: "you are sending too many files at once; try again",
 			header: http.Header{"Retry-After": {"2"}}})
@@ -1532,7 +1532,7 @@ func (w *writeFile) Close() error {
 	w.closed = true
 	defer func() {
 		w.st.s.inflight.Release(w.held)
-		w.st.p.acct.release(w.held)
+		w.st.p.unhold(w.held)
 	}()
 	switch {
 	case w.scratch && w.err == nil && w.st.bodyErr == nil:

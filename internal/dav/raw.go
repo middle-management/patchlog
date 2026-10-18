@@ -51,7 +51,7 @@ func (f *rawFile) open() error {
 		f.body.Close()
 		f.body = nil
 	}
-	b, err := f.st.p.c.OpenBlob(f.ctx, f.ns, f.name, f.ref.bid, f.off)
+	b, err := f.st.tk.c.OpenBlob(f.ctx, f.ns, f.name, f.ref.bid, f.off)
 	if err != nil {
 		return err
 	}
@@ -149,7 +149,7 @@ type blobSrc struct {
 // (§7.8), and the blob is copied with Blob-From, or uploaded again where
 // the core refuses that (a source of a higher rank, §7.8).
 func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte, o saveOpts) (string, bool, error) {
-	in := st.s.nsInfo(ctx, st.p, ns)
+	in := st.s.nsInfo(ctx, st.tk, ns)
 	if in.sealed {
 		return "", false, notOffered(ns)
 	}
@@ -178,7 +178,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			return nil
 		}
 		if from != nil {
-			err := st.p.c.CopyBlob(ctx, ns, name, bid, from.ns, from.name, "")
+			err := st.tk.c.CopyBlob(ctx, ns, name, bid, from.ns, from.name, "")
 			ae, isAPI := client.AsAPIError(err)
 			switch {
 			case err == nil:
@@ -188,7 +188,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 				return err
 			}
 		}
-		if _, err := st.p.c.UploadBlob(ctx, ns, name, typ, nonce, body); err != nil {
+		if _, err := st.tk.c.UploadBlob(ctx, ns, name, typ, nonce, body); err != nil {
 			return err
 		}
 		uploaded = true
@@ -198,7 +198,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 	var rev string
 	exact := true
 	err := st.retrying(ctx, func() (bool, error) {
-		h, err := st.p.c.Head(ctx, ns, name)
+		h, err := st.tk.c.Head(ctx, ns, name)
 		if err != nil {
 			return false, err
 		}
@@ -212,7 +212,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			if o.pre && st.noneMatch {
 				return false, fail(http.StatusPreconditionFailed, "%s/%s exists (If-None-Match: *)", ns, name)
 			}
-			cur, err := st.s.doc(ctx, st.p, ns, name, h.ID)
+			cur, err := st.s.doc(ctx, st.tk, ns, name, h.ID)
 			switch {
 			case err != nil:
 				return false, err
@@ -244,7 +244,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			ps := merge.Diff(refOf(cur.value), refOf(ref))
 			paths := writesOf(refOf(cur.value), ps)
 			ps = withNonce(in, cur.value, ps)
-			res, err := st.p.c.Append(ctx, ns, name, h.ID, ps)
+			res, err := st.tk.c.Append(ctx, ns, name, h.ID, ps)
 			switch {
 			case client.IsStale(err):
 				return true, nil
@@ -271,7 +271,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 				return false, err
 			}
 			ps = withNonce(in, ref, client.GenesisPatches(ref))
-			res, err = st.p.c.Create(ctx, ns, name, ps)
+			res, err = st.tk.c.Create(ctx, ns, name, ps)
 		} else {
 			// What the restore writes is settled (a 409 over someone
 			// else's delete uploads nothing) before the blob goes up.
@@ -284,8 +284,8 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			} else if err := upload(); err != nil {
 				return false, err
 			}
-			if res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps); err == nil {
-				st.p.markOwn(ns, name, res.ID)
+			if res, err = st.tk.c.Restore(ctx, ns, name, h.ID, ps); err == nil {
+				st.s.markOwn(st.p, ns, name, res.ID)
 			}
 		}
 		if client.IsStale(err) || client.IsGone(err) && !client.IsPurged(err) {

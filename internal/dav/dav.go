@@ -20,11 +20,14 @@
 // Edits others made since to other paths are kept, overlapping ones are a
 // 409; a raw file has no paths, so any change of its bytes since is one.
 // Editors' and systems' own files (swap and backup files, .DS_Store, ._*,
-// §H.6) live in memory, per principal, so editors' save dances work.
+// §H.6) live in memory, per user, so editors' save dances work.
 //
 // Two ways to authenticate: with a fixed grant (local mode, the WebDAV
 // clients log in with a password of the server's), or as a gateway, where
-// each request's Basic password is the grant sent upstream.
+// each request's Basic password is the grant sent upstream. State (bases,
+// scratch files, locks, guards) is kept per user (§H.7): in a gateway,
+// the root sub and kid GET /ns/{ns}/principal names for a grant, so every
+// token of one person is one user; in local mode, everyone is one.
 package dav
 
 import (
@@ -52,8 +55,8 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
-	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/lru"
 )
 
@@ -100,35 +103,37 @@ type Options struct {
 	// request (default the larger of 8 times MaxFileSize and twice
 	// MaxRawSize; 503 beyond).
 	InflightBytes int
-	// ScratchFiles and ScratchBytes bound one grant root's scratch files
+	// ScratchFiles and ScratchBytes bound one user's scratch files
 	// (default 256 and 32 MiB); ScratchTotal all of them (default 256
 	// MiB). ScratchIdle drops a scratch file untouched that long, and a
-	// gateway's principal idle that long (default an hour).
+	// gateway's user idle that long (default an hour).
 	ScratchFiles, ScratchBytes, ScratchTotal int
 	ScratchIdle                              time.Duration
-	// RecordBytes bounds the versions remembered as principals' bases (the
-	// revisions they were served, the content they wrote), for every
-	// principal together (default the larger of 128 MiB and 8 times
-	// MaxFileSize); over it, the grant root keeping the most gives way
-	// first. RecordIdle drops a document's versions untouched that long
-	// (default a day). They outlive the principal's scratch files.
+	// RecordBytes bounds the versions remembered as users' bases (the
+	// revisions they were served, the content they wrote), for every user
+	// together (default the larger of 128 MiB and 8 times MaxFileSize);
+	// over it, the user keeping the most gives way first. RecordIdle drops
+	// a document's versions untouched that long (default a day). They
+	// outlive the user's scratch files.
 	RecordBytes int
 	RecordIdle  time.Duration
-	// MaxPrincipals bounds the principals a gateway keeps state for, the
+	// MaxPrincipals bounds the users a gateway keeps state for (§H.7), the
 	// least recently seen without a request in flight dropped first
-	// (default 256); MaxPrincipalsPerRoot those of one grant root (the
-	// namespace that verified it, its authority block's kid and sub), so
-	// tokens attenuated from one grant offline can't push out others'
-	// (default 8).
-	MaxPrincipals, MaxPrincipalsPerRoot int
-	// MaxLocks bounds one principal's locks (default 256), and four times
-	// that one grant root's.
+	// (default 256); MaxTokensPerPrincipal the tokens it keeps for one
+	// user (re-minted, attenuated offline), the least recently used
+	// without a request in flight dropped first, to be verified again
+	// when it comes back (default 8).
+	MaxPrincipals, MaxTokensPerPrincipal int
+	// MaxLocks bounds one user's locks (default 256).
 	MaxLocks int
 	// VerifyEvery is how often a gateway asks the core again whether a
-	// principal's grant is accepted (default 5 minutes).
+	// token's grant is accepted (default 5 minutes): at least as often as
+	// edge grants expire (§H.7, §C.5.2), at most edge.MaxGrantTTL, which
+	// bounds how long a revoked grant still reaches its user's scratch
+	// files. Writers' settings (§7.4 writer) are kept for no longer.
 	VerifyEvery time.Duration
-	// CatalogTTL is how long a principal's read of a catalog's tree serves
-	// its requests, unless this server writes meanwhile (default 5s).
+	// CatalogTTL is how long a token's read of a catalog's tree serves its
+	// requests, unless this server writes meanwhile (default 5s).
 	CatalogTTL time.Duration
 	// Retries bounds the resends of a write whose head moved (412,
 	// default 5).
@@ -165,28 +170,26 @@ type Server struct {
 	start time.Time
 	fs    *davFS
 
-	local *principal // local mode
+	local *token // local mode: the one bearer, the one user
 
 	// gateway mode
 	anon      *client.Client // without a grant
-	checker   *grantcheck.Checker
 	verifying singleflight.Group
 	verifySem chan struct{} // verifications in flight
 	refusedMu sync.Mutex
-	refused   lru.Cache[string, time.Time] // grants the core refused lately, by hash
+	refused   lru.Cache[string, refusal] // grants the core refused lately, by hash
 
 	mu           sync.Mutex
-	principals   map[string]*principal // gateway mode, by grant hash
-	accounts     map[string]*account   // by grant root
-	public       map[string]publicity  // by namespace
+	tokens       map[string]*token     // gateway mode, by grant hash
+	principals   map[string]*principal // gateway mode, by user (userKey)
 	lastSweep    time.Time
-	scratchTotal atomic.Int64 // every principal's scratch bytes
+	scratchTotal atomic.Int64 // every user's scratch bytes
 
 	recMu    sync.Mutex
-	recRoots map[string]*recStore         // by grant root
-	recBytes int                          // what every root's records cost
+	recRoots map[string]*recStore         // by user
+	recBytes int                          // what every user's records cost
 	recSeq   uint64                       // records made
-	seen     lru.Cache[string, time.Time] // by principal and ns/name@rev: first shown
+	seen     lru.Cache[string, time.Time] // by user and ns/name@rev: first shown
 
 	docMu    sync.Mutex
 	docs     lru.Cache[string, *docEntry] // by ns/name@rev
@@ -229,7 +232,7 @@ func New(opt Options) (*Server, error) {
 	def(&opt.ScratchTotal, 256<<20)
 	def(&opt.RecordBytes, max(128<<20, 8*opt.MaxFileSize))
 	def(&opt.MaxPrincipals, 256)
-	def(&opt.MaxPrincipalsPerRoot, 8)
+	def(&opt.MaxTokensPerPrincipal, 8)
 	def(&opt.MaxLocks, 256)
 	def(&opt.Retries, 5)
 	defDur(&opt.ScratchIdle, time.Hour)
@@ -237,6 +240,9 @@ func New(opt Options) (*Server, error) {
 	defDur(&opt.VerifyEvery, 5*time.Minute)
 	defDur(&opt.CatalogTTL, 5*time.Second)
 	defDur(&opt.MaxRetryWait, 2*time.Second)
+	if opt.VerifyEvery > edge.MaxGrantTTL {
+		return nil, fmt.Errorf("dav: VerifyEvery %v is longer than edge grants live (%v): a gateway re-checks a grant at least as often as they expire (§H.7, §C.5.2)", opt.VerifyEvery, edge.MaxGrantTTL)
+	}
 	if opt.Realm == "" {
 		opt.Realm = "patchlog"
 	}
@@ -246,8 +252,8 @@ func New(opt Options) (*Server, error) {
 	if opt.Logf == nil {
 		opt.Logf = func(string, ...any) {}
 	}
-	s := &Server{opt: opt, flat: map[string]bool{}, cats: map[string]bool{}, principals: map[string]*principal{},
-		accounts: map[string]*account{}, public: map[string]publicity{}, recRoots: map[string]*recStore{},
+	s := &Server{opt: opt, flat: map[string]bool{}, cats: map[string]bool{}, tokens: map[string]*token{},
+		principals: map[string]*principal{}, recRoots: map[string]*recStore{},
 		sem: make(chan struct{}, opt.FetchConcurrency), inflight: semaphore.NewWeighted(int64(opt.InflightBytes)),
 		heavy: make(chan struct{}, maxHeavy)}
 	s.start = opt.Now()
@@ -270,13 +276,12 @@ func New(opt Options) (*Server, error) {
 		s.cats[ns] = true
 	}
 	s.fs = &davFS{s: s}
+	s.anon = opt.Client.With(client.WithBearer(""))
 	if opt.Gateway {
-		s.anon = opt.Client.With(client.WithBearer(""))
-		s.checker = grantcheck.New(s.anon, grantcheck.WithClock(opt.Now))
 		s.verifySem = make(chan struct{}, maxVerifying)
 		s.refused.MaxEntries = 1 << 12
 	} else {
-		s.local = s.newPrincipal("local", opt.Client, &account{root: "local"})
+		s.local = s.newToken("local", opt.Client, s.newPrincipal("local"), nil)
 		s.local.verified = s.start
 	}
 	return s, nil
@@ -299,7 +304,7 @@ func (s *Server) namespaces() []string {
 }
 
 // ServeHTTP authenticates the request, then serves it with x/net/webdav
-// over the principal's view.
+// over the user's view.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Whatever an answer holds (a file, a listing, an error repeating a
 	// name the client sent), no page of this origin, which holds the
@@ -315,7 +320,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "POST isn't a WebDAV method here; files are read with GET and written with PUT", http.StatusMethodNotAllowed)
 		return
 	}
-	p, de := s.authenticate(r)
+	tk, de := s.authenticate(r)
 	if de != nil {
 		for k, v := range de.header {
 			w.Header()[k] = v
@@ -326,8 +331,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, de.msg, de.status)
 		return
 	}
-	defer s.release(p)
-	st := &reqState{s: s, p: p, method: r.Method, path: slashClean(r.URL.Path), depth: r.Header.Get("Depth"), hdr: r.Header, resp: w.Header()}
+	defer s.release(tk)
+	p := tk.p
+	st := &reqState{s: s, tk: tk, p: p, method: r.Method, path: slashClean(r.URL.Path), depth: r.Header.Get("Depth"), hdr: r.Header, resp: w.Header()}
 	switch r.Method {
 	case "PROPFIND":
 		switch st.depth {
@@ -663,12 +669,12 @@ func splitIf(h string) string {
 	return strings.Join(out, " ")
 }
 
-// authenticate returns the request's principal, or the answer refusing
-// it. Local mode compares the Basic password in constant time. Gateway
-// mode takes it as the grant; nothing is kept for a grant before the core
-// has accepted it (verify), again every VerifyEvery. A grant refused is
-// refused for refusedFor without asking again.
-func (s *Server) authenticate(r *http.Request) (*principal, *davError) {
+// authenticate returns the request's token, or the answer refusing it.
+// Local mode compares the Basic password in constant time. Gateway mode
+// takes it as the grant: nothing is kept for a grant before the core has
+// accepted it (verify), and it is asked again every VerifyEvery. A grant
+// refused is refused for refusedFor without asking again.
+func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 	_, pw, ok := r.BasicAuth()
 	if !ok {
 		return nil, fail(http.StatusUnauthorized, "authentication required")
@@ -694,19 +700,18 @@ func (s *Server) authenticate(r *http.Request) (*principal, *davError) {
 	sum := sha256.Sum256([]byte(pw))
 	id := hex.EncodeToString(sum[:16])
 	s.mu.Lock()
-	if p := s.principals[id]; p != nil && now.Sub(p.verified) < s.opt.VerifyEvery {
-		p.used = now
-		p.inflight++
+	if tk := s.tokens[id]; tk != nil && !tk.verified.IsZero() && now.Sub(tk.verified) < s.opt.VerifyEvery {
+		s.useLocked(tk, now)
 		s.mu.Unlock()
 		s.sweep()
-		return p, nil
+		return tk, nil
 	}
 	s.mu.Unlock()
 	s.refusedMu.Lock()
-	at, refused := s.refused.Get(id)
+	rf, refused := s.refused.Get(id)
 	s.refusedMu.Unlock()
-	if refused && now.Sub(at) < refusedFor {
-		return nil, fail(http.StatusUnauthorized, "the core doesn't accept the grant")
+	if refused && now.Sub(rf.at) < refusedFor {
+		return nil, rf.err
 	}
 
 	c := s.opt.Client.With(client.WithBearer(pw))
@@ -716,28 +721,28 @@ func (s *Server) authenticate(r *http.Request) (*principal, *davError) {
 		select {
 		case s.verifySem <- struct{}{}:
 		case <-ctx.Done():
-			return "", &davError{status: http.StatusServiceUnavailable, msg: "too many logins at once; try again", header: http.Header{"Retry-After": {"5"}}}
+			return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many logins at once; try again", header: http.Header{"Retry-After": {"5"}}}
 		}
 		defer func() { <-s.verifySem }()
-		return s.verify(ctx, c, g, pw)
+		return s.verify(ctx, c, g)
 	})
 	var de *davError
-	if errors.As(err, &de) && de.status == http.StatusUnauthorized {
+	if errors.As(err, &de) && refusedStatus(de.status) {
 		s.refusedMu.Lock()
-		s.refused.Put(id, now, 1)
+		s.refused.Put(id, refusal{err: de, at: now}, 1)
 		s.refusedMu.Unlock()
 	}
-	ns, _ := v.(string)
 	named := map[string]bool{}
 	for _, n := range s.namespaces() {
 		named[n] = g.NamesNS(n)
 	}
-	p, de := s.admit(id, rootOf(ns, g), c, named, err)
+	vd, _ := v.(*verdict)
+	tk, de := s.admit(id, c, named, vd, err)
 	if de != nil {
 		return nil, de
 	}
 	s.sweep()
-	return p, nil
+	return tk, nil
 }
 
 // maxVerifying bounds the grants being verified at once, maxVerifyNS the
@@ -749,74 +754,40 @@ const (
 	refusedFor   = 30 * time.Second
 )
 
-// admit returns the principal of a grant (id, its root, its client, the
-// served namespaces it names) the core accepted, or refused with err:
-// then what was kept for it goes (revoked, or its key withdrawn).
-func (s *Server) admit(id, root string, c *client.Client, named map[string]bool, err error) (*principal, *davError) {
-	now := s.opt.Now()
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p := s.principals[id]
-	if err != nil {
-		var de *davError
-		if !errors.As(err, &de) {
-			de = fail(http.StatusBadGateway, "the grant couldn't be checked")
-		}
-		if de.status == http.StatusUnauthorized && p != nil && p.inflight == 0 {
-			s.dropLocked(p)
-		}
-		return nil, de
-	}
-	if p == nil {
-		if !s.makeRoomLocked(root) {
-			return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many users at once; try again",
-				header: http.Header{"Retry-After": {"5"}}}
-		}
-		a := s.accounts[root]
-		if a == nil {
-			a = &account{root: root}
-			s.accounts[root] = a
-		}
-		a.principals++
-		p = s.newPrincipal(id, c, a)
-		p.named = named
-		s.principals[id] = p
-	}
-	p.verified, p.used = now, now
-	p.inflight++
-	return p, nil
+// refusal is a grant's refusal (verify), and when.
+type refusal struct {
+	err *davError
+	at  time.Time
 }
 
-// rootOf is a grant's root: who its authority block was signed for, by
-// which key of namespace ns, the one that verified it (a kid names a key
-// of one namespace's document, §C.1). Tokens attenuated from one grant
-// (Addendum C) share it.
-func rootOf(ns string, g *grant.Grant) string {
-	b := g.Blocks[0]
-	return ns + "\x00" + b.Kid + "\x00" + b.Sub
+// refusedStatus reports a refusal of verify that is the grant's answer
+// for refusedFor: 401 (no namespace accepts it), 410 and 404 (the one
+// that verified it is purged, or absent).
+func refusedStatus(status int) bool {
+	return status == http.StatusUnauthorized || status == http.StatusGone || status == http.StatusNotFound
 }
 
-// release ends a request of p.
-func (s *Server) release(p *principal) {
-	if p == s.local {
-		return
-	}
-	s.mu.Lock()
-	p.inflight--
-	s.mu.Unlock()
+// verdict is the core's acceptance of a grant (verify): the served
+// namespace that accepted it, and its answer there (§7.4).
+type verdict struct {
+	ns   string
+	info *client.PrincipalInfo
 }
 
-// publicity is whether a namespace is publicly readable, as last asked.
-type publicity struct {
-	public bool
-	at     time.Time
-}
-
-// verify asks whether the core accepts grant g (token, sent by c) before a
-// gateway keeps anything for it, in the served namespaces it names (the
-// first maxVerifyNS of them), and returns the one that accepted it. One is
-// enough: another may not exist yet.
-func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, token string) (string, error) {
+// verify asks whether the core accepts grant g (sent by c), before a
+// gateway keeps anything for it: GET /ns/{ns}/principal (§7.4) in the
+// served namespaces it names, sorted, the first maxVerifyNS of them, until
+// one accepts it. Only the ns check and verification apply there (§C.2
+// item 1), the key's scope included, no verb and no rule, so a grant
+// limited to some resources, or without read, is accepted too (§H.7
+// "Limited grants"); and a public namespace answers it as any other,
+// though its reads ignore a bad grant (§7). One namespace is enough:
+// another may not exist yet, or not trust the key. A 401 there is a grant
+// that can't be used; a 410, a namespace purged once the grant verified
+// (§8.5); a 404, one that doesn't exist, to an operator grant (§C.4).
+// Accepted nowhere, the grant is refused with the first of 410 and 404
+// that it met (§H.4 "Answers"), else 401.
+func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant) (*verdict, error) {
 	var named []string
 	for _, ns := range s.namespaces() {
 		if g.NamesNS(ns) {
@@ -829,156 +800,189 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, t
 			nss = append(nss, b.NS...)
 		}
 		s.opt.Logf("dav: a grant for %q names none of the namespaces served (%q)", g.Blocks[0].Sub, nss)
-		return "", fail(http.StatusUnauthorized, "the grant names none of the namespaces served here")
+		return nil, fail(http.StatusUnauthorized, "the grant names none of the namespaces served here")
 	}
 	if len(named) > maxVerifyNS {
 		named = named[:maxVerifyNS]
 	}
-	why := "no key of a namespace it names verifies it"
+	why, purged, absent := "no key of a namespace it names verifies it", "", ""
 	for _, ns := range named {
-		ok, reason, err := s.verifyIn(ctx, c, ns, token)
-		if err != nil {
-			return "", upstream(err)
-		}
-		if ok {
-			return ns, nil
-		}
-		if reason != "" {
-			why = reason
+		info, err := c.NSPrincipal(ctx, ns)
+		ae, isAPI := client.AsAPIError(err)
+		switch {
+		case err == nil:
+			return &verdict{ns: ns, info: info}, nil
+		case client.IsPurged(err):
+			if purged == "" {
+				purged = ns
+			}
+		case isAPI && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden):
+			why = apiText(ae)
+		case isAPI && ae.Status == http.StatusNotFound:
+			if absent == "" {
+				absent = ns
+			}
+		default:
+			return nil, upstream(err)
 		}
 	}
-	return "", fail(http.StatusUnauthorized, "the core doesn't accept the grant: %s", why)
-}
-
-// verifyIn asks whether namespace ns accepts a grant (token, sent by c),
-// or why not. A namespace that isn't public answers its gestures listing
-// (§7.4, which needs only read, whatever the grant's rules say of
-// resources) to a grant its keys verify, in scope, and allow read; it
-// answers 401 to a grant none of its keys verifies, and 404 to the rest,
-// as to a namespace it hides (§7), which isn't an acceptance. A public
-// one ignores a bad grant on reads, so there the grant is verified as
-// consumers verify them (grantcheck, with the keys of the namespace
-// document, §C.6), key scope included. Whether ns is public is asked
-// again when the answer may be out of date: after a private namespace
-// accepted the grant (which a public one would, any grant), and after a
-// public one's document couldn't verify it.
-func (s *Server) verifyIn(ctx context.Context, c *client.Client, ns, token string) (bool, string, error) {
-	pub, err := s.isPublic(ctx, ns, false)
-	if err != nil {
-		return false, "", err
-	}
-	fresh := false
-	if !pub {
-		if ok, why, err := s.askCore(ctx, c, ns); err != nil || !ok {
-			return false, why, err
-		}
-		if pub, err = s.isPublic(ctx, ns, true); err != nil || !pub {
-			return err == nil, "", err
-		}
-		fresh = true
-	}
-	_, err = s.checker.Verify(ctx, ns, token)
-	var ae *grant.AuthError
 	switch {
-	case err == nil:
-		return true, "", nil
-	case !errors.As(err, &ae):
-		return false, "", err
-	case fresh:
-		return false, ae.Msg, nil
+	case purged != "":
+		return nil, fail(http.StatusGone, "namespace %s was purged (§8.5), and no other namespace your grant names here accepts it", purged)
+	case absent != "":
+		return nil, fail(http.StatusNotFound, "namespace %s doesn't exist (§7.4), and no other namespace your grant names here accepts it", absent)
 	}
-	if pub, err = s.isPublic(ctx, ns, true); err != nil || pub {
-		return false, ae.Msg, err
-	}
-	return s.askCore(ctx, c, ns)
+	return nil, fail(http.StatusUnauthorized, "the core doesn't accept the grant: %s", why)
 }
 
-// askCore reads ns's gestures listing with c, for verifyIn.
-func (s *Server) askCore(ctx context.Context, c *client.Client, ns string) (bool, string, error) {
-	_, _, err := c.GesturesPage(ctx, ns, client.NewGesture(), "")
-	ae, isAPI := client.AsAPIError(err)
-	switch {
-	case err == nil, client.IsNotOffered(err), client.IsPurged(err):
-		// Answered after the read check: not offered in a sealed
-		// namespace, a purged one gone.
-		return true, "", nil
-	case isAPI && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden):
-		return false, apiText(ae), nil
-	case isAPI && ae.Status == http.StatusNotFound:
-		return false, fmt.Sprintf("%s doesn't let it read (a key's scope refuses it, or it lacks read there), or doesn't exist", ns), nil
-	}
-	return false, "", err
+// userKey is who the state of a grant the core accepted (v) is kept for
+// (§H.7): the root sub and kid GET /ns/{ns}/principal named, never the
+// token, so every token of one person (minted again, attenuated offline)
+// is one user; with the namespace whose key verified it, since a kid
+// names a key of one namespace's document (§C.1), and the same kid in
+// another served namespace may be anyone's key, minting grants for the
+// same sub.
+func userKey(v *verdict) string {
+	return v.ns + "\x00" + v.info.Kid + "\x00" + v.info.Sub
 }
 
-// isPublic reports whether ns is read without a grant, asked of the core
-// at most once a minute, unless fresh.
-func (s *Server) isPublic(ctx context.Context, ns string, fresh bool) (bool, error) {
+// admit returns the token of a grant (id, its client, the served
+// namespaces it names) the core accepted (v), its user's state made only
+// now, or refused with err: then the token goes, and its user's other
+// tokens are asked again at their next request, since what refused it (a
+// revoked root, a key withdrawn) may refuse them too. The user's state
+// stays: only a token the core accepts reaches it, each asked again every
+// VerifyEvery, and it is that person's, whose grant minted again finds it
+// (§H.7); it goes when idle (ScratchIdle, RecordIdle) or to make room
+// (MaxPrincipals), as any user's.
+func (s *Server) admit(id string, c *client.Client, named map[string]bool, v *verdict, err error) (*token, *davError) {
 	now := s.opt.Now()
 	s.mu.Lock()
-	pi, ok := s.public[ns]
-	s.mu.Unlock()
-	if ok && !fresh && now.Sub(pi.at) < time.Minute {
-		return pi.public, nil
+	defer s.mu.Unlock()
+	tk := s.tokens[id]
+	if err != nil {
+		var de *davError
+		if !errors.As(err, &de) {
+			de = fail(http.StatusBadGateway, "the grant couldn't be checked")
+		}
+		if refusedStatus(de.status) && tk != nil {
+			for o := range tk.p.toks {
+				o.verified = time.Time{}
+			}
+			s.dropTokenLocked(tk)
+		}
+		return nil, de
 	}
-	_, err := s.anon.NSHead(ctx, ns)
-	switch {
-	case err == nil:
-		pi = publicity{public: true, at: now}
-	case client.IsAuth(err), client.IsNotFound(err):
-		pi = publicity{at: now}
-	default:
-		return false, err
+	key := userKey(v)
+	p := s.principals[key]
+	if p == nil {
+		if !s.makeRoomLocked() {
+			return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many users at once; try again",
+				header: http.Header{"Retry-After": {"5"}}}
+		}
+		p = s.newPrincipal(key)
+		s.principals[key] = p
+	}
+	if tk != nil && tk.p != p {
+		// Verified again as someone else: the namespace that accepted it
+		// before refuses it now, and another accepts it.
+		s.dropTokenLocked(tk)
+		tk = nil
+	}
+	if tk == nil {
+		if !s.tokenRoomLocked(p) {
+			return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many of your logins at once; try again",
+				header: http.Header{"Retry-After": {"5"}}}
+		}
+		tk = s.newToken(id, c, p, named)
+		s.tokens[id] = tk
+		p.toks[tk] = true
+	}
+	tk.verified = now
+	tk.keepWriter(v.ns, v.info.Writer, now)
+	s.useLocked(tk, now)
+	return tk, nil
+}
+
+// useLocked counts a request of tk's, now.
+func (s *Server) useLocked(tk *token, now time.Time) {
+	tk.used, tk.p.used = now, now
+	tk.inflight++
+	tk.p.inflight++
+}
+
+// release ends a request of tk's.
+func (s *Server) release(tk *token) {
+	if tk == s.local {
+		return
 	}
 	s.mu.Lock()
-	s.public[ns] = pi
+	tk.inflight--
+	tk.p.inflight--
 	s.mu.Unlock()
-	return pi.public, nil
 }
 
-// makeRoomLocked drops principals to make room for one more of root: the
-// least recently seen of root's own beyond MaxPrincipalsPerRoot, then the
-// least recently seen of all beyond MaxPrincipals; never one with a
-// request in flight. False: there is no room.
-func (s *Server) makeRoomLocked(root string) bool {
-	if a := s.accounts[root]; a != nil && a.principals >= s.opt.MaxPrincipalsPerRoot {
-		if !s.dropOldestLocked(func(p *principal) bool { return p.acct == a }) {
-			return false
-		}
-	}
+// makeRoomLocked drops users to make room for one more: the least
+// recently seen of all beyond MaxPrincipals, never one with a request in
+// flight. False: there is no room.
+func (s *Server) makeRoomLocked() bool {
 	for len(s.principals) >= s.opt.MaxPrincipals {
-		if !s.dropOldestLocked(func(*principal) bool { return true }) {
+		var old *principal
+		for _, p := range s.principals {
+			if p.inflight == 0 && (old == nil || p.used.Before(old.used)) {
+				old = p
+			}
+		}
+		if old == nil {
 			return false
 		}
+		s.dropPrincipalLocked(old)
 	}
 	return true
 }
 
-func (s *Server) dropOldestLocked(which func(*principal) bool) bool {
-	var old *principal
-	for _, p := range s.principals {
-		if p.inflight == 0 && which(p) && (old == nil || p.used.Before(old.used)) {
-			old = p
+// tokenRoomLocked drops p's tokens to make room for one more: the least
+// recently used beyond MaxTokensPerPrincipal, never one with a request in
+// flight, which is verified again when it comes back. False: there is no
+// room.
+func (s *Server) tokenRoomLocked(p *principal) bool {
+	for len(p.toks) >= s.opt.MaxTokensPerPrincipal {
+		var old *token
+		for tk := range p.toks {
+			if tk.inflight == 0 && (old == nil || tk.used.Before(old.used)) {
+				old = tk
+			}
 		}
+		if old == nil {
+			return false
+		}
+		s.dropTokenLocked(old)
 	}
-	if old == nil {
-		return false
-	}
-	s.dropLocked(old)
 	return true
 }
 
-// dropLocked forgets principal p: its locks and scratch files (its
-// records of what it was served stay, by principal, until they age out).
-func (s *Server) dropLocked(p *principal) {
-	delete(s.principals, p.id)
-	s.scratchTotal.Add(-int64(p.dropScratch()))
-	if p.acct.principals--; p.acct.principals <= 0 {
-		delete(s.accounts, p.acct.root)
+// dropTokenLocked forgets token tk: its next request is verified again.
+// Its user's state stays. A request of it still in flight finishes.
+func (s *Server) dropTokenLocked(tk *token) {
+	if s.tokens[tk.id] == tk {
+		delete(s.tokens, tk.id)
 	}
+	delete(tk.p.toks, tk)
 }
 
-// sweep drops idle scratch files, and idle principals of a gateway, at
-// most once a minute.
+// dropPrincipalLocked forgets user p: its tokens, locks and scratch files
+// (its records of what it was served stay, by user, until they age out).
+func (s *Server) dropPrincipalLocked(p *principal) {
+	delete(s.principals, p.id)
+	for tk := range p.toks {
+		s.dropTokenLocked(tk)
+	}
+	s.scratchTotal.Add(-int64(p.dropScratch()))
+}
+
+// sweep drops idle scratch files, and a gateway's idle tokens (unused for
+// VerifyEvery, verified again if they come back) and users (ScratchIdle),
+// at most once a minute.
 func (s *Server) sweep() {
 	now := s.opt.Now()
 	s.mu.Lock()
@@ -987,13 +991,18 @@ func (s *Server) sweep() {
 		return
 	}
 	s.lastSweep = now
+	for _, tk := range s.tokens {
+		if tk.inflight == 0 && now.Sub(tk.used) > s.opt.VerifyEvery {
+			s.dropTokenLocked(tk)
+		}
+	}
 	ps := make([]*principal, 0, len(s.principals)+1)
 	if s.local != nil {
-		ps = append(ps, s.local)
+		ps = append(ps, s.local.p)
 	}
 	for _, p := range s.principals {
 		if p.inflight == 0 && now.Sub(p.used) > s.opt.ScratchIdle {
-			s.dropLocked(p)
+			s.dropPrincipalLocked(p)
 			continue
 		}
 		ps = append(ps, p)
@@ -1007,69 +1016,83 @@ func (s *Server) sweep() {
 	s.recMu.Unlock()
 }
 
-// account is what the principals of one grant root share: their number
-// and the bounds on their scratch files. A root is signed by a key of a
-// namespace's (Addendum C), so only its issuers make new ones; attenuating
-// a grant offline makes a new token, a new principal, of the same root.
-type account struct {
-	root       string
-	principals int // under Server.mu
-
-	mu           sync.Mutex
-	files, bytes int   // scratch
-	locks        int   // its principals' locks
-	inflight     int64 // bytes of written files being buffered
-}
-
-// hold reserves n bytes of written files being buffered, within max.
-func (a *account) hold(n, max int64) bool {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.inflight+n > max {
+// hold reserves n bytes of written files being buffered for p, within
+// max.
+func (p *principal) hold(n, max int64) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.held+n > max {
 		return false
 	}
-	a.inflight += n
+	p.held += n
 	return true
 }
 
-func (a *account) release(n int64) {
-	a.mu.Lock()
-	a.inflight -= n
-	a.mu.Unlock()
+func (p *principal) unhold(n int64) {
+	p.mu.Lock()
+	p.held -= n
+	p.mu.Unlock()
 }
 
-// rootInflight is how many bytes of written files one grant root's
-// requests buffer at once: in a gateway, a share of InflightBytes, so
-// one user's stalled uploads don't refuse everyone's writes.
-func (s *Server) rootInflight() int64 {
+// userInflight is how many bytes of written files one user's requests
+// buffer at once: in a gateway, a share of InflightBytes, so one user's
+// stalled uploads don't refuse everyone's writes.
+func (s *Server) userInflight() int64 {
 	if !s.opt.Gateway {
 		return int64(s.opt.InflightBytes)
 	}
 	return int64(max(s.opt.MaxFileSize, s.opt.MaxRawSize, s.opt.InflightBytes/4))
 }
 
-// principal is what the server keeps for one upstream grant: its client,
-// locks and scratch files. Nothing of it is shared with another
-// principal; its records (records.go) are kept by its id.
-type principal struct {
-	id    string
-	c     *client.Client
-	locks webdav.LockSystem
-	acct  *account
+// token is one bearer: in a gateway, a grant the core verified (verify),
+// with the client sending it, the served namespaces it names, and what
+// was read with it, since another token of the same user may read less
+// (attenuated offline): writers' settings and namespace documents
+// (nsInfo), catalogs' trees. What is kept for its user is in its
+// principal, shared by every token of the user (§H.7).
+type token struct {
+	id string
+	c  *client.Client
+	p  *principal
 	// named: in a gateway, whether the grant names each served namespace
 	// (§C.2); nil in local mode, whose grant the operator chose them for.
 	named map[string]bool
 
-	// under Server.mu
+	// under Server.mu; verified zero: ask the core again at the next
+	// request
 	used, verified time.Time
 	inflight       int
 
 	mu      sync.Mutex
+	writers map[string]writerAt // by namespace: §7.4's writer block
+	docs    map[string]nsDocAt  // by namespace: what its document says
+	cats    map[string]*catGraph
+}
+
+func (s *Server) newToken(id string, c *client.Client, p *principal, named map[string]bool) *token {
+	return &token{id: id, c: c, p: p, named: named, used: s.opt.Now(), writers: map[string]writerAt{}, docs: map[string]nsDocAt{},
+		cats: map[string]*catGraph{}}
+}
+
+// principal is a user as the server keeps state for them (§H.7): their
+// locks, scratch files, dead properties, guards, recent deletes and moves
+// aside, within bounds; their records (records.go) are kept by its id,
+// apart and for longer. In a gateway, every token the core verified as
+// theirs (userKey) shares it; in local mode, there is one.
+type principal struct {
+	id    string // userKey; "local" in local mode
+	locks webdav.LockSystem
+
+	// under Server.mu
+	used     time.Time
+	inflight int             // requests in flight, over its tokens
+	toks     map[*token]bool // its tokens kept
+
+	mu      sync.Mutex
 	scratch map[string]*scratchFile // by path
 	sbytes  int
+	held    int64 // bytes of written files being buffered (hold)
 	dropped bool
-	ns      map[string]nsInfo
-	cats    map[string]*catGraph
 	locked  map[string]heldLock   // by token: its locks
 	props   map[string]*propSet   // by path: its dead properties (PROPPATCH)
 	pbytes  int                   // what props cost
@@ -1078,30 +1101,6 @@ type principal struct {
 	aside   map[string]time.Time  // documents' paths moved aside to a backup, and when
 	guards  map[string][]guard    // by document path: its refused saves' guards, oldest first
 	nguards int
-	own     lru.Cache[string, bool] // by ns/name@id: the tombstones and restores it wrote
-}
-
-// maxOwn bounds the tombstones and restores a principal remembers having
-// written (ownEntry).
-const maxOwn = 1 << 12
-
-// markOwn remembers that the principal wrote entry id of ns/name, a
-// tombstone or a restore: one between a save's base and the head is no
-// delete or restore by someone else (§11.3, §H.4).
-func (p *principal) markOwn(ns, name, id string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.own.Put(ns+"/"+name+"@"+id, true, 1)
-}
-
-// ownEntry reports whether the principal wrote entry id of ns/name, as
-// far as it remembers (markOwn): one it forgot counts as someone else's,
-// which a save from before refuses (a reload settles it).
-func (p *principal) ownEntry(ns, name, id string) bool {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	_, ok := p.own.Get(ns + "/" + name + "@" + id)
-	return ok
 }
 
 // asideFor is how soon after the principal moved a document aside to a
@@ -1330,21 +1329,20 @@ func (p *principal) guarded(path string, now time.Time) bool {
 	return len(p.guards[path]) > 0
 }
 
-func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
-	p := &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
-		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, locked: map[string]heldLock{}, props: map[string]*propSet{}, deletes: map[string]ownDelete{},
+func (s *Server) newPrincipal(id string) *principal {
+	return &principal{id: id, locks: webdav.NewMemLS(), toks: map[*token]bool{}, scratch: map[string]*scratchFile{},
+		locked: map[string]heldLock{}, props: map[string]*propSet{}, deletes: map[string]ownDelete{},
 		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now()}
-	p.own.MaxEntries = maxOwn
-	return p
 }
 
-// reqState is one request's view, in its context: the principal, what
-// the request is (MOVE and COPY destinations change what RemoveAll does,
+// reqState is one request's view, in its context: the token and its
+// user, what the request is (MOVE and COPY destinations change what RemoveAll does,
 // a PUT's preconditions what it writes), what it read already, and the
 // error to answer with.
 type reqState struct {
 	s      *Server
-	p      *principal
+	tk     *token
+	p      *principal // tk's user
 	method string
 	path   string
 	dst    string
@@ -1397,7 +1395,11 @@ func state(ctx context.Context) *reqState {
 // record keeps err for errWriter if it is a davError, and returns it.
 // Another failure (no such file) leaves the answer to the handler. In
 // local mode the core's 401 refuses the server's own grant, not the
-// user's password, so it is a 502 rather than a new login prompt.
+// user's password, so it is a 502 rather than a new login prompt; in a
+// gateway it refuses the token (revoked since it was verified), which is
+// verified again at its next request. A refusal over a writer's settings
+// (frozen, a nonce, a limit, §7.4 writer) drops the token's, read again
+// for the next write.
 func (st *reqState) record(err error) error {
 	if err == nil {
 		return nil
@@ -1407,8 +1409,16 @@ func (st *reqState) record(err error) error {
 		st.err = nil
 		return err
 	}
-	if de.status == http.StatusUnauthorized && !st.s.opt.Gateway {
+	if de.refresh {
+		st.tk.forgetWriters()
+	}
+	switch {
+	case de.status == http.StatusUnauthorized && !st.s.opt.Gateway:
 		de = &davError{status: http.StatusBadGateway, msg: "the core refused this server's grant (-bearer): " + de.msg, cause: de.cause}
+	case de.status == http.StatusUnauthorized:
+		st.s.mu.Lock()
+		st.tk.verified = time.Time{}
+		st.s.mu.Unlock()
 	}
 	st.err = de
 	return de

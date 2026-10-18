@@ -49,7 +49,7 @@ func authEnv(t *testing.T, gateway bool, with ...func(*dav.Options)) (*env, clie
 // Gateway mode: the Basic password is the grant, sent upstream, so the
 // revision is the grant's subject's; no grant, one that isn't, or one the
 // core refuses is 401 with a Basic challenge; one without write is 403.
-// Scratch files are per grant.
+// Scratch files are per user (§H.7).
 func TestGateway(t *testing.T) {
 	t.Parallel()
 	e, k := authEnv(t, true)
@@ -81,7 +81,7 @@ func TestGateway(t *testing.T) {
 	}
 	sameStrings(t, "bob's listing", names(e.propfindAs(bob, "/docs/"), "/docs/"), []string{"a.json"})
 
-	// Scratch files are each grant's own.
+	// Scratch files are each user's own.
 	e.expect(e.doAs(alice, "PUT", "/docs/.a.json.swp", "alice's swap"), 201, "alice's scratch")
 	sameStrings(t, "alice's listing", names(e.propfindAs(alice, "/docs/"), "/docs/"), []string{".a.json.swp", "a.json"})
 	sameStrings(t, "bob's listing", names(e.propfindAs(bob, "/docs/"), "/docs/"), []string{"a.json"})
@@ -129,8 +129,8 @@ func TestLocalMode(t *testing.T) {
 	}
 }
 
-// A gateway keeps MaxPrincipals principals, dropping the least recently
-// seen with its scratch files.
+// A gateway keeps MaxPrincipals users, dropping the least recently seen
+// with its scratch files.
 func TestGatewayEviction(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
@@ -153,8 +153,8 @@ func TestGatewayEviction(t *testing.T) {
 			t.Fatalf("%s's scratch %q", u, r.body)
 		}
 	}
-	// b comes back as a new principal, without its scratch file (and a,
-	// now the least recently seen, goes).
+	// b comes back as a new user, without its scratch file (and a, now
+	// the least recently seen, goes).
 	e.expect(e.doAs(g["b"], "GET", "/docs/scratch.swp", ""), 404, "b, dropped")
 }
 
@@ -191,14 +191,16 @@ func TestGatewayVerifies(t *testing.T) {
 	g.expect(g.doAs(carol, "PUT", "/pub/a.json", `{"by": "carol"}`), 201, "and its write")
 }
 
-// Tokens of one grant root (attenuated offline, or minted again) share
-// MaxPrincipalsPerRoot, so many of them push out only their own; a
-// principal with a request in flight isn't pushed out, nor its scratch
-// bytes lost to the server's budget.
+// Tokens of one person (attenuated offline, or minted again) are one user,
+// with one scratch store, and at most MaxTokensPerPrincipal of them are
+// kept: more push out only that user's tokens, never another user's
+// state, and one pushed out is verified again when it comes back, to the
+// same state. A user with a request in flight isn't pushed out, nor its
+// scratch bytes lost to the server's budget.
 func TestGatewayBounds(t *testing.T) {
 	t.Parallel()
 	e, k := authEnv(t, true, func(o *dav.Options) {
-		o.MaxPrincipals, o.MaxPrincipalsPerRoot = 3, 2
+		o.MaxPrincipals, o.MaxTokensPerPrincipal = 3, 2
 		o.ScratchTotal, o.ScratchBytes, o.MaxFileSize = 3<<20, 2<<20, 2<<20
 	})
 	now := e.s.Now()
@@ -211,7 +213,11 @@ func TestGatewayBounds(t *testing.T) {
 		e.expect(e.doAs(a, "PUT", "/docs/alice.swp", "a"+strconv.Itoa(i)), 201, "alice's scratch")
 	}
 	e.expect(e.doAs(bob, "GET", "/docs/bob.swp", ""), 200, "bob's, kept")
-	e.expect(e.doAs(alices[2], "GET", "/docs/alice.swp", ""), 200, "alice's latest, kept")
+	for i := range alices {
+		if r := e.expect(e.doAs(alices[i], "GET", "/docs/alice.swp", ""), 200, "alice's"); r.body != "a2" {
+			t.Fatalf("alice's scratch file through token %d: %q", i, r.body)
+		}
+	}
 
 	// p's PUT is in flight while two others come and go.
 	p := k.Grant(t, now, "user:p", []string{"docs"}, []string{"read"})
@@ -316,8 +322,8 @@ func TestGatewayScopeRefused(t *testing.T) {
 	g.expect(g.doAs(ok, "PUT", "/scoped/.swp", "x"), 201, "a grant within the key's scope")
 }
 
-// Asked again, a grant the key's scope no longer covers is refused, and
-// what was kept for it goes, as for a revoked one.
+// Asked again, a grant the key's scope no longer covers is refused, as a
+// revoked one is (TestGatewayRevokedToken).
 func TestGatewayReverify(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
@@ -375,10 +381,12 @@ func TestGatewayPublicityChange(t *testing.T) {
 	e.expect(e.doAs(carol, "PUT", "/docs/.swp", "x"), 201, "a valid one")
 }
 
-// A grant root is the namespace that verified it with its key's kid and
-// the subject: a key of the same kid in another served namespace mints
-// grants of another root, which don't push out the first one's
-// principals nor fill its scratch quota.
+// A user is the sub and kid GET /ns/{ns}/principal names, with the
+// namespace whose key verified the grant (a kid names a key of one
+// namespace's document): a key of the same kid in another served
+// namespace mints grants for the same sub that are another user's, which
+// share none of the first one's state, push out none of its tokens, nor
+// fill its scratch quota.
 func TestGatewayRootPerNamespace(t *testing.T) {
 	t.Parallel()
 	e, k := authEnv(t, true)
@@ -386,7 +394,7 @@ func TestGatewayRootPerNamespace(t *testing.T) {
 	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "other")))
 	must(op.CreateNamespace(e.ctx, "other", map[string]any{"read": "grant", "keys": []any{evil.Entry("*")}}))
 	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"docs", "other"}, Gateway: true, Logf: t.Logf,
-		MaxPrincipalsPerRoot: 2, ScratchBytes: 1 << 20, MaxFileSize: 1 << 20}))
+		MaxTokensPerPrincipal: 2, ScratchBytes: 1 << 20, MaxFileSize: 1 << 20}))
 	hs := httptest.NewServer(srv)
 	defer hs.Close()
 	g := &env{t: t, ctx: e.ctx, s: e.s, c: e.c, dav: hs}

@@ -71,7 +71,7 @@ func TestWholeRange(t *testing.T) {
 // time, at most maxGuards, the oldest going first.
 func TestGuards(t *testing.T) {
 	s := &Server{opt: Options{Now: time.Now}}
-	p := s.newPrincipal("p", nil, &account{})
+	p := s.newPrincipal("p")
 	now := time.Now()
 	for i := 0; i < 3; i++ {
 		p.noteRefusedSave("/a", 400, now)

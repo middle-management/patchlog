@@ -111,7 +111,7 @@ func taken(ns, name string) error {
 // one edited: the edit from its base (base) to v, rebased on the head and
 // appended with If-Match (§11.3, §H.4).
 func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body []byte, o saveOpts) (string, bool, error) {
-	in := st.s.nsInfo(ctx, st.p, ns)
+	in := st.s.nsInfo(ctx, st.tk, ns)
 	if in.sealed {
 		return "", false, notOffered(ns)
 	}
@@ -121,7 +121,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 	var rev string
 	var exact bool
 	err := st.retrying(ctx, func() (bool, error) {
-		h, err := st.p.c.Head(ctx, ns, name)
+		h, err := st.tk.c.Head(ctx, ns, name)
 		if err != nil {
 			return false, err
 		}
@@ -154,7 +154,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 				doc = dropNonce(v)
 			}
 			ps = withNonce(in, doc, client.GenesisPatches(doc))
-			res, err = st.p.c.Create(ctx, ns, name, ps)
+			res, err = st.tk.c.Create(ctx, ns, name, ps)
 			err = tooLarge(err, true)
 		} else if parent, ps, out, atBase, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
 			// Over opsPerSet or patchSetSize, a restore from the version
@@ -167,14 +167,14 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			if whole {
 				ps = wholeDoc(in, parent, out)
 			}
-			res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
+			res, err = st.tk.c.Restore(ctx, ns, name, h.ID, ps)
 			if atBase && !whole && setTooLarge(err) {
 				ps = wholeDoc(in, parent, out)
-				res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
+				res, err = st.tk.c.Restore(ctx, ns, name, h.ID, ps)
 			}
 			err = tooLarge(err, atBase)
 			if err == nil {
-				st.p.markOwn(ns, name, res.ID)
+				st.s.markOwn(st.p, ns, name, res.ID)
 			}
 		} else {
 			return false, err
@@ -236,14 +236,14 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 // make a new file; else nil: a new file.
 func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	own := st.p.deletedOwn(ns, name, h.ID, st.s.opt.Now())
-	if !own && !st.p.ownEntry(ns, name, h.ID) && st.hasBase(ns, name) {
+	if !own && !st.s.ownEntry(st.p, ns, name, h.ID) && st.hasBase(ns, name) {
 		st.s.refuse(st.p, ns, name)
 		return nil, fail(http.StatusConflict, "%s/%s was deleted by someone else since you opened it (§11.3, §H.4): your save isn't written over the delete; reload it (it reads as gone), and save it again to make it anew", ns, name)
 	}
 	if !own || h.Last == "" || h.Successor != "" {
 		return nil, nil
 	}
-	last, err := st.s.doc(ctx, st.p, ns, name, h.Last)
+	last, err := st.s.doc(ctx, st.tk, ns, name, h.Last)
 	switch {
 	case pruned(err):
 		return nil, nil
@@ -276,7 +276,7 @@ func (st *reqState) hasBase(ns, name string) bool {
 // merged one is 413, unsent where the gateway knows the limit (setOver).
 // retry: the head moved (412), read it again.
 func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, v any, body []byte) (string, bool, bool, error) {
-	cur, err := st.s.doc(ctx, st.p, ns, name, head)
+	cur, err := st.s.doc(ctx, st.tk, ns, name, head)
 	switch {
 	case err != nil:
 		return "", false, false, err
@@ -310,10 +310,10 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	if whole {
 		ps = wholeDoc(in, cur.value, out)
 	}
-	res, err := st.p.c.Append(ctx, ns, name, head, ps)
+	res, err := st.tk.c.Append(ctx, ns, name, head, ps)
 	if atHead && !whole && setTooLarge(err) {
 		ps = wholeDoc(in, cur.value, out)
-		res, err = st.p.c.Append(ctx, ns, name, head, ps)
+		res, err = st.tk.c.Append(ctx, ns, name, head, ps)
 	}
 	err = tooLarge(err, atHead)
 	switch {
@@ -438,7 +438,7 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 		case r.raw != nil:
 			c.doc, err = jsonv.Parse(trimBOM(r.raw))
 		default:
-			e, err := st.s.doc(ctx, st.p, ns, name, r.rev)
+			e, err := st.s.doc(ctx, st.tk, ns, name, r.rev)
 			switch {
 			case pruned(err):
 				goneErr = err
@@ -678,14 +678,14 @@ func (st *reqState) spans(ctx context.Context, ns, name, headRev string, cs []ca
 		if _, ok := out[from]; ok {
 			continue
 		}
-		es, err := st.p.c.Log(ctx, ns, name, headRev, from)
+		es, err := st.tk.c.Log(ctx, ns, name, headRev, from)
 		if pruned(err) {
 			return nil, gone()
 		}
 		if err != nil {
 			return nil, err
 		}
-		base, err := st.s.doc(ctx, st.p, ns, name, from)
+		base, err := st.s.doc(ctx, st.tk, ns, name, from)
 		switch {
 		case pruned(err):
 			return nil, gone()
@@ -704,7 +704,7 @@ func (st *reqState) spans(ctx context.Context, ns, name, headRev string, cs []ca
 			if need[es[i].ID] {
 				out[es[i].ID] = span{writes: append([]pointer.Pointer(nil), acc.writes...), foreign: acc.foreign}
 			}
-			if st.p.ownEntry(ns, name, es[i].ID) || wroteRev(cs, es[i].ID) {
+			if st.s.ownEntry(st.p, ns, name, es[i].ID) || wroteRev(cs, es[i].ID) {
 				// The principal's own: what it changed is in the head
 				// (rebase's diff), and its own to change again (unsafe).
 				continue
@@ -978,7 +978,7 @@ func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer
 		}
 	}
 	st.committed = true
-	st.p.markOwn(ns, name, res.ID)
+	st.s.markOwn(st.p, ns, name, res.ID)
 	exact := doc != nil && same(doc)
 	r := record{rev: res.ID, wrote: true, paths: paths}
 	var e *docEntry
@@ -1069,12 +1069,12 @@ const mergedNote = "; your save was merged with others' edits made since your ve
 // with If-Match on tomb), after the write meant to restore it failed with
 // err, which it returns, saying so.
 func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb string, err error) error {
-	res, rerr := st.p.c.Restore(ctx, ns, name, tomb, withNonce(in, nil, []any{}))
+	res, rerr := st.tk.c.Restore(ctx, ns, name, tomb, withNonce(in, nil, []any{}))
 	if rerr != nil {
 		st.s.opt.Logf("dav: %s/%s: restoring it as it was after a refused save: %v", ns, name, rerr)
 		return err
 	}
-	st.p.markOwn(ns, name, res.ID)
+	st.s.markOwn(st.p, ns, name, res.ID)
 	st.p.forgetDelete(ns, name)
 	st.undeleted = true
 	de, ok := upstream(err).(*davError)
@@ -1120,11 +1120,11 @@ func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) erro
 		if !st.p.deletedOwn(r.ns, r.name, "", st.s.opt.Now()) {
 			continue
 		}
-		h, herr := st.p.c.Head(ctx, r.ns, r.name)
+		h, herr := st.tk.c.Head(ctx, r.ns, r.name)
 		if herr != nil || h.State != client.Tombstoned || !st.p.deletedOwn(r.ns, r.name, h.ID, st.s.opt.Now()) {
 			continue
 		}
-		err = st.undelete(ctx, st.s.nsInfo(ctx, st.p, r.ns), r.ns, r.name, h.ID, err)
+		err = st.undelete(ctx, st.s.nsInfo(ctx, st.tk, r.ns), r.ns, r.name, h.ID, err)
 		st.changed()
 	}
 	return err
@@ -1136,12 +1136,12 @@ func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) erro
 // the new version restores it from them (restorePatches), or as it was if
 // that write is refused.
 func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) (string, error) {
-	if st.s.nsInfo(ctx, st.p, ns).sealed {
+	if st.s.nsInfo(ctx, st.tk, ns).sealed {
 		return "", notOffered(ns)
 	}
 	var tomb string
 	err := st.retrying(ctx, func() (bool, error) {
-		h, err := st.p.c.Head(ctx, ns, name)
+		h, err := st.tk.c.Head(ctx, ns, name)
 		if err != nil {
 			return false, err
 		}
@@ -1151,13 +1151,13 @@ func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) (st
 		if ifMatch != "" && h.ID != ifMatch {
 			return false, fail(http.StatusPreconditionFailed, "%s/%s changed since %s (If-Match); reload it", ns, name, ifMatch)
 		}
-		res, err := st.p.c.Delete(ctx, ns, name, h.ID)
+		res, err := st.tk.c.Delete(ctx, ns, name, h.ID)
 		if client.IsStale(err) {
 			return true, nil
 		}
 		if err == nil {
 			tomb = res.ID
-			st.p.markOwn(ns, name, res.ID)
+			st.s.markOwn(st.p, ns, name, res.ID)
 			st.p.noteDelete(ns, name, res.ID, st.s.opt.Now())
 		}
 		return false, err

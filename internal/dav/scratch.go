@@ -19,7 +19,7 @@ import (
 // kind (a LOCK of a new name, a 0-byte PUT of a new .json name,
 // holdEmpty); and scratch directories, which apps save through (a dot, macOS's
 // "(A Document Being Saved By …)", mayScratchDir). They live in memory,
-// per principal and path, bounded per grant root, and expire when left
+// per user (§H.6, §H.7) and path, bounded per user, and expire when left
 // untouched for ScratchIdle. They are never written to the core: moving
 // one onto a document name is how editors save.
 
@@ -85,8 +85,8 @@ func (st *reqState) touchLocked(name string, now time.Time) {
 }
 
 // scratchPut stores data, uploaded as ctype, at name, within the bounds of
-// the principal's grant root and the server's (507 beyond them, 413 for
-// one file over MaxFileSize).
+// the user and the server (507 beyond them, 413 for one file over
+// MaxFileSize).
 func (st *reqState) scratchPut(name string, data []byte, ctype string) error {
 	return st.scratchSet(name, &scratchFile{data: data, ctype: ctype})
 }
@@ -104,14 +104,15 @@ func (st *reqState) scratchMkdir(name string) error {
 }
 
 // mayKeep refuses a scratch file or directory at name in a served
-// namespace the principal's grant doesn't name: the server would keep it
-// there for a user who can't list the namespace, nor write to it.
+// namespace the request's grant doesn't name: the server would keep it
+// there for a user who can't list the namespace, nor write to it with
+// this token.
 func (st *reqState) mayKeep(name string) error {
-	if st.p.named == nil {
+	if st.tk.named == nil {
 		return nil
 	}
 	ns, _, _ := strings.Cut(strings.TrimPrefix(name, "/"), "/")
-	if (st.s.flat[ns] || st.s.cats[ns]) && !st.p.named[ns] {
+	if (st.s.flat[ns] || st.s.cats[ns]) && !st.tk.named[ns] {
 		return fail(http.StatusForbidden, "your grant doesn't name namespace %s: nothing is kept there for you (temporary files included)", ns)
 	}
 	return nil
@@ -160,39 +161,31 @@ func (st *reqState) scratchSet(name string, f *scratchFile) error {
 // reserveLocked accounts for n bytes in place of old (nil: one more file)
 // within the bounds.
 func (st *reqState) reserveLocked(old *scratchFile, n int) error {
-	s, p, a := st.s, st.p, st.p.acct
+	s, p := st.s, st.p
 	delta, files := n, 1
 	if old != nil {
 		delta, files = n-len(old.data), 0
 	}
-	a.mu.Lock()
-	defer a.mu.Unlock()
-	if a.files+files > s.opt.ScratchFiles {
+	if len(p.scratch)+files > s.opt.ScratchFiles {
 		return fail(http.StatusInsufficientStorage, "at most %d temporary files and folders (editors' and systems' own, kept in memory, §H.6) are kept per user", s.opt.ScratchFiles)
 	}
-	if delta > 0 && a.bytes+delta > s.opt.ScratchBytes {
+	if delta > 0 && p.sbytes+delta > s.opt.ScratchBytes {
 		return fail(http.StatusInsufficientStorage, "at most %d bytes of temporary files are kept per user", s.opt.ScratchBytes)
 	}
 	if s.scratchTotal.Add(int64(delta)) > int64(s.opt.ScratchTotal) && delta > 0 {
 		s.scratchTotal.Add(-int64(delta))
 		return fail(http.StatusInsufficientStorage, "the server keeps no more temporary files")
 	}
-	a.files += files
-	a.bytes += delta
 	p.sbytes += delta
 	return nil
 }
 
 // releaseLocked drops name, f, from the scratch store and its bounds.
 func (st *reqState) releaseLocked(name string, f *scratchFile) {
-	p, a := st.p, st.p.acct
+	p := st.p
 	delete(p.scratch, name)
 	p.sbytes -= len(f.data)
 	st.s.scratchTotal.Add(-int64(len(f.data)))
-	a.mu.Lock()
-	a.files--
-	a.bytes -= len(f.data)
-	a.mu.Unlock()
 }
 
 // evictJunkLocked drops the least recently used junk file but keep, false
@@ -438,18 +431,13 @@ func (p *principal) moveProps(from, to string) {
 	}
 }
 
-// dropScratch drops every scratch file and lock of a principal being
+// dropScratch drops every scratch file and lock of a user being
 // forgotten, returning the files' bytes; nothing is stored for it
 // afterwards (a request still in flight gets a 503).
 func (p *principal) dropScratch() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := p.sbytes
-	p.acct.mu.Lock()
-	p.acct.files -= len(p.scratch)
-	p.acct.bytes -= n
-	p.acct.locks -= len(p.locked)
-	p.acct.mu.Unlock()
 	p.scratch, p.sbytes, p.dropped, p.locked = map[string]*scratchFile{}, 0, true, map[string]heldLock{}
 	p.props, p.pbytes = map[string]*propSet{}, 0
 	return n
@@ -460,19 +448,14 @@ func (p *principal) dropScratch() int {
 func (p *principal) expireScratch(before time.Time) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	n, files := 0, 0
+	n := 0
 	for name, f := range p.scratch {
 		if f.used.Before(before) {
 			delete(p.scratch, name)
 			n += len(f.data)
-			files++
 		}
 	}
 	p.sbytes -= n
-	p.acct.mu.Lock()
-	p.acct.files -= files
-	p.acct.bytes -= n
-	p.acct.mu.Unlock()
 	for k, ps := range p.props {
 		if ps.at.Before(before) {
 			p.pbytes -= ps.bytes

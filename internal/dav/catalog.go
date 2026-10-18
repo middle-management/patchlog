@@ -27,7 +27,7 @@ import (
 // or a move is one append to the node (§H.5) and never touches the item.
 // New items are created in files.ns, with opaque names. The tree is built
 // from the catalog namespace's documents as the core has them
-// (tree.BuildGraph), kept per principal for CatalogTTL or until this
+// (tree.BuildGraph), kept per token for CatalogTTL or until this
 // server writes; the catalog's access ($access, §B.11) and the tree
 // service aren't consulted. catalog.mode "tree" is assumed: a node with
 // several parents (a DAG) shows under each, and is unlinked from one at a
@@ -36,8 +36,8 @@ import (
 const kindFolder = tree.KindFolder
 
 // catGraph is a catalog's live nodes: their documents and heads, and the
-// graph the tree service would build of them (§B.5), as one principal
-// read them, with the heads of their items, and the nodes' creation
+// graph the tree service would build of them (§B.5), as one token read
+// them, with the heads of their items, and the nodes' creation
 // times, as read since.
 type catGraph struct {
 	cat   string
@@ -51,25 +51,25 @@ type catGraph struct {
 	births map[string]time.Time    // by node
 }
 
-// graph returns catalog cat as the principal read it at most CatalogTTL
-// ago, and not before this server's last write.
+// graph returns catalog cat as the token read it at most CatalogTTL ago,
+// and not before this server's last write.
 func (st *reqState) graph(ctx context.Context, cat string) (*catGraph, error) {
 	if cg := st.graphs[cat]; cg != nil {
 		return cg, nil
 	}
 	now, gen := st.s.opt.Now(), st.s.gen.Load()
-	st.p.mu.Lock()
-	cg := st.p.cats[cat]
-	st.p.mu.Unlock()
+	st.tk.mu.Lock()
+	cg := st.tk.cats[cat]
+	st.tk.mu.Unlock()
 	if cg == nil || cg.gen != gen || now.Sub(cg.at) >= st.s.opt.CatalogTTL {
 		var err error
 		if cg, err = st.readGraph(ctx, cat); err != nil {
 			return nil, err
 		}
 		cg.at, cg.gen = now, gen
-		st.p.mu.Lock()
-		st.p.cats[cat] = cg
-		st.p.mu.Unlock()
+		st.tk.mu.Lock()
+		st.tk.cats[cat] = cg
+		st.tk.mu.Unlock()
 	}
 	if st.graphs == nil {
 		st.graphs = map[string]*catGraph{}
@@ -80,11 +80,11 @@ func (st *reqState) graph(ctx context.Context, cat string) (*catGraph, error) {
 
 // readGraph reads catalog cat's live nodes.
 func (st *reqState) readGraph(ctx context.Context, cat string) (*catGraph, error) {
-	hs, err := st.s.liveHeads(ctx, st.p, cat)
+	hs, err := st.s.liveHeads(ctx, st.tk, cat)
 	if err != nil {
 		return nil, err
 	}
-	docs, err := st.s.fetchHeads(ctx, st.p, hs, st.p.c.Head, true)
+	docs, err := st.s.fetchHeads(ctx, st.tk, hs, st.tk.c.Head, true)
 	if err != nil {
 		return nil, err
 	}
@@ -105,7 +105,7 @@ func (st *reqState) readGraph(ctx context.Context, cat string) (*catGraph, error
 // it has none (notTree): a catalog.files its namespace document lacks, or
 // a files.root that isn't a live folder.
 func (st *reqState) tree(ctx context.Context, cat string) (*catGraph, *treeFiles, error) {
-	in, err := st.s.nsInfoErr(ctx, st.p, cat)
+	in, err := st.s.nsInfoErr(ctx, st.tk, cat)
 	switch {
 	case err != nil:
 		return nil, nil, err
@@ -138,9 +138,9 @@ func notTree(cat, why string) error {
 // Catalogs whose document can't be read so are left to the requests that
 // open them, which answer why (404).
 func (s *Server) Check(ctx context.Context) error {
-	p := s.local
-	if p == nil {
-		p = s.newPrincipal("check", s.anon, &account{root: "check"})
+	tk := s.local
+	if tk == nil {
+		tk = s.newToken("check", s.anon, s.newPrincipal("check"), nil)
 	}
 	cats := make([]string, 0, len(s.cats))
 	for cat := range s.cats {
@@ -148,7 +148,7 @@ func (s *Server) Check(ctx context.Context) error {
 	}
 	sort.Strings(cats)
 	for _, cat := range cats {
-		in, err := s.nsInfoErr(ctx, p, cat)
+		in, err := s.nsInfoErr(ctx, tk, cat)
 		switch {
 		case err != nil:
 			s.opt.Logf("dav: catalog %s: its namespace document couldn't be read at start (%v); it is checked when opened", cat, err)
@@ -159,9 +159,9 @@ func (s *Server) Check(ctx context.Context) error {
 	return nil
 }
 
-// itemHead reads the head of a placement's item with p's client, once per
-// graph.
-func (cg *catGraph) itemHead(p *principal) func(context.Context, string, string) (*client.Head, error) {
+// itemHead reads the head of a placement's item with tk's client, once
+// per graph.
+func (cg *catGraph) itemHead(tk *token) func(context.Context, string, string) (*client.Head, error) {
 	return func(ctx context.Context, ns, name string) (*client.Head, error) {
 		k := ns + "/" + name
 		cg.mu.Lock()
@@ -170,7 +170,7 @@ func (cg *catGraph) itemHead(p *principal) func(context.Context, string, string)
 		if h != nil {
 			return h, nil
 		}
-		h, err := p.c.Head(ctx, ns, name)
+		h, err := tk.c.Head(ctx, ns, name)
 		if err != nil {
 			return nil, err
 		}
@@ -183,7 +183,7 @@ func (cg *catGraph) itemHead(p *principal) func(context.Context, string, string)
 
 // born is when node name was created, the genesis of its chain in the
 // catalog's log, read once per graph; zero if unknown (pruned, refused).
-func (cg *catGraph) born(ctx context.Context, p *principal, name string) time.Time {
+func (cg *catGraph) born(ctx context.Context, tk *token, name string) time.Time {
 	cg.mu.Lock()
 	t, ok := cg.births[name]
 	cg.mu.Unlock()
@@ -191,7 +191,7 @@ func (cg *catGraph) born(ctx context.Context, p *principal, name string) time.Ti
 		return t
 	}
 	if head := cg.heads[name]; head != "" {
-		if es, _, err := p.c.LogPage(ctx, cg.cat, name, head, ""); err == nil && len(es) > 0 && es[0].Parent == "" {
+		if es, _, err := tk.c.LogPage(ctx, cg.cat, name, head, ""); err == nil && len(es) > 0 && es[0].Parent == "" {
 			t, _ = time.Parse(time.RFC3339Nano, es[0].Created)
 		}
 	}
@@ -256,7 +256,7 @@ func (d *treeDir) find(s *Server, name string) (*treeEntry, bool) {
 
 // treeDir returns folder's children as the tree shows them (§H.2), once
 // per request: folders, and placements whose items are live, offered
-// (§H.7) and readable with the principal's grant (§B.11.5: nothing hidden
+// (§H.7) and readable with the request's grant (§B.11.5: nothing hidden
 // from it shows), each by its title, shown escaped if another tool wrote
 // one that breaks the rules (shown), a placement without one by its
 // item's name and a folder by its node's. Siblings whose names compare
@@ -274,7 +274,7 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 	sealed := map[string]bool{}
 	for _, n := range kids {
 		if _, ok := sealed[n.ItemNS]; n.Kind != kindFolder && !ok {
-			sealed[n.ItemNS] = st.s.nsInfo(ctx, st.p, n.ItemNS).sealed
+			sealed[n.ItemNS] = st.s.nsInfo(ctx, st.tk, n.ItemNS).sealed
 		}
 	}
 	heads := make([]*client.Head, len(kids))
@@ -285,7 +285,7 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 			continue
 		}
 		g.Go(func() error {
-			h, err := cg.itemHead(st.p)(gctx, n.ItemNS, n.ItemName)
+			h, err := cg.itemHead(st.tk)(gctx, n.ItemNS, n.ItemName)
 			switch {
 			case hidden(err):
 			case err != nil:
@@ -324,7 +324,7 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 		is := groups[k]
 		born := map[int]time.Time{}
 		for _, i := range is {
-			born[i] = cg.born(ctx, st.p, d.entries[i].node.Name)
+			born[i] = cg.born(ctx, st.tk, d.entries[i].node.Name)
 		}
 		sort.SliceStable(is, func(a, b int) bool {
 			if ea, eb := d.entries[is[a]].escaped, d.entries[is[b]].escaped; ea != eb {
@@ -519,10 +519,10 @@ func (st *reqState) newFile(ctx context.Context, t target, raw bool, v any, body
 	if err != nil {
 		return "", false, err
 	}
-	if !slices.Contains(st.s.nsInfo(ctx, st.p, t.ns).trust, f.ns) {
+	if !slices.Contains(st.s.nsInfo(ctx, st.tk, t.ns).trust, f.ns) {
 		return "", false, fail(http.StatusForbidden, "catalog %s doesn't trust %s, the namespace its files.ns names for new files (§H.2, §H.4): no file is created", t.ns, f.ns)
 	}
-	if st.s.nsInfo(ctx, st.p, f.ns).sealed {
+	if st.s.nsInfo(ctx, st.tk, f.ns).sealed {
 		return "", false, notOffered(f.ns)
 	}
 	item := newName()
@@ -547,7 +547,7 @@ func (st *reqState) newFile(ctx context.Context, t target, raw bool, v any, body
 		// not the client waits (§H.4): nothing else removes it.
 		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 		derr := st.retrying(dctx, func() (bool, error) {
-			_, err := st.p.c.Delete(dctx, f.ns, item, rev)
+			_, err := st.tk.c.Delete(dctx, f.ns, item, rev)
 			return false, err
 		})
 		cancel()
@@ -578,8 +578,8 @@ func (st *reqState) restoreFile(ctx context.Context, t target, raw bool, v any, 
 	if !ok || d.cat != t.ns || d.parent != t.parent {
 		return "", false, false, nil
 	}
-	in := st.s.nsInfo(ctx, st.p, d.cat)
-	h, err := st.p.c.Head(ctx, d.cat, d.node)
+	in := st.s.nsInfo(ctx, st.tk, d.cat)
+	h, err := st.tk.c.Head(ctx, d.cat, d.node)
 	if err != nil {
 		return "", false, true, err
 	}
@@ -587,18 +587,18 @@ func (st *reqState) restoreFile(ctx context.Context, t target, raw bool, v any, 
 		return "", false, false, nil
 	}
 	if d.itemTomb != "" {
-		ih, err := st.p.c.Head(ctx, d.itemNS, d.itemName)
+		ih, err := st.tk.c.Head(ctx, d.itemNS, d.itemName)
 		if err != nil {
 			return "", false, true, err
 		}
 		if ih.State != client.Tombstoned || ih.ID != d.itemTomb || ih.Successor != "" {
 			return "", false, false, nil
 		}
-		if last, err := st.s.doc(ctx, st.p, d.itemNS, d.itemName, ih.Last); err == nil && client.SuccessorOf(last.value) != "" {
+		if last, err := st.s.doc(ctx, st.tk, d.itemNS, d.itemName, ih.Last); err == nil && client.SuccessorOf(last.value) != "" {
 			return "", false, false, nil
 		}
 	}
-	if _, err := st.p.c.Restore(ctx, d.cat, d.node, d.nodeTomb, withNonce(in, nil, []any{})); err != nil {
+	if _, err := st.tk.c.Restore(ctx, d.cat, d.node, d.nodeTomb, withNonce(in, nil, []any{})); err != nil {
 		if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusForbidden || ae.Status == http.StatusGone || ae.Status == http.StatusPreconditionFailed) {
 			return "", false, false, nil
 		}
@@ -625,8 +625,8 @@ func (st *reqState) restoreFile(ctx context.Context, t target, raw bool, v any, 
 // frozen catalog, a grant that doesn't write it, or its rules refuse it
 // as they would the write.
 func (st *reqState) probeNode(ctx context.Context, cat, name string, doc map[string]any) error {
-	in := st.s.nsInfo(ctx, st.p, cat)
-	h, err := st.p.c.Head(ctx, cat, name)
+	in := st.s.nsInfo(ctx, st.tk, cat)
+	h, err := st.tk.c.Head(ctx, cat, name)
 	if err != nil {
 		return upstream(err)
 	}
@@ -643,7 +643,7 @@ func (st *reqState) probeNode(ctx context.Context, cat, name string, doc map[str
 		it.IfNoneMatch = true
 		it.Steps = []client.Step{client.PatchStep(withNonce(in, doc, client.GenesisPatches(doc)))}
 	}
-	res, err := st.p.c.Batch(ctx, cat, client.BatchRequest{Items: []client.BatchItem{it}}, true)
+	res, err := st.tk.c.Batch(ctx, cat, client.BatchRequest{Items: []client.BatchItem{it}}, true)
 	if err != nil {
 		return upstream(batchErr(err))
 	}
@@ -683,7 +683,7 @@ func (st *reqState) writable(ctx context.Context, t target) error {
 	if st.s.cats[t.docNS] || t.docNS == t.ns {
 		return fail(http.StatusForbidden, "%s is a placement of catalog node %s/%s; its file isn't written here (folders are made, renamed, moved and deleted as directories)", t.path, t.docNS, t.docName)
 	}
-	if st.s.flat[t.docNS] || slices.Contains(st.s.nsInfo(ctx, st.p, t.ns).trust, t.docNS) {
+	if st.s.flat[t.docNS] || slices.Contains(st.s.nsInfo(ctx, st.tk, t.ns).trust, t.docNS) {
 		return nil
 	}
 	return fail(http.StatusForbidden, "catalog %s doesn't trust namespace %s (§B.3), and it isn't served here (-ns): %s, a placement of %s/%s, isn't written through the catalog", t.ns, t.docNS, t.path, t.docNS, t.docName)
@@ -693,10 +693,10 @@ func (st *reqState) writable(ctx context.Context, t target) error {
 // restores it with doc if it is tombstoned (§8.2), with a fresh $nonce
 // where the catalog requires one (§H.7).
 func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[string]any) error {
-	in := st.s.nsInfo(ctx, st.p, cat)
+	in := st.s.nsInfo(ctx, st.tk, cat)
 	defer st.changed()
 	return st.retrying(ctx, func() (bool, error) {
-		h, err := st.p.c.Head(ctx, cat, name)
+		h, err := st.tk.c.Head(ctx, cat, name)
 		if err != nil {
 			return false, err
 		}
@@ -706,9 +706,9 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 		case client.Purged:
 			return false, purgedErr(cat, name)
 		case client.Tombstoned:
-			_, err = st.p.c.Restore(ctx, cat, name, h.ID, withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))
+			_, err = st.tk.c.Restore(ctx, cat, name, h.ID, withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))
 		default:
-			_, err = st.p.c.Create(ctx, cat, name, withNonce(in, doc, client.GenesisPatches(doc)))
+			_, err = st.tk.c.Create(ctx, cat, name, withNonce(in, doc, client.GenesisPatches(doc)))
 		}
 		if client.IsStale(err) || client.IsGone(err) {
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile", cat, name)
@@ -756,7 +756,7 @@ func (st *reqState) deleteFile(ctx context.Context, t target, ifMatch, successor
 		case err == nil, errors.Is(err, errNotExist):
 		case errors.As(err, &de) && de.status == http.StatusPreconditionFailed:
 			// Changed since the check: the file stays, placed, as it is.
-			st.undelete(ctx, st.s.nsInfo(ctx, st.p, t.ns), t.ns, t.node, ptomb, nil)
+			st.undelete(ctx, st.s.nsInfo(ctx, st.tk, t.ns), t.ns, t.node, ptomb, nil)
 			return de
 		case errors.As(err, &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden):
 			// The grant doesn't delete there (under tree-derived access the
@@ -779,10 +779,10 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 	if successor == "" {
 		return st.deleteDoc(ctx, ns, name, ifMatch)
 	}
-	in := st.s.nsInfo(ctx, st.p, ns)
+	in := st.s.nsInfo(ctx, st.tk, ns)
 	var tomb string
 	err := st.retrying(ctx, func() (bool, error) {
-		h, err := st.p.c.Head(ctx, ns, name)
+		h, err := st.tk.c.Head(ctx, ns, name)
 		if err != nil {
 			return false, err
 		}
@@ -792,23 +792,23 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 		if ifMatch != "" && h.ID != ifMatch {
 			return false, fail(http.StatusPreconditionFailed, "%s/%s changed since %s (If-Match); reload it", ns, name, ifMatch)
 		}
-		cur, err := st.s.doc(ctx, st.p, ns, name, h.ID)
+		cur, err := st.s.doc(ctx, st.tk, ns, name, h.ID)
 		if err != nil {
 			return false, err
 		}
 		if _, obj := cur.value.(map[string]any); !obj {
-			res, err := st.p.c.Delete(ctx, ns, name, h.ID)
+			res, err := st.tk.c.Delete(ctx, ns, name, h.ID)
 			if client.IsStale(err) {
 				return true, nil
 			}
 			if err == nil {
 				tomb = res.ID
-				st.p.markOwn(ns, name, tomb)
+				st.s.markOwn(st.p, ns, name, tomb)
 			}
 			return false, err
 		}
 		ps := withNonce(in, cur.value, []any{map[string]any{"op": "add", "path": "/$successor", "value": successor}})
-		res, err := st.p.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{{Resource: name, IfMatch: h.ID,
+		res, err := st.tk.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{{Resource: name, IfMatch: h.ID,
 			Steps: []client.Step{client.PatchStep(ps), client.DeleteStep()}}}}, false)
 		err = batchErr(err)
 		if client.IsStale(err) {
@@ -816,7 +816,7 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 		}
 		if err == nil && len(res.Items) == 1 && len(res.Items[0].IDs) == 2 {
 			tomb = res.Items[0].IDs[1]
-			st.p.markOwn(ns, name, tomb)
+			st.s.markOwn(st.p, ns, name, tomb)
 		}
 		st.committed = st.committed || err == nil
 		return false, err
@@ -831,7 +831,8 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 // one without visible children (treeDir), which a 409 names; deleting a
 // folder doesn't delete what is in it (§B.7). Placements whose items are
 // gone (dangling, §B.3) aren't contents, and are deleted first; those
-// whose items the principal can't read are neither named nor deleted. A
+// whose items the request's grant can't read are neither named nor
+// deleted. A
 // node with several parents (a DAG) is unlinked from this folder only.
 // The principal's scratch files in it go with it.
 func (st *reqState) deleteFolder(ctx context.Context, t target) error {
@@ -874,21 +875,24 @@ func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 }
 
 // dangling reports whether placement n's item is gone (§B.3): tombstoned
-// or purged, or missing from a namespace whose document the principal
-// reads (elsewhere a 404 may be the core hiding it, §7).
+// or purged, or missing from a namespace whose document the token reads
+// (elsewhere a 404 may be the core hiding it, §7).
 func (st *reqState) dangling(ctx context.Context, cg *catGraph, n *tree.Node) bool {
-	in := st.s.nsInfo(ctx, st.p, n.ItemNS)
-	if in.sealed {
+	if st.s.nsInfo(ctx, st.tk, n.ItemNS).sealed {
 		return false
 	}
-	h, err := cg.itemHead(st.p)(ctx, n.ItemNS, n.ItemName)
+	h, err := cg.itemHead(st.tk)(ctx, n.ItemNS, n.ItemName)
 	switch {
 	case err != nil:
 		return false
 	case h.State == client.Tombstoned, h.State == client.Purged:
 		return true
 	}
-	return h.State == client.NotFound && in.readErr == nil
+	if h.State != client.NotFound {
+		return false
+	}
+	d, err := st.s.nsDoc(ctx, st.tk, n.ItemNS)
+	return err == nil && d.readErr == nil
 }
 
 // moveNode renames or moves node src.node within its tree to dst (§H.5):
@@ -917,16 +921,16 @@ func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 	if moved {
 		order = cg.orderAfter(dst.parent)
 	}
-	in := st.s.nsInfo(ctx, st.p, src.ns)
+	in := st.s.nsInfo(ctx, st.tk, src.ns)
 	err = st.retrying(ctx, func() (bool, error) {
-		h, err := st.p.c.Head(ctx, src.ns, src.node)
+		h, err := st.tk.c.Head(ctx, src.ns, src.node)
 		if err != nil {
 			return false, err
 		}
 		if h.State != client.Live {
 			return false, errNotExist
 		}
-		e, err := st.s.doc(ctx, st.p, src.ns, src.node, h.ID)
+		e, err := st.s.doc(ctx, st.tk, src.ns, src.node, h.ID)
 		if err != nil {
 			return false, err
 		}
@@ -941,7 +945,7 @@ func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 		if len(ps) == 0 {
 			return false, nil
 		}
-		_, err = st.p.c.Append(ctx, src.ns, src.node, h.ID, withNonce(in, e.value, ps))
+		_, err = st.tk.c.Append(ctx, src.ns, src.node, h.ID, withNonce(in, e.value, ps))
 		if client.IsStale(err) {
 			return true, nil
 		}
@@ -1115,17 +1119,17 @@ func (st *reqState) deleteSource(ctx context.Context, src, dst target, rev, succ
 // to, ordered order: "" for to removes the entry, as does a to the node
 // is already in.
 func (st *reqState) editParents(ctx context.Context, cat, node, from, to, order string) error {
-	in := st.s.nsInfo(ctx, st.p, cat)
+	in := st.s.nsInfo(ctx, st.tk, cat)
 	defer st.changed()
 	return st.retrying(ctx, func() (bool, error) {
-		h, err := st.p.c.Head(ctx, cat, node)
+		h, err := st.tk.c.Head(ctx, cat, node)
 		if err != nil {
 			return false, err
 		}
 		if h.State != client.Live {
 			return false, errNotExist
 		}
-		e, err := st.s.doc(ctx, st.p, cat, node, h.ID)
+		e, err := st.s.doc(ctx, st.tk, cat, node, h.ID)
 		if err != nil {
 			return false, err
 		}
@@ -1134,7 +1138,7 @@ func (st *reqState) editParents(ctx context.Context, cat, node, from, to, order 
 		if len(ps) == 0 {
 			return false, nil
 		}
-		_, err = st.p.c.Append(ctx, cat, node, h.ID, withNonce(in, e.value, ps))
+		_, err = st.tk.c.Append(ctx, cat, node, h.ID, withNonce(in, e.value, ps))
 		if client.IsStale(err) {
 			return true, nil
 		}

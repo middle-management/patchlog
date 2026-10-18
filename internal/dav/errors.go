@@ -24,6 +24,10 @@ type davError struct {
 	header http.Header
 	cause  error // logged, not answered
 	frozen bool  // the core's 409 frozen: the namespace takes no writes (§8.4)
+	// refresh: the core refused a write over a writer's setting (frozen,
+	// a nonce, a limit), which the token's copy of §7.4's writer block
+	// may have had out of date (record)
+	refresh bool
 }
 
 func (e *davError) Error() string {
@@ -79,6 +83,7 @@ func limitRefusal(ae *client.APIError, more string) *davError {
 		}
 	}
 	e.msg += more
+	e.refresh = true
 	return e
 }
 
@@ -127,7 +132,7 @@ func upstream(err error) error {
 		return fail(ae.Status, "%s", msg)
 	case ae.Status == 409 && ae.Code == "frozen":
 		e := fail(http.StatusForbidden, "%s: the namespace takes no writes (§8.4)", msg)
-		e.frozen = true
+		e.frozen, e.refresh = true, true
 		if s := ae.Successor(); s != "" {
 			e.msg += "; its successor is " + s
 		}
@@ -139,7 +144,9 @@ func upstream(err error) error {
 	case ae.Status == 410:
 		return fail(http.StatusConflict, "the core answered 410: %s; reload it", msg)
 	case ae.Status == 422:
-		return fail(http.StatusUnprocessableEntity, "%s", msg)
+		e := fail(http.StatusUnprocessableEntity, "%s", msg)
+		e.refresh = ae.Code == "nonce"
+		return e
 	case ae.Status == 429:
 		return busy(ae)
 	}

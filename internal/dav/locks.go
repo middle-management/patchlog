@@ -8,20 +8,20 @@ import (
 	"golang.org/x/net/webdav"
 )
 
-// Locks live in memory, per principal (x/net/webdav's memLS), within
-// bounds: x/net/webdav keeps a lock's owner XML as sent and a lock with
-// Timeout: Infinite forever, one per path, so a read-only grant could pin
-// a body's worth of memory per document it reads.
+// Locks live in memory, per user (x/net/webdav's memLS, §H.6, §H.7), so
+// every token of one user holds them, within bounds: x/net/webdav keeps a
+// lock's owner XML as sent and a lock with Timeout: Infinite forever, one
+// per path, so a read-only grant could pin a body's worth of memory per
+// document it reads.
 
 // maxLockOwner bounds a lock's owner XML (Finder's and Windows' are under
 // a hundred bytes).
 const maxLockOwner = 1024
 
-// boundedLS is a principal's lock system, as one request uses it: owners
-// of at most maxLockOwner bytes, timeouts of at most ScratchIdle (Infinite
-// too), at most MaxLocks locks for the principal and four times that for
-// its grant root. A refusal is recorded for errWriter, as x/net/webdav
-// answers any error of Create with a 500.
+// boundedLS is a user's lock system, as one request uses it: owners of at
+// most maxLockOwner bytes, timeouts of at most ScratchIdle (Infinite too),
+// at most MaxLocks locks for the user. A refusal is recorded for
+// errWriter, as x/net/webdav answers any error of Create with a 500.
 type boundedLS struct {
 	webdav.LockSystem
 	st *reqState
@@ -44,11 +44,7 @@ func (l *boundedLS) Create(now time.Time, d webdav.LockDetails) (string, error) 
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.expireLocksLocked(now)
-	a := p.acct
-	a.mu.Lock()
-	full := len(p.locked) >= st.s.opt.MaxLocks || a.locks >= 4*st.s.opt.MaxLocks
-	a.mu.Unlock()
-	if full {
+	if len(p.locked) >= st.s.opt.MaxLocks {
 		return "", st.record(fail(http.StatusInsufficientStorage, "at most %d locks are kept per user", st.s.opt.MaxLocks))
 	}
 	tok, err := l.LockSystem.Create(now, d)
@@ -56,9 +52,6 @@ func (l *boundedLS) Create(now time.Time, d webdav.LockDetails) (string, error) 
 		return "", err
 	}
 	p.locked[tok] = heldLock{exp: now.Add(d.Duration), root: slashClean(d.Root)}
-	a.mu.Lock()
-	a.locks++
-	a.mu.Unlock()
 	return tok, nil
 }
 
@@ -83,9 +76,6 @@ func (l *boundedLS) Unlock(now time.Time, token string) error {
 	p.mu.Lock()
 	if _, ok := p.locked[token]; ok && (err == nil || err == webdav.ErrNoSuchLock) {
 		delete(p.locked, token)
-		p.acct.mu.Lock()
-		p.acct.locks--
-		p.acct.mu.Unlock()
 	}
 	p.mu.Unlock()
 	return err
@@ -126,14 +116,14 @@ func (l *boundedLS) Confirm(now time.Time, name0, name1 string, conditions ...we
 	}, nil
 }
 
-// heldLock is one of a principal's locks: when it expires, and the path
-// it was taken on.
+// heldLock is one of a user's locks: when it expires, and the path it was
+// taken on.
 type heldLock struct {
 	exp  time.Time
 	root string
 }
 
-// unlockUnder drops the principal's locks taken on name or below it: a
+// unlockUnder drops the user's locks taken on name or below it: a
 // DELETE that passed destroys them (RFC 4918 §9.6.1), and a MOVE moves no
 // lock with its source (§9.9.4), so neither is left to answer the client
 // 423 for a lock it can't hold any more.
@@ -151,9 +141,6 @@ func (p *principal) unlockUnder(name string, now time.Time) {
 		p.mu.Lock()
 		if _, ok := p.locked[tok]; ok && (err == nil || err == webdav.ErrNoSuchLock) {
 			delete(p.locked, tok)
-			p.acct.mu.Lock()
-			p.acct.locks--
-			p.acct.mu.Unlock()
 		}
 		p.mu.Unlock()
 	}
@@ -161,16 +148,9 @@ func (p *principal) unlockUnder(name string, now time.Time) {
 
 // expireLocksLocked forgets the locks of p expired by now, as memLS does.
 func (p *principal) expireLocksLocked(now time.Time) {
-	n := 0
 	for tok, h := range p.locked {
 		if !now.Before(h.exp) {
 			delete(p.locked, tok)
-			n++
 		}
-	}
-	if n > 0 {
-		p.acct.mu.Lock()
-		p.acct.locks -= n
-		p.acct.mu.Unlock()
 	}
 }
