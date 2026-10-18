@@ -20,6 +20,7 @@ import (
 	"golang.org/x/net/webdav"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/files"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 )
@@ -462,17 +463,17 @@ func (st *reqState) dirInfo(name string) *fileInfo {
 	return &fileInfo{name: name, dir: true, mode: fs.ModeDir | 0o755, mod: st.s.start}
 }
 
-// docInfo is a live document's file (§H.3): a raw file's size and type
-// are its reference's; a JSON file's size is its rendering's, or that of
-// the bytes the principal wrote, which it reads back (repr). Its time is
-// when the head was written (modTime).
+// docInfo is a live document's file (§H.3): its size and type as every
+// tool lists them (files.MetaOf), but a JSON file's size is that of the
+// bytes the principal wrote where it reads those back (repr). Its time
+// is when the head was written (modTime).
 func (st *reqState) docInfo(name string, hd headDoc) *fileInfo {
-	fi := &fileInfo{name: name, rev: hd.rev, mode: 0o644, size: hd.m.size, ctype: "application/json",
+	fi := &fileInfo{name: name, rev: hd.rev, mode: 0o644, size: hd.m.Size, ctype: hd.m.Type,
 		mod: st.s.modTime(st.p, docKey(hd.ns, hd.name, hd.rev), hd.created, hd.m.modified)}
-	if r := hd.m.raw; r != nil {
-		fi.ctype = r.typ
-	} else if b := st.s.exactOf(st.p, hd.ns, hd.name, hd.rev); b != nil {
-		fi.size = int64(len(b))
+	if hd.m.raw == nil {
+		if b := st.s.exactOf(st.p, hd.ns, hd.name, hd.rev); b != nil {
+			fi.size = int64(len(b))
+		}
 	}
 	return fi
 }
@@ -1057,11 +1058,7 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		if err != nil {
 			return err
 		}
-		ctype := "application/json"
-		if hd.m.raw != nil {
-			ctype = hd.m.raw.typ
-		}
-		if err := st.scratchPut(dst.path, b, ctype); err != nil {
+		if err := st.scratchPut(dst.path, b, hd.m.Type); err != nil {
 			return err
 		}
 		// The client takes the name for free now, and may create it
@@ -1222,7 +1219,7 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		for k, v := range m {
 			doc[k] = v
 		}
-		doc = bare(doc).(map[string]any)
+		doc = files.Bare(doc).(map[string]any)
 		if r := e.raw; r != nil {
 			typ := fileType(dst.base, r.typ)
 			if typ == r.typ {

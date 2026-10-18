@@ -4,8 +4,6 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
-
-	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // §H.1's table takes extensions in any letter case; types are lowercased,
@@ -29,27 +27,6 @@ func TestFileTypeTable(t *testing.T) {
 	} {
 		if got := fileType(c.name, c.ctype); got != c.want {
 			t.Errorf("fileType(%q, %q) = %q, want %q", c.name, c.ctype, got, c.want)
-		}
-	}
-}
-
-// A file shows a document without a top-level $nonce of the fresh form
-// and a $successor of §8.1's, and with any other value of those names,
-// which is content; names deeper down are content too.
-func TestBare(t *testing.T) {
-	t.Parallel()
-	nonce := "abcdefghijklmnopqrstuvwxyz"
-	for _, c := range []struct{ doc, want string }{
-		{`{"$nonce": "` + nonce + `", "$successor": "x", "a": 1}`, `{"a": 1}`},
-		{`{"$successor": "/r/other/x", "a": 1}`, `{"a": 1}`},
-		{`{"$nonce": 5, "$successor": "Not A Name", "a": 1}`, `{"$nonce": 5, "$successor": "Not A Name", "a": 1}`},
-		{`{"$nonce": "short", "a": {"$nonce": "` + nonce + `"}}`, `{"$nonce": "short", "a": {"$nonce": "` + nonce + `"}}`},
-		{`[{"$nonce": "` + nonce + `"}]`, `[{"$nonce": "` + nonce + `"}]`},
-		{`{"$schema": "/r/s/x/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "$nonce": "` + nonce + `"}`, `{"$schema": "/r/s/x/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`},
-	} {
-		got := bare(must(jsonv.Parse([]byte(c.doc))))
-		if want := must(jsonv.Parse([]byte(c.want))); !jsonv.Equal(got, want) {
-			t.Errorf("bare(%s) = %s, want %s", c.doc, jsonv.Canonical(got), c.want)
 		}
 	}
 }

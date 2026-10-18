@@ -1,21 +1,17 @@
 package dav
 
 import (
-	"bytes"
-	"encoding/json"
 	"mime"
 	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/middle-management/patchlog/internal/jsonv"
-	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // Files (Addendum H): a file other than a JSON file is a raw document,
 // whose root is a blob reference (§7.8) to its bytes, kept exactly; a JSON
-// file is a document, read as its rendering (§H.1).
+// file is a document, read as its rendering (§H.1), which internal/files
+// makes, as for every tool (files.Rendering, files.Bare).
 
 // extTypes is §H.1's table: a raw file's type by its name's extension, in
 // any letter case, so two tools store the same file alike.
@@ -64,45 +60,6 @@ func fileType(name, ctype string) string {
 		}
 	}
 	return "application/octet-stream"
-}
-
-// bare is a document as a file shows it (§H.1): without a top-level $nonce
-// of the fresh form (§6.4.1) and a $successor of §8.1's, which are the
-// writers' mechanics, not content. Any other value is returned as it is.
-func bare(doc any) any {
-	m, ok := doc.(map[string]any)
-	if !ok {
-		return doc
-	}
-	left := func(k string) bool {
-		v, has := m[k]
-		return has && (k == "$nonce" || k == "$successor") && schema.LeftOut(k, v)
-	}
-	if !left("$nonce") && !left("$successor") {
-		return doc
-	}
-	out := make(map[string]any, len(m))
-	for k, v := range m {
-		if !left(k) {
-			out[k] = v
-		}
-	}
-	return out
-}
-
-// render is a JSON file's rendering (§H.1): the canonical text (§3.1) of
-// the document as bare shows it, laid out as JSON.stringify(v, null, 2)
-// lays it out, with one final LF. The canonical text is laid out, never a
-// parsed object serialised again, so members keep JCS's order (keys that
-// look like array indices too), and a revision always reads as the same
-// bytes.
-func render(v any) []byte {
-	var b bytes.Buffer
-	if err := json.Indent(&b, jsonv.Canonical(bare(v)), "", "  "); err != nil {
-		panic("dav: canonical JSON doesn't indent: " + err.Error())
-	}
-	b.WriteByte('\n')
-	return b.Bytes()
 }
 
 // rawRef is a raw document's blob reference (§7.8): the file's bytes, as

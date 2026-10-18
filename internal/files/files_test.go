@@ -34,8 +34,13 @@ func TestRendering(t *testing.T) {
 		// included, as itself; structural characters inside strings and
 		// escaped quotes and backslashes don't lay anything out.
 		`{"s":"\u001f\n\"\\\u00e9\u2028😀","t":"{[,:]}","u":"a\\","v":"\\\""}`: "{\n  \"s\": \"\\u001f\\n\\\"\\\\é\u2028😀\",\n  \"t\": \"{[,:]}\",\n  \"u\": \"a\\\\\",\n  \"v\": \"\\\\\\\"\"\n}\n",
+		// Nothing is escaped for HTML or JavaScript: <, >, &, U+2029,
+		// DEL and / are themselves, as JCS writes them; the other short
+		// forms stay short, and NUL is \u0000.
+		`{"h":"<a href=\"x\">&amp;</a>","p":"\u2029\u007f/\u0000\b\f\r\t"}`: "{\n  \"h\": \"<a href=\\\"x\\\">&amp;</a>\",\n  \"p\": \"\u2029\u007f/\\u0000\\b\\f\\r\\t\"\n}\n",
 		// Numbers as ECMAScript writes them.
-		`[1e21,0.1,-0,1.5e-7,100,1E2,123456789012345,-2.5]`: "[\n  1e+21,\n  0.1,\n  0,\n  1.5e-7,\n  100,\n  100,\n  123456789012345,\n  -2.5\n]\n",
+		`[1e21,0.1,-0,1.5e-7,100,1E2,123456789012345,-2.5]`:  "[\n  1e+21,\n  0.1,\n  0,\n  1.5e-7,\n  100,\n  100,\n  123456789012345,\n  -2.5\n]\n",
+		`[1e-7,0.000001,4.35,0.1e1,9007199254740991,5e-324]`: "[\n  1e-7,\n  0.000001,\n  4.35,\n  1,\n  9007199254740991,\n  5e-324\n]\n",
 		// Empty containers stay {} and [].
 		`{"a":{},"b":[],"c":[{}],"d":[[]],"e":{"f":{}}}`: "{\n  \"a\": {},\n  \"b\": [],\n  \"c\": [\n    {}\n  ],\n  \"d\": [\n    []\n  ],\n  \"e\": {\n    \"f\": {}\n  }\n}\n",
 		`[[1,[2,[]]],[],[[[true]]]]`:                     "[\n  [\n    1,\n    [\n      2,\n      []\n    ]\n  ],\n  [],\n  [\n    [\n      [\n        true\n      ]\n    ]\n  ]\n]\n",
@@ -78,6 +83,49 @@ func TestRenderingLeavesOut(t *testing.T) {
 	Rendering(doc)
 	if _, ok := doc["$nonce"]; !ok {
 		t.Fatal("Rendering modified the document")
+	}
+}
+
+// Bare leaves out what the rendering leaves out (§H.1): a top-level
+// $nonce of the fresh form and $successor of §8.1's; any other value of
+// those names is content, as are names deeper down. Show gives the
+// rendering and the metadata MetaOf gives, alike.
+func TestBareAndShow(t *testing.T) {
+	t.Parallel()
+	nonce := strings.Repeat("a", 26)
+	for _, c := range []struct{ doc, want string }{
+		{`{"$nonce": "` + nonce + `", "$successor": "x", "a": 1}`, `{"a": 1}`},
+		{`{"$successor": "/r/other/x", "a": 1}`, `{"a": 1}`},
+		{`{"$nonce": 5, "$successor": "Not A Name", "a": 1}`, `{"$nonce": 5, "$successor": "Not A Name", "a": 1}`},
+		{`{"$nonce": "short", "a": {"$nonce": "` + nonce + `"}}`, `{"$nonce": "short", "a": {"$nonce": "` + nonce + `"}}`},
+		{`[{"$nonce": "` + nonce + `"}]`, `[{"$nonce": "` + nonce + `"}]`},
+		{`{"$schema": "/r/s/x/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "$nonce": "` + nonce + `"}`, `{"$schema": "/r/s/x/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`},
+		{`"text"`, `"text"`},
+		{`null`, `null`},
+	} {
+		doc := jsonv.MustParse([]byte(c.doc))
+		before := string(jsonv.Canonical(doc))
+		if got, want := Bare(doc), jsonv.MustParse([]byte(c.want)); !jsonv.Equal(got, want) {
+			t.Errorf("Bare(%s) = %s, want %s", c.doc, jsonv.Canonical(got), c.want)
+		}
+		if after := string(jsonv.Canonical(doc)); after != before {
+			t.Errorf("Bare modified %s: %s", before, after)
+		}
+	}
+	bid := "1" + strings.Repeat("a", 32)
+	for _, text := range []string{
+		`{"$nonce":"` + nonce + `","title":"Hi"}`,
+		`[1,{"a":[]}]`,
+		`{"$blob":"` + bid + `","type":"text/plain","size":3}`,
+	} {
+		v := jsonv.MustParse([]byte(text))
+		m, r := Show(v)
+		if m != MetaOf(v) {
+			t.Fatalf("%s: show %+v, MetaOf %+v", text, m, MetaOf(v))
+		}
+		if raw := m.Type != JSONType; raw && r != nil || !raw && !bytes.Equal(r, Rendering(v)) {
+			t.Fatalf("%s: show rendering %q", text, r)
+		}
 	}
 }
 

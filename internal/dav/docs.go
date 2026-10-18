@@ -9,16 +9,19 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/files"
 )
 
 // docEntry is a revision's document as served: rendered once, kept by
 // revision id, which never changes what it names (§3.3).
 type docEntry struct {
 	value any
-	// rendered is a JSON file's rendering (§H.1); raw is a raw file's blob
-	// reference instead (§7.8), and rendered nil.
+	// rendered is a JSON file's rendering (§H.1, files.Rendering); raw is
+	// a raw file's blob reference instead (§7.8), and rendered nil. file
+	// is its size and type as every tool lists them (files.Show, §H.3).
 	rendered []byte
 	raw      *rawRef
+	file     files.Meta
 	// modified is the revision's creation time where known: Last-Modified
 	// of its read (§7.1), or, for revisions this server wrote, the write's
 	// log entry's. Zero otherwise, as from cores that send none.
@@ -30,10 +33,8 @@ type docEntry struct {
 
 // newEntry is the entry of document v, read or written at modified.
 func newEntry(v any, modified time.Time) *docEntry {
-	e := &docEntry{value: v, modified: modified}
-	if e.raw = rawRefOf(v, client.RawBlobOf(v)); e.raw == nil {
-		e.rendered = render(v)
-	}
+	e := &docEntry{value: v, modified: modified, raw: rawRefOf(v, client.RawBlobOf(v))}
+	e.file, e.rendered = files.Show(v)
 	return e
 }
 
@@ -41,18 +42,14 @@ func newEntry(v any, modified time.Time) *docEntry {
 // its document once and kept by revision id for good, apart from the
 // documents (Server.metas), which take more room.
 type fileMeta struct {
-	raw      *rawRef // a raw file's reference; nil for a JSON file
-	size     int64   // the reference's size, or the rendering's length
-	modified time.Time
-	sealed   bool
+	files.Meta         // the reference's size and type, or the rendering's length and application/json
+	raw        *rawRef // a raw file's reference; nil for a JSON file
+	modified   time.Time
+	sealed     bool
 }
 
 func (e *docEntry) meta() fileMeta {
-	m := fileMeta{raw: e.raw, size: int64(len(e.rendered)), modified: e.modified, sealed: e.sealed}
-	if e.raw != nil {
-		m.size = e.raw.size
-	}
-	return m
+	return fileMeta{Meta: e.file, raw: e.raw, modified: e.modified, sealed: e.sealed}
 }
 
 func docKey(ns, name, rev string) string { return ns + "/" + name + "@" + rev }

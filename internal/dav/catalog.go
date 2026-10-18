@@ -1017,9 +1017,8 @@ func (st *reqState) copyOfFile(ctx context.Context, src target) (headDoc, []byte
 	if err != nil {
 		return hd, nil, err
 	}
-	st.ctype = "application/json"
+	st.ctype = hd.m.Type
 	if r := hd.m.raw; r != nil {
-		st.ctype = r.typ
 		st.copySrc = &blobSrc{ns: hd.ns, name: hd.name, ref: *r}
 	}
 	return hd, b, nil

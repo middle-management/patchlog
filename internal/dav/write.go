@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/files"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/patch"
@@ -220,7 +221,7 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 	if err != nil {
 		return nil, nil, nil, false, err
 	}
-	return last.value, withNonce(in, out, merge.Diff(bare(last.value), out)), out, atBase, nil
+	return last.value, withNonce(in, out, merge.Diff(files.Bare(last.value), out)), out, atBase, nil
 }
 
 // tombBase says how a write over tombstoned ns/name, head h, goes (§H.6
@@ -284,7 +285,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	if err != nil {
 		return "", false, false, err
 	}
-	ps := merge.Diff(bare(cur.value), out)
+	ps := merge.Diff(files.Bare(cur.value), out)
 	if len(ps) == 0 {
 		// It already reads so: nothing is written, so it is no write of
 		// the principal's (an undo would take it for one), but the
@@ -295,7 +296,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 		}
 		return head, exact, false, nil
 	}
-	paths := writesOf(bare(cur.value), ps)
+	paths := writesOf(files.Bare(cur.value), ps)
 	ps = withNonce(in, out, ps)
 	whole := atHead && overSet(in, ps)
 	if whole {
@@ -345,7 +346,7 @@ func setTooLarge(err error) bool {
 }
 
 // wholeDoc is the root replace writing out, a JSON file's document as
-// rendered (bare), over cur (§H.4, §11.3 "Overwriting on purpose"): it
+// rendered (files.Bare), over cur (§H.4, §11.3 "Overwriting on purpose"): it
 // carries cur's $successor, which the rendering leaves out, and a fresh
 // $nonce where one is needed (§C.7).
 func wholeDoc(in nsInfo, cur, out any) []any {
@@ -485,7 +486,7 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 // rebased returns v, a save of JSON file ns/name, rebased on head,
 // revision headRev (§11.3, §H.4), and whether its base is the head, the
 // same content (or none is known, and the head is the base: the file as
-// written wins). Documents are compared and written as rendered (bare),
+// written wins). Documents are compared and written as rendered (files.Bare),
 // so a $successor stays; v, head and the result are so.
 //
 // The base is the candidate (candidates) closest to v, the one its edit
@@ -513,9 +514,9 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev
 		return nil, false, err
 	}
 	for i := range cs {
-		cs[i].doc = bare(cs[i].doc)
+		cs[i].doc = files.Bare(cs[i].doc)
 	}
-	mine, head := bare(v), bare(head)
+	mine, head := files.Bare(v), files.Bare(head)
 	if lost {
 		if jsonv.Equal(mine, head) {
 			return head, true, nil
@@ -985,7 +986,7 @@ func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer
 // file as uploaded (§H.1 "Identity"): what the uploader holds is that
 // revision's, whatever its formatting, and whatever $nonce it got.
 func rendersAs(v any) func(doc any) bool {
-	return func(doc any) bool { return jsonv.Equal(bare(doc), v) }
+	return func(doc any) bool { return jsonv.Equal(files.Bare(doc), v) }
 }
 
 // retrying runs a write attempt again while it asks to (the head moved:
