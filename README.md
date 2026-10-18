@@ -29,6 +29,7 @@ and serves immutable, CDN-cacheable revisions.
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`) | §6.2, §7.1–§7.2 | ✅ (`serve -log-page-size`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
+| Reference extensions beyond the spec, proposed to it: `Last-Modified` and `Repr-Digest` on `…/rev/{id}`; `created`, `size` and `digest` on `/heads` entries | — | ✅ (see [Reference extensions](#reference-extensions-beyond-the-spec)) |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
@@ -699,6 +700,14 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   writes until it commits: a few seconds per 5 million namespace entries (about 4 s for the
   first on a local `postgres:16`). To build them without blocking, create them beforehand with
   `CREATE INDEX CONCURRENTLY` under the same names; the migration then finds them.
+- **Upgrading adds columns** `revisions.size` and `revisions.digest` (the `/heads` extension,
+  see [Reference extensions](#reference-extensions-beyond-the-spec)), on SQLite and Postgres.
+  They are nullable without a default, so adding them changes only the catalog, instantly
+  whatever the table's size, though on Postgres the `ALTER TABLE` waits for transactions
+  using `revisions` and holds back others while it does. Nothing is backfilled. Instances of
+  the previous release keep working against the migrated schema (they name their columns),
+  so a rolling upgrade is safe; heads they write, like those from before, are listed without
+  `size` and `digest` until written again.
 - **Keep transactions short.** The tailer can't move past the oldest running transaction in the
   database (its `xmin`), so one left open holds back every instance's wake-ups: set
   `idle_in_transaction_session_timeout` (e.g. `ALTER ROLE patchlog SET
@@ -2361,8 +2370,56 @@ curl -i -X PATCH $B/r/matches/derby -H "$P" -H 'If-Match: "1…"' \
 
 curl -i $B/r/matches/derby                  # 302 to /r/matches/derby/rev/{head}
 curl -L $B/r/matches/derby                  # the document
+curl -sIL $B/r/matches/derby                # its ETag, Last-Modified and Repr-Digest
 curl -L "$B/ns/matches/log"                 # the namespace log
 ```
+
+### Reference extensions beyond the spec
+
+Three additions beyond spec v0.52, proposed to it, for file-style and sync clients (a WebDAV
+gateway, for one), which compare their copies with what a deployment holds without fetching
+documents. They are additive: a client that doesn't know them is unaffected, and one that
+does treats each as optional.
+
+- **`Last-Modified`** on every `200` of `GET` and `HEAD /r/{ns}/{name}/rev/{id}`: the
+  revision's `created` time as an HTTP-date (to the second). A revision is immutable, so it
+  never changes. Sealed and e2e namespaces send it too (an e2e prune's snapshot is such a
+  `200`; other e2e revisions answer the fold redirect): timing is public at every level
+  (§E.4). Browsers may read it (it is CORS-safelisted). The origin doesn't evaluate
+  `If-Modified-Since`: `If-None-Match` with the id validates (`304`), and a CDN answers
+  `If-Modified-Since` from its own copy.
+- **`Repr-Digest: sha-256=:<base64>:`** (RFC 9530) on the same `200`s of a plain document: the
+  sha-256 of exactly the bytes served, the canonical document. Never with a JWE (sealed
+  namespaces, e2e snapshots), whose plaintext digest would be what the sealing hides; an e2e
+  namespace's keyring, served in the clear, has it. CORS exposes it. `304`s carry neither
+  header: the `ETag` already names the revision.
+- **`/ns/{ns}/rev/{ns_id}/heads` entries** (§7.4, `{ resource, kind, target }`) gain
+  `created`, the target's created time in the form log entries use, for heads and tombstones
+  (not purges: a remote branch's mirror of a resource purged at its base doesn't know it); and
+  for live heads `size` and `digest`, the byte length and `sha-256=:…:` of the canonical
+  document, exactly what `GET …/rev/{target}` serves and its `Repr-Digest` says. Never in sealed
+  or e2e namespaces, the keyring included (lengths and content hashes are what their
+  encryption, and its padding, hide: §E.2.2, §E.4), and never for tombstones. A branch lists
+  its base's values for what it reads through (the same document), a remote branch its base's
+  (§G.3). A head pruned since keeps them, as it keeps its target (`/rev/{target}` is then
+  `410`); a purge lists a purge, with none. The Go client has them as `HeadItem.Created`,
+  `Size` and `Digest`, a document's headers as `Doc.Modified` and `Doc.Digest`, and
+  `client.ReprDigest(b)` computes the form to compare a copy with.
+
+`size` and `digest` are stored, not computed, so a listing reads no document: the write that
+leaves a revision as a resource's head stores its document's length and sha-256 with it
+(`revisions.size`, `digest`), from the canonical bytes the write already holds. That is step
+7 for every resource write and batch (group commits, merges, rebases and bundle imports write
+batches), and the chains remote branches and mirrored schemas insert (§G.3). Intermediate
+steps of a multi-step item, which no entry makes a head, tombstones and e2e content (the
+server has no document, §E.3) store none. Purges clear them with the patch sets; prunes keep
+them, as they keep ids, created times and gestures (§8.6), and a restore from an archive
+moves no head. Heads written before the upgrade, or by an older instance during a rolling
+one, have none: they are listed without `size` and `digest` until the resource is written
+again. Nothing fills them in later: a `/heads` page is immutable and cached for a year, so
+values appearing in a listing already served would give one URL two answers; a backfill
+would have to fold the document of every head at every `ns_id`, not just the current ones;
+and while older instances still write, no backfill could finish. `created` was always stored.
 
 ## Grants
 
@@ -2535,7 +2592,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   their whole gate inside one write transaction.
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
-  `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, `heads.seq`, `deks`
+  `ns_config.doc`, `revisions.signature/schema_ref`, `revisions.size/digest` (a head's
+  document, for `/heads`: see [Reference extensions](#reference-extensions-beyond-the-spec)),
+  `resources.keep`, `heads.seq`, `deks`
   (wrapped data keys of encryption at rest, Addendum E.1), `epoch_keys`, `rev_epochs` and
   `sealed` (sealed namespaces, Addendum E.2); and
   for §G.3 `remote_branches` (registrations at the source: base, remote origin and name,
