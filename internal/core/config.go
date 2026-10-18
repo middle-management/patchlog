@@ -14,6 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/rules"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // Limits are the configurable limits of §6.6. Sizes are bytes; rates are
@@ -480,13 +481,13 @@ func checkKeyFields(v, prev any) *memberError {
 	return nil
 }
 
-// checkCatalog checks a catalog namespace's "catalog" (§B.6):
-// { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer },
-// and x- members.
+// checkCatalog checks a catalog namespace's "catalog" (§B.6, §7.4):
+// { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer,
+// "files"?: { "ns", "root", "folder"?, "placement"? } }, and x- members.
 func checkCatalog(v any) *memberError {
 	m, ok := v.(map[string]any)
 	if !ok {
-		return badAt(pointer.Pointer{"catalog"}, `must be { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer } (§B.6)`)
+		return badAt(pointer.Pointer{"catalog"}, `must be { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer, "files"?: { "ns", "root", "folder"?, "placement"? } } (§B.6)`)
 	}
 	for _, k := range sortedKeys(m) {
 		switch x := m[k]; {
@@ -510,9 +511,54 @@ func checkCatalog(v any) *memberError {
 			} else if _, err := pointer.Parse(t); err != nil {
 				return badAt(pointer.Pointer{"catalog", "title"}, "must be a JSON Pointer (§B.5)")
 			}
+		case k == "files":
+			if err := checkCatalogFiles(x); err != nil {
+				return err
+			}
 		case isX(k):
 		default:
 			return badAt(pointer.Pointer{"catalog", k}, `is not a known field; other members must start with "x-" (§B.6, §7.4)`)
+		}
+	}
+	return nil
+}
+
+// checkCatalogFiles checks "catalog.files", which makes a catalog a file tree
+// (§H.2): "ns" a namespace name, "root" a folder name (a resource name
+// without a dot, §B.2), "folder" and "placement" schema revision paths
+// (§6.1), and x- members. Whether the catalog trusts "ns", or the schemas
+// resolve, is the tools' to check (§H.4).
+func checkCatalogFiles(v any) *memberError {
+	at := func(k string) pointer.Pointer { return pointer.Pointer{"catalog", "files", k} }
+	m, ok := v.(map[string]any)
+	if !ok {
+		return badAt(pointer.Pointer{"catalog", "files"}, `must be { "ns", "root", "folder"?, "placement"? } (§H.2)`)
+	}
+	for _, k := range []string{"ns", "root"} {
+		if _, ok := m[k]; !ok {
+			return badAt(pointer.Pointer{"catalog", "files"}, "must have %q (§H.2)", k)
+		}
+	}
+	for _, k := range sortedKeys(m) {
+		x := m[k]
+		switch {
+		case k == "ns":
+			if s, ok := x.(string); !ok || !ValidNSName(s) {
+				return badAt(at(k), "must be a namespace name (§3.6, §H.2)")
+			}
+		case k == "root":
+			if s, ok := x.(string); !ok || !ValidResourceName(s) || strings.Contains(s, ".") {
+				return badAt(at(k), "must be a folder name: a resource name without a dot (§3.6, §B.2, §H.2)")
+			}
+		case k == "folder" || k == "placement":
+			if s, ok := x.(string); !ok {
+				return badAt(at(k), "must be a schema revision path (§6.1, §H.2)")
+			} else if _, ok := schema.ParseRef(s); !ok {
+				return badAt(at(k), "must be a schema revision path (§6.1, §H.2)")
+			}
+		case isX(k):
+		default:
+			return badAt(at(k), `is not a known field; other members must start with "x-" (§H.2, §7.4)`)
 		}
 	}
 	return nil
