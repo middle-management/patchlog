@@ -2,11 +2,14 @@
 
 ## Unreleased
 
-Implements spec **v0.54**. v0.53 restructures the text with no change in behaviour (terms
+Implements spec **v0.55**. v0.53 restructures the text with no change in behaviour (terms
 defined once in §2.1, a purged namespace's answers in one table, edge grants split into
 §C.5.2–§C.5.4); v0.54 serves file-style and sync clients, from the reference's notes 13–19:
 what this branch had added beyond v0.52 for them is now specified, outside E2 and E3 only, and
-raw documents, moves, whole-document appends and `logPageBytes` are new.
+raw documents, moves, whole-document appends and `logPageBytes` are new; v0.55 adds Addendum
+H, files, from the reference's WebDAV gateway, and in the core `GET /ns/{ns}/principal`, limit
+refusals that name the limit and the sizes, and `catalog.files`, with file metadata in the tree
+service's listings.
 
 **Changes to check before upgrading:**
 - **New columns `revisions.size` and `revisions.digest`**, added on the first start on SQLite and
@@ -39,9 +42,56 @@ raw documents, moves, whole-document appends and `logPageBytes` are new.
 - **A top-level `$successor` of the §8.1 form is left out of validation** (§6.2 step 5), the
   index's `x-index` and `x-ref` walks and the bundle closure, as `$schema` and a fresh `$nonce`
   are: closed schemas accept it, and walks that found it as a reference no longer do.
-- `GET /` answers `"spec": "0.54"`.
+- **Verification applies a key's `readScope: "resource"`** (§C.2 item 1, §C.4, v0.55): a `read`
+  grant such a key signs whose rules don't fix `/resource` (§2.1) is refused on every request,
+  `403` (`404` on a read of a private namespace, as any refusal there). It used to verify, and
+  read every resource. Edge-grant issuance refused it already.
+- **A namespace's own `rulesPerGrant`, `grantSize` and `rulesPerNamespace` are enforced**
+  (§6.6): a grant chain over the namespace's `rulesPerGrant` is `422`, a bearer over its
+  `grantSize` `413`, and a config write whose document has more rules than its own
+  `rulesPerNamespace` `422`; only the deployment maximums were. Stored documents are read as
+  before.
+- **Limit refusals carry `limit`, `measured` and `max`** (§6.6, §12, v0.55), batch items' reports
+  too; the bodies of `POST …/prune` and `POST /ns/{ns}/keys`, which no limit of §6.6 covers, are
+  `400 bad_input` above 1 MiB (were `413 limit`).
+- **The tree service's `items` table gains `created` and `file` columns**, added on the first
+  start (nullable). In a file tree (`catalog.files`, §H.2) the service reads every head of its
+  trusted namespaces as it applies it, sealed ones with keys, to give placements file metadata;
+  on the first start with a file tree it reads every live item's head once (meta `filed`) and
+  purges the catalog's cached listings.
+- **Writers that can't read a namespace document ask `GET /ns/{ns}/principal`** (§11.2, §C.7):
+  `client.NeedsNonce` and undo's limits and nonces now follow what it says, so undo inverses by
+  such writers carry no `$nonce` where nonces are optional; against a server before v0.55,
+  which answers `404` there, they add one in any private namespace, as before.
+- `GET /` answers `"spec": "0.55"`.
 
 **New:**
+- **`GET /ns/{ns}/principal`** (§7.4, v0.55; README design notes): what the grant in
+  `Authorization` is in a namespace, `{ principal, kid, can, roles }`, and what a writer needs
+  from the namespace document, `writer: { frozen, successor?, nonce, signatures, level?, limits
+  }`, the limits in force as §6.6 writes them, with `X-Config-Revision`. Only the `ns` check and
+  verification apply, so a grant limited to some resources or without `read` gets it; none, or
+  one that can't be used, is `401` even in a public namespace; an edge-grant cookie is no grant;
+  an operator grant gets `404` for an absent namespace; a purged namespace is `410 purged` once
+  the grant verifies; every answer is `no-store`. With authentication disabled it leaves out
+  `principal` and `kid`. Client: `Client.NSPrincipal`, `PrincipalInfo`, `WriterInfo`.
+- **Limit refusals name the limit** (§6.6, §12, v0.55): every `413`/`422` `limit` carries
+  `limit`, its §6.6 key, and for sizes and counts `measured` and `max`; durations and rates the
+  key alone; a body the server stopped reading names the deployment's limit (the principal's
+  `batchSize` for a batch) with the bytes read as a lower bound. Client: `APIError.Limit`,
+  `client.IsLimit`; `grant.TooLargeError` carries a bearer's sizes.
+- **`catalog.files`** (§7.4, §H.2): a catalog namespace document may say `"files": { "ns",
+  "root", "folder"?, "placement"? }`, checked in shape (`422 invalid` at its pointer otherwise).
+- **File metadata in tree listings** (§H.3, §E.2.6; README "File trees"): in a file tree, every
+  placement entry with a head carries `file: { size, type, modified }` of that head (a raw
+  file's reference, a JSON file's rendering length and `application/json`, the head's
+  `created`), sealed per entry under the item's `K_r` for items of sealed namespaces and left
+  out at E3; `catalog.files` coming or going reads every head, or drops the metadata.
+  `follow.Change` carries `Created`.
+- **`internal/files`** (§H.1): `files.Rendering`, the rendering of a JSON file (its canonical
+  text without a fresh `$nonce` or §8.1 `$successor`, laid out as `JSON.stringify(v, null, 2)`
+  with JCS's tokens and order), `files.Layout` and `files.MetaOf`, for the tree service and file
+  gateways alike.
 - **Revision metadata** (§7.1, §7.4; README "Files and sync clients"): outside sealed and e2e
   namespaces, judged by the namespace serving the read, a revision's `200` carries
   `Last-Modified`, its created time, with `If-Modified-Since` answered `304`, and

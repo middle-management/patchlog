@@ -26,7 +26,9 @@ and serves immutable, CDN-cacheable revisions.
 | Draft schema revisions in branches (`drafts.for`, repeated `Source-Authorization`), `in_use` by last available copy | §6.1, §7.4 | ✅ |
 | Releases across namespaces: release documents, the four-step release merge (plan, approve, resume), release rebases, release previews, janitor ordering; catalog merge grants | §F.9, §F.8, §B.5 | ✅ (`patchlog merge release`, `tree -release`, `POST /merge-grants`; see [Releases across namespaces](#releases-across-namespaces-f9)) |
 | Change envelopes, rule engine (`test`, `writes`, `compare`, `all`/`any`/`not`/`if`) | §6.4 | ✅ |
-| Limits (configurable, deployment maximums) and token-bucket rate limits | §6.6 | ✅ |
+| Limits (configurable, deployment maximums) and token-bucket rate limits; a refusal names the limit (`limit`) and, for sizes and counts, `measured` and `max` | §6.6, §12 | ✅ (see [Limit refusals](#design-notes)) |
+| `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, verbs, roles) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
+| File trees: `catalog.files` in catalog namespace documents, file metadata (`file: { size, type, modified }`) on placements in tree listings, sealed per entry for items of sealed namespaces, and the rendering of a JSON file shared by tools (`internal/files`) | §7.4, §H.1–§H.3, §E.2.6 | ✅ (tree service; see [File trees](#file-trees-h2-h3)) |
 | Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve -log-page-size`, `-log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
@@ -36,7 +38,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
 | Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
-| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
+| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools; writers that can't read the setting learn it from `GET /ns/{ns}/principal`, or add them in private namespaces | §C.7, §7.4 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge (a sealed namespace's documents, log, long-polls and events then answer `410 purged` with `head`, which followers, services, the janitor and remote branches take as the purge) | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, `nosniff` and `Content-Security-Policy: sandbox` on every blob response, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
@@ -2150,6 +2152,46 @@ Note: the §B.11.3 example key rule `not writes overlaps /$access` refuses every
 genesis writes `""`. Scope it to non-create actions and require `/doc/$access` to be absent on
 create.
 
+### File trees (§H.2, §H.3)
+
+Spec v0.55's Addendum H stores files in namespaces so that tools showing them as files, such as
+WebDAV gateways and mounts, share them. A catalog whose namespace document says
+`"catalog": { "trust": ["files"], "mode": "tree", "files": { "ns": "files", "root": "root" } }`
+is a file tree: folders are folder nodes and files placements, named by their `title`s. The
+tree service then gives every placement entry with a head, in `children`, `subtree`, `roots`,
+`ancestors` and `where`, the file metadata of that head:
+
+```json
+{ "name": "files.k3x9…", "kind": "item", "title": "notes.json", "head": "1…", "url": "…",
+  "file": { "size": 1234, "type": "application/json", "modified": "2026-10-18T09:12:44.512Z" } }
+```
+
+- **`size` and `type`**: for a raw file, a document whose root is a blob reference (§7.8), the
+  reference's; for a JSON file, the length of its rendering and `application/json`. The
+  rendering (§H.1, `files.Rendering`) is the canonical text of the document without a top-level
+  fresh `$nonce` or `$successor` of §8.1's form, laid out as `JSON.stringify(v, null, 2)` lays it
+  out, with JCS's tokens and member order (keys that look like array indices stay where JCS puts
+  them), and a final LF. `files.MetaOf` computes both, for the WebDAV gateway too.
+- **`modified`** is the head's `created` as the namespace log gives it (a batch entry's for a
+  batch, a `/heads` row's for a snapshot bootstrap), else its `Last-Modified`; it is left out
+  where neither is known (a snapshot of a sealed namespace, rows written before v0.54).
+- **Reads.** The service reads each head once, as it applies the entry that made it the head,
+  for every item of every trusted namespace (not only `files.ns`, implicit placements too), and
+  keeps the metadata with the item (`items.created`, `items.file`), so a folder lists in one
+  request. A sealed (E2) namespace is read with keys; an e2e one isn't, and its items get no
+  `file`. When `catalog.files` appears, every live item's head is read for it, and when it goes
+  the metadata goes, both moving listings to the new checkpoint; a database from before this, or
+  one a release that ignored `catalog.files` kept, is filled in on start (meta `filed`, purging
+  the catalog's cached listings, `ns:{catalog}`).
+- **Sealed items** (§E.2.6). For an item of a sealed namespace the entry carries
+  `"file": { "sealed": "<JWE>" }` instead, the JWE of `{ "file": { … } }` under the item's own
+  `K_r` (kid its namespace's current epoch, padded as that namespace pads), with `pl { ns, name,
+  view }` naming the item and the listing's `at` URL, whatever the catalog's level: a reader
+  given `K_r` by `/read-grants` opens it, and in a sealed catalog read whole, the catalog's JWE
+  holds it still sealed, so the catalog's keys open no content-derived value. A listing holding
+  one is stored and served unchanged, as a sealed catalog's listings are. The service stores the
+  metadata in the clear, as it does titles.
+
 ### Bundles (§G.4)
 
 ```sh
@@ -2411,7 +2453,11 @@ Spec v0.54 serves file-style and sync clients, such as a WebDAV gateway, mounted
 and editors, which compare their copies with what a deployment holds without fetching
 documents, keep files as blobs, move them and overwrite them whole (§11.3). Every field and
 header below is optional to a client: responses cached before an upgrade, or served by an
-older instance during one, lack them (see [Postgres](#postgres-d8)'s upgrade notes).
+older instance during one, lack them (see [Postgres](#postgres-d8)'s upgrade notes). Spec
+v0.55's Addendum H builds on them: how such tools store files, folders and names so they can
+share a namespace, with file metadata in tree listings (see [File trees](#file-trees-h2-h3)),
+and `GET /ns/{ns}/principal`, from which a writer limited to some resources learns what the
+namespace document asks of it (see [Design notes](#design-notes)).
 
 - **`Last-Modified`** on every `200` of `GET` and `HEAD /r/{ns}/{name}/rev/{id}`, in a namespace
   that is neither sealed nor e2e, judged by the namespace serving the read (a sealed branch
@@ -2724,7 +2770,10 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   body's `message` repeats the error), saying other members must start with `x-`. The check
   runs before the `*`-key guard. Other invalid namespace documents (a malformed `read`, `keys`,
   …) answer the same way, with the pointer their message names. The addenda's members are
-  checked in their shapes: `catalog: { trust?: [namespace names], mode?: "tree" | "dag" }`,
+  checked in their shapes: `catalog: { trust?: [namespace names], mode?: "tree" | "dag",
+  title?: pointer, files?: { ns, root, folder?, placement? } }` (`files`, v0.55, §H.2: `ns` a
+  namespace name, `root` a folder name, without a dot, and `folder` and `placement` schema
+  revision paths; whether the catalog trusts `ns` or the schemas resolve is the tools' to check),
   `catalogs: { <catalog>: { place?: ["group:…" | "user:…"] } }`, `merge: { authors: [{ sub,
   kid }] }`, `merged: { at: ns_id }`, `cleanup: { merged?, superseded?, abandoned? }` (ISO
   8601 durations), `abandoned` a boolean; and `revoked` lists revocation ids. `catalog`, each
@@ -2940,7 +2989,52 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `prefix` on `DELETE /edge-grants`, the one that may repeat), and answers anything else, a
   repeated parameter or another flag value with `400 bad_input`, `no-store`, before
   authentication.
-- **`GET /`** answers `{ "spec": "0.54", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /ns/{ns}/principal`** (§7.4, v0.55) answers `200` with `{ "principal", "kid", "can",
+  "roles", "writer": { "frozen", "successor"?, "nonce", "signatures", "level"?, "limits" } }`
+  and `X-Config-Revision`: the principal of §6.4.1 (`{ id, groups, roles, attrs, via, grant }`),
+  the root block's `kid`, the verbs its blocks allow, sorted (with roles, only those an
+  effective role lists), its effective roles, and what a writer needs from the namespace
+  document, which a grant limited to some resources can't read: `frozen`, `successor` if set,
+  `nonce` and `signatures` (`"required"` or `"optional"`; a sealed namespace says `"required"`,
+  as §E.2.5 holds every patch set there to a fresh `$nonce`), `level` (`at-rest`, `sealed`,
+  `e2e`; absent without `encryption`) and `limits`, every key of §6.6 as a namespace document
+  writes it (sizes and counts as integers, durations as ISO 8601, rates as `{ rate, burst }`),
+  the deployment's defaults and maximums applied, the deployment-only ones being the
+  deployment's (an allowance isn't applied). Only the `ns` check and verification apply, so a
+  grant limited to some resources or without `read` gets it; none, or one that can't be used, is
+  `401`, in a public namespace too; an edge-grant cookie is no grant here; a grant chained to an
+  operator key verifies against the operator keys and gets `404` for an absent namespace (and
+  `200` for an existing one, as §7.4 says; §C.4 still says `401`); a purged namespace is `410
+  purged` with `head` once the grant verifies. It takes no query parameter, draws no rate
+  token, works in frozen, sealed and e2e namespaces alike, and every answer is `no-store`. With
+  authentication disabled it leaves out `principal` and `kid` and lists every verb. The client
+  reads it with `Client.NSPrincipal` (`PrincipalInfo`, `WriterInfo`), and `NeedsNonce` and undo
+  ask it when the namespace document can't be read, as §11.2 says, falling back as before on a
+  server that answers `404` there. Verification now also applies a key's `readScope:
+  "resource"` (§C.2 item 1, §C.4) to every request: a `read` grant it signs that doesn't fix
+  `/resource` (§2.1) is refused (`403`, or `404` on a read of a private namespace, as any
+  refusal there).
+- **Limit refusals** (§6.6, §12, v0.55): every `413` or `422` with `code: "limit"` names the
+  limit's key in `limit`, and for sizes and counts carries `measured` and `max`, the limit in
+  force: `patchSetSize` (or `documentSize` for a whole-document patch set) and `opsPerSet` of
+  the patch set, `documentSize` and `nestingDepth` of the resulting document, `valueSize` and
+  `pathSize` of the first string or pointer found too long (canonical bytes, quotes included),
+  `blobsPerDocument`, `itemsPerBatch` and `batchSize` (the principal's, with an allowance),
+  `branchesPerNamespace` (the live branches with the new one), `branchDepth`, `keepPerResource`,
+  `rulesPerGrant` and `rulesPerNamespace`, `grantSize`, `blobSize` and `blobPending`; a
+  namespace document over a deployment maximum names that key with its value and the maximum,
+  an e2e document failing §6.6's inequality names `patchSetSize` with the left side as
+  `measured`, and durations and rates (`retryWindow`, `remoteRegistration`, `blobGrace`, the
+  rates, an allowance's `blobRate`) carry the key alone. A body the server stops reading names
+  the deployment's limit (`documentSize` for a resource's patch set, `patchSetSize` for
+  namespace documents and branches, `grantSize` for an edge-grant exchange) or, for a batch, the
+  principal's `batchSize`, with the bytes read as `measured`, a lower bound; a blob sent without
+  `Content-Length` gives `blobSize + 1`. A batch item's report carries its refusal's fields. The
+  prune and `/keys` bodies, which no limit covers, are `400 bad_input` above 1 MiB. A grant chain
+  is held to the namespace's `rulesPerGrant` and a bearer to its `grantSize`, and a config write
+  to the resulting document's `rulesPerNamespace`, as §6.6 says, not only to the deployment's
+  maximums. The client reads them with `APIError.Limit` and `client.IsLimit`.
+- **`GET /`** answers `{ "spec": "0.55", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace
