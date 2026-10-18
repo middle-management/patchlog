@@ -250,27 +250,74 @@ func newCompiler(load urlLoaderFunc) *jsonschema.Compiler {
 // characters.
 var freshNonce = regexp.MustCompile(`^[a-z2-7]{26}$`)
 
+// Names valid under §3.6, as core.ValidNSName and core.ValidResourceName,
+// which this package can't import.
+var (
+	nsNameRe  = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,63}$`)
+	resNameRe = regexp.MustCompile(`^[a-z0-9][a-z0-9._-]{0,127}$`)
+)
+
+// Successor reports whether v is a $successor of the form of §8.1: a bare
+// resource name, for one in the same namespace, or /r/{ns}/{name}, for one
+// in another, with names valid under §3.6.
+func Successor(v any) bool {
+	s, ok := v.(string)
+	if !ok {
+		return false
+	}
+	if resNameRe.MatchString(s) {
+		return true
+	}
+	rest, ok := strings.CutPrefix(s, "/r/")
+	if !ok {
+		return false
+	}
+	ns, name, ok := strings.Cut(rest, "/")
+	return ok && nsNameRe.MatchString(ns) && resNameRe.MatchString(name)
+}
+
+// LeftOut reports whether top-level member k with value v is one §6.2
+// step 5 leaves out of the instance: $schema, a $nonce of the fresh-nonce
+// form, and a $successor of the form of §8.1. A $nonce or $successor of
+// any other form is data. At a raw document's root they aren't part of
+// the blob reference either (§7.8).
+func LeftOut(k string, v any) bool {
+	switch k {
+	case "$schema":
+		return true
+	case "$nonce":
+		s, ok := v.(string)
+		return ok && freshNonce.MatchString(s)
+	case "$successor":
+		return Successor(v)
+	}
+	return false
+}
+
 // Instance returns what §6.2 step 5 validates for a document: the document
-// without its top-level $schema, and without a top-level $nonce of the
-// fresh-nonce form. They are mechanics rather than data, so closed schemas
-// needn't declare them. Reference walks (§6.5) and clients validating at
-// E3 use the same instance. doc itself is never modified.
+// without the top-level members LeftOut names. They are mechanics rather
+// than data, so closed schemas needn't declare them, and schemas can't
+// constrain them. Reference walks (§6.5) and clients validating at E3
+// (§E.3.2) use the same instance. doc itself is never modified.
 func Instance(doc any) any {
 	obj, ok := doc.(map[string]any)
 	if !ok {
 		return doc
 	}
-	n, hasNonce := obj["$nonce"].(string)
-	strip := hasNonce && freshNonce.MatchString(n)
-	if _, ok := obj["$schema"]; !ok && !strip {
+	n := 0
+	for _, k := range [...]string{"$schema", "$nonce", "$successor"} {
+		if v, ok := obj[k]; ok && LeftOut(k, v) {
+			n++
+		}
+	}
+	if n == 0 {
 		return doc
 	}
-	out := make(map[string]any, len(obj))
+	out := make(map[string]any, len(obj)-n)
 	for k, v := range obj {
-		if k == "$schema" || (k == "$nonce" && strip) {
-			continue
+		if !LeftOut(k, v) {
+			out[k] = v
 		}
-		out[k] = v
 	}
 	return out
 }

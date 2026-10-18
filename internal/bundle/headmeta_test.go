@@ -49,3 +49,27 @@ func TestImportHeadMeta(t *testing.T) {
 	}
 	liveHeadsMatch(t, dst.c, "matches")
 }
+
+// A move (§8.1) travels in a full-history bundle as content: the imported
+// head's 410 names the successor, and the new resource arrives with the
+// namespace.
+func TestImportMove(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	s := f.src
+	s.create("matches", "cup-2026", map[string]any{"title": "Cup"})
+	s.append("matches", "cup", op("add", "/$successor", "cup-2026"))
+	must(s.c.Delete(ctx, "matches", "cup", s.head("matches", "cup").ID))
+	if h := s.head("matches", "cup"); h.Successor != "cup-2026" {
+		t.Fatalf("source head %+v", h)
+	}
+	b, _, _ := f.export(t, bundle.ExportOptions{Select: []string{"matches"}})
+	dst := newDeployment(t, cmsOrigin)
+	importB(t, dst, b, bundle.ImportOptions{})
+	if h := dst.head("matches", "cup"); h.State != client.Tombstoned || h.Successor != "cup-2026" {
+		t.Fatalf("imported head %+v", h)
+	}
+	if dst.head("matches", "cup-2026").State != client.Live {
+		t.Fatal("the successor wasn't imported")
+	}
+}

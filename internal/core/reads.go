@@ -1,6 +1,7 @@
 package core
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // headItem is one resource as a namespace sees it.
@@ -141,6 +143,12 @@ type Head struct {
 	Last    string // tombstoned: last live revision
 	Public  bool
 	Horizon string
+	// Successor is, for a tombstoned head, the well-formed top-level
+	// $successor of the document at Last, as written (§8.1, §6.5): a bare
+	// name, which the client resolves against this namespace, or
+	// /r/{ns}/{name}. Set only where the namespace serving the 410 is
+	// neither sealed nor e2e; elsewhere a client reads it from Last.
+	Successor string
 }
 
 // ResourceHead resolves the head pointer.
@@ -174,7 +182,11 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		if v.head != nil && v.state != Purged {
 			h.Head = v.head.id.String()
 			if v.state == Tombstoned {
-				h.Last = t.lastLive(v.head).id.String()
+				last := t.lastLive(v.head)
+				h.Last = last.id.String()
+				if t.nsLevel(n) < levelSealed {
+					h.Successor = t.successorAt(last)
+				}
 			}
 		}
 		return nil
@@ -185,6 +197,30 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		e.rc.putHead(g, ns, name, *h, public)
 	}
 	return h, err
+}
+
+// successorAt is the top-level $successor of the document at row, a
+// tombstone's last live revision, if it has the form of §8.1 (§6.5); ""
+// if it has none, another form, or the document can't be read. The row
+// may be a base's (read-through) or a remote base's mirror: its document
+// is read here either way. Whoever wrote the document wrote it (§8.1).
+func (t *tx) successorAt(row *revRow) string {
+	if row == nil || row.kind != kindRev {
+		return ""
+	}
+	b, err := t.docBytesAt(row)
+	if err != nil || !bytes.Contains(b, []byte(`"$successor"`)) {
+		return ""
+	}
+	doc, err := jsonv.Parse(b)
+	if err != nil {
+		return ""
+	}
+	m, _ := doc.(map[string]any)
+	if s := m["$successor"]; schema.Successor(s) {
+		return s.(string)
+	}
+	return ""
 }
 
 // Rev is the answer for GET /r/{ns}/{name}/rev/{id}.

@@ -517,9 +517,15 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 		s.cache(w, r, ccLong, h.Public)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	case core.Tombstoned:
+		// With successor where the engine read one (§8.1): a moved
+		// resource, outside sealed and e2e namespaces.
 		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", quote(h.Head))
-		writeJSON(w, 410, map[string]any{"code": "gone", "tombstone": h.Head, "last": h.Last})
+		body := map[string]any{"code": "gone", "tombstone": h.Head, "last": h.Last}
+		if h.Successor != "" {
+			body["successor"] = h.Successor
+		}
+		writeJSON(w, 410, body)
 	default:
 		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", quote(h.Head))

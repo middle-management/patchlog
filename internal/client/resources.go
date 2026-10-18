@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -37,6 +38,11 @@ type Head struct {
 	State State
 	ID    string // head revision (Live) or tombstone (Tombstoned) id
 	Last  string // Tombstoned: last live revision id
+	// Successor is, for a Tombstoned head, where the resource moved as the
+	// 410 names it (§8.1): a bare name in the same namespace or
+	// /r/{ns}/{name} (ResolveSuccessor). Servers name it only outside
+	// sealed and e2e namespaces; Moved reads the document at Last there.
+	Successor string
 }
 
 // Head reads a resource's head pointer without following the redirect.
@@ -57,11 +63,60 @@ func (c *Client) Head(ctx context.Context, ns, name string) (*Head, error) {
 	case 410:
 		m := r.obj()
 		if t := str(m, "tombstone"); t != "" {
-			return &Head{State: Tombstoned, ID: t, Last: str(m, "last")}, nil
+			h := &Head{State: Tombstoned, ID: t, Last: str(m, "last")}
+			if s := str(m, "successor"); schema.Successor(s) {
+				h.Successor = s
+			}
+			return h, nil
 		}
 		return &Head{State: Purged}, nil
 	}
 	return nil, r.apiError()
+}
+
+// SuccessorOf is a document's top-level $successor if it has the form of
+// §8.1, which validation leaves out (§6.2 step 5), and "" otherwise.
+func SuccessorOf(doc any) string {
+	m, _ := doc.(map[string]any)
+	if s := m["$successor"]; schema.Successor(s) {
+		return s.(string)
+	}
+	return ""
+}
+
+// ResolveSuccessor resolves a successor that namespace ns names (§8.1): a
+// bare name is a resource of ns, the namespace serving the 410, so a move
+// survives merges out of a branch; /r/{ns2}/{name2} is one of ns2.
+func ResolveSuccessor(ns, successor string) (ns2, name2 string, ok bool) {
+	if !schema.Successor(successor) {
+		return "", "", false
+	}
+	if rest, cross := strings.CutPrefix(successor, "/r/"); cross {
+		ns2, name2, _ = strings.Cut(rest, "/")
+		return ns2, name2, true
+	}
+	return ns, successor, true
+}
+
+// Moved reports where a tombstoned resource moved (§8.1, §10): the
+// successor h, its head, names, or, where the 410 carries none, as in
+// sealed namespaces, the $successor of the document at h.Last, read with
+// the client's keys. "" if h isn't tombstoned or nothing names one. An
+// e2e namespace's document is folded by E2E.Moved instead. A client
+// offers the successor as a link, and follows it on its own only into a
+// namespace it already trusts (§10).
+func (c *Client) Moved(ctx context.Context, ns, name string, h *Head) (string, error) {
+	if h == nil || h.State != Tombstoned {
+		return "", nil
+	}
+	if h.Successor != "" {
+		return h.Successor, nil
+	}
+	d, err := c.Doc(ctx, ns, name, h.Last)
+	if err != nil {
+		return "", err
+	}
+	return SuccessorOf(d.Value), nil
 }
 
 // Doc is a document at a revision.

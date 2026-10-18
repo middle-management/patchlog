@@ -51,3 +51,28 @@ func TestMergeHeadMeta(t *testing.T) {
 		t.Fatalf("tombstone %+v", c)
 	}
 }
+
+// A move in a branch (§8.1) is content, so a merge carries it: the base's
+// head 410 names the successor, a bare name resolved against the base,
+// and the new resource arrives with it (§F.3).
+func TestMergeMove(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.branch("matches", "r8")
+	e.create("r8", "derby-2026", map[string]any{"title": "Derby"})
+	e.append("r8", "derby", op("add", "/$successor", "derby-2026"))
+	e.del("r8", "derby")
+	if h := e.head("r8", "derby"); h.Successor != "derby-2026" {
+		t.Fatalf("branch head %+v", h)
+	}
+	p := e.plan("matches", "r8", merge.Options{})
+	wantClasses(t, p, map[string]merge.Class{"derby": merge.FastForward, "derby-2026": merge.FastForward})
+	must(p.Apply(ctx))
+	h := e.head("matches", "derby")
+	if h.State != client.Tombstoned || h.Successor != "derby-2026" {
+		t.Fatalf("base head %+v", h)
+	}
+	if ns, name, ok := client.ResolveSuccessor("matches", h.Successor); !ok || ns != "matches" || e.head(ns, name).State != client.Live {
+		t.Fatalf("successor %s/%s %v", ns, name, ok)
+	}
+}

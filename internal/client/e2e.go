@@ -535,6 +535,23 @@ func (x *E2E) LoadE2E(ctx context.Context, ns, name string) (*Head, *E2EDoc, err
 	return h, d, err
 }
 
+// Moved is Client.Moved for an e2e namespace (§8.1, §10): its 410s carry
+// no successor, so it folds the document at h.Last and reads its
+// $successor.
+func (x *E2E) Moved(ctx context.Context, ns, name string, h *Head) (string, error) {
+	if h == nil || h.State != Tombstoned {
+		return "", nil
+	}
+	if h.Successor != "" {
+		return h.Successor, nil
+	}
+	d, err := x.DocE2E(ctx, ns, name, h.Last)
+	if err != nil {
+		return "", err
+	}
+	return SuccessorOf(d.Value), nil
+}
+
 // DocE2E folds the document at revision id: it follows the X-E2E fold
 // redirect, opens and verifies the log and folds it (see E2E).
 func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) {
