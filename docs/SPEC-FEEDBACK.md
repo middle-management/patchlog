@@ -128,6 +128,237 @@ From implementing v0.53 and v0.54.
     on a resource purge (a `heads:{ns}` tag), beyond §8.3. *Propose:* say this in §E.1, or
     suggest computing digests at read time at rest.
 
+From implementing v0.55, in the core and the tree service.
+
+25. **`/principal` and operator grants** (§7.4, §C.4). §7.4 shows `/principal` to "any grant that
+    verifies", operator grants included, but §C.4 makes "Any other request under one" `401`. The
+    reference answers `200`, with `can` the operator grant's block verbs and `roles` `[]`.
+    *Propose:* list `/principal` among §C.4's exceptions, and say what `can` and `roles` mean there.
+26. **`/principal` without authentication** (§1, §7.4). Not specified. The reference answers `200`
+    without `principal` and `kid`, with `can` every verb, `roles` `[]` and `writer` as usual, and
+    `404` for an absent namespace. *Propose:* say so.
+27. **`writer.nonce` in sealed namespaces** (§7.4, §E.2.5). The reference says `"required"` at E2,
+    where §E.2.5 requires a fresh `$nonce` in every patch set, `"optional"` at E3, and elsewhere the
+    document's setting. *Propose:* say "required where nonces are required or the namespace is
+    sealed".
+28. **What `writer.limits` holds** (§6.6, §7.4). The reference lists every key of §6.6, the
+    deployment-only ones at the deployment's values, and applies neither allowances nor the
+    key-scope `rate`. It holds a namespace to its own `rulesPerGrant` and `grantSize`, and to its
+    own `rulesPerNamespace` on a creation or a config write that changes `/rules` or
+    `/limits/rulesPerNamespace`, even a write that lowers a count still over the bound; other
+    writes, freezes included, still pass a document an earlier release stored over it. *Propose:*
+    say whether allowances apply, and whether a namespace's own bound holds every config write or
+    only those that change the rules or the bound.
+29. **`catalog.files`'s shape** (§7.4, §H.2). The reference takes `root` as a folder name (a
+    resource name without a dot), doesn't require `ns` to be in `trust` (the gateway checks it,
+    §H.4), allows `x-` members inside `files`, and checks `folder` and `placement` as schema
+    revision paths only. *Propose:* say "`root` is a node name", and confirm the `x-` members under
+    §7.4's rule.
+30. **The sealed form of `file`** (§H.3, §E.2.6). §E.2.6's per-entry `"sealed"` holds values of the
+    entry's own resource, such as a sealed catalog's title under the placement's `K_r`; a value
+    derived from another namespace's resource needs a member of its own. The reference uses `"file":
+    { "sealed": JWE }`, the plaintext `{ "file": { … } }` under the item's `K_r`, with `kid` the
+    item namespace's current epoch and `pl { ns, name, view }` naming the item, padded as that
+    namespace pads. §E.2.6 allows whole-response sealing only when every sealed value comes from one
+    namespace, so for a sealed catalog read whole the reference still seals the response under the
+    catalog's `K_e` and nests `file` sealed per entry, and marks the form provisional. While a
+    sealed content namespace's epoch key can't be fetched it answers `503`, not a listing without
+    `file`, which "stored once, served forever" would keep; stored listings are keyed by URL and
+    reader shape, as kept ones are. *Propose:* define a per-member sealed form for values of another
+    source and allow or forbid the nesting, and say that a stored view is per URL and reader shape.
+31. **`modified` where `created` is unknown, and which placements get `file`** (§H.3). The reference
+    leaves `modified` out and still gives `size` and `type`, and adds `file` to the placements of
+    every trusted namespace, implicit ones included, not only `files.ns`'s. *Propose:* say
+    "`modified`, the head's `created`, where known", and whether `file` is limited to placements of
+    `files.ns`.
+32. **Limit refusals for bounds that aren't §6.6 keys** (§6.6, §12, §C.5.2). Prune and `/keys`
+    bodies over 1 MiB are `400 bad_input`. A resource `PATCH` body over 4× the larger of
+    `patchSetSize` and `documentSize` names `documentSize`, with the deployment maximum. A `POST
+    /edge-grants` body over room for 50 grants of `grantSize` is `400 bad_input` with no sizes,
+    following §12's row ("an edge-grant exchange over its limits") and §C.5.2's `400` for more than
+    50 grants; one grant over `grantSize` is `413` once decoded. Where reading stopped, `measured`
+    counts body bytes, not canonical ones. *Propose:* list the oversized body in §C.5.2's table with
+    the 50-grant row.
+33. **The E3 inequality** (§6.6 Values). A config write that fails `3 × (valueSize + pathSize) + 1
+    KiB ≤ patchSetSize` is `422`, but the text names no `limit` for it. The reference names
+    `patchSetSize`, with `measured` the left side as §6.6 defines it for E3 and `max` the
+    `patchSetSize`. *Propose:* say so.
+34. **`429` bucket names** (§6.6). `limit` is `"allowance"` or `"allowance.blobRate"` for an
+    allowance's buckets, which aren't §6.6 keys. *Propose:* name them.
+35. **`measured` for the other limits** (§6.6). `pathSize` and `valueSize`: the first value found
+    too long, quotes included. `branchesPerNamespace`: the live branches including the new one.
+    `blobPending`: pending bytes plus this blob, counting at least 4 KiB each. A blob without
+    `Content-Length`: `blobSize` + 1. Durations and rates: `limit` alone. *Propose:* say "first
+    found" for the first, and the others as chosen.
+36. **`readScope` at verification** (§C.2, §C.4, §C.6). The reference applies a key's `readScope:
+    "resource"` in grant verification, which the core and the services that verify grants locally
+    (§C.6: tree, catalog, index) share. A read grant from such a key that doesn't fix `/resource` is
+    a key-scope `403` on every request, writes included, and `404` on a read of a private namespace
+    at the origin; services treat it as reading nothing. Before, services counted it as reading per
+    resource, and every name passed. *Propose:* confirm in §C.2 that the `403` holds on every
+    request, and say in §C.6 that services apply key scopes, `readScope` included, as the origin
+    does.
+37. **`/principal` and rate limits** (§6.6, §7.4). The reference draws no token for it. *Propose:*
+    say so.
+38. **`measured` shows a document's size to a writer without `read`** (§6.6, §E.2.2). For
+    `documentSize`, `nestingDepth`, `valueSize` and `pathSize`, `measured` describes the resulting
+    document. A writer with `append` but not `read` can send k root copies (`{ "op": "copy", "from":
+    "", "path": "/a" }`) and recover the document's exact canonical size, 2^k·S plus a constant,
+    from one `413`. That holds at E2 too, where `/heads` omits `size` because an exact length
+    defeats padding. Probing with `test` operations, or bisecting the old refusal, already gave it,
+    so this is faster, not new. *Propose:* say whether `measured` for a limit on the resulting
+    document is left out, or rounded to the padding bucket at E2, for a grant that doesn't allow
+    `read` of the resource. The reference follows the current text and gives it.
+
+From implementing v0.55, in the WebDAV gateway (Addendum H), tried with rclone, davfs2, vim and sed.
+
+39. **JSON saves with several candidate bases** (§H.4). Without a tag, the base is the record with
+    the fewest differing paths, and the save conflicts if "the closest records disagree". Taking the
+    closest silently dropped a value the user had set back to an older one (an undo of their own
+    save, together with a new edit). The reference makes a save `409`, naming the paths, when any
+    two of the user's versions, taken as the base, would apply it differently, even if each is safe.
+    The cost: a user whose client sends no `If-Match` and who adds a field, saves, then removes it
+    while editing something else gets one `409` and reloads. *Propose:* say the check runs over all
+    the user's versions, not the closest.
+40. **A revert of someone else's change after a reload** (§H.4). A user reloads after someone else
+    changed `/a`, then sets `/a` back and saves with no tag. The reference merges the save and keeps
+    the other value, so the revert isn't applied and the next read shows it. The data is the same as
+    for a stale editor buffer saved after a preview pane read the newer revision, which the other
+    base would overwrite, so the gateway can't tell the two apart and takes the safe one. *Propose:*
+    say that, without a tag, a save that sets back a value someone else changed is merged, and that
+    only the client's `ETag` settles it.
+41. **Raw saves against every version the user had** (§H.4). Without a tag, "the record with the
+    fewest paths differing" has no paths to count in a raw file, and picking one by size gave false
+    `409`s on a user's own consecutive saves whenever a size equalled an older version's. The
+    reference checks a raw save against every version the user had (the `If-Match` revision, else
+    every version served to them or written by them), and conflicts only if someone else changed the
+    bytes, or deleted or restored the file, after any of them; the user's own writes are remembered
+    as theirs. A user who reloaded early gets one `409` before the next save passes, which keeps the
+    stale-buffer protection of 40. *Propose:* say this for raw files.
+42. **Records per path** (§H.4). The text keeps records per user and file, but clients save to
+    paths, and a path can come to name another file between a read and a save (a rename, an expired
+    tree listing). A save without a tag then found no records and took the head as its base. The
+    reference keeps the document last read whole or written under each path with the records: a save
+    without a tag at a path that now names another document, or none, is `409`, and a `GET` of the
+    path is the reload; the user's own `DELETE` or `MOVE` forgets the path. A save whose `If-Match`
+    names a revision where no file is (a new name in a tree, a flat name that never existed) is
+    `412`, not a create; a flat name someone deleted since stays `409`, as the table has it.
+    *Propose:* say records are per path, and that a base on a path with no file is `412`.
+43. **What counts as others' writes** (§11.3, §H.4). The reference takes the paths that differ
+    between the documents at base and head together with the writes of the log entries between them,
+    so a value changed and changed back is a conflict, and leaves out the user's own entries. It is
+    stricter than §11.3's `theirs`, never looser. Its `409` for a pruned base covers a base it
+    recorded, and a pruned range between base and head, not only one named by `If-Match`. *Propose:*
+    say whether the user's own entries count, and that a pruned base includes recorded bases and
+    ranges.
+44. **Reloading a deleted file** (§H.4). After a `409` because someone else deleted the file, the
+    reload the text asks for is a `GET` that finds it gone (`404`), and the text doesn't say what
+    that reload is worth. In the reference the `409` lasts until that `GET`, after which a save
+    makes the file anew, with a root `replace` that drops any `$successor`. *Propose:* say that the
+    `404` is the reload, and whether the next save may recreate the file.
+45. **Scratch names missing from the list** (§H.6). Real clients use more names than the list has:
+    JetBrains' `*___jb_old___`, which pairs with the listed `*___jb_tmp___` (its safe save moves the
+    original aside under it, a move that is `403` without it); LibreOffice's `.~lock.NAME#`, which
+    in a tree otherwise creates and deletes a real file at each open; vim's `.swx`, `.swo` and the
+    like (`403` in the flat view; vim warns but saves); `sed -i`'s `sedXXXXXX`, which in the flat
+    view is neither a resource name nor listed, so `sed -i` fails there; macOS's `Icon\r`, a custom
+    folder icon whose CR (`Cc`) makes it an invalid title; and the system folders `.Trashes`,
+    `.Trash`, `.Trash-{uid}`, `.Spotlight-V100`, `.fseventsd` and `.DocumentRevisions-V100`, besides
+    `.TemporaryItems`. The names a file manager gives a copy made beside a file contain a space, so
+    no resource has one; in the flat view the reference takes them as scratch only as `COPY`
+    destinations, and a plain `PUT` of one is `403`. It first took every dot folder as scratch, and
+    what was put in one never reached the core; now only listed folders are scratch, and any other
+    is a real folder in a tree. *Propose:* add the names, and say that a folder is scratch only if
+    listed.
+46. **The move-aside window and restores** (§H.5, §H.6). §H.5 accepts vim's create-only `PUT`
+    "within a few seconds", with the head as its base. davfs2 uploads 10 s after the file is closed,
+    so the reference uses 30 s, as for delete-then-write, and takes the base as for any untagged
+    save (the user's records, else the head): with the head as base, edits others made after vim
+    opened the file are overwritten. A restore whose patch set is over `opsPerSet` or `patchSetSize`
+    is written as a whole-document `replace` when its base is the last live document. *Propose:* say
+    30 s and the base in §H.5, and the `replace` for restores in §H.6.
+47. **Guards and deliberate deletes** (§H.6). A refused `PUT` makes that user's `DELETE` of the path
+    `409`, once, for 10 s, and a guard "ends only by time". The reference lets a `DELETE` that
+    carries `If-Match` pass, since a client that sends one means it, but leaves the guard, so
+    rclone's cleanup `DELETE` in the same 10 s is refused once even after the user's own. *Propose:*
+    say whether an `If-Match` `DELETE` passes, and whether it ends the guard.
+48. **Case folding** (§H.2). The reference first folded with full Unicode case folding (`ß` as `ss`,
+    `ﬁ` as `fi`), merging names that Windows (NTFS, simple uppercase mapping) and Linux keep apart;
+    it now uses simple folding. It folds by default (`-case-sensitive` turns it off). "Tools refuse
+    to create a name a sibling has", but a `PUT` onto a sibling's name under another case edited the
+    sibling, so Linux rclone and davfs2, which copy `a.txt` and `A.txt` as two files, wrote one over
+    the other. Now a `PUT`, `COPY` or `MOVE` to a name that matches a sibling only under another
+    case is `409` naming the sibling, and sets a guard, unless the request carries a tag or the user
+    read or wrote that file under this spelling. `MKCOL` under another case is `405` (the folders
+    merge, nothing is lost), and a folder in the middle of a path matches whatever the case.
+    *Propose:* say "simple" folding, and that a case variant is refused with those exceptions.
+49. **Names a gateway receives** (§H.2). Titles are NFC, but clients such as macOS's send NFD: the
+    reference converts it to NFC rather than refusing. It refuses a trailing space or dot on create
+    and rename for every client, since it can't tell a Windows one, and shows an existing one
+    escaped. An escaped title (`a/b.txt` shown as `a%2Fb.txt`) never takes a real title's name, and
+    a numbered duplicate stays within 255 bytes. *Propose:* say NFD is converted, that the trailing
+    rule holds for every client, and how escapes and duplicate numbers meet real titles and the
+    length limit.
+50. **Folders with children the user can't see** (§H.5, §B.11.5). The text deletes a folder only if
+    it has no visible children, which lets a folder be deleted while placements of items the user
+    can't read stay in it. The reference neither names nor deletes them, so they become orphans
+    (§B.7). *Question:* intended, or should such a folder be `409` without naming them?
+51. **A partial move between namespaces** (§H.5). If the source's delete fails after the copy, the
+    client gets the error and the copy stays; there is no rollback. The reference deletes the source
+    only with `If-Match` naming the revision it copied (in a tree it checks the item's head before
+    the placement goes), so a source that changed since is `409` and stays. *Propose:* say that the
+    delete names the copied revision, that a failed delete leaves the copy, and that a changed
+    source is `409`.
+52. **Locks and dead properties** (§H.6, §H.8). `PROPPATCH` is "refused, or kept in the gateway";
+    the reference first answered `200` and kept nothing, which is neither. It keeps values per user
+    in memory (1 MiB per user, dropping the least recently set path's rather than refusing), moves
+    them with a `MOVE` and drops them with a `DELETE`. Locks follow the same events: a `DELETE`
+    drops the user's locks on the path and below (RFC 4918 §9.6.1), and a `MOVE` or `COPY` sent with
+    the source's lock token isn't `412` for want of a lock on the destination. *Propose:* say that
+    accepted properties are kept per user and follow the file, and that locks follow `DELETE` and
+    `MOVE`.
+53. **First-seen times** (§H.3, §H.7). §H.3 has a gateway without keys show "the time it first saw
+    the revision, kept across restarts" in sealed and end-to-end namespaces, but §H.7 has it not
+    offer them, so a keyless gateway never meets the case. The reference keeps the times it records
+    in memory only. *Propose:* drop the clause, or say which gateway shows these namespaces without
+    keys.
+54. **Empty files and new names** (§H.1, §H.6). Tools create empty files (`touch`, `.gitkeep`,
+    `__init__.py`) and `LOCK` a name before writing it. The reference makes or truncates a 0-byte
+    raw file for an empty body (over a JSON file it is `400`), and keeps an in-memory placeholder
+    only for a `LOCK` of a new name or a new `.json` name; it first answered `201` for an empty body
+    and kept nothing, so no one else saw the file. *Propose:* say an empty body is a 0-byte raw
+    file, and what a new empty `.json` name is (raw by §H.1, since an empty body isn't I-JSON, yet a
+    placeholder until it is filled).
+55. **A file's type on re-save** (§H.1). The reference works a raw file's type out again from the
+    name and the upload at every save, as the text reads, so a file whose extension isn't in the
+    table, saved by a client that sends no `Content-Type`, becomes `application/octet-stream` though
+    it was stored with another type. *Propose:* say that an existing file keeps its type unless the
+    extension is in the table or the upload names one.
+56. **Headers on a gateway's other answers** (§H.6, and 22). §H.6 asks for `nosniff` and `sandbox`
+    on raw bytes. The reference sends them on every answer, JSON and scratch files and error bodies
+    too, which repeat names the client sent, and answers `POST` to a file with `405` and `Allow`: a
+    `POST` had served the bytes without them. *Propose:* say "every response", as 22 does for blob
+    URLs.
+57. **Who owns `files.ns`** (§H.2, §H.5). A gateway deletes the item "where the tree owns
+    `files.ns`", but it can't see other catalogs to know whether any trusts the namespace. The
+    reference takes the tree to own it when the item is in `files.ns`. *Propose:* say how ownership
+    is known, or that "owns" means the item is in `files.ns`.
+58. **New files: the dry run before the upload** (§H.4). §H.4 lists the upload of a raw file's blob
+    first. The reference dry-runs the placement before the upload, so a refused placement uploads
+    nothing. *Propose:* say that order.
+
+## Settled in v0.55
+
+None of notes 1–24. v0.55 took up the WebDAV gateway as Addendum H, and added to the core `GET
+/ns/{ns}/principal`, `limit`, `measured` and `max` on limit refusals, and `catalog.files` (§7.4,
+§6.6, §12). Of the sections the notes cite it touched §6.6 (limit refusals, the `429` body), §7.4
+(the `/principal` row, `catalog.files`), §8.5 (the `410` row), §11.2 (how an undo learns the nonce
+setting), §12 (the error body) and §C.5 (a third exception to unrestricted read), but not the
+passages the notes are about. One note meets new text:
+- **Blob headers** (22): §H.6 asks a gateway for `nosniff` and `sandbox` on raw bytes too, with no
+  exemption for PDFs, so the cost reaches files served from a gateway. The note stays open (56 gives
+  the gateway's side).
+
 ## Settled in v0.53 and v0.54
 
 v0.53 restructured the text without changing behaviour. v0.54 took up notes 13–19 from the
