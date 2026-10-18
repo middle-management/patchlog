@@ -383,8 +383,9 @@ func TestCopyMoveLock(t *testing.T) {
 	e.expect(e.do("UNLOCK", "/docs/locked.json", "", "Lock-Token", token), 204, "UNLOCK")
 	_, doc = e.load("docs", "locked")
 	sameJSON(t, doc, map[string]any{"locked": true})
-	// An empty PUT doesn't truncate a live document.
-	e.expect(e.do("PUT", "/docs/locked.json", ""), 201, "empty PUT")
+	// An empty PUT over a JSON file is refused as any content that isn't
+	// I-JSON (§H.1), and leaves the document as it was.
+	e.expect(e.do("PUT", "/docs/locked.json", ""), 400, "empty PUT")
 	_, doc = e.load("docs", "locked")
 	sameJSON(t, doc, map[string]any{"locked": true})
 	// PROPPATCH (Windows sets file times) succeeds and keeps nothing.

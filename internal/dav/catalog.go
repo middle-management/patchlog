@@ -1015,10 +1015,20 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	if err != nil {
 		return err
 	}
-	if _, _, err := st.commitRev(ctx, dst, b); err != nil {
+	rev, _, err := st.commitRev(ctx, dst, b)
+	if err != nil {
 		return st.undoOwnDelete(ctx, dst, upstream(err))
 	}
+	if rev == "" {
+		return notMoved(src, dst)
+	}
 	return st.deleteSource(ctx, src, "")
+}
+
+// notMoved refuses a MOVE whose copy wrote nothing to the core (an empty
+// placeholder), whose source isn't deleted for it.
+func notMoved(src, dst target) error {
+	return fail(http.StatusConflict, "%s wasn't written to the core, so %s isn't deleted", dst.path, src.path)
 }
 
 // moveAcross moves live file src to dst, a new name in another tree or
@@ -1036,8 +1046,12 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 		return err
 	}
 	st.wroteTo = ""
-	if _, _, err := st.commitRev(ctx, dst, b); err != nil {
+	rev, _, err := st.commitRev(ctx, dst, b)
+	if err != nil {
 		return err
+	}
+	if rev == "" {
+		return notMoved(src, dst)
 	}
 	succ := ""
 	if ns, name, ok := strings.Cut(st.wroteTo, "/"); ok {

@@ -1188,26 +1188,25 @@ func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) 
 // commitRev writes body to the file a path names: an edit, a create or a
 // restore, or in a tree a new file, an item and its placement (newFile),
 // as a file of the kind kindOf says (§H.1). It returns the revision now
-// holding it, and whether that holds exactly body. An empty body creates
-// nothing: a client making a file before writing it (LOCK, Finder's
-// 0-byte PUT) gets a placeholder, and a live file isn't truncated.
+// holding it ("" for none), and whether that holds exactly body. An empty
+// body is a file like any other (§H.1): a raw file of 0 bytes, made or
+// truncated, and a JSON file's 400; but where its content would decide
+// its kind, a LOCK of a new name or a new .json name (Finder's 0-byte PUT
+// before the content), it is held as an empty placeholder (holdEmpty).
 func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (string, bool, error) {
 	defer st.changed()
+	if len(body) == 0 {
+		hold, err := st.holdEmpty(ctx, t)
+		if err != nil {
+			return "", false, err
+		}
+		if hold {
+			return "", true, st.scratchPut(t.path, nil, st.ctype)
+		}
+	}
 	raw, name, v, err := st.kindOf(ctx, t, body)
 	if err != nil {
 		return "", false, err
-	}
-	if len(body) == 0 || !raw && len(bytes.TrimSpace(trimBOM(body))) == 0 {
-		if t.kind != kNewNode {
-			hd, live, err := st.docAt(ctx, t)
-			if err != nil {
-				return "", false, err
-			}
-			if live {
-				return hd.rev, false, nil
-			}
-		}
-		return "", true, st.scratchPut(t.path, nil, st.ctype)
 	}
 	if !raw && v == nil {
 		if v, err = parseBody(body); err != nil {
@@ -1238,6 +1237,26 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 	}
 	st.scratchRemove(t.path)
 	return rev, exact, nil
+}
+
+// holdEmpty reports whether an empty write to t is kept as an empty
+// placeholder in scratch rather than written: one whose content decides
+// its kind (§H.1), a LOCK of a new name or a new .json name, which Finder
+// makes with a 0-byte PUT before it sends the content. Never a copy or a
+// move of a raw file (copySrc), which is one of 0 bytes, nor a write over
+// a live file, which a raw file takes and a JSON file refuses.
+func (st *reqState) holdEmpty(ctx context.Context, t target) (bool, error) {
+	switch {
+	case st.copySrc != nil:
+		return false, nil
+	case t.kind == kDoc || t.kind == kRaw:
+		if _, live, err := st.docAt(ctx, t); err != nil || live {
+			return false, err
+		}
+	case t.kind != kNewNode:
+		return false, nil
+	}
+	return st.method == "LOCK" || strings.HasSuffix(strings.ToLower(t.base), ".json"), nil
 }
 
 // kindOf says whether body, written to t, is a raw file's content, and of

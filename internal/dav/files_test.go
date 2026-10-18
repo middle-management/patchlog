@@ -643,3 +643,99 @@ func TestRawSaves(t *testing.T) {
 		t.Fatalf("413 %q after %d uploads", r.body, uploads.Load())
 	}
 }
+
+// An empty file is a file (§H.1): a new one of 0 bytes is a raw document
+// everyone sees, in the flat view and in a tree, an empty PUT truncates a
+// raw file, and a JSON file refuses it (400), as any content that isn't
+// I-JSON. Only where its content decides its kind, a new .json name
+// (Finder's 0-byte PUT before the content) and a LOCK of a new name, is it
+// held as a placeholder until content arrives.
+func TestEmptyFiles(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	o := e.another()
+	r := e.expect(e.do("PUT", "/matches/empty.txt", ""), 201, "PUT a new empty file")
+	if ref, data := e.rawOf("matches", "empty.txt"); len(data) != 0 || ref["size"] != float64(0) || ref["type"] != "text/plain" || r.header.Get("ETag") == "" {
+		t.Fatalf("empty.txt %v %q, ETag %q", ref, data, r.header.Get("ETag"))
+	}
+	if l := o.propfind("/matches/"); l["/matches/empty.txt"].size != "0" {
+		t.Fatalf("another user's listing %v", names(l, "/matches/"))
+	}
+	e.expect(e.do("PUT", "/cat/Season/__init__.py", ""), 201, "PUT a new empty file in a tree")
+	ns, item := e.itemOf("cat", "__init__.py")
+	if _, data := e.rawOf(ns, item); len(data) != 0 {
+		t.Fatalf("__init__.py %q", data)
+	}
+	sameStrings(t, "another user's tree", names(o.propfind("/cat/Season/"), "/cat/Season/"), []string{"__init__.py", "derby.json"})
+
+	// Truncated.
+	e.expect(e.do("PUT", "/matches/notes.md", "hello\n"), 201, "PUT notes.md")
+	r = e.expect(e.do("PUT", "/matches/notes.md", ""), 201, "PUT empty over notes.md")
+	if _, data := e.rawOf("matches", "notes.md"); len(data) != 0 || r.header.Get("ETag") == "" {
+		t.Fatalf("truncated notes.md %q, ETag %q", data, r.header.Get("ETag"))
+	}
+	if g := o.expect(o.do("GET", "/matches/notes.md", ""), 200, "GET"); g.body != "" {
+		t.Fatalf("GET %q", g.body)
+	}
+	e.expect(e.do("PUT", "/cat/Season/__init__.py", "x = 1\n"), 201, "fill it")
+	e.expect(e.do("PUT", "/cat/Season/__init__.py", ""), 201, "empty it again")
+	if _, data := e.rawOf(ns, item); len(data) != 0 {
+		t.Fatalf("__init__.py %q", data)
+	}
+
+	// A JSON file takes only I-JSON.
+	h, _ := e.load("matches", "derby")
+	for _, body := range []string{"", "  \n", "\xef\xbb\xbf"} {
+		e.expect(e.do("PUT", "/matches/derby.json", body), 400, "PUT "+strconv.Quote(body)+" over a JSON file")
+		e.expect(e.do("PUT", "/cat/Season/derby.json", body), 400, "PUT "+strconv.Quote(body)+" over a JSON file in a tree")
+	}
+	e.expectLive("matches", "derby", h, "after the refused saves")
+
+	// Placeholders: a new .json name, and a LOCK of a new name.
+	for _, p := range []string{"/matches/new.json", "/cat/Season/New.json"} {
+		e.expect(e.do("PUT", p, ""), 201, "0-byte PUT of "+p)
+		dir := p[:strings.LastIndexByte(p, '/')+1]
+		if l := e.propfind(dir); l[p].size != "0" {
+			t.Fatalf("placeholder %s: %v", p, names(l, dir))
+		}
+		if _, ok := o.propfind(dir)[p]; ok {
+			t.Fatalf("another user sees the placeholder %s", p)
+		}
+		e.expect(e.do("PUT", p, `{"v": 1}`), 201, "content of "+p)
+	}
+	_, doc := e.load("matches", "new")
+	sameJSON(t, doc, map[string]any{"v": 1})
+	ns, item = e.itemOf("cat", "New.json")
+	_, doc = e.load(ns, item)
+	sameJSON(t, doc, map[string]any{"v": 1})
+	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype><D:owner>me</D:owner></D:lockinfo>`
+	r = e.expect(e.do("LOCK", "/matches/locked.md", lock, "Timeout", "Second-60"), 201, "LOCK a new name")
+	if h, _ := e.load("matches", "locked.md"); h.State != client.NotFound {
+		t.Fatal("LOCK made a file")
+	}
+	e.expect(e.do("PUT", "/matches/locked.md", "# locked\n", "If", "("+r.header.Get("Lock-Token")+")"), 201, "PUT with the token")
+	if _, data := e.rawOf("matches", "locked.md"); string(data) != "# locked\n" {
+		t.Fatalf("locked.md %q", data)
+	}
+
+	// Copied and moved, an empty file stays one; its source is deleted
+	// only once the copy is written.
+	e.expect(e.do("COPY", "/matches/empty.txt", "", "Destination", "/matches/copy.txt"), 201, "COPY")
+	if _, data := e.rawOf("matches", "copy.txt"); len(data) != 0 {
+		t.Fatalf("copy.txt %q", data)
+	}
+	e.expect(e.do("MOVE", "/matches/copy.txt", "", "Destination", "/cat/Season/keep.txt"), 201, "MOVE into a tree")
+	ns, item = e.itemOf("cat", "keep.txt")
+	if _, data := e.rawOf(ns, item); len(data) != 0 {
+		t.Fatalf("keep.txt %q", data)
+	}
+	if hc, _ := e.load("matches", "copy.txt"); hc.State != client.Tombstoned || hc.Successor != item {
+		t.Fatalf("the moved file's source %+v", hc)
+	}
+	e.expect(e.do("PUT", "/matches/full.txt", "full"), 201, "PUT full.txt")
+	e.expect(e.do("MOVE", "/matches/empty.txt", "", "Destination", "/matches/full.txt"), 204, "MOVE onto a file")
+	if _, data := e.rawOf("matches", "full.txt"); len(data) != 0 {
+		t.Fatalf("full.txt %q", data)
+	}
+	e.expectTombstoned("matches", "empty.txt", "the moved file")
+}

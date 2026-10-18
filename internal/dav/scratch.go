@@ -12,8 +12,9 @@ import (
 // Scratch files: names that aren't documents, such as editors' swap,
 // backup and temporary files, .DS_Store and ._* (AppleDouble), the copies
 // file managers make beside a document in the flat view, and empty files a
-// client creates under a document name before writing it (LOCK, a 0-byte
-// PUT); and scratch directories, which apps save through (a dot, macOS's
+// client creates before writing them where their content decides their
+// kind (a LOCK of a new name, a 0-byte PUT of a new .json name,
+// holdEmpty); and scratch directories, which apps save through (a dot, macOS's
 // "(A Document Being Saved By …)", mayScratchDir). They live in memory,
 // per principal and path, bounded per grant root, and expire when left
 // untouched for ScratchIdle. They are never written to the core: moving
