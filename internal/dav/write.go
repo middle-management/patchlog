@@ -141,6 +141,9 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 		if o.pre && st.matchAny && !st.placeholder {
 			return false, fail(http.StatusPreconditionFailed, "%s/%s doesn't exist (If-Match: *)", ns, name)
 		}
+		if o.pre && st.ifMatch != "" && h.State == client.NotFound {
+			return false, noRevision(ns, name, st.ifMatch)
+		}
 		var res *client.WriteResult
 		var parent, out any = map[string]any{}, nil
 		var ps []any
@@ -182,6 +185,12 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 		return false, nil
 	})
 	return rev, exact, err
+}
+
+// noRevision is a save's 412 for an If-Match naming no revision of
+// ns/name, which never existed (§H.4 "Answers").
+func noRevision(ns, name, rev string) error {
+	return fail(http.StatusPreconditionFailed, "%s/%s has no revision %s (If-Match): it doesn't exist; reload it", ns, name, rev)
 }
 
 // restorePatches is the patch set writing v over tombstoned ns/name, and

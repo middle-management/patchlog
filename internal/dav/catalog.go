@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/text/unicode/norm"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/tree"
@@ -228,6 +229,8 @@ type treeEntry struct {
 	name string
 	node *tree.Node
 	item *client.Head
+	// escaped: its title breaks the rules, and is shown escaped (shown)
+	escaped bool
 }
 
 // treeDir is a folder's children as the tree shows them, by name and by
@@ -239,15 +242,16 @@ type treeDir struct {
 }
 
 // find returns the child named name, or whose name has name's nameKey
-// (a client whose file system ignores case asks for it so).
-func (d *treeDir) find(s *Server, name string) *treeEntry {
+// (a client whose file system ignores case asks for it so), and whether
+// name is its name, in NFC, as listed, rather than another case of it.
+func (d *treeDir) find(s *Server, name string) (*treeEntry, bool) {
 	if i, ok := d.byName[name]; ok {
-		return &d.entries[i]
+		return &d.entries[i], true
 	}
 	if i, ok := d.byKey[s.nameKey(name)]; ok {
-		return &d.entries[i]
+		return &d.entries[i], norm.NFC.String(name) == d.entries[i].name
 	}
-	return nil
+	return nil, false
 }
 
 // treeDir returns folder's children as the tree shows them (§H.2), once
@@ -258,7 +262,9 @@ func (d *treeDir) find(s *Server, name string) *treeEntry {
 // item's name and a folder by its node's. Siblings whose names compare
 // equal (nameKey), as a race leaves them, are shown as name (2).ext,
 // name (3).ext, … in order of their nodes' creation (born, then name),
-// the first keeping its name, skipping numbers whose names a sibling has.
+// the first keeping its name, skipping numbers whose names a sibling has;
+// a title shown escaped comes after those that aren't, so it never takes
+// the name of a real one.
 func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*treeDir, error) {
 	k := cg.cat + "/" + folder
 	if d := st.dirs[k]; d != nil {
@@ -298,7 +304,7 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 		if n.Kind != kindFolder && heads[i] == nil {
 			continue
 		}
-		d.entries = append(d.entries, treeEntry{name: nodeName(n), node: n, item: heads[i]})
+		d.entries = append(d.entries, treeEntry{name: nodeName(n), node: n, item: heads[i], escaped: n.Title != "" && shown(n.Title) != n.Title})
 	}
 	groups := map[string][]int{}
 	for i, e := range d.entries {
@@ -321,6 +327,11 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 			born[i] = cg.born(ctx, st.p, d.entries[i].node.Name)
 		}
 		sort.SliceStable(is, func(a, b int) bool {
+			if ea, eb := d.entries[is[a]].escaped, d.entries[is[b]].escaped; ea != eb {
+				// A title shown escaped never takes the name of one that
+				// is so (§H.2 "Titles").
+				return eb
+			}
 			ta, tb := born[is[a]], born[is[b]]
 			if ta.IsZero() != tb.IsZero() {
 				return !ta.IsZero()
@@ -401,7 +412,7 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 		if err != nil {
 			return t, err
 		}
-		e := d.find(st.s, seg)
+		e, _ := d.find(st.s, seg)
 		if e == nil || e.node.Kind != kindFolder {
 			t.kind = kMissing
 			return t, nil
@@ -414,8 +425,8 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 	if err != nil {
 		return t, err
 	}
-	if e := d.find(st.s, last); e != nil {
-		t.node, t.title = e.node.Name, e.name
+	if e, exact := d.find(st.s, last); e != nil {
+		t.node, t.title, t.otherCase = e.node.Name, e.name, !exact
 		if e.node.Kind == kindFolder {
 			t.kind = kFolder
 		} else {
@@ -943,6 +954,9 @@ func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 	}
 	if src.kind == kFolder {
 		st.scratchMoveUnder(src.path, dst.path)
+	} else {
+		st.s.forgetPath(st.p, src.path)
+		st.s.notePath(st.p, dst.path, src.docNS, src.docName)
 	}
 	return nil
 }
@@ -1091,6 +1105,9 @@ func (st *reqState) deleteSource(ctx context.Context, src, dst target, rev, succ
 	}
 	if de, ok := upstream(err).(*davError); ok && de.status == http.StatusPreconditionFailed {
 		return fail(http.StatusConflict, "%s was changed by someone else while it was moved: %s holds the version moved, and %s stays as it is now; reload both", src.path, dst.path, src.path)
+	}
+	if err == nil {
+		st.s.forgetPath(st.p, src.path)
 	}
 	return err
 }

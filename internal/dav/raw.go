@@ -260,6 +260,9 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 		if o.pre && st.matchAny && !st.placeholder {
 			return false, fail(http.StatusPreconditionFailed, "%s/%s doesn't exist (If-Match: *)", ns, name)
 		}
+		if o.pre && st.ifMatch != "" && h.State == client.NotFound {
+			return false, noRevision(ns, name, st.ifMatch)
+		}
 		var res *client.WriteResult
 		var parent any = map[string]any{}
 		var ps []any

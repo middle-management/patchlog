@@ -796,3 +796,38 @@ func TestRawOwnSaves(t *testing.T) {
 		t.Fatalf("c.txt %q", data)
 	}
 }
+
+// In the flat view a name that only looks like a copy of a live file (a
+// browser's duplicate download "invoice (1).pdf") is refused for a PUT
+// like any name that isn't a resource name, never kept in memory to
+// vanish; a file manager's Duplicate, a COPY to such a name, is scratch
+// until renamed. {name} (2).json, JSON document x's name beside a raw
+// x.json, keeps naming x for a client that has it open once the raw one
+// is gone, with or without If-Match, and is a 409 once x is gone too.
+func TestFlatCopyAndDupNames(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.expect(e.do("PUT", "/docs/invoice.pdf", "%PDF-1 a"), 201, "PUT invoice.pdf")
+	e.expect(e.do("PUT", "/docs/invoice%20(1).pdf", "%PDF-1 b"), 403, "PUT invoice (1).pdf")
+	e.expect(e.do("COPY", "/docs/invoice.pdf", "", "Destination", "/docs/invoice%20copy.pdf"), 201, "Duplicate")
+	sameStrings(t, "docs", e.liveNames("docs"), []string{"invoice.pdf"})
+
+	e.create("docs", "x", map[string]any{"v": "1"})
+	e.rawDoc("docs", "x.json", "application/json", []byte("// raw\n"), nil)
+	g := e.expect(e.do("GET", "/docs/x%20(2).json", ""), 200, "GET the duplicate name")
+	h, _ := e.load("docs", "x.json")
+	must(e.c.Delete(e.ctx, "docs", "x.json", h.ID))
+	e.expect(e.do("PUT", "/docs/x%20(2).json", edit(t, g.body, `"v": "1"`, `"v": "2"`)), 201, "PUT x (2).json after x.json went")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": "2"})
+	g = e.expect(e.do("GET", "/docs/x%20(2).json", ""), 200, "GET it again")
+	e.expect(e.do("PUT", "/docs/x%20(2).json", edit(t, g.body, `"v": "2"`, `"v": "3"`), "If-Match", g.header.Get("ETag")), 201, "PUT x (2).json with If-Match")
+	_, doc = e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": "3"})
+	sameStrings(t, "docs", names(e.propfind("/docs/"), "/docs/"), []string{"invoice copy.pdf", "invoice.pdf", "x.json"})
+	h, _ = e.load("docs", "x")
+	must(e.c.Delete(e.ctx, "docs", "x", h.ID))
+	e.expect(e.do("PUT", "/docs/x%20(2).json", `{"v": "4"}`), 409, "PUT x (2).json once x is gone")
+	e.expect(e.do("GET", "/docs/x%20(2).json", ""), 404, "GET x (2).json once x is gone")
+	e.expectTombstoned("docs", "x", "after the refused save")
+}

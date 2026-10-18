@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/schema"
@@ -141,13 +142,15 @@ func refOf(doc any) any {
 
 // scratchName reports the names of editors' and systems' own files, kept
 // by the gateway as scratch files (§H.6): .DS_Store, ._*, Thumbs.db, ~$*,
-// *.swp, 4913, *~, #*#, *___jb_tmp___ and .goutputstream-*; and
-// *___jb_old___, where JetBrains' safe write moves the original aside
-// before moving its *___jb_tmp___ in. A name a real file has is that
-// file's, whatever it looks like (resolveFlat).
+// *.swp, 4913, *~, #*#, *___jb_tmp___ and .goutputstream-*; *___jb_old___,
+// where JetBrains' safe write moves the original aside before moving its
+// *___jb_tmp___ in; and "Icon\r", where macOS keeps a folder's custom
+// icon, a name no title can be (a CR), which a Finder copy of such a folder
+// writes. A name a real file has is that file's, whatever it looks like
+// (resolveFlat).
 func scratchName(base string) bool {
 	switch {
-	case base == ".DS_Store", base == "Thumbs.db", base == "4913",
+	case base == ".DS_Store", base == "Thumbs.db", base == "4913", base == "Icon\r",
 		strings.HasPrefix(base, "._"), strings.HasPrefix(base, "~$"), strings.HasPrefix(base, ".goutputstream-"),
 		strings.HasSuffix(base, ".swp"), strings.HasSuffix(base, "~"),
 		len(base) > 1 && base[0] == '#' && base[len(base)-1] == '#',
@@ -159,14 +162,24 @@ func scratchName(base string) bool {
 
 // dupName is the name a file whose name another has is shown by (§H.2
 // "Siblings"): name (2).ext, name (3).ext, …, the number before the
-// extension (a folder's at the end), skipping one taken reports taken.
+// extension (a folder's at the end), skipping one taken reports taken;
+// within maxTitle bytes, the stem cut short (at a character) to fit.
 func dupName(name string, dir bool, taken func(string) bool) string {
 	stem, ext := name, ""
 	if i := strings.LastIndexByte(name, '.'); i > 0 && !dir {
 		stem, ext = name[:i], name[i:]
 	}
 	for n := 2; ; n++ {
-		if d := stem + " (" + strconv.Itoa(n) + ")" + ext; !taken(d) {
+		num := " (" + strconv.Itoa(n) + ")"
+		s, e := stem, ext
+		if len(s)+len(num)+len(e) > maxTitle && len(num)+len(e) >= maxTitle {
+			s, e = stem+ext, ""
+		}
+		for len(s)+len(num)+len(e) > maxTitle {
+			_, size := utf8.DecodeLastRuneInString(s)
+			s = s[:len(s)-size]
+		}
+		if d := s + num + e; !taken(d) {
 			return d
 		}
 	}

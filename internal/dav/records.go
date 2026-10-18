@@ -74,8 +74,21 @@ func (d docRecs) cost() int {
 type recStore struct {
 	docs      lru.Cache[string, docRecs] // by principal id and ns/name
 	forgotten lru.Cache[string, bool]    // documents whose records the bounds dropped
+	paths     lru.Cache[string, pathRec] // by principal id and path
 	used      time.Time
 }
+
+// pathRec is the document a principal last read whole or wrote under a
+// path (records are kept by document, and a path may come to name
+// another: a tree's title given to a new item, a raw x.json taking the
+// name of JSON document x), and when.
+type pathRec struct {
+	ns, name string
+	at       time.Time
+}
+
+// maxPaths bounds the paths a grant root's principals' path records keep.
+const maxPaths = 1 << 16
 
 func recKey(p *principal, ns, name string) string { return p.id + "\x00" + ns + "/" + name }
 
@@ -97,6 +110,7 @@ func (s *Server) storeLocked(root string) *recStore {
 		rs = &recStore{used: s.opt.Now()}
 		rs.docs.MaxEntries, rs.docs.MaxBytes = 1<<16, s.opt.RecordBytes
 		rs.forgotten.MaxEntries = maxForgotten
+		rs.paths.MaxEntries = maxPaths
 		rs.docs.OnEvict = func(k string, _ docRecs) { rs.forgotten.Put(k, true, 1) }
 		s.recRoots[root] = rs
 	}
@@ -236,6 +250,33 @@ func (s *Server) sweepRecordsLocked(now time.Time) {
 	}
 }
 
+// notePath records that p read ns/name whole, or wrote it, under path.
+func (s *Server) notePath(p *principal, path, ns, name string) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	s.storeLocked(p.acct.root).paths.Put(p.id+"\x00"+path, pathRec{ns: ns, name: name, at: s.opt.Now()}, 1)
+}
+
+// pathOf returns the document p last read whole or wrote under path,
+// within RecordIdle.
+func (s *Server) pathOf(p *principal, path string) (string, string, bool) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	r, ok := s.storeLocked(p.acct.root).paths.Get(p.id + "\x00" + path)
+	if !ok || s.opt.Now().Sub(r.at) > s.opt.RecordIdle {
+		return "", "", false
+	}
+	return r.ns, r.name, true
+}
+
+// forgetPath forgets what p read or wrote under path: it deleted or moved
+// the file there, or found it gone (a reload).
+func (s *Server) forgetPath(p *principal, path string) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	s.storeLocked(p.acct.root).paths.Remove(p.id + "\x00" + path)
+}
+
 // refuse marks p's records of ns/name as refused: the save was a 409,
 // which asks for a reload.
 func (s *Server) refuse(p *principal, ns, name string) {
@@ -318,16 +359,18 @@ func (st *reqState) repr(hd headDoc) []byte {
 	return hd.e.rendered
 }
 
-// stagedServe is the document a GET is answering with: a record once its
-// body is sent whole (errWriter), not on a 304 or for a range.
-type stagedServe struct{ ns, name, rev string }
+// stagedServe is the document a GET is answering with, under path: a
+// record once its body is sent whole (errWriter), not on a 304 or for a
+// range.
+type stagedServe struct{ ns, name, rev, path string }
 
 // served records a staged GET whose body went out: a reload, if a save
-// was refused.
+// was refused, and the document its path names now.
 func (st *reqState) served() {
 	if sv := st.serve; sv != nil {
 		st.serve = nil
 		st.s.remember(st.p, sv.ns, sv.name, record{rev: sv.rev}, true)
+		st.s.notePath(st.p, sv.path, sv.ns, sv.name)
 	}
 }
 

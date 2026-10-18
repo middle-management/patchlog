@@ -287,8 +287,20 @@ func TestTreeNewFiles(t *testing.T) {
 	if after := len(e.liveNames("cat")); after != before {
 		t.Fatalf("refused names made %d nodes", after-before)
 	}
-	// A sibling's name, under any case, is the sibling's.
-	e.expect(e.do("PUT", "/cat/Season/DERBY.JSON", `{"title": "Derby!"}`), 201, "PUT to a sibling's name in capitals")
+	// A sibling's name under another case is refused (§H.2: a name a
+	// sibling has isn't created, and a client telling case apart would
+	// write one file over the other), but by a client that read the
+	// sibling under that spelling, ignoring case: then it is the
+	// sibling's.
+	r = e.expect(e.do("PUT", "/cat/Season/DERBY.JSON", `{"title": "Derby!"}`), 409, "PUT to a sibling's name in capitals")
+	if !strings.Contains(r.body, `"derby.json"`) {
+		t.Fatalf("409 %q", r.body)
+	}
+	if _, doc := e.load("matches", "derby"); doc.(map[string]any)["title"] != "Derby" {
+		t.Fatalf("derby %v", doc)
+	}
+	e.expect(e.do("GET", "/cat/Season/DERBY.JSON", ""), 200, "GET a sibling's name in capitals")
+	e.expect(e.do("PUT", "/cat/Season/DERBY.JSON", `{"title": "Derby!"}`), 201, "PUT to the name it was read under")
 	if _, doc := e.load("matches", "derby"); doc.(map[string]any)["title"] != "Derby!" {
 		t.Fatalf("derby %v", doc)
 	}
@@ -964,4 +976,78 @@ func TestTreeNewFileCleanupRetried(t *testing.T) {
 	})
 	e.expect(e.do("PUT", "/cat/Season/new.md", "new"), 403, "PUT, its placement refused")
 	sameStrings(t, "matches", e.liveNames("matches"), []string{"derby"})
+}
+
+// Names in a tree compare without case (§H.2), and a name that is a
+// sibling's only under another case is refused for a new file, a write and
+// a MOVE onto it (409, naming the sibling), so a client telling case apart
+// (rclone, davfs2 on Linux) copying README.md and readme.md doesn't write
+// one over the other; its cleanup DELETE of the refused name is guarded
+// (§H.6). Folding is simple, a character for a character: Maße.txt and
+// Masse.txt are two files. "Icon\r", macOS's custom folder icon, is a
+// scratch file (no title holds a CR).
+func TestTreeCaseVariants(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	e.expect(e.do("PUT", "/cat/Season/README.md", "upper\n"), 201, "PUT README.md")
+	r := e.expect(e.do("PUT", "/cat/Season/readme.md", "lower\n"), 409, "PUT readme.md")
+	if !strings.Contains(r.body, `"README.md"`) {
+		t.Fatalf("409 %q", r.body)
+	}
+	e.expect(e.do("DELETE", "/cat/Season/readme.md", ""), 409, "the refused upload's cleanup DELETE")
+	e.expect(e.do("PUT", "/cat/Season/Other.md", "other\n"), 201, "PUT Other.md")
+	e.expect(e.do("MOVE", "/cat/Season/Other.md", "", "Destination", "/cat/Season/readme.MD"), 409, "MOVE onto another case of README.md")
+	e.expect(e.do("COPY", "/cat/Season/Other.md", "", "Destination", "/cat/Season/ReadMe.md"), 409, "COPY onto another case of README.md")
+	if g := e.do("GET", "/cat/Season/README.md", ""); g.body != "upper\n" {
+		t.Fatalf("README.md %q", g.body)
+	}
+	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"Other.md", "README.md", "derby.json"})
+	e.expect(e.do("PUT", "/cat/Season/Masse.txt", "Masse = mass\n"), 201, "PUT Masse.txt")
+	e.expect(e.do("PUT", "/cat/Season/Ma%C3%9Fe.txt", "Maße = measurements\n"), 201, "PUT Maße.txt")
+	if g := e.do("GET", "/cat/Season/Masse.txt", ""); g.body != "Masse = mass\n" {
+		t.Fatalf("Masse.txt %q", g.body)
+	}
+	e.expect(e.do("PUT", "/cat/Season/Icon%0D", "icns"), 201, "PUT Icon\\r")
+	sameStrings(t, "Season", names(e.another().propfind("/cat/Season/"), "/cat/Season/"), []string{"Masse.txt", "Maße.txt", "Other.md", "README.md", "derby.json"})
+	// With -case-sensitive, they are two files.
+	cs := treeEnv(t, func(_ *clienttest.Options, o *dav.Options) { o.CaseSensitive = true })
+	cs.expect(cs.do("PUT", "/cat/Season/README.md", "upper\n"), 201, "PUT README.md")
+	cs.expect(cs.do("PUT", "/cat/Season/readme.md", "lower\n"), 201, "PUT readme.md, case-sensitive")
+	sameStrings(t, "Season", names(cs.propfind("/cat/Season/"), "/cat/Season/"), []string{"README.md", "derby.json", "readme.md"})
+}
+
+// A folder whose name starts with a dot (.github, .obsidian) is a
+// person's folder in a tree, its files written to the core; only the
+// folders apps and systems save through (§H.6: macOS's "(A Document Being
+// Saved By …)", .TemporaryItems, …) are scratch.
+func TestTreeDotFolders(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	e.expect(e.do("MKCOL", "/cat/.github", ""), 201, "MKCOL .github")
+	e.expect(e.do("MKCOL", "/cat/.github/workflows", ""), 201, "MKCOL workflows")
+	e.expect(e.do("PUT", "/cat/.github/workflows/ci.yml", "on: push\n"), 201, "PUT ci.yml")
+	o := e.another()
+	if g := o.expect(o.do("GET", "/cat/.github/workflows/ci.yml", ""), 200, "GET by another user"); g.body != "on: push\n" {
+		t.Fatalf("ci.yml %q", g.body)
+	}
+	e.expect(e.do("MKCOL", "/cat/.TemporaryItems", ""), 201, "MKCOL macOS's folder")
+	e.expect(e.do("PUT", "/cat/.TemporaryItems/x", "temp"), 201, "PUT in it")
+	sameStrings(t, "cat", names(o.propfind("/cat/"), "/cat/"), []string{".github/", "Empty/", "Season/"})
+}
+
+// A title another tool wrote that breaks the rules is shown escaped, and
+// never takes the name of a real title that reads the same (§H.2): the
+// real one keeps its name, the escaped one is numbered, older or not.
+func TestTreeEscapedTitles(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	e.create("matches", "slash", map[string]any{"v": "slash"})
+	e.create("cat", "matches.slash", map[string]any{"title": "a/b.json", "parents": parents("cat", "empty")})
+	e.s.Clock.Advance(time.Second)
+	e.create("matches", "real", map[string]any{"v": "real"})
+	e.create("cat", "matches.real", map[string]any{"title": "a%2Fb.json", "parents": parents("cat", "empty")})
+	sameStrings(t, "Empty", names(e.propfind("/cat/Empty/"), "/cat/Empty/"), []string{"a%2Fb (2).json", "a%2Fb.json"})
+	if g := e.do("GET", "/cat/Empty/a%252Fb.json", ""); !strings.Contains(g.body, `"real"`) {
+		t.Fatalf("a%%2Fb.json %q", g.body)
+	}
 }

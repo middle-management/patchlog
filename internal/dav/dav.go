@@ -460,6 +460,7 @@ func (st *reqState) answered(status int) {
 		for _, g := range st.gone {
 			st.s.reloaded(st.p, g.ns, g.name)
 		}
+		st.s.forgetPath(st.p, st.path)
 	}
 }
 

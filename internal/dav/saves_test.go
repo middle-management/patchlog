@@ -697,3 +697,66 @@ func TestSaveOwnRevert(t *testing.T) {
 	_, doc := e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"a": "orig", "b": "changed"})
 }
+
+// Records are kept by document, and a path may come to name another: a
+// save without a tag at a path that names another document than the one
+// the user read or wrote under it, or none, is a 409 rather than a save
+// over what is there (§H.4): a tree's title given to a new item after the
+// old one was deleted, a raw x.json taking JSON document x's name. A
+// reload (a GET of the path) settles it. A save naming a revision
+// (If-Match) where the path holds no file is a 412, never a new file.
+func TestSavePathReplaced(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t, func(_ *clienttest.Options, o *dav.Options) { o.CatalogTTL = time.Nanosecond })
+	g := e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET")
+	hn, _ := e.load("cat", "matches.derby")
+	must(e.c.Delete(e.ctx, "cat", "matches.derby", hn.ID))
+	hi, _ := e.load("matches", "derby")
+	must(e.c.Delete(e.ctx, "matches", "derby", hi.ID))
+	e.create("matches", "newderby", map[string]any{"title": "Their new derby", "venue": "Theirs"})
+	e.create("cat", "matches.newderby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+	h, _ := e.load("matches", "newderby")
+	mine := edit(t, g.body, `"title": "Derby"`, `"title": "My derby"`)
+	e.expect(e.do("PUT", "/cat/Season/derby.json", mine), 409, "PUT, the path naming a new item")
+	e.expect(e.do("PUT", "/cat/Season/derby.json", mine, "If-Match", g.header.Get("ETag")), 412, "PUT If-Match, the path naming a new item")
+	e.expectLive("matches", "newderby", h, "after the refused saves")
+	r := e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "reload")
+	e.expect(e.do("PUT", "/cat/Season/derby.json", edit(t, r.body, `"Theirs"`, `"Mine"`)), 201, "PUT after the reload")
+	_, doc := e.load("matches", "newderby")
+	sameJSON(t, doc, map[string]any{"title": "Their new derby", "venue": "Mine"})
+
+	// Deleted by someone else, the tree read again since: no new file.
+	g = e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET")
+	o := e.another()
+	o.expect(o.do("DELETE", "/cat/Season/derby.json", ""), 204, "another user's DELETE")
+	before := e.liveNames("matches")
+	e.expect(e.do("PUT", "/cat/Season/derby.json", `{"title": "Mine"}`), 409, "PUT over another user's delete")
+	e.expect(e.do("PUT", "/cat/Season/derby.json", `{"title": "Mine"}`, "If-Match", g.header.Get("ETag")), 412, "PUT If-Match over another user's delete")
+	sameStrings(t, "matches", e.liveNames("matches"), before)
+	e.expect(e.do("GET", "/cat/Season/derby.json", ""), 404, "reload: gone")
+	e.expect(e.do("PUT", "/cat/Season/derby.json", `{"title": "Mine"}`), 201, "PUT after the reload")
+	if ns, item := e.itemOf("cat", "derby.json"); ns != "matches" || item == "newderby" {
+		t.Fatalf("derby.json is %s/%s", ns, item)
+	}
+
+	// The flat view: a raw x.json takes JSON document x's name.
+	f := newEnv(t, []string{"docs"}, nil, nil)
+	f.create("docs", "x", map[string]any{"v": "1"})
+	g = f.expect(f.do("GET", "/docs/x.json", ""), 200, "GET")
+	f.rawDoc("docs", "x.json", "application/json", []byte("// someone's raw file\n"), nil)
+	f.expect(f.do("PUT", "/docs/x.json", edit(t, g.body, `"v": "1"`, `"v": "2"`)), 409, "PUT, a raw x.json taking the name")
+	if _, data := f.rawOf("docs", "x.json"); string(data) != "// someone's raw file\n" {
+		t.Fatalf("raw x.json %q", data)
+	}
+	f.expect(f.do("GET", "/docs/x.json", ""), 200, "reload")
+	f.expect(f.do("PUT", "/docs/x.json", "// mine\n"), 201, "PUT after the reload")
+	if _, data := f.rawOf("docs", "x.json"); string(data) != "// mine\n" {
+		t.Fatalf("raw x.json %q", data)
+	}
+	// If-Match naming a revision, where no file is.
+	for _, p := range []string{"/docs/new.md", "/docs/new2.json"} {
+		f.expect(f.do("PUT", p, `{}`, "If-Match", `"bzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"`), 412, "PUT If-Match "+p)
+	}
+	f.expect(f.do("PUT", "/docs/.x.swp", `swap`, "If-Match", `"bzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"`), 412, "PUT If-Match to a scratch name")
+	sameStrings(t, "docs", f.liveNames("docs"), []string{"x", "x.json"})
+}

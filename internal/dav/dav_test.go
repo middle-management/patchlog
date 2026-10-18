@@ -776,9 +776,10 @@ func TestFoldersWhereNoFolderCanBe(t *testing.T) {
 	for _, p := range []string{"/matches/untitled folder", "/matches/archive", "/untitled folder", "/New folder"} {
 		e.expect(e.do("MKCOL", p, ""), 403, "MKCOL "+p)
 	}
-	e.expect(e.do("MKCOL", "/matches/.hidden", ""), 201, "MKCOL a dot folder")
-	e.expect(e.do("MOVE", "/matches/.hidden", "", "Destination", "/matches/archive"), 403, "MOVE it to a person's name")
-	e.expect(e.do("PUT", "/matches/.hidden/q3.json", `{"draft": true}`), 201, "PUT in an app's folder")
+	e.expect(e.do("MKCOL", "/matches/.hidden", ""), 403, "MKCOL a dot folder")
+	e.expect(e.do("MKCOL", "/matches/.TemporaryItems", ""), 201, "MKCOL an app's folder")
+	e.expect(e.do("MOVE", "/matches/.TemporaryItems", "", "Destination", "/matches/archive"), 403, "MOVE it to a person's name")
+	e.expect(e.do("PUT", "/matches/.TemporaryItems/q3.json", `{"draft": true}`), 201, "PUT in an app's folder")
 	e.expect(e.do("MKCOL", "/cat/untitled folder", ""), 201, "New Folder in a tree")
 	e.expect(e.do("PUT", "/cat/untitled folder/Report.json", `{"draft": true}`), 201, "PUT a file in it")
 	e.expect(e.do("MOVE", "/cat/untitled folder", "", "Destination", "/cat/Draft Ideas"), 201, "MOVE it to a person's name")
@@ -853,4 +854,27 @@ func TestMkcolExisting(t *testing.T) {
 			t.Fatalf("logged: %s", l)
 		}
 	}
+}
+
+// Only editors' and systems' own files and app folders can be at the root
+// (§H.6): a file there never reaches the core, so any other name is
+// refused rather than kept in memory a while (a report.pdf dropped on the
+// mount's top folder). In the flat view MKCOL is 403 (§H.8) but for app
+// folders, a dot folder too: what is copied into it would be lost.
+func TestRootAndFlatFolders(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	for _, n := range []string{"report.pdf", "notes.md", "Report.json", "photos", ".hidden"} {
+		e.expect(e.do("PUT", "/"+n, "data\n"), 403, "PUT /"+n)
+	}
+	e.expect(e.do("PUT", "/.DS_Store", "Bud1"), 201, "PUT /.DS_Store")
+	e.expect(e.do("MKCOL", "/Photos", ""), 403, "MKCOL /Photos")
+	e.expect(e.do("MKCOL", "/.github", ""), 403, "MKCOL /.github")
+	e.expect(e.do("MKCOL", "/.TemporaryItems", ""), 201, "MKCOL /.TemporaryItems")
+	sameStrings(t, "root", names(e.propfind("/"), "/"), []string{".DS_Store", ".TemporaryItems/", "docs/"})
+	for _, n := range []string{".github", ".obsidian", "Photos"} {
+		e.expect(e.do("MKCOL", "/docs/"+n, ""), 403, "MKCOL /docs/"+n)
+	}
+	e.expect(e.do("PUT", "/docs/.github/ci.yml", "on: push\n"), 409, "PUT below a folder that wasn't made")
+	e.expect(e.do("MKCOL", "/docs/(A Document Being Saved By TextEdit)", ""), 201, "MKCOL an app's folder")
 }

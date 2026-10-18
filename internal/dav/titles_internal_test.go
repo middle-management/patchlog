@@ -45,14 +45,20 @@ func TestShownTitles(t *testing.T) {
 	}
 }
 
-// Siblings' names compare after NFC and, unless case-sensitive, case
-// folding.
+// Siblings' names compare after NFC and, unless case-sensitive, simple
+// case folding, a character for a character, as case-insensitive file
+// systems compare them: ß isn't ss, nor ﬁ fi.
 func TestNameKeys(t *testing.T) {
 	t.Parallel()
 	folding, exact := &Server{}, &Server{opt: Options{CaseSensitive: true}}
-	for _, p := range [][2]string{{"Notes.MD", "notes.md"}, {"Résumé", "résumé"}, {"STRASSE", "straße"}} {
+	for _, p := range [][2]string{{"Notes.MD", "notes.md"}, {"Résumé", "résumé"}, {"STRAẞE", "straße"}, {"\u212Aelvin", "kelvin"}, {"ΣΊΣΥΦΟΣ", "σίσυφος"}} {
 		if folding.nameKey(p[0]) != folding.nameKey(p[1]) {
 			t.Errorf("%q and %q differ, folded", p[0], p[1])
+		}
+	}
+	for _, p := range [][2]string{{"Masse.txt", "Maße.txt"}, {"STRASSE", "straße"}, {"ﬁle.txt", "file.txt"}} {
+		if folding.nameKey(p[0]) == folding.nameKey(p[1]) {
+			t.Errorf("%q and %q compare equal, folded", p[0], p[1])
 		}
 	}
 	if exact.nameKey("Notes.md") == exact.nameKey("notes.md") {

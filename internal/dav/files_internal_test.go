@@ -1,7 +1,9 @@
 package dav
 
 import (
+	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
@@ -66,6 +68,14 @@ func TestDupNames(t *testing.T) {
 	// A folder's number is at the end: a dot in its name is no extension.
 	if got := dupName("v1.2", true, func(string) bool { return false }); got != "v1.2 (2)" {
 		t.Fatalf("dupName of a folder %q", got)
+	}
+	// Within 255 bytes, the stem cut short at a character.
+	long := strings.Repeat("é", 125) + ".md"
+	if got := dupName(long, false, func(string) bool { return false }); len(got) > maxTitle || !utf8.ValidString(got) || !strings.HasSuffix(got, " (2).md") {
+		t.Fatalf("dupName of a %d-byte name: %d bytes %q", len(long), len(got), got)
+	}
+	if got := dupName(strings.Repeat("x", 255), true, func(string) bool { return false }); len(got) != maxTitle || !strings.HasSuffix(got, " (2)") {
+		t.Fatalf("dupName of a 255-byte folder name: %d bytes", len(got))
 	}
 	for in, want := range map[string]string{"x (2).json": "x.json", "a.b (12).md": "a.b.md", "x (2)": "x"} {
 		if got, _, ok := dupOf(in); !ok || got != want {
