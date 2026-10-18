@@ -2332,23 +2332,27 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   is a file, not vim's probe). A new file is made under its name, which must be a resource name
   (§3.6: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 128
   characters), or for a JSON document `{name}.json`; any other name (`Notes.md`, a Save As
-  `Report.json`, `my notes.txt`, `.notes.tmp`) is refused with `403`, saying so, since kept in
-  memory only it would vanish, but for the scratch names below, and for the names file managers
-  give a copy made beside a file (Finder's Duplicate `x copy.md`, `x copy 2.md` and Keep Both's
-  `x 2.md`; Explorer's `x - Copy.md`, `Copy of x.md` and `x (1).md`; GNOME's `x (copy).md`, and
-  the same of any extension), which are scratch files, so a copy renamed to a file's name starts
-  a file from a template; one not renamed vanishes with the other scratch files. A new file whose
-  resource another kind of file has (`notes.md` beside a JSON document `notes.md`, shown as
-  `notes.md.json`; a JSON `pic.json` beside a raw `pic`) is `409`.
+  `Report.json`, `my notes.txt`, `.notes.tmp`, a browser's `invoice (1).pdf`) is refused with
+  `403`, saying so, since kept in memory only it would vanish, but for the scratch names below.
+  A COPY to one of the names file managers give a copy made beside a live file (Finder's
+  Duplicate `x copy.md`, `x copy 2.md` and Keep Both's `x 2.md`; Explorer's `x - Copy.md`, `Copy
+  of x.md` and `x (1).md`; GNOME's `x (copy).md`, and the same of any extension) makes a scratch
+  file, so a copy renamed to a file's name starts a file from a template; one not renamed
+  vanishes with the other scratch files. A new file whose resource another kind of file has
+  (`notes.md` beside a JSON document `notes.md`, shown as `notes.md.json`; a JSON `pic.json`
+  beside a raw `pic`) is `409`. `x (2).json` keeps naming the JSON document `x` for a client that
+  has it open once the raw `x.json` is gone (it is listed as `x.json` then), and is `409` once
+  `x` is gone too.
 - **Reading.** A raw file is served by this server itself, from its blob through the core and
   never as a redirect to the core's origin, streamed, with ranges (`206`), as its type. A JSON
   file reads as its rendering: the document's canonical text (§3.1), without a top-level `$nonce`
   of the fresh form and a `$successor` of §8.1's, laid out as `JSON.stringify(value, null, 2)`
   lays it out (members and elements on lines of their own, two spaces a level, `{}` and `[]` for
   empty ones, keys in JCS's order, those that look like array indices too), with one final LF:
-  the same bytes for the same revision. Every file's ETag is its head revision id, and files are
-  served with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, since
-  this origin holds users' credentials. A revision that holds exactly what a user wrote reads
+  the same bytes for the same revision. Every file's ETag is its head revision id, and every
+  answer, files, listings and error texts alike, carries `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox`, since this origin holds users' credentials; a `POST`, which
+  x/net/webdav would answer as a `GET`, is `405`. A revision that holds exactly what a user wrote reads
   back to that user as they wrote it, so a client checking the size of its upload finds it.
 - **Listings** (§H.3): each file's ETag is its row's `target`, its time the row's `created` (or,
   for rows without, the `Last-Modified` of the document's read; with neither, from an older core,
@@ -2368,9 +2372,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
 
 **Saving.**
 
-- A written file is buffered whole (`-max-file-size`, default 16 MiB, and at most 8 times that
-  over every request at once, in a gateway a quarter of that, or one file, for one grant root's,
-  else `503`) and committed once complete; a body cut short writes nothing, and a `PUT` with
+- A written file is buffered whole (a raw file at most `-max-raw-size`, default 64 MiB, the
+  core's default `blobSize`; a JSON file and a temporary file at most `-max-file-size`, default 16
+  MiB; at most the larger of 8 times `-max-file-size` and twice `-max-raw-size` over every request
+  at once, in a gateway a quarter of that, or one raw file, for one grant root's, else `503`) and
+  committed once complete; a body cut short writes nothing, and a `PUT` with
   `Content-Range` (a partial write) is `400`, writing nothing (§H.4). Other request bodies
   (PROPFIND, PROPPATCH, LOCK) are at most 64 KiB (`413`), read whole before they are handled, and
   those over 4 KiB are handled four at a time over the server: x/net/webdav decodes them a value
@@ -2381,13 +2387,19 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   beyond 2⁵³) included, as a raw file of its whole name. An existing file keeps its kind: a JSON
   file takes only I-JSON (`400` otherwise, nothing written), a raw file any bytes. One the user
   deleted moments ago and writes again (below) is restored as the file it was.
-- **Raw files** are saved by comparing the base (below) with the head first: any change of the
-  bytes between them is a `409`, as raw files have no paths to merge. Then the bytes are uploaded
-  as a blob (once however often the head moves meanwhile; `413` over the namespace's `blobSize`,
-  before any upload) and the reference's members set one by one (`/$blob`, `/type`, `/size`,
-  `/nonce`), never the root, so a `$schema` or `$successor` beside it stays. Bytes the head
-  already holds write nothing. The revision holds exactly what was sent, so its ETag answers the
-  PUT.
+- **Raw files** have no paths to merge, so their base is checked, never merged from: the
+  versions the user may have are the revision `If-Match` names, else every version this user was
+  served whole or wrote (below), and if, after any of them, someone else changed the bytes (a log
+  entry the user didn't write set a member of the reference, or the root) or deleted or restored
+  the file, the save is a `409`, so an editor's buffer isn't saved over bytes a preview read; the
+  user's own saves since are theirs to replace, so consecutive saves never conflict, whatever
+  their sizes, nor does a stale `If-Match` after the user's own save. A version the user had,
+  saved unchanged after someone else's bytes, writes nothing, and gets no ETag. Then the bytes
+  are uploaded as a blob (once however often the head moves meanwhile; `413` over the namespace's
+  `blobSize`, before any upload) and the reference's members set one by one (`/$blob`, `/type`,
+  `/size`, `/nonce`), never the root, so a `$schema` or `$successor` beside it stays. Bytes the
+  head already holds write nothing. The revision holds exactly what was sent, so its ETag answers
+  the PUT.
 - A new name is created (`If-None-Match: *` upstream); a tombstoned one is restored, so a name
   keeps one chain (§8.2): moments after the user's own DELETE (below), with the edit rebased on
   its last live document; a save from a version from before someone else's delete is a `409`
@@ -2396,7 +2408,10 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   moved away and written again isn't marked moved). A raw file over a JSON document's, or the
   other way round, replaces its root. A purged one is `410`, as is any name of a purged
   namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
-  `If-Match: *` (edit only) over a missing one; an empty placeholder (below) exists for both.
+  `If-Match: *` (edit only) over a missing one; an empty placeholder (below) exists for both. An
+  `If-Match` (or `If` header) tag naming a revision where no file is (a name that never existed,
+  a tree's name whose file was deleted or moved, a scratch name) is `412`, never a new file, but
+  where it restores the user's own DELETE of moments ago (below).
 - An existing JSON file gets the user's edit rebased on its head (§11.3, §H.4): the diff
   (`merge.Diff`) from the version the user edited, the base (as rendered: a `$successor` it
   leaves out stays), to what they wrote, applied to the current head and appended with `If-Match`
@@ -2411,7 +2426,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   an editor opened stays while a preview reads others' revisions); a save that changed nothing
   is no write. Of those, it is the one closest to what was written (the fewest changed paths): an
   editor's buffer is what it opened or last saved plus the user's edit, while a preview pane's or
-  a second window's GET moves on without it. A file equal to an older version is a save of it
+  a second window's GET moves on without it. Records are kept by document, and with them the
+  document each path named when the user last read it whole or wrote it: a save without a tag at
+  a path that names another document now (a tree's title given to a new item after the old one
+  was deleted, a raw `x.json` taking the JSON document `x`'s name), or none, is a `409` asking for
+  a reload, which a GET of the path is; the user's own DELETE or MOVE forgets the path. A file equal to an older version is a save of it
   unchanged, or, when the user wrote since and the file reverts just what that save changed, an
   undo of it. Edits others made since the base are kept: the patch set holds only the user's
   changes. Others' writes are what differs between the base and the head, and the writes of the
@@ -2426,13 +2445,17 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
 - A patch set over `opsPerSet` or `patchSetSize` (§6.6: the namespace's, else the deployment's,
   which the core's refusal tells) is sent as a root `replace` instead, which may be as large as
   `documentSize`, carrying the document's `$successor` and a fresh `$nonce` where nonces apply,
-  when the base is the head (§H.4): it then overwrites no one's edit. A save merged with others'
+  when the base is the head (§H.4): it then overwrites no one's edit. A restore after the user's
+  own DELETE (below) is written whole so when its base is the last live document. A save merged with others'
   edits is `413` instead, asking for a reload, after which the base is the head.
 - The base isn't guessed: a save may change the head only where every version the user may have
   edited agrees with the head (or holds what the user wrote there since), so whichever one their
   program had, no edit someone else made in between is undone or overwritten unseen. Where they
   can't be told apart, as the version an editor opened and a newer one a preview read, when the
-  edit covers what changed in between, the save is a `409` too. A `409` asks for a reload: the
+  edit covers what changed in between, the save is a `409` too; so is one that another version,
+  taken as the base, would apply otherwise as safely, naming where: an undo of the user's save
+  combined with a new edit looks like a second program's edit from the version before that save,
+  and taken as the latter the undo was dropped. A `409` asks for a reload: the
   user's next GET of the whole document sends it whatever its validators say (a cached copy may
   be what the editor had), and drops the versions recorded before the `409`, so the reloaded one
   is the base of the edit after it; a range read isn't that reload. A version that can't be read
@@ -2445,9 +2468,9 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   after a restart, or once a day has passed), the head is the base, so the file as written wins,
   as the diff from it; over a tombstoned document, a file made anew (above).
   Versions the bounds pushed out are remembered as lost: then a save that changes the document is
-  a `409` until a reload, rather than rebased on what is left. Within one user, the closest
-  version decides: two programs saving the same value, the last wins, and an undo of a save
-  combined with new edits is taken as edits of the older version (the undone change stays).
+  a `409` until a reload, rather than rebased on what is left. Within one user, two programs
+  saving the same value, the last wins; two editing from one version, the second save is a `409`
+  (above) until it reloads.
 - A PUT answers with the revision as its ETag only when that revision holds exactly what was sent
   (§H.1: its rendering is the uploaded value, whatever the formatting, and whatever `$nonce` it was
   given); one merged with others' edits gets none (RFC 9110 §9.3.4), and the user's next GET or
@@ -2485,10 +2508,14 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   than a new login prompt). A `429` is waited out when its Retry-After is at most 2 s, and is
   otherwise `503` with Retry-After. A core that can't be reached is `502` (the details are
   logged). `423` and `507` mean only a lock held and this server's memory full.
-- An empty write (a LOCK of a new name, Finder's 0-byte PUT) makes an empty placeholder until
-  content arrives; it never truncates a live file, so an empty raw file isn't made over WebDAV.
+- An empty file is a file (§H.1): a raw file of 0 bytes is made (`__init__.py`, `.gitkeep`), a raw
+  file truncated, and a JSON file refuses it (`400`), as any content that isn't I-JSON. Only where
+  the content decides the kind, a LOCK of a new name and a new `.json` name (Finder's 0-byte PUT
+  before the content), is it an empty placeholder in memory until content arrives.
 - DELETE tombstones (§8.1); with `If-Match` (or an `If` header's entity tag) naming another
-  revision than the head, it is `412`.
+  revision than the head, it is `412`. A DELETE that passes destroys the user's locks on the path
+  (RFC 4918 §9.6.1), and so does a MOVE on its source. A MOVE or COPY of a file the client holds
+  locked, sent with that lock's token, is taken: its destination needs a token only if locked.
 - **Guards** (§H.6). A refused PUT of a file, or a refused MOVE onto an existing file (answered
   `4xx` or `5xx`, having written nothing), sets a guard: the same user's DELETE of that path
   within 10 seconds is `409` ("wasn't deleted: this DELETE follows a refused save of the same
@@ -2513,7 +2540,10 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   namespace (or a tree) it is a copy, then a delete with `$successor` `/r/{ns}/{name}`. Onto an
   existing file (`Overwrite: T`, or none) it is a save of the source's content into it, its base
   taken as a PUT's, then a delete of the source: the target keeps its history, which is how
-  "write a temporary file, rename it over" saves land (§H.5); `Overwrite: F` is `412`. A JSON
+  "write a temporary file, rename it over" saves land (§H.5); `Overwrite: F` is `412`. A copy then
+  delete deletes only the revision of the source it copied: one someone edited meanwhile stays as
+  it is, and the MOVE is a `409` (the target holds the version moved). The source isn't deleted
+  for a copy that wrote nothing. A JSON
   file keeps a `{name}.json` name and a raw file a raw one, and a JSON file whose root isn't an
   object can't carry `$successor`: those MOVEs are `403` (copy, then delete). COPY to a new name
   creates it from the content (a raw file's bytes read through this server), and COPY over a
@@ -2521,9 +2551,9 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   below a file `409`.
 
 **Temporary and backup files** (§H.6). Editors' and systems' own files, `.DS_Store`, `._*`,
-`Thumbs.db`, `~$*`, `*.swp`, `4913`, `*~`, `#*#`, `*___jb_tmp___` and `.goutputstream-*`, and
-JetBrains' `*___jb_old___` beside its `*___jb_tmp___`, are scratch files, unless a live resource
-has the name: kept in memory per user and directory (at most 256 files and folders and 32 MiB a
+`Thumbs.db`, `~$*`, `*.swp`, `4913`, `*~`, `#*#`, `*___jb_tmp___` and `.goutputstream-*`,
+JetBrains' `*___jb_old___` beside its `*___jb_tmp___`, and macOS's `Icon\r` (a folder's custom
+icon, a name no title can be), are scratch files, unless a live resource has the name: kept in memory per user and directory (at most 256 files and folders and 32 MiB a
 grant root, 256 MiB in all, then `507`; in a gateway, only in the served namespaces the user's
 grant names, else `403`), listed beside the files so editors see what they wrote, and dropped
 after an hour untouched, or when the server stops. They never reach the core. In a file tree a
@@ -2542,12 +2572,16 @@ as a full disk).
   stays, and the write that follows is an edit of it (§H.5), its base taken as any save's; once,
   within 30 seconds of the MOVE, even one that creates only (davfs2's `If-None-Match: *`, as it
   takes the name for free after the MOVE, and uploads 10 seconds after the file is closed).
-- MKCOL of an app's folder, anywhere (a name starting with a dot, as `.TemporaryItems`, or
-  macOS's `(A Document Being Saved By TextEdit)`), makes a scratch directory, where every name is
-  a scratch file. Any other MKCOL outside a file tree is `403`, as is a MOVE giving a scratch
-  directory a person's name there: a person's folder in a flat namespace or at the root would
-  keep what is saved in it in memory only. Its files go with it, after an hour untouched or when
-  it is deleted. In a tree, moving one to a person's name makes a folder of that name.
+- MKCOL of an app's or a system's folder, anywhere (macOS's `(A Document Being Saved By
+  TextEdit)`, `.TemporaryItems`, `.Trashes`, `.Trash`, `.Trash-{uid}`, `.Spotlight-V100`,
+  `.fseventsd`, `.DocumentRevisions-V100`), makes a scratch directory, where every name is a
+  scratch file. Any other folder, a dot one too (`.github`, `.obsidian`), is a person's: a folder
+  node in a file tree, and `403` outside one (§H.8), as is a MOVE giving a scratch directory a
+  person's name there: a person's folder in a flat namespace or at the root would keep what is
+  saved in it in memory only. Its files go with it, after an hour untouched or when it is
+  deleted. In a tree, moving one to a person's name makes a folder of that name.
+- At the root only scratch names and app folders can be: no file there reaches the core, so any
+  other (a `report.pdf` dropped on the mount's top folder) is `403`.
 
 **File trees** (§H.2). `-catalog` serves catalogs whose namespace document's `catalog` object
 carries `files: { "ns", "root", "folder"?, "placement"? }`. One without isn't a file tree, and
@@ -2569,13 +2603,19 @@ with several parents shows under each, and a DELETE takes it out of that one onl
   as `%2E%2E`, a trailing dot as `%2E`), never passed into a listing as it is. Names hold
   capitals, spaces and any script, and a copy's name (`x copy.md`) or a new folder's (`untitled
   folder`) is a name like any other, renamed by a title change.
-- **Siblings** share one set of names, compared after NFC and Unicode case folding (with
-  `-case-sensitive`, after NFC only), as the file systems of Finder's and Explorer's users compare
-  them: a name a sibling has, under any case, is that sibling's (a PUT of `NOTES.md` beside
-  `notes.md` saves `notes.md`, and its MKCOL is `405`). Duplicates a race leaves, or another tool
-  makes, are shown as `name (2).ext`, `name (3).ext`, … in order of their nodes' creation in the
-  catalog's log, the first keeping its name, skipping numbers whose names a sibling has; a
-  folder's number goes at its name's end.
+- **Siblings** share one set of names, compared after NFC and Unicode simple case folding, a
+  character for a character (with `-case-sensitive`, after NFC only), as the file systems of
+  Finder's and Explorer's users compare them (so `Maße.txt` and `Masse.txt` are two names): a
+  read of a name a sibling has under another case reads that sibling, but a PUT, COPY or MOVE
+  onto it is `409`, naming the sibling, so a client telling case apart (rclone, davfs2 on Linux)
+  copying `README.md` and `readme.md` doesn't write one over the other, and the guard (above)
+  refuses its cleanup DELETE; a write to the spelling the user read the sibling under, or naming
+  its revision, is the sibling's. MKCOL of a folder's name under another case is `405`.
+  Duplicates a race leaves, or another tool makes, are shown as `name (2).ext`, `name (3).ext`, …
+  in order of their nodes' creation in the catalog's log, the first keeping its name, skipping
+  numbers whose names a sibling has, and after titles shown as they are where a title is shown
+  escaped (an escaped `a/b` never takes a real `a%2Fb`'s name); a folder's number goes at its
+  name's end, and a numbered name stays within 255 bytes, its stem cut short.
 - **Listings** show folders, and files whose items are live, offered (not sealed or end-to-end)
   and readable with the user's grant: dangling placements, cyclic nodes and items hidden from the
   user aren't shown. A folder's listing reads the heads of its own items (a path's folders above
@@ -2587,7 +2627,8 @@ with several parents shows under each, and a DELETE takes it out of that one onl
   otherwise). A dry run of the placement (§7.5) comes first, so one the core refuses (a frozen
   catalog, a grant that doesn't write it, the catalog's rules) writes nothing; then the item is
   created (`If-None-Match: *`; a raw file's blob uploaded first), then placed, and an item whose
-  placement is refused still, the catalog having changed in between, is deleted again at once.
+  placement is refused still, the catalog having changed in between, is deleted again at once (a
+  `429` waited out as a write's is).
   Its kind is §H.1's: a name ending in `.json` with I-JSON content makes a JSON document, any
   other a raw one. MKCOL makes a folder node so (an opaque name, `title`, `parents`, `order`,
   `$schema` from `files.folder`). Where the catalog requires nonces, each write to it carries a
@@ -2612,7 +2653,8 @@ with several parents shows under each, and a DELETE takes it out of that one onl
 - **Delete a file**: its placement, then, where its item is in `files.ns` (the tree owns it) and
   the user's grant allows `delete` there, its item; else the item stays, unplaced, as a failure
   between the two leaves it. A `DELETE` whose `If-Match` isn't the item's head is `412`, deleting
-  nothing.
+  nothing, as is one whose item changes between that check and its delete: the placement is
+  restored.
 - **Delete a folder**: only one without visible children (`409`, naming them, and nothing hidden
   from the user); placements whose items are gone (dangling, §B.3) aren't contents, and are
   deleted first; the user's scratch files in it go with it. Deletes never recurse, and the tree's
@@ -2631,7 +2673,9 @@ Blob references deeper in a JSON document read and edit as JSON. Sealed (E.2) an
 so saving several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5)
 can't list a namespace, whose `/heads` needs unrestricted read, but can open its files by path.
 PROPFIND with `Depth: infinity` is `403` (`propfind-finite-depth`), and one without Depth lists
-one level. Dead properties (PROPPATCH) are accepted and not kept.
+one level. Dead properties (PROPPATCH) are kept per user in memory (§H.8), at most 1 MiB a user,
+read back by PROPFIND, moved with a MOVE, dropped with a DELETE, an hour untouched or a restart.
+Uploads are buffered in memory, not spooled to disk.
 
 ### Bundles (§G.4)
 

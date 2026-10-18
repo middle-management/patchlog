@@ -74,32 +74,41 @@ raw documents, moves, whole-document appends and `logPageBytes` are new.
     to its bytes, kept exactly and typed by §H.1's extension table (else the upload's
     `Content-Type`); a JSON file is a document, read as its rendering (the canonical text laid
     out as `JSON.stringify(v, null, 2)`, without a fresh `$nonce` or a `$successor`). A new
-    `.json` file that isn't I-JSON is raw. Raw files are streamed from their blobs through this
-    server, with ranges, `nosniff` and a sandbox policy. Every file's ETag is its head revision.
+    `.json` file that isn't I-JSON is raw, and an empty file is a raw file of 0 bytes. Raw files
+    are streamed from their blobs through this server, with ranges; every answer carries
+    `nosniff` and a sandbox policy, and `POST` is `405`. Every file's ETag is its head revision.
+    Raw files are written up to `-max-raw-size` (64 MiB), JSON files up to `-max-file-size`.
   - **Layout** (§H.2, §H.3): a namespace (`-ns`) is the flat view, a raw document by its name and
     any other as `{name}.json`, listed from `/heads` with sizes and types read once per revision;
     a catalog with `catalog.files` (`-catalog`) is a file tree whose folders and files are named
-    by their nodes' titles (NFC, case folded unless `-case-sensitive`, duplicates numbered,
-    unsafe titles escaped), with new files created as opaque items in `files.ns` and renames and
-    moves one append to the node. Sealed and end-to-end namespaces aren't offered (§H.7).
+    by their nodes' titles (NFC, compared after simple case folding unless `-case-sensitive`, a
+    name a sibling has under another case refused for writes, duplicates numbered, unsafe titles
+    escaped), with new files created as opaque items in `files.ns` and renames and moves one
+    append to the node; dot folders are folders. Sealed and end-to-end namespaces aren't offered
+    (§H.7).
   - **Saves** (§H.4): the base is the revision `If-Match` (or the `If` header's first applicable
     entity tag) names, else the closest of the versions the user was served whole or wrote in
     the last day; the edit from it is rebased on the head, others' edits since kept, overlapping
     ones (what differs and what the log entries in between wrote) a `409`, as is a delete or
-    restore by someone else in between, a pruned base, or lost records; a raw file conflicts as
-    a whole and sets its reference's members one by one. A JSON patch set over `opsPerSet` or
-    `patchSetSize` is a root replace when the base is the head, else `413`. Answers follow
+    restore by someone else in between, a pruned base, lost records, versions that would apply
+    the save differently, or a path that came to name another file; a raw file is checked
+    against every version the user had, conflicts as a whole when someone else changed its bytes
+    since, and sets its reference's members one by one. A JSON patch set over `opsPerSet` or
+    `patchSetSize` is a root replace when the base is the head, else `413`. An `If-Match` where
+    no file is is `412`. Answers follow
     §H.4's table: an ETag only for a revision that holds exactly what was sent (and the next
     read in full after a merge), `410` for purged, `403` naming the successor for frozen, `413`
     for any limit, `503` with Retry-After for long rate limits.
   - **Moves** (§H.5, §H.8): within a tree, a rename or move of the node; onto an existing file, a
-    save into it, then a delete of the source, so the target keeps its history; across trees or
-    namespaces, a copy and a delete with `$successor`; in the flat view, to a free name, one
+    save into it, then a delete of the source's revision copied, so the target keeps its history;
+    across trees or namespaces, a copy and a delete with `$successor`; in the flat view, to a free
+    name, one
     batch creating the new resource and deleting the old with `$successor`. A file moved to a
     scratch name stays (an editor's backup).
   - **Clients as they are** (§H.6): editors' and systems' own files (`.DS_Store`, `._*`, `*.swp`,
-    `*~`, `.goutputstream-*`, …) and apps' folders stay in memory per user; locks are kept in
-    memory, bounded; a write to a path the user deleted within 30 seconds restores the file
+    `*~`, `.goutputstream-*`, …) and apps' folders stay in memory per user, and nothing else can
+    be at the root; locks and dead properties are kept in memory, bounded, and a DELETE or MOVE
+    drops the locks on its path; a write to a path the user deleted within 30 seconds restores the file
     rebased on its last live document, and a refused one undoes that DELETE; a refused PUT, or a
     refused MOVE onto a file, sets a guard that refuses the user's DELETE of the path within 10
     seconds once per refusal (rclone deletes every file whose upload failed), ending only by
