@@ -287,7 +287,7 @@ func TestBlobE2EDeclared(t *testing.T) {
 	e.mkNS("lim", e2eDoc(map[string]any{"limits": map[string]any{"blobsPerDocument": 1}}))
 	r1 := e.uploadE2E("lim", "x", []byte("one"), "alice")
 	r2 := e.uploadE2E("lim", "x", []byte("two"), "alice")
-	expectCode(t, e.writeAs("lim", "x", "", sealedOp(t, k, "lim", "x", "", addRoot(map[string]any{}), r1["$blob"].(string), r2["$blob"].(string)), "alice"), 422, "limit")
+	expectLimit(t, e.writeAs("lim", "x", "", sealedOp(t, k, "lim", "x", "", addRoot(map[string]any{}), r1["$blob"].(string), r2["$blob"].(string)), "alice"), 422, "blobsPerDocument", 2, 1)
 
 	// Delete, then restore with []: the last live document's list is kept,
 	// so a prune at the restore keeps the attachment.

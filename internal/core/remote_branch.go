@@ -700,7 +700,7 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		// The remote branch is a branch of every namespace of the chain:
 		// the branch-depth limit counts them all (§6.6).
 		if len(m.levels)+1 > e.opt.Maximums.BranchDepth {
-			return nil, limitErr(422, fmt.Sprintf("branch depth exceeded: the remote base's chain has more than %d namespaces", e.opt.Maximums.BranchDepth))
+			return nil, limitErr(422, "branchDepth", int64(len(m.levels)+1), int64(e.opt.Maximums.BranchDepth), fmt.Sprintf("branch depth exceeded: the remote base's chain has more than %d namespaces", e.opt.Maximums.BranchDepth))
 		}
 		ns, at = next.NS, next.At
 		mapErrs = append(mapErrs, levelErr(base.Origin, ns, unreadableBase(ns)))

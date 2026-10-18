@@ -675,7 +675,7 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				return nil, fmt.Errorf("/rules: %v", err)
 			}
 			if len(rs) > max.RulesPerNS {
-				return nil, &limitError{fmt.Sprintf("more than %d rules", max.RulesPerNS)}
+				return nil, sizeLimit("rulesPerNamespace", len(rs), max.RulesPerNS, fmt.Sprintf("more than %d rules", max.RulesPerNS))
 			}
 			c.Rules = rs
 		case "keys":
@@ -895,8 +895,8 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 		// Sealing grows a patch set by half, and it carries the declared
 		// blob list (§6.6, Values).
 		l := c.Limits
-		if 3*(l.ValueSize+l.PathSize)+(1<<10)+36*l.BlobsPerDocument > l.PatchSetSize {
-			return nil, &limitError{"an e2e namespace needs 3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize (§6.6)"}
+		if need := 3*(l.ValueSize+l.PathSize) + (1 << 10) + 36*l.BlobsPerDocument; need > l.PatchSetSize {
+			return nil, sizeLimit("patchSetSize", need, l.PatchSetSize, "an e2e namespace needs 3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize (§6.6)")
 		}
 		for i, r := range c.Retention {
 			if r.NoArchive {
@@ -932,7 +932,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/%s must be a non-negative integer", k)
 			}
 			if int(n) > *f(&max) {
-				return &limitError{fmt.Sprintf("/limits/%s exceeds the deployment maximum %d", k, *f(&max))}
+				return sizeLimit(k, int(n), *f(&max), fmt.Sprintf("/limits/%s exceeds the deployment maximum %d", k, *f(&max)))
 			}
 			*f(l) = int(n)
 			continue
@@ -945,7 +945,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/%s must be { rate, burst }", k)
 			}
 			if r > f(&max).Rate || b > f(&max).Burst {
-				return &limitError{fmt.Sprintf("/limits/%s exceeds the deployment maximum", k)}
+				return keyLimit(k, fmt.Sprintf("/limits/%s exceeds the deployment maximum", k))
 			}
 			*f(l) = Rate{r, b}
 			continue
@@ -957,7 +957,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/remoteRegistration must be a positive ISO 8601 duration")
 			}
 			if d > max.RemoteRegistration {
-				return &limitError{"/limits/remoteRegistration exceeds the deployment maximum"}
+				return keyLimit(k, "/limits/remoteRegistration exceeds the deployment maximum")
 			}
 			l.RemoteRegistration = d
 			continue
@@ -969,7 +969,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/blobGrace must be a positive ISO 8601 duration")
 			}
 			if d > max.BlobGrace {
-				return &limitError{"/limits/blobGrace exceeds the deployment maximum"}
+				return keyLimit(k, "/limits/blobGrace exceeds the deployment maximum")
 			}
 			l.BlobGrace = d
 			continue
@@ -981,7 +981,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/retryWindow must be an ISO 8601 duration")
 			}
 			if d < max.RetryWindowMin || d > max.RetryWindow {
-				return &limitError{"/limits/retryWindow is outside the deployment's range"}
+				return keyLimit(k, "/limits/retryWindow is outside the deployment's range")
 			}
 			l.RetryWindow = d
 			continue
@@ -990,7 +990,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 	}
 	// A pending blob lives at least as long as a retry may come (§6.6).
 	if l.BlobGrace < l.RetryWindow {
-		return &limitError{"/limits/blobGrace must be at least retryWindow (§6.6)"}
+		return keyLimit("blobGrace", "/limits/blobGrace must be at least retryWindow (§6.6)")
 	}
 	return nil
 }
@@ -1060,7 +1060,7 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/itemsPerBatch must be a positive integer", i)
 				}
 				if int(n) > max.ItemsPerBatch {
-					return nil, &limitError{fmt.Sprintf("/allowances/%d/itemsPerBatch exceeds the deployment maximum %d", i, max.ItemsPerBatch)}
+					return nil, sizeLimit("itemsPerBatch", int(n), max.ItemsPerBatch, fmt.Sprintf("/allowances/%d/itemsPerBatch exceeds the deployment maximum %d", i, max.ItemsPerBatch))
 				}
 				a.ItemsPerBatch = int(n)
 			case "batchSize":
@@ -1070,7 +1070,7 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/batchSize must be a positive integer, in bytes (§6.6)", i)
 				}
 				if n > max.BatchSize {
-					return nil, &limitError{fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize)}
+					return nil, sizeLimit("batchSize", n, max.BatchSize, fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize))
 				}
 				a.BatchSize = n
 			case "blobRate":
@@ -1081,7 +1081,7 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/blobRate must be { rate, burst } in bytes, rate positive and burst at least 1", i)
 				}
 				if r > max.BlobRate.Rate || b > max.BlobRate.Burst {
-					return nil, &limitError{fmt.Sprintf("/allowances/%d/blobRate exceeds the deployment maximum", i)}
+					return nil, keyLimit("blobRate", fmt.Sprintf("/allowances/%d/blobRate exceeds the deployment maximum", i))
 				}
 				a.BlobRate = Rate{r, b}
 			case "blobPending":
@@ -1091,7 +1091,7 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/blobPending must be a positive integer, in bytes (§6.6)", i)
 				}
 				if n > max.BlobPending {
-					return nil, &limitError{fmt.Sprintf("/allowances/%d/blobPending exceeds the deployment maximum %d", i, max.BlobPending)}
+					return nil, sizeLimit("blobPending", n, max.BlobPending, fmt.Sprintf("/allowances/%d/blobPending exceeds the deployment maximum %d", i, max.BlobPending))
 				}
 				a.BlobPending = n
 			case "until":
@@ -1117,9 +1117,29 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 	return out, nil
 }
 
-type limitError struct{ msg string }
+// limitError is a limit of §6.6 that a namespace document exceeds: key
+// names it, and a size or a count also carries measured and max (§12).
+type limitError struct {
+	msg, key      string
+	sized         bool
+	measured, max int64
+}
 
 func (e *limitError) Error() string { return e.msg }
+
+func sizeLimit(key string, measured, max int, msg string) *limitError {
+	return &limitError{msg: msg, key: key, sized: true, measured: int64(measured), max: int64(max)}
+}
+
+func keyLimit(key, msg string) *limitError { return &limitError{msg: msg, key: key} }
+
+// err is the 422 refusal of e (§6.6).
+func (e *limitError) err() *Error {
+	if e.sized {
+		return limitErr(422, e.key, e.measured, e.max, e.msg)
+	}
+	return limitKeyErr(422, e.key, e.msg)
+}
 
 var durRe = regexp.MustCompile(`^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$`)
 

@@ -85,8 +85,8 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 	if g == nil {
 		var err error
 		g, err = grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
-		if errors.Is(err, grant.ErrTooLarge) {
-			return nil, limitErr(413, "grant too large")
+		if e := grantTooLarge(err); e != nil {
+			return nil, e
 		}
 		if err != nil {
 			return nil, authErr(err)
@@ -150,6 +150,25 @@ func (c *grantCache) put(token string, g *grant.Grant) {
 	c.lru.Put(token, g, len(token))
 }
 
+// grantTooLarge is the 413 of a bearer over grantSize, which is decoded
+// before any namespace is consulted, so max is the deployment's (§6.6).
+func grantTooLarge(err error) *Error {
+	var te *grant.TooLargeError
+	if !errors.As(err, &te) {
+		return nil
+	}
+	return limitErr(413, "grantSize", int64(te.Size), int64(te.Max), "grant too large")
+}
+
+// rulesPerGrant is the bound on a chain's rules in force (§6.6): the
+// namespace's, or the deployment's for an operator grant.
+func (t *tx) rulesPerGrant(cfg *Config) int {
+	if cfg == nil {
+		return t.e.opt.Maximums.RulesPerGrant
+	}
+	return min(cfg.Limits.RulesPerGrant, t.e.opt.Maximums.RulesPerGrant)
+}
+
 func nsNotNamed(ns string) *Error {
 	return forbidden(fmt.Sprintf("the grant does not apply to namespace %q", ns))
 }
@@ -178,8 +197,8 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 	if err != nil {
 		return nil, authErr(err)
 	}
-	if len(v.BlockRules)+len(v.KeyRules) > t.e.opt.Maximums.RulesPerGrant {
-		return nil, limitErr(422, "too many rules in the grant chain")
+	if n, max := len(v.BlockRules)+len(v.KeyRules), t.rulesPerGrant(cfg); n > max {
+		return nil, limitErr(422, "rulesPerGrant", int64(n), int64(max), "too many rules in the grant chain")
 	}
 	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate}
 	a.bucketKey = v.Principal.ID + "\x00" + v.Key.Kid

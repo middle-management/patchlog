@@ -2,7 +2,6 @@ package core
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"slices"
 	"time"
@@ -110,8 +109,8 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 	bad := make([]*Error, len(bearers))
 	for i, b := range bearers {
 		g, err := grant.Decode(b, e.opt.Maximums.GrantSize)
-		if errors.Is(err, grant.ErrTooLarge) {
-			return nil, limitErr(413, "grant too large")
+		if e := grantTooLarge(err); e != nil {
+			return nil, e
 		}
 		if err != nil {
 			bad[i] = authErr(err) // ranked with the rest, in its place

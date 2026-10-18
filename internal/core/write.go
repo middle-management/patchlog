@@ -356,14 +356,14 @@ func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
 }
 
 // BatchBodyLimit authenticates a batch request and returns how many bytes
-// of body the server reads for it: the principal's batchSize (§6.6), plus
+// of body the server reads for it, and the principal's batchSize (§6.6)
+// that a refusal names: that batchSize, plus
 // room for the batch's own JSON (items, preconditions, an optional config
 // change). A larger body is refused with 413 without reading the rest,
 // which reveals nothing about any item (§7.5). The batch itself
 // authenticates again.
-func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (int, error) {
-	var limit int
-	err := e.read(ctx, func(t *tx) error {
+func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
+	err = e.read(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
@@ -376,10 +376,10 @@ func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (int, error) {
 		// No state checks here: the gate answers them in order after the
 		// body is parsed (§6.2, §7.5). This only bounds how much is read.
 		items, size := t.batchLimits(cur, a)
-		limit = size + size/4 + 512*items + max(cur.Limits.PatchSetSize, cur.Limits.DocumentSize) + 64<<10
+		bound, batchSize = size+size/4+512*items+max(cur.Limits.PatchSetSize, cur.Limits.DocumentSize)+64<<10, size
 		return nil
 	})
-	return limit, err
+	return bound, batchSize, err
 }
 
 // asErr converts an *Error into error without the typed-nil trap.
@@ -718,7 +718,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// batch's, not an item's.
 	if isBatch {
 		if len(items) > maxItems {
-			return nil, nil, limitErr(413, fmt.Sprintf("more than %d items", maxItems))
+			return nil, nil, limitErr(413, "itemsPerBatch", int64(len(items)), int64(maxItems), fmt.Sprintf("more than %d items", maxItems))
 		}
 		size := 0
 		for _, s := range all {
@@ -729,7 +729,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 		if size > maxSize {
-			return nil, nil, limitErr(413, "batch too large")
+			return nil, nil, limitErr(413, "batchSize", int64(size), int64(maxSize), "batch too large")
 		}
 	}
 	for _, s := range st {
@@ -1364,31 +1364,31 @@ func checkLimits(l Limits, s *itemState) *Error {
 		if step.del {
 			continue
 		}
-		maxPatch := l.PatchSetSize
+		maxPatch, key := l.PatchSetSize, "patchSetSize"
 		if fromScratch(step) {
-			maxPatch = l.DocumentSize
+			maxPatch, key = l.DocumentSize, "documentSize"
 		}
 		if len(step.canon) > maxPatch {
-			return limitErr(413, "patch set too large")
+			return limitErr(413, key, int64(len(step.canon)), int64(maxPatch), "patch set too large")
 		}
 		if ops, ok := step.raw.([]any); ok && len(ops) > l.OpsPerSet {
-			return limitErr(422, "too many operations")
+			return limitErr(422, "opsPerSet", int64(len(ops)), int64(l.OpsPerSet), "too many operations")
 		}
 		if step.docCanon = genesisDocCanon(step); step.docCanon == nil {
 			step.docCanon = jsonv.Canonical(step.doc)
 		}
 		if len(step.docCanon) > l.DocumentSize {
-			return limitErr(413, "document too large")
+			return limitErr(413, "documentSize", int64(len(step.docCanon)), int64(l.DocumentSize), "document too large")
 		}
 		sh := shapeOf(l, step.docCanon)
 		if sh.depth > l.NestingDepth {
-			return limitErr(422, "document nested too deeply")
+			return limitErr(422, "nestingDepth", int64(sh.depth), int64(l.NestingDepth), "document nested too deeply")
 		}
 		if step.sealed {
 			// e2e: clients check the limits on documents (§E.3.2); the
 			// server checks blobsPerDocument on the declared list (§E.3.1).
 			if len(step.declared) > l.BlobsPerDocument {
-				return limitErr(422, fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
+				return limitErr(422, "blobsPerDocument", int64(len(step.declared)), int64(l.BlobsPerDocument), fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
 			}
 			continue
 		}

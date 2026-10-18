@@ -537,8 +537,18 @@ func notFound() *Error            { return apiErr(404, "not_found") }
 func gone(kv ...any) *Error       { return apiErr(410, "gone", kv...) }
 func invalid(msg string) *Error   { return apiErr(422, "invalid", "message", msg) }
 func forbidden(msg string) *Error { return apiErr(403, "forbidden", "message", msg) }
-func limitErr(status int, msg string) *Error {
-	return apiErr(status, "limit", "message", msg)
+
+// limitErr refuses a size or a count over a limit of §6.6: limit names its
+// key, measured what was found (a lower bound where reading stopped) and
+// max the limit in force (§6.6, §12).
+func limitErr(status int, key string, measured, max int64, msg string) *Error {
+	return apiErr(status, "limit", "message", msg, "limit", key, "measured", measured, "max", max)
+}
+
+// limitKeyErr refuses a duration or a rate over a limit of §6.6, which
+// carries no sizes: only limit, its key.
+func limitKeyErr(status int, key, msg string) *Error {
+	return apiErr(status, "limit", "message", msg, "limit", key)
 }
 
 // tx is one database transaction with the engine's helpers.
