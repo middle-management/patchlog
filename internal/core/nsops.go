@@ -176,7 +176,7 @@ func freezeOnly(writes []string, doc any) bool {
 // document, so a member refused because the branch inherits it says so.
 func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error) {
 	cfg, err := e.parseConfig(doc)
-	if err == nil && len(cfg.Rules) > cfg.Limits.RulesPerNS {
+	if err == nil && len(cfg.Rules) > cfg.Limits.RulesPerNS && rulesOrBoundChanged(cfg.Doc, prev) {
 		// The document's own rulesPerNamespace, which parseConfig, reading
 		// stored documents too, doesn't hold them to (§6.6).
 		err = sizeLimit("rulesPerNamespace", len(cfg.Rules), cfg.Limits.RulesPerNS, fmt.Sprintf("more than %d rules", cfg.Limits.RulesPerNS))
@@ -194,6 +194,21 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 		return nil, configErr(err)
 	}
 	return cfg, nil
+}
+
+// rulesOrBoundChanged reports whether doc changes its rules or its own
+// rulesPerNamespace from prev (nil for a new namespace): the writes that
+// bound holds (§6.6). A document an earlier release stored over it, which
+// checked only the deployment's maximum, takes any other write, a freeze
+// among them, as members stored under an earlier version are kept until
+// they are changed (§7.4).
+func rulesOrBoundChanged(doc, prev map[string]any) bool {
+	if prev == nil {
+		return true
+	}
+	dl, _ := doc["limits"].(map[string]any)
+	pl, _ := prev["limits"].(map[string]any)
+	return !jsonv.Equal(doc["rules"], prev["rules"]) || !jsonv.Equal(dl["rulesPerNamespace"], pl["rulesPerNamespace"])
 }
 
 // configErr is the 422 for a namespace document that fails its schema: a

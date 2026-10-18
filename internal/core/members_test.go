@@ -339,3 +339,42 @@ func TestStoredMembersAfterUpgrade(t *testing.T) {
 		t.Fatalf("document %s", rev.Doc)
 	}
 }
+
+// §6.6, §7.4: a document's own rulesPerNamespace bounds its rules on
+// writes that change them or it. A document stored over it, as releases
+// that checked only the deployment's maximum let it be, still takes
+// writes that change neither, such as a freeze.
+func TestOwnRulesPerNamespace(t *testing.T) {
+	t.Parallel()
+	e := &Engine{opt: Options{Limits: DefaultLimits(), Maximums: DefaultLimits()}}
+	rule := map[string]any{"op": "test", "path": "/action", "value": "create"}
+	stored := map[string]any{"rules": []any{rule, rule, rule}, "limits": map[string]any{"rulesPerNamespace": 2.0}}
+	with := func(k string, v any) map[string]any {
+		d := jsonv.Clone(stored).(map[string]any)
+		d[k] = v
+		return d
+	}
+	if _, ae := e.newConfig(with("frozen", true), stored, nil); ae != nil {
+		t.Fatalf("a freeze of a document over its own rulesPerNamespace: %v", ae.Body)
+	}
+	for name, doc := range map[string]map[string]any{
+		"another rule":      with("rules", []any{rule, rule, rule, rule}),
+		"down to the bound": with("rules", []any{rule, rule}),
+		"a lower bound":     with("limits", map[string]any{"rulesPerNamespace": 1.0}),
+	} {
+		_, ae := e.newConfig(doc, stored, nil)
+		if name == "down to the bound" {
+			if ae != nil {
+				t.Errorf("%s: %v", name, ae.Body)
+			}
+			continue
+		}
+		if ae == nil || ae.Body["limit"] != "rulesPerNamespace" {
+			t.Errorf("%s: %v", name, ae)
+		}
+	}
+	// A new namespace is held to it.
+	if _, ae := e.newConfig(stored, nil, nil); ae == nil || ae.Body["limit"] != "rulesPerNamespace" {
+		t.Fatalf("a new namespace over its own rulesPerNamespace: %v", ae)
+	}
+}
