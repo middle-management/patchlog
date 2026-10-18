@@ -12,8 +12,9 @@
 //     anything else; no usable grant (malformed, unknown key, bad
 //     signature, revoked, expired, not yet valid) is 401;
 //   - key scopes, including attrs (validated with internal/rules as the
-//     core does) and requireAt/maxLag (checked against the named chain,
-//     relative to the grant's issuance, default maxLag 60 seconds);
+//     core does), requireAt/maxLag (checked against the named chain,
+//     relative to the grant's issuance, default maxLag 60 seconds) and
+//     readScope (a read grant that doesn't fix /resource is 403, §2.1);
 //   - read decisions: the grant allows read and its key-scope, block and
 //     role rules pass against a read envelope
 //     { action: "read", resource?, principal, now } (§C.2 item 5).

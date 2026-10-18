@@ -420,7 +420,7 @@ func edgeReadScope(a *actor) ([]string, bool) {
 // literal array. It reports false for any other rule, or a name that
 // isn't valid (§3.6).
 func fixesResource(rv any) ([]string, bool) {
-	lits, ok := resourceLiterals(rv)
+	lits, ok := grant.ResourceLiterals(rv)
 	if !ok {
 		return nil, false
 	}
@@ -437,51 +437,6 @@ func fixesResource(rv any) ([]string, bool) {
 		}
 	}
 	return names, true
-}
-
-// resourceLiterals returns the literals a rule of a fixing form tests
-// /resource against (§2.1): a test with value, or with a schema of only
-// enum, or a compare with eq and a literal, or with in and a literal
-// array. It reports false for a rule of any other form.
-func resourceLiterals(rv any) ([]any, bool) {
-	m, ok := rv.(map[string]any)
-	if !ok || len(m) != 3 || m["path"] != "/resource" {
-		return nil, false
-	}
-	var lits []any
-	literal := func(k string) (any, bool) {
-		o, ok := m[k].(map[string]any)
-		if !ok || len(o) != 1 {
-			return nil, false
-		}
-		v, ok := o["value"]
-		return v, ok
-	}
-	switch m["op"] {
-	case "test":
-		if v, ok := m["value"]; ok {
-			lits = []any{v}
-		} else if sch, ok := m["schema"].(map[string]any); ok && len(sch) == 1 {
-			if lits, ok = sch["enum"].([]any); !ok {
-				return nil, false
-			}
-		} else {
-			return nil, false
-		}
-	case "compare":
-		if v, ok := literal("eq"); ok {
-			lits = []any{v}
-		} else if v, ok := literal("in"); ok {
-			if lits, ok = v.([]any); !ok {
-				return nil, false
-			}
-		} else {
-			return nil, false
-		}
-	default:
-		return nil, false
-	}
-	return lits, true
 }
 
 // edgeReader decides a read under an edge grant (§C.5): of its namespace,

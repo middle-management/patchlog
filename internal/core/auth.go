@@ -160,50 +160,6 @@ func grantTooLarge(err error) *Error {
 	return limitErr(413, "grantSize", int64(te.Size), int64(te.Max), "grant too large")
 }
 
-// fixesResourceIn reports whether a verified grant's rules fix /resource
-// (§2.1): a rule of its blocks or its key's scope, at top level or inside
-// all, tests /resource against one name or a finite set, and the names
-// every such rule allows are some, all of them valid (§3.6).
-func fixesResourceIn(v *grant.Verified) bool {
-	var names map[string]bool
-	ok := true
-	var walk func(rules []any)
-	walk = func(rules []any) {
-		for _, rv := range rules {
-			if m, isMap := rv.(map[string]any); isMap && len(m) == 1 {
-				if all, isAll := m["all"].([]any); isAll {
-					walk(all)
-					continue
-				}
-			}
-			lits, shaped := resourceLiterals(rv)
-			if !shaped {
-				continue
-			}
-			set := map[string]bool{}
-			for _, l := range lits {
-				name, isStr := l.(string)
-				if !isStr || !ValidResourceName(name) {
-					ok = false
-				}
-				set[name] = true
-			}
-			if names == nil {
-				names = set
-				continue
-			}
-			for n := range names {
-				if !set[n] {
-					delete(names, n)
-				}
-			}
-		}
-	}
-	walk(v.KeyRules)
-	walk(v.BlockRules)
-	return ok && len(names) > 0
-}
-
 // rulesPerGrant is the bound on a chain's rules in force (§6.6): the
 // namespace's, or the deployment's for an operator grant.
 func (t *tx) rulesPerGrant(cfg *Config) int {
@@ -240,13 +196,6 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 	v, err := grant.Verify(g, env)
 	if err != nil {
 		return nil, authErr(err)
-	}
-	if v.Key.ReadScopeResource {
-		// The key's scope (§C.2 item 1, §C.4): every read grant it signs
-		// fixes /resource (§2.1).
-		if ok, _ := v.Allows("read"); ok && !fixesResourceIn(v) {
-			return nil, forbidden(fmt.Sprintf("key %q has readScope \"resource\": a read grant it signs must fix /resource (§2.1, §C.4)", v.Key.Kid))
-		}
 	}
 	if n, max := len(v.BlockRules)+len(v.KeyRules), t.rulesPerGrant(cfg); n > max {
 		return nil, limitErr(422, "rulesPerGrant", int64(n), int64(max), "too many rules in the grant chain")

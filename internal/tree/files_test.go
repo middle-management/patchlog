@@ -343,3 +343,43 @@ func TestFileTreeSealedCatalog(t *testing.T) {
 		t.Fatalf("file %v", got)
 	}
 }
+
+// §2.1, §C.4: a read grant from a key with readScope "resource" that
+// doesn't fix /resource is refused, by the core and by the service alike:
+// listings show it no item's head or file metadata.
+func TestFileTreeReadScope(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	rk := clienttest.NewKey("rk")
+	scoped := rk.Entry("read")
+	scoped["readScope"] = "resource"
+	for ns, doc := range map[string]map[string]any{
+		"files": {"read": "grant", "keys": []any{k.Entry("*"), scoped}},
+		"cat":   {"read": "public", "keys": []any{k.Entry("*"), rk.Entry("read")}, "catalog": filesCatalog("files")},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	all := []string{"cat", "files"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "config"})))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"parents": []any{}}))
+	must(w.CreateDoc(ctx, "files", "secret", map[string]any{"title": "x"}))
+	must(w.CreateDoc(ctx, "cat", "files.secret", map[string]any{"title": "s.json", "parents": parents("root@a0")}))
+	x := startSvc(t, s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"}))), svcOpts{now: s.Now})
+	x.caughtUp("cat", "files")
+
+	bad := rk.Grant(t, s.Now(), "user:r", all, []string{"read"})
+	if h, _, err := s.Client(t, client.WithBearer(bad)).Load(ctx, "files", "secret"); err == nil && h.State == client.Live {
+		t.Fatal("the core reads with it")
+	}
+	e := entriesOf(t, x.get("/cat/children?of=root", bad))["files.secret"]
+	if e == nil || e["head"] != nil || e["file"] != nil {
+		t.Fatalf("entry under a grant the core refuses: %v", e)
+	}
+	// Fixing /resource, it reads that item.
+	good := rk.Grant(t, s.Now(), "user:r", all, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "secret"}}})
+	if e := entriesOf(t, x.get("/cat/children?of=root", good))["files.secret"]; e["head"] == nil || fileOf(e) == nil {
+		t.Fatalf("entry under a grant fixing /resource: %v", e)
+	}
+}
