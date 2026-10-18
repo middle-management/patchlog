@@ -82,8 +82,8 @@ func TestSealedCatalog(t *testing.T) {
 		"encryption": map[string]any{"level": "sealed"}, "catalog": map[string]any{"trust": []any{"matches"}, "mode": "dag"}}))
 	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "matches"))).CreateNamespace(ctx, "matches", map[string]any{"read": "public", "keys": []any{k.Entry("*")}}))
 	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat", "matches"}, []string{"read", "create", "purge"})), client.WithKeys(client.NewKeys(nil)))
-	createNonced(t, w, "cat", "root", map[string]any{"title": "Root zqx", "parents": []any{}})
-	createNonced(t, w, "cat", "season", map[string]any{"title": "Season zqx", "parents": parents("root@a0")})
+	createNonced(t, w, "cat", "root", map[string]any{"title": "Root zq8x", "parents": []any{}})
+	createNonced(t, w, "cat", "season", map[string]any{"title": "Season zq8x", "parents": parents("root@a0")})
 	must(w.CreateDoc(ctx, "matches", "derby", map[string]any{"title": "derby"}))
 	createNonced(t, w, "cat", "matches.derby", map[string]any{"parents": parents("season")})
 
@@ -101,7 +101,7 @@ func TestSealedCatalog(t *testing.T) {
 	// A reader of the whole catalog: one JWE bound to { ns, view }.
 	full := k.Grant(t, s.Now(), "user:r", []string{"cat"}, []string{"read"})
 	f := x.fetch("/cat/children?of=root", full)
-	if ct := f.header.Get("Content-Type"); ct != seal.ContentType || strings.Contains(string(f.body), "zqx") {
+	if ct := f.header.Get("Content-Type"); ct != seal.ContentType || strings.Contains(string(f.body), "zq8x") {
 		t.Fatalf("sealed listing %q %s", ct, f.body)
 	}
 	if !strings.HasPrefix(f.path, "/cat/g/") || !strings.Contains(f.path, "/at/"+x.s.At()+"/") {
@@ -113,7 +113,7 @@ func TestSealedCatalog(t *testing.T) {
 	}
 	b := decode(t, must(derived.OpenView(string(f.body), keyOf, derived.View{NS: "cat", Target: f.path})))
 	kid := b["children"].([]any)[0].(map[string]any)
-	if kid["name"] != "season" || kid["title"] != "Season zqx" || kid["order"] != "a0" {
+	if kid["name"] != "season" || kid["title"] != "Season zq8x" || kid["order"] != "a0" {
 		t.Fatalf("children %v", b)
 	}
 	if _, err := derived.OpenView(string(f.body), func(string) []byte { return seal.NewKey() }, derived.View{NS: "cat", Target: f.path}); !errors.Is(err, seal.ErrDecrypt) {
@@ -137,7 +137,7 @@ func TestSealedCatalog(t *testing.T) {
 	// sealed under K_r of cat/root.
 	li := k.Grant(t, s.Now(), "user:li", []string{"cat"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "root"}}})
 	r := x.fetch("/cat/roots", li)
-	if ct := r.header.Get("Content-Type"); ct != "application/json" || strings.Contains(string(r.body), "zqx") {
+	if ct := r.header.Get("Content-Type"); ct != "application/json" || strings.Contains(string(r.body), "zq8x") {
 		t.Fatalf("per-entry listing %q %s", ct, r.body)
 	}
 	roots := decode(t, r.body)["roots"].([]any)
@@ -160,7 +160,7 @@ func TestSealedCatalog(t *testing.T) {
 		return nil
 	}
 	v := derived.View{NS: "cat", Target: r.path}
-	if t0 := decode(t, must(derived.OpenItem(e["sealed"].(string), kr, v, "cat", "root"))); t0["title"] != "Root zqx" {
+	if t0 := decode(t, must(derived.OpenItem(e["sealed"].(string), kr, v, "cat", "root"))); t0["title"] != "Root zq8x" {
 		t.Fatalf("title %v", t0)
 	}
 	if _, err := derived.OpenItem(e["sealed"].(string), derived.ItemKey(keyOf, "cat", "season"), v, "cat", "season"); err == nil {
