@@ -2213,9 +2213,10 @@ core only through its public API, and keeps nothing but memory caches.
 ./patchlog dav -api http://localhost:8080 -ns docs,matches -catalog cat-season \
   -bearer-file editor.grant -password-file dav.password      # http://127.0.0.1:8090/
 
-# Gateway mode: each request's Basic password is the user's own grant, sent upstream.
+# Gateway mode: each request's Basic password is the user's own grant, sent upstream; the
+# tree's folders listed by its tree service (§H.3).
 ./patchlog dav -api https://cms.example -ns docs -catalog cat-season -gateway \
-  -addr :8443 -tls-cert dav.crt -tls-key dav.key
+  -tree-url http://tree:8082 -addr :8443 -tls-cert dav.crt -tls-key dav.key
 ```
 
 - **Local mode** (the default) sends `-bearer` (or `-bearer-file`) with every request to the core,
@@ -2411,7 +2412,8 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   id for good (256 Ki revisions), apart from the documents themselves (`-cache-size`), so a
   listing reads only the documents it hasn't seen.
 - Each listing of a flat namespace reads its heads again; a catalog's tree, and its items' heads,
-  are read again after 5 seconds, or at once after a write through this server. Nothing is pushed.
+  are read again after 5 seconds, or at once after a write through this server (a tree service's
+  listings likewise, below). Nothing is pushed.
 - **Sealed and end-to-end namespaces** (Addendum E) need keys this server doesn't hold, so it
   doesn't offer them (§H.7): the root doesn't list them, anything asked of them is `404`, saying
   why, and a tree's placements of items in them aren't listed. A root listing reads the
@@ -2639,8 +2641,10 @@ catalog.files …`), read with the server's grant in local mode and without one 
 only a user's grant reads answers `404`, saying why, when opened, and the root doesn't list it.
 The tree's top level is the children of folder node `files.root`. It is built from the catalog
 namespace's documents, read from the core with the user's grant (`tree.BuildGraph`), again after
-5 seconds or at once after a write through this server. `catalog.mode: "tree"` is assumed: a node
-with several parents shows under each, and a DELETE takes it out of that one only.
+5 seconds or at once after a write through this server; with `-tree-url` its folders are listed
+by the tree service instead (below), and writes still read the documents. `catalog.mode: "tree"`
+is assumed: a node with several parents shows under each, and a DELETE takes it out of that one
+only.
 
 - **Names.** A folder is a folder node and a file a placement `{ns}.{item}`, whose content is its
   item, read and saved as in the flat view (a raw file typed by its name's extension). Each is
@@ -2668,7 +2672,41 @@ with several parents shows under each, and a DELETE takes it out of that one onl
 - **Listings** show folders, and files whose items are live, offered (not sealed or end-to-end)
   and readable with the user's grant: dangling placements, cyclic nodes and items hidden from the
   user aren't shown. A folder's listing reads the heads of its own items (a path's folders above
-  only where a name is ambiguous), and the document of each revision once, for its size and type.
+  only where a name is ambiguous), and the document of each revision once, for its size and type;
+  through a tree service, none of them (below).
+- **Through a tree service** (§H.3, §H.7). With `-tree-url URL`, the base URL of a `patchlog
+  tree` following the served catalogs (`CATALOG=URL` for a catalog's own, repeatable, as `serve
+  -tree-url` takes them; `TreeService` and `TreeServices` in `dav.Options`), a folder is listed
+  from the tree service's `children` listing, read with the user's grant as its bearer (in local
+  mode `-bearer`'s), which the tree service checks and filters the listing by (§B.11.5): every
+  page of it, at most 10 pages of 1000 entries, and a folder larger is `403`, never listed cut
+  short. A file's ETag is its entry's `head`, and its size, type and time the `file` metadata the
+  tree service adds (§H.3), so a folder lists in one request and no item is read for it; a
+  placement whose `file` is sealed (an item of a sealed namespace) isn't listed, and one without
+  `file`, or without its `modified`, is read from the core as above (an end-to-end namespace's
+  item isn't listed). Names are given as above, the same duplicates, escapes and case folding,
+  and a path resolves to what its folder lists, every folder on it listed. Placements of a
+  namespace the catalog doesn't trust are dangling (§B.5): the tree service doesn't list them,
+  and nor does this server, from the node documents either, where a catalog has a tree service.
+  Implicit placements (§B.9, `-self-placing`), which no node holds, aren't listed. A catalog whose
+  `catalog.title` is set is listed from its node documents, since the tree service gives
+  placements without a title their items' titles (§B.5) and a file is shown by its item's name
+  (§H.2). Listings are kept per user for 5 seconds, or until a write through this server. A grant
+  limited to some resources, which reads neither the catalog's namespace document nor its
+  `/heads` (§2.1, §7.4), lists through the tree service with the tree's settings
+  (`catalog.files`, `catalog.trust`) as last read with any grant, this server's own at start
+  included; until some grant read them, the tree answers `404`, and writes, which still read the
+  node documents, are refused it. The tree service unreachable is `502`, and its `503` (behind
+  the catalog, a sealed namespace's key) a `503` with its `Retry-After`: never an empty folder.
+- **Read-your-writes** through a tree service, which lags the core. For 30 seconds after a user's
+  write through this server (a new file or folder, a rename, a move, a delete, an edit, wherever
+  it is made), that user's listings of a tree carry `?min={ns}:{ns_id}` for each namespace entry
+  the write produced in the catalog or a namespace it trusts (the write's `X-Namespace-Revision`,
+  seen as the core answers it), which the tree service waits for (§B.5); other listings don't
+  wait. If it hasn't caught up within `-tree-wait` (3 s; the tree service's own `-min-wait`, 2 s,
+  answers sooner), or refuses a `min`, the folder is listed from the node documents instead, as
+  without a tree service, and so are the user's listings of that tree for 5 seconds; a grant that
+  can't read them gets `503` with `Retry-After`.
 - **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
   random base32 characters), and its placement titled with the name, under its folder: one
   `parents` entry, ordered after the folder's last ordered child, so new files list last, and
@@ -2712,11 +2750,11 @@ with several parents shows under each, and a DELETE takes it out of that one onl
   §B.3) or that is served with `-ns`, never to a catalog's own nodes (`403`): a local mode's grant
   may reach namespaces the server wasn't set up to serve.
 
-**Not in the prototype.** The catalog's trust list beyond bounding writes, access by subject set
-(`$access`, §B.11) and the tree service: users see what their grant reads, as the core lists it,
-and a tree's listings read its items rather than the tree service's `file` metadata (§H.3). Grants
-issued by the catalog (§B.11.4): each user's grant is passed through, so a new file is created
-before it is placed, never placed first. Merges of text: raw files conflict as a whole (§H.9).
+**Not in the prototype.** Without a tree service, the catalog's trust list beyond bounding writes
+and access by subject set (`$access`, §B.11): users see what their grant reads, as the core lists
+it. Writes in a tree through the tree service alone: they read the node documents, which a grant
+limited to some resources can't. Grants issued by the catalog (§B.11.4): each user's grant is
+passed through, so a new file is created before it is placed, never placed first. Merges of text: raw files conflict as a whole (§H.9).
 Blob references deeper in a JSON document read and edit as JSON. Sealed (E.2) and end-to-end (E.3) namespaces, which need keys. History
 (revisions and logs as directories), live invalidation, and batches: each file is its own write,
 so saving several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5)

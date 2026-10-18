@@ -142,6 +142,17 @@ service's listings.
     escaped), with new files created as opaque items in `files.ns` and renames and moves one
     append to the node; dot folders are folders. Sealed and end-to-end namespaces aren't offered
     (§H.7).
+  - **Listings through the tree service** (§H.3, §H.7; `-tree-url [CATALOG=]URL`, as `serve`'s,
+    and `-tree-wait`): a tree's folder is listed from the tree service's `children`, every page
+    (a folder over 10 pages of 1000 is `403`, never cut short), with the user's grant as bearer,
+    which the tree service filters by (§B.11.5), so a grant limited to some resources lists a
+    tree; sizes, types and times come from its `file` metadata and ETags from its heads, so no
+    item is read; names and path resolution are the node documents', placements whose `file` is
+    sealed aren't listed, and the tree service down is `502`/`503`, never an empty folder. A
+    user's listings after their own writes wait for the entries those produced (`?min=`, keyed
+    by the writes' `X-Namespace-Revision`) up to `-tree-wait`, then read the node documents. Without
+    a tree service, folders are listed from the node documents as before. Client:
+    `client.WithTransport`, `Client.Bearer`.
   - **Saves** (§H.4): the base is the revision `If-Match` (or the `If` header's first applicable
     entity tag) names, else the closest of the versions the user was served whole or wrote in
     the last day; the edit from it is rebased on the head, others' edits since kept, overlapping
@@ -172,7 +183,7 @@ service's listings.
   - Local mode sends one `-bearer` grant behind a password; gateway mode (`-gateway`) sends each
     request's Basic password upstream as its grant, keeps nothing for a grant the core hasn't
     accepted, and needs TLS beyond loopback. Not yet: the principal endpoint for users (keyed
-    by grant), the tree service's file metadata for listings, catalog-issued grants, text
+    by grant), writes in a tree through the tree service alone, catalog-issued grants, text
     merges, history, live invalidation, batches.
 
 **Fixes:**
