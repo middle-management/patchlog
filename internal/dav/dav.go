@@ -1097,11 +1097,15 @@ func userKey(v *verdict) string {
 }
 
 // idUser is who a token was verified as last (idUsers): its user
-// (userKey), and the namespace that verified it, kept past the token
-// itself, which goes when idle for VerifyEvery (sweep) or to make room,
-// so that coming back it is verified in the same order, and seen to have
-// become someone else.
-type idUser struct{ user, vns string }
+// (userKey), the namespace that verified it and its issuer there (the
+// namespace and the root kid), kept past the token itself, which goes
+// when idle for VerifyEvery (sweep) or to make room, so that coming back
+// it is verified in the same order, and seen to have become someone else.
+type idUser struct{ user, vns, issuer string }
+
+// issuerKey is the key that minted the grant v the core accepted: the
+// verifying namespace and the root block's kid, userKey without the sub.
+func issuerKey(v *verdict) string { return v.ns + "\x00" + v.info.Kid }
 
 // maxIDUsers bounds the token ids idUsers keeps, maxIDsPerUser those of
 // one user.
@@ -1113,48 +1117,144 @@ const (
 // idUsers is who each token id was verified as last (idUser), within
 // maxIDUsers over every user and maxIDsPerUser a user, the user's least
 // recently verified going first. Narrowing is offline and free, and each
-// narrowing is a new token id the core accepts: one user's logins with
-// thousands of them push out only that user's, not those that let
-// another person's token, dropped while idle and coming back as someone
-// else, be seen to switch (admit). Under Server.mu.
+// narrowing is a new token id the core accepts, and the holder of a
+// served namespace's key mints grants for any sub, each another user:
+// over maxIDUsers, the verifying namespace keeping the most ids gives
+// way, within it the issuer (kid) keeping the most, the least recently
+// verified of equals, and within that issuer its least recently verified
+// id. So one user's logins push out only that user's ids, and one key
+// holder's, for however many subs it mints or kids it adds to its
+// namespace, only its own, not those that let another person's token,
+// dropped while idle and coming back as someone else, be seen to switch
+// (admit): served namespaces are the operator's choice, and a
+// namespace's keys the issuers it trusts with its subs. Under Server.mu.
 type idUsers struct {
-	all     lru.Cache[string, idUser]
+	ids     map[string]idUser
 	users   map[string]*lru.Cache[string, struct{}] // by user: its token ids
+	issuers map[string]*lru.Cache[string, struct{}] // by issuer: its token ids
+	nss     map[string]*idGroup                     // by verifying namespace
+	seq     uint64
+	max     int
 	perUser int
+}
+
+// idGroup is the ids a verifying namespace keeps (n), by issuer (of),
+// or an issuer's, and when one was last verified (seq).
+type idGroup struct {
+	n, seq uint64
+	of     map[string]*idGroup
 }
 
 // init empties x, to keep at most all token ids, perUser of a user.
 func (x *idUsers) init(all, perUser int) {
-	*x = idUsers{perUser: perUser, users: map[string]*lru.Cache[string, struct{}]{}}
-	x.all.MaxEntries = all
-	x.all.OnEvict = func(id string, u idUser) { x.forget(id, u.user) }
+	*x = idUsers{max: all, perUser: perUser, ids: map[string]idUser{},
+		users: map[string]*lru.Cache[string, struct{}]{}, issuers: map[string]*lru.Cache[string, struct{}]{},
+		nss: map[string]*idGroup{}}
 }
 
 // get returns who token id was verified as last.
-func (x *idUsers) get(id string) (idUser, bool) { return x.all.Get(id) }
+func (x *idUsers) get(id string) (idUser, bool) {
+	u, ok := x.ids[id]
+	return u, ok
+}
 
 // put records that token id was verified as u.
 func (x *idUsers) put(id string, u idUser) {
-	if old, ok := x.all.Get(id); ok && old.user != u.user {
-		x.forget(id, old.user)
+	if old, ok := x.ids[id]; ok && old != u {
+		x.drop(id)
 	}
-	c := x.users[u.user]
-	if c == nil {
-		c = &lru.Cache[string, struct{}]{MaxEntries: x.perUser}
-		c.OnEvict = func(id string, _ struct{}) { x.all.Remove(id) }
-		x.users[u.user] = c
+	x.seq++
+	ns := x.nss[u.vns]
+	if ns == nil {
+		ns = &idGroup{of: map[string]*idGroup{}}
+		x.nss[u.vns] = ns
 	}
-	c.Put(id, struct{}{}, 1)
-	x.all.Put(id, u, 1)
+	is := ns.of[u.issuer]
+	if is == nil {
+		is = &idGroup{}
+		ns.of[u.issuer] = is
+	}
+	ns.seq, is.seq = x.seq, x.seq
+	if _, ok := x.ids[id]; ok {
+		x.users[u.user].Get(id)
+		x.issuers[u.issuer].Get(id)
+		return
+	}
+	x.ids[id] = u
+	ns.n++
+	is.n++
+	ic := x.issuers[u.issuer]
+	if ic == nil {
+		ic = &lru.Cache[string, struct{}]{MaxEntries: x.max + 1}
+		x.issuers[u.issuer] = ic
+	}
+	ic.Put(id, struct{}{}, 1)
+	uc := x.users[u.user]
+	if uc == nil {
+		uc = &lru.Cache[string, struct{}]{MaxEntries: x.perUser}
+		uc.OnEvict = func(id string, _ struct{}) { x.drop(id) }
+		x.users[u.user] = uc
+	}
+	uc.Put(id, struct{}{}, 1)
+	for len(x.ids) > x.max {
+		x.evict()
+	}
 }
 
-// forget drops token id from user's ids.
-func (x *idUsers) forget(id, user string) {
-	if c := x.users[user]; c != nil {
-		c.Remove(id)
-		if c.Len() == 0 {
-			delete(x.users, user)
+// evict drops the least recently verified id of the issuer keeping the
+// most ids in the verifying namespace keeping the most.
+func (x *idUsers) evict() {
+	ns := mostOf(x.nss)
+	if ns == "" {
+		return
+	}
+	if ic := x.issuers[mostOf(x.nss[ns].of)]; ic != nil {
+		if id, _, _, ok := ic.RemoveOldest(); ok {
+			x.drop(id)
 		}
+	}
+}
+
+// mostOf returns the key of the group of gs keeping the most ids, the
+// least recently verified of equals.
+func mostOf(gs map[string]*idGroup) string {
+	best := ""
+	for k, g := range gs {
+		if b := gs[best]; b == nil || g.n > b.n || g.n == b.n && g.seq < b.seq {
+			best = k
+		}
+	}
+	return best
+}
+
+// drop forgets token id.
+func (x *idUsers) drop(id string) {
+	u, ok := x.ids[id]
+	if !ok {
+		return
+	}
+	delete(x.ids, id)
+	if c := x.users[u.user]; c != nil {
+		if c.Remove(id); c.Len() == 0 {
+			delete(x.users, u.user)
+		}
+	}
+	if c := x.issuers[u.issuer]; c != nil {
+		if c.Remove(id); c.Len() == 0 {
+			delete(x.issuers, u.issuer)
+		}
+	}
+	ns := x.nss[u.vns]
+	if ns == nil {
+		return
+	}
+	if is := ns.of[u.issuer]; is != nil {
+		if is.n--; is.n == 0 {
+			delete(ns.of, u.issuer)
+		}
+	}
+	if ns.n--; ns.n == 0 {
+		delete(x.nss, u.vns)
 	}
 }
 
@@ -1236,7 +1336,7 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey,
 	if was != "" && was != key {
 		s.loseRecords(was, p, id)
 	}
-	s.idUsers.put(id, idUser{user: key, vns: v.ns})
+	s.idUsers.put(id, idUser{user: key, vns: v.ns, issuer: issuerKey(v)})
 	tk.verified, tk.vns = now, v.ns
 	tk.keepWriter(v.ns, v.info.Writer, now)
 	s.useLocked(tk, now)

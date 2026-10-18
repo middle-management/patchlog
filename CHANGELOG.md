@@ -212,7 +212,9 @@ service's listings.
     JWK Set too, has the core asked of each grant), asks again every 5 minutes (at most the 15
     minutes edge grants live) or after the core's `401`, and keys its state by the root `sub`
     and `kid` `/principal` names (with the namespace that verified it, asked first again for the
-    same token, kept past the token for the 256 tokens of each user verified last, and for its
+    same token, kept past the token for the 256 tokens of each user verified last, 16384 in
+    all, the verifying namespace and then the key keeping the most giving way, so one key
+    holder minting grants for many subs pushes out only its own, and for its
     kid and sub, every served namespace that did, the first never pushed out), never the token,
     so every token
     of one person, minted again or attenuated offline, shares their records, guards, own

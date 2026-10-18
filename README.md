@@ -2310,8 +2310,10 @@ core only through its public API, and keeps nothing but memory caches.
   each user may read and write, and the revisions are the grant's subject's. Nothing is kept for
   a grant before the core has accepted it: `GET /ns/{ns}/principal` (§7.4) in a served namespace
   the grant names until one accepts it: first the one that accepted this token before (kept past
-  the token, for the 256 tokens of each user verified last, so one user's logins with thousands
-  of narrowings push out only their own), then those that accepted a grant of its root `kid` and
+  the token, for the 256 tokens of each user verified last, 16384 in all, the verifying
+  namespace keeping the most giving way, then its key (`kid`) keeping the most, so one user's
+  logins with thousands of narrowings, or one key holder's for thousands of `sub`s or with
+  thousands of keys added to its namespace, push out only their own), then those that accepted a grant of its root `kid` and
   `sub` (every served namespace that did, in the order they did, so later ones never push out the
   first), then at most three of the rest, sorted, so a namespace created or given the key later,
   or another namespace's key with the same `kid`, doesn't make the same person someone else. It checks only that the grant names the namespace and verifies, key scope and revocation included, the

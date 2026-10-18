@@ -1278,6 +1278,95 @@ func TestGatewayIDUsersFlood(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"v": 1, "w": 2})
 }
 
+// Who each token was verified as (idUsers) is bounded per user, but the
+// holder of a served namespace's key mints grants for any sub, each
+// another user, and adds keys (kids) to its namespace: mallory, holding
+// the key of a served namespace of her own (mal), as the strangers of
+// TestGatewayStableUserManyNamespaces do, or a second key alpha lists,
+// logs in with more grants than the gateway keeps ids for at all, 8 per
+// user, for 34 subs, or 34 kids of mal's. Over the bound, the verifying
+// namespace keeping the most ids gives way, then its issuer keeping the
+// most: hers. alice's token, swept meanwhile and verified again as
+// another user, is still seen to switch, and her save from before is a
+// 409, not rebased on the head. The bounds are made small here (16384 and
+// 256 in use).
+func TestGatewayIDUsersFloodManySubs(t *testing.T) {
+	t.Parallel()
+	for _, flood := range []string{"one login", "subs of mal's key", "kids of mal's", "subs of a key of alpha's"} {
+		t.Run(flood, func(t *testing.T) {
+			clk := &testClock{t: time.Now()}
+			e, k := authEnv(t, true)
+			srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"alpha", "docs", "mal"}, Gateway: true,
+				Now: clk.now, VerifyEvery: time.Minute, Logf: t.Logf}))
+			const all, perUser, per = 256, 16, 8
+			dav.SetIDUsers(srv, all, perUser)
+			e.dav = newTestServer(t, srv)
+			writer := []string{"read", "create", "append", "restore", "delete", "config"}
+			mk := clienttest.NewKey("mk")
+			mks := []clienttest.Key{mk}
+			if flood == "kids of mal's" {
+				for i := 1; i <= all/per+2; i++ {
+					mks = append(mks, clienttest.NewKey(fmt.Sprintf("mk%d", i)))
+				}
+			}
+			var malKeys []any
+			for _, key := range mks {
+				malKeys = append(malKeys, key.Entry("*"))
+			}
+			alphaKeys := []any{k.Entry("*")}
+			ns := "mal"
+			if flood == "subs of a key of alpha's" {
+				alphaKeys, ns = append(alphaKeys, mk.Entry("*")), "alpha"
+			}
+			op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+			must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": alphaKeys}))
+			opm := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "mal")))
+			must(opm.CreateNamespace(e.ctx, "mal", map[string]any{"read": "grant", "keys": malKeys}))
+			alice := k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
+			e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+			buf := e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "alice's GET, verified by alpha").body
+			h, _ := e.load("docs", "x")
+			must(e.c.Append(e.ctx, "docs", "x", h.ID, []any{replace("/w", 2)}))
+			ac := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"alpha"}, writer)))
+			nh := must(ac.NSHead(e.ctx, "alpha"))
+			must(ac.PatchConfig(e.ctx, "alpha", nh.Config, []any{map[string]any{"op": "replace", "path": "/keys", "value": append([]any{clienttest.NewKey("k2").Entry("*")}, alphaKeys[1:]...)}}))
+			clk.add(2 * time.Minute)
+			// mallory's logins (the first sweeps alice's idle token), per
+			// tokens of each sub, or of each kid, within the per-user bound.
+			var wg sync.WaitGroup
+			ch := make(chan int)
+			for w := 0; w < 4; w++ {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					for i := range ch {
+						key, sub := mk, fmt.Sprintf("user:m%d", i/per)
+						if flood == "kids of mal's" {
+							key, sub = mks[i/per], "user:m"
+						}
+						tok := key.Grant(t, e.s.Now().Add(time.Duration(i)*time.Second), sub, []string{ns}, []string{"read"})
+						if r := e.doAs(tok, "GET", "/"+ns+"/.nothing", ""); r.status != 404 {
+							t.Errorf("mallory's login %d: %d %s", i, r.status, r.body)
+						}
+					}
+				}()
+			}
+			n := 1
+			if flood != "one login" {
+				n = all + 2*per
+			}
+			for i := 0; i < n; i++ {
+				ch <- i
+			}
+			close(ch)
+			wg.Wait()
+			e.expect(e.doAs(alice, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 409, "alice's save from before, verified again as another user after mallory's logins")
+			_, doc := e.load("docs", "x")
+			sameJSON(t, doc, map[string]any{"v": 1, "w": 2})
+		})
+	}
+}
+
 // A key set the core's jwks_uri answers 200 with a body that isn't a JWK
 // Set (`{}`, a proxy's JSON error page for an unrouted /.well-known) is a
 // failed read, as a 404 is (TestGatewayOperatorKeys404), not an empty
