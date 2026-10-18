@@ -1,8 +1,13 @@
 package dav_test
 
 import (
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,9 +123,11 @@ func TestDeleteAfterRefusedSave(t *testing.T) {
 
 // rclone's --retries (and a mount's write-back) send the refused save
 // again, each time followed by a DELETE: every one is refused, and the
-// document stays as it was. So does one whose save deleted the original
-// first (a DELETE, then the PUT), which the refusal restores: the DELETE
-// after that refusal is refused, not a tombstone again.
+// document stays as it was. One the principal deleted before the refused
+// save (rm in a mount, then a new file of the name; the DELETE of a
+// save that deletes the original first) is restored by the refusal
+// (undoOwnDelete), and the DELETE after it isn't refused: it leaves the
+// document deleted, as the principal chose, each retry alike.
 func TestDeleteAfterRefusedSaveRetried(t *testing.T) {
 	t.Parallel()
 	e := guardEnv(t, newClock())
@@ -135,25 +142,36 @@ func TestDeleteAfterRefusedSaveRetried(t *testing.T) {
 	e.create("docs", "y", map[string]any{"v": 1})
 	e.expect(e.do("GET", "/docs/y.json", ""), 200, "GET")
 	e.expect(e.do("DELETE", "/docs/y.json", ""), 204, "DELETE, the original first")
-	e.expect(e.do("PUT", "/docs/y.json", `{"v": 2`), 400, "PUT that isn't JSON: restored")
-	h, _ = e.load("docs", "y")
-	e.expectGuarded("/docs/y.json", "rclone's cleanup DELETE after the restore")
-	e.expect(e.do("PUT", "/docs/y.json", `{"v": 2`), 400, "the retried PUT")
-	e.expectGuarded("/docs/y.json", "the retry's cleanup DELETE")
-	e.expectLive("docs", "y", h, "after the retries")
+	for i := 0; i < 3; i++ {
+		e.expect(e.do("PUT", "/docs/y.json", `{"v": 2`), 400, "PUT that isn't JSON: restored")
+		if h, _ := e.load("docs", "y"); h.State != client.Live {
+			t.Fatalf("not restored: %v", h.State)
+		}
+		e.expect(e.do("DELETE", "/docs/y.json", ""), 204, "rclone's cleanup DELETE after the restore")
+		e.expectTombstoned("docs", "y", "after the cleanup")
+	}
 }
 
-// A GET of the file after the refused save (200: the user reloaded it)
-// lifts the guard; a HEAD, a listing or a range read (a mount's) doesn't.
+// A GET of the file a few seconds after the refused save (200: the user
+// reloaded it) lifts the guard; one in the second before rclone's DELETE
+// (another program of the same user), a HEAD, a listing or a range read
+// (a mount's) doesn't.
 func TestDeleteAfterRefusedSaveRead(t *testing.T) {
 	t.Parallel()
-	e := guardEnv(t, newClock())
+	c := newClock()
+	e := guardEnv(t, c)
 	e.refusedSave(0, "x")
-	e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET, a reload")
-	e.expect(e.do("DELETE", "/docs/x.json", ""), 204, "DELETE after the reload")
-	e.expectTombstoned("docs", "x", "DELETE after a reload")
+	c.add(time.Second)
+	e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET a second after")
+	e.expectGuarded("/docs/x.json", "DELETE after a GET a second after the refusal")
+	e.refusedSave(0, "w")
+	c.add(3 * time.Second)
+	e.expect(e.do("GET", "/docs/w.json", ""), 200, "GET, a reload")
+	e.expect(e.do("DELETE", "/docs/w.json", ""), 204, "DELETE after the reload")
+	e.expectTombstoned("docs", "w", "DELETE after a reload")
 
 	h := e.refusedSave(1, "y")
+	c.add(3 * time.Second)
 	e.expect(e.do("HEAD", "/docs/y.json", ""), 200, "HEAD")
 	e.propfind("/docs/")
 	e.expect(e.do("GET", "/docs/y.json", "", "Range", "bytes=0-3"), 206, "a range read")
@@ -195,6 +213,16 @@ func TestDeleteAfterRefusedSaveIfMatch(t *testing.T) {
 	e.expect(e.do("DELETE", "/docs/z.json", "", "If-Match", `"`+h.Last+`x"`), 412, "DELETE If-Match another revision")
 	e.expectGuarded("/docs/z.json", "DELETE without If-Match")
 	e.expectLive("docs", "z", h, "after a 412 and a refused DELETE")
+
+	// A DELETE done forgets the guard it passed: a refused save after it
+	// restores the document (undoOwnDelete), and rclone's DELETE then
+	// deletes it again, as the user chose; the first refusal's guard
+	// mustn't keep it.
+	h = e.refusedSave(1, "v")
+	e.expect(e.do("DELETE", "/docs/v.json", "", "If-Match", `"`+h.ID+`"`), 204, "DELETE If-Match the head")
+	e.expect(e.do("PUT", "/docs/v.json", `{"a": "2"`), 400, "a refused save after it: restored")
+	e.expect(e.do("DELETE", "/docs/v.json", ""), 204, "rclone's cleanup DELETE")
+	e.expectTombstoned("docs", "v", "after the cleanup")
 }
 
 // The guard is the principal's own: in a gateway, another user's DELETE
@@ -218,9 +246,11 @@ func TestDeleteAfterRefusedSaveGateway(t *testing.T) {
 	}
 }
 
-// A save that succeeded, merged with others' edits or not, sets no guard,
-// and lifts one a refused save set: rclone deletes a merged upload whose
-// size differs only without --ignore-size, a documented case.
+// A save that succeeded, merged with others' edits or not, sets no guard
+// (rclone deletes a merged upload whose size differs only without
+// --ignore-size, a documented case), nor lifts one a refused save set:
+// rclone's DELETE after its refused upload would delete the other
+// program's save.
 func TestDeleteAfterSuccessfulSave(t *testing.T) {
 	t.Parallel()
 	e := guardEnv(t, newClock())
@@ -241,26 +271,39 @@ func TestDeleteAfterSuccessfulSave(t *testing.T) {
 	e.expectGuarded("/docs/z.json", "DELETE after a refused save")
 	e.expectLive("docs", "z", h, "after a refused DELETE")
 	e.expect(e.do("PUT", "/docs/z.json", `{"a": "1"`), 400, "refused again")
-	e.expect(e.do("PUT", "/docs/z.json", `{"a": "2", "b": "1"}`), 201, "then saved")
-	e.expect(e.do("DELETE", "/docs/z.json", ""), 204, "DELETE after the save")
-	e.expectTombstoned("docs", "z", "DELETE after a refused save, then a save")
+	e.expect(e.do("PUT", "/docs/z.json", `{"a": "2", "b": "1"}`), 201, "another program's save")
+	h, _ = e.load("docs", "z")
+	e.expectGuarded("/docs/z.json", "rclone's cleanup DELETE after the other save")
+	e.expectLive("docs", "z", h, "after the cleanup")
+	e.expect(e.do("DELETE", "/docs/z.json", ""), 204, "DELETE again")
+	e.expectTombstoned("docs", "z", "DELETE again")
 }
 
 // A refused MOVE or COPY of a scratch file onto a document (an atomic
-// save whose temporary file isn't JSON) sets the guard as a refused PUT
-// does.
+// save whose temporary file isn't JSON) sets no guard: rclone deletes
+// nothing after one, and without a cache its next save over the file is
+// a DELETE, then a MOVE (Overwrite: F), which gives up when the DELETE is
+// refused (sed -i: "cannot rename").
 func TestDeleteAfterRefusedMove(t *testing.T) {
 	t.Parallel()
 	e := guardEnv(t, newClock())
-	for _, m := range []string{"MOVE", "COPY"} {
-		name := strings.ToLower(m)
-		e.create("docs", name, map[string]any{"a": "1"})
-		h, _ := e.load("docs", name)
-		e.expect(e.do("PUT", "/docs/.tmp-"+name, `{"a": "2"`), 201, "PUT scratch")
-		e.expect(e.do(m, "/docs/.tmp-"+name, "", "Destination", "/docs/"+name+".json", "Overwrite", "T"), 400, m+" that isn't JSON onto the document")
-		e.expectGuarded("/docs/"+name+".json", "DELETE after a refused "+m)
-		e.expectLive("docs", name, h, "after a refused "+m)
-	}
+	e.create("docs", "s", map[string]any{"n": 1})
+	e.expect(e.do("GET", "/docs/s.json", "", "Range", "bytes=0-100"), 206, "a mount's read")
+	e.expect(e.do("PUT", "/docs/sedA", `{"n": 1,}`), 201, "sed's temporary file")
+	e.expect(e.do("DELETE", "/docs/s.json", ""), 204, "rclone's rename: DELETE")
+	e.expect(e.do("MOVE", "/docs/sedA", "", "Destination", "/docs/s.json", "Overwrite", "F"), 400, "MOVE that isn't JSON: restored")
+	e.expect(e.do("DELETE", "/docs/sedA", ""), 204, "sed removes its temporary file")
+	e.expect(e.do("PUT", "/docs/sedB", `{"n": 2}`), 201, "the next sed -i: temporary file")
+	e.expect(e.do("DELETE", "/docs/s.json", ""), 204, "rclone's rename: DELETE")
+	e.expect(e.do("MOVE", "/docs/sedB", "", "Destination", "/docs/s.json", "Overwrite", "F"), 201, "MOVE onto the name")
+	_, doc := e.load("docs", "s")
+	sameJSON(t, doc, map[string]any{"n": 2.0})
+
+	e.create("docs", "copy", map[string]any{"a": "1"})
+	e.expect(e.do("PUT", "/docs/.tmp-copy", `{"a": "2"`), 201, "PUT scratch")
+	e.expect(e.do("COPY", "/docs/.tmp-copy", "", "Destination", "/docs/copy.json", "Overwrite", "T"), 400, "COPY that isn't JSON onto the document")
+	e.expect(e.do("DELETE", "/docs/copy.json", ""), 204, "DELETE after a refused COPY")
+	e.expectTombstoned("docs", "copy", "DELETE after a refused COPY")
 }
 
 // In a catalog folder, rclone's DELETE of a placement whose save was
@@ -286,11 +329,12 @@ func TestDeleteAfterRefusedPlacementSave(t *testing.T) {
 
 // Editors' save sequences after a refused save still save, and none
 // leaves a tombstone: vim's (backup, write, backup gone), gedit's and VS
-// Code's (a temporary file moved over the document), and those that
-// delete the original first (rclone's mount without a cache: DELETE, then
-// MOVE onto the name), whose DELETE is refused and whose MOVE then is an
-// edit (Overwrite: T), a 412 (Overwrite: F: the document is there), or
-// refused as the save was.
+// Code's (a temporary file moved over the document); rclone's mount
+// without a cache (its cleanup DELETE refused, then a save as DELETE and
+// MOVE onto the name, Overwrite: F); and a client that deletes the
+// original first and goes on when that DELETE is refused, whose MOVE then
+// is an edit (Overwrite: T), a 412 (Overwrite: F: the document is there),
+// or refused as the save was.
 func TestSavesAfterRefusedSave(t *testing.T) {
 	t.Parallel()
 	e := guardEnv(t, newClock())
@@ -311,10 +355,18 @@ func TestSavesAfterRefusedSave(t *testing.T) {
 	sameJSON(t, doc, saved)
 
 	e.refusedSave(1, "rc")
+	e.expectGuarded("/docs/rc.json", "rclone: the refused upload's cleanup DELETE")
 	e.expect(e.do("PUT", "/docs/rc.json.tmp", text), 201, "rclone: temporary file")
-	e.expectGuarded("/docs/rc.json", "rclone: DELETE of the original")
-	e.expect(e.do("MOVE", "/docs/rc.json.tmp", "", "Destination", "/docs/rc.json", "Overwrite", "T"), 204, "MOVE onto it")
+	e.expect(e.do("DELETE", "/docs/rc.json", ""), 204, "rclone: DELETE of the original")
+	e.expect(e.do("MOVE", "/docs/rc.json.tmp", "", "Destination", "/docs/rc.json", "Overwrite", "F"), 201, "rclone: MOVE onto the name")
 	_, doc = e.load("docs", "rc")
+	sameJSON(t, doc, saved)
+
+	e.refusedSave(1, "del")
+	e.expect(e.do("PUT", "/docs/del.json.tmp", text), 201, "temporary file")
+	e.expectGuarded("/docs/del.json", "DELETE of the original")
+	e.expect(e.do("MOVE", "/docs/del.json.tmp", "", "Destination", "/docs/del.json", "Overwrite", "T"), 204, "MOVE onto it")
+	_, doc = e.load("docs", "del")
 	sameJSON(t, doc, saved)
 
 	h := e.refusedSave(1, "rcf")
@@ -328,4 +380,165 @@ func TestSavesAfterRefusedSave(t *testing.T) {
 	e.expectGuarded("/docs/conflict.json", "DELETE of the original")
 	e.expect(e.do("MOVE", "/docs/conflict.json.tmp", "", "Destination", "/docs/conflict.json"), 409, "MOVE of the conflicting version")
 	e.expectLive("docs", "conflict", h, "after the conflicting MOVE")
+}
+
+// A document the user deleted a while ago isn't brought back by a refused
+// save of its name: the delete-then-write restore (undoOwnDelete) is for
+// a DELETE moments before the write, and the DELETE after a refusal that
+// restored one is done, so rclone's cleanup puts back the deletion. Nor
+// is a placement the user unplaced.
+func TestRefusedSaveAfterOldDelete(t *testing.T) {
+	t.Parallel()
+	c := newClock()
+	e := guardEnv(t, c)
+	e.create("docs", "gone", map[string]any{"secret": "unpublish me"})
+	e.expect(e.do("DELETE", "/docs/gone.json", ""), 204, "a deliberate DELETE")
+	c.add(6 * time.Hour)
+	r := e.expect(e.do("PUT", "/docs/gone.json", `{"title": "new"`), 400, "a new file of the name, not JSON")
+	if strings.Contains(r.body, "restored") {
+		t.Fatalf("restored 6 h after: %q", r.body)
+	}
+	e.expectTombstoned("docs", "gone", "after a refused save 6 h after the DELETE")
+	e.expect(e.do("DELETE", "/docs/gone.json", ""), 404, "rclone's cleanup DELETE")
+	e.expectTombstoned("docs", "gone", "after the cleanup")
+
+	// Within the restore's window (31 s isn't), still restored, and the
+	// cleanup deletes it again.
+	e.create("docs", "late", map[string]any{"v": 1})
+	e.expect(e.do("DELETE", "/docs/late.json", ""), 204, "DELETE")
+	c.add(31 * time.Second)
+	e.expect(e.do("PUT", "/docs/late.json", `{"v": 2`), 400, "refused 31 s after")
+	e.expectTombstoned("docs", "late", "refused 31 s after the DELETE")
+	e.create("docs", "soon", map[string]any{"v": 1})
+	e.expect(e.do("DELETE", "/docs/soon.json", ""), 204, "DELETE")
+	c.add(15 * time.Second)
+	r = e.expect(e.do("PUT", "/docs/soon.json", `{"v": 2`), 400, "refused 15 s after")
+	if !strings.Contains(r.body, "restored") {
+		t.Fatalf("not restored 15 s after: %q", r.body)
+	}
+	e.expect(e.do("DELETE", "/docs/soon.json", ""), 204, "rclone's cleanup DELETE")
+	e.expectTombstoned("docs", "soon", "after the cleanup")
+
+	e.create("docs", "p", map[string]any{"v": 1})
+	e.create("cat", "root", map[string]any{"parents": []any{}})
+	e.create("cat", "docs.p", map[string]any{"parents": parents("cat", "root")})
+	e.expect(e.do("DELETE", "/cat/root/docs.p.json", ""), 204, "unplace")
+	c.add(time.Hour)
+	e.expect(e.do("PUT", "/cat/root/docs.p.json", `{"v": 2`), 400, "a refused save of the path an hour after")
+	e.do("DELETE", "/cat/root/docs.p.json", "")
+	if h, _ := e.load("cat", "docs.p"); h.State != client.Tombstoned {
+		t.Fatalf("unplaced an hour ago, the placement is %v after a refused save", h.State)
+	}
+}
+
+// More refused uploads at once than 64 (rclone --transfers, or several
+// clients of local mode's one user) keep their guards; a cleanup DELETE
+// that finds nothing (a refused create's) uses its guard up.
+func TestDeleteAfterManyRefusedSaves(t *testing.T) {
+	t.Parallel()
+	e := guardEnv(t, newClock())
+	const n = 80
+	for i := 0; i < n; i++ {
+		e.create("docs", fmt.Sprintf("m%02d", i), map[string]any{"v": 1})
+	}
+	for i := 0; i < n; i++ {
+		e.expect(e.do("PUT", fmt.Sprintf("/docs/m%02d.json", i), `{"v": 2`), 400, "refused")
+	}
+	for i := 0; i < n; i++ {
+		e.expectGuarded(fmt.Sprintf("/docs/m%02d.json", i), "cleanup DELETE")
+		if h, _ := e.load("docs", fmt.Sprintf("m%02d", i)); h.State != client.Live {
+			t.Fatalf("m%02d is %v", i, h.State)
+		}
+	}
+
+	e.expect(e.do("PUT", "/docs/new.json", `{"v": 1`), 400, "a refused create")
+	e.expect(e.do("DELETE", "/docs/new.json", ""), 404, "its cleanup DELETE")
+	e.create("docs", "new", map[string]any{"v": 1})
+	e.expect(e.do("DELETE", "/docs/new.json", ""), 204, "a DELETE after someone created it")
+}
+
+// Two refused saves of one file before their cleanups (two clients of the
+// same user) refuse two DELETEs, saying so; a client's repeated refused
+// saves refuse at most two.
+func TestDeleteAfterTwoRefusedSaves(t *testing.T) {
+	t.Parallel()
+	e := guardEnv(t, newClock())
+	e.create("docs", "two", map[string]any{"v": 1})
+	h, _ := e.load("docs", "two")
+	e.expect(e.do("PUT", "/docs/two.json", `{"v": 2`), 400, "refused 1")
+	e.expect(e.do("PUT", "/docs/two.json", `{"v": 3`), 400, "refused 2")
+	r := e.expect(e.do("DELETE", "/docs/two.json", ""), 409, "cleanup 1")
+	if !strings.Contains(r.body, "2 refused saves") || !strings.Contains(r.body, "2 more times") {
+		t.Fatalf("cleanup 1: %q", r.body)
+	}
+	e.expectGuarded("/docs/two.json", "cleanup 2")
+	e.expectLive("docs", "two", h, "after two cleanups")
+
+	for i := 0; i < 4; i++ {
+		e.expect(e.do("PUT", "/docs/two.json", `{"v": 4`), 400, "refused again")
+	}
+	e.expect(e.do("DELETE", "/docs/two.json", ""), 409, "DELETE 1")
+	e.expectGuarded("/docs/two.json", "DELETE 2")
+	e.expect(e.do("DELETE", "/docs/two.json", ""), 204, "DELETE 3")
+	e.expectTombstoned("docs", "two", "DELETE 3")
+}
+
+// flakyRT answers the next GET of catalog cat's resources with a 429
+// while armed.
+type flakyRT struct{ armed atomic.Bool }
+
+func (f *flakyRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == "GET" && r.URL.Path == "/ns/cat" && f.armed.CompareAndSwap(true, false) {
+		return &http.Response{StatusCode: 429, Header: http.Header{"Retry-After": {"5"}, "Content-Type": {"application/json"}},
+			Body: io.NopCloser(strings.NewReader(`{"code":"rate_limited","message":"slow down"}`)), Request: r}, nil
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// A PUT of a placement's file refused because the catalog couldn't be
+// read (the core's 429: 503) still guards the placement against rclone's
+// cleanup DELETE, which may find it read.
+func TestDeleteAfterRefusedPlacementSaveUnread(t *testing.T) {
+	t.Parallel()
+	e := guardEnv(t, newClock())
+	e.create("docs", "p", map[string]any{"v": 1})
+	e.create("cat", "root", map[string]any{"parents": []any{}})
+	e.create("cat", "docs.p", map[string]any{"parents": parents("cat", "root")})
+	rt := &flakyRT{}
+	srv, err := dav.New(dav.Options{Client: e.s.Client(t, client.WithAuthor("dav"), client.WithHTTPClient(&http.Client{Transport: rt})),
+		Namespaces: []string{"docs"}, Catalogs: []string{"cat"}, Password: e.pw, Logf: t.Logf})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.dav = httptest.NewServer(srv)
+	t.Cleanup(e.dav.Close)
+	rt.armed.Store(true)
+	e.expect(e.do("PUT", "/cat/root/docs.p.json", `{"v": 2}`), 503, "PUT, the catalog's read rate-limited")
+	e.expectGuarded("/cat/root/docs.p.json", "rclone's cleanup DELETE")
+	sameJSON(t, e.parentsOf("docs.p"), parents("cat", "root"))
+}
+
+// A frozen namespace takes no DELETE (§8.4): the DELETE after a save
+// refused there, by the core or by the server (a body that isn't JSON),
+// gets the core's 403, not the guard's 409, which would say a second
+// DELETE deletes it.
+func TestDeleteAfterRefusedSaveFrozen(t *testing.T) {
+	t.Parallel()
+	c := newClock()
+	e := guardEnv(t, c)
+	e.create("docs", "x", map[string]any{"a": "1"})
+	e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
+	nh := must(e.c.NSHead(e.ctx, "docs"))
+	must(e.c.PatchConfig(e.ctx, "docs", nh.Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
+	c.add(time.Minute) // past the server's cache of the namespace's document
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "2"`), 400, "a body that isn't JSON")
+	r := e.expect(e.do("DELETE", "/docs/x.json", ""), 403, "DELETE after it")
+	if !strings.Contains(r.body, "frozen") {
+		t.Fatalf("DELETE: %q", r.body)
+	}
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "2"}`), 403, "a save the core refuses")
+	e.expect(e.do("DELETE", "/docs/x.json", ""), 403, "DELETE after it")
+	if h, _ := e.load("docs", "x"); h.State != client.Live {
+		t.Fatalf("x is %v", h.State)
+	}
 }

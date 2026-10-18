@@ -23,6 +23,7 @@ type davError struct {
 	msg    string
 	header http.Header
 	cause  error // logged, not answered
+	frozen bool  // the core's 409 frozen: the namespace takes no writes (§8.4)
 }
 
 func (e *davError) Error() string {
@@ -74,6 +75,7 @@ func upstream(err error) error {
 		return fail(ae.Status, "%s", msg)
 	case ae.Status == 409 && ae.Code == "frozen":
 		e := fail(http.StatusForbidden, "%s: the namespace takes no writes (§8.4)", msg)
+		e.frozen = true
 		if s := ae.Successor(); s != "" {
 			e.msg += "; its successor is " + s
 		}

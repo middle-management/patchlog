@@ -205,6 +205,19 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 	}), nil
 }
 
+// placementPath reports whether p, of at most maxRefusedPath bytes, may
+// name a placement's file in a served catalog, {cat}/…/{ns}.{name}.json,
+// whatever the catalog holds.
+func (st *reqState) placementPath(p string) bool {
+	segs := strings.Split(strings.TrimPrefix(p, "/"), "/")
+	base, ok := strings.CutSuffix(segs[len(segs)-1], ".json")
+	if !ok || len(segs) < 2 || len(p) > maxRefusedPath || !st.s.cats[segs[0]] {
+		return false
+	}
+	_, _, ok = tree.SplitPlacement(base)
+	return ok
+}
+
 // parentsOf is the parents value placing a node in folder: one live link
 // to it, or none at the root (§B.2).
 func parentsOf(cat, folder string) []any {

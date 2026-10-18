@@ -96,6 +96,7 @@ func (s *Server) keep(k string, e *docEntry) {
 // deployment's apply), for messages.
 type nsInfo struct {
 	sealed                bool
+	frozen                bool // §8.4: it takes no writes, a DELETE neither
 	nonce                 bool
 	trust                 []string
 	patchSetSize, docSize int
@@ -129,6 +130,7 @@ func (s *Server) nsInfo(ctx context.Context, p *principal, ns string) nsInfo {
 		lv, _ := enc["level"].(string)
 		in.sealed = lv == "sealed" || lv == "e2e"
 		in.nonce = d.Value["nonce"] == "required"
+		in.frozen = d.Value["frozen"] == true
 		lim, _ := d.Value["limits"].(map[string]any)
 		if n, ok := lim["patchSetSize"].(float64); ok {
 			in.patchSetSize = int(n)

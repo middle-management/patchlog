@@ -667,6 +667,7 @@ func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb stri
 		return err
 	}
 	st.p.forgetDelete(ns, name)
+	st.undeleted = true
 	de, ok := upstream(err).(*davError)
 	if !ok {
 		return err
@@ -686,7 +687,8 @@ func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb stri
 // is undone, and the document restored as it was, as a failed PUT leaves
 // it. So is a placement's node the principal's DELETE removed (unplaced)
 // before the write to its path. Only the principal's own tombstone, still
-// the head, is restored (with If-Match on it).
+// the head and written within ownDeleteUndo, is restored (with If-Match
+// on it).
 func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) error {
 	if err == nil || !t.isDoc() {
 		return err
@@ -697,11 +699,11 @@ func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) erro
 		todo = append(todo, res{t.ns, t.node})
 	}
 	for _, r := range todo {
-		if !st.p.deletedOwn(r.ns, r.name, "") {
+		if !st.p.deletedOwn(r.ns, r.name, "", st.s.opt.Now()) {
 			continue
 		}
 		h, herr := st.p.c.Head(ctx, r.ns, r.name)
-		if herr != nil || h.State != client.Tombstoned || !st.p.deletedOwn(r.ns, r.name, h.ID) {
+		if herr != nil || h.State != client.Tombstoned || !st.p.deletedOwn(r.ns, r.name, h.ID, st.s.opt.Now()) {
 			continue
 		}
 		err = st.undelete(ctx, st.s.nsInfo(ctx, st.p, r.ns), r.ns, r.name, h.ID, err)

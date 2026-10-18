@@ -391,18 +391,32 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // answered keeps what the request's answer, status, says of the
-// principal's saves for a DELETE that follows (refusedSaveFor): a save
-// of a document's file refused without writing to the core is noted; one
-// done, or a GET of the file answered whole, forgets it. It runs before
-// the answer goes out, so the client's next request finds it.
+// principal's saves for a DELETE that follows (refusedSaveFor). A PUT of
+// a document's file refused without writing to the core is noted, but
+// for one that put back the principal's own DELETE (undoOwnDelete), which
+// a DELETE after it leaves deleted as the principal chose, and one a
+// frozen namespace refused, which takes no DELETE either (§8.4). A DELETE
+// done, or a GET of the file answered whole once the refusal is
+// refusedSaveRead old, forgets them; a DELETE that found nothing (a
+// refused create's cleanup) uses one up. It runs before the answer goes
+// out, so the client's next request finds it.
 func (st *reqState) answered(status int) {
+	now := st.s.opt.Now()
 	switch {
-	case st.saveTo != "" && status >= 400 && !st.committed:
-		st.p.noteRefusedSave(st.saveTo, status, st.s.opt.Now())
-	case st.saveTo != "" && status < 400:
-		st.p.clearRefusedSave(st.saveTo)
-	case st.method == "GET" && status == http.StatusOK:
+	case st.method == "PUT" && st.saveTo != "" && status >= 400:
+		switch {
+		case st.committed, st.undeleted:
+		case st.saveDoc && st.err != nil && st.err.frozen:
+			st.p.clearRefusedSave(st.saveTo)
+		default:
+			st.p.noteRefusedSave(st.saveTo, status, now)
+		}
+	case st.method == "DELETE" && status < 400:
 		st.p.clearRefusedSave(st.path)
+	case st.method == "DELETE" && status == http.StatusNotFound:
+		st.p.takeRefusedSave(st.path, now)
+	case st.method == "GET" && status == http.StatusOK:
+		st.p.readAfterRefusedSave(st.path, now)
 	}
 }
 
@@ -1016,13 +1030,21 @@ func (p *principal) noteDelete(ns, name, tomb string, now time.Time) {
 	p.deletes[ns+"/"+name] = ownDelete{tomb: tomb, at: now}
 }
 
+// ownDeleteUndo is how long after the principal's DELETE of a document a
+// refused write of its name restores it as it was (undoOwnDelete): a
+// save that deletes the original first writes the new version moments
+// later (davfs2 within its upload delay, 10 seconds by default); one
+// deleted before that stays deleted.
+const ownDeleteUndo = 30 * time.Second
+
 // deletedOwn reports whether tomb, ns/name's head, is the principal's own
-// DELETE; with tomb "", whether it deleted ns/name lately.
-func (p *principal) deletedOwn(ns, name, tomb string) bool {
+// DELETE, within ownDeleteUndo of now; with tomb "", whether it deleted
+// ns/name that lately.
+func (p *principal) deletedOwn(ns, name, tomb string, now time.Time) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	d, ok := p.deletes[ns+"/"+name]
-	return ok && (tomb == "" || d.tomb == tomb)
+	return ok && now.Sub(d.at) <= ownDeleteUndo && (tomb == "" || d.tomb == tomb)
 }
 
 func (p *principal) forgetDelete(ns, name string) {
@@ -1031,21 +1053,46 @@ func (p *principal) forgetDelete(ns, name string) {
 	delete(p.deletes, ns+"/"+name)
 }
 
-// A refused save of a document's file (a PUT, or a MOVE or COPY onto it,
-// answered 4xx or 5xx, that wrote nothing of it) makes the principal's
-// next DELETE of the same path within refusedSaveFor a 409, once, unless
-// the principal read the file (a GET answered 200) or saved it since:
-// rclone deletes a file whose upload failed, a second after the failure
+// A refused save of a document's file (a PUT answered 4xx or 5xx that
+// wrote nothing of it) makes the principal's next DELETE of the same path
+// within refusedSaveFor a 409, once per refused save (at most
+// maxRefusedCount pending), unless the principal read the file since (a
+// GET answered 200, at least refusedSaveRead after the refusal): rclone
+// deletes a file whose upload failed, a second after the failure
 // (removeFailedCopy), and that DELETE would tombstone the document for
 // every reader, or unplace the placement, because a save was refused. A
 // DELETE naming the revision it deletes (If-Match) is deliberate and
-// passes; so does the DELETE sent again.
+// passes; so does the DELETE sent again. A refused MOVE or COPY onto the
+// file sets none: rclone never deletes after one, and its next save
+// without a cache (DELETE, then MOVE) would meet the guard instead.
 const refusedSaveFor = 10 * time.Second
 
-// refusedSave is a refused save: when, and the status it was answered.
+// refusedSaveRead is how old a refused save must be for a GET of the
+// file to lift its guard: another program of the principal's reading the
+// file in the second before rclone's DELETE isn't the principal's
+// reload.
+const refusedSaveRead = 2 * time.Second
+
+// maxRefused bounds the paths a principal's refused saves are kept for,
+// and maxRefusedCount the DELETEs one path's refuse: two clients' refused
+// saves of it, each followed by its cleanup, without making a deliberate
+// DELETE after a client's repeated refused saves (none of which deletes)
+// take more than a few tries.
+const (
+	maxRefused      = 1024
+	maxRefusedCount = 2
+)
+
+// maxRefusedPath bounds the path of a refused save kept for a PUT whose
+// path couldn't be resolved (a catalog that couldn't be read).
+const maxRefusedPath = 1024
+
+// refusedSave is a path's refused saves: the latest's time and status,
+// and how many DELETEs they still refuse.
 type refusedSave struct {
 	at     time.Time
 	status int
+	n      int
 }
 
 // noteRefusedSave remembers that a save of the document at path was
@@ -1058,7 +1105,8 @@ func (p *principal) noteRefusedSave(path string, status int, now time.Time) {
 			delete(p.refused, k)
 		}
 	}
-	if _, ok := p.refused[path]; !ok && len(p.refused) >= maxDeletes {
+	r, ok := p.refused[path]
+	if !ok && len(p.refused) >= maxRefused {
 		var old string
 		for k, r := range p.refused {
 			if old == "" || r.at.Before(p.refused[old].at) {
@@ -1067,25 +1115,44 @@ func (p *principal) noteRefusedSave(path string, status int, now time.Time) {
 		}
 		delete(p.refused, old)
 	}
-	p.refused[path] = refusedSave{at: now, status: status}
+	p.refused[path] = refusedSave{at: now, status: status, n: min(r.n+1, maxRefusedCount)}
 }
 
-// takeRefusedSave returns, once, the principal's refused save of the
-// document at path within refusedSaveFor of now.
-func (p *principal) takeRefusedSave(path string, now time.Time) (refusedSave, bool) {
+// takeRefusedSave takes one DELETE's refusal from the principal's refused
+// saves of the document at path within refusedSaveFor of now, saying how
+// many more DELETEs they refuse.
+func (p *principal) takeRefusedSave(path string, now time.Time) (r refusedSave, left int, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	r, ok := p.refused[path]
-	delete(p.refused, path)
-	return r, ok && now.Sub(r.at) <= refusedSaveFor
+	r, ok = p.refused[path]
+	if !ok || now.Sub(r.at) > refusedSaveFor {
+		delete(p.refused, path)
+		return r, 0, false
+	}
+	if r.n <= 1 {
+		delete(p.refused, path)
+		return r, 0, true
+	}
+	p.refused[path] = refusedSave{at: r.at, status: r.status, n: r.n - 1}
+	return r, r.n - 1, true
 }
 
-// clearRefusedSave forgets a refused save of the document at path: the
-// principal read the file since, or saved it.
+// clearRefusedSave forgets the refused saves of the document at path.
 func (p *principal) clearRefusedSave(path string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	delete(p.refused, path)
+}
+
+// readAfterRefusedSave forgets the refused saves of the document at path
+// that the principal read (a GET answered 200) at now, if the latest is
+// at least refusedSaveRead old: the principal reloaded it.
+func (p *principal) readAfterRefusedSave(path string, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if r, ok := p.refused[path]; ok && now.Sub(r.at) >= refusedSaveRead {
+		delete(p.refused, path)
+	}
 }
 
 func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
@@ -1118,12 +1185,16 @@ type reqState struct {
 	noETag      bool   // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
 	made        string // the revision commitDoc created or restored a document with
 	serve       *stagedServe
-	// saveTo is the document path the request writes (a PUT's, a MOVE's
-	// or COPY's destination), once resolved; committed: the request wrote
-	// to the core (a revision, a catalog node), not counting a restore of
-	// the principal's own DELETE as it was (undoOwnDelete).
+	// saveTo is the document path a PUT writes, once resolved (or one in
+	// a catalog that couldn't be read, maybe a placement's), and saveDoc
+	// whether it is a flat namespace's document; committed: the request
+	// wrote to the core (a revision, a catalog node), not counting a
+	// restore of the principal's own DELETE as it was (undoOwnDelete),
+	// which undeleted says it did.
 	saveTo    string
+	saveDoc   bool
 	committed bool
+	undeleted bool
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog
