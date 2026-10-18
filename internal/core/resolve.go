@@ -637,9 +637,12 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 // oldest limit of them, and with maxBytes > 0 only as many as their patch
 // sets fit in, as served (decompressed, decrypted at rest; the sealed op
 // at E3), though always one, more reporting that the range goes on (a
-// page, §7.1 Paging, logPageBytes). A since that isn't an ancestor of to
-// is errNotAncestor. A pruned entry anywhere in the range is a
-// prunedError, so every page of a range answers alike.
+// page, §7.1 Paging, logPageBytes). served, if not nil, measures an entry
+// instead: at E2 its JWE, so a page ends where the bytes served say and
+// padding hides where exact sizes would end it (§E.2.2). It is called in
+// order, for the entries returned and at most one more. A since that
+// isn't an ancestor of to is errNotAncestor. A pruned entry anywhere in
+// the range is a prunedError, so every page of a range answers alike.
 //
 // A page costs its own rows, whatever the range's length (§7.1 Paging): a
 // resource's chain is its rows in seq order (one first row, one child per
@@ -647,7 +650,7 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 // oldest first and only as far as the page goes, and the pruning check
 // looks only below horizons (prunedIn). Walking the parent links from to
 // instead read the whole rest of the range for every page.
-func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int) (entries []LogEntry, more bool, err error) {
+func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served func(LogEntry) int) (entries []LogEntry, more bool, err error) {
 	segs := t.ancestry(to)
 	// The range is (lo, max] of the oldest segment it reaches, segs[k],
 	// and the whole of the newer ones. Ids and parent links survive
@@ -675,6 +678,9 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int) (entries
 	// The scan stops once the rows' patch sets are sure to exceed
 	// maxBytes (servedAtLeast), so a page of large ones doesn't load the
 	// rest of limit; the page is cut exactly below, once they are opened.
+	// A JWE is no shorter than the patch set it holds unless compressed,
+	// which a padded one never is (§E.2.2), so at E2 only an unpadded
+	// page can end sooner than its JWEs would.
 	scanned := 0
 	full := func() bool {
 		return limit > 0 && len(rows) >= limit || maxBytes > 0 && scanned > maxBytes
@@ -720,7 +726,11 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int) (entries
 	size := 0
 	for _, r := range rows {
 		e := t.logEntry(r)
-		if size += e.size; maxBytes > 0 && len(out) > 0 && size > maxBytes {
+		n := e.size
+		if served != nil {
+			n = served(e)
+		}
+		if size += n; maxBytes > 0 && len(out) > 0 && size > maxBytes {
 			break
 		}
 		out = append(out, e)

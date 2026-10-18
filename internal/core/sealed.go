@@ -301,6 +301,22 @@ type sealJob struct {
 	plain     []byte
 	pad       bool   // the namespace pads (§E.2.2)
 	jwe       string // the stored value once known
+	fresh     bool   // jwe was sealed by sealNow and isn't stored yet
+}
+
+// sealNow seals a job not stored yet, so the length of what will be
+// served is known before finishSeal stores it (a sealed resource log
+// page's logPageBytes, ResourceLog).
+func (j *sealJob) sealNow() error {
+	if j.jwe != "" {
+		return nil
+	}
+	s, err := seal.SealMaybePadded(j.k, j.kid, j.pl, j.plain, j.pad)
+	if err != nil {
+		return err
+	}
+	j.jwe, j.fresh = s, true
+	return nil
 }
 
 // stored looks a job up in the sealed table.
@@ -369,14 +385,12 @@ func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain fu
 func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) error {
 	var todo []*sealJob
 	for _, j := range jobs {
-		if j == nil || j.jwe != "" {
+		if j == nil || j.jwe != "" && !j.fresh {
 			continue
 		}
-		s, err := seal.SealMaybePadded(j.k, j.kid, j.pl, j.plain, j.pad)
-		if err != nil {
+		if err := j.sealNow(); err != nil {
 			return err
 		}
-		j.jwe = s
 		todo = append(todo, j)
 	}
 	if len(todo) == 0 {

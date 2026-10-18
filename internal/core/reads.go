@@ -428,8 +428,9 @@ type Log struct {
 // empty it serves from the current head (for long-poll and SSE). Either
 // way it answers at most limit entries after since (0: all), oldest first,
 // and sets More when the range goes on (§7.1 Paging, §7.7). A page (limit
-// > 0) also holds no more patch set bytes than logPageBytes, though always
-// one entry; namespace logs carry no patch sets.
+// > 0) also holds no more patch set bytes than logPageBytes, at E2 bytes of
+// the entries' JWEs, though always one entry; namespace logs carry no patch
+// sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
@@ -481,7 +482,19 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		if limit > 0 {
 			maxBytes = e.opt.Maximums.LogPageBytes
 		}
-		entries, more, err := t.logBetween(to, sinceID, limit, maxBytes)
+		// At E2 each entry is served as its own JWE, stored or sealed now,
+		// and a page is bounded by their lengths (logBetween).
+		sealed := t.isSealedNS(n)
+		var served func(LogEntry) int
+		if sealed {
+			served = func(le LogEntry) int {
+				j := t.resJob(n, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
+				t.must(j.sealNow())
+				jobs = append(jobs, j)
+				return len(j.jwe)
+			}
+		}
+		entries, more, err := t.logBetween(to, sinceID, limit, maxBytes, served)
 		if err != nil {
 			var pe *prunedError
 			switch {
@@ -500,16 +513,12 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		// entries after it: the horizon's sealed snapshot is served as
 		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
 		out.Last = since
-		sealed := t.isSealedNS(n)
 		for _, e := range entries {
-			v := e.value()
-			out.Entries = append(out.Entries, v)
+			out.Entries = append(out.Entries, e.value())
 			out.Last = e.ID
-			if sealed {
-				jobs = append(jobs, t.resJob(n, name, e.row, sealEntry, func() []byte { return jsonv.Canonical(v) }))
-			}
 		}
 		if sealed {
+			jobs = jobs[:len(entries)]
 			out.Sealed, nsRowID = true, n.id
 		}
 		return nil

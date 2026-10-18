@@ -2,6 +2,8 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -124,4 +126,101 @@ func TestLogPageBytes(t *testing.T) {
 	// Deployment only: a namespace document can't set it.
 	expectCode(t, e.do(req{method: "PATCH", path: "/ns/x", ifNoneMatch: "*", author: "admin",
 		body: addRoot(map[string]any{"limits": map[string]any{"logPageBytes": 1024}})}), 422, "invalid")
+}
+
+// §7.1 Paging, §E.2.2: at E2 a resource log page is bounded by the JWEs it
+// serves, one per entry, not by the plaintext they hold, so where padding
+// makes entries alike their pages are alike: patch sets a byte apart in
+// one bucket page the same way, and a page holds as many JWEs as fit. The
+// entries sealed for a page are stored, so the next read serves the same
+// bytes, and the long-poll page from the same since is the same. Unpadded
+// JWEs are compressed and may be shorter than their plaintext, so a page
+// of them may end sooner, but never past the bound.
+func TestLogPageBytesSealed(t *testing.T) {
+	t.Parallel()
+	write := func(e *tenv, ns string, sizes []int) string {
+		head := e.wr(ns, "x", "", withNonce(addRoot(map[string]any{"v": strings.Repeat("q", sizes[0])})))
+		for _, n := range sizes[1:] {
+			head = e.wr(ns, "x", head, withNonce(ops(op("replace", "/v", strings.Repeat("q", n)))))
+		}
+		return head
+	}
+	type page struct {
+		since string
+		body  []byte
+		lens  []int
+	}
+	read := func(e *tenv, ns, head string) []page {
+		var out []page
+		for _, p := range e.pages("/r/"+ns+"/x/rev/"+head+"/log", "") {
+			var arr []string
+			if err := json.Unmarshal(p.body, &arr); err != nil || len(arr) == 0 {
+				t.Fatalf("%s: page %s", ns, p.body)
+			}
+			pg := page{since: p.since, body: p.body}
+			for _, s := range arr {
+				pg.lens = append(pg.lens, len(s))
+			}
+			out = append(out, pg)
+		}
+		return out
+	}
+	sum := func(xs []int) (n int) {
+		for _, x := range xs {
+			n += x
+		}
+		return n
+	}
+	sizes := func(last int) []int { return []int{1000, 1000, 1000, 1000, 1000, last} }
+	padded := map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed", "pad": true}}
+
+	// The length of one padded entry's JWE, served without a bound.
+	m := newSealedEnv(t)
+	m.mkNS("m", padded)
+	jwe := read(m, "m", write(m, "m", sizes(1000)))[0].lens[0]
+
+	bound := 2*jwe + jwe/2
+	e := newSealedEnv(t, withLogPageBytes(bound))
+	var first []int
+	for _, c := range []struct {
+		ns   string
+		last int
+	}{{"a", 1000}, {"b", 1001}, {"c", 1003}, {"d", 990}} {
+		e.mkNS(c.ns, padded)
+		head := write(e, c.ns, sizes(c.last))
+		ps := read(e, c.ns, head)
+		var layout []int
+		for i, p := range ps {
+			if len(p.lens) > 1 && sum(p.lens) > bound {
+				t.Fatalf("%s page %d: JWEs %v over %d", c.ns, i, p.lens, bound)
+			}
+			if i+1 < len(ps) && sum(p.lens)+ps[i+1].lens[0] <= bound {
+				t.Fatalf("%s page %d ends early: JWEs %v, next %d, bound %d", c.ns, i, p.lens, ps[i+1].lens[0], bound)
+			}
+			lp := e.get("/r/" + c.ns + "/x/log?live=long-poll&since=" + p.since)
+			expect(t, lp, 200)
+			if !bytes.Equal(lp.Body, p.body) {
+				t.Fatalf("%s long-poll from %q: %s, page %s", c.ns, p.since, lp.Body, p.body)
+			}
+			layout = append(layout, len(p.lens))
+		}
+		for i, p := range read(e, c.ns, head) {
+			if !bytes.Equal(p.body, ps[i].body) {
+				t.Fatalf("%s page %d sealed again: %s, was %s", c.ns, i, p.body, ps[i].body)
+			}
+		}
+		if first == nil {
+			first = layout
+		} else if fmt.Sprint(layout) != fmt.Sprint(first) {
+			t.Fatalf("%s pages %v, a %v: page ends depend on exact sizes", c.ns, layout, first)
+		}
+	}
+
+	// Unpadded: compressed JWEs, pages within the bound.
+	e.mkNS("u", map[string]any{"read": "public", "encryption": map[string]any{"level": "sealed"}})
+	for i, p := range read(e, "u", write(e, "u", sizes(1000))) {
+		if len(p.lens) > 1 && sum(p.lens) > bound {
+			t.Fatalf("unpadded page %d: JWEs %v over %d", i, p.lens, bound)
+		}
+	}
 }

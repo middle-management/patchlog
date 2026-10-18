@@ -2738,12 +2738,15 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first; a
   resource page at most `logPageBytes` of patch sets (§6.6, default 16 MiB, `serve
   -log-page-bytes`), measured as served (decompressed, decrypted at rest, the sealed op at E3,
-  the plaintext of E2's per-entry JWEs); and a namespace page, whose entries carry no patch
-  sets, at most as many resource entries as the page size, a batch entry counting as its items.
-  Either bound ends a page before an entry that would take it past, but a page always holds
-  one, so a patch set over `logPageBytes` is a page of its own. The byte bound stops the scan
-  once the stored rows are sure to exceed it (their stored lengths bound what they serve), so a
-  page of large patch sets reads no more rows than it serves; a
+  and at E2 the per-entry JWEs themselves, stored or sealed for the page, so where a page ends
+  says no more than their padded lengths do, §E.2.2); and a namespace page, whose entries carry
+  no patch sets, at most as many resource entries as the page size, a batch entry counting as
+  its items. Either bound ends a page before an entry that would take it past, but a page always
+  holds one, so a patch set over `logPageBytes` is a page of its own. The byte bound stops the
+  scan once the stored rows are sure to exceed it (their stored lengths bound what they serve,
+  and a JWE is no shorter than its plaintext unless compressed, which a padded one never is: an
+  unpadded E2 page may end sooner than its JWEs would), so a page of large patch sets reads no
+  more rows than it serves; a
   range that goes on carries `X-Log-Next: {id}`, the page's last entry and the `since` of the
   next page, an immutable range up to the same id, so every page caches as immutable. Errors are
   the range's on every page: a range crossing a pruning horizon is `410` on all of them. A page

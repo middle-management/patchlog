@@ -22,8 +22,9 @@ raw documents, moves, whole-document appends and `logPageBytes` are new.
   reference's own; §8.3 doesn't require it).
 - **Resource log pages are also bounded by `logPageBytes`** (§6.6, deployment only, default
   16 MiB, `serve -log-page-bytes`): ranges, long-polls and event-stream catch-up of large patch
-  sets come in more, shorter pages, each with `X-Log-Next` as before. A namespace document
-  setting `limits.logPageBytes` is `422`.
+  sets come in more, shorter pages, each with `X-Log-Next` as before; in a sealed namespace the
+  bound counts the entries' JWEs, so with `pad` a page ends where padded sizes say (§E.2.2). A
+  namespace document setting `limits.logPageBytes` is `422`.
 - **Blob responses carry `X-Content-Type-Options: nosniff` and
   `Content-Security-Policy: sandbox`** (§7.8), errors and the sealed `302` included: an HTML or
   SVG blob no longer runs as a page on the API's origin, and browsers no longer sniff a type
