@@ -2171,7 +2171,8 @@ tree service then gives every placement entry with a head, in `children`, `subtr
   rendering (§H.1, `files.Rendering`) is the canonical text of the document without a top-level
   fresh `$nonce` or `$successor` of §8.1's form, laid out as `JSON.stringify(v, null, 2)` lays it
   out, with JCS's tokens and member order (keys that look like array indices stay where JCS puts
-  them), and a final LF. `files.MetaOf` computes both, for the WebDAV gateway too.
+  them), and a final LF. `files.MetaOf` computes both; the WebDAV gateway renders and lists
+  files with the same code (`files.Show`, `files.Bare`).
 - **`modified`** is the head's `created` as the namespace log gives it (a batch entry's for a
   batch, a `/heads` row's for a snapshot bootstrap), else its `Last-Modified`; it is left out
   where neither is known (a snapshot of a sealed namespace, rows written before v0.54).
@@ -2223,38 +2224,50 @@ core only through its public API, and keeps nothing but memory caches.
   password of `-password-file` or a random one logged at start, compared in constant time. It is
   meant for one person on their own machine: the default `-addr` is `127.0.0.1:8090`, and plain
   HTTP on any other address logs a warning. Every program and device that logs in is one user
-  (one principal) to the server: what it keeps per user below is shared between them.
+  to the server (§H.7: one bearer for everyone): what it keeps per user below is shared between
+  them.
 - **Gateway mode** (`-gateway`) has no grant of its own: a request's Basic password is the grant,
   sent upstream as `Authorization: Bearer` (the user name is ignored), so the core decides what
   each user may read and write, and the revisions are the grant's subject's. Nothing is kept for
-  a grant before the core has accepted it: a read of a served namespace the grant names (its
-  gestures listing, §7.4, which needs only `read`; of the first three it names), which the core
-  answers to a grant one of its keys verifies, in the key's scope, with `read` there; its `401`,
-  or its `404` (a grant a key's scope refuses reads as a namespace it can't see, §7), is no
-  acceptance. In a public namespace, whose reads ignore a bad grant, the grant is verified
-  against the namespace document's keys instead, as consumers verify them, key scope included;
-  whether a namespace is public is asked again whenever a stale answer would let a grant through.
-  It is asked again every 5 minutes, so a revoked grant, or one its key's scope no longer covers,
-  loses what was kept for it. A grant the core doesn't accept is `401` with the Basic challenge,
-  so clients ask again, and says nothing of what is served; it is refused for 30 s without asking
-  the core again, and at most 8 grants are verified at once. Grants must not cross plain HTTP:
+  a grant before the core has accepted it: `GET /ns/{ns}/principal` (§7.4) in a served namespace
+  the grant names (the first of the first three, sorted, that accepts it), which checks only that
+  the grant names the namespace and verifies, key scope and revocation included, the same in a
+  public namespace (whose reads ignore a bad grant) as in a private one, so a grant limited to
+  some resources, or without `read`, is accepted too (§H.7 "Limited grants"). Its `401` is no
+  usable grant; a `410` there is a purged namespace, and a `404` one that doesn't exist (to an
+  operator grant): accepted nowhere else, the grant is answered `410` or `404` (§H.4 "Answers").
+  It is asked again every 5 minutes (`VerifyEvery`, at most the 15 minutes edge grants live,
+  §C.5.2), or at the next request after the core answered it `401`, so a revoked grant, or one
+  its key's scope no longer covers, is refused within that time. A refused token loses its
+  access, and the user's other tokens are asked again at their next request; the user's state
+  (below) stays, reached only through a token the core accepts, so a re-minted grant finds it. A
+  grant the core doesn't accept is `401` with the Basic challenge, so clients ask again, and says
+  nothing of what is served; it is refused for 30 s without asking the core again (a `410` or
+  `404` too), and at most 8 grants are verified at once. Grants must not cross plain HTTP:
   it refuses to start on an address other than loopback without `-tls-cert` and `-tls-key`,
   unless `-insecure`, and warns when `-api` is plain HTTP to another host. Both modes take
   `-tls-cert` and `-tls-key`.
-- What the server keeps per user is per principal (a hash of the upstream grant) and never shared:
+- What the server keeps is per user (§H.7) and never shared with another: in a gateway, a user is
+  the root `sub` and `kid` `GET /ns/{ns}/principal` names for the grant, with the namespace whose
+  key verified it (a kid names a key of one namespace's document, so the same kid in another
+  served namespace is someone else's), never the token: every token of one person, minted again
+  or attenuated offline, is the same user, whose own delete is theirs, not someone else's, and
+  whose records, guards, temporary files and locks carry over (a token attenuated to leave out
+  the namespace that verified the others is verified in another, and is another user). It keeps
   temporary files and locks (a lock lasts at most an hour, `Infinite` too, its owner is at most
-  1 KiB, and a principal holds at most 256, a grant root 1024, then `507`), dropped with the
-  principal (in a gateway, after an hour idle, or to make room: at most 256 principals, and 8 per
-  grant root, the namespace that verified the grant with its authority block's `kid` and `sub` (a
-  kid names a key of one namespace's document), so tokens attenuated from one grant offline push
-  out only their own; never one with a request in flight); and the versions of each document it
-  was served or wrote, the bases of its saves (below), kept for a day apart from the principal,
-  within 128 MiB for all users, where the grant root keeping the most gives way first, so one
-  user's uploads don't push out another's records (a write keeps the bytes it sent only where
-  they read otherwise rendered, and not when much larger than the rendering, as white space
-  padding would be). A restart loses all of it.
-  Rendered documents are cached by revision id for everyone, and handed to a principal only after
-  it read the head, or the listing, with its own grant.
+  1 KiB, and a user holds at most 256, then `507`), dropped with the user (in a gateway, after an
+  hour idle, or to make room: at most 256 users, `MaxPrincipals`, and 8 tokens a user,
+  `MaxTokensPerPrincipal`, so more tokens push out only that user's, which are verified again when
+  they come back; never one with a request in flight); and the versions of each document the user
+  was served or wrote, the bases of their saves (below), with the tombstones and restores they
+  wrote, kept for a day apart from the rest, within 128 MiB for all users, where the user keeping
+  the most gives way first, so one user's uploads don't push out another's records (a write
+  keeps the bytes it sent only where they read otherwise rendered, and not when much larger than
+  the rendering, as white space padding would be). A restart loses all of it. What is read with
+  a grant is kept per token, since another token of the same user may read less: the writer
+  settings, namespace documents and catalog trees below. Rendered documents are cached by
+  revision id for everyone, and handed to a token only after it read the head, or the listing,
+  with its own grant.
 - `-password-file` and `-bearer-file` readable by others than their owner log a warning.
 - Behind a reverse proxy, the proxy must pass the client's `Host` on (nginx: `proxy_set_header Host
   $host`), or set `X-Forwarded-Host`: MOVE and COPY name their destination by the host the client
@@ -2414,17 +2427,18 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   are read again after 5 seconds, or at once after a write through this server. Nothing is pushed.
 - **Sealed and end-to-end namespaces** (Addendum E) need keys this server doesn't hold, so it
   doesn't offer them (§H.7): the root doesn't list them, anything asked of them is `404`, saying
-  why, and a tree's placements of items in them aren't listed. A root listing reads the
-  document of each served namespace the user's grant names, once every 30 seconds, for this; one
-  it can't read is listed all the same, so a grant that reads only some namespaces mounts, and
-  the others answer `403` when opened.
+  why, and a tree's placements of items in them aren't listed. A root listing asks `GET
+  /ns/{ns}/principal` (§7.4 `writer.level`) of each served namespace the user's grant names, at
+  most every 30 seconds per token, for this (and reads a catalog's document, for its file tree);
+  one that refuses it is listed all the same, so a grant that reads only some namespaces mounts,
+  and the others answer `403` when opened.
 
 **Saving.**
 
 - A written file is buffered whole (a raw file at most `-max-raw-size`, default 64 MiB, the
   core's default `blobSize`; a JSON file and a temporary file at most `-max-file-size`, default 16
   MiB; at most the larger of 8 times `-max-file-size` and twice `-max-raw-size` over every request
-  at once, in a gateway a quarter of that, or one raw file, for one grant root's, else `503`) and
+  at once, in a gateway a quarter of that, or one raw file, for one user's, else `503`) and
   committed once complete; a body cut short writes nothing, and a `PUT` with
   `Content-Range` (a partial write) is `400`, writing nothing (§H.4). Other request bodies
   (PROPFIND, PROPPATCH, LOCK) are at most 64 KiB (`413`), read whole before they are handled, and
@@ -2444,8 +2458,8 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   user's own saves since are theirs to replace, so consecutive saves never conflict, whatever
   their sizes, nor does a stale `If-Match` after the user's own save. A version the user had,
   saved unchanged after someone else's bytes, writes nothing, and gets no ETag. Then the bytes
-  are uploaded as a blob (once however often the head moves meanwhile; `413` over the namespace's
-  `blobSize`, before any upload) and the reference's members set one by one (`/$blob`, `/type`,
+  are uploaded as a blob (once however often the head moves meanwhile; `413` over the `blobSize`
+  in force, before any upload) and the reference's members set one by one (`/$blob`, `/type`,
   `/size`, `/nonce`), never the root, so a `$schema` or `$successor` beside it stays. Bytes the
   head already holds write nothing. The revision holds exactly what was sent, so its ETag answers
   the PUT.
@@ -2491,12 +2505,14 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   `409 Conflict`, naming the paths, and nothing is written. A change both made, or a value
   reloaded since, is no conflict. A delete or restore by someone else between the base and the
   head is a `409` too, never merged over.
-- A patch set over `opsPerSet` or `patchSetSize` (§6.6: the namespace's, else the deployment's,
-  which the core's refusal tells) is sent as a root `replace` instead, which may be as large as
+- A patch set over `opsPerSet` or `patchSetSize` (§6.6: the limits in force, defaults applied, as
+  `GET /ns/{ns}/principal` gives them; else the core's refusal tells) is sent as a root `replace`
+  instead, which may be as large as
   `documentSize`, carrying the document's `$successor` and a fresh `$nonce` where nonces apply,
   when the base is the head (§H.4): it then overwrites no one's edit. A restore after the user's
   own DELETE (below) is written whole so when its base is the last live document. A save merged with others'
-  edits is `413` instead, asking for a reload, after which the base is the head.
+  edits is `413` instead, asking for a reload, after which the base is the head; it isn't sent
+  where the gateway knows the limit.
 - The base isn't guessed: a save may change the head only where every version the user may have
   edited agrees with the head (or holds what the user wrote there since), so whichever one their
   program had, no edit someone else made in between is undone or overwritten unseen. Where they
@@ -2542,15 +2558,22 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   and rclone's DELETE after its refused upload deletes a restored one again, unless a guard
   from an earlier refusal is still on it (above): the deletion stands.
 - `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
-  the namespace requires nonces or its document can't be read (§C.7), with a `Blob-Nonce` on a raw
-  file's blob. Where nonces are required, a JSON file's root must be an object, which carries the
+  the namespace requires nonces (§C.7), as `GET /ns/{ns}/principal`'s writer block says, which a
+  grant limited to some resources gets though it can't read the namespace document (§H.7), or
+  where that is refused; with a `Blob-Nonce` on a raw file's blob. The writer settings (frozen,
+  nonces, encryption level, limits) are kept per token for 30 seconds (it is `no-store`), and
+  asked again after the core refuses a write over one of them (`409 frozen`, `422 nonce`, a
+  limit). Where nonces are required, a JSON file's root must be an object, which carries the
   `$nonce`: an array or a scalar is `422`, saying why (§H.1).
 - The core's refusals come back as such, with its code and message as the text (the status is
   the answer's own, §H.4 "Answers"): `422` with its validation errors (schema, rules, `nonce`,
   signature), one per line; `413` for a limit (the core's `413`, or its `422` with code `limit`:
   a patch set over `patchSetSize` or `opsPerSet` that couldn't be sent whole, a create's over
-  `documentSize`, a document over `documentSize`, nesting), with the sizes of what was sent, as
-  the core measures them, and the limits the namespace sets; `403` for a frozen namespace (with
+  `documentSize`, a document over `documentSize`, nesting), naming the limit, what the core
+  measured and the limit in force, as in `too large: documentSize 1048577 > 1048576 (§6.6):
+  document too large`; the gateway's own checks before sending (`blobSize`, a merged patch set
+  over `opsPerSet` or `patchSetSize`, `-max-file-size`, `-max-raw-size`, the bytes read when the
+  bound was passed) answer the same way; `403` for a frozen namespace (with
   its `successor`): frozen is for good, and clients retry a `423` as a lock that may go (rclone 30
   times, for 45 seconds); `410` for a purged file or namespace; `401` and `403` (but in local
   mode a `401` refuses the server's own grant, not the user's password, so it is `502` rather
@@ -2603,7 +2626,7 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
 `Thumbs.db`, `~$*`, `*.swp`, `4913`, `*~`, `#*#`, `*___jb_tmp___` and `.goutputstream-*`,
 JetBrains' `*___jb_old___` beside its `*___jb_tmp___`, and macOS's `Icon\r` (a folder's custom
 icon, a name no title can be), are scratch files, unless a live resource has the name: kept in memory per user and directory (at most 256 files and folders and 32 MiB a
-grant root, 256 MiB in all, then `507`; in a gateway, only in the served namespaces the user's
+user, 256 MiB in all, then `507`; in a gateway, only in the served namespaces the user's
 grant names, else `403`), listed beside the files so editors see what they wrote, and dropped
 after an hour untouched, or when the server stops. They never reach the core. In a file tree a
 node's name is the node's whatever it looks like, and every other name a title can be is a file.
@@ -2720,7 +2743,8 @@ before it is placed, never placed first. Merges of text: raw files conflict as a
 Blob references deeper in a JSON document read and edit as JSON. Sealed (E.2) and end-to-end (E.3) namespaces, which need keys. History
 (revisions and logs as directories), live invalidation, and batches: each file is its own write,
 so saving several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5)
-can't list a namespace, whose `/heads` needs unrestricted read, but can open its files by path.
+can't list a namespace, whose `/heads` needs unrestricted read, but can open and write its files
+by path, learning the writer settings from `GET /ns/{ns}/principal` (§H.7).
 PROPFIND with `Depth: infinity` is `403` (`propfind-finite-depth`), and one without Depth lists
 one level. Dead properties (PROPPATCH) are kept per user in memory (§H.8), at most 1 MiB a user,
 read back by PROPFIND, moved with a MOVE, dropped with a DELETE, an hour untouched or a restart.

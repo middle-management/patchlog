@@ -129,7 +129,8 @@ service's listings.
   - **Files** (§H.1): a file other than a JSON file is a raw document, its root a blob reference
     to its bytes, kept exactly and typed by §H.1's extension table (else the upload's
     `Content-Type`); a JSON file is a document, read as its rendering (the canonical text laid
-    out as `JSON.stringify(v, null, 2)`, without a fresh `$nonce` or a `$successor`). A new
+    out as `JSON.stringify(v, null, 2)`, without a fresh `$nonce` or a `$successor`), made by
+    `internal/files` as for the tree service (`files.Show`, `files.Bare`, both new). A new
     `.json` file that isn't I-JSON is raw, and an empty file is a raw file of 0 bytes. Raw files
     are streamed from their blobs through this server, with ranges; every answer carries
     `nosniff` and a sandbox policy, and `POST` is `405`. Every file's ETag is its head revision.
@@ -154,7 +155,10 @@ service's listings.
     no file is is `412`. Answers follow
     §H.4's table: an ETag only for a revision that holds exactly what was sent (and the next
     read in full after a merge), `410` for purged, `403` naming the successor for frozen, `413`
-    for any limit, `503` with Retry-After for long rate limits.
+    for any limit, naming the limit, what was measured and the limit in force as the core gives
+    them (`too large: documentSize 1048577 > 1048576 (§6.6): document too large`), the
+    gateway's own checks (`blobSize`, `opsPerSet`, `patchSetSize`, `-max-file-size`,
+    `-max-raw-size`) alike, and `503` with Retry-After for long rate limits.
   - **Moves** (§H.5, §H.8): within a tree, a rename or move of the node; onto an existing file, a
     save into it, then a delete of the source's revision copied, so the target keeps its history;
     across trees or namespaces, a copy and a delete with `$successor`; in the flat view, to a free
@@ -169,11 +173,22 @@ service's listings.
     refused MOVE onto a file, sets a guard that refuses the user's DELETE of the path within 10
     seconds once per refusal (rclone deletes every file whose upload failed), ending only by
     time. `PROPFIND` without `Depth` is `1`, `Depth: infinity` `403`.
-  - Local mode sends one `-bearer` grant behind a password; gateway mode (`-gateway`) sends each
-    request's Basic password upstream as its grant, keeps nothing for a grant the core hasn't
-    accepted, and needs TLS beyond loopback. Not yet: the principal endpoint for users (keyed
-    by grant), the tree service's file metadata for listings, catalog-issued grants, text
-    merges, history, live invalidation, batches.
+  - **Users** (§H.7): local mode sends one `-bearer` grant behind a password, one user; gateway
+    mode (`-gateway`) sends each request's Basic password upstream as its grant and needs TLS
+    beyond loopback. It verifies a grant with `GET /ns/{ns}/principal` in a served namespace the
+    grant names, keeps nothing for one the core hasn't accepted (`401`; a purged namespace is
+    `410`, an absent one `404` to an operator grant), asks again every 5 minutes (at most the
+    15 minutes edge grants live) or after the core's `401`, and keys its state by the root `sub`
+    and `kid` `/principal` names (with the namespace that verified it), never the token, so
+    every token of one person, minted again or attenuated offline, shares their records,
+    guards, scratch files, locks and own tombstones. A refused token loses its access and has
+    the user's other tokens asked again; the user's state stays for their accepted tokens. At
+    most 256 users and 8 tokens a user (`MaxPrincipals`, `MaxTokensPerPrincipal`). Writer
+    settings (frozen, nonces, level, limits in force) come from `/principal`'s writer block,
+    which a grant limited to some resources gets too, kept per token for 30 seconds and asked
+    again after a refusal over one of them.
+  - Not yet: the tree service's file metadata for listings, catalog-issued grants, text merges,
+    history, live invalidation, batches.
 
 **Fixes:**
 - **Stored listings of the tree service are keyed by the reader's shape** (§A.4, §E.2.6), as
