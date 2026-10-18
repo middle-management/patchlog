@@ -2152,9 +2152,11 @@ create.
 
 ### WebDAV (prototype)
 
-`patchlog dav` serves namespaces as a network drive, for file managers and editors. It is an API
-consumer like the index and tree services: it reads and writes the core only through its public
-API, and keeps nothing but memory caches.
+`patchlog dav` serves namespaces as a network drive, for file managers and editors, following
+Addendum H (files): a file other than a JSON file is a raw document, its bytes a blob (§7.8), and a
+JSON file is a document, read as its rendering. It is an API consumer like the index and tree
+services: it reads and writes the core only through its public API, and keeps nothing but memory
+caches.
 
 ```sh
 # Local mode: one grant for every request; WebDAV clients log in with any user name and the password.
@@ -2232,9 +2234,10 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
 
 - The server keeps no modification times rclone can set, and no hashes, so rclone tells files
   apart by size alone (`rclone backend features pl:` shows `"Precision": 3153600000000000000`,
-  rclone's "not supported", and no `Hashes`). A file reads as its document rendered, which is
-  not always the size it was uploaded with: a save merged with others' edits, or given a
-  `$nonce`, reads back larger or smaller. So:
+  rclone's "not supported", and no `Hashes`). A raw file reads back as uploaded, but a JSON file
+  reads as its document rendered, which is not always the size it was uploaded with: a save
+  merged with others' edits reads back larger or smaller (to others, any upload not in its
+  rendered form). So:
 - **Copies and syncs to the server take `--ignore-size` and `--ignore-times` (`-I`).** Every
   file is sent on each run; one that is unchanged writes nothing (its diff is empty), a changed
   one is an edit rebased as any save is (below), so others' edits since are kept. With
@@ -2298,53 +2301,99 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
 
 ```
 /                                                 a directory per -ns and -catalog
-/docs/                                            a flat namespace: its live resources
-/docs/derby.json                                  the document /r/docs/derby
+/docs/                                            a flat namespace (§H.2): its live resources
+/docs/derby.json                                  the JSON document /r/docs/derby
+/docs/logo.png                                    the raw document /r/docs/logo.png: a file
 /cat-season/                                      a catalog: its root folders and placements
 /cat-season/root/season-2026/                     folder season-2026, in folder root
 /cat-season/root/season-2026/matches.derby.json   placement matches.derby: /r/matches/derby
 ```
 
-- A flat namespace lists its live resources (the `/heads` of its current `ns_id`) as
-  `{name}.json`. Only resource names map to documents (§3.6: lowercase letters, digits, `.`, `_`
-  and `-`). A `.json` name that doesn't start with a dot and names no document (`Notes.JSON`, a
-  Save As `Report.json`) is refused with `403`: kept in memory only, it would vanish. The names
-  file managers give a copy made beside a document are scratch files instead (Finder's Duplicate
-  `x copy.json`, `x copy 2.json` and Keep Both's `x 2.json`; Explorer's `x - Copy.json`, `Copy of
-  x.json` and `x (1).json`; GNOME's `x (copy).json`), so a copy renamed to a document name starts
-  a document from a template; one not renamed vanishes with the other scratch files.
-- A file reads as its document's canonical form (§3.1) indented by two spaces, keys sorted, with a
-  final newline: the same bytes for the same revision, so the ETag is the revision id and saving a
-  file unchanged writes nothing. A revision that holds exactly what a user wrote reads back to
-  that user as they wrote it, so a client checking the size of its upload finds it. Its size is
-  that representation's (listings read every document, a few at a time, cached by revision id:
-  `-cache-size` must hold every document of the served namespaces, or each listing reads them all
-  again), its type `application/json`, and its Last-Modified the revision's creation time for
-  revisions this server wrote, else when the user was first shown it (the core serves documents
-  without one), which starts over when the server does.
+- **Files** (§H.1). A raw document, whose root is a blob reference (`{ "$blob", "type", "size",
+  "nonce"? }`, with at most `$schema`, a fresh `$nonce` and a `$successor` beside it, §7.8), is a
+  file of the blob's bytes, kept exactly: text files (`.md`, `.txt`, source code) too. Any other
+  document is a JSON file. A raw file's type comes from its name's extension, in any letter case,
+  by §H.1's table (`md` `text/markdown`, `txt` `text/plain`, `png` `image/png`, `pdf`
+  `application/pdf`, `json` `application/json`, …); else from the upload's `Content-Type`, its
+  parameters dropped, unless it is `application/octet-stream`, `binary/octet-stream`,
+  `application/x-www-form-urlencoded` or `multipart/*`; else `application/octet-stream`. A copy
+  is typed as its source, and a temporary file moved onto a name as it was uploaded, unless the
+  name's extension says otherwise.
+- **The flat view** (§H.2). A flat namespace's directory lists its live resources (the head rows
+  of the `/heads` of its current `ns_id`): a raw document by its resource name, any other as
+  `{name}.json`. Where a raw `x.json` and a JSON document `x` both exist, as an API client can
+  make them, the raw file keeps the name and the document is shown, read and written as
+  `x (2).json`. A name a live resource has is that file's whatever it looks like (a raw `4913`
+  is a file, not vim's probe). A new file is made under its name, which must be a resource name
+  (§3.6: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 128
+  characters), or for a JSON document `{name}.json`; any other name (`Notes.md`, a Save As
+  `Report.json`, `my notes.txt`, `.notes.tmp`) is refused with `403`, saying so, since kept in
+  memory only it would vanish, but for the scratch names below, and for the names file managers
+  give a copy made beside a file (Finder's Duplicate `x copy.md`, `x copy 2.md` and Keep Both's
+  `x 2.md`; Explorer's `x - Copy.md`, `Copy of x.md` and `x (1).md`; GNOME's `x (copy).md`, and
+  the same of any extension), which are scratch files, so a copy renamed to a file's name starts
+  a file from a template; one not renamed vanishes with the other scratch files. A new file whose
+  resource another kind of file has (`notes.md` beside a JSON document `notes.md`, shown as
+  `notes.md.json`; a JSON `pic.json` beside a raw `pic`) is `409`.
+- **Reading.** A raw file is served by this server itself, from its blob through the core and
+  never as a redirect to the core's origin, streamed, with ranges (`206`), as its type. A JSON
+  file reads as its rendering: the document's canonical text (§3.1), without a top-level `$nonce`
+  of the fresh form and a `$successor` of §8.1's, laid out as `JSON.stringify(value, null, 2)`
+  lays it out (members and elements on lines of their own, two spaces a level, `{}` and `[]` for
+  empty ones, keys in JCS's order, those that look like array indices too), with one final LF:
+  the same bytes for the same revision. Every file's ETag is its head revision id, and files are
+  served with `X-Content-Type-Options: nosniff` and `Content-Security-Policy: sandbox`, since
+  this origin holds users' credentials. A revision that holds exactly what a user wrote reads
+  back to that user as they wrote it, so a client checking the size of its upload finds it.
+- **Listings** (§H.3): each file's ETag is its row's `target`, its time the row's `created` (or,
+  for rows without, the `Last-Modified` of the document's read; with neither, from an older core,
+  when the user was first shown the revision, kept in memory only), a raw file's size and type its
+  reference's, and a JSON file's size its rendering's (or that of what the user wrote and reads
+  back). Both need the head document once per revision: its size and type are kept by revision
+  id for good (256 Ki revisions), apart from the documents themselves (`-cache-size`), so a
+  listing reads only the documents it hasn't seen.
 - Each listing of a flat namespace reads its heads again; a catalog's tree, and its items' heads,
   are read again after 5 seconds, or at once after a write through this server. Nothing is pushed.
-- A root listing names the served namespaces without reading them, so a grant that reads only
-  some of them mounts all the same; the others answer `403` when opened.
+- **Sealed and end-to-end namespaces** (Addendum E) need keys this server doesn't hold, so it
+  doesn't offer them (§H.7): the root doesn't list them, anything asked of them is `404`, saying
+  why, and a catalog's placements of items in them aren't listed. A root listing reads the
+  document of each served namespace the user's grant names, once every 30 seconds, for this; one
+  it can't read is listed all the same, so a grant that reads only some namespaces mounts, and
+  the others answer `403` when opened.
 
 **Saving.**
 
 - A written file is buffered whole (`-max-file-size`, default 16 MiB, and at most 8 times that
   over every request at once, in a gateway a quarter of that, or one file, for one grant root's,
-  else `503`) and committed once complete; a body cut short writes nothing. It must be a JSON
-  document (I-JSON, a UTF-8 byte order mark aside), else `400`, and nothing is written. Other
-  request bodies (PROPFIND, PROPPATCH, LOCK) are at most 64 KiB (`413`), read whole before they
-  are handled, and those over 4 KiB are handled four at a time over the server: x/net/webdav
-  decodes them a value per element. A request has 10 minutes to arrive.
+  else `503`) and committed once complete; a body cut short writes nothing, and a `PUT` with
+  `Content-Range` (a partial write) is `400`, writing nothing (§H.4). Other request bodies
+  (PROPFIND, PROPPATCH, LOCK) are at most 64 KiB (`413`), read whole before they are handled, and
+  those over 4 KiB are handled four at a time over the server: x/net/webdav decodes them a value
+  per element. A request has 10 minutes to arrive.
+- **Which kind a file is** (§H.1). A new file whose name ends in `.json` and whose content is
+  I-JSON (a UTF-8 byte order mark dropped) is a JSON document of the name before `.json`; any
+  other new file is raw, a `.json` file that isn't I-JSON (comments, duplicate keys, integers
+  beyond 2⁵³) included, as a raw file of its whole name. An existing file keeps its kind: a JSON
+  file takes only I-JSON (`400` otherwise, nothing written), a raw file any bytes. One the user
+  deleted moments ago and writes again (below) is restored as the file it was.
+- **Raw files** are saved by comparing the base (below) with the head first: any change of the
+  bytes between them is a `409`, as raw files have no paths to merge. Then the bytes are uploaded
+  as a blob (once however often the head moves meanwhile; `413` over the namespace's `blobSize`,
+  before any upload) and the reference's members set one by one (`/$blob`, `/type`, `/size`,
+  `/nonce`), never the root, so a `$schema` or `$successor` beside it stays. Bytes the head
+  already holds write nothing. The revision holds exactly what was sent, so its ETag answers the
+  PUT.
 - A new name is created (`If-None-Match: *` upstream); a tombstoned one is restored, so a name
-  keeps one chain (§8.2), with the diff from its last live document (rebased as an edit is, below);
-  a purged one is `403`. A PUT's own `If-None-Match: *` (create only) is
+  keeps one chain (§8.2), with the diff from its last live document (rebased as an edit is, below;
+  a raw file over a JSON document's, or the other way round, replaces its root); a purged one is
+  `403`. A PUT's own `If-None-Match: *` (create only) is
   `412` over an existing file, and `If-Match: *` (edit only) over a missing one; an empty
   placeholder (below) exists for both. An `If` header's lists of entity tags only (no lock token,
   or the always true `Not <DAV:no-lock>`) are this server's to check, as `If-Match`.
-- An existing document gets the user's edit rebased on its head (§11 submit): the diff
-  (`merge.Diff`) from the version the user edited, the base, to what they wrote, applied to the
-  current head and appended with `If-Match` on it. The base is one of the versions the user may
+- An existing JSON file gets the user's edit rebased on its head (§11.3, §H.4): the diff
+  (`merge.Diff`) from the version the user edited, the base (as rendered: a `$successor` it
+  leaves out stays), to what they wrote, applied to the current head and appended with `If-Match`
+  on it. The base is one of the versions the user may
   have edited: the revision the PUT's `If-Match` (or an `If` header's entity tag) names, with the
   user's own writes that revision holds merged; else the versions this user was served (a GET's
   body; a `304` sends none) or wrote in the last day, at most 16 a document (over that, the oldest
@@ -2378,13 +2427,14 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   a `409` until a reload, rather than rebased on what is left. Within one user, the closest
   version decides: two programs saving the same value, the last wins, and an undo of a save
   combined with new edits is taken as edits of the older version (the undone change stays).
-- A PUT answers with the revision as its ETag only when that revision holds exactly what was sent;
-  one merged with others' edits, or given a `$nonce`, gets none (RFC 9110 §9.3.4), and the user's
-  next GET of it sends it whatever its validators say: a client may still file what it sent under
-  the merged revision's tag, which a HEAD or a listing shows (davfs2 asks with a HEAD after such a
-  PUT), and would keep showing it after a `304`. A client that reads the tag from a listing and
-  never GETs again keeps its copy. A save that writes nothing (the file already reads so) is no
-  write of the user's.
+- A PUT answers with the revision as its ETag only when that revision holds exactly what was sent
+  (§H.1: its rendering is the uploaded value, whatever the formatting, and whatever `$nonce` it was
+  given); one merged with others' edits gets none (RFC 9110 §9.3.4), and the user's next GET or
+  HEAD of it is answered in full whatever its validators say: a client may still file what it sent
+  under the merged revision's tag, which a HEAD or a listing shows (davfs2 asks with a HEAD after
+  such a PUT), and would keep showing it after a `304`. A client that reads the tag from a listing
+  and never GETs again keeps its copy. A save that writes nothing (the file already reads so) is
+  no write of the user's.
 - A save that deletes the original before writing the new version (DELETE, then a PUT, a COPY or
   a MOVE onto the name) restores it with the user's edit rebased on the last live document, as
   above. If that write fails within 30 seconds of the DELETE, whatever refuses it (a `409`
@@ -2395,7 +2445,9 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   document deleted longer ago stays deleted, and rclone's DELETE after its refused upload
   deletes a restored one again: the deletion stands.
 - `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
-  the namespace requires nonces or its document can't be read (§C.7).
+  the namespace requires nonces or its document can't be read (§C.7), with a `Blob-Nonce` on a raw
+  file's blob. Where nonces are required, a JSON file's root must be an object, which carries the
+  `$nonce`: an array or a scalar is `422`, saying why (§H.1).
 - The core's refusals come back as such, with its code and message as the text (the status is
   the answer's own): `422` with its validation errors (schema, rules, `nonce`, signature), one per
   line; `413` for a patch set over `patchSetSize` (a create's over `documentSize`) or a document
@@ -2407,7 +2459,7 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   2 s, and is otherwise `503` with Retry-After. A core that can't be reached is `502` (the
   details are logged).
 - An empty write (a LOCK of a new name, Finder's 0-byte PUT) makes an empty placeholder until
-  content arrives; it never truncates a live document.
+  content arrives; it never truncates a live file, so an empty raw file isn't made over WebDAV.
 - DELETE tombstones (§8.1); with `If-Match` (or an `If` header's entity tag) naming another
   revision than the head, it is `412`. A DELETE that follows the same user's refused PUT of the
   same file (answered `4xx` or `5xx`, having written nothing) within 10 seconds is `409` ("wasn't
@@ -2424,26 +2476,30 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   namespace, which takes no DELETE either, the DELETE gets the core's `403` instead. In local
   mode every program is the same user: another program's DELETE in those 10 seconds is refused
   once too, and its full read of the file 2 seconds or more after the refusal lifts the guard. A
-  MOVE between two documents is `403`: names are identity (§3.6), so there is no rename. COPY to
-  a new name creates it from the content, and COPY over a document edits it. MKCOL of a folder
-  that exists is `405` (not logged), and below a file `409`.
+  MOVE between two files is `403`: names are identity (§3.6), so there is no rename. COPY to a new
+  name creates it from the content (a raw file's bytes read through this server), and COPY over a
+  file edits it, as its kind takes it. MKCOL of a folder that exists is `405` (not logged), and
+  below a file `409`.
 
-**Temporary and backup files.** Names that aren't `{name}.json`, such as vim's `.x.json.swp`,
-`x.json~` and `4913`, gedit's `.goutputstream-*`, macOS's `.DS_Store` and `._x.json`, or
-`Untitled`, are scratch files: kept in memory per user and directory (at most 256 files and
-folders and 32 MiB a grant root, 256 MiB in all, then `507`; in a gateway, only in the served
-namespaces the user's grant names, else `403`), listed beside the documents so
-editors see what they wrote, and dropped after an hour untouched, or when the server stops. They
-never reach the core. Over the bounds, `._*`, `.DS_Store` and `Thumbs.db` make room for others,
-least recently used first, or are dropped rather than refused, so copying many files in doesn't
-fail on them (Finder reads a `507` as a full disk).
+**Temporary and backup files** (§H.6). Editors' and systems' own files, `.DS_Store`, `._*`,
+`Thumbs.db`, `~$*`, `*.swp`, `4913`, `*~`, `#*#`, `*___jb_tmp___` and `.goutputstream-*`, and
+JetBrains' `*___jb_old___` beside its `*___jb_tmp___`, are scratch files, unless a live resource
+has the name: kept in memory per user and directory (at most 256 files and folders and 32 MiB a
+grant root, 256 MiB in all, then `507`; in a gateway, only in the served namespaces the user's
+grant names, else `403`), listed beside the files so editors see what they wrote, and dropped
+after an hour untouched, or when the server stops. They never reach the core. Other temporary
+names are files of their own when they are resource names (`notes.md.tmp`), and refused when not
+(`.notes.md.tmp`, sed's `sedAb12Cd`): such a save fails in a flat directory. Over the bounds,
+`._*`, `.DS_Store` and `Thumbs.db` make room for others, least recently used first, or are
+dropped rather than refused, so copying many files in doesn't fail on them (Finder reads a `507`
+as a full disk).
 
-- A MOVE of a scratch file onto `{name}.json`, the atomic save of gedit, VS Code and most editors,
+- A MOVE of a scratch file onto a file's name, the atomic save of gedit, VS Code and most editors,
   commits its content exactly as a PUT would (an edit, a create or a restore), then drops it.
-- A MOVE of `{name}.json` to a scratch name, an editor moving the original aside as a backup
-  before writing the new version, copies it: the document stays, and the write that follows is an
-  edit of it, even one that creates only (davfs2's `If-None-Match: *`, as it takes the name for
-  free after the MOVE).
+- A MOVE of a file to a scratch name, an editor moving the original aside as a backup before
+  writing the new version, copies it (a raw file's bytes, within `-max-file-size`): the file
+  stays, and the write that follows is an edit of it, even one that creates only (davfs2's
+  `If-None-Match: *`, as it takes the name for free after the MOVE).
 - MKCOL where a catalog folder can't be makes a scratch directory, where every name is a scratch
   file, for apps that save through one, anywhere (a name starting with a dot, as
   `.TemporaryItems`, or macOS's `(A Document Being Saved By TextEdit)`), and in a catalog for a
@@ -2499,8 +2555,10 @@ the user's grant doesn't read, aren't shown.
 
 **Not in the prototype.** The catalog's trust list beyond bounding writes, access by subject set
 (`$access`, §B.11) and the tree service: users see what their grant reads, as the core lists it.
-Blobs as files: documents with `$blob` references read and edit as JSON. Sealed (E.2) and
-end-to-end (E.3) namespaces: listed read-only, with size 0, and their files are `501`. History
+File trees (§H.2: catalogs whose titles are file names): a catalog folder holds placements named
+`{ns}.{name}.json`, and a new placement's file is JSON (an existing raw item reads and saves as
+its bytes). Moves and renames of files (§H.5). Blob references deeper in a JSON document read and
+edit as JSON. Sealed (E.2) and end-to-end (E.3) namespaces, which need keys. History
 (revisions and logs as directories), live invalidation, and batches: each file is its own write,
 so saving several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5)
 can't list a namespace, whose `/heads` needs unrestricted read, but can open its files by path.
