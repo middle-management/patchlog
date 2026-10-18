@@ -52,7 +52,7 @@ import (
 //
 // gs is computed as for subject sets (§B.11.5), over markers of what the
 // answer depends on: for every private namespace the reader reads
-// unrestricted (§C.5), reads:{ns}, or for a grant that reads only some of
+// unrestricted (§2.1), reads:{ns}, or for a grant that reads only some of
 // its resources (whose hits are filtered per resource)
 // reads:{ns}:scope:{digest}, digest covering the rules its reads there are
 // judged by and the /principal values they refer to (readsScope); a

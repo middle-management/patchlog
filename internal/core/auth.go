@@ -509,7 +509,7 @@ func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error
 }
 
 // nsReader is reader for /ns/{ns} and the URLs under it, but the gestures
-// listing (anyReader): they need unrestricted read (readsNS, §C.5). A
+// listing (anyReader): they need unrestricted read (readsNS, §2.1). A
 // grant that may read only some resources gets the answer of any read it
 // may not make.
 func (t *tx) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
@@ -570,7 +570,7 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 	return a, nil
 }
 
-// readsNS reports whether a reads namespace n unrestricted (§C.5 "The
+// readsNS reports whether a reads namespace n unrestricted (§2.1, §C.5 "The
 // stream is metadata"): anyone does in a public namespace or with
 // authentication disabled, and otherwise a grant that may read there
 // through rules none of which refers to /resource (unrestrictedRoles).
@@ -579,7 +579,7 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 // registration (§G.3): a grant whose rules hide some resources could
 // otherwise list their names and heads, or read them through a branch.
 // Branching and registration check it as step 1 checks verbs (stepOne,
-// §6.2, §C.5), in a public namespace too: the grant must read n
+// §6.2, §2.1), in a public namespace too: the grant must read n
 // unrestricted and allow read, and its rules that refer only to /action,
 // /principal or /now must pass with /action read; rules over the rest of
 // the envelope apply to their own write at step 6.
@@ -598,7 +598,7 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource
-// readable (§C.5): its key has no readScope, no rule of its blocks or key
+// readable (§2.1): its key has no readScope, no rule of its blocks or key
 // scope refers to /resource, and, if it carries roles, some role listing
 // read has no rule that does. Those roles are returned, nil for a grant
 // without roles; roles are alternatives (§C.1.1), so one is enough.

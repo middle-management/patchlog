@@ -2,11 +2,16 @@ package client
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -33,6 +38,12 @@ type Head struct {
 	State State
 	ID    string // head revision (Live) or tombstone (Tombstoned) id
 	Last  string // Tombstoned: last live revision id
+	// Successor is, for a Tombstoned head, where the resource moved as the
+	// 410 names it (§8.1): a bare name in the same namespace or
+	// /r/{ns}/{name} (ResolveSuccessor). Servers name it only outside
+	// sealed and e2e namespaces; Moved reads the document at Last there,
+	// and E2E.Moved always does.
+	Successor string
 }
 
 // Head reads a resource's head pointer without following the redirect.
@@ -53,11 +64,64 @@ func (c *Client) Head(ctx context.Context, ns, name string) (*Head, error) {
 	case 410:
 		m := r.obj()
 		if t := str(m, "tombstone"); t != "" {
-			return &Head{State: Tombstoned, ID: t, Last: str(m, "last")}, nil
+			h := &Head{State: Tombstoned, ID: t, Last: str(m, "last")}
+			if s := str(m, "successor"); schema.Successor(s) {
+				h.Successor = s
+			}
+			return h, nil
 		}
 		return &Head{State: Purged}, nil
 	}
 	return nil, r.apiError()
+}
+
+// SuccessorOf is a document's top-level $successor if it has the form of
+// §8.1, which validation leaves out (§6.2 step 5), and "" otherwise.
+func SuccessorOf(doc any) string {
+	m, _ := doc.(map[string]any)
+	if s := m["$successor"]; schema.Successor(s) {
+		return s.(string)
+	}
+	return ""
+}
+
+// ResolveSuccessor resolves a successor that namespace ns names (§8.1): a
+// bare name is a resource of ns, the namespace serving the 410, so a move
+// survives merges out of a branch; /r/{ns2}/{name2} is one of ns2.
+func ResolveSuccessor(ns, successor string) (ns2, name2 string, ok bool) {
+	if !schema.Successor(successor) {
+		return "", "", false
+	}
+	if rest, cross := strings.CutPrefix(successor, "/r/"); cross {
+		ns2, name2, _ = strings.Cut(rest, "/")
+		return ns2, name2, true
+	}
+	return ns, successor, true
+}
+
+// Moved reports where a tombstoned resource moved (§8.1, §11): the
+// successor h, its head, names, or, where the 410 carries none, as in
+// sealed namespaces, the $successor of the document at h.Last, read with
+// the client's keys. "" if h isn't tombstoned or nothing names one. The
+// 410's successor is as authentic as any plaintext answer, the server's
+// or a cache's: a conforming server names none in a sealed namespace, so
+// a client that trusts caches there with no more than sealed content reads
+// the document itself (Doc, SuccessorOf). An e2e namespace's document is
+// folded by E2E.Moved instead, which ignores the 410's. A client offers
+// the successor as a link, and follows it on its own only into a namespace
+// it already trusts (§11).
+func (c *Client) Moved(ctx context.Context, ns, name string, h *Head) (string, error) {
+	if h == nil || h.State != Tombstoned {
+		return "", nil
+	}
+	if h.Successor != "" {
+		return h.Successor, nil
+	}
+	d, err := c.Doc(ctx, ns, name, h.Last)
+	if err != nil {
+		return "", err
+	}
+	return SuccessorOf(d.Value), nil
 }
 
 // Doc is a document at a revision.
@@ -65,6 +129,15 @@ type Doc struct {
 	ID    string
 	Raw   []byte // canonical bytes as served
 	Value any    // parsed (jsonv model)
+	// Modified is the revision's created time, from Last-Modified (to the
+	// second, and no later than the server's clock), zero if the server
+	// sent none. Digest is Raw's sha-256 in the RFC 9530 form /heads
+	// entries use (HeadItem.Digest, ReprDigest), from Repr-Digest; "" if
+	// the server sent none. Servers send both only outside sealed and e2e
+	// namespaces (§7.1), and responses cached before a server sent them
+	// lack them.
+	Modified time.Time
+	Digest   string
 }
 
 // Doc fetches the document at revision id (immutable). A tombstone id, a
@@ -93,7 +166,37 @@ func (c *Client) Doc(ctx context.Context, ns, name, id string) (*Doc, error) {
 	if err != nil {
 		return nil, fmt.Errorf("client: document %s/%s@%s: %w", ns, name, id, err)
 	}
-	return &Doc{ID: id, Raw: body, Value: v}, nil
+	d := &Doc{ID: id, Raw: body, Value: v}
+	if t, err := http.ParseTime(r.header.Get("Last-Modified")); err == nil {
+		d.Modified = t
+	}
+	if !isJOSE(r) {
+		d.Digest = reprSHA256(r.header.Get("Repr-Digest"))
+	}
+	return d, nil
+}
+
+// ReprDigest is the sha-256 of b in the RFC 9530 form, sha-256=:<base64>:,
+// as Doc.Digest and HeadItem.Digest give it: a document's Raw bytes hash
+// to its head's digest.
+func ReprDigest(b []byte) string {
+	sum := sha256.Sum256(b)
+	return "sha-256=:" + base64.StdEncoding.EncodeToString(sum[:]) + ":"
+}
+
+// reprSHA256 is the sha-256 member of a Repr-Digest field (RFC 9530, a
+// structured dictionary) in ReprDigest's form, or "" if it has none.
+func reprSHA256(field string) string {
+	for _, m := range strings.Split(field, ",") {
+		k, v, _ := strings.Cut(strings.TrimSpace(m), "=")
+		if k != "sha-256" || len(v) < 2 || v[0] != ':' || v[len(v)-1] != ':' {
+			continue
+		}
+		if b, err := base64.StdEncoding.DecodeString(v[1 : len(v)-1]); err == nil && len(b) == sha256.Size {
+			return "sha-256=" + v
+		}
+	}
+	return ""
 }
 
 // Load reads the head and, if live, the document at it (§11 load).

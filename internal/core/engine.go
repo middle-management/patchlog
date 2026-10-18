@@ -338,6 +338,13 @@ func Open(opt Options) (*Engine, error) {
 	if opt.Maximums.ExchangeRate == (Rate{}) {
 		opt.Maximums.ExchangeRate = opt.Limits.ExchangeRate
 	}
+	// And from before logPageBytes (§6.6), deployment only too.
+	if opt.Limits.LogPageBytes == 0 {
+		opt.Limits.LogPageBytes = DefaultLimits().LogPageBytes
+	}
+	if opt.Maximums.LogPageBytes == 0 {
+		opt.Maximums.LogPageBytes = opt.Limits.LogPageBytes
+	}
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
 	}
@@ -466,7 +473,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.52"
+const SpecVersion = "0.55"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a

@@ -289,6 +289,18 @@ type HeadItem struct {
 	Resource string
 	Kind     string // head, tombstone or purge
 	Target   string
+	// Created is Target's created time, as log entries give it, for a
+	// head or tombstone. Size and Digest describe a live head's document
+	// as GET …/rev/{target} serves it: its length in bytes and its sha-256
+	// in the RFC 9530 form (ReprDigest), for comparing a copy without
+	// fetching it (§7.4). All three are optional and not to be relied on:
+	// "" and 0 when the server didn't say, as in sealed and e2e
+	// namespaces, which send none, for purges, Size and Digest for
+	// tombstones, and for heads written before the server stored them (no
+	// canonical document is empty).
+	Created string
+	Size    int64
+	Digest  string
 }
 
 // HeadsPage fetches one page of GET /ns/{ns}/rev/{nsID}/heads after the
@@ -315,7 +327,11 @@ func (c *Client) HeadsPage(ctx context.Context, ns, nsID, after string) (items [
 	arr, _ := m["items"].([]any)
 	for _, x := range arr {
 		o, _ := x.(map[string]any)
-		items = append(items, HeadItem{Resource: str(o, "resource"), Kind: str(o, "kind"), Target: str(o, "target")})
+		it := HeadItem{Resource: str(o, "resource"), Kind: str(o, "kind"), Target: str(o, "target"), Created: str(o, "created"), Digest: str(o, "digest")}
+		if n, ok := o["size"].(float64); ok {
+			it.Size = int64(n)
+		}
+		items = append(items, it)
 	}
 	return items, str(m, "next"), nil
 }

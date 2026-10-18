@@ -618,7 +618,7 @@ func (ch *Checker) ReadsPerResource(v *grant.Verified) bool {
 }
 
 // ReadsUnrestricted reports whether a verified grant reads the namespace
-// unrestricted (§C.5) and may read it now: its key has no readScope, no
+// unrestricted (§2.1) and may read it now: its key has no readScope, no
 // rule of its blocks or key scope refers to /resource, they pass, and, if
 // it carries roles, so does some role that lists read and has no rule
 // referring to /resource. Its other roles don't count: roles are

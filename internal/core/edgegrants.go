@@ -10,7 +10,7 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 )
 
-// Edge grants (§C.5 "Issuing them", §9).
+// Edge grants (§C.5.2, §9).
 //
 // POST /edge-grants exchanges grants with read for edge grants: the grant
 // in Authorization, or up to MaxEdgeGrants of them in the body. Each gets
@@ -49,16 +49,16 @@ import (
 // and, if fixed, that resource only.
 
 // MaxEdgeGrants is how many grants one POST /edge-grants may exchange
-// (§C.5).
+// (§C.5.2).
 const MaxEdgeGrants = 50
 
 // maxEdgePrefixes is how many distinct prefixes one POST /edge-grants may
-// issue (§C.5): a namespace-wide edge grant gives two, /r/{ns} and
+// issue (§C.5.2): a namespace-wide edge grant gives two, /r/{ns} and
 // /ns/{ns}.
 const maxEdgePrefixes = 100
 
 // EdgeGrant is one namespace's edge grant: reads of NS, fixed to Resource
-// if set. It names no principal (§C.5 "Format").
+// if set. It names no principal (§C.5.3).
 type EdgeGrant struct {
 	NS       string
 	Resource string
@@ -69,7 +69,8 @@ type EdgeGrant struct {
 	Exp time.Time
 }
 
-// Prefixes are the URL prefixes the edge grant covers (§C.5).
+// Prefixes are the URL prefixes the edge grant covers (edge prefixes,
+// §2.1).
 func (g EdgeGrant) Prefixes() []string {
 	if g.Resource != "" {
 		return []string{"/r/" + g.NS + "/" + g.Resource}
@@ -86,7 +87,7 @@ type EdgeGrants struct {
 }
 
 // EdgeGrantsOffered is nil unless authentication is disabled, where
-// issuance is 404 not_offered whatever the request (§C.5, §12): the
+// issuance is 404 not_offered whatever the request (§C.5.2, §12): the
 // server asks it before reading a body.
 func (e *Engine) EdgeGrantsOffered() error {
 	if e.opt.AuthDisabled {
@@ -96,7 +97,7 @@ func (e *Engine) EdgeGrantsOffered() error {
 }
 
 // IssueEdgeGrants decides POST /edge-grants for bearers, the grants
-// exchanged, as they would follow "Bearer " (§C.5). None is 401; the
+// exchanged, as they would follow "Bearer " (§C.5.2). None is 401; the
 // server keeps their number within MaxEdgeGrants.
 func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGrants, error) {
 	if err := e.EdgeGrantsOffered(); err != nil {
@@ -157,9 +158,9 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 			return refused
 		}
 		// The cap counts distinct prefixes once the grants have verified, so
-		// a refusal outranks it (§C.5); it draws nothing.
+		// a refusal outranks it (§C.5.2); it draws nothing.
 		if col.over {
-			return badInput(fmt.Sprintf("the grants would issue more than %d distinct prefixes (§C.5)", maxEdgePrefixes))
+			return badInput(fmt.Sprintf("the grants would issue more than %d distinct prefixes (§C.5.2)", maxEdgePrefixes))
 		}
 		out.Grants = col.grants
 		// One token for the request from each principal's exchangeRate
@@ -181,7 +182,7 @@ func (e *Engine) IssueEdgeGrants(ctx context.Context, bearers []string) (*EdgeGr
 
 // edgeCollect gathers an exchange's edge grants, in the order of the
 // grants and their root blocks, while they give at most maxEdgePrefixes
-// distinct prefixes (§C.5). Past that it only records that the cap is
+// distinct prefixes (§C.5.2). Past that it only records that the cap is
 // exceeded: a grant naming many namespaces and fixing /resource to many
 // names gives their product, which the 400 needs no more of.
 type edgeCollect struct {
@@ -210,7 +211,7 @@ func (c *edgeCollect) add(eg EdgeGrant) bool {
 }
 
 // edgeGrantsOf decides the edge grants of g, presented as cred, in the
-// order its root block names namespaces (§C.5), and adds them to col,
+// order its root block names namespaces (§C.5.2), and adds them to col,
 // each with g's exp. It returns the key of g's principal's buckets, as a
 // write's are keyed (§6.6), and the first refusal of the lowest rank.
 func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (string, *Error) {
@@ -228,7 +229,7 @@ func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (s
 		var iss *edgeIssue
 		switch {
 		case ns == "*":
-			err = forbidden(`edge grants are issued per namespace; a grant naming "*" gets none (§C.5)`)
+			err = forbidden(`edge grants are issued per namespace; a grant naming "*" gets none (§C.5.2)`)
 		case !g.NamesNS(ns):
 			continue // a narrowing block leaves it out
 		default:
@@ -259,7 +260,7 @@ func (t *tx) edgeGrantsOf(g *grant.Grant, cred Credentials, col *edgeCollect) (s
 	return bucket, refused
 }
 
-// refusalRank orders the refusals of an all-or-nothing answer (§C.5): 401
+// refusalRank orders the refusals of an all-or-nothing answer (§C.5.2): 401
 // if any namespace's is, then 403, then the rest, and 410 for a purged one
 // only when every refusal is.
 func refusalRank(err *Error) int {
@@ -282,7 +283,7 @@ type edgeIssue struct {
 	bucket string
 }
 
-// edgeGrant decides g's edge grants in namespace ns (§C.5).
+// edgeGrant decides g's edge grants in namespace ns (§C.5.2).
 func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue, *Error) {
 	n := t.nsByName(ns)
 	if n == nil {
@@ -299,7 +300,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 	}
 	names, safe := edgeReadScope(a)
 	if !safe {
-		return nil, forbidden("the grant's read rules refer to /resource without fixing it to a finite set of valid names, or to /now, which an edge can't evaluate (§C.5): " + ns)
+		return nil, forbidden("the grant's read rules refer to /resource without fixing it to a finite set of valid names, or to /now, which an edge can't evaluate (§2.1, §C.5.2): " + ns)
 	}
 	if a.verified.Key.ReadScopeResource && names == nil {
 		return nil, forbidden("the key's readScope needs a grant fixing /resource (§C.4)")
@@ -312,7 +313,7 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 			}
 		}
 		if len(q) == 0 {
-			return nil, forbidden("no role of the grant that allows read qualifies for an edge grant: each has a rule referring to /resource or /now (§C.5): " + ns)
+			return nil, forbidden("no role of the grant that allows read qualifies for an edge grant: each has a rule referring to /resource or /now (§2.1): " + ns)
 		}
 		roles = q
 	}
@@ -341,7 +342,8 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 }
 
 // edgeRole reports whether a role's rules qualify it for an edge grant
-// (§C.5): none refers to /resource, /now or the whole envelope.
+// (§2.1 Qualifying role, §C.5.2): none refers to /resource, /now or the
+// whole envelope.
 func edgeRole(rules []any) bool {
 	for _, rv := range rules {
 		r, err := compileCached(rv)
@@ -356,8 +358,8 @@ func edgeRole(rules []any) bool {
 }
 
 // edgeReadScope classifies the rules of a's blocks and key scope, which
-// apply on top of its roles (§C.5). It returns the names they fix
-// /resource to, those every fixing rule allows, in the order of the first
+// apply on top of its roles (§C.5.2). It returns the names they fix
+// /resource to (§2.1), those every fixing rule allows, in the order of the first
 // fixing rule, or nil if none fixes it; and false if a rule refers to /now
 // or to the whole envelope, or to /resource other than by fixing it, at
 // top level or inside all, or if the names are none or one isn't valid
@@ -412,7 +414,7 @@ func edgeReadScope(a *actor) ([]string, bool) {
 	return names, true
 }
 
-// fixesResource returns the names a rule fixes /resource to (§C.5),
+// fixesResource returns the names a rule fixes /resource to (§2.1),
 // without duplicates: one for { "op": "test", "path": "/resource",
 // "value": name } or a compare with eq and { "value": name }; a finite
 // set for a test whose schema has only enum, or a compare with in and a

@@ -187,7 +187,7 @@ func Bearer(r *http.Request) string {
 //
 //   - catalog structure: everyone if the catalog is public, otherwise a
 //     grant for the catalog namespace that reads the whole namespace
-//     (unrestricted, §C.5: one read role without rules on /resource is
+//     (unrestricted, §2.1: one read role without rules on /resource is
 //     enough, roles being alternatives), or (filtered per node) one whose
 //     rules restrict /resource;
 //   - items' heads: public content namespaces, or content namespaces the

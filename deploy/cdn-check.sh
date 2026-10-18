@@ -113,7 +113,7 @@ expect "delete" "$(status)" 200
 tomb=$(sed -n 's/.*"tombstone":"\([^"]*\)".*/\1/p' "$TMP/body")
 write POST "/r/cdncheck/$name/purge" -H "If-Match: \"$tomb\""
 expect "purge" "$(status)" 204
-echo "  purged; the core sends PURGE X-Purge-Tags: r:cdncheck/$name (asynchronously)"
+echo "  purged; the core sends PURGE X-Purge-Tags: r:cdncheck/$name heads:cdncheck (asynchronously)"
 i=0
 while :; do
   sleep 0.2

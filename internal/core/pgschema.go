@@ -335,6 +335,11 @@ ALTER TABLE revisions ADD COLUMN IF NOT EXISTS undoes text;
 CREATE INDEX IF NOT EXISTS revisions_by_gesture ON revisions (gesture) WHERE gesture IS NOT NULL;
 CREATE INDEX IF NOT EXISTS revisions_by_undoes ON revisions (undoes) WHERE undoes IS NOT NULL;
 ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS gestures text;
+-- For a revision a write left as a head, its canonical document's length
+-- and sha-256, for /heads (headMeta, §7.4). Rows from
+-- before keep NULL, and are listed without them.
+ALTER TABLE revisions ADD COLUMN IF NOT EXISTS size bigint;
+ALTER TABLE revisions ADD COLUMN IF NOT EXISTS digest bytea;
 CREATE TABLE IF NOT EXISTS cache_gen (id smallint PRIMARY KEY CHECK (id = 1), gen bigint NOT NULL);
 INSERT INTO cache_gen (id, gen) VALUES (1, 0) ON CONFLICT DO NOTHING;
 -- The namespace entries recording a grant, for GET /ns/{ns}/grants/{gid}

@@ -703,3 +703,53 @@ func BenchmarkReadUncached(b *testing.B) {
 		}
 	}
 }
+
+// servedAtLeast, which bounds a log page's scan by logPageBytes (§6.6,
+// logBetween), never exceeds a patch set's bytes as served, compressed
+// rows larger than what they hold included (a minimum of -1 compresses
+// every patch set), and is exact for plaintext and rows encrypted at rest.
+func TestServedAtLeast(t *testing.T) {
+	t.Parallel()
+	skipOnPostgres(t)
+	ks, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, min := range []int{64, -1} {
+		e := compressEngine(t, ":memory:", "zstd", min, func(o *Options) { o.KeyStore = ks })
+		for _, ns := range []string{"plain", "enc"} {
+			doc := map[string]any{"read": "public"}
+			if ns == "enc" {
+				doc["encryption"] = map[string]any{"level": "at-rest"}
+			}
+			mkNS(t, e, ns, doc)
+			writeChain(t, e, ns, "d", 5)
+			writeChain(t, e, ns, "s", 1)
+			n := 0
+			err := e.read(context.Background(), func(tx *tx) error {
+				rows, err := tx.Query(`SELECT r.seq FROM revisions r JOIN resources s ON s.res = r.res JOIN namespaces n ON n.ns = s.ns
+					WHERE n.name = ? AND r.patches IS NOT NULL`, ns)
+				tx.must(err)
+				var seqs []int64
+				for rows.Next() {
+					var s int64
+					tx.must(rows.Scan(&s))
+					seqs = append(seqs, s)
+				}
+				rows.Close()
+				for _, s := range seqs {
+					r := tx.rev(s)
+					got, want := servedAtLeast(r), len(tx.patchesOf(r))
+					if got > want || !isPacked([]byte(r.patches.String)) && got != want {
+						t.Errorf("min %d, %s row %d (%q…): %d, served %d", min, ns, s, r.patches.String[:1], got, want)
+					}
+					n++
+				}
+				return nil
+			})
+			if err != nil || n < 6 {
+				t.Fatalf("%d rows, %v", n, err)
+			}
+		}
+	}
+}

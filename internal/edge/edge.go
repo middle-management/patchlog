@@ -102,7 +102,7 @@ func (v *Verifier) Verified(r *http.Request) bool {
 }
 
 // oneLine is the value of header k when h has exactly one line of it,
-// without a comma (§9, §C.5): two lines, or a list in one, count as
+// without a comma (§9, §C.5.3): two lines, or a list in one, count as
 // none, since proxies may join or split them.
 func oneLine(h http.Header, k string) (string, bool) {
 	vs := h.Values(k)

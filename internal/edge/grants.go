@@ -18,14 +18,14 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// Edge grants as cookies (§C.5 "Issuing them").
+// Edge grants as cookies (§C.5.2).
 //
 // POST /edge-grants exchanges verified grants with read for edge grants,
 // one per namespace each names, fixed to path prefixes: /r/{ns}/{name}, one
 // per name, for a grant whose read rules fix /resource, else /r/{ns} and
 // /ns/{ns}. Each prefix is a cookie whose Path is the prefix, so a browser
 // sends it only there, named per prefix so the cookies of several
-// namespaces and documents coexist. The format is the spec's default (§C.5 "Format"), so an edge
+// namespaces and documents coexist. The format is the spec's default (§C.5.3), so an edge
 // can be written once:
 //
 //	name:  CookiePrefix + hex(sha256(p)[:8])
@@ -46,7 +46,7 @@ import (
 // deployment opts in, to migrate to keys of their own.
 //
 // A Cookies may hold several keys, minting with the newest and accepting
-// any, so a key is rotated without making clients exchange again (§C.5).
+// any, so a key is rotated without making clients exchange again (§C.5.3).
 // Every key one Cookies holds vouches for the same prefixes (VouchesFor):
 // the core prefixes when Vouches is nil, else Vouches' prefixes outside
 // /r and /ns. So one Cookies holds one minter's keys: the origin's in one,
@@ -61,10 +61,10 @@ const CookiePrefix = "__Secure-pl-eg-"
 const DefaultKid = "origin"
 
 // MaxGrantTTL is the longest an edge grant lives: its lifetime is the
-// revocation latency (§C.5, 5–15 minutes).
+// revocation latency (§C.5.2, 5–15 minutes).
 const MaxGrantTTL = 15 * time.Minute
 
-// Claims are what an edge grant says (§C.5 "Format"): GET and HEAD under
+// Claims are what an edge grant says (§C.5.3): GET and HEAD under
 // Prefix are authorised until Exp (Unix seconds), vouched for by the key
 // named Kid. They carry no subject and no grant id.
 type Claims struct {
@@ -74,14 +74,14 @@ type Claims struct {
 }
 
 // Cookies issues edge-grant cookies under the newest of its keys and
-// verifies them under any it holds (§C.5 "Format"). They are one minter's
+// verifies them under any it holds (§C.5.3). They are one minter's
 // keys, and all vouch for the same prefixes (VouchesFor): the core ones
 // (ParsePrefix) when Vouches is nil, as the origin's do, else those
 // Vouches allows outside /r and /ns, as a service's do.
 type Cookies struct {
 	keys []cookieKey // oldest first: the last mints
 	// SameSite is the cookies' SameSite attribute: None when pages on
-	// other origins call with credentials (§C.5), else Lax.
+	// other origins call with credentials (§C.5.2), else Lax.
 	SameSite http.SameSite
 	// TTL caps an edge grant's lifetime (MaxGrantTTL if zero).
 	TTL time.Duration
@@ -124,7 +124,7 @@ func NewCookies(kid string, key []byte) *Cookies {
 // holds already, is an error. key vouches for the same prefixes as every
 // key c holds (VouchesFor), so AddKey rotates the keys of whichever
 // minter c belongs to: the origin's next key goes in the origin's
-// Cookies, a service's in the service's (§C.5: each key vouches only for
+// Cookies, a service's in the service's (§C.5.3: each key vouches only for
 // its own prefixes).
 func (c *Cookies) AddKey(kid string, key []byte) error {
 	switch {
@@ -182,7 +182,7 @@ func KeyFromSecret(secret []byte) []byte {
 // cookies with it, so the origin never signs with it by default: only
 // when the deployment names it (patchlog serve -edge-grant-key
 // KID=edge-secret), to migrate to key files of the origin's own. A
-// service's key must never be it (§C.5: each key vouches only for its own
+// service's key must never be it (§C.5.3: each key vouches only for its own
 // prefixes).
 func (v *Verifier) CookieKey() []byte {
 	if v == nil {
@@ -289,7 +289,7 @@ func parse(value string) (*Claims, string, []byte, error) {
 
 // verify checks parsed claims at now: a kid c holds, which vouches only
 // for its own prefixes (VouchesFor), and a valid MAC under its key,
-// compared in constant time (check 4 of §C.5); exp in the future (check 5).
+// compared in constant time (check 4 of §C.5.3); exp in the future (check 5).
 func (c *Cookies) verify(cl *Claims, p string, sum []byte, now time.Time) error {
 	key := c.key(cl.Kid)
 	if !c.VouchesFor(cl.Prefix) || key == nil {
@@ -304,7 +304,7 @@ func (c *Cookies) verify(cl *Claims, p string, sum []byte, now time.Time) error 
 	return nil
 }
 
-// Verify checks a cookie value at now (§C.5 "Format"): its claims, its kid
+// Verify checks a cookie value at now (§C.5.3): its claims, its kid
 // (any c holds) and prefix, its MAC under that kid's key and its expiry.
 func (c *Cookies) Verify(value string, now time.Time) (*Claims, error) {
 	cl, p, sum, err := parse(value)
@@ -323,7 +323,7 @@ var (
 )
 
 // ParsePrefix parses a core prefix, the only ones the origin's key vouches
-// for (§C.5): /r/{ns}/{name}, /r/{ns} or /ns/{ns}, with names valid under
+// for (§2.1): /r/{ns}/{name}, /r/{ns} or /ns/{ns}, with names valid under
 // §3.6. resource is "" for a namespace-wide prefix.
 func ParsePrefix(p string) (ns, resource string, ok bool) {
 	s := strings.Split(p, "/")
@@ -345,7 +345,7 @@ func Covers(prefix, path string) bool {
 }
 
 // CanonicalPath reports whether an escaped path has no empty, "." or ".."
-// segment and no percent-escape, check 2 of §C.5 (400 otherwise): the
+// segment and no percent-escape, check 2 of §C.5.3 (400 otherwise): the
 // cache keys the raw URL, and core names never need one (§3.6). "/" fails
 // it, having an empty segment; no prefix covers it anyway. An edge
 // embedding Check answers 400 for a request whose path fails it, which
@@ -363,8 +363,8 @@ func CanonicalPath(path string) bool {
 }
 
 // Check makes the checks an edge MUST make on every request, cache hits
-// included, before serving it or forwarding it as verified (§C.5 "What
-// an edge MUST check"), in order:
+// included, before serving it or forwarding it as verified (§C.5.3),
+// in order:
 //
 //  1. the method is GET or HEAD;
 //  2. the path has no empty, "." or ".." segment and no percent-escape;

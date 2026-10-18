@@ -1220,8 +1220,15 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 		if ValidGesture(e.Undoes) {
 			undoes = e.Undoes
 		}
-		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created, gesture, undoes) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?) RETURNING seq`,
-			res, id[:], parentSeq, first, kind, patches, author, sig, typed, parseCreated(e.Created, t.now), gesture, undoes)
+		var size, digest any
+		if kind == kindRev && !ch.opaque && i == len(ch.entries)-1 && t.resLevel(res) < levelSealed {
+			// The head the chain leaves (headMeta), but not in a sealed
+			// shadow or namespace, which never lists them.
+			sz, sum := headMeta(canonDoc)
+			size, digest = sz, sum
+		}
+		last = t.mustInsert(`INSERT INTO revisions (res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, schema_ref, created, gesture, undoes, size, digest) VALUES (?,?,?,?,?,?,?,NULL,NULL,?,?,?,?,?,?,?) RETURNING seq`,
+			res, id[:], parentSeq, first, kind, patches, author, sig, typed, parseCreated(e.Created, t.now), gesture, undoes, size, digest)
 		parentSeq = last
 		if kind == kindTombstone {
 			state = stateTombstoned
@@ -1371,7 +1378,7 @@ func (t *tx) purgeShadow(sh *nsRow, name string) {
 		return
 	}
 	t.deleteDEKs(`res = ?`, r.id)
-	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ?`, r.id)
+	_, err := t.Exec(`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res = ?`, r.id)
 	t.must(err)
 	_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE res = ?`, statePurged, r.id)
 	t.must(err)
@@ -1390,7 +1397,7 @@ func (t *tx) purgeShadowNS(sh *nsRow) {
 	t.deleteDEKs(`ns = ?`, sh.id)
 	q := `res IN (SELECT res FROM resources WHERE ns = ?)`
 	for _, s := range []string{
-		`UPDATE revisions SET patches = NULL WHERE ` + q,
+		`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE ` + q,
 		`DELETE FROM heads WHERE ` + q,
 		`DELETE FROM snapshots WHERE ` + q,
 	} {

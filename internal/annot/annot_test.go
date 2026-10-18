@@ -105,6 +105,15 @@ func TestCollectWith(t *testing.T) {
 				`x-index /8="text"`, `x-index /9="text"`, `x-index /10="text"`},
 		},
 		{
+			// §6.2 step 5: the instance leaves out a well-formed
+			// $successor (§8.1), so a closed schema still validates and
+			// its annotations are collected (§A.2).
+			name:   "$successor left out of a closed schema",
+			schema: `{"type":"object","additionalProperties":false,"x-index":"facet","properties":{"a":{"type":"string","x-index":"text"}}}`,
+			doc:    `{"a":"x","$successor":"/r/n/moved","$nonce":"abcdefghijklmnopqrstuvwxyz"}`,
+			want:   []string{`x-index ="facet"`, `x-index /a="text"`},
+		},
+		{
 			name: "oneOf only matching branch",
 			schema: `{"properties":{"v":{"oneOf":[
 				{"type":"string","x-index":"text"},
@@ -201,6 +210,12 @@ func TestCollectWith(t *testing.T) {
 				t.Errorf("got:\n%s\nwant:\n%s", g, w)
 			}
 		})
+	}
+	// A $successor of another form is data, which the closed schema
+	// refuses.
+	closed := `{"type":"object","additionalProperties":false,"properties":{"a":{"type":"string","x-index":"text"}}}`
+	if _, err := CollectWith(j(closed), "", j(`{"a":"x","$successor":"/r/n/moved/x"}`), loader); err == nil || !strings.Contains(err.Error(), "$successor") {
+		t.Errorf("malformed $successor: %v", err)
 	}
 }
 

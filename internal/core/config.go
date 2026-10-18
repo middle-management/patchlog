@@ -30,6 +30,7 @@ type Limits struct {
 	GrantSize            int
 	ItemsPerBatch        int
 	LogPageSize          int // deployment only
+	LogPageBytes         int // deployment only: patch set bytes per resource log page, as served (§7.1, §7.7)
 	BatchSize            int
 	BranchDepth          int // deployment only
 	BranchesPerNamespace int
@@ -75,6 +76,7 @@ func DefaultLimits() Limits {
 		GrantSize:            8 << 10,
 		ItemsPerBatch:        1000,
 		LogPageSize:          1000,
+		LogPageBytes:         16 << 20,
 		BatchSize:            16 << 20,
 		BranchDepth:          8,
 		BranchesPerNamespace: 100,
@@ -129,7 +131,7 @@ var limitFields = map[string]func(*Limits) *int{
 }
 
 // deploymentOnlyLimits are limits of §6.6 that only a deployment sets.
-var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "branchDepth": true, "exchangeRate": true}
+var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "logPageBytes": true, "branchDepth": true, "exchangeRate": true}
 
 var rateFields = map[string]func(*Limits) *Rate{
 	"ratePerResource":  func(l *Limits) *Rate { return &l.RatePerResource },

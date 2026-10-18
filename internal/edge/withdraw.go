@@ -6,7 +6,7 @@ import (
 )
 
 // Withdraw returns the Set-Cookie that removes prefix's edge grant from a
-// browser (§C.5 "Withdrawing them"): Issue's name and attributes, empty
+// browser (§C.5.4): Issue's name and attributes, empty
 // and expired, so the browser drops the cookie it holds under them.
 func (c *Cookies) Withdraw(prefix string) *http.Cookie {
 	ck := c.Issue(Claims{Prefix: prefix}, time.Unix(0, 0))

@@ -87,11 +87,11 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 	if aerr != nil {
 		return nil, aerr
 	}
-	// Step 1: unrestricted read (§C.5) and export, then the rate limit.
+	// Step 1: unrestricted read (§2.1) and export, then the rate limit.
 	// Remote entries don't count toward the live-branches limit, but are
 	// rate-limited.
 	if !t.readsNS(n, cfg, a, true) {
-		return nil, forbidden("registering a remote branch needs unrestricted read (§C.5)")
+		return nil, forbidden("registering a remote branch needs unrestricted read (§2.1)")
 	}
 	if err := t.authorize(a, "export", ""); err != nil {
 		return nil, err

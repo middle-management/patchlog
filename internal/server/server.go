@@ -61,6 +61,8 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("DELETE /r/{ns}/{name}", s.resourceDelete)
 	m.HandleFunc("GET /r/{ns}/{name}/rev/{id}", s.resourceRev)
 	m.HandleFunc("GET /r/{ns}/{name}/rev/{id}/log", s.resourceRevLog)
+	m.HandleFunc("GET /r/{ns}/{name}/raw", s.resourceRaw)
+	m.HandleFunc("GET /r/{ns}/{name}/rev/{id}/raw", s.resourceRaw)
 	m.HandleFunc("GET /r/{ns}/{name}/log", s.resourceLive)
 	m.HandleFunc("GET /r/{ns}/{name}/events", s.resourceEvents)
 	m.HandleFunc("POST /r/{ns}/{name}/purge", s.resourcePurge)
@@ -92,14 +94,18 @@ func New(e *core.Engine, opts ...Option) *Server {
 // ServeHTTP enforces canonical URLs (§3.6) before routing: no
 // percent-escape and no empty, "." or ".." segment, a trailing "/"
 // included, with the rule an edge checks them by (edge.CanonicalPath,
-// §C.5). No route but "/" ends in "/".
+// §C.5.3). No route but "/" ends in "/".
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	_, pattern := s.mux.Handler(r)
+	if blobRoutes[pattern] {
+		blobHeaders(w) // the 400s below are blob responses too (§7.8 Reading)
+	}
 	path := r.URL.EscapedPath()
 	if strings.Contains(strings.SplitN(r.RequestURI, "?", 2)[0], "%") || path != "/" && !edge.CanonicalPath(path) {
 		writeErr(w, &core.Error{Status: 400, Body: map[string]any{"code": "bad_input", "message": "non-canonical URL"}})
 		return
 	}
-	if _, pattern := s.mux.Handler(r); pattern != "" {
+	if pattern != "" {
 		if err := checkQuery(pattern, r.URL.RawQuery); err != nil {
 			telemetry.SetRoute(r, pattern) // the span is named by it all the same
 			writeErr(w, err)
@@ -133,7 +139,7 @@ var queryParams = map[string]map[string]string{
 	"POST /ns/{ns}/batch":             {"dry-run": flag},                       // §7.5
 	"POST /ns/{ns}/purge":             {"force": flag},                         // §8.5
 	"GET " + core.DefaultJWKSPath:     nil,                                     // §C.4: not checked
-	"DELETE /edge-grants":             nil,                                     // §C.5: prefix repeats; withdrawPrefixes checks it
+	"DELETE /edge-grants":             nil,                                     // §C.5.4: prefix repeats; withdrawPrefixes checks it
 }
 
 // checkQuery answers 400 bad_input for a query parameter the route doesn't
@@ -509,6 +515,20 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if h.State == core.Live {
+		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
+		w.Header().Set("ETag", quote(h.Head))
+		w.Header().Set("Location", "/r/"+ns+"/"+name+"/rev/"+h.Head)
+		w.WriteHeader(302)
+		return
+	}
+	s.headGone(w, r, ns, name, h)
+}
+
+// headGone answers a head pointer that isn't live (§7.1): never existed
+// (short), purged (long), or tombstoned, with successor where the engine
+// read one (§8.1: a moved resource, outside sealed and e2e namespaces).
+func (s *Server) headGone(w http.ResponseWriter, r *http.Request, ns, name string, h *core.Head) {
 	switch h.State {
 	case core.NotFound:
 		s.cache(w, r, ccShort, h.Public)
@@ -519,13 +539,73 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 	case core.Tombstoned:
 		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", quote(h.Head))
-		writeJSON(w, 410, map[string]any{"code": "gone", "tombstone": h.Head, "last": h.Last})
-	default:
-		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
-		w.Header().Set("ETag", quote(h.Head))
-		w.Header().Set("Location", "/r/"+ns+"/"+name+"/rev/"+h.Head)
-		w.WriteHeader(302)
+		body := map[string]any{"code": "gone", "tombstone": h.Head, "last": h.Last}
+		if h.Successor != "" {
+			body["successor"] = h.Successor
+		}
+		writeJSON(w, 410, body)
 	}
+}
+
+// resourceRaw is GET /r/{ns}/{name}/raw and …/rev/{id}/raw (§7.1, §7.8):
+// for a raw document, a 302 to the blob its root references, so a file
+// stored as a blob has a URL of its own; a document that isn't raw is 404
+// not_found. Both are cached as the document URL they stand for, a head
+// pointer or immutable, with its tags, as is a sealed or e2e namespace's
+// 404 not_offered (a level is never lowered). Every other answer is the
+// document URL's: an unknown id or head, a purge, a prune, a tombstone id
+// and a tombstoned head (with successor, §8.1). The Location is the
+// serving namespace's, so a branch reads its base's blob through.
+func (s *Server) resourceRaw(w http.ResponseWriter, r *http.Request) {
+	ns, name, id := r.PathValue("ns"), r.PathValue("name"), r.PathValue("id")
+	if err := validNames(ns, name); err != nil {
+		writeErr(w, err)
+		return
+	}
+	class := ccHead
+	if id != "" {
+		class = ccImmutable
+	}
+	raw, err := s.e.ResourceRaw(r.Context(), ns, name, id, creds(r))
+	if err != nil {
+		var ae *core.Error
+		if errors.As(err, &ae) && ae.Status == 404 && ae.Body["code"] == "not_offered" && ae.Public != nil {
+			s.cache(w, r, class, *ae.Public, resTags(ns, name)...)
+			writeJSON(w, 404, ae.Body)
+			return
+		}
+		if s.writeErrShort(w, r, err) {
+			return
+		}
+		writeErr(w, err)
+		return
+	}
+	if raw.Rev == nil {
+		s.headGone(w, r, ns, name, raw.Head)
+		return
+	}
+	if raw.Rev.Status != 200 {
+		// The head moved on, or the document went, since it was read.
+		rid := id
+		if rid == "" {
+			rid = raw.Head.Head
+		}
+		s.revGone(w, r, ns, name, rid, raw.Rev)
+		return
+	}
+	s.cache(w, r, class, raw.Rev.Public, resTags(ns, name)...)
+	if id == "" {
+		w.Header().Set("ETag", quote(raw.Head.Head))
+	} else {
+		w.Header().Set("ETag", quote(id))
+		w.Header().Set("X-Revision", id)
+	}
+	if raw.Blob == "" {
+		writeJSON(w, 404, map[string]any{"code": "not_found", "message": "not a raw document (§7.8)"})
+		return
+	}
+	w.Header().Set("Location", "/r/"+ns+"/"+name+"/blob/"+raw.Blob)
+	w.WriteHeader(302)
 }
 
 func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
@@ -569,7 +649,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("ETag", quote(id))
 		w.Header().Set("X-Revision", id)
 		w.Header().Set("X-E2E", "snapshot")
-		if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, quote(id)) {
+		if s.notModified(r, id, rev) {
 			w.WriteHeader(304)
 			return
 		}
@@ -577,6 +657,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, 410, map[string]any{"code": "gone", "snapshot": rev.JWE})
 			return
 		}
+		s.revMeta(w, rev)
 		w.Header().Set("Content-Type", seal.ContentType)
 		w.WriteHeader(200)
 		if r.Method != http.MethodHead {
@@ -590,7 +671,7 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		}
 		w.Header().Set("ETag", quote(id))
 		w.Header().Set("X-Revision", id)
-		if inm := r.Header.Get("If-None-Match"); inm != "" && strings.Contains(inm, quote(id)) {
+		if s.notModified(r, id, rev) {
 			w.WriteHeader(304)
 			return
 		}
@@ -598,11 +679,22 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		if rev.JWE != "" {
 			body, ct = []byte(rev.JWE), seal.ContentType
 		}
+		s.revMeta(w, rev)
 		w.Header().Set("Content-Type", ct)
 		w.WriteHeader(200)
 		if r.Method != http.MethodHead {
 			w.Write(body)
 		}
+	default:
+		s.revGone(w, r, ns, name, id, rev)
+	}
+}
+
+// revGone answers a revision URL without a document (§7.1): an unknown
+// id (short), a pruned revision, a tombstone id (immutable) or a purge
+// (long).
+func (s *Server) revGone(w http.ResponseWriter, r *http.Request, ns, name, id string, rev *core.Rev) {
+	switch {
 	case rev.Status == 404:
 		s.cache(w, r, ccShort, rev.Public)
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
@@ -619,6 +711,54 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		s.cache(w, r, ccLong, rev.Public)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
+}
+
+// revMeta sets a revision's 200 headers outside sealed and e2e namespaces
+// (§7.1), where the engine sets Created and Digest: Last-Modified
+// (lastModified), and Repr-Digest (RFC 9530), the sha-256 of the canonical
+// document served, which no content coding changes (none is applied).
+// Sealed and e2e reads carry neither (§E.2.2), the e2e keyring included.
+func (s *Server) revMeta(w http.ResponseWriter, rev *core.Rev) {
+	if lm, ok := s.lastModified(rev); ok {
+		w.Header().Set("Last-Modified", lm.Format(http.TimeFormat))
+	}
+	if rev.JWE == "" && len(rev.Digest) > 0 {
+		w.Header().Set("Repr-Digest", core.ReprDigest(rev.Digest))
+	}
+}
+
+// lastModified is a revision's Last-Modified: its created time to the
+// second, which never changes, but never later than now (RFC 9110
+// §8.8.2.1). Created times come from the writing instance's clock, or a
+// remote base's entries (§G.3), unchecked.
+func (s *Server) lastModified(rev *core.Rev) (time.Time, bool) {
+	if rev.Created.IsZero() {
+		return time.Time{}, false
+	}
+	lm, now := rev.Created.UTC().Truncate(time.Second), s.e.Now().UTC().Truncate(time.Second)
+	if lm.After(now) {
+		lm = now
+	}
+	return lm, true
+}
+
+// notModified tells whether a revision's answer is a 304: If-None-Match
+// names its id (an immutable ETag), or, without If-None-Match, a 200's
+// Last-Modified is no later than If-Modified-Since (§7.1, RFC 9110
+// §13.1.3, §13.2.2). Either is exact: a revision never changes. Where no
+// Last-Modified is sent (sealed and e2e namespaces) If-Modified-Since is
+// ignored, so 304s can't be probed for the created time the level hides.
+func (s *Server) notModified(r *http.Request, id string, rev *core.Rev) bool {
+	if inm := r.Header.Get("If-None-Match"); inm != "" {
+		return strings.Contains(inm, quote(id))
+	}
+	ims := r.Header.Values("If-Modified-Since")
+	if rev.Status != 200 || len(ims) != 1 {
+		return false
+	}
+	since, err := http.ParseTime(ims[0])
+	lm, ok := s.lastModified(rev)
+	return err == nil && ok && !lm.After(since)
 }
 
 func (s *Server) resourceRevLog(w http.ResponseWriter, r *http.Request) {
@@ -882,7 +1022,26 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(201)
 }
 
+// blobRoutes are the routes that read blobs, whose every answer carries
+// blobHeaders.
+var blobRoutes = map[string]bool{
+	"GET /r/{ns}/{name}/blob/{bid}":       true,
+	"GET /r/{ns}/{name}/blob/{bid}/e/{e}": true,
+}
+
+// blobHeaders sets what every blob response carries, errors and the
+// sealed 302 included (§7.8 Reading): writers choose a blob's type and its
+// URL is on the API's origin, so browsers must neither sniff another type
+// nor run script from one. sandbox alone, not the services' default-src
+// 'none', so images and text still display inline. Chromium's PDF viewer
+// is an extension, which shows a sandboxed PDF as a blank page.
+func blobHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+}
+
 func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
+	blobHeaders(w)
 	ns, name, bid := r.PathValue("ns"), r.PathValue("name"), r.PathValue("bid")
 	if err := validNames(ns, name); err != nil {
 		writeErr(w, err)
@@ -911,6 +1070,7 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 // blobEpochGet serves a blob of a sealed namespace sealed under an epoch
 // (§E.2.2).
 func (s *Server) blobEpochGet(w http.ResponseWriter, r *http.Request) {
+	blobHeaders(w)
 	ns, name, bid, ep := r.PathValue("ns"), r.PathValue("name"), r.PathValue("bid"), r.PathValue("e")
 	if err := validNames(ns, name); err != nil {
 		writeErr(w, err)
@@ -1065,7 +1225,12 @@ func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	s.cache(w, r, ccImmutable, page.Public, "ns:"+ns)
+	// heads:{ns} too, which a resource purge purges: an entry's size and
+	// digest (§7.4) are its document's, which a purge removes, unlike the
+	// names and ids the page also lists. §8.3 accepts that a digest
+	// already served survives a purge; this tag, the reference's own,
+	// clears the copies its edge holds.
+	s.cache(w, r, ccImmutable, page.Public, "ns:"+ns, "heads:"+ns)
 	out := map[string]any{"items": page.Items}
 	if page.Next != "" {
 		out["next"] = page.Next

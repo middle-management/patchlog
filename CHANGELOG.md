@@ -2,7 +2,70 @@
 
 ## Unreleased
 
+Implements spec **v0.54**. v0.53 restructures the text with no change in behaviour (terms
+defined once in §2.1, a purged namespace's answers in one table, edge grants split into
+§C.5.2–§C.5.4); v0.54 serves file-style and sync clients, from the reference's notes 13–19:
+what this branch had added beyond v0.52 for them is now specified, outside E2 and E3 only, and
+raw documents, moves, whole-document appends and `logPageBytes` are new.
+
+**Changes to check before upgrading:**
+- **New columns `revisions.size` and `revisions.digest`**, added on the first start on SQLite and
+  Postgres (nullable, no default: instant on Postgres; nothing is backfilled). They take about 40
+  bytes per revision a write leaves as a head outside sealed and e2e namespaces, in the clear in
+  encrypted-at-rest ones too, as ids are: a backup lets a guess of a head's document without a
+  `$nonce` be confirmed against its digest, even after a purge (§C.7). Heads written before
+  the upgrade, or by an older instance during a rolling one, are listed without `size` and
+  `digest` until written again; a purge by an older instance leaves the columns and doesn't
+  purge cached `/heads` pages (the README gives the SQL to clear them). Responses cached before
+  the upgrade lack the new fields and headers, so clients treat all of them as optional (§7.4).
+- **A config write that raises a namespace to sealed purges `ns:{ns}`** (§9), public or
+  private, as making it private does; and **a resource purge also purges `heads:{ns}`**, a new
+  tag on `/heads` pages, in every namespace it reaches, besides `r:{ns}/{name}` (the
+  reference's own; §8.3 doesn't require it).
+- **Resource log pages are also bounded by `logPageBytes`** (§6.6, deployment only, default
+  16 MiB, `serve -log-page-bytes`): ranges, long-polls and event-stream catch-up of large patch
+  sets come in more, shorter pages, each with `X-Log-Next` as before; in a sealed namespace the
+  bound counts the entries' JWEs, so with `pad` a page ends where padded sizes say (§E.2.2). A
+  namespace document setting `limits.logPageBytes` is `422`.
+- **Blob responses carry `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox`** (§7.8), errors and the sealed `302` included: an HTML or
+  SVG blob no longer runs as a page on the API's origin, and browsers no longer sniff a type
+  other than the uploaded one. Images and text still display inline, but Chromium shows a
+  sandboxed PDF as a blank page: download PDFs, or show them with a viewer on another origin.
+- **Appends and restores that overwrite the root may be as large as `documentSize`** (§6.6):
+  one whose first operation other than `test` is a root `replace` or `add`. Such an append was
+  `413` above `patchSetSize`, and a restore got `documentSize` only when its very first
+  operation was a root `replace`.
+- **A top-level `$successor` of the §8.1 form is left out of validation** (§6.2 step 5), the
+  index's `x-index` and `x-ref` walks and the bundle closure, as `$schema` and a fresh `$nonce`
+  are: closed schemas accept it, and walks that found it as a reference no longer do.
+- `GET /` answers `"spec": "0.54"`.
+
 **New:**
+- **Revision metadata** (§7.1, §7.4; README "Files and sync clients"): outside sealed and e2e
+  namespaces, judged by the namespace serving the read, a revision's `200` carries
+  `Last-Modified`, its created time, with `If-Modified-Since` answered `304`, and
+  `Repr-Digest: sha-256=:…:` (RFC 9530) of the canonical document; `/heads` entries carry
+  `created`, and live heads `size` and `digest`, stored at write time so a listing reads no
+  document; branches list their base's values for what they read through. Sealed and e2e
+  namespaces send none of them, the e2e keyring and prune snapshots included (§E.2.2), and
+  ignore `If-Modified-Since` there, so no `304` reveals a created time; `If-None-Match` still
+  gives one. The Go client exposes `HeadItem.Created`, `Size` and `Digest`, `Doc.Modified` and
+  `Digest`, and `client.ReprDigest`.
+- **Raw documents** (§7.1, §7.8): `GET /r/{ns}/{name}/raw` and `…/rev/{id}/raw` redirect (`302`)
+  to the blob a document whose root is only a blob reference stands for, cached as the document
+  URL; a document that isn't raw is `404 not_found`, sealed and e2e namespaces `404
+  not_offered`. A blob reference at a document's root may carry `$schema`, a fresh `$nonce` and
+  a well-formed `$successor`, so raw documents can be typed, nonced and moved. Client:
+  `client.RawBlobOf`, `Client.Raw`.
+- **Moves** (§8.1): a tombstoned head's `410` carries `successor`, copied from the last
+  document's well-formed `$successor` (a bare name or `/r/{ns}/{name}`), outside sealed and e2e
+  namespaces, read through branches and remote branches' mirrors. Client: `Head.Successor`,
+  `Client.Moved` (which reads the document at `last` where the `410` names none),
+  `E2E.Moved` (which always folds that document and ignores a `410`'s successor, since the
+  server is outside the trust boundary at E3), `client.SuccessorOf`,
+  `client.ResolveSuccessor`.
+- **`serve -log-page-bytes`**, and `LogPageBytes` in `core.Limits` and `clienttest.Options`.
 - **`patchlog dav`: namespaces and catalogs over WebDAV (a prototype)** (`internal/dav`), so
   file managers and editors (Finder, Explorer, GNOME Files, vim, VS Code) open and save
   documents as files, through the core's public API only. Flat namespaces (`-ns`) are
