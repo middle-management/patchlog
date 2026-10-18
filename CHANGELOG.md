@@ -45,20 +45,25 @@ service's listings.
 - **Verification applies a key's `readScope: "resource"`** (§C.2 item 1, §C.4, v0.55): a `read`
   grant such a key signs whose rules don't fix `/resource` (§2.1) is refused on every request,
   `403` (`404` on a read of a private namespace, as any refusal there). It used to verify, and
-  read every resource. Edge-grant issuance refused it already.
+  read every resource. Edge-grant issuance refused it already. `grant.Verify` applies it, so the
+  tree, catalog and index services (`grantcheck`) refuse it too: the tree service listed heads
+  and file metadata of a private namespace's items to it.
 - **A namespace's own `rulesPerGrant`, `grantSize` and `rulesPerNamespace` are enforced**
   (§6.6): a grant chain over the namespace's `rulesPerGrant` is `422`, a bearer over its
-  `grantSize` `413`, and a config write whose document has more rules than its own
-  `rulesPerNamespace` `422`; only the deployment maximums were. Stored documents are read as
-  before.
+  `grantSize` `413`, and a namespace creation or a config write that changes the rules or
+  `limits.rulesPerNamespace`, whose document has more rules than its own `rulesPerNamespace`,
+  `422`; only the deployment maximums were. Stored documents are read as before, and one stored
+  over its own `rulesPerNamespace` takes other config writes, freezes included.
 - **Limit refusals carry `limit`, `measured` and `max`** (§6.6, §12, v0.55), batch items' reports
   too; the bodies of `POST …/prune` and `POST /ns/{ns}/keys`, which no limit of §6.6 covers, are
-  `400 bad_input` above 1 MiB (were `413 limit`).
+  `400 bad_input` above 1 MiB, and so is a `POST /edge-grants` body over room for 50 grants
+  (§12: an exchange over its limits), all three `413 limit` before.
 - **The tree service's `items` table gains `created` and `file` columns**, added on the first
   start (nullable). In a file tree (`catalog.files`, §H.2) the service reads every head of its
   trusted namespaces as it applies it, sealed ones with keys, to give placements file metadata;
-  on the first start with a file tree it reads every live item's head once (meta `filed`) and
-  purges the catalog's cached listings.
+  on the first start with a file tree it reads every live item's head once (meta `filed`,
+  retried until every head is read) and purges the catalog's cached listings. While a sealed
+  namespace's epoch key can't be had for the moment, its listings are `503` with `Retry-After`.
 - **Undo by a writer that can't read the namespace document asks `GET /ns/{ns}/principal`**
   (§11.2) for the namespace's `opsPerSet` and `patchSetSize`, and splits inverses by them rather
   than by §6.6's defaults; against a server before v0.55, which answers `404` there, the
@@ -119,6 +124,13 @@ service's listings.
 - **`serve -log-page-bytes`**, and `LogPageBytes` in `core.Limits` and `clienttest.Options`.
 
 **Fixes:**
+- **Stored listings of the tree service are keyed by the reader's shape** (§A.4, §E.2.6), as
+  kept ones are: by URL and what the reader reads whole. A public namespace that turns private
+  moves neither the anonymous URL space nor a `gs`, so until the service's `at` moved, readers
+  were served the stored listing computed while it was public, with heads and urls of its items,
+  and it stayed stored at that `at`. This held for sealed and e2e catalogs, and with file
+  metadata for every file tree trusting a sealed namespace. Listings stored before the upgrade
+  are computed again.
 - **A second CDN purge from the index and the tree/catalog services** (D.8, as the core's): a
   request in flight when an apply committed a purge could hand the CDN a result or listing it
   read before the commit, immutable and tagged with what was just purged, after that purge had

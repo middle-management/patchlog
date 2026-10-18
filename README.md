@@ -2182,15 +2182,22 @@ tree service then gives every placement entry with a head, in `children`, `subtr
   `file`. When `catalog.files` appears, every live item's head is read for it, and when it goes
   the metadata goes, both moving listings to the new checkpoint; a database from before this, or
   one a release that ignored `catalog.files` kept, is filled in on start (meta `filed`, purging
-  the catalog's cached listings, `ns:{catalog}`).
+  the catalog's cached listings, `ns:{catalog}`). A head that can't be read for the moment (not
+  gone, nor unreadable content) is read again: the catalog's change is applied again by its
+  follower, and a start's fill-in is retried beside the followers until it succeeds.
 - **Sealed items** (§E.2.6). For an item of a sealed namespace the entry carries
   `"file": { "sealed": "<JWE>" }` instead, the JWE of `{ "file": { … } }` under the item's own
   `K_r` (kid its namespace's current epoch, padded as that namespace pads), with `pl { ns, name,
   view }` naming the item and the listing's `at` URL, whatever the catalog's level: a reader
   given `K_r` by `/read-grants` opens it, and in a sealed catalog read whole, the catalog's JWE
   holds it still sealed, so the catalog's keys open no content-derived value. A listing holding
-  one is stored and served unchanged, as a sealed catalog's listings are. The service stores the
-  metadata in the clear, as it does titles.
+  one is stored and served unchanged, as a sealed catalog's listings are, keyed like kept ones
+  by its URL and what the reader reads whole. While a sealed namespace's key can't be had for
+  the moment, listings are `503`, `no-store`, with `Retry-After`, as when the catalog's own key
+  can't, rather than kept at their `at` without it. Only sealed namespaces' keys are asked for.
+  The service stores the metadata in the clear, as it does titles. This form, and its nesting
+  inside a sealed catalog's JWE, are provisional: §E.2.6 defines a per-entry `"sealed"` member
+  for values of one source and none yet for values another namespace's resource gives.
 
 ### Bundles (§G.4)
 
@@ -3014,7 +3021,8 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   adds a fresh `$nonce` in a private namespace (`NeedsNonce`), as §C.7 recommends. Verification now also applies a key's `readScope:
   "resource"` (§C.2 item 1, §C.4) to every request: a `read` grant it signs that doesn't fix
   `/resource` (§2.1) is refused (`403`, or `404` on a read of a private namespace, as any
-  refusal there).
+  refusal there). `grant.Verify` applies it, so the services' grant checks (`grantcheck`: the
+  tree, catalog and index services) refuse the same grants.
 - **Limit refusals** (§6.6, §12, v0.55): every `413` or `422` with `code: "limit"` names the
   limit's key in `limit`, and for sizes and counts carries `measured` and `max`, the limit in
   force: `patchSetSize` (or `documentSize` for a whole-document patch set) and `opsPerSet` of
@@ -3028,13 +3036,17 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `measured`, and durations and rates (`retryWindow`, `remoteRegistration`, `blobGrace`, the
   rates, an allowance's `blobRate`) carry the key alone. A body the server stops reading names
   the deployment's limit (`documentSize` for a resource's patch set, `patchSetSize` for
-  namespace documents and branches, `grantSize` for an edge-grant exchange) or, for a batch, the
-  principal's `batchSize`, with the bytes read as `measured`, a lower bound; a blob sent without
-  `Content-Length` gives `blobSize + 1`. A batch item's report carries its refusal's fields. The
-  prune and `/keys` bodies, which no limit covers, are `400 bad_input` above 1 MiB. A grant chain
-  is held to the namespace's `rulesPerGrant` and a bearer to its `grantSize`, and a config write
-  to the resulting document's `rulesPerNamespace`, as §6.6 says, not only to the deployment's
-  maximums. The client reads them with `APIError.Limit` and `client.IsLimit`.
+  namespace documents and branches) or, for a batch, the principal's `batchSize`, with the bytes
+  read as `measured`, a lower bound; a blob sent without `Content-Length` gives `blobSize + 1`.
+  A batch item's report carries its refusal's fields. The prune and `/keys` bodies, which no
+  limit covers, are `400 bad_input` above 1 MiB, and so is an edge-grant exchange body over room
+  for 50 grants of `grantSize` (§12: an exchange over its limits; a grant too large is `413
+  grantSize` once decoded). A grant chain is held to the namespace's `rulesPerGrant` and a
+  bearer to its `grantSize`, and a config write that creates a namespace, or changes its rules
+  or its own `rulesPerNamespace`, to that bound, as §6.6 says, not only to the deployment's
+  maximums; a document an earlier release stored over its own `rulesPerNamespace` takes other
+  writes, a freeze among them. The client reads them with `APIError.Limit` and
+  `client.IsLimit`.
 - **`GET /`** answers `{ "spec": "0.55", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
