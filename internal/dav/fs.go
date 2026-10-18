@@ -691,12 +691,9 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	}
 	served := (st.method == "GET" || st.method == "HEAD") && t.path == st.path
 	if served && st.resp != nil {
-		// A file is served as its type, and whatever it holds, no page of
-		// this origin, which holds the users' credentials, runs it, nor
-		// does a browser take it for another type (§H.6 "Raw bytes").
+		// A file is served as its type, never one sniffed; nosniff and the
+		// sandbox go with every answer (ServeHTTP, §H.6 "Raw bytes").
 		st.resp.Set("Content-Type", fi.ctype)
-		st.resp.Set("X-Content-Type-Options", "nosniff")
-		st.resp.Set("Content-Security-Policy", "sandbox")
 	}
 	if fi.rev == "" {
 		f, ok := st.scratchGet(t.path)

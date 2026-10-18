@@ -294,6 +294,20 @@ func (s *Server) namespaces() []string {
 // ServeHTTP authenticates the request, then serves it with x/net/webdav
 // over the principal's view.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// Whatever an answer holds (a file, a listing, an error repeating a
+	// name the client sent), no page of this origin, which holds the
+	// users' credentials, runs it, nor does a browser take it for another
+	// type (§H.6 "Raw bytes").
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	if r.Method == http.MethodPost {
+		// x/net/webdav answers a POST as a GET, without the headers a
+		// served file gets (open): a cross-site form would run a writer's
+		// .html in this origin. No WebDAV client posts.
+		w.Header().Set("Allow", allowed)
+		http.Error(w, "POST isn't a WebDAV method here; files are read with GET and written with PUT", http.StatusMethodNotAllowed)
+		return
+	}
 	p, de := s.authenticate(r)
 	if de != nil {
 		for k, v := range de.header {
@@ -412,6 +426,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}}
 	h.ServeHTTP(&errWriter{ResponseWriter: w, st: st, realm: s.realm()}, r.WithContext(context.WithValue(r.Context(), stateKey{}, st)))
 }
+
+// allowed are the methods served (RFC 9110 §10.2.1 Allow).
+const allowed = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK"
 
 // answered keeps what the request's answer, status, says of the
 // principal's saves for a DELETE that follows (refusedSaveFor): a PUT of

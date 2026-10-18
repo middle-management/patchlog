@@ -164,7 +164,7 @@ func (st *reqState) reserveLocked(old *scratchFile, n int) error {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	if a.files+files > s.opt.ScratchFiles {
-		return fail(http.StatusInsufficientStorage, "at most %d temporary files and folders (names that aren't {name}.json) are kept per user", s.opt.ScratchFiles)
+		return fail(http.StatusInsufficientStorage, "at most %d temporary files and folders (editors' and systems' own, kept in memory, §H.6) are kept per user", s.opt.ScratchFiles)
 	}
 	if delta > 0 && a.bytes+delta > s.opt.ScratchBytes {
 		return fail(http.StatusInsufficientStorage, "at most %d bytes of temporary files are kept per user", s.opt.ScratchBytes)

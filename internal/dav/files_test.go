@@ -421,6 +421,29 @@ func TestRawBytes(t *testing.T) {
 	e.expect(e.do("GET", "/docs/page.html", "", "If-Range", `"1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"`, "Range", "bytes=0-0"), 200, "GET If-Range another revision")
 }
 
+// A POST, which x/net/webdav answers as a GET, is refused (405) before it
+// reads anything: a cross-site form posting to a writer's .html file
+// would have it served without the sandbox, in the origin holding the
+// users' credentials (§H.6 "Raw bytes"). Every answer, errors included,
+// carries nosniff and the sandbox policy.
+func TestPostRefused(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.rawDoc("docs", "evil.html", "text/html", []byte("<script>alert(document.cookie)</script>"), nil)
+	for _, p := range []string{"/docs/evil.html", "/docs/", "/docs/missing.html"} {
+		r := e.expect(e.do("POST", p, "a=b", "Content-Type", "application/x-www-form-urlencoded"), 405, "POST "+p)
+		if strings.Contains(r.body, "script") || r.header.Get("Allow") == "" || strings.Contains(r.header.Get("Allow"), "POST") {
+			t.Fatalf("POST %s: %v %q", p, r.header, r.body)
+		}
+	}
+	for _, r := range []resp{e.do("POST", "/docs/evil.html", ""), e.do("MKCOL", "/docs/%3Cimg%20src=x%3E", ""), e.do("GET", "/docs/missing.html", ""),
+		e.do("PROPFIND", "/docs/", "", "Depth", "1"), e.doAs("", "GET", "/docs/evil.html", "")} {
+		if r.header.Get("X-Content-Type-Options") != "nosniff" || r.header.Get("Content-Security-Policy") != "sandbox" {
+			t.Fatalf("%d answer without nosniff and sandbox: %v", r.status, r.header)
+		}
+	}
+}
+
 // A PUT with Content-Range (a partial write) is 400 and writes nothing
 // (§H.4).
 func TestPartialPut(t *testing.T) {
