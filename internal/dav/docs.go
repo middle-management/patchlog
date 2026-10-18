@@ -134,6 +134,7 @@ type nsInfo struct {
 	trust                 []string
 	files                 *treeFiles
 	notTree               string // why a catalog's document makes no file tree, if it was read
+	titled                bool   // a catalog's catalog.title is set: listings carry its items' titles (§B.5)
 	readErr               error  // the core's refusal of a catalog's document to the token (a 401, 403, 404)
 	patchSetSize, docSize int
 	opsPerSet, blobSize   int
@@ -152,6 +153,7 @@ type nsDocAt struct {
 	trust   []string
 	files   *treeFiles
 	notTree string
+	titled  bool
 	readErr error
 	at      time.Time
 }
@@ -268,7 +270,7 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 		if err != nil {
 			return nsInfo{nonce: true}, err
 		}
-		in.trust, in.files, in.notTree, in.readErr = d.trust, d.files, d.notTree, d.readErr
+		in.trust, in.files, in.notTree, in.titled, in.readErr = d.trust, d.files, d.notTree, d.titled, d.readErr
 	}
 	return in, nil
 }
@@ -307,6 +309,7 @@ func (s *Server) nsDoc(ctx context.Context, tk *token, ns string) (nsDocAt, erro
 			}
 		}
 		d.files, d.notTree = filesOf(cat)
+		_, d.titled = cat["title"]
 	}
 	tk.mu.Lock()
 	tk.docs[ns] = d
@@ -316,12 +319,15 @@ func (s *Server) nsDoc(ctx context.Context, tk *token, ns string) (nsDocAt, erro
 
 // headDoc is a live resource's head, the time it was written where a
 // listing says (§7.4 created), its file's metadata, and, once read, its
-// document.
+// document. listed: m is the file metadata a tree service listed (§H.3),
+// which shows the file but holds no blob id: reading the file reads its
+// own.
 type headDoc struct {
 	ns, name, rev string
 	created       time.Time
 	m             fileMeta
 	e             *docEntry
+	listed        bool
 }
 
 // entry returns hd's document, read if it wasn't.

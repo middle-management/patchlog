@@ -22,7 +22,7 @@ import (
 
 // davCmd serves namespaces over WebDAV (a prototype, internal/dav):
 //
-//	patchlog dav -api URL [-addr 127.0.0.1:8090] -ns NS[,NS…] [-catalog NS[,NS…] [-case-sensitive]]
+//	patchlog dav -api URL [-addr 127.0.0.1:8090] -ns NS[,NS…] [-catalog NS[,NS…] [-case-sensitive] [-tree-url [CATALOG=]URL]... [-tree-wait 3s]]
 //	             [-bearer GRANT | -bearer-file FILE] [-author NAME] [-password-file FILE]
 //	             [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]
 //
@@ -31,7 +31,9 @@ import (
 // password of -password-file, or a random one logged at start. Gateway
 // mode sends each request's Basic password upstream as its grant
 // (Authorization: Bearer); grants must not cross plain HTTP, so it needs
-// TLS on any address but loopback unless -insecure.
+// TLS on any address but loopback unless -insecure. With -tree-url, the
+// trees' folders are listed from the tree service (§H.3, §H.7), as
+// serve's -tree-url names it; without, from the catalogs' node documents.
 func davCmd(args []string) {
 	fs := flag.NewFlagSet("dav", flag.ExitOnError)
 	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")
@@ -40,6 +42,9 @@ func davCmd(args []string) {
 	fs.Var(&nss, "ns", "flat namespace to serve, a directory of its files: raw ones by name, JSON documents as {name}.json (repeatable or comma-separated)")
 	fs.Var(&cats, "catalog", "catalog namespace to serve as a file tree, one whose namespace document has catalog.files (§H.2; repeatable or comma-separated)")
 	caseSensitive := fs.Bool("case-sensitive", false, "compare the names in a file tree's folder after NFC only, not after case folding too")
+	var treeURLs multi
+	fs.Var(&treeURLs, "tree-url", "tree service (§B.5) following the -catalog trees, e.g. http://tree:8082, which their folders are listed from with each user's grant (§H.3, §H.7); CATALOG=URL maps one catalog to its own (repeatable). Without one, folders are listed from the catalogs' node documents")
+	treeWait := fs.Duration("tree-wait", 3*time.Second, "how long a user's listing waits for the tree service to reach the user's own writes (?min=) before it reads the node documents")
 	bearer := fs.String("bearer", "", "local mode: the grant every request is sent with (Authorization: Bearer)")
 	bearerFile := fs.String("bearer-file", "", "local mode: file holding -bearer")
 	author := fs.String("author", "", "X-Author for a -dev server (local mode)")
@@ -76,7 +81,10 @@ func davCmd(args []string) {
 		log.Fatalf("dav: -max-raw-size: %v", err)
 	}
 	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, CaseSensitive: *caseSensitive, Gateway: *gateway, FetchConcurrency: *fetchConc,
-		CacheBytes: cache, MaxFileSize: maxSize, MaxRawSize: maxRawSize, Logf: log.Printf}
+		CacheBytes: cache, MaxFileSize: maxSize, MaxRawSize: maxRawSize, TreeWait: *treeWait, Logf: log.Printf}
+	if opt.TreeService, opt.TreeServices, err = treeServices(treeURLs); err != nil {
+		log.Fatalf("dav: -tree-url: %v", err)
+	}
 	copts := []client.Option{client.WithIdleConns(*fetchConc)}
 	if *gateway {
 		if *bearer != "" || *bearerFile != "" || *passwordFile != "" || *author != "" {
@@ -158,6 +166,28 @@ func davCmd(args []string) {
 	<-ctx.Done()
 	forceOnSecond(sigs)
 	ls.Shutdown()
+}
+
+// treeServices splits -tree-url values into the default tree service, a
+// plain URL, and those of catalogs given as CATALOG=URL, as serve's
+// -tree-url takes them: what precedes a plain URL's first "=", if any,
+// holds its scheme's colon, so it is never a namespace name.
+func treeServices(vals []string) (string, map[string]string, error) {
+	def, per := "", map[string]string{}
+	for _, v := range vals {
+		cat, u, ok := strings.Cut(v, "=")
+		switch {
+		case ok && core.ValidNSName(cat) && per[cat] != "":
+			return "", nil, fmt.Errorf("catalog %s is mapped twice", cat)
+		case ok && core.ValidNSName(cat):
+			per[cat] = u
+		case def != "":
+			return "", nil, fmt.Errorf("%q: more than one default tree service (map the others as CATALOG=URL)", v)
+		default:
+			def = v
+		}
+	}
+	return def, per, nil
 }
 
 // loopback reports whether a listen address is a loopback one only.

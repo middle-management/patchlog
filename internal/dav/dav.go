@@ -72,6 +72,20 @@ type Options struct {
 	// Catalogs are the catalog namespaces served as file trees (§H.2),
 	// each with catalog.files in its namespace document.
 	Catalogs []string
+	// TreeService is the base URL of the tree service (§B.5) following
+	// the catalogs served, such as http://tree:8082, and TreeServices
+	// that of a catalog with its own, by catalog. A tree's folder is then
+	// listed from the tree service's children listing, read with the
+	// request's grant, which the tree service filters by (§H.3, §H.7,
+	// §B.11.5), with the file metadata it adds; without one, from the
+	// catalog's node documents read from the core, the fallback for
+	// deployments without a tree service (treesvc.go).
+	TreeService  string
+	TreeServices map[string]string
+	// TreeWait bounds how long a listing waits for the tree service to
+	// reach the user's own writes through this server (?min=, §B.5),
+	// before the folder is listed from the node documents (default 3s).
+	TreeWait time.Duration
 	// CaseSensitive compares the names of a tree's siblings after NFC
 	// only; by default they are compared after Unicode case folding too
 	// (§H.2 "Siblings"), as the file systems of macOS and Windows, whose
@@ -199,6 +213,7 @@ type Server struct {
 	inflight *semaphore.Weighted
 	heavy    chan struct{} // requests with a body over heavyBody being handled
 	gen      atomic.Uint64 // writes through this server: catalog reads older are stale
+	ts       treeShared    // the tree service's client, and the catalogs' settings
 }
 
 // New returns a server for opt.
@@ -240,6 +255,7 @@ func New(opt Options) (*Server, error) {
 	defDur(&opt.VerifyEvery, 5*time.Minute)
 	defDur(&opt.CatalogTTL, 5*time.Second)
 	defDur(&opt.MaxRetryWait, 2*time.Second)
+	defDur(&opt.TreeWait, 3*time.Second)
 	if opt.VerifyEvery > edge.MaxGrantTTL {
 		return nil, fmt.Errorf("dav: VerifyEvery %v is longer than edge grants live (%v): a gateway re-checks a grant at least as often as they expire (§H.7, §C.5.2)", opt.VerifyEvery, edge.MaxGrantTTL)
 	}
@@ -276,6 +292,10 @@ func New(opt Options) (*Server, error) {
 		s.cats[ns] = true
 	}
 	s.fs = &davFS{s: s}
+	if err := s.ts.init(&s.opt); err != nil {
+		return nil, err
+	}
+	opt.Client = s.opt.Client
 	s.anon = opt.Client.With(client.WithBearer(""))
 	if opt.Gateway {
 		s.verifySem = make(chan struct{}, maxVerifying)
@@ -1048,8 +1068,9 @@ func (s *Server) userInflight() int64 {
 // with the client sending it, the served namespaces it names, and what
 // was read with it, since another token of the same user may read less
 // (attenuated offline): writers' settings and namespace documents
-// (nsInfo), catalogs' trees. What is kept for its user is in its
-// principal, shared by every token of the user (§H.7).
+// (nsInfo), catalogs' trees, the folders a tree service listed to it.
+// What is kept for its user is in its principal, shared by every token of
+// the user (§H.7).
 type token struct {
 	id string
 	c  *client.Client
@@ -1067,6 +1088,8 @@ type token struct {
 	writers map[string]writerAt // by namespace: §7.4's writer block
 	docs    map[string]nsDocAt  // by namespace: what its document says
 	cats    map[string]*catGraph
+
+	dirs treeDirs // the folders a tree service listed to it (treesvc.go)
 }
 
 func (s *Server) newToken(id string, c *client.Client, p *principal, named map[string]bool) *token {
@@ -1076,9 +1099,10 @@ func (s *Server) newToken(id string, c *client.Client, p *principal, named map[s
 
 // principal is a user as the server keeps state for them (§H.7): their
 // locks, scratch files, dead properties, guards, recent deletes and moves
-// aside, within bounds; their records (records.go) are kept by its id,
-// apart and for longer. In a gateway, every token the core verified as
-// theirs (userKey) shares it; in local mode, there is one.
+// aside, and the writes their tree listings wait for, within bounds;
+// their records (records.go) are kept by its id, apart and for longer. In
+// a gateway, every token the core verified as theirs (userKey) shares it;
+// in local mode, there is one.
 type principal struct {
 	id    string // userKey; "local" in local mode
 	locks webdav.LockSystem
@@ -1087,6 +1111,8 @@ type principal struct {
 	used     time.Time
 	inflight int             // requests in flight, over its tokens
 	toks     map[*token]bool // its tokens kept
+
+	ts treeSvc // its writes its tree listings wait for (treesvc.go)
 
 	mu      sync.Mutex
 	scratch map[string]*scratchFile // by path
