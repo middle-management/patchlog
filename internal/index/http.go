@@ -183,7 +183,7 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
-	// A grant that reads the namespace unrestricted (§C.5) reads every
+	// A grant that reads the namespace unrestricted (§2.1) reads every
 	// resource; one whose reads can't differ between resources and that
 	// doesn't reads none.
 	a := &access{v: v, all: ix.checker.ReadsUnrestricted(v)}

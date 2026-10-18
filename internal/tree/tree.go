@@ -246,7 +246,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	}
 	if opt.EdgeGrants != nil && (opt.Catalog == "r" || opt.Catalog == "ns") {
 		// A service's prefixes lie under a root of its own, which never
-		// overlaps /r/ or /ns/ (§C.5 "Format").
+		// overlaps /r/ or /ns/ (§C.5.3).
 		return nil, fmt.Errorf("tree: catalog %q can't have edge grants: /%s/g/{gs} would overlap the core's prefixes", opt.Catalog, opt.Catalog)
 	}
 	if opt.MinWait == 0 {

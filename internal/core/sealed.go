@@ -448,7 +448,7 @@ type KeysAnswer struct {
 
 // Keys answers POST /ns/{ns}/keys. It needs a verified grant with read on
 // the namespace (with authentication disabled, anyone gets raw epoch keys).
-// A grant that reads the namespace unrestricted (§C.5: with roles, through
+// A grant that reads the namespace unrestricted (§2.1: with roles, through
 // one without /resource rules that passes) gets K_e; one restricted by
 // rules on /resource or a key with readScope "resource" gets K_r for each
 // requested resource it may read; any other is 403. Epochs run from the
@@ -502,7 +502,7 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			return nil
 		}
 		if refused {
-			return forbidden("epoch keys need unrestricted read on the namespace (§C.5, §E.2.3)")
+			return forbidden("epoch keys need unrestricted read on the namespace (§2.1, §E.2.3)")
 		}
 		if n.purged {
 			return t.purgedNS(n)

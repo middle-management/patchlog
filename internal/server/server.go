@@ -94,7 +94,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 // ServeHTTP enforces canonical URLs (§3.6) before routing: no
 // percent-escape and no empty, "." or ".." segment, a trailing "/"
 // included, with the rule an edge checks them by (edge.CanonicalPath,
-// §C.5). No route but "/" ends in "/".
+// §C.5.3). No route but "/" ends in "/".
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.EscapedPath()
 	if strings.Contains(strings.SplitN(r.RequestURI, "?", 2)[0], "%") || path != "/" && !edge.CanonicalPath(path) {
@@ -135,7 +135,7 @@ var queryParams = map[string]map[string]string{
 	"POST /ns/{ns}/batch":             {"dry-run": flag},                       // §7.5
 	"POST /ns/{ns}/purge":             {"force": flag},                         // §8.5
 	"GET " + core.DefaultJWKSPath:     nil,                                     // §C.4: not checked
-	"DELETE /edge-grants":             nil,                                     // §C.5: prefix repeats; withdrawPrefixes checks it
+	"DELETE /edge-grants":             nil,                                     // §C.5.4: prefix repeats; withdrawPrefixes checks it
 }
 
 // checkQuery answers 400 bad_input for a query parameter the route doesn't

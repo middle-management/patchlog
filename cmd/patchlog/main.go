@@ -460,7 +460,7 @@ func parseRate(s string) (core.Rate, error) {
 // edgeSecretKey, as the FILE of the origin's -edge-grant-key, is the key
 // derived from -edge-secret (edge.KeyFromSecret), for migrating a
 // deployment that minted under it to key files without making clients
-// exchange again (§C.5 "Format"). Every holder of the edge secret can
+// exchange again (§C.5.3). Every holder of the edge secret can
 // derive it, the services that take -edge-secret for their own edge
 // lifetimes included, and mint core cookies with it, so the origin holds
 // it only when named so. A file of that name is given as ./edge-secret.
@@ -536,7 +536,7 @@ func cookiesOf(keys []edgeGrantKey, c *corsFlags) (*edge.Cookies, error) {
 
 // edgeGrantCookies returns the edge-grant cookies of POST /edge-grants
 // (§C.5): under the -edge-grant-key flags (readEdgeGrantKeys), minting
-// with the last and accepting all, so keys rotate (§C.5 "Format");
+// with the last and accepting all, so keys rotate (§C.5.3);
 // without one, under a random key of this process, named kid, which no
 // edge can verify. It never falls back on the key derived from the edge
 // secret, which every service holding the secret could derive too:

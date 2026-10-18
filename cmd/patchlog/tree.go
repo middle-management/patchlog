@@ -152,7 +152,7 @@ func treeCmd(args []string) {
 		}
 		switch {
 		case topt.EdgeGrants == nil:
-			log.Printf("tree: catalog %s mints no edge grants: /%s/g/{gs} would overlap the core's prefixes (§C.5)", catalogs[0], catalogs[0])
+			log.Printf("tree: catalog %s mints no edge grants: /%s/g/{gs} would overlap the core's prefixes (§C.5.3)", catalogs[0], catalogs[0])
 		case len(edgeGrantKeys) > 0:
 			log.Printf("tree: edge grants: minted under kid %s, accepted under %s", topt.EdgeGrants.Kid(), strings.Join(topt.EdgeGrants.Kids(), ", "))
 		}
@@ -268,7 +268,7 @@ func treeCmd(args []string) {
 }
 
 // serviceEdgeGrantCookies returns the catalog service's own edge-grant
-// cookies (§B.11.5, §C.5 "Format"): under the -edge-grant-key flags,
+// cookies (§B.11.5, §C.5.3): under the -edge-grant-key flags,
 // [KID=]FILE as the origin takes them (readEdgeGrantKeys), a plain FILE
 // named kid (catalog-{catalog} if empty), minting with the last and
 // accepting all, so the service's keys rotate as the origin's do; without
@@ -282,7 +282,7 @@ func treeCmd(args []string) {
 func serviceEdgeGrantCookies(cat, kid string, originKids, keyFlags []string, ev *edge.Verifier, c *corsFlags) (*edge.Cookies, error) {
 	if cat == "r" || cat == "ns" {
 		if kid != "" || len(keyFlags) > 0 {
-			return nil, fmt.Errorf("-edge-grant-key and -edge-grant-kid: catalog %q can't have edge grants, since /%s/g/{gs} would overlap the core's prefixes (§C.5)", cat, cat)
+			return nil, fmt.Errorf("-edge-grant-key and -edge-grant-kid: catalog %q can't have edge grants, since /%s/g/{gs} would overlap the core's prefixes (§C.5.3)", cat, cat)
 		}
 		return nil, nil
 	}
@@ -299,10 +299,10 @@ func serviceEdgeGrantCookies(cat, kid string, originKids, keyFlags []string, ev 
 	derived := ev.CookieKey()
 	for _, k := range keys {
 		if slices.Contains(originKids, k.kid) {
-			return nil, fmt.Errorf("edge-grant kid %q is the origin's (-origin-edge-grant-kid): the service's key is its own, and vouches only for its own prefixes (§C.5)", k.kid)
+			return nil, fmt.Errorf("edge-grant kid %q is the origin's (-origin-edge-grant-kid): the service's key is its own, and vouches only for its own prefixes (§C.5.3)", k.kid)
 		}
 		if derived != nil && bytes.Equal(k.key, derived) {
-			return nil, fmt.Errorf("-edge-grant-key %s: that is the key derived from -edge-secret, which the origin may hold; the service's key is one the origin never holds (§C.5)", k.file)
+			return nil, fmt.Errorf("-edge-grant-key %s: that is the key derived from -edge-secret, which the origin may hold; the service's key is one the origin never holds (§C.5.3)", k.file)
 		}
 	}
 	return cookiesOf(keys, c)

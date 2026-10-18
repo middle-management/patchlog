@@ -577,7 +577,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		return nil, err
 	}
 	if !t.readsNS(base, bcfg, a, true) {
-		return nil, forbidden("branching needs unrestricted read on the base (§C.5)")
+		return nil, forbidden("branching needs unrestricted read on the base (§2.1)")
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
 		return nil, err

@@ -39,8 +39,8 @@ import (
 // prefixes.
 //
 //	POST   /edge-grants              exchange grants for cookies, as the
-//	                                 core's issuance (§C.5)
-//	DELETE /edge-grants?prefix=…     withdraw them (§C.5 "Withdrawing them")
+//	                                 core's issuance (§C.5.2)
+//	DELETE /edge-grants?prefix=…     withdraw them (§C.5.4)
 //
 // A cookie carries only kid, p and exp. A read under one is the subject
 // set's, so the service keeps the subjects behind each gs it minted a
@@ -60,7 +60,7 @@ import (
 // (cdnAll); a purged namespace counts as read whole by every reader only
 // once that long has passed since its purge (trustList).
 
-// maxEdgeGrants is how many grants one exchange takes in its body (§C.5).
+// maxEdgeGrants is how many grants one exchange takes in its body (§C.5.2).
 const maxEdgeGrants = 50
 
 // edgeClockSkew is how far an edge's clock may lag the service's: a
@@ -150,7 +150,7 @@ func (s *Service) edgePrefix(gs string) string { return "/" + s.opt.Catalog + "/
 
 // edgeGS is the subject set of one of the service's prefixes,
 // /{catalog}/g/{gs} with gs AllSubjects or an id: the only prefixes its
-// key vouches for (§C.5 "Format").
+// key vouches for (§C.5.3).
 func (s *Service) edgeGS(p string) (string, bool) {
 	gs, ok := strings.CutPrefix(p, "/"+s.opt.Catalog+"/g/")
 	if !ok {
@@ -183,7 +183,7 @@ func (s *Service) serveEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// issueEdgeGrants is POST /edge-grants (§B.11.5, following §C.5's
+// issueEdgeGrants is POST /edge-grants (§B.11.5, following §C.5.2's
 // issuance): with the grant in Authorization, or 1 to maxEdgeGrants grants
 // as { "grants": [ … ] } in an application/json body (415 otherwise), it
 // answers 200 { prefixes, exp } and one Set-Cookie per prefix. Each grant
@@ -335,7 +335,7 @@ func (s *Service) issueEdgeGrants(w http.ResponseWriter, r *http.Request) {
 	WriteJSON(w, http.StatusOK, map[string]any{"prefixes": prefixes, "exp": first.UTC().Format(time.RFC3339)})
 }
 
-// edgeGrantBearers are the grants an exchange takes (§C.5): those of a
+// edgeGrantBearers are the grants an exchange takes (§C.5.2): those of a
 // body { "grants": [ … ] }, 1 to maxEdgeGrants tokens as they would follow
 // "Bearer ", which takes no Authorization; without a body, the grant in
 // Authorization, if any. The body must be application/json (415
@@ -356,7 +356,7 @@ func edgeGrantBearers(r *http.Request) (bearers []string, status int, msg string
 		}
 		return nil, 0, ""
 	case r.Header.Get("Authorization") != "":
-		return nil, http.StatusBadRequest, "grants in the body take no Authorization (§C.5)"
+		return nil, http.StatusBadRequest, "grants in the body take no Authorization (§C.5.2)"
 	}
 	ct, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";")
 	if !strings.EqualFold(strings.TrimSpace(ct), "application/json") {
@@ -369,20 +369,20 @@ func edgeGrantBearers(r *http.Request) (bearers []string, status int, msg string
 	m, _ := v.(map[string]any)
 	gs, ok := m["grants"].([]any)
 	if !ok || len(m) != 1 || len(gs) < 1 || len(gs) > maxEdgeGrants {
-		return nil, http.StatusBadRequest, fmt.Sprintf("body must be { grants: [ … ] }, 1 to %d grants (§C.5)", maxEdgeGrants)
+		return nil, http.StatusBadRequest, fmt.Sprintf("body must be { grants: [ … ] }, 1 to %d grants (§C.5.2)", maxEdgeGrants)
 	}
 	for _, g := range gs {
 		t, ok := g.(string)
 		if !ok || strings.TrimSpace(t) == "" {
-			return nil, http.StatusBadRequest, "each grant is a string: the token as it would follow \"Bearer \" (§C.5)"
+			return nil, http.StatusBadRequest, "each grant is a string: the token as it would follow \"Bearer \" (§C.5.2)"
 		}
 		bearers = append(bearers, strings.TrimSpace(t))
 	}
 	return bearers, 0, ""
 }
 
-// withdrawEdgeGrants is DELETE /edge-grants?prefix=… (§C.5 "Withdrawing
-// them"): 204 with an expired Set-Cookie of the same name and attributes
+// withdrawEdgeGrants is DELETE /edge-grants?prefix=… (§C.5.4):
+// 204 with an expired Set-Cookie of the same name and attributes
 // for each prefix named, once even if named twice. prefix is its only
 // parameter, repeatable, and each must be one of the service's,
 // /{catalog}/g/{gs} (400 otherwise): the core's DELETE /edge-grants takes
@@ -415,7 +415,7 @@ func (s *Service) withdrawEdgeGrants(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if len(prefixes) == 0 {
-		WriteError(w, http.StatusBadRequest, "bad_input", "prefix is required (§C.5)")
+		WriteError(w, http.StatusBadRequest, "bad_input", "prefix is required (§C.5.4)")
 		return
 	}
 	for _, p := range prefixes {
