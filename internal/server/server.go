@@ -79,6 +79,7 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("GET /ns/{ns}/log", s.nsLive)
 	m.HandleFunc("GET /ns/{ns}/events", s.nsEvents)
 	m.HandleFunc("GET /ns/{ns}/gestures/{gesture}", s.nsGestures)
+	m.HandleFunc("GET /ns/{ns}/principal", s.nsPrincipal)
 	m.HandleFunc("GET /ns/{ns}/grants/{gid}", s.nsGrant)
 	m.HandleFunc("GET "+core.DefaultJWKSPath, s.operatorKeys)
 	m.HandleFunc("GET /ns/{ns}/branches", s.nsBranches)
@@ -1245,6 +1246,27 @@ func (s *Server) nsGestures(w http.ResponseWriter, r *http.Request) {
 		entries[i] = e
 	}
 	writeJSON(w, 200, entries)
+}
+
+// nsPrincipal is GET /ns/{ns}/principal (§7.4): what the grant in
+// Authorization is here, and what a writer needs from the namespace
+// document, with X-Config-Revision. Every answer, errors and the 410 of a
+// purged namespace included, is no-store: the origin answers it with the
+// grant, which no edge cookie covers (§C.5).
+func (s *Server) nsPrincipal(w http.ResponseWriter, r *http.Request) {
+	noStore(w)
+	ns := r.PathValue("ns")
+	if err := validNames(ns, ""); err != nil {
+		writeErr(w, err)
+		return
+	}
+	ans, err := s.e.Principal(r.Context(), ns, creds(r))
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	w.Header().Set("X-Config-Revision", ans.Config)
+	writeJSON(w, 200, ans.Body)
 }
 
 func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {

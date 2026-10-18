@@ -104,6 +104,16 @@ func TestV055LimitGrantFields(t *testing.T) {
 	g = e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": []any{rule}})
 	expect(t, e.write("PATCH", "sec", "x", "", addRoot(map[string]any{}), g), 201)
 
+	// A namespace's own grantSize, below the deployment's.
+	tk := newKey("tk")
+	e.mkNS("tiny", map[string]any{"keys": []any{tk.entry("*")}, "limits": map[string]any{"grantSize": 200}})
+	tg := e.grant(tk, "user:t", []string{"tiny"}, []string{"read"})
+	raw, err := base64.URLEncoding.DecodeString(tg)
+	if err != nil || len(raw) <= 200 {
+		t.Fatalf("grant of %d bytes: %v", len(raw), err)
+	}
+	expectLimit(t, e.get("/ns/tiny/principal", tg), 413, "grantSize", int64(len(raw)), 200)
+
 	gs := int64(core.DefaultMaximums().GrantSize)
 	// Too long to decode: measured is a lower bound, the decoded length.
 	expectLimit(t, e.write("PATCH", "sec", "y", "", addRoot(map[string]any{}), strings.Repeat("A", 12000)), 413, "grantSize", 9000, gs)

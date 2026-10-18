@@ -110,6 +110,9 @@ type Grant struct {
 	symbols []string           // the token's own symbol table, for appending
 	proof   ed25519.PrivateKey // the next secret; nil when sealed or stored
 
+	// size is the bearer's decoded length in bytes (Decode), 0 otherwise.
+	size int
+
 	// chainKey is the root key the signature chain last verified under
 	// (verifyChain): the chain doesn't change, so a grant decoded once
 	// and verified again (core keeps them by token) isn't re-checked.
@@ -330,8 +333,16 @@ func Decode(token string, maxSize int) (*Grant, error) {
 	if maxSize > 0 && len(data) > maxSize {
 		return nil, &TooLargeError{Size: len(data), Max: maxSize}
 	}
-	return decode(data, true)
+	g, err := decode(data, true)
+	if err == nil {
+		g.size = len(data)
+	}
+	return g, err
 }
+
+// Size is a decoded bearer's length in bytes, as grantSize bounds it
+// (§6.6); 0 for a grant that wasn't decoded from a bearer.
+func (g *Grant) Size() int { return g.size }
 
 // ParseStored parses the non-bearer stored form and checks its structure
 // and the chain signatures (not the root signature, which needs the

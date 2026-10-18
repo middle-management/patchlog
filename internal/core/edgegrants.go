@@ -420,6 +420,30 @@ func edgeReadScope(a *actor) ([]string, bool) {
 // literal array. It reports false for any other rule, or a name that
 // isn't valid (§3.6).
 func fixesResource(rv any) ([]string, bool) {
+	lits, ok := resourceLiterals(rv)
+	if !ok {
+		return nil, false
+	}
+	names := []string{}
+	seen := make(map[string]bool, len(lits))
+	for _, l := range lits {
+		name, ok := l.(string)
+		if !ok || !ValidResourceName(name) {
+			return nil, false
+		}
+		if !seen[name] {
+			seen[name] = true
+			names = append(names, name)
+		}
+	}
+	return names, true
+}
+
+// resourceLiterals returns the literals a rule of a fixing form tests
+// /resource against (§2.1): a test with value, or with a schema of only
+// enum, or a compare with eq and a literal, or with in and a literal
+// array. It reports false for a rule of any other form.
+func resourceLiterals(rv any) ([]any, bool) {
 	m, ok := rv.(map[string]any)
 	if !ok || len(m) != 3 || m["path"] != "/resource" {
 		return nil, false
@@ -457,19 +481,7 @@ func fixesResource(rv any) ([]string, bool) {
 	default:
 		return nil, false
 	}
-	names := []string{}
-	seen := make(map[string]bool, len(lits))
-	for _, l := range lits {
-		name, ok := l.(string)
-		if !ok || !ValidResourceName(name) {
-			return nil, false
-		}
-		if !seen[name] {
-			seen[name] = true
-			names = append(names, name)
-		}
-	}
-	return names, true
+	return lits, true
 }
 
 // edgeReader decides a read under an edge grant (§C.5): of its namespace,

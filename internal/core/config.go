@@ -1166,6 +1166,60 @@ func ParseDuration(s string) (time.Duration, error) {
 	return d, nil
 }
 
+// FormatDuration writes d as an ISO 8601 duration that ParseDuration reads
+// back: days, then hours, minutes and seconds, e.g. P30D, PT5M, P1DT12H.
+func FormatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	var b strings.Builder
+	b.WriteString("P")
+	if days := d / (24 * time.Hour); days > 0 {
+		fmt.Fprintf(&b, "%dD", days)
+		d -= days * 24 * time.Hour
+	}
+	if d == 0 {
+		if b.Len() == 1 {
+			return "PT0S"
+		}
+		return b.String()
+	}
+	b.WriteString("T")
+	if h := d / time.Hour; h > 0 {
+		fmt.Fprintf(&b, "%dH", h)
+		d -= h * time.Hour
+	}
+	if m := d / time.Minute; m > 0 {
+		fmt.Fprintf(&b, "%dM", m)
+		d -= m * time.Minute
+	}
+	if d > 0 {
+		b.WriteString(strconv.FormatFloat(d.Seconds(), 'f', -1, 64) + "S")
+	}
+	return b.String()
+}
+
+// Doc is l in the form of a namespace document's "limits" (§6.6): every
+// key of §6.6's table, sizes and counts as integers, durations as ISO 8601
+// durations and rates as { "rate", "burst" }. RetryWindowMin, the
+// deployment's floor, isn't one of them.
+func (l Limits) Doc() map[string]any {
+	out := map[string]any{}
+	for k, f := range limitFields {
+		out[k] = int64(*f(&l))
+	}
+	rate := func(r Rate) map[string]any { return map[string]any{"rate": r.Rate, "burst": r.Burst} }
+	for k, f := range rateFields {
+		out[k] = rate(*f(&l))
+	}
+	out["logPageSize"], out["logPageBytes"], out["branchDepth"] = int64(l.LogPageSize), int64(l.LogPageBytes), int64(l.BranchDepth)
+	out["exchangeRate"] = rate(l.ExchangeRate)
+	out["retryWindow"] = FormatDuration(l.RetryWindow)
+	out["remoteRegistration"] = FormatDuration(l.RemoteRegistration)
+	out["blobGrace"] = FormatDuration(l.BlobGrace)
+	return out
+}
+
 // starKids returns the kids of keys with can ["*"].
 func (c *Config) starKeys() map[string]grant.Key {
 	out := map[string]grant.Key{}
