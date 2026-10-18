@@ -2657,7 +2657,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   Versions the bounds pushed out are remembered as lost: then a save that changes the document is
   a `409`, rather than rebased on what is left, until the reload that `409` asks for; a read before
   it isn't that reload, since another program of the user's may still have the version pushed out
-  open, and its save would be rebased on that read. Within one user, two programs
+  open, and its save would be rebased on that read. So is a login pushed out of the 8 a
+  document keeps as to read it themselves (refused a save of it, or verified as another user,
+  since they last read it) by a ninth: the document is lost, and a reload already due when it
+  was pushed out is due no longer, so another program's read doesn't let its save from before
+  through. Within one user, two programs
   saving the same value, the last wins; two editing from one version, the second save is a `409`
   (above) until it reloads.
 - A PUT answers with the revision as its ETag only when that revision holds exactly what was sent

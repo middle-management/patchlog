@@ -175,7 +175,8 @@ service's listings.
     rclone mount retrying its upload isn't rebased on another program's read), its conditional
     GET answered in full, and those refusals, and any other of that login's before its read (a
     retry whose rebase clashes, a raw file's), ask no reload of the user's other programs, whose
-    records stay; lost records are a `409` until the reload it asks for; a raw file is
+    records stay (a file keeps 8 such logins; one pushed out by a ninth leaves the file's
+    records lost); lost records are a `409` until the reload it asks for; a raw file is
     checked
     against every version the user had, conflicts as a whole when someone else changed its bytes
     since, and sets its reference's members one by one. A JSON patch set over `opsPerSet` or

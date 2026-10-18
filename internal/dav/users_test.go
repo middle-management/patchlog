@@ -1120,6 +1120,63 @@ func TestGatewaySwitchRefusedRoom(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"v": 3, "w": 1})
 }
 
+// A document's tokens to read it themselves (unread) are bounded (8):
+// one pushed out by a ninth leaves the document lost, so its save from
+// before is refused, not rebased on the new user's records (§H.4, §H.7).
+// Here alice's 9 tokens, all verified by alpha, are verified again by
+// docs (a switch each); T1, whose client holds x as read before a third
+// party's edit, switched first, and its save from before is a 409 with 7
+// or 8 switched after it, never written whole over the edit (the new
+// user has no record of x, so the head would be the base). Its reloads
+// then let it save.
+func TestGatewaySwitchMarkPushedOut(t *testing.T) {
+	t.Parallel()
+	for _, others := range []int{7, 8} {
+		t.Run(fmt.Sprintf("others=%d", others), func(t *testing.T) {
+			clk := &testClock{t: time.Now()}
+			e, k := authEnv(t, true, func(o *dav.Options) {
+				o.Namespaces = []string{"alpha", "docs"}
+				o.Now, o.VerifyEvery = clk.now, time.Minute
+			})
+			writer := []string{"read", "create", "append", "restore", "delete", "config"}
+			op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+			must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+			var toks []string
+			for i := 0; i <= others; i++ {
+				toks = append(toks, k.Grant(t, e.s.Now().Add(time.Duration(i)*time.Second), "user:alice", []string{"alpha", "docs"}, writer))
+			}
+			e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+			buf := e.expect(e.doAs(toks[0], "GET", "/docs/x.json", ""), 200, "T1's GET, verified by alpha").body
+			for i, tok := range toks[1:] {
+				e.expect(e.doAs(tok, "PROPFIND", "/docs/", "", "Depth", "1"), 207, fmt.Sprintf("T%d, verified by alpha", i+2))
+			}
+			h, _ := e.load("docs", "x")
+			must(e.c.Append(e.ctx, "docs", "x", h.ID, []any{replace("/w", 2)}))
+			ac := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"alpha"}, writer)))
+			nh := must(ac.NSHead(e.ctx, "alpha"))
+			must(ac.PatchConfig(e.ctx, "alpha", nh.Config, []any{map[string]any{"op": "replace", "path": "/keys", "value": []any{clienttest.NewKey("k2").Entry("*")}}}))
+			clk.add(2 * time.Minute)
+			for i, tok := range toks {
+				e.expect(e.doAs(tok, "PROPFIND", "/docs/", "", "Depth", "1"), 207, fmt.Sprintf("T%d, verified again by docs (a switch)", i+1))
+			}
+			e.expect(e.doAs(toks[0], "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 409, "T1's save from before the switch")
+			_, doc := e.load("docs", "x")
+			sameJSON(t, doc, map[string]any{"v": 1, "w": 2})
+			saved := false
+			for try := 0; try < 3 && !saved; try++ {
+				buf = e.expect(e.doAs(toks[0], "GET", "/docs/x.json", ""), 200, "T1 reloads").body
+				r := e.doAs(toks[0], "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1))
+				saved = r.status == 201
+			}
+			if !saved {
+				t.Fatal("T1's save after three reloads is still refused")
+			}
+			_, doc = e.load("docs", "x")
+			sameJSON(t, doc, map[string]any{"v": 2, "w": 2})
+		})
+	}
+}
+
 // The record of where a person's grants verify (kidNS, by kid and sub)
 // keeps every served namespace that accepted one, the first never pushed
 // out by later ones (§H.7 "a reminted token is the same person"): four

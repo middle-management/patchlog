@@ -71,7 +71,7 @@ type docRecs struct {
 	// themselves before they save it without a base, at most maxUnread
 	// (refusedSave): one whose save of it was refused, or one verified
 	// as this user having been another (loseRecords), that hasn't read
-	// it since.
+	// it since. One pushed out makes the document lost (addUnread).
 	unread []string
 }
 
@@ -172,7 +172,7 @@ func (s *Server) loseRecords(from string, to *principal, by string) {
 			_, d.lost = dst.forgotten.Get(k)
 			dst.forgotten.Remove(k)
 		}
-		d.unread = withUnread(d.unread, by)
+		d.addUnread(by)
 		dst.docs.Put(k, d, d.cost())
 	}
 	dst.used = s.opt.Now()
@@ -395,26 +395,35 @@ func (s *Server) refuse(p *principal, ns, name, by string) {
 	} else if slices.Contains(d.unread, by) {
 		return
 	}
-	s.recSeq++
-	d.reload = s.recSeq
-	d.unread = withUnread(d.unread, by)
+	if !d.addUnread(by) {
+		s.recSeq++
+		d.reload = s.recSeq
+	}
 	before := st.docs.Bytes()
 	st.docs.Put(k, d, d.cost())
 	s.recBytes += st.docs.Bytes() - before
 	s.trimRecordsLocked()
 }
 
-// withUnread returns unread with token by in it, the newest, at most
-// maxUnread, the oldest going first.
-func withUnread(unread []string, by string) []string {
-	if slices.Contains(unread, by) {
-		return unread
+// addUnread adds token by to d's unread, the newest, at most maxUnread,
+// and reports whether that pushed the oldest out. The token pushed out
+// may still hold a version from before its refusal or its switch, which
+// a save rebased on the user's records would write over others' edits,
+// so the document is then lost, as when the bounds drop records: a save
+// that changes it is refused until the reload that refusal asks for. Not
+// a reload already due (which is undone): another program's read, the
+// next one, would be that reload, and let the token's save through.
+func (d *docRecs) addUnread(by string) bool {
+	if slices.Contains(d.unread, by) {
+		return false
 	}
-	unread = append(slices.Clip(unread), by)
-	if len(unread) > maxUnread {
-		unread = unread[1:]
+	d.unread = append(slices.Clip(d.unread), by)
+	if len(d.unread) <= maxUnread {
+		return false
 	}
-	return unread
+	d.unread = d.unread[1:]
+	d.lost, d.reload = true, 0
+	return true
 }
 
 // readBy notes that token by of p's read ns/name whole (served), or found

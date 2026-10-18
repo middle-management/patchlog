@@ -144,3 +144,45 @@ func TestLoseRecordsBounds(t *testing.T) {
 		t.Errorf("a document from never recorded: %+v", d)
 	}
 }
+
+// A token pushed out of a document's unread (maxUnread) by a refusal or
+// a switch leaves the document lost, and a reload already due when it is
+// pushed out is undone: otherwise the next read, another program's, would
+// be that reload, clear the lost mark and let the token's save from
+// before through, rebased on that read.
+func TestUnreadPushedOutLost(t *testing.T) {
+	c, err := client.New("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{Client: c, Namespaces: []string{"docs"}, Gateway: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	from := s.newPrincipal("from")
+	s.remember(from, "docs", "x", record{rev: "r0"}, true)
+	for _, how := range []string{"refused", "switched"} {
+		p := s.newPrincipal(how)
+		s.remember(p, "docs", "x", record{rev: "r1"}, true)
+		s.refuse(p, "docs", "x", "t0")
+		for i := 1; i < maxUnread; i++ {
+			s.refuse(p, "docs", "x", fmt.Sprintf("t%d", i))
+		}
+		if d := s.recordsOf(p, "docs", "x"); d.lost || d.reload == 0 || len(d.unread) != maxUnread {
+			t.Fatalf("%s: %d tokens refused: %+v", how, maxUnread, d)
+		}
+		if how == "refused" {
+			s.refuse(p, "docs", "x", "t8")
+		} else {
+			s.loseRecords(from.id, p, "t8")
+		}
+		d := s.recordsOf(p, "docs", "x")
+		if !d.lost || d.reload != 0 || slices.Contains(d.unread, "t0") || !slices.Contains(d.unread, "t8") {
+			t.Fatalf("%s: t0 pushed out by t8: %+v", how, d)
+		}
+		s.remember(p, "docs", "x", record{rev: "r2"}, true)
+		if d := s.recordsOf(p, "docs", "x"); !d.lost {
+			t.Errorf("%s: the next read, another program's, cleared the lost mark: %+v", how, d)
+		}
+	}
+}
