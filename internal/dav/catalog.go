@@ -28,10 +28,12 @@ import (
 // New items are created in files.ns, with opaque names. The tree is built
 // from the catalog namespace's documents as the core has them
 // (tree.BuildGraph), kept per principal for CatalogTTL or until this
-// server writes; the catalog's access ($access, §B.11) and the tree
-// service aren't consulted. catalog.mode "tree" is assumed: a node with
-// several parents (a DAG) shows under each, and is unlinked from one at a
-// time.
+// server writes; with a tree service (Options.TreeService, treesvc.go)
+// folders are listed, and paths resolved, from its listings instead
+// (§H.3), and writes still read the documents. The catalog's access
+// ($access, §B.11) is the tree service's to apply, never this server's.
+// catalog.mode "tree" is assumed: a node with several parents (a DAG)
+// shows under each, and is unlinked from one at a time.
 
 const kindFolder = tree.KindFolder
 
@@ -105,23 +107,18 @@ func (st *reqState) readGraph(ctx context.Context, cat string) (*catGraph, error
 // it has none (notTree): a catalog.files its namespace document lacks, or
 // a files.root that isn't a live folder.
 func (st *reqState) tree(ctx context.Context, cat string) (*catGraph, *treeFiles, error) {
-	in, err := st.s.nsInfoErr(ctx, st.p, cat)
-	switch {
-	case err != nil:
+	c, err := st.treeConf(ctx, cat)
+	if err != nil {
 		return nil, nil, err
-	case in.files == nil && in.readErr != nil:
-		return nil, nil, upstream(in.readErr)
-	case in.files == nil:
-		return nil, nil, notTree(cat, in.notTree)
 	}
 	cg, err := st.graph(ctx, cat)
 	if err != nil {
 		return nil, nil, err
 	}
-	if n := cg.g.Node(in.files.root); n == nil || n.Kind != kindFolder || n.Cyclic {
-		return nil, nil, fail(http.StatusNotFound, "catalog %s's files.root, %s, isn't a live folder node of it, so its file tree has no top level to show (§H.2)", cat, in.files.root)
+	if n := cg.g.Node(c.files.root); n == nil || n.Kind != kindFolder || n.Cyclic {
+		return nil, nil, fail(http.StatusNotFound, "catalog %s's files.root, %s, isn't a live folder node of it, so its file tree has no top level to show (§H.2)", cat, c.files.root)
 	}
-	return cg, in.files, nil
+	return cg, c.files, nil
 }
 
 // notTree is the answer for catalog cat, which isn't a file tree (why).
@@ -136,7 +133,8 @@ func notTree(cat, why string) error {
 // namespace document, read with the server's grant in local mode, or
 // without a grant in a gateway, has no usable catalog.files (§H.2).
 // Catalogs whose document can't be read so are left to the requests that
-// open them, which answer why (404).
+// open them, which answer why (404). What it reads is kept for grants
+// that list through a tree service and can't read it (treeConf).
 func (s *Server) Check(ctx context.Context) error {
 	p := s.local
 	if p == nil {
@@ -154,6 +152,9 @@ func (s *Server) Check(ctx context.Context) error {
 			s.opt.Logf("dav: catalog %s: its namespace document couldn't be read at start (%v); it is checked when opened", cat, err)
 		case in.files == nil && in.notTree != "":
 			return fmt.Errorf("dav: -catalog %s: %s", cat, in.notTree)
+		case in.files != nil:
+			// For grants that can't read it (treeConf).
+			s.learn(cat, &catConf{files: in.files, trust: in.trust, titled: in.titled})
 		}
 	}
 	return nil
@@ -224,13 +225,22 @@ func folderName(s string) bool { return client.ValidResourceName(s) && !strings.
 
 // treeEntry is a child of a folder as the tree shows it (§H.2): a folder
 // node, or a placement whose item is live and offered, by its name there,
-// with its item's head.
+// with its item's head, and, listed by a tree service, its file's
+// metadata and time (§H.3), if it gave them.
 type treeEntry struct {
 	name string
 	node *tree.Node
 	item *client.Head
 	// escaped: its title breaks the rules, and is shown escaped (shown)
-	escaped bool
+	escaped  bool
+	meta     *fileMeta
+	modified time.Time
+}
+
+// newTreeEntry is node n's entry, with its item's head, by the name it is
+// shown by before duplicates are numbered (nameDir).
+func newTreeEntry(n *tree.Node, item *client.Head) treeEntry {
+	return treeEntry{name: nodeName(n), node: n, item: item, escaped: n.Title != "" && shown(n.Title) != n.Title}
 }
 
 // treeDir is a folder's children as the tree shows them, by name and by
@@ -254,23 +264,61 @@ func (d *treeDir) find(s *Server, name string) (*treeEntry, bool) {
 	return nil, false
 }
 
-// treeDir returns folder's children as the tree shows them (§H.2), once
-// per request: folders, and placements whose items are live, offered
-// (§H.7) and readable with the principal's grant (§B.11.5: nothing hidden
-// from it shows), each by its title, shown escaped if another tool wrote
-// one that breaks the rules (shown), a placement without one by its
-// item's name and a folder by its node's. Siblings whose names compare
-// equal (nameKey), as a race leaves them, are shown as name (2).ext,
-// name (3).ext, … in order of their nodes' creation (born, then name),
-// the first keeping its name, skipping numbers whose names a sibling has;
-// a title shown escaped comes after those that aren't, so it never takes
-// the name of a real one.
-func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*treeDir, error) {
-	k := cg.cat + "/" + folder
+// treeDir returns folder's children in catalog cat as the tree shows
+// them (§H.2), once per request: listed by the catalog's tree service
+// (serviceDir, §H.3), else from its node documents (nodeDir), and named
+// alike whichever lists them (nameDir).
+func (st *reqState) treeDir(ctx context.Context, cat, folder string) (*treeDir, error) {
+	k := cat + "/" + folder
 	if d := st.dirs[k]; d != nil {
 		return d, nil
 	}
-	kids := cg.children(folder)
+	c, err := st.treeConf(ctx, cat)
+	if err != nil {
+		return nil, err
+	}
+	var d *treeDir
+	if st.s.viaService(cat, c) {
+		d, err = st.serviceDir(ctx, cat, folder, c)
+	} else {
+		d, err = st.nodeDir(ctx, cat, folder)
+	}
+	if err != nil {
+		return nil, err
+	}
+	if st.dirs == nil {
+		st.dirs = map[string]*treeDir{}
+	}
+	st.dirs[k] = d
+	return d, nil
+}
+
+// nodeDir lists folder's children in catalog cat from its node documents
+// (graph): folders, and placements whose items are live, offered (§H.7)
+// and readable with the principal's grant (§B.11.5: nothing hidden from
+// it shows). Where the catalog has a tree service, a placement of a
+// namespace the catalog doesn't trust is left out too, as dangling
+// (§B.5), as the tree service leaves it out: either lists a folder alike.
+func (st *reqState) nodeDir(ctx context.Context, cat, folder string) (*treeDir, error) {
+	cg, _, err := st.tree(ctx, cat)
+	if err != nil {
+		return nil, err
+	}
+	var trust []string
+	viaTree := st.s.treeURL(cat) != ""
+	if viaTree {
+		c, err := st.treeConf(ctx, cat)
+		if err != nil {
+			return nil, err
+		}
+		trust = c.trust
+	}
+	var kids []*tree.Node
+	for _, n := range cg.children(folder) {
+		if n.Kind == kindFolder || !viaTree || slices.Contains(trust, n.ItemNS) {
+			kids = append(kids, n)
+		}
+	}
 	sealed := map[string]bool{}
 	for _, n := range kids {
 		if _, ok := sealed[n.ItemNS]; n.Kind != kindFolder && !ok {
@@ -299,16 +347,30 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 	if err := g.Wait(); err != nil {
 		return nil, err
 	}
-	d := &treeDir{byName: map[string]int{}, byKey: map[string]int{}}
+	var entries []treeEntry
 	for i, n := range kids {
 		if n.Kind != kindFolder && heads[i] == nil {
 			continue
 		}
-		d.entries = append(d.entries, treeEntry{name: nodeName(n), node: n, item: heads[i], escaped: n.Title != "" && shown(n.Title) != n.Title})
+		entries = append(entries, newTreeEntry(n, heads[i]))
 	}
+	return st.s.nameDir(entries, func(node string) time.Time { return cg.born(ctx, st.p, node) }), nil
+}
+
+// nameDir names a folder's children, entries (newTreeEntry), as the tree
+// shows them (§H.2): each by its title, shown escaped if another tool
+// wrote one that breaks the rules (shown), a placement without one by its
+// item's name and a folder by its node's. Siblings whose names compare
+// equal (nameKey), as a race leaves them, are shown as name (2).ext,
+// name (3).ext, … in order of their nodes' creation (born, then name),
+// the first keeping its name, skipping numbers whose names a sibling has;
+// a title shown escaped comes after those that aren't, so it never takes
+// the name of a real one.
+func (s *Server) nameDir(entries []treeEntry, born func(node string) time.Time) *treeDir {
+	d := &treeDir{entries: entries, byName: map[string]int{}, byKey: map[string]int{}}
 	groups := map[string][]int{}
 	for i, e := range d.entries {
-		k := st.s.nameKey(e.name)
+		k := s.nameKey(e.name)
 		groups[k] = append(groups[k], i)
 	}
 	taken := map[string]bool{}
@@ -322,9 +384,9 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 	sort.Strings(dups)
 	for _, k := range dups {
 		is := groups[k]
-		born := map[int]time.Time{}
+		at := map[int]time.Time{}
 		for _, i := range is {
-			born[i] = cg.born(ctx, st.p, d.entries[i].node.Name)
+			at[i] = born(d.entries[i].node.Name)
 		}
 		sort.SliceStable(is, func(a, b int) bool {
 			if ea, eb := d.entries[is[a]].escaped, d.entries[is[b]].escaped; ea != eb {
@@ -332,7 +394,7 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 				// is so (§H.2 "Titles").
 				return eb
 			}
-			ta, tb := born[is[a]], born[is[b]]
+			ta, tb := at[is[a]], at[is[b]]
 			if ta.IsZero() != tb.IsZero() {
 				return !ta.IsZero()
 			}
@@ -343,19 +405,15 @@ func (st *reqState) treeDir(ctx context.Context, cg *catGraph, folder string) (*
 		})
 		for _, i := range is[1:] {
 			e := &d.entries[i]
-			e.name = dupName(e.name, e.node.Kind == kindFolder, func(s string) bool { return taken[st.s.nameKey(s)] })
-			taken[st.s.nameKey(e.name)] = true
+			e.name = dupName(e.name, e.node.Kind == kindFolder, func(n string) bool { return taken[s.nameKey(n)] })
+			taken[s.nameKey(e.name)] = true
 		}
 	}
 	for i, e := range d.entries {
 		d.byName[e.name] = i
-		d.byKey[st.s.nameKey(e.name)] = i
+		d.byKey[s.nameKey(e.name)] = i
 	}
-	if st.dirs == nil {
-		st.dirs = map[string]*treeDir{}
-	}
-	st.dirs[k] = d
-	return d, nil
+	return d
 }
 
 // nodeName is the name node n is shown by before duplicates are
@@ -398,17 +456,28 @@ func (st *reqState) childFolder(cg *catGraph, folder, seg string) *tree.Node {
 // whatever it looks like), or a new node a title can name, or a name no
 // file or folder can have (titleWhy).
 func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string) (target, error) {
-	cg, f, err := st.tree(ctx, t.ns)
+	c, err := st.treeConf(ctx, t.ns)
 	if err != nil {
 		return t, err
 	}
-	folder := f.root
-	for _, seg := range segs[:len(segs)-1] {
-		if n := st.childFolder(cg, folder, seg); n != nil {
-			folder = n.Name
-			continue
+	var cg *catGraph
+	if !st.s.viaService(t.ns, c) {
+		// The node documents: a path's folders above need none of their
+		// items read (childFolder). Through a tree service each folder is
+		// listed, so what a path names is what its folder lists.
+		if cg, _, err = st.tree(ctx, t.ns); err != nil {
+			return t, err
 		}
-		d, err := st.treeDir(ctx, cg, folder)
+	}
+	folder := c.files.root
+	for _, seg := range segs[:len(segs)-1] {
+		if cg != nil {
+			if n := st.childFolder(cg, folder, seg); n != nil {
+				folder = n.Name
+				continue
+			}
+		}
+		d, err := st.treeDir(ctx, t.ns, folder)
 		if err != nil {
 			return t, err
 		}
@@ -421,7 +490,7 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 	}
 	last := segs[len(segs)-1]
 	t.parent = folder
-	d, err := st.treeDir(ctx, cg, folder)
+	d, err := st.treeDir(ctx, t.ns, folder)
 	if err != nil {
 		return t, err
 	}
@@ -842,7 +911,7 @@ func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 	if n := cg.g.Node(t.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
 		return st.editParents(ctx, t.ns, t.node, t.parent, "", "")
 	}
-	d, err := st.treeDir(ctx, cg, t.node)
+	d, err := st.treeDir(ctx, t.ns, t.node)
 	if err != nil {
 		return err
 	}

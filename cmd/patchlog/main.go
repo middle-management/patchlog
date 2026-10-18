@@ -114,7 +114,7 @@ func usage() {
   patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false] [-purge-url URL]... [-edge-secret FILE]
   patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-access -key SEED -kid KID [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-origin-edge-grant-kid KID[,KID]]... [-exchange-rate RATE,BURST]]
                 [-bearer T] [-author A] [-self-placing] [-purge-url URL]... [-edge-secret FILE]
-  patchlog dav -api URL -ns NS[,NS…] [-catalog NS[,NS…]] [-addr 127.0.0.1:8090] [-bearer GRANT | -bearer-file FILE] [-author A] [-password-file FILE]
+  patchlog dav -api URL -ns NS[,NS…] [-catalog NS[,NS…] [-tree-url [CATALOG=]URL]...] [-addr 127.0.0.1:8090] [-bearer GRANT | -bearer-file FILE] [-author A] [-password-file FILE]
                [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]   (WebDAV, a prototype)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]

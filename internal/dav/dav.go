@@ -69,6 +69,20 @@ type Options struct {
 	// Catalogs are the catalog namespaces served as file trees (§H.2),
 	// each with catalog.files in its namespace document.
 	Catalogs []string
+	// TreeService is the base URL of the tree service (§B.5) following
+	// the catalogs served, such as http://tree:8082, and TreeServices
+	// that of a catalog with its own, by catalog. A tree's folder is then
+	// listed from the tree service's children listing, read with the
+	// principal's grant, which the tree service filters by (§H.3, §H.7,
+	// §B.11.5), with the file metadata it adds; without one, from the
+	// catalog's node documents read from the core, the fallback for
+	// deployments without a tree service (treesvc.go).
+	TreeService  string
+	TreeServices map[string]string
+	// TreeWait bounds how long a listing waits for the tree service to
+	// reach the principal's own writes through this server (?min=, §B.5),
+	// before the folder is listed from the node documents (default 3s).
+	TreeWait time.Duration
 	// CaseSensitive compares the names of a tree's siblings after NFC
 	// only; by default they are compared after Unicode case folding too
 	// (§H.2 "Siblings"), as the file systems of macOS and Windows, whose
@@ -196,6 +210,7 @@ type Server struct {
 	inflight *semaphore.Weighted
 	heavy    chan struct{} // requests with a body over heavyBody being handled
 	gen      atomic.Uint64 // writes through this server: catalog reads older are stale
+	ts       treeShared    // the tree service's client, and the catalogs' settings
 }
 
 // New returns a server for opt.
@@ -237,6 +252,7 @@ func New(opt Options) (*Server, error) {
 	defDur(&opt.VerifyEvery, 5*time.Minute)
 	defDur(&opt.CatalogTTL, 5*time.Second)
 	defDur(&opt.MaxRetryWait, 2*time.Second)
+	defDur(&opt.TreeWait, 3*time.Second)
 	if opt.Realm == "" {
 		opt.Realm = "patchlog"
 	}
@@ -270,6 +286,10 @@ func New(opt Options) (*Server, error) {
 		s.cats[ns] = true
 	}
 	s.fs = &davFS{s: s}
+	if err := s.ts.init(&s.opt); err != nil {
+		return nil, err
+	}
+	opt.Client = s.opt.Client
 	if opt.Gateway {
 		s.anon = opt.Client.With(client.WithBearer(""))
 		s.checker = grantcheck.New(s.anon, grantcheck.WithClock(opt.Now))
@@ -1079,6 +1099,7 @@ type principal struct {
 	guards  map[string][]guard    // by document path: its refused saves' guards, oldest first
 	nguards int
 	own     lru.Cache[string, bool] // by ns/name@id: the tombstones and restores it wrote
+	ts      treeSvc                 // its writes listings wait for, and its folders' listings
 }
 
 // maxOwn bounds the tombstones and restores a principal remembers having

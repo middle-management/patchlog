@@ -129,8 +129,8 @@ func (st *reqState) resolveName(ctx context.Context, name string) (target, error
 		t.kind = kNSDir
 	case len(segs) == 1 && st.s.cats[t.ns]:
 		t.kind = kCatDir
-		if f := st.s.nsInfo(ctx, st.p, t.ns).files; f != nil {
-			t.node = f.root
+		if c, err := st.treeConf(ctx, t.ns); err == nil {
+			t.node = c.files.root
 		}
 	case len(segs) == 1:
 		t = st.scratchAt(t, true)
@@ -504,7 +504,8 @@ type listing struct {
 // by its name, any other as {name}.json, and one whose name a raw one has
 // as {name} (2).json. A tree's folder lists its children by their names
 // there (treeDir). Each revision's document is read once for its file's
-// size and type (Server.metas).
+// size and type (Server.metas), but where a tree service listed them
+// (§H.3).
 func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 	if l := st.lists[t.path]; l != nil {
 		return l, nil
@@ -551,23 +552,26 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 			add(st.docInfo(name, hd))
 		}
 	case kCatDir, kFolder:
-		cg, _, err := st.tree(ctx, t.ns)
-		if err != nil {
-			return nil, err
-		}
-		d, err := st.treeDir(ctx, cg, t.node)
+		d, err := st.treeDir(ctx, t.ns, t.node)
 		if err != nil {
 			return nil, err
 		}
 		var files []headDoc
 		byRes := map[string]string{}
 		for _, e := range d.entries {
-			if e.node.Kind == kindFolder {
+			switch {
+			case e.node.Kind == kindFolder:
 				add(st.dirInfo(e.name))
-				continue
+			case e.meta != nil:
+				// The file metadata the tree service listed (§H.3): no
+				// item is read.
+				hd := headDoc{ns: e.node.ItemNS, name: e.node.ItemName, rev: e.item.ID, created: e.modified, m: *e.meta, listed: true}
+				l.docs[e.name] = hd
+				add(st.docInfo(e.name, hd))
+			default:
+				files = append(files, headDoc{ns: e.node.ItemNS, name: e.node.ItemName, rev: e.item.ID})
+				byRes[e.node.ItemNS+"/"+e.node.ItemName] = e.name
 			}
-			files = append(files, headDoc{ns: e.node.ItemNS, name: e.node.ItemName, rev: e.item.ID})
-			byRes[e.node.ItemNS+"/"+e.node.ItemName] = e.name
 		}
 		// fetchHeads leaves out what it can't read, so names pair up by
 		// resource (an item is placed once per catalog, §B.2).
@@ -613,14 +617,18 @@ func (st *reqState) head(ctx context.Context, ns, name string) (*client.Head, er
 }
 
 // docAt returns the live document a document path names, from the
-// directory's listing if the request read it, else from its head: for a
+// directory's listing if the request read it (a PROPFIND, for a file a
+// tree service listed), else from its head: for a
 // flat namespace's file, only a document of its kind (a JSON document's
 // file names no raw one, nor a raw file a JSON one), and never a sealed
 // one, which isn't offered (§H.7).
 func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) {
 	if l := st.lists[t.dir]; l != nil {
-		hd, ok := l.docs[t.shownAs()]
-		return hd, ok, nil
+		// A file the tree service listed (§H.3) is shown from its listing,
+		// as a PROPFIND opens it; anything else reads its document.
+		if hd, ok := l.docs[t.shownAs()]; !ok || !hd.listed || st.method == "PROPFIND" {
+			return hd, ok, nil
+		}
 	}
 	if t.kind == kPlacement && st.s.nsInfo(ctx, st.p, t.docNS).sealed {
 		return headDoc{}, false, nil
