@@ -61,6 +61,8 @@ func New(e *core.Engine, opts ...Option) *Server {
 	m.HandleFunc("DELETE /r/{ns}/{name}", s.resourceDelete)
 	m.HandleFunc("GET /r/{ns}/{name}/rev/{id}", s.resourceRev)
 	m.HandleFunc("GET /r/{ns}/{name}/rev/{id}/log", s.resourceRevLog)
+	m.HandleFunc("GET /r/{ns}/{name}/raw", s.resourceRaw)
+	m.HandleFunc("GET /r/{ns}/{name}/rev/{id}/raw", s.resourceRaw)
 	m.HandleFunc("GET /r/{ns}/{name}/log", s.resourceLive)
 	m.HandleFunc("GET /r/{ns}/{name}/events", s.resourceEvents)
 	m.HandleFunc("POST /r/{ns}/{name}/purge", s.resourcePurge)
@@ -509,6 +511,20 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if h.State == core.Live {
+		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
+		w.Header().Set("ETag", quote(h.Head))
+		w.Header().Set("Location", "/r/"+ns+"/"+name+"/rev/"+h.Head)
+		w.WriteHeader(302)
+		return
+	}
+	s.headGone(w, r, ns, name, h)
+}
+
+// headGone answers a head pointer that isn't live (§7.1): never existed
+// (short), purged (long), or tombstoned, with successor where the engine
+// read one (§8.1: a moved resource, outside sealed and e2e namespaces).
+func (s *Server) headGone(w http.ResponseWriter, r *http.Request, ns, name string, h *core.Head) {
 	switch h.State {
 	case core.NotFound:
 		s.cache(w, r, ccShort, h.Public)
@@ -517,8 +533,6 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 		s.cache(w, r, ccLong, h.Public)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	case core.Tombstoned:
-		// With successor where the engine read one (§8.1): a moved
-		// resource, outside sealed and e2e namespaces.
 		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
 		w.Header().Set("ETag", quote(h.Head))
 		body := map[string]any{"code": "gone", "tombstone": h.Head, "last": h.Last}
@@ -526,12 +540,68 @@ func (s *Server) resourceHead(w http.ResponseWriter, r *http.Request) {
 			body["successor"] = h.Successor
 		}
 		writeJSON(w, 410, body)
-	default:
-		s.cache(w, r, ccHead, h.Public, resTags(ns, name)...)
-		w.Header().Set("ETag", quote(h.Head))
-		w.Header().Set("Location", "/r/"+ns+"/"+name+"/rev/"+h.Head)
-		w.WriteHeader(302)
 	}
+}
+
+// resourceRaw is GET /r/{ns}/{name}/raw and …/rev/{id}/raw (§7.1, §7.8):
+// for a raw document, a 302 to the blob its root references, so a file
+// stored as a blob has a URL of its own; a document that isn't raw is 404
+// not_found. Both are cached as the document URL they stand for, a head
+// pointer or immutable, with its tags, as is a sealed or e2e namespace's
+// 404 not_offered (a level is never lowered). Every other answer is the
+// document URL's: an unknown id or head, a purge, a prune, a tombstone id
+// and a tombstoned head (with successor, §8.1). The Location is the
+// serving namespace's, so a branch reads its base's blob through.
+func (s *Server) resourceRaw(w http.ResponseWriter, r *http.Request) {
+	ns, name, id := r.PathValue("ns"), r.PathValue("name"), r.PathValue("id")
+	if err := validNames(ns, name); err != nil {
+		writeErr(w, err)
+		return
+	}
+	class := ccHead
+	if id != "" {
+		class = ccImmutable
+	}
+	raw, err := s.e.ResourceRaw(r.Context(), ns, name, id, creds(r))
+	if err != nil {
+		var ae *core.Error
+		if errors.As(err, &ae) && ae.Status == 404 && ae.Body["code"] == "not_offered" && ae.Public != nil {
+			s.cache(w, r, class, *ae.Public, resTags(ns, name)...)
+			writeJSON(w, 404, ae.Body)
+			return
+		}
+		if s.writeErrShort(w, r, err) {
+			return
+		}
+		writeErr(w, err)
+		return
+	}
+	if raw.Rev == nil {
+		s.headGone(w, r, ns, name, raw.Head)
+		return
+	}
+	if raw.Rev.Status != 200 {
+		// The head moved on, or the document went, since it was read.
+		rid := id
+		if rid == "" {
+			rid = raw.Head.Head
+		}
+		s.revGone(w, r, ns, name, rid, raw.Rev)
+		return
+	}
+	s.cache(w, r, class, raw.Rev.Public, resTags(ns, name)...)
+	if id == "" {
+		w.Header().Set("ETag", quote(raw.Head.Head))
+	} else {
+		w.Header().Set("ETag", quote(id))
+		w.Header().Set("X-Revision", id)
+	}
+	if raw.Blob == "" {
+		writeJSON(w, 404, map[string]any{"code": "not_found", "message": "not a raw document (§7.8)"})
+		return
+	}
+	w.Header().Set("Location", "/r/"+ns+"/"+name+"/blob/"+raw.Blob)
+	w.WriteHeader(302)
 }
 
 func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
@@ -611,6 +681,16 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodHead {
 			w.Write(body)
 		}
+	default:
+		s.revGone(w, r, ns, name, id, rev)
+	}
+}
+
+// revGone answers a revision URL without a document (§7.1): an unknown
+// id (short), a pruned revision, a tombstone id (immutable) or a purge
+// (long).
+func (s *Server) revGone(w http.ResponseWriter, r *http.Request, ns, name, id string, rev *core.Rev) {
+	switch {
 	case rev.Status == 404:
 		s.cache(w, r, ccShort, rev.Public)
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
@@ -938,7 +1018,18 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(201)
 }
 
+// blobHeaders sets what every blob response carries, errors and the
+// sealed 302 included (§7.8 Reading): writers choose a blob's type and its
+// URL is on the API's origin, so browsers must neither sniff another type
+// nor run script from one. sandbox alone, not the services' default-src
+// 'none', so images and PDFs still display inline.
+func blobHeaders(w http.ResponseWriter) {
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+}
+
 func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
+	blobHeaders(w)
 	ns, name, bid := r.PathValue("ns"), r.PathValue("name"), r.PathValue("bid")
 	if err := validNames(ns, name); err != nil {
 		writeErr(w, err)
@@ -967,6 +1058,7 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 // blobEpochGet serves a blob of a sealed namespace sealed under an epoch
 // (§E.2.2).
 func (s *Server) blobEpochGet(w http.ResponseWriter, r *http.Request) {
+	blobHeaders(w)
 	ns, name, bid, ep := r.PathValue("ns"), r.PathValue("name"), r.PathValue("bid"), r.PathValue("e")
 	if err := validNames(ns, name); err != nil {
 		writeErr(w, err)

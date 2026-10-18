@@ -247,13 +247,19 @@ func hasBlobMember(v any) bool {
 	return false
 }
 
+// checkBlobRef checks one reference: { "$blob", "type", "size", "nonce"? }
+// and no other members (§7.8). At the document's root, a raw document's,
+// the top-level members validation leaves out ($schema, a fresh $nonce, a
+// well-formed $successor, §6.2 step 5) aren't part of the reference; a
+// $nonce or $successor of another form is, and is refused.
 func checkBlobRef(m map[string]any, id, ptr string) *Error {
 	if _, err := ids.Parse(id); err != nil {
 		return blobErr(ptr, "$blob must be a blob id")
 	}
-	for k := range m {
-		switch k {
-		case "$blob", "type", "size", "nonce":
+	for k, v := range m {
+		switch {
+		case k == "$blob", k == "type", k == "size", k == "nonce":
+		case ptr == "" && schema.LeftOut(k, v):
 		default:
 			return blobErr(ptr, fmt.Sprintf("a blob reference has no member %q", k))
 		}
