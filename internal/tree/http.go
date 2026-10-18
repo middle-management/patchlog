@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -1173,16 +1172,12 @@ func (s *Service) awaitMins(ctx context.Context, vals []string, token string) (s
 	if err != nil {
 		return http.StatusBadRequest, "bad_input", err.Error()
 	}
-	followed := map[string]bool{}
-	for _, ns := range s.followed() {
-		followed[ns] = true
-	}
 	var own []minRef
 	other := map[*Service][]minRef{}
 	for _, m := range mins {
 		// A preview's readers write to the branches, so min names them.
 		m.ns = s.logical(m.ns)
-		if m.ns == "" || followed[m.ns] {
+		if m.ns == "" || s.follows(m.ns) {
 			own = append(own, m)
 			continue
 		}
@@ -1216,11 +1211,22 @@ func (s *Service) awaitMins(ctx context.Context, vals []string, token string) (s
 // follows ns, if any.
 func (s *Service) sibling(ns string) *Service {
 	for _, o := range s.siblings {
-		if slices.Contains(o.followed(), ns) {
+		if o.follows(ns) {
 			return o
 		}
 	}
 	return nil
+}
+
+// follows reports whether the service follows ns for a min (§A.5): the
+// catalog, or a namespace it trusts and can follow. A min naming one it
+// can't (unfollowed: refused or absent at the core, skipped for its keys)
+// would wait for a checkpoint that doesn't come; it is the 400 for a
+// namespace the service doesn't follow.
+func (s *Service) follows(ns string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return ns == s.opt.Catalog || s.g.Trust[ns] && s.unfollowed[ns] == ""
 }
 
 // sees reports whether the bearer of token ("" for none) may see ns:

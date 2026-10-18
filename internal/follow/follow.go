@@ -165,6 +165,7 @@ type options struct {
 	maxBackoff time.Duration
 	onError    func(ns string, err error)
 	onState    func(State)
+	onCatchUp  func(ns, head string, done bool)
 }
 
 // Option configures a Follower.
@@ -211,6 +212,16 @@ func WithOnError(f func(ns string, err error)) Option { return func(o *options) 
 // changes, and purged from purge-ns entries, or from the 410 purged that
 // stands in for them (§8.5).
 func WithOnState(f func(State)) Option { return func(o *options) { o.onState = f } }
+
+// WithOnCatchUp receives the catch-up's progress (§10 Catch up): done
+// false once the head to catch up to has been read (the core serves the
+// namespace), done true once the checkpoint has reached that head, every
+// page of the range before it delivered. A consumer that replays a long
+// log a page at a time has a checkpoint after the first page, long before
+// it reflects the namespace as of its start.
+func WithOnCatchUp(f func(ns, head string, done bool)) Option {
+	return func(o *options) { o.onCatchUp = f }
+}
 
 // New returns a follower of namespace ns.
 func New(c *client.Client, ns string, cp Checkpoint, h Handler, opts ...Option) *Follower {
@@ -502,6 +513,7 @@ func (n *nsFollower) catchUp(ctx context.Context) error {
 		return err
 	}
 	head := v.(*client.NSHead)
+	n.f.catchUp(n.ns, head.ID, false)
 	for n.cur != head.ID {
 		type page struct {
 			entries []client.NSEntry
@@ -529,6 +541,7 @@ func (n *nsFollower) catchUp(ctx context.Context) error {
 			return fmt.Errorf("follow: %s: caught up to %s, not %s", n.ns, n.cur, want)
 		}
 	}
+	n.f.catchUp(n.ns, head.ID, true)
 	return nil
 }
 
@@ -716,6 +729,12 @@ func (n *nsFollower) apply(ctx context.Context, b *Batch) error {
 func (f *Follower) report(ns string, err error) {
 	if f.opt.onError != nil {
 		f.opt.onError(ns, err)
+	}
+}
+
+func (f *Follower) catchUp(ns, head string, done bool) {
+	if f.opt.onCatchUp != nil {
+		f.opt.onCatchUp(ns, head, done)
 	}
 }
 
