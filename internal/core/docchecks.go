@@ -14,23 +14,28 @@ import (
 )
 
 // fromScratch reports whether a step's patch set may be as large as
-// documentSize: a create, or a restore whose first operation is a root
-// replace (§6.6). At E3 the patch set is sealed and its shape unknown, so
-// every create and restore counts.
+// documentSize instead of patchSetSize (§6.6 Whole documents): a create,
+// and an append or restore whose first operation other than test is a
+// root replace or add, so any document within the limits can be written,
+// or overwritten on purpose (§11.3), in one request. At E3 the patch set
+// is sealed and its shape unknown, so every create and restore counts and
+// no append does. In a batch the step still counts toward batchSize.
 func fromScratch(s *stepState) bool {
 	switch s.action {
 	case "create":
 		return true
-	case "restore":
+	case "append", "restore":
 		if s.sealed {
-			return true
+			return s.action == "restore"
 		}
 		ops, _ := s.raw.([]any)
-		if len(ops) == 0 {
-			return false
+		for _, o := range ops {
+			op, _ := o.(map[string]any)
+			if op["op"] == "test" {
+				continue
+			}
+			return (op["op"] == "replace" || op["op"] == "add") && op["path"] == ""
 		}
-		op, _ := ops[0].(map[string]any)
-		return op["op"] == "replace" && op["path"] == ""
 	}
 	return false
 }

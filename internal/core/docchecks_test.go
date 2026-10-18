@@ -12,7 +12,9 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// §6.6: at E3 every create and restore may be as large as documentSize.
+// §6.6 Whole documents: a create, and an append or restore whose first
+// operation other than test is a root replace or add, may be as large as
+// documentSize; at E3 every create and restore, and no append.
 func TestCheckLimitsFromScratch(t *testing.T) {
 	t.Parallel()
 	l := DefaultLimits()
@@ -20,6 +22,8 @@ func TestCheckLimitsFromScratch(t *testing.T) {
 	big := make([]byte, 500)
 	root := []any{map[string]any{"op": "replace", "path": "", "value": 1.0}}
 	add := []any{map[string]any{"op": "add", "path": "/a", "value": 1.0}}
+	test := map[string]any{"op": "test", "path": "/a", "value": 1.0}
+	rootAdd := map[string]any{"op": "add", "path": "", "value": 1.0}
 	for _, c := range []struct {
 		name string
 		s    stepState
@@ -32,7 +36,15 @@ func TestCheckLimitsFromScratch(t *testing.T) {
 		{"restore from scratch", stepState{action: "restore", raw: root}, true},
 		{"restore with add", stepState{action: "restore", raw: add}, false},
 		{"empty restore", stepState{action: "restore", raw: []any{}}, false},
-		{"append", stepState{action: "append", raw: root}, false},
+		{"append, a root replace", stepState{action: "append", raw: root}, true},
+		{"append, a root add", stepState{action: "append", raw: []any{rootAdd, add[0]}}, true},
+		{"append, tests first", stepState{action: "append", raw: []any{test, test, root[0]}}, true},
+		{"restore, a test first", stepState{action: "restore", raw: []any{test, rootAdd}}, true},
+		{"append", stepState{action: "append", raw: add}, false},
+		{"append, a root write later", stepState{action: "append", raw: []any{add[0], root[0]}}, false},
+		{"append, a test then not at the root", stepState{action: "append", raw: []any{test, add[0], root[0]}}, false},
+		{"append, only tests", stepState{action: "append", raw: []any{test}}, false},
+		{"append, a root remove", stepState{action: "append", raw: []any{map[string]any{"op": "remove", "path": ""}}}, false},
 	} {
 		c.s.canon = big
 		err := checkLimits(l, &itemState{steps: []*stepState{&c.s}})
