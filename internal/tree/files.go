@@ -12,6 +12,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/files"
+	"github.com/middle-management/patchlog/internal/follow"
 )
 
 // File trees (Addendum H). A catalog whose catalog.files names the
@@ -108,9 +109,12 @@ type refiling struct {
 // refile prepares a change of catalog.files: turning it on reads the head
 // of every live item of a trusted namespace that isn't e2e, with keys in a
 // sealed one, for its file metadata (§H.3), modified being the created the
-// items table holds, else the head's Last-Modified. An item whose head
-// can't be read is left without; its own entry follows. It runs under
-// wmu, so no apply commits items meanwhile.
+// items table holds, else the head's Last-Modified. An item gone since, or
+// whose head isn't readable content, is left without; its own entry
+// follows. Any other failure to read a head is returned, so the change is
+// made again, as an apply's fetches are, rather than leave the item
+// without until it changes. It runs under wmu, so no apply commits items
+// meanwhile.
 func (s *Service) refile(ctx context.Context, on bool) (*refiling, error) {
 	fr := &refiling{on: on, metas: map[[2]string]*FileMeta{}}
 	if !on {
@@ -159,11 +163,12 @@ func (s *Service) refile(ctx context.Context, on bool) (*refiling, error) {
 			continue
 		}
 		doc, err := s.keys.FetchDoc(ctx, s.actual(i.ns), i.name, i.head, nil)
-		if err != nil {
-			if ctx.Err() != nil {
-				return nil, ctx.Err()
-			}
+		switch {
+		case err == nil:
+		case errors.Is(err, follow.ErrNotLive) || client.IsGone(err) || client.IsNotFound(err) || errors.Is(err, derived.ErrSkip):
 			continue
+		default:
+			return nil, fmt.Errorf("tree: the file metadata of %s/%s: %w", s.actual(i.ns), i.name, err)
 		}
 		created := i.created
 		if doc.ID != i.head {
@@ -213,7 +218,8 @@ func (fr *refiling) apply(ctx context.Context, tx *sql.Tx, g *Graph, changed map
 // database from before file metadata, or a catalog.files a release that
 // ignored it applied. Listings change at an unchanged combined checkpoint,
 // so every cached listing of the catalog goes (ns:{catalog}), as for the
-// drift reload fixes.
+// drift reload fixes. "filed" is recorded only once every head is read,
+// so a failed one is made again (retryBackfill), and by the next start.
 func (s *Service) backfillFiles(ctx context.Context) error {
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
@@ -258,6 +264,30 @@ func (s *Service) backfillFiles(ctx context.Context) error {
 	s.kept.Purge(s.opt.Catalog, tags)
 	s.opt.Purger.PurgeTags(tags)
 	return nil
+}
+
+// retryBackfill runs backfillFiles until it succeeds or ctx is done, with
+// the pauses a follower makes between attempts: the core may not be up
+// yet when the service starts.
+func (s *Service) retryBackfill(ctx context.Context) {
+	pause := time.Second
+	for {
+		t := time.NewTimer(pause)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return
+		case <-t.C:
+		}
+		err := s.backfillFiles(ctx)
+		if err == nil || ctx.Err() != nil {
+			return
+		}
+		s.opt.Logf("tree: file metadata: %v; retrying", err)
+		if pause < 30*time.Second {
+			pause *= 2
+		}
+	}
 }
 
 // fileSealing is how a listing gives placements their file metadata

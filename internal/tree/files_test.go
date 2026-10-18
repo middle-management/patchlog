@@ -5,9 +5,12 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -442,5 +445,69 @@ func TestFileTreeReadScope(t *testing.T) {
 	good := rk.Grant(t, s.Now(), "user:r", all, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "secret"}}})
 	if e := entriesOf(t, x.get("/cat/children?of=root", good))["files.secret"]; e["head"] == nil || fileOf(e) == nil {
 		t.Fatalf("entry under a grant fixing /resource: %v", e)
+	}
+}
+
+// flaky answers the next fail requests whose path starts with prefix with
+// 503, as a core briefly unavailable would.
+type flaky struct {
+	prefix string
+	fail   atomic.Int32
+	failed atomic.Int32
+}
+
+func (f *flaky) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasPrefix(r.URL.Path, f.prefix) && f.fail.Add(-1) >= 0 {
+		f.failed.Add(1)
+		return &http.Response{StatusCode: 503, Header: http.Header{"Content-Type": {"application/json"}}, Request: r,
+			Body: io.NopCloser(strings.NewReader(`{"code":"unavailable","message":"try again"}`))}, nil
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// §H.3: a head that can't be read for the moment, as catalog.files comes
+// or on a start that fills file metadata in, is read again: the catalog's
+// change is applied once every live item's head is read, and the start's
+// fill-in is retried, so no item lists without file until it changes.
+func TestFileTreeRefileRetries(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("tester"))
+	must(c.CreateNamespace(ctx, "files", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "cat", map[string]any{"read": "public", "catalog": map[string]any{"trust": []any{"files"}, "mode": "tree"}}))
+	must(c.CreateDoc(ctx, "cat", "root", map[string]any{"parents": []any{}}))
+	must(c.CreateDoc(ctx, "files", "a", map[string]any{"a": []any{}}))
+	must(c.CreateDoc(ctx, "cat", "files.a", map[string]any{"parents": parents("root")}))
+	ft := &flaky{prefix: "/r/files/a/rev/"}
+	sc := s.Client(t, client.WithHTTPClient(&http.Client{Transport: ft}))
+	db := filepath.Join(t.TempDir(), "tree.db")
+	x := startSvc(t, sc, svcOpts{db: db})
+	x.caughtUp("cat", "files")
+	want := map[string]any{"size": float64(len("{\n  \"a\": []\n}\n")), "type": "application/json", "modified": createdOf(t, c, "files", "a")}
+	file := func() map[string]any { return fileOf(entriesOf(t, x.get("/cat/children?of=root", ""))["files.a"]) }
+
+	ft.fail.Store(1)
+	must(c.PatchConfig(ctx, "cat", must(c.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/catalog/files", "value": map[string]any{"ns": "files", "root": "root"}}}))
+	x.caughtUp("cat")
+	if got := file(); ft.failed.Load() != 1 || !reflect.DeepEqual(got, want) {
+		t.Fatalf("file after %d failed reads: %v, want %v", ft.failed.Load(), got, want)
+	}
+
+	// A start that fills it in, whose first read fails.
+	x.stop()
+	sq := must(sql.Open("sqlite", db))
+	for _, q := range []string{`UPDATE items SET file = NULL`, `DELETE FROM meta WHERE k = 'filed'`} {
+		if _, err := sq.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sq.Close()
+	ft.fail.Store(1)
+	x = startSvc(t, sc, svcOpts{db: db})
+	x.caughtUp("cat", "files")
+	waitFor(t, "the fill-in to be retried", func() bool { return reflect.DeepEqual(file(), want) })
+	if ft.failed.Load() != 2 {
+		t.Fatalf("%d failed reads", ft.failed.Load())
 	}
 }

@@ -525,7 +525,13 @@ func (s *Service) Run(ctx context.Context) error {
 	s.runCtx = ctx
 	s.fmu.Unlock()
 	if err := s.backfillFiles(ctx); err != nil && ctx.Err() == nil {
-		s.opt.Logf("tree: file metadata: %v", err)
+		// Made again beside the followers until it succeeds.
+		s.opt.Logf("tree: file metadata: %v; retrying", err)
+		s.fwg.Add(1)
+		go func() {
+			defer s.fwg.Done()
+			s.retryBackfill(ctx)
+		}()
 	}
 	s.ensureFollowers()
 	<-ctx.Done()
