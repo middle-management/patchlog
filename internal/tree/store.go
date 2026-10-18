@@ -25,10 +25,12 @@ import (
 //	                                 raw parents/$access kept to rebuild the graph on start
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
-//	items(ns, name, state, head, title)
-//	                                 liveness of every resource of the trusted namespaces seen;
-//	                                 a name without a row in a namespace with "purged:{ns}" is
-//	                                 purged (itemStateTitle)
+//	items(ns, name, state, head, title, created, file)
+//	                                 liveness of every resource of the trusted namespaces seen,
+//	                                 with its head's created and, in a file tree, its file
+//	                                 metadata (§H.3, files.go); a name without a row in a
+//	                                 namespace with "purged:{ns}" is purged (itemInfo); meta
+//	                                 "filed" marks file metadata computed for a file tree
 //	self_parents(ns, name, parents)  $parents of content documents (§B.9, -self-placing)
 //	sealed_views, sealed_view_tags   sealed listings of a sealed/e2e catalog (derived.Cache)
 //	edge_subjects(gs, subjects, exp) the subjects of each subject set the service minted edge
@@ -48,7 +50,7 @@ var createStmts = []string{
 		state INTEGER NOT NULL, PRIMARY KEY (child, pos))`,
 	`CREATE INDEX IF NOT EXISTS edges_by_parent ON edges (parent, ord, child)`,
 	`CREATE TABLE IF NOT EXISTS items (ns TEXT NOT NULL, name TEXT NOT NULL, state INTEGER NOT NULL, head TEXT, title TEXT,
-		PRIMARY KEY (ns, name)) WITHOUT ROWID`,
+		created TEXT, file TEXT, PRIMARY KEY (ns, name)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS self_parents (ns TEXT NOT NULL, name TEXT NOT NULL, parents TEXT NOT NULL,
 		PRIMARY KEY (ns, name)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS edge_subjects (gs TEXT PRIMARY KEY, subjects TEXT NOT NULL, exp INTEGER NOT NULL)`,
@@ -277,15 +279,15 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 		}
 		// The purged namespaces are s.purged, which mirrors the committed
 		// "purged:{ns}" rows, so no query per name the service never saw
-		// (itemStateTitle).
-		st, head, title, err := itemRow(ctx, q, n.ItemNS, n.ItemName)
+		// (itemInfo).
+		it, err := itemRow(ctx, q, n.ItemNS, n.ItemName)
 		if err != nil {
 			return nil, err
 		}
-		if _, purged := s.purged[n.ItemNS]; purged && st == ItemUnknown {
-			st = ItemPurged
+		if _, purged := s.purged[n.ItemNS]; purged && it.state == ItemUnknown {
+			it.state = ItemPurged
 		}
-		g.setItem(name, st, head, title)
+		g.setItem(name, it)
 	}
 	return g, nil
 }
@@ -302,11 +304,19 @@ func ReadItemState(ctx context.Context, tx *sql.Tx, ns, name string) (int, strin
 }
 
 func itemState(ctx context.Context, q queryer, ns, name string) (int, string, error) {
-	st, head, _, err := itemStateTitle(ctx, q, ns, name)
-	return st, head, err
+	it, err := itemInfo(ctx, q, ns, name)
+	return it.state, it.head, err
 }
 
-// itemStateTitle is itemState with the item's title (§B.5). A name the
+// itemData is what the service holds of a content item: its state, its
+// head if live, and that head's title (§B.5) and file metadata (§H.3).
+type itemData struct {
+	state       int
+	head, title string
+	file        *FileMeta
+}
+
+// itemInfo is itemState with the item's title and file metadata. A name the
 // service holds no row for is purged in a namespace it holds as purged
 // ("purged:{ns}"), not unknown: every name of a purged namespace is 410
 // purged at the core (§8.5), which keeps no list of them a service could
@@ -316,37 +326,37 @@ func itemState(ctx context.Context, q queryer, ns, name string) (int, string, er
 // follow.Coalesce). So a service that started after the purge answers as
 // one that followed it, and so does one that followed it for names it
 // never saw (§B.11.4).
-func itemStateTitle(ctx context.Context, q queryer, ns, name string) (int, string, string, error) {
-	st, head, title, err := itemRow(ctx, q, ns, name)
-	if err != nil || st != ItemUnknown {
-		return st, head, title, err
+func itemInfo(ctx context.Context, q queryer, ns, name string) (itemData, error) {
+	it, err := itemRow(ctx, q, ns, name)
+	if err != nil || it.state != ItemUnknown {
+		return it, err
 	}
 	var one int
 	err = q.QueryRowContext(ctx, `SELECT 1 FROM meta WHERE k = ?`, "purged:"+ns).Scan(&one)
 	switch {
 	case err == nil:
-		return ItemPurged, "", "", nil
+		return itemData{state: ItemPurged}, nil
 	case errors.Is(err, sql.ErrNoRows):
-		return ItemUnknown, "", "", nil
+		return itemData{state: ItemUnknown}, nil
 	}
-	return 0, "", "", err
+	return itemData{}, err
 }
 
 // itemRow reads a name's items row: ItemUnknown without one.
-func itemRow(ctx context.Context, q queryer, ns, name string) (int, string, string, error) {
-	var st int
-	var head, title sql.NullString
-	err := q.QueryRowContext(ctx, `SELECT state, head, title FROM items WHERE ns = ? AND name = ?`, ns, name).Scan(&st, &head, &title)
+func itemRow(ctx context.Context, q queryer, ns, name string) (itemData, error) {
+	var it itemData
+	var head, title, file sql.NullString
+	err := q.QueryRowContext(ctx, `SELECT state, head, title, file FROM items WHERE ns = ? AND name = ?`, ns, name).Scan(&it.state, &head, &title, &file)
 	if errors.Is(err, sql.ErrNoRows) {
-		return ItemUnknown, "", "", nil
+		return itemData{state: ItemUnknown}, nil
 	}
 	if err != nil {
-		return 0, "", "", err
+		return itemData{}, err
 	}
-	if st != ItemLive {
-		head.String, title.String = "", ""
+	if it.state == ItemLive {
+		it.head, it.title, it.file = head.String, title.String, decodeFile(file.String)
 	}
-	return st, head.String, title.String, nil
+	return it, nil
 }
 
 // titlePointer reads catalog.title (§B.5), a JSON Pointer. Anything else
@@ -372,11 +382,13 @@ func titleAt(doc any, p pointer.Pointer) string {
 	return t
 }
 
-// setConfig records the catalog namespace document and its trust list.
+// setConfig records the catalog namespace document, its trust list, its
+// title pointer and whether it is a file tree.
 func (g *Graph) setConfig(doc map[string]any) {
 	g.Config = doc
 	g.Trust = map[string]bool{}
 	g.TitlePtr, g.HasTitle = titlePointer(doc)
+	g.Files = isFileTree(doc)
 	cat, _ := doc["catalog"].(map[string]any)
 	arr, _ := cat["trust"].([]any)
 	for _, x := range arr {

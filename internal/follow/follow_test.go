@@ -443,19 +443,26 @@ func TestSQLCheckpoints(t *testing.T) {
 func TestCoalesce(t *testing.T) {
 	t.Parallel()
 	e := func(id, kind, res, target string) client.NSEntry {
-		return client.NSEntry{ID: id, Kind: kind, Resource: res, Target: target}
+		created := ""
+		if id != "" {
+			created = "t" + id
+		}
+		return client.NSEntry{ID: id, Kind: kind, Resource: res, Target: target, Created: created}
 	}
 	units := []follow.Unit{
 		{Entry: e("1", "head", "a", "a1")},
 		{Entry: e("2", "head", "b", "b1")},
-		{Entry: client.NSEntry{ID: "3", Kind: "batch", Entries: []client.NSEntry{
+		// A batch's sub-entries take the batch entry's created (§7.4).
+		{Entry: client.NSEntry{ID: "3", Kind: "batch", Created: "t3", Entries: []client.NSEntry{
 			{Kind: "config", Target: "c1"}, e("", "head", "a", "a2"), e("", "tombstone", "c", "c1")}}},
 		{Entry: e("4", "purge", "b", "b1")},
 		{Entry: e("5", "prune", "a", "a1")},
+		// A /heads row's created, without an id (synthetic).
+		{Entry: client.NSEntry{Kind: "head", Resource: "d", Target: "d1", Created: "td"}, Synthetic: true},
 	}
 	co := follow.Coalesce(units)
 	got := fmt.Sprint(co.Changes)
-	want := "[{a head a2 3 false} {c tombstone c1 3 false} {b purge b1 4 true}]"
+	want := "[{a head a2 3 false t3} {c tombstone c1 3 false t3} {b purge b1 4 true t4} {d head d1  false td}]"
 	if got != want {
 		t.Fatalf("changes %s\nwant    %s", got, want)
 	}

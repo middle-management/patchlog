@@ -100,7 +100,8 @@ type Unit struct {
 	// Entry is the namespace entry. For a batch, Entry.Entries holds its
 	// config entry (first, if any) and resource entries. For synthetic
 	// units from a /heads snapshot, Entry has Resource, Kind ("head",
-	// "tombstone" or "purge") and Target, and no ID; a namespace purged by
+	// "tombstone" or "purge"), Target and the row's Created, if any, and
+	// no ID; a namespace purged by
 	// then has no listing, and gives one unit with only Kind "purge-ns"
 	// and ID, its head, which is its purge-ns entry. So does a sealed
 	// namespace once it is purged, whose log is 410 too (§8.5), in place
@@ -442,7 +443,7 @@ func (n *nsFollower) deliverHeads(ctx context.Context, at, after string, genesis
 			genesis = nil
 		}
 		for _, it := range p.items {
-			e := client.NSEntry{Resource: it.Resource, Kind: it.Kind, Target: it.Target}
+			e := client.NSEntry{Resource: it.Resource, Kind: it.Kind, Target: it.Target, Created: it.Created}
 			units = append(units, Unit{Entry: e, Synthetic: true})
 		}
 		if p.next == after && after != "" {

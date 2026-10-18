@@ -76,9 +76,9 @@ func (g *Graph) With(changes map[string]any) *Graph {
 		}
 		n := ParseNode(g.Catalog, name, "", doc)
 		if old := g.explicit[name]; old != nil {
-			n.ItemState, n.ItemHead, n.ItemTitle = old.ItemState, old.ItemHead, old.ItemTitle
+			n.copyItem(old)
 		} else if s := g.self[name]; s != nil {
-			n.ItemState, n.ItemHead, n.ItemTitle = s.ItemState, s.ItemHead, s.ItemTitle
+			n.copyItem(s)
 		} else if n.ItemNS != "" {
 			n.ItemState = ItemLive
 		}

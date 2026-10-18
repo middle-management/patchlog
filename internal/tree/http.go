@@ -452,11 +452,22 @@ var ops = map[string]bool{
 // another form is redirected to it. Every parameter but min is
 // single-valued: given more than once, it is 400 bad_input.
 //
+// File trees (§H.2, §H.3; files.go). A catalog whose catalog.files makes
+// it a file tree gives every placement entry with a head "file": { size,
+// type, modified } of that head, in the clear for items of a namespace
+// that is neither sealed nor e2e. For an item of a sealed (E2) namespace
+// it is "file": { "sealed": JWE of { file } } under the item's own K_r,
+// kid its namespace's current epoch, pl { ns, name, view } of the item, so
+// readers given K_r by /read-grants open it, whatever the catalog's level;
+// for an e2e item it is left out. A listing holding any sealed file is
+// stored and served unchanged like a sealed catalog's.
+//
 // A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles are
-// the only values a listing takes from documents' content (names, heads,
-// hrefs, structure, order and cursors stay in the clear, and content
-// namespaces contribute nothing else), so a listing has one sealed source,
-// the catalog. A reader of the whole catalog gets the listing sealed as
+// the only values a listing takes from the catalog's content (names,
+// heads, hrefs, structure, order and cursors stay in the clear, and
+// content namespaces contribute nothing else but file metadata, sealed on
+// its own), so the catalog is the one source of what a listing seals
+// whole. A reader of the whole catalog gets the listing sealed as
 // one JWE under the catalog's current epoch key, Content-Type
 // application/jose, pl { ns, view } where view is the listing's request
 // target (/{catalog}[/g/{gs}]/at/{at}/{op}?{query}, the canonical form). A
@@ -785,7 +796,11 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	cat := s.opt.Catalog
 	keep := !perReader(op, v)
 	gen := s.kept.Generation(cat)
-	if info.Protected() && keep {
+	fs := s.fileSealing(ctx)
+	// A listing that seals values, the catalog's or an item's file
+	// metadata, is sealed once and then served unchanged (§E.2.6).
+	sealed := info.Protected() || fs.seals()
+	if sealed && keep {
 		at := s.At()
 		if st, ok := s.sealed.Get(ctx, canon(at)); ok {
 			st, _ = s.kept.Put(keyOf(at), cat, gen, true, st)
@@ -806,7 +821,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		l.at, nss = CombinedAt(g, curMap)
 		cps = checkpointsOf(g, curMap)
 		view = derived.View{NS: cat, Target: canon(l.at)}
-		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at}
+		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
 		if perEntry {
 			q.sealTitle = func(name, title string) string {
 				jwe, err := derived.SealItem(key, view, name, map[string]any{"title": title})
@@ -838,7 +853,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		// the reader.
 		return l, nil
 	}
-	if info.Protected() {
+	if sealed {
 		var err error
 		if l.st, err = s.sealed.Put(ctx, view.Target, cat, l.at, l.st); err != nil {
 			s.opt.Logf("tree: storing a sealed listing: %v", err)
@@ -851,7 +866,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			}
 		}
 	}
-	l.st, _ = s.kept.Put(keyOf(l.at), cat, gen, info.Protected(), l.st)
+	l.st, _ = s.kept.Put(keyOf(l.at), cat, gen, sealed, l.st)
 	s.recordAt(l.at, cps)
 	return l, nil
 }
@@ -1365,6 +1380,11 @@ type query struct {
 	// sealTitle, if set, seals a catalog node's title for per-entry
 	// sealing (§E.2.6): the entry carries "sealed" instead of "title".
 	sealTitle func(name, title string) string
+	// files says how placements carry file metadata in a file tree
+	// (§H.3), sealed under view; serr records a sealing failure.
+	files *fileSealing
+	view  derived.View
+	serr  *error
 }
 
 // title sets a node's title on an entry, in the clear or sealed.
@@ -1456,6 +1476,9 @@ func (q *query) entry(n *Node) map[string]any {
 			m["url"] = q.s.origin + q.g.ItemHref(n) + "/rev/" + n.ItemHead
 			if a := q.g.Actual(n.ItemNS); a != n.ItemNS {
 				m["branch"] = a
+			}
+			if f := q.file(n); f != nil {
+				m["file"] = f
 			}
 		}
 		if n.State == StateDangling {
