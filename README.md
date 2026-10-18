@@ -2154,9 +2154,10 @@ create.
 
 `patchlog dav` serves namespaces as a network drive, for file managers and editors, following
 Addendum H (files): a file other than a JSON file is a raw document, its bytes a blob (§7.8), and a
-JSON file is a document, read as its rendering. It is an API consumer like the index and tree
-services: it reads and writes the core only through its public API, and keeps nothing but memory
-caches.
+JSON file is a document, read as its rendering. A namespace (`-ns`) is a flat directory of its
+resources; a catalog (`-catalog`) is a file tree, whose files and folders are named by their
+nodes' titles. It is an API consumer like the index and tree services: it reads and writes the
+core only through its public API, and keeps nothing but memory caches.
 
 ```sh
 # Local mode: one grant for every request; WebDAV clients log in with any user name and the password.
@@ -2245,9 +2246,8 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   "Unchanged skipping") and exits 0: edits are silently not sent. Without `--ignore-size`, rclone
   checks the size of each upload, and a save merged with others' edits fails ("corrupted on
   transfer: sizes differ") and is deleted ("Removing failed copy"): the document is tombstoned,
-  or in a catalog folder the placement unplaced (its item keeps the merged edit), and each of
-  rclone's retries restores it and deletes it again; without `--ignore-times` too, an edit that
-  keeps the size isn't sent.
+  or in a file tree the file deleted, and each of rclone's retries restores it and deletes it
+  again; without `--ignore-times` too, an edit that keeps the size isn't sent.
 - **Copies from the server take `--ignore-times`**, else a document someone changed without
   changing its size isn't fetched.
 - **A refused save doesn't delete the document.** rclone answers every failed upload (a conflict,
@@ -2289,24 +2289,23 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   (below), with an I/O error for the program; the next save is done as usual. Use
   `--vfs-cache-mode writes`, which renames a file it hasn't uploaded yet in its cache, and then
   uploads it with a PUT.
-- `rclone sync` deletes what the source doesn't have: here, a tombstone per document. Renames
-  (`moveto` to another name) are refused: names are identity. `moveto` of a flat file into a
-  catalog folder, under its own name `{ns}.{name}.json`, places the document; it stays in the
-  flat directory. rclone sends a MKCOL for the parent folder before each upload: `405`, as a
-  folder that exists is, and not logged. `rclone mkdir` in a frozen catalog fails at once
-  (`403`). `rclone deletefile` of a placement whose item isn't live finds no file (the listing
-  hides it): `curl -X DELETE` its path instead (below).
+- `rclone sync` deletes what the source doesn't have: here, a tombstone per document. In a file
+  tree `moveto` renames and moves files and folders (below); in a flat directory it is refused
+  (`403`), names being identity, and `moveto` of a flat file into a tree copies it there and
+  deletes it. rclone sends a MKCOL for the parent folder before each upload: `405`, as a folder
+  that exists is, and not logged. `rclone mkdir` in a frozen catalog fails at once (`403`).
 
 **Layout.**
 
 ```
-/                                                 a directory per -ns and -catalog
-/docs/                                            a flat namespace (§H.2): its live resources
-/docs/derby.json                                  the JSON document /r/docs/derby
-/docs/logo.png                                    the raw document /r/docs/logo.png: a file
-/cat-season/                                      a catalog: its root folders and placements
-/cat-season/root/season-2026/                     folder season-2026, in folder root
-/cat-season/root/season-2026/matches.derby.json   placement matches.derby: /r/matches/derby
+/                                          a directory per -ns and -catalog
+/docs/                                     a flat namespace (§H.2): its live resources
+/docs/derby.json                           the JSON document /r/docs/derby
+/docs/logo.png                             the raw document /r/docs/logo.png: a file
+/cat-season/                               a file tree (§H.2): the children of its files.root
+/cat-season/Season 2026/                   a folder node titled "Season 2026"
+/cat-season/Season 2026/Derby report.md    a placement titled "Derby report.md": its item,
+                                           such as the raw document /r/matches/k3j2…
 ```
 
 - **Files** (§H.1). A raw document, whose root is a blob reference (`{ "$blob", "type", "size",
@@ -2356,7 +2355,7 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   are read again after 5 seconds, or at once after a write through this server. Nothing is pushed.
 - **Sealed and end-to-end namespaces** (Addendum E) need keys this server doesn't hold, so it
   doesn't offer them (§H.7): the root doesn't list them, anything asked of them is `404`, saying
-  why, and a catalog's placements of items in them aren't listed. A root listing reads the
+  why, and a tree's placements of items in them aren't listed. A root listing reads the
   document of each served namespace the user's grant names, once every 30 seconds, for this; one
   it can't read is listed all the same, so a grant that reads only some namespaces mounts, and
   the others answer `403` when opened.
@@ -2441,9 +2440,10 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   conflict, a `422`, a body that isn't JSON or is over `-max-file-size`, a frozen namespace, a
   precondition), the user's own DELETE is undone: the document is restored as it was (an empty
   patch set, if the user's tombstone is still its head), as a failed PUT leaves it, and the
-  answer says so. So is a placement the user's DELETE unplaced before a write to its path. A
-  document deleted longer ago stays deleted, and rclone's DELETE after its refused upload
-  deletes a restored one again: the deletion stands.
+  answer says so. In a file tree, a write to the path of a file the user deleted within 30
+  seconds restores it, its placement and then its item, and a refused one restores both as they
+  were (§H.6). A document deleted longer ago stays deleted, and rclone's DELETE after its refused
+  upload deletes a restored one again: the deletion stands.
 - `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
   the namespace requires nonces or its document can't be read (§C.7), with a `Blob-Nonce` on a raw
   file's blob. Where nonces are required, a JSON file's root must be an object, which carries the
@@ -2465,8 +2465,8 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   same file (answered `4xx` or `5xx`, having written nothing) within 10 seconds is `409` ("wasn't
   deleted: this DELETE follows a refused save of the same file … delete it again to delete it"),
   once per refused PUT, at most twice: rclone deletes any file whose upload failed, a second
-  later, which would tombstone the document for everyone (in a catalog folder, unplace the
-  placement) because a save was refused. The same DELETE sent again is done; so is one naming the
+  later, which would tombstone the document for everyone (in a file tree, delete the file)
+  because a save was refused. The same DELETE sent again is done; so is one naming the
   revision it deletes (`If-Match`), and one after the user read the file again at least 2 seconds
   after the refusal (a GET answered `200`, not a range read). A DELETE that finds nothing uses
   one refusal up (a refused create's cleanup), and one done forgets them. A PUT that succeeded,
@@ -2475,11 +2475,11 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   deleted (below): the DELETE after that leaves it deleted, as the user chose. In a frozen
   namespace, which takes no DELETE either, the DELETE gets the core's `403` instead. In local
   mode every program is the same user: another program's DELETE in those 10 seconds is refused
-  once too, and its full read of the file 2 seconds or more after the refusal lifts the guard. A
-  MOVE between two files is `403`: names are identity (§3.6), so there is no rename. COPY to a new
-  name creates it from the content (a raw file's bytes read through this server), and COPY over a
-  file edits it, as its kind takes it. MKCOL of a folder that exists is `405` (not logged), and
-  below a file `409`.
+  once too, and its full read of the file 2 seconds or more after the refusal lifts the guard. In
+  the flat view a MOVE between two files is `403`: names are identity (§3.6), so there is no
+  rename. COPY to a new name creates it from the content (a raw file's bytes read through this
+  server), and COPY over a file edits it, as its kind takes it. MKCOL of a folder that exists is
+  `405` (not logged), and below a file `409`.
 
 **Temporary and backup files** (§H.6). Editors' and systems' own files, `.DS_Store`, `._*`,
 `Thumbs.db`, `~$*`, `*.swp`, `4913`, `*~`, `#*#`, `*___jb_tmp___` and `.goutputstream-*`, and
@@ -2487,9 +2487,11 @@ JetBrains' `*___jb_old___` beside its `*___jb_tmp___`, are scratch files, unless
 has the name: kept in memory per user and directory (at most 256 files and folders and 32 MiB a
 grant root, 256 MiB in all, then `507`; in a gateway, only in the served namespaces the user's
 grant names, else `403`), listed beside the files so editors see what they wrote, and dropped
-after an hour untouched, or when the server stops. They never reach the core. Other temporary
-names are files of their own when they are resource names (`notes.md.tmp`), and refused when not
-(`.notes.md.tmp`, sed's `sedAb12Cd`): such a save fails in a flat directory. Over the bounds,
+after an hour untouched, or when the server stops. They never reach the core. In a file tree a
+node's name is the node's whatever it looks like, and every other name a title can be is a file.
+In a flat directory, other temporary names are files of their own when they are resource names
+(`notes.md.tmp`), and refused when not (`.notes.md.tmp`, sed's `sedAb12Cd`): such a save fails
+there. Over the bounds,
 `._*`, `.DS_Store` and `Thumbs.db` make room for others, least recently used first, or are
 dropped rather than refused, so copying many files in doesn't fail on them (Finder reads a `507`
 as a full disk).
@@ -2500,65 +2502,91 @@ as a full disk).
   writing the new version, copies it (a raw file's bytes, within `-max-file-size`): the file
   stays, and the write that follows is an edit of it, even one that creates only (davfs2's
   `If-None-Match: *`, as it takes the name for free after the MOVE).
-- MKCOL where a catalog folder can't be makes a scratch directory, where every name is a scratch
-  file, for apps that save through one, anywhere (a name starting with a dot, as
-  `.TemporaryItems`, or macOS's `(A Document Being Saved By TextEdit)`), and in a catalog for a
-  file manager's new folder before it is named (`untitled folder`, `New folder`, numbered), where
-  the `.json` names a person gives are refused as elsewhere. Any other MKCOL there is `403`, as is
-  a MOVE giving a scratch directory another name: a person's folder in a flat namespace or at the
-  root would keep what is saved in it in memory only. Its files go with it, after an hour
-  untouched or when it is deleted. In a catalog, moving one onto a folder name makes that folder.
+- MKCOL of an app's folder, anywhere (a name starting with a dot, as `.TemporaryItems`, or
+  macOS's `(A Document Being Saved By TextEdit)`), makes a scratch directory, where every name is
+  a scratch file. Any other MKCOL outside a file tree is `403`, as is a MOVE giving a scratch
+  directory a person's name there: a person's folder in a flat namespace or at the root would
+  keep what is saved in it in memory only. Its files go with it, after an hour untouched or when
+  it is deleted. In a tree, moving one to a person's name makes a folder of that name.
 
-**Catalogs** (Addendum B). The tree is built from the catalog namespace's documents, read from
-the core (parsed with `tree.BuildGraph`). A catalog's directory holds its roots (nodes without
-parents); folders are directories named by node name; placements are files `{ns}.{name}.json`
-whose content is their item `/r/{ns}/{name}`, read and edited as in the flat view. A node with
-several parents (a DAG) is under each; cyclic nodes and placements whose item isn't live, or that
-the user's grant doesn't read, aren't shown.
+**File trees** (§H.2). `-catalog` serves catalogs whose namespace document's `catalog` object
+carries `files: { "ns", "root", "folder"?, "placement"? }`. One without isn't a file tree, and
+isn't served: it is refused at start (`dav: -catalog plain: its namespace document has no
+catalog.files …`), read with the server's grant in local mode and without one in a gateway; one
+only a user's grant reads answers `404`, saying why, when opened, and the root doesn't list it.
+The tree's top level is the children of folder node `files.root`. It is built from the catalog
+namespace's documents, read from the core with the user's grant (`tree.BuildGraph`), again after
+5 seconds or at once after a write through this server. `catalog.mode: "tree"` is assumed: a node
+with several parents shows under each, and a DELETE takes it out of that one only.
 
-- MKCOL makes a folder, `{ "parents": [{ "href": "/r/{catalog}/{folder}" }] }`, or with
-  `"parents": []` at the catalog's root. A name the catalog already has elsewhere is `409` (move
-  that one instead). A name that isn't a folder name (a dot, capitals, a space) is `403`, but for
-  a file manager's new folder, a scratch directory until named: MOVE it onto a folder name to make
-  the folder, as Finder's New Folder does.
-- A MOVE of a folder or placement to another folder replaces only its `parents` entry for the
-  folder it left with one for the folder it enters (one write with `If-Match`, §B.2 "Move"; the
-  entry's `order` doesn't come along), and a MOVE to the catalog's root removes the entry.
-  Renaming is `403` (a folder's: make one of the new name and move what is in it there), and a
-  folder can't go into itself (`409`). A MOVE of a flat directory's `{name}.json` into a folder
-  as `{ns}.{name}.json` places that document, as a COPY does (it stays in the flat directory,
-  and nothing is written to it); a MOVE of a placement onto its item's file in the flat
-  directory unplaces it.
-- A DELETE of a placement unplaces it: the item stays in its namespace (§B.7). A node in several
-  folders is unlinked from that one only, as one link of a file with several; in its only folder
-  it is deleted. A folder is deleted only when nothing is in it (`409` naming what is); deletes
-  never recurse. A placement whose item isn't live (dangling, §B.3) isn't listed, but the `409`
-  of its folder names it, and a DELETE of its path unplaces it; one whose item the user's grant
-  doesn't read is named as such.
-- A PUT of a new `{ns}.{name}.json` in a folder creates the item if it doesn't exist (else edits
-  it), and the placement, with that folder as its parent: a new item first (§B.7: content first,
-  so no placement dangles), once a dry run of the placement (§7.5) says the core takes it, an
-  existing one after the placement, so a placement the core refuses (a frozen catalog, a grant
-  that doesn't write the catalog, the catalog's rules) writes nothing, and leaves an existing
-  item as it was. (A placement refused still, the catalog having changed between the dry run and
-  the write, deletes the item just created again.) An item
-  placed elsewhere in the catalog is `409` before anything is written: move its placement instead.
-  An existing item takes the PUT's preconditions (`If-None-Match: *` is `412`), and its edit is
-  checked before the placement is made: from a user who knows no version of it, a file whose
-  content differs is `409`, rather than replacing a document they never saw under a name that
-  looked new. A COPY of a document from a flat directory into a folder places it the same way.
+- **Names.** A folder is a folder node and a file a placement `{ns}.{item}`, whose content is its
+  item, read and saved as in the flat view (a raw file typed by its name's extension). Each is
+  named by its node's `title`; a placement without one by its item's name, a folder by its node
+  name. Titles are Unicode in NFC (a name sent in NFD, as macOS may, is stored in NFC), 1 to 255
+  bytes of UTF-8, not `.` or `..`, without `/`, `\`, NUL or characters of `Cc`, `Cf`, `Zl` and
+  `Zp`, and, for Windows clients, without a trailing space or dot: other names are `403`, saying
+  why. A title another tool wrote that breaks these rules is shown escaped (`a/b` as `a%2Fb`, `..`
+  as `%2E%2E`, a trailing dot as `%2E`), never passed into a listing as it is. Names hold
+  capitals, spaces and any script, and a copy's name (`x copy.md`) or a new folder's (`untitled
+  folder`) is a name like any other, renamed by a title change.
+- **Siblings** share one set of names, compared after NFC and Unicode case folding (with
+  `-case-sensitive`, after NFC only), as the file systems of Finder's and Explorer's users compare
+  them: a name a sibling has, under any case, is that sibling's (a PUT of `NOTES.md` beside
+  `notes.md` saves `notes.md`, and its MKCOL is `405`). Duplicates a race leaves, or another tool
+  makes, are shown as `name (2).ext`, `name (3).ext`, … in order of their nodes' creation in the
+  catalog's log, the first keeping its name, skipping numbers whose names a sibling has; a
+  folder's number goes at its name's end.
+- **Listings** show folders, and files whose items are live, offered (not sealed or end-to-end)
+  and readable with the user's grant: dangling placements, cyclic nodes and items hidden from the
+  user aren't shown. A folder's listing reads the heads of its own items (a path's folders above
+  only where a name is ambiguous), and the document of each revision once, for its size and type.
+- **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
+  random base32 characters), and its placement titled with the name, under its folder: one
+  `parents` entry, ordered after the folder's last ordered child, so new files list last, and
+  `$schema` from `files.placement` where given. The catalog must trust `files.ns` (`403`
+  otherwise). A dry run of the placement (§7.5) comes first, so one the core refuses (a frozen
+  catalog, a grant that doesn't write it, the catalog's rules) writes nothing; then the item is
+  created (`If-None-Match: *`; a raw file's blob uploaded first), then placed, and an item whose
+  placement is refused still, the catalog having changed in between, is deleted again at once.
+  Its kind is §H.1's: a name ending in `.json` with I-JSON content makes a JSON document, any
+  other a raw one. MKCOL makes a folder node so (an opaque name, `title`, `parents`, `order`,
+  `$schema` from `files.folder`). Where the catalog requires nonces, each write to it carries a
+  fresh `$nonce` (§H.7), as file writes do where `files.ns` requires them.
+- **Rename and move** (§H.5). A MOVE within the tree is one append to the node, with `If-Match`
+  on its head: a new name replaces its `title`, a new folder its `parents` entry (ordered after
+  the last child there), both in one patch set. The item isn't touched, so its history, ETag and
+  links stay. A rename to another case of the name is taken whatever `Overwrite` says. A folder
+  moves with what is in it, but not into itself or a folder in it (`403`), not over another
+  folder, and not out of its tree (folders aren't copied).
+- **Onto an existing file** a MOVE saves the source's content into it, its base taken as a PUT's,
+  so it keeps its history, then deletes the source: "write a temporary file, rename it over"
+  saves land so (the temporary name, unless a scratch name, is a file of the tree meanwhile).
+- **Across trees and namespaces** (to another tree, to or from a flat directory) a MOVE copies the
+  file, then deletes the source; where its item is deleted, its last revision first takes
+  `$successor` naming the copy (§8.1: a bare name in the same namespace, else `/r/{ns}/{name}`),
+  in one batch with the tombstone, unless its root isn't an object (a JSON array moves without).
+- **Copy** makes a new item with the source's content, and a placement for it: a raw file's blob
+  keeps its id and is copied with `Blob-From` (§7.8), or uploaded again where the core refuses
+  that (a source of a higher rank, such as a private namespace's, into a public one). Folders
+  aren't copied (`403`).
+- **Delete a file**: its placement, then, where its item is in `files.ns` (the tree owns it) and
+  the user's grant allows `delete` there, its item; else the item stays, unplaced, as a failure
+  between the two leaves it. A `DELETE` whose `If-Match` isn't the item's head is `412`, deleting
+  nothing.
+- **Delete a folder**: only one without visible children (`409`, naming them, and nothing hidden
+  from the user); placements whose items are gone (dangling, §B.3) aren't contents, and are
+  deleted first; the user's scratch files in it go with it. Deletes never recurse, and the tree's
+  top isn't deleted (`403`).
 - Writes through a placement go only to items in a namespace the catalog trusts (`catalog.trust`,
   §B.3) or that is served with `-ns`, never to a catalog's own nodes (`403`): a local mode's grant
   may reach namespaces the server wasn't set up to serve.
-- The documents it creates carry `parents` only: a catalog whose rules want more (`$schema`, an
-  `order`, no new roots, §B.6) refuses them with `422`.
 
 **Not in the prototype.** The catalog's trust list beyond bounding writes, access by subject set
-(`$access`, §B.11) and the tree service: users see what their grant reads, as the core lists it.
-File trees (§H.2: catalogs whose titles are file names): a catalog folder holds placements named
-`{ns}.{name}.json`, and a new placement's file is JSON (an existing raw item reads and saves as
-its bytes). Moves and renames of files (§H.5). Blob references deeper in a JSON document read and
-edit as JSON. Sealed (E.2) and end-to-end (E.3) namespaces, which need keys. History
+(`$access`, §B.11) and the tree service: users see what their grant reads, as the core lists it,
+and a tree's listings read its items rather than the tree service's `file` metadata (§H.3). Grants
+issued by the catalog (§B.11.4): each user's grant is passed through, so a new file is created
+before it is placed, never placed first. Renames in the flat view (§H.2: a copy and a delete).
+Blob references deeper in a JSON document read and edit as JSON. Sealed (E.2) and end-to-end (E.3) namespaces, which need keys. History
 (revisions and logs as directories), live invalidation, and batches: each file is its own write,
 so saving several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5)
 can't list a namespace, whose `/heads` needs unrestricted read, but can open its files by path.
