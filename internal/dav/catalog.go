@@ -616,7 +616,7 @@ func (st *reqState) probeNode(ctx context.Context, cat, name string, doc map[str
 	case client.Live:
 		return fail(http.StatusConflict, "%s is already in catalog %s", name, cat)
 	case client.Purged:
-		return fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", cat, name)
+		return purgedErr(cat, name)
 	case client.Tombstoned:
 		it.IfMatch = h.ID
 		it.Steps = []client.Step{client.PatchStep(withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))}
@@ -636,10 +636,10 @@ func (st *reqState) probeNode(ctx context.Context, cat, name string, doc map[str
 	return nil
 }
 
-// batchErr is a one-item batch's refusal (§7.5) as a single write's: the
-// item's own failure, else err.
+// batchErr is a batch's refusal (§7.5) as a single write's: its first
+// failing item's own failure, else err.
 func batchErr(err error) error {
-	if ae, ok := client.AsAPIError(err); ok && ae.Code == "batch" && len(ae.Items()) == 1 {
+	if ae, ok := client.AsAPIError(err); ok && ae.Code == "batch" && len(ae.Items()) > 0 {
 		return itemError(ae.Items()[0])
 	}
 	return err
@@ -685,7 +685,7 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 		case client.Live:
 			return false, fail(http.StatusConflict, "%s is already in catalog %s", name, cat)
 		case client.Purged:
-			return false, fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", cat, name)
+			return false, purgedErr(cat, name)
 		case client.Tombstoned:
 			_, err = st.p.c.Restore(ctx, cat, name, h.ID, withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))
 		default:
@@ -778,6 +778,7 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 			}
 			if err == nil {
 				tomb = res.ID
+				st.p.markOwn(ns, name, tomb)
 			}
 			return false, err
 		}
@@ -790,6 +791,7 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 		}
 		if err == nil && len(res.Items) == 1 && len(res.Items[0].IDs) == 2 {
 			tomb = res.Items[0].IDs[1]
+			st.p.markOwn(ns, name, tomb)
 		}
 		st.committed = st.committed || err == nil
 		return false, err
@@ -1002,6 +1004,7 @@ func (st *reqState) copyOfFile(ctx context.Context, src target) (headDoc, []byte
 // over" saves land. One document shown in both places isn't moved onto
 // itself.
 func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
+	st.onto = dst.path
 	if src.docNS == dst.docNS && src.docName == dst.docName {
 		return fail(http.StatusForbidden, "%s and %s are one document, %s/%s, shown in two places; delete the one you don't want", src.path, dst.path, src.docNS, src.docName)
 	}

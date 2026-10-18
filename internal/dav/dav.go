@@ -349,25 +349,24 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		st.ctype = r.Header.Get("Content-Type")
 		// x/net/webdav ignores the preconditions of a PUT and a DELETE:
-		// If-None-Match: * creates only, and the revision If-Match (or an
-		// If header's entity tag) names is the base of the edit (§11
-		// submit), or the revision a DELETE deletes. An If list of entity
-		// tags only it would take for lock tokens, and fail (412): those
-		// lists are this server's to check.
+		// If-None-Match: * creates only, and the revision If-Match (its
+		// first value), or failing that the If header (ifHeaderETag),
+		// names is the base of the edit (§H.4), or the revision a DELETE
+		// deletes. An If list of entity tags only it would take for lock
+		// tokens, and fail (412): those lists are this server's to check.
+		ifTag := ifHeaderETag(r.Header.Get("If"), st.path)
 		if h := r.Header.Get("If"); h != "" {
-			rest, tag := splitIf(h)
-			if rest == "" {
+			if rest := splitIf(h); rest == "" {
 				r.Header.Del("If")
 			} else {
 				r.Header.Set("If", rest)
 			}
-			st.ifMatch = tag
 		}
 		if r.Method == "PUT" {
 			// The write that follows a document's move aside (vim's backup)
 			// is the edit of it, even create-only (davfs2 then believes the
 			// name free).
-			aside := p.takeAside(st.path, s.opt.Now(), s.opt.ScratchIdle)
+			aside := p.takeAside(st.path, s.opt.Now())
 			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
 		}
 		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
@@ -375,8 +374,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st.matchAny = true
 		case im != "":
 			st.ifMatch = revOfETag(strings.TrimSpace(strings.Split(im, ",")[0]))
-		case st.ifMatch == "":
-			st.ifMatch = ifHeaderETag(r.Header.Get("If"))
+		default:
+			st.ifMatch = ifTag
 		}
 	}
 	switch {
@@ -415,32 +414,36 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // answered keeps what the request's answer, status, says of the
-// principal's saves for a DELETE that follows (refusedSaveFor). A PUT of
-// a document's file refused without writing to the core is noted, but
-// for one that put back the principal's own DELETE (undoOwnDelete), which
-// a DELETE after it leaves deleted as the principal chose, and one a
-// frozen namespace refused, which takes no DELETE either (§8.4). A DELETE
-// done, or a GET of the file answered whole once the refusal is
-// refusedSaveRead old, forgets them; a DELETE that found nothing (a
-// refused create's cleanup) uses one up. It runs before the answer goes
-// out, so the client's next request finds it.
+// principal's saves for a DELETE that follows (refusedSave): a PUT of a
+// file, or a MOVE onto an existing one (onto), refused without writing to
+// the core sets a guard, but for one that put back the principal's own
+// DELETE (undoOwnDelete), which a DELETE after it leaves deleted as the
+// principal chose, and one a frozen namespace refused, which takes no
+// DELETE either (§8.4); a DELETE that found nothing (a refused create's
+// cleanup) uses one up. A GET answered whole of a file the core has gone
+// is the reload a refused save over someone else's delete asked for
+// (tombBase). It runs before the answer goes out, so the client's next
+// request finds it.
 func (st *reqState) answered(status int) {
 	now := st.s.opt.Now()
+	guardOn := ""
 	switch {
-	case st.method == "PUT" && st.saveTo != "" && status >= 400:
-		switch {
-		case st.committed, st.undeleted:
-		case st.saveDoc && st.err != nil && st.err.frozen:
-			st.p.clearRefusedSave(st.saveTo)
-		default:
-			st.p.noteRefusedSave(st.saveTo, status, now)
+	case st.method == "PUT":
+		guardOn = st.saveTo
+	case st.method == "MOVE":
+		guardOn = st.onto
+	}
+	switch {
+	case guardOn != "" && status >= 400:
+		if !st.committed && !st.undeleted && (st.err == nil || !st.err.frozen) {
+			st.p.noteRefusedSave(guardOn, status, now)
 		}
-	case st.method == "DELETE" && status < 400:
-		st.p.clearRefusedSave(st.path)
 	case st.method == "DELETE" && status == http.StatusNotFound:
 		st.p.takeRefusedSave(st.path, now)
-	case st.method == "GET" && status == http.StatusOK:
-		st.p.readAfterRefusedSave(st.path, now)
+	case st.method == "GET" && status == http.StatusNotFound:
+		for _, g := range st.gone {
+			st.s.reloaded(st.p, g.ns, g.name)
+		}
 	}
 }
 
@@ -483,22 +486,60 @@ func revOfETag(tag string) string {
 	return tag[1 : len(tag)-1]
 }
 
-// ifHeaderETag is the first entity tag an If header (RFC 4918 §10.4)
-// requires, as macOS and Windows send one beside their lock token.
-func ifHeaderETag(h string) string {
+// ifHeaderETag is the revision an If header (RFC 4918 §10.4) names as a
+// save's base (§H.4), as macOS and Windows send one beside their lock
+// token: the first entity tag, not negated with Not, of the first list
+// that applies to this resource, reqPath, and holds one. An untagged list
+// applies to the request's resource; a tagged one to the resource its tag
+// names, and the lists after a tag are its own until the next.
+func ifHeaderETag(h, reqPath string) string {
+	applies := true
 	for i := 0; i < len(h); i++ {
 		switch h[i] {
 		case '<':
-			if j := strings.IndexByte(h[i:], '>'); j > 0 {
-				i += j
-			}
-		case '[':
-			j := strings.IndexByte(h[i:], ']')
+			j := strings.IndexByte(h[i:], '>')
 			if j < 0 {
 				return ""
 			}
-			if !strings.HasSuffix(strings.TrimSpace(h[:i]), "Not") {
-				if rev := revOfETag(h[i+1 : i+j]); rev != "" {
+			u, err := url.Parse(h[i+1 : i+j])
+			applies = err == nil && slashClean(u.Path) == reqPath
+			i += j
+		case '(':
+			j := strings.IndexByte(h[i:], ')')
+			if j < 0 {
+				return ""
+			}
+			list := h[i+1 : i+j]
+			i += j
+			if !applies {
+				continue
+			}
+			if rev := listETag(list); rev != "" {
+				return rev
+			}
+		}
+	}
+	return ""
+}
+
+// listETag is the revision of the first entity tag not negated with Not
+// among the conditions of one If list.
+func listETag(list string) string {
+	for i := 0; i < len(list); i++ {
+		switch list[i] {
+		case '<':
+			j := strings.IndexByte(list[i:], '>')
+			if j < 0 {
+				return ""
+			}
+			i += j
+		case '[':
+			j := strings.IndexByte(list[i:], ']')
+			if j < 0 {
+				return ""
+			}
+			if !strings.HasSuffix(strings.TrimSpace(list[:i]), "Not") {
+				if rev := revOfETag(list[i+1 : i+j]); rev != "" {
 					return rev
 				}
 			}
@@ -508,12 +549,15 @@ func ifHeaderETag(h string) string {
 	return ""
 }
 
-// splitIf takes out of an If header (RFC 4918 §10.4) its untagged lists
-// that hold entity tags only (with the always true Not <DAV:no-lock>),
-// and returns the rest and the first such entity tag's revision. One that
-// doesn't parse is left whole, for x/net/webdav to refuse.
-func splitIf(h string) (rest, rev string) {
-	var keep []string
+// splitIf takes out of an If header (RFC 4918 §10.4) its lists of entity
+// tags (with the always true Not <DAV:no-lock>), tagged or not: they hold
+// no lock token, which is all x/net/webdav checks (a list without one
+// always fails there, 412), and they are this server's to read
+// (ifHeaderETag). It returns the rest; one that doesn't parse is left
+// whole, for x/net/webdav to refuse.
+func splitIf(h string) string {
+	var out []string
+	tag, said := "", "" // the lists' resource tag, and the last one kept
 	i := 0
 	skip := func() {
 		for i < len(h) && (h[i] == ' ' || h[i] == '\t') {
@@ -530,20 +574,20 @@ func splitIf(h string) (rest, rev string) {
 		return s, true
 	}
 	for skip(); i < len(h); skip() {
-		start := i
-		tagged := false
 		if h[i] == '<' {
-			if _, ok := upto('>'); !ok {
-				return h, ""
+			t, ok := upto('>')
+			if !ok {
+				return h
 			}
-			tagged = true
+			tag = t
 			skip()
 		}
 		if i >= len(h) || h[i] != '(' {
-			return h, ""
+			return h
 		}
+		start := i
 		i++
-		tags, other := []string{}, false
+		tags, other := 0, false
 		for skip(); i < len(h) && h[i] != ')'; skip() {
 			not := false
 			if strings.HasPrefix(h[i:], "Not") {
@@ -552,44 +596,40 @@ func splitIf(h string) (rest, rev string) {
 				skip()
 			}
 			if i >= len(h) {
-				return h, ""
+				return h
 			}
 			switch h[i] {
 			case '<':
 				tok, ok := upto('>')
 				if !ok {
-					return h, ""
+					return h
 				}
 				if !not || tok != "<DAV:no-lock>" {
 					other = true
 				}
 			case '[':
-				tag, ok := upto(']')
-				if !ok {
-					return h, ""
+				if _, ok := upto(']'); !ok {
+					return h
 				}
-				if not {
-					other = true
-				} else {
-					tags = append(tags, tag[1:len(tag)-1])
-				}
+				tags++
 			default:
-				return h, ""
+				return h
 			}
 		}
 		if i >= len(h) {
-			return h, ""
+			return h
 		}
 		i++
-		if tagged || other || len(tags) == 0 {
-			keep = append(keep, h[start:i])
-			continue
-		}
-		if rev == "" {
-			rev = revOfETag(tags[0])
+		if other || tags == 0 {
+			// A list after a tag is that tag's (RFC 4918 §10.4.2): kept
+			// so, if the list that carried the tag is taken out.
+			if tag != said {
+				out, said = append(out, tag), tag
+			}
+			out = append(out, h[start:i])
 		}
 	}
-	return strings.Join(keep, " "), rev
+	return strings.Join(out, " ")
 }
 
 // authenticate returns the request's principal, or the answer refusing
@@ -999,12 +1039,44 @@ type principal struct {
 	dropped bool
 	ns      map[string]nsInfo
 	cats    map[string]*catGraph
-	locked  map[string]time.Time   // its locks' tokens, and when they expire
-	deletes map[string]ownDelete   // by ns/name: its latest DELETEs
-	trees   map[string]treeDelete  // by path: the files of trees its latest DELETEs removed
-	aside   map[string]time.Time   // documents' paths moved aside to a backup, and when
-	refused map[string]refusedSave // by document path: its refused saves lately
+	locked  map[string]time.Time  // its locks' tokens, and when they expire
+	deletes map[string]ownDelete  // by ns/name: its latest DELETEs
+	trees   map[string]treeDelete // by path: the files of trees its latest DELETEs removed
+	aside   map[string]time.Time  // documents' paths moved aside to a backup, and when
+	guards  map[string][]guard    // by document path: its refused saves' guards, oldest first
+	nguards int
+	own     lru.Cache[string, bool] // by ns/name@id: the tombstones and restores it wrote
 }
+
+// maxOwn bounds the tombstones and restores a principal remembers having
+// written (ownEntry).
+const maxOwn = 1 << 12
+
+// markOwn remembers that the principal wrote entry id of ns/name, a
+// tombstone or a restore: one between a save's base and the head is no
+// delete or restore by someone else (§11.3, §H.4).
+func (p *principal) markOwn(ns, name, id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.own.Put(ns+"/"+name+"@"+id, true, 1)
+}
+
+// ownEntry reports whether the principal wrote entry id of ns/name, as
+// far as it remembers (markOwn): one it forgot counts as someone else's,
+// which a save from before refuses (a reload settles it).
+func (p *principal) ownEntry(ns, name, id string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.own.Get(ns + "/" + name + "@" + id)
+	return ok
+}
+
+// asideFor is how soon after the principal moved a document aside to a
+// scratch name its create-only PUT of the document is taken as an edit
+// (§H.5 "Move to a scratch name", "within a few seconds"): vim on davfs2
+// moves the original aside when it saves, and davfs2 uploads the new
+// version when its upload delay (10 seconds by default) is over.
+const asideFor = 30 * time.Second
 
 // setAside remembers that the principal moved the document at name aside
 // (a backup's MOVE, which copies it): its client takes the name for free.
@@ -1021,13 +1093,13 @@ func (p *principal) setAside(name string, now time.Time) {
 }
 
 // takeAside reports, once, whether the principal moved the document at
-// name aside within idle.
-func (p *principal) takeAside(name string, now time.Time, idle time.Duration) bool {
+// name aside within asideFor.
+func (p *principal) takeAside(name string, now time.Time) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	at, ok := p.aside[name]
 	delete(p.aside, name)
-	return ok && now.Sub(at) <= idle
+	return ok && now.Sub(at) <= asideFor
 }
 
 // ownDelete is a tombstone a principal's DELETE wrote.
@@ -1120,113 +1192,117 @@ func (p *principal) forgetTreeDelete(path string) {
 	delete(p.trees, path)
 }
 
-// A refused save of a document's file (a PUT answered 4xx or 5xx that
-// wrote nothing of it) makes the principal's next DELETE of the same path
-// within refusedSaveFor a 409, once per refused save (at most
-// maxRefusedCount pending), unless the principal read the file since (a
-// GET answered 200, at least refusedSaveRead after the refusal): rclone
-// deletes a file whose upload failed, a second after the failure
-// (removeFailedCopy), and that DELETE would tombstone the document for
-// every reader, or delete a tree's file, because a save was refused. A
-// DELETE naming the revision it deletes (If-Match) is deliberate and
-// passes; so does the DELETE sent again. A refused MOVE or COPY onto the
-// file sets none: rclone never deletes after one, and its next save
-// without a cache (DELETE, then MOVE) would meet the guard instead.
+// A refused save of a file (a PUT, or a MOVE onto an existing file,
+// answered 4xx or 5xx without writing to the core) sets a guard (§H.6):
+// the principal's DELETE of the same path within refusedSaveFor is a 409,
+// once per refusal, and two refusals never share one. rclone deletes a
+// file whose upload failed, a second after the failure
+// (removeFailedCopy), whatever refused it, and that DELETE would
+// tombstone the document for every reader, or delete a tree's file,
+// because a save was refused. A guard ends only by time: a read of the
+// file doesn't lift it (another program's GET is no reload), nor does
+// another program's write, or a DELETE that passed. A DELETE naming the
+// revision it deletes (If-Match, or an If header's entity tag) is
+// deliberate and passes, the guards left as they are, as does one in a
+// frozen namespace, which the core refuses anyway (§8.4); one that finds
+// nothing (a refused create's cleanup) uses one up. A refused plain MOVE
+// (to a new name) or COPY sets none, nor does a write whose refusal undid
+// the principal's own DELETE (undoOwnDelete), whose cleanup DELETE then
+// leaves the file deleted as the principal chose, nor a refusal of a
+// frozen namespace's.
 const refusedSaveFor = 10 * time.Second
 
-// refusedSaveRead is how old a refused save must be for a GET of the
-// file to lift its guard: another program of the principal's reading the
-// file in the second before rclone's DELETE isn't the principal's
-// reload.
-const refusedSaveRead = 2 * time.Second
-
-// maxRefused bounds the paths a principal's refused saves are kept for,
-// and maxRefusedCount the DELETEs one path's refuse: two clients' refused
-// saves of it, each followed by its cleanup, without making a deliberate
-// DELETE after a client's repeated refused saves (none of which deletes)
-// take more than a few tries.
-const (
-	maxRefused      = 1024
-	maxRefusedCount = 2
-)
+// maxGuards bounds a principal's guards over all paths, sized for many
+// uploads refused at once (80 parallel uploads once exhausted a small
+// table and tombstoned 16 files, §H.6); over it, the oldest goes.
+const maxGuards = 4096
 
 // maxRefusedPath bounds the path of a refused save kept for a PUT whose
 // path couldn't be resolved (a tree that couldn't be read).
 const maxRefusedPath = 1024
 
-// refusedSave is a path's refused saves: the latest's time and status,
-// and how many DELETEs they still refuse.
-type refusedSave struct {
+// guard is a refused save's guard: when, and its status.
+type guard struct {
 	at     time.Time
 	status int
-	n      int
 }
 
-// noteRefusedSave remembers that a save of the document at path was
+// noteRefusedSave sets a guard on the file at path: a save of it was
 // refused (status) at now.
 func (p *principal) noteRefusedSave(path string, status int, now time.Time) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	for k, r := range p.refused {
-		if now.Sub(r.at) > refusedSaveFor {
-			delete(p.refused, k)
-		}
-	}
-	r, ok := p.refused[path]
-	if !ok && len(p.refused) >= maxRefused {
-		var old string
-		for k, r := range p.refused {
-			if old == "" || r.at.Before(p.refused[old].at) {
+	p.expireGuardsLocked(now)
+	for p.nguards >= maxGuards {
+		old := ""
+		for k, gs := range p.guards {
+			if old == "" || gs[0].at.Before(p.guards[old][0].at) {
 				old = k
 			}
 		}
-		delete(p.refused, old)
+		p.dropGuardLocked(old)
 	}
-	p.refused[path] = refusedSave{at: now, status: status, n: min(r.n+1, maxRefusedCount)}
+	p.guards[path] = append(p.guards[path], guard{at: now, status: status})
+	p.nguards++
 }
 
-// takeRefusedSave takes one DELETE's refusal from the principal's refused
-// saves of the document at path within refusedSaveFor of now, saying how
-// many more DELETEs they refuse.
-func (p *principal) takeRefusedSave(path string, now time.Time) (r refusedSave, left int, ok bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	r, ok = p.refused[path]
-	if !ok || now.Sub(r.at) > refusedSaveFor {
-		delete(p.refused, path)
-		return r, 0, false
+// expireGuardsLocked drops the guards older than refusedSaveFor.
+func (p *principal) expireGuardsLocked(now time.Time) {
+	for k, gs := range p.guards {
+		for len(gs) > 0 && now.Sub(gs[0].at) > refusedSaveFor {
+			gs = gs[1:]
+			p.nguards--
+		}
+		if len(gs) == 0 {
+			delete(p.guards, k)
+		} else {
+			p.guards[k] = gs
+		}
 	}
-	if r.n <= 1 {
-		delete(p.refused, path)
-		return r, 0, true
-	}
-	p.refused[path] = refusedSave{at: r.at, status: r.status, n: r.n - 1}
-	return r, r.n - 1, true
 }
 
-// clearRefusedSave forgets the refused saves of the document at path.
-func (p *principal) clearRefusedSave(path string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	delete(p.refused, path)
+// dropGuardLocked drops path's oldest guard.
+func (p *principal) dropGuardLocked(path string) {
+	gs := p.guards[path]
+	if len(gs) <= 1 {
+		delete(p.guards, path)
+	} else {
+		p.guards[path] = gs[1:]
+	}
+	if len(gs) > 0 {
+		p.nguards--
+	}
 }
 
-// readAfterRefusedSave forgets the refused saves of the document at path
-// that the principal read (a GET answered 200) at now, if the latest is
-// at least refusedSaveRead old: the principal reloaded it.
-func (p *principal) readAfterRefusedSave(path string, now time.Time) {
+// takeRefusedSave uses up the oldest guard on the file at path within
+// refusedSaveFor of now, saying how many more are left.
+func (p *principal) takeRefusedSave(path string, now time.Time) (g guard, left int, ok bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if r, ok := p.refused[path]; ok && now.Sub(r.at) >= refusedSaveRead {
-		delete(p.refused, path)
+	p.expireGuardsLocked(now)
+	gs := p.guards[path]
+	if len(gs) == 0 {
+		return guard{}, 0, false
 	}
+	p.dropGuardLocked(path)
+	return gs[0], len(gs) - 1, true
+}
+
+// guarded reports whether the file at path has a guard within
+// refusedSaveFor of now.
+func (p *principal) guarded(path string, now time.Time) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.expireGuardsLocked(now)
+	return len(p.guards[path]) > 0
 }
 
 func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
-	return &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
+	p := &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
 		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, locked: map[string]time.Time{}, deletes: map[string]ownDelete{},
-		trees: map[string]treeDelete{}, aside: map[string]time.Time{},
-		refused: map[string]refusedSave{}, used: s.opt.Now()}
+		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now()}
+	p.own.MaxEntries = maxOwn
+	return p
 }
 
 // reqState is one request's view, in its context: the principal, what
@@ -1266,6 +1342,11 @@ type reqState struct {
 	saveDoc   bool
 	committed bool
 	undeleted bool
+	// onto is the existing file a MOVE saves into (§H.5), whose refusal
+	// sets a guard (§H.6); gone, a document a GET found the core has
+	// gone (tombBase).
+	onto string
+	gone []stagedServe
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog

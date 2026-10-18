@@ -21,6 +21,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // errNotExist is what the WebDAV handler takes as "no such file".
@@ -672,6 +673,14 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		return &writeFile{st: st, ctx: ctx, t: t, scratch: true}, nil
 	}
 	fi, err := st.stat(ctx, t)
+	if errors.Is(err, errNotExist) && st.method == "GET" && t.path == st.path && t.docName != "" {
+		// A file the core has gone, read: the reload a save refused over
+		// someone else's delete asked for (tombBase).
+		st.gone = []stagedServe{{ns: t.docNS, name: t.docName}}
+		if t.rawName != "" {
+			st.gone = append(st.gone, stagedServe{ns: t.docNS, name: t.rawName})
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -851,20 +860,26 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	return nil
 }
 
-// afterRefusedSave refuses, once, a DELETE of the document's file t that
-// follows the principal's refused save of it (refusedSaveFor), unless it
-// names the revision it deletes. A document in a frozen namespace isn't
-// deleted anyway: its DELETE gets the core's refusal (§8.4).
+// afterRefusedSave refuses a DELETE of the document's file t that follows
+// the principal's refused save of it, using up one guard (refusedSaveFor,
+// §H.6), unless it names the revision it deletes, which passes and leaves
+// the guards. A document in a frozen namespace isn't deleted anyway: its
+// DELETE gets the core's refusal (§8.4), the guards left; whether it is
+// frozen is read again for a guarded DELETE, not taken from what was read
+// before the namespace froze.
 func (st *reqState) afterRefusedSave(ctx context.Context, t target) error {
-	if st.ifMatch != "" {
+	now := st.s.opt.Now()
+	if st.ifMatch != "" || !st.p.guarded(t.path, now) {
 		return nil
 	}
-	r, left, ok := st.p.takeRefusedSave(t.path, st.s.opt.Now())
+	if t.kind == kDoc || t.kind == kRaw {
+		st.p.forgetNS(t.docNS)
+		if st.s.nsInfo(ctx, st.p, t.docNS).frozen {
+			return nil
+		}
+	}
+	r, left, ok := st.p.takeRefusedSave(t.path, now)
 	if !ok {
-		return nil
-	}
-	if (t.kind == kDoc || t.kind == kRaw) && st.s.nsInfo(ctx, st.p, t.docNS).frozen {
-		st.p.clearRefusedSave(t.path)
 		return nil
 	}
 	again := "delete it again to delete it"
@@ -882,11 +897,12 @@ func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {
 
 // rename is a MOVE: the handler has cleared an existing destination
 // (removeAll, which leaves documents and nodes in place). A live file
-// moved to a scratch name is an editor's backup: copied, it stays. Where
-// a tree is involved, a file moves as §H.5 says (moveFile) and a folder
-// within its tree (moveFolder); in the flat view a file isn't renamed.
-// A scratch file moved onto a file's name is a save of its content, and a
-// scratch directory moved to a tree's new name becomes a folder there.
+// moved to a scratch name is an editor's backup: copied, it stays (§H.5).
+// Where a tree is involved, a file moves as §H.5 says (moveFile) and a
+// folder within its tree (moveFolder); in the flat view as §H.8 says
+// (moveFlat). A scratch file moved onto a file's name is a save of its
+// content, and a scratch directory moved to a tree's new name becomes a
+// folder there.
 func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	src, err := st.resolve(ctx, oldName)
 	if err != nil {
@@ -936,7 +952,7 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	case src.kind == kFolder:
 		return st.moveFolder(ctx, src, dst)
 	case live:
-		return fail(http.StatusForbidden, "names are identity (§3.6): a file of a namespace's directory isn't renamed or moved to another namespace's here; copy it to the new name and delete the old one (in the flat view a rename is a copy and a delete, §H.2)")
+		return st.moveFlat(ctx, src, dst)
 	case src.kind == kScratch && src.sdir:
 		switch {
 		case dst.kind == kNewNode && !appDir(dst.base):
@@ -967,7 +983,15 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	switch {
 	case dst.isDoc():
 		// The atomic save: a temporary file moved over the document is
-		// a write of its content.
+		// a write of its content, and one refused over a live file sets a
+		// guard (§H.6).
+		if dst.kind != kNewNode {
+			if _, live, err := st.docAt(ctx, dst); err != nil {
+				return err
+			} else if live {
+				st.onto = dst.path
+			}
+		}
 		if err := st.writable(ctx, dst); err != nil {
 			return err
 		}
@@ -981,6 +1005,146 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		return st.scratchRename(src.path, dst.path)
 	}
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
+}
+
+// moveFlat is a MOVE of live file src of a flat namespace where no tree
+// is involved (§H.8, §H.5): onto an existing file, a save of its content
+// into it, which keeps that file's history (moveOnto); to a free name in
+// another namespace, a copy and a delete (moveAcross); to a free name in
+// its own, a create and a delete with $successor in one batch
+// (batchMove).
+func (st *reqState) moveFlat(ctx context.Context, src, dst target) error {
+	if dst.kind != kDoc && dst.kind != kRaw {
+		return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
+	}
+	if _, live, err := st.docAt(ctx, dst); err != nil {
+		return err
+	} else if live {
+		return st.moveOnto(ctx, src, dst)
+	}
+	if dst.ns != src.ns {
+		return st.moveAcross(ctx, src, dst)
+	}
+	return st.batchMove(ctx, src, dst)
+}
+
+// batchMove moves live file src of a flat namespace to dst, a free name in
+// the same namespace (§H.8, §8.1): one batch (§7.5) creates the new
+// resource with src's document, its $nonce and $successor aside (restores
+// it so, if it is tombstoned), and appends $successor naming it to src
+// before src's tombstone, with If-Match on src's head (again on the new
+// head if it moved, 412). A raw file's blob is copied to the new resource
+// first with Blob-From (§7.8), or uploaded again where the new name gives
+// it another type (§H.1). A JSON file keeps a {name}.json name and a raw
+// file a raw one, and one whose root isn't an object, which can't carry
+// $successor, isn't moved (403): it can be copied, then deleted.
+func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
+	ns := src.ns
+	in := st.s.nsInfo(ctx, st.p, ns)
+	if in.sealed {
+		return notOffered(ns)
+	}
+	sent := map[string]bool{} // blobs copied or uploaded to the new resource
+	return st.retrying(ctx, func() (bool, error) {
+		sh, err := st.p.c.Head(ctx, ns, src.docName)
+		if err != nil {
+			return false, err
+		}
+		if sh.State != client.Live {
+			return false, errNotExist
+		}
+		e, err := st.s.doc(ctx, st.p, ns, src.docName, sh.ID)
+		switch {
+		case err != nil:
+			return false, err
+		case e.sealed:
+			return false, notOffered(ns)
+		}
+		to := dst.docName
+		m, obj := e.value.(map[string]any)
+		switch {
+		case e.raw != nil && dst.kind == kRaw:
+		case e.raw != nil && dst.rawName != "":
+			to = dst.rawName
+		case e.raw != nil:
+			return false, fail(http.StatusForbidden, "%s is a raw file, named by its resource name in a namespace's directory (§H.2), and %s names a JSON document; copy it there to keep its content as one", src.path, dst.base)
+		case dst.kind != kDoc:
+			return false, fail(http.StatusForbidden, "%s is a JSON file, shown as {name}.json in a namespace's directory (§H.2): it moves to another {name}.json; copy it to %s to keep its content as a raw file", src.path, dst.base)
+		case !obj:
+			return false, fail(http.StatusForbidden, "the root of %s is %s, which can't carry $successor (§8.1, §H.5), so it isn't moved; copy it to %s, then delete it", src.path, jsonKind(e.value), dst.base)
+		}
+		doc := map[string]any{}
+		for k, v := range m {
+			doc[k] = v
+		}
+		doc = bare(doc).(map[string]any)
+		if r := e.raw; r != nil {
+			typ := fileType(dst.base, r.typ)
+			if typ == r.typ {
+				if !sent[r.bid] {
+					if err := st.p.c.CopyBlob(ctx, ns, to, r.bid, ns, src.docName, ""); err != nil {
+						return false, err
+					}
+					sent[r.bid] = true
+				}
+			} else {
+				hd := headDoc{ns: ns, name: src.docName, rev: sh.ID, m: e.meta(), e: e}
+				b, err := st.fileBytes(ctx, &hd)
+				if err != nil {
+					return false, err
+				}
+				nonce := ""
+				if in.nonce {
+					nonce = seal.NewNonce()
+				}
+				delete(doc, "nonce")
+				for k, v := range refValue(client.BlobID(typ, nonce, b), typ, len(b), nonce) {
+					doc[k] = v
+				}
+				if bid := doc["$blob"].(string); !sent[bid] {
+					if _, err := st.p.c.UploadBlob(ctx, ns, to, typ, nonce, b); err != nil {
+						return false, err
+					}
+					sent[bid] = true
+				}
+			}
+		}
+		th, err := st.p.c.Head(ctx, ns, to)
+		if err != nil {
+			return false, err
+		}
+		item := client.BatchItem{Resource: to}
+		switch th.State {
+		case client.NotFound:
+			item.IfNoneMatch = true
+			item.Steps = []client.Step{client.PatchStep(withNonce(in, doc, client.GenesisPatches(doc)))}
+		case client.Tombstoned:
+			item.IfMatch = th.ID
+			item.Steps = []client.Step{client.PatchStep(withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))}
+		case client.Purged:
+			return false, purgedErr(ns, to)
+		default:
+			return false, fail(http.StatusConflict, "%s/%s was made by someone else meanwhile; %s isn't moved", ns, to, src.path)
+		}
+		succ := withNonce(in, e.value, []any{map[string]any{"op": "add", "path": "/$successor", "value": to}})
+		res, err := st.p.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{item, {Resource: src.docName, IfMatch: sh.ID,
+			Steps: []client.Step{client.PatchStep(succ), client.DeleteStep()}}}}, false)
+		err = batchErr(err)
+		if client.IsStale(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		st.committed = true
+		if len(res.Items) == 2 && len(res.Items[1].IDs) == 2 {
+			st.p.markOwn(ns, src.docName, res.Items[1].IDs[1])
+		}
+		if th.State == client.Tombstoned && len(res.Items) > 0 && len(res.Items[0].IDs) == 1 {
+			st.p.markOwn(ns, to, res.Items[0].IDs[0])
+		}
+		return false, nil
+	})
 }
 
 // fileBytes returns live file hd's content as its reader gets it: a JSON

@@ -58,6 +58,10 @@ func TestListAndGet(t *testing.T) {
 	e.expect(e.do("GET", "/docs/c.json", ""), 404, "GET tombstoned")
 	e.expect(e.do("GET", "/docs/nope.json", ""), 404, "GET missing")
 	e.expect(e.do("PROPFIND", "/", "", "Depth", "infinity"), 403, "PROPFIND infinity")
+	// No Depth is 1 (§H.6), not RFC 4918's infinity.
+	if r := e.expect(e.do("PROPFIND", "/docs/", ""), 207, "PROPFIND without Depth"); !strings.Contains(r.body, "/docs/a.json") {
+		t.Fatalf("PROPFIND without Depth: %s", r.body)
+	}
 	if r := e.expect(e.do("OPTIONS", "/docs/a.json", ""), 200, "OPTIONS"); r.header.Get("DAV") != "1, 2" {
 		t.Fatalf("OPTIONS %v", r.header)
 	}
@@ -340,14 +344,17 @@ func TestCopyMoveLock(t *testing.T) {
 	e := newEnv(t, []string{"docs", "other"}, nil, nil)
 	ra := e.create("docs", "a", map[string]any{"v": 1})
 	e.create("docs", "b", map[string]any{"v": 2})
-	e.expect(e.do("MOVE", "/docs/a.json", "", "Destination", "/docs/c.json"), 403, "rename")
-	e.expect(e.do("MOVE", "/docs/a.json", "", "Destination", "/docs/b.json", "Overwrite", "T"), 403, "move over another document")
-	e.expect(e.do("MOVE", "/docs/a.json", "", "Destination", "/other/a.json"), 403, "move to another namespace")
+	// A flat namespace's files move as §H.8 says (TestFlatMoves), but for
+	// one whose root can't carry $successor, or to a name of another kind
+	// of file. (Moves were refused before Addendum H.)
+	e.create("docs", "arr", []any{1.0})
+	e.expect(e.do("MOVE", "/docs/arr.json", "", "Destination", "/docs/c.json"), 403, "rename an array")
+	e.expect(e.do("MOVE", "/docs/a.json", "", "Destination", "/docs/c.md"), 403, "rename a JSON file to a raw file's name")
 	if h, _ := e.load("docs", "a"); h.ID != ra {
 		t.Fatal("a refused move changed a")
 	}
-	if h, _ := e.load("docs", "b"); h.State != client.Live {
-		t.Fatal("a refused move deleted b")
+	if h, _ := e.load("docs", "c"); h.State != client.NotFound {
+		t.Fatal("a refused move made c")
 	}
 	e.expect(e.do("COPY", "/docs/a.json", "", "Destination", "/other/a2.json"), 201, "copy")
 	_, doc := e.load("other", "a2")
@@ -446,10 +453,22 @@ func TestLimits(t *testing.T) {
 	})
 	e.create("small", "x", map[string]any{"v": 1})
 	e.do("GET", "/small/x.json", "")
-	// A 413 says what the core doesn't: the sizes, and the limit the
-	// namespace sets (§6.6); not the status again.
-	r := e.expect(e.do("PUT", "/small/x.json", `{"v": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 413, "PUT over patchSetSize")
-	if strings.HasPrefix(r.body, "413") || !strings.Contains(r.body, "patch set too large") || !strings.Contains(r.body, "patch set is 2039 bytes") || !strings.Contains(r.body, "patchSetSize 1024") {
+	// A patch set over patchSetSize from the head is written as a root
+	// replace, which may be as large as documentSize (§H.4, §6.6), where
+	// it was a 413 before Addendum H (TestOversizeSave has more).
+	e.expect(e.do("PUT", "/small/x.json", `{"v": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 201, "PUT over patchSetSize, from the head")
+	if p := e.lastEntry("small", "x").Patches.([]any); len(p) != 1 || p[0].(map[string]any)["path"] != "" {
+		t.Fatalf("not a root replace: %v", p)
+	}
+	// One merged with others' edits is a 413, which says what the core
+	// doesn't: the sizes, and the limit the namespace sets (§6.6); not
+	// the status again.
+	e.create("small", "y", map[string]any{"v": 1, "w": 1})
+	e.do("GET", "/small/y.json", "")
+	e.theirs("small", "y", replace("/w", 2))
+	r := e.expect(e.do("PUT", "/small/y.json", `{"v": 1, "w": 1, "big": "`+strings.Repeat("x", 2000)+`"}`), 413, "PUT over patchSetSize, merged")
+	if strings.HasPrefix(r.body, "413") || !strings.Contains(r.body, "patch set too large") || !strings.Contains(r.body, "patch set is 2039 bytes") ||
+		!strings.Contains(r.body, "patchSetSize 1024") || !strings.Contains(r.body, "merged") {
 		t.Fatalf("413 text %q", r.body)
 	}
 	e.expect(e.do("PUT", "/slow/x.json", `{"v": 1}`), 201, "first write")
@@ -471,7 +490,7 @@ func TestLimits(t *testing.T) {
 	// refused save (rclone's cleanup) is the core's 403, not the guard's
 	// 409 (which would say a second DELETE deletes it), though the 413
 	// before set the guard.
-	e.expect(e.do("DELETE", "/small/x.json", ""), 403, "DELETE in a frozen namespace")
+	e.expect(e.do("DELETE", "/small/y.json", ""), 403, "DELETE in a frozen namespace")
 	e.expect(e.do("PUT", "/small/new.json", `{"v": 1}`), 403, "create in a frozen namespace")
 }
 

@@ -37,15 +37,18 @@ func fail(status int, format string, args ...any) *davError {
 	return &davError{status: status, msg: fmt.Sprintf(format, args...)}
 }
 
-// upstream maps an error of the core (§12) to what the WebDAV client gets:
-// 401, 403 and 404 pass through, 409 frozen is 403 (a frozen namespace
-// takes no writes, §8.4, for good: clients retry a 423, as a lock that
-// may go), 413 stays, the other 422s keep their errors, 429 is 503 with
-// Retry-After, and anything else the core failed with is 502. A failure
-// to reach the core is 502 too, its details (the core's address) only
-// logged. Writes map 412, 410 and patch failures themselves. The text is
-// the core's code and message: the status is the answer's own, and the
-// core's is named only where it differs.
+// upstream maps an error of the core (§12) to what the WebDAV client gets
+// (§H.4 "Answers"): 401, 403 and 404 pass through, 409 frozen is 403
+// naming the successor (a frozen namespace takes no writes, §8.4, for
+// good: clients retry a 423, as a lock that may go), 410 purged stays
+// (§8.5) and another 410 (deleted meanwhile, pruned) is a 409 asking for
+// a reload, 413 stays and so does a 422 limit, as 413 (§6.6), the other
+// 422s keep their errors, 429 is 503 with Retry-After, and anything else
+// the core failed with is 502. A failure to reach the core is 502 too,
+// its details (the core's address) only logged. Writes map 412 and patch
+// failures themselves. The text is the core's code and message: the
+// status is the answer's own, and the core's is named only where it
+// differs.
 func upstream(err error) error {
 	if err == nil {
 		return nil
@@ -82,8 +85,12 @@ func upstream(err error) error {
 		return e
 	case ae.Status == 409:
 		return fail(http.StatusConflict, "%s", msg)
+	case ae.Status == 410 && ae.Code == "purged":
+		return fail(http.StatusGone, "%s: the namespace was purged (§8.5)", msg)
 	case ae.Status == 410:
-		return fail(http.StatusConflict, "the core answered 410: %s", msg)
+		return fail(http.StatusConflict, "the core answered 410: %s; reload it", msg)
+	case ae.Status == 422 && ae.Code == "limit":
+		return fail(http.StatusRequestEntityTooLarge, "%s (§6.6)", msg)
 	case ae.Status == 422:
 		return fail(http.StatusUnprocessableEntity, "%s", msg)
 	case ae.Status == 429:
@@ -160,7 +167,7 @@ func (w *errWriter) WriteHeader(code int) {
 	}
 	w.wrote = true
 	e := w.st.err
-	if code == http.StatusOK || code == http.StatusPartialContent {
+	if code == http.StatusOK || code == http.StatusPartialContent && wholeRange(w.Header().Get("Content-Range")) {
 		w.st.served()
 	}
 	if w.st.noETag {
@@ -190,6 +197,20 @@ func (w *errWriter) WriteHeader(code int) {
 	w.ResponseWriter.WriteHeader(e.status)
 	io.WriteString(w.ResponseWriter, e.msg+"\n")
 	w.swallow = true
+}
+
+// wholeRange reports whether a 206's Content-Range is the whole file
+// (bytes 0-{n-1}/{n}): only a revision served in full is recorded as a
+// base (§H.4), not a range a mount or a type sniffer reads.
+func wholeRange(cr string) bool {
+	r, ok := strings.CutPrefix(cr, "bytes 0-")
+	if !ok {
+		return false
+	}
+	last, total, ok := strings.Cut(r, "/")
+	l, err1 := strconv.ParseInt(last, 10, 64)
+	n, err2 := strconv.ParseInt(total, 10, 64)
+	return ok && err1 == nil && err2 == nil && l == n-1
 }
 
 func (w *errWriter) Write(b []byte) (int, error) {

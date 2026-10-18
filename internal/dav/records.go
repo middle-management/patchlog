@@ -257,6 +257,25 @@ func (s *Server) refuse(p *principal, ns, name string) {
 	s.trimRecordsLocked()
 }
 
+// reloaded forgets p's records of ns/name, gone in the core, if a save of
+// it was refused (refuse) since they were made: a GET found it gone, the
+// reload that refusal asked for, so the next write makes it anew
+// (tombBase) rather than meeting the refusal again.
+func (s *Server) reloaded(p *principal, ns, name string) {
+	k := recKey(p, ns, name)
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	st := s.storeLocked(p.acct.root)
+	d, ok := st.docs.Get(k)
+	if !ok || d.reload == 0 {
+		return
+	}
+	before := st.docs.Bytes()
+	st.docs.Remove(k)
+	st.forgotten.Remove(k)
+	s.recBytes += st.docs.Bytes() - before
+}
+
 // stale reports whether a GET of ns/name at rev must send it whatever the
 // client's validators say: a save of p's was refused (or its records
 // lost) and the reload is due, or p's newest record is a write of its
@@ -300,7 +319,7 @@ func (st *reqState) repr(hd headDoc) []byte {
 }
 
 // stagedServe is the document a GET is answering with: a record once its
-// body is sent (errWriter), not on a 304.
+// body is sent whole (errWriter), not on a 304 or for a range.
 type stagedServe struct{ ns, name, rev string }
 
 // served records a staged GET whose body went out: a reload, if a save

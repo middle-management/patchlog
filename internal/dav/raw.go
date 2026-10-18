@@ -204,7 +204,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 		}
 		switch h.State {
 		case client.Purged:
-			return false, fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", ns, name)
+			return false, purgedErr(ns, name)
 		case client.Live:
 			if o.pre && st.noneMatch {
 				return false, fail(http.StatusPreconditionFailed, "%s/%s exists (If-None-Match: *)", ns, name)
@@ -224,7 +224,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 				rev = h.ID
 				return false, nil
 			}
-			out, _, err := st.rebased(ctx, ns, name, ref, cur.value, refOf)
+			out, _, err := st.rebased(ctx, ns, name, ref, h.ID, cur.value, refOf)
 			if err != nil {
 				return false, err
 			}
@@ -250,19 +250,29 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 		if o.pre && st.matchAny && !st.placeholder {
 			return false, fail(http.StatusPreconditionFailed, "%s/%s doesn't exist (If-Match: *)", ns, name)
 		}
-		if err := upload(); err != nil {
-			return false, err
-		}
 		var res *client.WriteResult
 		var parent any = map[string]any{}
 		var ps []any
 		if h.State == client.NotFound {
+			if err := upload(); err != nil {
+				return false, err
+			}
 			ps = withNonce(in, ref, client.GenesisPatches(ref))
 			res, err = st.p.c.Create(ctx, ns, name, ps)
-		} else if parent, ps, err = st.rawRestorePatches(ctx, in, ns, name, h, ref); err == nil {
-			res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
+		} else {
+			// What the restore writes is settled (a 409 over someone
+			// else's delete uploads nothing) before the blob goes up.
+			if parent, ps, err = st.rawRestorePatches(ctx, in, ns, name, h, ref); err != nil {
+				return false, err
+			}
+			if err := upload(); err != nil {
+				return false, err
+			}
+			if res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps); err == nil {
+				st.p.markOwn(ns, name, res.ID)
+			}
 		}
-		if client.IsStale(err) || client.IsGone(err) {
+		if client.IsStale(err) || client.IsGone(err) && !client.IsPurged(err) {
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile; reload it", ns, name)
 		}
 		if err != nil {
@@ -275,27 +285,24 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 	return rev, err == nil, err
 }
 
-// rawRestorePatches is the patch set restoring tombstoned ns/name as raw
-// file ref, and the last live document it applies to (§8.2): a raw one's
-// reference rebased and set member by member, as over a live one; any
-// other's root replaced, the file being another.
+// rawRestorePatches is the patch set writing raw file ref over tombstoned
+// ns/name, and the last live document it applies to (§8.2), as tombBase
+// says: restored moments after the principal's own DELETE, a raw last
+// document's reference rebased and set member by member, as over a live
+// one; else, or over another kind of file, a new file, the root
+// replaced.
 func (st *reqState) rawRestorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, ref map[string]any) (any, []any, error) {
 	whole := func() (any, []any, error) {
 		return map[string]any{}, withNonce(in, ref, []any{map[string]any{"op": "replace", "path": "", "value": ref}}), nil
 	}
-	if h.Last == "" {
-		return whole()
-	}
-	last, err := st.s.doc(ctx, st.p, ns, name, h.Last)
+	last, err := st.tombBase(ctx, ns, name, h)
 	switch {
-	case pruned(err):
-		return whole()
 	case err != nil:
 		return nil, nil, err
-	case last.sealed, last.raw == nil:
+	case last == nil, last.raw == nil:
 		return whole()
 	}
-	out, _, err := st.rebased(ctx, ns, name, ref, last.value, refOf)
+	out, _, err := st.rebased(ctx, ns, name, ref, h.Last, last.value, refOf)
 	if err != nil {
 		return nil, nil, err
 	}

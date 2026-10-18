@@ -137,7 +137,7 @@ type nsInfo struct {
 	notTree               string // why a catalog's document makes no file tree, if it was read
 	readErr               error  // the core's refusal of the document to the principal (a 401, 403, 404)
 	patchSetSize, docSize int
-	blobSize              int
+	opsPerSet, blobSize   int
 	at                    time.Time
 }
 
@@ -178,6 +178,14 @@ func (s *Server) nsInfo(ctx context.Context, p *principal, ns string) nsInfo {
 	return in
 }
 
+// forgetNS drops what p read of ns's document, so the next nsInfo reads
+// it again.
+func (p *principal) forgetNS(ns string) {
+	p.mu.Lock()
+	delete(p.ns, ns)
+	p.mu.Unlock()
+}
+
 // nsInfoErr is nsInfo, with the error of a read that failed for now (a
 // 429, a 5xx, no answer), which isn't kept.
 func (s *Server) nsInfoErr(ctx context.Context, p *principal, ns string) (nsInfo, error) {
@@ -215,6 +223,9 @@ func (s *Server) nsInfoErr(ctx context.Context, p *principal, ns string) (nsInfo
 		}
 		if n, ok := lim["documentSize"].(float64); ok {
 			in.docSize = int(n)
+		}
+		if n, ok := lim["opsPerSet"].(float64); ok {
+			in.opsPerSet = int(n)
 		}
 		if n, ok := lim["blobSize"].(float64); ok {
 			in.blobSize = int(n)

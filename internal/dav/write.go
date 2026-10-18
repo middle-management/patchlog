@@ -129,7 +129,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 		case o.fresh && h.State != client.NotFound:
 			return false, taken(ns, name)
 		case h.State == client.Purged:
-			return false, fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", ns, name)
+			return false, purgedErr(ns, name)
 		case h.State == client.Live:
 			if o.pre && st.noneMatch {
 				return false, fail(http.StatusPreconditionFailed, "%s/%s exists (If-None-Match: *)", ns, name)
@@ -151,12 +151,17 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			}
 			ps = withNonce(in, doc, client.GenesisPatches(doc))
 			res, err = st.p.c.Create(ctx, ns, name, ps)
-			err = tooLarge(err, in, parent, ps, true)
+			err = tooLarge(err, in, parent, ps, true, true)
 		} else if parent, ps, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
 			res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
-			err = tooLarge(err, in, parent, ps, false)
+			err = tooLarge(err, in, parent, ps, false, true)
+			if err == nil {
+				st.p.markOwn(ns, name, res.ID)
+			}
+		} else {
+			return false, err
 		}
-		if client.IsStale(err) || client.IsGone(err) {
+		if client.IsStale(err) || client.IsGone(err) && !client.IsPurged(err) {
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile; reload it", ns, name)
 		}
 		if err != nil {
@@ -168,16 +173,15 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 	return rev, exact, err
 }
 
-// restorePatches is the patch set restoring tombstoned ns/name with v,
-// applied to the last live document (§8.2), and that document. With a
-// base the principal had, the edit from it is rebased on the last live
-// document, as a save over a live one is: a save that deletes the
-// original before writing (an editor's, or a client's that creates only)
-// keeps others' edits. Without one, the last live document is the base,
-// so the file as written wins, as over a live one: either way the patch
-// set is the diff from the last live document, not a whole new one. With
-// the last document pruned (§8.6), or a raw file's (another file now), the
-// root is replaced.
+// restorePatches is the patch set writing v over tombstoned ns/name, and
+// the last live document it applies to (§8.2), as tombBase says: a write
+// moments after the principal's own DELETE (an editor's, or a client's
+// that creates only) restores the file with the edit from its base
+// rebased on the last live document, as a save over a live one is, so
+// others' edits are kept (without a base, the last live document is the
+// base, and the file as written wins); any other write is a new file, the
+// root replaced, which drops a $successor (§8.1), as does one over a raw
+// file's last document (another file now) or a pruned one (§8.6).
 func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, v any) (any, []any, error) {
 	whole := func() (any, []any, error) {
 		doc := v
@@ -186,30 +190,67 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 		}
 		return map[string]any{}, withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}), nil
 	}
-	if h.Last == "" {
-		return whole()
-	}
-	last, err := st.s.doc(ctx, st.p, ns, name, h.Last)
+	last, err := st.tombBase(ctx, ns, name, h)
 	switch {
-	case pruned(err):
-		return whole()
 	case err != nil:
 		return nil, nil, err
-	case last.sealed, last.raw != nil:
+	case last == nil, last.raw != nil:
 		return whole()
 	}
-	out, _, err := st.rebased(ctx, ns, name, v, last.value, bare)
+	out, _, err := st.rebased(ctx, ns, name, v, h.Last, last.value, bare)
 	if err != nil {
 		return nil, nil, err
 	}
 	return last.value, withNonce(in, out, merge.Diff(bare(last.value), out)), nil
 }
 
+// tombBase says how a write over tombstoned ns/name, head h, goes (§H.6
+// "Delete, then write", §H.4): restored rebased on the last live
+// document, which it returns, when the principal's own DELETE wrote h
+// within ownDeleteUndo and the file didn't move away ($successor, §8.1);
+// a 409 when the principal has a base from before someone else's delete
+// (§11.3), whose reload (a GET finding the file gone) lets the write
+// make a new file; else nil: a new file.
+func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
+	own := st.p.deletedOwn(ns, name, h.ID, st.s.opt.Now())
+	if !own && !st.p.ownEntry(ns, name, h.ID) && st.hasBase(ns, name) {
+		st.s.refuse(st.p, ns, name)
+		return nil, fail(http.StatusConflict, "%s/%s was deleted by someone else since you opened it (§11.3, §H.4): your save isn't written over the delete; reload it (it reads as gone), and save it again to make it anew", ns, name)
+	}
+	if !own || h.Last == "" || h.Successor != "" {
+		return nil, nil
+	}
+	last, err := st.s.doc(ctx, st.p, ns, name, h.Last)
+	switch {
+	case pruned(err):
+		return nil, nil
+	case err != nil:
+		return nil, err
+	case last.sealed, client.SuccessorOf(last.value) != "":
+		return nil, nil
+	}
+	return last, nil
+}
+
+// hasBase reports whether a save of ns/name names or has a base (§H.4):
+// an If-Match (or If header) tag, or the principal's records of it, kept
+// or lost.
+func (st *reqState) hasBase(ns, name string) bool {
+	if st.ifMatch != "" {
+		return true
+	}
+	d := st.s.recordsOf(st.p, ns, name)
+	return len(d.rs) > 0 || d.lost
+}
+
 // edit appends the principal's edit of ns/name on head: the edit from its
 // base to v, rebased on the head (rebased). Changes others made since the
 // base are kept; where they overlap the edit's and v doesn't already
 // agree with the head, the save is 409 and nothing is written, never an
-// overwrite. retry: the head moved (412), read it again.
+// overwrite. A patch set over opsPerSet or patchSetSize (§6.6) is sent as
+// a root replace instead, which may be as large as documentSize, if the
+// base is the head (§H.4): it then writes nothing of others' over; a
+// merged one is 413. retry: the head moved (412), read it again.
 func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, v any, body []byte) (string, bool, bool, error) {
 	cur, err := st.s.doc(ctx, st.p, ns, name, head)
 	switch {
@@ -220,7 +261,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	case cur.raw != nil:
 		return "", false, false, fail(http.StatusConflict, "%s/%s is a raw file, shown as %s: a JSON file can't take its name (§H.2)", ns, name, name)
 	}
-	out, _, err := st.rebased(ctx, ns, name, v, cur.value, bare)
+	out, atHead, err := st.rebased(ctx, ns, name, v, head, cur.value, bare)
 	if err != nil {
 		return "", false, false, err
 	}
@@ -237,12 +278,20 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	}
 	paths := writesOf(bare(cur.value), ps)
 	ps = withNonce(in, out, ps)
+	whole := atHead && overSet(in, ps)
+	if whole {
+		ps = wholeDoc(in, cur.value, out)
+	}
 	res, err := st.p.c.Append(ctx, ns, name, head, ps)
-	err = tooLarge(err, in, cur.value, ps, false)
+	if atHead && !whole && setTooLarge(err) {
+		ps = wholeDoc(in, cur.value, out)
+		res, err = st.p.c.Append(ctx, ns, name, head, ps)
+	}
+	err = tooLarge(err, in, cur.value, ps, false, atHead)
 	switch {
 	case client.IsStale(err):
 		return "", false, true, nil
-	case client.IsGone(err):
+	case client.IsGone(err) && !client.IsPurged(err):
 		return "", false, false, fail(http.StatusConflict, "%s/%s was deleted meanwhile", ns, name)
 	case isPatchFailure(err):
 		st.s.refuse(st.p, ns, name)
@@ -251,6 +300,48 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 		return "", false, false, err
 	}
 	return res.ID, st.wrote(ns, name, cur.value, ps, paths, res, v, body, rendersAs(v)), false, nil
+}
+
+// overSet reports a patch set over the opsPerSet or patchSetSize the
+// namespace sets (§6.6); the deployment's, which this server doesn't
+// know, the core's refusal tells (setTooLarge).
+func overSet(in nsInfo, ps []any) bool {
+	return in.opsPerSet > 0 && len(ps) > in.opsPerSet || in.patchSetSize > 0 && len(jsonv.Canonical(ps)) > in.patchSetSize
+}
+
+// setTooLarge reports the core's refusal of a patch set over patchSetSize
+// (413) or opsPerSet (422), code limit (§6.6): by the limit it names, or,
+// from cores that name none, by its message.
+func setTooLarge(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	if !ok || ae.Code != "limit" {
+		return false
+	}
+	if l, _ := ae.Body["limit"].(string); l != "" {
+		return l == "patchSetSize" || l == "opsPerSet"
+	}
+	m, _ := ae.Body["message"].(string)
+	return ae.Status == http.StatusRequestEntityTooLarge && m == "patch set too large" ||
+		ae.Status == http.StatusUnprocessableEntity && m == "too many operations"
+}
+
+// wholeDoc is the root replace writing out, a JSON file's document as
+// rendered (bare), over cur (§H.4, §11.3 "Overwriting on purpose"): it
+// carries cur's $successor, which the rendering leaves out, and a fresh
+// $nonce where one is needed (§C.7).
+func wholeDoc(in nsInfo, cur, out any) []any {
+	doc := out
+	if m, ok := out.(map[string]any); ok {
+		if s := client.SuccessorOf(cur); s != "" {
+			c := make(map[string]any, len(m)+1)
+			for k, x := range m {
+				c[k] = x
+			}
+			c["$successor"] = s
+			doc = c
+		}
+	}
+	return withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}})
 }
 
 func conflict(ns, name string, clash []string) error {
@@ -270,27 +361,39 @@ func pruned(err error) bool {
 	return ok && (ae.Status == http.StatusNotFound || ae.Status == http.StatusGone)
 }
 
-// candidate is a version a save may have been edited from.
+// candidate is a version a save may have been edited from: its document,
+// the revision holding it or written as it, when it was recorded, and,
+// for a write of the principal's, what it changed.
 type candidate struct {
 	doc   any
+	rev   string
 	seq   uint64
 	wrote bool
 	paths []pointer.Pointer
 }
 
 // candidates returns the versions a save of ns/name may have been edited
-// from, oldest first, and whether records of it were lost (records.go).
-// That is the revision the PUT's If-Match (or If header) names, and the
-// writes of the principal's it holds merged (whose tag a client may learn
-// from a listing, or a HEAD after the PUT); else the principal's records.
-// A revision pruned since (§8.6) is no candidate; one that can't be read
-// otherwise (a 429, a 5xx) fails the save, and an If-Match no readable
-// revision answers to is a 412.
+// from, oldest first, and whether records of it were lost (records.go)
+// (§H.4 "The base"). That is the revision the PUT's If-Match (or If
+// header) names, and the writes of the principal's it holds merged (whose
+// tag a client may learn from a listing, or a HEAD after the PUT); else
+// the principal's records. If-Match: * names none: the head is the base.
+// An If-Match no revision of the document answers to is a 412, and one
+// the core no longer has (pruned, §8.6) a 409 asking for a reload; a
+// record whose revision is gone so counts as lost. A revision that can't
+// be read otherwise (a 429, a 5xx) fails the save: the head is never the
+// base instead.
 func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidate, bool, error) {
+	if st.matchAny {
+		return nil, false, nil
+	}
 	d := st.s.recordsOf(st.p, ns, name)
 	var cs []candidate
+	var goneErr error
+	// add adds r's version; gone: its revision isn't served any more
+	// (goneErr says how).
 	add := func(r record) (bool, error) {
-		c := candidate{seq: r.seq, wrote: r.wrote, paths: r.paths}
+		c := candidate{rev: r.rev, seq: r.seq, wrote: r.wrote, paths: r.paths}
 		var err error
 		switch {
 		case r.doc != nil:
@@ -301,28 +404,32 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 			e, err := st.s.doc(ctx, st.p, ns, name, r.rev)
 			switch {
 			case pruned(err):
-				return false, nil
+				goneErr = err
+				return true, nil
 			case err != nil:
 				return false, err
 			case e.sealed:
-				return false, nil
+				return true, nil
 			}
 			c.doc = e.value
 		}
 		if err != nil {
 			// What this server parsed before: not expected to fail.
-			return false, nil
+			return true, nil
 		}
 		cs = append(cs, c)
-		return true, nil
+		return false, nil
 	}
 	if st.ifMatch == "" {
+		lost := d.lost
 		for _, r := range d.rs {
-			if _, err := add(r); err != nil {
+			gone, err := add(r)
+			if err != nil {
 				return nil, false, err
 			}
+			lost = lost || gone
 		}
-		return cs, d.lost, nil
+		return cs, lost, nil
 	}
 	// What the client says it had, as recent as the principal's newest
 	// record of it.
@@ -332,32 +439,36 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 			named.seq = r.seq
 		}
 	}
-	ok, err := add(named)
+	gone, err := add(named)
 	if err != nil {
 		return nil, false, err
 	}
-	for _, r := range d.rs {
-		if r.wrote && r.rev == st.ifMatch {
-			got, err := add(r)
-			if err != nil {
-				return nil, false, err
-			}
-			ok = ok || got
+	if gone {
+		if ae, ok := client.AsAPIError(goneErr); ok && ae.Status == http.StatusGone {
+			st.s.refuse(st.p, ns, name)
+			return nil, false, fail(http.StatusConflict, "%s/%s: revision %s, the version you edited (If-Match), is no longer kept (pruned, §8.6), so your changes can't be told from others'; reload it and edit again", ns, name, st.ifMatch)
 		}
 	}
-	if !ok {
+	for _, r := range d.rs {
+		if r.wrote && r.rev == st.ifMatch {
+			if _, err := add(r); err != nil {
+				return nil, false, err
+			}
+		}
+	}
+	if len(cs) == 0 {
 		return nil, false, fail(http.StatusPreconditionFailed, "%s/%s has no revision %s (If-Match) to rebase the save on; reload it and edit again", ns, name, st.ifMatch)
 	}
 	sort.SliceStable(cs, func(i, j int) bool { return cs[i].seq < cs[j].seq })
 	return cs, false, nil
 }
 
-// rebased returns v, a save of ns/name, rebased on head (§11.3, §H.4), and
-// whether a base of the principal's was known (else the head is the
-// base, and the file as written wins). view is what of a document a save
-// compares and writes: bare, a JSON file's rendering, whose $successor
-// therefore stays; refOf, a raw file's reference. v, head and the result
-// are as view shows them.
+// rebased returns v, a save of ns/name, rebased on head, revision headRev
+// (§11.3, §H.4), and whether its base is the head, the same content (or
+// none is known, and the head is the base: the file as written wins).
+// view is what of a document a save compares and writes: bare, a JSON
+// file's rendering, whose $successor therefore stays; refOf, a raw file's
+// reference. v, head and the result are as view shows them.
 //
 // The base is the candidate (candidates) closest to v, the one its edit
 // changes the fewest paths of: an editor's buffer is the version it
@@ -371,9 +482,11 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 // What isn't guessed: the result may change a path of head only where
 // every candidate agrees with head (unsafe), so whichever one the client
 // really had, no edit someone else made since is undone or overwritten
-// unseen. A save that can't be rebased so is a 409, which asks for a
-// reload (refuse); so is one whose records were lost.
-func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any, view func(any) any) (any, bool, error) {
+// unseen; and an edit from a base before a delete or restore by someone
+// else (spans) isn't merged over it. A save that can't be rebased so is a
+// 409, which asks for a reload (refuse); so is one whose records were
+// lost.
+func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev string, head any, view func(any) any) (any, bool, error) {
 	cs, lost, err := st.candidates(ctx, ns, name)
 	if err != nil {
 		return nil, false, err
@@ -387,11 +500,11 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any, v
 			return head, true, nil
 		}
 		st.s.refuse(st.p, ns, name)
-		return nil, false, fail(http.StatusConflict, "%s/%s: this server no longer has the version you edited, so it can't tell your changes from others'; reload it and edit again", ns, name)
+		return nil, false, fail(http.StatusConflict, "%s/%s: the version you edited is no longer to be had (this server's records of it were dropped, or the core pruned it, §8.6), so your changes can't be told from others'; reload it and edit again", ns, name)
 	}
 	if len(cs) == 0 {
-		out, _ := rebase(head, mine, head)
-		return out, false, nil
+		out, _ := rebase(head, mine, head, nil)
+		return out, true, nil
 	}
 	dist := make([]int, len(cs))
 	least := -1
@@ -414,12 +527,25 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any, v
 			}
 		}
 	}
+	sp, err := st.spans(ctx, ns, name, headRev, cs, tied)
+	if err != nil {
+		return nil, false, err
+	}
 	var why []string
+	foreign := false
 	for _, i := range tied {
-		out, clash := rebase(cs[i].doc, mine, head)
+		s := sp[cs[i].rev]
+		if s.foreign && least > 0 {
+			if why == nil {
+				foreign = true
+				why = []string{}
+			}
+			continue
+		}
+		out, clash := rebase(cs[i].doc, mine, head, s.writes)
 		if len(clash) == 0 {
 			if clash = unsafe(out, head, cs); len(clash) == 0 {
-				return out, true, nil
+				return out, jsonv.Equal(cs[i].doc, head), nil
 			}
 		}
 		if why == nil {
@@ -427,7 +553,155 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any, v
 		}
 	}
 	st.s.refuse(st.p, ns, name)
-	return nil, true, conflict(ns, name, why)
+	if foreign {
+		return nil, false, fail(http.StatusConflict, "%s/%s was deleted or restored by someone else since you opened it (§11.3): your changes aren't merged over that; reload it and edit again", ns, name)
+	}
+	return nil, false, conflict(ns, name, why)
+}
+
+// span is what the log says happened between a candidate base and the
+// head (§11.3): the writes of its entries (logWrites) but the principal's
+// own, and whether someone else deleted or restored the document in
+// between, a tombstone or a restore the principal didn't write, whose
+// writes are empty but which a save from before isn't merged over.
+type span struct {
+	writes  []pointer.Pointer
+	foreign bool
+}
+
+// spans returns the spans from the revisions of candidates which (of cs)
+// to headRev, by revision, read from the log (§7.1), once from the oldest
+// where one range holds the others (one chain per name, §8.2). A
+// candidate at the head has none. A range the core no longer has (pruned,
+// §8.6) is a 409 asking for a reload.
+func (st *reqState) spans(ctx context.Context, ns, name, headRev string, cs []candidate, which []int) (map[string]span, error) {
+	out := map[string]span{}
+	need := map[string]bool{}
+	var revs []string
+	for _, i := range which {
+		if r := cs[i].rev; r != "" && r != headRev && !need[r] {
+			need[r] = true
+			revs = append(revs, r)
+		}
+	}
+	// Recorded earlier, likely older: read first, so later ones are in
+	// its range.
+	sort.SliceStable(revs, func(i, j int) bool { return seqOf(cs, revs[i]) < seqOf(cs, revs[j]) })
+	gone := func() error {
+		st.s.refuse(st.p, ns, name)
+		return fail(http.StatusConflict, "%s/%s: its history since the version you edited is no longer kept (pruned, §8.6), so your changes can't be told from others'; reload it and edit again", ns, name)
+	}
+	for _, from := range revs {
+		if _, ok := out[from]; ok {
+			continue
+		}
+		es, err := st.p.c.Log(ctx, ns, name, headRev, from)
+		if pruned(err) {
+			return nil, gone()
+		}
+		if err != nil {
+			return nil, err
+		}
+		base, err := st.s.doc(ctx, st.p, ns, name, from)
+		switch {
+		case pruned(err):
+			return nil, gone()
+		case err != nil:
+			return nil, err
+		}
+		ws := logWrites(base.value, es)
+		// Each candidate's span is that of the entries after its
+		// revision: from the last entry back.
+		var acc span
+		for i := len(es) - 1; i >= -1; i-- {
+			if i < 0 {
+				out[from] = acc
+				break
+			}
+			if need[es[i].ID] {
+				out[es[i].ID] = span{writes: append([]pointer.Pointer(nil), acc.writes...), foreign: acc.foreign}
+			}
+			if st.p.ownEntry(ns, name, es[i].ID) || wroteRev(cs, es[i].ID) {
+				// The principal's own: what it changed is in the head
+				// (rebase's diff), and its own to change again (unsafe).
+				continue
+			}
+			acc.writes = append(acc.writes, ws[i]...)
+			if es[i].Kind == "tombstone" || i > 0 && es[i-1].Kind == "tombstone" {
+				acc.foreign = true
+			}
+		}
+	}
+	return out, nil
+}
+
+// seqOf is when the first candidate of revision rev was recorded.
+func seqOf(cs []candidate, rev string) uint64 {
+	for _, c := range cs {
+		if c.rev == rev {
+			return c.seq
+		}
+	}
+	return 0
+}
+
+// wroteRev reports whether rev is a write of the principal's among cs.
+func wroteRev(cs []candidate, rev string) bool {
+	for _, c := range cs {
+		if c.wrote && c.rev == rev {
+			return true
+		}
+	}
+	return false
+}
+
+// logWrites returns the writes of each log entry of es (§6.4.1), applied
+// in order to doc, the document before the first: each cut at the
+// outermost array it goes through, before or after the entry (§H.4), and
+// without the members no file shows ($nonce, $successor, §H.1). A
+// tombstone writes nothing, and the restore after it applies to the last
+// live document (§8.2). An entry whose patch set is absent or doesn't
+// apply here writes the whole document, as do all after it.
+func logWrites(doc any, es []client.LogEntry) [][]pointer.Pointer {
+	out := make([][]pointer.Pointer, len(es))
+	cur, known := doc, true
+	for i, e := range es {
+		if e.Kind == "tombstone" {
+			continue
+		}
+		var ws []pointer.Pointer
+		var nd any
+		ops, err := patch.Parse(e.Patches)
+		if err == nil && known && e.HasPatches {
+			nd, ws, err = patch.Apply(cur, true, ops, patch.Options{ResourceEnvelope: true})
+		}
+		if err != nil || !known || !e.HasPatches {
+			out[i], known = []pointer.Pointer{{}}, false
+			continue
+		}
+		for _, w := range ws {
+			if len(w) == 1 && (w[0] == "$nonce" || w[0] == "$successor") {
+				continue
+			}
+			out[i] = append(out[i], cutAtArray(w, cur, nd))
+		}
+		cur = nd
+	}
+	return out
+}
+
+// cutAtArray is p cut at the outermost array it goes through in a or b.
+func cutAtArray(p pointer.Pointer, a, b any) pointer.Pointer {
+	for i := range p {
+		for _, d := range []any{a, b} {
+			if v, ok := pointer.Get(d, p[:i]); ok {
+				if _, arr := v.([]any); arr {
+					return append(pointer.Pointer{}, p[:i]...)
+				}
+			}
+		}
+	}
+	return p
 }
 
 // undoes reports whether mine reverts write w of the principal's: what
@@ -496,16 +770,18 @@ func ownSince(c candidate, q pointer.Pointer, head any, cs []candidate) bool {
 // (§6.4.1) but whole arrays for anything in one (§F.3's array rule, from
 // the outermost array: elements have no identity, so an index one side
 // names is another element after the other's insert or delete). Where
-// those writes overlap others' since base (head's), mine must agree with
-// head there, a change both made, or a version reloaded since; otherwise
-// the clashing paths are returned and nothing is. Documents are as
-// rebased's view shows them.
-func rebase(base, mine, head any) (any, []string) {
+// those writes overlap others' since base, mine must agree with head
+// there, a change both made, or a version reloaded since; otherwise the
+// clashing paths are returned and nothing is. Others' writes are what
+// differs between base and head, and logged, the writes of the log
+// entries between them (spans), which also hold a value someone changed
+// and changed back. Documents are as rebased's view shows them.
+func rebase(base, mine, head any, logged []pointer.Pointer) (any, []string) {
 	ours := writesOf(base, merge.Diff(base, mine))
 	if len(ours) == 0 {
 		return head, nil
 	}
-	theirs := writesOf(base, merge.Diff(base, head))
+	theirs := append(writesOf(base, merge.Diff(base, head)), logged...)
 	clash := map[string]bool{}
 	for _, o := range ours {
 		for _, t := range theirs {
@@ -681,19 +957,25 @@ func (st *reqState) retrying(ctx context.Context, attempt func() (retry bool, er
 	}
 }
 
-// tooLarge is the core's 413 for a write of patch set ps on parent (§6.6)
-// with what the core doesn't say: the sizes it measured, and the limits
-// the namespace sets, else that the deployment's apply. A create's patch
-// set counts against documentSize, not patchSetSize. Other errors pass.
-func tooLarge(err error, in nsInfo, parent any, ps []any, create bool) error {
+// tooLarge is the core's refusal of a write of patch set ps on parent for
+// a limit (§6.6: 413, or 422 code limit) as 413 (§H.4 "Answers"), with
+// what the core doesn't say: the sizes it measured, and the limits the
+// namespace sets, else that the deployment's apply. A create's patch set
+// counts against documentSize, not patchSetSize. A save merged with
+// others' edits (merged) isn't written whole, which only a save from the
+// head may be (§H.4), so it says to reload. Other errors pass.
+func tooLarge(err error, in nsInfo, parent any, ps []any, create, atHead bool) error {
 	ae, ok := client.AsAPIError(err)
-	if !ok || ae.Status != http.StatusRequestEntityTooLarge {
+	if !ok || ae.Status != http.StatusRequestEntityTooLarge && (ae.Status != http.StatusUnprocessableEntity || ae.Code != "limit") {
 		return err
 	}
 	var b strings.Builder
 	b.WriteString(apiText(ae))
 	fmt.Fprintf(&b, ": the patch set is %d bytes", len(jsonv.Canonical(ps)))
 	if ops, perr := patch.Parse(ps); perr == nil {
+		if ae.Status == http.StatusUnprocessableEntity {
+			fmt.Fprintf(&b, " in %d operations", len(ops))
+		}
 		if doc, _, aerr := patch.Apply(parent, true, ops, patch.Options{}); aerr == nil {
 			fmt.Fprintf(&b, " and the document %d bytes", len(jsonv.Canonical(doc)))
 		}
@@ -706,13 +988,19 @@ func tooLarge(err error, in nsInfo, parent any, ps []any, create bool) error {
 	if in.patchSetSize > 0 {
 		set = append(set, fmt.Sprintf("patchSetSize %d", in.patchSetSize))
 	}
+	if in.opsPerSet > 0 {
+		set = append(set, fmt.Sprintf("opsPerSet %d", in.opsPerSet))
+	}
 	if in.docSize > 0 {
 		set = append(set, fmt.Sprintf("documentSize %d", in.docSize))
 	}
 	if len(set) > 0 {
 		b.WriteString("the namespace sets " + strings.Join(set, " and ") + " (§6.6)")
 	} else {
-		b.WriteString("the namespace sets no size limits, so the deployment's apply (§6.6; by default patchSetSize 262144 and documentSize 1048576)")
+		b.WriteString("the namespace sets no size limits, so the deployment's apply (§6.6; by default patchSetSize 262144, opsPerSet 1000 and documentSize 1048576)")
+	}
+	if !atHead {
+		b.WriteString("; your save was merged with others' edits made since your version, so it isn't written whole (§H.4): reload it and save again")
 	}
 	return fail(http.StatusRequestEntityTooLarge, "%s", b.String())
 }
@@ -722,10 +1010,12 @@ func tooLarge(err error, in nsInfo, parent any, ps []any, create bool) error {
 // with If-Match on tomb), after the write meant to restore it failed with
 // err, which it returns, saying so.
 func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb string, err error) error {
-	if _, rerr := st.p.c.Restore(ctx, ns, name, tomb, withNonce(in, nil, []any{})); rerr != nil {
+	res, rerr := st.p.c.Restore(ctx, ns, name, tomb, withNonce(in, nil, []any{}))
+	if rerr != nil {
 		st.s.opt.Logf("dav: %s/%s: restoring it as it was after a refused save: %v", ns, name, rerr)
 		return err
 	}
+	st.p.markOwn(ns, name, res.ID)
 	st.p.forgetDelete(ns, name)
 	st.undeleted = true
 	de, ok := upstream(err).(*davError)
@@ -808,6 +1098,7 @@ func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) (st
 		}
 		if err == nil {
 			tomb = res.ID
+			st.p.markOwn(ns, name, res.ID)
 			st.p.noteDelete(ns, name, res.ID, st.s.opt.Now())
 		}
 		return false, err
@@ -816,4 +1107,10 @@ func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) (st
 		return "", errNotExist
 	}
 	return tomb, err
+}
+
+// purgedErr is a save's answer for purged ns/name (§8.3), or a name of a
+// purged namespace (§8.5): 410 (§H.4 "Answers").
+func purgedErr(ns, name string) error {
+	return fail(http.StatusGone, "%s/%s was purged (§8.3, §8.5); its name can't be used again", ns, name)
 }

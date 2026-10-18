@@ -552,3 +552,71 @@ func TestFlatListing(t *testing.T) {
 		t.Fatalf("without times: %+v", a)
 	}
 }
+
+// A raw file's save (§H.4): compared first, its base with the head, so
+// bytes someone changed and changed back between them are a conflict as
+// a whole (raw files have no paths to merge) before anything is uploaded;
+// over a blobSize the namespace sets it is 413 before any upload; and a
+// 412 when the head moves after the upload (another program's edit of a
+// member that isn't the bytes, a $nonce) is retried with the blob already
+// pending, never uploaded twice, the reference's members set one by one,
+// so the other member stays.
+func TestRawSaves(t *testing.T) {
+	t.Parallel()
+	var uploads atomic.Int32
+	var arm atomic.Bool
+	var e *env
+	theirNonce := seal.NewNonce()
+	e = newEnv(t, []string{"docs", "small"}, nil, map[string]map[string]any{"small": {"limits": map[string]any{"blobSize": 8}}},
+		func(c *clienttest.Options, _ *dav.Options) {
+			c.Wrap = func(h http.Handler) http.Handler {
+				return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == "PUT" && strings.Contains(r.URL.Path, "/blob/") && r.Header.Get("X-Author") != "other" {
+						uploads.Add(1)
+					}
+					if r.Method == "PATCH" && r.URL.Path == "/r/docs/f.md" && r.Header.Get("If-Match") != "" && arm.CompareAndSwap(true, false) {
+						hd, _ := e.load("docs", "f.md")
+						must(e.c.Append(e.ctx, "docs", "f.md", hd.ID, []any{map[string]any{"op": "add", "path": "/$nonce", "value": theirNonce}}))
+					}
+					h.ServeHTTP(w, r)
+				})
+			}
+		})
+
+	e.expect(e.do("PUT", "/docs/f.md", "one"), 201, "PUT f.md")
+	e.expect(e.do("GET", "/docs/f.md", ""), 200, "GET f.md")
+	uploads.Store(0)
+	arm.Store(true)
+	e.expect(e.do("PUT", "/docs/f.md", "three"), 201, "PUT f.md, its head moved after the upload")
+	if n := uploads.Load(); n != 1 {
+		t.Fatalf("%d uploads", n)
+	}
+	ref, data := e.rawOf("docs", "f.md")
+	if string(data) != "three" || ref["$nonce"] != theirNonce {
+		t.Fatalf("f.md %v %q", ref, data)
+	}
+	if p := patchPaths(t, e.lastEntry("docs", "f.md").Patches); strings.Join(p, " ") != "/$blob /size" {
+		t.Fatalf("the save's patch set writes %q", p)
+	}
+
+	// Changed and changed back by someone else: a conflict, nothing
+	// uploaded.
+	e.expect(e.do("GET", "/docs/f.md", ""), 200, "GET f.md")
+	h, _ := e.load("docs", "f.md")
+	cur := ref["$blob"].(string)
+	bid := must(e.c.UploadBlob(e.ctx, "docs", "f.md", "text/markdown", "", []byte("theirs")))
+	e.theirs("docs", "f.md", replace("/$blob", bid), replace("/size", 6))
+	e.theirs("docs", "f.md", replace("/$blob", cur), replace("/size", 5))
+	h, _ = e.load("docs", "f.md")
+	uploads.Store(0)
+	e.expect(e.do("PUT", "/docs/f.md", "mine"), 409, "PUT over bytes changed and changed back")
+	if n := uploads.Load(); n != 0 {
+		t.Fatalf("%d uploads for a conflict", n)
+	}
+	e.expectLive("docs", "f.md", h, "after the conflict")
+
+	r := e.expect(e.do("PUT", "/small/big.md", "123456789"), 413, "PUT over blobSize")
+	if !strings.Contains(r.body, "blobSize") || uploads.Load() != 0 {
+		t.Fatalf("413 %q after %d uploads", r.body, uploads.Load())
+	}
+}
