@@ -38,7 +38,7 @@ and serves immutable, CDN-cacheable revisions.
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
 | Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
-| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools; writers that can't read the setting learn it from `GET /ns/{ns}/principal`, or add them in private namespaces | §C.7, §7.4 | ✅ |
+| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces (`GET /ns/{ns}/principal` tells one that asks) | §C.7, §7.4 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge (a sealed namespace's documents, log, long-polls and events then answer `410 purged` with `head`, which followers, services, the janitor and remote branches take as the purge) | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
 | Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, `nosniff` and `Content-Security-Policy: sandbox` on every blob response, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
@@ -3008,9 +3008,10 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   purged` with `head` once the grant verifies. It takes no query parameter, draws no rate
   token, works in frozen, sealed and e2e namespaces alike, and every answer is `no-store`. With
   authentication disabled it leaves out `principal` and `kid` and lists every verb. The client
-  reads it with `Client.NSPrincipal` (`PrincipalInfo`, `WriterInfo`), and `NeedsNonce` and undo
-  ask it when the namespace document can't be read, as §11.2 says, falling back as before on a
-  server that answers `404` there. Verification now also applies a key's `readScope:
+  reads it with `Client.NSPrincipal` (`PrincipalInfo`, `WriterInfo`); undo asks it for the
+  namespace's `opsPerSet` and `patchSetSize` when the namespace document can't be read (§11.2),
+  falling back to §6.6's defaults on a server that answers `404` there, and such a writer still
+  adds a fresh `$nonce` in a private namespace (`NeedsNonce`), as §C.7 recommends. Verification now also applies a key's `readScope:
   "resource"` (§C.2 item 1, §C.4) to every request: a `read` grant it signs that doesn't fix
   `/resource` (§2.1) is refused (`403`, or `404` on a read of a private namespace, as any
   refusal there).

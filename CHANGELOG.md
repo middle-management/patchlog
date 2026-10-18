@@ -59,10 +59,11 @@ service's listings.
   trusted namespaces as it applies it, sealed ones with keys, to give placements file metadata;
   on the first start with a file tree it reads every live item's head once (meta `filed`) and
   purges the catalog's cached listings.
-- **Writers that can't read a namespace document ask `GET /ns/{ns}/principal`** (§11.2, §C.7):
-  `client.NeedsNonce` and undo's limits and nonces now follow what it says, so undo inverses by
-  such writers carry no `$nonce` where nonces are optional; against a server before v0.55,
-  which answers `404` there, they add one in any private namespace, as before.
+- **Undo by a writer that can't read the namespace document asks `GET /ns/{ns}/principal`**
+  (§11.2) for the namespace's `opsPerSet` and `patchSetSize`, and splits inverses by them rather
+  than by §6.6's defaults; against a server before v0.55, which answers `404` there, the
+  defaults hold as before. Such writers still add a fresh `$nonce` in private namespaces
+  (`client.NeedsNonce`), as §C.7 recommends for one that doesn't ask.
 - `GET /` answers `"spec": "0.55"`.
 
 **New:**

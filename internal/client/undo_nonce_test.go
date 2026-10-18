@@ -2,7 +2,6 @@ package client_test
 
 import (
 	"context"
-	"net/http"
 	"strings"
 	"testing"
 
@@ -72,44 +71,19 @@ func TestUndoRequiredNonces(t *testing.T) {
 }
 
 // §11.2, §C.7: a writer whose grant can't read the namespace document (its
-// rules refer to /resource, §C.5) learns the setting from GET
-// /ns/{ns}/principal (v0.55, §7.4), so its inverse adds a fresh $nonce
-// where the namespace requires them and not where it doesn't. On a server
-// before v0.55, which answers 404 there, it doesn't know the setting, so
-// in a private namespace every patch-set step of its inverse adds one,
-// though the document has none: one that came to require them takes the
-// undo, and so does one that doesn't, with the nonce to spare. An inverse
-// that results in an array has no member to add, so where nonces are
-// optional it is written without one.
+// rules refer to /resource, §C.5) doesn't know the setting, so in a
+// private namespace every patch-set step of its inverse adds a fresh
+// $nonce, though the document has none: one that came to require them
+// takes the undo, and so does one that doesn't, with the nonce to spare.
+// An inverse that results in an array has no member to add, so where
+// nonces are optional it is written without one.
 func TestUndoUnreadableNonces(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{Auth: true})
-	old := clienttest.New(t, clienttest.Options{Auth: true, Wrap: func(h http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if strings.HasSuffix(r.URL.Path, "/principal") {
-				http.NotFound(w, r)
-				return
-			}
-			h.ServeHTTP(w, r)
-		})
-	}})
 	k := clienttest.NewKey("k")
-	for _, c := range []struct {
-		setting string
-		s       *clienttest.Server
-		nonce   bool // the object inverse adds a fresh $nonce
-	}{
-		{"required", s, true},
-		{"optional", s, false},
-		{"optional", old, true},
-	} {
-		setting, s := c.setting, c.s
-		name := setting
-		if s == old {
-			name += "-before-v0.55"
-		}
-		t.Run(name, func(t *testing.T) {
+	for _, setting := range []string{"required", "optional"} {
+		t.Run(setting, func(t *testing.T) {
 			t.Parallel()
 			ns := "un-" + setting
 			admin := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
@@ -129,12 +103,9 @@ func TestUndoUnreadableNonces(t *testing.T) {
 				cfg := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{ns}, []string{"read", "config"})))
 				must(cfg.PatchConfig(ctx, ns, must(cfg.NSHead(ctx, ns)).Config, ops(op("add", "/nonce", "required"))))
 			}
-			if got := li.NeedsNonce(ctx, ns); got != c.nonce {
-				t.Fatalf("NeedsNonce %v", got)
-			}
 
 			plan := must(li.PlanUndo(ctx, ns, g))
-			if st := plan.Resources[0].Steps; len(st) != 1 || strings.Contains(string(jsonv.Canonical(jsonv.FromGo(st[0].Patches))), `"path":"/$nonce"`) != c.nonce {
+			if st := plan.Resources[0].Steps; len(st) != 1 || !strings.Contains(string(jsonv.Canonical(jsonv.FromGo(st[0].Patches))), `"path":"/$nonce"`) {
 				t.Fatalf("inverse %+v", st)
 			}
 			must(li.Undo(ctx, ns, g))

@@ -396,3 +396,38 @@ func TestUndoBadSince(t *testing.T) {
 		}
 	}
 }
+
+// §11.2, §7.4 (v0.55): a writer limited to some resources learns the
+// namespace's opsPerSet from GET /ns/{ns}/principal, and splits an inverse
+// that the defaults would send as one step the server refuses.
+func TestUndoLimitedWriterLimits(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true})
+	k := clienttest.NewKey("k")
+	opc := s.Client(t, client.WithBearer(s.OperatorGrant(t, "ul")))
+	must(opc.CreateNamespace(ctx, "ul", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}, "limits": map[string]any{"opsPerSet": 4}}))
+	only := map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}}
+	li := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:li", []string{"ul"}, []string{"read", "create", "append"}, only)))
+	if _, err := li.NSHead(ctx, "ul"); err == nil {
+		t.Fatal("li reads the namespace")
+	}
+	w := must(li.Create(ctx, "ul", "a", nonced(client.GenesisPatches(map[string]any{"n": 1}))))
+	g := client.NewGesture()
+	must(li.Append(ctx, "ul", "a", w.ID, ops(op("add", "/p", 1), op("add", "/q", 2), op("add", "/r", 3), op("add", "/s", 4)), client.WithGesture(g)))
+	plan := must(li.PlanUndo(ctx, "ul", g, client.UndoResources("a"), client.UndoScanLog()))
+	steps := plan.Resources[0].Steps
+	if len(steps) < 2 {
+		t.Fatalf("one step for an inverse over opsPerSet: %+v", steps)
+	}
+	for _, st := range steps {
+		if n := len(st.Patches.([]any)); n > 4 {
+			t.Fatalf("a step of %d operations: %+v", n, steps)
+		}
+	}
+	must(li.Undo(ctx, "ul", g, client.UndoResources("a"), client.UndoScanLog()))
+	doc, _ := docOf(t, li, "ul", "a")
+	if doc["n"] != 1.0 || doc["p"] != nil || doc["s"] != nil {
+		t.Fatalf("undone %v", doc)
+	}
+}

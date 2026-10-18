@@ -902,10 +902,10 @@ func (c *Client) keysLevel(ctx context.Context, ns string) (level string, learn 
 
 // undoLimits reads opsPerSet and patchSetSize from the namespace document
 // (§6.6), with the defaults when it doesn't say, and whether patch sets
-// add a fresh $nonce: it requires nonces (§C.7, NeedsNonce). A grant that
-// can't read the document asks GET /ns/{ns}/principal (§7.4), which gives
-// the limits in force; where that fails too, as on a server before v0.55,
-// the defaults hold and every patch set adds a nonce.
+// add a fresh $nonce: it requires nonces, or it can't be read (§C.7,
+// NeedsNonce). A grant that can't read the document asks GET
+// /ns/{ns}/principal for the limits in force (§7.4, §11.2); where that
+// fails too, as on a server before v0.55, the defaults hold.
 func (c *Client) undoLimits(ctx context.Context, ns string, cfg *undoConfig) (ops, size int, nonces bool) {
 	ops, size, nonces = 1000, 256<<10, true
 	var lim map[string]any
@@ -918,7 +918,7 @@ func (c *Client) undoLimits(ctx context.Context, ns string, cfg *undoConfig) (op
 	}
 	if !read {
 		if p, err := c.NSPrincipal(ctx, ns); err == nil {
-			nonces, lim = p.Writer.NonceRequired, p.Writer.Limits
+			lim = p.Writer.Limits
 		}
 	}
 	if n, ok := lim["opsPerSet"].(float64); ok && n >= 2 {

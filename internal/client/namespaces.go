@@ -88,21 +88,15 @@ func (c *Client) NonceRequired(ctx context.Context, ns string) (bool, error) {
 }
 
 // NeedsNonce reports whether a writer to ns adds a fresh $nonce to every
-// patch set (§C.7): ns requires nonces. A writer that can't read the
-// document, as under a grant whose rules refer to /resource (§C.5), asks
-// GET /ns/{ns}/principal (§7.4), and where that fails too, as on a server
-// before v0.55, adds one: a public namespace's document is always
-// readable, so that happens only in private ones, where an extra nonce is
-// harmless.
+// patch set (§C.7): ns requires nonces, or its document can't be read, as
+// under a grant whose rules refer to /resource (§C.5), so the writer
+// doesn't know the setting. A public namespace's document is always
+// readable, so that happens only in private ones, where §C.7 recommends a
+// nonce anyway: such a writer doesn't ask GET /ns/{ns}/principal (§7.4),
+// which NSPrincipal does for one that wants to know.
 func (c *Client) NeedsNonce(ctx context.Context, ns string) bool {
 	req, err := c.NonceRequired(ctx, ns)
-	if err == nil {
-		return req
-	}
-	if p, perr := c.NSPrincipal(ctx, ns); perr == nil {
-		return p.Writer.NonceRequired
-	}
-	return true
+	return err != nil || req
 }
 
 // NSEntry is one entry of a namespace log (§7.4), with the fields of §3.5.
