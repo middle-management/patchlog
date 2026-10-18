@@ -661,10 +661,14 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		WriteError(w, status, code, msg)
 		return
 	}
-	if c, _, _ := s.state(); c == "" {
+	if ns := s.behind(); ns != "" {
+		msg := "the tree service has not reached the catalog yet"
+		if ns != cat {
+			msg = "the tree service has not reached namespace " + ns + ", which the catalog trusts, yet"
+		}
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "1")
-		WriteError(w, http.StatusServiceUnavailable, "behind", "the tree service has not reached the catalog yet")
+		WriteError(w, http.StatusServiceUnavailable, "behind", msg)
 		return
 	}
 	// canon is the canonical URL of this listing at an at (§A.5): what

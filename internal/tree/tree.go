@@ -52,6 +52,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"strconv"
 	"sync"
@@ -196,13 +197,18 @@ type Service struct {
 	pmu     sync.Mutex
 	pending map[string][]follow.Unit // pages of unfinished snapshots (stage)
 
-	mu  sync.RWMutex // guards g, cur, purged
+	mu  sync.RWMutex // guards g, cur, purged, unfollowed
 	g   *Graph
 	cur map[string]string
 	// purged is when the service applied the purge of each namespace it
 	// holds as purged (meta "purged:{ns}", Unix nanoseconds; trustList).
 	purged  map[string]time.Time
 	changed chan struct{}
+	// unfollowed are the trusted namespaces the service can't follow,
+	// and why: skipped for their keys (Addendum E), or refused or absent
+	// at the core (a 401, 403 or 404); listings don't wait for them
+	// (behind).
+	unfollowed map[string]string
 
 	// trusted is when each namespace the catalog trusts became trusted,
 	// as far as the service knows (meta "trusted:{ns}"), guarded by mu;
@@ -289,7 +295,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db), kept: kept.New(opt.Now, keepBytes),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
-		cur:     map[string]string{}, purged: map[string]time.Time{}, changed: make(chan struct{}),
+		cur:     map[string]string{}, purged: map[string]time.Time{}, changed: make(chan struct{}), unfollowed: map[string]string{},
 		running: map[string]context.CancelFunc{},
 	}
 	s.repurge = repurge.New(db, opt.Purger, repurge.Options{Delay: opt.RepurgeDelay, Interval: opt.RepurgeInterval,
@@ -518,6 +524,46 @@ func (s *Service) state() (cur string, purged bool, changed <-chan struct{}) {
 	return s.cur[s.opt.Catalog], purged, s.changed
 }
 
+// behind returns a namespace the service follows that it holds no
+// checkpoint of yet, "" if there is none: the catalog, or a namespace the
+// catalog trusts that it is still catching up with (started with a fresh
+// database, rebuilt, or trusted lately). Until it has one, every
+// placement of an item there is missing (dangling, §B.3), and a listing
+// would show folders empty that aren't, which a sync tool mirrors as
+// files deleted (§H.3); listings answer 503 behind instead. A namespace
+// purged, or one it can't follow (unfollowed), isn't waited for: its
+// placements dangle for good.
+func (s *Service) behind() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.cur[s.opt.Catalog] == "" {
+		return s.opt.Catalog
+	}
+	var out []string
+	for ns := range s.g.Trust {
+		if _, purged := s.purged[ns]; s.cur[ns] == "" && !purged && s.unfollowed[ns] == "" {
+			out = append(out, ns)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	sort.Strings(out)
+	return out[0]
+}
+
+// setUnfollowed records why the service can't follow ns ("" when it can
+// again).
+func (s *Service) setUnfollowed(ns, why string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if why == "" {
+		delete(s.unfollowed, ns)
+	} else {
+		s.unfollowed[ns] = why
+	}
+}
+
 // Run follows the catalog and its trusted namespaces until ctx is done.
 // Followers of content namespaces start and stop as catalog.trust changes.
 func (s *Service) Run(ctx context.Context) error {
@@ -610,6 +656,7 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		if reason, permanent := s.keys.Check(ctx, real, ns != s.opt.Catalog); reason != "" {
 			if permanent {
 				s.opt.Logf("tree: skipping %s: %s", real, reason)
+				s.setUnfollowed(ns, reason)
 				return
 			}
 			err = fmt.Errorf("skipped: %s", reason)
@@ -626,6 +673,9 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		if errors.Is(err, follow.ErrPurged) {
 			s.opt.Logf("tree: %s was purged", real)
 			return
+		}
+		if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound) {
+			s.setUnfollowed(ns, err.Error())
 		}
 		s.opt.Logf("tree: following %s stopped: %v; restarting in %s", real, err, pause)
 		t := time.NewTimer(pause)
