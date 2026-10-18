@@ -2,6 +2,7 @@ package tree_test
 
 import (
 	"context"
+	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
@@ -42,14 +43,18 @@ func testPreviewFollowsRelease(t *testing.T) {
 	t.Cleanup(func() { cancel(); <-done; hs.Close(); p.Close() })
 	x := &svc{t: t, http: hs, core: w.c}
 
-	// at waits until the preview has reached every branch's head.
+	// at waits until the preview has reached every branch's head, and
+	// caught up with it: a branch's first checkpoint, from its bootstrap,
+	// may be its head before its catch-up has read that head, and
+	// listings are 503 behind until it has (§B.5).
 	reached := func(cat, matches string) {
 		t.Helper()
 		waitFor(t, "the preview to reach "+cat+" and "+matches, func() bool {
 			s := p.Service()
 			hc, err1 := w.c.NSHead(ctx, cat)
 			hm, err2 := w.c.NSHead(ctx, matches)
-			return err1 == nil && err2 == nil && s.Branches()["cat"] == cat && s.Checkpoint("cat") == hc.ID && s.Checkpoint("matches") == hm.ID
+			return err1 == nil && err2 == nil && s.Branches()["cat"] == cat && s.Checkpoint("cat") == hc.ID && s.Checkpoint("matches") == hm.ID &&
+				x.raw("/cat/children?of=root", "").status != http.StatusServiceUnavailable
 		})
 	}
 	reached("cat-r1", "matches-r1")
