@@ -96,12 +96,16 @@ func New(e *core.Engine, opts ...Option) *Server {
 // included, with the rule an edge checks them by (edge.CanonicalPath,
 // §C.5.3). No route but "/" ends in "/".
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	_, pattern := s.mux.Handler(r)
+	if blobRoutes[pattern] {
+		blobHeaders(w) // the 400s below are blob responses too (§7.8 Reading)
+	}
 	path := r.URL.EscapedPath()
 	if strings.Contains(strings.SplitN(r.RequestURI, "?", 2)[0], "%") || path != "/" && !edge.CanonicalPath(path) {
 		writeErr(w, &core.Error{Status: 400, Body: map[string]any{"code": "bad_input", "message": "non-canonical URL"}})
 		return
 	}
-	if _, pattern := s.mux.Handler(r); pattern != "" {
+	if pattern != "" {
 		if err := checkQuery(pattern, r.URL.RawQuery); err != nil {
 			telemetry.SetRoute(r, pattern) // the span is named by it all the same
 			writeErr(w, err)
@@ -1018,11 +1022,19 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(201)
 }
 
+// blobRoutes are the routes that read blobs, whose every answer carries
+// blobHeaders.
+var blobRoutes = map[string]bool{
+	"GET /r/{ns}/{name}/blob/{bid}":       true,
+	"GET /r/{ns}/{name}/blob/{bid}/e/{e}": true,
+}
+
 // blobHeaders sets what every blob response carries, errors and the
 // sealed 302 included (§7.8 Reading): writers choose a blob's type and its
 // URL is on the API's origin, so browsers must neither sniff another type
 // nor run script from one. sandbox alone, not the services' default-src
-// 'none', so images and PDFs still display inline.
+// 'none', so images and text still display inline. Chromium's PDF viewer
+// is an extension, which shows a sandboxed PDF as a blank page.
 func blobHeaders(w http.ResponseWriter) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox")

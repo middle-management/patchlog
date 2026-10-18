@@ -2465,9 +2465,12 @@ older instance during one, lack them (see [Postgres](#postgres-d8)'s upgrade not
   `Client.Raw`.
 - **Blob responses** carry `X-Content-Type-Options: nosniff` and
   `Content-Security-Policy: sandbox` on every answer of `…/blob/{bid}` and `…/blob/{bid}/e/{e}`,
-  `200`, `206`, `304`, the sealed `302` and errors alike (§7.8 Reading): writers choose a blob's
-  type, and its URL is on the API's origin, so a page can't run script from one. `sandbox`
-  alone, unlike the services' stricter policy, so images and PDFs still display inline.
+  `200`, `206`, `304`, the sealed `302` and errors alike, the `400`s for a non-canonical URL or
+  an unknown query parameter included (§7.8 Reading): writers choose a blob's type, and its URL
+  is on the API's origin, so a page can't run script from one. `sandbox` alone, unlike the
+  services' stricter policy, so images and text still display inline. Chromium shows a
+  sandboxed PDF as a blank page (its viewer is an extension), so a raw PDF file is better
+  downloaded, or shown by a viewer on another origin.
 - **Moves** (§8.1). A move is content: the resource's last revision before its tombstone sets a
   top-level `$successor`, a bare name for a resource of the same namespace, resolved against the
   namespace serving the `410`, or `/r/{ns2}/{name2}`. Within one namespace it is one batch

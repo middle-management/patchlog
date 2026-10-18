@@ -28,7 +28,8 @@ raw documents, moves, whole-document appends and `logPageBytes` are new.
 - **Blob responses carry `X-Content-Type-Options: nosniff` and
   `Content-Security-Policy: sandbox`** (§7.8), errors and the sealed `302` included: an HTML or
   SVG blob no longer runs as a page on the API's origin, and browsers no longer sniff a type
-  other than the uploaded one. Images and PDFs still display inline.
+  other than the uploaded one. Images and text still display inline, but Chromium shows a
+  sandboxed PDF as a blank page: download PDFs, or show them with a viewer on another origin.
 - **Appends that overwrite the root may be as large as `documentSize`** (§6.6): one whose first
   operation other than `test` is a root `replace` or `add` was `413` above `patchSetSize`.
 - **A top-level `$successor` of the §8.1 form is left out of validation** (§6.2 step 5), the

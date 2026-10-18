@@ -2,6 +2,7 @@ package server
 
 import (
 	"crypto/ecdh"
+	"strings"
 	"testing"
 	"time"
 
@@ -99,12 +100,14 @@ func TestRaw(t *testing.T) {
 		t.Fatalf("blob %v", b.H)
 	}
 
-	// No longer raw: a member beyond those validation leaves out.
+	// Still raw: a fresh $nonce and a well-formed $successor at the root
+	// are left out (§7.8 Files).
 	r1 := e.appendRev("m", "notes", r0, ops(op("replace", "/$nonce", "zyxwvutsrqponmlkjihgfedcba"), op("add", "/$successor", "/r/m/elsewhere")))
 	e.rawRedirect("/r/m/notes/raw", "m", "notes", bid, r1, ccHead)
 	if e.upload("m", "plain", "text/markdown", md) != bid {
 		t.Fatal("blob id")
 	}
+	// Not raw: the blob reference isn't the root.
 	e.create("m", "plain", map[string]any{"title": "x", "file": map[string]any{"$blob": bid, "type": "text/markdown", "size": len(md)}})
 	for path, class := range map[string]string{"/r/m/plain/raw": ccHead, "/r/m/plain/rev/" + e.head("m", "plain") + "/raw": ccImmutable} {
 		r := e.get(path)
@@ -229,8 +232,8 @@ func TestRawNotOffered(t *testing.T) {
 }
 
 // §7.8 Reading: every blob response carries nosniff and the sandbox
-// policy: 200, 206, 304, errors, and a sealed namespace's 302 and epoch
-// blobs.
+// policy: 200, 206, 304, errors, those answered before routing included,
+// and a sealed namespace's 302 and epoch blobs.
 func TestBlobHeaders(t *testing.T) {
 	t.Parallel()
 	e := newSealedEnv(t, withBlobTuning)
@@ -261,4 +264,9 @@ func TestBlobHeaders(t *testing.T) {
 	check(e.get(s.H.Get("Location")), 200)
 	check(e.do(req{method: "GET", path: s.H.Get("Location"), hdr: map[string]string{"Range": "bytes=0-9"}}), 206)
 	check(e.get(blobPath("s", "a", sbid)+"/e/99"), 404)
+	// Answered before routing: an unknown parameter, whose name the body
+	// echoes, and a percent-escape.
+	check(e.get(p+"?x=%3Cscript%3E"), 400)
+	check(e.get(s.H.Get("Location")+"?x=1"), 400)
+	check(e.get(strings.Replace(p, "/blob/", "/bl%6Fb/", 1)), 400)
 }
