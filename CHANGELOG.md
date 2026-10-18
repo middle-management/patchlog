@@ -16,7 +16,10 @@
   and the reload it asks for becomes the base. Editors' swap, backup and temp files and macOS's
   `._*` and `.DS_Store` stay in memory per user, so atomic saves and backup renames are edits,
   not deletes, as do a file manager's copies made beside a document until renamed. In catalogs
-  MKCOL makes a folder, MOVE replaces one `parents` entry and DELETE unplaces. Local mode sends
+  MKCOL makes a folder, MOVE replaces one `parents` entry and DELETE unplaces. A DELETE right
+  after the same user's refused save of the same file is refused once (`409`), since rclone
+  deletes every file whose upload failed, which would delete the document for everyone because a
+  save was refused; sent again, it is done. Local mode sends
   one `-bearer` grant behind a password; gateway mode (`-gateway`) sends each request's Basic
   password upstream as its grant, keeps nothing for a grant the core hasn't accepted, and needs
   TLS beyond loopback. Not yet: blobs as files, sealed and end-to-end namespaces (read-only),

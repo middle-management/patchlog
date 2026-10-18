@@ -2189,7 +2189,8 @@ rclone config create pl webdav url=http://127.0.0.1:8090/ vendor=other user=me \
 
 rclone copy --ignore-size --ignore-times ./docs pl:docs     # upload: every file, every time
 rclone copy --ignore-times pl:docs ./docs                   # download: likewise
-rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size # a mount
+rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
+  --dir-cache-time 1s --vfs-cache-max-age 5s --vfs-cache-poll-interval 5s   # a mount
 ```
 
 - The server keeps no modification times rclone can set, and no hashes, so rclone tells files
@@ -2209,12 +2210,42 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size # a mount
   keeps the size isn't sent.
 - **Copies from the server take `--ignore-times`**, else a document someone changed without
   changing its size isn't fetched.
-- **A mount takes `--ignore-size`** (`--vfs-cache-mode writes` or `full`): the upload of a save
-  merged with others' edits is then done, not deleted. Without it, the mount deletes the
-  document, and keeps retrying the upload, each time restoring it with an empty patch set and
-  deleting it again. Without a cache (`--vfs-cache-mode off`) rclone saves over a file as DELETE
-  then MOVE of a temporary file onto the name; a MOVE the server refuses (a file that isn't JSON,
-  a conflict) restores the document (below), and the program saving gets an I/O error.
+- **A refused save doesn't delete the document.** rclone answers every failed upload (a
+  conflict, a file that isn't JSON, one too large, a `422` or `403`) by deleting the file a
+  second later, and ignores that DELETE's answer. The server refuses it (`409`, above), and each
+  of rclone's retries (`--retries 3`, a mount's write-back) is refused again, its DELETE too: the
+  document stays as it was for everyone, and rclone exits with the save's error. Deleting it on
+  purpose right after works the second time: `rclone deletefile` retries on its own, and does.
+- **A mount takes `--vfs-cache-mode writes --ignore-size` and short cache times**
+  (`--dir-cache-time 1s --vfs-cache-max-age 5s --vfs-cache-poll-interval 5s`). Without
+  `--ignore-size` the upload of a save merged with others' edits fails on its size and the mount
+  deletes the document, retrying the upload, restoring it and deleting it again. rclone tells a
+  file's versions apart by size alone and, by default, keeps a directory listing for 5 minutes
+  and a file it wrote in its cache for an hour: a file someone else changed then reads as the
+  cached copy when its size didn't change, and is cut short at the old size when it grew (the
+  kernel reads no further), so `sed -i` or an editor writes clipped JSON back (`400`, refused).
+  With the short times another's edit shows within a few seconds. rclone's mount answers
+  extended attribute calls with `EIO`, so `ls -l` and `sed -i` print "Input/output error" about
+  them; the save is done all the same.
+- **After a refused save through a mount** (a conflict, clipped JSON), the program saving sees
+  no error with `--vfs-cache-mode writes`: the mount keeps showing its version, read from the
+  cache, and rclone retries the upload in the background (after 10 s, 20 s, 40 s, … up to every 5
+  minutes: "vfs cache: failed to upload try #N" in its log), refused each time. The way out is to
+  write the server's version into the mounted file, `rclone cat pl:docs/x.json > ~/pl/docs/x.json`
+  (the shell empties the mounted file before rclone reads, so the refused version isn't sent
+  again): that upload writes nothing, and you edit again from there. Don't read the document
+  with another program of the same user meanwhile (`rclone cat` to the terminal, a browser on the
+  same password): that read is the reload the `409` asks for, and the mount's next retry then
+  saves its old version over the other edit. With `--vfs-cache-mode off` the program saving gets
+  an I/O error instead and nothing is retried: re-reading the file through the mount (once
+  `--dir-cache-time` has passed) is the reload, and an edit of what it reads saves.
+- **Without a cache (`--vfs-cache-mode off`)** a program writing a file in place uploads it
+  with a PUT, but one saving through a temporary file renamed over it (`sed -i`, editors' safe
+  saves) makes rclone DELETE the document, then MOVE the temporary file onto the name (its MOVE
+  never overwrites): each such save writes a tombstone and then the restore with the edit, and
+  one the server refuses (a file that isn't JSON, a conflict) restores the document as it was
+  (below), with an I/O error for the program. Use `--vfs-cache-mode writes`, which renames a
+  file it hasn't uploaded yet in its cache, and then uploads it with a PUT.
 - `rclone sync` deletes what the source doesn't have: here, a tombstone per document. Renames
   (`moveto` to another name) are refused: names are identity. `moveto` of a flat file into a
   catalog folder, under its own name `{ns}.{name}.json`, places the document; it stays in the
@@ -2336,7 +2367,16 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size # a mount
 - An empty write (a LOCK of a new name, Finder's 0-byte PUT) makes an empty placeholder until
   content arrives; it never truncates a live document.
 - DELETE tombstones (§8.1); with `If-Match` (or an `If` header's entity tag) naming another
-  revision than the head, it is `412`. A MOVE between two documents is `403`: names are identity
+  revision than the head, it is `412`. A DELETE that follows the same user's refused save of the
+  same file (a PUT, or a MOVE or COPY onto it, answered `4xx` or `5xx`, that wrote nothing) within
+  10 seconds is `409` ("wasn't deleted: this DELETE follows a refused save of the same file …
+  delete it again to delete it"), once: rclone deletes any file whose upload failed, a second
+  later, which would tombstone the document for everyone (in a catalog folder, unplace the
+  placement) because a save was refused. The same DELETE sent again is done; so is one naming
+  the revision it deletes (`If-Match`), and one after the user read the file (a GET answered
+  `200`, not a range read) or saved it since. A save that succeeded, merged or not, sets no such
+  guard. In local mode every program is the same user, so another program's DELETE in those 10
+  seconds is refused once too. A MOVE between two documents is `403`: names are identity
   (§3.6), so there is no rename. COPY to a new name creates it from the content, and COPY over a
   document edits it. MKCOL of a folder that exists is `405` (not logged), and below a file `409`.
 
