@@ -67,27 +67,48 @@ raw documents, moves, whole-document appends and `logPageBytes` are new.
   `client.ResolveSuccessor`.
 - **`serve -log-page-bytes`**, and `LogPageBytes` in `core.Limits` and `clienttest.Options`.
 - **`patchlog dav`: namespaces and catalogs over WebDAV (a prototype)** (`internal/dav`), so
-  file managers and editors (Finder, Explorer, GNOME Files, vim, VS Code) open and save
-  documents as files, through the core's public API only. Flat namespaces (`-ns`) are
-  directories of `{name}.json`; catalogs (`-catalog`, Addendum B) are folder trees whose
-  placements `{ns}.{name}.json` hold their item. A file reads as its document's canonical form,
-  indented, with the revision id as ETag. A save is rebased (§11 submit): the diff from the
-  version the user had (`If-Match`, or the closest one they were served or wrote) is appended
-  to the head with `If-Match`, so others' edits are kept and overlapping ones are a `409`,
-  never an overwrite (writes inside an array count for the whole array, §F.3); a save that
-  would change a value one of the versions the user may have edited disagrees on is a `409` too,
-  and the reload it asks for becomes the base. Editors' swap, backup and temp files and macOS's
-  `._*` and `.DS_Store` stay in memory per user, so atomic saves and backup renames are edits,
-  not deletes, as do a file manager's copies made beside a document until renamed. In catalogs
-  MKCOL makes a folder, MOVE replaces one `parents` entry and DELETE unplaces. A DELETE right
-  after the same user's refused PUT of the same file is refused once per refused PUT (`409`),
-  since rclone deletes every file whose upload failed, which would delete the document for
-  everyone because a save was refused; sent again, it is done. A refused write restores the
-  user's own DELETE only within 30 seconds of it. Local mode sends
-  one `-bearer` grant behind a password; gateway mode (`-gateway`) sends each request's Basic
-  password upstream as its grant, keeps nothing for a grant the core hasn't accepted, and needs
-  TLS beyond loopback. Not yet: blobs as files, sealed and end-to-end namespaces (read-only),
-  history, live invalidation, batches.
+  file managers, editors and sync tools (Finder, Explorer, GNOME Files, vim, VS Code, rclone and
+  its mounts) open and save files through the core's public API only, following spec Addendum H
+  (files):
+  - **Files** (§H.1): a file other than a JSON file is a raw document, its root a blob reference
+    to its bytes, kept exactly and typed by §H.1's extension table (else the upload's
+    `Content-Type`); a JSON file is a document, read as its rendering (the canonical text laid
+    out as `JSON.stringify(v, null, 2)`, without a fresh `$nonce` or a `$successor`). A new
+    `.json` file that isn't I-JSON is raw. Raw files are streamed from their blobs through this
+    server, with ranges, `nosniff` and a sandbox policy. Every file's ETag is its head revision.
+  - **Layout** (§H.2, §H.3): a namespace (`-ns`) is the flat view, a raw document by its name and
+    any other as `{name}.json`, listed from `/heads` with sizes and types read once per revision;
+    a catalog with `catalog.files` (`-catalog`) is a file tree whose folders and files are named
+    by their nodes' titles (NFC, case folded unless `-case-sensitive`, duplicates numbered,
+    unsafe titles escaped), with new files created as opaque items in `files.ns` and renames and
+    moves one append to the node. Sealed and end-to-end namespaces aren't offered (§H.7).
+  - **Saves** (§H.4): the base is the revision `If-Match` (or the `If` header's first applicable
+    entity tag) names, else the closest of the versions the user was served whole or wrote in
+    the last day; the edit from it is rebased on the head, others' edits since kept, overlapping
+    ones (what differs and what the log entries in between wrote) a `409`, as is a delete or
+    restore by someone else in between, a pruned base, or lost records; a raw file conflicts as
+    a whole and sets its reference's members one by one. A JSON patch set over `opsPerSet` or
+    `patchSetSize` is a root replace when the base is the head, else `413`. Answers follow
+    §H.4's table: an ETag only for a revision that holds exactly what was sent (and the next
+    read in full after a merge), `410` for purged, `403` naming the successor for frozen, `413`
+    for any limit, `503` with Retry-After for long rate limits.
+  - **Moves** (§H.5, §H.8): within a tree, a rename or move of the node; onto an existing file, a
+    save into it, then a delete of the source, so the target keeps its history; across trees or
+    namespaces, a copy and a delete with `$successor`; in the flat view, to a free name, one
+    batch creating the new resource and deleting the old with `$successor`. A file moved to a
+    scratch name stays (an editor's backup).
+  - **Clients as they are** (§H.6): editors' and systems' own files (`.DS_Store`, `._*`, `*.swp`,
+    `*~`, `.goutputstream-*`, …) and apps' folders stay in memory per user; locks are kept in
+    memory, bounded; a write to a path the user deleted within 30 seconds restores the file
+    rebased on its last live document, and a refused one undoes that DELETE; a refused PUT, or a
+    refused MOVE onto a file, sets a guard that refuses the user's DELETE of the path within 10
+    seconds once per refusal (rclone deletes every file whose upload failed), ending only by
+    time. `PROPFIND` without `Depth` is `1`, `Depth: infinity` `403`.
+  - Local mode sends one `-bearer` grant behind a password; gateway mode (`-gateway`) sends each
+    request's Basic password upstream as its grant, keeps nothing for a grant the core hasn't
+    accepted, and needs TLS beyond loopback. Not yet: the principal endpoint for users (keyed
+    by grant), the tree service's file metadata for listings, catalog-issued grants, text
+    merges, history, live invalidation, batches.
 
 **Fixes:**
 - **A second CDN purge from the index and the tree/catalog services** (D.8, as the core's): a

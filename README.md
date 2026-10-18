@@ -2252,12 +2252,12 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   changing its size isn't fetched.
 - **A refused save doesn't delete the document.** rclone answers every failed upload (a conflict,
   a file that isn't JSON, one too large, a `422` or `403`) by deleting the file a second later,
-  and ignores that DELETE's answer. The server refuses it (`409`, above), and each of rclone's
-  retries (`--retries 3`, a mount's write-back) is refused again, its DELETE too: the document
-  stays as it was for everyone, and rclone exits with the save's error. Deleting it on purpose
-  right after works the second time: `rclone deletefile` retries on its own, and does. Nor does a
-  refused upload bring back a document you deleted (`rm` in a mount, an `rclone sync` deletion):
-  rclone's DELETE after it is done.
+  and ignores that DELETE's answer. The server refuses it (`409`, the guard below), and each of
+  rclone's retries (`--retries 3`, a mount's write-back) is refused again, its DELETE too: the
+  document stays as it was for everyone, and rclone exits with the save's error. Deleting it on
+  purpose right after takes one DELETE more per refused save, or none once 10 seconds have
+  passed: `rclone deletefile` retries on its own. Nor does a refused upload bring back a document
+  you deleted (`rm` in a mount, an `rclone sync` deletion): rclone's DELETE after it is done.
 - **A mount takes `--vfs-cache-mode writes --ignore-size` and short cache times**
   (`--dir-cache-time 1s --vfs-cache-max-age 5s --vfs-cache-poll-interval 5s`). Without
   `--ignore-size` the upload of a save merged with others' edits fails on its size and the mount
@@ -2286,14 +2286,20 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   saves) makes rclone DELETE the document, then MOVE the temporary file onto the name (its MOVE
   never overwrites): each such save writes a tombstone and then the restore with the edit, and
   one the server refuses (a file that isn't JSON, a conflict) restores the document as it was
-  (below), with an I/O error for the program; the next save is done as usual. Use
-  `--vfs-cache-mode writes`, which renames a file it hasn't uploaded yet in its cache, and then
-  uploads it with a PUT.
-- `rclone sync` deletes what the source doesn't have: here, a tombstone per document. In a file
-  tree `moveto` renames and moves files and folders (below); in a flat directory it is refused
-  (`403`), names being identity, and `moveto` of a flat file into a tree copies it there and
-  deletes it. rclone sends a MKCOL for the parent folder before each upload: `405`, as a folder
-  that exists is, and not logged. `rclone mkdir` in a frozen catalog fails at once (`403`).
+  (below), with an I/O error for the program; the next save is done as usual. A temporary file
+  with a scratch name stays in memory; in a file tree, or under a resource name in a flat
+  directory, it is a file of its own, which that MOVE deletes once it has restored the original
+  with its content, so the original keeps its history. sed's temporary names (`sedAb12Cd`) are
+  neither scratch names nor resource names, so `sed -i` fails in a flat directory without a
+  cache, writing nothing. Use `--vfs-cache-mode writes`, which renames a file it hasn't uploaded
+  yet in its cache, and then uploads it with a PUT.
+- `rclone sync` deletes what the source doesn't have: here, a tombstone per document (in a file
+  tree, the placement and its item). In a file tree `moveto` renames and moves files and folders
+  (below); in a flat directory it moves a file to another name in one batch, the old name's last
+  revision naming the new one in `$successor` (§8.1, below), and `moveto` between a flat
+  directory and a tree, or another namespace, copies the file and deletes it. rclone sends a
+  MKCOL for the parent folder before each upload: `405`, as a folder that exists is, and not
+  logged. `rclone mkdir` in a frozen catalog fails at once (`403`).
 
 **Layout.**
 
@@ -2383,45 +2389,61 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   already holds write nothing. The revision holds exactly what was sent, so its ETag answers the
   PUT.
 - A new name is created (`If-None-Match: *` upstream); a tombstoned one is restored, so a name
-  keeps one chain (§8.2), with the diff from its last live document (rebased as an edit is, below;
-  a raw file over a JSON document's, or the other way round, replaces its root); a purged one is
-  `403`. A PUT's own `If-None-Match: *` (create only) is
-  `412` over an existing file, and `If-Match: *` (edit only) over a missing one; an empty
-  placeholder (below) exists for both. An `If` header's lists of entity tags only (no lock token,
-  or the always true `Not <DAV:no-lock>`) are this server's to check, as `If-Match`.
+  keeps one chain (§8.2): moments after the user's own DELETE (below), with the edit rebased on
+  its last live document; a save from a version from before someone else's delete is a `409`
+  (deleted by someone else since you opened it), until a GET finding the file gone, the reload;
+  any other write makes the file anew, its root replaced (which drops a `$successor`, so a file
+  moved away and written again isn't marked moved). A raw file over a JSON document's, or the
+  other way round, replaces its root. A purged one is `410`, as is any name of a purged
+  namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
+  `If-Match: *` (edit only) over a missing one; an empty placeholder (below) exists for both.
 - An existing JSON file gets the user's edit rebased on its head (§11.3, §H.4): the diff
   (`merge.Diff`) from the version the user edited, the base (as rendered: a `$successor` it
   leaves out stays), to what they wrote, applied to the current head and appended with `If-Match`
-  on it. The base is one of the versions the user may
-  have edited: the revision the PUT's `If-Match` (or an `If` header's entity tag) names, with the
-  user's own writes that revision holds merged; else the versions this user was served (a GET's
-  body; a `304` sends none) or wrote in the last day, at most 16 a document (over that, the oldest
-  but the first goes: the version an editor opened stays while a preview reads others'
-  revisions). Of those, it is the one closest to what was written (the fewest changed paths): an
+  on it. The base is one of the versions the user may have edited: the revision the PUT's
+  `If-Match` names (its first value, `W/` dropped), or failing that its `If` header (the first
+  entity tag, not negated with `Not`, of the first list that applies to the file: untagged, or
+  tagged with its URL), with the user's own writes that revision holds merged; `If-Match: *` only
+  asks that the file exist, and the head is the base. Without one, the base is among the versions
+  this user was served whole (a GET's body, or a range that is the whole file; a `304`, a
+  `HEAD`, a `PROPFIND` and a partial range record nothing) or wrote in the last day, at most 16
+  a document (over that, the oldest but the first goes, and never the latest write: the version
+  an editor opened stays while a preview reads others' revisions); a save that changed nothing
+  is no write. Of those, it is the one closest to what was written (the fewest changed paths): an
   editor's buffer is what it opened or last saved plus the user's edit, while a preview pane's or
   a second window's GET moves on without it. A file equal to an older version is a save of it
   unchanged, or, when the user wrote since and the file reverts just what that save changed, an
   undo of it. Edits others made since the base are kept: the patch set holds only the user's
-  changes. Writes count whole arrays (an edit anywhere in an element is an edit of the array, from
-  the outermost: elements have no identity, so an index one side names is another element after
-  the other's insert or delete; §F.3's array rule). Where the user's writes overlap others' since
-  the base and what the user wrote differs from the head there, the save is `409 Conflict` and
-  nothing is written. A change both made, or a value reloaded since, is no conflict.
+  changes. Others' writes are what differs between the base and the head, and the writes of the
+  log entries between them (§11.3), so a value someone changed and changed back counts; the
+  user's own entries don't. Writes count whole arrays (an edit anywhere in an element is an edit
+  of the array, from the outermost: elements have no identity, so an index one side names is
+  another element after the other's insert or delete; §F.3's array rule). Where the user's writes
+  overlap others' since the base and what the user wrote differs from the head there, the save is
+  `409 Conflict`, naming the paths, and nothing is written. A change both made, or a value
+  reloaded since, is no conflict. A delete or restore by someone else between the base and the
+  head is a `409` too, never merged over.
+- A patch set over `opsPerSet` or `patchSetSize` (§6.6: the namespace's, else the deployment's,
+  which the core's refusal tells) is sent as a root `replace` instead, which may be as large as
+  `documentSize`, carrying the document's `$successor` and a fresh `$nonce` where nonces apply,
+  when the base is the head (§H.4): it then overwrites no one's edit. A save merged with others'
+  edits is `413` instead, asking for a reload, after which the base is the head.
 - The base isn't guessed: a save may change the head only where every version the user may have
   edited agrees with the head (or holds what the user wrote there since), so whichever one their
   program had, no edit someone else made in between is undone or overwritten unseen. Where they
-  can't be told apart, as the version an editor opened and a newer one a preview read (a one-byte
-  `Range` read counts) when the edit covers what changed in between, the save is a `409` too. A
-  `409` asks for a reload: the user's next GET of the document sends it whatever its validators
-  say (a cached copy may be what the editor had), and drops the versions recorded before the
-  `409`, so the reloaded one is the base of the edit after it. A version that can't be read again
-  for a save (a `429`, a `5xx`) fails it (`503`, `502`) rather than leaving it without a base; one
-  pruned since (§8.6) is none, and an `If-Match` naming no revision that can be read is `412`. A
-  head that moves meanwhile (`412`) is read again, the edit checked again and resent, up to five
-  times.
+  can't be told apart, as the version an editor opened and a newer one a preview read, when the
+  edit covers what changed in between, the save is a `409` too. A `409` asks for a reload: the
+  user's next GET of the whole document sends it whatever its validators say (a cached copy may
+  be what the editor had), and drops the versions recorded before the `409`, so the reloaded one
+  is the base of the edit after it; a range read isn't that reload. A version that can't be read
+  again for a save (a `429`, a `5xx`) fails it (`503`, `502`) rather than leaving it without a
+  base. One the core no longer has (pruned, §8.6), named by `If-Match` or recorded, or whose
+  history since is pruned, can't be compared: `409`, asking for a reload. An `If-Match` naming
+  no revision of the document is `412`. A head that moves meanwhile (`412`) is read again, the
+  edit checked again and resent, up to five times.
 - With nothing known of the base (a PUT without `If-Match` from a user never served the document,
-  after a restart, or once a day has passed), the head (of a tombstoned document, its last live
-  one) is the base, so the file as written wins, as the diff from it.
+  after a restart, or once a day has passed), the head is the base, so the file as written wins,
+  as the diff from it; over a tombstoned document, a file made anew (above).
   Versions the bounds pushed out are remembered as lost: then a save that changes the document is
   a `409` until a reload, rather than rebased on what is left. Within one user, the closest
   version decides: two programs saving the same value, the last wins, and an undo of a save
@@ -2435,51 +2457,68 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   and never GETs again keeps its copy. A save that writes nothing (the file already reads so) is
   no write of the user's.
 - A save that deletes the original before writing the new version (DELETE, then a PUT, a COPY or
-  a MOVE onto the name) restores it with the user's edit rebased on the last live document, as
-  above. If that write fails within 30 seconds of the DELETE, whatever refuses it (a `409`
-  conflict, a `422`, a body that isn't JSON or is over `-max-file-size`, a frozen namespace, a
-  precondition), the user's own DELETE is undone: the document is restored as it was (an empty
-  patch set, if the user's tombstone is still its head), as a failed PUT leaves it, and the
-  answer says so. In a file tree, a write to the path of a file the user deleted within 30
-  seconds restores it, its placement and then its item, and a refused one restores both as they
-  were (§H.6). A document deleted longer ago stays deleted, and rclone's DELETE after its refused
-  upload deletes a restored one again: the deletion stands.
+  a MOVE onto the name, of a temporary file or of another file) restores it with the user's edit
+  rebased on the last live document, as above, within 30 seconds of the DELETE (§H.6); a file
+  moved away since (its last document has `$successor`) is made anew instead. A MOVE of another
+  file deletes that file afterwards. If that write fails within 30 seconds of the DELETE,
+  whatever refuses it (a `409` conflict, a `422`, a body that isn't JSON or is over
+  `-max-file-size`, a frozen namespace, a precondition), the user's own DELETE is undone: the
+  document is restored as it was (an empty patch set, if the user's tombstone is still its head),
+  as a failed PUT leaves it, and the answer says so. In a file tree, a write to the path of a
+  file the user deleted within 30 seconds restores it, its placement and then its item, and a
+  refused one restores both as they were (§H.6). A document deleted longer ago stays deleted,
+  and rclone's DELETE after its refused upload deletes a restored one again, unless a guard
+  from an earlier refusal is still on it (above): the deletion stands.
 - `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
   the namespace requires nonces or its document can't be read (§C.7), with a `Blob-Nonce` on a raw
   file's blob. Where nonces are required, a JSON file's root must be an object, which carries the
   `$nonce`: an array or a scalar is `422`, saying why (§H.1).
 - The core's refusals come back as such, with its code and message as the text (the status is
-  the answer's own): `422` with its validation errors (schema, rules, `nonce`, signature), one per
-  line; `413` for a patch set over `patchSetSize` (a create's over `documentSize`) or a document
-  over `documentSize`, with the sizes of what was sent, as the core measures them, and the limits
-  the namespace sets; `403` for a frozen namespace (with its `successor`): frozen is for good,
-  and clients retry a `423` as a lock that may go (rclone 30 times, for 45 seconds); `401` and
-  `403` (but in local mode a `401` refuses the server's own grant, not the user's password, so it
-  is `502` rather than a new login prompt). A `429` is waited out when its Retry-After is at most
-  2 s, and is otherwise `503` with Retry-After. A core that can't be reached is `502` (the
-  details are logged).
+  the answer's own, §H.4 "Answers"): `422` with its validation errors (schema, rules, `nonce`,
+  signature), one per line; `413` for a limit (the core's `413`, or its `422` with code `limit`:
+  a patch set over `patchSetSize` or `opsPerSet` that couldn't be sent whole, a create's over
+  `documentSize`, a document over `documentSize`, nesting), with the sizes of what was sent, as
+  the core measures them, and the limits the namespace sets; `403` for a frozen namespace (with
+  its `successor`): frozen is for good, and clients retry a `423` as a lock that may go (rclone 30
+  times, for 45 seconds); `410` for a purged file or namespace; `401` and `403` (but in local
+  mode a `401` refuses the server's own grant, not the user's password, so it is `502` rather
+  than a new login prompt). A `429` is waited out when its Retry-After is at most 2 s, and is
+  otherwise `503` with Retry-After. A core that can't be reached is `502` (the details are
+  logged). `423` and `507` mean only a lock held and this server's memory full.
 - An empty write (a LOCK of a new name, Finder's 0-byte PUT) makes an empty placeholder until
   content arrives; it never truncates a live file, so an empty raw file isn't made over WebDAV.
 - DELETE tombstones (§8.1); with `If-Match` (or an `If` header's entity tag) naming another
-  revision than the head, it is `412`. A DELETE that follows the same user's refused PUT of the
-  same file (answered `4xx` or `5xx`, having written nothing) within 10 seconds is `409` ("wasn't
-  deleted: this DELETE follows a refused save of the same file … delete it again to delete it"),
-  once per refused PUT, at most twice: rclone deletes any file whose upload failed, a second
-  later, which would tombstone the document for everyone (in a file tree, delete the file)
-  because a save was refused. The same DELETE sent again is done; so is one naming the
-  revision it deletes (`If-Match`), and one after the user read the file again at least 2 seconds
-  after the refusal (a GET answered `200`, not a range read). A DELETE that finds nothing uses
-  one refusal up (a refused create's cleanup), and one done forgets them. A PUT that succeeded,
-  merged or not, sets no such guard and lifts none; nor does a refused MOVE or COPY onto the file
-  (rclone deletes nothing after one), or a PUT that restored the document the user had just
-  deleted (below): the DELETE after that leaves it deleted, as the user chose. In a frozen
-  namespace, which takes no DELETE either, the DELETE gets the core's `403` instead. In local
-  mode every program is the same user: another program's DELETE in those 10 seconds is refused
-  once too, and its full read of the file 2 seconds or more after the refusal lifts the guard. In
-  the flat view a MOVE between two files is `403`: names are identity (§3.6), so there is no
-  rename. COPY to a new name creates it from the content (a raw file's bytes read through this
-  server), and COPY over a file edits it, as its kind takes it. MKCOL of a folder that exists is
-  `405` (not logged), and below a file `409`.
+  revision than the head, it is `412`.
+- **Guards** (§H.6). A refused PUT of a file, or a refused MOVE onto an existing file (answered
+  `4xx` or `5xx`, having written nothing), sets a guard: the same user's DELETE of that path
+  within 10 seconds is `409` ("wasn't deleted: this DELETE follows a refused save of the same
+  file … delete it again to delete it"), once per refusal, and two refusals never share one:
+  rclone deletes any file whose upload failed, a second later, which would tombstone the document
+  for everyone (in a file tree, delete the file) because a save was refused. A guard ends only by
+  time: a read of the file doesn't lift it (it may be another program's), nor another program's
+  save, nor a DELETE that passed. A DELETE naming the revision it deletes (`If-Match`) is
+  deliberate and passes, leaving the guards as they are; one that finds nothing uses one up (a
+  refused create's cleanup). A refused plain MOVE (to a new name) or COPY sets none, nor does a
+  write whose refusal put back the document the user had just deleted (below): the DELETE after
+  that leaves it deleted, as the user chose. In a frozen namespace, which takes no DELETE either,
+  the DELETE gets the core's `403` instead. A user keeps at most 4096 guards (the oldest go
+  first), so many uploads refused at once each keep theirs. In local mode every program is the
+  same user: another program's DELETE in those 10 seconds is refused too.
+- **MOVE in the flat view** (§H.8). To a free name in the same namespace, one batch (§7.5)
+  creates the new resource with the document (a fresh `$nonce` where nonces apply) and appends
+  `$successor` naming it to the old one before its tombstone (§8.1), so the old name's `410` says
+  where it went; a raw file's blob is copied with `Blob-From` (§7.8), or uploaded again where the
+  new name's extension gives it another type. A tombstoned name is restored so, its root
+  replaced (one the user deleted within 30 seconds keeps its history: below). To another
+  namespace (or a tree) it is a copy, then a delete with `$successor` `/r/{ns}/{name}`. Onto an
+  existing file (`Overwrite: T`, or none) it is a save of the source's content into it, its base
+  taken as a PUT's, then a delete of the source: the target keeps its history, which is how
+  "write a temporary file, rename it over" saves land (§H.5); `Overwrite: F` is `412`. A JSON
+  file keeps a `{name}.json` name and a raw file a raw one, and a JSON file whose root isn't an
+  object can't carry `$successor`: those MOVEs are `403` (copy, then delete). COPY to a new name
+  creates it from the content (a raw file's bytes read through this server), and COPY over a
+  file edits it, as its kind takes it. MKCOL of a folder that exists is `405` (not logged), and
+  below a file `409`.
 
 **Temporary and backup files** (§H.6). Editors' and systems' own files, `.DS_Store`, `._*`,
 `Thumbs.db`, `~$*`, `*.swp`, `4913`, `*~`, `#*#`, `*___jb_tmp___` and `.goutputstream-*`, and
@@ -2500,8 +2539,9 @@ as a full disk).
   commits its content exactly as a PUT would (an edit, a create or a restore), then drops it.
 - A MOVE of a file to a scratch name, an editor moving the original aside as a backup before
   writing the new version, copies it (a raw file's bytes, within `-max-file-size`): the file
-  stays, and the write that follows is an edit of it, even one that creates only (davfs2's
-  `If-None-Match: *`, as it takes the name for free after the MOVE).
+  stays, and the write that follows is an edit of it (§H.5), its base taken as any save's; once,
+  within 30 seconds of the MOVE, even one that creates only (davfs2's `If-None-Match: *`, as it
+  takes the name for free after the MOVE, and uploads 10 seconds after the file is closed).
 - MKCOL of an app's folder, anywhere (a name starting with a dot, as `.TemporaryItems`, or
   macOS's `(A Document Being Saved By TextEdit)`), makes a scratch directory, where every name is
   a scratch file. Any other MKCOL outside a file tree is `403`, as is a MOVE giving a scratch
@@ -2585,7 +2625,7 @@ with several parents shows under each, and a DELETE takes it out of that one onl
 (`$access`, §B.11) and the tree service: users see what their grant reads, as the core lists it,
 and a tree's listings read its items rather than the tree service's `file` metadata (§H.3). Grants
 issued by the catalog (§B.11.4): each user's grant is passed through, so a new file is created
-before it is placed, never placed first. Renames in the flat view (§H.2: a copy and a delete).
+before it is placed, never placed first. Merges of text: raw files conflict as a whole (§H.9).
 Blob references deeper in a JSON document read and edit as JSON. Sealed (E.2) and end-to-end (E.3) namespaces, which need keys. History
 (revisions and logs as directories), live invalidation, and batches: each file is its own write,
 so saving several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5)
