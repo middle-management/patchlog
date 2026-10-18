@@ -156,6 +156,25 @@ func (st *reqState) tree(ctx context.Context, cat string) (*catGraph, *treeFiles
 	return cg, c.files, nil
 }
 
+// writeTree is tree for a write that changes a tree's nodes (a new file
+// or folder, a rename, a move, a delete), which the node documents decide
+// (§H.5). A grant that doesn't read them (§H.7 "Limited grants"), which
+// lists, reads and edits files through a tree service, is refused so
+// (403), rather than with the core's 404 for the catalog's /heads.
+func (st *reqState) writeTree(ctx context.Context, cat string) (*catGraph, *treeFiles, error) {
+	if _, err := st.treeConf(ctx, cat); err != nil {
+		return nil, nil, err
+	}
+	if _, err := st.graph(ctx, cat); err != nil {
+		var de *davError
+		if errors.As(upstream(err), &de) && (de.status == http.StatusForbidden || de.status == http.StatusNotFound) {
+			return nil, nil, fail(http.StatusForbidden, "your grant doesn't read catalog %s's node documents (%s), which a new file or folder, a rename, a move or a delete in its tree is made from (§H.5, §H.7 \"Limited grants\"): with it, files' contents are edited only", cat, de.msg)
+		}
+		return nil, nil, err
+	}
+	return st.tree(ctx, cat)
+}
+
 // notTree is the answer for catalog cat, which isn't a file tree (why).
 func notTree(cat, why string) error {
 	if why == "" {
@@ -563,9 +582,10 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 	cg, _, err := st.tree(ctx, t.ns)
 	var de *davError
 	switch {
-	case err != nil && errors.As(upstream(err), &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden):
+	case err != nil && errors.As(upstream(err), &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden || de.status == http.StatusNotFound):
 		// A grant that doesn't read the node documents (§H.7 "Limited
-		// grants") has only the listing to go by.
+		// grants"), which the core answers 404 for the catalog's /heads
+		// (§7), as behindDir finds, has only the listing to go by.
 		return r, nil
 	case err != nil || st.agrees(cg, steps):
 		return r, err
@@ -776,7 +796,7 @@ func (cg *catGraph) nodeDoc(schema, title, folder string) map[string]any {
 // mkFolder makes folder t.title in folder t.parent (MKCOL): a new folder
 // node with an opaque name (§H.2).
 func (st *reqState) mkFolder(ctx context.Context, t target) error {
-	cg, f, err := st.tree(ctx, t.ns)
+	cg, f, err := st.writeTree(ctx, t.ns)
 	if err != nil {
 		return err
 	}
@@ -803,7 +823,7 @@ func (st *reqState) newFile(ctx context.Context, t target, raw bool, v any, body
 	// A new file's kind is its name's and content's (§H.1), whatever the
 	// file deleted at its path was.
 	raw, v = newKind(t.title, body)
-	cg, f, err := st.tree(ctx, t.ns)
+	cg, f, err := st.writeTree(ctx, t.ns)
 	if err != nil {
 		return "", false, err
 	}
@@ -963,7 +983,9 @@ func itemError(m map[string]any) *client.APIError {
 // doesn't write: one in a catalog (a node document, which takes only the
 // writes of MKCOL, MOVE and DELETE here), or in a namespace neither served
 // (-ns) nor trusted by the catalog (§B.3), which a local mode's grant may
-// reach though the server wasn't set up to serve it.
+// reach though the server wasn't set up to serve it. The catalog's trust
+// is as the tree is listed with (treeConf): for a grant that doesn't read
+// the catalog's document (§H.7 "Limited grants"), as last read with any.
 func (st *reqState) writable(ctx context.Context, t target) error {
 	if t.kind != kPlacement {
 		return nil
@@ -971,7 +993,11 @@ func (st *reqState) writable(ctx context.Context, t target) error {
 	if st.s.cats[t.docNS] || t.docNS == t.ns {
 		return fail(http.StatusForbidden, "%s is a placement of catalog node %s/%s; its file isn't written here (folders are made, renamed, moved and deleted as directories)", t.path, t.docNS, t.docName)
 	}
-	if st.s.flat[t.docNS] || slices.Contains(st.s.nsInfo(ctx, st.tk, t.ns).trust, t.docNS) {
+	trust := st.s.nsInfo(ctx, st.tk, t.ns).trust
+	if c, err := st.treeConf(ctx, t.ns); err == nil {
+		trust = c.trust
+	}
+	if st.s.flat[t.docNS] || slices.Contains(trust, t.docNS) {
 		return nil
 	}
 	return fail(http.StatusForbidden, "catalog %s doesn't trust namespace %s (§B.3), and it isn't served here (-ns): %s, a placement of %s/%s, isn't written through the catalog", t.ns, t.docNS, t.path, t.docNS, t.docName)
@@ -1018,10 +1044,11 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 // node documents read had it (If-Match), which resolveCatalog checked the
 // path against: renamed or moved since by anyone, it is a 409, not
 // deleted. A node with several parents (a DAG) is unlinked from this
-// folder only. A principal's DELETE is remembered a while, so its write
+// folder only, while it still has the name and parent the path named
+// (unlink). A principal's DELETE is remembered a while, so its write
 // of the path restores the file (§H.6).
 func (st *reqState) deleteFile(ctx context.Context, t target, ifMatch, successor string) error {
-	cg, f, err := st.tree(ctx, t.ns)
+	cg, f, err := st.writeTree(ctx, t.ns)
 	if err != nil {
 		return err
 	}
@@ -1033,7 +1060,7 @@ func (st *reqState) deleteFile(ctx context.Context, t target, ifMatch, successor
 		return fail(http.StatusPreconditionFailed, "%s changed since %s (If-Match); reload it", t.path, ifMatch)
 	}
 	if n := cg.g.Node(t.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
-		return st.editParents(ctx, t.ns, t.node, t.parent, "", "")
+		return st.unlink(ctx, t)
 	}
 	ptomb, err := st.deleteDoc(ctx, t.ns, t.node, cg.heads[t.node])
 	if err != nil {
@@ -1128,12 +1155,15 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 // orphans. Placements whose items are gone (dangling, §B.3) aren't
 // contents, and are deleted first; those whose items the request's grant
 // can't read are neither named nor deleted. The folder node is deleted as
-// read (If-Match), not if it was renamed or moved meanwhile; a child
-// placed while it is deleted is orphaned (§H.5), as one placed by another
-// program always may be. A node with several parents (a DAG) is unlinked
-// from this folder only. The scope's scratch files in it go with it.
+// read (If-Match), and only while still named and placed as the path
+// named it, which was checked against the token's kept graph (agrees),
+// maybe older than this read: renamed or moved meanwhile, it is a 404 or
+// a 409; a child placed while it is deleted is orphaned (§H.5), as one
+// placed by another program always may be. A node with several parents
+// (a DAG) is unlinked from this folder only (unlink). The scope's scratch
+// files in it go with it.
 func (st *reqState) deleteFolder(ctx context.Context, t target) error {
-	cg, _, err := st.tree(ctx, t.ns)
+	cg, _, err := st.writeTree(ctx, t.ns)
 	if err != nil {
 		return err
 	}
@@ -1143,11 +1173,11 @@ func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 		}
 	}
 	n := cg.g.Node(t.node)
-	if !listed(n) || !slices.Contains(cg.g.WalkableParents(n), t.parent) {
-		return fail(http.StatusNotFound, "folder %s was moved or deleted by someone else just now; reload its folder", t.path)
+	if !listed(n) || !slices.Contains(cg.g.WalkableParents(n), t.parent) || st.s.nameKey(nodeName(n)) != st.s.nameKey(t.listedAs) {
+		return fail(http.StatusNotFound, "folder %s was renamed, moved or deleted by someone else just now; reload its folder", t.path)
 	}
 	if len(cg.g.WalkableParents(n)) > 1 {
-		return st.editParents(ctx, t.ns, t.node, t.parent, "", "")
+		return st.unlink(ctx, t)
 	}
 	d, err := st.nodeDir(ctx, t.ns, t.node)
 	if err != nil {
@@ -1248,7 +1278,7 @@ func (st *reqState) dangling(ctx context.Context, cg *catGraph, n *tree.Node) bo
 // second parent. The scope's scratch files in a moved folder move with
 // it.
 func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
-	cg, _, err := st.tree(ctx, src.ns)
+	cg, _, err := st.writeTree(ctx, src.ns)
 	if err != nil {
 		return err
 	}
@@ -1463,30 +1493,36 @@ func (st *reqState) deleteSource(ctx context.Context, src, dst target, rev, succ
 	return err
 }
 
-// editParents replaces node's parents entry for folder from with one for
-// to, ordered order: "" for to removes the entry, as does a to the node
-// is already in.
-func (st *reqState) editParents(ctx context.Context, cat, node, from, to, order string) error {
-	in := st.s.nsInfo(ctx, st.tk, cat)
+// unlink removes node t.node's parents entry for folder t.parent: a node
+// with several parents (a DAG), deleted from one folder (§H.5). Only
+// while its document as the core has it still names it as t's path did
+// (stillNamed), which was checked against the token's kept graph, maybe
+// older (another program's rename within CatalogTTL): one renamed or
+// moved since by anyone is a 404, as for moveNode, not unlinked over that.
+func (st *reqState) unlink(ctx context.Context, t target) error {
+	in := st.s.nsInfo(ctx, st.tk, t.ns)
 	defer st.changed()
 	return st.retrying(ctx, func() (bool, error) {
-		h, err := st.tk.c.Head(ctx, cat, node)
+		h, err := st.tk.c.Head(ctx, t.ns, t.node)
 		if err != nil {
 			return false, err
 		}
 		if h.State != client.Live {
 			return false, errNotExist
 		}
-		e, err := st.s.doc(ctx, st.tk, cat, node, h.ID)
+		e, err := st.s.doc(ctx, st.tk, t.ns, t.node, h.ID)
 		if err != nil {
 			return false, err
 		}
+		if !st.stillNamed(t, e.value) {
+			return false, fail(http.StatusNotFound, "%s was renamed or moved by someone else just now; reload its folder", t.path)
+		}
 		m, _ := e.value.(map[string]any)
-		ps := parentsEdit(cat, m["parents"], from, to, order)
+		ps := parentsEdit(t.ns, m["parents"], t.parent, "", "")
 		if len(ps) == 0 {
 			return false, nil
 		}
-		_, err = st.tk.c.Append(ctx, cat, node, h.ID, withNonce(in, e.value, ps))
+		_, err = st.tk.c.Append(ctx, t.ns, t.node, h.ID, withNonce(in, e.value, ps))
 		if client.IsStale(err) {
 			return true, nil
 		}

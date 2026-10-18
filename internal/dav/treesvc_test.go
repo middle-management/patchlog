@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -896,7 +897,7 @@ func TestTreeServiceOwnWritesUntilReached(t *testing.T) {
 	tr.paused.Store(true)
 	ts.expect(ts.do("PUT", "/cat/Season/new.txt", "hello"), 201, "PUT new.txt")
 	ts.expect(ts.do("MOVE", "/cat/Season/a.txt", "", "Destination", "/cat/Season/b.txt"), 201, "MOVE a.txt to b.txt")
-	for _, d := range []time.Duration{0, 31 * time.Second, 10 * time.Minute} {
+	for _, d := range []time.Duration{0, 31 * time.Second, 9 * time.Minute} {
 		clk.add(d)
 		sameStrings(t, fmt.Sprintf("Season %v later, the tree service behind", d), names(ts.propfind("/cat/Season/"), "/cat/Season/"),
 			[]string{"b.txt", "derby.json", "new.txt"})
@@ -1008,5 +1009,242 @@ func TestTreeServiceRenamedElsewhere(t *testing.T) {
 		if doc := e.nodeDoc("cat", c.node); doc["title"] != title {
 			t.Fatalf("%s's title %v", c.node, doc["title"])
 		}
+	}
+}
+
+// A user's writes to a namespace the tree service can't follow (its grant
+// doesn't name ghost: 403) make a ?min= it refuses (400, §A.5), with the
+// user's others in one query: found per namespace (one entry asked for
+// each alone), the refused one is dropped, one the tree service is still
+// behind on kept and waited for until reached, then dropped too; later
+// listings send none, and a grant of the user's limited to some
+// resources, which can't read the node documents, lists and reads again.
+func TestTreeServiceMinRefusedPerNamespace(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+	k := clienttest.NewKey("k")
+	all := []string{"cat", "matches", "ghost"}
+	for ns, doc := range map[string]map[string]any{
+		"matches": {"read": "grant", "keys": []any{k.Entry("*")}},
+		"ghost":   {"read": "grant", "keys": []any{k.Entry("*")}},
+		"cat":     {"read": "grant", "keys": []any{k.Entry("*")}, "catalog": treeCatalog("matches", "ghost")},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "append", "delete"})))
+	for _, d := range []struct {
+		ns, name string
+		doc      map[string]any
+	}{
+		{"matches", "derby", map[string]any{"title": "Derby"}},
+		{"ghost", "g", map[string]any{"text": "g"}},
+		{"cat", "root", map[string]any{"title": "Root", "parents": []any{}}},
+		{"cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")}},
+		{"cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")}},
+		{"cat", "ghost.g", map[string]any{"title": "g.json", "parents": parents("cat", "season")}},
+	} {
+		must(w.CreateDoc(ctx, d.ns, d.name, d.doc))
+	}
+	tr := startTree(t, s, "cat", client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat", "matches"}, []string{"read"})))
+	tr.caughtUp("cat", "matches")
+	var mu sync.Mutex
+	var sent []string // every ?min= value sent
+	front := newTestServer(t, http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sent = append(sent, r.URL.Query()["min"]...)
+		mu.Unlock()
+		httputil.NewSingleHostReverseProxy(must(url.Parse(tr.http.URL))).ServeHTTP(rw, r)
+	}))
+	sentSince := func(n int) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]string(nil), sent[n:]...)
+	}
+	count := func() int { mu.Lock(); defer mu.Unlock(); return len(sent) }
+	clk := &testClock{t: time.Now()}
+	g := &env{t: t, ctx: ctx, s: s, c: w, dav: newTestServer(t, must(dav.New(dav.Options{Client: s.Client(t), Catalogs: []string{"cat"},
+		Gateway: true, TreeService: front.URL, Logf: t.Logf, TreeWait: 300 * time.Millisecond, Now: clk.now})))}
+	ann := k.Grant(t, s.Now(), "user:ann", all, []string{"read", "create", "append", "delete"})
+	limited := k.Grant(t, s.Now(), "user:ann", all, []string{"read"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby"}}}}})
+	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	sameStrings(t, "the limited grant's Season", names(g.propfindAs(limited, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	// The tree service refuses mins naming ghost, which it can't follow.
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(10 * time.Millisecond) {
+		req := must(http.NewRequest("GET", tr.http.URL+"/cat/children?of=season&min=ghost:"+tr.s.Checkpoint("matches"), nil))
+		req.Header.Set("Authorization", "Bearer "+ann)
+		res := must(http.DefaultClient.Do(req))
+		res.Body.Close()
+		if res.StatusCode == http.StatusBadRequest {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("a min naming ghost: %d", res.StatusCode)
+		}
+	}
+
+	tr.paused.Store(true)
+	g.expect(g.doAs(ann, "PUT", "/cat/Season/derby.json", `{"title": "Derby!"}`), 201, "ann's PUT of derby.json")
+	g.expect(g.doAs(ann, "PUT", "/cat/Season/g.json", `{"text": "edited"}`), 201, "ann's PUT of g.json, an item of ghost")
+	if h, doc := g.load("ghost", "g"); h.State != client.Live || doc.(map[string]any)["text"] != "edited" {
+		t.Fatalf("ghost/g: %v %v", h.State, doc)
+	}
+	clk.add(6 * time.Second) // past slowFor, which the PUT's listing set
+	n := count()
+	g.propfindAs(ann, "/cat/Season/")
+	if got := sentSince(n); !slices.ContainsFunc(got, func(m string) bool { return strings.HasPrefix(m, "ghost:") }) {
+		t.Fatalf("the first listing after the writes sent %q", got)
+	}
+	// ghost's is dropped; matches', which the tree service hasn't
+	// reached, is waited for still.
+	clk.add(6 * time.Second)
+	n = count()
+	g.propfindAs(ann, "/cat/Season/")
+	got := sentSince(n)
+	if slices.ContainsFunc(got, func(m string) bool { return strings.HasPrefix(m, "ghost:") }) || !slices.ContainsFunc(got, func(m string) bool { return strings.HasPrefix(m, "matches:") }) {
+		t.Fatalf("the next listing sent %q, want matches' min only", got)
+	}
+	tr.paused.Store(false)
+	tr.caughtUp("cat", "matches")
+	clk.add(6 * time.Second)
+	g.propfindAs(ann, "/cat/Season/") // reaches matches'
+	n = count()
+	sameStrings(t, "ann's Season once caught up", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	if got := sentSince(n); len(got) > 0 {
+		t.Fatalf("a listing after every write was reached or refused sent %q", got)
+	}
+	g.expect(g.doAs(limited, "PROPFIND", "/cat/Season/", "", "Depth", "1"), 207, "the limited grant's PROPFIND")
+	if r := g.expect(g.doAs(limited, "GET", "/cat/Season/derby.json", ""), 200, "the limited grant's GET"); !strings.Contains(r.body, "Derby!") {
+		t.Fatalf("derby.json %q", r.body)
+	}
+}
+
+// A user's writes the tree service never reaches (here a front answering
+// every ?min= 503 behind, as for a follower that's stuck) are waited for
+// at most maxWroteAge (10 minutes), then not asked for again; a grant of
+// the user's that can't read the node documents (§H.7 "Limited grants")
+// is a 503 meanwhile for limitedWait (30 s) after the write, then shown
+// the tree service's listing without waiting.
+func TestTreeServiceMinsBounded(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	var withMin atomic.Int64
+	front := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Has("min") {
+			withMin.Add(1)
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			io.WriteString(w, `{"code":"behind","message":"the tree service has not reached min yet"}`)
+			return
+		}
+		httputil.NewSingleHostReverseProxy(must(url.Parse(a.tr.http.URL))).ServeHTTP(w, r)
+	}))
+	clk := &testClock{t: time.Now()}
+	g := a.gateway(t, front.URL, func(o *dav.Options) { o.TreeWait, o.Now = 300*time.Millisecond, clk.now })
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"})
+	narrow := a.limitedTo(t, "user:ann", "root", "season", "matches.derby", "derby")
+	g.propfindAs(ann, "/cat/")
+	sameStrings(t, "ann's Season through her limited token", names(g.propfindAs(narrow, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	g.expect(g.doAs(ann, "PUT", "/cat/Season/derby.json", `{"title": "Derby!"}`), 201, "ann's PUT of derby.json")
+	clk.add(10 * time.Second)
+	g.expect(g.doAs(narrow, "PROPFIND", "/cat/Season/", "", "Depth", "1"), 503, "the limited token's PROPFIND 10 s after ann's write")
+	clk.add(time.Minute)
+	g.expect(g.doAs(narrow, "PROPFIND", "/cat/Season/", "", "Depth", "1"), 207, "the limited token's PROPFIND a minute after ann's write")
+	g.expect(g.doAs(narrow, "GET", "/cat/Season/derby.json", ""), 200, "the limited token's GET")
+	n := withMin.Load()
+	clk.add(time.Minute)
+	sameStrings(t, "ann's Season, from the node documents", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+	if withMin.Load() == n {
+		t.Fatal("ann's listing 2 minutes after her write didn't wait for it")
+	}
+	clk.add(10 * time.Minute)
+	n = withMin.Load()
+	sameStrings(t, "ann's Season 12 minutes after her write", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+	if withMin.Load() != n {
+		t.Fatal("ann's listing 12 minutes after her write waited for it")
+	}
+}
+
+// Renamed elsewhere (another program, within CatalogTTL of the token's
+// kept graph): a DELETE of the old name of an empty folder, or of a file
+// placed in two folders (a DAG, unlinked from one), is a 404, not a
+// delete of the folder renamed or an unlink of the file renamed (§H.5).
+func TestTreeServiceRenamedElsewhereDeletes(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	e := &env{t: t, ctx: a.ctx, c: a.w}
+	must(a.w.CreateDoc(a.ctx, "cat", "box", map[string]any{"title": "Box", "parents": parents("cat", "root")}))
+	h, _ := e.load("cat", "matches.derby")
+	must(a.w.Append(a.ctx, "cat", "matches.derby", h.ID, []any{map[string]any{"op": "add", "path": "/parents/-", "value": map[string]any{"href": "/r/cat/hidden"}}}))
+	a.tr.caughtUp("cat", "matches")
+	for _, mode := range []string{"tree service", "node documents"} {
+		u := a.tr.http.URL
+		if mode == "node documents" {
+			u = ""
+		}
+		g := a.gateway(t, u, func(o *dav.Options) { o.TreeWait, o.CatalogTTL = 300*time.Millisecond, time.Minute })
+		bob := a.k.Grant(t, a.s.Now(), "user:bob", a.both, []string{"read", "create", "append", "delete"})
+		sameStrings(t, mode+": bob's top level", names(g.propfindAs(bob, "/cat/"), "/cat/"), []string{"Box/", "Hidden/", "Season/"})
+		sameStrings(t, mode+": bob's Season", names(g.propfindAs(bob, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+		a.tr.paused.Store(true)
+		g.expect(g.doAs(bob, "DELETE", "/cat/Season/none.json", ""), 404, mode+": bob's DELETE of no file, which reads the catalog")
+		hb, _ := e.load("cat", "box")
+		must(a.w.Append(a.ctx, "cat", "box", hb.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "Archive"}}))
+		hd, _ := e.load("cat", "matches.derby")
+		must(a.w.Append(a.ctx, "cat", "matches.derby", hd.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "derby-final.json"}}))
+
+		g.expect(g.doAs(bob, "DELETE", "/cat/Box/", ""), 404, mode+": bob's DELETE of Box, renamed Archive elsewhere")
+		if hb, _ := e.load("cat", "box"); hb.State != client.Live {
+			t.Fatalf("%s: the folder renamed Archive is %v", mode, hb.State)
+		}
+		g.expect(g.doAs(bob, "DELETE", "/cat/Season/derby.json", ""), 404, mode+": bob's DELETE of derby.json, renamed elsewhere")
+		if ps := e.parentsOf("matches.derby"); len(ps) != 2 {
+			t.Fatalf("%s: derby-final.json's parents %v", mode, ps)
+		}
+		// Back as they were for the next mode.
+		hb, _ = e.load("cat", "box")
+		must(a.w.Append(a.ctx, "cat", "box", hb.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "Box"}}))
+		hd, _ = e.load("cat", "matches.derby")
+		must(a.w.Append(a.ctx, "cat", "matches.derby", hd.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "derby.json"}}))
+		a.tr.paused.Store(false)
+		a.tr.caughtUp("cat", "matches")
+	}
+}
+
+// A grant limited to some resources (§H.7), which doesn't read the
+// catalog's node documents (the core answers it 404 for them), keeps the
+// listing to resolve a write's path by: it edits a file it lists and
+// reads, through the tree's trust as last read with any grant; a write
+// that changes the tree's nodes (a new file or folder, a move, a delete)
+// is a 403 saying why, not the core's bare 404.
+func TestTreeServiceLimitedGrantWrites(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	g := a.gateway(t, a.tr.http.URL)
+	g.propfindAs(a.k.Grant(t, a.s.Now(), "user:admin", a.both, []string{"read"}), "/cat/")
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby"}}}}})
+	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	g.expect(g.doAs(ann, "GET", "/cat/Season/derby.json", ""), 200, "ann's GET of derby.json")
+	if r := g.doAs(ann, "PUT", "/cat/Season/derby.json", `{"title": "Derby!"}`); r.status != 201 && r.status != 204 {
+		t.Fatalf("ann's PUT of derby.json: %d %q", r.status, r.body)
+	}
+	if _, doc := g.load("matches", "derby"); doc.(map[string]any)["title"] != "Derby!" {
+		t.Fatalf("matches/derby %v", doc)
+	}
+	for _, c := range []struct{ method, path, body string }{
+		{"PUT", "/cat/Season/new.json", `{"x": 1}`},
+		{"MKCOL", "/cat/Season/F", ""},
+		{"MOVE", "/cat/Season/derby.json", ""},
+		{"DELETE", "/cat/Season/derby.json", ""},
+	} {
+		if r := g.expect(g.doAs(ann, c.method, c.path, c.body, "Destination", "/cat/Season/d2.json"), 403, "ann's "+c.method+" "+c.path); !strings.Contains(r.body, "node documents") {
+			t.Fatalf("%s: 403 %q", c.method, r.body)
+		}
+	}
+	if h, _ := g.load("matches", "derby"); h.State != client.Live {
+		t.Fatalf("derby is %v", h.State)
 	}
 }

@@ -48,12 +48,16 @@ import (
 // their writes produced in the catalog and the namespaces it trusts, the
 // writes' X-Namespace-Revision (watchWrites), with ?min= (§B.5 "Fresh
 // listings after a write"), which the tree service waits for, until a
-// listing that asked for them came back: however long the tree service
-// lags, a user's own new file stays listed and a file they renamed
-// doesn't come back by its old name. Past TreeWait the folder is listed
-// from the node documents instead, as without a tree service, for slowFor
-// (a 503 if the token's grant can't read them either); entries the tree
-// service refuses to wait for (400) aren't asked for again. Other users'
+// listing that asked for them came back, for at most maxWroteAge:
+// however long the tree service lags within that, a user's own new file
+// stays listed and a file they renamed doesn't come back by its old name.
+// Past TreeWait the folder is listed from the node documents instead, as
+// without a tree service, for slowFor; a token whose grant can't read
+// them either gets a 503 for limitedWait after the user's write, then the
+// tree service's listing without waiting. Entries the tree service
+// refuses to wait for (400: a namespace it doesn't follow, or the reader
+// can't see) aren't asked for again, found per namespace (splitRefused),
+// so one such entry doesn't drop the user's others. Other users'
 // listings don't wait, and writes check what such a listing named
 // against the node documents (resolveCatalog). A listing is kept per
 // token for CatalogTTL, as a catalog's graph is: what one grant was shown
@@ -69,8 +73,16 @@ const (
 	// user's writes in time is listed from its node documents.
 	slowFor = 5 * time.Second
 	// maxWroteNS bounds the namespaces a user's writes are kept for, and
-	// maxWroteIDs the entries of one.
+	// maxWroteIDs the entries of one; maxWroteAge how long an entry the
+	// tree service hasn't reached is waited for: one it never reaches (its
+	// follower stuck) doesn't stall the user's listings for good.
 	maxWroteNS, maxWroteIDs = 64, 4
+	maxWroteAge             = 10 * time.Minute
+	// limitedWait is how long after the user's write a token whose grant
+	// can't read the catalog's node documents (§H.7 "Limited grants") is
+	// answered 503 while the tree service hasn't reached it, before it is
+	// shown the tree service's listing without waiting.
+	limitedWait = 30 * time.Second
 )
 
 // errBehind: the tree service hasn't reached a user's writes in time;
@@ -248,20 +260,31 @@ func (ts *treeSvc) noteWrite(ns, id string, now time.Time) {
 }
 
 // mins are the ?min= values of the entries the user's writes to the
-// namespaces nss produced, not yet reached (§B.5).
-func (ts *treeSvc) mins(nss []string) []string {
+// namespaces nss produced, not yet reached (§B.5), within maxWroteAge of
+// now (older ones are dropped), and when the oldest of them was written.
+func (ts *treeSvc) mins(nss []string, now time.Time) ([]string, time.Time) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	var out []string
+	var oldest time.Time
 	for ns, ws := range ts.wrote {
+		ws = slices.DeleteFunc(ws, func(w wroteID) bool { return now.Sub(w.at) > maxWroteAge })
+		if len(ws) == 0 {
+			delete(ts.wrote, ns)
+			continue
+		}
+		ts.wrote[ns] = ws
 		if slices.Contains(nss, ns) {
 			for _, w := range ws {
 				out = append(out, ns+":"+w.id)
+				if oldest.IsZero() || w.at.Before(oldest) {
+					oldest = w.at
+				}
 			}
 		}
 	}
 	slices.Sort(out)
-	return out
+	return out, oldest
 }
 
 // reached drops mins, the ?min= values of entries a listing of the tree
@@ -362,20 +385,21 @@ func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catCon
 		// it counts, changed).
 		return d, nil
 	}
-	mins := st.p.ts.mins(append([]string{cat}, c.trust...))
+	mins, oldest := st.p.ts.mins(append([]string{cat}, c.trust...), now)
 	if len(mins) > 0 && st.p.ts.isSlow(cat, now) {
-		return st.behindDir(ctx, cat, folder)
+		return st.behindDir(ctx, cat, folder, oldest)
 	}
 	ents, err := st.svcList(ctx, cat, folder, mins)
 	switch {
 	case errors.Is(err, errBehind):
 		st.s.opt.Logf("dav: %s: the tree service hasn't reached %s within %v; folder %s is listed from the catalog's node documents", cat, strings.Join(mins, " "), st.s.opt.TreeWait, folder)
 		st.p.ts.setSlow(cat, now.Add(slowFor))
-		return st.behindDir(ctx, cat, folder)
+		return st.behindDir(ctx, cat, folder, oldest)
 	case errors.Is(err, errMinsRefused):
-		st.s.opt.Logf("dav: %s: the tree service refuses to wait for %s; folder %s is listed from the catalog's node documents", cat, strings.Join(mins, " "), folder)
-		st.p.ts.reached(mins)
-		return st.behindDir(ctx, cat, folder)
+		drop := st.splitRefused(ctx, cat, folder, mins)
+		st.s.opt.Logf("dav: %s: the tree service refuses to wait for %s (of %s); folder %s is listed from the catalog's node documents", cat, strings.Join(drop, " "), strings.Join(mins, " "), folder)
+		st.p.ts.reached(drop)
+		return st.behindDir(ctx, cat, folder, oldest)
 	case err == nil:
 		st.p.ts.reached(mins)
 	}
@@ -385,6 +409,17 @@ func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catCon
 		}
 		return nil, err
 	}
+	d, err := st.svcDir(ctx, cat, ents)
+	if err != nil {
+		return nil, err
+	}
+	st.s.keepView(st.tk, k, tokenView{sd: svcDir{d: d, at: now, gen: gen}}, 256*(len(d.entries)+1))
+	return d, nil
+}
+
+// svcDir is a folder of catalog cat as the tree service listed its
+// children ents.
+func (st *reqState) svcDir(ctx context.Context, cat string, ents []svcItem) (*treeDir, error) {
 	var kids []treeEntry
 	for _, e := range ents {
 		te, ok, err := st.svcEntry(ctx, cat, e)
@@ -395,23 +430,84 @@ func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catCon
 			kids = append(kids, te)
 		}
 	}
-	d := st.s.nameDir(kids, func(node string) time.Time { return st.nodeBorn(ctx, cat, node) })
-	st.s.keepView(st.tk, k, tokenView{sd: svcDir{d: d, at: now, gen: gen}}, 256*(len(d.entries)+1))
-	return d, nil
+	return st.s.nameDir(kids, func(node string) time.Time { return st.nodeBorn(ctx, cat, node) }), nil
 }
 
 // behindDir lists folder of catalog cat from its node documents, while
-// the tree service is behind the user's writes; a grant that can't read
-// them (§H.7) waits for the tree service (503).
-func (st *reqState) behindDir(ctx context.Context, cat, folder string) (*treeDir, error) {
+// the tree service is behind the user's writes, the oldest made at
+// oldest; a grant that can't read them (§H.7) waits for the tree service
+// (503) for limitedWait after it, then is shown its listing without
+// waiting, which may lack the user's latest writes.
+func (st *reqState) behindDir(ctx context.Context, cat, folder string, oldest time.Time) (*treeDir, error) {
 	d, err := st.nodeDir(ctx, cat, folder)
 	var de *davError
 	if err != nil && errors.As(upstream(err), &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden || de.status == http.StatusNotFound) {
+		if !oldest.IsZero() && st.s.opt.Now().Sub(oldest) >= limitedWait {
+			ents, err := st.svcList(ctx, cat, folder, nil)
+			if err != nil {
+				return nil, err
+			}
+			return st.svcDir(ctx, cat, ents)
+		}
 		e := fail(http.StatusServiceUnavailable, "catalog %s's tree service hasn't caught up with your latest writes yet, and your grant doesn't read the catalog's nodes otherwise (%s); try again in a moment", cat, de.msg)
 		e.header = http.Header{"Retry-After": {"1"}}
 		return nil, e
 	}
 	return d, err
+}
+
+// splitRefused returns the mins to drop of mins, a set the tree service
+// refused (400): one namespace's are refused; of several, each
+// namespace's are asked for alone (a listing of one entry, within
+// TreeWait, all at once), and those it refuses (a namespace it doesn't
+// follow, or the reader can't see, §A.5) or has reached are dropped, those
+// it is still behind on kept.
+func (st *reqState) splitRefused(ctx context.Context, cat, folder string, mins []string) []string {
+	by := map[string][]string{}
+	for _, m := range mins {
+		ns, _, _ := strings.Cut(m, ":")
+		by[ns] = append(by[ns], m)
+	}
+	if len(by) < 2 {
+		return mins
+	}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	var drop []string
+	for _, ms := range by {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := st.svcProbe(ctx, cat, folder, ms); err == nil || errors.Is(err, errMinsRefused) {
+				mu.Lock()
+				drop = append(drop, ms...)
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	slices.Sort(drop)
+	return drop
+}
+
+// svcProbe asks catalog cat's tree service for one entry of folder's
+// children with mins, within TreeWait: nil once it has reached them,
+// errMinsRefused or errBehind where svcGet says so, another error else.
+func (st *reqState) svcProbe(ctx context.Context, cat, folder string, mins []string) error {
+	ctx, cancel := context.WithTimeout(ctx, st.s.opt.TreeWait)
+	defer cancel()
+	u, err := url.Parse(st.s.treeURL(cat) + "/" + cat + "/children?" + url.Values{"of": {folder}, "limit": {"1"}, "min": mins}.Encode())
+	if err != nil {
+		return err
+	}
+	for hops := 0; hops <= 4; hops++ {
+		_, loc, err := st.svcGet(ctx, cat, u, true)
+		if err != nil || loc == nil {
+			return err
+		}
+		u = loc
+	}
+	return errBehind
 }
 
 // svcItem is an entry of a children listing (§B.5, §H.3).
