@@ -498,24 +498,29 @@ func TestTreeServiceOwnWrites(t *testing.T) {
 	sameStrings(t, "Season once caught up", names(ts.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json", "late.txt"})
 }
 
-// §H.7: a grant limited to some resources reads neither the catalog's
-// namespace document nor its /heads (they take unrestricted read, §2.1,
-// §7.4), so without a tree service it can't list a tree; through one it
-// lists what the tree service shows it (§B.11.5): the folders and the
-// files it may read, and opens those.
-func TestTreeServiceLimitedGrant(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
-	k := clienttest.NewKey("k")
+// authTree is an authenticating core whose catalog cat, a file tree of
+// matches, has folders Season (derby.json, cup.json) and Hidden, and a tree
+// service following it with a grant of its own; grants of key k name both
+// namespaces.
+type authTree struct {
+	ctx  context.Context
+	s    *clienttest.Server
+	k    clienttest.Key
+	both []string
+	w    *client.Client // a writer's, straight to the core
+	tr   *treeRun
+}
+
+func newAuthTree(t *testing.T) *authTree {
+	t.Helper()
+	a := &authTree{ctx: context.Background(), s: clienttest.New(t, clienttest.Options{Auth: true, RealClock: true}), k: clienttest.NewKey("k"), both: []string{"cat", "matches"}}
 	for ns, doc := range map[string]map[string]any{
-		"matches": {"read": "grant", "keys": []any{k.Entry("*")}},
-		"cat":     {"read": "grant", "keys": []any{k.Entry("*")}, "catalog": treeCatalog("matches")},
+		"matches": {"read": "grant", "keys": []any{a.k.Entry("*")}},
+		"cat":     {"read": "grant", "keys": []any{a.k.Entry("*")}, "catalog": treeCatalog("matches")},
 	} {
-		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+		must(a.s.Client(t, client.WithBearer(a.s.OperatorGrant(t, ns))).CreateNamespace(a.ctx, ns, doc))
 	}
-	both := []string{"cat", "matches"}
-	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", both, []string{"read", "create", "append", "delete"})))
+	a.w = a.s.Client(t, client.WithBearer(a.k.Grant(t, a.s.Now(), "user:w", a.both, []string{"read", "create", "append", "delete"})))
 	for _, d := range []struct {
 		ns, name string
 		doc      map[string]any
@@ -528,18 +533,41 @@ func TestTreeServiceLimitedGrant(t *testing.T) {
 		{"cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")}},
 		{"cat", "matches.cup", map[string]any{"title": "cup.json", "parents": parents("cat", "season")}},
 	} {
-		must(w.CreateDoc(ctx, d.ns, d.name, d.doc))
+		must(a.w.CreateDoc(a.ctx, d.ns, d.name, d.doc))
 	}
-	tr := startTree(t, s, "cat", client.WithBearer(k.Grant(t, s.Now(), "svc:tree", both, []string{"read"})))
-	tr.caughtUp("cat", "matches")
-	gw := func(treeURL string) *env {
-		srv := must(dav.New(dav.Options{Client: s.Client(t), Catalogs: []string{"cat"}, Gateway: true, TreeService: treeURL, Logf: t.Logf}))
-		return &env{t: t, ctx: ctx, s: s, c: w, dav: newTestServer(t, srv)}
+	a.tr = startTree(t, a.s, "cat", client.WithBearer(a.k.Grant(t, a.s.Now(), "svc:tree", a.both, []string{"read"})))
+	a.tr.caughtUp("cat", "matches")
+	return a
+}
+
+// gateway is a gateway serving cat, listing it through treeURL ("" for
+// none), as f changes its options.
+func (a *authTree) gateway(t *testing.T, treeURL string, f ...func(*dav.Options)) *env {
+	t.Helper()
+	opt := dav.Options{Client: a.s.Client(t), Catalogs: []string{"cat"}, Gateway: true, TreeService: treeURL, Logf: t.Logf}
+	for _, g := range f {
+		g(&opt)
 	}
-	g := gw(tr.http.URL)
-	admin := k.Grant(t, s.Now(), "user:admin", both, []string{"read"})
-	limited := k.Grant(t, s.Now(), "user:li", both, []string{"read"}, map[string]any{"rules": []any{
-		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby"}}}}})
+	return &env{t: t, ctx: a.ctx, s: a.s, c: a.w, dav: newTestServer(t, must(dav.New(opt)))}
+}
+
+// limitedTo is a grant of sub limited to the resources named (§C.5).
+func (a *authTree) limitedTo(t *testing.T, sub string, resources ...any) string {
+	return a.k.Grant(t, a.s.Now(), sub, a.both, []string{"read"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": resources}}}})
+}
+
+// §H.7: a grant limited to some resources reads neither the catalog's
+// // namespace document nor its /heads (they take unrestricted read, §2.1,
+// §7.4), so without a tree service it can't list a tree; through one it
+// lists what the tree service shows it (§B.11.5): the folders and the
+// files it may read, and opens those.
+func TestTreeServiceLimitedGrant(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	g := a.gateway(t, a.tr.http.URL)
+	admin := a.k.Grant(t, a.s.Now(), "user:admin", a.both, []string{"read"})
+	limited := a.limitedTo(t, "user:li", "root", "season", "matches.derby", "derby")
 
 	sameStrings(t, "the admin's top level", names(g.propfindAs(admin, "/cat/"), "/cat/"), []string{"Hidden/", "Season/"})
 	sameStrings(t, "the limited grant's top level", names(g.propfindAs(limited, "/cat/"), "/cat/"), []string{"Season/"})
@@ -552,11 +580,44 @@ func TestTreeServiceLimitedGrant(t *testing.T) {
 
 	// Without a tree service, the node documents: the limited grant can't
 	// list the tree.
-	plain := gw("")
+	plain := a.gateway(t, "")
 	plain.propfindAs(admin, "/cat/")
 	if r := plain.doAs(limited, "PROPFIND", "/cat/", "", "Depth", "1"); r.status < 400 {
 		t.Fatalf("the limited grant listed the tree from the node documents: %d %s", r.status, r.body)
 	}
+}
+
+// §H.7 through a tree service: what the tree service listed to one token
+// is kept for that token only, so another token of the same user, which
+// may read less, is never shown it; the writes a user made through one
+// token are waited for (?min=) by their listings through another, while
+// another user's listings don't wait.
+func TestTreeServiceUserTokens(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.CatalogTTL, o.TreeWait = time.Minute, 500*time.Millisecond })
+	now := a.s.Now()
+	ann := a.k.Grant(t, now, "user:ann", a.both, []string{"read", "create", "append", "delete"})
+	again := a.k.Grant(t, now.Add(time.Second), "user:ann", a.both, []string{"read"})
+	narrow := a.limitedTo(t, "user:ann", "root", "season", "matches.derby", "derby")
+	bob := a.k.Grant(t, now, "user:bob", a.both, []string{"read"})
+
+	sameStrings(t, "ann's top level", names(g.propfindAs(ann, "/cat/"), "/cat/"), []string{"Hidden/", "Season/"})
+	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+	sameStrings(t, "ann's top level through her limited token", names(g.propfindAs(narrow, "/cat/"), "/cat/"), []string{"Season/"})
+	sameStrings(t, "ann's Season through her limited token", names(g.propfindAs(narrow, "/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+	g.expect(g.doAs(narrow, "PROPFIND", "/cat/Hidden/", "", "Depth", "1"), 404, "Hidden through ann's limited token")
+
+	// The tree service stops following. Ann's write through one token is
+	// waited for by her listing through another, up to TreeWait, which
+	// then reads the node documents; bob's listing doesn't wait.
+	a.tr.paused.Store(true)
+	g.expect(g.doAs(ann, "PUT", "/cat/Season/new.txt", "hello"), 201, "ann's PUT")
+	sameStrings(t, "Season through ann's other token", names(g.propfindAs(again, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json", "new.txt"})
+	sameStrings(t, "bob's Season", names(g.propfindAs(bob, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+	a.tr.paused.Store(false)
+	a.tr.caughtUp("cat", "matches")
+	sameStrings(t, "Season through ann's first token, caught up", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json", "new.txt"})
 }
 
 // The tree service down, or failing, is a 502 or a 503 with Retry-After,
