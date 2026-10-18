@@ -605,7 +605,15 @@ func (st *reqState) svcGet(ctx context.Context, cat string, u *url.URL, withMins
 		return nil, nil, fail(http.StatusNotFound, "catalog %s's tree service: %s", cat, msg)
 	case res.StatusCode == http.StatusGone:
 		return nil, nil, fail(http.StatusGone, "catalog %s's tree service: %s: the catalog was purged (§8.5)", cat, msg)
+	case res.StatusCode == http.StatusUnauthorized && !st.s.opt.Gateway:
+		// Local mode's grant is the server's own (-bearer): a 502, named
+		// as the tree service's refusal, where record would name a 401
+		// the core's.
+		return nil, nil, fail(http.StatusBadGateway, "catalog %s's tree service refused this server's grant (-bearer): %s", cat, msg)
 	case res.StatusCode == http.StatusUnauthorized, res.StatusCode == http.StatusForbidden:
+		// A gateway's 401 is the user's grant refused: the challenge
+		// again, and the token verified again at its next request
+		// (record).
 		return nil, nil, fail(res.StatusCode, "catalog %s's tree service refused the listing: %s", cat, msg)
 	case res.StatusCode == http.StatusServiceUnavailable, res.StatusCode == http.StatusTooManyRequests:
 		e := fail(http.StatusServiceUnavailable, "catalog %s's tree service answered %d: %s", cat, res.StatusCode, msg)

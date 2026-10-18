@@ -659,6 +659,40 @@ func TestTreeServiceDown(t *testing.T) {
 	down.expect(down.do("GET", "/cat/Season/derby.json", ""), 502, "GET with the tree service down")
 }
 
+// A tree service's 401 refuses the server's own grant in local mode
+// (-bearer): a 502 naming the tree service, not the core; in a gateway it
+// refuses the user's grant, a 401 with the challenge, as the core's is.
+func TestTreeServiceRefusedGrant(t *testing.T) {
+	t.Parallel()
+	refusing := func(target string) string {
+		front := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasSuffix(r.URL.Path, "/children") {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				io.WriteString(w, `{"code":"unauthorized","message":"no key verifies the grant"}`)
+				return
+			}
+			httputil.NewSingleHostReverseProxy(must(url.Parse(target))).ServeHTTP(w, r)
+		}))
+		return front.URL
+	}
+	e := treeEnv(t)
+	tr := startTree(t, e.s, "cat")
+	tr.caughtUp("cat", "matches")
+	local := treeDav(e, refusing(tr.http.URL))
+	r := local.expect(local.do("PROPFIND", "/cat/Season/", "", "Depth", "1"), 502, "local mode, the tree service refusing -bearer")
+	if !strings.Contains(r.body, "tree service refused this server's grant (-bearer)") || strings.Contains(r.body, "the core refused") {
+		t.Fatalf("502 %q", r.body)
+	}
+
+	a := newAuthTree(t)
+	g := a.gateway(t, refusing(a.tr.http.URL))
+	r = g.expect(g.doAs(a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read"}), "PROPFIND", "/cat/", "", "Depth", "1"), 401, "a gateway, the tree service refusing the user's grant")
+	if r.header.Get("WWW-Authenticate") == "" || !strings.Contains(r.body, "tree service refused the listing") {
+		t.Fatalf("401 %v %q", r.header, r.body)
+	}
+}
+
 // A folder lists over every page of the tree service's listing (§B.5
 // "paginated"), within a bound: a folder larger is refused, never listed
 // cut short.

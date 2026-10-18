@@ -2721,6 +2721,8 @@ only.
   included; until some grant read them, the tree answers `404`, and writes, which still read the
   node documents, are refused it. The tree service unreachable is `502`, and its `503` (behind
   the catalog, a sealed namespace's key) a `503` with its `Retry-After`: never an empty folder.
+  Its `401` and `403` are the user's grant refused, answered as the core's are (in local mode a
+  `401` refuses `-bearer`: `502`, naming the tree service).
 - **Read-your-writes** through a tree service, which lags the core. For 30 seconds after a user's
   write through this server (a new file or folder, a rename, a move, a delete, an edit, wherever
   it is made, with any of their tokens), that user's listings of a tree carry `?min={ns}:{ns_id}` for each namespace entry
