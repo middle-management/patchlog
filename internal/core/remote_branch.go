@@ -1221,8 +1221,9 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 			undoes = e.Undoes
 		}
 		var size, digest any
-		if kind == kindRev && !ch.opaque && i == len(ch.entries)-1 {
-			// The head the chain leaves (headMeta).
+		if kind == kindRev && !ch.opaque && i == len(ch.entries)-1 && t.resLevel(res) < levelSealed {
+			// The head the chain leaves (headMeta), but not in a sealed
+			// shadow or namespace, which never lists them.
 			sz, sum := headMeta(canonDoc)
 			size, digest = sz, sum
 		}

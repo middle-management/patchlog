@@ -69,9 +69,9 @@ func checkHeadMeta(t *testing.T, e *Engine, ns string, it map[string]any) {
 // moves a head at write time: a create, an append, a tombstone, a restore,
 // a batch's multi-step items (only the head they leave stores them), and a
 // branch's own writes, while its read-through entries are the base's.
-// What a page lists never changes once served: later writes, a prune
-// below a listed head (which keeps them, as it keeps the target) and a
-// branch leave it as it was; a purge makes the entry a purge, with none.
+// A page never gains them once served: later writes, a prune below a
+// listed head (which keeps them, as it keeps the target) and a branch
+// leave it as it was; a purge makes the entry a purge, with none.
 func TestHeadMeta(t *testing.T) {
 	t.Parallel()
 	var clock atomic.Int64 // Unix ms, moved past the retry window to prune

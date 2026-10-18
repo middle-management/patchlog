@@ -216,7 +216,9 @@ type Rev struct {
 	Referrer bool
 	// Created is the revision's created time, set with every 200 (Doc,
 	// JWE or Snapshot): Last-Modified, a reference extension (README).
-	// Timing is public at every level (§E.4), and never changes.
+	// It never changes. Sealed namespaces send it too, though their logs
+	// serve it sealed: timing stays in the clear at E2 (§E.2.2, §E.4),
+	// and edge grants hide it (§E.2.5).
 	Created time.Time
 	// Digest is the sha-256 of Doc, the bytes served, set with Doc and
 	// never with JWE: Repr-Digest (RFC 9530), a reference extension.
@@ -328,6 +330,10 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		out.Status, out.Doc = 200, b
+		if row.size.Valid && row.size.Int64 == int64(len(b)) && len(row.digest) == sha256.Size {
+			// The digest the write stored of these bytes (headMeta).
+			out.Digest = row.digest
+		}
 		if t.isSealedNS(n) {
 			nsRowID = n.id
 			job = t.resJob(n, name, row, sealDoc, func() []byte { return b })
@@ -336,12 +342,18 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 	})
 	if err == nil && job != nil {
 		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
-			out.Doc, out.JWE = nil, job.jwe
+			out.Doc, out.JWE, out.Digest = nil, job.jwe, nil
 		}
 	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
 		// A plain document (sealed ones have a job, e2e ones no document):
-		// immutable, and the same for every reader.
-		d := revDoc{doc: out.Doc, created: out.Created.UnixMilli(), digest: sha256.Sum256(out.Doc)}
+		// immutable, and the same for every reader. Hashed here unless the
+		// write stored its digest.
+		d := revDoc{doc: out.Doc, created: out.Created.UnixMilli()}
+		if out.Digest != nil {
+			copy(d.digest[:], out.Digest)
+		} else {
+			d.digest = sha256.Sum256(out.Doc)
+		}
 		out.Digest = d.digest[:]
 		e.rc.putRev(g, ns, name, id, d, public)
 	}
@@ -819,8 +831,9 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 				item["target"] = h.row.id.String()
 			}
 			// Reference extensions (README): created, the target's
-			// created time as log entries give it (timing is public at
-			// every level, §E.4), but not a purged one's, which a remote
+			// created time as log entries give it (in sealed namespaces
+			// too, whose logs serve it sealed: timing stays in the clear,
+			// §E.2.2, §E.4), but not a purged one's, which a remote
 			// branch's mirror doesn't know; and a live head's document's
 			// size and digest, as GET …/rev/{target} serves it, where the
 			// write stored them (headMeta). A pruned head keeps them, as

@@ -2095,9 +2095,11 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			// The step's gestures (§7.2), as the request resolved them.
 			gesture, undoes := nullStr(it.Steps[k].Gesture), nullStr(it.Steps[k].Undoes)
 			var size, digest any
-			if k == len(it.steps)-1 && !step.del && !it.e2e {
-				// The head the write leaves (headMeta); e2e content has
-				// no document here (§E.3).
+			if k == len(it.steps)-1 && !step.del && level < levelSealed {
+				// The head the write leaves (headMeta). Sealed and e2e
+				// namespaces never list them, and can't become less
+				// protected: none (e2e content has no document here
+				// anyway, §E.3).
 				if step.docCanon == nil {
 					step.docCanon = jsonv.Canonical(step.doc)
 				}
@@ -2232,11 +2234,13 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 // reference extension, README) without reading any document. Every path
 // that moves a head stores them where it has the document at hand: step 7
 // here, and the chains remote branches and mirrored schemas insert
-// (insertChain). e2e content has none (§E.3), nor do tombstones, nor rows
+// (insertChain). Sealed and e2e namespaces store none, as they list none
+// (e2e content has no document here, §E.3), nor do tombstones, nor rows
 // written before them or by an older instance, which are listed without
-// them until the next write: nothing fills them in later, so what a /heads
-// page lists of a head never changes once served. A purge clears them
-// with the content, and its entry lists a purge.
+// them until the next write. Nothing fills them in later, so a /heads page
+// never gains them once served; they only go: a purge clears them with
+// the content (its entry lists a purge, and its tags purge the cached
+// pages), and a namespace that becomes sealed lists them no more.
 func headMeta(doc []byte) (int64, []byte) {
 	sum := sha256.Sum256(doc)
 	return int64(len(doc)), sum[:]

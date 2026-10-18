@@ -177,7 +177,8 @@ func TestHeadMetaPlain(t *testing.T) {
 // document (§E.3).
 func TestHeadMetaEncrypted(t *testing.T) {
 	t.Parallel()
-	e := newSealedEnv(t)
+	path := headMetaDB(t)
+	e := newSealedEnv(t, withPath(path))
 	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
 	s0 := e.wr("s", "x", "", withNonce(addRoot(map[string]any{"v": 1.0})))
 	e.clock.Advance(time.Hour)
@@ -191,6 +192,11 @@ func TestHeadMetaEncrypted(t *testing.T) {
 	}
 	if it := e.headItems("s", e.nsHead("s"))["x"]; it["target"] != s1 || it["created"] == nil || it["size"] != nil || it["digest"] != nil {
 		t.Fatalf("sealed heads %v", it)
+	}
+	// Nor are they stored: nothing could list them, as a level can't be
+	// lowered.
+	if n := storedMeta(t, path); n != 0 {
+		t.Fatalf("%d sealed revisions store a size or digest", n)
 	}
 
 	f := newE2E(t, withArchive(t, t.TempDir()))
@@ -218,6 +224,55 @@ func TestHeadMetaEncrypted(t *testing.T) {
 	if r.H.Get("X-E2E") != "snapshot" || r.H.Get("Repr-Digest") != "" || r.H.Get("Last-Modified") != httpDate(t, created) {
 		t.Fatalf("e2e snapshot %v", r.H)
 	}
+}
+
+// A namespace raised to sealed lists no size or digest from then on, on
+// earlier pages too (the level decides when listing), and created still.
+func TestHeadMetaSealedLater(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t)
+	e.mkNS("n", map[string]any{"read": "public"})
+	e.create("n", "a", map[string]any{"a": 1.0})
+	at := e.nsHead("n")
+	if it := e.headItems("n", at)["a"]; it["digest"] == nil || it["size"] == nil {
+		t.Fatalf("plain %v", it)
+	}
+	expect(t, e.patchNS("n", ops(op("add", "/encryption", map[string]any{"level": "sealed"})), ""), 201)
+	for _, nsID := range []string{at, e.nsHead("n")} {
+		if it := e.headItems("n", nsID)["a"]; it["created"] == nil || it["digest"] != nil || it["size"] != nil {
+			t.Fatalf("sealed at %s: %v", nsID, it)
+		}
+	}
+}
+
+// headMetaDB is a database for a test that inspects what revisions store
+// (storedMeta): a SQLite file, or a Postgres database.
+func headMetaDB(t *testing.T) string {
+	t.Helper()
+	if pgtest.Enabled() {
+		return pgtest.NewDB(t)
+	}
+	return filepath.Join(t.TempDir(), "meta.db")
+}
+
+// storedMeta counts the revisions of the database at path that store a
+// size or digest (headMeta).
+func storedMeta(t *testing.T, path string) int {
+	t.Helper()
+	driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
+	if strings.HasPrefix(path, "postgres") {
+		driver, dsn = "pgx", path
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM revisions WHERE size IS NOT NULL OR digest IS NOT NULL`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 // A database from before the extension (the columns dropped) is migrated:
