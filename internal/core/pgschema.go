@@ -336,7 +336,7 @@ CREATE INDEX IF NOT EXISTS revisions_by_gesture ON revisions (gesture) WHERE ges
 CREATE INDEX IF NOT EXISTS revisions_by_undoes ON revisions (undoes) WHERE undoes IS NOT NULL;
 ALTER TABLE ns_log ADD COLUMN IF NOT EXISTS gestures text;
 -- For a revision a write left as a head, its canonical document's length
--- and sha-256, for /heads (headMeta, a reference extension). Rows from
+-- and sha-256, for /heads (headMeta, §7.4). Rows from
 -- before keep NULL, and are listed without them.
 ALTER TABLE revisions ADD COLUMN IF NOT EXISTS size bigint;
 ALTER TABLE revisions ADD COLUMN IF NOT EXISTS digest bytea;

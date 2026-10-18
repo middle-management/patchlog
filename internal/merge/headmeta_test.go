@@ -18,7 +18,7 @@ func (e *env) headItems(ns string) map[string]client.HeadItem {
 }
 
 // A merge's apply writes a batch, whose heads store their documents' sizes
-// and digests (/heads, a reference extension): a fast-forward, which
+// and digests (/heads, §7.4): a fast-forward, which
 // reproduces the branch's ids and so its entries' digests, and a replay,
 // a new revision with its own; a deletion's tombstone has none.
 func TestMergeHeadMeta(t *testing.T) {

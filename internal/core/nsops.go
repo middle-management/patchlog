@@ -389,11 +389,15 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 	// A sealed namespace's epoch key starts with the config write that
 	// begins its epoch (§E.2.1).
 	t.sealedConfigWritten(n, old, p.cfg)
-	if old.cachePublic() && !p.cfg.cachePublic() {
+	if old.cachePublic() && !p.cfg.cachePublic() || old.level < levelSealed && p.cfg.level >= levelSealed {
 		// Public copies at the edge must go (§9); every response of the
 		// namespace carries ns:{ns}. Its branches can't be public now
 		// (planConfig refuses while they are, sealed pairs aside, which
-		// keep serving ciphertext under their own tags).
+		// keep serving ciphertext under their own tags). So must, on a
+		// raise to sealed, whatever the read setting, the /heads pages
+		// listing created, size and digest and the revisions sent with
+		// Last-Modified and Repr-Digest (§7.1, §7.4), which the level now
+		// hides. A level is never lowered, and e2e only at creation.
 		t.tags = append(t.tags, "ns:"+n.name)
 	}
 	return seq

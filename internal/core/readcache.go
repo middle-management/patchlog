@@ -84,18 +84,25 @@ type revEntry struct {
 	revDoc
 }
 
-// revDoc is a plain revision's answer: its document, the revision's
-// created time (Unix ms) and the document's sha-256, hashed once when
-// cached (Rev.Created, Rev.Digest).
+// revDoc is a plain revision's answer: its document and, with meta, the
+// revision's created time (Unix ms) and the document's sha-256, hashed
+// once when cached (Rev.Created, Rev.Digest). An e2e namespace's keyring
+// is plain but sends neither (§7.1), so it is kept without meta; a level
+// change moves the meta counter, which drops every entry.
 type revDoc struct {
 	doc     []byte
+	meta    bool
 	created int64
 	digest  [sha256.Size]byte
 }
 
 // answer is the 200 serving d.
 func (d *revDoc) answer(public bool) *Rev {
-	return &Rev{Status: 200, Doc: d.doc, Created: time.UnixMilli(d.created), Digest: d.digest[:], Public: public}
+	r := &Rev{Status: 200, Doc: d.doc, Public: public}
+	if d.meta {
+		r.Created, r.Digest = time.UnixMilli(d.created), d.digest[:]
+	}
+	return r
 }
 
 type headEntry struct {

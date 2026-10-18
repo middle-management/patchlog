@@ -2230,8 +2230,8 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 
 // headMeta is what a revision a write leaves as a resource's head stores
 // of its document (revisions.size, digest): the length and sha-256 of its
-// canonical form, the bytes GET …/rev/{id} serves, which /heads lists (a
-// reference extension, README) without reading any document. Every path
+// canonical form, the bytes GET …/rev/{id} serves, which /heads lists
+// (§7.4) without reading any document. Every path
 // that moves a head stores them where it has the document at hand: step 7
 // here, and the chains remote branches and mirrored schemas insert
 // (insertChain). Sealed and e2e namespaces store none, as they list none
@@ -2240,7 +2240,8 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 // them until the next write. Nothing fills them in later, so a /heads page
 // never gains them once served; they only go: a purge clears them with
 // the content (its entry lists a purge, and its tags purge the cached
-// pages), and a namespace that becomes sealed lists them no more.
+// pages), and a namespace raised to sealed lists them, and created, no
+// more, and purges ns:{ns} with the raise (§9).
 func headMeta(doc []byte) (int64, []byte) {
 	sum := sha256.Sum256(doc)
 	return int64(len(doc)), sum[:]

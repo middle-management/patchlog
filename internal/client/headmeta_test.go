@@ -9,12 +9,11 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 )
 
-// The reference extensions (README) as the client surfaces them: a
-// document's Modified (Last-Modified) and Digest (Repr-Digest), and a
-// /heads entry's Created, Size and Digest, which match the document's
-// bytes (ReprDigest); a tombstone's entry has Created only. In a sealed
-// namespace the entries have no Size or Digest, and a document no Digest
-// (the header would describe the JWE), though Modified is set.
+// §7.1 and §7.4 as the client surfaces them: a document's Modified
+// (Last-Modified) and Digest (Repr-Digest), and a /heads entry's Created,
+// Size and Digest, which match the document's bytes (ReprDigest); a
+// tombstone's entry has Created only. In a sealed namespace the server
+// sends none of them: Created and Digest are "", Size 0 and Modified zero.
 func TestHeadMetaFields(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -39,22 +38,19 @@ func TestHeadMetaFields(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !d.Modified.Equal(tm.Truncate(time.Second)) {
-			t.Fatalf("%s: Modified %v, created %s", ns, d.Modified, created)
-		}
-		it := items["a"]
-		if it.Target != a.ID || it.Created != created {
-			t.Fatalf("%s: entry %+v, created %s", ns, it, created)
+		it, bi := items["a"], items["b"]
+		if it.Target != a.ID || bi.Kind != "tombstone" || bi.Target != bt.ID || bi.Size != 0 || bi.Digest != "" {
+			t.Fatalf("%s: entries %+v %+v", ns, it, bi)
 		}
 		if ns == "p" {
+			if !d.Modified.Equal(tm.Truncate(time.Second)) || it.Created != created || bi.Created == "" {
+				t.Fatalf("plain: Modified %v, entries %+v %+v, created %s", d.Modified, it, bi, created)
+			}
 			if d.Digest == "" || d.Digest != client.ReprDigest(d.Raw) || it.Digest != d.Digest || it.Size != int64(len(d.Raw)) {
 				t.Fatalf("plain: doc digest %q, entry %+v, %d bytes %s", d.Digest, it, len(d.Raw), client.ReprDigest(d.Raw))
 			}
-		} else if d.Digest != "" || it.Digest != "" || it.Size != 0 {
-			t.Fatalf("sealed: doc digest %q, entry %+v", d.Digest, it)
-		}
-		if bi := items["b"]; bi.Kind != "tombstone" || bi.Target != bt.ID || bi.Created == "" || bi.Size != 0 || bi.Digest != "" {
-			t.Fatalf("%s: tombstone %+v", ns, bi)
+		} else if !d.Modified.IsZero() || d.Digest != "" || it.Created != "" || it.Digest != "" || it.Size != 0 || bi.Created != "" {
+			t.Fatalf("sealed: Modified %v, doc digest %q, entries %+v %+v", d.Modified, d.Digest, it, bi)
 		}
 	}
 }

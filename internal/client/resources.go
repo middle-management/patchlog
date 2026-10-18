@@ -73,9 +73,9 @@ type Doc struct {
 	// second, and no later than the server's clock), zero if the server
 	// sent none. Digest is Raw's sha-256 in the RFC 9530 form /heads
 	// entries use (HeadItem.Digest, ReprDigest), from Repr-Digest; "" if
-	// the server sent none, as for a sealed document, whose header would
-	// describe the JWE. Both are reference extensions beyond the spec
-	// (README), missing from responses cached before a server sent them.
+	// the server sent none. Servers send both only outside sealed and e2e
+	// namespaces (§7.1), and responses cached before a server sent them
+	// lack them.
 	Modified time.Time
 	Digest   string
 }

@@ -293,10 +293,11 @@ type HeadItem struct {
 	// head or tombstone. Size and Digest describe a live head's document
 	// as GET …/rev/{target} serves it: its length in bytes and its sha-256
 	// in the RFC 9530 form (ReprDigest), for comparing a copy without
-	// fetching it. They are reference extensions beyond the spec
-	// (README): "" and 0 when the server didn't say, as for tombstones
-	// and purges, in sealed and e2e namespaces, and for heads written
-	// before the server stored them (no canonical document is empty).
+	// fetching it (§7.4). All three are optional and not to be relied on:
+	// "" and 0 when the server didn't say, as in sealed and e2e
+	// namespaces, which send none, for purges, Size and Digest for
+	// tombstones, and for heads written before the server stored them (no
+	// canonical document is empty).
 	Created string
 	Size    int64
 	Digest  string

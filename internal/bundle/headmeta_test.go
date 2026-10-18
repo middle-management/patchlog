@@ -9,7 +9,7 @@ import (
 
 // liveHeadsMatch checks every live head of ns's /heads listing against the
 // document it names: Size and Digest those of the bytes served, Created
-// its log entry's (reference extensions, README). It returns how many
+// its log entry's (§7.4). It returns how many
 // live heads it checked.
 func liveHeadsMatch(t *testing.T, c *client.Client, ns string) int {
 	t.Helper()
@@ -29,7 +29,7 @@ func liveHeadsMatch(t *testing.T, c *client.Client, ns string) int {
 }
 
 // A bundle import writes through batches, whose heads store their
-// documents' sizes and digests (/heads, a reference extension): a full
+// documents' sizes and digests (/heads, §7.4): a full
 // import, and an incremental one fast-forwarding a document.
 func TestImportHeadMeta(t *testing.T) {
 	t.Parallel()

@@ -159,10 +159,9 @@ func TestParse(t *testing.T) {
 // included; the edge's verification headers never are (§9). The lists cover what
 // §7 "Browsers" requires: the methods and headers that make requests
 // non-simple, plus Gesture, Undoes (§7.2), Blob-Nonce and Blob-From,
-// allowed, and If-Modified-Since, which revisions answer (a reference
-// extension); the headers clients read, Gesture, Undoes and X-Log-Next
-// (§7.1 Paging) among them, and Repr-Digest (a reference extension),
-// exposed.
+// allowed, and If-Modified-Since, which revisions answer (§7.1); the
+// headers clients read, Gesture, Undoes and X-Log-Next (§7.1 Paging) among
+// them, and Repr-Digest (§7.1), exposed.
 func TestHeaderLists(t *testing.T) {
 	allowed := strings.Split(Headers, ", ")
 	for _, h := range []string{"Authorization", "Content-Type", "If-Match", "If-None-Match", "If-Modified-Since", "If-Range", "Range", "Signature", "Source-Authorization", "Gesture", "Undoes", "Blob-From", "Blob-Nonce", "Last-Event-ID", "X-Author"} {

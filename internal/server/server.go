@@ -623,10 +623,11 @@ func (s *Server) resourceRev(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// revMeta sets the reference extensions of a revision's 200 (README):
-// Last-Modified (lastModified); and Repr-Digest (RFC 9530), the sha-256 of
-// the bytes served, for a plain document only, never a JWE (sealed and
-// e2e namespaces, §E.2.2).
+// revMeta sets a revision's 200 headers outside sealed and e2e namespaces
+// (§7.1), where the engine sets Created and Digest: Last-Modified
+// (lastModified), and Repr-Digest (RFC 9530), the sha-256 of the canonical
+// document served, which no content coding changes (none is applied).
+// Sealed and e2e reads carry neither (§E.2.2), the e2e keyring included.
 func (s *Server) revMeta(w http.ResponseWriter, rev *core.Rev) {
 	if lm, ok := s.lastModified(rev); ok {
 		w.Header().Set("Last-Modified", lm.Format(http.TimeFormat))
@@ -653,8 +654,10 @@ func (s *Server) lastModified(rev *core.Rev) (time.Time, bool) {
 
 // notModified tells whether a revision's answer is a 304: If-None-Match
 // names its id (an immutable ETag), or, without If-None-Match, a 200's
-// Last-Modified is no later than If-Modified-Since (RFC 9110 §13.1.3,
-// §13.2.2). Either is exact: a revision never changes.
+// Last-Modified is no later than If-Modified-Since (§7.1, RFC 9110
+// §13.1.3, §13.2.2). Either is exact: a revision never changes. Where no
+// Last-Modified is sent (sealed and e2e namespaces) If-Modified-Since is
+// ignored, so 304s can't be probed for the created time the level hides.
 func (s *Server) notModified(r *http.Request, id string, rev *core.Rev) bool {
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
 		return strings.Contains(inm, quote(id))
@@ -1113,8 +1116,10 @@ func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// heads:{ns} too, which a resource purge purges: an entry's size and
-	// digest (a reference extension, README) are its document's, which a
-	// purge removes, unlike the names and ids the page also lists (§8.3).
+	// digest (§7.4) are its document's, which a purge removes, unlike the
+	// names and ids the page also lists. §8.3 accepts that a digest
+	// already served survives a purge; this tag, the reference's own,
+	// clears the copies its edge holds.
 	s.cache(w, r, ccImmutable, page.Public, "ns:"+ns, "heads:"+ns)
 	out := map[string]any{"items": page.Items}
 	if page.Next != "" {

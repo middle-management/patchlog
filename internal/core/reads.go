@@ -214,15 +214,14 @@ type Rev struct {
 	// edge cookie covers the path, so an edge forwards the read undecided:
 	// it is served private, and no shared cache stores it.
 	Referrer bool
-	// Created is the revision's created time, set with every 200 (Doc,
-	// JWE or Snapshot): Last-Modified, a reference extension (README).
-	// It never changes. Sealed namespaces send it too, though their logs
-	// serve it sealed: timing stays in the clear at E2 (§E.2.2, §E.4),
-	// and edge grants hide it (§E.2.5).
+	// Created is the revision's created time and Digest the sha-256 of
+	// Doc, the bytes served: a 200's Last-Modified and Repr-Digest (RFC
+	// 9530, §7.1). Both are set only where the namespace serving the read
+	// is neither sealed nor e2e, the e2e keyring included: sealed logs
+	// hide created (§E.2.2), and an exact digest defeats padding, so a
+	// JWE, a sealed snapshot or a keyring there carries neither.
 	Created time.Time
-	// Digest is the sha-256 of Doc, the bytes served, set with Doc and
-	// never with JWE: Repr-Digest (RFC 9530), a reference extension.
-	Digest []byte
+	Digest  []byte
 }
 
 // ResourceRev serves the document at a revision.
@@ -231,7 +230,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		return c.answer(true), nil
 	}
 	g := e.rc.load(ns)
-	public, cached := false, false
+	public, cached, plain := false, false, false
 	var out *Rev
 	var job *sealJob
 	var nsRowID int64
@@ -255,12 +254,15 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		out = &Rev{Public: t.cachePublic(n), Referrer: referrer}
 		public = t.config(n.configSeq).Read == "public"
+		// Last-Modified and Repr-Digest, judged by the namespace serving
+		// the read (§7.1): a sealed branch of a plain base sends neither.
+		plain = t.nsLevel(n) < levelSealed
 		if perr != nil {
 			out.Status = 404
 			return nil
 		}
 		// May read: a plain document is the same for every reader
-		// (readcache.go). Sealed and e2e ones are never cached.
+		// (readcache.go). Sealed and e2e content is never cached.
 		if !t.isSealedNS(n) && !t.e2eContent(n, name) {
 			if c := e.rc.revFor(g, ns, name, id); c != nil {
 				out, cached = c.answer(out.Public), true
@@ -282,7 +284,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			out.Status = 404
 			return nil
 		}
-		out.Created = time.UnixMilli(row.created)
+		if plain {
+			out.Created = time.UnixMilli(row.created)
+		}
 		e2e := t.e2eContent(n, name)
 		if e2e {
 			// A prune's sealed snapshot is served as /rev/{H}, never as a
@@ -330,7 +334,7 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		out.Status, out.Doc = 200, b
-		if row.size.Valid && row.size.Int64 == int64(len(b)) && len(row.digest) == sha256.Size {
+		if plain && row.size.Valid && row.size.Int64 == int64(len(b)) && len(row.digest) == sha256.Size {
 			// The digest the write stored of these bytes (headMeta).
 			out.Digest = row.digest
 		}
@@ -345,16 +349,20 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			out.Doc, out.JWE, out.Digest = nil, job.jwe, nil
 		}
 	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
-		// A plain document (sealed ones have a job, e2e ones no document):
-		// immutable, and the same for every reader. Hashed here unless the
-		// write stored its digest.
-		d := revDoc{doc: out.Doc, created: out.Created.UnixMilli()}
-		if out.Digest != nil {
-			copy(d.digest[:], out.Digest)
-		} else {
-			d.digest = sha256.Sum256(out.Doc)
+		// A plain document (sealed ones have a job, e2e content no
+		// document, and an e2e keyring is kept without its created time
+		// and digest): immutable, and the same for every reader. Hashed
+		// here unless the write stored its digest.
+		d := revDoc{doc: out.Doc, meta: plain}
+		if plain {
+			d.created = out.Created.UnixMilli()
+			if out.Digest != nil {
+				copy(d.digest[:], out.Digest)
+			} else {
+				d.digest = sha256.Sum256(out.Doc)
+			}
+			out.Digest = d.digest[:]
 		}
-		out.Digest = d.digest[:]
 		e.rc.putRev(g, ns, name, id, d, public)
 	}
 	return out, err
@@ -814,9 +822,11 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		out = &HeadsPage{Items: []map[string]any{}, Public: t.cachePublic(n)}
 		page, next := t.pageHeads(n, &seq, after, e.opt.Maximums.LogPageSize)
 		out.Next = next
-		// Sizes and digests show what sealed and e2e namespaces hide:
-		// lengths, which their padding exists for, and a hash of content
-		// (§E.2.2, §E.4).
+		// created, size and digest show what sealed and e2e namespaces
+		// hide: created times, which their logs seal, lengths, which their
+		// padding exists for, and a hash of content (§7.4, §E.2.2). Judged
+		// by the namespace serving the page when it is listed, so pages at
+		// ns_ids from before a raise to sealed list none either.
 		plain := t.nsLevel(n) < levelSealed
 		for _, h := range page {
 			kind := "head"
@@ -830,17 +840,15 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			if h.row != nil {
 				item["target"] = h.row.id.String()
 			}
-			// Reference extensions (README): created, the target's
-			// created time as log entries give it (in sealed namespaces
-			// too, whose logs serve it sealed: timing stays in the clear,
-			// §E.2.2, §E.4), but not a purged one's, which a remote
-			// branch's mirror doesn't know; and a live head's document's
-			// size and digest, as GET …/rev/{target} serves it, where the
-			// write stored them (headMeta). A pruned head keeps them, as
-			// it keeps its target.
-			if h.row != nil && h.state != Purged {
+			// created, the target's created time as log entries give it,
+			// but not a purged one's, which a remote branch's mirror
+			// doesn't know; and a live head's document's size and digest,
+			// as GET …/rev/{target} serves it uncoded, where the write
+			// stored them (headMeta). A pruned head keeps them, as it
+			// keeps its target.
+			if plain && h.row != nil && h.state != Purged {
 				item["created"] = formatTime(h.row.created)
-				if h.state == Live && plain && h.row.size.Valid && len(h.row.digest) == sha256.Size {
+				if h.state == Live && h.row.size.Valid && len(h.row.digest) == sha256.Size {
 					item["size"] = float64(h.row.size.Int64)
 					item["digest"] = ReprDigest(h.row.digest)
 				}

@@ -50,7 +50,7 @@ const Methods = "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS"
 
 // Headers are the request headers the API reads beyond the CORS-safelisted
 // ones: credentials (§C.1), preconditions (§7.2, and If-Modified-Since on
-// revisions, a reference extension), gestures (§7.2), author signatures
+// revisions, §7.1), gestures (§7.2), author signatures
 // (§C.3), blob uploads and copies (§7.8), ranges and event-stream resumes
 // (§9), and X-Author, which names the author when authentication is off
 // (serve -dev). The edge's verification header (-edge-header) is left out
@@ -61,8 +61,8 @@ const Headers = "Authorization, Content-Type, If-Match, If-None-Match, If-Modifi
 // ones: at least those §7 "Browsers" lists, among them Gesture and Undoes
 // (what a write recorded, §7.2) and X-Log-Next, without
 // which a page can't follow a paged log range (§7.1) and must treat its
-// first page as truncated; and Repr-Digest, a revision's digest (a
-// reference extension; Last-Modified is safelisted).
+// first page as truncated; and Repr-Digest, a revision's digest (§7.1;
+// Last-Modified is safelisted).
 const Exposed = "ETag, Location, Retry-After, Allow, WWW-Authenticate, Accept-Ranges, Content-Range, Gesture, Undoes, X-Namespace-Revision, X-Config-Revision, X-Revision, X-Cursor, X-Log-Next, X-E2E, Repr-Digest"
 
 // Parse splits comma-separated origins, as given on the command line, and

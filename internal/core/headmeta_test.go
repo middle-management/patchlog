@@ -64,7 +64,7 @@ func checkHeadMeta(t *testing.T, e *Engine, ns string, it map[string]any) {
 	}
 }
 
-// Reference extensions (README): /heads entries carry created, and live
+// §7.4 in a plain namespace: /heads entries carry created, and live
 // heads the size and digest of their document, stored by every path that
 // moves a head at write time: a create, an append, a tombstone, a restore,
 // a batch's multi-step items (only the head they leave stores them), and a
