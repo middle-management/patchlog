@@ -283,25 +283,26 @@ func TestDeleteAfterSuccessfulSave(t *testing.T) {
 // save whose temporary file isn't JSON) sets no guard: rclone deletes
 // nothing after one, and without a cache its next save over the file is
 // a DELETE, then a MOVE (Overwrite: F), which gives up when the DELETE is
-// refused (sed -i: "cannot rename").
+// refused ("cannot rename"). The temporary files have a scratch name
+// (§H.6, gedit's); one of another name would be a file of its own.
 func TestDeleteAfterRefusedMove(t *testing.T) {
 	t.Parallel()
 	e := guardEnv(t, newClock())
 	e.create("docs", "s", map[string]any{"n": 1})
 	e.expect(e.do("GET", "/docs/s.json", "", "Range", "bytes=0-100"), 206, "a mount's read")
-	e.expect(e.do("PUT", "/docs/sedA", `{"n": 1,}`), 201, "sed's temporary file")
+	e.expect(e.do("PUT", "/docs/.goutputstream-A", `{"n": 1,}`), 201, "the temporary file")
 	e.expect(e.do("DELETE", "/docs/s.json", ""), 204, "rclone's rename: DELETE")
-	e.expect(e.do("MOVE", "/docs/sedA", "", "Destination", "/docs/s.json", "Overwrite", "F"), 400, "MOVE that isn't JSON: restored")
-	e.expect(e.do("DELETE", "/docs/sedA", ""), 204, "sed removes its temporary file")
-	e.expect(e.do("PUT", "/docs/sedB", `{"n": 2}`), 201, "the next sed -i: temporary file")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-A", "", "Destination", "/docs/s.json", "Overwrite", "F"), 400, "MOVE that isn't JSON: restored")
+	e.expect(e.do("DELETE", "/docs/.goutputstream-A", ""), 204, "the editor removes its temporary file")
+	e.expect(e.do("PUT", "/docs/.goutputstream-B", `{"n": 2}`), 201, "the next save: temporary file")
 	e.expect(e.do("DELETE", "/docs/s.json", ""), 204, "rclone's rename: DELETE")
-	e.expect(e.do("MOVE", "/docs/sedB", "", "Destination", "/docs/s.json", "Overwrite", "F"), 201, "MOVE onto the name")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-B", "", "Destination", "/docs/s.json", "Overwrite", "F"), 201, "MOVE onto the name")
 	_, doc := e.load("docs", "s")
 	sameJSON(t, doc, map[string]any{"n": 2.0})
 
 	e.create("docs", "copy", map[string]any{"a": "1"})
-	e.expect(e.do("PUT", "/docs/.tmp-copy", `{"a": "2"`), 201, "PUT scratch")
-	e.expect(e.do("COPY", "/docs/.tmp-copy", "", "Destination", "/docs/copy.json", "Overwrite", "T"), 400, "COPY that isn't JSON onto the document")
+	e.expect(e.do("PUT", "/docs/.goutputstream-copy", `{"a": "2"`), 201, "PUT scratch")
+	e.expect(e.do("COPY", "/docs/.goutputstream-copy", "", "Destination", "/docs/copy.json", "Overwrite", "T"), 400, "COPY that isn't JSON onto the document")
 	e.expect(e.do("DELETE", "/docs/copy.json", ""), 204, "DELETE after a refused COPY")
 	e.expectTombstoned("docs", "copy", "DELETE after a refused COPY")
 }
@@ -349,36 +350,36 @@ func TestSavesAfterRefusedSave(t *testing.T) {
 	sameJSON(t, doc, saved)
 
 	e.refusedSave(1, "code")
-	e.expect(e.do("PUT", "/docs/.code.json.tmp", text), 201, "VS Code: temporary file")
-	e.expect(e.do("MOVE", "/docs/.code.json.tmp", "", "Destination", "/docs/code.json"), 204, "VS Code: over the original")
+	e.expect(e.do("PUT", "/docs/.goutputstream-code", text), 201, "VS Code: temporary file")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-code", "", "Destination", "/docs/code.json"), 204, "VS Code: over the original")
 	_, doc = e.load("docs", "code")
 	sameJSON(t, doc, saved)
 
 	e.refusedSave(1, "rc")
 	e.expectGuarded("/docs/rc.json", "rclone: the refused upload's cleanup DELETE")
-	e.expect(e.do("PUT", "/docs/rc.json.tmp", text), 201, "rclone: temporary file")
+	e.expect(e.do("PUT", "/docs/.goutputstream-rc", text), 201, "rclone: temporary file")
 	e.expect(e.do("DELETE", "/docs/rc.json", ""), 204, "rclone: DELETE of the original")
-	e.expect(e.do("MOVE", "/docs/rc.json.tmp", "", "Destination", "/docs/rc.json", "Overwrite", "F"), 201, "rclone: MOVE onto the name")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-rc", "", "Destination", "/docs/rc.json", "Overwrite", "F"), 201, "rclone: MOVE onto the name")
 	_, doc = e.load("docs", "rc")
 	sameJSON(t, doc, saved)
 
 	e.refusedSave(1, "del")
-	e.expect(e.do("PUT", "/docs/del.json.tmp", text), 201, "temporary file")
+	e.expect(e.do("PUT", "/docs/.goutputstream-del", text), 201, "temporary file")
 	e.expectGuarded("/docs/del.json", "DELETE of the original")
-	e.expect(e.do("MOVE", "/docs/del.json.tmp", "", "Destination", "/docs/del.json", "Overwrite", "T"), 204, "MOVE onto it")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-del", "", "Destination", "/docs/del.json", "Overwrite", "T"), 204, "MOVE onto it")
 	_, doc = e.load("docs", "del")
 	sameJSON(t, doc, saved)
 
 	h := e.refusedSave(1, "rcf")
-	e.expect(e.do("PUT", "/docs/rcf.json.tmp", text), 201, "temporary file")
+	e.expect(e.do("PUT", "/docs/.goutputstream-rcf", text), 201, "temporary file")
 	e.expectGuarded("/docs/rcf.json", "DELETE of the original")
-	e.expect(e.do("MOVE", "/docs/rcf.json.tmp", "", "Destination", "/docs/rcf.json", "Overwrite", "F"), 412, "MOVE onto it, Overwrite: F")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-rcf", "", "Destination", "/docs/rcf.json", "Overwrite", "F"), 412, "MOVE onto it, Overwrite: F")
 	e.expectLive("docs", "rcf", h, "after a MOVE with Overwrite: F")
 
 	h = e.refusedSave(0, "conflict")
-	e.expect(e.do("PUT", "/docs/conflict.json.tmp", rendered(map[string]any{"a": "mine", "b": "1"})), 201, "temporary file")
+	e.expect(e.do("PUT", "/docs/.goutputstream-conflict", rendered(map[string]any{"a": "mine", "b": "1"})), 201, "temporary file")
 	e.expectGuarded("/docs/conflict.json", "DELETE of the original")
-	e.expect(e.do("MOVE", "/docs/conflict.json.tmp", "", "Destination", "/docs/conflict.json"), 409, "MOVE of the conflicting version")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-conflict", "", "Destination", "/docs/conflict.json"), 409, "MOVE of the conflicting version")
 	e.expectLive("docs", "conflict", h, "after the conflicting MOVE")
 }
 
@@ -386,7 +387,9 @@ func TestSavesAfterRefusedSave(t *testing.T) {
 // save of its name: the delete-then-write restore (undoOwnDelete) is for
 // a DELETE moments before the write, and the DELETE after a refusal that
 // restored one is done, so rclone's cleanup puts back the deletion. Nor
-// is a placement the user unplaced.
+// is a placement the user unplaced. (Refused for its size: a new file of
+// a deleted JSON file's name is no longer that file, and takes content
+// that isn't JSON as a raw file, §H.1.)
 func TestRefusedSaveAfterOldDelete(t *testing.T) {
 	t.Parallel()
 	c := newClock()
@@ -394,7 +397,8 @@ func TestRefusedSaveAfterOldDelete(t *testing.T) {
 	e.create("docs", "gone", map[string]any{"secret": "unpublish me"})
 	e.expect(e.do("DELETE", "/docs/gone.json", ""), 204, "a deliberate DELETE")
 	c.add(6 * time.Hour)
-	r := e.expect(e.do("PUT", "/docs/gone.json", `{"title": "new"`), 400, "a new file of the name, not JSON")
+	big := `{"v": "` + strings.Repeat("x", 2000) + `"}`
+	r := e.expect(e.do("PUT", "/docs/gone.json", big), 413, "a new file of the name, too large")
 	if strings.Contains(r.body, "restored") {
 		t.Fatalf("restored 6 h after: %q", r.body)
 	}
@@ -407,7 +411,7 @@ func TestRefusedSaveAfterOldDelete(t *testing.T) {
 	e.create("docs", "late", map[string]any{"v": 1})
 	e.expect(e.do("DELETE", "/docs/late.json", ""), 204, "DELETE")
 	c.add(31 * time.Second)
-	e.expect(e.do("PUT", "/docs/late.json", `{"v": 2`), 400, "refused 31 s after")
+	e.expect(e.do("PUT", "/docs/late.json", big), 413, "refused 31 s after")
 	e.expectTombstoned("docs", "late", "refused 31 s after the DELETE")
 	e.create("docs", "soon", map[string]any{"v": 1})
 	e.expect(e.do("DELETE", "/docs/soon.json", ""), 204, "DELETE")
@@ -433,7 +437,8 @@ func TestRefusedSaveAfterOldDelete(t *testing.T) {
 
 // More refused uploads at once than 64 (rclone --transfers, or several
 // clients of local mode's one user) keep their guards; a cleanup DELETE
-// that finds nothing (a refused create's) uses its guard up.
+// that finds nothing (a refused create's, too large: a new {name}.json
+// that isn't JSON is a raw file, §H.1) uses its guard up.
 func TestDeleteAfterManyRefusedSaves(t *testing.T) {
 	t.Parallel()
 	e := guardEnv(t, newClock())
@@ -451,7 +456,7 @@ func TestDeleteAfterManyRefusedSaves(t *testing.T) {
 		}
 	}
 
-	e.expect(e.do("PUT", "/docs/new.json", `{"v": 1`), 400, "a refused create")
+	e.expect(e.do("PUT", "/docs/new.json", `{"v": "`+strings.Repeat("x", 2000)+`"}`), 413, "a refused create")
 	e.expect(e.do("DELETE", "/docs/new.json", ""), 404, "its cleanup DELETE")
 	e.create("docs", "new", map[string]any{"v": 1})
 	e.expect(e.do("DELETE", "/docs/new.json", ""), 204, "a DELETE after someone created it")

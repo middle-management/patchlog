@@ -29,12 +29,14 @@ func must[T any](v T, err error) T {
 
 // env is a core (clienttest) and a WebDAV server in front of it.
 type env struct {
-	t   *testing.T
-	ctx context.Context
-	s   *clienttest.Server
-	c   *client.Client // writes "as someone else", straight to the core
-	dav *httptest.Server
-	pw  string // the Basic password requests send
+	t    *testing.T
+	ctx  context.Context
+	s    *clienttest.Server
+	c    *client.Client // writes "as someone else", straight to the core
+	dav  *httptest.Server
+	pw   string // the Basic password requests send
+	opt  dav.Options
+	flat []string
 }
 
 // newEnv starts a development core (no authentication) with namespaces
@@ -68,7 +70,22 @@ func newEnv(t *testing.T, flat, catalogs []string, nsDocs map[string]map[string]
 	}
 	e.dav = httptest.NewServer(srv)
 	t.Cleanup(e.dav.Close)
+	e.opt = dopt
 	return e
+}
+
+// another is a second WebDAV server over e's core, as e's was set up: its
+// user isn't e's, so it reads what e's user wrote as everyone does.
+func (e *env) another() *env {
+	e.t.Helper()
+	srv, err := dav.New(e.opt)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	o := *e
+	o.dav = httptest.NewServer(srv)
+	e.t.Cleanup(o.dav.Close)
+	return &o
 }
 
 type resp struct {

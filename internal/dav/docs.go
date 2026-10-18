@@ -1,43 +1,57 @@
 package dav
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 
 	"github.com/middle-management/patchlog/internal/client"
-	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // docEntry is a revision's document as served: rendered once, kept by
 // revision id, which never changes what it names (§3.3).
 type docEntry struct {
-	value    any
+	value any
+	// rendered is a JSON file's rendering (§H.1); raw is a raw file's blob
+	// reference instead (§7.8), and rendered nil.
 	rendered []byte
-	// created is the revision's creation time where known: for revisions
-	// this server wrote, from the write's log entry (§7.1). Zero
-	// otherwise: the core serves documents without it.
-	created time.Time
+	raw      *rawRef
+	// modified is the revision's creation time where known: Last-Modified
+	// of its read (§7.1), or, for revisions this server wrote, the write's
+	// log entry's. Zero otherwise, as from cores that send none.
+	modified time.Time
 	// sealed: the core served it sealed (application/jose, Addendum E),
-	// which isn't rendered.
+	// which this server, holding no keys, doesn't offer (§H.7).
 	sealed bool
 }
 
-// render is a document's canonical form (§3.1) indented by two spaces,
-// with a trailing newline: keys sorted and numbers as JCS writes them, so
-// a revision always reads as the same bytes and saving them unchanged is
-// an empty diff.
-func render(v any) []byte {
-	var b bytes.Buffer
-	if err := json.Indent(&b, jsonv.Canonical(v), "", "  "); err != nil {
-		panic("dav: canonical JSON doesn't indent: " + err.Error())
+// newEntry is the entry of document v, read or written at modified.
+func newEntry(v any, modified time.Time) *docEntry {
+	e := &docEntry{value: v, modified: modified}
+	if e.raw = rawRefOf(v, client.RawBlobOf(v)); e.raw == nil {
+		e.rendered = render(v)
 	}
-	b.WriteByte('\n')
-	return b.Bytes()
+	return e
+}
+
+// fileMeta is what a listing shows of a revision's file (§H.3), read from
+// its document once and kept by revision id for good, apart from the
+// documents (Server.metas), which take more room.
+type fileMeta struct {
+	raw      *rawRef // a raw file's reference; nil for a JSON file
+	size     int64   // the reference's size, or the rendering's length
+	modified time.Time
+	sealed   bool
+}
+
+func (e *docEntry) meta() fileMeta {
+	m := fileMeta{raw: e.raw, size: int64(len(e.rendered)), modified: e.modified, sealed: e.sealed}
+	if e.raw != nil {
+		m.size = e.raw.size
+	}
+	return m
 }
 
 func docKey(ns, name, rev string) string { return ns + "/" + name + "@" + rev }
@@ -70,7 +84,7 @@ func (s *Server) doc(ctx context.Context, p *principal, ns, name, rev string) (*
 		case err != nil:
 			return nil, err
 		default:
-			e = &docEntry{value: d.Value, rendered: render(d.Value)}
+			e = newEntry(d.Value, d.Modified)
 		}
 		s.keep(k, e)
 		return e, nil
@@ -81,25 +95,44 @@ func (s *Server) doc(ctx context.Context, p *principal, ns, name, rev string) (*
 	return v.(*docEntry), nil
 }
 
-// keep caches a document under its key; the value counts twice its
-// rendering.
+// meta returns the file metadata of ns/name at rev, from the cache or read
+// with its document (doc), on the same terms.
+func (s *Server) meta(ctx context.Context, p *principal, ns, name, rev string) (fileMeta, error) {
+	s.docMu.Lock()
+	m, ok := s.metas.Get(docKey(ns, name, rev))
+	s.docMu.Unlock()
+	if ok {
+		return m, nil
+	}
+	e, err := s.doc(ctx, p, ns, name, rev)
+	if err != nil {
+		return fileMeta{}, err
+	}
+	return e.meta(), nil
+}
+
+// keep caches a document under its key, and its metadata; the value
+// counts twice its rendering.
 func (s *Server) keep(k string, e *docEntry) {
 	s.docMu.Lock()
 	s.docs.Put(k, e, 3*len(e.rendered)+256)
+	s.metas.Put(k, e.meta(), 1)
 	s.docMu.Unlock()
 }
 
 // nsInfo is what writes to a namespace need from its document: whether
-// it is sealed or end-to-end (not served for writing here), whether
-// writes add a fresh $nonce (§C.7), a catalog's trust list (§B.3), and
-// the size limits it sets (§6.6; 0 where it sets none, and the
-// deployment's apply), for messages.
+// it is sealed or end-to-end (not offered here, §H.7), whether writes add
+// a fresh $nonce (§C.7) and whether the namespace requires one, a
+// catalog's trust list (§B.3), and the size limits it sets (§6.6; 0 where
+// it sets none, and the deployment's apply), for messages.
 type nsInfo struct {
 	sealed                bool
 	frozen                bool // §8.4: it takes no writes, a DELETE neither
 	nonce                 bool
+	nonceRequired         bool
 	trust                 []string
 	patchSetSize, docSize int
+	blobSize              int
 	at                    time.Time
 }
 
@@ -107,12 +140,19 @@ type nsInfo struct {
 // document p can't read, as under a grant limited to some resources,
 // means a fresh $nonce on every write (client.NeedsNonce, §C.7).
 func (s *Server) nsInfo(ctx context.Context, p *principal, ns string) nsInfo {
+	in, _ := s.nsInfoErr(ctx, p, ns)
+	return in
+}
+
+// nsInfoErr is nsInfo, with the error of a read that failed for now (a
+// 429, a 5xx, no answer), which isn't kept.
+func (s *Server) nsInfoErr(ctx context.Context, p *principal, ns string) (nsInfo, error) {
 	now := s.opt.Now()
 	p.mu.Lock()
 	in, ok := p.ns[ns]
 	p.mu.Unlock()
 	if ok && now.Sub(in.at) < 30*time.Second {
-		return in
+		return in, nil
 	}
 	in = nsInfo{at: now}
 	h, err := p.c.NSHead(ctx, ns)
@@ -120,16 +160,20 @@ func (s *Server) nsInfo(ctx context.Context, p *principal, ns string) nsInfo {
 	if err == nil {
 		d, err = p.c.NSDoc(ctx, ns, h.ID)
 	}
+	ae, isAPI := client.AsAPIError(err)
 	switch {
 	case errors.Is(err, client.ErrNoKeys):
-		in.sealed, in.nonce = true, true
+		in.sealed, in.nonce, in.nonceRequired = true, true, true
+	case err != nil && (!isAPI || ae.Status == 429 || ae.Status >= 500):
+		return nsInfo{nonce: true}, err
 	case err != nil:
 		in.nonce = true
 	default:
 		enc, _ := d.Value["encryption"].(map[string]any)
 		lv, _ := enc["level"].(string)
 		in.sealed = lv == "sealed" || lv == "e2e"
-		in.nonce = d.Value["nonce"] == "required"
+		in.nonceRequired = d.Value["nonce"] == "required" || lv == "sealed"
+		in.nonce = in.nonceRequired
 		in.frozen = d.Value["frozen"] == true
 		lim, _ := d.Value["limits"].(map[string]any)
 		if n, ok := lim["patchSetSize"].(float64); ok {
@@ -137,6 +181,9 @@ func (s *Server) nsInfo(ctx context.Context, p *principal, ns string) nsInfo {
 		}
 		if n, ok := lim["documentSize"].(float64); ok {
 			in.docSize = int(n)
+		}
+		if n, ok := lim["blobSize"].(float64); ok {
+			in.blobSize = int(n)
 		}
 		cat, _ := d.Value["catalog"].(map[string]any)
 		ts, _ := cat["trust"].([]any)
@@ -149,23 +196,42 @@ func (s *Server) nsInfo(ctx context.Context, p *principal, ns string) nsInfo {
 	p.mu.Lock()
 	p.ns[ns] = in
 	p.mu.Unlock()
-	return in
+	return in, nil
 }
 
-// headDoc is a live resource's head and its document.
+// headDoc is a live resource's head, the time it was written where a
+// listing says (§7.4 created), its file's metadata, and, once read, its
+// document.
 type headDoc struct {
 	ns, name, rev string
+	created       time.Time
+	m             fileMeta
 	e             *docEntry
 }
 
-// fetchHeads reads the documents of live heads, FetchConcurrency at a
-// time; heads whose rev is "" are read first (head). Resources that turn
-// out not to be live, or that p may not read (a placement's item in a
-// namespace its grant doesn't read, §B.3), are left out.
-func (s *Server) fetchHeads(ctx context.Context, p *principal, items []headDoc, head func(context.Context, string, string) (*client.Head, error)) ([]headDoc, error) {
+// entry returns hd's document, read if it wasn't.
+func (st *reqState) entry(ctx context.Context, hd *headDoc) (*docEntry, error) {
+	if hd.e != nil {
+		return hd.e, nil
+	}
+	e, err := st.s.doc(ctx, st.p, hd.ns, hd.name, hd.rev)
+	if err != nil {
+		return nil, err
+	}
+	hd.e = e
+	return e, nil
+}
+
+// fetchHeads reads the file metadata of live heads, and with docs their
+// documents, FetchConcurrency at a time; heads whose rev is "" are read
+// first (head). Resources that turn out not to be live, or that p may not
+// read (a placement's item in a namespace its grant doesn't read, §B.3),
+// are left out.
+func (s *Server) fetchHeads(ctx context.Context, p *principal, items []headDoc, head func(context.Context, string, string) (*client.Head, error), docs bool) ([]headDoc, error) {
 	g, gctx := errgroup.WithContext(ctx)
 	g.SetLimit(s.opt.FetchConcurrency)
 	out := make([]headDoc, len(items))
+	got := make([]bool, len(items))
 	for i, it := range items {
 		g.Go(func() error {
 			if it.rev == "" {
@@ -181,15 +247,21 @@ func (s *Server) fetchHeads(ctx context.Context, p *principal, items []headDoc, 
 				}
 				it.rev = h.ID
 			}
-			e, err := s.doc(gctx, p, it.ns, it.name, it.rev)
+			var err error
+			if docs {
+				if it.e, err = s.doc(gctx, p, it.ns, it.name, it.rev); err == nil {
+					it.m = it.e.meta()
+				}
+			} else {
+				it.m, err = s.meta(gctx, p, it.ns, it.name, it.rev)
+			}
 			if hidden(err) {
 				return nil
 			}
 			if err != nil {
 				return err
 			}
-			it.e = e
-			out[i] = it
+			out[i], got[i] = it, true
 			return nil
 		})
 	}
@@ -197,8 +269,8 @@ func (s *Server) fetchHeads(ctx context.Context, p *principal, items []headDoc, 
 		return nil, err
 	}
 	live := out[:0]
-	for _, it := range out {
-		if it.e != nil {
+	for i, it := range out {
+		if got[i] {
 			live = append(live, it)
 		}
 	}
@@ -212,7 +284,8 @@ func hidden(err error) bool {
 	return ok && (ae.Status == 403 || ae.Status == 404 || ae.Status == 410)
 }
 
-// liveHeads lists ns's live resources with p's grant (§7.4 /heads).
+// liveHeads lists ns's live resources with p's grant (§7.4 /heads), with
+// the time each head was written where the listing says.
 func (s *Server) liveHeads(ctx context.Context, p *principal, ns string) ([]headDoc, error) {
 	h, err := p.c.NSHead(ctx, ns)
 	if err != nil {
@@ -225,7 +298,9 @@ func (s *Server) liveHeads(ctx context.Context, p *principal, ns string) ([]head
 	out := make([]headDoc, 0, len(items))
 	for _, it := range items {
 		if it.Kind == "head" {
-			out = append(out, headDoc{ns: ns, name: it.Resource, rev: it.Target})
+			hd := headDoc{ns: ns, name: it.Resource, rev: it.Target}
+			hd.created, _ = time.Parse(time.RFC3339Nano, it.Created)
+			out = append(out, hd)
 		}
 	}
 	return out, nil

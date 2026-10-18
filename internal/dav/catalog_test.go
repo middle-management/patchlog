@@ -226,8 +226,8 @@ func TestCatalogPlacementWrites(t *testing.T) {
 	}
 	e.expect(e.do("PUT", "/cat/root/season/cat.empty.json", `{"parents": [], "x": 1}`), 403, "PUT through a placement of a catalog node")
 	sameJSON(t, e.parentsOf("empty"), parents("cat", "root"))
-	e.expect(e.do("PUT", "/matches/.tmp", `{"planted": true}`), 201, "temporary file")
-	e.expect(e.do("MOVE", "/matches/.tmp", "", "Destination", "/cat/root/season/secret.moved.json"), 403, "MOVE onto an untrusted placement")
+	e.expect(e.do("PUT", "/matches/.goutputstream-tmp", `{"planted": true}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/matches/.goutputstream-tmp", "", "Destination", "/cat/root/season/secret.moved.json"), 403, "MOVE onto an untrusted placement")
 
 	// A frozen catalog refuses the placement: the item isn't written.
 	e.create("matches", "final", map[string]any{"title": "Final", "score": "2-1"})
@@ -270,15 +270,21 @@ func counted(t *testing.T) (*env, func() int64) {
 	return e, func() int64 { return n.Swap(0) }
 }
 
-// What a listing costs upstream: the root's names nothing, a folder's
-// entries their own items only (not a subfolder's), a catalog's tree and
-// its items' heads once per CatalogTTL, a file's properties one head.
+// What a listing costs upstream: the root's each namespace's document
+// once every 30 seconds (sealed and end-to-end ones aren't offered,
+// §H.7), a folder's entries their own items only (not a subfolder's), a
+// catalog's tree and its items' heads once per CatalogTTL, a file's
+// properties two heads (its name could be a raw file's, §H.2).
 func TestCatalogRequests(t *testing.T) {
 	t.Parallel()
 	e, reqs := counted(t)
 	sameStrings(t, "root", names(e.propfind("/"), "/"), []string{"cat/", "matches/"})
-	if n := reqs(); n != 0 {
+	if n := reqs(); n != 4 {
 		t.Fatalf("PROPFIND / made %d requests", n)
+	}
+	e.propfind("/")
+	if n := reqs(); n != 0 {
+		t.Fatalf("PROPFIND / again made %d requests", n)
 	}
 	sameStrings(t, "cat/root", names(e.propfind("/cat/root/"), "/cat/root/"), []string{"season/"})
 	reqs()

@@ -312,13 +312,19 @@ func (st *reqState) served() {
 	}
 }
 
-// modTime is a document's Last-Modified: its creation time where known,
+// modTime is a file's time (§H.3): when its head was written, as the
+// listing says (created) or its read did (modified, Last-Modified, §7.1),
 // else when the principal was first shown it, later than any revision it
-// saw before, so editors notice a change. The latter starts over when the
+// saw before, so editors notice a change. Cores send times outside sealed
+// and end-to-end namespaces, which aren't offered here (§H.7), so first
+// sights are kept only in memory, for older cores, and start over when the
 // server does.
-func (s *Server) modTime(p *principal, k string, e *docEntry) time.Time {
-	if !e.created.IsZero() {
-		return e.created
+func (s *Server) modTime(p *principal, k string, created, modified time.Time) time.Time {
+	switch {
+	case !created.IsZero():
+		return created
+	case !modified.IsZero():
+		return modified
 	}
 	key := p.id + "\x00" + k
 	s.recMu.Lock()

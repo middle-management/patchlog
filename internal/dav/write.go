@@ -17,13 +17,13 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// parseBody parses a written file as I-JSON (§3.1), a UTF-8 byte order
-// mark aside: anything else is 400 and nothing is written.
+// parseBody parses a written JSON file as I-JSON (§3.1), a UTF-8 byte
+// order mark aside: anything else is 400 and nothing is written (§H.1).
 func parseBody(body []byte) (any, error) {
 	body = trimBOM(body)
 	v, err := jsonv.Parse(body)
 	if err != nil {
-		return nil, fail(http.StatusBadRequest, "not a JSON document (I-JSON, §3.1): %v", err)
+		return nil, fail(http.StatusBadRequest, "not a JSON document (I-JSON, §3.1), as a JSON file's content must be (§H.1): %v; nothing was written", err)
 	}
 	return v, nil
 }
@@ -35,8 +35,8 @@ func trimBOM(b []byte) []byte {
 	return b
 }
 
-// dropNonce is doc without its top-level $nonce: a fresh one is the
-// writer's to add (§C.7), so it is never part of a user's edit.
+// dropNonce is doc without its top-level $nonce, which a create where
+// nonces apply replaces with a fresh one (§C.7).
 func dropNonce(doc any) any {
 	m, ok := doc.(map[string]any)
 	if _, has := m["$nonce"]; !ok || !has {
@@ -52,26 +52,57 @@ func dropNonce(doc any) any {
 }
 
 // withNonce adds a fresh $nonce at the end of patches where ns needs one
-// (§C.7).
-func withNonce(in nsInfo, patches []any) []any {
-	if !in.nonce {
+// (§C.7), to doc, the document they result in, if its root is an object
+// that can carry one (nil: unknown, taken as one).
+func withNonce(in nsInfo, doc any, patches []any) []any {
+	if _, obj := doc.(map[string]any); !in.nonce || doc != nil && !obj {
 		return patches
 	}
 	return append(patches, map[string]any{"op": "add", "path": seal.NoncePath, "value": seal.NewNonce()})
 }
 
-// commitDoc writes v, uploaded as body, as the document of ns/name. It
-// returns the revision holding it, and whether that revision's document
-// is exactly v (else the upload was merged or given a $nonce, and the
+// rootRefused refuses JSON file v of namespace ns where nonces are
+// required (§C.7): its root must be an object, which carries $nonce
+// (§H.1).
+func rootRefused(in nsInfo, ns string, v any) error {
+	if _, obj := v.(map[string]any); obj || !in.nonceRequired {
+		return nil
+	}
+	return fail(http.StatusUnprocessableEntity, "namespace %s requires a fresh $nonce in every write (§C.7), which a JSON file carries at its root, so its root must be an object, not %s (§H.1); nothing was written", ns, jsonKind(v))
+}
+
+// jsonKind names a JSON value's kind, for messages.
+func jsonKind(v any) string {
+	switch v.(type) {
+	case []any:
+		return "an array"
+	case string:
+		return "a string"
+	case float64:
+		return "a number"
+	case bool:
+		return "a boolean"
+	case nil:
+		return "null"
+	}
+	return "an object"
+}
+
+// commitDoc writes v, uploaded as body, as JSON file ns/name (§H.1). It
+// returns the revision holding it, and whether that revision's rendering
+// is exactly v (else the upload was merged with others' edits, and the
 // revision is no validator of it). A new name is created (If-None-Match:
 // *); a tombstoned one restored (one name keeps one chain, §8.2); a live
 // one edited: the edit from its base (base) to v, rebased on the head and
-// appended with If-Match (§11 submit). pre: the document is the PUT's
+// appended with If-Match (§11.3, §H.4). pre: the document is the PUT's
 // file, whose preconditions hold for it.
 func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body []byte, pre bool) (string, bool, error) {
 	in := st.s.nsInfo(ctx, st.p, ns)
 	if in.sealed {
-		return "", false, fail(http.StatusNotImplemented, "%s is sealed or end-to-end (Addendum E); it isn't written over WebDAV", ns)
+		return "", false, notOffered(ns)
+	}
+	if err := rootRefused(in, ns, v); err != nil {
+		return "", false, err
 	}
 	var rev string
 	var exact bool
@@ -103,7 +134,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			if in.nonce {
 				doc = dropNonce(v)
 			}
-			ps = withNonce(in, client.GenesisPatches(doc))
+			ps = withNonce(in, doc, client.GenesisPatches(doc))
 			res, err = st.p.c.Create(ctx, ns, name, ps)
 			err = tooLarge(err, in, parent, ps, true)
 		} else if parent, ps, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
@@ -116,7 +147,7 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 		if err != nil {
 			return false, err
 		}
-		rev, exact = res.ID, st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, v, body)
+		rev, exact = res.ID, st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, v, body, rendersAs(v))
 		st.made = rev
 		return false, nil
 	})
@@ -131,14 +162,15 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 // keeps others' edits. Without one, the last live document is the base,
 // so the file as written wins, as over a live one: either way the patch
 // set is the diff from the last live document, not a whole new one. With
-// the last document pruned (§8.6), the root is replaced.
+// the last document pruned (§8.6), or a raw file's (another file now), the
+// root is replaced.
 func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, v any) (any, []any, error) {
 	whole := func() (any, []any, error) {
 		doc := v
 		if in.nonce {
 			doc = dropNonce(v)
 		}
-		return map[string]any{}, withNonce(in, []any{map[string]any{"op": "replace", "path": "", "value": doc}}), nil
+		return map[string]any{}, withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}), nil
 	}
 	if h.Last == "" {
 		return whole()
@@ -149,14 +181,14 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 		return whole()
 	case err != nil:
 		return nil, nil, err
-	case last.sealed:
+	case last.sealed, last.raw != nil:
 		return whole()
 	}
-	out, _, err := st.rebased(ctx, ns, name, v, last.value)
+	out, _, err := st.rebased(ctx, ns, name, v, last.value, bare)
 	if err != nil {
 		return nil, nil, err
 	}
-	return last.value, withNonce(in, merge.Diff(dropNonce(last.value), out)), nil
+	return last.value, withNonce(in, out, merge.Diff(bare(last.value), out)), nil
 }
 
 // edit appends the principal's edit of ns/name on head: the edit from its
@@ -166,29 +198,31 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 // overwrite. retry: the head moved (412), read it again.
 func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, v any, body []byte) (string, bool, bool, error) {
 	cur, err := st.s.doc(ctx, st.p, ns, name, head)
+	switch {
+	case err != nil:
+		return "", false, false, err
+	case cur.sealed:
+		return "", false, false, notOffered(ns)
+	case cur.raw != nil:
+		return "", false, false, fail(http.StatusConflict, "%s/%s is a raw file, shown as %s: a JSON file can't take its name (§H.2)", ns, name, name)
+	}
+	out, _, err := st.rebased(ctx, ns, name, v, cur.value, bare)
 	if err != nil {
 		return "", false, false, err
 	}
-	if cur.sealed {
-		return "", false, false, fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E); it isn't written over WebDAV", ns, name)
-	}
-	out, _, err := st.rebased(ctx, ns, name, v, cur.value)
-	if err != nil {
-		return "", false, false, err
-	}
-	ps := merge.Diff(dropNonce(cur.value), out)
+	ps := merge.Diff(bare(cur.value), out)
 	if len(ps) == 0 {
 		// It already reads so: nothing is written, so it is no write of
 		// the principal's (an undo would take it for one), but the
 		// principal has the head now, as written if exactly so.
-		exact := jsonv.Equal(cur.value, v)
+		exact := rendersAs(v)(cur.value)
 		if exact {
 			st.s.remember(st.p, ns, name, record{rev: head, raw: keepRaw(body, cur.rendered)}, false)
 		}
 		return head, exact, false, nil
 	}
-	paths := writesOf(dropNonce(cur.value), ps)
-	ps = withNonce(in, ps)
+	paths := writesOf(bare(cur.value), ps)
+	ps = withNonce(in, out, ps)
 	res, err := st.p.c.Append(ctx, ns, name, head, ps)
 	err = tooLarge(err, in, cur.value, ps, false)
 	switch {
@@ -202,7 +236,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	case err != nil:
 		return "", false, false, err
 	}
-	return res.ID, st.wrote(ns, name, cur.value, ps, paths, res, v, body), false, nil
+	return res.ID, st.wrote(ns, name, cur.value, ps, paths, res, v, body, rendersAs(v)), false, nil
 }
 
 func conflict(ns, name string, clash []string) error {
@@ -304,9 +338,12 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 	return cs, false, nil
 }
 
-// rebased returns v, a save of ns/name, rebased on head (§11 submit), and
+// rebased returns v, a save of ns/name, rebased on head (§11.3, §H.4), and
 // whether a base of the principal's was known (else the head is the
-// base, and the file as written wins).
+// base, and the file as written wins). view is what of a document a save
+// compares and writes: bare, a JSON file's rendering, whose $successor
+// therefore stays; refOf, a raw file's reference. v, head and the result
+// are as view shows them.
 //
 // The base is the candidate (candidates) closest to v, the one its edit
 // changes the fewest paths of: an editor's buffer is the version it
@@ -322,28 +359,30 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 // really had, no edit someone else made since is undone or overwritten
 // unseen. A save that can't be rebased so is a 409, which asks for a
 // reload (refuse); so is one whose records were lost.
-func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any) (any, bool, error) {
+func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any, view func(any) any) (any, bool, error) {
 	cs, lost, err := st.candidates(ctx, ns, name)
 	if err != nil {
 		return nil, false, err
 	}
-	mine := dropNonce(v)
+	for i := range cs {
+		cs[i].doc = view(cs[i].doc)
+	}
+	mine, head := view(v), view(head)
 	if lost {
-		if jsonv.Equal(mine, dropNonce(head)) {
-			return dropNonce(head), true, nil
+		if jsonv.Equal(mine, head) {
+			return head, true, nil
 		}
 		st.s.refuse(st.p, ns, name)
 		return nil, false, fail(http.StatusConflict, "%s/%s: this server no longer has the version you edited, so it can't tell your changes from others'; reload it and edit again", ns, name)
 	}
 	if len(cs) == 0 {
-		out, _ := rebase(head, v, head)
+		out, _ := rebase(head, mine, head)
 		return out, false, nil
 	}
 	dist := make([]int, len(cs))
 	least := -1
 	for i, c := range cs {
-		b := dropNonce(c.doc)
-		if dist[i] = len(writesOf(b, merge.Diff(b, mine))); least < 0 || dist[i] < least {
+		if dist[i] = len(writesOf(c.doc, merge.Diff(c.doc, mine))); least < 0 || dist[i] < least {
 			least = dist[i]
 		}
 	}
@@ -363,7 +402,7 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any) (
 	}
 	var why []string
 	for _, i := range tied {
-		out, clash := rebase(cs[i].doc, v, head)
+		out, clash := rebase(cs[i].doc, mine, head)
 		if len(clash) == 0 {
 			if clash = unsafe(out, head, cs); len(clash) == 0 {
 				return out, true, nil
@@ -378,13 +417,13 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v, head any) (
 }
 
 // undoes reports whether mine reverts write w of the principal's: what
-// differs from it is only what w changed.
+// differs from it is only what w changed. Documents are as rebased's view
+// shows them.
 func undoes(w candidate, mine any) bool {
 	if !w.wrote || len(w.paths) == 0 {
 		return false
 	}
-	b := dropNonce(w.doc)
-	for _, o := range writesOf(b, merge.Diff(b, mine)) {
+	for _, o := range writesOf(w.doc, merge.Diff(w.doc, mine)) {
 		in := false
 		for _, p := range w.paths {
 			if o.HasPrefix(p) {
@@ -406,11 +445,10 @@ func undoes(w candidate, mine any) bool {
 // wrote since (a later write of its own there, which head still holds) is
 // its own to change again.
 func unsafe(out, head any, cs []candidate) []string {
-	head, out = dropNonce(head), dropNonce(out)
 	var bad []string
 	for _, q := range writesOf(head, merge.Diff(head, out)) {
 		for _, c := range cs {
-			if !agree(dropNonce(c.doc), head, q) && !ownSince(c, q, head, cs) {
+			if !agree(c.doc, head, q) && !ownSince(c, q, head, cs) {
 				p := q.String()
 				if p == "" {
 					p = "(the whole document)"
@@ -427,7 +465,7 @@ func unsafe(out, head any, cs []candidate) []string {
 // holds what it wrote.
 func ownSince(c candidate, q pointer.Pointer, head any, cs []candidate) bool {
 	for _, w := range cs {
-		if !w.wrote || w.seq <= c.seq || !agree(dropNonce(w.doc), head, q) {
+		if !w.wrote || w.seq <= c.seq || !agree(w.doc, head, q) {
 			continue
 		}
 		for _, p := range w.paths {
@@ -439,16 +477,16 @@ func ownSince(c candidate, q pointer.Pointer, head any, cs []candidate) bool {
 	return false
 }
 
-// rebase applies the edit from base to mine onto head (§11 submit): the
-// result is head with mine's value at each path the edit writes, as
-// writes count (§6.4.1) but whole arrays for anything in one (§F.3's
-// array rule, from the outermost array: elements have no identity, so an
-// index one side names is another element after the other's insert or
-// delete). Where those writes overlap others' since base (head's), mine
-// must agree with head there, a change both made, or a version reloaded
-// since; otherwise the clashing paths are returned and nothing is.
+// rebase applies the edit from base to mine onto head (§11.3): the result
+// is head with mine's value at each path the edit writes, as writes count
+// (§6.4.1) but whole arrays for anything in one (§F.3's array rule, from
+// the outermost array: elements have no identity, so an index one side
+// names is another element after the other's insert or delete). Where
+// those writes overlap others' since base (head's), mine must agree with
+// head there, a change both made, or a version reloaded since; otherwise
+// the clashing paths are returned and nothing is. Documents are as
+// rebased's view shows them.
 func rebase(base, mine, head any) (any, []string) {
-	base, mine, head = dropNonce(base), dropNonce(mine), dropNonce(head)
 	ours := writesOf(base, merge.Diff(base, mine))
 	if len(ours) == 0 {
 		return head, nil
@@ -553,12 +591,12 @@ func graft(doc, src any, p pointer.Pointer) (any, bool) {
 }
 
 // wrote records a write of v, uploaded as body, as revision res.ID, which
-// changed paths, and reports whether that revision's document is exactly
-// v. The revision's document, the patches applied to parent as the core
-// applies them, is cached with its creation time from the log entry. A
-// create or restore replaces the whole document, so its parent is any
-// object.
-func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer.Pointer, res *client.WriteResult, v any, body []byte) bool {
+// changed paths, and reports whether that revision holds exactly what was
+// uploaded: whether same says so of its document. The revision's
+// document, the patches applied to parent as the core applies them, is
+// cached with its creation time from the log entry. A create or restore
+// replaces the whole document, so its parent is any object.
+func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer.Pointer, res *client.WriteResult, v any, body []byte, same func(doc any) bool) bool {
 	var doc any
 	if ops, err := patch.Parse(ps); err == nil {
 		doc, _, err = patch.Apply(parent, true, ops, patch.Options{})
@@ -567,14 +605,15 @@ func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer
 		}
 	}
 	st.committed = true
-	exact := doc != nil && jsonv.Equal(doc, v)
+	exact := doc != nil && same(doc)
 	r := record{rev: res.ID, wrote: true, paths: paths}
 	var e *docEntry
 	if doc != nil {
-		e = &docEntry{value: doc, rendered: render(doc)}
+		var created time.Time
 		if res.Entry != nil {
-			e.created, _ = time.Parse(time.RFC3339Nano, res.Entry.Created)
+			created, _ = time.Parse(time.RFC3339Nano, res.Entry.Created)
 		}
+		e = newEntry(doc, created)
 		st.s.keep(docKey(ns, name, res.ID), e)
 	}
 	if exact {
@@ -584,6 +623,13 @@ func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer
 	}
 	st.s.remember(st.p, ns, name, r, false)
 	return exact
+}
+
+// rendersAs reports, of a document, whether its rendering is v, a JSON
+// file as uploaded (§H.1 "Identity"): what the uploader holds is that
+// revision's, whatever its formatting, and whatever $nonce it got.
+func rendersAs(v any) func(doc any) bool {
+	return func(doc any) bool { return jsonv.Equal(bare(doc), v) }
 }
 
 // retrying runs a write attempt again while it asks to (the head moved:
@@ -662,7 +708,7 @@ func tooLarge(err error, in nsInfo, parent any, ps []any, create bool) error {
 // with If-Match on tomb), after the write meant to restore it failed with
 // err, which it returns, saying so.
 func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb string, err error) error {
-	if _, rerr := st.p.c.Restore(ctx, ns, name, tomb, withNonce(in, []any{})); rerr != nil {
+	if _, rerr := st.p.c.Restore(ctx, ns, name, tomb, withNonce(in, nil, []any{})); rerr != nil {
 		st.s.opt.Logf("dav: %s/%s: restoring it as it was after a refused save: %v", ns, name, rerr)
 		return err
 	}
@@ -695,6 +741,9 @@ func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) erro
 	}
 	type res struct{ ns, name string }
 	todo := []res{{t.docNS, t.docName}}
+	if t.rawName != "" {
+		todo = append(todo, res{t.docNS, t.rawName})
+	}
 	if t.kind == kNewPlacement {
 		todo = append(todo, res{t.ns, t.node})
 	}
@@ -718,7 +767,7 @@ func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) erro
 // from them (restorePatches), or as it was if that write is refused.
 func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) error {
 	if st.s.nsInfo(ctx, st.p, ns).sealed {
-		return fail(http.StatusNotImplemented, "%s is sealed or end-to-end (Addendum E); it isn't written over WebDAV", ns)
+		return notOffered(ns)
 	}
 	err := st.retrying(ctx, func() (bool, error) {
 		h, err := st.p.c.Head(ctx, ns, name)

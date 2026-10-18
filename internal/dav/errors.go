@@ -60,7 +60,7 @@ func upstream(err error) error {
 		}
 	}
 	if errors.Is(err, client.ErrNoKeys) {
-		return fail(http.StatusNotImplemented, "the content is sealed (Addendum E); sealed and end-to-end namespaces aren't served over WebDAV")
+		return fail(http.StatusNotFound, "the content is sealed (Addendum E), and this server holds no keys, so it doesn't offer it (§H.7)")
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return &davError{status: http.StatusServiceUnavailable, msg: "the request was canceled or timed out", cause: err}

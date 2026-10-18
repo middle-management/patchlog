@@ -21,10 +21,11 @@ import (
 // moving one onto a document name is how editors save.
 
 type scratchFile struct {
-	data []byte
-	dir  bool
-	mod  time.Time // last written
-	used time.Time // last touched
+	data  []byte
+	ctype string // the upload's Content-Type, for the file it is moved onto (fileType)
+	dir   bool
+	mod   time.Time // last written
+	used  time.Time // last touched
 }
 
 // junk reports the files macOS and Windows write beside others
@@ -80,11 +81,11 @@ func (st *reqState) touchLocked(name string, now time.Time) {
 	}
 }
 
-// scratchPut stores data at name, within the bounds of the principal's
-// grant root and the server's (507 beyond them, 413 for one file over
-// MaxFileSize).
-func (st *reqState) scratchPut(name string, data []byte) error {
-	return st.scratchSet(name, &scratchFile{data: data})
+// scratchPut stores data, uploaded as ctype, at name, within the bounds of
+// the principal's grant root and the server's (507 beyond them, 413 for
+// one file over MaxFileSize).
+func (st *reqState) scratchPut(name string, data []byte, ctype string) error {
+	return st.scratchSet(name, &scratchFile{data: data, ctype: ctype})
 }
 
 // scratchMkdir makes a scratch directory at name.

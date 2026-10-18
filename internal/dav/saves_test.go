@@ -190,8 +190,8 @@ func TestSavePreconditions(t *testing.T) {
 	_, doc := e.load("docs", "notes")
 	sameJSON(t, doc, map[string]any{"by": "alice", "text": "alice's notes"})
 	e.expect(e.do("PUT", "/docs/fresh.json", `{"by": "bob"}`, "If-None-Match", "*"), 201, "create-only of a new name")
-	e.expect(e.do("PUT", "/docs/.tmp", "x", "If-None-Match", "*"), 201, "create-only scratch")
-	e.expect(e.do("PUT", "/docs/.tmp", "y", "If-None-Match", "*"), 412, "create-only over a scratch file")
+	e.expect(e.do("PUT", "/docs/x.swp", "x", "If-None-Match", "*"), 201, "create-only scratch")
+	e.expect(e.do("PUT", "/docs/x.swp", "y", "If-None-Match", "*"), 412, "create-only over a scratch file")
 	e.expect(e.do("PUT", "/docs/absent.json", `{}`, "If-Match", "*"), 412, "edit-only of a new name")
 	if h, _ := e.load("docs", "absent"); h.State != client.NotFound {
 		t.Fatal("an edit-only PUT created")
@@ -207,9 +207,9 @@ func TestSaveDeleteThenWrite(t *testing.T) {
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/b", "theirs"))
-	e.expect(e.do("PUT", "/docs/.x.json.tmp", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT temporary file")
+	e.expect(e.do("PUT", "/docs/.goutputstream-x", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT temporary file")
 	e.expect(e.do("DELETE", "/docs/x.json", ""), 204, "DELETE original")
-	e.expect(e.do("MOVE", "/docs/.x.json.tmp", "", "Destination", "/docs/x.json"), 201, "MOVE onto it")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-x", "", "Destination", "/docs/x.json"), 201, "MOVE onto it")
 	_, doc := e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 	en := e.lastEntry("docs", "x")
@@ -529,9 +529,9 @@ func TestSaveDeleteThenWriteRefused(t *testing.T) {
 	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
 	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET").body
 	e.theirs("docs", "x", replace("/a", "theirs"))
-	e.expect(e.do("PUT", "/docs/.x.json.tmp", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT temporary file")
+	e.expect(e.do("PUT", "/docs/.goutputstream-x", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT temporary file")
 	e.expect(e.do("DELETE", "/docs/x.json", ""), 204, "DELETE original")
-	r := e.expect(e.do("MOVE", "/docs/.x.json.tmp", "", "Destination", "/docs/x.json"), 409, "MOVE onto it")
+	r := e.expect(e.do("MOVE", "/docs/.goutputstream-x", "", "Destination", "/docs/x.json"), 409, "MOVE onto it")
 	if !strings.Contains(r.body, "restored") {
 		t.Fatalf("409 %q", r.body)
 	}
@@ -630,8 +630,8 @@ func TestSaveDeleteThenWriteFails(t *testing.T) {
 	}{
 		{"PUT of a body that isn't JSON", 400, func(p string) resp { return e.do("PUT", p, `{"v": 2`) }},
 		{"MOVE of a scratch file that isn't JSON", 400, func(p string) resp {
-			e.expect(e.do("PUT", "/docs/sedXYZ", `{"v": 2`), 201, "PUT scratch")
-			return e.do("MOVE", "/docs/sedXYZ", "", "Destination", p, "Overwrite", "F")
+			e.expect(e.do("PUT", "/docs/.goutputstream-XYZ", `{"v": 2`), 201, "PUT scratch")
+			return e.do("MOVE", "/docs/.goutputstream-XYZ", "", "Destination", p, "Overwrite", "F")
 		}},
 		{"PUT over -max-file-size", 413, func(p string) resp { return e.do("PUT", p, `{"v": "`+strings.Repeat("x", 2000)+`"}`) }},
 		{"PUT with If-Match: *", 412, func(p string) resp { return e.do("PUT", p, `{"v": 2}`, "If-Match", "*") }},

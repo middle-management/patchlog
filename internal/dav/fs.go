@@ -20,6 +20,7 @@ import (
 	"golang.org/x/net/webdav"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
 // errNotExist is what the WebDAV handler takes as "no such file".
@@ -33,13 +34,14 @@ const (
 	kRoot                     // /
 	kNSDir                    // a flat namespace
 	kCatDir                   // a catalog's root (Addendum B)
-	kDoc                      // a flat namespace's {name}.json
+	kDoc                      // a flat namespace's JSON file, {name}.json (§H.2 "Flat view")
+	kRaw                      // a flat namespace's raw file, named by its resource name
 	kFolder                   // a catalog folder under the folder it names
 	kPlacement                // a catalog placement {ns}.{name}.json under the folder it names
 	kNewFolder                // a folder name that isn't under that folder (MKCOL)
 	kNewPlacement             // a placement file name that isn't under that folder (PUT)
-	kScratch                  // any other name in a directory: a scratch file or directory
-	kBadName                  // a .json name a person gave that names no document: refused
+	kScratch                  // a scratch file or directory (§H.6)
+	kBadName                  // a name no file can have there: refused
 )
 
 // target is a resolved path.
@@ -47,9 +49,10 @@ type target struct {
 	kind            kind
 	path, dir, base string
 	ns              string // the namespace or catalog it is in
-	// docNS and docName are the content document of a kDoc, kPlacement
-	// or kNewPlacement.
-	docNS, docName string
+	// docNS and docName are the content document of a kDoc, kRaw,
+	// kPlacement or kNewPlacement, live or not; rawName is the raw document
+	// a new kDoc's file is instead when its content isn't JSON (§H.1).
+	docNS, docName, rawName string
 	// node is the catalog node of a kFolder, kPlacement, kNewFolder or
 	// kNewPlacement, and parent the folder its path puts it in ("" for
 	// the catalog's root).
@@ -63,13 +66,7 @@ func (t target) isDir() bool {
 
 // isDoc: the path names a document's file (which may not be live).
 func (t target) isDoc() bool {
-	return t.kind == kDoc || t.kind == kPlacement || t.kind == kNewPlacement
-}
-
-// resourceOf is the resource name of a document file name {name}.json.
-func resourceOf(file string) (string, bool) {
-	name, ok := strings.CutSuffix(file, ".json")
-	return name, ok && client.ValidResourceName(name)
+	return t.kind == kDoc || t.kind == kRaw || t.kind == kPlacement || t.kind == kNewPlacement
 }
 
 // resolve says what name names for the request's principal, noting the
@@ -81,7 +78,7 @@ func (st *reqState) resolve(ctx context.Context, name string) (target, error) {
 	if st.method == "PUT" && st.saveTo == "" && slashClean(name) == st.path {
 		switch {
 		case err == nil && t.isDoc():
-			st.saveTo, st.saveDoc = t.path, t.kind == kDoc
+			st.saveTo, st.saveDoc = t.path, t.kind == kDoc || t.kind == kRaw
 		case err != nil && st.placementPath(st.path):
 			st.saveTo = st.path
 		}
@@ -98,6 +95,14 @@ func (st *reqState) resolveName(ctx context.Context, name string) (target, error
 	}
 	segs := strings.Split(name[1:], "/")
 	t.ns = segs[0]
+	if st.s.flat[t.ns] || st.s.cats[t.ns] {
+		if ok, err := st.offered(ctx, t.ns); err != nil || !ok {
+			if err == nil {
+				err = notOffered(t.ns)
+			}
+			return t, err
+		}
+	}
 	if len(segs) > 1 && st.isScratchDir(t.dir) {
 		// In a scratch directory, every name is scratch: a macOS app's
 		// safe save writes {name}.json there before moving it out. In a
@@ -113,14 +118,7 @@ func (st *reqState) resolveName(ctx context.Context, name string) (target, error
 	case len(segs) == 1:
 		t = st.scratchAt(t, true, nil)
 	case st.s.flat[t.ns] && len(segs) == 2:
-		if res, ok := resourceOf(segs[1]); ok {
-			t.kind, t.docNS, t.docName = kDoc, t.ns, res
-		} else {
-			t = st.scratchAt(t, true, func(orig string) bool {
-				h, err := st.head(ctx, t.ns, orig)
-				return err == nil && h.State == client.Live
-			})
-		}
+		return st.resolveFlat(ctx, t)
 	case st.s.cats[t.ns]:
 		return st.resolveCatalog(ctx, t, segs[1:])
 	default:
@@ -129,20 +127,111 @@ func (st *reqState) resolveName(ctx context.Context, name string) (target, error
 	return t, nil
 }
 
-// scratchAt makes t a scratch path; named, a name a person may have given
-// it: a .json name (any case) that doesn't start with a dot is refused,
-// since it would be kept only in memory and vanish (a Save As
-// "Report.json"), but for the name a file manager gives a copy of a
-// document beside it (Finder's Duplicate "x copy.json"), which the rename
-// that follows commits: beside reports whether the document a copy's
-// name names is in t's directory. Editors' and the system's own files
-// start with a dot or end otherwise (.x.json.swp, ._x.json, x.json~,
-// 4913).
+// resolveFlat resolves t, a name in flat namespace t.ns's directory (§H.2
+// "Flat view"): a live raw document by its resource name, another live
+// one as {name}.json, or as {name} (2).json where a raw one has that name;
+// else a scratch name (§H.6), a new file a resource name can make (raw,
+// or JSON for a {name}.json of JSON content: commitRev), a scratch file
+// kept there (a copy a file manager made beside a file), or a name no
+// file can have here.
+func (st *reqState) resolveFlat(ctx context.Context, t target) (target, error) {
+	hd, kind, ok, err := st.flatOwner(ctx, t.ns, t.dir, t.base)
+	switch {
+	case err != nil:
+		return t, err
+	case ok:
+		t.kind, t.docNS, t.docName = kind, t.ns, hd.name
+		return t, nil
+	case scratchName(t.base):
+		return st.scratchAt(t, false, nil), nil
+	}
+	t.docNS = t.ns
+	if stem, ok := strings.CutSuffix(t.base, ".json"); ok && client.ValidResourceName(stem) {
+		t.kind, t.docName = kDoc, stem
+		if client.ValidResourceName(t.base) {
+			t.rawName = t.base
+		}
+		return t, nil
+	}
+	if client.ValidResourceName(t.base) {
+		t.kind, t.docName = kRaw, t.base
+		return t, nil
+	}
+	if _, ok := st.scratchPeek(t.path); ok {
+		return st.scratchAt(t, false, nil), nil
+	}
+	if orig, ok := copyOf(t.base); ok {
+		if _, _, live, err := st.flatOwner(ctx, t.ns, t.dir, orig); err != nil || live {
+			return st.scratchAt(t, false, nil), err
+		}
+	}
+	t.kind = kBadName
+	return t, nil
+}
+
+// flatOwner returns the live document whose file is named base in flat
+// namespace ns's directory dir, and the file's kind (kRaw or kDoc): a raw
+// document named base; else a JSON one named {stem} for {stem}.json, or for
+// {stem} (2).json where a raw {stem}.json takes {stem}.json (dupName). The
+// directory's listing answers if the request read it, else heads.
+func (st *reqState) flatOwner(ctx context.Context, ns, dir, base string) (headDoc, kind, bool, error) {
+	live := func(name string) (headDoc, bool, error) {
+		if !client.ValidResourceName(name) {
+			return headDoc{}, false, nil
+		}
+		if l := st.lists[dir]; l != nil {
+			hd, ok := l.res[name]
+			return hd, ok, nil
+		}
+		h, err := st.head(ctx, ns, name)
+		if err != nil || h.State != client.Live {
+			return headDoc{}, false, err
+		}
+		m, err := st.s.meta(ctx, st.p, ns, name, h.ID)
+		if hidden(err) || err == nil && m.sealed {
+			return headDoc{}, false, nil
+		}
+		return headDoc{ns: ns, name: name, rev: h.ID, m: m}, err == nil, err
+	}
+	if hd, ok, err := live(base); err != nil || ok && hd.m.raw != nil {
+		return hd, kRaw, ok, err
+	}
+	stem, isJSON := strings.CutSuffix(base, ".json")
+	if d, n, dup := dupOf(base); dup && n == 2 {
+		// {stem} (2).json: JSON document {stem} if a raw {stem}.json is
+		// live, which keeps the name.
+		if stem, isJSON = strings.CutSuffix(d, ".json"); !isJSON {
+			return headDoc{}, 0, false, nil
+		}
+		if r, ok, err := live(d); err != nil || !ok || r.m.raw == nil {
+			return headDoc{}, 0, false, err
+		}
+	}
+	if !isJSON {
+		return headDoc{}, 0, false, nil
+	}
+	hd, ok, err := live(stem)
+	if err != nil || !ok || hd.m.raw != nil {
+		return headDoc{}, 0, false, err
+	}
+	return hd, kDoc, true, nil
+}
+
+// scratchAt makes t a scratch path; named, at the root or in a catalog
+// folder, a name a person may have given it: a .json name (any case) that
+// doesn't start with a dot is refused, since it would be kept only in
+// memory and vanish (a Save As "Report.json"), but for the name a file
+// manager gives a copy of a file beside it (Finder's Duplicate "x
+// copy.json"), which the rename that follows commits: beside reports
+// whether the file a copy's name names is in t's directory. Editors' and
+// the system's own files start with a dot or end otherwise (.x.json.swp,
+// ._x.json, x.json~, 4913). A flat namespace's directory refuses more
+// (resolveFlat).
 func (st *reqState) scratchAt(t target, named bool, beside func(orig string) bool) target {
 	t.kind = kScratch
 	f, ok := st.scratchPeek(t.path)
 	t.sdir = ok && f.dir
-	if named && !ok && !strings.HasPrefix(t.base, ".") && strings.HasSuffix(strings.ToLower(t.base), ".json") {
+	if named && !ok && !scratchName(t.base) && !strings.HasPrefix(t.base, ".") && strings.HasSuffix(strings.ToLower(t.base), ".json") {
 		if orig, isCopy := copyOf(t.base); !isCopy || beside == nil || !beside(orig) {
 			t.kind = kBadName
 		}
@@ -150,21 +239,21 @@ func (st *reqState) scratchAt(t target, named bool, beside func(orig string) boo
 	return t
 }
 
-// copyNames are the names file managers give a copy of x.json made beside
-// it: Finder's "x copy.json", "x copy 2.json" and "x 2.json" (Keep Both);
-// Explorer's "x - Copy.json", "x - Copy (2).json", "Copy of x.json" and
-// "x (1).json"; GNOME's "x (copy).json", "x (another copy).json", "x (3rd
-// copy).json".
-var copyNames = regexp.MustCompile(`^(?:(?i:copy of )(.+)|(.+?)(?:(?i: copy)(?: \d+)?|(?i: - copy)(?: \(\d+\))?| \((?i:copy|another copy|\d+(?:st|nd|rd|th) copy)\)| \(\d+\)| \d+))\.json$`)
+// copyNames are the names file managers give a copy of x.json (or any
+// x.ext, or x) made beside it: Finder's "x copy.json", "x copy 2.json" and
+// "x 2.json" (Keep Both); Explorer's "x - Copy.json", "x - Copy (2).json",
+// "Copy of x.json" and "x (1).json"; GNOME's "x (copy).json", "x (another
+// copy).json", "x (3rd copy).json". Each holds a space, so no resource
+// name looks like one.
+var copyNames = regexp.MustCompile(`^(?:(?i:copy of )(.+)|(.+?)(?:(?i: copy)(?: \d+)?|(?i: - copy)(?: \(\d+\))?| \((?i:copy|another copy|\d+(?:st|nd|rd|th) copy)\)| \(\d+\)| \d+)(\.[^. ]*)?)$`)
 
-// copyOf returns the resource name of the document a copy's name names.
+// copyOf returns the name of the file a copy's name names.
 func copyOf(base string) (string, bool) {
 	m := copyNames.FindStringSubmatch(base)
 	if m == nil {
 		return "", false
 	}
-	orig := m[1] + m[2]
-	return orig, client.ValidResourceName(orig)
+	return m[1] + m[2] + m[3], true
 }
 
 // appDir reports a directory name apps save through (macOS's safe save
@@ -210,10 +299,32 @@ func (st *reqState) mayScratchDir(t target) error {
 
 // badName is the refusal of a kBadName.
 func (st *reqState) badName(t target) error {
-	if st.s.cats[t.ns] {
+	switch {
+	case st.s.cats[t.ns]:
 		return fail(http.StatusForbidden, "%q names no document: in a catalog folder a file is a placement, {ns}.{name}.json, and a folder a resource name without a dot (§3.6, §B.2); a file named otherwise would only be kept in memory for a while, so it is refused", t.base)
+	case st.s.flat[t.ns]:
+		return fail(http.StatusForbidden, "%q names no file and can't name one: in a namespace's directory (the flat view, §H.2) a file is named by its resource name, 1 to 128 lowercase letters, digits, \".\", \"_\" and \"-\" starting with a letter or digit (§3.6), and a JSON document by {name}.json; a file named otherwise would only be kept in memory for a while, so it is refused", t.base)
 	}
-	return fail(http.StatusForbidden, "%q names no document: a document's file is {name}.json, a resource name of lowercase letters, digits, \".\", \"_\" and \"-\" (§3.6); a file named otherwise would only be kept in memory for a while, so it is refused", t.base)
+	return fail(http.StatusForbidden, "%q names no document: the root holds the namespaces served, and their files are in them; a file named otherwise would only be kept in memory for a while, so it is refused", t.base)
+}
+
+// notOffered is the answer for sealed and end-to-end namespace ns, whose
+// content needs keys this server doesn't hold (§H.7): it isn't offered at
+// all, rather than shown as empty files that seem writable.
+func notOffered(ns string) error {
+	return fail(http.StatusNotFound, "namespace %s is sealed or end-to-end encrypted (Addendum E), and this server holds no keys, so it doesn't offer it (§H.7)", ns)
+}
+
+// offered reports whether namespace ns is offered to the principal: one
+// that isn't sealed or end-to-end (notOffered), or whose document its
+// grant can't read (it then gets what the core answers), or doesn't name.
+// A document that couldn't be read for now (a 429, a 5xx) is the error.
+func (st *reqState) offered(ctx context.Context, ns string) (bool, error) {
+	if st.p.named != nil && !st.p.named[ns] {
+		return true, nil
+	}
+	in, err := st.s.nsInfoErr(ctx, st.p, ns)
+	return !in.sealed, err
 }
 
 // fileInfo is a file or directory as the handler sees it. A document's
@@ -262,11 +373,17 @@ func (st *reqState) dirInfo(name string) *fileInfo {
 	return &fileInfo{name: name, dir: true, mode: fs.ModeDir | 0o755, mod: st.s.start}
 }
 
+// docInfo is a live document's file (§H.3): a raw file's size and type
+// are its reference's; a JSON file's size is its rendering's, or that of
+// the bytes the principal wrote, which it reads back (repr). Its time is
+// when the head was written (modTime).
 func (st *reqState) docInfo(name string, hd headDoc) *fileInfo {
-	fi := &fileInfo{name: name, size: int64(len(st.repr(hd))), rev: hd.rev, mode: 0o644, ctype: "application/json",
-		mod: st.s.modTime(st.p, docKey(hd.ns, hd.name, hd.rev), hd.e)}
-	if hd.e.sealed {
-		fi.mode = 0o444
+	fi := &fileInfo{name: name, rev: hd.rev, mode: 0o644, size: hd.m.size, ctype: "application/json",
+		mod: st.s.modTime(st.p, docKey(hd.ns, hd.name, hd.rev), hd.created, hd.m.modified)}
+	if r := hd.m.raw; r != nil {
+		fi.ctype = r.typ
+	} else if b := st.s.exactOf(st.p, hd.ns, hd.name, hd.rev); b != nil {
+		fi.size = int64(len(b))
 	}
 	return fi
 }
@@ -275,9 +392,9 @@ func scratchInfo(name string, f *scratchFile) *fileInfo {
 	if f.dir {
 		return &fileInfo{name: name, dir: true, mode: fs.ModeDir | 0o755, mod: f.mod}
 	}
-	ct := mime.TypeByExtension(path.Ext(name))
-	if ct == "" {
-		ct = "application/octet-stream"
+	ct := fileType(name, f.ctype)
+	if m := mime.TypeByExtension(path.Ext(name)); ct == "application/octet-stream" && m != "" {
+		ct = m
 	}
 	return &fileInfo{name: name, size: int64(len(f.data)), mod: f.mod, mode: 0o644, ctype: ct}
 }
@@ -287,12 +404,17 @@ type listing struct {
 	infos  []os.FileInfo
 	byName map[string]*fileInfo
 	docs   map[string]headDoc // file name -> document
+	res    map[string]headDoc // a flat namespace's: resource name -> document
 }
 
-// list reads directory t: its documents, folders and placements as the
-// core has them now (each request reads a flat namespace again; a
-// catalog's tree is kept CatalogTTL), and the principal's scratch files
-// in it.
+// list reads directory t: its files, folders and placements as the core
+// has them now (each request reads a flat namespace again; a catalog's
+// tree is kept CatalogTTL), and the principal's scratch files in it. The
+// root lists the namespaces offered (§H.7). A flat namespace lists the
+// head rows of /heads (§H.3) by the flat view's names (§H.2): a raw
+// document by its name, any other as {name}.json, and one whose name a
+// raw one has as {name} (2).json; each revision's document is read once
+// for its file's size and type (Server.metas).
 func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 	if l := st.lists[t.path]; l != nil {
 		return l, nil
@@ -304,59 +426,78 @@ func (st *reqState) list(ctx context.Context, t target) (*listing, error) {
 			l.infos = append(l.infos, fi)
 		}
 	}
-	var files []headDoc
-	var names []string
-	head := st.p.c.Head
 	switch t.kind {
 	case kRoot:
 		for _, ns := range st.s.namespaces() {
-			add(st.dirInfo(ns))
+			// One whose document couldn't be read for now is listed, and
+			// answers for itself when opened.
+			if ok, err := st.offered(ctx, ns); ok || err != nil {
+				add(st.dirInfo(ns))
+			}
 		}
 	case kNSDir:
 		hs, err := st.s.liveHeads(ctx, st.p, t.ns)
 		if err != nil {
 			return nil, err
 		}
-		if st.s.nsInfo(ctx, st.p, t.ns).sealed {
-			// Listed, not read: their documents are sealed (Addendum E).
-			for _, h := range hs {
-				h.e = &docEntry{sealed: true}
-				l.docs[h.name+".json"] = h
-				add(st.docInfo(h.name+".json", h))
-			}
-			break
+		if hs, err = st.s.fetchHeads(ctx, st.p, hs, st.p.c.Head, false); err != nil {
+			return nil, err
 		}
-		files = hs
-		for _, h := range hs {
-			names = append(names, h.name+".json")
+		l.res = map[string]headDoc{}
+		for _, hd := range hs {
+			if !hd.m.sealed {
+				l.res[hd.name] = hd
+			}
+		}
+		taken := func(name string) bool { h, ok := l.res[name]; return ok && h.m.raw != nil }
+		for _, hd := range l.res {
+			name := hd.name
+			if hd.m.raw == nil {
+				if name += ".json"; taken(name) {
+					name = dupName(name, taken)
+				}
+			}
+			l.docs[name] = hd
+			add(st.docInfo(name, hd))
 		}
 	case kCatDir, kFolder:
 		cg, err := st.graph(ctx, t.ns)
 		if err != nil {
 			return nil, err
 		}
-		head = cg.itemHead(st.p)
+		var files []headDoc
+		var names []string
+		sealed := map[string]bool{}
 		for _, n := range cg.children(t.node) {
 			if n.Kind == kindFolder {
 				add(st.dirInfo(n.Name))
 				continue
 			}
-			files = append(files, headDoc{ns: n.ItemNS, name: n.ItemName})
-			names = append(names, n.Name+".json")
+			s, ok := sealed[n.ItemNS]
+			if !ok {
+				s = st.s.nsInfo(ctx, st.p, n.ItemNS).sealed
+				sealed[n.ItemNS] = s
+			}
+			if !s {
+				files = append(files, headDoc{ns: n.ItemNS, name: n.ItemName})
+				names = append(names, n.Name+".json")
+			}
 		}
-	}
-	if len(files) > 0 {
 		// Placements whose content isn't live (dangling, §B.3) are left
-		// out: fetchHeads drops them, so pair names up by resource.
+		// out: fetchHeads drops them, so pair names up by resource. Items
+		// in sealed and end-to-end namespaces aren't offered (§H.7).
 		byRes := map[string]string{}
 		for i, f := range files {
 			byRes[f.ns+"/"+f.name] = names[i]
 		}
-		docs, err := st.s.fetchHeads(ctx, st.p, files, head)
+		docs, err := st.s.fetchHeads(ctx, st.p, files, cg.itemHead(st.p), false)
 		if err != nil {
 			return nil, err
 		}
 		for _, hd := range docs {
+			if hd.m.sealed {
+				continue
+			}
 			name := byRes[hd.ns+"/"+hd.name]
 			l.docs[name] = hd
 			add(st.docInfo(name, hd))
@@ -391,21 +532,32 @@ func (st *reqState) head(ctx context.Context, ns, name string) (*client.Head, er
 }
 
 // docAt returns the live document a document path names, from the
-// directory's listing if the request read it, else from its head.
+// directory's listing if the request read it, else from its head: for a
+// flat namespace's file, only a document of its kind (a JSON document's
+// file names no raw one, nor a raw file a JSON one), and never a sealed
+// one, which isn't offered (§H.7).
 func (st *reqState) docAt(ctx context.Context, t target) (headDoc, bool, error) {
 	if l := st.lists[t.dir]; l != nil {
 		hd, ok := l.docs[t.base]
 		return hd, ok, nil
 	}
+	if t.kind == kPlacement && st.s.nsInfo(ctx, st.p, t.docNS).sealed {
+		return headDoc{}, false, nil
+	}
 	h, err := st.head(ctx, t.docNS, t.docName)
 	if err != nil || h.State != client.Live {
 		return headDoc{}, false, err
 	}
-	e, err := st.s.doc(ctx, st.p, t.docNS, t.docName, h.ID)
+	m, err := st.s.meta(ctx, st.p, t.docNS, t.docName, h.ID)
 	if err != nil {
 		return headDoc{}, false, err
 	}
-	return headDoc{ns: t.docNS, name: t.docName, rev: h.ID, e: e}, true, nil
+	hd := headDoc{ns: t.docNS, name: t.docName, rev: h.ID, m: m}
+	switch {
+	case m.sealed, t.kind == kDoc && m.raw != nil, t.kind == kRaw && m.raw == nil:
+		return hd, false, nil
+	}
+	return hd, true, nil
 }
 
 // stat is Stat of a resolved path.
@@ -434,7 +586,7 @@ func (st *reqState) stat(ctx context.Context, t target) (*fileInfo, error) {
 		}
 		return nil, errNotExist
 	}
-	if t.kind == kDoc || t.kind == kPlacement {
+	if t.kind == kDoc || t.kind == kRaw || t.kind == kPlacement {
 		hd, live, err := st.docAt(ctx, t)
 		if err != nil {
 			return nil, err
@@ -536,6 +688,15 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 		// every entry it lists for its properties.
 		return &dirFile{st: st, ctx: ctx, t: t, fi: fi}, nil
 	}
+	served := (st.method == "GET" || st.method == "HEAD") && t.path == st.path
+	if served && st.resp != nil {
+		// A file is served as its type, and whatever it holds, no page of
+		// this origin, which holds the users' credentials, runs it, nor
+		// does a browser take it for another type (§H.6 "Raw bytes").
+		st.resp.Set("Content-Type", fi.ctype)
+		st.resp.Set("X-Content-Type-Options", "nosniff")
+		st.resp.Set("Content-Security-Policy", "sandbox")
+	}
 	if fi.rev == "" {
 		f, ok := st.scratchGet(t.path)
 		if !ok {
@@ -550,23 +711,33 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	if !live {
 		return nil, errNotExist
 	}
-	if hd.e.sealed {
-		if st.method == "GET" || st.method == "HEAD" || st.method == "POST" {
-			return nil, fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E); sealed and end-to-end documents aren't served over WebDAV", hd.ns, hd.name)
-		}
-		return &memFile{Reader: bytes.NewReader(nil), fi: fi}, nil
-	}
-	if st.method == "GET" && t.path == st.path {
-		// What the client now has is a base of its next save, once the
+	if served {
+		// What the client now has is a base of its next save, once a GET's
 		// body is sent (a 304 sends none). A client whose copy is suspect
-		// gets the document whatever its validators say.
-		st.serve = &stagedServe{ns: hd.ns, name: hd.name, rev: hd.rev}
+		// gets the file whatever its validators say (§H.1 "Identity").
+		if st.method == "GET" {
+			st.serve = &stagedServe{ns: hd.ns, name: hd.name, rev: hd.rev}
+		}
 		if st.hdr != nil && st.s.stale(st.p, hd.ns, hd.name, hd.rev) {
 			st.hdr.Del("If-None-Match")
 			st.hdr.Del("If-Modified-Since")
 		}
 	}
-	return &memFile{Reader: bytes.NewReader(st.repr(hd)), fi: fi}, nil
+	if r := hd.m.raw; r != nil {
+		if st.method == "COPY" && t.path == st.path {
+			// The copy's type is the source's (fileType).
+			st.ctype = r.typ
+		}
+		return st.rawFile(ctx, hd, fi)
+	}
+	f := &docFile{st: st, ctx: ctx, hd: hd, fi: fi}
+	if served {
+		// Read now, so a failure is the answer.
+		if err := f.load(); err != nil {
+			return nil, err
+		}
+	}
+	return f, nil
 }
 
 // preconditions checks a PUT's If-None-Match: * (create only) and
@@ -613,11 +784,13 @@ func (st *reqState) mkdir(ctx context.Context, name string) error {
 		return os.ErrExist
 	case kNewFolder:
 		return st.mkFolder(ctx, t)
-	case kBadName:
-		return st.badName(t)
-	case kScratch:
+	case kBadName, kScratch:
 		// Not a catalog folder: a scratch directory (an app's safe save,
-		// a file manager's "untitled folder" before it is named).
+		// a file manager's "untitled folder" before it is named), which
+		// a name no file can have may be (§H.6).
+		if t.kind == kBadName && !appDir(t.base) {
+			return st.badName(t)
+		}
 		if err := st.mayScratchDir(t); err != nil {
 			return err
 		}
@@ -644,7 +817,7 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		if t.kind != kScratch && t.isDir() || t.kind == kPlacement {
 			return nil
 		}
-		if t.kind == kDoc {
+		if t.kind == kDoc || t.kind == kRaw {
 			if _, live, err := st.docAt(ctx, t); err != nil || live {
 				return err
 			}
@@ -657,7 +830,7 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		return errNotExist
 	case kRoot, kNSDir, kCatDir:
 		return fail(http.StatusForbidden, "the namespaces served are fixed; %s can't be deleted here", t.path)
-	case kDoc:
+	case kDoc, kRaw:
 		if _, live, err := st.docAt(ctx, t); err != nil {
 			return err
 		} else if live {
@@ -702,7 +875,7 @@ func (st *reqState) afterRefusedSave(ctx context.Context, t target) error {
 	if !ok {
 		return nil
 	}
-	if t.kind == kDoc && st.s.nsInfo(ctx, st.p, t.docNS).frozen {
+	if (t.kind == kDoc || t.kind == kRaw) && st.s.nsInfo(ctx, st.p, t.docNS).frozen {
 		st.p.clearRefusedSave(t.path)
 		return nil
 	}
@@ -732,7 +905,7 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	}
 	defer st.changed()
 	live := false
-	if src.kind == kDoc || src.kind == kPlacement {
+	if src.kind == kDoc || src.kind == kRaw || src.kind == kPlacement {
 		if _, live, err = st.docAt(ctx, src); err != nil {
 			return err
 		}
@@ -740,7 +913,7 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 	switch {
 	case src.kind == kMissing || dst.kind == kMissing:
 		return errNotExist
-	case dst.kind == kBadName:
+	case dst.kind == kBadName && !(src.kind == kScratch && src.sdir && appDir(dst.base)):
 		return st.badName(dst)
 	case live && (dst.kind == kScratch || dst.kind == kNewFolder):
 		// An editor moving the original aside as a backup before writing
@@ -749,10 +922,15 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		if err != nil {
 			return err
 		}
-		if hd.e.sealed {
-			return fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E)", hd.ns, hd.name)
+		b, err := st.fileBytes(ctx, &hd)
+		if err != nil {
+			return err
 		}
-		if err := st.scratchPut(dst.path, st.repr(hd)); err != nil {
+		ctype := "application/json"
+		if hd.m.raw != nil {
+			ctype = hd.m.raw.typ
+		}
+		if err := st.scratchPut(dst.path, b, ctype); err != nil {
 			return err
 		}
 		// The client takes the name for free now, and may create it
@@ -763,12 +941,12 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		switch {
 		case st.isCatalogMove(src, dst):
 			return st.move(ctx, src, dst)
-		case live && src.kind == kDoc && (dst.kind == kNewPlacement || dst.kind == kPlacement) && dst.docNS == src.docNS && dst.docName == src.docName:
+		case live && (src.kind == kDoc || src.kind == kRaw) && (dst.kind == kNewPlacement || dst.kind == kPlacement) && dst.docNS == src.docNS && dst.docName == src.docName:
 			// A document of a flat directory into a catalog folder: the
 			// same document placed there, as a COPY places it. It stays
 			// in its namespace, so in the flat directory too.
 			return st.placeByMove(ctx, src, dst)
-		case live && src.kind == kPlacement && dst.kind == kDoc && dst.docNS == src.docNS && dst.docName == src.docName:
+		case live && src.kind == kPlacement && (dst.kind == kDoc || dst.kind == kRaw) && dst.docNS == src.docNS && dst.docName == src.docName:
 			// A placement onto its own item's file in the flat directory:
 			// unplaced, as a DELETE of it does (§B.7); the item stays.
 			return st.unplace(ctx, src)
@@ -779,7 +957,7 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		case src.kind == kPlacement && (dst.kind == kNewPlacement || dst.kind == kPlacement) && dst.ns == src.ns:
 			return fail(http.StatusForbidden, "names are identity (§3.6, §B.1): a placement is named by its item, %s.%s, and can't be renamed; move it to another folder under the same name", src.docNS, src.docName)
 		}
-		return fail(http.StatusForbidden, "names are identity (§3.6, §B.1): a document can't be renamed or moved to another namespace; copy it to a new name and delete the old one, or, into a catalog folder, under its own name {ns}.{name}.json")
+		return fail(http.StatusForbidden, "names are identity (§3.6, §B.1): a file can't be renamed or moved to another namespace here; copy it to a new name and delete the old one, or, into a catalog folder, under its own name {ns}.{name}.json")
 	case src.kind == kScratch && src.sdir:
 		switch dst.kind {
 		case kNewFolder:
@@ -793,7 +971,7 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 			}
 			st.scratchUnmark(dst.path)
 			return nil
-		case kScratch:
+		case kScratch, kBadName:
 			if err := st.mayScratchDir(dst); err != nil {
 				return err
 			}
@@ -814,6 +992,7 @@ func (st *reqState) rename(ctx context.Context, oldName, newName string) error {
 		if err := st.writable(ctx, dst); err != nil {
 			return err
 		}
+		st.ctype = f.ctype
 		if _, _, err := st.commitRev(ctx, dst, f.data); err != nil {
 			return st.undoOwnDelete(ctx, dst, upstream(err))
 		}
@@ -838,22 +1017,48 @@ func (st *reqState) placeByMove(ctx context.Context, src, dst target) error {
 		return err
 	case !live:
 		return errNotExist
-	case hd.e.sealed:
-		return fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E)", hd.ns, hd.name)
 	}
-	_, _, err = st.commitRev(ctx, dst, st.repr(hd))
+	b, err := st.fileBytes(ctx, &hd)
+	if err != nil {
+		return err
+	}
+	_, _, err = st.commitRev(ctx, dst, b)
 	return err
 }
 
-// commitRev writes body to the document a path names: an edit, a create
-// or a restore, or for a new placement also the placement (§B.2). It
-// returns the revision now holding it, and whether that holds exactly
-// body. An empty body creates nothing: a client making a file before
-// writing it (LOCK, Finder's 0-byte PUT) gets a placeholder, and a live
-// document isn't truncated.
+// fileBytes returns live file hd's content as its reader gets it: a JSON
+// file's representation (repr), or a raw file's bytes, read whole from its
+// blob, at most MaxFileSize of them (413 beyond).
+func (st *reqState) fileBytes(ctx context.Context, hd *headDoc) ([]byte, error) {
+	if r := hd.m.raw; r != nil {
+		if r.size > int64(st.s.opt.MaxFileSize) {
+			return nil, fail(http.StatusRequestEntityTooLarge, "%s/%s is %d bytes, and a file kept or copied here whole is at most %d bytes", hd.ns, hd.name, r.size, st.s.opt.MaxFileSize)
+		}
+		b, err := st.p.c.GetBlob(ctx, hd.ns, hd.name, r.bid, r.nonce)
+		if err != nil {
+			return nil, err
+		}
+		return b.Data, nil
+	}
+	if _, err := st.entry(ctx, hd); err != nil {
+		return nil, err
+	}
+	return st.repr(*hd), nil
+}
+
+// commitRev writes body to the file a path names: an edit, a create or a
+// restore, or for a new placement also the placement (§B.2), as a file of
+// the kind kindOf says (§H.1). It returns the revision now holding it,
+// and whether that holds exactly body. An empty body creates nothing: a
+// client making a file before writing it (LOCK, Finder's 0-byte PUT) gets
+// a placeholder, and a live file isn't truncated.
 func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (string, bool, error) {
 	defer st.changed()
-	if len(bytes.TrimSpace(trimBOM(body))) == 0 {
+	raw, name, v, err := st.kindOf(ctx, t, body)
+	if err != nil {
+		return "", false, err
+	}
+	if len(body) == 0 || !raw && len(bytes.TrimSpace(trimBOM(body))) == 0 {
 		if t.kind != kNewPlacement {
 			hd, live, err := st.docAt(ctx, t)
 			if err != nil {
@@ -863,17 +1068,21 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 				return hd.rev, false, nil
 			}
 		}
-		return "", true, st.scratchPut(t.path, nil)
+		return "", true, st.scratchPut(t.path, nil, st.ctype)
 	}
-	v, err := parseBody(body)
-	if err != nil {
-		return "", false, err
+	if !raw && v == nil {
+		if v, err = parseBody(body); err != nil {
+			return "", false, err
+		}
 	}
 	var rev string
 	var exact bool
-	if t.kind == kNewPlacement {
-		rev, exact, err = st.place(ctx, t, v, body, true)
-	} else {
+	switch {
+	case t.kind == kNewPlacement:
+		rev, exact, err = st.place(ctx, t, v, body, raw, true)
+	case raw:
+		rev, exact, err = st.commitRaw(ctx, t.docNS, name, body, true)
+	default:
 		rev, exact, err = st.commitDoc(ctx, t.docNS, t.docName, v, body, true)
 	}
 	if err != nil {
@@ -881,6 +1090,44 @@ func (st *reqState) commitRev(ctx context.Context, t target, body []byte) (strin
 	}
 	st.scratchRemove(t.path)
 	return rev, exact, nil
+}
+
+// kindOf says whether body, written to t, is a raw file's content, and of
+// which resource, or else a JSON file's, parsed if it was (§H.1): a raw
+// file's path takes any bytes; a live JSON file only JSON; a new {name}.json
+// is JSON document {name} if body is I-JSON (a BOM dropped), else raw file
+// {name}.json; one the principal deleted moments ago is restored as the
+// file it was, JSON or raw (§H.6 "Delete, then write"); a placement's item
+// keeps its kind, and a new one is JSON.
+func (st *reqState) kindOf(ctx context.Context, t target, body []byte) (bool, string, any, error) {
+	switch t.kind {
+	case kRaw:
+		return true, t.docName, nil, nil
+	case kDoc:
+		if t.rawName == "" {
+			return false, t.docName, nil, nil
+		}
+		now := st.s.opt.Now()
+		_, live, err := st.docAt(ctx, t)
+		switch {
+		case err != nil || live || st.p.deletedOwn(t.docNS, t.docName, "", now):
+			return false, t.docName, nil, err
+		case st.p.deletedOwn(t.docNS, t.rawName, "", now):
+			return true, t.rawName, nil, nil
+		}
+		if v, err := jsonv.Parse(trimBOM(body)); err == nil {
+			return false, t.docName, v, nil
+		}
+		return true, t.rawName, nil, nil
+	case kPlacement, kNewPlacement:
+		h, err := st.head(ctx, t.docNS, t.docName)
+		if err != nil || h.State != client.Live {
+			return false, t.docName, nil, err
+		}
+		m, err := st.s.meta(ctx, st.p, t.docNS, t.docName, h.ID)
+		return err == nil && m.raw != nil, t.docName, nil, err
+	}
+	return false, t.docName, nil, nil
 }
 
 // writeFile buffers a written file whole; Close commits it, to the core
@@ -934,7 +1181,7 @@ func (w *writeFile) Close() error {
 	}()
 	switch {
 	case w.scratch && w.err == nil && w.st.bodyErr == nil:
-		return w.st.record(w.st.scratchPut(w.t.path, bytes.Clone(w.buf.Bytes())))
+		return w.st.record(w.st.scratchPut(w.t.path, bytes.Clone(w.buf.Bytes()), w.st.ctype))
 	case w.scratch:
 		return w.st.record(w.failure())
 	case w.err != nil, w.st.bodyErr != nil:
@@ -946,10 +1193,9 @@ func (w *writeFile) Close() error {
 	if exact {
 		w.rev = rev
 	} else {
-		// Merged, reformatted or given a $nonce: the revision isn't what
-		// the client sent, so it gets no validator for it (RFC 9110
-		// §9.3.4); a cache would keep what it sent under the revision's
-		// tag.
+		// Merged with others' edits: the revision isn't what the client
+		// sent, so it gets no validator for it (RFC 9110 §9.3.4, §H.1); a
+		// cache would keep what it sent under the revision's tag.
 		w.st.noETag = true
 	}
 	return w.st.record(w.st.undoOwnDelete(w.ctx, w.t, upstream(err)))
@@ -992,8 +1238,7 @@ func (noDeadProps) Patch(ps []webdav.Proppatch) ([]webdav.Propstat, error) {
 	return []webdav.Propstat{st}, nil
 }
 
-// memFile is a file read from memory: a document's rendering or a scratch
-// file.
+// memFile is a scratch file, read from memory.
 type memFile struct {
 	*bytes.Reader
 	noDeadProps
@@ -1004,6 +1249,47 @@ func (f *memFile) Close() error                       { return nil }
 func (f *memFile) Write([]byte) (int, error)          { return 0, os.ErrPermission }
 func (f *memFile) Readdir(int) ([]os.FileInfo, error) { return nil, os.ErrInvalid }
 func (f *memFile) Stat() (os.FileInfo, error)         { return f.fi, nil }
+
+// docFile is a JSON file being read: its representation (repr), read from
+// its document when first read or sought, not when opened, as a PROPFIND
+// opens every file it lists for its properties.
+type docFile struct {
+	noDeadProps
+	st  *reqState
+	ctx context.Context
+	hd  headDoc
+	fi  *fileInfo
+	r   *bytes.Reader
+}
+
+func (f *docFile) load() error {
+	if f.r == nil {
+		if _, err := f.st.entry(f.ctx, &f.hd); err != nil {
+			return err
+		}
+		f.r = bytes.NewReader(f.st.repr(f.hd))
+	}
+	return nil
+}
+
+func (f *docFile) Read(p []byte) (int, error) {
+	if err := f.load(); err != nil {
+		return 0, err
+	}
+	return f.r.Read(p)
+}
+
+func (f *docFile) Seek(offset int64, whence int) (int64, error) {
+	if err := f.load(); err != nil {
+		return 0, err
+	}
+	return f.r.Seek(offset, whence)
+}
+
+func (f *docFile) Close() error                       { return nil }
+func (f *docFile) Write([]byte) (int, error)          { return 0, os.ErrPermission }
+func (f *docFile) Readdir(int) ([]os.FileInfo, error) { return nil, os.ErrInvalid }
+func (f *docFile) Stat() (os.FileInfo, error)         { return f.fi, nil }
 
 // dirFile is a directory, listed on its first Readdir.
 type dirFile struct {

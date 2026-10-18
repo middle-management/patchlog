@@ -144,18 +144,18 @@ func TestGatewayEviction(t *testing.T) {
 	for _, u := range []string{"a", "b", "c"} {
 		g[u] = k.Grant(t, e.s.Now(), "user:"+u, []string{"docs"}, []string{"read"})
 	}
-	e.expect(e.doAs(g["a"], "PUT", "/docs/.scratch", "a"), 201, "a's scratch")
-	e.expect(e.doAs(g["b"], "PUT", "/docs/.scratch", "b"), 201, "b's scratch")
-	e.expect(e.doAs(g["a"], "GET", "/docs/.scratch", ""), 200, "a again")
-	e.expect(e.doAs(g["c"], "PUT", "/docs/.scratch", "c"), 201, "c's scratch")
+	e.expect(e.doAs(g["a"], "PUT", "/docs/scratch.swp", "a"), 201, "a's scratch")
+	e.expect(e.doAs(g["b"], "PUT", "/docs/scratch.swp", "b"), 201, "b's scratch")
+	e.expect(e.doAs(g["a"], "GET", "/docs/scratch.swp", ""), 200, "a again")
+	e.expect(e.doAs(g["c"], "PUT", "/docs/scratch.swp", "c"), 201, "c's scratch")
 	for _, u := range []string{"a", "c"} {
-		if r := e.expect(e.doAs(g[u], "GET", "/docs/.scratch", ""), 200, u+" kept"); r.body != u {
+		if r := e.expect(e.doAs(g[u], "GET", "/docs/scratch.swp", ""), 200, u+" kept"); r.body != u {
 			t.Fatalf("%s's scratch %q", u, r.body)
 		}
 	}
 	// b comes back as a new principal, without its scratch file (and a,
 	// now the least recently seen, goes).
-	e.expect(e.doAs(g["b"], "GET", "/docs/.scratch", ""), 404, "b, dropped")
+	e.expect(e.doAs(g["b"], "GET", "/docs/scratch.swp", ""), 404, "b, dropped")
 }
 
 // A gateway keeps nothing for a grant before the core accepts it: a grant
@@ -185,7 +185,7 @@ func TestGatewayVerifies(t *testing.T) {
 	defer hs.Close()
 	g := &env{t: t, ctx: e.ctx, s: e.s, c: e.c, dav: hs}
 	forged := clienttest.NewKey("k").Grant(t, e.s.Now(), "user:mallory", []string{"pub"}, []string{"read"})
-	g.expect(g.doAs(forged, "PUT", "/pub/.junk", "x"), 401, "a forged grant for a public namespace")
+	g.expect(g.doAs(forged, "PUT", "/pub/junk.swp", "x"), 401, "a forged grant for a public namespace")
 	carol := k.Grant(t, e.s.Now(), "user:carol", []string{"pub"}, []string{"read", "create"})
 	g.expect(g.doAs(carol, "PUT", "/pub/.swp", "x"), 201, "a valid one")
 	g.expect(g.doAs(carol, "PUT", "/pub/a.json", `{"by": "carol"}`), 201, "and its write")
@@ -203,20 +203,20 @@ func TestGatewayBounds(t *testing.T) {
 	})
 	now := e.s.Now()
 	bob := k.Grant(t, now, "user:bob", []string{"docs"}, []string{"read"})
-	e.expect(e.doAs(bob, "PUT", "/docs/.bob", "b"), 201, "bob's scratch")
+	e.expect(e.doAs(bob, "PUT", "/docs/bob.swp", "b"), 201, "bob's scratch")
 	var alices []string
 	for i := 0; i < 3; i++ {
 		a := k.Grant(t, now.Add(time.Duration(i)*time.Second), "user:alice", []string{"docs"}, []string{"read"})
 		alices = append(alices, a)
-		e.expect(e.doAs(a, "PUT", "/docs/.alice", "a"+strconv.Itoa(i)), 201, "alice's scratch")
+		e.expect(e.doAs(a, "PUT", "/docs/alice.swp", "a"+strconv.Itoa(i)), 201, "alice's scratch")
 	}
-	e.expect(e.doAs(bob, "GET", "/docs/.bob", ""), 200, "bob's, kept")
-	e.expect(e.doAs(alices[2], "GET", "/docs/.alice", ""), 200, "alice's latest, kept")
+	e.expect(e.doAs(bob, "GET", "/docs/bob.swp", ""), 200, "bob's, kept")
+	e.expect(e.doAs(alices[2], "GET", "/docs/alice.swp", ""), 200, "alice's latest, kept")
 
 	// p's PUT is in flight while two others come and go.
 	p := k.Grant(t, now, "user:p", []string{"docs"}, []string{"read"})
 	pr, pw := io.Pipe()
-	req := must(http.NewRequest("PUT", e.dav.URL+"/docs/.big", pr))
+	req := must(http.NewRequest("PUT", e.dav.URL+"/docs/big.swp", pr))
 	req.SetBasicAuth("u", p)
 	done := make(chan int)
 	go func() {
@@ -230,16 +230,16 @@ func TestGatewayBounds(t *testing.T) {
 	}()
 	pw.Write([]byte(strings.Repeat("A", 1000)))
 	for _, u := range []string{"user:q", "user:r", "user:s"} {
-		e.doAs(k.Grant(t, now, u, []string{"docs"}, []string{"read"}), "GET", "/docs/.none", "")
+		e.doAs(k.Grant(t, now, u, []string{"docs"}, []string{"read"}), "GET", "/docs/none.swp", "")
 	}
 	pw.Write([]byte(strings.Repeat("A", 2<<20-1000)))
 	pw.Close()
 	if st := <-done; st != 201 {
 		t.Fatalf("p's PUT: %d", st)
 	}
-	e.expect(e.doAs(p, "GET", "/docs/.big", ""), 200, "p's file")
-	e.expect(e.doAs(p, "DELETE", "/docs/.big", ""), 204, "p's file deleted")
-	e.expect(e.doAs(k.Grant(t, now, "user:t", []string{"docs"}, []string{"read"}), "PUT", "/docs/.x", strings.Repeat("B", 2<<20)), 201, "the budget is whole")
+	e.expect(e.doAs(p, "GET", "/docs/big.swp", ""), 200, "p's file")
+	e.expect(e.doAs(p, "DELETE", "/docs/big.swp", ""), 204, "p's file deleted")
+	e.expect(e.doAs(k.Grant(t, now, "user:t", []string{"docs"}, []string{"read"}), "PUT", "/docs/x.swp", strings.Repeat("B", 2<<20)), 201, "the budget is whole")
 }
 
 // A root listing names the served namespaces without reading them, so a
@@ -369,7 +369,7 @@ func TestGatewayPublicityChange(t *testing.T) {
 	must(admin.PatchConfig(ctx, "docs", cr.Config, []any{map[string]any{"op": "replace", "path": "/read", "value": "public"}}))
 	for i := 0; i < 3; i++ {
 		forged := clienttest.NewKey("x").Grant(t, s.Now(), "user:mallory"+strconv.Itoa(i), []string{"docs"}, []string{"read"})
-		e.expect(e.doAs(forged, "PUT", "/docs/.junk", "x"), 401, "a forged grant after the namespace turned public")
+		e.expect(e.doAs(forged, "PUT", "/docs/junk.swp", "x"), 401, "a forged grant after the namespace turned public")
 	}
 	carol := k.Grant(t, s.Now(), "user:carol", []string{"docs"}, []string{"read"})
 	e.expect(e.doAs(carol, "PUT", "/docs/.swp", "x"), 201, "a valid one")
@@ -394,7 +394,7 @@ func TestGatewayRootPerNamespace(t *testing.T) {
 	g.expect(g.doAs(alice, "PUT", "/docs/.a.json.swp", "alice's unsaved work"), 201, "alice's swap")
 	for i := 0; i < 3; i++ {
 		tok := evil.Grant(t, e.s.Now().Add(time.Duration(i)*time.Second), "user:alice", []string{"other"}, []string{"read"})
-		g.expect(g.doAs(tok, "PUT", "/other/.fill", strings.Repeat("F", 400<<10)), 201, "the other namespace's alice")
+		g.expect(g.doAs(tok, "PUT", "/other/fill.swp", strings.Repeat("F", 400<<10)), 201, "the other namespace's alice")
 	}
 	if r := g.expect(g.doAs(alice, "GET", "/docs/.a.json.swp", ""), 200, "alice's swap, kept"); r.body != "alice's unsaved work" {
 		t.Fatalf("alice's swap %q", r.body)
@@ -506,7 +506,7 @@ func TestGatewayInflightShare(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		pr, pw := io.Pipe()
 		pws = append(pws, pw)
-		req := must(http.NewRequest("PUT", e.dav.URL+"/docs/.slow"+strconv.Itoa(i), pr))
+		req := must(http.NewRequest("PUT", e.dav.URL+"/docs/slow"+strconv.Itoa(i)+".swp", pr))
 		req.SetBasicAuth("u", mallory)
 		go func() {
 			defer func() { done <- struct{}{} }()
@@ -528,7 +528,7 @@ func TestXMLBodyBound(t *testing.T) {
 	t.Parallel()
 	e, k := authEnv(t, true)
 	reader := k.Grant(t, e.s.Now(), "user:mallory", []string{"docs"}, []string{"read"})
-	e.expect(e.doAs(reader, "PUT", "/docs/.x", "x"), 201, "scratch")
+	e.expect(e.doAs(reader, "PUT", "/docs/x.swp", "x"), 201, "scratch")
 	pp := func(n int) string {
 		var b strings.Builder
 		b.WriteString(`<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:"><D:set><D:prop>`)
@@ -538,8 +538,8 @@ func TestXMLBodyBound(t *testing.T) {
 		b.WriteString(`</D:prop></D:set></D:propertyupdate>`)
 		return b.String()
 	}
-	e.expect(e.doAs(reader, "PROPPATCH", "/docs/.x", pp(100<<10)), 413, "PROPPATCH of 100 KiB")
-	e.expect(e.doAs(reader, "PROPPATCH", "/docs/.x", pp(32<<10)), 207, "PROPPATCH of 32 KiB")
+	e.expect(e.doAs(reader, "PROPPATCH", "/docs/x.swp", pp(100<<10)), 413, "PROPPATCH of 100 KiB")
+	e.expect(e.doAs(reader, "PROPPATCH", "/docs/x.swp", pp(32<<10)), 207, "PROPPATCH of 32 KiB")
 }
 
 // In a gateway, nothing is kept for a user in a served namespace their

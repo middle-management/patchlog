@@ -116,12 +116,16 @@ func TestPutCreateEdit(t *testing.T) {
 	if !strings.Contains(r.body, "JSON") {
 		t.Fatalf("invalid JSON: %q", r.body)
 	}
-	e.expect(e.do("PUT", "/docs/bad.json", `{"a": 1, "a": 2}`), 400, "PUT duplicate keys")
 	if h2, _ := e.load("docs", "new"); h2.ID != en.ID {
 		t.Fatalf("invalid JSON wrote %s", h2.ID)
 	}
+	// A new .json file that isn't I-JSON is a raw file of that name (§H.1).
+	e.expect(e.do("PUT", "/docs/bad.json", `{"a": 1, "a": 2}`), 201, "PUT duplicate keys")
 	if h2, _ := e.load("docs", "bad"); h2.State != client.NotFound {
 		t.Fatalf("invalid JSON created bad: %v", h2.State)
+	}
+	if _, doc := e.load("docs", "bad.json"); client.RawBlobOf(doc) == "" {
+		t.Fatalf("bad.json %v", doc)
 	}
 	// A byte order mark, as some Windows editors write, is fine.
 	e.expect(e.do("PUT", "/docs/bom.json", "\xef\xbb\xbf{\"x\": 1}"), 201, "PUT with BOM")
@@ -297,8 +301,8 @@ func TestEditorSaves(t *testing.T) {
 	sameJSON(t, log[2].Patches, []any{map[string]any{"op": "replace", "path": "/n", "value": 2}})
 	sameStrings(t, "after gedit", names(e.propfind("/docs/"), "/docs/"), []string{"x.json"})
 	// A new file saved the same way is a create.
-	e.expect(e.do("PUT", "/docs/.new.json.tmp", `{"fresh": true}`), 201, "temporary file")
-	e.expect(e.do("MOVE", "/docs/.new.json.tmp", "", "Destination", "/docs/new.json"), 201, "temporary to a new name")
+	e.expect(e.do("PUT", "/docs/.goutputstream-new", `{"fresh": true}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-new", "", "Destination", "/docs/new.json"), 201, "temporary to a new name")
 	_, doc := e.load("docs", "new")
 	sameJSON(t, doc, map[string]any{"fresh": true})
 }
@@ -385,35 +389,39 @@ func TestCopyMoveLock(t *testing.T) {
 
 	// Behind a proxy that passes its own Host on: a Destination naming
 	// the host the client used (X-Forwarded-Host) is this server.
-	e.expect(e.do("PUT", "/docs/.p.tmp", `{"v": 3}`), 201, "temporary file")
-	e.expect(e.do("MOVE", "/docs/.p.tmp", "", "Destination", "http://dav.example/docs/p.json"), 502, "MOVE to another host")
-	e.expect(e.do("MOVE", "/docs/.p.tmp", "", "Destination", "http://dav.example/docs/p.json", "X-Forwarded-Host", "dav.example"), 201, "MOVE through a proxy")
+	e.expect(e.do("PUT", "/docs/.goutputstream-p", `{"v": 3}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-p", "", "Destination", "http://dav.example/docs/p.json"), 502, "MOVE to another host")
+	e.expect(e.do("MOVE", "/docs/.goutputstream-p", "", "Destination", "http://dav.example/docs/p.json", "X-Forwarded-Host", "dav.example"), 201, "MOVE through a proxy")
 	_, doc = e.load("docs", "p")
 	sameJSON(t, doc, map[string]any{"v": 3})
 }
 
 // A namespace that requires nonces (§C.7) gets a fresh $nonce with every
-// write; the document's own $nonce is never part of an edit.
+// write. A file's rendering leaves it out (§H.1), so the writer's file is
+// stored as sent (its ETag), and the $nonce is never part of an edit.
 func TestNonceRequired(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"priv"}, nil, map[string]map[string]any{"priv": {"nonce": "required"}})
-	e.expect(e.do("PUT", "/priv/x.json", `{"title": "A"}`), 201, "PUT new")
-	_, doc := e.load("priv", "x")
+	put := e.expect(e.do("PUT", "/priv/x.json", `{"title": "A"}`), 201, "PUT new")
+	h, doc := e.load("priv", "x")
 	n1, _ := doc.(map[string]any)["$nonce"].(string)
-	if len(n1) != 26 {
-		t.Fatalf("created %v", doc)
+	if len(n1) != 26 || put.header.Get("ETag") != `"`+h.ID+`"` {
+		t.Fatalf("created %v, ETag %q", doc, put.header.Get("ETag"))
 	}
-	served := e.expect(e.do("GET", "/priv/x.json", ""), 200, "GET").body
-	if !strings.Contains(served, n1) {
+	if b := e.expect(e.do("GET", "/priv/x.json", ""), 200, "GET").body; b != `{"title": "A"}` {
+		t.Fatalf("the writer's GET %q", b)
+	}
+	e2 := e.another()
+	served := e2.expect(e2.do("GET", "/priv/x.json", ""), 200, "GET").body
+	if served != rendered(map[string]any{"title": "A"}) || strings.Contains(served, n1) {
 		t.Fatalf("GET %q", served)
 	}
 	e.expect(e.do("PUT", "/priv/x.json", served), 201, "PUT unchanged")
 	if en := e.lastEntry("priv", "x"); en.Parent != "" {
 		t.Fatal("an unchanged save wrote")
 	}
-	// Edited, with the $nonce line dropped: no remove of it, a fresh one.
+	// Edited: no op on the $nonce but a fresh one.
 	edited := strings.Replace(served, `"A"`, `"B"`, 1)
-	edited = strings.Replace(edited, `"$nonce": "`+n1+`",`, "", 1)
 	e.expect(e.do("PUT", "/priv/x.json", edited), 201, "PUT edit")
 	en := e.lastEntry("priv", "x")
 	ps := en.Patches.([]any)
@@ -490,62 +498,91 @@ func TestScratchBounds(t *testing.T) {
 		o.ScratchFiles, o.ScratchBytes = 2, 10
 		o.Now = func() time.Time { mu.Lock(); defer mu.Unlock(); return now }
 	})
-	e.expect(e.do("PUT", "/docs/.a", "12345"), 201, "first")
-	e.expect(e.do("PUT", "/docs/.b", "12345"), 201, "second")
-	e.expect(e.do("PUT", "/docs/.c", "1"), 507, "third file")
-	e.expect(e.do("PUT", "/docs/.b", "123456"), 507, "over the bytes")
-	e.expect(e.do("PUT", "/docs/.b", "123"), 201, "smaller")
-	e.expect(e.do("PUT", "/docs/.c", "1"), 507, "still two files")
+	e.expect(e.do("PUT", "/docs/a.swp", "12345"), 201, "first")
+	e.expect(e.do("PUT", "/docs/b.swp", "12345"), 201, "second")
+	e.expect(e.do("PUT", "/docs/c.swp", "1"), 507, "third file")
+	e.expect(e.do("PUT", "/docs/b.swp", "123456"), 507, "over the bytes")
+	e.expect(e.do("PUT", "/docs/b.swp", "123"), 201, "smaller")
+	e.expect(e.do("PUT", "/docs/c.swp", "1"), 507, "still two files")
 	mu.Lock()
 	now = now.Add(30 * time.Minute)
 	mu.Unlock()
-	e.expect(e.do("GET", "/docs/.a", ""), 200, "touched")
+	e.expect(e.do("GET", "/docs/a.swp", ""), 200, "touched")
 	mu.Lock()
 	now = now.Add(45 * time.Minute)
 	mu.Unlock()
-	sameStrings(t, "after 75 minutes", names(e.propfind("/docs/"), "/docs/"), []string{".a"})
-	e.expect(e.do("PUT", "/docs/.c", "1"), 201, "room again")
+	sameStrings(t, "after 75 minutes", names(e.propfind("/docs/"), "/docs/"), []string{"a.swp"})
+	e.expect(e.do("PUT", "/docs/c.swp", "1"), 201, "room again")
 }
 
-// Sealed namespaces (Addendum E) are listed but not served: their files
-// read and write as 501.
+// Sealed and end-to-end namespaces (Addendum E) need keys this server
+// doesn't hold, so it doesn't offer them (§H.7): the root doesn't list
+// them, and whatever is asked of them is 404, saying why. Nothing in them
+// is shown as an empty file that seems writable, nor copied out as one.
 func TestSealed(t *testing.T) {
 	t.Parallel()
 	ks := must(keystore.New(keystore.Generate()))
-	e := newEnv(t, []string{"sec"}, nil, map[string]map[string]any{"sec": {"encryption": map[string]any{"level": "sealed"}}},
-		func(c *clienttest.Options, _ *dav.Options) { c.KeyStore = ks })
+	e := newEnv(t, []string{"docs", "sec", "e2e"}, nil, map[string]map[string]any{
+		"sec": {"encryption": map[string]any{"level": "sealed"}},
+		"e2e": {"encryption": map[string]any{"level": "e2e"}},
+	}, func(c *clienttest.Options, _ *dav.Options) { c.KeyStore = ks })
 	w := e.s.Client(t, client.WithAuthor("other"), client.WithKeys(client.NewKeys(nil)))
 	ps := append(client.GenesisPatches(map[string]any{"secret": true}), map[string]any{"op": "add", "path": "/$nonce", "value": seal.NewNonce()})
 	must(w.Create(e.ctx, "sec", "x", ps))
-	l := e.propfind("/sec/")
-	sameStrings(t, "listing", names(l, "/sec/"), []string{"x.json"})
-	e.expect(e.do("GET", "/sec/x.json", ""), 501, "GET sealed")
-	e.expect(e.do("PUT", "/sec/x.json", `{"secret": false}`), 501, "PUT sealed")
-	e.expect(e.do("PUT", "/sec/y.json", `{"new": true}`), 501, "PUT new in a sealed namespace")
+	sameStrings(t, "root", names(e.propfind("/"), "/"), []string{"docs/"})
+	for _, r := range []resp{
+		e.do("PROPFIND", "/sec/", "", "Depth", "1"),
+		e.do("PROPFIND", "/e2e/", "", "Depth", "1"),
+		e.do("GET", "/sec/x.json", ""),
+		e.do("PUT", "/sec/x.json", `{"secret": false}`),
+		e.do("PUT", "/sec/y.json", `{"new": true}`),
+		e.do("PUT", "/e2e/y.json", `{"new": true}`),
+		e.do("COPY", "/sec/x.json", "", "Destination", "/docs/x.json"),
+		e.do("MKCOL", "/sec/.TemporaryItems", ""),
+	} {
+		if r.status != 404 || !strings.Contains(r.body, "doesn't offer it (§H.7)") {
+			t.Fatalf("%d %q", r.status, r.body)
+		}
+	}
+	if h, _ := e.load("docs", "x"); h.State != client.NotFound {
+		t.Fatalf("a COPY out of a sealed namespace made docs/x: %v", h.State)
+	}
+	sameStrings(t, "docs", names(e.propfind("/docs/"), "/docs/"), nil)
+	if h, _ := e.load("sec", "y"); h.State != client.NotFound {
+		t.Fatal("a PUT wrote to a sealed namespace")
+	}
 }
 
-// A .json name a person gives a file that names no document (a Save As
-// "Report.json", capitals, a copy's name without the original beside it)
-// is refused: kept in memory only, it would vanish within the hour.
-// Editors' and the system's own names stay scratch files.
+// A name a person gives a file that no file can have (a Save As
+// "Report.json", capitals, a space, a copy's name without the original
+// beside it, a dot) is refused: kept in memory only, it would vanish
+// within the hour; in a flat namespace's directory every name but a
+// resource name (§H.2), and every name a resource has is a file's. Editors'
+// and the system's own names stay scratch files (§H.6).
 func TestRefusedNames(t *testing.T) {
 	t.Parallel()
 	e := catalogEnv(t)
 	e.create("matches", "x", map[string]any{"a": "1"})
-	for _, p := range []string{"/matches/Report.json", "/matches/Notes.JSON", "/matches/y copy.json", "/Report.json", "/cat/root/season/Report.json", "/cat/root/season/matches.X.json"} {
+	for _, p := range []string{"/matches/Report.json", "/matches/Notes.JSON", "/matches/y copy.json", "/matches/Untitled", "/matches/My%20notes.md", "/matches/.x.json.tmp",
+		"/Report.json", "/cat/root/season/Report.json", "/cat/root/season/matches.X.json"} {
 		r := e.expect(e.do("PUT", p, `{"a": "2"}`), 403, "PUT "+p)
-		if !strings.Contains(r.body, "names no document") {
+		if !strings.Contains(r.body, "names no") {
 			t.Fatalf("PUT %s: %q", p, r.body)
 		}
 	}
-	e.expect(e.do("PUT", "/matches/.x.json.tmp", `{"a": "3"}`), 201, "temporary file")
-	e.expect(e.do("MOVE", "/matches/.x.json.tmp", "", "Destination", "/matches/Report.json"), 403, "MOVE to a refused name")
+	e.expect(e.do("PUT", "/matches/.goutputstream-x", `{"a": "3"}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/matches/.goutputstream-x", "", "Destination", "/matches/Report.json"), 403, "MOVE to a refused name")
 	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
 	e.expect(e.do("LOCK", "/matches/Report.json", lock), 403, "LOCK of a refused name")
-	for _, p := range []string{"/matches/x.json~", "/matches/._x.json", "/matches/.x.json.swp", "/matches/4913", "/matches/x.json___jb_tmp___", "/matches/Untitled"} {
+	for _, p := range []string{"/matches/x.json~", "/matches/._x.json", "/matches/.x.json.swp", "/matches/4913", "/matches/x.json___jb_tmp___",
+		"/matches/x.json___jb_old___", "/matches/~$x.json", "/matches/%23x.json%23", "/matches/.DS_Store", "/matches/Thumbs.db"} {
 		e.expect(e.do("PUT", p, "scratch"), 201, "PUT "+p)
 	}
-	sameStrings(t, "listing", names(e.propfind("/matches/"), "/matches/"), []string{"._x.json", ".x.json.swp", ".x.json.tmp", "4913", "Untitled", "derby.json", "x.json", "x.json___jb_tmp___", "x.json~"})
+	sameStrings(t, "listing", names(e.propfind("/matches/"), "/matches/"), []string{"#x.json#", ".DS_Store", "._x.json", ".goutputstream-x", ".x.json.swp", "4913",
+		"Thumbs.db", "derby.json", "x.json", "x.json___jb_old___", "x.json___jb_tmp___", "x.json~", "~$x.json"})
+	if heads := must(e.c.Heads(e.ctx, "matches", must(e.c.NSHead(e.ctx, "matches")).ID)); len(heads) != 2 {
+		t.Fatalf("scratch files reached the core: %+v", heads)
+	}
 }
 
 // Directories a flat namespace or the root can't hold as documents are

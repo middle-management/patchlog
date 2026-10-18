@@ -74,7 +74,7 @@ func (st *reqState) readGraph(ctx context.Context, cat string) (*catGraph, error
 	if err != nil {
 		return nil, err
 	}
-	docs, err := st.s.fetchHeads(ctx, st.p, hs, st.p.c.Head)
+	docs, err := st.s.fetchHeads(ctx, st.p, hs, st.p.c.Head, true)
 	if err != nil {
 		return nil, err
 	}
@@ -82,7 +82,7 @@ func (st *reqState) readGraph(ctx context.Context, cat string) (*catGraph, error
 	nodes := map[string]any{}
 	for _, hd := range docs {
 		if hd.e.sealed {
-			return nil, fail(http.StatusNotImplemented, "catalog %s is sealed (Addendum E); it isn't served over WebDAV", cat)
+			return nil, notOffered(cat)
 		}
 		cg.heads[hd.name] = hd.rev
 		nodes[hd.name] = hd.e.value
@@ -200,8 +200,9 @@ func (st *reqState) resolveCatalog(ctx context.Context, t target, segs []string)
 		return t, nil
 	}
 	return st.scratchAt(t, true, func(orig string) bool {
-		n := cg.under(orig, parent)
-		return n != nil && n.Kind == tree.KindPlacement
+		node, ok := strings.CutSuffix(orig, ".json")
+		n := cg.under(node, parent)
+		return ok && n != nil && n.Kind == tree.KindPlacement
 	}), nil
 }
 
@@ -250,21 +251,22 @@ func (st *reqState) mkFolder(ctx context.Context, t target) error {
 	return st.createNode(ctx, t.ns, t.node, map[string]any{"parents": parentsOf(t.ns, t.parent)})
 }
 
-// place writes v as the document of a placement's item, created if it
-// doesn't exist (else edited), and creates the placement in t.parent
-// (§B.2). An item placed elsewhere in the catalog is a 409, before
-// anything is written: one placement per item per catalog, so it is moved
-// instead. A new item is written first (§B.7: content first, so a
-// placement never dangles), once a dry run of the placement (§7.5) says
-// the core takes it, so a placement it refuses (a frozen catalog, a grant
-// that doesn't write it, the catalog's rules) writes nothing; one refused
-// still, the catalog having changed in between, deletes the new item
-// again. An existing item is written after its placement, so a placement
-// the core refuses leaves it as it was. An existing item takes the PUT's
-// preconditions (pre), and its edit is checked before the placement is
-// made: one the principal knows no version of is refused when v differs
-// from it, since the new file name made it look like a create.
-func (st *reqState) place(ctx context.Context, t target, v any, body []byte, pre bool) (string, bool, error) {
+// place writes v (or for a raw file, body) as the document of a
+// placement's item, created if it doesn't exist (else edited), and creates
+// the placement in t.parent (§B.2). An item placed elsewhere in the
+// catalog is a 409, before anything is written: one placement per item per
+// catalog, so it is moved instead. A new item is written first (§B.7:
+// content first, so a placement never dangles), once a dry run of the
+// placement (§7.5) says the core takes it, so a placement it refuses (a
+// frozen catalog, a grant that doesn't write it, the catalog's rules)
+// writes nothing; one refused still, the catalog having changed in
+// between, deletes the new item again. An existing item is written after
+// its placement, so a placement the core refuses leaves it as it was. An
+// existing item takes the PUT's preconditions (pre), and its edit is
+// checked before the placement is made: one the principal knows no
+// version of is refused when the file differs from it, since the new file
+// name made it look like a create.
+func (st *reqState) place(ctx context.Context, t target, v any, body []byte, raw, pre bool) (string, bool, error) {
 	cg, err := st.graph(ctx, t.ns)
 	if err != nil {
 		return "", false, err
@@ -276,6 +278,12 @@ func (st *reqState) place(ctx context.Context, t target, v any, body []byte, pre
 	if err != nil {
 		return "", false, upstream(err)
 	}
+	commit := func() (string, bool, error) {
+		if raw {
+			return st.commitRaw(ctx, t.docNS, t.docName, body, pre)
+		}
+		return st.commitDoc(ctx, t.docNS, t.docName, v, body, pre)
+	}
 	node := map[string]any{"parents": parentsOf(t.ns, t.parent)}
 	if h.State == client.Live {
 		if pre && st.noneMatch {
@@ -286,24 +294,31 @@ func (st *reqState) place(ctx context.Context, t target, v any, body []byte, pre
 			return "", false, upstream(err)
 		}
 		if cur.sealed {
-			return "", false, fail(http.StatusNotImplemented, "%s/%s is sealed (Addendum E); it isn't written over WebDAV", t.docNS, t.docName)
+			return "", false, notOffered(t.docNS)
 		}
-		out, based, err := st.rebased(ctx, t.docNS, t.docName, v, cur.value)
-		if err != nil {
-			return "", false, upstream(err)
+		unseen := false
+		if raw {
+			d := st.s.recordsOf(st.p, t.docNS, t.docName)
+			unseen = st.ifMatch == "" && len(d.rs) == 0 && !sameBytes(cur.raw, body)
+		} else {
+			out, based, err := st.rebased(ctx, t.docNS, t.docName, v, cur.value, bare)
+			if err != nil {
+				return "", false, upstream(err)
+			}
+			unseen = !based && !jsonv.Equal(out, bare(cur.value))
 		}
-		if !based && !jsonv.Equal(out, dropNonce(cur.value)) {
+		if unseen {
 			return "", false, fail(http.StatusConflict, "%s/%s exists, with other content, and you haven't opened it here; open it (in %s/) and save your changes there, then copy it into this folder", t.docNS, t.docName, t.docNS)
 		}
 		if err := st.createNode(ctx, t.ns, t.node, node); err != nil {
 			return "", false, err
 		}
-		return st.commitDoc(ctx, t.docNS, t.docName, v, body, pre)
+		return commit()
 	}
 	if err := st.probeNode(ctx, t.ns, t.node, node); err != nil {
 		return "", false, err
 	}
-	rev, exact, err := st.commitDoc(ctx, t.docNS, t.docName, v, body, pre)
+	rev, exact, err := commit()
 	if err != nil {
 		return "", false, err
 	}
@@ -344,10 +359,10 @@ func (st *reqState) probeNode(ctx context.Context, cat, name string, doc map[str
 		return fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", cat, name)
 	case client.Tombstoned:
 		it.IfMatch = h.ID
-		it.Steps = []client.Step{client.PatchStep(withNonce(in, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))}
+		it.Steps = []client.Step{client.PatchStep(withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))}
 	default:
 		it.IfNoneMatch = true
-		it.Steps = []client.Step{client.PatchStep(withNonce(in, client.GenesisPatches(doc)))}
+		it.Steps = []client.Step{client.PatchStep(withNonce(in, doc, client.GenesisPatches(doc)))}
 	}
 	res, err := st.p.c.Batch(ctx, cat, client.BatchRequest{Items: []client.BatchItem{it}}, true)
 	if ae, ok := client.AsAPIError(err); ok && ae.Code == "batch" && len(ae.Items()) == 1 {
@@ -407,9 +422,9 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 		case client.Purged:
 			return false, fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", cat, name)
 		case client.Tombstoned:
-			_, err = st.p.c.Restore(ctx, cat, name, h.ID, withNonce(in, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))
+			_, err = st.p.c.Restore(ctx, cat, name, h.ID, withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}))
 		default:
-			_, err = st.p.c.Create(ctx, cat, name, withNonce(in, client.GenesisPatches(doc)))
+			_, err = st.p.c.Create(ctx, cat, name, withNonce(in, doc, client.GenesisPatches(doc)))
 		}
 		if client.IsStale(err) || client.IsGone(err) {
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile", cat, name)
@@ -521,7 +536,7 @@ func (st *reqState) editParents(ctx context.Context, cat, node, from, to string)
 		if len(ps) == 0 {
 			return false, nil
 		}
-		_, err = st.p.c.Append(ctx, cat, node, h.ID, withNonce(in, ps))
+		_, err = st.p.c.Append(ctx, cat, node, h.ID, withNonce(in, e.value, ps))
 		if client.IsStale(err) {
 			return true, nil
 		}

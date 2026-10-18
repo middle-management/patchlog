@@ -3,19 +3,24 @@
 // consumer like the other services: it talks to the core only through its
 // public HTTP API (internal/client) and keeps nothing but caches.
 //
-// Layout: / lists a directory per exposed namespace. A flat namespace's
-// directory lists its live resources as {name}.json; a catalog (Addendum
-// B) is a folder tree, folders as directories and placements as
-// {ns}.{name}.json files holding the content document /r/{ns}/{name}.
+// It follows Addendum H (files). Layout: / lists a directory per exposed
+// namespace, but sealed and end-to-end ones, which need keys it doesn't
+// hold (§H.7). A flat namespace's directory is the flat view (§H.2): a raw
+// document (its root a blob reference, §7.8) as its resource name, any
+// other as {name}.json; a catalog (Addendum B) is a folder tree, folders
+// as directories and placements as {ns}.{name}.json files holding the
+// content document /r/{ns}/{name}.
 //
-// A file reads as the document's canonical JSON (§3.1) indented, so it is
-// the same bytes for the same revision, whose id is its ETag. A save is
-// rebased (§11 submit): the edit from the version the saver had (the
-// revision its If-Match names, else the closest of those it was served or
-// wrote) to what it wrote, applied to the head with If-Match. Edits others
-// made since to other paths are kept, overlapping ones are a 409. Names
-// that aren't documents (editor swap and backup files, .DS_Store, ._*)
-// live in memory, per principal, so editors' save dances work.
+// A raw file reads as its blob's bytes, typed by its name (§H.1); a JSON
+// file as its rendering, the document's canonical JSON (§3.1) laid out,
+// so it is the same bytes for the same revision, whose id is its ETag. A
+// save is rebased (§11.3, §H.4): the edit from the version the saver had
+// (the revision its If-Match names, else the closest of those it was
+// served or wrote) to what it wrote, applied to the head with If-Match.
+// Edits others made since to other paths are kept, overlapping ones are a
+// 409; a raw file has no paths, so any change of its bytes since is one.
+// Editors' and systems' own files (swap and backup files, .DS_Store, ._*,
+// §H.6) live in memory, per principal, so editors' save dances work.
 //
 // Two ways to authenticate: with a fixed grant (local mode, the WebDAV
 // clients log in with a password of the server's), or as a gateway, where
@@ -58,8 +63,8 @@ type Options struct {
 	// request is made with (client.WithBearer); in gateway mode each
 	// request's grant replaces its bearer.
 	Client *client.Client
-	// Namespaces are the flat namespaces served, each a directory of
-	// {name}.json files.
+	// Namespaces are the flat namespaces served, each a directory of its
+	// files (§H.2 "Flat view").
 	Namespaces []string
 	// Catalogs are the catalog namespaces served as folder trees (Addendum
 	// B).
@@ -76,7 +81,8 @@ type Options struct {
 	// (default 8).
 	FetchConcurrency int
 	// CacheBytes bounds the rendered documents kept by revision id
-	// (default 64 MiB).
+	// (default 64 MiB); the files' sizes and types are kept apart
+	// (maxMetas).
 	CacheBytes int
 	// MaxFileSize bounds a written file, buffered whole (default 16 MiB).
 	MaxFileSize int
@@ -135,6 +141,11 @@ const (
 	maxHeavy   = 4
 )
 
+// maxMetas bounds the files' metadata kept by revision id (fileMeta, a
+// few dozen bytes each), so a listing reads each revision's document once
+// though the documents don't fit CacheBytes.
+const maxMetas = 1 << 18
+
 // Server is the WebDAV handler.
 type Server struct {
 	opt   Options
@@ -168,6 +179,7 @@ type Server struct {
 
 	docMu    sync.Mutex
 	docs     lru.Cache[string, *docEntry] // by ns/name@rev
+	metas    lru.Cache[string, fileMeta]  // by ns/name@rev
 	sem      chan struct{}
 	group    singleflight.Group
 	inflight *semaphore.Weighted
@@ -228,6 +240,7 @@ func New(opt Options) (*Server, error) {
 		heavy: make(chan struct{}, maxHeavy)}
 	s.start = opt.Now()
 	s.docs.MaxEntries, s.docs.MaxBytes = 1<<20, opt.CacheBytes
+	s.metas.MaxEntries = maxMetas
 	s.seen.MaxEntries = 1 << 17
 	for _, ns := range opt.Namespaces {
 		if !client.ValidNSName(ns) {
@@ -288,7 +301,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release(p)
-	st := &reqState{s: s, p: p, method: r.Method, path: slashClean(r.URL.Path), depth: r.Header.Get("Depth"), hdr: r.Header}
+	st := &reqState{s: s, p: p, method: r.Method, path: slashClean(r.URL.Path), depth: r.Header.Get("Depth"), hdr: r.Header, resp: w.Header()}
 	switch r.Method {
 	case "PROPFIND":
 		switch st.depth {
@@ -324,6 +337,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	case "PUT", "DELETE":
+		if r.Method == "PUT" && r.Header.Get("Content-Range") != "" {
+			// x/net/webdav would write the range as the whole file.
+			http.Error(w, "a PUT with Content-Range (a partial write) isn't taken: send the whole file (§H.4); nothing was written", http.StatusBadRequest)
+			return
+		}
+		st.ctype = r.Header.Get("Content-Type")
 		// x/net/webdav ignores the preconditions of a PUT and a DELETE:
 		// If-None-Match: * creates only, and the revision If-Match (or an
 		// If header's entity tag) names is the base of the edit (§11
@@ -1175,6 +1194,7 @@ type reqState struct {
 	err    *davError
 
 	hdr       http.Header // the request's
+	resp      http.Header // the answer's
 	ifMatch   string      // the revision a PUT's or DELETE's If-Match or If header names
 	matchAny  bool        // If-Match: *
 	noneMatch bool        // If-None-Match: *
@@ -1182,6 +1202,7 @@ type reqState struct {
 	// (scratch) at its document path, which exists for If-Match: *.
 	placeholder bool
 	bodyErr     error  // reading the request body failed
+	ctype       string // the type a written raw file was uploaded as (fileType): a PUT's Content-Type, a copy's source's
 	noETag      bool   // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
 	made        string // the revision commitDoc created or restored a document with
 	serve       *stagedServe

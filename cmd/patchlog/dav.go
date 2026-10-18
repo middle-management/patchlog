@@ -36,7 +36,7 @@ func davCmd(args []string) {
 	api := fs.String("api", "http://localhost:8080", "base URL of the patch-log API")
 	addr := fs.String("addr", "127.0.0.1:8090", "listen address of the WebDAV server")
 	var nss, cats multi
-	fs.Var(&nss, "ns", "flat namespace to serve, a directory of {name}.json files (repeatable or comma-separated)")
+	fs.Var(&nss, "ns", "flat namespace to serve, a directory of its files: raw ones by name, JSON documents as {name}.json (repeatable or comma-separated)")
 	fs.Var(&cats, "catalog", "catalog namespace to serve as a folder tree (Addendum B; repeatable or comma-separated)")
 	bearer := fs.String("bearer", "", "local mode: the grant every request is sent with (Authorization: Bearer)")
 	bearerFile := fs.String("bearer-file", "", "local mode: file holding -bearer")
