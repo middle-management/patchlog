@@ -182,7 +182,7 @@ func serve(args []string) {
 	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
 	var edgeGrantKeys multi
 	fs.Var(&edgeGrantKeys, "edge-grant-key", "[KID=]FILE: a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes -edge-grant-kid) (§C.5); a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, a random key per process, so cookies don't survive a restart, reach another instance or verify at an edge: an edge verifying cookies needs key files. FILE "+edgeSecretKey+" is the key derived from -edge-secret, for migrating to key files only: every holder of the edge secret, services included, can derive it and mint cookies with it")
-	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key given as a plain -edge-grant-key FILE, or of the random one without -edge-grant-key, which the cookies carry and a verifying edge looks the key up by (§C.5 \"Format\")")
+	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key given as a plain -edge-grant-key FILE, or of the random one without -edge-grant-key, which the cookies carry and a verifying edge looks the key up by (§C.5.3)")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)

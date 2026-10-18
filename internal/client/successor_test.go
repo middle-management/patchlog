@@ -9,10 +9,10 @@ import (
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
-// Moves (§8.1, §10): Head.Successor is what a plain namespace's 410 names,
+// Moves (§8.1, §11): Head.Successor is what a plain namespace's 410 names,
 // and Moved falls back to the document at Last where the 410 names none:
-// a sealed namespace, read with the client's keys, and an e2e one, folded
-// by E2E.Moved. ResolveSuccessor resolves a bare name against the
+// a sealed namespace, read with the client's keys. E2E.Moved always folds
+// it, ignoring a successor a 410 names. ResolveSuccessor resolves a bare name against the
 // namespace serving the 410. At E3 the client's validation leaves a
 // well-formed $successor out of the instance, as the server's does
 // (§6.2 step 5, §E.3.2), so a closed schema needn't declare it.

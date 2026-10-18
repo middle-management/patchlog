@@ -342,7 +342,8 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 }
 
 // edgeRole reports whether a role's rules qualify it for an edge grant
-// (§C.5): none refers to /resource, /now or the whole envelope.
+// (§2.1 Qualifying role, §C.5.2): none refers to /resource, /now or the
+// whole envelope.
 func edgeRole(rules []any) bool {
 	for _, rv := range rules {
 		r, err := compileCached(rv)
@@ -357,8 +358,8 @@ func edgeRole(rules []any) bool {
 }
 
 // edgeReadScope classifies the rules of a's blocks and key scope, which
-// apply on top of its roles (§C.5). It returns the names they fix
-// /resource to, those every fixing rule allows, in the order of the first
+// apply on top of its roles (§C.5.2). It returns the names they fix
+// /resource to (§2.1), those every fixing rule allows, in the order of the first
 // fixing rule, or nil if none fixes it; and false if a rule refers to /now
 // or to the whole envelope, or to /resource other than by fixing it, at
 // top level or inside all, or if the names are none or one isn't valid

@@ -2484,7 +2484,8 @@ older instance during one, lack them (see [Postgres](#postgres-d8)'s upgrade not
   it; it is read from that document where it is stored, a base's rows or a remote base's mirror
   included, and cached with the head. A `[]` restore brings the document back with its
   `$successor`; a client restoring a moved resource also removes it. Signatures, rules on
-  `/doc`, merges, imports, bundles and remote branches carry it as any content. The Go client
+  `/doc`, merges, imports, history bundles and remote branches carry it as any content
+  (snapshot bundles don't, see [Bundles](#bundles-g4)). The Go client
   reads it as `Head.Successor`; `Client.Moved` falls back to the document at `last` where the
   `410` names none, `E2E.Moved` always folds that document, verified, and ignores a successor
   the `410` names (none comes from a conforming server at E3, which is outside the trust
@@ -2513,7 +2514,10 @@ document of every head at every `ns_id`, not just the current ones; and while ol
 still write, no backfill could finish. They only go: a purge turns its entries into purges,
 and a namespace raised to sealed lists them on none of its pages from then on, and purges the
 copies cached before. `created` was always stored. In an encrypted-at-rest namespace the two
-columns are stored in the clear, as ids are, which hash plaintext patch sets too (§C.7).
+columns are stored in the clear, as ids are, which hash plaintext patch sets too (§C.7): a
+dump or backup, one taken before a purge included, whose keys the purge destroys, still lets
+anyone confirm a guess of a head's whole document against its digest, unless the document
+holds a `$nonce` (§C.7), as it can confirm a guess of a patch set against its id.
 
 **Beyond the spec.** A resource purge also purges the `/heads` pages of every namespace it
 reaches, which carry `heads:{ns}` besides `ns:{ns}` (§9). §8.3 accepts that a digest already

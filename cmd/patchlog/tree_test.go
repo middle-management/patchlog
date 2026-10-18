@@ -32,7 +32,7 @@ func TestTreeCatalogFlags(t *testing.T) {
 	}
 }
 
-// TestServiceEdgeGrantCookies (§B.11.5, §C.5 "Format"): the catalog
+// TestServiceEdgeGrantCookies (§B.11.5, §C.5.3): the catalog
 // service's edge-grant keys and kids are its own. -edge-grant-key is
 // repeatable, [KID=]FILE as the origin takes it, a plain FILE named by
 // -edge-grant-kid (default catalog-{catalog}): cookies are minted under
