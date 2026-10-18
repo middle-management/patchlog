@@ -69,7 +69,8 @@ func TestV050EdgeGrantsBodyShape(t *testing.T) {
 		{"grants not an array", req{body: map[string]any{"grants": reader}}, 400, "bad_input"},
 		{"an array", req{body: []any{reader}}, 400, "bad_input"},
 		{"malformed JSON", req{raw: `{"grants": [`}, 400, "bad_input"},
-		{"too large", req{raw: `{"grants": ["` + strings.Repeat("A", 600<<10) + `"]}`}, 413, "limit"},
+		// More than room for 50 grants: over the exchange's limits (§12).
+		{"too large", req{raw: `{"grants": ["` + strings.Repeat("A", 600<<10) + `"]}`}, 400, "bad_input"},
 		{"a grant too large", req{body: map[string]any{"grants": []any{reader, huge}}}, 413, "limit"},
 		{"not a grant", req{body: map[string]any{"grants": []any{reader, "x"}}}, 401, "unauthenticated"},
 		{"empty token", req{body: map[string]any{"grants": []any{""}}}, 401, "unauthenticated"},

@@ -116,11 +116,11 @@ func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 	if err != nil {
 		return nil, badInput("could not read body")
 	}
-	// Read before any grant is decoded, so grantSize is the deployment's
-	// (§6.6); measured counts the body's bytes read.
-	lim := bodyLimit{"grantSize", s.e.Limits().GrantSize}
+	// More than room for the grants an exchange takes is over its limits:
+	// 400 bad_input (§12, §C.5.2), not a grant's grantSize, which no grant
+	// was measured against. A grant too large is grantSize when decoded.
 	if len(body) > max {
-		return nil, tooLarge(len(body), lim)
+		return nil, tooLarge(len(body), noLimit)
 	}
 	if len(body) == 0 {
 		if c := creds(r); c.Bearer != "" {
@@ -135,7 +135,7 @@ func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 		return nil, &core.Error{Status: 415, Body: map[string]any{"code": "bad_input", "message": "use application/json"}}
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
-	v, err := readJSON(r, max, lim)
+	v, err := readJSON(r, max, noLimit)
 	if err != nil {
 		return nil, err
 	}

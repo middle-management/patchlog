@@ -121,13 +121,17 @@ func TestV055LimitGrantFields(t *testing.T) {
 	n := base64.URLEncoding.EncodedLen(int(gs))
 	expectLimit(t, e.write("PATCH", "sec", "y", "", addRoot(map[string]any{}), strings.Repeat("A", n)), 413, "grantSize", gs+1, gs)
 
-	// Edge-grant exchanges (§C.5.2): a grant too large, and a body too
-	// large to hold the grants it may, counted in the body's bytes read.
+	// Edge-grant exchanges (§C.5.2): a grant too large is grantSize; a
+	// body too large to hold the grants it may is over the exchange's
+	// limits, 400 bad_input (§12), with no sizes, since no grant measured
+	// them.
 	reader := e.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"})
 	expectLimit(t, e.issueGrants(reader, strings.Repeat("A", 12000)), 413, "grantSize", 9000, gs)
-	bound := core.MaxEdgeGrants*(len("biscuit:")+base64.URLEncoding.EncodedLen(int(gs))+4) + 4096
 	r := e.do(req{method: "POST", path: "/edge-grants", raw: `{"grants": ["` + strings.Repeat("A", 600<<10) + `"]}`})
-	expectLimit(t, r, 413, "grantSize", int64(bound+1), gs)
+	expectCode(t, r, 400, "bad_input")
+	if b := r.Obj(); b["limit"] != nil || b["measured"] != nil {
+		t.Fatalf("an oversized exchange body names sizes: %s", r.Body)
+	}
 }
 
 // §6.6: branchesPerNamespace, on creation and unfreezing, and branchDepth.
