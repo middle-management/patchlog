@@ -1,6 +1,7 @@
 package dav_test
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -253,4 +254,57 @@ func TestDeleteThenMoveOnto(t *testing.T) {
 	if h, _ := e.load("matches", "lid.tmp"); h.State != client.Live {
 		t.Fatalf("the temporary file is %v after the refused MOVE", h.State)
 	}
+}
+
+// A MOVE onto an existing file, or across trees or namespaces, deletes
+// only the revision of the source it copied (§H.5): someone else's edit of
+// the source made while the copy is written isn't tombstoned unseen; the
+// MOVE is a 409, the target holding the version moved and the source as
+// it is now.
+func TestMoveSourceChanged(t *testing.T) {
+	t.Parallel()
+	h := &hook{}
+	e := newEnv(t, []string{"docs", "other", "matches"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches")}}, withHook(h))
+	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	theirs := func(ns, name string) func() {
+		return func() { e.theirs(ns, name, map[string]any{"op": "add", "path": "/theirs", "value": "important"}) }
+	}
+	check := func(ns, name, what string) {
+		t.Helper()
+		hd, doc := e.load(ns, name)
+		if hd.State != client.Live || doc.(map[string]any)["theirs"] != "important" {
+			t.Fatalf("%s: the source %v %v", what, hd.State, doc)
+		}
+	}
+	e.create("docs", "a", map[string]any{"v": "a"})
+	e.create("docs", "b", map[string]any{"v": "b"})
+	h.set(at("PATCH", "/r/docs/b"), theirs("docs", "a"))
+	e.expect(e.do("MOVE", "/docs/a.json", "", "Destination", "/docs/b.json"), 409, "MOVE onto, the source edited meanwhile")
+	check("docs", "a", "onto")
+	_, b := e.load("docs", "b")
+	sameJSON(t, b, map[string]any{"v": "a"})
+
+	e.create("docs", "c", map[string]any{"v": "c"})
+	h.set(func(r *http.Request) bool {
+		return r.URL.Path == "/r/other/c" && r.Method != "GET" && r.Method != "HEAD"
+	}, theirs("docs", "c"))
+	e.expect(e.do("MOVE", "/docs/c.json", "", "Destination", "/other/c.json"), 409, "MOVE across, the source edited meanwhile")
+	check("docs", "c", "across")
+
+	e.create("matches", "derby", map[string]any{"title": "Derby"})
+	e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "root")})
+	e.create("matches", "cup", map[string]any{"title": "Cup"})
+	e.create("cat", "matches.cup", map[string]any{"title": "cup.json", "parents": parents("cat", "root")})
+	h.set(at("PATCH", "/r/matches/cup"), theirs("matches", "derby"))
+	e.expect(e.do("MOVE", "/cat/derby.json", "", "Destination", "/cat/cup.json"), 409, "a tree's MOVE onto, the source edited meanwhile")
+	check("matches", "derby", "a tree's onto")
+	if hn, _ := e.load("cat", "matches.derby"); hn.State != client.Live {
+		t.Fatalf("the source's placement %v", hn.State)
+	}
+	h.set(func(r *http.Request) bool {
+		return r.URL.Path == "/r/docs/d" && r.Method != "GET" && r.Method != "HEAD"
+	}, theirs("matches", "derby"))
+	e.expect(e.do("MOVE", "/cat/derby.json", "", "Destination", "/docs/d.json"), 409, "a tree's MOVE across, the source edited meanwhile")
+	check("matches", "derby", "a tree's across")
+	sameStrings(t, "tree", names(e.propfind("/cat/"), "/cat/"), []string{"cup.json", "derby.json"})
 }

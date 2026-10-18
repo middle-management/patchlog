@@ -532,7 +532,15 @@ func (st *reqState) newFile(ctx context.Context, t target, raw bool, v any, body
 	}
 	st.wroteTo = f.ns + "/" + item
 	if err := st.createNode(ctx, t.ns, node, doc); err != nil {
-		if _, derr := st.p.c.Delete(ctx, f.ns, item, rev); derr != nil {
+		// Deleted at once, a 429 waited out as a write's is, whether or
+		// not the client waits (§H.4): nothing else removes it.
+		dctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+		derr := st.retrying(dctx, func() (bool, error) {
+			_, err := st.p.c.Delete(dctx, f.ns, item, rev)
+			return false, err
+		})
+		cancel()
+		if derr != nil {
 			st.s.opt.Logf("dav: %s/%s: deleting the item created for a placement the core refused: %v", f.ns, item, derr)
 			return "", false, err
 		}
@@ -703,12 +711,14 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 // placement, then, where the tree owns the item's namespace (files.ns,
 // §H.2) and the grant allows it, its item, with $successor first where
 // successor names where it went (moveAcross); otherwise the item stays,
-// unplaced. A failure between the two leaves it so too (§H.4). A DELETE
-// whose If-Match isn't the item's head is a 412, before anything is
-// written. A node with several parents (a DAG) is unlinked from this
-// folder only. A principal's DELETE is remembered a while, so its write
-// of the path restores the file (§H.6).
-func (st *reqState) deleteFile(ctx context.Context, t target, successor string) error {
+// unplaced. A failure between the two leaves it so too (§H.4). With
+// ifMatch (a DELETE's If-Match, the revision a MOVE copied), an item
+// whose head isn't that revision is a 412, before anything is written,
+// or, if it changed between the check and its delete, after its
+// placement is restored as it was. A node with several parents (a DAG)
+// is unlinked from this folder only. A principal's DELETE is remembered a
+// while, so its write of the path restores the file (§H.6).
+func (st *reqState) deleteFile(ctx context.Context, t target, ifMatch, successor string) error {
 	cg, f, err := st.tree(ctx, t.ns)
 	if err != nil {
 		return err
@@ -717,8 +727,8 @@ func (st *reqState) deleteFile(ctx context.Context, t target, successor string) 
 	if err != nil {
 		return err
 	}
-	if st.ifMatch != "" && (h.State != client.Live || h.ID != st.ifMatch) {
-		return fail(http.StatusPreconditionFailed, "%s changed since %s (If-Match); reload it", t.path, st.ifMatch)
+	if ifMatch != "" && (h.State != client.Live || h.ID != ifMatch) {
+		return fail(http.StatusPreconditionFailed, "%s changed since %s (If-Match); reload it", t.path, ifMatch)
 	}
 	if n := cg.g.Node(t.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
 		return st.editParents(ctx, t.ns, t.node, t.parent, "", "")
@@ -729,10 +739,14 @@ func (st *reqState) deleteFile(ctx context.Context, t target, successor string) 
 	}
 	d := treeDelete{cat: t.ns, node: t.node, nodeTomb: ptomb, parent: t.parent, itemNS: t.docNS, itemName: t.docName}
 	if t.docNS == f.ns {
-		d.itemTomb, err = st.deleteItem(ctx, t.docNS, t.docName, st.ifMatch, successor)
+		d.itemTomb, err = st.deleteItem(ctx, t.docNS, t.docName, ifMatch, successor)
 		var de *davError
 		switch {
 		case err == nil, errors.Is(err, errNotExist):
+		case errors.As(err, &de) && de.status == http.StatusPreconditionFailed:
+			// Changed since the check: the file stays, placed, as it is.
+			st.undelete(ctx, st.s.nsInfo(ctx, st.p, t.ns), t.ns, t.node, ptomb, nil)
+			return de
 		case errors.As(err, &de) && (de.status == http.StatusUnauthorized || de.status == http.StatusForbidden):
 			// The grant doesn't delete there (under tree-derived access the
 			// catalog's key never does, §B.11.3): the item stays, unplaced.
@@ -1011,7 +1025,7 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	if err := st.writable(ctx, dst); err != nil {
 		return err
 	}
-	_, b, err := st.copyOfFile(ctx, src)
+	hd, b, err := st.copyOfFile(ctx, src)
 	if err != nil {
 		return err
 	}
@@ -1022,7 +1036,7 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 	if rev == "" {
 		return notMoved(src, dst)
 	}
-	return st.deleteSource(ctx, src, "")
+	return st.deleteSource(ctx, src, dst, hd.rev, "")
 }
 
 // notMoved refuses a MOVE whose copy wrote nothing to the core (an empty
@@ -1060,17 +1074,24 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 			succ = name
 		}
 	}
-	return st.deleteSource(ctx, src, succ)
+	return st.deleteSource(ctx, src, dst, hd.rev, succ)
 }
 
-// deleteSource deletes file src after its content went elsewhere (a MOVE):
-// a tree's file as a DELETE deletes it (deleteFile), a flat namespace's
-// resource; successor, if given, is where it went (§8.1).
-func (st *reqState) deleteSource(ctx context.Context, src target, successor string) error {
+// deleteSource deletes file src after its content, revision rev, went to
+// dst (a MOVE): a tree's file as a DELETE deletes it (deleteFile), a flat
+// namespace's resource; successor, if given, is where it went (§8.1).
+// Only rev is deleted: an edit someone made to src meanwhile, which dst
+// doesn't hold, leaves src as it is now, a 409.
+func (st *reqState) deleteSource(ctx context.Context, src, dst target, rev, successor string) error {
+	var err error
 	if src.kind == kPlacement {
-		return st.deleteFile(ctx, src, successor)
+		err = st.deleteFile(ctx, src, rev, successor)
+	} else {
+		_, err = st.deleteItem(ctx, src.docNS, src.docName, rev, successor)
 	}
-	_, err := st.deleteItem(ctx, src.docNS, src.docName, "", successor)
+	if de, ok := upstream(err).(*davError); ok && de.status == http.StatusPreconditionFailed {
+		return fail(http.StatusConflict, "%s was changed by someone else while it was moved: %s holds the version moved, and %s stays as it is now; reload both", src.path, dst.path, src.path)
+	}
 	return err
 }
 

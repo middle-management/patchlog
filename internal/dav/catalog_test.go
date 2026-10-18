@@ -913,3 +913,55 @@ func TestTreeRequests(t *testing.T) {
 		t.Fatalf("after MKCOL %v", names(l, "/cat/Season/"))
 	}
 }
+
+// A tree DELETE with If-Match whose item changes between the check and
+// its delete is a 412, the placement restored: the file stays as it is,
+// not unplaced (§H.5).
+func TestTreeDeleteIfMatchRace(t *testing.T) {
+	t.Parallel()
+	h := &hook{}
+	e := treeEnv(t, withHook(h))
+	g := e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET")
+	h.set(at("DELETE", "/r/cat/matches.derby"), func() {
+		e.theirs("matches", "derby", map[string]any{"op": "add", "path": "/theirs", "value": "important"})
+	})
+	e.expect(e.do("DELETE", "/cat/Season/derby.json", "", "If-Match", g.header.Get("ETag")), 412, "DELETE If-Match, the item edited meanwhile")
+	if hn, _ := e.load("cat", "matches.derby"); hn.State != client.Live {
+		t.Fatalf("placement %v", hn.State)
+	}
+	if hi, doc := e.load("matches", "derby"); hi.State != client.Live || doc.(map[string]any)["theirs"] != "important" {
+		t.Fatalf("item %v %v", hi.State, doc)
+	}
+	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+}
+
+// The item created for a new file whose placement the core refuses after
+// the dry run is deleted again, a 429 on that delete waited out (§H.4):
+// nothing else would remove it.
+func TestTreeNewFileCleanupRetried(t *testing.T) {
+	t.Parallel()
+	var placed, deleted atomic.Int32
+	e := treeEnv(t, func(c *clienttest.Options, _ *dav.Options) {
+		c.Wrap = func(h http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.Header.Get("X-Author") != "dav":
+				case strings.HasPrefix(r.URL.Path, "/r/cat/matches.") && r.Method != "GET" && r.Method != "HEAD" && placed.Add(1) == 1:
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusForbidden)
+					w.Write([]byte(`{"code": "forbidden", "message": "no placing now"}`))
+					return
+				case strings.HasPrefix(r.URL.Path, "/r/matches/") && r.Method == "DELETE" && deleted.Add(1) == 1:
+					w.Header().Set("Content-Type", "application/json")
+					w.Header().Set("Retry-After", "0")
+					w.WriteHeader(http.StatusTooManyRequests)
+					w.Write([]byte(`{"code": "rate", "message": "rate limit exceeded"}`))
+					return
+				}
+				h.ServeHTTP(w, r)
+			})
+		}
+	})
+	e.expect(e.do("PUT", "/cat/Season/new.md", "new"), 403, "PUT, its placement refused")
+	sameStrings(t, "matches", e.liveNames("matches"), []string{"derby"})
+}

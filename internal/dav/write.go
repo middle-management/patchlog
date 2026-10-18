@@ -142,8 +142,9 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			return false, fail(http.StatusPreconditionFailed, "%s/%s doesn't exist (If-Match: *)", ns, name)
 		}
 		var res *client.WriteResult
-		var parent any = map[string]any{}
+		var parent, out any = map[string]any{}, nil
 		var ps []any
+		var atBase bool
 		if h.State == client.NotFound {
 			doc := v
 			if in.nonce {
@@ -152,9 +153,19 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			ps = withNonce(in, doc, client.GenesisPatches(doc))
 			res, err = st.p.c.Create(ctx, ns, name, ps)
 			err = tooLarge(err, in, parent, ps, true, true)
-		} else if parent, ps, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
+		} else if parent, ps, out, atBase, err = st.restorePatches(ctx, in, ns, name, h, v); err == nil {
+			// Over opsPerSet or patchSetSize, a restore from the version
+			// the client had is written whole, as an edit is (§H.4).
+			whole := atBase && overSet(in, ps)
+			if whole {
+				ps = wholeDoc(in, parent, out)
+			}
 			res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
-			err = tooLarge(err, in, parent, ps, false, true)
+			if atBase && !whole && setTooLarge(err) {
+				ps = wholeDoc(in, parent, out)
+				res, err = st.p.c.Restore(ctx, ns, name, h.ID, ps)
+			}
+			err = tooLarge(err, in, parent, ps, false, atBase)
 			if err == nil {
 				st.p.markOwn(ns, name, res.ID)
 			}
@@ -181,27 +192,26 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 // others' edits are kept (without a base, the last live document is the
 // base, and the file as written wins); any other write is a new file, the
 // root replaced, which drops a $successor (§8.1), as does one over a raw
-// file's last document (another file now) or a pruned one (§8.6).
-func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, v any) (any, []any, error) {
-	whole := func() (any, []any, error) {
+// file's last document (another file now) or a pruned one (§8.6). It
+// returns the rebased document too, and whether its base is the last
+// live document, from which it may be written whole (§H.4).
+func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name string, h *client.Head, v any) (parent any, ps []any, out any, atBase bool, err error) {
+	last, err := st.tombBase(ctx, ns, name, h)
+	switch {
+	case err != nil:
+		return nil, nil, nil, false, err
+	case last == nil, last.raw != nil:
 		doc := v
 		if in.nonce {
 			doc = dropNonce(v)
 		}
-		return map[string]any{}, withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}), nil
+		return map[string]any{}, withNonce(in, doc, []any{map[string]any{"op": "replace", "path": "", "value": doc}}), doc, true, nil
 	}
-	last, err := st.tombBase(ctx, ns, name, h)
-	switch {
-	case err != nil:
-		return nil, nil, err
-	case last == nil, last.raw != nil:
-		return whole()
-	}
-	out, _, err := st.rebased(ctx, ns, name, v, h.Last, last.value)
+	out, atBase, err = st.rebased(ctx, ns, name, v, h.Last, last.value)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, false, err
 	}
-	return last.value, withNonce(in, out, merge.Diff(bare(last.value), out)), nil
+	return last.value, withNonce(in, out, merge.Diff(bare(last.value), out)), out, atBase, nil
 }
 
 // tombBase says how a write over tombstoned ns/name, head h, goes (§H.6

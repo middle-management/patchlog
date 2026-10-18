@@ -847,7 +847,7 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		if err := st.afterRefusedSave(ctx, t); err != nil {
 			return err
 		}
-		return st.deleteFile(ctx, t, "")
+		return st.deleteFile(ctx, t, st.ifMatch, "")
 	case kFolder:
 		return st.deleteFolder(ctx, t)
 	}

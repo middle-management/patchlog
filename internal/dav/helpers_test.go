@@ -12,6 +12,8 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -19,6 +21,44 @@ import (
 	"github.com/middle-management/patchlog/internal/dav"
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
+
+// hook runs f once, before the core serves the first request of the
+// WebDAV server's (X-Author: dav) that match takes: someone else acting in
+// the middle of a request.
+type hook struct {
+	mu    sync.Mutex
+	match func(*http.Request) bool
+	f     func()
+	fired atomic.Bool
+}
+
+func (h *hook) set(match func(*http.Request) bool, f func()) {
+	h.mu.Lock()
+	h.match, h.f = match, f
+	h.fired.Store(false)
+	h.mu.Unlock()
+}
+
+func withHook(h *hook) func(*clienttest.Options, *dav.Options) {
+	return func(o *clienttest.Options, _ *dav.Options) {
+		o.Wrap = func(next http.Handler) http.Handler {
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				h.mu.Lock()
+				m, f := h.match, h.f
+				h.mu.Unlock()
+				if m != nil && r.Header.Get("X-Author") == "dav" && m(r) && h.fired.CompareAndSwap(false, true) {
+					f()
+				}
+				next.ServeHTTP(w, r)
+			})
+		}
+	}
+}
+
+// at matches requests of method to path.
+func at(method, path string) func(*http.Request) bool {
+	return func(r *http.Request) bool { return r.Method == method && r.URL.Path == path }
+}
 
 func must[T any](v T, err error) T {
 	if err != nil {

@@ -330,3 +330,34 @@ func TestSaveRecordsForADay(t *testing.T) {
 	_, doc = e.load("docs", "y")
 	sameJSON(t, doc, map[string]any{"a": "mine", "b": "1"})
 }
+
+// A write moments after the user's own DELETE restores the file rebased
+// on its last live document (§H.6), and a restore patch set over
+// opsPerSet or patchSetSize is written whole from there, as an edit from
+// the head is (§H.4), in the flat view and in a tree, rather than refused
+// and the DELETE undone.
+func TestOversizeRestore(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"lim"}, []string{"cat"}, map[string]map[string]any{
+		"lim": {"limits": map[string]any{"opsPerSet": 3}},
+		"cat": {"catalog": treeCatalog("lim")},
+	})
+	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	e.create("lim", "ops", map[string]any{"a": "0", "b": "0", "c": "0", "d": "0"})
+	e.create("lim", "t", map[string]any{"a": "0", "b": "0", "c": "0", "d": "0"})
+	e.create("cat", "lim.t", map[string]any{"title": "t.json", "parents": parents("cat", "root")})
+	for _, c := range []struct{ path, ns, name string }{{"/lim/ops.json", "lim", "ops"}, {"/cat/t.json", "lim", "t"}} {
+		e.expect(e.do("GET", c.path, ""), 200, "GET "+c.path)
+		e.expect(e.do("DELETE", c.path, ""), 204, "DELETE "+c.path)
+		e.expect(e.do("PUT", c.path, `{"a": "2", "b": "2", "c": "2", "d": "2"}`), 201, "PUT over opsPerSet after the DELETE of "+c.path)
+		h, doc := e.load(c.ns, c.name)
+		if h.State != client.Live {
+			t.Fatalf("%s: %v", c.path, h.State)
+		}
+		sameJSON(t, doc, map[string]any{"a": "2", "b": "2", "c": "2", "d": "2"})
+		if p := patchPaths(t, e.lastEntry(c.ns, c.name).Patches); len(p) == 0 || p[0] != "" {
+			t.Fatalf("%s: not a root replace: %q", c.path, p)
+		}
+	}
+	sameStrings(t, "tree", names(e.propfind("/cat/"), "/cat/"), []string{"t.json"})
+}
