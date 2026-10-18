@@ -2697,41 +2697,40 @@ only.
   user aren't shown. A folder's listing reads the heads of its own items (a path's folders above
   only where a name is ambiguous), and the document of each revision once, for its size and type;
   through a tree service, none of them (below).
-- **Through a tree service** (§H.3, §H.7). With `-tree-url URL`, the base URL of a `patchlog
-  tree` following the served catalogs (`CATALOG=URL` for a catalog's own, repeatable, as `serve
-  -tree-url` takes them; `TreeService` and `TreeServices` in `dav.Options`), a folder is listed
-  from the tree service's `children` listing, read with the request's grant passed through as its
-  bearer (in local mode `-bearer`'s), which the tree service checks and filters the listing by
-  (§B.11.5): every page of it, at most 10 pages of 1000 entries, and a folder larger is `403`,
-  never listed cut short. A file's ETag is its entry's `head`, and its size, type and time the `file` metadata the
-  tree service adds (§H.3), so a folder lists in one request and no item is read for it; a
-  placement whose `file` is sealed (an item of a sealed namespace) isn't listed, and one without
-  `file`, or without its `modified`, is read from the core as above (an end-to-end namespace's
-  item isn't listed). Names are given as above, the same duplicates, escapes and case folding,
-  and a path resolves to what its folder lists, every folder on it listed. Placements of a
-  namespace the catalog doesn't trust are dangling (§B.5): the tree service doesn't list them,
-  and nor does this server, from the node documents either, where a catalog has a tree service.
-  Implicit placements (§B.9, `-self-placing`), which no node holds, aren't listed. A catalog whose
-  `catalog.title` is set is listed from its node documents, since the tree service gives
-  placements without a title their items' titles (§B.5) and a file is shown by its item's name
-  (§H.2). Listings are kept per token for 5 seconds, or until a write through this server. A grant
-  limited to some resources, which reads neither the catalog's namespace document nor its
-  `/heads` (§2.1, §7.4), lists through the tree service with the tree's settings
-  (`catalog.files`, `catalog.trust`) as last read with any grant, this server's own at start
-  included; until some grant read them, the tree answers `404`, and writes, which still read the
-  node documents, are refused it. The tree service unreachable is `502`, and its `503` (behind
-  the catalog, a sealed namespace's key) a `503` with its `Retry-After`: never an empty folder.
-  Its `401` and `403` are the user's grant refused, answered as the core's are (in local mode a
-  `401` refuses `-bearer`: `502`, naming the tree service).
+- **Through a tree service** (§H.3, §H.7). With `-tree-url URL`, the base URL of a `patchlog tree`
+  following the served catalogs (`CATALOG=URL` for a catalog's own, repeatable, as `serve -tree-url`
+  takes them; `TreeService` and `TreeServices` in `dav.Options`), a folder is listed from the tree
+  service's `children` listing, read with the request's grant passed through as its bearer (in local
+  mode `-bearer`'s), which the tree service checks and filters the listing by (§B.11.5): every page
+  of it, at most 10 pages of 1000 entries, and a folder larger is `403`, never listed cut short. A
+  file's ETag is its entry's `head`, and its size, type and time the `file` metadata the tree
+  service adds (§H.3), so a folder lists in one request and no item is read for it; a placement
+  whose `file` is sealed (an item of a sealed namespace) isn't listed, and one without `file`, or
+  without its `modified`, is read from the core as above (an end-to-end namespace's item isn't
+  listed). Names are given as above, the same duplicates, escapes and case folding, and a path
+  resolves to what its folder lists, every folder on it listed. Placements of a namespace the
+  catalog doesn't trust are dangling (§B.5): the tree service doesn't list them, and nor does this
+  server, from the node documents either, where a catalog has a tree service. Implicit placements
+  (§B.9, `-self-placing`), which no node holds, aren't listed. A catalog whose `catalog.title` is
+  set is listed from its node documents, since the tree service gives placements without a title
+  their items' titles (§B.5) and a file is shown by its item's name (§H.2). Listings are kept per
+  token for 5 seconds, or until a write through this server. A grant limited to some resources,
+  which reads neither the catalog's namespace document nor its `/heads` (§2.1, §7.4), lists through
+  the tree service with the tree's settings (`catalog.files`, `catalog.trust`) as last read with any
+  grant, this server's own at start included; until some grant read them, the tree answers `404`,
+  and writes, which still read the node documents, are refused it. The tree service unreachable is
+  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
+  `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
+  as the core's are (in local mode a `401` refuses `-bearer`: `502`, naming the tree service).
 - **Read-your-writes** through a tree service, which lags the core. For 30 seconds after a user's
-  write through this server (a new file or folder, a rename, a move, a delete, an edit, wherever
-  it is made, with any of their tokens), that user's listings of a tree carry `?min={ns}:{ns_id}` for each namespace entry
-  the write produced in the catalog or a namespace it trusts (the write's `X-Namespace-Revision`,
-  seen as the core answers it), which the tree service waits for (§B.5); other listings don't
-  wait. If it hasn't caught up within `-tree-wait` (3 s; the tree service's own `-min-wait`, 2 s,
-  answers sooner), or refuses a `min`, the folder is listed from the node documents instead, as
-  without a tree service, and so are the user's listings of that tree for 5 seconds; a grant that
-  can't read them gets `503` with `Retry-After`.
+  write through this server (a new file or folder, a rename, a move, a delete, an edit, wherever it
+  is made, with any of their tokens), that user's listings of a tree carry `?min={ns}:{ns_id}` for
+  each namespace entry the write produced in the catalog or a namespace it trusts (the write's
+  `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5);
+  other users' listings don't wait. If it hasn't caught up within `-tree-wait` (3 s; the tree
+  service's own `-min-wait`, 2 s, answers sooner), or refuses a `min`, the folder is listed from the
+  node documents instead, as without a tree service, and so are the user's listings of that tree for
+  5 seconds; a grant that can't read them gets `503` with `Retry-After`.
 - **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
   random base32 characters), and its placement titled with the name, under its folder: one
   `parents` entry, ordered after the folder's last ordered child, so new files list last, and
