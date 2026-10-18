@@ -484,7 +484,7 @@ func TestLimits(t *testing.T) {
 	// times over 45 seconds).
 	nh := must(e.c.NSHead(e.ctx, "small"))
 	must(e.c.PatchConfig(e.ctx, "small", nh.Config, []any{map[string]any{"op": "add", "path": "/frozen", "value": true}}))
-	r = e.expect(e.do("PUT", "/small/x.json", `{"v": 2}`), 403, "PUT to a frozen namespace")
+	r = e.expect(e.do("PUT", "/small/x.json", `{"v": 2, "big": "`+strings.Repeat("x", 2000)+`"}`), 403, "PUT to a frozen namespace")
 	if !strings.Contains(r.body, "frozen") || strings.Contains(r.body, "409") {
 		t.Fatalf("403 text %q", r.body)
 	}

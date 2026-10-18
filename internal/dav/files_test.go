@@ -739,3 +739,60 @@ func TestEmptyFiles(t *testing.T) {
 	}
 	e.expectTombstoned("matches", "empty.txt", "the moved file")
 }
+
+// One user's consecutive saves of a raw file never conflict with each
+// other, whatever their sizes: its base isn't picked by how close a
+// version's reference is to the upload (a version of the upload's size
+// differs in /$blob only), and the user's own writes since a version it
+// had are its own to replace, a stale If-Match too. Someone else's bytes
+// since any version the user had are a conflict, so an editor's buffer
+// isn't saved over them because a preview read them; a version saved
+// unchanged over them writes nothing.
+func TestRawOwnSaves(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}})
+	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	for _, p := range []string{"/docs/todo.md", "/cat/todo.md"} {
+		e.expect(e.do("PUT", p, "- [ ] milk\n"), 201, "create "+p)
+		e.expect(e.do("PUT", p, "- [ ] milk\n- [ ] eggs\n"), 201, "a longer save of "+p)
+		e.expect(e.do("PUT", p, "- [x] milk\n"), 201, "a save of the first one's size of "+p)
+		e.expect(e.do("GET", p, ""), 200, "GET "+p)
+		e.expect(e.do("PUT", p, "- [x] milk, and more\n"), 201, "a longer save after a GET of "+p)
+		e.expect(e.do("PUT", p, "- [x] MILK\n"), 201, "a save of the read one's size of "+p)
+		if g := e.expect(e.do("GET", p, ""), 200, "GET "+p); g.body != "- [x] MILK\n" {
+			t.Fatalf("%s: %q", p, g.body)
+		}
+	}
+	// A stale If-Match, after the user's own save.
+	e.rawDoc("docs", "a.txt", "text/plain", []byte("one"), nil)
+	g := e.expect(e.do("GET", "/docs/a.txt", ""), 200, "GET a.txt")
+	e.expect(e.do("PUT", "/docs/a.txt", "two"), 201, "PUT a.txt")
+	e.expect(e.do("PUT", "/docs/a.txt", "six", "If-Match", g.header.Get("ETag")), 201, "PUT with the tag from before the user's save")
+	if _, data := e.rawOf("docs", "a.txt"); string(data) != "six" {
+		t.Fatalf("a.txt %q", data)
+	}
+
+	// An editor's version, someone else's bytes, a preview reading them.
+	e.rawDoc("docs", "b.txt", "text/plain", []byte("one"), nil)
+	e.expect(e.do("GET", "/docs/b.txt", ""), 200, "GET editor")
+	h, _ := e.load("docs", "b.txt")
+	bid := must(e.c.UploadBlob(e.ctx, "docs", "b.txt", "text/plain", "", []byte("theirs")))
+	must(e.c.Append(e.ctx, "docs", "b.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
+	e.expect(e.do("GET", "/docs/b.txt", ""), 200, "GET preview")
+	e.expect(e.do("PUT", "/docs/b.txt", "mine"), 409, "PUT the editor's buffer")
+	// Saved unchanged, the editor's version writes nothing over theirs.
+	e.rawDoc("docs", "c.txt", "text/plain", []byte("one"), nil)
+	e.expect(e.do("GET", "/docs/c.txt", ""), 200, "GET")
+	h, _ = e.load("docs", "c.txt")
+	bid = must(e.c.UploadBlob(e.ctx, "docs", "c.txt", "text/plain", "", []byte("theirs")))
+	must(e.c.Append(e.ctx, "docs", "c.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
+	h, _ = e.load("docs", "c.txt")
+	r := e.expect(e.do("PUT", "/docs/c.txt", "one"), 201, "PUT the version read, unchanged")
+	if r.header.Get("ETag") != "" {
+		t.Fatalf("ETag %q for what isn't the head's content", r.header.Get("ETag"))
+	}
+	e.expectLive("docs", "c.txt", h, "after an unchanged save")
+	if _, data := e.rawOf("docs", "c.txt"); string(data) != "theirs" {
+		t.Fatalf("c.txt %q", data)
+	}
+}

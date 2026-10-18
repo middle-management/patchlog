@@ -57,12 +57,18 @@ func TestSaveBases(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 	sameJSON(t, e.lastEntry("docs", "x").Patches, []any{replace("/a", "mine")})
 
-	// Two clients of one principal edit from the same GET.
+	// Two clients of one principal edit from the same GET: the second
+	// save reads as an edit of the GET's version (c1's change kept) as
+	// well as an undo of c1's save with an edit (TestSaveOwnRevert), which
+	// differ at /a, so it is a 409 rather than either; after a reload it
+	// keeps c1's change.
 	e.create("docs", "y", map[string]any{"a": "1", "b": "1"})
 	c1 := e.expect(e.do("GET", "/docs/y.json", ""), 200, "GET c1").body
 	c2 := e.expect(e.do("GET", "/docs/y.json", ""), 200, "GET c2").body
 	e.expect(e.do("PUT", "/docs/y.json", edit(t, c1, `"a": "1"`, `"a": "c1"`)), 201, "PUT c1")
-	e.expect(e.do("PUT", "/docs/y.json", edit(t, c2, `"b": "1"`, `"b": "c2"`)), 201, "PUT c2")
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, c2, `"b": "1"`, `"b": "c2"`)), 409, "PUT c2")
+	c2 = e.expect(e.do("GET", "/docs/y.json", ""), 200, "reload c2").body
+	e.expect(e.do("PUT", "/docs/y.json", edit(t, c2, `"b": "1"`, `"b": "c2"`)), 201, "PUT c2 after the reload")
 	_, doc = e.load("docs", "y")
 	sameJSON(t, doc, map[string]any{"a": "c1", "b": "c2"})
 
@@ -666,4 +672,28 @@ func TestSaveDeleteThenWriteFails(t *testing.T) {
 	sameJSON(t, e.parentsOf("docs.p"), parents("cat", "root"))
 	_, doc := e.load("docs", "p")
 	sameJSON(t, doc, map[string]any{"v": 1})
+}
+
+// A save that reads as an edit of more than one version the user had,
+// with different results, isn't applied as either (§H.4): an undo of the
+// user's own save combined with a new edit looks like a second program's
+// edit from the version before that save. Taken as the latter, the undo
+// was dropped, with a 2xx; it is a 409, and after a reload the save goes
+// through as sent.
+func TestSaveOwnRevert(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	e.create("docs", "x", map[string]any{"a": "orig", "b": "orig"})
+	e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET")
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "changed", "b": "orig"}`), 201, "save")
+	h, _ := e.load("docs", "x")
+	r := e.expect(e.do("PUT", "/docs/x.json", `{"a": "orig", "b": "changed"}`), 409, "undo the save and edit")
+	if !strings.Contains(r.body, "/a") {
+		t.Fatalf("409 %q", r.body)
+	}
+	e.expectLive("docs", "x", h, "after the refused save")
+	e.expect(e.do("GET", "/docs/x.json", ""), 200, "reload")
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "orig", "b": "changed"}`), 201, "save after the reload")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"a": "orig", "b": "changed"})
 }

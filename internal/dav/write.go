@@ -197,7 +197,7 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 	case last == nil, last.raw != nil:
 		return whole()
 	}
-	out, _, err := st.rebased(ctx, ns, name, v, h.Last, last.value, bare)
+	out, _, err := st.rebased(ctx, ns, name, v, h.Last, last.value)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -261,7 +261,7 @@ func (st *reqState) edit(ctx context.Context, in nsInfo, ns, name, head string, 
 	case cur.raw != nil:
 		return "", false, false, fail(http.StatusConflict, "%s/%s is a raw file, shown as %s: a JSON file can't take its name (§H.2)", ns, name, name)
 	}
-	out, atHead, err := st.rebased(ctx, ns, name, v, head, cur.value, bare)
+	out, atHead, err := st.rebased(ctx, ns, name, v, head, cur.value)
 	if err != nil {
 		return "", false, false, err
 	}
@@ -463,12 +463,11 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 	return cs, false, nil
 }
 
-// rebased returns v, a save of ns/name, rebased on head, revision headRev
-// (§11.3, §H.4), and whether its base is the head, the same content (or
-// none is known, and the head is the base: the file as written wins).
-// view is what of a document a save compares and writes: bare, a JSON
-// file's rendering, whose $successor therefore stays; refOf, a raw file's
-// reference. v, head and the result are as view shows them.
+// rebased returns v, a save of JSON file ns/name, rebased on head,
+// revision headRev (§11.3, §H.4), and whether its base is the head, the
+// same content (or none is known, and the head is the base: the file as
+// written wins). Documents are compared and written as rendered (bare),
+// so a $successor stays; v, head and the result are so.
 //
 // The base is the candidate (candidates) closest to v, the one its edit
 // changes the fewest paths of: an editor's buffer is the version it
@@ -482,25 +481,28 @@ func (st *reqState) candidates(ctx context.Context, ns, name string) ([]candidat
 // What isn't guessed: the result may change a path of head only where
 // every candidate agrees with head (unsafe), so whichever one the client
 // really had, no edit someone else made since is undone or overwritten
-// unseen; and an edit from a base before a delete or restore by someone
-// else (spans) isn't merged over it. A save that can't be rebased so is a
-// 409, which asks for a reload (refuse); so is one whose records were
-// lost.
-func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev string, head any, view func(any) any) (any, bool, error) {
+// unseen; an edit from a base before a delete or restore by someone else
+// (spans) isn't merged over it; and where another candidate, taken as the
+// base, would give another result as safely (ambiguous), as an undo of
+// the principal's own save combined with a new edit and a second
+// program's edit from the version before that save do, the save isn't
+// applied as either. A save that can't be rebased so is a 409, which asks
+// for a reload (refuse); so is one whose records were lost.
+func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev string, head any) (any, bool, error) {
 	cs, lost, err := st.candidates(ctx, ns, name)
 	if err != nil {
 		return nil, false, err
 	}
 	for i := range cs {
-		cs[i].doc = view(cs[i].doc)
+		cs[i].doc = bare(cs[i].doc)
 	}
-	mine, head := view(v), view(head)
+	mine, head := bare(v), bare(head)
 	if lost {
 		if jsonv.Equal(mine, head) {
 			return head, true, nil
 		}
 		st.s.refuse(st.p, ns, name)
-		return nil, false, fail(http.StatusConflict, "%s/%s: the version you edited is no longer to be had (this server's records of it were dropped, or the core pruned it, §8.6), so your changes can't be told from others'; reload it and edit again", ns, name)
+		return nil, false, lostBase(ns, name)
 	}
 	if len(cs) == 0 {
 		out, _ := rebase(head, mine, head, nil)
@@ -527,7 +529,11 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev
 			}
 		}
 	}
-	sp, err := st.spans(ctx, ns, name, headRev, cs, tied)
+	all := make([]int, len(cs))
+	for i := range all {
+		all[i] = i
+	}
+	sp, err := st.spans(ctx, ns, name, headRev, cs, all)
 	if err != nil {
 		return nil, false, err
 	}
@@ -545,6 +551,10 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev
 		out, clash := rebase(cs[i].doc, mine, head, s.writes)
 		if len(clash) == 0 {
 			if clash = unsafe(out, head, cs); len(clash) == 0 {
+				if amb := ambiguous(cs, dist, sp, i, mine, head, out); amb != nil {
+					st.s.refuse(st.p, ns, name)
+					return nil, false, fail(http.StatusConflict, "%s/%s: your save reads as an edit of more than one version you were served or wrote, which give different results at %s (an undo of a save of yours combined with a new edit, and another program's edit from the version before that save, look alike; §H.4); reload it and save again", ns, name, strings.Join(amb, ", "))
+				}
 				return out, jsonv.Equal(cs[i].doc, head), nil
 			}
 		}
@@ -557,6 +567,42 @@ func (st *reqState) rebased(ctx context.Context, ns, name string, v any, headRev
 		return nil, false, fail(http.StatusConflict, "%s/%s was deleted or restored by someone else since you opened it (§11.3): your changes aren't merged over that; reload it and edit again", ns, name)
 	}
 	return nil, false, conflict(ns, name, why)
+}
+
+// ambiguous returns where another candidate than cs[i], taken as the
+// base as safely (rebase, unsafe), gives another result than out, or nil:
+// then the save can't be told for an edit of one version rather than the
+// other (§H.4 "if the closest records disagree … a conflict", here of
+// any two). A candidate the save equals (dist 0) is its save unchanged,
+// which the undo of a later write of the principal's, if chosen, is
+// meant over, and one from before someone else's delete or restore is
+// never a base.
+func ambiguous(cs []candidate, dist []int, sp map[string]span, i int, mine, head, out any) []string {
+	for j, c := range cs {
+		if j == i || dist[j] == 0 || sp[c.rev].foreign || jsonv.Equal(c.doc, cs[i].doc) {
+			continue
+		}
+		o, clash := rebase(c.doc, mine, head, sp[c.rev].writes)
+		if len(clash) > 0 || len(unsafe(o, head, cs)) > 0 || jsonv.Equal(o, out) {
+			continue
+		}
+		var at []string
+		for _, p := range writesOf(out, merge.Diff(out, o)) {
+			s := p.String()
+			if s == "" {
+				s = "(the whole document)"
+			}
+			at = append(at, s)
+		}
+		return at
+	}
+	return nil
+}
+
+// lostBase is a save's refusal where the versions it may have been made
+// from are no longer known (records.go, §8.6).
+func lostBase(ns, name string) error {
+	return fail(http.StatusConflict, "%s/%s: the version you edited is no longer to be had (this server's records of it were dropped, or the core pruned it, §8.6), so your changes can't be told from others'; reload it and edit again", ns, name)
 }
 
 // span is what the log says happened between a candidate base and the
@@ -895,6 +941,7 @@ func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer
 		}
 	}
 	st.committed = true
+	st.p.markOwn(ns, name, res.ID)
 	exact := doc != nil && same(doc)
 	r := record{rev: res.ID, wrote: true, paths: paths}
 	var e *docEntry
