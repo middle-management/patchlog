@@ -566,6 +566,7 @@ func (st *reqState) wrote(ns, name string, parent any, ps []any, paths []pointer
 			doc = nil
 		}
 	}
+	st.committed = true
 	exact := doc != nil && jsonv.Equal(doc, v)
 	r := record{rev: res.ID, wrote: true, paths: paths}
 	var e *docEntry

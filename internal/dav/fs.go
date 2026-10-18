@@ -71,8 +71,17 @@ func resourceOf(file string) (string, bool) {
 	return name, ok && client.ValidResourceName(name)
 }
 
-// resolve says what name names for the request's principal.
+// resolve says what name names for the request's principal, noting the
+// document path the request writes (saveTo).
 func (st *reqState) resolve(ctx context.Context, name string) (target, error) {
+	t, err := st.resolveName(ctx, name)
+	if err == nil && t.isDoc() && (st.method == "PUT" && t.path == st.path || (st.method == "MOVE" || st.method == "COPY") && t.path == st.dst) {
+		st.saveTo = t.path
+	}
+	return t, err
+}
+
+func (st *reqState) resolveName(ctx context.Context, name string) (target, error) {
 	name = slashClean(name)
 	t := target{path: name, dir: path.Dir(name), base: path.Base(name)}
 	if name == "/" {
@@ -644,10 +653,16 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		if _, live, err := st.docAt(ctx, t); err != nil {
 			return err
 		} else if live {
+			if err := st.afterRefusedSave(t); err != nil {
+				return err
+			}
 			return st.deleteDoc(ctx, t.docNS, t.docName, st.ifMatch)
 		}
 	case kFolder, kPlacement:
 		if t.kind == kPlacement {
+			if err := st.afterRefusedSave(t); err != nil {
+				return err
+			}
 			// A placement whose item isn't live (dangling, §B.3) isn't
 			// listed, but its path unplaces it: else it would keep its
 			// folder from being deleted, with nothing to show for it.
@@ -665,6 +680,21 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 		return errNotExist
 	}
 	return nil
+}
+
+// afterRefusedSave refuses, once, a DELETE of the document's file t that
+// follows the principal's refused save of it (refusedSaveFor), unless it
+// names the revision it deletes.
+func (st *reqState) afterRefusedSave(t target) error {
+	if st.ifMatch != "" {
+		return nil
+	}
+	r, ok := st.p.takeRefusedSave(t.path, st.s.opt.Now())
+	if !ok {
+		return nil
+	}
+	return fail(http.StatusConflict, "%s wasn't deleted: this DELETE follows a refused save of the same file (%d, moments ago), and some clients (rclone) delete a file whose upload failed; delete it again to delete it",
+		t.path, r.status)
 }
 
 func (d *davFS) Rename(ctx context.Context, oldName, newName string) error {

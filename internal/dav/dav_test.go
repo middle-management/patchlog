@@ -459,6 +459,10 @@ func TestLimits(t *testing.T) {
 	if !strings.Contains(r.body, "frozen") || strings.Contains(r.body, "409") {
 		t.Fatalf("403 text %q", r.body)
 	}
+	// A DELETE right after the refused save is refused as such, once
+	// (rclone's cleanup of a failed upload); sent again, the core
+	// refuses it.
+	e.expect(e.do("DELETE", "/small/x.json", ""), 409, "DELETE after the refused save")
 	e.expect(e.do("DELETE", "/small/x.json", ""), 403, "DELETE in a frozen namespace")
 	e.expect(e.do("PUT", "/small/new.json", `{"v": 1}`), 403, "create in a frozen namespace")
 }

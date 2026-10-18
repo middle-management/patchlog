@@ -401,6 +401,7 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 		if client.IsStale(err) || client.IsGone(err) {
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile", cat, name)
 		}
+		st.committed = st.committed || err == nil
 		return false, err
 	})
 }

@@ -390,6 +390,22 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.ServeHTTP(&errWriter{ResponseWriter: w, st: st, realm: s.realm()}, r.WithContext(context.WithValue(r.Context(), stateKey{}, st)))
 }
 
+// answered keeps what the request's answer, status, says of the
+// principal's saves for a DELETE that follows (refusedSaveFor): a save
+// of a document's file refused without writing to the core is noted; one
+// done, or a GET of the file answered whole, forgets it. It runs before
+// the answer goes out, so the client's next request finds it.
+func (st *reqState) answered(status int) {
+	switch {
+	case st.saveTo != "" && status >= 400 && !st.committed:
+		st.p.noteRefusedSave(st.saveTo, status, st.s.opt.Now())
+	case st.saveTo != "" && status < 400:
+		st.p.clearRefusedSave(st.saveTo)
+	case st.method == "GET" && status == http.StatusOK:
+		st.p.clearRefusedSave(st.path)
+	}
+}
+
 // lockTimeout is a LOCK's Timeout header (RFC 4918 §10.7) within max: its
 // first value, Infinite or none (infinite) as max.
 func lockTimeout(h string, max time.Duration) string {
@@ -945,9 +961,10 @@ type principal struct {
 	dropped bool
 	ns      map[string]nsInfo
 	cats    map[string]*catGraph
-	locked  map[string]time.Time // its locks' tokens, and when they expire
-	deletes map[string]ownDelete // by ns/name: its latest DELETEs
-	aside   map[string]time.Time // documents' paths moved aside to a backup, and when
+	locked  map[string]time.Time   // its locks' tokens, and when they expire
+	deletes map[string]ownDelete   // by ns/name: its latest DELETEs
+	aside   map[string]time.Time   // documents' paths moved aside to a backup, and when
+	refused map[string]refusedSave // by document path: its refused saves lately
 }
 
 // setAside remembers that the principal moved the document at name aside
@@ -1014,10 +1031,67 @@ func (p *principal) forgetDelete(ns, name string) {
 	delete(p.deletes, ns+"/"+name)
 }
 
+// A refused save of a document's file (a PUT, or a MOVE or COPY onto it,
+// answered 4xx or 5xx, that wrote nothing of it) makes the principal's
+// next DELETE of the same path within refusedSaveFor a 409, once, unless
+// the principal read the file (a GET answered 200) or saved it since:
+// rclone deletes a file whose upload failed, a second after the failure
+// (removeFailedCopy), and that DELETE would tombstone the document for
+// every reader, or unplace the placement, because a save was refused. A
+// DELETE naming the revision it deletes (If-Match) is deliberate and
+// passes; so does the DELETE sent again.
+const refusedSaveFor = 10 * time.Second
+
+// refusedSave is a refused save: when, and the status it was answered.
+type refusedSave struct {
+	at     time.Time
+	status int
+}
+
+// noteRefusedSave remembers that a save of the document at path was
+// refused (status) at now.
+func (p *principal) noteRefusedSave(path string, status int, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for k, r := range p.refused {
+		if now.Sub(r.at) > refusedSaveFor {
+			delete(p.refused, k)
+		}
+	}
+	if _, ok := p.refused[path]; !ok && len(p.refused) >= maxDeletes {
+		var old string
+		for k, r := range p.refused {
+			if old == "" || r.at.Before(p.refused[old].at) {
+				old = k
+			}
+		}
+		delete(p.refused, old)
+	}
+	p.refused[path] = refusedSave{at: now, status: status}
+}
+
+// takeRefusedSave returns, once, the principal's refused save of the
+// document at path within refusedSaveFor of now.
+func (p *principal) takeRefusedSave(path string, now time.Time) (refusedSave, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	r, ok := p.refused[path]
+	delete(p.refused, path)
+	return r, ok && now.Sub(r.at) <= refusedSaveFor
+}
+
+// clearRefusedSave forgets a refused save of the document at path: the
+// principal read the file since, or saved it.
+func (p *principal) clearRefusedSave(path string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.refused, path)
+}
+
 func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
 	return &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
 		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, locked: map[string]time.Time{}, deletes: map[string]ownDelete{}, aside: map[string]time.Time{},
-		used: s.opt.Now()}
+		refused: map[string]refusedSave{}, used: s.opt.Now()}
 }
 
 // reqState is one request's view, in its context: the principal, what
@@ -1044,6 +1118,12 @@ type reqState struct {
 	noETag      bool   // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
 	made        string // the revision commitDoc created or restored a document with
 	serve       *stagedServe
+	// saveTo is the document path the request writes (a PUT's, a MOVE's
+	// or COPY's destination), once resolved; committed: the request wrote
+	// to the core (a revision, a catalog node), not counting a restore of
+	// the principal's own DELETE as it was (undoOwnDelete).
+	saveTo    string
+	committed bool
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog

@@ -168,6 +168,7 @@ func (w *errWriter) WriteHeader(code int) {
 		if code == http.StatusUnauthorized {
 			w.Header().Set("WWW-Authenticate", w.realm)
 		}
+		w.st.answered(code)
 		w.ResponseWriter.WriteHeader(code)
 		return
 	}
@@ -183,6 +184,7 @@ func (w *errWriter) WriteHeader(code int) {
 		h.Set("WWW-Authenticate", w.realm)
 	}
 	h.Set("Content-Type", "text/plain; charset=utf-8")
+	w.st.answered(e.status)
 	w.ResponseWriter.WriteHeader(e.status)
 	io.WriteString(w.ResponseWriter, e.msg+"\n")
 	w.swallow = true
