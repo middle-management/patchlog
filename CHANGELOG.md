@@ -157,7 +157,9 @@ service's listings.
     folder's emptiness is the node documents', and a folder is deleted, or a file in several
     folders unlinked from one, only while still named as the path named it. A grant limited to
     some resources edits the files it lists and reads; a new file or folder, a move or a delete
-    by it, which the node documents decide, is `403`, a move before anything is written. A user's listings after their own writes,
+    by it, which the node documents decide, is `403`, a move before anything is written, as is a
+    move whose source the grant's verbs (`GET /ns/{ns}/principal`'s `can`) don't let it delete,
+    a tree's file or a flat one (only what rules decide is met after the copy). A user's listings after their own writes,
     through any of their tokens, wait for the entries those produced (`?min=`, keyed by the
     writes' `X-Namespace-Revision`) until a listing that waited came back, for at most 10
     minutes, each up to `-tree-wait`, then read the node documents (a token that can't read

@@ -1319,3 +1319,42 @@ func TestTreeServiceLimitedGrantMoveWritesNothing(t *testing.T) {
 		t.Fatalf("derby is %v", h.State)
 	}
 }
+
+// A MOVE whose source the grant can't delete, its verbs in the namespace
+// the delete is made in lacking delete (§C.2: here a common editor's
+// read, create and append), or, a flat file moved to another namespace,
+// the append setting its $successor (§8.1), is refused before anything is
+// written (§H.5): a tree's file onto another listed file or to a new name
+// in a flat namespace, a flat file onto another or into a tree. The
+// destination keeps its content or isn't made, and the source stays.
+func TestTreeServiceNoDeleteMoveWritesNothing(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"matches"} })
+	bob := a.k.Grant(t, a.s.Now(), "user:bob", a.both, []string{"read", "create", "append"})
+	carl := a.k.Grant(t, a.s.Now(), "user:carl", a.both, []string{"read", "create", "delete"})
+	sameStrings(t, "bob's Season", names(g.propfindAs(bob, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
+	// Each namespace's head moves with any write in it (§7.4).
+	heads := func() string {
+		return must(a.w.NSHead(a.ctx, "matches")).ID + " " + must(a.w.NSHead(a.ctx, "cat")).ID
+	}
+	for _, c := range []struct{ who, tok, src, dst, verb string }{
+		{"bob", bob, "/cat/Season/derby.json", "/cat/Season/cup.json", "delete"},
+		{"bob", bob, "/cat/Season/derby.json", "/matches/moved.json", "delete"},
+		{"bob", bob, "/matches/derby.json", "/matches/cup.json", "delete"},
+		{"bob", bob, "/matches/derby.json", "/cat/Season/moved.json", "delete"},
+		{"carl", carl, "/matches/derby.json", "/cat/Season/moved.json", "append"},
+	} {
+		before := heads()
+		r := g.doAs(c.tok, "MOVE", c.src, "", "Destination", c.dst, "Overwrite", "T")
+		if r.status != 403 || !strings.Contains(r.body, "doesn't allow "+c.verb) || !strings.Contains(r.body, "nothing was written") {
+			t.Errorf("%s's MOVE of %s to %s: %d %q", c.who, c.src, c.dst, r.status, r.body)
+		}
+		if after := heads(); after != before {
+			t.Errorf("%s's refused MOVE of %s to %s wrote: heads %s -> %s", c.who, c.src, c.dst, before, after)
+		}
+	}
+	if h, _ := g.load("matches", "derby"); h.State != client.Live {
+		t.Errorf("derby is %v", h.State)
+	}
+}

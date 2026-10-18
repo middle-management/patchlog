@@ -2746,7 +2746,10 @@ rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
   "write a temporary file, rename it over" saves land (§H.5); `Overwrite: F` is `412`. A copy then
   delete deletes only the revision of the source it copied: one someone edited meanwhile stays as
   it is, and the MOVE is a `409` (the target holds the version moved). The source isn't deleted
-  for a copy that wrote nothing. A JSON
+  for a copy that wrote nothing. A copy then delete whose source the grant can't delete, as the
+  core's `GET /ns/{ns}/principal` lists its verbs there (no `delete`, or no `append` for the
+  `$successor` a move to another namespace sets), is `403` before anything is written; what only
+  the grant's rules decide is known at the delete, which leaves the copy. A JSON
   file keeps a `{name}.json` name and a raw file a raw one, and a JSON file whose root isn't an
   object can't carry `$successor`: those MOVEs are `403` (copy, then delete). COPY to a new name
   creates it from the content (a raw file's bytes read through this server), and COPY over a
@@ -2911,6 +2914,10 @@ only.
   file, then deletes the source; where its item is deleted, its last revision first takes
   `$successor` naming the copy (§8.1: a bare name in the same namespace, else `/r/{ns}/{name}`),
   in one batch with the tombstone, unless its root isn't an object (a JSON array moves without).
+  A MOVE onto a file or across whose source's placement the grant's verbs in the catalog don't
+  let it delete (`delete`, or `append` to unlink a file in several folders) is `403` before
+  anything is written, as is one by a grant that doesn't read the node documents; what only the
+  grant's rules decide is known at the delete, which leaves the copy.
 - **Copy** makes a new item with the source's content, and a placement for it: a raw file's blob
   keeps its id and is copied with `Blob-From` (§7.8), or uploaded again where the core refuses
   that (a source of a higher rank, such as a private namespace's, into a public one). Folders

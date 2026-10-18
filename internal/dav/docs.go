@@ -123,10 +123,12 @@ func (s *Server) keep(k string, e *docEntry) {
 // limited to some resources learns though it can't read the namespace
 // document: whether it is sealed or end-to-end (not offered here, §H.7),
 // frozen, whether writes add a fresh $nonce (§C.7) and whether the
-// namespace requires one, and the limits in force (§6.6, the deployment's
-// defaults and maximums applied; 0 where not known); and, of a catalog,
+// namespace requires one, the limits in force (§6.6, the deployment's
+// defaults and maximums applied; 0 where not known), and the verbs the
+// grant allows there (can, nil where not known); and, of a catalog,
 // what its document says: its trust list (§B.3) and file tree (§H.2).
 type nsInfo struct {
+	can                   map[string]bool
 	sealed                bool
 	frozen                bool // §8.4: it takes no writes, a DELETE neither
 	nonce                 bool
@@ -144,6 +146,7 @@ type nsInfo struct {
 // at at, or the core's refusal of it (err: a 401, 403, 404 or 410).
 type writerAt struct {
 	w   client.WriterInfo
+	can []string // the verbs the grant allows there (§7.4 can); nil if not said
 	err error
 	at  time.Time
 }
@@ -203,11 +206,21 @@ func (s *Server) nsInfo(ctx context.Context, tk *token, ns string) nsInfo {
 // settings drops it sooner (davError.refresh).
 func (s *Server) writerTTL() time.Duration { return min(30*time.Second, s.opt.VerifyEvery) }
 
-// keepWriter keeps ns's writer block w, as tk was given it at now.
-func (tk *token) keepWriter(ns string, w client.WriterInfo, now time.Time) {
+// keepWriter keeps ns's writer block and verbs, as tk was given them at
+// now (pi, GET /ns/{ns}/principal).
+func (tk *token) keepWriter(ns string, pi *client.PrincipalInfo, now time.Time) {
 	tk.mu.Lock()
-	tk.writers[ns] = writerAt{w: w, at: now}
+	tk.writers[ns] = writerOf(pi, now)
 	tk.mu.Unlock()
+}
+
+// writerOf is what nsInfo keeps of principal answer pi, given at now.
+func writerOf(pi *client.PrincipalInfo, now time.Time) writerAt {
+	wa := writerAt{w: pi.Writer, at: now}
+	if _, said := pi.Raw["can"].([]any); said {
+		wa.can = append([]string{}, pi.Can...)
+	}
+	return wa
 }
 
 // forgetNS drops what tk was given of ns (its writer block, its
@@ -248,7 +261,7 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 		case err != nil:
 			wa = writerAt{err: err, at: now}
 		default:
-			wa = writerAt{w: pi.Writer, at: now}
+			wa = writerOf(pi, now)
 		}
 		tk.mu.Lock()
 		tk.writers[ns] = wa
@@ -264,6 +277,12 @@ func (s *Server) nsInfoErr(ctx context.Context, tk *token, ns string) (nsInfo, e
 		size := func(k string) int { n, _ := w.Size(k); return int(n) }
 		in.patchSetSize, in.docSize = size("patchSetSize"), size("documentSize")
 		in.opsPerSet, in.blobSize = size("opsPerSet"), size("blobSize")
+		if wa.can != nil {
+			in.can = map[string]bool{}
+			for _, v := range wa.can {
+				in.can[v] = true
+			}
+		}
 	}
 	if s.cats[ns] {
 		d, err := s.nsDoc(ctx, tk, ns)

@@ -1439,17 +1439,40 @@ func (st *reqState) moveOnto(ctx context.Context, src, dst target) error {
 }
 
 // sourceDeletable refuses, before a MOVE writes anything, one whose
-// source is a tree's file the grant can't delete: a delete in a tree is
+// source the grant can't delete, since a copy written before that 403
+// would leave the destination replaced or made and the source there, a
+// refused request with a lasting effect: a tree's file, whose delete is
 // made from the node documents (writeTree), which a grant limited to some
-// resources doesn't read (§H.7 "Limited grants"), and a copy written
-// before that 403 would leave the destination replaced and the source
-// there, a refused request with a lasting effect.
+// resources doesn't read (§H.7 "Limited grants"), and is the tombstone of
+// its placement, or for one in several folders an append unlinking it
+// (deleteFile), which the grant's verbs in the catalog must allow; a flat
+// namespace's file, a tombstone its verbs there must allow (allows).
+// What only rules decide (§C.2) isn't known before the core is asked:
+// such a refusal of the delete still leaves the copy.
 func (st *reqState) sourceDeletable(ctx context.Context, src target) error {
-	if src.kind != kPlacement {
-		return nil
+	ns, verb := src.docNS, "delete"
+	if src.kind == kPlacement {
+		cg, _, err := st.writeTree(ctx, src.ns)
+		if err != nil {
+			return err
+		}
+		ns = src.ns
+		if n := cg.g.Node(src.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
+			verb = "append"
+		}
 	}
-	_, _, err := st.writeTree(ctx, src.ns)
-	return err
+	return st.allows(ctx, src, ns, verb)
+}
+
+// allows refuses a MOVE of src whose delete takes verb in ns where the
+// grant's verbs there (GET /ns/{ns}/principal can, §7.4) don't include
+// it; where they aren't known (that read failed, an older core), the
+// core's refusal of the delete is the answer.
+func (st *reqState) allows(ctx context.Context, src target, ns, verb string) error {
+	if can := st.s.nsInfo(ctx, st.tk, ns).can; can != nil && !can[verb] {
+		return fail(http.StatusForbidden, "%s isn't moved: the grant doesn't allow %s in %s, which deleting it takes (§C.2), so it would stay where it is beside the copy; nothing was written", src.path, verb, ns)
+	}
+	return nil
 }
 
 // notMoved refuses a MOVE whose copy wrote nothing to the core (an empty
@@ -1475,6 +1498,19 @@ func (st *reqState) moveAcross(ctx context.Context, src, dst target) error {
 	hd, b, err := st.copyOfFile(ctx, src)
 	if err != nil {
 		return err
+	}
+	if src.kind != kPlacement {
+		// Its last revision takes $successor first, an append, where its
+		// root is an object (deleteItem).
+		e, err := st.entry(ctx, &hd)
+		if err != nil {
+			return err
+		}
+		if _, obj := e.value.(map[string]any); obj {
+			if err := st.allows(ctx, src, src.docNS, "append"); err != nil {
+				return err
+			}
+		}
 	}
 	st.wroteTo = ""
 	rev, _, err := st.commitRev(ctx, dst, b)

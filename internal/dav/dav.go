@@ -1338,7 +1338,7 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey,
 	}
 	s.idUsers.put(id, idUser{user: key, vns: v.ns, issuer: issuerKey(v)})
 	tk.verified, tk.vns = now, v.ns
-	tk.keepWriter(v.ns, v.info.Writer, now)
+	tk.keepWriter(v.ns, v.info, now)
 	s.useLocked(tk, now)
 	return tk, nil
 }
