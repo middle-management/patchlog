@@ -143,7 +143,7 @@ On a sprite the stack's URL (`https://{sprite}-{org}.sprites.app`) routes to the
 
 This starts the core server in dev mode, seeds a few demo namespaces and documents, and runs the
 search index, the tree service and the branch janitor, all behind a local CDN (Varnish, see
-[The local CDN](#the-local-cdn-9)):
+[The local CDN](#the-local-cdn-9)), and the WebDAV gateway beside it:
 
 | URL | What |
 |---|---|
@@ -155,10 +155,11 @@ search index, the tree service and the branch janitor, all behind a local CDN (V
 | http://localhost:8080/playground/tree/cat/roots | the same, through the core's read-only proxy (`-tree-url`) |
 | http://localhost:8080/playground/index/demo?q=derby | the search index, through the core's read-only proxy (`-index-url`) |
 | http://localhost:9080, :9081, :9082 | the core, search and tree origins directly, bypassing the CDN |
+| http://localhost:8090 | WebDAV gateway (`patchlog dav`): `demo` and `files` as flat directories, `drive` as a file tree; any user name, password `patchlog-dev` (see [WebDAV in the stack](#webdav-in-the-stack)) |
 
 The seed creates `schemas`, `demo` (a few matches, with catalog roles), two catalogs of `demo`,
-`private` (sealed, E2) and `vault` (end-to-end, E3: create its keyring from the playground's Keys
-tab). The catalogs:
+`files` and `drive` (a file tree of `files`), `private` (sealed, E2) and `vault` (end-to-end, E3:
+create its keyring from the playground's Keys tab). The catalogs:
 
 - `cat`, `mode: tree` (one parent per node, §B.6): folders, placements, `$access`, an embargoed
   folder with `inherit: false`, and one dangling placement.
@@ -170,9 +171,14 @@ tab). The catalogs:
   `group:catalog-admins`' desk on the root reaches it only around `editorial`. `loop-a` and
   `loop-b` are each other's parents: the tree service flags that cycle under
   `/topics/problems` and lists neither. [deploy/seed.sh](deploy/seed.sh) draws the whole DAG.
+- `drive`, a file tree (`catalog.files`, see [File trees](#file-trees-h2-h3)) whose items live in
+  `files`: folders `Reports` and `Photos` under its root, and in them `Q3 summary.md` and
+  `README.txt` as raw documents (a blob and a document whose root is its reference, §7.8),
+  `logo.png`, a raw PNG, and `budget.json`, a JSON document. Its rules are `cat`'s, for `files`'
+  items, and §H.2's titles. [deploy/seed.sh](deploy/seed.sh) draws it.
 
-One tree service serves both (`-catalog=cat -catalog=topics`), each at `/{catalog}/…` with its own
-database.
+One tree service serves the three (`-catalog=cat -catalog=topics -catalog=drive`), each at
+`/{catalog}/…` with its own database.
 
 Spec v0.46 additions to the catalog and tree services:
 
@@ -193,10 +199,58 @@ Spec v0.46 additions to the catalog and tree services:
 - Data lives in the `data` volume: databases, pruning archives, and the at-rest master key,
   which is created on first start.
 - Ports and the origin can be changed with `PATCHLOG_PORT`, `INDEX_PORT`, `TREE_PORT` (the
-  CDN's), `CORE_DIRECT_PORT`, `INDEX_DIRECT_PORT`, `TREE_DIRECT_PORT` (the origins') and
-  `PATCHLOG_ORIGIN`.
+  CDN's), `CORE_DIRECT_PORT`, `INDEX_DIRECT_PORT`, `TREE_DIRECT_PORT` (the origins'), `DAV_PORT`
+  (the WebDAV gateway's) and `PATCHLOG_ORIGIN`.
 - Without Docker, `make dev` runs just the core server, and `make check` runs vet, the tests and
   a gofmt check.
+
+### WebDAV in the stack
+
+`dav` in compose.yaml is the WebDAV gateway (see [WebDAV](#webdav-prototype)) in local mode
+against the dev core, so its writes carry `X-Author: dav`. Open http://localhost:8090/ with any
+user name and the password `patchlog-dev`. It serves `demo` and `files` as flat directories of
+their documents, and `drive` as a file tree whose folders are listed by the tree service:
+
+```
+/demo/derby.json …                    demo's matches, as JSON files
+/files/q3-summary.md …                the namespace files: drive's items, by resource name
+/drive/README.txt                     the file tree drive (§H.2): a raw document, text/plain
+/drive/Reports/Q3 summary.md          a raw document, text/markdown
+/drive/Reports/budget.json            a JSON document
+/drive/Photos/logo.png                a raw document, image/png
+```
+
+The password is a compose config, `${DAV_PASSWORD:-patchlog-dev}`, which reaches the gateway as a
+file only the container's user can read (`DAV_PASSWORD=… docker compose up -d` changes it). It is a
+development password, published here, and the gateway speaks plain HTTP: keep port 8090 to your
+own machine, as with the rest of the stack.
+
+- **macOS Finder**: Go → Connect to Server (⌘K), `http://localhost:8090/`, then Connect as a
+  Registered User with any name and `patchlog-dev`.
+- **Windows**: File Explorer → This PC → Map network drive, folder `http://localhost:8090/`, or
+  `net use Z: http://localhost:8090/ /user:me patchlog-dev`. Windows' WebClient sends Basic
+  credentials over HTTPS only, by default. For this plain-HTTP gateway, set `BasicAuthLevel` to
+  `2` under `HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters` and restart the
+  WebClient service, or serve the gateway over HTTPS (`-tls-cert`, `-tls-key`).
+- **rclone**, a remote of vendor `other`:
+
+  ```sh
+  rclone config create pl-dev webdav url=http://localhost:8090/ vendor=other user=me \
+    pass=patchlog-dev --obscure
+  rclone ls pl-dev:drive
+  rclone mount pl-dev: ~/pl --vfs-cache-mode writes --ignore-size \
+    --dir-cache-time 1s --vfs-cache-max-age 5s --vfs-cache-poll-interval 5s
+
+  # Or without a config, the :webdav: backend:
+  rclone ls --webdav-url http://localhost:8090/ --webdav-vendor other --webdav-user me \
+    --webdav-pass "$(rclone obscure patchlog-dev)" :webdav:drive
+  ```
+
+  Copies and syncs to it take `--ignore-size --ignore-times`; see **rclone** under
+  [WebDAV](#webdav-prototype) for why, and for the mount's flags.
+- **davfs2** (Linux): `sudo mount -t davfs http://localhost:8090/ /mnt/pl`, then any user name and
+  `patchlog-dev` when asked (or put `http://localhost:8090/ me patchlog-dev` in
+  `/etc/davfs2/secrets`).
 
 ### The local CDN (§9)
 
