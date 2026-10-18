@@ -1053,3 +1053,196 @@ func TestGatewaySwitchRefusedRoom(t *testing.T) {
 	_, doc := e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"v": 3, "w": 1})
 }
+
+// The record of where a person's grants verify (kidNS, by kid and sub)
+// keeps every served namespace that accepted one, the first never pushed
+// out by later ones (§H.7 "a reminted token is the same person"): four
+// more namespaces accepting a grant of the same kid and sub (a
+// stranger's, whose key is named "k" too and mints sub user:alice, or
+// alice's own single-namespace grants) don't make docs, which verified
+// her first, lose its place to alpha, which sorts first and is given her
+// key later: her token minted again is still docs' user, with her swap
+// file, and her save without If-Match is rebased on what she read.
+func TestGatewayStableUserManyNamespaces(t *testing.T) {
+	t.Parallel()
+	for _, variant := range []string{"a stranger's", "alice's own"} {
+		t.Run(variant, func(t *testing.T) {
+			e, k := authEnv(t, true, func(o *dav.Options) { o.Namespaces = []string{"alpha", "docs", "z1", "z2", "z3", "z4"} })
+			key := clienttest.NewKey("k")
+			if variant == "alice's own" {
+				key = k
+			}
+			writer := []string{"read", "create", "append", "restore", "delete"}
+			alice := k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
+			e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+			buf := e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "alice's GET (verified by docs)").body
+			e.expect(e.doAs(alice, "PUT", "/docs/.x.json.swp", "swap"), 201, "alice's swap file")
+			h, _ := e.load("docs", "x")
+			must(e.c.Append(e.ctx, "docs", "x", h.ID, []any{map[string]any{"op": "replace", "path": "/w", "value": 2}}))
+			for i := 1; i <= 4; i++ {
+				ns := fmt.Sprintf("z%d", i)
+				op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, ns)))
+				must(op.CreateNamespace(e.ctx, ns, map[string]any{"read": "grant", "keys": []any{key.Entry("*")}}))
+				tok := key.Grant(t, e.s.Now(), "user:alice", []string{ns}, []string{"read"})
+				e.expect(e.doAs(tok, "PROPFIND", "/"+ns+"/", "", "Depth", "1"), 207, ns+"'s listing for (k, user:alice)")
+			}
+			op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+			must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+			again := k.Grant(t, e.s.Now().Add(time.Second), "user:alice", []string{"alpha", "docs"}, writer)
+			if r := e.expect(e.doAs(again, "GET", "/docs/.x.json.swp", ""), 200, "alice's swap file by her token minted again"); r.body != "swap" {
+				t.Fatalf("alice's swap file %q", r.body)
+			}
+			e.expect(e.doAs(again, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 201, "alice's save, no If-Match")
+			_, doc := e.load("docs", "x")
+			sameJSON(t, doc, map[string]any{"v": 2, "w": 2})
+		})
+	}
+}
+
+// Who each token was verified as (idUsers), what lets a token dropped
+// while idle be seen to come back as another user (TestGatewaySwitchAfterSweep),
+// is bounded per user, not only over all users: narrowing is offline and
+// free, so mallory logging in with more narrowings of her one grant than
+// the gateway keeps ids for at all pushes out only her own. alice's token,
+// swept meanwhile and verified again as another user, is still seen to
+// switch, and her save from before is a 409, not rebased on the head.
+// The bounds are made small here (16384 and 256 in use).
+func TestGatewayIDUsersFlood(t *testing.T) {
+	t.Parallel()
+	clk := &testClock{t: time.Now()}
+	e, k := authEnv(t, true)
+	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"alpha", "docs"}, Gateway: true,
+		Now: clk.now, VerifyEvery: time.Minute, Logf: t.Logf}))
+	const all, perUser = 256, 16
+	dav.SetIDUsers(srv, all, perUser)
+	e.dav = newTestServer(t, srv)
+	writer := []string{"read", "create", "append", "restore", "delete", "config"}
+	op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, "alpha")))
+	must(op.CreateNamespace(e.ctx, "alpha", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"alpha", "docs"}, writer)
+	mallory := k.Grant(t, e.s.Now(), "user:mallory", []string{"docs"}, []string{"read"})
+	e.create("docs", "x", map[string]any{"v": 1, "w": 1})
+	buf := e.expect(e.doAs(alice, "GET", "/docs/x.json", ""), 200, "alice's GET, verified by alpha").body
+	h, _ := e.load("docs", "x")
+	must(e.c.Append(e.ctx, "docs", "x", h.ID, []any{map[string]any{"op": "replace", "path": "/w", "value": 2}}))
+	ac := e.s.Client(t, client.WithBearer(k.Grant(t, e.s.Now(), "user:admin", []string{"alpha"}, writer)))
+	nh := must(ac.NSHead(e.ctx, "alpha"))
+	must(ac.PatchConfig(e.ctx, "alpha", nh.Config, []any{map[string]any{"op": "replace", "path": "/keys", "value": []any{clienttest.NewKey("k2").Entry("*")}}}))
+	clk.add(2 * time.Minute)
+	// mallory's logins (the first sweeps alice's idle token), fewer at once
+	// than her tokens kept, so each is admitted.
+	var wg sync.WaitGroup
+	ch := make(chan int)
+	for w := 0; w < 4; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range ch {
+				tok := narrowed(t, mallory, map[string]any{"via": fmt.Sprintf("m%d", i)})
+				if r := e.doAs(tok, "GET", "/docs/.nothing", ""); r.status != 404 {
+					t.Errorf("mallory's login %d: %d %s", i, r.status, r.body)
+				}
+			}
+		}()
+	}
+	for i := 0; i < all+perUser; i++ {
+		ch <- i
+	}
+	close(ch)
+	wg.Wait()
+	e.expect(e.doAs(alice, "PUT", "/docs/x.json", strings.Replace(buf, `"v": 1`, `"v": 2`, 1)), 409, "alice's save from before, verified again as another user after mallory's logins")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"v": 1, "w": 2})
+}
+
+// A key set the core's jwks_uri answers 200 with a body that isn't a JWK
+// Set (`{}`, a proxy's JSON error page for an unrouted /.well-known) is a
+// failed read, as a 404 is (TestGatewayOperatorKeys404), not an empty
+// set: an operator grant for alice's sub, whose kid docs' key carries,
+// isn't taken for alice and doesn't read her swap file.
+func TestGatewayOperatorKeysNotASet(t *testing.T) {
+	t.Parallel()
+	for _, body := range []string{`{"error":"no route"}`, `{}`} {
+		t.Run(body, func(t *testing.T) {
+			ctx := context.Background()
+			s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
+			k := clienttest.NewKey("operator")
+			op := s.Client(t, client.WithBearer(s.OperatorGrant(t, "docs")))
+			must(op.CreateNamespace(ctx, "docs", map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}))
+			rp := httputil.NewSingleHostReverseProxy(must(url.Parse(s.URL)))
+			rp.Transport = s.HTTP.Client().Transport
+			front := newTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if strings.HasPrefix(r.URL.Path, "/.well-known/") {
+					w.Header().Set("Content-Type", "application/json")
+					io.WriteString(w, body)
+					return
+				}
+				rp.ServeHTTP(w, r)
+			}))
+			srv := must(dav.New(dav.Options{Client: must(client.New(front.URL)), Namespaces: []string{"docs"}, Gateway: true, Logf: t.Logf}))
+			e := &env{t: t, ctx: ctx, s: s, dav: newTestServer(t, srv)}
+			alice := k.Grant(t, s.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append"})
+			e.expect(e.doAs(alice, "PUT", "/docs/.notes.md.swp", "alice's unsaved draft"), 201, "alice's swap file")
+			opAlice := clienttest.Mint(t, s.OperatorKey, map[string]any{"kid": "operator", "sub": "user:alice", "ns": []any{"docs"},
+				"can": []any{"read"}, "exp": s.Now().Add(time.Hour).Format(time.RFC3339)})
+			e.expect(e.doAs(opAlice, "GET", "/docs/.notes.md.swp", ""), 401, "the operator grant, the key set answered 200 "+body)
+		})
+	}
+}
+
+// ns, can, roles and groups are sets (§C.1, §C.2): alice's token minted
+// again with the same rights listed in another order (or one listed
+// twice) is in the same scope (§H.7 "a reminted token is the same
+// person"), and reads her swap file.
+func TestGatewayScopeListOrder(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true, func(o *dav.Options) { o.Namespaces = []string{"docs", "notes"} })
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"docs", "notes"}, []string{"read", "create", "append"},
+		map[string]any{"groups": []any{"eng", "ops"}, "roles": []any{"editor", "viewer"}})
+	again := k.Grant(t, e.s.Now().Add(time.Minute), "user:alice", []string{"notes", "docs"}, []string{"append", "create", "read", "read"},
+		map[string]any{"groups": []any{"ops", "eng"}, "roles": []any{"viewer", "editor"}})
+	e.expect(e.doAs(alice, "PUT", "/docs/.x.json.swp", "swap"), 201, "alice's swap file")
+	if r := e.expect(e.doAs(again, "GET", "/docs/.x.json.swp", ""), 200, "alice's swap file by her token minted again, the same rights in another order"); r.body != "swap" {
+		t.Fatalf("alice's swap file %q", r.body)
+	}
+}
+
+// Tokens narrowed offline keep scopes per chain, the token their
+// narrowing started from: a delegate holding one narrowed token of
+// alice's narrows it 8 times and keeps a scratch file in each scope,
+// which fills only its chain's pool (its next narrowing is 503), not that
+// of alice's own read-only narrowing for her phone or another delegate's.
+// Chains are bounded too, a new one making room among the others' idle
+// scopes: once 8 other chains each keep a file, a new one is 503, and
+// alice's tokens as issued are untouched (§H.6, §H.7).
+func TestGatewayNarrowedChains(t *testing.T) {
+	t.Parallel()
+	e, k := authEnv(t, true)
+	alice := k.Grant(t, e.s.Now(), "user:alice", []string{"docs"}, []string{"read", "create", "append", "restore", "delete"})
+	e.create("docs", "x", map[string]any{"v": 1})
+	e.expect(e.doAs(alice, "PUT", "/docs/.x.json.swp", "unsaved edits"), 201, "alice's swap file")
+	mallory := narrowed(t, alice, map[string]any{"via": "user:mallory"})
+	for i := 0; i < 8; i++ {
+		tok := narrowed(t, mallory, map[string]any{"via": fmt.Sprintf("m%d", i)})
+		e.expect(e.doAs(tok, "PUT", fmt.Sprintf("/docs/.m%d.swp", i), "m"), 201, "the delegate's scratch file")
+	}
+	e.expect(e.doAs(narrowed(t, mallory, map[string]any{"via": "m8"}), "GET", "/docs/x.json", ""), 503, "the delegate's ninth narrowing, its 8 scopes each keeping a file")
+	phone := narrowed(t, alice, map[string]any{"can": []any{"read"}})
+	e.expect(e.doAs(phone, "GET", "/docs/x.json", ""), 200, "alice's own read-only narrowing for her phone")
+	carol := narrowed(t, alice, map[string]any{"via": "user:carol"})
+	e.expect(e.doAs(carol, "GET", "/docs/x.json", ""), 200, "another delegate's token")
+	// Seven more chains, each keeping a file: the phone's and carol's
+	// idle scopes make room.
+	for i := 0; i < 7; i++ {
+		tok := narrowed(t, alice, map[string]any{"via": fmt.Sprintf("svc:%d", i)})
+		e.expect(e.doAs(tok, "PUT", fmt.Sprintf("/docs/.c%d.swp", i), "c"), 201, "a chain's scratch file")
+	}
+	r := e.expect(e.doAs(narrowed(t, alice, map[string]any{"via": "svc:new"}), "GET", "/docs/x.json", ""), 503, "a new chain, 8 others each keeping a file")
+	if r.header.Get("Retry-After") == "" {
+		t.Fatalf("503 without Retry-After: %v", r.header)
+	}
+	e.expect(e.doAs(narrowed(t, mallory, map[string]any{"via": "m0"}), "GET", "/docs/.m0.swp", ""), 200, "the delegate's scratch file, kept")
+	if r := e.expect(e.doAs(alice, "GET", "/docs/.x.json.swp", ""), 200, "alice's swap file"); r.body != "unsaved edits" {
+		t.Fatalf("alice's swap file %q", r.body)
+	}
+}

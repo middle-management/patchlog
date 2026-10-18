@@ -206,21 +206,26 @@ service's listings.
     grant names, keeps nothing for one the core hasn't accepted (`401`; a purged namespace is
     `410`, an absent one `404` to an operator grant; one an operator key signed `401`, told by
     its signature under the operator key history at `jwks_uri`, unless the namespace lists that
-    key under that kid too, as the core serves it), asks again every 5 minutes (at most the 15
+    key under that kid too, as the core serves it; a key set it can't read, a `200` that isn't a
+    JWK Set too, has the core asked of each grant), asks again every 5 minutes (at most the 15
     minutes edge grants live) or after the core's `401`, and keys its state by the root `sub`
     and `kid` `/principal` names (with the namespace that verified it, asked first again for the
-    same token, kept past the token, and for its kid and sub), never the token, so every token
+    same token, kept past the token for the 256 tokens of each user verified last, and for its
+    kid and sub, every served namespace that did, the first never pushed out), never the token,
+    so every token
     of one person, minted again or attenuated offline, shares their records, guards, own
     tombstones and the writes their tree listings wait for; a token verified again as another
     user (once admitted as that user) must read every document its old user had records of
     itself before saving it without a base, the new user's other tokens unaffected. Scratch
     files, locks and dead properties are shared by the tokens the issuer minted with the same
-    rights (the root block's `ns`, `can`, `roles`, `rules`, `groups`, `attrs`), and a token
+    rights (the root block's `ns`, `can`, `roles`, `rules`, `groups`, `attrs`, the sets in any
+    order), and a token
     minted limited to some resources or attenuated offline (another ns, can, rules, a via) has
     its own. A refused token loses its access and has the user's other tokens asked again; the
     user's state stays for their accepted tokens. At most 256 users and 8 tokens a user, and 8
-    scopes of tokens as issued and 8 of tokens narrowed offline, one keeping scratch files or
-    locks never dropped to make room (`MaxPrincipals`, `MaxTokensPerPrincipal`). Writer settings (frozen,
+    scopes of tokens as issued and 8 of tokens narrowed offline from each of at most 8 tokens
+    (a delegate's narrowings fill only its own), one keeping scratch files or locks never
+    dropped to make room (`MaxPrincipals`, `MaxTokensPerPrincipal`). Writer settings (frozen,
     nonces, level, limits in force) come from `/principal`'s writer block, which a grant
     limited to some resources gets too, kept per token for 30 seconds and asked again after a
     refusal over one of them; what is read with a grant (documents, catalog trees, tree-service

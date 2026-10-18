@@ -2293,10 +2293,11 @@ core only through its public API, and keeps nothing but memory caches.
   each user may read and write, and the revisions are the grant's subject's. Nothing is kept for
   a grant before the core has accepted it: `GET /ns/{ns}/principal` (§7.4) in a served namespace
   the grant names until one accepts it: first the one that accepted this token before (kept past
-  the token), then those that accepted a grant of its root `kid` and `sub` (up to 4, in the order
-  they did), then at most three of the rest, sorted, so a namespace created or given the key
-  later, or another namespace's key with the same `kid`, doesn't make the same person someone
-  else. It checks only that the grant names the namespace and verifies, key scope and revocation included, the
+  the token, for the 256 tokens of each user verified last, so one user's logins with thousands
+  of narrowings push out only their own), then those that accepted a grant of its root `kid` and
+  `sub` (every served namespace that did, in the order they did, so later ones never push out the
+  first), then at most three of the rest, sorted, so a namespace created or given the key later,
+  or another namespace's key with the same `kid`, doesn't make the same person someone else. It checks only that the grant names the namespace and verifies, key scope and revocation included, the
   same in a public namespace (whose reads ignore a bad grant) as in a private one, so a grant
   limited to some resources, or without `read`, is accepted too (§H.7 "Limited grants"). Its
   `401` is no usable grant; a `410` there is a purged namespace, and a `404` one that doesn't
@@ -2307,8 +2308,9 @@ core only through its public API, and keeps nothing but memory caches.
   every login asking meanwhile, and after a failed read not for 30 s) under which its signature
   verifies, so a namespace key that carries the same `kid` is never mistaken for it; unless the
   namespace lists that very key under that `kid` too, which makes it the namespace's grant, as
-  the core serves it. While the key set can't be read (a `404` too: a proxy not routing
-  `/.well-known`), the core is asked of each grant whether the namespace's own keys verify it.
+  the core serves it. While the key set can't be read (a `404` too, or a `200` whose body isn't a
+  JWK Set, an object with a `keys` array: a proxy not routing `/.well-known`), the core is asked
+  of each grant whether the namespace's own keys verify it.
   It is asked again every 5 minutes (`VerifyEvery`, at most the 15 minutes edge grants live,
   §C.5.2), or at the next request after the core answered it `401`, so a revoked grant, or one
   its key's scope no longer covers, is refused within that time. A refused token loses its
@@ -2333,7 +2335,8 @@ core only through its public API, and keeps nothing but memory caches.
   tokens aren't refused). Temporary files, locks and dead properties, which may hold what one token read (a
   document's backup copy, an editor's swap file with its text), carry over between the tokens
   the issuer minted with the same rights (the root block's `ns`, `can`, `roles`, `rules`,
-  `groups` and `attrs`, whatever its times), but a token minted limited to some resources
+  `groups` and `attrs`, whatever its times, and whatever the order `ns`, `can`, `roles` and
+  `groups` list them in), but a token minted limited to some resources
   (§C.5.1) or attenuated offline (a narrowing block with another `ns`, `can`, `rules` or a `via`:
   a delegate) has its own, and no token reaches the temporary files of a namespace its grant
   doesn't name (§H.6 "served only to that user"). It keeps temporary files and locks (a lock
@@ -2342,9 +2345,11 @@ core only through its public API, and keeps nothing but memory caches.
   with the user (in a gateway, after an hour idle, or to make room: at most 256 users,
   `MaxPrincipals`, and 8 tokens a user, `MaxTokensPerPrincipal`, so more tokens push out only that
   user's, which are verified again when they come back; never one with a request in flight). Of
-  a user's sets of temporary files and locks, 8 are kept for tokens as issued and 8 for tokens
-  narrowed offline: one that holds temporary files or locks is never dropped to make room, a new
-  one is `503` then. The bounds on temporary files are the user's, over those sets, so a token
+  a user's sets of temporary files and locks, 8 are kept for tokens as issued, and 8 for tokens
+  narrowed offline from each token their narrowing started from (a delegate's own narrowings
+  stay within its 8, not those of the user's other narrowed tokens), from at most 8 such tokens:
+  one that holds temporary files or locks is never dropped to make room, a new one is `503`
+  then. The bounds on temporary files are the user's, over those sets, so a token
   that reads less can tell from its `507`s how much the user's other tokens keep (the size of a
   backup copy). And the versions of each
   document the user was served or wrote, the bases of their saves (below), with the tombstones

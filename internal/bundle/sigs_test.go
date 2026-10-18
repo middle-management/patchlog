@@ -371,7 +371,11 @@ func grantsHandler(grants map[string]*grant.Grant, grantFor func(author string) 
 				return
 			}
 			if r.URL.Path == "/.well-known/patchlog-keys" {
-				body, _ := json.Marshal(map[string]any{"keys": jwks})
+				// A JWK Set, as the core serves it: "keys" an array, empty
+				// for none (null isn't a set, client.OperatorKeys).
+				keys := []map[string]any{}
+				keys = append(keys, jwks...)
+				body, _ := json.Marshal(map[string]any{"keys": keys})
 				w.Header().Set("Content-Type", "application/json")
 				w.Write(body)
 				return

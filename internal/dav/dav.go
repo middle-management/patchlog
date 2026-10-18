@@ -202,8 +202,8 @@ type Server struct {
 	mu           sync.Mutex
 	tokens       map[string]*token           // gateway mode, by grant hash
 	principals   map[string]*principal       // gateway mode, by user (userKey)
-	kidNS        lru.Cache[string, []string] // gateway mode, by root kid and sub: the namespaces that accepted a grant of them, first first (verify)
-	idUsers      lru.Cache[string, idUser]   // gateway mode, by token id: who it was verified as last, kept past the token (admit)
+	kidNS        lru.Cache[string, []string] // gateway mode, by root kid and sub: the served namespaces that accepted a grant of them, first first (verify)
+	idUsers      idUsers                     // gateway mode: who each token was verified as last, kept past the token (admit)
 	lastSweep    time.Time
 	scratchTotal atomic.Int64 // every user's scratch bytes
 
@@ -319,8 +319,8 @@ func New(opt Options) (*Server, error) {
 	if opt.Gateway {
 		s.verifySem = make(chan struct{}, maxVerifying)
 		s.refused.MaxEntries = 1 << 12
-		s.kidNS.MaxEntries = 1 << 12
-		s.idUsers.MaxEntries = 1 << 14
+		s.kidNS.MaxEntries, s.kidNS.MaxBytes = 1<<12, 1<<16
+		s.idUsers.init(maxIDUsers, maxIDsPerUser)
 	} else {
 		s.local = s.newToken("local", opt.Client, s.newScopeLocked(s.newPrincipal("local"), ""), nil)
 		s.local.verified = s.start
@@ -750,7 +750,7 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 			return tk, nil
 		}
 		prev = tk.vns
-	} else if u, ok := s.idUsers.Get(id); ok {
+	} else if u, ok := s.idUsers.get(id); ok {
 		// Dropped since (idle, or to make room): verified again in the
 		// same order, and seen to have become someone else (admit).
 		prev = u.vns
@@ -786,8 +786,8 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 		named[n] = g.NamesNS(n)
 	}
 	vd, _ := v.(*verdict)
-	skey, narrowed := scopeOf(g)
-	tk, de := s.admit(id, c, named, skey, narrowed, vd, err)
+	skey, chain := scopeOf(g)
+	tk, de := s.admit(id, c, named, skey, chain, vd, err)
 	if de != nil {
 		return nil, de
 	}
@@ -803,10 +803,6 @@ const (
 	maxVerifyNS  = 3
 	refusedFor   = 30 * time.Second
 )
-
-// maxKidNS bounds the namespaces kidNS keeps for one root kid and sub,
-// the oldest going first.
-const maxKidNS = 4
 
 // kidSub is kidNS's key for a root block's kid and sub.
 func kidSub(kid, sub string) string { return kid + "\x00" + sub }
@@ -855,10 +851,15 @@ type verdict struct {
 // per namespace document and free-form (§C.1), so the record is by kid
 // and sub, not kid alone, which another namespace's key named alike
 // (another person's) would take first; and since a namespace's key may
-// mint grants for any sub, it keeps a few namespaces, so one that
-// accepted a grant for the same kid and sub first, but that this grant
-// doesn't name or that refuses it, doesn't stand for the person's. The
-// preferred namespaces don't count against maxVerifyNS.
+// mint grants for any sub, it keeps every served namespace that accepted
+// one, never dropping the first for a later one: one that accepted a
+// grant for the same kid and sub first, but that this grant doesn't name
+// or that refuses it, doesn't stand for the person's, and namespaces
+// accepting the kid and sub later (a stranger's, whose key is named
+// alike, or the person's own single-namespace grants) don't push the
+// person's out. Only served namespaces are asked, so a record holds at
+// most those (and kidNS's bounds count them). The preferred namespaces
+// don't count against maxVerifyNS.
 //
 // A grant an operator key signed (§C.4) authorizes nothing this server
 // does, and is refused (401) where /principal accepts it
@@ -915,10 +916,8 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, p
 			}
 			s.mu.Lock()
 			if nss, _ := s.kidNS.Get(rk); !slices.Contains(nss, ns) {
-				if len(nss) >= maxKidNS {
-					nss = nss[1:]
-				}
-				s.kidNS.Put(rk, append(slices.Clip(nss), ns), 1)
+				nss = append(slices.Clip(nss), ns)
+				s.kidNS.Put(rk, nss, len(nss))
 			}
 			s.mu.Unlock()
 			return &verdict{ns: ns, info: info}, nil
@@ -1104,8 +1103,63 @@ func userKey(v *verdict) string {
 // become someone else.
 type idUser struct{ user, vns string }
 
+// maxIDUsers bounds the token ids idUsers keeps, maxIDsPerUser those of
+// one user.
+const (
+	maxIDUsers    = 1 << 14
+	maxIDsPerUser = 1 << 8
+)
+
+// idUsers is who each token id was verified as last (idUser), within
+// maxIDUsers over every user and maxIDsPerUser a user, the user's least
+// recently verified going first. Narrowing is offline and free, and each
+// narrowing is a new token id the core accepts: one user's logins with
+// thousands of them push out only that user's, not those that let
+// another person's token, dropped while idle and coming back as someone
+// else, be seen to switch (admit). Under Server.mu.
+type idUsers struct {
+	all     lru.Cache[string, idUser]
+	users   map[string]*lru.Cache[string, struct{}] // by user: its token ids
+	perUser int
+}
+
+// init empties x, to keep at most all token ids, perUser of a user.
+func (x *idUsers) init(all, perUser int) {
+	*x = idUsers{perUser: perUser, users: map[string]*lru.Cache[string, struct{}]{}}
+	x.all.MaxEntries = all
+	x.all.OnEvict = func(id string, u idUser) { x.forget(id, u.user) }
+}
+
+// get returns who token id was verified as last.
+func (x *idUsers) get(id string) (idUser, bool) { return x.all.Get(id) }
+
+// put records that token id was verified as u.
+func (x *idUsers) put(id string, u idUser) {
+	if old, ok := x.all.Get(id); ok && old.user != u.user {
+		x.forget(id, old.user)
+	}
+	c := x.users[u.user]
+	if c == nil {
+		c = &lru.Cache[string, struct{}]{MaxEntries: x.perUser}
+		c.OnEvict = func(id string, _ struct{}) { x.all.Remove(id) }
+		x.users[u.user] = c
+	}
+	c.Put(id, struct{}{}, 1)
+	x.all.Put(id, u, 1)
+}
+
+// forget drops token id from user's ids.
+func (x *idUsers) forget(id, user string) {
+	if c := x.users[user]; c != nil {
+		c.Remove(id)
+		if c.Len() == 0 {
+			delete(x.users, user)
+		}
+	}
+}
+
 // admit returns the token of a grant (id, its client, the served
-// namespaces it names, its narrowing skey, narrowed or not) the core
+// namespaces it names, its narrowing skey and chain, scopeOf) the core
 // accepted (v), its user's state made only now, or refused with err: then
 // the token goes, and its user's other tokens are asked again at their
 // next request, since what refused it (a revoked root, a key withdrawn)
@@ -1114,7 +1168,7 @@ type idUser struct{ user, vns string }
 // person's, whose grant minted again finds it (§H.7); it goes when idle
 // (ScratchIdle, RecordIdle) or to make room (MaxPrincipals), as any
 // user's.
-func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey string, narrowed bool, v *verdict, err error) (*token, *davError) {
+func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey, chain string, v *verdict, err error) (*token, *davError) {
 	now := s.opt.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1153,7 +1207,7 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey 
 	was := ""
 	if tk != nil {
 		was = tk.p.id
-	} else if u, ok := s.idUsers.Get(id); ok {
+	} else if u, ok := s.idUsers.get(id); ok {
 		was = u.user
 	}
 	if tk != nil && tk.p != p {
@@ -1167,13 +1221,13 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey 
 		}
 		sc := p.scopes[skey]
 		if sc == nil {
-			if !s.scopeRoomLocked(p, narrowed) {
+			if full := s.scopeRoomLocked(p, chain); full != "" {
 				return nil, &davError{status: http.StatusServiceUnavailable,
-					msg:    fmt.Sprintf("your %d other logins of this kind (%s) each keep temporary files or locks, or are busy; try again once one of them is idle", s.opt.MaxTokensPerPrincipal, map[bool]string{true: "narrowed offline", false: "as issued"}[narrowed]),
+					msg:    fmt.Sprintf("%s each keep temporary files or locks, or are busy; try again once one of them is idle", full),
 					header: http.Header{"Retry-After": {"60"}}}
 			}
 			sc = s.newScopeLocked(p, skey)
-			sc.narrowed = narrowed
+			sc.chain = chain
 		}
 		tk = s.newToken(id, c, sc, named)
 		s.tokens[id] = tk
@@ -1182,7 +1236,7 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey 
 	if was != "" && was != key {
 		s.loseRecords(was, p, id)
 	}
-	s.idUsers.Put(id, idUser{user: key, vns: v.ns}, 1)
+	s.idUsers.put(id, idUser{user: key, vns: v.ns})
 	tk.verified, tk.vns = now, v.ns
 	tk.keepWriter(v.ns, v.info.Writer, now)
 	s.useLocked(tk, now)
@@ -1248,35 +1302,59 @@ func (s *Server) tokenRoomLocked(p *principal) bool {
 	return true
 }
 
-// scopeRoomLocked drops one of p's scopes to make room for one more,
-// narrowed offline or not: the least recently used of those alike beyond
+// scopeRoomLocked drops one of p's scopes to make room for one more of
+// chain (scopeOf): the least recently used of its pool beyond
 // MaxTokensPerPrincipal that holds no scratch file or lock and has no
-// request in flight (dead properties, cosmetic, may go with it). False:
-// there is no room. A scope with content isn't dropped to make room:
+// request in flight (dead properties, cosmetic, may go with it). Tokens
+// as issued are one pool; tokens narrowed offline a pool per chain, the
+// token their narrowing started from (its first narrowing block), and at
+// most MaxTokensPerPrincipal chains, a new one making room by dropping
+// other chains' scopes alike. It returns who keeps the room, or "" once
+// there is room. A scope with content isn't dropped to make room:
 // narrowing is offline and free, and whoever holds a token of the user's
 // (a delegate, the user's own devices) would drop the editor's swap
-// files, backup copies and locks with a few new narrowings; and those
-// can't make room among the scopes of tokens as issued.
-func (s *Server) scopeRoomLocked(p *principal, narrowed bool) bool {
+// files, backup copies and locks with a few new narrowings; those can't
+// make room among the scopes of tokens as issued, and a delegate's, which
+// only extend its own chain (a narrowing can't drop a block), fill only
+// that chain's pool, not the user's other narrowed tokens' (their phone's
+// read-only token, another delegate's): only a holder of a token as
+// issued starts a chain.
+func (s *Server) scopeRoomLocked(p *principal, chain string) string {
+	now := s.opt.Now()
+	max := s.opt.MaxTokensPerPrincipal
 	for {
 		n := 0
-		var old *scope
+		others := map[string]bool{} // other chains
+		var old, other *scope
 		for _, sc := range p.scopes {
-			if sc.narrowed != narrowed {
-				continue
+			idle := sc.inflight == 0 && !sc.holds(now)
+			switch {
+			case sc.chain == chain:
+				n++
+				if idle && (old == nil || sc.used.Before(old.used)) {
+					old = sc
+				}
+			case chain != "" && sc.chain != "":
+				others[sc.chain] = true
+				if idle && (other == nil || sc.used.Before(other.used)) {
+					other = sc
+				}
 			}
-			n++
-			if sc.inflight == 0 && !sc.holds(s.opt.Now()) && (old == nil || sc.used.Before(old.used)) {
-				old = sc
-			}
 		}
-		if n < s.opt.MaxTokensPerPrincipal {
-			return true
+		switch {
+		case n >= max && old == nil && chain == "":
+			return fmt.Sprintf("your %d other logins as issued", max)
+		case n >= max && old == nil:
+			return fmt.Sprintf("your %d other logins narrowed offline from the same token", max)
+		case n >= max:
+			s.dropScopeLocked(old)
+		case n == 0 && chain != "" && len(others) >= max && other == nil:
+			return fmt.Sprintf("logins narrowed offline from %d other tokens of yours", max)
+		case n == 0 && chain != "" && len(others) >= max:
+			s.dropScopeLocked(other)
+		default:
+			return ""
 		}
-		if old == nil {
-			return false
-		}
-		s.dropScopeLocked(old)
 	}
 }
 
@@ -1457,10 +1535,10 @@ type principal struct {
 // only to that user"). What holds no content (guards, deletes, moves
 // aside, records) stays the user's.
 type scope struct {
-	p        *principal
-	key      string
-	narrowed bool // its grants have narrowing blocks (scopeOf)
-	locks    webdav.LockSystem
+	p     *principal
+	key   string
+	chain string // its grants' narrowing chain, "" as issued (scopeOf)
+	locks webdav.LockSystem
 
 	// under Server.mu
 	used     time.Time
@@ -1476,22 +1554,31 @@ type scope struct {
 }
 
 // scopeOf is the narrowing of grant g that its token's scope is kept by,
-// and whether g has narrowing blocks: a digest of what limits what g may
-// read (§C.1): the root block's ns, can, roles and rules, and groups and
+// and its chain, "" without narrowing blocks: a digest of what limits
+// what g may read (§C.1): the root block's ns, can, roles and rules, and groups and
 // attrs, which rules may test, without its kid and sub (the user's,
 // userKey), nbf, exp and at, which bound only when or as of when it is
 // used, and enc and signers, which don't limit reads; then each
 // narrowing block without nbf and exp, leaving out blocks that hold
 // nothing else. A token the issuer mints again with the same rights is
 // in the same scope (§H.7 "a reminted token is the same person"); one it
-// limited to some resources (rules on /resource, §C.5.1) isn't.
-func scopeOf(g *grant.Grant) (string, bool) {
+// limited to some resources (rules on /resource, §C.5.1) isn't. ns, can,
+// roles and groups are sets (§C.1, §C.2: tested by containment and
+// intersection), so they are digested sorted and without duplicates: the
+// same rights listed in another order (an issuer building them from a
+// set) are the same scope. The chain is the digest up to the first
+// narrowing block that holds something: the token the narrowings started
+// from, which a delegate's further narrowings keep (scopeRoomLocked).
+func scopeOf(g *grant.Grant) (string, string) {
 	h := sha256.New()
 	write := func(raw map[string]any, skip ...string) bool {
 		m := make(map[string]any, len(raw))
 		for k, v := range raw {
 			if !slices.Contains(skip, k) {
 				m[k] = v
+				if slices.Contains(setMembers, k) {
+					m[k] = asSet(v)
+				}
 			}
 		}
 		if len(m) == 0 {
@@ -1502,13 +1589,40 @@ func scopeOf(g *grant.Grant) (string, bool) {
 		return true
 	}
 	write(g.Blocks[0].Raw, "kid", "sub", "nbf", "exp", "at", "enc", "signers")
-	narrowed := false
+	chain := ""
 	for _, b := range g.Blocks[1:] {
-		if write(b.Raw, "nbf", "exp") {
-			narrowed = true
+		if write(b.Raw, "nbf", "exp") && chain == "" {
+			chain = hex.EncodeToString(h.Sum(nil)[:16])
 		}
 	}
-	return hex.EncodeToString(h.Sum(nil)[:16]), narrowed
+	return hex.EncodeToString(h.Sum(nil)[:16]), chain
+}
+
+// setMembers are the block members scopeOf digests as sets.
+var setMembers = []string{"ns", "can", "roles", "groups"}
+
+// asSet returns v, a list of strings, sorted and without duplicates; any
+// other value as it is.
+func asSet(v any) any {
+	arr, ok := v.([]any)
+	if !ok {
+		return v
+	}
+	ss := make([]string, 0, len(arr))
+	for _, x := range arr {
+		s, ok := x.(string)
+		if !ok {
+			return v
+		}
+		ss = append(ss, s)
+	}
+	slices.Sort(ss)
+	ss = slices.Compact(ss)
+	out := make([]any, len(ss))
+	for i, s := range ss {
+		out[i] = s
+	}
+	return out
 }
 
 // asideFor is how soon after the principal moved a document aside to a
