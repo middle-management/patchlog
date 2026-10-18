@@ -53,6 +53,32 @@ type catGraph struct {
 	births map[string]time.Time    // by node
 }
 
+// tokenView is what one token read of a catalog, kept by the token's id
+// for CatalogTTL, or until this server writes (views): the catalog's
+// graph, or one folder as its tree service listed it. They are kept
+// within CacheBytes over every token, the least recently used going
+// first, since each token keeps its own (what one grant was shown is
+// never shown to another, §H.7), and a catalog's graph holds every node.
+type tokenView struct {
+	cg *catGraph
+	sd svcDir
+}
+
+// view returns what token tk read under k (a catalog, or catalog/folder).
+func (s *Server) view(tk *token, k string) (tokenView, bool) {
+	s.viewMu.Lock()
+	defer s.viewMu.Unlock()
+	return s.views.Get(tk.id + "\x00" + k)
+}
+
+// keepView keeps v, which tk read under k, at cost n (about what its
+// nodes or entries take in memory).
+func (s *Server) keepView(tk *token, k string, v tokenView, n int) {
+	s.viewMu.Lock()
+	defer s.viewMu.Unlock()
+	s.views.Put(tk.id+"\x00"+k, v, n)
+}
+
 // graph returns catalog cat as the token read it at most CatalogTTL ago,
 // and not before this server's last write.
 func (st *reqState) graph(ctx context.Context, cat string) (*catGraph, error) {
@@ -60,18 +86,15 @@ func (st *reqState) graph(ctx context.Context, cat string) (*catGraph, error) {
 		return cg, nil
 	}
 	now, gen := st.s.opt.Now(), st.s.gen.Load()
-	st.tk.mu.Lock()
-	cg := st.tk.cats[cat]
-	st.tk.mu.Unlock()
+	v, _ := st.s.view(st.tk, cat)
+	cg := v.cg
 	if cg == nil || cg.gen != gen || now.Sub(cg.at) >= st.s.opt.CatalogTTL {
 		var err error
 		if cg, err = st.readGraph(ctx, cat); err != nil {
 			return nil, err
 		}
 		cg.at, cg.gen = now, gen
-		st.tk.mu.Lock()
-		st.tk.cats[cat] = cg
-		st.tk.mu.Unlock()
+		st.s.keepView(st.tk, cat, tokenView{cg: cg}, 512*(len(cg.heads)+1))
 	}
 	if st.graphs == nil {
 		st.graphs = map[string]*catGraph{}
@@ -138,7 +161,7 @@ func notTree(cat, why string) error {
 func (s *Server) Check(ctx context.Context) error {
 	tk := s.local
 	if tk == nil {
-		tk = s.newToken("check", s.anon, s.newPrincipal("check"), nil)
+		tk = s.newToken("check", s.anon, s.newScopeLocked(s.newPrincipal("check"), ""), nil)
 	}
 	cats := make([]string, 0, len(s.cats))
 	for cat := range s.cats {
@@ -903,7 +926,7 @@ func (st *reqState) deleteItem(ctx context.Context, ns, name, ifMatch, successor
 // whose items the request's grant can't read are neither named nor
 // deleted. A
 // node with several parents (a DAG) is unlinked from this folder only.
-// The principal's scratch files in it go with it.
+// The scope's scratch files in it go with it.
 func (st *reqState) deleteFolder(ctx context.Context, t target) error {
 	cg, _, err := st.tree(ctx, t.ns)
 	if err != nil {
@@ -970,7 +993,7 @@ func (st *reqState) dangling(ctx context.Context, cg *catGraph, n *tree.Node) bo
 // name (kNewNode), or src's own under another case, which compares equal
 // (nameKey). A folder can't go into itself or a folder in it (403). In
 // its new folder the node gets an order after the last child there. The
-// principal's scratch files in a moved folder move with it.
+// scope's scratch files in a moved folder move with it.
 func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 	cg, _, err := st.tree(ctx, src.ns)
 	if err != nil {

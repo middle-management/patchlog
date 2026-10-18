@@ -8,8 +8,9 @@ import (
 	"golang.org/x/net/webdav"
 )
 
-// Locks live in memory, per user (x/net/webdav's memLS, §H.6, §H.7), so
-// every token of one user holds them, within bounds: x/net/webdav keeps a
+// Locks live in memory, per user (x/net/webdav's memLS, §H.6, §H.7) and
+// narrowing (scope), so every token of one user and scope holds them,
+// within the user's bounds: x/net/webdav keeps a
 // lock's owner XML as sent and a lock with Timeout: Infinite forever, one
 // per path, so a read-only grant could pin a body's worth of memory per
 // document it reads.
@@ -18,7 +19,7 @@ import (
 // a hundred bytes).
 const maxLockOwner = 1024
 
-// boundedLS is a user's lock system, as one request uses it: owners of at
+// boundedLS is a scope's lock system, as one request uses it: owners of at
 // most maxLockOwner bytes, timeouts of at most ScratchIdle (Infinite too),
 // at most MaxLocks locks for the user. A refusal is recorded for
 // errWriter, as x/net/webdav answers any error of Create with a 500.
@@ -36,22 +37,26 @@ func (l *boundedLS) clamp(d time.Duration) time.Duration {
 }
 
 func (l *boundedLS) Create(now time.Time, d webdav.LockDetails) (string, error) {
-	st, p := l.st, l.st.p
+	st, sc := l.st, l.st.sc
 	if len(d.OwnerXML) > maxLockOwner {
 		return "", st.record(fail(http.StatusBadRequest, "a lock's owner is at most %d bytes", maxLockOwner))
 	}
 	d.Duration = l.clamp(d.Duration)
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.expireLocksLocked(now)
-	if len(p.locked) >= st.s.opt.MaxLocks {
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	n := 0
+	for _, o := range sc.p.scopes {
+		o.expireLocksLocked(now)
+		n += len(o.locked)
+	}
+	if n >= st.s.opt.MaxLocks {
 		return "", st.record(fail(http.StatusInsufficientStorage, "at most %d locks are kept per user", st.s.opt.MaxLocks))
 	}
 	tok, err := l.LockSystem.Create(now, d)
 	if err != nil {
 		return "", err
 	}
-	p.locked[tok] = heldLock{exp: now.Add(d.Duration), root: slashClean(d.Root)}
+	sc.locked[tok] = heldLock{exp: now.Add(d.Duration), root: slashClean(d.Root)}
 	return tok, nil
 }
 
@@ -59,25 +64,25 @@ func (l *boundedLS) Refresh(now time.Time, token string, d time.Duration) (webda
 	d = l.clamp(d)
 	ld, err := l.LockSystem.Refresh(now, token, d)
 	if err == nil {
-		p := l.st.p
-		p.mu.Lock()
-		if h, ok := p.locked[token]; ok {
+		sc := l.st.sc
+		sc.p.mu.Lock()
+		if h, ok := sc.locked[token]; ok {
 			h.exp = now.Add(d)
-			p.locked[token] = h
+			sc.locked[token] = h
 		}
-		p.mu.Unlock()
+		sc.p.mu.Unlock()
 	}
 	return ld, err
 }
 
 func (l *boundedLS) Unlock(now time.Time, token string) error {
 	err := l.LockSystem.Unlock(now, token)
-	p := l.st.p
-	p.mu.Lock()
-	if _, ok := p.locked[token]; ok && (err == nil || err == webdav.ErrNoSuchLock) {
-		delete(p.locked, token)
+	sc := l.st.sc
+	sc.p.mu.Lock()
+	if _, ok := sc.locked[token]; ok && (err == nil || err == webdav.ErrNoSuchLock) {
+		delete(sc.locked, token)
 	}
-	p.mu.Unlock()
+	sc.p.mu.Unlock()
 	return err
 }
 
@@ -123,34 +128,34 @@ type heldLock struct {
 	root string
 }
 
-// unlockUnder drops the user's locks taken on name or below it: a
+// unlockUnder drops the scope's locks taken on name or below it: a
 // DELETE that passed destroys them (RFC 4918 §9.6.1), and a MOVE moves no
 // lock with its source (§9.9.4), so neither is left to answer the client
 // 423 for a lock it can't hold any more.
-func (p *principal) unlockUnder(name string, now time.Time) {
-	p.mu.Lock()
+func (sc *scope) unlockUnder(name string, now time.Time) {
+	sc.p.mu.Lock()
 	var toks []string
-	for tok, h := range p.locked {
+	for tok, h := range sc.locked {
 		if h.root == name || strings.HasPrefix(h.root, strings.TrimSuffix(name, "/")+"/") {
 			toks = append(toks, tok)
 		}
 	}
-	p.mu.Unlock()
+	sc.p.mu.Unlock()
 	for _, tok := range toks {
-		err := p.locks.Unlock(now, tok)
-		p.mu.Lock()
-		if _, ok := p.locked[tok]; ok && (err == nil || err == webdav.ErrNoSuchLock) {
-			delete(p.locked, tok)
+		err := sc.locks.Unlock(now, tok)
+		sc.p.mu.Lock()
+		if _, ok := sc.locked[tok]; ok && (err == nil || err == webdav.ErrNoSuchLock) {
+			delete(sc.locked, tok)
 		}
-		p.mu.Unlock()
+		sc.p.mu.Unlock()
 	}
 }
 
-// expireLocksLocked forgets the locks of p expired by now, as memLS does.
-func (p *principal) expireLocksLocked(now time.Time) {
-	for tok, h := range p.locked {
+// expireLocksLocked forgets the locks of sc expired by now, as memLS does.
+func (sc *scope) expireLocksLocked(now time.Time) {
+	for tok, h := range sc.locked {
 		if !now.Before(h.exp) {
-			delete(p.locked, tok)
+			delete(sc.locked, tok)
 		}
 	}
 }

@@ -27,7 +27,9 @@
 // each request's Basic password is the grant sent upstream. State (bases,
 // scratch files, locks, guards) is kept per user (§H.7): in a gateway,
 // the root sub and kid GET /ns/{ns}/principal names for a grant, so every
-// token of one person is one user; in local mode, everyone is one.
+// token of one person is one user; in local mode, everyone is one. What
+// may hold what one token read (scratch files, locks, dead properties) is
+// kept apart for a token narrowed offline (scope).
 package dav
 
 import (
@@ -43,6 +45,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -57,6 +60,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 )
 
@@ -104,7 +108,8 @@ type Options struct {
 	FetchConcurrency int
 	// CacheBytes bounds the rendered documents kept by revision id
 	// (default 64 MiB); the files' sizes and types are kept apart
-	// (maxMetas).
+	// (maxMetas). It bounds, apart too, the catalogs' graphs and the
+	// folders' listings kept by token (views).
 	CacheBytes int
 	// MaxFileSize bounds a written JSON file and a scratch file, buffered
 	// whole (default 16 MiB).
@@ -136,7 +141,8 @@ type Options struct {
 	// (default 256); MaxTokensPerPrincipal the tokens it keeps for one
 	// user (re-minted, attenuated offline), the least recently used
 	// without a request in flight dropped first, to be verified again
-	// when it comes back (default 8).
+	// when it comes back (default 8), and the narrowings (scopes) whose
+	// scratch files and locks it keeps for one user, likewise.
 	MaxPrincipals, MaxTokensPerPrincipal int
 	// MaxLocks bounds one user's locks (default 256).
 	MaxLocks int
@@ -194,10 +200,18 @@ type Server struct {
 	refused   lru.Cache[string, refusal] // grants the core refused lately, by hash
 
 	mu           sync.Mutex
-	tokens       map[string]*token     // gateway mode, by grant hash
-	principals   map[string]*principal // gateway mode, by user (userKey)
+	tokens       map[string]*token         // gateway mode, by grant hash
+	principals   map[string]*principal     // gateway mode, by user (userKey)
+	kidNS        lru.Cache[string, string] // gateway mode, by root kid: the namespace that first accepted a grant of it (verify)
 	lastSweep    time.Time
 	scratchTotal atomic.Int64 // every user's scratch bytes
+
+	opMu   sync.Mutex
+	opKeys []client.OperatorKey // the deployment's operator keys (operatorKeys), read at opAt
+	opAt   time.Time
+
+	viewMu sync.Mutex
+	views  lru.Cache[string, tokenView] // by token id: catalogs' graphs and folders it read (views)
 
 	recMu    sync.Mutex
 	recRoots map[string]*recStore         // by user
@@ -297,11 +311,13 @@ func New(opt Options) (*Server, error) {
 	}
 	opt.Client = s.opt.Client
 	s.anon = opt.Client.With(client.WithBearer(""))
+	s.views.MaxEntries, s.views.MaxBytes = 1<<16, opt.CacheBytes
 	if opt.Gateway {
 		s.verifySem = make(chan struct{}, maxVerifying)
 		s.refused.MaxEntries = 1 << 12
+		s.kidNS.MaxEntries = 1 << 12
 	} else {
-		s.local = s.newToken("local", opt.Client, s.newPrincipal("local"), nil)
+		s.local = s.newToken("local", opt.Client, s.newScopeLocked(s.newPrincipal("local"), ""), nil)
 		s.local.verified = s.start
 	}
 	return s, nil
@@ -352,8 +368,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer s.release(tk)
-	p := tk.p
-	st := &reqState{s: s, tk: tk, p: p, method: r.Method, path: slashClean(r.URL.Path), depth: r.Header.Get("Depth"), hdr: r.Header, resp: w.Header()}
+	sc := tk.sc
+	st := &reqState{s: s, tk: tk, p: tk.p, sc: sc, method: r.Method, path: slashClean(r.URL.Path), depth: r.Header.Get("Depth"), hdr: r.Header, resp: w.Header()}
 	switch r.Method {
 	case "PROPFIND":
 		switch st.depth {
@@ -413,7 +429,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// The write that follows a document's move aside (vim's backup)
 			// is the edit of it, even create-only (davfs2 then believes the
 			// name free).
-			aside := p.takeAside(st.path, s.opt.Now())
+			aside := tk.p.takeAside(st.path, s.opt.Now())
 			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
 		}
 		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
@@ -450,7 +466,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	h := &webdav.Handler{FileSystem: s.fs, LockSystem: &boundedLS{LockSystem: p.locks, st: st}, Logger: func(r *http.Request, err error) {
+	h := &webdav.Handler{FileSystem: s.fs, LockSystem: &boundedLS{LockSystem: sc.locks, st: st}, Logger: func(r *http.Request, err error) {
 		// Not logged: no such file, and a MKCOL of a directory that
 		// exists (405), which rclone sends before every upload.
 		if err != nil && !errors.Is(err, errNotExist) && !errors.Is(err, fs.ErrExist) {
@@ -490,12 +506,12 @@ func (st *reqState) answered(status int) {
 	case st.method == "DELETE" && status == http.StatusNotFound:
 		st.p.takeRefusedSave(st.path, now)
 	case (st.method == "DELETE" || st.method == "MOVE") && status < 300:
-		st.p.unlockUnder(st.path, now)
+		st.sc.unlockUnder(st.path, now)
 		to := ""
 		if st.method == "MOVE" {
 			to = st.dst
 		}
-		st.p.moveProps(st.path, to)
+		st.sc.moveProps(st.path, to)
 	case st.method == "GET" && status == http.StatusNotFound:
 		for _, g := range st.gone {
 			st.s.reloaded(st.p, g.ns, g.name)
@@ -720,11 +736,15 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 	sum := sha256.Sum256([]byte(pw))
 	id := hex.EncodeToString(sum[:16])
 	s.mu.Lock()
-	if tk := s.tokens[id]; tk != nil && !tk.verified.IsZero() && now.Sub(tk.verified) < s.opt.VerifyEvery {
-		s.useLocked(tk, now)
-		s.mu.Unlock()
-		s.sweep()
-		return tk, nil
+	prev := ""
+	if tk := s.tokens[id]; tk != nil {
+		if !tk.verified.IsZero() && now.Sub(tk.verified) < s.opt.VerifyEvery {
+			s.useLocked(tk, now)
+			s.mu.Unlock()
+			s.sweep()
+			return tk, nil
+		}
+		prev = tk.vns
 	}
 	s.mu.Unlock()
 	s.refusedMu.Lock()
@@ -744,7 +764,7 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 			return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many logins at once; try again", header: http.Header{"Retry-After": {"5"}}}
 		}
 		defer func() { <-s.verifySem }()
-		return s.verify(ctx, c, g)
+		return s.verify(ctx, c, g, prev)
 	})
 	var de *davError
 	if errors.As(err, &de) && refusedStatus(de.status) {
@@ -757,7 +777,7 @@ func (s *Server) authenticate(r *http.Request) (*token, *davError) {
 		named[n] = g.NamesNS(n)
 	}
 	vd, _ := v.(*verdict)
-	tk, de := s.admit(id, c, named, vd, err)
+	tk, de := s.admit(id, c, named, scopeOf(g), vd, err)
 	if de != nil {
 		return nil, de
 	}
@@ -796,18 +816,34 @@ type verdict struct {
 
 // verify asks whether the core accepts grant g (sent by c), before a
 // gateway keeps anything for it: GET /ns/{ns}/principal (§7.4) in the
-// served namespaces it names, sorted, the first maxVerifyNS of them, until
-// one accepts it. Only the ns check and verification apply there (§C.2
-// item 1), the key's scope included, no verb and no rule, so a grant
-// limited to some resources, or without read, is accepted too (§H.7
-// "Limited grants"); and a public namespace answers it as any other,
-// though its reads ignore a bad grant (§7). One namespace is enough:
-// another may not exist yet, or not trust the key. A 401 there is a grant
-// that can't be used; a 410, a namespace purged once the grant verified
-// (§8.5); a 404, one that doesn't exist, to an operator grant (§C.4).
-// Accepted nowhere, the grant is refused with the first of 410 and 404
-// that it met (§H.4 "Answers"), else 401.
-func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant) (*verdict, error) {
+// served namespaces it names, the first maxVerifyNS of them, until one
+// accepts it. Only the ns check and verification apply there (§C.2 item
+// 1), the key's scope included, no verb and no rule, so a grant limited
+// to some resources, or without read, is accepted too (§H.7 "Limited
+// grants"); and a public namespace answers it as any other, though its
+// reads ignore a bad grant (§7). One namespace is enough: another may not
+// exist yet, or not trust the key. A 401 there is a grant that can't be
+// used; a 410, a namespace purged once the grant verified (§8.5); a 404,
+// one that doesn't exist, to an operator grant (§C.4). Accepted nowhere,
+// the grant is refused with the first of 410 and 404 that it met (§H.4
+// "Answers"), else 401.
+//
+// The namespace that accepts a grant is part of its user (userKey), so
+// the order they are asked in keeps a person one user: first prev, the
+// one that accepted this token before, then the one that first accepted
+// a grant of its root kid (kidNS), then the rest, sorted. A namespace
+// created later, or given the key later, that sorts first then doesn't
+// make the same token, or the same person's next one, someone else, with
+// none of their records, scratch files or locks.
+//
+// A grant an operator key signed (§C.4) authorizes nothing this server
+// does, and is refused (401) where /principal accepts it
+// (operatorSigned): its root kid may name a namespace's key too, and
+// /principal, which verifies it against the operator keys, names that
+// kid, so it would be taken for that key's user, and reach their scratch
+// files. Where the namespace doesn't exist, its 404 is the answer, as
+// the core's to an operator grant.
+func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant, prev string) (*verdict, error) {
 	var named []string
 	for _, ns := range s.namespaces() {
 		if g.NamesNS(ns) {
@@ -822,6 +858,17 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant) (
 		s.opt.Logf("dav: a grant for %q names none of the namespaces served (%q)", g.Blocks[0].Sub, nss)
 		return nil, fail(http.StatusUnauthorized, "the grant names none of the namespaces served here")
 	}
+	kid := g.Blocks[0].Kid
+	s.mu.Lock()
+	first, _ := s.kidNS.Get(kid)
+	s.mu.Unlock()
+	order := make([]string, 0, len(named))
+	for _, ns := range append([]string{prev, first}, named...) {
+		if ns != "" && slices.Contains(named, ns) && !slices.Contains(order, ns) {
+			order = append(order, ns)
+		}
+	}
+	named = order
 	if len(named) > maxVerifyNS {
 		named = named[:maxVerifyNS]
 	}
@@ -831,6 +878,17 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant) (
 		ae, isAPI := client.AsAPIError(err)
 		switch {
 		case err == nil:
+			switch op, err := s.operatorSigned(ctx, g); {
+			case err != nil:
+				return nil, err
+			case op:
+				return nil, fail(http.StatusUnauthorized, "the grant is signed by an operator key (kid %q), which authorizes creating namespaces and forced purges (§C.4), nothing this server does: log in with a grant from a key a namespace's document lists", kid)
+			}
+			s.mu.Lock()
+			if _, ok := s.kidNS.Get(kid); !ok {
+				s.kidNS.Put(kid, ns, 1)
+			}
+			s.mu.Unlock()
 			return &verdict{ns: ns, info: info}, nil
 		case client.IsPurged(err):
 			if purged == "" {
@@ -855,27 +913,78 @@ func (s *Server) verify(ctx context.Context, c *client.Client, g *grant.Grant) (
 	return nil, fail(http.StatusUnauthorized, "the core doesn't accept the grant: %s", why)
 }
 
+// operatorKeysFor is how long the deployment's operator keys, as read
+// (operatorKeys), are used before they are read again; they are served
+// cacheable for minutes (§C.4).
+const operatorKeysFor = 5 * time.Minute
+
+// operatorSigned reports whether an operator key signed grant g (§C.4):
+// one of the deployment's operator key history (operatorKeys) whose kid
+// is g's root kid, and under whose public key g's signature chain
+// verifies. kids are never reused there, but a namespace document's key
+// may carry an operator key's kid (kids are free-form): only the
+// signature tells which of them signed g.
+func (s *Server) operatorSigned(ctx context.Context, g *grant.Grant) (bool, error) {
+	keys, err := s.operatorKeys(ctx)
+	if err != nil {
+		return false, err
+	}
+	for _, k := range keys {
+		if k.Kid == g.Blocks[0].Kid && g.SignedBy(k.Pub) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// operatorKeys returns the deployment's operator key history (§C.4), read
+// without a grant at most operatorKeysFor ago; one that can't be read
+// again is used as last read, and with none read yet the verification
+// fails (502, 503) rather than take an operator's grant for a user's. A
+// core that publishes none (404) has none.
+func (s *Server) operatorKeys(ctx context.Context) ([]client.OperatorKey, error) {
+	now := s.opt.Now()
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if !s.opAt.IsZero() && now.Sub(s.opAt) < operatorKeysFor {
+		return s.opKeys, nil
+	}
+	keys, err := s.anon.OperatorKeys(ctx)
+	switch ae, ok := client.AsAPIError(err); {
+	case err == nil:
+	case ok && ae.Status == http.StatusNotFound:
+		keys = nil
+	case !s.opAt.IsZero():
+		s.opt.Logf("dav: the deployment's operator keys couldn't be read again (%v); those read at %v are used", err, s.opAt)
+		return s.opKeys, nil
+	default:
+		return nil, upstream(err)
+	}
+	s.opKeys, s.opAt = keys, now
+	return keys, nil
+}
+
 // userKey is who the state of a grant the core accepted (v) is kept for
 // (§H.7): the root sub and kid GET /ns/{ns}/principal named, never the
 // token, so every token of one person (minted again, attenuated offline)
 // is one user; with the namespace whose key verified it, since a kid
 // names a key of one namespace's document (§C.1), and the same kid in
 // another served namespace may be anyone's key, minting grants for the
-// same sub.
+// same sub. verify asks the namespaces in an order that keeps it so.
 func userKey(v *verdict) string {
 	return v.ns + "\x00" + v.info.Kid + "\x00" + v.info.Sub
 }
 
 // admit returns the token of a grant (id, its client, the served
-// namespaces it names) the core accepted (v), its user's state made only
-// now, or refused with err: then the token goes, and its user's other
-// tokens are asked again at their next request, since what refused it (a
-// revoked root, a key withdrawn) may refuse them too. The user's state
-// stays: only a token the core accepts reaches it, each asked again every
-// VerifyEvery, and it is that person's, whose grant minted again finds it
-// (§H.7); it goes when idle (ScratchIdle, RecordIdle) or to make room
-// (MaxPrincipals), as any user's.
-func (s *Server) admit(id string, c *client.Client, named map[string]bool, v *verdict, err error) (*token, *davError) {
+// namespaces it names, its narrowing skey) the core accepted (v), its
+// user's state made only now, or refused with err: then the token goes,
+// and its user's other tokens are asked again at their next request,
+// since what refused it (a revoked root, a key withdrawn) may refuse them
+// too. The user's state stays: only a token the core accepts reaches it,
+// each asked again every VerifyEvery, and it is that person's, whose
+// grant minted again finds it (§H.7); it goes when idle (ScratchIdle,
+// RecordIdle) or to make room (MaxPrincipals), as any user's.
+func (s *Server) admit(id string, c *client.Client, named map[string]bool, skey string, v *verdict, err error) (*token, *davError) {
 	now := s.opt.Now()
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -905,7 +1014,11 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, v *ve
 	}
 	if tk != nil && tk.p != p {
 		// Verified again as someone else: the namespace that accepted it
-		// before refuses it now, and another accepts it.
+		// before refuses it now, and another accepts it. That user's
+		// records don't hold what this token's client may have open, so
+		// its saves without a base are refused until it reloads, rather
+		// than rebased on the head (§H.4).
+		s.loseRecords(tk.p, p)
 		s.dropTokenLocked(tk)
 		tk = nil
 	}
@@ -914,11 +1027,19 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, v *ve
 			return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many of your logins at once; try again",
 				header: http.Header{"Retry-After": {"5"}}}
 		}
-		tk = s.newToken(id, c, p, named)
+		sc := p.scopes[skey]
+		if sc == nil {
+			if !s.scopeRoomLocked(p) {
+				return nil, &davError{status: http.StatusServiceUnavailable, msg: "too many of your logins at once; try again",
+					header: http.Header{"Retry-After": {"5"}}}
+			}
+			sc = s.newScopeLocked(p, skey)
+		}
+		tk = s.newToken(id, c, sc, named)
 		s.tokens[id] = tk
 		p.toks[tk] = true
 	}
-	tk.verified = now
+	tk.verified, tk.vns = now, v.ns
 	tk.keepWriter(v.ns, v.info.Writer, now)
 	s.useLocked(tk, now)
 	return tk, nil
@@ -926,9 +1047,10 @@ func (s *Server) admit(id string, c *client.Client, named map[string]bool, v *ve
 
 // useLocked counts a request of tk's, now.
 func (s *Server) useLocked(tk *token, now time.Time) {
-	tk.used, tk.p.used = now, now
+	tk.used, tk.p.used, tk.sc.used = now, now, now
 	tk.inflight++
 	tk.p.inflight++
+	tk.sc.inflight++
 }
 
 // release ends a request of tk's.
@@ -939,6 +1061,7 @@ func (s *Server) release(tk *token) {
 	s.mu.Lock()
 	tk.inflight--
 	tk.p.inflight--
+	tk.sc.inflight--
 	s.mu.Unlock()
 }
 
@@ -981,6 +1104,25 @@ func (s *Server) tokenRoomLocked(p *principal) bool {
 	return true
 }
 
+// scopeRoomLocked drops p's scopes to make room for one more: the least
+// recently used beyond MaxTokensPerPrincipal, never one with a request in
+// flight. False: there is no room.
+func (s *Server) scopeRoomLocked(p *principal) bool {
+	for len(p.scopes) >= s.opt.MaxTokensPerPrincipal {
+		var old *scope
+		for _, sc := range p.scopes {
+			if sc.inflight == 0 && (old == nil || sc.used.Before(old.used)) {
+				old = sc
+			}
+		}
+		if old == nil {
+			return false
+		}
+		s.dropScopeLocked(old)
+	}
+	return true
+}
+
 // dropTokenLocked forgets token tk: its next request is verified again.
 // Its user's state stays. A request of it still in flight finishes.
 func (s *Server) dropTokenLocked(tk *token) {
@@ -990,19 +1132,36 @@ func (s *Server) dropTokenLocked(tk *token) {
 	delete(tk.p.toks, tk)
 }
 
-// dropPrincipalLocked forgets user p: its tokens, locks and scratch files
-// (its records of what it was served stay, by user, until they age out).
+// dropScopeLocked forgets scope sc of a user: its locks and scratch
+// files, and its tokens, verified again at their next request.
+func (s *Server) dropScopeLocked(sc *scope) {
+	for tk := range sc.p.toks {
+		if tk.sc == sc {
+			s.dropTokenLocked(tk)
+		}
+	}
+	sc.p.mu.Lock()
+	delete(sc.p.scopes, sc.key)
+	sc.p.mu.Unlock()
+	s.scratchTotal.Add(-int64(sc.drop()))
+}
+
+// dropPrincipalLocked forgets user p: its tokens, and its scopes' locks
+// and scratch files (its records of what it was served stay, by user,
+// until they age out).
 func (s *Server) dropPrincipalLocked(p *principal) {
 	delete(s.principals, p.id)
 	for tk := range p.toks {
 		s.dropTokenLocked(tk)
 	}
-	s.scratchTotal.Add(-int64(p.dropScratch()))
+	for _, sc := range p.scopes {
+		s.dropScopeLocked(sc)
+	}
 }
 
 // sweep drops idle scratch files, and a gateway's idle tokens (unused for
-// VerifyEvery, verified again if they come back) and users (ScratchIdle),
-// at most once a minute.
+// VerifyEvery, verified again if they come back), users and scopes
+// (ScratchIdle), at most once a minute.
 func (s *Server) sweep() {
 	now := s.opt.Now()
 	s.mu.Lock()
@@ -1024,6 +1183,11 @@ func (s *Server) sweep() {
 		if p.inflight == 0 && now.Sub(p.used) > s.opt.ScratchIdle {
 			s.dropPrincipalLocked(p)
 			continue
+		}
+		for _, sc := range p.scopes {
+			if sc.inflight == 0 && now.Sub(sc.used) > s.opt.ScratchIdle {
+				s.dropScopeLocked(sc)
+			}
 		}
 		ps = append(ps, p)
 	}
@@ -1065,47 +1229,46 @@ func (s *Server) userInflight() int64 {
 }
 
 // token is one bearer: in a gateway, a grant the core verified (verify),
-// with the client sending it, the served namespaces it names, and what
-// was read with it, since another token of the same user may read less
-// (attenuated offline): writers' settings and namespace documents
-// (nsInfo), catalogs' trees, the folders a tree service listed to it.
-// What is kept for its user is in its principal, shared by every token of
-// the user (§H.7).
+// with the client sending it, the served namespaces it names, the
+// namespace that verified it, and what was read with it, since another
+// token of the same user may read less (attenuated offline): writers'
+// settings and namespace documents (nsInfo); its catalogs' graphs and the
+// folders a tree service listed to it are kept by its id (views). What is
+// kept for its user is in its principal, shared by every token of the
+// user (§H.7), and in its principal's scope for its narrowing (scopeOf).
 type token struct {
 	id string
 	c  *client.Client
 	p  *principal
+	sc *scope // of p, for the grant's narrowing
 	// named: in a gateway, whether the grant names each served namespace
 	// (§C.2); nil in local mode, whose grant the operator chose them for.
 	named map[string]bool
 
 	// under Server.mu; verified zero: ask the core again at the next
-	// request
+	// request; vns, the namespace whose GET /ns/{ns}/principal accepted
+	// it last (verdict), asked first when it is verified again
 	used, verified time.Time
 	inflight       int
+	vns            string
 
 	mu      sync.Mutex
 	writers map[string]writerAt // by namespace: §7.4's writer block
 	docs    map[string]nsDocAt  // by namespace: what its document says
-	cats    map[string]*catGraph
-
-	dirs treeDirs // the folders a tree service listed to it (treesvc.go)
 }
 
-func (s *Server) newToken(id string, c *client.Client, p *principal, named map[string]bool) *token {
-	return &token{id: id, c: c, p: p, named: named, used: s.opt.Now(), writers: map[string]writerAt{}, docs: map[string]nsDocAt{},
-		cats: map[string]*catGraph{}}
+func (s *Server) newToken(id string, c *client.Client, sc *scope, named map[string]bool) *token {
+	return &token{id: id, c: c, p: sc.p, sc: sc, named: named, used: s.opt.Now(), writers: map[string]writerAt{}, docs: map[string]nsDocAt{}}
 }
 
 // principal is a user as the server keeps state for them (§H.7): their
-// locks, scratch files, dead properties, guards, recent deletes and moves
-// aside, and the writes their tree listings wait for, within bounds;
-// their records (records.go) are kept by its id, apart and for longer. In
-// a gateway, every token the core verified as theirs (userKey) shares it;
-// in local mode, there is one.
+// guards, recent deletes and moves aside, the writes their tree listings
+// wait for and the bytes their uploads buffer, within bounds, and, by
+// narrowing, their scopes; their records (records.go) are kept by its id,
+// apart and for longer. In a gateway, every token the core verified as
+// theirs (userKey) shares it; in local mode, there is one.
 type principal struct {
-	id    string // userKey; "local" in local mode
-	locks webdav.LockSystem
+	id string // userKey; "local" in local mode
 
 	// under Server.mu
 	used     time.Time
@@ -1115,18 +1278,69 @@ type principal struct {
 	ts treeSvc // its writes its tree listings wait for (treesvc.go)
 
 	mu      sync.Mutex
-	scratch map[string]*scratchFile // by path
-	sbytes  int
-	held    int64 // bytes of written files being buffered (hold)
-	dropped bool
-	locked  map[string]heldLock   // by token: its locks
-	props   map[string]*propSet   // by path: its dead properties (PROPPATCH)
-	pbytes  int                   // what props cost
+	held    int64                 // bytes of written files being buffered (hold)
+	scopes  map[string]*scope     // by scopeOf; membership under Server.mu too
 	deletes map[string]ownDelete  // by ns/name: its latest DELETEs
 	trees   map[string]treeDelete // by path: the files of trees its latest DELETEs removed
 	aside   map[string]time.Time  // documents' paths moved aside to a backup, and when
 	guards  map[string][]guard    // by document path: its refused saves' guards, oldest first
 	nguards int
+}
+
+// scope is what a principal keeps for its tokens of one narrowing
+// (scopeOf), which may hold what one token read: their scratch files,
+// locks (their owners' XML) and dead properties, within the principal's
+// bounds, over its scopes. A token the issuer minted for the user shares
+// the user's root scope with every other; one narrowed offline (another
+// ns, can, rules, or a via: a delegate) has its own, so a scratch file
+// one wrote, such as a document's backup copy (§H.5) or an editor's swap
+// file holding its text, is never served to a token that may read less
+// (§H.6 "served only to that user"). What holds no content (guards,
+// deletes, moves aside, records) stays the user's.
+type scope struct {
+	p     *principal
+	key   string
+	locks webdav.LockSystem
+
+	// under Server.mu
+	used     time.Time
+	inflight int
+
+	// under p.mu
+	scratch map[string]*scratchFile // by path
+	sbytes  int
+	dropped bool
+	locked  map[string]heldLock // by token: its locks
+	props   map[string]*propSet // by path: its dead properties (PROPPATCH)
+	pbytes  int                 // what props cost
+}
+
+// scopeOf is the narrowing of grant g that its token's scope is kept by:
+// a digest of its narrowing blocks (§C.1) without nbf and exp, which
+// bound only when it is used, leaving out blocks that hold nothing else;
+// "" for a root block alone, whatever it says, as the issuer minted it
+// for the user (§H.7 "a reminted token is the same person").
+func scopeOf(g *grant.Grant) string {
+	h := sha256.New()
+	n := 0
+	for _, b := range g.Blocks[1:] {
+		m := make(map[string]any, len(b.Raw))
+		for k, v := range b.Raw {
+			if k != "nbf" && k != "exp" {
+				m[k] = v
+			}
+		}
+		if len(m) == 0 {
+			continue
+		}
+		h.Write(jsonv.Canonical(m))
+		h.Write([]byte{0})
+		n++
+	}
+	if n == 0 {
+		return ""
+	}
+	return hex.EncodeToString(h.Sum(nil)[:16])
 }
 
 // asideFor is how soon after the principal moved a document aside to a
@@ -1356,9 +1570,18 @@ func (p *principal) guarded(path string, now time.Time) bool {
 }
 
 func (s *Server) newPrincipal(id string) *principal {
-	return &principal{id: id, locks: webdav.NewMemLS(), toks: map[*token]bool{}, scratch: map[string]*scratchFile{},
-		locked: map[string]heldLock{}, props: map[string]*propSet{}, deletes: map[string]ownDelete{},
+	return &principal{id: id, toks: map[*token]bool{}, scopes: map[string]*scope{}, deletes: map[string]ownDelete{},
 		trees: map[string]treeDelete{}, aside: map[string]time.Time{}, guards: map[string][]guard{}, used: s.opt.Now()}
+}
+
+// newScopeLocked makes p's scope key.
+func (s *Server) newScopeLocked(p *principal, key string) *scope {
+	sc := &scope{p: p, key: key, locks: webdav.NewMemLS(), used: s.opt.Now(), scratch: map[string]*scratchFile{},
+		locked: map[string]heldLock{}, props: map[string]*propSet{}}
+	p.mu.Lock()
+	p.scopes[key] = sc
+	p.mu.Unlock()
+	return sc
 }
 
 // reqState is one request's view, in its context: the token and its
@@ -1369,6 +1592,7 @@ type reqState struct {
 	s      *Server
 	tk     *token
 	p      *principal // tk's user
+	sc     *scope     // tk's scope of p
 	method string
 	path   string
 	dst    string

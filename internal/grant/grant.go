@@ -132,6 +132,14 @@ func (g *Grant) verifyChain(root ed25519.PublicKey) error {
 	return nil
 }
 
+// SignedBy reports whether g's signature chain verifies under root key
+// pub, whatever its blocks say: which of two keys sharing its root kid
+// signed it, such as a deployment's operator key and a namespace's
+// (§C.4), which a verifier holding both tells apart only so.
+func (g *Grant) SignedBy(pub ed25519.PublicKey) bool {
+	return len(pub) == ed25519.PublicKeySize && g.c != nil && g.verifyChain(pub) == nil
+}
+
 // ChainVerified reports whether the signature chain has verified under
 // some root key (Verify), as opposed to only having decoded.
 func (g *Grant) ChainVerified() bool { return g.chainKey.Load() != nil }

@@ -125,6 +125,25 @@ func (s *Server) storeLocked(p *principal) *recStore {
 	return rs
 }
 
+// loseRecords marks the documents user from has records of as lost in
+// to's records (§H.4 "records evicted"): a token verified as to now, that
+// was from's, may have them open, and to's records don't hold what it
+// opened, so its saves without a base are refused until it reloads.
+func (s *Server) loseRecords(from, to *principal) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	src := s.recRoots[from.id]
+	if src == nil {
+		return
+	}
+	dst := s.storeLocked(to)
+	for _, k := range src.docs.Keys() {
+		if _, ok := dst.docs.Get(k); !ok {
+			dst.forgotten.Put(k, true, 1)
+		}
+	}
+}
+
 // markOwn remembers that user p wrote entry id of ns/name, a tombstone or
 // a restore: one between a save's base and the head is no delete or
 // restore by someone else (§11.3, §H.4), whichever of p's tokens wrote it

@@ -88,6 +88,18 @@ func (c *Cache[K, V]) Remove(k K) bool {
 	return true
 }
 
+// Keys returns the keys, the most recently used first, marking none used.
+func (c *Cache[K, V]) Keys() []K {
+	out := make([]K, 0, len(c.m))
+	if c.l == nil {
+		return out
+	}
+	for e := c.l.Front(); e != nil; e = e.Next() {
+		out = append(out, e.Value.(*item[K, V]).k)
+	}
+	return out
+}
+
 // Len is the number of entries, Bytes their total cost.
 func (c *Cache[K, V]) Len() int   { return len(c.m) }
 func (c *Cache[K, V]) Bytes() int { return c.bytes }

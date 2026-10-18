@@ -588,6 +588,22 @@ func TestVerifyAgain(t *testing.T) {
 	wantStatus(t, err, 403)
 }
 
+// SignedBy tells which of two keys under one kid signed a grant, narrowed
+// or not, whatever its blocks say.
+func TestSignedBy(t *testing.T) {
+	f, other := newFixture(t, nil), newFixture(t, nil)
+	g := roundtrip(t, mustMint(t, f, nil))
+	n, err := g.Narrow(map[string]any{"via": "svc:x", "can": []any{"read"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, x := range []*Grant{g, roundtrip(t, n)} {
+		if !x.SignedBy(f.keys[0].Pub) || x.SignedBy(other.keys[0].Pub) || x.SignedBy(nil) {
+			t.Fatalf("%d blocks: signed by its key %v, by another %v", len(x.Blocks), x.SignedBy(f.keys[0].Pub), x.SignedBy(other.keys[0].Pub))
+		}
+	}
+}
+
 // The ns check comes first, before anything is verified (§C.2): a grant
 // not naming the namespace is 403 even when it would also be a 401.
 func TestNSCheckFirst(t *testing.T) {

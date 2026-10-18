@@ -17,7 +17,6 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/files"
-	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/telemetry"
 	"github.com/middle-management/patchlog/internal/tree"
 )
@@ -70,8 +69,6 @@ const (
 	// maxWroteNS bounds the namespaces a user's writes are kept for, and
 	// maxWroteIDs the entries of one.
 	maxWroteNS, maxWroteIDs = 64, 4
-	// maxTreeDirs bounds the folders' listings a token keeps.
-	maxTreeDirs = 256
 )
 
 // errBehind: the tree service hasn't reached a user's writes in time.
@@ -200,14 +197,6 @@ type treeSvc struct {
 	slow  map[string]time.Time // by catalog: listed from node documents until then
 }
 
-// treeDirs is the folders a tree service listed to a token, kept per
-// token as everything read with its grant is (§H.7): another token of the
-// same user may be shown less.
-type treeDirs struct {
-	mu   sync.Mutex
-	dirs lru.Cache[string, svcDir] // by catalog/folder node
-}
-
 // wroteID is a namespace entry a write produced, and when.
 type wroteID struct {
 	id string
@@ -298,23 +287,13 @@ func (ts *treeSvc) setSlow(cat string, until time.Time) {
 	ts.slow[cat] = until
 }
 
-// get returns folder k's listing if it was listed less than ttl before
-// now and since this server's last write (gen).
-func (td *treeDirs) get(k string, now time.Time, ttl time.Duration, gen uint64) *treeDir {
-	td.mu.Lock()
-	defer td.mu.Unlock()
-	sd, ok := td.dirs.Get(k)
-	if !ok || sd.gen != gen || now.Sub(sd.at) >= ttl {
+// fresh returns sd's listing if it was listed less than ttl before now
+// and since this server's last write (gen).
+func (sd svcDir) fresh(now time.Time, ttl time.Duration, gen uint64) *treeDir {
+	if sd.d == nil || sd.gen != gen || now.Sub(sd.at) >= ttl {
 		return nil
 	}
 	return sd.d
-}
-
-func (td *treeDirs) keep(k string, sd svcDir) {
-	td.mu.Lock()
-	defer td.mu.Unlock()
-	td.dirs.MaxEntries = maxTreeDirs
-	td.dirs.Put(k, sd, 1)
 }
 
 // roundTripFunc adapts a function to http.RoundTripper.
@@ -360,7 +339,8 @@ func writtenNS(p string) string {
 func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catConf) (*treeDir, error) {
 	now, gen := st.s.opt.Now(), st.s.gen.Load()
 	k := cat + "/" + folder
-	if d := st.tk.dirs.get(k, now, st.s.opt.CatalogTTL, gen); d != nil {
+	v, _ := st.s.view(st.tk, k)
+	if d := v.sd.fresh(now, st.s.opt.CatalogTTL, gen); d != nil {
 		// Listed since this server's last write, so with every write of
 		// the user's it was to wait for (a write notes its entry before
 		// it counts, changed).
@@ -393,7 +373,7 @@ func (st *reqState) serviceDir(ctx context.Context, cat, folder string, c catCon
 		}
 	}
 	d := st.s.nameDir(kids, func(node string) time.Time { return st.nodeBorn(ctx, cat, node) })
-	st.tk.dirs.keep(k, svcDir{d: d, at: now, gen: gen})
+	st.s.keepView(st.tk, k, tokenView{sd: svcDir{d: d, at: now, gen: gen}}, 256*(len(d.entries)+1))
 	return d, nil
 }
 

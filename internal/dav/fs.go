@@ -500,7 +500,7 @@ type listing struct {
 
 // list reads directory t: its files and folders as the core has them now
 // (each request reads a flat namespace again; a catalog's tree is kept
-// CatalogTTL), and the principal's scratch files in it. The root lists
+// CatalogTTL), and the scope's scratch files in it. The root lists
 // the namespaces offered (§H.7, §H.2). A flat namespace lists the head
 // rows of /heads (§H.3) by the flat view's names (§H.2): a raw document
 // by its name, any other as {name}.json, and one whose name a raw one has
@@ -1593,12 +1593,12 @@ type deadProps struct {
 
 // DeadProps implements webdav.DeadPropsHolder.
 func (d deadProps) DeadProps() (map[xml.Name]webdav.Property, error) {
-	return d.st.p.deadProps(d.path), nil
+	return d.st.sc.deadProps(d.path), nil
 }
 
 // Patch implements webdav.DeadPropsHolder: every change is kept.
 func (d deadProps) Patch(ps []webdav.Proppatch) ([]webdav.Propstat, error) {
-	d.st.p.patchProps(d.path, ps, d.st.s.opt.Now())
+	d.st.sc.patchProps(d.path, ps, d.st.s.opt.Now())
 	st := webdav.Propstat{Status: http.StatusOK}
 	for _, p := range ps {
 		for _, prop := range p.Props {

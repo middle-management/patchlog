@@ -73,3 +73,23 @@ func TestCacheRemove(t *testing.T) {
 		t.Fatalf("evicted %v", evicted)
 	}
 }
+
+// Keys lists the keys, the most recently used first, and marks none used.
+func TestCacheKeys(t *testing.T) {
+	var c Cache[string, int]
+	if k := c.Keys(); len(k) != 0 {
+		t.Fatalf("an empty cache's keys: %q", k)
+	}
+	c.MaxEntries = 3
+	c.Put("a", 1, 1)
+	c.Put("b", 2, 1)
+	c.Put("c", 3, 1)
+	c.Get("a")
+	if k := c.Keys(); len(k) != 3 || k[0] != "a" || k[1] != "c" || k[2] != "b" {
+		t.Fatalf("keys %q", k)
+	}
+	c.Put("d", 4, 1) // evicts b, which Keys didn't mark used
+	if _, ok := c.Get("b"); ok {
+		t.Fatal("Keys marked b used")
+	}
+}

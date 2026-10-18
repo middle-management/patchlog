@@ -19,9 +19,11 @@ import (
 // kind (a LOCK of a new name, a 0-byte PUT of a new .json name,
 // holdEmpty); and scratch directories, which apps save through (a dot, macOS's
 // "(A Document Being Saved By …)", mayScratchDir). They live in memory,
-// per user (§H.6, §H.7) and path, bounded per user, and expire when left
-// untouched for ScratchIdle. They are never written to the core: moving
-// one onto a document name is how editors save.
+// per user (§H.6, §H.7), narrowing (scope) and path, bounded per user,
+// and expire when left untouched for ScratchIdle. Only tokens of the
+// scope that wrote one, and whose grant names its namespace (mayKeep),
+// reach it. They are never written to the core: moving one onto a
+// document name is how editors save.
 
 type scratchFile struct {
 	data  []byte
@@ -41,42 +43,45 @@ func junk(name string) bool {
 	return strings.HasPrefix(b, "._") || b == ".DS_Store" || b == "Thumbs.db"
 }
 
-// scratchGet returns the principal's scratch file or directory at name.
+// scratchGet returns the scope's scratch file or directory at name.
 func (st *reqState) scratchGet(name string) (*scratchFile, bool) {
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	f, ok := p.scratch[name]
+	if st.mayKeep(name) != nil {
+		return nil, false
+	}
+	sc := st.sc
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	f, ok := sc.scratch[name]
 	if ok {
 		st.touchLocked(name, st.s.opt.Now())
 	}
 	return f, ok
 }
 
-// scratchPeek returns the principal's scratch file or directory at name
+// scratchPeek returns the scope's scratch file or directory at name
 // without touching it (resolving a path, listing).
 func (st *reqState) scratchPeek(name string) (*scratchFile, bool) {
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	f, ok := p.scratch[name]
+	if st.mayKeep(name) != nil {
+		return nil, false
+	}
+	sc := st.sc
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	f, ok := sc.scratch[name]
 	return f, ok
 }
 
-// isScratchDir reports whether name is one of the principal's scratch
+// isScratchDir reports whether name is one of the scope's scratch
 // directories.
 func (st *reqState) isScratchDir(name string) bool {
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	f := p.scratch[name]
-	return f != nil && f.dir
+	f, ok := st.scratchPeek(name)
+	return ok && f.dir
 }
 
 // touchLocked marks name and the scratch directories it is in used.
 func (st *reqState) touchLocked(name string, now time.Time) {
 	for n := name; n != "/"; n = path.Dir(n) {
-		f := st.p.scratch[n]
+		f := st.sc.scratch[n]
 		if f == nil {
 			return
 		}
@@ -93,11 +98,7 @@ func (st *reqState) scratchPut(name string, data []byte, ctype string) error {
 
 // scratchMkdir makes a scratch directory at name.
 func (st *reqState) scratchMkdir(name string) error {
-	p := st.p
-	p.mu.Lock()
-	_, had := p.scratch[name]
-	p.mu.Unlock()
-	if had {
+	if _, had := st.scratchPeek(name); had {
 		return os.ErrExist
 	}
 	return st.scratchSet(name, &scratchFile{dir: true})
@@ -106,7 +107,9 @@ func (st *reqState) scratchMkdir(name string) error {
 // mayKeep refuses a scratch file or directory at name in a served
 // namespace the request's grant doesn't name: the server would keep it
 // there for a user who can't list the namespace, nor write to it with
-// this token.
+// this token; nor does such a token reach one there another token of the
+// scope keeps (scratchGet, scratchPeek, scratchList), which may hold a
+// document's text that the core refuses this one (§H.6, §C.2).
 func (st *reqState) mayKeep(name string) error {
 	if st.tk.named == nil {
 		return nil
@@ -119,7 +122,7 @@ func (st *reqState) mayKeep(name string) error {
 }
 
 func (st *reqState) scratchSet(name string, f *scratchFile) error {
-	s, p := st.s, st.p
+	s, sc := st.s, st.sc
 	if err := st.mayKeep(name); err != nil {
 		return err
 	}
@@ -128,12 +131,12 @@ func (st *reqState) scratchSet(name string, f *scratchFile) error {
 	}
 	now := s.opt.Now()
 	f.mod, f.used = now, now
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.dropped {
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	if sc.dropped {
 		return fail(http.StatusServiceUnavailable, "this login was signed out meanwhile; try again")
 	}
-	old := p.scratch[name]
+	old := sc.scratch[name]
 	if old != nil && old.dir != f.dir {
 		return fail(http.StatusMethodNotAllowed, "%s is a %s", name, map[bool]string{true: "directory", false: "file"}[old.dir])
 	}
@@ -153,38 +156,42 @@ func (st *reqState) scratchSet(name string, f *scratchFile) error {
 			return err
 		}
 	}
-	p.scratch[name] = f
+	sc.scratch[name] = f
 	st.touchLocked(path.Dir(name), now)
 	return nil
 }
 
 // reserveLocked accounts for n bytes in place of old (nil: one more file)
-// within the bounds.
+// within the bounds, which are the user's, over their scopes.
 func (st *reqState) reserveLocked(old *scratchFile, n int) error {
-	s, p := st.s, st.p
+	s, sc := st.s, st.sc
 	delta, files := n, 1
 	if old != nil {
 		delta, files = n-len(old.data), 0
 	}
-	if len(p.scratch)+files > s.opt.ScratchFiles {
+	nfiles, nbytes := 0, 0
+	for _, o := range sc.p.scopes {
+		nfiles, nbytes = nfiles+len(o.scratch), nbytes+o.sbytes
+	}
+	if nfiles+files > s.opt.ScratchFiles {
 		return fail(http.StatusInsufficientStorage, "at most %d temporary files and folders (editors' and systems' own, kept in memory, §H.6) are kept per user", s.opt.ScratchFiles)
 	}
-	if delta > 0 && p.sbytes+delta > s.opt.ScratchBytes {
+	if delta > 0 && nbytes+delta > s.opt.ScratchBytes {
 		return fail(http.StatusInsufficientStorage, "at most %d bytes of temporary files are kept per user", s.opt.ScratchBytes)
 	}
 	if s.scratchTotal.Add(int64(delta)) > int64(s.opt.ScratchTotal) && delta > 0 {
 		s.scratchTotal.Add(-int64(delta))
 		return fail(http.StatusInsufficientStorage, "the server keeps no more temporary files")
 	}
-	p.sbytes += delta
+	sc.sbytes += delta
 	return nil
 }
 
 // releaseLocked drops name, f, from the scratch store and its bounds.
 func (st *reqState) releaseLocked(name string, f *scratchFile) {
-	p := st.p
-	delete(p.scratch, name)
-	p.sbytes -= len(f.data)
+	sc := st.sc
+	delete(sc.scratch, name)
+	sc.sbytes -= len(f.data)
 	st.s.scratchTotal.Add(-int64(len(f.data)))
 }
 
@@ -193,7 +200,7 @@ func (st *reqState) releaseLocked(name string, f *scratchFile) {
 func (st *reqState) evictJunkLocked(keep string) bool {
 	var name string
 	var old *scratchFile
-	for n, f := range st.p.scratch {
+	for n, f := range st.sc.scratch {
 		if n != keep && !f.dir && junk(n) && (old == nil || f.used.Before(old.used)) {
 			name, old = n, f
 		}
@@ -205,19 +212,22 @@ func (st *reqState) evictJunkLocked(keep string) bool {
 	return true
 }
 
-// scratchRemove drops the principal's scratch file or directory at name,
+// scratchRemove drops the scope's scratch file or directory at name,
 // with everything in it.
 func (st *reqState) scratchRemove(name string) bool {
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	f, ok := p.scratch[name]
+	if st.mayKeep(name) != nil {
+		return false
+	}
+	sc := st.sc
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	f, ok := sc.scratch[name]
 	if !ok {
 		return false
 	}
 	st.releaseLocked(name, f)
 	if f.dir {
-		for n, g := range p.scratch {
+		for n, g := range sc.scratch {
 			if strings.HasPrefix(n, name+"/") {
 				st.releaseLocked(n, g)
 			}
@@ -229,10 +239,10 @@ func (st *reqState) scratchRemove(name string) bool {
 // scratchUnmark drops the scratch directory entry at name, keeping what
 // is in it: the directory became a tree's folder.
 func (st *reqState) scratchUnmark(name string) {
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if f, ok := p.scratch[name]; ok {
+	sc := st.sc
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	if f, ok := sc.scratch[name]; ok {
 		st.releaseLocked(name, f)
 	}
 }
@@ -243,19 +253,22 @@ func (st *reqState) scratchRename(oldName, newName string) error {
 	if err := st.mayKeep(newName); err != nil {
 		return err
 	}
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.dropped {
+	if st.mayKeep(oldName) != nil {
+		return os.ErrNotExist
+	}
+	sc := st.sc
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	if sc.dropped {
 		return fail(http.StatusServiceUnavailable, "this login was signed out meanwhile; try again")
 	}
-	f, ok := p.scratch[oldName]
+	f, ok := sc.scratch[oldName]
 	if !ok {
 		return os.ErrNotExist
 	}
 	moves := map[string]string{oldName: newName}
 	if f.dir {
-		for n := range p.scratch {
+		for n := range sc.scratch {
 			if rest, ok := strings.CutPrefix(n, oldName+"/"); ok {
 				moves[n] = newName + "/" + rest
 			}
@@ -264,49 +277,52 @@ func (st *reqState) scratchRename(oldName, newName string) error {
 	now := st.s.opt.Now()
 	got := map[string]*scratchFile{}
 	for from := range moves {
-		got[from] = p.scratch[from]
-		delete(p.scratch, from)
+		got[from] = sc.scratch[from]
+		delete(sc.scratch, from)
 	}
 	for from, to := range moves {
-		if g, had := p.scratch[to]; had {
+		if g, had := sc.scratch[to]; had {
 			st.releaseLocked(to, g)
 		}
-		p.scratch[to] = got[from]
+		sc.scratch[to] = got[from]
 	}
 	f.used = now
 	st.touchLocked(path.Dir(newName), now)
 	return nil
 }
 
-// scratchMoveUnder moves the principal's scratch files and directories
+// scratchMoveUnder moves the scope's scratch files and directories
 // below dir to below to: a tree's folder was renamed or moved.
 func (st *reqState) scratchMoveUnder(dir, to string) {
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	sc := st.sc
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
 	moves := map[string]*scratchFile{}
-	for name, f := range p.scratch {
+	for name, f := range sc.scratch {
 		if rest, ok := strings.CutPrefix(name, dir+"/"); ok {
 			moves[to+"/"+rest] = f
-			delete(p.scratch, name)
+			delete(sc.scratch, name)
 		}
 	}
 	for name, f := range moves {
-		if g, had := p.scratch[name]; had {
+		if g, had := sc.scratch[name]; had {
 			st.releaseLocked(name, g)
 		}
-		p.scratch[name] = f
+		sc.scratch[name] = f
 	}
 }
 
-// scratchList lists the principal's scratch files and directories in
+// scratchList lists the scope's scratch files and directories in
 // directory dir, by name.
 func (st *reqState) scratchList(dir string) map[string]*scratchFile {
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	out := map[string]*scratchFile{}
-	for name, f := range p.scratch {
+	if st.mayKeep(dir+"/x") != nil {
+		return out
+	}
+	sc := st.sc
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	for name, f := range sc.scratch {
 		if path.Dir(name) == dir {
 			out[path.Base(name)] = f
 		}
@@ -314,14 +330,17 @@ func (st *reqState) scratchList(dir string) map[string]*scratchFile {
 	return out
 }
 
-// scratchUnder returns the paths of the principal's scratch files and
+// scratchUnder returns the paths of the scope's scratch files and
 // directories below dir.
 func (st *reqState) scratchUnder(dir string) []string {
-	p := st.p
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	if st.mayKeep(dir+"/x") != nil {
+		return nil
+	}
+	sc := st.sc
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
 	var out []string
-	for name := range p.scratch {
+	for name := range sc.scratch {
 		if strings.HasPrefix(name, dir+"/") {
 			out = append(out, name)
 		}
@@ -330,7 +349,7 @@ func (st *reqState) scratchUnder(dir string) []string {
 	return out
 }
 
-// maxPropBytes bounds a principal's dead properties (PROPPATCH), their
+// maxPropBytes bounds a scope's dead properties (PROPPATCH), their
 // names and values: over it, those of the path touched least recently go
 // first. They are cosmetic (Windows' file times), so dropping them is
 // better than refusing a client's write over them.
@@ -348,11 +367,11 @@ func propCost(p webdav.Property) int {
 	return len(p.XMLName.Space) + len(p.XMLName.Local) + len(p.Lang) + len(p.InnerXML) + 64
 }
 
-// deadProps returns the principal's dead properties of path.
-func (p *principal) deadProps(path string) map[xml.Name]webdav.Property {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	ps := p.props[path]
+// deadProps returns the scope's dead properties of path.
+func (sc *scope) deadProps(path string) map[xml.Name]webdav.Property {
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	ps := sc.props[path]
 	if ps == nil {
 		return nil
 	}
@@ -363,103 +382,107 @@ func (p *principal) deadProps(path string) map[xml.Name]webdav.Property {
 	return out
 }
 
-// patchProps applies a PROPPATCH's changes to the principal's dead
+// patchProps applies a PROPPATCH's changes to the scope's dead
 // properties of path, within maxPropBytes.
-func (p *principal) patchProps(path string, patches []webdav.Proppatch, now time.Time) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.dropped {
+func (sc *scope) patchProps(path string, patches []webdav.Proppatch, now time.Time) {
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	if sc.dropped {
 		return
 	}
-	ps := p.props[path]
+	ps := sc.props[path]
 	if ps == nil {
 		ps = &propSet{props: map[xml.Name]webdav.Property{}}
-		p.props[path] = ps
+		sc.props[path] = ps
 	}
 	for _, pp := range patches {
 		for _, prop := range pp.Props {
 			if old, ok := ps.props[prop.XMLName]; ok {
 				ps.bytes -= propCost(old)
-				p.pbytes -= propCost(old)
+				sc.pbytes -= propCost(old)
 				delete(ps.props, prop.XMLName)
 			}
 			if !pp.Remove {
 				ps.props[prop.XMLName] = prop
 				ps.bytes += propCost(prop)
-				p.pbytes += propCost(prop)
+				sc.pbytes += propCost(prop)
 			}
 		}
 	}
 	ps.at = now
-	for p.pbytes > maxPropBytes {
+	for sc.pbytes > maxPropBytes {
 		old := ""
-		for k, o := range p.props {
-			if old == "" || o.at.Before(p.props[old].at) {
+		for k, o := range sc.props {
+			if old == "" || o.at.Before(sc.props[old].at) {
 				old = k
 			}
 		}
-		p.pbytes -= p.props[old].bytes
-		delete(p.props, old)
+		sc.pbytes -= sc.props[old].bytes
+		delete(sc.props, old)
 	}
 	if len(ps.props) == 0 {
-		delete(p.props, path)
+		delete(sc.props, path)
 	}
 }
 
-// moveProps moves the principal's dead properties of the paths at or
+// moveProps moves the scope's dead properties of the paths at or
 // below from to below to (a MOVE that passed, RFC 4918 §9.9.1), or drops
 // them, to "" (a DELETE that passed).
-func (p *principal) moveProps(from, to string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
+func (sc *scope) moveProps(from, to string) {
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
 	moved := map[string]*propSet{}
-	for k, ps := range p.props {
+	for k, ps := range sc.props {
 		if rest, ok := strings.CutPrefix(k, from); ok && (rest == "" || strings.HasPrefix(rest, "/")) {
-			delete(p.props, k)
+			delete(sc.props, k)
 			if to != "" {
 				moved[to+rest] = ps
 			} else {
-				p.pbytes -= ps.bytes
+				sc.pbytes -= ps.bytes
 			}
 		}
 	}
 	for k, ps := range moved {
-		if old := p.props[k]; old != nil {
-			p.pbytes -= old.bytes
+		if old := sc.props[k]; old != nil {
+			sc.pbytes -= old.bytes
 		}
-		p.props[k] = ps
+		sc.props[k] = ps
 	}
 }
 
-// dropScratch drops every scratch file and lock of a user being
-// forgotten, returning the files' bytes; nothing is stored for it
+// drop drops every scratch file, lock and dead property of a scope
+// being forgotten, returning the files' bytes; nothing is stored for it
 // afterwards (a request still in flight gets a 503).
-func (p *principal) dropScratch() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	n := p.sbytes
-	p.scratch, p.sbytes, p.dropped, p.locked = map[string]*scratchFile{}, 0, true, map[string]heldLock{}
-	p.props, p.pbytes = map[string]*propSet{}, 0
+func (sc *scope) drop() int {
+	sc.p.mu.Lock()
+	defer sc.p.mu.Unlock()
+	n := sc.sbytes
+	sc.scratch, sc.sbytes, sc.dropped, sc.locked = map[string]*scratchFile{}, 0, true, map[string]heldLock{}
+	sc.props, sc.pbytes = map[string]*propSet{}, 0
 	return n
 }
 
-// expireScratch drops scratch files untouched since before, returning
-// their bytes.
+// expireScratch drops p's scratch files and dead properties untouched
+// since before, in every scope, returning the files' bytes.
 func (p *principal) expireScratch(before time.Time) int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	n := 0
-	for name, f := range p.scratch {
-		if f.used.Before(before) {
-			delete(p.scratch, name)
-			n += len(f.data)
+	for _, sc := range p.scopes {
+		m := 0
+		for name, f := range sc.scratch {
+			if f.used.Before(before) {
+				delete(sc.scratch, name)
+				m += len(f.data)
+			}
 		}
-	}
-	p.sbytes -= n
-	for k, ps := range p.props {
-		if ps.at.Before(before) {
-			p.pbytes -= ps.bytes
-			delete(p.props, k)
+		sc.sbytes -= m
+		n += m
+		for k, ps := range sc.props {
+			if ps.at.Before(before) {
+				sc.pbytes -= ps.bytes
+				delete(sc.props, k)
+			}
 		}
 	}
 	return n
