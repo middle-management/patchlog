@@ -616,12 +616,13 @@ func TestSavePreconditionsPlaceholder(t *testing.T) {
 // it back whatever refuses the write that follows, not only a conflict: a
 // body that isn't JSON (rclone's mount without a cache renames over a
 // file as DELETE, then MOVE of a scratch file onto the name), one over
-// -max-file-size, a failed precondition. A placement unplaced by the
-// user's DELETE before a write to its path is placed back the same way.
+// -max-file-size, a failed precondition. A tree's file deleted by the
+// user's DELETE before a write to its path is put back the same way: its
+// placement, and its item.
 func TestSaveDeleteThenWriteFails(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{
-		"cat": {"catalog": map[string]any{"trust": []any{"docs"}}},
+		"cat": {"catalog": treeCatalog("docs")},
 	}, func(_ *clienttest.Options, o *dav.Options) { o.MaxFileSize = 1024 })
 	for i, c := range []struct {
 		what   string
@@ -655,9 +656,13 @@ func TestSaveDeleteThenWriteFails(t *testing.T) {
 	}
 	e.create("docs", "p", map[string]any{"v": 1})
 	e.create("cat", "root", map[string]any{"parents": []any{}})
-	e.create("cat", "docs.p", map[string]any{"parents": parents("cat", "root")})
-	e.expect(e.do("DELETE", "/cat/root/docs.p.json", ""), 204, "DELETE placement")
-	e.expect(e.do("PUT", "/cat/root/docs.p.json", `{"v": 2`), 400, "PUT of a body that isn't JSON to its path")
+	e.create("cat", "docs.p", map[string]any{"title": "p.json", "parents": parents("cat", "root")})
+	e.expect(e.do("DELETE", "/cat/p.json", ""), 204, "DELETE a tree's file")
+	e.expectTombstoned("docs", "p", "the item")
+	r := e.expect(e.do("PUT", "/cat/p.json", `{"v": 2`), 400, "PUT of a body that isn't JSON to its path")
+	if !strings.Contains(r.body, "restored as it was") {
+		t.Fatalf("400 %q", r.body)
+	}
 	sameJSON(t, e.parentsOf("docs.p"), parents("cat", "root"))
 	_, doc := e.load("docs", "p")
 	sameJSON(t, doc, map[string]any{"v": 1})

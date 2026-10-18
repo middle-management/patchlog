@@ -57,11 +57,15 @@ func TestBare(t *testing.T) {
 func TestDupNames(t *testing.T) {
 	t.Parallel()
 	taken := map[string]bool{"x (2).json": true}
-	if got := dupName("x.json", func(n string) bool { return taken[n] }); got != "x (3).json" {
+	if got := dupName("x.json", false, func(n string) bool { return taken[n] }); got != "x (3).json" {
 		t.Fatalf("dupName %q", got)
 	}
-	if got := dupName("notes", func(string) bool { return false }); got != "notes (2)" {
+	if got := dupName("notes", false, func(string) bool { return false }); got != "notes (2)" {
 		t.Fatalf("dupName %q", got)
+	}
+	// A folder's number is at the end: a dot in its name is no extension.
+	if got := dupName("v1.2", true, func(string) bool { return false }); got != "v1.2 (2)" {
+		t.Fatalf("dupName of a folder %q", got)
 	}
 	for in, want := range map[string]string{"x (2).json": "x.json", "a.b (12).md": "a.b.md", "x (2)": "x"} {
 		if got, _, ok := dupOf(in); !ok || got != want {

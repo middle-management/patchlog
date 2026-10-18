@@ -244,8 +244,8 @@ func TestGatewayBounds(t *testing.T) {
 
 // A root listing names the served namespaces without reading them, so a
 // grant that reads only some of them still mounts; the others refuse when
-// opened. A catalog folder leaves out the placements whose items the
-// grant doesn't read.
+// opened. A tree's folder leaves out the files whose items the grant
+// doesn't read (§B.11.5: nothing hidden shows).
 func TestGatewayPartialGrant(t *testing.T) {
 	t.Parallel()
 	e, k := authEnv(t, true)
@@ -253,7 +253,7 @@ func TestGatewayPartialGrant(t *testing.T) {
 		op := e.s.Client(t, client.WithBearer(e.s.OperatorGrant(t, ns)))
 		doc := map[string]any{"read": "grant", "keys": []any{k.Entry("*")}}
 		if ns == "cat" {
-			doc["catalog"] = map[string]any{"trust": []any{"docs", "secret"}, "mode": "dag"}
+			doc["catalog"] = treeCatalog("docs", "secret")
 		}
 		must(op.CreateNamespace(e.ctx, ns, doc))
 	}
@@ -262,7 +262,7 @@ func TestGatewayPartialGrant(t *testing.T) {
 	must(w.CreateDoc(e.ctx, "secret", "s", map[string]any{"v": 2}))
 	must(w.CreateDoc(e.ctx, "cat", "root", map[string]any{"parents": []any{}}))
 	for _, n := range []string{"docs.a", "secret.s"} {
-		must(w.CreateDoc(e.ctx, "cat", n, map[string]any{"parents": parents("cat", "root")}))
+		must(w.CreateDoc(e.ctx, "cat", n, map[string]any{"title": n + ".json", "parents": parents("cat", "root")}))
 	}
 	srv := must(dav.New(dav.Options{Client: e.s.Client(t), Namespaces: []string{"docs", "secret"}, Catalogs: []string{"cat"}, Gateway: true, Logf: t.Logf}))
 	hs := httptest.NewServer(srv)
@@ -273,7 +273,7 @@ func TestGatewayPartialGrant(t *testing.T) {
 	if r := g.do("PROPFIND", "/secret/", "", "Depth", "1"); r.status != 403 {
 		t.Fatalf("PROPFIND /secret/: %d %s", r.status, r.body)
 	}
-	sameStrings(t, "cat/root", names(g.propfind("/cat/root/"), "/cat/root/"), []string{"docs.a.json"})
+	sameStrings(t, "cat", names(g.propfind("/cat/"), "/cat/"), []string{"docs.a.json"})
 }
 
 // A grant the core refuses for its key's scope (a lifetime over the
@@ -561,11 +561,12 @@ func TestGatewayScratchUnnamed(t *testing.T) {
 	e.expect(e.doAs(carol, "PUT", "/.DS_Store", "x"), 201, "carol's scratch file at the root")
 }
 
-// In a gateway, a PUT of a new placement whose item doesn't exist is
-// checked by a dry run of the placement with the user's grant (§7.5)
-// before the item is created: a catalog the grant reads but can't write
-// (its role there allows only read) refuses it, and nothing is written;
-// one it writes takes it.
+// In a gateway, a PUT of a new file in a tree is checked by a dry run of
+// its placement with the user's grant (§7.5) before its item is created:
+// a catalog the grant reads but can't write (its role there allows only
+// read) refuses it, and nothing is written; one it writes takes it. A
+// DELETE whose grant doesn't delete in files.ns deletes the placement and
+// leaves the item (§H.5).
 func TestGatewayPlacementRefusedByGrant(t *testing.T) {
 	t.Parallel()
 	s := clienttest.New(t, clienttest.Options{Auth: true, RealClock: true})
@@ -574,8 +575,8 @@ func TestGatewayPlacementRefusedByGrant(t *testing.T) {
 	member := func(can ...any) map[string]any { return map[string]any{"member": map[string]any{"can": can}} }
 	for ns, doc := range map[string]map[string]any{
 		"matches": {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read", "create", "append")},
-		"cat":     {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read", "create", "append"), "catalog": map[string]any{"trust": []any{"matches"}}},
-		"ro":      {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read"), "catalog": map[string]any{"trust": []any{"matches"}}},
+		"cat":     {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read", "create", "append", "delete"), "catalog": treeCatalog("matches")},
+		"ro":      {"read": "grant", "keys": []any{k.Entry("*")}, "roles": member("read"), "catalog": treeCatalog("matches")},
 	} {
 		op := s.Client(t, client.WithBearer(s.OperatorGrant(t, ns)))
 		must(op.CreateNamespace(ctx, ns, doc))
@@ -589,15 +590,20 @@ func TestGatewayPlacementRefusedByGrant(t *testing.T) {
 	defer hs.Close()
 	e := &env{t: t, ctx: ctx, s: s, c: admin, dav: hs}
 	alice := k.Grant(t, s.Now(), "user:alice", []string{"matches", "cat", "ro"}, nil, map[string]any{"roles": []any{"member"}})
-	sameStrings(t, "ro", names(e.propfindAs(alice, "/ro/"), "/ro/"), []string{"root/"})
-	e.expect(e.doAs(alice, "PUT", "/ro/root/matches.refused.json", `{"title": "Refused"}`), 403, "PUT of a placement in a catalog the grant only reads")
-	if h, _ := e.load("matches", "refused"); h.State != client.NotFound {
-		t.Fatalf("a refused placement created its item: %v", h.State)
-	}
-	e.expect(e.doAs(alice, "PUT", "/cat/root/matches.taken.json", `{"title": "Taken"}`), 201, "PUT of a placement in a catalog the grant writes")
-	_, doc := e.load("matches", "taken")
+	sameStrings(t, "ro", names(e.propfindAs(alice, "/ro/"), "/ro/"), nil)
+	e.expect(e.doAs(alice, "PUT", "/ro/refused.json", `{"title": "Refused"}`), 403, "PUT of a file in a tree the grant only reads")
+	sameStrings(t, "matches", e.liveNames("matches"), nil)
+	e.expect(e.doAs(alice, "PUT", "/cat/taken.json", `{"title": "Taken"}`), 201, "PUT of a file in a tree the grant writes")
+	node, _ := e.titled("cat", "taken.json")
+	_, item, _ := strings.Cut(node, ".")
+	_, doc := e.load("matches", item)
 	sameJSON(t, doc, map[string]any{"title": "Taken"})
-	if en := e.lastEntry("cat", "matches.taken"); en.Grant == nil || en.Grant.Sub != "user:alice" {
+	if en := e.lastEntry("cat", node); en.Grant == nil || en.Grant.Sub != "user:alice" {
 		t.Fatalf("placement entry %+v", en)
+	}
+	e.expect(e.doAs(alice, "DELETE", "/cat/taken.json", ""), 204, "DELETE without delete in files.ns")
+	e.expectTombstoned("cat", node, "the placement")
+	if h, _ := e.load("matches", item); h.State != client.Live {
+		t.Fatalf("an item the grant can't delete is %v", h.State)
 	}
 }

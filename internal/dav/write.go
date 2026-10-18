@@ -88,15 +88,29 @@ func jsonKind(v any) string {
 	return "an object"
 }
 
+// saveOpts say how a save treats what is there: pre, the document is the
+// PUT's file, whose preconditions hold for it; fresh, it only creates (a
+// tree's new item: a name that exists or existed is a 409, never edited
+// or restored); fname, the file's name, which types a raw file
+// (fileType).
+type saveOpts struct {
+	pre, fresh bool
+	fname      string
+}
+
+// taken is a fresh save's refusal of ns/name, which exists or existed.
+func taken(ns, name string) error {
+	return fail(http.StatusConflict, "%s/%s, the name drawn for a new file, exists or existed already; try again", ns, name)
+}
+
 // commitDoc writes v, uploaded as body, as JSON file ns/name (§H.1). It
 // returns the revision holding it, and whether that revision's rendering
 // is exactly v (else the upload was merged with others' edits, and the
 // revision is no validator of it). A new name is created (If-None-Match:
 // *); a tombstoned one restored (one name keeps one chain, §8.2); a live
 // one edited: the edit from its base (base) to v, rebased on the head and
-// appended with If-Match (§11.3, §H.4). pre: the document is the PUT's
-// file, whose preconditions hold for it.
-func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body []byte, pre bool) (string, bool, error) {
+// appended with If-Match (§11.3, §H.4).
+func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body []byte, o saveOpts) (string, bool, error) {
 	in := st.s.nsInfo(ctx, st.p, ns)
 	if in.sealed {
 		return "", false, notOffered(ns)
@@ -106,24 +120,25 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 	}
 	var rev string
 	var exact bool
-	st.made = ""
 	err := st.retrying(ctx, func() (bool, error) {
 		h, err := st.p.c.Head(ctx, ns, name)
 		if err != nil {
 			return false, err
 		}
-		switch h.State {
-		case client.Purged:
+		switch {
+		case o.fresh && h.State != client.NotFound:
+			return false, taken(ns, name)
+		case h.State == client.Purged:
 			return false, fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", ns, name)
-		case client.Live:
-			if pre && st.noneMatch {
+		case h.State == client.Live:
+			if o.pre && st.noneMatch {
 				return false, fail(http.StatusPreconditionFailed, "%s/%s exists (If-None-Match: *)", ns, name)
 			}
 			r, x, retry, err := st.edit(ctx, in, ns, name, h.ID, v, body)
 			rev, exact = r, x
 			return retry, err
 		}
-		if pre && st.matchAny && !st.placeholder {
+		if o.pre && st.matchAny && !st.placeholder {
 			return false, fail(http.StatusPreconditionFailed, "%s/%s doesn't exist (If-Match: *)", ns, name)
 		}
 		var res *client.WriteResult
@@ -148,7 +163,6 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 			return false, err
 		}
 		rev, exact = res.ID, st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, v, body, rendersAs(v))
-		st.made = rev
 		return false, nil
 	})
 	return rev, exact, err
@@ -731,21 +745,27 @@ func (st *reqState) undelete(ctx context.Context, in nsInfo, ns, name, tomb stri
 // write (a conflict, a body that isn't JSON, one too large, a frozen
 // namespace, a precondition), the principal's own DELETE moments before
 // is undone, and the document restored as it was, as a failed PUT leaves
-// it. So is a placement's node the principal's DELETE removed (unplaced)
-// before the write to its path. Only the principal's own tombstone, still
-// the head and written within ownDeleteUndo, is restored (with If-Match
-// on it).
+// it (§H.6). In a tree, that is the file the principal's DELETE of the
+// path removed: its placement, then its item if it went too. Only the
+// principal's own tombstone, still the head and written within
+// ownDeleteUndo, is restored (with If-Match on it).
 func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) error {
 	if err == nil || !t.isDoc() {
 		return err
 	}
 	type res struct{ ns, name string }
-	todo := []res{{t.docNS, t.docName}}
+	var todo []res
+	if t.docNS != "" {
+		todo = append(todo, res{t.docNS, t.docName})
+	}
 	if t.rawName != "" {
 		todo = append(todo, res{t.docNS, t.rawName})
 	}
-	if t.kind == kNewPlacement {
-		todo = append(todo, res{t.ns, t.node})
+	if d, ok := st.p.treeDeleted(t.path, st.s.opt.Now()); ok && t.kind == kNewNode && d.cat == t.ns {
+		todo = append(todo, res{d.cat, d.node})
+		if d.itemTomb != "" {
+			todo = append(todo, res{d.itemNS, d.itemName})
+		}
 	}
 	for _, r := range todo {
 		if !st.p.deletedOwn(r.ns, r.name, "", st.s.opt.Now()) {
@@ -762,13 +782,15 @@ func (st *reqState) undoOwnDelete(ctx context.Context, t target, err error) erro
 }
 
 // deleteDoc tombstones ns/name (§8.1), if its head is ifMatch when that
-// is given (412 otherwise). The principal's records of it stay: a save
-// that deletes the original before writing the new version restores it
-// from them (restorePatches), or as it was if that write is refused.
-func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) error {
+// is given (412 otherwise), and returns the tombstone. The principal's
+// records of it stay: a save that deletes the original before writing
+// the new version restores it from them (restorePatches), or as it was if
+// that write is refused.
+func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) (string, error) {
 	if st.s.nsInfo(ctx, st.p, ns).sealed {
-		return notOffered(ns)
+		return "", notOffered(ns)
 	}
+	var tomb string
 	err := st.retrying(ctx, func() (bool, error) {
 		h, err := st.p.c.Head(ctx, ns, name)
 		if err != nil {
@@ -785,12 +807,13 @@ func (st *reqState) deleteDoc(ctx context.Context, ns, name, ifMatch string) err
 			return true, nil
 		}
 		if err == nil {
+			tomb = res.ID
 			st.p.noteDelete(ns, name, res.ID, st.s.opt.Now())
 		}
 		return false, err
 	})
 	if errors.Is(err, errNotExist) {
-		return errNotExist
+		return "", errNotExist
 	}
-	return err
+	return tomb, err
 }

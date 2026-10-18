@@ -11,14 +11,13 @@ import (
 
 // Scratch files: names that aren't documents, such as editors' swap,
 // backup and temporary files, .DS_Store and ._* (AppleDouble), the copies
-// file managers make beside a document, and empty files a client creates
-// under a document name before writing it (LOCK, a 0-byte PUT); and
-// scratch directories, which apps save through (a dot, macOS's "(A
-// Document Being Saved By …)"), and file managers make in a catalog as
-// "untitled folder" before it is named (mayScratchDir). They live in
-// memory, per principal and path, bounded per grant root, and expire when
-// left untouched for ScratchIdle. They are never written to the core:
-// moving one onto a document name is how editors save.
+// file managers make beside a document in the flat view, and empty files a
+// client creates under a document name before writing it (LOCK, a 0-byte
+// PUT); and scratch directories, which apps save through (a dot, macOS's
+// "(A Document Being Saved By …)", mayScratchDir). They live in memory,
+// per principal and path, bounded per grant root, and expire when left
+// untouched for ScratchIdle. They are never written to the core: moving
+// one onto a document name is how editors save.
 
 type scratchFile struct {
 	data  []byte
@@ -231,7 +230,7 @@ func (st *reqState) scratchRemove(name string) bool {
 }
 
 // scratchUnmark drops the scratch directory entry at name, keeping what
-// is in it: the directory became a catalog folder.
+// is in it: the directory became a tree's folder.
 func (st *reqState) scratchUnmark(name string) {
 	p := st.p
 	p.mu.Lock()
@@ -280,6 +279,27 @@ func (st *reqState) scratchRename(oldName, newName string) error {
 	f.used = now
 	st.touchLocked(path.Dir(newName), now)
 	return nil
+}
+
+// scratchMoveUnder moves the principal's scratch files and directories
+// below dir to below to: a tree's folder was renamed or moved.
+func (st *reqState) scratchMoveUnder(dir, to string) {
+	p := st.p
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	moves := map[string]*scratchFile{}
+	for name, f := range p.scratch {
+		if rest, ok := strings.CutPrefix(name, dir+"/"); ok {
+			moves[to+"/"+rest] = f
+			delete(p.scratch, name)
+		}
+	}
+	for name, f := range moves {
+		if g, had := p.scratch[name]; had {
+			st.releaseLocked(name, g)
+		}
+		p.scratch[name] = f
+	}
 }
 
 // scratchList lists the principal's scratch files and directories in

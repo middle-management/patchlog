@@ -159,10 +159,10 @@ func scratchName(base string) bool {
 
 // dupName is the name a file whose name another has is shown by (§H.2
 // "Siblings"): name (2).ext, name (3).ext, …, the number before the
-// extension, skipping one taken reports taken.
-func dupName(name string, taken func(string) bool) string {
+// extension (a folder's at the end), skipping one taken reports taken.
+func dupName(name string, dir bool, taken func(string) bool) string {
 	stem, ext := name, ""
-	if i := strings.LastIndexByte(name, '.'); i > 0 {
+	if i := strings.LastIndexByte(name, '.'); i > 0 && !dir {
 		stem, ext = name[:i], name[i:]
 	}
 	for n := 2; ; n++ {

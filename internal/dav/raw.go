@@ -123,20 +123,30 @@ func refValue(bid, typ string, size int, nonce string) map[string]any {
 	return m
 }
 
+// blobSrc is the blob of a raw file being copied (a COPY's source, a
+// MOVE's to another namespace or tree): the copy keeps its id, and copies
+// it rather than uploading it again (§7.8 Blob-From, §H.5).
+type blobSrc struct {
+	ns, name string
+	ref      rawRef
+}
+
 // commitRaw writes body as raw file ns/name (§H.1, §H.4), typed by its
-// name and upload (fileType), and returns the revision holding it, which
-// holds exactly body. A new name is created and a tombstoned one restored
-// (§8.2), the blob uploaded first. A live raw file's save compares its
-// base (the revision the PUT's If-Match names, else the closest of those
-// the principal was served or wrote, rebased) with the head first: raw
-// files have no paths to merge, so any change of its bytes between them
-// is a conflict (409), and only then is the blob uploaded, once however
-// often the head moves (412), and the reference's members set one by one,
-// never the root, so $schema and $successor stay. Bytes the head already
-// holds write nothing, nonces or not. Where nonces apply (§C.7) the blob
-// has a Blob-Nonce and the root a fresh $nonce. pre: the file is the
-// PUT's, whose preconditions hold for it.
-func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte, pre bool) (string, bool, error) {
+// file name and upload (fileType), and returns the revision holding it,
+// which holds exactly body. A new name is created and a tombstoned one
+// restored (§8.2), the blob uploaded first. A live raw file's save
+// compares its base (the revision the PUT's If-Match names, else the
+// closest of those the principal was served or wrote, rebased) with the
+// head first: raw files have no paths to merge, so any change of its
+// bytes between them is a conflict (409), and only then is the blob
+// uploaded, once however often the head moves (412), and the reference's
+// members set one by one, never the root, so $schema and $successor stay.
+// Bytes the head already holds write nothing, nonces or not. Where nonces
+// apply (§C.7) the blob has a Blob-Nonce and the root a fresh $nonce. A
+// copy of a raw file of the same type keeps its blob's id, nonce or not
+// (§7.8), and the blob is copied with Blob-From, or uploaded again where
+// the core refuses that (a source of a higher rank, §7.8).
+func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte, o saveOpts) (string, bool, error) {
 	in := st.s.nsInfo(ctx, st.p, ns)
 	if in.sealed {
 		return "", false, notOffered(ns)
@@ -144,36 +154,59 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 	if in.blobSize > 0 && len(body) > in.blobSize {
 		return "", false, fail(http.StatusRequestEntityTooLarge, "the file is %d bytes, over the blobSize of %d bytes namespace %s sets (§6.6, §7.8); nothing was uploaded", len(body), in.blobSize, ns)
 	}
-	typ := fileType(name, st.ctype)
+	if o.fname == "" {
+		o.fname = name
+	}
+	typ := fileType(o.fname, st.ctype)
 	nonce := ""
 	if in.nonce {
 		nonce = seal.NewNonce()
+	}
+	from := st.copySrc
+	if from != nil && from.ref.typ == typ && from.ref.size == int64(len(body)) && client.BlobID(typ, from.ref.nonce, body) == from.ref.bid {
+		nonce = from.ref.nonce
+	} else {
+		from = nil
 	}
 	bid := client.BlobID(typ, nonce, body)
 	ref := refValue(bid, typ, len(body), nonce)
 	uploaded := false
 	upload := func() error {
-		if !uploaded {
-			if _, err := st.p.c.UploadBlob(ctx, ns, name, typ, nonce, body); err != nil {
+		if uploaded {
+			return nil
+		}
+		if from != nil {
+			err := st.p.c.CopyBlob(ctx, ns, name, bid, from.ns, from.name, "")
+			ae, isAPI := client.AsAPIError(err)
+			switch {
+			case err == nil:
+				uploaded = true
+				return nil
+			case !isAPI || ae.Status != http.StatusNotFound && ae.Status != http.StatusUnprocessableEntity:
 				return err
 			}
-			uploaded = true
 		}
+		if _, err := st.p.c.UploadBlob(ctx, ns, name, typ, nonce, body); err != nil {
+			return err
+		}
+		uploaded = true
 		return nil
 	}
 	same := func(doc any) bool { return client.RawBlobOf(doc) == bid }
 	var rev string
-	st.made = ""
 	err := st.retrying(ctx, func() (bool, error) {
 		h, err := st.p.c.Head(ctx, ns, name)
 		if err != nil {
 			return false, err
 		}
+		if o.fresh && h.State != client.NotFound {
+			return false, taken(ns, name)
+		}
 		switch h.State {
 		case client.Purged:
 			return false, fail(http.StatusForbidden, "%s/%s was purged; its name can't be used again (§8.3)", ns, name)
 		case client.Live:
-			if pre && st.noneMatch {
+			if o.pre && st.noneMatch {
 				return false, fail(http.StatusPreconditionFailed, "%s/%s exists (If-None-Match: *)", ns, name)
 			}
 			cur, err := st.s.doc(ctx, st.p, ns, name, h.ID)
@@ -214,7 +247,7 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			st.wrote(ns, name, cur.value, ps, paths, res, ref, nil, same)
 			return false, nil
 		}
-		if pre && st.matchAny && !st.placeholder {
+		if o.pre && st.matchAny && !st.placeholder {
 			return false, fail(http.StatusPreconditionFailed, "%s/%s doesn't exist (If-Match: *)", ns, name)
 		}
 		if err := upload(); err != nil {
@@ -236,7 +269,6 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 			return false, err
 		}
 		rev = res.ID
-		st.made = rev
 		st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, ref, nil, same)
 		return false, nil
 	})

@@ -3,6 +3,7 @@ package dav
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -123,17 +124,50 @@ func (s *Server) keep(k string, e *docEntry) {
 // nsInfo is what writes to a namespace need from its document: whether
 // it is sealed or end-to-end (not offered here, §H.7), whether writes add
 // a fresh $nonce (§C.7) and whether the namespace requires one, a
-// catalog's trust list (§B.3), and the size limits it sets (§6.6; 0 where
-// it sets none, and the deployment's apply), for messages.
+// catalog's trust list (§B.3) and file tree (§H.2), and the size limits
+// it sets (§6.6; 0 where it sets none, and the deployment's apply), for
+// messages.
 type nsInfo struct {
 	sealed                bool
 	frozen                bool // §8.4: it takes no writes, a DELETE neither
 	nonce                 bool
 	nonceRequired         bool
 	trust                 []string
+	files                 *treeFiles
+	notTree               string // why a catalog's document makes no file tree, if it was read
+	readErr               error  // the core's refusal of the document to the principal (a 401, 403, 404)
 	patchSetSize, docSize int
 	blobSize              int
 	at                    time.Time
+}
+
+// treeFiles is a catalog's catalog.files (§H.2): the content namespace
+// new files are created in, the folder node whose children are the
+// tree's top level, and the schemas new folder and placement nodes
+// carry as $schema ("" for none).
+type treeFiles struct {
+	ns, root, folder, placement string
+}
+
+// filesOf reads catalog.files from a namespace document's catalog
+// object, or says why it makes no file tree.
+func filesOf(cat map[string]any) (*treeFiles, string) {
+	m, ok := cat["files"].(map[string]any)
+	if !ok {
+		return nil, "its namespace document has no catalog.files (§H.2, §7.4), so it isn't a file tree: its placements have no file names to show"
+	}
+	f := &treeFiles{}
+	f.ns, _ = m["ns"].(string)
+	f.root, _ = m["root"].(string)
+	f.folder, _ = m["folder"].(string)
+	f.placement, _ = m["placement"].(string)
+	switch {
+	case !client.ValidNSName(f.ns):
+		return nil, fmt.Sprintf("its catalog.files.ns, %q, isn't a namespace name (§3.6)", f.ns)
+	case !folderName(f.root):
+		return nil, fmt.Sprintf("its catalog.files.root, %q, can't name a folder node: a resource name without a dot (§3.6, §B.2)", f.root)
+	}
+	return f, ""
 }
 
 // nsInfo reads ns's document with p's grant, at most every 30 seconds. A
@@ -167,7 +201,7 @@ func (s *Server) nsInfoErr(ctx context.Context, p *principal, ns string) (nsInfo
 	case err != nil && (!isAPI || ae.Status == 429 || ae.Status >= 500):
 		return nsInfo{nonce: true}, err
 	case err != nil:
-		in.nonce = true
+		in.nonce, in.readErr = true, err
 	default:
 		enc, _ := d.Value["encryption"].(map[string]any)
 		lv, _ := enc["level"].(string)
@@ -192,6 +226,7 @@ func (s *Server) nsInfoErr(ctx context.Context, p *principal, ns string) (nsInfo
 				in.trust = append(in.trust, t)
 			}
 		}
+		in.files, in.notTree = filesOf(cat)
 	}
 	p.mu.Lock()
 	p.ns[ns] = in

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/base32"
 	"errors"
@@ -21,7 +22,7 @@ import (
 
 // davCmd serves namespaces over WebDAV (a prototype, internal/dav):
 //
-//	patchlog dav -api URL [-addr 127.0.0.1:8090] -ns NS[,NS…] [-catalog NS[,NS…]]
+//	patchlog dav -api URL [-addr 127.0.0.1:8090] -ns NS[,NS…] [-catalog NS[,NS…] [-case-sensitive]]
 //	             [-bearer GRANT | -bearer-file FILE] [-author NAME] [-password-file FILE]
 //	             [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]
 //
@@ -37,7 +38,8 @@ func davCmd(args []string) {
 	addr := fs.String("addr", "127.0.0.1:8090", "listen address of the WebDAV server")
 	var nss, cats multi
 	fs.Var(&nss, "ns", "flat namespace to serve, a directory of its files: raw ones by name, JSON documents as {name}.json (repeatable or comma-separated)")
-	fs.Var(&cats, "catalog", "catalog namespace to serve as a folder tree (Addendum B; repeatable or comma-separated)")
+	fs.Var(&cats, "catalog", "catalog namespace to serve as a file tree, one whose namespace document has catalog.files (§H.2; repeatable or comma-separated)")
+	caseSensitive := fs.Bool("case-sensitive", false, "compare the names in a file tree's folder after NFC only, not after case folding too")
 	bearer := fs.String("bearer", "", "local mode: the grant every request is sent with (Authorization: Bearer)")
 	bearerFile := fs.String("bearer-file", "", "local mode: file holding -bearer")
 	author := fs.String("author", "", "X-Author for a -dev server (local mode)")
@@ -68,7 +70,7 @@ func davCmd(args []string) {
 	if err != nil {
 		log.Fatalf("dav: -max-file-size: %v", err)
 	}
-	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, Gateway: *gateway, FetchConcurrency: *fetchConc,
+	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, CaseSensitive: *caseSensitive, Gateway: *gateway, FetchConcurrency: *fetchConc,
 		CacheBytes: cache, MaxFileSize: maxSize, Logf: log.Printf}
 	copts := []client.Option{client.WithIdleConns(*fetchConc)}
 	if *gateway {
@@ -109,6 +111,13 @@ func davCmd(args []string) {
 		log.Fatal(err)
 	}
 	srv, err := dav.New(opt)
+	if err != nil {
+		log.Fatal(err)
+	}
+	// A catalog that isn't a file tree (no catalog.files) isn't served.
+	cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	err = srv.Check(cctx)
+	cancel()
 	if err != nil {
 		log.Fatal(err)
 	}

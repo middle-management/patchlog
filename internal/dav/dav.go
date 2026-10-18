@@ -7,9 +7,9 @@
 // namespace, but sealed and end-to-end ones, which need keys it doesn't
 // hold (§H.7). A flat namespace's directory is the flat view (§H.2): a raw
 // document (its root a blob reference, §7.8) as its resource name, any
-// other as {name}.json; a catalog (Addendum B) is a folder tree, folders
-// as directories and placements as {ns}.{name}.json files holding the
-// content document /r/{ns}/{name}.
+// other as {name}.json; a catalog (Addendum B) with catalog.files is a
+// file tree (§H.2), its folder nodes as directories and its placements as
+// files holding their items, each named by its node's title.
 //
 // A raw file reads as its blob's bytes, typed by its name (§H.1); a JSON
 // file as its rendering, the document's canonical JSON (§3.1) laid out,
@@ -66,9 +66,14 @@ type Options struct {
 	// Namespaces are the flat namespaces served, each a directory of its
 	// files (§H.2 "Flat view").
 	Namespaces []string
-	// Catalogs are the catalog namespaces served as folder trees (Addendum
-	// B).
+	// Catalogs are the catalog namespaces served as file trees (§H.2),
+	// each with catalog.files in its namespace document.
 	Catalogs []string
+	// CaseSensitive compares the names of a tree's siblings after NFC
+	// only; by default they are compared after Unicode case folding too
+	// (§H.2 "Siblings"), as the file systems of macOS and Windows, whose
+	// clients can't hold two names that differ only in case, compare them.
+	CaseSensitive bool
 	// Gateway takes each request's Basic password as the grant sent
 	// upstream as Authorization: Bearer; the user name is ignored.
 	Gateway bool
@@ -996,6 +1001,7 @@ type principal struct {
 	cats    map[string]*catGraph
 	locked  map[string]time.Time   // its locks' tokens, and when they expire
 	deletes map[string]ownDelete   // by ns/name: its latest DELETEs
+	trees   map[string]treeDelete  // by path: the files of trees its latest DELETEs removed
 	aside   map[string]time.Time   // documents' paths moved aside to a backup, and when
 	refused map[string]refusedSave // by document path: its refused saves lately
 }
@@ -1072,6 +1078,48 @@ func (p *principal) forgetDelete(ns, name string) {
 	delete(p.deletes, ns+"/"+name)
 }
 
+// treeDelete is a file of a tree a principal's DELETE removed (§H.5): its
+// placement node in catalog cat, in folder parent, and its tombstone; its
+// item, and the item's tombstone if the DELETE deleted it too.
+type treeDelete struct {
+	cat, node, nodeTomb, parent string
+	itemNS, itemName, itemTomb  string
+	at                          time.Time
+}
+
+// noteTreeDelete remembers that the principal's DELETE of path removed
+// file d.
+func (p *principal) noteTreeDelete(path string, d treeDelete, now time.Time) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.trees) >= maxDeletes {
+		var old string
+		for k, t := range p.trees {
+			if old == "" || t.at.Before(p.trees[old].at) {
+				old = k
+			}
+		}
+		delete(p.trees, old)
+	}
+	d.at = now
+	p.trees[path] = d
+}
+
+// treeDeleted returns the file of a tree the principal's DELETE of path
+// removed within ownDeleteUndo of now.
+func (p *principal) treeDeleted(path string, now time.Time) (treeDelete, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	d, ok := p.trees[path]
+	return d, ok && now.Sub(d.at) <= ownDeleteUndo
+}
+
+func (p *principal) forgetTreeDelete(path string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.trees, path)
+}
+
 // A refused save of a document's file (a PUT answered 4xx or 5xx that
 // wrote nothing of it) makes the principal's next DELETE of the same path
 // within refusedSaveFor a 409, once per refused save (at most
@@ -1079,7 +1127,7 @@ func (p *principal) forgetDelete(ns, name string) {
 // GET answered 200, at least refusedSaveRead after the refusal): rclone
 // deletes a file whose upload failed, a second after the failure
 // (removeFailedCopy), and that DELETE would tombstone the document for
-// every reader, or unplace the placement, because a save was refused. A
+// every reader, or delete a tree's file, because a save was refused. A
 // DELETE naming the revision it deletes (If-Match) is deliberate and
 // passes; so does the DELETE sent again. A refused MOVE or COPY onto the
 // file sets none: rclone never deletes after one, and its next save
@@ -1103,7 +1151,7 @@ const (
 )
 
 // maxRefusedPath bounds the path of a refused save kept for a PUT whose
-// path couldn't be resolved (a catalog that couldn't be read).
+// path couldn't be resolved (a tree that couldn't be read).
 const maxRefusedPath = 1024
 
 // refusedSave is a path's refused saves: the latest's time and status,
@@ -1176,7 +1224,8 @@ func (p *principal) readAfterRefusedSave(path string, now time.Time) {
 
 func (s *Server) newPrincipal(id string, c *client.Client, a *account) *principal {
 	return &principal{id: id, c: c, locks: webdav.NewMemLS(), acct: a, scratch: map[string]*scratchFile{},
-		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, locked: map[string]time.Time{}, deletes: map[string]ownDelete{}, aside: map[string]time.Time{},
+		ns: map[string]nsInfo{}, cats: map[string]*catGraph{}, locked: map[string]time.Time{}, deletes: map[string]ownDelete{},
+		trees: map[string]treeDelete{}, aside: map[string]time.Time{},
 		refused: map[string]refusedSave{}, used: s.opt.Now()}
 }
 
@@ -1201,17 +1250,18 @@ type reqState struct {
 	// placeholder: the PUT's preconditions found an empty placeholder
 	// (scratch) at its document path, which exists for If-Match: *.
 	placeholder bool
-	bodyErr     error  // reading the request body failed
-	ctype       string // the type a written raw file was uploaded as (fileType): a PUT's Content-Type, a copy's source's
-	noETag      bool   // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
-	made        string // the revision commitDoc created or restored a document with
+	bodyErr     error    // reading the request body failed
+	ctype       string   // the type a written raw file was uploaded as (fileType): a PUT's Content-Type, a copy's source's
+	copySrc     *blobSrc // the blob of the raw file a COPY or MOVE copies, whose id the copy keeps
+	wroteTo     string   // the ns/name commitRev wrote last
+	noETag      bool     // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
 	serve       *stagedServe
 	// saveTo is the document path a PUT writes, once resolved (or one in
-	// a catalog that couldn't be read, maybe a placement's), and saveDoc
-	// whether it is a flat namespace's document; committed: the request
-	// wrote to the core (a revision, a catalog node), not counting a
-	// restore of the principal's own DELETE as it was (undoOwnDelete),
-	// which undeleted says it did.
+	// a tree that couldn't be read), and saveDoc whether it is a flat
+	// namespace's document; committed: the request wrote to the core (a
+	// revision, a catalog node), not counting a restore of the
+	// principal's own DELETE as it was (undoOwnDelete), which undeleted
+	// says it did.
 	saveTo    string
 	saveDoc   bool
 	committed bool
@@ -1219,6 +1269,7 @@ type reqState struct {
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog
+	dirs   map[string]*treeDir     // by catalog/folder node
 	heads  map[string]*client.Head // by ns/name
 }
 
@@ -1252,7 +1303,7 @@ func (st *reqState) record(err error) error {
 // changed forgets what the request read, after it wrote, and makes other
 // requests' catalog reads stale.
 func (st *reqState) changed() {
-	st.lists, st.graphs, st.heads = nil, nil, nil
+	st.lists, st.graphs, st.dirs, st.heads = nil, nil, nil, nil
 	st.s.gen.Add(1)
 }
 

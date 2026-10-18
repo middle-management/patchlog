@@ -557,14 +557,15 @@ func TestSealed(t *testing.T) {
 // "Report.json", capitals, a space, a copy's name without the original
 // beside it, a dot) is refused: kept in memory only, it would vanish
 // within the hour; in a flat namespace's directory every name but a
-// resource name (§H.2), and every name a resource has is a file's. Editors'
-// and the system's own names stay scratch files (§H.6).
+// resource name (§H.2), and every name a resource has is a file's; at the
+// root, a .json name. (In a file tree such names are titles, TestTreeNewFiles.)
+// Editors' and the system's own names stay scratch files (§H.6).
 func TestRefusedNames(t *testing.T) {
 	t.Parallel()
-	e := catalogEnv(t)
+	e := treeEnv(t)
 	e.create("matches", "x", map[string]any{"a": "1"})
 	for _, p := range []string{"/matches/Report.json", "/matches/Notes.JSON", "/matches/y copy.json", "/matches/Untitled", "/matches/My%20notes.md", "/matches/.x.json.tmp",
-		"/Report.json", "/cat/root/season/Report.json", "/cat/root/season/matches.X.json"} {
+		"/Report.json"} {
 		r := e.expect(e.do("PUT", p, `{"a": "2"}`), 403, "PUT "+p)
 		if !strings.Contains(r.body, "names no") {
 			t.Fatalf("PUT %s: %q", p, r.body)
@@ -742,41 +743,41 @@ func TestVimOnDavfs2(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/x.json", `{"a": "again"}`, "If-None-Match", "*"), 412, "PUT create-only after it")
 }
 
-// Folders are made only where they can hold documents (catalogs) and
+// Folders are made only where they can hold documents (file trees) and
 // where apps save through them (a name starting with a dot, TextEdit's
 // "(A Document Being Saved By …)"): a person's folder in a flat namespace
 // or at the root would keep what is saved into it in memory only. In a
-// catalog, a file manager's "untitled folder" waits to be named, and holds
-// no documents meanwhile.
+// tree, a file manager's "untitled folder" is a folder like any other,
+// and holds files at once.
 func TestFoldersWhereNoFolderCanBe(t *testing.T) {
 	t.Parallel()
-	e := catalogEnv(t)
-	for _, p := range []string{"/matches/untitled folder", "/matches/archive", "/untitled folder", "/New folder", "/cat/root/Draft Ideas"} {
+	e := treeEnv(t)
+	for _, p := range []string{"/matches/untitled folder", "/matches/archive", "/untitled folder", "/New folder"} {
 		e.expect(e.do("MKCOL", p, ""), 403, "MKCOL "+p)
 	}
 	e.expect(e.do("MKCOL", "/matches/.hidden", ""), 201, "MKCOL a dot folder")
 	e.expect(e.do("MOVE", "/matches/.hidden", "", "Destination", "/matches/archive"), 403, "MOVE it to a person's name")
 	e.expect(e.do("PUT", "/matches/.hidden/q3.json", `{"draft": true}`), 201, "PUT in an app's folder")
-	e.expect(e.do("MKCOL", "/cat/root/untitled folder", ""), 201, "New Folder in a catalog")
-	e.expect(e.do("PUT", "/cat/root/untitled folder/matches.q3.json", `{"draft": true}`), 403, "PUT a document in it")
-	e.expect(e.do("PUT", "/cat/root/untitled folder/Report.json", `{"draft": true}`), 403, "PUT a .json in it")
-	e.expect(e.do("MOVE", "/cat/root/untitled folder", "", "Destination", "/cat/root/Draft Ideas"), 403, "MOVE it to a name that isn't a folder's")
-	e.expect(e.do("MOVE", "/cat/root/untitled folder", "", "Destination", "/cat/root/drafts"), 201, "MOVE it to a folder name")
-	sameJSON(t, e.parentsOf("drafts"), parents("cat", "root"))
-	e.expect(e.do("PUT", "/cat/root/drafts/matches.q3.json", `{"draft": true}`), 201, "PUT a placement in the folder")
-	if h, _ := e.load("matches", "q3"); h.State != client.Live {
-		t.Fatalf("matches/q3 %v", h.State)
+	e.expect(e.do("MKCOL", "/cat/untitled folder", ""), 201, "New Folder in a tree")
+	e.expect(e.do("PUT", "/cat/untitled folder/Report.json", `{"draft": true}`), 201, "PUT a file in it")
+	e.expect(e.do("MOVE", "/cat/untitled folder", "", "Destination", "/cat/Draft Ideas"), 201, "MOVE it to a person's name")
+	folder, _ := e.titled("cat", "Draft Ideas")
+	sameJSON(t, e.parentsOf(folder), []any{map[string]any{"href": "/r/cat/root", "order": "a0"}})
+	ns, item := e.itemOf("cat", "Report.json")
+	if h, _ := e.load(ns, item); h.State != client.Live {
+		t.Fatalf("%s/%s %v", ns, item, h.State)
 	}
 }
 
 // Duplicating a document in place, then renaming the copy, is how a
-// file manager starts a document from a template: the copy names file
-// managers give (Finder's "x copy.json", Explorer's "x - Copy.json", Keep
-// Both's "x (1).json", ...) of a document beside them are scratch files,
-// committed by the rename. Other .json names a person gives are refused.
+// file manager starts a document from a template: in the flat view the
+// copy names file managers give (Finder's "x copy.json", Explorer's "x -
+// Copy.json", Keep Both's "x (1).json", ...) of a document beside them are
+// scratch files, committed by the rename; other .json names a person
+// gives are refused. In a tree the copy is a file, renamed by a title.
 func TestDuplicateThenRename(t *testing.T) {
 	t.Parallel()
-	e := catalogEnv(t)
+	e := treeEnv(t)
 	e.create("matches", "template", map[string]any{"a": "1"})
 	for i, n := range []string{"template copy.json", "template copy 2.json", "template - Copy.json", "template - Copy (2).json", "Copy of template.json",
 		"template (1).json", "template 2.json", "template (copy).json", "template (another copy).json", "template (3rd copy).json"} {
@@ -790,9 +791,10 @@ func TestDuplicateThenRename(t *testing.T) {
 	for _, n := range []string{"Template copy.json", "other copy.json", "season 2026.json"} {
 		e.expect(e.do("PUT", "/matches/"+url.PathEscape(n), `{}`), 403, "PUT "+n)
 	}
-	e.expect(e.do("COPY", "/cat/root/season/matches.derby.json", "", "Destination", "/cat/root/season/matches.derby%20copy.json"), 201, "Duplicate a placement")
-	e.expect(e.do("MOVE", "/cat/root/season/matches.derby%20copy.json", "", "Destination", "/cat/root/season/matches.derby2.json"), 201, "rename it")
-	_, doc := e.load("matches", "derby2")
+	e.expect(e.do("COPY", "/cat/Season/derby.json", "", "Destination", "/cat/Season/derby%20copy.json"), 201, "Duplicate a file in a tree")
+	e.expect(e.do("MOVE", "/cat/Season/derby%20copy.json", "", "Destination", "/cat/Season/derby2.json"), 201, "rename it")
+	ns, item := e.itemOf("cat", "derby2.json")
+	_, doc := e.load(ns, item)
 	sameJSON(t, doc, map[string]any{"title": "Derby"})
 }
 
@@ -803,7 +805,7 @@ func TestMkcolExisting(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	var logged []string
-	e := newEnv(t, []string{"docs"}, []string{"cat"}, nil, func(_ *clienttest.Options, o *dav.Options) {
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}}, func(_ *clienttest.Options, o *dav.Options) {
 		o.Logf = func(format string, args ...any) {
 			mu.Lock()
 			logged = append(logged, fmt.Sprintf(format, args...))
@@ -812,12 +814,13 @@ func TestMkcolExisting(t *testing.T) {
 	})
 	e.create("docs", "x", map[string]any{"v": 1})
 	e.create("cat", "root", map[string]any{"parents": []any{}})
-	e.create("cat", "docs.x", map[string]any{"parents": parents("cat", "root")})
+	e.create("cat", "sub", map[string]any{"title": "Sub", "parents": parents("cat", "root")})
+	e.create("cat", "docs.x", map[string]any{"title": "x.json", "parents": parents("cat", "root")})
 	e.expect(e.do("MKCOL", "/docs/.TemporaryItems", ""), 201, "MKCOL scratch directory")
-	for _, p := range []string{"/", "/docs/", "/docs", "/cat/", "/cat/root/", "/docs/.TemporaryItems"} {
+	for _, p := range []string{"/", "/docs/", "/docs", "/cat/", "/cat/Sub/", "/cat/sub", "/docs/.TemporaryItems"} {
 		e.expect(e.do("MKCOL", p, ""), 405, "MKCOL "+p)
 	}
-	for _, p := range []string{"/docs/x.json/sub", "/cat/root/docs.x.json/sub", "/cat/root/nowhere/sub"} {
+	for _, p := range []string{"/docs/x.json/sub", "/cat/x.json/sub", "/cat/nowhere/sub"} {
 		if r := e.expect(e.do("MKCOL", p, ""), 409, "MKCOL below a file"); !strings.Contains(r.body, "isn't a folder") {
 			t.Fatalf("MKCOL %s: %q", p, r.body)
 		}

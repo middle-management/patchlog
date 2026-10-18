@@ -83,9 +83,15 @@ func (e *env) another() *env {
 		e.t.Fatal(err)
 	}
 	o := *e
-	o.dav = httptest.NewServer(srv)
-	e.t.Cleanup(o.dav.Close)
+	o.dav = newTestServer(e.t, srv)
 	return &o
+}
+
+// newTestServer serves h until the test ends.
+func newTestServer(t *testing.T, h http.Handler) *httptest.Server {
+	hs := httptest.NewServer(h)
+	t.Cleanup(hs.Close)
+	return hs
 }
 
 type resp struct {
