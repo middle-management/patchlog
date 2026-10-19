@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.22.0
 
 Implements spec **v0.55**. v0.53 restructures the text with no change in behaviour (terms
 defined once in §2.1, a purged namespace's answers in one table, edge grants split into
