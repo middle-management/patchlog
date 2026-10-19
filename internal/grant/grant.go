@@ -55,8 +55,17 @@ var b64 = base64.RawURLEncoding.Strict()
 // tokenPrefix is the optional text prefix of a Biscuit token.
 const tokenPrefix = "biscuit:"
 
-// ErrTooLarge reports a token over the grant size limit (§6.6).
+// ErrTooLarge reports a token over the grant size limit (§6.6). Decode
+// returns it as a *TooLargeError, which carries the sizes.
 var ErrTooLarge = errors.New("grant exceeds size limit")
+
+// TooLargeError is ErrTooLarge with the sizes a limit refusal reports
+// (§6.6): Size the token's decoded bytes, a lower bound when Decode
+// stopped before decoding it, and Max the limit.
+type TooLargeError struct{ Size, Max int }
+
+func (e *TooLargeError) Error() string        { return ErrTooLarge.Error() }
+func (e *TooLargeError) Is(target error) bool { return target == ErrTooLarge }
 
 // AuthError is an authentication (401) or authorisation (403) failure.
 type AuthError struct {
@@ -100,6 +109,9 @@ type Grant struct {
 	c       *container
 	symbols []string           // the token's own symbol table, for appending
 	proof   ed25519.PrivateKey // the next secret; nil when sealed or stored
+
+	// size is the bearer's decoded length in bytes (Decode), 0 otherwise.
+	size int
 
 	// chainKey is the root key the signature chain last verified under
 	// (verifyChain): the chain doesn't change, so a grant decoded once
@@ -305,7 +317,8 @@ func (g *Grant) Seal() (*Grant, error) {
 func Decode(token string, maxSize int) (*Grant, error) {
 	token = strings.TrimPrefix(token, tokenPrefix)
 	if maxSize > 0 && len(token) > base64.URLEncoding.EncodedLen(maxSize) {
-		return nil, ErrTooLarge
+		n := base64.RawURLEncoding.DecodedLen(len(strings.TrimRight(token, "=")))
+		return nil, &TooLargeError{Size: max(n, maxSize+1), Max: maxSize}
 	}
 	var data []byte
 	var err error
@@ -318,10 +331,18 @@ func Decode(token string, maxSize int) (*Grant, error) {
 		return nil, unauth("grant is not a Biscuit token in URL-safe base64")
 	}
 	if maxSize > 0 && len(data) > maxSize {
-		return nil, ErrTooLarge
+		return nil, &TooLargeError{Size: len(data), Max: maxSize}
 	}
-	return decode(data, true)
+	g, err := decode(data, true)
+	if err == nil {
+		g.size = len(data)
+	}
+	return g, err
 }
+
+// Size is a decoded bearer's length in bytes, as grantSize bounds it
+// (§6.6); 0 for a grant that wasn't decoded from a bearer.
+func (g *Grant) Size() int { return g.size }
 
 // ParseStored parses the non-bearer stored form and checks its structure
 // and the chain signatures (not the root signature, which needs the

@@ -29,7 +29,7 @@ func TestParseRate(t *testing.T) {
 
 // -edge-grant-key is repeatable, [KID=]FILE, a plain FILE named by
 // -edge-grant-kid: cookies are minted under the last and accepted under
-// any (§C.5 "Format"). Without one, a random key named -edge-grant-kid,
+// any (§C.5.3). Without one, a random key named -edge-grant-kid,
 // never the key derived from -edge-secret, which every service holding
 // the secret could derive and mint core cookies with; FILE edge-secret
 // opts in to it next to key files, with a warning, so a deployment on it

@@ -3,6 +3,7 @@ package core
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
 	"errors"
 	"fmt"
@@ -355,14 +356,14 @@ func (t *tx) batchLimits(cfg *Config, a *actor) (items, size int) {
 }
 
 // BatchBodyLimit authenticates a batch request and returns how many bytes
-// of body the server reads for it: the principal's batchSize (§6.6), plus
+// of body the server reads for it, and the principal's batchSize (§6.6)
+// that a refusal names: that batchSize, plus
 // room for the batch's own JSON (items, preconditions, an optional config
 // change). A larger body is refused with 413 without reading the rest,
 // which reveals nothing about any item (§7.5). The batch itself
 // authenticates again.
-func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (int, error) {
-	var limit int
-	err := e.read(ctx, func(t *tx) error {
+func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (bound, batchSize int, err error) {
+	err = e.read(ctx, func(t *tx) error {
 		n := t.nsByName(req.NS)
 		if n == nil {
 			return t.absentNS(req.NS, req.Cred)
@@ -375,10 +376,10 @@ func (e *Engine) BatchBodyLimit(ctx context.Context, req Request) (int, error) {
 		// No state checks here: the gate answers them in order after the
 		// body is parsed (§6.2, §7.5). This only bounds how much is read.
 		items, size := t.batchLimits(cur, a)
-		limit = size + size/4 + 512*items + max(cur.Limits.PatchSetSize, cur.Limits.DocumentSize) + 64<<10
+		bound, batchSize = size+size/4+512*items+max(cur.Limits.PatchSetSize, cur.Limits.DocumentSize)+64<<10, size
 		return nil
 	})
-	return limit, err
+	return bound, batchSize, err
 }
 
 // asErr converts an *Error into error without the typed-nil trap.
@@ -717,7 +718,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// batch's, not an item's.
 	if isBatch {
 		if len(items) > maxItems {
-			return nil, nil, limitErr(413, fmt.Sprintf("more than %d items", maxItems))
+			return nil, nil, limitErr(413, "itemsPerBatch", int64(len(items)), int64(maxItems), fmt.Sprintf("more than %d items", maxItems))
 		}
 		size := 0
 		for _, s := range all {
@@ -728,7 +729,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 		if size > maxSize {
-			return nil, nil, limitErr(413, "batch too large")
+			return nil, nil, limitErr(413, "batchSize", int64(size), int64(maxSize), "batch too large")
 		}
 	}
 	for _, s := range st {
@@ -1363,31 +1364,31 @@ func checkLimits(l Limits, s *itemState) *Error {
 		if step.del {
 			continue
 		}
-		maxPatch := l.PatchSetSize
+		maxPatch, key := l.PatchSetSize, "patchSetSize"
 		if fromScratch(step) {
-			maxPatch = l.DocumentSize
+			maxPatch, key = l.DocumentSize, "documentSize"
 		}
 		if len(step.canon) > maxPatch {
-			return limitErr(413, "patch set too large")
+			return limitErr(413, key, int64(len(step.canon)), int64(maxPatch), "patch set too large")
 		}
 		if ops, ok := step.raw.([]any); ok && len(ops) > l.OpsPerSet {
-			return limitErr(422, "too many operations")
+			return limitErr(422, "opsPerSet", int64(len(ops)), int64(l.OpsPerSet), "too many operations")
 		}
 		if step.docCanon = genesisDocCanon(step); step.docCanon == nil {
 			step.docCanon = jsonv.Canonical(step.doc)
 		}
 		if len(step.docCanon) > l.DocumentSize {
-			return limitErr(413, "document too large")
+			return limitErr(413, "documentSize", int64(len(step.docCanon)), int64(l.DocumentSize), "document too large")
 		}
 		sh := shapeOf(l, step.docCanon)
 		if sh.depth > l.NestingDepth {
-			return limitErr(422, "document nested too deeply")
+			return limitErr(422, "nestingDepth", int64(sh.depth), int64(l.NestingDepth), "document nested too deeply")
 		}
 		if step.sealed {
 			// e2e: clients check the limits on documents (§E.3.2); the
 			// server checks blobsPerDocument on the declared list (§E.3.1).
 			if len(step.declared) > l.BlobsPerDocument {
-				return limitErr(422, fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
+				return limitErr(422, "blobsPerDocument", int64(len(step.declared)), int64(l.BlobsPerDocument), fmt.Sprintf("more than %d blobs declared", l.BlobsPerDocument))
 			}
 			continue
 		}
@@ -1928,7 +1929,7 @@ func (t *tx) storeGrant(g *grant.Grant, encrypt bool) []byte {
 var (
 	insResources = bulkInsert("resources", "ns bigint, name text", "RETURNING res, name")
 	insRevisions = bulkInsert("revisions", "res bigint, id bytea, parent_seq bigint, first smallint, kind smallint, patches bytea, author bigint, "+
-		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text", "RETURNING seq, res")
+		"via text, grant_id bytea, signature text, schema_ref text, created bigint, gesture text, undoes text, size bigint, digest bytea", "RETURNING seq, res")
 	insRevEpochs = bulkInsert("rev_epochs", "seq bigint, epoch bigint", "")
 	insSnapshots = bulkInsert("snapshots", "seq bigint, res bigint, doc bytea", "ON CONFLICT (seq) DO UPDATE SET res = excluded.res, doc = excluded.doc")
 	upsertHeads  = bulkInsert("heads", "res bigint, seq bigint, doc bytea", "ON CONFLICT (res) DO UPDATE SET seq = excluded.seq, doc = excluded.doc")
@@ -2093,7 +2094,19 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			}
 			// The step's gestures (§7.2), as the request resolved them.
 			gesture, undoes := nullStr(it.Steps[k].Gesture), nullStr(it.Steps[k].Undoes)
-			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli(), gesture, undoes})
+			var size, digest any
+			if k == len(it.steps)-1 && !step.del && level < levelSealed {
+				// The head the write leaves (headMeta). Sealed and e2e
+				// namespaces never list them, and can't become less
+				// protected: none (e2e content has no document here
+				// anyway, §E.3).
+				if step.docCanon == nil {
+					step.docCanon = jsonv.Canonical(step.doc)
+				}
+				sz, sum := headMeta(step.docCanon)
+				size, digest = sz, sum
+			}
+			rows = append(rows, []any{it.res, step.id[:], parent, first, kind, patches, it.author, it.via, it.grantID, sig, typed, t.now.UnixMilli(), gesture, undoes, size, digest})
 			stepItems = append(stepItems, it)
 		}
 		if len(rows) == 0 {
@@ -2106,9 +2119,10 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		})
 		for i, it := range stepItems {
 			step, row, seq := it.steps[k], rows[i], it.last
+			digest, _ := row[15].([]byte)
 			t.inserted(revRow{seq: seq, res: it.res, id: step.id, parentSeq: anyInt(row[2]), first: row[3] == 1, kind: row[4].(int),
 				patches: anyStr(row[5]), author: it.author, via: anyStr(it.via), grantID: it.grantID, signature: anyStr(row[9]), created: row[11].(int64),
-				gesture: anyStr(row[12]), undoes: anyStr(row[13])})
+				gesture: anyStr(row[12]), undoes: anyStr(row[13]), size: anyInt(row[14]), digest: digest})
 			if !step.del {
 				// The blobs the document references are attached with it
 				// (§7.8, step 7); a sealed step's are those its op declares,
@@ -2212,6 +2226,25 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 		out[i] = histRow{it.res, it.last}
 	}
 	return out
+}
+
+// headMeta is what a revision a write leaves as a resource's head stores
+// of its document (revisions.size, digest): the length and sha-256 of its
+// canonical form, the bytes GET …/rev/{id} serves, which /heads lists
+// (§7.4) without reading any document. Every path
+// that moves a head stores them where it has the document at hand: step 7
+// here, and the chains remote branches and mirrored schemas insert
+// (insertChain). Sealed and e2e namespaces store none, as they list none
+// (e2e content has no document here, §E.3), nor do tombstones, nor rows
+// written before them or by an older instance, which are listed without
+// them until the next write. Nothing fills them in later, so a /heads page
+// never gains them once served; they only go: a purge clears them with
+// the content (its entry lists a purge, and its tags purge the cached
+// pages), and a namespace raised to sealed lists them, and created, no
+// more, and purges ns:{ns} with the raise (§9).
+func headMeta(doc []byte) (int64, []byte) {
+	sum := sha256.Sum256(doc)
+	return int64(len(doc)), sum[:]
 }
 
 // countSinceSnapshot counts res's revisions since its last snapshot, and

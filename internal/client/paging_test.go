@@ -435,3 +435,47 @@ func testE2EFoldFromHorizon(t *testing.T, size int) {
 		t.Fatalf("the tombstone horizon itself: %v", err)
 	}
 }
+
+// §6.6 logPageBytes: a resource log range whose patch sets exceed it
+// pages early, an entry larger than it alone, and Log still reads the
+// whole range; LogPage names the next page's since.
+func TestLogPageBytes(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LogPageBytes: 2048})
+	c := s.Client(t, client.WithAuthor("alice"))
+	must(c.CreateNamespace(ctx, "docs", map[string]any{"read": "public"}))
+	w := must(c.CreateDoc(ctx, "docs", "a", map[string]any{}))
+	ids := []string{w.ID}
+	for i := 1; i < 8; i++ {
+		v := strings.Repeat(string(rune('a'+i)), 900)
+		if i == 4 {
+			v = strings.Repeat("z", 4000)
+		}
+		w = must(c.Append(ctx, "docs", "a", w.ID, ops(op("add", fmt.Sprintf("/k%d", i), v))))
+		ids = append(ids, w.ID)
+	}
+	all := must(c.Log(ctx, "docs", "a", w.ID, ""))
+	if len(all) != len(ids) {
+		t.Fatalf("%d entries, want %d", len(all), len(ids))
+	}
+	for i, e := range all {
+		if e.ID != ids[i] {
+			t.Fatalf("entry %d: %s, want %s", i, e.ID, ids[i])
+		}
+	}
+	var pages int
+	for since := ""; ; pages++ {
+		es, next := must2(c.LogPage(ctx, "docs", "a", w.ID, since))
+		if len(es) == 0 || next != "" && next != es[len(es)-1].ID {
+			t.Fatalf("page from %q: %d entries, next %q", since, len(es), next)
+		}
+		if next == "" {
+			break
+		}
+		since = next
+	}
+	if pages < 3 {
+		t.Fatalf("%d pages", pages+1)
+	}
+}

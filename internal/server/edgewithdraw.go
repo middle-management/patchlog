@@ -8,8 +8,8 @@ import (
 	"github.com/middle-management/patchlog/internal/edge"
 )
 
-// withdrawEdgeGrants is DELETE /edge-grants?prefix=… (§C.5 "Withdrawing
-// them"): 204, no-store, with an expired Set-Cookie of the same name and
+// withdrawEdgeGrants is DELETE /edge-grants?prefix=… (§C.5.4):
+// 204, no-store, with an expired Set-Cookie of the same name and
 // attributes for each prefix named. A browser sends the cookies only under
 // their paths, never here, so the prefixes are those issuance returned.
 // It needs no grant, since it only narrows; its preflight is allowed only
@@ -28,7 +28,7 @@ func (s *Server) withdrawEdgeGrants(w http.ResponseWriter, r *http.Request) {
 }
 
 // withdrawPrefixes are the prefix parameters of DELETE /edge-grants, at
-// least one: the only parameter it takes, and repeatable (§7, §C.5). Each
+// least one: the only parameter it takes, and repeatable (§7, §C.5.4). Each
 // has a shape issuance returns, /r/{ns}/{name}, /r/{ns} or /ns/{ns};
 // repeats are withdrawn once.
 func withdrawPrefixes(raw string) ([]string, error) {
@@ -44,7 +44,7 @@ func withdrawPrefixes(raw string) ([]string, error) {
 		}
 		for _, p := range vs {
 			if _, _, ok := edge.ParsePrefix(p); !ok {
-				return nil, badInput(fmt.Sprintf("prefix %q isn't one issuance returns: /r/{ns}/{name}, /r/{ns} or /ns/{ns} (§C.5)", p))
+				return nil, badInput(fmt.Sprintf("prefix %q isn't one issuance returns: /r/{ns}/{name}, /r/{ns} or /ns/{ns} (§C.5.4)", p))
 			}
 			if !seen[p] {
 				seen[p] = true
@@ -53,7 +53,7 @@ func withdrawPrefixes(raw string) ([]string, error) {
 		}
 	}
 	if len(out) == 0 {
-		return nil, badInput("prefix is required (§C.5)")
+		return nil, badInput("prefix is required (§C.5.4)")
 	}
 	return out, nil
 }

@@ -2,7 +2,8 @@
 
 This is the **reference implementation** of the **Patch Log** specification. The
 canonical text of the specification is maintained outside this repository;
-[docs/SPEC.md](docs/SPEC.md) mirrors it, and deltas the reference takes that the
+[docs/SPEC.md](docs/SPEC.md) mirrors it, with the spec's own change log in
+[docs/SPEC-CHANGELOG.md](docs/SPEC-CHANGELOG.md), and deltas the reference takes that the
 text doesn't yet describe are collected for its writer in
 [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) — when the two disagree, the
 reference and this README are what implementations are measured against, and the
@@ -25,19 +26,22 @@ and serves immutable, CDN-cacheable revisions.
 | Draft schema revisions in branches (`drafts.for`, repeated `Source-Authorization`), `in_use` by last available copy | §6.1, §7.4 | ✅ |
 | Releases across namespaces: release documents, the four-step release merge (plan, approve, resume), release rebases, release previews, janitor ordering; catalog merge grants | §F.9, §F.8, §B.5 | ✅ (`patchlog merge release`, `tree -release`, `POST /merge-grants`; see [Releases across namespaces](#releases-across-namespaces-f9)) |
 | Change envelopes, rule engine (`test`, `writes`, `compare`, `all`/`any`/`not`/`if`) | §6.4 | ✅ |
-| Limits (configurable, deployment maximums) and token-bucket rate limits | §6.6 | ✅ |
-| Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`) | §6.2, §7.1–§7.2 | ✅ (`serve -log-page-size`; see [Design notes](#design-notes)) |
+| Limits (configurable, deployment maximums) and token-bucket rate limits; a refusal names the limit (`limit`) and, for sizes and counts, `measured` and `max` | §6.6, §12 | ✅ (see [Limit refusals](#design-notes)) |
+| `GET /ns/{ns}/principal`: what the grant in `Authorization` is in a namespace (principal, `kid`, verbs, roles) and what a writer needs from the namespace document (frozen, successor, nonce, signatures, level, limits in force), to a grant limited to some resources or without `read` too | §7.4, §C.5, §C.7, §8.5 | ✅ (client `NSPrincipal`; see [Design notes](#design-notes)) |
+| File trees: `catalog.files` in catalog namespace documents, file metadata (`file: { size, type, modified }`) on placements in tree listings, sealed per entry for items of sealed namespaces, and the rendering of a JSON file shared by tools (`internal/files`) | §7.4, §H.1–§H.3, §E.2.6 | ✅ (tree service; see [File trees](#file-trees-h2-h3)) |
+| Reads, writes, gate order, `412`/`428`, idempotent retry, paged log ranges (`X-Log-Next`, bounded by entries and by `logPageBytes`) | §6.2, §7.1–§7.2 | ✅ (`serve -log-page-size`, `-log-page-bytes`; see [Design notes](#design-notes)) |
 | SSE events, long-poll with cursors | §7.3, §7.7 | ✅ |
 | Namespace documents (the spec's members validated strictly, others must start with `x-`), log, `/heads` (byte order of name), `/branches` | §7.4 | ✅ |
+| Files and sync clients: `Last-Modified`, `Repr-Digest` and `If-Modified-Since` on `…/rev/{id}`, and `created`, `size` and `digest` on `/heads` entries, outside E2 and E3; raw documents at `…/raw`; moves recorded as `$successor`, named by the head's `410`; whole-document appends up to `documentSize` | §6.2, §6.6, §7.1, §7.4, §7.8, §8.1 | ✅ (see [Files and sync clients](#files-and-sync-clients-71-74-78-81)) |
 | Atomic batches (multi-step items, config changes, dry run, retry) | §7.5 | ✅ |
 | Gestures for undo and redo: `Gesture`/`Undoes` on writes and batch steps, in logs, `GET /ns/{ns}/gestures/{gesture}`, carried by merges and bundles | §7.2, §7.4, §7.5, §F.3, §G.4.1 | ✅ (server, tooling, client library, and the undo/redo procedure of §11.2 in the client and the playground; see [Undo and redo](#undo-and-redo-112)) |
 | Local branches: read-through, foreign parents, keys follow the base (the base's current keys work in its branches) | §7.6, §C.4 | ✅ |
 | `schemaReads`: schemas follow their documents into listed namespaces | §6.1 | ✅ |
 | Edge grants as cookies in §C.5's default format (`kid`): `POST /edge-grants` for one grant or up to 50 (`{ "grants": [ … ] }`), fixed to finite sets of resources (`enum`, `compare` `in`), at most 100 distinct prefixes, drawing on each principal's `exchangeRate` bucket once a request, keys rotated (`-edge-grant-key KID=FILE`, repeatable), withdrawn with `DELETE /edge-grants`, verified by the origin with or without an edge, an edge's checks in Go (`edge.Cookies.Check`); the catalog service mints its own for its listings, bound to a subject set (`/{catalog}/g/{gs}`) | §C.5, §9, §B.11.5 | ✅ |
-| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces | §C.7 | ✅ |
+| Required nonces: `"nonce": "required"`, `422 nonce` at gate step 3 (sealed namespaces too), kept by branches and remote branches, required by a base only once its branches require them (`409 in_use`), added by undo, merges, imports, schema import and release tools, and by writers that can't read the setting in private namespaces (`GET /ns/{ns}/principal` tells one that asks) | §C.7, §7.4 | ✅ |
 | Tombstone, restore, purge (with propagation), freeze, namespace purge (a sealed namespace's documents, log, long-polls and events then answer `410 purged` with `head`, which followers, services, the janitor and remote branches take as the purge) | §8.1–§8.5 | ✅ |
 | Pruning with horizons, protected revisions, kept documents, archives and retention | §8.6 | ✅ (file:// archives) |
-| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
+| Blobs: uploads, copies (`Blob-From`, `Source-Authorization`), pending entries and `blobGrace`, availability (bases, batch sources), attach at write, ranges, `nosniff` and `Content-Security-Policy: sandbox` on every blob response, purge and pruning (`410`, archived as blob lines, back on restore), bundle blob lines, mirrored by remote branches | §7.8, §G.3, §G.4.1 | ✅ (bytes in files under `-blob-dir`, encrypted per resource at rest; sealed and e2e specifics to come) |
 | Cache-Control classes and cache tags | §9 | ✅ (tag purges over HTTP with `-purge-url`, default: log; a local Varnish CDN in the compose stack; private content cached at the edge only for reads a verifying edge vouches for, with `-edge-secret`) |
 | Grants (Biscuit v3, §C.8), narrowing, sealing, roles, attributes, key scopes, revocation | Addendum C | ✅ |
 | Remote branches: registration (`export`), mirroring with verification, schema mirroring, purge notices, bases that are branches, sealed and e2e bases | §G.3, §G.5.2 | ✅ (mirrored up front) |
@@ -231,8 +235,9 @@ curl -sI -H 'X-Cache-Debug: 1' http://localhost:8080/r/demo/derby -L | grep -i -
 
 **Purging.** `patchlog serve`, `index` and `tree` take `-purge-url URL` (repeatable; compose
 passes `http://cdn:8080/`). Without it purges are only logged, as before. With it, each tag purge
-(resource purge `r:{ns}/{name}`, namespace purge `ns:{ns}`, the services' `idx:{ns}` and listing
-tags) becomes
+(resource purge `r:{ns}/{name}` and `heads:{ns}`, namespace purge `ns:{ns}`, `ns:{ns}` too for
+a config write that makes a public namespace private or raises one to sealed (§9), the services'
+`idx:{ns}` and listing tags) becomes
 
 ```
 PURGE / HTTP/1.1
@@ -435,7 +440,7 @@ gives a default so an edge can be written once. The reference issues exactly tha
   and makes the same checks with whichever kid a cookie names, so neither's cookies cover the
   other's URLs.
 
-**Rotating the edge-grant key** (§C.5 "Format", v0.51). The origin and its edges hold several
+**Rotating the edge-grant key** (§C.5.3, v0.51). The origin and its edges hold several
 keys at once, each named by its `kid`, and the origin mints with the newest, so a key is
 rotated without making clients exchange again:
 
@@ -699,6 +704,27 @@ make up-pg     # the compose stack with a postgres:16 container (compose.postgre
   writes until it commits: a few seconds per 5 million namespace entries (about 4 s for the
   first on a local `postgres:16`). To build them without blocking, create them beforehand with
   `CREATE INDEX CONCURRENTLY` under the same names; the migration then finds them.
+- **Upgrading adds columns** `revisions.size` and `revisions.digest` (`/heads` sizes and
+  digests, §7.4, see [Files and sync clients](#files-and-sync-clients-71-74-78-81)), on SQLite and Postgres.
+  They are nullable without a default, so adding them changes only the catalog, instantly
+  whatever the table's size, though on Postgres the `ALTER TABLE` waits for transactions
+  using `revisions` and holds back others while it does. Nothing is backfilled. From then on
+  they take about 40 bytes (SQLite; 41 to 48 on Postgres) on each revision a write leaves as
+  a head outside sealed and e2e namespaces: for small documents written one revision at a time
+  that is nearly every revision, and grew the `revisions` table by about 40% (the whole
+  database by 9%) in a test of 20,000 such writes. Instances of the previous release keep
+  working against the migrated schema (they name their columns), so a rolling upgrade is
+  safe, with two leftovers. Heads they write, like those from before, are listed without
+  `size` and `digest` until written again. And a purge they run nulls only the patch sets: the
+  purged resource's two columns stay (never listed, since a purged resource is listed as a
+  purge, but in an encrypted-at-rest namespace a plaintext hash that destroying the data key
+  doesn't remove), and cached `/heads` pages aren't purged (`heads:{ns}`). Once no older
+  instance runs, clear the columns with `UPDATE revisions SET size = NULL, digest = NULL WHERE
+  digest IS NOT NULL AND res IN (SELECT res FROM resources WHERE state = 2)` (2: purged).
+  Responses cached before the upgrade, or served by an older instance during it, lack the
+  v0.54 fields and headers: `/heads` pages lack them and revisions `Last-Modified` and
+  `Repr-Digest` until those copies expire or are purged, so clients treat them all as optional,
+  as §7.4 says.
 - **Keep transactions short.** The tailer can't move past the oldest running transaction in the
   database (its `xmin`), so one left open holds back every instance's wake-ups: set
   `idle_in_transaction_session_timeout` (e.g. `ALTER ROLE patchlog SET
@@ -1557,7 +1583,7 @@ curl -X PATCH $B/ns/release-7 -H "$P" -H 'If-None-Match: *' -H "Authorization: B
 
 - **Source side (A).** `POST /ns/{ns}/branches` with `{ "remote": { "origin", "ns" }, "at" }`
   registers (`If-None-Match: *`) or renews (`If-Match` with the latest entry's `ns_id`, same
-  `at`). It needs unrestricted `read` (§C.5), checked as gate step 1 checks verbs, in a public
+  `at`). It needs unrestricted `read` (§2.1), checked as gate step 1 checks verbs, in a public
   namespace too (v0.49), and `export`, is checked as an `export` envelope, is rate-limited,
   appends a remote `branch` entry, is listed in `/branches` while unexpired, and protects the
   head as of `at` from pruning for the registration lifetime (`limits.remoteRegistration`,
@@ -1689,6 +1715,14 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
     `X-Cursor`, error bodies (including `410` bodies with `tombstone`/`last`/`horizon`), and the
     metadata listings `/heads` and `/branches` (names and ids are in URLs anyway, §E.2.2).
     Write responses go only to the writer (`no-store`) and stay plaintext.
+  - Not sent at all (§7.1, §7.4, §E.2.2): revisions' `Last-Modified` and `Repr-Digest`, and
+    `/heads` entries' `created`, `size` and `digest`, which would show the exact created times
+    the logs seal and the lengths padding hides; `If-Modified-Since` is ignored, so `304`s can't
+    be probed for them (`If-None-Match` still gives one). A tombstoned head's `410` names no
+    `successor` (§8.1): a client reads `$successor` from the document at `last`
+    (`client.Moved`). `…/raw` is `404 not_offered`. A namespace raised to sealed lists none of
+    the three on any of its pages from then on, earlier ones included, and the raise purges
+    `ns:{ns}` (§9), whatever its `read`.
 - **Keys.** Each (namespace, epoch) has a 256-bit random epoch key, wrapped by the key store in
   `epoch_keys`. `encryption.epoch` starts at 1 (absent means 1; a new namespace or branch may
   name any start) and a config write may only keep it or add exactly 1, which starts a new
@@ -1714,7 +1748,7 @@ curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs"
   (also for a `read: "public"` sealed namespace); with `-dev` anyone gets epoch keys. It
   refuses as other reads do (§7): `401` without a usable grant, `403` for a grant that doesn't
   name the namespace (ignored, so `401`, in a public one), `404` without `read`. A grant that
-  reads the namespace unrestricted (§C.5; with roles, through one without `/resource` rules
+  reads the namespace unrestricted (§2.1; with roles, through one without `/resource` rules
   that passes) gets `K_e` (and `resources` is ignored); one restricted by rules on `/resource`
   or a key with `readScope: "resource"` gets `K_r` for each requested resource it may read.
   Unlike the other `/ns/{ns}` URLs, it serves such grants. Any other `read` grant, whose rules
@@ -1805,7 +1839,12 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   `{ "code": "gone", "snapshot": "<JWE>" }`. The snapshot stays served after an archive restore
   clears the horizon, until a later prune or a purge. Every other revision keeps the fold
   redirect (what it should serve is §13's open question), so a key holder folding a revision
-  after the horizon reads `/rev/{s}` and then the range after `s`.
+  after the horizon reads `/rev/{s}` and then the range after `s`. As at E2, no revision read,
+  the keyring's and snapshots included, carries `Last-Modified` or `Repr-Digest`
+  (`If-Modified-Since` is ignored), `/heads` entries carry no `created`, `size` or `digest`,
+  a tombstoned head's `410` names no `successor` (`client.E2E.Moved` folds the document at
+  `last` for its `$successor`, and ignores one a `410` names), and `…/raw` is `404
+  not_offered` (§7.1, §7.4, §8.1).
 - **The keyring.** The reserved resource `keyring` holds `seal.Keyring` in plaintext (wrapped
   epoch keys and public X25519 JWKs only). It is the only plaintext resource: written by key
   holders with ordinary writes, checked like any document plus `seal.ParseKeyring`, `ns` equal
@@ -2113,6 +2152,53 @@ Note: the §B.11.3 example key rule `not writes overlaps /$access` refuses every
 genesis writes `""`. Scope it to non-create actions and require `/doc/$access` to be absent on
 create.
 
+### File trees (§H.2, §H.3)
+
+Spec v0.55's Addendum H stores files in namespaces so that tools showing them as files, such as
+WebDAV gateways and mounts, share them. A catalog whose namespace document says
+`"catalog": { "trust": ["files"], "mode": "tree", "files": { "ns": "files", "root": "root" } }`
+is a file tree: folders are folder nodes and files placements, named by their `title`s. The
+tree service then gives every placement entry with a head, in `children`, `subtree`, `roots`,
+`ancestors` and `where`, the file metadata of that head:
+
+```json
+{ "name": "files.k3x9…", "kind": "item", "title": "notes.json", "head": "1…", "url": "…",
+  "file": { "size": 1234, "type": "application/json", "modified": "2026-10-18T09:12:44.512Z" } }
+```
+
+- **`size` and `type`**: for a raw file, a document whose root is a blob reference (§7.8), the
+  reference's; for a JSON file, the length of its rendering and `application/json`. The
+  rendering (§H.1, `files.Rendering`) is the canonical text of the document without a top-level
+  fresh `$nonce` or `$successor` of §8.1's form, laid out as `JSON.stringify(v, null, 2)` lays it
+  out, with JCS's tokens and member order (keys that look like array indices stay where JCS puts
+  them), and a final LF. `files.MetaOf` computes both, for the WebDAV gateway too.
+- **`modified`** is the head's `created` as the namespace log gives it (a batch entry's for a
+  batch, a `/heads` row's for a snapshot bootstrap), else its `Last-Modified`; it is left out
+  where neither is known (a snapshot of a sealed namespace, rows written before v0.54).
+- **Reads.** The service reads each head once, as it applies the entry that made it the head,
+  for every item of every trusted namespace (not only `files.ns`, implicit placements too), and
+  keeps the metadata with the item (`items.created`, `items.file`), so a folder lists in one
+  request. A sealed (E2) namespace is read with keys; an e2e one isn't, and its items get no
+  `file`. When `catalog.files` appears, every live item's head is read for it, and when it goes
+  the metadata goes, both moving listings to the new checkpoint; a database from before this, or
+  one a release that ignored `catalog.files` kept, is filled in on start (meta `filed`, purging
+  the catalog's cached listings, `ns:{catalog}`). A head that can't be read for the moment (not
+  gone, nor unreadable content) is read again: the catalog's change is applied again by its
+  follower, and a start's fill-in is retried beside the followers until it succeeds.
+- **Sealed items** (§E.2.6). For an item of a sealed namespace the entry carries
+  `"file": { "sealed": "<JWE>" }` instead, the JWE of `{ "file": { … } }` under the item's own
+  `K_r` (kid its namespace's current epoch, padded as that namespace pads), with `pl { ns, name,
+  view }` naming the item and the listing's `at` URL, whatever the catalog's level: a reader
+  given `K_r` by `/read-grants` opens it, and in a sealed catalog read whole, the catalog's JWE
+  holds it still sealed, so the catalog's keys open no content-derived value. A listing holding
+  one is stored and served unchanged, as a sealed catalog's listings are, keyed like kept ones
+  by its URL and what the reader reads whole. While a sealed namespace's key can't be had for
+  the moment, listings are `503`, `no-store`, with `Retry-After`, as when the catalog's own key
+  can't, rather than kept at their `at` without it. Only sealed namespaces' keys are asked for.
+  The service stores the metadata in the clear, as it does titles. This form, and its nesting
+  inside a sealed catalog's JWE, are provisional: §E.2.6 defines a per-entry `"sealed"` member
+  for values of one source and none yet for values another namespace's resource gives.
+
 ### Bundles (§G.4)
 
 ```sh
@@ -2144,7 +2230,10 @@ patchlog import -i all.jsonl -atomic -ns demo-schemas=demo2-schemas,demo=demo2  
   `patchlog import` and the merge tools sign their own steps with `-sign-key kid:seed` (or
   `$PATCHLOG_SIGN_KEY`); original signatures are never re-sent.
 - **Snapshot bundles** go through `{ns}-upstream` namespaces. Pinned references between snapshot
-  documents are rewritten to them, keeping any `#id` fragment.
+  documents are rewritten to them, keeping any `#id` fragment. A deleted resource's snapshot
+  line carries no document, and an upstream import appends only a tombstone, so a moved
+  resource's `$successor` (§8.1) travels in history bundles, where it is content like any
+  other, and not in snapshots.
 - **`-atomic`** lands each namespace as one batch, which needs an allowance for large imports
   (§6.6), within the deployment maximums (1,000 items and 16 MiB unless raised with
   `serve -max-items-per-batch` and `-max-batch-size`). **`-pace`** splits batches to fit the
@@ -2361,8 +2450,133 @@ curl -i -X PATCH $B/r/matches/derby -H "$P" -H 'If-Match: "1…"' \
 
 curl -i $B/r/matches/derby                  # 302 to /r/matches/derby/rev/{head}
 curl -L $B/r/matches/derby                  # the document
+curl -sIL $B/r/matches/derby                # its ETag, Last-Modified and Repr-Digest
 curl -L "$B/ns/matches/log"                 # the namespace log
 ```
+
+### Files and sync clients (§7.1, §7.4, §7.8, §8.1)
+
+Spec v0.54 serves file-style and sync clients, such as a WebDAV gateway, mounted file systems
+and editors, which compare their copies with what a deployment holds without fetching
+documents, keep files as blobs, move them and overwrite them whole (§11.3). Every field and
+header below is optional to a client: responses cached before an upgrade, or served by an
+older instance during one, lack them (see [Postgres](#postgres-d8)'s upgrade notes). Spec
+v0.55's Addendum H builds on them: how such tools store files, folders and names so they can
+share a namespace, with file metadata in tree listings (see [File trees](#file-trees-h2-h3)),
+and `GET /ns/{ns}/principal`, from which a writer limited to some resources learns what the
+namespace document asks of it (see [Design notes](#design-notes)).
+
+- **`Last-Modified`** on every `200` of `GET` and `HEAD /r/{ns}/{name}/rev/{id}`, in a namespace
+  that is neither sealed nor e2e, judged by the namespace serving the read (a sealed branch
+  sends none for what it reads through from a plain base): the revision's `created` as an
+  HTTP-date, to the second. A revision is immutable, so it never changes, except that it is
+  never later than the serving instance's clock (RFC 9110 §8.8.2.1): created times come from
+  the writing instance's clock, or a remote base's entries. `If-Modified-Since` no earlier than
+  it is a `304`, and `If-None-Match` with the id one too, which decides when both are sent (RFC
+  9110 §13.2.2). Sealed and e2e reads, the e2e keyring's and prune snapshots included, carry
+  none: sealed logs hide `created` (§E.2.2). There `If-Modified-Since` is ignored, as RFC 9110
+  §13.1.3 says for a representation without a modification date, so `304`s can't be probed for
+  the time it hides; `If-None-Match` still answers `304`. Browsers may read it (it is
+  CORS-safelisted, and CORS allows `If-Modified-Since`).
+- **`Repr-Digest: sha-256=:<base64>:`** (RFC 9530) on the same `200`s: the sha-256 of the bytes
+  served, the canonical document, which the server serves without content coding. Never in
+  sealed or e2e namespaces, whose JWEs it would describe, and whose plaintext digest, and an
+  exact length, padding exists to hide; nor for the e2e keyring, though it is served in the
+  clear. CORS exposes it. `304`s carry neither header: the `ETag` already names the revision.
+- **`/ns/{ns}/rev/{ns_id}/heads` entries** (`{ resource, kind, target, created?, size?,
+  digest? }`) carry, in a namespace that is neither sealed nor e2e, judged by the namespace
+  serving the page, `created`, the target's created time in the form log entries use, for
+  heads and tombstones (not purges: a remote branch's mirror of a resource purged at its base
+  doesn't know it); and for live heads `size` and `digest`, the byte length and `sha-256=:…:`
+  of the canonical document, exactly what `GET …/rev/{target}` serves and its `Repr-Digest`
+  says (for a raw document, the reference's length, not the file's, which the reference's own
+  `size` gives). At E2 and E3 all three are absent, on every page, those at `ns_id`s from
+  before a raise to sealed included. A branch lists its base's values for what it reads through
+  (the same document), a remote branch its base's (§G.3). A head pruned since keeps them, as it
+  keeps its target (`/rev/{target}` is then `410`); a purge lists a purge, with none. The Go
+  client has them as `HeadItem.Created`, `Size` and `Digest`, a document's headers as
+  `Doc.Modified` and `Doc.Digest`, and `client.ReprDigest(b)` computes the form to compare a copy
+  with.
+- **Purges.** A config write that raises a namespace to sealed purges `ns:{ns}` with the write
+  (§9), whatever its `read`, as making it private does, so no edge keeps `/heads` pages with
+  these fields, or revisions with these headers. (A level is never lowered, and e2e is set only
+  at creation.)
+- **Raw documents** (§7.8 Files). A document whose root is a blob reference,
+  `{ "$blob", "type", "size", "nonce"? }`, with no other members than `$schema`, a fresh
+  `$nonce` and a well-formed `$successor`, which a blob reference at the root may carry (§7.8:
+  nowhere else), stands for a file. `GET /r/{ns}/{name}/raw` and `…/rev/{id}/raw` answer `302`
+  to `…/blob/{bid}`, the serving namespace's URL (a branch reads its base's blob through), with
+  the document URL's `ETag` (and `X-Revision`), cached as that URL is: a head pointer, or
+  immutable, tagged `r:{ns}/{name}`. A document that isn't raw is `404 not_found`, cached alike;
+  unknown, pruned, purged and tombstoned ids and heads answer as the document URL does (a
+  tombstoned head's `410` with `tombstone`, `last` and `successor`). In sealed and e2e
+  namespaces, the e2e keyring included, both are `404 not_offered` after the read check, cached
+  as the document URL (a level is never lowered); a purged namespace's `410` comes first
+  (§8.5). The read check is the document's, so per-resource grants and edge grants for
+  `/r/{ns}/{name}` cover both URLs; a `schemaReads` referrer opens only revision paths. The Go
+  client tells a raw document from its value with `client.RawBlobOf`, and asks the server with
+  `Client.Raw`.
+- **Blob responses** carry `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox` on every answer of `…/blob/{bid}` and `…/blob/{bid}/e/{e}`,
+  `200`, `206`, `304`, the sealed `302` and errors alike, the `400`s for a non-canonical URL or
+  an unknown query parameter included (§7.8 Reading): writers choose a blob's type, and its URL
+  is on the API's origin, so a page can't run script from one. `sandbox` alone, unlike the
+  services' stricter policy, so images and text still display inline. Chromium shows a
+  sandboxed PDF as a blank page (its viewer is an extension), so a raw PDF file is better
+  downloaded, or shown by a viewer on another origin.
+- **Moves** (§8.1). A move is content: the resource's last revision before its tombstone sets a
+  top-level `$successor`, a bare name for a resource of the same namespace, resolved against the
+  namespace serving the `410`, or `/r/{ns2}/{name2}`. Within one namespace it is one batch
+  (create the new resource, then append `$successor` to the old one and delete it). Validation
+  leaves a `$successor` of that form out of the instance (§6.2 step 5), as it does `$schema`
+  and a fresh `$nonce`, so a closed schema needn't declare it; one of any other form is data.
+  The same instance serves E3 client validation and merges, the index's `x-index` and `x-ref`
+  walks and the bundle closure. The head pointer's `410` then carries
+  `{ "tombstone", "last", "successor"? }`, copied from the last document's `$successor` when it
+  is well-formed, in a namespace that is neither sealed nor e2e, judged by the namespace serving
+  it; it is read from that document where it is stored, a base's rows or a remote base's mirror
+  included, and cached with the head. A `[]` restore brings the document back with its
+  `$successor`; a client restoring a moved resource also removes it. Signatures, rules on
+  `/doc`, merges, imports, history bundles and remote branches carry it as any content
+  (snapshot bundles don't, see [Bundles](#bundles-g4)). The Go client
+  reads it as `Head.Successor`; `Client.Moved` falls back to the document at `last` where the
+  `410` names none, `E2E.Moved` always folds that document, verified, and ignores a successor
+  the `410` names (none comes from a conforming server at E3, which is outside the trust
+  boundary), and `client.ResolveSuccessor` resolves a bare name.
+- **Whole documents** (§6.6). An append or restore whose first operation other than `test` is
+  a root `replace` or `add` may be as large as `documentSize`, as a create may, so a document is
+  overwritten on purpose in one request (§11.3); at E3 every create and restore may, and no
+  append does. See the limits in [Design notes](#design-notes), and `logPageBytes`, which keeps
+  a log page of such patch sets bounded.
+
+`size` and `digest` are stored, not computed, so a listing reads no document: the write that
+leaves a revision as a resource's head stores its document's length and sha-256 with it
+(`revisions.size`, `digest`), from the canonical bytes the write already holds, and a read of
+that revision serves the stored digest as its `Repr-Digest` instead of hashing again. That is
+step 7 for every resource write and batch (group commits, merges, rebases and bundle imports
+write batches), and the chains remote branches and mirrored schemas insert (§G.3).
+Intermediate steps of a multi-step item, which no entry makes a head, tombstones, and
+sealed and e2e namespaces store none: they never list them, and a level can't be lowered
+(at e2e the server has no document anyway, §E.3). Purges clear them with the patch sets;
+prunes keep them, as they keep ids, created times and gestures (§8.6), and a restore from an
+archive moves no head. Heads written before the upgrade, or by an older instance during a
+rolling one, have none: they are listed without `size` and `digest` until the resource is
+written again. Nothing fills them in later: a `/heads` page is immutable and cached for a
+year, so a listing already served never gains them (§7.4); a backfill would have to fold the
+document of every head at every `ns_id`, not just the current ones; and while older instances
+still write, no backfill could finish. They only go: a purge turns its entries into purges,
+and a namespace raised to sealed lists them on none of its pages from then on, and purges the
+copies cached before. `created` was always stored. In an encrypted-at-rest namespace the two
+columns are stored in the clear, as ids are, which hash plaintext patch sets too (§C.7): a
+dump or backup, one taken before a purge included, whose keys the purge destroys, still lets
+anyone confirm a guess of a head's whole document against its digest, unless the document
+holds a `$nonce` (§C.7), as it can confirm a guess of a patch set against its id.
+
+**Beyond the spec.** A resource purge also purges the `/heads` pages of every namespace it
+reaches, which carry `heads:{ns}` besides `ns:{ns}` (§9). §8.3 accepts that a digest already
+served survives a purge, as ids do, but a cached page would keep listing the purged head's
+size and digest, which the origin no longer lists, so the reference clears its own edge's
+copies; browsers' copies remain until their `max-age` expires.
 
 ## Grants
 
@@ -2407,7 +2621,7 @@ gets `404`). Public namespaces ignore an unusable or unrelated grant on reads.
 
 `/ns/{ns}` and every URL under it but the gestures listing and `POST /ns/{ns}/keys` (the
 namespace document, its log, events and long-polls, `/heads`, `/branches`, `/grants/…`) need
-**unrestricted** read (§C.5, v0.47): the key has no `readScope`, no rule in the grant's blocks or its key's scope refers to
+**unrestricted** read (§2.1, v0.47): the key has no `readScope`, no rule in the grant's blocks or its key's scope refers to
 `/resource`, and, with roles, one role listing `read` has no such rule. A grant that reads only
 some resources gets `404` there, as for any read it may not make, so it can't list the names
 and heads its reads hide; a resource's own URLs, its event stream included, need read on that
@@ -2535,7 +2749,10 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   their whole gate inside one write transaction.
 - **Additions to the D.2 layout**: `namespaces.head_seq/config_seq/base_config_seq`,
   `ns_log.body` (the canonical entry exactly as hashed) and `ns_log.config_seq`,
-  `ns_config.doc`, `revisions.signature/schema_ref`, `resources.keep`, `heads.seq`, `deks`
+  `ns_config.doc`, `revisions.signature/schema_ref`, `revisions.size/digest` (a head's
+  document, for `/heads`, about 40 bytes a row: see
+  [Files and sync clients](#files-and-sync-clients-71-74-78-81)),
+  `resources.keep`, `heads.seq`, `deks`
   (wrapped data keys of encryption at rest, Addendum E.1), `epoch_keys`, `rev_epochs` and
   `sealed` (sealed namespaces, Addendum E.2); and
   for §G.3 `remote_branches` (registrations at the source: base, remote origin and name,
@@ -2560,7 +2777,10 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   body's `message` repeats the error), saying other members must start with `x-`. The check
   runs before the `*`-key guard. Other invalid namespace documents (a malformed `read`, `keys`,
   …) answer the same way, with the pointer their message names. The addenda's members are
-  checked in their shapes: `catalog: { trust?: [namespace names], mode?: "tree" | "dag" }`,
+  checked in their shapes: `catalog: { trust?: [namespace names], mode?: "tree" | "dag",
+  title?: pointer, files?: { ns, root, folder?, placement? } }` (`files`, v0.55, §H.2: `ns` a
+  namespace name, `root` a folder name, without a dot, and `folder` and `placement` schema
+  revision paths; whether the catalog trusts `ns` or the schemas resolve is the tools' to check),
   `catalogs: { <catalog>: { place?: ["group:…" | "user:…"] } }`, `merge: { authors: [{ sub,
   kid }] }`, `merged: { at: ns_id }`, `cleanup: { merged?, superseded?, abandoned? }` (ISO
   8601 durations), `abandoned` a boolean; and `revoked` lists revocation ids. `catalog`, each
@@ -2581,9 +2801,18 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   documents, so an import from an older deployment brings no such members (§G.4); a remote
   branch's shadow keeps only the `encryption` fields this version defines of an e2e base's.
 - **Paged log ranges** (§7.1). `…/rev/{id}/log?since=` (resources and namespaces) answers at most
-  the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first, and
-  a namespace page at most as many resource entries, a batch entry counting as its items: it
-  ends before an entry that would take it past, but always holds one; a
+  the log page size of entries (§6.6, default 1,000, `serve -log-page-size`), oldest first; a
+  resource page at most `logPageBytes` of patch sets (§6.6, default 16 MiB, `serve
+  -log-page-bytes`), measured as served (decompressed, decrypted at rest, the sealed op at E3,
+  and at E2 the per-entry JWEs themselves, stored or sealed for the page, so where a page ends
+  says no more than their padded lengths do, §E.2.2); and a namespace page, whose entries carry
+  no patch sets, at most as many resource entries as the page size, a batch entry counting as
+  its items. Either bound ends a page before an entry that would take it past, but a page always
+  holds one, so a patch set over `logPageBytes` is a page of its own. The byte bound stops the
+  scan once the stored rows are sure to exceed it (their stored lengths bound what they serve,
+  and a JWE is no shorter than its plaintext unless compressed, which a padded one never is: an
+  unpadded E2 page may end sooner than its JWEs would), so a page of large patch sets reads no
+  more rows than it serves; a
   range that goes on carries `X-Log-Next: {id}`, the page's last entry and the `since` of the
   next page, an immutable range up to the same id, so every page caches as immutable. Errors are
   the range's on every page: a range crossing a pruning horizon is `410` on all of them. A page
@@ -2659,9 +2888,13 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `ratePerNamespace`, `blobRate` (`{ rate, burst }`, `blobRate` in bytes), `retryWindow`,
   `remoteRegistration` and `blobGrace` (ISO 8601 durations; `blobGrace` at least `retryWindow`).
   Sizes written with units (`"64 MiB"`), unknown or v0.20 names (`liveBranches`,
-  `remoteBranchLife`) and the deployment-only `logPageSize`, `branchDepth` and `exchangeRate`
-  (`serve -exchange-rate`, §C.5) are `422`. Creates, and restores from scratch, may be as large
-  as `documentSize`; `valueSize` and `pathSize` bound strings and pointers, and an e2e namespace
+  `remoteBranchLife`) and the deployment-only `logPageSize`, `logPageBytes`
+  (`serve -log-page-bytes`), `branchDepth` and `exchangeRate` (`serve -exchange-rate`, §C.5) are
+  `422`. Creates, and appends and restores whose first operation other than `test` is a root
+  `replace` or `add` (§6.6 Whole documents), may be as large as `documentSize` instead of
+  `patchSetSize`; at E3, where the patch set's shape is sealed, every create and restore may and
+  no append does; in a batch they still count toward `batchSize`. `valueSize` and `pathSize`
+  bound strings and pointers, and an e2e namespace
   needs `3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize`. `$blob`
   objects must be well-formed and name available blobs that match their type, size and nonce
   (`422`, `code: "blob"`). Allowances may also set `blobRate` and `blobPending`; the deployment
@@ -2763,7 +2996,58 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   `prefix` on `DELETE /edge-grants`, the one that may repeat), and answers anything else, a
   repeated parameter or another flag value with `400 bad_input`, `no-store`, before
   authentication.
-- **`GET /`** answers `{ "spec": "0.52", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
+- **`GET /ns/{ns}/principal`** (§7.4, v0.55) answers `200` with `{ "principal", "kid", "can",
+  "roles", "writer": { "frozen", "successor"?, "nonce", "signatures", "level"?, "limits" } }`
+  and `X-Config-Revision`: the principal of §6.4.1 (`{ id, groups, roles, attrs, via, grant }`),
+  the root block's `kid`, the verbs its blocks allow, sorted (with roles, only those an
+  effective role lists), its effective roles, and what a writer needs from the namespace
+  document, which a grant limited to some resources can't read: `frozen`, `successor` if set,
+  `nonce` and `signatures` (`"required"` or `"optional"`; a sealed namespace says `"required"`,
+  as §E.2.5 holds every patch set there to a fresh `$nonce`), `level` (`at-rest`, `sealed`,
+  `e2e`; absent without `encryption`) and `limits`, every key of §6.6 as a namespace document
+  writes it (sizes and counts as integers, durations as ISO 8601, rates as `{ rate, burst }`),
+  the deployment's defaults and maximums applied, the deployment-only ones being the
+  deployment's (an allowance isn't applied). Only the `ns` check and verification apply, so a
+  grant limited to some resources or without `read` gets it; none, or one that can't be used, is
+  `401`, in a public namespace too; an edge-grant cookie is no grant here; a grant chained to an
+  operator key verifies against the operator keys and gets `404` for an absent namespace (and
+  `200` for an existing one, as §7.4 says; §C.4 still says `401`); a purged namespace is `410
+  purged` with `head` once the grant verifies. It takes no query parameter, draws no rate
+  token, works in frozen, sealed and e2e namespaces alike, and every answer is `no-store`. With
+  authentication disabled it leaves out `principal` and `kid` and lists every verb. The client
+  reads it with `Client.NSPrincipal` (`PrincipalInfo`, `WriterInfo`); undo asks it for the
+  namespace's `opsPerSet` and `patchSetSize` when the namespace document can't be read (§11.2),
+  falling back to §6.6's defaults on a server that answers `404` there, and such a writer still
+  adds a fresh `$nonce` in a private namespace (`NeedsNonce`), as §C.7 recommends. Verification now also applies a key's `readScope:
+  "resource"` (§C.2 item 1, §C.4) to every request: a `read` grant it signs that doesn't fix
+  `/resource` (§2.1) is refused (`403`, or `404` on a read of a private namespace, as any
+  refusal there). `grant.Verify` applies it, so the services' grant checks (`grantcheck`: the
+  tree, catalog and index services) refuse the same grants.
+- **Limit refusals** (§6.6, §12, v0.55): every `413` or `422` with `code: "limit"` names the
+  limit's key in `limit`, and for sizes and counts carries `measured` and `max`, the limit in
+  force: `patchSetSize` (or `documentSize` for a whole-document patch set) and `opsPerSet` of
+  the patch set, `documentSize` and `nestingDepth` of the resulting document, `valueSize` and
+  `pathSize` of the first string or pointer found too long (canonical bytes, quotes included),
+  `blobsPerDocument`, `itemsPerBatch` and `batchSize` (the principal's, with an allowance),
+  `branchesPerNamespace` (the live branches with the new one), `branchDepth`, `keepPerResource`,
+  `rulesPerGrant` and `rulesPerNamespace`, `grantSize`, `blobSize` and `blobPending`; a
+  namespace document over a deployment maximum names that key with its value and the maximum,
+  an e2e document failing §6.6's inequality names `patchSetSize` with the left side as
+  `measured`, and durations and rates (`retryWindow`, `remoteRegistration`, `blobGrace`, the
+  rates, an allowance's `blobRate`) carry the key alone. A body the server stops reading names
+  the deployment's limit (`documentSize` for a resource's patch set, `patchSetSize` for
+  namespace documents and branches) or, for a batch, the principal's `batchSize`, with the bytes
+  read as `measured`, a lower bound; a blob sent without `Content-Length` gives `blobSize + 1`.
+  A batch item's report carries its refusal's fields. The prune and `/keys` bodies, which no
+  limit covers, are `400 bad_input` above 1 MiB, and so is an edge-grant exchange body over room
+  for 50 grants of `grantSize` (§12: an exchange over its limits; a grant too large is `413
+  grantSize` once decoded). A grant chain is held to the namespace's `rulesPerGrant` and a
+  bearer to its `grantSize`, and a config write that creates a namespace, or changes its rules
+  or its own `rulesPerNamespace`, to that bound, as §6.6 says, not only to the deployment's
+  maximums; a document an earlier release stored over its own `rulesPerNamespace` takes other
+  writes, a freeze among them. The client reads them with `APIError.Limit` and
+  `client.IsLimit`.
+- **`GET /`** answers `{ "spec": "0.55", "auth": "grants" | "disabled", "origin", "jwks_uri" }` (§1, §7,
   §G.1): the spec version, dotted decimal, from one constant (`core.SpecVersion`), and whether
   authentication is on. `client.Root` reads all three; `client.AuthDisabled` asks again every
   time, for tools that decide on the mode. A remote branch reads its base's namespace

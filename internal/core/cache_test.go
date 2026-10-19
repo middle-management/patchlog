@@ -28,19 +28,19 @@ func TestReadCacheRoom(t *testing.T) {
 	c := &readCache{maxBytes: 1 << 20}
 	g := c.load("n")
 	for i := 0; i < 50; i++ {
-		c.putRev(g, "n", fmt.Sprint(i), "r", make([]byte, 100<<10), true)
+		c.putRev(g, "n", fmt.Sprint(i), "r", revDoc{doc: make([]byte, 100<<10)}, true)
 	}
 	if c.bytes > 1<<20 || len(c.revs) == 0 || len(c.revs) < 5 {
 		t.Fatalf("%d revisions, %d bytes", len(c.revs), c.bytes)
 	}
 	c.revs, c.bytes = nil, 0
 	for i := 0; i < 3; i++ {
-		c.putRev(g, "n", "a", "r", make([]byte, 1000), true)
+		c.putRev(g, "n", "a", "r", revDoc{doc: make([]byte, 1000)}, true)
 	}
 	if c.bytes != 1000 || len(c.revs) != 1 {
 		t.Fatalf("a replaced revision: %d revisions, %d bytes", len(c.revs), c.bytes)
 	}
-	c.putRev(g, "n", "huge", "r", make([]byte, 300<<10), true)
+	c.putRev(g, "n", "huge", "r", revDoc{doc: make([]byte, 300<<10)}, true)
 	if _, ok := c.revs[revKey("n", "huge", "r")]; ok {
 		t.Fatal("a revision over a quarter of the bytes is kept")
 	}

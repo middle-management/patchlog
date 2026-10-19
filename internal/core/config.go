@@ -14,6 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/rules"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // Limits are the configurable limits of §6.6. Sizes are bytes; rates are
@@ -30,6 +31,7 @@ type Limits struct {
 	GrantSize            int
 	ItemsPerBatch        int
 	LogPageSize          int // deployment only
+	LogPageBytes         int // deployment only: patch set bytes per resource log page, as served (§7.1, §7.7)
 	BatchSize            int
 	BranchDepth          int // deployment only
 	BranchesPerNamespace int
@@ -75,6 +77,7 @@ func DefaultLimits() Limits {
 		GrantSize:            8 << 10,
 		ItemsPerBatch:        1000,
 		LogPageSize:          1000,
+		LogPageBytes:         16 << 20,
 		BatchSize:            16 << 20,
 		BranchDepth:          8,
 		BranchesPerNamespace: 100,
@@ -129,7 +132,7 @@ var limitFields = map[string]func(*Limits) *int{
 }
 
 // deploymentOnlyLimits are limits of §6.6 that only a deployment sets.
-var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "branchDepth": true, "exchangeRate": true}
+var deploymentOnlyLimits = map[string]bool{"logPageSize": true, "logPageBytes": true, "branchDepth": true, "exchangeRate": true}
 
 var rateFields = map[string]func(*Limits) *Rate{
 	"ratePerResource":  func(l *Limits) *Rate { return &l.RatePerResource },
@@ -478,13 +481,13 @@ func checkKeyFields(v, prev any) *memberError {
 	return nil
 }
 
-// checkCatalog checks a catalog namespace's "catalog" (§B.6):
-// { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer },
-// and x- members.
+// checkCatalog checks a catalog namespace's "catalog" (§B.6, §7.4):
+// { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer,
+// "files"?: { "ns", "root", "folder"?, "placement"? } }, and x- members.
 func checkCatalog(v any) *memberError {
 	m, ok := v.(map[string]any)
 	if !ok {
-		return badAt(pointer.Pointer{"catalog"}, `must be { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer } (§B.6)`)
+		return badAt(pointer.Pointer{"catalog"}, `must be { "trust"?: [namespace names], "mode"?: "tree" | "dag", "title"?: pointer, "files"?: { "ns", "root", "folder"?, "placement"? } } (§B.6)`)
 	}
 	for _, k := range sortedKeys(m) {
 		switch x := m[k]; {
@@ -508,9 +511,54 @@ func checkCatalog(v any) *memberError {
 			} else if _, err := pointer.Parse(t); err != nil {
 				return badAt(pointer.Pointer{"catalog", "title"}, "must be a JSON Pointer (§B.5)")
 			}
+		case k == "files":
+			if err := checkCatalogFiles(x); err != nil {
+				return err
+			}
 		case isX(k):
 		default:
 			return badAt(pointer.Pointer{"catalog", k}, `is not a known field; other members must start with "x-" (§B.6, §7.4)`)
+		}
+	}
+	return nil
+}
+
+// checkCatalogFiles checks "catalog.files", which makes a catalog a file tree
+// (§H.2): "ns" a namespace name, "root" a folder name (a resource name
+// without a dot, §B.2), "folder" and "placement" schema revision paths
+// (§6.1), and x- members. Whether the catalog trusts "ns", or the schemas
+// resolve, is the tools' to check (§H.4).
+func checkCatalogFiles(v any) *memberError {
+	at := func(k string) pointer.Pointer { return pointer.Pointer{"catalog", "files", k} }
+	m, ok := v.(map[string]any)
+	if !ok {
+		return badAt(pointer.Pointer{"catalog", "files"}, `must be { "ns", "root", "folder"?, "placement"? } (§H.2)`)
+	}
+	for _, k := range []string{"ns", "root"} {
+		if _, ok := m[k]; !ok {
+			return badAt(pointer.Pointer{"catalog", "files"}, "must have %q (§H.2)", k)
+		}
+	}
+	for _, k := range sortedKeys(m) {
+		x := m[k]
+		switch {
+		case k == "ns":
+			if s, ok := x.(string); !ok || !ValidNSName(s) {
+				return badAt(at(k), "must be a namespace name (§3.6, §H.2)")
+			}
+		case k == "root":
+			if s, ok := x.(string); !ok || !ValidResourceName(s) || strings.Contains(s, ".") {
+				return badAt(at(k), "must be a folder name: a resource name without a dot (§3.6, §B.2, §H.2)")
+			}
+		case k == "folder" || k == "placement":
+			if s, ok := x.(string); !ok {
+				return badAt(at(k), "must be a schema revision path (§6.1, §H.2)")
+			} else if _, ok := schema.ParseRef(s); !ok {
+				return badAt(at(k), "must be a schema revision path (§6.1, §H.2)")
+			}
+		case isX(k):
+		default:
+			return badAt(at(k), `is not a known field; other members must start with "x-" (§H.2, §7.4)`)
 		}
 	}
 	return nil
@@ -627,7 +675,7 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 				return nil, fmt.Errorf("/rules: %v", err)
 			}
 			if len(rs) > max.RulesPerNS {
-				return nil, &limitError{fmt.Sprintf("more than %d rules", max.RulesPerNS)}
+				return nil, sizeLimit("rulesPerNamespace", len(rs), max.RulesPerNS, fmt.Sprintf("more than %d rules", max.RulesPerNS))
 			}
 			c.Rules = rs
 		case "keys":
@@ -847,8 +895,8 @@ func parseConfig(doc any, defaults, max Limits) (*Config, error) {
 		// Sealing grows a patch set by half, and it carries the declared
 		// blob list (§6.6, Values).
 		l := c.Limits
-		if 3*(l.ValueSize+l.PathSize)+(1<<10)+36*l.BlobsPerDocument > l.PatchSetSize {
-			return nil, &limitError{"an e2e namespace needs 3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize (§6.6)"}
+		if need := 3*(l.ValueSize+l.PathSize) + (1 << 10) + 36*l.BlobsPerDocument; need > l.PatchSetSize {
+			return nil, sizeLimit("patchSetSize", need, l.PatchSetSize, "an e2e namespace needs 3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize (§6.6)")
 		}
 		for i, r := range c.Retention {
 			if r.NoArchive {
@@ -884,7 +932,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/%s must be a non-negative integer", k)
 			}
 			if int(n) > *f(&max) {
-				return &limitError{fmt.Sprintf("/limits/%s exceeds the deployment maximum %d", k, *f(&max))}
+				return sizeLimit(k, int(n), *f(&max), fmt.Sprintf("/limits/%s exceeds the deployment maximum %d", k, *f(&max)))
 			}
 			*f(l) = int(n)
 			continue
@@ -897,7 +945,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/%s must be { rate, burst }", k)
 			}
 			if r > f(&max).Rate || b > f(&max).Burst {
-				return &limitError{fmt.Sprintf("/limits/%s exceeds the deployment maximum", k)}
+				return keyLimit(k, fmt.Sprintf("/limits/%s exceeds the deployment maximum", k))
 			}
 			*f(l) = Rate{r, b}
 			continue
@@ -909,7 +957,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/remoteRegistration must be a positive ISO 8601 duration")
 			}
 			if d > max.RemoteRegistration {
-				return &limitError{"/limits/remoteRegistration exceeds the deployment maximum"}
+				return keyLimit(k, "/limits/remoteRegistration exceeds the deployment maximum")
 			}
 			l.RemoteRegistration = d
 			continue
@@ -921,7 +969,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/blobGrace must be a positive ISO 8601 duration")
 			}
 			if d > max.BlobGrace {
-				return &limitError{"/limits/blobGrace exceeds the deployment maximum"}
+				return keyLimit(k, "/limits/blobGrace exceeds the deployment maximum")
 			}
 			l.BlobGrace = d
 			continue
@@ -933,7 +981,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 				return fmt.Errorf("/limits/retryWindow must be an ISO 8601 duration")
 			}
 			if d < max.RetryWindowMin || d > max.RetryWindow {
-				return &limitError{"/limits/retryWindow is outside the deployment's range"}
+				return keyLimit(k, "/limits/retryWindow is outside the deployment's range")
 			}
 			l.RetryWindow = d
 			continue
@@ -942,7 +990,7 @@ func parseLimits(v any, l *Limits, max Limits) error {
 	}
 	// A pending blob lives at least as long as a retry may come (§6.6).
 	if l.BlobGrace < l.RetryWindow {
-		return &limitError{"/limits/blobGrace must be at least retryWindow (§6.6)"}
+		return keyLimit("blobGrace", "/limits/blobGrace must be at least retryWindow (§6.6)")
 	}
 	return nil
 }
@@ -1012,7 +1060,7 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/itemsPerBatch must be a positive integer", i)
 				}
 				if int(n) > max.ItemsPerBatch {
-					return nil, &limitError{fmt.Sprintf("/allowances/%d/itemsPerBatch exceeds the deployment maximum %d", i, max.ItemsPerBatch)}
+					return nil, sizeLimit("itemsPerBatch", int(n), max.ItemsPerBatch, fmt.Sprintf("/allowances/%d/itemsPerBatch exceeds the deployment maximum %d", i, max.ItemsPerBatch))
 				}
 				a.ItemsPerBatch = int(n)
 			case "batchSize":
@@ -1022,7 +1070,7 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/batchSize must be a positive integer, in bytes (§6.6)", i)
 				}
 				if n > max.BatchSize {
-					return nil, &limitError{fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize)}
+					return nil, sizeLimit("batchSize", n, max.BatchSize, fmt.Sprintf("/allowances/%d/batchSize exceeds the deployment maximum %d", i, max.BatchSize))
 				}
 				a.BatchSize = n
 			case "blobRate":
@@ -1033,7 +1081,7 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/blobRate must be { rate, burst } in bytes, rate positive and burst at least 1", i)
 				}
 				if r > max.BlobRate.Rate || b > max.BlobRate.Burst {
-					return nil, &limitError{fmt.Sprintf("/allowances/%d/blobRate exceeds the deployment maximum", i)}
+					return nil, keyLimit("blobRate", fmt.Sprintf("/allowances/%d/blobRate exceeds the deployment maximum", i))
 				}
 				a.BlobRate = Rate{r, b}
 			case "blobPending":
@@ -1043,7 +1091,7 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 					return nil, fmt.Errorf("/allowances/%d/blobPending must be a positive integer, in bytes (§6.6)", i)
 				}
 				if n > max.BlobPending {
-					return nil, &limitError{fmt.Sprintf("/allowances/%d/blobPending exceeds the deployment maximum %d", i, max.BlobPending)}
+					return nil, sizeLimit("blobPending", n, max.BlobPending, fmt.Sprintf("/allowances/%d/blobPending exceeds the deployment maximum %d", i, max.BlobPending))
 				}
 				a.BlobPending = n
 			case "until":
@@ -1069,9 +1117,29 @@ func parseAllowances(v any, max Limits) ([]Allowance, error) {
 	return out, nil
 }
 
-type limitError struct{ msg string }
+// limitError is a limit of §6.6 that a namespace document exceeds: key
+// names it, and a size or a count also carries measured and max (§12).
+type limitError struct {
+	msg, key      string
+	sized         bool
+	measured, max int64
+}
 
 func (e *limitError) Error() string { return e.msg }
+
+func sizeLimit(key string, measured, max int, msg string) *limitError {
+	return &limitError{msg: msg, key: key, sized: true, measured: int64(measured), max: int64(max)}
+}
+
+func keyLimit(key, msg string) *limitError { return &limitError{msg: msg, key: key} }
+
+// err is the 422 refusal of e (§6.6).
+func (e *limitError) err() *Error {
+	if e.sized {
+		return limitErr(422, e.key, e.measured, e.max, e.msg)
+	}
+	return limitKeyErr(422, e.key, e.msg)
+}
 
 var durRe = regexp.MustCompile(`^P(?:(\d+)Y)?(?:(\d+)M)?(?:(\d+)W)?(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+(?:\.\d+)?)S)?)?$`)
 
@@ -1096,6 +1164,60 @@ func ParseDuration(s string) (time.Duration, error) {
 		d += time.Duration(f * float64(time.Second))
 	}
 	return d, nil
+}
+
+// FormatDuration writes d as an ISO 8601 duration that ParseDuration reads
+// back: days, then hours, minutes and seconds, e.g. P30D, PT5M, P1DT12H.
+func FormatDuration(d time.Duration) string {
+	if d < 0 {
+		d = 0
+	}
+	var b strings.Builder
+	b.WriteString("P")
+	if days := d / (24 * time.Hour); days > 0 {
+		fmt.Fprintf(&b, "%dD", days)
+		d -= days * 24 * time.Hour
+	}
+	if d == 0 {
+		if b.Len() == 1 {
+			return "PT0S"
+		}
+		return b.String()
+	}
+	b.WriteString("T")
+	if h := d / time.Hour; h > 0 {
+		fmt.Fprintf(&b, "%dH", h)
+		d -= h * time.Hour
+	}
+	if m := d / time.Minute; m > 0 {
+		fmt.Fprintf(&b, "%dM", m)
+		d -= m * time.Minute
+	}
+	if d > 0 {
+		b.WriteString(strconv.FormatFloat(d.Seconds(), 'f', -1, 64) + "S")
+	}
+	return b.String()
+}
+
+// Doc is l in the form of a namespace document's "limits" (§6.6): every
+// key of §6.6's table, sizes and counts as integers, durations as ISO 8601
+// durations and rates as { "rate", "burst" }. RetryWindowMin, the
+// deployment's floor, isn't one of them.
+func (l Limits) Doc() map[string]any {
+	out := map[string]any{}
+	for k, f := range limitFields {
+		out[k] = int64(*f(&l))
+	}
+	rate := func(r Rate) map[string]any { return map[string]any{"rate": r.Rate, "burst": r.Burst} }
+	for k, f := range rateFields {
+		out[k] = rate(*f(&l))
+	}
+	out["logPageSize"], out["logPageBytes"], out["branchDepth"] = int64(l.LogPageSize), int64(l.LogPageBytes), int64(l.BranchDepth)
+	out["exchangeRate"] = rate(l.ExchangeRate)
+	out["retryWindow"] = FormatDuration(l.RetryWindow)
+	out["remoteRegistration"] = FormatDuration(l.RemoteRegistration)
+	out["blobGrace"] = FormatDuration(l.BlobGrace)
+	return out
 }
 
 // starKids returns the kids of keys with can ["*"].

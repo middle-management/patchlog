@@ -12,8 +12,9 @@
 //     anything else; no usable grant (malformed, unknown key, bad
 //     signature, revoked, expired, not yet valid) is 401;
 //   - key scopes, including attrs (validated with internal/rules as the
-//     core does) and requireAt/maxLag (checked against the named chain,
-//     relative to the grant's issuance, default maxLag 60 seconds);
+//     core does), requireAt/maxLag (checked against the named chain,
+//     relative to the grant's issuance, default maxLag 60 seconds) and
+//     readScope (a read grant that doesn't fix /resource is 403, §2.1);
 //   - read decisions: the grant allows read and its key-scope, block and
 //     role rules pass against a read envelope
 //     { action: "read", resource?, principal, now } (§C.2 item 5).
@@ -618,7 +619,7 @@ func (ch *Checker) ReadsPerResource(v *grant.Verified) bool {
 }
 
 // ReadsUnrestricted reports whether a verified grant reads the namespace
-// unrestricted (§C.5) and may read it now: its key has no readScope, no
+// unrestricted (§2.1) and may read it now: its key has no readScope, no
 // rule of its blocks or key scope refers to /resource, they pass, and, if
 // it carries roles, so does some role that lists read and has no rule
 // referring to /resource. Its other roles don't count: roles are

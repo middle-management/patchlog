@@ -14,7 +14,7 @@ import (
 	"github.com/middle-management/patchlog/internal/edge"
 )
 
-// WithEdgeGrants enables POST /edge-grants (§C.5): grants are exchanged
+// WithEdgeGrants enables POST /edge-grants (§C.5.2): grants are exchanged
 // for edge grants as cookies, issued with c's newest key and verified
 // with any it holds, so its keys rotate (edge.Cookies.AddKey). Without
 // it the origin still issues them, named edge.DefaultKid, under a random
@@ -51,7 +51,7 @@ func referrerCache(w http.ResponseWriter) {
 	edge.NoStore(w.Header())
 }
 
-// edgeGrants is POST /edge-grants (§C.5): with the grant in
+// edgeGrants is POST /edge-grants (§C.5.2): with the grant in
 // Authorization, or several in the body (edgeGrantBearers), 200 with
 // { prefixes, exp } and one Set-Cookie per prefix: Path the prefix
 // (/r/{ns}/{name}, /r/{ns}, /ns/{ns}, covering what lies below), Secure,
@@ -63,7 +63,7 @@ func referrerCache(w http.ResponseWriter) {
 func (s *Server) edgeGrants(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	if err := s.e.EdgeGrantsOffered(); err != nil {
-		writeErr(w, err) // whatever the body (§C.5)
+		writeErr(w, err) // whatever the body (§C.5.2)
 		return
 	}
 	bearers, err := s.edgeGrantBearers(r)
@@ -100,7 +100,7 @@ func (s *Server) edgeGrants(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"prefixes": prefixes, "exp": first.UTC().Format(time.RFC3339)})
 }
 
-// edgeGrantBearers are the grants POST /edge-grants exchanges (§C.5):
+// edgeGrantBearers are the grants POST /edge-grants exchanges (§C.5.2):
 // those of a body { "grants": [ … ] }, 1 to core.MaxEdgeGrants tokens as
 // they would follow "Bearer ", which takes no Authorization (400
 // otherwise); without a body, the grant in Authorization, if any. A
@@ -116,6 +116,12 @@ func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 	if err != nil {
 		return nil, badInput("could not read body")
 	}
+	// More than room for the grants an exchange takes is over its limits:
+	// 400 bad_input (§12, §C.5.2), not a grant's grantSize, which no grant
+	// was measured against. A grant too large is grantSize when decoded.
+	if len(body) > max {
+		return nil, tooLarge(len(body), noLimit)
+	}
 	if len(body) == 0 {
 		if c := creds(r); c.Bearer != "" {
 			return []string{c.Bearer}, nil
@@ -123,25 +129,25 @@ func (s *Server) edgeGrantBearers(r *http.Request) ([]string, error) {
 		return nil, nil
 	}
 	if r.Header.Get("Authorization") != "" {
-		return nil, badInput("grants in the body take no Authorization (§C.5)")
+		return nil, badInput("grants in the body take no Authorization (§C.5.2)")
 	}
 	if mediaType(r) != "application/json" {
 		return nil, &core.Error{Status: 415, Body: map[string]any{"code": "bad_input", "message": "use application/json"}}
 	}
 	r.Body = io.NopCloser(bytes.NewReader(body))
-	v, err := readJSON(r, max)
+	v, err := readJSON(r, max, noLimit)
 	if err != nil {
 		return nil, err
 	}
 	m, _ := v.(map[string]any)
 	gs, ok := m["grants"].([]any)
 	if !ok || len(m) != 1 || len(gs) < 1 || len(gs) > core.MaxEdgeGrants {
-		return nil, badInput(fmt.Sprintf("body must be { grants: [ … ] }, 1 to %d grants (§C.5)", core.MaxEdgeGrants))
+		return nil, badInput(fmt.Sprintf("body must be { grants: [ … ] }, 1 to %d grants (§C.5.2)", core.MaxEdgeGrants))
 	}
 	out := make([]string, len(gs))
 	for i, g := range gs {
 		if out[i], ok = g.(string); !ok {
-			return nil, badInput("each grant is a string: the token as it would follow \"Bearer \" (§C.5)")
+			return nil, badInput("each grant is a string: the token as it would follow \"Bearer \" (§C.5.2)")
 		}
 		out[i] = strings.TrimSpace(out[i]) // as in Authorization (creds)
 	}

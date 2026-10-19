@@ -1,14 +1,19 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"database/sql"
+	"encoding/base64"
 	"errors"
 	"sort"
 	"sync"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // headItem is one resource as a namespace sees it.
@@ -138,6 +143,12 @@ type Head struct {
 	Last    string // tombstoned: last live revision
 	Public  bool
 	Horizon string
+	// Successor is, for a tombstoned head, the well-formed top-level
+	// $successor of the document at Last, as written (§8.1, §6.5): a bare
+	// name, which the client resolves against this namespace, or
+	// /r/{ns}/{name}. Set only where the namespace serving the 410 is
+	// neither sealed nor e2e; elsewhere a client reads it from Last.
+	Successor string
 }
 
 // ResourceHead resolves the head pointer.
@@ -171,7 +182,11 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		if v.head != nil && v.state != Purged {
 			h.Head = v.head.id.String()
 			if v.state == Tombstoned {
-				h.Last = t.lastLive(v.head).id.String()
+				last := t.lastLive(v.head)
+				h.Last = last.id.String()
+				if t.nsLevel(n) < levelSealed {
+					h.Successor = t.successorAt(last)
+				}
 			}
 		}
 		return nil
@@ -182,6 +197,30 @@ func (e *Engine) ResourceHead(ctx context.Context, ns, name string, cred Credent
 		e.rc.putHead(g, ns, name, *h, public)
 	}
 	return h, err
+}
+
+// successorAt is the top-level $successor of the document at row, a
+// tombstone's last live revision, if it has the form of §8.1 (§6.5); ""
+// if it has none, another form, or the document can't be read. The row
+// may be a base's (read-through) or a remote base's mirror: its document
+// is read here either way. Whoever wrote the document wrote it (§8.1).
+func (t *tx) successorAt(row *revRow) string {
+	if row == nil || row.kind != kindRev {
+		return ""
+	}
+	b, err := t.docBytesAt(row)
+	if err != nil || !bytes.Contains(b, []byte(`"$successor"`)) {
+		return ""
+	}
+	doc, err := jsonv.Parse(b)
+	if err != nil {
+		return ""
+	}
+	m, _ := doc.(map[string]any)
+	if s := m["$successor"]; schema.Successor(s) {
+		return s.(string)
+	}
+	return ""
 }
 
 // Rev is the answer for GET /r/{ns}/{name}/rev/{id}.
@@ -211,15 +250,23 @@ type Rev struct {
 	// edge cookie covers the path, so an edge forwards the read undecided:
 	// it is served private, and no shared cache stores it.
 	Referrer bool
+	// Created is the revision's created time and Digest the sha-256 of
+	// Doc, the bytes served: a 200's Last-Modified and Repr-Digest (RFC
+	// 9530, §7.1). Both are set only where the namespace serving the read
+	// is neither sealed nor e2e, the e2e keyring included: sealed logs
+	// hide created (§E.2.2), and an exact digest defeats padding, so a
+	// JWE, a sealed snapshot or a keyring there carries neither.
+	Created time.Time
+	Digest  []byte
 }
 
 // ResourceRev serves the document at a revision.
 func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Credentials) (*Rev, error) {
-	if doc := e.rc.rev(ns, name, id); doc != nil {
-		return &Rev{Status: 200, Doc: doc, Public: true}, nil
+	if c := e.rc.rev(ns, name, id); c != nil {
+		return c.answer(true), nil
 	}
 	g := e.rc.load(ns)
-	public, cached := false, false
+	public, cached, plain := false, false, false
 	var out *Rev
 	var job *sealJob
 	var nsRowID int64
@@ -243,15 +290,19 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		}
 		out = &Rev{Public: t.cachePublic(n), Referrer: referrer}
 		public = t.config(n.configSeq).Read == "public"
+		// Last-Modified and Repr-Digest, judged by the namespace serving
+		// the read (§7.1): a sealed branch of a plain base sends neither.
+		plain = t.nsLevel(n) < levelSealed
 		if perr != nil {
 			out.Status = 404
 			return nil
 		}
 		// May read: a plain document is the same for every reader
-		// (readcache.go). Sealed and e2e ones are never cached.
+		// (readcache.go). Sealed and e2e content is never cached.
 		if !t.isSealedNS(n) && !t.e2eContent(n, name) {
-			if doc := e.rc.revFor(g, ns, name, id); doc != nil {
-				out.Status, out.Doc, cached = 200, doc, true
+			if c := e.rc.revFor(g, ns, name, id); c != nil {
+				out, cached = c.answer(out.Public), true
+				out.Referrer = referrer
 				return nil
 			}
 		}
@@ -268,6 +319,9 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 		if row == nil {
 			out.Status = 404
 			return nil
+		}
+		if plain {
+			out.Created = time.UnixMilli(row.created)
 		}
 		e2e := t.e2eContent(n, name)
 		if e2e {
@@ -316,6 +370,10 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 			return nil
 		}
 		out.Status, out.Doc = 200, b
+		if plain && row.size.Valid && row.size.Int64 == int64(len(b)) && len(row.digest) == sha256.Size {
+			// The digest the write stored of these bytes (headMeta).
+			out.Digest = row.digest
+		}
 		if t.isSealedNS(n) {
 			nsRowID = n.id
 			job = t.resJob(n, name, row, sealDoc, func() []byte { return b })
@@ -324,12 +382,24 @@ func (e *Engine) ResourceRev(ctx context.Context, ns, name, id string, cred Cred
 	})
 	if err == nil && job != nil {
 		if err = e.finishSeal(ctx, nsRowID, []*sealJob{job}); err == nil {
-			out.Doc, out.JWE = nil, job.jwe
+			out.Doc, out.JWE, out.Digest = nil, job.jwe, nil
 		}
 	} else if err == nil && !cached && out.Status == 200 && !out.Snapshot {
-		// A plain document (sealed ones have a job, e2e ones no document):
-		// immutable, and the same for every reader.
-		e.rc.putRev(g, ns, name, id, out.Doc, public)
+		// A plain document (sealed ones have a job, e2e content no
+		// document, and an e2e keyring is kept without its created time
+		// and digest): immutable, and the same for every reader. Hashed
+		// here unless the write stored its digest.
+		d := revDoc{doc: out.Doc, meta: plain}
+		if plain {
+			d.created = out.Created.UnixMilli()
+			if out.Digest != nil {
+				copy(d.digest[:], out.Digest)
+			} else {
+				d.digest = sha256.Sum256(out.Doc)
+			}
+			out.Digest = d.digest[:]
+		}
+		e.rc.putRev(g, ns, name, id, d, public)
 	}
 	return out, err
 }
@@ -357,7 +427,10 @@ type Log struct {
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
 // empty it serves from the current head (for long-poll and SSE). Either
 // way it answers at most limit entries after since (0: all), oldest first,
-// and sets More when the range goes on (§7.1 Paging, §7.7).
+// and sets More when the range goes on (§7.1 Paging, §7.7). A page (limit
+// > 0) also holds no more patch set bytes than logPageBytes, at E2 bytes of
+// the entries' JWEs, though always one entry; namespace logs carry no patch
+// sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
@@ -405,7 +478,23 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			}
 			sinceID = &sid
 		}
-		entries, more, err := t.logBetween(to, sinceID, limit)
+		maxBytes := 0
+		if limit > 0 {
+			maxBytes = e.opt.Maximums.LogPageBytes
+		}
+		// At E2 each entry is served as its own JWE, stored or sealed now,
+		// and a page is bounded by their lengths (logBetween).
+		sealed := t.isSealedNS(n)
+		var served func(LogEntry) int
+		if sealed {
+			served = func(le LogEntry) int {
+				j := t.resJob(n, name, le.row, sealEntry, func() []byte { return jsonv.Canonical(le.value()) })
+				t.must(j.sealNow())
+				jobs = append(jobs, j)
+				return len(j.jwe)
+			}
+		}
+		entries, more, err := t.logBetween(to, sinceID, limit, maxBytes, served)
 		if err != nil {
 			var pe *prunedError
 			switch {
@@ -424,16 +513,12 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 		// entries after it: the horizon's sealed snapshot is served as
 		// /rev/{H} (ResourceRev), never as a log entry (§7.1 Paging).
 		out.Last = since
-		sealed := t.isSealedNS(n)
 		for _, e := range entries {
-			v := e.value()
-			out.Entries = append(out.Entries, v)
+			out.Entries = append(out.Entries, e.value())
 			out.Last = e.ID
-			if sealed {
-				jobs = append(jobs, t.resJob(n, name, e.row, sealEntry, func() []byte { return jsonv.Canonical(v) }))
-			}
 		}
 		if sealed {
+			jobs = jobs[:len(entries)]
 			out.Sealed, nsRowID = true, n.id
 		}
 		return nil
@@ -749,6 +834,12 @@ func (e *Engine) namespaceLog(ctx context.Context, ns, nsID, since string, limit
 	return out, err
 }
 
+// ReprDigest is the RFC 9530 form of a sha-256 digest, sha-256=:<base64>:,
+// as /heads entries and the Repr-Digest header give it.
+func ReprDigest(sum []byte) string {
+	return "sha-256=:" + base64.StdEncoding.EncodeToString(sum) + ":"
+}
+
 // HeadsPage is a page of GET /ns/{ns}/rev/{ns_id}/heads.
 type HeadsPage struct {
 	Items  []map[string]any `json:"items"`
@@ -782,6 +873,12 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		out = &HeadsPage{Items: []map[string]any{}, Public: t.cachePublic(n)}
 		page, next := t.pageHeads(n, &seq, after, e.opt.Maximums.LogPageSize)
 		out.Next = next
+		// created, size and digest show what sealed and e2e namespaces
+		// hide: created times, which their logs seal, lengths, which their
+		// padding exists for, and a hash of content (§7.4, §E.2.2). Judged
+		// by the namespace serving the page when it is listed, so pages at
+		// ns_ids from before a raise to sealed list none either.
+		plain := t.nsLevel(n) < levelSealed
 		for _, h := range page {
 			kind := "head"
 			switch h.state {
@@ -793,6 +890,19 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			item := map[string]any{"resource": h.name, "kind": kind}
 			if h.row != nil {
 				item["target"] = h.row.id.String()
+			}
+			// created, the target's created time as log entries give it,
+			// but not a purged one's, which a remote branch's mirror
+			// doesn't know; and a live head's document's size and digest,
+			// as GET …/rev/{target} serves it uncoded, where the write
+			// stored them (headMeta). A pruned head keeps them, as it
+			// keeps its target.
+			if plain && h.row != nil && h.state != Purged {
+				item["created"] = formatTime(h.row.created)
+				if h.state == Live && h.row.size.Valid && len(h.row.digest) == sha256.Size {
+					item["size"] = float64(h.row.size.Int64)
+					item["digest"] = ReprDigest(h.row.digest)
+				}
 			}
 			out.Items = append(out.Items, item)
 		}

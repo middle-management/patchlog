@@ -149,6 +149,7 @@ func serve(args []string) {
 	maxBlobSize := fs.String("max-blob-size", "", "deployment maximum blob size, e.g. \"1 GiB\" (default: the namespace default, 64 MiB; §7.8)")
 	maxBlobPending := fs.String("max-blob-pending", "", "deployment maximum bytes of pending blobs per uploader and namespace, e.g. \"16 GiB\" (default: the namespace default, 256 MiB); allowances may go up to it (§6.6)")
 	logPageSize := fs.Int("log-page-size", 0, "log page size (§6.6, deployment only): a log range answers at most this many entries a page, with X-Log-Next naming the next page's since (§7.1); long-poll answers and /heads pages are as long (default 1000)")
+	logPageBytes := fs.String("log-page-bytes", "", "bytes of patch sets per resource log page (§6.6 logPageBytes, deployment only), e.g. \"16 MiB\" (the default): a resource log range, long-poll answer or event-stream catch-up page ends before an entry that would take it past, though it always holds one (§7.1, §7.7)")
 	exchangeRate := fs.String("exchange-rate", "", "edge-grant exchanges per principal (§6.6, §C.5, deployment only), as RATE,BURST, e.g. 10,100 (the default): each POST /edge-grants draws one token from the bucket of each principal whose grants it carries, and none from their write buckets")
 	var opKeys multi
 	fs.Var(&opKeys, "operator-key", "base64url Ed25519 public key allowed to create namespaces (repeatable; kid is \"operator\", \"operator-2\", …)")
@@ -181,7 +182,7 @@ func serve(args []string) {
 	edgePrefixHeader := fs.String("edge-prefix-header", edge.DefaultPrefixHeader, edgePrefixHeaderUsage)
 	var edgeGrantKeys multi
 	fs.Var(&edgeGrantKeys, "edge-grant-key", "[KID=]FILE: a file holding a key edge-grant cookies of POST /edge-grants are signed with, named KID (a plain FILE takes -edge-grant-kid) (§C.5); a FILE with '=' before any '/' is given as KID=FILE or ./FILE; repeatable, to rotate keys: cookies under any are accepted, and the last given signs new ones. Without it, a random key per process, so cookies don't survive a restart, reach another instance or verify at an edge: an edge verifying cookies needs key files. FILE "+edgeSecretKey+" is the key derived from -edge-secret, for migrating to key files only: every holder of the edge secret, services included, can derive it and mint cookies with it")
-	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key given as a plain -edge-grant-key FILE, or of the random one without -edge-grant-key, which the cookies carry and a verifying edge looks the key up by (§C.5 \"Format\")")
+	edgeGrantKid := fs.String("edge-grant-kid", edge.DefaultKid, "the name (kid) of the edge-grant key given as a plain -edge-grant-key FILE, or of the random one without -edge-grant-key, which the cookies carry and a verifying edge looks the key up by (§C.5.3)")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)
@@ -233,6 +234,16 @@ func serve(args []string) {
 	}
 	if *logPageSize > 0 {
 		max.LogPageSize = *logPageSize
+	}
+	if *logPageBytes != "" {
+		n, err := core.ParseSize(*logPageBytes)
+		if err == nil && n <= 0 {
+			err = errors.New("must be positive")
+		}
+		if err != nil {
+			log.Fatalf("-log-page-bytes: %v", err)
+		}
+		max.LogPageBytes = n
 	}
 	if *exchangeRate != "" {
 		r, err := parseRate(*exchangeRate)
@@ -449,7 +460,7 @@ func parseRate(s string) (core.Rate, error) {
 // edgeSecretKey, as the FILE of the origin's -edge-grant-key, is the key
 // derived from -edge-secret (edge.KeyFromSecret), for migrating a
 // deployment that minted under it to key files without making clients
-// exchange again (§C.5 "Format"). Every holder of the edge secret can
+// exchange again (§C.5.3). Every holder of the edge secret can
 // derive it, the services that take -edge-secret for their own edge
 // lifetimes included, and mint core cookies with it, so the origin holds
 // it only when named so. A file of that name is given as ./edge-secret.
@@ -525,7 +536,7 @@ func cookiesOf(keys []edgeGrantKey, c *corsFlags) (*edge.Cookies, error) {
 
 // edgeGrantCookies returns the edge-grant cookies of POST /edge-grants
 // (§C.5): under the -edge-grant-key flags (readEdgeGrantKeys), minting
-// with the last and accepting all, so keys rotate (§C.5 "Format");
+// with the last and accepting all, so keys rotate (§C.5.3);
 // without one, under a random key of this process, named kid, which no
 // edge can verify. It never falls back on the key derived from the edge
 // secret, which every service holding the secret could derive too:

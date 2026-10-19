@@ -231,14 +231,19 @@ type revRow struct {
 	// gesture and undoes are the gesture ids it was written with (§7.2),
 	// metadata outside its id that pruning keeps (§8.6).
 	gesture, undoes sql.NullString
+	// size and digest are the length and sha-256 of the canonical document
+	// of a revision a write left as a head (headMeta), which /heads lists;
+	// NULL for any other row, and for rows from before them.
+	size   sql.NullInt64
+	digest []byte
 }
 
-const revCols = `seq, res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, created, gesture, undoes`
+const revCols = `seq, res, id, parent_seq, first, kind, patches, author, via, grant_id, signature, created, gesture, undoes, size, digest`
 
 func scanRev(row interface{ Scan(...any) error }) (*revRow, error) {
 	r := &revRow{}
 	var id []byte
-	err := row.Scan(&r.seq, &r.res, &id, &r.parentSeq, &r.first, &r.kind, &r.patches, &r.author, &r.via, &r.grantID, &r.signature, &r.created, &r.gesture, &r.undoes)
+	err := row.Scan(&r.seq, &r.res, &id, &r.parentSeq, &r.first, &r.kind, &r.patches, &r.author, &r.via, &r.grantID, &r.signature, &r.created, &r.gesture, &r.undoes, &r.size, &r.digest)
 	r.id = ids.FromBytes(id)
 	return r, err
 }
@@ -576,7 +581,8 @@ type LogEntry struct {
 	Gesture string `json:"gesture,omitempty"`
 	Undoes  string `json:"undoes,omitempty"`
 
-	row *revRow // the entry's row (sealing, sealed.go)
+	row  *revRow // the entry's row (sealing, sealed.go)
+	size int     // its patch set's bytes as served (logPageBytes, logBetween)
 }
 
 func (e LogEntry) value() map[string]any {
@@ -612,7 +618,8 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 	} else {
 		e.Kind = "rev"
 		if r.patches.Valid { // NULL below a horizon (§8.6)
-			e.Patches = jsonv.MustParse(t.patchesOf(r))
+			b := t.patchesOf(r)
+			e.Patches, e.size = jsonv.MustParse(b), len(b)
 		}
 	}
 	if r.grantID != nil {
@@ -627,10 +634,15 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 
 // logBetween returns the entries after since (exclusive; nil = from the
 // first entry) up to to (inclusive), oldest first: with limit > 0 only the
-// oldest limit of them, more reporting that the range goes on (a page,
-// §7.1). A since that isn't an ancestor of to is errNotAncestor. A pruned
-// entry anywhere in the range is a prunedError, so every page of a range
-// answers alike.
+// oldest limit of them, and with maxBytes > 0 only as many as their patch
+// sets fit in, as served (decompressed, decrypted at rest; the sealed op
+// at E3), though always one, more reporting that the range goes on (a
+// page, §7.1 Paging, logPageBytes). served, if not nil, measures an entry
+// instead: at E2 its JWE, so a page ends where the bytes served say and
+// padding hides where exact sizes would end it (§E.2.2). It is called in
+// order, for the entries returned and at most one more. A since that
+// isn't an ancestor of to is errNotAncestor. A pruned entry anywhere in
+// the range is a prunedError, so every page of a range answers alike.
 //
 // A page costs its own rows, whatever the range's length (§7.1 Paging): a
 // resource's chain is its rows in seq order (one first row, one child per
@@ -638,7 +650,7 @@ func (t *tx) logEntry(r *revRow) LogEntry {
 // oldest first and only as far as the page goes, and the pruning check
 // looks only below horizons (prunedIn). Walking the parent links from to
 // instead read the whole rest of the range for every page.
-func (t *tx) logBetween(to *revRow, since *ids.ID, limit int) (entries []LogEntry, more bool, err error) {
+func (t *tx) logBetween(to *revRow, since *ids.ID, limit, maxBytes int, served func(LogEntry) int) (entries []LogEntry, more bool, err error) {
 	segs := t.ancestry(to)
 	// The range is (lo, max] of the oldest segment it reaches, segs[k],
 	// and the whole of the newer ones. Ids and parent links survive
@@ -663,7 +675,17 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit int) (entries []LogEntr
 		return nil, false, err
 	}
 	var rows []*revRow
-	for i := k; i >= 0 && (limit <= 0 || len(rows) < limit); i-- {
+	// The scan stops once the rows' patch sets are sure to exceed
+	// maxBytes (servedAtLeast), so a page of large ones doesn't load the
+	// rest of limit; the page is cut exactly below, once they are opened.
+	// A JWE is no shorter than the patch set it holds unless compressed,
+	// which a padded one never is (§E.2.2), so at E2 only an unpadded
+	// page can end sooner than its JWEs would.
+	scanned := 0
+	full := func() bool {
+		return limit > 0 && len(rows) >= limit || maxBytes > 0 && scanned > maxBytes
+	}
+	for i := k; i >= 0 && !full(); i-- {
 		from := int64(0)
 		if i == k {
 			from = lo
@@ -676,10 +698,11 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit int) (entries []LogEntr
 		}
 		rs, err := t.Query(q, args...)
 		t.must(err)
-		for rs.Next() {
+		for !full() && rs.Next() {
 			r, err := scanRev(rs)
 			t.must(err)
 			rows = append(rows, r)
+			scanned += servedAtLeast(r)
 		}
 		t.must(rs.Err())
 		rs.Close()
@@ -699,12 +722,46 @@ func (t *tx) logBetween(to *revRow, since *ids.ID, limit int) (entries []LogEntr
 		prev = r.seq
 		t.knowRevID(r.seq, r.id)
 	}
-	more = len(rows) > 0 && rows[len(rows)-1].seq != to.seq
 	out := make([]LogEntry, 0, len(rows))
+	size := 0
 	for _, r := range rows {
-		out = append(out, t.logEntry(r))
+		e := t.logEntry(r)
+		n := e.size
+		if served != nil {
+			n = served(e)
+		}
+		if size += n; maxBytes > 0 && len(out) > 0 && size > maxBytes {
+			break
+		}
+		out = append(out, e)
 	}
+	rows = rows[:len(out)]
+	more = len(rows) > 0 && rows[len(rows)-1].seq != to.seq
 	return out, more, nil
+}
+
+// servedAtLeast is a lower bound of the bytes of r's patch set as served,
+// from what is stored, without opening it: plaintext is served as stored;
+// a compressed row as its frame's content size, or, where a small frame
+// doesn't say, its length less the most a zstd frame adds to what it holds
+// (raw blocks: the marker, frame header and checksum, and 3 bytes a
+// block); and an encrypted row's plaintext, canonical JSON (compress.go),
+// as its length less the version byte, nonce and tag (sealRow).
+func servedAtLeast(r *revRow) int {
+	if !r.patches.Valid {
+		return 0
+	}
+	raw := r.patches.String
+	switch {
+	case isSealed(raw):
+		return max(0, len(raw)-rowOverhead)
+	case isPacked([]byte(raw[:min(len(raw), 1)])):
+		if n := packedLen([]byte(raw[:min(len(raw), 19)])); n >= 0 {
+			return int(n)
+		}
+		return max(0, len(raw)-1-18-4-3*(len(raw)/(128<<10)+1))
+	}
+	return len(raw)
 }
 
 // prunedIn reports a range's newest pruned entry (§8.6) as a prunedError,

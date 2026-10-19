@@ -75,8 +75,9 @@ type Node struct {
 	// Placements.
 	ItemNS, ItemName string // "" if the name doesn't split into a valid item
 	ItemState        int
-	ItemHead         string // last known head revision of a live item
-	ItemTitle        string // the string at the catalog's title pointer in that head (§B.5), "" if none
+	ItemHead         string    // last known head revision of a live item
+	ItemTitle        string    // the string at the catalog's title pointer in that head (§B.5), "" if none
+	ItemFile         *FileMeta // the head's file metadata in a file tree (§H.3), nil if none
 
 	// Derived by analyze.
 	State      int    // StateLive or StateDangling
@@ -142,6 +143,9 @@ type Graph struct {
 	// not a valid JSON Pointer (then it is ignored).
 	TitlePtr pointer.Pointer
 	HasTitle bool
+	// Files is set when catalog.files makes the catalog a file tree
+	// (§H.2): placements then carry their item's file metadata (§H.3).
+	Files bool
 	// Content is each followed content namespace's document as of the
 	// checkpoint the service reflects for it, so what depends on roles and
 	// keys is pinned to the combined checkpoint (§B.11.5).
@@ -362,11 +366,17 @@ func (g *Graph) refresh(name string) {
 	}
 }
 
+// copyItem gives n what from holds of its item: state, head, title and
+// file metadata.
+func (n *Node) copyItem(from *Node) {
+	n.ItemState, n.ItemHead, n.ItemTitle, n.ItemFile = from.ItemState, from.ItemHead, from.ItemTitle, from.ItemFile
+}
+
 func (g *Graph) setExplicit(n *Node) {
 	if old := g.explicit[n.Name]; old != nil {
-		n.ItemState, n.ItemHead, n.ItemTitle = old.ItemState, old.ItemHead, old.ItemTitle
+		n.copyItem(old)
 	} else if s := g.self[n.Name]; s != nil {
-		n.ItemState, n.ItemHead, n.ItemTitle = s.ItemState, s.ItemHead, s.ItemTitle
+		n.copyItem(s)
 	}
 	g.explicit[n.Name] = n
 	g.refresh(n.Name)
@@ -379,7 +389,7 @@ func (g *Graph) removeExplicit(name string) {
 
 func (g *Graph) setSelf(n *Node) {
 	if e := g.explicit[n.Name]; e != nil {
-		n.ItemState, n.ItemHead, n.ItemTitle = e.ItemState, e.ItemHead, e.ItemTitle
+		n.copyItem(e)
 	}
 	g.self[n.Name] = n
 	g.refresh(n.Name)
@@ -390,13 +400,13 @@ func (g *Graph) removeSelf(name string) {
 	g.refresh(name)
 }
 
-// setItem records an item's state on the explicit and implicit placement
-// for it, if any; it reports whether a node exists.
-func (g *Graph) setItem(name string, state int, head, title string) bool {
+// setItem records what the service holds of an item on the explicit and
+// implicit placement for it, if any; it reports whether a node exists.
+func (g *Graph) setItem(name string, it itemData) bool {
 	found := false
 	for _, n := range []*Node{g.explicit[name], g.self[name]} {
 		if n != nil {
-			n.ItemState, n.ItemHead, n.ItemTitle = state, head, title
+			n.ItemState, n.ItemHead, n.ItemTitle, n.ItemFile = it.state, it.head, it.title, it.file
 			found = true
 		}
 	}

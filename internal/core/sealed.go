@@ -301,6 +301,22 @@ type sealJob struct {
 	plain     []byte
 	pad       bool   // the namespace pads (§E.2.2)
 	jwe       string // the stored value once known
+	fresh     bool   // jwe was sealed by sealNow and isn't stored yet
+}
+
+// sealNow seals a job not stored yet, so the length of what will be
+// served is known before finishSeal stores it (a sealed resource log
+// page's logPageBytes, ResourceLog).
+func (j *sealJob) sealNow() error {
+	if j.jwe != "" {
+		return nil
+	}
+	s, err := seal.SealMaybePadded(j.k, j.kid, j.pl, j.plain, j.pad)
+	if err != nil {
+		return err
+	}
+	j.jwe, j.fresh = s, true
+	return nil
 }
 
 // stored looks a job up in the sealed table.
@@ -369,14 +385,12 @@ func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain fu
 func (e *Engine) finishSeal(ctx context.Context, ns int64, jobs []*sealJob) error {
 	var todo []*sealJob
 	for _, j := range jobs {
-		if j == nil || j.jwe != "" {
+		if j == nil || j.jwe != "" && !j.fresh {
 			continue
 		}
-		s, err := seal.SealMaybePadded(j.k, j.kid, j.pl, j.plain, j.pad)
-		if err != nil {
+		if err := j.sealNow(); err != nil {
 			return err
 		}
-		j.jwe = s
 		todo = append(todo, j)
 	}
 	if len(todo) == 0 {
@@ -448,7 +462,7 @@ type KeysAnswer struct {
 
 // Keys answers POST /ns/{ns}/keys. It needs a verified grant with read on
 // the namespace (with authentication disabled, anyone gets raw epoch keys).
-// A grant that reads the namespace unrestricted (§C.5: with roles, through
+// A grant that reads the namespace unrestricted (§2.1: with roles, through
 // one without /resource rules that passes) gets K_e; one restricted by
 // rules on /resource or a key with readScope "resource" gets K_r for each
 // requested resource it may read; any other is 403. Epochs run from the
@@ -502,7 +516,7 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			return nil
 		}
 		if refused {
-			return forbidden("epoch keys need unrestricted read on the namespace (§C.5, §E.2.3)")
+			return forbidden("epoch keys need unrestricted read on the namespace (§2.1, §E.2.3)")
 		}
 		if n.purged {
 			return t.purgedNS(n)

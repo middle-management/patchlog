@@ -111,6 +111,21 @@ func TestFindRefsWith(t *testing.T) {
 			want:   []string{`/d a/b rev="" entry="" key="" pinned=false`},
 		},
 		{
+			// §6.5: the walk uses the instance of §6.2 step 5, so a
+			// well-formed top-level $successor (§8.1) isn't a reference;
+			// one of another form is data, walked like any member.
+			name:   "$successor left out",
+			schema: `{"additionalProperties":{"x-ref":{}}}`,
+			doc:    `{"$successor":"/r/a/moved","$nonce":"abcdefghijklmnopqrstuvwxyz","d":"/r/a/b","e":{"$successor":"/r/a/c"}}`,
+			want:   []string{`/d a/b rev="" entry="" key="" pinned=false`},
+		},
+		{
+			name:   "$successor of another form is data",
+			schema: `{"additionalProperties":{"x-ref":{}}}`,
+			doc:    `{"$successor":"/r/a/b#e"}`,
+			want:   []string{`/$successor a/b rev="" entry="e" key="" pinned=false`},
+		},
+		{
 			name:   "cycle without instance progress",
 			schema: `{"$defs":{"a":{"$ref":"#/$defs/b","x-ref":{}},"b":{"$ref":"#/$defs/a"}},"$ref":"#/$defs/a"}`,
 			doc:    `"/r/a/b"`,

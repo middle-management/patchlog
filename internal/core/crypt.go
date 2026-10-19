@@ -167,6 +167,10 @@ func newGCM(key []byte) cipher.AEAD {
 	return aead
 }
 
+// rowOverhead is what sealRow adds to a value: the version byte, the GCM
+// nonce and its tag.
+const rowOverhead = 1 + 12 + 16
+
 // sealRow encrypts a stored value (row format above).
 func sealRow(dek, aad, plain []byte) []byte {
 	aead := newGCM(dek)

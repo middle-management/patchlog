@@ -125,10 +125,10 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 	p.id = ids.Revision(&curID, p.canon)
 	// Step 4.
 	if len(p.canon) > cur.Limits.PatchSetSize {
-		return nil, limitErr(413, "patch set too large")
+		return nil, limitErr(413, "patchSetSize", int64(len(p.canon)), int64(cur.Limits.PatchSetSize), "patch set too large")
 	}
-	if len(jsonv.Canonical(newDoc)) > cur.Limits.DocumentSize {
-		return nil, limitErr(413, "document too large")
+	if n := len(jsonv.Canonical(newDoc)); n > cur.Limits.DocumentSize {
+		return nil, limitErr(413, "documentSize", int64(n), int64(cur.Limits.DocumentSize), "document too large")
 	}
 	// Step 5: the built-in namespace-document schema and branch fields.
 	cfg, verr := t.validateConfig(n, cur, newDoc, writes, a)
@@ -176,6 +176,11 @@ func freezeOnly(writes []string, doc any) bool {
 // document, so a member refused because the branch inherits it says so.
 func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error) {
 	cfg, err := e.parseConfig(doc)
+	if err == nil && len(cfg.Rules) > cfg.Limits.RulesPerNS && rulesOrBoundChanged(cfg.Doc, prev) {
+		// The document's own rulesPerNamespace, which parseConfig, reading
+		// stored documents too, doesn't hold them to (§6.6).
+		err = sizeLimit("rulesPerNamespace", len(cfg.Rules), cfg.Limits.RulesPerNS, fmt.Sprintf("more than %d rules", cfg.Limits.RulesPerNS))
+	}
 	if err == nil {
 		err = checkMembers(cfg.Doc, prev)
 	}
@@ -191,6 +196,21 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 	return cfg, nil
 }
 
+// rulesOrBoundChanged reports whether doc changes its rules or its own
+// rulesPerNamespace from prev (nil for a new namespace): the writes that
+// bound holds (§6.6). A document an earlier release stored over it, which
+// checked only the deployment's maximum, takes any other write, a freeze
+// among them, as members stored under an earlier version are kept until
+// they are changed (§7.4).
+func rulesOrBoundChanged(doc, prev map[string]any) bool {
+	if prev == nil {
+		return true
+	}
+	dl, _ := doc["limits"].(map[string]any)
+	pl, _ := prev["limits"].(map[string]any)
+	return !jsonv.Equal(doc["rules"], prev["rules"]) || !jsonv.Equal(dl["rulesPerNamespace"], pl["rulesPerNamespace"])
+}
+
 // configErr is the 422 for a namespace document that fails its schema: a
 // limit has code "limit"; anything else is code "invalid" with
 // errors: [{ "pointer", "message" }], as for schema validation (§7.4,
@@ -200,7 +220,7 @@ func configErr(err error) *Error {
 	var me *memberError
 	switch {
 	case errors.As(err, &le):
-		return limitErr(422, le.msg)
+		return le.err()
 	case errors.As(err, &me):
 		return docInvalid(me.pointer, me.Error())
 	}
@@ -306,8 +326,8 @@ func (t *tx) validateConfig(n *nsRow, cur *Config, newDoc any, writes []string, 
 			// Unfreezing makes the branch live again, which counts against
 			// its base's branchesPerNamespace as creating one does (§6.6,
 			// §8.4).
-			if t.liveBranches(base, n) >= t.config(base.configSeq).Limits.BranchesPerNamespace {
-				return nil, limitErr(422, "too many live branches: the base already has branchesPerNamespace live branches (§6.6, §8.4)")
+			if live, max := t.liveBranches(base, n), t.config(base.configSeq).Limits.BranchesPerNamespace; live >= max {
+				return nil, limitErr(422, "branchesPerNamespace", int64(live+1), int64(max), "too many live branches: the base already has branchesPerNamespace live branches (§6.6, §8.4)")
 			}
 		}
 	}
@@ -389,11 +409,15 @@ func (t *tx) insertConfig(n *nsRow, p *configPlan, author int64) int64 {
 	// A sealed namespace's epoch key starts with the config write that
 	// begins its epoch (§E.2.1).
 	t.sealedConfigWritten(n, old, p.cfg)
-	if old.cachePublic() && !p.cfg.cachePublic() {
+	if old.cachePublic() && !p.cfg.cachePublic() || old.level < levelSealed && p.cfg.level >= levelSealed {
 		// Public copies at the edge must go (§9); every response of the
 		// namespace carries ns:{ns}. Its branches can't be public now
 		// (planConfig refuses while they are, sealed pairs aside, which
-		// keep serving ciphertext under their own tags).
+		// keep serving ciphertext under their own tags). So must, on a
+		// raise to sealed, whatever the read setting, the /heads pages
+		// listing created, size and digest and the revisions sent with
+		// Last-Modified and Repr-Digest (§7.1, §7.4), which the level now
+		// hides. A level is never lowered, and e2e only at creation.
 		t.tags = append(t.tags, "ns:"+n.name)
 	}
 	return seq
@@ -573,7 +597,7 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		return nil, err
 	}
 	if !t.readsNS(base, bcfg, a, true) {
-		return nil, forbidden("branching needs unrestricted read on the base (§C.5)")
+		return nil, forbidden("branching needs unrestricted read on the base (§2.1)")
 	}
 	if err := t.rateLimit(base, bcfg, a, nil, 1); err != nil {
 		return nil, err
@@ -649,13 +673,13 @@ func (t *tx) createBranch(req Request, br BranchRequest) (*WriteResult, *Error) 
 		depth++
 	}
 	if depth > t.e.opt.Maximums.BranchDepth {
-		return nil, limitErr(422, "branch depth exceeded")
+		return nil, limitErr(422, "branchDepth", int64(depth), int64(t.e.opt.Maximums.BranchDepth), "branch depth exceeded")
 	}
 	// Live branches only (§6.6): merged or superseded branches are frozen,
 	// not live (§F.6), and don't count, so branches kept for review after
 	// their merge don't block new ones.
-	if t.liveBranches(base, nil) >= bcfg.Limits.BranchesPerNamespace {
-		return nil, limitErr(422, "too many live branches")
+	if live := t.liveBranches(base, nil); live >= bcfg.Limits.BranchesPerNamespace {
+		return nil, limitErr(422, "branchesPerNamespace", int64(live+1), int64(bcfg.Limits.BranchesPerNamespace), "too many live branches")
 	}
 	// Step 5. The document starts as the base's, so the members this
 	// version defines that it holds unchanged are judged as there; any
@@ -871,7 +895,8 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 			// Destroying the data key makes whatever survives of the
 			// rows and archives unreadable (§8.3, §E.1).
 			t.deleteDEKs(`res = ?`, res)
-			_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ?`, res)
+			// The documents' sizes and digests go with them (headMeta).
+			_, err := t.Exec(`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res = ?`, res)
 			t.must(err)
 			_, err = t.Exec(`UPDATE resources SET state = ?, keep = NULL WHERE res = ?`, statePurged, res)
 			t.must(err)
@@ -891,7 +916,10 @@ func (t *tx) purgeResource(n *nsRow, name string, author int64, forced bool) ids
 			entry["forced"] = true
 		}
 		_, nsID = t.appendNS(n, entry, &res, &target, n.configSeq, author)
-		t.tags = append(t.tags, "r:"+n.name+"/"+name)
+		// And the /heads pages, which list a head's document's size and
+		// digest (NamespaceHeads): every branch the purge reaches purges
+		// its own.
+		t.tags = append(t.tags, "r:"+n.name+"/"+name, "heads:"+n.name)
 		t.flushDocs = true
 	}
 	// Sealed copies of its content go too (§E.2.2).
@@ -974,7 +1002,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		t.deleteSealed(`ns = ?`, n.id)
 		t.deleteBlobEpochs(`ns = ?`, n.id)
 		t.deleteEpochKeys(n.id)
-		_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
+		_, err := t.Exec(`UPDATE revisions SET patches = NULL, size = NULL, digest = NULL WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
 		_, err = t.Exec(`DELETE FROM heads WHERE res IN (SELECT res FROM resources WHERE ns = ?)`, n.id)
 		t.must(err)
@@ -1067,7 +1095,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			return invalid("horizon must be an ancestor of the head")
 		}
 		if len(pr.Keep) > cfg.Limits.KeepPerResource {
-			return limitErr(422, "too many kept revisions")
+			return limitErr(422, "keepPerResource", int64(len(pr.Keep)), int64(cfg.Limits.KeepPerResource), "too many kept revisions")
 		}
 		e2e := t.e2eContent(n, name)
 		switch {
@@ -1244,6 +1272,9 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 		epochs = t.resourceBlobEpochs(n, own)
 	}
 	t.pruneBlobs(own.id, h.seq, kept)
+	// Only patch sets go: ids, created times, gestures and a head's size
+	// and digest (headMeta) are metadata the rows keep, so /heads at an
+	// earlier ns_id lists a pruned head as it did.
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
 	// Below the horizon only the documents kept above survive:

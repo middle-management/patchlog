@@ -901,22 +901,31 @@ func (c *Client) keysLevel(ctx context.Context, ns string) (level string, learn 
 }
 
 // undoLimits reads opsPerSet and patchSetSize from the namespace document
-// (§6.6), with the defaults when it doesn't say or can't be read, and
-// whether patch sets add a fresh $nonce: it requires nonces, or it can't
-// be read (§C.7, NeedsNonce).
+// (§6.6), with the defaults when it doesn't say, and whether patch sets
+// add a fresh $nonce: it requires nonces, or it can't be read (§C.7,
+// NeedsNonce). A grant that can't read the document asks GET
+// /ns/{ns}/principal for the limits in force (§7.4, §11.2); where that
+// fails too, as on a server before v0.55, the defaults hold.
 func (c *Client) undoLimits(ctx context.Context, ns string, cfg *undoConfig) (ops, size int, nonces bool) {
 	ops, size, nonces = 1000, 256<<10, true
+	var lim map[string]any
+	read := false
 	if h, err := c.NSHead(ctx, ns); err == nil {
 		if d, err := c.NSDoc(ctx, ns, h.ID); err == nil {
-			nonces = d.Value["nonce"] == "required"
-			lim, _ := d.Value["limits"].(map[string]any)
-			if n, ok := lim["opsPerSet"].(float64); ok && n >= 2 {
-				ops = int(n)
-			}
-			if n, ok := lim["patchSetSize"].(float64); ok && n >= 1024 {
-				size = int(n)
-			}
+			nonces, read = d.Value["nonce"] == "required", true
+			lim, _ = d.Value["limits"].(map[string]any)
 		}
+	}
+	if !read {
+		if p, err := c.NSPrincipal(ctx, ns); err == nil {
+			lim = p.Writer.Limits
+		}
+	}
+	if n, ok := lim["opsPerSet"].(float64); ok && n >= 2 {
+		ops = int(n)
+	}
+	if n, ok := lim["patchSetSize"].(float64); ok && n >= 1024 {
+		size = int(n)
 	}
 	if cfg.maxOps > 0 {
 		ops = cfg.maxOps

@@ -888,10 +888,10 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 // checkSize is check 5 for a body of size bytes.
 func (g *blobGate) checkSize(size int64) *Error {
 	if size > g.maxSize {
-		return limitErr(413, fmt.Sprintf("a blob is larger than blobSize (%d bytes)", g.maxSize))
+		return limitErr(413, "blobSize", size, g.maxSize, fmt.Sprintf("a blob is larger than blobSize (%d bytes)", g.maxSize))
 	}
-	if g.pendUsed+max(size, pendingMin) > g.pendMax {
-		return limitErr(413, fmt.Sprintf("the uploader's pending blobs would exceed blobPending (%d bytes)", g.pendMax))
+	if n := g.pendUsed + max(size, pendingMin); n > g.pendMax {
+		return limitErr(413, "blobPending", n, g.pendMax, fmt.Sprintf("the uploader's pending blobs would exceed blobPending (%d bytes)", g.pendMax))
 	}
 	return nil
 }

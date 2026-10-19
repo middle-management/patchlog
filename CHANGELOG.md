@@ -2,7 +2,135 @@
 
 ## Unreleased
 
+Implements spec **v0.55**. v0.53 restructures the text with no change in behaviour (terms
+defined once in §2.1, a purged namespace's answers in one table, edge grants split into
+§C.5.2–§C.5.4); v0.54 serves file-style and sync clients, from the reference's notes 13–19:
+what this branch had added beyond v0.52 for them is now specified, outside E2 and E3 only, and
+raw documents, moves, whole-document appends and `logPageBytes` are new; v0.55 adds Addendum
+H, files, from the reference's WebDAV gateway, and in the core `GET /ns/{ns}/principal`, limit
+refusals that name the limit and the sizes, and `catalog.files`, with file metadata in the tree
+service's listings.
+
+**Changes to check before upgrading:**
+- **New columns `revisions.size` and `revisions.digest`**, added on the first start on SQLite and
+  Postgres (nullable, no default: instant on Postgres; nothing is backfilled). They take about 40
+  bytes per revision a write leaves as a head outside sealed and e2e namespaces, in the clear in
+  encrypted-at-rest ones too, as ids are: a backup lets a guess of a head's document without a
+  `$nonce` be confirmed against its digest, even after a purge (§C.7). Heads written before
+  the upgrade, or by an older instance during a rolling one, are listed without `size` and
+  `digest` until written again; a purge by an older instance leaves the columns and doesn't
+  purge cached `/heads` pages (the README gives the SQL to clear them). Responses cached before
+  the upgrade lack the new fields and headers, so clients treat all of them as optional (§7.4).
+- **A config write that raises a namespace to sealed purges `ns:{ns}`** (§9), public or
+  private, as making it private does; and **a resource purge also purges `heads:{ns}`**, a new
+  tag on `/heads` pages, in every namespace it reaches, besides `r:{ns}/{name}` (the
+  reference's own; §8.3 doesn't require it).
+- **Resource log pages are also bounded by `logPageBytes`** (§6.6, deployment only, default
+  16 MiB, `serve -log-page-bytes`): ranges, long-polls and event-stream catch-up of large patch
+  sets come in more, shorter pages, each with `X-Log-Next` as before; in a sealed namespace the
+  bound counts the entries' JWEs, so with `pad` a page ends where padded sizes say (§E.2.2). A
+  namespace document setting `limits.logPageBytes` is `422`.
+- **Blob responses carry `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox`** (§7.8), errors and the sealed `302` included: an HTML or
+  SVG blob no longer runs as a page on the API's origin, and browsers no longer sniff a type
+  other than the uploaded one. Images and text still display inline, but Chromium shows a
+  sandboxed PDF as a blank page: download PDFs, or show them with a viewer on another origin.
+- **Appends and restores that overwrite the root may be as large as `documentSize`** (§6.6):
+  one whose first operation other than `test` is a root `replace` or `add`. Such an append was
+  `413` above `patchSetSize`, and a restore got `documentSize` only when its very first
+  operation was a root `replace`.
+- **A top-level `$successor` of the §8.1 form is left out of validation** (§6.2 step 5), the
+  index's `x-index` and `x-ref` walks and the bundle closure, as `$schema` and a fresh `$nonce`
+  are: closed schemas accept it, and walks that found it as a reference no longer do.
+- **Verification applies a key's `readScope: "resource"`** (§C.2 item 1, §C.4, v0.55): a `read`
+  grant such a key signs whose rules don't fix `/resource` (§2.1) is refused on every request,
+  `403` (`404` on a read of a private namespace, as any refusal there). It used to verify, and
+  read every resource. Edge-grant issuance refused it already. `grant.Verify` applies it, so the
+  tree, catalog and index services (`grantcheck`) refuse it too: the tree service listed heads
+  and file metadata of a private namespace's items to it.
+- **A namespace's own `rulesPerGrant`, `grantSize` and `rulesPerNamespace` are enforced**
+  (§6.6): a grant chain over the namespace's `rulesPerGrant` is `422`, a bearer over its
+  `grantSize` `413`, and a namespace creation or a config write that changes the rules or
+  `limits.rulesPerNamespace`, whose document has more rules than its own `rulesPerNamespace`,
+  `422`; only the deployment maximums were. Stored documents are read as before, and one stored
+  over its own `rulesPerNamespace` takes other config writes, freezes included.
+- **Limit refusals carry `limit`, `measured` and `max`** (§6.6, §12, v0.55), batch items' reports
+  too; the bodies of `POST …/prune` and `POST /ns/{ns}/keys`, which no limit of §6.6 covers, are
+  `400 bad_input` above 1 MiB, and so is a `POST /edge-grants` body over room for 50 grants
+  (§12: an exchange over its limits), all three `413 limit` before.
+- **The tree service's `items` table gains `created` and `file` columns**, added on the first
+  start (nullable). In a file tree (`catalog.files`, §H.2) the service reads every head of its
+  trusted namespaces as it applies it, sealed ones with keys, to give placements file metadata;
+  on the first start with a file tree it reads every live item's head once (meta `filed`,
+  retried until every head is read) and purges the catalog's cached listings. While a sealed
+  namespace's epoch key can't be had for the moment, its listings are `503` with `Retry-After`.
+- **Undo by a writer that can't read the namespace document asks `GET /ns/{ns}/principal`**
+  (§11.2) for the namespace's `opsPerSet` and `patchSetSize`, and splits inverses by them rather
+  than by §6.6's defaults; against a server before v0.55, which answers `404` there, the
+  defaults hold as before. Such writers still add a fresh `$nonce` in private namespaces
+  (`client.NeedsNonce`), as §C.7 recommends for one that doesn't ask.
+- `GET /` answers `"spec": "0.55"`.
+
+**New:**
+- **`GET /ns/{ns}/principal`** (§7.4, v0.55; README design notes): what the grant in
+  `Authorization` is in a namespace, `{ principal, kid, can, roles }`, and what a writer needs
+  from the namespace document, `writer: { frozen, successor?, nonce, signatures, level?, limits
+  }`, the limits in force as §6.6 writes them, with `X-Config-Revision`. Only the `ns` check and
+  verification apply, so a grant limited to some resources or without `read` gets it; none, or
+  one that can't be used, is `401` even in a public namespace; an edge-grant cookie is no grant;
+  an operator grant gets `404` for an absent namespace; a purged namespace is `410 purged` once
+  the grant verifies; every answer is `no-store`. With authentication disabled it leaves out
+  `principal` and `kid`. Client: `Client.NSPrincipal`, `PrincipalInfo`, `WriterInfo`.
+- **Limit refusals name the limit** (§6.6, §12, v0.55): every `413`/`422` `limit` carries
+  `limit`, its §6.6 key, and for sizes and counts `measured` and `max`; durations and rates the
+  key alone; a body the server stopped reading names the deployment's limit (the principal's
+  `batchSize` for a batch) with the bytes read as a lower bound. Client: `APIError.Limit`,
+  `client.IsLimit`; `grant.TooLargeError` carries a bearer's sizes.
+- **`catalog.files`** (§7.4, §H.2): a catalog namespace document may say `"files": { "ns",
+  "root", "folder"?, "placement"? }`, checked in shape (`422 invalid` at its pointer otherwise).
+- **File metadata in tree listings** (§H.3, §E.2.6; README "File trees"): in a file tree, every
+  placement entry with a head carries `file: { size, type, modified }` of that head (a raw
+  file's reference, a JSON file's rendering length and `application/json`, the head's
+  `created`), sealed per entry under the item's `K_r` for items of sealed namespaces and left
+  out at E3; `catalog.files` coming or going reads every head, or drops the metadata.
+  `follow.Change` carries `Created`.
+- **`internal/files`** (§H.1): `files.Rendering`, the rendering of a JSON file (its canonical
+  text without a fresh `$nonce` or §8.1 `$successor`, laid out as `JSON.stringify(v, null, 2)`
+  with JCS's tokens and order), `files.Layout` and `files.MetaOf`, for the tree service and file
+  gateways alike.
+- **Revision metadata** (§7.1, §7.4; README "Files and sync clients"): outside sealed and e2e
+  namespaces, judged by the namespace serving the read, a revision's `200` carries
+  `Last-Modified`, its created time, with `If-Modified-Since` answered `304`, and
+  `Repr-Digest: sha-256=:…:` (RFC 9530) of the canonical document; `/heads` entries carry
+  `created`, and live heads `size` and `digest`, stored at write time so a listing reads no
+  document; branches list their base's values for what they read through. Sealed and e2e
+  namespaces send none of them, the e2e keyring and prune snapshots included (§E.2.2), and
+  ignore `If-Modified-Since` there, so no `304` reveals a created time; `If-None-Match` still
+  gives one. The Go client exposes `HeadItem.Created`, `Size` and `Digest`, `Doc.Modified` and
+  `Digest`, and `client.ReprDigest`.
+- **Raw documents** (§7.1, §7.8): `GET /r/{ns}/{name}/raw` and `…/rev/{id}/raw` redirect (`302`)
+  to the blob a document whose root is only a blob reference stands for, cached as the document
+  URL; a document that isn't raw is `404 not_found`, sealed and e2e namespaces `404
+  not_offered`. A blob reference at a document's root may carry `$schema`, a fresh `$nonce` and
+  a well-formed `$successor`, so raw documents can be typed, nonced and moved. Client:
+  `client.RawBlobOf`, `Client.Raw`.
+- **Moves** (§8.1): a tombstoned head's `410` carries `successor`, copied from the last
+  document's well-formed `$successor` (a bare name or `/r/{ns}/{name}`), outside sealed and e2e
+  namespaces, read through branches and remote branches' mirrors. Client: `Head.Successor`,
+  `Client.Moved` (which reads the document at `last` where the `410` names none),
+  `E2E.Moved` (which always folds that document and ignores a `410`'s successor, since the
+  server is outside the trust boundary at E3), `client.SuccessorOf`,
+  `client.ResolveSuccessor`.
+- **`serve -log-page-bytes`**, and `LogPageBytes` in `core.Limits` and `clienttest.Options`.
+
 **Fixes:**
+- **Stored listings of the tree service are keyed by the reader's shape** (§A.4, §E.2.6), as
+  kept ones are: by URL and what the reader reads whole. A public namespace that turns private
+  moves neither the anonymous URL space nor a `gs`, so until the service's `at` moved, readers
+  were served the stored listing computed while it was public, with heads and urls of its items,
+  and it stayed stored at that `at`. This held for sealed and e2e catalogs, and with file
+  metadata for every file tree trusting a sealed namespace. Listings stored before the upgrade
+  are computed again.
 - **A second CDN purge from the index and the tree/catalog services** (D.8, as the core's): a
   request in flight when an apply committed a purge could hand the CDN a result or listing it
   read before the commit, immutable and tagged with what was just purged, after that purge had

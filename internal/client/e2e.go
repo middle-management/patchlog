@@ -535,6 +535,22 @@ func (x *E2E) LoadE2E(ctx context.Context, ns, name string) (*Head, *E2EDoc, err
 	return h, d, err
 }
 
+// Moved is Client.Moved for an e2e namespace (§8.1, §11): it folds the
+// document at h.Last, verifying its chain, and reads its $successor. The
+// server is outside the trust boundary at E3, and its 410s there carry no
+// successor, so one that h names is ignored: a move it made up would steer
+// the client, and the edits it follows with, to a resource of its choice.
+func (x *E2E) Moved(ctx context.Context, ns, name string, h *Head) (string, error) {
+	if h == nil || h.State != Tombstoned {
+		return "", nil
+	}
+	d, err := x.DocE2E(ctx, ns, name, h.Last)
+	if err != nil {
+		return "", err
+	}
+	return SuccessorOf(d.Value), nil
+}
+
 // DocE2E folds the document at revision id: it follows the X-E2E fold
 // redirect, opens and verifies the log and folds it (see E2E).
 func (x *E2E) DocE2E(ctx context.Context, ns, name, id string) (*E2EDoc, error) {

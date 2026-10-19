@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/ids"
+	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // BlobID computes a blob's id (§3.7) from its media type (lowercased,
@@ -148,4 +149,71 @@ func (c *Client) GetBlobRange(ctx context.Context, ns, name, bid string, from, t
 		return nil, r.apiError()
 	}
 	return r.body, nil
+}
+
+// RawBlobOf is the blob id of a raw document (§7.8), one whose root is a
+// blob reference with no other members than those validation leaves out
+// ($schema, a fresh $nonce, a well-formed $successor, §6.2 step 5): a file
+// stored as a blob. "" for any other document.
+func RawBlobOf(doc any) string {
+	m, ok := doc.(map[string]any)
+	if !ok {
+		return ""
+	}
+	bid, _ := m["$blob"].(string)
+	if checkID("blob", bid) != nil {
+		return ""
+	}
+	if s, ok := m["$schema"].(string); ok && schema.IsDialect(s) {
+		return ""
+	}
+	_, typed := m["type"].(string)
+	_, sized := m["size"].(float64)
+	if !typed || !sized {
+		return ""
+	}
+	for k, v := range m {
+		switch k {
+		case "$blob", "type", "size":
+		case "nonce":
+			if _, ok := v.(string); !ok {
+				return ""
+			}
+		default:
+			if !schema.LeftOut(k, v) {
+				return ""
+			}
+		}
+	}
+	return bid
+}
+
+// Raw asks for the blob a raw document stands for (§7.1): …/raw at the head
+// (id "") or …/rev/{id}/raw, whose 302 names it, for reading with GetBlob.
+// A document that isn't raw is a 404 *APIError (not_found), as is any
+// document of a sealed or e2e namespace (not_offered); a tombstoned head
+// or id, a purge or a prune is a 410, as at the document's own URL.
+func (c *Client) Raw(ctx context.Context, ns, name, id string) (string, error) {
+	if err := checkRes(ns, name); err != nil {
+		return "", err
+	}
+	path := "/r/" + ns + "/" + name
+	if id != "" {
+		if err := checkID("revision", id); err != nil {
+			return "", err
+		}
+		path += "/rev/" + id
+	}
+	r, err := c.do(ctx, "GET", path+"/raw", nil, nil)
+	if err != nil {
+		return "", err
+	}
+	if r.status != 302 {
+		return "", r.apiError()
+	}
+	bid, ok := strings.CutPrefix(r.header.Get("Location"), "/r/"+ns+"/"+name+"/blob/")
+	if !ok || checkID("blob", bid) != nil {
+		return "", fmt.Errorf("client: %s/raw redirects to %q", path, r.header.Get("Location"))
+	}
+	return bid, nil
 }

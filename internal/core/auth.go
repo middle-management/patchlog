@@ -85,8 +85,8 @@ func (t *tx) decodeGrant(nsName string, cred Credentials) (*grant.Grant, *Error)
 	if g == nil {
 		var err error
 		g, err = grant.Decode(cred.Bearer, t.e.opt.Maximums.GrantSize)
-		if errors.Is(err, grant.ErrTooLarge) {
-			return nil, limitErr(413, "grant too large")
+		if e := grantTooLarge(err); e != nil {
+			return nil, e
 		}
 		if err != nil {
 			return nil, authErr(err)
@@ -150,6 +150,25 @@ func (c *grantCache) put(token string, g *grant.Grant) {
 	c.lru.Put(token, g, len(token))
 }
 
+// grantTooLarge is the 413 of a bearer over grantSize, which is decoded
+// before any namespace is consulted, so max is the deployment's (§6.6).
+func grantTooLarge(err error) *Error {
+	var te *grant.TooLargeError
+	if !errors.As(err, &te) {
+		return nil
+	}
+	return limitErr(413, "grantSize", int64(te.Size), int64(te.Max), "grant too large")
+}
+
+// rulesPerGrant is the bound on a chain's rules in force (§6.6): the
+// namespace's, or the deployment's for an operator grant.
+func (t *tx) rulesPerGrant(cfg *Config) int {
+	if cfg == nil {
+		return t.e.opt.Maximums.RulesPerGrant
+	}
+	return min(cfg.Limits.RulesPerGrant, t.e.opt.Maximums.RulesPerGrant)
+}
+
 func nsNotNamed(ns string) *Error {
 	return forbidden(fmt.Sprintf("the grant does not apply to namespace %q", ns))
 }
@@ -178,8 +197,13 @@ func (t *tx) verifyGrant(g *grant.Grant, nsName string, n *nsRow, cfg *Config, k
 	if err != nil {
 		return nil, authErr(err)
 	}
-	if len(v.BlockRules)+len(v.KeyRules) > t.e.opt.Maximums.RulesPerGrant {
-		return nil, limitErr(422, "too many rules in the grant chain")
+	if n, max := len(v.BlockRules)+len(v.KeyRules), t.rulesPerGrant(cfg); n > max {
+		return nil, limitErr(422, "rulesPerGrant", int64(n), int64(max), "too many rules in the grant chain")
+	}
+	if cfg != nil && g.Size() > cfg.Limits.GrantSize {
+		// The namespace's grantSize, below the deployment's that decoding
+		// applied (§6.6).
+		return nil, limitErr(413, "grantSize", int64(g.Size()), int64(cfg.Limits.GrantSize), "grant too large")
 	}
 	a := &actor{principal: v.Principal, verified: v, star: v.StarKey, grant: g, keyRate: v.Key.Rate}
 	a.bucketKey = v.Principal.ID + "\x00" + v.Key.Kid
@@ -509,7 +533,7 @@ func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error
 }
 
 // nsReader is reader for /ns/{ns} and the URLs under it, but the gestures
-// listing (anyReader): they need unrestricted read (readsNS, §C.5). A
+// listing (anyReader): they need unrestricted read (readsNS, §2.1). A
 // grant that may read only some resources gets the answer of any read it
 // may not make.
 func (t *tx) nsReader(n *nsRow, cred Credentials) (*actor, *Error) {
@@ -570,7 +594,7 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 	return a, nil
 }
 
-// readsNS reports whether a reads namespace n unrestricted (§C.5 "The
+// readsNS reports whether a reads namespace n unrestricted (§2.1, §C.5 "The
 // stream is metadata"): anyone does in a public namespace or with
 // authentication disabled, and otherwise a grant that may read there
 // through rules none of which refers to /resource (unrestrictedRoles).
@@ -579,7 +603,7 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 // registration (§G.3): a grant whose rules hide some resources could
 // otherwise list their names and heads, or read them through a branch.
 // Branching and registration check it as step 1 checks verbs (stepOne,
-// §6.2, §C.5), in a public namespace too: the grant must read n
+// §6.2, §2.1), in a public namespace too: the grant must read n
 // unrestricted and allow read, and its rules that refer only to /action,
 // /principal or /now must pass with /action read; rules over the rest of
 // the envelope apply to their own write at step 6.
@@ -598,7 +622,7 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource
-// readable (§C.5): its key has no readScope, no rule of its blocks or key
+// readable (§2.1): its key has no readScope, no rule of its blocks or key
 // scope refers to /resource, and, if it carries roles, some role listing
 // read has no rule that does. Those roles are returned, nil for a grant
 // without roles; roles are alternatives (§C.1.1), so one is enough.

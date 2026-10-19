@@ -338,6 +338,13 @@ func Open(opt Options) (*Engine, error) {
 	if opt.Maximums.ExchangeRate == (Rate{}) {
 		opt.Maximums.ExchangeRate = opt.Limits.ExchangeRate
 	}
+	// And from before logPageBytes (§6.6), deployment only too.
+	if opt.Limits.LogPageBytes == 0 {
+		opt.Limits.LogPageBytes = DefaultLimits().LogPageBytes
+	}
+	if opt.Maximums.LogPageBytes == 0 {
+		opt.Maximums.LogPageBytes = opt.Limits.LogPageBytes
+	}
 	if opt.LongPollInterval == 0 {
 		opt.LongPollInterval = 20 * time.Second
 	}
@@ -466,7 +473,7 @@ func (e *Engine) Ping(ctx context.Context) error { return e.db.PingContext(ctx) 
 // SpecVersion is the version of the Patch Log specification this
 // implementation follows, published at GET / as { "spec" } (§7, §7.4), in
 // dotted decimal numbers compared component by component.
-const SpecVersion = "0.52"
+const SpecVersion = "0.55"
 
 // AuthMode is what GET / publishes as "auth" (§1, §7): "grants" when
 // requests authenticate with grants (Addendum C), "disabled" for a
@@ -530,8 +537,18 @@ func notFound() *Error            { return apiErr(404, "not_found") }
 func gone(kv ...any) *Error       { return apiErr(410, "gone", kv...) }
 func invalid(msg string) *Error   { return apiErr(422, "invalid", "message", msg) }
 func forbidden(msg string) *Error { return apiErr(403, "forbidden", "message", msg) }
-func limitErr(status int, msg string) *Error {
-	return apiErr(status, "limit", "message", msg)
+
+// limitErr refuses a size or a count over a limit of §6.6: limit names its
+// key, measured what was found (a lower bound where reading stopped) and
+// max the limit in force (§6.6, §12).
+func limitErr(status int, key string, measured, max int64, msg string) *Error {
+	return apiErr(status, "limit", "message", msg, "limit", key, "measured", measured, "max", max)
+}
+
+// limitKeyErr refuses a duration or a rate over a limit of §6.6, which
+// carries no sizes: only limit, its key.
+func limitKeyErr(status int, key, msg string) *Error {
+	return apiErr(status, "limit", "message", msg, "limit", key)
 }
 
 // tx is one database transaction with the engine's helpers.

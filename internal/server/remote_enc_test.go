@@ -129,6 +129,11 @@ func TestRemoteBranchSealed(t *testing.T) {
 	w := b.wr("rel", "x", x2, withNonce(ops(op("add", "/b", encMarker+"-b"))))
 	open(t, string(b.get("/r/rel/x/rev/"+w).Body), resKey(t, bk["rel#1"], "rel", "x"), "rel#1", seal.ResourcePL("rel", "x", w, "doc"))
 	assertNoPlaintext(t, path)
+	// Neither the mirrored chains nor B's own write store a document's
+	// size or digest, which a sealed namespace never lists (headMeta).
+	if n := storedMeta(t, path); n != 0 {
+		t.Fatalf("%d revisions store a size or digest", n)
+	}
 
 	// A accepts the registration: it can't check B's level (§G.5).
 	expect(t, a.register("s", "rel", at, "", rt.bearer), 201)

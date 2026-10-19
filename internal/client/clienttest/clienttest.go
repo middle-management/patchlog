@@ -74,6 +74,10 @@ type Options struct {
 	// Paging). Zero means PATCHLOG_TEST_LOG_PAGE_SIZE (testenv), else the
 	// default, 1000.
 	LogPageSize int
+	// LogPageBytes is the deployment's logPageBytes (§6.6): resource log
+	// pages hold at most this many bytes of patch sets, and one entry at
+	// least. Zero means the default, 16 MiB.
+	LogPageBytes int
 	// Wrap, if set, wraps the server's handler, e.g. to change state
 	// between two requests of a flow.
 	Wrap func(http.Handler) http.Handler
@@ -105,9 +109,14 @@ func New(t testing.TB, opt Options) *Server {
 	}
 	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: Origin, AuthDisabled: !opt.Auth, LongPollInterval: opt.LongPoll, Purger: nopPurger{}, KeyStore: opt.KeyStore,
 		Archiver: opt.Archiver, RetentionInterval: -1}
-	if opt.LogPageSize > 0 {
+	if opt.LogPageSize > 0 || opt.LogPageBytes > 0 {
 		o.Maximums = core.DefaultMaximums()
-		o.Maximums.LogPageSize = opt.LogPageSize
+		if opt.LogPageSize > 0 {
+			o.Maximums.LogPageSize = opt.LogPageSize
+		}
+		if opt.LogPageBytes > 0 {
+			o.Maximums.LogPageBytes = opt.LogPageBytes
+		}
 	}
 	testenv.Apply(&o)
 	s := &Server{auth: opt.Auth}

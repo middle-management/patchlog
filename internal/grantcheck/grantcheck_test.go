@@ -154,7 +154,8 @@ func TestCheckRead(t *testing.T) {
 		}
 	}
 	// A scoped key reads per resource, whatever the grant's rules.
-	v := must(f.ch.Verify(ctx, "sec", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}, map[string]any{"attrs": map[string]any{"level": 1}})))
+	v := must(f.ch.Verify(ctx, "sec", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}, map[string]any{"attrs": map[string]any{"level": 1},
+		"rules": []any{map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "pub-x"}}}}})))
 	if f.ch.ReadsUnrestricted(v) || !f.ch.ReadsPerResource(v) {
 		t.Error("a key with readScope reads unrestricted")
 	}
@@ -170,6 +171,44 @@ func TestCheckRead(t *testing.T) {
 	}
 	if f.serverReads(t, "sec", "a", tok) {
 		t.Fatal("server still reads with the revoked grant")
+	}
+}
+
+// §2.1, §C.4: a key with readScope "resource" signs read grants that fix
+// /resource; one that doesn't is refused at verification (403), as the
+// core refuses it, whatever it is used for. Grants without read, and read
+// grants of other keys, aren't held to it.
+func TestReadScopeAtVerification(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t)
+	must(f.adminC.CreateDoc(ctx, "sec", "a", map[string]any{}))
+	fix := func(rules ...any) map[string]any { return map[string]any{"rules": rules} }
+	value := map[string]any{"op": "test", "path": "/resource", "value": "a"}
+	for _, tc := range []struct {
+		name   string
+		token  string
+		status int
+	}{
+		{"no rules", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}), 403},
+		{"a rule that doesn't fix it", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}, fix(map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}})), 403},
+		{"an invalid name", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}, fix(map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"a", "A b"}}})), 403},
+		{"disjoint sets", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}, fix(value, map[string]any{"op": "test", "path": "/resource", "value": "b"})), 403},
+		{"one name", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}, fix(value)), 0},
+		{"inside all", f.grant(f.scoped, "user:li", []string{"sec"}, []string{"read"}, fix(map[string]any{"all": []any{value}})), 0},
+		{"another key", f.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"}), 0},
+	} {
+		_, err := f.ch.Verify(ctx, "sec", tc.token)
+		if got := authStatus(err); got != tc.status || (tc.status == 0 && err != nil) {
+			t.Errorf("%s: Verify %v, want %d", tc.name, err, tc.status)
+		}
+		d, err := f.ch.CheckRead(ctx, "sec", tc.token, "a")
+		if got := authStatus(err); got != tc.status || d.Allowed != (tc.status == 0) {
+			t.Errorf("%s: CheckRead %+v %v, want %d", tc.name, d, err, tc.status)
+		}
+		// The origin agrees.
+		if f.serverReads(t, "sec", "a", tc.token) != (tc.status == 0) {
+			t.Errorf("%s: the server disagrees", tc.name)
+		}
 	}
 }
 

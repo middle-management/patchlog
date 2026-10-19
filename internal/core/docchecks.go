@@ -14,23 +14,28 @@ import (
 )
 
 // fromScratch reports whether a step's patch set may be as large as
-// documentSize: a create, or a restore whose first operation is a root
-// replace (§6.6). At E3 the patch set is sealed and its shape unknown, so
-// every create and restore counts.
+// documentSize instead of patchSetSize (§6.6 Whole documents): a create,
+// and an append or restore whose first operation other than test is a
+// root replace or add, so any document within the limits can be written,
+// or overwritten on purpose (§11.3), in one request. At E3 the patch set
+// is sealed and its shape unknown, so every create and restore counts and
+// no append does. In a batch the step still counts toward batchSize.
 func fromScratch(s *stepState) bool {
 	switch s.action {
 	case "create":
 		return true
-	case "restore":
+	case "append", "restore":
 		if s.sealed {
-			return true
+			return s.action == "restore"
 		}
 		ops, _ := s.raw.([]any)
-		if len(ops) == 0 {
-			return false
+		for _, o := range ops {
+			op, _ := o.(map[string]any)
+			if op["op"] == "test" {
+				continue
+			}
+			return (op["op"] == "replace" || op["op"] == "add") && op["path"] == ""
 		}
-		op, _ := ops[0].(map[string]any)
-		return op["op"] == "replace" && op["path"] == ""
 	}
 	return false
 }
@@ -78,13 +83,13 @@ type shapeScan struct {
 func (s *shapeScan) value(path, depth int) {
 	walked := s.bad == nil
 	if walked && path+2 > s.l.PathSize {
-		s.bad = limitErr(413, fmt.Sprintf("a path is longer than %d bytes", s.l.PathSize))
+		s.bad = limitErr(413, "pathSize", int64(path+2), int64(s.l.PathSize), fmt.Sprintf("a path is longer than %d bytes", s.l.PathSize))
 		walked = false
 	}
 	switch s.b[s.i] {
 	case '"':
 		if n := s.str(); walked && n > s.l.ValueSize {
-			s.bad = limitErr(413, fmt.Sprintf("a string is longer than %d bytes", s.l.ValueSize))
+			s.bad = limitErr(413, "valueSize", int64(n), int64(s.l.ValueSize), fmt.Sprintf("a string is longer than %d bytes", s.l.ValueSize))
 		}
 	case '[':
 		s.depth = max(s.depth, depth+1)
@@ -115,7 +120,7 @@ func (s *shapeScan) value(path, depth int) {
 			n := s.str()
 			name := s.b[start:s.i]
 			if names && n > s.l.ValueSize {
-				s.bad = limitErr(413, fmt.Sprintf("a member name is longer than %d bytes", s.l.ValueSize))
+				s.bad = limitErr(413, "valueSize", int64(n), int64(s.l.ValueSize), fmt.Sprintf("a member name is longer than %d bytes", s.l.ValueSize))
 				names = false
 			}
 			if string(name) == `"$blob"` {
@@ -215,7 +220,7 @@ func checkBlobRefs(l Limits, doc any) *Error {
 		return bad
 	}
 	if len(distinct) > l.BlobsPerDocument {
-		return limitErr(422, fmt.Sprintf("more than %d blobs referenced", l.BlobsPerDocument))
+		return limitErr(422, "blobsPerDocument", int64(len(distinct)), int64(l.BlobsPerDocument), fmt.Sprintf("more than %d blobs referenced", l.BlobsPerDocument))
 	}
 	return nil
 }
@@ -247,13 +252,19 @@ func hasBlobMember(v any) bool {
 	return false
 }
 
+// checkBlobRef checks one reference: { "$blob", "type", "size", "nonce"? }
+// and no other members (§7.8). At the document's root, a raw document's,
+// the top-level members validation leaves out ($schema, a fresh $nonce, a
+// well-formed $successor, §6.2 step 5) aren't part of the reference; a
+// $nonce or $successor of another form is, and is refused.
 func checkBlobRef(m map[string]any, id, ptr string) *Error {
 	if _, err := ids.Parse(id); err != nil {
 		return blobErr(ptr, "$blob must be a blob id")
 	}
-	for k := range m {
-		switch k {
-		case "$blob", "type", "size", "nonce":
+	for k, v := range m {
+		switch {
+		case k == "$blob", k == "type", k == "size", k == "nonce":
+		case ptr == "" && schema.LeftOut(k, v):
 		default:
 			return blobErr(ptr, fmt.Sprintf("a blob reference has no member %q", k))
 		}
