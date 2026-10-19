@@ -164,6 +164,99 @@ if [ -n "$topicscfg" ]; then
     {"if":[{"op":"test","path":"/action","value":"create"}],"then":[{"op":"test","path":"/doc/parents","schema":{"minItems":1}}]}]}]'
 fi
 
+# A file tree (Addendum H), which the WebDAV gateway (dav) serves as a
+# network drive: the catalog drive, whose files' items live in the namespace
+# files. Its catalog.files (§H.2) names files as the namespace new files are
+# created in (drive trusts it), root as the folder whose children are the
+# top level, and the folder and placement schemas new nodes carry. Folders
+# and files are named by their nodes' titles; the items have readable names
+# here, which mean nothing once a file is renamed. Its rules (added below,
+# after the root exists) are cat's, for files' items, and §H.2's titles.
+#
+#   root "Drive"
+#   ├─ Reports [a0]                    reports
+#   │  ├─ Q3 summary.md [a0]           files.q3-summary.md: a raw document (§7.8), text/markdown
+#   │  └─ budget.json [a1]             files.budget: a JSON document
+#   ├─ Photos [a1]                     photos
+#   │  └─ logo.png [a0]                files.logo.png: a raw document, image/png
+#   └─ README.txt [a2]                 files.readme.txt: a raw document, text/plain
+create_ns files '{"read":"public"}' >/dev/null
+drivecfg=$(create_ns drive "{\"read\":\"public\",\"catalog\":{\"trust\":[\"files\"],\"mode\":\"tree\",\"files\":{\"ns\":\"files\",\"root\":\"root\",\"folder\":\"/r/schemas/folder/rev/$folder\",\"placement\":\"/r/schemas/placement/rev/$placement\"}}}")
+
+blob_id() { # blob_id TYPE FILE -> the id of FILE's bytes as a blob of TYPE, without a nonce (§3.7)
+  { printf 'patchlog-blob-v1\n%s\n\n' "$1"; cat "$2"; } | sha256sum | awk '{
+    hex = "0123456789abcdef"; b32 = "abcdefghijklmnopqrstuvwxyz234567"; bits = ""; id = "1"
+    for (i = 1; i <= 40; i++) { # trunc160: the first 20 bytes, as bits
+      v = index(hex, substr($1, i, 1)) - 1
+      bits = bits int(v / 8) % 2 int(v / 4) % 2 int(v / 2) % 2 v % 2
+    }
+    for (i = 1; i <= 160; i += 5) { # base32lower, 5 bits a character (§3.2)
+      v = 0
+      for (j = 0; j < 5; j++) v = v * 2 + substr(bits, i + j, 1)
+      id = id substr(b32, v + 1, 1)
+    }
+    print id
+  }'
+}
+raw() { # raw NAME TYPE FILE: the raw document /r/files/NAME, unless it exists: FILE's bytes as a blob, then a document whose root is its reference
+  [ -z "$(head_of "/r/files/$1")" ] || return 0
+  bid=$(blob_id "$2" "$3")
+  if ! curl -sS -f -o /dev/null -X PUT "$API/r/files/$1/blob/$bid" -H "Content-Type: $2" -H "$A" --data-binary "@$3"; then
+    echo "seed: uploading the blob of /r/files/$1 failed" >&2
+    return 0
+  fi
+  create "/r/files/$1" "{\"\$blob\":\"$bid\",\"type\":\"$2\",\"size\":$(wc -c <"$3" | tr -d ' ')}" >/dev/null
+}
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+cat >"$tmp/q3-summary.md" <<'EOF'
+# Q3 summary
+
+- Two derbies and a cup final.
+- Attendance up 12 % on last season.
+
+A raw file: these bytes are a blob, kept exactly. Each save through the
+WebDAV gateway is a revision of /r/files/q3-summary.md.
+EOF
+cat >"$tmp/readme.txt" <<'EOF'
+This drive is the catalog drive (a file tree, spec Addendum H), served over
+WebDAV by `patchlog dav` (in the compose stack, /drive/ on DAV_PORT, 8090 by
+default).
+
+Folders are folder nodes of drive, and files its placements, named by their
+titles; each file's content is a document in the namespace files. Renaming
+or moving a file changes only its placement, so the file keeps its history.
+EOF
+# A 16x16 PNG, a ring.
+echo 'iVBORw0KGgoAAAANSUhEUgAAABAAAAAQAQMAAAAlPW0iAAAABlBMVEX///8fb+uXBXurAAAAKklEQVR42mNgYGBgf8DA/4FB/geD/R+GGjuGCjkEAnKBgkApoAKgMgYGACOBDD38jlFXAAAAAElFTkSuQmCC' |
+  base64 -d >"$tmp/logo.png"
+raw q3-summary.md text/markdown "$tmp/q3-summary.md"
+raw readme.txt text/plain "$tmp/readme.txt"
+raw logo.png image/png "$tmp/logo.png"
+create /r/files/budget '{"title":"Budget 2026","currency":"SEK","lines":[{"item":"Travel","amount":12000},{"item":"Equipment","amount":8500}],"total":20500}' >/dev/null
+
+create /r/drive/root "{$F,\"title\":\"Drive\"}" >/dev/null
+create /r/drive/reports "{$F,\"title\":\"Reports\",\"parents\":[{\"href\":\"/r/drive/root\",\"order\":\"a0\"}]}" >/dev/null
+create /r/drive/photos "{$F,\"title\":\"Photos\",\"parents\":[{\"href\":\"/r/drive/root\",\"order\":\"a1\"}]}" >/dev/null
+place() { # place ITEM TITLE FOLDER ORDER: a placement of /r/files/ITEM in FOLDER, its file name TITLE
+  create "/r/drive/files.$1" "{$PL,\"title\":\"$2\",\"parents\":[{\"href\":\"/r/drive/$3\",\"order\":\"$4\"}],\"\$nonce\":\"$(nonce)\"}" >/dev/null
+}
+place q3-summary.md 'Q3 summary.md' reports a0
+place budget budget.json reports a1
+place logo.png logo.png photos a0
+place readme.txt README.txt root a2
+
+if [ -n "$drivecfg" ]; then
+  curl -s -o /dev/null -X PATCH "$API/ns/drive" -H "$P" -H "$A" -H "If-Match: \"$drivecfg\"" -d '[{"op":"add","path":"/rules","value":[
+    {"op":"test","path":"/resource","schema":{"pattern":"^([a-z0-9][a-z0-9_-]*|files\\.[a-z0-9][a-z0-9._-]*)$"}},
+    {"if":[{"op":"test","path":"/action","schema":{"enum":["create","append","restore"]}},{"op":"test","path":"/doc/parents","exists":true}],
+     "then":[{"op":"test","path":"/doc/parents","schema":{"type":"array","maxItems":1,"items":{"type":"object","required":["href"],"additionalProperties":false,
+       "properties":{"href":{"type":"string","pattern":"^/r/drive/[a-z0-9][a-z0-9_-]{0,127}$"},"order":{"type":"string","pattern":"^[0-9A-Za-z]{1,64}$"}}}}}]},
+    {"if":[{"op":"test","path":"/action","value":"create"}],"then":[{"op":"test","path":"/doc/parents","schema":{"minItems":1}}]},
+    {"if":[{"op":"test","path":"/action","schema":{"enum":["create","append","restore"]}},{"op":"test","path":"/doc/title","exists":true}],
+     "then":[{"op":"test","path":"/doc/title","schema":{"type":"string","minLength":1,"pattern":"^[^/\\\\\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]+$","not":{"enum":[".",".."]}}}]}]}]'
+fi
+
 # Encryption demos (Addendum E; the server needs -master-key). "private" is
 # sealed for delivery (E2): documents leave the origin as JWEs, and every
 # patch set carries a fresh $nonce. "vault" is end-to-end (E3): the server
@@ -173,4 +266,4 @@ curl -s -o /dev/null -X PATCH "$API/r/private/memo" -H "$P" -H "$A" -H 'If-None-
   -d "[{\"op\":\"add\",\"path\":\"\",\"value\":{\"title\":\"Sealed memo\",\"text\":\"Only key holders can read this.\"}},{\"op\":\"add\",\"path\":\"/\$nonce\",\"value\":\"$(nonce)\"}]"
 create_ns vault '{"read":"public","encryption":{"level":"e2e"}}' >/dev/null
 
-echo "seeded: namespaces schemas, demo, cat (catalog, a tree), topics (catalog, a DAG), private (E2), vault (E3); schema /r/schemas/match/rev/$schema"
+echo "seeded: namespaces schemas, demo, cat (catalog, a tree), topics (catalog, a DAG), files, drive (catalog, a file tree of files), private (E2), vault (E3); schema /r/schemas/match/rev/$schema"

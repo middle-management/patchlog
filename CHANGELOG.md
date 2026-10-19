@@ -122,8 +122,152 @@ service's listings.
   server is outside the trust boundary at E3), `client.SuccessorOf`,
   `client.ResolveSuccessor`.
 - **`serve -log-page-bytes`**, and `LogPageBytes` in `core.Limits` and `clienttest.Options`.
+- **`patchlog dav`: namespaces and catalogs over WebDAV (a prototype)** (`internal/dav`), so
+  file managers, editors and sync tools (Finder, Explorer, GNOME Files, vim, VS Code, rclone and
+  its mounts) open and save files through the core's public API only, following spec Addendum H
+  (files):
+  - **Files** (§H.1): a file other than a JSON file is a raw document, its root a blob reference
+    to its bytes, kept exactly and typed by §H.1's extension table (else the upload's
+    `Content-Type`); a JSON file is a document, read as its rendering (the canonical text laid
+    out as `JSON.stringify(v, null, 2)`, without a fresh `$nonce` or a `$successor`), made by
+    `internal/files` as for the tree service (`files.Show`, `files.Bare`, both new). A new
+    `.json` file that isn't I-JSON is raw, and an empty file is a raw file of 0 bytes. Raw files
+    are streamed from their blobs through this server, with ranges; every answer carries
+    `nosniff` and a sandbox policy, and `POST` is `405`. Every file's ETag is its head revision.
+    Raw files are written up to `-max-raw-size` (64 MiB), JSON files up to `-max-file-size`.
+  - **Layout** (§H.2, §H.3): a namespace (`-ns`) is the flat view, a raw document by its name and
+    any other as `{name}.json`, listed from `/heads` with sizes and types read once per revision;
+    a catalog with `catalog.files` (`-catalog`) is a file tree whose folders and files are named
+    by their nodes' titles (NFC, compared after simple case folding unless `-case-sensitive`, a
+    name a sibling has under another case refused for writes, duplicates numbered, unsafe titles
+    escaped), with new files created as opaque items in `files.ns` and renames and moves one
+    append to the node; dot folders are folders. Sealed and end-to-end namespaces aren't offered
+    (§H.7).
+  - **Listings through the tree service** (§H.3, §H.7; `-tree-url [CATALOG=]URL`, as `serve`'s,
+    and `-tree-wait`): a tree's folder is listed from the tree service's `children`, every page
+    (a folder over 10 pages of 1000 is `403` as a listing, never cut short, and its files are
+    still reached by name, from the node documents), with the request's grant passed through as
+    bearer, which the tree service filters by (§B.11.5), so a grant limited to some resources
+    lists a tree; sizes, types and times come from its `file` metadata and ETags from its heads,
+    so no item is read; names and path resolution are the node documents', placements whose
+    `file` is sealed aren't listed, and the tree service down, or not caught up with a trusted
+    namespace, is `502`/`503`, never an empty folder. Writes check what a listing named against
+    the node documents and resolve the path from them where it lags (a name renamed, moved or
+    just given by another user), so a stale name is never deleted, moved or created twice, a
+    folder's emptiness is the node documents', and a folder is deleted, or a file in several
+    folders unlinked from one, only while still named as the path named it. A grant limited to
+    some resources edits the files it lists and reads; a new file or folder, a move or a delete
+    by it, which the node documents decide, is `403`, a move before anything is written, as is a
+    move whose source the grant's verbs (`GET /ns/{ns}/principal`'s `can`) don't let it delete,
+    a tree's file or a flat one (only what rules decide is met after the copy). A user's listings after their own writes,
+    through any of their tokens, wait for the entries those produced (`?min=`, keyed by the
+    writes' `X-Namespace-Revision`) until a listing that waited came back, for at most 10
+    minutes, each up to `-tree-wait`, then read the node documents (a token that can't read
+    them gets `503` for 30 s, then the tree service's listing); entries the tree service refuses
+    (`400`) are found per namespace and not asked for again. Without a tree service, folders are
+    listed from the node documents as before. Client: `client.WithTransport`,
+    `Client.Bearer`.
+  - **Saves** (§H.4): the base is the revision `If-Match` (or the `If` header's first applicable
+    entity tag) names, else the closest of the versions the user was served whole or wrote in
+    the last day; the edit from it is rebased on the head, others' edits since kept, overlapping
+    ones (what differs and what the log entries in between wrote) a `409`, as is a delete or
+    restore by someone else in between, a pruned base, lost records, versions that would apply
+    the save differently, or a path that came to name another file; after a `409`, a save
+    without a base by the same login is refused again until that login reads the file (an
+    rclone mount retrying its upload isn't rebased on another program's read), its conditional
+    GET answered in full, and those refusals, and any other of that login's before its read (a
+    retry whose rebase clashes, a raw file's), ask no reload of the user's other programs, whose
+    records stay (a file keeps 8 such logins; one pushed out by a ninth leaves the file's
+    records lost); lost records are a `409` until the reload it asks for; a raw file is
+    checked
+    against every version the user had, conflicts as a whole when someone else changed its bytes
+    since, and sets its reference's members one by one. A JSON patch set over `opsPerSet` or
+    `patchSetSize` is a root replace when the base is the head, else `413`. An `If-Match` where
+    no file is is `412`. Answers follow
+    §H.4's table: an ETag only for a revision that holds exactly what was sent (and the next
+    read in full after a merge), `410` for purged, `403` naming the successor for frozen, `413`
+    for any limit, naming the limit, what was measured and the limit in force as the core gives
+    them (`too large: documentSize 1048577 > 1048576 (§6.6): document too large`), the
+    gateway's own checks (`blobSize`, `opsPerSet`, `patchSetSize`, `-max-file-size`,
+    `-max-raw-size`) alike, and `503` with Retry-After for long rate limits.
+  - **Moves** (§H.5, §H.8): within a tree, a rename or move of the node; onto an existing file, a
+    save into it, then a delete of the source's revision copied, so the target keeps its history;
+    across trees or namespaces, a copy and a delete with `$successor`; in the flat view, to a free
+    name, one
+    batch creating the new resource and deleting the old with `$successor`. A file moved to a
+    scratch name stays (an editor's backup).
+  - **Clients as they are** (§H.6): editors' and systems' own files (`.DS_Store`, `._*`, `*.swp`,
+    `*~`, `.goutputstream-*`, …) and apps' folders stay in memory per user and narrowing, reached
+    only by a token whose grant names their namespace, and nothing else can be at the root; locks and dead properties are kept in memory, bounded, and a DELETE or MOVE
+    drops the locks on its path; a write to a path the user deleted within 30 seconds restores the file
+    rebased on its last live document, and a refused one undoes that DELETE; a refused PUT, or a
+    refused MOVE onto a file, sets a guard that refuses the user's DELETE of the path within 10
+    seconds once per refusal (rclone deletes every file whose upload failed), ending only by
+    time. `PROPFIND` without `Depth` is `1`, `Depth: infinity` `403`.
+  - **Users** (§H.7): local mode sends one `-bearer` grant behind a password, one user; gateway
+    mode (`-gateway`) sends each request's Basic password upstream as its grant and needs TLS
+    beyond loopback. It verifies a grant with `GET /ns/{ns}/principal` in a served namespace the
+    grant names, keeps nothing for one the core hasn't accepted (`401`; a purged namespace is
+    `410`, an absent one `404` to an operator grant; one an operator key signed `401`, told by
+    its signature under the operator key history at `jwks_uri`, unless the namespace lists that
+    key under that kid too, as the core serves it; a key set it can't read, a `200` that isn't a
+    JWK Set too, has the core asked of each grant), asks again every 5 minutes (at most the 15
+    minutes edge grants live) or after the core's `401`, and keys its state by the root `sub`
+    and `kid` `/principal` names (with the namespace that verified it, asked first again for the
+    same token, kept past the token for the 256 tokens of each user verified last, 16384 in
+    all, the verifying namespace and then the key keeping the most giving way, so one key
+    holder minting grants for many subs pushes out only its own, and for its
+    kid and sub, every served namespace that did, the first never pushed out), never the token,
+    so every token
+    of one person, minted again or attenuated offline, shares their records, guards, own
+    tombstones and the writes their tree listings wait for; a token verified again as another
+    user (once admitted as that user) must read every document its old user had records of
+    itself before saving it without a base, the new user's other tokens unaffected. Scratch
+    files, locks and dead properties are shared by the tokens the issuer minted with the same
+    rights (the root block's `ns`, `can`, `roles`, `rules`, `groups`, `attrs`, the sets in any
+    order), and a token
+    minted limited to some resources or attenuated offline (another ns, can, rules, a via) has
+    its own. A refused token loses its access and has the user's other tokens asked again; the
+    user's state stays for their accepted tokens. At most 256 users and 8 tokens a user, and 8
+    scopes of tokens as issued and 8 of tokens narrowed offline from each of at most 8 tokens
+    (a delegate's narrowings fill only its own), one keeping scratch files or locks never
+    dropped to make room (`MaxPrincipals`, `MaxTokensPerPrincipal`). Writer settings (frozen,
+    nonces, level, limits in force) come from `/principal`'s writer block, which a grant
+    limited to some resources gets too, kept per token for 30 seconds and asked again after a
+    refusal over one of them; what is read with a grant (documents, catalog trees, tree-service
+    listings) stays per token, the trees and listings within `-cache-size` over every token.
+  - **In the compose stack** (`dav`, http://localhost:8090/, any user name, password
+    `patchlog-dev` or `DAV_PASSWORD`'s, delivered as a compose config file read when the
+    container is created, so `up -d --force-recreate dav` changes it; this needs Docker Compose
+    2.23.1 or newer, for the whole stack): `demo` as a flat directory and `drive` as a file tree,
+    listed by the stack's tree service, which follows `drive` too. `files`, drive's content
+    namespace, isn't served flat, where a rename or delete would leave drive's placement
+    dangling; the gateway doesn't mount the data volume. The seed creates `files` and `drive` (`catalog.files`, with folder and
+    placement schemas and `cat`'s rules plus §H.2's titles) with two folders, raw Markdown, text
+    and PNG files and a JSON file. README "WebDAV in the stack" has Finder, Windows, rclone
+    and davfs2 how-tos.
+  - Not yet: new files, folders, moves and deletes in a tree through the tree service alone
+    (a grant limited to some resources edits files only), catalog-issued grants, text merges,
+    history, live invalidation, batches.
 
 **Fixes:**
+- **A tree service's listings are `503 behind` until it has caught up with every namespace the
+  catalog trusts** (§B.5, §H.3, §10), not only with the catalog. Started with a fresh database,
+  rebuilt, or trusting a namespace lately, it answered every folder with its placements of that
+  namespace missing, so folders listed empty, which a sync tool mirrors as deleted files. Caught
+  up means to the head the namespace's follower read when it started, not a first log page
+  (`follow.WithOnCatchUp`), recorded so that a restart on the same database doesn't wait again.
+  A trusted namespace it can't follow (purged, skipped for its keys as configured, refused or
+  absent at the core) isn't waited for, until the core serves it again, and a `?min=` naming it
+  is `400`; one whose epoch key can't be fetched for the moment (a transport error, a `5xx`, a
+  `429`: `derived.Retryable`, `client.Transient`; `Keys.Check` reports it), sealed or end-to-end
+  (`client.E2E.Key` answers such a failure of the relay's keys and the keyring with it, not
+  `ErrNoKeys`), is skipped but still waited for. A
+  namespace the catalog stops trusting loses its catch-up, also one its follower reports after
+  that apply (stopped, also after it is trusted again), and a record of one left by a stop, so
+  trusted again it is waited for again. A
+  catalog trusting a large new namespace now lists nothing until the service has caught up with
+  it.
 - **Stored listings of the tree service are keyed by the reader's shape** (§A.4, §E.2.6), as
   kept ones are: by URL and what the reader reads whole. A public namespace that turns private
   moves neither the anonymous URL space nor a `gs`, so until the service's `at` moved, readers

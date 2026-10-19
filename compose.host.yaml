@@ -8,7 +8,8 @@
 # Every container shares the host's network. The service names still
 # resolve (to 127.0.0.1, via extra_hosts), and the ports are the ones
 # compose.yaml publishes: the CDN on 8080–8082, the origins directly on
-# 9080–9082. `docker compose exec` doesn't work on such hosts either.
+# 9080–9082, the WebDAV gateway on 8090 (DAV_PORT). `docker compose exec`
+# doesn't work on such hosts either.
 
 x-host: &host
   network_mode: host
@@ -40,7 +41,7 @@ services:
       - -shutdown-timeout=20s
     # Healthchecks run through `docker exec`, which joins the container's
     # namespaces, and hosts like these refuse that too, so compose.yaml's
-    # `patchlog health` checks are off for the core, index and tree. The
+    # `patchlog health` checks are off for the core, index, tree and dav. The
     # seed polls /_health itself instead, and the CDN only needs the
     # origins started (its own probes of /_health still work: they are
     # plain HTTP over the host network). Graceful shutdown doesn't depend
@@ -65,9 +66,22 @@ services:
 
   tree:
     <<: *host
-    command: [tree, -api=http://patchlog:9080, -catalog=cat, -catalog=topics, "-db=/data/tree-{catalog}.db", -addr=:9082, -purge-url=http://cdn:8080/, -shutdown-timeout=20s]
+    command: [tree, -api=http://patchlog:9080, -catalog=cat, -catalog=topics, -catalog=drive, "-db=/data/tree-{catalog}.db", -addr=:9082, -purge-url=http://cdn:8080/, -shutdown-timeout=20s]
     healthcheck:
       disable: true
+
+  # Started once the tree service is (its folders' listings answer 502
+  # until it listens).
+  dav:
+    <<: *host
+    command: [dav, -api=http://patchlog:9080, -ns=demo, -catalog=drive, -tree-url=http://tree:9082, "-addr=:${DAV_PORT:-8090}", -password-file=/run/dav.password, -author=dav, -shutdown-timeout=20s]
+    healthcheck:
+      disable: true
+    depends_on: !override
+      seed:
+        condition: service_completed_successfully
+      tree:
+        condition: service_started
 
   janitor:
     <<: *host

@@ -52,6 +52,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"sort"
 	"strconv"
 	"sync"
@@ -196,13 +197,24 @@ type Service struct {
 	pmu     sync.Mutex
 	pending map[string][]follow.Unit // pages of unfinished snapshots (stage)
 
-	mu  sync.RWMutex // guards g, cur, purged
+	mu  sync.RWMutex // guards g, cur, purged, caught, target, unfollowed
 	g   *Graph
 	cur map[string]string
 	// purged is when the service applied the purge of each namespace it
 	// holds as purged (meta "purged:{ns}", Unix nanoseconds; trustList).
 	purged  map[string]time.Time
 	changed chan struct{}
+	// caught are the namespaces the service has once caught up with, to
+	// the head their follower read when it started (target; meta
+	// "caught:{ns}"): until then listings wait for them (behind).
+	caught map[string]bool
+	target map[string]string
+	// unfollowed are the trusted namespaces the service can't follow,
+	// and why: skipped for their keys (Addendum E), or refused or absent
+	// at the core (a 401, 403 or 404); listings don't wait for them
+	// (behind), nor ?min= naming them (awaitMins). Cleared once the core
+	// serves the namespace's head to its follower again.
+	unfollowed map[string]string
 
 	// trusted is when each namespace the catalog trusts became trusted,
 	// as far as the service knows (meta "trusted:{ns}"), guarded by mu;
@@ -289,7 +301,8 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 		keys: derived.NewKeys(opt.Client, opt.Recipient), sealed: derived.NewCache(0, db), kept: kept.New(opt.Now, keepBytes),
 		opt: opt, c: opt.Client, db: db, cps: follow.SQLCheckpoints{DB: db}, origin: origin,
 		checker: grantcheck.New(opt.Client, grantcheck.WithClock(opt.Now), grantcheck.WithTTL(opt.CheckerTTL)),
-		cur:     map[string]string{}, purged: map[string]time.Time{}, changed: make(chan struct{}),
+		cur:     map[string]string{}, purged: map[string]time.Time{}, changed: make(chan struct{}), unfollowed: map[string]string{},
+		caught: map[string]bool{}, target: map[string]string{},
 		running: map[string]context.CancelFunc{},
 	}
 	s.repurge = repurge.New(db, opt.Purger, repurge.Options{Delay: opt.RepurgeDelay, Interval: opt.RepurgeInterval,
@@ -358,6 +371,19 @@ func (s *Service) init(ctx context.Context) error {
 		s.cur[s.logical(ns)] = id
 	}
 	rows.Close()
+	rows, err = s.db.QueryContext(ctx, `SELECT substr(k, 8) FROM meta WHERE k LIKE 'caught:%'`)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var ns string
+		if err := rows.Scan(&ns); err != nil {
+			rows.Close()
+			return err
+		}
+		s.caught[ns] = true
+	}
+	rows.Close()
 	rows, err = s.db.QueryContext(ctx, `SELECT substr(k, 8), v FROM meta WHERE k LIKE 'purged:%'`)
 	if err != nil {
 		return err
@@ -392,6 +418,13 @@ func (s *Service) init(ctx context.Context) error {
 	if err := s.reload(ctx); err != nil {
 		return err
 	}
+	// A catch-up recorded of a namespace the catalog doesn't trust (its
+	// DELETE in forgetUntrusted failed, or the service stopped between the
+	// apply that untrusted it and that DELETE) is dropped, so that trusted
+	// again it is waited for (more 503s, never a listing short of files).
+	s.mu.Lock()
+	s.forgetUntrusted(ctx)
+	s.mu.Unlock()
 	return s.loadTrusted(ctx)
 }
 
@@ -518,6 +551,120 @@ func (s *Service) state() (cur string, purged bool, changed <-chan struct{}) {
 	return s.cur[s.opt.Catalog], purged, s.changed
 }
 
+// behind returns a namespace the service follows that it hasn't caught
+// up with yet, "" if there is none: the catalog, or a namespace the
+// catalog trusts (the service started with a fresh database, rebuilt, or
+// trusting it lately). Until its follower has replayed the log to the
+// head it read when it started (caught), every placement of an item in a
+// page not applied yet is missing (dangling, §B.3), and a listing would
+// show folders empty or part filled that aren't, which a sync tool
+// mirrors as files deleted (§H.3); listings answer 503 behind instead. A
+// checkpoint isn't enough: a log longer than a page is applied a page at
+// a time, and the first sets one (§10 Catch up). Once caught up, a
+// restart doesn't wait again: what it holds is the namespace as of a
+// checkpoint, as any follower lags. A namespace purged, or one it can't
+// follow (unfollowed), isn't waited for: its placements dangle meanwhile.
+func (s *Service) behind() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if !s.caught[s.opt.Catalog] {
+		return s.opt.Catalog
+	}
+	var out []string
+	for ns := range s.g.Trust {
+		if _, purged := s.purged[ns]; !s.caught[ns] && !purged && s.unfollowed[ns] == "" {
+			out = append(out, ns)
+		}
+	}
+	if len(out) == 0 {
+		return ""
+	}
+	sort.Strings(out)
+	return out[0]
+}
+
+// setUnfollowed records why the service can't follow ns ("" when it can
+// again).
+func (s *Service) setUnfollowed(ns, why string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if why == "" {
+		delete(s.unfollowed, ns)
+	} else {
+		s.unfollowed[ns] = why
+	}
+}
+
+// onCatchUp is the follower of ns reporting its catch-up (follow.
+// WithOnCatchUp): once the core serves ns's head, the service follows it
+// again (unfollowed cleared), and listings wait for it until it is caught
+// up (behind); once the checkpoint reaches that head (target), the
+// service has caught up with ns: Apply marks it so as it publishes that
+// checkpoint, and done marks it where nothing was left to apply. A
+// report for a namespace the catalog no longer trusts is dropped: its
+// follower is stopped only after the apply that untrusted it
+// (forgetUntrusted), and a report on its way meanwhile would mark it
+// caught, so that trusted again it wasn't waited for while its follower
+// replays what was placed in between. So is a report of a follower
+// stopped (ctx, cancelled by ensureFollowers at the end of that apply,
+// before the catalog's next apply can trust the namespace again), which
+// may come once it is trusted again, with a head read before what was
+// placed in between, while the new follower is still catching up.
+func (s *Service) onCatchUp(ctx context.Context, ns, head string, done bool) {
+	s.mu.Lock()
+	if ctx.Err() != nil || ns != s.opt.Catalog && !s.g.Trust[ns] {
+		s.mu.Unlock()
+		return
+	}
+	if !done {
+		delete(s.unfollowed, ns)
+		s.target[ns] = head
+		s.mu.Unlock()
+		return
+	}
+	mark := !s.caught[ns]
+	s.caught[ns] = true
+	s.mu.Unlock()
+	if mark {
+		s.recordCaught(ctx, ns, head)
+	}
+}
+
+// recordCaught records that the service caught up with ns at head (meta
+// "caught:{ns}"). Unrecorded, a restart waits for the catch-up again:
+// more 503s, never a listing short of files.
+func (s *Service) recordCaught(ctx context.Context, ns, head string) {
+	if _, err := s.db.ExecContext(context.WithoutCancel(ctx), `INSERT INTO meta (k, v) VALUES (?, ?) ON CONFLICT (k) DO UPDATE SET v = excluded.v`,
+		"caught:"+ns, head); err != nil {
+		s.opt.Logf("tree: recording the catch-up with %s: %v", ns, err)
+	}
+}
+
+// forgetUntrusted drops what the service knows of following each
+// namespace the catalog no longer trusts (caught, target, unfollowed): trusted
+// again, it is waited for until caught up again, from the checkpoint it
+// stopped at. Called with mu held for writing.
+func (s *Service) forgetUntrusted(ctx context.Context) {
+	for ns := range s.caught {
+		if ns != s.opt.Catalog && !s.g.Trust[ns] {
+			delete(s.caught, ns)
+			if _, err := s.db.ExecContext(ctx, `DELETE FROM meta WHERE k = ?`, "caught:"+ns); err != nil {
+				s.opt.Logf("tree: forgetting the catch-up with %s: %v", ns, err)
+			}
+		}
+	}
+	for ns := range s.unfollowed {
+		if !s.g.Trust[ns] {
+			delete(s.unfollowed, ns)
+		}
+	}
+	for ns := range s.target {
+		if ns != s.opt.Catalog && !s.g.Trust[ns] {
+			delete(s.target, ns)
+		}
+	}
+}
+
 // Run follows the catalog and its trusted namespaces until ctx is done.
 // Followers of content namespaces start and stop as catalog.trust changes.
 func (s *Service) Run(ctx context.Context) error {
@@ -592,6 +739,7 @@ func (s *Service) follow(ctx context.Context, ns string) {
 	opts := []follow.Option{
 		follow.WithMaxUnits(0),
 		follow.WithOnError(func(n string, err error) { s.opt.Logf("tree: %s: %v", n, err) }),
+		follow.WithOnCatchUp(func(_, head string, done bool) { s.onCatchUp(ctx, ns, head, done) }),
 	}
 	opts = append(opts, s.opt.FollowOptions...)
 	pause := time.Second
@@ -607,7 +755,17 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		// catalog, whose listings can't be sealed); skip it and say why. A
 		// content namespace is followed for heads even if its e2e
 		// documents can't be read.
-		if reason, permanent := s.keys.Check(ctx, real, ns != s.opt.Catalog); reason != "" {
+		// Skipped for its keys as configured, it isn't waited for (behind)
+		// until its keys come and the core serves its head again
+		// (onCatchUp). Skipped because its epoch key couldn't be fetched
+		// for the moment (the core briefly unreachable, a 5xx, a 429:
+		// retry), it is still waited for, as a namespace being caught up
+		// with is: listings are 503 behind, never short of its items, and
+		// a ?min= naming it waits.
+		if reason, permanent, retry := s.keys.Check(ctx, real, ns != s.opt.Catalog); reason != "" {
+			if !retry {
+				s.setUnfollowed(ns, reason)
+			}
 			if permanent {
 				s.opt.Logf("tree: skipping %s: %s", real, reason)
 				return
@@ -626,6 +784,9 @@ func (s *Service) follow(ctx context.Context, ns string) {
 		if errors.Is(err, follow.ErrPurged) {
 			s.opt.Logf("tree: %s was purged", real)
 			return
+		}
+		if ae, ok := client.AsAPIError(err); ok && (ae.Status == http.StatusUnauthorized || ae.Status == http.StatusForbidden || ae.Status == http.StatusNotFound) {
+			s.setUnfollowed(ns, err.Error())
 		}
 		s.opt.Logf("tree: following %s stopped: %v; restarting in %s", real, err, pause)
 		t := time.NewTimer(pause)
@@ -813,14 +974,24 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		s.opt.Purger.PurgeTags(res.tags)
 	}
 	s.cur[b.NS] = b.NewCheckpoint
+	// The catch-up's head reached: caught up as this checkpoint is out
+	// (if still trusted, and by a follower not stopped since, onCatchUp).
+	caughtNow := !s.caught[b.NS] && s.target[b.NS] == b.NewCheckpoint && (b.NS == s.opt.Catalog || s.g.Trust[b.NS]) && ctx.Err() == nil
+	if caughtNow {
+		s.caught[b.NS] = true
+	}
 	if co.PurgedNS {
 		s.purged[b.NS] = res.purgedAt
 	}
 	trustChanged := !sameSet(oldTrust, s.g.Trust)
 	if trustChanged {
 		s.noteTrust(context.WithoutCancel(ctx))
+		s.forgetUntrusted(context.WithoutCancel(ctx))
 	}
 	s.mu.Unlock()
+	if caughtNow {
+		s.recordCaught(ctx, b.NS, b.NewCheckpoint)
+	}
 
 	if len(res.tags) > 0 {
 		// The purged rows' traces in the WAL go too (secure_delete zeroes

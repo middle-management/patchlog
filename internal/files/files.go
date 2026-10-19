@@ -16,29 +16,36 @@ import (
 const JSONType = "application/json"
 
 // Rendering is what a JSON file reads as (§H.1): the canonical JSON text
-// (§3.1) of doc without a top-level $nonce of the fresh form (§6.4.1) or
-// $successor of the form of §8.1, laid out by Layout. $schema stays. doc
+// (§3.1) of doc as Bare shows it, laid out by Layout. $schema stays. doc
 // is a parsed document (jsonv values) and is not modified.
 func Rendering(doc any) []byte {
-	if m, ok := doc.(map[string]any); ok {
-		drop := 0
-		for _, k := range [...]string{"$nonce", "$successor"} {
-			if v, has := m[k]; has && schema.LeftOut(k, v) {
-				drop++
-			}
-		}
-		if drop > 0 {
-			out := make(map[string]any, len(m)-drop)
-			for k, v := range m {
-				if (k == "$nonce" || k == "$successor") && schema.LeftOut(k, v) {
-					continue
-				}
-				out[k] = v
-			}
-			doc = out
+	return Layout(jsonv.Canonical(Bare(doc)))
+}
+
+// Bare is doc as a file shows it (§H.1): without a top-level $nonce of
+// the fresh form (§6.4.1) or $successor of the form of §8.1, which are
+// writers' mechanics, not content; what a JSON file's save diffs against
+// (§H.4). doc is not modified: a copy without them is returned, or doc
+// itself if it has neither.
+func Bare(doc any) any {
+	m, ok := doc.(map[string]any)
+	if !ok {
+		return doc
+	}
+	left := func(k string) bool {
+		v, has := m[k]
+		return has && schema.LeftOut(k, v)
+	}
+	if !left("$nonce") && !left("$successor") {
+		return doc
+	}
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		if (k != "$nonce" && k != "$successor") || !left(k) {
+			out[k] = v
 		}
 	}
-	return Layout(jsonv.Canonical(doc))
+	return out
 }
 
 // Layout lays out canonical JSON text as ECMAScript's
@@ -109,11 +116,20 @@ type Meta struct {
 
 // MetaOf is doc's Meta (§H.3).
 func MetaOf(doc any) Meta {
+	m, _ := Show(doc)
+	return m
+}
+
+// Show is how doc reads as a file: its Meta (§H.3) and, for a JSON file,
+// its rendering (Rendering), made once; a raw file's bytes are its blob's,
+// and its rendering nil.
+func Show(doc any) (Meta, []byte) {
 	if client.RawBlobOf(doc) != "" {
 		m := doc.(map[string]any)
 		size, _ := m["size"].(float64)
 		typ, _ := m["type"].(string)
-		return Meta{Size: int64(size), Type: typ}
+		return Meta{Size: int64(size), Type: typ}, nil
 	}
-	return Meta{Size: int64(len(Rendering(doc))), Type: JSONType}
+	r := Rendering(doc)
+	return Meta{Size: int64(len(r)), Type: JSONType}, r
 }

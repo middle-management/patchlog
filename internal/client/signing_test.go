@@ -3,6 +3,9 @@ package client_test
 import (
 	"context"
 	"crypto/ed25519"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -50,5 +53,41 @@ func TestWithSigner(t *testing.T) {
 	}
 	if root := must(c.Root(ctx)); root.JWKSURI != clienttest.Origin+"/.well-known/patchlog-keys" {
 		t.Fatalf("root %+v", root)
+	}
+}
+
+// §C.4: the operator key history is a JWK Set, an object whose "keys" is
+// an array; any other 200 body (a proxy's JSON error page for an unrouted
+// /.well-known, `{}`, "keys": null) is an error, never an empty set, which
+// callers checking grants against the operator keys would take for none.
+func TestOperatorKeysNotASet(t *testing.T) {
+	t.Parallel()
+	for body, ok := range map[string]bool{
+		`{"keys":[]}`:              true,
+		`{"keys":[{"kty":"RSA"}]}`: true,
+		`{}`:                       false,
+		`{"error":"no route"}`:     false,
+		`{"keys":null}`:            false,
+		`{"keys":{"kty":"OKP"}}`:   false,
+		`[{"keys":[]}]`:            false,
+		`"keys"`:                   false,
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			if r.URL.Path == "/" {
+				io.WriteString(w, `{"spec":"0.55"}`)
+				return
+			}
+			io.WriteString(w, body)
+		}))
+		c, err := client.New(srv.URL)
+		if err != nil {
+			t.Fatal(err)
+		}
+		keys, err := c.OperatorKeys(context.Background())
+		srv.Close()
+		if ok != (err == nil) || len(keys) > 0 {
+			t.Errorf("key set %s: %v, %v", body, keys, err)
+		}
 	}
 }

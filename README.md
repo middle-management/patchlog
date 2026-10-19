@@ -135,6 +135,10 @@ packages.
 make up        # or: docker compose up --build -d
 ```
 
+It needs Docker Compose 2.23.1 or newer (`docker compose version`): `compose.yaml` gives the
+WebDAV gateway's password as a config with `content`, which older versions refuse, and with it
+the whole file.
+
 On hosts where Docker can't create network namespaces (a Fly.io sprite, some VMs and CI runners;
 `bind-mount /proc/…/ns/net …: permission denied`), use `make up-host`, which layers
 `compose.host.yaml` over it: host networking, the same ports, and no `docker exec` healthchecks.
@@ -143,7 +147,7 @@ On a sprite the stack's URL (`https://{sprite}-{org}.sprites.app`) routes to the
 
 This starts the core server in dev mode, seeds a few demo namespaces and documents, and runs the
 search index, the tree service and the branch janitor, all behind a local CDN (Varnish, see
-[The local CDN](#the-local-cdn-9)):
+[The local CDN](#the-local-cdn-9)), and the WebDAV gateway beside it:
 
 | URL | What |
 |---|---|
@@ -155,10 +159,11 @@ search index, the tree service and the branch janitor, all behind a local CDN (V
 | http://localhost:8080/playground/tree/cat/roots | the same, through the core's read-only proxy (`-tree-url`) |
 | http://localhost:8080/playground/index/demo?q=derby | the search index, through the core's read-only proxy (`-index-url`) |
 | http://localhost:9080, :9081, :9082 | the core, search and tree origins directly, bypassing the CDN |
+| http://localhost:8090 | WebDAV gateway (`patchlog dav`): `demo` as a flat directory, `drive` as a file tree; any user name, password `patchlog-dev` (see [WebDAV in the stack](#webdav-in-the-stack)) |
 
 The seed creates `schemas`, `demo` (a few matches, with catalog roles), two catalogs of `demo`,
-`private` (sealed, E2) and `vault` (end-to-end, E3: create its keyring from the playground's Keys
-tab). The catalogs:
+`files` and `drive` (a file tree of `files`), `private` (sealed, E2) and `vault` (end-to-end, E3:
+create its keyring from the playground's Keys tab). The catalogs:
 
 - `cat`, `mode: tree` (one parent per node, §B.6): folders, placements, `$access`, an embargoed
   folder with `inherit: false`, and one dangling placement.
@@ -170,9 +175,14 @@ tab). The catalogs:
   `group:catalog-admins`' desk on the root reaches it only around `editorial`. `loop-a` and
   `loop-b` are each other's parents: the tree service flags that cycle under
   `/topics/problems` and lists neither. [deploy/seed.sh](deploy/seed.sh) draws the whole DAG.
+- `drive`, a file tree (`catalog.files`, see [File trees](#file-trees-h2-h3)) whose items live in
+  `files`: folders `Reports` and `Photos` under its root, and in them `Q3 summary.md` and
+  `README.txt` as raw documents (a blob and a document whose root is its reference, §7.8),
+  `logo.png`, a raw PNG, and `budget.json`, a JSON document. Its rules are `cat`'s, for `files`'
+  items, and §H.2's titles. [deploy/seed.sh](deploy/seed.sh) draws it.
 
-One tree service serves both (`-catalog=cat -catalog=topics`), each at `/{catalog}/…` with its own
-database.
+One tree service serves the three (`-catalog=cat -catalog=topics -catalog=drive`), each at
+`/{catalog}/…` with its own database.
 
 Spec v0.46 additions to the catalog and tree services:
 
@@ -193,10 +203,68 @@ Spec v0.46 additions to the catalog and tree services:
 - Data lives in the `data` volume: databases, pruning archives, and the at-rest master key,
   which is created on first start.
 - Ports and the origin can be changed with `PATCHLOG_PORT`, `INDEX_PORT`, `TREE_PORT` (the
-  CDN's), `CORE_DIRECT_PORT`, `INDEX_DIRECT_PORT`, `TREE_DIRECT_PORT` (the origins') and
-  `PATCHLOG_ORIGIN`.
+  CDN's), `CORE_DIRECT_PORT`, `INDEX_DIRECT_PORT`, `TREE_DIRECT_PORT` (the origins'), `DAV_PORT`
+  (the WebDAV gateway's) and `PATCHLOG_ORIGIN`.
 - Without Docker, `make dev` runs just the core server, and `make check` runs vet, the tests and
   a gofmt check.
+
+### WebDAV in the stack
+
+`dav` in compose.yaml is the WebDAV gateway (see [WebDAV](#webdav-prototype)) in local mode
+against the dev core, so its writes carry `X-Author: dav`. Open http://localhost:8090/ with any
+user name and the password `patchlog-dev`. It serves `demo` as a flat directory of its
+documents, and `drive` as a file tree whose folders are listed by the tree service:
+
+```
+/demo/derby.json …                    demo's matches, as JSON files
+/drive/README.txt                     the file tree drive (§H.2): a raw document, text/plain
+/drive/Reports/Q3 summary.md          a raw document, text/markdown
+/drive/Reports/budget.json            a JSON document
+/drive/Photos/logo.png                a raw document, image/png
+```
+
+drive's items live in the namespace `files`, which the gateway doesn't serve as a flat directory:
+there a rename is a copy and a delete (§H.2 "Flat view"), so renaming or deleting a file in it
+would take the file out of `/drive/`, leaving its placement dangling. `/demo/` is such a flat
+directory of `demo`, whose documents `cat` and `topics` place: renaming or deleting one there
+leaves their placements of it dangling the same way (a rename's new name, in `$successor`, §8.1,
+is not followed by them). Rename and move files in `/drive/`, which changes only their
+placements.
+
+The password is a compose config, `${DAV_PASSWORD:-patchlog-dev}`, which reaches the gateway as a
+file only the container's user can read. It is read when the `dav` container is created (the
+first `up`, or after `down`): on a running stack, `DAV_PASSWORD=… docker compose up -d
+--force-recreate dav` changes it (a plain `up -d` keeps the old one). It is a development
+password, published here, and the gateway speaks plain HTTP: keep port 8090 to your own
+machine, as with the rest of the stack. The gateway keeps nothing but memory caches, so it
+doesn't mount the `data` volume, which holds the core's databases and master key.
+
+- **macOS Finder**: Go → Connect to Server (⌘K), `http://localhost:8090/`, then Connect as a
+  Registered User with any name and `patchlog-dev`.
+- **Windows**: File Explorer → This PC → Map network drive, folder `http://localhost:8090/`, or
+  `net use Z: http://localhost:8090/ /user:me patchlog-dev`. Windows' WebClient sends Basic
+  credentials over HTTPS only, by default. For this plain-HTTP gateway, set `BasicAuthLevel` to
+  `2` under `HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters` and restart the
+  WebClient service, or serve the gateway over HTTPS (`-tls-cert`, `-tls-key`).
+- **rclone**, a remote of vendor `other`:
+
+  ```sh
+  rclone config create pl-dev webdav url=http://localhost:8090/ vendor=other user=me \
+    pass=patchlog-dev --obscure
+  rclone ls pl-dev:drive
+  rclone mount pl-dev: ~/pl --vfs-cache-mode writes --ignore-size \
+    --dir-cache-time 1s --vfs-cache-max-age 5s --vfs-cache-poll-interval 5s
+
+  # Or without a config, the :webdav: backend:
+  rclone ls --webdav-url http://localhost:8090/ --webdav-vendor other --webdav-user me \
+    --webdav-pass "$(rclone obscure patchlog-dev)" :webdav:drive
+  ```
+
+  Copies and syncs to it take `--ignore-size --ignore-times`; see **rclone** under
+  [WebDAV](#webdav-prototype) for why, and for the mount's flags.
+- **davfs2** (Linux): `sudo mount -t davfs http://localhost:8090/ /mnt/pl`, then any user name and
+  `patchlog-dev` when asked (or put `http://localhost:8090/ me patchlog-dev` in
+  `/etc/davfs2/secrets`).
 
 ### The local CDN (§9)
 
@@ -824,17 +892,17 @@ PATCHLOG_CORS_ORIGINS='*' make up     # compose passes it to every server
 
 ### Health checks and graceful shutdown
 
-`serve`, `index` and `tree` answer two paths ahead of their own routes. Both are
+`serve`, `index`, `tree` and `dav` answer two paths ahead of their own routes. Both are
 `Cache-Control: no-store` and `CDN-Cache-Control: no-store`, and the compose CDN passes them, so
 a probe always reaches the origin itself:
 
 | Path | Answer |
 | --- | --- |
 | `GET /_health` | Liveness and drain state: `200 {"status":"ok"}` while serving, `503 {"status":"draining"}` from the moment shutdown starts. It touches no database, so frequent probes are cheap. Use it for load-balancer and CDN probes and container healthchecks. |
-| `GET /_ready` | Readiness: `503 {"status":"draining"}` while draining, `503 {"status":"unavailable","error":…}` when the core can't reach its database (a ping with a 2 s timeout), else `200 {"status":"ok"}`. The index and tree keep local SQLite databases they opened at start, so for them it is the drain state alone. |
+| `GET /_ready` | Readiness: `503 {"status":"draining"}` while draining, `503 {"status":"unavailable","error":…}` when the core can't reach its database (a ping with a 2 s timeout), else `200 {"status":"ok"}`. The index and tree keep local SQLite databases they opened at start, and `dav` keeps none, so for them it is the drain state alone. |
 
 The paths start with `_`, which no namespace or catalog name can (§3.6), so they never shadow
-the index's `/{ns}` or the tree's `/{catalog}`; they sit beside the services' `/_status`.
+the index's `/{ns}`, the tree's `/{catalog}` or a `dav` directory; they sit beside the services' `/_status`.
 `patchlog health [URL]` (default `http://localhost:8080/_health`; `:8081` is short for
 `http://localhost:8081/_health`) exits 0 on a 200 and 1 otherwise, so the image needs no curl or
 wget for healthchecks.
@@ -1910,7 +1978,18 @@ anonymous readers of a public catalog, `/{catalog}/g/{gs}/at/{at}/…` for reade
 the subject set before the checkpoint (v0.51, §B.11.5); the old `/{catalog}/at/{at}/g/{gs}/…` is
 moved there with a `301`. Cycles and depth over 64 show up under `problems`. `-catalog` is repeatable (or comma-separated): each catalog gets its own
 service and database (`-db` with `{catalog}` replaced, or `-{catalog}` added before the
-extension) behind one origin, and `/_status` covers them all (`?catalog=` for one).
+extension) behind one origin, and `/_status` covers them all (`?catalog=` for one). Listings
+are `503 behind`, with `Retry-After`, until the service has caught up with the catalog and with
+every namespace it trusts (started with a fresh database, rebuilt, or trusting one lately), to
+the head each one's follower read when it started, not just a first log page, rather than show
+every placement of a namespace not yet followed as missing; once caught up, a restart on the
+same database doesn't wait again. One it can't follow (purged, skipped for its keys as
+configured, refused or absent at the core) isn't waited for until the core serves it again, and a
+`?min=` naming it is `400`; one whose epoch key can't be fetched for the moment (the core
+unreachable, a `5xx`, a `429`), sealed or end-to-end (its relay's keys and its keyring both),
+is skipped but still waited for. A namespace the catalog stops
+trusting loses its catch-up, also one its follower reports after that (once stopped, also after
+it is trusted again), and one recorded before a stop, so trusted again it is waited for again.
 
 Listings are kept like the search index's results (§A.4, §B.5, v0.49): every listing computed,
 the one at the `at` a redirect names included, is kept in memory for about a minute (at most
@@ -2171,7 +2250,8 @@ tree service then gives every placement entry with a head, in `children`, `subtr
   rendering (§H.1, `files.Rendering`) is the canonical text of the document without a top-level
   fresh `$nonce` or `$successor` of §8.1's form, laid out as `JSON.stringify(v, null, 2)` lays it
   out, with JCS's tokens and member order (keys that look like array indices stay where JCS puts
-  them), and a final LF. `files.MetaOf` computes both, for the WebDAV gateway too.
+  them), and a final LF. `files.MetaOf` computes both; the WebDAV gateway renders and lists
+  files with the same code (`files.Show`, `files.Bare`).
 - **`modified`** is the head's `created` as the namespace log gives it (a batch entry's for a
   batch, a `/heads` row's for a snapshot bootstrap), else its `Last-Modified`; it is left out
   where neither is known (a snapshot of a sealed namespace, rows written before v0.54).
@@ -2198,6 +2278,680 @@ tree service then gives every placement entry with a head, in `children`, `subtr
   The service stores the metadata in the clear, as it does titles. This form, and its nesting
   inside a sealed catalog's JWE, are provisional: §E.2.6 defines a per-entry `"sealed"` member
   for values of one source and none yet for values another namespace's resource gives.
+
+### WebDAV (prototype)
+
+`patchlog dav` serves namespaces as a network drive, for file managers and editors, following
+Addendum H (files): a file other than a JSON file is a raw document, its bytes a blob (§7.8), and a
+JSON file is a document, read as its rendering. A namespace (`-ns`) is a flat directory of its
+resources; a catalog (`-catalog`) is a file tree, whose files and folders are named by their
+nodes' titles. It is an API consumer like the index and tree services: it reads and writes the
+core only through its public API, and keeps nothing but memory caches.
+
+```sh
+# Local mode: one grant for every request; WebDAV clients log in with any user name and the password.
+./patchlog dav -api http://localhost:8080 -ns docs,matches -catalog cat-season \
+  -bearer-file editor.grant -password-file dav.password      # http://127.0.0.1:8090/
+
+# Gateway mode: each request's Basic password is the user's own grant, sent upstream; the
+# tree's folders listed by its tree service (§H.3).
+./patchlog dav -api https://cms.example -ns docs -catalog cat-season -gateway \
+  -tree-url http://tree:8082 -addr :8443 -tls-cert dav.crt -tls-key dav.key
+```
+
+- **Local mode** (the default) sends `-bearer` (or `-bearer-file`) with every request to the core,
+  or `-author NAME` to a `-dev` one. WebDAV clients log in with HTTP Basic: any user name, and the
+  password of `-password-file` or a random one logged at start, compared in constant time. It is
+  meant for one person on their own machine: the default `-addr` is `127.0.0.1:8090`, and plain
+  HTTP on any other address logs a warning. Every program and device that logs in is one user
+  to the server (§H.7: one bearer for everyone): what it keeps per user below is shared between
+  them.
+- **Gateway mode** (`-gateway`) has no grant of its own: a request's Basic password is the grant,
+  sent upstream as `Authorization: Bearer` (the user name is ignored), so the core decides what
+  each user may read and write, and the revisions are the grant's subject's. Nothing is kept for
+  a grant before the core has accepted it: `GET /ns/{ns}/principal` (§7.4) in a served namespace
+  the grant names until one accepts it: first the one that accepted this token before (kept past
+  the token, for the 256 tokens of each user verified last, 16384 in all, the verifying
+  namespace keeping the most giving way, then its key (`kid`) keeping the most, so one user's
+  logins with thousands of narrowings, or one key holder's for thousands of `sub`s or with
+  thousands of keys added to its namespace, push out only their own), then those that accepted a grant of its root `kid` and
+  `sub` (every served namespace that did, in the order they did, so later ones never push out the
+  first), then at most three of the rest, sorted, so a namespace created or given the key later,
+  or another namespace's key with the same `kid`, doesn't make the same person someone else. It checks only that the grant names the namespace and verifies, key scope and revocation included, the
+  same in a public namespace (whose reads ignore a bad grant) as in a private one, so a grant
+  limited to some resources, or without `read`, is accepted too (§H.7 "Limited grants"). Its
+  `401` is no usable grant; a `410` there is a purged namespace, and a `404` one that doesn't
+  exist (to an operator grant): accepted nowhere else, the grant is answered `410` or `404` (§H.4
+  "Answers"). A grant an operator key signed (§C.4), which `/principal` verifies too and which
+  authorizes nothing this server does, is `401`: its root `kid` names a key of the deployment's
+  operator key history (`jwks_uri`, read without a grant and kept 5 minutes, read again once for
+  every login asking meanwhile, and after a failed read not for 30 s) under which its signature
+  verifies, so a namespace key that carries the same `kid` is never mistaken for it; unless the
+  namespace lists that very key under that `kid` too, which makes it the namespace's grant, as
+  the core serves it. While the key set can't be read (a `404` too, or a `200` whose body isn't a
+  JWK Set, an object with a `keys` array: a proxy not routing `/.well-known`), the core is asked
+  of each grant whether the namespace's own keys verify it.
+  It is asked again every 5 minutes (`VerifyEvery`, at most the 15 minutes edge grants live,
+  §C.5.2), or at the next request after the core answered it `401`, so a revoked grant, or one
+  its key's scope no longer covers, is refused within that time. A refused token loses its
+  access, and the user's other tokens are asked again at their next request; the user's state
+  (below) stays, reached only through a token the core accepts, so a re-minted grant finds it. A
+  grant the core doesn't accept is `401` with the Basic challenge, so clients ask again, and says
+  nothing of what is served; it is refused for 30 s without asking the core again (a `410` or
+  `404` too), and at most 8 grants are verified at once. Grants must not cross plain HTTP:
+  it refuses to start on an address other than loopback without `-tls-cert` and `-tls-key`,
+  unless `-insecure`, and warns when `-api` is plain HTTP to another host. Both modes take
+  `-tls-cert` and `-tls-key`.
+- What the server keeps is per user (§H.7) and never shared with another: in a gateway, a user is
+  the root `sub` and `kid` `GET /ns/{ns}/principal` names for the grant, with the namespace whose
+  key verified it (a kid names a key of one namespace's document, so the same kid in another
+  served namespace is someone else's), never the token: every token of one person, minted again
+  or attenuated offline, is the same user, whose own delete is theirs, not someone else's, and
+  whose records and guards carry over (a token attenuated to leave out the namespace that
+  verified the others is verified in another, and is another user; a token verified again as
+  another user, the namespace that verified it refusing it now, whether kept meanwhile or not,
+  has its saves without a base of every document its old user had records of refused until it
+  reads that document itself: another token's read isn't its reload, and the new user's other
+  tokens aren't refused). Temporary files, locks and dead properties, which may hold what one token read (a
+  document's backup copy, an editor's swap file with its text), carry over between the tokens
+  the issuer minted with the same rights (the root block's `ns`, `can`, `roles`, `rules`,
+  `groups` and `attrs`, whatever its times, and whatever the order `ns`, `can`, `roles` and
+  `groups` list them in), but a token minted limited to some resources
+  (§C.5.1) or attenuated offline (a narrowing block with another `ns`, `can`, `rules` or a `via`:
+  a delegate) has its own, and no token reaches the temporary files of a namespace its grant
+  doesn't name (§H.6 "served only to that user"). It keeps temporary files and locks (a lock
+  lasts at most an hour, `Infinite` too, its owner is at most 1 KiB, and a user holds at most
+  256, then `507`) and dead properties (1 MiB a user, the least recently set going first), dropped
+  with the user (in a gateway, after an hour idle, or to make room: at most 256 users,
+  `MaxPrincipals`, and 8 tokens a user, `MaxTokensPerPrincipal`, so more tokens push out only that
+  user's, which are verified again when they come back; never one with a request in flight). Of
+  a user's sets of temporary files and locks, 8 are kept for tokens as issued, and 8 for tokens
+  narrowed offline from each token their narrowing started from (a delegate's own narrowings
+  stay within its 8, not those of the user's other narrowed tokens), from at most 8 such tokens:
+  one that holds temporary files or locks is never dropped to make room, a new one is `503`
+  then. The bounds on temporary files are the user's, over those sets, so a token
+  that reads less can tell from its `507`s how much the user's other tokens keep (the size of a
+  backup copy). And the versions of each
+  document the user was served or wrote, the bases of their saves (below), with the tombstones
+  and restores they wrote, kept for a day apart from the rest, within 128 MiB for all users,
+  where the user keeping the most gives way first, so one user's uploads don't push out
+  another's records (a write keeps the bytes it sent only where they read otherwise rendered,
+  and not when much larger than the rendering, as white space padding would be). A restart
+  loses all of it. What is read with
+  a grant is kept per token, since another token of the same user may read less: the writer
+  settings, namespace documents, catalog trees and tree-service listings below, the last two
+  within `-cache-size` over every token, the least recently used going first. Rendered
+  documents are cached by revision id for everyone, and handed to a token only after it read the
+  head, or the listing, with its own grant.
+- `-password-file` and `-bearer-file` readable by others than their owner log a warning.
+- Behind a reverse proxy, the proxy must pass the client's `Host` on (nginx: `proxy_set_header Host
+  $host`), or set `X-Forwarded-Host`: MOVE and COPY name their destination by the host the client
+  used, and another host's is refused (`502`).
+
+**Mounting.** macOS Finder: Go → Connect to Server (⌘K), `http://127.0.0.1:8090/` (`https://…`
+for a gateway), as a registered user with any name and the password (the grant). Finder writes
+only to servers with locks, which are served (in memory). Windows: File Explorer → This PC → Map
+network drive, or `net use Z: https://dav.example/ /user:me PASSWORD`; its WebClient service sends
+Basic credentials only over HTTPS by default (`BasicAuthLevel` 1), so serve with `-tls-cert` and
+`-tls-key` (for `http://localhost`, `BasicAuthLevel` 2 in the registry allows it). GNOME Files:
+Other Locations → Connect to Server, `dav://127.0.0.1:8090/` (`davs://` with TLS), or
+`gio mount dav://127.0.0.1:8090/`. davfs2 mounts a local-mode server, but not a gateway with a
+grant as its password ("Could not authenticate to server: rejected Basic challenge"; rclone logs
+in with the same grant). rclone needs `--ignore-size`, and for copies `--ignore-times` too: see
+**rclone** below.
+
+**rclone.** A remote of vendor `other`:
+
+```sh
+rclone config create pl webdav url=http://127.0.0.1:8090/ vendor=other user=me \
+  pass="$(cat dav.password)" --obscure
+
+rclone copy --ignore-size --ignore-times ./docs pl:docs     # upload: every file, every time
+rclone copy --ignore-times pl:docs ./docs                   # download: likewise
+rclone mount pl: ~/pl --vfs-cache-mode writes --ignore-size \
+  --dir-cache-time 1s --vfs-cache-max-age 5s --vfs-cache-poll-interval 5s   # a mount
+```
+
+- The server keeps no modification times rclone can set, and no hashes, so rclone tells files
+  apart by size alone (`rclone backend features pl:` shows `"Precision": 3153600000000000000`,
+  rclone's "not supported", and no `Hashes`). A raw file reads back as uploaded, but a JSON file
+  reads as its document rendered, which is not always the size it was uploaded with: a save
+  merged with others' edits reads back larger or smaller (to others, any upload not in its
+  rendered form). So:
+- **Copies and syncs to the server take `--ignore-size` and `--ignore-times` (`-I`).** Every
+  file is sent on each run; one that is unchanged writes nothing (its diff is empty), a changed
+  one is an edit rebased as any save is (below), so others' edits since are kept. With
+  `--ignore-size` alone, rclone skips every file that already exists ("Sizes identical",
+  "Unchanged skipping") and exits 0: edits are silently not sent. Without `--ignore-size`, rclone
+  checks the size of each upload, and a save merged with others' edits fails ("corrupted on
+  transfer: sizes differ") and is deleted ("Removing failed copy"): the document is tombstoned,
+  or in a file tree the file deleted, and each of rclone's retries restores it and deletes it
+  again; without `--ignore-times` too, an edit that keeps the size isn't sent.
+- **Copies from the server take `--ignore-times`**, else a document someone changed without
+  changing its size isn't fetched.
+- **A refused save doesn't delete the document.** rclone answers every failed upload (a conflict,
+  a file that isn't JSON, one too large, a `422` or `403`) by deleting the file a second later,
+  and ignores that DELETE's answer. The server refuses it (`409`, the guard below), and each of
+  rclone's retries (`--retries 3`, a mount's write-back) is refused again, its DELETE too: the
+  document stays as it was for everyone, and rclone exits with the save's error. Deleting it on
+  purpose right after takes one DELETE more per refused save, or none once 10 seconds have
+  passed: `rclone deletefile` retries on its own. Nor does a refused upload bring back a document
+  you deleted (`rm` in a mount, an `rclone sync` deletion): rclone's DELETE after it is done.
+- **A mount takes `--vfs-cache-mode writes --ignore-size` and short cache times**
+  (`--dir-cache-time 1s --vfs-cache-max-age 5s --vfs-cache-poll-interval 5s`). Without
+  `--ignore-size` the upload of a save merged with others' edits fails on its size and the mount
+  deletes the document, retrying the upload, restoring it and deleting it again. rclone tells a
+  file's versions apart by size alone and, by default, keeps a directory listing for 5 minutes
+  and a file it wrote in its cache for an hour: a file someone else changed then reads as the
+  cached copy when its size didn't change, and is cut short at the old size when it grew (the
+  kernel reads no further), so `sed -i` or an editor writes clipped JSON back (`400`, refused).
+  With the short times another's edit shows within a few seconds. rclone's mount answers
+  extended attribute calls with `EIO`, so `ls -l` and `sed -i` print "Input/output error" about
+  them; the save is done all the same.
+- **After a refused save through a mount** (a conflict, clipped JSON), the program saving sees
+  no error with `--vfs-cache-mode writes`: the mount keeps showing its version, read from the
+  cache, and rclone retries the upload in the background (after 10 s, 20 s, 40 s, … up to every 5
+  minutes: "vfs cache: failed to upload try #N" in its log), refused each time. The way out is to
+  write the server's version into the mounted file, `rclone cat pl:docs/x.json > ~/pl/docs/x.json`
+  (the shell empties the mounted file before rclone reads, so the refused version isn't sent
+  again): that upload writes nothing, and you edit again from there. A login refused a save must
+  read the file itself (its conditional GET is answered in full) before its next save without a
+  base is taken, and its retries ask no reload of anyone else's, so another program's read
+  doesn't let the mount's retries through, but only one with another grant: a program logging in
+  with the mount's own (local mode's one password, or a gateway user's grant given to both) is
+  the same login, and its read (`rclone cat` to the terminal, a browser) is the reload the `409`
+  asks for, after which the mount's next retry saves its old version over the other edit. With
+  `--vfs-cache-mode off` the program saving gets
+  an I/O error instead and nothing is retried: re-reading the file through the mount (once
+  `--dir-cache-time` has passed) is the reload, and an edit of what it reads saves.
+- **Without a cache (`--vfs-cache-mode off`)** a program writing a file in place uploads it
+  with a PUT, but one saving through a temporary file renamed over it (`sed -i`, editors' safe
+  saves) makes rclone DELETE the document, then MOVE the temporary file onto the name (its MOVE
+  never overwrites): each such save writes a tombstone and then the restore with the edit, and
+  one the server refuses (a file that isn't JSON, a conflict) restores the document as it was
+  (below), with an I/O error for the program; the next save is done as usual. A temporary file
+  with a scratch name stays in memory; in a file tree, or under a resource name in a flat
+  directory, it is a file of its own, which that MOVE deletes once it has restored the original
+  with its content, so the original keeps its history. sed's temporary names (`sedAb12Cd`) are
+  neither scratch names nor resource names, so `sed -i` fails in a flat directory without a
+  cache, writing nothing. Use `--vfs-cache-mode writes`, which renames a file it hasn't uploaded
+  yet in its cache, and then uploads it with a PUT.
+- `rclone sync` deletes what the source doesn't have: here, a tombstone per document (in a file
+  tree, the placement and its item). In a file tree `moveto` renames and moves files and folders
+  (below); in a flat directory it moves a file to another name in one batch, the old name's last
+  revision naming the new one in `$successor` (§8.1, below), and `moveto` between a flat
+  directory and a tree, or another namespace, copies the file and deletes it. rclone sends a
+  MKCOL for the parent folder before each upload: `405`, as a folder that exists is, and not
+  logged. `rclone mkdir` in a frozen catalog fails at once (`403`).
+
+**Layout.**
+
+```
+/                                          a directory per -ns and -catalog
+/docs/                                     a flat namespace (§H.2): its live resources
+/docs/derby.json                           the JSON document /r/docs/derby
+/docs/logo.png                             the raw document /r/docs/logo.png: a file
+/cat-season/                               a file tree (§H.2): the children of its files.root
+/cat-season/Season 2026/                   a folder node titled "Season 2026"
+/cat-season/Season 2026/Derby report.md    a placement titled "Derby report.md": its item,
+                                           such as the raw document /r/matches/k3j2…
+```
+
+- **Files** (§H.1). A raw document, whose root is a blob reference (`{ "$blob", "type", "size",
+  "nonce"? }`, with at most `$schema`, a fresh `$nonce` and a `$successor` beside it, §7.8), is a
+  file of the blob's bytes, kept exactly: text files (`.md`, `.txt`, source code) too. Any other
+  document is a JSON file. A raw file's type comes from its name's extension, in any letter case,
+  by §H.1's table (`md` `text/markdown`, `txt` `text/plain`, `png` `image/png`, `pdf`
+  `application/pdf`, `json` `application/json`, …); else from the upload's `Content-Type`, its
+  parameters dropped, unless it is `application/octet-stream`, `binary/octet-stream`,
+  `application/x-www-form-urlencoded` or `multipart/*`; else `application/octet-stream`. A copy
+  is typed as its source, and a temporary file moved onto a name as it was uploaded, unless the
+  name's extension says otherwise.
+- **The flat view** (§H.2). A flat namespace's directory lists its live resources (the head rows
+  of the `/heads` of its current `ns_id`): a raw document by its resource name, any other as
+  `{name}.json`. Where a raw `x.json` and a JSON document `x` both exist, as an API client can
+  make them, the raw file keeps the name and the document is shown, read and written as
+  `x (2).json`. A name a live resource has is that file's whatever it looks like (a raw `4913`
+  is a file, not vim's probe). A new file is made under its name, which must be a resource name
+  (§3.6: lowercase letters, digits, `.`, `_` and `-`, starting with a letter or digit, at most 128
+  characters), or for a JSON document `{name}.json`; any other name (`Notes.md`, a Save As
+  `Report.json`, `my notes.txt`, `.notes.tmp`, a browser's `invoice (1).pdf`) is refused with
+  `403`, saying so, since kept in memory only it would vanish, but for the scratch names below.
+  A COPY to one of the names file managers give a copy made beside a live file (Finder's
+  Duplicate `x copy.md`, `x copy 2.md` and Keep Both's `x 2.md`; Explorer's `x - Copy.md`, `Copy
+  of x.md` and `x (1).md`; GNOME's `x (copy).md`, and the same of any extension) makes a scratch
+  file, so a copy renamed to a file's name starts a file from a template; one not renamed
+  vanishes with the other scratch files. A new file whose resource another kind of file has
+  (`notes.md` beside a JSON document `notes.md`, shown as `notes.md.json`; a JSON `pic.json`
+  beside a raw `pic`) is `409`. `x (2).json` keeps naming the JSON document `x` for a client that
+  has it open once the raw `x.json` is gone (it is listed as `x.json` then), and is `409` once
+  `x` is gone too.
+- **Reading.** A raw file is served by this server itself, from its blob through the core and
+  never as a redirect to the core's origin, streamed, with ranges (`206`), as its type. A JSON
+  file reads as its rendering: the document's canonical text (§3.1), without a top-level `$nonce`
+  of the fresh form and a `$successor` of §8.1's, laid out as `JSON.stringify(value, null, 2)`
+  lays it out (members and elements on lines of their own, two spaces a level, `{}` and `[]` for
+  empty ones, keys in JCS's order, those that look like array indices too), with one final LF:
+  the same bytes for the same revision. Every file's ETag is its head revision id, and every
+  answer, files, listings and error texts alike, carries `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: sandbox`, since this origin holds users' credentials; a `POST`, which
+  x/net/webdav would answer as a `GET`, is `405`. A revision that holds exactly what a user wrote reads
+  back to that user as they wrote it, so a client checking the size of its upload finds it.
+- **Listings** (§H.3): each file's ETag is its row's `target`, its time the row's `created` (or,
+  for rows without, the `Last-Modified` of the document's read; with neither, from an older core,
+  when the user was first shown the revision, kept in memory only), a raw file's size and type its
+  reference's, and a JSON file's size its rendering's (or that of what the user wrote and reads
+  back). Both need the head document once per revision: its size and type are kept by revision
+  id for good (256 Ki revisions), apart from the documents themselves (`-cache-size`), so a
+  listing reads only the documents it hasn't seen.
+- Each listing of a flat namespace reads its heads again; a catalog's tree, and its items' heads,
+  are read again after 5 seconds, or at once after a write through this server (a tree service's
+  listings likewise, below). Nothing is pushed.
+- **Sealed and end-to-end namespaces** (Addendum E) need keys this server doesn't hold, so it
+  doesn't offer them (§H.7): the root doesn't list them, anything asked of them is `404`, saying
+  why, and a tree's placements of items in them aren't listed. A root listing asks `GET
+  /ns/{ns}/principal` (§7.4 `writer.level`) of each served namespace the user's grant names, at
+  most every 30 seconds per token, for this (and reads a catalog's document, for its file tree);
+  one that refuses it is listed all the same, so a grant that reads only some namespaces mounts,
+  and the others answer `403` when opened.
+
+**Saving.**
+
+- A written file is buffered whole (a raw file at most `-max-raw-size`, default 64 MiB, the
+  core's default `blobSize`; a JSON file and a temporary file at most `-max-file-size`, default 16
+  MiB; at most the larger of 8 times `-max-file-size` and twice `-max-raw-size` over every request
+  at once, in a gateway a quarter of that, or one raw file, for one user's, else `503`) and
+  committed once complete; a body cut short writes nothing, and a `PUT` with
+  `Content-Range` (a partial write) is `400`, writing nothing (§H.4). Other request bodies
+  (PROPFIND, PROPPATCH, LOCK) are at most 64 KiB (`413`), read whole before they are handled, and
+  those over 4 KiB are handled four at a time over the server: x/net/webdav decodes them a value
+  per element. A request has 10 minutes to arrive.
+- **Which kind a file is** (§H.1). A new file whose name ends in `.json` and whose content is
+  I-JSON (a UTF-8 byte order mark dropped) is a JSON document of the name before `.json`; any
+  other new file is raw, a `.json` file that isn't I-JSON (comments, duplicate keys, integers
+  beyond 2⁵³) included, as a raw file of its whole name. An existing file keeps its kind: a JSON
+  file takes only I-JSON (`400` otherwise, nothing written), a raw file any bytes. One the user
+  deleted moments ago and writes again (below) is restored as the file it was.
+- **Raw files** have no paths to merge, so their base is checked, never merged from: the
+  versions the user may have are the revision `If-Match` names, else every version this user was
+  served whole or wrote (below), and if, after any of them, someone else changed the bytes (a log
+  entry the user didn't write set a member of the reference, or the root) or deleted or restored
+  the file, the save is a `409`, so an editor's buffer isn't saved over bytes a preview read; the
+  user's own saves since are theirs to replace, so consecutive saves never conflict, whatever
+  their sizes, nor does a stale `If-Match` after the user's own save. A version the user had,
+  saved unchanged after someone else's bytes, writes nothing, and gets no ETag. Then the bytes
+  are uploaded as a blob (once however often the head moves meanwhile; `413` over the `blobSize`
+  in force, before any upload) and the reference's members set one by one (`/$blob`, `/type`,
+  `/size`, `/nonce`), never the root, so a `$schema` or `$successor` beside it stays. Bytes the
+  head already holds write nothing. The revision holds exactly what was sent, so its ETag answers
+  the PUT.
+- A new name is created (`If-None-Match: *` upstream); a tombstoned one is restored, so a name
+  keeps one chain (§8.2): moments after the user's own DELETE (below), with the edit rebased on
+  its last live document; a save from a version from before someone else's delete is a `409`
+  (deleted by someone else since you opened it), until a GET finding the file gone, the reload;
+  any other write makes the file anew, its root replaced (which drops a `$successor`, so a file
+  moved away and written again isn't marked moved). A raw file over a JSON document's, or the
+  other way round, replaces its root. A purged one is `410`, as is any name of a purged
+  namespace. A PUT's own `If-None-Match: *` (create only) is `412` over an existing file, and
+  `If-Match: *` (edit only) over a missing one; an empty placeholder (below) exists for both. An
+  `If-Match` (or `If` header) tag naming a revision where no file is (a name that never existed,
+  a tree's name whose file was deleted or moved, a scratch name) is `412`, never a new file, but
+  where it restores the user's own DELETE of moments ago (below).
+- An existing JSON file gets the user's edit rebased on its head (§11.3, §H.4): the diff
+  (`merge.Diff`) from the version the user edited, the base (as rendered: a `$successor` it
+  leaves out stays), to what they wrote, applied to the current head and appended with `If-Match`
+  on it. The base is one of the versions the user may have edited: the revision the PUT's
+  `If-Match` names (its first value, `W/` dropped), or failing that its `If` header (the first
+  entity tag, not negated with `Not`, of the first list that applies to the file: untagged, or
+  tagged with its URL), with the user's own writes that revision holds merged; `If-Match: *` only
+  asks that the file exist, and the head is the base. Without one, the base is among the versions
+  this user was served whole (a GET's body, or a range that is the whole file; a `304`, a
+  `HEAD`, a `PROPFIND` and a partial range record nothing) or wrote in the last day, at most 16
+  a document (over that, the oldest but the first goes, and never the latest write: the version
+  an editor opened stays while a preview reads others' revisions); a save that changed nothing
+  is no write. Of those, it is the one closest to what was written (the fewest changed paths): an
+  editor's buffer is what it opened or last saved plus the user's edit, while a preview pane's or
+  a second window's GET moves on without it. Records are kept by document, and with them the
+  document each path named when the user last read it whole or wrote it: a save without a tag at
+  a path that names another document now (a tree's title given to a new item after the old one
+  was deleted, a raw `x.json` taking the JSON document `x`'s name), or none, is a `409` asking for
+  a reload, which a GET of the path is; the user's own DELETE or MOVE forgets the path. A file equal to an older version is a save of it
+  unchanged, or, when the user wrote since and the file reverts just what that save changed, an
+  undo of it. Edits others made since the base are kept: the patch set holds only the user's
+  changes. Others' writes are what differs between the base and the head, and the writes of the
+  log entries between them (§11.3), so a value someone changed and changed back counts; the
+  user's own entries don't. Writes count whole arrays (an edit anywhere in an element is an edit
+  of the array, from the outermost: elements have no identity, so an index one side names is
+  another element after the other's insert or delete; §F.3's array rule). Where the user's writes
+  overlap others' since the base and what the user wrote differs from the head there, the save is
+  `409 Conflict`, naming the paths, and nothing is written. A change both made, or a value
+  reloaded since, is no conflict. A delete or restore by someone else between the base and the
+  head is a `409` too, never merged over.
+- A patch set over `opsPerSet` or `patchSetSize` (§6.6: the limits in force, defaults applied, as
+  `GET /ns/{ns}/principal` gives them; else the core's refusal tells) is sent as a root `replace`
+  instead, which may be as large as
+  `documentSize`, carrying the document's `$successor` and a fresh `$nonce` where nonces apply,
+  when the base is the head (§H.4): it then overwrites no one's edit. A restore after the user's
+  own DELETE (below) is written whole so when its base is the last live document. A save merged with others'
+  edits is `413` instead, asking for a reload, after which the base is the head; it isn't sent
+  where the gateway knows the limit.
+- The base isn't guessed: a save may change the head only where every version the user may have
+  edited agrees with the head (or holds what the user wrote there since), so whichever one their
+  program had, no edit someone else made in between is undone or overwritten unseen. Where they
+  can't be told apart, as the version an editor opened and a newer one a preview read, when the
+  edit covers what changed in between, the save is a `409` too; so is one that another version,
+  taken as the base, would apply otherwise as safely, naming where: an undo of the user's save
+  combined with a new edit looks like a second program's edit from the version before that save,
+  and taken as the latter the undo was dropped. A `409` asks for a reload: the
+  user's next GET of the whole document sends it whatever its validators say (a cached copy may
+  be what the editor had), and drops the versions recorded before the `409`, so the reloaded one
+  is the base of the edit after it; a range read isn't that reload. A `409` to a login that
+  must read the file itself first (refused a save of it, or verified as another user, since it
+  last read it: a retry, whatever refuses it) asks for none again, so another program's next
+  read keeps the version it has open. A version that can't be read
+  again for a save (a `429`, a `5xx`) fails it (`503`, `502`) rather than leaving it without a
+  base. One the core no longer has (pruned, §8.6), named by `If-Match` or recorded, or whose
+  history since is pruned, can't be compared: `409`, asking for a reload. An `If-Match` naming
+  no revision of the document is `412`. A head that moves meanwhile (`412`) is read again, the
+  edit checked again and resent, up to five times.
+- With nothing known of the base (a PUT without `If-Match` from a user never served the document,
+  after a restart, or once a day has passed), the head is the base, so the file as written wins,
+  as the diff from it; over a tombstoned document, a file made anew (above).
+  Versions the bounds pushed out are remembered as lost: then a save that changes the document is
+  a `409`, rather than rebased on what is left, until the reload that `409` asks for; a read before
+  it isn't that reload, since another program of the user's may still have the version pushed out
+  open, and its save would be rebased on that read. So is a login pushed out of the 8 a
+  document keeps as to read it themselves (refused a save of it, or verified as another user,
+  since they last read it) by a ninth: the document is lost, and a reload already due when it
+  was pushed out is due no longer, so another program's read doesn't let its save from before
+  through. Within one user, two programs
+  saving the same value, the last wins; two editing from one version, the second save is a `409`
+  (above) until it reloads.
+- A PUT answers with the revision as its ETag only when that revision holds exactly what was sent
+  (§H.1: its rendering is the uploaded value, whatever the formatting, and whatever `$nonce` it was
+  given); one merged with others' edits gets none (RFC 9110 §9.3.4), and the user's next GET or
+  HEAD of it is answered in full whatever its validators say: a client may still file what it sent
+  under the merged revision's tag, which a HEAD or a listing shows (davfs2 asks with a HEAD after
+  such a PUT), and would keep showing it after a `304`. A client that reads the tag from a listing
+  and never GETs again keeps its copy. A save that writes nothing (the file already reads so) is
+  no write of the user's.
+- A save that deletes the original before writing the new version (DELETE, then a PUT, a COPY or
+  a MOVE onto the name, of a temporary file or of another file) restores it with the user's edit
+  rebased on the last live document, as above, within 30 seconds of the DELETE (§H.6); a file
+  moved away since (its last document has `$successor`) is made anew instead. A MOVE of another
+  file deletes that file afterwards. If that write fails within 30 seconds of the DELETE,
+  whatever refuses it (a `409` conflict, a `422`, a body that isn't JSON or is over
+  `-max-file-size`, a frozen namespace, a precondition), the user's own DELETE is undone: the
+  document is restored as it was (an empty patch set, if the user's tombstone is still its head),
+  as a failed PUT leaves it, and the answer says so. In a file tree, a write to the path of a
+  file the user deleted within 30 seconds restores it, its placement and then its item, and a
+  refused one restores both as they were (§H.6). A document deleted longer ago stays deleted,
+  and rclone's DELETE after its refused upload deletes a restored one again, unless a guard
+  from an earlier refusal is still on it (above): the deletion stands.
+- `$nonce` is the writer's to refresh: it is never part of an edit, and a fresh one is added where
+  the namespace requires nonces (§C.7), as `GET /ns/{ns}/principal`'s writer block says, which a
+  grant limited to some resources gets though it can't read the namespace document (§H.7), or
+  where that is refused; with a `Blob-Nonce` on a raw file's blob. The writer settings (frozen,
+  nonces, encryption level, limits) are kept per token for 30 seconds (it is `no-store`), and
+  asked again after the core refuses a write over one of them (`409 frozen`, `422 nonce`, a
+  limit). Where nonces are required, a JSON file's root must be an object, which carries the
+  `$nonce`: an array or a scalar is `422`, saying why (§H.1).
+- The core's refusals come back as such, with its code and message as the text (the status is
+  the answer's own, §H.4 "Answers"): `422` with its validation errors (schema, rules, `nonce`,
+  signature), one per line; `413` for a limit (the core's `413`, or its `422` with code `limit`:
+  a patch set over `patchSetSize` or `opsPerSet` that couldn't be sent whole, a create's over
+  `documentSize`, a document over `documentSize`, nesting), naming the limit, what the core
+  measured and the limit in force, as in `too large: documentSize 1048577 > 1048576 (§6.6):
+  document too large`; the gateway's own checks before sending (`blobSize`, a merged patch set
+  over `opsPerSet` or `patchSetSize`, `-max-file-size`, `-max-raw-size`, the bytes read when the
+  bound was passed) answer the same way; `403` for a frozen namespace (with
+  its `successor`): frozen is for good, and clients retry a `423` as a lock that may go (rclone 30
+  times, for 45 seconds); `410` for a purged file or namespace; `401` and `403` (but in local
+  mode a `401` refuses the server's own grant, not the user's password, so it is `502` rather
+  than a new login prompt). A `429` is waited out when its Retry-After is at most 2 s, and is
+  otherwise `503` with Retry-After. A core that can't be reached is `502` (the details are
+  logged). `423` and `507` mean only a lock held and this server's memory full.
+- An empty file is a file (§H.1): a raw file of 0 bytes is made (`__init__.py`, `.gitkeep`), a raw
+  file truncated, and a JSON file refuses it (`400`), as any content that isn't I-JSON. Only where
+  the content decides the kind, a LOCK of a new name and a new `.json` name (Finder's 0-byte PUT
+  before the content), is it an empty placeholder in memory until content arrives.
+- DELETE tombstones (§8.1); with `If-Match` (or an `If` header's entity tag) naming another
+  revision than the head, it is `412`. A DELETE that passes destroys the user's locks on the path
+  (RFC 4918 §9.6.1), and so does a MOVE on its source. A MOVE or COPY of a file the client holds
+  locked, sent with that lock's token, is taken: its destination needs a token only if locked.
+- **Guards** (§H.6). A refused PUT of a file, or a refused MOVE onto an existing file (answered
+  `4xx` or `5xx`, having written nothing), sets a guard: the same user's DELETE of that path
+  within 10 seconds is `409` ("wasn't deleted: this DELETE follows a refused save of the same
+  file … delete it again to delete it"), once per refusal, and two refusals never share one:
+  rclone deletes any file whose upload failed, a second later, which would tombstone the document
+  for everyone (in a file tree, delete the file) because a save was refused. A guard ends only by
+  time: a read of the file doesn't lift it (it may be another program's), nor another program's
+  save, nor a DELETE that passed. A DELETE naming the revision it deletes (`If-Match`) is
+  deliberate and passes, leaving the guards as they are; one that finds nothing uses one up (a
+  refused create's cleanup). A refused plain MOVE (to a new name) or COPY sets none, nor does a
+  write whose refusal put back the document the user had just deleted (below): the DELETE after
+  that leaves it deleted, as the user chose. In a frozen namespace, which takes no DELETE either,
+  the DELETE gets the core's `403` instead. A user keeps at most 4096 guards (the oldest go
+  first), so many uploads refused at once each keep theirs. In local mode every program is the
+  same user: another program's DELETE in those 10 seconds is refused too.
+- **MOVE in the flat view** (§H.8). To a free name in the same namespace, one batch (§7.5)
+  creates the new resource with the document (a fresh `$nonce` where nonces apply) and appends
+  `$successor` naming it to the old one before its tombstone (§8.1), so the old name's `410` says
+  where it went; a raw file's blob is copied with `Blob-From` (§7.8), or uploaded again where the
+  new name's extension gives it another type. A tombstoned name is restored so, its root
+  replaced (one the user deleted within 30 seconds keeps its history: below). To another
+  namespace (or a tree) it is a copy, then a delete with `$successor` `/r/{ns}/{name}`. Onto an
+  existing file (`Overwrite: T`, or none) it is a save of the source's content into it, its base
+  taken as a PUT's, then a delete of the source: the target keeps its history, which is how
+  "write a temporary file, rename it over" saves land (§H.5); `Overwrite: F` is `412`. A copy then
+  delete deletes only the revision of the source it copied: one someone edited meanwhile stays as
+  it is, and the MOVE is a `409` (the target holds the version moved). The source isn't deleted
+  for a copy that wrote nothing. A copy then delete whose source the grant can't delete, as the
+  core's `GET /ns/{ns}/principal` lists its verbs there (no `delete`, or no `append` for the
+  `$successor` a move to another namespace sets), is `403` before anything is written; what only
+  the grant's rules decide is known at the delete, which leaves the copy. A JSON
+  file keeps a `{name}.json` name and a raw file a raw one, and a JSON file whose root isn't an
+  object can't carry `$successor`: those MOVEs are `403` (copy, then delete). COPY to a new name
+  creates it from the content (a raw file's bytes read through this server), and COPY over a
+  file edits it, as its kind takes it. MKCOL of a folder that exists is `405` (not logged), and
+  below a file `409`.
+
+**Temporary and backup files** (§H.6). Editors' and systems' own files, `.DS_Store`, `._*`,
+`Thumbs.db`, `~$*`, `*.swp`, `4913`, `*~`, `#*#`, `*___jb_tmp___` and `.goutputstream-*`,
+JetBrains' `*___jb_old___` beside its `*___jb_tmp___`, and macOS's `Icon\r` (a folder's custom
+icon, a name no title can be), are scratch files, unless a live resource has the name: kept in memory per user and directory (at most 256 files and folders and 32 MiB a
+user, 256 MiB in all, then `507`; in a gateway, only in the served namespaces the user's
+grant names, else `403`), listed beside the files so editors see what they wrote, and dropped
+after an hour untouched, or when the server stops. They never reach the core. In a file tree a
+node's name is the node's whatever it looks like, and every other name a title can be is a file.
+In a flat directory, other temporary names are files of their own when they are resource names
+(`notes.md.tmp`), and refused when not (`.notes.md.tmp`, sed's `sedAb12Cd`): such a save fails
+there. Over the bounds,
+`._*`, `.DS_Store` and `Thumbs.db` make room for others, least recently used first, or are
+dropped rather than refused, so copying many files in doesn't fail on them (Finder reads a `507`
+as a full disk).
+
+- A MOVE of a scratch file onto a file's name, the atomic save of gedit, VS Code and most editors,
+  commits its content exactly as a PUT would (an edit, a create or a restore), then drops it.
+- A MOVE of a file to a scratch name, an editor moving the original aside as a backup before
+  writing the new version, copies it (a raw file's bytes, within `-max-file-size`): the file
+  stays, and the write that follows is an edit of it (§H.5), its base taken as any save's; once,
+  within 30 seconds of the MOVE, even one that creates only (davfs2's `If-None-Match: *`, as it
+  takes the name for free after the MOVE, and uploads 10 seconds after the file is closed).
+- MKCOL of an app's or a system's folder, anywhere (macOS's `(A Document Being Saved By
+  TextEdit)`, `.TemporaryItems`, `.Trashes`, `.Trash`, `.Trash-{uid}`, `.Spotlight-V100`,
+  `.fseventsd`, `.DocumentRevisions-V100`), makes a scratch directory, where every name is a
+  scratch file. Any other folder, a dot one too (`.github`, `.obsidian`), is a person's: a folder
+  node in a file tree, and `403` outside one (§H.8), as is a MOVE giving a scratch directory a
+  person's name there: a person's folder in a flat namespace or at the root would keep what is
+  saved in it in memory only. Its files go with it, after an hour untouched or when it is
+  deleted. In a tree, moving one to a person's name makes a folder of that name.
+- At the root only scratch names and app folders can be: no file there reaches the core, so any
+  other (a `report.pdf` dropped on the mount's top folder) is `403`.
+
+**File trees** (§H.2). `-catalog` serves catalogs whose namespace document's `catalog` object
+carries `files: { "ns", "root", "folder"?, "placement"? }`. One without isn't a file tree, and
+isn't served: it is refused at start (`dav: -catalog plain: its namespace document has no
+catalog.files …`), read with the server's grant in local mode and without one in a gateway; one
+only a user's grant reads answers `404`, saying why, when opened, and the root doesn't list it.
+The tree's top level is the children of folder node `files.root`. It is built from the catalog
+namespace's documents, read from the core with the user's grant (`tree.BuildGraph`), again after
+5 seconds or at once after a write through this server; with `-tree-url` its folders are listed
+by the tree service instead (below), and writes still read the documents. `catalog.mode: "tree"`
+is assumed: a node with several parents shows under each, and a DELETE takes it out of that one
+only.
+
+- **Names.** A folder is a folder node and a file a placement `{ns}.{item}`, whose content is its
+  item, read and saved as in the flat view (a raw file typed by its name's extension). Each is
+  named by its node's `title`; a placement without one by its item's name, a folder by its node
+  name. Titles are Unicode in NFC (a name sent in NFD, as macOS may, is stored in NFC), 1 to 255
+  bytes of UTF-8, not `.` or `..`, without `/`, `\`, NUL or characters of `Cc`, `Cf`, `Zl` and
+  `Zp`, and, for Windows clients, without a trailing space or dot: other names are `403`, saying
+  why. A title another tool wrote that breaks these rules is shown escaped (`a/b` as `a%2Fb`, `..`
+  as `%2E%2E`, a trailing dot as `%2E`), never passed into a listing as it is. Names hold
+  capitals, spaces and any script, and a copy's name (`x copy.md`) or a new folder's (`untitled
+  folder`) is a name like any other, renamed by a title change.
+- **Siblings** share one set of names, compared after NFC and Unicode simple case folding, a
+  character for a character (with `-case-sensitive`, after NFC only), as the file systems of
+  Finder's and Explorer's users compare them (so `Maße.txt` and `Masse.txt` are two names): a
+  read of a name a sibling has under another case reads that sibling, but a PUT, COPY or MOVE
+  onto it is `409`, naming the sibling, so a client telling case apart (rclone, davfs2 on Linux)
+  copying `README.md` and `readme.md` doesn't write one over the other, and the guard (above)
+  refuses its cleanup DELETE; a write to the spelling the user read the sibling under, or naming
+  its revision, is the sibling's. MKCOL of a folder's name under another case is `405`.
+  Duplicates a race leaves, or another tool makes, are shown as `name (2).ext`, `name (3).ext`, …
+  in order of their nodes' creation in the catalog's log, the first keeping its name, skipping
+  numbers whose names a sibling has, and after titles shown as they are where a title is shown
+  escaped (an escaped `a/b` never takes a real `a%2Fb`'s name); a folder's number goes at its
+  name's end, and a numbered name stays within 255 bytes, its stem cut short.
+- **Listings** show folders, and files whose items are live, offered (not sealed or end-to-end)
+  and readable with the user's grant: dangling placements, cyclic nodes and items hidden from the
+  user aren't shown. A folder's listing reads the heads of its own items (a path's folders above
+  only where a name is ambiguous), and the document of each revision once, for its size and type;
+  through a tree service, none of them (below).
+- **Through a tree service** (§H.3, §H.7). With `-tree-url URL`, the base URL of a `patchlog tree`
+  following the served catalogs (`CATALOG=URL` for a catalog's own, repeatable, as `serve -tree-url`
+  takes them; `TreeService` and `TreeServices` in `dav.Options`), a folder is listed from the tree
+  service's `children` listing, read with the request's grant passed through as its bearer (in local
+  mode `-bearer`'s), which the tree service checks and filters the listing by (§B.11.5): every page
+  of it, at most 10 pages of 1000 entries, and a folder larger is `403`, never listed cut short;
+  its files are opened, written, moved and deleted by name all the same, found in the node
+  documents with only the items of the name asked for read. A
+  file's ETag is its entry's `head`, and its size, type and time the `file` metadata the tree
+  service adds (§H.3), so a folder lists in one request and no item is read for it; a placement
+  whose `file` is sealed (an item of a sealed namespace) isn't listed, and one without `file`, or
+  without its `modified`, is read from the core as above (an end-to-end namespace's item isn't
+  listed). Names are given as above, the same duplicates, escapes and case folding, and a path
+  resolves to what its folder lists, every folder on it listed. A write (PUT, DELETE, MOVE, COPY,
+  MKCOL) checks what the listing named against the node documents, read again if read before the
+  request: a name another user renamed or moved a moment ago, or a name a file was just given,
+  which the listing doesn't show yet (it doesn't wait for other users' writes), is resolved from
+  the node documents instead, as without a tree service, so a DELETE or MOVE of a renamed file's
+  old name is refused and touches nothing, and a PUT of a name a sibling has now is that
+  sibling's, never a second file by its name. A placement is deleted, a node renamed or moved, a
+  folder deleted or a file in several folders unlinked from one, only as its document was read
+  and still named as the path named it: changed since by another program, it is a `409` or
+  `404`.
+  Placements of a namespace the
+  catalog doesn't trust are dangling (§B.5): the tree service doesn't list them, and nor does this
+  server, from the node documents either, where a catalog has a tree service. Implicit placements
+  (§B.9, `-self-placing`), which no node holds, aren't listed. A catalog whose `catalog.title` is
+  set is listed from its node documents, since the tree service gives placements without a title
+  their items' titles (§B.5) and a file is shown by its item's name (§H.2). Listings are kept per
+  token for 5 seconds, or until a write through this server. A grant limited to some resources,
+  which reads neither the catalog's namespace document nor its `/heads` (§2.1, §7.4), lists through
+  the tree service with the tree's settings (`catalog.files`, `catalog.trust`) as last read with any
+  grant, this server's own at start included; until some grant read them, the tree answers `404`.
+  Such a grant edits the files it lists and reads; a new file or folder, a move or a delete, which
+  the node documents decide, is `403`, saying so, a move before anything is written (onto another
+  file, or to another tree or namespace, the copy is the first write). The tree service unreachable is
+  `502`, and its `503` (behind the catalog, a sealed namespace's key) a `503` with its
+  `Retry-After`: never an empty folder. Its `401` and `403` are the user's grant refused, answered
+  as the core's are (in local mode a `401` refuses `-bearer`: `502`, naming the tree service). A
+  tree service answers `503` behind until it has caught up with every namespace the catalog
+  trusts and can follow, not only with the catalog (started with a fresh database, rebuilt, or
+  trusting one lately), rather than list every folder empty or part filled; the gateway answers
+  that `503` too.
+- **Read-your-writes** through a tree service, which lags the core. After a user's write through
+  this server (a new file or folder, a rename, a move, a delete, an edit, wherever it is made, with
+  any of their tokens), that user's listings of a tree carry `?min={ns}:{ns_id}` for each namespace
+  entry the write produced in the catalog or a namespace it trusts (the write's
+  `X-Namespace-Revision`, seen as the core answers it), which the tree service waits for (§B.5),
+  until a listing that carried them came back, for at most 10 minutes (at most the last 4 entries
+  of 64 namespaces a user); other users' listings don't wait. If it hasn't caught up within
+  `-tree-wait` (3 s; the tree service's own `-min-wait`, 2 s, answers sooner), the folder is
+  listed from the node documents instead, as without a tree service, and so are the user's
+  listings of that tree for 5 seconds, however long the tree service lags within those 10
+  minutes: their new file stays listed, and a file they renamed doesn't come back by its old name;
+  a grant that can't read the node documents gets `503` with `Retry-After` for 30 s after the
+  write, then the tree service's listing without waiting. A `min` the tree service refuses
+  (`400`: a namespace it doesn't follow, or the reader can't see) is found per namespace, each
+  one's asked for alone: those refused, and those reached, aren't asked for again, the rest
+  are, and that listing is from the node documents.
+- **New files** (§H.4). A PUT of a new name creates an item in `files.ns` with an opaque name (13
+  random base32 characters), and its placement titled with the name, under its folder: one
+  `parents` entry, ordered after the folder's last ordered child, so new files list last, and
+  `$schema` from `files.placement` where given. The catalog must trust `files.ns` (`403`
+  otherwise). A dry run of the placement (§7.5) comes first, so one the core refuses (a frozen
+  catalog, a grant that doesn't write it, the catalog's rules) writes nothing; then the item is
+  created (`If-None-Match: *`; a raw file's blob uploaded first), then placed, and an item whose
+  placement is refused still, the catalog having changed in between, is deleted again at once (a
+  `429` waited out as a write's is).
+  Its kind is §H.1's: a name ending in `.json` with I-JSON content makes a JSON document, any
+  other a raw one. MKCOL makes a folder node so (an opaque name, `title`, `parents`, `order`,
+  `$schema` from `files.folder`). Where the catalog requires nonces, each write to it carries a
+  fresh `$nonce` (§H.7), as file writes do where `files.ns` requires them.
+- **Rename and move** (§H.5). A MOVE within the tree is one append to the node, with `If-Match`
+  on its head: a new name replaces its `title`, a new folder its `parents` entry (ordered after
+  the last child there), both in one patch set. The item isn't touched, so its history, ETag and
+  links stay. A rename to another case of the name is taken whatever `Overwrite` says. A folder
+  moves with what is in it, but not into itself or a folder in it (`403`), not over another
+  folder, and not out of its tree (folders aren't copied).
+- **Onto an existing file** a MOVE saves the source's content into it, its base taken as a PUT's,
+  so it keeps its history, then deletes the source: "write a temporary file, rename it over"
+  saves land so (the temporary name, unless a scratch name, is a file of the tree meanwhile).
+- **Across trees and namespaces** (to another tree, to or from a flat directory) a MOVE copies the
+  file, then deletes the source; where its item is deleted, its last revision first takes
+  `$successor` naming the copy (§8.1: a bare name in the same namespace, else `/r/{ns}/{name}`),
+  in one batch with the tombstone, unless its root isn't an object (a JSON array moves without).
+  A MOVE onto a file or across whose source's placement the grant's verbs in the catalog don't
+  let it delete (`delete`, or `append` to unlink a file in several folders) is `403` before
+  anything is written, as is one by a grant that doesn't read the node documents; what only the
+  grant's rules decide is known at the delete, which leaves the copy.
+- **Copy** makes a new item with the source's content, and a placement for it: a raw file's blob
+  keeps its id and is copied with `Blob-From` (§7.8), or uploaded again where the core refuses
+  that (a source of a higher rank, such as a private namespace's, into a public one). Folders
+  aren't copied (`403`).
+- **Delete a file**: its placement, then, where its item is in `files.ns` (the tree owns it) and
+  the user's grant allows `delete` there, its item; else the item stays, unplaced, as a failure
+  between the two leaves it. A `DELETE` whose `If-Match` isn't the item's head is `412`, deleting
+  nothing, as is one whose item changes between that check and its delete: the placement is
+  restored.
+- **Delete a folder**: only one without visible children (`409`, naming them, and nothing hidden
+  from the user), as the node documents, read for it, have them, never a tree service's listing,
+  which lags (a file someone put in it a moment ago); placements whose items are gone (dangling,
+  §B.3) aren't contents, and are deleted first; the user's scratch files in it go with it. Deletes
+  never recurse, and the tree's top isn't deleted (`403`).
+- Writes through a placement go only to items in a namespace the catalog trusts (`catalog.trust`,
+  §B.3) or that is served with `-ns`, never to a catalog's own nodes (`403`): a local mode's grant
+  may reach namespaces the server wasn't set up to serve.
+
+**Not in the prototype.** Without a tree service, the catalog's trust list beyond bounding writes
+and access by subject set (`$access`, §B.11): users see what their grant reads, as the core lists
+it. Writes in a tree through the tree service alone: they read the node documents, which a grant
+limited to some resources can't. Grants issued by the catalog (§B.11.4): each user's grant is
+passed through, so a new file is created before it is placed, never placed first. Merges of
+text: raw files conflict as a whole (§H.9). Blob references deeper in a JSON document read and
+edit as JSON. Sealed (E.2) and end-to-end (E.3) namespaces, which need keys. History (revisions
+and logs as directories), live invalidation, and batches: each file is its own write, so saving
+several isn't atomic. Users limited to some resources (rules on `/resource`, §C.5) can't list a
+flat namespace, whose `/heads` needs unrestricted read, but can open and write its files by
+path, learning the writer settings from `GET /ns/{ns}/principal` (§H.7); a tree's folders they
+list through a tree service (above).
+PROPFIND with `Depth: infinity` is `403` (`propfind-finite-depth`), and one without Depth lists
+one level. Dead properties (PROPPATCH) are kept per user in memory (§H.8), at most 1 MiB a user,
+read back by PROPFIND, moved with a MOVE, dropped with a DELETE, an hour untouched or a restart.
+Uploads are buffered in memory, not spooled to disk.
 
 ### Bundles (§G.4)
 
@@ -3088,6 +3842,7 @@ internal/release     release documents (§F.9)
 internal/janitor     branch cleanup with claim verification (§F.6)
 internal/tree        tree service: folders, placements, links, manifests (§B.2–§B.9)
 internal/catalog     tree-derived access and grant issuing (§B.11)
+internal/dav         WebDAV for file managers and editors: namespaces and catalogs as files, saves as diffs (a prototype)
 internal/bundle      bundle format, export and import (§G.4)
 internal/archive     file:// archives for pruning and offline restore (§8.6)
 internal/pgtest      a fresh Postgres database per test (PATCHLOG_TEST_PG)

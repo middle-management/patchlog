@@ -5,6 +5,7 @@
 //	patchlog grant mint -key SEED -block '{"kid":…,"sub":…,"ns":[…],"can":[…],"exp":…}'
 //	patchlog grant narrow -grant TOKEN -block '{"can":["read"],…}' [-seal]
 //	patchlog grant seal -grant TOKEN
+//	patchlog dav -api URL -ns NS[,NS…] [-catalog NS[,NS…]] [-gateway] …   (WebDAV, a prototype)
 //
 // Grants are Biscuit v3 tokens (§C.8).
 package main
@@ -59,7 +60,7 @@ func main() {
 		usage()
 	}
 	switch os.Args[1] {
-	case "serve", "index", "tree", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema":
+	case "serve", "index", "tree", "dav", "merge", "rebase", "janitor", "export", "import", "bundle", "archive", "schema":
 		// OpenTelemetry, if configured by OTEL_* (off by default):
 		// flushed when the command returns (after a server's graceful
 		// shutdown), not on log.Fatal.
@@ -79,6 +80,8 @@ func main() {
 		indexCmd(os.Args[2:])
 	case "tree":
 		treeCmd(os.Args[2:])
+	case "dav":
+		davCmd(os.Args[2:])
 	case "merge":
 		mergeCmd(os.Args[2:])
 	case "rebase":
@@ -111,6 +114,8 @@ func usage() {
   patchlog index -ns NS[,NS…] [-api URL] [-db index.db] [-addr :8081] [-bearer GRANT] [-author NAME] [-branches] [-rebuild] [-untyped-listing=false] [-purge-url URL]... [-edge-secret FILE]
   patchlog tree -api URL -catalog NS[,NS]... [-db tree.db] [-addr :8082] [-access -key SEED -kid KID [-edge-grant-key [KID=]FILE]... [-edge-grant-kid KID] [-origin-edge-grant-kid KID[,KID]]... [-exchange-rate RATE,BURST]]
                 [-bearer T] [-author A] [-self-placing] [-purge-url URL]... [-edge-secret FILE]
+  patchlog dav -api URL -ns NS[,NS…] [-catalog NS[,NS…] [-tree-url [CATALOG=]URL]...] [-addr 127.0.0.1:8090] [-bearer GRANT | -bearer-file FILE] [-author A] [-password-file FILE]
+               [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]   (WebDAV, a prototype)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
   patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
@@ -121,7 +126,7 @@ func usage() {
   patchlog schema import -api URL -ns NS [-bearer T] [-author A] [-name NAME] [-dry-run] [-json] URL|FILE...
   patchlog health [-timeout 2s] [URL]   (exit 0 if URL, default http://localhost:8080/_health, answers 200)
 
-serve, index and tree also take -shutdown-timeout 30s and -shutdown-delay 0 (graceful shutdown) and answer /_health and /_ready.`)
+serve, index, tree and dav also take -shutdown-timeout 30s and -shutdown-delay 0 (graceful shutdown) and answer /_health and /_ready.`)
 	os.Exit(2)
 }
 

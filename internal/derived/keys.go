@@ -246,11 +246,16 @@ func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey
 
 // Check decides whether the service can consume ns. It returns "" if it
 // can, else why not; permanent means retrying won't help without a new
-// configuration (an e2e namespace and no recipient key). partial (an e2e
-// namespace whose documents can't be read, which a tree service may still
-// follow for heads) is reported when allowPartial and is not a skip. A
-// purged namespace is consumed: its follower learns of the purge.
-func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason string, permanent bool) {
+// configuration (an e2e namespace and no recipient key), and retry that
+// the epoch key couldn't be fetched for a reason asking again may mend
+// (Retryable: the core unreachable, a 5xx, a 429), rather than the
+// service's keys as configured: ns is skipped all the same (nothing is
+// consumed that can't be decrypted or sealed), but a consumer waiting for
+// it keeps waiting. partial (an e2e namespace whose documents can't be
+// read, which a tree service may still follow for heads) is reported when
+// allowPartial and is not a skip. A purged namespace is consumed: its
+// follower learns of the purge.
+func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason string, permanent, retry bool) {
 	in, err := k.Info(ctx, ns)
 	switch {
 	case err != nil && errors.Is(err, client.ErrNoKeys):
@@ -259,11 +264,11 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 		// Not an encryption problem (e.g. the core is unreachable): the
 		// follower's own retries report it.
 		k.setReason(ns, "", false)
-		return "", false
+		return "", false, false
 	case in.Level == LevelE2E && k.e2e == nil:
 		if allowPartial {
 			k.setReason(ns, "e2e namespace and no keyring recipient key: documents are not read", false)
-			return "", false
+			return "", false, false
 		}
 		reason, permanent = "e2e namespace and no keyring recipient key configured", true
 	case in.Protected():
@@ -272,14 +277,23 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 			// Its keys are destroyed with its content (§8.5): the
 			// follower learns of the purge, and nothing is left to seal.
 			k.setReason(ns, "", false)
-			return "", false
+			return "", false, false
 		}
 		if err != nil {
 			reason = "cannot obtain the epoch key to seal derived views: " + err.Error()
+			retry = Retryable(err)
 		}
 	}
 	k.setReason(ns, reason, reason != "")
-	return reason, permanent
+	return reason, permanent, retry
+}
+
+// Retryable reports a failure to fetch keys that asking again may mend:
+// the core unreachable or the connection cut (a transport error), or its
+// 5xx or 429. Not the service's configuration: no key for its grant
+// (client.ErrNoKeys), none to unwrap one with, or a 4xx refusal.
+func Retryable(err error) bool {
+	return !errors.Is(err, client.ErrNoKeys) && client.Transient(err)
 }
 
 func (k *Keys) setReason(ns, reason string, skipped bool) {

@@ -61,6 +61,40 @@ func TestCatchUpPaged(t *testing.T) {
 	}
 }
 
+// WithOnCatchUp reports the head a catch-up replays to once it is read,
+// before any page is delivered, and again once the checkpoint reaches it,
+// after the last page: a checkpoint alone (the first page's) isn't caught
+// up (§10 Catch up).
+func TestCatchUpReported(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond, LogPageSize: 2})
+	c := s.Client(t, client.WithAuthor("admin"))
+	must(c.CreateNamespace(ctx, "main", map[string]any{"read": "public"}))
+	id := must(c.CreateDoc(ctx, "main", "a", map[string]any{"n": 0})).ID
+	for i := 1; i < 6; i++ {
+		id = must(c.Append(ctx, "main", "a", id, rep("/n", i))).ID
+	}
+	head := must(c.NSHead(ctx, "main")).ID
+	cp := &follow.MemoryCheckpoints{}
+	rec := &recorder{cp: cp}
+	var mu sync.Mutex
+	var got []string
+	r := start(follow.New(c, "main", cp, rec, follow.WithMaxUnits(0), follow.WithOnCatchUp(func(ns, h string, done bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		got = append(got, fmt.Sprintf("%s %s %v after %d", ns, h, done, len(rec.snapshot())))
+	})))
+	waitFor(t, "catch-up", checkpointIs(t, cp, c, "main"))
+	waitFor(t, "the catch-up reported", func() bool { mu.Lock(); defer mu.Unlock(); return len(got) == 2 })
+	r.stop(t)
+	mu.Lock()
+	defer mu.Unlock()
+	if want := []string{"main " + head + " false after 0", "main " + head + " true after 4"}; fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("reported %q, want %q", got, want)
+	}
+}
+
 // The follower's flows with a log page size of 2: catch-up ranges, branch
 // bootstraps (first page only) and snapshot starts all read paged logs.
 //

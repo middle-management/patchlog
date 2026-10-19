@@ -26,7 +26,10 @@ type OperatorKey struct {
 
 // OperatorKeys reads the JWK Set at the jwks_uri that GET / gives, by
 // default /.well-known/patchlog-keys (§C.4). Entries that aren't OKP
-// Ed25519 keys with a kid are left out.
+// Ed25519 keys with a kid are left out. A body that isn't a JWK Set, an
+// object whose "keys" is an array (`{}`, a proxy's JSON error page), is
+// an error, never an empty set: callers that check grants against the
+// operator keys would take every grant for a namespace's.
 func (c *Client) OperatorKeys(ctx context.Context) ([]OperatorKey, error) {
 	r, err := c.do(ctx, "GET", "/", nil, nil)
 	if err != nil {
@@ -89,7 +92,10 @@ func (c *Client) OperatorKeys(ctx context.Context) ([]OperatorKey, error) {
 		return nil, fmt.Errorf("client: the JWK Set is not JSON: %w", err)
 	}
 	set, _ := v.(map[string]any)
-	arr, _ := set["keys"].([]any)
+	arr, isSet := set["keys"].([]any)
+	if !isSet {
+		return nil, fmt.Errorf("client: %s is not a JWK Set (an object with a \"keys\" array, §C.4)", uri)
+	}
 	var out []OperatorKey
 	for _, x := range arr {
 		k, _ := x.(map[string]any)

@@ -454,7 +454,7 @@ func (ix *Index) follow(ctx context.Context, ns string) {
 		var err error
 		// Addendum E: never consume what can't be decrypted (or whose
 		// results can't be sealed); skip it and say why.
-		if reason, permanent := ix.keys.Check(ctx, ns, false); reason != "" {
+		if reason, permanent, _ := ix.keys.Check(ctx, ns, false); reason != "" {
 			if permanent {
 				ix.opt.Logf("index: skipping %s: %s", ns, reason)
 				return

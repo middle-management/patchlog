@@ -2,6 +2,12 @@ package derived_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"syscall"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
@@ -52,7 +58,33 @@ func TestCheckSealedPurged(t *testing.T) {
 	if _, err := k.EpochKey(ctx, "sec", 1); !client.IsPurged(err) {
 		t.Fatalf("epoch key after the purge: %v", err)
 	}
-	if reason, permanent := k.Check(ctx, "sec", false); reason != "" || permanent || k.Skipped("sec") != "" {
-		t.Fatalf("check: %q %v", reason, permanent)
+	if reason, permanent, retry := k.Check(ctx, "sec", false); reason != "" || permanent || retry || k.Skipped("sec") != "" {
+		t.Fatalf("check: %q %v %v", reason, permanent, retry)
+	}
+}
+
+// Retryable tells a failure to fetch keys that asking again may mend (the
+// core unreachable, a 5xx, a 429) from the service's configuration's (no
+// key for its grant, none to unwrap one with, a 4xx refusal), which a
+// tree service stops waiting for and the other it keeps waiting for.
+func TestRetryable(t *testing.T) {
+	for _, c := range []struct {
+		err  error
+		want bool
+	}{
+		{&url.Error{Op: "Post", URL: "http://core/ns/v/keys", Err: errors.New("connection reset by peer")}, true},
+		{fmt.Errorf("fetching: %w", syscall.ECONNRESET), true},
+		{io.ErrUnexpectedEOF, true},
+		{&client.APIError{Status: http.StatusServiceUnavailable}, true},
+		{&client.APIError{Status: http.StatusTooManyRequests}, true},
+		{&client.APIError{Status: http.StatusForbidden}, false},
+		{&client.APIError{Status: http.StatusNotFound}, false},
+		{fmt.Errorf("%w: the grant gets no epoch key v#1", client.ErrNoKeys), false},
+		{errors.New("derived: v#1 is wrapped to the grant's enc and no recipient key is configured"), false},
+		{nil, false},
+	} {
+		if got := derived.Retryable(c.err); got != c.want {
+			t.Errorf("Retryable(%v) = %v", c.err, got)
+		}
 	}
 }

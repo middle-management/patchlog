@@ -11,6 +11,9 @@ type Cache[K comparable, V any] struct {
 	// cost, and an entry costing more than a quarter of it isn't kept: it
 	// would push out a quarter of the cache.
 	MaxEntries, MaxBytes int
+	// OnEvict, if set, is called with each entry Put evicts to keep the
+	// bounds (not one replaced, removed or flushed).
+	OnEvict func(K, V)
 
 	l     *list.List
 	m     map[K]*list.Element
@@ -52,12 +55,49 @@ func (c *Cache[K, V]) Put(k K, v V, n int) {
 		c.bytes += n
 	}
 	for len(c.m) > c.MaxEntries || c.MaxBytes > 0 && c.bytes > c.MaxBytes {
-		e := c.l.Back()
-		it := e.Value.(*item[K, V])
-		c.l.Remove(e)
-		delete(c.m, it.k)
-		c.bytes -= it.n
+		k, v, _, _ := c.RemoveOldest()
+		if c.OnEvict != nil {
+			c.OnEvict(k, v)
+		}
 	}
+}
+
+// RemoveOldest drops the least recently used entry and returns it with
+// its cost; false if there is none.
+func (c *Cache[K, V]) RemoveOldest() (K, V, int, bool) {
+	if len(c.m) == 0 {
+		var k K
+		var v V
+		return k, v, 0, false
+	}
+	it := c.l.Remove(c.l.Back()).(*item[K, V])
+	delete(c.m, it.k)
+	c.bytes -= it.n
+	return it.k, it.v, it.n, true
+}
+
+// Remove drops k's entry, reporting whether there was one.
+func (c *Cache[K, V]) Remove(k K) bool {
+	e, ok := c.m[k]
+	if !ok {
+		return false
+	}
+	it := c.l.Remove(e).(*item[K, V])
+	delete(c.m, k)
+	c.bytes -= it.n
+	return true
+}
+
+// Keys returns the keys, the most recently used first, marking none used.
+func (c *Cache[K, V]) Keys() []K {
+	out := make([]K, 0, len(c.m))
+	if c.l == nil {
+		return out
+	}
+	for e := c.l.Front(); e != nil; e = e.Next() {
+		out = append(out, e.Value.(*item[K, V]).k)
+	}
+	return out
 }
 
 // Len is the number of entries, Bytes their total cost.
