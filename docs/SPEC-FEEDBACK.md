@@ -561,6 +561,107 @@ From two more rounds on v0.55, in the same gateway.
     reload that `409` asks for", a full read by the token refused, and say that programs sharing one
     grant count as one.
 
+From a review of v0.55 as a whole (specification-level proposals; no divergence in the
+reference, which follows the current text in each case). Two companion drafts came out of
+the same review: `docs/TESTVECTORS.md` (the §13 test-vector addendum, with vectors
+computed by the reference) and `docs/CONFORMANCE.md` (a requirement index).
+
+73. **What `GET /`'s `spec` means** (§7). The version is published and compared
+    component-wise, but no section says what a client, a federation peer or a tool should
+    *do* with it: which differences are breaking, whether a peer may refuse on version,
+    and how it relates to the member-tolerance rules (§7.4) that make skew safe. As
+    written it is advertisement that every consumer will invent semantics for.
+    *Propose:* either downgrade it to informational ("carries no conformance meaning;
+    behaviour is discovered per feature"), or define it: a consumer MUST NOT refuse on
+    the version alone (as §7.4 already says for namespace documents), and a deployment
+    increments the version when it changes anything §1's Conformance section makes
+    byte-exact or gate-visible. The reference treats it as informational.
+74. **Edge-grant cookies are host-only** (§C.5.2, §C.5.3). The attributes listed are
+    `Secure`, `HttpOnly`, `SameSite`, `Path`, and a `__Secure-` name, but nothing says
+    the cookie is set **without a `Domain` attribute**. With `Domain`, the `__Secure-`
+    prefix is rejected, so a conforming minter can't set one by accident; stating
+    "host-only" anyway closes the subdomain question for service formats that don't use
+    the prefix, and for edges reading cookies they didn't mint. *Propose:* say "no
+    `Domain` attribute: the cookie is host-only".
+75. **The release merge lock** (§F.9). "A lock resource per catalog base … taking it is
+    an append with `If-Match` that sets the holder when there is none, and releasing it
+    is an append that clears it" is the whole protocol, inside a parenthetical: the
+    document shape, what a holder is, what a stale holder means (a crashed merge
+    service), and whether the lock is advisory (a second service appends with
+    `If-Match` on the same head and wins the race) are left to each deployment, so two
+    merge-service implementations can't share a release namespace. *Propose:* promote it
+    to a short subsection fixing the document shape (`{ "holder": <sub of the merge
+    service>, "plan": <plan digest> }`, empty object when free), that the lock is
+    advisory and claimed by compare-and-append, and how a stale lock is taken over (the
+    resuming service names the stored plan's digest; anything else needs a person).
+76. **`after` and `X-Log-Next`** (§7.1, §7.4). Log ranges page with `X-Log-Next`
+    (implicit `since` continuation), `/heads` pages with `after` + `next`, and the
+    gestures listing uses `X-Log-Next` carrying a composite `{resource}/{id}` that the
+    client passes back as `?after=` — so `after` has two grammars and `X-Log-Next` two
+    meanings. *Propose:* one mechanism: keep `after` as the request parameter everywhere
+    (a plain bound in byte order of name for `/heads`; `{resource}/{id}` for gestures;
+    not needed for log ranges, whose `since` already continues), and keep `X-Log-Next`
+    purely as the response header naming the value to continue from. Rename the gestures
+    continuation so `?after=` never takes a composite form on one endpoint and a plain
+    name on another.
+77. **`compare … "in"` with a scalar right side** (§6.4.2). The grammar allows
+    `"in": { "value": … }` and `"in": { "path": … }`, and "in is true when the left value
+    equals an element of the right-hand array"; a right side that isn't an array isn't
+    covered by "operands of different or unsupported types", since `in` has no stated
+    operand types. The reference treats a non-array right side as false. *Propose:* say
+    so.
+78. **Rate-bucket deduction is atomic** (§6.6). "A request is admitted while every bucket
+    it draws on holds at least one token, and its cost is then deducted" doesn't say the
+    check-and-deduct is one atomic operation. With several origin instances sharing a
+    database, non-atomic buckets let every instance admit the same token, multiplying the
+    configured rates by the instance count. The reference deducts transactionally with
+    the write's admission. *Propose:* "the check and the deduction are atomic with each
+    other (and with the write for the buckets it draws on), across every instance sharing
+    the store".
+79. **Long-poll cursor bounds** (§7.7). "A cursor more than one hour's worth of intervals
+    ahead of the server's is `400`, so cursors can't mint unlimited cache keys" bounds
+    the future only. A cursor far in the *past* also mints fresh cache keys (one per
+    request, each waiting a full interval). The cost is bounded by the client doing the
+    waiting, so it matters less, but the reference answers such a request immediately
+    with `204` and a corrected cursor rather than `400`, since a past cursor is what a
+    client holds after a partition. *Propose:* say what a past cursor gets.
+
+80. **Making the normative load visible** (§1, reading convention). Under the
+    convention, every statement of what a server answers is a requirement, so at the
+    text's current length every sentence is load-bearing and two readers will extract
+    different requirement sets. The companion drafts mitigate this from outside
+    (`docs/CONFORMANCE.md` restates, `docs/TESTVECTORS.md` pins); the text itself could,
+    over a few versions:
+    1. End each section with a **Requirements** block: short imperative statements with
+       stable ids (§6.2's gate order already works this way, and is the spec's most
+       reliably implemented part). Requirement diffs between versions become checkable,
+       where v0.53's "no change in behaviour" had to be taken on trust.
+    2. Mark rationale as rationale (an italic *Rationale:* note after each block), so
+       the justification passages — worth keeping, they stop implementers re-deriving
+       wrong designs — stop being mined for requirements.
+    3. Extract inline protocols into subsections of their own: the merge lock (75), the
+       cookie name derivation (§C.5.3), the paging continuation grammar (76), the `pl`
+       claims per payload kind (§E.2.2, now spread over four bullets). Each is a small
+       format or state machine that wants a grammar block and negative cases.
+    4. Lint the defined terms: use each §2.1 term only in its defined sense, and never
+       paraphrase the concept ("the rule for other namespaces" in §7.5, "judged
+       structurally" in §6.1). A paraphrase reads as a second, subtly different rule;
+       notes 1–72 accreted from the reference having to pick one.
+    5. Move the fast-changing edges into **registries**: §12 is one for errors; limits
+       (§6.6), namespace-document members (§7.4), verbs, entry kinds, query parameters,
+       cache tags and `x-*` keywords want the same. Additions become visibly additive,
+       and "did a version change behaviour?" becomes a registry diff.
+    Then §1's convention can narrow to: normative = requirement blocks + registries +
+    the byte-exact definitions (with vectors); the rest is explanation. *Propose:* take
+    it in that order, §6–§8 first (most gate-visible, already list-shaped), registries
+    in the same pass, term lint once and then in CI; don't split the file (cross-
+    references are already the text's main cost) and don't cut the rationale.
+81. **`spec` on `GET /` and the versioned edges** (see 73). If the version stays
+    informational, the registries of 80.5 give deployments a better lever: a peer or
+    tool learns what a deployment offers from the endpoints themselves (`404
+    not_offered`) and from `/principal`, not from a number. *Question:* is that the
+    intended discovery path for newer features, and should §7 say so?
+
 ## Settled in v0.55
 
 None of notes 1–24. v0.55 took up the WebDAV gateway as Addendum H, and added to the core `GET

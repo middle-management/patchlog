@@ -7,7 +7,9 @@ canonical text of the specification is maintained outside this repository;
 text doesn't yet describe are collected for its writer in
 [docs/SPEC-FEEDBACK.md](docs/SPEC-FEEDBACK.md) — when the two disagree, the
 reference and this README are what implementations are measured against, and the
-mirror follows. References to D.x (storage layout, write path, snapshots, Postgres) are to
+mirror follows. Companion drafts for the spec writer: [docs/TESTVECTORS.md](docs/TESTVECTORS.md)
+(known-answer vectors for the byte-exact definitions, computed by this implementation) and
+[docs/CONFORMANCE.md](docs/CONFORMANCE.md) (a requirement index over the spec). References to D.x (storage layout, write path, snapshots, Postgres) are to
 Addendum D of spec v0.49 and earlier, the Bun prototype's notes, which v0.50 moved out of the
 spec into the prototype's `PROTOTYPE.md`; this implementation still follows them, as its own
 choices under §5.
