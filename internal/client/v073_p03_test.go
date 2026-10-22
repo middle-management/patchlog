@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/seal"
 )
@@ -18,7 +19,7 @@ func TestV073FoldStoredSchemaDocument(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	s := clienttest.New(t, clienttest.Options{KeyStore: keyStore(t)})
-	c := s.Client(t)
+	c := s.Client(t, client.WithAuthor("alice"))
 	_, priv, _ := seal.GenerateRecipient()
 	x := c.E2E(priv)
 	must(c.CreateNamespace(ctx, "e", map[string]any{"encryption": map[string]any{"level": "e2e"}}))
