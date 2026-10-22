@@ -439,7 +439,7 @@ func (x *E2E) prepareWrite(ctx context.Context, ns, name, base string, patches a
 		return fail(fmt.Errorf("client: e2e write %s/%s: %w", ns, name, err))
 	}
 	if !x.noValidate {
-		if msg, err := x.validate(ctx, ns, nd); err != nil {
+		if msg, err := x.validate(ctx, ns, nd, false); err != nil {
 			return nil, err
 		} else if msg != "" {
 			return nil, fmt.Errorf("client: e2e write %s/%s: the document doesn't validate against its $schema: %s", ns, name, msg)
@@ -890,7 +890,7 @@ func (x *E2E) Validate(ctx context.Context, doc any) (string, error) {
 	if x.noValidate {
 		return "", nil
 	}
-	return x.validate(ctx, "", doc)
+	return x.validate(ctx, "", doc, false)
 }
 
 // ValidateIn is Validate for a document written to namespace target,
@@ -901,7 +901,7 @@ func (x *E2E) ValidateIn(ctx context.Context, target string, doc any) (string, e
 	if x.noValidate {
 		return "", nil
 	}
-	return x.validate(ctx, target, doc)
+	return x.validate(ctx, target, doc, false)
 }
 
 // snapshot fetches the sealed snapshot of the pruning horizon h of ns/name
@@ -1033,7 +1033,7 @@ func (x *E2E) fold(ctx context.Context, ns, name, id, since string, arr []any) (
 			flag("patch set doesn't apply: " + err.Error())
 			continue
 		}
-		msg, err = x.validate(ctx, ns, nd)
+		msg, err = x.validate(ctx, ns, nd, true)
 		if err != nil {
 			return nil, err
 		}
@@ -1073,8 +1073,11 @@ func (e *errSchemaLoad) Unwrap() error { return e.err }
 
 // validate checks doc against its $schema (§6.1 forms), fetching schemas
 // through the client. It returns a message for an invalid document, or an
-// error when a schema couldn't be fetched.
-func (x *E2E) validate(ctx context.Context, target string, doc any) (string, error) {
+// error when a schema couldn't be fetched. stored is for a revision a fold
+// re-validates, which is held to the rules it was written under (§6.1):
+// Legacy, until revisions keep their markers, so a schema document an
+// earlier version accepted still folds.
+func (x *E2E) validate(ctx context.Context, target string, doc any, stored bool) (string, error) {
 	m, ok := doc.(map[string]any)
 	if !ok {
 		return "", nil
@@ -1151,7 +1154,12 @@ func (x *E2E) validate(ctx context.Context, target string, doc any) (string, err
 			}
 		}
 	}
-	err := x.schemas.v.Validate(doc, load)
+	var err error
+	if stored {
+		err = x.schemas.v.ValidateRules(doc, load, schema.Legacy)
+	} else {
+		err = x.schemas.v.Validate(doc, load)
+	}
 	if err == nil {
 		return "", nil
 	}
