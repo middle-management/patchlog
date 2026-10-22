@@ -6,8 +6,9 @@
 //   - the root signature by a key of the namespace document at its head;
 //   - in a branch, keys follow the base (§C.4): a key the branch copied from
 //     its base is accepted only while the base's current document still has
-//     it with the same pub, recursively;
-//   - revocations of the namespace and, for a branch, of every base;
+//     it with the same pub, recursively, through local bases only: a remote
+//     branch's keys and revocations are its own (§10, §G.3);
+//   - revocations of the namespace and, for a branch, of every local base;
 //   - the order of §C.2: a grant not naming the namespace is 403 before
 //     anything else; no usable grant (malformed, unknown key, bad
 //     signature, revoked, expired, not yet valid) is 401;
@@ -95,9 +96,12 @@ type Config struct {
 	Roles   grant.Roles
 	Revoked map[string]bool
 	MaxLag  *time.Duration
-	Base    string // the base namespace of a branch, "" otherwise
-	BaseAt  string
-	Doc     map[string]any
+	// Base is the base namespace of a local branch, "" otherwise: a
+	// remote branch's base is in another deployment, and contributes no
+	// keys or revocations (§C.4, §10, §G.3).
+	Base   string
+	BaseAt string
+	Doc    map[string]any
 }
 
 // ParseConfig extracts the grant-relevant fields of a namespace document.
@@ -126,8 +130,13 @@ func ParseConfig(ns, head string, doc map[string]any) (*Config, error) {
 		}
 	}
 	if b, ok := doc["base"].(map[string]any); ok {
-		cfg.Base, _ = b["ns"].(string)
-		cfg.BaseAt, _ = b["at"].(string)
+		// A base with an origin is a remote branch's, in another
+		// deployment: a namespace of the same name here is unrelated,
+		// so it is never loaded for its keys (§10, §G.3).
+		if _, remote := b["origin"]; !remote {
+			cfg.Base, _ = b["ns"].(string)
+			cfg.BaseAt, _ = b["at"].(string)
+		}
 	}
 	return cfg, nil
 }
@@ -662,13 +671,54 @@ func (ch *Checker) ReadsUnrestricted(v *grant.Verified) bool {
 // passWhole reports whether rules rs pass against env without referring to
 // /resource (or the whole envelope).
 func (ch *Checker) passWhole(rs []any, env map[string]any) bool {
+	return ch.passWholeRefs(rs, env, "resource")
+}
+
+// passWholeRefs reports whether rules rs pass against env without
+// referring to any of refs or to the whole envelope.
+func (ch *Checker) passWholeRefs(rs []any, env map[string]any, refs ...string) bool {
 	for _, rv := range rs {
 		r, err := ch.compile(rv)
-		if err != nil || r.Refs()["resource"] || r.Refs()["*"] || !r.Eval(env) {
+		if err != nil || r.Refs()["*"] || !r.Eval(env) {
 			return false
+		}
+		for _, ref := range refs {
+			if r.Refs()[ref] {
+				return false
+			}
 		}
 	}
 	return true
+}
+
+// NamespaceWide reports whether a verified grant would be issued a
+// namespace-wide edge grant in its namespace (§C.5.2), as far as its rules
+// decide: it reads the namespace unrestricted (§2.1), no rule of its
+// blocks or key scope refers to /now or the whole envelope, they pass now
+// against a read envelope, and, if it carries roles, it has a qualifying
+// role (§2.1): one listing read whose rules refer to neither /resource
+// nor /now, and pass now. It is ReadsUnrestricted less the rules an edge
+// can't evaluate: a reader whose access depends on the clock is decided
+// on each request, never by a namespace-wide view such as g/all (§B.11.5).
+// Whether the namespace exists, is purged or public is the caller's.
+func (ch *Checker) NamespaceWide(v *grant.Verified) bool {
+	ok, roles := v.Allows("read")
+	if !ok || v.Key.ReadScopeResource {
+		return false
+	}
+	env := ReadEnvelope(v, "", ch.now())
+	if !ch.passWholeRefs(v.KeyRules, env, "resource", "now") || !ch.passWholeRefs(v.BlockRules, env, "resource", "now") {
+		return false
+	}
+	if !v.HasRoles() {
+		return true
+	}
+	for _, role := range roles {
+		if ch.passWholeRefs(v.RoleRules(role), env, "resource", "now") {
+			return true
+		}
+	}
+	return false
 }
 
 func (ch *Checker) compile(v any) (*rules.Rule, error) {
