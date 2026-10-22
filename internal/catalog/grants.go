@@ -582,9 +582,10 @@ func parentHrefsRule(list []string) any {
 }
 
 // planContent decides content verbs (read, append, create, …) on an item
-// from the caller's effective roles at its placement, collected only
-// through subjects the catalog's key in the content namespace may assert
-// (§B.11.4); restore is planRestore's. The roles, their definitions and
+// from the caller's roles at its placement, collected only through
+// subjects the catalog's key in the content namespace may grant through
+// (who.through: its sub and groups scopes, §B.11.2, §B.11.4); restore is
+// planRestore's. The roles, their definitions and
 // the catalog's key are those as of the checkpoint the decision reports
 // (configAt), as for visibility.
 func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (_ *plan, err error) {
