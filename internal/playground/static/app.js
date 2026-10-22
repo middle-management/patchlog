@@ -414,8 +414,9 @@ async function refreshNS() {
     S.config = r.hdr('X-Config-Revision') || '';
     S.nsRaw = r.jose ? r.text : '';
     if (r.jose) {
-      // A sealed namespace (E2) serves its document as a JWE bound to { ns, id: ns_id, kind: "config" }.
-      const d = await decrypted(r, ns, '', { ns, id: S.nsHead, kind: 'config' });
+      // A sealed namespace (E2) serves its document as a JWE bound to { ns, id: ns_id, kind: "doc" }
+      // (§E.2.2); bytes sealed before v0.63 say kind "config", which readers still accept.
+      const d = await decrypted(r, ns, '', (hd) => ({ ns, id: S.nsHead, kind: hd.pl && hd.pl.kind === 'config' ? 'config' : 'doc' }));
       if (ns !== S.ns) return;
       S.nsDoc = d.value; S.nsSeal = d;
     } else { S.nsDoc = r.json; S.nsSeal = null; }
@@ -1876,7 +1877,8 @@ async function openSnapshot(ns, name, h, r) {
   const hdr = Z.parseJWE(jwe).header;
   const kns = Z.parseKid(hdr.kid).ns;
   if (!(await nsChainOK(ns, kns))) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: sealed under ${hdr.kid}`);
-  return openSealed(kns, jwe, '', { ns: kns, name, id: h, kind: 'snapshot' });
+  // pl { ns, name, id } (§E.3.1); snapshots stored before v0.63 also carry kind "snapshot".
+  return openSealed(kns, jwe, '', (hd) => (hd.pl && hd.pl.kind === 'snapshot' ? { ns: kns, name, id: h, kind: 'snapshot' } : { ns: kns, name, id: h }));
 }
 
 /* foldLog verifies and folds an e2e log answer that ends at id and starts after since. A fold from a pruning

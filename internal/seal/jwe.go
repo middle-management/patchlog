@@ -69,14 +69,22 @@ var b64 = base64.RawURLEncoding.Strict()
 // Use the constructors below so that shapes stay exactly as specified.
 type PL map[string]any
 
-// Kinds of resource/namespace documents in PL.
+// Kinds in PL (§E.2.2).
 const (
 	KindRev       = "rev"
 	KindTombstone = "tombstone"
 	KindDoc       = "doc"
 	KindLog       = "log"
-	KindConfig    = "config"
-	KindSnapshot  = "snapshot"
+	// KindPurge and KindPrune are the kinds of a resource stream's purge
+	// and prune events (ResourceEventPL).
+	KindPurge = "purge"
+	KindPrune = "prune"
+	// KindConfig and KindSnapshot are legacy: bytes sealed before v0.63
+	// bind a namespace document with kind "config" (now "doc") and an E3
+	// prune snapshot with kind "snapshot" (now no kind). Expect accepts
+	// them for those payloads (legacyPL); nothing seals them any more.
+	KindConfig   = "config"
+	KindSnapshot = "snapshot"
 )
 
 // ResourcePL binds a resource revision/document/log entry:
@@ -85,9 +93,18 @@ func ResourcePL(ns, name, id, kind string) PL {
 	return PL{"ns": ns, "name": name, "id": id, "kind": kind}
 }
 
-// NamespaceDocPL binds a namespace document: { ns, id, kind: "config" }.
+// ResourceEventPL binds a resource stream's purge or prune event, sealed
+// under the resource's K_r of the current epoch (§E.2.2, §7.3):
+// { ns, name, kind }, kind the event type, KindPurge or KindPrune. The
+// event has no id, so neither has its pl.
+func ResourceEventPL(ns, name, kind string) PL {
+	return PL{"ns": ns, "name": name, "kind": kind}
+}
+
+// NamespaceDocPL binds the namespace document at ns_id id:
+// { ns, id, kind: "doc" } (§E.2.2).
 func NamespaceDocPL(ns, id string) PL {
-	return PL{"ns": ns, "id": id, "kind": KindConfig}
+	return PL{"ns": ns, "id": id, "kind": KindDoc}
 }
 
 // RangePL binds a namespace log range: { ns, range: [since, id] }.
@@ -108,10 +125,10 @@ func PatchSetPL(ns, name, parent string) PL {
 	return PL{"ns": ns, "name": name, "parent": parent}
 }
 
-// SnapshotPL binds an E3 prune snapshot: { ns, name, id, kind: "snapshot" }
-// (§8.6).
+// SnapshotPL binds an E3 prune snapshot to the revision whose document it
+// is: { ns, name, id }, with no kind (§E.3.1, §8.6).
 func SnapshotPL(ns, name, id string) PL {
-	return PL{"ns": ns, "name": name, "id": id, "kind": KindSnapshot}
+	return PL{"ns": ns, "name": name, "id": id}
 }
 
 // Header is a parsed JWE protected header.
@@ -286,11 +303,46 @@ func OpenExpect(jwe string, key []byte, wantKid string, wantPL PL) ([]byte, erro
 	return pt, nil
 }
 
-// Expect reports ErrMismatch unless the header's kid and pl are exactly
-// wantKid and wantPL.
+// Expect reports ErrMismatch unless the header's kid is wantKid and its pl
+// is exactly wantPL, or the legacy pl of the same payload (legacyPL): bytes
+// sealed before v0.63 are stored once and served forever (§E.2.2), so
+// readers accept both forms.
 func (h *Header) Expect(wantKid string, wantPL PL) error {
-	if h.Kid != wantKid || !jsonv.Equal(map[string]any(h.PL), jsonv.FromGo(map[string]any(wantPL))) {
+	if h.Kid != wantKid {
 		return ErrMismatch
+	}
+	if plEqual(h.PL, wantPL) {
+		return nil
+	}
+	if legacy := legacyPL(wantPL); legacy != nil && plEqual(h.PL, legacy) {
+		return nil
+	}
+	return ErrMismatch
+}
+
+func plEqual(got, want PL) bool {
+	return jsonv.Equal(map[string]any(got), jsonv.FromGo(map[string]any(want)))
+}
+
+// legacyPL returns the pl that bytes sealed before v0.63 carry for the
+// payload want binds, or nil where it was the same:
+//
+//   - a namespace document, { ns, id, kind: "doc" }, was bound to
+//     { ns, id, kind: "config" };
+//   - an E3 prune snapshot, { ns, name, id }, to { ns, name, id,
+//     kind: "snapshot" }.
+//
+// No other payload had those pls, so accepting them opens nothing else.
+func legacyPL(want PL) PL {
+	_, ns := want["ns"]
+	_, id := want["id"]
+	_, name := want["name"]
+	kind, hasKind := want["kind"]
+	switch {
+	case len(want) == 3 && ns && id && kind == KindDoc:
+		return PL{"ns": want["ns"], "id": want["id"], "kind": KindConfig}
+	case len(want) == 3 && ns && id && name && !hasKind:
+		return PL{"ns": want["ns"], "name": want["name"], "id": want["id"], "kind": KindSnapshot}
 	}
 	return nil
 }

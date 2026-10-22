@@ -2,6 +2,7 @@ package seal
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 
@@ -41,6 +42,7 @@ func TestV073SealNeverCompresses(t *testing.T) {
 		GrantPL("matches", "1gggg"),
 		PatchSetPL("matches", "derby", ""),
 		SnapshotPL("matches", "derby", "1aaaa"),
+		ResourceEventPL("matches", "derby", KindPurge),
 		{"ns": "matches", "view": "/matches/at/1aaaa?q=x"},
 	} {
 		name := string(jsonv.Canonical(map[string]any(pl)))
@@ -116,5 +118,79 @@ func TestV073SealWithIV(t *testing.T) {
 	d, _ := Seal(k, "matches#1", pl, []byte(`{"a":1}`))
 	if c == d {
 		t.Fatal("Seal repeated an IV")
+	}
+}
+
+// ---- ENC-1, ENC-21, resource events: pl shapes (§E.2.2, §E.3.1, v0.63) ----
+
+func TestV073PLShapes(t *testing.T) {
+	for _, tc := range []struct {
+		pl   PL
+		want string
+	}{
+		{NamespaceDocPL("matches", "1aaaa"), `{"id":"1aaaa","kind":"doc","ns":"matches"}`},
+		{SnapshotPL("matches", "derby", "1aaaa"), `{"id":"1aaaa","name":"derby","ns":"matches"}`},
+		{ResourceEventPL("matches", "derby", KindPurge), `{"kind":"purge","name":"derby","ns":"matches"}`},
+		{ResourceEventPL("matches", "derby", KindPrune), `{"kind":"prune","name":"derby","ns":"matches"}`},
+	} {
+		if got := string(jsonv.Canonical(map[string]any(tc.pl))); got != tc.want {
+			t.Errorf("pl %s, want %s", got, tc.want)
+		}
+	}
+	// What Seal and SealSnapshot put in the header.
+	k := key(12)
+	jwe, _ := Seal(k, "matches#1", NamespaceDocPL("matches", "1aaaa"), []byte(`{}`))
+	if h, _ := ParseHeader(jwe); string(h.Raw) != `{"alg":"dir","enc":"A256GCM","kid":"matches#1","pl":{"id":"1aaaa","kind":"doc","ns":"matches"}}` {
+		t.Errorf("namespace document header %s", h.Raw)
+	}
+	snap, _ := SealSnapshot(k, "matches#1", "matches", "derby", "1aaaa", map[string]any{})
+	if h, _ := ParseHeader(snap); string(h.Raw) != `{"alg":"dir","enc":"A256GCM","kid":"matches#1","pl":{"id":"1aaaa","name":"derby","ns":"matches"}}` {
+		t.Errorf("snapshot header %s", h.Raw)
+	}
+}
+
+// Readers accept the pl of bytes sealed before v0.63 for the payloads whose
+// pl changed, and for nothing else.
+func TestV073LegacyPLAccepted(t *testing.T) {
+	k := key(13)
+	mk := func(pl string) string {
+		return handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"m#1","pl":`+pl+`}`, []byte(`{"a":1}`), false)
+	}
+	legacyDoc := mk(`{"id":"1aaaa","kind":"config","ns":"m"}`)
+	legacySnap := mk(`{"id":"1aaaa","kind":"snapshot","name":"r","ns":"m"}`)
+	if _, err := OpenExpect(legacyDoc, k, "m#1", NamespaceDocPL("m", "1aaaa")); err != nil {
+		t.Fatalf("legacy namespace document: %v", err)
+	}
+	if _, err := OpenSnapshot(legacySnap, k, "m#1", "m", "r", "1aaaa"); err != nil {
+		t.Fatalf("legacy snapshot: %v", err)
+	}
+	if _, err := OpenExpect(mk(`{"id":"1aaaa","kind":"doc","ns":"m"}`), k, "m#1", NamespaceDocPL("m", "1aaaa")); err != nil {
+		t.Fatalf("namespace document: %v", err)
+	}
+	if _, err := OpenSnapshot(mk(`{"id":"1aaaa","name":"r","ns":"m"}`), k, "m#1", "m", "r", "1aaaa"); err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	for name, c := range map[string]struct {
+		jwe  string
+		kid  string
+		want PL
+	}{
+		"legacy doc, other id":           {legacyDoc, "m#1", NamespaceDocPL("m", "1bbbb")},
+		"legacy doc, other kid":          {legacyDoc, "m#2", NamespaceDocPL("m", "1aaaa")},
+		"legacy doc as a resource doc":   {legacyDoc, "m#1", ResourcePL("m", "r", "1aaaa", KindDoc)},
+		"legacy doc as a snapshot":       {legacyDoc, "m#1", SnapshotPL("m", "r", "1aaaa")},
+		"legacy snapshot, other id":      {legacySnap, "m#1", SnapshotPL("m", "r", "1bbbb")},
+		"legacy snapshot, other name":    {legacySnap, "m#1", SnapshotPL("m", "s", "1aaaa")},
+		"legacy snapshot as a resource":  {legacySnap, "m#1", ResourcePL("m", "r", "1aaaa", KindDoc)},
+		"resource doc as a snapshot":     {mk(`{"id":"1aaaa","kind":"doc","name":"r","ns":"m"}`), "m#1", SnapshotPL("m", "r", "1aaaa")},
+		"revision entry as a snapshot":   {mk(`{"id":"1aaaa","kind":"rev","name":"r","ns":"m"}`), "m#1", SnapshotPL("m", "r", "1aaaa")},
+		"config pl as a resource doc":    {mk(`{"id":"1aaaa","kind":"config","name":"r","ns":"m"}`), "m#1", ResourcePL("m", "r", "1aaaa", KindDoc)},
+		"purge event as a prune event":   {mk(`{"kind":"purge","name":"r","ns":"m"}`), "m#1", ResourceEventPL("m", "r", KindPrune)},
+		"resource event as a namespace":  {mk(`{"kind":"purge","name":"r","ns":"m"}`), "m#1", NamespaceDocPL("m", "1aaaa")},
+		"legacy doc with an extra claim": {mk(`{"id":"1aaaa","kind":"config","ns":"m","x":1}`), "m#1", NamespaceDocPL("m", "1aaaa")},
+	} {
+		if _, err := OpenExpect(c.jwe, k, c.kid, c.want); !errors.Is(err, ErrMismatch) {
+			t.Errorf("%s: err = %v, want ErrMismatch", name, err)
+		}
 	}
 }

@@ -122,6 +122,8 @@ func TestInteropHandBuilt(t *testing.T) {
 	if err != nil || !bytes.Equal(got, pt) {
 		t.Fatalf("got %q, %v", got, err)
 	}
+	// Legacy bytes: compressed, with the namespace document's kind before
+	// v0.63 ("config"), which readers still accept.
 	big := bytes.Repeat([]byte("abc"), 1000)
 	hdrZ := `{"zip":"DEF","alg":"dir","enc":"A256GCM","kid":"matches#2","pl":{"ns":"matches","id":"1abc","kind":"config"}}`
 	jwe = handJWE(t, k, hdrZ, big, true)
@@ -142,7 +144,7 @@ func TestInteropHandBuilt(t *testing.T) {
 		t.Fatalf("hand decrypt: %v", err)
 	}
 	hraw, _ := base64.RawURLEncoding.DecodeString(p[0])
-	want := `{"alg":"dir","enc":"A256GCM","kid":"matches#2","pl":{"id":"1abc","kind":"config","ns":"matches"}}`
+	want := `{"alg":"dir","enc":"A256GCM","kid":"matches#2","pl":{"id":"1abc","kind":"doc","ns":"matches"}}`
 	if string(hraw) != want {
 		t.Fatalf("header %s", hraw)
 	}
