@@ -23,6 +23,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/ecdh"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -47,6 +48,9 @@ type Client struct {
 	bearer string
 	author string
 	keys   *Keys // sealed namespaces (sealed.go)
+	// senders are the keyring senders E2E views open entries from
+	// (WithKeyringSenders, e2e.go).
+	senders []*ecdh.PublicKey
 	// sourceAuth are grants sent as Source-Authorization on every write
 	// (WithSourceAuthorization).
 	sourceAuth []string

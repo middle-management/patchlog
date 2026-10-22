@@ -424,7 +424,7 @@ func TestListingsTransientKeyErrorE2E(t *testing.T) {
 		return base.RoundTrip(req)
 	})
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"}, map[string]any{"enc": svcJWK})),
-		client.WithKeys(client.NewKeys(svcPriv)), client.WithHTTPClient(&http.Client{Transport: rt}))
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithHTTPClient(&http.Client{Transport: rt}), client.WithKeyringSenders(wPriv.PublicKey()))
 	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.Recipient = svcPriv })
 	t.Cleanup(func() { failing.Store(false) })
 	x.caughtUp("cat", "pub")

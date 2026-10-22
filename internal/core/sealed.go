@@ -550,7 +550,7 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			}
 			m := map[string]any{"kid": kid, "key": base64.RawURLEncoding.EncodeToString(key)}
 			if resource != "" {
-				m["resource"] = resource
+				m["name"] = resource
 			}
 			out = append(out, m)
 			return nil

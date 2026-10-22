@@ -191,36 +191,38 @@ func TestE2EGateAndReads(t *testing.T) {
 	t.Parallel()
 	f := newE2E(t)
 	e := f.tenv
-	adminPub := newRecipient(t)
+	_, adminPriv, _ := seal.GenerateRecipient()
+	adminPub := adminPriv.PublicKey()
 	f.k1 = seal.NewKey()
 	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
 
-	// The keyring: plaintext, checked as a keyring of this namespace.
-	kr, err := seal.BuildKeyring("e", 1, f.k1, []*ecdh.PublicKey{adminPub, readerPub})
+	// The keyring: plaintext, checked as a keyring of this namespace
+	// (§E.3.2), its entries wrapped by the admin.
+	kr, err := seal.BuildKeyringV2(adminPriv, "e", 1, f.k1, []*ecdh.PublicKey{adminPub, readerPub})
 	if err != nil {
 		t.Fatal(err)
 	}
-	other, _ := seal.BuildKeyring("x", 1, f.k1, []*ecdh.PublicKey{adminPub})
+	other, _ := seal.BuildKeyringV2(adminPriv, "x", 1, f.k1, []*ecdh.PublicKey{adminPub})
 	expectCode(t, e.write("PATCH", "e", "keyring", "", addRoot(other.Value()), f.adminG), 422, "invalid")
-	ahead, _ := seal.BuildKeyring("e", 2, f.k1, []*ecdh.PublicKey{adminPub})
+	ahead, _ := seal.BuildKeyringV2(adminPriv, "e", 2, f.k1, []*ecdh.PublicKey{adminPub})
 	expectCode(t, e.write("PATCH", "e", "keyring", "", addRoot(ahead.Value()), f.adminG), 422, "invalid")
 	expectCode(t, e.write("PATCH", "e", "keyring", "", addRoot(map[string]any{"v": 1.0}), f.adminG), 422, "invalid")
 	expectCode(t, e.writeRaw("e", "keyring", "", sealed(t, f.k1, "e#1", "e", "keyring", "", addRoot(kr.Value())), f.adminG), 422, "invalid")
 	krID := e.create("e", "keyring", kr.Value(), f.adminG)
-	if d := e.doc("e", "keyring", f.readerG); d["ns"] != "e" {
+	if d := e.doc("e", "keyring", f.readerG); len(d["keys"].([]any)) != 2 {
 		t.Fatalf("keyring doc %v", d)
 	}
 
-	// POST /keys relays the reader's wrapped key only.
+	// POST /keys relays the reader's wrapped key only, with its from.
 	keys, r := e.keysOf("e", nil, f.readerG)
 	if r == nil || len(keys) != 1 {
 		t.Fatalf("keys %v %v", keys, r)
 	}
 	w, err := seal.ParseWrappedKey(r.Obj()["keys"].([]any)[0])
-	if err != nil || w.Kid != "e#1" {
+	if err != nil || w.Kid != "e#1" || w.From != seal.Thumbprint(adminPub) {
 		t.Fatalf("wrapped %v %v", w, err)
 	}
-	if k, err := seal.UnwrapKey(f.readerPriv, w); err != nil || string(k) != string(f.k1) {
+	if k, err := seal.UnwrapKeyAuth(f.readerPriv, adminPub, w); err != nil || string(k) != string(f.k1) {
 		t.Fatalf("unwrap %v", err)
 	}
 	_, r = e.keysOf("e", nil, e.grant(f.writer, "user:noenc", []string{"e"}, []string{"read"}))
@@ -416,7 +418,7 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	adminPriv := func() *ecdh.PrivateKey { _, p, _ := seal.GenerateRecipient(); return p }()
 	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
 	k1 := seal.NewKey()
-	kr, _ := seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{adminPriv.PublicKey(), readerPub})
+	kr, _ := seal.BuildKeyringV2(adminPriv, "e", 1, k1, []*ecdh.PublicKey{adminPriv.PublicKey(), readerPub})
 	krHead := e.create("e", "keyring", kr.Value(), f.adminG)
 	d0 := etagOf(e.writeRaw("e", "d", "", sealed(t, k1, "e#1", "e", "d", "", addRoot(map[string]any{"n": 0.0})), f.writerG))
 
@@ -424,7 +426,7 @@ func TestE2EEpochsBranchesLevels(t *testing.T) {
 	// with the epoch bump in one batch; the removed reader gets nothing of
 	// the new epoch.
 	k2 := seal.NewKey()
-	if _, err := kr.Rotate(k2, []*ecdh.PublicKey{adminPriv.PublicKey()}); err != nil {
+	if err := kr.Add(adminPriv, adminPriv.PublicKey(), "e#2", k2); err != nil {
 		t.Fatal(err)
 	}
 	replace := ops(op("replace", "", kr.Value()))

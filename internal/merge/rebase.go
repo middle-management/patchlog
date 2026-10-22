@@ -2,7 +2,6 @@ package merge
 
 import (
 	"context"
-	"crypto/ecdh"
 	"errors"
 	"fmt"
 	"strings"
@@ -307,12 +306,13 @@ func ontoReads(ctx context.Context, c *client.Client, onto, read string) bool {
 
 // successorKeyring gives an e2e successor its own keyring (§F.8): its
 // sealed patch sets bind it, so it can't write under the keyring it reads
-// through from its base. The key is wrapped for the readers of the old
-// branch's current epoch (its own keyring's, or the one it reads through)
-// and for the view itself. A successor that has one already (a resumed
-// rebase) is left as it is.
+// through from its base. The key is wrapped for the view itself and for
+// the readers of the old branch's newest epoch (its own keyring's, or the
+// one it reads through) whose keys the view knows, each holding an entry
+// from a sender it knows (client.E2E.KeyringReaders, §E.3.2). A successor
+// that has one already (a resumed rebase) is left as it is.
 func successorKeyring(ctx context.Context, x *client.E2E, branch, onto, succ string) error {
-	if kr, _, err := x.Keyring(ctx, succ); err == nil && kr.NS == succ {
+	if kr, _, err := x.Keyring(ctx, succ); err == nil && kr.Current(succ) > 0 {
 		return nil
 	} else if err != nil && !client.IsNotFound(err) {
 		return err
@@ -324,13 +324,7 @@ func successorKeyring(ctx context.Context, x *client.E2E, branch, onto, succ str
 	if err != nil {
 		return fmt.Errorf("merge: reading the keyring of %s: %w", branch, err)
 	}
-	var readers []*ecdh.PublicKey
-	for _, rid := range kr.Readers(kr.Current) {
-		if pub := kr.Recipients[rid]; pub != nil {
-			readers = append(readers, pub)
-		}
-	}
-	if _, err := x.InitKeyring(ctx, succ, readers...); err != nil {
+	if _, err := x.InitKeyring(ctx, succ, x.KeyringReaders(kr)...); err != nil {
 		return fmt.Errorf("merge: keyring of %s: %w", succ, err)
 	}
 	return nil

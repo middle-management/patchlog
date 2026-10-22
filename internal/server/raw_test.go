@@ -222,7 +222,7 @@ func TestRawNotOffered(t *testing.T) {
 	// e2e: content and keyring alike.
 	f := newE2E(t)
 	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
-	kr, err := seal.BuildKeyring("e", 1, seal.NewKey(), []*ecdh.PublicKey{readerPub})
+	kr, err := seal.BuildKeyringV2(f.readerPriv, "e", 1, seal.NewKey(), []*ecdh.PublicKey{readerPub})
 	if err != nil {
 		t.Fatal(err)
 	}

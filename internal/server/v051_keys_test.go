@@ -99,7 +99,8 @@ func TestKeysLimitedWriter(t *testing.T) {
 	// is 422, and one whose rules refuse every read 404.
 	e.mkNS("x", map[string]any{"read": "grant", "keys": []any{k.entry("*")}, "encryption": map[string]any{"level": "e2e", "pad": true}})
 	k1 := seal.NewKey()
-	kr, err := seal.BuildKeyring("x", 1, k1, []*ecdh.PublicKey{pub})
+	_, admin, _ := seal.GenerateRecipient()
+	kr, err := seal.BuildKeyringV2(admin, "x", 1, k1, []*ecdh.PublicKey{pub})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -113,10 +114,10 @@ func TestKeysLimitedWriter(t *testing.T) {
 	if len(keys) != 1 {
 		t.Fatalf("e2e keys %s", r.Body)
 	}
-	if w, err = seal.ParseWrappedKey(r.Obj()["keys"].([]any)[0]); err != nil || w.Kid != "x#1" {
+	if w, err = seal.ParseWrappedKey(r.Obj()["keys"].([]any)[0]); err != nil || w.Kid != "x#1" || w.From != seal.Thumbprint(admin.PublicKey()) {
 		t.Fatalf("wrapped %v %v", w, err)
 	}
-	if got, err := seal.UnwrapKey(priv, w); err != nil || string(got) != string(k1) {
+	if got, err := seal.UnwrapKeyAuth(priv, admin.PublicKey(), w); err != nil || string(got) != string(k1) {
 		t.Fatalf("unwrap %v", err)
 	}
 	keys, r = e.keysOf("x", map[string]any{"epochs": []any{}}, li)

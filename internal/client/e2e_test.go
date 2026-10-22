@@ -51,9 +51,11 @@ func testE2EClient(t *testing.T) {
 	adminC := s.Client(t, client.WithBearer(admin.Grant(t, now, "user:admin", []string{"e", "eb", "schemas"}, all, map[string]any{"enc": adminJWK})))
 	ad := adminC.E2E(adminPriv)
 	wc := s.Client(t, client.WithBearer(writer.Grant(t, now, "user:writer", []string{"e", "eb"}, []string{"read", "create", "append", "restore", "delete", "prune"}, map[string]any{"enc": writerJWK})))
-	w := wc.E2E(writerPriv)
+	// The writer and the reader know the admin's key, which wraps the
+	// keyring's entries (§E.3.2).
+	w := wc.E2E(writerPriv).WithSenders(adminPriv.PublicKey())
 	rc := s.Client(t, client.WithBearer(writer.Grant(t, now, "user:reader", []string{"e"}, []string{"read"}, map[string]any{"enc": readerJWK})))
-	rd := rc.E2E(readerPriv)
+	rd := rc.E2E(readerPriv).WithSenders(adminPriv.PublicKey())
 
 	// A schema in a public namespace, referenced from sealed documents.
 	sch := must(adminC.CreateDoc(ctx, "schemas", "item", map[string]any{"$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -151,12 +153,12 @@ func testE2EClient(t *testing.T) {
 	sameJSON(t, must(w.DocE2E(ctx, "e", "d", n4.ID)).Value, want)
 	sameJSON(t, must(ad.DocE2E(ctx, "e", "d", n4.ID)).Value, want)
 	kr, _ := must2(ad.Keyring(ctx, "e"))
-	if len(kr.Readers(2)) != 2 || len(kr.Readers(1)) != 3 {
-		t.Fatalf("keyring readers %v %v", kr.Readers(1), kr.Readers(2))
+	if len(kr.Recipients("e#2")) != 2 || len(kr.Recipients("e#1")) != 3 {
+		t.Fatalf("keyring readers %v %v", kr.Recipients("e#1"), kr.Recipients("e#2"))
 	}
 	// Adding the reader back wraps the current epoch for them.
 	must(ad.AddReader(ctx, "e", readerPriv.PublicKey(), false))
-	rd2 := rc.E2E(readerPriv)
+	rd2 := rc.E2E(readerPriv).WithSenders(adminPriv.PublicKey())
 	sameJSON(t, must(rd2.DocE2E(ctx, "e", "d", n4.ID)).Value, want)
 
 	// A branch is e2e; with its own keyring its writes bind the branch and

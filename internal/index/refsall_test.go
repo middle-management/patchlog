@@ -524,7 +524,8 @@ func TestRefsAcrossSealed(t *testing.T) {
 	must(ad.CreateDocSealed(ctx, "e", "d", doc))
 	must(ad.CreateDocSealed(ctx, "e2", "d", doc))
 
-	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", all[1:], []string{"read"}, map[string]any{"enc": iJWK})), client.WithKeys(client.NewKeys(iPriv)))
+	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", all[1:], []string{"read"}, map[string]any{"enc": iJWK})), client.WithKeys(client.NewKeys(iPriv)),
+		client.WithKeyringSenders(wPriv.PublicKey()))
 	opts := svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: all[1:], now: s.Now}
 	withKey := func(o *indexOpts) { o.Recipient = iPriv }
 	idx := startSvcWith(t, ic, opts, withKey)

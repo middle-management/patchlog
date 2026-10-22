@@ -25,12 +25,14 @@ package core
 //   - Storage. Patch sets are stored as sent, and encrypted at rest as well
 //     (E1 machinery). No documents: no head documents, no intermediate
 //     snapshots, no document cache; the $schema index (§6.1) sees nothing.
-//   - The keyring. The reserved resource "keyring" holds the seal keyring
-//     (seal.Keyring) in plaintext: wrapped epoch keys and public JWKs only.
-//     Key-holding admin clients write it with ordinary plaintext writes,
-//     which the gate checks like any other plus seal.ParseKeyring, ns equal
-//     to the namespace and current not after encryption.epoch. It is the
-//     only plaintext resource of an e2e namespace.
+//   - The keyring. The reserved resource "keyring" holds the keyring
+//     document (seal.KeyringV2, §E.3.2) in plaintext: epoch keys wrapped
+//     in HPKE auth mode, each entry naming its recipient (to) and the
+//     admin key that wrapped it (from) by thumbprint. Key-holding admin
+//     clients write it with ordinary plaintext writes, which the gate
+//     checks as outside E3 plus seal.ParseKeyringV2, kids naming the
+//     namespace and epochs not after encryption.epoch (checkKeyring). It is
+//     the only plaintext resource of an e2e namespace.
 //   - Epochs. encryption.epoch works as at E2, but the server holds no key:
 //     e2e_epochs records when each epoch began (for POST /keys and kid
 //     checks). A key holder rotates by re-wrapping the keyring and bumping
@@ -55,10 +57,11 @@ package core
 //     them and records the list in blob_refs, which outlives pruning, like
 //     a document's references. A prune's snapshot may declare its own list
 //     ("blobs" beside "snapshot"), which then stands for the horizon's.
-//   - POST /ns/{ns}/keys relays the keyring's wrapped keys for the grant's
-//     enc recipient only.
+//   - POST /ns/{ns}/keys relays the keyring entries whose to is the
+//     thumbprint of the grant's enc, with their from (§E.2.3).
 
 import (
+	"crypto/ecdh"
 	"database/sql"
 	"fmt"
 	"strconv"
@@ -247,21 +250,32 @@ func (t *tx) declaredAt(row *revRow) []ids.ID {
 }
 
 // checkKeyring checks the keyring resource's documents in an e2e
-// namespace: a keyring of this namespace whose current epoch has begun.
+// namespace (§E.3.2): the keyring document, { "keys": [{ kid, to, from,
+// wrapped }] } with nothing else but a $nonce and no two entries for one
+// kid and to (seal.ParseKeyringV2), whose kids name this namespace and
+// epochs not after encryption.epoch. A keyring in the format before v0.63
+// is refused like any other document: a key holder wraps it again.
 func (t *tx) checkKeyring(n *nsRow, cfg *Config, s *itemState) *Error {
 	for _, st := range s.steps {
 		if st.del {
 			continue
 		}
-		kr, err := seal.ParseKeyring(st.doc)
+		kr, err := seal.ParseKeyringV2(st.doc)
 		if err != nil {
-			return invalid("the keyring resource of an e2e namespace must be a keyring document (§E.3.2): " + err.Error())
+			msg := "the keyring resource of an e2e namespace must be a keyring document, { \"keys\": [{ \"kid\", \"to\", \"from\", \"wrapped\" }] } (§E.3.2): " + err.Error()
+			if _, lerr := seal.ParseKeyring(st.doc); lerr == nil {
+				msg = "the keyring is in the format before v0.63; a key holder wraps its keys again in the §E.3.2 keyring document (client.E2E.MigrateKeyring, patchlog e2e migrate-keyring)"
+			}
+			return invalid(msg)
 		}
-		if kr.NS != n.name {
-			return invalid(fmt.Sprintf("the keyring's ns must be %q", n.name))
-		}
-		if kr.Current > cfg.Epoch {
-			return invalid(fmt.Sprintf("the keyring names epoch %d, after the namespace's encryption.epoch %d; bump the epoch in the same batch", kr.Current, cfg.Epoch))
+		for _, e := range kr.Entries {
+			kns, ep, _ := seal.ParseKid(e.Kid)
+			if kns != n.name {
+				return invalid(fmt.Sprintf("the keyring's kids must name namespace %q, not %q (§E.3.2)", n.name, e.Kid))
+			}
+			if ep > cfg.Epoch {
+				return invalid(fmt.Sprintf("the keyring names epoch %d, after the namespace's encryption.epoch %d; bump the epoch in the same batch", ep, cfg.Epoch))
+			}
 		}
 	}
 	return nil
@@ -290,9 +304,10 @@ func (t *tx) e2eSnapshot(row *revRow) string {
 }
 
 // keysE2E answers POST /ns/{ns}/keys for an e2e namespace (§E.3.2): the
-// keyring's entries wrapped to the grant's enc, for the epochs the grant
-// may have (the §E.2.3 range). The keyring is read as n sees it, so a
-// branch without its own relays its base's.
+// keyring's entries whose to is the thumbprint of the grant's enc, with
+// their from, for the epochs the grant may have (the §E.2.3 range). The
+// keyring is read as n sees it, so a branch without its own relays its
+// base's.
 func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
 	enc := recipientOf(a)
 	if enc == nil {
@@ -300,20 +315,19 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 	}
 	out := []map[string]any{}
 	seen := map[string]bool{}
-	rid := seal.RecipientID(enc)
-	out = t.relayKeyring(out, seen, n, a, kr, rid)
+	out = t.relayKeyring(out, seen, n, a, kr, enc)
 	// A remote branch's shadows may hold keyrings of the remote base's own
 	// bases, mirrored as foreign parents or read through (§G.5.2): readers
 	// need them for the ciphertext those bases sealed.
 	for _, sh := range t.remoteShadows(n) {
-		out = t.relayKeyring(out, seen, sh, a, kr, rid)
+		out = t.relayKeyring(out, seen, sh, a, kr, enc)
 	}
 	return out, nil
 }
 
-// relayKeyring appends to out the entries for rid of the keyring as n sees
-// it, unless one of the same namespace was relayed already.
-func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, a *actor, kr KeysRequest, rid string) []map[string]any {
+// relayKeyring appends to out the entries for enc of the keyring as n sees
+// it, unless one of the same owner was relayed already.
+func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, a *actor, kr KeysRequest, enc *ecdh.PublicKey) []map[string]any {
 	v := t.resolve(n, KeyringName, nil)
 	if v.state != Live || v.head == nil {
 		return out
@@ -322,15 +336,14 @@ func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, 
 	if err != nil {
 		return out
 	}
-	ring, err := seal.ParseKeyring(d)
-	if err != nil || seen[ring.NS] {
-		return out
-	}
-	seen[ring.NS] = true
 	owner := n
 	if v.src != nil && v.src.ns != n.id {
 		owner = t.nsByID(v.src.ns)
 	}
+	if seen[owner.name] {
+		return out
+	}
+	seen[owner.name] = true
 	ocfg := t.config(owner.configSeq)
 	epochs := t.grantEpochsOf(t.epochStarts(`e2e_epochs`, owner.id, ocfg.Epoch), ocfg, a)
 	if kr.Epochs != nil {
@@ -346,11 +359,37 @@ func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, 
 		}
 		epochs = keep
 	}
+	return append(out, keyringEntries(d, enc, epochs)...)
+}
+
+// keyringEntries returns the entries of keyring document d for the
+// recipient enc, of the given epochs, as /keys relays them (§E.2.3): the
+// entries whose to is enc's thumbprint, with from. Each entry's kid names
+// the keyring's owner, checked when it was written; for a remote branch's
+// shadow, the remote base (§G.5). A keyring stored in the format before
+// v0.63 (seal.Keyring), which the gate refuses to write now, is relayed as
+// stored, without from, until a key holder wraps it again.
+func keyringEntries(d any, enc *ecdh.PublicKey, epochs []int) []map[string]any {
+	want := make(map[int]bool, len(epochs))
 	for _, e := range epochs {
-		if w, ok := ring.Epochs[e][rid]; ok {
-			// The keyring's ns is its owner's, checked when it was written;
-			// for a remote branch's shadow, the remote base's (§G.5).
-			out = append(out, seal.WrappedKey{Kid: seal.Kid(ring.NS, e), Wrapped: w}.Value())
+		want[e] = true
+	}
+	var out []map[string]any
+	if ring, err := seal.ParseKeyringV2(d); err == nil {
+		for _, e := range ring.To(seal.Thumbprint(enc)) {
+			if _, ep, err := seal.ParseKid(e.Kid); err == nil && want[ep] {
+				out = append(out, e.Relayed().Value())
+			}
+		}
+		return out
+	}
+	old, err := seal.ParseKeyring(d)
+	if err != nil {
+		return nil
+	}
+	for _, e := range epochs {
+		if w, err := seal.Lookup(old, enc, e); err == nil {
+			out = append(out, w.Value())
 		}
 	}
 	return out

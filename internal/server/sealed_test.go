@@ -59,7 +59,7 @@ func (e *tenv) keysOf(ns string, body map[string]any, bearer string) (map[string
 	for _, x := range arr {
 		m := x.(map[string]any)
 		k := m["kid"].(string)
-		if res, ok := m["resource"].(string); ok {
+		if res, ok := m["name"].(string); ok {
 			k += " " + res
 		}
 		if ks, ok := m["key"].(string); ok {

@@ -29,13 +29,21 @@ package client
 //     document even WithoutValidation; folds flag a revision whose list
 //     differs from its decrypted document.
 //   - Keyring administration (InitKeyring, AddReader, RotateEpoch) writes
-//     the namespace's plaintext "keyring" resource (seal.Keyring), and
-//     RotateEpoch bumps encryption.epoch in the same batch.
+//     the namespace's plaintext "keyring" resource (seal.KeyringV2,
+//     §E.3.2), each entry wrapped in HPKE auth mode under the view's own
+//     recipient key, the admin key its from names; RotateEpoch bumps
+//     encryption.epoch in the same batch. MigrateKeyring wraps a keyring
+//     stored in the format before v0.63 (seal.Keyring) again, which the
+//     server refuses to have written now.
 //
 // Epoch keys come from keys added with AddKey, else (with a recipient
 // private key) from POST /ns/{ns}/keys, which relays the keyring entries
 // wrapped for the grant's enc, else from the namespace's own keyring
 // resource (not one read through from a base: its keys are the base's).
+// An entry opens only with the public key of the sender its from names
+// (§E.3.2): the view knows its own recipient keys, those given with
+// WithSenders, and the client's (WithKeyringSenders), and skips entries
+// from any other.
 // Writes seal under the current epoch, with the pad setting, both from the
 // namespace document, or, for a writer limited to some resources that
 // can't read it (§C.5), from what POST /ns/{ns}/keys names beside the keys
@@ -77,6 +85,7 @@ type E2E struct {
 	c          *Client
 	recipient  *ecdh.PrivateKey
 	extra      []*ecdh.PrivateKey // more recipients to unwrap with (WithRecipient)
+	senders    []*ecdh.PublicKey  // keyring senders known besides its own keys (WithSenders)
 	keys       *e2eKeys
 	schemas    *e2eSchemas
 	pads       *e2ePads
@@ -128,6 +137,36 @@ func (x *E2E) WithRecipient(priv *ecdh.PrivateKey) *E2E {
 		cp.extra = append(append([]*ecdh.PrivateKey(nil), x.extra...), priv)
 	}
 	return &cp
+}
+
+// WithSenders returns a view that also opens keyring entries wrapped by
+// the admin keys pubs (§E.3.2), sharing the key cache. A keyring entry
+// names its sender by thumbprint only, and HPKE auth mode needs the
+// sender's public key to open it, so a reader learns its admins' keys out
+// of band, as it learns whom it trusts to distribute keys. The view's own
+// recipient keys are always known: an admin reads back what it wrapped.
+func (x *E2E) WithSenders(pubs ...*ecdh.PublicKey) *E2E {
+	cp := *x
+	cp.senders = append(append([]*ecdh.PublicKey(nil), x.senders...), pubs...)
+	return &cp
+}
+
+// WithKeyringSenders makes every E2E view of the client open keyring
+// entries wrapped by the admin keys pubs (E2E.WithSenders): services
+// reading e2e namespaces (derived.Keys) take them so.
+func WithKeyringSenders(pubs ...*ecdh.PublicKey) Option {
+	return func(c *Client) { c.senders = append(c.senders, pubs...) }
+}
+
+// knownSenders lists the keyring senders the view opens entries from: its
+// own recipient keys, then WithSenders', then the client's.
+func (x *E2E) knownSenders() []*ecdh.PublicKey {
+	var out []*ecdh.PublicKey
+	for _, p := range x.recipients() {
+		out = append(out, p.PublicKey())
+	}
+	out = append(out, x.senders...)
+	return append(out, x.c.senders...)
 }
 
 // recipients lists the view's private keys, primary first.
@@ -212,10 +251,11 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 			}
 			key := e.Key
 			if key == nil {
-				if key, err = unwrapRelayed(privs, e.Wrapped); err != nil {
-					// Not the key for us (anyone can wrap to a
-					// thumbprint, §E.3.2): the other relay or the
-					// keyring may still hold it.
+				if key, err = unwrapRelayed(privs, e.Wrapped, x.knownSenders()); err != nil {
+					// Not the key for us, or from a sender this view
+					// doesn't know (anyone can wrap to a thumbprint,
+					// §E.3.2): the other relay or the keyring may still
+					// hold it.
 					unwrapErr = fmt.Errorf("client: unwrapping %s: %w", kid, err)
 					continue
 				}
@@ -226,12 +266,19 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	}
 	// Then the keyring itself (a key holder may read it directly), if it
 	// is the namespace's own: a branch without one reads its base's
-	// through, and those are the base's keys, not "{branch}#{e}".
-	kr, _, err := x.Keyring(ctx, ns)
+	// through, whose entries name the base's keys, not "{branch}#{e}".
+	kr, old, _, err := x.keyring(ctx, ns)
 	switch {
-	case err == nil && kr.NS == ns:
+	case err == nil && kr != nil:
 		for _, priv := range privs {
-			if key, err := kr.EpochKey(priv, epoch); err == nil {
+			if key, err := kr.EpochKey(priv, kid, x.knownSenders()); err == nil {
+				x.AddKey(kid, key)
+				return key, nil
+			}
+		}
+	case err == nil && old.NS == ns:
+		for _, priv := range privs {
+			if key, err := old.EpochKey(priv, epoch); err == nil {
 				x.AddKey(kid, key)
 				return key, nil
 			}
@@ -249,18 +296,14 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 }
 
 // unwrapRelayed opens a K_e that /keys relays from a keyring (§E.3.2) with
-// one of privs: under the HPKE info of v0.63 or, for an entry of a keyring
-// stored before, the info of that time, as Keyring.EpochKey reads the
-// keyring itself. Both infos bind the kid (and a K_r's resource), so an
-// entry can't be presented as another epoch's under either.
-func unwrapRelayed(privs []*ecdh.PrivateKey, w seal.WrappedKey) ([]byte, error) {
-	var err error
+// one of privs (seal.UnwrapRelayed): an entry with from in auth mode under
+// the one of senders it names, one relayed from a keyring stored before
+// v0.63 under the HPKE info of v0.63 or of that time.
+func unwrapRelayed(privs []*ecdh.PrivateKey, w seal.WrappedKey, senders []*ecdh.PublicKey) ([]byte, error) {
+	err := fmt.Errorf("client: no recipient key")
 	for _, priv := range privs {
 		var key []byte
-		if key, err = seal.UnwrapKey(priv, w); err == nil {
-			return key, nil
-		}
-		if key, err = seal.UnwrapKeyLegacy(priv, w); err == nil {
+		if key, err = seal.UnwrapRelayed(priv, w, senders); err == nil {
 			return key, nil
 		}
 	}
@@ -1244,23 +1287,93 @@ func (x *E2E) prune(ctx context.Context, ns, name, horizon string) (*PruneResult
 
 // --- keyring administration -------------------------------------------------
 
-// Keyring reads the keyring resource of ns and returns it with its head.
-func (x *E2E) Keyring(ctx context.Context, ns string) (*seal.Keyring, string, error) {
+// ErrLegacyKeyring reports a keyring resource stored in the format before
+// v0.63 (seal.Keyring), which servers no longer take as the keyring: a
+// key holder wraps it again with MigrateKeyring.
+var ErrLegacyKeyring = errors.New("client: the keyring is in the format before v0.63; wrap it again with MigrateKeyring")
+
+// keyring reads the keyring resource of ns as ns sees it (its base's, read
+// through, in a branch without one): the keyring document (§E.3.2), or
+// failing that one in the format before v0.63 (old), and its head.
+func (x *E2E) keyring(ctx context.Context, ns string) (kr *seal.KeyringV2, old *seal.Keyring, head string, err error) {
 	h, d, err := x.c.Load(ctx, ns, KeyringName)
 	if err != nil {
-		return nil, "", err
+		return nil, nil, "", err
 	}
 	if h.State != Live {
-		return nil, "", &APIError{Status: 404, Code: "not_found", Method: "GET", Path: "/r/" + ns + "/" + KeyringName}
+		return nil, nil, "", &APIError{Status: 404, Code: "not_found", Method: "GET", Path: "/r/" + ns + "/" + KeyringName}
 	}
-	kr, err := seal.ParseKeyring(d.Value)
-	if err != nil {
-		return nil, "", err
+	if kr, err = seal.ParseKeyringV2(d.Value); err == nil {
+		return kr, nil, h.ID, nil
 	}
-	return kr, h.ID, nil
+	if old, lerr := seal.ParseKeyring(d.Value); lerr == nil {
+		return nil, old, h.ID, nil
+	}
+	return nil, nil, "", err
 }
 
-// withSelf adds the view's own recipient to readers, once.
+// Keyring reads the keyring resource of ns (§E.3.2) as ns sees it and
+// returns it with its head. One stored in the format before v0.63 is
+// ErrLegacyKeyring (LegacyKeyring reads it).
+func (x *E2E) Keyring(ctx context.Context, ns string) (*seal.KeyringV2, string, error) {
+	kr, _, head, err := x.keyring(ctx, ns)
+	if err == nil && kr == nil {
+		return nil, "", ErrLegacyKeyring
+	}
+	return kr, head, err
+}
+
+// LegacyKeyring reads a keyring resource of ns stored in the format before
+// v0.63 (seal.Keyring), to migrate it, and returns it with its head.
+func (x *E2E) LegacyKeyring(ctx context.Context, ns string) (*seal.Keyring, string, error) {
+	_, old, head, err := x.keyring(ctx, ns)
+	if err == nil && old == nil {
+		return nil, "", fmt.Errorf("client: the keyring of %s is not in the format before v0.63", ns)
+	}
+	return old, head, err
+}
+
+// KeyringReaders returns the public keys among those the view knows (its
+// own recipient keys and senders, WithSenders) for which kr holds the key
+// of its newest epoch, from a sender the view knows. A keyring names its
+// recipients by thumbprint only, so a reader whose public key the view
+// doesn't know can't be wrapped for again, and an entry from an unknown
+// sender is not taken as a reader at all: anyone can wrap to a thumbprint
+// (§E.3.2). Rewrapping for a new namespace (a successor's keyring, §F.8)
+// starts from these.
+func (x *E2E) KeyringReaders(kr *seal.KeyringV2) []*ecdh.PublicKey {
+	newest, kid := -1, ""
+	for _, e := range kr.Entries {
+		if _, ep, err := seal.ParseKid(e.Kid); err == nil && ep > newest {
+			newest, kid = ep, e.Kid
+		}
+	}
+	from := map[string]bool{}
+	for _, s := range x.knownSenders() {
+		from[seal.Thumbprint(s)] = true
+	}
+	var out []*ecdh.PublicKey
+	seen := map[string]bool{}
+	for _, p := range x.knownSenders() {
+		tp := seal.Thumbprint(p)
+		if e, ok := kr.Entry(kid, tp); ok && from[e.From] && !seen[tp] {
+			seen[tp] = true
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// admin is the key that wraps the keyring entries the view writes, in
+// HPKE auth mode: its own recipient key, which their from names (§E.3.2).
+func (x *E2E) admin() (*ecdh.PrivateKey, error) {
+	if x.recipient == nil {
+		return nil, fmt.Errorf("client: keyring administration needs the view's recipient key, which wraps the entries (§E.3.2)")
+	}
+	return x.recipient, nil
+}
+
+// withSelf adds the view's own recipient to readers, once each.
 func (x *E2E) withSelf(readers []*ecdh.PublicKey) []*ecdh.PublicKey {
 	seen := map[string]bool{}
 	var out []*ecdh.PublicKey
@@ -1268,8 +1381,8 @@ func (x *E2E) withSelf(readers []*ecdh.PublicKey) []*ecdh.PublicKey {
 		readers = append([]*ecdh.PublicKey{x.recipient.PublicKey()}, readers...)
 	}
 	for _, r := range readers {
-		if rid := seal.RecipientID(r); !seen[rid] {
-			seen[rid] = true
+		if tp := seal.Thumbprint(r); !seen[tp] {
+			seen[tp] = true
 			out = append(out, r)
 		}
 	}
@@ -1281,23 +1394,28 @@ func replaceRoot(v any) []any {
 }
 
 // InitKeyring creates the keyring of ns: a fresh key for the current epoch,
-// wrapped for readers and for the view's own recipient. In a branch that
-// reads its base's keyring through, it replaces it with the branch's own
-// (a first write on the foreign parent, §7.6).
+// wrapped for readers and for the view's own recipient, which wraps them
+// (auth mode, §E.3.2). In a branch that reads its base's keyring through,
+// it replaces it with the branch's own (a first write on the foreign
+// parent, §7.6).
 func (x *E2E) InitKeyring(ctx context.Context, ns string, readers ...*ecdh.PublicKey) (*WriteResult, error) {
+	admin, err := x.admin()
+	if err != nil {
+		return nil, err
+	}
 	cfg, err := x.config(ctx, ns)
 	if err != nil {
 		return nil, err
 	}
 	key := seal.NewKey()
-	kr, err := seal.BuildKeyring(ns, cfg.Epoch, key, x.withSelf(readers))
+	kr, err := seal.BuildKeyringV2(admin, ns, cfg.Epoch, key, x.withSelf(readers))
 	if err != nil {
 		return nil, err
 	}
 	var w *WriteResult
-	cur, head, err := x.Keyring(ctx, ns)
+	cur, old, head, err := x.keyring(ctx, ns)
 	switch {
-	case err == nil && cur.NS == ns:
+	case err == nil && (cur != nil && cur.Current(ns) > 0 || old != nil && old.NS == ns):
 		return nil, fmt.Errorf("client: namespace %s already has a keyring", ns)
 	case err == nil:
 		w, err = x.c.Append(ctx, ns, KeyringName, head, replaceRoot(kr.Value()))
@@ -1312,24 +1430,33 @@ func (x *E2E) InitKeyring(ctx context.Context, ns string, readers ...*ecdh.Publi
 }
 
 // AddReader wraps the current epoch's key for reader (§E.3.2: adding a
-// reader) and, with history, every older epoch the view can unwrap.
+// reader) and, with history, every older epoch of the keyring the view
+// can open, in auth mode under the view's own recipient key.
 func (x *E2E) AddReader(ctx context.Context, ns string, reader *ecdh.PublicKey, history bool) (*WriteResult, error) {
+	admin, err := x.admin()
+	if err != nil {
+		return nil, err
+	}
 	kr, head, err := x.Keyring(ctx, ns)
 	if err != nil {
 		return nil, err
 	}
-	for e := range kr.Epochs {
-		if e != kr.Current && !history {
+	cur := kr.Current(ns)
+	if cur == 0 {
+		return nil, fmt.Errorf("client: the keyring of %s holds no key of it", ns)
+	}
+	for _, e := range kr.Epochs(ns) {
+		if e != cur && !history {
 			continue
 		}
 		key, err := x.Key(ctx, seal.Kid(ns, e))
 		if err != nil {
-			if e == kr.Current {
+			if e == cur {
 				return nil, err
 			}
 			continue
 		}
-		if err := kr.Add(reader, e, key); err != nil {
+		if err := kr.Add(admin, reader, seal.Kid(ns, e), key); err != nil {
 			return nil, err
 		}
 	}
@@ -1341,6 +1468,10 @@ func (x *E2E) AddReader(ctx context.Context, ns string, reader *ecdh.PublicKey, 
 // keyring together with encryption.epoch + 1 in one batch. It needs a grant
 // chained to a * key (§7.4) and returns the new epoch.
 func (x *E2E) RotateEpoch(ctx context.Context, ns string, readers ...*ecdh.PublicKey) (int, error) {
+	admin, err := x.admin()
+	if err != nil {
+		return 0, err
+	}
 	kr, head, err := x.Keyring(ctx, ns)
 	if err != nil {
 		return 0, err
@@ -1349,13 +1480,15 @@ func (x *E2E) RotateEpoch(ctx context.Context, ns string, readers ...*ecdh.Publi
 	if err != nil {
 		return 0, err
 	}
-	if kr.Current != cfg.Epoch {
-		return 0, fmt.Errorf("client: the keyring of %s is at epoch %d but encryption.epoch is %d", ns, kr.Current, cfg.Epoch)
+	if cur := kr.Current(ns); cur != cfg.Epoch {
+		return 0, fmt.Errorf("client: the keyring of %s is at epoch %d but encryption.epoch is %d", ns, cur, cfg.Epoch)
 	}
 	key := seal.NewKey()
-	e, err := kr.Rotate(key, x.withSelf(readers))
-	if err != nil {
-		return 0, err
+	e := cfg.Epoch + 1
+	for _, r := range x.withSelf(readers) {
+		if err := kr.Add(admin, r, seal.Kid(ns, e), key); err != nil {
+			return 0, err
+		}
 	}
 	_, err = x.c.Batch(ctx, ns, BatchRequest{
 		Config: &BatchConfig{IfMatch: cfg.Config, Patches: []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": e}}},
@@ -1366,4 +1499,35 @@ func (x *E2E) RotateEpoch(ctx context.Context, ns string, readers ...*ecdh.Publi
 	}
 	x.AddKey(seal.Kid(ns, e), key)
 	return e, nil
+}
+
+// MigrateKeyring wraps the keyring of ns stored in the format before v0.63
+// again as the keyring document (§E.3.2, seal.MigrateKeyring): every
+// epoch's key, which the view opens from its own entry, is wrapped in
+// auth mode under the view's recipient key for the readers given for that
+// epoch, and for the view itself. readers must name every epoch the old
+// keyring holds, and comes from the caller, out of band: the stored
+// recipient lists are untrusted (anyone could write them, and a reader
+// left out of a rotation must not get its key now). It returns the write.
+func (x *E2E) MigrateKeyring(ctx context.Context, ns string, readers map[int][]*ecdh.PublicKey) (*WriteResult, error) {
+	admin, err := x.admin()
+	if err != nil {
+		return nil, err
+	}
+	old, head, err := x.LegacyKeyring(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	if old.NS != ns {
+		return nil, fmt.Errorf("client: %s reads the keyring of %s through; migrate it there", ns, old.NS)
+	}
+	with := make(map[int][]*ecdh.PublicKey, len(readers))
+	for e, rs := range readers {
+		with[e] = x.withSelf(rs)
+	}
+	kr, err := seal.MigrateKeyring(old, admin, with)
+	if err != nil {
+		return nil, err
+	}
+	return x.c.Append(ctx, ns, KeyringName, head, replaceRoot(kr.Value()))
 }

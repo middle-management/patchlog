@@ -58,11 +58,12 @@ func docAccess(doc any) string {
 }
 
 // e2eEpochs lists the epochs the lines of an e2e namespace are sealed
-// under: the kids of sealed patch sets, and the keyring's current epochs.
+// under: the kids of sealed patch sets, and the newest epoch of the
+// namespace each keyring line holds a key of (keyringEpoch).
 // err is a failure to read the target, which a requires decides for
 // (e2eRestoresRequires).
 // Each document keeps its lines' epochs (bdoc.epochs) for the batches
-// (splitEpochs): a sealed line's kid's, a keyring line's current epoch
+// (splitEpochs): a sealed line's kid's, a keyring line's newest epoch
 // after it, 0 for a tombstone or a restore.
 // It checks those lines as §G.5.1 has the importer do at step 1: every
 // rev line but the keyring's is one sealed op whose pl.ns and kid name the
@@ -96,9 +97,9 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 					problems = append(problems, fmt.Sprintf("e2e namespace %s: %s: %v", ns, k, rerr))
 					break
 				}
-				if kr, err := seal.ParseKeyring(doc); live && err == nil {
-					note(kr.Current)
-					d.epochs[i] = kr.Current
+				if e := keyringEpoch(doc, ns); live && e > 0 {
+					note(e)
+					d.epochs[i] = e
 				}
 			}
 			continue
@@ -149,6 +150,19 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 		lo, hi = 1, 1
 	}
 	return lo, hi, problems, nil
+}
+
+// keyringEpoch is the newest epoch of namespace ns a keyring document
+// holds a key of, read from its entries' kids (§E.3.2), 0 for none. A
+// keyring in the format before v0.63 (seal.Keyring) names it as current.
+func keyringEpoch(doc any, ns string) int {
+	if kr, err := seal.ParseKeyringV2(doc); err == nil {
+		return kr.Current(ns)
+	}
+	if kr, err := seal.ParseKeyring(doc); err == nil && kr.NS == ns {
+		return kr.Current
+	}
+	return 0
 }
 
 // e2eRestoresRequires reports whether an incremental document's first

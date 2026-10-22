@@ -172,7 +172,9 @@ func (k *Keys) EpochKey(ctx context.Context, ns string, epoch int) ([]byte, erro
 			return nil, err
 		}
 		for _, e := range got {
-			if e.Kid != kid || e.Resource != "" {
+			// A K_r (name) or a relayed keyring entry (from, §E.3.2)
+			// can't seal a view.
+			if e.Kid != kid || e.Resource != "" || e.From != "" {
 				continue
 			}
 			key = e.Key

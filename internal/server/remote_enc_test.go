@@ -174,11 +174,11 @@ func TestRemoteBranchE2E(t *testing.T) {
 	readerJWK, readerPriv, _ := seal.GenerateRecipient()
 	readerPub := readerPriv.PublicKey()
 	k1, k2 := seal.NewKey(), seal.NewKey()
-	kr, _ := seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{readerPub})
+	kr, _ := seal.BuildKeyringV2(readerPriv, "e", 1, k1, []*ecdh.PublicKey{readerPub})
 	krHead := a.create("e", "keyring", kr.Value(), adminG)
 	d0 := etagOf(a.writeRaw("e", "d", "", sealed(t, k1, "e#1", "e", "d", "", addRoot(map[string]any{"n": 0.0, "t": encMarker})), adminG))
 	// Rotate: keyring and epoch in one batch.
-	if _, err := kr.Rotate(k2, []*ecdh.PublicKey{readerPub}); err != nil {
+	if err := kr.Add(readerPriv, readerPub, "e#2", k2); err != nil {
 		t.Fatal(err)
 	}
 	r := a.do(req{method: "POST", path: "/ns/e/batch", bearer: adminG, body: map[string]any{
@@ -223,7 +223,7 @@ func TestRemoteBranchE2E(t *testing.T) {
 	}
 	// The keyring reads as a document, and its wrapped keys are relayed
 	// under the base's kids to the grant's enc.
-	if d := b.doc("rel", "keyring", bAdmin); d["ns"] != "e" {
+	if d := b.doc("rel", "keyring", bAdmin); len(d["keys"].([]any)) != 2 {
 		t.Fatalf("keyring %v", d)
 	}
 	readerG := b.grant(kB, "user:reader", []string{"rel"}, []string{"read"}, map[string]any{"enc": readerJWK})
@@ -237,7 +237,7 @@ func TestRemoteBranchE2E(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		k, err := seal.UnwrapKey(readerPriv, w)
+		k, err := seal.UnwrapKeyAuth(readerPriv, readerPub, w)
 		want := map[string][]byte{"e#1": k1, "e#2": k2}[w.Kid]
 		if err != nil || string(k) != string(want) {
 			t.Fatalf("unwrap %s: %v", w.Kid, err)
@@ -363,14 +363,14 @@ func TestRemoteBranchE2EChain(t *testing.T) {
 	g := a.grant(kA, "user:admin", []string{"e", "eb"}, allVerbs)
 	readerJWK, readerPriv, _ := seal.GenerateRecipient()
 	ke, kb := seal.NewKey(), seal.NewKey()
-	kre, _ := seal.BuildKeyring("e", 1, ke, []*ecdh.PublicKey{readerPriv.PublicKey()})
+	kre, _ := seal.BuildKeyringV2(readerPriv, "e", 1, ke, []*ecdh.PublicKey{readerPriv.PublicKey()})
 	krHead := a.create("e", "keyring", kre.Value(), g)
 	d0 := etagOf(a.writeRaw("e", "d", "", sealed(t, ke, "e#1", "e", "d", "", addRoot(map[string]any{"d": encMarker})), g))
 	g0 := etagOf(a.writeRaw("e", "g", "", sealed(t, ke, "e#1", "e", "g", "", addRoot(map[string]any{"g": 0.0})), g))
 	expect(t, a.branch("e", map[string]any{"name": "eb"}, g), 201)
 	// The branch's own keyring (on the base's as a foreign parent) and a
 	// write of its own on top of the base's content.
-	krb, _ := seal.BuildKeyring("eb", 1, kb, []*ecdh.PublicKey{readerPriv.PublicKey()})
+	krb, _ := seal.BuildKeyringV2(readerPriv, "eb", 1, kb, []*ecdh.PublicKey{readerPriv.PublicKey()})
 	a.appendRev("eb", "keyring", krHead, ops(op("replace", "", krb.Value())), g)
 	g1 := etagOf(a.writeRaw("eb", "g", g0, sealed(t, kb, "eb#1", "eb", "g", g0, ops(op("add", "/b", true))), g))
 	at := a.nsHead("eb", g)

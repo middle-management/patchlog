@@ -92,7 +92,7 @@ func TestUndoLimitedKeys(t *testing.T) {
 	if ans.Level != "e2e" || ans.Epoch != 1 || !ans.Pad || len(ans.Keys) != 0 {
 		t.Fatalf("e2e keys %+v", ans)
 	}
-	lx := li.E2E(priv)
+	lx := li.E2E(priv).WithSenders(adminPriv.PublicKey())
 	w = must(lx.CreateDocSealed(ctx, "ke", "a", map[string]any{"n": 0, "m": 0}))
 	if !patchSetPadded(t, ac, ax, "ke", "a", w.ID) {
 		t.Fatal("li's write isn't padded")
@@ -249,7 +249,7 @@ func TestUndoLimitedKeysAnswers(t *testing.T) {
 	ac := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:admin", []string{"ae"}, []string{"read", "create", "append", "config"}, map[string]any{"enc": adminJWK})))
 	ax := ac.E2E(adminPriv)
 	must(ax.InitKeyring(ctx, "ae", priv.PublicKey()))
-	lx := li.E2E(priv)
+	lx := li.E2E(priv).WithSenders(adminPriv.PublicKey())
 	w = must(lx.CreateDocSealed(ctx, "ae", "a", map[string]any{"n": 0}))
 	g = client.NewGesture()
 	w = must(lx.AppendSealed(ctx, "ae", "a", w.ID, ops(op("replace", "/n", 1)), client.WithGesture(g)))

@@ -393,11 +393,11 @@ func testBundleE2E(t *testing.T) {
 	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
 	reader := identity(t)
 	k1, k2 := seal.NewKey(), seal.NewKey()
-	kr, err := seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()})
+	kr, err := seal.BuildKeyringV2(reader, "e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()})
 	noErr(t, err)
 	krHead := src.create("e", "keyring", kr.Value())
 	d0 := e2eWrite(t, src, k1, "e#1", "e", "d", "", client.GenesisPatches(map[string]any{"v": marker}))
-	_, err = kr.Rotate(k2, []*ecdh.PublicKey{reader.PublicKey()})
+	err = kr.Add(reader, reader.PublicKey(), "e#2", k2)
 	noErr(t, err)
 	h := must(src.c.NSHead(ctx, "e"))
 	_, err = src.c.Batch(ctx, "e", client.BatchRequest{Config: &client.BatchConfig{IfMatch: h.Config, Patches: ops(op("add", "/encryption/epoch", 2.0))},
