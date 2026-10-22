@@ -250,7 +250,7 @@ func TestV050EdgeGrantsAllOrNothing(t *testing.T) {
 		{"not a grant", []string{"x", ok}, 401, ""},
 		{"403 then 401", []string{noRead, bad}, 401, ""},
 		{"401 then 403", []string{missing, noRead}, 401, ""},
-		{"star", []string{ok, star}, 403, ""},
+		{"star", []string{ok, star}, 401, ""}, // "*": 401 (§C.4, v0.63)
 		{"star then 401", []string{star, missing}, 401, ""},
 		{"no read", []string{ok, noRead}, 403, ""},
 		{"purged and 403", []string{p1, noRead}, 403, ""},

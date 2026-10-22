@@ -67,19 +67,33 @@ func TestV047EdgeGrantRoles(t *testing.T) {
 		}
 	}
 
-	// No qualifying role: each tests /resource (even one fixing it, or
-	// next to a block fixing it) or /now, fails now for the principal, or
-	// doesn't list read.
+	// A role may test /resource where the grant's blocks fix it, and
+	// qualifies when it passes for each name fixed (§2.1, v0.65).
+	for name, c := range map[string]struct {
+		r    *resp
+		want string
+	}{
+		"pattern":        {issue("user:li", []any{"writer"}, resRule("draft-1")), "/r/sec/draft-1"},
+		"role and block": {issue("user:li", []any{"fixer"}, resRule("a")), "/r/sec/a"},
+	} {
+		if c.r.Code != 200 || prefixes(c.r) != c.want {
+			t.Errorf("%s: %d %s", name, c.r.Code, c.r.Body)
+		}
+	}
+
+	// No qualifying role: each tests /resource without the grant fixing
+	// it, or fails for a name it fixes, or tests /now, fails now for the
+	// principal, or doesn't list read.
 	for name, r := range map[string]*resp{
-		"pattern":         issue("user:li", []any{"writer"}, resRule("draft-1")),
-		"role fixes":      issue("user:li", []any{"fixer"}),
-		"role and block":  issue("user:li", []any{"fixer"}, resRule("a")),
-		"now":             issue("user:li", []any{"clock", "writer"}),
-		"principal":       issue("user:li", []any{"bobonly"}),
-		"no read":         issue("user:li", []any{"lister", "fixer"}),
-		"block refuses":   issue("user:li", []any{"reader"}, map[string]any{"op": "test", "path": "/principal/id", "value": "user:bob"}),
-		"block unfixed":   issue("user:li", []any{"reader"}, map[string]any{"not": resRule("b")}),
-		"blocks disagree": issue("user:li", []any{"reader"}, resRule("a"), resRule("b")),
+		"pattern, another name": issue("user:li", []any{"writer"}, resRule("a")),
+		"role fixes":            issue("user:li", []any{"fixer"}),
+		"role, another block":   issue("user:li", []any{"fixer"}, resRule("b")),
+		"now":                   issue("user:li", []any{"clock", "writer"}),
+		"principal":             issue("user:li", []any{"bobonly"}),
+		"no read":               issue("user:li", []any{"lister", "fixer"}),
+		"block refuses":         issue("user:li", []any{"reader"}, map[string]any{"op": "test", "path": "/principal/id", "value": "user:bob"}),
+		"block unfixed":         issue("user:li", []any{"reader"}, map[string]any{"not": resRule("b")}),
+		"blocks disagree":       issue("user:li", []any{"reader"}, resRule("a"), resRule("b")),
 	} {
 		if r.Code != 403 || r.H.Get("Set-Cookie") != "" {
 			t.Errorf("%s: %d %s %v", name, r.Code, r.Body, r.H.Values("Set-Cookie"))

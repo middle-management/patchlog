@@ -99,12 +99,20 @@ func TestV073StoredGrantIsAuthorityBlock(t *testing.T) {
 	}
 }
 
+// v073Env is an engine with authentication on (v073Engine): mint mints
+// grants of the key k every namespace it creates lists, opMint operator
+// grants, and create creates a namespace under the operator grant.
+type v073Env struct {
+	*Engine
+	mint, opMint func(root map[string]any) string
+	create       func(ns string, doc map[string]any)
+}
+
 // v073Engine opens an engine with authentication on, as authEngine does,
 // with lim the namespace defaults and max the deployment maximums (fast
 // write rates in both), and creates namespace n with document doc plus a
-// key k (can "*"). It returns the engine, a function minting grants of k,
-// and one creating another namespace under the operator grant.
-func v073Engine(t *testing.T, lim, max Limits, doc map[string]any) (*Engine, func(root map[string]any) string, func(ns string, doc map[string]any)) {
+// key k (can "*").
+func v073Engine(t *testing.T, lim, max Limits, doc map[string]any) *v073Env {
 	t.Helper()
 	opPub, opPriv := grant.GenerateKey()
 	ops, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": opPub, "can": []any{"*"}}}))
@@ -134,19 +142,22 @@ func v073Engine(t *testing.T, lim, max Limits, doc map[string]any) (*Engine, fun
 	}
 	pub, priv := grant.GenerateKey()
 	key := map[string]any{"kid": "k", "alg": "ed25519", "pub": pub, "can": []any{"*"}}
-	create := func(ns string, doc map[string]any) {
+	env := &v073Env{Engine: e,
+		mint:   func(root map[string]any) string { return mint(priv, root) },
+		opMint: func(root map[string]any) string { return mint(opPriv, root) }}
+	env.create = func(ns string, doc map[string]any) {
 		t.Helper()
 		d := map[string]any{"keys": []any{key}}
 		for k, v := range doc {
 			d[k] = v
 		}
-		opG := mint(opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{ns}, "can": []any{"config"}})
+		opG := env.opMint(map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{ns}, "can": []any{"config"}})
 		if _, err := e.WriteConfig(context.Background(), Request{NS: ns, Cred: Credentials{Bearer: opG}}, ConfigChange{IfNoneMatch: true, Patches: []any{map[string]any{"op": "add", "path": "", "value": d}}}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	create("n", doc)
-	return e, func(root map[string]any) string { return mint(priv, root) }, create
+	env.create("n", doc)
+	return env
 }
 
 // v073Limit checks err is a 413 limit refusal naming key, with measured and
@@ -178,10 +189,11 @@ func v073Rules(n int) []any {
 // doesn't ignore it, /principal and edge-grant issuance included, and
 // before the ns check (§6.6, §C.2, v0.63, F-C1 default).
 func TestV073GrantRuleCompiledAtDecode(t *testing.T) {
-	e, mint, _ := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant"})
+	e := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant"})
+	mint := e.mint
 	ctx := context.Background()
 	writer := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create"}})}
-	if _, err := v073Create(e, writer, "a"); err != nil {
+	if _, err := v073Create(e.Engine, writer, "a"); err != nil {
 		t.Fatal(err)
 	}
 	for name, rule := range map[string]any{
@@ -189,7 +201,7 @@ func TestV073GrantRuleCompiledAtDecode(t *testing.T) {
 		"lookahead":  map[string]any{"op": "test", "path": "/principal/id", "schema": map[string]any{"pattern": "(?=user)"}},
 	} {
 		bad := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create", "read"}, "rules": []any{rule}})}
-		if _, err := v073Create(e, bad, "b"); v073Status(err) != 401 {
+		if _, err := v073Create(e.Engine, bad, "b"); v073Status(err) != 401 {
 			t.Fatalf("%s: write %v", name, err)
 		}
 		if _, err := e.ResourceHead(ctx, "n", "a", bad); v073Status(err) != 401 {
@@ -202,7 +214,7 @@ func TestV073GrantRuleCompiledAtDecode(t *testing.T) {
 			t.Fatalf("%s: edge grants %v", name, err)
 		}
 		other := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"elsewhere"}, "can": []any{"create"}, "rules": []any{rule}})}
-		if _, err := v073Create(e, other, "b"); v073Status(err) != 401 {
+		if _, err := v073Create(e.Engine, other, "b"); v073Status(err) != 401 {
 			t.Fatalf("%s: not naming n: %v", name, err)
 		}
 	}
@@ -213,8 +225,9 @@ func TestV073GrantRuleCompiledAtDecode(t *testing.T) {
 // the ns check on every request that doesn't ignore the grant (§C.8,
 // §12.2, v0.63, v0.73). Public reads ignore the grant.
 func TestV073RulesPerGrantBeforeNSCheck(t *testing.T) {
-	e, mint, create := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant"})
-	create("pub", map[string]any{"read": "public"})
+	e := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant"})
+	mint := e.mint
+	e.create("pub", map[string]any{"read": "public"})
 	ctx := context.Background()
 	writer := func(ns string) Credentials {
 		return Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{ns}, "can": []any{"create"}})}
@@ -227,12 +240,12 @@ func TestV073RulesPerGrantBeforeNSCheck(t *testing.T) {
 	// 32 forms pass; two top-level rules nesting 34 forms between them
 	// don't, though the old count, of top-level rules, saw 2.
 	at := Credentials{Bearer: mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create", "read"}, "rules": v073Rules(32)})}
-	if _, err := v073Create(e, at, "b"); err != nil {
+	if _, err := v073Create(e.Engine, at, "b"); err != nil {
 		t.Fatal(err)
 	}
 	over := map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n", "pub"}, "can": []any{"create", "read"}, "rules": append(v073Rules(18), v073Rules(18)...)}
 	tok := Credentials{Bearer: mint(over)}
-	_, err := v073Create(e, tok, "c")
+	_, err := v073Create(e.Engine, tok, "c")
 	v073Limit(t, "write", err, "rulesPerGrant", 36, 32)
 	_, err = e.ResourceHead(ctx, "n", "a", tok)
 	v073Limit(t, "private read", err, "rulesPerGrant", 36, 32)
@@ -243,7 +256,7 @@ func TestV073RulesPerGrantBeforeNSCheck(t *testing.T) {
 	_, err = e.ResourceHead(ctx, "nope", "a", tok)
 	v073Limit(t, "absent namespace", err, "rulesPerGrant", 36, 32)
 	over["ns"] = []any{"elsewhere"}
-	_, err = v073Create(e, Credentials{Bearer: mint(over)}, "c")
+	_, err = v073Create(e.Engine, Credentials{Bearer: mint(over)}, "c")
 	v073Limit(t, "not naming n", err, "rulesPerGrant", 36, 32)
 	if _, err := e.ResourceHead(ctx, "pub", "a", tok); err != nil {
 		t.Fatalf("a public read ignores the grant: %v", err)
@@ -256,10 +269,10 @@ func TestV073RulesPerGrantBeforeNSCheck(t *testing.T) {
 func TestV073GrantLimitsDeploymentOnly(t *testing.T) {
 	lim := DefaultLimits()
 	lim.RulesPerGrant, lim.GrantSize = 2, 300
-	e, mint, _ := v073Engine(t, lim, DefaultMaximums(), map[string]any{"read": "grant"})
-	g := mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create"}, "rules": v073Rules(3),
+	e := v073Engine(t, lim, DefaultMaximums(), map[string]any{"read": "grant"})
+	g := e.mint(map[string]any{"kid": "k", "sub": "user:w", "ns": []any{"n"}, "can": []any{"create"}, "rules": v073Rules(3),
 		"attrs": map[string]any{"pad": strings.Repeat("x", 300)}})
-	if _, err := v073Create(e, Credentials{Bearer: g}, "a"); err != nil {
+	if _, err := v073Create(e.Engine, Credentials{Bearer: g}, "a"); err != nil {
 		t.Fatalf("held to the namespace's grant limits: %v", err)
 	}
 }
@@ -275,4 +288,119 @@ func TestV073OversizeGrantNotNamingNS(t *testing.T) {
 	v073Limit(t, "write", err, "grantSize", 0, 0)
 	_, err = e.ResourceHead(context.Background(), "n", "a", Credentials{Bearer: big})
 	v073Limit(t, "read", err, "grantSize", 0, 0)
+}
+
+// v073Prefixes lists the prefixes of an exchange's edge grants.
+func v073Prefixes(eg *EdgeGrants) []string {
+	var out []string
+	for _, g := range eg.Grants {
+		out = append(out, g.Prefixes()...)
+	}
+	return out
+}
+
+// A qualifying role may refer to /resource when the grant fixes it, and
+// then must pass for every name fixed (once if none is); it may not refer
+// to /now (§2.1, §C.5.2, v0.65, v0.71).
+func TestV073QualifyingRolePerFixedName(t *testing.T) {
+	inAB := map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "b"}}}
+	e := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant", "roles": map[string]any{
+		"doc":    map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "doc"}}},
+		"ab":     map[string]any{"can": []any{"read"}, "rules": []any{inAB, map[string]any{"op": "test", "path": "/principal/id", "value": "user:r"}}},
+		"a-only": map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "compare", "path": "/resource", "eq": map[string]any{"value": "a"}}}},
+		"clock":  map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/now", "exists": true}}},
+		"plain":  map[string]any{"can": []any{"read"}},
+	}})
+	ctx := context.Background()
+	fix := func(names ...any) []any {
+		return []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": names}}}
+	}
+	for _, c := range []struct {
+		name  string
+		roles []any
+		rules []any
+		want  string // "" for 403
+	}{
+		{"role testing the fixed name", []any{"doc"}, fix("doc"), "/r/n/doc"},
+		{"role passing for every name fixed", []any{"ab"}, fix("a", "b"), "/r/n/a /r/n/b"},
+		{"role failing for one name fixed", []any{"a-only"}, fix("a", "b"), ""},
+		{"one role of two qualifies", []any{"a-only", "ab"}, fix("a", "b"), "/r/n/a /r/n/b"},
+		{"role on /resource, nothing fixed", []any{"doc"}, nil, ""},
+		{"role on /now", []any{"clock"}, nil, ""},
+		{"role on /now, a name fixed", []any{"clock"}, fix("doc"), ""},
+		{"role without rules", []any{"plain"}, nil, "/r/n /ns/n"},
+	} {
+		root := map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"n"}, "roles": c.roles}
+		if c.rules != nil {
+			root["rules"] = c.rules
+		}
+		eg, err := e.IssueEdgeGrants(ctx, []string{e.mint(root)})
+		if c.want == "" {
+			if v073Status(err) != 403 {
+				t.Errorf("%s: want 403, got %v", c.name, err)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("%s: %v", c.name, err)
+			continue
+		}
+		if got := strings.Join(v073Prefixes(eg), " "); got != c.want {
+			t.Errorf("%s: prefixes %q, want %q", c.name, got, c.want)
+		}
+	}
+}
+
+// A grant naming "*" gets no edge grant, 401: from a namespace key it is
+// invalid, and an operator grant authorises no read (§C.4, v0.63). No
+// grant at all is 401 too (§C.5.2).
+func TestV073EdgeGrantsStarAndNone(t *testing.T) {
+	e := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant"})
+	ctx := context.Background()
+	for name, tok := range map[string]string{
+		"operator":  e.opMint(map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"*"}, "can": []any{"read", "config"}}),
+		"namespace": e.mint(map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"*"}, "can": []any{"read"}}),
+		"beside n":  e.mint(map[string]any{"kid": "k", "sub": "user:r", "ns": []any{"n", "*"}, "can": []any{"read"}}),
+	} {
+		if _, err := e.IssueEdgeGrants(ctx, []string{tok}); v073Status(err) != 401 {
+			t.Errorf("%s grant naming *: %v", name, err)
+		}
+	}
+	if _, err := e.IssueEdgeGrants(ctx, nil); v073Status(err) != 401 {
+		t.Fatalf("no grant: %v", err)
+	}
+}
+
+// A grant narrowed to roles over a root without roles carries roles, and
+// has no effective role: it allows no verb, and /principal says so (§2.1,
+// §C.2, v0.66).
+func TestV073NarrowedToRolesAllowsNothing(t *testing.T) {
+	e := v073Engine(t, DefaultLimits(), DefaultMaximums(), map[string]any{"read": "grant", "roles": map[string]any{
+		"reader": map[string]any{"can": []any{"read"}}}})
+	ctx := context.Background()
+	root, err := grant.Decode(e.mint(map[string]any{"kid": "k", "sub": "user:d", "ns": []any{"n"}, "can": []any{"create", "read"}}), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := v073Create(e.Engine, Credentials{Bearer: root.Encode()}, "a"); err != nil {
+		t.Fatal(err)
+	}
+	n, err := root.Narrow(map[string]any{"via": "svc:x", "roles": []any{"reader"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := Credentials{Bearer: n.Encode()}
+	if _, err := v073Create(e.Engine, cred, "b"); v073Status(err) != 403 {
+		t.Fatalf("create: %v", err)
+	}
+	if _, err := e.ResourceHead(ctx, "n", "a", cred); v073Status(err) != 404 {
+		t.Fatalf("read: %v", err)
+	}
+	p, err := e.Principal(ctx, "n", cred)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if can, roles := p.Body["can"].([]any), p.Body["roles"].([]any); len(can) != 0 || len(roles) != 0 {
+		t.Fatalf("principal can %v roles %v", can, roles)
+	}
 }
