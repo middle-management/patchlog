@@ -169,8 +169,8 @@ func TestSealedOutputs(t *testing.T) {
 				t.Fatalf("doc %d: %s != %s", i, pt, pr.Body)
 			}
 			if i == 0 {
-				if h, _ := seal.ParseHeader(string(sr.Body)); h.Zip != seal.ZipDeflate {
-					t.Fatal("a large document is not compressed before sealing")
+				if h, _ := seal.ParseHeader(string(sr.Body)); h.Zip != "" {
+					t.Fatal("a large document is compressed before sealing (§E.2.2: never)")
 				}
 			}
 			out["doc"+id] = string(sr.Body)

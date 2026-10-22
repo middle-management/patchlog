@@ -11,10 +11,10 @@ import (
 //
 // The plaintext is the UTF-8 JSON that would otherwise be sealed, followed
 // by ASCII spaces up to PadLen of its length. Trailing whitespace is valid
-// JSON, so readers need nothing new. Padded payloads are never compressed:
-// a compression ratio leaks the content that padding is meant to hide (and
-// padding before compressing would be squeezed out again). Each JWE is
-// padded as a whole: a log range too, not its entries separately.
+// JSON, so readers need nothing new. No sealed payload is compressed
+// (§E.2.2), and a padded one couldn't be: a compression ratio leaks the
+// content that padding is meant to hide. Each JWE is padded as a whole: a
+// log range too, not its entries separately.
 
 // MinPadded is the smallest padded length (§E.2.2).
 const MinPadded = 256
@@ -52,15 +52,15 @@ func Padded(plaintext []byte) bool {
 }
 
 // IsPadded reports whether a JWE opened as (h, plaintext) is padded as
-// §E.2.2 requires: no zip header, and plaintext padded to its bucket.
+// §E.2.2 requires: no zip header (which only legacy bytes carry), and
+// plaintext padded to its bucket.
 func IsPadded(h *Header, plaintext []byte) bool {
 	return h.Zip == "" && Padded(plaintext)
 }
 
-// SealPadded is Seal with padding: plaintext is padded to its bucket and
-// never compressed.
+// SealPadded is Seal with padding: plaintext is padded to its bucket.
 func SealPadded(key []byte, kid string, pl PL, plaintext []byte) (string, error) {
-	return seal(key, kid, pl, Pad(plaintext), false)
+	return seal(key, kid, pl, Pad(plaintext), nil)
 }
 
 // SealMaybePadded is SealPadded if pad is set, Seal otherwise.

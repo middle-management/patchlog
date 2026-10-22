@@ -126,12 +126,14 @@ func OpenPatchSetPadded(patchSet any, key []byte, kid, ns, name, parent string) 
 }
 
 // SealSnapshot seals an E3 prune snapshot (§8.6): the document doc of
-// revision id, as canonical JSON, with pl {ns, name, id, kind: "snapshot"}.
+// revision id, as canonical JSON, with pl {ns, name, id} (§E.3.1).
 func SealSnapshot(key []byte, kid, ns, name, id string, doc any) (string, error) {
 	return SealSnapshotPad(key, kid, ns, name, id, doc, false)
 }
 
-// OpenSnapshot decrypts a prune snapshot bound to kid and {ns, name, id}.
+// OpenSnapshot decrypts a prune snapshot bound to kid and {ns, name, id},
+// or to the legacy {ns, name, id, kind: "snapshot"} of snapshots stored
+// before v0.63 (Expect).
 func OpenSnapshot(jwe string, key []byte, kid, ns, name, id string) (any, error) {
 	pt, err := OpenExpect(jwe, key, kid, SnapshotPL(ns, name, id))
 	if err != nil {

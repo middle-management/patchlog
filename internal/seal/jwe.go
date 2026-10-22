@@ -4,8 +4,8 @@
 //     alg "dir", enc "A256GCM" and the `pl` binding claims (§E.2.2).
 //   - Key schedule: epoch keys K_e, kids "{ns}#{e}" and per-resource keys
 //     K_r = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ 0x0A ‖ name) (§E.2.1).
-//   - Key wrapping to recipients' X25519 keys with HPKE (RFC 9180) and the
-//     E3 keyring resource (§E.2.3, §E.3.2).
+//   - Key wrapping to recipients' X25519 keys with HPKE (RFC 9180), in base
+//     mode, and in auth mode for the E3 keyring resource (§E.2.3, §E.3.2).
 //   - E3 sealed patch sets and prune snapshots (§E.3.1, §8.6).
 //   - E1 storage encryption: row AEAD and a chunked streaming file format.
 //   - `$nonce` helpers (§C.7, §E.2.5).
@@ -39,12 +39,9 @@ const (
 	AlgDir     = "dir"
 	EncA256GCM = "A256GCM"
 	// ZipDeflate marks raw DEFLATE (RFC 1951) compressed plaintext
-	// (RFC 7516 §4.1.3).
+	// (RFC 7516 §4.1.3). Seal never sets it (§E.2.2); Open still inflates
+	// it in bytes sealed before v0.65, which are served forever.
 	ZipDeflate = "DEF"
-
-	// CompressThreshold is the plaintext size from which Seal tries
-	// compression. Compression is kept only if it actually shrinks.
-	CompressThreshold = 1024
 
 	// DefaultMaxPlaintext bounds decompressed output in Open and
 	// OpenExpect (zip-bomb guard). Use OpenLimit for another bound.
@@ -72,14 +69,22 @@ var b64 = base64.RawURLEncoding.Strict()
 // Use the constructors below so that shapes stay exactly as specified.
 type PL map[string]any
 
-// Kinds of resource/namespace documents in PL.
+// Kinds in PL (§E.2.2).
 const (
 	KindRev       = "rev"
 	KindTombstone = "tombstone"
 	KindDoc       = "doc"
 	KindLog       = "log"
-	KindConfig    = "config"
-	KindSnapshot  = "snapshot"
+	// KindPurge and KindPrune are the kinds of a resource stream's purge
+	// and prune events (ResourceEventPL).
+	KindPurge = "purge"
+	KindPrune = "prune"
+	// KindConfig and KindSnapshot are legacy: bytes sealed before v0.63
+	// bind a namespace document with kind "config" (now "doc") and an E3
+	// prune snapshot with kind "snapshot" (now no kind). Expect accepts
+	// them for those payloads (legacyPL); nothing seals them any more.
+	KindConfig   = "config"
+	KindSnapshot = "snapshot"
 )
 
 // ResourcePL binds a resource revision/document/log entry:
@@ -88,9 +93,18 @@ func ResourcePL(ns, name, id, kind string) PL {
 	return PL{"ns": ns, "name": name, "id": id, "kind": kind}
 }
 
-// NamespaceDocPL binds a namespace document: { ns, id, kind: "config" }.
+// ResourceEventPL binds a resource stream's purge or prune event, sealed
+// under the resource's K_r of the current epoch (§E.2.2, §7.3):
+// { ns, name, kind }, kind the event type, KindPurge or KindPrune. The
+// event has no id, so neither has its pl.
+func ResourceEventPL(ns, name, kind string) PL {
+	return PL{"ns": ns, "name": name, "kind": kind}
+}
+
+// NamespaceDocPL binds the namespace document at ns_id id:
+// { ns, id, kind: "doc" } (§E.2.2).
 func NamespaceDocPL(ns, id string) PL {
-	return PL{"ns": ns, "id": id, "kind": KindConfig}
+	return PL{"ns": ns, "id": id, "kind": KindDoc}
 }
 
 // RangePL binds a namespace log range: { ns, range: [since, id] }.
@@ -111,10 +125,10 @@ func PatchSetPL(ns, name, parent string) PL {
 	return PL{"ns": ns, "name": name, "parent": parent}
 }
 
-// SnapshotPL binds an E3 prune snapshot: { ns, name, id, kind: "snapshot" }
-// (§8.6).
+// SnapshotPL binds an E3 prune snapshot to the revision whose document it
+// is: { ns, name, id }, with no kind (§E.3.1, §8.6).
 func SnapshotPL(ns, name, id string) PL {
-	return PL{"ns": ns, "name": name, "id": id, "kind": KindSnapshot}
+	return PL{"ns": ns, "name": name, "id": id}
 }
 
 // Header is a parsed JWE protected header.
@@ -122,29 +136,40 @@ type Header struct {
 	Alg string
 	Enc string
 	Kid string
-	Zip string // "" or "DEF"
+	Zip string // "" or, in legacy bytes only, "DEF"
 	PL  PL
 	// Raw is the decoded protected header (UTF-8 JSON) as transmitted.
 	Raw []byte
 }
 
 // Seal encrypts plaintext under key as a JWE compact serialization with
-// protected header canonical({alg:"dir", enc:"A256GCM", kid, pl, zip?}).
-// Plaintext of at least CompressThreshold bytes is DEFLATE-compressed when
-// that shrinks it, except for namespace log ranges (pl with "range"), which
-// are never compressed (§E.2.2).
+// protected header canonical({alg:"dir", enc:"A256GCM", kid, pl}). Sealed
+// payloads are never compressed and carry no zip header, whatever pl binds
+// (§E.2.2): a document holds content from several authors (CRIME/BREACH).
 func Seal(key []byte, kid string, pl PL, plaintext []byte) (string, error) {
-	_, isRange := pl["range"]
-	return seal(key, kid, pl, plaintext, !isRange)
+	return seal(key, kid, pl, plaintext, nil)
 }
 
-// SealUncompressed is Seal without compression, for callers that must not
-// compress (e.g. content mixing several authors).
+// SealUncompressed is Seal, which no longer compresses (§E.2.2).
+//
+// Deprecated: use Seal.
 func SealUncompressed(key []byte, kid string, pl PL, plaintext []byte) (string, error) {
-	return seal(key, kid, pl, plaintext, false)
+	return seal(key, kid, pl, plaintext, nil)
 }
 
-func seal(key []byte, kid string, pl PL, plaintext []byte, mayCompress bool) (string, error) {
+// SealWithIV is Seal with the 12-byte iv in place of a random one, for
+// test vectors (Addendum I). Never use it for content: an IV used twice
+// under one key breaks AES-GCM.
+func SealWithIV(key []byte, kid string, pl PL, plaintext, iv []byte) (string, error) {
+	if len(iv) != 12 {
+		return "", fmt.Errorf("seal: an IV has 12 bytes")
+	}
+	return seal(key, kid, pl, plaintext, iv)
+}
+
+// seal seals plaintext as Seal does, under iv, or a fresh random IV when
+// iv is nil.
+func seal(key []byte, kid string, pl PL, plaintext, iv []byte) (string, error) {
 	aead, err := newGCM(key)
 	if err != nil {
 		return "", err
@@ -153,17 +178,12 @@ func seal(key []byte, kid string, pl PL, plaintext []byte, mayCompress bool) (st
 		return "", fmt.Errorf("seal: kid and pl are required")
 	}
 	hdr := map[string]any{"alg": AlgDir, "enc": EncA256GCM, "kid": kid, "pl": map[string]any(pl)}
-	body := plaintext
-	if mayCompress && len(plaintext) >= CompressThreshold {
-		if z := deflate(plaintext); len(z) < len(plaintext) {
-			body = z
-			hdr["zip"] = ZipDeflate
-		}
-	}
 	protected := b64.EncodeToString(jsonv.Canonical(hdr))
-	iv := make([]byte, aead.NonceSize())
-	rand.Read(iv)
-	sealed := aead.Seal(nil, iv, body, []byte(protected))
+	if iv == nil {
+		iv = make([]byte, aead.NonceSize())
+		rand.Read(iv)
+	}
+	sealed := aead.Seal(nil, iv, plaintext, []byte(protected))
 	ct, tag := sealed[:len(sealed)-aead.Overhead()], sealed[len(sealed)-aead.Overhead():]
 	var sb strings.Builder
 	sb.WriteString(protected)
@@ -283,11 +303,46 @@ func OpenExpect(jwe string, key []byte, wantKid string, wantPL PL) ([]byte, erro
 	return pt, nil
 }
 
-// Expect reports ErrMismatch unless the header's kid and pl are exactly
-// wantKid and wantPL.
+// Expect reports ErrMismatch unless the header's kid is wantKid and its pl
+// is exactly wantPL, or the legacy pl of the same payload (legacyPL): bytes
+// sealed before v0.63 are stored once and served forever (§E.2.2), so
+// readers accept both forms.
 func (h *Header) Expect(wantKid string, wantPL PL) error {
-	if h.Kid != wantKid || !jsonv.Equal(map[string]any(h.PL), jsonv.FromGo(map[string]any(wantPL))) {
+	if h.Kid != wantKid {
 		return ErrMismatch
+	}
+	if plEqual(h.PL, wantPL) {
+		return nil
+	}
+	if legacy := legacyPL(wantPL); legacy != nil && plEqual(h.PL, legacy) {
+		return nil
+	}
+	return ErrMismatch
+}
+
+func plEqual(got, want PL) bool {
+	return jsonv.Equal(map[string]any(got), jsonv.FromGo(map[string]any(want)))
+}
+
+// legacyPL returns the pl that bytes sealed before v0.63 carry for the
+// payload want binds, or nil where it was the same:
+//
+//   - a namespace document, { ns, id, kind: "doc" }, was bound to
+//     { ns, id, kind: "config" };
+//   - an E3 prune snapshot, { ns, name, id }, to { ns, name, id,
+//     kind: "snapshot" }.
+//
+// No other payload had those pls, so accepting them opens nothing else.
+func legacyPL(want PL) PL {
+	_, ns := want["ns"]
+	_, id := want["id"]
+	_, name := want["name"]
+	kind, hasKind := want["kind"]
+	switch {
+	case len(want) == 3 && ns && id && kind == KindDoc:
+		return PL{"ns": want["ns"], "id": want["id"], "kind": KindConfig}
+	case len(want) == 3 && ns && id && name && !hasKind:
+		return PL{"ns": want["ns"], "name": want["name"], "id": want["id"], "kind": KindSnapshot}
 	}
 	return nil
 }
@@ -303,16 +358,9 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-func deflate(p []byte) []byte {
-	var buf bytes.Buffer
-	w, _ := flate.NewWriter(&buf, flate.BestCompression)
-	w.Write(p)
-	w.Close()
-	return buf.Bytes()
-}
-
 // inflate decompresses raw DEFLATE, failing with ErrTooLarge as soon as the
-// output would exceed max bytes.
+// output would exceed max bytes. Only bytes sealed before v0.65 are
+// compressed (ZipDeflate).
 func inflate(z []byte, max int) ([]byte, error) {
 	r := flate.NewReader(bytes.NewReader(z))
 	defer r.Close()

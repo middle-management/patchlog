@@ -414,8 +414,8 @@ async function refreshNS() {
     S.config = r.hdr('X-Config-Revision') || '';
     S.nsRaw = r.jose ? r.text : '';
     if (r.jose) {
-      // A sealed namespace (E2) serves its document as a JWE bound to { ns, id: ns_id, kind: "config" }.
-      const d = await decrypted(r, ns, '', { ns, id: S.nsHead, kind: 'config' });
+      // A sealed namespace (E2) serves its document as a JWE bound to { ns, id: ns_id, kind: "doc" } (nsDocPL).
+      const d = await decrypted(r, ns, '', nsDocPL(ns, S.nsHead));
       if (ns !== S.ns) return;
       S.nsDoc = d.value; S.nsSeal = d;
     } else { S.nsDoc = r.json; S.nsSeal = null; }
@@ -1660,6 +1660,12 @@ async function contentKey(kid, resource) {
   return kr;
 }
 
+/* nsDocPL is the pl wanted of namespace ns's sealed document id: { ns, id, kind: "doc" } (§E.2.2), or for bytes
+ * sealed before v0.63, which readers still accept, kind "config". Every reader of a namespace document uses it. */
+function nsDocPL(ns, id) {
+  return (hd) => ({ ns, id, kind: hd.pl && hd.pl.kind === 'config' ? 'config' : 'doc' });
+}
+
 /* openSealed decrypts a JWE of namespace ns after checking its kid and pl against what was asked for. */
 async function openSealed(ns, jwe, resource, wantPL) {
   const { header } = Z.parseJWE(jwe);
@@ -1876,7 +1882,8 @@ async function openSnapshot(ns, name, h, r) {
   const hdr = Z.parseJWE(jwe).header;
   const kns = Z.parseKid(hdr.kid).ns;
   if (!(await nsChainOK(ns, kns))) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: sealed under ${hdr.kid}`);
-  return openSealed(kns, jwe, '', { ns: kns, name, id: h, kind: 'snapshot' });
+  // pl { ns, name, id } (§E.3.1); snapshots stored before v0.63 also carry kind "snapshot".
+  return openSealed(kns, jwe, '', (hd) => (hd.pl && hd.pl.kind === 'snapshot' ? { ns: kns, name, id: h, kind: 'snapshot' } : { ns: kns, name, id: h }));
 }
 
 /* foldLog verifies and folds an e2e log answer that ends at id and starts after since. A fold from a pruning
@@ -2450,7 +2457,7 @@ async function nsHeadDoc(ns) {
   const r = await api('GET', `/ns/${ns}`, { auto: true, label: 'catalog' });
   if (r.status !== 200) return { status: r.status };
   const head = r.etag() || ((/\/rev\/([^/]+)$/.exec(r.finalPath) || [])[1] || '');
-  const doc = r.jose ? (await decrypted(r, ns, '', { ns, id: head, kind: 'config' })).value : r.json;
+  const doc = r.jose ? (await decrypted(r, ns, '', nsDocPL(ns, head))).value : r.json;
   return { status: 200, head, config: r.hdr('X-Config-Revision') || '', doc, sealed: r.jose };
 }
 
