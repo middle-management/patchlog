@@ -1986,7 +1986,7 @@ func checkNarrowing(ctx context.Context, c *client.Client, b *ReleaseBranch, p *
 		} else if !strings.Contains(r.Name, ".") {
 			newFolders[r.Name] = true
 		}
-		sc, err := foldWrites(start, r.Steps)
+		sc, err := foldWrites(start, r.Steps, false)
 		if err != nil {
 			return err
 		}

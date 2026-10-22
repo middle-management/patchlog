@@ -941,12 +941,12 @@ func (p *Plan) classifyAncestry(ctx context.Context, r *Resource, h *client.Head
 		r.conflict(ConflictPruned, "the common ancestor's document is not available (pruned)")
 		return nil
 	}
-	bsc, err := foldWrites(*bstart, r.Steps)
+	bsc, err := foldWrites(*bstart, r.Steps, true)
 	if err != nil {
 		r.conflict(ConflictUnreadable, "branch side: "+err.Error())
 		return nil
 	}
-	tsc, err := foldWrites(*tstart, baseSteps)
+	tsc, err := foldWrites(*tstart, baseSteps, false)
 	if err != nil {
 		r.conflict(ConflictUnreadable, "target side: "+err.Error())
 		return nil

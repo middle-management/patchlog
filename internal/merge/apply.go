@@ -131,7 +131,7 @@ func (p *Plan) squash(ctx context.Context, r *Resource, h *client.Head) error {
 		}
 		start = docState{doc: d, exists: true, deleted: true}
 	}
-	sc, err := foldWrites(docState{doc: jsonv.Clone(start.doc), exists: start.exists, deleted: start.deleted}, r.Steps)
+	sc, err := foldWrites(docState{doc: jsonv.Clone(start.doc), exists: start.exists, deleted: start.deleted}, r.Steps, false)
 	if err != nil {
 		r.conflict(ConflictUnreadable, "squash: "+err.Error())
 		return nil

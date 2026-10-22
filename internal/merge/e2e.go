@@ -70,20 +70,18 @@ func (r *Resource) dropConflicts(kind string) {
 // doesn't validate.
 func (p *Plan) sealSteps(ctx context.Context, r *Resource) (steps []client.Step, msg string, err error) {
 	x := p.opt.E2E
+	// A create applies to the document null (§6.2 step 3).
 	var doc any
-	exists := false
 	switch {
 	case r.BaseState == client.Live.String():
 		if doc, err = p.doc(ctx, p.Target, r.Name, r.Base); err != nil {
 			return nil, "", err
 		}
-		exists = true
 	case r.BaseState == client.Tombstoned.String() && r.baseLast != "":
 		// A patch set on a tombstone restores the last live document.
 		if doc, err = p.doc(ctx, p.Target, r.Name, r.baseLast); err != nil {
 			return nil, "", err
 		}
-		exists = true
 	}
 	prev := r.Base
 	if r.IfNoneMatch {
@@ -105,7 +103,7 @@ func (p *Plan) sealSteps(ctx context.Context, r *Resource) (steps []client.Step,
 		if err != nil {
 			return nil, fmt.Sprintf("step %d: %v", i, err), nil
 		}
-		nd, _, err := patch.Apply(jsonv.Clone(doc), exists, ops, patch.Options{})
+		nd, _, err := patch.Apply(jsonv.Clone(doc), true, ops, patch.Options{})
 		if err != nil {
 			return nil, fmt.Sprintf("step %d doesn't apply: %v", i, err), nil
 		}
@@ -129,7 +127,7 @@ func (p *Plan) sealSteps(ctx context.Context, r *Resource) (steps []client.Step,
 		}
 		// The re-sealed step keeps the source revision's gesture (§F.3).
 		steps = append(steps, client.PatchStep(sealed).WithGesture(s.Gesture, s.Undoes))
-		doc, exists = nd, true
+		doc = nd
 	}
 	return steps, "", nil
 }
