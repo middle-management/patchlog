@@ -39,12 +39,9 @@ const (
 	AlgDir     = "dir"
 	EncA256GCM = "A256GCM"
 	// ZipDeflate marks raw DEFLATE (RFC 1951) compressed plaintext
-	// (RFC 7516 §4.1.3).
+	// (RFC 7516 §4.1.3). Seal never sets it (§E.2.2); Open still inflates
+	// it in bytes sealed before v0.65, which are served forever.
 	ZipDeflate = "DEF"
-
-	// CompressThreshold is the plaintext size from which Seal tries
-	// compression. Compression is kept only if it actually shrinks.
-	CompressThreshold = 1024
 
 	// DefaultMaxPlaintext bounds decompressed output in Open and
 	// OpenExpect (zip-bomb guard). Use OpenLimit for another bound.
@@ -122,29 +119,40 @@ type Header struct {
 	Alg string
 	Enc string
 	Kid string
-	Zip string // "" or "DEF"
+	Zip string // "" or, in legacy bytes only, "DEF"
 	PL  PL
 	// Raw is the decoded protected header (UTF-8 JSON) as transmitted.
 	Raw []byte
 }
 
 // Seal encrypts plaintext under key as a JWE compact serialization with
-// protected header canonical({alg:"dir", enc:"A256GCM", kid, pl, zip?}).
-// Plaintext of at least CompressThreshold bytes is DEFLATE-compressed when
-// that shrinks it, except for namespace log ranges (pl with "range"), which
-// are never compressed (§E.2.2).
+// protected header canonical({alg:"dir", enc:"A256GCM", kid, pl}). Sealed
+// payloads are never compressed and carry no zip header, whatever pl binds
+// (§E.2.2): a document holds content from several authors (CRIME/BREACH).
 func Seal(key []byte, kid string, pl PL, plaintext []byte) (string, error) {
-	_, isRange := pl["range"]
-	return seal(key, kid, pl, plaintext, !isRange)
+	return seal(key, kid, pl, plaintext, nil)
 }
 
-// SealUncompressed is Seal without compression, for callers that must not
-// compress (e.g. content mixing several authors).
+// SealUncompressed is Seal, which no longer compresses (§E.2.2).
+//
+// Deprecated: use Seal.
 func SealUncompressed(key []byte, kid string, pl PL, plaintext []byte) (string, error) {
-	return seal(key, kid, pl, plaintext, false)
+	return seal(key, kid, pl, plaintext, nil)
 }
 
-func seal(key []byte, kid string, pl PL, plaintext []byte, mayCompress bool) (string, error) {
+// SealWithIV is Seal with the 12-byte iv in place of a random one, for
+// test vectors (Addendum I). Never use it for content: an IV used twice
+// under one key breaks AES-GCM.
+func SealWithIV(key []byte, kid string, pl PL, plaintext, iv []byte) (string, error) {
+	if len(iv) != 12 {
+		return "", fmt.Errorf("seal: an IV has 12 bytes")
+	}
+	return seal(key, kid, pl, plaintext, iv)
+}
+
+// seal seals plaintext as Seal does, under iv, or a fresh random IV when
+// iv is nil.
+func seal(key []byte, kid string, pl PL, plaintext, iv []byte) (string, error) {
 	aead, err := newGCM(key)
 	if err != nil {
 		return "", err
@@ -153,17 +161,12 @@ func seal(key []byte, kid string, pl PL, plaintext []byte, mayCompress bool) (st
 		return "", fmt.Errorf("seal: kid and pl are required")
 	}
 	hdr := map[string]any{"alg": AlgDir, "enc": EncA256GCM, "kid": kid, "pl": map[string]any(pl)}
-	body := plaintext
-	if mayCompress && len(plaintext) >= CompressThreshold {
-		if z := deflate(plaintext); len(z) < len(plaintext) {
-			body = z
-			hdr["zip"] = ZipDeflate
-		}
-	}
 	protected := b64.EncodeToString(jsonv.Canonical(hdr))
-	iv := make([]byte, aead.NonceSize())
-	rand.Read(iv)
-	sealed := aead.Seal(nil, iv, body, []byte(protected))
+	if iv == nil {
+		iv = make([]byte, aead.NonceSize())
+		rand.Read(iv)
+	}
+	sealed := aead.Seal(nil, iv, plaintext, []byte(protected))
 	ct, tag := sealed[:len(sealed)-aead.Overhead()], sealed[len(sealed)-aead.Overhead():]
 	var sb strings.Builder
 	sb.WriteString(protected)
@@ -303,16 +306,9 @@ func newGCM(key []byte) (cipher.AEAD, error) {
 	return cipher.NewGCM(block)
 }
 
-func deflate(p []byte) []byte {
-	var buf bytes.Buffer
-	w, _ := flate.NewWriter(&buf, flate.BestCompression)
-	w.Write(p)
-	w.Close()
-	return buf.Bytes()
-}
-
 // inflate decompresses raw DEFLATE, failing with ErrTooLarge as soon as the
-// output would exceed max bytes.
+// output would exceed max bytes. Only bytes sealed before v0.65 are
+// compressed (ZipDeflate).
 func inflate(z []byte, max int) ([]byte, error) {
 	r := flate.NewReader(bytes.NewReader(z))
 	defer r.Close()

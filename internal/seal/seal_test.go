@@ -28,12 +28,11 @@ func TestJWERoundTrip(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		pt   []byte
-		zip  bool
 	}{
-		{"small", []byte(`{"score":"2-1"}`), false},
-		{"large", bytes.Repeat([]byte(`{"a":"bbbbbbbb"},`), 200), true},
-		{"large-random-ish", randBytes(4096), false}, // doesn't shrink
-		{"empty", nil, false},
+		{"small", []byte(`{"score":"2-1"}`)},
+		{"large", bytes.Repeat([]byte(`{"a":"bbbbbbbb"},`), 200)}, // compressible, yet never compressed (§E.2.2)
+		{"large-random-ish", randBytes(4096)},
+		{"empty", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			jwe, err := Seal(k, kid, pl, tc.pt)
@@ -44,8 +43,8 @@ func TestJWERoundTrip(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if (h.Zip == ZipDeflate) != tc.zip {
-				t.Fatalf("zip = %q, want %v", h.Zip, tc.zip)
+			if h.Zip != "" {
+				t.Fatalf("zip = %q, want none", h.Zip)
 			}
 			// Header is canonical JSON.
 			if want := jsonv.Canonical(jsonv.MustParse(h.Raw)); !bytes.Equal(h.Raw, want) {
@@ -200,10 +199,8 @@ func TestTamper(t *testing.T) {
 func TestZipBomb(t *testing.T) {
 	k := key(4)
 	bomb := make([]byte, 10<<20) // 10 MiB of zeros → a few KiB compressed
-	jwe, err := Seal(k, "ns#1", ResourcePL("ns", "r", "1a", KindRev), bomb)
-	if err != nil {
-		t.Fatal(err)
-	}
+	// Seal never compresses (§E.2.2); bytes sealed before v0.65 may be.
+	jwe := handJWE(t, k, `{"alg":"dir","enc":"A256GCM","kid":"ns#1","pl":{"id":"1a","kind":"rev","name":"r","ns":"ns"},"zip":"DEF"}`, bomb, true)
 	if len(jwe) > 100<<10 {
 		t.Fatalf("not compressed: %d", len(jwe))
 	}
