@@ -46,7 +46,8 @@
 // The batch's source.at is the branch revision the plan was classified
 // from (BranchAt), never a later one: re-classification after a 412 only
 // reads the target again, and a plan built later (NewPlan) reads the
-// branch's new head and uses that as its source.at.
+// branch's new head and uses that as its source.at, unless
+// Options.BranchAt fixes it.
 //
 // End-to-end namespaces (§F.8, §G.5). Sealed patch sets bind their
 // namespace (§E.3.1), so when the branch or the target is e2e the plan
@@ -286,6 +287,12 @@ type Options struct {
 	// are never carried over (§C.3).
 	Signer *sig.Key
 
+	// BranchAt, if set, is the branch's ns_id to classify from, in place of
+	// its head: the batch's source.at. A release keeps each branch's ns_id
+	// from before its approval's freeze (§F.9). It must be in the branch's
+	// chain.
+	BranchAt string
+
 	// successor is set by Rebase: the target is the branch's successor,
 	// whose merge batches of the branch are the rebase itself, so all of
 	// them count as merge points without merge.authors (§F.6 accepts them
@@ -406,16 +413,19 @@ func NewPlan(ctx context.Context, c *client.Client, target, branch string, opt O
 		}
 	}
 	p.Reencrypt = p.BranchLevel == "e2e" || p.TargetLevel == "e2e"
-	bh, err := c.NSHead(ctx, branch)
-	if err != nil {
-		return nil, fmt.Errorf("merge: branch %s: %w", branch, err)
+	p.BranchAt = opt.BranchAt
+	if p.BranchAt == "" {
+		bh, err := c.NSHead(ctx, branch)
+		if err != nil {
+			return nil, fmt.Errorf("merge: branch %s: %w", branch, err)
+		}
+		p.BranchAt = bh.ID
 	}
-	p.BranchAt = bh.ID
-	blog, err := c.NSLog(ctx, branch, bh.ID, "")
+	blog, err := c.NSLog(ctx, branch, p.BranchAt, "")
 	if err != nil {
 		return nil, fmt.Errorf("merge: branch %s log: %w", branch, err)
 	}
-	bdoc, err := c.NSDoc(ctx, branch, bh.ID)
+	bdoc, err := c.NSDoc(ctx, branch, p.BranchAt)
 	if err != nil {
 		return nil, err
 	}

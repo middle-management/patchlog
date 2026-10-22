@@ -1,6 +1,7 @@
 package merge_test
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -11,8 +12,10 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/merge"
+	"github.com/middle-management/patchlog/internal/release"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -328,5 +331,193 @@ func TestV073MergeCopiesBlobs(t *testing.T) {
 	}
 	if b := must(owner.GetBlob(ctx, "pics", "cup", cb, "")); string(b.Data) != string(png) {
 		t.Fatalf("pics/cup blob %q", b.Data)
+	}
+}
+
+// §F.9 Merging (v0.63): before approval each listed branch's base must be
+// the namespace it is keyed by; a branch of a branch of it no longer
+// passes because its base chain reaches it.
+func TestV073ReleaseBaseIsKeyedNamespace(t *testing.T) {
+	t.Parallel()
+	w := newRelWorld(t)
+	w.branch("schemas", "schemas-r7")
+	w.branch("schemas-r7", "schemas-r7-b")
+	w.appendTo("schemas-r7-b", "match", op("add", "/properties/venue", map[string]any{"type": "string"}))
+	w.writeRelease("release-x", map[string]string{"schemas": "schemas-r7-b"})
+	rp := must(merge.PlanRelease(ctx, w.anna, w.opts("release-x")))
+	if got := conflictKinds(rp)[merge.RCBaseChain]; len(got) != 1 || got[0] != "schemas/" {
+		t.Fatalf("conflicts %+v", rp.Conflicts)
+	}
+	if !strings.Contains(rp.Conflicts[0].Message, "schemas-r7") {
+		t.Fatalf("message %q", rp.Conflicts[0].Message)
+	}
+	// Its own base is fine.
+	w.writeRelease("release-y", map[string]string{"schemas": "schemas-r7"})
+	if rp := must(merge.PlanRelease(ctx, w.anna, w.opts("release-y"))); len(conflictKinds(rp)[merge.RCBaseChain]) != 0 {
+		t.Fatalf("conflicts %+v", rp.Conflicts)
+	}
+}
+
+// §F.9 (v0.63, v0.56, v0.65): the digest is over the plan shape the spec
+// defines; approval keeps each branch's ns_id from before its freeze as
+// every batch's source.at; the merge lock is { holder, plan } in the
+// release document's own namespace (whatever StateNS says), taken, given
+// its plan, and released to {}.
+func TestV073ReleaseDigestAtAndLock(t *testing.T) {
+	t.Parallel()
+	w := newRelWorld(t)
+	w.startCatalog()
+	w.branch("cat-season", "cat-season-r8")
+	w.appendTo("cat-season-r8", "season", op("replace", "/title", "Season 2026"))
+	w.writeRelease("release-8", map[string]string{"cat-season": "cat-season-r8"})
+	// The stored plan lives elsewhere; the lock doesn't.
+	must(w.s.Client(t, client.WithBearer(w.s.OperatorGrant(t, "schemas-x"))).CreateNamespace(ctx, "schemas-x",
+		map[string]any{"read": "grant", "keys": []any{w.opsKey.Entry("*"), w.idp.Entry(grant.Verbs...)}}))
+	o := w.opts("release-8")
+	o.StateNS = "schemas-x"
+
+	rp := must(merge.PlanRelease(ctx, w.anna, o))
+	if !rp.Clean() || rp.Format != merge.PlanFormat {
+		t.Fatalf("plan %+v", rp)
+	}
+	before := must(w.anna.NSHead(ctx, "cat-season-r8")).ID
+	rel := must(release.Load(ctx, w.anna, "/r/releases/release-8"))
+	want := map[string]any{
+		"release": "/r/releases/release-8/rev/" + rel.Ref.Rev,
+		"batches": []any{map[string]any{
+			"ns":     "cat-season",
+			"source": map[string]any{"ns": "cat-season-r8", "at": before},
+			"items": []any{map[string]any{"resource": "season", "ifMatch": must(w.anna.Head(ctx, "cat-season", "season")).ID,
+				"steps": []any{[]any{map[string]any{"op": "replace", "path": "/title", "value": "Season 2026"}}}}},
+		}},
+	}
+	if got := merge.PlanDigest(want); rp.Digest != got {
+		t.Fatalf("digest %s, want %s over %s", rp.Digest, got, jsonv.Canonical(jsonv.FromGo(want)))
+	}
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, rp))
+	if h := must(w.anna.Head(ctx, "schemas-x", merge.PlanName("release-8"))); h.State != client.Live {
+		t.Fatal("the plan isn't stored in StateNS")
+	}
+	rp = must(merge.ApproveRelease(ctx, w.anna, o))
+	if b := rp.Branches[0]; b.At != before || must(w.anna.NSHead(ctx, "cat-season-r8")).ID == before {
+		t.Fatalf("branch at %s, want the ns_id before the freeze %s", b.At, before)
+	}
+	// Planning again after the approval still classifies from before the
+	// freeze, so the digest holds.
+	o2 := o
+	o2.AcceptFrozen = rp.FrozenBy()
+	if again := must(merge.PlanRelease(ctx, w.anna, o2)); again.Digest != rp.Digest {
+		t.Fatalf("planned again after the freeze: %s, approved %s", again.Digest, rp.Digest)
+	}
+
+	rp = must(merge.ApplyRelease(ctx, w.anna, o))
+	if rp.State != merge.ReleaseDone {
+		t.Fatalf("state %s", rp.State)
+	}
+	for _, st := range rp.Steps {
+		if st.Done == "noop" {
+			continue
+		}
+		if e := entryOf(t, w.anna, "cat-season", st.Done); e.Source["at"] != before {
+			t.Fatalf("step %d source %v, want at %s", st.Step, e.Source, before)
+		}
+	}
+	// The lock: taken, given its plan, released; in releases, not in
+	// StateNS.
+	lock := merge.LockName("cat-season")
+	if h := must(w.anna.Head(ctx, "schemas-x", lock)); h.State != client.NotFound {
+		t.Fatalf("a lock in StateNS: %+v", h)
+	}
+	h := must(w.anna.Head(ctx, "releases", lock))
+	var docs []string
+	for _, e := range must(w.anna.Log(ctx, "releases", lock, h.ID, "")) {
+		docs = append(docs, string(jsonv.Canonical(must(w.anna.Doc(ctx, "releases", lock, e.ID)).Value)))
+	}
+	wantDocs := []string{`{"holder":"user:anna"}`, `{"holder":"user:anna","plan":"` + rp.Digest + `"}`, `{}`}
+	if !reflect.DeepEqual(docs, wantDocs) {
+		t.Fatalf("lock documents %q, want %q", docs, wantDocs)
+	}
+}
+
+// §F.9 The merge lock: a resuming service takes over only a lock whose
+// plan is its stored plan's digest; a lock held without a plan, for
+// another plan, or by an earlier version ({ "release" }) is ErrLocked,
+// naming holder and plan; an earlier version's free lock is free.
+func TestV073ReleaseLockTakeover(t *testing.T) {
+	t.Parallel()
+	w := newRelWorld(t)
+	w.startCatalog()
+	w.branch("cat-season", "cat-season-r8")
+	w.appendTo("cat-season-r8", "season", op("replace", "/title", "Season 2026"))
+	w.writeRelease("release-8", map[string]string{"cat-season": "cat-season-r8"})
+	o := w.opts("release-8")
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, must(merge.PlanRelease(ctx, w.anna, o))))
+	rp := must(merge.ApproveRelease(ctx, w.anna, o))
+	lock := merge.LockName("cat-season")
+	setLock := func(doc map[string]any) {
+		t.Helper()
+		if h := must(w.anna.Head(ctx, "releases", lock)); h.State == client.Live {
+			must(w.anna.Append(ctx, "releases", lock, h.ID, ops(op("replace", "", doc))))
+		} else {
+			must(w.anna.CreateDoc(ctx, "releases", lock, doc))
+		}
+	}
+	for _, c := range []struct {
+		doc  map[string]any
+		want string
+	}{
+		{map[string]any{"holder": "svc:other"}, "svc:other holds releases/" + lock + " for plan (none)"},
+		{map[string]any{"holder": "svc:other", "plan": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}, "for plan 1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{map[string]any{"release": "/r/releases/release-6", "since": "2026-01-01T00:00:00Z"}, "an earlier version's merge of /r/releases/release-6"},
+	} {
+		setLock(c.doc)
+		_, err := merge.ApplyRelease(ctx, w.anna, o)
+		if !errors.Is(err, merge.ErrLocked) || !strings.Contains(err.Error(), c.want) {
+			t.Fatalf("lock %v: %v", c.doc, err)
+		}
+	}
+	// Another service crashed holding this plan's lock: taken over.
+	setLock(map[string]any{"holder": "svc:other", "plan": rp.Digest})
+	o.AfterStep = func(*merge.ReleaseStep) error { return errors.New("stop") }
+	if _, err := merge.ApplyRelease(ctx, w.anna, o); err == nil || errors.Is(err, merge.ErrLocked) {
+		t.Fatalf("takeover: %v", err)
+	}
+	if l := must(merge.ReadLock(ctx, w.anna, o, "cat-season")); l.Holder != "user:anna" || l.Plan != rp.Digest {
+		t.Fatalf("lock after takeover %+v", l)
+	}
+	// An earlier version's free lock is free: release it as one would have.
+	setLock(map[string]any{"release": nil})
+	if l := must(merge.ReadLock(ctx, w.anna, o, "cat-season")); !l.Free() {
+		t.Fatalf("legacy free lock %+v", l)
+	}
+	o.AfterStep = nil
+	if rp, err := merge.ApplyRelease(ctx, w.anna, o); err != nil || rp.State != merge.ReleaseDone {
+		t.Fatalf("apply over a free legacy lock: %v", err)
+	}
+}
+
+// §F.9: the stored-plan format changed with the digest, so a plan stored
+// or approved before needs planning and approving again.
+func TestV073ReleaseOldPlanFormat(t *testing.T) {
+	t.Parallel()
+	w := newRelWorld(t)
+	w.branch("schemas", "schemas-r7")
+	w.appendTo("schemas-r7", "match", op("add", "/properties/venue", map[string]any{"type": "string"}))
+	w.writeRelease("release-x", map[string]string{"schemas": "schemas-r7"})
+	o := w.opts("release-x")
+	rp := must(merge.PlanRelease(ctx, w.anna, o))
+	rp.Format = 0
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, rp))
+	if _, err := merge.ApproveRelease(ctx, w.anna, o); !errors.Is(err, merge.ErrDigest) || !strings.Contains(err.Error(), "format") {
+		t.Fatalf("approving an old-format plan: %v", err)
+	}
+	stored := must(merge.LoadReleasePlan(ctx, w.anna, o))
+	stored.State = merge.ReleaseApproved
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, stored))
+	if _, err := merge.ApplyRelease(ctx, w.anna, o); !errors.Is(err, merge.ErrInvalidPlan) {
+		t.Fatalf("applying an old-format approval: %v", err)
+	}
+	if h := must(w.anna.Head(ctx, "schemas", "match")); h.ID != w.T0 {
+		t.Fatal("something was merged")
 	}
 }

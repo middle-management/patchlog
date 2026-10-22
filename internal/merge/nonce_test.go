@@ -107,7 +107,8 @@ func TestRequiredNoncesReleaseSplit(t *testing.T) {
 // §C.7, §F.9: in a state namespace that requires nonces, the release
 // tool's own documents get a fresh $nonce in every revision: the stored
 // plan (created, restored with a root replace after a delete, appended to
-// at every step) and the catalog base's lock (taken and released).
+// at every step) and the catalog base's lock (taken, given its plan, and
+// released).
 func TestRequiredNoncesReleaseState(t *testing.T) {
 	t.Parallel()
 	w := newRelWorld(t)
@@ -154,7 +155,8 @@ func TestRequiredNoncesReleaseState(t *testing.T) {
 	if ns := nonces(plan); len(ns) < 5 {
 		t.Fatalf("plan revisions %v", ns)
 	}
-	if ns := nonces(lock); len(ns) != 2 {
+	// Taken (holder), its plan set, released (§F.9).
+	if ns := nonces(lock); len(ns) != 3 {
 		t.Fatalf("lock revisions %v", ns)
 	}
 	if holder := must(merge.LockHolder(ctx, w.anna, o, "cat-season")); holder != "" {
