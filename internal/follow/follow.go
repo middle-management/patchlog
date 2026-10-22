@@ -568,6 +568,13 @@ func (n *nsFollower) followLongPoll(ctx context.Context) error {
 				// rather than its purge-ns entry (§8.5).
 				return n.deliverPurged(ctx, err)
 			}
+			if cursor != "" && client.IsBadInput(err) {
+				// A cursor too far behind the server's (a long pause, a
+				// clock change) is 400: poll again without it (§7.7).
+				// Without a cursor, a 400 is the follower's to report.
+				cursor = ""
+				continue
+			}
 			if !client.Retryable(err) {
 				return err
 			}

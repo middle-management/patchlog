@@ -731,8 +731,10 @@ func (r *runner) largeDocs() {
 }
 
 // live measures long-poll followers (§7.7) of one namespace: w followers
-// wait on the same URL (the namespace's head as since, no cursor), one
-// write lands, and each follower's wait ends with it. Through a CDN that
+// wait on the same URL (the namespace's head as since; the first request,
+// without a cursor, is answered at once, and each then waits with the
+// cursor it returned), one write lands, and each follower's wait ends
+// with it. Through a CDN that
 // collapses identical misses (-live-url), the origin answers one request
 // for all of them; directly, every follower is a request of its own that
 // the write wakes and that reads the log again.
@@ -779,22 +781,9 @@ func (r *runner) live() {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				since, cursor := head, ""
 				parked.Add(1)
-				for ctx.Err() == nil {
-					res, err := lcs[i].LongPoll(ctx, ns, since, cursor)
-					if err != nil {
-						if errs.Add(1) == 1 {
-							r.logf("long-poll: %v", err)
-						}
-						time.Sleep(100 * time.Millisecond)
-						continue
-					}
-					if len(res.Entries) > 0 {
-						got[i] = time.Now()
-						return
-					}
-					since, cursor = res.Since, res.Cursor
+				if waitEntries(ctx, lcs[i], ns, head, &errs, r.logf) {
+					got[i] = time.Now()
 				}
 			}()
 		}
@@ -831,6 +820,34 @@ func (r *runner) live() {
 		out[fmt.Sprint(w)] = res
 	}
 	r.record("long_poll_fanout", out)
+}
+
+// waitEntries long-polls ns from since (§7.7), echoing each answer's
+// cursor and since, until entries arrive (true) or ctx ends (false). A
+// failed poll counts in errs, the first one logged, and is tried again
+// after a pause; a cursor too far behind the server's is 400 bad_input,
+// after which it polls again at once without it (§7.7).
+func waitEntries(ctx context.Context, c *client.Client, ns, since string, errs *atomic.Int64, logf func(string, ...any)) bool {
+	cursor := ""
+	for ctx.Err() == nil {
+		res, err := c.LongPoll(ctx, ns, since, cursor)
+		if err != nil && cursor != "" && client.IsBadInput(err) {
+			cursor = ""
+			continue
+		}
+		if err != nil {
+			if errs.Add(1) == 1 {
+				logf("long-poll: %v", err)
+			}
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		if len(res.Entries) > 0 {
+			return true
+		}
+		since, cursor = res.Since, res.Cursor
+	}
+	return false
 }
 
 // settle waits until the core's CPU time grows by less than 20 ms in

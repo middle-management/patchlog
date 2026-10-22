@@ -24,7 +24,11 @@ type LongPollResult struct {
 // LongPoll waits for namespace entries after since (§7.7). Echo the
 // returned Cursor and Since in the next call. It returns at once when
 // entries exist, and otherwise at the server's interval boundary with
-// Timeout set. Errors are as for NSLog (404 since not in chain, …).
+// Timeout set; without a cursor, or with one behind the server's, at once.
+// Errors are as for NSLog (404 since not in chain, …). A cursor more than
+// an hour's worth of intervals behind or ahead of the server's, after a
+// long pause or a clock change, is 400 bad_input (IsBadInput): poll again
+// once without it, as a follower does.
 func (c *Client) LongPoll(ctx context.Context, ns, since, cursor string) (*LongPollResult, error) {
 	if err := checkNS(ns); err != nil {
 		return nil, err
@@ -65,7 +69,8 @@ type ResourceLongPollResult struct {
 	Timeout bool
 }
 
-// ResourceLongPoll waits for resource log entries after since (§7.7).
+// ResourceLongPoll waits for resource log entries after since (§7.7), as
+// LongPoll does; a resource with no entries waits as for an empty since.
 func (c *Client) ResourceLongPoll(ctx context.Context, ns, name, since, cursor string) (*ResourceLongPollResult, error) {
 	if err := checkRes(ns, name); err != nil {
 		return nil, err
@@ -91,6 +96,12 @@ func (c *Client) ResourceLongPoll(ctx context.Context, ns, name, since, cursor s
 	}
 	return res, nil
 }
+
+// IsBadInput reports a 400 bad_input: a request-shape error (§12.1), such
+// as a long-poll cursor more than an hour's worth of intervals behind or
+// ahead of the server's (§7.7), after which a follower polls again without
+// the cursor.
+func IsBadInput(err error) bool { return statusIs(err, 400, "bad_input") }
 
 func (c *Client) longPoll(ctx context.Context, path, since, cursor string) (*response, error) {
 	if err := checkOptID("since", since); err != nil {
