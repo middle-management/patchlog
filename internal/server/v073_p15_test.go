@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -718,5 +719,73 @@ func TestV073P15RegistrationStaleWithoutHead(t *testing.T) {
 	expectCode(t, r, 412, "stale")
 	if h := r.Str("head"); h == "" || h != reg.Str("ns_id") {
 		t.Fatalf("412 with a registration: head %q, its entry %q: %s", h, reg.Str("ns_id"), r.Body)
+	}
+}
+
+// §6.6 "Dry runs draw tokens as the submit would" (F-G4): a batch whose
+// config change fails after its step 1 (here a failing test op, step 3)
+// draws its tokens once its items pass step 1, submitted or dry-run alike:
+// one per item, and one for the change unless a * key made it (here
+// authentication is off, so star, or bob's grant, which isn't). Once the
+// bucket is empty, both are 429, as the config write alone would be.
+func TestV073P15ConfigFailureDrawsAlike(t *testing.T) {
+	t.Parallel()
+	limits := map[string]any{"limits": map[string]any{"ratePerPrincipal": map[string]any{"rate": 0.001, "burst": 4.0}}}
+	setups := map[string]func() (e *tenv, ns, who string){
+		"star": func() (*tenv, string, string) {
+			e := newEnv(t)
+			e.mkNS("m", limits)
+			return e, "m", "alice"
+		},
+		"grant": func() (*tenv, string, string) {
+			f := newAuthFixture(t, limits)
+			return f.tenv, "sec", f.issuerG
+		},
+	}
+	want := map[string]int{"star": 2, "grant": 1} // writes left of 4 after the batch
+	for name, setup := range setups {
+		for _, dry := range []bool{false, true} {
+			e, ns, who := setup()
+			batch := map[string]any{
+				"config": map[string]any{"ifMatch": e.configID(ns, who), "patches": ops(op("test", "/x-nope", 1.0))},
+				"items": []any{
+					map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}},
+					map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}},
+				}}
+			send := func() *resp {
+				path := "/ns/" + ns + "/batch"
+				if dry {
+					path += "?dry-run=1"
+				}
+				q := req{method: "POST", path: path, body: batch}
+				if e.auth {
+					q.bearer = who
+				} else {
+					q.author = who
+				}
+				return e.do(q)
+			}
+			r := send()
+			if dry {
+				expect(t, r, 200)
+				if c, _ := r.Obj()["config"].(map[string]any); c["status"] != 422.0 || c["code"] != "invalid" {
+					t.Fatalf("%s: dry run's config report: %s", name, r.Body)
+				}
+			} else {
+				expectCode(t, r, 422, "invalid")
+			}
+			left := 0
+			for ; left < 10; left++ {
+				w := e.write("PATCH", ns, fmt.Sprintf("w%d", left), "", addRoot(map[string]any{}), who)
+				if w.Code == 429 {
+					break
+				}
+				expect(t, w, 201)
+			}
+			if left != want[name] {
+				t.Errorf("%s, dry run %v: %d writes left after the batch, want %d", name, dry, left, want[name])
+			}
+			expectCode(t, send(), 429, "rate")
+		}
 	}
 }

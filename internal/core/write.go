@@ -571,35 +571,31 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	cfgFailed := false
 	drawn := rateDrawn
 	if cc != nil {
-		if dryRun {
-			// A failure of the change's step 1 answers the dry run as
-			// that config write would.
-			if err := t.authorize(a, "config", ""); err != nil {
-				return nil, nil, err
-			}
+		// A failure of the change's step 1 answers the batch, a dry run
+		// included, as that config write would (§7.5), drawing nothing.
+		if err := t.authorize(a, "config", ""); err != nil {
+			return nil, nil, err
 		}
 		p, err := t.planConfig(n, cur, a, cc, true)
 		if err != nil {
-			// A retried batch finds its config precondition stale: look
-			// for the batch it would have produced first (§7.5, §7.2).
 			var ae *Error
-			if errors.As(err, &ae) && ae.Status == 412 && cc.IfMatch != "" {
-				// Signatures aren't checked: they come after the retry
-				// lookup (§6.2 step 2.3), which answers a retry as first
-				// recorded whatever it carries. If the lookup finds
-				// nothing, the batch fails with its config change's error,
-				// so no item is ever judged under the wrong configuration
-				// (§C.3.1 "Requiring signatures").
-				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
-					// The request passed step 1, so it draws its tokens,
-					// even though the replay lookup ends it (§6.6, §6.2).
-					// Its config change costs a token unless a * key
-					// made it (§6.6); whether it was only a freeze isn't
-					// known once the precondition failed.
-					cost := len(items)
-					if !a.star {
-						cost++
-					}
+			if !errors.As(err, &ae) {
+				return nil, nil, err
+			}
+			// The change failed after its step 1. The batch draws its
+			// tokens once its items pass step 1 too, as when the change
+			// passes, so a submit and its dry run draw alike (§6.6): a
+			// token per item, and one for the change unless a * key made
+			// it, since whether it was only a freeze isn't known once it
+			// failed (F-G4). A submit is then answered with the change's
+			// error, which a dry run reports, judging the items against
+			// the current configuration.
+			if len(authorizeItems(a)) == 0 {
+				cost := len(items)
+				if !a.star {
+					cost++
+				}
+				if cost > 0 {
 					names := make([]string, len(items))
 					for i, it := range items {
 						names[i] = it.Resource
@@ -611,6 +607,16 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 					if t.rateDrawn != nil {
 						*t.rateDrawn = true
 					}
+				}
+				// A retried batch finds its config precondition stale:
+				// look for the batch it would have produced first (§7.5,
+				// §7.2). Signatures aren't checked: they come after the
+				// retry lookup (§6.2 step 2.3), which answers a retry as
+				// first recorded whatever it carries. If the lookup finds
+				// nothing, the batch fails with its config change's
+				// error, so no item is ever judged under the wrong
+				// configuration (§C.3.1 "Requiring signatures").
+				if pid, perr := ids.Parse(cc.IfMatch); ae.Status == 412 && cc.IfMatch != "" && perr == nil {
 					exp := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
 					if r := t.replay(n, a, st, &configPlan{expected: &exp}, true); r != nil {
 						// It is that batch, but the lookup doesn't apply
@@ -630,7 +636,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 					}
 				}
 			}
-			if !dryRun || ae == nil {
+			if !dryRun {
 				return nil, nil, err
 			}
 			cfgReport, cfgFailed = reportOf(ae), true
@@ -656,11 +662,9 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	// A batch costs a token per item, and one for its config change unless
 	// that is exempt (§6.6), so only a batch with no items and an exempt
-	// change costs nothing. A dry run's change that failed after its step
-	// 1 passed it: it costs a token unless a * key made it, as for the
-	// retry lookup above.
+	// change costs nothing. One whose change failed drew above.
 	cost := len(items)
-	if cplan != nil && !cplan.exempt || cfgFailed && !a.star {
+	if cplan != nil && !cplan.exempt {
 		cost++
 	}
 	if len(items) > 0 {
