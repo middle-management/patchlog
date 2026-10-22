@@ -15,7 +15,8 @@ import (
 // namespace the catalog trusts moves listings' at but not the checkpoint
 // of a decision on a matches item. In POST /read-grants each entry
 // carries its own: a placement node names its item's namespace, a folder
-// none; a public item of a followed namespace carries the checkpoint its
+// every trusted namespace, whose roles decide its visibility (v0.56 note
+// 4); a public item of a followed namespace carries the checkpoint its
 // exposure was read at, and one of a namespace the service doesn't
 // follow, read at the head, none. Every item comes back with a grant,
 // "public": true or its node's answer, so the reader may read them all.
@@ -56,7 +57,7 @@ func TestCheckpointNamesItsNamespaces(t *testing.T) {
 			t.Errorf("%s: grant checkpoint %v, want %v", when, r.body["checkpoint"], cp)
 		}
 		rg := w.do("POST", "/read-grants", bob, map[string]any{"items": items})
-		for i, want := range []any{cp, cp, w.checkpointOf(), nil} {
+		for i, want := range []any{cp, cp, w.checkpointOf("matches", "teams"), nil} {
 			e := entry(rg, i)
 			if e == nil || e["error"] != nil || (i == 0) != (e["grant"] != nil) || (i == 3) != (e["public"] == true) {
 				t.Errorf("%s: entry %d: %v", when, i, e)

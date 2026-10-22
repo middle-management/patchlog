@@ -69,8 +69,9 @@ func TestDecisionCheckpoint(t *testing.T) {
 	}
 
 	// /read-grants: one entry per item in request order, each with the
-	// checkpoint it was decided at (a catalog folder: the catalog's
-	// alone); the reader may read them all iff no entry has an error.
+	// checkpoint it was decided at (a catalog folder: the catalog's and
+	// every trusted namespace's, whose roles decide its visibility); the
+	// reader may read them all iff no entry has an error.
 	items := toAny("/r/matches/rumour1", "/r/matches/derby", "/r/cat/season", "/r/matches/ghost")
 	rg := w.do("POST", "/read-grants", bob, map[string]any{"items": items})
 	if _, has := rg.body["checkpoint"]; rg.status != 200 || has {
@@ -91,9 +92,6 @@ func TestDecisionCheckpoint(t *testing.T) {
 			t.Errorf("entry %d: %v (want %q)", i, e, want)
 		}
 		wantCP := cp
-		if i == 2 {
-			wantCP = w.checkpointOf()
-		}
 		if !reflect.DeepEqual(e["checkpoint"], wantCP) {
 			t.Errorf("entry %d: checkpoint %v, want %v", i, e["checkpoint"], wantCP)
 		}
@@ -111,20 +109,27 @@ func TestDecisionCheckpoint(t *testing.T) {
 		req    map[string]any
 		status int
 		cp     bool
+		want   map[string]any // the checkpoint, if not cp
 	}{
-		{"no role", map[string]any{"item": "/r/matches/rumour1", "want": toAny("read")}, 403, true},
-		{"not placed", map[string]any{"item": "/r/matches/ghost", "want": toAny("read")}, 403, true},
-		{"taken name", map[string]any{"item": "/r/matches/derby", "want": toAny("create")}, 409, true},
-		{"never existed", map[string]any{"item": "/r/matches/ghost", "want": toAny("restore")}, 404, true},
-		{"live", map[string]any{"item": "/r/matches/derby", "want": toAny("restore")}, 409, true},
-		{"no move power", map[string]any{"node": "matches.rumour1", "want": toAny("move"), "to": toAny("season")}, 403, true},
-		{"no such node", map[string]any{"node": "matches.ghost", "want": toAny("delete")}, 404, true},
-		{"already placed", map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}, 409, true},
-		{"unknown verb", map[string]any{"item": "/r/matches/derby", "want": toAny("fly")}, 400, false},
-		{"not a folder", map[string]any{"node": "nf", "want": toAny("create"), "to": toAny("matches.derby")}, 422, false},
+		{"no role", map[string]any{"item": "/r/matches/rumour1", "want": toAny("read")}, 403, true, nil},
+		{"not placed", map[string]any{"item": "/r/matches/ghost", "want": toAny("read")}, 403, true, nil},
+		{"taken name", map[string]any{"item": "/r/matches/derby", "want": toAny("create")}, 409, true, nil},
+		{"never existed", map[string]any{"item": "/r/matches/ghost", "want": toAny("restore")}, 404, true, nil},
+		{"live", map[string]any{"item": "/r/matches/derby", "want": toAny("restore")}, 409, true, nil},
+		{"widens", map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("derbies")}, 403, true, nil},
+		{"hidden node", map[string]any{"node": "matches.rumour1", "want": toAny("move"), "to": toAny("season")}, 404, true, nil},
+		{"no such node", map[string]any{"node": "matches.ghost", "want": toAny("delete")}, 404, true, nil},
+		{"already placed", map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}, 409, true, nil},
+		{"unknown verb", map[string]any{"item": "/r/matches/derby", "want": toAny("fly")}, 400, false, nil},
+		// Decided from the catalog alone.
+		{"not a folder", map[string]any{"node": "nf", "want": toAny("create"), "to": toAny("matches.derby")}, 404, true, w.checkpointOf()},
 	} {
 		r := w.issue(bob, c.req, c.status)
-		if got, has := r.body["checkpoint"]; has != c.cp || has && !reflect.DeepEqual(got, cp) {
+		want := cp
+		if c.want != nil {
+			want = c.want
+		}
+		if got, has := r.body["checkpoint"]; has != c.cp || has && !reflect.DeepEqual(got, want) {
 			t.Errorf("%s: %d %v (checkpoint %v)", c.name, r.status, r.body, cp)
 		}
 	}
