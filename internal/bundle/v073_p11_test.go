@@ -479,3 +479,67 @@ func TestV073ImportLimitEitherStatus(t *testing.T) {
 		t.Fatalf("blob upload refused with 422 limit: %v", err)
 	}
 }
+
+// snapshotOf exports the snapshot documents of namespaces nss of d.
+func snapshotOf(t *testing.T, d *deployment, nss ...string) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	_, _, err := bundle.Export(ctx, d.c, &buf, bundle.ExportOptions{Select: nss, Mode: bundle.Snapshot, Plaintext: true})
+	noErr(t, err)
+	return buf.Bytes()
+}
+
+// An upstream namespace is written only by imports from one origin: a
+// bundle from another origin than the imports that wrote an existing
+// {ns}-upstream is refused at step 1, before anything is written, and
+// imports renamed (§G.4.4, MF-45). An import batch's source without
+// origin is the target's own (§7.5).
+func TestV073UpstreamOneOrigin(t *testing.T) {
+	t.Parallel()
+	const otherOrigin = "https://other.example"
+	x := newDeployment(t, stagingOrigin)
+	x.ns("m", nil)
+	x.create("m", "a", map[string]any{"v": 1.0})
+	y := newDeployment(t, otherOrigin)
+	y.ns("m", nil)
+	y.ns("copy", nil)
+	y.create("m", "a", map[string]any{"v": 2.0})
+	y.create("copy", "a", map[string]any{"v": 3.0})
+
+	dst := newDeployment(t, cmsOrigin)
+	importB(t, dst, snapshotOf(t, x, "m"), bundle.ImportOptions{})
+	before := must(dst.c.NSHead(ctx, "m-upstream")).ID
+	_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(snapshotOf(t, y, "m")), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true})
+	var ce *bundle.CheckError
+	if !errors.As(err, &ce) || !strings.Contains(err.Error(), "m-upstream") || !strings.Contains(err.Error(), "written by imports from "+stagingOrigin) ||
+		!strings.Contains(err.Error(), "comes from "+otherOrigin) {
+		t.Fatalf("a second origin's import into m-upstream: %v", err)
+	}
+	if after := must(dst.c.NSHead(ctx, "m-upstream")).ID; after != before || dst.doc("m", "a")["v"] != 1.0 {
+		t.Fatal("the refused import wrote")
+	}
+	// Renamed, it goes through m2-upstream.
+	importB(t, dst, snapshotOf(t, y, "m"), bundle.ImportOptions{NSMap: map[string]string{"m": "m2"}})
+	if dst.doc("m2", "a")["v"] != 2.0 || dst.doc("m2-upstream", "a")["v"] != 2.0 {
+		t.Fatal("the renamed import")
+	}
+	// The first origin goes on importing into m-upstream.
+	x.append("m", "a", op("replace", "/v", 4.0))
+	importB(t, dst, snapshotOf(t, x, "m"), bundle.ImportOptions{})
+	if dst.doc("m", "a")["v"] != 4.0 {
+		t.Fatal("a later import from the first origin")
+	}
+
+	// The target's own bundle, imported renamed, writes sources without
+	// origin: they count as its own origin.
+	dst.ns("loc", nil)
+	dst.create("loc", "a", map[string]any{"v": 5.0})
+	importB(t, dst, snapshotOf(t, dst, "loc"), bundle.ImportOptions{NSMap: map[string]string{"loc": "copy"}})
+	if dst.doc("copy-upstream", "a")["v"] != 5.0 {
+		t.Fatal("the local import")
+	}
+	_, err = bundle.Import(ctx, dst.c, bundle.BytesOpener(snapshotOf(t, y, "copy")), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true})
+	if !errors.As(err, &ce) || !strings.Contains(err.Error(), "copy-upstream") || !strings.Contains(err.Error(), "written by imports from "+cmsOrigin) {
+		t.Fatalf("an import into an upstream the target's own imports wrote: %v", err)
+	}
+}

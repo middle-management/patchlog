@@ -584,6 +584,9 @@ func Import(ctx context.Context, c *client.Client, open Opener, opt ImportOption
 	if err == nil {
 		err = im.checkAccess(ctx)
 	}
+	if err == nil {
+		err = im.checkUpstreamOrigins(ctx)
+	}
 	if err != nil {
 		// Its reads are the import's first requests to the target
 		// namespaces (existing).
@@ -760,6 +763,64 @@ func (im *importer) checkUpstreams() error {
 			why = fmt.Sprintf("is %d characters, over the %d a namespace name may have (§3.6, §G.4.4): %s, or a shorter upstream suffix", len(u), maxNSName, shorter)
 		}
 		problems = append(problems, what+" "+why)
+	}
+	if len(problems) > 0 {
+		return &CheckError{Problems: problems}
+	}
+	return nil
+}
+
+// checkUpstreamOrigins refuses, at step 1, a bundle from another origin
+// than the imports that wrote an existing upstream namespace it would
+// write (§G.4.4): {ns}-upstream is written only by imports from one
+// origin, so a second origin's namespace is imported renamed, its
+// snapshot documents going through {dst}-upstream. The imports that wrote
+// one are its batch entries with a bundle source, whose origin is
+// source.origin, or the target's own where the source has none (§7.5).
+func (im *importer) checkUpstreamOrigins(ctx context.Context) error {
+	srcOf := map[string]string{} // upstream namespace → its source namespace
+	for _, k := range im.keys {
+		if d := im.docs[k]; d.info.History == Snapshot {
+			srcOf[im.upstreamNS(d.ns)] = d.ns
+		}
+	}
+	us := make([]string, 0, len(srcOf))
+	for u := range srcOf {
+		us = append(us, u)
+	}
+	sort.Strings(us)
+	var problems []string
+	for _, u := range us {
+		h, err := im.c.NSHead(ctx, u)
+		if client.IsNotFound(err) || client.IsGone(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("import: upstream namespace %s: %w", u, err)
+		}
+		log, err := im.c.NSLog(ctx, u, h.ID, "")
+		if err != nil {
+			return fmt.Errorf("import: upstream namespace %s: %w", u, err)
+		}
+		for _, e := range log {
+			if e.Kind != "batch" || !e.HasSource || e.Source == nil {
+				continue
+			}
+			if _, imported := e.Source["bundle"]; !imported {
+				continue
+			}
+			o, _ := e.Source["origin"].(string)
+			if o == "" {
+				o = im.origin
+			}
+			if o != im.h.Origin {
+				src := srcOf[u]
+				problems = append(problems, fmt.Sprintf("%s, the upstream namespace of %s's snapshot documents, was written by imports from %s, and the bundle comes from %s: "+
+					"an upstream namespace is written only by imports from one origin (§G.4.4); import %s renamed (-ns %s=<name>), so its snapshot documents go through <name>%s",
+					u, src, o, im.h.Origin, src, src, im.opt.UpstreamSuffix))
+				break
+			}
+		}
 	}
 	if len(problems) > 0 {
 		return &CheckError{Problems: problems}
