@@ -300,7 +300,11 @@ func (t *tx) loadDraft(ref schema.Ref, sc *schemaCtx) (any, bool) {
 		if !t.credsRead(c, ref.Name, sc.creds) {
 			continue
 		}
-		d, err := t.docAt(t.rev(cr.seq))
+		row := t.rev(cr.seq)
+		if !t.schemaKeysOpen(c, ref.Name, row, sc) {
+			continue // a sealed candidate's draft takes keys (§6.1)
+		}
+		d, err := t.docAt(row)
 		if err != nil {
 			continue
 		}

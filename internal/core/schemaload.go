@@ -182,8 +182,11 @@ func (t *tx) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string
 // loadSchemaIn resolves a schema revision path in its own namespace. The
 // writer needs read on the copy (§6.1 Read permission): in the namespace
 // written, with the write's own grant; in any other, by the rule for other
-// namespaces (§7.5). A revision it can't read there is ErrForbidden, which
-// falls through to drafts in a branch (loadSchema), as an absent one does.
+// namespaces (§7.5). From a sealed namespace, public or not, in the
+// namespace written too, it also needs keys that open the revision under
+// the epoch it is served under (schemaKeysOpen). A revision it can't read
+// there is ErrForbidden, which falls through to drafts in a branch
+// (loadSchema), as an absent one does.
 func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 	n := t.schemaNS(ref.NS)
 	if n == nil || n.purged {
@@ -206,7 +209,14 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 		readable = t.credsRead(n, ref.Name, sc.creds)
 	}
 	if readable {
-		return t.schemaRevIn(n, ref)
+		row := t.schemaRevRow(n, ref)
+		if row == nil {
+			return nil, schema.ErrUnavailable
+		}
+		if !t.schemaKeysOpen(n, ref.Name, row, sc) {
+			return nil, schema.ErrForbidden
+		}
+		return t.schemaDocAt(row)
 	}
 	if sc.target == nil || !t.schemaReadsServe(n, sc.target) {
 		return nil, schema.ErrForbidden
@@ -219,6 +229,20 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 		return nil, schema.ErrForbidden
 	}
 	return d, nil
+}
+
+// schemaKeysOpen reports whether the writer of sc gets keys opening schema
+// revision row of resource name in n, as resolving it takes in a sealed
+// namespace, public or not, the namespace written included (§6.1 Read
+// permission, §2.1 Protection): §E.2.3's keys for the epoch the revision
+// is served under, to the request's own grant or one in
+// Source-Authorization (keywindow.go). Other namespaces need none here
+// (schemaReads is refused in sealed ones, §6.1).
+func (t *tx) schemaKeysOpen(n *nsRow, name string, row *revRow, sc *schemaCtx) bool {
+	if !t.isSealedNS(n) {
+		return true
+	}
+	return t.revKeyOpen(n, name, row, sc.creds)
 }
 
 // schemaNS is nsByName for the namespace of a schema path (loadSchemaIn),
@@ -330,22 +354,37 @@ func (t *tx) prefetchSchemas(refs []schema.Ref) {
 	}
 }
 
+// schemaRevRow finds revision ref.Rev of resource ref.Name in n: nil if
+// unknown, purged or a tombstone.
+func (t *tx) schemaRevRow(n *nsRow, ref schema.Ref) *revRow {
+	v := t.resolve(n, ref.Name, nil)
+	if v.head == nil || v.state == Purged || v.state == NotFound {
+		return nil
+	}
+	id, err := ids.Parse(ref.Rev)
+	if err != nil {
+		return nil
+	}
+	row := t.findInAncestry(v.head, id)
+	if row == nil || row.kind == kindTombstone {
+		return nil
+	}
+	return row
+}
+
 // schemaRevIn loads revision ref.Rev of resource ref.Name in n, a
 // namespace that isn't a branch: ErrUnavailable if unknown, purged,
 // pruned or a tombstone.
 func (t *tx) schemaRevIn(n *nsRow, ref schema.Ref) (any, error) {
-	v := t.resolve(n, ref.Name, nil)
-	if v.head == nil || v.state == Purged || v.state == NotFound {
+	row := t.schemaRevRow(n, ref)
+	if row == nil {
 		return nil, schema.ErrUnavailable
 	}
-	id, err := ids.Parse(ref.Rev)
-	if err != nil {
-		return nil, schema.ErrUnavailable
-	}
-	row := t.findInAncestry(v.head, id)
-	if row == nil || row.kind == kindTombstone {
-		return nil, schema.ErrUnavailable
-	}
+	return t.schemaDocAt(row)
+}
+
+// schemaDocAt is the document of schema revision row.
+func (t *tx) schemaDocAt(row *revRow) (any, error) {
 	// A revision with its patch set is the document its id determines:
 	// parsed once, kept apart from the document cache, which a large write
 	// fills with its own (docBytesAt).

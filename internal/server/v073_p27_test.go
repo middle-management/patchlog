@@ -3,9 +3,11 @@ package server
 import (
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // Spec v0.73, package P27: blob uploads and copies, epoch blob URLs
@@ -213,4 +215,221 @@ func TestV073EpochBlobURLNotOffered(t *testing.T) {
 	if cc := r.H.Get("Cache-Control"); !strings.HasPrefix(cc, "private") {
 		t.Errorf("private namespace: Cache-Control %q", cc)
 	}
+}
+
+// protectionEnv is an authenticated deployment with sealed namespaces, and
+// a key k every namespace it makes lists as a "*" key, so one grant may
+// name several (§C.4).
+type protectionEnv struct {
+	*tenv
+	k    keyPair
+	long map[string]any
+	// star may write, read and change the configuration of every
+	// namespace made; nbf0 is a block member from before the first epoch.
+	star string
+	nbf0 map[string]any
+	all  []string
+}
+
+func newProtectionEnv(t *testing.T, nss map[string]map[string]any) *protectionEnv {
+	e := newSealedAuthEnv(t, withBlobTuning)
+	p := &protectionEnv{tenv: e, k: newKey("k"), long: map[string]any{"exp": t0.Add(10 * time.Hour).Format(time.RFC3339)}}
+	for _, ns := range sortedNames(nss) {
+		doc := nss[ns]
+		doc["keys"] = []any{p.k.entry("*")}
+		e.mkNS(ns, doc)
+		p.all = append(p.all, ns)
+	}
+	p.star = e.grant(p.k, "user:admin", p.all, []string{"create", "append", "read", "config"}, p.long)
+	p.nbf0 = map[string]any{"exp": t0.Add(10 * time.Hour).Format(time.RFC3339), "nbf": t0.Add(-time.Hour).Format(time.RFC3339)}
+	return p
+}
+
+func sortedNames(m map[string]map[string]any) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// blobIn uploads data to ns/name and writes a document referencing it,
+// with a fresh $nonce, under the star grant.
+func (p *protectionEnv) blobIn(ns, name string, data []byte) string {
+	p.t.Helper()
+	bid := p.upload(ns, name, "text/plain", data, p.star)
+	p.wr(ns, name, "", withNonce(addRoot(map[string]any{"b": ref(bid, "text/plain", len(data), "")})), p.star)
+	return bid
+}
+
+// rotate starts the next epoch of sealed namespace ns an hour later.
+func (p *protectionEnv) rotate(ns string, epoch float64) {
+	p.t.Helper()
+	p.clock.Advance(time.Hour)
+	expect(p.t, p.patchNS(ns, ops(op("add", "/encryption/epoch", epoch)), p.star), 201)
+}
+
+// CIS-28 (BBD-28, ENC-31): as a source a sealed namespace ranks sealed
+// (= private) whatever its read; as a target, one whose read is public
+// ranks public. A copy into another namespace that ranks lower is 404;
+// ranks don't apply within one namespace (§2.1 Protection, §7.8 Copying;
+// security scenarios Protection 2, 3 and 4).
+func TestV073CopyRanks(t *testing.T) {
+	t.Parallel()
+	p := newProtectionEnv(t, map[string]map[string]any{
+		"priv":  {"read": "grant"},
+		"priv2": {"read": "grant"},
+		"pub":   {"read": "public"},
+		"spub":  sealedDoc(map[string]any{"read": "public"}),
+		"spriv": sealedDoc(map[string]any{"read": "grant"}),
+	})
+	data := []byte("ranked bytes")
+	bid := p.blobIn("priv", "a", data)
+	from := blobPath("priv", "a", bid)
+	// Scenario 2: private source, sealed target with read public.
+	expectCode(t, p.copyBlob("spub", "a", bid, from, "", p.star), 404, "not_found")
+	// Equal ranks and upward work: private = sealed.
+	expect(t, p.copyBlob("priv2", "a", bid, from, "", p.star), 201)
+	expect(t, p.copyBlob("spriv", "a", bid, from, "", p.star), 201)
+	// Public into sealed public: equal ranks.
+	pbid := p.blobIn("pub", "a", []byte("public bytes"))
+	expect(t, p.copyBlob("spub", "a", pbid, blobPath("pub", "a", pbid), "", p.star), 201)
+
+	// Scenario 3: a sealed source with read public ranks sealed: not into a
+	// plain public namespace, nor another sealed public one; into a sealed
+	// private one it may.
+	sbid := p.blobIn("spub", "s", []byte("sealed public bytes"))
+	sfrom := blobPath("spub", "s", sbid)
+	expectCode(t, p.copyBlob("pub", "s", sbid, sfrom, "", p.star), 404, "not_found")
+	expect(t, p.copyBlob("spriv", "s", sbid, sfrom, "", p.star), 201)
+	expect(t, p.copyBlob("priv", "s", sbid, sfrom, "", p.star), 201)
+	// Scenario 4: within the sealed public namespace, ranks don't apply.
+	expect(t, p.copyBlob("spub", "t", sbid, sfrom, "", p.star), 201)
+}
+
+// BBD-29: a copy from a sealed source, public or not, within one namespace
+// too, takes only a blob that opens under an epoch it is served under
+// there, with keys §E.2.3 gives the request's own grant or one in
+// Source-Authorization; otherwise 404 (§2.1 Protection, §7.8 Copying;
+// security scenarios Protection 4, 21 and 23).
+func TestV073CopySealedKeyWindow(t *testing.T) {
+	t.Parallel()
+	p := newProtectionEnv(t, map[string]map[string]any{
+		"priv":  {"read": "grant"},
+		"spub":  sealedDoc(map[string]any{"read": "public"}),
+		"spriv": sealedDoc(map[string]any{"read": "grant"}),
+	})
+	bid := p.blobIn("spub", "a", []byte("public sealed bytes"))
+	from := blobPath("spub", "a", bid)
+	// Scenario 21: a writer elsewhere with no grant for the public sealed
+	// source gets no keys: 404, though anyone may read it.
+	w := p.grant(p.k, "user:w", []string{"priv"}, []string{"read", "create", "append"}, p.long)
+	expectCode(t, p.copyBlob("priv", "x", bid, from, "", w), 404, "not_found")
+	// One whose grant also names the source with read gets K_e.
+	wr := p.grant(p.k, "user:w", []string{"priv", "spub"}, []string{"read", "create", "append"}, p.long)
+	expect(t, p.copyBlob("priv", "x", bid, from, "", wr), 201)
+	// Or with Source-Authorization.
+	src := p.grant(p.k, "user:w", []string{"spub"}, []string{"read"}, p.long)
+	expect(t, p.copyBlob("priv", "y", bid, from, src, w), 201)
+	// Scenario 4: within the sealed public namespace, a writer without
+	// read gets no keys.
+	wo := p.grant(p.k, "user:w", []string{"spub"}, []string{"create", "append"}, p.long)
+	expectCode(t, p.copyBlob("spub", "b", bid, from, "", wo), 404, "not_found")
+	expect(t, p.copyBlob("spub", "b", bid, from, "", wr), 201)
+	// A grant whose rules fix /resource gets K_r of the names it fixes.
+	fixA := p.grant(p.k, "user:w", []string{"spub", "priv"}, []string{"read", "create", "append"}, p.long, map[string]any{"rules": []any{map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": []any{"a", "z"}}}}})
+	expect(t, p.copyBlob("priv", "z", bid, from, "", fixA), 201)
+
+	// Scenario 23: a sealed private source whose blob is served under
+	// epoch 1 only; once the epoch is 2, a grant without nbf gets the
+	// current epoch's keys alone, and the copy is 404. One whose nbf
+	// reaches back to epoch 1 gets that epoch's too.
+	gbid := p.blobIn("spriv", "a", []byte("sealed private bytes"))
+	gfrom := blobPath("spriv", "a", gbid)
+	reader := p.grant(p.k, "user:r", []string{"spriv", "priv"}, []string{"read", "create", "append"}, p.long)
+	expect(t, p.copyBlob("priv", "g1", gbid, gfrom, "", reader), 201)
+	p.rotate("spriv", 2)
+	reader = p.grant(p.k, "user:r", []string{"spriv", "priv"}, []string{"read", "create", "append"}, p.long)
+	expectCode(t, p.copyBlob("priv", "g2", gbid, gfrom, "", reader), 404, "not_found")
+	early := p.grant(p.k, "user:r", []string{"spriv", "priv"}, []string{"read", "create", "append"}, p.nbf0)
+	expect(t, p.copyBlob("priv", "g2", gbid, gfrom, "", early), 201)
+	// A revision written now references it too: served under epoch 2 as
+	// well, so the grant without nbf opens it.
+	h := p.head("spriv", "a", p.star)
+	p.wr("spriv", "a", h, withNonce(ops(op("add", "/again", true))), p.star)
+	expect(t, p.copyBlob("priv", "g3", gbid, gfrom, "", reader), 201)
+}
+
+// BBD-30: a batch's local source from a sealed source.ns makes available
+// only the blobs the caller's keys open under a served epoch; the others
+// are 422 blob (§2.1 Protection, §7.8 Availability; security scenario
+// Protection 22).
+func TestV073SourceSealedKeyWindow(t *testing.T) {
+	t.Parallel()
+	p := newProtectionEnv(t, map[string]map[string]any{
+		"priv": {"read": "grant"},
+		"spub": sealedDoc(map[string]any{"read": "public"}),
+	})
+	data := []byte("source bytes")
+	bid := p.blobIn("spub", "a", data)
+	at := p.nsHead("spub", p.star)
+	batch := func(bearer, srcGrant string) *resp {
+		item := map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"b": ref(bid, "text/plain", len(data), "")})}}
+		q := req{method: "POST", path: "/ns/priv/batch", bearer: bearer, body: map[string]any{"items": []any{item}, "source": map[string]any{"ns": "spub", "at": at}}}
+		if srcGrant != "" {
+			q.hdr = map[string]string{"Source-Authorization": "Bearer " + srcGrant}
+		}
+		return p.do(q)
+	}
+	// Anyone reads the public source unrestricted, so source.at is
+	// checked; without keys, its blob isn't made available.
+	w := p.grant(p.k, "user:w", []string{"priv"}, []string{"read", "create", "append"}, p.long)
+	r := batch(w, "")
+	expectCode(t, r, 422, "batch")
+	if !strings.Contains(r.String(), `"blob"`) {
+		t.Fatalf("want an item refused with blob: %s", r.Body)
+	}
+	// With keys, from Source-Authorization or the grant itself.
+	expect(t, batch(w, p.grant(p.k, "user:w", []string{"spub"}, []string{"read"}, p.long)), 201)
+}
+
+// CIS-23: resolving a schema from a sealed namespace, public or not, takes
+// keys §E.2.3 gives for the epoch the revision is served under, to the
+// request's grant or one in Source-Authorization, in the namespace written
+// too; without them it is 422 schema_unavailable (§6.1 Read permission;
+// security scenario Protection 36).
+func TestV073SchemaSealedKeyWindow(t *testing.T) {
+	t.Parallel()
+	p := newProtectionEnv(t, map[string]map[string]any{
+		"docs":    {"read": "grant"},
+		"schemas": sealedDoc(map[string]any{"read": "public"}),
+	})
+	x := p.wr("schemas", "match", "", withNonce(addRoot(map[string]any{"$schema": dialect, "type": "object", "required": []any{"n"}})), p.star)
+	path := "/r/schemas/match/rev/" + x
+	doc := map[string]any{"$schema": path, "n": 1.0}
+	// No grant for schemas: no keys, though it is public.
+	w := p.grant(p.k, "user:w", []string{"docs"}, []string{"read", "create", "append"}, p.long)
+	r := p.write("PATCH", "docs", "d", "", addRoot(doc), w)
+	expectCode(t, r, 422, "schema_unavailable")
+	if r.Str("path") != path && r.Str("ref") != path {
+		t.Fatalf("names %s: %s", path, r.Body)
+	}
+	// With keys for X's epoch: resolves, and validates.
+	wk := p.grant(p.k, "user:w", []string{"docs", "schemas"}, []string{"read", "create", "append"}, p.long)
+	expectCode(t, p.write("PATCH", "docs", "bad", "", addRoot(map[string]any{"$schema": path}), wk), 422, "invalid")
+	expect(t, p.write("PATCH", "docs", "d", "", addRoot(doc), wk), 201)
+	// Once the epoch moved on, a grant whose window starts after X's epoch
+	// gets no key for it: in the namespace written too.
+	p.rotate("schemas", 2)
+	wk = p.grant(p.k, "user:w", []string{"docs", "schemas"}, []string{"read", "create", "append"}, p.long)
+	expectCode(t, p.write("PATCH", "docs", "e", "", addRoot(doc), wk), 422, "schema_unavailable")
+	expectCode(t, p.write("PATCH", "schemas", "e", "", withNonce(addRoot(doc)), wk), 422, "schema_unavailable")
+	early := p.grant(p.k, "user:w", []string{"docs", "schemas"}, []string{"read", "create", "append"}, p.nbf0)
+	expect(t, p.write("PATCH", "docs", "e", "", addRoot(doc), early), 201)
+	expect(t, p.write("PATCH", "schemas", "e", "", withNonce(addRoot(doc)), early), 201)
+	// Source-Authorization serves as well.
+	q := req{method: "PATCH", path: "/r/docs/f", ifNoneMatch: "*", body: addRoot(doc), bearer: w,
+		hdr: map[string]string{"Source-Authorization": "Bearer " + p.grant(p.k, "user:w", []string{"schemas"}, []string{"read"}, p.nbf0)}}
+	expect(t, p.do(q), 201)
 }

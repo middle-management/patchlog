@@ -148,6 +148,35 @@ func (t *tx) sealedBlobHead(n *nsRow, name string, bid ids.ID, out *Blob) *sealJ
 	return nil
 }
 
+// blobKeyEpochs lists the epochs a request for blob bid of resource name
+// of sealed namespace n would be served under (§E.2.2), for the key window
+// of a copy or a batch's local source (keywindow.go): those fixed, or,
+// when none of its referencing revisions has an epoch yet, the current
+// one, under which such a request would fix the newest of them
+// (sealedBlobHead). None if no still served revision references it.
+func (t *tx) blobKeyEpochs(n *nsRow, name string, bid ids.ID) map[int]bool {
+	v := t.resolve(n, name, nil)
+	eps := t.blobEpochs(n, v.head, bid)
+	if len(eps) == 0 && v.head != nil && t.blobRevServed(v.head, bid) {
+		eps[t.config(n.configSeq).Epoch] = true
+	}
+	return eps
+}
+
+// blobRevServed reports whether a still served revision of the history
+// ending at head references bid, as newestBlobRev looks for one.
+func (t *tx) blobRevServed(head *revRow, bid ids.ID) bool {
+	where := ` WHERE b.res = ? AND b.bid = ? AND r.seq <= ? AND r.kind = 0 AND ` + servedRev
+	for _, seg := range t.ancestry(head) {
+		var ok bool
+		t.must(t.QueryRow(`SELECT EXISTS (SELECT 1`+refRevs+where+`)`, seg.res, bid[:], seg.max).Scan(&ok))
+		if ok {
+			return true
+		}
+	}
+	return false
+}
+
 // newestBlobRev prepares the sealing of the newest still served revision
 // of the history ending at head whose document references bid, or nil.
 func (t *tx) newestBlobRev(n *nsRow, name string, head *revRow, bid ids.ID) *sealJob {
