@@ -720,15 +720,10 @@ func TestReleasePreview(t *testing.T) {
 	if items["matches.cup"] != nil || items["matches.derby"] != nil {
 		t.Fatalf("moved nodes still under season: %v", items)
 	}
-	// A viewer who can't read matches-r7 sees the structure, no items.
-	code, body = get(catOnly, "/cat-season/children?of=season")
-	if code != 200 {
+	// A viewer who can't read matches-r7 is shown nothing: a preview is a
+	// tree service without §B.11, which serves only g/all (§B.11.5).
+	if code, body = get(catOnly, "/cat-season/children?of=season"); code != 403 {
 		t.Fatalf("children (catalog only): %d %v", code, body)
-	}
-	for _, x := range body["children"].([]any) {
-		if m := x.(map[string]any); m["head"] != nil || m["url"] != nil {
-			t.Fatalf("an unreadable branch's item is shown: %v", m)
-		}
 	}
 	// A grant for the bases doesn't read the preview.
 	if code, _ := get(base, "/cat-season/children?of=season"); code != 403 {

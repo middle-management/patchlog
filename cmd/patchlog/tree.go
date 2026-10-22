@@ -44,10 +44,12 @@ import (
 // Callers of POST /grants and of private listings present an ordinary core
 // grant for the catalog namespace as their identity.
 //
-// Listings live at /{catalog}/at/{at}/…, or for a reader with a grant at
-// /{catalog}/g/{gs}/at/{at}/…, the subject set first (§B.11.5), where at
-// is the combined checkpoint over the catalog and every followed content
-// namespace (§B.5); they are
+// Listings live at /{catalog}/at/{at}/… while every namespace in them is
+// public, for everyone, else at /{catalog}/g/{gs}/at/{at}/…, the subject
+// set first (§B.11.5): without -access only g/all, for readers whose grants
+// would be issued namespace-wide edge grants on every namespace (403 for
+// others, 401 without a grant). at is the combined checkpoint over the
+// catalog and every followed content namespace (§B.5); listings are
 // immutable, answered only at the canonical form of their query (§A.5), and
 // tagged r:{ns}/{name} and ns:{ns}. Read-your-writes: ?min={ns}:{ns_id},
 // repeatable, which always redirects (§A.5). Cache purges go to the CDN at
@@ -56,8 +58,9 @@ import (
 // With -access the service also mints edge grants of its own for its
 // listings (§B.11.5, §C.5): POST /edge-grants exchanges a caller's grants
 // for a cookie bound to its subject set, /{catalog}/g/{gs}, or to
-// /{catalog}/g/all for a reader of the catalog and every trusted namespace
-// as a whole, and DELETE /edge-grants?prefix=… withdraws them. They are
+// /{catalog}/g/all for a reader whose grants would be issued namespace-wide
+// edge grants on each of the catalog and its trusted namespaces that isn't
+// public, and DELETE /edge-grants?prefix=… withdraws them. They are
 // signed with the last -edge-grant-key [KID=]FILE, a key of the service's
 // own that the origin never holds (without it, a random one per process),
 // and accepted under any, so its keys rotate as the origin's do; a plain
@@ -67,7 +70,7 @@ import (
 // kid the origin holds as it rotates): each key vouches only for its own
 // prefixes. Each exchange draws one token from the
 // exchangeRate bucket of each principal it names (-exchange-rate
-// RATE,BURST; 429 when empty). A read under one, without
+// RATE,BURST; 429 when empty), shared by the instances on one -db. A read under one, without
 // Authorization, is the subject set's, and gets edge lifetimes behind a
 // verifying edge (-edge-secret) that checked it with the service's kid.
 // A catalog named r or ns mints none: its prefixes would overlap the
@@ -111,7 +114,7 @@ func treeCmd(args []string) {
 	edgeGrantKid := fs.String("edge-grant-kid", "", "the name (kid) of the service's edge-grant key given as a plain -edge-grant-key FILE, or of the random one, which its cookies carry and a verifying edge looks the key up by (§C.5.3), for -access; default catalog-{catalog}. No kid of the service's may be one of the origin's (-origin-edge-grant-kid): each key vouches only for its own prefixes, the service's for /{catalog}/g/{gs}")
 	var originKidFlags multi
 	fs.Var(&originKidFlags, "origin-edge-grant-kid", "the origin's edge-grant kids, which no kid of the service's may be: every KID of its -edge-grant-key flags, and its -edge-grant-kid (repeatable or comma-separated; default origin). Keep the list in step with the origin's key rotation")
-	exchangeRate := fs.String("exchange-rate", "", "exchangeRate (§6.6, §C.5): edge-grant exchanges each principal may make at the service's POST /edge-grants, for -access, as RATE,BURST, e.g. 10,100 (the default); per process")
+	exchangeRate := fs.String("exchange-rate", "", "exchangeRate (§6.6, §C.5): edge-grant exchanges each principal may make at the service's POST /edge-grants, for -access, as RATE,BURST, e.g. 10,100 (the default); the buckets are shared by the instances on one -db (§B.11.5)")
 	corsFlags := addCORSFlags(fs)
 	sdFlags := addShutdownFlags(fs)
 	fs.Parse(args)

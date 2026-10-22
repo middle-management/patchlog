@@ -24,6 +24,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/dav"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/tree"
 )
@@ -45,7 +46,56 @@ type treeRun struct {
 	hits   atomic.Int64 // listing requests
 }
 
+// scopeRoles is a RoleView for tests (§B.11.5): a reader's subject set is
+// the names its grant's block rules fix /resource to (a test against a
+// schema of only an enum), and it sees the catalog nodes and the items of
+// those names. A tree service without §B.11 serves only g/all (§B.11.5),
+// so the tree services of these tests filter with it, as the catalog
+// service filters by roles, to list to grants limited to some resources.
+type scopeRoles struct{}
+
+func (scopeRoles) Resolve(_ context.Context, v *grant.Verified) ([]string, tree.Visibility, error) {
+	set := scopeSet{}
+	for _, r := range v.BlockRules {
+		m, _ := r.(map[string]any)
+		sch, _ := m["schema"].(map[string]any)
+		enum, _ := sch["enum"].([]any)
+		for _, e := range enum {
+			if s, ok := e.(string); ok && m["op"] == "test" && m["path"] == "/resource" {
+				set[s] = true
+			}
+		}
+	}
+	var subjects []string
+	for n := range set {
+		subjects = append(subjects, "scope:"+n)
+	}
+	slices.Sort(subjects)
+	return subjects, set, nil
+}
+
+func (scopeRoles) ForSubjects(subjects []string) tree.Visibility {
+	set := scopeSet{}
+	for _, s := range subjects {
+		set[strings.TrimPrefix(s, "scope:")] = true
+	}
+	return set
+}
+
+// scopeSet is the visibility of a scopeRoles subject set.
+type scopeSet map[string]bool
+
+func (s scopeSet) Node(_ *tree.Graph, n *tree.Node) bool { return s[n.Name] }
+func (s scopeSet) Item(_ *tree.Graph, n *tree.Node) bool { return s[n.ItemName] }
+
 func startTree(t *testing.T, cs *clienttest.Server, cat string, opts ...client.Option) *treeRun {
+	t.Helper()
+	return startTreeWith(t, cs, cat, scopeRoles{}, opts...)
+}
+
+// startTreeWith is startTree with rv the tree service's RoleView: nil for
+// a tree service without §B.11.
+func startTreeWith(t *testing.T, cs *clienttest.Server, cat string, rv tree.RoleView, opts ...client.Option) *treeRun {
 	t.Helper()
 	r := &treeRun{t: t}
 	base := http.DefaultTransport.(*http.Transport).Clone()
@@ -78,7 +128,7 @@ func startTree(t *testing.T, cs *clienttest.Server, cat string, opts ...client.O
 	})
 	r.core = cs.Client(t, append([]client.Option{client.WithAuthor("tree"), client.WithHTTPClient(&http.Client{Transport: rt})}, opts...)...)
 	svc, err := tree.Open(context.Background(), tree.Options{Client: r.core, Catalog: cat, DB: filepath.Join(t.TempDir(), "tree.db"),
-		MinWait: 200 * time.Millisecond, RepurgeInterval: -1, Logf: t.Logf,
+		MinWait: 200 * time.Millisecond, RepurgeInterval: -1, Logf: t.Logf, RoleView: rv,
 		FollowOptions: []follow.Option{follow.WithBackoff(time.Millisecond, 20*time.Millisecond)}})
 	if err != nil {
 		t.Fatal(err)
@@ -587,6 +637,14 @@ func TestTreeServiceLimitedGrant(t *testing.T) {
 	if r := plain.doAs(limited, "PROPFIND", "/cat/", "", "Depth", "1"); r.status < 400 {
 		t.Fatalf("the limited grant listed the tree from the node documents: %d %s", r.status, r.body)
 	}
+	// Nor through a tree service without §B.11, which serves only g/all
+	// (§B.11.5): it refuses the limited grant, 403, which the gateway
+	// answers.
+	bare := startTreeWith(t, a.s, "cat", nil, client.WithBearer(a.k.Grant(t, a.s.Now(), "svc:tree", a.both, []string{"read"})))
+	bare.caughtUp("cat", "matches")
+	bg := a.gateway(t, bare.http.URL)
+	sameStrings(t, "the admin's top level through a tree service without §B.11", names(bg.propfindAs(admin, "/cat/"), "/cat/"), []string{"Hidden/", "Season/"})
+	bg.expect(bg.doAs(limited, "PROPFIND", "/cat/", "", "Depth", "1"), 403, "the limited grant through a tree service without §B.11")
 }
 
 // §H.7 through a tree service: what the tree service listed to one token
@@ -852,8 +910,10 @@ func TestTreeServiceBehindContent(t *testing.T) {
 		}
 	}
 	ts := treeDav(e, hs.URL)
+	// The tree service's message is generic, naming what it waits for
+	// only as ns, to readers of the whole catalog (§B.5).
 	r := ts.expect(ts.do("PROPFIND", "/cat/Season/", "", "Depth", "1"), 503, "PROPFIND of Season before the tree service reached matches")
-	if r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "matches") {
+	if r.header.Get("Retry-After") == "" || !strings.Contains(r.body, "behind") {
 		t.Fatalf("503 %v %q", r.header, r.body)
 	}
 	if r := ts.do("DELETE", "/cat/Season", ""); r.status < 400 {

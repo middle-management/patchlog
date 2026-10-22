@@ -174,13 +174,13 @@ func TestMultiMinElsewhere(t *testing.T) {
 	if r := x.raw(old+"?min=c:"+cw, ""); r.status != 302 || r.header.Get("Location") != want {
 		t.Errorf("min for c from an at: %d %s, want %s", r.status, r.header.Get("Location"), want)
 	}
-	// b is private: a reader whose grant reads it is redirected; one
-	// without a grant for it gets the same 400 as for a namespace no
-	// catalog follows.
+	// b is private: a reader whose grant reads it is redirected, to the
+	// public URL space of cat, whose checkpoint has only public
+	// namespaces (§B.11.5); one without a grant for it gets the same 400
+	// as for a namespace no catalog follows.
 	bw := must(root.CreateDoc(ctx, "b", "x", map[string]any{"t": 1})).NSID
 	bReader := reader.Grant(t, s.Now(), "user:bea", []string{"cat", "b"}, []string{"read"})
-	if r := x.raw("/cat/roots?min=b:"+bw, bReader); r.status != 302 || !strings.HasPrefix(r.header.Get("Location"), "/cat/g/") ||
-		!strings.HasSuffix(r.header.Get("Location"), "/at/"+cat.s.At()+"/roots") {
+	if r := x.raw("/cat/roots?min=b:"+bw, bReader); r.status != 302 || r.header.Get("Location") != "/cat/at/"+cat.s.At()+"/roots" {
 		t.Errorf("min for b with a grant for it: %d %s", r.status, r.header.Get("Location"))
 	}
 	hidden, unknown := x.raw("/cat/roots?min=b:"+bw, ""), x.raw("/cat/roots?min=zz:"+bw, "")
