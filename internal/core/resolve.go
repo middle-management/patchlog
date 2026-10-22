@@ -143,7 +143,8 @@ func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
 				}
 			default:
 				// A purged row too: as of asOf it is purged only if it
-				// had an entry then (resolve, §8.3).
+				// had an entry then, its own or, with none of its own
+				// there, one read through from the base (resolve, §8.3).
 				resIDs = append(resIDs, r.id)
 			}
 		}
@@ -300,11 +301,11 @@ func (v *view) readThrough() bool { return v.own == nil || v.own.headSeq.Valid =
 
 // resolve returns a resource as seen from ns, now (asOf nil) or as of an
 // ns_log seq of ns. A resource purged since asOf is purged as of asOf too,
-// with its head then, but only if it had an entry then: one that didn't
-// is read through, or not found, as it was then. So a branch created
-// later at an at before a purge sees the name as purged only where it
-// would read an entry for it through, and lists it with its head as of at
-// (§8.3, invariant 7); head_history rows outlive the purge.
+// with its head then, but only if it had an entry then, its own or read
+// through: one that didn't is not found, as it was then. So a branch
+// created later at an at before a purge sees the name as purged only
+// where it would read an entry for it through, and lists it with its head
+// as of at (§8.3, invariant 7); head_history rows outlive the purge.
 func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 	v := &view{ns: n, name: name}
 	r := t.resource(n.id, name)
@@ -355,6 +356,14 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 		at := n.baseAt.Int64
 		bv := t.resolve(base, name, &at)
 		v.state, v.head, v.src = bv.state, bv.head, bv.src
+		if r != nil && r.state == statePurged && bv.state != NotFound {
+			// Purged in n since asOf, when n read an entry for it
+			// through: purged as of asOf too, with the head it read
+			// through then. A purge of a name n reads through records
+			// no head_history (purgeResource), and the base keeps it
+			// live, since purges never propagate upwards (§8.3).
+			v.state, v.src = Purged, r
+		}
 		return v
 	}
 	v.state = NotFound

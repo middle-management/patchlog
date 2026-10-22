@@ -789,3 +789,76 @@ func TestV073LateBranchSeesPurgeAsOfAt(t *testing.T) {
 	// A late branch may create a name it never saw.
 	expect(t, e.write("PATCH", "early", "x", "", addRoot(map[string]any{"new": true})), 201)
 }
+
+// headsAt reads ns's /heads at nsID, by resource.
+func headsAt(t *testing.T, e *tenv, ns, nsID string) map[string]map[string]any {
+	t.Helper()
+	r := e.get("/ns/" + ns + "/rev/" + nsID + "/heads")
+	expect(t, r, 200)
+	out := map[string]map[string]any{}
+	for _, h := range r.Obj()["heads"].([]any) {
+		m := h.(map[string]any)
+		out[m["resource"].(string)] = m
+	}
+	return out
+}
+
+// §8.3, invariant 7 (BBD-16): a branch that purges a name it reads
+// through, or whose own chain began reading it through, keeps it purged
+// at every ns_id at which it read an entry for it: its /heads lists it as
+// purge with the head it read through then, and a branch of it, created
+// before or after the purge, at any at, answers 410 for it, never the
+// base's live content, which the purge leaves alone (purges never
+// propagate upwards).
+func TestV073BranchPurgeOfReadThroughStaysPurged(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("main", map[string]any{"read": "public"})
+	x1 := e.create("main", "x", map[string]any{"secret": "s3cr3t"})
+	z1 := e.create("main", "z", map[string]any{"v": 1.0})
+	expect(t, e.branch("main", map[string]any{"name": "c"}, "alice"), 201)
+	c0 := e.nsHead("c") // c reads x and z through
+	expect(t, e.branch("c", map[string]any{"name": "b"}, "alice"), 201)
+	z2 := e.appendRev("c", "z", z1, ops(op("replace", "/v", 2.0)))
+	expect(t, e.get("/r/c/x"), 302)
+	expect(t, e.purge("c", "x", x1, "admin"), 204)
+	expect(t, e.purge("c", "z", z2, "admin"), 204)
+	expect(t, e.get("/r/c/x"), 410)
+	expect(t, e.get("/r/main/x"), 302)
+	expect(t, e.get("/r/main/x/rev/"+x1), 200)
+
+	want := func(ns string, h map[string]map[string]any, name, target string) {
+		t.Helper()
+		if x := h[name]; x == nil || x["kind"] != "purge" || x["target"] != target {
+			t.Errorf("%s /heads %s: %v, want purge with target %s", ns, name, x, target)
+		}
+	}
+	ch := headsAt(t, e, "c", e.nsHead("c"))
+	want("c", ch, "x", x1)
+	want("c", ch, "z", z2)
+	// As of c0 c read both through: purged since, so purged then, with
+	// the heads it read through.
+	ch = headsAt(t, e, "c", c0)
+	want("c@at", ch, "x", x1)
+	want("c@at", ch, "z", z1)
+	// b, a branch of c from before the purge, was purged by propagation.
+	expect(t, e.get("/r/b/x"), 410)
+	want("b", headsAt(t, e, "b", e.nsHead("b")), "x", x1)
+
+	// Branches of c created after the purge, at its head and at c0.
+	expect(t, e.branch("c", map[string]any{"name": "d"}, "alice"), 201)
+	expect(t, e.branch("c", map[string]any{"name": "d0", "at": c0}, "alice"), 201)
+	for _, ns := range []string{"d", "d0"} {
+		for _, path := range []string{"/r/" + ns + "/x", "/r/" + ns + "/x/rev/" + x1, "/r/" + ns + "/z", "/r/" + ns + "/z/rev/" + z1} {
+			if r := e.get(path); r.Code != 410 {
+				t.Errorf("%s: %d %s, want 410: content c purged reappears in a later branch of c", path, r.Code, r.Body)
+			}
+		}
+	}
+	dh := headsAt(t, e, "d", e.nsHead("d"))
+	want("d", dh, "x", x1)
+	want("d", dh, "z", z2)
+	d0h := headsAt(t, e, "d0", e.nsHead("d0"))
+	want("d0", d0h, "x", x1)
+	want("d0", d0h, "z", z1)
+}
