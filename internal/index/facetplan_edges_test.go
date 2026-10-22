@@ -111,6 +111,17 @@ func randomQueryExt(r *rand.Rand) url.Values {
 	if r.IntN(10) == 0 {
 		v.Set("schema", "/r/schemas/")
 	}
+	// after is a position with q or sort, else a resource name (§A.4):
+	// the sort added above may have changed which.
+	if a := v.Get("after"); a != "" {
+		_, err := strconv.Atoi(a)
+		switch positional := v.Has("q") || v.Has("sort"); {
+		case positional && err != nil:
+			v.Set("after", fmt.Sprint(r.IntN(60)))
+		case !positional && err == nil:
+			v.Set("after", fmt.Sprintf("r%03d", r.IntN(300)))
+		}
+	}
 	return v
 }
 
@@ -241,10 +252,13 @@ func TestDriverThresholds(t *testing.T) {
 	type c struct{ ns, q string }
 	var cases []c
 	for _, ns := range []string{"n1000", "n1001"} {
-		cases = append(cases, c{ns, "facet[/k]=hit"}, c{ns, "facet[/k]=hit&sort=-/n&counts=/st"}, c{ns, "facet[/k]=hit&after=240&limit=20"})
+		cases = append(cases, c{ns, "facet[/k]=hit"}, c{ns, "facet[/k]=hit&sort=-/n&counts=/st"}, c{ns, "facet[/k]=hit&after=d000240&limit=20"})
 	}
 	for v := range big {
-		for _, extra := range []string{"", "&sort=/n", "&counts=/st&counts=/k", "&after=980&limit=20", "&after=981&limit=20", "&after=16380&limit=4", "&after=16400&limit=1", "&facet[/st]=s3", "&ge[/n]=50"} {
+		// Without q or sort, after is a resource name (§A.4); with sort, a
+		// position.
+		for _, extra := range []string{"", "&sort=/n", "&counts=/st,/k", "&after=d000980&limit=20", "&after=d000981&limit=20", "&after=d016380&limit=4",
+			"&after=d016400&limit=1", "&sort=/n&after=980&limit=20", "&sort=/n&after=16400&limit=1", "&facet[/st]=s3", "&ge[/n]=50"} {
 			cases = append(cases, c{"big", "facet[/k]=" + v + extra})
 		}
 	}

@@ -416,8 +416,7 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	st, cur, _, err := ix.refsAnswer(ctx, rd, rq, target)
 	if err != nil {
 		if errors.Is(err, errRefsKeys) {
-			w.Header().Set("Retry-After", "5")
-			writeErr(w, http.StatusServiceUnavailable, "keys", err.Error())
+			writeBehind(w, err.Error()) // §12.1: no code of its own
 			return
 		}
 		ix.opt.Logf("index: query %s: %v", r.URL, err)

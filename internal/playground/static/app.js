@@ -3418,7 +3418,9 @@ function srParams(ns) {
   // One sort, keys comma-separated: the canonical form sorts repeated values (§A.5).
   const sorts = $('srSort').value.split(',').map((x) => x.trim()).filter(Boolean);
   if (sorts.length) p.set('sort', sorts.join(','));
-  for (const c of $('srCounts').value.split(',').map((x) => x.trim()).filter(Boolean)) p.append('counts', c);
+  // counts is one value too, paths comma-separated: a repeated counts is 400 (§A.4).
+  const counts = $('srCounts').value.split(',').map((x) => x.trim()).filter(Boolean);
+  if (counts.length) p.set('counts', counts.join(','));
   if ($('srLimit').value.trim()) p.set('limit', $('srLimit').value.trim());
   const w = WRITES.get(ns);
   if ($('srRyw').checked && w) p.set('min', w.id);
@@ -3468,14 +3470,30 @@ function canonQuery(params) {
   return ps.length ? '?' + ps.map(([k, v]) => esc(k) + '=' + esc(v)).join('&') : '';
 }
 
-/* srNextPath is the URL of the page after a result at view: next itself, or for a ref query without q or sort, which
- * pages by name (§A.4), view with next as its after, in the canonical form. */
+/* srNextPath is the URL of the page after a result at view: view with next as its after, in the canonical form. Every
+ * query pages as /_refs does (§A.4): next is the following page's after, a resource name without q or sort, else an
+ * opaque position. */
 function srNextPath(view, next) {
-  if (next.startsWith('/')) return INDEX + next;
   const [p, qs] = view.split('?');
   const u = new URLSearchParams(qs || '');
   u.set('after', next);
   return INDEX + p + canonQuery(u);
+}
+
+/* srFailure says why a search of ns got no result. A namespace the index follows but lacks the keys of is 404, as one it
+ * doesn't follow (§A.4); its /_status entry, skipped, tells the two apart. One whose keys it can't fetch for now is 503
+ * behind (§12.1). */
+function srFailure(ns, res) {
+  const r = res.r;
+  const st = srStatusOf(ns);
+  return res.sealedWhole ? 'The index answered with a sealed result this browser has no key for: ' + res.sealedWhole.error
+    : r.neterr ? 'Network error: ' + r.neterr
+      : r.status === 502 ? 'The search index is not reachable through the proxy (502): it may still be starting.'
+        : r.status === 404 && st && st.skipped ? `The index follows ${ns} but lacks its keys (404): ${st.reason || ''}`
+          : r.status === 404 ? `The index does not serve a namespace named ${ns} (404): it follows ${SR.indexed.length ? SR.indexed.join(', ') : 'only what its -ns flag lists'}.`
+            : r.status === 401 || r.status === 403 ? `The index refused the read (${r.status}): ${ns} is not public; put a read grant in the connection bar's bearer field.`
+              : r.status === 503 ? `The index has not reached ${ns} yet (503 ${(r.json && r.json.code) || ''}): ${(r.json && r.json.message) || ''}`
+                : `The index answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}${r.json && r.json.message ? ': ' + r.json.message : ''}`;
 }
 
 /* runSearch queries the namespace in the page's fields, or fetches the next page of the last result. */
@@ -3512,18 +3530,7 @@ async function runSearch(more) {
     if (gen !== SR.gen) return;
     $('srStatus').textContent = '';
     const r = res.r;
-    if (!res.body) {
-      const st = srStatusOf(ns);
-      const why = res.sealedWhole ? 'The index answered with a sealed result this browser has no key for: ' + res.sealedWhole.error
-        : r.neterr ? 'Network error: ' + r.neterr
-          : r.status === 502 ? 'The search index is not reachable through the proxy (502): it may still be starting.'
-            : r.status === 404 ? `The index does not serve a namespace named ${ns} (404): it follows ${SR.indexed.length ? SR.indexed.join(', ') : 'only what its -ns flag lists'}.`
-              : r.status === 401 || r.status === 403 ? `The index refused the read (${r.status}): ${ns} is not public; put a read grant in the connection bar's bearer field.`
-                : r.status === 503 && r.json && r.json.code === 'skipped' ? `The index does not consume ${ns}: ${r.json.message || (st && st.reason) || ''}`
-                  : r.status === 503 ? `The index has not reached ${ns} yet (503 ${(r.json && r.json.code) || ''}): ${(r.json && r.json.message) || ''}`
-                    : `The index answered ${r.status}${r.json && r.json.code ? ' ' + r.json.code : ''}${r.json && r.json.message ? ': ' + r.json.message : ''}`;
-      return srMessage('err', why);
-    }
+    if (!res.body) return srMessage('err', srFailure(ns, res));
     const b = res.body;
     SR.at = b.at || ''; SR.view = res.view; SR.next = typeof b.next === 'string' ? b.next : '';
     SR.hits = more ? SR.hits.concat(b.hits || []) : (b.hits || []);
@@ -3578,9 +3585,11 @@ function renderSearch() {
     res.replaceChildren(h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['resource', 'schema', 'score', 'facets', 'revision', ''].map((c) => h('th', {}, c)))), h('tbody', {}, rows))));
   }
   $('srMore').hidden = !SR.next;
+  // counts: { path: { value: hits } }, each value its string form (§A.2, §A.4); most hits first.
   const counts = SR.counts && typeof SR.counts === 'object' ? Object.keys(SR.counts).sort() : [];
+  const byHits = (m) => Object.entries(m && typeof m === 'object' ? m : {}).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   $('srCountsOut').replaceChildren(...counts.map((p) => h('div', { class: 'chips' }, h('span', {}, 'counts ' + p + ':'),
-    ...(SR.counts[p] || []).map((c) => h('button', { class: 'badge info chip', title: `filter on ${p} = ${c.value}`, onclick: () => srAddFilter(p, c.value) }, `${c.value} × ${c.count}`)))));
+    ...byHits(SR.counts[p]).map(([v, n]) => h('button', { class: 'badge info chip', title: `filter on ${p} = ${v}`, onclick: () => srAddFilter(p, v) }, `${v} × ${n}`)))));
 }
 
 function initSearch() {

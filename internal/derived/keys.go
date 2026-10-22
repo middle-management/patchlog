@@ -74,6 +74,7 @@ type Keys struct {
 	epoch   map[string][]byte // kid → K_e
 	reasons map[string]string // ns → why it is skipped or partly read
 	skipped map[string]bool
+	lacks   map[string]bool // ns → skipped for want of keys, not for now (Check)
 }
 
 // NewKeys returns a tracker reading with c. recipient is the service's
@@ -81,7 +82,7 @@ type Keys struct {
 // enc, and makes e2e namespaces readable (the keyring must name its public
 // key). It may be nil.
 func NewKeys(c *client.Client, recipient *ecdh.PrivateKey) *Keys {
-	k := &Keys{c: c, info: map[string]Info{}, epoch: map[string][]byte{}, reasons: map[string]string{}, skipped: map[string]bool{}}
+	k := &Keys{c: c, info: map[string]Info{}, epoch: map[string][]byte{}, reasons: map[string]string{}, skipped: map[string]bool{}, lacks: map[string]bool{}}
 	if recipient != nil {
 		k.e2e = c.E2E(recipient).WithoutValidation()
 	}
@@ -251,10 +252,12 @@ func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey
 // (Retryable: the core unreachable, a 5xx, a 429), rather than the
 // service's keys as configured: ns is skipped all the same (nothing is
 // consumed that can't be decrypted or sealed), but a consumer waiting for
-// it keeps waiting. partial (an e2e namespace whose documents can't be
-// read, which a tree service may still follow for heads) is reported when
-// allowPartial and is not a skip. A purged namespace is consumed: its
-// follower learns of the purge.
+// it keeps waiting. A skip without retry is for want of keys (Skip):
+// client.ErrNoKeys, an e2e namespace and no recipient key, a 4xx from
+// /keys, or a key the service can't unwrap. partial (an e2e namespace
+// whose documents can't be read, which a tree service may still follow
+// for heads) is reported when allowPartial and is not a skip. A purged
+// namespace is consumed: its follower learns of the purge.
 func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason string, permanent, retry bool) {
 	in, err := k.Info(ctx, ns)
 	switch {
@@ -263,11 +266,11 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 	case err != nil:
 		// Not an encryption problem (e.g. the core is unreachable): the
 		// follower's own retries report it.
-		k.setReason(ns, "", false)
+		k.setReason(ns, "", false, false)
 		return "", false, false
 	case in.Level == LevelE2E && k.e2e == nil:
 		if allowPartial {
-			k.setReason(ns, "e2e namespace and no keyring recipient key: documents are not read", false)
+			k.setReason(ns, "e2e namespace and no keyring recipient key: documents are not read", false, false)
 			return "", false, false
 		}
 		reason, permanent = "e2e namespace and no keyring recipient key configured", true
@@ -276,7 +279,7 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 		if client.IsPurged(err) {
 			// Its keys are destroyed with its content (§8.5): the
 			// follower learns of the purge, and nothing is left to seal.
-			k.setReason(ns, "", false)
+			k.setReason(ns, "", false, false)
 			return "", false, false
 		}
 		if err != nil {
@@ -284,7 +287,7 @@ func (k *Keys) Check(ctx context.Context, ns string, allowPartial bool) (reason 
 			retry = Retryable(err)
 		}
 	}
-	k.setReason(ns, reason, reason != "")
+	k.setReason(ns, reason, reason != "", reason != "" && !retry)
 	return reason, permanent, retry
 }
 
@@ -296,7 +299,7 @@ func Retryable(err error) bool {
 	return !errors.Is(err, client.ErrNoKeys) && client.Transient(err)
 }
 
-func (k *Keys) setReason(ns, reason string, skipped bool) {
+func (k *Keys) setReason(ns, reason string, skipped, lacks bool) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if reason == "" {
@@ -305,16 +308,26 @@ func (k *Keys) setReason(ns, reason string, skipped bool) {
 		k.reasons[ns] = reason
 	}
 	k.skipped[ns] = skipped
+	k.lacks[ns] = lacks
 }
 
 // Skipped returns why ns is skipped ("" if it is consumed).
 func (k *Keys) Skipped(ns string) string {
+	reason, _ := k.Skip(ns)
+	return reason
+}
+
+// Skip returns why ns is skipped ("" if it is consumed), and whether for
+// want of keys: the service lacks them as configured (§A.4, §E.2.6: a
+// query of it is 404, as of a namespace the service doesn't follow), rather
+// than failing to fetch them for now (503 behind until it can, §12.1).
+func (k *Keys) Skip(ns string) (reason string, lacksKeys bool) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	if !k.skipped[ns] {
-		return ""
+		return "", false
 	}
-	return k.reasons[ns]
+	return k.reasons[ns], k.lacks[ns]
 }
 
 // Status reports nss (sorted).
