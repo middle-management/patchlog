@@ -1,6 +1,6 @@
 package main
 
-// patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-bearer T] [-json]
+// patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-skip-unopenable] [-bearer T] [-json]
 //
 // Wraps an e2e namespace's keyring stored in the format before v0.63 again
 // as the keyring document of §E.3.2 (client.E2E.MigrateKeyring): every
@@ -9,6 +9,13 @@ package main
 // itself. The stored recipient lists aren't used: anyone could have
 // written them, and a reader left out of a rotation must not get its key
 // now (§E.2.4), so the readers come from the caller.
+//
+// With -skip-unopenable, a key holder that can't open every epoch (one
+// added at a later epoch) wraps the epochs it opens, the newest among them,
+// and leaves out the others (client.E2E.MigrateKeyringOpenable), so the
+// namespace can be rotated again. Run on a keyring already migrated, the
+// command puts back, from the keyring's last revision in the old format,
+// the epochs a migration left out.
 
 import (
 	"context"
@@ -16,14 +23,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 
+	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
 const e2eUsage = `usage:
-  patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-bearer T] [-author A] [-json]`
+  patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-skip-unopenable] [-bearer T] [-author A] [-json]`
 
 func e2eCmd(args []string) {
 	if len(args) == 0 || args[0] != "migrate-keyring" {
@@ -37,6 +44,7 @@ func e2eCmd(args []string) {
 	var readers, current multi
 	fs.Var(&readers, "reader", "file with a reader's X25519 public key (a JWK {kty, crv, x}, or base64url x), given every epoch the keyring holds (repeatable)")
 	fs.Var(&current, "current-reader", "as -reader, but given only the keyring's newest epoch, as a reader added since the last rotation is (repeatable)")
+	skip := fs.Bool("skip-unopenable", false, "leave out the epochs -identity can't open (it must open the newest), so a key holder added at a later epoch can migrate and then rotate; the keys left out stay in the keyring's history until a holder of them runs migrate-keyring again")
 	fs.Parse(args[1:])
 	if *ns == "" || *identity == "" {
 		fmt.Fprintln(os.Stderr, "e2e migrate-keyring: -ns and -identity are required")
@@ -60,39 +68,51 @@ func e2eCmd(args []string) {
 	}
 	ctx := context.Background()
 	x := tf.client().E2E(admin)
-	old, _, err := x.LegacyKeyring(ctx, *ns)
+	old, epochs, err := x.MigrationSource(ctx, *ns)
 	if err != nil {
 		toolFatal(err)
 	}
-	epochs := make([]int, 0, len(old.Epochs))
-	for e := range old.Epochs {
-		epochs = append(epochs, e)
+	readersOf := migrationReaders(epochs, old.Current, all, newest)
+	var w *client.WriteResult
+	var left []int
+	if *skip {
+		w, left, err = x.MigrateKeyringOpenable(ctx, *ns, readersOf)
+	} else {
+		w, err = x.MigrateKeyring(ctx, *ns, readersOf)
 	}
-	w, err := x.MigrateKeyring(ctx, *ns, migrationReaders(epochs, all, newest))
 	if err != nil {
 		toolFatal(err)
 	}
 	if *tf.asJSON {
-		printJSON(map[string]any{"ns": *ns, "keyring": w.ID})
+		out := map[string]any{"ns": *ns, "left": left}
+		if w != nil {
+			out["keyring"] = w.ID
+		}
+		printJSON(out)
 		return
 	}
-	fmt.Printf("keyring of %s wrapped again as revision %s; readers name %s as its sender\n", *ns, w.ID, seal.Thumbprint(admin.PublicKey()))
+	if w == nil {
+		fmt.Printf("keyring of %s: no epoch to wrap again\n", *ns)
+	} else {
+		fmt.Printf("keyring of %s wrapped again as revision %s; readers name %s as its sender\n", *ns, w.ID, seal.Thumbprint(admin.PublicKey()))
+	}
+	if len(left) > 0 {
+		fmt.Printf("left out epochs %v, which %s can't open: a holder of them runs migrate-keyring again to put them back\n", left, *identity)
+	}
 }
 
-// migrationReaders gives each of epochs the readers of all, and the newest
-// of them also those of newest (seal.MigrateKeyring wants every epoch
-// named, an empty list leaving it to the admin alone).
-func migrationReaders(epochs []int, all, newest []*ecdh.PublicKey) map[int][]*ecdh.PublicKey {
+// migrationReaders gives each of epochs the readers of all, and epoch
+// current, the old keyring's newest, if among them, also those of newest
+// (MigrateKeyring wants every epoch named, an empty list leaving it to
+// the admin alone).
+func migrationReaders(epochs []int, current int, all, newest []*ecdh.PublicKey) map[int][]*ecdh.PublicKey {
 	out := make(map[int][]*ecdh.PublicKey, len(epochs))
-	if len(epochs) == 0 {
-		return out
-	}
-	sort.Ints(epochs)
 	for _, e := range epochs {
 		out[e] = append([]*ecdh.PublicKey(nil), all...)
 	}
-	last := epochs[len(epochs)-1]
-	out[last] = append(out[last], newest...)
+	if _, ok := out[current]; ok {
+		out[current] = append(out[current], newest...)
+	}
 	return out
 }
 

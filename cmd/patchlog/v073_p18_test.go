@@ -34,11 +34,16 @@ func TestV073MigrateKeyringReaders(t *testing.T) {
 	if _, err := readPublicKeys([]string{bad}); err == nil {
 		t.Fatal("an Ed25519 key read as a reader")
 	}
-	m := migrationReaders([]int{3, 1, 2}, []*ecdh.PublicKey{a.PublicKey()}, []*ecdh.PublicKey{b.PublicKey()})
+	m := migrationReaders([]int{3, 1, 2}, 3, []*ecdh.PublicKey{a.PublicKey()}, []*ecdh.PublicKey{b.PublicKey()})
 	if len(m) != 3 || len(m[1]) != 1 || len(m[2]) != 1 || len(m[3]) != 2 || !m[3][1].Equal(b.PublicKey()) {
 		t.Fatalf("readers by epoch %v", m)
 	}
-	if m := migrationReaders([]int{1}, nil, nil); len(m) != 1 || len(m[1]) != 0 {
+	if m := migrationReaders([]int{1}, 1, nil, nil); len(m) != 1 || len(m[1]) != 0 {
 		t.Fatalf("an epoch without readers must be named %v", m)
+	}
+	// Putting back epochs a migration left out: the newest isn't among
+	// them, so no epoch gets the -current-reader keys.
+	if m := migrationReaders([]int{1, 2}, 3, nil, []*ecdh.PublicKey{b.PublicKey()}); len(m) != 2 || len(m[1]) != 0 || len(m[2]) != 0 {
+		t.Fatalf("readers of epochs put back %v", m)
 	}
 }

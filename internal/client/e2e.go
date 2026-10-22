@@ -67,6 +67,8 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"slices"
+	"sort"
 	"strings"
 	"sync"
 
@@ -1519,25 +1521,143 @@ func (x *E2E) RotateEpoch(ctx context.Context, ns string, readers ...*ecdh.Publi
 // keyring holds, and comes from the caller, out of band: the stored
 // recipient lists are untrusted (anyone could write them, and a reader
 // left out of a rotation must not get its key now). It returns the write.
+//
+// On a keyring already in the new format it puts back the epochs that a
+// migration left out (MigrateKeyringOpenable) from the newest earlier
+// revision in the old format (MigrationSource), which readers must name
+// then; with none left out, it writes nothing and returns nil.
 func (x *E2E) MigrateKeyring(ctx context.Context, ns string, readers map[int][]*ecdh.PublicKey) (*WriteResult, error) {
+	w, _, err := x.migrateKeyring(ctx, ns, readers, false)
+	return w, err
+}
+
+// MigrateKeyringOpenable is MigrateKeyring for a key holder that can't open
+// every epoch of the old keyring, such as a reader added at a later epoch,
+// which in v0.55 could rotate: revoking means rotating the epoch (§E.3.2),
+// and RotateEpoch needs the keyring in the new format. It wraps again the
+// epochs of readers the view opens, which must include the old keyring's
+// newest, and leaves out the others, which it returns: their keys are
+// then in the keyring's history only, not in the keyring /keys relays,
+// until a holder of them puts them back with MigrateKeyring.
+func (x *E2E) MigrateKeyringOpenable(ctx context.Context, ns string, readers map[int][]*ecdh.PublicKey) (*WriteResult, []int, error) {
+	return x.migrateKeyring(ctx, ns, readers, true)
+}
+
+// MigrationSource returns the keyring of ns in the format before v0.63 that
+// MigrateKeyring wraps again, and the epochs of it to wrap, ascending: the
+// keyring itself and all its epochs, or, when it is already in the new
+// format, its newest earlier revision in the old format and the epochs the
+// keyring lacks.
+func (x *E2E) MigrationSource(ctx context.Context, ns string) (old *seal.Keyring, epochs []int, err error) {
+	old, _, epochs, _, err = x.migrationSource(ctx, ns)
+	return old, epochs, err
+}
+
+// migrationSource is MigrationSource, with the keyring document to wrap
+// the epochs into (a new one, or the keyring as it is) and its head.
+func (x *E2E) migrationSource(ctx context.Context, ns string) (old *seal.Keyring, dst *seal.KeyringV2, epochs []int, head string, err error) {
+	cur, old, head, err := x.keyring(ctx, ns)
+	if err != nil {
+		return nil, nil, nil, "", err
+	}
+	have := map[int]bool{}
+	switch {
+	case old != nil && old.NS != ns:
+		return nil, nil, nil, "", fmt.Errorf("client: %s reads the keyring of %s through; migrate it there", ns, old.NS)
+	case old != nil:
+		dst = &seal.KeyringV2{}
+	case cur.Current(ns) == 0:
+		return nil, nil, nil, "", fmt.Errorf("client: %s reads its base's keyring through; it has none of its own to migrate", ns)
+	default:
+		dst = cur
+		for _, e := range cur.Epochs(ns) {
+			have[e] = true
+		}
+		es, err := x.c.Log(ctx, ns, KeyringName, head, "")
+		if err != nil {
+			return nil, nil, nil, "", err
+		}
+		for i := len(es) - 1; i >= 0 && old == nil; i-- {
+			if es[i].Kind != "rev" || es[i].ID == head {
+				continue
+			}
+			d, err := x.c.Doc(ctx, ns, KeyringName, es[i].ID)
+			if err != nil {
+				return nil, nil, nil, "", err
+			}
+			if k, err := seal.ParseKeyring(d.Value); err == nil && k.NS == ns {
+				old = k
+			}
+		}
+		if old == nil {
+			return nil, nil, nil, "", fmt.Errorf("client: the keyring of %s is not in the format before v0.63, and has no earlier revision in it", ns)
+		}
+	}
+	for e := range old.Epochs {
+		if !have[e] {
+			epochs = append(epochs, e)
+		}
+	}
+	sort.Ints(epochs)
+	return old, dst, epochs, head, nil
+}
+
+// migrateKeyring is MigrateKeyring, leaving out with skip the epochs the
+// view can't open (MigrateKeyringOpenable).
+func (x *E2E) migrateKeyring(ctx context.Context, ns string, readers map[int][]*ecdh.PublicKey, skip bool) (*WriteResult, []int, error) {
 	admin, err := x.admin()
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	old, head, err := x.LegacyKeyring(ctx, ns)
+	old, kr, epochs, head, err := x.migrationSource(ctx, ns)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if old.NS != ns {
-		return nil, fmt.Errorf("client: %s reads the keyring of %s through; migrate it there", ns, old.NS)
+	fresh := len(kr.Entries) == 0
+	for e := range readers {
+		if _, ok := old.Epochs[e]; !ok {
+			return nil, nil, fmt.Errorf("client: migrating the keyring of %s: readers given for epoch %d, which it doesn't hold", ns, e)
+		}
 	}
-	with := make(map[int][]*ecdh.PublicKey, len(readers))
-	for e, rs := range readers {
-		with[e] = x.withSelf(rs)
+	var left []int
+	wrapped := 0
+	for _, e := range epochs {
+		rs, named := readers[e]
+		var key []byte
+		if named {
+			for _, priv := range x.recipients() {
+				if key, err = old.EpochKey(priv, e); err == nil {
+					break
+				}
+			}
+		}
+		if key == nil {
+			switch {
+			case skip:
+				left = append(left, e)
+				continue
+			case !named:
+				return nil, nil, fmt.Errorf("client: migrating the keyring of %s: no readers given for epoch %d", ns, e)
+			default:
+				return nil, nil, fmt.Errorf("client: migrating the keyring of %s: epoch %d: %w", ns, e, err)
+			}
+		}
+		for _, r := range x.withSelf(rs) {
+			if err := kr.Add(admin, r, seal.Kid(ns, e), key); err != nil {
+				return nil, nil, fmt.Errorf("client: migrating the keyring of %s: epoch %d: %w", ns, e, err)
+			}
+		}
+		wrapped++
 	}
-	kr, err := seal.MigrateKeyring(old, admin, with)
+	if fresh && slices.Contains(left, old.Current) {
+		return nil, left, fmt.Errorf("client: migrating the keyring of %s: the view can't open its newest epoch %d, which writes and rotations need; a holder of it migrates", ns, old.Current)
+	}
+	if wrapped == 0 {
+		return nil, left, nil
+	}
+	w, err := x.c.Append(ctx, ns, KeyringName, head, replaceRoot(kr.Value()))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return x.c.Append(ctx, ns, KeyringName, head, replaceRoot(kr.Value()))
+	return w, left, nil
 }
