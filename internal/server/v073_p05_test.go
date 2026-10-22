@@ -617,3 +617,61 @@ func TestV073RemoteBranchCreationHeldToLimits(t *testing.T) {
 	expect(t, b.get("/ns/rel"), 404)
 	expect(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 201)
 }
+
+// v0.73 §E.1 Stored digests, for a database an earlier version wrote: it
+// stored the heads' plaintext sizes and sha-256s at every level below
+// sealed, at rest included, and nothing later clears them in a namespace
+// already at rest. Opening it clears them, once (migrations), from the
+// revisions of namespaces encrypted at all, and keeps a plain namespace's;
+// /heads at rest lists none, even where a row still has them.
+func TestV073AtRestDigestsFromBeforeUpgrade(t *testing.T) {
+	t.Parallel()
+	path, blobs := v073DB(t), t.TempDir()
+	ks := newKeyStore(t)
+	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+	e := newEnv(t, withKeyStore(ks), withEncTuning, at)
+	e.mkNS("r", atRest(map[string]any{"read": "public"}))
+	e.mkNS("p", map[string]any{"read": "public"})
+	ra := e.create("r", "a", map[string]any{"secret": "guessable"})
+	e.appendRev("r", "a", ra, ops(op("add", "/more", 1.0)))
+	e.create("p", "b", map[string]any{"b": 1.0})
+	e.srv.Close()
+	e.e.Close()
+	// As an earlier version left it: no migrations table, and a size and
+	// digest on each revision written as a head at rest.
+	db, q := v073SQL(t, path)
+	stale := func() {
+		t.Helper()
+		canon := []byte(`{"secret":"guessable"}`)
+		sum := sha256.Sum256(canon)
+		if _, err := db.Exec(q(`UPDATE revisions SET size = ?, digest = ? WHERE res IN (SELECT r.res FROM resources r JOIN namespaces n ON n.ns = r.ns WHERE n.name = 'r')`), len(canon), sum[:]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stale()
+	if _, err := db.Exec(`DROP TABLE migrations`); err != nil {
+		t.Fatal(err)
+	}
+	if n := storedMeta(t, path); n != 3 {
+		t.Fatalf("%d revisions with a size or digest before the upgrade, want 3", n)
+	}
+	e = newEnv(t, withKeyStore(ks), withEncTuning, at)
+	if n := storedMeta(t, path); n != 1 {
+		t.Fatalf("%d revisions with a size or digest after the upgrade, want the plain head's", n)
+	}
+	if it := e.headItems("p", e.nsHead("p"))["b"]; it["size"] == nil || it["digest"] == nil {
+		t.Fatalf("plain heads %v", it)
+	}
+	e.srv.Close()
+	e.e.Close()
+	// Once: a row with them again is left, and /heads at rest still lists
+	// none.
+	stale()
+	e = newEnv(t, withKeyStore(ks), withEncTuning, at)
+	if n := storedMeta(t, path); n != 3 {
+		t.Fatalf("%d revisions with a size or digest, want 3: the migration ran again", n)
+	}
+	if it := e.headItems("r", e.nsHead("r"))["a"]; it["created"] == nil || it["size"] != nil || it["digest"] != nil {
+		t.Fatalf("at-rest heads %v", it)
+	}
+}

@@ -877,8 +877,11 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 		// hide: created times, which their logs seal, lengths, which their
 		// padding exists for, and a hash of content (§7.4, §E.2.2). Judged
 		// by the namespace serving the page when it is listed, so pages at
-		// ns_ids from before a raise to sealed list none either.
-		plain := t.nsLevel(n) < levelSealed
+		// ns_ids from before a raise to sealed list none either. Nor do
+		// size and digest show at rest, where none are stored (§E.1 Stored
+		// digests; clearAtRestDigests, encryptNamespace).
+		level := t.nsLevel(n)
+		plain := level < levelSealed
 		for _, h := range page {
 			kind := "head"
 			switch h.state {
@@ -899,7 +902,7 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 			// keeps its target.
 			if plain && h.row != nil && h.state != Purged {
 				item["created"] = formatTime(h.row.created)
-				if h.state == Live && h.row.size.Valid && len(h.row.digest) == sha256.Size {
+				if h.state == Live && level < levelAtRest && h.row.size.Valid && len(h.row.digest) == sha256.Size {
 					item["size"] = float64(h.row.size.Int64)
 					item["digest"] = ReprDigest(h.row.digest)
 				}
