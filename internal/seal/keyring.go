@@ -9,9 +9,11 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
-// Keyring is the E3 `keyring` resource document (§E.3.2) that a
-// key-holding admin client writes into an e2e namespace. The server only
-// relays it. Its JSON form is:
+// Keyring is the E3 `keyring` resource document in its format before
+// v0.63; the spec's format is KeyringV2 (§E.3.2), and this one is kept so
+// that stored keyrings can be read and migrated (MigrateKeyring). A
+// key-holding admin client wrote it into an e2e namespace, and the server
+// only relays it. Its JSON form is:
 //
 //	{
 //	  "keyring": 1,                         // format version
@@ -23,10 +25,11 @@ import (
 //	}
 //
 // rid is RecipientID (text(trunc160(sha256(canonical(jwk))))). Each epoch
-// maps recipients to K_e wrapped with HPKE under context kid = "{ns}#{e}"
-// (WrapKey with no resource). `recipients` lists every key referenced by
-// some epoch. Old epochs are kept: revoked readers already held them
-// (§E.2.4), and current readers need them for old revisions.
+// maps recipients to K_e wrapped with HPKE in base mode (WrapKey with no
+// resource; keyrings stored before v0.63 used the info of that time,
+// UnwrapKeyLegacy). `recipients` lists every key referenced by some epoch.
+// Old epochs are kept: revoked readers already held them (§E.2.4), and
+// current readers need them for old revisions.
 type Keyring struct {
 	NS         string
 	Current    int
@@ -116,13 +119,44 @@ func Lookup(kr *Keyring, jwk any, epoch int) (WrappedKey, error) {
 	return WrappedKey{Kid: Kid(kr.NS, epoch), Wrapped: w}, nil
 }
 
-// EpochKey looks up and unwraps epoch's key with the recipient's private key.
+// EpochKey looks up and unwraps epoch's key with the recipient's private
+// key, under the HPKE info of v0.63 or, for a keyring stored before, the
+// info of that time (UnwrapKeyLegacy).
 func (kr *Keyring) EpochKey(priv *ecdh.PrivateKey, epoch int) ([]byte, error) {
 	w, err := Lookup(kr, priv.PublicKey(), epoch)
 	if err != nil {
 		return nil, err
 	}
-	return UnwrapKey(priv, w)
+	k, err := UnwrapKey(priv, w)
+	if err != nil {
+		k, err = UnwrapKeyLegacy(priv, w)
+	}
+	return k, err
+}
+
+// MigrateKeyring rewrites a keyring of the format before v0.63 as a
+// KeyringV2 (§E.3.2): every epoch's key, which admin, one of its
+// recipients, unwraps, is wrapped again in auth mode under admin's key for
+// each recipient of that epoch. It fails if admin can't open an epoch.
+func MigrateKeyring(old *Keyring, admin *ecdh.PrivateKey) (*KeyringV2, error) {
+	epochs := make([]int, 0, len(old.Epochs))
+	for e := range old.Epochs {
+		epochs = append(epochs, e)
+	}
+	sort.Ints(epochs)
+	kr := &KeyringV2{}
+	for _, e := range epochs {
+		k, err := old.EpochKey(admin, e)
+		if err != nil {
+			return nil, fmt.Errorf("seal: migrating keyring %s: epoch %d: %w", old.NS, e, err)
+		}
+		for _, rid := range old.Readers(e) {
+			if err := kr.Add(admin, old.Recipients[rid], Kid(old.NS, e), k); err != nil {
+				return nil, err
+			}
+		}
+	}
+	return kr, nil
 }
 
 // Value returns the keyring document as a jsonv model value.

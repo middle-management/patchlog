@@ -603,3 +603,202 @@ func TestV073SealBlobWithIV(t *testing.T) {
 		t.Fatal("an 8-byte IV accepted")
 	}
 }
+
+// ---- ENC-11: the keyring document (§E.3.2, v0.63) ----
+
+func TestV073KeyringV2(t *testing.T) {
+	_, admin, _ := GenerateRecipient()
+	_, a, _ := GenerateRecipient()
+	_, b, _ := GenerateRecipient()
+	_, mallory, _ := GenerateRecipient()
+	k1, k2 := NewKey(), NewKey()
+	kr := &KeyringV2{Nonce: NewNonce()}
+	for _, c := range []struct {
+		to  *ecdh.PrivateKey
+		kid string
+		k   []byte
+	}{{a, "sec#1", k1}, {b, "sec#1", k1}, {a, "sec#2", k2}, {admin, "sec#2", k2}} {
+		if err := kr.Add(admin, c.to.PublicKey(), c.kid, c.k); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Adding again replaces: never two entries for one kid and to.
+	if err := kr.Add(admin, a.PublicKey(), "sec#1", k1); err != nil || len(kr.Entries) != 4 {
+		t.Fatalf("%d entries, %v", len(kr.Entries), err)
+	}
+	if err := kr.Add(admin, a.PublicKey(), "sec", k1); err == nil {
+		t.Fatal("a kid without an epoch accepted")
+	}
+	doc, _ := kr.MarshalJSON()
+	v := jsonv.MustParse(doc).(map[string]any)
+	if len(v) != 2 || v["$nonce"] != kr.Nonce {
+		t.Fatalf("document %s", doc)
+	}
+	for _, x := range v["keys"].([]any) {
+		e := x.(map[string]any)
+		if len(e) != 4 || e["from"] != Thumbprint(admin.PublicKey()) || !ValidThumbprint(e["to"].(string)) {
+			t.Fatalf("entry %v", e)
+		}
+	}
+	kr2, err := ParseKeyringV2(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again, _ := kr2.MarshalJSON(); !bytes.Equal(again, doc) {
+		t.Fatalf("round trip\n %s\n %s", again, doc)
+	}
+	trusted := []*ecdh.PublicKey{mallory.PublicKey(), admin.PublicKey()}
+	if got, err := kr2.EpochKey(a, "sec#2", trusted); err != nil || !bytes.Equal(got, k2) {
+		t.Fatalf("a's sec#2: %v", err)
+	}
+	if got, err := kr2.EpochKey(b, "sec#1", trusted); err != nil || !bytes.Equal(got, k1) {
+		t.Fatalf("b's sec#1: %v", err)
+	}
+	if _, err := kr2.EpochKey(b, "sec#2", trusted); err == nil {
+		t.Fatal("b has no sec#2")
+	}
+	if _, err := kr2.EpochKey(a, "sec#2", []*ecdh.PublicKey{mallory.PublicKey()}); err == nil {
+		t.Fatal("a key from an untrusted sender")
+	}
+	if got := kr2.Epochs("sec"); len(got) != 2 || got[0] != 1 || got[1] != 2 {
+		t.Fatalf("epochs %v", got)
+	}
+	if got := kr2.Epochs("other"); len(got) != 0 {
+		t.Fatalf("epochs of another namespace %v", got)
+	}
+
+	// Anyone can wrap to a thumbprint: an entry claiming the admin's from
+	// but wrapped by another key doesn't open with the admin's key, and
+	// one honest about its from isn't trusted.
+	forged, _ := WrapKeyAuth(mallory, a.PublicKey(), "sec#3", "", NewKey())
+	kr2.Put(KeyringEntry{Kid: "sec#3", To: Thumbprint(a.PublicKey()), From: Thumbprint(admin.PublicKey()), Wrapped: forged.Wrapped})
+	if _, err := kr2.EpochKey(a, "sec#3", trusted); !errors.Is(err, ErrDecrypt) {
+		t.Fatalf("forged from: %v", err)
+	}
+	kr2.Put(KeyringEntry{Kid: "sec#3", To: Thumbprint(a.PublicKey()), From: Thumbprint(mallory.PublicKey()), Wrapped: forged.Wrapped})
+	if _, err := kr2.EpochKey(a, "sec#3", []*ecdh.PublicKey{admin.PublicKey()}); err == nil {
+		t.Fatal("an entry from an untrusted sender opened")
+	}
+	// An entry moved to another kid doesn't open: the info binds kid.
+	e, _ := kr2.Entry("sec#1", Thumbprint(a.PublicKey()))
+	e.Kid = "sec#2"
+	if _, err := e.Open(a, admin.PublicKey()); !errors.Is(err, ErrDecrypt) {
+		t.Fatalf("moved entry: %v", err)
+	}
+	// Open checks that to and from name the keys given.
+	e, _ = kr2.Entry("sec#1", Thumbprint(b.PublicKey()))
+	if _, err := e.Open(a, admin.PublicKey()); err == nil {
+		t.Fatal("opened an entry to another key")
+	}
+	if _, err := e.Open(b, mallory.PublicKey()); err == nil {
+		t.Fatal("opened an entry with another from")
+	}
+}
+
+// The document's members are exact, entries are well-formed, and no two
+// entries share a kid and to (§E.3.2: 422 invalid at the gate).
+func TestV073ParseKeyringV2(t *testing.T) {
+	_, admin, _ := GenerateRecipient()
+	_, a, _ := GenerateRecipient()
+	_, b, _ := GenerateRecipient()
+	w, _ := WrapKeyAuth(admin, a.PublicKey(), "sec#1", "", NewKey())
+	ws := b64.EncodeToString(w.Wrapped)
+	ta, tb, tf := Thumbprint(a.PublicKey()), Thumbprint(b.PublicKey()), Thumbprint(admin.PublicKey())
+	entry := func(kid, to, from, wrapped string) string {
+		return `{"kid":"` + kid + `","to":"` + to + `","from":"` + from + `","wrapped":"` + wrapped + `"}`
+	}
+	good := entry("sec#1", ta, tf, ws)
+	for _, doc := range []string{
+		`{"keys":[]}`,
+		`{"keys":[],"$nonce":"` + NewNonce() + `"}`,
+		`{"keys":[` + good + `]}`,
+		`{"keys":[` + good + `,` + entry("sec#1", tb, tf, ws) + `,` + entry("sec#2", ta, tf, ws) + `]}`, // same kid or same to: fine
+	} {
+		if _, err := ParseKeyringV2([]byte(doc)); err != nil {
+			t.Errorf("%s: %v", doc, err)
+		}
+	}
+	for name, doc := range map[string]string{
+		"not an object":          `[]`,
+		"no keys":                `{}`,
+		"keys not an array":      `{"keys":{}}`,
+		"another member":         `{"keys":[],"ns":"sec"}`,
+		"the old format":         `{"keyring":1,"ns":"sec","current":1,"recipients":{},"epochs":{}}`,
+		"$nonce not a string":    `{"keys":[],"$nonce":1}`,
+		"entry not an object":    `{"keys":["x"]}`,
+		"entry with a suite":     `{"keys":[{"kid":"sec#1","to":"` + ta + `","from":"` + tf + `","wrapped":"` + ws + `","suite":"x"}]}`,
+		"entry without from":     `{"keys":[{"kid":"sec#1","to":"` + ta + `","wrapped":"` + ws + `"}]}`,
+		"entry with a number":    `{"keys":[{"kid":"sec#1","to":"` + ta + `","from":"` + tf + `","wrapped":1}]}`,
+		"kid without epoch":      `{"keys":[` + entry("sec", ta, tf, ws) + `]}`,
+		"kid epoch not decimal":  `{"keys":[` + entry("sec#01", ta, tf, ws) + `]}`,
+		"to not a thumbprint":    `{"keys":[` + entry("sec#1", RecipientID(a.PublicKey()), tf, ws) + `]}`,
+		"from not base64url":     `{"keys":[` + entry("sec#1", ta, "+"+tf[1:], ws) + `]}`,
+		"wrapped not base64url":  `{"keys":[` + entry("sec#1", ta, tf, ws+"=") + `]}`,
+		"wrapped too short":      `{"keys":[` + entry("sec#1", ta, tf, ws[:40]) + `]}`,
+		"two entries kid and to": `{"keys":[` + good + `,` + entry("sec#1", ta, Thumbprint(b.PublicKey()), ws) + `]}`,
+	} {
+		if _, err := ParseKeyringV2([]byte(doc)); !errors.Is(err, ErrFormat) {
+			t.Errorf("%s: err = %v, want ErrFormat", name, err)
+		}
+	}
+	// And the old parser refuses the new document.
+	if _, err := ParseKeyring([]byte(`{"keys":[` + good + `]}`)); err == nil {
+		t.Error("ParseKeyring took a v0.63 keyring")
+	}
+}
+
+// A keyring stored before v0.63 (old format, keys wrapped in base mode
+// under the old info) opens for migration and is rewritten in the new
+// format, in auth mode under the admin's key.
+func TestV073MigrateKeyring(t *testing.T) {
+	_, admin, _ := GenerateRecipient()
+	_, b, _ := GenerateRecipient()
+	k1, k2 := NewKey(), NewKey()
+	old, _ := BuildKeyring("sec", 1, k1, []*ecdh.PublicKey{admin.PublicKey(), b.PublicKey()})
+	old.Rotate(k2, []*ecdh.PublicKey{admin.PublicKey()})
+	// As stored before v0.63: wrapped under the old info.
+	for e, m := range old.Epochs {
+		k := map[int][]byte{1: k1, 2: k2}[e]
+		for rid := range m {
+			pk, _ := hpke.NewDHKEMPublicKey(old.Recipients[rid])
+			w, err := hpke.Seal(pk, hpke.HKDFSHA256(), hpke.AES256GCM(), legacyWrapInfo(Kid("sec", e), ""), k)
+			if err != nil {
+				t.Fatal(err)
+			}
+			m[rid] = w
+		}
+	}
+	doc, _ := old.MarshalJSON()
+	stored, err := ParseKeyring(doc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := stored.EpochKey(b, 1); err != nil || !bytes.Equal(got, k1) {
+		t.Fatalf("legacy EpochKey: %v", err)
+	}
+	kr, err := MigrateKeyring(stored, admin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kr.Entries) != 3 {
+		t.Fatalf("%d entries", len(kr.Entries))
+	}
+	trusted := []*ecdh.PublicKey{admin.PublicKey()}
+	if got, err := kr.EpochKey(b, "sec#1", trusted); err != nil || !bytes.Equal(got, k1) {
+		t.Fatalf("b's sec#1: %v", err)
+	}
+	if got, err := kr.EpochKey(admin, "sec#2", trusted); err != nil || !bytes.Equal(got, k2) {
+		t.Fatalf("admin's sec#2: %v", err)
+	}
+	if _, err := kr.EpochKey(b, "sec#2", trusted); err == nil {
+		t.Fatal("b was revoked before sec#2")
+	}
+	reparsed, _ := kr.MarshalJSON()
+	if _, err := ParseKeyringV2(reparsed); err != nil {
+		t.Fatal(err)
+	}
+	// Only a recipient of every epoch can migrate.
+	if _, err := MigrateKeyring(stored, b); err == nil {
+		t.Fatal("b migrated an epoch it doesn't hold")
+	}
+}
