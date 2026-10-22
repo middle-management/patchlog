@@ -439,6 +439,11 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 
 	// Dependents: leaves first.
 	deps, err := j.c.Branches(ctx, ns)
+	if client.IsPurged(err) {
+		// Purged since its log was read, or, unsealed, before: a purged
+		// namespace's /branches is 410 (§7.4, §8.5).
+		return purgedSince(d, err), nil
+	}
 	if err != nil {
 		return d, err
 	}
@@ -909,6 +914,10 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 		return false, fmt.Sprintf("successor %s is a branch of %s, not of a namespace in the branch's base chain (%s, §7.4)", succ, sbase, strings.Join(chain, ", ")), nil
 	}
 	brs, err := b.j.c.Branches(ctx, sbase)
+	if client.IsPurged(err) {
+		// A purged namespace's /branches is 410 (§7.4, §8.5).
+		return false, "the successor's base " + sbase + " is purged", nil
+	}
 	if err != nil {
 		return false, "", err
 	}
