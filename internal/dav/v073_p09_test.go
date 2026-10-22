@@ -607,3 +607,28 @@ func TestV073MovedAwayFromRecords(t *testing.T) {
 	refused(e.expect(e.do("PUT", "/docs/far.json", `{"a": "mine"}`, "If-Match", `"`+old+`"`), 409, "PUT naming the version moved"), "/r/other/far")
 	e.expectTombstoned("docs", "far", "far")
 }
+
+// An If-Match whose first value isn't an entity tag (unquoted, say)
+// names no revision: the condition is false, 412 and nothing done, on a
+// MOVE as on a PUT or a DELETE, never the request done as if it had no
+// precondition (RFC 9110 §13.1.1; §H.4 "The base", §H.5, GW-1). Empty
+// list elements are skipped (RFC 9110 §5.6.1).
+func TestV073MalformedIfMatch(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs"}, nil, nil)
+	old := e.create("docs", "x", map[string]any{"a": "1"})
+	e.theirs("docs", "x", replace("/a", "2"))
+	h, _ := e.load("docs", "x")
+	for _, tag := range []string{old, h.ID, "W/" + h.ID, `"` + h.ID, `""`, ","} {
+		e.expect(e.do("MOVE", "/docs/x.json", "", "Destination", "/docs/y.json", "If-Match", tag), 412, "MOVE If-Match: "+tag)
+		e.expect(e.do("PUT", "/docs/x.json", `{"a": "mine"}`, "If-Match", tag), 412, "PUT If-Match: "+tag)
+		e.expect(e.do("DELETE", "/docs/x.json", "", "If-Match", tag), 412, "DELETE If-Match: "+tag)
+	}
+	e.expectLive("docs", "x", h, "x after the refusals")
+	if g, _ := e.load("docs", "y"); g.State != client.NotFound {
+		t.Fatalf("y made by a refused MOVE: %v", g.State)
+	}
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "mine"}`, "If-Match", `, "`+h.ID+`"`), 201, "PUT If-Match: an empty element, then the head")
+	_, doc := e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"a": "mine"})
+}

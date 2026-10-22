@@ -424,7 +424,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case im == "*":
 				st.srcAny = true
 			case im != "":
-				st.srcMatch = revOfETag(strings.TrimSpace(strings.Split(im, ",")[0]))
+				rev, ok := matchTag(im)
+				if !ok {
+					badMatch(w, im)
+					return
+				}
+				st.srcMatch = rev
 			default:
 				st.srcMatch = ifTag
 			}
@@ -459,20 +464,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				r.Header.Set("If", rest)
 			}
 		}
+		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
+		case im == "*":
+			st.matchAny = true
+		case im != "":
+			rev, ok := matchTag(im)
+			if !ok {
+				badMatch(w, im)
+				return
+			}
+			st.ifMatch = rev
+		default:
+			st.ifMatch = ifTag
+		}
 		if r.Method == "PUT" {
 			// The write that follows a document's move aside (vim's backup)
 			// is the edit of it, even create-only (davfs2 then believes the
 			// name free).
 			aside := tk.p.takeAside(st.path, s.opt.Now())
 			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
-		}
-		switch im := strings.TrimSpace(r.Header.Get("If-Match")); {
-		case im == "*":
-			st.matchAny = true
-		case im != "":
-			st.ifMatch = revOfETag(strings.TrimSpace(strings.Split(im, ",")[0]))
-		default:
-			st.ifMatch = ifTag
 		}
 	}
 	switch {
@@ -581,6 +591,28 @@ func (b *bodyReader) Read(p []byte) (int, error) {
 		b.st.bodyErr = err
 	}
 	return n, err
+}
+
+// matchTag is the revision the first entity tag of If-Match value im
+// names (§H.4 "The base", §H.5), empty list elements skipped (RFC 9110
+// §5.6.1), and false where that first value isn't an entity tag (one
+// unquoted, say): it names no revision, so the condition is false, not
+// absent (RFC 9110 §13.1.1), and the request is refused (badMatch)
+// rather than done without one.
+func matchTag(im string) (string, bool) {
+	for _, v := range strings.Split(im, ",") {
+		if v = strings.TrimSpace(v); v != "" {
+			rev := revOfETag(v)
+			return rev, rev != ""
+		}
+	}
+	return "", false
+}
+
+// badMatch answers a PUT, DELETE or MOVE whose If-Match names no
+// revision (matchTag): 412, nothing done.
+func badMatch(w http.ResponseWriter, im string) {
+	http.Error(w, fmt.Sprintf("If-Match %q isn't an entity tag (a quoted revision, as ETag gives it, RFC 9110 §8.8.3): it names no revision, so the condition is false (RFC 9110 §13.1.1); nothing was done", im), http.StatusPreconditionFailed)
 }
 
 // revOfETag is the revision an entity tag names: this server's tags are
