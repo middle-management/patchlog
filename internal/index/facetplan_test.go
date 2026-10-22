@@ -333,16 +333,20 @@ func randomIndex(t *testing.T, r *rand.Rand, noFTS bool) *Index {
 			}
 			if r.IntN(10) < 8 {
 				f := float64(r.IntN(10)) / 2
-				p.rows.sort = append(p.rows.sort, sortRow{"/s", f, string(jsonv.Canonical(f))})
+				p.rows.sort = append(p.rows.sort, sortRow{"/s", f, string(jsonv.Canonical([]any{f}))})
 			}
 			for _, path := range []string{"/t", "/u"} {
 				if r.IntN(10) < 6 {
 					var v any = sortStrings[r.IntN(len(sortStrings))]
-					if path == "/u" && r.IntN(2) == 0 {
-						v = float64(r.IntN(5))
+					if path == "/u" {
+						switch r.IntN(4) {
+						case 0, 1:
+							v = float64(r.IntN(5))
+						case 2:
+							v = r.IntN(2) == 0
+						}
 					}
-					sv, _ := sortValue(v)
-					p.rows.sort = append(p.rows.sort, sortRow{path, sv, string(jsonv.Canonical(v))})
+					p.rows.sort = append(p.rows.sort, sortRow{path, sortColumn(v), string(jsonv.Canonical([]any{v}))})
 				}
 			}
 			for k := range r.IntN(3) {

@@ -310,11 +310,13 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 
 	// Plain listing: typed and untyped documents, by name.
 	s.expect("/matches", "cup", "derby", "final", "notes")
-	// Text: fields through $ref (player names), object leaves under a text annotation.
+	// Text: fields through $ref (player names). An object marked text
+	// indexes nothing (v0.73, §A.2: only strings, numbers and booleans are
+	// collected), so notes' leaves aren't searchable.
 	s.expect("/matches?q=derby", "derby") // the untyped "notes" is not searchable
 	s.expect("/matches?q=larsson", "cup", "derby")
 	s.expect("/matches?q=larsson+henrik", "derby")
-	s.expect("/matches?q=red+card", "derby")
+	s.expect("/matches?q=red+card")
 	s.expect("/matches?q=lars*", "cup", "derby")
 	s.expect("/matches?q=nothing-matches-this")
 	// Facets: arrays expand, values through $defs/$ref, non-strings as JSON.
@@ -323,13 +325,15 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 	s.expect("/matches?facet[/tags]=local&facet[/status]=planned", "final")
 	s.expect("/matches?facet[/players/id]=p3", "cup")
 	s.expect("/matches?facet[/live]=true", "cup")
-	// Sort and ranges (numbers typed; RFC 3339 normalised to UTC).
+	// Sort and ranges (numbers typed; strings as UTF-8 bytes, without
+	// date-time normalisation since v0.73, §A.2).
 	s.expect("/matches?sort=-/attendance", "final", "derby", "cup", "notes")
 	s.expect("/matches?sort=/kickoff&facet[/status]=planned", "final", "cup")
 	s.expect("/matches?sort=/kickoff", "derby", "final", "cup", "notes")
 	s.expect("/matches?gt[/attendance]=9000", "derby", "final")
 	s.expect("/matches?ge[/attendance]=9000&lt[/attendance]=42000", "cup")
-	s.expect("/matches?ge[/kickoff]=2026-10-05T11:30:00%2B02:00&sort=/kickoff", "final", "cup")
+	s.expect("/matches?ge[/kickoff]=2026-10-05T11:30:00%2B02:00&sort=/kickoff", "cup")
+	s.expect("/matches?ge[/kickoff]=2026-10-05T09&sort=/kickoff", "final", "cup")
 	s.expect("/matches?lt[/kickoff]=2026-10-05T00:00:00Z", "derby")
 	// Schema: exact revision or all revisions (prefix).
 	s.expect("/matches?schema="+w.match, "cup", "derby")

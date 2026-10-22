@@ -28,11 +28,13 @@ import (
 //	                    %23entry) only those naming that entry
 //	facet[/path]=v      exact match on an x-index "facet" field; repeated values of one
 //	                    path are ORed, different paths ANDed
-//	gt|ge|lt|le[/path]=v range filter on an x-index "sort" field: a number compares with
-//	                    numbers, anything else with strings (RFC 3339 date-times normalised)
+//	gt|ge|lt|le[/path]=v range filter (an extension) on an x-index "sort" field, on each
+//	                    document's least value: a number compares with numbers, anything
+//	                    else with strings, as UTF-8 bytes
 //	sort=/a,-/b         order by "sort" fields, keys comma-separated, - for descending
-//	                    (once, §A.5; missing values last); default: score (with q),
-//	                    then resource name
+//	                    (once, §A.5): each document by its least value at the path, numbers
+//	                    before strings before booleans, missing values last in either
+//	                    direction (§A.2); default: score (with q), then resource name
 //	counts=/path        facet counts over all hits (repeatable)
 //	fields=/a,/b        also show those indexed fields in hits, "text" ones included; a path
 //	                    no schema of the namespace's documents marks with x-index is 400,
@@ -202,11 +204,11 @@ func ParseQuery(v url.Values) (*Query, error) {
 				q.Facets[path] = append(q.Facets[path], vals...)
 			case rangeOps[name] != "":
 				for _, s := range vals {
+					// Strings compare as stored: as UTF-8 bytes, with
+					// no date-time normalisation (§A.2).
 					rf := rangeFilter{op: rangeOps[name], path: path}
 					if f, err := strconv.ParseFloat(s, 64); err == nil {
 						rf.num, rf.f = true, f
-					} else if t, ok := normTime(s); ok {
-						rf.s = t
 					} else {
 						rf.s = s
 					}
@@ -377,7 +379,7 @@ func (q *Query) filters() []filter {
 		fs = append(fs, f)
 	}
 	// The ranges on one path are one filter: a document has one sort value
-	// per path, and on the query index they bound one range.
+	// per path, its least, and on the query index they bound one range.
 	for i := 0; i < len(q.Ranges); {
 		f := filter{table: `"sort"`, a: "r", idx: "sort_q", pk: "sqlite_autoindex_sort_1", args: []any{q.Ranges[i].path}}
 		cond := `r.path = ?`
@@ -675,8 +677,9 @@ func (e *FieldError) Error() string {
 	return "fields: " + e.Path + " is not a field any schema indexed in the namespace marks with x-index"
 }
 
-// attachSorts gives each hit its sort values as written, for the paths
-// that have no facet value (a field that is both shows its facet values).
+// attachSorts gives each hit its sort values as written, every value at the
+// path (§A.4), for the paths that have no facet value (a field that is both
+// shows its facet values).
 func (ix *Index) attachSorts(ctx context.Context, tx *sql.Tx, ns string, hits []Hit) error {
 	if len(hits) == 0 {
 		return nil
@@ -708,10 +711,14 @@ func (ix *Index) attachSorts(ctx context.Context, tx *sql.Tx, ns string, hits []
 		if err != nil {
 			return err
 		}
+		vs, ok := v.([]any)
+		if !ok {
+			vs = []any{v}
+		}
 		if h.Sorts == nil {
 			h.Sorts = map[string][]any{}
 		}
-		h.Sorts[p] = []any{v}
+		h.Sorts[p] = vs
 	}
 	return rows.Err()
 }

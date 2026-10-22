@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -15,6 +16,32 @@ import (
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/seal"
 )
+
+// v073World is a public namespace "items" whose documents use one schema
+// revision of "schemas", marked as props says.
+type v073World struct {
+	c   *client.Client
+	s   *clienttest.Server
+	sch string // the schema's revision path
+}
+
+func v073Setup(t *testing.T, props map[string]any) *v073World {
+	t.Helper()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{LongPoll: 150 * time.Millisecond})
+	c := s.Client(t, client.WithAuthor("admin"))
+	must(c.CreateNamespace(ctx, "schemas", map[string]any{"read": "public"}))
+	must(c.CreateNamespace(ctx, "items", map[string]any{"read": "public"}))
+	props["$schema"] = map[string]any{"type": "string"}
+	sch := must(c.CreateDoc(ctx, "schemas", "item", map[string]any{"$schema": d2020, "type": "object", "properties": props}))
+	return &v073World{c: c, s: s, sch: "/r/schemas/item/rev/" + sch.ID}
+}
+
+func (w *v073World) doc(t *testing.T, name string, fields map[string]any) {
+	t.Helper()
+	fields["$schema"] = w.sch
+	must(w.c.CreateDoc(context.Background(), "items", name, fields))
+}
 
 // answerOf follows redirects and returns the last answer.
 func (s *svc) answerOf(path, token string) resp {
@@ -146,4 +173,85 @@ func TestV073KeysLacking(t *testing.T) {
 	if f := x.fetch("/sec?q=secret", bob); f.header.Get("Content-Type") != seal.ContentType {
 		t.Errorf("sealed, keys fetched: %v", f.header)
 	}
+}
+
+// TestV073SortOrder (IX-6, §A.2): a document sorts by its least value at
+// the path in either direction, numbers before strings before booleans,
+// numbers by value, strings by UTF-8 bytes with no date-time normalisation,
+// false before true, and documents without one last in either direction.
+// Hits carry every value as "<path>": [values].
+func TestV073SortOrder(t *testing.T) {
+	t.Parallel()
+	w := v073Setup(t, map[string]any{"rank": map[string]any{"x-index": "sort"}})
+	for name, v := range map[string]any{
+		"a": 5, "b": []any{9, 1}, "c": "s", "d": true, "e": false, "g": "2026-10-04T18:00:00+02:00", "h": "2026-10-04T17:00:00Z",
+		"i": []any{"x", 3}, "j": []any{true, "t"},
+	} {
+		w.doc(t, name, map[string]any{"rank": v})
+	}
+	w.doc(t, "f", map[string]any{})
+	x := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"items"}})
+	x.caughtUp("items")
+	x.expect("/items?sort=/rank", "b", "i", "a", "h", "g", "c", "j", "e", "d", "f")
+	b := x.expect("/items?sort=-/rank", "d", "e", "j", "c", "g", "h", "a", "i", "b", "f")
+	got := map[string]string{}
+	for _, h := range b["hits"].([]any) {
+		m := h.(map[string]any)
+		got[m["resource"].(string)] = fmt.Sprint(m["/rank"])
+	}
+	if got["b"] != "[9 1]" || got["d"] != "[true]" || got["j"] != "[true t]" || got["f"] != "<nil>" {
+		t.Errorf("hit values %v", got)
+	}
+}
+
+// TestV073UnavailableSchema (IX-22, §A.1): a document whose pinned schema
+// revision answers 403, or can't be opened for want of keys, is indexed
+// exactly as one without $schema: a docs row only if untyped documents
+// are listed, no match for schema=, and its schema counts for no path; the
+// follower doesn't stall.
+func TestV073UnavailableSchema(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	admin := clienttest.NewKey("admin")
+	keys := []any{admin.Entry("*")}
+	for ns, doc := range map[string]map[string]any{
+		"priv":    {"read": "grant", "keys": keys},
+		"sealed":  {"read": "public", "keys": keys, "encryption": map[string]any{"level": "sealed"}},
+		"schemas": {"read": "public", "keys": keys},
+		"items":   {"read": "public", "keys": keys},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	all := []string{"read", "create"}
+	w := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:w", []string{"priv", "sealed", "schemas", "items"}, all)), client.WithKeys(client.NewKeys(nil)))
+	mk := func(ns string) string {
+		sch := map[string]any{"$schema": d2020, "type": "object", "properties": map[string]any{"v": map[string]any{"type": "string", "x-index": "facet"}}}
+		if ns == "sealed" {
+			return "/r/sealed/s/rev/" + must(createNonced(w, ns, "s", sch)).ID
+		}
+		return "/r/" + ns + "/s/rev/" + must(w.CreateDoc(ctx, ns, "s", sch)).ID
+	}
+	open, forbidden, keyless := mk("schemas"), mk("priv"), mk("sealed")
+	for name, sch := range map[string]string{"open": open, "forbidden": forbidden, "keyless": keyless} {
+		must(w.CreateDoc(ctx, "items", name, map[string]any{"$schema": sch, "v": "x"}))
+	}
+	// The indexer reads items and schemas, not priv, and holds no keys.
+	indexer := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"items", "schemas", "sealed"}, []string{"read"})))
+	x := startSvc(t, indexer, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"items"}, now: s.Now})
+	x.caughtUp("items")
+	x.expect("/items", "open")
+	x.expect("/items?facet[/v]=x", "open")
+	x.expect("/items?schema=" + url.QueryEscape(forbidden))
+	x.expect("/items?schema=/r/priv/s")
+	x.expect("/items?schema=" + url.QueryEscape(keyless))
+	y := startSvc(t, indexer, svcOpts{db: filepath.Join(t.TempDir(), "u.db"), ns: []string{"items"}, untyped: true, now: s.Now})
+	y.caughtUp("items")
+	b := y.expect("/items", "forbidden", "keyless", "open")
+	for _, h := range b["hits"].([]any) {
+		if m := h.(map[string]any); m["resource"] != "open" && m["schema"] != nil {
+			t.Errorf("an untyped hit with a schema: %v", m)
+		}
+	}
+	y.expect("/items?schema=/r/sealed/s")
 }
