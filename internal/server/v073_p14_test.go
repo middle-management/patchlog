@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"crypto/ed25519"
 	"testing"
 	"time"
 
@@ -347,4 +348,31 @@ func TestV073RemoteE2ENameInChain(t *testing.T) {
 	// Below E3 the name is free (§G.5.2 binds e2e sources only).
 	a.mkNS("plain", map[string]any{"read": "public"})
 	expect(t, b.mkRemote("plain", remoteGenesis("plain", a.nsHead("plain"), nil)), 201)
+}
+
+// The operator grant that creates a remote branch is checked for config,
+// which covers the schema namespaces it creates and mirrors into: without
+// it, 403 and nothing is written (§C.2, §C.4).
+func TestV073RemoteOperatorConfig(t *testing.T) {
+	t.Parallel()
+	var bPriv ed25519.PrivateKey
+	a := newEnv(t, withOrigin(originA))
+	f := populateA(t, a)
+	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(&route{url: a.srv.URL}))
+	b.opPriv = bPriv
+	opGrant := func(can ...string) string {
+		return mint(t, bPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"rel"}, "can": strs(can),
+			"exp": b.clock.Now().Add(time.Hour).Format(time.RFC3339)})
+	}
+	genesis := remoteGenesis("main", f.at, map[string]any{"read": "grant"})
+	for _, can := range [][]string{{"read"}, {"purge", "purge-ns"}} {
+		r := b.do(req{method: "PATCH", path: "/ns/rel", ifNoneMatch: "*", body: genesis, bearer: opGrant(can...)})
+		expectCode(t, r, 403, "forbidden")
+		// To an operator grant, /principal of a missing namespace is 404 (§7.4).
+		expect(t, b.get("/ns/rel/principal", b.operatorGrant("rel")), 404)
+		expect(t, b.get("/ns/schemas/principal", b.operatorGrant("schemas")), 404)
+	}
+	r := b.do(req{method: "PATCH", path: "/ns/rel", ifNoneMatch: "*", body: genesis, bearer: opGrant("config")})
+	expect(t, r, 201)
+	expect(t, b.get("/ns/schemas/principal", b.operatorGrant("schemas")), 200)
 }

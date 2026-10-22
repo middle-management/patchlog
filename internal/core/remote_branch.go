@@ -982,8 +982,8 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 
 // --- creating a remote branch ----------------------------------------------
 
-// checkRemoteGenesis authenticates the operator grant and checks the
-// genesis of a remote branch (§C.4, §G.3).
+// checkRemoteGenesis authenticates the operator grant, checks it for
+// config, and checks the genesis of a remote branch (§C.4, §G.3).
 func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[string]any, *actor, *Error) {
 	if !ValidNSName(req.NS) {
 		return nil, nil, nil, badInput("invalid namespace name")
@@ -998,6 +998,12 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	}
 	if a.verified != nil && !a.star {
 		return nil, nil, nil, forbidden("creating a remote branch needs a deployment operator key")
+	}
+	// The operator grant is checked for config, which covers the schema
+	// histories the creation mirrors and the namespaces it creates for
+	// them (§C.2, §C.4).
+	if aerr := t.authorize(a, "config", ""); aerr != nil {
+		return nil, nil, nil, aerr
 	}
 	ops, err := patch.Parse(cc.Patches)
 	if err != nil {
