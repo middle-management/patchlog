@@ -27,14 +27,16 @@ func p15Items(t *testing.T, r *resp) map[int]map[string]any {
 	return out
 }
 
-// p15Item checks a batch failure's item: its status and code.
+// p15Item checks a batch failure's or dry run's item: its status and
+// code ("" for none).
 func p15Item(t *testing.T, r *resp, index, status int, code string) map[string]any {
 	t.Helper()
 	it, ok := p15Items(t, r)[index]
 	if !ok {
 		t.Fatalf("item %d not reported: %s", index, r.Body)
 	}
-	if st, _ := it["status"].(float64); int(st) != status || it["code"] != code {
+	got, _ := it["code"].(string)
+	if st, _ := it["status"].(float64); int(st) != status || got != code {
 		t.Fatalf("item %d: %v %v, want %d %s: %s", index, it["status"], it["code"], status, code, r.Body)
 	}
 	return it
@@ -499,6 +501,199 @@ func TestV073P15ArchiveGenesisOnNull(t *testing.T) {
 		expect(t, d, 200)
 		if d.Obj()["n"] != float64(i) {
 			t.Fatalf("restored rev %d: %s", i, d.Body)
+		}
+	}
+}
+
+// §7.5 (GB-24): a batch's 201, and its retry's 200, carry the new config
+// id as the body's config and X-Config-Revision when the batch has a
+// config change; a batch without one carries neither.
+func TestV073P15BatchConfigRevision(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	cfg := e.configID("m")
+	patches := ops(op("add", "/x-note", "n"))
+	body := map[string]any{
+		"items":  []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}},
+		"config": map[string]any{"ifMatch": cfg, "patches": patches},
+	}
+	want := hashID(t, cfg, canonical(patches))
+	for _, status := range []int{201, 200} {
+		r := e.batchReq("m", body, "alice")
+		expect(t, r, status)
+		if r.Str("config") != want || r.H.Get("X-Config-Revision") != want || r.H.Get("X-Namespace-Revision") != r.Str("ns_id") {
+			t.Fatalf("%d: %s %v", status, r.Body, r.H)
+		}
+	}
+	// Only a config change.
+	cfg2 := e.configID("m")
+	r := e.batchReq("m", map[string]any{"config": map[string]any{"ifMatch": cfg2, "patches": ops(op("add", "/x-other", "o"))}}, "alice")
+	expect(t, r, 201)
+	if r.H.Get("X-Config-Revision") == "" || r.H.Get("X-Config-Revision") != r.Str("config") {
+		t.Fatalf("config-only batch: %s %v", r.Body, r.H)
+	}
+	// None.
+	r = e.batchReq("m", map[string]any{"items": []any{map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}, "alice")
+	expect(t, r, 201)
+	if _, has := r.H["X-Config-Revision"]; has || r.Obj()["config"] != nil {
+		t.Fatalf("batch without a config change: %s %v", r.Body, r.H)
+	}
+}
+
+// §7.2, §7.5 (GB-25): a dry run answers 200 { items, config? }: an item
+// that would pass at 201, and every item at 200 with its ids where a
+// submit would be answered as an idempotent retry, its config change at
+// 200 with its id. A dry run names no entry: no ns_id, and none of the
+// revision headers.
+func TestV073P15DryRunShape(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	cfg := e.configID("m")
+	genesis := addRoot(map[string]any{})
+	body := map[string]any{
+		"items":  []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{genesis}}},
+		"config": map[string]any{"ifMatch": cfg, "patches": ops(op("add", "/x-note", "n"))},
+	}
+	dry := func(body map[string]any) *resp {
+		t.Helper()
+		r := e.do(req{method: "POST", path: "/ns/m/batch?dry-run=1", body: body, author: "alice"})
+		expect(t, r, 200)
+		for _, h := range []string{"X-Namespace-Revision", "X-Config-Revision"} {
+			if _, has := r.H[h]; has {
+				t.Fatalf("a dry run carries %s: %v", h, r.H)
+			}
+		}
+		if _, has := r.Obj()["ns_id"]; has {
+			t.Fatalf("a dry run carries ns_id: %s", r.Body)
+		}
+		return r
+	}
+	gid := hashID(t, "", canonical(genesis))
+	cid := hashID(t, cfg, canonical(ops(op("add", "/x-note", "n"))))
+	r := dry(body)
+	it := r.Obj()["items"].([]any)[0].(map[string]any)
+	if it["status"] != 201.0 || it["index"] != 0.0 || it["ids"].([]any)[0] != gid {
+		t.Fatalf("passing item: %s", r.Body)
+	}
+	if c, _ := r.Obj()["config"].(map[string]any); c["status"] != 201.0 || c["config"] != cid {
+		t.Fatalf("config report: %s", r.Body)
+	}
+
+	// Once applied, a dry run reports the retry a submit would answer.
+	expect(t, e.batchReq("m", body, "alice"), 201)
+	r = dry(body)
+	it = r.Obj()["items"].([]any)[0].(map[string]any)
+	if it["status"] != 200.0 || it["index"] != 0.0 || it["resource"] != "a" || it["ids"].([]any)[0] != gid {
+		t.Fatalf("retried item: %s", r.Body)
+	}
+	if c, _ := r.Obj()["config"].(map[string]any); c["status"] != 200.0 || c["config"] != cid {
+		t.Fatalf("retried config: %s", r.Body)
+	}
+	// Without a config change too; another author's is no retry.
+	items := map[string]any{"items": []any{map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{genesis}}}}
+	expect(t, e.batchReq("m", items, "alice"), 201)
+	r = dry(items)
+	if it := r.Obj()["items"].([]any)[0].(map[string]any); it["status"] != 200.0 || it["ids"].([]any)[0] != gid {
+		t.Fatalf("retried item: %s", r.Body)
+	}
+	if _, has := r.Obj()["config"]; has {
+		t.Fatalf("a dry run without a config change reports one: %s", r.Body)
+	}
+	r = e.do(req{method: "POST", path: "/ns/m/batch?dry-run=1", body: items, author: "bob"})
+	expect(t, r, 200)
+	p15Item(t, r, 0, 412, "stale")
+}
+
+// §7.5 (GB-26): a dry run runs steps 1-6 for its config change and reports
+// it as config: on success { status: 201, config } and the items judged
+// against what it produces; failing after its step 1, its failure, and the
+// items judged against the current configuration; failing step 1, the
+// dry run answers as that config write would.
+func TestV073P15DryRunConfigReport(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	star, k := newKey("admin"), newKey("k")
+	noTitle := map[string]any{
+		"if":   []any{map[string]any{"op": "test", "path": "/action", "value": "config"}},
+		"then": []any{map[string]any{"not": map[string]any{"op": "writes", "overlaps": "/x-title"}}},
+	}
+	e.mkNS("m", map[string]any{"read": "public", "rules": []any{noTitle},
+		"keys": []any{star.entry("*"), k.entry("config", "create", "append", "delete", "restore")}})
+	admin := e.grant(star, "admin", []string{"m"}, []string{"config", "create", "append"})
+	alice := e.grant(k, "alice", []string{"m"}, []string{"config", "create", "append"})
+	bob := e.grant(k, "bob", []string{"m"}, []string{"create", "append"})
+	cfg := e.configID("m")
+	twoOps := []any{map[string]any{"resource": "z", "ifNoneMatch": "*", "steps": []any{ops(op("add", "", map[string]any{}), op("add", "/x", 1.0))}}}
+	limit := ops(op("add", "/limits", map[string]any{"opsPerSet": 1}))
+	dry := func(ifMatch string, patches []any, who string) *resp {
+		t.Helper()
+		return e.do(req{method: "POST", path: "/ns/m/batch?dry-run=1", bearer: who, body: map[string]any{
+			"items": twoOps, "config": map[string]any{"ifMatch": ifMatch, "patches": patches}}})
+	}
+	report := func(r *resp, status int, code string) map[string]any {
+		t.Helper()
+		expect(t, r, 200)
+		c, _ := r.Obj()["config"].(map[string]any)
+		if c["status"] != float64(status) || (code != "" && c["code"] != code) {
+			t.Fatalf("config report: %s, want %d %s", r.Body, status, code)
+		}
+		return c
+	}
+
+	// Success: the id a submit would produce; the item meets the limit the
+	// change sets.
+	r := dry(cfg, limit, admin)
+	if report(r, 201, "")["config"] != hashID(t, cfg, canonical(limit)) {
+		t.Fatalf("config id: %s", r.Body)
+	}
+	p15Item(t, r, 0, 422, "limit")
+	if e.configID("m") != cfg {
+		t.Fatal("a dry run wrote its config change")
+	}
+	// Stale: reported, and the item judged against the current document.
+	r = dry(hashID(t, "", []byte("x")), limit, admin)
+	if report(r, 412, "stale")["config"] != cfg {
+		t.Fatalf("stale report: %s", r.Body)
+	}
+	p15Item(t, r, 0, 201, "")
+	// The *-key guard at step 6 is after step 1: reported too.
+	r = dry(cfg, limit, alice)
+	report(r, 403, "forbidden")
+	p15Item(t, r, 0, 201, "")
+	// A namespace rule.
+	r = dry(cfg, ops(op("add", "/x-title", "T")), alice)
+	report(r, 422, "rule")
+	p15Item(t, r, 0, 201, "")
+	// Step 1: answered as the config write.
+	r = dry(cfg, ops(op("add", "/x-note", "n")), bob)
+	expectCode(t, r, 403, "forbidden")
+	if _, has := r.Obj()["items"]; has {
+		t.Fatalf("a step-1 refusal of the config change reports items: %s", r.Body)
+	}
+}
+
+// §7.5, §8.4, §8.5 (GB-31): a dry run in a purged or a frozen namespace is
+// answered as a submit would be, without items.
+func TestV073P15DryRunPurgedFrozen(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("p", map[string]any{"read": "public"})
+	e.mkNS("f", map[string]any{"read": "public"})
+	item := map[string]any{"items": []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}
+	head := e.nsPurge("p")
+	r := e.do(req{method: "POST", path: "/ns/p/batch?dry-run=1", body: item, author: "alice"})
+	expectPurged(t, r, head)
+	expect(t, e.patchNS("f", ops(op("add", "/frozen", true), op("add", "/successor", "p")), ""), 201)
+	r = e.do(req{method: "POST", path: "/ns/f/batch?dry-run=1", body: item, author: "alice"})
+	expectCode(t, r, 409, "frozen")
+	if r.Str("successor") != "p" {
+		t.Fatalf("frozen: %s", r.Body)
+	}
+	for _, r := range []*resp{r, e.do(req{method: "POST", path: "/ns/p/batch?dry-run=1", body: item, author: "alice"})} {
+		if _, has := r.Obj()["items"]; has {
+			t.Fatalf("answered with items: %s", r.Body)
 		}
 	}
 }

@@ -93,10 +93,17 @@ type WriteResult struct {
 	Entry    *LogEntry // single writes: the resulting entry
 	Replayed bool
 	ConfigID string
+	// ConfigReport is a dry run's report of its config change (§7.5):
+	// { status: 201, config } with the id a submit would produce,
+	// { status: 200, config } for an idempotent retry, or a failure after
+	// the change's step 1 as { status, code, … }. Nil without one.
+	ConfigReport map[string]any
 }
 
 // ItemResult lists the ids an item produced. In a dry-run report it also
-// carries the item's index and status, and a failed item's error body.
+// carries the item's index and status (201 for one that would pass, 200
+// in a batch a submit would answer as a retry), and a failed item's error
+// body.
 type ItemResult struct {
 	Resource string         `json:"resource"`
 	IDs      []string       `json:"ids,omitempty"`
@@ -143,6 +150,34 @@ func dropFailed(st []*itemState, fs []itemErr, fails map[int]*Error) []*itemStat
 	return out
 }
 
+// retryReport is a dry run's report of a batch a submit would answer as
+// an idempotent retry (§7.5): every item at status 200 with its ids, and
+// the config change at 200 with its id. No namespace entry is named.
+func retryReport(items []Item, r *WriteResult) *WriteResult {
+	out := &WriteResult{Status: 200, Replayed: true, Items: make([]ItemResult, len(items))}
+	for i, it := range items {
+		idx := i
+		out.Items[i] = ItemResult{Resource: it.Resource, Index: &idx, Status: 200}
+		if i < len(r.Items) {
+			out.Items[i].IDs = r.Items[i].IDs
+		}
+	}
+	if r.ConfigID != "" {
+		out.ConfigReport = map[string]any{"status": 200, "config": r.ConfigID}
+	}
+	return out
+}
+
+// reportOf is a failure as a dry run reports it (§7.5): its error body
+// with its status.
+func reportOf(e *Error) map[string]any {
+	m := map[string]any{"status": e.Status}
+	for k, v := range e.Body {
+		m[k] = v
+	}
+	return m
+}
+
 // dryRunReport is a dry run's report (§7.5). An item whose only failure
 // is a blob that isn't available reports that failure with the ids a
 // submit would produce once the blob is; one that also fails a later step
@@ -168,7 +203,7 @@ func dryRunReport(items []Item, passed []*itemState, fails, blobFails map[int]*E
 				r.Err = body
 			}
 		} else if s := byIndex[i]; s != nil {
-			r.Status = 200
+			r.Status = 201
 			if berr != nil {
 				r.Status, r.Err = berr.Status, berr.Body
 			}
@@ -529,7 +564,20 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 
 	cfg := cur
 	var cplan *configPlan
+	// A dry run reports its config change as config (§7.5): the id a
+	// submit would produce, or a failure after the change's step 1, which
+	// leaves the items judged against the current configuration.
+	var cfgReport map[string]any
+	cfgFailed := false
+	drawn := rateDrawn
 	if cc != nil {
+		if dryRun {
+			// A failure of the change's step 1 answers the dry run as
+			// that config write would.
+			if err := t.authorize(a, "config", ""); err != nil {
+				return nil, nil, err
+			}
+		}
 		p, err := t.planConfig(n, cur, a, cc, true)
 		if err != nil {
 			// A retried batch finds its config precondition stale: look
@@ -559,6 +607,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 					if err := t.rateLimit(n, cur, a, names, cost); err != nil {
 						return nil, nil, err
 					}
+					drawn = true
 					if t.rateDrawn != nil {
 						*t.rateDrawn = true
 					}
@@ -567,22 +616,35 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 						// It is that batch, but the lookup doesn't apply
 						// to a purged resource (§6.2 step 2, §7.2): 410
 						// for its items, not a 412 that would invite the
-						// client to apply its config change again.
-						if pf := t.purgedItems(n, st); len(pf) > 0 {
+						// client to apply its config change again. A dry
+						// run reports them, and the change's 412.
+						pf := t.purgedItems(n, st)
+						switch {
+						case len(pf) == 0 && dryRun:
+							return nil, retryReport(items, r), nil
+						case len(pf) == 0:
+							return nil, r, nil
+						case !dryRun:
 							return nil, nil, fail(pf)
 						}
-						return nil, r, nil
 					}
 				}
 			}
-			return nil, nil, err
-		}
-		cplan = p
-		cfg = p.cfg
-		if len(items) > 0 {
-			a, aerr = t.authenticate(n.name, n, cfg, req.Cred, nil)
-			if aerr != nil {
-				return nil, nil, aerr
+			if !dryRun || ae == nil {
+				return nil, nil, err
+			}
+			cfgReport, cfgFailed = reportOf(ae), true
+		} else {
+			cplan = p
+			cfg = p.cfg
+			if len(items) > 0 {
+				a, aerr = t.authenticate(n.name, n, cfg, req.Cred, nil)
+				if aerr != nil {
+					return nil, nil, aerr
+				}
+			}
+			if dryRun {
+				cfgReport = map[string]any{"status": 201, "config": p.id.String()}
 			}
 		}
 	}
@@ -594,9 +656,11 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	// A batch costs a token per item, and one for its config change unless
 	// that is exempt (§6.6), so only a batch with no items and an exempt
-	// change costs nothing.
+	// change costs nothing. A dry run's change that failed after its step
+	// 1 passed it: it costs a token unless a * key made it, as for the
+	// retry lookup above.
 	cost := len(items)
-	if cplan != nil && !cplan.exempt {
+	if cplan != nil && !cplan.exempt || cfgFailed && !a.star {
 		cost++
 	}
 	if len(items) > 0 {
@@ -611,7 +675,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		for _, it := range items {
 			names = append(names, it.Resource)
 		}
-		if !rateDrawn && (t.rateDrawn == nil || !*t.rateDrawn) {
+		if !drawn && (t.rateDrawn == nil || !*t.rateDrawn) {
 			if err := t.rateLimit(n, cfg, a, names, cost); err != nil {
 				return nil, nil, err
 			}
@@ -637,8 +701,16 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		}
 		st = dropFailed(st, pf, dryFails)
 	}
-	if r := t.replay(n, a, st, cplan, isBatch); r != nil {
-		return nil, r, nil
+	// A dry run looks for the batch a submit would be answered with only
+	// while every item is still checked, and never without the config
+	// change it carries, whose failure the lookup above answered.
+	if !cfgFailed && (!dryRun || len(dryFails) == 0) {
+		if r := t.replay(n, a, st, cplan, isBatch); r != nil {
+			if dryRun {
+				return nil, retryReport(items, r), nil
+			}
+			return nil, r, nil
+		}
 	}
 	// Settling the verb completes authorisation: a 403 here is reported
 	// like one of step 1, and a dry run answers it as a submit would
@@ -844,9 +916,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	if dryRun {
 		// A dry run reports every item (§7.5): its ids, or the error of the
-		// step it failed at.
+		// step it failed at, and its config change.
 		result.Status = 200
 		result.Items = dryRunReport(items, st, dryFails, blobFails)
+		result.ConfigReport = cfgReport
 		return nil, result, nil
 	}
 

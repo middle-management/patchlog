@@ -517,8 +517,10 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 	var failures []string
 	allDeferrable, onlyBlobs, allBlob := true, true, true
 	for i, it := range res.Items {
+		// 201 for an item that would pass, 200 for each item of a batch a
+		// submit would answer as a retry (§7.5); 200 alone before v0.67.
 		st, _ := it.Raw["status"].(float64)
-		if st != 200 {
+		if st != 201 && st != 200 {
 			code, _ := it.Raw["code"].(string)
 			msg, _ := it.Raw["message"].(string)
 			failures = append(failures, fmt.Sprintf("%s: %v %s %s", it.Resource, st, code, msg))

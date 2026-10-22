@@ -59,7 +59,7 @@ func TestV042SignatureOrder(t *testing.T) {
 	}}})
 	expect(t, r, 200)
 	items := r.Obj()["items"].([]any)
-	if d, ok := items[0].(map[string]any); !ok || d["status"] != 422.0 || d["code"] != "signature" || items[1].(map[string]any)["status"] != 200.0 {
+	if d, ok := items[0].(map[string]any); !ok || d["status"] != 422.0 || d["code"] != "signature" || items[1].(map[string]any)["status"] != 201.0 {
 		t.Fatalf("dry run %s", r.Body)
 	}
 
