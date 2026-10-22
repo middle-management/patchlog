@@ -1038,10 +1038,17 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 type PruneRequest struct {
 	Horizon string
 	Keep    []string
+	// KeepSent reports that the request sent keep, so that keep: []
+	// (clear the keep set) is told from no keep (leave it) (§8.6, §6.4.1).
+	KeepSent bool
 	// Snapshot is the horizon's document sealed by a key-holding client
 	// (seal.SealSnapshot), required for e2e resources and refused
 	// elsewhere (§8.6).
 	Snapshot string
+	// Precondition reports that the request sent If-Match or
+	// If-None-Match, which a prune doesn't take: 428 at step 2.5 (§7.2,
+	// §8.6). Both together are the server's 400.
+	Precondition bool
 }
 
 // PruneResult is the answer to a prune.

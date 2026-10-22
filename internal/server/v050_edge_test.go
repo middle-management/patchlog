@@ -76,10 +76,10 @@ func TestV050EdgeGrantsBodyShape(t *testing.T) {
 		{"empty token", req{body: map[string]any{"grants": []any{""}}}, 401, "unauthenticated"},
 		{"no body, no Authorization", req{}, 401, "unauthenticated"},
 		// A cross-site form posts text/plain without a preflight.
-		{"text/plain", req{body: map[string]any{"grants": []any{reader}}, ct: "text/plain"}, 415, "bad_input"},
-		{"form", req{raw: `{"grants":["` + reader + `"]}`, ct: "application/x-www-form-urlencoded"}, 415, "bad_input"},
-		{"text/plain form shape", req{raw: `{"grants":["` + reader + `"]}` + "\r\n", ct: "text/plain", hdr: map[string]string{"Origin": "https://evil.example"}}, 415, "bad_input"},
-		{"no Content-Type", req{raw: `{"grants":["` + reader + `"]}`, ct: " "}, 415, "bad_input"},
+		{"text/plain", req{body: map[string]any{"grants": []any{reader}}, ct: "text/plain"}, 415, "unsupported_type"},
+		{"form", req{raw: `{"grants":["` + reader + `"]}`, ct: "application/x-www-form-urlencoded"}, 415, "unsupported_type"},
+		{"text/plain form shape", req{raw: `{"grants":["` + reader + `"]}` + "\r\n", ct: "text/plain", hdr: map[string]string{"Origin": "https://evil.example"}}, 415, "unsupported_type"},
+		{"no Content-Type", req{raw: `{"grants":["` + reader + `"]}`, ct: " "}, 415, "unsupported_type"},
 	} {
 		c.q.method, c.q.path = "POST", "/edge-grants"
 		r := e.do(c.q)

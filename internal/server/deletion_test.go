@@ -187,7 +187,7 @@ func TestPurgeNamespace(t *testing.T) {
 	// Writes are 410; the name stays reserved; no branches from it.
 	expect(t, e.write("PATCH", "old", "a", a, []any{}), 410)
 	expect(t, e.write("PATCH", "old", "z", "", addRoot(map[string]any{})), 410)
-	expect(t, e.do(req{method: "PATCH", path: "/ns/old", ifNoneMatch: "*", body: addRoot(map[string]any{})}), 412)
+	expect(t, e.do(req{method: "PATCH", path: "/ns/old", ifNoneMatch: "*", body: addRoot(map[string]any{}), author: "admin"}), 412)
 	expect(t, e.branch("old", map[string]any{"name": "oldc"}, "alice"), 410)
 	expect(t, nspurge("old"), 410)
 	// The listing reports the purged branch.

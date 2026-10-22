@@ -168,8 +168,10 @@ func TestV055LimitOversizedBodies(t *testing.T) {
 	bound := 4 * (64 << 10)
 	pad := strings.Repeat("x", 300<<10)
 	expectLimit(t, e.write("PATCH", "b", "r", "", addRoot(map[string]any{"a": pad})), 413, "documentSize", int64(bound+1), 64<<10)
-	expectLimit(t, e.patchNS("b", ops(op("add", "/x-a", pad)), ""), 413, "patchSetSize", int64(bound+1), 16<<10)
-	expectLimit(t, e.branch("b", map[string]any{"name": "b1", "at": at, "x-pad": pad}, "alice"), 413, "patchSetSize", int64(bound+1), 16<<10)
+	// Config writes and branch creations are cut off as a resource PATCH
+	// is, naming documentSize (§6.6, v0.73).
+	expectLimit(t, e.patchNS("b", ops(op("add", "/x-a", pad)), ""), 413, "documentSize", int64(bound+1), 64<<10)
+	expectLimit(t, e.branch("b", map[string]any{"name": "b1", "at": at, "x-pad": pad}, "alice"), 413, "documentSize", int64(bound+1), 64<<10)
 	batchBound := 2048 + 2048/4 + 512*10 + (64 << 10) + 64<<10
 	r := e.do(req{method: "POST", path: "/ns/b/batch", author: "alice", body: map[string]any{"items": []any{
 		map[string]any{"resource": "r", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"a": pad})}}}}})

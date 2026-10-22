@@ -31,7 +31,7 @@ func TestNamespace(t *testing.T) {
 	expect(t, e.get("/ns/docs/rev/"+hashID(t, "", []byte("x"))), 404)
 
 	// Creating an existing namespace: 412 {config}.
-	r = e.do(req{method: "PATCH", path: "/ns/docs", ifNoneMatch: "*", body: addRoot(map[string]any{})})
+	r = e.do(req{method: "PATCH", path: "/ns/docs", ifNoneMatch: "*", body: addRoot(map[string]any{}), author: "admin"})
 	expectCode(t, r, 412, "stale")
 	if r.Str("config") != cfg0 {
 		t.Fatalf("412 body %s", r.Body)
@@ -65,8 +65,8 @@ func TestNamespace(t *testing.T) {
 		t.Fatalf("412 %s", r.Body)
 	}
 	// 428 and 415.
-	expectCode(t, e.do(req{method: "PATCH", path: "/ns/docs", body: patches}), 428, "precondition_required")
-	expect(t, e.do(req{method: "PATCH", path: "/ns/docs", ct: "application/json", ifMatch: cfg1, body: patches}), 415)
+	expectCode(t, e.do(req{method: "PATCH", path: "/ns/docs", body: patches, author: "alice"}), 428, "precondition_required")
+	expect(t, e.do(req{method: "PATCH", path: "/ns/docs", ct: "application/json", ifMatch: cfg1, body: patches, author: "alice"}), 415)
 	// Validation against the built-in namespace-document schema.
 	expect(t, e.patchNS("docs", ops(op("replace", "/read", "everyone")), ""), 422)
 	expect(t, e.patchNS("docs", ops(op("add", "/rules", "nope")), ""), 422)

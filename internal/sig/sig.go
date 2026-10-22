@@ -55,9 +55,16 @@ type Signature struct {
 // String is the header form.
 func (s Signature) String() string { return s.Alg + ":" + s.Kid + ":" + b64.EncodeToString(s.Sig) }
 
-// Parse parses "<alg>:<kid>:<sig>". An algorithm other than Ed25519 parses
-// (it is stored unverified unless its kid is listed); the sig must be
-// unpadded base64url.
+// SigLen is the length of a signature's <sig>: 64 bytes in base64url
+// without padding (§C.3.1).
+const SigLen = 86
+
+// Parse parses a stored "<alg>:<kid>:<sig>", as a bundle verifier reads
+// it back: an algorithm other than Ed25519 parses (it is stored
+// unverified unless its kid is listed), and the sig is unpadded base64url
+// of any length, since a server at spec v0.55 stored an unlisted kid's
+// signature whatever its length (§C.3.1). Request input is parsed with
+// ParseInput.
 func Parse(h string) (Signature, error) {
 	parts := strings.Split(h, ":")
 	if len(parts) != 3 || parts[0] == "" || parts[1] == "" || parts[2] == "" {
@@ -68,6 +75,20 @@ func Parse(h string) (Signature, error) {
 		return Signature{}, errors.New("the sig of a signature must be base64url without padding")
 	}
 	return Signature{Alg: parts[0], Kid: parts[1], Sig: raw}, nil
+}
+
+// ParseInput parses a Signature header or step signature of a request
+// (§C.3.1): Parse's form with the sig exactly SigLen characters, whatever
+// the alg or kid. Anything else is a request-shape error.
+func ParseInput(h string) (Signature, error) {
+	s, err := Parse(h)
+	if err != nil {
+		return Signature{}, err
+	}
+	if p := h[strings.LastIndexByte(h, ':')+1:]; len(p) != SigLen {
+		return Signature{}, fmt.Errorf("the sig of a signature must be %d base64url characters without padding", SigLen)
+	}
+	return s, nil
 }
 
 // Signer is a key entry of a root block's signers (§C.3.1).

@@ -85,7 +85,7 @@ services:
 
   janitor:
     <<: *host
-    command: [janitor, -api=http://patchlog:9080, -ns=demo]
+    command: [janitor, -api=http://patchlog:9080, -ns=demo, -author=janitor]
 
   cdn:
     <<: *host
