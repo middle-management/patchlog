@@ -70,6 +70,7 @@ import (
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
+	"github.com/middle-management/patchlog/internal/svcedge"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -164,7 +165,8 @@ type Options struct {
 	// ExchangeRate is the exchangeRate bucket each principal draws one
 	// token from per exchange at POST /edge-grants (§C.5, §6.6; default
 	// DefaultExchangeRate). It is a deployment's limit, so the service
-	// has its own, per process.
+	// has its own buckets, shared by every instance on its database DB
+	// (§B.11.5, svcedge.Store).
 	ExchangeRate Rate
 	// Branches makes the service a release preview (§B.5, §F.9): it maps
 	// a namespace (the catalog, or a content namespace it trusts) to the
@@ -223,10 +225,12 @@ type Service struct {
 	// kept with EdgeGrants only (edgegrants.go).
 	trusted map[string]time.Time
 
+	// edge keeps the subjects behind each gs the service minted edge
+	// grants for, and the exchangeRate buckets, shared with the instances
+	// on its database (edgegrants.go).
+	edge      *svcedge.Store
 	emu       sync.Mutex
-	edgeSubs  map[string]edgeSubjects // gs → its subjects, for its edge grants
-	allIssued map[int64]time.Time     // exp → the first issue of a g/all edge grant expiring then
-	exchanges exchangeBuckets         // exchangeRate, per principal
+	allIssued map[int64]time.Time // exp → the first issue of a g/all edge grant expiring then
 
 	// siblings are the services of the other catalogs behind the same
 	// Multi, set before it serves (awaitMins).
@@ -335,6 +339,10 @@ func (s *Service) init(ctx context.Context) error {
 		if _, err := s.db.ExecContext(ctx, q); err != nil {
 			return fmt.Errorf("tree: schema: %w", err)
 		}
+	}
+	var err error
+	if s.edge, err = svcedge.NewStore(ctx, s.db); err != nil {
+		return fmt.Errorf("tree: schema: %w", err)
 	}
 	// A database from an earlier release (addedColumns).
 	for _, tc := range addedColumns {

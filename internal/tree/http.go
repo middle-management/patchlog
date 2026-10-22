@@ -23,6 +23,7 @@ import (
 	"github.com/middle-management/patchlog/internal/kept"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/svcedge"
 	"github.com/middle-management/patchlog/internal/telemetry"
 )
 
@@ -177,13 +178,7 @@ func (v *viewer) item(g *Graph, n *Node) bool {
 }
 
 // Bearer returns the request's bearer token.
-func Bearer(r *http.Request) string {
-	h := r.Header.Get("Authorization")
-	if len(h) > 7 && strings.EqualFold(h[:7], "bearer ") {
-		return strings.TrimSpace(h[7:])
-	}
-	return ""
-}
+func Bearer(r *http.Request) string { return svcedge.Bearer(r) }
 
 // viewer resolves the reader (§B.10: services that list content enforce
 // read permissions for every node and item they list):
@@ -562,8 +557,16 @@ func (s *Service) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	s.serve(w, r, op, at, gs, isAt)
 }
 
-// WriteAuthError writes a grant failure (401/403) or an upstream error.
+// WriteAuthError writes a grant failure (401/403) or an upstream error. A
+// grant over grantSize or rulesPerGrant is 413, code limit, naming the
+// limit, as the origin answers it (§C.8): services verify as the origin
+// does (§C.6).
 func WriteAuthError(w http.ResponseWriter, err error, logf func(string, ...any)) {
+	var le *grantcheck.LimitError
+	if errors.As(err, &le) {
+		svcedge.Limit(le.Limit, le.Measured, le.Max).Write(w)
+		return
+	}
 	var ae *grant.AuthError
 	if errors.As(err, &ae) {
 		code := "forbidden"
