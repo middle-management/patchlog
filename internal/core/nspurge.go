@@ -22,19 +22,28 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 		if err := t.authorize(a, "purge", name); err != nil {
 			return err
 		}
+		// ?force=1 under a grant that can't force is 403 at step 1,
+		// whether or not the purge needs it (§6.1).
+		if force {
+			if err := t.mayForce(n, a, operator); err != nil {
+				return err
+			}
+		}
 		// 410 after authorisation, like every write (§6.2).
 		if n.purged {
 			return t.purgedNS(n)
 		}
+		// A purged resource is 410 at step 2.1, before the precondition
+		// (§6.2, §8.3).
+		v := t.resolve(n, name, nil)
+		if v.state == Purged {
+			return gone()
+		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
 		}
-		v := t.resolve(n, name, nil)
-		switch v.state {
-		case NotFound:
+		if v.state == NotFound {
 			return notFound()
-		case Purged:
-			return gone()
 		}
 		if ifMatch != v.head.id.String() {
 			return apiErr(412, "stale", "head", v.head.id.String())
@@ -48,9 +57,7 @@ func (e *Engine) Purge(ctx context.Context, req Request, name, ifMatch string, f
 			if !force {
 				return t.inUse(broken, "the purge would remove the last available copy of a referenced schema revision (§6.1)")
 			}
-			if err := t.mayForce(n, a, operator); err != nil {
-				return err
-			}
+			// The grant may force: mayForce passed at step 1.
 			forced = true
 		}
 		if !operator {
@@ -108,16 +115,17 @@ func (t *tx) purger(n *nsRow, cfg *Config, req Request, force bool) (a *actor, o
 	return nil, false, err
 }
 
-// mayForce decides whether a purge refused as in_use may be forced (§6.1):
-// with ?force=1 and a grant chained to a deployment operator key, or, for
-// a purge of a branch or of a resource in one, to a * key of that branch,
-// inherited or its own. A * key of a namespace that isn't a branch
-// doesn't force. With authentication disabled everyone is the operator.
+// mayForce decides whether a purge may send ?force=1 (§6.1): with a grant
+// chained to a deployment operator key, or, for a purge of a branch or of
+// a resource in one, to a * key of that branch, inherited or its own. A *
+// key of a namespace that isn't a branch doesn't force. With
+// authentication disabled everyone is the operator. Under any other grant
+// ?force=1 is 403 at step 1 of §6.2, whether or not the purge needs it.
 func (t *tx) mayForce(n *nsRow, a *actor, operator bool) *Error {
 	if operator || t.e.opt.AuthDisabled || (n.isBranch() && a.star) {
 		return nil
 	}
-	return forbidden("forcing a purge refused as in_use needs a grant chained to a deployment operator key, or, in a branch, to a * key of the branch (§6.1)")
+	return forbidden("?force=1 needs a grant chained to a deployment operator key, or, in a branch, to a * key of the branch (§6.1)")
 }
 
 // purgeResource purges name in n and propagates to every branch (§8.3). It
@@ -215,9 +223,20 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		if err := t.authorize(a, "purge-ns", ""); err != nil {
 			return err
 		}
-		// 410 after authorisation, like every write (§6.2).
+		// ?force=1 under a grant that can't force is 403 at step 1 (§6.1).
+		if force {
+			if err := t.mayForce(n, a, operator); err != nil {
+				return err
+			}
+		}
+		// In §6.2's order (§8.5): 410 after authorisation, like every
+		// write (step 2.1); not frozen (step 2.4); then the precondition
+		// (step 2.5).
 		if n.purged {
 			return t.purgedNS(n)
+		}
+		if !cfg.Frozen {
+			return apiErr(409, "not_frozen")
 		}
 		if ifMatch == "" {
 			return apiErr(428, "precondition_required")
@@ -225,9 +244,6 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 		head := t.nsLogID(n.headSeq.Int64)
 		if ifMatch != head.String() {
 			return apiErr(412, "stale", "head", head.String())
-		}
-		if !cfg.Frozen {
-			return apiErr(409, "not_frozen")
 		}
 		var deps []string
 		for _, b := range t.branchesOf(n) {
@@ -244,9 +260,7 @@ func (e *Engine) PurgeNamespace(ctx context.Context, req Request, ifMatch string
 			if !force {
 				return t.inUse(broken, "the namespace holds the last available copy of a schema revision referenced from another namespace (§6.1)")
 			}
-			if err := t.mayForce(n, a, operator); err != nil {
-				return err
-			}
+			// The grant may force: mayForce passed at step 1.
 			forced = true
 		}
 		if !operator {
