@@ -36,3 +36,38 @@ console.log(srNextPath('/demo/at/1def?q=goal&sort=-%2Fkickoff', '2'));`
 		t.Fatalf("got %q, want %q", got, want)
 	}
 }
+
+// TestV073SearchLackingKeys (IX-2, §A.4): a namespace the index follows
+// but lacks the keys of answers 404, as one it doesn't follow; the search
+// tab tells the two apart by /_status, which lists it as skipped, and
+// says why.
+func TestV073SearchLackingKeys(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	js, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := `const SR = { status: [{ ns: 'e', skipped: true, reason: 'no keyring names the service key' }, { ns: 'pub' }] };
+SR.indexed = SR.status.map((n) => n.ns);
+` + jsFunction(t, js, "srStatusOf") + "\n" + jsFunction(t, js, "srFailure") + `
+const res = (status, json) => ({ r: { status, json } });
+console.log(srFailure('e', res(404, { code: 'not_found', message: 'namespace not indexed' })));
+console.log(srFailure('x', res(404, { code: 'not_found', message: 'namespace not indexed' })));
+console.log(srFailure('pub', res(503, { code: 'behind', message: 'the index cannot obtain the keys of the namespace yet' })));`
+	out, err := exec.Command(node, "-e", src).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	want := []string{
+		"The index follows e but lacks its keys (404): no keyring names the service key",
+		"The index does not serve a namespace named x (404): it follows e, pub.",
+		"The index has not reached pub yet (503 behind): the index cannot obtain the keys of the namespace yet",
+	}
+	if got := strings.Split(strings.TrimSpace(string(out)), "\n"); strings.Join(got, "\n") != strings.Join(want, "\n") {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}
