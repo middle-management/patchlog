@@ -425,12 +425,13 @@ type Log struct {
 }
 
 // ResourceLog serves /r/{ns}/{name}/rev/{id}/log?since= (§7.1). With id
-// empty it serves from the current head (for long-poll and SSE). Either
-// way it answers at most limit entries after since (0: all), oldest first,
-// and sets More when the range goes on (§7.1 Paging, §7.7). A page (limit
-// > 0) also holds no more patch set bytes than logPageBytes, at E2 bytes of
-// the entries' JWEs, though always one entry; namespace logs carry no patch
-// sets.
+// empty it serves from the current head (for long-poll and SSE), and with
+// since empty too, for a resource with no entries, an empty range rather
+// than 404 (§7.3, §7.7). Either way it answers at most limit entries after
+// since (0: all), oldest first, and sets More when the range goes on (§7.1
+// Paging, §7.7). A page (limit > 0) also holds no more patch set bytes than
+// logPageBytes, at E2 bytes of the entries' JWEs, though always one entry;
+// namespace logs carry no patch sets.
 func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, limit int, cred Credentials) (*Log, error) {
 	var out *Log
 	var jobs []*sealJob
@@ -453,7 +454,15 @@ func (e *Engine) ResourceLog(ctx context.Context, ns, name, id, since string, li
 			return nil
 		}
 		if v.head == nil {
+			// A resource with no entries: from its head and genesis (a
+			// live read with an empty since), an empty range, which an
+			// event stream or long-poll waits on, once the read check
+			// above has passed (§7.3, §7.7). Any other range of it is
+			// unknown.
 			out.Status = 404
+			if id == "" && since == "" {
+				out.Status = 200
+			}
 			return nil
 		}
 		to := v.head

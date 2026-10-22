@@ -106,3 +106,69 @@ func TestV073P28LongPollCursorBehind(t *testing.T) {
 	}
 	cursorIs("current", r, cur+1)
 }
+
+// §7.7 Answer (RH-41): a live read of a resource with no entries waits as
+// for an empty since, and its create wakes it; a 204 for an empty since
+// carries no X-Revision, so the next since stays empty. Without live, the
+// 404 (short) stays, and a grant that may not read the resource gets 404.
+func TestV073P28LongPollNoEntries(t *testing.T) {
+	const interval = 20 * time.Second
+	e := newEnv(t, withLongPoll(interval), withFileDB(t))
+	e.mkNS("docs", map[string]any{"read": "public"})
+
+	// No cursor: 204 at once, without X-Revision.
+	r := e.get("/r/docs/new/log?live=long-poll")
+	expect(t, r, 204)
+	if _, ok := r.H["X-Revision"]; ok || r.H.Get("X-Cursor") == "" {
+		t.Fatalf("204 for an empty since: %v", r.H)
+	}
+	r = e.get("/r/docs/new/log?since=&live=long-poll")
+	expect(t, r, 204)
+	if _, ok := r.H["X-Revision"]; ok {
+		t.Fatalf("204 for since=: %v", r.H)
+	}
+
+	// With the current cursor it waits, and the create wakes it.
+	if rem := interval - time.Duration(time.Now().UnixNano()%int64(interval)); rem < 2*time.Second {
+		time.Sleep(rem + 10*time.Millisecond)
+	}
+	done := make(chan *resp, 1)
+	cur := strconv.FormatInt(p28Cursor(interval), 10)
+	go func() { done <- e.get("/r/docs/new/log?live=long-poll&cursor=" + cur) }()
+	time.Sleep(100 * time.Millisecond)
+	select {
+	case r := <-done:
+		t.Fatalf("answered before the create: %d %v", r.Code, r.H)
+	default:
+	}
+	g := e.create("docs", "new", map[string]any{"n": 1.0})
+	select {
+	case r := <-done:
+		if r.Code != 200 || len(r.Arr()) != 1 || r.H.Get("X-Revision") != g {
+			t.Fatalf("woken long-poll %d %s %v", r.Code, r.Body, r.H)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("long-poll not woken by the create")
+	}
+
+	// Without live: 404, short; a non-empty since that is unknown: 404.
+	r = e.get("/r/docs/none/log")
+	expect(t, r, 404)
+	if cc := r.H.Get("Cache-Control"); cc != ccShort {
+		t.Fatalf("404 Cache-Control %q", cc)
+	}
+	expect(t, e.get("/r/docs/none/log?since="+g+"&live=long-poll"), 404)
+
+	// A grant that may not read the resource: 404, not a wait.
+	a := newAuthEnv(t, withLongPoll(interval))
+	k := newKey("k")
+	a.mkNS("p", map[string]any{"keys": []any{k.entry("*")}})
+	other := a.grant(k, "bob", []string{"p"}, []string{"read"}, map[string]any{
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "other"}}})
+	expect(t, a.get("/r/p/new/log?live=long-poll", other), 404)
+	r = a.get("/r/p/other/log?live=long-poll", other)
+	expect(t, r, 204)
+	if _, ok := r.H["X-Revision"]; ok {
+		t.Fatalf("private 204 for an empty since: %v", r.H)
+	}
+}

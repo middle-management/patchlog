@@ -108,7 +108,11 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			cur = reqCursor + 1
 		}
 		s.setLive(w, r, lg.Public, "public, max-age=0, s-maxage=2", tags)
-		w.Header().Set(header, since)
+		if since != "" {
+			// Without since the header is absent, so the client's next
+			// since stays empty (§7.7 Answer).
+			w.Header().Set(header, since)
+		}
 		w.Header().Set("X-Cursor", strconv.FormatInt(cur, 10))
 		w.WriteHeader(204)
 		return
