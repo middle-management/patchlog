@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
-	"strconv"
 	"strings"
 	"time"
 
@@ -556,16 +555,13 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		hits = append(hits, m)
 	}
 	body["hits"] = hits
+	// Every query pages as /_refs does (§A.4): next is the after of the
+	// following page, absent on the last; a resource name without q or
+	// sort, else an opaque position.
 	if res.More && q.ByName() {
-		// As /_refs pages (§A.4): the after of the following page.
 		body["next"] = res.Hits[len(res.Hits)-1].Resource
 	} else if res.More {
-		nv := url.Values{}
-		for k, v := range vals {
-			nv[k] = v
-		}
-		nv.Set("after", strconv.Itoa(q.After+len(res.Hits)))
-		body["next"] = base(a, ns) + "/at/" + at + derived.CanonicalQuery(nv, "min")
+		body["next"] = positionAfter(q.After + len(res.Hits))
 	}
 	if res.Counts != nil {
 		body["counts"] = res.Counts

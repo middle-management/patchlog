@@ -358,19 +358,20 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 		t.Errorf("at %v", b["at"])
 	}
 
-	// Counts and paging.
+	// Counts and paging (v0.73: counts by string form, as a map; next is
+	// the after of the following page, here a resource name, §A.4).
 	b = s.search("/matches?counts=/tags&limit=2", "")
 	if got := resources(b); fmt.Sprint(got) != "[cup derby]" {
 		t.Errorf("page 1 %v", got)
 	}
-	if c := fmt.Sprint(b["counts"]); c != "map[/tags:[map[count:2 value:cup] map[count:2 value:local] map[count:1 value:rivalry]]]" {
+	if c := fmt.Sprint(b["counts"]); c != "map[/tags:map[cup:2 local:2 rivalry:1]]" {
 		t.Errorf("counts %s", c)
 	}
 	next, _ := b["next"].(string)
-	if next == "" {
-		t.Fatal("no next")
+	if next != "derby" {
+		t.Fatalf("next %q", next)
 	}
-	b = s.search(next, "")
+	b = s.search("/matches?after="+next+"&counts=/tags&limit=2", "")
 	if got := resources(b); fmt.Sprint(got) != "[final notes]" || b["next"] != nil {
 		t.Errorf("page 2 %v next %v", got, b["next"])
 	}

@@ -130,8 +130,9 @@ func TestReferenceQueries(t *testing.T) {
 
 	// Without q or sort, a ref query pages as /_refs does (§A.4): after is
 	// a bare resource name, a plain bound, and next the after of the
-	// following page. Counts still count every hit. Queries with q or sort
-	// keep their offsets.
+	// following page. Counts still count every hit (v0.73: by string form,
+	// as a map). Queries with q or sort page by an opaque position, which
+	// next gives (v0.73: the value, not a URL).
 	route4 := "/pages?ref=" + enc("/r/logic/route-4")
 	if b := x.expect(route4+"&limit=1", "a"); b["next"] != "a" {
 		t.Errorf("next %v", b["next"])
@@ -140,10 +141,10 @@ func TestReferenceQueries(t *testing.T) {
 		t.Errorf("next on the last page %v", b["next"])
 	}
 	x.expect("/pages?ref="+enc(live)+"&after=a0", "d")
-	if b := x.expect("/pages?ref="+enc(live)+"&after=a&counts=/kind", "d"); fmt.Sprint(b["counts"]) != "map[/kind:[map[count:2 value:x]]]" {
+	if b := x.expect("/pages?ref="+enc(live)+"&after=a&counts=/kind", "d"); fmt.Sprint(b["counts"]) != "map[/kind:map[x:2]]" {
 		t.Errorf("counts after a: %v", b["counts"])
 	}
-	if b := x.expect(route4+"&sort=/title&limit=1", "a"); !strings.Contains(fmt.Sprint(b["next"]), "after=1") {
+	if b := x.expect(route4+"&sort=/title&limit=1", "a"); b["next"] != "1" {
 		t.Errorf("next with sort %v", b["next"])
 	}
 	x.expect(route4+"&sort=/title&after=1", "b")
