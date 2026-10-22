@@ -434,7 +434,7 @@ func checkMembers(doc, prev map[string]any) error {
 			for i, e := range arr {
 				s, _ := e.(string)
 				if _, perr := ids.Parse(s); perr != nil && !kept[s] {
-					err = badAt(pointer.Pointer{"revoked", strconv.Itoa(i)}, "must be a revocation id, the text id of a block's signature (§C.4)")
+					err = badAt(pointer.Pointer{"revoked", strconv.Itoa(i)}, "must be a revocation id: a root block's grant id, or a narrowing block's text(trunc160(sha256(signature))) (§C.4)")
 					break
 				}
 			}
@@ -480,8 +480,10 @@ func definedMembers(doc map[string]any) map[string]any {
 
 // checkKeyFields refuses fields a key entry doesn't define (§C.4), which
 // grant.ParseKeys accepts when they start with "x-", as stored documents
-// may hold them: key entries are strict (§7.4). An entry prev holds
-// unchanged is kept.
+// may hold them: key entries are strict (§7.4). An attrs schema is held to
+// the rules of a rule's schema (§C.4, §6.4.2), compiled as the test that
+// checks it at verification; grant.ParseKeys checks only that it is an
+// object or a boolean. An entry prev holds unchanged is kept.
 func checkKeyFields(v, prev any) *memberError {
 	pa, _ := prev.([]any)
 	arr, _ := v.([]any)
@@ -500,6 +502,11 @@ func checkKeyFields(v, prev any) *memberError {
 		for _, f := range sortedKeys(m) {
 			if isX(f) {
 				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), f}, "is not a key field; a key entry holds only the fields of §C.4")
+			}
+		}
+		if a, ok := m["attrs"]; ok {
+			if _, err := rules.Compile(map[string]any{"op": "test", "path": "/attrs", "schema": a}); err != nil {
+				return badAt(pointer.Pointer{"keys", strconv.Itoa(i), "attrs"}, "must be a JSON Schema held to the rules of a rule's schema (§C.4, §6.4.2): %v", err)
 			}
 		}
 	}

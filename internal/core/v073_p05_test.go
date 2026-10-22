@@ -130,3 +130,25 @@ func TestV073GrantLimitsDeploymentOnly(t *testing.T) {
 		}
 	}
 }
+
+// v0.73 §C.4: a key's attrs schema is compiled as a rule's schema when the
+// document is written (422 invalid at /keys/{i}/attrs); an entry stored
+// before, kept unchanged, still passes.
+func TestV073KeyAttrsKeptWhenStored(t *testing.T) {
+	t.Parallel()
+	bad := map[string]any{"kid": "k", "alg": "ed25519", "pub": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo", "can": []any{"read"},
+		"attrs": map[string]any{"pattern": "(?=x)"}}
+	doc := map[string]any{"keys": []any{bad}}
+	err := checkMembers(jsonv.FromGo(doc).(map[string]any), nil)
+	var me *memberError
+	if !errors.As(err, &me) || me.pointer != "/keys/0/attrs" {
+		t.Fatalf("a new uncompilable attrs schema: %v", err)
+	}
+	if err := checkMembers(jsonv.FromGo(doc).(map[string]any), jsonv.FromGo(map[string]any{"keys": []any{bad}, "x-old": true}).(map[string]any)); err != nil {
+		t.Fatalf("a stored entry kept: %v", err)
+	}
+	moved := jsonv.FromGo(map[string]any{"keys": []any{map[string]any{"kid": "j", "alg": "ed25519", "pub": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo", "can": []any{"read"}}, bad}}).(map[string]any)
+	if err := checkMembers(moved, jsonv.FromGo(doc).(map[string]any)); err != nil {
+		t.Fatalf("a stored entry kept at another index: %v", err)
+	}
+}

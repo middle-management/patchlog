@@ -10,18 +10,20 @@ import (
 	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
+// v073DB is a database for a test to open, and inspect, by its path.
+func v073DB(t *testing.T) string {
+	if pgtest.Enabled() {
+		return pgtest.NewDB(t)
+	}
+	return filepath.Join(t.TempDir(), "test.db")
+}
+
 // v073Reopenable opens a server on a database that outlives its engine,
 // and returns a function that closes it and opens the same database with
 // further options: a deployment restarted with other settings.
 func v073Reopenable(t *testing.T, opts ...envOpt) (*tenv, func(more ...envOpt) *tenv) {
 	t.Helper()
-	var path string
-	if pgtest.Enabled() {
-		path = pgtest.NewDB(t)
-	} else {
-		path = filepath.Join(t.TempDir(), "test.db")
-	}
-	blobs := t.TempDir()
+	path, blobs := v073DB(t), t.TempDir()
 	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
 	e := newEnv(t, append(append([]envOpt{}, opts...), at)...)
 	return e, func(more ...envOpt) *tenv {
@@ -399,4 +401,42 @@ func TestV073ValuesEveryNamespace(t *testing.T) {
 	r := e.branch("v1", map[string]any{"name": "v1b", "at": at, "patches": ops(op("replace", "/limits/patchSetSize", 4000))}, "alice")
 	expectLimit(t, r, 422, "patchSetSize", 4324, 4000)
 	expect(t, e.branch("v1", map[string]any{"name": "v1b", "at": at}, "alice"), 201)
+}
+
+// v0.73 §C.4: a key scope's attrs schema is held to the rules of a rule's
+// schema (§6.4.2), compiled when the namespace document is written: 422
+// invalid at /keys/{i}/attrs, not a 403 on every request it verifies.
+func TestV073KeyAttrsCompiledAtWrite(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("k", map[string]any{})
+	k := newKey("k")
+	for _, attrs := range []any{
+		map[string]any{"properties": map[string]any{"team": map[string]any{"type": "string", "pattern": "(?=x)"}}}, // lookaround: not RE2
+		map[string]any{"$ref": "https://example.com/schema"},                                                       // remote reference
+	} {
+		key := k.entry("read")
+		key["attrs"] = attrs
+		r := e.patchNS("k", ops(op("add", "/keys", []any{newKey("other").entry("read"), key})), "")
+		expectCode(t, r, 422, "invalid")
+		if errs, _ := r.Obj()["errors"].([]any); len(errs) != 1 || errs[0].(map[string]any)["pointer"] != "/keys/1/attrs" {
+			t.Fatalf("attrs %v: %s", attrs, r.Body)
+		}
+	}
+	key := k.entry("read")
+	key["attrs"] = map[string]any{"required": []any{"team"}, "properties": map[string]any{"team": map[string]any{"pattern": "^[a-z]+$"}}}
+	expect(t, e.patchNS("k", ops(op("add", "/keys", []any{key})), ""), 201)
+}
+
+// v0.73 §C.4: the revoked message names what a revocation id is, a root
+// block's being its grant id.
+func TestV073RevokedMessage(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("v", map[string]any{})
+	r := e.patchNS("v", ops(op("add", "/revoked", []any{"not-an-id"})), "")
+	expectCode(t, r, 422, "invalid")
+	if !strings.Contains(r.Str("message"), "grant id") {
+		t.Fatalf("revoked message %s", r.Body)
+	}
 }
