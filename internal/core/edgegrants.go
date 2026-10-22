@@ -350,9 +350,9 @@ func (t *tx) edgeGrant(g *grant.Grant, ns string, cred Credentials) (*edgeIssue,
 // of its rules refers to /now or the whole envelope, one refers to
 // /resource only if the grant fixes it (names, nil for none), and they
 // pass now against a read envelope for the principal with /resource set
-// to each name fixed, or once if none is.
-// A rule that doesn't refer to /resource gives the same for every name, so
-// only those that do are evaluated per name.
+// to each name fixed, or once if none is. A rule that doesn't refer to
+// /resource gives the same for every name, so only those that do are
+// evaluated per name.
 func (t *tx) qualifies(a *actor, rs []any, names []string) bool {
 	var once, each []*rules.Rule
 	for _, rv := range rs {
