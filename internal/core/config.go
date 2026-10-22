@@ -1112,7 +1112,7 @@ func parseLimits(v any, l *Limits, max Limits, md configMode) error {
 
 // sizeFields are limits in bytes. A namespace document writes them as
 // integers (§6.6); ParseSize's "64 MiB" form is for deployment flags only.
-var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "valueSize": true, "pathSize": true, "grantSize": true, "batchSize": true, "blobSize": true, "blobPending": true}
+var sizeFields = map[string]bool{"patchSetSize": true, "documentSize": true, "valueSize": true, "pathSize": true, "batchSize": true, "blobSize": true, "blobPending": true}
 
 var sizeRe = regexp.MustCompile(`^(\d+)\s*(B|KiB|MiB|GiB)?$`)
 
