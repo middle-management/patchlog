@@ -1341,9 +1341,20 @@ function undoImpossible(r) {
   return '';
 }
 
-/* undoRun undoes gesture g: plans, stops on conflicts, writes one batch with a fresh Gesture and Undoes: g, and on
- * 412 plans again (3 retries). It returns { ok, plan, gesture, attempts, ns_id }, { conflicts }, { impossible },
- * { refused } or { nothing }. */
+/* undoHeadMoved tells whether a failed undo batch means a head moved since the plan, so it plans again (§11.2 Guard): a
+ * 412, or a 410 gone naming a head, the tombstone of a resource deleted meanwhile (§7.2), as client.Undo does. */
+function undoHeadMoved(r) {
+  const j = r.json || {};
+  if (r.status === 412) return true;
+  if (r.status !== 410) return false;
+  if (j.code === 'gone') return !!j.head;
+  const it = (j.items || []).find((x) => x && x.status === 410);
+  return !!it && it.code === 'gone' && !!it.head;
+}
+
+/* undoRun undoes gesture g: plans, stops on conflicts, writes one batch with a fresh Gesture and Undoes: g, and when a
+ * head moved meanwhile (undoHeadMoved) plans again (3 retries), so a delete meanwhile is reported as a conflict. It
+ * returns { ok, plan, gesture, attempts, ns_id }, { conflicts }, { impossible }, { refused } or { nothing }. */
 async function undoRun(ns, g, o = {}) {
   const gesture = o.gesture || Z.newNonce();
   let plan = null;
@@ -1358,12 +1369,12 @@ async function undoRun(ns, g, o = {}) {
     if (!plan.items.length) return { nothing: true, plan };
     const r = await api('POST', `/ns/${ns}/batch`, { body: { gesture, undoes: g, items: plan.items }, label: 'undo' });
     if (r.status === 201 || r.status === 200) return { ok: true, plan, gesture, attempts: attempt, ns_id: r.hdr('X-Namespace-Revision') || (r.json || {}).ns_id };
-    if (r.status === 412) continue;
+    if (undoHeadMoved(r)) continue;
     const why = undoImpossible(r);
     if (why) return { impossible: why, message: httpFail(r).message, plan };
     throw httpFail(r);
   }
-  throw new Error('the heads kept moving (412 four times)');
+  throw new Error('the heads kept moving (412 or 410 four times)');
 }
 
 /* undoLatest finds the latest undo of gesture g (by author, if given): redo undoes it (§11.2 Redo). A grant that can't

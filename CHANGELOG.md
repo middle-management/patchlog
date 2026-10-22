@@ -145,8 +145,9 @@ leaves a question open, the reference implements the default the plan states.
     create's `412` as "exists, restore" must handle this `410` too. The merge tool (re-classifying
     such items), the release lock, the importer (a batch failing at step 2.5 with any mix of
     such `410`s and `412`s is "the target moved … import again"; a `412` batch that lists
-    another step-2.5 failure, such as a `428`, isn't), `client.Undo` (re-planning, as after a
-    `412`) and the WebDAV gateway do.
+    another step-2.5 failure, such as a `428`, isn't), `client.Undo` and the playground's Undo /
+    redo card (re-planning, as after a `412`, so a delete meanwhile is reported as a conflict),
+    and the WebDAV gateway do.
   - A batch `"delete"` step right after another `"delete"` is `422 invalid` at step 2.5,
     reported with the other precondition failures in request order, instead of at step 3.
   - A batch item under `ifNoneMatch` whose first step is `"delete"`, and a `DELETE` with
