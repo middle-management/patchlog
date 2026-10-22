@@ -646,3 +646,49 @@ func testReleaseResumesOldFormatMerge(t *testing.T, stateNS string) {
 		t.Fatalf("lock documents %q", docs)
 	}
 }
+
+// §F.9 split nodes: each half of a person's split must change the node.
+// A first half that is the catalog base's document as it is (the change
+// only widens) left step 2 without an item, so the plan's digest had no
+// { batch, item } for the second half's precondition and planning failed
+// outright; a second half that is the first (the change only narrows)
+// gave the digest a step-4 item that the merge then never submitted, so
+// step 4 stopped as changed from the approved plan after step 2 went in.
+// Both are now a bad split, and the change plans whole once it is dropped.
+func TestV073ReleaseSplitHalvesChangeTheNode(t *testing.T) {
+	t.Parallel()
+	w := newRelWorld(t)
+	w.startCatalog()
+	w.branch("cat-season", "cat-season-r8")
+	w.appendTo("cat-season-r8", "season", op("add", "/$access/inherit", false))              // narrows only
+	w.appendTo("cat-season-r8", "embargo", op("add", "/$access/group:fans", sAny("reader"))) // widens only
+	w.writeRelease("release-8", map[string]string{"cat-season": "cat-season-r8"})
+	o := w.opts("release-8")
+	for _, c := range []struct {
+		node string
+		half any
+		want string
+	}{
+		{"embargo", w.doc("cat-season", "embargo"), "first half is the catalog base's document"},
+		{"season", w.doc("cat-season-r8", "season"), "second half is its first"},
+	} {
+		o.Splits = map[string]map[string]any{"cat-season": {c.node: c.half}}
+		rp, err := merge.PlanRelease(ctx, w.anna, o)
+		if err != nil {
+			t.Fatalf("split of %s: %v", c.node, err)
+		}
+		if got := conflictKinds(rp)[merge.RCBadSplit]; len(got) != 1 || got[0] != "cat-season/"+c.node || !strings.Contains(rp.Conflicts[0].Message, c.want) {
+			t.Fatalf("split of %s: conflicts %+v", c.node, rp.Conflicts)
+		}
+	}
+	o.Splits = nil
+	rp := must(merge.PlanRelease(ctx, w.anna, o))
+	if got := stepsOf(rp); !rp.Clean() || !reflect.DeepEqual(got, []string{"2 cat-season season", "4 cat-season embargo"}) {
+		t.Fatalf("plan %q, conflicts %+v", got, rp.Conflicts)
+	}
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, rp))
+	must(merge.ApproveRelease(ctx, w.anna, o))
+	if rp := must(merge.ApplyRelease(ctx, w.anna, o)); rp.State != merge.ReleaseDone {
+		t.Fatalf("state %s", rp.State)
+	}
+}

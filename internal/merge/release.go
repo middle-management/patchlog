@@ -22,7 +22,8 @@ package merge
 //
 // Conflicts reported before anything is submitted (ReleaseConflict): a
 // catalog node narrowing for some subjects and widening for others
-// (resolved by a split: the document after step 2, given by a person); a
+// (resolved by a split: the document after step 2, given by a person,
+// each half changing the node); a
 // content item step 3 creates or restores that a placement in the catalog
 // base already names (fine if step 2 removes that placement, or if the
 // release keeps it unchanged and the approver accepts it); a pinned x-ref
@@ -120,7 +121,7 @@ const (
 	RCSchemaChanged  = "schema_changed"     // a schema resource can't fast-forward (§F.9)
 	RCNarrowAndWiden = "narrows_and_widens" // a catalog node narrows for some subjects, widens for others
 	RCStep2Widens    = "step2_widens"       // the narrowing batch as a whole widens
-	RCBadSplit       = "bad_split"          // a split's halves don't narrow, then widen
+	RCBadSplit       = "bad_split"          // a split's halves don't narrow, then widen, or one changes nothing
 	RCPlacedItem     = "placed_item"        // step 3 would publish an item under an existing placement
 	RCDanglingPin    = "dangling_pin"       // a pinned link to a revision the merge replays
 	RCForeignDraft   = "foreign_draft"      // a draft resolved in a branch the release doesn't list
@@ -929,6 +930,17 @@ func (x *relCtx) catalogSteps(ctx context.Context, b *ReleaseBranch) (narrow, wi
 			d2 := catalog.DiffAccess(mid, mid.With(map[string]any{name: doc}), incs)
 			if len(d1.Widens) > 0 || len(d2.Narrows) > 0 {
 				x.conflict(RCBadSplit, b.Key, b.NS, name, fmt.Sprintf("the split must narrow, then widen: its first half %s, its second %s", d1.Kind(), d2.Kind()))
+				continue
+			}
+			// Each half must change the node ($nonce aside), or its step
+			// has no item for it, and the plan's digest no item for the
+			// second half's precondition to name (§F.9).
+			if bd, ok := baseDocs[name]; ok && jsonv.Equal(dropNonce(bd), dropNonce(jsonv.FromGo(sd))) {
+				x.conflict(RCBadSplit, b.Key, b.NS, name, "the split's first half is the catalog base's document as it is, so step 2 has nothing to merge for it: drop the split, and the change merges whole (§F.9)")
+				continue
+			}
+			if jsonv.Equal(dropNonce(jsonv.FromGo(sd)), dropNonce(doc)) {
+				x.conflict(RCBadSplit, b.Key, b.NS, name, "the split's second half is its first, so step 4 has nothing to merge for it: drop the split, and the change merges whole (§F.9)")
 				continue
 			}
 			halves[name] = Half{Narrow: sd, Wide: doc, Reason: "split"}
