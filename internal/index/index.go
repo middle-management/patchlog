@@ -8,6 +8,7 @@
 //	checkpoints(origin, ns, ns_id)         follow.SQLCheckpoints, saved in the apply tx
 //	seen(ns, ns_id)                        every ns_id applied, for ?min= (§A.5)
 //	ns_state(ns, purged)                   purge-ns marks the namespace gone
+//	ns_conf(ns, public, level)             the read mode and level last applied (narrowed)
 //	docs(docid, ns, resource, head, schema) one row per live resource (untyped too, see UntypedListing)
 //	text  fts5(ns, resource, schema, path, body)  rowid = docid<<20 | n, so a resource's rows are a rowid range
 //	facet(ns, resource, schema, path, value, raw)  value: the string form (§A.2), raw: canonical JSON
@@ -252,7 +253,7 @@ func (ix *Index) FTS() bool { return ix.fts }
 func (ix *Index) Origin() string { return ix.origin }
 
 var dropStmts = []string{
-	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS ns_state`,
+	`DROP TABLE IF EXISTS checkpoints`, `DROP TABLE IF EXISTS seen`, `DROP TABLE IF EXISTS ns_state`, `DROP TABLE IF EXISTS ns_conf`,
 	`DROP TABLE IF EXISTS docs`, `DROP TABLE IF EXISTS "text"`, `DROP TABLE IF EXISTS facet`, `DROP TABLE IF EXISTS "sort"`, `DROP TABLE IF EXISTS refs`,
 	derived.CacheDropStmts[0], derived.CacheDropStmts[1],
 }
@@ -264,6 +265,7 @@ var dropStmts = []string{
 var createStmts = []string{
 	`CREATE TABLE IF NOT EXISTS seen (ns TEXT NOT NULL, ns_id TEXT NOT NULL, PRIMARY KEY (ns, ns_id)) WITHOUT ROWID`,
 	`CREATE TABLE IF NOT EXISTS ns_state (ns TEXT PRIMARY KEY, purged INTEGER NOT NULL DEFAULT 0)`,
+	`CREATE TABLE IF NOT EXISTS ns_conf (ns TEXT PRIMARY KEY, public INTEGER NOT NULL, level TEXT NOT NULL)`,
 	`CREATE TABLE IF NOT EXISTS docs (docid INTEGER PRIMARY KEY, ns TEXT NOT NULL, resource TEXT NOT NULL, head TEXT NOT NULL, schema TEXT, UNIQUE (ns, resource))`,
 	`CREATE TABLE IF NOT EXISTS facet (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value TEXT NOT NULL, raw TEXT NOT NULL, PRIMARY KEY (ns, resource, path, value))`,
 	`CREATE TABLE IF NOT EXISTS "sort" (ns TEXT NOT NULL, resource TEXT NOT NULL, schema TEXT, path TEXT NOT NULL, value, raw TEXT, PRIMARY KEY (ns, resource, path))`,
@@ -586,16 +588,22 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	// by position, count facets over every hit and may show any document,
 	// so none may outlive a purge of one of them. It also purges
 	// r:{ns}/{name}, which /_refs answers showing the resource carry, and
-	// a purge-ns the namespace's pointers (ns:{ns}). Kept results, stored
-	// sealed ones (in this transaction) and /_refs answers go by the same
-	// tags.
+	// a purge-ns the namespace's pointers (ns:{ns}). So does a config
+	// entry on which §9 purges ns:{ns}, one making the namespace private
+	// or raising it to sealed or e2e: results computed before it, public
+	// or in the clear, must go. Kept results, stored sealed ones (in this
+	// transaction) and /_refs answers go by the same tags.
+	narrowed, err := ix.narrowed(ctx, tx, b)
+	if err != nil {
+		return err
+	}
 	var tags []string
 	for _, p := range preps {
 		if p.purged {
 			tags = append(tags, "r:"+b.NS+"/"+p.resource)
 		}
 	}
-	if len(tags) > 0 || co.PurgedNS {
+	if len(tags) > 0 || co.PurgedNS || narrowed {
 		tags = append(tags, "idx:"+b.NS)
 	}
 	if co.PurgedNS {
@@ -672,6 +680,54 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 		}
 	}
 	return nil
+}
+
+// narrowed reports whether a config unit of b makes its namespace private
+// or raises it to sealed or e2e (§9), against the read mode and level the
+// index last applied (ns_conf), and records the last unit's, in tx. Before
+// the first it records, the namespace counts as public and unsealed, so
+// the first private or sealed document it applies counts too: once, at
+// the genesis of a namespace followed from the start, when nothing is
+// cached yet, and after an upgrade from a database without ns_conf, when
+// there may be.
+func (ix *Index) narrowed(ctx context.Context, tx *sql.Tx, b *follow.Batch) (bool, error) {
+	public, level, known := true, "", false
+	narrowed := false
+	for _, u := range b.Units {
+		if u.Config == nil {
+			continue
+		}
+		if !known {
+			err := tx.QueryRowContext(ctx, `SELECT public, level FROM ns_conf WHERE ns = ?`, b.NS).Scan(&public, &level)
+			if err != nil && !errors.Is(err, sql.ErrNoRows) {
+				return false, err
+			}
+			known = true
+		}
+		read, _ := u.Config.Value["read"].(string)
+		lv := derived.InfoOf(u.Config.Value).Level
+		if public && read != "public" || levelRank(lv) > levelRank(level) && derived.Protected(lv) {
+			narrowed = true
+		}
+		public, level = read == "public", lv
+	}
+	if !known {
+		return false, nil
+	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO ns_conf (ns, public, level) VALUES (?, ?, ?) ON CONFLICT (ns) DO UPDATE SET public = excluded.public, level = excluded.level`, b.NS, public, level)
+	return narrowed, err
+}
+
+// levelRank orders encryption levels as raises go (Addendum E): at rest
+// changes nothing a view shows.
+func levelRank(level string) int {
+	switch level {
+	case derived.LevelSealed:
+		return 1
+	case derived.LevelE2E:
+		return 2
+	}
+	return 0
 }
 
 // prepare fetches p.resource's document at revision id and extracts its

@@ -457,3 +457,59 @@ func TestV073ResourcePurgeIdx(t *testing.T) {
 		}
 	}
 }
+
+// TestV073NarrowingPurge (IX-21, §A.1, §9): a config entry that makes a
+// followed namespace private, or raises it to sealed, purges idx:{ns};
+// one that narrows nothing purges nothing, before or after a restart,
+// which keeps what was applied.
+func TestV073NarrowingPurge(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	k, other := clienttest.NewKey("k"), clienttest.NewKey("other")
+	nss := []string{"pub", "pr"}
+	for _, ns := range nss {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, map[string]any{"read": "public", "keys": []any{k.Entry("*")}}))
+	}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", nss, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	for _, ns := range nss {
+		must(w.CreateDoc(ctx, ns, "a", map[string]any{"title": ns}))
+	}
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}, map[string]any{"enc": jwk})), client.WithKeys(client.NewKeys(priv)))
+	opts := svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: nss, untyped: true, now: s.Now}
+	withKey := func(o *indexOpts) { o.Recipient = priv }
+	x := startSvcWith(t, ic, opts, withKey)
+	x.caughtUp("pub")
+	x.caughtUp("pr")
+	patch := func(ns string, ops ...any) {
+		t.Helper()
+		must(w.PatchConfig(ctx, ns, must(w.NSHead(ctx, ns)).Config, ops))
+		x.appliedUpTo(x.caughtUp(ns))
+	}
+	addKey := map[string]any{"op": "add", "path": "/keys/-", "value": other.Entry("read")}
+	patch("pub", addKey)
+	if got := x.purgesSoFar(); got != "[]" {
+		t.Fatalf("purges before anything narrowed: %s", got)
+	}
+	patch("pub", map[string]any{"op": "replace", "path": "/read", "value": "grant"})
+	if got := x.purgesSoFar(); got != "[[idx:pub]]" {
+		t.Errorf("purges after pub turned private: %s", got)
+	}
+	patch("pr", map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}})
+	if got := x.purgesSoFar(); got != "[[idx:pub] [idx:pr]]" {
+		t.Errorf("purges after pr was raised to sealed: %s", got)
+	}
+	// What was applied survives a restart: a change that narrows nothing
+	// still purges nothing.
+	x.stop()
+	x = startSvcWith(t, ic, opts, withKey)
+	x.caughtUp("pub")
+	patch("pub", map[string]any{"op": "add", "path": "/keys/-", "value": clienttest.NewKey("third").Entry("read")})
+	if got := x.purgesSoFar(); got != "[]" {
+		t.Errorf("purges after a restart and a change narrowing nothing: %s", got)
+	}
+}

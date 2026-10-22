@@ -609,8 +609,9 @@ func TestRefsAcrossSealed(t *testing.T) {
 		t.Errorf("after the purge: %s", got)
 	}
 
-	// A stored answer is not served once a namespace it covers turns
-	// private, though the anonymous subject set stays the same.
+	// A stored answer is dropped once a namespace it covers turns private
+	// (§A.1, §9, v0.73), and not served, though the anonymous subject set
+	// stays the same.
 	must(createNonced(w, "sec", "s2", doc))
 	idx.caughtUp("sec")
 	f = idx.fetch("/_refs?to="+url.QueryEscape(x), "")
@@ -622,8 +623,8 @@ func TestRefsAcrossSealed(t *testing.T) {
 	idx.stop()
 	idx = startSvcWith(t, ic, opts, withKey)
 	idx.caughtUp("sec")
-	if _, ok := idx.ix.SealedViews()[f.path]; !ok {
-		t.Fatal("the answer with s2 is not stored")
+	if _, ok := idx.ix.SealedViews()[f.path]; ok {
+		t.Error("the answer with s2 survived sec turning private")
 	}
 	if r := idx.raw(f.path, ""); r.status != 302 {
 		t.Errorf("after sec went private: %d %v", r.status, r.body)
