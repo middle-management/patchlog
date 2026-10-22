@@ -361,9 +361,10 @@ func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 		r := issue(sec, c.rules...)
 		if c.prefixes == "" {
 			// A rule that doesn't compile makes the grant invalid, 401
-			// on every request (§6.6, v0.63).
+			// on every request (§6.6, v0.63); in with a string is valid,
+			// false (§6.4.2), and refers to /resource without fixing it.
 			want := 403
-			if c.name == "enum not an array" || c.name == "in a string" {
+			if c.name == "enum not an array" {
 				want = 401
 			}
 			if r.Code != want {

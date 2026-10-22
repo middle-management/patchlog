@@ -345,3 +345,19 @@ func TestV073RulesPerGrantAtDecode(t *testing.T) {
 		t.Fatalf("want too large, got %v", err)
 	}
 }
+
+// §6.4.2 makes compare with in and a literal that isn't an array a valid
+// rule, false when evaluated: compiling rules at decode doesn't make a
+// grant carrying it invalid.
+func TestV073CompareInLiteralAtDecode(t *testing.T) {
+	f := newFixture(t, nil)
+	rule := map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": "a"}}
+	g := mustMint(t, f, map[string]any{"rules": []any{rule}})
+	if _, err := Decode(g.Encode(), 0); err != nil {
+		t.Fatalf("root block: %v", err)
+	}
+	n, _ := mustMint(t, f, nil).Narrow(map[string]any{"rules": []any{rule}})
+	if _, err := Decode(n.Encode(), 0); err != nil {
+		t.Fatalf("narrowing block: %v", err)
+	}
+}

@@ -284,7 +284,6 @@ func TestCompileErrors(t *testing.T) {
 		`{"op":"compare","path":"/a","eq":{"path":"b"}}`,
 		`{"op":"compare","path":"/a","eq":1}`,
 		`{"op":"compare","path":"/a","eq":{"value":1,"x":1}}`,
-		`{"op":"compare","path":"/a","in":{"value":3}}`,
 		`{"op":"compare","path":"/a","zz":{"value":3}}`,
 		`{"all":{}}`, `{"all":[1]}`, `{"all":[],"any":[]}`,
 		`{"any":[{"op":"x"}]}`,
