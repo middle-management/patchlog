@@ -816,9 +816,11 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 	if names(b["children"]) != "matches.rumour1" {
 		t.Errorf("eic on rumours: %v", b)
 	}
-	// Roots: a folder is listed only for readers with some role there.
+	// Roots: a folder is listed only for readers with some role there, and
+	// a visible node whose parents are all hidden is a root for the
+	// reader's subject set (§B.11.5): root is hidden from fan-club.
 	b, _ = get("/cat/roots", fan)
-	if names(b["roots"]) != "" {
+	if names(b["roots"]) != "derbies,season" {
 		t.Errorf("fan roots: %v", b)
 	}
 	b, _ = get("/cat/where?item=/r/matches/other", w.caller("user:guest"))
@@ -826,8 +828,9 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 		t.Errorf("guest where: %v", b)
 	}
 	// Paths through folders the guest may not see are left out, without a
-	// count of them (§B.11.5).
-	if len(b["paths"].([]any)) != 0 || b["hidden"] != nil || b["incomplete"] != nil {
+	// count of them: the placement's parents are all hidden from the
+	// guest, so it is a root, where its one path ends (§B.11.5).
+	if ps, _ := b["paths"].([]any); len(ps) != 1 || len(ps[0].([]any)) != 0 || b["hidden"] != nil || b["incomplete"] != nil {
 		t.Errorf("guest paths: %v", b)
 	}
 

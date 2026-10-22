@@ -652,12 +652,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
-	if status, code, msg := s.awaitMins(ctx, vals["min"], Bearer(r)); status != 0 {
-		w.Header().Set("Cache-Control", "no-store")
-		if status == http.StatusServiceUnavailable {
-			w.Header().Set("Retry-After", "1")
-		}
-		WriteError(w, status, code, msg)
+	if a := s.awaitMins(ctx, vals["min"], Bearer(r)); a.status != 0 {
+		a.write(w)
 		return
 	}
 	if ns := s.behind(); ns != "" {
@@ -742,7 +738,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		s.opt.Logf("tree: keys of %s: %v", cat, err)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals listings of the catalog")
+		// Keys it can't fetch yet are a view it hasn't caught up with
+		// (§12.1 behind, §E.2.6).
+		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key that seals listings of the catalog yet")
 		return
 	}
 	l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key)
@@ -751,7 +749,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		s.opt.Logf("tree: %v", err)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals the file metadata of a trusted namespace")
+		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key that seals the file metadata of a trusted namespace yet")
 	case err != nil:
 		s.opt.Logf("tree: sealing a listing: %v", err)
 		WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
@@ -1151,9 +1149,18 @@ type minRef struct{ ns, id string }
 // the service has reached every one (waiting up to MinWait), else the
 // status and error to answer with: 400 for a malformed min or one naming a
 // namespace the service doesn't follow, 503 (with Retry-After) while it is
-// behind. Services of the addenda use it for the endpoints that take min.
+// behind. A min naming a namespace the service holds as purged counts as
+// reached. Services of the addenda use it for the endpoints that take min.
 func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, code, msg string) {
-	return s.awaitMins(ctx, vals, "")
+	a := s.awaitMins(ctx, vals, "")
+	return a.status, a.code, a.msg
+}
+
+// AwaitMinsRefused is AwaitMins with, for a 400, the mins it refuses as
+// given, which the body of the 400 lists as min (§A.5).
+func (s *Service) AwaitMinsRefused(ctx context.Context, vals []string) (status int, code, msg string, refused []string) {
+	a := s.awaitMins(ctx, vals, "")
+	return a.status, a.code, a.msg, a.refused
 }
 
 // minElsewhere is the 400 for a min naming a namespace that neither the
@@ -1162,49 +1169,120 @@ func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, cod
 // exist.
 const minElsewhere = "min names a namespace the service does not follow or the reader can't see"
 
+// minAnswer is the answer to a request whose mins can't all be waited for
+// (§A.5): status 0 once every one is reached; else the status, code and
+// message, and, for a 400, refused, every min refused as given, which the
+// body lists as min, so a tool drops those.
+type minAnswer struct {
+	status    int
+	code, msg string
+	refused   []string
+}
+
+// write writes a: no-store, Retry-After on a 503.
+func (a minAnswer) write(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	if a.status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "1")
+	}
+	body := map[string]any{"code": a.code, "message": a.msg}
+	if len(a.refused) > 0 {
+		body["min"] = a.refused
+	}
+	WriteJSON(w, a.status, body)
+}
+
 // awaitMins is AwaitMins for a reader presenting token ("" for none).
 // Behind Multi, a min naming a namespace that another catalog's service
 // follows, and that the reader may see (public, or its grant reads it),
 // is waited for there: this catalog's at doesn't cover it, so the
-// listing then redirects to the current at in one hop (§A.5, §B.5).
-func (s *Service) awaitMins(ctx context.Context, vals []string, token string) (status int, code, msg string) {
-	mins, err := parseMins(vals)
-	if err != nil {
-		return http.StatusBadRequest, "bad_input", err.Error()
-	}
+// listing then redirects to the current at in one hop (§A.5, §B.5). A min
+// naming a namespace this service or a sibling holds as purged counts as
+// reached, without a read check: a purge is no secret (§A.5, §E.4).
+func (s *Service) awaitMins(ctx context.Context, vals []string, token string) minAnswer {
 	var own []minRef
 	other := map[*Service][]minRef{}
-	for _, m := range mins {
+	var refused []string
+	malformed := ""
+	for _, raw := range vals {
+		m, err := parseMin(raw)
+		if err != nil {
+			refused = append(refused, raw)
+			if malformed == "" {
+				malformed = err.Error()
+			}
+			continue
+		}
 		// A preview's readers write to the branches, so min names them.
 		m.ns = s.logical(m.ns)
-		if m.ns == "" || s.follows(m.ns) {
+		if m.ns == "" {
 			own = append(own, m)
+			continue
+		}
+		if s.holdsPurged(m.ns) {
+			continue
+		}
+		if s.follows(m.ns) {
+			own = append(own, m)
+			continue
+		}
+		if s.siblingPurged(m.ns) {
 			continue
 		}
 		o := s.sibling(m.ns)
 		if o == nil {
-			return http.StatusBadRequest, "bad_input", minElsewhere
+			refused = append(refused, raw)
+			continue
 		}
 		switch ok, err := o.sees(ctx, m.ns, token); {
 		case err != nil:
 			s.opt.Logf("tree: access check for %s: %v", m.ns, err)
-			return http.StatusBadGateway, "upstream", "cannot read a namespace configuration"
+			return minAnswer{status: http.StatusBadGateway, code: "upstream", msg: "cannot read a namespace configuration"}
 		case !ok:
-			return http.StatusBadRequest, "bad_input", minElsewhere
+			refused = append(refused, raw)
+			continue
 		}
 		other[o] = append(other[o], m)
 	}
+	if len(refused) > 0 {
+		msg := minElsewhere
+		if malformed != "" {
+			msg = malformed
+		}
+		return minAnswer{status: http.StatusBadRequest, code: "bad_input", msg: msg, refused: refused}
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.opt.MinWait)
 	defer cancel()
+	behind := minAnswer{status: http.StatusServiceUnavailable, code: "behind", msg: "the tree service has not reached min yet"}
 	if !s.waitMins(ctx, own) {
-		return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
+		return behind
 	}
 	for o, ms := range other {
 		if !o.waitMins(ctx, ms) {
-			return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
+			return behind
 		}
 	}
-	return 0, "", ""
+	return minAnswer{}
+}
+
+// holdsPurged reports whether the service holds ns as purged (meta
+// "purged:{ns}"), trusted still or not.
+func (s *Service) holdsPurged(ns string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.purged[ns]
+	return ok
+}
+
+// siblingPurged reports whether the service of another catalog behind the
+// same Multi holds ns as purged.
+func (s *Service) siblingPurged(ns string) bool {
+	for _, o := range s.siblings {
+		if o.holdsPurged(ns) {
+			return true
+		}
+	}
+	return false
 }
 
 // sibling is the service of another catalog behind the same Multi that
@@ -1268,20 +1346,29 @@ func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
 func parseMins(vals []string) ([]minRef, error) {
 	var out []minRef
 	for _, v := range vals {
-		var m minRef
-		if i := strings.LastIndexByte(v, ':'); i >= 0 {
-			m.ns, v = v[:i], v[i+1:]
-			if !client.ValidNSName(m.ns) {
-				return nil, errors.New("min: malformed namespace name")
-			}
+		m, err := parseMin(v)
+		if err != nil {
+			return nil, err
 		}
-		if _, err := ids.Parse(v); err != nil {
-			return nil, errors.New("min must be {ns}:{ns_id} or an ns_id")
-		}
-		m.id = v
 		out = append(out, m)
 	}
 	return out, nil
+}
+
+// parseMin parses one ?min= value: {ns}:{ns_id} or a bare {ns_id}.
+func parseMin(v string) (minRef, error) {
+	var m minRef
+	if i := strings.LastIndexByte(v, ':'); i >= 0 {
+		m.ns, v = v[:i], v[i+1:]
+		if !client.ValidNSName(m.ns) {
+			return minRef{}, errors.New("min: malformed namespace name")
+		}
+	}
+	if _, err := ids.Parse(v); err != nil {
+		return minRef{}, errors.New("min must be {ns}:{ns_id} or an ns_id")
+	}
+	m.id = v
+	return m, nil
 }
 
 // waitMins waits up to MinWait until every min is reached: the namespace's
@@ -1473,10 +1560,15 @@ func (q *query) node(param string) (*Node, int, string) {
 	q.tags.node(q.g, name)
 	n := q.g.Node(name)
 	if n == nil || !q.v.node(q.g, n) {
-		return nil, http.StatusNotFound, "no such node"
+		return nil, http.StatusNotFound, noSuchNode
 	}
 	return n, http.StatusOK, ""
 }
+
+// noSuchNode is the 404 of a parameter naming a node or item not in the
+// catalog, or hidden from the reader: one message, so it doesn't tell
+// them apart (§B.5, §B.11.5).
+const noSuchNode = "no such node"
 
 func (q *query) entry(n *Node) map[string]any {
 	q.tags.node(q.g, n.Name)
@@ -1622,28 +1714,33 @@ func nonNil(a []any) []any {
 	return a
 }
 
-// paths returns every walkable path from n up to a root through nodes the
-// viewer may see, root first, without n itself, bounded at MaxDepth and
-// maxPaths. incomplete counts paths that end below a root (at a node whose
-// parents are all gone, dangling or cyclic), deep those cut at MaxDepth. A
-// path through a node the viewer may not see is left out without a trace:
-// listings show only paths through visible folders, and nothing about a
-// hidden node, not even a count (§B.11.5), so limits apply to visible
-// paths only.
+// paths returns every walkable path from n up to a root for the viewer
+// through nodes it may see, root first, without n itself, bounded at
+// MaxDepth and maxPaths. A root for the viewer is a node without parents,
+// or a visible one whose parents are all hidden from it, where its paths
+// end (§B.11.5). incomplete counts paths that end below a root (at a node
+// whose parents are all gone, dangling or cyclic), deep those cut at
+// MaxDepth. A path through a node the viewer may not see is left out
+// without a trace: listings show only paths through visible folders, and
+// nothing about a hidden node, not even a count (§B.11.5), so limits apply
+// to visible paths only.
 func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated bool) {
 	var stack []*Node
 	var walk func(x *Node, depth int)
+	end := func() {
+		p := make([]*Node, len(stack))
+		for i := range stack {
+			p[i] = stack[len(stack)-1-i]
+		}
+		paths = append(paths, p)
+	}
 	walk = func(x *Node, depth int) {
 		if len(paths) >= maxPaths {
 			truncated = true
 			return
 		}
 		if len(x.Parents) == 0 && !x.Cyclic {
-			p := make([]*Node, len(stack))
-			for i := range stack {
-				p[i] = stack[len(stack)-1-i]
-			}
-			paths = append(paths, p)
+			end()
 			return
 		}
 		ps := q.g.WalkableParents(x)
@@ -1651,15 +1748,22 @@ func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated
 			incomplete++
 			return
 		}
+		var visible []*Node
+		for _, pn := range ps {
+			if parent := q.g.Node(pn); q.v.node(q.g, parent) {
+				visible = append(visible, parent)
+			}
+		}
+		if len(visible) == 0 {
+			// Every parent is hidden: x is a root for the viewer.
+			end()
+			return
+		}
 		if depth >= MaxDepth {
 			deep++
 			return
 		}
-		for _, pn := range ps {
-			parent := q.g.Node(pn)
-			if !q.v.node(q.g, parent) {
-				continue
-			}
+		for _, parent := range visible {
 			onPath := false
 			for _, s := range stack {
 				if s == parent {
@@ -1782,16 +1886,43 @@ func (q *query) subtree() (any, int, string) {
 	return body, http.StatusOK, ""
 }
 
-// roots lists nodes without parents.
+// roots lists the roots for the reader's subject set (§B.5, §B.11.5):
+// visible nodes without parents, and visible nodes whose parents are all
+// hidden from it.
 func (q *query) roots() (any, int, string) {
 	out := []any{}
-	for _, name := range q.g.Names() {
-		n := q.g.Node(name)
-		if len(n.Parents) == 0 && n.Live() && q.v.node(q.g, n) {
-			out = append(out, q.entry(n))
-		}
+	for _, n := range q.rootNodes() {
+		out = append(out, q.entry(n))
 	}
 	return map[string]any{"at": q.at, "roots": out}, http.StatusOK, ""
+}
+
+// rootNodes are the live nodes that are roots for the viewer, by name.
+func (q *query) rootNodes() []*Node {
+	var out []*Node
+	for _, name := range q.g.Names() {
+		if n := q.g.Node(name); n.Live() && q.v.node(q.g, n) && q.rootFor(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// rootFor reports whether n, visible to the viewer, is a root for it: it
+// has no parents, or every parent a walk may go up to is hidden from it
+// (§B.11.5). A node whose parents are all gone, dangling or cyclic is an
+// orphan (§B.5), not a root.
+func (q *query) rootFor(n *Node) bool {
+	if len(n.Parents) == 0 {
+		return true
+	}
+	ps := q.g.WalkableParents(n)
+	for _, p := range ps {
+		if q.v.node(q.g, q.g.Node(p)) {
+			return false
+		}
+	}
+	return len(ps) > 0
 }
 
 func (q *query) parentsJSON(n *Node) []any {
@@ -1918,7 +2049,9 @@ func (q *query) problems() (any, int, string) {
 }
 
 // where answers "is this item in the catalog, and where?" with its
-// placement and every path to a root.
+// placement and every path to a root. An item not in the catalog, or
+// whose placement is hidden from the reader, is 404 with one message, as
+// a parameter naming a node not in the catalog is (§B.5, §B.11.5).
 func (q *query) where() (any, int, string) {
 	ref := q.vals.Get("item")
 	ns, name, ok := ParseHref(ref)
@@ -1927,12 +2060,11 @@ func (q *query) where() (any, int, string) {
 	}
 	pl := ns + "." + name
 	q.tags.node(q.g, pl)
-	body := map[string]any{"at": q.at, "item": ref, "placement": nil}
 	n := q.g.Node(pl)
 	if n == nil || !q.v.node(q.g, n) {
-		return body, http.StatusOK, ""
+		return nil, http.StatusNotFound, noSuchNode
 	}
-	body["placement"] = q.entry(n)
+	body := map[string]any{"at": q.at, "item": ref, "placement": q.entry(n)}
 	ps, incomplete, deep, trunc := q.paths(n)
 	body["paths"] = q.pathJSON(ps)
 	if incomplete > 0 {
