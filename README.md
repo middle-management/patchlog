@@ -1710,11 +1710,13 @@ patchlog janitor -ns schemas,matches,cat-season -release $R                     
   listed branches in place of their bases (their `/heads` at their first entry, then their logs).
   The graph keeps the bases' names, as documents do; checkpoints, the combined checkpoint, cache
   tags, `/_status` and read checks use the branches, and items carry `url` into the branch and
-  `branch`. A viewer sees the catalog only with a grant reading the catalog's branch (`403`
-  otherwise), and an item's head only with one reading the content branch: items in a content
-  branch the viewer can't read are hidden, never shown from the base. A preview issues no grants (`-access` is
-  refused), and covers one catalog. It follows the release document's namespace log (§10,
-  `tree.OpenPreview`): a revision listing other branches, such as a rebase's successors, switches the
+  `branch`. A preview is a tree service without §B.11 (v0.73, §B.11.5): it serves only `g/all`,
+  to readers whose grants would be issued namespace-wide edge grants on every listed branch that
+  isn't public. Any other grant is `403`, one reading only the catalog's branch or only the bases
+  included (nothing is shown from the base), and a request without a grant gets listings only
+  while the catalog and every branch in the checkpoint are public (`401` otherwise). A preview
+  issues no grants (`-access` is refused), and covers one catalog. It follows the release
+  document's namespace log (§10, `tree.OpenPreview`): a revision listing other branches, such as a rebase's successors, switches the
   preview to them without a restart (it rebuilds its database from the new branches, answering `503`
   `behind` until it has reached them); a revision with the same branches, an invalid one, or deleting
   the document leaves it as it is.
