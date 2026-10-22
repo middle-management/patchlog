@@ -453,7 +453,7 @@ func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
 		return t.edgeReader(n, cred.Edge, resource)
 	}
-	return t.readerCheckURL(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) }, true)
+	return t.readerCheckURL(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) }, readResource)
 }
 
 // nsReader is reader for /ns/{ns} and the URLs under it, but the gestures
@@ -491,12 +491,31 @@ func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 // read of a resource URL in a private namespace answers 404 (§C.2 item
 // 1, §7). A verified grant that may not read is 404.
 func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
-	return t.readerCheckURL(n, cred, may, false)
+	return t.readerCheckURL(n, cred, may, readNS)
 }
 
-// readerCheckURL is readerCheck; resourceURL for a read of a resource URL
-// (reader), where a key-scope failure is 404.
-func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, resourceURL bool) (*actor, *Error) {
+// keysReader is readerCheck for POST /ns/{ns}/keys, which doesn't ignore
+// the grant in a public namespace either (§7, §E.2.3): there too, a grant
+// that doesn't name the namespace is 403, one that can't be used 401, and
+// one its key's scope refuses 403 (§C.2 item 1), as at
+// GET /ns/{ns}/principal.
+func (t *tx) keysReader(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
+	return t.readerCheckURL(n, cred, may, readKeys)
+}
+
+// readKind is the kind of read readerCheckURL authenticates.
+type readKind int
+
+const (
+	readNS       readKind = iota // /ns/{ns} and the URLs under it (readerCheck)
+	readResource                 // a resource URL (reader)
+	readKeys                     // POST /ns/{ns}/keys (keysReader)
+)
+
+// readerCheckURL is readerCheck for a kind of read: a public namespace
+// ignores the grant, but at POST /ns/{ns}/keys, and a key-scope failure is
+// 404 at a resource URL.
+func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, kind readKind) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
 	if t.e.opt.AuthDisabled {
@@ -509,15 +528,15 @@ func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, r
 		switch {
 		case err == nil:
 			t.e.bearers.put(cred.Bearer, g)
-		case cfg.Read == "public":
+		case cfg.Read == "public" && kind != readKeys:
 			// Public content doesn't need the grant: one that is unusable,
-			// or doesn't name the namespace, is ignored.
+			// or doesn't name the namespace, is ignored (§7).
 			a = nil
 		case g == nil && err.Status == 403:
 			return nil, err // not named
 		case err.Status == 401 || err.Status == 413:
 			return nil, err
-		case !resourceURL:
+		case kind != readResource:
 			// The key's scope refuses the grant (403, §C.2 item 1).
 			return nil, err
 		default:

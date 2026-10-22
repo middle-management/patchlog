@@ -234,6 +234,7 @@ func TestV073P17KeyScopeFailureIs403(t *testing.T) {
 			"GET /ns/p/grants/…":   func() error { _, err := e.Grant(ctx, "p", gid, cred); return err },
 			"GET /ns/p/gestures/…": func() error { _, err := e.Gestures(ctx, "p", gesture, "", cred); return err },
 			"POST /ns/p/keys":      func() error { _, err := e.Keys(ctx, "p", cred, KeysRequest{}); return err },
+			"POST /ns/q/keys":      func() error { _, err := e.Keys(ctx, "q", cred, KeysRequest{}); return err },
 			"GET /ns/p/principal":  func() error { _, err := e.Principal(ctx, "p", cred); return err },
 			"GET /ns/q/principal":  func() error { _, err := e.Principal(ctx, "q", cred); return err },
 			"PATCH /r/p/new":       func() error { _, err := v073CreateIn(e.Engine, "p", cred, "new"); return err },
@@ -713,6 +714,41 @@ func TestV073P17MergedLargeBatch(t *testing.T) {
 	for i, d := range got[2:] {
 		if d.key != fmt.Sprintf("r\x00import\x00doc-%06d\x00w", i) || d.cost != 2 {
 			t.Fatalf("merged: draw %d is %q, cost %v", i+2, d.key, d.cost)
+		}
+	}
+}
+
+// POST /ns/{ns}/keys doesn't ignore the grant in a public namespace, as
+// its reads do: it keeps the 403 and 401 answers of steps 2 and 3 (§7,
+// §E.2.3), so a grant that doesn't name the namespace is 403 there, one
+// that can't be used or none 401, and one with read passes to the answer
+// (404 not_offered, the namespace isn't sealed).
+func TestV073P17KeysPublicNamespaceKeepsGrant(t *testing.T) {
+	e := v073Engine(t, p17Fast(), p17Fast(), map[string]any{"read": "grant"})
+	ctx := context.Background()
+	var ks p17Keys
+	ks.add("admin", map[string]any{"can": []any{"*"}})
+	e.create("q", map[string]any{"read": "public", "keys": ks.entries})
+	other := ks.mint(t, map[string]any{"kid": "admin", "sub": "user:o", "ns": []any{"elsewhere"}, "can": []any{"read"}})
+	reader := ks.mint(t, map[string]any{"kid": "admin", "sub": "user:r", "ns": []any{"q"}, "can": []any{"read"}})
+	for _, c := range []struct {
+		what   string
+		cred   Credentials
+		status int
+		code   string
+	}{
+		{"a grant not naming q", other, 403, "forbidden"},
+		{"a token that isn't a grant", Credentials{Bearer: "not-a-grant"}, 401, "unauthenticated"},
+		{"no grant", Credentials{}, 401, "unauthenticated"},
+		{"a grant with read", reader, 404, "not_offered"},
+	} {
+		_, err := e.Keys(ctx, "q", c.cred, KeysRequest{})
+		if ae, ok := err.(*Error); !ok || ae.Status != c.status || ae.Body["code"] != c.code {
+			t.Errorf("POST /ns/q/keys, %s: want %d %s, got %v", c.what, c.status, c.code, err)
+		}
+		// Its reads ignore the grant.
+		if _, err := e.NamespaceHead(ctx, "q", c.cred); err != nil {
+			t.Errorf("GET /ns/q, %s: %v", c.what, err)
 		}
 	}
 }

@@ -483,10 +483,11 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			return t.absentNS(ns, cred)
 		}
 		cfg := t.config(n.configSeq)
-		// Refused as other reads are (§7): 401 without a usable grant, 403
-		// for one that doesn't name a namespace that isn't public, and 404
-		// for one that doesn't verify or has no read.
-		a, aerr := t.readerCheck(n, cred, func(a *actor) bool {
+		// Refused as /principal is, in a public namespace too (§7): 401
+		// without a usable grant, 403 for one that doesn't name the
+		// namespace or that its key's scope refuses (§C.2 item 1), and 404
+		// for one that has no read.
+		a, aerr := t.keysReader(n, cred, func(a *actor) bool {
 			return t.e.opt.AuthDisabled || a != nil && a.verified.Can["read"]
 		})
 		if aerr != nil {
