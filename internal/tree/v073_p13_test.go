@@ -578,3 +578,58 @@ func TestV073LookupNotOffered(t *testing.T) {
 		t.Errorf("sealed: %d %v", r.status, r.body)
 	}
 }
+
+// TC-6 (§B.5, §B.9, §E.2.2, §E.2.6): an implicit placement's born is a
+// value of its item, the created of the content document's first
+// revision: shown only with the item's head, to readers of the item, and
+// never for items of a sealed namespace, whose logs alone carry the exact
+// created of their revisions, nor once a namespace is raised to sealed
+// (with the item's title).
+func TestV073BornOfImplicitPlacement(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for ns, doc := range map[string]map[string]any{
+		"sec":  {"read": "public", "keys": []any{k.Entry("*")}, "encryption": map[string]any{"level": "sealed"}},
+		"priv": {"read": "grant", "keys": []any{k.Entry("*")}},
+		"pub":  {"read": "public", "keys": []any{k.Entry("*")}},
+		"cat":  {"read": "public", "keys": []any{k.Entry("*")}, "catalog": map[string]any{"trust": []any{"sec", "priv", "pub"}, "title": "/title"}},
+	} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	all := []string{"cat", "sec", "priv", "pub"}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", all, []string{"read", "create", "config"})), client.WithKeys(client.NewKeys(nil)))
+	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	self := map[string]any{"title": "Doc", "$parents": []any{map[string]any{"href": "/r/cat/root"}}}
+	createNonced(t, w, "sec", "doc", self)
+	must(w.CreateDoc(ctx, "priv", "doc", self))
+	must(w.CreateDoc(ctx, "pub", "doc", self))
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	x := startSvc(t, sc, svcOpts{now: s.Now, selfPlacing: true})
+	x.caughtUp(all...)
+
+	es := entriesOf(t, x.get("/cat/children?of=root", ""))
+	if e := es["pub.doc"]; e["born"] != bornOf(t, w, "pub", "doc") || e["title"] != "Doc" {
+		t.Errorf("an item of a public namespace: %v", e)
+	}
+	if e := es["sec.doc"]; e == nil || e["head"] == nil || e["born"] != nil || e["title"] != nil {
+		t.Errorf("an item of a sealed namespace: %v", e)
+	}
+	if e := es["priv.doc"]; e == nil || e["head"] != nil || e["born"] != nil {
+		t.Errorf("an item the reader can't read: %v", e)
+	}
+	r := k.Grant(t, s.Now(), "user:r", all, []string{"read"})
+	if e := entriesOf(t, x.get("/cat/children?of=root", r))["priv.doc"]; e["head"] == nil || e["born"] != bornOf(t, w, "priv", "doc") {
+		t.Errorf("an item the reader can read: %v", e)
+	}
+
+	// Raised to sealed: the values listings took from its items go.
+	h := must(w.NSHead(ctx, "pub"))
+	must(w.PatchConfig(ctx, "pub", h.Config, []any{map[string]any{"op": "add", "path": "/encryption", "value": map[string]any{"level": "sealed"}}}))
+	x.caughtUp("pub")
+	if e := entriesOf(t, x.get("/cat/children?of=root", ""))["pub.doc"]; e == nil || e["head"] == nil || e["born"] != nil || e["title"] != nil {
+		t.Errorf("an item of a namespace raised to sealed: %v", e)
+	}
+}

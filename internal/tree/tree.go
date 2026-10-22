@@ -901,6 +901,18 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 		}
 		filed = in.Level != derived.LevelE2E
 	}
+	// An implicit placement's born is a value of its item (§B.9, §B.5):
+	// read only for items of namespaces that are neither sealed nor e2e,
+	// whose logs give the created of each revision in the clear (§E.2.2,
+	// §E.2.6), as titles are.
+	bornable := false
+	if !isCat && s.opt.SelfPlacing {
+		in, err := s.keys.Info(ctx, fb.NS)
+		if err != nil {
+			return fmt.Errorf("tree: the encryption of %s: %w", fb.NS, err)
+		}
+		bornable = !in.Protected()
+	}
 	var preps []prep
 	for _, ch := range co.Changes {
 		p := prep{name: ch.Resource, kind: ch.Kind, head: ch.Target, purged: ch.Purged, created: ch.Created}
@@ -924,7 +936,7 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 				}
 				// A node's born (§B.5): a catalog node's, or that of the
 				// implicit placement a content document makes (§B.9).
-				self := !isCat && s.opt.SelfPlacing && parseSelf(s.opt.Catalog, b.NS, ch.Resource, doc.Value) != nil
+				self := bornable && parseSelf(s.opt.Catalog, b.NS, ch.Resource, doc.Value) != nil
 				if isCat || self {
 					if p.born, err = s.nodeBorn(ctx, fb.NS, ch.Resource, p.head, self); err != nil {
 						return err
@@ -1195,6 +1207,29 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 				if n.ItemNS == ns {
 					g.removeSelf(name)
 					changed[name] = true
+				}
+			}
+		}
+		if cfg != nil && derived.InfoOf(cfg.Value).Protected() {
+			// Raised to sealed or e2e (levels only rise, §E.2.1): the values
+			// listings took from its items go, titles (§B.5) and implicit
+			// placements' born (§B.9), which Apply no longer reads (§E.2.2,
+			// §E.2.6).
+			if _, err := tx.ExecContext(ctx, `UPDATE items SET title = NULL WHERE ns = ? AND title IS NOT NULL`, ns); err != nil {
+				return nil, err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE self_parents SET born = NULL WHERE ns = ?`, ns); err != nil {
+				return nil, err
+			}
+			for _, m := range []map[string]*Node{g.explicit, g.self} {
+				for name, n := range m {
+					if n.ItemNS == ns && (n.ItemTitle != "" || n.Self && n.Born != "") {
+						n.ItemTitle = ""
+						if n.Self {
+							n.Born = ""
+						}
+						changed[name] = true
+					}
 				}
 			}
 		}
@@ -1563,7 +1598,22 @@ func (s *Service) backfillNodes(ctx context.Context) error {
 		}
 	}
 	borns := map[string]string{}
+	open := map[string]bool{} // namespaces whose items' born listings show (Apply)
 	for _, w := range wants {
+		if w.self {
+			ok, seen := open[w.ns]
+			if !seen {
+				in, err := s.keys.Info(ctx, w.ns)
+				if err != nil {
+					return fmt.Errorf("tree: the encryption of %s: %w", w.ns, err)
+				}
+				ok = !in.Protected()
+				open[w.ns] = ok
+			}
+			if !ok {
+				continue
+			}
+		}
 		b, err := s.bornOf(ctx, w.ns, w.name, w.head)
 		if err != nil {
 			return err

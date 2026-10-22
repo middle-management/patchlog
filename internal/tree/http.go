@@ -1600,7 +1600,12 @@ const noSuchNode = "no such node"
 
 // entry is a node as listings show it. Its title and born (§B.5) are the
 // values it takes from the catalog's content, sealed per entry where the
-// listing is (values).
+// listing is (values). An implicit placement's born is its item's, the
+// created of the content document's first revision (§B.9): like the
+// item's head and title, it is shown only to readers of the item, and
+// only for items of namespaces that are neither sealed nor e2e, which the
+// service doesn't hold it for (Apply), since §E.2.2 keeps the exact
+// created of their revisions in their logs.
 func (q *query) entry(n *Node) map[string]any {
 	q.tags.node(q.g, n.Name)
 	m := map[string]any{"href": q.g.Href(n.Name), "name": n.Name, "kind": "folder"}
@@ -1608,7 +1613,7 @@ func (q *query) entry(n *Node) map[string]any {
 	if n.Title != "" {
 		vals["title"] = n.Title
 	}
-	if n.Born != "" {
+	if n.Born != "" && !n.Self {
 		vals["born"] = n.Born
 	}
 	if n.Kind == KindPlacement {
@@ -1623,6 +1628,9 @@ func (q *query) entry(n *Node) map[string]any {
 			if n.Title == "" && n.ItemTitle != "" {
 				// The head's title (§B.5), unless the placement has its own.
 				vals["title"] = n.ItemTitle
+			}
+			if n.Self && n.Born != "" {
+				vals["born"] = n.Born
 			}
 			m["head"] = n.ItemHead
 			// In a release preview the head is the branch's: url reads it
