@@ -263,17 +263,26 @@ const (
 
 // NewValidator returns an empty Validator.
 func NewValidator() *Validator {
-	c := newCompiler(nil, V073)
-	meta, err := c.Compile(Dialect2020)
-	if err != nil {
-		panic("schema: compiling bundled meta-schema: " + err.Error())
-	}
 	return &Validator{
 		compiled: lru.Cache[compiledKey, *jsonschema.Schema]{MaxEntries: maxCompiledSchemas},
 		docs:     lru.Cache[string, any]{MaxEntries: maxSchemaDocs},
-		meta:     meta,
+		meta:     metaSchema(V073),
 	}
 }
+
+// metaSchema compiles the draft 2020-12 meta-schema under r.
+func metaSchema(r Rules) *jsonschema.Schema {
+	meta, err := newCompiler(nil, r).Compile(Dialect2020)
+	if err != nil {
+		panic("schema: compiling bundled meta-schema: " + err.Error())
+	}
+	return meta
+}
+
+// legacyMeta is the meta-schema as Legacy compiles it, for schema
+// documents re-validated under the rules they were stored under; only
+// callers that do so compile it.
+var legacyMeta = sync.OnceValue(func() *jsonschema.Schema { return metaSchema(Legacy) })
 
 type urlLoaderFunc func(url string) (any, error)
 
@@ -365,18 +374,27 @@ func Instance(doc any) any {
 	return out
 }
 
-// Validate implements §6.2 step 5 for a resulting document. A document
+// Validate implements §6.2 step 5 for a document written now. A document
 // that is a schema (a dialect $schema) is checked as one written now:
-// in write mode (CheckSchemaDocument), compiled under V073. A schema
-// revision a document names compiles under Legacy, as every stored
-// revision does until revisions keep their markers (ValidateRules).
+// in write mode (CheckSchemaDocument), under V073. A schema revision a
+// document names compiles under Legacy, as every stored revision does
+// until revisions keep their markers. Re-validating content stored
+// under an earlier version takes ValidateRules.
 func (v *Validator) Validate(doc any, load Loader) error {
+	if IsSchemaDoc(doc) {
+		return v.ValidateRules(doc, load, V073)
+	}
 	return v.ValidateRules(doc, load, Legacy)
 }
 
-// ValidateRules is Validate, compiling the schema revision doc's $schema
-// names under rules, the marker it was written under (§6.1). The marker
-// of that revision governs its whole $ref closure.
+// ValidateRules is Validate under rules, the marker of what doc is held
+// to (§6.1). For a schema document, that is the marker it was written
+// under: V073 checks it as Validate does; Legacy checks it in stored
+// mode, as v0.55 did at write, and compiles it under Legacy, so
+// re-validating a schema revision stored (or copied from one stored)
+// before the upgrade gives the answer its write got. For any other
+// document, it is the marker of the schema revision its $schema names,
+// which governs that revision's whole $ref closure.
 func (v *Validator) ValidateRules(doc any, load Loader, rules Rules) error {
 	obj, ok := doc.(map[string]any)
 	if !ok {
@@ -391,7 +409,7 @@ func (v *Validator) ValidateRules(doc any, load Loader, rules Rules) error {
 		return &RefError{Msg: "$schema must be a string"}
 	}
 	if IsDialect(s) {
-		return v.validateSchemaDocument(doc, load)
+		return v.validateSchemaDocument(doc, load, rules)
 	}
 	ref, ok := ParseRef(s)
 	if !ok {
@@ -404,27 +422,33 @@ func (v *Validator) ValidateRules(doc any, load Loader, rules Rules) error {
 	return toValidationError(sch.Validate(Instance(doc)))
 }
 
-// validateSchemaDocument checks a document whose $schema is a dialect URL,
-// as a schema written now. A top-level $nonce or $successor that step 5
-// leaves out isn't a keyword: it is left out before the document is
-// checked against its dialect, checked and compiled (§6.5).
-func (v *Validator) validateSchemaDocument(doc any, load Loader) error {
+// validateSchemaDocument checks a document whose $schema is a dialect URL
+// under rules, the marker it was written under: V073 as a schema written
+// now (write mode), Legacy as one stored before (stored mode, with no
+// revision path). A top-level $nonce or $successor that step 5 leaves out
+// isn't a keyword: it is left out before the document is checked against
+// its dialect, checked and compiled (§6.5).
+func (v *Validator) validateSchemaDocument(doc any, load Loader, rules Rules) error {
 	doc = leaveOut(doc)
-	if err := toValidationError(v.meta.Validate(doc)); err != nil {
+	meta, ck := v.meta, checker{mode: write}
+	if rules == Legacy {
+		meta, ck = legacyMeta(), checker{mode: stored}
+	}
+	if err := toValidationError(meta.Validate(doc)); err != nil {
 		return err
 	}
-	if err := CheckSchemaDocument(doc, ""); err != nil {
+	if err := ck.check(doc, pointer.Pointer{}); err != nil {
 		return err
 	}
 	// Compile it too, so unresolvable fragments, plain names no anchor
 	// defines and unavailable revisions are caught now rather than when a
 	// document first references this schema (§6.1).
 	var loadErr error
-	c := newCompiler(v.urlLoader(load, &loadErr), V073)
+	c := newCompiler(v.urlLoader(load, &loadErr), rules)
 	// The revisions of its $ref closure are stored, and compile as they
 	// did (§6.1): their patterns as Legacy reads them, until each compiles
 	// under its own marker. The document's own patterns were checked under
-	// V073 above, by the meta-schema and the check.
+	// rules above, by the meta-schema and the check.
 	c.UseRegexpEngine(Legacy.regexpEngine)
 	if err := c.AddResource(newSchemaURL, doc); err != nil {
 		return &SchemaError{Msg: err.Error()}

@@ -53,10 +53,12 @@ type mode uint8
 const (
 	// write: a schema document written now (§6.1, §6.2 step 5, §6.5, §6.6).
 	write mode = iota
-	// stored: a schema document loaded by its revision path, held to the
-	// rules it was written under (§6.1): v0.55's, which allowed a nested
-	// dialect $schema, a root $id equal to its own revision path and any
-	// format, together with all that writes accept now.
+	// stored: a schema document stored under an earlier version, held to
+	// the rules it was written under (§6.1): v0.55's, which allowed a
+	// nested dialect $schema, a root $id equal to its own revision path
+	// and any format, together with all that writes accept now. Its
+	// revision path is selfPath; without one (re-validating its content,
+	// ValidateRules) any $id is refused, as v0.55 refused it at write.
 	stored
 	// fragment: a rule's schema fragment (§6.4.2): write's rules, with no
 	// $schema in any subschema and same-document references only.
@@ -237,7 +239,7 @@ func (ck checker) checkCore(obj map[string]any, at pointer.Pointer) error {
 			return &SchemaError{Msg: fmt.Sprintf("$id at %s is not allowed", loc(at))}
 		}
 		s, _ := v.(string)
-		if len(at) != 0 || s != ck.selfPath {
+		if len(at) != 0 || ck.selfPath == "" || s != ck.selfPath {
 			return &RefError{Msg: fmt.Sprintf("$id at %s is not allowed", loc(at))}
 		}
 	}

@@ -534,3 +534,52 @@ func TestV073WriteRefsStoredPattern(t *testing.T) {
 		t.Errorf("its own pattern: got %v, want invalid", err)
 	}
 }
+
+// CIS-17, INV-2: re-validating a schema document under the marker it was
+// written under gives the answer its write got. Under Legacy it is held
+// to v0.55's rules (stored mode, no revision path); under V073, and in a
+// write (Validate), to today's (§6.1).
+func TestV073RevalidateStoredSchemaDocument(t *testing.T) {
+	old := `{` + d073 + `,"type":"object","properties":{
+		"v":{"type":"string","format":"semver"},
+		"c":{"type":"string","format":"color"},
+		"p":{"type":"string","pattern":"^a\\x{D800}?$"},
+		"n":{` + d073 + `,"type":"string"}}}`
+	v, s := NewValidator(), newStore()
+	if err := v.ValidateRules(j(old), s.load, Legacy); err != nil {
+		t.Errorf("Legacy: %v", err)
+	}
+	if err := v.ValidateRules(j(old), s.load, V073); !isInvalid(err) {
+		t.Errorf("V073: got %v, want invalid", err)
+	}
+	if err := v.Validate(j(old), s.load); !isInvalid(err) {
+		t.Errorf("written now: got %v, want invalid", err)
+	}
+	// What v0.55 refused, Legacy still refuses, as v0.55 did.
+	var re *RefError
+	for _, doc := range []string{
+		`{` + d073 + `,"$id":"` + pathPerson + `"}`,
+		`{` + d073 + `,"$id":""}`,
+		`{` + d073 + `,"$ref":"` + pathAddress + `#/nope"}`,
+	} {
+		err := v.ValidateRules(j(doc), s.load, Legacy)
+		if strings.Contains(doc, "$id") && !errors.As(err, &re) {
+			t.Errorf("%s: got %T %v, want RefError", doc, err, err)
+		}
+		if err == nil {
+			t.Errorf("%s: Legacy accepts", doc)
+		}
+	}
+	for _, doc := range []string{
+		`{` + d073 + `,"foo":1}`,
+		`{` + d073 + `,"pattern":"(?=a)"}`,
+		`{` + d073 + `,"type":"nope"}`,
+	} {
+		if err := v.ValidateRules(j(doc), s.load, Legacy); !isInvalid(err) {
+			t.Errorf("%s: got %v, want invalid", doc, err)
+		}
+	}
+	if err := v.ValidateRules(j(`{`+d073+`,"$ref":"`+pathMissing+`"}`), s.load, Legacy); RefPath(err) != pathMissing {
+		t.Errorf("unavailable: %v", err)
+	}
+}
