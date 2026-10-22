@@ -803,6 +803,26 @@ func (im *importer) submitAll(ctx context.Context, run *runner, lims map[*node]l
 	return nil
 }
 
+// targetMoved reports a batch failure caused by the target moving after
+// it was classified: a 412, or a 410 whose items are all gone with head,
+// the tombstone a create or an older-head append meets on a resource
+// deleted meanwhile, where a create used to get a 412 (§7.2, §8.1).
+func targetMoved(ae *client.APIError) bool {
+	if ae.Status == 412 {
+		return true
+	}
+	items := ae.Items()
+	if ae.Status != 410 || len(items) == 0 {
+		return false
+	}
+	for _, it := range items {
+		if head, _ := it["head"].(string); it["code"] != "gone" || head == "" {
+			return false
+		}
+	}
+	return true
+}
+
 // submitBatch submits a node's batch i, dry-run first if it updates, and
 // checks the ids it produced. A concurrent batch's requests wait at its
 // namespace's gate (admit); any other batch paces after each (pace).
@@ -833,7 +853,7 @@ func (im *importer) submitBatch(ctx context.Context, n *node, i int, l limits) e
 			switch {
 			case batchOverLimits(err) && im.opt.Mode == Atomic:
 				return &TooLargeError{NS: n.ns, Items: len(b.parts), Size: b.size, Err: err}
-			case ae.Status == 412:
+			case targetMoved(ae):
 				return fmt.Errorf("import: the target moved while importing into %s (%w); import again: classification by ancestry picks up what is left", n.ns, err)
 			}
 			// The failing items, as a dry run lists them.
