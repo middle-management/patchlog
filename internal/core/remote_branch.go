@@ -475,9 +475,86 @@ type remoteMirror struct {
 	level   int    // the base's encryption level at at (as served)
 	levels  []*remoteLevel
 	schemas []*remoteSchema
-	// schemaNonce: the schemas' source namespaces that require nonces
-	// (§C.7), as far as they can be read.
-	schemaNonce map[string]bool
+	// schemaSources: the schemas' source namespaces at the base, as their
+	// current namespace documents give them (fetchSchemaSources).
+	schemaSources map[string]schemaSource
+}
+
+// Protection ranks (§2.1): public < private = sealed < e2e.
+const (
+	rankPublic = iota
+	rankPrivate
+	rankE2E
+)
+
+// schemaSource is what a remote branch's schema mirror takes from its
+// source namespace at the base (§G.3): its protection as a source (§2.1),
+// and whether it requires nonces (§C.7).
+type schemaSource struct {
+	rank  int
+	nonce bool
+}
+
+// sourceRank is the protection of a namespace document as a source
+// (§2.1): e2e at E3, sealed (ranked as private) at E2 whatever its read,
+// and otherwise public or private by its read. A level this deployment
+// doesn't know counts as the strictest.
+func sourceRank(doc map[string]any) int {
+	if enc, ok := doc["encryption"].(map[string]any); ok {
+		lv, _ := enc["level"].(string)
+		switch levelOf(lv) {
+		case levelE2E, levelNone:
+			return rankE2E
+		case levelSealed:
+			return rankPrivate
+		}
+	}
+	if doc["read"] == "public" {
+		return rankPublic
+	}
+	return rankPrivate
+}
+
+// targetRank is the protection of a namespace of this deployment as a
+// target (§2.1): as a source, except that a sealed one whose read is
+// public is public.
+func targetRank(cfg *Config) int {
+	switch {
+	case cfg.level == levelE2E:
+		return rankE2E
+	case cfg.Read == "public":
+		return rankPublic
+	}
+	return rankPrivate
+}
+
+// fetchSchemaSources reads the current namespace document of each source
+// namespace of a remote branch's schema closure at the base (§G.3). One
+// this deployment can't read counts as private (§2.1) and leaves the
+// nonce setting optional (§C.7): mirroring writes nothing through the
+// gate, so only later writes here would be checked. Only no answer, or a
+// 5xx, fails creation (502).
+func fetchSchemaSources(ctx context.Context, c *client.Client, schemas []*remoteSchema) (map[string]schemaSource, *Error) {
+	out := map[string]schemaSource{}
+	for _, s := range schemas {
+		if _, done := out[s.ns]; done {
+			continue
+		}
+		src := schemaSource{rank: rankPrivate}
+		h, err := c.NSHead(ctx, s.ns)
+		var d *client.NSDoc
+		if err == nil {
+			d, err = c.NSDoc(ctx, s.ns, h.ID)
+		}
+		switch {
+		case err == nil:
+			src = schemaSource{rank: sourceRank(d.Value), nonce: d.Value["nonce"] == "required"}
+		case noAnswer(err):
+			return nil, upstreamErr("/ns/%s: %v", s.ns, err)
+		}
+		out[s.ns] = src
+	}
+	return out, nil
 }
 
 // fetchLevel fetches and verifies a namespace's log up to at, and its
@@ -867,7 +944,11 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 	for _, k := range sortedKeys(schemas) {
 		m.schemas = append(m.schemas, schemas[k])
 	}
-	m.schemaNonce = fetchSchemaNonces(ctx, c, m.schemas)
+	sources, ferr := fetchSchemaSources(ctx, c, m.schemas)
+	if ferr != nil {
+		return nil, ferr
+	}
+	m.schemaSources = sources
 	return m, nil
 }
 
@@ -1010,7 +1091,7 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	for i := range m.levels {
 		t.shadowLevels[shadowLevelName(req.NS, i)] = cfg.level
 	}
-	if err := t.mirrorSchemas(m, req.NS, cfg, author); err != nil {
+	if err := t.mirrorSchemas(m, req.NS, author); err != nil {
 		return nil, err
 	}
 	shadow, atSeq := t.insertShadows(req.NS, m)
@@ -1308,12 +1389,16 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 // mirrorSchemas mirrors the schema closure into namespaces of this
 // deployment that aren't branches, under the same paths, so $schema
 // resolves here (§G.3). A namespace that doesn't exist is created with the
-// branch's read mode, keys and roles, and takes its source's nonce setting
-// once its history is in (requireNonces, §C.7). A path whose chain neither
-// contains the base's nor is a prefix of it is 409 name_conflict. The
-// entries it writes record the creating operator as author and its grant
-// (§7.4).
-func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author int64) *Error {
+// genesis document { "read": "public" } if its source at the base is
+// public (§2.1), and { "read": "grant" } otherwise, and takes its source's
+// nonce setting once its history is in (requireNonces, §C.7). A mirror,
+// created or existing, that ranks below its source is 422 (§2.1). A path
+// whose chain neither contains the base's nor is a prefix of it, or a
+// namespace that is a branch, is 409 name_conflict; a namespace that
+// refuses the history answers as it refuses it: 410 purged, or 409 frozen
+// where history would be written. The entries it writes record the
+// creating operator as author and its grant (§7.4).
+func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error {
 	type change struct {
 		name string
 		kind string
@@ -1329,23 +1414,47 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 		conflict := func(s *remoteSchema, why string) *Error {
 			return apiErr(409, "name_conflict", "path", "/r/"+s.ns+"/"+s.name+"/rev/"+s.chain.last().ID, "message", why)
 		}
-		if nsName == branch || n != nil && (n.isBranch() || n.purged) {
-			return conflict(byNS[nsName][0], "the schema namespace here is a branch or purged")
+		if nsName == branch || n != nil && n.isBranch() {
+			return conflict(byNS[nsName][0], "the schema namespace here is a branch")
 		}
+		if n != nil && n.purged {
+			// It refuses the history as any write to it (§8.5).
+			e := t.purgedNS(n)
+			e.Body["ns"] = nsName
+			e.Body["message"] = "the schema namespace " + nsName + " here is purged, so the schemas can't be mirrored into it (§G.3, §8.5)"
+			return e
+		}
+		src := m.schemaSources[nsName]
 		created := n == nil
 		if created {
-			doc := map[string]any{"read": cfg.Read}
-			for _, k := range []string{"keys", "roles", "encryption"} {
-				if v, ok := cfg.Doc[k]; ok {
-					doc[k] = jsonv.Clone(v)
-				}
+			read := "grant"
+			if src.rank == rankPublic {
+				read = "public"
 			}
+			doc := map[string]any{"read": read}
 			n, _, _ = t.insertNamespace(nsName, []any{map[string]any{"op": "add", "path": "", "value": doc}}, doc, false, author)
+		}
+		cur := t.config(n.configSeq)
+		if rank := targetRank(cur); rank < src.rank {
+			return invalid(fmt.Sprintf("the schema namespace %s here is less protected than its source at the base (§2.1): "+
+				"a remote branch's schema mirror never ranks below its source (§G.3)", nsName))
+		}
+		// A frozen one refuses the history as any write to it (§8.4), where
+		// there is history to write.
+		var frozen *Error
+		if cur.Frozen {
+			frozen = apiErr(409, "frozen", "message", "the schema namespace "+nsName+" here is frozen, so the schemas can't be mirrored into it (§G.3, §8.4)")
+			if cur.Successor != "" {
+				frozen.Body["successor"] = cur.Successor
+			}
 		}
 		var changes []change
 		for _, s := range byNS[nsName] {
 			own := t.resource(n.id, s.name)
 			if own == nil {
+				if frozen != nil {
+					return frozen
+				}
 				res := t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, n.id, s.name)
 				head := t.insertChain(res, s.chain, 0, nil, false)
 				changes = append(changes, change{s.name, s.chain.last().Kind, head, res})
@@ -1358,6 +1467,9 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 			if i, ok := s.chain.index[h.id.String()]; ok {
 				if i == len(s.chain.entries)-1 {
 					continue // same head
+				}
+				if frozen != nil {
+					return frozen
 				}
 				head := t.insertChain(own.id, s.chain, i+1, h, false) // a prefix: extend it
 				changes = append(changes, change{s.name, s.chain.last().Kind, head, own.id})
@@ -1385,7 +1497,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 			t.must(err)
 		}
 		t.tags = append(t.tags, "ns:"+n.name)
-		if created && m.schemaNonce[nsName] {
+		if created && src.nonce {
 			t.requireNonces(n, author)
 		}
 	}

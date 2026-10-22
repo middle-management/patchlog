@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"testing"
+
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // Spec v0.73, package P14: remote branch creation and registration (§G.3,
@@ -97,4 +99,123 @@ func TestV073RemoteChainRequired(t *testing.T) {
 	if string(canonical(doc["base"])) != string(canonical(map[string]any{"origin": originA, "ns": "r7", "at": f.atA, "chain": strs(r7Chain)})) || doc["x-title"] != "B's" {
 		t.Fatalf("document %v", doc)
 	}
+}
+
+// A missing schema mirror is created with the genesis document exactly
+// { "read": "public" } if its source at A is public, and { "read": "grant" }
+// otherwise, whatever the remote branch's own read, followed by the nonce
+// config write where the source requires nonces (§G.3, §2.1, §C.7).
+func TestV073RemoteSchemaMirrorGenesis(t *testing.T) {
+	t.Parallel()
+	a, b, _ := pair(t, nil, nil)
+	a.mkNS("pub", map[string]any{"read": "public", "nonce": "required"})
+	a.mkNS("priv", map[string]any{"read": "grant"})
+	nonced := matchSchema()
+	nonced["$nonce"] = seal.NewNonce()
+	sPub := a.create("pub", "match", nonced)
+	sPriv := a.create("priv", "match", matchSchema())
+	a.mkNS("main", map[string]any{"read": "public"})
+	a.create("main", "x", map[string]any{"$schema": "/r/pub/match/rev/" + sPub, "score": "1-0"})
+	a.create("main", "y", map[string]any{"$schema": "/r/priv/match/rev/" + sPriv, "score": "0-1"})
+	a.mkNS("hidden", map[string]any{"read": "grant"})
+	a.create("hidden", "z", map[string]any{"$schema": "/r/pub/match/rev/" + sPub, "score": "2-2"})
+
+	// A public remote branch of the public main.
+	expect(t, b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), nil)), 201)
+	genesis := func(ns string) string {
+		t.Helper()
+		lg := b.nsLog(ns)
+		if lg[0]["kind"] != "config" {
+			t.Fatalf("%s: log %v", ns, lg)
+		}
+		return lg[0]["target"].(string)
+	}
+	for ns, read := range map[string]string{"pub": "public", "priv": "grant"} {
+		if got, want := genesis(ns), hashID(t, "", canonical(addRoot(map[string]any{"read": read}))); got != want {
+			t.Errorf("%s: genesis %s, want that of {read: %s}", ns, got, read)
+		}
+	}
+	// The nonce setting follows, by a config write, once the history is in.
+	if k := b.nsKinds("pub"); len(k) != 3 || k[1] != "batch" || k[2] != "config" {
+		t.Fatalf("pub's log %v", k)
+	}
+	if doc := b.get("/ns/pub/rev/" + b.nsHead("pub")).Obj(); string(canonical(doc)) != `{"nonce":"required","read":"public"}` {
+		t.Fatalf("pub's document %v", doc)
+	}
+	if k := b.nsKinds("priv"); len(k) != 2 {
+		t.Fatalf("priv's log %v", k)
+	}
+
+	// A private remote branch doesn't make the mirror of a public source
+	// private (b2 has no mirror yet).
+	b2 := newEnv(t, withOrigin(originB), withRemote(&route{url: a.srv.URL}))
+	expect(t, b2.mkRemote("rel", remoteGenesis("hidden", a.nsHead("hidden"), map[string]any{"read": "grant"})), 201)
+	if doc := b2.get("/ns/pub/rev/" + b2.nsHead("pub")).Obj(); doc["read"] != "public" {
+		t.Fatalf("pub's document %v", doc)
+	}
+}
+
+// A mirror, created or existing, that ranks below its source is 422; a
+// frozen one refuses the history with 409 frozen, where there is history to
+// write, and a purged one with 410 purged; nothing is written (§G.3, §2.1).
+func TestV073RemoteSchemaMirrorRefusals(t *testing.T) {
+	t.Parallel()
+	a, _, rt := pair(t, nil, nil)
+	a.mkNS("schemas", map[string]any{"read": "grant"})
+	s1 := a.create("schemas", "match", matchSchema())
+	a.mkNS("main", map[string]any{"read": "public"})
+	a.create("main", "d", map[string]any{"$schema": "/r/schemas/match/rev/" + s1, "score": "1-0"})
+	at := a.nsHead("main")
+	fresh := func() *tenv { return newEnv(t, withOrigin(originB), withRemote(rt)) }
+	nothing := func(b *tenv, schemasLog int) {
+		t.Helper()
+		expect(t, b.get("/ns/rel"), 404)
+		if k := b.nsKinds("schemas"); len(k) != schemasLog {
+			t.Fatalf("schemas' log %v", k)
+		}
+	}
+
+	// A public mirror of a private source.
+	b := fresh()
+	b.mkNS("schemas", map[string]any{"read": "public"})
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 422, "invalid")
+	nothing(b, 1)
+	expect(t, b.patchNS("schemas", ops(op("replace", "/read", "grant")), ""), 201)
+	expect(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 201)
+
+	// Frozen: refused where history would be written, and only there.
+	b = fresh()
+	b.mkNS("other", map[string]any{"read": "grant"})
+	b.mkNS("schemas", map[string]any{"read": "grant"})
+	expect(t, b.patchNS("schemas", ops(op("add", "/frozen", true), op("add", "/successor", "other")), ""), 201)
+	r := b.mkRemote("rel", remoteGenesis("main", at, nil))
+	expectCode(t, r, 409, "frozen")
+	if r.Str("successor") != "other" {
+		t.Fatalf("409 %s", r.Body)
+	}
+	nothing(b, 2)
+	if g := b.get("/r/schemas/match"); g.Code != 404 {
+		t.Fatalf("mirrored into a frozen namespace: %d", g.Code)
+	}
+	b = fresh()
+	expect(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 201)
+	expect(t, b.patchNS("schemas", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, b.mkRemote("rel2", remoteGenesis("main", at, nil)), 201) // nothing to write
+
+	// Purged: 410 purged, naming the namespace and its purge.
+	b = fresh()
+	b.mkNS("schemas", map[string]any{"read": "grant"})
+	head := b.nsPurge("schemas")
+	r = b.mkRemote("rel", remoteGenesis("main", at, nil))
+	expectCode(t, r, 410, "purged")
+	if r.Str("ns") != "schemas" || r.Str("head") != head {
+		t.Fatalf("410 %s, want ns schemas and head %s", r.Body, head)
+	}
+	expect(t, b.get("/ns/rel"), 404)
+
+	// A branch, or a different history, is still name_conflict.
+	b = fresh()
+	b.mkNS("base", map[string]any{"read": "grant"})
+	expect(t, b.branch("base", map[string]any{"name": "schemas"}, "alice"), 201)
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 409, "name_conflict")
 }

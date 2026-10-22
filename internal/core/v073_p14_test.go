@@ -45,3 +45,48 @@ func TestV073FetchErr(t *testing.T) {
 		t.Errorf("unverified: %v", e)
 	}
 }
+
+// Protection ranks of a schema mirror's source and target (§2.1): sealed is
+// private as a source whatever its read, but a sealed public target is
+// public; an unknown level is the strictest.
+func TestV073MirrorRanks(t *testing.T) {
+	t.Parallel()
+	enc := func(read, level string) map[string]any {
+		d := map[string]any{"read": read}
+		if level != "" {
+			d["encryption"] = map[string]any{"level": level}
+		}
+		return d
+	}
+	for _, c := range []struct {
+		doc  map[string]any
+		want int
+	}{
+		{enc("public", ""), rankPublic},
+		{enc("public", "at-rest"), rankPublic},
+		{enc("grant", ""), rankPrivate},
+		{enc("public", "sealed"), rankPrivate},
+		{enc("grant", "sealed"), rankPrivate},
+		{enc("grant", "e2e"), rankE2E},
+		{enc("public", "quantum"), rankE2E},
+		{map[string]any{}, rankPrivate},
+	} {
+		if got := sourceRank(c.doc); got != c.want {
+			t.Errorf("source %v: %d, want %d", c.doc, got, c.want)
+		}
+	}
+	for _, c := range []struct {
+		cfg  *Config
+		want int
+	}{
+		{&Config{Read: "public"}, rankPublic},
+		{&Config{Read: "public", level: levelSealed}, rankPublic},
+		{&Config{Read: "grant", level: levelSealed}, rankPrivate},
+		{&Config{Read: "grant"}, rankPrivate},
+		{&Config{Read: "grant", level: levelE2E}, rankE2E},
+	} {
+		if got := targetRank(c.cfg); got != c.want {
+			t.Errorf("target %+v: %d, want %d", c.cfg, got, c.want)
+		}
+	}
+}
