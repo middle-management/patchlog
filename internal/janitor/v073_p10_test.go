@@ -265,7 +265,7 @@ func TestV073InheritedKeysOnlyFromLocalBases(t *testing.T) {
 	ops := clienttest.NewKey("ops")
 	must(b.operator(t, "rel").CreateNamespace(ctx, "rel", map[string]any{"read": "grant",
 		"keys": []any{ops.Entry("read", "create", "config", "branch", "purge-ns")},
-		"base": map[string]any{"origin": clienttest.Origin, "ns": "matches", "at": at}}))
+		"base": map[string]any{"origin": clienttest.Origin, "ns": "matches", "at": at, "chain": []any{"matches"}}}))
 	// B's own matches, where ops is a * key.
 	must(b.operator(t, "matches").CreateNamespace(ctx, "matches", map[string]any{"read": "grant", "keys": []any{ops.Entry("*")}}))
 	ed := must(client.New(b.url, client.WithBearer(ops.Grant(t, time.Now(), "user:ed", []string{"rel", "loc", "matches"},
