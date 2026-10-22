@@ -347,7 +347,9 @@ func TestE2ENamespace(t *testing.T) {
 	if st["level"] != "e2e" || !strings.Contains(st["reason"].(string), "keyring recipient") {
 		t.Fatalf("status %v", st)
 	}
-	if r := nx.raw("/e?q="+marker, ""); r.status != 503 || r.body["code"] != "skipped" {
+	// v0.73 (§A.4): a namespace whose keys the service lacks is 404, as
+	// one it doesn't follow.
+	if r := nx.raw("/e?q="+marker, ""); r.status != 404 || r.body["code"] != "not_found" {
 		t.Fatalf("skipped namespace: %d %v", r.status, r.body)
 	}
 	if n := nx.ix.CountRows("e"); n != 0 || nx.ix.Checkpoint("e") != "" {

@@ -92,6 +92,11 @@ const minElsewhere = "min names a namespace the service does not follow or the r
 //	GET /_status                  each followed namespace's encryption level and
 //	                              epoch, whether results are sealed, and why a
 //	                              namespace is skipped
+//
+// A namespace skipped for want of keys (derived.Keys.Skip) is 404 as one
+// the index doesn't follow (§A.4); one whose keys can't be fetched for now
+// is 503 behind after the read check, as is a failure to get the key that
+// seals its results.
 func (ix *Index) Handler() http.Handler {
 	return http.HandlerFunc(ix.serveHTTP)
 }
@@ -137,7 +142,9 @@ func (ix *Index) serveHTTP(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "not_found", "not found")
 		return
 	}
-	if !client.ValidNSName(ns) || !ix.known(ns) {
+	// A namespace the service doesn't follow, or a sealed or e2e one whose
+	// keys it lacks, is 404 alike, before the read check (§A.4, §E.2.6).
+	if _, lacks := ix.keys.Skip(ns); !client.ValidNSName(ns) || !ix.known(ns) || lacks {
 		writeErr(w, http.StatusNotFound, "not_found", "namespace not indexed")
 		return
 	}
@@ -236,11 +243,6 @@ func base(a *access, ns string) string {
 
 func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string, isAt bool) {
 	ctx := r.Context()
-	if reason := ix.keys.Skipped(ns); reason != "" {
-		w.Header().Set("Retry-After", "60")
-		writeErr(w, http.StatusServiceUnavailable, "skipped", "the index does not consume this namespace: "+reason)
-		return
-	}
 	vals := r.URL.Query()
 	q, err := ParseQuery(vals)
 	if err != nil {
@@ -288,6 +290,12 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	}
 	if purged {
 		writePurged(w, head)
+		return
+	}
+	// Keys the service fails to fetch for now (lacking them is the 404
+	// above): behind, as before its first checkpoint (§A.4, §12.1).
+	if reason, _ := ix.keys.Skip(ns); reason != "" {
+		writeBehind(w, "the index cannot obtain the keys of the namespace yet")
 		return
 	}
 	setPtrHeaders := func() {
@@ -353,9 +361,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// e2e namespace the view a result is bound to (§E.2.6).
 	target := func(id string) string { return base(a, ns) + "/at/" + id + derived.CanonicalQuery(vals, "min") }
 	if !ix.waitMins(ctx, q.Mins) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Retry-After", "1")
-		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached min yet")
+		writeBehind(w, "the index has not reached min yet")
 		return
 	}
 	// The committed checkpoint, not the in-memory one: Apply publishes the
@@ -382,9 +388,7 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 		}
 	}
 	if cur == "" {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Retry-After", "1")
-		writeErr(w, http.StatusServiceUnavailable, "behind", "the index has not reached the namespace yet")
+		writeBehind(w, "the index has not reached the namespace yet")
 		return
 	}
 	// min always redirects (§A.5): an older at whose kept result already
@@ -442,9 +446,10 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 
 	info, key, err := ix.keys.Current(ctx, ns)
 	if err != nil {
+		// The key that seals results can't be had: behind (§12.1), no
+		// code of its own.
 		ix.opt.Logf("index: keys of %s: %v", ns, err)
-		w.Header().Set("Retry-After", "5")
-		writeErr(w, http.StatusServiceUnavailable, "keys", "the index cannot obtain the key that seals results of this namespace")
+		writeBehind(w, "the index cannot obtain the key that seals results of this namespace yet")
 		return
 	}
 	if info.Protected() {
@@ -621,7 +626,8 @@ func (ix *Index) writeStored(w http.ResponseWriter, r *http.Request, a *access, 
 
 // serveStatus answers GET /_status (Addendum E): each followed namespace's
 // encryption level and epoch, whether its results are sealed, and why it is
-// skipped if it is.
+// skipped if it is. A query of one skipped for want of keys is 404, of one
+// skipped for now 503 behind.
 func (ix *Index) serveStatus(w http.ResponseWriter) {
 	ix.mu.Lock()
 	nss := make([]string, 0, len(ix.roots))
@@ -787,6 +793,14 @@ func (ix *Index) seen(ctx context.Context, ns, id string) bool {
 	var one int
 	err := ix.db.QueryRowContext(ctx, `SELECT 1 FROM seen WHERE ns = ? AND ns_id = ?`, ns, id).Scan(&one)
 	return err == nil
+}
+
+// writeBehind answers 503 behind (§A.4, §A.5, §12.1): no-store, with
+// Retry-After.
+func writeBehind(w http.ResponseWriter, msg string) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Retry-After", "1")
+	writeErr(w, http.StatusServiceUnavailable, "behind", msg)
 }
 
 // writePurged answers 410 purged with head, the namespace's purge-ns entry,

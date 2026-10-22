@@ -26,10 +26,11 @@
 // be built WithKeys, and Recipient unwraps keys wrapped to the grant's
 // enc); an e2e (E3) namespace only with a keyring Recipient key, its
 // documents folded client-side (the keyring itself is never indexed).
-// Without keys a namespace is skipped: not followed, answered 503
-// "skipped", and reported with the reason at GET /_status. Results over a
-// sealed or e2e namespace are sealed under its current epoch key
-// (§E.2.5): see Handler.
+// Without keys a namespace is skipped: not followed, and reported with the
+// reason at GET /_status. One whose keys the service lacks is answered 404
+// as one it doesn't follow (§A.4); one whose keys it can't fetch for now,
+// 503 behind. Results over a sealed or e2e namespace are sealed under its
+// current epoch key (§E.2.5): see Handler.
 //
 // Stored plaintext. Full-text, facet and sort queries need the indexed
 // values in the clear, so the database holds plaintext derived from
