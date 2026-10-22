@@ -287,9 +287,20 @@ function newEntry(o) {
   return e;
 }
 
+/* With authentication disabled (serve -dev), a write names its author in X-Author and one without it is 400
+ * (§7.2): until the author box is filled, requests without a bearer send DEV_AUTHOR, the name the server gave
+ * such writes before it required the header. authDisabled is what GET / reported (initConn). */
+const DEV_AUTHOR = 'anonymous';
+let authDisabled = false;
+function devAuthor() {
+  const a = $('author').value.trim();
+  if (a) return a;
+  return authDisabled && !$('bearer').value.trim() ? DEV_AUTHOR : '';
+}
+
 function authHeaders() {
   const hd = {};
-  const a = $('author').value.trim();
+  const a = devAuthor();
   if (a) hd['X-Author'] = a;
   const b = $('bearer').value.trim();
   if (b) hd['Authorization'] = /^bearer\s/i.test(b) ? b : 'Bearer ' + b;
@@ -368,6 +379,8 @@ function initConn() {
   api('GET', '/', { label: 'connect' }).then((r) => {
     // GET / (§7): { spec, auth: "grants" | "disabled", origin }.
     const j = r.ok && r.json;
+    authDisabled = !!(j && j.auth === 'disabled');
+    if (authDisabled) $('author').placeholder = `${DEV_AUTHOR} until set  (X-Author, serve -dev)`;
     $('origin').textContent = j && j.origin ? 'origin ' + j.origin + (j.auth === 'disabled' ? ' \u00b7 authentication disabled (development)' : '') : (r.neterr ? 'server unreachable' : 'HTTP ' + r.status);
   });
 }
@@ -453,7 +466,7 @@ async function refreshNS() {
   ]);
   if (ns !== S.ns) return;
   if (lg.status === 200) { const v = await nsLogRead(ns, lg); if (ns !== S.ns) return; S.nsLog = v; }
-  if (hd.status === 200 && hd.json) { S.heads = hd.json.items || []; S.headsNext = hd.json.next || ''; }
+  if (hd.status === 200 && hd.json) { S.heads = headsOf(hd.json); S.headsNext = hd.json.next || ''; }
   if (br.status === 200 && Array.isArray(br.json)) S.branches = br.json; else S.branches = [];
   renderNsAll();
   updateLiveUrls();
@@ -576,10 +589,14 @@ function renderBranches() {
     h('td', {}, b.name ? h('button', { class: 'tiny', onclick: () => asUser(() => selectNS(b.name)) }, 'open') : ''))));
 }
 
+// A /heads page's entries: { heads, next? } (§7.4), or { items } from a
+// server before v0.65.
+function headsOf(page) { return page.heads || page.items || []; }
+
 async function headsMore() {
   if (!S.headsNext || !S.nsHead) return;
   const r = await api('GET', `/ns/${S.ns}/rev/${S.nsHead}/heads?after=${encodeURIComponent(S.headsNext)}`, { auto: true });
-  if (r.status === 200 && r.json) { S.heads = S.heads.concat(r.json.items || []); S.headsNext = r.json.next || ''; renderHeads(); }
+  if (r.status === 200 && r.json) { S.heads = S.heads.concat(headsOf(r.json)); S.headsNext = r.json.next || ''; renderHeads(); }
 }
 
 /* namespace actions */
@@ -1372,7 +1389,7 @@ async function undoLatest(ns, g, author, resources) {
 }
 
 /* ---- the Undo / redo card ---- */
-function undoAuthor() { return $('undoAuthor').value.trim() || $('author').value.trim(); }
+function undoAuthor() { return $('undoAuthor').value.trim() || devAuthor(); }
 
 function undoRefresh() {
   U.stack = S.ns && S.nsHead && undoAuthor() ? undoStackFrom(S.nsLog, undoAuthor()) : null;
@@ -2448,7 +2465,7 @@ async function allHeads(ns, head) {
   for (let page = 0; page < 20; page++) {
     const r = await api('GET', `/ns/${ns}/rev/${head}/heads` + (after ? `?after=${encodeURIComponent(after)}` : ''), { auto: true, label: 'catalog' });
     if (r.status !== 200 || !r.json) break;
-    items = items.concat(r.json.items || []);
+    items = items.concat(headsOf(r.json));
     if (!r.json.next) break;
     after = r.json.next;
   }

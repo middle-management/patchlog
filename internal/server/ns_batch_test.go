@@ -109,7 +109,7 @@ func TestNamespace(t *testing.T) {
 	e.create("docs", "c", map[string]any{})
 	r = e.get("/ns/docs/rev/" + e.nsHead("docs") + "/heads")
 	expect(t, r, 200)
-	items := r.Obj()["items"].([]any)
+	items := r.Obj()["heads"].([]any)
 	got := []string{}
 	for _, x := range items {
 		m := x.(map[string]any)
@@ -119,11 +119,11 @@ func TestNamespace(t *testing.T) {
 		t.Fatalf("heads %v", got)
 	}
 	r = e.get("/ns/docs/rev/" + head + "/heads")
-	if len(r.Obj()["items"].([]any)) != 0 {
+	if len(r.Obj()["heads"].([]any)) != 0 {
 		t.Fatalf("heads at genesis %s", r.Body)
 	}
 	r = e.get("/ns/docs/rev/" + e.nsHead("docs") + "/heads?after=a")
-	if n := len(r.Obj()["items"].([]any)); n != 2 {
+	if n := len(r.Obj()["heads"].([]any)); n != 2 {
 		t.Fatalf("heads after=a %s", r.Body)
 	}
 }

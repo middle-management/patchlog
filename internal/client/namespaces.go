@@ -332,7 +332,13 @@ func (c *Client) HeadsPage(ctx context.Context, ns, nsID, after string) (items [
 		return nil, "", r.apiError()
 	}
 	m := r.obj()
-	arr, _ := m["items"].([]any)
+	// { heads, next? } (§7.4); servers before v0.65 answer { items, next? },
+	// and a remote branch reads its base's pages from whatever version its
+	// deployment runs (§G.3).
+	arr, ok := m["heads"].([]any)
+	if !ok {
+		arr, _ = m["items"].([]any)
+	}
 	for _, x := range arr {
 		o, _ := x.(map[string]any)
 		it := HeadItem{Resource: str(o, "resource"), Kind: str(o, "kind"), Target: str(o, "target"), Created: str(o, "created"), Digest: str(o, "digest")}

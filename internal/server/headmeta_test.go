@@ -33,7 +33,7 @@ func (e *tenv) headItems(ns, nsID string, bearer ...string) map[string]map[strin
 	r := e.get("/ns/"+ns+"/rev/"+nsID+"/heads", bearer...)
 	expect(e.t, r, 200)
 	out := map[string]map[string]any{}
-	for _, x := range r.Obj()["items"].([]any) {
+	for _, x := range r.Obj()["heads"].([]any) {
 		m := x.(map[string]any)
 		out[m["resource"].(string)] = m
 	}

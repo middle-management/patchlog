@@ -846,9 +846,10 @@ func ReprDigest(sum []byte) string {
 	return "sha-256=:" + base64.StdEncoding.EncodeToString(sum) + ":"
 }
 
-// HeadsPage is a page of GET /ns/{ns}/rev/{ns_id}/heads.
+// HeadsPage is a page of GET /ns/{ns}/rev/{ns_id}/heads, served as
+// { "heads": Items, "next"? } (§7.4).
 type HeadsPage struct {
-	Items  []map[string]any `json:"items"`
+	Items  []map[string]any `json:"heads"`
 	Next   string           `json:"next,omitempty"`
 	Public bool             `json:"-"`
 }

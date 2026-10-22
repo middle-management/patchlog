@@ -61,3 +61,19 @@ func TestV073EntriesVia(t *testing.T) {
 		t.Errorf("namespace entries via %v, %v", nl[0].Via, nl[1].Via)
 	}
 }
+
+// HeadsPage reads { heads, next? } (§7.4), and { items, next? } from
+// servers before v0.65, which a remote branch's base may run (RH-10).
+func TestV073HeadsPageShapes(t *testing.T) {
+	t.Parallel()
+	nsID := ids.Hash(nil, []byte("n")).String()
+	for key, want := range map[string]string{"heads": "a", "items": "b"} {
+		c := serveJSON(t, func(r *http.Request) any {
+			return map[string]any{key: []any{map[string]any{"resource": want, "kind": "head", "target": nsID}}, "next": want}
+		})
+		items, next, err := c.HeadsPage(context.Background(), "n", nsID, "")
+		if err != nil || len(items) != 1 || items[0].Resource != want || next != want {
+			t.Errorf("%s: %v %q %v", key, items, next, err)
+		}
+	}
+}

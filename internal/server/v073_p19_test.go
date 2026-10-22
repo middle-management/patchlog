@@ -247,3 +247,37 @@ func TestV073RemoteMirrorCopiesVia(t *testing.T) {
 		t.Errorf("mirrored undelegated entry via %v", got)
 	}
 }
+
+// §7.4, §7.1 Continuations (RH-10): /heads answers { heads, next? }, next
+// the following page's after, absent on the last.
+func TestV073HeadsShape(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withLogPageSize(2))
+	e.mkNS("m", map[string]any{"read": "public"})
+	for _, n := range []string{"a", "b", "c"} {
+		e.create("m", n, map[string]any{})
+	}
+	head := e.nsHead("m")
+	r := e.get("/ns/m/rev/" + head + "/heads")
+	expect(t, r, 200)
+	m := r.Obj()
+	if _, has := m["items"]; has {
+		t.Fatalf("heads page %s carries items", r.Body)
+	}
+	if hs, _ := m["heads"].([]any); len(hs) != 2 || m["next"] != "b" {
+		t.Fatalf("first page %s", r.Body)
+	}
+	r = e.get("/ns/m/rev/" + head + "/heads?after=b")
+	m = r.Obj()
+	if hs, _ := m["heads"].([]any); len(hs) != 1 || hs[0].(map[string]any)["resource"] != "c" {
+		t.Fatalf("last page %s", r.Body)
+	}
+	if _, has := m["next"]; has {
+		t.Fatalf("last page %s names a next", r.Body)
+	}
+	// An empty page is still { heads: [] }.
+	r = e.get("/ns/m/rev/" + head + "/heads?after=z")
+	if hs, ok := r.Obj()["heads"].([]any); !ok || len(hs) != 0 {
+		t.Fatalf("empty page %s", r.Body)
+	}
+}

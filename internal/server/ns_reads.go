@@ -184,7 +184,7 @@ func (s *Server) nsHeads(w http.ResponseWriter, r *http.Request) {
 	// already served survives a purge; this tag, the reference's own,
 	// clears the copies its edge holds.
 	s.cache(w, r, ccImmutable, page.Public, "ns:"+ns, "heads:"+ns)
-	out := map[string]any{"items": page.Items}
+	out := map[string]any{"heads": page.Items}
 	if page.Next != "" {
 		out["next"] = page.Next
 	}
