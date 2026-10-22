@@ -284,6 +284,7 @@ func TestI2I3Server(t *testing.T) {
 		t.Fatal(err)
 	}
 	rq.Header.Set("Content-Type", "text/plain")
+	rq.Header.Set("X-Author", "vectors") // authentication is disabled (§7.2)
 	resp, err := http.DefaultClient.Do(rq)
 	if err != nil {
 		t.Fatal(err)
@@ -648,12 +649,12 @@ func TestI10Rendering(t *testing.T) {
 }
 
 // deployment starts an in-process deployment (core and server, with
-// authentication disabled) and returns a client of it, with the public
-// namespace ns created.
+// authentication disabled) and returns a client of it, writing as X-Author
+// "vectors" (§7.2), with the public namespace ns created.
 func deployment(t *testing.T, ns string) *client.Client {
 	t.Helper()
 	s := clienttest.New(t, clienttest.Options{})
-	c, err := client.New(s.URL)
+	c, err := client.New(s.URL, client.WithAuthor("vectors"))
 	if err != nil {
 		t.Fatal(err)
 	}
