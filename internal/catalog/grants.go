@@ -1185,16 +1185,15 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		return nil, ahead(conflict("%s is already placed in %s; move it instead", item, cat))
 	case h.State == client.Purged:
 		return nil, ahead(conflict("the placement %s was purged", pl))
+	case h.State == client.Tombstoned && widens && !seenD:
+		// The service holds no rows of the placement's deletion (it never
+		// saw it, or it is from before deleted placements' rows were
+		// kept): compared with none, and not decided at the checkpoint.
+		return nil, ahead(forbidden("re-placing %s would give %s the role %s, and the catalog keeps no rows of its deleted placement to compare with; a catalog admin can place it", item, wSubj, wRole))
 	case h.State == client.Tombstoned && widens:
 		// A re-place that widens the deleted placement's rows (§B.11.4
 		// No widening, §B.11.7).
-		err := forbidden("re-placing %s would give %s the role %s, which it didn't have when its placement was deleted; a catalog admin can place it", item, wSubj, wRole)
-		if !seenD {
-			// The service holds no rows of the placement's deletion:
-			// compared with none, not decided at the checkpoint.
-			return nil, ahead(err)
-		}
-		return nil, err
+		return nil, forbidden("re-placing %s would give %s the role %s, which it didn't have when its placement was deleted; a catalog admin can place it", item, wSubj, wRole)
 	case h.State == client.Tombstoned:
 		// Re-placing restores the old placement (§B.11.4): the grant carries
 		// only restore, never create or append, and the client restores

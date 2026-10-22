@@ -33,8 +33,10 @@
 //     current placement would widen them (§B.11.4, §B.11.7). A move of a
 //     deleted item's placement is checked like any other.
 //   - A deleted placement's rows are kept apart from its catalog tombstone
-//     until it is placed again or purged, and a re-place by a non-admin
-//     is refused if it would widen them (§B.11.4 Place, §B.11.7).
+//     until it is placed again or purged, whatever becomes of its item,
+//     and a re-place by a non-admin is refused if it would widen them
+//     (§B.11.4 Place, §B.11.7). One deleted under v0.55, which dropped
+//     its rows, has none kept, so only an admin can re-place it.
 //   - Listings and /read-grants share one visibility test (§B.11.5,
 //     visibility.Node), decided per request from effective and the
 //     content namespaces' documents as of the combined checkpoint
@@ -143,9 +145,13 @@ type Service struct {
 	frozen map[string]map[string][]string
 	// Deleted placements with the rows they had when their catalog
 	// tombstone was seen (§B.11.7), unless their item's are frozen
-	// (tomb): a re-place is checked against them (§B.11.4 Place). None
-	// is in eff.
+	// (tomb): a re-place is checked against them (§B.11.4 Place). An
+	// empty map is a placement deleted without rows, which the service
+	// saw all the same (unplacedRows). None is in eff.
 	unplaced map[string]map[string][]string
+	// placed holds the names of explicit placements as of the last
+	// refresh, so that unplace knows a name whose node is gone was one.
+	placed map[string]bool
 
 	// readRoles per content namespace, with the document they were
 	// derived from (readRolesOf).
@@ -183,7 +189,7 @@ func Open(ctx context.Context, opt Options) (*Service, error) {
 	}
 	s := &Service{opt: opt, eff: map[string]map[string][]string{}, users: map[string]bool{},
 		tomb: map[string]bool{}, frozen: map[string]map[string][]string{},
-		unplaced: map[string]map[string][]string{}, rrCache: map[string]rrEntry{}}
+		unplaced: map[string]map[string][]string{}, placed: map[string]bool{}, rrCache: map[string]rrEntry{}}
 	s.now = opt.Tree.Now
 	if s.now == nil {
 		s.now = time.Now
@@ -244,7 +250,8 @@ func (s *Service) Handler() http.Handler {
 // keyed by the node's href. Rows with tombstoned = 1 are a deleted item's,
 // frozen as they were when its tombstone was seen, and rows with
 // tombstoned = 2 a deleted placement's, kept as they were when its
-// catalog tombstone was seen (§B.11.7).
+// catalog tombstone was seen (§B.11.7). A row with an empty subject and
+// role (keptMarker) records a deletion kept without rows.
 func (s *Service) Init(ctx context.Context, db *sql.DB) error {
 	for _, q := range []string{
 		`CREATE TABLE IF NOT EXISTS access_nodes (node TEXT PRIMARY KEY, inherit INTEGER NOT NULL DEFAULT 1)`,
@@ -286,7 +293,7 @@ func (s *Service) Rebuild(ctx context.Context, tx *sql.Tx, g *tree.Graph) error 
 			return err
 		}
 	}
-	s.eff = map[string]map[string][]string{}
+	s.eff, s.placed = map[string]map[string][]string{}, map[string]bool{}
 	if err := s.loadFrozen(ctx, tx, g); err != nil {
 		return err
 	}
@@ -298,7 +305,7 @@ func (s *Service) Rebuild(ctx context.Context, tx *sql.Tx, g *tree.Graph) error 
 			return err
 		}
 	}
-	if err := s.sweepFrozen(ctx, tx, g); err != nil {
+	if err := s.sweepKept(ctx, tx, g); err != nil {
 		return err
 	}
 	s.users = directUsers(g)
@@ -306,6 +313,7 @@ func (s *Service) Rebuild(ctx context.Context, tx *sql.Tx, g *tree.Graph) error 
 }
 
 // Update recomputes acl for changed nodes and effective for their subtrees.
+// The kept rows of names that aren't nodes are swept apart (sweepKept).
 func (s *Service) Update(ctx context.Context, tx *sql.Tx, g *tree.Graph, changed map[string]bool) error {
 	var names []string
 	for name := range changed {
@@ -319,7 +327,7 @@ func (s *Service) Update(ctx context.Context, tx *sql.Tx, g *tree.Graph, changed
 			return err
 		}
 	}
-	if err := s.sweepFrozen(ctx, tx, g); err != nil {
+	if err := s.sweepKept(ctx, tx, g); err != nil {
 		return err
 	}
 	s.users = directUsers(g)
@@ -338,6 +346,9 @@ func (s *Service) refresh(ctx context.Context, tx *sql.Tx, g *tree.Graph, name s
 	n := g.Node(name)
 	if n == nil || n.Self {
 		return s.unplace(ctx, tx, g, name, clear)
+	}
+	if n.Kind == tree.KindPlacement {
+		s.placed[name] = true
 	}
 	if _, ok := s.unplaced[name]; ok {
 		// Placed again: its deleted placement's rows go (§B.11.7).
@@ -366,33 +377,58 @@ func (s *Service) refresh(ctx context.Context, tx *sql.Tx, g *tree.Graph, name s
 // unplace brings the rows of a name without an explicit node up to date:
 // a node deleted, purged, or never one. A purge drops whatever is kept of
 // it (§8.3). A placement deleted while its item is tombstoned keeps the
-// item's frozen rows, while the item stays tombstoned (sweepFrozen). Any
-// other placement's rows, as they were when its catalog tombstone was
-// seen, are kept apart until it is placed again (refresh) or purged
-// (§B.11.7), for re-places (§B.11.4 Place); a folder's go.
+// item's frozen rows, which become its own once the item isn't tombstoned
+// any more (sweepKept). Any other placement's rows, as they were when its
+// catalog tombstone was seen, none included, are kept apart until it is
+// placed again (refresh) or purged (§B.11.7), for re-places (§B.11.4
+// Place); a folder's go.
 func (s *Service) unplace(ctx context.Context, tx *sql.Tx, g *tree.Graph, name string, clear bool) error {
 	if g.Purged != nil && g.Purged(name) {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM effective WHERE node = ?`, g.Href(name)); err != nil {
-			return err
-		}
-		delete(s.eff, name)
-		delete(s.frozen, name)
-		delete(s.tomb, name)
-		delete(s.unplaced, name)
-		return nil
+		return s.dropKept(ctx, tx, g, name)
 	}
+	was := s.placed[name]
+	delete(s.placed, name)
 	if _, ok := s.unplaced[name]; ok || s.tomb[name] {
 		return nil
 	}
-	if _, _, ok := tree.SplitPlacement(name); ok && len(s.eff[name]) > 0 {
+	if was {
 		if _, err := tx.ExecContext(ctx, `UPDATE effective SET tombstoned = 2 WHERE node = ? AND tombstoned = 0`, g.Href(name)); err != nil {
 			return err
 		}
-		s.unplaced[name] = s.eff[name]
+		rows := s.eff[name]
+		if len(rows) == 0 {
+			rows = map[string][]string{}
+			if err := keptMarker(ctx, tx, g.Href(name), 2); err != nil {
+				return err
+			}
+		}
+		s.unplaced[name] = rows
 		delete(s.eff, name)
 		return nil
 	}
 	return s.writeEffective(ctx, tx, g, name, nil, clear)
+}
+
+// dropKept drops every row of a purged name, kept ones included (§8.3).
+func (s *Service) dropKept(ctx context.Context, tx *sql.Tx, g *tree.Graph, name string) error {
+	if _, err := tx.ExecContext(ctx, `DELETE FROM effective WHERE node = ?`, g.Href(name)); err != nil {
+		return err
+	}
+	delete(s.eff, name)
+	delete(s.frozen, name)
+	delete(s.tomb, name)
+	delete(s.unplaced, name)
+	delete(s.placed, name)
+	return nil
+}
+
+// keptMarker records that a name's kept rows (tombstoned = kind) are
+// none, with a row of no subject, so that a restart (loadFrozen) still
+// knows the service saw the deletion (unplacedRows). No subject is
+// empty, so the row never counts as a role.
+func keptMarker(ctx context.Context, tx *sql.Tx, href string, kind int) error {
+	_, err := tx.ExecContext(ctx, `INSERT INTO effective (node, subject, role, tombstoned) VALUES (?, '', '', ?) ON CONFLICT DO NOTHING`, href, kind)
+	return err
 }
 
 // replaced drops a deleted placement's rows once it is placed again.
@@ -407,9 +443,10 @@ func (s *Service) replaced(ctx context.Context, tx *sql.Tx, g *tree.Graph, name 
 // unplacedRows is what a re-place of a deleted placement is compared
 // with (§B.11.4 Place, §B.11.7): the rows it had when its catalog
 // tombstone was seen, or, if its item was tombstoned then, the item's
-// frozen rows. seen is false if the service holds neither: the placement
-// had no rows, or the service never saw it deleted, or lost its rows (a
-// rebuild from scratch); none counts.
+// frozen rows; either may be none. seen is false if the service holds
+// neither: it never saw the placement deleted, or lost its rows (a
+// rebuild from scratch, or a deletion from before it kept them); none
+// counts.
 func (s *Service) unplacedRows(name string) (rows map[string][]string, seen bool) {
 	if rows, ok := s.unplaced[name]; ok {
 		return rows, true
@@ -427,6 +464,8 @@ func (s *Service) freeze(ctx context.Context, tx *sql.Tx, g *tree.Graph, name st
 	}
 	if e := s.eff[name]; len(e) > 0 {
 		s.frozen[name] = e
+	} else if err := keptMarker(ctx, tx, g.Href(name), 1); err != nil {
+		return err
 	}
 	delete(s.eff, name)
 	s.tomb[name] = true
@@ -443,13 +482,25 @@ func (s *Service) unfreeze(ctx context.Context, tx *sql.Tx, g *tree.Graph, name 
 	return nil
 }
 
-// sweepFrozen drops the frozen rows of deleted items that are no longer
-// placed (refresh doesn't see them) once the item isn't tombstoned any
-// more: restored outside the catalog, or purged. A later deletion then
-// freezes afresh, never reusing rows of an earlier one.
-func (s *Service) sweepFrozen(ctx context.Context, tx *sql.Tx, g *tree.Graph) error {
+// sweepKept brings the kept rows of names without an explicit node up to
+// date, which refresh doesn't see: an apply's changed names are nodes.
+// A purge of the catalog drops them all (§8.3). The frozen rows of a
+// deleted item whose placement was deleted are its placement's rows too
+// (unplace): once the item isn't tombstoned any more (restored outside
+// the catalog, purged or forgotten), they stay as the deleted
+// placement's, kept until it is placed again (§B.11.7), and a later
+// deletion of the item freezes afresh, never reusing them.
+func (s *Service) sweepKept(ctx context.Context, tx *sql.Tx, g *tree.Graph) error {
+	gone := func(name string) bool { n := g.Node(name); return n == nil || n.Self }
+	purged := func(name string) bool { return g.Purged != nil && g.Purged(name) }
 	for name := range s.tomb {
-		if n := g.Node(name); n != nil && !n.Self {
+		if !gone(name) {
+			continue
+		}
+		if purged(name) {
+			if err := s.dropKept(ctx, tx, g, name); err != nil {
+				return err
+			}
 			continue
 		}
 		st := tree.ItemUnknown
@@ -460,11 +511,41 @@ func (s *Service) sweepFrozen(ctx context.Context, tx *sql.Tx, g *tree.Graph) er
 			}
 		}
 		if st != tree.ItemTombstoned {
-			if err := s.unfreeze(ctx, tx, g, name); err != nil {
+			if err := s.thaw(ctx, tx, g, name); err != nil {
 				return err
 			}
 		}
 	}
+	if g.Purged == nil {
+		return nil
+	}
+	for name := range s.unplaced {
+		if gone(name) && purged(name) {
+			if err := s.dropKept(ctx, tx, g, name); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// thaw makes a deleted placement's frozen rows its own (tombstoned = 2)
+// once its item isn't tombstoned any more (sweepKept).
+func (s *Service) thaw(ctx context.Context, tx *sql.Tx, g *tree.Graph, name string) error {
+	href := g.Href(name)
+	if _, err := tx.ExecContext(ctx, `UPDATE effective SET tombstoned = 2 WHERE node = ? AND tombstoned = 1`, href); err != nil {
+		return err
+	}
+	rows := s.frozen[name]
+	if len(rows) == 0 {
+		rows = map[string][]string{}
+		if err := keptMarker(ctx, tx, href, 2); err != nil {
+			return err
+		}
+	}
+	s.unplaced[name] = rows
+	delete(s.frozen, name)
+	delete(s.tomb, name)
 	return nil
 }
 
@@ -492,13 +573,18 @@ func (s *Service) loadFrozen(ctx context.Context, tx *sql.Tx, g *tree.Graph) err
 		if kind == 1 {
 			kept = s.frozen
 			s.tomb[name] = true
+			if subj == "" {
+				continue // keptMarker: frozen holds only names with roles
+			}
 		}
 		m := kept[name]
 		if m == nil {
 			m = map[string][]string{}
 			kept[name] = m
 		}
-		m[subj] = append(m[subj], role)
+		if subj != "" {
+			m[subj] = append(m[subj], role)
+		}
 	}
 	return rows.Err()
 }

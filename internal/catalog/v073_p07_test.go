@@ -2,6 +2,7 @@ package catalog_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"strings"
 	"testing"
@@ -9,6 +10,7 @@ import (
 	"github.com/middle-management/patchlog/internal/catalog"
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/grantcheck"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 	"github.com/middle-management/patchlog/internal/tree"
 )
 
@@ -511,5 +513,187 @@ func TestDeletedPlacementRowsV073(t *testing.T) {
 	must(0, w.svc.Tree().DB().QueryRow(`SELECT count(*) FROM effective WHERE node = '/r/cat/matches.derby'`).Scan(&n))
 	if n != 0 {
 		t.Errorf("rows of a purged placement: %d", n)
+	}
+}
+
+// keptRows counts a node's effective rows with tombstoned = kind, the
+// marker of a deletion kept without rows (an empty subject) included.
+func (w *world) keptRows(name string, kind int) int {
+	w.t.Helper()
+	var n int
+	must(0, w.svc.Tree().DB().QueryRow(`SELECT count(*) FROM effective WHERE node = ? AND tombstoned = ?`, "/r/cat/"+name, kind).Scan(&n))
+	return n
+}
+
+// TestDeletedPlacementRowsOutliveItemV073 (TC-27, §B.11.7): a placement
+// deleted while its item is tombstoned keeps the item's frozen rows as
+// its own, so they stay, until it is placed again, when the item is
+// restored outside the catalog or purged, across restarts too. A re-place
+// into the folder it was deleted from widens nothing (a restore-only
+// grant); one into a wider folder is refused at the checkpoint.
+func TestDeletedPlacementRowsOutliveItemV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	for _, item := range []string{"derby", "rumour1"} {
+		must(w.ops.Delete(ctx, "matches", item, must(w.ops.Head(ctx, "matches", item)).ID))
+		w.caughtUp()
+		must(w.ops.Delete(ctx, "cat", "matches."+item, must(w.ops.Head(ctx, "cat", "matches."+item)).ID))
+		w.caughtUp()
+	}
+	if n := w.keptRows("matches.derby", 1); n != 4 {
+		t.Fatalf("frozen rows of the deleted placement: %d", n)
+	}
+
+	// derby is restored outside the catalog, rumour1 purged.
+	tomb := must(w.ops.Head(ctx, "matches", "derby"))
+	must(w.ops.Restore(ctx, "matches", "derby", tomb.ID, []any{map[string]any{"op": "replace", "path": "",
+		"value": map[string]any{"title": "derby"}}}))
+	purger := w.core(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"purge"}))
+	must(purger.Purge(ctx, "matches", "rumour1", must(w.ops.Head(ctx, "matches", "rumour1")).ID, false))
+	w.caughtUp()
+	eic := w.caller("user:eve", "editors-in-chief", "match-desk")
+	toSeason := map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}
+	toTR := map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("rumours")}
+	for _, restarted := range []bool{false, true} {
+		if restarted {
+			w.stop()
+			w.start()
+			w.caughtUp()
+		}
+		// season's four entries, and rumours' one, are the deleted
+		// placements' own now.
+		for name, want := range map[string]int{"matches.derby": 4, "matches.rumour1": 1} {
+			if n1, n2 := w.keptRows(name, 1), w.keptRows(name, 2); n1 != 0 || n2 != want {
+				t.Errorf("restarted %v: rows of %s: %d frozen, %d kept (want 0, %d)", restarted, name, n1, n2, want)
+			}
+		}
+		if b := w.issue(eic, toSeason, 200).body; fmt.Sprint(b["can"]) != "[restore]" {
+			t.Errorf("restarted %v: re-place into season: %v", restarted, b)
+		}
+		if r := w.issue(eic, toTR, 403); r.body["checkpoint"] == nil {
+			t.Errorf("restarted %v: widening re-place: %v", restarted, r.body)
+		}
+	}
+
+	// Placed again, they go.
+	g := w.grantFor(eic, toSeason)
+	ptomb := must(w.ops.Head(ctx, "cat", "matches.derby"))
+	must(w.core(g).Restore(ctx, "cat", "matches.derby", ptomb.ID, []any{map[string]any{"op": "replace", "path": "",
+		"value": map[string]any{"parents": parents("season")}}}))
+	w.caughtUp()
+	if n1, n2 := w.keptRows("matches.derby", 1), w.keptRows("matches.derby", 2); n1 != 0 || n2 != 0 {
+		t.Errorf("kept rows once placed again: %d frozen, %d kept", n1, n2)
+	}
+}
+
+// TestCatalogPurgeDropsKeptRowsV073 (TC-27, §8.3, §B.11.7): a purge of the
+// catalog namespace drops the rows kept for deleted placements, which
+// aren't nodes any more, and the frozen rows of deleted items whose
+// placements were deleted, with the rest.
+func TestCatalogPurgeDropsKeptRowsV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	must(w.ops.Delete(ctx, "cat", "matches.derby", must(w.ops.Head(ctx, "cat", "matches.derby")).ID))
+	must(w.ops.Delete(ctx, "matches", "rumour1", must(w.ops.Head(ctx, "matches", "rumour1")).ID))
+	w.caughtUp()
+	must(w.ops.Delete(ctx, "cat", "matches.rumour1", must(w.ops.Head(ctx, "cat", "matches.rumour1")).ID))
+	w.caughtUp()
+	if n1, n2 := w.keptRows("matches.rumour1", 1), w.keptRows("matches.derby", 2); n1 != 1 || n2 != 4 {
+		t.Fatalf("kept rows before the purge: %d frozen, %d kept", n1, n2)
+	}
+	w.purge("cat")
+	var n int
+	must(0, w.svc.Tree().DB().QueryRow(`SELECT count(*) FROM effective`).Scan(&n))
+	if n != 0 {
+		t.Errorf("effective rows after the catalog namespace was purged: %d (want 0)", n)
+	}
+}
+
+// TestRowlessDeletedPlacementV073 (TC-27, §B.11.4 checkpoint): a placement
+// deleted without rows is still one the service saw deleted, across
+// restarts, whether its item was live or tombstoned then: a re-place that
+// would give it any role widens, and that refusal is decided at the
+// checkpoint, so it carries it. A deleted folder keeps nothing.
+func TestRowlessDeletedPlacementV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("cat", "bare", map[string]any{"title": "Bare", "parents": parents("root")})
+	w.doc("cat", "spare", map[string]any{"title": "Spare", "parents": parents("root")})
+	for _, item := range []string{"lone", "gone"} {
+		w.doc("matches", item, map[string]any{"title": item})
+		w.doc("cat", "matches."+item, map[string]any{"parents": parents("bare")})
+	}
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	must(w.ops.Delete(ctx, "matches", "gone", must(w.ops.Head(ctx, "matches", "gone")).ID))
+	w.caughtUp()
+	for _, name := range []string{"matches.lone", "matches.gone", "spare"} {
+		must(w.ops.Delete(ctx, "cat", name, must(w.ops.Head(ctx, "cat", name)).ID))
+	}
+	w.caughtUp()
+	bob := w.caller("user:bob", "match-desk")
+	for _, restarted := range []bool{false, true} {
+		if restarted {
+			w.stop()
+			w.start()
+			w.caughtUp()
+		}
+		for _, item := range []string{"lone", "gone"} {
+			r := w.issue(bob, map[string]any{"item": "/r/matches/" + item, "want": toAny("place"), "to": toAny("season")}, 403)
+			msg, _ := r.body["message"].(string)
+			if r.body["checkpoint"] == nil || !strings.Contains(msg, "didn't have when its placement was deleted") {
+				t.Errorf("restarted %v: widening re-place of %s: %v", restarted, item, r.body)
+			}
+		}
+		var n int
+		must(0, w.svc.Tree().DB().QueryRow(`SELECT count(*) FROM effective WHERE node = '/r/cat/spare'`).Scan(&n))
+		if n != 0 {
+			t.Errorf("restarted %v: rows of a deleted folder: %d", restarted, n)
+		}
+	}
+}
+
+// TestPlacementDeletedUnseenV073 (TC-27; v0.55 data): v0.55 dropped a
+// deleted placement's rows, so one deleted before the upgrade has none
+// kept. A non-admin's re-place is compared with none: refused, saying no
+// rows are kept, not that the placement lacked the role, and without a
+// checkpoint, since the service holds nothing of the deletion. An admin
+// may still re-place it. Simulated by removing the kept rows, as v0.55
+// would have, while the service is stopped.
+func TestPlacementDeletedUnseenV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	must(w.ops.Delete(ctx, "cat", "matches.derby", must(w.ops.Head(ctx, "cat", "matches.derby")).ID))
+	w.caughtUp()
+	w.stop()
+	db, err := sql.Open("sqlite", sqlitedsn.DSN(w.db, ""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	must(db.Exec(`DELETE FROM effective WHERE node = '/r/cat/matches.derby'`))
+	db.Close()
+	w.start()
+	w.caughtUp()
+	toSeason := map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}
+	r := w.issue(w.caller("user:eve", "editors-in-chief", "match-desk"), toSeason, 403)
+	if msg, _ := r.body["message"].(string); !strings.Contains(msg, "keeps no rows") || r.body["checkpoint"] != nil {
+		t.Errorf("re-place of a placement deleted unseen: %v", r.body)
+	}
+	if b := w.issue(w.caller("user:ada", "catalog-admins", "editors-in-chief"), toSeason, 200).body; fmt.Sprint(b["can"]) != "[restore]" {
+		t.Errorf("an admin's re-place: %v", b)
 	}
 }
