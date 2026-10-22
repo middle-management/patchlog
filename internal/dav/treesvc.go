@@ -100,6 +100,7 @@ type treeShared struct {
 
 	mu    sync.Mutex
 	confs map[string]catConf // by catalog
+	read  map[string]bool    // by catalog: its settings were read, a file tree's or not
 }
 
 // init checks opt's tree services and, with any, watches the writes of
@@ -128,7 +129,7 @@ func (ts *treeShared) init(opt *Options) error {
 		}
 	}
 	opt.TreeServices = urls
-	ts.confs, ts.page = map[string]catConf{}, treePage
+	ts.confs, ts.read, ts.page = map[string]catConf{}, map[string]bool{}, treePage
 	if opt.TreeService == "" && len(urls) == 0 {
 		return nil
 	}
@@ -191,6 +192,7 @@ func (st *reqState) treeConf(ctx context.Context, cat string) (catConf, error) {
 func (s *Server) learn(cat string, c *catConf) {
 	s.ts.mu.Lock()
 	defer s.ts.mu.Unlock()
+	s.ts.read[cat] = true
 	if c == nil {
 		delete(s.ts.confs, cat)
 	} else {
@@ -203,6 +205,14 @@ func (s *Server) learned(cat string) (catConf, bool) {
 	defer s.ts.mu.Unlock()
 	c, ok := s.ts.confs[cat]
 	return c, ok
+}
+
+// settingsRead reports whether catalog cat's settings were read with any
+// grant since start (learn), whether or not they make a file tree.
+func (s *Server) settingsRead(cat string) bool {
+	s.ts.mu.Lock()
+	defer s.ts.mu.Unlock()
+	return s.ts.read[cat]
 }
 
 // treeSvc is what a user (principal) keeps for listing through a tree

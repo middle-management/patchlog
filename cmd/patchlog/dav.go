@@ -22,7 +22,7 @@ import (
 
 // davCmd serves namespaces over WebDAV (a prototype, internal/dav):
 //
-//	patchlog dav -api URL [-addr 127.0.0.1:8090] -ns NS[,NS…] [-catalog NS[,NS…] [-case-sensitive] [-tree-url [CATALOG=]URL]... [-tree-wait 3s]]
+//	patchlog dav -api URL [-addr 127.0.0.1:8090] -ns NS[,NS…] [-catalog NS[,NS…] [-case-sensitive] [-tree-url [CATALOG=]URL]... [-tree-wait 3s]] [-inline-pdf]
 //	             [-bearer GRANT | -bearer-file FILE] [-author NAME] [-password-file FILE]
 //	             [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]
 //
@@ -42,6 +42,7 @@ func davCmd(args []string) {
 	fs.Var(&nss, "ns", "flat namespace to serve, a directory of its files: raw ones by name, JSON documents as {name}.json (repeatable or comma-separated)")
 	fs.Var(&cats, "catalog", "catalog namespace to serve as a file tree, one whose namespace document has catalog.files (§H.2; repeatable or comma-separated)")
 	caseSensitive := fs.Bool("case-sensitive", false, "compare the names in a file tree's folder after NFC only, not after case folding too")
+	inlinePDF := fs.Bool("inline-pdf", false, "serve PDFs for display in the browser rather than as attachments (Content-Disposition: attachment); either way without the sandbox (§7.8, §H.6)")
 	var treeURLs multi
 	fs.Var(&treeURLs, "tree-url", "tree service (§B.5) following the -catalog trees, e.g. http://tree:8082, which their folders are listed from with each user's grant (§H.3, §H.7); CATALOG=URL maps one catalog to its own (repeatable). Without one, folders are listed from the catalogs' node documents")
 	treeWait := fs.Duration("tree-wait", 3*time.Second, "how long a user's listing waits for the tree service to reach the user's own writes (?min=) before it reads the node documents")
@@ -80,7 +81,7 @@ func davCmd(args []string) {
 	if err != nil {
 		log.Fatalf("dav: -max-raw-size: %v", err)
 	}
-	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, CaseSensitive: *caseSensitive, Gateway: *gateway, FetchConcurrency: *fetchConc,
+	opt := dav.Options{Namespaces: flat, Catalogs: catalogs, CaseSensitive: *caseSensitive, InlinePDF: *inlinePDF, Gateway: *gateway, FetchConcurrency: *fetchConc,
 		CacheBytes: cache, MaxFileSize: maxSize, MaxRawSize: maxRawSize, TreeWait: *treeWait, Logf: log.Printf}
 	if opt.TreeService, opt.TreeServices, err = treeServices(treeURLs); err != nil {
 		log.Fatalf("dav: -tree-url: %v", err)

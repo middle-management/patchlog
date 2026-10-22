@@ -202,17 +202,18 @@ func TestAsideWindow(t *testing.T) {
 
 // A DELETE of a file, then a MOVE of another file onto its path (rclone's
 // mount without a cache saves through a temporary file so, and in a tree
-// or under a resource name the temporary file is a file of its own): the
-// write restores the deleted file (§H.6), its placement and its item, or
+// or under a resource name the temporary file is a file of its own; sed
+// -i's is a scratch file since v0.56, §H.6): the write restores the
+// deleted file (§H.6), its placement and its item, or
 // its resource, rebased on its last live document, so it keeps its
 // history and others' edits; then the temporary file is deleted. One the
 // core refuses puts the deleted file back as it was.
 func TestDeleteThenMoveOnto(t *testing.T) {
 	t.Parallel()
-	e := treeEnv(t)
+	e := treeDocsEnv(t)
 	buf := e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET").body
 	e.theirs("matches", "derby", map[string]any{"op": "add", "path": "/venue", "value": "theirs"})
-	e.expect(e.do("PUT", "/cat/Season/sedAb12Cd", edit(t, buf, `"Derby"`, `"Derby (sed)"`)), 201, "PUT the temporary file, a file of the tree")
+	e.expect(e.do("PUT", "/cat/Season/sedAb12Cd", edit(t, buf, `"Derby"`, `"Derby (sed)"`)), 201, "PUT the temporary file, sed -i's, a scratch file (§H.6)")
 	e.expect(e.do("DELETE", "/cat/Season/derby.json", ""), 204, "DELETE the original")
 	e.expect(e.do("MOVE", "/cat/Season/sedAb12Cd", "", "Destination", "/cat/Season/derby.json", "Overwrite", "F"), 201, "MOVE onto the name")
 	if h, _ := e.load("cat", "matches.derby"); h.State != client.Live {
@@ -222,36 +223,54 @@ func TestDeleteThenMoveOnto(t *testing.T) {
 	sameJSON(t, doc, map[string]any{"title": "Derby (sed)", "venue": "theirs"})
 	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 
+	// A temporary file whose name isn't scratch is a file of the tree,
+	// its own placement and item: moved onto the path, it restores the
+	// deleted file the same way, and is deleted.
+	buf = e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET").body
+	e.theirs("matches", "derby", replace("/venue", "theirs again"))
+	e.expect(e.do("PUT", "/cat/Season/derby.tmp", edit(t, buf, `"Derby (sed)"`, `"Derby (tmp)"`)), 201, "PUT the temporary file, a file of the tree")
+	if h, _ := e.load("cat", "matches.derby"); h.State != client.Live {
+		t.Fatalf("the placement is %v", h.State)
+	}
+	e.expect(e.do("DELETE", "/cat/Season/derby.json", ""), 204, "DELETE the original")
+	e.expect(e.do("MOVE", "/cat/Season/derby.tmp", "", "Destination", "/cat/Season/derby.json", "Overwrite", "F"), 201, "MOVE onto the name")
+	if h, _ := e.load("cat", "matches.derby"); h.State != client.Live {
+		t.Fatalf("the placement is %v", h.State)
+	}
+	_, doc = e.load("matches", "derby")
+	sameJSON(t, doc, map[string]any{"title": "Derby (tmp)", "venue": "theirs again"})
+	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+
 	// The flat view, a temporary file with a resource name.
-	e.create("matches", "cup", map[string]any{"title": "Cup", "n": "1"})
-	buf = e.expect(e.do("GET", "/matches/cup.json", ""), 200, "GET").body
-	e.theirs("matches", "cup", replace("/n", "theirs"))
-	e.expect(e.do("PUT", "/matches/cup.tmp.json", edit(t, buf, `"Cup"`, `"Cup (tmp)"`)), 201, "PUT the temporary file")
-	e.expect(e.do("DELETE", "/matches/cup.json", ""), 204, "DELETE the original")
-	e.expect(e.do("MOVE", "/matches/cup.tmp.json", "", "Destination", "/matches/cup.json", "Overwrite", "F"), 201, "MOVE onto the name")
-	_, doc = e.load("matches", "cup")
+	e.create("docs", "cup", map[string]any{"title": "Cup", "n": "1"})
+	buf = e.expect(e.do("GET", "/docs/cup.json", ""), 200, "GET").body
+	e.theirs("docs", "cup", replace("/n", "theirs"))
+	e.expect(e.do("PUT", "/docs/cup.tmp.json", edit(t, buf, `"Cup"`, `"Cup (tmp)"`)), 201, "PUT the temporary file")
+	e.expect(e.do("DELETE", "/docs/cup.json", ""), 204, "DELETE the original")
+	e.expect(e.do("MOVE", "/docs/cup.tmp.json", "", "Destination", "/docs/cup.json", "Overwrite", "F"), 201, "MOVE onto the name")
+	_, doc = e.load("docs", "cup")
 	sameJSON(t, doc, map[string]any{"title": "Cup (tmp)", "n": "theirs"})
-	if h, _ := e.load("matches", "cup.tmp"); h.State != client.Tombstoned || h.Successor != "" {
+	if h, _ := e.load("docs", "cup.tmp"); h.State != client.Tombstoned || h.Successor != "" {
 		t.Fatalf("cup.tmp: %+v", h)
 	}
 
 	// Refused (a conflict): the original is put back as it was.
-	e.create("matches", "lid", map[string]any{"title": "Lid"})
-	buf = e.expect(e.do("GET", "/matches/lid.json", ""), 200, "GET").body
-	e.theirs("matches", "lid", replace("/title", "theirs"))
-	e.expect(e.do("PUT", "/matches/lid.tmp.json", edit(t, buf, `"Lid"`, `"Lid (tmp)"`)), 201, "PUT the temporary file")
-	e.expect(e.do("DELETE", "/matches/lid.json", ""), 204, "DELETE the original")
-	r := e.expect(e.do("MOVE", "/matches/lid.tmp.json", "", "Destination", "/matches/lid.json", "Overwrite", "F"), 409, "MOVE of a conflicting version")
+	e.create("docs", "lid", map[string]any{"title": "Lid"})
+	buf = e.expect(e.do("GET", "/docs/lid.json", ""), 200, "GET").body
+	e.theirs("docs", "lid", replace("/title", "theirs"))
+	e.expect(e.do("PUT", "/docs/lid.tmp.json", edit(t, buf, `"Lid"`, `"Lid (tmp)"`)), 201, "PUT the temporary file")
+	e.expect(e.do("DELETE", "/docs/lid.json", ""), 204, "DELETE the original")
+	r := e.expect(e.do("MOVE", "/docs/lid.tmp.json", "", "Destination", "/docs/lid.json", "Overwrite", "F"), 409, "MOVE of a conflicting version")
 	if !strings.Contains(r.body, "restored") {
 		t.Fatalf("409 %q", r.body)
 	}
-	now, doc := e.load("matches", "lid")
+	now, doc := e.load("docs", "lid")
 	sameJSON(t, doc, map[string]any{"title": "theirs"})
-	if now.State != client.Live || len(must(e.c.Log(e.ctx, "matches", "lid", "", ""))) != 4 {
+	if now.State != client.Live || len(must(e.c.Log(e.ctx, "docs", "lid", "", ""))) != 4 {
 		t.Fatalf("lid isn't restored as it was: %+v", now)
 	}
-	sameJSON(t, e.lastEntry("matches", "lid").Patches, []any{})
-	if h, _ := e.load("matches", "lid.tmp"); h.State != client.Live {
+	sameJSON(t, e.lastEntry("docs", "lid").Patches, []any{})
+	if h, _ := e.load("docs", "lid.tmp"); h.State != client.Live {
 		t.Fatalf("the temporary file is %v after the refused MOVE", h.State)
 	}
 }

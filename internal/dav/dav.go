@@ -9,7 +9,9 @@
 // document (its root a blob reference, §7.8) as its resource name, any
 // other as {name}.json; a catalog (Addendum B) with catalog.files is a
 // file tree (§H.2), its folder nodes as directories and its placements as
-// files holding their items, each named by its node's title.
+// files holding their items, each named by its node's title. The tree
+// owns the items of its catalog.files.ns: served flat too, that
+// namespace is read-only there (readOnly).
 //
 // A raw file reads as its blob's bytes, typed by its name (§H.1); a JSON
 // file as its rendering, the document's canonical JSON (§3.1) laid out,
@@ -89,6 +91,12 @@ type Options struct {
 	// reach the user's own writes through this server (?min=, §B.5),
 	// before the folder is listed from the node documents (default 3s).
 	TreeWait time.Duration
+	// InlinePDF serves a PDF (a raw file stored as application/pdf) for
+	// display in the browser; by default it is sent as an attachment
+	// (Content-Disposition: attachment). Either way its 200 and 206 go
+	// without the sandbox, which blanks browsers' PDF viewers, and keep
+	// nosniff (§7.8, §H.6 "Headers").
+	InlinePDF bool
 	// CaseSensitive compares the names of a tree's siblings after NFC
 	// only; by default they are compared after Unicode case folding too
 	// (§H.2 "Siblings"), as the file systems of macOS and Windows, whose
@@ -355,7 +363,8 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Whatever an answer holds (a file, a listing, an error repeating a
 	// name the client sent), no page of this origin, which holds the
 	// users' credentials, runs it, nor does a browser take it for another
-	// type (§H.6 "Raw bytes").
+	// type (§H.6 "Headers"); a PDF served whole or in part goes without
+	// the sandbox (pdf).
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Content-Security-Policy", "sandbox")
 	if r.Method == http.MethodPost {
@@ -485,6 +494,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
 		}
 	}
+	if de := st.readOnly(r.Context()); de != nil {
+		http.Error(w, de.msg, de.status)
+		return
+	}
 	switch {
 	case r.Body != nil && r.Method == "PUT":
 		r.Body = &bodyReader{ReadCloser: r.Body, st: st}
@@ -520,24 +533,112 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.ServeHTTP(&errWriter{ResponseWriter: w, st: st, realm: s.realm()}, r.WithContext(context.WithValue(r.Context(), stateKey{}, st)))
 }
 
+// readOnly refuses (403) a request that would write in the flat view of
+// a namespace a served file tree owns (§H.2 "A file tree is a catalog":
+// the tree owns the items in its files.ns, and a gateway doesn't also
+// serve files.ns as a writable flat folder): a PUT, DELETE, MKCOL or
+// LOCK there, a MOVE out of it or into it, a COPY into it. It is shown
+// read-only, its files read and copied out as anywhere; its items are
+// written through the tree.
+func (st *reqState) readOnly(ctx context.Context) *davError {
+	var paths []string
+	switch st.method {
+	case "PUT", "DELETE", "MKCOL", "LOCK":
+		paths = []string{st.path}
+	case "MOVE":
+		paths = []string{st.path, st.dst}
+	case "COPY":
+		paths = []string{st.dst}
+	}
+	for _, p := range paths {
+		ns, _, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
+		cat, unread, err := st.ownedBy(ctx, ns)
+		switch {
+		case err != nil:
+			if de, ok := upstream(err).(*davError); ok {
+				return de
+			}
+			return fail(http.StatusBadGateway, "%s: file tree settings couldn't be read: %v", p, err)
+		case cat != "":
+			return fail(http.StatusForbidden, "%s is read-only here: file tree %s owns the items of namespace %s (its catalog.files.ns, §H.2), so they are written, moved and deleted through /%s/, not in %s's flat view", p, cat, ns, cat, ns)
+		case unread != "":
+			return fail(http.StatusForbidden, "%s is read-only here for now: file tree %s may own the items of namespace %s (its catalog.files.ns, §H.2), whose flat view isn't written then, and its settings can't be read with your grant, nor were they read with another since this server started; they are once a user whose grant reads catalog %s opens /%s/", p, unread, ns, unread, unread)
+		}
+	}
+	return nil
+}
+
+// ownedBy returns the served catalog whose file tree owns flat namespace
+// ns, the one its catalog.files.ns names (§H.2), "" for none: as the
+// token reads the catalog's settings (nsInfo), else as last read with
+// any grant, the server's own at start included (learn). Where some
+// served catalog's settings are known neither way (a gateway's start
+// reads them without a grant), it fails closed: unread names that
+// catalog, which may own ns; err is a read that failed for now.
+func (st *reqState) ownedBy(ctx context.Context, ns string) (owner, unread string, err error) {
+	if !st.s.flat[ns] {
+		return "", "", nil
+	}
+	cats := make([]string, 0, len(st.s.cats))
+	for cat := range st.s.cats {
+		cats = append(cats, cat)
+	}
+	sort.Strings(cats)
+	for _, cat := range cats {
+		in, err := st.s.nsInfoErr(ctx, st.tk, cat)
+		var files *treeFiles
+		switch {
+		case err == nil && in.files != nil:
+			files = in.files
+			st.s.learn(cat, &catConf{files: in.files, trust: in.trust, titled: in.titled})
+		case err == nil && in.readErr == nil:
+			// Not a file tree.
+			st.s.learn(cat, nil)
+			continue
+		default:
+			// Not read with this token, refused or failed for now: as
+			// read with another grant.
+			c, ok := st.s.learned(cat)
+			switch {
+			case ok:
+				files = c.files
+			case st.s.settingsRead(cat):
+				continue
+			case err != nil:
+				return "", "", err
+			default:
+				if unread == "" {
+					unread = cat
+				}
+				continue
+			}
+		}
+		if files != nil && files.ns == ns {
+			return cat, "", nil
+		}
+	}
+	return "", unread, nil
+}
+
 // allowed are the methods served (RFC 9110 §10.2.1 Allow).
 const allowed = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK"
 
 // answered keeps what the request's answer, status, says of the
-// principal's saves for a DELETE that follows (refusedSaveFor): a PUT of
-// a file, or a MOVE onto an existing one (onto), refused without writing
-// to the core sets a guard, but for one that put back the principal's own
-// DELETE (undoOwnDelete), which a DELETE after it leaves deleted as the
-// principal chose, and one a frozen namespace refused, which takes no
-// DELETE either (§8.4); a DELETE that found nothing (a refused create's
-// cleanup) uses one up. A GET finding a file gone (404) is the reload a
-// refused save over someone else's delete asked for (tombBase). It runs
-// before the answer goes out, so the client's next request finds it.
+// principal's saves for a DELETE that follows (refusedSaveFor): a PUT or
+// a COPY of a file (saveTo), or a MOVE onto an existing one (onto),
+// refused without writing to the core sets a guard, but for one that put
+// back the principal's own DELETE (undoOwnDelete), which a DELETE after
+// it leaves deleted as the principal chose, and one a frozen namespace
+// refused, which takes no DELETE either (§8.4); a DELETE that found
+// nothing (a refused create's cleanup) uses one up. A GET finding a file
+// gone (404) is the reload a refused save over someone else's delete
+// asked for (tombBase). It runs before the answer goes out, so the
+// client's next request finds it.
 func (st *reqState) answered(status int) {
 	now := st.s.opt.Now()
 	guardOn := ""
 	switch {
-	case st.method == "PUT":
+	case st.method == "PUT", st.method == "COPY":
 		guardOn = st.saveTo
 	case st.method == "MOVE":
 		guardOn = st.onto
@@ -1907,8 +2008,9 @@ func (p *principal) forgetTreeDelete(path string) {
 	delete(p.trees, path)
 }
 
-// A refused save of a file (a PUT, or a MOVE onto an existing file,
-// answered 4xx or 5xx without writing to the core) sets a guard (§H.6):
+// A refused save of a file (a PUT, a COPY of a file, or a MOVE onto an
+// existing file, answered 4xx or 5xx without writing to the core; a case
+// variant refused, §H.2, among them) sets a guard (§H.6):
 // the principal's DELETE of the same path within refusedSaveFor is a 409,
 // once per refusal, and two refusals never share one. rclone deletes a
 // file whose upload failed, a second after the failure
@@ -1921,7 +2023,7 @@ func (p *principal) forgetTreeDelete(path string) {
 // deliberate and passes, the guards left as they are, as does one in a
 // frozen namespace, which the core refuses anyway (§8.4); one that finds
 // nothing (a refused create's cleanup) uses one up. A refused plain MOVE
-// (to a new name) or COPY sets none, nor does a write whose refusal undid
+// (to a new name) sets none, nor does a write whose refusal undid
 // the principal's own DELETE (undoOwnDelete), whose cleanup DELETE then
 // leaves the file deleted as the principal chose, nor a refusal of a
 // frozen namespace's.
@@ -2064,8 +2166,9 @@ type reqState struct {
 	noETag      bool     // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
 	serve       *stagedServe
 	// saveTo is the document path a PUT writes, once resolved (or one in
-	// a tree that couldn't be read), and saveDoc whether it is a flat
-	// namespace's document; committed: the request wrote to the core (a
+	// a tree that couldn't be read), or a COPY's file (open), and saveDoc
+	// whether a PUT's is a flat namespace's document; committed: the
+	// request wrote to the core (a
 	// revision, a catalog node), not counting a restore of the
 	// principal's own DELETE as it was (undoOwnDelete), which undeleted
 	// says it did.
@@ -2082,6 +2185,9 @@ type reqState struct {
 	// destination (moveAcross), which a name moved away takes as a new
 	// file: a move, not a save (movedAway)
 	moving bool
+	// pdf: the GET or HEAD serves a PDF, without the sandbox (servePDF),
+	// which any answer but its 200 or 206 puts back (errWriter)
+	pdf bool
 
 	lists  map[string]*listing     // by directory path
 	graphs map[string]*catGraph    // by catalog

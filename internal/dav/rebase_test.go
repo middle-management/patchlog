@@ -351,13 +351,14 @@ func TestOversizeRestore(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t, []string{"lim"}, []string{"cat"}, map[string]map[string]any{
 		"lim": {"limits": map[string]any{"opsPerSet": 3}},
-		"cat": {"catalog": treeCatalog("lim")},
+		"cat": {"catalog": treeCatalog("tlim")},
 	})
+	must(e.c.CreateNamespace(e.ctx, "tlim", map[string]any{"read": "public", "limits": map[string]any{"opsPerSet": 3}}))
 	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
 	e.create("lim", "ops", map[string]any{"a": "0", "b": "0", "c": "0", "d": "0"})
-	e.create("lim", "t", map[string]any{"a": "0", "b": "0", "c": "0", "d": "0"})
-	e.create("cat", "lim.t", map[string]any{"title": "t.json", "parents": parents("cat", "root")})
-	for _, c := range []struct{ path, ns, name string }{{"/lim/ops.json", "lim", "ops"}, {"/cat/t.json", "lim", "t"}} {
+	e.create("tlim", "t", map[string]any{"a": "0", "b": "0", "c": "0", "d": "0"})
+	e.create("cat", "tlim.t", map[string]any{"title": "t.json", "parents": parents("cat", "root")})
+	for _, c := range []struct{ path, ns, name string }{{"/lim/ops.json", "lim", "ops"}, {"/cat/t.json", "tlim", "t"}} {
 		e.expect(e.do("GET", c.path, ""), 200, "GET "+c.path)
 		e.expect(e.do("DELETE", c.path, ""), 204, "DELETE "+c.path)
 		e.expect(e.do("PUT", c.path, `{"a": "2", "b": "2", "c": "2", "d": "2"}`), 201, "PUT over opsPerSet after the DELETE of "+c.path)
