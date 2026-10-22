@@ -193,18 +193,20 @@ func TestRefsAcrossNamespaces(t *testing.T) {
 	if _, gs, loc := idx.refsPointer(q, soon); gs != anonGs || refsAllHits(idx.search(loc, soon)) != "pub/p1" {
 		t.Errorf("rules on /now: %s", loc)
 	}
-	// One read role without rules on /resource reads pb whole (§C.5),
-	// whatever the grant's other roles, so rules on /now elsewhere don't
-	// make it unreadable: such a grant shares a plain reader's answer.
+	// A qualifying role (a read role without rules on /resource or /now)
+	// gets the grant a namespace-wide edge grant (§C.5.2), whatever its
+	// other roles, so rules on /now in those don't make pb unreadable:
+	// such a grant shares a plain reader's answer. A rule on /now in a
+	// block does: no edge grant, and pb counts as unreadable (§A.4,
+	// v0.73; IX-15).
 	_, pbGs, _ := idx.refsPointer(q, issuer.Grant(t, s.Now(), "user:pbr", []string{"pb"}, []string{"read"}))
-	for name, g := range map[string]string{
-		"reader and timed": issuer.Grant(t, s.Now(), "user:r1", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "timed"}}),
-		"reader and editor, a rule on /now": issuer.Grant(t, s.Now(), "user:r2", []string{"pb"}, nil,
-			map[string]any{"roles": []any{"reader", "editor"}, "rules": []any{isNow}}),
-	} {
-		if _, gs, loc := idx.refsPointer(q, g); gs != pbGs || refsAllHits(idx.search(loc, g)) != "pb/b1 pb/b2 pub/p1" {
-			t.Errorf("%s: %s", name, loc)
-		}
+	r1 := issuer.Grant(t, s.Now(), "user:r1", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "timed"}})
+	if _, gs, loc := idx.refsPointer(q, r1); gs != pbGs || refsAllHits(idx.search(loc, r1)) != "pb/b1 pb/b2 pub/p1" {
+		t.Errorf("reader and timed: %s", loc)
+	}
+	r2 := issuer.Grant(t, s.Now(), "user:r2", []string{"pb"}, nil, map[string]any{"roles": []any{"reader", "editor"}, "rules": []any{isNow}})
+	if _, gs, loc := idx.refsPointer(q, r2); gs != anonGs || refsAllHits(idx.search(loc, r2)) != "pub/p1" {
+		t.Errorf("reader and editor, a rule on /now: %s", loc)
 	}
 
 	// A write in pb moves bob's at, not amy's.

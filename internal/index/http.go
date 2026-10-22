@@ -2,7 +2,6 @@ package index
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,7 +15,6 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
-	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lifecycle"
 	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/telemetry"
@@ -175,7 +173,8 @@ type access struct {
 	public bool
 	v      *grant.Verified
 	all    bool   // reads every resource: no per-resource filtering
-	gs     string // subject-set id (private only)
+	marker string // what the reader's answers depend on (private only, §A.4)
+	gs     string // subject-set id over marker (private only)
 }
 
 func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*access, error) {
@@ -197,39 +196,34 @@ func (ix *Index) access(ctx context.Context, ns string, r *http.Request) (*acces
 	if ok, _ := v.Allows("read"); !ok {
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant does not allow read"}
 	}
-	// A grant that reads the namespace unrestricted (§2.1) reads every
-	// resource; one whose reads can't differ between resources and that
-	// doesn't reads none.
-	a := &access{v: v, all: ix.checker.ReadsUnrestricted(v)}
-	if !a.all && !ix.checker.ReadsPerResource(v) {
+	// Results are keyed by a subject set over the reader's marker (§A.4,
+	// as /_refs computes it, §B.11.5): reads:{ns} for a grant that would
+	// be issued a namespace-wide edge grant (§C.5.2), which reads every
+	// resource, so all such readers share results whatever their subjects;
+	// reads:{ns}:scope:{digest} for one that reads only what its rules
+	// allow, digest covering those rules and the /principal values they
+	// refer to (readsScope), so readers limited alike share them. Where
+	// those rules refer to /now the namespace counts as unreadable: a
+	// result at an at can't change with the clock.
+	if ix.checker.NamespaceWide(v) {
+		return marked(&access{v: v, all: true, marker: "reads:" + ns}), nil
+	}
+	digest, ok := readsScope(v)
+	if !ok {
+		return nil, &grant.AuthError{Status: 403, Msg: "a rule limiting the grant's reads refers to /now"}
+	}
+	// One whose reads can't differ between resources, and that doesn't
+	// read the namespace whole now, reads none of it.
+	if !ix.checker.ReadsPerResource(v) {
 		return nil, &grant.AuthError{Status: 403, Msg: "a grant or key rule refuses the read"}
 	}
-	// §B.11.5: results are keyed by the reader's subject set. Readers of the
-	// whole namespace see the same hits, so their key is just their groups
-	// (users share caches with their groups). A reader whose grant restricts
-	// resources sees a filtered list that depends on the grant itself, so
-	// its key also carries the subject and a digest of everything the
-	// filter reads (principal and rules); it shares only with identical
-	// grants.
-	subjects := grantcheck.SubjectSet(v, !a.all)
-	if !a.all {
-		subjects = append(subjects, "scope:"+scopeDigest(v))
-	}
-	a.gs = grantcheck.SubjectSetID(subjects)
-	return a, nil
+	return marked(&access{v: v, marker: "reads:" + ns + ":scope:" + digest}), nil
 }
 
-func scopeDigest(v *grant.Verified) string {
-	roles := map[string]any{}
-	for _, role := range v.EffectiveRoles {
-		roles[role] = v.RoleRules(role)
-	}
-	x := map[string]any{
-		"principal": v.Principal.Envelope(), "key": v.Key.Kid, "readScope": v.Key.ReadScopeResource,
-		"keyRules": v.KeyRules, "blockRules": v.BlockRules, "roles": roles,
-	}
-	sum := sha256.Sum256(jsonv.Canonical(jsonv.FromGo(x)))
-	return ids.FromBytes(sum[:ids.Size]).String()
+// marked sets a's gs, the subject set of its marker alone.
+func marked(a *access) *access {
+	a.gs = grantcheck.SubjectSetID([]string{a.marker})
+	return a
 }
 
 func bearer(r *http.Request) string {

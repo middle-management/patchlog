@@ -6,11 +6,13 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -203,5 +205,71 @@ func TestV073MinSkippedNamespace(t *testing.T) {
 		if r := x.raw(p, amy); r.status != 400 || fmt.Sprint(r.body["min"]) != "[sec:"+id+"]" {
 			t.Errorf("%s, a grant that doesn't read sec: %d %v", p, r.status, r.body)
 		}
+	}
+}
+
+// gsOf asks /{ns}?q=… with tok and returns the subject set its pointer
+// redirects to.
+func (s *svc) gsOf(ns, tok string) string {
+	s.t.Helper()
+	r := s.raw("/"+ns+"?limit=5", tok)
+	loc := r.header.Get("Location")
+	if r.status != 302 || !strings.HasPrefix(loc, "/"+ns+"/g/") {
+		s.t.Fatalf("/%s pointer: %d %s %v", ns, r.status, loc, r.body)
+	}
+	return strings.Split(loc, "/")[3]
+}
+
+// TestV073PrivateGsMarkers (IX-14, IX-15, §A.4): a private namespace's
+// results are served under gs = SubjectSetID([marker]), as /_refs computes
+// it: reads:{ns} for a grant that would be issued a namespace-wide edge
+// grant, whatever its subjects and groups, else reads:{ns}:scope:{digest},
+// shared by readers limited by the same rules and /principal values. A
+// grant whose read rules refer to /now finds the namespace unreadable:
+// 403, and /_refs leaves it out.
+func TestV073PrivateGsMarkers(t *testing.T) {
+	t.Parallel()
+	w := v073P22Setup(t)
+	x, s, is := w.x, w.s, w.issuer
+	whole := grantcheck.SubjectSetID([]string{"reads:pa"})
+	for _, tok := range []string{
+		w.amy,
+		is.Grant(t, s.Now(), "user:cy", []string{"pa"}, []string{"read"}, map[string]any{"groups": []any{"editors"}}),
+		is.Grant(t, s.Now(), "user:dee", []string{"pa", "pb"}, []string{"read"}, map[string]any{"groups": []any{"x", "y"}}),
+	} {
+		if gs := x.gsOf("pa", tok); gs != whole {
+			t.Errorf("a whole reader's gs %s, want %s", gs, whole)
+		}
+	}
+	// The same subject set as amy's /_refs answer, which reads pa alone of
+	// the private namespaces.
+	q := "?to=" + url.QueryEscape("/r/target/x")
+	if _, gs, _ := x.refsPointer(q, w.amy); gs != whole {
+		t.Errorf("amy's /_refs gs %s, want %s", gs, whole)
+	}
+	onlyA := func(sub string, groups ...any) string {
+		return is.Grant(t, s.Now(), sub, []string{"pa"}, []string{"read"}, map[string]any{"groups": groups,
+			"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
+	}
+	li, lu := x.gsOf("pa", onlyA("user:li", "editors")), x.gsOf("pa", onlyA("user:lu", "x"))
+	if li != lu || li == whole {
+		t.Errorf("readers limited alike: gs %s and %s (whole %s)", li, lu, whole)
+	}
+	if _, gs, _ := x.refsPointer(q, onlyA("user:li", "editors")); gs != li {
+		t.Errorf("a limited reader's /_refs gs %s, want %s", gs, li)
+	}
+	notA := is.Grant(t, s.Now(), "user:mo", []string{"pa"}, []string{"read"}, map[string]any{
+		"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"not": map[string]any{"const": "a"}}}}})
+	if gs := x.gsOf("pa", notA); gs == li || gs == whole {
+		t.Errorf("other rules share gs %s", gs)
+	}
+	// A rule on /now, even one that passes now: unreadable.
+	soon := is.Grant(t, s.Now(), "user:soon", []string{"pa"}, []string{"read"}, map[string]any{"rules": []any{
+		map[string]any{"op": "compare", "path": "/now", "lt": map[string]any{"value": "2999-01-01T00:00:00Z"}}}})
+	if r := x.raw("/pa?limit=5", soon); r.status != 403 || r.body["code"] != "forbidden" || r.header.Get("Cache-Control") != "no-store" {
+		t.Errorf("a rule on /now: %d %v %v", r.status, r.body, r.header)
+	}
+	if _, gs, loc := x.refsPointer(q, soon); gs != grantcheck.SubjectSetID(nil) || fmt.Sprint(x.search(loc, soon)["namespaces"]) != "map[pub:"+x.ix.Checkpoint("pub")+"]" {
+		t.Errorf("a rule on /now, /_refs: %s", loc)
 	}
 }

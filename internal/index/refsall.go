@@ -56,9 +56,9 @@ import (
 // it.
 //
 // gs is computed as for subject sets (§B.11.5), over markers of what the
-// answer depends on: for every private namespace the reader reads
-// unrestricted (§2.1), reads:{ns}, or for a grant that reads only some of
-// its resources (whose hits are filtered per resource)
+// answer depends on (Index.access): for every private namespace where the
+// reader's grant would be issued a namespace-wide edge grant (§C.5.2),
+// reads:{ns}, or where it reads otherwise (its hits filtered per resource)
 // reads:{ns}:scope:{digest}, digest covering the rules its reads there are
 // judged by and the /principal values they refer to (readsScope); a
 // namespace where those rules refer to /now counts as unreadable. A
@@ -208,17 +208,12 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			return nil, err
 		}
 		if !a.public {
-			marker := "reads:" + ns
+			// access marks it (§A.4), and refuses a namespace whose
+			// read rules refer to /now.
 			if !a.all {
-				digest, ok := readsScope(a.v)
-				if !ok {
-					refuse(403)
-					continue
-				}
-				marker += ":scope:" + digest
 				rd.allow[ns] = func(name string) bool { return ix.checker.AllowsRead(a.v, name) }
 			}
-			rd.public, markers = false, append(markers, marker)
+			rd.public, markers = false, append(markers, a.marker)
 		}
 		rd.nss = append(rd.nss, ns)
 	}
