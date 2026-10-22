@@ -337,7 +337,8 @@ type UndoResult struct {
 
 // Undo undoes gesture in ns (§11.2): it plans the inverse, stops on
 // conflicts (*ConflictError), writes it as one batch with a fresh Gesture
-// and Undoes: gesture, and re-plans after a 412 up to UndoRetries times.
+// and Undoes: gesture, and re-plans after a 412, or a 410 gone naming a
+// tombstone as head (headMoved), up to UndoRetries times.
 // An undo that can't be done is an *ImpossibleError.
 func (c *Client) Undo(ctx context.Context, ns, gesture string, opts ...UndoOption) (*UndoResult, error) {
 	cfg := undoOptions(opts)
@@ -360,13 +361,37 @@ func (c *Client) Undo(ctx context.Context, ns, gesture string, opts ...UndoOptio
 		if err == nil {
 			return &UndoResult{Plan: plan, Batch: br, Gesture: cfg.gesture, Attempts: attempt}, nil
 		}
-		if IsStale(err) {
+		if headMoved(err) {
 			last = err
 			continue
 		}
 		return nil, impossibleFromWrite(ns, gesture, err)
 	}
 	return nil, fmt.Errorf("client: undo of %s: the heads kept moving: %w", gesture, last)
+}
+
+// headMoved reports a write refused because a head it names moved since
+// it was read: a 412, or a 410 gone naming the tombstone that is now the
+// head, which an append or a create on a resource deleted meanwhile gets
+// from v0.73 instead of a 412 (§7.2, §8.1), alone or as the batch item
+// that sets the batch's status.
+func headMoved(err error) bool {
+	if IsStale(err) {
+		return true
+	}
+	ae, ok := AsAPIError(err)
+	if !ok || ae.Status != 410 {
+		return false
+	}
+	if ae.Code == "gone" {
+		return ae.Head() != ""
+	}
+	for _, it := range ae.Items() {
+		if st, _ := it["status"].(float64); st == 410 {
+			return it["code"] == "gone" && str(it, "head") != ""
+		}
+	}
+	return false
 }
 
 // PlanUndo plans the undo of gesture without writing anything: the inverse
