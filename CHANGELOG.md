@@ -151,7 +151,10 @@ leaves a question open, the reference implements the default the plan states.
     reported with the other precondition failures in request order, instead of at step 3.
   - A batch item under `ifNoneMatch` whose first step is `"delete"`, and a `DELETE` with
     `If-None-Match: *`, get `428 precondition_required` after authorisation, whatever the
-    resource's state; a purged namespace still answers `410 purged` first.
+    resource's state; a purged namespace still answers `410 purged` first. Such a write has no
+    usable precondition, so its signatures aren't checked: in a namespace with
+    `"signatures": "required"` it gets the `428`, not `422 signature`, with or without one, dry
+    runs included (§C.3.1).
   - A resource `PATCH`, or a batch item whose first step is a patch set, sent without a
     precondition is checked against `create`, `append` and `restore` at step 1 and then gets
     `428`: a create-only grant now sees `428` instead of `403` (§C.2 item 2).

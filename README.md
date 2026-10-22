@@ -3828,7 +3828,9 @@ patchlog grant mint -key "$NSKEY" -block '{"kid":"editors","sub":"ann","ns":["do
   after rate limits, the idempotent-retry lookup and settling the verb, so a retry is answered
   as first recorded and authorisation failures come first. The parent is the one the
   precondition names (the `If-Match` id, none for a create); a write without a usable
-  precondition gets `428` or `400`. A malformed `Signature` is `400`, before authentication,
+  precondition (a `DELETE` with `If-None-Match: *`, or a batch item whose first step is
+  `"delete"` under `ifNoneMatch`, included) isn't checked, `"required"` included, and gets
+  `428` or `400`. A malformed `Signature` is `400`, before authentication,
   and so is one whose `<sig>` isn't exactly 86 unpadded base64url characters (§C.3.1; signatures
   stored earlier are still read, `sig.Parse`), and a `Signature` header on any write but a
   resource `PATCH` or `DELETE` (a batch's step objects carry their own `signature`; for blob
