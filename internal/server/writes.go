@@ -15,8 +15,8 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if mediaType(r) != "application/json-patch+json" {
-		writeErr(w, &core.Error{Status: 415, Body: map[string]any{"code": "bad_input", "message": "use application/json-patch+json"}})
+	if err := requireType(r, jsonPatchType); err != nil {
+		writeErr(w, err)
 		return
 	}
 	p, err := preconditions(r)
@@ -126,6 +126,10 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if err := requireType(r, jsonType); err != nil {
+		writeErr(w, err)
+		return
+	}
 	body, err := readJSON(r, 1<<20, noLimit)
 	if err != nil {
 		writeErr(w, err)
@@ -185,8 +189,8 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	if mediaType(r) != "application/json-patch+json" {
-		writeErr(w, &core.Error{Status: 415, Body: map[string]any{"code": "bad_input", "message": "use application/json-patch+json"}})
+	if err := requireType(r, jsonPatchType); err != nil {
+		writeErr(w, err)
 		return
 	}
 	p, err := preconditions(r)
@@ -236,6 +240,10 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 	}
 	p, err := preconditions(r)
 	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := requireType(r, jsonType); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -314,6 +322,10 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 	// that comes before the gate (§6.2).
 	if _, has := r.Header["Signature"]; has {
 		writeErr(w, badInput("a batch carries signatures in its step objects, not in a Signature header (§C.3.1)"))
+		return
+	}
+	if err := requireType(r, jsonType); err != nil {
+		writeErr(w, err)
 		return
 	}
 	// Batch limits depend on the principal (§6.6): authenticate first, then

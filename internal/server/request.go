@@ -96,12 +96,21 @@ func (s *Server) patchBody(resource bool) (int, bodyLimit) {
 	return 4 * max(l.PatchSetSize, l.DocumentSize), lim
 }
 
-func mediaType(r *http.Request) string {
-	ct := r.Header.Get("Content-Type")
-	if i := strings.IndexByte(ct, ';'); i >= 0 {
-		ct = ct[:i]
+// JSON request bodies' media types (§7.2): JSON Patch for resource and
+// namespace patches, JSON for every other body.
+const (
+	jsonPatchType = "application/json-patch+json"
+	jsonType      = "application/json"
+)
+
+// requireType answers 415 unsupported_type unless the request's
+// Content-Type is want, compared as a media type (jsonv.MediaType): a
+// request-shape error, checked before the body is read (§6.2, §7.2).
+func requireType(r *http.Request, want string) error {
+	if jsonv.MediaType(r.Header.Get("Content-Type"), want) {
+		return nil
 	}
-	return strings.TrimSpace(strings.ToLower(ct))
+	return &core.Error{Status: 415, Body: map[string]any{"code": "unsupported_type", "message": "use " + want + " (§7.2)"}}
 }
 
 // etag parses a single strong ETag from If-Match / If-None-Match.

@@ -853,7 +853,7 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 		g.typ, g.nonce = typ, up.Nonce
 	}
 	if cfg.level == levelE2E && g.typ != SealedBlobType {
-		return nil, apiErr(415, "bad_input", "message", "an e2e namespace accepts only "+SealedBlobType+" blobs (§E.3.1)")
+		return nil, apiErr(415, "unsupported_type", "message", "an e2e namespace accepts only "+SealedBlobType+" blobs (§E.3.1)")
 	}
 	// 5. Sizes: blobSize and the uploader's pending bytes.
 	if al := t.allowanceOf(cfg, a); al != nil && al.BlobPending > 0 {

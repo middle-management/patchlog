@@ -219,6 +219,12 @@ func (s *Server) nsKeys(w http.ResponseWriter, r *http.Request) {
 	}
 	var kr core.KeysRequest
 	if r.ContentLength != 0 {
+		// A body is JSON (§7.2); without one, the request asks for the
+		// default keys (§E.2.3).
+		if err := requireType(r, jsonType); err != nil {
+			writeErr(w, err)
+			return
+		}
 		body, err := readJSON(r, 1<<20, noLimit)
 		if err != nil {
 			writeErr(w, err)

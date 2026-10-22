@@ -125,3 +125,61 @@ func TestV073SignatureShape(t *testing.T) {
 		t.Fatalf("signature not stored: %v", le)
 	}
 }
+
+// §7.2, §12.1 (GB-19, GB-20, GB-21): every JSON body other than a JSON
+// Patch is application/json; media types are compared ignoring case, a
+// charset naming UTF-8 the only parameter; every 415 is unsupported_type.
+func TestV073MediaTypes(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	id := e.create("m", "a", map[string]any{"n": 1})
+	unsupported := func(name string, r *resp) {
+		t.Helper()
+		if r.Code != 415 || r.Str("code") != "unsupported_type" {
+			t.Errorf("%s: %d %s, want 415 unsupported_type", name, r.Code, r.Body)
+		}
+	}
+	// JSON bodies other than a JSON Patch, sent as anything else.
+	batch := map[string]any{"items": []any{map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}
+	for _, ct := range []string{"text/plain", "application/json; charset=latin1", "application/json; foo=bar", "application/json-patch+json", " "} {
+		for _, c := range []struct {
+			name string
+			q    req
+		}{
+			{"batch", req{method: "POST", path: "/ns/m/batch", body: batch}},
+			{"branch", req{method: "POST", path: "/ns/m/branches", ifNoneMatch: "*", body: map[string]any{"name": "m-b"}}},
+			{"remote registration", req{method: "POST", path: "/ns/m/branches", ifNoneMatch: "*", body: map[string]any{"remote": map[string]any{"origin": "https://other.example", "ns": "x"}, "at": id}}},
+			{"prune", req{method: "POST", path: "/r/m/a/prune", body: map[string]any{"horizon": id}}},
+			{"keys", req{method: "POST", path: "/ns/m/keys", body: map[string]any{}}},
+		} {
+			c.q.ct, c.q.author = ct, "alice"
+			unsupported(c.name+" "+ct, e.do(c.q))
+		}
+	}
+	// /keys without a body keeps its no-body form (here: not sealed).
+	expectCode(t, e.do(req{method: "POST", path: "/ns/m/keys", author: "alice"}), 404, "not_offered")
+	// JSON Patch bodies.
+	for _, ct := range []string{"application/json", "application/json-patch+json; charset=latin1", "application/json-patch+json; foo=bar", "text/plain"} {
+		unsupported("resource PATCH "+ct, e.do(req{method: "PATCH", path: "/r/m/a", ifMatch: id, ct: ct, body: ops(op("add", "/x", 1)), author: "alice"}))
+		unsupported("config PATCH "+ct, e.do(req{method: "PATCH", path: "/ns/m", ifMatch: e.configID("m"), ct: ct, body: ops(op("add", "/x-a", 1)), author: "alice"}))
+	}
+	// Case and a UTF-8 charset don't matter.
+	r := e.do(req{method: "PATCH", path: "/r/m/a", ifMatch: id, ct: "Application/JSON-Patch+JSON; Charset=UTF-8", body: ops(op("add", "/x", 1)), author: "alice"})
+	expect(t, r, 201)
+	expect(t, e.do(req{method: "PATCH", path: "/ns/m", ifMatch: e.configID("m"), ct: `application/json-patch+json;charset="utf-8"`, body: ops(op("add", "/x-a", 1)), author: "alice"}), 201)
+	expect(t, e.do(req{method: "POST", path: "/ns/m/batch", ct: "APPLICATION/json; charset=Utf-8", body: batch, author: "alice"}), 201)
+	expect(t, e.do(req{method: "POST", path: "/r/m/a/prune", ct: "application/json;charset=utf-8", body: map[string]any{"horizon": id}, author: "alice"}), 200)
+	// Edge-grant exchanges (§C.5.2).
+	f := newAuthFixture(t, nil)
+	reader := f.grant(f.issuer, "user:bob", []string{"sec"}, []string{"read"})
+	for _, ct := range []string{"application/json; charset=latin1", "application/json; x=y", "text/plain"} {
+		unsupported("edge-grants "+ct, f.do(req{method: "POST", path: "/edge-grants", ct: ct, body: map[string]any{"grants": []any{reader}}}))
+	}
+	expect(t, f.do(req{method: "POST", path: "/edge-grants", ct: "Application/Json; charset=UTF-8", body: map[string]any{"grants": []any{reader}}}), 200)
+	// An E3 upload that isn't a sealed blob (§7.8, §E.3.1).
+	k := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning)
+	k.mkNS("e", e2eDoc(map[string]any{}))
+	r, _ = k.putBlob("e", "a", "image/png", "", []byte("plain"))
+	unsupported("E3 upload", r)
+}

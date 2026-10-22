@@ -77,3 +77,21 @@ func TestParseInputNoncharacters(t *testing.T) {
 		}
 	}
 }
+
+// §7.2 (GB-21): media types compare ignoring case, with a charset naming
+// UTF-8 the only parameter.
+func TestMediaType(t *testing.T) {
+	for _, ct := range []string{"application/json", "Application/JSON", "application/json; charset=utf-8", "application/json;charset=UTF-8",
+		`application/json; charset="utf-8"`, "application/json ; Charset = Utf-8", "application/json;"} {
+		if !MediaType(ct, "application/json") {
+			t.Errorf("MediaType(%q) = false", ct)
+		}
+	}
+	for _, ct := range []string{"", " ", "text/plain", "application/json-patch+json", "application/jsonx", "application/json; charset=latin1",
+		"application/json; charset=utf8", "application/json; foo=bar", "application/json; charset=utf-8; foo=bar", "application/json, text/plain",
+		"application/json; charset=utf-8; charset=latin1"} {
+		if MediaType(ct, "application/json") {
+			t.Errorf("MediaType(%q) = true", ct)
+		}
+	}
+}
