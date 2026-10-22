@@ -183,3 +183,91 @@ func TestV073MediaTypes(t *testing.T) {
 	r, _ = k.putBlob("e", "a", "image/png", "", []byte("plain"))
 	unsupported("E3 upload", r)
 }
+
+// §7, §3.2 (CIS-4): an id not in text form in a URL, in since or in an
+// event stream's Last-Event-ID is 400 bad_input, not cached, before
+// authentication, the read check and an unknown namespace's 404; a
+// well-formed unknown id stays 404, short. A gesture listing's after
+// stays 404 (§7.4).
+func TestV073MalformedIDs(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	k := newKey("pub")
+	e.mkNS("pub", map[string]any{"read": "public", "keys": []any{k.entry("*")}})
+	w := e.grant(k, "user:w", []string{"pub"}, []string{"read", "create", "append"})
+	id := e.create("pub", "a", map[string]any{"n": 1}, w)
+	nsID := e.nsHead("pub")
+	good := hashID(t, "", []byte("nowhere"))
+	for _, bad := range []string{"nope", strings.ToUpper(good), good[:32], good + "a", "2" + good[1:], good[:32] + "1"} {
+		for _, ns := range []string{"pub", "sec", "nowhere"} {
+			paths := []string{
+				"/r/" + ns + "/a/rev/" + bad, "/r/" + ns + "/a/rev/" + bad + "/log", "/r/" + ns + "/a/rev/" + bad + "/raw",
+				"/ns/" + ns + "/rev/" + bad, "/ns/" + ns + "/rev/" + bad + "/log", "/ns/" + ns + "/rev/" + bad + "/heads",
+				"/ns/" + ns + "/grants/" + bad,
+				"/r/" + ns + "/a/blob/" + bad, "/r/" + ns + "/a/blob/" + bad + "/e/1",
+				"/r/" + ns + "/a/rev/" + id + "/log?since=" + bad, "/r/" + ns + "/a/log?since=" + bad,
+				"/r/" + ns + "/a/log?since=" + bad + "&live=long-poll", "/r/" + ns + "/a/events?since=" + bad,
+				"/ns/" + ns + "/rev/" + nsID + "/log?since=" + bad, "/ns/" + ns + "/log?since=" + bad,
+				"/ns/" + ns + "/log?live=long-poll&since=" + bad, "/ns/" + ns + "/events?since=" + bad,
+			}
+			for _, p := range paths {
+				r := e.get(p)
+				expectShape(t, p, r)
+				if strings.Contains(p, "/blob/") && (r.H.Get("X-Content-Type-Options") != "nosniff" || r.H.Get("Content-Security-Policy") != "sandbox") {
+					t.Errorf("%s: blob headers %v", p, r.H)
+				}
+			}
+			for _, p := range []string{"/r/" + ns + "/a/events", "/ns/" + ns + "/events"} {
+				expectShape(t, p+" Last-Event-ID", e.do(req{method: "GET", path: p, hdr: map[string]string{"Last-Event-ID": bad}}))
+			}
+			r := e.do(req{method: "PUT", path: "/r/" + ns + "/a/blob/" + bad, raw: "x", ct: "text/plain"})
+			expectShape(t, "PUT blob "+bad, r)
+		}
+	}
+	// Well-formed but unknown: 404, short.
+	for _, p := range []string{"/r/pub/a/rev/" + good, "/ns/pub/rev/" + good, "/r/pub/a/rev/" + id + "/log?since=" + good} {
+		r := e.get(p)
+		expectCode(t, r, 404, "not_found")
+		if cc := r.H.Get("Cache-Control"); cc != ccShort {
+			t.Errorf("%s: Cache-Control %q", p, cc)
+		}
+	}
+	// An empty since is genesis; an empty Last-Event-ID is none.
+	expect(t, e.get("/r/pub/a/rev/"+id+"/log?since="), 200)
+	// A gesture listing's after is a cursor: an unknown one is 404.
+	d := newEnv(t)
+	d.mkNS("m", map[string]any{"read": "public"})
+	expectCode(t, d.get("/ns/m/gestures/"+strings.Repeat("a", 26)+"?after=nope"), 404, "not_found")
+}
+
+// §7.3 (RH-31): a present, non-empty Last-Event-ID wins over since, on
+// resource and namespace streams.
+func TestV073LastEventIDWins(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("docs", map[string]any{"read": "public"})
+	r1 := e.create("docs", "a", map[string]any{"n": 1})
+	n1 := e.nsHead("docs")
+	r2 := e.appendRev("docs", "a", r1, ops(op("replace", "/n", 2)))
+	n2 := e.nsHead("docs")
+	r3 := e.appendRev("docs", "a", r2, ops(op("replace", "/n", 3)))
+	n3 := e.nsHead("docs")
+	ch, _, _ := e.openSSE("/r/docs/a/events?since="+r1, map[string]string{"Last-Event-ID": r2})
+	if ev := next(t, ch); ev.id != r3 {
+		t.Fatalf("resource stream from Last-Event-ID: %v, want %s", ev, r3)
+	}
+	ch, _, _ = e.openSSE("/ns/docs/events?since="+n1, map[string]string{"Last-Event-ID": n2})
+	if ev := next(t, ch); ev.id != n3 {
+		t.Fatalf("namespace stream from Last-Event-ID: %v, want %s", ev, n3)
+	}
+	// An empty Last-Event-ID leaves since.
+	ch, _, _ = e.openSSE("/r/docs/a/events?since="+r1, map[string]string{"Last-Event-ID": ""})
+	if ev := next(t, ch); ev.id != r2 {
+		t.Fatalf("resource stream from since: %v, want %s", ev, r2)
+	}
+	// A Last-Event-ID not in the log is judged, not since.
+	other := hashID(t, "", []byte("other"))
+	expectCode(t, e.do(req{method: "GET", path: "/r/docs/a/events?since=" + r1, hdr: map[string]string{"Last-Event-ID": other}}), 404, "not_found")
+	expectCode(t, e.do(req{method: "GET", path: "/ns/docs/events?since=" + n1, hdr: map[string]string{"Last-Event-ID": other}}), 404, "not_found")
+}

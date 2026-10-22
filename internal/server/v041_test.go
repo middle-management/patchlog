@@ -291,9 +291,9 @@ func TestV041Grants(t *testing.T) {
 	if le := e.lastLog("sec", "a", a0, g); le["grant"].(map[string]any)["id"] != gid {
 		t.Fatalf("log %v", le)
 	}
-	// A grant not recorded here, or a malformed id: 404.
+	// A grant not recorded here: 404; a malformed id: 400 (§7).
 	expectCode(t, e.get("/ns/sec/grants/"+grantIDOf(t, f.svcGrant(e)), f.adminG), 404, "not_found")
-	expect(t, e.get("/ns/sec/grants/nope", f.adminG), 404)
+	expectCode(t, e.get("/ns/sec/grants/nope", f.adminG), 400, "bad_input")
 	// It needs read.
 	expect(t, e.get("/ns/sec/grants/"+gid), 401)
 

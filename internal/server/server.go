@@ -92,7 +92,9 @@ func New(e *core.Engine, opts ...Option) *Server {
 // ServeHTTP enforces canonical URLs (§3.6) before routing: no
 // percent-escape and no empty, "." or ".." segment, a trailing "/"
 // included, with the rule an edge checks them by (edge.CanonicalPath,
-// §C.5.3). No route but "/" ends in "/".
+// §C.5.3). No route but "/" ends in "/". Then the route's query
+// parameters (checkQuery) and the ids in its URL, since and Last-Event-ID
+// (checkIDs), all request-shape errors (§7).
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	_, pattern := s.mux.Handler(r)
 	if blobRoutes[pattern] {
@@ -104,7 +106,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if pattern != "" {
-		if err := checkQuery(pattern, r.URL.RawQuery); err != nil {
+		err := checkQuery(pattern, r.URL.RawQuery)
+		if err == nil {
+			err = checkIDs(pattern, r)
+		}
+		if err != nil {
 			telemetry.SetRoute(r, pattern) // the span is named by it all the same
 			writeErr(w, err)
 			return

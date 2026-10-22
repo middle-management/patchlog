@@ -219,7 +219,8 @@ func TestReviewLogCacheClasses(t *testing.T) {
 		if ns == "priv" {
 			want = "private, max-age=5"
 		}
-		for _, path := range []string{"/ns/" + ns + "/rev/2bbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/ns/" + ns + "/rev/2bbbbbbbbbbbbbbbbbbbbbbbbbbbbb/heads"} {
+		unknown := hashID(t, "", []byte("not in the chain")) // well-formed: a malformed id is 400 (§7)
+		for _, path := range []string{"/ns/" + ns + "/rev/" + unknown, "/ns/" + ns + "/rev/" + unknown + "/heads"} {
 			r := e.get(path)
 			expectCode(t, r, 404, "not_found")
 			if cc := r.H.Get("Cache-Control"); cc != want {

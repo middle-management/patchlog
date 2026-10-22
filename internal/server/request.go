@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/sig"
 )
@@ -371,9 +372,51 @@ func parseStep(v any, d gestureDefaults, where string) (core.Step, error) {
 	return core.Step{}, badInput(where + ": a step is a patch set, \"delete\" or a step object")
 }
 
+// sinceParam is where an event stream starts (§7.3): a Last-Event-ID that
+// is present and not empty, which wins over since, else since, empty for
+// genesis. checkIDs has checked both.
 func sinceParam(r *http.Request) string {
-	if s := r.URL.Query().Get("since"); s != "" {
-		return s
+	if id := r.Header.Get("Last-Event-ID"); id != "" {
+		return id
 	}
-	return r.Header.Get("Last-Event-ID")
+	return r.URL.Query().Get("since")
+}
+
+// validID reports whether s is an id in text form (§3.2).
+func validID(s string) bool {
+	_, err := ids.Parse(s)
+	return err == nil
+}
+
+// idSegments are the path wildcards that hold ids (§3.2): a revision's or
+// namespace revision's {id}, a grant's {gid} and a blob's {bid}.
+var idSegments = map[string]bool{"{id}": true, "{gid}": true, "{bid}": true}
+
+// checkIDs answers 400 bad_input for an id not in text form (§3.2) in the
+// URL routed to pattern, in since, or in an event stream's Last-Event-ID
+// (§7): a request-shape error, answered before authentication, the read
+// check and an unknown namespace's 404, and never cached (§6.2). A
+// well-formed id the namespace lacks stays the core's 404. A gesture
+// listing's after is a cursor, not an id, and stays the core's 404 too
+// (§7.4). ServeHTTP calls it once the URL is known to be canonical, so its
+// segments line up with the pattern's.
+func checkIDs(pattern string, r *http.Request) error {
+	_, path, _ := strings.Cut(pattern, " ")
+	ps, rs := strings.Split(path, "/"), strings.Split(r.URL.Path, "/")
+	if len(ps) == len(rs) {
+		for i, seg := range ps {
+			if idSegments[seg] && !validID(rs[i]) {
+				return badInput(fmt.Sprintf("%s %q is not an id in text form (§3.2, §7)", seg, rs[i]))
+			}
+		}
+	}
+	if v := r.URL.Query().Get("since"); v != "" && !validID(v) {
+		return badInput(fmt.Sprintf("since %q is not an id in text form (§3.2, §7)", v))
+	}
+	if strings.HasSuffix(pattern, "/events") {
+		if v := r.Header.Get("Last-Event-ID"); v != "" && !validID(v) {
+			return badInput(fmt.Sprintf("Last-Event-ID %q is not an id in text form (§3.2, §7.3)", v))
+		}
+	}
+	return nil
 }
