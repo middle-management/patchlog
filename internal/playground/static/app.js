@@ -1927,7 +1927,12 @@ async function openSnapshot(ns, name, h, r) {
   const kns = Z.parseKid(hdr.kid).ns;
   if (!(await nsChainOK(ns, kns))) throw new Error(`e2e snapshot of ${ns}/${name} at ${h}: sealed under ${hdr.kid}`);
   // pl { ns, name, id } (§E.3.1); snapshots stored before v0.63 also carry kind "snapshot".
-  return openSealed(kns, jwe, '', (hd) => (hd.pl && hd.pl.kind === 'snapshot' ? { ns: kns, name, id: h, kind: 'snapshot' } : { ns: kns, name, id: h }));
+  // Under the resource's K_r (§E.3.1, v0.65), or K_e, which sealed snapshots before.
+  const want = (hd) => (hd.pl && hd.pl.kind === 'snapshot' ? { ns: kns, name, id: h, kind: 'snapshot' } : { ns: kns, name, id: h });
+  try { return await openSealed(kns, jwe, name, want); } catch (err) {
+    if (err.checks) throw err;
+    return openSealed(kns, jwe, '', want);
+  }
 }
 
 /* foldLog verifies and folds an e2e log answer that ends at id and starts after since. A fold from a pruning
@@ -1966,22 +1971,27 @@ async function foldLog(ns, name, id, since, arr) {
     try { hdr = Z.parseJWE(jwe).header; kns = Z.parseKid(hdr.kid).ns; } catch (err) { flag('sealed patch set: ' + err.message); continue; }
     if (!(await nsChainOK(ns, kns))) { flag('sealed under another namespace\'s key ' + hdr.kid); continue; }
     e._sealed = hdr.kid;
-    const key = await contentKey(hdr.kid, '');
+    // Under the resource's K_r (§E.3.1, v0.65), or K_e, which sealed E3 patch sets before.
     let o;
-    try { o = await Z.openJWE(jwe, key); } catch (err) { flag('sealed patch set: ' + err.message); continue; }
+    try { o = await Z.openJWE(jwe, await contentKey(hdr.kid, name)); } catch (_) {
+      try { o = await Z.openJWE(jwe, await contentKey(hdr.kid, '')); } catch (err) { flag('sealed patch set: ' + err.message); continue; }
+    }
     const diff = Z.plDiff(hdr.pl, { ns: kns, name, parent: e.parent || '' });
     if (diff.length) { flag('sealed patch set bound to another ' + diff.join(', ')); continue; }
     let plain;
     try { plain = JSON.parse(o.text); } catch (err) { flag('patch set: ' + err.message); continue; }
     e._plain = plain;
     if (cfg.pad && o.plaintext.length !== paddedLength(Z.utf8(o.text.replace(/ +$/, '')).length)) e._note = 'not padded to its size bucket (the namespace has pad; it may predate it)';
+    // One that doesn't apply is flagged and folded as []; one that doesn't validate or declares the wrong
+    // blobs is flagged and still folded (§E.3.2, client.E2E fold).
     let res;
     try { res = Z.applyPatch(doc, exists, plain); } catch (err) { flag('patch set does not apply: ' + err.message); continue; }
     const v = await validateDoc(res.doc);
-    if (v.errors.length) { flag('the document does not validate against its $schema: ' + v.errors.map((x) => (x.pointer || '(root)') + ' ' + x.message).join('; ')); continue; }
+    if (v.errors.length) flag('the document does not validate against its $schema: ' + v.errors.map((x) => (x.pointer || '(root)') + ' ' + x.message).join('; '));
     if (v.note) e._note = (e._note ? e._note + '; ' : '') + v.note;
-    if (!Z.sameBlobs(Z.sealedBlobs(e.patches), Z.blobIDs(res.doc))) { flag('the declared blob list does not match the blobs the document references (\u00a7E.3.1)'); continue; }
-    doc = res.doc; exists = res.exists; out.validID = e.id; e._doc = doc;
+    if (!Z.sameBlobs(Z.sealedBlobs(e.patches), Z.blobIDs(res.doc))) flag('the declared blob list does not match the blobs the document references (\u00a7E.3.1)');
+    doc = res.doc; exists = res.exists; e._doc = doc;
+    if (!e._flag) out.validID = e.id;
   }
   if (prev !== id) bad(`the log ends at ${prev}, not ${id}`);
   if (!exists) bad('no valid revision');
@@ -1994,7 +2004,7 @@ function foldSummary(f) {
   return h('div', { class: 'seal-box' + (f.flagged.length ? ' bad' : '') },
     h('div', { class: 'state-line' }, h('span', { class: 'badge tomb' }, 'E3'), h('span', {}, `folded ${revs} sealed revision(s)` + (f.since ? ' from a prune snapshot' : '') + ' in this browser'),
       f.flagged.length ? h('span', { class: 'badge err' }, `${f.flagged.length} flagged`) : h('span', { class: 'badge ok' }, 'all valid')),
-    f.validID && f.validID !== f.id ? h('div', { class: 'note' }, 'The document is that of the last valid revision ', idEl(f.validID), '.') : null,
+    f.validID && f.validID !== f.id ? h('div', { class: 'note' }, 'The last revision folded without a flag is ', idEl(f.validID), '; flagged ones that applied are in the document.') : null,
     f.flagged.length ? h('ul', { class: 'checks' }, ...f.flagged.map((x) => h('li', { class: 'bad' }, '✗ ', idEl(x.id), ` ${x.author || ''}: ${x.message}`))) : null);
 }
 
@@ -2055,7 +2065,7 @@ async function writeSealed(kind, patchText) {
     const info = await nsInfo(ns);
     const enc = (info.doc && info.doc.encryption) || {};
     const kid = Z.kid(ns, enc.epoch || 1);
-    const key = await contentKey(kid, '');
+    const key = await contentKey(kid, res); // the resource's K_r (§E.3.1)
     const blobs = Z.blobIDs(result); // declared in plaintext on the sealed op (§E.3.1)
     const body = Z.canonical(await Z.sealPatchSet(key, kid, ns, res, parent, patches, !!enc.pad, blobs));
     const expect = await Z.revisionID(parent, JSON.parse(body));
