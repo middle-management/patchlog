@@ -199,7 +199,9 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 
 // samePrincipal reports whether namespace entry seq was written by the
 // principal of a, whose author id is author: the same root sub and kid,
-// or, while authentication is disabled, the same author (§7.2, §6.6).
+// or, while authentication is disabled, the same author (§7.2, §6.6). An
+// entry that records no grant, written while authentication was disabled
+// or before grants were recorded (v0.37), matches on author.
 func (t *tx) samePrincipal(seq int64, a *actor, author int64) bool {
 	var au int64
 	var gid []byte
@@ -207,10 +209,10 @@ func (t *tx) samePrincipal(seq int64, a *actor, author int64) bool {
 	if au != author {
 		return false
 	}
-	if a.grant == nil {
+	if a.grant == nil || gid == nil {
 		return true
 	}
-	if gid == nil || len(a.grant.Blocks) == 0 {
+	if len(a.grant.Blocks) == 0 {
 		return false
 	}
 	ref, root := t.grantRef(gid), a.grant.Blocks[0]
