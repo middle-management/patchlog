@@ -463,6 +463,21 @@ func blobsOnly(err error) bool {
 	return len(items) > 0
 }
 
+// batchOverLimits reports a batch refused as a whole by its namespace's
+// batch limits, itemsPerBatch or batchSize: 422 limit at step 4, or 413
+// limit for a body cut off (§6.6, §7.5), answered without items. A limit
+// that refuses one of its items, such as documentSize, is a batch failure
+// that lists the item (client.IsLimit reports both), and no allowance or
+// smaller batch helps it.
+func batchOverLimits(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	if !ok || ae.Code != "limit" {
+		return false
+	}
+	key, _, _, _, _ := ae.Limit()
+	return key == "itemsPerBatch" || key == "batchSize"
+}
+
 // deferrable codes: dry-run failures that are expected while an earlier
 // namespace's batch (e.g. the schemas) hasn't committed.
 var deferrable = map[string]bool{"schema_unavailable": true}
@@ -478,9 +493,7 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 	if err != nil {
 		b.rep.DryRun = "failed"
 		b.rep.Error = err.Error()
-		// A limit refusal is 413 for a body cut off, 422 limit at step 4
-		// (§6.6); client.IsLimit takes both.
-		if client.IsLimit(err) && im.opt.Mode == Atomic {
+		if batchOverLimits(err) && im.opt.Mode == Atomic {
 			return &TooLargeError{NS: b.n.ns, Items: len(req.Items), Size: b.size, Err: err}
 		}
 		return fmt.Errorf("import: dry run of the batch into %s: %w", b.n.ns, err)
@@ -791,7 +804,7 @@ func (im *importer) submitBatch(ctx context.Context, n *node, i int, l limits) e
 		var failures []string
 		if ae, ok := client.AsAPIError(err); ok {
 			switch {
-			case client.IsLimit(err) && im.opt.Mode == Atomic:
+			case batchOverLimits(err) && im.opt.Mode == Atomic:
 				return &TooLargeError{NS: n.ns, Items: len(b.parts), Size: b.size, Err: err}
 			case ae.Status == 412:
 				return fmt.Errorf("import: the target moved while importing into %s (%w); import again: classification by ancestry picks up what is left", n.ns, err)

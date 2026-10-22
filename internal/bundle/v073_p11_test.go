@@ -995,3 +995,44 @@ func TestV073E2EKeyringConflict(t *testing.T) {
 		t.Fatal("the refused import wrote")
 	}
 }
+
+// An atomic batch one of whose items a limit on the resulting document
+// refuses (documentSize here) isn't over the namespace's batch limits: no
+// allowance or backfill helps it. The import fails listing the item, as
+// for any item refused, whether the core answers it 413 or, as a v0.73
+// core does, 422 batch with the item's 422 limit; only itemsPerBatch and
+// batchSize, the batch's own refusal, are a TooLargeError (§6.6, §7.5,
+// GB-16).
+func TestV073AtomicItemLimitIsNotBatchTooLarge(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("m", nil)
+	src.create("m", "a-small", map[string]any{"v": 1.0})
+	src.create("m", "z-big", map[string]any{"v": strings.Repeat("x", 6000)})
+	var buf bytes.Buffer
+	_, _, err := bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"m"}})
+	noErr(t, err)
+	for _, v073 := range []bool{false, true} {
+		// A namespace the import creates: only its first item is dry-run
+		// (probe), so the batch's refusal comes from its submit.
+		dst := newDeployment(t, cmsOrigin)
+		c := dst.c.With(client.WithAuthor("bob"))
+		if v073 {
+			c = must(client.New(limitProxy(t, dst.url, false), client.WithAuthor("bob")))
+		}
+		rep, err := bundle.Import(ctx, c, bundle.BytesOpener(buf.Bytes()), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true,
+			NamespaceDoc: func(ns, upstreamOf string) any {
+				return map[string]any{"read": "public", "limits": map[string]any{"documentSize": 4096.0}}
+			}})
+		var tl *bundle.TooLargeError
+		if err == nil || errors.As(err, &tl) || !strings.Contains(err.Error(), "z-big: ") || !strings.Contains(err.Error(), "limit") {
+			t.Fatalf("v0.73 answers %v: %v, want the batch's failure listing z-big over documentSize", v073, err)
+		}
+		if len(rep.Batches) != 1 || len(rep.Batches[0].Failures) != 1 || !strings.HasPrefix(rep.Batches[0].Failures[0], "z-big: ") {
+			t.Fatalf("v0.73 answers %v: batch report %+v", v073, rep.Batches)
+		}
+		if h := dst.head("m", "a-small"); h.State != client.NotFound {
+			t.Fatalf("v0.73 answers %v: the failed atomic batch wrote", v073)
+		}
+	}
+}
