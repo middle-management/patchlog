@@ -22,6 +22,15 @@ func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[strin
 	if a.verified == nil {
 		return nil
 	}
+	if err := t.scopeRules(a, env, stepOne, blind); err != nil {
+		return err
+	}
+	return t.roleRules(a, verb, roles, env, stepOne, blind)
+}
+
+// scopeRules evaluates the key-scope and block rules of a's verified
+// grant, as grantRulesMode does.
+func (t *tx) scopeRules(a *actor, env map[string]any, stepOne, blind bool) *Error {
 	for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
 		for _, rv := range src {
 			r, err := compileCached(rv)
@@ -39,6 +48,14 @@ func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[strin
 			}
 		}
 	}
+	return nil
+}
+
+// roleRules evaluates the role rules of a's verified grant, if it carries
+// roles, as grantRulesMode does: roles are alternatives (§C.1.1), so the
+// rules evaluated must pass for one of roles, or with roles nil for one of
+// the effective roles that list verb.
+func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any, stepOne, blind bool) *Error {
 	if a.verified.HasRoles() {
 		if roles == nil {
 			_, roles = a.verified.Allows(verb)

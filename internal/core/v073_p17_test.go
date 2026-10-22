@@ -145,3 +145,33 @@ func TestV073P17EndedAllowanceDoesNotHideLater(t *testing.T) {
 		}
 	}
 }
+
+// For branching (and registration), a role that counts for read must pass
+// all its rules against a read envelope, as a read does, not only those a
+// step-1 check evaluates: a role whose rule reads /doc doesn't count, so
+// the grant doesn't read the base unrestricted (§C.2 item 2, v0.66).
+func TestV073P17BranchRoleRulesInFull(t *testing.T) {
+	e := v073Engine(t, p17Fast(), p17Fast(), map[string]any{"read": "grant", "roles": map[string]any{
+		"doc-reader": map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/doc/x", "exists": true}}},
+		"reader":     map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/action", "value": "read"}}},
+		"z-reader":   map[string]any{"can": []any{"read"}, "rules": []any{map[string]any{"op": "test", "path": "/principal/id", "value": "user:z"}}},
+		"brancher":   map[string]any{"can": []any{"branch"}},
+	}})
+	ctx := context.Background()
+	for i, c := range []struct {
+		name  string
+		roles []any
+		want  int
+	}{
+		{"role reading /doc", []any{"doc-reader", "brancher"}, 403},
+		{"role failing a step-1 rule", []any{"z-reader", "brancher"}, 403},
+		{"role passing all its rules", []any{"reader", "brancher"}, 0},
+		{"one role of two counts", []any{"doc-reader", "reader", "brancher"}, 0},
+	} {
+		cred := Credentials{Bearer: e.mint(map[string]any{"kid": "k", "sub": "user:b", "ns": []any{"n"}, "roles": c.roles})}
+		_, err := e.CreateBranch(ctx, Request{NS: "n", Cred: cred}, BranchRequest{Name: "b" + string(rune('a'+i)), IfNoneMatch: true})
+		if got := v073Status(err); got != c.want {
+			t.Errorf("%s: got %d (%v), want %d", c.name, got, err, c.want)
+		}
+	}
+}

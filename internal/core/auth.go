@@ -523,10 +523,12 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 // registration (§G.3): a grant whose rules hide some resources could
 // otherwise list their names and heads, or read them through a branch.
 // Branching and registration check it as step 1 checks verbs (stepOne,
-// §6.2, §2.1), in a public namespace too: the grant must read n
-// unrestricted and allow read, and its rules that refer only to /action,
-// /principal or /now must pass with /action read; rules over the rest of
-// the envelope apply to their own write at step 6.
+// §6.2, §2.1, §C.2 item 2), in a public namespace too: the grant must read
+// n unrestricted and allow read, and its key-scope and block rules that
+// refer only to /action, /principal or /now must pass with /action read,
+// rules over the rest of the envelope applying to their own write at step
+// 6; a role that counts for read must pass all its rules against the read
+// envelope, as a read does (item 5), whatever they refer to.
 func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 	if cfg.Read == "public" && !stepOne || t.e.opt.AuthDisabled {
 		return true
@@ -538,7 +540,11 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 		return true // a namespace's edge grant (edgeReader)
 	}
 	roles, ok := a.unrestrictedRoles()
-	return ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), stepOne) == nil
+	if !ok {
+		return false
+	}
+	env := t.basicEnvelope("read", "", a)
+	return t.scopeRules(a, env, stepOne, false) == nil && t.roleRules(a, "read", roles, env, false, false) == nil
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource
