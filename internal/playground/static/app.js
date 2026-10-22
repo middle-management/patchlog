@@ -1597,7 +1597,9 @@ async function nsInfo(ns) {
   return info;
 }
 
-/* takeKeys stores the entries of a POST /ns/{ns}/keys answer: raw keys, or keys wrapped to the grant's enc. */
+/* takeKeys stores the entries of a POST /ns/{ns}/keys answer: raw keys, or keys wrapped to the grant's enc. An e2e
+ * relay passes on keyring entries as stored, wrapped under the info of v0.63 or, stored before, the one of that time;
+ * an entry that opens under neither is skipped (anyone can wrap to a thumbprint, §E.3.2), leaving the keyring. */
 async function takeKeys(arr) {
   let n = 0;
   for (const e of arr || []) {
@@ -1607,7 +1609,7 @@ async function takeKeys(arr) {
     else if (typeof e.wrapped === 'string') {
       if (e.suite && e.suite !== Z.SUITE) continue;
       if (!ID) throw new Error('the keys are wrapped to the grant\'s enc: import that identity in the Keys tab');
-      key = await Z.unwrapKey(ID, e.kid, e.resource || '', Z.unb64u(e.wrapped));
+      try { key = await Z.unwrapStoredKey(ID, e.kid, e.resource || '', Z.unb64u(e.wrapped)); } catch (_) { continue; }
       from = 'POST /keys (HPKE-wrapped)';
     } else continue;
     if (key.length !== 32) continue;

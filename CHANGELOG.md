@@ -138,11 +138,18 @@ the reference implements the default the plan states.
     E3 prune snapshot to `pl: { ns, name, id }` without `kind`; readers still accept the old
     forms in stored bytes, but a prune whose snapshot carries `kind: "snapshot"` is now `422
     invalid`. The playground opens both forms.
-  - **Breaking for E3 keyrings:** keys are wrapped under the HPKE info `"patchlog-key-v1"` LF
-    kid LF name (name empty for `K_e`), so keys wrapped under the old info don't open with the
-    current code, including the entries of every E3 `keyring` resource stored today, which a
-    key-holding admin must wrap again (`seal.UnwrapKeyLegacy` and `seal.MigrateKeyring`, which
-    wraps only to readers the caller names, read the old ones).
+  - **E3 keyrings:** keys are wrapped under the HPKE info `"patchlog-key-v1"` LF kid LF name
+    (name empty for `K_e`). The entries of E3 `keyring` resources stored before, under the old
+    info, still open: the client (`client.E2E`, and so services through `derived.Keys`) and the
+    playground try the old info when the current one fails (`seal.UnwrapKeyLegacy`), for
+    entries read in the keyring and relayed by `/keys` alike, and a relayed entry that opens
+    under neither no longer stops a reader that may read the keyring from trying it. A
+    key-holding admin should still wrap them again. Until the server takes the §E.3.2 keyring
+    document (wave 2), that is `client.E2E.AddReader(ctx, ns, reader, true)` once per reader,
+    the admin's own key included: it wraps that reader's entry of every epoch the admin can open
+    again under the new info, in the current document shape. `seal.MigrateKeyring`, which wraps
+    only to readers the caller names, gives a `seal.KeyringV2` that the server still refuses as
+    the `keyring` resource (`422 invalid`).
 - **Patch writes** (§6.2 step 3, §6.4.1, §F.3): an add, copy or move into an array below its
   length, and a remove or move-from of an element that isn't the last, also write the array
   itself, once per op, so rules on `writes`, merge and rebase conflict checks and undo see these

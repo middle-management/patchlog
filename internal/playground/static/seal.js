@@ -216,6 +216,21 @@ async function unwrapKey(identity, kid, resource, wrapped) {
   if (k.length !== 32) throw new Error('unwrapped key is not 32 bytes');
   return k;
 }
+/* Keyrings stored before v0.63 wrapped their keys under the info of that time, "patchlog-keys-v1\n" ‖ kid, then
+ * "\n" ‖ resource for a K_r only; /keys relays such entries as stored. Like the current info it binds kid and resource. */
+function legacyWrapContext(kid, resource) { return utf8('patchlog-keys-v1\n' + kid + (resource ? '\n' + resource : '')); }
+/* unwrapStoredKey opens a keyring entry, read in the keyring or relayed by /keys (§E.3.2), under the current info or,
+ * failing that, the legacy one (internal/seal's Keyring.EpochKey and the client's relayed entries do the same). */
+async function unwrapStoredKey(identity, kid, resource, wrapped) {
+  try {
+    return await unwrapKey(identity, kid, resource, wrapped);
+  } catch (e) {
+    let k;
+    try { k = await hpkeOpen(identity, legacyWrapContext(kid, resource), wrapped); } catch (_) { throw e; }
+    if (k.length !== 32) throw e;
+    return k;
+  }
+}
 
 /* ---------------- kids ---------------- */
 function kid(ns, epoch) { return ns + '#' + epoch; }
@@ -409,7 +424,7 @@ async function keyringEpochKey(kr, identity, epoch) {
   const rid = await recipientID(identity.x);
   const w = (kr.epochs[String(epoch)] || {})[rid];
   if (!w) throw new Error(`the keyring has no key for this identity in epoch ${epoch}`);
-  return unwrapKey(identity, kid(kr.ns, epoch), '', unb64u(w));
+  return unwrapStoredKey(identity, kid(kr.ns, epoch), '', unb64u(w));
 }
 
 /* ---------------- JSON Patch (RFC 6902) ---------------- */
@@ -644,7 +659,7 @@ root.PLSeal = {
   SUITE, b64u, unb64u, b32, hex, unhex, utf8, equalBytes, randomBytes, newNonce, canonical, padLen,
   sha256, chainID, revisionID, tombstoneID, idBytes,
   hkdf, resourceKey, generateIdentity, identityFromPrivate, recipientJWK, recipientID, parseJWK,
-  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
+  hpkeSeal, hpkeOpen, wrapKey, unwrapKey, unwrapStoredKey, kid, parseKid, parseJWE, openJWE, sealJWE, plDiff,
   sealPatchSet, sealedJWE, sealedBlobs, BLOB_TYPE, blobType, blobID, blobIDs, sameBlobs, parseBlob, openBlob, sealBlob, encryptBlob, decryptBlob,
   parseKeyring, buildKeyring, keyringAdd, keyringEpochKey,
   applyPatch, validate, selfTest,

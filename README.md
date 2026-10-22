@@ -1988,12 +1988,18 @@ curl -X PATCH $B/ns/vault -H "$P" -H 'If-None-Match: *' -H "Authorization: Beare
   epoch keys and public X25519 JWKs only). It is the only plaintext resource: written by key
   holders with ordinary writes, checked like any document plus `seal.ParseKeyring`, `ns` equal
   to the namespace and `current` not after `encryption.epoch`. Its entries are wrapped under
-  the HPKE info `"patchlog-key-v1"` LF kid LF name (v0.63), so entries wrapped before this
-  version don't open with the current code: a key holder must wrap them again
-  (`seal.UnwrapKeyLegacy`, and `seal.MigrateKeyring`, which wraps each epoch's key only to the
-  readers the caller names). `internal/seal` also has the §E.3.2 keyring document
-  (`seal.KeyringV2`: `{ keys: [ { kid, to, from, wrapped } ], $nonce? }`, entries in HPKE auth
-  mode, `seal.Thumbprint` recipients), which the server and clients don't use yet.
+  the HPKE info `"patchlog-key-v1"` LF kid LF name (v0.63). Entries wrapped before this
+  version, under `"patchlog-keys-v1"` LF kid, still open: `seal.Keyring.EpochKey`, the
+  client's relayed keys (`client.E2E`, which services' `derived.Keys` use) and the playground
+  try the old info when the current one fails (`seal.UnwrapKeyLegacy`), and a relayed entry
+  that opens under neither leaves the keyring to try. A key holder should still wrap them
+  again: until the server takes the §E.3.2 document, with `client.E2E.AddReader(ctx, ns,
+  reader, true)` once per reader, its own key included, which wraps that reader's entry of
+  every epoch it can open under the new info. `internal/seal` also has the §E.3.2 keyring
+  document (`seal.KeyringV2`: `{ keys: [ { kid, to, from, wrapped } ], $nonce? }`, entries in
+  HPKE auth mode, `seal.Thumbprint` recipients) and `seal.MigrateKeyring`, which wraps each
+  epoch's key only to the readers the caller names, but the server and clients don't use it
+  yet: the server refuses it as the `keyring` resource (`422 invalid`).
 - **`POST /ns/{ns}/keys`** relays only wrapped keys: it needs a verified grant with `read`
   whose root block carries `enc` (else `422`; non-readers, and grants whose rules refuse every
   read, `404`). A grant limited to some resources gets its own entries too, without reading the

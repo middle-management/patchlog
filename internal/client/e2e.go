@@ -193,7 +193,7 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	// fetch that failed for a reason asking again may mend (Transient),
 	// with no key found otherwise, is that failure, not ErrNoKeys: the key
 	// may be there (a service waiting for the namespace keeps waiting).
-	var failed error
+	var failed, unwrapErr error
 	relays := []string{ns}
 	if via != "" && via != ns {
 		relays = []string{via, ns}
@@ -212,14 +212,12 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 			}
 			key := e.Key
 			if key == nil {
-				var uerr error
-				for _, priv := range privs {
-					if key, uerr = seal.UnwrapKey(priv, e.Wrapped); uerr == nil {
-						break
-					}
-				}
-				if uerr != nil {
-					return nil, fmt.Errorf("client: unwrapping %s: %w", kid, uerr)
+				if key, err = unwrapRelayed(privs, e.Wrapped); err != nil {
+					// Not the key for us (anyone can wrap to a
+					// thumbprint, §E.3.2): the other relay or the
+					// keyring may still hold it.
+					unwrapErr = fmt.Errorf("client: unwrapping %s: %w", kid, err)
+					continue
 				}
 			}
 			x.AddKey(kid, key)
@@ -244,7 +242,29 @@ func (x *E2E) keyVia(ctx context.Context, kid, via string) ([]byte, error) {
 	if failed != nil {
 		return nil, fmt.Errorf("client: fetching the epoch key %s: %w", kid, failed)
 	}
+	if unwrapErr != nil {
+		return nil, unwrapErr
+	}
 	return nil, fmt.Errorf("%w: %s", ErrNoKeys, kid)
+}
+
+// unwrapRelayed opens a K_e that /keys relays from a keyring (§E.3.2) with
+// one of privs: under the HPKE info of v0.63 or, for an entry of a keyring
+// stored before, the info of that time, as Keyring.EpochKey reads the
+// keyring itself. Both infos bind the kid (and a K_r's resource), so an
+// entry can't be presented as another epoch's under either.
+func unwrapRelayed(privs []*ecdh.PrivateKey, w seal.WrappedKey) ([]byte, error) {
+	var err error
+	for _, priv := range privs {
+		var key []byte
+		if key, err = seal.UnwrapKey(priv, w); err == nil {
+			return key, nil
+		}
+		if key, err = seal.UnwrapKeyLegacy(priv, w); err == nil {
+			return key, nil
+		}
+	}
+	return nil, err
 }
 
 // EncryptionLevel returns a namespace's encryption.level ("" if none). A
