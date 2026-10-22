@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/core"
@@ -234,18 +236,24 @@ func validNames(ns, name string) error {
 	return nil
 }
 
-func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
+// parseBatch reads a batch body (§7.5). hdr are the batch's Gesture and
+// Undoes headers, which stand for its own gesture and undoes members.
+func parseBatch(body any, hdr gestureDefaults) ([]core.Item, *core.ConfigChange, any, error) {
 	m, ok := body.(map[string]any)
 	if !ok {
 		return nil, nil, nil, badInput("batch body must be an object")
 	}
 	// The batch's own gesture and undoes are defaults for every step
-	// (§7.5), as an item's are for its steps.
-	var batchG gestureDefaults
+	// (§7.5), as an item's are for its steps; each may come as a member or
+	// a header, not both (400).
+	batchG := hdr
 	for k, v := range m {
 		switch k {
 		case "items", "config", "source":
 		case "gesture", "undoes":
+			if k == "gesture" && hdr.gesture != "" || k == "undoes" && hdr.undoes != "" {
+				return nil, nil, nil, badInput(fmt.Sprintf("the batch's %s is given both as a header and in the body (§7.5)", k))
+			}
 			if err := batchG.set(k, v, "batch"); err != nil {
 				return nil, nil, nil, err
 			}
@@ -328,7 +336,81 @@ func parseBatch(body any) ([]core.Item, *core.ConfigChange, any, error) {
 			return nil, nil, nil, badInput("config needs patches")
 		}
 	}
+	if sv, has := m["source"]; has {
+		if err := checkSource(sv, items); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 	return items, cc, m["source"], nil
+}
+
+// checkSource answers 400 bad_input, a request-shape error, for a batch
+// source of any shape but { origin?, ns, at, bundle?, ids? } (§3.5): ns a
+// namespace name; at an ns_id and bundle a digest, in text form; ids an
+// object with at most one member per item, named by the item's resource,
+// each a text id; origin a canonical origin in the form of §C.3, a
+// non-canonical spelling refused rather than normalised, since the source
+// is hashed as sent. Whether at is in the chain of ns, and an origin that
+// is this deployment's own, are the core's 422 source (§7.5).
+func checkSource(v any, items []core.Item) error {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return badInput("source must be an object (§3.5)")
+	}
+	resources := make(map[string]bool, len(items))
+	for _, it := range items {
+		resources[it.Resource] = true
+	}
+	ns, _ := m["ns"].(string)
+	at, _ := m["at"].(string)
+	if !core.ValidNSName(ns) || !validID(at) {
+		return badInput("source needs ns, a namespace name, and at, an ns_id in text form (§3.5)")
+	}
+	for k, x := range m {
+		switch k {
+		case "ns", "at":
+		case "origin":
+			if o, ok := x.(string); !ok || !canonicalOrigin(o) {
+				return badInput("source.origin must be an origin in the form of §C.3: scheme://host[:port], lowercase, default port omitted (§3.5)")
+			}
+		case "bundle":
+			if b, ok := x.(string); !ok || !validID(b) {
+				return badInput("source.bundle must be a bundle digest in text form (§3.5, §G.4.1)")
+			}
+		case "ids":
+			o, ok := x.(map[string]any)
+			if !ok {
+				return badInput("source.ids must be an object (§3.5)")
+			}
+			for name, id := range o {
+				if s, ok := id.(string); !resources[name] || !ok || !validID(s) {
+					return badInput(fmt.Sprintf("source.ids member %q must name a resource of the batch's items, with an id in text form (§3.5)", name))
+				}
+			}
+		default:
+			return badInput(fmt.Sprintf("unknown source member %q (§3.5)", k))
+		}
+	}
+	return nil
+}
+
+// canonicalOrigin reports whether s is an http or https origin in the RFC
+// 6454 ASCII serialisation of §C.3: scheme://host[:port], lowercase,
+// with no default port, path, query or user.
+func canonicalOrigin(s string) bool {
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" && u.Scheme != "http" || u.Host == "" || u.User != nil || u.Opaque != "" ||
+		u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || s != u.Scheme+"://"+u.Host || strings.ToLower(s) != s {
+		return false
+	}
+	if p := u.Port(); p != "" || strings.HasSuffix(u.Host, ":") {
+		n, err := strconv.Atoi(p)
+		if err != nil || strconv.Itoa(n) != p || n < 1 || n > 65535 ||
+			u.Scheme == "https" && n == 443 || u.Scheme == "http" && n == 80 {
+			return false
+		}
+	}
+	return true
 }
 
 // gestureDefaults are the gesture and undoes a batch or item gives its

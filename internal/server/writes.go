@@ -357,6 +357,12 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	// The batch's Gesture and Undoes headers are its defaults (§7.5).
+	g, u, err := gestures(r)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	// Batch limits depend on the principal (§6.6): authenticate first, then
 	// stop reading a body larger than that principal's batchSize (§7.5).
 	req := core.Request{NS: ns, Cred: creds(r), SourceCreds: sourceCreds(r)}
@@ -370,7 +376,7 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	items, cc, source, err := parseBatch(body)
+	items, cc, source, err := parseBatch(body, gestureDefaults{g, u})
 	if err != nil {
 		writeErr(w, err)
 		return

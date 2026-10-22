@@ -465,3 +465,88 @@ func TestV073RequestFacts(t *testing.T) {
 	hr.Header.Add("Blob-Nonce", nonce)
 	expectShape(t, "repeated Blob-Nonce", sendRaw(t, hr))
 }
+
+// §3.5, §7.5 (CIS-8): a batch source of any shape but { origin?, ns, at,
+// bundle?, ids? }, with text ids, ids naming the batch's resources and a
+// canonical origin, is the batch's own 400, recorded nowhere.
+func TestV073BatchSourceShape(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	e.mkNS("rel", map[string]any{"read": "public"})
+	at := e.nsHead("rel")
+	id := hashID(t, "", []byte("x"))
+	items := []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}
+	before := e.nsHead("m")
+	for _, src := range []any{
+		"rel", nil, []any{}, map[string]any{},
+		map[string]any{"ns": "rel"},
+		map[string]any{"at": at},
+		map[string]any{"ns": "Rel!", "at": at},
+		map[string]any{"ns": "rel", "at": "zzz"},
+		map[string]any{"ns": "rel", "at": at, "x": 1},
+		map[string]any{"ns": "rel", "at": at, "bundle": 5},
+		map[string]any{"ns": "rel", "at": at, "bundle": "zzz"},
+		map[string]any{"ns": "rel", "at": at, "ids": []any{}},
+		map[string]any{"ns": "rel", "at": at, "ids": map[string]any{"zzz": id}},
+		map[string]any{"ns": "rel", "at": at, "ids": map[string]any{"a": "notanid"}},
+		map[string]any{"ns": "rel", "at": at, "ids": map[string]any{"a": 1}},
+		map[string]any{"ns": "rel", "at": at, "origin": 1},
+		map[string]any{"ns": "rel", "at": at, "origin": "https://Other.example"},
+		map[string]any{"ns": "rel", "at": at, "origin": "HTTPS://other.example"},
+		map[string]any{"ns": "rel", "at": at, "origin": "https://other.example/"},
+		map[string]any{"ns": "rel", "at": at, "origin": "https://other.example:443"},
+		map[string]any{"ns": "rel", "at": at, "origin": "https://other.example:0444"},
+		map[string]any{"ns": "rel", "at": at, "origin": "https://other.example:"},
+		map[string]any{"ns": "rel", "at": at, "origin": "http://other.example:80"},
+		map[string]any{"ns": "rel", "at": at, "origin": "https://u@other.example"},
+		map[string]any{"ns": "rel", "at": at, "origin": "ftp://other.example"},
+		map[string]any{"ns": "rel", "at": at, "origin": "other.example"},
+	} {
+		r := e.batchReq("m", map[string]any{"items": items, "source": src}, "alice")
+		expectShape(t, string(canonical(src)), r)
+	}
+	if e.nsHead("m") != before {
+		t.Fatal("a refused source was recorded")
+	}
+	// Well-formed: another deployment's source is recorded unchecked.
+	src := map[string]any{"origin": "https://other.example:8443", "ns": "rel", "at": id, "bundle": id, "ids": map[string]any{"a": id}}
+	r := e.batchReq("m", map[string]any{"items": items, "source": src}, "alice")
+	expect(t, r, 201)
+	lg := e.get("/ns/m/rev/" + r.Str("ns_id") + "/log").Arr()
+	if got := lg[len(lg)-1].(map[string]any)["source"]; string(canonical(got)) != string(canonical(src)) {
+		t.Fatalf("source %v", got)
+	}
+}
+
+// §7.5 (GB-27): a batch's Gesture and Undoes headers are its defaults; one
+// given both as a header and in the body is 400.
+func TestV073BatchGestureHeaders(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	g, u := strings.Repeat("g", 26), strings.Repeat("u", 26)
+	items := []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}
+	r := e.do(req{method: "POST", path: "/ns/m/batch", body: map[string]any{"items": items}, author: "alice", hdr: map[string]string{"Gesture": g, "Undoes": u}})
+	expect(t, r, 201)
+	id := r.Obj()["items"].([]any)[0].(map[string]any)["ids"].([]any)[0].(string)
+	if le := e.lastLog("m", "a", id, ""); le["gesture"] != g || le["undoes"] != u {
+		t.Fatalf("entry %v", le)
+	}
+	// A step's own value still overrides the header's.
+	own := strings.Repeat("s", 26)
+	items2 := []any{map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{map[string]any{"patches": addRoot(map[string]any{}), "gesture": own}}}}
+	r = e.do(req{method: "POST", path: "/ns/m/batch", body: map[string]any{"items": items2}, author: "alice", hdr: map[string]string{"Gesture": g}})
+	expect(t, r, 201)
+	if le := e.lastLog("m", "b", e.head("m", "b"), ""); le["gesture"] != own {
+		t.Fatalf("entry %v", le)
+	}
+	for _, k := range []string{"gesture", "undoes"} {
+		h := map[string]string{"Gesture": g}
+		if k == "undoes" {
+			h = map[string]string{"Undoes": u}
+		}
+		expectShape(t, "both ways "+k, e.do(req{method: "POST", path: "/ns/m/batch", body: map[string]any{"items": items, k: g}, author: "alice", hdr: h}))
+	}
+	expectShape(t, "malformed Gesture", e.do(req{method: "POST", path: "/ns/m/batch", body: map[string]any{"items": items}, author: "alice", hdr: map[string]string{"Gesture": "nope"}}))
+}
