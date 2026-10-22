@@ -66,6 +66,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -303,50 +304,136 @@ func (t *tx) e2eSnapshot(row *revRow) string {
 	return jwe
 }
 
-// keysE2E answers POST /ns/{ns}/keys for an e2e namespace (§E.3.2): the
-// keyring's entries whose to is the thumbprint of the grant's enc, with
-// their from, for the epochs the grant may have (the §E.2.3 range). The
-// keyring is read as n sees it, so a branch without its own relays its
-// base's.
+// keysE2E answers POST /ns/{ns}/keys for an e2e namespace (§E.2.3,
+// §E.3.2): the keyring entries whose to is the thumbprint of the grant's
+// enc, with their from. Those of n's own keyring, for the epochs of the
+// §E.2.3 window the request asks; in a branch, those of each local base's
+// keyring as of at (§F.8.1), whether or not the branch has written its own
+// since, for that base's epochs baseEpochs selects, which the request's
+// epochs don't narrow; and for a remote branch, those of the shadows it
+// reads through.
 func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[string]any, error) {
 	enc := recipientOf(a)
 	if enc == nil {
 		return nil, invalid("e2e namespaces relay only wrapped keys: the grant's root block needs enc, an X25519 public key (§E.2.3, §E.3.2)")
 	}
 	out := []map[string]any{}
-	seen := map[string]bool{}
-	out = t.relayKeyring(out, seen, n, a, kr, enc)
-	// A remote branch's shadows may hold keyrings of the remote base's own
-	// bases, mirrored as foreign parents or read through (§G.5.2): readers
-	// need them for the ciphertext those bases sealed.
-	for _, sh := range t.remoteShadows(n) {
-		out = t.relayKeyring(out, seen, sh, a, kr, enc)
+	seen := map[string]bool{} // kids relayed
+	add := func(entries []map[string]any) {
+		for _, e := range entries {
+			if kid, _ := e["kid"].(string); !seen[kid] {
+				seen[kid] = true
+				out = append(out, e)
+			}
+		}
+	}
+	if d := t.ownKeyring(n, nil); d != nil {
+		add(keyringEntries(d, enc, selectEpochs(t.grantEpochsOf(t.epochStarts(`e2e_epochs`, n.id, cfg.Epoch), cfg, a), kr.Epochs)))
+	}
+	for child := n; child.isBranch(); {
+		b := t.nsByID(child.base.Int64)
+		if b.isShadow() {
+			// A remote branch's shadows may hold keyrings of the remote
+			// base's own bases, mirrored as foreign parents or read
+			// through (§G.5.2): readers need them for the ciphertext
+			// those bases sealed.
+			for _, sh := range t.remoteShadows(child) {
+				add(t.relayKeyring(sh, a, kr, enc))
+			}
+			break
+		}
+		at := child.baseAt.Int64
+		if d := t.ownKeyring(b, &at); d != nil {
+			add(keyringEntries(d, enc, t.baseEpochs(b, at, a)))
+		}
+		child = b
 	}
 	return out, nil
 }
 
-// relayKeyring appends to out the entries for enc of the keyring as n sees
-// it, unless one of the same owner was relayed already.
-func (t *tx) relayKeyring(out []map[string]any, seen map[string]bool, n *nsRow, a *actor, kr KeysRequest, enc *ecdh.PublicKey) []map[string]any {
-	v := t.resolve(n, KeyringName, nil)
-	if v.state != Live || v.head == nil {
-		return out
+// ownKeyring returns the keyring document of n itself as of asOf (nil:
+// now), nil if n has no live keyring of its own then: one it reads through
+// from a base is that base's.
+func (t *tx) ownKeyring(n *nsRow, asOf *int64) any {
+	v := t.resolve(n, KeyringName, asOf)
+	if v.state != Live || v.head == nil || v.src == nil || v.src.ns != n.id {
+		return nil
 	}
 	d, err := t.docAt(v.head)
 	if err != nil {
-		return out
+		return nil
+	}
+	return d
+}
+
+// baseEpochs lists the epochs of local base b whose keys a branch's /keys
+// relays from b's keyring as of at, b's namespace entry seq (§E.2.3): b's
+// epochs up to the one in force at at, starting from the one b had in
+// force at the latest nbf among the grant's blocks, or at at if that is
+// earlier; where no block has nbf, the epoch b has in force now, so none
+// once b has moved past its epoch at at. Without a grant (authentication
+// disabled), every epoch up to at. Epochs from before an e2e raise are
+// not keyring epochs (Levels, P36).
+func (t *tx) baseEpochs(b *nsRow, at int64, a *actor) []int {
+	var cseq, created int64
+	if err := t.QueryRow(`SELECT config_seq, created FROM ns_log WHERE seq = ?`, at).Scan(&cseq, &created); err != nil {
+		return nil
+	}
+	acfg := t.config(cseq)
+	if acfg.level != levelE2E {
+		return nil
+	}
+	atEpoch := acfg.Epoch
+	all := t.epochStarts(`e2e_epochs`, b.id, atEpoch)
+	if len(all) == 0 {
+		return nil
+	}
+	first := all[0].e
+	if a != nil && a.grant != nil {
+		nbf := latestNbf(a)
+		switch {
+		case nbf == nil:
+			if t.config(b.configSeq).Epoch != atEpoch {
+				return nil
+			}
+			first = atEpoch
+		case !nbf.Before(time.UnixMilli(created)):
+			first = atEpoch
+		default:
+			for _, x := range all {
+				if !x.created.After(*nbf) {
+					first = x.e
+				}
+			}
+		}
+	}
+	var out []int
+	for _, x := range all {
+		if x.e >= first {
+			out = append(out, x.e)
+		}
+	}
+	return out
+}
+
+// relayKeyring returns the entries for enc of the keyring as n, a remote
+// branch's shadow, sees it, for the epochs of the §E.2.3 window of the
+// keyring's owner that the request asks.
+func (t *tx) relayKeyring(n *nsRow, a *actor, kr KeysRequest, enc *ecdh.PublicKey) []map[string]any {
+	v := t.resolve(n, KeyringName, nil)
+	if v.state != Live || v.head == nil {
+		return nil
+	}
+	d, err := t.docAt(v.head)
+	if err != nil {
+		return nil
 	}
 	owner := n
 	if v.src != nil && v.src.ns != n.id {
 		owner = t.nsByID(v.src.ns)
 	}
-	if seen[owner.name] {
-		return out
-	}
-	seen[owner.name] = true
 	ocfg := t.config(owner.configSeq)
-	epochs := selectEpochs(t.grantEpochsOf(t.epochStarts(`e2e_epochs`, owner.id, ocfg.Epoch), ocfg, a), kr.Epochs)
-	return append(out, keyringEntries(d, enc, epochs)...)
+	return keyringEntries(d, enc, selectEpochs(t.grantEpochsOf(t.epochStarts(`e2e_epochs`, owner.id, ocfg.Epoch), ocfg, a), kr.Epochs))
 }
 
 // keyringEntries returns the entries of keyring document d for the

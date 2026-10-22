@@ -359,3 +359,93 @@ func TestV073KeysExchangeRate(t *testing.T) {
 		t.Fatalf("third e2e /keys: %d %s", r.Code, r.Body)
 	}
 }
+
+// P18, ENC-18 (§E.2.3, §F.8.1): an e2e branch's /keys relays its own
+// keyring's entries and each local base's keyring's as of at, even after
+// the branch has written its own: for the base's epochs up to the one in
+// force at at, from the one in force at the latest nbf or at at if that
+// is earlier; with no nbf, the epoch the base has in force now, so none
+// once it has moved past its epoch at at. The request's epochs don't
+// select among the base's.
+func TestV073KeysBranchBases(t *testing.T) {
+	t.Parallel()
+	f := newE2E(t)
+	e := f.tenv
+	admin := f.readerPriv // wraps the keyrings; the reader is a recipient too
+	readerPub := f.readerPriv.PublicKey()
+	k1, k2, k3, kb := seal.NewKey(), seal.NewKey(), seal.NewKey(), seal.NewKey()
+	kr, err := seal.BuildKeyringV2(admin, "e", 1, k1, []*ecdh.PublicKey{readerPub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	adm := func() string { return e.grant(f.admin, "user:admin", []string{"e", "eb"}, allVerbs) }
+	head := e.create("e", "keyring", kr.Value(), adm())
+	rotate := func(epoch float64, key []byte) {
+		t.Helper()
+		if err := kr.Add(admin, readerPub, seal.Kid("e", int(epoch)), key); err != nil {
+			t.Fatal(err)
+		}
+		g := adm()
+		r := e.do(req{method: "POST", path: "/ns/e/batch", bearer: g, body: map[string]any{
+			"config": map[string]any{"ifMatch": e.configID("e", g), "patches": ops(op("add", "/encryption/epoch", epoch))},
+			"items":  []any{map[string]any{"resource": "keyring", "ifMatch": head, "steps": []any{ops(op("replace", "", kr.Value()))}}}}})
+		expect(t, r, 201)
+		head = r.Obj()["items"].([]any)[0].(map[string]any)["ids"].([]any)[0].(string)
+	}
+	e.clock.Advance(time.Hour)
+	rotate(2, k2) // epoch 2 from t0+1h
+	e.clock.Advance(time.Hour)
+	expect(t, e.branch("e", map[string]any{"name": "eb"}, adm()), 201) // at: t0+2h, epoch 2
+	e.clock.Advance(10 * time.Minute)
+	at := func(d time.Duration) map[string]any { return map[string]any{"nbf": t0.Add(d).Format(time.RFC3339)} }
+	reader := func(extra ...map[string]any) string {
+		return e.grant(f.writer, "user:reader", []string{"eb"}, []string{"read"}, append(extra, map[string]any{"enc": f.readerJWK})...)
+	}
+	kids := func(body map[string]any, g string) string {
+		t.Helper()
+		_, r := e.keysOf("eb", body, g)
+		return kidsOf(t, r)
+	}
+	for name, c := range map[string]struct {
+		grant string
+		want  string
+	}{
+		"no nbf, base still at its epoch at at": {reader(), "e#2"},
+		"nbf before the base's first epoch":     {reader(at(-time.Hour)), "e#1,e#2"},
+		"nbf in epoch 1":                        {reader(at(30 * time.Minute)), "e#1,e#2"},
+		"nbf after at":                          {reader(at(125 * time.Minute)), "e#2"},
+	} {
+		if got := kids(nil, c.grant); got != c.want {
+			t.Errorf("%s: %s, want %s", name, got, c.want)
+		}
+	}
+	// The request's epochs don't select among the base's.
+	if got := kids(map[string]any{"epochs": []any{}}, reader(at(-time.Hour))); got != "e#1,e#2" {
+		t.Errorf("epochs [] narrowed the base's: %s", got)
+	}
+
+	// The branch writes its own keyring, of the epoch its document copied:
+	// both are relayed.
+	bk, err := seal.BuildKeyringV2(admin, "eb", 2, kb, []*ecdh.PublicKey{readerPub})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.appendRev("eb", "keyring", head, ops(op("replace", "", bk.Value())), adm())
+	if got := kids(nil, reader(at(-time.Hour))); got != "eb#2,e#1,e#2" {
+		t.Errorf("after the branch's own keyring: %s", got)
+	}
+	if got := kids(map[string]any{"epochs": []any{}}, reader(at(-time.Hour))); got != "e#1,e#2" {
+		t.Errorf("epochs [] with the branch's own: %s", got)
+	}
+
+	// The base moves past its epoch at at: a grant without nbf gets none
+	// of the base's, and none ever gets the base's epoch after at.
+	e.clock.Advance(time.Hour)
+	rotate(3, k3)
+	if got := kids(nil, reader()); got != "eb#2" {
+		t.Errorf("no nbf, base past its epoch at at: %s", got)
+	}
+	if got := kids(nil, reader(at(-time.Hour))); got != "eb#2,e#1,e#2" {
+		t.Errorf("after the base's rotation: %s", got)
+	}
+}
