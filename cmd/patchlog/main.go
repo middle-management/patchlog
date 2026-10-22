@@ -96,6 +96,8 @@ func main() {
 		schemaCmd(os.Args[2:])
 	case "health":
 		healthCmd(os.Args[2:])
+	case "e2e":
+		e2eCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -125,6 +127,7 @@ func usage() {
   patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]
   patchlog schema import -api URL -ns NS [-bearer T] [-author A] [-name NAME] [-dry-run] [-json] URL|FILE...
   patchlog health [-timeout 2s] [URL]   (exit 0 if URL, default http://localhost:8080/_health, answers 200)
+  patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-bearer T]
 
 serve, index, tree and dav also take -shutdown-timeout 30s and -shutdown-delay 0 (graceful shutdown) and answer /_health and /_ready.`)
 	os.Exit(2)
