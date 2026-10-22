@@ -4,8 +4,8 @@
 //     alg "dir", enc "A256GCM" and the `pl` binding claims (§E.2.2).
 //   - Key schedule: epoch keys K_e, kids "{ns}#{e}" and per-resource keys
 //     K_r = HKDF-SHA256(K_e, "patchlog-e2", ns ‖ 0x0A ‖ name) (§E.2.1).
-//   - Key wrapping to recipients' X25519 keys with HPKE (RFC 9180) and the
-//     E3 keyring resource (§E.2.3, §E.3.2).
+//   - Key wrapping to recipients' X25519 keys with HPKE (RFC 9180), in base
+//     mode, and in auth mode for the E3 keyring resource (§E.2.3, §E.3.2).
 //   - E3 sealed patch sets and prune snapshots (§E.3.1, §8.6).
 //   - E1 storage encryption: row AEAD and a chunked streaming file format.
 //   - `$nonce` helpers (§C.7, §E.2.5).
