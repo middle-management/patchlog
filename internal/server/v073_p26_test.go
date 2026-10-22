@@ -499,3 +499,28 @@ func TestV073P26PrunePrecondition(t *testing.T) {
 	e.purgeNSAs("ppx", sg)
 	expectCode(t, pre("ppx", "x", map[string]any{"horizon": x}, sg, x, ""), 410, "purged")
 }
+
+// v0.73 §8.3 Branches (BBD-15): a purge propagates to every branch,
+// recursively; a branch that sees no entry for the name is skipped, with no
+// entry, but its own branches aren't, and a branch's purge entry targets
+// its own view's head.
+func TestV073P26PurgeSkipsBranchWithoutEntry(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	expect(t, e.branch("m", map[string]any{"name": "m1"}, "alice"), 201) // before x
+	x := e.create("m", "x", map[string]any{"v": 1.0})
+	expect(t, e.branch("m1", map[string]any{"name": "m2"}, "alice"), 201)
+	w := e.create("m2", "x", map[string]any{"v": 2.0}) // m2's own chain
+	m1 := e.nsHead("m1")
+
+	expect(t, e.purge("m", "x", x, "admin"), 204)
+	if e.nsHead("m1") != m1 {
+		t.Fatalf("m1, with no entry for x, got one: %v", e.lastNSEntry("m1"))
+	}
+	expect(t, e.get("/r/m1/x"), 404)
+	if en := e.lastNSEntry("m2"); en["kind"] != "purge" || en["resource"] != "x" || en["target"] != w {
+		t.Fatalf("m2's last entry %v, want a purge of x targeting %s", en, w)
+	}
+	expectCode(t, e.get("/r/m2/x"), 410, "gone")
+}
