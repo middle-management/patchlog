@@ -961,13 +961,22 @@ func (st *reqState) removeAll(ctx context.Context, name string) error {
 	case kRoot, kNSDir, kCatDir:
 		return fail(http.StatusForbidden, "the namespaces served are fixed; %s can't be deleted here", t.path)
 	case kDoc, kRaw:
-		if _, live, err := st.docAt(ctx, t); err != nil {
+		if hd, live, err := st.docAt(ctx, t); err != nil {
 			return err
 		} else if live {
 			if err := st.afterRefusedSave(ctx, t); err != nil {
 				return err
 			}
-			_, err := st.deleteDoc(ctx, t.docNS, t.docName, st.ifMatch)
+			// Without a tag, the head read here is deleted (If-Match), and
+			// one someone changed since is a 409 (§H.5 "Delete a file").
+			match := st.ifMatch
+			if match == "" {
+				match = hd.rev
+			}
+			_, err := st.deleteDoc(ctx, t.docNS, t.docName, match)
+			if de, ok := err.(*davError); ok && de.status == http.StatusPreconditionFailed && st.ifMatch == "" {
+				err = movedSinceRead(t)
+			}
 			if err == nil {
 				st.s.forgetPath(st.p, t.path)
 			}
