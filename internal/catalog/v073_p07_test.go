@@ -241,3 +241,150 @@ func TestVisibilityKeyRulesV073(t *testing.T) {
 		t.Error("a key without read in can lets roles count for read")
 	}
 }
+
+// TestAdminPowersV073 (TC-21, scenario 4): a caller in catalog-admins
+// needs no tree power for any organising request; the place list, key
+// rules and the 404/409 answers still apply (§B.11.4).
+func TestAdminPowersV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("matches", "newone", map[string]any{"title": "new"})
+	w.start()
+	w.caughtUp()
+	// ada is an admin with no role anywhere; editors-in-chief puts her in
+	// matches' place list, and gives her desk on rumours only.
+	ada := w.caller("user:ada", "catalog-admins", "editors-in-chief")
+	w.issue(ada, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("season")}, 200)
+	w.issue(ada, map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("derbies")}, 200)
+	w.issue(ada, map[string]any{"node": "matches.shared", "want": toAny("delete")}, 200)
+	w.issue(ada, map[string]any{"node": "previews", "want": toAny("create"), "to": toAny("season")}, 200)
+	// The place list still applies to admins (§B.11.4 Place, F-T5).
+	w.issue(w.caller("user:ada", "catalog-admins"), map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("season")}, 403)
+	// So do the 409s.
+	w.issue(ada, map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}, 409)
+	w.issue(ada, map[string]any{"node": "season", "want": toAny("create"), "to": toAny("root")}, 409)
+	// A non-admin with the same roles has no power on season.
+	eve := w.caller("user:eve", "editors-in-chief")
+	w.issue(eve, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("season")}, 403)
+	w.issue(eve, map[string]any{"node": "matches.shared", "want": toAny("delete")}, 403)
+
+	// Merge checks (§F.8): an admin approver needs no power either.
+	head := func(name string) string { return must(w.ops.Head(context.Background(), "cat", name)).ID }
+	b := map[string]any{"batch": map[string]any{"source": map[string]any{"ns": "cat-r1", "at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		"items": []any{map[string]any{"resource": "matches.shared", "ifMatch": head("matches.shared"), "steps": []any{"delete"}}}}}
+	ask := func(approver string) resp {
+		return w.doWith("POST", "/merge-grants", w.caller("svc:merge"), b, map[string]string{"Approver-Authorization": "Bearer " + approver})
+	}
+	if r := ask(ada); r.status != 200 {
+		t.Errorf("merge approved by an admin without move: %d %v", r.status, r.body)
+	}
+	if r := ask(eve); r.status != 403 {
+		t.Errorf("merge approved by a non-admin without move: %d %v", r.status, r.body)
+	}
+}
+
+// TestBrokenParentsGiveNoPowerV073 (TC-23, scenario 46): powers count only
+// at a live folder that isn't cyclic, and only through subjects the
+// catalog's key in the catalog may assert. A missing, tombstoned, cyclic
+// or non-folder parent gives none, so a non-admin can't move a node from
+// it or unplace it (403); an admin can (§B.11.2 Tree powers, §B.11.4).
+func TestBrokenParentsGiveNoPowerV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	desk := func(extra ...any) map[string]any {
+		return acc(append([]any{"group:match-desk", "desk"}, extra...)...)
+	}
+	// c1 and c2 are a cycle; tomb will be deleted; opsf's role comes
+	// through group:ops, which the catalog's key denies (§B.11.3).
+	w.doc("cat", "c1", map[string]any{"title": "c1", "parents": parents("c2"), "$access": desk()})
+	w.doc("cat", "c2", map[string]any{"title": "c2", "parents": parents("c1"), "$access": desk()})
+	w.doc("cat", "tomb", map[string]any{"title": "tomb", "parents": parents("root"), "$access": desk()})
+	w.doc("cat", "opsf", map[string]any{"title": "opsf", "parents": parents("root"), "$access": acc("group:ops", "desk")})
+	for _, n := range []string{"p1", "p2", "p3", "p4"} {
+		w.doc("matches", n, map[string]any{"title": n})
+	}
+	w.doc("cat", "matches.p1", map[string]any{"parents": parents("season", "ghost")}) // ghost never existed
+	w.doc("cat", "matches.p2", map[string]any{"parents": parents("season", "tomb")})
+	w.doc("cat", "matches.p3", map[string]any{"parents": parents("season", "c1")})
+	w.doc("cat", "matches.p4", map[string]any{"parents": parents("season", "matches.derby")})
+	w.start()
+	w.caughtUp()
+	tomb := must(w.ops.Head(context.Background(), "cat", "tomb"))
+	must(w.ops.Delete(context.Background(), "cat", "tomb", tomb.ID))
+	w.caughtUp()
+
+	bob := w.caller("user:bob", "match-desk")
+	admin := w.caller("user:ada", "catalog-admins")
+	for _, n := range []string{"matches.p1", "matches.p2", "matches.p3", "matches.p4"} {
+		// bob has move at season, but not at the other parent.
+		w.issue(bob, map[string]any{"node": n, "want": toAny("move"), "to": toAny("season")}, 403)
+		w.issue(bob, map[string]any{"node": n, "want": toAny("delete")}, 403)
+		w.issue(admin, map[string]any{"node": n, "want": toAny("move"), "to": toAny("season")}, 200)
+		w.issue(admin, map[string]any{"node": n, "want": toAny("delete")}, 200)
+	}
+	// Leaving only season, which bob has move at, is fine.
+	w.doc("cat", "matches.p5", map[string]any{"parents": parents("season")})
+	w.doc("matches", "p5", map[string]any{"title": "p5"})
+	w.caughtUp()
+	w.issue(bob, map[string]any{"node": "matches.p5", "want": toAny("delete")}, 200)
+
+	// A role collected through a group the catalog's key may not assert
+	// gives no power.
+	w.issue(w.caller("user:o", "ops"), map[string]any{"node": "underops", "want": toAny("create"), "to": toAny("opsf")}, 403)
+	w.issue(w.caller("user:o", "ops", "match-desk"), map[string]any{"node": "underops", "want": toAny("create"), "to": toAny("season")}, 200)
+
+	// The same in merge checks (§F.8): a broken parent gives no power.
+	head := func(name string) string { return must(w.ops.Head(context.Background(), "cat", name)).ID }
+	b := map[string]any{"batch": map[string]any{"source": map[string]any{"ns": "cat-r1", "at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		"items": []any{map[string]any{"resource": "matches.p1", "ifMatch": head("matches.p1"), "steps": []any{"delete"}}}}}
+	if r := w.doWith("POST", "/merge-grants", w.caller("svc:merge"), b, map[string]string{"Approver-Authorization": "Bearer " + bob}); r.status != 403 {
+		t.Errorf("merge deleting under a dangling parent: %d %v", r.status, r.body)
+	}
+}
+
+// TestInheritedPowersV073 (TC-24, scenarios 2 and 46): at a folder without
+// $access but with parents, a subject's role has a power when the same
+// subject's role has it at every parents entry, recursively; a broken
+// parent gives none (§B.11.2 Tree powers, §B.11.4 Create a folder).
+func TestInheritedPowersV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("cat", "p1", map[string]any{"title": "P1", "parents": parents("root"), "$access": acc("group:a", "desk", "group:c", "desk")})
+	w.doc("cat", "p2", map[string]any{"title": "P2", "parents": parents("root"), "$access": acc("group:b", "desk", "group:c", "desk")})
+	w.doc("cat", "f", map[string]any{"title": "F", "parents": parents("p1", "p2")})
+	w.doc("cat", "g", map[string]any{"title": "G", "parents": parents("f")})
+	w.doc("cat", "half", map[string]any{"title": "half", "parents": parents("p1", "ghost")})
+	w.doc("matches", "m", map[string]any{"title": "m"})
+	w.doc("cat", "matches.m", map[string]any{"parents": parents("f")})
+	w.start()
+	w.caughtUp()
+	create := func(token, under string, status int) {
+		t.Helper()
+		w.issue(token, map[string]any{"node": "new-" + under, "want": toAny("create"), "to": toAny(under)}, status)
+	}
+	a, ab, c := w.caller("user:a", "a"), w.caller("user:ab", "a", "b"), w.caller("user:c", "c")
+	// Scenario 2: powers are judged per subject. a has desk at P1 only;
+	// a member of both a and b has it at each parent, but through
+	// different subjects.
+	create(a, "f", 403)
+	create(ab, "f", 403)
+	// c's desk holds at both parents: F has its move, and so does G below
+	// it, which takes F's.
+	create(c, "f", 200)
+	create(c, "g", 200)
+	w.issue(c, map[string]any{"node": "matches.m", "want": toAny("move"), "to": toAny("g")}, 200)
+	// A parents entry that dangles gives none.
+	create(c, "half", 403)
+
+	// Scenario 46: a member of b deletes P2. a still can't act in F: the
+	// tombstoned parent gives no power, so deleting a node never widens.
+	p2 := must(w.ops.Head(context.Background(), "cat", "p2"))
+	must(w.ops.Delete(context.Background(), "cat", "p2", p2.ID))
+	w.caughtUp()
+	create(a, "f", 403)
+	w.issue(a, map[string]any{"node": "matches.m", "want": toAny("move"), "to": toAny("p1")}, 403)
+	create(c, "f", 403)
+}

@@ -16,7 +16,11 @@
 //   - Tree powers (move, place) come from the catalog namespace's roles and
 //     apply only where a role granting them is assigned directly, unless
 //     the folder's $access sets inheritPowers: then the roles collected on
-//     the walk up count there too (§B.11.2).
+//     the walk up count there too. At a folder without $access but with
+//     parents, a subject's role has them where it has them at every
+//     parent. They count only at live folders that aren't cyclic, through
+//     subjects the catalog's key in the catalog may assert, and callers in
+//     the admin group need none (§B.11.2, §B.11.4; powers).
 //   - Content namespaces define what a role means (§B.11.1): the catalog
 //     keeps only roles the content namespace defines with a wanted verb.
 //   - A caller's subjects are its sub, if it starts with user:, and

@@ -102,17 +102,19 @@ func TestInheritPowers(t *testing.T) {
 		t.Helper()
 		w.issue(bob, map[string]any{"item": "/r/matches/pw", "want": toAny("place"), "to": toAny(to)}, status)
 	}
-	// Powers are assigned where a role granting them is, and nowhere else.
+	// Powers are assigned where a role granting them is, and at folders
+	// without $access, which take, per subject, the powers held at all
+	// their parents (§B.11.2 v0.66): plain's from desks, deep's from inh.
 	place("desks", 200)
-	place("plain", 403)
-	place("deep", 403)
-	// inheritPowers brings them down to that folder, not below it.
+	place("plain", 200)
+	place("deep", 200)
+	// inheritPowers brings them down to that folder.
 	place("inh", 200)
 	// inherit: false stops the walk up, so nothing is collected.
 	place("cut", 403)
 	// Folders can be created under it, by the same power.
 	w.issue(bob, map[string]any{"node": "newf", "want": toAny("create"), "to": toAny("inh")}, 200)
-	w.issue(bob, map[string]any{"node": "newf", "want": toAny("create"), "to": toAny("plain")}, 403)
+	w.issue(bob, map[string]any{"node": "newf", "want": toAny("create"), "to": toAny("cut")}, 403)
 
 	// Moves: still bounded by no widening. Out of inh (move there comes by
 	// inheritPowers) into derbies (fan-club: desk) would widen.
