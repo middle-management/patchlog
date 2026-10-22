@@ -20,6 +20,9 @@ func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	up := blobUpload(r)
+	if err := s.writeHeaders(r, false); err != nil && up.ShapeErr == "" {
+		up.ShapeErr = errMessage(err) // at check 4 (§7.8)
+	}
 	if up.From != "" {
 		// A copy has an empty body (400 if not, in its place in the order,
 		// before any body is read): a declared length says so; only a

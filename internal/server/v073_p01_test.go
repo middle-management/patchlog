@@ -553,6 +553,91 @@ func TestV073BatchGestureHeaders(t *testing.T) {
 	expectShape(t, "malformed Gesture", e.do(req{method: "POST", path: "/ns/m/batch", body: map[string]any{"items": items}, author: "alice", hdr: map[string]string{"Gesture": "nope"}}))
 }
 
+// §C.3.1 (GR-38): a Signature header on any write other than a resource
+// PATCH or DELETE is 400, before any 401; an upload's is a header shape
+// error of check 4 (§7.8), after authorisation and 409 frozen.
+func TestV073SignatureHeaderElsewhere(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	hdr := map[string]string{"Signature": "Ed25519:k1:" + strings.Repeat("A", 86)}
+	id := hashID(t, "", []byte("x"))
+	for _, q := range []req{
+		{method: "PATCH", path: "/ns/sec", ifMatch: id, body: ops(op("add", "/x-a", 1))},
+		{method: "PATCH", path: "/ns/new", ifNoneMatch: "*", body: addRoot(map[string]any{})},
+		{method: "POST", path: "/ns/sec/batch", body: map[string]any{"items": []any{}}},
+		{method: "POST", path: "/r/sec/a/purge", ifMatch: id},
+		{method: "POST", path: "/ns/sec/purge", ifMatch: id},
+		{method: "POST", path: "/r/sec/a/prune", body: map[string]any{"horizon": id}},
+		{method: "POST", path: "/ns/sec/branches", ifNoneMatch: "*", body: map[string]any{"name": "sec-b"}},
+		{method: "POST", path: "/ns/sec/branches", ifNoneMatch: "*", body: map[string]any{"remote": map[string]any{"origin": "https://other.example", "ns": "x"}, "at": id}},
+	} {
+		q.hdr = hdr
+		expectShape(t, q.method+" "+q.path, e.do(q))
+		q.bearer = f.adminG
+		expectShape(t, q.method+" "+q.path+" with a grant", e.do(q))
+	}
+	// Uploads and copies: at check 4.
+	data := []byte("bytes")
+	bid := blobID("text/plain", "", data)
+	up := req{method: "PUT", path: blobPath("sec", "a", bid), raw: string(data), ct: "text/plain", hdr: hdr}
+	expectCode(t, e.do(up), 401, "unauthenticated")
+	up.bearer = f.issuerG
+	expectShape(t, "upload", e.do(up))
+	cp := req{method: "PUT", path: blobPath("sec", "a", bid), bearer: f.issuerG, hdr: map[string]string{"Signature": hdr["Signature"], "Blob-From": blobPath("sec", "b", bid)}}
+	expectShape(t, "copy", e.do(cp))
+	k := newKey("fz")
+	e.mkNS("fz", map[string]any{"read": "public", "frozen": true, "keys": []any{k.entry("*")}})
+	up = req{method: "PUT", path: blobPath("fz", "a", bid), raw: string(data), ct: "text/plain", hdr: hdr, bearer: e.grant(k, "user:w", []string{"fz"}, []string{"create"})}
+	expectCode(t, e.do(up), 409, "frozen")
+}
+
+// §7.2 (GB-57): while authentication is disabled, a write without X-Author
+// is 400; reads are unaffected. An upload's is a header shape error of
+// check 4 (§7.8).
+func TestV073XAuthorRequired(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withBlobTuning)
+	e.mkNS("m", map[string]any{"read": "public"})
+	id := e.create("m", "a", map[string]any{"n": 1})
+	cfg, at := e.configID("m"), e.nsHead("m")
+	data := []byte("bytes")
+	bid := blobID("text/plain", "", data)
+	for _, author := range []string{"", " "} {
+		for _, q := range []req{
+			{method: "PATCH", path: "/r/m/a", ifMatch: id, body: ops(op("add", "/x", 1))},
+			{method: "PATCH", path: "/r/m/b", ifNoneMatch: "*", body: addRoot(map[string]any{})},
+			{method: "DELETE", path: "/r/m/a", ifMatch: id},
+			{method: "PATCH", path: "/ns/m", ifMatch: cfg, body: ops(op("add", "/x-a", 1))},
+			{method: "PATCH", path: "/ns/n2", ifNoneMatch: "*", body: addRoot(map[string]any{})},
+			{method: "POST", path: "/ns/m/batch", body: map[string]any{"items": []any{map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}},
+			{method: "POST", path: "/ns/m/branches", ifNoneMatch: "*", body: map[string]any{"name": "m-b"}},
+			{method: "POST", path: "/ns/m/branches", ifNoneMatch: "*", body: map[string]any{"remote": map[string]any{"origin": "https://other.example", "ns": "x"}, "at": at}},
+			{method: "POST", path: "/r/m/a/purge", ifMatch: id},
+			{method: "POST", path: "/ns/m/purge", ifMatch: at},
+			{method: "POST", path: "/r/m/a/prune", body: map[string]any{"horizon": id}},
+			{method: "PUT", path: blobPath("m", "a", bid), raw: string(data), ct: "text/plain"},
+		} {
+			if author != "" {
+				q.hdr = map[string]string{"X-Author": author}
+			}
+			expectShape(t, q.method+" "+q.path+" author "+author, e.do(q))
+		}
+	}
+	if e.head("m", "a") != id {
+		t.Fatal("a write without X-Author changed the resource")
+	}
+	// Reads, POST /keys among them, need none.
+	expect(t, e.get("/r/m/a"), 302)
+	expect(t, e.get("/r/m/a/rev/"+id), 200)
+	expectCode(t, e.do(req{method: "POST", path: "/ns/m/keys"}), 404, "not_offered")
+	// With an author, the same write goes through.
+	expect(t, e.do(req{method: "PATCH", path: "/r/m/a", ifMatch: id, body: ops(op("add", "/x", 1)), author: "alice"}), 201)
+	// With authentication on, X-Author isn't needed.
+	f := newAuthFixture(t, nil)
+	expect(t, f.do(req{method: "PATCH", path: "/r/sec/a", ifNoneMatch: "*", body: addRoot(map[string]any{}), bearer: f.issuerG}), 201)
+}
+
 // §7.7 (RH-40): live is absent or long-poll, an empty value included
 // otherwise 400; cursor is a decimal number, so cursor= and +5 are 400;
 // both before authorisation.

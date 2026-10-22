@@ -15,6 +15,10 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if err := s.writeHeaders(r, true); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if err := requireType(r, jsonPatchType); err != nil {
 		writeErr(w, err)
 		return
@@ -63,6 +67,10 @@ func (s *Server) resourceDelete(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if err := s.writeHeaders(r, true); err != nil {
+		writeErr(w, err)
+		return
+	}
 	// If-None-Match: * is a precondition DELETE doesn't take: the core's
 	// 428, after authorisation (§7.5, §12.1), not a request-shape error.
 	p, err := preconditions(r)
@@ -102,6 +110,10 @@ func (s *Server) resourcePurge(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if err := s.writeHeaders(r, false); err != nil {
+		writeErr(w, err)
+		return
+	}
 	p, err := preconditions(r)
 	if err != nil {
 		writeErr(w, err)
@@ -121,6 +133,10 @@ func (s *Server) resourcePrune(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	ns, name := r.PathValue("ns"), r.PathValue("name")
 	if err := validNames(ns, name); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.writeHeaders(r, false); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -204,6 +220,10 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
+	if err := s.writeHeaders(r, false); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if err := requireType(r, jsonPatchType); err != nil {
 		writeErr(w, err)
 		return
@@ -250,6 +270,10 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	ns := r.PathValue("ns")
 	if err := validNames(ns, ""); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.writeHeaders(r, false); err != nil {
 		writeErr(w, err)
 		return
 	}
@@ -353,6 +377,10 @@ func (s *Server) nsBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, badInput("a batch carries signatures in its step objects, not in a Signature header (§C.3.1)"))
 		return
 	}
+	if err := s.writeHeaders(r, false); err != nil {
+		writeErr(w, err)
+		return
+	}
 	if err := requireType(r, jsonType); err != nil {
 		writeErr(w, err)
 		return
@@ -408,6 +436,10 @@ func (s *Server) nsPurge(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
 	ns := r.PathValue("ns")
 	if err := validNames(ns, ""); err != nil {
+		writeErr(w, err)
+		return
+	}
+	if err := s.writeHeaders(r, false); err != nil {
 		writeErr(w, err)
 		return
 	}

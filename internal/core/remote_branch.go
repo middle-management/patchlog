@@ -1687,6 +1687,10 @@ func postRegistration(ctx context.Context, ep RemoteEndpoint, baseURL, ns string
 	}
 	if ep.Bearer != "" {
 		hr.Header.Set("Authorization", "Bearer "+ep.Bearer)
+	} else if rm, ok := body["remote"].(map[string]any); ok {
+		// A base with authentication disabled needs an author for the
+		// write (§7.2): this deployment, by its origin.
+		hr.Header.Set("X-Author", fmt.Sprint(rm["origin"]))
 	}
 	res, err := ep.HTTPClient.Do(hr)
 	if err != nil {

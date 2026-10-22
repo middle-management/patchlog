@@ -97,6 +97,20 @@ func (s *Server) patchBody() (int, bodyLimit) {
 	return 4 * max(l.PatchSetSize, l.DocumentSize), bodyLimit{"documentSize", l.DocumentSize}
 }
 
+// writeHeaders checks a write's request-shape headers before step 1
+// (§6.2): while authentication is disabled, an X-Author (§7.2); and a
+// Signature header only where signed, on a resource PATCH or DELETE,
+// which signature() reads (§C.3.1). Each is 400.
+func (s *Server) writeHeaders(r *http.Request, signed bool) error {
+	if s.e.AuthMode() == "disabled" && strings.TrimSpace(r.Header.Get("X-Author")) == "" {
+		return badInput("a write needs X-Author while authentication is disabled (§7.2)")
+	}
+	if _, has := r.Header["Signature"]; has && !signed {
+		return badInput("the Signature header covers a single PATCH or DELETE of a resource, and is 400 on any other write (§C.3.1)")
+	}
+	return nil
+}
+
 // JSON request bodies' media types (§7.2): JSON Patch for resource and
 // namespace patches, JSON for every other body.
 const (
