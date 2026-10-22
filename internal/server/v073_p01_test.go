@@ -671,6 +671,7 @@ func TestV073PatchBodiesNameDocumentSize(t *testing.T) {
 	t.Parallel()
 	l := core.DefaultLimits()
 	l.DocumentSize, l.PatchSetSize = 64<<10, 16<<10
+	l.ValueSize, l.PathSize = 4<<10, 1<<10 // 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6)
 	e := newEnv(t, func(o *core.Options) { o.Limits, o.Maximums = l, l })
 	e.mkNS("b", map[string]any{})
 	bound := 4 * (64 << 10)
