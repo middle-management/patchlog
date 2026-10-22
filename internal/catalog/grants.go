@@ -85,12 +85,14 @@ type Issued struct {
 }
 
 // Error is a refusal with an HTTP status. A refusal that is a decision
-// carries the checkpoint it was decided at (decidedAt).
+// carries the checkpoint it was decided at (decidedAt); a 410 purged
+// carries Head, the purged namespace's purge-ns entry (§12.1).
 type Error struct {
 	Status     int
 	Code       string
 	Msg        string
 	Checkpoint map[string]string
+	Head       string
 }
 
 func (e *Error) Error() string { return fmt.Sprintf("%d %s: %s", e.Status, e.Code, e.Msg) }
@@ -108,14 +110,65 @@ func upstream(err error) error {
 }
 
 // configErr answers a namespace document the checker couldn't read: 410
-// gone for a purged sealed namespace, whose documents are 410 purged once
-// the purge destroys their epoch keys (§8.5), as for a purged item, since
-// nothing in it can be granted any more; 502 otherwise.
+// purged, with the core's head, the purge-ns entry, for a purged sealed
+// namespace, whose documents are 410 purged once the purge destroys their
+// epoch keys (§8.5), since nothing in it can be granted any more; 502
+// otherwise. Decided at the core's head, it carries no checkpoint
+// (decidedAt).
 func configErr(ns string, err error) error {
 	if client.IsPurged(err) {
-		return errf(410, "gone", "namespace %s is purged", ns)
+		var head string
+		if ae, ok := client.AsAPIError(err); ok {
+			head, _ = ae.Body["head"].(string)
+		}
+		return purgedErr(ns, head)
 	}
 	return upstream(err)
+}
+
+// purgedErr is the 410 purged a catalog service answers for every name of
+// a purged namespace, first among item answers, with head its purge-ns
+// entry (§B.11.4, §8.5, §12.1). A purged item of a namespace that isn't
+// is 410 gone (§8.3).
+func purgedErr(ns, head string) error {
+	return &Error{Status: 410, Code: "purged", Msg: fmt.Sprintf("namespace %s is purged", ns), Head: head}
+}
+
+// purgedIn is purgedErr, decided at the checkpoint g and cur reflect, for
+// a namespace the service holds as purged there, its purge-ns entry
+// ns's checkpoint (tree.Service.PurgeEntry); nil otherwise. Call it under
+// View.
+func (s *Service) purgedIn(g *tree.Graph, cur map[string]string, ns string) error {
+	head, purged := s.t.PurgeEntry(ns)
+	if !purged {
+		return nil
+	}
+	e := purgedErr(ns, head).(*Error)
+	e.Checkpoint = checkpointAt(g, cur, ns)
+	return e
+}
+
+// purgedAt is purgedIn at the checkpoint the service is at.
+func (s *Service) purgedAt(ns string) (err error) {
+	s.t.View(func(g *tree.Graph, cur map[string]string) { err = s.purgedIn(g, cur, ns) })
+	return err
+}
+
+// contentConfig is content namespace ns's document at the head (the grant
+// checker's copy), whose entry for the catalog's key signs a grant for its
+// items (plan.key). Every name of a namespace the service holds as purged
+// is 410 purged first, decided at the checkpoint (purgedAt); one whose
+// document the core answers 410 purged (a sealed one, §8.5) is so too,
+// from the core's head (configErr).
+func (s *Service) contentConfig(ctx context.Context, ns string) (*grantcheck.Config, error) {
+	if err := s.purgedAt(ns); err != nil {
+		return nil, err
+	}
+	cfg, err := s.t.Checker().Config(ctx, ns)
+	if err != nil {
+		return nil, configErr(ns, err)
+	}
+	return cfg, nil
 }
 
 // decidedAt marks a refusal that is a decision (403, 404, 409, 410) with
@@ -549,8 +602,15 @@ func writeErr(w http.ResponseWriter, err error) {
 		if ce.Status == 503 {
 			w.Header().Set("Retry-After", "1")
 		}
-		if ce.Checkpoint != nil {
-			tree.WriteJSON(w, ce.Status, map[string]any{"code": ce.Code, "message": ce.Msg, "checkpoint": ce.Checkpoint})
+		if ce.Checkpoint != nil || ce.Head != "" {
+			body := map[string]any{"code": ce.Code, "message": ce.Msg}
+			if ce.Checkpoint != nil {
+				body["checkpoint"] = ce.Checkpoint
+			}
+			if ce.Head != "" {
+				body["head"] = ce.Head
+			}
+			tree.WriteJSON(w, ce.Status, body)
 			return
 		}
 		tree.WriteError(w, ce.Status, ce.Code, ce.Msg)
@@ -661,13 +721,126 @@ func parentHrefsRule(list []string) any {
 	return map[string]any{"op": "test", "path": "/doc/parents", "schema": sch}
 }
 
+// itemFacts is what an item request's decision reads of the item ns/name
+// at the checkpoint a View reflects (§B.11.4): whether the catalog trusts
+// ns; whether the service has a checkpoint of ns (known), so that the
+// names ns has had are decided there; the item's state there (a name the
+// service never saw is tree.ItemUnknown, every name of a namespace it
+// holds as purged tree.ItemPurged, tree.ItemState); and its explicit
+// placement in this catalog, nil if it has none (an implicit one, from
+// $parents, grants nothing, §B.9).
+type itemFacts struct {
+	trusted, known bool
+	state          int
+	node           *tree.Node
+}
+
+// itemIn reads an item's facts (itemFacts) at the checkpoint g and cur
+// reflect. The state of an item without a placement is read from the
+// service's database, which an apply changes with the checkpoint under
+// the graph lock, so it is the state at that checkpoint too. The service
+// follows only trusted namespaces: of an untrusted one's items it knows
+// nothing. Call it under View.
+func (s *Service) itemIn(ctx context.Context, g *tree.Graph, cur map[string]string, ns, name string) (itemFacts, error) {
+	f := itemFacts{trusted: g.Trust[ns], known: cur[ns] != ""}
+	if !f.trusted {
+		return f, nil
+	}
+	if n := g.Node(ns + "." + name); n != nil && !n.Self {
+		f.node, f.state = n, n.ItemState
+		return f, nil
+	}
+	st, _, err := s.t.ItemState(ctx, ns, name)
+	f.state = st
+	return f, err
+}
+
+// rolesIn is the union over subs of eff's roles (a node's roles per
+// subject).
+func rolesIn(eff map[string][]string, subs map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for subj, roles := range eff {
+		if subs[subj] {
+			for _, r := range roles {
+				out[r] = true
+			}
+		}
+	}
+	return out
+}
+
+// intersect is the roles in both a and b.
+func intersect(a, b map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for r := range a {
+		if b[r] {
+			out[r] = true
+		}
+	}
+	return out
+}
+
+// counting is the roles among roles that count for verb in the content
+// namespace whose document is cfg (§B.11.2 Through the key): the
+// namespace defines the role with verb, and the catalog's key there, key,
+// lists verb in its can and allows the role in its roles scope; roles
+// were collected through the subjects key may grant through
+// (who.through). Sorted; none without a key.
+func counting(cfg *grantcheck.Config, key *grant.Key, roles map[string]bool, verb string) []string {
+	if key == nil || !key.IsStar() && !contains(key.Can, verb) {
+		return nil
+	}
+	var out []string
+	for r := range roles {
+		if def, ok := cfg.Roles[r]; ok && roleAllowed(key, r) && contains(def.Can, verb) {
+			out = append(out, r)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// noRole is the 403 of an item request that keeps no role (§B.11.4): one
+// answer whether the item has no placement in this catalog, a dangling
+// one, or one hidden from the caller (/read-grants), or no role of the
+// caller's counts there, so that it doesn't show which (§B.11, §B.11.5).
+func noRole(want []string, item string) error {
+	return forbidden("no role of yours allows %s on %s", strings.Join(want, ", "), item)
+}
+
+func untrusted(ns, cat string) error {
+	return forbidden("namespace %s is not trusted by catalog %s", ns, cat)
+}
+
+func (s *Service) noContentKey(ns string) error {
+	return forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
+}
+
 // planContent decides content verbs (read, append, create, …) on an item
 // from the caller's roles at its placement, collected only through
 // subjects the catalog's key in the content namespace may grant through
 // (who.through: its sub and groups scopes, §B.11.2, §B.11.4); restore is
-// planRestore's. The roles, their definitions and
-// the catalog's key are those as of the checkpoint the decision reports
-// (configAt), as for visibility.
+// planRestore's. The roles, their definitions and the catalog's key are
+// those as of the checkpoint the decision reports (configAt), as for
+// visibility.
+//
+// A create answers, in order (§B.11.4 Create): 410 purged in a purged
+// namespace (contentConfig, purgedIn); 409 for a name that exists or
+// existed, as the checkpoint has it, then as the core's head has it (a
+// name the service hasn't seen yet, which carries no checkpoint,
+// decidedAt); then 403 for an item without a placement in this catalog,
+// or a caller without a role kept.
+//
+// Other verbs answer as Restore's list does (§B.11.4): 410 purged; 404
+// for a name that never existed; for a purged item, 403 without a role
+// that counts for read at its placement, computed as for a live item
+// (Effective), and 410 gone otherwise; then 403 when no role is kept, a
+// dangling placement included (§B.11.2), with one message whether the
+// item has a placement or not (noRole).
+//
+// Names are decided only in a namespace the service has a checkpoint of
+// (itemFacts.known), and the service follows only trusted ones: an item of
+// a namespace the catalog doesn't trust is 403 after the 410.
 func (s *Service) planContent(ctx context.Context, v *grant.Verified, item string, want []string) (_ *plan, err error) {
 	for _, w := range want {
 		if !grant.IsVerb(w) {
@@ -692,52 +865,65 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		}
 		return s.planRestore(ctx, v, ns, name, item)
 	}
-	latest, err := s.t.Checker().Config(ctx, ns)
+	latest, err := s.contentConfig(ctx, ns)
 	if err != nil {
-		return nil, configErr(ns, err)
-	}
-	signer := findKey(latest.Keys, s.opt.Kid)
-	if signer == nil {
-		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
+		return nil, err
 	}
 	pl := ns + "." + name
 	var (
-		cfg             *grantcheck.Config
-		key             *grant.Key
-		trusted, placed bool
-		state, itemSt   int
-		roles           map[string]bool
-		cp              string
-		checkpoint      map[string]string
+		cfg        *grantcheck.Config
+		key        *grant.Key
+		f          itemFacts
+		roles      map[string]bool
+		cp         string
+		checkpoint map[string]string
 	)
 	defer func() { err = decidedAt(err, checkpoint) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, ns)
-		cfg = s.configAt(g, ns, latest)
-		if key = findKey(cfg.Keys, s.opt.Kid); key == nil {
+		if err = s.purgedIn(g, cur, ns); err != nil {
 			return
 		}
-		trusted = g.Trust[ns]
-		if n := g.Node(pl); n != nil && !n.Self {
-			placed, state, itemSt = true, n.State, n.ItemState
+		if f, err = s.itemIn(ctx, g, cur, ns, name); err != nil {
+			return
 		}
+		cfg = s.configAt(g, ns, latest)
+		key = findKey(cfg.Keys, s.opt.Kid)
 		// Roles count only through subjects the catalog's key in the
 		// content namespace may grant through: its sub and groups scopes
 		// (§B.11.2 Through the key, §B.11.4 Resolve).
-		roles = s.rolesFor(pl, callerOf(v).through(key))
+		subs := callerOf(v).through(key)
+		switch {
+		case create || !f.trusted:
+		case f.known && f.state == tree.ItemUnknown:
+			err = errf(404, "not_found", "%s has never existed", item)
+		case f.state == tree.ItemPurged:
+			// Restore's read check, at its placement as for a live item:
+			// a purged item's placement dangles and grants nothing
+			// (§B.11.2), but a caller who could read it learns it was
+			// purged, as the core would tell it (§8.3).
+			var at map[string][]string
+			if f.node != nil {
+				at = Effective(g, pl, nil)
+			}
+			if len(counting(cfg, key, rolesIn(at, subs), "read")) == 0 {
+				err = noRole(want, item)
+			} else {
+				err = errf(410, "gone", "%s was purged", item)
+			}
+		}
+		if err == nil {
+			roles = s.rolesFor(pl, subs)
+		}
 	})
-	switch {
-	case key == nil:
-		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
-	case !trusted:
-		return nil, forbidden("namespace %s is not trusted by catalog %s", ns, cat)
-	case !placed:
-		return nil, forbidden("%s is not placed in catalog %s", item, cat)
-	case create:
-		// A create grant can only ever produce the genesis: refuse names that
-		// exist or existed (§B.11.4).
-		if itemSt != tree.ItemUnknown {
+	if err != nil {
+		return nil, err
+	}
+	if create && f.trusted {
+		// A create grant can only ever produce the genesis: refuse names
+		// that exist or existed, which are not secrets (§B.11.4).
+		if f.state != tree.ItemUnknown {
 			return nil, conflict("%s exists or existed", item)
 		}
 		h, err := s.t.Client().Head(ctx, ns, name)
@@ -749,9 +935,16 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 			checkpoint = nil
 			return nil, conflict("%s exists or existed", item)
 		}
-	case state != tree.StateLive:
-		// A dangling placement grants nothing (§B.11.2).
-		return nil, forbidden("the placement of %s is dangling", item)
+	}
+	switch {
+	case !f.trusted:
+		return nil, untrusted(ns, cat)
+	case key == nil:
+		return nil, s.noContentKey(ns)
+	case f.node == nil, !create && f.node.State != tree.StateLive:
+		// No placement, or a dangling one, which grants nothing but
+		// create for an item that has never existed (§B.11.2).
+		return nil, noRole(want, item)
 	}
 	var kept, can []string
 	for r := range roles {
@@ -778,7 +971,7 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		}
 	}
 	if len(can) == 0 {
-		return nil, forbidden("no role of yours allows %s on %s", strings.Join(want, ", "), item)
+		return nil, noRole(want, item)
 	}
 	var final []string
 	for _, r := range kept {
@@ -790,141 +983,142 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		}
 	}
 	sort.Strings(final)
+	signer, err := s.contentSigner(latest, &checkpoint)
+	if err != nil {
+		return nil, err
+	}
 	return &plan{ns: ns, resource: name, can: can, roles: final, rules: []any{resourceRule(name)}, cp: cp, checkpoint: checkpoint, key: signer}, nil
 }
 
+// contentSigner is the catalog's key in latest, a content namespace's
+// document at the head, which signs a grant for its items (plan.key). A
+// head without it is a 403 decided at the head, not at the checkpoint, so
+// it clears the checkpoint (decidedAt); it comes after the decision's own
+// answers, as signer's does for organising grants.
+func (s *Service) contentSigner(latest *grantcheck.Config, checkpoint *map[string]string) (*grant.Key, error) {
+	key := findKey(latest.Keys, s.opt.Kid)
+	if key == nil {
+		*checkpoint = nil
+		return nil, s.noContentKey(latest.NS)
+	}
+	return key, nil
+}
+
 // planRestore decides a restore (§B.11.4): it brings back a deleted item
-// where it is placed, for the roles its placement had when the tombstone
-// was seen (§B.11.7), collected through subjects the catalog's key may
-// assert. The frozen rows stay those of the deletion even if the item was
-// unplaced and placed again, but the item must still have a placement in
-// this catalog. The grant can only restore: if the item is live by the
-// time it is used, the write is an append and the core refuses it.
+// where it is placed, for the roles that count for restore both in the
+// rows its placement had when the tombstone was seen (§B.11.7) and at its
+// placement now, computed as for a live item (Effective), collected
+// through subjects the catalog's key may assert. The frozen rows stay
+// those of the deletion even if the item was unplaced and placed again,
+// but the item must still have a placement in this catalog. The grant can
+// only restore: if the item is live by the time it is used, the write is
+// an append and the core refuses it.
 //
 // The answers come in this order, so they reveal nothing to callers
 // without read beyond what names and purges already do (§E.4):
 //
-//   - 404 for a name that never existed, 410 for a purged item: any name
-//     of a namespace the service holds as purged, which is 410 at the
-//     core too, even one it never saw, as when it started after the purge
-//     (tree.ItemState, §8.5);
-//   - 403 for a caller without a role granting read on the item (in its
-//     frozen rows if deleted, its current ones if live), without a role
-//     granting restore, whose item has no placement, or whose restore
-//     would widen: the roles the item would have after it, from its
-//     current placement, exceed its frozen rows for some subject, judged
-//     with includes as for moves (§B.11.7). Such an item is restored by
-//     a catalog admin, who skips that check as for moves;
-//   - then 409 for a live item.
+//   - 410 purged for every name of a purged namespace (contentConfig,
+//     purgedIn), and 403 for an item of a namespace the catalog doesn't
+//     trust, of whose names the service knows nothing;
+//   - 404 for a name that never existed;
+//   - 403 for a caller without a role that counts for read on the item
+//     both at its placement now and, if it is deleted, in its frozen rows
+//     (an item without a placement has no role there), answered as one
+//     without a role kept (noRole);
+//   - 410 gone for a purged item (§8.3), 409 for a live one;
+//   - 403 for a caller without a role kept, or whose restore would widen:
+//     the roles the item would have after it, from its current
+//     placement, exceed its frozen rows for some subject, judged with
+//     includes as for moves (§B.11.4 No widening). Such an item is
+//     restored by a catalog admin, who skips that check as for moves.
 //
-// Each refusal carries the checkpoint it holds at (decidedAt). The item's
-// state is read from the database, which changes with the checkpoint
-// under the graph lock, so what is read held at some checkpoint between
-// the ones before and after the read: a name the service has seen is
-// never unknown again, so 404 holds at the one before, and a purge is
-// permanent, so 410 holds at the one after.
+// Each refusal carries the checkpoint it was decided at (decidedAt).
 func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, item string) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	pl := ns + "." + name
-	trusted := false
-	var cp string
-	var checkpoint map[string]string
-	defer func() { err = decidedAt(err, checkpoint) }()
-	s.t.View(func(g *tree.Graph, cur map[string]string) {
-		trusted = g.Trust[ns]
-		checkpoint = checkpointAt(g, cur, ns)
-	})
-	if !trusted {
-		// The service follows only trusted namespaces: it knows nothing of
-		// this one's items.
-		return nil, forbidden("namespace %s is not trusted by catalog %s", ns, cat)
-	}
-	itemSt, _, err := s.t.ItemState(ctx, ns, name)
+	want := []string{"restore"}
+	latest, err := s.contentConfig(ctx, ns)
 	if err != nil {
 		return nil, err
 	}
-	switch itemSt {
-	case tree.ItemUnknown:
-		return nil, errf(404, "not_found", "%s has never existed", item)
-	case tree.ItemPurged:
-		s.t.View(func(g *tree.Graph, cur map[string]string) { checkpoint = checkpointAt(g, cur, ns) })
-		return nil, errf(410, "gone", "%s was purged: there is nothing to restore", item)
-	}
-	latest, err := s.t.Checker().Config(ctx, ns)
-	if err != nil {
-		return nil, configErr(ns, err)
-	}
-	signer := findKey(latest.Keys, s.opt.Kid)
-	if signer == nil {
-		// Decided at the head, as in planContent (decidedAt).
-		checkpoint = nil
-		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
-	}
 	admin := s.isAdmin(v)
 	var (
-		cfg         *grantcheck.Config
-		key         *grant.Key
-		placed      bool
-		roles       map[string]bool
-		wSubj, wRol string
-		widens      bool
+		cp         string
+		checkpoint map[string]string
+		kept       []string
 	)
+	defer func() { err = decidedAt(err, checkpoint) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		checkpoint = checkpointAt(g, cur, ns)
-		cfg = s.configAt(g, ns, latest)
-		if key = findKey(cfg.Keys, s.opt.Kid); key == nil {
+		if err = s.purgedIn(g, cur, ns); err != nil {
+			return
+		}
+		var f itemFacts
+		if f, err = s.itemIn(ctx, g, cur, ns, name); err != nil {
+			return
+		}
+		switch {
+		case !f.trusted:
+			err = untrusted(ns, cat)
+			return
+		case f.known && f.state == tree.ItemUnknown:
+			err = errf(404, "not_found", "%s has never existed", item)
+			return
+		}
+		cfg := s.configAt(g, ns, latest)
+		key := findKey(cfg.Keys, s.opt.Kid)
+		if key == nil {
+			err = s.noContentKey(ns)
 			return
 		}
 		subs := callerOf(v).through(key)
-		incs := map[string]Includes{ns: ParseIncludes(cfg.Doc)}
-		n := g.Node(pl)
-		placed = n != nil && !n.Self
-		if placed {
-			itemSt = n.ItemState
+		var now map[string][]string
+		if f.node != nil {
+			now = Effective(g, pl, nil)
 		}
-		if itemSt == tree.ItemLive {
-			roles = s.rolesFor(pl, subs)
+		// The roles at its placement now, and for a deleted item those
+		// in its frozen rows too (§B.11.7).
+		both := rolesIn(now, subs)
+		if f.state == tree.ItemTombstoned {
+			both = intersect(both, s.frozenRolesFor(pl, subs))
+		}
+		if len(counting(cfg, key, both, "read")) == 0 {
+			err = noRole(want, item)
 			return
 		}
-		roles = s.frozenRolesFor(pl, subs)
-		if !placed || admin {
+		switch f.state {
+		case tree.ItemPurged:
+			err = errf(410, "gone", "%s was purged: there is nothing to restore", item)
+			return
+		case tree.ItemLive:
+			err = conflict("%s is not deleted", item)
+			return
+		case tree.ItemUnknown:
+			// The service has no checkpoint of ns: it keeps nothing of
+			// the item.
+			err = noRole(want, item)
 			return
 		}
-		wSubj, wRol, widens = widening(pl, Effective(g, pl, nil), s.frozen[pl], incs)
-	})
-	if key == nil {
-		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
-	}
-	if itemSt == tree.ItemPurged {
-		return nil, errf(410, "gone", "%s was purged: there is nothing to restore", item)
-	}
-	// Roles the content namespace defines with a verb, within the key's
-	// roles scope.
-	with := func(verb string) []string {
-		var out []string
-		for r := range roles {
-			if def, ok := cfg.Roles[r]; ok && roleAllowed(key, r) && contains(def.Can, verb) {
-				out = append(out, r)
+		if kept = counting(cfg, key, both, "restore"); len(kept) == 0 || f.node == nil {
+			err = noRole(want, item)
+			return
+		}
+		if !admin {
+			incs := map[string]Includes{ns: ParseIncludes(cfg.Doc)}
+			if subj, r, widens := widening(pl, now, s.frozen[pl], incs); widens {
+				err = forbidden("restoring %s would give %s the role %s, which it didn't have when the item was deleted; a catalog admin can restore it", item, subj, r)
 			}
 		}
-		sort.Strings(out)
-		return out
+	})
+	if err != nil {
+		return nil, err
 	}
-	kept := with("restore")
-	switch {
-	case len(with("read")) == 0:
-		return nil, forbidden("no role of yours allows read on %s", item)
-	case len(kept) == 0 || !key.IsStar() && !contains(key.Can, "restore"):
-		return nil, forbidden("no role of yours allows restore on %s", item)
-	case !placed:
-		return nil, forbidden("%s is not placed in catalog %s", item, cat)
-	case widens:
-		return nil, forbidden("restoring %s would give %s the role %s, which it didn't have when the item was deleted; a catalog admin can restore it", item, wSubj, wRol)
-	case itemSt == tree.ItemLive:
-		return nil, conflict("%s is not deleted", item)
+	signer, err := s.contentSigner(latest, &checkpoint)
+	if err != nil {
+		return nil, err
 	}
-	return &plan{ns: ns, resource: name, can: []string{"restore"}, roles: kept, rules: []any{resourceRule(name)}, cp: cp, checkpoint: checkpoint, key: signer}, nil
+	return &plan{ns: ns, resource: name, can: want, roles: kept, rules: []any{resourceRule(name)}, cp: cp, checkpoint: checkpoint, key: signer}, nil
 }
 
 // folders resolves a request's to list to distinct node names (400 for a

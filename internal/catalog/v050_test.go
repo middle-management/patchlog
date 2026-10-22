@@ -112,7 +112,7 @@ func TestDecisionCheckpoint(t *testing.T) {
 		want   map[string]any // the checkpoint, if not cp
 	}{
 		{"no role", map[string]any{"item": "/r/matches/rumour1", "want": toAny("read")}, 403, true, nil},
-		{"not placed", map[string]any{"item": "/r/matches/ghost", "want": toAny("read")}, 403, true, nil},
+		{"never existed, read", map[string]any{"item": "/r/matches/ghost", "want": toAny("read")}, 404, true, nil},
 		{"taken name", map[string]any{"item": "/r/matches/derby", "want": toAny("create")}, 409, true, nil},
 		{"never existed", map[string]any{"item": "/r/matches/ghost", "want": toAny("restore")}, 404, true, nil},
 		{"live", map[string]any{"item": "/r/matches/derby", "want": toAny("restore")}, 409, true, nil},
@@ -326,8 +326,9 @@ func TestDecisionsPinned(t *testing.T) {
 
 // TestHeadKeyRefusal: a refusal because the catalog's key is missing from
 // the content namespace at the head is decided at the head, not at a
-// checkpoint, so it carries none, for restore as for other verbs
-// (§B.11.4).
+// checkpoint, so it carries none, for restore as for other verbs. It
+// comes after the decision's own answers, so the restore is of a deleted
+// item, which the decision grants (§B.11.4).
 func TestHeadKeyRefusal(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -340,6 +341,8 @@ func TestHeadKeyRefusal(t *testing.T) {
 	w.start()
 	w.caughtUp()
 	bob := w.caller("user:bob", "match-desk")
+	must(w.ops.Delete(ctx, "matches", "shared", must(w.ops.Head(ctx, "matches", "shared")).ID))
+	w.caughtUp()
 	rt.hold.Store(true)
 	opm := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"config"})))
 	cfg := must(w.ops.NSHead(ctx, "matches")).Config
@@ -348,8 +351,8 @@ func TestHeadKeyRefusal(t *testing.T) {
 		c, err := w.svc.Tree().Checker().Config(ctx, "matches")
 		return err == nil && len(c.Keys) == 2
 	})
-	for _, want := range []string{"read", "restore"} {
-		r := w.issue(bob, map[string]any{"item": "/r/matches/derby", "want": toAny(want)}, 403)
+	for want, item := range map[string]string{"read": "/r/matches/derby", "restore": "/r/matches/shared"} {
+		r := w.issue(bob, map[string]any{"item": item, "want": toAny(want)}, 403)
 		if msg, _ := r.body["message"].(string); !strings.Contains(msg, "catalog's key") || r.body["checkpoint"] != nil {
 			t.Errorf("%s with the key missing at the head: %v", want, r.body)
 		}

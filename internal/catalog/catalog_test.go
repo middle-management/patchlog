@@ -690,8 +690,9 @@ func TestCreateFlow(t *testing.T) {
 	g := w.grantFor(bob, map[string]any{"item": "/r/matches/final", "want": toAny("place"), "to": toAny("season")})
 	must(w.core(g).CreateDoc(ctx, "cat", "matches.final", map[string]any{"parents": parents("season")}))
 	w.caughtUp()
-	// A dangling placement grants nothing but create.
-	w.issue(bob, map[string]any{"item": "/r/matches/final", "want": toAny("read")}, 403)
+	// A dangling placement grants nothing but create: a read of a name
+	// that never existed is 404 (§B.11.4).
+	w.issue(bob, map[string]any{"item": "/r/matches/final", "want": toAny("read")}, 404)
 	w.issue(bob, map[string]any{"item": "/r/matches/final", "want": toAny("create", "append")}, 400)
 	// Roles without create (translator) get nothing.
 	w.issue(anna, map[string]any{"item": "/r/matches/final", "want": toAny("create")}, 403)

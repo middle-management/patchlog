@@ -230,9 +230,10 @@ func TestRestoreV038(t *testing.T) {
 	// Never existed: 404, for anyone, placed or not.
 	restore(nobody, "/r/matches/final", 404)
 	restore(nobody, "/r/matches/ghost", 404)
-	// Live: 403 without read, 403 without restore, then 409.
+	// Live: 403 without read, then 409, before the role kept is judged
+	// (§B.11.4 Restore, scenario 12).
 	restore(nobody, "/r/matches/derby", 403)
-	restore(fan, "/r/matches/derby", 403)
+	restore(fan, "/r/matches/derby", 409)
 	restore(bob, "/r/matches/derby", 409)
 
 	// Deleted, then unplaced: no placement, 403.
@@ -242,7 +243,9 @@ func TestRestoreV038(t *testing.T) {
 	restore(nobody, "/r/matches/again", 403)
 	must(w.ops.Delete(ctx, "cat", "matches.again", must(w.ops.Head(ctx, "cat", "matches.again")).ID))
 	w.caughtUp()
-	if r := restore(bob, "/r/matches/again", 403); !strings.Contains(r.body["message"].(string), "not placed") {
+	// Without a placement it has no role there that counts for read, and
+	// is answered as a caller without a role kept (§B.11.4).
+	if r := restore(bob, "/r/matches/again", 403); r.body["message"] != "no role of yours allows restore on /r/matches/again" {
 		t.Errorf("unplaced: %v", r.body)
 	}
 	// Placed again (the placement restored, under derbies): the frozen rows
@@ -270,11 +273,15 @@ func TestRestoreV038(t *testing.T) {
 		t.Errorf("restore grant: %v", b)
 	}
 
-	// Purged: 410, before anything about the caller.
+	// Purged: 410 to a caller with a role that counts for read at its
+	// placement, as for a live item, 403 to anyone else, as the core
+	// answers a caller who doesn't pass the read check (§B.11.4 Restore,
+	// §8.3, scenario 42).
 	purger := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"matches"}, []string{"read", "purge"})))
 	must(purger.Purge(ctx, "matches", "again", must(w.ops.Head(ctx, "matches", "again")).ID, false))
 	w.caughtUp()
-	restore(nobody, "/r/matches/again", 410)
+	restore(nobody, "/r/matches/again", 403)
+	restore(bob, "/r/matches/again", 410)
 }
 
 // TestMoveDeletedPlacement: a move of a deleted item's placement is
