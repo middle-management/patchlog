@@ -1,8 +1,10 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strings"
 	"sync"
@@ -395,8 +397,6 @@ func (t *tx) basicEnvelope(action, resource string, a *actor) map[string]any {
 	return env
 }
 
-var stepOneRefs = []string{"action", "resource", "principal", "now"}
-
 // authorize is step 1 of §6.2 for one verb: verbs, and the grant, key and
 // role rules that refer only to the request. It does not rate-limit.
 func (t *tx) authorize(a *actor, verb, resource string) *Error {
@@ -409,70 +409,6 @@ func (t *tx) authorize(a *actor, verb, resource string) *Error {
 	}
 	env := t.basicEnvelope(verb, resource, a)
 	return t.grantRules(a, verb, roles, env, true)
-}
-
-// grantRules evaluates key-scope, block and role rules. With stepOne, only
-// rules that refer solely to action, resource, principal and now are
-// evaluated.
-func (t *tx) grantRules(a *actor, verb string, roles []string, env map[string]any, stepOne bool) *Error {
-	return t.grantRulesMode(a, verb, roles, env, stepOne, false)
-}
-
-// grantRulesMode is grantRules; with blind, a rule reading writes or /doc
-// fails (sealed writes of e2e namespaces, §6.2): a key-scope or block rule
-// refuses the request, and a role with one doesn't allow it.
-func (t *tx) grantRulesMode(a *actor, verb string, roles []string, env map[string]any, stepOne, blind bool) *Error {
-	if a.verified == nil {
-		return nil
-	}
-	for _, src := range [][]any{a.verified.KeyRules, a.verified.BlockRules} {
-		for _, rv := range src {
-			r, err := compileCached(rv)
-			if err != nil {
-				return forbidden("invalid grant rule")
-			}
-			if stepOne && !r.OnlyRefs(stepOneRefs...) {
-				continue
-			}
-			if _, b := blindRule(r); blind && b {
-				return forbidden("a grant or key rule reads writes or /doc, which the server can't see in an e2e namespace (§6.2, §E.3.2)")
-			}
-			if !r.Eval(env) {
-				return forbidden("a grant or key rule refuses the request")
-			}
-		}
-	}
-	if a.verified.HasRoles() {
-		if roles == nil {
-			_, roles = a.verified.Allows(verb)
-		}
-		passed := false
-		for _, role := range roles {
-			ok := true
-			for _, rv := range a.verified.RoleRules(role) {
-				r, err := compileCached(rv)
-				if err != nil {
-					ok = false
-					break
-				}
-				if stepOne && !r.OnlyRefs(stepOneRefs...) {
-					continue
-				}
-				if _, b := blindRule(r); (blind && b) || !r.Eval(env) {
-					ok = false
-					break
-				}
-			}
-			if ok {
-				passed = true
-				break
-			}
-		}
-		if !passed {
-			return forbidden("no role allows the request")
-		}
-	}
-	return nil
 }
 
 var ruleCache sync.Map // canonical rule -> *rules.Rule
@@ -490,23 +426,6 @@ func compileCached(v any) (*rules.Rule, error) {
 	return r, nil
 }
 
-// checkRules is step 6 of §6.2: namespace rules, then grant, key and role
-// rules, against the full envelope.
-func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool) *Error {
-	verb := env["action"].(string)
-	if a.verified != nil {
-		if ok, _ := a.verified.Allows(verb); !ok {
-			return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
-		}
-	}
-	if !(isConfig && a.star) {
-		if i, path, ok := rules.EvalList(cfg.Rules, env); !ok {
-			return apiErr(422, "rule", "rule", i, "path", path)
-		}
-	}
-	return t.grantRules(a, verb, nil, env, false)
-}
-
 // canRead decides read access to a namespace, optionally for one resource
 // (§C.2 item 5, §C.5).
 func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
@@ -522,17 +441,19 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 	return t.grantRules(a, "read", nil, t.basicEnvelope("read", resource, a), false) == nil
 }
 
-// reader authenticates a read request, if it carries credentials, and
-// decides access. A grant that doesn't name the namespace is 403 (§7), as
-// for a namespace that doesn't exist, except that public namespaces ignore
-// it and answer as to an unauthenticated request; other refusals answer
-// 404 rather than 403 so existence is not revealed.
+// reader authenticates a read of a resource URL (/r/{ns}/{name} and the
+// URLs under it), if it carries credentials, and decides access. A grant
+// that doesn't name the namespace is 403 (§7), as for a namespace that
+// doesn't exist, except that public namespaces ignore it and answer as to
+// an unauthenticated request; other refusals, a key-scope failure
+// included, answer 404 rather than 403, so that neither the resource's
+// nor the namespace's existence is revealed (§7, §C.2 item 1).
 func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
 		return t.edgeReader(n, cred.Edge, resource)
 	}
-	return t.readerCheck(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) })
+	return t.readerCheckURL(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) }, readResource)
 }
 
 // nsReader is reader for /ns/{ns} and the URLs under it, but the gestures
@@ -563,7 +484,38 @@ func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 	})
 }
 
+// readerCheck authenticates a read that isn't of a resource URL, such as
+// /ns/{ns} and the URLs under it, or POST /ns/{ns}/keys, and decides
+// access with may. A grant its key's scope doesn't allow (sub, groups,
+// maxTtl, requireAt, readScope …) is 403 there, as for a write: only a
+// read of a resource URL in a private namespace answers 404 (§C.2 item
+// 1, §7). A verified grant that may not read is 404.
 func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
+	return t.readerCheckURL(n, cred, may, readNS)
+}
+
+// keysReader is readerCheck for POST /ns/{ns}/keys, which doesn't ignore
+// the grant in a public namespace either (§7, §E.2.3): there too, a grant
+// that doesn't name the namespace is 403, one that can't be used 401, and
+// one its key's scope refuses 403 (§C.2 item 1), as at
+// GET /ns/{ns}/principal.
+func (t *tx) keysReader(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
+	return t.readerCheckURL(n, cred, may, readKeys)
+}
+
+// readKind is the kind of read readerCheckURL authenticates.
+type readKind int
+
+const (
+	readNS       readKind = iota // /ns/{ns} and the URLs under it (readerCheck)
+	readResource                 // a resource URL (reader)
+	readKeys                     // POST /ns/{ns}/keys (keysReader)
+)
+
+// readerCheckURL is readerCheck for a kind of read: a public namespace
+// ignores the grant, but at POST /ns/{ns}/keys, and a key-scope failure is
+// 404 at a resource URL.
+func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, kind readKind) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
 	if t.e.opt.AuthDisabled {
@@ -576,13 +528,16 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 		switch {
 		case err == nil:
 			t.e.bearers.put(cred.Bearer, g)
-		case cfg.Read == "public":
+		case cfg.Read == "public" && kind != readKeys:
 			// Public content doesn't need the grant: one that is unusable,
-			// or doesn't name the namespace, is ignored.
+			// or doesn't name the namespace, is ignored (§7).
 			a = nil
 		case g == nil && err.Status == 403:
 			return nil, err // not named
 		case err.Status == 401 || err.Status == 413:
+			return nil, err
+		case kind != readResource:
+			// The key's scope refuses the grant (403, §C.2 item 1).
 			return nil, err
 		default:
 			return nil, notFound()
@@ -606,10 +561,12 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 // registration (§G.3): a grant whose rules hide some resources could
 // otherwise list their names and heads, or read them through a branch.
 // Branching and registration check it as step 1 checks verbs (stepOne,
-// §6.2, §2.1), in a public namespace too: the grant must read n
-// unrestricted and allow read, and its rules that refer only to /action,
-// /principal or /now must pass with /action read; rules over the rest of
-// the envelope apply to their own write at step 6.
+// §6.2, §2.1, §C.2 item 2), in a public namespace too: the grant must read
+// n unrestricted and allow read, and its key-scope and block rules that
+// refer only to /action, /principal or /now must pass with /action read,
+// rules over the rest of the envelope applying to their own write at step
+// 6; a role that counts for read must pass all its rules against the read
+// envelope, as a read does (item 5), whatever they refer to.
 func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 	if cfg.Read == "public" && !stepOne || t.e.opt.AuthDisabled {
 		return true
@@ -621,7 +578,11 @@ func (t *tx) readsNS(n *nsRow, cfg *Config, a *actor, stepOne bool) bool {
 		return true // a namespace's edge grant (edgeReader)
 	}
 	roles, ok := a.unrestrictedRoles()
-	return ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), stepOne) == nil
+	if !ok {
+		return false
+	}
+	env := t.basicEnvelope("read", "", a)
+	return t.scopeRules(a, env, stepOne, false) == nil && t.roleRules(a, "read", roles, env, false, false) == nil
 }
 
 // unrestrictedRoles reports whether a grant's rules leave every resource
@@ -665,10 +626,14 @@ func refersToResource(rs []any) bool {
 // (admit creates them full), so sweep drops those, at most once a minute
 // once there are many: buckets were never dropped, and memory grew with
 // every resource and principal written until restart.
+//
+// On Postgres, unless Options.LocalRateBuckets, the buckets live in the
+// store instead, shared by every instance (store, ratebuckets.go).
 type rateLimiter struct {
 	mu    sync.Mutex
 	b     map[string]*bucket
 	swept time.Time
+	store *bucketStore
 }
 
 type bucket struct {
@@ -701,6 +666,14 @@ func (b *bucket) refill(now time.Time, r Rate) {
 }
 
 func newRateLimiter() *rateLimiter { return &rateLimiter{b: map[string]*bucket{}} }
+
+// close closes the store's pool, if the buckets are in the store.
+func (rl *rateLimiter) close() error {
+	if rl.store == nil {
+		return nil
+	}
+	return rl.store.close()
+}
 
 type draw struct {
 	key  string
@@ -796,7 +769,16 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 // (rounded up to the millisecond), which a client under a fast allowance
 // waits by instead.
 func (t *tx) admit(draws []draw) *Error {
-	wait, hit, ok := t.e.rate.admit(t.now, draws)
+	var wait time.Duration
+	var hit string
+	var ok bool
+	if s := t.e.rate.store; s != nil {
+		var err error
+		wait, hit, ok, err = s.admit(t.ctx, t.now, draws)
+		t.must(err)
+	} else {
+		wait, hit, ok = t.e.rate.admit(t.now, draws)
+	}
 	if !ok {
 		secs := int(math.Ceil(wait.Seconds()))
 		if secs < 1 {
@@ -812,6 +794,14 @@ func (t *tx) admit(draws []draw) *Error {
 // charge deducts more from a bucket an admitted request drew on: an
 // upload's bytes beyond what it declared (§7.8).
 func (rl *rateLimiter) charge(now time.Time, d draw) {
+	if rl.store != nil {
+		// The upload is stored: a failure to charge leaves its bytes
+		// undrawn, which only the log tells.
+		if err := rl.store.charge(context.Background(), now, d); err != nil {
+			log.Printf("rate buckets: charging %s: %v", d.name, err)
+		}
+		return
+	}
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	b := rl.b[d.key]
@@ -824,21 +814,22 @@ func (rl *rateLimiter) charge(now time.Time, d draw) {
 	b.tokens -= d.cost
 }
 
-// allowanceOf returns the actor's allowance in a configuration, if any.
+// allowanceOf returns the actor's allowance in a configuration, if any:
+// the first matching entry whose until hasn't passed, so one that has
+// ended doesn't hide a later one (§6.6 Allowances). Without a verified
+// grant (authentication disabled) there is no signing key, and an entry
+// matches on sub alone.
 func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
 	kid := ""
 	if a.verified != nil {
 		kid = a.verified.Key.Kid
 	}
-	al := cfg.allowance(a.principal.ID, kid, a.verified == nil)
-	if al != nil && !al.Until.IsZero() && !t.now.Before(al.Until) {
-		return nil // ended: ignored from `until` on (§6.6)
-	}
-	return al
+	return cfg.allowanceAt(t.now, a.principal.ID, kid)
 }
 
-// guardedPaths need a grant chained to a * key (§7.4).
-var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures", "/nonce", "/schemaReads"}
+// guardedPaths need a grant chained to a * key (§7.4, §C.2): a config
+// write or a branch's patches covering or overlapping one of them.
+var guardedPaths = []string{"/keys", "/roles", "/revoked", "/limits", "/allowances", "/merge", "/retention", "/encryption", "/signatures", "/nonce", "/schemaReads", "/catalogs", "/maxLag"}
 
 func touchesGuarded(writes []string) bool {
 	for _, w := range writes {

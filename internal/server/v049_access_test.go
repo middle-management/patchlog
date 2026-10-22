@@ -111,10 +111,13 @@ func TestV049KeysUnrestricted(t *testing.T) {
 	expectCode(t, r, 403, "forbidden")
 	_, missing := e.keysOf("nope", nil, notNamed)
 	expectCode(t, missing, 403, "forbidden")
-	// A public namespace ignores a grant that doesn't name it, as its reads
-	// do: keys still need one.
+	// A public namespace's reads ignore a grant that doesn't name it, but
+	// /keys doesn't: it keeps the 403 of the ns check (§7, since v0.63),
+	// and the 401 without a grant.
 	e.mkNS("p", sealedDoc(map[string]any{"read": "public", "keys": []any{k.entry("*")}}))
 	_, r = e.keysOf("p", nil, notNamed)
+	expectCode(t, r, 403, "forbidden")
+	_, r = e.keysOf("p", nil, "")
 	expectCode(t, r, 401, "unauthenticated")
 }
 
