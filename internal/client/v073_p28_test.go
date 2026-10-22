@@ -51,6 +51,13 @@ func TestV073P28ResourcePurgePruneEvents(t *testing.T) {
 			case ev := <-events:
 				return ev
 			case err := <-done:
+				// An event sent just before the stream ended comes first.
+				select {
+				case ev := <-events:
+					done <- err
+					return ev
+				default:
+				}
 				t.Fatalf("%s: stream ended: %v", level, err)
 			case <-time.After(5 * time.Second):
 				t.Fatalf("%s: no event", level)

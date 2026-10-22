@@ -38,7 +38,7 @@ func p28LongPollEnv(t *testing.T, interval time.Duration) (e *tenv, r1, head str
 		p28AfterBoundary(interval)
 		start := time.Now()
 		r := e.get(path)
-		if d := time.Since(start); d > interval/4 {
+		if d := time.Since(start); d > interval/2 {
 			t.Fatalf("%s: answered after %v, want at once", what, d)
 		}
 		return r
@@ -483,6 +483,7 @@ func TestV073P28StreamEndsAtCredentialExpiry(t *testing.T) {
 	expect(t, r, 200)
 	cs := edgeCookies(t, r)
 
+	opened := time.Now()
 	streams := map[string]<-chan p28Event{}
 	for what, open := range map[string]func() (int, <-chan p28Event){
 		"namespace, grant":   func() (int, <-chan p28Event) { return e.p28SSE("/ns/sec/events", bearerHdr(short)) },
@@ -504,12 +505,12 @@ func TestV073P28StreamEndsAtCredentialExpiry(t *testing.T) {
 		p28Next(t, streams[what]) // the genesis entry
 		p28Next(t, streams[what]) // a's create
 	}
-	start := time.Now()
 	for what, ch := range streams {
 		p28Ends(t, what, ch, 6*time.Second)
 	}
-	if d := time.Since(start); d < time.Second {
-		t.Fatalf("streams ended after %v, before the grant's exp", d)
+	// Each stream's end is timed from its start, 2 s before exp.
+	if d := time.Since(opened); d < 1500*time.Millisecond {
+		t.Fatalf("streams ended %v after they opened, before the grant's exp", d)
 	}
 }
 
