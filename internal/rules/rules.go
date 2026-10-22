@@ -11,6 +11,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pointer"
+	"github.com/middle-management/patchlog/internal/schema"
 	"github.com/santhosh-tekuri/jsonschema/v6"
 )
 
@@ -85,19 +86,45 @@ type node interface {
 	refs(add func(pointer.Pointer))
 }
 
-// Compile validates and compiles one rule.
-func Compile(v any) (*Rule, error) {
-	n, err := compileNode(v)
+// Compile validates and compiles one rule as stored: its schema fragments
+// compile as they did when stored, held to none of the rules §6.4.2 has
+// for fragments since v0.65 (F-S3): the library's formats asserted and
+// patterns read as §6.6 says, a pattern RE2 took as written included
+// (schema.Legacy). Rules from stored namespace documents, and those of a
+// grant decoded under CompileStrict, compile so.
+func Compile(v any) (*Rule, error) { return compile(v, false) }
+
+// CompileStrict compiles one rule written now, in a namespace document
+// (§7.4) or a grant (§C.8): each schema fragment must pass
+// schema.CheckFragment (§6.1's $id ban, §6.5 and §6.6 as for a schema
+// document, no $schema in any subschema, same-document $ref and
+// $dynamicRef only) and is asserted with draft 2020-12's format set and
+// RE2 as §6.6 reads it (schema.V073), so one that breaks them makes the
+// namespace document invalid (422), or the grant (401).
+func CompileStrict(v any) (*Rule, error) { return compile(v, true) }
+
+func compile(v any, strict bool) (*Rule, error) {
+	n, err := compileNode(v, strict)
 	if err != nil {
 		return nil, err
 	}
 	return &Rule{n: n, at: -1}, nil
 }
 
-// CompileList compiles an array of rules; nil => empty list. Each rule
-// remembers its index, which EvalList and EvalTri report in a failure's
-// path (§6.4.3).
-func CompileList(v any) ([]*Rule, error) {
+// CompileList compiles an array of rules as stored (Compile); nil =>
+// empty list. Each rule remembers its index, which EvalList and EvalTri
+// report in a failure's path (§6.4.3).
+func CompileList(v any) ([]*Rule, error) { return compileList(v, nil) }
+
+// CompileListStrict is CompileList for rules written now: each rule is
+// compiled by CompileStrict, unless kept reports it (as JSON) is one the
+// write keeps unchanged from a stored document, which compiles as stored
+// (Compile). kept may be nil.
+func CompileListStrict(v any, kept func(rule any) bool) ([]*Rule, error) {
+	return compileList(v, func(x any) bool { return kept == nil || !kept(x) })
+}
+
+func compileList(v any, strict func(any) bool) ([]*Rule, error) {
 	if v == nil {
 		return nil, nil
 	}
@@ -107,7 +134,7 @@ func CompileList(v any) ([]*Rule, error) {
 	}
 	out := make([]*Rule, 0, len(arr))
 	for i, x := range arr {
-		r, err := Compile(x)
+		r, err := compile(x, strict != nil && strict(x))
 		if err != nil {
 			return nil, fmt.Errorf("rule %d: %w", i, err)
 		}
@@ -264,24 +291,24 @@ func ptrField(m map[string]any, key string) (pointer.Pointer, error) {
 	return p, nil
 }
 
-func compileNode(v any) (node, error) {
+func compileNode(v any, strict bool) (node, error) {
 	m, err := asObject(v)
 	if err != nil {
 		return nil, err
 	}
 	if _, ok := m["op"]; ok {
-		return compileOp(m)
+		return compileOp(m, strict)
 	}
 	switch {
 	case has(m, "all"):
-		return compileGroup(m, "all")
+		return compileGroup(m, "all", strict)
 	case has(m, "any"):
-		return compileGroup(m, "any")
+		return compileGroup(m, "any", strict)
 	case has(m, "not"):
 		if err := checkKeys(m, "not"); err != nil {
 			return nil, err
 		}
-		in, err := compileNode(m["not"])
+		in, err := compileNode(m["not"], strict)
 		if err != nil {
 			return nil, fmt.Errorf("not: %w", err)
 		}
@@ -293,11 +320,11 @@ func compileNode(v any) (node, error) {
 		if !has(m, "if") || !has(m, "then") {
 			return nil, errors.New(`"if" and "then" must appear together`)
 		}
-		c, err := compileArr(m["if"], "if")
+		c, err := compileArr(m["if"], "if", strict)
 		if err != nil {
 			return nil, err
 		}
-		t, err := compileArr(m["then"], "then")
+		t, err := compileArr(m["then"], "then", strict)
 		if err != nil {
 			return nil, err
 		}
@@ -308,14 +335,14 @@ func compileNode(v any) (node, error) {
 
 func has(m map[string]any, k string) bool { _, ok := m[k]; return ok }
 
-func compileArr(v any, name string) ([]node, error) {
+func compileArr(v any, name string, strict bool) ([]node, error) {
 	arr, ok := v.([]any)
 	if !ok {
 		return nil, fmt.Errorf("%q must be an array of rules", name)
 	}
 	out := make([]node, 0, len(arr))
 	for i, x := range arr {
-		n, err := compileNode(x)
+		n, err := compileNode(x, strict)
 		if err != nil {
 			return nil, fmt.Errorf("%s[%d]: %w", name, i, err)
 		}
@@ -324,11 +351,11 @@ func compileArr(v any, name string) ([]node, error) {
 	return out, nil
 }
 
-func compileGroup(m map[string]any, key string) (node, error) {
+func compileGroup(m map[string]any, key string, strict bool) (node, error) {
 	if err := checkKeys(m, key); err != nil {
 		return nil, err
 	}
-	ns, err := compileArr(m[key], key)
+	ns, err := compileArr(m[key], key, strict)
 	if err != nil {
 		return nil, err
 	}
@@ -338,14 +365,14 @@ func compileGroup(m map[string]any, key string) (node, error) {
 	return &anyNode{ns}, nil
 }
 
-func compileOp(m map[string]any) (node, error) {
+func compileOp(m map[string]any, strict bool) (node, error) {
 	op, ok := m["op"].(string)
 	if !ok {
 		return nil, errors.New(`"op" must be a string`)
 	}
 	switch op {
 	case "test":
-		return compileTest(m)
+		return compileTest(m, strict)
 	case "writes":
 		return compileWrites(m)
 	case "compare":
@@ -364,7 +391,7 @@ type testNode struct {
 	schema *jsonschema.Schema
 }
 
-func compileTest(m map[string]any) (node, error) {
+func compileTest(m map[string]any, strict bool) (node, error) {
 	if err := checkKeys(m, "op", "path", "value", "exists", "schema"); err != nil {
 		return nil, err
 	}
@@ -393,7 +420,7 @@ func compileTest(m map[string]any) (node, error) {
 		}
 		n.exists = b
 	case "schema":
-		s, err := compileSchema(m["schema"])
+		s, err := compileSchema(m["schema"], strict)
 		if err != nil {
 			return nil, err
 		}
@@ -410,15 +437,27 @@ func (refuseLoader) Load(url string) (any, error) {
 
 const schemaURL = "urn:patchlog:rule"
 
-func compileSchema(v any) (*jsonschema.Schema, error) {
+// compileSchema compiles a test's schema fragment with format assertions
+// (§6.4.2). strict holds it to the rules of a fragment written now and
+// compiles it under schema.V073 (CompileStrict); otherwise it compiles
+// as stored, under schema.Legacy, as v0.55 did, but for patterns with
+// \uXXXX, which RE2 refused then.
+func compileSchema(v any, strict bool) (*jsonschema.Schema, error) {
 	switch v.(type) {
 	case map[string]any, bool:
 	default:
 		return nil, errors.New(`"schema" must be an object or boolean`)
 	}
+	rs := schema.Legacy
+	if strict {
+		if err := schema.CheckFragment(v); err != nil {
+			return nil, err
+		}
+		rs = schema.V073
+	}
 	c := jsonschema.NewCompiler()
+	rs.Configure(c)
 	c.UseLoader(refuseLoader{})
-	c.AssertFormat()
 	if err := c.AddResource(schemaURL, jsonv.Clone(v)); err != nil {
 		return nil, fmt.Errorf("invalid schema: %w", err)
 	}

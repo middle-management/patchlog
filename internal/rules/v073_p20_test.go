@@ -220,3 +220,120 @@ func TestV073P20EvalTriKnown(t *testing.T) {
 		}
 	}
 }
+
+// CIS-21 (§6.4.2): a schema fragment written now is held to §6.1's $id
+// ban, §6.5 and §6.6 as a schema document is, with no $schema in any
+// subschema and same-document $ref and $dynamicRef only; CIS-15: asserted
+// with draft 2020-12's format set, and no other format; CIS-16: patterns
+// are RE2 with \uXXXX read as \x{XXXX}. A fragment stored before compiles
+// as it did (Compile).
+func TestV073P20SchemaFragments(t *testing.T) {
+	t.Parallel()
+	rule := func(schema string) any {
+		return jsonv.MustParse([]byte(`{"op":"test","path":"/a","schema":` + schema + `}`))
+	}
+	for _, s := range []string{
+		`{"$id":"x"}`,
+		`{"$id":"/r/schemas/s/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		`{"$schema":"https://json-schema.org/draft/2020-12/schema"}`,
+		`{"properties":{"a":{"$schema":"https://json-schema.org/draft/2020-12/schema"}}}`,
+		`{"foo":1}`,
+		`{"items":{"bar":{}}}`,
+		`{"format":"nope"}`,
+		`{"format":"semver"}`,
+		`{"format":"period"}`,
+		`{"dependencies":{}}`,
+		`{"$recursiveRef":"#"}`,
+		`{"$recursiveAnchor":true}`,
+		`{"$ref":"/r/schemas/s/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`,
+		`{"$ref":"https://example.com/s.json"}`,
+		`{"$dynamicRef":"other#x"}`,
+		`{"$ref":"#/$defs/missing"}`,
+		`{"pattern":"\\ud800"}`,
+		`{"pattern":"\\x{DC00}"}`,
+		`{"patternProperties":{"\\udfff":{}}}`,
+		`{"pattern":"(?=a)"}`,
+	} {
+		if _, err := CompileStrict(rule(s)); err == nil {
+			t.Errorf("CompileStrict accepted %s", s)
+		}
+		if _, err := CompileListStrict([]any{rule(s)}, nil); err == nil {
+			t.Errorf("CompileListStrict accepted %s", s)
+		}
+	}
+	// Accepted, and as §6.6 and the format set say.
+	for _, x := range []struct {
+		schema, yes, no string
+	}{
+		{`{"pattern":"^\\u00e9$"}`, `"é"`, `"e"`},
+		{`{"pattern":"^[\\u00e0-\\u00ff]+$"}`, `"éà"`, `"ea"`},
+		{`{"pattern":"^\\ud83d\\ude00$"}`, `"😀"`, `"x"`},
+		{`{"patternProperties":{"^\\u00e9$":{"type":"number"}}}`, `{"é":1}`, `{"é":"x"}`},
+		{`{"pattern":"^\\\\u0041$"}`, `"\\u0041"`, `"A"`},
+		{`{"format":"idn-email"}`, `"jörg@exämple.se"`, `"not an email"`},
+		{`{"format":"idn-hostname"}`, `"exämple.se"`, `"-bad-.se"`},
+		{`{"format":"date-time"}`, `"2026-01-01T00:00:00Z"`, `"tomorrow"`},
+		{`{"definitions":{"n":{"type":"integer"}},"$ref":"#/definitions/n"}`, `3`, `"3"`},
+		{`{"$defs":{"n":{"$anchor":"num","type":"integer"}},"$ref":"#num"}`, `3`, `"3"`},
+		{`{"x-index":{"text":true},"type":"string"}`, `"s"`, `1`},
+	} {
+		r, err := CompileStrict(rule(x.schema))
+		if err != nil {
+			t.Errorf("CompileStrict(%s): %v", x.schema, err)
+			continue
+		}
+		if !r.Eval(env(`{"a":` + x.yes + `}`)) {
+			t.Errorf("%s: %s fails", x.schema, x.yes)
+		}
+		if r.Eval(env(`{"a":` + x.no + `}`)) {
+			t.Errorf("%s: %s passes", x.schema, x.no)
+		}
+	}
+
+	// As stored: what v0.55 accepted still compiles, and validates as it
+	// did (semver asserted by the library, idn-email not); \u patterns,
+	// which RE2 refused, now compile too.
+	for _, x := range []struct {
+		schema, yes, no string
+	}{
+		{`{"$id":"x","type":"string"}`, `"s"`, `1`},
+		{`{"foo":1,"type":"string"}`, `"s"`, `1`},
+		{`{"properties":{"b":{"$schema":"https://json-schema.org/draft/2020-12/schema","type":"string"}}}`, `{"b":"s"}`, `{"b":1}`},
+		{`{"format":"semver"}`, `"1.2.3"`, `"one"`},
+		{`{"format":"nope","type":"string"}`, `"s"`, `1`},
+		{`{"format":"idn-email","type":"string"}`, `"not an email"`, `1`},
+		{`{"pattern":"^\\u00e9$"}`, `"é"`, `"e"`},
+		{`{"pattern":"^\\x{D800}?a$"}`, `"a"`, `"b"`},
+	} {
+		r, err := Compile(rule(x.schema))
+		if err != nil {
+			t.Errorf("Compile(%s): %v", x.schema, err)
+			continue
+		}
+		if !r.Eval(env(`{"a":`+x.yes+`}`)) || r.Eval(env(`{"a":`+x.no+`}`)) {
+			t.Errorf("as stored %s: %s should pass and %s fail", x.schema, x.yes, x.no)
+		}
+		rs, err := CompileList([]any{rule(x.schema)})
+		if err != nil || len(rs) != 1 {
+			t.Errorf("CompileList(%s): %v", x.schema, err)
+		}
+	}
+	// A rule kept unchanged from a stored document compiles as stored;
+	// any other in the list is held to the fragment rules.
+	old := rule(`{"format":"semver"}`)
+	kept := func(r any) bool { return jsonv.Equal(r, old) }
+	if _, err := CompileListStrict([]any{rule(`{"type":"string"}`), old}, kept); err != nil {
+		t.Errorf("a kept rule: %v", err)
+	}
+	if _, err := CompileListStrict([]any{old, rule(`{"format":"period"}`)}, kept); err == nil {
+		t.Error("a new rule beside a kept one was accepted")
+	}
+	// Nested forms are held too, and a kept rule is kept whole.
+	nested := jsonv.MustParse([]byte(`{"if":[{"op":"test","path":"/action","value":"create"}],"then":[{"not":{"op":"test","path":"/doc","schema":{"$id":"x"}}}]}`))
+	if _, err := CompileStrict(nested); err == nil {
+		t.Error("a nested fragment escaped the rules")
+	}
+	if _, err := CompileListStrict([]any{nested}, func(r any) bool { return jsonv.Equal(r, nested) }); err != nil {
+		t.Errorf("a kept nested rule: %v", err)
+	}
+}

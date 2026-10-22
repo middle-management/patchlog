@@ -436,10 +436,12 @@ func countForms(v any) int {
 	return n
 }
 
-// compileRules compiles every rule of g's blocks (§6.4.2): a grant that
-// carries one that doesn't compile, such as one of an unknown form or with
-// a pattern RE2 doesn't accept, is invalid (401, §6.6), on every request
-// that doesn't ignore it, not only those that evaluate it.
+// compileRules compiles every rule of g's blocks as written now
+// (rules.CompileStrict, §6.4.2): a grant that carries one that doesn't
+// compile, such as one of an unknown form, with a pattern RE2 doesn't
+// accept (§6.6), or with a schema fragment that breaks §6.4.2's rules for
+// fragments, is invalid (401), on every request that doesn't ignore it,
+// not only those that evaluate it.
 func (g *Grant) compileRules() error {
 	for i, b := range g.Blocks {
 		for j, r := range b.Rules {
@@ -468,7 +470,7 @@ func compileRule(v any) (*rules.Rule, error) {
 	if ok {
 		return r, nil
 	}
-	r, err := rules.Compile(v)
+	r, err := rules.CompileStrict(v)
 	if err != nil {
 		return nil, err
 	}

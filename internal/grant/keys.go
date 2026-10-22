@@ -8,6 +8,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/pattern"
 )
 
 // Key is a signing key entry of the namespace document with its scope (§C.4).
@@ -67,6 +69,14 @@ func contains(xs []string, s string) bool {
 		}
 	}
 	return false
+}
+
+// SubPattern compiles a key scope's sub (§C.4): a regular expression that
+// the whole root sub must match, RE2 with \uXXXX read as \x{XXXX}, a
+// surrogate pair of such escapes as one code point and a lone surrogate
+// refused (§6.6, pattern.Translate).
+func SubPattern(s string) (*regexp.Regexp, error) {
+	return pattern.Compile(`^(?:` + s + `)$`)
 }
 
 var keyFields = map[string]bool{"kid": true, "alg": true, "pub": true, "can": true, "maxTtl": true, "sub": true, "groups": true, "roles": true, "attrs": true, "rules": true, "readScope": true, "rate": true, "requireAt": true, "maxLag": true}
@@ -148,9 +158,16 @@ func parseKey(e any) (Key, error) {
 		if !ok {
 			return k, errors.New("sub must be a regular expression string")
 		}
-		re, err := regexp.Compile(`^(?:` + s + `)$`)
+		re, err := SubPattern(s)
 		if err != nil {
-			return k, fmt.Errorf("sub: %v", err)
+			// Stored before §6.6 read \uXXXX: RE2 took it as written,
+			// a \x{D800} included, and it keeps matching as it did.
+			// A config write refuses it (core checkKeyFields).
+			old, oerr := regexp.Compile(`^(?:` + s + `)$`)
+			if oerr != nil {
+				return k, fmt.Errorf("sub: %v", err)
+			}
+			re = old
 		}
 		k.SubPattern = re
 	}
