@@ -9,16 +9,17 @@
 //
 // # Format decisions (where §G.4.1 leaves room)
 //
-//   - Every line, header included, is written as canonical JSON (JCS, §3.1)
-//     followed by "\n". Readers accept any I-JSON line and ignore blank
-//     lines.
+//   - Every line, header included, is canonical JSON (JCS, §3.1) followed
+//     by one 0x0A (§G.4.1). Readers reject a bundle with any other line: a
+//     blank line, one that isn't byte for byte its canonical form (spaces,
+//     another member order or number spelling, a CR), or a last line
+//     without its 0x0A. So a hand-edited or pretty-printed bundle doesn't
+//     read.
 //   - The bundle digest used in source.bundle (§3.5, §G.4.4) is
-//     text(trunc160(sha256(L₁ ‖ 0x0A ‖ L₂ ‖ 0x0A ‖ … ‖ Lₙ ‖ 0x0A))), where Lᵢ is
-//     canonical(line i), header first. For a bundle written by Writer that
-//     is the truncated SHA-256 of the file's bytes. The spec only says
-//     text(digest); the text form of §3.2 is defined for 160-bit values, so
-//     the digest is truncated like an id, and hashing canonical lines makes
-//     it independent of whitespace.
+//     text(trunc160(sha256(b))), where b is the bundle's bytes as written
+//     (§I.9), header first; with canonical lines that is
+//     L₁ ‖ 0x0A ‖ … ‖ Lₙ ‖ 0x0A, Lᵢ the canonical form of line i. Of a sealed
+//     bundle (§G.5.1.1) it is the decrypted bundle's.
 //   - Keys of docs and requires are "{ns}/{name}". external entries are
 //     "{ns}/{name}" for a live dependency (checked by name in the target)
 //     or "{ns}/{name}/rev/{id}" for a pinned one (checked by id).
@@ -844,6 +845,8 @@ func newChecker(h *Header) *checker {
 	return &checker{h: h, docs: map[string]*docState{}, blobs: map[string]bool{}, grants: map[string]bool{}, n: 1, hash: sha256.New()}
 }
 
+// digestLine adds a line to the digest: its bytes as written, which are
+// its canonical form, and the 0x0A after them (§G.4.1, §I.9).
 func (c *checker) digestLine(canon []byte) {
 	c.hash.Write(canon)
 	c.hash.Write([]byte{0x0A})
@@ -1023,28 +1026,49 @@ func (r *Reader) Header() *Header { return r.h }
 // alive for as long as the line.
 func (r *Reader) keepDocCanon() { r.docCanon = true }
 
+// next reads the next line and parses it: its value and its bytes as
+// read, without the 0x0A, which are its canonical form.
 func (r *Reader) next() (any, []byte, error) {
-	for {
-		b, err := r.br.ReadBytes('\n')
-		if len(b) == 0 && err != nil {
-			if err == io.EOF {
-				return nil, nil, io.EOF
-			}
-			return nil, nil, err
-		}
-		if err != nil && err != io.EOF {
-			return nil, nil, err
-		}
-		r.lineNo++
-		if len(bytes.TrimSpace(b)) == 0 {
-			continue
-		}
-		v, perr := jsonv.Parse(b)
-		if perr != nil {
-			return nil, nil, &Error{Line: r.lineNo, Msg: "not I-JSON: " + perr.Error()}
-		}
-		return v, jsonv.Canonical(v), nil
+	b, err := r.br.ReadBytes('\n')
+	if len(b) == 0 && err != nil {
+		return nil, nil, err
 	}
+	if err != nil && err != io.EOF {
+		return nil, nil, err
+	}
+	r.lineNo++
+	body, lerr := lineBody(r.lineNo, b)
+	if lerr != nil {
+		return nil, nil, lerr
+	}
+	return parseCanonical(r.lineNo, body)
+}
+
+// lineBody is a line as ReadBytes read it, without its 0x0A: each line is
+// followed by one 0x0A, the last included, and none is blank (§G.4.1).
+func lineBody(lineNo int, b []byte) ([]byte, error) {
+	if len(b) == 0 || b[len(b)-1] != '\n' {
+		return nil, &Error{Line: lineNo, Msg: "the last line doesn't end in 0x0A (truncated?); every line is followed by one (§G.4.1)"}
+	}
+	if len(b) == 1 {
+		return nil, &Error{Line: lineNo, Msg: "a blank line; every line is canonical JSON (§G.4.1)"}
+	}
+	return b[:len(b)-1], nil
+}
+
+// parseCanonical parses a line's bytes, which must be its canonical JSON
+// byte for byte (§3.1, §G.4.1): a bundle with any other line is rejected,
+// so the digest over the bytes as written (§I.9) is one over canonical
+// lines. The bytes are returned as the canonical form, which they are.
+func parseCanonical(lineNo int, body []byte) (any, []byte, error) {
+	v, err := jsonv.Parse(body)
+	if err != nil {
+		return nil, nil, &Error{Line: lineNo, Msg: "not I-JSON: " + err.Error()}
+	}
+	if !bytes.Equal(jsonv.Canonical(v), body) {
+		return nil, nil, &Error{Line: lineNo, Msg: "not canonical JSON (§3.1); every line is written in its canonical form (§G.4.1)"}
+	}
+	return v, body, nil
 }
 
 // Next returns the next line, checked. At the end it runs the whole-bundle
@@ -1147,12 +1171,12 @@ func (r *Reader) parallel(workers int) {
 	for i := 0; i < workers; i++ {
 		go func() {
 			for j := range jobs {
-				v, perr := jsonv.Parse(j.b)
-				if perr != nil {
-					j.out <- parsedLine{lineNo: j.lineNo, err: &Error{Line: j.lineNo, Msg: "not I-JSON: " + perr.Error()}}
+				v, canon, err := parseCanonical(j.lineNo, j.b)
+				if err != nil {
+					j.out <- parsedLine{lineNo: j.lineNo, err: err}
 					continue
 				}
-				j.out <- parseAt(j.lineNo, v, jsonv.Canonical(v), authors, docCanon)
+				j.out <- parseAt(j.lineNo, v, canon, authors, docCanon)
 			}
 		}()
 	}
@@ -1167,25 +1191,28 @@ func (r *Reader) parallel(workers int) {
 				return false
 			}
 		}
+		fail := func(lineNo int, err error) {
+			out := make(chan parsedLine, 1)
+			out <- parsedLine{lineNo: lineNo, err: err}
+			send(out)
+		}
 		for {
 			b, err := br.ReadBytes('\n')
 			if len(b) == 0 && err != nil {
-				out := make(chan parsedLine, 1)
-				out <- parsedLine{lineNo: lineNo, err: err}
-				send(out)
+				fail(lineNo, err)
 				return
 			}
 			if err != nil && err != io.EOF {
-				out := make(chan parsedLine, 1)
-				out <- parsedLine{lineNo: lineNo, err: err}
-				send(out)
+				fail(lineNo, err)
 				return
 			}
 			lineNo++
-			if len(bytes.TrimSpace(b)) == 0 {
-				continue
+			body, err := lineBody(lineNo, b)
+			if err != nil {
+				fail(lineNo, err)
+				return
 			}
-			j := job{lineNo: lineNo, b: b, out: make(chan parsedLine, 1)}
+			j := job{lineNo: lineNo, b: body, out: make(chan parsedLine, 1)}
 			if !send(j.out) {
 				return
 			}

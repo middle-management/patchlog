@@ -61,8 +61,6 @@ func TestReaderParallel(t *testing.T) {
 	}
 	must(w.Close())
 	b := buf.Bytes()
-	// Blank lines are skipped, and counted.
-	b = bytes.Replace(b, []byte("\n"), []byte("\n\n"), 3)
 
 	seqKeys, seqDigest, err := readAll(t, b, 1)
 	if err != nil || len(seqKeys) != 300 {
@@ -81,6 +79,11 @@ func TestReaderParallel(t *testing.T) {
 		{"not JSON", []byte(`"doc 150"`), []byte(`"doc 150`)},
 		{"not a line", []byte(`"resource":"d150"`), []byte(`"resource":"d150","zz":1`)},
 		{"truncated", b, b[:bytes.LastIndexByte(b[:len(b)-1], '\n')+1]},
+		// A blank line, a line that isn't canonical and a last line
+		// without its 0x0A are rejected at the same line (§G.4.1).
+		{"blank line", []byte("\n"), []byte("\n\n")},
+		{"not canonical", []byte(`"resource":"d150"`), []byte(`"resource": "d150"`)},
+		{"no final newline", b, b[:len(b)-1]},
 	} {
 		c := bytes.Replace(b, bad.from, bad.to, 1)
 		seqKeys, _, seqErr := readAll(t, c, 1)
