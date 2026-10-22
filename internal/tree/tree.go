@@ -70,6 +70,7 @@ import (
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/repurge"
 	"github.com/middle-management/patchlog/internal/sqlitedsn"
+	"golang.org/x/sync/errgroup"
 )
 
 // Purger purges the tree service's own cache tags.
@@ -671,17 +672,26 @@ func (s *Service) Run(ctx context.Context) error {
 	s.fmu.Lock()
 	s.runCtx = ctx
 	s.fmu.Unlock()
-	for what, fill := range map[string]func(context.Context) error{"file metadata": s.backfillFiles, "nodes": s.backfillNodes} {
-		if err := fill(ctx); err != nil && ctx.Err() == nil {
-			// Made again beside the followers until it succeeds.
-			s.opt.Logf("tree: %s: %v; retrying", what, err)
-			s.fwg.Add(1)
-			go func() {
-				defer s.fwg.Done()
-				s.retryBackfill(ctx, what, fill)
-			}()
-		}
+	if err := s.backfillFiles(ctx); err != nil && ctx.Err() == nil {
+		// Made again beside the followers until it succeeds.
+		s.opt.Logf("tree: file metadata: %v; retrying", err)
+		s.fwg.Add(1)
+		go func() {
+			defer s.fwg.Done()
+			s.retryBackfill(ctx, "file metadata", s.backfillFiles)
+		}()
 	}
+	// Born and deleted explicit placements, one log or page per node of a
+	// database from before them, are read beside the followers, which
+	// don't wait for them.
+	s.fwg.Add(1)
+	go func() {
+		defer s.fwg.Done()
+		if err := s.backfillNodes(ctx); err != nil && ctx.Err() == nil {
+			s.opt.Logf("tree: nodes: %v; retrying", err)
+			s.retryBackfill(ctx, "nodes", s.backfillNodes)
+		}
+	}()
 	s.ensureFollowers()
 	<-ctx.Done()
 	s.fwg.Wait()
@@ -817,8 +827,10 @@ type prep struct {
 	file    *FileMeta
 	purged  bool
 	// born is the node's born (§B.5): of a catalog node, or of the
-	// implicit placement a content document makes.
-	born string
+	// implicit placement a content document makes; bornUnknown that it
+	// can't be known, or isn't read (Node.BornUnknown).
+	born        string
+	bornUnknown bool
 }
 
 // Apply implements follow.Handler. The batch's units are coalesced and
@@ -936,11 +948,14 @@ func (s *Service) Apply(ctx context.Context, fb *follow.Batch) error {
 				}
 				// A node's born (§B.5): a catalog node's, or that of the
 				// implicit placement a content document makes (§B.9).
-				self := bornable && parseSelf(s.opt.Catalog, b.NS, ch.Resource, doc.Value) != nil
-				if isCat || self {
-					if p.born, err = s.nodeBorn(ctx, fb.NS, ch.Resource, p.head, self); err != nil {
+				self := !isCat && s.opt.SelfPlacing && parseSelf(s.opt.Catalog, b.NS, ch.Resource, doc.Value) != nil
+				switch {
+				case isCat || self && bornable:
+					if p.born, p.bornUnknown, err = s.nodeBorn(ctx, fb.NS, ch.Resource, p.head, self, ch.Purged); err != nil {
 						return err
 					}
+				case self:
+					p.bornUnknown = true
 				}
 			case errors.Is(err, derived.ErrSkip) && !isCat:
 				// A live item whose document isn't readable content (an
@@ -1156,7 +1171,7 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			changed[p.name] = true
 			if p.kind == "head" && p.doc != nil {
 				n := ParseNode(cat, p.name, p.head, p.doc)
-				n.Born = p.born
+				n.Born, n.BornUnknown = p.born, p.bornUnknown
 				if g.explicitGone[p.name] {
 					if err := saveGone(ctx, tx, p.name, false); err != nil {
 						return nil, err
@@ -1218,15 +1233,15 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			if _, err := tx.ExecContext(ctx, `UPDATE items SET title = NULL WHERE ns = ? AND title IS NOT NULL`, ns); err != nil {
 				return nil, err
 			}
-			if _, err := tx.ExecContext(ctx, `UPDATE self_parents SET born = NULL WHERE ns = ?`, ns); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE self_parents SET born = '' WHERE ns = ?`, ns); err != nil {
 				return nil, err
 			}
 			for _, m := range []map[string]*Node{g.explicit, g.self} {
 				for name, n := range m {
-					if n.ItemNS == ns && (n.ItemTitle != "" || n.Self && n.Born != "") {
+					if n.ItemNS == ns && (n.ItemTitle != "" || n.Self && !n.BornUnknown) {
 						n.ItemTitle = ""
 						if n.Self {
-							n.Born = ""
+							n.Born, n.BornUnknown = "", true
 						}
 						changed[name] = true
 					}
@@ -1276,15 +1291,12 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 			}
 			if sn != nil {
 				m, _ := p.doc.(map[string]any)
-				var born any
-				if p.born != "" {
-					born = p.born
-				}
 				if _, err := tx.ExecContext(ctx, `INSERT INTO self_parents (ns, name, parents, born) VALUES (?, ?, ?, ?)
-					ON CONFLICT (ns, name) DO UPDATE SET parents = excluded.parents, born = excluded.born`, ns, p.name, canonJSON(m["$parents"]), born); err != nil {
+					ON CONFLICT (ns, name) DO UPDATE SET parents = excluded.parents, born = excluded.born`, ns, p.name, canonJSON(m["$parents"]), bornVal(p.born, p.bornUnknown)); err != nil {
 					return nil, err
 				}
-				sn.ItemState, sn.ItemHead, sn.ItemTitle, sn.ItemFile, sn.Born = st, head, title, file, p.born
+				sn.ItemState, sn.ItemHead, sn.ItemTitle, sn.ItemFile = st, head, title, file
+				sn.Born, sn.BornUnknown = p.born, p.bornUnknown
 				g.setSelf(sn)
 				changed[pl] = true
 			} else if g.self[pl] != nil {
@@ -1490,10 +1502,12 @@ func (s *Service) Seen(ctx context.Context, nsID string) bool {
 
 // nodeBorn is the born of a node (§B.5) whose document is ns/name, head
 // head (ns as followed): a catalog node's, or with self an implicit
-// placement's, which a content document makes (§B.9). The service keeps
-// it with the node, so it reads it only for a node it doesn't hold one
-// for (bornOf).
-func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self bool) (string, error) {
+// placement's, which a content document makes (§B.9), and whether it
+// can't be known. The service keeps both with the node, so it reads the
+// log only for a node it holds neither for, or whose chain a purge in
+// this batch replaced (purged), never again for a chain whose born is
+// unknown (bornOf).
+func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self, purged bool) (string, bool, error) {
 	node := name
 	if self {
 		node = s.logical(ns) + "." + name
@@ -1503,22 +1517,25 @@ func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self bool
 	if self {
 		n = s.g.self[node]
 	}
-	known := ""
-	if n != nil {
-		known = n.Born
+	var born string
+	known := false
+	if n != nil && !purged {
+		born, known = n.Born, n.Born != "" || n.BornUnknown
 	}
 	s.mu.RUnlock()
-	if known != "" {
-		return known, nil
+	if known {
+		return born, born == "", nil
 	}
-	return s.bornOf(ctx, ns, name, head)
+	born, err := s.bornOf(ctx, ns, name, head)
+	return born, err == nil && born == "", err
 }
 
 // bornOf is when ns/name was created (§B.5 born): the created of the first
 // revision of its chain up to head, the first its log gives from genesis.
 // A log that can't be read for the moment (Transient) is an error, so the
 // apply is made again; otherwise, as for a resource gone since or a chain
-// a prune cut (410, §7.1), the born is unknown ("").
+// a prune cut (410 pruned, §7.1), the born is unknown (""), and only
+// failures other than those are logged.
 func (s *Service) bornOf(ctx context.Context, ns, name, head string) (string, error) {
 	es, _, err := s.c.LogPage(ctx, ns, name, head, "")
 	switch {
@@ -1526,7 +1543,7 @@ func (s *Service) bornOf(ctx context.Context, ns, name, head string) (string, er
 	case client.Transient(err):
 		return "", fmt.Errorf("tree: the log of %s/%s: %w", ns, name, err)
 	default:
-		if !client.IsGone(err) && !client.IsNotFound(err) {
+		if !client.IsGone(err) && !client.IsPruned(err) && !client.IsNotFound(err) {
 			s.opt.Logf("tree: the born of %s/%s is unknown: %v", ns, name, err)
 		}
 		return "", nil
@@ -1537,18 +1554,24 @@ func (s *Service) bornOf(ctx context.Context, ns, name, head string) (string, er
 	return es[0].Created, nil
 }
 
+// bornReads bounds the logs backfillNodes reads at once.
+const bornReads = 4
+
 // backfillNodes fills in, on start, what a database from an earlier
-// release lacks: born (§B.5) for every node without it, read from its
-// log, and once (meta "gone"), the deleted and purged explicit placements
-// that win over $parents (§B.9), from the catalog's /heads at its
-// checkpoint. Listings change at an unchanged combined checkpoint, so
-// every cached listing of the catalog goes (ns:{catalog}), as for the
-// drift reload fixes. It runs before the followers start, and, should it
-// fail, again beside them until it succeeds (retryBackfill), under wmu so
-// no apply commits meanwhile.
+// release lacks: born (§B.5) for every node that has neither it nor a
+// record that it can't be known, read from its log (bornReads at a time;
+// an implicit placement whose item is in a sealed or e2e namespace isn't
+// read, as Apply doesn't read it), and once (meta "gone"), the deleted and
+// purged explicit placements that win over $parents (§B.9), from the
+// catalog's /heads at its checkpoint. It runs beside the followers (Run),
+// reading outside the locks and taking wmu only to apply what it read: a
+// node whose head moved meanwhile was read by the apply that moved it. A
+// born that can't be known is recorded, so neither a later head nor the
+// next start asks again. Listings change at an unchanged combined
+// checkpoint, so every cached listing of the catalog goes (ns:{catalog}),
+// as for the drift reload fixes. Should it fail, it is made again until it
+// succeeds (retryBackfill).
 func (s *Service) backfillNodes(ctx context.Context) error {
-	s.wmu.Lock()
-	defer s.wmu.Unlock()
 	cat := s.opt.Catalog
 	var marked string
 	err := s.db.QueryRowContext(ctx, `SELECT v FROM meta WHERE k = 'gone'`).Scan(&marked)
@@ -1565,16 +1588,19 @@ func (s *Service) backfillNodes(ctx context.Context) error {
 	cp, purged := s.cur[cat], false
 	_, purged = s.purged[cat]
 	for name, n := range s.g.explicit {
-		if n.Born == "" && n.Head != "" {
+		if n.Born == "" && !n.BornUnknown && n.Head != "" {
 			wants = append(wants, want{node: name, ns: s.actual(cat), name: name, head: n.Head})
 		}
 	}
 	for name, n := range s.g.self {
-		if n.Born == "" && n.ItemHead != "" {
+		if n.Born == "" && !n.BornUnknown && n.ItemHead != "" {
 			wants = append(wants, want{node: name, ns: s.actual(n.ItemNS), name: n.ItemName, head: n.ItemHead, self: true})
 		}
 	}
 	s.mu.RUnlock()
+	if !fillGone && len(wants) == 0 {
+		return nil
+	}
 	// A database that starts empty records them as it applies the catalog.
 	var gone []string
 	if fillGone && cp != "" && !purged {
@@ -1597,36 +1623,40 @@ func (s *Service) backfillNodes(ctx context.Context) error {
 			after = next
 		}
 	}
-	borns := map[string]string{}
 	open := map[string]bool{} // namespaces whose items' born listings show (Apply)
 	for _, w := range wants {
-		if w.self {
-			ok, seen := open[w.ns]
-			if !seen {
-				in, err := s.keys.Info(ctx, w.ns)
-				if err != nil {
-					return fmt.Errorf("tree: the encryption of %s: %w", w.ns, err)
-				}
-				ok = !in.Protected()
-				open[w.ns] = ok
+		if _, seen := open[w.ns]; w.self && !seen {
+			in, err := s.keys.Info(ctx, w.ns)
+			if err != nil {
+				return fmt.Errorf("tree: the encryption of %s: %w", w.ns, err)
 			}
-			if !ok {
-				continue
-			}
+			open[w.ns] = !in.Protected()
 		}
-		b, err := s.bornOf(ctx, w.ns, w.name, w.head)
-		if err != nil {
+	}
+	borns := make([]string, len(wants)) // "" where unknown
+	eg, ectx := errgroup.WithContext(ctx)
+	eg.SetLimit(bornReads)
+	for i, w := range wants {
+		if w.self && !open[w.ns] {
+			continue
+		}
+		eg.Go(func() error {
+			b, err := s.bornOf(ectx, w.ns, w.name, w.head)
+			borns[i] = b
 			return err
-		}
-		if b != "" {
-			borns[w.node] = b
-		}
+		})
 	}
-	if !fillGone && len(borns) == 0 {
-		return nil
+	if err := eg.Wait(); err != nil {
+		return err
 	}
+
+	s.wmu.Lock()
+	defer s.wmu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -1634,21 +1664,35 @@ func (s *Service) backfillNodes(ctx context.Context) error {
 	defer tx.Rollback()
 	g := s.g
 	changed := map[string]bool{}
-	for _, w := range wants {
-		n := g.explicit[w.node]
+	for i, w := range wants {
+		n, head := g.explicit[w.node], ""
 		if w.self {
 			n = g.self[w.node]
 		}
-		if n == nil || n.Born != "" || borns[w.node] == "" {
+		if n != nil {
+			head = n.Head
+			if w.self {
+				head = n.ItemHead
+			}
+		}
+		if n == nil || n.Born != "" || n.BornUnknown || head != w.head {
 			continue
 		}
-		n.Born = borns[w.node]
+		n.Born, n.BornUnknown = borns[i], borns[i] == ""
 		if w.self {
-			if _, err := tx.ExecContext(ctx, `UPDATE self_parents SET born = ? WHERE ns = ? AND name = ?`, n.Born, n.ItemNS, n.ItemName); err != nil {
+			if _, err := tx.ExecContext(ctx, `UPDATE self_parents SET born = ? WHERE ns = ? AND name = ?`, bornVal(n.Born, n.BornUnknown), n.ItemNS, n.ItemName); err != nil {
 				return err
 			}
 		}
-		if g.nodes[w.node] == n {
+		switch {
+		case g.nodes[w.node] != n:
+		case n.BornUnknown:
+			// Listings show nothing new: only the record that it can't be
+			// known.
+			if _, err := tx.ExecContext(ctx, `UPDATE nodes SET born = '' WHERE name = ?`, w.node); err != nil {
+				return err
+			}
+		default:
 			changed[w.node] = true
 		}
 	}

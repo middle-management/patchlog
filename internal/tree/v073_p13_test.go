@@ -7,6 +7,8 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -632,4 +634,119 @@ func TestV073BornOfImplicitPlacement(t *testing.T) {
 	if e := entriesOf(t, x.get("/cat/children?of=root", ""))["pub.doc"]; e == nil || e["head"] == nil || e["born"] != nil || e["title"] != nil {
 		t.Errorf("an item of a namespace raised to sealed: %v", e)
 	}
+}
+
+// logGate counts the resource log requests (…/rev/{id}/log) under prefix
+// and, while hold is open, holds them.
+type logGate struct {
+	prefix string
+	n      atomic.Int32
+	hold   chan struct{}
+}
+
+func (g *logGate) RoundTrip(r *http.Request) (*http.Response, error) {
+	if strings.HasPrefix(r.URL.Path, g.prefix) && strings.HasSuffix(r.URL.Path, "/log") {
+		g.n.Add(1)
+		if g.hold != nil {
+			select {
+			case <-g.hold:
+			case <-r.Context().Done():
+				return nil, r.Context().Err()
+			}
+		}
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// TC-6 (§B.5, §7.1): a born that can't be known, its chain cut by a
+// prune (410 pruned), is recorded with the node: neither a later head nor
+// a restart reads the log for it again, and a 410 pruned isn't logged as
+// a failure.
+func TestV073BornUnknownRecorded(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := setup(t)
+	w.folder(t, "root", "Root")
+	a := must(w.c.CreateDoc(ctx, "cat", "season", map[string]any{"title": "S", "parents": parents("root")}))
+	a1 := must(w.c.Append(ctx, "cat", "season", a.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "S1"}}))
+	w.s.Clock.Advance(10 * time.Minute)
+	must(w.c.Append(ctx, "cat", "season", a1.ID, []any{map[string]any{"op": "replace", "path": "/title", "value": "S2"}}))
+	must(w.c.Prune(ctx, "cat", "season", client.PruneRequest{Horizon: a1.ID}))
+	g := &logGate{prefix: "/r/cat/season/"}
+	sc := w.s.Client(t, client.WithAuthor("tester"), client.WithHTTPClient(&http.Client{Transport: g}))
+	var mu sync.Mutex
+	var logged []string
+	logf := func(o *tree.Options) {
+		o.Logf = func(f string, a ...any) {
+			mu.Lock()
+			logged = append(logged, fmt.Sprintf(f, a...))
+			mu.Unlock()
+			t.Logf(f, a...)
+		}
+	}
+	db := t.TempDir() + "/tree.db"
+	x := startSvc(t, sc, svcOpts{db: db}, logf)
+	x.caughtUp("cat", "matches")
+	if e := entriesOf(t, x.get("/cat/children?of=root", ""))["season"]; e == nil || e["born"] != nil {
+		t.Fatalf("season %v", e)
+	}
+	first := g.n.Load()
+	for i := range 3 {
+		w.replace(t, "cat", "season", "/title", fmt.Sprint("T", i))
+		x.caughtUp("cat")
+	}
+	x.stop()
+	x = startSvc(t, sc, svcOpts{db: db}, logf)
+	x.caughtUp("cat", "matches")
+	// A node created since is read as before.
+	w.folder(t, "late", "Late", "root")
+	x.caughtUp("cat")
+	if e := entriesOf(t, x.get("/cat/children?of=root", ""))["late"]; e["born"] != bornOf(t, w.c, "cat", "late") {
+		t.Errorf("late %v", e)
+	}
+	x.stop()
+	if n := g.n.Load(); first != 1 || n != first {
+		t.Errorf("season's log read %d times for its first head, %d for three more and a restart", first, n-first)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, l := range logged {
+		if strings.Contains(l, "born") {
+			t.Errorf("logged: %s", l)
+		}
+	}
+}
+
+// TC-6 (§B.5, §B.9): a start that fills in born for a database from
+// before it reads the logs beside the followers, outside the write lock:
+// the service follows and lists new writes while those reads wait.
+func TestV073BackfillBesideFollowers(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.folder(t, "root", "Root")
+	w.folder(t, "season", "Season", "root@a0")
+	db := t.TempDir() + "/tree.db"
+	x := startSvc(t, w.c, svcOpts{db: db})
+	x.caughtUp("cat", "matches")
+	x.stop()
+	sq := must(sql.Open("sqlite", sqlitedsn.DSN(db, "")))
+	if _, err := sq.Exec(`UPDATE nodes SET born = NULL`); err != nil {
+		t.Fatal(err)
+	}
+	sq.Close()
+	g := &logGate{prefix: "/r/cat/season/", hold: make(chan struct{})}
+	sc := w.s.Client(t, client.WithAuthor("tester"), client.WithHTTPClient(&http.Client{Transport: g}))
+	x = startSvc(t, sc, svcOpts{db: db})
+	waitFor(t, "the backfill reading season's log", func() bool { return g.n.Load() > 0 })
+	w.folder(t, "late", "Late", "root@a1")
+	x.caughtUp("cat")
+	es := entriesOf(t, x.get("/cat/children?of=root", ""))
+	if es["late"] == nil || es["season"]["born"] != nil {
+		t.Fatalf("while the backfill waits: %v", es)
+	}
+	close(g.hold)
+	want := bornOf(t, w.c, "cat", "season")
+	waitFor(t, "season's born filled in", func() bool {
+		return entriesOf(t, x.get("/cat/children?of=root", ""))["season"]["born"] == want
+	})
 }

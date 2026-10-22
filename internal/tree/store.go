@@ -25,7 +25,8 @@ import (
 //	                                 one row per node (explicit, or implicit from $parents);
 //	                                 raw parents/$access kept to rebuild the graph on start;
 //	                                 born, the created of the first revision of the node's
-//	                                 document (§B.5)
+//	                                 document (§B.5), '' where it can't be known, NULL where
+//	                                 it isn't read yet (bornVal)
 //	edges(child, pos, parent, ord, state)
 //	                                 one row per declared parents entry (hrefs), with its state
 //	items(ns, name, state, head, title, created, file)
@@ -111,7 +112,8 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 		_, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE name = ?`, name)
 		return err
 	}
-	var item, itemHead, head, title, dangling, born any
+	var item, itemHead, head, title, dangling any
+	born := bornVal(n.Born, n.BornUnknown)
 	if it := n.Item(); it != "" {
 		item = it
 	}
@@ -126,9 +128,6 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 	}
 	if n.Dangling != "" {
 		dangling = n.Dangling
-	}
-	if n.Born != "" {
-		born = n.Born
 	}
 	var parents, access any
 	if !n.Self {
@@ -158,6 +157,21 @@ func (s *Service) persistNode(ctx context.Context, tx *sql.Tx, g *Graph, name st
 	}
 	g.saved[name] = n.snapshot()
 	return nil
+}
+
+// bornVal is the born column of a node (nodes.born, self_parents.born):
+// its born, the empty string where it can't be known (Node.BornUnknown),
+// NULL where it isn't read yet (backfillNodes reads it).
+func bornVal(born string, unknown bool) any {
+	if born == "" && !unknown {
+		return nil
+	}
+	return born
+}
+
+// bornCol reads what bornVal stored.
+func bornCol(c sql.NullString) (born string, unknown bool) {
+	return c.String, c.Valid && c.String == ""
 }
 
 func b2i(b bool) int {
@@ -244,7 +258,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 			doc["$access"] = v
 		}
 		n := ParseNode(g.Catalog, r.name, r.head.String, doc)
-		n.Born = r.born.String
+		n.Born, n.BornUnknown = bornCol(r.born)
 		g.setExplicit(n)
 	}
 	// Deleted and purged explicit placements, before the implicit ones
@@ -305,7 +319,7 @@ func (s *Service) loadGraph(ctx context.Context, q queryer) (*Graph, error) {
 			return nil, err
 		}
 		if n := parseSelf(g.Catalog, ns, name, map[string]any{"$parents": parseJSON(ps)}); n != nil {
-			n.Born = born.String
+			n.Born, n.BornUnknown = bornCol(born)
 			selfs = append(selfs, n)
 		}
 	}

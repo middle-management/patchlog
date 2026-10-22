@@ -83,6 +83,11 @@ type Node struct {
 	// (§B.5): the catalog resource's, or for an implicit placement the
 	// content document's; "" where the service doesn't know it.
 	Born string
+	// BornUnknown records that Born can't be known for the node's chain
+	// (a prune cut it, so its log from genesis is 410), or isn't read for
+	// it (an implicit placement whose item is in a sealed or e2e
+	// namespace, §B.9): it isn't asked for again until the chain changes.
+	BornUnknown bool
 
 	// Derived by analyze.
 	State      int    // StateLive or StateDangling
