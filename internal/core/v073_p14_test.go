@@ -3,6 +3,7 @@ package core
 import (
 	"errors"
 	"fmt"
+	"io"
 	"net/url"
 	"testing"
 
@@ -43,6 +44,22 @@ func TestV073FetchErr(t *testing.T) {
 	}
 	if e := unverified("x %d", 1); e.Status != 502 || e.Code() != "upstream" {
 		t.Errorf("unverified: %v", e)
+	}
+	// The base's own namespace document: only no answer, or a 5xx, is 502.
+	base := &BaseRef{Origin: "https://a.example", NS: "n", At: "1"}
+	for _, c := range []struct {
+		err    error
+		status int
+	}{
+		{api(403, "forbidden"), 422},
+		{api(404, "not_found"), 422},
+		{api(502, ""), 502},
+		{fmt.Errorf("reading: %w", io.ErrUnexpectedEOF), 502},
+		{fmt.Errorf("opening: %w", client.ErrNoKeys), 422},
+	} {
+		if got := unknownLevel(base, c.err); got.Status != c.status {
+			t.Errorf("unknownLevel %v: %d, want %d", c.err, got.Status, c.status)
+		}
 	}
 }
 

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"slices"
@@ -141,7 +142,8 @@ func noAnswer(err error) bool {
 		return ae.Status >= 500
 	}
 	var ue *url.Error
-	return errors.As(err, &ue)
+	var ne net.Error
+	return errors.As(err, &ue) || errors.As(err, &ne) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // endpoint resolves how an origin is reached.
@@ -472,8 +474,8 @@ type remoteLevel struct {
 // remoteMirror is the base as of at, verified.
 type remoteMirror struct {
 	base    *BaseRef
-	read    string // the base's read mode at at (as served; §G.5)
-	level   int    // the base's encryption level at at (as served)
+	read    string // the base's current read mode (as served; §G.5.2)
+	level   int    // the base's current encryption level (as served)
 	levels  []*remoteLevel
 	schemas []*remoteSchema
 	// schemaSources: the schemas' source namespaces at the base, as their
