@@ -2,10 +2,13 @@ package seal
 
 import (
 	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
 	"crypto/ecdh"
 	"crypto/hpke"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"strings"
@@ -551,5 +554,52 @@ func TestV073WrapKeyAuthVector(t *testing.T) {
 	}
 	if got, err := UnwrapKeyAuth(recipient, sender.PublicKey(), w); err != nil || !bytes.Equal(got, key(0x44)) {
 		t.Fatal(err)
+	}
+}
+
+// ---- Deterministic hooks: a fixed IV for sealed blobs ----
+
+// SealBlobWithIV gives the §E.2.2 layout "PLB1" ‖ len ‖ header ‖ iv ‖
+// AES-256-GCM(size ‖ bytes ‖ padding) ‖ tag, byte for byte, with the
+// additional data everything before iv.
+func TestV073SealBlobWithIV(t *testing.T) {
+	k := key(14)
+	iv := []byte("fedcba987654")
+	data := []byte("blob bytes")
+	for _, c := range []struct {
+		kid  string
+		pl   PL
+		hdr  string
+		pad  bool
+		size int
+	}{
+		{"m#2", BlobPL("m", "r", "1bbbb"), `{"enc":"A256GCM","kid":"m#2","pl":{"blob":"1bbbb","name":"r","ns":"m"}}`, false, 8 + len(data)},
+		{"", nil, `{"enc":"A256GCM"}`, true, MinPadded},
+	} {
+		got, err := SealBlobWithIV(k, c.kid, c.pl, data, c.pad, iv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		again, _ := SealBlobWithIV(k, c.kid, c.pl, data, c.pad, iv)
+		if !bytes.Equal(got, again) {
+			t.Fatal("not deterministic")
+		}
+		plain := make([]byte, c.size)
+		binary.BigEndian.PutUint64(plain, uint64(len(data)))
+		copy(plain[8:], data)
+		want := binary.BigEndian.AppendUint32([]byte("PLB1"), uint32(len(c.hdr)))
+		want = append(want, c.hdr...)
+		block, _ := aes.NewCipher(k)
+		gcm, _ := cipher.NewGCM(block)
+		want = gcm.Seal(append(append([]byte(nil), want...), iv...), iv, plain, want)
+		if !bytes.Equal(got, want) {
+			t.Fatalf("header %s: sealed blob %x, want %x", c.hdr, got, want)
+		}
+		if h, d, err := OpenBlob(got, k); err != nil || !bytes.Equal(d, data) || string(h.Raw) != c.hdr {
+			t.Fatalf("open: %v", err)
+		}
+	}
+	if _, err := SealBlobWithIV(k, "", nil, data, false, iv[:8]); err == nil {
+		t.Fatal("an 8-byte IV accepted")
 	}
 }

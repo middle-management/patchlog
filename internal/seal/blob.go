@@ -55,6 +55,22 @@ type BlobHeader struct {
 // is the E2 one, {enc, kid, pl}; with kid "" (and pl nil) it is E3's {enc}.
 // With pad, the plaintext is padded with zero bytes to its bucket.
 func SealBlob(key []byte, kid string, pl PL, data []byte, pad bool) ([]byte, error) {
+	return sealBlob(key, kid, pl, data, pad, nil)
+}
+
+// SealBlobWithIV is SealBlob with the 12-byte iv in place of a random one,
+// for test vectors (Addendum I). Never use it for content: an IV used
+// twice under one key breaks AES-GCM.
+func SealBlobWithIV(key []byte, kid string, pl PL, data []byte, pad bool, iv []byte) ([]byte, error) {
+	if len(iv) != 12 {
+		return nil, fmt.Errorf("seal: an IV has 12 bytes")
+	}
+	return sealBlob(key, kid, pl, data, pad, iv)
+}
+
+// sealBlob seals as SealBlob does, under iv, or a fresh random IV when iv
+// is nil.
+func sealBlob(key []byte, kid string, pl PL, data []byte, pad bool, iv []byte) ([]byte, error) {
 	aead, err := newGCM(key)
 	if err != nil {
 		return nil, err
@@ -79,8 +95,10 @@ func SealBlob(key []byte, kid string, pl PL, data []byte, pad bool) ([]byte, err
 	out = binary.BigEndian.AppendUint32(out, uint32(len(h)))
 	out = append(out, h...)
 	aad := out[:len(out):len(out)]
-	iv := make([]byte, aead.NonceSize())
-	rand.Read(iv)
+	if iv == nil {
+		iv = make([]byte, aead.NonceSize())
+		rand.Read(iv)
+	}
 	out = append(out, iv...)
 	return aead.Seal(out, iv, plain, aad), nil
 }
