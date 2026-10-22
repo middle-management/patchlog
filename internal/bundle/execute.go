@@ -814,19 +814,26 @@ func (im *importer) submitAll(ctx context.Context, run *runner, lims map[*node]l
 }
 
 // targetMoved reports a batch failure caused by the target moving after
-// it was classified: a 412, or a 410 whose items are all gone with head,
-// the tombstone a create or an older-head append meets on a resource
-// deleted meanwhile, where a create used to get a 412 (§7.2, §8.1).
+// it was classified: a 412 or a 410 whose items each failed for that, with
+// a 412, or with a 410 gone naming the tombstone that is now the head,
+// which a create or an older-head append meets on a resource deleted
+// meanwhile, where a create used to get a 412 (§7.2, §8.1). The batch has
+// the status of its first such item in request order and lists them all
+// (§7.5), so either may come first. A 412 without items is the epoch
+// raise's stale config change, answered as that config write (§7.5). A
+// purged resource's 410 (no head, step 2.1) or a purged namespace's isn't.
 func targetMoved(ae *client.APIError) bool {
-	if ae.Status == 412 {
-		return true
-	}
-	items := ae.Items()
-	if ae.Status != 410 || len(items) == 0 {
+	if ae.Status != 412 && ae.Status != 410 {
 		return false
 	}
+	items := ae.Items()
+	if len(items) == 0 {
+		return ae.Status == 412
+	}
 	for _, it := range items {
-		if head, _ := it["head"].(string); it["code"] != "gone" || head == "" {
+		st, _ := it["status"].(float64)
+		head, _ := it["head"].(string)
+		if st != 412 && (st != 410 || it["code"] != "gone" || head == "") {
 			return false
 		}
 	}
