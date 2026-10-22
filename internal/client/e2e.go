@@ -198,6 +198,16 @@ func (x *E2E) WithoutValidation() *E2E {
 // Client returns the underlying client.
 func (x *E2E) Client() *Client { return x.c }
 
+// PublicKey returns the public key of the view's own recipient key, the
+// admin key the keyring entries it writes name as from (§E.3.2), or nil
+// without one.
+func (x *E2E) PublicKey() *ecdh.PublicKey {
+	if x.recipient == nil {
+		return nil
+	}
+	return x.recipient.PublicKey()
+}
+
 // AddKey caches the epoch key of kid "{ns}#{e}".
 func (x *E2E) AddKey(kid string, key []byte) {
 	x.keys.mu.Lock()

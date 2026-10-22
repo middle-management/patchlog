@@ -2,11 +2,13 @@ package merge
 
 import (
 	"context"
+	"crypto/ecdh"
 	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // RebaseOptions configure Rebase (§F.5).
@@ -44,7 +46,24 @@ type RebaseOptions struct {
 	// Plan options for the replays (Squash is ignored: a rebase keeps ids).
 	// An e2e branch needs Plan.E2E.
 	Plan Options
+	// SuccessorReaders are the public keys an e2e successor's keyring
+	// wraps its key for (§F.8.1, §E.3.2), besides Plan.E2E's own
+	// recipient key and the readers of the old branch's newest epoch
+	// whose keys the view knows (client.E2E.KeyringReaders). A keyring
+	// names its readers by thumbprint only, so a reader whose key the
+	// view doesn't otherwise know is named here, not as a sender
+	// (WithSenders): senders are the admins the view trusts to distribute
+	// keys.
+	SuccessorReaders []*ecdh.PublicKey
 }
+
+// ErrReadersDropped reports that an e2e successor's keyring holds no key
+// for some readers of the old branch's newest epoch (RebaseResult.
+// DroppedReaders), so switching would end their access: Rebase stops
+// before replaying. Wrap the successor's key for them (client.E2E.
+// AddReader) and run Rebase again, which resumes, or revoke them in the
+// old branch first by rotating its epoch (§E.3.2).
+var ErrReadersDropped = errors.New("merge: the successor's keyring drops readers of the old branch")
 
 // RebaseResult reports what Rebase did.
 type RebaseResult struct {
@@ -59,6 +78,10 @@ type RebaseResult struct {
 	// replay and the switch.
 	CatchUp       *Plan   `json:"catchUp,omitempty"`
 	CatchUpResult *Result `json:"catchUpResult,omitempty"`
+	// DroppedReaders lists, at E3, the thumbprints of the readers of the
+	// old branch's newest epoch, in its own keyring, that the successor's
+	// keyring holds no key for (ErrReadersDropped).
+	DroppedReaders []string `json:"droppedReaders,omitempty"`
 }
 
 // Rebase creates a successor of a branch from its base's current head and
@@ -73,7 +96,8 @@ type RebaseResult struct {
 //
 // An e2e branch (§F.8) needs Plan.E2E. The successor gets its own keyring
 // first (successorKeyring), and the replays re-encrypt under it, so no id
-// is kept. Every merge batch of the branch in the successor counts as a
+// is kept. With Switch, a successor whose keyring would drop readers of
+// the old branch gets no replay (ErrReadersDropped). Every merge batch of the branch in the successor counts as a
 // merge point, merge.authors or not (they are the rebase, as the janitor's
 // superseded check assumes, §F.6), so a resumed rebase and the catch-up
 // replay exactly what is new.
@@ -180,8 +204,14 @@ func Rebase(ctx context.Context, c *client.Client, opt RebaseOptions) (*RebaseRe
 		return nil, err
 	}
 	if e2e {
-		if err := successorKeyring(ctx, opt.Plan.E2E, opt.Branch, onto, opt.New); err != nil {
+		dropped, err := successorKeyring(ctx, opt.Plan.E2E, opt.Branch, onto, opt.New, opt.SuccessorReaders)
+		if err != nil {
 			return out, err
+		}
+		out.DroppedReaders = dropped
+		if len(dropped) > 0 && opt.Switch {
+			return out, fmt.Errorf("%w: %s holds no key of %s for %s; wrap it for them (AddReader) and rebase again, or revoke them in %s first by rotating its epoch",
+				ErrReadersDropped, opt.New, opt.New, strings.Join(dropped, ", "), opt.Branch)
 		}
 	}
 
@@ -304,30 +334,100 @@ func ontoReads(ctx context.Context, c *client.Client, onto, read string) bool {
 	return err == nil && p.read == read
 }
 
-// successorKeyring gives an e2e successor its own keyring (§F.8): its
+// successorKeyring gives an e2e successor its own keyring (§F.8.1): its
 // sealed patch sets bind it, so it can't write under the keyring it reads
-// through from its base. The key is wrapped for the view itself and for
-// the readers of the old branch's newest epoch (its own keyring's, or the
-// one it reads through) whose keys the view knows, each holding an entry
-// from a sender it knows (client.E2E.KeyringReaders, §E.3.2). A successor
-// that has one already (a resumed rebase) is left as it is.
-func successorKeyring(ctx context.Context, x *client.E2E, branch, onto, succ string) error {
-	if kr, _, err := x.Keyring(ctx, succ); err == nil && kr.Current(succ) > 0 {
-		return nil
-	} else if err != nil && !client.IsNotFound(err) {
-		return err
+// through from its base. The key is wrapped for the view itself, for
+// readers, and for the readers of the old branch's newest epoch (its own
+// keyring's, or the one it reads through) whose keys the view knows, each
+// holding an entry from a sender it knows (client.E2E.KeyringReaders,
+// §E.3.2). A successor that has one already (a resumed rebase) keeps it,
+// its keys wrapped for those of readers it lacks (client.E2E.AddReader).
+//
+// It returns the thumbprints of the readers of the old branch's newest
+// epoch in its own keyring that the successor's keyring holds no key for,
+// from whichever sender: a reader the old branch's keys reach, and the
+// successor's don't, would lose access by the switch. A branch without a
+// keyring of its own has no writes of its own to lose.
+//
+// A keyring stored in the format before v0.63 that a namespace reads
+// through from its base counts as none; one of the branch's or the
+// successor's own is wrapped again first (client.E2E.MigrateKeyring).
+func successorKeyring(ctx context.Context, x *client.E2E, branch, onto, succ string, readers []*ecdh.PublicKey) ([]string, error) {
+	have, own, err := keyringAs(ctx, x, succ)
+	if err != nil {
+		return nil, err
 	}
-	kr, _, err := x.Keyring(ctx, branch)
-	if client.IsNotFound(err) {
-		kr, _, err = x.Keyring(ctx, onto)
+	kr, branchOwn, err := keyringAs(ctx, x, branch)
+	if err == nil && kr == nil {
+		kr, _, err = keyringAs(ctx, x, onto)
 	}
 	if err != nil {
-		return fmt.Errorf("merge: reading the keyring of %s: %w", branch, err)
+		return nil, fmt.Errorf("merge: reading the keyring of %s: %w", branch, err)
 	}
-	if _, err := x.InitKeyring(ctx, succ, x.KeyringReaders(kr)...); err != nil {
-		return fmt.Errorf("merge: keyring of %s: %w", succ, err)
+	held := map[string]bool{} // the successor's newest epoch's readers
+	if own {
+		for _, tp := range have.Recipients(seal.Kid(succ, have.Current(succ))) {
+			held[tp] = true
+		}
+		// A resumed rebase wraps the successor's keys for readers named
+		// since.
+		for _, r := range readers {
+			if tp := seal.Thumbprint(r); !held[tp] {
+				if _, err := x.AddReader(ctx, succ, r, true); err != nil {
+					return nil, fmt.Errorf("merge: adding a reader to the keyring of %s: %w", succ, err)
+				}
+				held[tp] = true
+			}
+		}
+	} else {
+		if kr != nil {
+			readers = append(readers[:len(readers):len(readers)], x.KeyringReaders(kr)...)
+		}
+		if _, err := x.InitKeyring(ctx, succ, readers...); err != nil {
+			return nil, fmt.Errorf("merge: keyring of %s: %w", succ, err)
+		}
+		// InitKeyring wraps for readers and the view's own key.
+		if pub := x.PublicKey(); pub != nil {
+			held[seal.Thumbprint(pub)] = true
+		}
+		for _, r := range readers {
+			held[seal.Thumbprint(r)] = true
+		}
 	}
-	return nil
+	if !branchOwn {
+		return nil, nil
+	}
+	var dropped []string
+	for _, tp := range kr.Recipients(seal.Kid(branch, kr.Current(branch))) {
+		if !held[tp] {
+			dropped = append(dropped, tp)
+		}
+	}
+	return dropped, nil
+}
+
+// keyringAs reads the keyring of ns as ns sees it (client.E2E.Keyring),
+// reporting whether it is ns's own, nil if ns has none, or reads through
+// one stored in the format before v0.63. One of ns's own in that format is
+// an error naming ns, to be wrapped again first.
+func keyringAs(ctx context.Context, x *client.E2E, ns string) (*seal.KeyringV2, bool, error) {
+	kr, _, err := x.Keyring(ctx, ns)
+	switch {
+	case err == nil:
+		return kr, kr.Current(ns) > 0, nil
+	case client.IsNotFound(err):
+		return nil, false, nil
+	case errors.Is(err, client.ErrLegacyKeyring):
+		old, _, err := x.LegacyKeyring(ctx, ns)
+		if err != nil {
+			return nil, false, err
+		}
+		if old.NS == ns {
+			return nil, false, fmt.Errorf("merge: the keyring of %s is in the format before v0.63: a key holder wraps it again first (patchlog e2e migrate-keyring -ns %s)", ns, ns)
+		}
+		return nil, false, nil
+	}
+	return nil, false, err
 }
 
 // ResourceStatus is one line of Status.
