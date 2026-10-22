@@ -1224,8 +1224,12 @@ func (o *organising) leaves(n *tree.Node, verb string) error {
 // through the walk-up, and until an admin gives it $access (the grant
 // refuses a document with $access unless the caller is an admin), each
 // subject's role has the powers there that it has at all its parents
-// (powers). The new name is exempt from the 404s (organising): one that
-// exists or existed is 409, decided from the core's head.
+// (powers). The new name is exempt from the 404s (organising), and is
+// 409, after the 403s, where it is taken, hidden or not (names are not
+// secrets): a node has it, or a parents entry or an accepted $parents
+// names it (Graph.DeclaredChildren), which the checkpoint decides, since
+// creating it would re-attach that dangling edge and widen access below
+// it (scenario 41); or a node had it, which the core's head decides.
 func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node string, req Request) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	name, ok := tree.Resolve(cat, node)
@@ -1243,11 +1247,13 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	admin := s.isAdmin(v)
 	var cp string
 	var checkpoint map[string]string
+	var taken bool
 	defer func() { err = decidedAt(err, checkpoint) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
 		cp = cur[cat]
 		o := s.organisingAt(g, v, admin)
 		defer func() { checkpoint = o.checkpoint(cur) }()
+		taken = g.Node(name) != nil || len(g.DeclaredChildren(name)) > 0
 		if err = o.offered(); err != nil {
 			return
 		}
@@ -1281,12 +1287,16 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	if err != nil {
 		return nil, err
 	}
+	if taken {
+		return nil, conflict("%s is taken in %s: a node has it, or a parents entry names it", name, cat)
+	}
 	h, herr := s.t.Client().Head(ctx, cat, name)
 	if herr != nil {
 		return nil, upstream(herr)
 	}
 	if h.State != client.NotFound {
-		// The core is ahead of the checkpoint (decidedAt).
+		// The core is ahead of the checkpoint, or a node had the name,
+		// which the service doesn't keep (decidedAt).
 		checkpoint = nil
 		return nil, conflict("%s exists or existed in %s", name, cat)
 	}
