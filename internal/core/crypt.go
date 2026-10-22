@@ -515,43 +515,39 @@ func (t *tx) encryptResource(res int64) {
 // --- configuration checks -----------------------------------------------------
 
 // checkEncryption checks a namespace document's encryption level (§7.4,
-// Addendum E): a key store is needed for any level, a level is never
-// lowered or removed, and a branch is at least at its base's level.
-// cur is nil for a new namespace; baseLevel is -1 if there is no base.
+// Addendum E Levels): a key store is needed for any level, and a level is
+// never lowered or removed. cur is nil for a new namespace. baseLevel is
+// the level of a branch's local base, -1 if there is none: a branch is at
+// least at its base's level, and e2e only over an e2e base, which its
+// creation and a raise to e2e are checked against; other config writes
+// don't check it (Addendum E, Branches and dependents). Refusals are 422
+// invalid with errors pointing at the member, as branch fields are (§7.4).
 func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 	if cfg.level > levelNone && t.e.opt.KeyStore == nil {
-		return invalid("/encryption: no key store configured on this server")
+		return docInvalid("/encryption", "/encryption: no key store configured on this server")
 	}
 	if cur != nil && cfg.level < cur.level {
-		return invalid("/encryption: the encryption level cannot be lowered or removed")
+		return docInvalid("/encryption", "/encryption: the encryption level cannot be lowered or removed")
 	}
-	if baseLevel >= 0 && cfg.level < baseLevel {
-		return invalid("/encryption: a branch cannot have a lower encryption level than its base")
+	toE2E := cfg.level == levelE2E && (cur == nil || cur.level < levelE2E)
+	if baseLevel >= 0 && (cur == nil || toE2E) {
+		if cfg.level < baseLevel {
+			return docInvalid("/encryption", "/encryption: a branch cannot have a lower encryption level than its base")
+		}
+		if cfg.level == levelE2E && baseLevel < levelE2E {
+			return docInvalid("/encryption", "/encryption: a branch can be e2e only if its base is")
+		}
 	}
 	// End-to-end (§E.3) only from the start: an existing namespace's ids,
-	// documents and log are over plaintext, and so is a base that isn't
-	// e2e, which a branch would read through.
-	if cfg.level == levelE2E {
-		if cur != nil && cur.level < levelE2E {
-			return invalid("/encryption: an existing namespace cannot become e2e; its content is already plaintext on the server (create a new e2e namespace)")
-		}
-		if baseLevel >= 0 && baseLevel < levelE2E {
-			return invalid("/encryption: a branch can be e2e only if its base is")
-		}
+	// documents and log are over plaintext.
+	if cur != nil && toE2E {
+		return docInvalid("/encryption", "/encryption: an existing namespace cannot become e2e; its content is already plaintext on the server (create a new e2e namespace)")
 	}
-	if cur != nil && cfg.level == levelE2E && cfg.Epoch != cur.Epoch && cfg.Epoch != cur.Epoch+1 {
-		return invalid(fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
-	}
-	// Epochs (§E.2.1): a sealed namespace's epoch only moves forward, one
-	// at a time; a namespace that becomes sealed starts at epoch 1. A new
-	// namespace or branch may start at any epoch.
-	if cur != nil && cfg.level == levelSealed {
-		switch {
-		case cur.level == levelSealed && cfg.Epoch != cur.Epoch && cfg.Epoch != cur.Epoch+1:
-			return invalid(fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
-		case cur.level < levelSealed && cfg.Epoch != 1:
-			return invalid("/encryption/epoch: a namespace becoming sealed starts at epoch 1")
-		}
+	// Epochs (§E.2.1): in a namespace already at sealed or e2e, the epoch
+	// only moves forward, one at a time. A new namespace or branch, or one
+	// becoming sealed, which has no epoch keys yet, may start at any epoch.
+	if cur != nil && cur.level >= levelSealed && cfg.level >= levelSealed && cfg.Epoch != cur.Epoch && cfg.Epoch != cur.Epoch+1 {
+		return docInvalid("/encryption/epoch", fmt.Sprintf("/encryption/epoch can only stay at %d or be incremented to %d", cur.Epoch, cur.Epoch+1))
 	}
 	return nil
 }

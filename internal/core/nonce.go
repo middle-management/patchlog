@@ -43,10 +43,11 @@ func checkRequiredNonces(s *itemState) *Error {
 // before its base set it never had it on, so leaving it off turns nothing
 // off. base is the branch's base, nil for a namespace that isn't a branch.
 // A remote branch's shadow holds what its base required when the branch
-// was created (insertShadow).
+// was created (insertShadow). The refusal is 422 invalid with errors
+// pointing at /nonce, as for the other branch fields (§7.4).
 func (t *tx) checkNonceBase(cur, cfg *Config, base *nsRow) *Error {
 	if base != nil && !cfg.NonceRequired && (cur == nil || cur.NonceRequired) && t.config(base.configSeq).NonceRequired {
-		return invalid(`/nonce: a branch can't turn off the nonce requirement its base has (§7.6, §C.7)`)
+		return docInvalid("/nonce", `/nonce: a branch can't turn off the nonce requirement its base has (§7.6, §C.7)`)
 	}
 	return nil
 }
