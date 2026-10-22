@@ -2,13 +2,17 @@ package server
 
 import (
 	"crypto/sha256"
+	"database/sql"
 	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // v073DB is a database for a test to open, and inspect, by its path.
@@ -480,4 +484,94 @@ func TestV073RevokedMessage(t *testing.T) {
 	if !strings.Contains(r.Str("message"), "grant id") {
 		t.Fatalf("revoked message %s", r.Body)
 	}
+}
+
+// v073SQL opens the database at path, a test's own (v073DB), for a test
+// to inspect or set rows as an earlier release left them; q's ? are the
+// dialect's placeholders.
+func v073SQL(t *testing.T, path string) (db *sql.DB, q func(string) string) {
+	t.Helper()
+	driver, dsn := "sqlite", sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
+	q = func(s string) string { return s }
+	if strings.HasPrefix(path, "postgres") {
+		driver, dsn = "pgx", path
+		q = func(s string) string {
+			var b strings.Builder
+			n := 0
+			for _, r := range s {
+				if r == '?' {
+					n++
+					fmt.Fprintf(&b, "$%d", n)
+					continue
+				}
+				b.WriteRune(r)
+			}
+			return b.String()
+		}
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return db, q
+}
+
+// v073Epoch is encryption.epoch of a namespace's current document, as
+// stored.
+func v073Epoch(t *testing.T, path, ns string) float64 {
+	t.Helper()
+	db, q := v073SQL(t, path)
+	var doc string
+	if err := db.QueryRow(q(`SELECT c.doc FROM ns_config c JOIN namespaces n ON c.ns = n.ns WHERE n.name = ? ORDER BY c.seq DESC LIMIT 1`), ns).Scan(&doc); err != nil {
+		t.Fatal(err)
+	}
+	enc, _ := jsonv.MustParse([]byte(doc)).(map[string]any)["encryption"].(map[string]any)
+	ep, _ := enc["epoch"].(float64)
+	return ep
+}
+
+// v0.73 §6.6 Values holds a config write that changes limits or
+// encryption, but an epoch's rotation changes no term of the inequality,
+// and §E.2.1 rotates whenever read access is revoked. A sealed namespace
+// whose limits no longer meet the inequality (one an earlier release held
+// only at E3, or here a deployment's since lowered default) keeps
+// rotating: after a revocation, on schedule and by a config write moving
+// its epoch, while a write changing its limits or another encryption
+// member is still held to it.
+func TestV073EpochRotationNotHeldToValues(t *testing.T) {
+	t.Parallel()
+	path, blobs := v073DB(t), t.TempDir()
+	ks := newKeyStore(t)
+	at := func(o *core.Options) { o.Path, o.BlobDir = path, blobs }
+	e := newEnv(t, withKeyStore(ks), withEncTuning, at)
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+	e.srv.Close()
+	e.e.Close()
+	e = newEnv(t, withKeyStore(ks), withEncTuning, at, func(o *core.Options) {
+		o.Limits.PatchSetSize = 64 << 10
+		o.RotateOnRevoke = true
+	})
+	need := int64(3*(64<<10+2<<10) + 1<<10)
+	expect(t, e.write("PATCH", "s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0}))), 201)
+	expect(t, e.patchNS("s", ops(op("add", "/revoked", []any{"1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})), ""), 201)
+	// The document sets no epoch: 1 (§E.2.1), and the rotation adds 2.
+	if ep := v073Epoch(t, path, "s"); ep != 2 {
+		t.Fatalf("epoch %v after a revocation with -rotate-on-revoke, want 2", ep)
+	}
+	if ep, err := e.e.RotateEpoch(t.Context(), "s", core.RotateAuthor); err != nil || ep != 3 {
+		t.Fatalf("RotateEpoch: %v, %v", ep, err)
+	}
+	e.clock.Advance(2 * time.Hour)
+	if done, err := e.e.RotateDue(t.Context(), time.Hour); err != nil || len(done) != 1 {
+		t.Fatalf("RotateDue: %v, %v", done, err)
+	}
+	expect(t, e.patchNS("s", ops(op("replace", "/encryption/epoch", 5.0)), ""), 201)
+	if ep := v073Epoch(t, path, "s"); ep != 5 {
+		t.Fatalf("epoch %v, want 5", ep)
+	}
+	expect(t, e.write("PATCH", "s", "a", e.head("s", "a"), withNonce(ops(op("add", "/w", 2.0)))), 201)
+	expectLimit(t, e.patchNS("s", ops(op("add", "/encryption/pad", true)), ""), 422, "patchSetSize", need, 64<<10)
+	expectLimit(t, e.patchNS("s", ops(op("replace", "/encryption/epoch", 6.0), op("add", "/limits", map[string]any{"opsPerSet": 100})), ""),
+		422, "patchSetSize", need, 64<<10)
 }

@@ -187,9 +187,10 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 			err = sizeLimit("rulesPerNamespace", cfg.ruleForms, bound, fmt.Sprintf("more than %d rule forms in rules, roles and key scopes (§12.2)", bound))
 		}
 	}
-	if err == nil && (prev == nil || base != nil || !jsonv.Equal(cfg.Doc["limits"], prev["limits"]) || !jsonv.Equal(cfg.Doc["encryption"], prev["encryption"])) {
+	if err == nil && (prev == nil || base != nil || valuesChanged(cfg.Doc, prev)) {
 		// A creation, a branch's included, or a write that changes limits
-		// or encryption (§6.6 Values); never a stored document.
+		// or encryption (§6.6 Values); never a stored document, nor an
+		// epoch's rotation.
 		err = cfg.checkValues()
 	}
 	if err == nil {
@@ -205,6 +206,32 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 		return nil, configErr(err)
 	}
 	return cfg, nil
+}
+
+// valuesChanged reports whether doc changes from prev what the §6.6 Values
+// inequality holds a config write to: limits, or encryption other than its
+// epoch. An epoch moves on every rotation, the server's on a schedule and
+// whenever read access is revoked (§E.2.1), and an E3 client's bump; it
+// changes no term of the inequality, and refusing it would leave a
+// namespace stored under an earlier bound, or a since lowered default,
+// sealed under the key a revoked reader holds.
+func valuesChanged(doc, prev map[string]any) bool {
+	return !jsonv.Equal(doc["limits"], prev["limits"]) || !jsonv.Equal(withoutEpoch(doc["encryption"]), withoutEpoch(prev["encryption"]))
+}
+
+// withoutEpoch is an encryption member without its epoch.
+func withoutEpoch(v any) any {
+	m, ok := v.(map[string]any)
+	if !ok {
+		return v
+	}
+	out := make(map[string]any, len(m))
+	for k, x := range m {
+		if k != "epoch" {
+			out[k] = x
+		}
+	}
+	return out
 }
 
 // rulesOrBoundChanged reports whether doc changes its rule forms, in
