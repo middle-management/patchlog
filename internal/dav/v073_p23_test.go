@@ -508,11 +508,11 @@ func TestV073FolderCopyThroughTreeService(t *testing.T) {
 	}
 }
 
-// goneCreates makes the core answer a create (If-None-Match: *) of a
-// tombstoned name 410 gone, with the tombstone as head, as cores do from
-// v0.73 (§7.2), where clienttest's answers 412 stale: on its own and as a
-// batch item. It wraps what the options f install.
-func goneCreates(f ...func(*clienttest.Options, *dav.Options)) func(*clienttest.Options, *dav.Options) {
+// staleCreates makes the core answer a create (If-None-Match: *) of a
+// tombstoned name 412 stale, with the tombstone as head, as cores did
+// before v0.73, where clienttest's answers 410 gone with head (§7.2): on
+// its own and as a batch item. It wraps what the options f install.
+func staleCreates(f ...func(*clienttest.Options, *dav.Options)) func(*clienttest.Options, *dav.Options) {
 	return func(o *clienttest.Options, d *dav.Options) {
 		for _, g := range f {
 			g(o, d)
@@ -543,21 +543,28 @@ func goneCreates(f ...func(*clienttest.Options, *dav.Options)) func(*clienttest.
 				rec := httptest.NewRecorder()
 				next.ServeHTTP(rec, r)
 				status, body := rec.Code, rec.Body.Bytes()
-				gone := func(m map[string]any) {
-					m["code"], m["message"] = "gone", "the resource is tombstoned (§8.1)"
+				// A 410 gone with head is a tombstone; one without is a
+				// purged resource, which stays 410.
+				tombstoned := func(m map[string]any) bool {
+					_, head := m["head"]
+					return m["code"] == "gone" && head
+				}
+				stale := func(m map[string]any) {
+					m["code"] = "stale"
+					delete(m, "message")
 				}
 				var m map[string]any
-				if status == http.StatusPreconditionFailed && json.Unmarshal(body, &m) == nil {
+				if status == http.StatusGone && json.Unmarshal(body, &m) == nil {
 					switch items, _ := m["items"].([]any); {
-					case create && m["code"] == "stale":
-						gone(m)
-						status = http.StatusGone
+					case create && tombstoned(m):
+						stale(m)
+						status = http.StatusPreconditionFailed
 					case m["code"] == "batch":
 						for i, x := range items {
 							it, _ := x.(map[string]any)
-							if creates[it["index"].(float64)] && it["code"] == "stale" {
-								gone(it)
-								it["status"] = float64(http.StatusGone)
+							if creates[it["index"].(float64)] && tombstoned(it) {
+								stale(it)
+								it["status"] = float64(http.StatusPreconditionFailed)
 							}
 							if i == 0 {
 								status = int(it["status"].(float64))
@@ -583,14 +590,15 @@ func goneCreates(f ...func(*clienttest.Options, *dav.Options)) func(*clienttest.
 // is tried again over the tombstone, and restores it; a new file's create
 // that meets a 410 is written over the tombstone, a new file over a
 // tombstone restoring it (§H.2 "Flat view"), while a 412, which may be
-// a file someone else made, is a 409 (P15's 410 on creates).
+// a file someone else made, is a 409 (P15's 410 on creates). The core
+// answers 410; staleCreates gives the 412 of a core before v0.73.
 func TestV073CreateOnTombstoneGone(t *testing.T) {
 	t.Parallel()
 	for _, v073 := range []bool{true, false} {
 		h := &hook{}
 		with := withHook(h)
-		if v073 {
-			with = goneCreates(withHook(h))
+		if !v073 {
+			with = staleCreates(withHook(h))
 		}
 		e := newEnv(t, []string{"docs"}, nil, nil, with)
 		tombstone := func(name string) func() {
