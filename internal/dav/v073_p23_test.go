@@ -6,9 +6,39 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/dav"
 )
 
 // Spec v0.73, Addendum H (gateways): copies, moves and names.
+
+// treeDocsEnv is treeEnv with flat namespace docs served too: the flat
+// view of matches, the tree's files.ns, is read-only (§H.2 "A file tree
+// is a catalog"), and docs, which no tree served owns, is written in the
+// flat view.
+func treeDocsEnv(t *testing.T, with ...func(*clienttest.Options, *dav.Options)) *env {
+	e := newEnv(t, []string{"docs", "matches"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches")}}, with...)
+	e.create("matches", "derby", map[string]any{"title": "Derby"})
+	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
+	e.create("cat", "empty", map[string]any{"title": "Empty", "parents": parents("cat", "root")})
+	e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "season")})
+	return e
+}
+
+// docsNS creates flat namespace docs beside a's tree, under a's key,
+// holding derby and cup: no tree owns it, so the gateway writes it in the
+// flat view, where the tree's files.ns, matches, is read-only (§H.2). It
+// returns a client writing there.
+func (a *authTree) docsNS(t *testing.T) *client.Client {
+	t.Helper()
+	must(a.s.Client(t, client.WithBearer(a.s.OperatorGrant(t, "docs"))).CreateNamespace(a.ctx, "docs", map[string]any{"read": "grant", "keys": []any{a.k.Entry("*")}}))
+	w := a.s.Client(t, client.WithBearer(a.k.Grant(t, a.s.Now(), "user:w", []string{"docs"}, []string{"read", "create", "append", "delete"})))
+	for _, n := range []string{"derby", "cup"} {
+		must(w.CreateDoc(a.ctx, "docs", n, map[string]any{"title": n}))
+	}
+	return w
+}
 
 // Editors' and systems' own files are scratch files, kept in the gateway
 // and never written to the core (§H.6): since v0.56 also LibreOffice's
@@ -157,4 +187,55 @@ func TestV073UntrustedPlacementsLeftOut(t *testing.T) {
 	e.expectTombstoned("cat", "secret.plans", "the untrusted placement, dangling")
 	_, doc := e.load("secret", "plans")
 	sameJSON(t, doc, map[string]any{"launch": "monday"})
+}
+
+// A file tree owns the items of its files.ns (§H.2 "A file tree is a
+// catalog"): a gateway that also serves files.ns flat serves it
+// read-only, its files read and copied out as anywhere, but PUT, DELETE,
+// MKCOL and LOCK there, a MOVE into or out of it, and a COPY into it are
+// 403, nothing written; the tree's own writes, and a flat namespace no
+// tree owns, are as before (GW-22).
+func TestV073FilesNSReadOnlyFlat(t *testing.T) {
+	t.Parallel()
+	e := treeDocsEnv(t)
+	hd, _ := e.load("matches", "derby")
+	e.expect(e.do("GET", "/matches/derby.json", ""), 200, "GET in the read-only flat view")
+	sameStrings(t, "matches", names(e.propfind("/matches/"), "/matches/"), []string{"derby.json"})
+	lock := `<?xml version="1.0" encoding="utf-8"?><D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>`
+	for _, c := range []struct {
+		method, path, body string
+		hdr                []string
+	}{
+		{"PUT", "/matches/x.json", `{"a": 1}`, nil},
+		{"PUT", "/matches/derby.json", `{"title": "mine"}`, nil},
+		{"PUT", "/matches/.x.swp", "swap", nil},
+		{"DELETE", "/matches/derby.json", "", nil},
+		{"MKCOL", "/matches/.TemporaryItems", "", nil},
+		{"LOCK", "/matches/new.md", lock, nil},
+		{"MOVE", "/matches/derby.json", "", []string{"Destination", "/matches/d2.json"}},
+		{"MOVE", "/matches/derby.json", "", []string{"Destination", "/cat/Empty/moved.json"}},
+		{"MOVE", "/matches/derby.json", "", []string{"Destination", "/docs/moved.json"}},
+		{"MOVE", "/cat/Season/derby.json", "", []string{"Destination", "/matches/moved.json"}},
+		{"COPY", "/cat/Season/derby.json", "", []string{"Destination", "/matches/copy.json"}},
+		{"COPY", "/docs/x.json", "", []string{"Destination", "/matches/copy.json"}},
+	} {
+		r := e.expect(e.do(c.method, c.path, c.body, c.hdr...), 403, c.method+" "+c.path+" "+strings.Join(c.hdr, " "))
+		if !strings.Contains(r.body, "read-only") || !strings.Contains(r.body, "file tree cat") {
+			t.Fatalf("%s %s: %q", c.method, c.path, r.body)
+		}
+	}
+	e.expectLive("matches", "derby", hd, "derby after the refusals")
+	sameStrings(t, "matches", e.liveNames("matches"), []string{"derby"})
+	if hn, _ := e.load("cat", "matches.derby"); hn.State != client.Live {
+		t.Fatalf("derby's placement %v", hn.State)
+	}
+
+	e.expect(e.do("COPY", "/matches/derby.json", "", "Destination", "/cat/Empty/copy.json"), 201, "COPY out of the read-only flat view")
+	e.expect(e.do("COPY", "/matches/derby.json", "", "Destination", "/docs/copy.json"), 201, "COPY out of it to a flat namespace")
+	e.expect(e.do("PUT", "/cat/Season/new.json", `{"n": 1}`), 201, "PUT in the tree")
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": 1}`), 201, "PUT in a flat namespace no tree owns")
+	e.expect(e.do("DELETE", "/docs/x.json", ""), 204, "DELETE there")
+	if got := e.liveNames("matches"); len(got) != 3 {
+		t.Fatalf("matches %q, want derby and the tree's two new items", got)
+	}
 }

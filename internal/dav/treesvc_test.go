@@ -1294,18 +1294,19 @@ func TestTreeServiceLimitedGrantWrites(t *testing.T) {
 // can't delete it there (the node documents decide, §H.5, §H.7 "Limited
 // grants"), is refused before anything is written: onto another listed
 // file (a temporary file renamed over), the destination keeps its
-// content; to a new name in a flat namespace it can write, no copy is
-// made. The source stays either way.
+// content; to a new name in a flat namespace it can write (docs, which no
+// tree owns, §H.2), no copy is made. The source stays either way.
 func TestTreeServiceLimitedGrantMoveWritesNothing(t *testing.T) {
 	t.Parallel()
 	a := newAuthTree(t)
-	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"matches"} })
+	w := a.docsNS(t)
+	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"docs"} })
 	g.propfindAs(a.k.Grant(t, a.s.Now(), "user:admin", a.both, []string{"read"}), "/cat/")
-	ann := a.k.Grant(t, a.s.Now(), "user:ann", a.both, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
+	ann := a.k.Grant(t, a.s.Now(), "user:ann", []string{"cat", "matches", "docs"}, []string{"read", "create", "append", "delete"}, map[string]any{"rules": []any{
 		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": []any{"root", "season", "matches.derby", "derby", "matches.cup", "cup", "moved"}}}}})
 	sameStrings(t, "ann's Season", names(g.propfindAs(ann, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
 	cupBefore, _ := g.load("matches", "cup")
-	for _, dst := range []string{"/cat/Season/cup.json", "/matches/moved.json"} {
+	for _, dst := range []string{"/cat/Season/cup.json", "/docs/moved.json"} {
 		if r := g.expect(g.doAs(ann, "MOVE", "/cat/Season/derby.json", "", "Destination", dst, "Overwrite", "T"), 403, "ann's MOVE of derby.json to "+dst); !strings.Contains(r.body, "node documents") {
 			t.Fatalf("MOVE to %s: 403 %q", dst, r.body)
 		}
@@ -1313,8 +1314,8 @@ func TestTreeServiceLimitedGrantMoveWritesNothing(t *testing.T) {
 	if cupAfter, doc := g.load("matches", "cup"); cupAfter.ID != cupBefore.ID {
 		t.Fatalf("matches/cup changed by a refused MOVE: %s -> %s, now %v", cupBefore.ID, cupAfter.ID, doc)
 	}
-	if h, _ := g.load("matches", "moved"); h.State != client.NotFound {
-		t.Fatalf("matches/moved made by a refused MOVE: %v", h.State)
+	if h := must(w.Head(a.ctx, "docs", "moved")); h.State != client.NotFound {
+		t.Fatalf("docs/moved made by a refused MOVE: %v", h.State)
 	}
 	if h, _ := g.load("matches", "derby"); h.State != client.Live {
 		t.Fatalf("derby is %v", h.State)
@@ -1326,25 +1327,28 @@ func TestTreeServiceLimitedGrantMoveWritesNothing(t *testing.T) {
 // read, create and append), or, a flat file moved to another namespace,
 // the append setting its $successor (§8.1), is refused before anything is
 // written (§H.5): a tree's file onto another listed file or to a new name
-// in a flat namespace, a flat file onto another or into a tree. The
-// destination keeps its content or isn't made, and the source stays.
+// in a flat namespace, a flat file onto another or into a tree (in docs,
+// which no tree owns, §H.2). The destination keeps its content or isn't
+// made, and the source stays.
 func TestTreeServiceNoDeleteMoveWritesNothing(t *testing.T) {
 	t.Parallel()
 	a := newAuthTree(t)
-	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"matches"} })
-	bob := a.k.Grant(t, a.s.Now(), "user:bob", a.both, []string{"read", "create", "append"})
-	carl := a.k.Grant(t, a.s.Now(), "user:carl", a.both, []string{"read", "create", "delete"})
+	w := a.docsNS(t)
+	g := a.gateway(t, a.tr.http.URL, func(o *dav.Options) { o.Namespaces = []string{"docs"} })
+	three := []string{"cat", "matches", "docs"}
+	bob := a.k.Grant(t, a.s.Now(), "user:bob", three, []string{"read", "create", "append"})
+	carl := a.k.Grant(t, a.s.Now(), "user:carl", three, []string{"read", "create", "delete"})
 	sameStrings(t, "bob's Season", names(g.propfindAs(bob, "/cat/Season/"), "/cat/Season/"), []string{"cup.json", "derby.json"})
 	// Each namespace's head moves with any write in it (§7.4).
 	heads := func() string {
-		return must(a.w.NSHead(a.ctx, "matches")).ID + " " + must(a.w.NSHead(a.ctx, "cat")).ID
+		return must(a.w.NSHead(a.ctx, "matches")).ID + " " + must(a.w.NSHead(a.ctx, "cat")).ID + " " + must(w.NSHead(a.ctx, "docs")).ID
 	}
 	for _, c := range []struct{ who, tok, src, dst, verb string }{
 		{"bob", bob, "/cat/Season/derby.json", "/cat/Season/cup.json", "delete"},
-		{"bob", bob, "/cat/Season/derby.json", "/matches/moved.json", "delete"},
-		{"bob", bob, "/matches/derby.json", "/matches/cup.json", "delete"},
-		{"bob", bob, "/matches/derby.json", "/cat/Season/moved.json", "delete"},
-		{"carl", carl, "/matches/derby.json", "/cat/Season/moved.json", "append"},
+		{"bob", bob, "/cat/Season/derby.json", "/docs/moved.json", "delete"},
+		{"bob", bob, "/docs/derby.json", "/docs/cup.json", "delete"},
+		{"bob", bob, "/docs/derby.json", "/cat/Season/moved.json", "delete"},
+		{"carl", carl, "/docs/derby.json", "/cat/Season/moved.json", "append"},
 	} {
 		before := heads()
 		r := g.doAs(c.tok, "MOVE", c.src, "", "Destination", c.dst, "Overwrite", "T")

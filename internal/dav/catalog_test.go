@@ -662,34 +662,40 @@ func TestTreeCopy(t *testing.T) {
 // item, deleted, names the copy in $successor (§8.1), but a JSON file
 // whose root isn't an object can't. Moved onto an existing file, its
 // content is saved into it, which keeps its history: a temporary file
-// renamed over a file (§H.5).
+// renamed over a file (§H.5). (The flat view is loose's, which no tree
+// owns, §H.2.)
 func TestTreeMoveAcross(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"matches", "docs"}, []string{"cat", "cat2"}, map[string]map[string]any{
-		"cat":  {"catalog": treeCatalog("matches")},
+	e := newEnv(t, []string{"loose"}, []string{"cat", "cat2"}, map[string]map[string]any{
+		"cat":  {"catalog": treeCatalog("matches", "loose")},
 		"cat2": {"catalog": treeCatalog("docs")},
 	})
+	for _, ns := range []string{"matches", "docs"} {
+		must(e.c.CreateNamespace(e.ctx, ns, map[string]any{"read": "public"}))
+	}
 	e.create("matches", "derby", map[string]any{"title": "Derby"})
 	for _, cat := range []string{"cat", "cat2"} {
 		e.create(cat, "root", map[string]any{"parents": []any{}})
 	}
 	e.create("cat", "matches.derby", map[string]any{"title": "derby.json", "parents": parents("cat", "root")})
+	e.create("loose", "same", map[string]any{"title": "Same"})
+	e.create("cat", "loose.same", map[string]any{"title": "same.json", "parents": parents("cat", "root")})
 
 	e.expect(e.do("PUT", "/cat/report.md", "text"), 201, "PUT")
 	_, a := e.itemOf("cat", "report.md")
-	e.expect(e.do("MOVE", "/cat/report.md", "", "Destination", "/docs/report.md"), 201, "MOVE to the flat view")
-	if b := e.expect(e.do("GET", "/docs/report.md", ""), 200, "GET").body; b != "text" {
+	e.expect(e.do("MOVE", "/cat/report.md", "", "Destination", "/loose/report.md"), 201, "MOVE to the flat view")
+	if b := e.expect(e.do("GET", "/loose/report.md", ""), 200, "GET").body; b != "text" {
 		t.Fatalf("GET %q", b)
 	}
-	if h, _ := e.load("matches", a); h.State != client.Tombstoned || h.Successor != "/r/docs/report.md" {
+	if h, _ := e.load("matches", a); h.State != client.Tombstoned || h.Successor != "/r/loose/report.md" {
 		t.Fatalf("moved item %+v", h)
 	}
-	sameStrings(t, "cat", names(e.propfind("/cat/"), "/cat/"), []string{"derby.json"})
+	sameStrings(t, "cat", names(e.propfind("/cat/"), "/cat/"), []string{"derby.json", "same.json"})
 
-	e.expect(e.do("PUT", "/matches/notes.txt", "n"), 201, "PUT flat")
-	e.expect(e.do("MOVE", "/matches/notes.txt", "", "Destination", "/cat/notes.txt"), 201, "MOVE into the tree")
+	e.expect(e.do("PUT", "/loose/notes.txt", "n"), 201, "PUT flat")
+	e.expect(e.do("MOVE", "/loose/notes.txt", "", "Destination", "/cat/notes.txt"), 201, "MOVE into the tree")
 	_, b := e.itemOf("cat", "notes.txt")
-	if h, _ := e.load("matches", "notes.txt"); h.State != client.Tombstoned || h.Successor != b {
+	if h, _ := e.load("loose", "notes.txt"); h.State != client.Tombstoned || h.Successor != "/r/matches/"+b {
 		t.Fatalf("moved resource %+v, copy %s", h, b)
 	}
 	e.expect(e.do("MOVE", "/cat/notes.txt", "", "Destination", "/cat2/notes.txt"), 201, "MOVE to another tree")
@@ -703,11 +709,11 @@ func TestTreeMoveAcross(t *testing.T) {
 
 	e.expect(e.do("PUT", "/cat/list.json", `[1, 2]`), 201, "PUT a JSON array")
 	_, l := e.itemOf("cat", "list.json")
-	e.expect(e.do("MOVE", "/cat/list.json", "", "Destination", "/docs/list.json"), 201, "MOVE a JSON array")
+	e.expect(e.do("MOVE", "/cat/list.json", "", "Destination", "/loose/list.json"), 201, "MOVE a JSON array")
 	if h, _ := e.load("matches", l); h.State != client.Tombstoned || h.Successor != "" {
 		t.Fatalf("moved array %+v", h)
 	}
-	_, doc := e.load("docs", "list")
+	_, doc := e.load("loose", "list")
 	sameJSON(t, doc, []any{1, 2})
 
 	e.expect(e.do("PUT", "/cat/draft.md", "v1"), 201, "PUT")
@@ -728,7 +734,7 @@ func TestTreeMoveAcross(t *testing.T) {
 	if m := e.lastEntry("matches", "derby"); m.Parent != "" {
 		t.Fatal("derby written")
 	}
-	r := e.expect(e.do("MOVE", "/matches/derby.json", "", "Destination", "/cat/derby.json"), 403, "MOVE of a document onto itself in the tree")
+	r := e.expect(e.do("MOVE", "/loose/same.json", "", "Destination", "/cat/same.json"), 403, "MOVE of a document onto itself in the tree")
 	if !strings.Contains(r.body, "one document") {
 		t.Fatalf("403 %q", r.body)
 	}

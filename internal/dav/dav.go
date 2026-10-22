@@ -485,6 +485,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			st.noneMatch = r.Header.Get("If-None-Match") == "*" && !aside
 		}
 	}
+	if de := st.readOnly(r.Context()); de != nil {
+		http.Error(w, de.msg, de.status)
+		return
+	}
 	switch {
 	case r.Body != nil && r.Method == "PUT":
 		r.Body = &bodyReader{ReadCloser: r.Body, st: st}
@@ -518,6 +522,57 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}}
 	h.ServeHTTP(&errWriter{ResponseWriter: w, st: st, realm: s.realm()}, r.WithContext(context.WithValue(r.Context(), stateKey{}, st)))
+}
+
+// readOnly refuses (403) a request that would write in the flat view of
+// a namespace a served file tree owns (§H.2 "A file tree is a catalog":
+// the tree owns the items in its files.ns, and a gateway doesn't also
+// serve files.ns as a writable flat folder): a PUT, DELETE, MKCOL or
+// LOCK there, a MOVE out of it or into it, a COPY into it. It is shown
+// read-only, its files read and copied out as anywhere; its items are
+// written through the tree.
+func (st *reqState) readOnly(ctx context.Context) *davError {
+	var paths []string
+	switch st.method {
+	case "PUT", "DELETE", "MKCOL", "LOCK":
+		paths = []string{st.path}
+	case "MOVE":
+		paths = []string{st.path, st.dst}
+	case "COPY":
+		paths = []string{st.dst}
+	}
+	for _, p := range paths {
+		ns, _, _ := strings.Cut(strings.TrimPrefix(p, "/"), "/")
+		if cat := st.ownedBy(ctx, ns); cat != "" {
+			return fail(http.StatusForbidden, "%s is read-only here: file tree %s owns the items of namespace %s (its catalog.files.ns, §H.2), so they are written, moved and deleted through /%s/, not in %s's flat view", p, cat, ns, cat, ns)
+		}
+	}
+	return nil
+}
+
+// ownedBy returns the served catalog whose file tree owns flat namespace
+// ns, the one its catalog.files.ns names (§H.2), "" for none: as the
+// token reads the catalog's settings (treeConf), else as last read with
+// any grant, the server's own at start included (learn).
+func (st *reqState) ownedBy(ctx context.Context, ns string) string {
+	if !st.s.flat[ns] {
+		return ""
+	}
+	cats := make([]string, 0, len(st.s.cats))
+	for cat := range st.s.cats {
+		cats = append(cats, cat)
+	}
+	sort.Strings(cats)
+	for _, cat := range cats {
+		c, err := st.treeConf(ctx, cat)
+		if err != nil {
+			c, _ = st.s.learned(cat)
+		}
+		if c.files != nil && c.files.ns == ns {
+			return cat
+		}
+	}
+	return ""
 }
 
 // allowed are the methods served (RFC 9110 §10.2.1 Allow).

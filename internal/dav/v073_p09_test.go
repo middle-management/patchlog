@@ -32,7 +32,7 @@ func TestV073VerifyEveryFiveMinutes(t *testing.T) {
 func TestV073DeleteWithoutTagHeadMoved(t *testing.T) {
 	t.Parallel()
 	h := &hook{}
-	e := treeEnv(t, withHook(h))
+	e := treeDocsEnv(t, withHook(h))
 	h.set(at("DELETE", "/r/matches/derby"), func() {
 		e.theirs("matches", "derby", map[string]any{"op": "add", "path": "/theirs", "value": "important"})
 	})
@@ -45,16 +45,16 @@ func TestV073DeleteWithoutTagHeadMoved(t *testing.T) {
 	}
 	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 
-	e.create("matches", "x", map[string]any{"a": "1"})
-	h.set(at("DELETE", "/r/matches/x"), func() {
-		e.theirs("matches", "x", replace("/a", "theirs"))
+	e.create("docs", "x", map[string]any{"a": "1"})
+	h.set(at("DELETE", "/r/docs/x"), func() {
+		e.theirs("docs", "x", replace("/a", "theirs"))
 	})
-	e.expect(e.do("DELETE", "/matches/x.json", ""), 409, "flat DELETE, edited after the gateway read it")
-	if hx, doc := e.load("matches", "x"); hx.State != client.Live || doc.(map[string]any)["a"] != "theirs" {
+	e.expect(e.do("DELETE", "/docs/x.json", ""), 409, "flat DELETE, edited after the gateway read it")
+	if hx, doc := e.load("docs", "x"); hx.State != client.Live || doc.(map[string]any)["a"] != "theirs" {
 		t.Fatalf("x %v %v", hx.State, doc)
 	}
-	e.expect(e.do("DELETE", "/matches/x.json", ""), 204, "DELETE again")
-	e.expectTombstoned("matches", "x", "x")
+	e.expect(e.do("DELETE", "/docs/x.json", ""), 204, "DELETE again")
+	e.expectTombstoned("docs", "x", "x")
 	e.expect(e.do("DELETE", "/cat/Season/derby.json", ""), 204, "tree DELETE again")
 	e.expectTombstoned("matches", "derby", "the item")
 }
@@ -93,13 +93,13 @@ func TestV073DeleteFolderDanglingForbidden(t *testing.T) {
 // and in a tree.
 func TestV073DeleteWeakTag(t *testing.T) {
 	t.Parallel()
-	e := treeEnv(t)
-	r0 := e.create("matches", "x", map[string]any{"a": "1"})
-	e.theirs("matches", "x", replace("/a", "2"))
-	e.expect(e.do("DELETE", "/matches/x.json", "", "If-Match", `W/"`+r0+`"`), 412, "flat DELETE W/ an old revision")
-	h, _ := e.load("matches", "x")
-	e.expect(e.do("DELETE", "/matches/x.json", "", "If-Match", `W/"`+h.ID+`"`), 204, "flat DELETE W/ the head")
-	e.expectTombstoned("matches", "x", "x")
+	e := treeDocsEnv(t)
+	r0 := e.create("docs", "x", map[string]any{"a": "1"})
+	e.theirs("docs", "x", replace("/a", "2"))
+	e.expect(e.do("DELETE", "/docs/x.json", "", "If-Match", `W/"`+r0+`"`), 412, "flat DELETE W/ an old revision")
+	h, _ := e.load("docs", "x")
+	e.expect(e.do("DELETE", "/docs/x.json", "", "If-Match", `W/"`+h.ID+`"`), 204, "flat DELETE W/ the head")
+	e.expectTombstoned("docs", "x", "x")
 
 	old := must(e.c.Head(e.ctx, "matches", "derby")).ID
 	e.theirs("matches", "derby", replace("/title", "Derby 2"))
@@ -117,14 +117,16 @@ func TestV073DeleteWeakTag(t *testing.T) {
 // type comes out as the source's.
 func TestV073RawTextNeedsUTF8(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}})
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("files")}})
+	must(e.c.CreateNamespace(e.ctx, "files", map[string]any{"read": "public"}))
 	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
 	bad := "\xff\xfe\x00abc"
-	typeOf := func(name string) string {
+	typeIn := func(ns, name string) string {
 		t.Helper()
-		ref, _ := e.rawOf("docs", name)
+		ref, _ := e.rawOf(ns, name)
 		return ref["type"].(string)
 	}
+	typeOf := func(name string) string { t.Helper(); return typeIn("docs", name) }
 	for _, c := range []struct{ name, ctype, body, typ string }{
 		{"bin.txt", "", bad, "application/octet-stream"},
 		{"bin.md", "text/markdown", bad, "application/octet-stream"},
@@ -140,8 +142,8 @@ func TestV073RawTextNeedsUTF8(t *testing.T) {
 		}
 	}
 	e.expect(e.do("PUT", "/cat/notes.md", bad), 201, "PUT in a tree")
-	if _, item := e.itemOf("cat", "notes.md"); typeOf(item) != "application/octet-stream" {
-		t.Fatalf("a tree's notes.md of bytes that aren't UTF-8: %s", typeOf(item))
+	if ns, item := e.itemOf("cat", "notes.md"); typeIn(ns, item) != "application/octet-stream" {
+		t.Fatalf("a tree's notes.md of bytes that aren't UTF-8: %s", typeIn(ns, item))
 	}
 
 	// Another tool's text/plain file of bytes that aren't UTF-8.
@@ -178,13 +180,15 @@ func TestV073RawTextNeedsUTF8(t *testing.T) {
 // does a restore after the user's own DELETE.
 func TestV073RawTypeKept(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("docs")}})
+	e := newEnv(t, []string{"docs"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("files")}})
+	must(e.c.CreateNamespace(e.ctx, "files", map[string]any{"read": "public"}))
 	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
-	typeOf := func(name string) string {
+	typeIn := func(ns, name string) string {
 		t.Helper()
-		ref, _ := e.rawOf("docs", name)
+		ref, _ := e.rawOf(ns, name)
 		return ref["type"].(string)
 	}
+	typeOf := func(name string) string { t.Helper(); return typeIn("docs", name) }
 	e.expect(e.do("PUT", "/docs/x.foo", "one", "Content-Type", "image/x-foo"), 201, "PUT x.foo")
 	for i, c := range []struct{ ctype, typ string }{
 		{"", "image/x-foo"},
@@ -216,8 +220,8 @@ func TestV073RawTypeKept(t *testing.T) {
 	// A tree's file.
 	e.expect(e.do("PUT", "/cat/pic", "one", "Content-Type", "image/x-foo"), 201, "PUT /cat/pic")
 	e.expect(e.do("PUT", "/cat/pic", "two"), 201, "re-save /cat/pic without a type")
-	if _, item := e.itemOf("cat", "pic"); typeOf(item) != "image/x-foo" {
-		t.Fatalf("a tree's pic: %s", typeOf(item))
+	if ns, item := e.itemOf("cat", "pic"); typeIn(ns, item) != "image/x-foo" {
+		t.Fatalf("a tree's pic: %s", typeIn(ns, item))
 	}
 }
 
@@ -337,40 +341,40 @@ func TestV073NewFileOverMovedAway(t *testing.T) {
 func TestV073ExpiredRecordsEvicted(t *testing.T) {
 	t.Parallel()
 	c := newClock()
-	e := treeEnv(t, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
+	e := treeDocsEnv(t, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
 
 	// A document untouched for a day.
-	e.create("matches", "x", map[string]any{"a": "1", "b": "1"})
-	buf := e.expect(e.do("GET", "/matches/x.json", ""), 200, "GET x").body
-	e.theirs("matches", "x", replace("/b", "theirs"))
-	e.rawDoc("matches", "r.txt", "text/plain", []byte("one"), nil)
-	e.expect(e.do("GET", "/matches/r.txt", ""), 200, "GET r.txt")
-	h, _ := e.load("matches", "r.txt")
-	bid := must(e.c.UploadBlob(e.ctx, "matches", "r.txt", "text/plain", "", []byte("theirs")))
-	must(e.c.Append(e.ctx, "matches", "r.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
+	e.create("docs", "x", map[string]any{"a": "1", "b": "1"})
+	buf := e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET x").body
+	e.theirs("docs", "x", replace("/b", "theirs"))
+	e.rawDoc("docs", "r.txt", "text/plain", []byte("one"), nil)
+	e.expect(e.do("GET", "/docs/r.txt", ""), 200, "GET r.txt")
+	h, _ := e.load("docs", "r.txt")
+	bid := must(e.c.UploadBlob(e.ctx, "docs", "r.txt", "text/plain", "", []byte("theirs")))
+	must(e.c.Append(e.ctx, "docs", "r.txt", h.ID, []any{replace("/$blob", bid), replace("/size", 6)}))
 	// A document read, then read again by another program 20 h later.
-	e.create("matches", "w", map[string]any{"a": "1", "b": "1"})
-	wbuf := e.expect(e.do("GET", "/matches/w.json", ""), 200, "GET w (the editor)").body
-	e.theirs("matches", "w", replace("/b", "theirs"))
+	e.create("docs", "w", map[string]any{"a": "1", "b": "1"})
+	wbuf := e.expect(e.do("GET", "/docs/w.json", ""), 200, "GET w (the editor)").body
+	e.theirs("docs", "w", replace("/b", "theirs"))
 	// A tree's file read under its path.
 	e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET derby.json")
 
 	c.add(20 * time.Hour)
-	e.expect(e.do("GET", "/matches/w.json", ""), 200, "GET w (a preview)")
+	e.expect(e.do("GET", "/docs/w.json", ""), 200, "GET w (a preview)")
 	c.add(5 * time.Hour)
-	e.expect(e.do("PUT", "/matches/w.json", edit(t, wbuf, `"a": "1"`, `"a": "mine"`)), 201, "PUT w, touched within the day")
-	_, doc := e.load("matches", "w")
+	e.expect(e.do("PUT", "/docs/w.json", edit(t, wbuf, `"a": "1"`, `"a": "mine"`)), 201, "PUT w, touched within the day")
+	_, doc := e.load("docs", "w")
 	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 
-	hx, _ := e.load("matches", "x")
-	e.expect(e.do("PUT", "/matches/x.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT x after 25 h")
-	e.expectLive("matches", "x", hx, "x after the refusal")
-	hr, _ := e.load("matches", "r.txt")
-	e.expect(e.do("PUT", "/matches/r.txt", "mine"), 409, "PUT r.txt after 25 h")
-	e.expectLive("matches", "r.txt", hr, "r.txt after the refusal")
-	buf = e.expect(e.do("GET", "/matches/x.json", ""), 200, "the reload").body
-	e.expect(e.do("PUT", "/matches/x.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT x after the reload")
-	_, doc = e.load("matches", "x")
+	hx, _ := e.load("docs", "x")
+	e.expect(e.do("PUT", "/docs/x.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT x after 25 h")
+	e.expectLive("docs", "x", hx, "x after the refusal")
+	hr, _ := e.load("docs", "r.txt")
+	e.expect(e.do("PUT", "/docs/r.txt", "mine"), 409, "PUT r.txt after 25 h")
+	e.expectLive("docs", "r.txt", hr, "r.txt after the refusal")
+	buf = e.expect(e.do("GET", "/docs/x.json", ""), 200, "the reload").body
+	e.expect(e.do("PUT", "/docs/x.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 201, "PUT x after the reload")
+	_, doc = e.load("docs", "x")
 	sameJSON(t, doc, map[string]any{"a": "mine", "b": "theirs"})
 
 	// The path's file replaced by another (deleted, a new item placed
@@ -384,15 +388,15 @@ func TestV073ExpiredRecordsEvicted(t *testing.T) {
 	e.expectLive("matches", "derby2", h2, "derby2 after the refusal")
 
 	// Swept, the idle user's records leave marks: still a 409.
-	e.create("matches", "z", map[string]any{"a": "1", "b": "1"})
-	buf = e.expect(e.do("GET", "/matches/z.json", ""), 200, "GET z").body
-	e.theirs("matches", "z", replace("/b", "theirs"))
+	e.create("docs", "z", map[string]any{"a": "1", "b": "1"})
+	buf = e.expect(e.do("GET", "/docs/z.json", ""), 200, "GET z").body
+	e.theirs("docs", "z", replace("/b", "theirs"))
 	c.add(25 * time.Hour)
 	e.expect(e.do("PROPFIND", "/", "", "Depth", "0"), 207, "a request after a day (sweeps)")
 	c.add(2 * time.Minute)
-	hz, _ := e.load("matches", "z")
-	e.expect(e.do("PUT", "/matches/z.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT z after the sweep")
-	e.expectLive("matches", "z", hz, "z after the refusal")
+	hz, _ := e.load("docs", "z")
+	e.expect(e.do("PUT", "/docs/z.json", edit(t, buf, `"a": "1"`, `"a": "mine"`)), 409, "PUT z after the sweep")
+	e.expectLive("docs", "z", hz, "z after the refusal")
 }
 
 // On any MOVE, the client's If-Match (its first value, W/ dropped), or
@@ -404,7 +408,7 @@ func TestV073ExpiredRecordsEvicted(t *testing.T) {
 // never the target's base.
 func TestV073MoveSourceIfMatch(t *testing.T) {
 	t.Parallel()
-	e := newEnv(t, []string{"matches", "other"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches")}})
+	e := newEnv(t, []string{"docs", "matches", "other"}, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches")}})
 	e.create("matches", "derby", map[string]any{"title": "Derby"})
 	e.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
 	e.create("cat", "season", map[string]any{"title": "Season", "parents": parents("cat", "root")})
@@ -425,34 +429,34 @@ func TestV073MoveSourceIfMatch(t *testing.T) {
 		}
 	}
 
-	e.create("matches", "x", map[string]any{"a": "1"})
-	old, h := stale("matches", "x")
-	e.create("matches", "onto", map[string]any{"a": "onto"})
-	ho, _ := e.load("matches", "onto")
-	e.expect(e.do("PUT", "/matches/.x.swp", "swap"), 201, "a scratch file")
+	e.create("docs", "x", map[string]any{"a": "1"})
+	old, h := stale("docs", "x")
+	e.create("docs", "onto", map[string]any{"a": "onto"})
+	ho, _ := e.load("docs", "onto")
+	e.expect(e.do("PUT", "/docs/.x.swp", "swap"), 201, "a scratch file")
 	for _, c := range []struct{ what, dst string }{
-		{"a rename", "/matches/x2.json"},
-		{"onto an existing file", "/matches/onto.json"},
+		{"a rename", "/docs/x2.json"},
+		{"onto an existing file", "/docs/onto.json"},
 		{"to another namespace", "/other/x.json"},
-		{"over a scratch file", "/matches/.x.swp"},
+		{"over a scratch file", "/docs/.x.swp"},
 	} {
 		for _, hdr := range [][]string{{"If-Match", q(old)}, {"If-Match", "W/" + q(old)}, {"If", "([" + q(old) + "])"}, {"If-Match", q(old) + ", " + q(h.ID)}} {
-			e.expect(e.do("MOVE", "/matches/x.json", "", append([]string{"Destination", c.dst}, hdr...)...), 412, "MOVE "+c.what+", "+hdr[0]+": "+hdr[1])
+			e.expect(e.do("MOVE", "/docs/x.json", "", append([]string{"Destination", c.dst}, hdr...)...), 412, "MOVE "+c.what+", "+hdr[0]+": "+hdr[1])
 		}
 	}
-	e.expectLive("matches", "x", h, "x after refused moves")
-	e.expectLive("matches", "onto", ho, "onto after refused moves")
-	notMade("matches", "x2")
+	e.expectLive("docs", "x", h, "x after refused moves")
+	e.expectLive("docs", "onto", ho, "onto after refused moves")
+	notMade("docs", "x2")
 	notMade("other", "x")
-	if g := e.expect(e.do("GET", "/matches/.x.swp", ""), 200, "GET the scratch file"); g.body != "swap" {
+	if g := e.expect(e.do("GET", "/docs/.x.swp", ""), 200, "GET the scratch file"); g.body != "swap" {
 		t.Fatalf("the scratch file %q", g.body)
 	}
-	e.expect(e.do("MOVE", "/matches/nothing.json", "", "Destination", "/matches/n2.json", "If-Match", "*"), 412, "MOVE If-Match: * of nothing")
-	e.expect(e.do("MOVE", "/matches/x.json", "", "Destination", "/matches/onto.json", "If-Match", "W/"+q(h.ID)), 204, "MOVE onto a file, W/ the head")
-	e.expectTombstoned("matches", "x", "x")
-	_, doc := e.load("matches", "onto")
+	e.expect(e.do("MOVE", "/docs/nothing.json", "", "Destination", "/docs/n2.json", "If-Match", "*"), 412, "MOVE If-Match: * of nothing")
+	e.expect(e.do("MOVE", "/docs/x.json", "", "Destination", "/docs/onto.json", "If-Match", "W/"+q(h.ID)), 204, "MOVE onto a file, W/ the head")
+	e.expectTombstoned("docs", "x", "x")
+	_, doc := e.load("docs", "onto")
 	sameJSON(t, doc, map[string]any{"a": "1", "theirs": 1})
-	e.expect(e.do("MOVE", "/matches/onto.json", "", "Destination", "/matches/y.json", "If-Match", "*"), 201, "MOVE If-Match: *")
+	e.expect(e.do("MOVE", "/docs/onto.json", "", "Destination", "/docs/y.json", "If-Match", "*"), 201, "MOVE If-Match: *")
 
 	// In a tree: the item's head for a file, the node's for a folder.
 	old, h = stale("matches", "derby")
