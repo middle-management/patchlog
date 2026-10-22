@@ -40,7 +40,7 @@ func TestRemoteBranchBlobs(t *testing.T) {
 
 	// Bytes that don't match their id are refused, and nothing is written.
 	rt.set(tamper(t, a, "/blob/"+bid2, func(b []byte) []byte { return bytes.ToUpper(b) }), "")
-	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 502, "remote")
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 502, "upstream")
 	expect(t, b.get("/ns/rel"), 404)
 	rt.set(a.srv.URL, "")
 	expect(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 201)
@@ -131,7 +131,7 @@ func TestRemoteBranchSealedBlobs(t *testing.T) {
 
 	// A sealing that doesn't open is refused, and nothing is written.
 	rt.set(tamper(t, a, "/blob/"+bid+"/e/", func(b []byte) []byte { b[len(b)-1] ^= 1; return b }), rt.bearer)
-	expectCode(t, b.mkRemote("rel", remoteGenesis("s", at, sealedBranch)), 502, "remote")
+	expectCode(t, b.mkRemote("rel", remoteGenesis("s", at, sealedBranch)), 502, "upstream")
 	expect(t, b.get("/ns/rel"), 404)
 	rt.set(a.srv.URL, rt.bearer)
 	expect(t, b.mkRemote("rel", remoteGenesis("s", at, sealedBranch)), 201)
@@ -204,7 +204,7 @@ func TestRemoteBranchE2EBlobs(t *testing.T) {
 
 	// Bytes that don't match their id are refused, and nothing is written.
 	rt.set(tamper(t, a, "/blob/"+b2, func(b []byte) []byte { b[len(b)-1] ^= 1; return b }), rt.bearer)
-	expectCode(t, b.mkRemote("rel", genesis), 502, "remote")
+	expectCode(t, b.mkRemote("rel", genesis), 502, "upstream")
 	rt.set(a.srv.URL, rt.bearer)
 	expect(t, b.mkRemote("rel", genesis), 201)
 	bAdmin := b.grant(kB, "user:b", []string{"rel"}, allVerbs)

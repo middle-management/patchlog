@@ -70,7 +70,7 @@ func TestRemoteBranchSealed(t *testing.T) {
 	sealed := map[string]any{"read": "grant", "encryption": map[string]any{"level": "sealed"}}
 	// Without the identity, the wrapped keys can't be opened.
 	r := b.mkRemote("rel", remoteGenesis("s", at, sealed))
-	expectCode(t, r, 502, "remote")
+	expectCode(t, r, 502, "upstream")
 	expect(t, b.get("/ns/rel"), 404)
 	mu.Lock()
 	id = bPriv

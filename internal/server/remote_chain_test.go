@@ -263,7 +263,7 @@ func TestRemoteBranchOfBranchTampered(t *testing.T) {
 	for _, c := range cases {
 		rt.set(tamper(t, a, c.match, func(b []byte) []byte { return bytes.ReplaceAll(b, []byte(c.from), []byte(c.to)) }), "")
 		r := b.mkRemote("rel", remoteGenesis("r7", f.atA, nil))
-		if r.Code != 502 || r.Str("code") != "remote" {
+		if r.Code != 502 || r.Str("code") != "upstream" || r.Str("origin") != originA {
 			t.Errorf("%s: %d %s", c.name, r.Code, r.Body)
 		}
 		expect(t, b.get("/ns/rel"), 404)

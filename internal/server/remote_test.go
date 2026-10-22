@@ -545,7 +545,7 @@ func TestRemoteTampered(t *testing.T) {
 	for _, c := range cases {
 		rt.set(tamper(t, a, c.match, func(b []byte) []byte { return bytes.ReplaceAll(b, []byte(c.from), []byte(c.to)) }), "")
 		r := b.mkRemote("rel", remoteGenesis("main", f.at, nil))
-		if r.Code != 502 || r.Str("code") != "remote" {
+		if r.Code != 502 || r.Str("code") != "upstream" || r.Str("origin") != originA {
 			t.Errorf("%s: %d %s", c.name, r.Code, r.Body)
 		}
 		expect(t, b.get("/ns/rel"), 404)
@@ -553,7 +553,7 @@ func TestRemoteTampered(t *testing.T) {
 	}
 	// Unreachable: 502.
 	rt.set("http://127.0.0.1:1", "")
-	expectCode(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 502, "remote")
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 502, "upstream")
 	// Genuine data through the same proxy works.
 	rt.set(tamper(t, a, "/nothing", nil), "")
 	expect(t, b.mkRemote("rel", remoteGenesis("main", f.at, nil)), 201)
@@ -576,8 +576,8 @@ func TestRemoteKeys(t *testing.T) {
 	rt := &route{url: a.srv.URL}
 	b := newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt))
 	b.opPriv = bPriv
-	// Without a read grant at A, the base can't be fetched.
-	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"read": "grant"})), 502, "remote")
+	// Without a read grant at A, B can't read the base: 422 (§G.3, §G.5.2).
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"read": "grant"})), 422, "invalid")
 	rt.set(a.srv.URL, a.grant(kA, "svc:b", []string{"main"}, []string{"read"}))
 	// Only the operator key creates remote branches.
 	q := req{method: "PATCH", path: "/ns/rel", ifNoneMatch: "*", body: remoteGenesis("main", at, nil), bearer: gA}

@@ -120,13 +120,27 @@ func remoteBaseIn(patches any) bool {
 	return has
 }
 
-func remoteErr(format string, a ...any) *Error {
-	return apiErr(502, "remote", "message", fmt.Sprintf(format, a...))
+// upstreamErr is the 502 of a remote branch's creation that failed at its
+// base's deployment (§G.3, §12.1): it didn't answer, answered 5xx, or served
+// data that fails verification. fetchRemote adds origin, naming that
+// deployment, to every such 502 it returns.
+func upstreamErr(format string, a ...any) *Error {
+	return apiErr(502, "upstream", "message", fmt.Sprintf(format, a...))
 }
 
 // unverified reports source data that fails verification.
 func unverified(format string, a ...any) *Error {
-	return apiErr(502, "remote", "message", "the base's data failed verification: "+fmt.Sprintf(format, a...))
+	return upstreamErr("%s", "the base's data failed verification: "+fmt.Sprintf(format, a...))
+}
+
+// noAnswer reports a failed fetch where the base's deployment didn't
+// answer, or answered 5xx: only that is 502 upstream at creation (§G.3).
+func noAnswer(err error) bool {
+	if ae, ok := client.AsAPIError(err); ok {
+		return ae.Status >= 500
+	}
+	var ue *url.Error
+	return errors.As(err, &ue)
 }
 
 // endpoint resolves how an origin is reached.
@@ -162,37 +176,43 @@ func (e *Engine) remoteClient(origin string) (*client.Client, RemoteEndpoint, er
 	return c, ep, err
 }
 
-// fetchErr maps a failed fetch from the base.
+// fetchErr maps a failed fetch from the base (§G.3, §G.5.2). What the base
+// answers is a base this deployment can't read, 422, but for its 410s
+// (pruned, gone or purged, levelErr); only no answer, or a 5xx, is 502
+// upstream. Keys this deployment can't get leave the base unreadable too.
 func fetchErr(what string, err error) *Error {
 	if ae, ok := client.AsAPIError(err); ok {
 		switch {
 		case ae.Status == 404:
 			return invalid(fmt.Sprintf("%s: not found at the base (at not in its chain, or not readable)", what))
 		case ae.Status == 401 || ae.Status == 403:
-			return remoteErr("%s: the base refused access (%d)", what, ae.Status)
+			return invalid(fmt.Sprintf("%s: the base refused access (%d), so this deployment can't read it; "+
+				"the endpoint's grant needs unrestricted read there (§G.3, §G.5.2)", what, ae.Status))
 		case ae.Status == 410 && ae.Code == "pruned":
 			return apiErr(410, "pruned", "message", what+": history needed at at was pruned at the base", "horizon", ae.Horizon())
 		case ae.Status == 410:
 			return gone("message", what+": gone at the base")
+		case ae.Status >= 500:
+			return upstreamErr("%s: %d from the base", what, ae.Status)
 		}
-		return remoteErr("%s: %d from the base", what, ae.Status)
+		return invalid(fmt.Sprintf("%s: the base answered %d, so this deployment can't read it (§G.3)", what, ae.Status))
 	}
 	if errors.Is(err, client.ErrNoKeys) {
-		return remoteErr("%s: the base is sealed (Addendum E.2) and its keys aren't available to this deployment; "+
-			"the endpoint's grant must get them from the base's POST /ns/{ns}/keys (§G.5)", what)
+		return invalid(fmt.Sprintf("%s: the base is sealed (Addendum E.2) and its keys aren't available to this deployment, so it can't read it; "+
+			"the endpoint's grant must get them from the base's POST /ns/{ns}/keys (§G.5.2)", what))
 	}
-	return remoteErr("%s: %v", what, err)
+	return upstreamErr("%s: %v", what, err)
 }
 
 // schemaFetchErr maps a failed fetch of a referenced schema revision from
 // its namespace at the base (§G.3): a revision that doesn't resolve there,
 // as with a draft in a branch (§6.1), or that is purged there, can't be
 // mirrored, and creation fails with 422 (§12: unknown, purged or
-// unreadable). A schema namespace isn't in the base's chain, so its purge
-// is no purged base (purgedBase).
+// unreadable, as a 401 or 403 is). A schema namespace isn't in the base's
+// chain, so its purge is no purged base (purgedBase).
 func schemaFetchErr(ref schema.Ref) func(string, error) *Error {
 	return func(what string, err error) *Error {
-		if ae, ok := client.AsAPIError(err); ok && (ae.Status == 404 || ae.Status == 410 && ae.Code != "pruned") {
+		if ae, ok := client.AsAPIError(err); ok && (ae.Status == 404 || ae.Status == 401 || ae.Status == 403 || ae.Status == 410 && ae.Code != "pruned") {
 			return apiErr(422, "schema_unavailable", "ref", ref.Path(), "message",
 				ref.Path()+" doesn't resolve in "+ref.NS+" at the base (a draft in a branch there, §6.1, purged, or unreadable); "+
 					"a remote branch mirrors schema revisions only from their own namespace (§G.3)")
@@ -544,15 +564,14 @@ func fetchLevel(ctx context.Context, c *client.Client, origin, ns, at string, ma
 
 // unknownLevel refuses a remote branch whose base's namespace document
 // can't be read at at: without it, B can't tell how protected the base is
-// (§G.5.2). A transport failure stays a 502; anything the base answered,
-// or a document B can't open, is 422.
+// (§G.5.2). No answer, or a 5xx, stays a 502; anything else the base
+// answered, or a document B can't open, is 422.
 func unknownLevel(base *BaseRef, err error) *Error {
 	what := "/ns/" + base.NS + "/rev/" + base.At
 	msg := fmt.Sprintf("%s: this deployment can't read the base's namespace document (%v), so it can't tell how protected the base is; "+
 		"a remote branch is refused then (§G.5.2): the endpoint's grant needs read on it, and keys if it is sealed", what, err)
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		return remoteErr("%s", msg)
+	if noAnswer(err) {
+		return upstreamErr("%s", msg)
 	}
 	return invalid(msg)
 }
@@ -630,17 +649,23 @@ func (e *Engine) shadowEncryption(ns string, enc map[string]any) (map[string]any
 // fetched and verified too, each as of the at of the branch above it, and
 // every read-through head is verified against the log of the base that
 // wrote it.
-func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror, *Error) {
+func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirror, failed *Error) {
+	defer func() {
+		// A 502 names the remote base's deployment (§12.1).
+		if failed != nil && failed.Code() == "upstream" {
+			failed.Body["origin"] = base.Origin
+		}
+	}()
 	c, _, err := e.remoteClient(base.Origin)
 	if err != nil {
-		return nil, remoteErr("%s: %v", base.Origin, err)
+		return nil, upstreamErr("%s: %v", base.Origin, err)
 	}
 	root, err := c.Root(ctx)
 	if err != nil {
 		return nil, fetchErr("GET /", err)
 	}
 	if root.Origin != base.Origin {
-		return nil, remoteErr("the deployment reached for %s publishes the origin %q", base.Origin, root.Origin)
+		return nil, upstreamErr("the deployment reached for %s publishes the origin %q", base.Origin, root.Origin)
 	}
 	m := &remoteMirror{base: base, read: "grant"}
 	// A 410 purged for a namespace's URLs names it (levelErr). A's own
