@@ -690,3 +690,81 @@ func TestV073RotationAfterRevokeRetried(t *testing.T) {
 		t.Fatalf("still due: %v", due)
 	}
 }
+
+// P18 review (ENC-17, §E.2.3 "as /edge-grants does", §C.5.2): an e2e
+// /keys request that is refused (422, the grant has no enc) draws no
+// exchangeRate token; the principal's next, valid request gets its keys.
+func TestV073E2EKeysRefusalDrawsNoToken(t *testing.T) {
+	t.Parallel()
+	f := newE2E(t, withExchangeRate(core.Rate{Rate: 0.001, Burst: 1}))
+	e := f.tenv
+	noEnc := e.grant(f.writer, "user:reader", []string{"e"}, []string{"read"})
+	if _, r := e.keysOf("e", nil, noEnc); r.Code != 422 {
+		t.Fatalf("e2e /keys without enc: %d %s", r.Code, r.Body)
+	}
+	if _, r := e.keysOf("e", nil, f.readerG); r.Code != 200 {
+		t.Fatalf("after a refused request: %d %s", r.Code, r.Body)
+	}
+	if _, r := e.keysOf("e", nil, f.readerG); r.Code != 429 {
+		t.Fatalf("a second valid request within the burst of 1: %d %s", r.Code, r.Body)
+	}
+}
+
+// P18 review (§E.2.4): with -rotate-on-revoke the rotation is recorded as
+// due with the revocation, and any new epoch clears it: one an operator's
+// config write begins counts as the rotation, so the retry doesn't rotate
+// again; and a revocation whose rotation succeeds leaves nothing due.
+func TestV073RotationDueClearedByNewEpoch(t *testing.T) {
+	t.Parallel()
+	ks := &flakyKeyStore{KeyStore: newKeyStore(t)}
+	e := newAuthEnv(t, withKeyStore(ks), withEncTuning, func(o *core.Options) { o.RotateOnRevoke = true })
+	k := newKey("k")
+	e.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{k.entry("*")}}))
+	star := e.grant(k, "user:admin", []string{"s"}, []string{"config", "read"})
+	ctx := context.Background()
+	ks.failing.Store(true)
+	expect(t, e.patchNS("s", ops(op("add", "/revoked", []any{"1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})), star), 201)
+	ks.failing.Store(false)
+	if due, _ := e.e.RotationsDue(ctx); len(due) != 1 {
+		t.Fatalf("due: %v", due)
+	}
+	expect(t, e.patchNS("s", ops(op("add", "/encryption/epoch", 2.0)), star), 201)
+	if due, _ := e.e.RotationsDue(ctx); len(due) != 0 {
+		t.Errorf("still due after a new epoch begun by a config write: %v", due)
+	}
+	if done, err := e.e.RetryRotations(ctx); err != nil || len(done) != 0 {
+		t.Errorf("retried a rotation a config write made: rotated %v again (%v)", done, err)
+	}
+	// A revocation whose rotation succeeds: epoch 3, nothing due.
+	expect(t, e.patchNS("s", ops(op("add", "/revoked/-", "1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")), star), 201)
+	if due, _ := e.e.RotationsDue(ctx); len(due) != 0 {
+		t.Errorf("due after a rotation that succeeded: %v", due)
+	}
+	h, err := seal.ParseHeader(string(e.get("/ns/s/rev/"+e.nsHead("s", star), star).Body))
+	if err != nil || h.Kid != "s#3" {
+		t.Errorf("namespace document after the second revocation: %v %v", h, err)
+	}
+}
+
+// P18 review (ENC-14, §7.4: historyEpochs "an integer ≥ 0", §E.2.3): with
+// historyEpochs 0, a grant gets keys for the current epoch alone, whatever
+// its nbf; 0 isn't read as "no cap".
+func TestV073HistoryEpochsZero(t *testing.T) {
+	t.Parallel()
+	e := newSealedAuthEnv(t)
+	k := newKey("k")
+	e.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{k.entry("*")}}))
+	long := map[string]any{"exp": t0.Add(10 * time.Hour).Format(time.RFC3339)}
+	star := e.grant(k, "user:admin", []string{"s"}, []string{"read", "config"}, long)
+	e.clock.Advance(time.Hour)
+	expect(t, e.patchNS("s", ops(op("add", "/encryption/epoch", 2.0)), star), 201)
+	early := e.grant(k, "user:r", []string{"s"}, []string{"read"}, map[string]any{"nbf": t0.Add(-time.Hour).Format(time.RFC3339)})
+	if _, r := e.keysOf("s", nil, early); kidsOf(t, r) != "s#1,s#2" {
+		t.Fatalf("without historyEpochs: %s", kidsOf(t, r))
+	}
+	expect(t, e.patchNS("s", ops(op("add", "/encryption/historyEpochs", 0.0)), star), 201)
+	if _, r := e.keysOf("s", nil, early); kidsOf(t, r) != "s#2" {
+		t.Errorf("historyEpochs 0: %s", kidsOf(t, r))
+	}
+	expect(t, e.patchNS("s", ops(op("replace", "/encryption/historyEpochs", -1.0)), star), 422)
+}

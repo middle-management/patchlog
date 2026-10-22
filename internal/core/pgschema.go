@@ -363,8 +363,9 @@ DO $$ DECLARE c record; BEGIN
 END $$;
 -- The one-time data migrations done (dataMigrations, db.go), by name.
 CREATE TABLE IF NOT EXISTS migrations (name text PRIMARY KEY);
--- P18: sealed namespaces whose rotation after a revocation failed,
--- retried until one succeeds (Options.RotateOnRevoke, sealed.go).
+-- P18: sealed namespaces whose rotation after a revocation is due,
+-- recorded with the revocation and cleared by the next new epoch;
+-- retried until then (Options.RotateOnRevoke, sealed.go).
 CREATE TABLE IF NOT EXISTS rotations_due (
   ns    bigint PRIMARY KEY REFERENCES namespaces,
   since bigint NOT NULL

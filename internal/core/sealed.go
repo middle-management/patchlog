@@ -123,6 +123,13 @@ func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == l
 // sealed document beginning a new epoch gets its epoch key, and with
 // -rotate-on-revoke a change that revokes access (a new revocation, a key
 // removed or changed) queues a rotation.
+//
+// The rotation is recorded as due (rotations_due) in the same transaction
+// as the revocation, for n and the sealed branches it reaches (§C.4), so
+// a rotation that fails after the commit, or a crash before it, is retried
+// (RetryRotations): a revoked reader mustn't keep the current epoch key
+// (§E.2.4). A new epoch, whoever begins it (a rotation, or an operator's
+// config write), is the rotation that was due.
 func (t *tx) sealedConfigWritten(n *nsRow, old, cfg *Config) {
 	t.e2eConfigWritten(n, old, cfg)
 	if cfg.level != levelSealed {
@@ -130,10 +137,27 @@ func (t *tx) sealedConfigWritten(n *nsRow, old, cfg *Config) {
 	}
 	if old == nil || old.level != levelSealed || old.Epoch != cfg.Epoch {
 		t.createEpochKey(n.id, cfg.Epoch)
+		_, err := t.Exec(`DELETE FROM rotations_due WHERE ns = ?`, n.id)
+		t.must(err)
 		return
 	}
 	if revokesAccess(old, cfg) {
+		if t.e.opt.RotateOnRevoke {
+			t.markRotationDue(n)
+		}
 		t.rotate = append(t.rotate, n.name)
+	}
+}
+
+// markRotationDue records that n, and every sealed branch below it, needs
+// a rotation after a revocation (sealedConfigWritten).
+func (t *tx) markRotationDue(n *nsRow) {
+	if t.isSealedNS(n) {
+		_, err := t.Exec(`INSERT INTO rotations_due (ns, since) VALUES (?, ?) ON CONFLICT (ns) DO NOTHING`, n.id, t.now.UnixMilli())
+		t.must(err)
+	}
+	for _, b := range t.allBranchesOf(n) {
+		t.markRotationDue(b)
 	}
 }
 
@@ -512,9 +536,6 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			if n.purged {
 				return t.purgedNS(n)
 			}
-			if err := t.drawExchange(a); err != nil {
-				return err
-			}
 			keys, err := t.keysE2E(n, cfg, a, kr)
 			if err != nil {
 				return err
@@ -809,7 +830,7 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 			}
 		}
 	}
-	if h := cfg.HistoryEpochs; h > 0 && cfg.Epoch-h > first {
+	if h := cfg.HistoryEpochs; cfg.HistoryCapped && cfg.Epoch-h > first {
 		first = cfg.Epoch - h
 	}
 	var out []int
@@ -828,14 +849,29 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 // retention's): a new epoch key is created and content written from then on
 // is sealed under it. It returns the new epoch.
 func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error) {
-	var epoch int
-	err := e.update(ctx, func(t *tx) error {
+	epoch, _, err := e.rotateEpoch(ctx, ns, author, false)
+	return epoch, err
+}
+
+// rotateEpoch is RotateEpoch; with ifDue, it rotates only while ns has a
+// rotation due (rotations_due), checked under the namespace's lock, so the
+// rotation after a revocation and its retry never both rotate. rotated
+// reports whether it did.
+func (e *Engine) rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (epoch int, rotated bool, err error) {
+	err = e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(ns)
 		if n == nil {
 			return notFound()
 		}
 		if n.purged {
 			return t.purgedNS(n)
+		}
+		if ifDue {
+			var due int
+			t.must(t.QueryRow(`SELECT COUNT(*) FROM rotations_due WHERE ns = ?`, n.id).Scan(&due))
+			if due == 0 {
+				return nil
+			}
 		}
 		cur := t.config(n.configSeq)
 		if cur.level != levelSealed {
@@ -851,21 +887,20 @@ func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error
 		aid := t.authorID(author)
 		seq := t.insertConfig(n, p, aid)
 		t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, aid)
-		epoch = p.cfg.Epoch
-		// A rotation, whoever makes it, is the one a failed rotation
-		// after a revocation waited for.
-		_, err = t.Exec(`DELETE FROM rotations_due WHERE ns = ?`, n.id)
-		t.must(err)
+		// The new epoch clears a rotation that was due
+		// (sealedConfigWritten).
+		epoch, rotated = p.cfg.Epoch, true
 		return nil
 	})
-	return epoch, err
+	return epoch, rotated, err
 }
 
 // rotateAfterRevoke rotates each namespace a committed config write revoked
-// access in, and its sealed branches (revocations reach them, §C.4). One
-// that fails is recorded as due (rotations_due) and retried until a
-// rotation succeeds (RetryRotations), so that a revoked reader doesn't
-// keep the current epoch key with nothing but a log line (§E.2.4).
+// access in, and its sealed branches (revocations reach them, §C.4), while
+// their rotation is due. The revoking write recorded it as due
+// (sealedConfigWritten), so one that fails here is retried until a
+// rotation succeeds (RetryRotations), and a revoked reader doesn't keep the
+// current epoch key with nothing but a log line (§E.2.4).
 func (e *Engine) rotateAfterRevoke(names []string) {
 	ctx := context.Background()
 	seen := map[string]bool{}
@@ -876,9 +911,8 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 			continue
 		}
 		seen[ns] = true
-		if _, err := e.RotateEpoch(ctx, ns, RotateAuthor); err != nil {
+		if _, _, err := e.rotateEpoch(ctx, ns, RotateAuthor, true); err != nil {
 			log.Printf("rotate-on-revoke %s: %v (retried until a rotation succeeds)", ns, err)
-			e.markRotationDue(ctx, ns)
 		}
 		_ = e.read(ctx, func(t *tx) error {
 			if n := t.nsByName(ns); n != nil {
@@ -893,23 +927,8 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 	}
 }
 
-// markRotationDue records that sealed namespace ns needs a rotation that
-// failed (rotateAfterRevoke).
-func (e *Engine) markRotationDue(ctx context.Context, ns string) {
-	err := e.update(ctx, func(t *tx) error {
-		if n := t.nsByName(ns); n != nil && !n.purged {
-			_, err := t.Exec(`INSERT INTO rotations_due (ns, since) VALUES (?, ?) ON CONFLICT (ns) DO NOTHING`, n.id, t.now.UnixMilli())
-			t.must(err)
-		}
-		return nil
-	})
-	if err != nil {
-		log.Printf("rotate-on-revoke %s: recording the rotation as due: %v", ns, err)
-	}
-}
-
-// RotationsDue lists the namespaces whose rotation after a revocation
-// failed and hasn't succeeded since, by name.
+// RotationsDue lists the namespaces whose rotation after a revocation is
+// due: recorded with the revocation, and no new epoch begun since.
 func (e *Engine) RotationsDue(ctx context.Context) ([]string, error) {
 	var out []string
 	err := e.read(ctx, func(t *tx) error {
@@ -957,11 +976,14 @@ func (e *Engine) RetryRotations(ctx context.Context) ([]string, error) {
 			}
 			continue
 		}
-		if _, err := e.RotateEpoch(ctx, ns, RotateAuthor); err != nil {
+		_, rotated, err := e.rotateEpoch(ctx, ns, RotateAuthor, true)
+		if err != nil {
 			log.Printf("rotate-on-revoke %s: retry: %v", ns, err)
 			continue
 		}
-		done = append(done, ns)
+		if rotated {
+			done = append(done, ns)
+		}
 	}
 	return done, nil
 }

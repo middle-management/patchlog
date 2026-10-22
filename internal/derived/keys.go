@@ -25,8 +25,10 @@ type Info struct {
 	Epoch int    // encryption.epoch of a sealed or e2e namespace (default 1)
 	Pad   bool   // encryption.pad: sealed payloads are padded (§E.2.2)
 	// HistoryEpochs is encryption.historyEpochs: how many epochs before
-	// the current one readers get keys for (0: all, §E.2.3).
+	// the current one readers get keys for (§E.2.3), when HistoryCapped;
+	// all of them without it (§7.4).
 	HistoryEpochs int
+	HistoryCapped bool
 }
 
 // Protected reports whether views derived from the namespace are sealed.
@@ -43,8 +45,8 @@ func InfoOf(doc map[string]any) Info {
 		if f, ok := enc["epoch"].(float64); ok && f >= 1 {
 			in.Epoch = int(f)
 		}
-		if f, ok := enc["historyEpochs"].(float64); ok && f >= 1 {
-			in.HistoryEpochs = int(f)
+		if f, ok := enc["historyEpochs"].(float64); ok && f >= 0 {
+			in.HistoryEpochs, in.HistoryCapped = int(f), true
 		}
 	}
 	return in
@@ -227,7 +229,7 @@ func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey
 		return nil, err
 	}
 	first := 1
-	if in.HistoryEpochs > 0 {
+	if in.HistoryCapped {
 		first = max(1, in.Epoch-in.HistoryEpochs)
 	}
 	var out []ResourceKey

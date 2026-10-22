@@ -338,6 +338,11 @@ func (t *tx) keysE2E(n *nsRow, cfg *Config, a *actor, kr KeysRequest) ([]map[str
 	if enc == nil {
 		return nil, invalid("e2e namespaces relay only wrapped keys: the grant's root block needs enc, an X25519 public key (§E.2.3, §E.3.2)")
 	}
+	// Once nothing is refused, the request draws its exchangeRate token,
+	// as /edge-grants does (§E.2.3, §C.5.2).
+	if err := t.drawExchange(a); err != nil {
+		return nil, err
+	}
 	out := []map[string]any{}
 	seen := map[string]bool{} // kids relayed
 	add := func(entries []map[string]any) {
