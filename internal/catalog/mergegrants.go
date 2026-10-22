@@ -496,20 +496,27 @@ func (s *Service) IssueMerge(ctx context.Context, v, av *grant.Verified, batch m
 		out.Admin = true
 		return out, nil
 	}
+	// The batch's pairs of /resource and /action, as one alternative per
+	// action naming its resources, so the rule's forms stay within
+	// rulesPerGrant (§12.2) however many items the batch has.
 	var can []string
-	var alts []any
+	names := map[string][]any{}
 	for _, mi := range items {
 		for _, a := range mi.actions {
 			if !contains(can, a) {
 				can = append(can, a)
 			}
+			names[a] = append(names[a], mi.name)
 		}
-		alts = append(alts, map[string]any{"all": []any{
-			resourceRule(mi.name),
-			map[string]any{"op": "test", "path": "/action", "schema": map[string]any{"enum": toAny(mi.actions)}},
-		}})
 	}
 	sort.Strings(can)
+	alts := []any{}
+	for _, a := range can {
+		alts = append(alts, map[string]any{"all": []any{
+			map[string]any{"op": "test", "path": "/action", "value": a},
+			map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": names[a]}},
+		}})
+	}
 	for _, a := range can {
 		if !key.IsStar() && !contains(key.Can, a) {
 			return nil, forbidden("the merge key may not %s in %s", a, cat)
