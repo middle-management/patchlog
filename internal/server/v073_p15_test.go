@@ -697,3 +697,26 @@ func TestV073P15DryRunPurgedFrozen(t *testing.T) {
 		}
 	}
 }
+
+// §12.1 (GB-56): a remote registration's renewal (If-Match) with no
+// registration to renew is 412 stale without head, not head: null; one
+// that has a registration names its latest entry (§G.3).
+func TestV073P15RegistrationStaleWithoutHead(t *testing.T) {
+	t.Parallel()
+	a := newEnv(t, withOrigin(originA))
+	a.mkNS("main", map[string]any{"read": "public"})
+	a.create("main", "p", map[string]any{"n": 0.0})
+	at := a.nsHead("main")
+	r := a.register("main", "rel", at, hashID(t, "", []byte("x")), "b")
+	expectCode(t, r, 412, "stale")
+	if v, has := r.Obj()["head"]; has {
+		t.Fatalf("412 without a registration carries head %v: %s", v, r.Body)
+	}
+	reg := a.register("main", "rel", at, "", "b")
+	expect(t, reg, 201)
+	r = a.register("main", "rel", at, hashID(t, "", []byte("x")), "b")
+	expectCode(t, r, 412, "stale")
+	if h := r.Str("head"); h == "" || h != reg.Str("ns_id") {
+		t.Fatalf("412 with a registration: head %q, its entry %q: %s", h, reg.Str("ns_id"), r.Body)
+	}
+}
