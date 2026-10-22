@@ -153,8 +153,7 @@ func newCollector(load schema.Loader, keywords []string) *collector {
 		}
 	}
 	comp := jsonschema.NewCompiler()
-	comp.DefaultDraft(jsonschema.Draft2020)
-	comp.AssertFormat()
+	schema.Legacy.Configure(comp) // as stored revisions compile (§6.1)
 	comp.UseLoader(urlLoader(func(u string) (any, error) { return c.doc(u) }))
 	c.comp = comp
 	return c
@@ -411,7 +410,7 @@ func findAnchor(s any, name string, at pointer.Pointer) (pointer.Pointer, bool) 
 			if p, ok := sub(v, k); ok {
 				return p, true
 			}
-		case "properties", "patternProperties", "$defs", "dependentSchemas":
+		case "properties", "patternProperties", "$defs", "definitions", "dependentSchemas":
 			if m, ok := v.(map[string]any); ok {
 				for _, n := range sortedKeys(m) {
 					if p, ok := sub(m[n], k, n); ok {
@@ -445,7 +444,7 @@ func (c *collector) regexp(re string) (*regexp.Regexp, error) {
 	if r, ok := c.regexps[re]; ok {
 		return r, nil
 	}
-	r, err := regexp.Compile(re)
+	r, err := schema.Legacy.CompileRegexp(re)
 	if err != nil {
 		return nil, &schema.SchemaError{Msg: fmt.Sprintf("patternProperties %q: %v", re, err)}
 	}

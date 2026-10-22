@@ -137,7 +137,8 @@ var (
 	ErrForbidden = errors.New("no read access to schema namespace")
 )
 
-// RefError reports a malformed or disallowed $schema, $ref or $id (422 schema_ref).
+// RefError reports a malformed or disallowed $schema, $ref or $dynamicRef,
+// or a stored schema's $id other than its own path (422 schema_ref).
 type RefError struct{ Msg string }
 
 func (e *RefError) Error() string { return "schema_ref: " + e.Msg }
@@ -203,11 +204,21 @@ var printer = message.NewPrinter(language.English)
 // closure). A schema evicted is loaded and compiled again when next used.
 // They were unbounded, so a deployment whose schemas get new revisions
 // kept every revision it ever validated against until restart.
+//
+// A schema compiles under the Rules marker of the revision a document's
+// $schema names (§6.1), so compiled schemas are kept by path and marker.
 type Validator struct {
 	mu       sync.Mutex
-	compiled lru.Cache[string, *jsonschema.Schema] // revision path -> compiled root
-	docs     lru.Cache[string, any]                // revision path -> checked schema document
-	meta     *jsonschema.Schema                    // draft 2020-12 meta-schema
+	compiled lru.Cache[compiledKey, *jsonschema.Schema] // revision path and marker -> compiled root
+	docs     lru.Cache[string, any]                     // revision path -> checked schema document
+	meta     *jsonschema.Schema                         // draft 2020-12 meta-schema, for schemas written now
+}
+
+// compiledKey keys a compiled schema: its revision path and the rules it
+// compiled under.
+type compiledKey struct {
+	path  string
+	rules Rules
 }
 
 // The schemas kept: compiled, and their documents (a compiled schema's
@@ -219,13 +230,13 @@ const (
 
 // NewValidator returns an empty Validator.
 func NewValidator() *Validator {
-	c := newCompiler(nil)
+	c := newCompiler(nil, V073)
 	meta, err := c.Compile(Dialect2020)
 	if err != nil {
 		panic("schema: compiling bundled meta-schema: " + err.Error())
 	}
 	return &Validator{
-		compiled: lru.Cache[string, *jsonschema.Schema]{MaxEntries: maxCompiledSchemas},
+		compiled: lru.Cache[compiledKey, *jsonschema.Schema]{MaxEntries: maxCompiledSchemas},
 		docs:     lru.Cache[string, any]{MaxEntries: maxSchemaDocs},
 		meta:     meta,
 	}
@@ -235,10 +246,9 @@ type urlLoaderFunc func(url string) (any, error)
 
 func (f urlLoaderFunc) Load(url string) (any, error) { return f(url) }
 
-func newCompiler(load urlLoaderFunc) *jsonschema.Compiler {
+func newCompiler(load urlLoaderFunc, r Rules) *jsonschema.Compiler {
 	c := jsonschema.NewCompiler()
-	c.DefaultDraft(jsonschema.Draft2020)
-	c.AssertFormat()
+	r.Configure(c)
 	if load == nil {
 		load = func(url string) (any, error) { return nil, fmt.Errorf("refusing to load %q", url) }
 	}
@@ -322,8 +332,19 @@ func Instance(doc any) any {
 	return out
 }
 
-// Validate implements §6.2 step 5 for a resulting document.
+// Validate implements §6.2 step 5 for a resulting document. A document
+// that is a schema (a dialect $schema) is checked as one written now:
+// in write mode (CheckSchemaDocument), compiled under V073. A schema
+// revision a document names compiles under Legacy, as every stored
+// revision does until revisions keep their markers (ValidateRules).
 func (v *Validator) Validate(doc any, load Loader) error {
+	return v.ValidateRules(doc, load, Legacy)
+}
+
+// ValidateRules is Validate, compiling the schema revision doc's $schema
+// names under rules, the marker it was written under (§6.1). The marker
+// of that revision governs its whole $ref closure.
+func (v *Validator) ValidateRules(doc any, load Loader, rules Rules) error {
 	obj, ok := doc.(map[string]any)
 	if !ok {
 		return nil
@@ -343,25 +364,30 @@ func (v *Validator) Validate(doc any, load Loader) error {
 	if !ok {
 		return &RefError{Msg: fmt.Sprintf("$schema %q is neither a schema revision path nor a supported dialect", s)}
 	}
-	sch, err := v.compile(ref, load)
+	sch, err := v.compile(ref, load, rules)
 	if err != nil {
 		return err
 	}
 	return toValidationError(sch.Validate(Instance(doc)))
 }
 
-// validateSchemaDocument checks a document whose $schema is a dialect URL.
+// validateSchemaDocument checks a document whose $schema is a dialect URL,
+// as a schema written now. A top-level $nonce or $successor that step 5
+// leaves out isn't a keyword: it is left out before the document is
+// checked against its dialect, checked and compiled (§6.5).
 func (v *Validator) validateSchemaDocument(doc any, load Loader) error {
+	doc = leaveOut(doc)
 	if err := toValidationError(v.meta.Validate(doc)); err != nil {
 		return err
 	}
 	if err := CheckSchemaDocument(doc, ""); err != nil {
 		return err
 	}
-	// Compile it too, so unresolvable fragments and unavailable revisions are
-	// caught now rather than when a document first references this schema.
+	// Compile it too, so unresolvable fragments, plain names no anchor
+	// defines and unavailable revisions are caught now rather than when a
+	// document first references this schema (§6.1).
 	var loadErr error
-	c := newCompiler(v.urlLoader(load, &loadErr))
+	c := newCompiler(v.urlLoader(load, &loadErr), V073)
 	if err := c.AddResource(newSchemaURL, doc); err != nil {
 		return &SchemaError{Msg: err.Error()}
 	}
@@ -374,16 +400,17 @@ func (v *Validator) validateSchemaDocument(doc any, load Loader) error {
 	return nil
 }
 
-func (v *Validator) compile(ref Ref, load Loader) (*jsonschema.Schema, error) {
+func (v *Validator) compile(ref Ref, load Loader, rules Rules) (*jsonschema.Schema, error) {
 	path := ref.Path()
+	key := compiledKey{path, rules}
 	v.mu.Lock()
-	sch, _ := v.compiled.Get(path)
+	sch, _ := v.compiled.Get(key)
 	v.mu.Unlock()
 	if sch != nil {
 		return sch, nil
 	}
 	var loadErr error
-	c := newCompiler(v.urlLoader(load, &loadErr))
+	c := newCompiler(v.urlLoader(load, &loadErr), rules)
 	sch, err := c.Compile(syntheticBase + path)
 	if err != nil {
 		if loadErr != nil {
@@ -392,10 +419,10 @@ func (v *Validator) compile(ref Ref, load Loader) (*jsonschema.Schema, error) {
 		return nil, &SchemaError{Msg: err.Error()}
 	}
 	v.mu.Lock()
-	if prev, _ := v.compiled.Get(path); prev != nil {
+	if prev, _ := v.compiled.Get(key); prev != nil {
 		sch = prev
 	} else {
-		v.compiled.Put(path, sch, 1)
+		v.compiled.Put(key, sch, 1)
 	}
 	v.mu.Unlock()
 	return sch, nil
@@ -444,7 +471,7 @@ func (v *Validator) urlLoader(load Loader, loadErr *error) urlLoaderFunc {
 		if err := checkStoredSchema(doc, path); err != nil {
 			return fail(err)
 		}
-		doc = jsonv.Clone(doc)
+		doc = jsonv.Clone(leaveOut(doc))
 		v.mu.Lock()
 		if prev, ok := v.docs.Get(path); ok {
 			doc = prev
@@ -456,7 +483,9 @@ func (v *Validator) urlLoader(load Loader, loadErr *error) urlLoaderFunc {
 	}
 }
 
-// checkStoredSchema defensively re-checks a schema loaded by revision path.
+// checkStoredSchema defensively re-checks a schema loaded by revision
+// path, in stored mode (CheckSchemaDocument): a schema stored under an
+// earlier version is compiled as that version did (§6.1).
 func checkStoredSchema(doc any, path string) error {
 	switch d := doc.(type) {
 	case bool:

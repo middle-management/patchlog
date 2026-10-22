@@ -295,13 +295,12 @@ func TestDialectDocuments(t *testing.T) {
 	invalid := map[string]want{
 		`{` + d + `,"foo":1}`:                                              wantSchema,
 		`{` + d + `,"properties":{"a":{"foo":1}}}`:                         wantSchema,
-		`{` + d + `,"allOf":[{"definitions":{}}]}`:                         wantSchema,
 		`{` + d + `,"$ref":"http://x"}`:                                    wantRef,
 		`{` + d + `,"items":{"$ref":"/r/a/b"}}`:                            wantRef,
 		`{` + d + `,"$ref":"https://patchlog.invalid` + pathAddress + `"}`: wantRef,
 		`{` + d + `,"$dynamicRef":"` + pathAddress + `"}`:                  wantRef,
-		`{` + d + `,"$id":"` + pathAddress + `"}`:                          wantRef,
-		`{` + d + `,"$defs":{"x":{"$id":"x"}}}`:                            wantRef,
+		`{` + d + `,"$id":"` + pathAddress + `"}`:                          wantSchema,
+		`{` + d + `,"$defs":{"x":{"$id":"x"}}}`:                            wantSchema,
 		`{` + d + `,"pattern":"^(?=a)"}`:                                   wantBad,
 		`{` + d + `,"patternProperties":{"(a)\\1":{}}}`:                    wantBad,
 		`{` + d + `,"type":"nope"}`:                                        wantInvalid,
@@ -345,7 +344,9 @@ func TestCheckSchemaDocumentSelfID(t *testing.T) {
 	if err := CheckSchemaDocument(doc, pathAddress); !errors.As(err, &re) {
 		t.Fatalf("got %v", err)
 	}
-	if err := CheckSchemaDocument(doc, ""); !errors.As(err, &re) {
+	// Written, any $id is invalid (§6.1).
+	var se *SchemaError
+	if err := CheckSchemaDocument(doc, ""); !errors.As(err, &se) {
 		t.Fatalf("got %v", err)
 	}
 }
@@ -550,13 +551,13 @@ func TestValidatorCachesBounded(t *testing.T) {
 	if v.compiled.Len() > maxCompiledSchemas || v.docs.Len() > maxSchemaDocs {
 		t.Fatalf("%d compiled, %d documents kept", v.compiled.Len(), v.docs.Len())
 	}
-	if _, ok := v.compiled.Get(path(0)); ok {
+	if _, ok := v.compiled.Get(compiledKey{path(0), Legacy}); ok {
 		t.Fatal("the least recently used schema kept")
 	}
 	if err := v.Validate(map[string]any{"$schema": path(0)}, load); err == nil {
 		t.Fatal("an evicted schema no longer validates")
 	}
-	if _, ok := v.compiled.Get(path(0)); !ok {
+	if _, ok := v.compiled.Get(compiledKey{path(0), Legacy}); !ok {
 		t.Fatal("an evicted schema wasn't compiled again")
 	}
 }
