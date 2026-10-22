@@ -147,15 +147,23 @@ func (g *Grant) ChainVerified() bool { return g.chainKey.Load() != nil }
 // ID is the grant id of §C.3: trunc160(sha256(canonical(root block))).
 func (g *Grant) ID() ids.ID { return ids.Of(jsonv.Canonical(g.Blocks[0].Raw)) }
 
-// RevocationIDs returns the revocation id of every block, in order:
-// text(trunc160(sha256(its Biscuit signature))) (§C.4, §C.8).
+// RevocationIDs returns the revocation id of every block, in order (§C.4,
+// §C.8): the root block's is its grant id (ID), so revoking it revokes
+// every token minted with that root block, however re-serialised or
+// re-minted; a narrowing block's is text(trunc160(sha256(its Biscuit
+// signature))).
 func (g *Grant) RevocationIDs() []string {
 	out := make([]string, len(g.c.blocks))
 	for i, sb := range g.c.blocks {
 		out[i] = ids.Of(sb.sig).String()
 	}
+	out[0] = g.ID().String()
 	return out
 }
+
+// rootSigID is the text id of the root block's signature, its revocation
+// id before v0.71, which Verify still honours in revoked lists (§C.4).
+func (g *Grant) rootSigID() string { return ids.Of(g.c.blocks[0].sig).String() }
 
 // Stored is the non-bearer form (§C.3): the Biscuit without its proof.
 func (g *Grant) Stored() []byte {
