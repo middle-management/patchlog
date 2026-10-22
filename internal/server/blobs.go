@@ -91,7 +91,7 @@ func (s *Server) blobGet(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.e.OpenBlob(r.Context(), ns, name, bid, creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}
 		writeErr(w, err)
@@ -120,7 +120,7 @@ func (s *Server) blobEpochGet(w http.ResponseWriter, r *http.Request) {
 	}
 	b, err := s.e.OpenSealedBlob(r.Context(), ns, name, bid, ep, creds(r))
 	if err != nil {
-		if s.writeErrShort(w, r, err) {
+		if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 			return
 		}
 		writeErr(w, err)
@@ -145,13 +145,13 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, eta
 		noStore(w)
 		writeJSON(w, b.Status, map[string]any{"code": "not_found"})
 	case b.Status == 404:
-		s.cache(w, r, ccShort, b.Public)
+		s.cache(w, r, ccShort, b.Public, resTags(ns, name)...)
 		writeJSON(w, 404, map[string]any{"code": "not_found"})
 	case b.Code == "pruned":
 		s.cache(w, r, ccPruned, b.Public, resTags(ns, name)...)
 		writeJSON(w, 410, prunedBody(b.Horizon, b.Archive))
 	case b.Status == 410:
-		s.cache(w, r, ccLong, b.Public)
+		s.cache(w, r, ccLong, b.Public, resTags(ns, name)...)
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
 }

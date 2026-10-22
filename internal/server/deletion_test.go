@@ -190,10 +190,12 @@ func TestPurgeNamespace(t *testing.T) {
 	expect(t, e.do(req{method: "PATCH", path: "/ns/old", ifNoneMatch: "*", body: addRoot(map[string]any{}), author: "admin"}), 412)
 	expect(t, e.branch("old", map[string]any{"name": "oldc"}, "alice"), 410)
 	expect(t, nspurge("old"), 410)
-	// The listing reports the purged branch.
-	bl := e.get("/ns/old/branches").Arr()
-	if len(bl) != 1 || bl[0].(map[string]any)["purged"] != true {
-		t.Fatalf("branches of purged %v", bl)
+	// Its branch listing, which listed the purged branch oldb before
+	// v0.60, is 410 purged, long (§7.4, §8.5).
+	bl := e.get("/ns/old/branches")
+	expectCode(t, bl, 410, "purged")
+	if bl.Str("head") != e.nsHead("old") || bl.H.Get("Cache-Control") != ccLong {
+		t.Fatalf("branches of purged %d %s %v", bl.Code, bl.Body, bl.H)
 	}
 }
 

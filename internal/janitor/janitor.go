@@ -243,6 +243,11 @@ type candidate struct{ base, ns string }
 // walk lists ns's live branches, each after its own branches.
 func (j *Janitor) walk(ctx context.Context, ns string) ([]candidate, error) {
 	brs, err := j.c.Branches(ctx, ns)
+	if client.IsPurged(err) {
+		// A purged namespace's /branches is 410 (§7.4, §8.5): every
+		// branch was purged before it (§2.1).
+		return nil, nil
+	}
 	if err != nil {
 		return nil, fmt.Errorf("janitor: branches of %s: %w", ns, err)
 	}
@@ -1353,6 +1358,9 @@ func (j *Janitor) Run(ctx context.Context) error {
 		}
 		cp.Save(origin, ns, h.ID)
 		brs, err := j.c.Branches(ctx, ns)
+		if client.IsPurged(err) {
+			return nil // a purged namespace has no live branches (§8.5)
+		}
 		if err != nil {
 			return err
 		}

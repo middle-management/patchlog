@@ -73,3 +73,27 @@ console.log(out.join(' '));`
 		t.Fatalf("X-Author %s, want %s", out, want)
 	}
 }
+
+// A sealed document's ETag is "{id}.{e}" (§E.2.2, RH-12): the page takes
+// the id from it, as from any tag, for the URLs and preconditions it
+// builds.
+func TestV073SealedETagIDWithNode(t *testing.T) {
+	t.Parallel()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed")
+	}
+	js, err := assets.ReadFile("static/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := jsFunction(t, js, "etagID") + `
+console.log([etagID('"1abc.2"'), etagID('W/"1abc.13"'), etagID('"1abc"')].join(' '));`
+	out, err := exec.Command(node, "-e", src).CombinedOutput()
+	if err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if want := "1abc 1abc 1abc"; strings.TrimSpace(string(out)) != want {
+		t.Fatalf("etagID %s, want %s", out, want)
+	}
+}

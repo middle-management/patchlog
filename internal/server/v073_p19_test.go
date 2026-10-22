@@ -281,3 +281,133 @@ func TestV073HeadsShape(t *testing.T) {
 		t.Fatalf("empty page %s", r.Body)
 	}
 }
+
+// §7.1, §7.4, §E.2.2 (RH-12, ENC-6): a sealed 200 of /rev/{id} and of
+// /ns/{ns}/rev/{ns_id} has ETag "{id}.{e}", e the stored sealing's epoch,
+// which If-None-Match is compared with; "{id}" alone, perhaps served in
+// plaintext before the namespace was sealed, doesn't match. Writes take
+// the id without .{e}.
+func TestV073SealedETagNamesEpoch(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t)
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+	a1 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	ns1 := e.nsHead("s")
+	expect(t, e.patchNS("s", ops(op("add", "/encryption/epoch", 2.0)), ""), 201)
+	a2 := e.wr("s", "a", a1, withNonce(ops(op("replace", "/v", 2.0)))) // If-Match "{a1}"
+	ns2 := e.nsHead("s")
+	for _, c := range []struct{ path, id, e string }{
+		{"/r/s/a/rev/" + a1, a1, "1"},
+		{"/r/s/a/rev/" + a2, a2, "2"},
+		{"/ns/s/rev/" + ns1, ns1, "1"},
+		{"/ns/s/rev/" + ns2, ns2, "2"},
+	} {
+		r := e.get(c.path)
+		expect(t, r, 200)
+		tag := quote(c.id + "." + c.e)
+		if !isJOSE(r) || r.H.Get("ETag") != tag {
+			t.Errorf("%s: ETag %q, want %s", c.path, r.H.Get("ETag"), tag)
+		}
+		for inm, want := range map[string]int{tag: 304, "W/" + tag: 304, `"x", ` + tag: 304, quote(c.id): 200, quote(c.id + ".9"): 200} {
+			if got := e.do(req{method: "GET", path: c.path, hdr: map[string]string{"If-None-Match": inm}}); got.Code != want {
+				t.Errorf("%s If-None-Match %s: %d, want %d", c.path, inm, got.Code, want)
+			}
+		}
+	}
+	// Head pointers keep "{id}".
+	if h := e.get("/r/s/a"); h.H.Get("ETag") != quote(a2) {
+		t.Errorf("head pointer ETag %q", h.H.Get("ETag"))
+	}
+	if h := e.get("/ns/s"); h.H.Get("ETag") != quote(ns2) {
+		t.Errorf("namespace head pointer ETag %q", h.H.Get("ETag"))
+	}
+	// A namespace that isn't sealed keeps "{id}".
+	e.mkNS("p", map[string]any{"read": "public"})
+	p1 := e.create("p", "a", map[string]any{})
+	if r := e.get("/r/p/a/rev/" + p1); r.H.Get("ETag") != quote(p1) {
+		t.Errorf("plain ETag %q", r.H.Get("ETag"))
+	}
+}
+
+// §7.4, §8.5 (RH-19, BBD-10): once the namespace is purged, /branches is
+// 410 purged with head, after the unrestricted-read check, in the long
+// class with the namespace's tag.
+func TestV073BranchesOfPurgedNamespace(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	expect(t, e.patchNS("sec", ops(op("add", "/frozen", true)), f.adminG), 201)
+	expect(t, e.do(req{method: "POST", path: "/ns/sec/purge", ifMatch: e.nsHead("sec", f.adminG), bearer: f.adminG}), 204)
+	head := e.nsHead("sec", f.adminG)
+	r := e.get("/ns/sec/branches", f.adminG)
+	expectCode(t, r, 410, "purged")
+	if r.Str("head") != head {
+		t.Errorf("head %q, want the purge-ns entry %s", r.Str("head"), head)
+	}
+	if cc := r.H.Get("Cache-Control"); cc != "private, max-age=0" && cc != ccLong {
+		t.Errorf("Cache-Control %q", cc)
+	}
+	if r.H.Get("Cache-Tag") != "ns:sec" {
+		t.Errorf("Cache-Tag %q", r.H.Get("Cache-Tag"))
+	}
+	// Without unrestricted read, the read check answers first, as for a
+	// namespace that isn't purged.
+	limited := e.grant(f.issuer, "user:l", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
+	if r := e.get("/ns/sec/branches", limited); r.Code != 404 {
+		t.Errorf("limited reader: %d %s, want the read check's 404", r.Code, r.Body)
+	}
+	// A public namespace's 410 is cached long.
+	p := newEnv(t)
+	p.mkNS("pub", map[string]any{"read": "public"})
+	expect(t, p.patchNS("pub", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, p.do(req{method: "POST", path: "/ns/pub/purge", ifMatch: p.nsHead("pub"), author: "admin"}), 204)
+	r = p.get("/ns/pub/branches")
+	expectCode(t, r, 410, "purged")
+	if r.H.Get("Cache-Control") != ccLong || r.H.Get("Cache-Tag") != "ns:pub" {
+		t.Errorf("public 410: %v", r.H)
+	}
+}
+
+// §9 (RH-45): Short answers (unknown-id 404) and Long answers (410 of a
+// purged resource or namespace) carry ns:{ns}, and r:{ns}/{name} on
+// resource URLs, so a purge of either tag clears them.
+func TestV073ShortAndLongAnswersTagged(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	a := e.create("m", "a", map[string]any{})
+	bid := e.upload("m", "a", "text/plain", []byte("hi"))
+	unknown := hashID(t, "", []byte("nothing"))
+	res := "ns:m,r:m/a"
+	check := func(path string, code int, class, tags string) {
+		t.Helper()
+		r := e.get(path)
+		if r.Code != code || r.H.Get("Cache-Control") != class || r.H.Get("Cache-Tag") != tags {
+			t.Errorf("%s: %d %q %q, want %d %q %q", path, r.Code, r.H.Get("Cache-Control"), r.H.Get("Cache-Tag"), code, class, tags)
+		}
+	}
+	check("/r/m/nope", 404, ccShort, "ns:m,r:m/nope")
+	check("/r/m/a/rev/"+unknown, 404, ccShort, res)
+	check("/r/m/a/rev/"+unknown+"/log", 404, ccShort, res)
+	check("/r/m/a/rev/"+unknown+"/raw", 404, ccShort, res)
+	check("/r/m/a/blob/"+unknown, 404, ccShort, res)
+	check("/r/m/a/log", 302, ccHead, res)
+	check("/r/m/nope/log", 404, ccShort, "ns:m,r:m/nope")
+	check("/ns/m/rev/"+unknown, 404, ccShort, "ns:m")
+	check("/ns/m/rev/"+unknown+"/log", 404, ccShort, "ns:m")
+	check("/ns/m/rev/"+unknown+"/heads", 404, ccShort, "ns:m")
+	check("/ns/m/grants/"+unknown, 404, ccShort, "ns:m")
+	expect(t, e.purge("m", "a", a, "admin"), 204)
+	check("/r/m/a", 410, ccLong, res)
+	check("/r/m/a/rev/"+a, 410, ccLong, res)
+	check("/r/m/a/rev/"+a+"/log", 410, ccLong, res)
+	check("/r/m/a/blob/"+bid, 410, ccLong, res)
+	check("/r/m/a/log", 410, ccLong, res)
+	// A purged namespace's URLs (§8.5).
+	expect(t, e.patchNS("m", ops(op("add", "/frozen", true)), ""), 201)
+	expect(t, e.do(req{method: "POST", path: "/ns/m/purge", ifMatch: e.nsHead("m"), author: "admin"}), 204)
+	head := e.nsHead("m")
+	check("/r/m/b", 410, ccLong, "ns:m,r:m/b")
+	check("/ns/m/rev/"+head+"/heads", 410, ccLong, "ns:m")
+	check("/ns/m/branches", 410, ccLong, "ns:m")
+}

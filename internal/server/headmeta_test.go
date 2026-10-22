@@ -227,7 +227,7 @@ func TestHeadMetaEncrypted(t *testing.T) {
 			t.Fatalf("sealed revision %s: %v", id, r.H)
 		}
 		e.noRevMeta("/r/s/x/rev/" + id)
-		if c := e.do(req{method: "GET", path: "/r/s/x/rev/" + id, hdr: map[string]string{"If-None-Match": quote(id)}}); c.Code != 304 {
+		if c := e.do(req{method: "GET", path: "/r/s/x/rev/" + id, hdr: map[string]string{"If-None-Match": quote(id + ".1")}}); c.Code != 304 {
 			t.Fatalf("sealed If-None-Match: %d", c.Code)
 		}
 	}

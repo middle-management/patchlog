@@ -57,7 +57,7 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 		wait := s.e.Wait(ns)
 		lg, err := fetch(r.Context(), since)
 		if err != nil {
-			if s.writeErrShort(w, r, err) {
+			if s.writeErrShort(w, r, err, tags...) {
 				return
 			}
 			writeErr(w, err)
@@ -128,7 +128,7 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 	if !live {
 		h, err := s.e.ResourceHead(r.Context(), ns, name, creds(r))
 		if err != nil {
-			if s.writeErrShort(w, r, err) {
+			if s.writeErrShort(w, r, err, resTags(ns, name)...) {
 				return
 			}
 			writeErr(w, err)
@@ -141,10 +141,10 @@ func (s *Server) resourceLive(w http.ResponseWriter, r *http.Request) {
 			}
 			if code == 404 {
 				// Unknown resource: §9's short class, as resourceHead does.
-				s.cache(w, r, ccShort, h.Public)
+				s.cache(w, r, ccShort, h.Public, resTags(ns, name)...)
 			} else {
 				// A purged resource is 410, "long" (§9).
-				s.cache(w, r, ccLong, h.Public)
+				s.cache(w, r, ccLong, h.Public, resTags(ns, name)...)
 			}
 			writeJSON(w, code, map[string]any{"code": map[int]string{404: "not_found", 410: "gone"}[code]})
 			return

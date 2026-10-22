@@ -921,7 +921,8 @@ func (e *Engine) NamespaceHeads(ctx context.Context, ns, nsID, after string, cre
 	return out, err
 }
 
-// Branches lists a namespace's direct branches (§7.4).
+// Branches lists a namespace's direct branches (§7.4): once the namespace
+// is purged, 410 purged, after the unrestricted-read check (§8.5).
 func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]map[string]any, bool, error) {
 	var out []map[string]any
 	var public bool
@@ -932,6 +933,9 @@ func (e *Engine) Branches(ctx context.Context, ns string, cred Credentials) ([]m
 		}
 		if _, err := t.nsReader(n, cred); err != nil {
 			return err
+		}
+		if n.purged {
+			return t.purgedRead(n)
 		}
 		public = t.cachePublic(n)
 		out = []map[string]any{}

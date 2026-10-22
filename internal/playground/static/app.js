@@ -360,8 +360,9 @@ function wrap(e) {
   };
 }
 /* etagID is the id an ETag carries, unquoted: the server's are strong, but a proxy that compresses responses
- * makes them weak (W/"…"), around the same id, which would otherwise end up in URLs and preconditions. */
-function etagID(v) { return v ? v.trim().replace(/^W\//, '').replace(/^"|"$/g, '') : ''; }
+ * makes them weak (W/"…"), around the same id, which would otherwise end up in URLs and preconditions. A sealed
+ * document's tag adds .{e}, its sealing's epoch (§E.2.2), which ids never contain and preconditions leave out. */
+function etagID(v) { return v ? v.trim().replace(/^W\//, '').replace(/^"|"$/g, '').replace(/\.\d+$/, '') : ''; }
 
 /* purgedHead is the head a 410 purged names, the purge-ns entry's ns_id (§8.5), '' for any other answer. A purged
  * sealed namespace's documents and log are 410 purged too, and GET /ns/{ns} redirects to one, so this is how the page

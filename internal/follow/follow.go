@@ -314,6 +314,12 @@ func (n *nsFollower) run(ctx context.Context) error {
 // discoverBranches starts followers for the namespace's current branches.
 func (n *nsFollower) discoverBranches(ctx context.Context) error {
 	v, err := n.f.retryValue(ctx, n.ns, func() (any, error) { return n.f.c.Branches(ctx, n.ns) })
+	if client.IsPurged(err) {
+		// A purged namespace's /branches is 410 (§7.4, §8.5); it had no
+		// live branches left to purge it (§2.1), and its log still ends
+		// in the purge-ns entry its follower delivers.
+		return nil
+	}
 	if err != nil {
 		return err
 	}
