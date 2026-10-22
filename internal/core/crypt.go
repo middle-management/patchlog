@@ -515,8 +515,9 @@ func (t *tx) encryptResource(res int64) {
 // --- configuration checks -----------------------------------------------------
 
 // checkEncryption checks a namespace document's encryption level (§7.4,
-// Addendum E Levels): a key store is needed for any level, and a level is
-// never lowered or removed. cur is nil for a new namespace. baseLevel is
+// Addendum E Levels): a key store is needed for any level, a level is
+// never lowered or removed, and a raise to e2e starts a new epoch. cur is
+// nil for a new namespace. baseLevel is
 // the level of a branch's local base, -1 if there is none: a branch is at
 // least at its base's level, and e2e only over an e2e base, which its
 // creation and a raise to e2e are checked against; other config writes
@@ -538,10 +539,14 @@ func (t *tx) checkEncryption(cur, cfg *Config, baseLevel int) *Error {
 			return docInvalid("/encryption", "/encryption: a branch can be e2e only if its base is")
 		}
 	}
-	// End-to-end (§E.3) only from the start: an existing namespace's ids,
-	// documents and log are over plaintext.
-	if cur != nil && toE2E {
-		return docInvalid("/encryption", "/encryption: an existing namespace cannot become e2e; its content is already plaintext on the server (create a new e2e namespace)")
+	// A raise to e2e (Addendum E Levels, Changing it) starts a new epoch.
+	// From sealed it must be the current one plus one: the origin holds
+	// the earlier epochs' keys, so they mustn't seal anything written end
+	// to end. From none or at-rest, which have no epoch keys, any epoch
+	// from 1 serves (F-E1); an absent one is 1. What was stored before the
+	// raise keeps its level (e2eConfigWritten records the raise).
+	if cur != nil && toE2E && cur.level == levelSealed && cfg.Epoch != cur.Epoch+1 {
+		return docInvalid("/encryption/epoch", fmt.Sprintf("/encryption/epoch must be %d: a raise from sealed to e2e starts a new epoch, since the origin holds the keys of epoch %d and before (Addendum E Levels)", cur.Epoch+1, cur.Epoch))
 	}
 	// Epochs (§E.2.1): in a namespace already at sealed or e2e, the epoch
 	// only moves forward, one at a time. A new namespace or branch, or one

@@ -39,6 +39,13 @@ package core
 //     e2e_epochs records when each epoch began (for POST /keys and kid
 //     checks). A key holder rotates by re-wrapping the keyring and bumping
 //     the epoch, in one batch.
+//   - Raises (Addendum E Levels). A config write, or a batch's config
+//     change, may raise a namespace to e2e from none, at-rest or sealed,
+//     starting a new epoch (from sealed, the current one plus one;
+//     checkEncryption). e2e_raises records the raising configuration and
+//     what was in force before (e2eRaiseOf). Writes from the raising
+//     entry on are sealed ops; what was stored before stays plaintext on
+//     the server.
 //   - Reads. GET /r/{ns}/{name}/rev/{id} answers 302 to
 //     /r/{ns}/{name}/rev/{id}/log?since={s} with X-E2E: fold, where s is
 //     the latest client-supplied snapshot at or before id (omitted if none).
@@ -65,6 +72,7 @@ package core
 import (
 	"crypto/ecdh"
 	"database/sql"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -87,7 +95,13 @@ func (t *tx) isE2E(n *nsRow) bool { return t.nsLevel(n) == levelE2E }
 func (t *tx) e2eContent(n *nsRow, name string) bool { return name != KeyringName && t.isE2E(n) }
 
 // e2eConfigWritten records the start of an e2e namespace's epoch: its
-// creation (or a branch's), and every write that increments the epoch.
+// creation (or a branch's), a raise to e2e, and every write that
+// increments the epoch. A raise (Addendum E Levels) is recorded too, in
+// e2e_raises, with what was in force before it: from then on, the
+// raising entry's items included, writes go through the E3 gate, since
+// the configuration they are checked under is e2e (§7.5), and what was
+// stored before is served at the level before (P35). The new epoch is
+// the rotation a revocation made due, if any (§E.2.4).
 func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	if cfg.level != levelE2E {
 		return
@@ -97,6 +111,58 @@ func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	}
 	_, err := t.Exec(`INSERT INTO e2e_epochs (ns, epoch, created) VALUES (?,?,?) ON CONFLICT DO NOTHING`, n.id, cfg.Epoch, t.now.UnixMilli())
 	t.must(err)
+	if old == nil || old.level == levelE2E {
+		return
+	}
+	epoch, pad := 0, 0
+	if old.level == levelSealed {
+		epoch = old.Epoch
+		if old.Pad {
+			pad = 1
+		}
+	}
+	_, err = t.Exec(`INSERT INTO e2e_raises (ns, config_seq, level, epoch, pad, created) VALUES (?,?,?,?,?,?)`, n.id, n.configSeq, old.level, epoch, pad, t.now.UnixMilli())
+	t.must(err)
+	_, err = t.Exec(`DELETE FROM rotations_due WHERE ns = ?`, n.id)
+	t.must(err)
+}
+
+// e2eRaise is a namespace's raise to e2e (Addendum E Levels).
+type e2eRaise struct {
+	// configSeq is the configuration that made the namespace e2e; seq
+	// and id are the namespace entry (config or batch) that wrote it,
+	// before which the raise lies in the log.
+	configSeq, seq int64
+	id             ids.ID
+	// level is the level before the raise; from sealed, epoch and pad are
+	// the last epoch and pad setting before it, which content stored
+	// before the raise keeps (§E.2.2).
+	level int
+	epoch int
+	pad   bool
+}
+
+// e2eRaiseOf returns n's raise to e2e, nil for a namespace that was e2e
+// from its creation or isn't e2e. The raising entry is the first of n's
+// log written under the raising configuration or a later one.
+func (t *tx) e2eRaiseOf(n *nsRow) *e2eRaise {
+	r := &e2eRaise{}
+	var pad int
+	err := t.QueryRow(`SELECT config_seq, level, epoch, pad FROM e2e_raises WHERE ns = ?`, n.id).Scan(&r.configSeq, &r.level, &r.epoch, &pad)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	t.must(err)
+	r.pad = pad != 0
+	var id []byte
+	err = t.QueryRow(`SELECT seq, id FROM ns_log WHERE ns = ? AND config_seq >= ? ORDER BY config_seq, seq LIMIT 1`, n.id, r.configSeq).Scan(&r.seq, &id)
+	if errors.Is(err, sql.ErrNoRows) {
+		// The raising entry is being appended in this transaction.
+		return r
+	}
+	t.must(err)
+	r.id = ids.FromBytes(id)
+	return r
 }
 
 // e2eEpochOK reports whether epoch e of n may seal what is checked under
