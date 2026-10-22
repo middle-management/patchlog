@@ -710,3 +710,102 @@ func TestV073SealedPublicTargetRanksPublic(t *testing.T) {
 	// Into another namespace of the same deployment, it is ranked.
 	importErr(t, dst, ob.Bytes(), bundle.ImportOptions{NSMap: map[string]string{"own": "p"}}, "less protected")
 }
+
+// e2eChain writes a full-history bundle of e2e namespace ns: one document,
+// name, whose revisions have the patch sets given (nil for a tombstone),
+// and a keyring whose revisions are the keyrings given, if any.
+func e2eChain(t *testing.T, ns, name string, keyrings []*seal.Keyring, patchSets ...[]any) []byte {
+	t.Helper()
+	chain := func(res string, sets [][]any) (ls []bundle.Line, head string) {
+		for _, ps := range sets {
+			if ps == nil {
+				id := must(client.ExpectedTombstone(head))
+				ls = append(ls, bundle.Line{NS: ns, Resource: res, ID: id, Parent: head, Kind: "tombstone"})
+				head = id
+				continue
+			}
+			v := must(client.ToValue(ps))
+			id := must(client.ExpectedRevision(head, v))
+			ls = append(ls, bundle.Line{NS: ns, Resource: res, ID: id, Parent: head, Kind: "rev", Patches: v})
+			head = id
+		}
+		return ls, head
+	}
+	h := bundle.Header{Origin: stagingOrigin, Created: "2026-10-01T00:00:00Z", At: map[string]string{ns: ids.Hash(nil, []byte(ns)).String()},
+		Docs: map[string]bundle.DocInfo{}, Access: map[string]string{ns: bundle.AccessE2E}}
+	var all []bundle.Line
+	if len(keyrings) > 0 {
+		var sets [][]any
+		for _, kr := range keyrings {
+			sets = append(sets, ops(op("replace", "", kr.Value())))
+		}
+		sets[0] = client.GenesisPatches(keyrings[0].Value())
+		ls, head := chain("keyring", sets)
+		h.Docs[bundle.Key(ns, "keyring")] = bundle.DocInfo{History: bundle.Full, Head: head}
+		all = append(all, ls...)
+	}
+	ls, head := chain(name, patchSets)
+	h.Docs[bundle.Key(ns, name)] = bundle.DocInfo{History: bundle.Full, Head: head}
+	all = append(all, ls...)
+	var buf bytes.Buffer
+	w := must(bundle.NewWriter(&buf, h))
+	for _, l := range all {
+		noErr(t, w.Line(l))
+	}
+	must(w.Close())
+	return buf.Bytes()
+}
+
+// sealedSet is a sealed patch set (§E.3.1) under kid, bound to pl.ns ns.
+func sealedSet(t *testing.T, key []byte, kid, ns, name, parent string, patches []any) []any {
+	t.Helper()
+	ps, err := seal.SealPatchSet(key, kid, ns, name, parent, jsonv.FromGo(patches))
+	noErr(t, err)
+	return jsonv.MustParse(ps).([]any)
+}
+
+// For an e2e source, every rev line but the keyring's is one sealed op
+// whose pl.ns and kid name the line's ns, or a restore's []: anything else
+// refuses the bundle at step 1, before anything is written (§G.5.1,
+// MF-53).
+func TestV073E2ELinesAtStep1(t *testing.T) {
+	t.Parallel()
+	k := seal.NewKey()
+	reader := identity(t)
+	kr := must(seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{reader.PublicKey()}))
+	g := client.GenesisPatches(map[string]any{"v": 1.0})
+	for name, c := range map[string]struct {
+		sets [][]any
+		want string
+	}{
+		"plaintext history": {[][]any{g}, "isn't one sealed op or a restore's []"},
+		"base's kid":        {[][]any{sealedSet(t, k, "base#1", "base", "d", "", g)}, `sealed under kid "base#1" with pl.ns "base"`},
+		"base's pl.ns":      {[][]any{sealedSet(t, k, "e#1", "base", "d", "", g)}, `sealed under kid "e#1" with pl.ns "base"`},
+		"two ops": {[][]any{append(sealedSet(t, k, "e#1", "e", "d", "", g), sealedSet(t, k, "e#1", "e", "d", "", g)...)},
+			"isn't one sealed op"},
+		"plaintext after sealed": {[][]any{sealedSet(t, k, "e#1", "e", "d", "", g), ops(op("add", "/w", 2.0))}, "isn't one sealed op"},
+	} {
+		b := e2eChain(t, "e", "d", []*seal.Keyring{kr}, c.sets...)
+		dst := newEncDeployment(t, cmsOrigin)
+		_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true, AllowLessProtected: true})
+		var ae *bundle.AccessError
+		if !errors.As(err, &ae) || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: %v, want an access error containing %q", name, err, c.want)
+			continue
+		}
+		if _, err := dst.c.NSHead(ctx, "e"); !client.IsNotFound(err) {
+			t.Errorf("%s: the refused import created e: %v", name, err)
+		}
+	}
+	// One sealed op per line, a tombstone and a restore's [] import.
+	s1 := sealedSet(t, k, "e#1", "e", "d", "", g)
+	id1 := must(client.ExpectedRevision("", must(client.ToValue(s1))))
+	s2 := sealedSet(t, k, "e#1", "e", "d", id1, ops(op("add", "/w", 2.0)))
+	id2 := must(client.ExpectedRevision(id1, must(client.ToValue(s2))))
+	restore := must(client.ExpectedRevision(must(client.ExpectedTombstone(id2)), []any{}))
+	dst := newEncDeployment(t, cmsOrigin)
+	importB(t, dst, e2eChain(t, "e", "d", []*seal.Keyring{kr}, s1, s2, nil, []any{}), bundle.ImportOptions{})
+	if h := dst.head("e", "d"); h.ID != restore || h.State != client.Live {
+		t.Fatalf("sealed lines, a tombstone and a restore: %+v", h)
+	}
+}

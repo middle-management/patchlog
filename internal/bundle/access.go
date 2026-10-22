@@ -59,7 +59,14 @@ func docAccess(doc any) string {
 
 // e2eEpochs lists the epochs the lines of an e2e namespace are sealed
 // under: the kids of sealed patch sets, and the keyring's current epochs.
-func (im *importer) e2eEpochs(ns string) (lo, hi int, err error) {
+// It checks those lines as §G.5.1 has the importer do at step 1: every
+// rev line but the keyring's is one sealed op whose pl.ns and kid name the
+// namespace, or a restore's []. Anything else (plaintext history from
+// before the source became end-to-end, or a line a branch reads through
+// from a base, sealed under the base's name) is a problem: such history is
+// carried over as a merge by a client that holds both sets of keys, with
+// new ids. Tombstones carry no patches.
+func (im *importer) e2eEpochs(ns string) (lo, hi int, problems []string, err error) {
 	note := func(e int) {
 		if lo == 0 || e < lo {
 			lo = e
@@ -78,7 +85,7 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, err error) {
 			live := false
 			for _, l := range d.lines {
 				if doc, live, err = verify.Replay(doc, live, []client.LogEntry{l.LogEntry()}); err != nil {
-					return 0, 0, fmt.Errorf("%s: %w", k, err)
+					return 0, 0, nil, fmt.Errorf("%s: %w", k, err)
 				}
 				if kr, err := seal.ParseKeyring(doc); live && err == nil {
 					note(kr.Current)
@@ -87,20 +94,29 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, err error) {
 			continue
 		}
 		for _, l := range d.lines {
+			if l.Kind != "rev" {
+				continue
+			}
+			if ps, isArr := l.Patches.([]any); isArr && len(ps) == 0 {
+				continue // a restore's []
+			}
 			jwe, ok := seal.SealedJWE(l.Patches)
 			if !ok {
-				continue // a tombstone, or a [] restore
+				problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s isn't one sealed op or a restore's [], as history from before the source became end-to-end isn't: "+
+					"only a client holding both sets of keys carries it over, as a merge with new ids (§G.5.1, Addendum E Levels)", ns, l.ID, d.name))
+				continue
 			}
 			h, err := seal.ParseHeader(jwe)
 			if err != nil {
-				return 0, 0, fmt.Errorf("%s: %s: %w", k, l.ID, err)
+				problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s: %v", ns, l.ID, d.name, err))
+				continue
 			}
-			kns, e, err := seal.ParseKid(h.Kid)
-			if err != nil {
-				return 0, 0, fmt.Errorf("%s: %s: %w", k, l.ID, err)
-			}
-			if kns != ns {
-				return 0, 0, fmt.Errorf("%s: %s is sealed under %s, not a key of %s", k, l.ID, h.Kid, ns)
+			kns, e, kerr := seal.ParseKid(h.Kid)
+			plNS, _ := h.PL["ns"].(string)
+			if kerr != nil || kns != ns || plNS != ns {
+				problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s is sealed under kid %q with pl.ns %q, not for %s, as a line a branch reads through from its base is: "+
+					"only a client holding both sets of keys carries it over, as a merge with new ids (§G.5.1)", ns, l.ID, d.name, h.Kid, plNS, ns))
+				continue
 			}
 			note(e)
 		}
@@ -108,7 +124,7 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, err error) {
 	if lo == 0 {
 		lo, hi = 1, 1
 	}
-	return lo, hi, nil
+	return lo, hi, problems, nil
 }
 
 // targetInfo is what checkAccess reads of an existing namespace.
@@ -210,7 +226,8 @@ func (im *importer) checkAccess(ctx context.Context) error {
 		if src == AccessE2E {
 			// Ciphertext, verbatim (§G.5.1): only an e2e target of the
 			// same name can take it. No override: it can't work otherwise.
-			lo, hi, err := im.e2eEpochs(tg.src)
+			lo, hi, probs, err := im.e2eEpochs(tg.src)
+			problems = append(problems, probs...)
 			switch {
 			case err != nil:
 				problems = append(problems, fmt.Sprintf("e2e namespace %s: %v", tg.src, err))
