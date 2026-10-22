@@ -739,3 +739,41 @@ func TestV073FolderMoveAcrossTreesNoDelete(t *testing.T) {
 	g.expect(g.doAs(carl, "MOVE", "/cat/Season", "", "Destination", "/cat2/Season"), 201, "carl's MOVE of the folder to another tree")
 	sameStrings(t, "cat2's Season", names(g.propfindAs(carl, "/cat2/Season/"), "/cat2/Season/"), []string{"cup.json", "derby.json"})
 }
+
+// A raw file written over a tombstone whose restore the core refuses is
+// answered as that write would be (§H.6): a rule's 422 here, not a
+// dropped connection; and one over a name tombstoned again since its head
+// was read (410 gone, §7.2) is written over the new tombstone, as a JSON
+// file's is (the P15 transition).
+func TestV073RawRestoreRefused(t *testing.T) {
+	t.Parallel()
+	refuseRestore := []any{map[string]any{
+		"if":   []any{map[string]any{"op": "test", "path": "/action", "value": "restore"}},
+		"then": []any{map[string]any{"op": "test", "path": "/doc/never", "exists": true}},
+	}}
+	e := newEnv(t, []string{"docs"}, nil, map[string]map[string]any{"docs": {"rules": refuseRestore}})
+	e.rawDoc("docs", "x.txt", "text/plain", []byte("theirs"), nil)
+	h, _ := e.load("docs", "x.txt")
+	must(e.c.Delete(e.ctx, "docs", "x.txt", h.ID))
+	e.expect(e.do("PUT", "/docs/x.txt", "mine"), 422, "raw PUT over a tombstone whose restore a rule refuses")
+	e.expectTombstoned("docs", "x.txt", "after the refused restore")
+
+	hk := &hook{}
+	e2 := newEnv(t, []string{"docs"}, nil, nil, withHook(hk))
+	e2.rawDoc("docs", "x.txt", "text/plain", []byte("theirs"), nil)
+	hd, _ := e2.load("docs", "x.txt")
+	must(e2.c.Delete(e2.ctx, "docs", "x.txt", hd.ID))
+	hk.set(at("PATCH", "/r/docs/x.txt"), func() {
+		// Someone else restores it and deletes it again: a new tombstone.
+		t1, _ := e2.load("docs", "x.txt")
+		r := must(e2.c.Restore(e2.ctx, "docs", "x.txt", t1.ID, []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"again": true}}}))
+		must(e2.c.Delete(e2.ctx, "docs", "x.txt", r.ID))
+	})
+	e2.expect(e2.do("PUT", "/docs/x.txt", "mine"), 201, "raw PUT over a name tombstoned again meanwhile")
+	if !hk.fired.Load() {
+		t.Fatal("the hook didn't fire")
+	}
+	if _, data := e2.rawOf("docs", "x.txt"); string(data) != "mine" {
+		t.Fatalf("x.txt %q", data)
+	}
+}

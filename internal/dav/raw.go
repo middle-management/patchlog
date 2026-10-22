@@ -263,8 +263,11 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 		} else {
 			// What the restore writes is settled (a 409 over someone
 			// else's delete uploads nothing) before the blob goes up: the
-			// file restored as it was keeps its type (fileType).
-			last, err := st.tombBase(ctx, ns, name, h)
+			// file restored as it was keeps its type (fileType). The
+			// attempt's err is assigned, not shadowed: the Restore's
+			// refusal is what the switch below answers (§H.6).
+			var last *docEntry
+			last, err = st.tombBase(ctx, ns, name, h)
 			if err != nil {
 				return false, err
 			}
