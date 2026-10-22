@@ -154,18 +154,17 @@ func (t *tx) draftsServe(c *nsRow, ccfg *Config, w *nsRow) bool {
 
 // schemaReadsServe reports whether n's schemaReads opens its schema
 // revisions for writes to w (§6.1): w is n, or listed in schemaReads.for,
-// or a local branch of such a namespace.
+// or a local branch of such a namespace, branches of branches included.
+// schemaReads.for is never matched against a branch: a branch qualifies
+// only through the namespace at the root of its chain of local bases.
 func (t *tx) schemaReadsServe(n *nsRow, w *nsRow) bool {
 	cfg := t.config(n.configSeq)
 	if cfg.SchemaReadsFor == nil || cfg.level >= levelSealed || n.isBranch() {
 		return false
 	}
 	for x := w; ; {
-		if x.id == n.id || DraftsMatch(cfg.SchemaReadsFor, x.name) {
-			return true
-		}
 		if !x.isBranch() {
-			return false
+			return x.id == n.id || DraftsMatch(cfg.SchemaReadsFor, x.name)
 		}
 		x = t.nsRowUnlocked(x.base.Int64)
 		if x.isShadow() {

@@ -433,3 +433,119 @@ func TestV073SchemaSealedKeyWindow(t *testing.T) {
 		hdr: map[string]string{"Source-Authorization": "Bearer " + p.grant(p.k, "user:w", []string{"schemas"}, []string{"read"}, p.nbf0)}}
 	expect(t, p.do(q), 201)
 }
+
+// CIS-20: 422 schema_unavailable names the revision path that didn't
+// resolve as path; ref carries it too, for one release (§6.1, §12.1).
+func TestV073SchemaUnavailablePath(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("n", map[string]any{"read": "public"})
+	unknown := "/r/n/s/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	r := e.write("PATCH", "n", "d", "", addRoot(map[string]any{"$schema": unknown}))
+	expectCode(t, r, 422, "schema_unavailable")
+	if r.Str("path") != unknown || r.Str("ref") != unknown {
+		t.Fatalf("path %q, ref %q; want %s: %s", r.Str("path"), r.Str("ref"), unknown, r.Body)
+	}
+	// In a schema's $ref closure: the revision that didn't resolve, not
+	// the dialect.
+	r = e.write("PATCH", "n", "s2", "", addRoot(map[string]any{"$schema": dialect, "$ref": unknown}))
+	expectCode(t, r, 422, "schema_unavailable")
+	if r.Str("path") != unknown {
+		t.Fatalf("closure: path %q: %s", r.Str("path"), r.Body)
+	}
+	// A batch item carries it too.
+	item := map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{"$schema": unknown})}}
+	r = e.do(req{method: "POST", path: "/ns/n/batch", author: "alice", body: map[string]any{"items": []any{item}}})
+	expectCode(t, r, 422, "batch")
+	items, _ := r.Obj()["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["path"] != unknown {
+		t.Fatalf("batch item: %s", r.Body)
+	}
+}
+
+// CIS-22: a $schema or $ref path naming a branch is 422 schema_ref only for
+// a writer who can read the revision there; for any other, or for a
+// revision the branch doesn't hold, it is schema_unavailable, as for a
+// namespace that doesn't exist (§6.1 Never into a branch).
+func TestV073SchemaBranchPathUnreadable(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	k := newKey("k")
+	e.mkNS("main", map[string]any{"read": "grant", "keys": []any{k.entry("*")}})
+	e.mkNS("docs", map[string]any{"read": "grant", "keys": []any{k.entry("*")}})
+	star := e.grant(k, "user:admin", []string{"main", "main-b", "docs"}, allVerbs)
+	expect(t, e.branch("main", map[string]any{"name": "main-b"}, star), 201)
+	x := e.create("main-b", "s", map[string]any{"$schema": dialect, "type": "object"}, star)
+	path := "/r/main-b/s/rev/" + x
+	unknown := "/r/main-b/s/rev/1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	nowhere := "/r/nothing/s/rev/" + x
+
+	w := e.grant(k, "user:w", []string{"docs"}, []string{"read", "create", "append"})
+	r := e.write("PATCH", "docs", "d", "", addRoot(map[string]any{"$schema": path}), w)
+	expectCode(t, r, 422, "schema_unavailable")
+	if r.Str("path") != path {
+		t.Fatalf("path %q: %s", r.Str("path"), r.Body)
+	}
+	// The same answer as for a namespace that doesn't exist.
+	r2 := e.write("PATCH", "docs", "d", "", addRoot(map[string]any{"$schema": nowhere}), w)
+	expectCode(t, r2, 422, "schema_unavailable")
+	// In a schema's $ref too.
+	expectCode(t, e.write("PATCH", "docs", "s", "", addRoot(map[string]any{"$schema": dialect, "$ref": path}), w), 422, "schema_unavailable")
+	// A grant reading the branch, but not that resource, can't read it.
+	only := e.grant(k, "user:w", []string{"docs", "main-b"}, []string{"read", "create", "append"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "d"}}})
+	expectCode(t, e.write("PATCH", "docs", "d", "", addRoot(map[string]any{"$schema": path}), only), 422, "schema_unavailable")
+
+	// A writer who reads it there learns it is a branch: schema_ref.
+	wr := e.grant(k, "user:w", []string{"docs", "main-b"}, []string{"read", "create", "append"})
+	expectCode(t, e.write("PATCH", "docs", "d", "", addRoot(map[string]any{"$schema": path}), wr), 422, "schema_ref")
+	expectCode(t, e.write("PATCH", "docs", "s", "", addRoot(map[string]any{"$schema": dialect, "$ref": path}), wr), 422, "schema_ref")
+	// In a write to the branch itself, with the write's own grant.
+	expectCode(t, e.write("PATCH", "main-b", "d", "", addRoot(map[string]any{"$schema": path}), wr), 422, "schema_ref")
+	// A revision the branch doesn't hold doesn't resolve.
+	expectCode(t, e.write("PATCH", "docs", "d", "", addRoot(map[string]any{"$schema": unknown}), wr), 422, "schema_unavailable")
+}
+
+// CIS-27: schemaReads.for is never matched against a branch. A write to a
+// branch qualifies only through the namespace at the root of its local
+// bases, and referrers count only in listed namespaces that aren't
+// branches (§6.1 Schemas follow their documents, §2.1 Referrer).
+func TestV073SchemaReadsNeverBranches(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	sk, pk := newKey("sk"), newKey("pk")
+	e.mkNS("schemas", map[string]any{"read": "grant", "keys": []any{sk.entry("*"), pk.entry("read")},
+		"schemaReads": map[string]any{"for": []any{"content*", "rel"}}})
+	e.mkNS("plain", map[string]any{"read": "grant", "keys": []any{pk.entry("*")}})
+	e.mkNS("content", map[string]any{"read": "grant", "keys": []any{pk.entry("*")}})
+	sg := e.grant(sk, "user:admin", []string{"schemas"}, allVerbs)
+	s := e.create("schemas", "s", map[string]any{"$schema": dialect, "type": "object"}, sg)
+	sRef := "/r/schemas/s/rev/" + s
+	pg := e.grant(pk, "user:admin", []string{"plain", "content-x", "rel", "content", "content-y"}, allVerbs)
+	for _, b := range [][2]string{{"plain", "content-x"}, {"plain", "rel"}, {"content", "content-y"}} {
+		expect(t, e.branch(b[0], map[string]any{"name": b[1]}, pg), 201)
+	}
+	w := e.grant(pk, "user:w", []string{"plain", "content-x", "rel", "content", "content-y"}, []string{"read", "create", "append"})
+	// Branches of an unlisted base whose names match the list, by prefix
+	// or exactly, don't resolve it without read on schemas.
+	for _, ns := range []string{"content-x", "rel", "plain"} {
+		expectCode(t, e.write("PATCH", ns, "d", "", addRoot(map[string]any{"$schema": sRef}), w), 422, "schema_unavailable")
+	}
+	// A listed namespace and its branch do.
+	expect(t, e.write("PATCH", "content", "d", "", addRoot(map[string]any{"$schema": sRef}), w), 201)
+	expect(t, e.write("PATCH", "content-y", "e", "", addRoot(map[string]any{"$schema": sRef}), w), 201)
+
+	// Referrers: a document of content-x pinning the revision, written by
+	// one who may read schemas, doesn't open it to content-x's readers;
+	// content's does.
+	sr := e.grant(pk, "user:w", []string{"schemas"}, []string{"read"})
+	expect(t, e.do(req{method: "PATCH", path: "/r/content-x/pin", ifNoneMatch: "*", body: addRoot(map[string]any{"$schema": sRef}), bearer: w,
+		hdr: map[string]string{"Source-Authorization": "Bearer " + sr}}), 201)
+	xr := e.grant(pk, "user:xr", []string{"content-x"}, []string{"read"})
+	expectCode(t, e.get(sRef, xr), 403, "forbidden")
+	cr := e.grant(pk, "user:cr", []string{"content"}, []string{"read"})
+	expect(t, e.get(sRef, cr), 200)
+	// content-y reads content's documents through; its own count for
+	// nothing, but the grant also names content.
+	yr := e.grant(pk, "user:yr", []string{"content-y"}, []string{"read"})
+	expectCode(t, e.get(sRef, yr), 403, "forbidden")
+}

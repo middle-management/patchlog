@@ -85,6 +85,14 @@ func pinnedSchemas(st []*itemState, pns string) []schema.Ref {
 	return refs
 }
 
+// schemaUnavailable is the 422 schema_unavailable of a schema revision
+// path that doesn't resolve for the writer, which path names (§6.1,
+// §12.1). ref, the member's name before v0.63, carries it too, for one
+// release.
+func schemaUnavailable(path string, kv ...any) *Error {
+	return apiErr(422, "schema_unavailable", append([]any{"path", path, "ref", path}, kv...)...)
+}
+
 func schemaErr(err error, path string) *Error {
 	var re *schema.RefError
 	var ue *schema.UnavailableError
@@ -96,13 +104,13 @@ func schemaErr(err error, path string) *Error {
 	case errors.Is(err, schema.ErrBranch):
 		return apiErr(422, "schema_ref", "message", "a schema reference must not name a branch")
 	case errors.As(err, &ue):
-		return apiErr(422, "schema_unavailable", "ref", ue.Ref)
+		return schemaUnavailable(ue.Ref)
 	case schema.RefPath(err) != "":
 		// The revision that didn't resolve, wherever in the closure it is,
 		// never the document's own $schema (a dialect URL for a schema).
-		return apiErr(422, "schema_unavailable", "ref", schema.RefPath(err))
+		return schemaUnavailable(schema.RefPath(err))
 	case errors.Is(err, schema.ErrUnavailable), errors.Is(err, schema.ErrForbidden):
-		return apiErr(422, "schema_unavailable", "ref", path)
+		return schemaUnavailable(path)
 	case errors.As(err, &ve):
 		var details []any
 		for _, d := range ve.Errors {
@@ -118,7 +126,9 @@ func schemaErr(err error, path string) *Error {
 // loadSchema resolves a schema revision path for a writer (§6.1): from the
 // write's own earlier items, in the path's namespace, or, in a write to a
 // branch, among the drafts in branches of that namespace (loadDraft). A
-// path naming a branch is ErrBranch, whatever the drafts.
+// path naming a branch is ErrBranch for a writer who can read the revision
+// there, whatever the drafts, and unavailable for any other (drafts are
+// looked up by the paths of namespaces that aren't branches).
 //
 // Within a transaction, which reads one snapshot, a path resolves the same
 // way for the same writer (sc) every time: the result is kept for the
@@ -193,7 +203,13 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 		return nil, schema.ErrUnavailable
 	}
 	if n.isBranch() {
-		return nil, schema.ErrBranch
+		// Never into a branch (schema_ref), but that tells only a writer
+		// who can read the revision there: for any other the path doesn't
+		// resolve, as in a namespace that doesn't exist (§6.1).
+		if row := t.schemaRevRow(n, ref); row != nil && t.schemaReadable(n, ref.Name, sc) && t.schemaKeysOpen(n, ref.Name, row, sc) {
+			return nil, schema.ErrBranch
+		}
+		return nil, schema.ErrUnavailable
 	}
 	if t.e2eContent(n, ref.Name) {
 		// The server can't read schemas in an e2e namespace (§E.3.2).
@@ -202,13 +218,7 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 	// A namespace that opens its schemas with schemaReads lets writes to a
 	// listed namespace resolve them without read (§6.1); only schema
 	// documents, checked once loaded.
-	var readable bool
-	if sc.target != nil && n.id == sc.target.id {
-		readable = t.canRead(n, t.config(n.configSeq), sc.a, ref.Name)
-	} else {
-		readable = t.credsRead(n, ref.Name, sc.creds)
-	}
-	if readable {
+	if t.schemaReadable(n, ref.Name, sc) {
 		row := t.schemaRevRow(n, ref)
 		if row == nil {
 			return nil, schema.ErrUnavailable
@@ -229,6 +239,17 @@ func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
 		return nil, schema.ErrForbidden
 	}
 	return d, nil
+}
+
+// schemaReadable reports whether the writer of sc may read resource name
+// of n (§6.1 Read permission): in the namespace written, with the write's
+// own grant; in any other, by the rule for other namespaces (§7.5), with
+// it or a grant in Source-Authorization.
+func (t *tx) schemaReadable(n *nsRow, name string, sc *schemaCtx) bool {
+	if sc.target != nil && n.id == sc.target.id {
+		return t.canRead(n, t.config(n.configSeq), sc.a, name)
+	}
+	return t.credsRead(n, name, sc.creds)
 }
 
 // schemaKeysOpen reports whether the writer of sc gets keys opening schema
