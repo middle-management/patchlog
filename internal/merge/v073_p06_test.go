@@ -1,12 +1,16 @@
 package merge_test
 
 import (
+	"fmt"
+	"net/http"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/seal"
@@ -219,5 +223,110 @@ func TestV073RebaseSwitchUpTheChain(t *testing.T) {
 		}
 	} else if !res.Switched {
 		t.Fatalf("not switched: %+v", res)
+	}
+}
+
+// blobLog records a client's blob PUTs: "copy <status>" for a Blob-From
+// copy, "upload <status>" for one with a body.
+type blobLog struct {
+	mu   sync.Mutex
+	puts []string
+}
+
+func (l *blobLog) wrap(rt http.RoundTripper) http.RoundTripper {
+	return rtFunc(func(r *http.Request) (*http.Response, error) {
+		resp, err := rt.RoundTrip(r)
+		if r.Method == "PUT" && strings.Contains(r.URL.Path, "/blob/") && err == nil {
+			kind := "upload"
+			if r.Header.Get("Blob-From") != "" {
+				kind = "copy"
+			}
+			l.mu.Lock()
+			l.puts = append(l.puts, fmt.Sprintf("%s %d", kind, resp.StatusCode))
+			l.mu.Unlock()
+		}
+		return resp, err
+	})
+}
+
+func (l *blobLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return strings.Join(l.puts, ", ")
+}
+
+type rtFunc func(*http.Request) (*http.Response, error)
+
+func (f rtFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// §F.3 Blobs, §7.8, §2.1 (v0.66): a merger without unrestricted read on
+// the branch (here a batch grant fixed to one resource, as a catalog's
+// merge grant is) copies the blobs its items reference into the target
+// first, since the batch's source makes none available to it; where the
+// ranks refuse the copy (a private branch into a public base: 404) it
+// uploads the bytes. A merger with unrestricted read copies nothing.
+func TestV073MergeCopiesBlobs(t *testing.T) {
+	t.Parallel()
+	s := clienttest.New(t, clienttest.Options{Auth: true})
+	k := clienttest.NewKey("ops")
+	for ns, read := range map[string]string{"pics": "grant", "pub": "public"} {
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, map[string]any{"read": read, "keys": []any{k.Entry("*")}}))
+	}
+	all := []string{"pics", "pics-r7", "pub", "pub-r7"}
+	owner := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:ed", all, grant.Verbs)))
+	png := []byte("\x89PNG not really")
+	setup := func(base, br string, patches ...map[string]any) string {
+		must(owner.CreateDoc(ctx, base, "derby", map[string]any{"title": "Derby"}))
+		req := client.BranchRequest{Name: br}
+		if len(patches) > 0 {
+			req.Patches = ops(patches...)
+		}
+		must(owner.CreateBranch(ctx, base, req))
+		bid := must(owner.UploadBlob(ctx, br, "derby", "image/png", "", png))
+		h := must(owner.Head(ctx, br, "derby"))
+		must(owner.Append(ctx, br, "derby", h.ID, ops(op("add", "/img", client.BlobRef(bid, "image/png", len(png), "")))))
+		return bid
+	}
+	bid := setup("pics", "pics-r7")
+	setup("pub", "pub-r7", op("add", "/read", "grant"))
+
+	// The batch goes in under a grant fixed to derby: no unrestricted read
+	// on the branch, so its source makes no blobs available.
+	fixed := func(l *blobLog) *client.Client {
+		return s.Client(t, client.WithTransport(l.wrap), client.WithBearer(k.Grant(t, s.Now(), "svc:merge", all, []string{"read", "create", "append", "restore"},
+			map[string]any{"rules": []any{op("test", "/resource", "derby")}})))
+	}
+	for _, c := range []struct{ base, branch, want string }{
+		{"pics", "pics-r7", "copy 201"},
+		{"pub", "pub-r7", "copy 404, upload 201"},
+	} {
+		l := &blobLog{}
+		p := must(merge.NewPlan(ctx, owner, c.base, c.branch, merge.Options{BatchClient: fixed(l)}))
+		must(p.DryRun(ctx))
+		res, err := p.Apply(ctx)
+		if err != nil {
+			t.Fatalf("%s: merge: %v (blob PUTs: %s)", c.branch, err, l)
+		}
+		if res.NSID == "" || l.String() != c.want {
+			t.Fatalf("%s: blob PUTs %q, want %q (%+v)", c.branch, l, c.want, res)
+		}
+	}
+	if b := must(owner.GetBlob(ctx, "pub", "derby", bid, "")); string(b.Data) != string(png) {
+		t.Fatalf("pub/derby blob %q", b.Data)
+	}
+
+	// With unrestricted read the batch's source serves: nothing is copied.
+	must(owner.CreateDoc(ctx, "pics-r7", "cup", map[string]any{"title": "Cup"}))
+	cb := must(owner.UploadBlob(ctx, "pics-r7", "cup", "image/png", "", png))
+	h := must(owner.Head(ctx, "pics-r7", "cup"))
+	must(owner.Append(ctx, "pics-r7", "cup", h.ID, ops(op("add", "/img", client.BlobRef(cb, "image/png", len(png), "")))))
+	l := &blobLog{}
+	full := s.Client(t, client.WithTransport(l.wrap), client.WithBearer(k.Grant(t, s.Now(), "svc:merge", all, grant.Verbs)))
+	must(must(merge.NewPlan(ctx, full, "pics", "pics-r7", merge.Options{})).Apply(ctx))
+	if l.String() != "" {
+		t.Fatalf("a merger with unrestricted read made blob PUTs: %s", l)
+	}
+	if b := must(owner.GetBlob(ctx, "pics", "cup", cb, "")); string(b.Data) != string(png) {
+		t.Fatalf("pics/cup blob %q", b.Data)
 	}
 }
