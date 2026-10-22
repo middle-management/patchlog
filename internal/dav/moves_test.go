@@ -201,10 +201,10 @@ func TestAsideWindow(t *testing.T) {
 }
 
 // A DELETE of a file, then a MOVE of another file onto its path (rclone's
-// mount without a cache saves through a temporary file so, and under a
-// resource name the temporary file is a file of its own; sed -i's is a
-// scratch file since v0.56, §H.6): the
-// write restores the deleted file (§H.6), its placement and its item, or
+// mount without a cache saves through a temporary file so, and in a tree
+// or under a resource name the temporary file is a file of its own; sed
+// -i's is a scratch file since v0.56, §H.6): the write restores the
+// deleted file (§H.6), its placement and its item, or
 // its resource, rebased on its last live document, so it keeps its
 // history and others' edits; then the temporary file is deleted. One the
 // core refuses puts the deleted file back as it was.
@@ -221,6 +221,24 @@ func TestDeleteThenMoveOnto(t *testing.T) {
 	}
 	_, doc := e.load("matches", "derby")
 	sameJSON(t, doc, map[string]any{"title": "Derby (sed)", "venue": "theirs"})
+	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
+
+	// A temporary file whose name isn't scratch is a file of the tree,
+	// its own placement and item: moved onto the path, it restores the
+	// deleted file the same way, and is deleted.
+	buf = e.expect(e.do("GET", "/cat/Season/derby.json", ""), 200, "GET").body
+	e.theirs("matches", "derby", replace("/venue", "theirs again"))
+	e.expect(e.do("PUT", "/cat/Season/derby.tmp", edit(t, buf, `"Derby (sed)"`, `"Derby (tmp)"`)), 201, "PUT the temporary file, a file of the tree")
+	if h, _ := e.load("cat", "matches.derby"); h.State != client.Live {
+		t.Fatalf("the placement is %v", h.State)
+	}
+	e.expect(e.do("DELETE", "/cat/Season/derby.json", ""), 204, "DELETE the original")
+	e.expect(e.do("MOVE", "/cat/Season/derby.tmp", "", "Destination", "/cat/Season/derby.json", "Overwrite", "F"), 201, "MOVE onto the name")
+	if h, _ := e.load("cat", "matches.derby"); h.State != client.Live {
+		t.Fatalf("the placement is %v", h.State)
+	}
+	_, doc = e.load("matches", "derby")
+	sameJSON(t, doc, map[string]any{"title": "Derby (tmp)", "venue": "theirs again"})
 	sameStrings(t, "Season", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 
 	// The flat view, a temporary file with a resource name.
