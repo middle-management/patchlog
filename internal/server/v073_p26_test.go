@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"testing"
 	"time"
 )
@@ -11,6 +12,32 @@ import (
 func (e *tenv) forcePurge(path, ifMatch, bearer string) *resp {
 	e.t.Helper()
 	return e.do(req{method: "POST", path: path + "?force=1", ifMatch: ifMatch, bearer: bearer})
+}
+
+// noEntry checks that a write answered without X-Namespace-Revision and
+// left ns's head at head (§7.2, §8.6).
+func noEntry(t *testing.T, e *tenv, r *resp, ns, head string) {
+	t.Helper()
+	if got := r.H.Get("X-Namespace-Revision"); got != "" {
+		t.Fatalf("X-Namespace-Revision %s on a write that records nothing: %s", got, r.Body)
+	}
+	if now := e.nsHead(ns); now != head {
+		t.Fatalf("%s's head moved from %s to %s", ns, head, now)
+	}
+}
+
+// pruneEntry checks that a prune answered with the prune entry it appended
+// to ns, targeting horizon (§3.5, §8.6).
+func pruneEntry(t *testing.T, e *tenv, r *resp, ns, name, horizon string) {
+	t.Helper()
+	expect(t, r, 200)
+	if r.Str("horizon") != horizon {
+		t.Fatalf("horizon %s, want %s", r.Body, horizon)
+	}
+	en := e.lastNSEntry(ns)
+	if r.H.Get("X-Namespace-Revision") != en["id"] || en["kind"] != "prune" || en["resource"] != name || en["target"] != horizon {
+		t.Fatalf("X-Namespace-Revision %q, last entry %v", r.H.Get("X-Namespace-Revision"), en)
+	}
 }
 
 // v0.73 §6.2 step 2.1, §8.3 (BBD-38): a resource purge checks the verb,
@@ -126,4 +153,114 @@ func TestV073P26NamespacePurgeOrder(t *testing.T) {
 	if deps, _ := r.Obj()["dependents"].([]any); len(deps) != 1 || deps[0] != "npb" {
 		t.Fatalf("dependents %s", r.Body)
 	}
+}
+
+// v0.73 §8.6 Request, §6.4.1 (BBD-46, GB-14): a prune that sends keep
+// replaces the keep set, and [] clears it; one without keep leaves it, and
+// its documents stay as the horizon moves past them. A prune that changes
+// only the keep set appends a prune entry targeting the effective horizon,
+// with X-Namespace-Revision; one that changes nothing writes nothing. The
+// envelope's doc carries keep only when it was sent.
+func TestV073P26KeepSet(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withoutRetentionLoop)
+	e.mkNS("ks", map[string]any{"read": "public"})
+	revs := e.chain("ks", "a", 10)
+	e.clock.Advance(time.Hour)
+	prune := func(body map[string]any) *resp { return e.prune("ks", "a", body, "admin") }
+	served := func(i int) { t.Helper(); expect(t, e.get("/r/ks/a/rev/"+revs[i]), 200) }
+	pruned := func(i int) { t.Helper(); expectCode(t, e.get("/r/ks/a/rev/"+revs[i]), 410, "pruned") }
+
+	pruneEntry(t, e, prune(map[string]any{"horizon": revs[4], "keep": []any{revs[2]}}), "ks", "a", revs[4])
+	served(2)
+	pruned(1)
+	pruned(3)
+	// Without keep, the set stays, past the horizon too.
+	pruneEntry(t, e, prune(map[string]any{"horizon": revs[6]}), "ks", "a", revs[6])
+	served(2)
+	pruned(4)
+	served(6)
+
+	// Only the keep set changes: an entry targeting the effective
+	// horizon, here the current one, above the one asked for.
+	pruneEntry(t, e, prune(map[string]any{"horizon": revs[5], "keep": []any{}}), "ks", "a", revs[6])
+	pruned(2)
+	served(6)
+	// Nothing changes: no entry, keep sent or not.
+	head := e.nsHead("ks")
+	r := prune(map[string]any{"horizon": revs[6], "keep": []any{}})
+	expect(t, r, 200)
+	noEntry(t, e, r, "ks", head)
+	r = prune(map[string]any{"horizon": revs[6]})
+	expect(t, r, 200)
+	noEntry(t, e, r, "ks", head)
+	// Revisions above the horizon join the set (an entry); the same set
+	// in another order is no change. A prune past them keeps them.
+	pruneEntry(t, e, prune(map[string]any{"horizon": revs[6], "keep": []any{revs[8], revs[7]}}), "ks", "a", revs[6])
+	head = e.nsHead("ks")
+	r = prune(map[string]any{"horizon": revs[6], "keep": []any{revs[7], revs[8], revs[7]}})
+	expect(t, r, 200)
+	noEntry(t, e, r, "ks", head)
+	pruneEntry(t, e, prune(map[string]any{"horizon": revs[9]}), "ks", "a", revs[9])
+	served(7)
+	served(8)
+	pruned(6)
+	// Dropping one of them from the set drops its document.
+	pruneEntry(t, e, prune(map[string]any{"horizon": revs[9], "keep": []any{revs[8]}}), "ks", "a", revs[9])
+	pruned(7)
+	served(8)
+	// Retention, which sends no keep, leaves the set too.
+	revs = append(revs, e.appendRev("ks", "a", revs[9], ops(op("replace", "/n", 10.0))))
+	revs = append(revs, e.appendRev("ks", "a", revs[10], ops(op("replace", "/n", 11.0))))
+	expect(t, e.patchNS("ks", ops(op("add", "/retention", []any{map[string]any{"keep": map[string]any{"revisions": 1.0}, "archive": false}})), ""), 201)
+	e.clock.Advance(time.Hour)
+	if rep, err := e.e.ApplyRetention(context.Background()); err != nil || rep.Pruned != 1 {
+		t.Fatalf("retention %+v %v", rep, err)
+	}
+	pruned(10)
+	served(8)
+	served(11)
+
+	// The envelope: { horizon } without keep, { horizon, keep } with it,
+	// [] included.
+	noKeep := map[string]any{
+		"if":   []any{map[string]any{"op": "test", "path": "/action", "value": "prune"}},
+		"then": []any{map[string]any{"op": "test", "path": "/doc/keep", "exists": false}},
+	}
+	e.mkNS("kr", map[string]any{"read": "public", "rules": []any{noKeep}})
+	k := e.chain("kr", "a", 3)
+	e.clock.Advance(time.Hour)
+	expectCode(t, e.prune("kr", "a", map[string]any{"horizon": k[1], "keep": []any{}}, "admin"), 422, "rule")
+	pruneEntry(t, e, e.prune("kr", "a", map[string]any{"horizon": k[1]}, "admin"), "kr", "a", k[1])
+}
+
+// v0.73 §8.6 Request, §12.2 (BBD-47): outside a branch, each keep id is a
+// revision of the resource whose document is still served, or the prune is
+// 422 invalid, whether or not the horizon moves; more ids than
+// keepPerResource is 422 limit.
+func TestV073P26KeepServed(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withoutRetentionLoop)
+	e.mkNS("kv", map[string]any{"read": "public", "limits": map[string]any{"keepPerResource": 2.0}})
+	revs := e.chain("kv", "a", 8)
+	e.clock.Advance(time.Hour)
+	prune := func(body map[string]any) *resp { return e.prune("kv", "a", body, "admin") }
+	pruneEntry(t, e, prune(map[string]any{"horizon": revs[4], "keep": []any{revs[1]}}), "kv", "a", revs[4])
+
+	head := e.nsHead("kv")
+	// revs[2] is pruned: 422 whether the horizon stays or moves.
+	expectCode(t, prune(map[string]any{"horizon": revs[4], "keep": []any{revs[1], revs[2]}}), 422, "invalid")
+	expectCode(t, prune(map[string]any{"horizon": revs[6], "keep": []any{revs[2]}}), 422, "invalid")
+	// Not a revision of the resource.
+	expectCode(t, prune(map[string]any{"horizon": revs[4], "keep": []any{hashID(t, "", nil)}}), 422, "invalid")
+	expectLimit(t, prune(map[string]any{"horizon": revs[6], "keep": []any{revs[1], revs[4], revs[6]}}), 422, "keepPerResource", 3, 2)
+	if e.nsHead("kv") != head {
+		t.Fatal("a refused prune wrote an entry")
+	}
+	expect(t, e.get("/r/kv/a/rev/"+revs[1]), 200)
+	expect(t, e.get("/r/kv/a/rev/"+revs[5]), 200)
+	// Still served: a kept revision and the horizon.
+	pruneEntry(t, e, prune(map[string]any{"horizon": revs[6], "keep": []any{revs[1], revs[4]}}), "kv", "a", revs[6])
+	expect(t, e.get("/r/kv/a/rev/"+revs[4]), 200)
+	expectCode(t, e.get("/r/kv/a/rev/"+revs[5]), 410, "pruned")
 }

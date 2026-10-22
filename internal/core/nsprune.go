@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"database/sql"
+	"fmt"
 
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
@@ -28,7 +29,9 @@ type PruneRequest struct {
 // PruneResult is the answer to a prune.
 type PruneResult struct {
 	Horizon string // the effective horizon
-	NSID    string // the prune entry's ns_id, if the horizon moved
+	// NSID is the prune entry's ns_id, if the prune moved the horizon or
+	// changed the keep set (§8.6).
+	NSID    string
 	Archive string // the URL of the archive written, if any
 }
 
@@ -87,6 +90,8 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		case e2e && pr.Snapshot == "":
 			return invalid("pruning an e2e resource needs the horizon's document as a sealed snapshot (§8.6)")
 		}
+		// Each keep id is a revision of the resource whose document is
+		// still served, whether or not the horizon moves (§8.6).
 		var keep []*revRow
 		for _, k := range pr.Keep {
 			kid, err := ids.Parse(k)
@@ -97,7 +102,15 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 			if row == nil || row.kind != kindRev {
 				return invalid("keep lists a revision that is not in the resource's history")
 			}
+			if _, err := t.docBytesAt(row); err != nil {
+				return invalid(fmt.Sprintf("keep lists revision %s, whose document is no longer served (§8.6)", k))
+			}
 			keep = append(keep, row)
+		}
+		keepStrs := pr.Keep
+		if !pr.KeepSent {
+			// A prune without keep leaves the keep set (§8.6).
+			keep, keepStrs = t.storedKeep(v.own)
 		}
 		h = t.protect(n, cfg, v.own.id, h)
 		rule := cfg.retentionRule(name)
@@ -120,9 +133,13 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 				return forbidden("going below what retention keeps needs a grant chained to a * key")
 			}
 		}
+		// The envelope's doc is { horizon, keep? } as sent (§6.4.1).
+		doc := map[string]any{"horizon": pr.Horizon}
+		if pr.KeepSent {
+			doc["keep"] = anyStrings(pr.Keep)
+		}
 		env := t.basicEnvelope("prune", name, a)
-		env["writes"], env["patches"] = []any{}, []any{}
-		env["doc"] = map[string]any{"horizon": pr.Horizon, "keep": anyStrings(pr.Keep)}
+		env["writes"], env["patches"], env["doc"] = []any{}, []any{}, doc
 		if err := t.checkRules(cfg, a, env, false); err != nil {
 			return err
 		}
@@ -131,7 +148,7 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		if e2e {
 			res, perr = t.pruneToE2E(n, cfg, name, v.own, h, hid, pr, dest, t.actorID(a))
 		} else {
-			res, perr = t.pruneTo(n, name, v.own, h, keep, pr.Keep, dest, hasArchive, t.actorID(a))
+			res, perr = t.pruneTo(n, name, v.own, h, keep, keepStrs, pr.KeepSent, dest, hasArchive, t.actorID(a))
 		}
 		if perr != nil {
 			return perr
@@ -140,6 +157,71 @@ func (e *Engine) Prune(ctx context.Context, req Request, name string, pr PruneRe
 		return nil
 	})
 	return out, err
+}
+
+// storedKeep is own's keep set (§8.6): its revisions in the resource's
+// history, and their ids as stored.
+func (t *tx) storedKeep(own *resRow) (keep []*revRow, keepStrs []string) {
+	if !own.keep.Valid || !own.headSeq.Valid {
+		return nil, nil
+	}
+	head := t.rev(own.headSeq.Int64)
+	a, _ := jsonv.MustParse([]byte(own.keep.String)).([]any)
+	for _, x := range a {
+		s, _ := x.(string)
+		id, err := ids.Parse(s)
+		if err != nil {
+			continue
+		}
+		if row := t.findInAncestry(head, id); row != nil && row.kind == kindRev {
+			keep = append(keep, row)
+			keepStrs = append(keepStrs, s)
+		}
+	}
+	return keep, keepStrs
+}
+
+// keepChanged reports whether keep, as a set, differs from own's stored
+// keep set (§8.6); an absent set is empty.
+func keepChanged(own *resRow, keep []string) bool {
+	var old []string
+	if own.keep.Valid {
+		a, _ := jsonv.MustParse([]byte(own.keep.String)).([]any)
+		for _, x := range a {
+			s, _ := x.(string)
+			old = append(old, s)
+		}
+	}
+	set := func(xs []string) map[string]bool {
+		m := make(map[string]bool, len(xs))
+		for _, x := range xs {
+			m[x] = true
+		}
+		return m
+	}
+	a, b := set(old), set(keep)
+	if len(a) != len(b) {
+		return true
+	}
+	for x := range a {
+		if !b[x] {
+			return true
+		}
+	}
+	return false
+}
+
+// effectiveHorizon is the horizon a prune to h, which protect has already
+// moved down, leaves own at, never below the current one (§8.6), and
+// whether that moves the horizon: a horizon with nothing of its resource's
+// chain below it (a first entry) prunes nothing.
+func (t *tx) effectiveHorizon(own *resRow, h *revRow) (*revRow, bool) {
+	if cur := own.horizonSeq; cur.Valid && h.seq <= cur.Int64 {
+		return t.rev(cur.Int64), false
+	}
+	var below bool
+	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ? AND seq < ?)`, own.id, h.seq).Scan(&below))
+	return h, below
 }
 
 // protect moves a horizon down past the protected revisions of §8.6: the
@@ -167,21 +249,20 @@ func (t *tx) protect(n *nsRow, cfg *Config, res int64, h *revRow) *revRow {
 	return h
 }
 
-// pruneTo prunes own below h, which protect has already moved down. With
-// archive set, the pruned range is written to dest first, and nothing is
-// dropped unless that succeeds.
-func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revRow, keepStrs []string, dest string, archive bool, author int64) (*PruneResult, error) {
+// pruneTo prunes own below h, which protect has already moved down, and
+// with keepSent replaces its keep set with keep (keepStrs as sent);
+// otherwise keep is the stored set, which stays. With archive set, the
+// pruned range is written to dest first, and nothing is dropped unless
+// that succeeds. A prune entry, targeting the effective horizon, is
+// appended only if the horizon moved or the keep set changed: a prune that
+// changes nothing writes nothing (§8.6).
+func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revRow, keepStrs []string, keepSent bool, dest string, archive bool, author int64) (*PruneResult, error) {
 	cur := own.horizonSeq
-	if cur.Valid && h.seq <= cur.Int64 {
-		return &PruneResult{Horizon: t.rev(cur.Int64).id.String()}, nil
-	}
-	// A horizon with nothing of its resource's chain below it (a first
-	// entry) prunes nothing, and a prune that changes nothing writes
-	// nothing (§8.6).
-	var below bool
-	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM revisions WHERE res = ? AND seq < ?)`, own.id, h.seq).Scan(&below))
-	if !below {
-		return &PruneResult{Horizon: h.id.String()}, nil
+	h, moves := t.effectiveHorizon(own, h)
+	changed := keepSent && keepChanged(own, keepStrs)
+	res := &PruneResult{Horizon: h.id.String()}
+	if !moves && !changed {
+		return res, nil
 	}
 	// Documents that stay available: the horizon (and for a tombstone the
 	// last live document), kept revisions and referenced schemas.
@@ -210,20 +291,24 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 		}
 	}
 	rrows.Close()
+	// A prune that changes only the keep set moves nothing: the documents
+	// it keeps below the horizon are those still served there, which have
+	// their snapshots, and those above it are served anyway.
 	docs := map[int64][]byte{}
-	for seq, row := range keepSeqs {
-		if row == nil {
-			row = t.rev(seq)
+	if moves {
+		for seq, row := range keepSeqs {
+			if row == nil {
+				row = t.rev(seq)
+			}
+			doc, err := t.docBytesAt(row)
+			if err != nil {
+				return nil, invalid("a kept revision was already pruned")
+			}
+			docs[seq] = doc
 		}
-		doc, err := t.docBytesAt(row)
-		if err != nil {
-			return nil, invalid("a kept revision was already pruned")
-		}
-		docs[seq] = doc
 	}
 	// Archive before dropping anything (§8.6).
-	res := &PruneResult{Horizon: h.id.String()}
-	if archive {
+	if moves && archive {
 		from := own.horizonSeq.Int64
 		if !cur.Valid {
 			t.must(t.QueryRow(`SELECT MIN(seq) FROM revisions WHERE res = ?`, own.id).Scan(&from))
@@ -239,7 +324,7 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 		t.must(err)
 	}
 	// Attachments no kept document references end (§7.8); the archive
-	// written above carries their blobs.
+	// written above, or when the horizon passed them, carries their blobs.
 	kept := make([]int64, 0, len(keepSeqs)+len(preserve))
 	for seq := range keepSeqs {
 		kept = append(kept, seq)
@@ -259,8 +344,9 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 	_, err := t.Exec(`UPDATE revisions SET patches = NULL WHERE res = ? AND seq < ? AND kind = 0`, own.id, h.seq)
 	t.must(err)
 	// Below the horizon only the documents kept above survive:
-	// intermediate snapshots (D.4) and an earlier prune's keep set go,
-	// or pruned revisions would still be served.
+	// intermediate snapshots (D.4) and the documents an earlier keep set
+	// kept but this one doesn't go, or pruned revisions would still be
+	// served.
 	srows, qerr := t.Query(`SELECT seq FROM snapshots WHERE res = ? AND seq < ?`, own.id, h.seq)
 	t.must(qerr)
 	var drop []int64
@@ -280,9 +366,15 @@ func (t *tx) pruneTo(n *nsRow, name string, own *resRow, h *revRow, keep []*revR
 	// Sealed copies of what was pruned go too, wherever they are served
 	// (a branch reads through); kept documents keep their bytes.
 	t.deletePrunedSealed(own.id, h.seq, keepSeqs)
-	keepJSON := string(jsonv.Canonical(anyStrings(keepStrs)))
-	_, err = t.Exec(`UPDATE resources SET horizon_seq = ?, keep = ? WHERE res = ?`, h.seq, keepJSON, own.id)
-	t.must(err)
+	if moves {
+		_, err = t.Exec(`UPDATE resources SET horizon_seq = ? WHERE res = ?`, h.seq, own.id)
+		t.must(err)
+	}
+	if keepSent {
+		// keep replaces the keep set, and [] clears it (§8.6).
+		_, err = t.Exec(`UPDATE resources SET keep = ? WHERE res = ?`, string(jsonv.Canonical(anyStrings(keepStrs))), own.id)
+		t.must(err)
+	}
 	if epochs != nil {
 		t.pruneBlobEpochs(n, name, own.id, epochs)
 	}
