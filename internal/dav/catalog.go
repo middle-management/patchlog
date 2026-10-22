@@ -1513,8 +1513,9 @@ func (st *reqState) copyFolder(ctx context.Context, t target) error {
 // A failure part-way leaves what was done, with no rollback, and is
 // answered as that child's MOVE would be. Before anything is written: a
 // folder that carries $access or sits under one isn't moved
-// (accessRefused), nor one the grant can't delete (allows). The MOVE's
-// If-Match names src's node (srcPrecondition), not its files.
+// (accessRefused), nor one the grant can't delete, or unlink where it has
+// several parents (allows). The MOVE's If-Match names src's node
+// (srcPrecondition), not its files.
 func (st *reqState) moveFolderAcross(ctx context.Context, src, dst target) error {
 	cg, _, err := st.writeTree(ctx, src.ns)
 	if err != nil {
@@ -1523,7 +1524,12 @@ func (st *reqState) moveFolderAcross(ctx context.Context, src, dst target) error
 	if err := st.accessRefused(cg, src); err != nil {
 		return err
 	}
-	if err := st.allows(ctx, src, src.ns, "delete"); err != nil {
+	verb := "delete"
+	if n := cg.g.Node(src.node); n != nil && len(cg.g.WalkableParents(n)) > 1 {
+		// Unlinked from this folder only (deleteFolder).
+		verb = "append"
+	}
+	if err := st.allows(ctx, src, src.ns, verb); err != nil {
 		return err
 	}
 	match, anyMatch := st.srcMatch, st.srcAny

@@ -710,3 +710,32 @@ func TestV073OntoExisting(t *testing.T) {
 	e.nodeDoc("cat", "matches.t")
 	e.nodeDoc("cat", "matches.r")
 }
+
+// A folder's MOVE to another tree whose grant can't delete the folder in
+// its catalog is refused before anything is written (§C.2, §H.5): no
+// folder made in the other tree, nothing moved (GW-8).
+func TestV073FolderMoveAcrossTreesNoDelete(t *testing.T) {
+	t.Parallel()
+	a := newAuthTree(t)
+	must(a.s.Client(t, client.WithBearer(a.s.OperatorGrant(t, "cat2"))).CreateNamespace(a.ctx, "cat2", map[string]any{
+		"read": "grant", "keys": []any{a.k.Entry("*")}, "catalog": treeCatalog("matches")}))
+	w := a.s.Client(t, client.WithBearer(a.k.Grant(t, a.s.Now(), "user:w", []string{"cat2"}, []string{"read", "create", "append", "delete"})))
+	must(w.CreateDoc(a.ctx, "cat2", "root", map[string]any{"title": "Root", "parents": []any{}}))
+	g := a.gateway(t, "", func(o *dav.Options) { o.Catalogs = []string{"cat", "cat2"} })
+	all := []string{"cat", "cat2", "matches"}
+	bob := a.k.Grant(t, a.s.Now(), "user:bob", all, []string{"read", "create", "append"})
+	heads := func() string {
+		return must(a.w.NSHead(a.ctx, "matches")).ID + " " + must(a.w.NSHead(a.ctx, "cat")).ID + " " + must(w.NSHead(a.ctx, "cat2")).ID
+	}
+	before := heads()
+	r := g.doAs(bob, "MOVE", "/cat/Season", "", "Destination", "/cat2/Season")
+	if r.status != 403 || !strings.Contains(r.body, "doesn't allow delete") || !strings.Contains(r.body, "nothing was written") {
+		t.Fatalf("bob's MOVE of a folder to another tree: %d %q", r.status, r.body)
+	}
+	if after := heads(); after != before {
+		t.Fatalf("the refused MOVE wrote: heads %s -> %s", before, after)
+	}
+	carl := a.k.Grant(t, a.s.Now(), "user:carl", all, []string{"read", "create", "append", "delete"})
+	g.expect(g.doAs(carl, "MOVE", "/cat/Season", "", "Destination", "/cat2/Season"), 201, "carl's MOVE of the folder to another tree")
+	sameStrings(t, "cat2's Season", names(g.propfindAs(carl, "/cat2/Season/"), "/cat2/Season/"), []string{"cup.json", "derby.json"})
+}
