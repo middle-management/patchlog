@@ -493,22 +493,28 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		for _, s := range st {
 			s.cands = nil
 			for j := range s.Steps {
-				if j == 0 && hasCandidates(s.Item) {
-					// Append or restore, which only the resource's state
-					// decides: both are tried, and step 2 settles it (§6.2).
+				if verbs := candidateVerbs(s.Item); j == 0 && verbs != nil {
+					// Verbs only the resource's state decides: each is
+					// tried, and the item passes if any does (§C.2 item 2).
+					// Under If-Match step 2 settles it; without a
+					// precondition step 2.5 answers 428.
 					var first *Error
-					for _, verb := range []string{"append", "restore"} {
+					var passed []string
+					for _, verb := range verbs {
 						if err := t.authorize(a, verb, s.Resource); err != nil {
 							if first == nil {
 								first = err
 							}
 							continue
 						}
-						s.cands = append(s.cands, verb)
+						passed = append(passed, verb)
 					}
-					if len(s.cands) == 0 {
+					if len(passed) == 0 {
 						fs = append(fs, itemErr{s.index, first})
 						break
+					}
+					if hasCandidates(s.Item) {
+						s.cands = passed
 					}
 					continue
 				}
@@ -622,8 +628,9 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 
 	// Step 2: precondition — idempotent retry, settling the verb, frozen,
 	// the precondition. The retry lookup doesn't apply to a purged
-	// resource: the answer is 410, as for every URL of it, before the
-	// frozen check (§6.2 step 2, §7.2, §8.3).
+	// resource, nor to one a branch answers 502 upstream for: the answer is
+	// 410, as for every URL of it, or that 502, before the frozen check
+	// (§1, §6.2 step 2.1, §7.2, §8.3).
 	if pf := t.purgedItems(n, st); len(pf) > 0 {
 		if !dryRun {
 			return nil, nil, fail(pf)
@@ -960,6 +967,23 @@ func hasCandidates(it Item) bool {
 	return it.IfMatch != "" && !it.IfNoneMatch && len(it.Steps) > 0 && !it.Steps[0].Delete
 }
 
+// candidateVerbs are the verbs step 1 checks for an item's first step when
+// the request doesn't fix one (§C.2 item 2): append and restore for a
+// patch set under If-Match, and create, append and restore for one without
+// a precondition, which then gets 428 at step 2.5. Nil when the request
+// fixes the verb (staticVerb).
+func candidateVerbs(it Item) []string {
+	switch {
+	case len(it.Steps) == 0 || it.Steps[0].Delete:
+		return nil
+	case hasCandidates(it):
+		return []string{"append", "restore"}
+	case it.IfMatch == "" && !it.IfNoneMatch:
+		return []string{"create", "append", "restore"}
+	}
+	return nil
+}
+
 // settle is the second sub-step of step 2 (§6.2): it settles the verb of
 // an item with candidate verbs from the resource's state as the writer sees
 // it (a branch's view, read-through included), and refuses one that isn't
@@ -991,7 +1015,8 @@ func (t *tx) entryVerb(row *revRow) string {
 }
 
 // staticVerb is the verb of step j known from the request. The first patch
-// step of an If-Match item has candidate verbs instead (hasCandidates).
+// step of an item under If-Match, or without a precondition, has candidate
+// verbs instead (candidateVerbs).
 func staticVerb(it Item, j int) string {
 	s := it.Steps[j]
 	if s.Delete {
@@ -1041,22 +1066,27 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 	return out, true
 }
 
-// purgedItems answers 410 for each item whose resource is purged, as the
-// writer sees it (§7.6): the idempotent-retry lookup doesn't apply to it
-// (§6.2 step 2, §7.2), and every URL of it is 410 (§8.3).
+// purgedItems answers step 2.1's refusals before the retry lookup, which
+// doesn't apply to them (§6.2 step 2, §7.2): the 502 upstream of a
+// resource whose source was raised to a level this server lacks
+// (upstreamRefusal, §1), and 410 for each item whose resource is purged,
+// as the writer sees it (§7.6), as every URL of it is (§8.3).
 func (t *tx) purgedItems(n *nsRow, st []*itemState) []itemErr {
 	var fs []itemErr
 	for _, s := range st {
-		if t.resolve(n, s.Resource, nil).state == Purged {
+		if err := t.upstreamRefusal(n, s.Resource); err != nil {
+			fs = append(fs, itemErr{s.index, err})
+		} else if t.resolve(n, s.Resource, nil).state == Purged {
 			fs = append(fs, itemErr{s.index, gone()})
 		}
 	}
 	return fs
 }
 
-// replay implements the idempotent-retry lookup (§7.2, §7.5). Callers
-// answer a purged resource first (purgedItems): the lookup doesn't apply
-// to one.
+// replay implements the idempotent-retry lookup (§7.2, §7.5): the entry
+// this request would have produced, written by the same principal, the
+// same author under the same root sub and kid (sameRoot). Callers answer a
+// purged resource first (purgedItems): the lookup doesn't apply to one.
 func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
 	author := t.actorID(a)
 	if !isBatch {
@@ -1074,7 +1104,7 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		}
 		last := want[len(want)-1]
 		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
-		if err != nil || row.author != author {
+		if err != nil || row.author != author || !t.sameRoot(row.grantID, a) {
 			return nil
 		}
 		if s.cands != nil && !contains(s.cands, t.entryVerb(row)) {
@@ -1155,9 +1185,12 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 	}
 	var match []byte
 	for _, seq := range cands {
-		var id []byte
+		var id, gid []byte
 		var body string
-		if t.QueryRow(`SELECT id, body FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body) != nil {
+		if t.QueryRow(`SELECT id, body, grant_id FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body, &gid) != nil {
+			continue
+		}
+		if !t.sameRoot(gid, a) {
 			continue
 		}
 		b := jsonv.MustParse([]byte(body)).(map[string]any)
@@ -1174,6 +1207,23 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		r.ConfigID = cp.expected.String()
 	}
 	return r
+}
+
+// sameRoot reports whether an entry recorded under grant gid (nil for
+// none), whose author matched, was written by the principal of a: the same
+// root sub and kid (§7.2, §7.5). An entry that records no grant, written
+// while authentication was disabled or before grants were recorded
+// (v0.37), and any entry for a request made while it is disabled, match on
+// the author alone. samePrincipal is this for a namespace entry.
+func (t *tx) sameRoot(gid []byte, a *actor) bool {
+	if a.grant == nil || gid == nil {
+		return true
+	}
+	if len(a.grant.Blocks) == 0 {
+		return false
+	}
+	ref, root := t.grantRef(gid), a.grant.Blocks[0]
+	return ref != nil && ref["sub"] == root.Sub && ref["kid"] == root.Kid
 }
 
 // candidateVerbsMatch reports whether every item with candidate verbs
@@ -1196,16 +1246,28 @@ func (t *tx) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
 	return true
 }
 
-// precondition is step 2 for one item (§7.2, §7.6 first writes).
+// precondition is step 2.5 for one item (§6.2, §7.2, §7.6 first writes).
+// What the request alone decides comes first: a "delete" step right after
+// another (§7.5), then a "delete" under If-None-Match (428), then the
+// comparison with the resource's state.
 func (t *tx) precondition(n *nsRow, s *itemState) *Error {
+	for j := 1; j < len(s.Steps); j++ {
+		if s.Steps[j].Delete && s.Steps[j-1].Delete {
+			return doubleDelete()
+		}
+	}
+	if s.IfNoneMatch && s.IfMatch == "" && len(s.Steps) > 0 && s.Steps[0].Delete {
+		// Not the precondition a delete takes, whatever the resource's
+		// state (§7.5, §12.1), as for a DELETE with If-None-Match: *.
+		return apiErr(428, "precondition_required", "message", "a delete takes If-Match")
+	}
 	v := t.resolve(n, s.Resource, nil)
 	s.view = v
+	// A 412 names the head where there is one; with none, no member (§12.1).
 	headErr := func() *Error {
 		e := apiErr(412, "stale")
 		if v.head != nil {
 			e.Body["head"] = v.head.id.String()
-		} else {
-			e.Body["head"] = nil
 		}
 		return e
 	}
@@ -1218,6 +1280,10 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 			return nil
 		case Purged:
 			return gone()
+		case Tombstoned:
+			// Never a 412, which a client could read as "exists, restore
+			// it" (§7.2, §8.1).
+			return gone("head", v.head.id.String())
 		default:
 			return headErr()
 		}
@@ -1233,7 +1299,7 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 			return headErr()
 		case Tombstoned:
 			if want != v.head.id || s.Steps[0].Delete {
-				return gone("tombstone", v.head.id.String())
+				return gone("head", v.head.id.String())
 			}
 		case Live:
 			if want != v.head.id {
@@ -1247,8 +1313,9 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 	}
 }
 
-// doubleDelete answers a delete step right after another (§7.5): 422, as a
-// DELETE of a tombstoned resource is 410.
+// doubleDelete answers a delete step right after another (§7.5): 422 at
+// step 2.5, as a DELETE of a tombstoned resource is 410 there. Step 3
+// keeps the check for the steps it applies.
 func doubleDelete() *Error {
 	return apiErr(422, "invalid", "message", "a delete step can't follow another delete")
 }
