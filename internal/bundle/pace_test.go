@@ -198,7 +198,8 @@ func TestBackfillAllowanceGrant(t *testing.T) {
 		"read":   "public",
 		"keys":   []any{admin.Entry("*"), ops.Entry("read", "create", "append")},
 		"limits": map[string]any{"itemsPerBatch": 3, "batchSize": 1 << 10},
-		"allowances": []any{map[string]any{"sub": "svc:importer", "kid": "ops-2026", "bucket": map[string]any{"rate": 1000, "burst": 1000},
+		// Within the deployment maximum of ratePerNamespace (§6.6).
+		"allowances": []any{map[string]any{"sub": "svc:importer", "kid": "ops-2026", "bucket": map[string]any{"rate": 500, "burst": 1000},
 			"itemsPerBatch": 5, "batchSize": 1 << 20}},
 	}))
 	can := []string{"read", "create", "append"}
@@ -217,7 +218,7 @@ func TestBackfillAllowanceGrant(t *testing.T) {
 	if got := batchSizes(rep); !slices.Equal(got, []int{5, 2}) || rep.Batches[0].PacedBy != "allowance" || rep.Batches[1].NSID == "" {
 		t.Fatalf("batches %v %+v", got, rep.Batches[0])
 	}
-	if want := []time.Duration{5 * time.Millisecond, 5 * time.Millisecond, 2 * time.Millisecond}; !slices.Equal(sleeps, want) {
+	if want := []time.Duration{10 * time.Millisecond, 10 * time.Millisecond, 4 * time.Millisecond}; !slices.Equal(sleeps, want) {
 		t.Fatalf("sleeps %v, want %v", sleeps, want)
 	}
 }
