@@ -36,15 +36,20 @@
 //     after it in the branch. §F.6 asks for no merge.authors check here:
 //     the successor is a branch too, and its batches are the rebase.
 //   - abandoned: the branch's document has "abandoned": true, set by a
-//     config write whose recorded grant chains to a * key of the branch,
-//     inherited or its own (§F.6): the root kid of the entry's grant (§7.4)
-//     names a key with scope "*" in the branch's document as of that
-//     write, or in a base's. An entry written while authentication was
-//     disabled records "grant": null (§1): it counts while the deployment
-//     still runs disabled, as GET / says ("auth": "disabled"), since every
-//     request then counts as holding a * key, and for no one under
-//     "grants". An entry without "grant" at all (the server's own, or one
-//     from before v0.37) counts for no one.
+//     config write whose recorded grant chains to a current * key of the
+//     branch, inherited or its own (§F.6): the root kid of the entry's
+//     grant (§7.4) names a key whose can lists "*" among the keys the
+//     branch accepts now (§C.4: its bases' current keys, then its own,
+//     less its copies of base keys the base has since dropped), and the
+//     grant isn't revoked there now. Keys are inherited from local bases
+//     only: the walk stops at a base in another deployment (base.origin),
+//     so a namespace here that shares its name lends none. An entry
+//     written while authentication was disabled records "grant": null
+//     (§1): it counts while the deployment still runs disabled, as GET /
+//     says ("auth": "disabled"), since every request then counts as
+//     holding a * key, and for no one under "grants". An entry without
+//     "grant" at all (the server's own, or one from before v0.37) counts
+//     for no one.
 //   - a branch with no head, tombstone or batch entry of its own counts as
 //     merged.
 //   - at E3, entries for the branch's keyring resource don't count in any
@@ -60,7 +65,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
 	"reflect"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -328,7 +335,7 @@ func (j *Janitor) Check(ctx context.Context, base, ns string) (Decision, error) 
 
 	enc, _ := doc.Value["encryption"].(map[string]any)
 	b := &branch{j: j, base: base, ns: ns, doc: doc.Value, log: log, e2e: enc["level"] == "e2e",
-		docs: map[string]nsAt{ns: {head.ID, doc.Value}}}
+		docs: map[string]nsAt{ns: {head.ID, doc.Value}}, keyCache: map[string]map[string]nsKey{}}
 	if b.cfgs, err = b.configDocs(ctx); err != nil {
 		return d, err
 	}
@@ -462,6 +469,8 @@ type branch struct {
 	e2e  bool // at E3 the keyring is never merged (§F.6, §F.8.1)
 	cfgs []configEntry
 	docs map[string]nsAt
+	// keyCache holds keys by namespace.
+	keyCache map[string]map[string]nsKey
 }
 
 // nsAt is a namespace's head and its document there.
@@ -722,9 +731,11 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string) (bool, strin
 }
 
 // verifyAbandoned checks an abandoned claim (§F.6): the config write that
-// set "abandoned": true was made under a grant chained to a * key of the
-// branch, inherited or its own. Only its administrators can give up
-// everyone's unmerged work.
+// set "abandoned": true was made under a grant chained to a current * key
+// of the branch, inherited from a local base or its own (starKey): a key
+// removed or replaced since, or one of a base in another deployment,
+// doesn't count. Only its administrators can give up everyone's unmerged
+// work.
 func (b *branch) verifyAbandoned(ctx context.Context) (bool, string, error) {
 	var setter *configEntry
 	was := false
@@ -755,36 +766,195 @@ func (b *branch) verifyAbandoned(ctx context.Context) (bool, string, error) {
 		}
 		return false, fmt.Sprintf("the config write %s that set it was written while authentication was disabled (grant: null), which counts for no one now that the deployment runs with grants (§1); set abandoned again", e.ID), nil
 	}
-	docs := []map[string]any{setter.doc}
-	for cur, i := setter.doc, 0; i < 64; i++ {
-		bref, _ := cur["base"].(map[string]any)
-		bns, _ := bref["ns"].(string)
-		if bns == "" {
-			break
-		}
-		bd, err := b.current(ctx, bns)
-		if err != nil {
-			break // an unreadable base: its keys can't be checked
-		}
-		docs = append(docs, bd)
-		cur = bd
+	ok, why, err := b.starKey(ctx, e, b.ns)
+	if err != nil || ok {
+		return ok, "", err
 	}
-	for _, doc := range docs {
-		keys, _ := doc["keys"].([]any)
-		for _, k := range keys {
-			km, _ := k.(map[string]any)
-			if km["kid"] != e.Grant.Kid {
+	return false, fmt.Sprintf("the config write %s that set it was by %s, but %s", e.ID, e.Grant.Sub, why), nil
+}
+
+// nsKey is a namespace key as the janitor compares keys: its alg and pub,
+// and whether its can lists "*".
+type nsKey struct {
+	alg, pub string
+	star     bool
+}
+
+// parseKeys reads a namespace document's keys by kid. The core validates
+// them, so malformed entries are skipped.
+func parseKeys(v any) map[string]nsKey {
+	out := map[string]nsKey{}
+	arr, _ := v.([]any)
+	for _, x := range arr {
+		m, _ := x.(map[string]any)
+		kid, _ := m["kid"].(string)
+		if kid == "" {
+			continue
+		}
+		var k nsKey
+		k.alg, _ = m["alg"].(string)
+		k.pub, _ = m["pub"].(string)
+		can, _ := m["can"].([]any)
+		k.star = slices.Contains(can, any("*"))
+		out[kid] = k
+	}
+	return out
+}
+
+// localBase returns the base of a namespace document in this deployment:
+// its name and at, and false for a namespace that isn't a branch, or whose
+// base lives in another deployment (base.origin, §7.6, §G.3).
+func localBase(doc map[string]any) (ns, at string, ok bool) {
+	bref, _ := doc["base"].(map[string]any)
+	ns, _ = bref["ns"].(string)
+	at, _ = bref["at"].(string)
+	if _, remote := bref["origin"]; remote || ns == "" {
+		return "", "", false
+	}
+	return ns, at, true
+}
+
+// maxDepth bounds base chains (the deployment's branch depth is 8 by
+// default, §6.6).
+const maxDepth = 32
+
+// keys returns the keys ns accepts now, by kid, as the core does (§C.4,
+// keys follow the base): its base's, recursively, whose entries win over
+// ns's own for a shared kid, then its own, less those it copied from its
+// base at creation and the base has since removed. Only local bases count
+// (§7.6): the walk stops at a namespace whose base has origin, so a local
+// namespace that shares a remote base's name lends no keys.
+func (b *branch) keys(ctx context.Context, ns string) (map[string]nsKey, error) {
+	return b.keysAt(ctx, ns, 0)
+}
+
+func (b *branch) keysAt(ctx context.Context, ns string, depth int) (map[string]nsKey, error) {
+	if k, ok := b.keyCache[ns]; ok {
+		return k, nil
+	}
+	if depth > maxDepth {
+		return nil, fmt.Errorf("janitor: base chain of %s too deep", ns)
+	}
+	doc, err := b.current(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	out := parseKeys(doc["keys"])
+	if bns, at, ok := localBase(doc); ok {
+		baseKeys, err := b.keysAt(ctx, bns, depth+1)
+		if err != nil {
+			return nil, err
+		}
+		copied, err := b.copiedKids(ctx, ns, bns, at)
+		if err != nil {
+			return nil, err
+		}
+		own := out
+		out = maps.Clone(baseKeys)
+		for kid, k := range own {
+			if _, inBase := baseKeys[kid]; inBase || copied[kid] {
 				continue
 			}
-			can, _ := km["can"].([]any)
-			for _, c := range can {
-				if c == "*" {
-					return true, "", nil
-				}
-			}
+			out[kid] = k
 		}
 	}
-	return false, fmt.Sprintf("the config write %s that set it was by %s under key %q, not a * key of the branch", e.ID, e.Grant.Sub, e.Grant.Kid), nil
+	b.keyCache[ns] = out
+	return out, nil
+}
+
+// copiedKids returns the kids a branch copied from its base at creation:
+// those of the base's document in force at the base's branch entry for it,
+// found in the base's log after the branch's at (§7.6, §C.4).
+func (b *branch) copiedKids(ctx context.Context, ns, base, at string) (map[string]bool, error) {
+	bh, _, err := b.head(ctx, base)
+	if err != nil {
+		return nil, err
+	}
+	entries, err := b.j.c.NSLog(ctx, base, bh, at)
+	if err != nil {
+		return nil, fmt.Errorf("janitor: log of %s, the base of %s: %w", base, ns, err)
+	}
+	for _, e := range entries {
+		if e.Kind != "branch" || e.Name != ns || e.Remote != nil {
+			continue
+		}
+		d, err := b.j.c.NSDoc(ctx, base, e.ID)
+		if err != nil {
+			return nil, err
+		}
+		out := map[string]bool{}
+		for kid := range parseKeys(d.Value["keys"]) {
+			out[kid] = true
+		}
+		return out, nil
+	}
+	return nil, fmt.Errorf("janitor: no branch entry for %s in %s after %s", ns, base, at)
+}
+
+// revoked returns the revocation ids in force in ns now: its own and those
+// of its local bases (§C.4).
+func (b *branch) revoked(ctx context.Context, ns string) (map[string]bool, error) {
+	out := map[string]bool{}
+	for i := 0; ns != "" && i <= maxDepth; i++ {
+		doc, err := b.current(ctx, ns)
+		if err != nil {
+			return nil, err
+		}
+		rv, _ := doc["revoked"].([]any)
+		for _, x := range rv {
+			if s, ok := x.(string); ok {
+				out[s] = true
+			}
+		}
+		ns, _, _ = localBase(doc)
+	}
+	return out, nil
+}
+
+// starKey reports whether a namespace entry's recorded grant chains to a
+// current * key of the branch (§F.6), as far as a janitor can tell from
+// what the entry records, the grant's id and its root sub and kid (§7.4):
+// the kid names a key whose can lists "*" among the keys the branch
+// accepts now (keys: its own or a local base's), and the grant isn't
+// revoked there now. A kid is a name within a namespace, so for an entry
+// written in another namespace, in (a successor), the kid must also name
+// the same key, alg and pub, among those in accepts now. why says what
+// failed. An entry without a grant, such as one written while
+// authentication was disabled, is the caller's to judge.
+func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string) (ok bool, why string, err error) {
+	if e.Grant == nil || e.Grant.Kid == "" {
+		return false, "it records no key", nil
+	}
+	kid := e.Grant.Kid
+	keys, err := b.keys(ctx, b.ns)
+	if err != nil {
+		return false, "", err
+	}
+	k, found := keys[kid]
+	switch {
+	case !found:
+		return false, fmt.Sprintf("key %q isn't one the branch accepts now (§C.4)", kid), nil
+	case !k.star:
+		return false, fmt.Sprintf("key %q isn't a * key of the branch", kid), nil
+	}
+	rv, err := b.revoked(ctx, b.ns)
+	if err != nil {
+		return false, "", err
+	}
+	if e.Grant.ID != "" && rv[e.Grant.ID] {
+		return false, fmt.Sprintf("its grant %s is revoked in the branch (§C.4)", e.Grant.ID), nil
+	}
+	if in == b.ns {
+		return true, "", nil
+	}
+	ks, err := b.keys(ctx, in)
+	if err != nil {
+		return false, "", err
+	}
+	if k2, found := ks[kid]; !found || !strings.EqualFold(k2.alg, k.alg) || k2.pub != k.pub {
+		return false, fmt.Sprintf("key %q of %s isn't the branch's * key of that name", kid, in), nil
+	}
+	return true, "", nil
 }
 
 // configEntry is one of the branch's config writes, a config entry or a

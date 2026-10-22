@@ -1,12 +1,83 @@
 package janitor_test
 
 import (
+	"crypto/ed25519"
+	"errors"
+	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 
+	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/janitor"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/merge"
+	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/server"
+	"github.com/middle-management/patchlog/internal/testenv"
 )
+
+// patchConfig writes a config change to ns as c.
+func patchConfig(t *testing.T, c *client.Client, ns string, patches ...map[string]any) {
+	t.Helper()
+	ps := make([]any, len(patches))
+	for i, p := range patches {
+		ps[i] = p
+	}
+	must(c.PatchConfig(ctx, ns, must(c.NSHead(ctx, ns)).Config, ps))
+}
+
+// authEnv is a deployment with authentication on: a base "matches" whose
+// * keys are ops and tmp, with editor's key allowing everything else, and
+// a document derby.
+type authEnv struct {
+	t                  *testing.T
+	s                  *clienttest.Server
+	ops, tmp, editor   clienttest.Key
+	admin, ed, janitor *client.Client
+	nss                []string
+}
+
+var allVerbs = []string{"read", "create", "append", "config", "branch", "purge-ns"}
+
+func newAuthEnv(t *testing.T, nss []string, base map[string]any) *authEnv {
+	s := clienttest.New(t, clienttest.Options{Auth: true})
+	a := &authEnv{t: t, s: s, ops: clienttest.NewKey("ops"), tmp: clienttest.NewKey("tmp"), editor: clienttest.NewKey("editor"),
+		nss: append([]string{"matches"}, nss...)}
+	a.admin, a.ed, a.janitor = a.as(a.ops, "user:ops"), a.as(a.editor, "user:ed"), a.as(a.ops, "svc:janitor")
+	doc := map[string]any{"read": "grant", "keys": []any{a.ops.Entry("*"), a.tmp.Entry("*"), a.editor.Entry(allVerbs...)}}
+	for k, v := range base {
+		doc[k] = v
+	}
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "matches"))).CreateNamespace(ctx, "matches", doc))
+	must(a.admin.CreateDoc(ctx, "matches", "derby", map[string]any{"score": "0-0"}))
+	return a
+}
+
+// as is a client with a grant of k for sub on every namespace of the
+// environment, valid for 30 days.
+func (a *authEnv) as(k clienttest.Key, sub string) *client.Client {
+	return must(client.New(a.s.URL, client.WithBearer(k.Grant(a.t, a.s.Now(), sub, a.nss, allVerbs,
+		map[string]any{"exp": a.s.Now().Add(30 * day).Format(time.RFC3339)}))))
+}
+
+// branch creates a branch of base with an edit of derby of its own and
+// cleanup, as the editor.
+func (a *authEnv) branch(t *testing.T, base, name string, cleanup map[string]any) {
+	t.Helper()
+	must(a.ed.CreateBranch(ctx, base, client.BranchRequest{Name: name, Patches: []any{op("add", "/cleanup", cleanup)}}))
+	h := must(a.ed.Head(ctx, name, "derby"))
+	must(a.ed.Append(ctx, name, "derby", h.ID, []any{op("replace", "/score", "1-0")}))
+}
+
+func (a *authEnv) check(t *testing.T, base, ns string, after time.Duration) janitor.Decision {
+	t.Helper()
+	later := func() time.Time { return a.s.Now().Add(after) }
+	return must(janitor.New(a.janitor, janitor.Options{Now: later}).Check(ctx, base, ns))
+}
 
 // §F.6 (v0.63): a branch is purged as a state only by a member of its own
 // cleanup for that state; the base's cleanup sets minimums only, and cleanup
@@ -81,4 +152,127 @@ func TestV073PeriodFromLastClaimWrite(t *testing.T) {
 	if d := e.sweep(false)["r7"]; d.Action != janitor.ActionPurged || d.Claim != "merged" {
 		t.Fatalf("r7 %+v", d)
 	}
+}
+
+// §F.6 (v0.63): abandoned counts only if the write that set it was under a
+// grant chaining to a current * key of the branch, its own or a local
+// base's (§C.4): a * key removed since, from the branch or from the base,
+// no longer counts, also where the branch still lists its copy of a base
+// key, which never falls back once the base drops it.
+func TestV073AbandonedNeedsCurrentStarKey(t *testing.T) {
+	t.Parallel()
+	a := newAuthEnv(t, []string{"r1", "r2", "r3", "r4"}, nil)
+	for _, b := range []string{"r1", "r2", "r3", "r4"} {
+		a.branch(t, "matches", b, map[string]any{"abandoned": "P1D"})
+	}
+	abandon := func(c *client.Client, ns string) {
+		t.Helper()
+		patchConfig(t, c, ns, op("add", "/frozen", true), op("add", "/abandoned", true))
+	}
+	// r1: a * key of the branch's own, added with a base * key, sets
+	// abandoned, and is removed again.
+	own := clienttest.NewKey("own")
+	patchConfig(t, a.admin, "r1", op("add", "/keys/-", own.Entry("*")))
+	a.nss = append(a.nss, "r1")
+	abandon(a.as(own, "user:own"), "r1")
+	keys := must(a.admin.NSDoc(ctx, "r1", must(a.admin.NSHead(ctx, "r1")).ID)).Value["keys"].([]any)
+	patchConfig(t, a.admin, "r1", op("remove", "/keys/"+strconv.Itoa(len(keys)-1), nil))
+	// r2: the base's * key tmp sets abandoned; then the base drops tmp.
+	abandon(a.as(a.tmp, "user:tmp"), "r2")
+	patchConfig(t, a.admin, "matches", op("remove", "/keys/1", nil))
+	// r3: the base's * key ops, still in force.
+	abandon(a.admin, "r3")
+	// r4: ops too, but under a grant the base has revoked since.
+	abandon(a.as(a.ops, "user:revoked"), "r4")
+	log := must(a.admin.NSLog(ctx, "r4", must(a.admin.NSHead(ctx, "r4")).ID, ""))
+	patchConfig(t, a.admin, "matches", op("add", "/revoked", []any{log[len(log)-1].Grant.ID}))
+
+	for _, ns := range []string{"r1", "r2"} {
+		d := a.check(t, "matches", ns, 2*day)
+		wantKeep(t, d, "isn't one the branch accepts now")
+		if d.Claim != "" {
+			t.Fatalf("%s: %+v", ns, d)
+		}
+	}
+	wantKeep(t, a.check(t, "matches", "r4", 2*day), "is revoked in the branch")
+	if d := a.check(t, "matches", "r3", 2*day); d.Action != janitor.ActionPurged || d.Claim != "abandoned" {
+		t.Fatalf("r3: %+v", d)
+	}
+}
+
+// remoteDeployment is a second deployment, with authentication on and its
+// own origin, that reaches the clienttest servers' origin at aURL for
+// remote branches (§G.3).
+type remoteDeployment struct {
+	url string
+	op  ed25519.PrivateKey
+}
+
+type nopPurger struct{}
+
+func (nopPurger) PurgeTags([]string) {}
+
+func newRemoteDeployment(t *testing.T, aURL string) *remoteDeployment {
+	t.Helper()
+	pub, priv := grant.GenerateKey()
+	ks, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": pub, "can": []any{"*"}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := core.Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), Origin: "https://b.example", OperatorKeys: ks,
+		Purger: nopPurger{}, RetentionInterval: -1, LongPollInterval: 300 * time.Millisecond,
+		Remote: core.RemoteOptions{FollowInterval: -1, Resolve: func(origin string) (core.RemoteEndpoint, error) {
+			if origin != clienttest.Origin {
+				return core.RemoteEndpoint{}, errors.New("unknown origin " + origin)
+			}
+			return core.RemoteEndpoint{BaseURL: aURL}, nil
+		}}}
+	testenv.Apply(&o)
+	e, err := core.Open(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hs := httptest.NewServer(server.New(e))
+	t.Cleanup(func() {
+		hs.CloseClientConnections()
+		hs.Close()
+		e.Close()
+	})
+	return &remoteDeployment{url: hs.URL, op: priv}
+}
+
+// operator is a client with an operator grant to create ns (§C.4).
+func (d *remoteDeployment) operator(t *testing.T, ns string) *client.Client {
+	return must(client.New(d.url, client.WithBearer(clienttest.Mint(t, d.op, map[string]any{"kid": "operator", "sub": "op:root",
+		"ns": []any{ns}, "can": []any{"config"}, "exp": time.Now().Add(time.Hour).Format(time.RFC3339)}))))
+}
+
+// §F.6, §C.4 (v0.71, v0.72): inherited * keys come only from local bases.
+// A local branch of a remote branch inherits the remote branch's keys, but
+// not those of the remote branch's base, which lives in another
+// deployment, nor those of a namespace here that shares its name.
+func TestV073InheritedKeysOnlyFromLocalBases(t *testing.T) {
+	t.Parallel()
+	a := clienttest.New(t, clienttest.Options{})
+	ac := a.Client(t, client.WithAuthor("alice"))
+	must(ac.CreateNamespace(ctx, "matches", map[string]any{"read": "public"}))
+	must(ac.CreateDoc(ctx, "matches", "derby", map[string]any{"score": "0-0"}))
+	at := must(ac.NSHead(ctx, "matches")).ID
+
+	b := newRemoteDeployment(t, a.URL)
+	ops := clienttest.NewKey("ops")
+	must(b.operator(t, "rel").CreateNamespace(ctx, "rel", map[string]any{"read": "grant",
+		"keys": []any{ops.Entry("read", "create", "config", "branch", "purge-ns")},
+		"base": map[string]any{"origin": clienttest.Origin, "ns": "matches", "at": at}}))
+	// B's own matches, where ops is a * key.
+	must(b.operator(t, "matches").CreateNamespace(ctx, "matches", map[string]any{"read": "grant", "keys": []any{ops.Entry("*")}}))
+	ed := must(client.New(b.url, client.WithBearer(ops.Grant(t, time.Now(), "user:ed", []string{"rel", "loc", "matches"},
+		[]string{"read", "create", "config", "branch", "purge-ns"}))))
+	must(ed.CreateBranch(ctx, "rel", client.BranchRequest{Name: "loc", Patches: []any{op("add", "/cleanup", map[string]any{"abandoned": "P1D"})}}))
+	must(ed.CreateDoc(ctx, "loc", "x", map[string]any{"n": 1}))
+	patchConfig(t, ed, "loc", op("add", "/frozen", true), op("add", "/abandoned", true))
+
+	later := func() time.Time { return time.Now().Add(2 * day) }
+	d := must(janitor.New(ed, janitor.Options{Now: later}).Check(ctx, "rel", "loc"))
+	wantKeep(t, d, `key "ops" isn't a * key of the branch`)
 }
