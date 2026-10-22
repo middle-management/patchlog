@@ -792,11 +792,18 @@ func (cg *catGraph) nodeDoc(schema, title, folder string) map[string]any {
 // mkFolder makes folder t.title in folder t.parent (MKCOL): a new folder
 // node with an opaque name (§H.2).
 func (st *reqState) mkFolder(ctx context.Context, t target) error {
+	_, err := st.makeFolder(ctx, t)
+	return err
+}
+
+// makeFolder is mkFolder, returning the new folder node's name.
+func (st *reqState) makeFolder(ctx context.Context, t target) (string, error) {
 	cg, f, err := st.writeTree(ctx, t.ns)
 	if err != nil {
-		return err
+		return "", err
 	}
-	return st.createNode(ctx, t.ns, newName(), cg.nodeDoc(f.folder, t.title, t.parent))
+	name := newName()
+	return name, st.createNode(ctx, t.ns, name, cg.nodeDoc(f.folder, t.title, t.parent))
 }
 
 // newFile creates file t.title in folder t.parent of tree t.ns with body,
@@ -1376,18 +1383,196 @@ func (st *reqState) moveNode(ctx context.Context, src, dst target) error {
 }
 
 // moveFolder is a MOVE of folder src: within its tree, a rename or a move
-// (moveNode); a folder isn't copied, so it doesn't leave its tree, nor
-// replace another folder or a file.
+// (moveNode); to a new name in another tree, a new folder there that what
+// is in src moves into (moveFolderAcross). A folder doesn't replace
+// another folder or a file (§H.5), and the flat view has no folders
+// (§H.2).
 func (st *reqState) moveFolder(ctx context.Context, src, dst target) error {
 	switch {
-	case dst.ns != src.ns:
-		return fail(http.StatusForbidden, "folder %s moves only within its file tree (catalog %s); folders aren't copied: make one there, and move what is in %s into it", src.path, src.ns, src.path)
-	case dst.kind == kNewNode, dst.kind == kFolder && dst.node == src.node:
+	case dst.kind == kFolder && dst.node == src.node && dst.ns == src.ns:
 		return st.moveNode(ctx, src, dst)
-	case dst.kind == kFolder:
-		return fail(http.StatusForbidden, "%s is a folder already; a folder doesn't replace another (move what is in %s into it instead)", dst.path, src.path)
+	case dst.kind == kFolder, dst.kind == kCatDir:
+		return fail(http.StatusForbidden, "%s is a folder already; a folder doesn't replace another (move what is in %s into it instead, §H.5)", dst.path, src.path)
+	case dst.kind == kPlacement:
+		return fail(http.StatusForbidden, "%s is a file: a folder doesn't replace it (§H.5)", dst.path)
+	case dst.kind == kNewNode && dst.ns == src.ns:
+		return st.moveNode(ctx, src, dst)
+	case dst.kind == kNewNode:
+		return st.moveFolderAcross(ctx, src, dst)
+	case !st.s.cats[dst.ns]:
+		return fail(http.StatusForbidden, "folder %s moves only to a file tree: %s isn't in one, and a namespace's directory (the flat view) has no folders (§H.2)", src.path, dst.path)
 	}
 	return fail(http.StatusForbidden, "%s can't be moved to %s", src.path, dst.path)
+}
+
+// accessRefused refuses (403) to copy folder src, or move it to another
+// tree, where it carries $access or sits under a folder that does
+// (§B.11.1), as the node documents of catalog graph cg have it: the copy
+// is made without it (§H.5), which only catalog-admins set (§B.11.3), and
+// whether a copy may so widen who reads what is copied is open (§B.12).
+// Until that is settled the gateway refuses (F-H12); $access means
+// something only in a tree with tree-derived access (§B.11), so a tree
+// whose folders carry it is taken for one.
+func (st *reqState) accessRefused(cg *catGraph, src target) error {
+	seen := map[string]bool{}
+	var carrier func(n *tree.Node) *tree.Node
+	carrier = func(n *tree.Node) *tree.Node {
+		if n == nil || seen[n.Name] {
+			return nil
+		}
+		seen[n.Name] = true
+		if n.HasAccess {
+			return n
+		}
+		for _, p := range cg.g.WalkableParents(n) {
+			if c := carrier(cg.g.Node(p)); c != nil {
+				return c
+			}
+		}
+		return nil
+	}
+	c := carrier(cg.g.Node(src.node))
+	switch {
+	case c == nil:
+		return nil
+	case c.Name == src.node:
+		return fail(http.StatusForbidden, "folder %s carries access settings ($access, §B.11.1), which its copy wouldn't (§H.5): whether a copy may widen who reads what is in it is open (§B.12), so this server doesn't copy it, nor move it to another tree", src.path)
+	}
+	return fail(http.StatusForbidden, "folder %s is in a folder that carries access settings ($access, §B.11.1), which its copy wouldn't have (§H.5): whether a copy may widen who reads what is in it is open (§B.12), so this server doesn't copy it, nor move it to another tree", src.path)
+}
+
+// copyFolder makes t, the copy of a folder a COPY makes (§H.5 "Copy"),
+// before x/net/webdav copies the folder's visible children (its listing,
+// dirFile) into it one by one, unless Depth: 0 asks for the folder alone;
+// a failure part-way leaves what was done, with no rollback, and is
+// answered as that child's copy would be. The folder copied is the one
+// at t's place below the COPY's source: a tree's folder, copied to a new
+// name of a tree as a new folder node titled with that name and without
+// the source's $access (mkFolder), not into itself or a folder in it,
+// and not where it carries $access or sits under a folder that does
+// (accessRefused). Onto an existing folder or file it is 403 (412 with
+// Overwrite: F, x/net/webdav's); a namespace's directory, a tree's top
+// level and a scratch directory aren't copied.
+func (st *reqState) copyFolder(ctx context.Context, t target) error {
+	src, err := st.resolve(ctx, st.path+strings.TrimPrefix(t.path, st.dst))
+	if err != nil {
+		return err
+	}
+	if src.kind != kFolder {
+		return fail(http.StatusForbidden, "%s isn't a folder of a file tree, the only folders copied (§H.5): a namespace's directory, a tree's top level and an app's temporary folder aren't", src.path)
+	}
+	switch t.kind {
+	case kMissing:
+		return fail(http.StatusConflict, "%s can't be made: %s isn't a folder here (a file, or nothing)", t.path, t.dir)
+	case kRoot, kNSDir, kCatDir, kFolder:
+		return fail(http.StatusForbidden, "%s is a folder already: a folder copied there doesn't replace it, nor go into it (§H.5); copy it to a new name", t.path)
+	case kDoc, kRaw, kPlacement:
+		return fail(http.StatusForbidden, "%s is a file: a folder copied there doesn't replace it (§H.5)", t.path)
+	case kNewNode:
+	case kBadName:
+		if st.s.cats[t.ns] {
+			return st.badName(t)
+		}
+		fallthrough
+	default:
+		return fail(http.StatusForbidden, "folder %s is copied only into a file tree: %s isn't a new name in one, and a namespace's directory (the flat view) has no folders (§H.2)", src.path, t.path)
+	}
+	cg, _, err := st.writeTree(ctx, src.ns)
+	if err != nil {
+		return err
+	}
+	if t.ns == src.ns && (t.parent == src.node || cg.g.Descendants([]string{src.node})[t.parent]) {
+		return fail(http.StatusForbidden, "folder %s can't be copied into itself or a folder in it (§H.5)", src.path)
+	}
+	if err := st.accessRefused(cg, src); err != nil {
+		return err
+	}
+	_, err = st.makeFolder(ctx, t)
+	return err
+}
+
+// moveFolderAcross moves folder src to dst, a new name in another tree
+// (§H.5 "Copy": a folder moved to another tree): a new folder node there,
+// titled with dst's name and without src's $access, src's visible
+// children (from the node documents, nodeDir) then moved into it one by
+// one, a file as a move across trees moves it (moveAcross: a copy, then a
+// delete of the source, its item taking $successor where it leaves its
+// namespace), a folder as this, and src deleted once empty (deleteFolder).
+// A failure part-way leaves what was done, with no rollback, and is
+// answered as that child's MOVE would be. Before anything is written: a
+// folder that carries $access or sits under one isn't moved
+// (accessRefused), nor one the grant can't delete (allows). The MOVE's
+// If-Match names src's node (srcPrecondition), not its files.
+func (st *reqState) moveFolderAcross(ctx context.Context, src, dst target) error {
+	cg, _, err := st.writeTree(ctx, src.ns)
+	if err != nil {
+		return err
+	}
+	if err := st.accessRefused(cg, src); err != nil {
+		return err
+	}
+	if err := st.allows(ctx, src, src.ns, "delete"); err != nil {
+		return err
+	}
+	match, anyMatch := st.srcMatch, st.srcAny
+	st.srcMatch, st.srcAny = "", false
+	defer func() { st.srcMatch, st.srcAny = match, anyMatch }()
+	if err := st.moveInto(ctx, src, dst); err != nil {
+		return err
+	}
+	st.scratchMoveUnder(src.path, dst.path)
+	return st.deleteFolder(ctx, src)
+}
+
+// moveInto makes folder dst and moves folder src's visible children into
+// it (moveFolderAcross).
+func (st *reqState) moveInto(ctx context.Context, src, dst target) error {
+	node, err := st.makeFolder(ctx, dst)
+	if err != nil {
+		return err
+	}
+	cg, err := st.freshGraph(ctx, src.ns)
+	if err != nil {
+		return err
+	}
+	d, err := st.nodeDir(ctx, src.ns, src.node)
+	if err != nil {
+		return err
+	}
+	for _, e := range d.entries {
+		from := target{path: src.path + "/" + e.name, dir: src.path, base: e.name, ns: src.ns, node: e.node.Name, parent: src.node,
+			title: e.name, listedAs: nodeName(e.node)}
+		title, err := newTitle(e.name)
+		if err != nil {
+			return err
+		}
+		to := target{kind: kNewNode, path: dst.path + "/" + e.name, dir: dst.path, base: e.name, ns: dst.ns, parent: node, title: title}
+		if e.node.Kind == kindFolder {
+			from.kind = kFolder
+			if err := st.accessRefused(cg, from); err != nil {
+				return err
+			}
+			if err := st.moveInto(ctx, from, to); err != nil {
+				return err
+			}
+			st.scratchMoveUnder(from.path, to.path)
+			err := st.deleteFolder(ctx, from)
+			st.changed()
+			if err != nil {
+				return err
+			}
+			continue
+		}
+		from.kind, from.docNS, from.docName = kPlacement, e.node.ItemNS, e.node.ItemName
+		err = st.moveAcross(ctx, from, to)
+		// What was read before is stale now: the folder's emptiness is
+		// read again from the node documents (deleteFolder).
+		st.changed()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // moveFile is a MOVE of live file src where a tree is involved (§H.5):
@@ -1431,7 +1616,7 @@ func (st *reqState) copyOfFile(ctx context.Context, src target) (headDoc, []byte
 	if err != nil {
 		return hd, nil, err
 	}
-	st.ctype = hd.m.Type
+	st.ctype, st.copySrc = hd.m.Type, nil
 	if r := hd.m.raw; r != nil {
 		st.copySrc = &blobSrc{ns: hd.ns, name: hd.name, ref: *r}
 	}

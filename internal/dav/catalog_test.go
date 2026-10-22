@@ -486,7 +486,7 @@ func TestTreeRenameMove(t *testing.T) {
 	e.expect(e.do("MOVE", "/cat/Empty", "", "Destination", "/cat/Empty/Empty"), 403, "a folder into itself")
 	e.expect(e.do("MOVE", "/cat/Empty", "", "Destination", "/cat/Season"), 403, "a folder over another")
 	e.expect(e.do("MOVE", "/cat/Empty/Old%20Stuff/Derby.json", "", "Destination", "/cat/Season"), 403, "a file over a folder")
-	e.expect(e.do("MOVE", "/cat/Season", "", "Destination", "/matches/Season"), 403, "a folder out of its tree")
+	e.expect(e.do("MOVE", "/cat/Season", "", "Destination", "/matches/Season"), 403, "a folder out of its tree, into the flat view")
 	e.expect(e.do("MOVE", "/cat/Empty/Old%20Stuff/Derby.json", "", "Destination", "/cat/Season/bad."), 403, "a rename to a refused name")
 	sameJSON(t, e.parentsOf("season"), parents("cat", "root"))
 }
@@ -596,7 +596,8 @@ func TestTreeDeleteThenWrite(t *testing.T) {
 // A copy is a new item with the source's content, and a placement: a raw
 // file's blob copied with Blob-From (§7.8), keeping its id, or uploaded
 // again where the source's rank doesn't allow that (§H.5 "Copy"). A
-// folder isn't copied.
+// folder is copied as a new folder of what is in it (since v0.67,
+// TestV073FolderCopy).
 func TestTreeCopy(t *testing.T) {
 	t.Parallel()
 	var froms, uploads atomic.Int64
@@ -655,7 +656,8 @@ func TestTreeCopy(t *testing.T) {
 	if b := e.expect(e.do("GET", "/cat/secret.png", ""), 200, "GET").body; b != "\x89PNG secret" {
 		t.Fatalf("GET %q", b)
 	}
-	e.expect(e.do("COPY", "/cat/Season", "", "Destination", "/cat/Season2"), 403, "COPY of a folder")
+	e.expect(e.do("COPY", "/cat/Season", "", "Destination", "/cat/Season2"), 201, "COPY of a folder")
+	sameStrings(t, "Season2", names(e.propfind("/cat/Season2/"), "/cat/Season2/"), names(e.propfind("/cat/Season/"), "/cat/Season/"))
 }
 
 // A file moved to another tree or namespace is copied, then deleted; its

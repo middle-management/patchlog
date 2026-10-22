@@ -861,11 +861,17 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 			st.hdr.Del("If-Modified-Since")
 		}
 	}
+	copied := st.method == "COPY" && (t.path == st.path || strings.HasPrefix(t.path, st.path+"/"))
+	if copied {
+		// The file a COPY copies next, itself or one in the folder it
+		// copies (copyFolder): none of the last one's type or blob.
+		st.ctype, st.copySrc = "", nil
+	}
 	if r := hd.m.raw; r != nil {
 		if served && r.typ == pdfType {
 			st.servePDF()
 		}
-		if st.method == "COPY" && t.path == st.path {
+		if copied {
 			// The copy's type is the source's (fileType), and its blob the
 			// source's, copied (§7.8, §H.5 "Copy").
 			st.ctype = r.typ
@@ -964,12 +970,14 @@ func (d *davFS) Mkdir(ctx context.Context, name string, perm os.FileMode) error 
 }
 
 func (st *reqState) mkdir(ctx context.Context, name string) error {
-	if st.method == "COPY" {
-		return fail(http.StatusForbidden, "folders aren't copied; move them, or make one and move what goes in it")
-	}
 	t, err := st.resolve(ctx, name)
 	if err != nil {
 		return err
+	}
+	if st.method == "COPY" {
+		// x/net/webdav makes the copy of a folder before copying what is
+		// in it, one by one.
+		return st.copyFolder(ctx, t)
 	}
 	switch t.kind {
 	case kMissing:
