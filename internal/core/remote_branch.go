@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -541,11 +542,7 @@ func fetchSchemaSources(ctx context.Context, c *client.Client, schemas []*remote
 			continue
 		}
 		src := schemaSource{rank: rankPrivate}
-		h, err := c.NSHead(ctx, s.ns)
-		var d *client.NSDoc
-		if err == nil {
-			d, err = c.NSDoc(ctx, s.ns, h.ID)
-		}
+		d, err := currentNSDoc(ctx, c, s.ns)
 		switch {
 		case err == nil:
 			src = schemaSource{rank: sourceRank(d.Value), nonce: d.Value["nonce"] == "required"}
@@ -639,18 +636,42 @@ func fetchLevel(ctx context.Context, c *client.Client, origin, ns, at string, ma
 	return lv, &BaseRef{NS: bns, At: bat}, nil
 }
 
-// unknownLevel refuses a remote branch whose base's namespace document
-// can't be read at at: without it, B can't tell how protected the base is
-// (§G.5.2). No answer, or a 5xx, stays a 502; anything else the base
+// unknownLevel refuses a remote branch whose base's current namespace
+// document can't be read: without it, B can't tell how protected the base
+// is (§G.5.2). No answer, or a 5xx, stays a 502; anything else the base
 // answered, or a document B can't open, is 422.
 func unknownLevel(base *BaseRef, err error) *Error {
-	what := "/ns/" + base.NS + "/rev/" + base.At
+	what := "/ns/" + base.NS
 	msg := fmt.Sprintf("%s: this deployment can't read the base's namespace document (%v), so it can't tell how protected the base is; "+
 		"a remote branch is refused then (§G.5.2): the endpoint's grant needs read on it, and keys if it is sealed", what, err)
 	if noAnswer(err) {
 		return upstreamErr("%s", msg)
 	}
 	return invalid(msg)
+}
+
+// currentNSDoc fetches a namespace's current document at the base: the
+// one at its head.
+func currentNSDoc(ctx context.Context, c *client.Client, ns string) (*client.NSDoc, error) {
+	h, err := c.NSHead(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	return c.NSDoc(ctx, ns, h.ID)
+}
+
+// docLevel is the encryption level a namespace document of the base
+// declares; one this deployment doesn't know counts as the strictest.
+func docLevel(doc map[string]any) int {
+	enc, ok := doc["encryption"].(map[string]any)
+	if !ok {
+		return levelNone
+	}
+	lv, _ := enc["level"].(string)
+	if l := levelOf(lv); l != levelNone {
+		return l
+	}
+	return levelE2E
 }
 
 // fetchEpochs reads an e2e level's encryption member as of its at, and its
@@ -767,10 +788,13 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 		}
 		m.levels = append(m.levels, lv)
 		if len(m.levels) == 1 {
-			// The base's protection comes from its namespace document
-			// (sealed ones are decrypted with the endpoint's keys). One B
-			// can't read is refused: its level can't be told (§G.5.2).
-			d, err := c.NSDoc(ctx, base.NS, base.At)
+			// The base's protection comes from its current namespace
+			// document, as a local branch's creation is judged by its
+			// base's (§G.5.2, §7.4): its read, level and nonce setting,
+			// which merging back must pass there now (§C.7). Sealed ones
+			// are decrypted with the endpoint's keys. One B can't read is
+			// refused: its protection can't be told (§G.5.2).
+			d, err := currentNSDoc(ctx, c, base.NS)
 			if err != nil {
 				return nil, unknownLevel(base, err)
 			}
@@ -782,19 +806,23 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirro
 			if d.Value["read"] == "public" {
 				m.read = "public"
 			}
-			if enc, ok := d.Value["encryption"].(map[string]any); ok {
-				lv, _ := enc["level"].(string)
-				if m.level = levelOf(lv); m.level == levelNone {
-					m.level = levelE2E // unknown: the strictest
+			m.level = docLevel(d.Value)
+			lv.nonce = d.Value["nonce"] == "required" && m.level != levelE2E
+			if m.level == levelE2E {
+				// A branch of a raised base can't be created with an at
+				// before its e2e raise (Addendum E, Levels): the epoch
+				// key in force at an earlier at also opens what the base
+				// sealed after it. The base's document as of at says
+				// whether the raise lies after at.
+				ad, err := c.NSDoc(ctx, base.NS, base.At)
+				if err != nil && noAnswer(err) {
+					return nil, upstreamErr("/ns/%s/rev/%s: %v", base.NS, base.At, err)
+				}
+				if err != nil || docLevel(ad.Value) != levelE2E {
+					return nil, docInvalid("/base/at", "/base/at is before the base's raise to e2e: a branch of a raised base "+
+						"can't be created with an at before its e2e raise (Addendum E, Levels, §G.5.2); create it at a later at, such as the base's head")
 				}
 			}
-			// The nonce setting is the base's current one, not the one at
-			// at: merging back must pass there now (§C.7).
-			nonce, err := c.NonceRequired(ctx, base.NS)
-			if err != nil {
-				return nil, mapErr("/ns/"+base.NS, err)
-			}
-			lv.nonce = nonce && m.level != levelE2E
 		}
 		if next == nil {
 			break
@@ -1083,6 +1111,11 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	}
 	if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
 		return nil, docInvalid("/base/chain", fmt.Sprintf("/base/chain must be %s: the base's namespace, then its base, and so on, as of at (§G.3)", jsonv.Canonical(chain)))
+	}
+	if m.level == levelE2E && slices.Contains(cfg.Base.Chain, req.NS) {
+		// A kid {ns}#{e} names one keyring (§F.8.1).
+		return nil, docInvalid("/base/chain", "/base/chain names "+req.NS+": a remote branch of an e2e base can't have the name of a namespace in its base.chain, "+
+			"since read-through ciphertext keeps their names in pl.ns and kid (§G.5.2, §F.8.1)")
 	}
 	// The shadows' mirrored rows follow the branch's level.
 	if t.shadowLevels == nil {

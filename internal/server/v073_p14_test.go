@@ -288,3 +288,63 @@ func TestV073RegistrationSamePrincipal(t *testing.T) {
 		t.Fatalf("renewal retry under the same sub and kid: %d %s", r.Code, r.Body)
 	}
 }
+
+// Creation is judged against the base's current namespace document, as a
+// local branch's is against its base's: its read, its level, and an at
+// before its raise to e2e (§G.5.2, §7.4, Addendum E Levels).
+func TestV073RemoteCurrentSourceDocument(t *testing.T) {
+	t.Parallel()
+	a, b, rt := pair(t, nil, []envOpt{withKeyStore(newKeyStore(t))})
+	a.mkNS("main", map[string]any{"read": "public"})
+	a.create("main", "p", map[string]any{"v": 1.0})
+	at := a.nsHead("main")
+	// A public at at, private now: a public remote branch is refused.
+	expect(t, a.patchNS("main", ops(op("replace", "/read", "grant")), ""), 201)
+	if r := b.mkRemote("pub", remoteGenesis("main", at, nil)); r.Code != 422 || r.Str("code") != "invalid" {
+		t.Errorf("public remote branch of a base private now: %d %s, want 422 invalid", r.Code, r.Body)
+	}
+	expect(t, b.mkRemote("rel", remoteGenesis("main", at, map[string]any{"read": "grant"})), 201)
+
+	// e2e now, but not at at: at is before the raise, whatever the
+	// branch's level. (A's deployment is made to claim the raise; this
+	// server raises nothing to e2e.)
+	a.mkNS("m", map[string]any{"read": "public"})
+	a.create("m", "p", map[string]any{"v": 1.0})
+	atM := a.nsHead("m")
+	expect(t, a.patchNS("m", ops(op("add", "/x-title", "raised")), ""), 201)
+	head := a.nsHead("m")
+	rt.set(tamper(t, a, "/ns/m/rev/"+head, func(b []byte) []byte {
+		return bytes.Replace(b, []byte(`{"read"`), []byte(`{"encryption":{"level":"e2e"},"read"`), 1)
+	}), "")
+	for name, doc := range map[string]map[string]any{
+		"private": {"read": "grant"},
+		"e2e":     e2eDoc(map[string]any{"read": "grant"}),
+	} {
+		r := b.mkRemote("relm", remoteGenesis("m", atM, doc))
+		expectCode(t, r, 422, "invalid")
+		if errs, _ := r.Obj()["errors"].([]any); len(errs) != 1 || errs[0].(map[string]any)["pointer"] != "/base/at" {
+			t.Fatalf("%s: %s, want an error at /base/at", name, r.Body)
+		}
+		expect(t, b.get("/ns/relm"), 404)
+	}
+}
+
+// An E3 remote branch can't have the name of a namespace in its
+// base.chain: a kid {ns}#{e} names one keyring (§G.5.2, §F.8.1).
+func TestV073RemoteE2ENameInChain(t *testing.T) {
+	t.Parallel()
+	a, b, _ := pair(t, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning}, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning})
+	a.mkNS("e", e2eDoc(map[string]any{"read": "grant"}))
+	at := a.nsHead("e")
+	r := b.mkRemote("e", remoteGenesis("e", at, e2eDoc(map[string]any{"read": "grant"})))
+	expectCode(t, r, 422, "invalid")
+	if errs, _ := r.Obj()["errors"].([]any); len(errs) != 1 || errs[0].(map[string]any)["pointer"] != "/base/chain" {
+		t.Fatalf("%s, want an error at /base/chain", r.Body)
+	}
+	expect(t, b.get("/ns/e"), 404)
+	expect(t, b.mkRemote("rel", remoteGenesis("e", at, e2eDoc(map[string]any{"read": "grant"}))), 201)
+
+	// Below E3 the name is free (§G.5.2 binds e2e sources only).
+	a.mkNS("plain", map[string]any{"read": "public"})
+	expect(t, b.mkRemote("plain", remoteGenesis("plain", a.nsHead("plain"), nil)), 201)
+}
