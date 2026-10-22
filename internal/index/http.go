@@ -324,12 +324,15 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	// ns), in one hop, if the service follows it and the reader may see
 	// it; any other is 400 (§A.5), with one message either way, as in
 	// /_refs, so a min doesn't tell which private namespaces are indexed.
+	// A namespace whose keys the service lacks is one it doesn't follow
+	// (§A.4): no checkpoint will cover it.
+	lacks := func(other string) bool { _, l := ix.keys.Skip(other); return l }
 	for i, m := range q.Mins {
 		switch {
 		case m.NS == "":
 			q.Mins[i].NS = ns
 		case m.NS == ns:
-		case !ix.known(m.NS):
+		case !ix.known(m.NS) || lacks(m.NS):
 			w.Header().Set("Cache-Control", "no-store")
 			writeErr(w, http.StatusBadRequest, "bad_input", minElsewhere)
 			return

@@ -451,3 +451,41 @@ func TestV073SchemaFilter(t *testing.T) {
 		x.expect("/items?schema=" + url.QueryEscape(s))
 	}
 }
+
+// TestV073MinLackingKeys (IX-2, §A.4, §A.5): a namespace whose keys the
+// service lacks is answered as one it doesn't follow. A min naming one on
+// a query of another namespace is then 400, as a min naming an unfollowed
+// namespace is, not a wait ending in 503 behind.
+func TestV073MinLackingKeys(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
+	keys := []any{admin.Entry("*"), issuer.Entry("read")}
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "e"))).CreateNamespace(ctx, "e", map[string]any{"read": "grant", "keys": keys,
+		"encryption": map[string]any{"level": "e2e"}}))
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "pub"))).CreateNamespace(ctx, "pub", map[string]any{"read": "public", "keys": keys}))
+	wr := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:w", []string{"pub"}, []string{"read", "create"})))
+	must(wr.CreateDoc(ctx, "pub", "a", map[string]any{"title": "x"}))
+	bob := issuer.Grant(t, s.Now(), "user:bob", []string{"e", "pub"}, []string{"read"})
+	// No keyring of e names the service's recipient key: it lacks keys.
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"e", "pub"}, []string{"read"}, map[string]any{"enc": jwk})),
+		client.WithKeys(client.NewKeys(priv)))
+	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"e", "pub"}, untyped: true, now: s.Now, minWait: 300 * time.Millisecond},
+		func(o *indexOpts) { o.Recipient = priv })
+	id := x.caughtUp("pub") // any well-formed ns_id
+	waitFor(t, "e skipped", func() bool { return x.raw("/e", bob).status == 404 })
+	unf := x.raw("/pub?min=unfollowed:"+id, bob)
+	if unf.status != 400 || unf.body["code"] != "bad_input" {
+		t.Fatalf("unfollowed min: %d %v", unf.status, unf.body)
+	}
+	lack := x.raw("/pub?min=e:"+id, bob)
+	if lack.status != unf.status || fmt.Sprint(lack.body) != fmt.Sprint(unf.body) || lack.header.Get("Cache-Control") != unf.header.Get("Cache-Control") {
+		t.Errorf("a min naming a namespace whose keys the service lacks: %d %v %v, unlike an unfollowed one: %d %v %v",
+			lack.status, lack.body, lack.header, unf.status, unf.body, unf.header)
+	}
+}
