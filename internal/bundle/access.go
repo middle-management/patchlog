@@ -59,17 +59,20 @@ func docAccess(doc any) string {
 
 // e2eEpochs lists the epochs the lines of an e2e namespace are sealed
 // under: the kids of sealed patch sets, and the keyring's current epochs.
+// err is a failure to read the target, which a requires decides for
+// (e2eRestoresRequires).
 // Each document keeps its lines' epochs (bdoc.epochs) for the batches
 // (splitEpochs): a sealed line's kid's, a keyring line's current epoch
 // after it, 0 for a tombstone or a restore.
 // It checks those lines as §G.5.1 has the importer do at step 1: every
 // rev line but the keyring's is one sealed op whose pl.ns and kid name the
-// namespace, or a restore's []. Anything else (plaintext history from
-// before the source became end-to-end, or a line a branch reads through
-// from a base, sealed under the base's name) is a problem: such history is
-// carried over as a merge by a client that holds both sets of keys, with
-// new ids. Tombstones carry no patches.
-func (im *importer) e2eEpochs(ns string) (lo, hi int, problems []string, err error) {
+// namespace, or a restore's [], one whose parent is a tombstone (§6.2).
+// Anything else (plaintext history from before the source became
+// end-to-end, a [] appended to a live revision or created with, or a line
+// a branch reads through from a base, sealed under the base's name) is a
+// problem: such history is carried over as a merge by a client that holds
+// both sets of keys, with new ids. Tombstones carry no patches.
+func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, problems []string, err error) {
 	note := func(e int) {
 		if lo == 0 || e < lo {
 			lo = e
@@ -88,8 +91,10 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, problems []string, err err
 			var doc any
 			live := false
 			for i, l := range d.lines {
-				if doc, live, err = verify.Replay(doc, live, []client.LogEntry{l.LogEntry()}); err != nil {
-					return 0, 0, nil, fmt.Errorf("%s: %w", k, err)
+				var rerr error
+				if doc, live, rerr = verify.Replay(doc, live, []client.LogEntry{l.LogEntry()}); rerr != nil {
+					problems = append(problems, fmt.Sprintf("e2e namespace %s: %s: %v", ns, k, rerr))
+					break
 				}
 				if kr, err := seal.ParseKeyring(doc); live && err == nil {
 					note(kr.Current)
@@ -103,7 +108,20 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, problems []string, err err
 				continue
 			}
 			if ps, isArr := l.Patches.([]any); isArr && len(ps) == 0 {
-				continue // a restore's []
+				// A restore's [] only: its parent, the line before it, is a
+				// tombstone. An incremental document's first line follows
+				// requires, the target's (e2eRestoresRequires).
+				restore := i > 0 && d.lines[i-1].Kind == "tombstone"
+				if i == 0 && l.Parent != "" {
+					if restore, err = im.e2eRestoresRequires(ctx, d); err != nil {
+						return 0, 0, nil, err
+					}
+				}
+				if !restore {
+					problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s is [] after a revision that isn't a tombstone, so it isn't one sealed op or a restore's [], as history from before the source became end-to-end may be: "+
+						"only a client holding both sets of keys carries it over, as a merge with new ids (§6.2, §G.5.1, Addendum E Levels)", ns, l.ID, d.name))
+				}
+				continue
 			}
 			jwe, ok := seal.SealedJWE(l.Patches)
 			if !ok {
@@ -131,6 +149,23 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, problems []string, err err
 		lo, hi = 1, 1
 	}
 	return lo, hi, problems, nil
+}
+
+// e2eRestoresRequires reports whether an incremental document's first
+// line, a [] whose parent is requires, may stand as a restore. The import
+// writes that line only where the target's head is requires, and then
+// requires must be a tombstone there. Where the target's head is another,
+// or it has none, the line isn't written: the target holds it already, or
+// the requires check or classification (step 2) leaves the document out.
+func (im *importer) e2eRestoresRequires(ctx context.Context, d *bdoc) (bool, error) {
+	th, err := im.head(ctx, d.tns, d.name)
+	if client.IsNotFound(err) || client.IsGone(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return th.ID != d.requires || th.State == client.Tombstoned, nil
 }
 
 // e2eKeyringConflict reports an existing e2e target whose keyring has a
@@ -294,11 +329,12 @@ func (im *importer) checkAccess(ctx context.Context) error {
 		if src == AccessE2E {
 			// Ciphertext, verbatim (§G.5.1): only an e2e target of the
 			// same name can take it. No override: it can't work otherwise.
-			lo, _, probs, err := im.e2eEpochs(tg.src)
+			lo, _, probs, err := im.e2eEpochs(ctx, tg.src)
+			if err != nil {
+				return fmt.Errorf("import: target namespace %s: %w", tns, err)
+			}
 			problems = append(problems, probs...)
 			switch {
-			case err != nil:
-				problems = append(problems, fmt.Sprintf("e2e namespace %s: %v", tg.src, err))
 			case snapshots[tg.src]:
 				problems = append(problems, fmt.Sprintf("e2e namespace %s has snapshot documents, which only a client holding its keys can import (§G.5.1)", tg.src))
 			case tns != tg.src:

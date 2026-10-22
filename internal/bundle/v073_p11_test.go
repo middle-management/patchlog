@@ -719,7 +719,14 @@ func TestV073SealedPublicTargetRanksPublic(t *testing.T) {
 // and a keyring whose revisions are the keyrings given, if any.
 func e2eChain(t *testing.T, ns, name string, keyrings []*seal.Keyring, patchSets ...[]any) []byte {
 	t.Helper()
-	chain := func(res string, sets [][]any) (ls []bundle.Line, head string) {
+	return e2eBundle(t, ns, name, "", keyrings, patchSets...)
+}
+
+// e2eBundle is e2eChain with the document's chain going on from requires,
+// an incremental document, unless requires is "".
+func e2eBundle(t *testing.T, ns, name, requires string, keyrings []*seal.Keyring, patchSets ...[]any) []byte {
+	t.Helper()
+	chain := func(res string, sets [][]any, head string) (ls []bundle.Line, _ string) {
 		for _, ps := range sets {
 			if ps == nil {
 				id := must(client.ExpectedTombstone(head))
@@ -743,12 +750,15 @@ func e2eChain(t *testing.T, ns, name string, keyrings []*seal.Keyring, patchSets
 			sets = append(sets, ops(op("replace", "", kr.Value())))
 		}
 		sets[0] = client.GenesisPatches(keyrings[0].Value())
-		ls, head := chain("keyring", sets)
+		ls, head := chain("keyring", sets, "")
 		h.Docs[bundle.Key(ns, "keyring")] = bundle.DocInfo{History: bundle.Full, Head: head}
 		all = append(all, ls...)
 	}
-	ls, head := chain(name, patchSets)
+	ls, head := chain(name, patchSets, requires)
 	h.Docs[bundle.Key(ns, name)] = bundle.DocInfo{History: bundle.Full, Head: head}
+	if requires != "" {
+		h.Requires = map[string]string{bundle.Key(ns, name): requires}
+	}
 	all = append(all, ls...)
 	var buf bytes.Buffer
 	w := must(bundle.NewWriter(&buf, h))
@@ -1034,5 +1044,54 @@ func TestV073AtomicItemLimitIsNotBatchTooLarge(t *testing.T) {
 		if h := dst.head("m", "a-small"); h.State != client.NotFound {
 			t.Fatalf("v0.73 answers %v: the failed atomic batch wrote", v073)
 		}
+	}
+}
+
+// A [] in an e2e source is a restore's only where its parent is a
+// tombstone: one appended to a live revision, or created with, refuses
+// the bundle at step 1 as any line that isn't one sealed op does, before
+// anything is written. The parent of an incremental document's first line
+// is requires, the target's (§6.2, §G.5.1, MF-53).
+func TestV073E2EEmptyPatchSetOnlyRestores(t *testing.T) {
+	t.Parallel()
+	k := seal.NewKey()
+	kr := must(seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{identity(t).PublicKey()}))
+	g := client.GenesisPatches(map[string]any{"v": 1.0})
+	s1 := sealedSet(t, k, "e#1", "e", "d", "", g)
+	id1 := must(client.ExpectedRevision("", must(client.ToValue(s1))))
+	tomb := must(client.ExpectedTombstone(id1))
+	refused := func(name string, dst *deployment, b []byte) {
+		t.Helper()
+		_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true})
+		var ae *bundle.AccessError
+		if !errors.As(err, &ae) || !strings.Contains(err.Error(), "after a revision that isn't a tombstone") {
+			t.Errorf("%s: %v, want an access error at step 1", name, err)
+		}
+	}
+	for name, sets := range map[string][][]any{
+		"[] appended to a live revision": {s1, {}},
+		"[] created with":                {{}},
+	} {
+		dst := newEncDeployment(t, cmsOrigin)
+		refused(name, dst, e2eChain(t, "e", "d", []*seal.Keyring{kr}, sets...))
+		if _, err := dst.c.NSHead(ctx, "e"); !client.IsNotFound(err) {
+			t.Errorf("%s: the refused import created e: %v", name, err)
+		}
+	}
+
+	// An incremental document whose first line is [] after requires: a
+	// restore where requires is a tombstone in the target, refused where
+	// it is live.
+	dst := newEncDeployment(t, cmsOrigin)
+	importB(t, dst, e2eChain(t, "e", "d", []*seal.Keyring{kr}, s1, nil), bundle.ImportOptions{})
+	importB(t, dst, e2eBundle(t, "e", "d", tomb, nil, []any{}), bundle.ImportOptions{})
+	if h := dst.head("e", "d"); h.State != client.Live || h.ID != must(client.ExpectedRevision(tomb, []any{})) {
+		t.Fatalf("a restore after requires: %+v", h)
+	}
+	dst2 := newEncDeployment(t, cmsOrigin)
+	importB(t, dst2, e2eChain(t, "e", "d", []*seal.Keyring{kr}, s1), bundle.ImportOptions{})
+	refused("[] appended to requires", dst2, e2eBundle(t, "e", "d", id1, nil, []any{}))
+	if h := dst2.head("e", "d"); h.ID != id1 {
+		t.Fatalf("the refused import wrote: %+v", h)
 	}
 }
