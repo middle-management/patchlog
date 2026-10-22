@@ -2104,11 +2104,14 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 			// The step's gestures (§7.2), as the request resolved them.
 			gesture, undoes := nullStr(it.Steps[k].Gesture), nullStr(it.Steps[k].Undoes)
 			var size, digest any
-			if k == len(it.steps)-1 && !step.del && level < levelSealed {
+			if k == len(it.steps)-1 && !step.del && level < levelAtRest {
 				// The head the write leaves (headMeta). Sealed and e2e
 				// namespaces never list them, and can't become less
 				// protected: none (e2e content has no document here
-				// anyway, §E.3).
+				// anyway, §E.3). Nor does one encrypted at rest, where
+				// a plaintext sha-256 beside the encrypted content would
+				// confirm a guess of the document (§E.1 Stored digests):
+				// its reads hash the document they serve.
 				if step.docCanon == nil {
 					step.docCanon = jsonv.Canonical(step.doc)
 				}
@@ -2244,13 +2247,16 @@ func (t *tx) insertItemsBy(n *nsRow, st []*itemState, ws []writer) []histRow {
 // that moves a head stores them where it has the document at hand: step 7
 // here, and the chains remote branches and mirrored schemas insert
 // (insertChain). Sealed and e2e namespaces store none, as they list none
-// (e2e content has no document here, §E.3), nor do tombstones, nor rows
-// written before them or by an older instance, which are listed without
-// them until the next write. Nothing fills them in later, so a /heads page
-// never gains them once served; they only go: a purge clears them with
-// the content (its entry lists a purge, and its tags purge the cached
-// pages), and a namespace raised to sealed lists them, and created, no
-// more, and purges ns:{ns} with the raise (§9).
+// (e2e content has no document here, §E.3), nor do namespaces encrypted
+// at rest, where the digest would sit in plaintext beside the encrypted
+// content (§E.1 Stored digests), nor tombstones, nor rows written before
+// them or by an older instance, which are listed without them until the
+// next write. Nothing fills them in later, so a /heads page never gains
+// them once served; they only go: a purge clears them with the content
+// (its entry lists a purge, and its tags purge the cached pages), any
+// raise of the level clears them (encryptNamespace), and a namespace
+// raised to sealed lists them, and created, no more, and purges ns:{ns}
+// with the raise (§9).
 func headMeta(doc []byte) (int64, []byte) {
 	sum := sha256.Sum256(doc)
 	return int64(len(doc)), sum[:]

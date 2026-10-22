@@ -302,7 +302,8 @@ func TestHeadMetaEncrypted(t *testing.T) {
 // and its revisions carry no Last-Modified or Repr-Digest. The raise
 // purges ns:{ns}, which the pages and revisions cached with them carry
 // (§9), whether the namespace was public or private; raising to at-rest
-// changes nothing listed, and purges nothing.
+// purges nothing, and drops the stored size and digest, which would sit in
+// plaintext beside the encrypted content (§E.1 Stored digests, v0.56).
 func TestHeadMetaSealedLater(t *testing.T) {
 	t.Parallel()
 	rec := &recPurger{}
@@ -323,7 +324,7 @@ func TestHeadMetaSealedLater(t *testing.T) {
 		if calls := rec.take(); purged(calls, "ns:"+ns) {
 			t.Fatalf("%s: a raise to at-rest purged %v", ns, calls)
 		}
-		if it := e.headItems(ns, at)["a"]; it["digest"] == nil {
+		if it := e.headItems(ns, at)["a"]; it["created"] == nil || it["digest"] != nil || it["size"] != nil {
 			t.Fatalf("at-rest %v", it)
 		}
 		expect(t, e.patchNS(ns, ops(op("replace", "/encryption", map[string]any{"level": "sealed"})), ""), 201)

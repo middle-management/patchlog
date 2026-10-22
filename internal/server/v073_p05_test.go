@@ -1,6 +1,7 @@
 package server
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -401,6 +402,46 @@ func TestV073ValuesEveryNamespace(t *testing.T) {
 	r := e.branch("v1", map[string]any{"name": "v1b", "at": at, "patches": ops(op("replace", "/limits/patchSetSize", 4000))}, "alice")
 	expectLimit(t, r, 422, "patchSetSize", 4324, 4000)
 	expect(t, e.branch("v1", map[string]any{"name": "v1b", "at": at}, "alice"), 201)
+}
+
+// v0.73 §E.1 Stored digests: a namespace encrypted at rest stores no
+// plaintext size or digest of its heads beside the encrypted content, and
+// a raise to at-rest clears the ones stored before. /heads leaves them
+// out; a revision read still sends Repr-Digest (§7.1), of the document it
+// serves.
+func TestV073NoStoredDigestsAtRest(t *testing.T) {
+	t.Parallel()
+	path := v073DB(t)
+	e := newSealedEnv(t, withPath(path))
+	e.mkNS("r", map[string]any{"read": "public", "encryption": map[string]any{"level": "at-rest"}})
+	a := e.create("r", "a", map[string]any{"a": 1.0})
+	if n := storedMeta(t, path); n != 0 {
+		t.Fatalf("%d revisions at rest store a size or digest", n)
+	}
+	if it := e.headItems("r", e.nsHead("r"))["a"]; it["created"] == nil || it["size"] != nil || it["digest"] != nil {
+		t.Fatalf("at-rest heads %v", it)
+	}
+	for i := 0; i < 2; i++ { // computed, then from the read cache
+		r := e.get("/r/r/a/rev/" + a)
+		sum := sha256.Sum256(r.Body)
+		if r.Code != 200 || r.H.Get("Repr-Digest") != core.ReprDigest(sum[:]) || r.H.Get("Last-Modified") == "" {
+			t.Fatalf("at-rest revision %d %v", r.Code, r.H)
+		}
+	}
+
+	e.mkNS("p", map[string]any{"read": "public"})
+	e.create("p", "b", map[string]any{"b": 1.0})
+	if n := storedMeta(t, path); n != 1 {
+		t.Fatalf("%d revisions store a size or digest, want the plain head's", n)
+	}
+	expect(t, e.patchNS("p", ops(op("add", "/encryption", map[string]any{"level": "at-rest"})), ""), 201)
+	if n := storedMeta(t, path); n != 0 {
+		t.Fatalf("%d revisions store a size or digest after the raise to at-rest", n)
+	}
+	e.appendRev("p", "b", e.head("p", "b"), ops(op("add", "/c", 2.0)))
+	if n := storedMeta(t, path); n != 0 {
+		t.Fatalf("%d revisions store a size or digest after a write at rest", n)
+	}
 }
 
 // v0.73 §C.4: a key scope's attrs schema is held to the rules of a rule's
