@@ -810,21 +810,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		if !placed || admin {
 			return
 		}
-		frozen := s.frozen[pl]
-		after := Effective(g, pl, nil)
-		subjects := make([]string, 0, len(after))
-		for subj := range after {
-			subjects = append(subjects, subj)
-		}
-		sort.Strings(subjects)
-		for _, subj := range subjects {
-			for _, r := range after[subj] {
-				if !present(pl, r, frozen[subj], incs) {
-					wSubj, wRol, widens = subj, r, true
-					return
-				}
-			}
-		}
+		wSubj, wRol, widens = widening(pl, Effective(g, pl, nil), s.frozen[pl], incs)
 	})
 	if key == nil {
 		return nil, forbidden("namespace %s does not list the catalog's key %q", ns, s.opt.Kid)
@@ -1099,7 +1085,10 @@ func (s *Service) keyAt(g *tree.Graph, ns string, latest *grantcheck.Config) *gr
 
 // planPlace decides a placement (§B.11.4): the caller is in the content
 // namespace's catalogs.{catalog}.place list, and has a role with place
-// assigned on every target folder.
+// assigned on every target folder. Re-placing a deleted placement (a
+// restore) must also not widen, unless the caller is an admin: the item's
+// roles from its placement after the write, under to, are compared with
+// the deleted placement's rows (§B.11.4 No widening, §B.11.7).
 //
 // The catalog only issues the grant; the client writes the placement
 // document. Clients should give every placement (create or restore) a
@@ -1131,9 +1120,11 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		return nil, err
 	}
 	var (
-		key        *grant.Key
-		cp         string
-		checkpoint map[string]string
+		key           *grant.Key
+		cp            string
+		checkpoint    map[string]string
+		wSubj, wRole  string
+		widens, seenD bool
 	)
 	defer func() { err = decidedAt(err, checkpoint) }()
 	s.t.View(func(g *tree.Graph, cur map[string]string) {
@@ -1165,6 +1156,16 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		}
 		if n := g.Node(pl); n != nil && !n.Self {
 			err = conflict("%s is already placed in %s; move it instead", item, cat)
+			return
+		}
+		if !admin {
+			// Judged here, at the checkpoint, for a re-place below: the
+			// rows the placement had when it was deleted, against the
+			// roles it would have under to, with no $access (§B.11.3).
+			var kept map[string][]string
+			kept, seenD = s.unplacedRows(pl)
+			incs := map[string]Includes{ns: ParseIncludes(s.configAt(g, ns, ccfg).Doc)}
+			wSubj, wRole, widens = widening(pl, rolesUnder(g, tos), kept, incs)
 		}
 	})
 	if err != nil {
@@ -1183,6 +1184,16 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		return nil, ahead(conflict("%s is already placed in %s; move it instead", item, cat))
 	case h.State == client.Purged:
 		return nil, ahead(conflict("the placement %s was purged", pl))
+	case h.State == client.Tombstoned && widens:
+		// A re-place that widens the deleted placement's rows (§B.11.4
+		// No widening, §B.11.7).
+		err := forbidden("re-placing %s would give %s the role %s, which it didn't have when its placement was deleted; a catalog admin can place it", item, wSubj, wRole)
+		if !seenD {
+			// The service holds no rows of the placement's deletion:
+			// compared with none, not decided at the checkpoint.
+			return nil, ahead(err)
+		}
+		return nil, err
 	case h.State == client.Tombstoned:
 		// Re-placing restores the old placement (§B.11.4): the grant carries
 		// only restore, never create or append, and the client restores
@@ -1395,6 +1406,46 @@ func present(d, r string, before []string, incs map[string]Includes) bool {
 	return false
 }
 
+// widening reports the first subject and role, in byte order, of after
+// (roles per subject at node d after a write) that isn't present in
+// before (§B.11.4 No widening, present).
+func widening(d string, after, before map[string][]string, incs map[string]Includes) (subject, role string, bad bool) {
+	subjects := make([]string, 0, len(after))
+	for subj := range after {
+		subjects = append(subjects, subj)
+	}
+	sort.Strings(subjects)
+	for _, subj := range subjects {
+		for _, r := range after[subj] {
+			if !present(d, r, before[subj], incs) {
+				return subj, r, true
+			}
+		}
+	}
+	return "", "", false
+}
+
+// rolesUnder is the roles a node without $access would have under the
+// live folders tos (§B.11.2 Walk up): the union of theirs.
+func rolesUnder(g *tree.Graph, tos []string) map[string][]string {
+	acc := map[string]map[string]bool{}
+	for _, f := range tos {
+		for subj, roles := range Effective(g, f, nil) {
+			for _, r := range roles {
+				addRole(acc, subj, r)
+			}
+		}
+	}
+	out := map[string][]string{}
+	for subj, m := range acc {
+		for r := range m {
+			out[subj] = append(out[subj], r)
+		}
+		sort.Strings(out[subj])
+	}
+	return out
+}
+
 // widens reports a subject, node and role that a move of name to tos
 // would add to the effective roles of the moved subtree (§B.11.4). Roles
 // are compared by name, with the content namespace's declared includes.
@@ -1413,19 +1464,8 @@ func (s *Service) widens(g *tree.Graph, name string, tos []string, incs map[stri
 		// against the roles the item would have now, not against its frozen
 		// rows (§B.11.7). Who may restore it still doesn't change with a
 		// move, and a restore that would widen is refused (planRestore).
-		after := Effective(g, d, override)
-		before := Effective(g, d, nil)
-		subjects := make([]string, 0, len(after))
-		for subj := range after {
-			subjects = append(subjects, subj)
-		}
-		sort.Strings(subjects)
-		for _, subj := range subjects {
-			for _, r := range after[subj] {
-				if !present(d, r, before[subj], incs) {
-					return subj, d, r, true
-				}
-			}
+		if subj, r, bad := widening(d, Effective(g, d, override), Effective(g, d, nil), incs); bad {
+			return subj, d, r, true
 		}
 	}
 	return "", "", "", false

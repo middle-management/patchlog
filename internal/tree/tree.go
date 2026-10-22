@@ -1059,6 +1059,21 @@ type applyResult struct {
 	purgedAt time.Time // when the purge of the batch's namespace was applied
 }
 
+// purgedNames is Graph.Purged for an apply of a batch of the catalog
+// (isCat) or of a content namespace: the catalog names the batch purged,
+// or every one if it purged the catalog.
+func purgedNames(isCat, all bool, preps []prep) func(string) bool {
+	set := map[string]bool{}
+	if isCat {
+		for _, p := range preps {
+			if p.purged {
+				set[p.name] = true
+			}
+		}
+	}
+	return func(name string) bool { return isCat && all || set[name] }
+}
+
 func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Coalesced, preps []prep, cfg, content *client.NSDoc, retitle map[[2]string]string, fr *refiling) (*applyResult, error) {
 	g := s.g
 	cat := s.opt.Catalog
@@ -1274,7 +1289,10 @@ func (s *Service) applyLocked(ctx context.Context, b *follow.Batch, co follow.Co
 		}
 	}
 	if s.opt.Hook != nil {
-		if err := s.opt.Hook.Update(ctx, tx, g, changed); err != nil {
+		g.Purged = purgedNames(b.NS == cat, co.PurgedNS, preps)
+		err := s.opt.Hook.Update(ctx, tx, g, changed)
+		g.Purged = nil
+		if err != nil {
 			return nil, err
 		}
 	}

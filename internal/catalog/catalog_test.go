@@ -884,6 +884,9 @@ func TestRePlaceRestoreOnly(t *testing.T) {
 	w.caughtUp()
 	ctx := context.Background()
 	bob := w.caller("user:bob", "match-desk")
+	// A re-place must not widen the rows the placement had when it was
+	// deleted (§B.11.4 v0.69, §B.11.7): narrow gives a subset of season's.
+	w.doc("cat", "narrow", map[string]any{"title": "Narrow", "parents": parents("root"), "$access": acc("group:match-desk", "desk")})
 
 	// Place, then unplace.
 	w.doc("matches", "again", map[string]any{"title": "again"})
@@ -895,7 +898,7 @@ func TestRePlaceRestoreOnly(t *testing.T) {
 	w.caughtUp()
 
 	// Re-place: restore only, never create or append.
-	b := w.issue(bob, map[string]any{"item": "/r/matches/again", "want": toAny("place"), "to": toAny("derbies")}, 200).body
+	b := w.issue(bob, map[string]any{"item": "/r/matches/again", "want": toAny("place"), "to": toAny("narrow")}, 200).body
 	if fmt.Sprint(b["can"]) != "[restore]" {
 		t.Fatalf("re-place grant can %v", b["can"])
 	}
@@ -910,7 +913,7 @@ func TestRePlaceRestoreOnly(t *testing.T) {
 	// A restore that brings $access is refused (only admins may, §B.11.3):
 	// by the namespace rule (422) or the key rule (403), as for creates.
 	if _, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{
-		"parents": parents("derbies"), "$access": acc("user:bob", "desk"), "$nonce": "n2"})); !isStatus(err, 403) && !isStatus(err, 422) {
+		"parents": parents("narrow"), "$access": acc("user:bob", "desk"), "$nonce": "n2"})); !isStatus(err, 403) && !isStatus(err, 422) {
 		t.Errorf("restore with $access: %v", err)
 	}
 	// Other parents than the grant fixes are refused.
@@ -918,24 +921,25 @@ func TestRePlaceRestoreOnly(t *testing.T) {
 		t.Errorf("restore with other parents: %v", err)
 	}
 	// The grant can't create another node.
-	if _, err := rc.CreateDoc(ctx, "cat", "matches.again2", map[string]any{"parents": parents("derbies")}); !isStatus(err, 403) {
+	if _, err := rc.CreateDoc(ctx, "cat", "matches.again2", map[string]any{"parents": parents("narrow")}); !isStatus(err, 403) {
 		t.Errorf("restore grant creating: %v", err)
 	}
 	// The restore with a root replace and a fresh $nonce (§B.11.4 note).
-	res, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{"parents": parents("derbies"), "$nonce": "n2"}))
+	res, err := rc.Restore(ctx, "cat", "matches.again", tomb.ID, rootReplace(map[string]any{"parents": parents("narrow"), "$nonce": "n2"}))
 	if err != nil {
 		t.Fatalf("restore: %v", err)
 	}
 	// Once live, the restore-only grant can't act as a move: the write is
 	// an append, which the grant doesn't allow.
-	if _, err := rc.Append(ctx, "cat", "matches.again", res.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents("derbies")}}); !isStatus(err, 403) {
+	if _, err := rc.Append(ctx, "cat", "matches.again", res.ID, []any{map[string]any{"op": "replace", "path": "/parents", "value": parents("narrow")}}); !isStatus(err, 403) {
 		t.Errorf("restore-only grant appending to the live placement: %v", err)
 	}
 	w.caughtUp()
 	if got := w.svc.Tree().Checkpoint("cat"); got == "" {
 		t.Fatal("no checkpoint")
 	}
-	w.issue(w.caller("user:fred", "fan-club"), map[string]any{"item": "/r/matches/again", "want": toAny("append")}, 200)
+	w.issue(bob, map[string]any{"item": "/r/matches/again", "want": toAny("append")}, 200)
+	w.issue(w.caller("user:fred", "fan-club"), map[string]any{"item": "/r/matches/again", "want": toAny("read")}, 403)
 }
 
 // TestRestoreOnlyGrantOnRevivedPlacement: a restore-only grant used after
@@ -951,16 +955,20 @@ func TestRestoreOnlyGrantOnRevivedPlacement(t *testing.T) {
 	w.caughtUp()
 	ctx := context.Background()
 	bob := w.caller("user:bob", "match-desk")
+	// The service sees the placement live, so it keeps its rows when it is
+	// deleted, and a re-place into narrow doesn't widen them (§B.11.7).
+	w.doc("cat", "narrow", map[string]any{"title": "Narrow", "parents": parents("root"), "$access": acc("group:match-desk", "desk")})
 	w.doc("matches", "again", map[string]any{"title": "again"})
 	w.doc("cat", "matches.again", map[string]any{"parents": parents("season")})
+	w.caughtUp()
 	must(w.ops.Delete(ctx, "cat", "matches.again", must(w.ops.Head(ctx, "cat", "matches.again")).ID))
 	w.caughtUp()
 	tomb := must(w.ops.Head(ctx, "cat", "matches.again"))
-	g := w.grantFor(bob, map[string]any{"item": "/r/matches/again", "want": toAny("place"), "to": toAny("derbies")})
+	g := w.grantFor(bob, map[string]any{"item": "/r/matches/again", "want": toAny("place"), "to": toAny("narrow")})
 	// Someone else restores it first.
 	must(w.ops.Restore(ctx, "cat", "matches.again", tomb.ID, []any{}))
 	// The stale tombstone as If-Match: 403 (not a candidate verb), not 412.
-	move := []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"parents": parents("derbies")}}}
+	move := []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"parents": parents("narrow")}}}
 	if _, err := w.core(g).Restore(ctx, "cat", "matches.again", tomb.ID, move); !isStatus(err, 403) {
 		t.Errorf("restore-only grant on a revived placement, stale If-Match: %v", err)
 	}

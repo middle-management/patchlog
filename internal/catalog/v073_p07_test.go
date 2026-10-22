@@ -3,6 +3,7 @@ package catalog_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/catalog"
@@ -433,5 +434,82 @@ func TestFolderRolesByNameV073(t *testing.T) {
 	})
 	if d := catalog.DiffAccess(b2, a2, incs); d.Kind() != "narrows" {
 		t.Errorf("an item's move from desk to reader: %s %v", d.Kind(), d)
+	}
+}
+
+// TestDeletedPlacementRowsV073 (TC-27, scenario 11): a deleted
+// placement's rows are kept, as they were when its catalog tombstone was
+// seen, until it is placed again or purged, across restarts (Rebuild),
+// and a non-admin's re-place (a restore-only grant) that would widen them
+// is refused (§B.11.4 Place, No widening; §B.11.7).
+func TestDeletedPlacementRowsV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	ctx := context.Background()
+	kept := func(name string) int {
+		var n int
+		must(0, w.svc.Tree().DB().QueryRow(`SELECT count(*) FROM effective WHERE node = ? AND tombstoned = 2`, "/r/cat/"+name).Scan(&n))
+		return n
+	}
+	must(w.ops.Delete(ctx, "cat", "matches.derby", must(w.ops.Head(ctx, "cat", "matches.derby")).ID))
+	w.caughtUp()
+	// season's four entries: match-desk, translators, fan-club and user:li.
+	if n := kept("matches.derby"); n != 4 {
+		t.Fatalf("kept rows of the deleted placement: %d", n)
+	}
+
+	// Scenario 11: an editor-in-chief who also is in match-desk sees TR
+	// (rumours), has place there and is in the place list; re-placing
+	// derby into TR would give group:editors-in-chief desk.
+	eic := w.caller("user:eve", "editors-in-chief", "match-desk")
+	toTR := map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("rumours")}
+	r := w.issue(eic, toTR, 403)
+	if msg, _ := r.body["message"].(string); !strings.Contains(msg, "group:editors-in-chief") || r.body["checkpoint"] == nil {
+		t.Errorf("widening re-place: %v", r.body)
+	}
+	// Into season: a restore-only grant.
+	toSeason := map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}
+	if b := w.issue(eic, toSeason, 200).body; fmt.Sprint(b["can"]) != "[restore]" {
+		t.Errorf("re-place into season: %v", b)
+	}
+	// An admin may widen.
+	w.issue(w.caller("user:ada", "catalog-admins", "editors-in-chief"), toTR, 200)
+
+	// Rebuild keeps them.
+	w.stop()
+	w.start()
+	w.caughtUp()
+	if n := kept("matches.derby"); n != 4 {
+		t.Errorf("kept rows after a restart: %d", n)
+	}
+	w.issue(eic, toTR, 403)
+
+	// Placed again, they go and the rows are computed again.
+	g := w.grantFor(eic, toSeason)
+	tomb := must(w.ops.Head(ctx, "cat", "matches.derby"))
+	must(w.core(g).Restore(ctx, "cat", "matches.derby", tomb.ID, []any{map[string]any{"op": "replace", "path": "",
+		"value": map[string]any{"parents": parents("season")}}}))
+	w.caughtUp()
+	if n := kept("matches.derby"); n != 0 {
+		t.Errorf("kept rows once placed again: %d", n)
+	}
+	w.issue(w.caller("user:fred", "fan-club"), map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
+
+	// Deleted again, then purged: the rows go (§8.3).
+	must(w.ops.Delete(ctx, "cat", "matches.derby", must(w.ops.Head(ctx, "cat", "matches.derby")).ID))
+	w.caughtUp()
+	if n := kept("matches.derby"); n != 4 {
+		t.Fatalf("kept rows of the deleted placement, again: %d", n)
+	}
+	purger := w.core(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"purge"}))
+	must(purger.Purge(ctx, "cat", "matches.derby", must(w.ops.Head(ctx, "cat", "matches.derby")).ID, false))
+	w.caughtUp()
+	var n int
+	must(0, w.svc.Tree().DB().QueryRow(`SELECT count(*) FROM effective WHERE node = '/r/cat/matches.derby'`).Scan(&n))
+	if n != 0 {
+		t.Errorf("rows of a purged placement: %d", n)
 	}
 }
