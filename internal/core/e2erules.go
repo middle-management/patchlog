@@ -26,14 +26,17 @@ func blindRule(r *rules.Rule) (string, bool) {
 const blindMsg = "the server can't see writes or /doc of a sealed write in an e2e namespace, so a rule reading them fails the write (§6.2, §E.3.2)"
 
 // checkRulesE2E is step 6 for a sealed create, append or restore: like
-// checkRules, but a namespace rule reading writes or /doc fails with 422
-// rule, and such a grant, key or role rule with 403.
+// checkRules, grant, key and role rules first, but such a rule reading
+// writes or /doc fails with 403, and such a namespace rule with 422 rule.
 func (t *tx) checkRulesE2E(cfg *Config, a *actor, env map[string]any) *Error {
 	verb := env["action"].(string)
 	if a.verified != nil {
 		if ok, _ := a.verified.Allows(verb); !ok {
 			return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
 		}
+	}
+	if err := t.grantRulesMode(a, verb, nil, env, false, true); err != nil {
+		return err
 	}
 	for i, r := range cfg.Rules {
 		if p, blind := blindRule(r); blind {
@@ -43,5 +46,5 @@ func (t *tx) checkRulesE2E(cfg *Config, a *actor, env map[string]any) *Error {
 			return apiErr(422, "rule", "rule", i, "path", path)
 		}
 	}
-	return t.grantRulesMode(a, verb, nil, env, false, true)
+	return nil
 }

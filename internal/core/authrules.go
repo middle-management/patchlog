@@ -89,8 +89,13 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 	return nil
 }
 
-// checkRules is step 6 of §6.2: namespace rules, then grant, key and role
-// rules, against the full envelope.
+// checkRules is the rules of step 6 of §6.2 for one write, after the
+// *-key guard and a config write's in_use refusals, which its callers run:
+// grant, key and role rules (403), then namespace rules (422) (§6.4.3,
+// §C.2 item 4), against the full envelope. A config write under a * key,
+// so any while authentication is disabled, isn't judged by namespace
+// rules (§1, §6.4.3); nor is a namespace's creation under the operator
+// grant, which doesn't call this.
 func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool) *Error {
 	verb := env["action"].(string)
 	if a.verified != nil {
@@ -98,10 +103,13 @@ func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool
 			return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
 		}
 	}
+	if err := t.grantRules(a, verb, nil, env, false); err != nil {
+		return err
+	}
 	if !(isConfig && a.star) {
 		if i, path, ok := rules.EvalList(cfg.Rules, env); !ok {
 			return apiErr(422, "rule", "rule", i, "path", path)
 		}
 	}
-	return t.grantRules(a, verb, nil, env, false)
+	return nil
 }
