@@ -1,6 +1,9 @@
 package server
 
 import (
+	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/base64"
 	"slices"
 	"testing"
 	"time"
@@ -410,4 +413,124 @@ func TestV073ShortAndLongAnswersTagged(t *testing.T) {
 	check("/r/m/b", 410, ccLong, "ns:m,r:m/b")
 	check("/ns/m/rev/"+head+"/heads", 410, ccLong, "ns:m")
 	check("/ns/m/branches", 410, ccLong, "ns:m")
+}
+
+// thumbprintOf is the RFC 7638 thumbprint of an Ed25519 key entry's pub,
+// computed by hand: sha-256 of {"crv":"Ed25519","kty":"OKP","x":…}.
+func thumbprintOf(t *testing.T, pub string) string {
+	t.Helper()
+	raw, err := base64.RawURLEncoding.DecodeString(pub)
+	if err != nil || len(raw) != ed25519.PublicKeySize {
+		t.Fatalf("pub %q: %v", pub, err)
+	}
+	sum := sha256.Sum256([]byte(`{"crv":"Ed25519","kty":"OKP","x":"` + base64.RawURLEncoding.EncodeToString(raw) + `"}`))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+// §7.4, §C.4, §H.7 (RH-22, RH-23, GR-41): /principal gives key, the RFC
+// 7638 thumbprint of the verifying key, the same under different kids in
+// different namespaces, and operator, true only for an operator grant
+// (can its blocks' verbs, roles []); with authentication disabled there
+// is no key and operator is false.
+func TestV073PrincipalKeyAndOperator(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	// The issuer's key, under another kid, in a second namespace.
+	other := keyPair{kid: "elsewhere", pub: f.issuer.pub, priv: f.issuer.priv}
+	expect(t, e.do(req{method: "PATCH", path: "/ns/two", ifNoneMatch: "*", bearer: e.operatorGrant("two"),
+		body: addRoot(map[string]any{"read": "grant", "keys": []any{other.entry("read")}})}), 201)
+	want := thumbprintOf(t, f.issuer.pub)
+	r := e.principalOf("sec", f.issuerG)
+	expect(t, r, 200)
+	b := r.Obj()
+	if b["key"] != want || b["kid"] != "issuer" || b["operator"] != false {
+		t.Fatalf("namespace grant: key %v kid %v operator %v, want %s issuer false", b["key"], b["kid"], b["operator"], want)
+	}
+	r = e.principalOf("two", e.grant(other, "user:bob", []string{"two"}, []string{"read"}))
+	expect(t, r, 200)
+	if b := r.Obj(); b["key"] != want || b["kid"] != "elsewhere" {
+		t.Fatalf("same key under kid elsewhere: key %v kid %v, want %s", b["key"], b["kid"], want)
+	}
+	// An operator grant: its published JWK's thumbprint.
+	r = e.principalOf("sec", e.operatorGrant("sec"))
+	expect(t, r, 200)
+	b = r.Obj()
+	opPub := base64.RawURLEncoding.EncodeToString(e.opPriv.Public().(ed25519.PublicKey))
+	if b["operator"] != true || b["key"] != thumbprintOf(t, opPub) || len(strsOf(b["roles"])) != 0 ||
+		!slices.Equal(strsOf(b["can"]), []string{"config"}) {
+		t.Fatalf("operator grant %s", r.Body)
+	}
+	set := e.get("/.well-known/patchlog-keys").Obj()["keys"].([]any)[0].(map[string]any)
+	if set["x"] != opPub {
+		t.Fatalf("published operator JWK %v", set)
+	}
+	// Authentication disabled.
+	d := newEnv(t)
+	d.mkNS("d", map[string]any{})
+	r = d.principalOf("d", "")
+	expect(t, r, 200)
+	b = r.Obj()
+	if _, has := b["key"]; has || b["operator"] != false {
+		t.Fatalf("auth disabled: %s", r.Body)
+	}
+}
+
+// §7.4, §B.6, §H.2 (RH-24): a catalog namespace's /principal gives
+// catalog: trust ([] when absent) and files to a grant with unrestricted
+// read; to any other, files without x- members and trusted in place of
+// trust. Other namespaces have no catalog member.
+func TestV073PrincipalCatalog(t *testing.T) {
+	t.Parallel()
+	files := map[string]any{"ns": "docs", "root": "root", "x-note": "internal"}
+	f := newAuthFixture(t, map[string]any{"catalog": map[string]any{"trust": []any{"docs", "media"}, "mode": "tree", "files": files}})
+	e := f.tenv
+	r := e.principalOf("sec", f.issuerG)
+	expect(t, r, 200)
+	c, _ := r.Obj()["catalog"].(map[string]any)
+	if !slices.Equal(strsOf(c["trust"]), []string{"docs", "media"}) || c["files"].(map[string]any)["x-note"] != "internal" {
+		t.Fatalf("unrestricted reader's catalog %v", c)
+	}
+	if _, has := c["trusted"]; has {
+		t.Fatalf("unrestricted reader gets trusted: %v", c)
+	}
+	// A grant limited to some resources, and one without read.
+	for name, g := range map[string]string{
+		"limited": e.grant(f.issuer, "user:l", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}}),
+		"no read": e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"}),
+	} {
+		r := e.principalOf("sec", g)
+		expect(t, r, 200)
+		c, _ := r.Obj()["catalog"].(map[string]any)
+		fl, _ := c["files"].(map[string]any)
+		if _, has := c["trust"]; has || c["trusted"] != true || fl["ns"] != "docs" || fl["root"] != "root" {
+			t.Errorf("%s: catalog %v", name, c)
+		}
+		if _, has := fl["x-note"]; has {
+			t.Errorf("%s: files keeps its x- member: %v", name, fl)
+		}
+	}
+	// files.ns not trusted, and a catalog without trust or files.
+	expect(t, e.patchNS("sec", ops(op("replace", "/catalog/files/ns", "elsewhere")), f.adminG), 201)
+	r = e.principalOf("sec", e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"}))
+	if c, _ := r.Obj()["catalog"].(map[string]any); c["trusted"] != false {
+		t.Errorf("untrusted files.ns: %v", c)
+	}
+	expect(t, e.patchNS("sec", ops(op("replace", "/catalog", map[string]any{"mode": "dag"})), f.adminG), 201)
+	r = e.principalOf("sec", f.issuerG)
+	if c, _ := r.Obj()["catalog"].(map[string]any); c == nil || c["trust"] == nil || len(strsOf(c["trust"])) != 0 {
+		t.Errorf("catalog without trust: %s", r.Body)
+	}
+	if _, has := r.Obj()["catalog"].(map[string]any)["files"]; has {
+		t.Errorf("catalog without files has files: %s", r.Body)
+	}
+	r = e.principalOf("sec", e.grant(f.issuer, "user:w", []string{"sec"}, []string{"append"}))
+	if c, _ := r.Obj()["catalog"].(map[string]any); c["trusted"] != false {
+		t.Errorf("catalog without files, limited: %v", c)
+	}
+	// Not a catalog.
+	expect(t, e.patchNS("sec", ops(op("remove", "/catalog")), f.adminG), 201)
+	if _, has := e.principalOf("sec", f.issuerG).Obj()["catalog"]; has {
+		t.Error("a namespace without catalog has a catalog member")
+	}
 }
