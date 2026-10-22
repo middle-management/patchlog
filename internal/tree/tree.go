@@ -1480,10 +1480,10 @@ func (s *Service) nodeBorn(ctx context.Context, ns, name, head string, self bool
 }
 
 // bornOf is when ns/name was created (§B.5 born): the created of the first
-// revision of its chain up to head, the first its log gives, or where a
-// prune dropped it the oldest the log still has. A log that can't be read
-// for the moment (Transient) is an error, so the apply is made again;
-// otherwise, as for a resource gone since, the born is unknown ("").
+// revision of its chain up to head, the first its log gives from genesis.
+// A log that can't be read for the moment (Transient) is an error, so the
+// apply is made again; otherwise, as for a resource gone since or a chain
+// a prune cut (410, §7.1), the born is unknown ("").
 func (s *Service) bornOf(ctx context.Context, ns, name, head string) (string, error) {
 	es, _, err := s.c.LogPage(ctx, ns, name, head, "")
 	switch {
