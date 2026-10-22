@@ -52,8 +52,9 @@
 //
 // Decisions (POST /grants, POST /read-grants, POST /merge-grants) are
 // taken at one checkpoint, which answers carry beside each grant as
-// checkpoint, { ns: ns_id }: the ns_ids of the catalog and of each named
-// item's namespace there (§B.11.4, checkpointAt), which are all a
+// checkpoint, { ns: ns_id }: the ns_ids of the catalog, of each named
+// item's namespace there, and of the content namespaces whose roles or
+// includes the decision read (§B.11.4, checkpointAt), which are all a
 // decision depends on, not the combined checkpoint of listings (§B.5).
 // So do refusals that are decisions (403, 404, 409, 410), so a client that
 // caches decisions keys them by it; the grants' own at stays the
@@ -881,16 +882,20 @@ func (s *Service) frozenRolesFor(name string, subs map[string]bool) map[string]b
 // (§B.11.5, §B.11.7). There is nothing to recompute: visibility is decided
 // per request from effective and those documents.
 func (s *Service) Resolve(ctx context.Context, v *grant.Verified) ([]string, tree.Visibility, error) {
-	keyed := groupSubjects(v.Principal.Groups)
-	if user := UserSubject(v.Principal.ID); user != "" {
-		with := false
-		s.t.View(func(g *tree.Graph, _ map[string]string) { with = s.users[user] || s.subScoped(g) })
-		if with {
-			keyed = append(keyed, user)
-			sort.Strings(keyed)
-		}
-	}
+	var keyed []string
+	s.t.View(func(g *tree.Graph, _ map[string]string) { keyed = s.keyedAt(g, v) })
 	return keyed, s.ForSubjects(keyed), nil
+}
+
+// keyedAt is the subject set Resolve keys v's listings by, as of the
+// checkpoint g reflects. Call it under View.
+func (s *Service) keyedAt(g *tree.Graph, v *grant.Verified) []string {
+	keyed := groupSubjects(v.Principal.Groups)
+	if user := UserSubject(v.Principal.ID); user != "" && (s.users[user] || s.subScoped(g)) {
+		keyed = append(keyed, user)
+		sort.Strings(keyed)
+	}
+	return keyed
 }
 
 // subScoped reports whether the catalog's key has a sub scope in some
@@ -1140,6 +1145,23 @@ func (v *visibility) Node(g *tree.Graph, n *tree.Node) bool {
 		return false
 	}
 	return v.counts(v.roles(g, n.ItemNS), eff, n.ItemName, true)
+}
+
+// Organising is Node as organising requests judge a node (§B.11.4,
+// §B.11.5): a dangling placement is judged as if its item were live,
+// from the roles at it computed from the graph as a live item's are
+// (Effective; a deleted item's frozen rows aren't its roles at the node),
+// through its item's content namespace, which must still be trusted. A
+// cyclic or implicit node stays hidden: it collects nothing (§B.5
+// Cycles, §B.9).
+func (v *visibility) Organising(g *tree.Graph, n *tree.Node) bool {
+	switch {
+	case n == nil || n.Self || n.Cyclic:
+		return false
+	case n.Kind == tree.KindFolder || n.Live():
+		return v.Node(g, n)
+	}
+	return v.counts(v.roles(g, n.ItemNS), Effective(g, n.Name, nil), n.ItemName, true)
 }
 
 // counts reports whether a role of eff (a node's roles per subject)

@@ -140,6 +140,11 @@ func (n *Node) Item() string {
 // placement whose item is live in a trusted namespace.
 func (n *Node) Live() bool { return n.State == StateLive && !n.Cyclic }
 
+// RawParents is an explicit node's parents member as its document has it
+// (nil if absent), which a Move grant's test of /parents names (§B.11.4).
+// Callers must not change it.
+func (n *Node) RawParents() any { return n.rawParents }
+
 // Graph is the in-memory view of one catalog as of the recorded
 // checkpoints. It is read under the service's lock (Service.View).
 type Graph struct {
