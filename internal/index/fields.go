@@ -231,12 +231,14 @@ func hasKind(v any, kind string) bool {
 }
 
 // regexp compiles a patternProperties pattern once per walk (nil if it
-// doesn't compile, which matches no name).
+// doesn't compile, which matches no name), as the core reads it when it
+// validates: \uXXXX is a code point (§6.6), and a pattern RE2 accepted as
+// written before that rule still compiles as it did (schema.Legacy, §6.1).
 func (w *markWalk) regexp(pat string) *regexp.Regexp {
 	if re, ok := w.res[pat]; ok {
 		return re
 	}
-	re, err := regexp.Compile(pat)
+	re, err := schema.Legacy.CompileRegexp(pat)
 	if err != nil {
 		re = nil
 	}
