@@ -739,6 +739,17 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			return nil, nil, limitErr(422, "batchSize", int64(size), int64(maxSize), "batch too large")
 		}
 	}
+	// Then the batch's source, before any item's own limits and so before
+	// blob references, which may depend on it (§7.5, §7.8).
+	var src any
+	var bs *batchSource
+	if isBatch && source != nil {
+		var err *Error
+		src, bs, err = t.checkSource(req, source)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	for _, s := range st {
 		readable := func() bool { return t.canRead(n, cfg, a, s.Resource) }
 		if err := checkLimits(cfg.Limits, s, readable); err != nil {
@@ -750,17 +761,6 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			return nil, nil, fail(fs)
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
-	}
-	// A batch's source, then blob references naming available blobs
-	// (§7.5, §7.8), also at step 4: the blobs may depend on the source.
-	var src any
-	var bs *batchSource
-	if isBatch && source != nil {
-		var err *Error
-		src, bs, err = t.checkSource(req, source)
-		if err != nil {
-			return nil, nil, err
-		}
 	}
 	// A dry run reports a blob that isn't available, and runs the later
 	// steps as if it were (§7.5).
@@ -1328,8 +1328,7 @@ func doubleDelete() *Error {
 // Each later step applies to a copy of the document before it; the first
 // applies in place to the parent's, which is parsed for this item alone.
 func (t *tx) applySteps(s *itemState) *Error {
-	var doc any
-	exists := false
+	var doc any   // a create's: the document null (§6.2 step 3)
 	owned := true // doc is no step's yet: nil, or the parent's parsed here
 	var parentID *ids.ID
 	tomb := false
@@ -1346,7 +1345,7 @@ func (t *tx) applySteps(s *itemState) *Error {
 			}
 			return gone()
 		}
-		doc, exists = d, true
+		doc = d
 		p := s.parent.id
 		parentID = &p
 		tomb = s.parent.kind == kindTombstone
@@ -1378,19 +1377,26 @@ func (t *tx) applySteps(s *itemState) *Error {
 			if err != nil {
 				return patchErr(err)
 			}
-			if m, ok := doc.(map[string]any); ok && exists {
+			if m, ok := doc.(map[string]any); ok {
 				// Before the patches apply: in place, they change doc.
 				ss.prevNonce, _ = m["$nonce"].(string)
 			}
-			nd, writes, err := patch.Apply(doc, exists, ops, patch.Options{ResourceEnvelope: true, InPlace: owned, ShareLast: true})
+			// A create's patches apply to the document null, not to "no
+			// document": test "" null, and a root replace, copy or move,
+			// work on it (§6.2 step 3).
+			nd, writes, err := patch.Apply(doc, true, ops, patch.Options{ResourceEnvelope: true, InPlace: owned, ShareLast: true})
 			if err != nil {
 				return patchErr(err)
+			}
+			if nd == nil && ss.action == "create" {
+				// Nothing was made: a create's document isn't null (F-G3).
+				return patchErr(&patch.Error{Index: len(ops), Message: "a create's resulting document is null (§6.2 step 3)"})
 			}
 			ss.canon = s.canon(j)
 			ss.id = s.revID(j, parentID)
 			ss.doc = nd
 			ss.writes = patch.WritesStrings(writes)
-			doc, exists, tomb = nd, true, false
+			doc, tomb = nd, false
 		}
 		owned = false
 		id := ss.id

@@ -310,7 +310,8 @@ func (c *remoteChain) fold(f func(i int, e client.LogEntry, doc any) error) erro
 			if err != nil {
 				return fmt.Errorf("revision %s: %v", e.ID, err)
 			}
-			doc, _, err = patch.Apply(doc, exists, ops, patch.Options{})
+			// A genesis applies to the document null (§6.2 step 3).
+			doc, _, err = patch.Apply(doc, true, ops, patch.Options{})
 			if err != nil {
 				return fmt.Errorf("revision %s: %v", e.ID, err)
 			}

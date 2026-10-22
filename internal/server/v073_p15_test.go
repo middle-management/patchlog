@@ -1,9 +1,13 @@
 package server
 
 import (
+	"context"
 	"crypto/ed25519"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/middle-management/patchlog/internal/archive"
 )
 
 // p15Items returns a batch failure's items by index, each checked to be an
@@ -351,4 +355,146 @@ func TestV073P15BranchRetryNotReadThrough(t *testing.T) {
 	}}, "alice")
 	expectCode(t, r, 412, "batch")
 	p15Item(t, r, 0, 412, "stale")
+}
+
+// §6.2 step 3 (GB-8): a create's patches apply to the document null:
+// test "" null and a root replace work, and the genesis folds onto null
+// when the document is read back from storage. A create whose result is
+// null is 422 invalid (F-G3).
+func TestV073P15CreateAppliesToNull(t *testing.T) {
+	t.Parallel()
+	e, reopen := v073Reopenable(t)
+	e.mkNS("m", map[string]any{"read": "public"})
+	genesis := ops(op("test", "", nil), op("add", "", map[string]any{"n": 1.0}), op("add", "/m", 2.0))
+	r := e.write("PATCH", "m", "a", "", genesis)
+	expect(t, r, 201)
+	a0 := etagOf(r)
+	if a0 != hashID(t, "", canonical(genesis)) {
+		t.Fatalf("genesis id %s", a0)
+	}
+	a1 := e.appendRev("m", "a", a0, ops(op("replace", "/n", 3.0)))
+	r = e.write("PATCH", "m", "b", "", ops(op("replace", "", map[string]any{"b": true})))
+	expect(t, r, 201)
+
+	for name, patches := range map[string][]any{
+		"empty":        {},
+		"null":         ops(op("add", "", nil)),
+		"test only":    ops(op("test", "", nil)),
+		"replace null": ops(op("replace", "", nil)),
+	} {
+		r := e.write("PATCH", "m", "c", "", patches)
+		expectCode(t, r, 422, "invalid")
+		if name == "empty" && r.Obj()["index"] != 0.0 {
+			t.Fatalf("empty create: %s", r.Body)
+		}
+	}
+	expectCode(t, e.write("PATCH", "m", "c", "", ops(op("test", "", map[string]any{}), op("add", "", map[string]any{}))), 422, "invalid")
+
+	// Read back from storage alone: the genesis folds onto null.
+	e = reopen()
+	for id, want := range map[string]string{a0: `{"m":2,"n":1}`, a1: `{"m":2,"n":3}`} {
+		g := e.get("/r/m/a/rev/" + id)
+		expect(t, g, 200)
+		if string(canonical(g.Obj())) != want {
+			t.Fatalf("%s: %s, want %s", id, g.Body, want)
+		}
+	}
+	if d := e.doc("m", "b"); d["b"] != true {
+		t.Fatalf("b: %v", d)
+	}
+}
+
+// §7.5 (GB-28): at step 4 the batch limits come first, then the local
+// source's check (422 source), then each item's own limits.
+func TestV073P15SourceBeforeItemLimits(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("m", map[string]any{"read": "public", "limits": map[string]any{"opsPerSet": 1}})
+	e.mkNS("rel", map[string]any{"read": "public"})
+	items := []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{
+		ops(op("add", "", map[string]any{}), op("add", "/x", 1.0)),
+	}}}
+	r := e.batchReq("m", map[string]any{"items": items}, "alice")
+	expectItemLimit(t, r, 422, "opsPerSet", 2, 1)
+	r = e.batchReq("m", map[string]any{"items": items, "source": map[string]any{"ns": "rel", "at": hashID(t, "", []byte("x"))}}, "alice")
+	expectCode(t, r, 422, "source")
+	if _, has := r.Obj()["items"]; has {
+		t.Fatalf("a refused source is answered without items: %s", r.Body)
+	}
+	// The batch limits still come first.
+	many := append(append([]any{}, items...), map[string]any{"resource": "b", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}})
+	e.mkNS("two", map[string]any{"read": "public", "limits": map[string]any{"itemsPerBatch": 1}})
+	r = e.batchReq("two", map[string]any{"items": many, "source": map[string]any{"ns": "rel", "at": hashID(t, "", []byte("x"))}}, "alice")
+	expectLimit(t, r, 422, "itemsPerBatch", 2, 1)
+}
+
+// §7.5, §12.1 (GB-30): a source.origin equal to this deployment's own is
+// 422 code source, for any caller, without items.
+func TestV073P15SourceOwnOrigin(t *testing.T) {
+	t.Parallel()
+	e := newAuthEnv(t)
+	k := newKey("k")
+	e.mkNS("m", map[string]any{"read": "grant", "keys": []any{k.entry("*")}})
+	e.mkNS("rel", map[string]any{"read": "grant", "keys": []any{k.entry("*")}})
+	writer := e.grant(k, "alice", []string{"m"}, []string{"create"})
+	items := []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}
+	src := map[string]any{"origin": "https://cms.example", "ns": "rel", "at": hashID(t, "", []byte("x"))}
+	r := e.batchReq("m", map[string]any{"items": items, "source": src}, writer)
+	expectCode(t, r, 422, "source")
+	if _, has := r.Obj()["items"]; has {
+		t.Fatalf("answered with items: %s", r.Body)
+	}
+}
+
+// §6.2 step 3, §G.3 (GB-8): a remote branch folds what it reads through
+// from its base's deployment as that deployment applied it: a genesis
+// onto the document null.
+func TestV073P15RemoteGenesisOnNull(t *testing.T) {
+	t.Parallel()
+	a, b, _ := pair(t, nil, nil)
+	a.mkNS("main", map[string]any{"read": "public"})
+	r := a.write("PATCH", "main", "p", "", ops(op("test", "", nil), op("add", "", map[string]any{"n": 1.0}), op("add", "/m", 2.0)))
+	expect(t, r, 201)
+	p0 := etagOf(r)
+	a.appendRev("main", "p", p0, ops(op("replace", "/n", 3.0)))
+	expect(t, b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), nil)), 201)
+	if d := b.doc("rel", "p"); string(canonical(d)) != `{"m":2,"n":3}` {
+		t.Fatalf("read through: %v", d)
+	}
+	g := b.get("/r/rel/p/rev/" + p0)
+	expect(t, g, 200)
+	if string(canonical(g.Obj())) != `{"m":2,"n":1}` {
+		t.Fatalf("genesis read through: %s", g.Body)
+	}
+}
+
+// §6.2 step 3, §8.6 (GB-8): a pruned range whose genesis applies to the
+// document null archives, verifies and restores, its snapshots rebuilt by
+// folding the genesis onto null.
+func TestV073P15ArchiveGenesisOnNull(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	e := newEnv(t, withArchive(t, dir), withoutRetentionLoop)
+	e.mkNS("main", map[string]any{"read": "public"})
+	r := e.write("PATCH", "main", "a", "", ops(op("test", "", nil), op("add", "", map[string]any{"n": 0.0})))
+	expect(t, r, 201)
+	revs := []string{etagOf(r)}
+	for i := 1; i < 5; i++ {
+		revs = append(revs, e.appendRev("main", "a", revs[i-1], ops(op("replace", "/n", float64(i)))))
+	}
+	e.clock.Advance(time.Hour)
+	expect(t, e.prune("main", "a", map[string]any{"horizon": revs[3]}, "admin"), 200)
+	verifyArchive(t, filepath.Join(dir, "main", "a", revs[3]+".jsonl"))
+	expectCode(t, e.get("/r/main/a/rev/"+revs[1]), 410, "pruned")
+	reps, err := archive.Restore(context.Background(), e.e, archive.RestoreOptions{From: archive.URL(dir)})
+	if err != nil || len(reps) != 1 || reps[0].Restored != 3 || len(reps[0].Failed) != 0 {
+		t.Fatalf("restore %+v %v", reps, err)
+	}
+	for i, id := range revs {
+		d := e.get("/r/main/a/rev/" + id)
+		expect(t, d, 200)
+		if d.Obj()["n"] != float64(i) {
+			t.Fatalf("restored rev %d: %s", i, d.Body)
+		}
+	}
 }

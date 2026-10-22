@@ -30,9 +30,12 @@ func Replay(start any, live bool, entries []client.LogEntry) (doc any, isLive bo
 				return nil, false, &Error{i, e.ID, err.Error()}
 			}
 			// A restore applies to the last live document (exists), a
-			// genesis to nothing.
-			exists := isLive || (doc != nil && e.Parent != "")
-			doc, _, err = patch.Apply(doc, exists, ops, patch.Options{})
+			// genesis to the document null (§6.2 step 3).
+			cur, exists := doc, isLive || doc != nil
+			if e.Parent == "" {
+				cur, exists = nil, true
+			}
+			doc, _, err = patch.Apply(cur, exists, ops, patch.Options{})
 			if err != nil {
 				return nil, false, &Error{i, e.ID, err.Error()}
 			}
