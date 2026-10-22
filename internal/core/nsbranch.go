@@ -316,7 +316,11 @@ func (t *tx) branchAt(base *nsRow, at string) (int64, bool) {
 // branch and one outside the base's chain matches nothing, and the same
 // patches. The patches are judged by the genesis they give from the base's
 // document in force at the creation, so later config writes to the base
-// don't turn a retry into a 412.
+// don't turn a retry into a 412. A creation made before v0.73 kept the
+// base's cleanup (legacyBranchDropped), and nothing stored tells it from
+// one whose patches set cleanup to the base's value, so patches match if
+// either list gives the genesis: like ops that change nothing, a retry
+// whose patches differ only that way gets the branch its principal made.
 func (t *tx) branchRetry(base, ex *nsRow, br BranchRequest, a *actor) *WriteResult {
 	if ex.purged || !ex.base.Valid || ex.base.Int64 != base.id {
 		return nil

@@ -452,3 +452,33 @@ func TestV073P16BranchRotatesAfterBaseStarKeyChange(t *testing.T) {
 		t.Fatalf("RotateEpoch(sb): epoch %d, %v; want 3", ep, err)
 	}
 }
+
+// v0.73 §7.6 Result, Configuration (BBD-3, BBD-7): a creation made before
+// v0.73 inherited the base's cleanup, and its retry still gets 200. The
+// branch below is stored as such a creation with no patches would be (one
+// that sets cleanup to the base's value gives the same genesis), so the
+// retry without patches matches it under the earlier list, the one with
+// the patches under the current one; other patches don't.
+func TestV073P16BranchRetryLegacyCleanup(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	cleanup := map[string]any{"merged": "P7D"}
+	e.mkNS("main", map[string]any{"read": "public", "cleanup": cleanup})
+	at := e.nsHead("main")
+	r := e.branch("main", map[string]any{"name": "lb", "at": at, "patches": ops(op("add", "/cleanup", cleanup))}, "alice")
+	expect(t, r, 201)
+	nsID := r.Str("ns_id")
+	for _, body := range []map[string]any{{"name": "lb", "at": at}, {"name": "lb", "at": at, "patches": ops(op("add", "/cleanup", cleanup))}} {
+		r = e.branch("main", body, "alice")
+		expect(t, r, 200)
+		if r.Str("ns_id") != nsID {
+			t.Fatalf("retry %v: ns_id %q, want %q", body, r.Str("ns_id"), nsID)
+		}
+	}
+	expectCode(t, e.branch("main", map[string]any{"name": "lb", "at": at, "patches": ops(op("add", "/cleanup", map[string]any{"merged": "P1D"}))}, "alice"), 412, "stale")
+	// A branch that doesn't hold cleanup matches only patches that leave
+	// it out.
+	expect(t, e.branch("main", map[string]any{"name": "nb", "at": at}, "alice"), 201)
+	expect(t, e.branch("main", map[string]any{"name": "nb", "at": at}, "alice"), 200)
+	expectCode(t, e.branch("main", map[string]any{"name": "nb", "at": at, "patches": ops(op("add", "/cleanup", cleanup))}, "alice"), 412, "stale")
+}
