@@ -273,13 +273,17 @@ func TestRequireAt(t *testing.T) {
 	must(f.adminC.PatchConfig(ctx, "sec", cfgID, []any{map[string]any{"op": "add", "path": "/keys/-", "value": e}}))
 	head := must(f.adminC.NSHead(ctx, "sec")).ID
 
-	ok := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head})
+	// Issuance is the root's nbf, the key setting no maxTtl (§C.4).
+	nbf := f.s.Now().Format(time.RFC3339)
+	ok := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head, "nbf": nbf})
 	if _, err := f.ch.Verify(ctx, "sec", ok); err != nil {
 		t.Fatalf("at at head: %v", err)
 	}
-	missing := f.grant(at, "user:a", []string{"sec"}, []string{"read"})
-	bogus := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})
-	for _, tok := range []string{missing, bogus} {
+	missing := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"nbf": nbf})
+	bogus := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": "1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "nbf": nbf})
+	// Without nbf or a key maxTtl, nothing dates its issuance (v0.65).
+	undated := f.grant(at, "user:a", []string{"sec"}, []string{"read"}, map[string]any{"at": head})
+	for _, tok := range []string{missing, bogus, undated} {
 		if _, err := f.ch.Verify(ctx, "sec", tok); authStatus(err) != 403 {
 			t.Fatalf("bad at accepted: %v", err)
 		}

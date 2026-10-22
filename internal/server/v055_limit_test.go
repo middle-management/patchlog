@@ -92,27 +92,23 @@ func TestV055LimitConfigFields(t *testing.T) {
 	expectLimit(t, e.patchNS("s", ops(op("add", "/x-b", strings.Repeat("b", 300))), ""), 413, "documentSize", int64(len(canonical(want))), 600)
 }
 
-// §6.6: rulesPerGrant is the namespace's, and grantSize the deployment's,
-// since a bearer is decoded before any namespace is consulted.
+// §6.6, §C.8: rulesPerGrant and grantSize are the deployment's (deployment
+// only, §12.2, v0.63), checked as a bearer is decoded, before any
+// namespace is consulted: 413.
 func TestV055LimitGrantFields(t *testing.T) {
 	t.Parallel()
-	f := newAuthFixture(t, map[string]any{"limits": map[string]any{"rulesPerGrant": 1}})
+	f := newAuthFixture(t, nil)
 	e := f.tenv
 	rule := map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}
-	g := e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": []any{rule, rule}})
-	expectLimit(t, e.write("PATCH", "sec", "x", "", addRoot(map[string]any{}), g), 422, "rulesPerGrant", 2, 1)
-	g = e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": []any{rule}})
-	expect(t, e.write("PATCH", "sec", "x", "", addRoot(map[string]any{}), g), 201)
-
-	// A namespace's own grantSize, below the deployment's.
-	tk := newKey("tk")
-	e.mkNS("tiny", map[string]any{"keys": []any{tk.entry("*")}, "limits": map[string]any{"grantSize": 200}})
-	tg := e.grant(tk, "user:t", []string{"tiny"}, []string{"read"})
-	raw, err := base64.URLEncoding.DecodeString(tg)
-	if err != nil || len(raw) <= 200 {
-		t.Fatalf("grant of %d bytes: %v", len(raw), err)
+	rpg := int64(core.DefaultMaximums().RulesPerGrant)
+	rules := make([]any, rpg+1)
+	for i := range rules {
+		rules[i] = rule
 	}
-	expectLimit(t, e.get("/ns/tiny/principal", tg), 413, "grantSize", int64(len(raw)), 200)
+	g := e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": rules})
+	expectLimit(t, e.write("PATCH", "sec", "x", "", addRoot(map[string]any{}), g), 413, "rulesPerGrant", rpg+1, rpg)
+	g = e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": rules[:rpg]})
+	expect(t, e.write("PATCH", "sec", "x", "", addRoot(map[string]any{}), g), 201)
 
 	gs := int64(core.DefaultMaximums().GrantSize)
 	// Too long to decode: measured is a lower bound, the decoded length.

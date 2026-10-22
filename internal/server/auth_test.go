@@ -428,17 +428,23 @@ func TestAuthRequireAtMaxLag(t *testing.T) {
 	noAt := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"})
 	expect(t, e.write("PATCH", "sec", "a", "", addRoot(map[string]any{}), noAt), 403)
 
+	// Issuance is the root's nbf, the key setting no maxTtl; without one
+	// the grant fails the scope (§C.4, v0.65).
 	at := e.nsHead("sec", f.adminG)
-	g := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at})
+	expect(t, e.write("PATCH", "sec", "a", "", addRoot(map[string]any{}), e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at})), 403)
+	issued := func() map[string]any { return map[string]any{"nbf": e.clock.Now().Format(time.RFC3339)} }
+	g := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at}, issued())
 	expect(t, e.write("PATCH", "sec", "b", "", addRoot(map[string]any{}), g), 201)
 
-	// at stops being the head; within maxLag the grant still works…
+	// at stops being the head; a grant issued within maxLag of that works…
 	e.clock.Advance(30 * time.Second)
 	expect(t, e.write("PATCH", "sec", "c", "", addRoot(map[string]any{}), g), 201)
-	// …beyond it, it doesn't.
+	expect(t, e.write("PATCH", "sec", "c2", "", addRoot(map[string]any{}), e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at}, issued())), 201)
+	// …one issued beyond it doesn't, and g, issued in time, still does.
 	e.clock.Advance(90 * time.Second)
-	expect(t, e.write("PATCH", "sec", "d", "", addRoot(map[string]any{}), g), 403)
-	fresh := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": e.nsHead("sec", f.adminG)})
+	expect(t, e.write("PATCH", "sec", "d", "", addRoot(map[string]any{}), e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": at}, issued())), 403)
+	expect(t, e.write("PATCH", "sec", "e", "", addRoot(map[string]any{}), g), 201)
+	fresh := e.grant(cat, "user:li", []string{"sec"}, []string{"read", "create"}, map[string]any{"at": e.nsHead("sec", f.adminG)}, issued())
 	expect(t, e.write("PATCH", "sec", "d", "", addRoot(map[string]any{}), fresh), 201)
 
 	// maxLag must be a duration.

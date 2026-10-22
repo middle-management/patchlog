@@ -250,7 +250,7 @@ func TestV050EdgeGrantsAllOrNothing(t *testing.T) {
 		{"not a grant", []string{"x", ok}, 401, ""},
 		{"403 then 401", []string{noRead, bad}, 401, ""},
 		{"401 then 403", []string{missing, noRead}, 401, ""},
-		{"star", []string{ok, star}, 403, ""},
+		{"star", []string{ok, star}, 401, ""}, // "*": 401 (§C.4, v0.63)
 		{"star then 401", []string{star, missing}, 401, ""},
 		{"no read", []string{ok, noRead}, 403, ""},
 		{"purged and 403", []string{p1, noRead}, 403, ""},
@@ -360,8 +360,15 @@ func TestV050EdgeGrantsFiniteSets(t *testing.T) {
 	} {
 		r := issue(sec, c.rules...)
 		if c.prefixes == "" {
-			if r.Code != 403 {
-				t.Errorf("%s: want 403: %d %s", c.name, r.Code, r.Body)
+			// A rule that doesn't compile makes the grant invalid, 401
+			// on every request (§6.6, v0.63); in with a string is valid,
+			// false (§6.4.2), and refers to /resource without fixing it.
+			want := 403
+			if c.name == "enum not an array" {
+				want = 401
+			}
+			if r.Code != want {
+				t.Errorf("%s: want %d: %d %s", c.name, want, r.Code, r.Body)
 			}
 			expectNoCookies(t, c.name, r)
 			continue

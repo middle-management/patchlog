@@ -2055,21 +2055,27 @@ func adminGrant(opt ReleaseOptions, cat string, p *Plan) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("merge: the admin grant: %w", err)
 	}
+	// The pairs as one alternative per action naming its resources, so
+	// the rule's forms stay within rulesPerGrant (§12.2) however many
+	// items the batch has.
 	var can []string
-	var alts []any
+	names := map[string][]any{}
 	for _, r := range p.Items() {
-		acts := itemActions(r)
-		for _, a := range acts {
+		for _, a := range itemActions(r) {
 			if !slicesContains(can, a) {
 				can = append(can, a)
 			}
+			names[a] = append(names[a], r.Name)
 		}
-		alts = append(alts, map[string]any{"all": []any{
-			map[string]any{"op": "test", "path": "/resource", "value": r.Name},
-			map[string]any{"op": "test", "path": "/action", "schema": map[string]any{"enum": anyStrings(acts)}},
-		}})
 	}
 	sort.Strings(can)
+	alts := []any{}
+	for _, a := range can {
+		alts = append(alts, map[string]any{"all": []any{
+			map[string]any{"op": "test", "path": "/action", "value": a},
+			map[string]any{"op": "compare", "path": "/resource", "in": map[string]any{"value": names[a]}},
+		}})
+	}
 	via := opt.Via
 	if via == "" {
 		via = opt.Who

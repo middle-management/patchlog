@@ -469,8 +469,10 @@ func TestRevocation(t *testing.T) {
 	if d.RevocationIDs()[0] != g.RevocationIDs()[0] || len(d.RevocationIDs()) != 2 {
 		t.Fatal("revocation ids unstable")
 	}
-	if g.RevocationIDs()[0] != ids.Of(g.c.blocks[0].sig).String() {
-		t.Fatal("revocation id is text(trunc160(sha256(sig)))")
+	// A root block's revocation id is its grant id, a narrowing block's
+	// the text id of its signature (§C.4, v0.71).
+	if g.RevocationIDs()[0] != g.ID().String() || d.RevocationIDs()[1] != ids.Of(n.c.blocks[1].sig).String() {
+		t.Fatal("revocation ids: the root's is its grant id, a narrowing block's text(trunc160(sha256(sig)))")
 	}
 	// Revoking the authority block revokes everything narrowed from it.
 	env := f.env()
@@ -628,8 +630,7 @@ func TestNSCheckFirst(t *testing.T) {
 }
 
 // "*" in ns names every namespace, but only operator grants may use it
-// (§C.4). From a namespace key it is refused with 403: the grant is valid,
-// it just doesn't apply.
+// (§C.4). From a namespace key the grant is invalid: 401 (v0.63).
 func TestStarNS(t *testing.T) {
 	f := newFixture(t, nil)
 	g := roundtrip(t, mustMint(t, f, map[string]any{"ns": []string{"*"}}))
@@ -637,7 +638,7 @@ func TestStarNS(t *testing.T) {
 		t.Fatal("* names every namespace")
 	}
 	_, err := Verify(g, f.env())
-	wantStatus(t, err, 403)
+	wantStatus(t, err, 401)
 	env := f.env()
 	env.Operator = true
 	env.NS = "new-ns"
@@ -647,7 +648,7 @@ func TestStarNS(t *testing.T) {
 	// Also when the namespace is named alongside "*".
 	g = roundtrip(t, mustMint(t, f, map[string]any{"ns": []string{"matches", "*"}}))
 	_, err = Verify(g, f.env())
-	wantStatus(t, err, 403)
+	wantStatus(t, err, 401)
 }
 
 func TestKeyScope(t *testing.T) {
@@ -672,7 +673,7 @@ func TestKeyScope(t *testing.T) {
 		{"attrs ok", map[string]any{"attrs": map[string]any{"region": "se"}}, nil, true},
 		{"attrs violated", map[string]any{"attrs": map[string]any{"region": "no"}}, nil, false},
 		{"requireAt missing", map[string]any{"requireAt": true}, nil, false},
-		{"requireAt ok", map[string]any{"requireAt": true}, map[string]any{"at": "1" + strings.Repeat("a", 32)}, true},
+		{"requireAt ok", map[string]any{"requireAt": true}, map[string]any{"at": "1" + strings.Repeat("a", 32), "nbf": ts(-time.Minute)}, true},
 		{"requireAt lag", map[string]any{"requireAt": "cat", "maxLag": "PT1M"}, map[string]any{"at": map[string]any{"ns": "cat", "id": "1" + strings.Repeat("a", 32)}}, false},
 		{"requireAt default lag", map[string]any{"requireAt": "cat"}, map[string]any{"at": map[string]any{"ns": "cat", "id": "1" + strings.Repeat("a", 32)}}, false},
 		{"requireAt key lag laxer", map[string]any{"requireAt": "cat", "maxLag": "PT5M"}, map[string]any{"at": map[string]any{"ns": "cat", "id": "1" + strings.Repeat("a", 32)}}, false},
@@ -707,11 +708,15 @@ func TestKeyScope(t *testing.T) {
 			}
 		})
 	}
-	// Key scope can bounds effective verbs of a narrowed grant listing extra verbs.
+	// Key scope can bounds effective verbs of a narrowed grant listing
+	// extra verbs: they narrow nothing more (§C.1), only the root's can is
+	// held to the key's (§C.4).
 	f := newFixture(t, map[string]any{"can": []any{"read", "append"}})
 	g, _ := mustMint(t, f, nil).Narrow(map[string]any{"can": []string{"delete"}})
-	_, err := Verify(roundtrip(t, g), f.env())
-	wantStatus(t, err, 403)
+	v, err := Verify(roundtrip(t, g), f.env())
+	if err != nil || len(v.Can) != 0 {
+		t.Fatalf("narrowed to a verb outside the key's can: %v, can %v", err, v)
+	}
 }
 
 func TestRoles(t *testing.T) {
@@ -777,10 +782,11 @@ func TestStored(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.HasProof() || p.Sealed() || p.ID() != g.ID() || len(p.Blocks) != 2 {
+	// The stored form is the authority block alone (§C.8, v0.63).
+	if p.HasProof() || p.Sealed() || p.ID() != g.ID() || len(p.Blocks) != 1 {
 		t.Fatal("stored parse")
 	}
-	if strings.Join(p.RevocationIDs(), ",") != strings.Join(g.RevocationIDs(), ",") {
+	if strings.Join(p.RevocationIDs(), ",") != g.RevocationIDs()[0] {
 		t.Fatal("stored revocation ids")
 	}
 	if _, err := p.Narrow(map[string]any{"via": "x"}); err == nil {
@@ -792,10 +798,10 @@ func TestStored(t *testing.T) {
 	if _, err := ParseStored(tokenBytes(t, g.Encode())); err == nil {
 		t.Fatal("token accepted as stored form")
 	}
-	// Block signatures are still checked.
-	bad := replaceOnce(t, append([]byte(nil), s...), "svc", "svd")
-	if _, err := ParseStored(bad); err == nil {
-		t.Fatal("tampered stored form accepted")
+	// The authority block's signature is still checked, under its key.
+	bad, err := ParseStored(replaceOnce(t, append([]byte(nil), s...), "user:bob", "user:bab"))
+	if err != nil || !p.SignedBy(f.keys[0].Pub) || bad.SignedBy(f.keys[0].Pub) {
+		t.Fatal("tampered stored form verifies")
 	}
 }
 
@@ -857,13 +863,15 @@ func TestIssuedAndMaxLag(t *testing.T) {
 	exp := now.Add(30 * time.Minute)
 	nbf := now.Add(-50 * time.Minute)
 	withTTL := &Key{MaxTTL: &ttl}
+	if _, ok := Issued(Block{Exp: &exp}, &Key{}); ok {
+		t.Fatal("nothing: issued without nbf or maxTtl")
+	}
 	cases := []struct {
 		name string
 		root Block
 		key  *Key
 		want time.Time
 	}{
-		{"nothing", Block{Exp: &exp}, &Key{}, now},
 		{"nbf, no maxTtl", Block{Exp: &exp, Nbf: &nbf}, &Key{}, nbf},
 		{"exp - maxTtl", Block{Exp: &exp}, withTTL, exp.Add(-ttl)},
 		{"max(nbf, exp - maxTtl)", Block{Exp: &exp, Nbf: &nbf}, withTTL, exp.Add(-ttl)},
@@ -876,7 +884,7 @@ func TestIssuedAndMaxLag(t *testing.T) {
 		want time.Time
 	}{"later nbf", Block{Exp: &exp, Nbf: &late}, withTTL, late})
 	for _, c := range cases {
-		if got := Issued(c.root, c.key, now); !got.Equal(c.want) {
+		if got, ok := Issued(c.root, c.key); !ok || !got.Equal(c.want) {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
