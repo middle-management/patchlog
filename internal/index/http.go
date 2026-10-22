@@ -81,15 +81,17 @@ const strictMins = false
 // the redirect above), private, no-store (§A.4, §B.11.5).
 //
 // Sealed and e2e namespaces (§E.2.5, §E.2.6; package derived). A result
-// has one source, so a reader of the whole namespace gets it sealed as one
-// JWE under the namespace's current epoch key, Content-Type
-// application/jose, pl { ns, view } where view is the result's request
-// target (/{ns}[/g/{gs}]/at/{ns_id}?{query}, the canonical form). A reader
-// whose grant restricts resources may hold only per-resource keys, so it
-// gets JSON { at, ns, hits, next? } in which each hit keeps resource, id
-// and url in the clear and carries its score, schema and facets as
-// "sealed": JWE under its resource's K_r, pl { ns, name, view }; counts,
-// which aggregate over resources, are refused (400) for such readers.
+// has one source, so in a private namespace a reader of it whole (marker
+// reads:{ns}) gets it sealed as one JWE under the namespace's current
+// epoch key, Content-Type application/jose, pl { ns, view } where view is
+// the result's request target (/{ns}/g/{gs}/at/{ns_id}?{query}, the
+// canonical form). A public namespace's results, which every reader gets,
+// and those of a reader whose grant restricts resources, who may hold
+// only per-resource keys, are JSON { at, ns, hits, next? } in which each
+// hit keeps resource, id and url in the clear and carries its score,
+// schema and facets as "sealed": JWE under its resource's K_r, pl { ns,
+// name, view }; counts, which aggregate over resources, are refused (400)
+// there.
 // Sealed results are produced once per view (so per epoch: a rotation
 // moves the checkpoint), stored in the database with their cache tags, and
 // served unchanged, across restarts, until a purge with one of those tags
@@ -481,16 +483,21 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	ix.writeStored(w, r, a, at, st)
 }
 
-// errCounts refuses counts over a sealed namespace to a reader whose grant
-// restricts resources (400): counts aggregate over resources, and such a
-// reader may hold only per-resource keys.
-var errCounts = errors.New("counts over a sealed namespace need a grant that reads the whole namespace")
+// errCounts refuses counts over a sealed namespace to a reader whose
+// results are sealed per entry (400, §E.2.6 Aggregates): counts aggregate
+// over resources, so they have no entry of their own.
+var errCounts = errors.New("counts over a sealed namespace are served only sealed whole, to a grant that reads the whole private namespace")
 
 // answer runs q at the current checkpoint in one read transaction, builds
 // its result, sealed in a sealed or e2e namespace, keeps it (and stores a
 // sealed one), and returns the result kept with the checkpoint it is at.
 func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Values, q *Query, info derived.Info, key derived.Key) (derived.Stored, string, error) {
-	if info.Protected() && !a.all && len(q.Counts) > 0 {
+	// A result is sealed whole only when its source isn't public and every
+	// reader its URL admits reads it whole, under reads:{ns} (§E.2.6
+	// Whole-response sealing); a public sealed namespace's results, which
+	// anyone reads, and a limited reader's, are sealed per entry.
+	perEntry := info.Protected() && (a.public || !a.all)
+	if perEntry && len(q.Counts) > 0 {
 		return derived.Stored{}, "", errCounts
 	}
 	var allow func(string) bool
@@ -531,7 +538,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		if h.Self {
 			m["self"] = true
 		}
-		if info.Protected() && !a.all {
+		if perEntry {
 			// Per-entry sealing: what the document gave (score, schema,
 			// facets) under its resource's key; names, ids and URLs stay.
 			values := map[string]any{}
@@ -561,7 +568,7 @@ func (ix *Index) answer(ctx context.Context, a *access, ns string, vals url.Valu
 		body["counts"] = res.Counts
 	}
 	st := derived.Stored{JSON: true, Tags: resultTags(ns, res)}
-	if info.Protected() && a.all {
+	if info.Protected() && !perEntry {
 		var jwe string
 		jwe, err = derived.SealView(key, view, body)
 		st.Body, st.JSON = []byte(jwe), false

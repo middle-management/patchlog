@@ -12,6 +12,7 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/seal"
 )
@@ -511,5 +512,70 @@ func TestV073NarrowingPurge(t *testing.T) {
 	patch("pub", map[string]any{"op": "add", "path": "/keys/-", "value": clienttest.NewKey("third").Entry("read")})
 	if got := x.purgesSoFar(); got != "[]" {
 		t.Errorf("purges after a restart and a change narrowing nothing: %s", got)
+	}
+}
+
+// TestV073PublicSealedPerEntry (ENC-33, §E.2.6): a result is sealed whole
+// only when its source isn't public and its URL admits only readers of it
+// whole (reads:{ns}); a public sealed namespace's results are JSON with
+// each hit sealed per entry, and counts, which aggregate, are 400 there.
+func TestV073PublicSealedPerEntry(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"ps", "vs", "schemas"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns != "schemas" {
+			doc["encryption"] = map[string]any{"level": "sealed"}
+		}
+		if ns == "vs" {
+			doc["read"] = "grant"
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"ps", "vs", "schemas"}, []string{"read", "create"})), client.WithKeys(client.NewKeys(nil)))
+	sch := must(w.CreateDoc(ctx, "schemas", "item", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}, "tag": map[string]any{"type": "string", "x-index": "facet"}}}))
+	for _, ns := range []string{"ps", "vs"} {
+		must(createNonced(w, ns, "a", map[string]any{"$schema": "/r/schemas/item/rev/" + sch.ID, "title": "secret a", "tag": "t"}))
+	}
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"ps", "vs"}, []string{"read"}, map[string]any{"enc": jwk})), client.WithKeys(client.NewKeys(priv)))
+	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"ps", "vs"}, now: s.Now}, func(o *indexOpts) { o.Recipient = priv })
+	x.caughtUp("ps")
+	x.caughtUp("vs")
+
+	// Public and sealed: per entry, anonymous or with a grant.
+	rd := k.Grant(t, s.Now(), "user:r", []string{"ps", "vs"}, []string{"read"})
+	for _, tok := range []string{"", rd} {
+		f := x.fetch("/ps?q=secret", tok)
+		if ct := f.header.Get("Content-Type"); ct != "application/json" || strings.Contains(string(f.body), "secret") {
+			t.Fatalf("public sealed: %q %s", ct, f.body)
+		}
+		hit := decodeJSON(t, f.body)["hits"].([]any)[0].(map[string]any)
+		jwe, _ := hit["sealed"].(string)
+		if hit["resource"] != "a" || hit["score"] != nil || jwe == "" {
+			t.Fatalf("hit %v", hit)
+		}
+		v := decodeJSON(t, must(derived.OpenItem(jwe, derived.ItemKey(epochKeys(t, w, "ps"), "ps", "a"), derived.View{NS: "ps", Target: f.path}, "ps", "a")))
+		if v["score"] == nil || fmt.Sprint(v["/tag"]) != "[t]" {
+			t.Errorf("opens to %v", v)
+		}
+		if r := x.answerOf("/ps?q=secret&counts=/tag", tok); r.status != 400 || r.body["code"] != "bad_input" {
+			t.Errorf("counts over a public sealed namespace: %d %v", r.status, r.body)
+		}
+	}
+	// Private and sealed, read whole: one JWE, counts included.
+	f := x.fetch("/vs?q=secret&counts=/tag", rd)
+	if ct := f.header.Get("Content-Type"); ct != seal.ContentType {
+		t.Fatalf("private sealed: %q %s", ct, f.body)
+	}
+	b := decodeJSON(t, must(derived.OpenView(string(f.body), epochKeys(t, w, "vs"), derived.View{NS: "vs", Target: f.path})))
+	if b["counts"] == nil || fmt.Sprint(resources(b)) != "[a]" {
+		t.Errorf("private sealed: %v", b)
 	}
 }

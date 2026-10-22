@@ -16,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/client/clienttest"
 	"github.com/middle-management/patchlog/internal/derived"
+	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/seal"
 )
@@ -88,9 +89,11 @@ func createNonced(c *client.Client, ns, name string, doc map[string]any) (*clien
 	return c.Create(context.Background(), ns, name, ps)
 }
 
-// Results over a sealed namespace are one JWE under its current epoch key,
-// bound to the result's URL; a public namespace's stay plain JSON. Keys
-// come from POST /keys with the indexer's grant, wrapped to its enc.
+// Results over a private sealed namespace, for a reader of it whole, are
+// one JWE under its current epoch key, bound to the result's URL; a public
+// namespace's stay plain JSON. Keys come from POST /keys with the
+// indexer's grant, wrapped to its enc. (Since v0.73 a public sealed
+// namespace's results are sealed per entry, §E.2.6: sec is private here.)
 func TestSealedNamespace(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -99,10 +102,14 @@ func TestSealedNamespace(t *testing.T) {
 	for _, ns := range []string{"sec", "pub", "schemas"} {
 		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
 		if ns == "sec" {
+			doc["read"] = "grant"
 			doc["encryption"] = map[string]any{"level": "sealed"}
 		}
 		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
 	}
+	// A reader of sec whole, under reads:sec (§A.4).
+	rd := k.Grant(t, s.Now(), "user:r", []string{"sec"}, []string{"read"})
+	gs := grantcheck.SubjectSetID([]string{"reads:sec"})
 	all := []string{"read", "create", "append", "purge", "config"}
 	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"sec", "pub", "schemas"}, all)), client.WithKeys(client.NewKeys(nil)))
 	// The schema lives in a public namespace (§E.2.5).
@@ -138,7 +145,7 @@ func TestSealedNamespace(t *testing.T) {
 	}
 
 	// Sealed namespace: a JWE under sec#1, bound to { ns, view }.
-	f := x.fetch("/sec?q=secret&counts=/tag", "")
+	f := x.fetch("/sec?q=secret&counts=/tag", rd)
 	if ct := f.header.Get("Content-Type"); ct != seal.ContentType {
 		t.Fatalf("sealed content type %q: %s", ct, f.body)
 	}
@@ -147,7 +154,7 @@ func TestSealedNamespace(t *testing.T) {
 	}
 	h := must(seal.ParseHeader(string(f.body)))
 	at := x.ix.Checkpoint("sec")
-	if h.Kid != "sec#1" || h.Zip != "" || fmt.Sprint(h.PL) != fmt.Sprint(map[string]any{"ns": "sec", "view": "/sec/at/" + at + "?counts=%2Ftag&q=secret"}) {
+	if h.Kid != "sec#1" || h.Zip != "" || fmt.Sprint(h.PL) != fmt.Sprint(map[string]any{"ns": "sec", "view": "/sec/g/" + gs + "/at/" + at + "?counts=%2Ftag&q=secret"}) {
 		t.Fatalf("header %+v", h)
 	}
 	keys := epochKeys(t, w, "sec")
@@ -161,7 +168,7 @@ func TestSealedNamespace(t *testing.T) {
 		t.Fatalf("hit %v", hit)
 	}
 	// Requested fields are sealed with the rest (§A.4).
-	ff := x.fetch("/sec?q=secret&fields=%2Ftitle", "")
+	ff := x.fetch("/sec?q=secret&fields=%2Ftitle", rd)
 	fpt := must(derived.OpenView(string(ff.body), keys, derived.View{NS: "sec", Target: ff.path}))
 	if fh := decodeJSON(t, fpt)["hits"].([]any)[0].(map[string]any); fmt.Sprint(fh["/title"]) != "[secret a]" || strings.Contains(string(ff.body), "secret") {
 		t.Fatalf("fields in a sealed result: %s", fpt)
@@ -175,7 +182,7 @@ func TestSealedNamespace(t *testing.T) {
 		t.Fatalf("other view: %v", err)
 	}
 	// Sealed once, served unchanged; only the canonical URL is served.
-	if again := x.fetch(f.path, ""); string(again.body) != string(f.body) {
+	if again := x.fetch(f.path, rd); string(again.body) != string(f.body) {
 		t.Fatal("resealed on a second read")
 	}
 	// Stored in the database, with its cache tags: a restart serves the
@@ -186,10 +193,10 @@ func TestSealedNamespace(t *testing.T) {
 	x.stop()
 	x = startSvcWith(t, ic, opts, withKey)
 	x.caughtUp("sec")
-	if again := x.fetch(f.path, ""); string(again.body) != string(f.body) || !strings.Contains(again.header.Get("Cache-Tag"), "r:sec/a") {
+	if again := x.fetch(f.path, rd); string(again.body) != string(f.body) || !strings.Contains(again.header.Get("Cache-Tag"), "r:sec/a") {
 		t.Fatalf("resealed after a restart (tags %q)", again.header.Get("Cache-Tag"))
 	}
-	if r := x.raw("/sec/at/"+at+"?q=secret&counts=/tag", ""); r.status != 302 || r.header.Get("Location") != f.path {
+	if r := x.raw("/sec/g/"+gs+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
 		t.Fatalf("non-canonical: %d %s", r.status, r.header.Get("Location"))
 	}
 
@@ -202,7 +209,7 @@ func TestSealedNamespace(t *testing.T) {
 	// A rotation moves the checkpoint: results are sealed under the new epoch.
 	must(s.Engine.RotateEpoch(ctx, "sec", "system:rotate"))
 	x.caughtUp("sec")
-	f2 := x.fetch("/sec?q=secret", "")
+	f2 := x.fetch("/sec?q=secret", rd)
 	if h := must(seal.ParseHeader(string(f2.body))); h.Kid != "sec#2" {
 		t.Fatalf("after rotation kid %s", h.Kid)
 	}
@@ -211,10 +218,10 @@ func TestSealedNamespace(t *testing.T) {
 	}
 	// Kept, the result at the previous checkpoint is still served there,
 	// unchanged, at its canonical URL only (B9).
-	if again := x.fetch(f.path, ""); again.path != f.path || string(again.body) != string(f.body) {
+	if again := x.fetch(f.path, rd); again.path != f.path || string(again.body) != string(f.body) {
 		t.Fatalf("kept result: %s, changed %v", again.path, string(again.body) != string(f.body))
 	}
-	if r := x.raw("/sec/at/"+at+"?q=secret&counts=/tag", ""); r.status != 302 || r.header.Get("Location") != f.path {
+	if r := x.raw("/sec/g/"+gs+"/at/"+at+"?q=secret&counts=/tag", rd); r.status != 302 || r.header.Get("Location") != f.path {
 		t.Fatalf("non-canonical, kept: %d %s", r.status, r.header.Get("Location"))
 	}
 
@@ -231,11 +238,11 @@ func TestSealedNamespace(t *testing.T) {
 		}
 	}
 	for _, p := range []string{f.path, f2.path} {
-		if r := x.raw(p, ""); r.status != 302 {
+		if r := x.raw(p, rd); r.status != 302 {
 			t.Fatalf("kept result %s survived the purge: %d", p, r.status)
 		}
 	}
-	f3 := x.fetch("/sec?q=secret", "")
+	f3 := x.fetch("/sec?q=secret", rd)
 	if got := strings.Join(resources(decodeJSON(t, must(derived.OpenView(string(f3.body), epochKeys(t, w, "sec"), derived.View{NS: "sec", Target: f3.path})))), ","); got != "b" {
 		t.Fatalf("after purge %s", got)
 	}
@@ -356,30 +363,39 @@ func TestE2ENamespace(t *testing.T) {
 		t.Fatalf("skipped namespace has %d rows", n)
 	}
 
-	// With the keyring recipient key: indexed, and results sealed.
+	// With the keyring recipient key: indexed, and results sealed, per
+	// entry since e is public (§E.2.6, v0.73).
 	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"e"}, []string{"read"}, map[string]any{"enc": idxJWK})))
 	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"e"}, untyped: true, now: s.Now}, func(o *indexOpts) { o.Recipient = idxPriv })
 	x.caughtUp("e")
 	f := x.fetch("/e?q="+marker, "")
-	if ct := f.header.Get("Content-Type"); ct != seal.ContentType || strings.Contains(string(f.body), marker) {
+	if ct := f.header.Get("Content-Type"); ct != "application/json" || strings.Contains(string(f.body), marker) {
 		t.Fatalf("e2e result: %q %s", ct, f.body)
 	}
 	ke := must(ad.Key(ctx, "e#1"))
-	b := decodeJSON(t, must(derived.OpenView(string(f.body), func(kid string) []byte {
+	epochKey := func(kid string) []byte {
 		if kid == "e#1" {
 			return ke
 		}
 		return nil
-	}, derived.View{NS: "e", Target: f.path})))
+	}
+	b := decodeJSON(t, f.body)
 	got := resources(b)
 	sort.Strings(got)
 	if strings.Join(got, ",") != "a,b" {
 		t.Fatalf("e2e hits %v", got)
 	}
+	for _, h := range b["hits"].([]any) {
+		h := h.(map[string]any)
+		name := h["resource"].(string)
+		v := decodeJSON(t, must(derived.OpenItem(h["sealed"].(string), derived.ItemKey(epochKey, "e", name), derived.View{NS: "e", Target: f.path}, "e", name)))
+		if v["score"] == nil {
+			t.Errorf("%s opens to %v", name, v)
+		}
+	}
 	// The keyring is not content: not even in plain listings.
 	lst := x.fetch("/e", "")
-	b = decodeJSON(t, must(derived.OpenView(string(lst.body), func(string) []byte { return ke }, derived.View{NS: "e", Target: lst.path})))
-	if got := strings.Join(resources(b), ","); got != "a,b" {
+	if got := strings.Join(resources(decodeJSON(t, lst.body)), ","); got != "a,b" {
 		t.Fatalf("listing %s", got)
 	}
 }
@@ -400,13 +416,20 @@ func TestSealedPadded(t *testing.T) {
 	}
 	x := startSvc(t, c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"p"}, now: s.Now})
 	x.caughtUp("p")
+	// p is public: its hits are sealed per entry (§E.2.6, v0.73), each
+	// padded.
 	f := x.fetch("/p?q=padded", "")
-	h := must(seal.ParseHeader(string(f.body)))
-	pt := must(derived.OpenView(string(f.body), epochKeys(t, c, "p"), derived.View{NS: "p", Target: f.path}))
-	if !seal.IsPadded(h, pt) || len(pt) <= 2100 {
-		t.Fatalf("not padded: zip %q, %d bytes", h.Zip, len(pt))
-	}
-	if got := strings.Join(resources(decodeJSON(t, pt)), ","); got != "a,b,c" {
+	b := decodeJSON(t, f.body)
+	if got := strings.Join(resources(b), ","); got != "a,b,c" {
 		t.Fatalf("hits %s", got)
+	}
+	for _, hit := range b["hits"].([]any) {
+		hit := hit.(map[string]any)
+		name, jwe := hit["resource"].(string), hit["sealed"].(string)
+		h := must(seal.ParseHeader(jwe))
+		pt := must(derived.OpenItem(jwe, derived.ItemKey(epochKeys(t, c, "p"), "p", name), derived.View{NS: "p", Target: f.path}, "p", name))
+		if !seal.IsPadded(h, pt) || len(pt) <= 700 {
+			t.Fatalf("%s not padded: zip %q, %d bytes", name, h.Zip, len(pt))
+		}
 	}
 }
