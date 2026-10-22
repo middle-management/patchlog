@@ -3,13 +3,18 @@ package catalog_test
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"reflect"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // p30Same reports whether two refusals are alike but for the item they
@@ -259,6 +264,15 @@ func TestPurgedNamespaceItemsV073(t *testing.T) {
 					t.Errorf("%v: %v (head %s, checkpoint %v)", c.req, r.body, head, cp)
 				}
 			}
+			rg := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/ghost")})
+			for i := range 2 {
+				if e := entry(rg, i); e == nil || e["status"] != 410.0 || e["code"] != "purged" || e["head"] != head {
+					t.Errorf("read-grants entry %d: %v", i, e)
+				}
+			}
+			if !reflect.DeepEqual(rg.body["checkpoint"], cp) {
+				t.Errorf("read-grants checkpoint %v, want %v", rg.body["checkpoint"], cp)
+			}
 		})
 	}
 
@@ -285,4 +299,224 @@ func TestPurgedNamespaceItemsV073(t *testing.T) {
 		}
 		rt.hold.Store(false)
 	})
+}
+
+// TestReadGrantsAnswerShapeV073 (TC-41): POST /read-grants answers 200
+// { items: [{ item, grant?, public?, keys?, keysWithheld?, status?,
+// code? }], checkpoint }: one entry per item in request order, status and
+// code for an item refused, and one checkpoint over every namespace any
+// decision read, so a teams item adds teams; no entry carries a
+// checkpoint or an error object, and exp stays beside a grant (§B.11.4).
+func TestReadGrantsAnswerShapeV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.trustTeams()
+	w.start()
+	w.caughtUp()
+	waitFor(t, "teams to be followed", func() bool { return w.svc.Tree().Checkpoint("teams") != "" })
+	fan := w.caller("user:fred", "fan-club")
+	items := toAny("/r/matches/derby", "/r/matches/rumour1", "/r/matches/ghost", "/r/teams/t1", "nonsense")
+	rg := w.do("POST", "/read-grants", fan, map[string]any{"items": items})
+	var keys []string
+	for k := range rg.body {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if rg.status != 200 || fmt.Sprint(keys) != "[checkpoint items]" || !reflect.DeepEqual(rg.body["checkpoint"], w.checkpointOf("matches", "teams")) {
+		t.Fatalf("read-grants: %d %v", rg.status, rg.body)
+	}
+	for i, want := range []struct {
+		status float64
+		code   string
+	}{{0, ""}, {403, "forbidden"}, {404, "not_found"}, {403, "forbidden"}, {400, "bad_input"}} {
+		e := entry(rg, i)
+		status, _ := e["status"].(float64)
+		code, _ := e["code"].(string)
+		if e["item"] != items[i] || status != want.status || code != want.code || e["error"] != nil || e["checkpoint"] != nil ||
+			(want.status == 0) != (e["grant"] != nil && e["exp"] != nil) {
+			t.Errorf("entry %d: %v", i, e)
+		}
+	}
+	// Items of matches only: the checkpoint names the catalog and matches.
+	rg = w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/ghost")})
+	if !reflect.DeepEqual(rg.body["checkpoint"], w.checkpointOf("matches")) {
+		t.Errorf("read-grants of matches items: %v", rg.body)
+	}
+}
+
+// TestReadGrantsCatalogNodesV073 (TC-42, scenario 21): a catalog node in
+// POST /read-grants is 400 in a catalog that is neither sealed nor
+// end-to-end, visible or not; in a sealed one a visible node gets its
+// keys and no grant, and a hidden one is 404, answered as a node not in
+// the catalog (§B.11.5).
+func TestReadGrantsCatalogNodesV073(t *testing.T) {
+	t.Parallel()
+	t.Run("unsealed", func(t *testing.T) {
+		t.Parallel()
+		w := setup(t)
+		w.seed()
+		w.start()
+		w.caughtUp()
+		rg := w.do("POST", "/read-grants", w.caller("user:fred", "fan-club"), map[string]any{"items": toAny("/r/cat/season", "/r/cat/rumours", "/r/cat/matches.derby")})
+		for i := range 3 {
+			if e := entry(rg, i); e["status"] != 400.0 || e["code"] != "bad_input" {
+				t.Errorf("entry %d: %v", i, e)
+			}
+		}
+	})
+	t.Run("sealed", func(t *testing.T) {
+		t.Parallel()
+		w := setupWith(t, true)
+		w.seed()
+		w.start()
+		w.caughtUp()
+		jwk, _, err := seal.GenerateRecipient()
+		if err != nil {
+			t.Fatal(err)
+		}
+		fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
+		items := toAny("/r/cat/season", "/r/cat/rumours", "/r/cat/nosuch", "/r/cat/matches.rumour1", "/r/cat/matches.ghost")
+		rg := w.do("POST", "/read-grants", fan, map[string]any{"items": items})
+		if e := entry(rg, 0); e["status"] != nil || e["grant"] != nil || e["keys"] == nil {
+			t.Errorf("visible folder: %v", e)
+		}
+		// A folder's visibility reads every trusted namespace (§B.11.4).
+		if !reflect.DeepEqual(rg.body["checkpoint"], w.checkpointOf("matches")) {
+			t.Errorf("checkpoint %v, want %v", rg.body["checkpoint"], w.checkpointOf("matches"))
+		}
+		for _, pair := range [][2]int{{1, 2}, {3, 4}} {
+			h, m := entry(rg, pair[0]), entry(rg, pair[1])
+			hn, mn := strings.TrimPrefix(items[pair[0]].(string), "/r/cat/"), strings.TrimPrefix(items[pair[1]].(string), "/r/cat/")
+			if h["status"] != 404.0 || h["code"] != "not_found" || h["keys"] != nil || !p30Same(h, m, hn, mn) {
+				t.Errorf("hidden %v, missing %v", h, m)
+			}
+		}
+	})
+}
+
+// TestReadGrantsVisibleRolesV073 (TC-43, scenario 47): a /read-grants item
+// is refused as POST /grants refuses a read of it, counting only the roles
+// that make it visible, by the listing visibility test: a role whose rule
+// refers to /now doesn't, though POST /grants grants it, which doesn't
+// evaluate rules. A hidden item is answered as one without a placement,
+// and the grant carries only the roles that make the item visible
+// (§B.11.5).
+func TestReadGrantsVisibleRolesV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("matches", "opener", map[string]any{"title": "opener"})
+	w.start()
+	w.caughtUp()
+	w.patchMatches(
+		map[string]any{"op": "add", "path": "/roles/timed", "value": map[string]any{"can": toAny("read"),
+			"rules": []any{map[string]any{"op": "test", "path": "/now", "schema": map[string]any{"type": "string"}}}}},
+		map[string]any{"op": "add", "path": "/keys/2/roles/allow/-", "value": "timed"})
+	w.patch("cat", "season", map[string]any{"op": "add", "path": "/$access/group:timers", "value": toAny("timed")},
+		map[string]any{"op": "replace", "path": "/$access/group:fan-club", "value": toAny("reader", "timed")})
+	w.caughtUp()
+
+	// Scenario 47: rumour1 is placed only in rumours, hidden from bob;
+	// opener has no placement. Both are refused alike.
+	bob := w.caller("user:bob", "match-desk")
+	rg := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/matches/rumour1", "/r/matches/opener")})
+	if a, b := entry(rg, 0), entry(rg, 1); a["status"] != 403.0 || !p30Same(a, b, "/r/matches/rumour1", "/r/matches/opener") {
+		t.Errorf("hidden %v, unplaced %v", a, b)
+	}
+
+	// A role with a /now rule makes nothing visible.
+	timer := w.caller("user:tim", "timers")
+	w.issue(timer, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200)
+	if e := entry(w.do("POST", "/read-grants", timer, map[string]any{"items": toAny("/r/matches/derby")}), 0); e["status"] != 403.0 {
+		t.Errorf("read-grants through a /now role: %v", e)
+	}
+	// The grant carries the roles that make the item visible only.
+	fan := w.caller("user:fred", "fan-club")
+	if b := w.issue(fan, map[string]any{"item": "/r/matches/derby", "want": toAny("read")}, 200).body; fmt.Sprint(b["roles"]) != "[reader timed]" {
+		t.Errorf("POST /grants roles %v", b["roles"])
+	}
+	e := entry(w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby")}), 0)
+	tok, _ := e["grant"].(string)
+	if tok == "" {
+		t.Fatalf("read-grants: %v", e)
+	}
+	if g := must(grant.Decode(tok, 0)); fmt.Sprint(g.Blocks[0].Roles) != "[reader]" {
+		t.Errorf("read grant roles %v", g.Blocks[0].Roles)
+	}
+}
+
+// TestReadGrantsPublicSealedV073 (TC-44): an item in a public sealed
+// namespace comes back with its keys alone, no grant and no "public":
+// true, which is only for items of public namespaces that aren't sealed;
+// the keys still pass the role check (§B.11.5).
+func TestReadGrantsPublicSealedV073(t *testing.T) {
+	t.Parallel()
+	w := setupWith(t, true)
+	w.seed()
+	w.start()
+	w.caughtUp()
+	w.patchMatches(map[string]any{"op": "add", "path": "/read", "value": "public"})
+	jwk, _, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
+	rg := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/rumour1")})
+	d, r := entry(rg, 0), entry(rg, 1)
+	if ks, _ := d["keys"].([]any); d["public"] != nil || d["grant"] != nil || d["status"] != nil || len(ks) != 2 {
+		t.Errorf("public sealed item: %v", d)
+	}
+	if r["status"] != 403.0 || r["keys"] != nil || r["public"] != nil {
+		t.Errorf("public sealed item the caller can't see: %v", r)
+	}
+}
+
+// p30KeysRT fails the service's POST /keys of one namespace while set.
+type p30KeysRT struct {
+	ns   string
+	fail atomic.Bool
+	base http.RoundTripper
+}
+
+func (k *p30KeysRT) RoundTrip(r *http.Request) (*http.Response, error) {
+	if k.fail.Load() && r.Method == "POST" && r.URL.Path == "/ns/"+k.ns+"/keys" {
+		return &http.Response{StatusCode: 503, Status: "503 Service Unavailable", Request: r,
+			Header: http.Header{"Content-Type": {"application/json"}},
+			Body:   io.NopCloser(strings.NewReader(`{"code":"held","message":"held by the test"}`))}, nil
+	}
+	return k.base.RoundTrip(r)
+}
+
+// TestReadGrantsKeysBehindV073 (TC-19, catalog half): an item whose keys
+// the service can't fetch yet is undecided: status 503 with code behind
+// (§12.1, §E.2.6), and decided once they can be.
+func TestReadGrantsKeysBehindV073(t *testing.T) {
+	t.Parallel()
+	w := setupWith(t, true)
+	w.seed()
+	rt := &p30KeysRT{ns: "matches", base: transport}
+	w.svcClient = w.s.Client(t, client.WithHTTPClient(&http.Client{Transport: rt}), client.WithKeys(client.NewKeys(nil)),
+		client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches"}, []string{"read"},
+			map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+	w.start()
+	w.caughtUp()
+	jwk, _, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fan := w.idp.Grant(t, w.s.Now(), "user:fred", []string{"cat"}, []string{}, map[string]any{"groups": toAny("fan-club"), "enc": jwk})
+	body := map[string]any{"items": toAny("/r/matches/derby")}
+	if e := entry(w.do("POST", "/read-grants", fan, body), 0); e["status"] != nil || e["keys"] == nil {
+		t.Fatalf("read-grants: %v", e)
+	}
+	rt.fail.Store(true)
+	w.svc.Tree().Keys().Forget("matches")
+	if e := entry(w.do("POST", "/read-grants", fan, body), 0); e["status"] != 503.0 || e["code"] != "behind" || e["grant"] != nil || e["keys"] != nil {
+		t.Errorf("keys unavailable: %v", e)
+	}
+	rt.fail.Store(false)
+	if e := entry(w.do("POST", "/read-grants", fan, body), 0); e["status"] != nil || e["keys"] == nil {
+		t.Errorf("keys available again: %v", e)
+	}
 }

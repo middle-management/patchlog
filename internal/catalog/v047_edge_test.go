@@ -33,7 +33,7 @@ func TestReadGrantsForEdgeGrants(t *testing.T) {
 
 	fan := w.caller("user:fred", "fan-club")
 	r := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby")})
-	g, _ := r.body["grants"].([]any)[0].(map[string]any)["grant"].(string)
+	g, _ := entry(r, 0)["grant"].(string)
 	if r.status != 200 || g == "" {
 		t.Fatalf("read-grants: %d %v", r.status, r.body)
 	}

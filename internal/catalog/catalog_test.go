@@ -845,14 +845,15 @@ func TestPrivateListingsAndReadGrants(t *testing.T) {
 		t.Errorf("guest paths: %v", b)
 	}
 
-	// Read grants: one per item, fixed to it, no-store.
+	// Read grants: one per item, fixed to it, no-store; a name that never
+	// existed is 404 (§B.11.4, §B.11.5).
 	r := w.do("POST", "/read-grants", fan, map[string]any{"items": toAny("/r/matches/derby", "/r/matches/rumour1", "/r/matches/nope")})
 	if r.status != 200 || r.header.Get("Cache-Control") != "no-store" {
 		t.Fatalf("read-grants: %d %v", r.status, r.header)
 	}
-	gs := r.body["grants"].([]any)
+	gs := r.body["items"].([]any)
 	g0, g1, g2 := gs[0].(map[string]any), gs[1].(map[string]any), gs[2].(map[string]any)
-	if g0["grant"] == nil || g1["error"].(map[string]any)["status"] != 403.0 || g2["error"] == nil {
+	if g0["grant"] == nil || g1["status"] != 403.0 || g2["status"] != 404.0 {
 		t.Fatalf("read-grants: %v", gs)
 	}
 	rc := w.core(g0["grant"].(string))

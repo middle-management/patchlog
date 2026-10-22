@@ -103,7 +103,7 @@ func TestVisibilityRulesV038(t *testing.T) {
 	opsCaller := w.caller("user:o", "ops")
 	w.issue(opsCaller, map[string]any{"item": "/r/matches/x3", "want": toAny("read")}, 403)
 	rg := w.do("POST", "/read-grants", opsCaller, map[string]any{"items": toAny("/r/matches/x3")})
-	if e := rg.body["grants"].([]any)[0].(map[string]any)["error"]; e == nil {
+	if e := entry(rg, 0)["status"]; e != 403.0 {
 		t.Errorf("read-grants through an unassertable group: %v", rg.body)
 	}
 	// The same role through an assertable subject does.

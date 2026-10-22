@@ -294,55 +294,53 @@ const maxReadGrants = 100
 const readGrantRetries = 3
 
 // serveReadGrants issues one read grant per item, fixed to that resource
-// (§B.11.5). Items of public namespaces need none; refusals are reported
-// per item:
+// (§B.11.5), and answers 200 with
 //
-//	{ "grants": [
-//	  { "item", "grant", "exp", "keys"?, "keysWithheld"?, "checkpoint" },
-//	  { "item", "public": true, "keys"?, "checkpoint"? },
-//	  { "item", "keys"? | "keysWithheld"?, "checkpoint" },                 a catalog node
-//	  { "item", "error": { "status", "code", "message" }, "checkpoint"? } ] }
+//	{ "items": [
+//	  { "item", "grant", "exp", "keys"?, "keysWithheld"? },         a private item
+//	  { "item", "public": true, "keys"? },                           a public item that isn't sealed (E3 included)
+//	  { "item", "keys" | "keysWithheld" },                           a public sealed item, or a catalog node
+//	  { "item", "status", "code", "message", "head"? } ],            refused (4xx) or undecided (5xx)
+//	  "checkpoint": { ns: ns_id, … } }
 //
 // with one entry per item, in request order, and at most maxReadGrants
-// items (400 above). It answers for every item at once, all decided at one
-// combined checkpoint (§B.5): it notes it before and after deciding, and
-// decides again if it moved, up to readGrantRetries times, then answers
-// 503 behind with Retry-After.
+// items (400 above). exp and message are extras beside the members the
+// spec names (F-B8); head is a 410 purged's, its purge-ns entry (§12.1).
 //
-// Each entry carries the checkpoint its decision was made at, beside its
-// grant as POST /grants carries it (§B.11.4, checkpointAt): the catalog's
-// ns_id and that of the item's own namespace (for a catalog node, of the
-// item a placement names, and for a folder, of every trusted namespace,
-// whose roles decide its visibility), which are all that one item's
-// decision depends on. So a client caches each item's decision on its
-// own, and a write to one item's namespace leaves the others' standing. One map for
-// the whole answer would key every item by every named namespace, and
-// couldn't leave out the entries §B.11.4 gives none: a refusal decided
-// from state the checkpoint doesn't pin (decidedAt), a 5xx, or a public
-// item of a namespace the service doesn't follow, whose exposure is read
-// at the head.
+// It answers for every item at once, all decided at one combined
+// checkpoint (§B.5): it notes it before and after deciding, and decides
+// again if it moved, up to readGrantRetries times, then answers 503
+// behind with Retry-After. So one checkpoint stands beside the whole
+// answer (§B.11.4): the ns_ids there of every namespace a decision read,
+// the catalog's, each named item's namespace's, and, for a catalog folder
+// named, every trusted namespace's, whose roles decide its visibility
+// (decideReads). An entry with a 5xx status (503 behind from checkLag or
+// addKeys, 502 upstream) is undecided, and the client asks again; a
+// refusal decided from state the checkpoint doesn't pin (decidedAt) has
+// no mark of its own (default, F-T3).
 //
 // So "may this reader read all of these?" is one call (§B.11.5): it may
-// if every entry comes back with a grant, or "public": true (an item in a
-// public namespace that isn't sealed, which gets no grant), or, for a
-// sealed item or a catalog node, with its keys; that is, if no entry has
-// an error. It may not if an entry's error is a refusal (a 4xx status);
-// an entry whose error is a 5xx (503 behind from checkLag, 503 keys, 502
-// upstream) is undecided, and the client asks again. Whether a namespace
+// if every entry comes back with a grant, "public": true (an item in a
+// public namespace that isn't sealed, which needs no grant), or, for a
+// catalog node or an item in a public sealed namespace, its keys alone;
+// that is, if no entry has a status. An item is refused as POST /grants
+// refuses a read of it, only the roles that make it visible counting
+// (planRead), and a catalog node is 400 in a catalog that is neither
+// sealed nor end-to-end, and otherwise 404 if hidden. Whether a namespace
 // is public, and its encryption, are read as of the checkpoint too
 // (exposureAt).
 //
 // Keys (§B.11.5, §E.2.6). For an item of a sealed content namespace the
 // answer also carries the item's per-resource keys K_r, which open its
 // revisions; for a sealed or e2e catalog, the keys of its placement node
-// {ns}.{name}, which open the placement's per-entry listing entries, if
-// the placement is visible to the caller. An item may also be a catalog
-// node /r/{catalog}/{name} visible to the caller: it gets that node's
-// keys only (no grant). Visible is the one test listings use (§B.11.5,
-// visibility.Node). Keys are
-// derived from the epoch keys the service holds as a consumer, for the
-// epochs a reader gets (derived.Keys.ResourceKeys), and wrapped (HPKE) to
-// the enc key of the caller's grant in the §E.2.3 format:
+// {ns}.{name}, which open the placement's per-entry listing entry, as the
+// item is visible to the caller. An item may also be a catalog node
+// /r/{catalog}/{name} visible to the caller: it gets that node's keys
+// only (no grant). Visible is the one test listings use (§B.11.5,
+// visibility.Node). Keys are derived from the epoch keys the service
+// holds as a consumer, for the epochs a reader gets
+// (derived.Keys.ResourceKeys), and wrapped (HPKE) to the enc key of the
+// caller's grant in the §E.2.3 format:
 //
 //	"keys": [{ "kid": "{ns}#{e}", "name": name, "wrapped" }, …]
 //
@@ -375,12 +373,20 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 	}
 	for try := 0; try <= readGrantRetries; try++ {
 		before := s.t.At()
-		out := s.decideReads(ctx, v, req.Items)
+		out, read := s.decideReads(ctx, v, req.Items)
 		if f := s.afterDecide.Load(); f != nil {
 			(*f)(try)
 		}
+		var cp map[string]string
+		s.t.View(func(g *tree.Graph, cur map[string]string) {
+			nss := make([]string, 0, len(read))
+			for ns := range read {
+				nss = append(nss, ns)
+			}
+			cp = checkpointAt(g, cur, nss...)
+		})
 		if s.t.At() == before {
-			tree.WriteJSON(w, http.StatusOK, map[string]any{"grants": out})
+			tree.WriteJSON(w, http.StatusOK, map[string]any{"items": out, "checkpoint": cp})
 			return
 		}
 	}
@@ -388,142 +394,133 @@ func (s *Service) serveReadGrants(w http.ResponseWriter, r *http.Request) {
 }
 
 // decideReads decides POST /read-grants' items (serveReadGrants), one
-// entry per item, in order.
-func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []string) []any {
+// entry per item, in order, and reports the namespaces the decisions
+// read besides the catalog, which the answer's checkpoint names.
+func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []string) ([]any, map[string]bool) {
 	lagOK := map[string]bool{}
 	cat := s.t.Catalog()
 	var enc *ecdh.PublicKey
 	if len(v.Grant.Blocks) > 0 {
 		enc = v.Grant.Blocks[0].Enc
 	}
-	// pin is the checkpoint a decision on items of nss reports
-	// (checkpointAt).
-	pin := func(nss ...string) (cp map[string]string) {
-		s.t.View(func(g *tree.Graph, cur map[string]string) { cp = checkpointAt(g, cur, nss...) })
-		return cp
-	}
-	// pinNode is the checkpoint a decision on the visibility of catalog
-	// node name reports: a folder's reads every trusted namespace's
-	// roles, a placement's its item's namespace's (§B.11.4 checkpoint).
-	// Which is judged from the name, not the graph, so a hidden folder's
-	// refusal carries the checkpoint a missing one's does (§B.11.5).
-	pinNode := func(name string) (cp map[string]string) {
-		s.t.View(func(g *tree.Graph, cur map[string]string) {
-			nss := itemNS(name)
-			if folderName(name) {
-				for ns := range g.Trust {
-					nss = append(nss, ns)
-				}
-			}
-			cp = checkpointAt(g, cur, nss...)
-		})
-		return cp
-	}
-	// visible is the visibility test listings use (§B.11.5), for catalog
-	// nodes and their keys.
-	var vis tree.Visibility
-	visible := func(name string) (bool, error) {
-		if vis == nil {
-			var err error
-			if _, vis, err = s.Resolve(ctx, v); err != nil {
-				return false, upstream(err)
-			}
-		}
-		ok := false
-		s.t.View(func(g *tree.Graph, _ map[string]string) {
-			if n := g.Node(name); n != nil {
-				ok = vis.Node(g, n)
-			}
-		})
-		return ok, nil
-	}
+	// Every item is judged by the visibility test of the subject set the
+	// caller's listings are keyed by (§B.11.5, Resolve).
+	var vis *visibility
+	s.t.View(func(g *tree.Graph, _ map[string]string) {
+		w, groups := whoOf(s.keyedAt(g, v))
+		vis = &visibility{s: s, who: w, groups: groups}
+	})
+	read := map[string]bool{}
 	out := []any{}
 	for _, item := range items {
 		e := map[string]any{"item": item}
 		ns, name, ok := tree.ParseHref(item)
 		var err error
-		var want []keyOf         // the keys the item's answer carries
-		var cp map[string]string // the checkpoint it was decided at
+		var want []keyOf // the keys the item's answer carries
 		switch {
 		case ok && ns == cat:
-			// A catalog node: its keys, if the caller sees it.
-			cp = pinNode(name)
-			var seen bool
-			if seen, err = visible(name); err == nil && !seen {
-				err = decidedAt(forbidden("%s is not a catalog node you can see", item), cp)
-			}
+			// A catalog node: its keys, if the caller sees it, in a
+			// catalog that has keys for its nodes; in any other, its nodes
+			// need no keys, and no grant reads them (§B.11.5). What its
+			// visibility reads is judged from the name, so a hidden node's
+			// answer reads what a missing one's does: a folder's every
+			// trusted namespace's roles, a placement's its item's
+			// namespace's.
+			s.t.View(func(g *tree.Graph, _ map[string]string) {
+				if !derived.InfoOf(g.Config).Protected() {
+					err = badInput("%s is a node of catalog %s, which is neither sealed nor end-to-end: its nodes have no keys to hand out", item, cat)
+					return
+				}
+				for _, n := range itemNS(name) {
+					read[n] = true
+				}
+				if folderName(name) {
+					for n := range g.Trust {
+						read[n] = true
+					}
+				}
+				if n := g.Node(name); n == nil || !vis.Node(g, n) {
+					err = errf(404, "not_found", "no node %s in %s", name, cat)
+				}
+			})
 			want = []keyOf{{cat, name}}
+		case ok:
+			read[ns] = true
+			want, err = s.decideRead(ctx, v, vis, e, ns, name, item, lagOK)
 		default:
-			var public, pinned bool
-			var in derived.Info
-			if ok {
-				public, in, pinned = s.exposureAt(ctx, ns)
-			}
-			if public && !in.Protected() {
-				e["public"] = true
-				if pinned {
-					e["checkpoint"] = pin(ns)
-				}
-				out = append(out, e)
-				continue
-			}
-			var p *plan
-			p, err = s.planContent(ctx, v, item, []string{"read"})
-			if err == nil {
-				cp = p.checkpoint
-			}
-			if err == nil && public {
-				// Ciphertext is public; the keys decide (§E.2.5).
-				e["public"] = true
-			} else if err == nil {
-				var is *Issued
-				if is, err = s.mint(ctx, v, p, lagOK); err == nil {
-					e["grant"], e["exp"] = is.Grant, is.Exp
-				}
-			}
-			if in.Level == derived.LevelSealed {
-				want = append(want, keyOf{ns, name})
-			}
-			// The placement's keys open its listing entry, so they go only
-			// to callers the entry is listed for (§B.11.5).
-			if err == nil {
-				var seen bool
-				if seen, err = visible(ns + "." + name); seen {
-					want = append(want, keyOf{cat, ns + "." + name})
-				}
-			}
+			err = badInput("item must be /r/{ns}/{name}")
 		}
 		if err == nil {
 			err = s.addKeys(ctx, e, enc, want)
 		}
 		if err != nil {
-			delete(e, "grant")
-			delete(e, "exp")
-			delete(e, "public")
+			for _, k := range []string{"grant", "exp", "public", "keys", "keysWithheld"} {
+				delete(e, k)
+			}
 			var ce *Error
 			if !errors.As(err, &ce) {
 				ce = &Error{Status: 500, Code: "internal", Msg: err.Error()}
 			}
-			e["error"] = map[string]any{"status": ce.Status, "code": ce.Code, "message": ce.Msg}
-			// Only a refusal decided at the checkpoint carries it
-			// (decidedAt).
-			cp = ce.Checkpoint
-		}
-		if len(cp) > 0 {
-			e["checkpoint"] = cp
+			e["status"], e["code"], e["message"] = ce.Status, ce.Code, ce.Msg
+			if ce.Head != "" {
+				e["head"] = ce.Head
+			}
 		}
 		out = append(out, e)
 	}
-	return out
+	return out, read
+}
+
+// decideRead decides a /read-grants item of content namespace ns into e
+// (decideReads), and returns the keys its answer carries. Every name of a
+// purged namespace is 410 purged first (§B.11.4); an item in a public
+// namespace that isn't sealed is "public": true, with no grant and no
+// check; any other is decided by planRead, and then gets a grant if its
+// namespace is private, or, if it is public, its keys alone where it is
+// sealed and "public": true where it is end-to-end, since the keyring,
+// not K_r, opens its revisions (§E.3.2) and no grant is needed to read
+// them.
+func (s *Service) decideRead(ctx context.Context, v *grant.Verified, vis *visibility, e map[string]any, ns, name, item string, lagOK map[string]bool) ([]keyOf, error) {
+	if err := s.purgedAt(ns); err != nil {
+		return nil, err
+	}
+	public, in := s.exposureAt(ctx, ns)
+	if public && !in.Protected() {
+		e["public"] = true
+		return nil, nil
+	}
+	p, err := s.planRead(ctx, v, vis, item)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case public && in.Level == derived.LevelE2E:
+		e["public"] = true
+	case public:
+		// Its ciphertext is public: the keys decide (§E.2.5).
+	default:
+		is, err := s.mint(ctx, v, p, lagOK)
+		if err != nil {
+			return nil, err
+		}
+		e["grant"], e["exp"] = is.Grant, is.Exp
+	}
+	var want []keyOf
+	if in.Level == derived.LevelSealed {
+		want = append(want, keyOf{ns, name})
+	}
+	// The placement's keys open its listing entry, so they go only to
+	// callers it is listed for, as planRead found it visible (§B.11.5);
+	// a catalog that is neither sealed nor e2e has none (addKeys).
+	return append(want, keyOf{s.t.Catalog(), ns + "." + name}), nil
 }
 
 // exposureAt is whether ns is public and its encryption, as of the
 // checkpoint the service is at (Graph.Content, configAt), so that one
 // checkpoint gives one answer for an item (§B.11.4); the grant checker's
 // and the key tracker's copies at the head stand in for a namespace the
-// service doesn't follow, which has no state at a checkpoint (pinned
-// false).
-func (s *Service) exposureAt(ctx context.Context, ns string) (public bool, in derived.Info, pinned bool) {
+// service doesn't follow, which has no state at a checkpoint.
+func (s *Service) exposureAt(ctx context.Context, ns string) (public bool, in derived.Info) {
 	held := false
 	s.t.View(func(g *tree.Graph, _ map[string]string) {
 		c := g.Content[ns]
@@ -536,11 +533,11 @@ func (s *Service) exposureAt(ctx context.Context, ns string) (public bool, in de
 		}
 	})
 	if held {
-		return public, in, true
+		return public, in
 	}
 	cfg, err := s.t.Checker().Config(ctx, ns)
 	in, _ = s.t.Keys().Info(ctx, ns)
-	return err == nil && cfg.Read == "public", in, false
+	return err == nil && cfg.Read == "public", in
 }
 
 // keyOf names a resource whose per-resource keys an answer carries.
@@ -548,14 +545,15 @@ type keyOf struct{ ns, name string }
 
 // addKeys sets e["keys"] to the per-resource keys of want (those of
 // namespaces that are sealed or e2e), wrapped to enc, or e["keysWithheld"]
-// if there are keys and no enc to wrap them to.
+// if there are keys and no enc to wrap them to. Keys the service can't
+// fetch yet make the item undecided: 503 behind (§12.1, §E.2.6).
 func (s *Service) addKeys(ctx context.Context, e map[string]any, enc *ecdh.PublicKey, want []keyOf) error {
 	var got []derived.ResourceKey
 	for _, k := range want {
 		ks, err := s.t.Keys().ResourceKeys(ctx, k.ns, k.name)
 		if err != nil {
 			logf(s)("catalog: keys of %s/%s: %v", k.ns, k.name, err)
-			return errf(503, "keys", "the catalog service cannot obtain the keys of %s", k.ns)
+			return errf(503, "behind", "the catalog service can't yet fetch the keys of %s", k.ns)
 		}
 		got = append(got, ks...)
 	}
@@ -1119,6 +1117,112 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		return nil, err
 	}
 	return &plan{ns: ns, resource: name, can: want, roles: kept, rules: []any{resourceRule(name)}, cp: cp, checkpoint: checkpoint, key: signer}, nil
+}
+
+// planRead decides a POST /read-grants item of a content namespace as
+// planContent decides a read (§B.11.5): the same answers in the same
+// order, but only the roles that make the item visible count (the test
+// listings use, itemRoles), so a hidden item is answered as one without a
+// placement (noRole), as Restore's read check answers it, and the grant
+// carries those roles.
+func (s *Service) planRead(ctx context.Context, v *grant.Verified, vis *visibility, item string) (_ *plan, err error) {
+	cat := s.t.Catalog()
+	ns, name, ok := tree.ParseHref(item)
+	if !ok {
+		return nil, badInput("item must be /r/{ns}/{name}")
+	}
+	latest, err := s.contentConfig(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	pl := ns + "." + name
+	want := []string{"read"}
+	var (
+		cp         string
+		checkpoint map[string]string
+		roles      []string
+	)
+	defer func() { err = decidedAt(err, checkpoint) }()
+	s.t.View(func(g *tree.Graph, cur map[string]string) {
+		cp = cur[cat]
+		checkpoint = checkpointAt(g, cur, ns)
+		if err = s.purgedIn(g, cur, ns); err != nil {
+			return
+		}
+		var f itemFacts
+		if f, err = s.itemIn(ctx, g, cur, ns, name); err != nil {
+			return
+		}
+		rr := vis.roles(g, ns)
+		switch {
+		case !f.trusted:
+			err = untrusted(ns, cat)
+		case f.known && f.state == tree.ItemUnknown:
+			err = errf(404, "not_found", "%s has never existed", item)
+		case f.state == tree.ItemPurged:
+			var at map[string][]string
+			if f.node != nil {
+				at = Effective(g, pl, nil)
+			}
+			if len(vis.itemRoles(rr, at, name)) == 0 {
+				err = noRole(want, item)
+			} else {
+				err = errf(410, "gone", "%s was purged", item)
+			}
+		case f.node == nil || !f.node.Live():
+			err = noRole(want, item)
+		default:
+			if roles = vis.itemRoles(rr, s.eff[pl], name); len(roles) == 0 {
+				err = noRole(want, item)
+			}
+		}
+	})
+	if err != nil {
+		return nil, err
+	}
+	signer, err := s.contentSigner(latest, &checkpoint)
+	if err != nil {
+		return nil, err
+	}
+	return &plan{ns: ns, resource: name, can: want, roles: roles, rules: []any{resourceRule(name)}, cp: cp, checkpoint: checkpoint, key: signer}, nil
+}
+
+// itemRoles is the roles of eff (an item's roles per subject at its
+// placement) that make the item, resource of rr's namespace, visible to
+// v's subject set (§B.11.5): as visibility.counts judges an item, those
+// collected through a subject rr's key may grant through that count for
+// read through it, whose own rules and the key's scope rules pass for a
+// read of resource. Sorted.
+func (v *visibility) itemRoles(rr *readRoles, eff map[string][]string, resource string) []string {
+	if rr == nil || rr.key == nil {
+		return nil
+	}
+	subs := v.who.through(rr.key)
+	var groups []any
+	for _, gr := range v.groups {
+		if ok, _ := rr.key.Groups.Permits([]string{gr}); ok {
+			groups = append(groups, gr)
+		}
+	}
+	tried := map[string]bool{}
+	var out []string
+	for subj, roles := range eff {
+		if !subs[subj] {
+			continue
+		}
+		for _, r := range roles {
+			def := rr.roles[r]
+			if def == nil || tried[r] {
+				continue
+			}
+			tried[r] = true
+			if len(def.rules) == 0 && len(rr.keyRules) == 0 || passes(rr, def, r, resource, groups) {
+				out = append(out, r)
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // folders resolves a request's to list to distinct node names (400 for a
