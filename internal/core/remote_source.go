@@ -133,11 +133,6 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 		return &RegistrationResult{Status: 200, NSID: t.nsLogID(row.nsSeq).String(), Origin: rr.Origin, NS: rr.NS,
 			At: t.nsLogID(row.atSeq).String(), Expires: time.UnixMilli(row.expires).UTC()}
 	}
-	entryBy := func(seq int64) (int64, int64) {
-		var au, created int64
-		t.must(t.QueryRow(`SELECT author, created FROM ns_log WHERE seq = ?`, seq).Scan(&au, &created))
-		return au, created
-	}
 	stale := func() *Error {
 		e := apiErr(412, "stale")
 		if row != nil {
@@ -152,10 +147,10 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 		return nil, badInput("both If-Match and If-None-Match")
 	case rr.IfNoneMatch:
 		if row != nil && row.expires > now {
-			// A retry of the request that wrote the latest entry: same
-			// principal and at, within the retry window (§7.2).
-			au, created := entryBy(row.nsSeq)
-			if au == author && row.atSeq == atSeq && now-created <= cfg.Limits.RetryWindow.Milliseconds() {
+			// A retry of the request that wrote the latest entry: the same
+			// principal and at, for as long as the registration is
+			// unexpired, with no other bound (§G.3).
+			if row.atSeq == atSeq && t.samePrincipal(row.nsSeq, a, author) {
 				return latest(), nil
 			}
 			return nil, stale()
@@ -166,11 +161,11 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 		}
 		if rr.IfMatch != t.nsLogID(row.nsSeq).String() {
 			// A retry by the same principal whose If-Match names the entry
-			// before the latest gets the latest.
-			if row.prevSeq.Valid && rr.IfMatch == t.nsLogID(row.prevSeq.Int64).String() && row.atSeq == atSeq {
-				if au, _ := entryBy(row.nsSeq); au == author {
-					return latest(), nil
-				}
+			// before the latest gets the latest, while the registration is
+			// unexpired (§G.3).
+			if row.prevSeq.Valid && rr.IfMatch == t.nsLogID(row.prevSeq.Int64).String() && row.atSeq == atSeq &&
+				row.expires > now && t.samePrincipal(row.nsSeq, a, author) {
+				return latest(), nil
 			}
 			return nil, stale()
 		}
@@ -200,6 +195,26 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 		n.id, rr.Origin, rr.NS, atSeq, seq, prev, expires.UnixMilli())
 	t.must(err)
 	return &RegistrationResult{Status: 201, NSID: nsID.String(), Origin: rr.Origin, NS: rr.NS, At: atID.String(), Expires: expires}, nil
+}
+
+// samePrincipal reports whether namespace entry seq was written by the
+// principal of a, whose author id is author: the same root sub and kid,
+// or, while authentication is disabled, the same author (§7.2, §6.6).
+func (t *tx) samePrincipal(seq int64, a *actor, author int64) bool {
+	var au int64
+	var gid []byte
+	t.must(t.QueryRow(`SELECT author, grant_id FROM ns_log WHERE seq = ?`, seq).Scan(&au, &gid))
+	if au != author {
+		return false
+	}
+	if a.grant == nil {
+		return true
+	}
+	if gid == nil || len(a.grant.Blocks) == 0 {
+		return false
+	}
+	ref, root := t.grantRef(gid), a.grant.Blocks[0]
+	return ref != nil && ref["sub"] == root.Sub && ref["kid"] == root.Kid
 }
 
 // liveRegistrations lists the unexpired remote branch registrations of n.

@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/seal"
 )
@@ -218,4 +219,72 @@ func TestV073RemoteSchemaMirrorRefusals(t *testing.T) {
 	b.mkNS("base", map[string]any{"read": "grant"})
 	expect(t, b.branch("base", map[string]any{"name": "schemas"}, "alice"), 201)
 	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 409, "name_conflict")
+}
+
+// A registration retry answers 200 only while the latest registration is
+// unexpired, and has no other bound: an If-None-Match retry works past the
+// retry window, and an If-Match retry naming the entry before the latest
+// is 412 once the latest expired (§G.3).
+func TestV073RegistrationRetryExpiry(t *testing.T) {
+	t.Parallel()
+	a := newEnv(t, withOrigin(originA))
+	a.mkNS("main", map[string]any{"read": "public"})
+	a.create("main", "p", map[string]any{"v": 1.0})
+	at := a.nsHead("main")
+
+	r := a.register("main", "rel", at, "", "b")
+	expect(t, r, 201)
+	reg1 := r.Str("ns_id")
+	a.clock.Advance(2 * time.Hour) // past the retry window, not the registration
+	if r := a.register("main", "rel", at, "", "b"); r.Code != 200 || r.Str("ns_id") != reg1 {
+		t.Errorf("retry past the retry window: %d %s, want 200 with %s", r.Code, r.Body, reg1)
+	}
+	expectCode(t, a.register("main", "rel", at, "", "c"), 412, "stale")
+
+	r = a.register("main", "rel", at, reg1, "b")
+	expect(t, r, 201)
+	reg2 := r.Str("ns_id")
+	r = a.register("main", "rel", at, reg1, "b")
+	expect(t, r, 200)
+	if r.Str("ns_id") != reg2 {
+		t.Fatalf("renewal retry %s", r.Body)
+	}
+	a.clock.Advance(31 * 24 * time.Hour) // reg2 expired
+	r = a.register("main", "rel", at, reg1, "b")
+	expectCode(t, r, 412, "stale")
+	if r.Str("head") != reg2 {
+		t.Fatalf("412 %s, want head %s", r.Body, reg2)
+	}
+	// Renewing the expired latest still works.
+	expect(t, a.register("main", "rel", at, reg2, "b"), 201)
+}
+
+// "Same principal" for a registration retry is the same root sub and kid:
+// a grant for the same sub from another key is 412 (§G.3, §7.2).
+func TestV073RegistrationSamePrincipal(t *testing.T) {
+	t.Parallel()
+	a := newAuthEnv(t, withOrigin(originA))
+	k1, k2 := newKey("k1"), newKey("k2")
+	a.mkNS("main", map[string]any{"read": "grant", "keys": []any{k1.entry("*"), k2.entry("*")}})
+	g1 := a.grant(k1, "svc:b", []string{"main"}, []string{"read", "export"})
+	g2 := a.grant(k2, "svc:b", []string{"main"}, []string{"read", "export"})
+	at := a.nsHead("main", g1)
+
+	r := a.register("main", "rel", at, "", g1)
+	expect(t, r, 201)
+	reg1 := r.Str("ns_id")
+	expectCode(t, a.register("main", "rel", at, "", g2), 412, "stale")
+	a.clock.Advance(time.Minute)
+	g1b := a.grant(k1, "svc:b", []string{"main"}, []string{"read", "export"}) // reminted, same key
+	if r := a.register("main", "rel", at, "", g1b); r.Code != 200 || r.Str("ns_id") != reg1 {
+		t.Fatalf("retry under the same sub and kid: %d %s", r.Code, r.Body)
+	}
+
+	r = a.register("main", "rel", at, reg1, g1)
+	expect(t, r, 201)
+	reg2 := r.Str("ns_id")
+	expectCode(t, a.register("main", "rel", at, reg1, g2), 412, "stale")
+	if r := a.register("main", "rel", at, reg1, g1b); r.Code != 200 || r.Str("ns_id") != reg2 {
+		t.Fatalf("renewal retry under the same sub and kid: %d %s", r.Code, r.Body)
+	}
 }
