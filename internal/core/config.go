@@ -1378,13 +1378,13 @@ func cloneDoc(m map[string]any) map[string]any { return jsonv.Clone(m).(map[stri
 // applied to a stored document, which an earlier release may have stored
 // under other defaults.
 func (c *Config) checkValues() error {
-	if c.level != levelE2E {
-		return nil
-	}
 	l := c.Limits
-	need := 3*(l.ValueSize+l.PathSize) + (1 << 10) + 36*l.BlobsPerDocument
+	need, rule := 3*(l.ValueSize+l.PathSize)+(1<<10), "3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize"
+	if c.level == levelE2E {
+		need, rule = need+36*l.BlobsPerDocument, "3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize, at E3"
+	}
 	if need > l.PatchSetSize {
-		return sizeLimit("patchSetSize", need, l.PatchSetSize, "an e2e namespace needs 3 × (valueSize + pathSize) + 1 KiB + 36 B × blobsPerDocument ≤ patchSetSize (§6.6)")
+		return sizeLimit("patchSetSize", need, l.PatchSetSize, fmt.Sprintf("a namespace needs %s, so that every string can be replaced by one append with a test of its old value (§6.6)", rule))
 	}
 	return nil
 }

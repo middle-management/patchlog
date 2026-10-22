@@ -152,7 +152,7 @@ func TestLimitKeys(t *testing.T) {
 			body: addRoot(map[string]any{"limits": limits})})
 	}
 	good := map[string]any{
-		"patchSetSize": 1024, "opsPerSet": 10, "documentSize": 4096, "nestingDepth": 8,
+		"patchSetSize": 4096, "valueSize": 600, "pathSize": 100, "opsPerSet": 10, "documentSize": 4096, "nestingDepth": 8,
 		"rulesPerNamespace": 4, "itemsPerBatch": 10,
 		"batchSize": 1 << 20, "branchesPerNamespace": 3, "keepPerResource": 5,
 		"ratePerResource": map[string]any{"rate": 1, "burst": 2}, "ratePerPrincipal": map[string]any{"rate": 1, "burst": 2},

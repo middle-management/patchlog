@@ -379,3 +379,24 @@ func TestV073MeasuredLeftOutWithoutRead(t *testing.T) {
 		}
 	}
 }
+
+// v0.73 §6.6 Values: every namespace's creation, a branch's included, and
+// a config write that changes limits or encryption need 3 × (valueSize +
+// pathSize) + 1 KiB ≤ patchSetSize, not only an E3 namespace's, which adds
+// 36 B × blobsPerDocument.
+func TestV073ValuesEveryNamespace(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	mk := func(ns string, patchSetSize int) *resp {
+		return e.do(req{method: "PATCH", path: "/ns/" + ns, ifNoneMatch: "*", author: "admin",
+			body: addRoot(map[string]any{"limits": map[string]any{"valueSize": 1000, "pathSize": 100, "patchSetSize": patchSetSize}})})
+	}
+	expectLimit(t, mk("v1", 4323), 422, "patchSetSize", 4324, 4323)
+	expect(t, mk("v1", 4324), 201)
+	expectLimit(t, e.patchNS("v1", ops(op("replace", "/limits/valueSize", 1001)), ""), 422, "patchSetSize", 4327, 4324)
+	expect(t, e.patchNS("v1", ops(op("add", "/x-note", "unrelated")), ""), 201)
+	at := e.nsHead("v1")
+	r := e.branch("v1", map[string]any{"name": "v1b", "at": at, "patches": ops(op("replace", "/limits/patchSetSize", 4000))}, "alice")
+	expectLimit(t, r, 422, "patchSetSize", 4324, 4000)
+	expect(t, e.branch("v1", map[string]any{"name": "v1b", "at": at}, "alice"), 201)
+}

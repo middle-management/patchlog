@@ -20,7 +20,7 @@ import (
 func TestV055LimitResourceFields(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	e.mkNS("l", map[string]any{"limits": map[string]any{"documentSize": 1000, "patchSetSize": 200,
+	e.mkNS("l", map[string]any{"limits": map[string]any{"documentSize": 1000, "patchSetSize": 1500, "valueSize": 100, "pathSize": 50,
 		"nestingDepth": 3, "keepPerResource": 2}})
 
 	// A document grown past documentSize by appends within patchSetSize.
@@ -83,13 +83,20 @@ func TestV055LimitConfigFields(t *testing.T) {
 	expectLimit(t, allow("blobRate", map[string]any{"rate": 1e15, "burst": 1}), 422, "blobRate", -1, -1)
 
 	// Config patch sets and documents (§7.4 step 4).
-	e.mkNS("s", map[string]any{"limits": map[string]any{"patchSetSize": 400, "documentSize": 600}})
-	big := ops(op("add", "/x-a", strings.Repeat("a", 400)))
-	expectLimit(t, e.patchNS("s", big, ""), 422, "patchSetSize", int64(len(canonical(big))), 400)
-	expect(t, e.patchNS("s", ops(op("add", "/x-a", strings.Repeat("a", 300))), ""), 201)
-	want := map[string]any{"limits": map[string]any{"patchSetSize": 400, "documentSize": 600},
-		"x-a": strings.Repeat("a", 300), "x-b": strings.Repeat("b", 300)}
-	expectLimit(t, e.patchNS("s", ops(op("add", "/x-b", strings.Repeat("b", 300))), ""), 422, "documentSize", int64(len(canonical(want))), 600)
+	lim := map[string]any{"patchSetSize": 1500, "documentSize": 2000, "valueSize": 100, "pathSize": 50}
+	e.mkNS("s", map[string]any{"limits": lim})
+	strs := func(c string, n int) []any {
+		out := make([]any, n)
+		for i := range out {
+			out[i] = strings.Repeat(c, 98)
+		}
+		return out
+	}
+	big := ops(op("add", "/x-a", strs("a", 16)))
+	expectLimit(t, e.patchNS("s", big, ""), 422, "patchSetSize", int64(len(canonical(big))), 1500)
+	expect(t, e.patchNS("s", ops(op("add", "/x-a", strs("a", 8))), ""), 201)
+	want := map[string]any{"limits": lim, "x-a": strs("a", 8), "x-b": strs("b", 12)}
+	expectLimit(t, e.patchNS("s", ops(op("add", "/x-b", strs("b", 12))), ""), 422, "documentSize", int64(len(canonical(want))), 2000)
 }
 
 // §6.6, §12.2: rulesPerGrant and grantSize are deployment only (v0.63),
@@ -160,6 +167,7 @@ func TestV055LimitOversizedBodies(t *testing.T) {
 	t.Parallel()
 	l := core.DefaultLimits()
 	l.DocumentSize, l.PatchSetSize, l.BatchSize, l.ItemsPerBatch = 64<<10, 16<<10, 2048, 10
+	l.ValueSize, l.PathSize = 4<<10, 1<<10 // 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6)
 	e := newEnv(t, func(o *core.Options) { o.Limits, o.Maximums = l, l })
 	e.mkNS("b", map[string]any{})
 	at := e.nsHead("b")

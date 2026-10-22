@@ -1,6 +1,7 @@
 package server
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -15,9 +16,22 @@ import (
 func TestWholeDocumentAppends(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
-	e.mkNS("s", map[string]any{"limits": map[string]any{"patchSetSize": 1024, "documentSize": 16384, "batchSize": 6000}})
-	str := strings.Repeat("x", 1000)
-	big := map[string]any{"a": str, "b": str, "c": str, "d": str}
+	// 3 × (valueSize + pathSize) + 1 KiB ≤ patchSetSize (§6.6 Values).
+	e.mkNS("s", map[string]any{"limits": map[string]any{"patchSetSize": 2048, "valueSize": 300, "pathSize": 40, "documentSize": 16384, "batchSize": 6000}})
+	str := strings.Repeat("x", 290)
+	big, huge := map[string]any{}, map[string]any{}
+	var adds []map[string]any
+	for i := 0; i < 60; i++ {
+		k := fmt.Sprintf("k%02d", i)
+		huge[k] = str
+		if i < 16 {
+			big[k] = str
+		}
+		if i < 8 {
+			adds = append(adds, op("add", "/"+k, str))
+		}
+	}
+	big["a"], big["d"] = str, str
 	head := e.create("s", "r", map[string]any{"a": "old"})
 
 	head = e.appendRev("s", "r", head, ops(op("test", "/a", "old"), op("replace", "", big)))
@@ -30,13 +44,12 @@ func TestWholeDocumentAppends(t *testing.T) {
 	for _, set := range [][]any{
 		ops(op("test", "/a", str), op("replace", "/a", str+"y"), op("replace", "", big)),
 		ops(op("add", "/x", 1.0), op("replace", "", big)),
-		ops(op("replace", "/a", strings.Repeat("y", 1100))),
+		ops(op("replace", "/a", strings.Repeat("y", 2100))),
 		ops(op("test", "", big), op("add", "/z", big)),
 	} {
 		expectCode(t, e.write("PATCH", "s", "r", head, set), 422, "limit")
 	}
 	// Still within documentSize.
-	huge := map[string]any{"a": strings.Repeat(str, 17)}
 	expectCode(t, e.write("PATCH", "s", "r", head, ops(op("replace", "", huge))), 422, "limit")
 	// A restore, after a test too.
 	tomb := e.del("s", "r", head)
@@ -50,7 +63,7 @@ func TestWholeDocumentAppends(t *testing.T) {
 	q := e.head("s", "q")
 	expect(t, e.batchReq("s", map[string]any{"items": []any{item("r", head, ops(op("replace", "", big))), item("q", q, ops(op("add", "/k", 1.0)))}}, "alice"), 201)
 	head = e.head("s", "r")
-	r := e.batchReq("s", map[string]any{"items": []any{item("r", head, ops(op("add", "/k", str), op("add", "/l", str)))}}, "alice")
+	r := e.batchReq("s", map[string]any{"items": []any{item("r", head, ops(adds...))}}, "alice")
 	expectCode(t, r, 422, "batch")
 	if it := r.Obj()["items"].([]any)[0].(map[string]any); it["code"] != "limit" || it["index"] != 0.0 {
 		t.Fatalf("item %v", it)
