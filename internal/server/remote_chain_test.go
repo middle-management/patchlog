@@ -33,6 +33,10 @@ type chainFixture struct {
 	lateInBase string
 }
 
+// r7Chain is the base.chain of a remote branch of r7, A's branch of
+// matches (§G.3).
+var r7Chain = []string{"r7", "matches"}
+
 func populateChain(t *testing.T, a *tenv) chainFixture {
 	t.Helper()
 	var f chainFixture
@@ -99,7 +103,7 @@ func TestRemoteBranchOfBranch(t *testing.T) {
 	a, b, _ := pair(t, nil, nil)
 	f := populateChain(t, a)
 
-	expect(t, b.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), 201)
+	expect(t, b.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil)), 201)
 	if k := b.nsKinds("rel"); len(k) != 1 || k[0] != "config" {
 		t.Fatalf("remote branch log %v", k)
 	}
@@ -210,7 +214,7 @@ func TestRemoteBranchTwoLevels(t *testing.T) {
 	atB := a.nsHead("r7b")
 	a.appendRev("r7b", "own", o4, ops(op("replace", "/v", 5.0))) // after atB
 
-	expect(t, b.mkRemote("rel", remoteGenesis("r7b", atB, nil)), 201)
+	expect(t, b.mkRemote("rel", remoteGenesisChain([]string{"r7b", "r7", "matches"}, atB, nil)), 201)
 	want := map[string]string{"own": o4, "x": x3, "mine": mine, "fresh": f.n1, "derby": f.d2, "e": f.e1}
 	for name, id := range want {
 		if got := b.head("rel", name); got != id {
@@ -262,7 +266,7 @@ func TestRemoteBranchOfBranchTampered(t *testing.T) {
 	}
 	for _, c := range cases {
 		rt.set(tamper(t, a, c.match, func(b []byte) []byte { return bytes.ReplaceAll(b, []byte(c.from), []byte(c.to)) }), "")
-		r := b.mkRemote("rel", remoteGenesis("r7", f.atA, nil))
+		r := b.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil))
 		if r.Code != 502 || r.Str("code") != "upstream" || r.Str("origin") != originA {
 			t.Errorf("%s: %d %s", c.name, r.Code, r.Body)
 		}
@@ -270,7 +274,7 @@ func TestRemoteBranchOfBranchTampered(t *testing.T) {
 		expect(t, b.get("/ns/schemas"), 404)
 	}
 	rt.set(tamper(t, a, "/nothing", nil), "")
-	expect(t, b.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), 201)
+	expect(t, b.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil)), 201)
 }
 
 // refusing serves A through a proxy that answers status for paths
@@ -312,7 +316,7 @@ func TestRemoteBranchOfBranchUnreadableBase(t *testing.T) {
 	f := populateChain(t, a)
 	for _, status := range []int{401, 403, 404} {
 		rt.set(refusing(t, a, "/matches/", status), "")
-		r := b.mkRemote("rel", remoteGenesis("r7", f.atA, nil))
+		r := b.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil))
 		expectCode(t, r, 422, "invalid")
 		if !strings.Contains(r.Str("message"), "matches") {
 			t.Fatalf("%d: message %s", status, r.Body)
@@ -341,7 +345,7 @@ func TestRemoteBranchOfBranchGrantScope(t *testing.T) {
 
 	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"r7"}, []string{"read"})}
 	b := newEnv(t, withOrigin(originB), withRemote(rt))
-	genesis := remoteGenesis("r7", atA, map[string]any{"read": "grant"})
+	genesis := remoteGenesisChain(r7Chain, atA, map[string]any{"read": "grant"})
 	r := b.mkRemote("rel", genesis)
 	expectCode(t, r, 422, "invalid")
 	expect(t, b.get("/ns/rel"), 404)
@@ -364,12 +368,12 @@ func TestRemoteBranchDepth(t *testing.T) {
 	}
 	a, b, rt := pair(t, nil, []envOpt{lim(1)})
 	f := populateChain(t, a)
-	expectCode(t, b.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), 422, "limit")
+	expectCode(t, b.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil)), 422, "limit")
 	expect(t, b.get("/ns/rel"), 404)
 	expect(t, b.mkRemote("rel", remoteGenesis("matches", f.at1, nil)), 201)
 
 	b2 := newEnv(t, withOrigin(originB), withRemote(rt), lim(2))
-	expect(t, b2.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), 201)
+	expect(t, b2.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil)), 201)
 	expectCode(t, b2.branch("rel", map[string]any{"name": "rel-b"}, "alice"), 422, "limit")
 }
 
@@ -379,7 +383,7 @@ func TestRemoteBranchOfBranchPurge(t *testing.T) {
 	t.Parallel()
 	a, b, _ := pair(t, nil, nil)
 	f := populateChain(t, a)
-	expect(t, b.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), 201)
+	expect(t, b.mkRemote("rel", remoteGenesisChain(r7Chain, f.atA, nil)), 201)
 	expect(t, b.branch("rel", map[string]any{"name": "rel-b"}, "alice"), 201)
 	ctx := context.Background()
 	if err := b.e.SyncRemotes(ctx); err != nil {
@@ -415,12 +419,12 @@ func TestRemoteBranchOfBranchPurge(t *testing.T) {
 	}
 	// A remote branch made after the purge sees it too.
 	atA2 := a.nsHead("r7")
-	expect(t, b.mkRemote("rel2", remoteGenesis("r7", atA2, nil)), 201)
+	expect(t, b.mkRemote("rel2", remoteGenesisChain(r7Chain, atA2, nil)), 201)
 	expect(t, b.get("/r/rel2/e"), 410)
 	expect(t, b.get("/r/rel2/own"), 410)
 	sameHeads(t, a, b, "r7", atA2, "rel2")
 	// And one at the old at, whose /heads now lists the purges.
-	expect(t, b.mkRemote("rel3", remoteGenesis("r7", f.atA, nil)), 201)
+	expect(t, b.mkRemote("rel3", remoteGenesisChain(r7Chain, f.atA, nil)), 201)
 	expect(t, b.get("/r/rel3/e"), 410)
 	expect(t, b.get("/r/rel3/own/rev/"+f.o1), 410)
 }

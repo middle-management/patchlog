@@ -67,8 +67,16 @@ func pair(t *testing.T, aOpts, bOpts []envOpt, bMod ...func(*core.RemoteOptions)
 	return a, b, rt
 }
 
+// remoteGenesis is the genesis of a remote branch of ns, a namespace of A
+// that isn't a branch: its base.chain is [ns] (§G.3).
 func remoteGenesis(ns, at string, extra map[string]any) []any {
-	doc := map[string]any{"read": "public", "base": map[string]any{"origin": originA, "ns": ns, "at": at}}
+	return remoteGenesisChain([]string{ns}, at, extra)
+}
+
+// remoteGenesisChain is the genesis of a remote branch of chain[0], whose
+// bases as of at are the rest of chain (§G.3).
+func remoteGenesisChain(chain []string, at string, extra map[string]any) []any {
+	doc := map[string]any{"read": "public", "base": map[string]any{"origin": originA, "ns": chain[0], "at": at, "chain": strs(chain)}}
 	for k, v := range extra {
 		doc[k] = v
 	}

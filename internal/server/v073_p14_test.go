@@ -61,3 +61,40 @@ func TestV073RemoteUnreadableBase(t *testing.T) {
 	rt.set(a.srv.URL, "")
 	expect(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 201)
 }
+
+// The genesis gives base.chain: a missing chain is 422 at /base/chain,
+// before anything is fetched, and a wrong one too. The genesis is stored as
+// sent, so its config id is the creator's (§G.3).
+func TestV073RemoteChainRequired(t *testing.T) {
+	t.Parallel()
+	a, b, rt := pair(t, nil, nil)
+	f := populateChain(t, a)
+	expectPointer := func(r *resp, ptr string) {
+		t.Helper()
+		expectCode(t, r, 422, "invalid")
+		errs, _ := r.Obj()["errors"].([]any)
+		if len(errs) != 1 || errs[0].(map[string]any)["pointer"] != ptr {
+			t.Fatalf("errors %s, want one at %s", r.Body, ptr)
+		}
+		expect(t, b.get("/ns/rel"), 404)
+	}
+	noChain := addRoot(map[string]any{"read": "public", "base": map[string]any{"origin": originA, "ns": "r7", "at": f.atA}})
+	rt.set("http://127.0.0.1:1", "") // nothing is fetched
+	expectPointer(b.mkRemote("rel", noChain), "/base/chain")
+	rt.set(a.srv.URL, "")
+	expectPointer(b.mkRemote("rel", noChain), "/base/chain")
+	expectPointer(b.mkRemote("rel", remoteGenesis("r7", f.atA, nil)), "/base/chain")
+	expectPointer(b.mkRemote("rel", remoteGenesisChain([]string{"r7", "matches", "schemas"}, f.atA, nil)), "/base/chain")
+
+	// A genesis of several ops, stored as sent: the config id is over it.
+	genesis := append(remoteGenesisChain(r7Chain, f.atA, nil), op("add", "/x-title", "B's"))
+	r := b.mkRemote("rel", genesis)
+	expect(t, r, 201)
+	if want := hashID(t, "", canonical(genesis)); r.H.Get("X-Config-Revision") != want || b.configID("rel") != want {
+		t.Fatalf("config id %s, want %s", r.H.Get("X-Config-Revision"), want)
+	}
+	doc := b.get("/ns/rel/rev/" + b.nsHead("rel")).Obj()
+	if string(canonical(doc["base"])) != string(canonical(map[string]any{"origin": originA, "ns": "r7", "at": f.atA, "chain": strs(r7Chain)})) || doc["x-title"] != "B's" {
+		t.Fatalf("document %v", doc)
+	}
+}

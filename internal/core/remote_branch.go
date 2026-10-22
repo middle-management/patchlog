@@ -911,6 +911,12 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	if cfg.Base.Origin == t.e.opt.Origin {
 		return nil, nil, nil, invalid("the base is in this deployment; create a local branch with POST /ns/{base}/branches")
 	}
+	if cfg.Base.Chain == nil {
+		// The creator gives chain, checked once the base is verified
+		// (insertRemoteBranch); the genesis is never rewritten (§G.3).
+		return nil, nil, nil, docInvalid("/base/chain", `/base/chain is missing: a remote branch's genesis gives the base's namespace, then its base, and so on, as of at, e.g. "chain": [`+
+			strconv.Quote(cfg.Base.NS)+`] for a base that isn't a branch (§G.3)`)
+	}
 	if cfg.Successor != "" {
 		return nil, nil, nil, invalid("a new namespace cannot have a successor")
 	}
@@ -988,21 +994,14 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	}
 	// base.chain records the namespaces followed while verifying (§G.3):
 	// readers of an e2e branch accept read-through ciphertext bound to any
-	// of them. A genesis may give it, and must then give it right;
-	// otherwise it is added, and the genesis becomes one add of the whole
-	// document, as stored.
+	// of them. The genesis gives it (checkRemoteGenesis), and must give it
+	// right; its config id is over the genesis as sent.
 	chain := make([]any, len(m.levels))
 	for i, lv := range m.levels {
 		chain[i] = lv.ns
 	}
-	if cfg.Base.Chain != nil {
-		if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
-			return nil, invalid(fmt.Sprintf("/base/chain must be %v: the base's namespace and its bases as of at", chain))
-		}
-	} else {
-		doc = jsonv.Clone(doc).(map[string]any)
-		doc["base"].(map[string]any)["chain"] = chain
-		cc.Patches = []any{map[string]any{"op": "add", "path": "", "value": doc}}
+	if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
+		return nil, docInvalid("/base/chain", fmt.Sprintf("/base/chain must be %s: the base's namespace, then its base, and so on, as of at (§G.3)", jsonv.Canonical(chain)))
 	}
 	// The shadows' mirrored rows follow the branch's level.
 	if t.shadowLevels == nil {

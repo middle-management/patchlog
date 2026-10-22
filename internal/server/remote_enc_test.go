@@ -390,7 +390,9 @@ func TestRemoteBranchE2EChain(t *testing.T) {
 	}
 	expectCode(t, b.mkRemote("rel", genesis("eb")), 422, "invalid")
 	expectCode(t, b.mkRemote("rel", genesis("eb", "x")), 422, "invalid")
-	expect(t, b.mkRemote("rel", genesis()), 201)
+	// The genesis must give chain; it isn't added (§G.3).
+	expectCode(t, b.mkRemote("rel", genesis()), 422, "invalid")
+	expect(t, b.mkRemote("rel", genesis("eb", "e")), 201)
 	expect(t, b.mkRemote("rel2", genesis("eb", "e")), 201)
 	bAdmin := b.grant(kB, "user:b", []string{"rel"}, allVerbs)
 	base := b.get("/ns/rel/rev/"+b.nsHead("rel", bAdmin), bAdmin).Obj()["base"].(map[string]any)

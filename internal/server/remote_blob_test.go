@@ -90,7 +90,7 @@ func TestRemoteBranchBlobsChain(t *testing.T) {
 	a.appendRev("br", "y", a.head("br", "y"), ops(op("add", "/o", ref(obid, "text/plain", len(own), ""))))
 	at := a.nsHead("br")
 
-	expect(t, b.mkRemote("rel", remoteGenesis("br", at, nil)), 201)
+	expect(t, b.mkRemote("rel", remoteGenesisChain([]string{"br", "base"}, at, nil)), 201)
 	for _, p := range []string{blobPath("rel", "x", bid), blobPath("rel", "y", bid), blobPath("rel", "y", obid)} {
 		expect(t, b.get(p), 200)
 	}
