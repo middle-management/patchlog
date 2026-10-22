@@ -1,8 +1,10 @@
 package core
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"log"
 	"math"
 	"strings"
 	"sync"
@@ -605,10 +607,14 @@ func refersToResource(rs []any) bool {
 // (admit creates them full), so sweep drops those, at most once a minute
 // once there are many: buckets were never dropped, and memory grew with
 // every resource and principal written until restart.
+//
+// On Postgres, unless Options.LocalRateBuckets, the buckets live in the
+// store instead, shared by every instance (store, ratebuckets.go).
 type rateLimiter struct {
 	mu    sync.Mutex
 	b     map[string]*bucket
 	swept time.Time
+	store *bucketStore
 }
 
 type bucket struct {
@@ -641,6 +647,14 @@ func (b *bucket) refill(now time.Time, r Rate) {
 }
 
 func newRateLimiter() *rateLimiter { return &rateLimiter{b: map[string]*bucket{}} }
+
+// close closes the store's pool, if the buckets are in the store.
+func (rl *rateLimiter) close() error {
+	if rl.store == nil {
+		return nil
+	}
+	return rl.store.close()
+}
 
 type draw struct {
 	key  string
@@ -736,7 +750,16 @@ func (t *tx) blobDraw(n *nsRow, cfg *Config, a *actor, size int64) draw {
 // (rounded up to the millisecond), which a client under a fast allowance
 // waits by instead.
 func (t *tx) admit(draws []draw) *Error {
-	wait, hit, ok := t.e.rate.admit(t.now, draws)
+	var wait time.Duration
+	var hit string
+	var ok bool
+	if s := t.e.rate.store; s != nil {
+		var err error
+		wait, hit, ok, err = s.admit(t.ctx, t.now, draws)
+		t.must(err)
+	} else {
+		wait, hit, ok = t.e.rate.admit(t.now, draws)
+	}
 	if !ok {
 		secs := int(math.Ceil(wait.Seconds()))
 		if secs < 1 {
@@ -752,6 +775,14 @@ func (t *tx) admit(draws []draw) *Error {
 // charge deducts more from a bucket an admitted request drew on: an
 // upload's bytes beyond what it declared (§7.8).
 func (rl *rateLimiter) charge(now time.Time, d draw) {
+	if rl.store != nil {
+		// The upload is stored: a failure to charge leaves its bytes
+		// undrawn, which only the log tells.
+		if err := rl.store.charge(context.Background(), now, d); err != nil {
+			log.Printf("rate buckets: charging %s: %v", d.name, err)
+		}
+		return
+	}
 	rl.mu.Lock()
 	defer rl.mu.Unlock()
 	b := rl.b[d.key]

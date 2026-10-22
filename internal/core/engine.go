@@ -138,6 +138,12 @@ type Options struct {
 	// namespace still in their check phase (zero means 200µs; negative,
 	// no wait). Writes that find no group of their namespace never wait.
 	GroupCommitWait time.Duration
+	// LocalRateBuckets keeps the rate-limit buckets of §6.6 in this
+	// instance's memory on Postgres too, as on SQLite, instead of in the
+	// database (ratebuckets.go): only for a deployment of one instance,
+	// since instances sharing a database must share their buckets (§6.6
+	// Cost).
+	LocalRateBuckets bool
 	// BlobSweepInterval is how often pending blobs past blobGrace are
 	// deleted (§7.8, SweepBlobs), and orphan blob files (SweepBlobFiles),
 	// on the leader. Zero means ten minutes; negative disables it.
@@ -414,12 +420,20 @@ func Open(opt Options) (*Engine, error) {
 		db.Close()
 		return nil, err
 	}
+	if pg && !opt.LocalRateBuckets {
+		// The buckets of every instance on the database (ratebuckets.go).
+		if e.rate.store, err = openBucketStore(opt.Path); err != nil {
+			db.Close()
+			return nil, err
+		}
+	}
 	if pg {
 		if e.opt.TailInterval <= 0 {
 			e.opt.TailInterval = 100 * time.Millisecond
 		}
 		s, err := e.tailStart(context.Background())
 		if err != nil {
+			e.rate.close()
 			db.Close()
 			return nil, fmt.Errorf("starting the tailer: %w", err)
 		}
@@ -474,6 +488,7 @@ func (e *Engine) Close() error {
 	e.stmts.close()
 	err := e.db.Close()
 	e.comp.close()
+	e.rate.close()
 	return err
 }
 

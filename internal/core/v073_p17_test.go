@@ -3,7 +3,11 @@ package core
 import (
 	"context"
 	"crypto/ed25519"
+	"fmt"
+	"math"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -265,5 +269,172 @@ func TestV073P17KeyScopeFailureIs403(t *testing.T) {
 	writer := ks.mint(t, map[string]any{"kid": "admin", "sub": "user:w", "ns": []any{"p"}, "can": []any{"create"}})
 	if _, err := e.NamespaceHead(ctx, "p", writer); v073Status(err) != 404 {
 		t.Errorf("grant without read, GET /ns/p: want 404, got %v", err)
+	}
+}
+
+// p17RateEngine opens an engine on path with authentication disabled, a
+// clock that stands still at now unless the test moves it, and lim as the
+// namespace defaults (maximums fast), and creates namespace n.
+func p17RateEngine(t *testing.T, path, dir string, clock *atomic.Int64, lim Limits, local bool) *Engine {
+	t.Helper()
+	e, err := Open(Options{Path: path, BlobDir: dir, AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Limits: lim, Maximums: p17Fast(), TailInterval: tailEvery, Purger: discardPurger{}, LocalRateBuckets: local,
+		Now: func() time.Time { return time.UnixMilli(clock.Load()) }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	return e
+}
+
+// p17Rate checks err is a 429 rate refusal naming limit, with retryAfter
+// wait (seconds) and Retry-After its whole seconds rounded up.
+func p17Rate(t *testing.T, what string, err error, limit string, wait float64) {
+	t.Helper()
+	e, ok := err.(*Error)
+	if !ok || e.Status != 429 || e.Body["code"] != "rate" || e.Body["limit"] != limit {
+		t.Fatalf("%s: want 429 rate %s, got %v", what, limit, err)
+	}
+	if e.Body["retryAfter"] != wait || e.Header["Retry-After"][0] != fmt.Sprint(int(math.Ceil(wait))) {
+		t.Fatalf("%s: retryAfter %v, Retry-After %v, want %v", what, e.Body["retryAfter"], e.Header["Retry-After"], wait)
+	}
+}
+
+// Instances sharing a Postgres database share their buckets: a bucket's
+// check and deduction are one atomic step across them, so together they
+// admit no more than its burst before it refills, and a request refused
+// after admission keeps its deduction for both (§6.6 Cost, D.8).
+// LocalRateBuckets keeps a bucket per instance.
+func TestV073P17SharedBucketsAcrossInstances(t *testing.T) {
+	const burst = 5
+	for _, local := range []bool{false, true} {
+		var clock atomic.Int64
+		clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+		lim := p17Fast()
+		lim.RatePerPrincipal = Rate{0.001, burst}
+		url, dir := pgtest.NewDB(t), t.TempDir()
+		a := p17RateEngine(t, url, dir, &clock, lim, local)
+		b := p17RateEngine(t, url, dir, &clock, lim, local)
+		mkNS(t, a, "n", map[string]any{})
+
+		// Concurrent writes of one principal through both instances.
+		var admitted, limited atomic.Int64
+		var wg sync.WaitGroup
+		for i := range 4 * burst {
+			e := a
+			if i%2 == 1 {
+				e = b
+			}
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_, err := v073CreateIn(e, "n", Credentials{Author: "w"}, fmt.Sprintf("r%d", i))
+				switch status(err) {
+				case 0:
+					admitted.Add(1)
+				case 429:
+					limited.Add(1)
+				default:
+					t.Errorf("write %d: %v", i, err)
+				}
+			}()
+		}
+		wg.Wait()
+		want := int64(burst)
+		if local {
+			want = 2 * burst
+		}
+		if admitted.Load() != want || limited.Load() != 4*burst-want {
+			t.Fatalf("local %v: %d admitted, %d limited, want %d admitted", local, admitted.Load(), limited.Load(), want)
+		}
+
+		// A create refused after admission (412, the name is taken) keeps
+		// its deduction, which the other instance sees.
+		x := Credentials{Author: "x"}
+		for i := range burst - 1 {
+			e := a
+			if i > 0 {
+				e = b
+			}
+			// Each create differs, so none is a retry of the first (§7.2).
+			it := Item{Resource: "x", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{"i": float64(i)}}}}}}
+			if _, err := e.WriteResource(context.Background(), Request{NS: "n", Cred: x}, it); i > 0 && status(err) != 412 || i == 0 && err != nil {
+				t.Fatalf("local %v: create %d of x: %v", local, i, err)
+			}
+		}
+		_, errA := v073CreateIn(a, "n", x, "x2")
+		_, errB := v073CreateIn(b, "n", x, "x3")
+		if local {
+			if errA != nil || errB != nil {
+				t.Fatalf("local buckets: %v, %v", errA, errB)
+			}
+			continue
+		}
+		if errA != nil {
+			t.Fatalf("the last token: %v", errA)
+		}
+		if status(errB) != 429 {
+			t.Fatalf("after the burst, refusals included: %v", errB)
+		}
+	}
+}
+
+// The store's draw and charge: a charge deducts whatever the bucket holds,
+// below zero, and the next draw waits for the bucket to refill to one
+// token; buckets never drawn on are full, and a sweep deletes the rows of
+// full ones only (ratebuckets.go).
+func TestV073P17BucketStore(t *testing.T) {
+	url := pgtest.NewDB(t)
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	e := p17RateEngine(t, url, t.TempDir(), &clock, p17Fast(), false)
+	s := e.rate.store
+	if s == nil {
+		t.Fatal("no bucket store on Postgres")
+	}
+	ctx := context.Background()
+	now := time.UnixMilli(clock.Load())
+	d := draw{"b\x00test", Rate{100, 1000}, 400, "blobRate"}
+	other := draw{"p\x00test", Rate{1, 10}, 1, "ratePerPrincipal"}
+	for i := range 2 {
+		if _, _, ok, err := s.admit(ctx, now, []draw{d, other}); err != nil || !ok {
+			t.Fatalf("draw %d: %v %v", i, ok, err)
+		}
+	}
+	// 200 left; a charge of 500 takes it to -300.
+	d.cost = 500
+	if err := s.charge(ctx, now, d); err != nil {
+		t.Fatal(err)
+	}
+	wait, hit, ok, err := s.admit(ctx, now, []draw{other, d})
+	if err != nil || ok || hit != "blobRate" || wait != 3010*time.Millisecond {
+		t.Fatalf("after the charge: wait %v hit %q ok %v err %v", wait, hit, ok, err)
+	}
+	var rows int
+	count := func() int {
+		t.Helper()
+		if err := e.db.QueryRow(`SELECT count(*) FROM rate_buckets`).Scan(&rows); err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	// The first draw started this instance's first sweep, which found
+	// nothing full.
+	s.wg.Wait()
+	if count() != 2 {
+		t.Fatalf("after the first sweep: %d rows, want 2", rows)
+	}
+	// A minute on, both have refilled to their bursts (8 + 60 × 1 ≥ 10,
+	// -300 + 60 × 100 ≥ 1000), and go when a draw starts this instance's
+	// next sweep; the bucket that draw takes from isn't full, and stays.
+	clock.Add(int64(sweepEvery/time.Millisecond) + 1)
+	now = time.UnixMilli(clock.Load())
+	fresh := draw{"r\x00test", Rate{0.001, 3}, 1, "ratePerResource"}
+	if _, _, ok, err := s.admit(ctx, now, []draw{fresh}); err != nil || !ok {
+		t.Fatalf("fresh draw: %v %v", ok, err)
+	}
+	s.wg.Wait()
+	if count() != 1 {
+		t.Fatalf("after the sweep: %d rows, want the one bucket not full", rows)
 	}
 }
