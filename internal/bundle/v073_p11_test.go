@@ -7,16 +7,22 @@ import (
 	"crypto/ecdh"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
+	"github.com/middle-management/patchlog/internal/client/clienttest"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/ids"
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // v0.73 bundle format (P11): canonical lines and the digest over the
@@ -274,5 +280,137 @@ func TestV073SealedBundlePadding(t *testing.T) {
 		if err == nil || !errors.Is(err, bundle.ErrInvalid) {
 			t.Errorf("sealed writer, %s: %v", name, err)
 		}
+	}
+}
+
+// storedString wraps a grants handler so that GET /ns/{ns}/grants/{gid}
+// serves stored as the authority block alone, one string (§C.3.1), as a
+// v0.73 server does.
+func storedString(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.URL.Path, "/grants/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		rec := httptest.NewRecorder()
+		next.ServeHTTP(rec, r)
+		body := rec.Body.Bytes()
+		var m map[string]any
+		if rec.Code == 200 && json.Unmarshal(body, &m) == nil {
+			if arr, ok := m["stored"].([]any); ok && len(arr) > 0 {
+				m["stored"] = arr[0]
+			}
+			body, _ = json.Marshal(m)
+		}
+		for k, v := range rec.Header() {
+			if k != "Content-Length" {
+				w.Header()[k] = v
+			}
+		}
+		w.WriteHeader(rec.Code)
+		w.Write(body)
+	})
+}
+
+// Grant lines carry stored as one string, the authority SignedBlock
+// (§G.4.1, §C.3.1): the exporter writes it whether the source serves the
+// string or, as before v0.73, every block; a bundle whose grant line
+// carries the old array still reads, as its first element (GR-31).
+func TestV073GrantLineStoredString(t *testing.T) {
+	t.Parallel()
+	for _, served := range []string{"string", "array"} {
+		t.Run(served, func(t *testing.T) {
+			t.Parallel()
+			nsKey := clienttest.NewKey("ns-key")
+			bot := signerKey(t, "bot-a", 1)
+			g := mint(t, nsKey.Priv, nsKey.Kid, "alice", bot)
+			grants := map[string]*grant.Grant{g.ID().String(): g}
+			wrap := grantsHandler(grants, func(string) *grant.Grant { return g }, nil)
+			if served == "string" {
+				inner := wrap
+				wrap = func(h http.Handler) http.Handler { return storedString(inner(h)) }
+			}
+			srv := clienttest.New(t, clienttest.Options{Wrap: wrap})
+			c := srv.Client(t, client.WithAuthor("alice"))
+			_, err := c.CreateNamespace(ctx, "matches", map[string]any{"read": "public", "keys": []any{nsKey.Entry("create", "append", "delete", "read")}})
+			noErr(t, err)
+			genesis := client.GenesisPatches(map[string]any{"n": 1})
+			canon := jsonv.Canonical(must(client.ToValue(genesis)))
+			r1 := must(c.Create(ctx, "matches", "derby", genesis, client.WithSignature(bot.SignPatches(clienttest.Origin, "matches", "derby", nil, canon)))).ID
+
+			var buf bytes.Buffer
+			_, _, err = bundle.Export(ctx, c, &buf, bundle.ExportOptions{Select: []string{"matches/derby"}, Authors: true})
+			noErr(t, err)
+			sum := must(bundle.Verify(bytes.NewReader(buf.Bytes())))
+			var gl map[string]any
+			for _, l := range lines(buf.Bytes())[1:] {
+				m := jsonv.MustParse(l).(map[string]any)
+				if _, ok := m["stored"]; ok {
+					gl = m
+				}
+			}
+			want := storedBlocks(t, g)[0]
+			if gl == nil || gl["stored"] != want {
+				t.Fatalf("grant line %v, want stored %q", gl, want)
+			}
+			if sum.Signatures == nil || sum.Signatures.Counts[bundle.SigAttested] != 1 {
+				t.Fatalf("signatures %+v", sum.Signatures)
+			}
+			// The old form: every block, authority first, read as its
+			// first; the rest isn't used.
+			ls := lines(buf.Bytes())
+			for i, l := range ls {
+				m := jsonv.MustParse(l).(map[string]any)
+				if _, ok := m["stored"]; ok {
+					m["stored"] = []any{want, base64.RawURLEncoding.EncodeToString([]byte("a narrowing block"))}
+					ls[i] = jsonv.Canonical(m)
+				}
+			}
+			var results []bundle.SigResult
+			_, err = bundle.VerifyWith(ctx, bytes.NewReader(join(ls)), bundle.VerifyOptions{OnSignature: func(r bundle.SigResult) { results = append(results, r) }})
+			noErr(t, err)
+			if len(results) != 1 || results[0].ID != r1 || results[0].Status != bundle.SigAttested {
+				t.Fatalf("legacy stored array: %+v", results)
+			}
+			// Neither form may be empty or other than base64url.
+			for name, v := range map[string]any{"empty string": "", "empty array": []any{}, "padded": want + "=", "number": 1.0, "array of numbers": []any{1.0}} {
+				for i, l := range ls {
+					m := jsonv.MustParse(l).(map[string]any)
+					if _, ok := m["stored"]; ok {
+						m["stored"] = v
+						bad := append([][]byte{}, ls...)
+						bad[i] = jsonv.Canonical(m)
+						if _, err := bundle.Verify(bytes.NewReader(join(bad))); err == nil || !strings.Contains(err.Error(), "stored") {
+							t.Errorf("stored %s: %v", name, err)
+						}
+					}
+				}
+			}
+		})
+	}
+}
+
+// The writer takes a grant line's stored as one string and writes it so.
+func TestV073GrantLineWriterString(t *testing.T) {
+	t.Parallel()
+	nsKey := clienttest.NewKey("ns-key")
+	bot := signerKey(t, "bot-1", 1)
+	g := mint(t, nsKey.Priv, nsKey.Kid, "alice", bot)
+	gid := g.ID().String()
+	sign := func(parent *ids.ID, body []byte) string {
+		return bot.Sign(sig.Digest(srcOrigin, "matches", "derby", parent, body))
+	}
+	b := writeHistory(t, "matches", "derby", func(w *bundle.Writer) ids.ID {
+		noErr(t, w.Line(grantLine(t, "matches", g, keyEntryOf(nsKey))))
+		l, id := history(t, "matches", "derby", nil, client.GenesisPatches(map[string]any{"n": 1}), sign, gid)
+		noErr(t, w.Line(l))
+		return id
+	})
+	m := jsonv.MustParse(lines(b)[1]).(map[string]any)
+	if s, ok := m["stored"].(string); !ok || s != storedBlocks(t, g)[0] {
+		t.Fatalf("stored %v", m["stored"])
+	}
+	if s := must(bundle.Verify(bytes.NewReader(b))); s.Signatures.Counts[bundle.SigAttested] != 1 {
+		t.Fatalf("signatures %+v", s.Signatures)
 	}
 }

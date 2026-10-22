@@ -34,7 +34,9 @@
 //   - Grant lines (§G.4.1, §C.3.1): with "authors": true a bundle carries
 //     one line { "ns", "grant", "root", "stored", "key"?: { "kid", "alg",
 //     "pub" } } per grant its history lines reference, before the first
-//     that does. Its ns is the namespace whose entry first recorded the
+//     that does. stored is the authority SignedBlock in base64url, one
+//     string, as /grants/{gid} serves it; bundles written before v0.73
+//     carry an array of the token's SignedBlocks, read as its first. Its ns is the namespace whose entry first recorded the
 //     grant, a name or { origin, ns } like "written", and a grant is one
 //     line per bundle whatever its ns; key is left out when the exporter
 //     could find none. A history line for a revision written in another
@@ -304,9 +306,11 @@ type KeyEntry struct{ Kid, Alg, Pub string }
 // (§C.3.1), with the key entry its root block verified against at the
 // source. Key is attested by the exporter, not proven.
 type GrantLine struct {
-	ID     string         // the grant id, text(trunc160(sha256(canonical(root))))
-	Root   map[string]any // the root block
-	Stored []string       // the token's SignedBlocks in base64url, authority first
+	ID   string         // the grant id, text(trunc160(sha256(canonical(root))))
+	Root map[string]any // the root block
+	// Stored is the authority SignedBlock in base64url without padding,
+	// the stored form of §C.3.1.
+	Stored string
 	// Key is the key entry the root block verified against; the zero value
 	// (no Kid) when the exporter could find none, and the line leaves
 	// `key` out.
@@ -354,11 +358,7 @@ func HistoryLine(ns, name string, e client.LogEntry, authors bool) Line {
 
 func (l *Line) value() map[string]any {
 	if g := l.GrantLine; g != nil {
-		stored := make([]any, len(g.Stored))
-		for i, b := range g.Stored {
-			stored[i] = b
-		}
-		m := map[string]any{"ns": NSRef{Origin: g.Origin, NS: l.NS}.value(), "grant": g.ID, "root": g.Root, "stored": stored}
+		m := map[string]any{"ns": NSRef{Origin: g.Origin, NS: l.NS}.value(), "grant": g.ID, "root": g.Root, "stored": g.Stored}
 		if g.HasKey() {
 			m["key"] = map[string]any{"kid": g.Key.Kid, "alg": g.Key.Alg, "pub": g.Key.Pub}
 		}
@@ -782,20 +782,11 @@ func parseGrantLine(m map[string]any, l *Line, authors bool) (*Line, error) {
 		return nil, fmt.Errorf("grant line %s: root must be an object", g.ID)
 	}
 	g.Root = root
-	arr, ok := m["stored"].([]any)
-	if !ok || len(arr) == 0 {
-		return nil, fmt.Errorf("grant line %s: stored must be a non-empty array of base64url blocks", g.ID)
+	stored, err := StoredAuthority(m["stored"])
+	if err != nil {
+		return nil, fmt.Errorf("grant line %s: %v", g.ID, err)
 	}
-	for _, x := range arr {
-		str, ok := x.(string)
-		if !ok || str == "" {
-			return nil, fmt.Errorf("grant line %s: stored must be an array of base64url strings", g.ID)
-		}
-		if _, err := base64.RawURLEncoding.Strict().DecodeString(str); err != nil {
-			return nil, fmt.Errorf("grant line %s: stored blocks must be base64url without padding", g.ID)
-		}
-		g.Stored = append(g.Stored, str)
-	}
+	g.Stored = stored
 	kv, hasKey := m["key"]
 	if !hasKey {
 		// The exporter found no key (§G.4.1): the chain can't be completed
@@ -823,6 +814,36 @@ func parseGrantLine(m map[string]any, l *Line, authors bool) (*Line, error) {
 	}
 	l.GrantLine = g
 	return l, nil
+}
+
+// StoredAuthority reads the stored form of a grant (§C.3.1) as a grant
+// line or GET /ns/{ns}/grants/{gid} gives it: the authority SignedBlock,
+// one base64url string without padding. The form before v0.73, an array of
+// the token's SignedBlocks authority first, is read as its first.
+func StoredAuthority(v any) (string, error) {
+	block := func(x any) (string, error) {
+		s, ok := x.(string)
+		if !ok || s == "" {
+			return "", fmt.Errorf("stored must be the authority block, a base64url string")
+		}
+		if _, err := base64.RawURLEncoding.Strict().DecodeString(s); err != nil {
+			return "", fmt.Errorf("stored must be base64url without padding")
+		}
+		return s, nil
+	}
+	arr, legacy := v.([]any)
+	if !legacy {
+		return block(v)
+	}
+	if len(arr) == 0 {
+		return "", fmt.Errorf("stored must be the authority block, a base64url string")
+	}
+	for _, x := range arr {
+		if _, err := block(x); err != nil {
+			return "", err
+		}
+	}
+	return arr[0].(string), nil
 }
 
 // --- the checker shared by Reader and Writer ---------------------------------
