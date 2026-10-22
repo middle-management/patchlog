@@ -2,6 +2,7 @@ package index_test
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -15,6 +16,7 @@ import (
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // v073P22World is pa and pb (read: grant) and pub (public), each with an
@@ -577,5 +579,76 @@ func TestV073PublicSealedPerEntry(t *testing.T) {
 	b := decodeJSON(t, must(derived.OpenView(string(f.body), epochKeys(t, w, "vs"), derived.View{NS: "vs", Target: f.path})))
 	if b["counts"] == nil || fmt.Sprint(resources(b)) != "[a]" {
 		t.Errorf("private sealed: %v", b)
+	}
+}
+
+// TestV073PublicSealedStoredBefore (ENC-33, §E.2.6): a stored view is keyed
+// by its URL and the shape of the reader's keys. Before v0.73 a public
+// sealed namespace's results were stored sealed whole under K_e, counts
+// included, at the URLs their per-entry results have now; once the index
+// opens, those are served no more, though the checkpoint, which would
+// retire them, hasn't moved: the result is JSON sealed per entry, and
+// counts are 400 there.
+func TestV073PublicSealedStoredBefore(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: keyStore(t), LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	for _, ns := range []string{"ps", "schemas"} {
+		doc := map[string]any{"read": "public", "keys": []any{k.Entry("*")}}
+		if ns == "ps" {
+			doc["encryption"] = map[string]any{"level": "sealed"}
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"ps", "schemas"}, []string{"read", "create"})), client.WithKeys(client.NewKeys(nil)))
+	sch := must(w.CreateDoc(ctx, "schemas", "item", map[string]any{"$schema": d2020, "type": "object",
+		"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}, "tag": map[string]any{"type": "string", "x-index": "facet"}}}))
+	must(createNonced(w, "ps", "a", map[string]any{"$schema": "/r/schemas/item/rev/" + sch.ID, "title": "secret a", "tag": "t"}))
+	jwk, priv, err := seal.GenerateRecipient()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ic := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:indexer", []string{"ps"}, []string{"read"}, map[string]any{"enc": jwk})), client.WithKeys(client.NewKeys(priv)))
+	dbPath := filepath.Join(t.TempDir(), "i.db")
+	opts := svcOpts{db: dbPath, ns: []string{"ps"}, now: s.Now}
+	withKey := func(o *indexOpts) { o.Recipient = priv }
+	x := startSvcWith(t, ic, opts, withKey)
+	at := x.caughtUp("ps")
+	x.stop()
+
+	// What answer stored before v0.73 for two queries at this checkpoint:
+	// one JWE under K_e, pl { ns, view }, tagged as results are.
+	key := derived.Key{NS: "ps", Epoch: 1, K: epochKeys(t, w, "ps")("ps#1")}
+	db := must(sql.Open("sqlite", sqlitedsn.DSN(dbPath, "")))
+	cache := derived.NewCache(16, db)
+	if err := cache.Init(ctx); err != nil {
+		t.Fatal(err)
+	}
+	plain := "/ps/at/" + at + "?q=secret"
+	counts := "/ps/at/" + at + "?counts=%2Ftag&q=secret"
+	hits := []any{map[string]any{"resource": "a", "score": 1, "/tag": []any{"t"}}}
+	for view, body := range map[string]map[string]any{
+		plain:  {"at": at, "ns": "ps", "hits": hits},
+		counts: {"at": at, "ns": "ps", "hits": hits, "counts": map[string]any{"/tag": map[string]any{"t": 1}}},
+	} {
+		jwe := must(derived.SealView(key, derived.View{NS: "ps", Target: view}, body))
+		must(cache.Put(ctx, view, "ps", at, derived.Stored{Body: []byte(jwe), Tags: "idx:ps,r:ps/a"}))
+	}
+	db.Close()
+
+	x = startSvcWith(t, ic, opts, withKey)
+	if got := x.caughtUp("ps"); got != at {
+		t.Fatalf("checkpoint moved: %s", got)
+	}
+	f := x.fetch("/ps?q=secret", "")
+	if ct := f.header.Get("Content-Type"); ct != "application/json" || f.path != plain {
+		t.Errorf("%s: %q, want application/json sealed per entry at %s", f.path, ct, plain)
+	}
+	if hit := decodeJSON(t, f.body)["hits"].([]any)[0].(map[string]any); hit["sealed"] == nil {
+		t.Errorf("hit %v", hit)
+	}
+	if r := x.raw(counts, ""); r.status != 400 || r.body["code"] != "bad_input" {
+		t.Errorf("counts over a public sealed namespace: %d %v", r.status, r.body)
 	}
 }
