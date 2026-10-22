@@ -335,3 +335,82 @@ func TestV073PrivatePointerNoStore(t *testing.T) {
 		t.Errorf("public pointer: %d %v", r.status, r.header)
 	}
 }
+
+// TestV073ScoresPerDocument (IX-19, §A.4): a hit's score depends on its
+// document alone: not on documents of its namespace the reader can't see,
+// nor on other namespaces. FTS5 and the LIKE table alike.
+func TestV073ScoresPerDocument(t *testing.T) {
+	t.Parallel()
+	for _, noFTS := range []bool{false, true} {
+		t.Run(fmt.Sprintf("noFTS=%v", noFTS), func(t *testing.T) {
+			t.Parallel()
+			testV073ScoresPerDocument(t, noFTS)
+		})
+	}
+}
+
+func testV073ScoresPerDocument(t *testing.T, noFTS bool) {
+	ctx := context.Background()
+	s := clienttest.New(t, clienttest.Options{Auth: true, LongPoll: 150 * time.Millisecond})
+	admin, issuer := clienttest.NewKey("admin"), clienttest.NewKey("issuer")
+	nss := []string{"sec", "other"}
+	for _, ns := range nss {
+		doc := map[string]any{"read": "grant", "keys": []any{admin.Entry("*"), issuer.Entry("read")}}
+		if ns == "other" {
+			doc["read"] = "public"
+		}
+		must(s.Client(t, client.WithBearer(s.OperatorGrant(t, ns))).CreateNamespace(ctx, ns, doc))
+	}
+	root := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "user:root", nss, []string{"read", "create"})))
+	refs := map[string]string{}
+	for _, ns := range nss {
+		sch := must(root.CreateDoc(ctx, ns, "schema", map[string]any{"$schema": d2020, "type": "object",
+			"properties": map[string]any{"title": map[string]any{"type": "string", "x-index": "text"}}}))
+		refs[ns] = "/r/" + ns + "/schema/rev/" + sch.ID
+	}
+	mk := func(ns, name, title string) {
+		must(root.CreateDoc(ctx, ns, name, map[string]any{"$schema": refs[ns], "title": title}))
+	}
+	mk("sec", "pub-1", "a goal and another goal")
+	mk("sec", "secret-x", "nothing")
+	mk("other", "o1", "goal")
+	x := startSvc(t, s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", nss, []string{"read"}))),
+		svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: nss, now: s.Now, noFTS: noFTS})
+	x.caughtUp("sec")
+	x.caughtUp("other")
+	if x.ix.FTS() == noFTS {
+		t.Fatalf("FTS = %v", x.ix.FTS())
+	}
+	limited := issuer.Grant(t, s.Now(), "user:li", []string{"sec"}, []string{"read"}, map[string]any{"rules": []any{
+		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string", "pattern": "^pub-"}}}})
+	scores := func() map[string]any {
+		out := map[string]any{}
+		for _, c := range []struct{ path, tok string }{{"/sec?q=goal", limited}, {"/other?q=goal", ""}} {
+			for _, h := range x.search(c.path, c.tok)["hits"].([]any) {
+				m := h.(map[string]any)
+				out[m["resource"].(string)] = m["score"]
+			}
+		}
+		return out
+	}
+	before := scores()
+	if len(before) != 2 || before["pub-1"] == nil || before["o1"] == nil {
+		t.Fatalf("scores %v", before)
+	}
+	// Hidden documents of sec, and other namespaces, gain the word.
+	mk("sec", "secret-y", "goal goal goal goal")
+	mk("sec", "secret-z", "goal")
+	for i := range 5 {
+		mk("other", fmt.Sprintf("o%d", i+2), "goal goal")
+	}
+	x.caughtUp("sec")
+	x.caughtUp("other")
+	after := scores()
+	if len(after) != 7 || after["pub-1"] != before["pub-1"] || after["o1"] != before["o1"] {
+		t.Errorf("scores %v, before %v", after, before)
+	}
+	// One occurrence of the one word scores 1 (scoreK1), two more.
+	if after["o1"] != 1.0 || after["o2"].(float64) <= 1 || after["pub-1"] != after["o2"] {
+		t.Errorf("scores %v", after)
+	}
+}

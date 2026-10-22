@@ -564,20 +564,9 @@ func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (stri
 	sb.WriteString(` FROM `)
 	switch {
 	case len(q.words) > 0:
-		sb.WriteString(`(SELECT docid, sum(s) AS score FROM (`)
-		for i, w := range q.words {
-			if i > 0 {
-				sb.WriteString(` UNION ALL `)
-			}
-			if ix.fts {
-				fmt.Fprintf(&sb, `SELECT rowid >> %d AS docid, %d AS k, -rank AS s FROM "text" WHERE "text" MATCH ?`, textShift, i)
-				args = append(args, ftsPhrase(w))
-			} else {
-				fmt.Fprintf(&sb, `SELECT docid, %d AS k, 1.0 AS s FROM "text" WHERE body LIKE ? ESCAPE '\'`, i)
-				args = append(args, likePattern(w))
-			}
-		}
-		fmt.Fprintf(&sb, `) GROUP BY docid HAVING count(DISTINCT k) = %d) t CROSS JOIN docs d`, len(q.words))
+		m, margs := textMatchSQL(ix.fts, q.words)
+		sb.WriteString(m + ` t CROSS JOIN docs d`)
+		args = append(args, margs...)
 	case drive >= 0:
 		f := fs[drive]
 		sb.WriteString(`(SELECT DISTINCT ` + f.a + `.resource FROM ` + f.table + ` ` + f.a + ` INDEXED BY ` + f.idx + ` WHERE ` + f.a + `.ns = ? AND ` + f.cond + `) m CROSS JOIN docs d`)
@@ -637,6 +626,42 @@ func (ix *Index) candidateSQL(ns string, q *Query, fs []filter, drive int) (stri
 		sb.WriteString(`t.score DESC, `)
 	}
 	sb.WriteString(`d.resource`)
+	return sb.String(), args
+}
+
+// scoreK1 saturates a word's term frequency in a hit's score (§A.4): a
+// word occurring tf times in the document counts tf·(k1+1)/(tf+k1), BM25's
+// term weight with a fixed idf and no length normalisation. A score so
+// depends on its document alone, never on documents the reader can't see
+// or on other namespaces (whose statistics FTS5's rank, bm25, reads), so
+// readers who share a result share its scores too.
+const scoreK1 = 1.2
+
+// textMatchSQL is the subquery of the documents whose text matches every
+// word, (docid, score): with FTS5, a word's occurrences in a row are the
+// phrase instances highlight() marks (in a select of its own: LIMIT -1
+// keeps SQLite from flattening it into the aggregate, where an FTS5
+// auxiliary function can't run); with the LIKE table, the row's
+// case-folded (ASCII) occurrences of the word. A row that matched counts
+// at least one.
+func textMatchSQL(fts bool, words []string) (string, []any) {
+	var sb strings.Builder
+	var args []any
+	fmt.Fprintf(&sb, `(SELECT docid, sum(tf * %g / (tf + %g)) AS score FROM (SELECT docid, k, sum(c) AS tf FROM (`, scoreK1+1, scoreK1)
+	for i, w := range words {
+		if i > 0 {
+			sb.WriteString(` UNION ALL `)
+		}
+		if fts {
+			fmt.Fprintf(&sb, `SELECT * FROM (SELECT rowid >> %d AS docid, %d AS k, max(1, length(highlight("text", 4, char(1), '')) - length(body)) AS c FROM "text" WHERE "text" MATCH ? LIMIT -1)`, textShift, i)
+			args = append(args, ftsPhrase(w))
+		} else {
+			fmt.Fprintf(&sb, `SELECT docid, %d AS k, max(1, (length(body) - length(replace(lower(body), lower(?), ''))) / length(?)) AS c FROM "text" WHERE body LIKE ? ESCAPE '\'`, i)
+			bare := strings.TrimRight(w, "*")
+			args = append(args, bare, bare, likePattern(w))
+		}
+	}
+	fmt.Fprintf(&sb, `) GROUP BY docid, k) GROUP BY docid HAVING count(*) = %d)`, len(words))
 	return sb.String(), args
 }
 
