@@ -15,9 +15,12 @@ package main
 // the stored plan and the catalog bases' merge locks, which live in the
 // release document's namespace: { holder, plan } while held, {} while
 // free (§F.9). A lock another plan holds, or one an earlier version wrote
-// ({ "release" }), is released by a person: append {} to it. rebase creates a successor of every branch (§F.5) and
-// writes a new revision of the release document listing them. abandon
-// freezes every branch with abandoned: true (needs a * key, §F.6).
+// ({ "release" }), is released by a person: append {} to it. The one
+// exception is a merge an earlier version stopped part-way: apply resumes
+// it from its stored plan, taking over the lock that version took for it.
+// rebase creates a successor of every branch (§F.5) and writes a new
+// revision of the release document listing them. abandon freezes every
+// branch with abandoned: true (needs a * key, §F.6).
 //
 // Catalog batches (§F.8): -merge-bearer is the merge service's own grant
 // for the catalog (merge grants are issued only to it); -bearer, the
@@ -282,6 +285,8 @@ func printLocks(rp *merge.ReleasePlan, locks []*merge.Lock) {
 		switch {
 		case l.Free():
 			fmt.Printf("  lock %s: free\n", where)
+		case l.Legacy != "" && l.Legacy == rp.Release && rp.Format == 0 && rp.State == merge.ReleaseMerging:
+			fmt.Printf("  lock %s: held by an earlier version's merge of this release, stopped part-way; apply resumes it and takes the lock over\n", where)
 		case l.Legacy != "":
 			fmt.Printf("  lock %s: held by an earlier version's merge of %s; a person releases it (append {})\n", where, l.Legacy)
 		case l.Plan == rp.Digest:

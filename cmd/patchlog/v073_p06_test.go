@@ -41,3 +41,32 @@ func TestV073ReleaseStatusLocks(t *testing.T) {
 		}
 	}
 }
+
+// §F.9 "a merge that stops part-way resumes from that plan": status says
+// that apply takes over the lock an earlier version took for this release,
+// whose merge it stopped part-way; any other earlier-version lock is a
+// person's to release.
+func TestV073ReleaseStatusLegacyLock(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout := os.Stdout
+	os.Stdout = w
+	legacy := []*merge.Lock{{NS: "releases", Name: "merge-lock.cat", State: client.Live, Legacy: "/r/releases/release-7"}}
+	printLocks(&merge.ReleasePlan{Release: "/r/releases/release-7", State: merge.ReleaseMerging, Digest: "1old"}, legacy)
+	printLocks(&merge.ReleasePlan{Release: "/r/releases/release-7", State: merge.ReleaseMerging, Digest: "1new", Format: merge.PlanFormat}, legacy)
+	printLocks(&merge.ReleasePlan{Release: "/r/releases/release-8", State: merge.ReleaseMerging, Digest: "1old"}, legacy)
+	w.Close()
+	os.Stdout = stdout
+	b, _ := io.ReadAll(r)
+	lines := strings.Split(strings.TrimSpace(string(b)), "\n")
+	if len(lines) != 3 || !strings.Contains(lines[0], "apply resumes it and takes the lock over") {
+		t.Fatalf("got\n%s", b)
+	}
+	for _, l := range lines[1:] {
+		if !strings.Contains(l, "a person releases it") {
+			t.Fatalf("got\n%s", b)
+		}
+	}
+}

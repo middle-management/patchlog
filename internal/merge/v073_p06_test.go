@@ -521,3 +521,128 @@ func TestV073ReleaseOldPlanFormat(t *testing.T) {
 		t.Fatal("something was merged")
 	}
 }
+
+// §F.9 "a merge that stops part-way resumes from that plan and never
+// reverts", across the upgrade: a merge an earlier version started and
+// stopped after step 1 left its plan in state merging without a format,
+// branch ats or digests of today's rendering, and its { "release" } lock
+// held (in StateNS, where that version kept its locks). It can't be
+// approved again, so ApplyRelease resumes it: the step digests checked as
+// that version rendered them (here step 3's differ, matches requiring
+// nonces), every batch's source.at the branch's ns_id before the freeze,
+// the lock taken over only if it names this release, and released.
+func TestV073ReleaseResumesOldFormatMerge(t *testing.T) {
+	t.Parallel()
+	for _, stateNS := range []string{"", "schemas-x"} {
+		t.Run("state-ns="+stateNS, func(t *testing.T) {
+			t.Parallel()
+			testReleaseResumesOldFormatMerge(t, stateNS)
+		})
+	}
+}
+
+func testReleaseResumesOldFormatMerge(t *testing.T, stateNS string) {
+	w := newRelWorld(t)
+	w.startCatalog()
+	h := must(w.ops.NSHead(ctx, "matches"))
+	must(w.ops.PatchConfig(ctx, "matches", h.Config, ops(op("add", "/nonce", "required"))))
+	w.branch("schemas", "schemas-r7", op("add", "/drafts", map[string]any{"for": sAny("matches-r7")}))
+	w.branch("matches", "matches-r7")
+	w.branch("cat-season", "cat-season-r7")
+	w.appendTo("schemas-r7", "match", op("add", "/properties/venue", map[string]any{"type": "string"}))
+	w.appendTo("matches-r7", "derby", op("replace", "/home", "Z"), op("add", "/$nonce", seal.NewNonce()))
+	w.appendTo("cat-season-r7", "season", op("replace", "/title", "Season 2026"))
+	w.writeRelease("release-7", map[string]string{"schemas": "schemas-r7", "matches": "matches-r7", "cat-season": "cat-season-r7"})
+	o := w.opts("release-7")
+	lockNS := "releases"
+	if stateNS != "" {
+		must(w.s.Client(t, client.WithBearer(w.s.OperatorGrant(t, stateNS))).CreateNamespace(ctx, stateNS,
+			map[string]any{"read": "grant", "keys": []any{w.opsKey.Entry("*"), w.idp.Entry(grant.Verbs...)}}))
+		o.StateNS, lockNS = stateNS, stateNS
+	}
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, must(merge.PlanRelease(ctx, w.anna, o))))
+	rp := must(merge.ApproveRelease(ctx, w.anna, o))
+	if got := stepsOf(rp); !reflect.DeepEqual(got, []string{"1 schemas match", "3 matches derby", "4 cat-season season"}) {
+		t.Fatalf("steps %q", got)
+	}
+	ats := map[string]string{}
+	for _, b := range rp.Branches {
+		ats[b.Key] = b.At
+	}
+	stop := errors.New("stop")
+	o.AfterStep = func(st *merge.ReleaseStep) error {
+		if st.Step == 1 {
+			return stop
+		}
+		return nil
+	}
+	if _, err := merge.ApplyRelease(ctx, w.anna, o); !errors.Is(err, stop) {
+		t.Fatalf("apply: %v", err)
+	}
+	o.AfterStep = nil
+
+	// As the earlier version left it.
+	stored := must(merge.LoadReleasePlan(ctx, w.anna, o))
+	step3 := stored.Steps[1].Digest
+	noErr(t, merge.LegacyPlan(ctx, w.anna, o, stored))
+	if stored.Steps[1].Digest == step3 {
+		t.Fatal("step 3's digest renders the same in both formats; the test shows nothing")
+	}
+	noErr(t, merge.SaveReleasePlan(ctx, w.anna, o, stored))
+	lock := merge.LockName("cat-season")
+	setLock := func(ns string, doc map[string]any) {
+		t.Helper()
+		if h := must(w.anna.Head(ctx, ns, lock)); h.State == client.Live {
+			must(w.anna.Append(ctx, ns, lock, h.ID, ops(op("replace", "", doc))))
+		} else {
+			must(w.anna.CreateDoc(ctx, ns, lock, doc))
+		}
+	}
+	if lockNS != "releases" {
+		setLock("releases", map[string]any{})
+	}
+	if _, err := merge.ApproveRelease(ctx, w.anna, o); err == nil {
+		t.Fatal("approved a merging plan again")
+	}
+	// Another release's earlier-version lock isn't this one's.
+	setLock(lockNS, map[string]any{"release": "/r/releases/release-6", "since": "2026-01-01T00:00:00Z"})
+	if _, err := merge.ApplyRelease(ctx, w.anna, o); !errors.Is(err, merge.ErrLocked) {
+		t.Fatalf("resumed over another release's lock: %v", err)
+	}
+	setLock(lockNS, map[string]any{"release": "/r/releases/release-7", "since": "2026-01-01T00:00:00Z"})
+
+	rp, err := merge.ApplyRelease(ctx, w.anna, o)
+	if err != nil {
+		t.Fatalf("resuming a merge an earlier version stopped part-way: %v", err)
+	}
+	if rp.State != merge.ReleaseDone {
+		t.Fatalf("state %s", rp.State)
+	}
+	if d := w.doc("matches", "derby"); d["home"] != "Z" {
+		t.Fatalf("derby %v", d)
+	}
+	if d := w.doc("cat-season", "season"); d["title"] != "Season 2026" {
+		t.Fatalf("season %v", d)
+	}
+	for _, st := range rp.Steps[1:] {
+		ns := rp.Branch(st.Key).Target
+		if e := entryOf(t, w.anna, ns, st.Done); e.Source["at"] != ats[st.Key] {
+			t.Fatalf("step %d source %v, want at %s, the ns_id before the freeze", st.Step, e.Source, ats[st.Key])
+		}
+	}
+	// Both locks are free; the one in releases was taken over and given
+	// the plan when it was the earlier version's.
+	for _, ns := range []string{"releases", lockNS} {
+		if !w.live(ns, lock) || len(w.doc(ns, lock)) != 0 {
+			t.Fatalf("lock %s/%s: %v", ns, lock, w.doc(ns, lock))
+		}
+	}
+	lh := must(w.anna.Head(ctx, "releases", lock))
+	var docs []string
+	for _, e := range must(w.anna.Log(ctx, "releases", lock, lh.ID, "")) {
+		docs = append(docs, string(jsonv.Canonical(must(w.anna.Doc(ctx, "releases", lock, e.ID)).Value)))
+	}
+	if held := `{"holder":"user:anna","plan":"` + rp.Digest + `"}`; !strings.Contains(strings.Join(docs, " "), held) || docs[len(docs)-1] != `{}` {
+		t.Fatalf("lock documents %q", docs)
+	}
+}

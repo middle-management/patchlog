@@ -46,16 +46,21 @@ package merge
 // again, requires it clean, for the same revision and with the same
 // digest, and freezes every listed branch (§8.4), recording each branch's
 // config id and its ns_id before the freeze, which stays every batch's
-// source.at; unfreezing a branch (any config change) invalidates the plan. ApplyRelease runs the
-// steps from the stored plan, each classified again with a dry run right
-// before it is submitted, and stops for a new approval if a step's items
-// differ from the approved ones; it records each step as it completes, and
-// resumes from there after a stop. It never reverts. Catalog batches are
-// submitted by the merge service under grants the catalog service signs
-// for it for exactly that batch, or, where they change $access, under a
-// catalog admin's grant narrowed with the merge service's via (§F.8,
-// MergeGranter). Every branch records merged only after step 4, with at
-// the target's ns_id after the last batch into it.
+// source.at; unfreezing a branch (any config change) invalidates the
+// plan. ApplyRelease runs the steps from the stored plan, each classified
+// again with a dry run right before it is submitted, and stops for a new
+// approval if a step's items differ from the approved ones; it records
+// each step as it completes, and resumes from there after a stop. It never
+// reverts. A plan an earlier version stored (format 0, without the digest
+// above or each branch's at) is planned and approved again, unless that
+// version stopped part-way through merging it: that merge resumes from the
+// stored plan, each step checked against the step digest the earlier
+// version recorded. Catalog batches are submitted by the merge service
+// under grants the catalog service signs for it for exactly that batch,
+// or, where they change $access, under a catalog admin's grant narrowed
+// with the merge service's via (§F.8, MergeGranter). Every branch records
+// merged only after step 4, with at the target's ns_id after the last
+// batch into it.
 //
 // One release per catalog base at a time: ApplyRelease holds the merge
 // lock, resource merge-lock.{catalog base} in the release document's own
@@ -65,10 +70,11 @@ package merge
 // or an append with If-Match on a free head, setting holder; then plan is
 // set by a further compare-and-append, and releasing is an append back to
 // {}. A merge resuming from a stored plan takes over (sets holder, by
-// compare-and-append) only a lock whose plan is that plan's digest; any
-// other held lock, one written by an earlier version ({ "release" })
-// included, is released by a person. It is held from the first step until
-// every branch records merged.
+// compare-and-append) only a lock whose plan is that plan's digest, or,
+// resuming a merge an earlier version stopped, the lock that version took
+// for the release ({ "release" }, in StateNS); any other held lock, one
+// written by an earlier version included, is released by a person. It is
+// held from the first step until every branch records merged.
 
 import (
 	"bytes"
@@ -179,8 +185,9 @@ type Half struct {
 }
 
 // PlanFormat is the stored plan's format. 2: the plan digest of v0.73
-// (§F.9) and each branch's at; a plan stored under an earlier format is
-// planned and approved again.
+// (§F.9) and each branch's at; a plan stored under an earlier format (0,
+// none recorded) is planned and approved again, unless its merge stopped
+// part-way, which ApplyRelease resumes.
 const PlanFormat = 2
 
 // ReleasePlan is the stored plan of a release merge.
@@ -1373,6 +1380,35 @@ func ApproveRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (
 	return fresh, SaveReleasePlan(ctx, c, opt, fresh)
 }
 
+// legacyAts gives each branch of a plan an earlier version stored, which
+// records no at, its ns_id before the approval's freeze (§F.9): the entry
+// before the config entry of its FrozenConfig. A branch that records
+// merged has no step left and keeps none.
+func legacyAts(ctx context.Context, c *client.Client, rp *ReleasePlan) error {
+	for _, b := range rp.Branches {
+		if b.At != "" || b.Merged != "" || b.FrozenConfig == "" {
+			continue
+		}
+		h, err := c.NSHead(ctx, b.NS)
+		if err != nil {
+			return err
+		}
+		log, err := c.NSLog(ctx, b.NS, h.ID, "")
+		if err != nil {
+			return err
+		}
+		for i := len(log) - 1; i > 0 && b.At == ""; i-- {
+			if log[i].Kind == "config" && log[i].Target == b.FrozenConfig {
+				b.At = log[i].Prev
+			}
+		}
+		if b.At == "" {
+			return fmt.Errorf("%w: %s's log has no freeze %s by the approval", ErrInvalidPlan, b.NS, b.FrozenConfig)
+		}
+	}
+	return nil
+}
+
 // entryBefore returns the ns_id before the entry id of ns's chain, which
 // follows since (an ns_id in that chain).
 func entryBefore(ctx context.Context, c *client.Client, ns, id, since string) (string, error) {
@@ -1445,16 +1481,29 @@ func ApplyRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*R
 	default:
 		return rp, fmt.Errorf("merge: the plan is %s, not approved", rp.State)
 	}
-	if rp.Digest == "" || rp.Format != PlanFormat {
+	// A plan an earlier version stored (format 0) is planned and approved
+	// again, unless that version stopped part-way through merging it: such
+	// a merge resumes from that plan and never reverts (§F.9), its steps
+	// checked against the step digests it stored (approvedStep), each
+	// source.at its branch's ns_id before the approval's freeze
+	// (legacyAts), and the lock it took for its release taken over
+	// (acquireLock).
+	legacy := rp.Format == 0 && rp.State == ReleaseMerging
+	if rp.Digest == "" || (rp.Format != PlanFormat && !legacy) {
 		return rp, fmt.Errorf("%w: it was approved without the plan digest of §F.9 (format %d, now %d): plan and approve again", ErrInvalidPlan, rp.Format, PlanFormat)
 	}
 	if err := checkApproved(ctx, c, rp); err != nil {
 		return rp, err
 	}
+	if legacy {
+		if err := legacyAts(ctx, c, rp); err != nil {
+			return rp, err
+		}
+	}
 	// One release per catalog base at a time.
 	for _, b := range rp.Branches {
 		if b.Catalog {
-			if err := acquireLock(ctx, c, rp, b.Target); err != nil {
+			if err := acquireLock(ctx, c, opt, rp, b.Target); err != nil {
 				return rp, err
 			}
 		}
@@ -1518,7 +1567,7 @@ func ApplyRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (*R
 	}
 	for _, b := range rp.Branches {
 		if b.Catalog {
-			if err := releaseLock(ctx, c, rp, b.Target); err != nil {
+			if err := releaseLock(ctx, c, opt, rp, b.Target); err != nil {
 				return rp, err
 			}
 		}
@@ -1620,7 +1669,7 @@ func AbandonRelease(ctx context.Context, c *client.Client, opt ReleaseOptions) (
 		}
 		for _, b := range rp.Branches {
 			if b.Catalog {
-				if err := releaseLock(ctx, c, rp, b.Target); err != nil {
+				if err := releaseLock(ctx, c, opt, rp, b.Target); err != nil {
 					return out, err
 				}
 			}
@@ -1652,6 +1701,16 @@ type Lock struct {
 // earlier version's { "release": null } counts as free too).
 func (l *Lock) Free() bool {
 	return l.State == client.NotFound || (l.State == client.Live && l.Holder == "" && l.Plan == "" && l.Legacy == "")
+}
+
+// heldFor reports a lock held for rp: for its digest, or, for a plan an
+// earlier version stored (format 0), the lock ({ "release" }) that version
+// took for rp's release.
+func (l *Lock) heldFor(rp *ReleasePlan) bool {
+	if l.State != client.Live {
+		return false
+	}
+	return (l.Plan != "" && l.Plan == rp.Digest) || (rp.Format == 0 && l.Legacy != "" && l.Legacy == rp.Release)
 }
 
 // lockNS is the namespace of a release's merge locks: the release
@@ -1729,13 +1788,25 @@ func writeLock(ctx context.Context, c *client.Client, l *Lock, doc map[string]an
 // is taken by setting holder, this service's sub (a create with
 // If-None-Match: *, or an append with If-Match on its free head), then
 // plan, rp's digest, is set by a further compare-and-append. A lock held
-// for rp's digest is resumed, its holder replaced by this service's sub
-// where it differs. Any other held lock is ErrLocked, naming its holder
-// and plan, for a person to release.
-func acquireLock(ctx context.Context, c *client.Client, rp *ReleasePlan, base string) error {
+// for rp (heldFor: for its digest, or the lock an earlier version took
+// for the release of a plan it stored and stopped merging) is resumed,
+// set to this service's sub and rp's digest where it differs. Any other
+// held lock is ErrLocked, naming its holder and plan, for a person to
+// release; so too, resuming a merge an earlier version stopped, a lock
+// held for another release in StateNS, where that version kept its locks.
+func acquireLock(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, base string) error {
 	ns, err := lockNS(rp.Release)
 	if err != nil {
 		return err
+	}
+	if sns, err := opt.stateNS(rp.Release); err == nil && rp.Format == 0 && sns != ns {
+		l, err := readLock(ctx, c, sns, base)
+		if err != nil {
+			return err
+		}
+		if l.State == client.Live && !l.Free() && !l.heldFor(rp) {
+			return lockedErr(l, rp)
+		}
 	}
 	sub, _, err := c.Principal(ctx)
 	if err != nil {
@@ -1755,19 +1826,12 @@ func acquireLock(ctx context.Context, c *client.Client, rp *ReleasePlan, base st
 			doc = map[string]any{"holder": sub}
 		case l.Plan == rp.Digest && l.Holder == sub:
 			return nil
-		case l.Plan == rp.Digest, took && l.Holder == sub && l.Plan == "":
+		case l.heldFor(rp), took && l.Holder == sub && l.Plan == "":
 			// Resuming rp, or ours from this call's take: (re)set holder
 			// and plan.
 			doc = map[string]any{"holder": sub, "plan": rp.Digest}
 		default:
-			holder, plan := l.Holder, l.Plan
-			if l.Legacy != "" {
-				holder = "an earlier version's merge of " + l.Legacy
-			}
-			if plan == "" {
-				plan = "(none)"
-			}
-			return fmt.Errorf("%w: %s holds %s/%s for plan %s, not this release's %s; a person releases it", ErrLocked, holder, ns, l.Name, plan, rp.Digest)
+			return lockedErr(l, rp)
 		}
 		err = writeLock(ctx, c, l, doc)
 		switch {
@@ -1782,29 +1846,61 @@ func acquireLock(ctx context.Context, c *client.Client, rp *ReleasePlan, base st
 	return fmt.Errorf("merge: the lock %s/%s keeps changing", ns, LockName(base))
 }
 
-// releaseLock releases the lock of a catalog base if it is held for rp's
-// digest: an append back to {} (§F.9).
-func releaseLock(ctx context.Context, c *client.Client, rp *ReleasePlan, base string) error {
+// lockedErr is ErrLocked for a lock held other than for rp, naming its
+// holder and plan.
+func lockedErr(l *Lock, rp *ReleasePlan) error {
+	holder, plan := l.Holder, l.Plan
+	if l.Legacy != "" {
+		holder = "an earlier version's merge of " + l.Legacy
+	}
+	if plan == "" {
+		plan = "(none)"
+	}
+	return fmt.Errorf("%w: %s holds %s/%s for plan %s, not this release's %s; a person releases it", ErrLocked, holder, l.NS, l.Name, plan, rp.Digest)
+}
+
+// releaseLock releases the lock of a catalog base if it is held for rp
+// (heldFor): an append back to {} (§F.9). For a plan an earlier version
+// stored, so too the lock that version took in StateNS, where it kept its
+// locks.
+func releaseLock(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, base string) error {
 	ns, err := lockNS(rp.Release)
 	if err != nil {
 		return err
 	}
-	l, err := readLock(ctx, c, ns, base)
-	if err != nil {
-		return err
+	nss := []string{ns}
+	if sns, err := opt.stateNS(rp.Release); err == nil && rp.Format == 0 && sns != ns {
+		nss = append(nss, sns)
 	}
-	if l.State != client.Live || l.Plan == "" || l.Plan != rp.Digest {
-		return nil
+	for _, ns := range nss {
+		l, err := readLock(ctx, c, ns, base)
+		if err != nil {
+			return err
+		}
+		if !l.heldFor(rp) {
+			continue
+		}
+		if err := writeLock(ctx, c, l, map[string]any{}); err != nil {
+			return err
+		}
 	}
-	return writeLock(ctx, c, l, map[string]any{})
+	return nil
+}
+
+// stepItem is one item of a step's batch as a plan's digest renders it
+// (digestItems): the resource, its precondition and its steps.
+type stepItem struct {
+	name  string
+	pre   map[string]any
+	steps []client.Step
 }
 
 // stepPlan builds one step's batch from the stored plan, classified again
 // against the targets as they are: the plan (nil if nothing is left to
-// do) and the step's digest items (§F.9). planning builds it before
-// anything is submitted: the second half of a split node then applies to
-// the first half's result, which isn't in the target yet.
-func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, st *ReleaseStep, planning bool) (*Plan, []any, error) {
+// do) and the step's items (§F.9). planning builds it before anything is
+// submitted: the second half of a split node then applies to the first
+// half's result, which isn't in the target yet.
+func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan, st *ReleaseStep, planning bool) (*Plan, []stepItem, error) {
 	b := rp.Branch(st.Key)
 	if b == nil {
 		return nil, nil, fmt.Errorf("no branch for %s in the plan", st.Key)
@@ -1837,7 +1933,7 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 	// head already has the document is done (a resumed step). Planned
 	// second halves apply to the first half's result.
 	var resolve []half
-	var items []any
+	var items []stepItem
 	var np *Plan // the target's nonce needs, for planned second halves
 	for _, h := range hs {
 		if planning && st.Step == 4 {
@@ -1852,7 +1948,7 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 			if diff == nil {
 				diff = []any{}
 			}
-			items = append(items, digestItem(h.name, map[string]any{"after": map[string]any{"step": 2, "key": st.Key, "item": h.name}}, np.withNonces([]client.Step{client.PatchStep(diff)})))
+			items = append(items, stepItem{h.name, map[string]any{"after": map[string]any{"step": 2, "key": st.Key, "item": h.name}}, np.withNonces([]client.Step{client.PatchStep(diff)})})
 			continue
 		}
 		cur, err := c.Head(ctx, b.Target, h.name)
@@ -1880,7 +1976,7 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 		all = append(all, h.name)
 	}
 	if len(all) == 0 {
-		return nil, orderItems(st, items), nil
+		return nil, items, nil
 	}
 	p, err := NewPlan(ctx, c, b.Target, b.NS, Options{Resources: all, BranchAt: b.At, SourceAuthorizations: opt.SourceAuthorizations, Signer: opt.Signer})
 	if err != nil {
@@ -1955,12 +2051,22 @@ func stepPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rel
 		default:
 			pre = map[string]any{"ifMatch": r.IfMatch}
 		}
-		items = append(items, digestItem(r.Name, pre, r.Steps))
+		items = append(items, stepItem{r.Name, pre, r.Steps})
 	}
 	if len(p.Items()) == 0 {
 		p = nil
 	}
-	return p, orderItems(st, items), nil
+	return p, items, nil
+}
+
+// digestItems renders a step's items for the plan's digest (§F.9), in the
+// order its batch sends them (orderItems).
+func digestItems(st *ReleaseStep, items []stepItem) []any {
+	out := make([]any, 0, len(items))
+	for _, it := range items {
+		out = append(out, digestItem(it.name, it.pre, it.steps))
+	}
+	return orderItems(st, out)
 }
 
 // digestItem is one item of a plan's digest (§F.9): the resource, its
@@ -2057,6 +2163,64 @@ func stepDigest(st *ReleaseStep, items []any) string {
 	return ids.Of(jsonv.Canonical(map[string]any{"step": float64(st.Step), "key": st.Key, "items": items})).String()
 }
 
+// approvedStep reports whether a step's items are the ones approved: its
+// stored digest (stepDigest over digestItems), or, for a plan an earlier
+// version stored (format 0), that digest as the earlier version rendered
+// the items (legacyDigestItems), so a merge it stopped part-way resumes
+// from that plan (§F.9).
+func approvedStep(rp *ReleasePlan, st *ReleaseStep, items []stepItem) bool {
+	if stepDigest(st, digestItems(st, items)) == st.Digest {
+		return true
+	}
+	return rp.Format == 0 && stepDigest(st, legacyDigestItems(items)) == st.Digest
+}
+
+// legacyDigestItems renders a step's items as the step digests of format
+// 0 did: each step list with every $nonce member of a value, and the value
+// of every operation on a $nonce path, left out; the items by resource
+// name.
+func legacyDigestItems(items []stepItem) []any {
+	out := make([]any, 0, len(items))
+	for _, it := range items {
+		m := map[string]any{"resource": it.name, "steps": legacyStripNonces(jsonv.FromGo(StepsJSON(it.steps)))}
+		if m["steps"] == nil {
+			m["steps"] = []any{}
+		}
+		for k, v := range it.pre {
+			m[k] = v
+		}
+		out = append(out, m)
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		return out[i].(map[string]any)["resource"].(string) < out[j].(map[string]any)["resource"].(string)
+	})
+	return out
+}
+
+func legacyStripNonces(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(t))
+		for k, x := range t {
+			if k == "$nonce" {
+				continue
+			}
+			out[k] = legacyStripNonces(x)
+		}
+		if path, _ := t["path"].(string); path == "/$nonce" || strings.HasSuffix(path, "/$nonce") {
+			delete(out, "value")
+		}
+		return out
+	case []any:
+		out := make([]any, len(t))
+		for i, x := range t {
+			out[i] = legacyStripNonces(x)
+		}
+		return out
+	}
+	return v
+}
+
 // PlanObject is the plan a release's digest is over (§F.9):
 //
 //	{ "release": <the release document's revision path>,
@@ -2136,8 +2300,8 @@ func (x *relCtx) digest(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		items[st] = its
-		st.Digest = stepDigest(st, its)
+		items[st] = digestItems(st, its)
+		st.Digest = stepDigest(st, items[st])
 	}
 	plan, err := PlanObject(x.rp.Release+"/rev/"+x.rp.Revision, x.rp.Branches, x.rp.Steps, items)
 	if err != nil {
@@ -2166,7 +2330,7 @@ func runStep(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *Rele
 	if p == nil {
 		return "noop", nil // nothing left: a resumed step that went in
 	}
-	if st.Digest != "" && stepDigest(st, items) != st.Digest {
+	if st.Digest != "" && !approvedStep(rp, st, items) {
 		return "", fmt.Errorf("%w (step %d, %s)", ErrPlanChanged, st.Step, st.Key)
 	}
 	if b.Catalog {

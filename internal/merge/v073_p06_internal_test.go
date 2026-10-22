@@ -1,6 +1,7 @@
 package merge
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -121,5 +122,63 @@ func TestV073PlanObject(t *testing.T) {
 	}
 	if PlanDigest(plan) != ids.Of([]byte(want)).String() {
 		t.Fatal("the digest isn't text(trunc160(sha256(canonical(plan))))")
+	}
+}
+
+// LegacyPlan rewrites rp as an earlier version stored it, for tests of a
+// merge that version stopped part-way: no format, no branch at, and the
+// step digests of the steps not done yet as that version rendered them.
+func LegacyPlan(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *ReleasePlan) error {
+	for _, st := range rp.Steps {
+		if st.Done != "" {
+			continue
+		}
+		_, its, err := stepPlan(ctx, c, opt, rp, st, false)
+		if err != nil {
+			return err
+		}
+		st.Digest = stepDigest(st, legacyDigestItems(its))
+	}
+	rp.Format = 0
+	for _, b := range rp.Branches {
+		b.At = ""
+	}
+	return nil
+}
+
+// §F.9 "a merge that stops part-way resumes from that plan": a plan an
+// earlier version stored (format 0) has step digests over items rendered
+// as that version did ($nonce members and $nonce op values left out, items
+// by name); a step of such a plan is approved under either rendering, one
+// of the current format only under its own.
+func TestV073LegacyStepDigests(t *testing.T) {
+	fresh := "abcdefghijklmnopqrstuvwxyz"
+	items := []stepItem{
+		{"zeta", map[string]any{"ifMatch": "1z"}, []client.Step{client.PatchStep([]any{
+			map[string]any{"op": "add", "path": "/$nonce", "value": fresh},
+			map[string]any{"op": "add", "path": "/a", "value": map[string]any{"$nonce": fresh, "b": 1.0}},
+		})}},
+		{"alpha", map[string]any{"ifNoneMatch": "*"}, []client.Step{client.DeleteStep()}},
+	}
+	got := string(jsonv.Canonical(jsonv.FromGo(legacyDigestItems(items))))
+	want := `[{"ifNoneMatch":"*","resource":"alpha","steps":["delete"]},` +
+		`{"ifMatch":"1z","resource":"zeta","steps":[[{"op":"add","path":"/$nonce"},{"op":"add","path":"/a","value":{"b":1}}]]}]`
+	if got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	st := &ReleaseStep{Step: 1, Key: "schemas", Resources: []string{"zeta", "alpha"}}
+	legacy, current := stepDigest(st, legacyDigestItems(items)), stepDigest(st, digestItems(st, items))
+	if legacy == current {
+		t.Fatal("the renderings agree; the test shows nothing")
+	}
+	for _, c := range []struct {
+		format int
+		digest string
+		want   bool
+	}{{0, legacy, true}, {0, current, true}, {PlanFormat, current, true}, {PlanFormat, legacy, false}, {0, "1other", false}} {
+		st.Digest = c.digest
+		if got := approvedStep(&ReleasePlan{Format: c.format}, st, items); got != c.want {
+			t.Fatalf("format %d, digest %s: approved %v", c.format, c.digest, got)
+		}
 	}
 }
