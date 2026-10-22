@@ -556,7 +556,8 @@ const i9 = `{"authors":false,"bundle":1,"origin":"https://staging.example"}` + "
 // I.9 (§G.4.1): a bundle digest covers the bytes as written. I.9's lines
 // are a digest test only (its header lacks created, at and docs), so the
 // bundle Reader and Writer are held to the same digest over a readable
-// bundle with I.9's history line.
+// bundle with I.9's history line, and the Reader refuses that bundle with
+// either line re-encoded rather than digest it as its canonical lines.
 func TestI9BundleDigest(t *testing.T) {
 	t.Parallel()
 	if got := ids.Of([]byte(i9)).String(); got != "1b3a64kkqf3o6f3rglkgi6ok5hgldbne6" {
@@ -564,7 +565,8 @@ func TestI9BundleDigest(t *testing.T) {
 	}
 
 	_, line, _ := strings.Cut(i9, "\n")
-	b := `{"at":{"matches":"` + nsID2 + `"},"authors":false,"bundle":1,"created":"2026-10-04T12:00:00Z","docs":{"matches/derby":{"head":"` + idG + `","history":"full"}},"origin":"https://staging.example"}` + "\n" + line
+	hdr := `{"at":{"matches":"` + nsID2 + `"},"authors":false,"bundle":1,"created":"2026-10-04T12:00:00Z","docs":{"matches/derby":{"head":"` + idG + `","history":"full"}},"origin":"https://staging.example"}` + "\n"
+	b := hdr + line
 	want := ids.Of([]byte(b)).String()
 
 	var buf bytes.Buffer
@@ -584,19 +586,42 @@ func TestI9BundleDigest(t *testing.T) {
 		t.Errorf("Writer wrote\n%s(digest %s), want\n%s(digest %s)", buf.String(), d, b, want)
 	}
 
+	if d, err := readBundle(b); err != nil || d != want {
+		t.Errorf("Reader digest %s (%v), want %s over the bytes", d, err, want)
+	}
+
+	// The same bundle with a line that isn't canonical JSON followed by one
+	// 0x0A is rejected (§G.4.1). A Reader that re-encoded such a line before
+	// hashing would report want, the digest of other bytes than it was
+	// given, so re-encoding either line never reproduces a digest.
+	for _, c := range []struct{ what, b string }{
+		{"history line re-encoded", hdr + `{"resource":"derby", "ns":"matches", "kind":"rev", "parent":"", "id":"` + idG + `", "patches":[{"op":"add","path":"","value":{"title":"Hello","views":0}}]}` + "\n"},
+		{"history line with another number spelling", hdr + strings.Replace(line, `"views":0`, `"views":0.0`, 1)},
+		{"history line with an escape", hdr + strings.Replace(line, `"Hello"`, `"\u0048ello"`, 1)},
+		{"header re-encoded", strings.Replace(hdr, `,"authors":false,"bundle":1,`, `, "authors": false, "bundle": 1, `, 1) + line},
+		{"blank line", hdr + "\n" + line},
+		{"CRLF line ends", strings.ReplaceAll(b, "\n", "\r\n")},
+		{"last line without its 0x0A", strings.TrimSuffix(b, "\n")},
+	} {
+		if d, err := readBundle(c.b); err == nil {
+			t.Errorf("%s: read with digest %s (the bytes as written: %s), want rejected (§G.4.1, I.9)", c.what, d, ids.Of([]byte(c.b)))
+		}
+	}
+}
+
+// readBundle reads b to its end with the bundle Reader and returns the
+// digest it reports, or the error it refuses b with.
+func readBundle(b string) (string, error) {
 	r, err := bundle.NewReader(strings.NewReader(b))
 	if err != nil {
-		t.Fatal(err)
+		return "", err
 	}
 	for {
 		if _, err := r.Next(); err == io.EOF {
-			break
+			return r.Digest(), nil
 		} else if err != nil {
-			t.Fatal(err)
+			return "", err
 		}
-	}
-	if r.Digest() != want {
-		t.Errorf("Reader digest %s, want %s over the bytes", r.Digest(), want)
 	}
 }
 
