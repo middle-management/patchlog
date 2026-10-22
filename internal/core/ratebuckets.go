@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"errors"
 	"log"
 	"runtime"
 	"slices"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -21,7 +23,8 @@ import (
 // rows of rate_buckets, and a request's draw is one call of rate_draw
 // (pgschema.go), one statement: it adds the rows of buckets never drawn
 // on, full, then locks the rows of every bucket the request draws on in
-// key order, so two draws never wait on each other in a cycle, refills
+// key order, so two draws never wait on each other in a cycle (and the
+// sweep of full buckets never waits on a draw: maybeSweep), refills
 // them to now, and deducts each cost only if every one holds a token.
 // Instances sharing a database therefore admit no more between them than
 // one instance would.
@@ -132,8 +135,11 @@ func (s *bucketStore) charge(ctx context.Context, now time.Time, d draw) error {
 }
 
 // draw runs drawSQL, again if a sweep deleted a row between rate_draw's
-// insert and its lock. It returns the buckets' tokens before any
-// deduction, by key, and whether it deducted.
+// insert and its lock, or if Postgres rolled it back for a deadlock with
+// a statement that locks bucket rows out of key order (none of this
+// package's does; an operator's might): rate_draw is one statement, so a
+// draw rolled back deducted nothing. It returns the buckets' tokens
+// before any deduction, by key, and whether it deducted.
 func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, force bool) (map[string]float64, bool, error) {
 	ds := merged(draws)
 	keys := make([][]byte, len(ds))
@@ -143,37 +149,59 @@ func (s *bucketStore) draw(ctx context.Context, now time.Time, draws []draw, for
 	for i, d := range ds {
 		keys[i], rates[i], bursts[i], costs[i] = []byte(d.key), d.rate.Rate, d.rate.Burst, d.cost
 	}
+	var err error
 	for range 3 {
-		rows, err := s.db.QueryContext(ctx, drawSQL, keys, rates, bursts, costs, now.UnixMicro(), force)
-		if err != nil {
+		var tokens map[string]float64
+		var ok bool
+		tokens, ok, err = s.drawOnce(ctx, now, keys, rates, bursts, costs, force)
+		switch {
+		case deadlocked(err):
+			continue
+		case err != nil:
 			return nil, false, err
-		}
-		tokens := make(map[string]float64, len(ds))
-		ok := false
-		for rows.Next() {
-			var k []byte
-			var t float64
-			if err := rows.Scan(&k, &t, &ok); err != nil {
-				rows.Close()
-				return nil, false, err
-			}
-			tokens[string(k)] = t
-		}
-		if err := rows.Close(); err != nil {
-			return nil, false, err
-		}
-		if err := rows.Err(); err != nil {
-			return nil, false, err
-		}
-		if len(tokens) == len(ds) {
+		case len(tokens) == len(ds):
 			if ok {
 				s.maybeSweep(now)
 			}
 			return tokens, ok, nil
 		}
+		// A sweep deletes only full buckets, so not on every attempt.
+		err = errBucketsVanish
 	}
-	// A sweep deletes only full buckets, so not on every attempt.
-	return nil, false, errBucketsVanish
+	return nil, false, err
+}
+
+// drawOnce runs drawSQL once.
+func (s *bucketStore) drawOnce(ctx context.Context, now time.Time, keys [][]byte, rates, bursts, costs []float64, force bool) (map[string]float64, bool, error) {
+	rows, err := s.db.QueryContext(ctx, drawSQL, keys, rates, bursts, costs, now.UnixMicro(), force)
+	if err != nil {
+		return nil, false, err
+	}
+	defer rows.Close()
+	tokens := make(map[string]float64, len(keys))
+	ok := false
+	for rows.Next() {
+		var k []byte
+		var t float64
+		if err := rows.Scan(&k, &t, &ok); err != nil {
+			return nil, false, err
+		}
+		tokens[string(k)] = t
+	}
+	if err := rows.Close(); err != nil {
+		return nil, false, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, err
+	}
+	return tokens, ok, nil
+}
+
+// deadlocked reports whether Postgres rolled a statement back as the
+// victim of a deadlock.
+func deadlocked(err error) bool {
+	var pe *pgconn.PgError
+	return errors.As(err, &pe) && pe.Code == "40P01"
 }
 
 type bucketError string
@@ -199,9 +227,16 @@ func (s *bucketStore) maybeSweep(now time.Time) {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		// A row a draw locked or changed meanwhile is judged again as it
-		// now is (READ COMMITTED), so a bucket drawn on isn't deleted.
-		if _, err := s.db.Exec(`DELETE FROM rate_buckets WHERE tokens + ($1::bigint - last) * rate / 1e6 >= burst`, now.UnixMicro()); err != nil {
+		// The sweep locks the rows it deletes first, skipping any a draw
+		// holds: it never waits for a draw, so it never waits in a cycle
+		// with one, as deleting full rows in the table's order could (a
+		// draw that saw a row before the sweep deleted it, waiting for
+		// it, while holding a row the sweep comes to later). A row a draw
+		// changed meanwhile is judged again as it now is (READ
+		// COMMITTED), so a bucket drawn on isn't deleted; one a draw
+		// holds is drawn on, and the next sweep judges it.
+		if _, err := s.db.Exec(`DELETE FROM rate_buckets WHERE key IN (
+			SELECT key FROM rate_buckets WHERE tokens + ($1::bigint - last) * rate / 1e6 >= burst FOR UPDATE SKIP LOCKED)`, now.UnixMicro()); err != nil {
 			log.Printf("rate buckets: sweep: %v", err)
 		}
 		s.mu.Lock()

@@ -501,3 +501,165 @@ func TestV073P17BucketStore(t *testing.T) {
 		t.Fatalf("after the sweep: %d rows, want the one bucket not full", rows)
 	}
 }
+
+// p17SlowBuckets adds triggers to rate_buckets that only stretch two
+// moments, so that an interleaving otherwise a window of microseconds
+// happens every time: an insert of the bucket ins (a draw's insert of the
+// buckets it hasn't seen, before it locks the ones it has) and a delete
+// of the bucket del (a sweep's, between rows). They take no lock.
+func p17SlowBuckets(t *testing.T, e *Engine, ins, del string) {
+	t.Helper()
+	for _, q := range []string{
+		`CREATE FUNCTION p17_slow_ins() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.key = '\x` + fmt.Sprintf("%x", ins) + `'::bytea THEN PERFORM pg_sleep(0.3); END IF; RETURN NEW; END $$`,
+		`CREATE TRIGGER p17_slow_ins BEFORE INSERT ON rate_buckets FOR EACH ROW EXECUTE FUNCTION p17_slow_ins()`,
+		`CREATE FUNCTION p17_slow_del() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.key = '\x` + fmt.Sprintf("%x", del) + `'::bytea THEN PERFORM pg_sleep(0.5); END IF; RETURN OLD; END $$`,
+		`CREATE TRIGGER p17_slow_del BEFORE DELETE ON rate_buckets FOR EACH ROW EXECUTE FUNCTION p17_slow_del()`,
+	} {
+		if _, err := e.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// p17FullBuckets adds full buckets with keys, in that order on the heap.
+func p17FullBuckets(t *testing.T, e *Engine, now time.Time, r Rate, keys ...string) {
+	t.Helper()
+	for _, k := range keys {
+		if _, err := e.db.Exec(`INSERT INTO rate_buckets (key, tokens, last, rate, burst) VALUES ($1, $2, $3, $4, $2)`, []byte(k), r.Burst, now.UnixMicro(), r.Rate); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// A sweep never waits on a draw, so the two never wait on each other in a
+// cycle: a draw that saw buckets a and b and is adding c, while the sweep
+// deletes the full b, m and a in that order (the table's), finds the
+// rows gone, and no deadlock. Deleting in the table's order, the sweep
+// held b and waited for a, which the draw had locked while it waited for
+// b: Postgres rolled one back (ratebuckets.go).
+func TestV073P17SweepNeverWaitsOnDraw(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only")
+	}
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	e := p17RateEngine(t, pgtest.FreshDB(t), t.TempDir(), &clock, p17Fast(), false)
+	s := e.rate.store
+	now := time.UnixMilli(clock.Load())
+	r := Rate{1, 10}
+	p17FullBuckets(t, e, now, r, "b", "m", "a")
+	p17SlowBuckets(t, e, "c", "m")
+	type res struct {
+		tokens map[string]float64
+		err    error
+	}
+	done := make(chan res, 1)
+	go func() {
+		// drawOnce, which runs rate_draw once: a deadlock is its error.
+		tokens, _, err := s.drawOnce(context.Background(), now, [][]byte{[]byte("a"), []byte("b"), []byte("c")},
+			[]float64{1, 1, 1}, []float64{10, 10, 10}, []float64{1, 1, 1}, false)
+		done <- res{tokens, err}
+	}()
+	// The draw has seen a and b, and is adding c.
+	time.Sleep(100 * time.Millisecond)
+	s.maybeSweep(now)
+	got := <-done
+	s.wg.Wait()
+	if got.err != nil {
+		t.Fatalf("draw during a sweep: %v", got.err)
+	}
+	if len(got.tokens) == 3 {
+		t.Fatalf("draw during a sweep found every row: %v", got.tokens)
+	}
+	// The draw runs again on what the sweep left.
+	if _, _, ok, err := s.admit(context.Background(), now, []draw{{"a", r, 1, "x"}, {"b", r, 1, "x"}, {"c", r, 1, "x"}}); err != nil || !ok {
+		t.Fatalf("draw after the sweep: %v %v", ok, err)
+	}
+}
+
+// End to end: a dry run, whose draw runs in a read transaction that
+// nothing runs again, during that sweep is admitted, not an internal
+// error (§6.6 Dry runs). Its buckets: n\x00n < p\x00w < r\x00n\x00a\x00w
+// (new); the sweep's order: p\x00w, m, n\x00n.
+func TestV073P17SweepDuringDryRun(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only")
+	}
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	e := p17RateEngine(t, pgtest.FreshDB(t), t.TempDir(), &clock, p17Fast(), false)
+	s := e.rate.store
+	mkNS(t, e, "n", map[string]any{})
+	s.wg.Wait()
+	if _, err := e.db.Exec(`DELETE FROM rate_buckets`); err != nil {
+		t.Fatal(err)
+	}
+	s.mu.Lock()
+	s.swept = time.Time{}
+	s.mu.Unlock()
+	now := time.UnixMilli(clock.Load())
+	p17FullBuckets(t, e, now, Rate{1e9, 1e9}, "p\x00w", "m", "n\x00n")
+	p17SlowBuckets(t, e, "r\x00n\x00a\x00w", "m")
+	done := make(chan error, 1)
+	go func() {
+		it := Item{Resource: "a", IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}}}}
+		_, err := e.Batch(context.Background(), Request{NS: "n", Cred: Credentials{Author: "w"}}, []Item{it}, nil, nil, true)
+		done <- err
+	}()
+	time.Sleep(100 * time.Millisecond)
+	s.maybeSweep(now)
+	err := <-done
+	s.wg.Wait()
+	if err != nil {
+		t.Fatalf("dry run during a sweep: %v", err)
+	}
+}
+
+// A draw Postgres rolls back for a deadlock (with a statement that locks
+// bucket rows out of key order) deducted nothing, and runs again.
+func TestV073P17DrawRetriesDeadlock(t *testing.T) {
+	if !pgtest.Enabled() {
+		t.Skip("Postgres only")
+	}
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	e := p17RateEngine(t, pgtest.NewDB(t), t.TempDir(), &clock, p17Fast(), false)
+	s := e.rate.store
+	now := time.UnixMilli(clock.Load())
+	r := Rate{1, 10}
+	p17FullBuckets(t, e, now, r, "a", "b")
+	ctx := context.Background()
+	tx, err := e.db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`SELECT 1 FROM rate_buckets WHERE key = 'b' FOR UPDATE`); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		// The draw locks a, then waits for b.
+		_, _, ok, err := s.admit(ctx, now, []draw{{"a", r, 1, "x"}, {"b", r, 1, "x"}})
+		if err == nil && !ok {
+			err = fmt.Errorf("refused")
+		}
+		done <- err
+	}()
+	time.Sleep(200 * time.Millisecond)
+	// Waiting for a closes the cycle. The draw, waiting longer, finds the
+	// deadlock first, and Postgres rolls it back.
+	if _, err := tx.Exec(`SELECT 1 FROM rate_buckets WHERE key = 'a' FOR UPDATE`); err != nil {
+		t.Fatalf("the other statement was the deadlock's victim: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("draw in a deadlock: %v", err)
+	}
+	var tokens float64
+	if err := e.db.QueryRow(`SELECT tokens FROM rate_buckets WHERE key = 'a'`).Scan(&tokens); err != nil || tokens != 9 {
+		t.Fatalf("a after the draw: %v tokens, %v; want one deduction", tokens, err)
+	}
+}
