@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -120,13 +122,28 @@ func remoteBaseIn(patches any) bool {
 	return has
 }
 
-func remoteErr(format string, a ...any) *Error {
-	return apiErr(502, "remote", "message", fmt.Sprintf(format, a...))
+// upstreamErr is the 502 of a remote branch's creation that failed at its
+// base's deployment (§G.3, §12.1): it didn't answer, answered 5xx, or served
+// data that fails verification. fetchRemote adds origin, naming that
+// deployment, to every such 502 it returns.
+func upstreamErr(format string, a ...any) *Error {
+	return apiErr(502, "upstream", "message", fmt.Sprintf(format, a...))
 }
 
 // unverified reports source data that fails verification.
 func unverified(format string, a ...any) *Error {
-	return apiErr(502, "remote", "message", "the base's data failed verification: "+fmt.Sprintf(format, a...))
+	return upstreamErr("%s", "the base's data failed verification: "+fmt.Sprintf(format, a...))
+}
+
+// noAnswer reports a failed fetch where the base's deployment didn't
+// answer, or answered 5xx: only that is 502 upstream at creation (§G.3).
+func noAnswer(err error) bool {
+	if ae, ok := client.AsAPIError(err); ok {
+		return ae.Status >= 500
+	}
+	var ue *url.Error
+	var ne net.Error
+	return errors.As(err, &ue) || errors.As(err, &ne) || errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // endpoint resolves how an origin is reached.
@@ -162,37 +179,43 @@ func (e *Engine) remoteClient(origin string) (*client.Client, RemoteEndpoint, er
 	return c, ep, err
 }
 
-// fetchErr maps a failed fetch from the base.
+// fetchErr maps a failed fetch from the base (§G.3, §G.5.2). What the base
+// answers is a base this deployment can't read, 422, but for its 410s
+// (pruned, gone or purged, levelErr); only no answer, or a 5xx, is 502
+// upstream. Keys this deployment can't get leave the base unreadable too.
 func fetchErr(what string, err error) *Error {
 	if ae, ok := client.AsAPIError(err); ok {
 		switch {
 		case ae.Status == 404:
 			return invalid(fmt.Sprintf("%s: not found at the base (at not in its chain, or not readable)", what))
 		case ae.Status == 401 || ae.Status == 403:
-			return remoteErr("%s: the base refused access (%d)", what, ae.Status)
+			return invalid(fmt.Sprintf("%s: the base refused access (%d), so this deployment can't read it; "+
+				"the endpoint's grant needs unrestricted read there (§G.3, §G.5.2)", what, ae.Status))
 		case ae.Status == 410 && ae.Code == "pruned":
 			return apiErr(410, "pruned", "message", what+": history needed at at was pruned at the base", "horizon", ae.Horizon())
 		case ae.Status == 410:
 			return gone("message", what+": gone at the base")
+		case ae.Status >= 500:
+			return upstreamErr("%s: %d from the base", what, ae.Status)
 		}
-		return remoteErr("%s: %d from the base", what, ae.Status)
+		return invalid(fmt.Sprintf("%s: the base answered %d, so this deployment can't read it (§G.3)", what, ae.Status))
 	}
 	if errors.Is(err, client.ErrNoKeys) {
-		return remoteErr("%s: the base is sealed (Addendum E.2) and its keys aren't available to this deployment; "+
-			"the endpoint's grant must get them from the base's POST /ns/{ns}/keys (§G.5)", what)
+		return invalid(fmt.Sprintf("%s: the base is sealed (Addendum E.2) and its keys aren't available to this deployment, so it can't read it; "+
+			"the endpoint's grant must get them from the base's POST /ns/{ns}/keys (§G.5.2)", what))
 	}
-	return remoteErr("%s: %v", what, err)
+	return upstreamErr("%s: %v", what, err)
 }
 
 // schemaFetchErr maps a failed fetch of a referenced schema revision from
 // its namespace at the base (§G.3): a revision that doesn't resolve there,
 // as with a draft in a branch (§6.1), or that is purged there, can't be
 // mirrored, and creation fails with 422 (§12: unknown, purged or
-// unreadable). A schema namespace isn't in the base's chain, so its purge
-// is no purged base (purgedBase).
+// unreadable, as a 401 or 403 is). A schema namespace isn't in the base's
+// chain, so its purge is no purged base (purgedBase).
 func schemaFetchErr(ref schema.Ref) func(string, error) *Error {
 	return func(what string, err error) *Error {
-		if ae, ok := client.AsAPIError(err); ok && (ae.Status == 404 || ae.Status == 410 && ae.Code != "pruned") {
+		if ae, ok := client.AsAPIError(err); ok && (ae.Status == 404 || ae.Status == 401 || ae.Status == 403 || ae.Status == 410 && ae.Code != "pruned") {
 			return apiErr(422, "schema_unavailable", "ref", ref.Path(), "message",
 				ref.Path()+" doesn't resolve in "+ref.NS+" at the base (a draft in a branch there, §6.1, purged, or unreadable); "+
 					"a remote branch mirrors schema revisions only from their own namespace (§G.3)")
@@ -451,13 +474,86 @@ type remoteLevel struct {
 // remoteMirror is the base as of at, verified.
 type remoteMirror struct {
 	base    *BaseRef
-	read    string // the base's read mode at at (as served; §G.5)
-	level   int    // the base's encryption level at at (as served)
+	read    string // the base's current read mode (as served; §G.5.2)
+	level   int    // the base's current encryption level (as served)
 	levels  []*remoteLevel
 	schemas []*remoteSchema
-	// schemaNonce: the schemas' source namespaces that require nonces
-	// (§C.7), as far as they can be read.
-	schemaNonce map[string]bool
+	// schemaSources: the schemas' source namespaces at the base, as their
+	// current namespace documents give them (fetchSchemaSources).
+	schemaSources map[string]schemaSource
+}
+
+// Protection ranks (§2.1): public < private = sealed < e2e.
+const (
+	rankPublic = iota
+	rankPrivate
+	rankE2E
+)
+
+// schemaSource is what a remote branch's schema mirror takes from its
+// source namespace at the base (§G.3): its protection as a source (§2.1),
+// and whether it requires nonces (§C.7).
+type schemaSource struct {
+	rank  int
+	nonce bool
+}
+
+// sourceRank is the protection of a namespace document as a source
+// (§2.1): e2e at E3, sealed (ranked as private) at E2 whatever its read,
+// and otherwise public or private by its read. A level this deployment
+// doesn't know counts as the strictest.
+func sourceRank(doc map[string]any) int {
+	if enc, ok := doc["encryption"].(map[string]any); ok {
+		lv, _ := enc["level"].(string)
+		switch levelOf(lv) {
+		case levelE2E, levelNone:
+			return rankE2E
+		case levelSealed:
+			return rankPrivate
+		}
+	}
+	if doc["read"] == "public" {
+		return rankPublic
+	}
+	return rankPrivate
+}
+
+// targetRank is the protection of a namespace of this deployment as a
+// target (§2.1): as a source, except that a sealed one whose read is
+// public is public.
+func targetRank(cfg *Config) int {
+	switch {
+	case cfg.level == levelE2E:
+		return rankE2E
+	case cfg.Read == "public":
+		return rankPublic
+	}
+	return rankPrivate
+}
+
+// fetchSchemaSources reads the current namespace document of each source
+// namespace of a remote branch's schema closure at the base (§G.3). One
+// this deployment can't read counts as private (§2.1) and leaves the
+// nonce setting optional (§C.7): mirroring writes nothing through the
+// gate, so only later writes here would be checked. Only no answer, or a
+// 5xx, fails creation (502).
+func fetchSchemaSources(ctx context.Context, c *client.Client, schemas []*remoteSchema) (map[string]schemaSource, *Error) {
+	out := map[string]schemaSource{}
+	for _, s := range schemas {
+		if _, done := out[s.ns]; done {
+			continue
+		}
+		src := schemaSource{rank: rankPrivate}
+		d, err := currentNSDoc(ctx, c, s.ns)
+		switch {
+		case err == nil:
+			src = schemaSource{rank: sourceRank(d.Value), nonce: d.Value["nonce"] == "required"}
+		case noAnswer(err):
+			return nil, upstreamErr("/ns/%s: %v", s.ns, err)
+		}
+		out[s.ns] = src
+	}
+	return out, nil
 }
 
 // fetchLevel fetches and verifies a namespace's log up to at, and its
@@ -542,19 +638,42 @@ func fetchLevel(ctx context.Context, c *client.Client, origin, ns, at string, ma
 	return lv, &BaseRef{NS: bns, At: bat}, nil
 }
 
-// unknownLevel refuses a remote branch whose base's namespace document
-// can't be read at at: without it, B can't tell how protected the base is
-// (§G.5.2). A transport failure stays a 502; anything the base answered,
-// or a document B can't open, is 422.
+// unknownLevel refuses a remote branch whose base's current namespace
+// document can't be read: without it, B can't tell how protected the base
+// is (§G.5.2). No answer, or a 5xx, stays a 502; anything else the base
+// answered, or a document B can't open, is 422.
 func unknownLevel(base *BaseRef, err error) *Error {
-	what := "/ns/" + base.NS + "/rev/" + base.At
+	what := "/ns/" + base.NS
 	msg := fmt.Sprintf("%s: this deployment can't read the base's namespace document (%v), so it can't tell how protected the base is; "+
 		"a remote branch is refused then (§G.5.2): the endpoint's grant needs read on it, and keys if it is sealed", what, err)
-	var ue *url.Error
-	if errors.As(err, &ue) {
-		return remoteErr("%s", msg)
+	if noAnswer(err) {
+		return upstreamErr("%s", msg)
 	}
 	return invalid(msg)
+}
+
+// currentNSDoc fetches a namespace's current document at the base: the
+// one at its head.
+func currentNSDoc(ctx context.Context, c *client.Client, ns string) (*client.NSDoc, error) {
+	h, err := c.NSHead(ctx, ns)
+	if err != nil {
+		return nil, err
+	}
+	return c.NSDoc(ctx, ns, h.ID)
+}
+
+// docLevel is the encryption level a namespace document of the base
+// declares; one this deployment doesn't know counts as the strictest.
+func docLevel(doc map[string]any) int {
+	enc, ok := doc["encryption"].(map[string]any)
+	if !ok {
+		return levelNone
+	}
+	lv, _ := enc["level"].(string)
+	if l := levelOf(lv); l != levelNone {
+		return l
+	}
+	return levelE2E
 }
 
 // fetchEpochs reads an e2e level's encryption member as of its at, and its
@@ -630,17 +749,23 @@ func (e *Engine) shadowEncryption(ns string, enc map[string]any) (map[string]any
 // fetched and verified too, each as of the at of the branch above it, and
 // every read-through head is verified against the log of the base that
 // wrote it.
-func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror, *Error) {
+func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (_ *remoteMirror, failed *Error) {
+	defer func() {
+		// A 502 names the remote base's deployment (§12.1).
+		if failed != nil && failed.Code() == "upstream" {
+			failed.Body["origin"] = base.Origin
+		}
+	}()
 	c, _, err := e.remoteClient(base.Origin)
 	if err != nil {
-		return nil, remoteErr("%s: %v", base.Origin, err)
+		return nil, upstreamErr("%s: %v", base.Origin, err)
 	}
 	root, err := c.Root(ctx)
 	if err != nil {
 		return nil, fetchErr("GET /", err)
 	}
 	if root.Origin != base.Origin {
-		return nil, remoteErr("the deployment reached for %s publishes the origin %q", base.Origin, root.Origin)
+		return nil, upstreamErr("the deployment reached for %s publishes the origin %q", base.Origin, root.Origin)
 	}
 	m := &remoteMirror{base: base, read: "grant"}
 	// A 410 purged for a namespace's URLs names it (levelErr). A's own
@@ -665,10 +790,13 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 		}
 		m.levels = append(m.levels, lv)
 		if len(m.levels) == 1 {
-			// The base's protection comes from its namespace document
-			// (sealed ones are decrypted with the endpoint's keys). One B
-			// can't read is refused: its level can't be told (§G.5.2).
-			d, err := c.NSDoc(ctx, base.NS, base.At)
+			// The base's protection comes from its current namespace
+			// document, as a local branch's creation is judged by its
+			// base's (§G.5.2, §7.4): its read, level and nonce setting,
+			// which merging back must pass there now (§C.7). Sealed ones
+			// are decrypted with the endpoint's keys. One B can't read is
+			// refused: its protection can't be told (§G.5.2).
+			d, err := currentNSDoc(ctx, c, base.NS)
 			if err != nil {
 				return nil, unknownLevel(base, err)
 			}
@@ -680,19 +808,23 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 			if d.Value["read"] == "public" {
 				m.read = "public"
 			}
-			if enc, ok := d.Value["encryption"].(map[string]any); ok {
-				lv, _ := enc["level"].(string)
-				if m.level = levelOf(lv); m.level == levelNone {
-					m.level = levelE2E // unknown: the strictest
+			m.level = docLevel(d.Value)
+			lv.nonce = d.Value["nonce"] == "required" && m.level != levelE2E
+			if m.level == levelE2E {
+				// A branch of a raised base can't be created with an at
+				// before its e2e raise (Addendum E, Levels): the epoch
+				// key in force at an earlier at also opens what the base
+				// sealed after it. The base's document as of at says
+				// whether the raise lies after at.
+				ad, err := c.NSDoc(ctx, base.NS, base.At)
+				if err != nil && noAnswer(err) {
+					return nil, upstreamErr("/ns/%s/rev/%s: %v", base.NS, base.At, err)
+				}
+				if err != nil || docLevel(ad.Value) != levelE2E {
+					return nil, docInvalid("/base/at", "/base/at is before the base's raise to e2e: a branch of a raised base "+
+						"can't be created with an at before its e2e raise (Addendum E, Levels, §G.5.2); create it at a later at, such as the base's head")
 				}
 			}
-			// The nonce setting is the base's current one, not the one at
-			// at: merging back must pass there now (§C.7).
-			nonce, err := c.NonceRequired(ctx, base.NS)
-			if err != nil {
-				return nil, mapErr("/ns/"+base.NS, err)
-			}
-			lv.nonce = nonce && m.level != levelE2E
 		}
 		if next == nil {
 			break
@@ -842,14 +974,18 @@ func (e *Engine) fetchRemote(ctx context.Context, base *BaseRef) (*remoteMirror,
 	for _, k := range sortedKeys(schemas) {
 		m.schemas = append(m.schemas, schemas[k])
 	}
-	m.schemaNonce = fetchSchemaNonces(ctx, c, m.schemas)
+	sources, ferr := fetchSchemaSources(ctx, c, m.schemas)
+	if ferr != nil {
+		return nil, ferr
+	}
+	m.schemaSources = sources
 	return m, nil
 }
 
 // --- creating a remote branch ----------------------------------------------
 
-// checkRemoteGenesis authenticates the operator grant and checks the
-// genesis of a remote branch (§C.4, §G.3).
+// checkRemoteGenesis authenticates the operator grant, checks it for
+// config, and checks the genesis of a remote branch (§C.4, §G.3).
 func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[string]any, *actor, *Error) {
 	if !ValidNSName(req.NS) {
 		return nil, nil, nil, badInput("invalid namespace name")
@@ -864,6 +1000,12 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	}
 	if a.verified != nil && !a.star {
 		return nil, nil, nil, forbidden("creating a remote branch needs a deployment operator key")
+	}
+	// The operator grant is checked for config, which covers the schema
+	// histories the creation mirrors and the namespaces it creates for
+	// them (§C.2, §C.4).
+	if aerr := t.authorize(a, "config", ""); aerr != nil {
+		return nil, nil, nil, aerr
 	}
 	ops, err := patch.Parse(cc.Patches)
 	if err != nil {
@@ -890,6 +1032,12 @@ func (t *tx) checkRemoteGenesis(req Request, cc ConfigChange) (*Config, map[stri
 	}
 	if cfg.Base.Origin == t.e.opt.Origin {
 		return nil, nil, nil, invalid("the base is in this deployment; create a local branch with POST /ns/{base}/branches")
+	}
+	if cfg.Base.Chain == nil {
+		// The creator gives chain, checked once the base is verified
+		// (insertRemoteBranch); the genesis is never rewritten (§G.3).
+		return nil, nil, nil, docInvalid("/base/chain", `/base/chain is missing: a remote branch's genesis gives the base's namespace, then its base, and so on, as of at, e.g. "chain": [`+
+			strconv.Quote(cfg.Base.NS)+`] for a base that isn't a branch (§G.3)`)
 	}
 	if cfg.Successor != "" {
 		return nil, nil, nil, invalid("a new namespace cannot have a successor")
@@ -968,21 +1116,19 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	}
 	// base.chain records the namespaces followed while verifying (§G.3):
 	// readers of an e2e branch accept read-through ciphertext bound to any
-	// of them. A genesis may give it, and must then give it right;
-	// otherwise it is added, and the genesis becomes one add of the whole
-	// document, as stored.
+	// of them. The genesis gives it (checkRemoteGenesis), and must give it
+	// right; its config id is over the genesis as sent.
 	chain := make([]any, len(m.levels))
 	for i, lv := range m.levels {
 		chain[i] = lv.ns
 	}
-	if cfg.Base.Chain != nil {
-		if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
-			return nil, invalid(fmt.Sprintf("/base/chain must be %v: the base's namespace and its bases as of at", chain))
-		}
-	} else {
-		doc = jsonv.Clone(doc).(map[string]any)
-		doc["base"].(map[string]any)["chain"] = chain
-		cc.Patches = []any{map[string]any{"op": "add", "path": "", "value": doc}}
+	if !jsonv.Equal(anyStrings(cfg.Base.Chain), chain) {
+		return nil, docInvalid("/base/chain", fmt.Sprintf("/base/chain must be %s: the base's namespace, then its base, and so on, as of at (§G.3)", jsonv.Canonical(chain)))
+	}
+	if m.level == levelE2E && slices.Contains(cfg.Base.Chain, req.NS) {
+		// A kid {ns}#{e} names one keyring (§F.8.1).
+		return nil, docInvalid("/base/chain", "/base/chain names "+req.NS+": a remote branch of an e2e base can't have the name of a namespace in its base.chain, "+
+			"since read-through ciphertext keeps their names in pl.ns and kid (§G.5.2, §F.8.1)")
 	}
 	// The shadows' mirrored rows follow the branch's level.
 	if t.shadowLevels == nil {
@@ -991,7 +1137,7 @@ func (t *tx) insertRemoteBranch(req Request, cc ConfigChange, cfg *Config, doc m
 	for i := range m.levels {
 		t.shadowLevels[shadowLevelName(req.NS, i)] = cfg.level
 	}
-	if err := t.mirrorSchemas(m, req.NS, cfg, author); err != nil {
+	if err := t.mirrorSchemas(m, req.NS, author); err != nil {
 		return nil, err
 	}
 	shadow, atSeq := t.insertShadows(req.NS, m)
@@ -1290,17 +1436,32 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 // mirrorSchemas mirrors the schema closure into namespaces of this
 // deployment that aren't branches, under the same paths, so $schema
 // resolves here (§G.3). A namespace that doesn't exist is created with the
-// branch's read mode, keys and roles, and takes its source's nonce setting
-// once its history is in (requireNonces, §C.7). A path whose chain neither
-// contains the base's nor is a prefix of it is 409 name_conflict. The
+// genesis document { "read": "public" } if its source at the base is
+// public (§2.1), and { "read": "grant" } otherwise, and takes its source's
+// nonce setting once its history is in (requireNonces, §C.7). A mirror,
+// created or existing, that ranks below its source is 422 (§2.1). A path
+// whose chain neither contains the base's nor is a prefix of it, or a
+// namespace that is a branch, is 409 name_conflict. A namespace that
+// refuses the history answers as it refuses it: 410 purged, 410 gone for a
+// purged resource, and, where history would be written, 409 frozen, or 422
+// at e2e, where only a key holder seals content (§2.1, §E.3.1). Every
+// resource of a namespace is judged before anything is written to it. The
 // entries it writes record the creating operator as author and its grant
 // (§7.4).
-func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author int64) *Error {
+func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error {
 	type change struct {
 		name string
 		kind string
 		head int64
 		res  int64
+	}
+	// write is history to write: s.chain from from on, onto parent, into
+	// res (0 for a new resource row).
+	type write struct {
+		s      *remoteSchema
+		res    int64
+		from   int
+		parent *revRow
 	}
 	byNS := map[string][]*remoteSchema{}
 	for _, s := range m.schemas {
@@ -1308,50 +1469,94 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 	}
 	for _, nsName := range sortedKeys(byNS) {
 		n := t.nsForWrite(nsName)
+		path := func(s *remoteSchema) string { return "/r/" + s.ns + "/" + s.name + "/rev/" + s.chain.last().ID }
 		conflict := func(s *remoteSchema, why string) *Error {
-			return apiErr(409, "name_conflict", "path", "/r/"+s.ns+"/"+s.name+"/rev/"+s.chain.last().ID, "message", why)
+			return apiErr(409, "name_conflict", "path", path(s), "message", why)
 		}
-		if nsName == branch || n != nil && (n.isBranch() || n.purged) {
-			return conflict(byNS[nsName][0], "the schema namespace here is a branch or purged")
+		if nsName == branch || n != nil && n.isBranch() {
+			return conflict(byNS[nsName][0], "the schema namespace here is a branch")
 		}
+		if n != nil && n.purged {
+			// It refuses the history as any write to it (§8.5).
+			e := t.purgedNS(n)
+			e.Body["ns"] = nsName
+			e.Body["message"] = "the schema namespace " + nsName + " here is purged, so the schemas can't be mirrored into it (§G.3, §8.5)"
+			return e
+		}
+		src := m.schemaSources[nsName]
 		created := n == nil
 		if created {
-			doc := map[string]any{"read": cfg.Read}
-			for _, k := range []string{"keys", "roles", "encryption"} {
-				if v, ok := cfg.Doc[k]; ok {
-					doc[k] = jsonv.Clone(v)
-				}
+			read := "grant"
+			if src.rank == rankPublic {
+				read = "public"
 			}
+			doc := map[string]any{"read": read}
 			n, _, _ = t.insertNamespace(nsName, []any{map[string]any{"op": "add", "path": "", "value": doc}}, doc, false, author)
 		}
-		var changes []change
+		cur := t.config(n.configSeq)
+		if rank := targetRank(cur); rank < src.rank {
+			return invalid(fmt.Sprintf("the schema namespace %s here is less protected than its source at the base (§2.1): "+
+				"a remote branch's schema mirror never ranks below its source (§G.3)", nsName))
+		}
+		var writes []write
 		for _, s := range byNS[nsName] {
 			own := t.resource(n.id, s.name)
 			if own == nil {
-				res := t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, n.id, s.name)
-				head := t.insertChain(res, s.chain, 0, nil, false)
-				changes = append(changes, change{s.name, s.chain.last().Kind, head, res})
+				writes = append(writes, write{s: s})
 				continue
 			}
-			if own.state == statePurged || !own.headSeq.Valid {
-				return conflict(s, "the resource here is purged")
+			if !own.headSeq.Valid && own.state != statePurged {
+				// A row without entries, as a pending blob's (§7.8), holds
+				// no resource: the history goes in as for a missing one.
+				writes = append(writes, write{s: s, res: own.id})
+				continue
+			}
+			// A purged resource that holds the base's history refuses it as
+			// any write to it does (410 gone, §7.2, §8.3), before the
+			// frozen check (§6.2 step 2).
+			purged := gone("path", path(s), "message", "the resource here is purged, so its schema history can't be mirrored into it (§G.3, §8.3)")
+			if !own.headSeq.Valid {
+				return purged
 			}
 			h := t.rev(own.headSeq.Int64)
-			if i, ok := s.chain.index[h.id.String()]; ok {
-				if i == len(s.chain.entries)-1 {
-					continue // same head
-				}
-				head := t.insertChain(own.id, s.chain, i+1, h, false) // a prefix: extend it
-				changes = append(changes, change{s.name, s.chain.last().Kind, head, own.id})
-				continue
+			i, prefix := s.chain.index[h.id.String()]
+			if !prefix && t.findInAncestry(h, mustID(s.chain.last().ID)) == nil {
+				return conflict(s, "the resource here holds a different history")
 			}
-			if t.findInAncestry(h, mustID(s.chain.last().ID)) != nil {
-				continue // already contains the base's chain
+			switch {
+			case own.state == statePurged:
+				return purged
+			case !prefix || i == len(s.chain.entries)-1:
+				continue // already contains the base's chain, or the same head
 			}
-			return conflict(s, "the resource here holds a different history")
+			writes = append(writes, write{s: s, res: own.id, from: i + 1, parent: h}) // a prefix: extend it
 		}
-		if len(changes) == 0 {
+		if len(writes) == 0 {
 			continue
+		}
+		if cur.Frozen {
+			// A frozen one refuses the history as any write to it (§8.4).
+			e := apiErr(409, "frozen", "message", "the schema namespace "+nsName+" here is frozen, so the schemas can't be mirrored into it (§G.3, §8.4)")
+			if cur.Successor != "" {
+				e.Body["successor"] = cur.Successor
+			}
+			return e
+		}
+		if cur.level == levelE2E {
+			// Only a key holder seals content into e2e (§2.1): this
+			// deployment writes the history as it is, which an e2e
+			// namespace refuses (§E.3.1).
+			return invalid("the schema namespace " + nsName + " here is end-to-end, so the schemas can't be mirrored into it: " +
+				"only a key holder seals content into e2e (§2.1, §G.3)")
+		}
+		var changes []change
+		for _, w := range writes {
+			res := w.res
+			if res == 0 {
+				res = t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, n.id, w.s.name)
+			}
+			head := t.insertChain(res, w.s.chain, w.from, w.parent, false)
+			changes = append(changes, change{w.s.name, w.s.chain.last().Kind, head, res})
 		}
 		var entries []any
 		for _, c := range changes {
@@ -1367,7 +1572,7 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, cfg *Config, author i
 			t.must(err)
 		}
 		t.tags = append(t.tags, "ns:"+n.name)
-		if created && m.schemaNonce[nsName] {
+		if created && src.nonce {
 			t.requireNonces(n, author)
 		}
 	}

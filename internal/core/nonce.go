@@ -1,9 +1,6 @@
 package core
 
 import (
-	"context"
-
-	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -80,24 +77,6 @@ func (t *tx) nonceDependents(n *nsRow) []string {
 		if !t.config(b.configSeq).NonceRequired {
 			out = append(out, b.name)
 		}
-	}
-	return out
-}
-
-// fetchSchemaNonces reads which namespaces of a remote branch's schema
-// closure require nonces at the base's deployment, so a schema namespace
-// created here for them takes its source's setting (requireNonces). A
-// namespace document the endpoint can't read leaves the setting optional:
-// mirroring writes nothing through the gate, so only later writes here
-// would be checked.
-func fetchSchemaNonces(ctx context.Context, c *client.Client, schemas []*remoteSchema) map[string]bool {
-	out := map[string]bool{}
-	for _, s := range schemas {
-		if _, done := out[s.ns]; done {
-			continue
-		}
-		req, err := c.NonceRequired(ctx, s.ns)
-		out[s.ns] = err == nil && req
 	}
 	return out
 }
