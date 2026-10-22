@@ -1435,10 +1435,13 @@ func (t *tx) insertChain(res int64, ch *remoteChain, from int, parent *revRow, f
 // nonce setting once its history is in (requireNonces, §C.7). A mirror,
 // created or existing, that ranks below its source is 422 (§2.1). A path
 // whose chain neither contains the base's nor is a prefix of it, or a
-// namespace that is a branch, is 409 name_conflict; a namespace that
-// refuses the history answers as it refuses it: 410 purged, or 409 frozen
-// where history would be written. The entries it writes record the
-// creating operator as author and its grant (§7.4).
+// namespace that is a branch, is 409 name_conflict. A namespace that
+// refuses the history answers as it refuses it: 410 purged, 410 gone for a
+// purged resource, and, where history would be written, 409 frozen, or 422
+// at e2e, where only a key holder seals content (§2.1, §E.3.1). Every
+// resource of a namespace is judged before anything is written to it. The
+// entries it writes record the creating operator as author and its grant
+// (§7.4).
 func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error {
 	type change struct {
 		name string
@@ -1446,14 +1449,23 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error 
 		head int64
 		res  int64
 	}
+	// write is history to write: s.chain from from on, onto parent, into
+	// res (0 for a new resource row).
+	type write struct {
+		s      *remoteSchema
+		res    int64
+		from   int
+		parent *revRow
+	}
 	byNS := map[string][]*remoteSchema{}
 	for _, s := range m.schemas {
 		byNS[s.ns] = append(byNS[s.ns], s)
 	}
 	for _, nsName := range sortedKeys(byNS) {
 		n := t.nsForWrite(nsName)
+		path := func(s *remoteSchema) string { return "/r/" + s.ns + "/" + s.name + "/rev/" + s.chain.last().ID }
 		conflict := func(s *remoteSchema, why string) *Error {
-			return apiErr(409, "name_conflict", "path", "/r/"+s.ns+"/"+s.name+"/rev/"+s.chain.last().ID, "message", why)
+			return apiErr(409, "name_conflict", "path", path(s), "message", why)
 		}
 		if nsName == branch || n != nil && n.isBranch() {
 			return conflict(byNS[nsName][0], "the schema namespace here is a branch")
@@ -1480,49 +1492,65 @@ func (t *tx) mirrorSchemas(m *remoteMirror, branch string, author int64) *Error 
 			return invalid(fmt.Sprintf("the schema namespace %s here is less protected than its source at the base (§2.1): "+
 				"a remote branch's schema mirror never ranks below its source (§G.3)", nsName))
 		}
-		// A frozen one refuses the history as any write to it (§8.4), where
-		// there is history to write.
-		var frozen *Error
-		if cur.Frozen {
-			frozen = apiErr(409, "frozen", "message", "the schema namespace "+nsName+" here is frozen, so the schemas can't be mirrored into it (§G.3, §8.4)")
-			if cur.Successor != "" {
-				frozen.Body["successor"] = cur.Successor
-			}
-		}
-		var changes []change
+		var writes []write
 		for _, s := range byNS[nsName] {
 			own := t.resource(n.id, s.name)
 			if own == nil {
-				if frozen != nil {
-					return frozen
-				}
-				res := t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, n.id, s.name)
-				head := t.insertChain(res, s.chain, 0, nil, false)
-				changes = append(changes, change{s.name, s.chain.last().Kind, head, res})
+				writes = append(writes, write{s: s})
 				continue
 			}
-			if own.state == statePurged || !own.headSeq.Valid {
-				return conflict(s, "the resource here is purged")
+			if !own.headSeq.Valid && own.state != statePurged {
+				// A row without entries, as a pending blob's (§7.8), holds
+				// no resource: the history goes in as for a missing one.
+				writes = append(writes, write{s: s, res: own.id})
+				continue
+			}
+			// A purged resource that holds the base's history refuses it as
+			// any write to it does (410 gone, §7.2, §8.3), before the
+			// frozen check (§6.2 step 2).
+			purged := gone("path", path(s), "message", "the resource here is purged, so its schema history can't be mirrored into it (§G.3, §8.3)")
+			if !own.headSeq.Valid {
+				return purged
 			}
 			h := t.rev(own.headSeq.Int64)
-			if i, ok := s.chain.index[h.id.String()]; ok {
-				if i == len(s.chain.entries)-1 {
-					continue // same head
-				}
-				if frozen != nil {
-					return frozen
-				}
-				head := t.insertChain(own.id, s.chain, i+1, h, false) // a prefix: extend it
-				changes = append(changes, change{s.name, s.chain.last().Kind, head, own.id})
-				continue
+			i, prefix := s.chain.index[h.id.String()]
+			if !prefix && t.findInAncestry(h, mustID(s.chain.last().ID)) == nil {
+				return conflict(s, "the resource here holds a different history")
 			}
-			if t.findInAncestry(h, mustID(s.chain.last().ID)) != nil {
-				continue // already contains the base's chain
+			switch {
+			case own.state == statePurged:
+				return purged
+			case !prefix || i == len(s.chain.entries)-1:
+				continue // already contains the base's chain, or the same head
 			}
-			return conflict(s, "the resource here holds a different history")
+			writes = append(writes, write{s: s, res: own.id, from: i + 1, parent: h}) // a prefix: extend it
 		}
-		if len(changes) == 0 {
+		if len(writes) == 0 {
 			continue
+		}
+		if cur.Frozen {
+			// A frozen one refuses the history as any write to it (§8.4).
+			e := apiErr(409, "frozen", "message", "the schema namespace "+nsName+" here is frozen, so the schemas can't be mirrored into it (§G.3, §8.4)")
+			if cur.Successor != "" {
+				e.Body["successor"] = cur.Successor
+			}
+			return e
+		}
+		if cur.level == levelE2E {
+			// Only a key holder seals content into e2e (§2.1): this
+			// deployment writes the history as it is, which an e2e
+			// namespace refuses (§E.3.1).
+			return invalid("the schema namespace " + nsName + " here is end-to-end, so the schemas can't be mirrored into it: " +
+				"only a key holder seals content into e2e (§2.1, §G.3)")
+		}
+		var changes []change
+		for _, w := range writes {
+			res := w.res
+			if res == 0 {
+				res = t.mustInsert(`INSERT INTO resources (ns, name) VALUES (?,?) RETURNING res`, n.id, w.s.name)
+			}
+			head := t.insertChain(res, w.s.chain, w.from, w.parent, false)
+			changes = append(changes, change{w.s.name, w.s.chain.last().Kind, head, res})
 		}
 		var entries []any
 		for _, c := range changes {

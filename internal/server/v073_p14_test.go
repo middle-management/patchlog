@@ -3,6 +3,7 @@ package server
 import (
 	"bytes"
 	"crypto/ed25519"
+	"fmt"
 	"testing"
 	"time"
 
@@ -375,4 +376,119 @@ func TestV073RemoteOperatorConfig(t *testing.T) {
 	r := b.do(req{method: "PATCH", path: "/ns/rel", ifNoneMatch: "*", body: genesis, bearer: opGrant("config")})
 	expect(t, r, 201)
 	expect(t, b.get("/ns/schemas/principal", b.operatorGrant("schemas")), 200)
+}
+
+// A schema mirror that is end-to-end refuses the history where there is
+// history to write: only a key holder seals content into e2e, and this
+// deployment writes it as it is (422, §2.1, §G.3, §E.3.1). It ranks above
+// any source, so the rank check alone would let a private source be
+// mirrored, in the clear, into an e2e namespace whose read is public.
+func TestV073RemoteSchemaMirrorE2E(t *testing.T) {
+	t.Parallel()
+	// A public source.
+	a, b, _ := pair(t, nil, []envOpt{withKeyStore(newKeyStore(t)), withEncTuning})
+	a.mkNS("schemas", map[string]any{"read": "public"})
+	s1 := a.create("schemas", "match", matchSchema())
+	a.mkNS("main", map[string]any{"read": "public"})
+	a.create("main", "d", map[string]any{"$schema": "/r/schemas/match/rev/" + s1, "score": "1-0"})
+	b.mkNS("schemas", e2eDoc(map[string]any{"read": "public"}))
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", a.nsHead("main"), nil)), 422, "invalid")
+	expect(t, b.get("/ns/rel"), 404)
+	if k := b.nsKinds("schemas"); len(k) != 1 {
+		t.Fatalf("schemas' log %v", k)
+	}
+	expect(t, b.get("/r/schemas/match/rev/"+s1+"/log"), 404)
+
+	// A private source at A, and an e2e mirror on B that anyone may read.
+	var aPriv, bPriv ed25519.PrivateKey
+	a = newEnv(t, withOrigin(originA), withAuth(&aPriv))
+	a.opPriv = aPriv
+	kA := newKey("admin")
+	a.mkNS("schemas", map[string]any{"read": "grant", "keys": []any{kA.entry("*")}})
+	a.mkNS("main", map[string]any{"read": "public", "keys": []any{kA.entry("*")}})
+	gA := a.grant(kA, "user:a", []string{"main", "schemas"}, []string{"read", "create", "append"})
+	secret := matchSchema()
+	secret["description"] = "private at A"
+	s1 = a.create("schemas", "match", secret, gA)
+	a.create("main", "d", map[string]any{"$schema": "/r/schemas/match/rev/" + s1, "score": "1-0"}, gA)
+	at := a.nsHead("main", gA)
+	rt := &route{url: a.srv.URL, bearer: a.grant(kA, "svc:b", []string{"main", "schemas"}, []string{"read"})}
+	b = newEnv(t, withOrigin(originB), withAuth(&bPriv), withRemote(rt), withKeyStore(newKeyStore(t)), withEncTuning)
+	b.opPriv = bPriv
+	b.mkNS("schemas", e2eDoc(map[string]any{"read": "public"}))
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 422, "invalid")
+	expect(t, b.get("/ns/rel/principal", b.operatorGrant("rel")), 404)
+	if g := b.get("/r/schemas/match/rev/" + s1 + "/log"); g.Code != 404 {
+		t.Fatalf("A's private schema at B, read with no grant: %d %s", g.Code, g.Body)
+	}
+}
+
+// A schema path on B that holds a purged resource refuses the history as
+// any write to a purged resource does, 410 gone, before the frozen check,
+// where its chain is the base's, a prefix of it or contains it; one whose
+// chain is a different history is 409 name_conflict. A resource row
+// without entries, as a pending blob's, holds no resource (§G.3, §7.2,
+// §8.3, §6.2).
+func TestV073RemoteSchemaMirrorPurgedResource(t *testing.T) {
+	t.Parallel()
+	a, _, rt := pair(t, nil, nil)
+	a.mkNS("schemas", map[string]any{"read": "public"})
+	s1 := a.create("schemas", "match", matchSchema())
+	s2 := a.appendRev("schemas", "match", s1, ops(op("add", "/title", "Match")))
+	a.mkNS("main", map[string]any{"read": "public"})
+	a.create("main", "d", map[string]any{"$schema": "/r/schemas/match/rev/" + s2, "score": "1-0"})
+	at := a.nsHead("main")
+	fresh := func() *tenv {
+		b := newEnv(t, withOrigin(originB), withRemote(rt))
+		b.mkNS("schemas", map[string]any{"read": "public"})
+		return b
+	}
+	expectGone := func(b *tenv, what string) {
+		t.Helper()
+		r := b.mkRemote("rel", remoteGenesis("main", at, nil))
+		if r.Code != 410 || r.Str("code") != "gone" || r.Str("path") != "/r/schemas/match/rev/"+s2 {
+			t.Fatalf("%s: %d %s, want 410 gone naming the revision", what, r.Code, r.Body)
+		}
+		expect(t, b.get("/ns/rel"), 404)
+	}
+
+	// A prefix of A's chain, purged: B's own create on the path is 410 too.
+	b := fresh()
+	if id := b.create("schemas", "match", matchSchema()); id != s1 {
+		t.Fatalf("B's revision %s, want A's %s", id, s1)
+	}
+	expect(t, b.purge("schemas", "match", s1, "admin"), 204)
+	expectCode(t, b.do(req{method: "PATCH", path: "/r/schemas/match", ifNoneMatch: "*", body: addRoot(matchSchema()), author: "admin"}), 410, "gone")
+	expectGone(b, "a prefix")
+	// Frozen too: the purged resource answers first.
+	expect(t, b.patchNS("schemas", ops(op("add", "/frozen", true)), ""), 201)
+	expectGone(b, "a prefix in a frozen namespace")
+
+	// A's very chain, and one that contains it.
+	for _, extra := range []bool{false, true} {
+		b = fresh()
+		b.create("schemas", "match", matchSchema())
+		head := b.appendRev("schemas", "match", s1, ops(op("add", "/title", "Match")))
+		if extra {
+			head = b.appendRev("schemas", "match", head, ops(op("add", "/description", "B's")))
+		}
+		expect(t, b.purge("schemas", "match", head, "admin"), 204)
+		expectGone(b, fmt.Sprintf("A's chain (extended: %v)", extra))
+	}
+
+	// A different history, purged, is still name_conflict.
+	b = fresh()
+	other := matchSchema()
+	other["title"] = "B's own"
+	id := b.create("schemas", "match", other)
+	expect(t, b.purge("schemas", "match", id, "admin"), 204)
+	expectCode(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 409, "name_conflict")
+
+	// A pending blob's row: the history goes in as for a missing resource.
+	b = fresh()
+	b.upload("schemas", "match", "image/png", []byte("not yet referenced"))
+	expect(t, b.mkRemote("rel", remoteGenesis("main", at, nil)), 201)
+	if g := b.get("/r/schemas/match"); etagOf(g) != s2 {
+		t.Fatalf("mirrored head: %d %s, want %s", g.Code, g.H.Get("ETag"), s2)
+	}
 }
