@@ -42,16 +42,29 @@ func liveQuery(q url.Values) (live bool, cursor int64, err error) {
 
 // longPoll implements §7.7 for a log fetched by fetch, with the request's
 // cursor (liveQuery), -1 without one.
+//
+// A cursor more than an hour's worth of intervals ahead of or behind this
+// server's is 400; the client then omits it. A request without a cursor,
+// or with one behind the server's, is answered at once: with the entries
+// after since, or else 204 with the current cursor. A current cursor, or
+// one ahead, waits until this server's interval boundary at the latest
+// (§7.7 Intervals and cursors).
 func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header string, tags []string, reqCursor int64,
 	fetch func(ctx context.Context, since string) (*core.Log, error)) {
 	since := r.URL.Query().Get("since")
 	interval := s.e.LongPollInterval()
 	now := time.Now()
 	current := now.UnixNano() / int64(interval)
-	if reqCursor > current+int64(time.Hour/interval) {
-		writeErr(w, badInput("cursor too far ahead"))
+	hour := int64(time.Hour / interval)
+	switch {
+	case reqCursor > current+hour:
+		writeErr(w, badInput("cursor too far ahead (§7.7)"))
+		return
+	case reqCursor >= 0 && reqCursor < current-hour:
+		writeErr(w, badInput("cursor too far behind: poll again without it (§7.7)"))
 		return
 	}
+	atOnce := reqCursor < current
 	deadline := time.Unix(0, (current+1)*int64(interval))
 	for {
 		wait := s.e.Wait(ns)
@@ -78,15 +91,17 @@ func (s *Server) longPoll(w http.ResponseWriter, r *http.Request, ns, header str
 			writeLogBody(w, lg)
 			return
 		}
-		select {
-		case <-wait:
-			continue
-		case <-time.After(time.Until(deadline)):
-		case <-lifecycle.Stopping(r.Context()):
-			// The server is shutting down: the normal "no change" answer
-			// now, so the client polls again (elsewhere).
-		case <-r.Context().Done():
-			return
+		if !atOnce {
+			select {
+			case <-wait:
+				continue
+			case <-time.After(time.Until(deadline)):
+			case <-lifecycle.Stopping(r.Context()):
+				// The server is shutting down: the normal "no change"
+				// answer now, so the client polls again (elsewhere).
+			case <-r.Context().Done():
+				return
+			}
 		}
 		cur := time.Now().UnixNano() / int64(interval)
 		if reqCursor+1 > cur {
