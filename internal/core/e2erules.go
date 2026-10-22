@@ -3,8 +3,6 @@ package core
 // Step 6 for sealed writes in end-to-end namespaces (§6.2, §E.3.2).
 
 import (
-	"fmt"
-
 	"github.com/middle-management/patchlog/internal/rules"
 )
 
@@ -25,19 +23,10 @@ func blindRule(r *rules.Rule) (string, bool) {
 
 const blindMsg = "the server can't see writes or /doc of a sealed write in an e2e namespace, so a rule reading them fails the write (§6.2, §E.3.2)"
 
-// checkRulesE2E is step 6 for a sealed create, append or restore: like
-// checkRules, grant, key and role rules first, but such a rule reading
-// writes or /doc fails with 403, and such a namespace rule with 422 rule.
-func (t *tx) checkRulesE2E(cfg *Config, a *actor, env map[string]any) *Error {
-	verb := env["action"].(string)
-	if a.verified != nil {
-		if ok, _ := a.verified.Allows(verb); !ok {
-			return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
-		}
-	}
-	if err := t.grantRulesMode(a, verb, nil, env, false, true); err != nil {
-		return err
-	}
+// checkNSRulesE2E is checkNSRules for a sealed create, append or
+// restore: a namespace rule reading writes or /doc fails with 422 rule.
+// Its grant, key and role rules are checkGrantRules with blind.
+func checkNSRulesE2E(cfg *Config, env map[string]any) *Error {
 	for i, r := range cfg.Rules {
 		if p, blind := blindRule(r); blind {
 			return apiErr(422, "rule", "rule", i, "path", p, "message", blindMsg)

@@ -111,3 +111,67 @@ func TestV073P25GrantRulesBeforeNamespaceRules(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// GB-2 (GR-25): in a batch, the grant, key and role rules run for every
+// item before the namespace rules run for any. The batch fails with the
+// status of the earliest failing sub-step, reporting only the items that
+// failed it; a dry run drops those and runs the next sub-step for the rest
+// (§6.2 step 6, §7.5 Failure and Dry run).
+func TestV073P25BatchRuleSubSteps(t *testing.T) {
+	e := v073Engine(t, p17Fast(), p17Fast(), map[string]any{"read": "grant"})
+	ctx := context.Background()
+	var ks p17Keys
+	ks.add("w", map[string]any{"can": []any{"read", "create", "append"}})
+	e.create("p", map[string]any{"read": "grant", "keys": ks.entries, "rules": []any{p25NSRule}})
+	// A block rule for documents of kind g only.
+	kindG := map[string]any{"if": []any{map[string]any{"op": "test", "path": "/doc/kind", "value": "g"}}, "then": []any{p25GrantRule}}
+	cred := ks.mint(t, map[string]any{"kid": "w", "sub": "user:w", "ns": []any{"p"}, "can": []any{"read", "create", "append"}, "rules": []any{kindG}})
+	create := func(name string, steps ...[]any) Item {
+		it := Item{Resource: name, IfNoneMatch: true}
+		for _, s := range steps {
+			it.Steps = append(it.Steps, Step{Patches: s})
+		}
+		return it
+	}
+	items := []Item{
+		// A namespace rule refuses item 0, the grant rule item 1.
+		create("n", p25Root(map[string]any{})),
+		create("g", p25Root(map[string]any{"ok": true, "kind": "g"})),
+		// Item 2's first step fails only the namespace rule, its second
+		// only the grant rule: the grant rules run for both steps first.
+		create("s", p25Root(map[string]any{}), []any{map[string]any{"op": "replace", "path": "", "value": map[string]any{"ok": true, "kind": "g"}}}),
+	}
+	_, err := e.Batch(ctx, Request{NS: "p", Cred: cred}, items, nil, nil, false)
+	b := p25Refused(t, "batch", err, 403, "batch")
+	got := b.Body["items"].([]any)
+	if len(got) != 2 {
+		t.Fatalf("batch reports %v, want items 1 and 2", got)
+	}
+	for k, want := range []int{1, 2} {
+		m := got[k].(map[string]any)
+		if m["index"] != want || m["status"] != 403 || m["code"] != "forbidden" {
+			t.Fatalf("batch item %d: %v, want index %d at 403 forbidden", k, m, want)
+		}
+	}
+	// Without the items the grant rule refuses, the namespace rule's 422.
+	_, err = e.Batch(ctx, Request{NS: "p", Cred: cred}, items[:1], nil, nil, false)
+	b = p25Refused(t, "batch of item 0", err, 422, "batch")
+	if got := b.Body["items"].([]any); len(got) != 1 || got[0].(map[string]any)["index"] != 0 || got[0].(map[string]any)["path"] != "/rules/0/then/0" {
+		t.Fatalf("batch of item 0 reports %v", got)
+	}
+
+	// A dry run reports each item at the sub-step it failed.
+	res, err := e.Batch(ctx, Request{NS: "p", Cred: cred}, append(items, create("fine", p25Root(map[string]any{"ok": true}))), nil, nil, true)
+	if err != nil || res.Status != 200 || len(res.Items) != 4 {
+		t.Fatalf("dry run: %v %+v", err, res)
+	}
+	for i, want := range []struct {
+		status int
+		code   string
+	}{{422, "rule"}, {403, "forbidden"}, {403, "forbidden"}, {201, ""}} {
+		r := res.Items[i]
+		if r.Status != want.status || (want.code != "" && r.Err["code"] != want.code) {
+			t.Errorf("dry run item %d: %d %v, want %d %s", i, r.Status, r.Err, want.status, want.code)
+		}
+	}
+}

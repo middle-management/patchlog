@@ -92,24 +92,40 @@ func (t *tx) roleRules(a *actor, verb string, roles []string, env map[string]any
 // checkRules is the rules of step 6 of §6.2 for one write, after the
 // *-key guard and a config write's in_use refusals, which its callers run:
 // grant, key and role rules (403), then namespace rules (422) (§6.4.3,
-// §C.2 item 4), against the full envelope. A config write under a * key,
-// so any while authentication is disabled, isn't judged by namespace
-// rules (§1, §6.4.3); nor is a namespace's creation under the operator
-// grant, which doesn't call this.
+// §C.2 item 4). A batch runs each half for every item before the next
+// (checkItems).
 func (t *tx) checkRules(cfg *Config, a *actor, env map[string]any, isConfig bool) *Error {
+	if err := t.checkGrantRules(a, env, false); err != nil {
+		return err
+	}
+	return checkNSRules(cfg, a, env, isConfig)
+}
+
+// checkGrantRules is step 6's grant, key and role rules, all of them,
+// against the full envelope with the write's verb (§C.2 item 4): 403. With
+// blind, a rule reading writes or /doc fails (grantRulesMode).
+func (t *tx) checkGrantRules(a *actor, env map[string]any, blind bool) *Error {
 	verb := env["action"].(string)
 	if a.verified != nil {
 		if ok, _ := a.verified.Allows(verb); !ok {
 			return forbidden(fmt.Sprintf("the grant does not allow %s", verb))
 		}
 	}
-	if err := t.grantRules(a, verb, nil, env, false); err != nil {
-		return err
+	return t.grantRulesMode(a, verb, nil, env, false, blind)
+}
+
+// checkNSRules is step 6's namespace rules in cfg, the configuration in
+// force (§6.4.3): the first that fails is 422 rule, with its index and the
+// path of the failing rule form. A config write under a * key, so any
+// while authentication is disabled, isn't judged by them (§1, §6.4.3); nor
+// is a namespace's creation under the operator grant, which doesn't call
+// this.
+func checkNSRules(cfg *Config, a *actor, env map[string]any, isConfig bool) *Error {
+	if isConfig && a.star {
+		return nil
 	}
-	if !(isConfig && a.star) {
-		if i, path, ok := rules.EvalList(cfg.Rules, env); !ok {
-			return apiErr(422, "rule", "rule", i, "path", path)
-		}
+	if i, path, ok := rules.EvalList(cfg.Rules, env); !ok {
+		return apiErr(422, "rule", "rule", i, "path", path)
 	}
 	return nil
 }
