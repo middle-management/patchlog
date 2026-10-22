@@ -1465,11 +1465,22 @@ func (st *reqState) accessRefused(cg *catGraph, src target) error {
 // (accessRefused). Onto an existing folder or file it is 403 (412 with
 // Overwrite: F, x/net/webdav's), and to another case of a sibling's name
 // 409 (§H.2 "Siblings"), either setting a guard (§H.6); a namespace's
-// directory, a tree's top level and a scratch directory aren't copied.
+// directory, a tree's top level and a scratch directory aren't copied,
+// but an app's scratch directory in the folder copied, which its listing
+// shows, is copied as one, with what is in it (§H.6), as a move to
+// another tree carries it over (scratchMoveUnder).
 func (st *reqState) copyFolder(ctx context.Context, t target) error {
 	src, err := st.resolve(ctx, st.path+strings.TrimPrefix(t.path, st.dst))
 	if err != nil {
 		return err
+	}
+	if src.kind == kScratch && src.sdir && t.path != st.dst {
+		switch t.kind {
+		case kNewNode, kScratch, kBadName:
+			// In memory, as the original: x/net/webdav copies what is in
+			// it into it next, scratch there too.
+			return st.scratchMkdir(t.path)
+		}
 	}
 	if src.kind != kFolder {
 		return fail(http.StatusForbidden, "%s isn't a folder of a file tree, the only folders copied (§H.5): a namespace's directory, a tree's top level and an app's temporary folder aren't", src.path)

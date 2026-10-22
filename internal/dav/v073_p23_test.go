@@ -834,3 +834,25 @@ func TestV073CaseVariantOfFolderGuarded(t *testing.T) {
 	}
 	e.expect(e.do("DELETE", "/cat/Empty", ""), 204, "DELETE once the guards are used up")
 }
+
+// A folder's COPY copies what its listing shows one by one (§H.5),
+// including an app's scratch directory the gateway keeps in it (§H.6,
+// macOS's .TemporaryItems): its copy is a scratch directory too, with
+// what is in it, and no folder node; the folder's files listed after it
+// are copied as before (GW-7).
+func TestV073FolderCopyWithScratchDir(t *testing.T) {
+	t.Parallel()
+	e := treeEnv(t)
+	e.expect(e.do("MKCOL", "/cat/Season/.TemporaryItems", ""), 201, "an app's folder in Season")
+	e.expect(e.do("PUT", "/cat/Season/.TemporaryItems/draft", "half"), 201, "a file the app saves there")
+	nodes := len(e.liveNames("cat"))
+	e.expect(e.do("COPY", "/cat/Season", "", "Destination", "/cat/Season2"), 201, "COPY of a folder holding an app's scratch folder")
+	sameStrings(t, "Season2", names(e.propfind("/cat/Season2/"), "/cat/Season2/"), []string{".TemporaryItems/", "derby.json"})
+	if r := e.expect(e.do("GET", "/cat/Season2/.TemporaryItems/draft", ""), 200, "GET the copied scratch file"); r.body != "half" {
+		t.Fatalf("the copied scratch file holds %q", r.body)
+	}
+	if got := len(e.liveNames("cat")); got != nodes+2 {
+		t.Fatalf("cat holds %d nodes after the copy, want %d: Season2 and derby.json's placement, the scratch folder none", got, nodes+2)
+	}
+	e.expect(e.do("GET", "/cat/Season2/derby.json", ""), 200, "GET the copied file")
+}
