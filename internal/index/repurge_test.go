@@ -75,11 +75,12 @@ func TestRepurge(t *testing.T) {
 	// reached its due time, so the loop sends nothing more.
 	must(w.c.Purge(ctx, "matches", "final", must(w.c.Head(ctx, "matches", "final")).ID, false))
 	s.appliedUpTo(s.caughtUp("matches"))
-	const once = "[[r:matches/final idx:matches:counts]]"
+	// A resource purge purges idx:{ns} (§A.1, v0.73).
+	const once = "[[r:matches/final idx:matches]]"
 	if got := s.purgesSoFar(); got != once {
 		t.Fatalf("purges %s, want %s", got, once)
 	}
-	if q := s.ix.QueuedRepurges(); !reflect.DeepEqual(q, [][]string{{"r:matches/final", "idx:matches:counts"}}) {
+	if q := s.ix.QueuedRepurges(); !reflect.DeepEqual(q, [][]string{{"r:matches/final", "idx:matches"}}) {
 		t.Fatalf("queued %v", q)
 	}
 	c.Advance(time.Minute - time.Millisecond)
@@ -92,7 +93,7 @@ func TestRepurge(t *testing.T) {
 	// Once more after the delay, by the loop, and then never again.
 	c.Advance(time.Millisecond)
 	waitFor(t, "the second purge", func() bool { return len(s.ix.QueuedRepurges()) == 0 })
-	if got, want := s.purgesSoFar(), "[[r:matches/final idx:matches:counts] [r:matches/final idx:matches:counts]]"; got != want {
+	if got, want := s.purgesSoFar(), "[[r:matches/final idx:matches] [r:matches/final idx:matches]]"; got != want {
 		t.Errorf("purges %s, want %s", got, want)
 	}
 	c.Advance(time.Hour)
@@ -154,7 +155,7 @@ func TestRepurgeDisabled(t *testing.T) {
 	if n, err := s.ix.Repurge(ctx); err != nil || n != 0 {
 		t.Errorf("sent %d second purges (%v)", n, err)
 	}
-	if got := s.purgesSoFar(); got != "[[r:matches/final idx:matches:counts]]" {
+	if got := s.purgesSoFar(); got != "[[r:matches/final idx:matches]]" {
 		t.Errorf("purges %s", got)
 	}
 }

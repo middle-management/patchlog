@@ -414,3 +414,46 @@ func testV073ScoresPerDocument(t *testing.T, noFTS bool) {
 		t.Errorf("scores %v", after)
 	}
 }
+
+// TestV073ResourcePurgeIdx (IX-20, §A.1): a resource purge purges idx:{ns}:
+// the purger and the second-purge queue get it, and kept results and
+// /_refs answers of the namespace that don't show the resource are no
+// longer answered at their at.
+func TestV073ResourcePurgeIdx(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	w := setup(t)
+	w.seed(t)
+	s := startSvc(t, w.c, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"matches"}, untyped: true})
+	s.caughtUp("matches")
+	cup := s.raw("/matches?q=cup", "").header.Get("Location")
+	refs := s.raw("/_refs?to="+url.QueryEscape(w.playerRef), "").header.Get("Location")
+	if r := s.raw(cup, ""); r.status != 200 || strings.Contains(fmt.Sprint(resources(r.body)), "notes") {
+		t.Fatalf("?q=cup: %d %v", r.status, r.body)
+	}
+	if r := s.raw(refs, ""); r.status != 200 {
+		t.Fatalf("/_refs: %d %v", r.status, r.body)
+	}
+	// The checkpoint moves on; both stay kept.
+	w.doc(t, "rematch", w.match, map[string]any{"title": "Derby rematch"})
+	s.caughtUp("matches")
+	for _, p := range []string{cup, refs} {
+		if r := s.raw(p, ""); r.status != 200 {
+			t.Fatalf("kept %s: %d", p, r.status)
+		}
+	}
+	// Purge notes, which neither shows.
+	must(w.c.Purge(ctx, "matches", "notes", must(w.c.Head(ctx, "matches", "notes")).ID, false))
+	s.appliedUpTo(s.caughtUp("matches"))
+	if got := s.purgesSoFar(); got != "[[r:matches/notes idx:matches]]" {
+		t.Errorf("purges %s", got)
+	}
+	if q := s.ix.QueuedRepurges(); fmt.Sprint(q) != "[[r:matches/notes idx:matches]]" {
+		t.Errorf("queued second purges %v", q)
+	}
+	for _, p := range []string{cup, refs} {
+		if r := s.raw(p, ""); r.status != 302 {
+			t.Errorf("%s after the purge: %d, want 302", p, r.status)
+		}
+	}
+}

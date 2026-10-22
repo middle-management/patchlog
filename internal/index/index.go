@@ -581,22 +581,25 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 			return err
 		}
 	}
-	// §A.1, §A.4: a purge removes every cached result that shows the
-	// resource, through the r:{ns}/{name} tag each result carries per hit
-	// (and results with facet counts, which may aggregate it); a purge-ns
-	// removes every cached result and pointer of the namespace. Stored
-	// sealed results go by the same tags, in this transaction.
+	// §A.1, §A.4: a purge, of a resource or of the namespace, purges
+	// idx:{ns}, which every result of the namespace carries: results page
+	// by position, count facets over every hit and may show any document,
+	// so none may outlive a purge of one of them. It also purges
+	// r:{ns}/{name}, which /_refs answers showing the resource carry, and
+	// a purge-ns the namespace's pointers (ns:{ns}). Kept results, stored
+	// sealed ones (in this transaction) and /_refs answers go by the same
+	// tags.
 	var tags []string
-	if co.PurgedNS {
-		tags = append(tags, "idx:"+b.NS, "ns:"+b.NS)
-	}
 	for _, p := range preps {
 		if p.purged {
 			tags = append(tags, "r:"+b.NS+"/"+p.resource)
 		}
 	}
-	if len(tags) > 0 && !co.PurgedNS {
-		tags = append(tags, countsTag(b.NS))
+	if len(tags) > 0 || co.PurgedNS {
+		tags = append(tags, "idx:"+b.NS)
+	}
+	if co.PurgedNS {
+		tags = append(tags, "ns:"+b.NS)
 	}
 	if err := ix.sealed.Purge(ctx, tx, tags); err != nil {
 		return err
@@ -612,7 +615,7 @@ func (ix *Index) Apply(ctx context.Context, b *follow.Batch) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
-	ix.refsPurged(ctx, b.NS, tags)
+	ix.refsPurged(ctx, b.NS, tags, co.PurgedNS)
 	if b.Partial() {
 		// A page of a snapshot later pages complete: the index doesn't
 		// reflect the namespace as of b.NewCheckpoint yet, so the

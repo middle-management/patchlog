@@ -64,8 +64,9 @@ const strictMins = false
 // answered 200 while its result for the query is kept; otherwise it is one
 // "the service no longer keeps results for" and is redirected
 // (head-pointer class) to the current one (§A.4). A result served at an
-// ns_id never changes while it is served, and a purge removes it from
-// caches, and from the kept results, through its r: tags.
+// ns_id never changes while it is served, and any purge in its namespace
+// removes it from caches, and from the kept results, through its idx:{ns}
+// tag (§A.1).
 //
 // Redirects name the query in its canonical form (§A.5,
 // derived.CanonicalQuery), and an at URL is answered 200 only in that form
@@ -635,17 +636,11 @@ func (ix *Index) serveStatus(w http.ResponseWriter) {
 
 // resultTags is a result's Cache-Tag.
 func resultTags(ns string, res *Result) string {
-	// §A.4: idx:{ns} for the namespace, r:{ns}/{name} for every resource
-	// the result shows, so a purge of any of them removes it from caches
-	// (Apply purges these). Facet counts aggregate values of hits beyond
-	// the page too, so a result with counts also carries a counts tag
-	// that every resource purge in the namespace clears.
+	// §A.4: idx:{ns} for the namespace, which every purge in it purges
+	// (Apply), and r:{ns}/{name} for every resource the result shows.
 	tags := []string{"idx:" + ns}
 	for _, h := range res.Hits {
 		tags = append(tags, "r:"+ns+"/"+h.Resource)
-	}
-	if res.Counts != nil {
-		tags = append(tags, countsTag(ns))
 	}
 	return strings.Join(tags, ",")
 }
@@ -684,10 +679,6 @@ func (ix *Index) committed(ctx context.Context, ns string) (string, bool, error)
 		ix.origin, ns, ns).Scan(&id, &purged)
 	return id, purged, err
 }
-
-// countsTag tags results with facet counts, which can reflect any resource
-// of the namespace.
-func countsTag(ns string) string { return "idx:" + ns + ":counts" }
 
 // atIncludes reports whether the kept result of ns at an older at, which
 // url names, already includes every min (§A.5 "min always redirects"),

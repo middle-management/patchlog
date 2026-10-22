@@ -390,9 +390,11 @@ func testTypedQueries(t *testing.T, noFTS bool) {
 	if got := tagSet(r); !got["idx:matches"] || !got["r:matches/cup"] || !got["r:matches/final"] || got["r:matches/derby"] || got["ns:matches"] || len(got) != 3 {
 		t.Errorf("at tags: %v", r.header.Get("Cache-Tag"))
 	}
-	// A result with facet counts also carries the counts tag.
+	// A result with facet counts is tagged so too: every purge in the
+	// namespace purges idx:{ns} (§A.1, v0.73), so it needs no tag of its
+	// own.
 	r = s.raw(s.raw("/matches?counts=/tags&q=zlatan", "").header.Get("Location"), "")
-	if got := tagSet(r); !got["idx:matches:counts"] || !got["r:matches/derby"] {
+	if got := tagSet(r); !got["idx:matches"] || !got["r:matches/derby"] || len(got) != 2 {
 		t.Errorf("counts tags: %v", r.header.Get("Cache-Tag"))
 	}
 	// Bad input.
@@ -471,7 +473,8 @@ func testUpdatesTombstonePurge(t *testing.T) {
 	s.mu.Lock()
 	purges := fmt.Sprint(s.purges)
 	s.mu.Unlock()
-	if purges != "[[r:matches/final idx:matches:counts]]" {
+	// A resource purge purges idx:{ns} (§A.1, v0.73).
+	if purges != "[[r:matches/final idx:matches]]" {
 		t.Errorf("purges %s", purges)
 	}
 }

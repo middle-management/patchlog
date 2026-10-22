@@ -794,14 +794,20 @@ func (ix *Index) writeRefs(w http.ResponseWriter, r *http.Request, rd *refsReade
 
 // refsPurged drops the answers a purge of tags in ns removes, once its
 // apply has committed: kept ones, and stored sealed ones put since the
-// apply's own purge of them (answers carry no counts tag, and results
-// with counts computed since are current).
-func (ix *Index) refsPurged(ctx context.Context, ns string, tags []string) {
+// apply's own purge of them. Those go by the tags only a result read
+// before the commit carries: r:{ns}/{name} of a resource purged, and, if
+// the namespace is purged (purgedNS), idx:{ns}, which no answer read since
+// covers. A result of ns read since carries idx:{ns} and is current:
+// dropped, a stored sealed one would be sealed again, unlike what it
+// served (§E.2.6).
+func (ix *Index) refsPurged(ctx context.Context, ns string, tags []string, purgedNS bool) {
 	if len(tags) == 0 {
 		return
 	}
 	ix.refs.Purge(refsScope, tags)
-	tags = slices.DeleteFunc(slices.Clone(tags), func(t string) bool { return t == countsTag(ns) })
+	if !purgedNS {
+		tags = slices.DeleteFunc(slices.Clone(tags), func(t string) bool { return t == "idx:"+ns })
+	}
 	if err := ix.sealed.Purge(ctx, ix.db, tags); err != nil {
 		ix.opt.Logf("index: purging sealed results of /_refs: %v", err)
 	}
