@@ -462,6 +462,9 @@ var dataMigrations = []struct {
 	run  func(ctx context.Context, tx *sql.Tx, ph func(n int) string) error
 }{
 	{"at-rest-digests", clearAtRestDigests},
+	// P18: purge the public edge copies of sealed and e2e namespaces with
+	// read "grant", cached publicly before v0.73 (purgeGrantCaches, RH-44).
+	{"grant-caches-private", purgeGrantCaches},
 }
 
 func migrateData(ctx context.Context, tx *sql.Tx, ph func(n int) string) error {

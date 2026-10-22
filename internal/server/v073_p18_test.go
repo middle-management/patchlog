@@ -768,3 +768,59 @@ func TestV073HistoryEpochsZero(t *testing.T) {
 	}
 	expect(t, e.patchNS("s", ops(op("replace", "/encryption/historyEpochs", -1.0)), star), 422)
 }
+
+// P18 review (RH-44, §E.2.5): sealed and e2e namespaces with read "grant"
+// were cached publicly before v0.73, and nothing else purges the edge
+// copies they left. Opening a database from before the change queues,
+// once, the purge of their ns:{ns} tags (cdn_repurge, due at once), and
+// not of a public or plain namespace's.
+func TestV073GrantCachesPurgedOnUpgrade(t *testing.T) {
+	t.Parallel()
+	path, blobs := v073DB(t), t.TempDir()
+	ks := newKeyStore(t)
+	p := &recPurger{}
+	at := func(o *core.Options) { o.Path, o.BlobDir, o.Purger = path, blobs, p }
+	e := newEnv(t, withKeyStore(ks), withEncTuning, at)
+	e.mkNS("g", sealedDoc(map[string]any{"read": "grant"}))
+	e.mkNS("x", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
+	e.mkNS("pub", sealedDoc(map[string]any{"read": "public"}))
+	e.mkNS("plain", map[string]any{"read": "grant"})
+	reopen := func() {
+		t.Helper()
+		e.srv.Close()
+		e.e.Close()
+		e = newEnv(t, withKeyStore(ks), withEncTuning, at)
+		p.take()
+	}
+	sent := func() []string {
+		t.Helper()
+		if _, err := e.e.Repurge(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+		var out []string
+		for _, tags := range p.take() {
+			out = append(out, tags...)
+		}
+		sort.Strings(out)
+		return out
+	}
+	e.srv.Close()
+	e.e.Close()
+	// As an earlier version left it: the migration not run, nothing queued.
+	db, q := v073SQL(t, path)
+	for _, s := range []string{`DELETE FROM migrations WHERE name = 'grant-caches-private'`, `DELETE FROM cdn_repurge`} {
+		if _, err := db.Exec(q(s)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e = newEnv(t, withKeyStore(ks), withEncTuning, at)
+	p.take()
+	if got := strings.Join(sent(), ","); got != "ns:g,ns:x" {
+		t.Fatalf("purged on upgrade: %s, want ns:g and ns:x", got)
+	}
+	// Once.
+	reopen()
+	if got := sent(); len(got) != 0 {
+		t.Fatalf("purged again: %v", got)
+	}
+}
