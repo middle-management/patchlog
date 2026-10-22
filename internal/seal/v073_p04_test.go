@@ -3,6 +3,8 @@ package seal
 import (
 	"bytes"
 	"crypto/hpke"
+	"crypto/sha256"
+	"encoding/base64"
 	"errors"
 	"strings"
 	"testing"
@@ -260,5 +262,32 @@ func TestV073UnwrapKeyLegacy(t *testing.T) {
 		if _, err := UnwrapKeyLegacy(priv, w); !errors.Is(err, ErrDecrypt) {
 			t.Fatalf("legacy wrap under another kid: %v", err)
 		}
+	}
+}
+
+// ---- ENC-9: key thumbprints (§E.2.3, RFC 7638, v0.63) ----
+
+func TestV073Thumbprint(t *testing.T) {
+	// RFC 8037 Appendix A.3: the RFC 7638 thumbprint of an OKP JWK.
+	if got := jwkThumbprint(map[string]any{"crv": "Ed25519", "kty": "OKP", "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"}); got != "kPrK_qmxVWaYVA9wwBF6Iuo3vVzz7TxHCTwXBygrS4k" {
+		t.Fatalf("RFC 8037 A.3 thumbprint %s", got)
+	}
+	// An X25519 key: SHA-256 of {"crv":"X25519","kty":"OKP","x":…}
+	// exactly, base64url without padding.
+	_, priv, _ := GenerateRecipient()
+	x := b64.EncodeToString(priv.PublicKey().Bytes())
+	sum := sha256.Sum256([]byte(`{"crv":"X25519","kty":"OKP","x":"` + x + `"}`))
+	tp := Thumbprint(priv.PublicKey())
+	if tp != base64.RawURLEncoding.EncodeToString(sum[:]) || len(tp) != 43 {
+		t.Fatalf("thumbprint %s", tp)
+	}
+	// It doesn't depend on how the JWK was written.
+	pub, err := ParseRecipientJWK([]byte(`{ "x": "` + x + `", "kty": "OKP", "use": "enc", "crv": "X25519" }`))
+	if err != nil || Thumbprint(pub) != tp {
+		t.Fatalf("parsed JWK thumbprint: %v", err)
+	}
+	_, other, _ := GenerateRecipient()
+	if Thumbprint(other.PublicKey()) == tp {
+		t.Fatal("two keys, one thumbprint")
 	}
 }

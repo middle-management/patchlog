@@ -143,10 +143,27 @@ func RecipientJWK(pub *ecdh.PublicKey) map[string]any {
 	return map[string]any{"kty": "OKP", "crv": "X25519", "x": b64.EncodeToString(pub.Bytes())}
 }
 
-// RecipientID is the stable id of a recipient public key:
-// text(trunc160(sha256(canonical({kty, crv, x})))), a 33-character id.
+// RecipientID is the id that named a recipient public key before v0.63:
+// text(trunc160(sha256(canonical({kty, crv, x})))), a 33-character id. The
+// spec names keys by Thumbprint now; this one remains for the keyring
+// format before v0.63 (Keyring).
 func RecipientID(pub *ecdh.PublicKey) string {
 	return ids.Of(jsonv.Canonical(RecipientJWK(pub))).String()
+}
+
+// Thumbprint is the RFC 7638 SHA-256 thumbprint of pub as a JWK, base64url
+// without padding (43 characters): it names a recipient or sender in
+// keyring entries (to, from) and /keys relays (§E.2.3, §E.3.2).
+func Thumbprint(pub *ecdh.PublicKey) string {
+	return jwkThumbprint(RecipientJWK(pub))
+}
+
+// jwkThumbprint hashes the canonical JSON of a JWK's required members,
+// which is RFC 7638's input (§3): members in lexicographic order, no
+// whitespace, which for an OKP key are crv, kty and x.
+func jwkThumbprint(required map[string]any) string {
+	s := sha256.Sum256(jsonv.Canonical(required))
+	return b64.EncodeToString(s[:])
 }
 
 // GenerateRecipient makes a new X25519 key pair and returns its public JWK
