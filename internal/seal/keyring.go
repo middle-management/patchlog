@@ -135,13 +135,34 @@ func (kr *Keyring) EpochKey(priv *ecdh.PrivateKey, epoch int) ([]byte, error) {
 }
 
 // MigrateKeyring rewrites a keyring of the format before v0.63 as a
-// KeyringV2 (§E.3.2): every epoch's key, which admin, one of its
-// recipients, unwraps, is wrapped again in auth mode under admin's key for
-// each recipient of that epoch. It fails if admin can't open an epoch.
-func MigrateKeyring(old *Keyring, admin *ecdh.PrivateKey) (*KeyringV2, error) {
+// KeyringV2 (§E.3.2): every epoch's key, which admin unwraps from its own
+// entry, is wrapped again in auth mode under admin's key for exactly the
+// readers the caller gives for that epoch, in their order.
+//
+// The stored document is untrusted input. It is base mode, which anyone
+// can wrap to, the server included, and nothing says who wrote its
+// recipient lists, so they aren't used: an entry for a key no admin
+// added, or for a reader left out of a rotation (§E.2.4), held nothing,
+// and wrapping the real K_e for it would hand the key over as from the
+// admin. readers comes from the caller, out of band: its own records, or
+// the stored lists (Readers, Recipients) once someone has confirmed them.
+// It must name every epoch old holds and no other; an empty list leaves
+// an epoch without entries. The epoch keys are no better authenticated,
+// since anyone can wrap a key of their choosing to admin: a caller that
+// can checks each against a payload sealed under its kid before writing
+// the result. It fails if admin can't open an epoch.
+func MigrateKeyring(old *Keyring, admin *ecdh.PrivateKey, readers map[int][]*ecdh.PublicKey) (*KeyringV2, error) {
 	epochs := make([]int, 0, len(old.Epochs))
 	for e := range old.Epochs {
+		if _, ok := readers[e]; !ok {
+			return nil, fmt.Errorf("seal: migrating keyring %s: no readers given for epoch %d", old.NS, e)
+		}
 		epochs = append(epochs, e)
+	}
+	for e := range readers {
+		if _, ok := old.Epochs[e]; !ok {
+			return nil, fmt.Errorf("seal: migrating keyring %s: readers given for epoch %d, which it doesn't hold", old.NS, e)
+		}
 	}
 	sort.Ints(epochs)
 	kr := &KeyringV2{}
@@ -150,9 +171,9 @@ func MigrateKeyring(old *Keyring, admin *ecdh.PrivateKey) (*KeyringV2, error) {
 		if err != nil {
 			return nil, fmt.Errorf("seal: migrating keyring %s: epoch %d: %w", old.NS, e, err)
 		}
-		for _, rid := range old.Readers(e) {
-			if err := kr.Add(admin, old.Recipients[rid], Kid(old.NS, e), k); err != nil {
-				return nil, err
+		for _, r := range readers[e] {
+			if err := kr.Add(admin, r, Kid(old.NS, e), k); err != nil {
+				return nil, fmt.Errorf("seal: migrating keyring %s: epoch %d: %w", old.NS, e, err)
 			}
 		}
 	}

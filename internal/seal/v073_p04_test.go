@@ -11,6 +11,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -749,7 +750,8 @@ func TestV073ParseKeyringV2(t *testing.T) {
 
 // A keyring stored before v0.63 (old format, keys wrapped in base mode
 // under the old info) opens for migration and is rewritten in the new
-// format, in auth mode under the admin's key.
+// format, in auth mode under the admin's key, for the readers the caller
+// gives per epoch.
 func TestV073MigrateKeyring(t *testing.T) {
 	_, admin, _ := GenerateRecipient()
 	_, b, _ := GenerateRecipient()
@@ -776,7 +778,8 @@ func TestV073MigrateKeyring(t *testing.T) {
 	if got, err := stored.EpochKey(b, 1); err != nil || !bytes.Equal(got, k1) {
 		t.Fatalf("legacy EpochKey: %v", err)
 	}
-	kr, err := MigrateKeyring(stored, admin)
+	readers := map[int][]*ecdh.PublicKey{1: {admin.PublicKey(), b.PublicKey()}, 2: {admin.PublicKey()}}
+	kr, err := MigrateKeyring(stored, admin, readers)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -798,7 +801,104 @@ func TestV073MigrateKeyring(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Only a recipient of every epoch can migrate.
-	if _, err := MigrateKeyring(stored, b); err == nil {
+	if _, err := MigrateKeyring(stored, b, readers); err == nil {
 		t.Fatal("b migrated an epoch it doesn't hold")
+	}
+	// readers names every epoch the keyring holds, and no other.
+	if _, err := MigrateKeyring(stored, admin, map[int][]*ecdh.PublicKey{1: {admin.PublicKey()}}); err == nil {
+		t.Fatal("migrated without readers for sec#2")
+	}
+	if _, err := MigrateKeyring(stored, admin, map[int][]*ecdh.PublicKey{1: {admin.PublicKey()}, 2: {admin.PublicKey()}, 3: {admin.PublicKey()}}); err == nil {
+		t.Fatal("migrated with readers for sec#3, which the keyring doesn't hold")
+	}
+	// An empty list leaves the epoch without entries; a nil key is refused.
+	kr, err = MigrateKeyring(stored, admin, map[int][]*ecdh.PublicKey{1: {admin.PublicKey()}, 2: nil})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kr.Entries) != 1 || kr.Entries[0].Kid != "sec#1" {
+		t.Fatalf("empty readers for sec#2: %d entries, want sec#1's one", len(kr.Entries))
+	}
+	if _, err := MigrateKeyring(stored, admin, map[int][]*ecdh.PublicKey{1: {nil}, 2: nil}); err == nil {
+		t.Fatal("migrated to a nil key")
+	}
+}
+
+// tamperedKeyring returns the stored form of kr with an entry for pub in
+// epoch e that anyone could write: the stored document is base mode and
+// unauthenticated, so pub is listed and given junk (its writer doesn't
+// know K_e).
+func tamperedKeyring(t *testing.T, kr *Keyring, e int, pub *ecdh.PublicKey) *Keyring {
+	t.Helper()
+	doc := kr.Value()
+	rid := RecipientID(pub)
+	doc["recipients"].(map[string]any)[rid] = RecipientJWK(pub)
+	doc["epochs"].(map[string]any)[strconv.Itoa(e)].(map[string]any)[rid] = b64.EncodeToString([]byte("junk"))
+	out, err := ParseKeyring(doc)
+	if err != nil {
+		t.Fatalf("the old parser refuses the tampered keyring: %v", err)
+	}
+	return out
+}
+
+// Migration doesn't take its recipients from the stored keyring: a key
+// listed there by anyone who can write the keyring resource, or by a
+// server serving the admin a modified copy (§E.3.2: anyone can wrap to a
+// thumbprint), held nothing before migration and gets nothing after it,
+// rather than the real K_e as from the trusted admin.
+func TestV073MigrateKeyringIgnoresStoredRecipients(t *testing.T) {
+	_, admin, _ := GenerateRecipient()
+	_, reader, _ := GenerateRecipient()
+	_, mallory, _ := GenerateRecipient()
+	k1 := NewKey()
+	stored, err := BuildKeyring("sec", 1, k1, []*ecdh.PublicKey{admin.PublicKey(), reader.PublicKey()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tampered := tamperedKeyring(t, stored, 1, mallory.PublicKey())
+	if _, err := tampered.EpochKey(mallory, 1); err == nil {
+		t.Fatal("junk entry opened")
+	}
+	kr, err := MigrateKeyring(tampered, admin, map[int][]*ecdh.PublicKey{1: {admin.PublicKey(), reader.PublicKey()}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted := []*ecdh.PublicKey{admin.PublicKey()}
+	if got, err := kr.EpochKey(mallory, "sec#1", trusted); err == nil || bytes.Equal(got, k1) {
+		t.Fatal("migration wrapped the real epoch key, as from the admin, for a recipient injected into the stored keyring")
+	}
+	if _, ok := kr.Entry("sec#1", Thumbprint(mallory.PublicKey())); ok {
+		t.Fatal("the migrated keyring has an entry for the injected recipient")
+	}
+	if got, err := kr.EpochKey(reader, "sec#1", trusted); err != nil || !bytes.Equal(got, k1) {
+		t.Fatalf("reader's sec#1: %v", err)
+	}
+}
+
+// Nor does migration un-revoke: a reader left out of a rotation (§E.2.4)
+// who lists itself in the new epoch of the stored keyring doesn't get
+// that epoch's key from it.
+func TestV073MigrateKeyringDoesNotUnrevoke(t *testing.T) {
+	_, admin, _ := GenerateRecipient()
+	_, revoked, _ := GenerateRecipient()
+	k1, k2 := NewKey(), NewKey()
+	stored, _ := BuildKeyring("sec", 1, k1, []*ecdh.PublicKey{admin.PublicKey(), revoked.PublicKey()})
+	if _, err := stored.Rotate(k2, []*ecdh.PublicKey{admin.PublicKey()}); err != nil {
+		t.Fatal(err)
+	}
+	tampered := tamperedKeyring(t, stored, 2, revoked.PublicKey())
+	kr, err := MigrateKeyring(tampered, admin, map[int][]*ecdh.PublicKey{
+		1: {admin.PublicKey(), revoked.PublicKey()},
+		2: {admin.PublicKey()},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	trusted := []*ecdh.PublicKey{admin.PublicKey()}
+	if got, err := kr.EpochKey(revoked, "sec#2", trusted); err == nil || bytes.Equal(got, k2) {
+		t.Fatal("a reader revoked at sec#2 gets sec#2's key, as from the admin, after migration")
+	}
+	if got, err := kr.EpochKey(revoked, "sec#1", trusted); err != nil || !bytes.Equal(got, k1) {
+		t.Fatalf("revoked reader's sec#1, which it held: %v", err)
 	}
 }
