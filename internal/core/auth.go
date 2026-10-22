@@ -439,17 +439,19 @@ func (t *tx) canRead(n *nsRow, cfg *Config, a *actor, resource string) bool {
 	return t.grantRules(a, "read", nil, t.basicEnvelope("read", resource, a), false) == nil
 }
 
-// reader authenticates a read request, if it carries credentials, and
-// decides access. A grant that doesn't name the namespace is 403 (§7), as
-// for a namespace that doesn't exist, except that public namespaces ignore
-// it and answer as to an unauthenticated request; other refusals answer
-// 404 rather than 403 so existence is not revealed.
+// reader authenticates a read of a resource URL (/r/{ns}/{name} and the
+// URLs under it), if it carries credentials, and decides access. A grant
+// that doesn't name the namespace is 403 (§7), as for a namespace that
+// doesn't exist, except that public namespaces ignore it and answer as to
+// an unauthenticated request; other refusals, a key-scope failure
+// included, answer 404 rather than 403, so that neither the resource's
+// nor the namespace's existence is revealed (§7, §C.2 item 1).
 func (t *tx) reader(n *nsRow, cred Credentials, resource string) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	if cred.Edge != nil && cfg.Read != "public" && !t.e.opt.AuthDisabled {
 		return t.edgeReader(n, cred.Edge, resource)
 	}
-	return t.readerCheck(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) })
+	return t.readerCheckURL(n, cred, func(a *actor) bool { return t.canRead(n, cfg, a, resource) }, true)
 }
 
 // nsReader is reader for /ns/{ns} and the URLs under it, but the gestures
@@ -480,7 +482,19 @@ func (t *tx) anyReader(n *nsRow, cred Credentials) (*actor, *Error) {
 	})
 }
 
+// readerCheck authenticates a read that isn't of a resource URL, such as
+// /ns/{ns} and the URLs under it, or POST /ns/{ns}/keys, and decides
+// access with may. A grant its key's scope doesn't allow (sub, groups,
+// maxTtl, requireAt, readScope …) is 403 there, as for a write: only a
+// read of a resource URL in a private namespace answers 404 (§C.2 item
+// 1, §7). A verified grant that may not read is 404.
 func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*actor, *Error) {
+	return t.readerCheckURL(n, cred, may, false)
+}
+
+// readerCheckURL is readerCheck; resourceURL for a read of a resource URL
+// (reader), where a key-scope failure is 404.
+func (t *tx) readerCheckURL(n *nsRow, cred Credentials, may func(*actor) bool, resourceURL bool) (*actor, *Error) {
 	cfg := t.config(n.configSeq)
 	var a *actor
 	if t.e.opt.AuthDisabled {
@@ -500,6 +514,9 @@ func (t *tx) readerCheck(n *nsRow, cred Credentials, may func(*actor) bool) (*ac
 		case g == nil && err.Status == 403:
 			return nil, err // not named
 		case err.Status == 401 || err.Status == 413:
+			return nil, err
+		case !resourceURL:
+			// The key's scope refuses the grant (403, §C.2 item 1).
 			return nil, err
 		default:
 			return nil, notFound()

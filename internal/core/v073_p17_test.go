@@ -3,6 +3,7 @@ package core
 import (
 	"context"
 	"crypto/ed25519"
+	"strings"
 	"testing"
 	"time"
 
@@ -173,5 +174,96 @@ func TestV073P17BranchRoleRulesInFull(t *testing.T) {
 		if got := v073Status(err); got != c.want {
 			t.Errorf("%s: got %d (%v), want %d", c.name, got, err, c.want)
 		}
+	}
+}
+
+// A grant its key's scope doesn't allow (readScope, sub, groups, maxTtl,
+// requireAt) is 403 on every request that doesn't ignore it: writes,
+// /principal, POST /keys, and /ns/{ns} and the URLs under it in a private
+// namespace. Only a read of a resource URL there answers 404 (§C.2 item 1,
+// §7).
+func TestV073P17KeyScopeFailureIs403(t *testing.T) {
+	e := v073Engine(t, p17Fast(), p17Fast(), map[string]any{"read": "grant"})
+	ctx := context.Background()
+	var ks p17Keys
+	ks.add("admin", map[string]any{"can": []any{"*"}})
+	ks.add("scoped", map[string]any{"can": []any{"read", "create"}, "readScope": "resource"})
+	ks.add("subs", map[string]any{"can": []any{"read", "create"}, "sub": "user:a.*"})
+	ks.add("groups", map[string]any{"can": []any{"read", "create"}, "groups": map[string]any{"allow": []any{"staff"}}})
+	ks.add("ttl", map[string]any{"can": []any{"read", "create"}, "maxTtl": "PT1M"})
+	for _, ns := range []string{"p", "q"} {
+		doc := map[string]any{"read": "grant", "keys": ks.entries}
+		if ns == "q" {
+			doc["read"] = "public"
+		}
+		e.create(ns, doc)
+	}
+	admin := ks.mint(t, map[string]any{"kid": "admin", "sub": "user:root", "ns": []any{"p", "q"}, "can": []any{"read", "create"}})
+	w, err := e.WriteResource(ctx, Request{NS: "p", Cred: admin}, Item{Resource: "doc", IfNoneMatch: true,
+		Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.WriteResource(ctx, Request{NS: "q", Cred: admin}, Item{Resource: "doc", IfNoneMatch: true,
+		Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}}}}); err != nil {
+		t.Fatal(err)
+	}
+	gid, _ := w.Entry.Grant["id"].(string)
+	if gid == "" {
+		t.Fatal("the entry names no grant")
+	}
+	gesture := strings.Repeat("a", 26)
+	refused := map[string]Credentials{
+		"readScope": ks.mint(t, map[string]any{"kid": "scoped", "sub": "user:r", "ns": []any{"p", "q"}, "can": []any{"read"}}),
+		"sub":       ks.mint(t, map[string]any{"kid": "subs", "sub": "user:x", "ns": []any{"p", "q"}, "can": []any{"read"}}),
+		"groups":    ks.mint(t, map[string]any{"kid": "groups", "sub": "user:g", "groups": []any{"guests"}, "ns": []any{"p", "q"}, "can": []any{"read"}}),
+		"maxTtl":    ks.mint(t, map[string]any{"kid": "ttl", "sub": "user:t", "ns": []any{"p", "q"}, "can": []any{"read"}}),
+	}
+	for name, cred := range refused {
+		ns := map[string]func() error{
+			"GET /ns/p":            func() error { _, err := e.NamespaceHead(ctx, "p", cred); return err },
+			"GET /ns/p/log":        func() error { _, err := e.NamespaceLog(ctx, "p", "", "", 0, cred); return err },
+			"GET /ns/p/events":     func() error { _, err := e.NamespaceEvents(ctx, "p", "", 0, cred); return err },
+			"GET /ns/p/heads":      func() error { _, err := e.NamespaceHeads(ctx, "p", "", "", cred); return err },
+			"GET /ns/p/branches":   func() error { _, _, err := e.Branches(ctx, "p", cred); return err },
+			"GET /ns/p/grants/…":   func() error { _, err := e.Grant(ctx, "p", gid, cred); return err },
+			"GET /ns/p/gestures/…": func() error { _, err := e.Gestures(ctx, "p", gesture, "", cred); return err },
+			"POST /ns/p/keys":      func() error { _, err := e.Keys(ctx, "p", cred, KeysRequest{}); return err },
+			"GET /ns/p/principal":  func() error { _, err := e.Principal(ctx, "p", cred); return err },
+			"GET /ns/q/principal":  func() error { _, err := e.Principal(ctx, "q", cred); return err },
+			"PATCH /r/p/new":       func() error { _, err := v073CreateIn(e.Engine, "p", cred, "new"); return err },
+			"PATCH /r/q/new":       func() error { _, err := v073CreateIn(e.Engine, "q", cred, "new"); return err },
+		}
+		for what, call := range ns {
+			if err := call(); v073Status(err) != 403 {
+				t.Errorf("%s grant, %s: want 403, got %v", name, what, err)
+			}
+		}
+		res := map[string]func() error{
+			"GET /r/p/doc":     func() error { _, err := e.ResourceHead(ctx, "p", "doc", cred); return err },
+			"GET /r/p/doc/log": func() error { _, err := e.ResourceLog(ctx, "p", "doc", "", "", 0, cred); return err },
+			"GET /r/p/doc/events": func() error {
+				_, err := e.ResourceEvents(ctx, "p", "doc", "", 0, cred)
+				return err
+			},
+			"GET /r/p/absent": func() error { _, err := e.ResourceHead(ctx, "p", "absent", cred); return err },
+		}
+		for what, call := range res {
+			if err := call(); v073Status(err) != 404 {
+				t.Errorf("%s grant, %s: want 404, got %v", name, what, err)
+			}
+		}
+		// A public namespace's reads ignore the grant (§7).
+		if _, err := e.NamespaceHead(ctx, "q", cred); err != nil {
+			t.Errorf("%s grant, GET /ns/q: %v", name, err)
+		}
+		if _, err := e.ResourceHead(ctx, "q", "doc", cred); err != nil {
+			t.Errorf("%s grant, GET /r/q/doc: %v", name, err)
+		}
+	}
+	// A verified grant without read keeps the 404 of a read it may not make.
+	writer := ks.mint(t, map[string]any{"kid": "admin", "sub": "user:w", "ns": []any{"p"}, "can": []any{"create"}})
+	if _, err := e.NamespaceHead(ctx, "p", writer); v073Status(err) != 404 {
+		t.Errorf("grant without read, GET /ns/p: want 404, got %v", err)
 	}
 }
