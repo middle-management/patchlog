@@ -78,6 +78,10 @@ type ExportOptions struct {
 	ForeignParents bool
 	// Recipients seal the bundle to their X25519 public keys (§G.5.1.1).
 	Recipients []*ecdh.PublicKey
+	// Pad pads each sealed line's plaintext to its §E.2.2 bucket, so the
+	// line sizes a sealed bundle shows say less (§G.5.1.1). Only with
+	// Recipients.
+	Pad bool
 	// Plaintext allows writing lines of private and sealed namespaces
 	// unsealed; without it or Recipients, Write refuses (§G.5.1).
 	Plaintext bool
@@ -770,6 +774,7 @@ func (p *ExportPlan) Write(ctx context.Context, w io.Writer) (*Summary, error) {
 		if sw, err = NewSealedWriter(w, p.opt.Recipients); err != nil {
 			return nil, err
 		}
+		sw.Pad = p.opt.Pad
 		w = sw
 	}
 	bw, err := NewWriter(w, p.Header())
