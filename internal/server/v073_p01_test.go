@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+
+	"github.com/middle-management/patchlog/internal/core"
 )
 
 // sendRaw sends a request built by hand, for headers req can't express
@@ -575,4 +577,21 @@ func TestV073LiveQuery(t *testing.T) {
 	expect(t, e.get("/ns/pub/log?cursor=0"), 302)
 	expect(t, e.get("/r/pub/a/log?live=long-poll&cursor=007"), 200)
 	expect(t, e.get("/ns/pub/log?live=long-poll"), 200)
+}
+
+// §6.6 (GB-47): a config write's, a namespace creation's and a branch's
+// body is cut off as a resource PATCH's is, naming documentSize with the
+// deployment's maximum.
+func TestV073PatchBodiesNameDocumentSize(t *testing.T) {
+	t.Parallel()
+	l := core.DefaultLimits()
+	l.DocumentSize, l.PatchSetSize = 64<<10, 16<<10
+	e := newEnv(t, func(o *core.Options) { o.Limits, o.Maximums = l, l })
+	e.mkNS("b", map[string]any{})
+	bound := 4 * (64 << 10)
+	pad := strings.Repeat("x", 300<<10)
+	expectLimit(t, e.write("PATCH", "b", "r", "", addRoot(map[string]any{"a": pad})), 413, "documentSize", int64(bound+1), 64<<10)
+	expectLimit(t, e.patchNS("b", ops(op("add", "/x-a", pad)), ""), 413, "documentSize", int64(bound+1), 64<<10)
+	expectLimit(t, e.do(req{method: "PATCH", path: "/ns/c", ifNoneMatch: "*", body: addRoot(map[string]any{"x-a": pad}), author: "admin"}), 413, "documentSize", int64(bound+1), 64<<10)
+	expectLimit(t, e.branch("b", map[string]any{"name": "b1", "patches": ops(op("add", "/x-a", pad))}, "alice"), 413, "documentSize", int64(bound+1), 64<<10)
 }

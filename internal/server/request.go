@@ -86,18 +86,15 @@ func tooLarge(n int, lim bodyLimit) error {
 		"limit": lim.key, "measured": int64(n), "max": int64(lim.max)}}
 }
 
-// patchBody bounds the body of a resource or namespace patch set, read
-// before step 1 of §6.2, so by the deployment's maximum (§6.6): four times
-// its larger bound, room for JSON text laid out at length. lim names
-// documentSize for resources, whose whole-document patch sets it bounds,
-// and patchSetSize for namespace documents and branches.
-func (s *Server) patchBody(resource bool) (int, bodyLimit) {
+// patchBody bounds a PATCH-type body, read before step 1 of §6.2, so by
+// the deployment's maximums (§6.6): four times the larger of patchSetSize
+// and documentSize, room for JSON text laid out at length. A longer body
+// names documentSize with the deployment's maximum, for a resource patch
+// and equally for a config write, a namespace's creation and a branch's
+// creation, whose bodies are cut off as a resource PATCH's are (§6.6).
+func (s *Server) patchBody() (int, bodyLimit) {
 	l := s.e.Limits()
-	lim := bodyLimit{"patchSetSize", l.PatchSetSize}
-	if resource {
-		lim = bodyLimit{"documentSize", l.DocumentSize}
-	}
-	return 4 * max(l.PatchSetSize, l.DocumentSize), lim
+	return 4 * max(l.PatchSetSize, l.DocumentSize), bodyLimit{"documentSize", l.DocumentSize}
 }
 
 // JSON request bodies' media types (§7.2): JSON Patch for resource and

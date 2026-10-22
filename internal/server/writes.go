@@ -34,7 +34,7 @@ func (s *Server) resourcePatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	bound, lim := s.patchBody(true)
+	bound, lim := s.patchBody()
 	body, err := readJSON(r, bound, lim)
 	if err != nil {
 		writeErr(w, err)
@@ -213,7 +213,7 @@ func (s *Server) nsPatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	bound, lim := s.patchBody(false)
+	bound, lim := s.patchBody()
 	body, err := readJSON(r, bound, lim)
 	if err != nil {
 		writeErr(w, err)
@@ -262,7 +262,7 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	bound, lim := s.patchBody(false)
+	bound, lim := s.patchBody()
 	body, err := readJSON(r, bound, lim)
 	if err != nil {
 		writeErr(w, err)
