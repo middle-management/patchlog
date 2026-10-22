@@ -130,8 +130,9 @@ func TestBatchSourceChecked(t *testing.T) {
 	// available through a good one.
 	expectCode(t, batch(plain("x5"), map[string]any{"ns": "other", "at": bogus}, og), 422, "source")
 	expect(t, batch(withBlob("a"), map[string]any{"ns": "other", "at": at}, og), 201)
-	// An origin equal to this deployment's own.
-	expectCode(t, batch(plain("x7"), map[string]any{"origin": "https://cms.example", "ns": "other", "at": at}, ""), 422, "invalid")
+	// An origin equal to this deployment's own: 422 source, for any
+	// caller (§7.5, §12.1).
+	expectCode(t, batch(plain("x7"), map[string]any{"origin": "https://cms.example", "ns": "other", "at": at}, ""), 422, "source")
 }
 
 // §7.8 Availability: through a batch's source, a blob attached in a base

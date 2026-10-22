@@ -15,7 +15,6 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/patch"
 	"github.com/middle-management/patchlog/internal/rules"
-	"github.com/middle-management/patchlog/internal/schema"
 )
 
 // Step is one step of a write: a patch set, or a delete.
@@ -94,10 +93,17 @@ type WriteResult struct {
 	Entry    *LogEntry // single writes: the resulting entry
 	Replayed bool
 	ConfigID string
+	// ConfigReport is a dry run's report of its config change (§7.5):
+	// { status: 201, config } with the id a submit would produce,
+	// { status: 200, config } for an idempotent retry, or a failure after
+	// the change's step 1 as { status, code, … }. Nil without one.
+	ConfigReport map[string]any
 }
 
 // ItemResult lists the ids an item produced. In a dry-run report it also
-// carries the item's index and status, and a failed item's error body.
+// carries the item's index and status (201 for one that would pass, 200
+// in a batch a submit would answer as a retry), and a failed item's error
+// body.
 type ItemResult struct {
 	Resource string         `json:"resource"`
 	IDs      []string       `json:"ids,omitempty"`
@@ -144,6 +150,34 @@ func dropFailed(st []*itemState, fs []itemErr, fails map[int]*Error) []*itemStat
 	return out
 }
 
+// retryReport is a dry run's report of a batch a submit would answer as
+// an idempotent retry (§7.5): every item at status 200 with its ids, and
+// the config change at 200 with its id. No namespace entry is named.
+func retryReport(items []Item, r *WriteResult) *WriteResult {
+	out := &WriteResult{Status: 200, Replayed: true, Items: make([]ItemResult, len(items))}
+	for i, it := range items {
+		idx := i
+		out.Items[i] = ItemResult{Resource: it.Resource, Index: &idx, Status: 200}
+		if i < len(r.Items) {
+			out.Items[i].IDs = r.Items[i].IDs
+		}
+	}
+	if r.ConfigID != "" {
+		out.ConfigReport = map[string]any{"status": 200, "config": r.ConfigID}
+	}
+	return out
+}
+
+// reportOf is a failure as a dry run reports it (§7.5): its error body
+// with its status.
+func reportOf(e *Error) map[string]any {
+	m := map[string]any{"status": e.Status}
+	for k, v := range e.Body {
+		m[k] = v
+	}
+	return m
+}
+
 // dryRunReport is a dry run's report (§7.5). An item whose only failure
 // is a blob that isn't available reports that failure with the ids a
 // submit would produce once the blob is; one that also fails a later step
@@ -169,7 +203,7 @@ func dryRunReport(items []Item, passed []*itemState, fails, blobFails map[int]*E
 				r.Err = body
 			}
 		} else if s := byIndex[i]; s != nil {
-			r.Status = 200
+			r.Status = 201
 			if berr != nil {
 				r.Status, r.Err = berr.Status, berr.Body
 			}
@@ -494,22 +528,28 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		for _, s := range st {
 			s.cands = nil
 			for j := range s.Steps {
-				if j == 0 && hasCandidates(s.Item) {
-					// Append or restore, which only the resource's state
-					// decides: both are tried, and step 2 settles it (§6.2).
+				if verbs := candidateVerbs(s.Item); j == 0 && verbs != nil {
+					// Verbs only the resource's state decides: each is
+					// tried, and the item passes if any does (§C.2 item 2).
+					// Under If-Match step 2 settles it; without a
+					// precondition step 2.5 answers 428.
 					var first *Error
-					for _, verb := range []string{"append", "restore"} {
+					var passed []string
+					for _, verb := range verbs {
 						if err := t.authorize(a, verb, s.Resource); err != nil {
 							if first == nil {
 								first = err
 							}
 							continue
 						}
-						s.cands = append(s.cands, verb)
+						passed = append(passed, verb)
 					}
-					if len(s.cands) == 0 {
+					if len(passed) == 0 {
 						fs = append(fs, itemErr{s.index, first})
 						break
+					}
+					if hasCandidates(s.Item) {
+						s.cands = passed
 					}
 					continue
 				}
@@ -524,29 +564,38 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 
 	cfg := cur
 	var cplan *configPlan
+	// A dry run reports its config change as config (§7.5): the id a
+	// submit would produce, or a failure after the change's step 1, which
+	// leaves the items judged against the current configuration.
+	var cfgReport map[string]any
+	cfgFailed := false
+	drawn := rateDrawn
 	if cc != nil {
+		// A failure of the change's step 1 answers the batch, a dry run
+		// included, as that config write would (§7.5), drawing nothing.
+		if err := t.authorize(a, "config", ""); err != nil {
+			return nil, nil, err
+		}
 		p, err := t.planConfig(n, cur, a, cc, true)
 		if err != nil {
-			// A retried batch finds its config precondition stale: look
-			// for the batch it would have produced first (§7.5, §7.2).
 			var ae *Error
-			if errors.As(err, &ae) && ae.Status == 412 && cc.IfMatch != "" {
-				// Signatures aren't checked: they come after the retry
-				// lookup (§6.2 step 2.3), which answers a retry as first
-				// recorded whatever it carries. If the lookup finds
-				// nothing, the batch fails with its config change's error,
-				// so no item is ever judged under the wrong configuration
-				// (§C.3.1 "Requiring signatures").
-				if pid, perr := ids.Parse(cc.IfMatch); perr == nil && len(authorizeItems(a)) == 0 {
-					// The request passed step 1, so it draws its tokens,
-					// even though the replay lookup ends it (§6.6, §6.2).
-					// Its config change costs a token unless a * key
-					// made it (§6.6); whether it was only a freeze isn't
-					// known once the precondition failed.
-					cost := len(items)
-					if !a.star {
-						cost++
-					}
+			if !errors.As(err, &ae) {
+				return nil, nil, err
+			}
+			// The change failed after its step 1. The batch draws its
+			// tokens once its items pass step 1 too, as when the change
+			// passes, so a submit and its dry run draw alike (§6.6): a
+			// token per item, and one for the change unless a * key made
+			// it, since whether it was only a freeze isn't known once it
+			// failed (F-G4). A submit is then answered with the change's
+			// error, which a dry run reports, judging the items against
+			// the current configuration.
+			if len(authorizeItems(a)) == 0 {
+				cost := len(items)
+				if !a.star {
+					cost++
+				}
+				if cost > 0 {
 					names := make([]string, len(items))
 					for i, it := range items {
 						names[i] = it.Resource
@@ -554,30 +603,54 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 					if err := t.rateLimit(n, cur, a, names, cost); err != nil {
 						return nil, nil, err
 					}
+					drawn = true
 					if t.rateDrawn != nil {
 						*t.rateDrawn = true
 					}
+				}
+				// A retried batch finds its config precondition stale:
+				// look for the batch it would have produced first (§7.5,
+				// §7.2). Signatures aren't checked: they come after the
+				// retry lookup (§6.2 step 2.3), which answers a retry as
+				// first recorded whatever it carries. If the lookup finds
+				// nothing, the batch fails with its config change's
+				// error, so no item is ever judged under the wrong
+				// configuration (§C.3.1 "Requiring signatures").
+				if pid, perr := ids.Parse(cc.IfMatch); ae.Status == 412 && cc.IfMatch != "" && perr == nil {
 					exp := ids.Revision(&pid, jsonv.Canonical(cc.Patches))
 					if r := t.replay(n, a, st, &configPlan{expected: &exp}, true); r != nil {
 						// It is that batch, but the lookup doesn't apply
 						// to a purged resource (§6.2 step 2, §7.2): 410
 						// for its items, not a 412 that would invite the
-						// client to apply its config change again.
-						if pf := t.purgedItems(n, st); len(pf) > 0 {
+						// client to apply its config change again. A dry
+						// run reports them, and the change's 412.
+						pf := t.purgedItems(n, st)
+						switch {
+						case len(pf) == 0 && dryRun:
+							return nil, retryReport(items, r), nil
+						case len(pf) == 0:
+							return nil, r, nil
+						case !dryRun:
 							return nil, nil, fail(pf)
 						}
-						return nil, r, nil
 					}
 				}
 			}
-			return nil, nil, err
-		}
-		cplan = p
-		cfg = p.cfg
-		if len(items) > 0 {
-			a, aerr = t.authenticate(n.name, n, cfg, req.Cred, nil)
-			if aerr != nil {
-				return nil, nil, aerr
+			if !dryRun {
+				return nil, nil, err
+			}
+			cfgReport, cfgFailed = reportOf(ae), true
+		} else {
+			cplan = p
+			cfg = p.cfg
+			if len(items) > 0 {
+				a, aerr = t.authenticate(n.name, n, cfg, req.Cred, nil)
+				if aerr != nil {
+					return nil, nil, aerr
+				}
+			}
+			if dryRun {
+				cfgReport = map[string]any{"status": 201, "config": p.id.String()}
 			}
 		}
 	}
@@ -589,7 +662,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	// A batch costs a token per item, and one for its config change unless
 	// that is exempt (§6.6), so only a batch with no items and an exempt
-	// change costs nothing.
+	// change costs nothing. One whose change failed drew above.
 	cost := len(items)
 	if cplan != nil && !cplan.exempt {
 		cost++
@@ -606,7 +679,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 		for _, it := range items {
 			names = append(names, it.Resource)
 		}
-		if !rateDrawn && (t.rateDrawn == nil || !*t.rateDrawn) {
+		if !drawn && (t.rateDrawn == nil || !*t.rateDrawn) {
 			if err := t.rateLimit(n, cfg, a, names, cost); err != nil {
 				return nil, nil, err
 			}
@@ -623,16 +696,25 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 
 	// Step 2: precondition — idempotent retry, settling the verb, frozen,
 	// the precondition. The retry lookup doesn't apply to a purged
-	// resource: the answer is 410, as for every URL of it, before the
-	// frozen check (§6.2 step 2, §7.2, §8.3).
+	// resource, nor to one a branch answers 502 upstream for: the answer is
+	// 410, as for every URL of it, or that 502, before the frozen check
+	// (§1, §6.2 step 2.1, §7.2, §8.3).
 	if pf := t.purgedItems(n, st); len(pf) > 0 {
 		if !dryRun {
 			return nil, nil, fail(pf)
 		}
 		st = dropFailed(st, pf, dryFails)
 	}
-	if r := t.replay(n, a, st, cplan, isBatch); r != nil {
-		return nil, r, nil
+	// A dry run looks for the batch a submit would be answered with only
+	// while every item is still checked, and never without the config
+	// change it carries, whose failure the lookup above answered.
+	if !cfgFailed && (!dryRun || len(dryFails) == 0) {
+		if r := t.replay(n, a, st, cplan, isBatch); r != nil {
+			if dryRun {
+				return nil, retryReport(items, r), nil
+			}
+			return nil, r, nil
+		}
 	}
 	// Settling the verb completes authorisation: a 403 here is reported
 	// like one of step 1, and a dry run answers it as a submit would
@@ -733,6 +815,17 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			return nil, nil, limitErr(422, "batchSize", int64(size), int64(maxSize), "batch too large")
 		}
 	}
+	// Then the batch's source, before any item's own limits and so before
+	// blob references, which may depend on it (§7.5, §7.8).
+	var src any
+	var bs *batchSource
+	if isBatch && source != nil {
+		var err *Error
+		src, bs, err = t.checkSource(req, source)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 	for _, s := range st {
 		readable := func() bool { return t.canRead(n, cfg, a, s.Resource) }
 		if err := checkLimits(cfg.Limits, s, readable); err != nil {
@@ -744,17 +837,6 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			return nil, nil, fail(fs)
 		}
 		st, fs = dropFailed(st, fs, dryFails), nil
-	}
-	// A batch's source, then blob references naming available blobs
-	// (§7.5, §7.8), also at step 4: the blobs may depend on the source.
-	var src any
-	var bs *batchSource
-	if isBatch && source != nil {
-		var err *Error
-		src, bs, err = t.checkSource(req, source)
-		if err != nil {
-			return nil, nil, err
-		}
 	}
 	// A dry run reports a blob that isn't available, and runs the later
 	// steps as if it were (§7.5).
@@ -838,9 +920,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	if dryRun {
 		// A dry run reports every item (§7.5): its ids, or the error of the
-		// step it failed at.
+		// step it failed at, and its config change.
 		result.Status = 200
 		result.Items = dryRunReport(items, st, dryFails, blobFails)
+		result.ConfigReport = cfgReport
 		return nil, result, nil
 	}
 
@@ -961,6 +1044,23 @@ func hasCandidates(it Item) bool {
 	return it.IfMatch != "" && !it.IfNoneMatch && len(it.Steps) > 0 && !it.Steps[0].Delete
 }
 
+// candidateVerbs are the verbs step 1 checks for an item's first step when
+// the request doesn't fix one (§C.2 item 2): append and restore for a
+// patch set under If-Match, and create, append and restore for one without
+// a precondition, which then gets 428 at step 2.5. Nil when the request
+// fixes the verb (staticVerb).
+func candidateVerbs(it Item) []string {
+	switch {
+	case len(it.Steps) == 0 || it.Steps[0].Delete:
+		return nil
+	case hasCandidates(it):
+		return []string{"append", "restore"}
+	case it.IfMatch == "" && !it.IfNoneMatch:
+		return []string{"create", "append", "restore"}
+	}
+	return nil
+}
+
 // settle is the second sub-step of step 2 (§6.2): it settles the verb of
 // an item with candidate verbs from the resource's state as the writer sees
 // it (a branch's view, read-through included), and refuses one that isn't
@@ -992,7 +1092,8 @@ func (t *tx) entryVerb(row *revRow) string {
 }
 
 // staticVerb is the verb of step j known from the request. The first patch
-// step of an If-Match item has candidate verbs instead (hasCandidates).
+// step of an item under If-Match, or without a precondition, has candidate
+// verbs instead (candidateVerbs).
 func staticVerb(it Item, j int) string {
 	s := it.Steps[j]
 	if s.Delete {
@@ -1042,22 +1143,27 @@ func expectedIDs(s *itemState) ([]ids.ID, bool) {
 	return out, true
 }
 
-// purgedItems answers 410 for each item whose resource is purged, as the
-// writer sees it (§7.6): the idempotent-retry lookup doesn't apply to it
-// (§6.2 step 2, §7.2), and every URL of it is 410 (§8.3).
+// purgedItems answers step 2.1's refusals before the retry lookup, which
+// doesn't apply to them (§6.2 step 2, §7.2): the 502 upstream of a
+// resource whose source was raised to a level this server lacks
+// (upstreamRefusal, §1), and 410 for each item whose resource is purged,
+// as the writer sees it (§7.6), as every URL of it is (§8.3).
 func (t *tx) purgedItems(n *nsRow, st []*itemState) []itemErr {
 	var fs []itemErr
 	for _, s := range st {
-		if t.resolve(n, s.Resource, nil).state == Purged {
+		if err := t.upstreamRefusal(n, s.Resource); err != nil {
+			fs = append(fs, itemErr{s.index, err})
+		} else if t.resolve(n, s.Resource, nil).state == Purged {
 			fs = append(fs, itemErr{s.index, gone()})
 		}
 	}
 	return fs
 }
 
-// replay implements the idempotent-retry lookup (§7.2, §7.5). Callers
-// answer a purged resource first (purgedItems): the lookup doesn't apply
-// to one.
+// replay implements the idempotent-retry lookup (§7.2, §7.5): the entry
+// this request would have produced, written by the same principal, the
+// same author under the same root sub and kid (sameRoot). Callers answer a
+// purged resource first (purgedItems): the lookup doesn't apply to one.
 func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch bool) *WriteResult {
 	author := t.actorID(a)
 	if !isBatch {
@@ -1075,7 +1181,7 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		}
 		last := want[len(want)-1]
 		row, err := scanRev(t.QueryRow(`SELECT `+revCols+` FROM revisions WHERE res = ? AND id = ?`, own.id, last[:]))
-		if err != nil || row.author != author {
+		if err != nil || row.author != author || !t.sameRoot(row.grantID, a) {
 			return nil
 		}
 		if s.cands != nil && !contains(s.cands, t.entryVerb(row)) {
@@ -1156,9 +1262,12 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 	}
 	var match []byte
 	for _, seq := range cands {
-		var id []byte
+		var id, gid []byte
 		var body string
-		if t.QueryRow(`SELECT id, body FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body) != nil {
+		if t.QueryRow(`SELECT id, body, grant_id FROM ns_log WHERE seq = ? AND ns = ? AND kind = ? AND author = ?`, seq, n.id, nsKindCode("batch"), author).Scan(&id, &body, &gid) != nil {
+			continue
+		}
+		if !t.sameRoot(gid, a) {
 			continue
 		}
 		b := jsonv.MustParse([]byte(body)).(map[string]any)
@@ -1175,6 +1284,23 @@ func (t *tx) replay(n *nsRow, a *actor, st []*itemState, cp *configPlan, isBatch
 		r.ConfigID = cp.expected.String()
 	}
 	return r
+}
+
+// sameRoot reports whether an entry recorded under grant gid (nil for
+// none), whose author matched, was written by the principal of a: the same
+// root sub and kid (§7.2, §7.5). An entry that records no grant, written
+// while authentication was disabled or before grants were recorded
+// (v0.37), and any entry for a request made while it is disabled, match on
+// the author alone. samePrincipal is this for a namespace entry.
+func (t *tx) sameRoot(gid []byte, a *actor) bool {
+	if a.grant == nil || gid == nil {
+		return true
+	}
+	if len(a.grant.Blocks) == 0 {
+		return false
+	}
+	ref, root := t.grantRef(gid), a.grant.Blocks[0]
+	return ref != nil && ref["sub"] == root.Sub && ref["kid"] == root.Kid
 }
 
 // candidateVerbsMatch reports whether every item with candidate verbs
@@ -1197,16 +1323,28 @@ func (t *tx) candidateVerbsMatch(n *nsRow, st []*itemState) bool {
 	return true
 }
 
-// precondition is step 2 for one item (§7.2, §7.6 first writes).
+// precondition is step 2.5 for one item (§6.2, §7.2, §7.6 first writes).
+// What the request alone decides comes first: a "delete" step right after
+// another (§7.5), then a "delete" under If-None-Match (428), then the
+// comparison with the resource's state.
 func (t *tx) precondition(n *nsRow, s *itemState) *Error {
+	for j := 1; j < len(s.Steps); j++ {
+		if s.Steps[j].Delete && s.Steps[j-1].Delete {
+			return doubleDelete()
+		}
+	}
+	if s.IfNoneMatch && s.IfMatch == "" && len(s.Steps) > 0 && s.Steps[0].Delete {
+		// Not the precondition a delete takes, whatever the resource's
+		// state (§7.5, §12.1), as for a DELETE with If-None-Match: *.
+		return apiErr(428, "precondition_required", "message", "a delete takes If-Match")
+	}
 	v := t.resolve(n, s.Resource, nil)
 	s.view = v
+	// A 412 names the head where there is one; with none, no member (§12.1).
 	headErr := func() *Error {
 		e := apiErr(412, "stale")
 		if v.head != nil {
 			e.Body["head"] = v.head.id.String()
-		} else {
-			e.Body["head"] = nil
 		}
 		return e
 	}
@@ -1219,6 +1357,10 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 			return nil
 		case Purged:
 			return gone()
+		case Tombstoned:
+			// Never a 412, which a client could read as "exists, restore
+			// it" (§7.2, §8.1).
+			return gone("head", v.head.id.String())
 		default:
 			return headErr()
 		}
@@ -1234,7 +1376,7 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 			return headErr()
 		case Tombstoned:
 			if want != v.head.id || s.Steps[0].Delete {
-				return gone("tombstone", v.head.id.String())
+				return gone("head", v.head.id.String())
 			}
 		case Live:
 			if want != v.head.id {
@@ -1248,8 +1390,9 @@ func (t *tx) precondition(n *nsRow, s *itemState) *Error {
 	}
 }
 
-// doubleDelete answers a delete step right after another (§7.5): 422, as a
-// DELETE of a tombstoned resource is 410.
+// doubleDelete answers a delete step right after another (§7.5): 422 at
+// step 2.5, as a DELETE of a tombstoned resource is 410 there. Step 3
+// keeps the check for the steps it applies.
 func doubleDelete() *Error {
 	return apiErr(422, "invalid", "message", "a delete step can't follow another delete")
 }
@@ -1262,8 +1405,7 @@ func doubleDelete() *Error {
 // Each later step applies to a copy of the document before it; the first
 // applies in place to the parent's, which is parsed for this item alone.
 func (t *tx) applySteps(s *itemState) *Error {
-	var doc any
-	exists := false
+	var doc any   // a create's: the document null (§6.2 step 3)
 	owned := true // doc is no step's yet: nil, or the parent's parsed here
 	var parentID *ids.ID
 	tomb := false
@@ -1280,7 +1422,7 @@ func (t *tx) applySteps(s *itemState) *Error {
 			}
 			return gone()
 		}
-		doc, exists = d, true
+		doc = d
 		p := s.parent.id
 		parentID = &p
 		tomb = s.parent.kind == kindTombstone
@@ -1312,19 +1454,29 @@ func (t *tx) applySteps(s *itemState) *Error {
 			if err != nil {
 				return patchErr(err)
 			}
-			if m, ok := doc.(map[string]any); ok && exists {
+			if m, ok := doc.(map[string]any); ok {
 				// Before the patches apply: in place, they change doc.
 				ss.prevNonce, _ = m["$nonce"].(string)
 			}
-			nd, writes, err := patch.Apply(doc, exists, ops, patch.Options{ResourceEnvelope: true, InPlace: owned, ShareLast: true})
+			// A create's patches apply to the document null, not to "no
+			// document": test "" null, and a root replace, copy or move,
+			// work on it (§6.2 step 3).
+			nd, writes, err := patch.Apply(doc, true, ops, patch.Options{ResourceEnvelope: true, InPlace: owned, ShareLast: true})
 			if err != nil {
 				return patchErr(err)
+			}
+			if nd == nil && len(writes) == 0 && ss.action == "create" {
+				// A create that writes nothing, [] or only tests, makes no
+				// document, as before creates applied to null; one that
+				// writes null stores it (F-G3). Writes are §6.3's, so a
+				// root copy or move onto itself, which writes "", does.
+				return patchErr(&patch.Error{Index: len(ops), Message: "a create must write the document; it applies to null (§6.2 step 3)"})
 			}
 			ss.canon = s.canon(j)
 			ss.id = s.revID(j, parentID)
 			ss.doc = nd
 			ss.writes = patch.WritesStrings(writes)
-			doc, exists, tomb = nd, true, false
+			doc, tomb = nd, false
 		}
 		owned = false
 		id := ss.id
@@ -1417,363 +1569,6 @@ func checkDocument(l Limits, step *stepState) *Error {
 	return checkBlobRefs(l, step.doc)
 }
 
-// validateDoc is step 5: resolve $schema and validate (§6.1). It returns the
-// document's $schema, if typed.
-func (t *tx) validateDoc(doc any, sc *schemaCtx, pending map[string]any) (string, *Error) {
-	m, ok := doc.(map[string]any)
-	if !ok {
-		return "", nil
-	}
-	sv, has := m["$schema"]
-	if !has {
-		return "", nil
-	}
-	s, _ := sv.(string)
-	load := func(ref schema.Ref) (any, error) { return t.loadSchema(ref, sc, pending) }
-	// The validator keeps compiled schemas across writes and writers, so
-	// availability and read permission are checked here for the whole
-	// $ref closure.
-	// A schema document (a dialect $schema) starts the closure at its own
-	// $refs, so a cached revision the writer may not read is still refused,
-	// and the error names the revision that didn't resolve, not the dialect.
-	var queue []schema.Ref
-	if r, ok := schema.ParseRef(s); ok {
-		queue = []schema.Ref{r}
-	} else if schema.IsDialect(s) {
-		queue = schema.Refs(doc)
-	}
-	{
-		seen := map[string]bool{}
-		for len(queue) > 0 {
-			r := queue[0]
-			queue = queue[1:]
-			if seen[r.Path()] {
-				continue
-			}
-			seen[r.Path()] = true
-			d, err := load(r)
-			if err != nil {
-				return "", schemaErr(err, r.Path())
-			}
-			queue = append(queue, t.schemaRefs(r, d, sc, pending)...)
-		}
-	}
-	if err := t.e.validator.Validate(doc, load); err != nil {
-		return "", schemaErr(err, s)
-	}
-	return s, nil
-}
-
-// pinnedSchemas lists the schema revisions that the documents of a write's
-// steps pin by $schema, for step 5 to read them ahead (prefetchSchemas),
-// leaving out the paths of the write's own documents (pendingKey under
-// pns): loadSchema finds those among them, without reading their
-// namespace, when they come first. A schema document's $refs, and the
-// $ref closures, are resolved as they are reached (validateDoc).
-func pinnedSchemas(st []*itemState, pns string) []schema.Ref {
-	own := map[string]bool{}
-	for _, s := range st {
-		for _, step := range s.steps {
-			if !step.del && !step.sealed {
-				own[pendingKey(pns, s.Resource, step.id)] = true
-			}
-		}
-	}
-	var refs []schema.Ref
-	for _, s := range st {
-		for _, step := range s.steps {
-			if step.del || step.sealed {
-				continue
-			}
-			m, _ := step.doc.(map[string]any)
-			sv, _ := m["$schema"].(string)
-			if r, ok := schema.ParseRef(sv); ok && !own[r.Path()] {
-				refs = append(refs, r)
-			}
-		}
-	}
-	return refs
-}
-
-func schemaErr(err error, path string) *Error {
-	var re *schema.RefError
-	var ue *schema.UnavailableError
-	var ve *schema.ValidationError
-	var se *schema.SchemaError
-	switch {
-	case errors.As(err, &re):
-		return apiErr(422, "schema_ref", "message", re.Msg)
-	case errors.Is(err, schema.ErrBranch):
-		return apiErr(422, "schema_ref", "message", "a schema reference must not name a branch")
-	case errors.As(err, &ue):
-		return apiErr(422, "schema_unavailable", "ref", ue.Ref)
-	case schema.RefPath(err) != "":
-		// The revision that didn't resolve, wherever in the closure it is,
-		// never the document's own $schema (a dialect URL for a schema).
-		return apiErr(422, "schema_unavailable", "ref", schema.RefPath(err))
-	case errors.Is(err, schema.ErrUnavailable), errors.Is(err, schema.ErrForbidden):
-		return apiErr(422, "schema_unavailable", "ref", path)
-	case errors.As(err, &ve):
-		var details []any
-		for _, d := range ve.Errors {
-			details = append(details, map[string]any{"pointer": d.Pointer, "message": d.Message})
-		}
-		return apiErr(422, "invalid", "errors", details)
-	case errors.As(err, &se):
-		return apiErr(422, "invalid", "message", "invalid schema: "+se.Msg)
-	}
-	return invalid(err.Error())
-}
-
-// loadSchema resolves a schema revision path for a writer (§6.1): from the
-// write's own earlier items, in the path's namespace, or, in a write to a
-// branch, among the drafts in branches of that namespace (loadDraft). A
-// path naming a branch is ErrBranch, whatever the drafts.
-//
-// Within a transaction, which reads one snapshot, a path resolves the same
-// way for the same writer (sc) every time: the result is kept for the
-// transaction (t.schemas), so a batch's documents typed by the same schemas
-// resolve and parse each once, not once for every document and $ref.
-func (t *tx) loadSchema(ref schema.Ref, sc *schemaCtx, pending map[string]any) (any, error) {
-	if d, ok := pending[ref.Path()]; ok {
-		return d, nil
-	}
-	t.deps.addSchema(ref)
-	key := schemaKey{sc, ref.Path()}
-	if r, ok := t.schemas[key]; ok {
-		return r.doc, r.err
-	}
-	d, err := t.loadSchemaIn(ref, sc)
-	if err != nil && !errors.Is(err, schema.ErrBranch) {
-		if dd, ok := t.loadDraft(ref, sc); ok {
-			d, err = dd, nil
-		} else {
-			d = nil
-		}
-	}
-	if t.schemas == nil {
-		t.schemas = map[schemaKey]schemaLoaded{}
-	}
-	t.schemas[key] = schemaLoaded{doc: d, err: err}
-	return d, err
-}
-
-// schemaKey and schemaLoaded are a transaction's resolved schema paths
-// (loadSchema).
-type schemaKey struct {
-	sc   *schemaCtx
-	path string
-}
-
-type schemaLoaded struct {
-	doc any
-	err error
-	// refs is schema.Refs(doc), once hasRefs (schemaRefs).
-	refs    []schema.Ref
-	hasRefs bool
-}
-
-// schemaRefs is schema.Refs of d, the schema loadSchema resolved ref to,
-// kept with it for the transaction (t.schemas): every document typed by a
-// schema walks its $ref closure (validateDoc).
-func (t *tx) schemaRefs(ref schema.Ref, d any, sc *schemaCtx, pending map[string]any) []schema.Ref {
-	key := schemaKey{sc, ref.Path()}
-	l, ok := t.schemas[key]
-	if _, own := pending[key.path]; own || !ok {
-		return schema.Refs(d)
-	}
-	if !l.hasRefs {
-		l.refs, l.hasRefs = schema.Refs(d), true
-		t.schemas[key] = l
-	}
-	return l.refs
-}
-
-// loadSchemaIn resolves a schema revision path in its own namespace. The
-// writer needs read on the copy (§6.1 Read permission): in the namespace
-// written, with the write's own grant; in any other, by the rule for other
-// namespaces (§7.5). A revision it can't read there is ErrForbidden, which
-// falls through to drafts in a branch (loadSchema), as an absent one does.
-func (t *tx) loadSchemaIn(ref schema.Ref, sc *schemaCtx) (any, error) {
-	n := t.schemaNS(ref.NS)
-	if n == nil || n.purged {
-		return nil, schema.ErrUnavailable
-	}
-	if n.isBranch() {
-		return nil, schema.ErrBranch
-	}
-	if t.e2eContent(n, ref.Name) {
-		// The server can't read schemas in an e2e namespace (§E.3.2).
-		return nil, schema.ErrUnavailable
-	}
-	// A namespace that opens its schemas with schemaReads lets writes to a
-	// listed namespace resolve them without read (§6.1); only schema
-	// documents, checked once loaded.
-	var readable bool
-	if sc.target != nil && n.id == sc.target.id {
-		readable = t.canRead(n, t.config(n.configSeq), sc.a, ref.Name)
-	} else {
-		readable = t.credsRead(n, ref.Name, sc.creds)
-	}
-	if readable {
-		return t.schemaRevIn(n, ref)
-	}
-	if sc.target == nil || !t.schemaReadsServe(n, sc.target) {
-		return nil, schema.ErrForbidden
-	}
-	d, err := t.schemaRevIn(n, ref)
-	if err != nil {
-		return nil, err
-	}
-	if !schema.IsSchemaDoc(d) {
-		return nil, schema.ErrForbidden
-	}
-	return d, nil
-}
-
-// schemaNS is nsByName for the namespace of a schema path (loadSchemaIn),
-// which the transaction remembers (memo.schemaNS): a batch whose documents
-// are typed by many schemas of one namespace reads its row once, not once
-// per schema.
-func (t *tx) schemaNS(name string) *nsRow {
-	if n, ok := t.memo.schemaNS[name]; ok {
-		// Taking the lock (a row read while namespaces weren't locked,
-		// noLock) forgets the row, which is then read again under it.
-		t.lockNS(n.id, lockShared)
-		if n, ok := t.memo.schemaNS[name]; ok {
-			t.deps.addNS(&n)
-			return &n
-		}
-	}
-	n := t.nsByName(name)
-	if n != nil {
-		t.memoSchemaNS(n)
-	}
-	return n
-}
-
-func (t *tx) memoSchemaNS(n *nsRow) {
-	if t.memo.schemaNS == nil {
-		t.memo.schemaNS = map[string]nsRow{}
-	}
-	t.memo.schemaNS[n.name] = *n
-}
-
-// prefetchSchemas reads ahead what resolving refs, schema revision paths,
-// reads in storage (loadSchemaIn): the rows of their namespaces in one
-// statement, then for each namespace the rows of the resources they name
-// and of those resources' heads in two more (prefetchHeads). On Postgres
-// every namespace's lock is taken first, shared as nsByName takes it and
-// in ascending key order, and the rows are read once all are held
-// (pglock.go). loadSchemaIn then answers a path whose revision is its
-// resource's head from the transaction's memo; an older revision is looked
-// up in the resource's ancestry, and a schema's $ref closure resolved, as
-// before. (A batch whose documents were typed by a thousand schemas of one
-// namespace read three rows for each, a statement each: the namespace's,
-// the resource's and its head's.)
-func (t *tx) prefetchSchemas(refs []schema.Ref) {
-	byNS := map[string]map[string]bool{}
-	for _, r := range refs {
-		if byNS[r.NS] == nil {
-			byNS[r.NS] = map[string]bool{}
-		}
-		byNS[r.NS][r.Name] = true
-	}
-	if len(byNS) == 0 {
-		return
-	}
-	nsNames := sortedKeys(byNS)
-	if t.locking() {
-		want := map[int32]lockMode{}
-		var unknown []string
-		for _, name := range nsNames {
-			if v, ok := t.e.ids.nss.Load(name); ok {
-				want[lockKey(v.(int64))] = lockShared
-			} else {
-				unknown = append(unknown, name)
-			}
-		}
-		if len(unknown) > 0 {
-			rows, err := t.Query(`SELECT ns, name FROM namespaces WHERE `+t.e.inArray("name", "text"), t.e.arrayArg(unknown))
-			t.must(err)
-			for rows.Next() {
-				var id int64
-				var name string
-				t.must(rows.Scan(&id, &name))
-				want[lockKey(id)] = lockShared
-				if !t.dirty {
-					t.e.ids.nss.Store(name, id)
-				}
-			}
-			t.must(rows.Err())
-			rows.Close()
-		}
-		t.lockAll(want)
-	}
-	var read []string
-	for _, name := range nsNames {
-		if _, ok := t.memo.schemaNS[name]; !ok {
-			read = append(read, name)
-		}
-	}
-	if len(read) > 0 {
-		rows, err := t.Query(`SELECT `+nsCols+` FROM namespaces WHERE `+t.e.inArray("name", "text"), t.e.arrayArg(read))
-		t.must(err)
-		for rows.Next() {
-			n, err := scanNS(rows)
-			t.must(err)
-			if !n.isShadow() { // never a path's (nsByName)
-				t.memoSchemaNS(n)
-			}
-		}
-		t.must(rows.Err())
-		rows.Close()
-	}
-	for _, name := range nsNames {
-		n := t.schemaNS(name) // as loadSchemaIn reads it (writeDeps)
-		// loadSchemaIn reads no resource of a namespace that is unknown,
-		// purged, a branch or e2e.
-		if n == nil || n.purged || n.isBranch() || t.isE2E(n) {
-			continue
-		}
-		t.prefetchHeads(n, sortedKeys(byNS[name]), nil)
-	}
-}
-
-// schemaRevIn loads revision ref.Rev of resource ref.Name in n, a
-// namespace that isn't a branch: ErrUnavailable if unknown, purged,
-// pruned or a tombstone.
-func (t *tx) schemaRevIn(n *nsRow, ref schema.Ref) (any, error) {
-	v := t.resolve(n, ref.Name, nil)
-	if v.head == nil || v.state == Purged || v.state == NotFound {
-		return nil, schema.ErrUnavailable
-	}
-	id, err := ids.Parse(ref.Rev)
-	if err != nil {
-		return nil, schema.ErrUnavailable
-	}
-	row := t.findInAncestry(v.head, id)
-	if row == nil || row.kind == kindTombstone {
-		return nil, schema.ErrUnavailable
-	}
-	// A revision with its patch set is the document its id determines:
-	// parsed once, kept apart from the document cache, which a large write
-	// fills with its own (docBytesAt).
-	if row.patches.Valid {
-		if d, ok := t.e.schemaDocs.get(row.id); ok {
-			return d, nil
-		}
-	}
-	d, err := t.docAt(row)
-	if err != nil {
-		return nil, schema.ErrUnavailable
-	}
-	if row.patches.Valid {
-		t.e.schemaDocs.put(row.id, d)
-	}
-	return d, nil
-}
-
 // rulesRead reports whether a rule deciding a's verb in cfg may read the
 // change envelope's member m (§6.4.1): one of the namespace's rules, or of
 // the grant's key, block and role rules.
@@ -1832,50 +1627,6 @@ func (t *tx) stepEnvelope(s *itemState, step *stepState, a *actor, withPatches b
 		}
 	}
 	return env
-}
-
-// checkSource validates a batch's source at step 4 (§7.5). It returns the
-// source as recorded and, for a local source the caller may read
-// unrestricted (with the grant in Source-Authorization, if given), whose
-// source.at it checked, the source that makes blobs available (§7.8). Any
-// other caller's local source is recorded unchecked and makes no blobs
-// available, so the check reveals nothing about a namespace it can't read.
-func (t *tx) checkSource(req Request, v any) (any, *batchSource, *Error) {
-	m, ok := v.(map[string]any)
-	if !ok {
-		return nil, nil, invalid("source must be an object")
-	}
-	for k := range m {
-		switch k {
-		case "origin", "ns", "at", "bundle", "ids":
-		default:
-			return nil, nil, invalid("unknown source member " + k)
-		}
-	}
-	ns, _ := m["ns"].(string)
-	at, _ := m["at"].(string)
-	if !ValidNSName(ns) || at == "" {
-		return nil, nil, invalid("source needs ns and at")
-	}
-	if o, has := m["origin"]; has {
-		if o == t.e.opt.Origin {
-			return nil, nil, invalid("source origin is this deployment")
-		}
-		return m, nil, nil // another deployment's blobs are uploaded (§G.3)
-	}
-	sn := t.nsByName(ns)
-	if sn == nil || sn.purged || !t.sourceUnrestricted(sn, req) {
-		return m, nil, nil
-	}
-	id, err := ids.Parse(at)
-	if err != nil {
-		return nil, nil, apiErr(422, "source", "message", "source.at is not in the chain of source.ns")
-	}
-	seq, ok := t.nsLogSeq(sn.id, id)
-	if !ok {
-		return nil, nil, apiErr(422, "source", "message", "source.at is not in the chain of source.ns")
-	}
-	return m, &batchSource{n: sn, atSeq: seq}, nil
 }
 
 // actorID is authorID for an actor. Under a grant it also remembers the

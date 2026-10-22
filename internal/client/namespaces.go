@@ -604,8 +604,31 @@ type BatchItemResult struct {
 type BatchResult struct {
 	Status int    // 201, or 200 for a dry run or an idempotent retry
 	NSID   string // the batch entry ("" for a dry run)
-	Config string // the new config id, if the batch changed it
-	Items  []BatchItemResult
+	Config string // the new config id, if the batch changed it ("" for a dry run)
+	// ConfigReport is a dry run's report for its config change (§7.5):
+	// { status: 201, config } with the id a submit would produce, status
+	// 200 where the submit would be answered as a retry, or the change's
+	// failure after its step 1 as { status, code, … }. See ConfigError.
+	ConfigReport map[string]any
+	Items        []BatchItemResult
+	path         string
+}
+
+// ConfigError is a dry run's config change that fails after its step 1,
+// as the *APIError its submit would answer with (§7.5), or nil. Such a dry
+// run is 200, and judges its items against the current configuration.
+func (r *BatchResult) ConfigError() *APIError {
+	st, _ := r.ConfigReport["status"].(float64)
+	if st < 300 {
+		return nil
+	}
+	body := make(map[string]any, len(r.ConfigReport))
+	for k, v := range r.ConfigReport {
+		if k != "status" {
+			body[k] = v
+		}
+	}
+	return &APIError{Status: int(st), Code: str(body, "code"), Body: body, Method: "POST", Path: r.path}
 }
 
 func (b BatchRequest) body() (map[string]any, error) {
@@ -690,7 +713,14 @@ func (c *Client) Batch(ctx context.Context, ns string, b BatchRequest, dryRun bo
 		return nil, r.apiError()
 	}
 	m := r.obj()
-	res := &BatchResult{Status: r.status, NSID: r.header.Get("X-Namespace-Revision"), Config: str(m, "config")}
+	res := &BatchResult{Status: r.status, NSID: r.header.Get("X-Namespace-Revision"), path: "/ns/" + ns + "/batch"}
+	switch v := m["config"].(type) {
+	case string:
+		res.Config = v
+	case map[string]any:
+		// A dry run reports its config change (§7.5).
+		res.ConfigReport = v
+	}
 	if res.NSID == "" {
 		res.NSID = str(m, "ns_id")
 	}

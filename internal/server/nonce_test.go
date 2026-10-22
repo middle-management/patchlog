@@ -58,7 +58,7 @@ func TestNonceRequired(t *testing.T) {
 	r := e.do(req{method: "POST", path: "/ns/n/batch?dry-run=1", body: body, author: "alice"})
 	expect(t, r, 200)
 	rep := r.Obj()["items"].([]any)
-	if a, b, c := rep[0].(map[string]any), rep[1].(map[string]any), rep[2].(map[string]any); a["status"] != 200.0 || b["code"] != "nonce" || c["code"] != "nonce" {
+	if a, b, c := rep[0].(map[string]any), rep[1].(map[string]any), rep[2].(map[string]any); a["status"] != 201.0 || b["code"] != "nonce" || c["code"] != "nonce" {
 		t.Fatalf("dry run %s", r.Body)
 	}
 	r = e.batchReq("n", body, "alice")

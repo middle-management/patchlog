@@ -872,7 +872,7 @@ func TestBlobDryRun(t *testing.T) {
 	expect(t, r, 200)
 	items := r.Obj()["items"].([]any)
 	ok, bad := items[0].(map[string]any), items[1].(map[string]any)
-	if ok["status"] != 200.0 || bad["status"] != 422.0 || bad["code"] != "blob" {
+	if ok["status"] != 201.0 || bad["status"] != 422.0 || bad["code"] != "blob" {
 		t.Fatalf("report %s", r.Body)
 	}
 	if s := e.blobStats(); s.Attached != 0 || s.Pending != 1 {

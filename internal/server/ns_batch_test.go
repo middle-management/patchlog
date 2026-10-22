@@ -161,10 +161,11 @@ func TestBatch(t *testing.T) {
 	if nsid == "" || r.H.Get("X-Namespace-Revision") != nsid || nsid != e.nsHead("m") {
 		t.Fatalf("batch ns id %s %v", r.Body, r.H)
 	}
-	// The dry-run report adds index and status; the ids are the submit's.
+	// The dry-run report adds index and status, 201 for an item that
+	// would pass (§7.5); the ids are the submit's.
 	for i, it := range r.Obj()["items"].([]any) {
 		d := dry.([]any)[i].(map[string]any)
-		if d["index"] != float64(i) || d["status"] != 200.0 || string(canonical(d["ids"])) != string(canonical(it.(map[string]any)["ids"])) {
+		if d["index"] != float64(i) || d["status"] != 201.0 || string(canonical(d["ids"])) != string(canonical(it.(map[string]any)["ids"])) {
 			t.Fatalf("dry run %v differs from %v", d, it)
 		}
 	}
@@ -418,7 +419,7 @@ func TestBatchDryRunNewPrincipal(t *testing.T) {
 	}
 	a, b, c := rep[0].(map[string]any), rep[1].(map[string]any), rep[2].(map[string]any)
 	if a["index"] != 0.0 || a["status"] != 412.0 || a["code"] != "stale" || b["status"] != 422.0 || b["code"] != "invalid" ||
-		c["status"] != 200.0 || c["ids"].([]any)[0] != hashID(t, "", canonical(addRoot(map[string]any{}))) {
+		c["status"] != 201.0 || c["ids"].([]any)[0] != hashID(t, "", canonical(addRoot(map[string]any{}))) {
 		t.Fatalf("report %s", r.Body)
 	}
 	// Authorisation failures still answer as a submit would (§6.2).

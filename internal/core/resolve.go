@@ -521,9 +521,11 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 		}
 		cur = t.rev(cur.parentSeq.Int64)
 	}
+	if base == nil && len(stack) == 0 {
+		return nil, errors.New("no document")
+	}
 	var doc any
-	exists := base != nil
-	if exists && len(stack) > 0 {
+	if base != nil && len(stack) > 0 {
 		doc = jsonv.MustParse(base)
 	}
 	for i := len(stack) - 1; i >= 0; i-- {
@@ -535,15 +537,13 @@ func (t *tx) docBytesAt(r *revRow) ([]byte, error) {
 		// The fold owns doc (parsed above), so the ops change it in place,
 		// and only the revision asked for is serialised and cached: copying
 		// and canonicalising the whole document at every step made a fold
-		// cost O(steps × size).
-		doc, _, err = patch.Apply(doc, exists, ops, patch.Options{InPlace: true})
+		// cost O(steps × size). Without a base the fold starts at the
+		// genesis, whose patches apply to the document null, as the
+		// create's did (§6.2 step 3).
+		doc, _, err = patch.Apply(doc, true, ops, patch.Options{InPlace: true})
 		if err != nil {
 			return nil, err
 		}
-		exists = true
-	}
-	if !exists {
-		return nil, errors.New("no document")
 	}
 	if len(stack) == 0 {
 		return base, nil

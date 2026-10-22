@@ -629,8 +629,7 @@ func (t *tx) clearPrunedEpochs(n *nsRow, name string) {
 // reached since the previous one. Existing snapshots (kept documents) stay
 // and count as snapshots.
 func (t *tx) rebuildSnapshots(res, upTo int64) error {
-	var doc any
-	exists := false
+	var doc any // the genesis applies to the document null (§6.2 step 3)
 	var count, size int
 	after := int64(0)
 	for {
@@ -662,11 +661,10 @@ func (t *tx) rebuildSnapshots(res, upTo int64) error {
 			if err != nil {
 				return err
 			}
-			doc, _, err = patch.Apply(doc, exists, ops, patch.Options{})
+			doc, _, err = patch.Apply(doc, true, ops, patch.Options{})
 			if err != nil {
 				return err
 			}
-			exists = true
 			count++
 			size += len(canon)
 			var has bool

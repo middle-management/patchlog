@@ -271,8 +271,11 @@ func (p *Plan) checkIDs(res *client.BatchResult) error {
 }
 
 // DryRun submits the batch with ?dry-run=1 (§7.5) and returns the per-item
-// report. A failing item is an *client.APIError with code "batch". An empty
-// plan returns (nil, nil).
+// report. A failing item is an *client.APIError with code "batch". An
+// explicit config change that fails after its step 1 is reported in a 200
+// with the items judged against the current configuration; DryRun returns
+// it as the *client.APIError Apply would fail with. An empty plan returns
+// (nil, nil).
 func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	if err := p.sealItems(ctx); err != nil {
 		return nil, err
@@ -296,6 +299,9 @@ func (p *Plan) DryRun(ctx context.Context) (*client.BatchResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if ce := res.ConfigError(); ce != nil {
+		return res, ce
+	}
 	return res, p.checkIDs(res)
 }
 
@@ -313,9 +319,9 @@ type Result struct {
 // Apply submits the batch with source { ns: branch, at: branchAt }, after
 // copying the blobs its items reference where the source doesn't make them
 // available (copyBlobs, §F.3 Blobs). If the target moved meanwhile, the
-// failing items (412) are re-classified and the batch resubmitted, up to
-// MaxRetries times. Re-classification reads the
-// target again but keeps the branch revision the plan was built from, so
+// failing items (412, or 410 on a resource deleted meanwhile) are
+// re-classified and the batch resubmitted, up to MaxRetries times.
+// Re-classification reads the target again but keeps the branch revision the plan was built from, so
 // source.at stays the revision every item was classified from; work the
 // branch got meanwhile is left for the next merge. It returns ErrConflicts when a
 // resource needs a person, before or after re-classification.
@@ -346,14 +352,14 @@ func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 			return out, p.checkIDs(res)
 		}
 		ae, ok := client.AsAPIError(err)
-		if !ok || ae.Status != 412 || attempt > p.opt.MaxRetries {
+		if !ok || (ae.Status != 412 && ae.Status != 410) || attempt > p.opt.MaxRetries {
 			return nil, err
 		}
 		items := p.Items()
 		var stale []*Resource
 		for _, it := range ae.Items() {
 			idx, ok := it["index"].(float64)
-			if ok && int(idx) >= 0 && int(idx) < len(items) {
+			if ok && int(idx) >= 0 && int(idx) < len(items) && itemMoved(it) {
 				stale = append(stale, items[int(idx)])
 			}
 		}
@@ -369,6 +375,17 @@ func (p *Plan) Apply(ctx context.Context) (*Result, error) {
 			}
 		}
 	}
+}
+
+// itemMoved reports whether a batch failure's item failed because its
+// target moved since it was classified: a 412, or a 410 gone naming the
+// tombstone that is now the head, which a create or an append on a
+// resource deleted meanwhile gets instead of a 412 (§7.2, §8.1).
+// Re-classification reads the target again, so it becomes a restore.
+func itemMoved(it map[string]any) bool {
+	st, _ := it["status"].(float64)
+	head, _ := it["head"].(string)
+	return st == 412 || st == 410 && it["code"] == "gone" && head != ""
 }
 
 // Freeze freezes a merged branch with one config write that also records

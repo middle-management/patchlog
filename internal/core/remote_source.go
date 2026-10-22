@@ -133,12 +133,12 @@ func (t *tx) registerRemote(req Request, rr RemoteRegistration) (*RegistrationRe
 		return &RegistrationResult{Status: 200, NSID: t.nsLogID(row.nsSeq).String(), Origin: rr.Origin, NS: rr.NS,
 			At: t.nsLogID(row.atSeq).String(), Expires: time.UnixMilli(row.expires).UTC()}
 	}
+	// A 412 names the registration's latest entry as head, and leaves
+	// head out when there is none (§12.1).
 	stale := func() *Error {
 		e := apiErr(412, "stale")
 		if row != nil {
 			e.Body["head"] = t.nsLogID(row.nsSeq).String()
-		} else {
-			e.Body["head"] = nil
 		}
 		return e
 	}

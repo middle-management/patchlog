@@ -1851,11 +1851,21 @@ func acquireLock(ctx context.Context, c *client.Client, opt ReleaseOptions, rp *
 			return nil
 		case err == nil:
 			took = true
-		case !client.IsStale(err):
+		case !client.IsStale(err) && !deletedSince(err):
+			// Anything but a lock that moved since it was read, which the
+			// next round reads again.
 			return fmt.Errorf("merge: taking the lock %s/%s: %w", ns, l.Name, err)
 		}
 	}
 	return fmt.Errorf("merge: the lock %s/%s keeps changing", ns, LockName(base))
+}
+
+// deletedSince reports the 410 gone with head that a create, or an
+// append on an older head, gets on a resource deleted since it was read; a
+// create used to get a 412 (§7.2, §8.1). The resource moved, as for a 412.
+func deletedSince(err error) bool {
+	ae, ok := client.AsAPIError(err)
+	return ok && ae.Status == 410 && ae.Code == "gone" && ae.Head() != ""
 }
 
 // lockedErr is ErrLocked for a lock held other than for rp, naming its
