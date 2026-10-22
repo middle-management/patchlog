@@ -736,3 +736,56 @@ func TestV073LegacySealedGrantConverted(t *testing.T) {
 		t.Fatal("the converted answer's bytes differ between reads")
 	}
 }
+
+// §8.3 Branches, invariant 7 (BBD-16): a branch created later, at an at
+// before a purge, sees the name as purged only where it would read an
+// entry for it through: there it answers 410, and /heads lists it as
+// purge with its head as of at as target; a name without an entry as of
+// at is 404 and not listed.
+func TestV073LateBranchSeesPurgeAsOfAt(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.mkNS("main", map[string]any{"read": "public"})
+	e.create("main", "a", map[string]any{})
+	at0 := e.nsHead("main")
+	x1 := e.create("main", "x", map[string]any{"v": 1.0})
+	at1 := e.nsHead("main")
+	x2 := e.appendRev("main", "x", x1, ops(op("replace", "/v", 2.0)))
+	y1 := e.create("main", "y", map[string]any{})
+	expect(t, e.purge("main", "x", x2, "admin"), 204)
+	expect(t, e.purge("main", "y", y1, "admin"), 204)
+	expect(t, e.branch("main", map[string]any{"name": "early", "at": at0}, "alice"), 201)
+	expect(t, e.branch("main", map[string]any{"name": "late", "at": at1}, "alice"), 201)
+
+	expect(t, e.get("/r/late/x"), 410)
+	expect(t, e.get("/r/late/x/rev/"+x1), 410)
+	expect(t, e.get("/r/late/y"), 404)
+	expect(t, e.get("/r/early/x"), 404)
+	expect(t, e.get("/r/early/y"), 404)
+	heads := func(ns string) map[string]map[string]any {
+		out := map[string]map[string]any{}
+		for _, h := range e.get("/ns/" + ns + "/rev/" + e.nsHead(ns) + "/heads").Obj()["heads"].([]any) {
+			m := h.(map[string]any)
+			out[m["resource"].(string)] = m
+		}
+		return out
+	}
+	lh := heads("late")
+	if x := lh["x"]; x == nil || x["kind"] != "purge" || x["target"] != x1 {
+		t.Errorf("late /heads x %v, want purge with target %s, the head as of at", x, x1)
+	}
+	if _, listed := lh["y"]; listed {
+		t.Errorf("late /heads lists y, which had no entry as of at: %v", lh["y"])
+	}
+	eh := heads("early")
+	if _, listed := eh["x"]; listed || eh["a"] == nil {
+		t.Errorf("early /heads %v: x listed or a missing", eh)
+	}
+	// The base itself still lists both as purged, with their heads then.
+	mh := heads("main")
+	if mh["x"]["kind"] != "purge" || mh["x"]["target"] != x2 || mh["y"]["kind"] != "purge" {
+		t.Errorf("main /heads %v", mh)
+	}
+	// A late branch may create a name it never saw.
+	expect(t, e.write("PATCH", "early", "x", "", addRoot(map[string]any{"new": true})), 201)
+}

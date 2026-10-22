@@ -135,13 +135,15 @@ func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
 			switch {
 			case r == nil:
 				rest = append(rest, name)
-			case r.state == statePurged || asOf == nil:
+			case asOf == nil:
 				if r.headSeq.Valid {
 					heads = append(heads, r.headSeq.Int64)
 				} else if r.state != statePurged {
 					rest = append(rest, name)
 				}
 			default:
+				// A purged row too: as of asOf it is purged only if it
+				// had an entry then (resolve, §8.3).
 				resIDs = append(resIDs, r.id)
 			}
 		}
@@ -173,7 +175,7 @@ func (t *tx) prefetchHeads(n *nsRow, names []string, asOf *int64) {
 			t.must(rows.Err())
 			rows.Close()
 			for _, name := range names {
-				if r := t.memo.res[resKey{n.id, name}]; r != nil && r.state != statePurged && at[r.id] == 0 {
+				if r := t.memo.res[resKey{n.id, name}]; r != nil && at[r.id] == 0 {
 					rest = append(rest, name)
 				}
 			}
@@ -297,13 +299,21 @@ type view struct {
 func (v *view) readThrough() bool { return v.own == nil || v.own.headSeq.Valid == false }
 
 // resolve returns a resource as seen from ns, now (asOf nil) or as of an
-// ns_log seq of ns.
+// ns_log seq of ns. A resource purged since asOf is purged as of asOf too,
+// with its head then, but only if it had an entry then: one that didn't
+// is read through, or not found, as it was then. So a branch created
+// later at an at before a purge sees the name as purged only where it
+// would read an entry for it through, and lists it with its head as of at
+// (§8.3, invariant 7); head_history rows outlive the purge.
 func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 	v := &view{ns: n, name: name}
 	r := t.resource(n.id, name)
 	v.own = r
 	if r != nil {
-		if r.state == statePurged {
+		// A remote branch's shadow mirrors a resource purged at its base
+		// before at with its head's id alone, and no history: purged as
+		// of at (insertShadow).
+		if r.state == statePurged && (asOf == nil || n.isShadow() && !t.hasHistory(r.id)) {
 			v.state, v.src = Purged, r
 			if r.headSeq.Valid {
 				v.head = t.rev(r.headSeq.Int64)
@@ -329,9 +339,12 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 		if found {
 			v.src = r
 			v.head = t.rev(headSeq)
-			if v.head.kind == kindTombstone {
+			switch {
+			case r.state == statePurged:
+				v.state = Purged
+			case v.head.kind == kindTombstone:
 				v.state = Tombstoned
-			} else {
+			default:
 				v.state = Live
 			}
 			return v
@@ -346,6 +359,14 @@ func (t *tx) resolve(n *nsRow, name string, asOf *int64) *view {
 	}
 	v.state = NotFound
 	return v
+}
+
+// hasHistory reports whether res has head_history rows: entries of its
+// own namespace that moved its head.
+func (t *tx) hasHistory(res int64) bool {
+	var has bool
+	t.must(t.QueryRow(`SELECT EXISTS (SELECT 1 FROM head_history WHERE res = ?)`, res).Scan(&has))
+	return has
 }
 
 // segment is a stretch of one resource's chain: rows of res with seq ≤ max.
