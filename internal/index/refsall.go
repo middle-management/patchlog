@@ -97,13 +97,26 @@ type refsQuery struct {
 	afterNS, afterName string // after, split at its first "/"
 }
 
+// parseRefsQuery parses a /_refs query. Mins it refuses as given, every
+// bare one (no namespace is the queried one here) and malformed ones, are
+// a *MinError returned with the query, its other mins in mins, as
+// ParseQuery returns them.
 func parseRefsQuery(v url.Values) (*refsQuery, error) {
 	pv := url.Values{}
+	var bare []string
 	for k, vals := range v {
 		switch k {
 		case "to", "after":
-		case "min", "limit":
+		case "limit":
 			pv[k] = vals
+		case "min":
+			for _, s := range vals {
+				if strings.Contains(s, ":") {
+					pv[k] = append(pv[k], s)
+				} else {
+					bare = append(bare, s)
+				}
+			}
 		default:
 			return nil, fmt.Errorf("unknown parameter %q", k)
 		}
@@ -119,27 +132,20 @@ func parseRefsQuery(v url.Values) (*refsQuery, error) {
 		return nil, fmt.Errorf("to: %v", err)
 	}
 	q, err := ParseQuery(pv)
-	if err != nil {
+	var bad *MinError
+	if err != nil && !errors.As(err, &bad) {
 		return nil, err
 	}
-	var bare *MinError
-	for _, m := range q.Mins {
-		if m.NS == "" {
-			if bare == nil {
-				bare = &MinError{Msg: "min must be {ns}:{ns_id}"}
-			}
-			bare.Refused = append(bare.Refused, m.String())
-		}
-	}
-	if bare != nil {
-		return nil, bare
-	}
+	bad = bad.With(v["min"], bare, "min must be {ns}:{ns_id}")
 	rq := &refsQuery{ref: ref, mins: q.Mins, limit: q.Limit}
 	if s := v.Get("after"); s != "" {
 		var ok bool
 		if rq.afterNS, rq.afterName, ok = strings.Cut(s, "/"); !ok {
 			return nil, errors.New("after must be {ns}/{name}")
 		}
+	}
+	if bad != nil {
+		return rq, bad
 	}
 	return rq, nil
 }
@@ -345,7 +351,12 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	ctx := r.Context()
 	vals := r.URL.Query()
 	rq, err := parseRefsQuery(vals)
-	if err != nil {
+	var bad *MinError
+	switch {
+	case errors.As(err, &bad):
+		ix.refsBadMins(w, r, rq, bad)
+		return
+	case err != nil:
 		writeQueryErr(w, err)
 		return
 	}
@@ -464,6 +475,22 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 		return
 	}
 	ix.writeRefs(w, r, rd, cur, st)
+}
+
+// refsBadMins answers a /_refs request with mins refused as given (bad,
+// from parseRefsQuery): 400 whoever asks, as before the read check, listing
+// for a reader that check admits every other min refused too (refsMins),
+// so that one 400 names every min refused (§A.5).
+func (ix *Index) refsBadMins(w http.ResponseWriter, r *http.Request, rq *refsQuery, bad *MinError) {
+	ctx := r.Context()
+	if reached, err := ix.refsCheckpoints(ctx, ix.db, ix.refsNamespaces()); err == nil {
+		if rd, err := ix.refsReader(ctx, r, reached); err == nil {
+			if _, _, refused, _, err := ix.refsMins(ctx, r, rd, rq.mins); err == nil {
+				bad = bad.With(r.URL.Query()["min"], refused, minElsewhere)
+			}
+		}
+	}
+	writeMinErr(w, bad)
 }
 
 // refsMins judges the mins of a /_refs request before any is waited for

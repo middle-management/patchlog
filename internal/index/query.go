@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -110,6 +111,38 @@ type MinError struct {
 
 func (e *MinError) Error() string { return e.Msg }
 
+// With returns the MinError listing e's mins (e may be nil) and refused,
+// each once and in the order given (the request's min values) has them,
+// msg added to e's message: one 400 lists every min refused, whatever the
+// reasons (§A.5).
+func (e *MinError) With(given, refused []string, msg string) *MinError {
+	if len(refused) == 0 {
+		return e
+	}
+	set := map[string]bool{}
+	var msgs []string
+	if e != nil {
+		for _, s := range e.Refused {
+			set[s] = true
+		}
+		msgs = append(msgs, e.Msg)
+	}
+	for _, s := range refused {
+		set[s] = true
+	}
+	if !slices.Contains(msgs, msg) {
+		msgs = append(msgs, msg)
+	}
+	out := &MinError{Msg: strings.Join(msgs, "; ")}
+	for _, s := range given {
+		if set[s] {
+			out.Refused = append(out.Refused, s)
+			delete(set, s)
+		}
+	}
+	return out
+}
+
 // ParseMin parses "{ns_id}" or "{ns}:{ns_id}" (§A.5, §B.5).
 func ParseMin(s string) (MinRef, error) {
 	var m MinRef
@@ -159,9 +192,13 @@ func validPath(p string) error {
 }
 
 // ParseQuery parses and validates query parameters. Unknown parameters are
-// rejected, so cache keys stay meaningful.
+// rejected, so cache keys stay meaningful. Malformed mins, and bare ones
+// given more than once, are a *MinError listing them returned with the
+// query, its other mins in Mins: the caller judges those too, so that one
+// 400 lists every min refused (§A.5).
 func ParseQuery(v url.Values) (*Query, error) {
 	q := &Query{Facets: map[string][]string{}, Limit: 20}
+	var bad *MinError
 	one := func(k string) (string, error) {
 		if len(v[k]) > 1 {
 			return "", fmt.Errorf("%s given more than once", k)
@@ -178,15 +215,17 @@ func ParseQuery(v url.Values) (*Query, error) {
 			// A set (§A.5): the same value twice is one. A bare ns_id is
 			// given once, on a query of one namespace; only {ns}:{ns_id}
 			// repeats.
-			var bad *MinError
-			seen, bare := map[MinRef]bool{}, 0
+			seen := map[MinRef]bool{}
+			var bares []string
 			for _, s := range vals {
 				m, err := ParseMin(s)
 				if err != nil {
 					if bad == nil {
 						bad = &MinError{Msg: err.Error()}
 					}
-					bad.Refused = append(bad.Refused, s)
+					if !slices.Contains(bad.Refused, s) {
+						bad.Refused = append(bad.Refused, s)
+					}
 					continue
 				}
 				if seen[m] {
@@ -194,15 +233,13 @@ func ParseQuery(v url.Values) (*Query, error) {
 				}
 				seen[m] = true
 				if m.NS == "" {
-					bare++
+					bares = append(bares, s)
 				}
 				q.Mins = append(q.Mins, m)
 			}
-			if bad != nil {
-				return nil, bad
-			}
-			if bare > 1 {
-				return nil, fmt.Errorf("min={ns_id} given more than once; name other namespaces as min={ns}:{ns_id}")
+			if len(bares) > 1 {
+				bad = bad.With(vals, bares, "min={ns_id} given more than once; name other namespaces as min={ns}:{ns_id}")
+				q.Mins = slices.DeleteFunc(q.Mins, func(m MinRef) bool { return m.NS == "" })
 			}
 		case "sort":
 			// One parameter, keys comma-separated: the canonical form
@@ -313,6 +350,9 @@ func ParseQuery(v url.Values) (*Query, error) {
 			return nil, err
 		}
 		q.After = n
+	}
+	if bad != nil {
+		return q, bad
 	}
 	return q, nil
 }

@@ -250,11 +250,24 @@ func (ix *Index) serve(w http.ResponseWriter, r *http.Request, gs, ns, at string
 	ctx := r.Context()
 	vals := r.URL.Query()
 	q, err := ParseQuery(vals)
-	if err != nil {
+	var bad *MinError
+	if err != nil && !errors.As(err, &bad) {
 		writeQueryErr(w, err)
 		return
 	}
 	a, err := ix.access(ctx, ns, r)
+	if bad != nil {
+		// Malformed mins are 400 whoever asks, as before the read check;
+		// to a reader who passes it, the 400 lists every other min refused
+		// too, so that one 400 names every min refused (§A.5).
+		if err == nil {
+			if refused, _, err := ix.judgeMins(ctx, r, ns, q.Mins, strictMins); err == nil {
+				bad = bad.With(vals["min"], refused, minElsewhere)
+			}
+		}
+		writeMinErr(w, bad)
+		return
+	}
 	if client.IsPurged(err) {
 		// A purged sealed namespace's document is 410 too (§8.5): the
 		// core makes the read check before answering it, as below.

@@ -88,9 +88,13 @@ func TestV073MinRefusedListed(t *testing.T) {
 	if refs.body["message"] != hidden.body["message"] {
 		t.Errorf("/_refs message %v", refs.body["message"])
 	}
-	// Malformed ones are listed too, as the tree service lists them.
-	refused(x.raw("/pa?min=garbage&min=pb:"+pb+"&min=pa:zzz", w.amy), "garbage", "pa:zzz")
+	// Malformed ones are listed too, as the tree service lists them, with
+	// every well-formed one refused, in the order given; without the grant
+	// that would judge those, the malformed ones alone, still 400.
+	refused(x.raw("/pa?min=garbage&min=pb:"+pb+"&min=pa:zzz", w.amy), "garbage", "pb:"+pb, "pa:zzz")
+	refused(x.raw("/pa?min=garbage&min=pb:"+pb+"&min=pa:zzz", ""), "garbage", "pa:zzz")
 	refused(x.raw(q+"&min="+pb, w.amy), pb)
+	refused(x.raw(q+"&min=pa:zzz&min=pb:"+pb+"&min=garbage", w.amy), "pa:zzz", "pb:"+pb, "garbage")
 }
 
 // TestV073RefsMinPurged (IX-11, §A.4 Coverage, §A.5): on /_refs, a min
@@ -680,4 +684,30 @@ func TestV073RefsUnverifiedForeignGs(t *testing.T) {
 	if r := x.raw(bobLoc, w.amy); r.status != 403 || r.body["code"] != "forbidden" {
 		t.Errorf("/_refs at bob's gs with amy's grant: %d %v", r.status, r.body)
 	}
+}
+
+// TestV073MinListComplete (IX-10, IX-13, §A.5): one 400 lists every min
+// refused, as given, whatever the reasons: malformed mins with the
+// well-formed ones the reader is refused, on a query and on /_refs, and
+// every bare min on /_refs, however many; two different bare mins on a
+// query of one namespace are listed too.
+func TestV073MinListComplete(t *testing.T) {
+	t.Parallel()
+	w := v073P22Setup(t)
+	x := w.x
+	pa, pb := x.ix.Checkpoint("pa"), x.ix.Checkpoint("pb")
+	listed := func(r resp, want ...string) {
+		t.Helper()
+		if r.status != 400 || r.body["code"] != "bad_input" || r.header.Get("Cache-Control") != "no-store" || fmt.Sprint(r.body["min"]) != fmt.Sprint(want) {
+			t.Errorf("%d %v, want min %v", r.status, r.body, want)
+		}
+	}
+	listed(x.raw("/pa?min=garbage&min=pb:"+pb, w.amy), "garbage", "pb:"+pb)
+	listed(x.raw("/pa?min="+pa+"&min="+pb+"&min=pb:"+pb, w.amy), pa, pb, "pb:"+pb)
+	q := "/_refs?to=" + url.QueryEscape("/r/target/x")
+	listed(x.raw(q+"&min="+pb, w.amy), pb)
+	listed(x.raw(q+"&min="+pb+"&min="+pa, w.amy), pb, pa)
+	listed(x.raw(q+"&min="+pb+"&min=garbage&min=pb:"+pb+"&min=pa:"+pa, w.amy), pb, "garbage", "pb:"+pb)
+	// Accepted ones aren't listed: bob may see pb.
+	listed(x.raw(q+"&min="+pb+"&min=pb:"+pb, w.bob), pb)
 }
