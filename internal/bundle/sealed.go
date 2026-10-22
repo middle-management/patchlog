@@ -15,14 +15,19 @@ package bundle
 //     A recipient's kid is its RFC 7638 JWK thumbprint (Thumbprint).
 //   - Each following line is a JWE compact under K_b with the protected
 //     header canonical({"alg":"dir","enc":"A256GCM","pl":{"bundle":id,
-//     "line":n}}), plus "last":true on the final line only; no kid (there is
-//     one key) and no compression. The plaintext of line n is bundle line n
-//     as canonical JSON (§3.1), without its newline.
+//     "line":n}}), with "last":true in pl on the final line only; no kid
+//     (there is one key) and no compression. The plaintext of line n is
+//     bundle line n as canonical JSON (§3.1), without its newline, and with
+//     SealedWriter.Pad followed by spaces up to its §E.2.2 bucket.
 //   - A reader rejects the whole sealed bundle if a line fails to decrypt,
 //     its header has other members, pl.bundle isn't id, the line numbers
 //     aren't 0, 1, 2… in order, or no line says last or a line follows it.
-//     The decrypted lines are then an ordinary bundle, checked by Reader;
-//     its digest (source.bundle) is the plaintext bundle's.
+//     Sealed bundles written before v0.73 carry last beside pl rather than
+//     in it, which a reader still takes. Trailing spaces (padding, which
+//     canonical JSON never ends in) are removed from each line's plaintext,
+//     and the decrypted lines are then an ordinary bundle, checked by
+//     Reader as strictly as a plain one (§G.4.1); its digest
+//     (source.bundle) is the plaintext bundle's (§G.5.1.1).
 //
 // Key files are JWKs: a recipient is {"kty":"OKP","crv":"X25519","x"}, an
 // identity (private key) the same with "d" (RFC 8037).
@@ -170,8 +175,14 @@ func newAEAD(key []byte) cipher.AEAD {
 // SealedWriter seals a bundle written to it (the bytes a Writer produces,
 // or any bundle file) line by line (§G.5.1.1). Each line is sealed once the
 // next one starts, so the last can be marked; Close seals it. Close must be
-// called; it doesn't close the underlying writer.
+// called; it doesn't close the underlying writer. Like a Reader it takes
+// only canonical lines, each followed by one 0x0A (§G.4.1): it never seals
+// a bundle a Reader would reject.
 type SealedWriter struct {
+	// Pad pads each line's plaintext to its §E.2.2 bucket with spaces,
+	// which readers remove (§G.5.1.1); set it before the first Write.
+	Pad bool
+
 	w       io.Writer
 	aead    cipher.AEAD
 	id      string
@@ -236,28 +247,36 @@ func (s *SealedWriter) Write(p []byte) (int, error) {
 	return n, nil
 }
 
+// line takes one bundle line, without its 0x0A.
 func (s *SealedWriter) line(b []byte) error {
-	if len(bytes.TrimSpace(b)) == 0 {
-		return nil
+	no := s.n + 1
+	if s.has {
+		no++
 	}
-	v, err := jsonv.Parse(b)
-	if err != nil {
-		return &Error{Line: s.n + 1, Msg: "not I-JSON: " + err.Error()}
+	if len(b) == 0 {
+		return &Error{Line: no, Msg: "a blank line; every line is canonical JSON (§G.4.1)"}
+	}
+	if _, _, err := parseCanonical(no, b); err != nil {
+		return err
 	}
 	if s.has {
 		if err := s.emit(s.pending, false); err != nil {
 			return err
 		}
 	}
-	s.pending, s.has = jsonv.Canonical(v), true
+	s.pending, s.has = append([]byte(nil), b...), true
 	return nil
 }
 
 func (s *SealedWriter) emit(pt []byte, last bool) error {
-	hdr := map[string]any{"alg": seal.AlgDir, "enc": seal.EncA256GCM, "pl": map[string]any{"bundle": s.id, "line": float64(s.n)}}
+	pl := map[string]any{"bundle": s.id, "line": float64(s.n)}
 	if last {
-		hdr["last"] = true
+		pl["last"] = true
 	}
+	if s.Pad {
+		pt = seal.Pad(pt)
+	}
+	hdr := map[string]any{"alg": seal.AlgDir, "enc": seal.EncA256GCM, "pl": pl}
 	protected := b64.EncodeToString(jsonv.Canonical(hdr))
 	iv := make([]byte, s.aead.NonceSize())
 	rand.Read(iv)
@@ -287,10 +306,13 @@ func (s *SealedWriter) Close() error {
 	if s.err != nil {
 		return s.err
 	}
-	if len(bytes.TrimSpace(s.buf)) > 0 {
-		if s.err = s.line(s.buf); s.err != nil {
-			return s.err
+	if len(s.buf) > 0 {
+		no := s.n + 1
+		if s.has {
+			no++
 		}
+		s.err = &Error{Line: no, Msg: "the last line doesn't end in 0x0A (truncated?); every line is followed by one (§G.4.1)"}
+		return s.err
 	}
 	if !s.has {
 		s.err = &Error{Line: 1, Msg: "empty bundle"}
@@ -419,8 +441,13 @@ func (r *sealedReader) next() error {
 		}
 	}
 	pl, _ := h["pl"].(map[string]any)
-	if pl == nil || len(pl) != 2 {
-		return fail("pl must be {bundle, line}")
+	if pl == nil {
+		return fail("pl must be {bundle, line, last?}")
+	}
+	for k := range pl {
+		if k != "bundle" && k != "line" && k != "last" {
+			return fail("pl must be {bundle, line, last?}")
+		}
 	}
 	if pl["bundle"] != r.id {
 		return fail("pl.bundle isn't this bundle's id (spliced?)")
@@ -428,11 +455,26 @@ func (r *sealedReader) next() error {
 	if n, ok := pl["line"].(float64); !ok || n != float64(r.n) {
 		return fail(fmt.Sprintf("line %v out of order, want %d", pl["line"], r.n))
 	}
+	// last is in pl (§G.5.1.1); sealed bundles written before v0.73 put it
+	// beside pl, which is still read.
+	if l, has := pl["last"]; has {
+		if l != true {
+			return fail("pl.last must be true if present")
+		}
+		r.last = true
+	}
 	if l, has := h["last"]; has {
 		if l != true {
 			return fail("last must be true if present")
 		}
 		r.last = true
+	}
+	// Padding (§E.2.2) is removed before the checks and the digest: the
+	// spaces after the JSON, which a canonical line never ends in. What is
+	// left is one bundle line, checked by the Reader (§G.4.1).
+	pt = bytes.TrimRight(pt, " ")
+	if bytes.IndexByte(pt, '\n') >= 0 {
+		return fail("a line's plaintext holds a 0x0A; each sealed line is one bundle line")
 	}
 	r.n++
 	r.out = append(pt, '\n')

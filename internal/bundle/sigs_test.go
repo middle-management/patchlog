@@ -76,7 +76,7 @@ func keyEntryOf(k clienttest.Key) bundle.KeyEntry {
 func grantLine(t *testing.T, ns string, g *grant.Grant, key bundle.KeyEntry) bundle.Line {
 	t.Helper()
 	root := jsonv.MustParse(jsonv.Canonical(g.Blocks[0].Raw)).(map[string]any)
-	return bundle.Line{NS: ns, GrantLine: &bundle.GrantLine{ID: g.ID().String(), Root: root, Stored: storedBlocks(t, g), Key: key}}
+	return bundle.Line{NS: ns, GrantLine: &bundle.GrantLine{ID: g.ID().String(), Root: root, Stored: storedBlocks(t, g)[0], Key: key}}
 }
 
 const srcOrigin = "https://src.example"
