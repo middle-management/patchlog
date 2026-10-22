@@ -852,13 +852,20 @@ func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error
 		seq := t.insertConfig(n, p, aid)
 		t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, aid)
 		epoch = p.cfg.Epoch
+		// A rotation, whoever makes it, is the one a failed rotation
+		// after a revocation waited for.
+		_, err = t.Exec(`DELETE FROM rotations_due WHERE ns = ?`, n.id)
+		t.must(err)
 		return nil
 	})
 	return epoch, err
 }
 
 // rotateAfterRevoke rotates each namespace a committed config write revoked
-// access in, and its sealed branches (revocations reach them, §C.4).
+// access in, and its sealed branches (revocations reach them, §C.4). One
+// that fails is recorded as due (rotations_due) and retried until a
+// rotation succeeds (RetryRotations), so that a revoked reader doesn't
+// keep the current epoch key with nothing but a log line (§E.2.4).
 func (e *Engine) rotateAfterRevoke(names []string) {
 	ctx := context.Background()
 	seen := map[string]bool{}
@@ -870,7 +877,8 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 		}
 		seen[ns] = true
 		if _, err := e.RotateEpoch(ctx, ns, RotateAuthor); err != nil {
-			log.Printf("rotate-on-revoke %s: %v", ns, err)
+			log.Printf("rotate-on-revoke %s: %v (retried until a rotation succeeds)", ns, err)
+			e.markRotationDue(ctx, ns)
 		}
 		_ = e.read(ctx, func(t *tx) error {
 			if n := t.nsByName(ns); n != nil {
@@ -882,6 +890,102 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 			}
 			return nil
 		})
+	}
+}
+
+// markRotationDue records that sealed namespace ns needs a rotation that
+// failed (rotateAfterRevoke).
+func (e *Engine) markRotationDue(ctx context.Context, ns string) {
+	err := e.update(ctx, func(t *tx) error {
+		if n := t.nsByName(ns); n != nil && !n.purged {
+			_, err := t.Exec(`INSERT INTO rotations_due (ns, since) VALUES (?, ?) ON CONFLICT (ns) DO NOTHING`, n.id, t.now.UnixMilli())
+			t.must(err)
+		}
+		return nil
+	})
+	if err != nil {
+		log.Printf("rotate-on-revoke %s: recording the rotation as due: %v", ns, err)
+	}
+}
+
+// RotationsDue lists the namespaces whose rotation after a revocation
+// failed and hasn't succeeded since, by name.
+func (e *Engine) RotationsDue(ctx context.Context) ([]string, error) {
+	var out []string
+	err := e.read(ctx, func(t *tx) error {
+		rows, err := t.Query(`SELECT n.name FROM rotations_due d JOIN namespaces n ON n.ns = d.ns ORDER BY n.name`)
+		t.must(err)
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			t.must(rows.Scan(&name))
+			out = append(out, name)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// RetryRotations retries the rotations RotationsDue lists and returns the
+// namespaces rotated. One whose namespace was purged, or is no longer
+// sealed, is dropped: nothing is left to rotate.
+func (e *Engine) RetryRotations(ctx context.Context) ([]string, error) {
+	due, err := e.RotationsDue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var done []string
+	for _, ns := range due {
+		if err := e.jobStep(ctx); err != nil {
+			return done, err
+		}
+		var drop bool
+		if err := e.read(ctx, func(t *tx) error {
+			n := t.nsByName(ns)
+			drop = n == nil || n.purged || t.config(n.configSeq).level != levelSealed
+			return nil
+		}); err != nil {
+			return done, err
+		}
+		if drop {
+			if err := e.update(ctx, func(t *tx) error {
+				_, err := t.Exec(`DELETE FROM rotations_due WHERE ns IN (SELECT ns FROM namespaces WHERE name = ?)`, ns)
+				t.must(err)
+				return nil
+			}); err != nil {
+				return done, err
+			}
+			continue
+		}
+		if _, err := e.RotateEpoch(ctx, ns, RotateAuthor); err != nil {
+			log.Printf("rotate-on-revoke %s: retry: %v", ns, err)
+			continue
+		}
+		done = append(done, ns)
+	}
+	return done, nil
+}
+
+// rotateRetryLoop retries failed rotations (RetryRotations) every minute
+// until Close.
+func (e *Engine) rotateRetryLoop() {
+	defer e.bg.Done()
+	tk := time.NewTicker(time.Minute)
+	defer tk.Stop()
+	for {
+		select {
+		case <-e.stop:
+			return
+		case <-tk.C:
+			if !e.leader(context.Background()) {
+				continue // another instance retries (pglock.go)
+			}
+			if done, err := e.RetryRotations(leaderJob(context.Background())); err != nil {
+				log.Printf("rotate-on-revoke: retrying: %v", err)
+			} else if len(done) > 0 {
+				log.Printf("rotate-on-revoke: rotated %v on retry", done)
+			}
+		}
 	}
 }
 

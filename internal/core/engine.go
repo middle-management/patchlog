@@ -449,6 +449,10 @@ func Open(opt Options) (*Engine, error) {
 		e.bg.Add(1)
 		go e.rotateLoop(opt.RotateEpochs)
 	}
+	if opt.RotateOnRevoke {
+		e.bg.Add(1)
+		go e.rotateRetryLoop()
+	}
 	if e.opt.RepurgeDelay == 0 {
 		e.opt.RepurgeDelay = 3*e.opt.TailInterval + 2*time.Minute
 	}

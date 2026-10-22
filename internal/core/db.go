@@ -325,6 +325,13 @@ CREATE TABLE IF NOT EXISTS remote_notices (
 
 -- Addition: the one-time data migrations done (dataMigrations), by name.
 CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
+
+-- Addition (P18): sealed namespaces whose rotation after a revocation
+-- failed, retried until one succeeds (Options.RotateOnRevoke, sealed.go).
+CREATE TABLE IF NOT EXISTS rotations_due (
+  ns    INTEGER PRIMARY KEY REFERENCES namespaces,
+  since INTEGER NOT NULL
+);
 `
 
 // openDB opens the database: a Postgres URL (pgschema.go), or a SQLite

@@ -1,13 +1,16 @@
 package server
 
 import (
+	"context"
 	"crypto/ecdh"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -625,5 +628,65 @@ func TestV073SealedCacheByReadMode(t *testing.T) {
 		if r.Code >= 400 || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") || r.H.Get("CDN-Cache-Control") == "" || r.H.Get("CDN-Cache-Control") == "no-store" {
 			t.Errorf("%s verified: %d %v", path, r.Code, r.H)
 		}
+	}
+}
+
+// flakyKeyStore fails Wrap while failing is set.
+type flakyKeyStore struct {
+	core.KeyStore
+	failing atomic.Bool
+}
+
+func (k *flakyKeyStore) Wrap(ctx context.Context, key, aad []byte) ([]byte, error) {
+	if k.failing.Load() {
+		return nil, errors.New("key store unavailable")
+	}
+	return k.KeyStore.Wrap(ctx, key, aad)
+}
+
+// P18 carry-over (§E.2.4): with -rotate-on-revoke, a rotation that fails
+// after a revocation committed is recorded as due and retried until one
+// succeeds, rather than only logged.
+func TestV073RotationAfterRevokeRetried(t *testing.T) {
+	t.Parallel()
+	ks := &flakyKeyStore{KeyStore: newKeyStore(t)}
+	e := newAuthEnv(t, withKeyStore(ks), withEncTuning, func(o *core.Options) { o.RotateOnRevoke = true })
+	k := newKey("k")
+	e.mkNS("s", sealedDoc(map[string]any{"read": "grant", "keys": []any{k.entry("*")}}))
+	star := e.grant(k, "user:admin", []string{"s"}, []string{"config", "read"})
+	epoch := func() float64 {
+		t.Helper()
+		r := e.get("/ns/s/rev/"+e.nsHead("s", star), star)
+		h, err := seal.ParseHeader(string(r.Body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, n, _ := seal.ParseKid(h.Kid)
+		return float64(n)
+	}
+	ctx := context.Background()
+	ks.failing.Store(true)
+	expect(t, e.patchNS("s", ops(op("add", "/revoked", []any{"1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"})), star), 201)
+	if due, err := e.e.RotationsDue(ctx); err != nil || len(due) != 1 || due[0] != "s" {
+		t.Fatalf("due after a failed rotation: %v %v", due, err)
+	}
+	ks.failing.Store(false)
+	if epoch() != 1 {
+		t.Fatal("rotated while the key store failed")
+	}
+	// Still failing: kept due.
+	ks.failing.Store(true)
+	if done, err := e.e.RetryRotations(ctx); err != nil || len(done) != 0 {
+		t.Fatalf("retry while failing: %v %v", done, err)
+	}
+	ks.failing.Store(false)
+	if done, err := e.e.RetryRotations(ctx); err != nil || len(done) != 1 {
+		t.Fatalf("retry: %v %v", done, err)
+	}
+	if epoch() != 2 {
+		t.Fatalf("epoch after the retry: %v", epoch())
+	}
+	if due, _ := e.e.RotationsDue(ctx); len(due) != 0 {
+		t.Fatalf("still due: %v", due)
 	}
 }
