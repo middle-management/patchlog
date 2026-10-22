@@ -3555,8 +3555,8 @@ branch name, a body with a Unicode noncharacter, a malformed `Signature`, or a w
 authentication and before an unknown namespace's `404`; on event streams a non-empty
 `Last-Event-ID` wins over `since` (§7.3). A batch body is the exception: it is read only up to
 the verified principal's `batchSize` (§6.2, §7.5), so its shapes are judged once the grant is
-verified. A bearer over the deployment's `grantSize` or `rulesPerGrant` is then `413`. A grant not
-naming the namespace in every block that carries `ns` is
+verified. A bearer over the deployment's `grantSize` or `rulesPerGrant` is then `413`. A grant
+not naming the namespace in every block that carries `ns` is
 `403` before anything is verified or looked up, whether or not the namespace exists; no usable
 grant (missing, malformed, badly signed, unknown key, revoked, expired, not yet valid, with a
 rule that doesn't compile, or naming `"*"` without being an operator grant) is `401`;

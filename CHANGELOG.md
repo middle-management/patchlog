@@ -49,8 +49,8 @@ the reference implements the default the plan states.
     twice; a malformed config `If-Match` (it was ignored, giving `412`); a batch item with both
     `ifMatch` and `ifNoneMatch`, or a malformed item or config `ifMatch` (the batch's own `400`,
     no longer an item report); a malformed branch name, branch or registration `at`, prune
-    `horizon` or `keep` entry. `DELETE` with `If-None-Match: *` is no longer a shape error: it is judged
-    after authorisation and stays `410`/`412` until the gate answers `428`;
+    `horizon` or `keep` entry. `DELETE` with `If-None-Match: *` is no longer a shape error: it
+    is judged after authorisation and stays `410`/`412` until the gate answers `428`;
   - a batch `source` that isn't `{ origin?, ns, at, bundle?, ids? }`, with text ids, `ids`
     members naming the batch's resources, and `origin` canonical (`scheme://host[:port]`,
     lowercase ASCII, an IDN host as its A-label, no default port), refused rather than
