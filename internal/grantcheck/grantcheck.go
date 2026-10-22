@@ -9,9 +9,12 @@
 //     it with the same pub, recursively, through local bases only: a remote
 //     branch's keys and revocations are its own (§10, §G.3);
 //   - revocations of the namespace and, for a branch, of every local base;
-//   - the order of §C.2: a grant not naming the namespace is 403 before
-//     anything else; no usable grant (malformed, unknown key, bad
-//     signature, revoked, expired, not yet valid) is 401;
+//   - the order of §C.2 and §C.8: a token that can't be decoded, whose
+//     rules don't compile, or over grantSize or rulesPerGrant is 401
+//     first (the origin answers the limits 413); then a grant not naming
+//     the namespace is 403 before anything else; no usable grant (unknown
+//     key, bad signature, revoked, expired, not yet valid, "*" outside an
+//     operator grant) is 401;
 //   - key scopes, including attrs (validated with internal/rules as the
 //     core does), requireAt/maxLag (checked against the named chain,
 //     relative to the grant's issuance, default maxLag 60 seconds) and

@@ -9,8 +9,9 @@
 //
 // The bearer form is Biscuit's URL-safe base64 (padded, accepted with or
 // without padding and with or without the "biscuit:" prefix). The
-// non-bearer stored form (§C.3) is the same protobuf message without its
-// proof, so every block signature can be checked but it is not a token.
+// non-bearer stored form (§C.3, §C.8) is the authority block's protobuf
+// SignedBlock alone, so its signature can be checked but it is not a
+// token; rows stored before v0.73 hold the whole chain without proof.
 package grant
 
 import (
@@ -194,8 +195,8 @@ func (g *Grant) rootSigID() string { return ids.Of(g.c.blocks[0].sig).String() }
 func (g *Grant) Stored() []byte { return g.c.blocks[0].encode() }
 
 // SignedBlocks are the token's protobuf SignedBlock messages in order,
-// authority first: the stored form's blocks, as GET /ns/{ns}/grants/{gid}
-// serves them (§C.3.1).
+// authority first. A grant parsed from its stored form has the authority
+// block alone, which GET /ns/{ns}/grants/{gid} serves (§C.3.1).
 func (g *Grant) SignedBlocks() [][]byte {
 	out := make([][]byte, len(g.c.blocks))
 	for i, sb := range g.c.blocks {
