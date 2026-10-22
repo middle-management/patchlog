@@ -529,3 +529,173 @@ func TestCheckpointNamesWhatWasReadV073(t *testing.T) {
 	waitFor(t, "the service to apply the teams write", func() bool { return w.svc.Tree().Checkpoint("teams") != before["teams"] })
 	check("after a /roles change in teams")
 }
+
+// trustTeams adds teams to the catalog's trusted namespaces, with item
+// t1, before start: it lists no catalog key, so no role counts there and
+// its placements are hidden from every caller not in catalog-admins.
+func (w *world) trustTeams() {
+	w.t.Helper()
+	t, ctx := w.t, context.Background()
+	op := w.s.Client(t, client.WithBearer(w.s.OperatorGrant(t, "teams")))
+	must(op.CreateNamespace(ctx, "teams", map[string]any{"read": "grant", "keys": []any{w.opsKey.Entry("*")},
+		"roles": map[string]any{"reader": map[string]any{"can": toAny("read")}}}))
+	opc := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"config"})))
+	must(opc.PatchConfig(ctx, "cat", must(w.ops.NSHead(ctx, "cat")).Config, []any{map[string]any{"op": "add", "path": "/catalog/trust/-", "value": "teams"}}))
+	ot := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"teams"}, []string{"create", "read"})))
+	must(ot.Create(ctx, "teams", "t1", client.GenesisPatches(map[string]any{"title": "t1"})))
+	w.svcClient = w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "svc:catalog", []string{"cat", "matches", "teams"}, []string{"read"},
+		map[string]any{"exp": w.s.Now().Add(24 * time.Hour).Format(time.RFC3339)})))
+}
+
+// TestHiddenAnsweredAsMissingV073 (TC-22, TC-40): to a caller not in
+// catalog-admins, a request naming a node or a to folder hidden from it
+// is answered as one naming a missing node, checkpoint included, so
+// nothing about the hidden node appears: a folder's name, or any to, reads
+// every trusted namespace whether or not a live folder has it, in
+// organising requests and for a catalog node in POST /read-grants alike
+// (§B.11, §B.11.4 checkpoint, §B.11.5). With two trusted namespaces, a
+// placement's own namespace is not all a folder's visibility reads.
+func TestHiddenAnsweredAsMissingV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.trustTeams()
+	w.start()
+	w.caughtUp()
+	waitFor(t, "teams to be followed", func() bool { return w.svc.Tree().Checkpoint("teams") != "" })
+	bob := w.caller("user:bob", "match-desk")
+	// same compares two answers, the first naming hidden where the second
+	// names missing.
+	same := func(what string, a, b map[string]any, hidden, missing string) {
+		t.Helper()
+		am, _ := a["message"].(string)
+		if a["code"] != b["code"] || strings.Replace(am, hidden, missing, 1) != b["message"] || !reflect.DeepEqual(a["checkpoint"], b["checkpoint"]) {
+			t.Errorf("%s: %s answers %v, %s %v", what, hidden, a, missing, b)
+		}
+		if _, has := a["checkpoint"]; !has {
+			t.Errorf("%s: no checkpoint in %v", what, a)
+		}
+	}
+	for _, c := range []struct {
+		what            string
+		hidden, missing string
+		req             func(name string) map[string]any
+	}{
+		{"create under", "rumours", "nosuch", func(n string) map[string]any {
+			return map[string]any{"node": "nf", "want": toAny("create"), "to": toAny(n)}
+		}},
+		{"create under a placement", "matches.derby", "nosuch", func(n string) map[string]any {
+			return map[string]any{"node": "nf", "want": toAny("create"), "to": toAny(n)}
+		}},
+		{"place under", "rumours", "nosuch", func(n string) map[string]any {
+			return map[string]any{"item": "/r/matches/fresh", "want": toAny("place"), "to": toAny(n)}
+		}},
+		{"move", "rumours", "nosuch", func(n string) map[string]any {
+			return map[string]any{"node": n, "want": toAny("move"), "to": toAny("season")}
+		}},
+		{"move under", "rumours", "nosuch", func(n string) map[string]any {
+			return map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny(n)}
+		}},
+		{"delete", "rumours", "nosuch", func(n string) map[string]any {
+			return map[string]any{"node": n, "want": toAny("delete")}
+		}},
+		{"restore", "rumours", "nosuch", func(n string) map[string]any {
+			return map[string]any{"node": n, "want": toAny("restore")}
+		}},
+		{"delete a placement", "matches.rumour1", "matches.ghost", func(n string) map[string]any {
+			return map[string]any{"node": n, "want": toAny("delete")}
+		}},
+	} {
+		same(c.what, w.issue(bob, c.req(c.hidden), 404).body, w.issue(bob, c.req(c.missing), 404).body, c.hidden, c.missing)
+	}
+
+	rg := w.do("POST", "/read-grants", bob, map[string]any{"items": toAny("/r/cat/rumours", "/r/cat/nosuch")})
+	hidden, missing := entry(rg, 0), entry(rg, 1)
+	if hidden == nil || missing == nil {
+		t.Fatalf("read-grants: %d %v", rg.status, rg.body)
+	}
+	he, _ := hidden["error"].(map[string]any)
+	me, _ := missing["error"].(map[string]any)
+	he["checkpoint"], me["checkpoint"] = hidden["checkpoint"], missing["checkpoint"]
+	same("read-grants", he, me, "rumours", "nosuch")
+}
+
+// TestOrganisingGrantsRefuseAccessV073 (TC-29): a non-admin's Move grant
+// may change the node's other members, $access excepted, and its Place
+// grant may not create a placement with $access, by the grant's own rules
+// as Create a folder's, not only the catalog's key's and namespace's
+// (§B.11.3, §B.11.4).
+func TestOrganisingGrantsRefuseAccessV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.doc("cat", "cup", map[string]any{"title": "Cup", "parents": parents("season"), "$access": acc("group:match-desk", "desk")})
+	w.doc("matches", "newone", map[string]any{"title": "newone"})
+	ctx := context.Background()
+	// A catalog whose namespace and key carry no $access rules.
+	opc := w.s.Client(t, client.WithBearer(w.opsKey.Grant(t, w.s.Now(), "user:ops", []string{"cat"}, []string{"config"})))
+	must(opc.PatchConfig(ctx, "cat", must(w.ops.NSHead(ctx, "cat")).Config, []any{
+		map[string]any{"op": "remove", "path": "/rules"},
+		map[string]any{"op": "remove", "path": "/keys/2/rules"}}))
+	w.start()
+	w.caughtUp()
+	bob := w.caller("user:bob", "match-desk")
+
+	b := w.issue(bob, map[string]any{"node": "cup", "want": toAny("move"), "to": toAny("season")}, 200).body
+	for _, op := range []any{
+		map[string]any{"op": "add", "path": "/$access", "value": acc("group:fan-club", "desk")},
+		map[string]any{"op": "add", "path": "/$access/group:fan-club", "value": toAny("desk")},
+		map[string]any{"op": "remove", "path": "/$access"},
+	} {
+		if err := w.moveWith(b, "cup", op); !isStatus(err, 403) {
+			t.Errorf("a Move grant writing $access with %v: %v", op, err)
+		}
+	}
+	if err := w.moveWith(b, "cup", map[string]any{"op": "replace", "path": "/title", "value": "The Cup"}); err != nil {
+		t.Errorf("a rename: %v", err)
+	}
+
+	b = w.issue(bob, map[string]any{"item": "/r/matches/newone", "want": toAny("place"), "to": toAny("season")}, 200).body
+	pc := w.core(b["grant"].(string))
+	if _, err := pc.CreateDoc(ctx, "cat", "matches.newone", map[string]any{"parents": parents("season"), "$access": acc("group:fan-club", "desk")}); !isStatus(err, 403) {
+		t.Errorf("a Place grant creating a placement with $access: %v", err)
+	}
+	must(pc.CreateDoc(ctx, "cat", "matches.newone", map[string]any{"parents": parents("season")}))
+}
+
+// TestWideningRefusalNamesNothingHiddenV073 (TC-22): a non-admin's Move
+// refused for widening at a node hidden from the caller names only the
+// moved node, not the hidden one nor the subject and role it would gain;
+// at a node the caller sees, it names all three (§B.11, §B.11.4 No
+// widening, §B.11.5).
+func TestWideningRefusalNamesNothingHiddenV073(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.seed()
+	w.trustTeams()
+	w.doc("cat", "zfolder", map[string]any{"title": "Z", "parents": parents("season")})
+	w.doc("cat", "teams.t1", map[string]any{"parents": parents("zfolder")})
+	w.doc("cat", "afolder", map[string]any{"title": "A", "parents": parents("season")})
+	w.start()
+	w.caughtUp()
+	waitFor(t, "teams to be followed", func() bool { return w.svc.Tree().Checkpoint("teams") != "" })
+	bob := w.caller("user:bob", "match-desk")
+	w.issue(bob, map[string]any{"node": "teams.t1", "want": toAny("delete")}, 404)
+
+	// Into derbies, fan-club gets desk below zfolder, first at teams.t1.
+	r := w.issue(bob, map[string]any{"node": "zfolder", "want": toAny("move"), "to": toAny("derbies")}, 403)
+	msg, _ := r.body["message"].(string)
+	for _, s := range []string{"teams.t1", "fan-club", "desk"} {
+		if strings.Contains(msg, s) {
+			t.Errorf("the refusal names %s, hidden from the caller: %q", s, msg)
+		}
+	}
+	if !strings.Contains(msg, "zfolder") || r.body["checkpoint"] == nil {
+		t.Errorf("the refusal: %v", r.body)
+	}
+	// afolder, which bob sees, is named with the subject and role.
+	r = w.issue(bob, map[string]any{"node": "afolder", "want": toAny("move"), "to": toAny("derbies")}, 403)
+	if msg, _ := r.body["message"].(string); !strings.Contains(msg, "group:fan-club the role desk on /r/cat/afolder") {
+		t.Errorf("the refusal at a visible node: %q", msg)
+	}
+}

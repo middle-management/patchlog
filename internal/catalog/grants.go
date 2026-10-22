@@ -166,6 +166,13 @@ func itemNS(node string) []string {
 	return nil
 }
 
+// folderName reports whether a catalog node named name would be a folder:
+// a name without a dot (tree.ParseNode), whether or not the catalog has
+// such a node.
+func folderName(name string) bool {
+	return !strings.Contains(name, ".")
+}
+
 // plan is a decision, made under the graph lock at a checkpoint: cp is
 // the catalog's ns_id there (the grant's at), checkpoint what the answer
 // reports (checkpointAt). key is the signing key's entry as of the head,
@@ -345,10 +352,12 @@ func (s *Service) decideReads(ctx context.Context, v *grant.Verified, items []st
 	// pinNode is the checkpoint a decision on the visibility of catalog
 	// node name reports: a folder's reads every trusted namespace's
 	// roles, a placement's its item's namespace's (§B.11.4 checkpoint).
+	// Which is judged from the name, not the graph, so a hidden folder's
+	// refusal carries the checkpoint a missing one's does (§B.11.5).
 	pinNode := func(name string) (cp map[string]string) {
 		s.t.View(func(g *tree.Graph, cur map[string]string) {
 			nss := itemNS(name)
-			if n := g.Node(name); n != nil && n.Kind == tree.KindFolder {
+			if folderName(name) {
 				for ns := range g.Trust {
 					nss = append(nss, ns)
 				}
@@ -1071,8 +1080,9 @@ func addRole(m map[string]map[string]bool, k, v string) {
 // of it, or, to a caller not in catalog-admins, either one hidden from it
 // (§B.11.5), a new folder's name excepted (node, targets); 403 for a
 // requirement that fails; then 409, and Place's 410. A hidden node is so
-// answered as a missing one, with the same message, except to admins
-// organising and where the answer is 409 (names are not secrets).
+// answered as a missing one, with the same message and checkpoint, except
+// to admins organising and where the answer is 409 (names are not
+// secrets); no refusal names a hidden node (planMove's widening).
 type organising struct {
 	g     *tree.Graph
 	admin bool
@@ -1146,7 +1156,15 @@ func (o *organising) sees(n *tree.Node) bool {
 // untombstoned node of the catalog, an explicit one, that the caller
 // sees. A tombstoned folder is answered so too: folders are restored only
 // by catalog admins, under grants of their own (§B.11.4).
+//
+// A hidden node is answered as a missing one, checkpoint included
+// (§B.11, §B.11.5): for a caller not in catalog-admins, a folder's name
+// reads every trusted namespace whether or not a folder has it, as a
+// placement's name reads its item's namespace (itemNS).
 func (o *organising) node(name string) (*tree.Node, error) {
+	if !o.admin && folderName(name) {
+		o.readTrusted()
+	}
 	n := o.g.Node(name)
 	if n == nil || n.Self || !o.sees(n) {
 		return nil, errf(404, "not_found", "no node %s in %s", name, o.g.Catalog)
@@ -1155,8 +1173,14 @@ func (o *organising) node(name string) (*tree.Node, error) {
 }
 
 // targets checks a request's to list: 404 for an entry that isn't a live
-// folder of the catalog, or that the caller doesn't see.
+// folder of the catalog, or that the caller doesn't see. For a caller not
+// in catalog-admins, any to reads every trusted namespace, so the 404 for
+// a hidden folder carries the checkpoint one for any other entry does
+// (node).
 func (o *organising) targets(tos []string) error {
+	if !o.admin && len(tos) > 0 {
+		o.readTrusted()
+	}
 	for _, f := range tos {
 		if !liveFolder(o.g, f) || !o.sees(o.g.Node(f)) {
 			return errf(404, "not_found", "no folder %s in %s", f, o.g.Catalog)
@@ -1341,7 +1365,8 @@ func (s *Service) keyAt(g *tree.Graph, ns string, latest *grantcheck.Config) *gr
 // document. Clients should give every placement (create or restore) a
 // fresh random $nonce (§C.7, §B.11.4), so its revision ids can't be used to
 // confirm guesses of its content; the grant's rules fix only /resource and
-// /doc/parents, so a $nonce is always allowed.
+// /doc/parents, and refuse a non-admin's $access, so a $nonce is always
+// allowed.
 func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string, req Request) (_ *plan, err error) {
 	cat := s.t.Catalog()
 	ns, name, ok := tree.ParseHref(item)
@@ -1485,7 +1510,13 @@ func (s *Service) planPlace(ctx context.Context, v *grant.Verified, item string,
 		}
 		verb = "restore"
 	}
-	return &plan{ns: cat, resource: pl, can: []string{verb}, rules: []any{resourceRule(pl), parentsRule(cat, tos)}, cp: cp, checkpoint: checkpoint, key: signer}, nil
+	rules := []any{resourceRule(pl), parentsRule(cat, tos)}
+	if !admin {
+		// Only an admin creates or restores a placement with $access
+		// (§B.11.3), as Create a folder's grant says too.
+		rules = append(rules, map[string]any{"op": "test", "path": "/doc/$access", "exists": false})
+	}
+	return &plan{ns: cat, resource: pl, can: []string{verb}, rules: rules, cp: cp, checkpoint: checkpoint, key: signer}, nil
 }
 
 func inPlaceList(doc map[string]any, cat string, subs map[string]bool) bool {
@@ -1515,8 +1546,9 @@ func inPlaceList(doc map[string]any, cat string, subs map[string]bool) bool {
 // included.
 //
 // A Move grant may also change the node's other members, $access
-// excepted, which the catalog's key's rules refuse (§B.11.3): a rename is
-// a move to the node's current parents. Unless the caller is an admin,
+// excepted, which the catalog's key's rules refuse (§B.11.3) and, unless
+// the caller is an admin, the grant's own rules too: a rename is a move
+// to the node's current parents. Unless the caller is an admin,
 // its patch set must begin with a test of /parents against the node's
 // parents as decided, which the answer gives as parents (a rule on
 // /patches/0), so it moves the node only from where it was judged: a
@@ -1602,7 +1634,14 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 			incs = s.includesAt(g, incs)
 			o.readTrusted()
 			if subj, at, role, bad := s.widens(g, name, tos, incs); bad {
-				err = forbidden("the move would give %s the role %s on %s", subj, role, g.Href(at))
+				// Nothing about a node hidden from the caller appears, not
+				// its name nor its roles (§B.11, §B.11.5): the refusal then
+				// names only the moved node, which the caller sees (node).
+				if an := g.Node(at); an == nil || !o.sees(an) {
+					err = forbidden("the move would widen access below %s", name)
+				} else {
+					err = forbidden("the move would give %s the role %s on %s", subj, role, g.Href(at))
+				}
 				return
 			}
 			parents = n.RawParents()
@@ -1621,8 +1660,11 @@ func (s *Service) planMove(ctx context.Context, v *grant.Verified, node string, 
 	}
 	rules := []any{resourceRule(name), parentsRule(cat, tos)}
 	if !admin {
+		// $access excepted in the grant itself, as Create a folder's and
+		// Place's are, not only by the catalog's key's rules (§B.11.3).
 		rules = append(rules, map[string]any{"op": "test", "path": "/patches/0",
-			"value": map[string]any{"op": "test", "path": "/parents", "value": parents}})
+			"value": map[string]any{"op": "test", "path": "/parents", "value": parents}},
+			map[string]any{"not": map[string]any{"op": "writes", "overlaps": "/$access"}})
 	}
 	return &plan{ns: cat, resource: name, can: []string{"append"}, cp: cp, checkpoint: checkpoint, key: signer, rules: rules,
 		parents: parents, head: head, expBy: expBy}, nil

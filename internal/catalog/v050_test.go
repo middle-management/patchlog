@@ -121,8 +121,9 @@ func TestDecisionCheckpoint(t *testing.T) {
 		{"no such node", map[string]any{"node": "matches.ghost", "want": toAny("delete")}, 404, true, nil},
 		{"already placed", map[string]any{"item": "/r/matches/derby", "want": toAny("place"), "to": toAny("season")}, 409, true, nil},
 		{"unknown verb", map[string]any{"item": "/r/matches/derby", "want": toAny("fly")}, 400, false, nil},
-		// Decided from the catalog alone.
-		{"not a folder", map[string]any{"node": "nf", "want": toAny("create"), "to": toAny("matches.derby")}, 404, true, w.checkpointOf()},
+		// A to entry that isn't a folder is answered as a hidden folder
+		// is, checkpoint included: every trusted namespace (§B.11.5).
+		{"not a folder", map[string]any{"node": "nf", "want": toAny("create"), "to": toAny("matches.derby")}, 404, true, nil},
 	} {
 		r := w.issue(bob, c.req, c.status)
 		want := cp
