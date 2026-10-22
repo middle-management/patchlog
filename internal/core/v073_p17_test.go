@@ -300,6 +300,69 @@ func p17Rate(t *testing.T, what string, err error, limit string, wait float64) {
 	}
 }
 
+// A dry run draws tokens as the submit would, and against a drained
+// bucket is 429 rate with Retry-After (§6.6 Dry runs, §7.5).
+func TestV073P17DryRunRateLimited(t *testing.T) {
+	var clock atomic.Int64
+	clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+	lim := p17Fast()
+	lim.RatePerPrincipal = Rate{1, 2}
+	e := p17RateEngine(t, pgtest.DB(t), t.TempDir(), &clock, lim, false)
+	mkNS(t, e, "n", map[string]any{})
+	w := Credentials{Author: "w"}
+	create := func(name string) Item {
+		return Item{Resource: name, IfNoneMatch: true, Steps: []Step{{Patches: []any{map[string]any{"op": "add", "path": "", "value": map[string]any{}}}}}}
+	}
+	ctx := context.Background()
+	if _, err := v073CreateIn(e, "n", w, "a"); err != nil {
+		t.Fatal(err)
+	}
+	// The dry run takes the bucket's last token, so the submit finds it
+	// empty.
+	if _, err := e.Batch(ctx, Request{NS: "n", Cred: w}, []Item{create("b")}, nil, nil, true); err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	_, err := e.Batch(ctx, Request{NS: "n", Cred: w}, []Item{create("b")}, nil, nil, false)
+	p17Rate(t, "submit after the dry run", err, "ratePerPrincipal", 1)
+	_, err = e.Batch(ctx, Request{NS: "n", Cred: w}, []Item{create("b")}, nil, nil, true)
+	p17Rate(t, "dry run on the drained bucket", err, "ratePerPrincipal", 1)
+}
+
+// With two buckets empty, retryAfter is the wait until both hold a token:
+// the longer one, whichever bucket it is (§6.6 Exceeding one).
+func TestV073P17RetryAfterLongestWait(t *testing.T) {
+	for _, c := range []struct {
+		principal, resource Rate
+		limit               string
+		wait                float64
+	}{
+		{Rate{1, 1}, Rate{0.25, 1}, "ratePerResource", 4},
+		{Rate{0.2, 1}, Rate{0.5, 1}, "ratePerPrincipal", 5},
+	} {
+		var clock atomic.Int64
+		clock.Store(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC).UnixMilli())
+		lim := p17Fast()
+		lim.RatePerPrincipal, lim.RatePerResource = c.principal, c.resource
+		e := p17RateEngine(t, pgtest.DB(t), t.TempDir(), &clock, lim, false)
+		mkNS(t, e, "n", map[string]any{})
+		id, err := put(e, "n", "a", "", 1)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = put(e, "n", "a", id, 2)
+		p17Rate(t, c.limit, err, c.limit, c.wait)
+		// Half the wait refills the faster bucket only: still refused, by
+		// the slower one, for what is left of its wait.
+		clock.Add(int64(c.wait * 500))
+		_, err = put(e, "n", "a", id, 2)
+		p17Rate(t, c.limit+", halfway", err, c.limit, c.wait/2)
+		clock.Add(int64(c.wait * 500))
+		if _, err := put(e, "n", "a", id, 2); err != nil {
+			t.Fatalf("%s: after the wait: %v", c.limit, err)
+		}
+	}
+}
+
 // Instances sharing a Postgres database share their buckets: a bucket's
 // check and deduction are one atomic step across them, so together they
 // admit no more than its burst before it refills, and a request refused
