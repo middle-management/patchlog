@@ -406,6 +406,13 @@ BEGIN
   SELECT cur.key, cur.tokens, ok.ok FROM cur, ok;
 END
 $draw$;
+-- Sealed namespaces whose rotation after a revocation is due,
+-- recorded with the revocation and cleared by the next new epoch;
+-- retried until then (Options.RotateOnRevoke, sealed.go).
+CREATE TABLE IF NOT EXISTS rotations_due (
+  ns    bigint PRIMARY KEY REFERENCES namespaces,
+  since bigint NOT NULL
+);
 `
 
 // openPG opens a Postgres database and creates or migrates its schema.

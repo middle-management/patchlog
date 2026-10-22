@@ -373,7 +373,9 @@ func (g *grantExporter) epochKey(ctx context.Context, ns, kid string) ([]byte, e
 		return nil, fmt.Errorf("export: keys of %s for its grants: %w", ns, err)
 	}
 	for _, e := range got {
-		if e.Kid != kid || e.Resource != "" {
+		// A keyring entry an e2e namespace relays (from, §E.3.2) isn't an
+		// epoch key the server holds: grants are sealed under those only.
+		if e.Kid != kid || e.Resource != "" || e.From != "" {
 			continue
 		}
 		key := e.Key

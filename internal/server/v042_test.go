@@ -183,7 +183,8 @@ func TestV042Grants(t *testing.T) {
 	gid := grantIDOf(t, w)
 	r := s.get("/ns/s/grants/"+gid, w)
 	expect(t, r, 200)
-	if !isJOSE(r) || r.H.Get("Cache-Control") != ccImmutable {
+	// read "grant": private, sealed or not (v0.63 §E.2.5).
+	if !isJOSE(r) || r.H.Get("Cache-Control") != "private, max-age=300" {
 		t.Fatalf("sealed grant headers %v", r.H)
 	}
 	keys, kr := s.keysOf("s", nil, w)

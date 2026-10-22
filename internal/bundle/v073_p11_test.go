@@ -717,14 +717,14 @@ func TestV073SealedPublicTargetRanksPublic(t *testing.T) {
 // e2eChain writes a full-history bundle of e2e namespace ns: one document,
 // name, whose revisions have the patch sets given (nil for a tombstone),
 // and a keyring whose revisions are the keyrings given, if any.
-func e2eChain(t *testing.T, ns, name string, keyrings []*seal.Keyring, patchSets ...[]any) []byte {
+func e2eChain(t *testing.T, ns, name string, keyrings []*seal.KeyringV2, patchSets ...[]any) []byte {
 	t.Helper()
 	return e2eBundle(t, ns, name, "", keyrings, patchSets...)
 }
 
 // e2eBundle is e2eChain with the document's chain going on from requires,
 // an incremental document, unless requires is "".
-func e2eBundle(t *testing.T, ns, name, requires string, keyrings []*seal.Keyring, patchSets ...[]any) []byte {
+func e2eBundle(t *testing.T, ns, name, requires string, keyrings []*seal.KeyringV2, patchSets ...[]any) []byte {
 	t.Helper()
 	chain := func(res string, sets [][]any, head string) (ls []bundle.Line, _ string) {
 		for _, ps := range sets {
@@ -785,7 +785,7 @@ func TestV073E2ELinesAtStep1(t *testing.T) {
 	t.Parallel()
 	k := seal.NewKey()
 	reader := identity(t)
-	kr := must(seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{reader.PublicKey()}))
+	kr := must(seal.BuildKeyringV2(reader, "e", 1, k, []*ecdh.PublicKey{reader.PublicKey()}))
 	g := client.GenesisPatches(map[string]any{"v": 1.0})
 	for name, c := range map[string]struct {
 		sets [][]any
@@ -798,7 +798,7 @@ func TestV073E2ELinesAtStep1(t *testing.T) {
 			"isn't one sealed op"},
 		"plaintext after sealed": {[][]any{sealedSet(t, k, "e#1", "e", "d", "", g), ops(op("add", "/w", 2.0))}, "isn't one sealed op"},
 	} {
-		b := e2eChain(t, "e", "d", []*seal.Keyring{kr}, c.sets...)
+		b := e2eChain(t, "e", "d", []*seal.KeyringV2{kr}, c.sets...)
 		dst := newEncDeployment(t, cmsOrigin)
 		_, err := bundle.Import(ctx, dst.c, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true, AllowLessProtected: true})
 		var ae *bundle.AccessError
@@ -817,7 +817,7 @@ func TestV073E2ELinesAtStep1(t *testing.T) {
 	id2 := must(client.ExpectedRevision(id1, must(client.ToValue(s2))))
 	restore := must(client.ExpectedRevision(must(client.ExpectedTombstone(id2)), []any{}))
 	dst := newEncDeployment(t, cmsOrigin)
-	importB(t, dst, e2eChain(t, "e", "d", []*seal.Keyring{kr}, s1, s2, nil, []any{}), bundle.ImportOptions{})
+	importB(t, dst, e2eChain(t, "e", "d", []*seal.KeyringV2{kr}, s1, s2, nil, []any{}), bundle.ImportOptions{})
 	if h := dst.head("e", "d"); h.ID != restore || h.State != client.Live {
 		t.Fatalf("sealed lines, a tombstone and a restore: %+v", h)
 	}
@@ -894,7 +894,7 @@ func epochInForce(t *testing.T, d *deployment) *client.Client {
 type e2eSource struct {
 	src            *deployment
 	k1, k2         []byte
-	kr1            *seal.Keyring
+	kr1            *seal.KeyringV2
 	d0, d1         string
 	before, after  []byte
 	krGenesis, kr2 string
@@ -905,7 +905,7 @@ func newE2ESource(t *testing.T) *e2eSource {
 	s := &e2eSource{src: newEncDeployment(t, stagingOrigin), k1: seal.NewKey(), k2: seal.NewKey()}
 	s.src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
 	reader := identity(t)
-	kr := must(seal.BuildKeyring("e", 1, s.k1, []*ecdh.PublicKey{reader.PublicKey()}))
+	kr := must(seal.BuildKeyringV2(reader, "e", 1, s.k1, []*ecdh.PublicKey{reader.PublicKey()}))
 	s.krGenesis = s.src.create("e", "keyring", kr.Value())
 	s.d0 = e2eWrite(t, s.src, s.k1, "e#1", "e", "d", "", client.GenesisPatches(map[string]any{"v": 1.0}))
 	export := func() []byte {
@@ -915,7 +915,7 @@ func newE2ESource(t *testing.T) *e2eSource {
 		return buf.Bytes()
 	}
 	s.before = export()
-	must(kr.Rotate(s.k2, []*ecdh.PublicKey{reader.PublicKey()}))
+	noErr(t, kr.Add(reader, reader.PublicKey(), "e#2", s.k2))
 	h := must(s.src.c.NSHead(ctx, "e"))
 	res := must(s.src.c.Batch(ctx, "e", client.BatchRequest{Config: &client.BatchConfig{IfMatch: h.Config, Patches: ops(op("add", "/encryption/epoch", 2.0))},
 		Items: []client.BatchItem{{Resource: "keyring", IfMatch: s.krGenesis, Steps: []client.Step{client.PatchStep(ops(op("replace", "", kr.Value())))}}}}, false))
@@ -993,7 +993,7 @@ func TestV073E2EEpochsInterleaved(t *testing.T) {
 	// An existing target below the bundle's lowest epoch: refused.
 	src3 := newEncDeployment(t, stagingOrigin)
 	src3.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": 2.0}})
-	kr := must(seal.BuildKeyring("e", 2, s.k2, []*ecdh.PublicKey{identity(t).PublicKey()}))
+	kr := keyringOf(t, "e", 2, s.k2)
 	src3.create("e", "keyring", kr.Value())
 	e2eWrite(t, src3, s.k2, "e#2", "e", "x", "", client.GenesisPatches(map[string]any{"v": 3.0}))
 	var b3 bytes.Buffer
@@ -1013,7 +1013,7 @@ func TestV073E2EKeyringConflict(t *testing.T) {
 	s := newE2ESource(t)
 	dst := newEncDeployment(t, cmsOrigin)
 	dst.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": 2.0}})
-	other := must(seal.BuildKeyring("e", 2, seal.NewKey(), []*ecdh.PublicKey{identity(t).PublicKey()}))
+	other := keyringOf(t, "e", 2, seal.NewKey())
 	own := dst.create("e", "keyring", other.Value())
 	importErr(t, dst, s.after, bundle.ImportOptions{Resolutions: map[string]bundle.Resolution{"e/keyring": bundle.ResolveSkip}},
 		"the target's keyring has a different history from the bundle's")
@@ -1071,7 +1071,7 @@ func TestV073AtomicItemLimitIsNotBatchTooLarge(t *testing.T) {
 func TestV073E2EEmptyPatchSetOnlyRestores(t *testing.T) {
 	t.Parallel()
 	k := seal.NewKey()
-	kr := must(seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{identity(t).PublicKey()}))
+	kr := keyringOf(t, "e", 1, k)
 	g := client.GenesisPatches(map[string]any{"v": 1.0})
 	s1 := sealedSet(t, k, "e#1", "e", "d", "", g)
 	id1 := must(client.ExpectedRevision("", must(client.ToValue(s1))))
@@ -1089,7 +1089,7 @@ func TestV073E2EEmptyPatchSetOnlyRestores(t *testing.T) {
 		"[] created with":                {{}},
 	} {
 		dst := newEncDeployment(t, cmsOrigin)
-		refused(name, dst, e2eChain(t, "e", "d", []*seal.Keyring{kr}, sets...))
+		refused(name, dst, e2eChain(t, "e", "d", []*seal.KeyringV2{kr}, sets...))
 		if _, err := dst.c.NSHead(ctx, "e"); !client.IsNotFound(err) {
 			t.Errorf("%s: the refused import created e: %v", name, err)
 		}
@@ -1099,13 +1099,13 @@ func TestV073E2EEmptyPatchSetOnlyRestores(t *testing.T) {
 	// restore where requires is a tombstone in the target, refused where
 	// it is live.
 	dst := newEncDeployment(t, cmsOrigin)
-	importB(t, dst, e2eChain(t, "e", "d", []*seal.Keyring{kr}, s1, nil), bundle.ImportOptions{})
+	importB(t, dst, e2eChain(t, "e", "d", []*seal.KeyringV2{kr}, s1, nil), bundle.ImportOptions{})
 	importB(t, dst, e2eBundle(t, "e", "d", tomb, nil, []any{}), bundle.ImportOptions{})
 	if h := dst.head("e", "d"); h.State != client.Live || h.ID != must(client.ExpectedRevision(tomb, []any{})) {
 		t.Fatalf("a restore after requires: %+v", h)
 	}
 	dst2 := newEncDeployment(t, cmsOrigin)
-	importB(t, dst2, e2eChain(t, "e", "d", []*seal.Keyring{kr}, s1), bundle.ImportOptions{})
+	importB(t, dst2, e2eChain(t, "e", "d", []*seal.KeyringV2{kr}, s1), bundle.ImportOptions{})
 	refused("[] appended to requires", dst2, e2eBundle(t, "e", "d", id1, nil, []any{}))
 	if h := dst2.head("e", "d"); h.ID != id1 {
 		t.Fatalf("the refused import wrote: %+v", h)
@@ -1203,13 +1203,12 @@ func TestV073E2ERaiseOverSkippedEpoch(t *testing.T) {
 	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
 	reader := identity(t)
 	k1, k3 := seal.NewKey(), seal.NewKey()
-	kr := must(seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()}))
+	kr := must(seal.BuildKeyringV2(reader, "e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()}))
 	krGenesis := src.create("e", "keyring", kr.Value())
 	d0 := e2eWrite(t, src, k1, "e#1", "e", "d", "", client.GenesisPatches(map[string]any{"v": 1.0}))
 	h := must(src.c.NSHead(ctx, "e"))
 	must(src.c.PatchConfig(ctx, "e", h.Config, ops(op("add", "/encryption/epoch", 2.0))))
-	noErr(t, kr.Add(reader.PublicKey(), 3, k3))
-	kr.Current = 3
+	noErr(t, kr.Add(reader, reader.PublicKey(), "e#3", k3))
 	h = must(src.c.NSHead(ctx, "e"))
 	res := must(src.c.Batch(ctx, "e", client.BatchRequest{Config: &client.BatchConfig{IfMatch: h.Config, Patches: ops(op("replace", "/encryption/epoch", 3.0))},
 		Items: []client.BatchItem{{Resource: "keyring", IfMatch: krGenesis, Steps: []client.Step{client.PatchStep(ops(op("replace", "", kr.Value())))}}}}, false))

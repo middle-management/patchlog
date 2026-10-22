@@ -178,6 +178,80 @@ func (kr *KeyringV2) Add(sender *ecdh.PrivateKey, recipient *ecdh.PublicKey, kid
 	return nil
 }
 
+// BuildKeyringV2 starts the keyring of ns with epochKey, the K_e of epoch,
+// wrapped for each reader in auth mode under the admin key sender (Add).
+// Readers repeated, or the same key as another, get one entry.
+func BuildKeyringV2(sender *ecdh.PrivateKey, ns string, epoch int, epochKey []byte, readers []*ecdh.PublicKey) (*KeyringV2, error) {
+	kr := &KeyringV2{}
+	for _, r := range readers {
+		if err := kr.Add(sender, r, Kid(ns, epoch), epochKey); err != nil {
+			return nil, err
+		}
+	}
+	return kr, nil
+}
+
+// Relayed is the entry as /keys relays it (§E.2.3): kid, from and wrapped.
+func (e KeyringEntry) Relayed() WrappedKey {
+	return WrappedKey{Kid: e.Kid, From: e.From, Wrapped: e.Wrapped}
+}
+
+// To returns the entries for the recipient thumbprint to, in order.
+func (kr *KeyringV2) To(to string) []KeyringEntry {
+	var out []KeyringEntry
+	for _, e := range kr.Entries {
+		if e.To == to {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// Recipients returns the recipient thumbprints of kid's entries, sorted.
+func (kr *KeyringV2) Recipients(kid string) []string {
+	var out []string
+	for _, e := range kr.Entries {
+		if e.Kid == kid {
+			out = append(out, e.To)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// Current returns the newest epoch of namespace ns that some entry holds
+// a key of, 0 if none.
+func (kr *KeyringV2) Current(ns string) int {
+	eps := kr.Epochs(ns)
+	if len(eps) == 0 {
+		return 0
+	}
+	return eps[len(eps)-1]
+}
+
+// UnwrapRelayed opens a key /keys relays (§E.2.3) with priv: a keyring
+// entry, which names its sender's thumbprint in From, in auth mode under
+// the one of senders it names, failing unless senders holds it (anyone
+// can wrap to a thumbprint, §E.3.2); a key without From in base mode, under
+// the HPKE info of v0.63 or, for an entry of a keyring stored before
+// (Keyring) relayed as stored, the info of that time. Every info binds the
+// kid (and a K_r's name), so a key can't be presented as another epoch's.
+func UnwrapRelayed(priv *ecdh.PrivateKey, w WrappedKey, senders []*ecdh.PublicKey) ([]byte, error) {
+	if w.From == "" {
+		k, err := UnwrapKey(priv, w)
+		if err != nil {
+			k, err = UnwrapKeyLegacy(priv, w)
+		}
+		return k, err
+	}
+	for _, s := range senders {
+		if s != nil && Thumbprint(s) == w.From {
+			return UnwrapKeyAuth(priv, s, w)
+		}
+	}
+	return nil, fmt.Errorf("seal: the key of %s is from %s, which isn't a known sender", w.Kid, w.From)
+}
+
 // Open unwraps the entry's key with the recipient's private key and the
 // public key of the sender its from names. It fails unless to and from
 // are the thumbprints of those keys, and with ErrDecrypt unless sender

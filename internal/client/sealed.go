@@ -122,6 +122,11 @@ func (k *Keys) key(ctx context.Context, c *Client, kid, resource string) ([]byte
 		return nil, err
 	}
 	for _, e := range got {
+		if e.From != "" {
+			// A keyring entry an e2e namespace relays (§E.3.2): E2E opens
+			// those, with the senders it knows.
+			continue
+		}
 		key := e.Key
 		if key == nil {
 			if k.recipient == nil {
@@ -146,13 +151,16 @@ func (k *Keys) key(ctx context.Context, c *Client, kid, resource string) ([]byte
 // WithKeys decrypts sealed namespaces with keys from k (Addendum E.2).
 func WithKeys(k *Keys) Option { return func(c *Client) { c.keys = k } }
 
-// KeyEntry is one key of a POST /ns/{ns}/keys answer: Key is set for a raw
-// key, Wrapped for one wrapped to the grant's enc.
+// KeyEntry is one key of a POST /ns/{ns}/keys answer (§E.2.3): Key is set
+// for a raw key, Wrapped for one wrapped to the grant's enc.
 type KeyEntry struct {
 	Kid      string
-	Resource string // set for a per-resource key K_r
-	Key      []byte
-	Wrapped  seal.WrappedKey
+	Resource string // the answer's name: set for a per-resource key K_r
+	// From is set for a keyring entry an e2e namespace relays (§E.3.2):
+	// the thumbprint of the admin key that wrapped it in HPKE auth mode.
+	From    string
+	Key     []byte
+	Wrapped seal.WrappedKey
 }
 
 // KeysAnswer is a POST /ns/{ns}/keys answer (§E.2.3): the keys, and the
@@ -210,7 +218,11 @@ func (c *Client) FetchKeysAnswer(ctx context.Context, ns string, epochs []int, r
 	arr, _ := obj["keys"].([]any)
 	for _, x := range arr {
 		m, _ := x.(map[string]any)
-		e := KeyEntry{Kid: str(m, "kid"), Resource: str(m, "resource")}
+		// A K_r's resource is "name"; servers before v0.63 said "resource".
+		e := KeyEntry{Kid: str(m, "kid"), Resource: str(m, "name")}
+		if e.Resource == "" {
+			e.Resource = str(m, "resource")
+		}
 		if ks, ok := m["key"].(string); ok {
 			if e.Key, err = base64.RawURLEncoding.DecodeString(ks); err != nil || len(e.Key) != seal.KeySize {
 				return nil, fmt.Errorf("client: %s: malformed key", e.Kid)
@@ -220,6 +232,7 @@ func (c *Client) FetchKeysAnswer(ctx context.Context, ns string, epochs []int, r
 		} else if e.Wrapped.Kid != e.Kid || e.Wrapped.Resource != e.Resource {
 			return nil, fmt.Errorf("client: %s: wrapped key mismatch", e.Kid)
 		}
+		e.From = e.Wrapped.From
 		out.Keys = append(out.Keys, e)
 	}
 	return out, nil

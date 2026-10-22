@@ -39,10 +39,13 @@ import (
 	"crypto/ecdh"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"slices"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -103,13 +106,67 @@ func epochAAD(ns int64, epoch int) []byte {
 }
 
 // cachePublic reports whether a namespace's responses use the public cache
-// classes of §9: public namespaces, and sealed and e2e ones whatever their
-// read mode (§E.2.5): they only ever serve ciphertext.
+// classes of §9. Sealed and e2e namespaces are cached by their read mode
+// like any other (§E.2.5): a public one publicly, its ciphertext opening
+// only to key holders; one with read "grant" privately, with edge
+// lifetimes only on a read its verifying edge verified.
 func (t *tx) cachePublic(n *nsRow) bool { return t.config(n.configSeq).cachePublic() }
 
 // cachePublic reports whether a namespace with this document uses the
 // public cache classes (see tx.cachePublic).
-func (c *Config) cachePublic() bool { return c.Read == "public" || c.level >= levelSealed }
+func (c *Config) cachePublic() bool { return c.Read == "public" }
+
+// purgeGrantCaches is the data migration for cachePublic's change (RH-44):
+// versions before v0.73 cached every sealed and e2e namespace publicly,
+// and nothing purges the edge copies they left of those whose read isn't
+// "public" (a config write purges ns:{ns} only when it changes
+// cachePublic), which serve the ciphertext and the metadata read "grant"
+// hides (§E.2.5) until they expire. It queues their ns:{ns} purge in
+// cdn_repurge, due at once, which the leader sends (repurgeLoop) as it
+// sends any write's second purge. The level and read are read from each
+// namespace's current document, stored in plaintext; a remote branch's
+// shadows ("~…") serve under the branch's name.
+func purgeGrantCaches(ctx context.Context, tx *sql.Tx, ph func(n int) string) error {
+	rows, err := tx.QueryContext(ctx, `SELECT n.name, c.doc FROM namespaces n JOIN ns_config c ON c.seq = n.config_seq ORDER BY n.name`)
+	if err != nil {
+		return err
+	}
+	var tags []string
+	for rows.Next() {
+		var name string
+		var doc sql.NullString
+		if err := rows.Scan(&name, &doc); err != nil {
+			rows.Close()
+			return err
+		}
+		var d struct {
+			Read       any `json:"read"`
+			Encryption struct {
+				Level string `json:"level"`
+			} `json:"encryption"`
+		}
+		if !strings.HasPrefix(name, "~") && doc.Valid && json.Unmarshal([]byte(doc.String), &d) == nil &&
+			levelOf(d.Encryption.Level) >= levelSealed && d.Read != "public" {
+			tags = append(tags, "ns:"+name)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for len(tags) > 0 {
+		n := min(len(tags), 100)
+		b, err := json.Marshal(tags[:n])
+		if err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO cdn_repurge (tags, due) VALUES (`+ph(1)+`, 0)`, string(b)); err != nil {
+			return err
+		}
+		tags = tags[n:]
+	}
+	return nil
+}
 
 // isSealedNS reports whether n serves sealed content.
 func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == levelSealed }
@@ -120,6 +177,13 @@ func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == l
 // sealed document beginning a new epoch gets its epoch key, and with
 // -rotate-on-revoke a change that revokes access (a new revocation, a key
 // removed or changed) queues a rotation.
+//
+// The rotation is recorded as due (rotations_due) in the same transaction
+// as the revocation, for n and the sealed branches it reaches (§C.4), so
+// a rotation that fails after the commit, or a crash before it, is retried
+// (RetryRotations): a revoked reader mustn't keep the current epoch key
+// (§E.2.4). A new epoch, whoever begins it (a rotation, or an operator's
+// config write), is the rotation that was due.
 func (t *tx) sealedConfigWritten(n *nsRow, old, cfg *Config) {
 	t.e2eConfigWritten(n, old, cfg)
 	if cfg.level != levelSealed {
@@ -127,10 +191,27 @@ func (t *tx) sealedConfigWritten(n *nsRow, old, cfg *Config) {
 	}
 	if old == nil || old.level != levelSealed || old.Epoch != cfg.Epoch {
 		t.createEpochKey(n.id, cfg.Epoch)
+		_, err := t.Exec(`DELETE FROM rotations_due WHERE ns = ?`, n.id)
+		t.must(err)
 		return
 	}
 	if revokesAccess(old, cfg) {
+		if t.e.opt.RotateOnRevoke {
+			t.markRotationDue(n)
+		}
 		t.rotate = append(t.rotate, n.name)
+	}
+}
+
+// markRotationDue records that n, and every sealed branch below it, needs
+// a rotation after a revocation (sealedConfigWritten).
+func (t *tx) markRotationDue(n *nsRow) {
+	if t.isSealedNS(n) {
+		_, err := t.Exec(`INSERT INTO rotations_due (ns, since) VALUES (?, ?) ON CONFLICT (ns) DO NOTHING`, n.id, t.now.UnixMilli())
+		t.must(err)
+	}
+	for _, b := range t.allBranchesOf(n) {
+		t.markRotationDue(b)
 	}
 }
 
@@ -365,13 +446,16 @@ func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 }
 
 // rangeJob prepares the sealing of n's namespace log range (since, to],
-// where to is ns_log seq toSeq with id toID.
+// where to is ns_log seq toSeq with id toID: a range, long-poll answer or
+// namespace event is sealed under K_e of the current epoch (§E.2.2), not
+// that of its last entry. A stored range keeps its bytes; one evicted is
+// sealed again under the epoch current then.
 func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j
 	}
-	e := t.entryEpoch(n, toSeq)
+	e := t.config(n.configSeq).Epoch
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()
 	j.pad = t.config(n.configSeq).Pad
 	return j
@@ -460,20 +544,19 @@ type KeysAnswer struct {
 	Pad   bool
 }
 
-// Keys answers POST /ns/{ns}/keys. It needs a verified grant with read on
-// the namespace (with authentication disabled, anyone gets raw epoch keys).
-// A grant that reads the namespace unrestricted (§2.1: with roles, through
-// one without /resource rules that passes) gets K_e; one restricted by
-// rules on /resource or a key with readScope "resource" gets K_r for each
-// requested resource it may read; any other is 403. Epochs run from the
-// one in force at the root block's nbf (without nbf: the first, capped to
-// the last historyEpochs) to the current one, and never include an epoch
-// that started after the grant's effective exp (§E.2.3). Keys are
-// HPKE-wrapped to the root block's enc if it has one, and raw base64url
-// otherwise. At E3 any grant with read, whatever its rules, gets the
-// keyring entries wrapped to its enc (§E.3.2). A namespace that isn't
+// Keys answers POST /ns/{ns}/keys (§E.2.3). It needs a verified grant
+// with read on the namespace (with authentication disabled, anyone gets
+// raw epoch keys). At E2 a grant whose rules fix /resource (§2.1) gets
+// K_r for the names asked, by default every name it fixes, and is 403 for
+// a name it doesn't fix or may not read; any other gets K_e if it reads
+// the namespace unrestricted, and is 403 otherwise (keysScope). Epochs are
+// those of the §E.2.3 window (grantEpochsOf), narrowed to those asked.
+// Keys are HPKE-wrapped to the root block's enc if it has one, and raw
+// base64url otherwise. At E3 any grant with read, whatever its rules, gets
+// the keyring entries wrapped to its enc (§E.3.2). A namespace that isn't
 // sealed is 404 not_offered, once the read check passes: there is nothing
-// to seal (§E.2.3).
+// to seal (§E.2.3). A request answered with keys draws one token from the
+// principal's exchangeRate bucket, as /edge-grants does (§6.6).
 func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysRequest) (*KeysAnswer, error) {
 	var out []map[string]any
 	var ans *KeysAnswer
@@ -493,7 +576,6 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		if aerr != nil {
 			return aerr
 		}
-		perResource, refused := t.keysReadScope(a)
 		if cfg.level == levelE2E {
 			// The server only relays the keyring entries a key holder
 			// wrapped to the grant's enc (§E.3.2), so a grant that reads
@@ -501,7 +583,7 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			// resources: such a writer needs them, and the epoch and pad,
 			// to seal (§E.2.3, §E.3.1). Per-resource keys don't exist at
 			// E3. A grant whose rules refuse every read reads nothing.
-			if refused {
+			if _, refused := t.keysReadScope(a); refused {
 				return notFound()
 			}
 			// 410 once the read check passes, as every URL of a
@@ -516,8 +598,11 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			ans = &KeysAnswer{Keys: keys, Epoch: cfg.Epoch, Level: levelNames[cfg.level], Pad: cfg.Pad}
 			return nil
 		}
-		if refused {
-			return forbidden("epoch keys need unrestricted read on the namespace (§2.1, §E.2.3)")
+		// §E.2.3's test is part of the read check, so it comes before a
+		// purged namespace's 410 and not_offered (§8.5).
+		names, perResource, serr := t.keysScope(a, kr)
+		if serr != nil {
+			return serr
 		}
 		if n.purged {
 			return t.purgedNS(n)
@@ -525,20 +610,10 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 		if cfg.level != levelSealed {
 			return apiErr(404, "not_offered", "message", "the namespace is not sealed: there are no keys, and nothing to seal (§E.2.3)")
 		}
-		epochs := t.grantEpochs(n, cfg, a)
-		if kr.Epochs != nil {
-			want := map[int]bool{}
-			for _, x := range kr.Epochs {
-				want[x] = true
-			}
-			var keep []int
-			for _, x := range epochs {
-				if want[x] {
-					keep = append(keep, x)
-				}
-			}
-			epochs = keep
+		if err := t.drawExchange(a); err != nil {
+			return err
 		}
+		epochs := selectEpochs(t.grantEpochs(n, cfg, a), kr.Epochs)
 		var enc = recipientOf(a)
 		emit := func(kid, resource string, key []byte) error {
 			if enc != nil {
@@ -551,24 +626,10 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 			}
 			m := map[string]any{"kid": kid, "key": base64.RawURLEncoding.EncodeToString(key)}
 			if resource != "" {
-				m["resource"] = resource
+				m["name"] = resource
 			}
 			out = append(out, m)
 			return nil
-		}
-		var names []string
-		if perResource {
-			seen := map[string]bool{}
-			for _, r := range kr.Resources {
-				if !ValidResourceName(r) || seen[r] {
-					continue
-				}
-				seen[r] = true
-				if t.grantRules(a, "read", nil, t.basicEnvelope("read", r, a), false) == nil {
-					names = append(names, r)
-				}
-			}
-			sort.Strings(names)
 		}
 		out = []map[string]any{}
 		for _, ep := range epochs {
@@ -596,7 +657,137 @@ func (e *Engine) Keys(ctx context.Context, ns string, cred Credentials, kr KeysR
 	return ans, err
 }
 
-// keysReadScope classifies a grant for /keys (§C.5, §E.2.3). K_e only
+// drawExchange draws the one token a /keys request takes from the
+// principal's exchangeRate bucket (§E.2.3, §6.6): 429 naming exchangeRate
+// when it is empty.
+func (t *tx) drawExchange(a *actor) *Error {
+	if a == nil || a.bucketKey == "" {
+		return nil
+	}
+	return t.admit([]draw{{"e\x00" + a.bucketKey, t.e.opt.Maximums.ExchangeRate, 1, "exchangeRate"}})
+}
+
+// selectEpochs keeps the epochs of window that asked names, all of them
+// if asked is nil (§E.2.3: by default all).
+func selectEpochs(window, asked []int) []int {
+	if asked == nil {
+		return window
+	}
+	want := map[int]bool{}
+	for _, x := range asked {
+		want[x] = true
+	}
+	var keep []int
+	for _, x := range window {
+		if want[x] {
+			keep = append(keep, x)
+		}
+	}
+	return keep
+}
+
+// keysScope decides what a grant gets from /keys at E2 (§E.2.3): a grant
+// whose rules fix /resource (§2.1, fixedNames) gets K_r for the names
+// asked, by default every name its rules fix, each of which they must fix
+// and the grant may read (403 otherwise), sorted; any other grant gets K_e
+// if it reads the namespace unrestricted (§2.1), and is 403 otherwise, the
+// names asked being ignored. With authentication disabled, every request
+// gets K_e.
+func (t *tx) keysScope(a *actor, kr KeysRequest) (names []string, perResource bool, err *Error) {
+	if a == nil || a.verified == nil {
+		return nil, false, nil
+	}
+	fixed, fixes := fixedNames(a)
+	if !fixes {
+		if !t.readsUnrestricted(a) {
+			return nil, false, forbidden("epoch keys need unrestricted read on the namespace (§2.1, §E.2.3)")
+		}
+		return nil, false, nil
+	}
+	in := make(map[string]bool, len(fixed))
+	for _, n := range fixed {
+		in[n] = true
+	}
+	want := kr.Resources
+	if want == nil {
+		want = fixed
+	}
+	seen := map[string]bool{}
+	names = []string{}
+	for _, r := range want {
+		if seen[r] {
+			continue
+		}
+		seen[r] = true
+		if !in[r] {
+			return nil, false, forbidden(fmt.Sprintf("the grant's rules don't fix /resource to %q, so it gets no key of it (§2.1, §E.2.3)", r))
+		}
+		if t.grantRules(a, "read", nil, t.basicEnvelope("read", r, a), false) != nil {
+			return nil, false, forbidden(fmt.Sprintf("the grant may not read %q, so it gets no key of it (§E.2.3)", r))
+		}
+		names = append(names, r)
+	}
+	sort.Strings(names)
+	return names, true, nil
+}
+
+// readsUnrestricted reports whether a reads the namespace unrestricted
+// (§2.1): it may read, neither its key's scope nor its rules refer to
+// /resource, and, with roles, a read role without such rules passes its
+// rules against a read envelope.
+func (t *tx) readsUnrestricted(a *actor) bool {
+	roles, ok := a.unrestrictedRoles()
+	return ok && t.grantRules(a, "read", roles, t.basicEnvelope("read", "", a), false) == nil
+}
+
+// fixedNames returns the names a's rules fix /resource to (§2.1): a rule
+// of its blocks or its key's scope, at top level or nested only in alls,
+// that tests /resource against one name, or a finite set (fixesResource),
+// each such rule narrowing the names to those all of them allow. It
+// reports false when none fixes it, the set left is empty, or a literal of
+// a fixing rule isn't a valid name (§3.6), even one the intersection
+// drops. Rules that refer to /resource otherwise don't fix it, and are
+// left to the read check per name.
+func fixedNames(a *actor) ([]string, bool) {
+	var names []string
+	fixed, bad := false, false
+	var walk func(rs []any)
+	walk = func(rs []any) {
+		for _, rv := range rs {
+			if m, ok := rv.(map[string]any); ok && len(m) == 1 {
+				if all, ok := m["all"].([]any); ok {
+					walk(all)
+					continue
+				}
+			}
+			if _, ok := grant.ResourceLiterals(rv); !ok {
+				continue
+			}
+			set, ok := fixesResource(rv)
+			if !ok {
+				bad = true
+				continue
+			}
+			if !fixed {
+				names, fixed = set, true
+				continue
+			}
+			in := make(map[string]bool, len(set))
+			for _, n := range set {
+				in[n] = true
+			}
+			names = slices.DeleteFunc(names, func(n string) bool { return !in[n] })
+		}
+	}
+	walk(a.verified.KeyRules)
+	walk(a.verified.BlockRules)
+	if bad || !fixed || len(names) == 0 {
+		return nil, false
+	}
+	return names, true
+}
+
+// keysReadScope classifies a grant for /keys at E3 (§C.5, §E.2.3). K_e only
 // through rules none of which refers to /resource. Roles are
 // alternatives: if the unrestricted ones fail, a read role that refers to
 // /resource may still pass per resource (perResource); without one, the
@@ -650,39 +841,58 @@ func (t *tx) epochStarts(table string, ns int64, max int) []epochStart {
 	return all
 }
 
-// grantEpochsOf applies the §E.2.3 epoch range of a grant to all.
+// latestNbf is the latest nbf among a's blocks (§E.2.3), nil if no block
+// has one or there is no grant.
+func latestNbf(a *actor) *time.Time {
+	if a == nil || a.grant == nil {
+		return nil
+	}
+	var nbf *time.Time
+	for _, b := range a.grant.Blocks {
+		if b.Nbf != nil && (nbf == nil || b.Nbf.After(*nbf)) {
+			nbf = b.Nbf
+		}
+	}
+	return nbf
+}
+
+// grantEpochsOf applies the §E.2.3 window to all, a namespace's epochs and
+// when each began, ascending, up to the current one: from the epoch in
+// force at the last namespace entry created at or before the latest nbf
+// among the grant's blocks, or the first where there is none (the
+// namespace wasn't sealed then); with no nbf in any block, the current
+// epoch alone; and with encryption.historyEpochs h, no more than the
+// current one and the h before it. An epoch begins with the config write,
+// a batch's config change included, that sets it, at that entry's time,
+// so the epoch in force at the last entry at or before nbf is the latest
+// that began at or before it. Epochs that began after the grant's exp are
+// not left out (v0.63). Without a grant (authentication disabled), every
+// epoch, as far as historyEpochs allows.
 func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 	if len(all) == 0 {
 		return nil
 	}
 	first := all[0].e
-	var exp *time.Time
 	if a != nil && a.grant != nil {
-		root := a.grant.Blocks[0]
-		if root.Nbf != nil {
+		nbf := latestNbf(a)
+		if nbf == nil {
+			first = cfg.Epoch
+		} else {
 			for _, x := range all {
-				if !x.created.After(*root.Nbf) {
+				if !x.created.After(*nbf) {
 					first = x.e
 				}
 			}
 		}
-		for _, b := range a.grant.Blocks {
-			if b.Exp != nil && (exp == nil || b.Exp.Before(*exp)) {
-				exp = b.Exp
-			}
-		}
 	}
-	if h := cfg.HistoryEpochs; h > 0 && cfg.Epoch-h+1 > first {
-		first = cfg.Epoch - h + 1
+	if h := cfg.HistoryEpochs; cfg.HistoryCapped && cfg.Epoch-h > first {
+		first = cfg.Epoch - h
 	}
 	var out []int
 	for _, x := range all {
-		// §E.2.3: a grant never receives epochs that started after its
-		// exp. One that starts exactly at exp is included.
-		if x.e < first || (exp != nil && x.created.After(*exp)) {
-			continue
+		if x.e >= first {
+			out = append(out, x.e)
 		}
-		out = append(out, x.e)
 	}
 	return out
 }
@@ -694,14 +904,29 @@ func (t *tx) grantEpochsOf(all []epochStart, cfg *Config, a *actor) []int {
 // retention's): a new epoch key is created and content written from then on
 // is sealed under it. It returns the new epoch.
 func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error) {
-	var epoch int
-	err := e.update(ctx, func(t *tx) error {
+	epoch, _, err := e.rotateEpoch(ctx, ns, author, false)
+	return epoch, err
+}
+
+// rotateEpoch is RotateEpoch; with ifDue, it rotates only while ns has a
+// rotation due (rotations_due), checked under the namespace's lock, so the
+// rotation after a revocation and its retry never both rotate. rotated
+// reports whether it did.
+func (e *Engine) rotateEpoch(ctx context.Context, ns, author string, ifDue bool) (epoch int, rotated bool, err error) {
+	err = e.update(ctx, func(t *tx) error {
 		n := t.nsForWrite(ns)
 		if n == nil {
 			return notFound()
 		}
 		if n.purged {
 			return t.purgedNS(n)
+		}
+		if ifDue {
+			var due int
+			t.must(t.QueryRow(`SELECT COUNT(*) FROM rotations_due WHERE ns = ?`, n.id).Scan(&due))
+			if due == 0 {
+				return nil
+			}
 		}
 		cur := t.config(n.configSeq)
 		if cur.level != levelSealed {
@@ -717,14 +942,20 @@ func (e *Engine) RotateEpoch(ctx context.Context, ns, author string) (int, error
 		aid := t.authorID(author)
 		seq := t.insertConfig(n, p, aid)
 		t.appendNS(n, map[string]any{"kind": "config", "target": p.id.String()}, nil, &seq, seq, aid)
-		epoch = p.cfg.Epoch
+		// The new epoch clears a rotation that was due
+		// (sealedConfigWritten).
+		epoch, rotated = p.cfg.Epoch, true
 		return nil
 	})
-	return epoch, err
+	return epoch, rotated, err
 }
 
 // rotateAfterRevoke rotates each namespace a committed config write revoked
-// access in, and its sealed branches (revocations reach them, §C.4).
+// access in, and its sealed branches (revocations reach them, §C.4), while
+// their rotation is due. The revoking write recorded it as due
+// (sealedConfigWritten), so one that fails here is retried until a
+// rotation succeeds (RetryRotations), and a revoked reader doesn't keep the
+// current epoch key with nothing but a log line (§E.2.4).
 func (e *Engine) rotateAfterRevoke(names []string) {
 	ctx := context.Background()
 	seen := map[string]bool{}
@@ -735,8 +966,8 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 			continue
 		}
 		seen[ns] = true
-		if _, err := e.RotateEpoch(ctx, ns, RotateAuthor); err != nil {
-			log.Printf("rotate-on-revoke %s: %v", ns, err)
+		if _, _, err := e.rotateEpoch(ctx, ns, RotateAuthor, true); err != nil {
+			log.Printf("rotate-on-revoke %s: %v (retried until a rotation succeeds)", ns, err)
 		}
 		_ = e.read(ctx, func(t *tx) error {
 			if n := t.nsByName(ns); n != nil {
@@ -748,6 +979,90 @@ func (e *Engine) rotateAfterRevoke(names []string) {
 			}
 			return nil
 		})
+	}
+}
+
+// RotationsDue lists the namespaces whose rotation after a revocation is
+// due: recorded with the revocation, and no new epoch begun since.
+func (e *Engine) RotationsDue(ctx context.Context) ([]string, error) {
+	var out []string
+	err := e.read(ctx, func(t *tx) error {
+		rows, err := t.Query(`SELECT n.name FROM rotations_due d JOIN namespaces n ON n.ns = d.ns ORDER BY n.name`)
+		t.must(err)
+		defer rows.Close()
+		for rows.Next() {
+			var name string
+			t.must(rows.Scan(&name))
+			out = append(out, name)
+		}
+		return nil
+	})
+	return out, err
+}
+
+// RetryRotations retries the rotations RotationsDue lists and returns the
+// namespaces rotated. One whose namespace was purged, or is no longer
+// sealed, is dropped: nothing is left to rotate.
+func (e *Engine) RetryRotations(ctx context.Context) ([]string, error) {
+	due, err := e.RotationsDue(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var done []string
+	for _, ns := range due {
+		if err := e.jobStep(ctx); err != nil {
+			return done, err
+		}
+		var drop bool
+		if err := e.read(ctx, func(t *tx) error {
+			n := t.nsByName(ns)
+			drop = n == nil || n.purged || t.config(n.configSeq).level != levelSealed
+			return nil
+		}); err != nil {
+			return done, err
+		}
+		if drop {
+			if err := e.update(ctx, func(t *tx) error {
+				_, err := t.Exec(`DELETE FROM rotations_due WHERE ns IN (SELECT ns FROM namespaces WHERE name = ?)`, ns)
+				t.must(err)
+				return nil
+			}); err != nil {
+				return done, err
+			}
+			continue
+		}
+		_, rotated, err := e.rotateEpoch(ctx, ns, RotateAuthor, true)
+		if err != nil {
+			log.Printf("rotate-on-revoke %s: retry: %v", ns, err)
+			continue
+		}
+		if rotated {
+			done = append(done, ns)
+		}
+	}
+	return done, nil
+}
+
+// rotateRetryLoop retries failed rotations (RetryRotations) every minute
+// until Close.
+func (e *Engine) rotateRetryLoop() {
+	defer e.bg.Done()
+	tk := time.NewTicker(time.Minute)
+	defer tk.Stop()
+	for {
+		select {
+		case <-e.stop:
+			return
+		case <-tk.C:
+			if !e.leader(context.Background()) {
+				continue // another instance retries (pglock.go)
+			}
+			if done, err := e.RetryRotations(leaderJob(context.Background())); err != nil {
+				log.Printf("rotate-on-revoke: retrying: %v", err)
+			} else if len(done) > 0 {
+				log.Printf("rotate-on-revoke: rotated %v on retry", done)
+			}
+		}
 	}
 }
 

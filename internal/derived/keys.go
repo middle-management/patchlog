@@ -24,9 +24,11 @@ type Info struct {
 	Level string // encryption.level ("" if none)
 	Epoch int    // encryption.epoch of a sealed or e2e namespace (default 1)
 	Pad   bool   // encryption.pad: sealed payloads are padded (§E.2.2)
-	// HistoryEpochs is encryption.historyEpochs: how many epochs back
-	// readers get keys for (0: all).
+	// HistoryEpochs is encryption.historyEpochs: how many epochs before
+	// the current one readers get keys for (§E.2.3), when HistoryCapped;
+	// all of them without it (§7.4).
 	HistoryEpochs int
+	HistoryCapped bool
 }
 
 // Protected reports whether views derived from the namespace are sealed.
@@ -43,8 +45,8 @@ func InfoOf(doc map[string]any) Info {
 		if f, ok := enc["epoch"].(float64); ok && f >= 1 {
 			in.Epoch = int(f)
 		}
-		if f, ok := enc["historyEpochs"].(float64); ok && f >= 1 {
-			in.HistoryEpochs = int(f)
+		if f, ok := enc["historyEpochs"].(float64); ok && f >= 0 {
+			in.HistoryEpochs, in.HistoryCapped = int(f), true
 		}
 	}
 	return in
@@ -172,7 +174,9 @@ func (k *Keys) EpochKey(ctx context.Context, ns string, epoch int) ([]byte, erro
 			return nil, err
 		}
 		for _, e := range got {
-			if e.Kid != kid || e.Resource != "" {
+			// A K_r (name) or a relayed keyring entry (from, §E.3.2)
+			// can't seal a view.
+			if e.Kid != kid || e.Resource != "" || e.From != "" {
 				continue
 			}
 			key = e.Key
@@ -214,18 +218,19 @@ type ResourceKey struct {
 }
 
 // ResourceKeys derives K_r of ns/name (§E.2.1) for every epoch a reader
-// gets keys for: from the current one back encryption.historyEpochs epochs
-// (all if unset), as far as the service holds their epoch keys. It returns
-// nothing for a namespace that is neither sealed nor e2e, and an error only
-// if not even the current epoch's key is available.
+// gets keys for: the current one and, with encryption.historyEpochs h, the
+// h before it (all if unset, §E.2.3), as far as the service holds their
+// epoch keys. It returns nothing for a namespace that is neither sealed
+// nor e2e, and an error only if not even the current epoch's key is
+// available.
 func (k *Keys) ResourceKeys(ctx context.Context, ns, name string) ([]ResourceKey, error) {
 	in, err := k.Info(ctx, ns)
 	if err != nil || !in.Protected() {
 		return nil, err
 	}
 	first := 1
-	if in.HistoryEpochs > 0 {
-		first = max(1, in.Epoch-in.HistoryEpochs+1)
+	if in.HistoryCapped {
+		first = max(1, in.Epoch-in.HistoryEpochs)
 	}
 	var out []ResourceKey
 	for e := in.Epoch; e >= first; e-- {

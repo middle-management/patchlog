@@ -245,7 +245,7 @@ const readGrantRetries = 3
 // epochs a reader gets (derived.Keys.ResourceKeys), and wrapped (HPKE) to
 // the enc key of the caller's grant in the §E.2.3 format:
 //
-//	"keys": [{ "kid": "{ns}#{e}", "resource": name, "suite", "wrapped" }, …]
+//	"keys": [{ "kid": "{ns}#{e}", "name": name, "wrapped" }, …]
 //
 // A caller whose grant has no enc gets "keysWithheld" instead. Keys of an
 // e2e content namespace are not given: its revisions are sealed by clients

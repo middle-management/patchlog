@@ -246,8 +246,8 @@ func TestHeadMetaEncrypted(t *testing.T) {
 
 	// A public e2e namespace's keyring, served in the clear and from the
 	// transaction-free read cache.
-	pub := newRecipient(t)
-	kr, err := seal.BuildKeyring("pe", 1, seal.NewKey(), []*ecdh.PublicKey{pub})
+	_, pubPriv, _ := seal.GenerateRecipient()
+	kr, err := seal.BuildKeyringV2(pubPriv, "pe", 1, seal.NewKey(), []*ecdh.PublicKey{pubPriv.PublicKey()})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestHeadMetaEncrypted(t *testing.T) {
 	f := newE2E(t, withArchive(t, t.TempDir()))
 	k := seal.NewKey()
 	readerPub, _ := seal.ParseRecipientJWK(f.readerJWK)
-	fkr, err := seal.BuildKeyring("e", 1, k, []*ecdh.PublicKey{readerPub})
+	fkr, err := seal.BuildKeyringV2(f.readerPriv, "e", 1, k, []*ecdh.PublicKey{readerPub})
 	if err != nil {
 		t.Fatal(err)
 	}

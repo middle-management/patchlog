@@ -166,9 +166,11 @@ type Config struct {
 	Encryption string
 	// Epoch is encryption.epoch of a sealed or e2e namespace (§E.2.1,
 	// §E.3.2): 1 if absent, 0 otherwise. HistoryEpochs is encryption.historyEpochs,
-	// 0 if absent (no cap).
+	// 0 if absent; HistoryCapped reports it present (no cap without it,
+	// §7.4), 0 meaning the current epoch alone (§E.2.3).
 	Epoch         int
 	HistoryEpochs int
+	HistoryCapped bool
 	// Pad is encryption.pad of a sealed or e2e namespace: sealed payloads
 	// are padded to size buckets (§E.2.2, seal.PadLen).
 	Pad bool
@@ -933,10 +935,10 @@ func parseConfigIn(doc any, defaults, max Limits, md configMode) (*Config, error
 				}
 				if x, has := e["historyEpochs"]; has {
 					f, ok := x.(float64)
-					if !ok || f < 1 || f != float64(int(f)) || f > 1<<31 {
-						return nil, fmt.Errorf("/encryption/historyEpochs must be a positive integer")
+					if !ok || f < 0 || f != float64(int(f)) || f > 1<<31 {
+						return nil, fmt.Errorf("/encryption/historyEpochs must be an integer ≥ 0")
 					}
-					c.HistoryEpochs = int(f)
+					c.HistoryEpochs, c.HistoryCapped = int(f), true
 				}
 				if x, has := e["pad"]; has {
 					b, ok := x.(bool)

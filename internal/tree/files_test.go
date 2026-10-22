@@ -241,7 +241,7 @@ func TestFileTreeSealed(t *testing.T) {
 	must(w.CreateDoc(ctx, "cat", "root", map[string]any{"parents": []any{}}))
 
 	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", all, []string{"read"}, map[string]any{"enc": svcJWK})),
-		client.WithKeys(client.NewKeys(svcPriv)))
+		client.WithKeys(client.NewKeys(svcPriv)), client.WithKeyringSenders(wPriv.PublicKey()))
 	x := startSvc(t, sc, svcOpts{now: s.Now}, func(o *tree.Options) { o.Recipient = svcPriv })
 	x.caughtUp("cat", "files", "secret")
 

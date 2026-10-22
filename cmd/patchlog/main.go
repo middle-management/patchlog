@@ -96,6 +96,8 @@ func main() {
 		schemaCmd(os.Args[2:])
 	case "health":
 		healthCmd(os.Args[2:])
+	case "e2e":
+		e2eCmd(os.Args[2:])
 	default:
 		usage()
 	}
@@ -117,7 +119,7 @@ func usage() {
   patchlog dav -api URL -ns NS[,NS…] [-catalog NS[,NS…] [-tree-url [CATALOG=]URL]...] [-addr 127.0.0.1:8090] [-bearer GRANT | -bearer-file FILE] [-author A] [-password-file FILE]
                [-gateway [-insecure]] [-tls-cert FILE -tls-key FILE]   (WebDAV, a prototype)
   patchlog merge status|plan|apply -api URL -branch NS [-base NS] [-bearer T] [-author A] [-freeze] [-squash] [-resolve name=file.json]... [-config patches.json] [-json]
-  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-bearer T] [-author A] [-json]
+  patchlog rebase -api URL -branch NS -new NAME [-onto NS] [-switch] [-identity key.jwk]... [-reader pub.jwk]... [-bearer T] [-author A] [-json]
   patchlog janitor -api URL -ns base1,base2 [-dry-run] [-once] [-interval 1m] [-bearer T] [-author A] [-json]
   patchlog export -api URL -ns NS[,NS] [-resource a,b] [-mode history|snapshot] [-o file.jsonl] [-bearer T]
   patchlog import -api URL -ns TARGET -i file.jsonl [-dry-run] (-atomic | -pace 0.5) [-bearer T]
@@ -125,6 +127,7 @@ func usage() {
   patchlog archive restore -db patchlog.db [-blob-dir DIR] [-from file:///path] [-ns NS] [-resource NAME] [-master-key FILE]
   patchlog schema import -api URL -ns NS [-bearer T] [-author A] [-name NAME] [-dry-run] [-json] URL|FILE...
   patchlog health [-timeout 2s] [URL]   (exit 0 if URL, default http://localhost:8080/_health, answers 200)
+  patchlog e2e migrate-keyring -api URL -ns NS -identity admin.jwk [-reader pub.jwk]... [-current-reader pub.jwk]... [-bearer T]
 
 serve, index, tree and dav also take -shutdown-timeout 30s and -shutdown-delay 0 (graceful shutdown) and answer /_health and /_ready.`)
 	os.Exit(2)

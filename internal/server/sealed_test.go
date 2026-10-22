@@ -59,7 +59,7 @@ func (e *tenv) keysOf(ns string, body map[string]any, bearer string) (map[string
 	for _, x := range arr {
 		m := x.(map[string]any)
 		k := m["kid"].(string)
-		if res, ok := m["resource"].(string); ok {
+		if res, ok := m["name"].(string); ok {
 			k += " " + res
 		}
 		if ks, ok := m["key"].(string); ok {
@@ -312,8 +312,9 @@ func TestSealedOutputs(t *testing.T) {
 	}
 }
 
-// read: "grant" still decides who may fetch ciphertext, while caching uses
-// the public classes (§E.2.5).
+// read: "grant" decides who may fetch ciphertext, and caching follows it
+// as for any namespace: private, with no edge lifetimes without a
+// verifying edge (v0.63 §E.2.5).
 func TestSealedReadGrant(t *testing.T) {
 	t.Parallel()
 	e := newSealedAuthEnv(t)
@@ -327,7 +328,7 @@ func TestSealedReadGrant(t *testing.T) {
 	expect(t, e.get("/ns/s/rev/"+e.nsHead("s", w)+"/log", nr), 404)
 	r := e.get("/r/s/a/rev/"+id, w)
 	expect(t, r, 200)
-	if !isJOSE(r) || r.H.Get("Cache-Control") != ccImmutable || r.H.Get("CDN-Cache-Control") != "" {
+	if !isJOSE(r) || r.H.Get("Cache-Control") != "private, max-age=300" || r.H.Get("CDN-Cache-Control") != "no-store" {
 		t.Fatalf("headers %v", r.H)
 	}
 	// Keys need a verified read grant.
@@ -378,10 +379,12 @@ func TestSealedKeys(t *testing.T) {
 	docB := string(e.get("/r/s/b/rev/"+b, star).Body)
 	open(t, docA, resKey(t, ke1, "s", "a"), "s#1", seal.ResourcePL("s", "a", a, "doc"))
 
-	// Per-resource keys for a grant fixed to /resource: only resources it
-	// may read. K_a opens a's documents and not b's.
+	// Per-resource keys for a grant fixed to /resource: K_a opens a's
+	// documents and not b's. A name it doesn't fix is 403 (v0.63 §E.2.3).
 	fixed := e.grant(rk, "user:li", []string{"s"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
-	keys, r = e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, fixed)
+	_, r = e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, fixed)
+	expectCode(t, r, 403, "forbidden")
+	keys, r = e.keysOf("s", map[string]any{"resources": []any{"a"}}, fixed)
 	expect(t, r, 200)
 	ka := keys["s#1 a"]
 	if len(keys) != 1 || ka == nil {
@@ -391,8 +394,9 @@ func TestSealedKeys(t *testing.T) {
 	if _, err := seal.OpenExpect(docB, ka, "s#1", seal.ResourcePL("s", "b", b, "doc")); !errors.Is(err, seal.ErrDecrypt) {
 		t.Fatalf("K_a opened b: %v", err)
 	}
-	// Per-resource grants get no epoch key, and nothing without resources.
-	if keys, _ := e.keysOf("s", nil, fixed); len(keys) != 0 {
+	// Per-resource grants get no epoch key; without resources, the keys
+	// of every name they fix (v0.63 §E.2.3).
+	if keys, _ := e.keysOf("s", nil, fixed); len(keys) != 1 || keys["s#1 a"] == nil {
 		t.Fatalf("per-resource grant without resources got %v", keys)
 	}
 
@@ -419,7 +423,14 @@ func TestSealedKeys(t *testing.T) {
 		}
 		return strings.Join(out, ",")
 	}
+	// Without nbf in any block, the current epoch only (v0.63 §E.2.3);
+	// with one before the first epoch, all of them.
 	keys, _ = e.keysOf("s", nil, e.grant(k, "user:r", []string{"s"}, []string{"read"}))
+	if got := epochsOf(keys); got != "s#3" {
+		t.Fatalf("epochs without nbf: %s", got)
+	}
+	early := map[string]any{"nbf": t0.Add(-time.Hour).Format(time.RFC3339)}
+	keys, _ = e.keysOf("s", nil, e.grant(k, "user:r", []string{"s"}, []string{"read"}, early))
 	if got := epochsOf(keys); got != "s#1,s#2,s#3" {
 		t.Fatalf("all epochs: %s", got)
 	}
@@ -437,33 +448,24 @@ func TestSealedKeys(t *testing.T) {
 	if got := epochsOf(keys); got != "s#3" {
 		t.Fatalf("requested epochs: %s", got)
 	}
-	// historyEpochs caps history.
+	// historyEpochs h caps history at the current epoch and the h before
+	// it (v0.63 §E.2.3).
 	expect(t, e.patchNS("s", ops(op("add", "/encryption/historyEpochs", 1.0)), star), 201)
-	keys, _ = e.keysOf("s", nil, reader)
-	if got := epochsOf(keys); got != "s#3" {
+	keys, _ = e.keysOf("s", nil, e.grant(k, "user:r", []string{"s"}, []string{"read"}, early))
+	if got := epochsOf(keys); got != "s#2,s#3" {
 		t.Fatalf("epochs with historyEpochs 1: %s", got)
 	}
 	expect(t, e.patchNS("s", ops(op("remove", "/encryption/historyEpochs")), star), 201)
-	// Never an epoch that started after the grant's exp: epoch 4 starts at
-	// t0+5h, and the clock is set back before it for the grant to verify.
+	// An epoch that started after the grant's exp isn't left out (v0.63
+	// dropped v0.55's rule): epoch 4 starts at t0+5h, and the clock is set
+	// back before it for the grant to verify.
 	e.clock.set(t0.Add(5 * time.Hour))
 	expect(t, e.patchNS("s", ops(op("add", "/encryption/epoch", 4.0)), e.grant(k, "user:admin", []string{"s"}, []string{"config", "read"})), 201)
 	e.clock.set(t0.Add(150 * time.Minute))
-	short := e.grant(k, "user:r", []string{"s"}, []string{"read"}, map[string]any{"exp": t0.Add(3 * time.Hour).Format(time.RFC3339)})
+	short := e.grant(k, "user:r", []string{"s"}, []string{"read"}, early, map[string]any{"exp": t0.Add(3 * time.Hour).Format(time.RFC3339)})
 	keys, _ = e.keysOf("s", nil, short)
-	if got := epochsOf(keys); got != "s#1,s#2,s#3" {
-		t.Fatalf("epochs before exp: %s", got)
-	}
-	atExp := e.grant(k, "user:r", []string{"s"}, []string{"read"}, map[string]any{"exp": t0.Add(5 * time.Hour).Format(time.RFC3339)})
-	keys, _ = e.keysOf("s", nil, atExp)
 	if got := epochsOf(keys); got != "s#1,s#2,s#3,s#4" {
-		// An epoch that starts exactly at exp is included (§E.2.3).
-		t.Fatalf("epochs to exp: %s", got)
-	}
-	later := e.grant(k, "user:r", []string{"s"}, []string{"read"}, map[string]any{"exp": t0.Add(6 * time.Hour).Format(time.RFC3339)})
-	keys, _ = e.keysOf("s", nil, later)
-	if got := epochsOf(keys); got != "s#1,s#2,s#3,s#4" {
-		t.Fatalf("epochs before a later exp: %s", got)
+		t.Fatalf("epochs past exp: %s", got)
 	}
 
 	// Wrapped to the grant's enc (HPKE): no raw key in the body.
@@ -471,7 +473,7 @@ func TestSealedKeys(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wg := e.grant(k, "user:r", []string{"s"}, []string{"read"}, map[string]any{"enc": jwk})
+	wg := e.grant(k, "user:r", []string{"s"}, []string{"read"}, early, map[string]any{"enc": jwk})
 	_, r = e.keysOf("s", map[string]any{"epochs": []any{1.0}}, wg)
 	expect(t, r, 200)
 	if strings.Contains(string(r.Body), `"key"`) || strings.Contains(string(r.Body), base64.RawURLEncoding.EncodeToString(ke1)) {
@@ -494,7 +496,7 @@ func TestSealedKeys(t *testing.T) {
 		t.Fatal("another recipient unwrapped the key")
 	}
 	// Per-resource keys are wrapped with their resource bound.
-	fw := e.grant(rk, "user:li", []string{"s"}, []string{"read"}, map[string]any{"enc": jwk, "rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
+	fw := e.grant(rk, "user:li", []string{"s"}, []string{"read"}, early, map[string]any{"enc": jwk, "rules": []any{map[string]any{"op": "test", "path": "/resource", "value": "a"}}})
 	_, r = e.keysOf("s", map[string]any{"epochs": []any{1.0}, "resources": []any{"a"}}, fw)
 	arr = r.Obj()["keys"].([]any)
 	w, _ = seal.ParseWrappedKey(arr[0])

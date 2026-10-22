@@ -1,7 +1,6 @@
 package server
 
 import (
-	"errors"
 	"strconv"
 	"testing"
 	"time"
@@ -93,7 +92,9 @@ func TestV047UnrestrictedRead(t *testing.T) {
 // v0.47 §C.5, §E.2.3: only a grant that reads the namespace unrestricted
 // gets epoch keys. A read role whose rule refers to /resource but passes
 // without it (hiding b) doesn't count, even beside an unrestricted role
-// that fails for the principal; such a grant gets per-resource keys.
+// that fails for the principal. Since v0.63 only a grant whose rules fix
+// /resource gets per-resource keys, and role rules don't fix it (§2.1), so
+// such a grant is 403.
 func TestV047SealedKeysRoles(t *testing.T) {
 	t.Parallel()
 	e := newSealedAuthEnv(t)
@@ -109,16 +110,10 @@ func TestV047SealedKeysRoles(t *testing.T) {
 
 	roles := map[string]any{"roles": []any{"notB", "staff"}}
 	x := e.grant(k, "user:x", []string{"s"}, nil, roles)
-	keys, r := e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, x)
-	expect(t, r, 200)
-	if len(keys) != 1 || keys["s#1 a"] == nil {
-		t.Fatalf("restricted role: %s", r.Body)
-	}
-	if _, err := seal.OpenExpect(docB, keys["s#1 a"], "s#1", seal.ResourcePL("s", "b", b, "doc")); !errors.Is(err, seal.ErrDecrypt) {
-		t.Fatalf("K_a opened b: %v", err)
-	}
+	_, r := e.keysOf("s", map[string]any{"resources": []any{"a", "b"}}, x)
+	expectCode(t, r, 403, "forbidden")
 	// Roles are alternatives: staff's passes, so it reads unrestricted.
-	keys, r = e.keysOf("s", nil, e.grant(k, "user:staff", []string{"s"}, nil, roles))
+	keys, r := e.keysOf("s", nil, e.grant(k, "user:staff", []string{"s"}, nil, roles))
 	expect(t, r, 200)
 	if len(keys) != 1 || keys["s#1"] == nil {
 		t.Fatalf("unrestricted role: %s", r.Body)

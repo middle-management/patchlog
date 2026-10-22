@@ -357,7 +357,8 @@ func TestE2ENamespace(t *testing.T) {
 	}
 
 	// With the keyring recipient key: indexed, and results sealed.
-	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"e"}, []string{"read"}, map[string]any{"enc": idxJWK})))
+	ic := s.Client(t, client.WithBearer(admin.Grant(t, s.Now(), "svc:indexer", []string{"e"}, []string{"read"}, map[string]any{"enc": idxJWK})),
+		client.WithKeyringSenders(adminPriv.PublicKey()))
 	x := startSvcWith(t, ic, svcOpts{db: filepath.Join(t.TempDir(), "i.db"), ns: []string{"e"}, untyped: true, now: s.Now}, func(o *indexOpts) { o.Recipient = idxPriv })
 	x.caughtUp("e")
 	f := x.fetch("/e?q="+marker, "")

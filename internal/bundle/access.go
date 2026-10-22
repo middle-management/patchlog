@@ -58,11 +58,14 @@ func docAccess(doc any) string {
 }
 
 // e2eEpochs lists the epochs the lines of an e2e namespace are sealed
-// under: the kids of sealed patch sets, and the keyring's current epochs.
+// under: the kids of sealed patch sets, and the newest epoch of the
+// namespace each keyring line holds a key of, read from its entries' kids
+// (§E.3.2). A keyring line whose document isn't a keyring document, such
+// as one in the format before v0.63, is a problem.
 // err is a failure to read the target, which a requires decides for
 // (e2eRestoresRequires).
 // Each document keeps its lines' epochs (bdoc.epochs) for the batches
-// (splitEpochs): a sealed line's kid's, a keyring line's current epoch
+// (splitEpochs): a sealed line's kid's, a keyring line's newest epoch
 // after it, 0 for a tombstone or a restore.
 // It checks those lines as §G.5.1 has the importer do at step 1: every
 // rev line but the keyring's is one sealed op whose pl.ns and kid name the
@@ -96,9 +99,26 @@ func (im *importer) e2eEpochs(ctx context.Context, ns string) (lo, hi int, probl
 					problems = append(problems, fmt.Sprintf("e2e namespace %s: %s: %v", ns, k, rerr))
 					break
 				}
-				if kr, err := seal.ParseKeyring(doc); live && err == nil {
-					note(kr.Current)
-					d.epochs[i] = kr.Current
+				if !live {
+					continue
+				}
+				// The target's gate checks every keyring revision written
+				// to an e2e namespace, a bundle's history included, as the
+				// keyring document (§E.3.2), and refuses the format before
+				// v0.63 (ENC-11): refused here, before anything is written.
+				kr, kerr := seal.ParseKeyringV2(doc)
+				if kerr != nil {
+					if _, lerr := seal.ParseKeyring(doc); lerr == nil {
+						problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s is a keyring in the format before v0.63, which an e2e target refuses to have written, history included (§E.3.2): "+
+							"the namespace's history can't be imported, even after migrate-keyring at the source, which leaves the earlier revisions as they are; only a client holding the keys carries its content over, re-sealed with new ids (§G.5.1)", ns, l.ID, d.name))
+					} else {
+						problems = append(problems, fmt.Sprintf("e2e namespace %s: revision %s of %s isn't a keyring document, which an e2e target refuses to have written (§E.3.2): %v", ns, l.ID, d.name, kerr))
+					}
+					break
+				}
+				if e := kr.Current(ns); e > 0 {
+					note(e)
+					d.epochs[i] = e
 				}
 			}
 			continue

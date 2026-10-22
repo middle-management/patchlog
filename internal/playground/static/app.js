@@ -1582,6 +1582,15 @@ function saveIdentity(v) {
   renderIdentity(); renderKeyring();
 }
 
+/* knownKeys lists the X25519 public keys (x) this browser knows: its identity's and those it remembered (rememberKey),
+ * the keyring senders whose entries it opens (§E.3.2) and the recipients it can wrap for again. */
+function knownKeys() { return [...(ID ? [ID.x] : []), ...store.get('pl.knownKeys', [])]; }
+function rememberKey(x) {
+  if (!x || (ID && x === ID.x)) return;
+  const list = store.get('pl.knownKeys', []);
+  if (!list.includes(x)) { list.push(x); store.set('pl.knownKeys', list); }
+}
+
 function keyFrom(kid, resource, from) { KEYS.from.set(kid + '\n' + (resource || ''), from); renderKeysHeld(); }
 function holdEpoch(kid, key, from) { KEYS.epoch.set(kid, key); keyFrom(kid, '', from); }
 function holdRes(kid, resource, key, from) { KEYS.res.set(kid + '\n' + resource, key); keyFrom(kid, resource, from); }
@@ -1597,23 +1606,26 @@ async function nsInfo(ns) {
   return info;
 }
 
-/* takeKeys stores the entries of a POST /ns/{ns}/keys answer: raw keys, or keys wrapped to the grant's enc. An e2e
- * relay passes on keyring entries as stored, wrapped under the info of v0.63 or, stored before, the one of that time;
- * an entry that opens under neither is skipped (anyone can wrap to a thumbprint, §E.3.2), leaving the keyring. */
+/* takeKeys stores the entries of a POST /ns/{ns}/keys answer, { kid, name?, from?, wrapped } or { kid, name?, key }
+ * (§E.2.3; servers before v0.63 said resource for name): raw keys, or keys wrapped to the grant's enc. An e2e relay
+ * passes on keyring entries with their from, which open only with a sender this browser knows (knownKeys), and those
+ * of a keyring stored before v0.63 as stored; an entry that doesn't open is skipped (anyone can wrap to a thumbprint,
+ * §E.3.2), leaving the keyring. */
 async function takeKeys(arr) {
   let n = 0;
   for (const e of arr || []) {
     if (!e || typeof e.kid !== 'string') continue;
+    const res = e.name || e.resource || '';
     let key, from = 'POST /keys (raw)';
     if (typeof e.key === 'string') key = Z.unb64u(e.key);
     else if (typeof e.wrapped === 'string') {
       if (e.suite && e.suite !== Z.SUITE) continue;
       if (!ID) throw new Error('the keys are wrapped to the grant\'s enc: import that identity in the Keys tab');
-      try { key = await Z.unwrapStoredKey(ID, e.kid, e.resource || '', Z.unb64u(e.wrapped)); } catch (_) { continue; }
+      try { key = await Z.unwrapRelayedKey(ID, e, e.from ? knownKeys() : []); } catch (_) { continue; }
       from = 'POST /keys (HPKE-wrapped)';
     } else continue;
     if (key.length !== 32) continue;
-    if (e.resource) holdRes(e.kid, e.resource, key, from); else holdEpoch(e.kid, key, from);
+    if (res) holdRes(e.kid, res, key, from); else holdEpoch(e.kid, key, from);
     n++;
   }
   return n;
@@ -1624,8 +1636,9 @@ async function keyringKey(ns, epoch) {
   if (!ID) throw new Error('no identity: generate or import one in the Keys tab');
   const r = await api('GET', `/r/${ns}/keyring`, { auto: true, label: 'keyring' });
   if (r.status !== 200 || !r.json) throw new Error(`no keyring in ${ns} (GET answered ${r.status})`);
-  const kr = Z.parseKeyring(r.json);
-  const key = await Z.keyringEpochKey(kr, ID, epoch);
+  const key = Z.isKeyringV2(r.json)
+    ? await Z.keyringV2EpochKey(Z.parseKeyringV2(r.json), ID, Z.kid(ns, epoch), knownKeys())
+    : await Z.keyringEpochKey(Z.parseKeyring(r.json), ID, epoch);
   holdEpoch(Z.kid(ns, epoch), key, 'keyring (HPKE-wrapped)');
   return key;
 }
@@ -2249,10 +2262,10 @@ function renderIdentity() {
   box.className = '';
   const jwk = Z.recipientJWK(ID.x);
   const rid = h('span', { class: 'muted' }, '…');
-  Z.recipientID(ID.x).then((v) => { rid.replaceWith(idEl(v)); });
+  Z.thumbprint(ID.x).then((v) => { rid.replaceWith(h('span', { class: 'mono small' }, v)); });
   const block = { kid: '<key id>', sub: 'user:you', ns: [S.ns || 'ns'], can: ['read'], exp: '2026-12-31T00:00:00Z', enc: jwk };
   box.replaceChildren(
-    h('dl', { class: 'kv' }, h('dt', {}, 'public key'), h('dd', { class: 'mono' }, ID.x), h('dt', {}, 'recipient id'), h('dd', {}, rid)),
+    h('dl', { class: 'kv' }, h('dt', {}, 'public key'), h('dd', { class: 'mono' }, ID.x), h('dt', {}, 'thumbprint'), h('dd', {}, rid)),
     h('div', { class: 'row' }, h('button', { class: 'tiny', onclick: () => copy(JSON.stringify(jwk), 'public JWK') }, 'Copy public JWK'),
       h('button', { class: 'tiny', onclick: () => { $('krReader').value = JSON.stringify(jwk); toast('Reader field set'); } }, 'Use as reader below')),
     jsonPre(jwk),
@@ -2298,14 +2311,28 @@ async function importIdentity() {
 }
 
 /* ---- E3 keyring administration (client.E2E InitKeyring / AddReader / RotateEpoch) ---- */
-const KR = { ns: '', doc: null, head: '', status: 0 };
+/* The keyring document (§E.3.2): entries wrapped in HPKE auth mode under this identity, the admin key their from
+ * names. A keyring stored in the format before v0.63 is shown, but servers refuse writing it: a key holder wraps it
+ * again (patchlog e2e migrate-keyring). */
+const KR = { ns: '', doc: null, legacy: null, head: '', status: 0 };
 async function loadKeyring() {
-  KR.ns = S.ns; KR.doc = null; KR.head = ''; KR.status = 0;
+  KR.ns = S.ns; KR.doc = null; KR.legacy = null; KR.head = ''; KR.status = 0; KR.err = '';
   if (!S.ns || S.nsLevel !== 'e2e') return renderKeyring();
   const r = await api('GET', `/r/${S.ns}/keyring`, { auto: true, label: 'keyring' });
   KR.status = r.status;
-  if (r.status === 200) { try { KR.doc = Z.parseKeyring(r.json); KR.head = r.hdr('X-Revision') || r.etag(); } catch (err) { KR.err = err.message; } }
+  if (r.status === 200) {
+    try {
+      if (Z.isKeyringV2(r.json)) KR.doc = Z.parseKeyringV2(r.json); else KR.legacy = Z.parseKeyring(r.json);
+      KR.head = r.hdr('X-Revision') || r.etag();
+    } catch (err) { KR.err = err.message; }
+  }
   renderKeyring();
+}
+/* knownByThumbprint maps the thumbprints of knownKeys to their x. */
+async function knownByThumbprint() {
+  const m = new Map();
+  for (const x of knownKeys()) m.set(await Z.thumbprint(x), x);
+  return m;
 }
 async function renderKeyring() {
   const box = $('krStatus');
@@ -2315,76 +2342,100 @@ async function renderKeyring() {
   if (!S.ns || lvl !== 'e2e') { box.className = 'muted'; box.textContent = S.ns ? `${S.ns} is not an e2e namespace (encryption.level ${lvl || 'none'}).` : 'Select an e2e namespace above.'; return; }
   const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
   box.className = '';
+  if (KR.legacy) {
+    box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, 'keyring format before v0.63'), h('span', { class: 'muted' }, `current epoch ${KR.legacy.current}`)),
+      h('p', { class: 'note' }, 'Servers no longer take this format as the keyring (§E.3.2): a key holder wraps it again with patchlog e2e migrate-keyring. Its entries still open here.'));
+    return;
+  }
   if (!KR.doc) {
     box.replaceChildren(h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'badge warn' }, KR.status === 404 ? 'no keyring yet' : 'keyring not readable (' + KR.status + ')'), h('span', { class: 'muted' }, 'encryption.epoch ' + epoch)),
       h('p', { class: 'note' }, 'Init keyring creates it with a fresh key for epoch ' + epoch + ', wrapped for this identity.'));
     return;
   }
-  const mine = ID ? await Z.recipientID(ID.x) : '';
-  const rows = Object.entries(KR.doc.recipients).map(([rid, jwk]) => {
-    const eps = Object.keys(KR.doc.epochs).filter((e) => KR.doc.epochs[e][rid]).sort((a, b) => a - b);
-    return h('tr', {}, h('td', {}, h('input', { type: 'checkbox', class: 'kr-keep', 'data-x': jwk.x, checked: eps.includes(String(KR.doc.current)) || rid === mine, title: 'keep in a rotation' })),
-      h('td', {}, idEl(rid), rid === mine ? h('span', { class: 'badge ok' }, 'this identity') : null), h('td', { class: 'mono small' }, eps.join(', ')));
+  const mine = ID ? await Z.thumbprint(ID.x) : '';
+  const known = await knownByThumbprint();
+  const eps = Z.keyringV2Epochs(KR.doc, S.ns), cur = eps.length ? eps[eps.length - 1] : 0;
+  const byTo = new Map();
+  for (const e of KR.doc.keys) { if (!byTo.has(e.to)) byTo.set(e.to, []); byTo.get(e.to).push(e); }
+  const rows = [...byTo.entries()].map(([to, es]) => {
+    const x = known.get(to);
+    const has = es.map((e) => { try { return Z.parseKid(e.kid).epoch; } catch (_) { return -1; } }).sort((a, b) => a - b);
+    return h('tr', {}, h('td', {}, h('input', { type: 'checkbox', class: 'kr-keep', 'data-x': x || '', disabled: !x, checked: !!x && (has.includes(cur) || to === mine), title: x ? 'keep in a rotation' : 'its public key is unknown here: remember it to keep it' })),
+      h('td', { class: 'mono small' }, to, to === mine ? h('span', { class: 'badge ok' }, 'this identity') : null),
+      h('td', { class: 'mono small' }, [...new Set(es.map((e) => e.from))].map((f) => f === mine ? 'this identity' : known.has(f) ? 'known' : f).join(', ')),
+      h('td', { class: 'mono small' }, has.join(', ')));
   });
   box.replaceChildren(
-    h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'muted' }, 'keyring head'), idEl(KR.head), h('span', { class: 'muted' }, `current epoch ${KR.doc.current} · encryption.epoch ${epoch}`),
-      KR.doc.current !== epoch ? h('span', { class: 'badge warn' }, 'epoch mismatch') : null,
-      mine && KR.doc.epochs[String(epoch)] && KR.doc.epochs[String(epoch)][mine] ? h('span', { class: 'badge ok' }, 'this identity can read and write') : h('span', { class: 'badge err' }, 'this identity holds no current key')),
-    h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'keep'), h('th', {}, 'recipient'), h('th', {}, 'epochs'))), h('tbody', {}, ...rows))));
+    h('div', { class: 'state-line' }, h('b', {}, S.ns), h('span', { class: 'muted' }, 'keyring head'), idEl(KR.head), h('span', { class: 'muted' }, `current epoch ${cur} · encryption.epoch ${epoch}`),
+      cur !== epoch ? h('span', { class: 'badge warn' }, 'epoch mismatch') : null,
+      mine && KR.doc.keys.some((e) => e.kid === Z.kid(S.ns, epoch) && e.to === mine) ? h('span', { class: 'badge ok' }, 'this identity can read and write') : h('span', { class: 'badge err' }, 'this identity holds no current key')),
+    h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, h('th', {}, 'keep'), h('th', {}, 'recipient (to)'), h('th', {}, 'from'), h('th', {}, 'epochs'))), h('tbody', {}, ...rows))));
 }
 function readerX() {
   const t = $('krReader').value.trim();
   if (!t) return '';
   return t.startsWith('{') ? Z.parseJWK(t) : Z.parseJWK({ kty: 'OKP', crv: 'X25519', x: t });
 }
+function krKnow() {
+  try {
+    const x = readerX();
+    if (!x) return toast('Paste the key\'s public key');
+    rememberKey(x); toast('Key remembered: its keyring entries open here, and it can be kept in a rotation'); renderKeyring();
+  } catch (err) { toast(err.message); }
+}
+function krLegacyRefused() { if (KR.legacy) { toast('The keyring is in the format before v0.63: wrap it again (patchlog e2e migrate-keyring)'); return true; } return false; }
 async function krInit() {
   if (!ID) return toast('Generate or import an identity first');
   try {
     const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
-    const key = Z.randomBytes(32);
-    const kr = Z.buildKeyring(S.ns, epoch);
-    await Z.keyringAdd(kr, ID.x, epoch, key);
+    const key = Z.randomBytes(32), kidStr = Z.kid(S.ns, epoch);
+    const kr = Z.buildKeyringV2();
+    await Z.keyringV2Add(kr, ID, ID.x, kidStr, key);
     const other = readerX();
-    if (other) await Z.keyringAdd(kr, other, epoch, key);
+    if (other) { await Z.keyringV2Add(kr, ID, other, kidStr, key); rememberKey(other); }
     let r;
-    if (KR.doc && KR.doc.ns === S.ns) return toast('The namespace already has a keyring');
-    if (KR.doc) r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
+    if (KR.doc && Z.keyringV2Epochs(KR.doc, S.ns).length || KR.legacy && KR.legacy.ns === S.ns) return toast('The namespace already has a keyring');
+    if (KR.doc || KR.legacy) r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
     else r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-None-Match': '*' }, body: [{ op: 'add', path: '', value: kr }], label: 'keyring' });
-    if (r.ok) { holdEpoch(Z.kid(S.ns, epoch), key, 'generated here (Init keyring)'); toast('Keyring created'); await refreshNS(); await loadKeyring(); }
+    if (r.ok) { holdEpoch(kidStr, key, 'generated here (Init keyring)'); toast('Keyring created'); await refreshNS(); await loadKeyring(); }
   } catch (err) { toast(err.message); }
 }
 async function krAdd() {
   try {
+    if (!ID) return toast('Generate or import an identity first');
     const x = readerX();
     if (!x) return toast('Paste the reader\'s public key');
     await loadKeyring();
+    if (krLegacyRefused()) return;
     if (!KR.doc) return toast('No keyring');
     const kr = JSON.parse(JSON.stringify(KR.doc));
-    for (const e of Object.keys(kr.epochs).map(Number)) {
-      if (e !== kr.current && !$('krHistory').checked) continue;
+    const eps = Z.keyringV2Epochs(kr, S.ns), cur = eps[eps.length - 1];
+    if (cur === undefined) return toast('The keyring holds no key of ' + S.ns);
+    for (const e of eps) {
+      if (e !== cur && !$('krHistory').checked) continue;
       let key;
-      try { key = await contentKey(Z.kid(S.ns, e), ''); } catch (err) { if (e === kr.current) throw err; continue; }
-      await Z.keyringAdd(kr, x, e, key);
+      try { key = await contentKey(Z.kid(S.ns, e), ''); } catch (err) { if (e === cur) throw err; continue; }
+      await Z.keyringV2Add(kr, ID, x, Z.kid(S.ns, e), key);
     }
     const r = await api('PATCH', `/r/${S.ns}/keyring`, { ct: PJ, headers: { 'If-Match': quoteId(KR.head) }, body: [{ op: 'replace', path: '', value: kr }], label: 'keyring' });
-    if (r.ok) { toast('Reader added'); await loadKeyring(); }
+    if (r.ok) { rememberKey(x); toast('Reader added'); await loadKeyring(); }
   } catch (err) { toast(err.message); }
 }
 async function krRotate() {
   try {
     if (!ID) return toast('Generate or import an identity first');
     await loadKeyring();
+    if (krLegacyRefused()) return;
     if (!KR.doc) return toast('No keyring');
     const epoch = ((S.nsDoc || {}).encryption || {}).epoch || 1;
-    if (KR.doc.current !== epoch) return toast(`The keyring is at epoch ${KR.doc.current} but encryption.epoch is ${epoch}`);
-    const keep = new Set([...document.querySelectorAll('.kr-keep')].filter((c) => c.checked).map((c) => c.dataset.x));
+    const eps = Z.keyringV2Epochs(KR.doc, S.ns), cur = eps[eps.length - 1];
+    if (cur !== epoch) return toast(`The keyring is at epoch ${cur} but encryption.epoch is ${epoch}`);
+    const keep = new Set([...document.querySelectorAll('.kr-keep')].filter((c) => c.checked && c.dataset.x).map((c) => c.dataset.x));
     keep.add(ID.x);
     if (!confirm(`Rotate ${S.ns} to epoch ${epoch + 1} for ${keep.size} recipient(s)? Recipients left out cannot read anything written afterwards.`)) return;
     const kr = JSON.parse(JSON.stringify(KR.doc));
-    const e = kr.current + 1, key = Z.randomBytes(32);
-    kr.epochs[String(e)] = {};
-    for (const x of keep) await Z.keyringAdd(kr, x, e, key);
-    kr.current = e;
+    const e = cur + 1, key = Z.randomBytes(32);
+    for (const x of keep) await Z.keyringV2Add(kr, ID, x, Z.kid(S.ns, e), key);
     const r = await api('POST', `/ns/${S.ns}/batch`, { label: 'rotate', body: {
       config: { ifMatch: S.config, patches: [{ op: 'add', path: '/encryption/epoch', value: e }] },
       items: [{ resource: 'keyring', ifMatch: KR.head, steps: [[{ op: 'replace', path: '', value: kr }]] }] } });
@@ -3987,6 +4038,7 @@ function init() {
   $('krInit').onclick = krInit;
   $('krAdd').onclick = krAdd;
   $('krRotate').onclick = krRotate;
+  $('krKnow').onclick = krKnow;
   $('jweOpen').onclick = decryptPasted;
   $('selfTest').onclick = runSelfTest;
   $('resendSealed').onclick = sendSealed;

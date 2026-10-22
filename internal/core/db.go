@@ -339,6 +339,14 @@ CREATE TABLE IF NOT EXISTS rate_buckets (
   rate   REAL    NOT NULL,
   burst  REAL    NOT NULL
 );
+
+-- Addition: sealed namespaces whose rotation after a revocation is
+-- due, recorded with the revocation and cleared by the next new epoch;
+-- retried until then (Options.RotateOnRevoke, sealed.go).
+CREATE TABLE IF NOT EXISTS rotations_due (
+  ns    INTEGER PRIMARY KEY REFERENCES namespaces,
+  since INTEGER NOT NULL
+);
 `
 
 // openDB opens the database: a Postgres URL (pgschema.go), or a SQLite
@@ -468,6 +476,9 @@ var dataMigrations = []struct {
 	run  func(ctx context.Context, tx *sql.Tx, ph func(n int) string) error
 }{
 	{"at-rest-digests", clearAtRestDigests},
+	// P18: purge the public edge copies of sealed and e2e namespaces with
+	// read "grant", cached publicly before v0.73 (purgeGrantCaches, RH-44).
+	{"grant-caches-private", purgeGrantCaches},
 }
 
 func migrateData(ctx context.Context, tx *sql.Tx, ph func(n int) string) error {

@@ -238,7 +238,11 @@ func TestSealedWrappedAndPerResource(t *testing.T) {
 	if _, err := pr.Doc(ctx, "s", "b", b.ID); !client.IsNotFound(err) {
 		t.Fatalf("b: %v", err)
 	}
-	fk := must(pr.FetchKeys(ctx, "s", nil, []string{"a", "b"}))
+	// A name its rules don't fix is 403 (v0.63 §E.2.3).
+	if _, err := pr.FetchKeys(ctx, "s", nil, []string{"a", "b"}); !isStatus(err, 403) {
+		t.Fatalf("per-resource keys of an unfixed name: %v", err)
+	}
+	fk := must(pr.FetchKeys(ctx, "s", nil, []string{"a"}))
 	if len(fk) != 1 || fk[0].Resource != "a" {
 		t.Fatalf("per-resource keys %+v", fk)
 	}
