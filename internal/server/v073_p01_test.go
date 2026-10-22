@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // sendRaw sends a request built by hand, for headers req can't express
@@ -689,8 +690,8 @@ func TestV073PatchBodiesNameDocumentSize(t *testing.T) {
 func TestV073SourceOriginASCII(t *testing.T) {
 	t.Parallel()
 	for _, o := range []string{"https://bücher.example", "https://exämple.com:8443", "https://b%C3%BCcher.example", "https://xn--bcher-kva.example/ü"} {
-		if canonicalOrigin(o) {
-			t.Errorf("canonicalOrigin(%q) = true", o)
+		if sig.CanonicalOrigin(o) {
+			t.Errorf("sig.CanonicalOrigin(%q) = true", o)
 		}
 	}
 	e := newEnv(t)

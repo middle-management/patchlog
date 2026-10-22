@@ -101,7 +101,6 @@ import (
 	"fmt"
 	"hash"
 	"io"
-	"net/url"
 	"regexp"
 	"sort"
 	"strings"
@@ -289,17 +288,12 @@ func parseNSRef(v any) (NSRef, error) {
 		}
 		o, _ := x["origin"].(string)
 		n, _ := x["ns"].(string)
-		if !validOrigin(o) || !client.ValidNSName(n) {
-			return NSRef{}, fmt.Errorf("want a namespace name or { origin, ns } with an origin and a valid ns")
+		if !sig.CanonicalOrigin(o) || !client.ValidNSName(n) {
+			return NSRef{}, fmt.Errorf("want a namespace name or { origin, ns } with a canonical origin (§C.3) and a valid ns")
 		}
 		return NSRef{Origin: o, NS: n}, nil
 	}
 	return NSRef{}, fmt.Errorf("want a namespace name or { origin, ns }")
-}
-
-func validOrigin(o string) bool {
-	u, err := url.Parse(o)
-	return err == nil && (u.Scheme == "http" || u.Scheme == "https") && u.Host != "" && u.Path == "" && u.RawQuery == "" && u.Fragment == "" && u.User == nil
 }
 
 // KeyEntry is a signer or namespace key entry as a grant line's key gives
@@ -495,6 +489,12 @@ func parseHeader(v any) (*Header, error) {
 	h.Origin, _ = m["origin"].(string)
 	if h.Origin == "" {
 		return nil, fmt.Errorf("header needs an origin")
+	}
+	// The exporting deployment's canonical origin (§C.3): an import copies
+	// it into every batch's source.origin, which takes no other form
+	// (§3.5), and verifiers put it in signing inputs.
+	if !sig.CanonicalOrigin(h.Origin) {
+		return nil, fmt.Errorf("header origin %q is not a canonical origin (§C.3, §G.4.1): scheme://host[:port] in lowercase ASCII without a default port", h.Origin)
 	}
 	h.Created, _ = m["created"].(string)
 	if h.Created == "" {

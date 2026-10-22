@@ -15,6 +15,7 @@ import (
 	"github.com/middle-management/patchlog/internal/pointer"
 	"github.com/middle-management/patchlog/internal/rules"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Limits are the configurable limits of §6.6. Sizes are bytes; rates are
@@ -302,33 +303,21 @@ func isLoopbackHost(host string) bool {
 }
 
 // ValidRemoteOrigin reports whether s is an origin another deployment may
-// have, in the RFC 6454 ASCII serialisation of §C.3 (scheme://host[:port],
-// lowercase, default port omitted). It must be https, except that plain
-// http is accepted for loopback hosts, so two local deployments can try
-// remote branches.
+// have, in the RFC 6454 ASCII serialisation of §C.3 (sig.CanonicalOrigin:
+// scheme://host[:port], lowercase ASCII, default port omitted). It must be
+// https, except that plain http is accepted for loopback hosts, so two
+// local deployments can try remote branches.
 func ValidRemoteOrigin(s string) bool {
+	if !sig.CanonicalOrigin(s) {
+		return false
+	}
 	u, err := url.Parse(s)
-	if err != nil || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" || u.Path != "" {
+	if err != nil {
 		return false
 	}
-	switch u.Scheme {
-	case "https":
-		if u.Port() == "443" {
-			return false
-		}
-	case "http":
-		// http is for loopback hosts: localhost, the whole 127.0.0.0/8
-		// range, or [::1] (§G.3).
-		if !isLoopbackHost(u.Hostname()) || u.Port() == "80" {
-			return false
-		}
-	default:
-		return false
-	}
-	if strings.ToLower(u.Host) != u.Host || strings.HasSuffix(u.Host, ":") {
-		return false
-	}
-	return s == u.Scheme+"://"+u.Host
+	// http is for loopback hosts: localhost, the whole 127.0.0.0/8 range,
+	// or [::1] (§G.3).
+	return u.Scheme == "https" || isLoopbackHost(u.Hostname())
 }
 
 // nsMembers are the namespace-document members this version of the spec

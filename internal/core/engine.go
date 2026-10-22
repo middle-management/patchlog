@@ -40,6 +40,7 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/lru"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Options configure an Engine.
@@ -47,7 +48,9 @@ type Options struct {
 	// Path of the SQLite database, or ":memory:", or a Postgres URL
 	// (postgres://…, Addendum D.8).
 	Path string
-	// Origin is the deployment's canonical origin (§G.1), e.g. https://cms.example.
+	// Origin is the deployment's canonical origin (§G.1), e.g. https://cms.example:
+	// scheme://host[:port] in lowercase ASCII without a default port
+	// (sig.CanonicalOrigin); Open refuses any other non-empty value.
 	Origin string
 	// AuthDisabled accepts every request (development only). The author is
 	// taken from X-Author.
@@ -293,6 +296,13 @@ var testOptions func(*Options)
 func Open(opt Options) (*Engine, error) {
 	if testOptions != nil {
 		testOptions(&opt)
+	}
+	// GET / publishes the origin, and signing inputs, batch sources and
+	// bundle headers carry it, all in the canonical form (§7, §3.5, §C.3,
+	// §G.4.1): a deployment that started with another couldn't have its
+	// bundles imported or its signatures verified elsewhere.
+	if opt.Origin != "" && !sig.CanonicalOrigin(opt.Origin) {
+		return nil, fmt.Errorf("core: origin %q is not a canonical origin (§C.3): scheme://host[:port] in lowercase ASCII, an IDN host as its A-label, without a default port, path or trailing slash", opt.Origin)
 	}
 	if opt.Limits == (Limits{}) {
 		opt.Limits = DefaultLimits()

@@ -23,6 +23,16 @@ the reference implements the default the plan states.
   `compose.host.yaml` now start the janitor with `-author=janitor`, whose namespace purges had
   been failing. A remote registration sent without a bearer names this deployment's origin as
   its author. The playground sends `X-Author` only once its author box is filled.
+- **Origins must be canonical** (§3.5, §7, §C.3, §G.3, §G.4.1): `scheme://host[:port]` in
+  lowercase ASCII, an IDN host as its A-label, without a default port, path or trailing slash
+  (`sig.CanonicalOrigin`, the one test now used everywhere). `serve -origin` (and
+  `core.Options.Origin`) in any other form is refused at startup: such a deployment's bundles
+  couldn't be imported elsewhere, since an import copies the header's origin into each batch's
+  `source.origin`. Bundle readers refuse a header or `written` origin in another form when the
+  bundle is read (`bundle verify` included) instead of at the import's first batch, so a bundle
+  exported by a deployment with a non-canonical origin, or edited by hand, no longer verifies.
+  Remote origins (`base.origin`, a registration's `remote.origin`, `serve -remote-*`) also
+  refuse a Unicode host and a port written with leading zeros.
 - **Malformed ids are `400 bad_input`**, `no-store`, before authentication and before an
   unknown namespace's `404` (§7): in URLs (`/rev/{id}` with its `/log` and `/raw`,
   `/ns/{ns}/rev/{ns_id}` with `/log` and `/heads`, `/grants/{gid}`, `/blob/{bid}`), in `since`

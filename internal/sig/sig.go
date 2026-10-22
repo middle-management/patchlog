@@ -9,6 +9,8 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/middle-management/patchlog/internal/ids"
@@ -193,4 +195,33 @@ func ParseKey(s string) (Key, error) {
 		return Key{}, errors.New("the seed of a signing key must be 32 bytes in base64url")
 	}
 	return Key{Kid: s[:i], Priv: ed25519.NewKeyFromSeed(seed)}, nil
+}
+
+// CanonicalOrigin reports whether s is an http or https origin in the RFC
+// 6454 ASCII serialisation that the signing input carries (§C.3):
+// scheme://host[:port], lowercase, with no default port, path, query,
+// fragment or user, and a port in decimal without leading zeros. A host
+// in Unicode isn't that serialisation (its A-label is), so any non-ASCII
+// byte refuses it. It is the one test for a deployment's own origin, a
+// batch's source.origin (§3.5), a remote base's (§G.3) and a bundle's
+// (§G.4.1).
+func CanonicalOrigin(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	u, err := url.Parse(s)
+	if err != nil || u.Scheme != "https" && u.Scheme != "http" || u.Host == "" || u.User != nil || u.Opaque != "" ||
+		u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || s != u.Scheme+"://"+u.Host || strings.ToLower(s) != s {
+		return false
+	}
+	if p := u.Port(); p != "" || strings.HasSuffix(u.Host, ":") {
+		n, err := strconv.Atoi(p)
+		if err != nil || strconv.Itoa(n) != p || n < 1 || n > 65535 ||
+			u.Scheme == "https" && n == 443 || u.Scheme == "http" && n == 80 {
+			return false
+		}
+	}
+	return true
 }

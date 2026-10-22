@@ -640,6 +640,11 @@ go build -tags grpcnotrace -o patchlog ./cmd/patchlog   # the tag only trims the
 ./patchlog serve -db prod.db -origin https://cms.example -operator-key <PUBLIC>
 ```
 
+`-origin` is the deployment's canonical origin (§C.3), which `GET /` publishes and signatures,
+batch sources and bundles carry: `scheme://host[:port]` in lowercase ASCII, an IDN host as its
+A-label, without a default port, path or trailing slash. `serve` refuses any other form at
+startup.
+
 ### Postgres (D.8)
 
 SQLite is the default. Give `-db` a Postgres URL instead of a file (or set `PATCHLOG_DB`, which
