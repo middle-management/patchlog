@@ -825,7 +825,10 @@ func TestV073E2ELinesAtStep1(t *testing.T) {
 
 // epochInForce fronts an e2e deployment as a core that accepts a sealed
 // patch set only under the epoch in force (§E.3.1) does: a batch with a
-// step sealed under another epoch of its namespace is 422.
+// step sealed under another epoch of its namespace is 422. A batch's items
+// are checked against the configuration its config change produces
+// (§7.5), so one that moves encryption.epoch moves the epoch in force for
+// them.
 func epochInForce(t *testing.T, d *deployment) *client.Client {
 	t.Helper()
 	u := must(url.Parse(d.url))
@@ -847,6 +850,15 @@ func epochInForce(t *testing.T, d *deployment) *client.Client {
 			epoch = int(f)
 		}
 		req, _ := jsonv.MustParse(body).(map[string]any)
+		cfg, _ := req["config"].(map[string]any)
+		cops, _ := cfg["patches"].([]any)
+		for _, x := range cops {
+			if o, _ := x.(map[string]any); o["path"] == "/encryption/epoch" {
+				if f, ok := o["value"].(float64); ok {
+					epoch = int(f)
+				}
+			}
+		}
 		items, _ := req["items"].([]any)
 		for _, x := range items {
 			it, _ := x.(map[string]any)
@@ -913,11 +925,15 @@ func newE2ESource(t *testing.T) *e2eSource {
 	return s
 }
 
-// targetEpoch is encryption.epoch of a target namespace.
+// targetEpoch is encryption.epoch of a target namespace, 1 where its
+// document leaves it out.
 func targetEpoch(t *testing.T, d *deployment, ns string) float64 {
 	t.Helper()
 	h := must(d.c.NSHead(ctx, ns))
-	return must(d.c.NSDoc(ctx, ns, h.ID)).Value["encryption"].(map[string]any)["epoch"].(float64)
+	if e, ok := must(d.c.NSDoc(ctx, ns, h.ID)).Value["encryption"].(map[string]any)["epoch"].(float64); ok {
+		return e
+	}
+	return 1
 }
 
 // An e2e import moves the target up one epoch at a time as its keyring
@@ -1093,5 +1109,123 @@ func TestV073E2EEmptyPatchSetOnlyRestores(t *testing.T) {
 	refused("[] appended to requires", dst2, e2eBundle(t, "e", "d", id1, nil, []any{}))
 	if h := dst2.head("e", "d"); h.ID != id1 {
 		t.Fatalf("the refused import wrote: %+v", h)
+	}
+}
+
+// refusing fronts an e2e deployment whose batches into namespace e the
+// importer may not all write, as rules on /resource may decide for its
+// keyring (§E.3.2): a batch for which refused says so is 403. Config
+// writes of their own pass.
+func refusing(t *testing.T, d *deployment, refused func(dry bool, items []any) bool) *client.Client {
+	t.Helper()
+	rp := httputil.NewSingleHostReverseProxy(must(url.Parse(d.url)))
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == "POST" && r.URL.Path == "/ns/e/batch" {
+			body := must(io.ReadAll(r.Body))
+			r.Body = io.NopCloser(bytes.NewReader(body))
+			r.ContentLength = int64(len(body))
+			req, _ := jsonv.MustParse(body).(map[string]any)
+			items, _ := req["items"].([]any)
+			if refused(r.URL.Query().Get("dry-run") == "1", items) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(403)
+				io.WriteString(w, `{"code":"forbidden","message":"rules on /resource refuse this principal's writes to e"}`)
+				return
+			}
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	t.Cleanup(hs.Close)
+	return must(client.New(hs.URL, client.WithAuthor("alice"), client.WithKeys(client.NewKeys(nil))))
+}
+
+// An e2e target moves up to an epoch in the same batch as the keyring line
+// that brings that epoch's key: the batch's config change raises
+// encryption.epoch, and the keyring's lines go first in their epoch. So a
+// batch that fails, at its dry run or at its submit, leaves the target at
+// the epoch before, whose key its keyring holds, never at one whose key
+// it lacks (§7.5, §E.2.1, §G.5.1, MF-55).
+func TestV073E2ERaiseWithKeyringLine(t *testing.T) {
+	t.Parallel()
+	s := newE2ESource(t)
+	keyringAppend := func(items []any) bool {
+		for _, x := range items {
+			if it, _ := x.(map[string]any); it["resource"] == "keyring" && it["ifMatch"] != nil {
+				return true
+			}
+		}
+		return false
+	}
+	for name, c := range map[string]struct {
+		refused func(dry bool, items []any) bool
+		mode    bundle.ImportMode
+		before  bool // the target has the first epoch's lines
+	}{
+		// The epoch-2 batch is dry-run, with its config change, before
+		// anything is written.
+		"every batch refused": {func(bool, []any) bool { return true }, bundle.Atomic, true},
+		// Its dry run passes and its submit is refused.
+		"submits refused": {func(dry bool, _ []any) bool { return !dry }, bundle.Atomic, true},
+		// One item per batch: the epoch-2 keyring line goes first in its
+		// epoch, so in the batch that raises the target, not after it.
+		"keyring line refused, one item per batch": {func(dry bool, items []any) bool { return !dry && keyringAppend(items) }, bundle.Backfill, false},
+	} {
+		dst := newEncDeployment(t, cmsOrigin)
+		if c.before {
+			importB(t, dst, s.before, bundle.ImportOptions{})
+		} else {
+			// Its document leaves encryption.epoch out, at 1.
+			dst.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}, "limits": map[string]any{"itemsPerBatch": 1.0}})
+		}
+		_, err := bundle.Import(ctx, refusing(t, dst, c.refused), bundle.BytesOpener(s.after), bundle.ImportOptions{Mode: c.mode,
+			Sleep: func(context.Context, time.Duration) error { return nil }})
+		if err == nil || !strings.Contains(err.Error(), "403 forbidden") {
+			t.Fatalf("%s: %v, want the batch's 403", name, err)
+		}
+		if e, kr, d := targetEpoch(t, dst, "e"), dst.head("e", "keyring").ID, dst.head("e", "d").ID; e != 1 || kr != s.krGenesis || d != s.d0 {
+			t.Fatalf("%s: the failed import left e at epoch %v, its keyring at %s (genesis %s), d at %s (%s before epoch 2)", name, e, kr, s.krGenesis, d, s.d0)
+		}
+		// Imported again where nothing refuses it, it goes on from there.
+		importB(t, dst, s.after, bundle.ImportOptions{Mode: c.mode, Sleep: func(context.Context, time.Duration) error { return nil }})
+		if e, kr, d := targetEpoch(t, dst, "e"), dst.head("e", "keyring").ID, dst.head("e", "d").ID; e != 2 || kr != s.kr2 || d != s.d1 {
+			t.Fatalf("%s: imported again, e is at epoch %v, its keyring at %s, d at %s", name, e, kr, d)
+		}
+	}
+}
+
+// Where the source's keyring skipped an epoch, no line brings that
+// epoch's key, so the target is moved through it by a config write of its
+// own, and up to the next in that epoch's first batch, with its keyring
+// line (§E.2.1, §G.5.1, MF-55).
+func TestV073E2ERaiseOverSkippedEpoch(t *testing.T) {
+	t.Parallel()
+	src := newEncDeployment(t, stagingOrigin)
+	src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
+	reader := identity(t)
+	k1, k3 := seal.NewKey(), seal.NewKey()
+	kr := must(seal.BuildKeyring("e", 1, k1, []*ecdh.PublicKey{reader.PublicKey()}))
+	krGenesis := src.create("e", "keyring", kr.Value())
+	d0 := e2eWrite(t, src, k1, "e#1", "e", "d", "", client.GenesisPatches(map[string]any{"v": 1.0}))
+	h := must(src.c.NSHead(ctx, "e"))
+	must(src.c.PatchConfig(ctx, "e", h.Config, ops(op("add", "/encryption/epoch", 2.0))))
+	noErr(t, kr.Add(reader.PublicKey(), 3, k3))
+	kr.Current = 3
+	h = must(src.c.NSHead(ctx, "e"))
+	res := must(src.c.Batch(ctx, "e", client.BatchRequest{Config: &client.BatchConfig{IfMatch: h.Config, Patches: ops(op("replace", "/encryption/epoch", 3.0))},
+		Items: []client.BatchItem{{Resource: "keyring", IfMatch: krGenesis, Steps: []client.Step{client.PatchStep(ops(op("replace", "", kr.Value())))}}}}, false))
+	kr3 := res.Items[0].IDs[0]
+	d1 := e2eWrite(t, src, k3, "e#3", "e", "d", d0, ops(op("add", "/w", 1.0)))
+	var buf bytes.Buffer
+	_, _, err := bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"e/d"}})
+	noErr(t, err)
+
+	dst := newEncDeployment(t, cmsOrigin)
+	rep, err := bundle.Import(ctx, epochInForce(t, dst), bundle.BytesOpener(buf.Bytes()), bundle.ImportOptions{Mode: bundle.Atomic, CreateNamespaces: true})
+	noErr(t, err)
+	if dst.head("e", "d").ID != d1 || dst.head("e", "keyring").ID != kr3 || targetEpoch(t, dst, "e") != 3 {
+		t.Fatalf("d %s, keyring %s, epoch %v", dst.head("e", "d").ID, dst.head("e", "keyring").ID, targetEpoch(t, dst, "e"))
+	}
+	if len(rep.Batches) != 2 || !strings.Contains(strings.Join(rep.Notes, " "), "epochs 1 to 3") {
+		t.Fatalf("%d batches, notes %v", len(rep.Batches), rep.Notes)
 	}
 }

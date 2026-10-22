@@ -461,11 +461,15 @@ func (im *importer) nsDoc(ctx context.Context, n *node) any {
 	return im.defaultNSDoc(ctx, n)
 }
 
-// moveEpoch moves an e2e target up one epoch at a time to e, with
-// encryption.epoch config writes (§E.2.1: an epoch only moves by one),
+// moveEpoch readies an e2e target for a batch of epoch e above its own,
 // once every batch of its node in flight has committed: those are sealed
-// under the epoch before, which step 3 accepts only while it is in force
-// (§E.3.1, §G.5.1). It needs config on the target, with a * key (§7.4).
+// under an epoch before, which step 3 accepts only while it is in force
+// (§E.3.1, §G.5.1). The batch moves the target to e itself, in its config
+// change, with the keyring line that brings e's key (raise); moveEpoch
+// moves it up to e-1, one epoch at a time (§E.2.1: an epoch only moves by
+// one), with encryption.epoch config writes of their own, only where the
+// bundle has no line of the epochs between, as where the source's keyring
+// skipped one. It needs config on the target, with a * key (§7.4).
 func (im *importer) moveEpoch(ctx context.Context, run *runner, n *node, e int) error {
 	if e <= im.e2eAt[n.ns] {
 		return nil
@@ -473,12 +477,12 @@ func (im *importer) moveEpoch(ctx context.Context, run *runner, n *node, e int) 
 	if err := run.waitFor(func(f *flight) bool { return f.n == n }); err != nil {
 		return err
 	}
-	for next := im.e2eAt[n.ns] + 1; next <= e; next++ {
+	for next := im.e2eAt[n.ns] + 1; next < e; next++ {
 		var err error
 		im.io(func() {
 			var h *client.NSHead
 			if h, err = im.c.NSHead(ctx, n.ns); err == nil {
-				_, err = im.c.PatchConfig(ctx, n.ns, h.Config, []any{map[string]any{"op": "replace", "path": "/encryption/epoch", "value": float64(next)}})
+				_, err = im.c.PatchConfig(ctx, n.ns, h.Config, epochOps(next))
 			}
 		})
 		if err != nil {
@@ -487,6 +491,33 @@ func (im *importer) moveEpoch(ctx context.Context, run *runner, n *node, e int) 
 		im.e2eAt[n.ns] = next
 	}
 	return nil
+}
+
+// raise is the config change of an e2e target's batch whose epoch is the
+// one after the target's (moveEpoch): it moves the target up to it in the
+// same atomic write as the batch's lines, the keyring line that brings
+// that epoch's key first among them (splitEpochs), so a batch that fails
+// moves nothing (§7.5, §E.2.1). A dry run checks the lines against the
+// configuration it produces, as the submit does (§7.5). nil for any other
+// batch.
+func (im *importer) raise(ctx context.Context, b *batch) (*client.BatchConfig, error) {
+	at, ok := im.e2eAt[b.n.ns]
+	if !ok || b.epoch != at+1 {
+		return nil, nil
+	}
+	var h *client.NSHead
+	var err error
+	im.io(func() { h, err = im.c.NSHead(ctx, b.n.ns) })
+	if err != nil {
+		return nil, fmt.Errorf("import: moving %s to epoch %d: %w", b.n.ns, b.epoch, err)
+	}
+	return &client.BatchConfig{IfMatch: h.Config, Patches: epochOps(b.epoch)}, nil
+}
+
+// epochOps set encryption.epoch to e: with add, since a namespace document
+// may leave the member out at epoch 1 (§E.2.1).
+func epochOps(e int) []any {
+	return []any{map[string]any{"op": "add", "path": "/encryption/epoch", "value": float64(e)}}
 }
 
 // withoutNonce leaves a document's $nonce out of a comparison. A document
