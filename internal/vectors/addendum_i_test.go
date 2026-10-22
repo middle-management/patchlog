@@ -276,6 +276,24 @@ func TestI2I3Server(t *testing.T) {
 		t.Fatalf("child: %v %v, want %s", w, err, idC)
 	}
 	data := []byte("hello patchlog\n")
+	// The deployment recomputes the id over the body, with the Blob-Nonce
+	// as its nonce (§7.8): the bytes sent without I.3's nonce don't hash
+	// to the id with it.
+	rq, err := http.NewRequest(http.MethodPut, c.BaseURL()+"/r/matches/derby/blob/1hdwkfub2zymqzgc75snybxosfk67633s", bytes.NewReader(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rq.Header.Set("Content-Type", "text/plain")
+	resp, err := http.DefaultClient.Do(rq)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	v, _ := jsonv.Parse(body)
+	if m, _ := v.(map[string]any); resp.StatusCode != http.StatusUnprocessableEntity || m["code"] != "blob_mismatch" {
+		t.Errorf("upload without the nonce: %s %s, want 422 blob_mismatch", resp.Status, body)
+	}
 	for nonce, want := range map[string]string{"": "1m5jj344d7tz7cicfmq53ayhmwuubpmyt", "aaaaaaaaaaaaaaaaaaaaaaaaaa": "1hdwkfub2zymqzgc75snybxosfk67633s"} {
 		if bid, err := c.UploadBlob(ctx, "matches", "derby", "text/plain", nonce, data); err != nil || bid != want {
 			t.Errorf("upload (nonce %q): %s %v, want %s", nonce, bid, err, want)
@@ -400,9 +418,10 @@ func TestI5EdgeCookies(t *testing.T) {
 		t.Errorf("Check = %q %v, want /r/demo/derby", p, ok)
 	}
 
-	// mac is I.5's MAC over a value's first part as written: what a minter
-	// other than Issue might send, so each case below fails only for the
-	// reason it names.
+	// mac is I.5's MAC over a value's first part as written, for the values
+	// a minter other than Issue might send: each case below carries a MAC
+	// that verifies over its own first part, or over the re-encoding I.5
+	// names.
 	mac := func(part string) string {
 		m := hmac.New(sha256.New, key)
 		m.Write([]byte(part))
