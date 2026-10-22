@@ -1958,9 +1958,10 @@ func (im *importer) planUpstream(ctx context.Context, d *bdoc, refs []annot.Ref)
 			if ndv, err = parsedDoc(nd); err != nil {
 				return nil, err
 			}
-		}
-		if sealed {
-			// The upstream's own $nonce isn't part of the snapshot (§E.2.5).
+			// Diffs ignore $nonce (§G.4.4): a snapshot whose only change is
+			// its $nonce writes nothing. And a sealed upstream's genesis
+			// carries its own fresh one (nonced), not the snapshot's
+			// (§E.2.5); another's carries the snapshot as it is.
 			prevDoc, ndv = withoutNonce(prevDoc), withoutNonce(ndv)
 		}
 		switch {

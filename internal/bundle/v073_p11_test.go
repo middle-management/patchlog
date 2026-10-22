@@ -573,3 +573,26 @@ func TestV073UpstreamNonceForSealedTarget(t *testing.T) {
 		t.Fatalf("second import: upstream %s, %d batches", u.Class, len(rep.Batches))
 	}
 }
+
+// Upstream diffs ignore $nonce whatever the namespaces' levels (§G.4.4,
+// MF-47): a snapshot whose only change is its $nonce writes nothing.
+func TestV073UpstreamDiffIgnoresNonce(t *testing.T) {
+	t.Parallel()
+	src := newDeployment(t, stagingOrigin)
+	src.ns("n", nil)
+	src.create("n", "a", map[string]any{"v": 1.0, "$nonce": seal.NewNonce()})
+	dst := newDeployment(t, cmsOrigin)
+	importB(t, dst, snapshotOf(t, src, "n"), bundle.ImportOptions{})
+	up := dst.head("n-upstream", "a").ID
+	src.append("n", "a", op("replace", "/$nonce", seal.NewNonce()))
+	rep := importB(t, dst, snapshotOf(t, src, "n"), bundle.ImportOptions{})
+	if u := rep.Doc("n/a").Upstream; u.Class != "unchanged" || u.Head != up || len(rep.Batches) != 0 {
+		t.Fatalf("a snapshot changed only in its $nonce: upstream %+v, %d batches", u, len(rep.Batches))
+	}
+	// A real change still diffs, without touching the $nonce.
+	src.append("n", "a", op("replace", "/v", 2.0), op("replace", "/$nonce", seal.NewNonce()))
+	rep = importB(t, dst, snapshotOf(t, src, "n"), bundle.ImportOptions{})
+	if u := rep.Doc("n/a").Upstream; u.Class != "append" || dst.doc("n", "a")["v"] != 2.0 {
+		t.Fatalf("a changed snapshot: upstream %+v", u)
+	}
+}
