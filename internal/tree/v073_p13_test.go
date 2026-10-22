@@ -750,3 +750,160 @@ func TestV073BackfillBesideFollowers(t *testing.T) {
 		return entriesOf(t, x.get("/cat/children?of=root", ""))["season"]["born"] == want
 	})
 }
+
+// ENC-35 (§A.4, §B.5, §H.3): the pages after a children page are kept
+// with it at its at, so a tool following next there pages through one
+// folder however it changes meanwhile: nothing deleted, moved or
+// reordered after page 1 makes it skip a child. A position given at an at
+// whose pages are no longer kept starts the folder again at the current
+// at, where some children come twice and none is skipped.
+func TestV073ChildrenPagesKept(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.folder(t, "root", "Root")
+	for i, n := range []string{"a", "b", "c", "d"} {
+		w.folder(t, n, strings.ToUpper(n), fmt.Sprintf("root@a%d", i))
+	}
+	x := startSvc(t, w.c, svcOpts{now: w.s.Now})
+	x.caughtUp("cat", "matches")
+	page := func(at, query string) resp {
+		t.Helper()
+		r := x.raw("/cat/at/"+at+"/children"+query, "")
+		if r.status != 200 {
+			t.Fatalf("GET at %s %s: %d %v", at, query, r.status, r.body)
+		}
+		return r
+	}
+	for _, change := range []func(){
+		func() { w.del(t, "cat", "b") },
+		func() { w.replace(t, "cat", "c", "/parents/0/order", "a9") },
+	} {
+		at := x.s.At()
+		p1 := page(at, "?limit=2&of=root")
+		next, _ := p1.body["next"].(string)
+		want := names(page(at, "?limit=1000&of=root").body["children"])
+		change()
+		x.caughtUp("cat")
+		if x.s.At() == at {
+			t.Fatal("the at didn't move")
+		}
+		seen := names(p1.body["children"])
+		for next != "" {
+			p := page(at, next)
+			seen += "," + names(p.body["children"])
+			next, _ = p.body["next"].(string)
+		}
+		if seen != want {
+			t.Errorf("pages at %s: %s, the folder there %s", at, seen, want)
+		}
+	}
+
+	// Not kept any more: the folder again, at the current at.
+	at := x.s.At()
+	p1 := page(at, "?limit=1&of=root")
+	next := p1.body["next"].(string)
+	w.s.Clock.Advance(2 * time.Minute)
+	w.del(t, "cat", "a")
+	x.caughtUp("cat")
+	var got []string
+	for b := x.get("/cat/at/"+at+"/children"+next, ""); ; {
+		got = append(got, names(b["children"]))
+		n, _ := b["next"].(string)
+		if n == "" {
+			break
+		}
+		b = x.get("/cat/at/"+b["at"].(string)+"/children"+n, "")
+	}
+	if want := names(x.get("/cat/children?of=root&limit=1000", "")["children"]); strings.Join(got, ",") != want {
+		t.Errorf("after a position not kept: %v, want the folder again (%s)", got, want)
+	}
+}
+
+// ENC-35 (§A.4, §B.5): next sent as after, as /_refs' is, continues at
+// the following page; a malformed position is 400; an order key alone,
+// the earlier releases' after, is still accepted.
+func TestV073ChildrenNextAsAfter(t *testing.T) {
+	t.Parallel()
+	w := setup(t)
+	w.folder(t, "root", "Root")
+	for i, n := range []string{"a", "b", "c"} {
+		w.folder(t, n, strings.ToUpper(n), fmt.Sprintf("root@a%d", i))
+	}
+	x := startSvc(t, w.c, svcOpts{})
+	x.caughtUp("cat", "matches")
+	at := x.s.At()
+	next := x.raw("/cat/at/"+at+"/children?limit=1&of=root", "").body["next"].(string)
+	q := url.Values{"of": {"root"}, "limit": {"1"}, "after": {next}}
+	if got := names(x.get("/cat/at/"+at+"/children?"+q.Encode(), "")["children"]); got != "b" {
+		t.Errorf("after=<next>: %q", got)
+	}
+	inner := must(url.ParseQuery(next[1:]))
+	cur := strings.Split(inner.Get("after"), "~") // pos, at, last
+	if len(cur) != 3 || cur[2] != "a" {
+		t.Fatalf("next %s", next)
+	}
+	for _, bad := range []string{"1~nope~a", cur[0] + "~" + cur[1] + "~A", "0" + strings.Join(cur, "~")} {
+		if r := x.raw(x.atURL("/cat/children?of=root&after="+url.QueryEscape(bad), ""), ""); r.status != 400 {
+			t.Errorf("after=%s: %d %v", bad, r.status, r.body)
+		}
+	}
+	if got := names(x.get("/cat/children?of=root&after=a0", "")["children"]); got != "b,c" {
+		t.Errorf("after=a0: %q", got)
+	}
+}
+
+// ENC-35 (§E.2.6): in a sealed catalog the pages kept with the one asked
+// for are each bound to their own URL: a reader given per-entry sealing
+// opens a following page's entries with that page's view.
+func TestV073ChildrenPagesSealed(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{Auth: true, KeyStore: ks, LongPoll: 150 * time.Millisecond})
+	k := clienttest.NewKey("k")
+	must(s.Client(t, client.WithBearer(s.OperatorGrant(t, "cat"))).CreateNamespace(ctx, "cat", map[string]any{"read": "grant", "keys": []any{k.Entry("*")},
+		"encryption": map[string]any{"level": "sealed"}, "catalog": map[string]any{"trust": []any{}}}))
+	w := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "user:w", []string{"cat"}, []string{"read", "create"})), client.WithKeys(client.NewKeys(nil)))
+	createNonced(t, w, "cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	for i, n := range []string{"a", "b", "c"} {
+		createNonced(t, w, "cat", n, map[string]any{"title": strings.ToUpper(n), "parents": parents(fmt.Sprintf("root@a%d", i))})
+	}
+	sc := s.Client(t, client.WithBearer(k.Grant(t, s.Now(), "svc:tree", []string{"cat"}, []string{"read"})), client.WithKeys(client.NewKeys(nil)))
+	x := startSvc(t, sc, svcOpts{now: s.Now})
+	x.caughtUp("cat")
+	names := []any{"root", "a", "b", "c"}
+	li := k.Grant(t, s.Now(), "user:li", []string{"cat"}, []string{"read"}, map[string]any{"rules": []any{map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"enum": names}}}})
+	kr := func(name string) func(string) []byte {
+		fk := must(s.Client(t, client.WithBearer(li)).FetchKeys(ctx, "cat", nil, []string{name}))
+		return func(kid string) []byte {
+			if kid == fk[0].Kid {
+				return fk[0].Key
+			}
+			return nil
+		}
+	}
+	f := x.fetch("/cat/children?of=root&limit=1", li)
+	path, _, _ := strings.Cut(f.path, "?")
+	// The at moves on: the following pages are answered at theirs from
+	// what was kept with the first.
+	createNonced(t, w, "cat", "x", map[string]any{"title": "X", "parents": parents("a")})
+	x.caughtUp("cat")
+	for i, want := range []string{"A", "B", "C"} {
+		b := decode(t, f.body)
+		e := b["children"].([]any)[0].(map[string]any)
+		name := e["name"].(string)
+		v := decode(t, must(derived.OpenItem(e["sealed"].(string), kr(name), derived.View{NS: "cat", Target: f.path}, "cat", name)))
+		if v["title"] != want {
+			t.Errorf("page %d: %v", i, v)
+		}
+		next, _ := b["next"].(string)
+		if next == "" {
+			break
+		}
+		r := x.raw(path+next, li)
+		if r.status != 200 {
+			t.Fatalf("page %d at its at: %d", i+1, r.status)
+		}
+		f = x.fetch(path+next, li)
+	}
+}

@@ -55,6 +55,9 @@ const (
 	maxSubtreeNodes = 5000
 	maxManifest     = 10000
 	maxTags         = 200
+	// keptChildren bounds the children of the pages a children listing
+	// computes and keeps after the one asked for (query.children).
+	keptChildren = 10 * maxLimit
 	// keepBytes bounds the listings kept past their at (package kept).
 	keepBytes = 64 << 20
 )
@@ -435,7 +438,9 @@ var ops = map[string]bool{
 // (viewer.shape), and answered 200 at its at however far the checkpoint
 // moves meanwhile, so one redirect suffices (§A.4 "Bounded redirects",
 // §B.5 "only if it is current or that exact result was stored"); any other
-// at is redirected to the current one. A purge drops the kept listings
+// at is redirected to the current one. A children page is kept with the
+// pages after it, so a tool following next pages through the folder as
+// it is at that at (query.children). A purge drops the kept listings
 // that carry a tag it purges. Listings whose answer depends on more than
 // the reader's URL space (perReader) aren't kept.
 //
@@ -675,7 +680,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	// listing is bound to (§E.2.6). Only it is answered 200: another form
 	// of it, or one with min, is redirected.
 	canon := func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
-	keyOf := func(at string) string { return canon(at) + "\n" + v.shape() }
+	keyOf := func(at string) string { return listingKey(canon(at), v) }
 	keep := !perReader(op, v)
 	var cur string
 	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
@@ -847,6 +852,7 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	)
 	perEntry := info.Protected() && !v.catAll
 	var cps map[string]string
+	var more []keptPage
 	s.View(func(g *Graph, curMap map[string]string) {
 		l.at, nss = CombinedAt(g, curMap)
 		cps = checkpointsOf(g, curMap)
@@ -854,12 +860,19 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
 		if perEntry {
 			q.sealValues = func(name string, vals map[string]any) string {
-				jwe, err := derived.SealItem(key, view, name, vals)
+				jwe, err := derived.SealItem(key, q.view, name, vals)
 				if err != nil && serr == nil {
 					serr = err
 				}
 				return jwe
 			}
+		}
+		if op == "children" && keep {
+			// The following pages are kept with this one, each at its own
+			// URL: the same at with the query their next gives.
+			path, _, _ := strings.Cut(view.Target, "?")
+			q.pages = &more
+			q.pageView = func(query string) derived.View { return derived.View{NS: cat, Target: path + query} }
 		}
 		body, l.status, l.msg = q.run(op)
 		tags = q.tags
@@ -867,15 +880,23 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	if l.status != http.StatusOK {
 		return l, nil
 	}
-	l.st = derived.Stored{JSON: true, Tags: tags.header(cat, nss)}
-	if serr == nil && info.Protected() && !perEntry {
-		var jwe string
-		jwe, serr = derived.SealView(key, view, body)
-		l.st.Body, l.st.JSON = []byte(jwe), false
-	} else if serr == nil {
-		l.st.Body, serr = derived.Marshal(body)
+	// stored is a computed page as it is served: sealed whole, or JSON.
+	stored := func(view derived.View, body any, tags tagSet) (derived.Stored, error) {
+		st := derived.Stored{JSON: true, Tags: tags.header(cat, nss)}
+		var err error
+		if info.Protected() && !perEntry {
+			var jwe string
+			jwe, err = derived.SealView(key, view, body)
+			st.Body, st.JSON = []byte(jwe), false
+		} else {
+			st.Body, err = derived.Marshal(body)
+		}
+		return st, err
 	}
 	if serr != nil {
+		return nil, serr
+	}
+	if l.st, serr = stored(view, body, tags); serr != nil {
 		return nil, serr
 	}
 	if !keep {
@@ -883,10 +904,26 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		// the reader.
 		return l, nil
 	}
+	type page struct {
+		key string
+		st  derived.Stored
+	}
+	pages := []page{{keyOf(l.at), l.st}}
+	for _, p := range more {
+		st, err := stored(p.view, p.body, p.tags)
+		if err != nil {
+			// Computed when asked for, as without it.
+			s.opt.Logf("tree: sealing a following page: %v", err)
+			break
+		}
+		pages = append(pages, page{listingKey(p.view.Target, v), st})
+	}
 	if sealed {
-		var err error
-		if l.st, err = s.sealed.Put(ctx, keyOf(l.at), cat, l.at, l.st); err != nil {
-			s.opt.Logf("tree: storing a sealed listing: %v", err)
+		for i := range pages {
+			var err error
+			if pages[i].st, err = s.sealed.Put(ctx, pages[i].key, cat, l.at, pages[i].st); err != nil {
+				s.opt.Logf("tree: storing a sealed listing: %v", err)
+			}
 		}
 		if cur := s.At(); cur != l.at {
 			// An apply (maybe a purge) committed meanwhile: don't keep a
@@ -896,10 +933,18 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			}
 		}
 	}
-	l.st, _ = s.kept.Put(keyOf(l.at), cat, gen, sealed, l.st)
+	for i := range pages {
+		pages[i].st, _ = s.kept.Put(pages[i].key, cat, gen, sealed, pages[i].st)
+	}
+	l.st = pages[0].st
 	s.recordAt(l.at, cps)
 	return l, nil
 }
+
+// listingKey is what a listing at url is stored and kept under for reader
+// v: the URL and the reader's shape, since a namespace that turns private
+// moves no URL (viewer.shape).
+func listingKey(url string, v *viewer) string { return url + "\n" + v.shape() }
 
 // atRecord is what a combined at is over: each namespace's checkpoint, by
 // the name listings and min use (in a release preview, the base's).
@@ -1512,6 +1557,11 @@ type query struct {
 	files *fileSealing
 	view  derived.View
 	serr  *error
+	// pages, where set, collects the pages of a children listing after
+	// the one asked for (children), each sealed under the view pageView
+	// gives for its query, for listing to keep with it.
+	pages    *[]keptPage
+	pageView func(query string) derived.View
 }
 
 // values sets the values an entry of node name takes from the catalog's
@@ -1681,9 +1731,19 @@ func limitParam(vals url.Values) (int, bool) {
 // as /_refs is (§A.4): at most limit, strictly after after, next the query
 // of the following page, absent on the last. after is an opaque position
 // in the listing (childCursor), never an order key, which in a sealed
-// catalog is a value of its content (§E.2.6). The cursor of earlier
-// releases, after={order} with name= and unordered=1, is still accepted
-// for one release (cursorBefore).
+// catalog is a value of its content (§E.2.6). A next sent as after, as
+// §A.4 has next be the following page's after, continues where it says
+// (pagingParams). The cursor of earlier releases, after={order} alone or
+// with name= or unordered=1, is still accepted for one release
+// (cursorBefore).
+//
+// The pages after the one asked for are computed with it, at the same
+// at, up to keptChildren children, when q.pages is set (listing keeps
+// them): a tool that follows next at that at is answered there however
+// far the checkpoint moves meanwhile, as long as the pages are kept, so
+// the folder it pages through is one folder (§H.3). A position given at
+// another at, which a redirect leads to once its own at isn't kept,
+// starts the folder again (childCursor.start).
 func (q *query) children() (any, int, string) {
 	n, st, msg := q.node("of")
 	if n == nil {
@@ -1698,21 +1758,26 @@ func (q *query) children() (any, int, string) {
 	}
 	kids := q.visibleChildren(n.Name)
 	start := 0
-	after, hasAfter := q.vals["after"]
-	hasName, legacy := q.vals.Has("name"), q.vals.Has("name") || q.vals.Has("unordered")
+	pv := pagingParams(q.vals)
+	after, hasAfter := pv["after"]
+	hasName, legacy := pv.Has("name"), pv.Has("name") || pv.Has("unordered")
 	if hasAfter && !legacy {
-		if pos, last, ok := parseCursor(after[0]); ok {
-			start = cursorStart(kids, pos, last)
-		} else {
+		c, ok := parseCursor(after[0])
+		switch {
+		case ok:
+			start = c.start(kids, q.at)
+		case looksLikeCursor(after[0]):
+			return nil, http.StatusBadRequest, "malformed after: a children listing continues at the query its next gives"
+		default:
 			legacy = true
 		}
 	}
 	if legacy {
-		cur := Child{Node: &Node{Name: q.vals.Get("name")}}
+		cur := Child{Node: &Node{Name: pv.Get("name")}}
 		if hasAfter {
 			cur.Order, cur.HasOrder = after[0], true
 		}
-		if q.vals.Get("unordered") == "1" {
+		if pv.Get("unordered") == "1" {
 			cur.HasOrder = false
 		}
 		start = len(kids)
@@ -1723,6 +1788,46 @@ func (q *query) children() (any, int, string) {
 			}
 		}
 	}
+	body, end, next := q.childPage(n, kids, start, limit, q.vals)
+	if q.pages != nil {
+		view, tags := q.view, q.tags
+		for from := end; next != nil && end-from < keptChildren; {
+			q.view, q.tags = q.pageView(derived.CanonicalQuery(next)), tagSet{}
+			q.tags.node(q.g, n.Name)
+			var b map[string]any
+			b, end, next = q.childPage(n, kids, end, limit, next)
+			*q.pages = append(*q.pages, keptPage{view: q.view, body: b, tags: q.tags})
+		}
+		q.view, q.tags = view, tags
+	}
+	return body, http.StatusOK, ""
+}
+
+// pagingParams are the parameters of vals that say where a children page
+// starts: after, name and unordered, or, where after is itself a next
+// (a query, "?after=…"), which a client reading §A.4's "next is the after
+// of the following page" sends, the ones in it.
+func pagingParams(vals url.Values) url.Values {
+	if a := vals.Get("after"); strings.HasPrefix(a, "?") {
+		if inner, err := url.ParseQuery(a[1:]); err == nil && len(inner["after"]) == 1 {
+			return inner
+		}
+	}
+	return vals
+}
+
+// keptPage is a page of a children listing computed with the one asked
+// for (query.children), with the view of its own URL and its tags.
+type keptPage struct {
+	view derived.View
+	body any
+	tags tagSet
+}
+
+// childPage is the page of folder n's visible children kids from start,
+// with vals its query, the end of the page in kids, and the query of the
+// following page (nil on the last).
+func (q *query) childPage(n *Node, kids []Child, start, limit int, vals url.Values) (map[string]any, int, url.Values) {
 	page := []any{}
 	end := min(start+limit, len(kids))
 	for _, c := range kids[start:end] {
@@ -1733,57 +1838,78 @@ func (q *query) children() (any, int, string) {
 		page = append(page, e)
 	}
 	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "children": page, "total": len(kids)}
-	if end < len(kids) {
-		nv := url.Values{}
-		for k, v := range q.vals {
-			nv[k] = v
-		}
-		for _, k := range []string{"after", "name", "unordered", "min"} {
-			nv.Del(k)
-		}
-		nv.Set("after", childCursor(end, kids[end-1].Node.Name))
-		body["next"] = derived.CanonicalQuery(nv)
+	if end == len(kids) {
+		return body, end, nil
 	}
-	return body, http.StatusOK, ""
+	nv := url.Values{}
+	for k, v := range vals {
+		nv[k] = v
+	}
+	for _, k := range []string{"after", "name", "unordered", "min"} {
+		nv.Del(k)
+	}
+	nv.Set("after", childCursor{pos: end, at: q.at, last: kids[end-1].Node.Name}.String())
+	body["next"] = derived.CanonicalQuery(nv)
+	return body, end, nv
 }
 
-// childCursor is the position after a page of children (§E.2.6): pos, the
-// number of visible children up to the page's end, and last, the node name
-// of the page's last child, both in the clear like the listing's
-// structure, never an order key.
-func childCursor(pos int, last string) string { return strconv.Itoa(pos) + "~" + last }
+// childCursor is the position after a page of children (§A.4, §E.2.6):
+// pos, the number of visible children up to the page's end, at, the at of
+// the listing, and last, the node name of the page's last child, all in
+// the clear like the listing's structure, never an order key.
+type childCursor struct {
+	pos      int
+	at, last string
+}
+
+func (c childCursor) String() string { return strconv.Itoa(c.pos) + "~" + c.at + "~" + c.last }
 
 // parseCursor parses a childCursor; ok is false for anything else, such as
 // the order key of an earlier release's cursor.
-func parseCursor(s string) (pos int, last string, ok bool) {
-	p, last, found := strings.Cut(s, "~")
+func parseCursor(s string) (c childCursor, ok bool) {
+	p, rest, _ := strings.Cut(s, "~")
+	at, last, found := strings.Cut(rest, "~")
 	if !found || p == "" || len(p) > 9 || p[0] == '0' || !client.ValidResourceName(last) {
-		return 0, "", false
+		return c, false
 	}
 	for i := 0; i < len(p); i++ {
 		if p[i] < '0' || p[i] > '9' {
-			return 0, "", false
+			return c, false
 		}
 	}
-	pos, _ = strconv.Atoi(p)
-	return pos, last, true
+	if _, err := ids.Parse(at); err != nil {
+		return c, false
+	}
+	c.pos, _ = strconv.Atoi(p)
+	c.at, c.last = at, last
+	return c, true
 }
 
-// cursorStart is where the page after a childCursor starts in kids: at
-// pos, where last is the child before it, as it is at the at the cursor
-// was given at; else, as at another at a redirect leads to, after last
-// where it is still listed, and at pos where it isn't.
-func cursorStart(kids []Child, pos int, last string) int {
-	pos = min(pos, len(kids))
-	if pos > 0 && kids[pos-1].Node.Name == last {
-		return pos
+// looksLikeCursor reports whether s has a childCursor's shape, digits, at
+// and a name joined by "~", without being one (a malformed or truncated
+// position, 400) rather than an order key of the earlier releases' cursor.
+func looksLikeCursor(s string) bool {
+	p, rest, found := strings.Cut(s, "~")
+	if !found || p == "" || strings.Trim(p, "0123456789") != "" {
+		return false
 	}
-	for i, c := range kids {
-		if c.Node.Name == last {
-			return i + 1
-		}
+	_, _, found = strings.Cut(rest, "~")
+	return found
+}
+
+// start is where the page after c starts in kids, the visible children at
+// at: at c.pos, where c was given at this at and its last child is there.
+// A position given at another at (the redirect from an at whose pages are
+// no longer kept) or for another reader says nothing of where that page
+// would start now: children moved, deleted or reordered meanwhile, before
+// it or after, would be skipped. So the folder starts again, and a tool
+// paging it sees some children twice, which is harmless, rather than miss
+// one, which a sync tool takes for a delete (§H.3).
+func (c childCursor) start(kids []Child, at string) int {
+	if c.at == at && c.pos <= len(kids) && kids[c.pos-1].Node.Name == c.last {
+		return c.pos
 	}
-	return pos
+	return 0
 }
 
 // cursorBefore reports whether the cursor of an earlier release (an order
