@@ -54,7 +54,7 @@ func TestAllowances(t *testing.T) {
 	// Allowances are guarded by a * key and bounded by the deployment maximums.
 	cid := e.configID("sec", f.adminG)
 	expectCode(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.issuerG,
-		body: ops(op("replace", "/allowances/0/bucket/rate", 1000))}), 403, "forbidden")
+		body: ops(op("replace", "/allowances/0/bucket/rate", 400))}), 403, "forbidden")
 	expectCode(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,
 		body: ops(op("replace", "/allowances/0/itemsPerBatch", 51))}), 422, "limit")
 	expectCode(t, e.do(req{method: "PATCH", path: "/ns/sec", ifMatch: cid, bearer: f.adminG,

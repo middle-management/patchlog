@@ -174,12 +174,23 @@ func freezeOnly(writes []string, doc any) bool {
 // produces (§7.4): parseConfig, then checkMembers against prev, what the
 // write keeps (nil for a new namespace). base is a new branch's base's
 // document, so a member refused because the branch inherits it says so.
+// A limit or allowance prev holds unchanged is held to the deployment's
+// maximums rather than refused (configMode, §6.6).
 func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error) {
-	cfg, err := e.parseConfig(doc)
-	if err == nil && len(cfg.Rules) > cfg.Limits.RulesPerNS && rulesOrBoundChanged(cfg.Doc, prev) {
-		// The document's own rulesPerNamespace, which parseConfig, reading
-		// stored documents too, doesn't hold them to (§6.6).
-		err = sizeLimit("rulesPerNamespace", len(cfg.Rules), cfg.Limits.RulesPerNS, fmt.Sprintf("more than %d rules", cfg.Limits.RulesPerNS))
+	cfg, err := parseConfigIn(doc, e.opt.Limits, e.opt.Maximums, configMode{prev: prev})
+	if err == nil {
+		// rulesPerNamespace, the document's own or the default, within the
+		// deployment's maximum, counts every rule form of rules, roles and
+		// key scopes (§12.2). It holds the writes that change what it
+		// bounds, not a document stored over it (§6.6).
+		if bound := min(cfg.Limits.RulesPerNS, e.opt.Maximums.RulesPerNS); cfg.ruleForms > bound && rulesOrBoundChanged(cfg.Doc, prev) {
+			err = sizeLimit("rulesPerNamespace", cfg.ruleForms, bound, fmt.Sprintf("more than %d rule forms in rules, roles and key scopes (§12.2)", bound))
+		}
+	}
+	if err == nil && (prev == nil || base != nil || !jsonv.Equal(cfg.Doc["limits"], prev["limits"]) || !jsonv.Equal(cfg.Doc["encryption"], prev["encryption"])) {
+		// A creation, a branch's included, or a write that changes limits
+		// or encryption (§6.6 Values); never a stored document.
+		err = cfg.checkValues()
 	}
 	if err == nil {
 		err = checkMembers(cfg.Doc, prev)
@@ -196,19 +207,44 @@ func (e *Engine) newConfig(doc any, prev, base map[string]any) (*Config, *Error)
 	return cfg, nil
 }
 
-// rulesOrBoundChanged reports whether doc changes its rules or its own
-// rulesPerNamespace from prev (nil for a new namespace): the writes that
-// bound holds (§6.6). A document an earlier release stored over it, which
-// checked only the deployment's maximum, takes any other write, a freeze
-// among them, as members stored under an earlier version are kept until
-// they are changed (§7.4).
+// rulesOrBoundChanged reports whether doc changes its rule forms, in
+// rules, roles or key scopes, or its own rulesPerNamespace from prev (nil
+// for a new namespace): the writes that bound holds (§6.6, §12.2). A
+// document an earlier release stored over it, which checked only the
+// deployment's maximum, or counted only rules, takes any other write, a
+// freeze among them, as members stored under an earlier version are kept
+// until they are changed (§7.4).
 func rulesOrBoundChanged(doc, prev map[string]any) bool {
 	if prev == nil {
 		return true
 	}
 	dl, _ := doc["limits"].(map[string]any)
 	pl, _ := prev["limits"].(map[string]any)
-	return !jsonv.Equal(doc["rules"], prev["rules"]) || !jsonv.Equal(dl["rulesPerNamespace"], pl["rulesPerNamespace"])
+	return !jsonv.Equal(ruleLists(doc), ruleLists(prev)) || !jsonv.Equal(dl["rulesPerNamespace"], pl["rulesPerNamespace"])
+}
+
+// ruleLists gathers the rule lists of a namespace document that
+// rulesPerNamespace counts: rules, each role's and each key scope's, by
+// role name and kid, leaving out roles and keys without rules.
+func ruleLists(doc map[string]any) map[string]any {
+	out := map[string]any{}
+	if v, ok := doc["rules"]; ok {
+		out["rules"] = v
+	}
+	roles, _ := doc["roles"].(map[string]any)
+	for name, r := range roles {
+		if m, _ := r.(map[string]any); m != nil && m["rules"] != nil {
+			out["roles/"+name] = m["rules"]
+		}
+	}
+	keys, _ := doc["keys"].([]any)
+	for _, k := range keys {
+		if m, _ := k.(map[string]any); m != nil && m["rules"] != nil {
+			kid, _ := m["kid"].(string) // unique (grant.ParseKeys)
+			out["keys/"+kid] = m["rules"]
+		}
+	}
+	return out
 }
 
 // configErr is the 422 for a namespace document that fails its schema: a

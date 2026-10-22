@@ -92,11 +92,11 @@ func TestV055LimitConfigFields(t *testing.T) {
 	expectLimit(t, e.patchNS("s", ops(op("add", "/x-b", strings.Repeat("b", 300))), ""), 422, "documentSize", int64(len(canonical(want))), 600)
 }
 
-// §6.6: rulesPerGrant is the namespace's, and grantSize the deployment's,
-// since a bearer is decoded before any namespace is consulted.
+// §6.6, §12.2: rulesPerGrant and grantSize are deployment only (v0.63),
+// and grantSize is decoded before any namespace is consulted.
 func TestV055LimitGrantFields(t *testing.T) {
 	t.Parallel()
-	f := newAuthFixture(t, map[string]any{"limits": map[string]any{"rulesPerGrant": 1}})
+	f := newAuthFixture(t, nil, func(o *core.Options) { m := core.DefaultMaximums(); m.RulesPerGrant = 1; o.Maximums = m })
 	e := f.tenv
 	rule := map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"type": "string"}}
 	g := e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": []any{rule, rule}})
@@ -104,15 +104,13 @@ func TestV055LimitGrantFields(t *testing.T) {
 	g = e.grant(f.issuer, "user:r", []string{"sec"}, []string{"read", "create"}, map[string]any{"rules": []any{rule}})
 	expect(t, e.write("PATCH", "sec", "x", "", addRoot(map[string]any{}), g), 201)
 
-	// A namespace's own grantSize, below the deployment's.
+	// A namespace document can't set either (§12.2).
 	tk := newKey("tk")
-	e.mkNS("tiny", map[string]any{"keys": []any{tk.entry("*")}, "limits": map[string]any{"grantSize": 200}})
-	tg := e.grant(tk, "user:t", []string{"tiny"}, []string{"read"})
-	raw, err := base64.URLEncoding.DecodeString(tg)
-	if err != nil || len(raw) <= 200 {
-		t.Fatalf("grant of %d bytes: %v", len(raw), err)
+	for _, k := range []string{"grantSize", "rulesPerGrant"} {
+		r := e.do(req{method: "PATCH", path: "/ns/tiny", ifNoneMatch: "*", bearer: e.operatorGrant("tiny"),
+			body: addRoot(map[string]any{"keys": []any{tk.entry("*")}, "limits": map[string]any{k: 1}})})
+		expectCode(t, r, 422, "invalid")
 	}
-	expectLimit(t, e.get("/ns/tiny/principal", tg), 413, "grantSize", int64(len(raw)), 200)
 
 	gs := int64(core.DefaultMaximums().GrantSize)
 	// Too long to decode: measured is a lower bound, the decoded length.
