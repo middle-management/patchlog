@@ -1388,9 +1388,11 @@ func (t *tx) applySteps(s *itemState) *Error {
 			if err != nil {
 				return patchErr(err)
 			}
-			if nd == nil && ss.action == "create" {
-				// Nothing was made: a create's document isn't null (F-G3).
-				return patchErr(&patch.Error{Index: len(ops), Message: "a create's resulting document is null (§6.2 step 3)"})
+			if nd == nil && len(writes) == 0 && ss.action == "create" {
+				// A create that writes nothing, [] or only tests, makes no
+				// document, as before creates applied to null; one that
+				// writes null stores it (F-G3).
+				return patchErr(&patch.Error{Index: len(ops), Message: "a create must write the document; it applies to null (§6.2 step 3)"})
 			}
 			ss.canon = s.canon(j)
 			ss.id = s.revID(j, parentID)

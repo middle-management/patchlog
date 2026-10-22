@@ -359,8 +359,10 @@ func TestV073P15BranchRetryNotReadThrough(t *testing.T) {
 
 // §6.2 step 3 (GB-8): a create's patches apply to the document null:
 // test "" null and a root replace work, and the genesis folds onto null
-// when the document is read back from storage. A create whose result is
-// null is 422 invalid (F-G3).
+// when the document is read back from storage. A create that writes
+// nothing, [] or only tests, makes no document and is 422 invalid, as
+// before; one that writes null stores the document null, as an add of
+// null did (F-G3).
 func TestV073P15CreateAppliesToNull(t *testing.T) {
 	t.Parallel()
 	e, reopen := v073Reopenable(t)
@@ -373,19 +375,17 @@ func TestV073P15CreateAppliesToNull(t *testing.T) {
 		t.Fatalf("genesis id %s", a0)
 	}
 	a1 := e.appendRev("m", "a", a0, ops(op("replace", "/n", 3.0)))
-	r = e.write("PATCH", "m", "b", "", ops(op("replace", "", map[string]any{"b": true})))
-	expect(t, r, 201)
+	expect(t, e.write("PATCH", "m", "b", "", ops(op("replace", "", map[string]any{"b": true}))), 201)
+	expect(t, e.write("PATCH", "m", "n", "", ops(op("replace", "", nil))), 201)
 
 	for name, patches := range map[string][]any{
-		"empty":        {},
-		"null":         ops(op("add", "", nil)),
-		"test only":    ops(op("test", "", nil)),
-		"replace null": ops(op("replace", "", nil)),
+		"empty":     {},
+		"test only": ops(op("test", "", nil)),
 	} {
 		r := e.write("PATCH", "m", "c", "", patches)
 		expectCode(t, r, 422, "invalid")
-		if name == "empty" && r.Obj()["index"] != 0.0 {
-			t.Fatalf("empty create: %s", r.Body)
+		if r.Obj()["index"] != float64(len(patches)) {
+			t.Fatalf("%s: %s", name, r.Body)
 		}
 	}
 	expectCode(t, e.write("PATCH", "m", "c", "", ops(op("test", "", map[string]any{}), op("add", "", map[string]any{}))), 422, "invalid")
@@ -401,6 +401,10 @@ func TestV073P15CreateAppliesToNull(t *testing.T) {
 	}
 	if d := e.doc("m", "b"); d["b"] != true {
 		t.Fatalf("b: %v", d)
+	}
+	g := e.get("/r/m/n/rev/" + e.head("m", "n"))
+	if expect(t, g, 200); string(g.Body) != "null" {
+		t.Fatalf("n: %s", g.Body)
 	}
 }
 
