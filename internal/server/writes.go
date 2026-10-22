@@ -308,6 +308,13 @@ func (s *Server) nsCreateBranch(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	name, _ := m["name"].(string)
+	// A malformed name is the request's own shape: 400 before
+	// authentication and an unknown base's 404, as a malformed at (§3.6,
+	// §6.2).
+	if !core.ValidNSName(name) {
+		writeErr(w, badInput("invalid branch name"))
+		return
+	}
 	// at, if given, is an ns_id in text form, or 400 (§7); one that isn't
 	// in the base's chain is the core's 422 (§7.6).
 	var at string

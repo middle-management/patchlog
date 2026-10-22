@@ -3534,11 +3534,13 @@ with the official Go library, biscuit-go v2.2.0, which decode, verify and narrow
 biscuit-go v2.2.0 parses our tokens but only knows signature version 0, so it can't verify them.
 
 Status codes (§C.2, §7): the request's shape is judged first, so a malformed id (in the URL,
-`since` or `Last-Event-ID`; a well-formed unknown one stays `404`), a malformed precondition, a
-body with a Unicode noncharacter, a malformed `Signature`, or a write without `X-Author` while
-authentication is disabled is `400 bad_input`, `no-store`, before authentication and before an
-unknown namespace's `404`; on event streams a non-empty `Last-Event-ID` wins over `since`
-(§7.3). A bearer over the deployment's `grantSize` or `rulesPerGrant` is then `413`. A grant not
+`since` or `Last-Event-ID`; a well-formed unknown one stays `404`), a malformed precondition or
+branch name, a body with a Unicode noncharacter, a malformed `Signature`, or a write without
+`X-Author` while authentication is disabled is `400 bad_input`, `no-store`, before
+authentication and before an unknown namespace's `404`; on event streams a non-empty
+`Last-Event-ID` wins over `since` (§7.3). A batch body is the exception: it is read only up to
+the verified principal's `batchSize` (§6.2, §7.5), so its shapes are judged once the grant is
+verified. A bearer over the deployment's `grantSize` or `rulesPerGrant` is then `413`. A grant not
 naming the namespace in every block that carries `ns` is
 `403` before anything is verified or looked up, whether or not the namespace exists; no usable
 grant (missing, malformed, badly signed, unknown key, revoked, expired, not yet valid, with a

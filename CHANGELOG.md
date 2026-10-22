@@ -29,15 +29,16 @@ the reference implements the default the plan states.
   and in `Last-Event-ID`. They were `404`; well-formed unknown ids stay `404`. On event
   streams a non-empty `Last-Event-ID` wins over `since` (§7.3).
 - **Request shapes refused before authentication** (long-poll parameters before
-  authorisation; §3.1, §3.5, §7, §7.2, §7.5, §7.7, §C.3.1), each `400 bad_input`:
+  authorisation, and a batch body's once its grant is verified, below; §3.1, §3.5, §6.2, §7,
+  §7.2, §7.5, §7.7, §C.3.1), each `400 bad_input`:
   - a request body with a Unicode noncharacter (U+FDD0–U+FDEF, U+nFFFE, U+nFFFF), raw or
     escaped; blob uploads are not affected;
   - a precondition that isn't one strong tag around a text id or `If-None-Match: *`:
     `If-Match: *`, a weak tag, a list, a sealed `"{id}.{e}"`, an empty value, a header given
     twice; a malformed config `If-Match` (it was ignored, giving `412`); a batch item with both
     `ifMatch` and `ifNoneMatch`, or a malformed item or config `ifMatch` (the batch's own `400`,
-    no longer an item report); a malformed branch or registration `at`, prune `horizon` or
-    `keep` entry. `DELETE` with `If-None-Match: *` is no longer a shape error: it is judged
+    no longer an item report); a malformed branch name, branch or registration `at`, prune
+    `horizon` or `keep` entry. `DELETE` with `If-None-Match: *` is no longer a shape error: it is judged
     after authorisation and stays `410`/`412` until the gate answers `428`;
   - a batch `source` that isn't `{ origin?, ns, at, bundle?, ids? }`, with text ids, `ids`
     members naming the batch's resources, and `origin` canonical (`scheme://host[:port]`,
@@ -51,7 +52,12 @@ the reference implements the default the plan states.
     §7.8). Signatures already stored keep reading: bundle checks report an unlisted kid as
     `unverifiable` whatever the length of its `<sig>`;
   - on long-polls, a `live` other than `long-poll` (`live=` used to redirect) and a `cursor`
-    that isn't decimal (`cursor=`, `+5`).
+    that isn't decimal (`cursor=`, `+5`);
+  - a batch body is read only up to the verified principal's `batchSize` (§6.2, §7.5), so the
+    shapes above that are in its body (a noncharacter, an item's preconditions, a malformed
+    config `ifMatch`, `source`, `gesture` or `undoes` beside its header, a step `signature`)
+    are answered once the grant is verified: an undecodable bearer is `401`, and one over
+    `grantSize` `413`, before them. The batch's headers are still judged first.
 - **Content types** (§7.2, §12.1): batch, branch creation, remote registration, prune and
   `POST /keys` bodies need `Content-Type: application/json`. Media types compare
   case-insensitively and the only parameter allowed is `charset=utf-8`, for JSON Patch and JSON
