@@ -30,10 +30,10 @@ func TestNamespace(t *testing.T) {
 	}
 	expect(t, e.get("/ns/docs/rev/"+hashID(t, "", []byte("x"))), 404)
 
-	// Creating an existing namespace: 412 {config}.
+	// Creating an existing namespace: 412 without config (v0.71 §7.4).
 	r = e.do(req{method: "PATCH", path: "/ns/docs", ifNoneMatch: "*", body: addRoot(map[string]any{}), author: "admin"})
 	expectCode(t, r, 412, "stale")
-	if r.Str("config") != cfg0 {
+	if _, has := r.Obj()["config"]; has {
 		t.Fatalf("412 body %s", r.Body)
 	}
 	// Document writes don't move the config id, so If-Match stays valid.

@@ -135,8 +135,12 @@ func TestNonceRequiredGuarded(t *testing.T) {
 	expect(t, e.patchNS("g", ops(op("add", "/nonce", "required")), sg), 201)
 	expectCode(t, e.branch("g", map[string]any{"name": "gb", "patches": ops(op("replace", "/nonce", "required"))}, cg), 403, "forbidden")
 	expect(t, e.branch("g", map[string]any{"name": "gb"}, cg), 201)
-	expectCode(t, e.patchNS("gb", ops(op("replace", "/nonce", "optional")), cg), 403, "forbidden")
+	// Turning off the base's requirement is a branch field, refused (422)
+	// before the *-key guard, whoever writes it (§7.4, §C.2); a guarded
+	// write that is otherwise valid needs a * key of the base.
+	expectNonceKept(t, e.patchNS("gb", ops(op("replace", "/nonce", "optional")), cg))
 	expectNonceKept(t, e.patchNS("gb", ops(op("replace", "/nonce", "optional")), sg))
+	expectCode(t, e.patchNS("gb", ops(op("add", "/signatures", "optional")), cg), 403, "forbidden")
 }
 
 // §G.3: a remote branch of a base that requires nonces must be created
