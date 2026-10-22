@@ -230,14 +230,15 @@ func (st *reqState) restorePatches(ctx context.Context, in nsInfo, ns, name stri
 // tombBase says how a write over tombstoned ns/name, head h, goes (§H.6
 // "Delete, then write", §H.4): restored rebased on the last live
 // document, which it returns, when the principal's own DELETE wrote h
-// within ownDeleteUndo; a 409 when the principal has a base from before
+// within ownDeleteUndo; a 409 naming where it went for a file moved
+// away, whose last revision has $successor (§8.1), which no save makes
+// anew, from a version the principal had or not, before or after the
+// reload a refusal asks for (movedAway, §H.2 "Flat view", §H.4 "The
+// reload"), though a MOVE of a live file there does, a rename back
+// included (moving); a 409 when the principal has a base from before
 // someone else's delete (§11.3), whose reload (a GET finding the file
-// gone) lets the write make a new file; a 409 naming where it went for
-// a file moved away, whose last revision has $successor (§8.1), which no
-// save makes anew, before or after that reload (movedAway, §H.2 "Flat
-// view", §H.4 "The reload"), though a MOVE of a live file there does, a
-// rename back included (moving); else nil: a new file, but not by a
-// token refused a save of it that hasn't read it since (refusedSave).
+// gone) lets the write make a new file; else nil: a new file, but not by
+// a token refused a save of it that hasn't read it since (refusedSave).
 func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	last, err := st.tombLast(ctx, ns, name, h)
 	if err == nil && last == nil {
@@ -252,29 +253,40 @@ func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Hea
 func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	own := st.p.deletedOwn(ns, name, h.ID, st.s.opt.Now())
 	mine := own || st.s.ownEntry(st.p, ns, name, h.ID)
-	if !mine && st.hasBase(ns, name) {
-		st.refuse(ns, name)
-		return nil, fail(http.StatusConflict, "%s/%s was deleted by someone else since you opened it (§11.3, §H.4): your save isn't written over the delete; reload it (it reads as gone), and save it again to make it anew", ns, name)
-	}
+	// A save from a version the principal had, over someone else's
+	// delete (§11.3): refused, the refusal naming where the file went if
+	// it moved, so that the reload it asks for isn't followed by another.
+	theirs := !mine && st.hasBase(ns, name)
 	var last *docEntry
 	if h.Last != "" {
 		var err error
 		last, err = st.s.doc(ctx, st.tk, ns, name, h.Last)
 		switch {
-		case pruned(err):
+		case pruned(err), err != nil && theirs:
+			// Refused either way: moved away as far as the head says.
 			last = nil
 		case err != nil:
 			return nil, err
-		case last.sealed:
-			// Successors aren't trusted where the gateway can't read them
-			// (sealed, F-H11): a new file.
-			return nil, nil
 		}
 	}
-	if !st.moving {
+	// Successors aren't trusted where the gateway can't read them
+	// (sealed, F-H11).
+	sealed := last != nil && last.sealed
+	if !st.moving && !sealed {
 		if err := movedAway(ns, name, h, last); err != nil {
+			if theirs {
+				st.refuse(ns, name)
+			}
 			return nil, err
 		}
+	}
+	switch {
+	case theirs:
+		st.refuse(ns, name)
+		return nil, fail(http.StatusConflict, "%s/%s was deleted by someone else since you opened it (§11.3, §H.4): your save isn't written over the delete; reload it (it reads as gone), and save it again to make it anew", ns, name)
+	case sealed:
+		// A new file.
+		return nil, nil
 	}
 	if !own && mine {
 		// The user's own DELETE, written before ownDeleteUndo, forgot
@@ -312,7 +324,7 @@ func movedAway(ns, name string, h *client.Head, last *docEntry) error {
 			to += ".json"
 		}
 	}
-	return fail(http.StatusConflict, "%s/%s was moved to %s (§8.1): a save doesn't make it anew at its old name (§H.2, §H.4); open it there, or save under another name", ns, name, to)
+	return fail(http.StatusConflict, "%s/%s was moved to %s (§8.1): no save recreates it at its old name (§H.2, §H.4); open it there, or save under another name", ns, name, to)
 }
 
 // hasBase reports whether a save of ns/name names or has a base (§H.4):

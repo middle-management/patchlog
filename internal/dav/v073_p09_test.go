@@ -570,3 +570,40 @@ func TestV073OwnDeleteAfterRetire(t *testing.T) {
 	e.expect(e.do("PUT", "/docs/z.json", `{"a": "mine"}`), 409, "PUT z.json over someone else's delete, after the sweep")
 	e.expectTombstoned("docs", "z", "z after the refusal")
 }
+
+// A save from a version the user had (records, or If-Match) of a file
+// someone else then moved away is 409 naming the new path, the first
+// refusal too, not one for someone else's delete asking for a reload
+// after which a save would make it anew: no save does (§H.4 "Answers",
+// "The reload", GW-23); the refusals after it, with or without that
+// reload, name it as well.
+func TestV073MovedAwayFromRecords(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, []string{"docs", "other"}, nil, nil)
+	o := e.another()
+	refused := func(r resp, to string) {
+		t.Helper()
+		if !strings.Contains(r.body, to) || strings.Contains(r.body, "deleted by someone else") {
+			t.Fatalf("409 naming %s: %q", to, r.body)
+		}
+	}
+	e.create("docs", "x", map[string]any{"a": "1"})
+	e.expect(e.do("GET", "/docs/x.json", ""), 200, "GET x.json")
+	o.expect(o.do("MOVE", "/docs/x.json", "", "Destination", "/docs/y.json"), 201, "someone else's MOVE")
+	refused(e.expect(e.do("PUT", "/docs/x.json", `{"a": "mine"}`), 409, "PUT the version read"), "/docs/y.json")
+	refused(e.expect(e.do("PUT", "/docs/x.json", `{"a": "mine"}`), 409, "PUT again, without a GET"), "/docs/y.json")
+	e.expect(e.do("GET", "/docs/x.json", ""), 404, "the reload")
+	refused(e.expect(e.do("PUT", "/docs/x.json", `{"a": "mine"}`), 409, "PUT after the reload"), "/docs/y.json")
+	e.expectTombstoned("docs", "x", "x")
+
+	e.rawDoc("docs", "n.md", "text/markdown", []byte("one"), nil)
+	e.expect(e.do("GET", "/docs/n.md", ""), 200, "GET n.md")
+	o.expect(o.do("MOVE", "/docs/n.md", "", "Destination", "/docs/m.md"), 201, "someone else's MOVE of a raw file")
+	refused(e.expect(e.do("PUT", "/docs/n.md", "mine"), 409, "PUT the raw file read"), "/docs/m.md")
+	e.expectTombstoned("docs", "n.md", "n.md")
+
+	old := e.create("docs", "far", map[string]any{"a": "1"})
+	o.expect(o.do("MOVE", "/docs/far.json", "", "Destination", "/other/far.json"), 201, "someone else's MOVE to another namespace")
+	refused(e.expect(e.do("PUT", "/docs/far.json", `{"a": "mine"}`, "If-Match", `"`+old+`"`), 409, "PUT naming the version moved"), "/r/other/far")
+	e.expectTombstoned("docs", "far", "far")
+}
