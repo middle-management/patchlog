@@ -6,6 +6,35 @@ import (
 	"github.com/middle-management/patchlog/internal/jsonv"
 )
 
+// GR-2 (§3.1, §C.8): a bearer's grant_block strings are I-JSON input, so a
+// noncharacter, raw or escaped, makes the grant invalid (401). A stored
+// grant is read as it was stored.
+func TestV073P20BlockNoncharacter(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t, nil)
+	for _, sub := range []string{"user:\uFFFE", "user:\uFDD0", "user:\U0010FFFF", "user:\U0001FFFF"} {
+		g := mustMint(t, f, map[string]any{"sub": sub})
+		_, err := Decode(g.Encode(), 0)
+		wantStatus(t, err, 401)
+		// The stored form of such a grant still parses: it is read as
+		// stored, not as input.
+		if s, err := ParseStored(g.Stored()); err != nil || s.Blocks[0].Sub != sub {
+			t.Fatalf("%q: stored form: %v", sub, err)
+		}
+	}
+	// A narrowing block's string too.
+	n, err := mustMint(t, f, nil).Narrow(map[string]any{"via": "svc:\uFFFF"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = Decode(n.Encode(), 0)
+	wantStatus(t, err, 401)
+	// U+FFFD and other non-noncharacters are fine.
+	if _, err := Decode(mustMint(t, f, map[string]any{"sub": "user:\uFFFD\uFDCF\uFDF0"}).Encode(), 0); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // CIS-21 (§6.4.2): a grant whose rules carry a schema fragment that breaks
 // the fragment rules (§6.1's $id ban, §6.5, §6.6, no $schema, same-document
 // references only) is invalid (401); CIS-15: so is a format draft 2020-12

@@ -45,6 +45,9 @@ func TestV073P20RuleFragmentsOverHTTP(t *testing.T) {
 		map[string]any{"op": "test", "path": "/resource", "schema": map[string]any{"pattern": `^\u0061$`}}}})
 	expect(t, e.get("/r/sec/a", good), 302)
 	expectCode(t, e.get("/r/sec/b", good), 404, "not_found") // a refused read
+
+	// GR-2: a noncharacter in a block makes the grant invalid.
+	expectCode(t, e.get("/r/sec/a", e.grant(f.issuer, "user:bob\uFFFE", []string{"sec"}, []string{"read"})), 401, "unauthenticated")
 }
 
 // CIS-16 (§C.4): a key's sub with \u matches the whole root sub as the
