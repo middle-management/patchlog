@@ -190,7 +190,8 @@ type sealedBlobJob struct {
 // ReadSealedBlob answers GET /r/{ns}/{name}/blob/{bid}/e/{e} (§E.2.2): the
 // blob sealed under epoch e, if n serves it under e. Other epochs are 404
 // with NoStore, or 410 pruned once pruning removed every revision of the
-// epoch that references it. Only sealed namespaces have this URL.
+// epoch that references it. Only sealed namespaces have this URL: in any
+// other it is 404 not_offered (epochNotOffered).
 func (e *Engine) ReadSealedBlob(ctx context.Context, ns, name, bidText, epochText string, cred Credentials) (*Blob, error) {
 	b, err := e.OpenSealedBlob(ctx, ns, name, bidText, epochText, cred)
 	if err != nil {
@@ -220,9 +221,14 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 			return t.purgedRead(n)
 		}
 		out = &Blob{Public: t.cachePublic(n)}
+		if !t.isSealedNS(n) {
+			// Only sealed namespaces have this URL: 404 not_offered,
+			// after the resource's read check, cached as short (§7.1).
+			return epochNotOffered(out.Public)
+		}
 		bid, perr := ids.Parse(bidText)
 		ep, eerr := strconv.Atoi(epochText)
-		if perr != nil || eerr != nil || ep < 1 || strconv.Itoa(ep) != epochText || !t.isSealedNS(n) {
+		if perr != nil || eerr != nil || ep < 1 || strconv.Itoa(ep) != epochText {
 			out.Status = 404
 			return nil
 		}
@@ -297,6 +303,15 @@ func (e *Engine) openSealedBlob(ctx context.Context, ns, name, bidText, epochTex
 	}
 	out.setContent(memContent(stored))
 	return out, nil
+}
+
+// epochNotOffered is …/blob/{bid}/e/{e} outside sealed namespaces (§7.1,
+// §7.8): 404 not_offered, with the short class (§9). Public is for the
+// server's cache class, as for nfNS.
+func epochNotOffered(public bool) *Error {
+	e := apiErr(404, "not_offered", "message", "epoch blob URLs are served in sealed namespaces only (§7.1, §E.2.2)")
+	e.Public = &public
+	return e
 }
 
 // storeSealedBlob stores job's sealing unless one is stored already, and

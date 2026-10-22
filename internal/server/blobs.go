@@ -14,6 +14,7 @@ import (
 
 func (s *Server) blobPut(w http.ResponseWriter, r *http.Request) {
 	noStore(w)
+	blobHeaders(w) // a blob URL's response, errors included (§7.8 Reading)
 	ns, name, bid := r.PathValue("ns"), r.PathValue("name"), r.PathValue("bid")
 	if err := validNames(ns, name); err != nil {
 		writeErr(w, err)
@@ -64,11 +65,13 @@ func blobUpload(r *http.Request) core.BlobUpload {
 	return up
 }
 
-// blobRoutes are the routes that read blobs, whose every answer carries
-// blobHeaders.
+// blobRoutes are the routes of blob URLs, whose every answer carries
+// blobHeaders: reads, and uploads and copies, which answer at the same URL
+// (§7.8).
 var blobRoutes = map[string]bool{
 	"GET /r/{ns}/{name}/blob/{bid}":       true,
 	"GET /r/{ns}/{name}/blob/{bid}/e/{e}": true,
+	"PUT /r/{ns}/{name}/blob/{bid}":       true,
 }
 
 // blobHeaders sets what every blob response carries, errors and the

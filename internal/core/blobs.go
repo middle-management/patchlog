@@ -819,9 +819,14 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 		}
 	}
 	// 2. A purged namespace or resource, after authorisation and the rate
-	// limits (§7.8).
+	// limits (§7.8); between them, a resource whose source was raised to a
+	// level this server lacks (502 upstream, §1, §12.1), as at step 2.1 of
+	// a write.
 	if n.purged {
 		return nil, t.purgedNS(n)
+	}
+	if err := t.upstreamRefusal(n, name); err != nil {
+		return nil, err
 	}
 	if t.resolve(n, name, nil).state == Purged {
 		return nil, gone()
@@ -862,10 +867,17 @@ func (t *tx) gateBlob(req Request, name string, bid ids.ID, up *BlobUpload, draw
 		if !ok {
 			return nil, badInput("the Content-Type must be a media type, type/subtype")
 		}
-		if up.Nonce != "" && !seal.ValidNonce(up.Nonce) {
-			return nil, badInput("Blob-Nonce must be 26 base32 characters")
+		// Present is checked, empty or repeated (joined) included: a blob
+		// without a nonce sends no Blob-Nonce (§7.8).
+		if (up.NonceSent || up.Nonce != "") && !seal.ValidNonce(up.Nonce) {
+			return nil, badInput("Blob-Nonce must be one value of 26 base32 characters; a blob without a nonce sends none")
 		}
 		g.typ, g.nonce = typ, up.Nonce
+	}
+	// An upload takes no precondition: one sent is 428 at check 4, for a
+	// copy after its source checks (§7.2, §7.8, §12.1).
+	if up.Precondition {
+		return nil, apiErr(428, "precondition_required", "message", "an upload or copy takes no precondition (§7.8)")
 	}
 	if cfg.level == levelE2E && g.typ != SealedBlobType {
 		return nil, apiErr(415, "unsupported_type", "message", "an e2e namespace accepts only "+SealedBlobType+" blobs (§E.3.1)")
