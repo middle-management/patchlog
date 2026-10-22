@@ -641,9 +641,10 @@ func (s *Service) planContent(ctx context.Context, v *grant.Verified, item strin
 		if n := g.Node(pl); n != nil && !n.Self {
 			placed, state, itemSt = true, n.State, n.ItemState
 		}
-		// Effective roles are collected only through subjects the catalog's
-		// key in the content namespace may assert (§B.11.4 Resolve).
-		roles = s.rolesFor(pl, assertable(key, Subjects(v)))
+		// Roles count only through subjects the catalog's key in the
+		// content namespace may grant through: its sub and groups scopes
+		// (§B.11.2 Through the key, §B.11.4 Resolve).
+		roles = s.rolesFor(pl, callerOf(v).through(key))
 	})
 	switch {
 	case key == nil:
@@ -794,7 +795,7 @@ func (s *Service) planRestore(ctx context.Context, v *grant.Verified, ns, name, 
 		if key = findKey(cfg.Keys, s.opt.Kid); key == nil {
 			return
 		}
-		subs := assertable(key, Subjects(v))
+		subs := callerOf(v).through(key)
 		incs := map[string]Includes{ns: ParseIncludes(cfg.Doc)}
 		n := g.Node(pl)
 		placed = n != nil && !n.Self
@@ -1005,13 +1006,11 @@ func (s *Service) planCreateFolder(ctx context.Context, v *grant.Verified, node 
 	return &plan{ns: cat, resource: name, can: []string{"create"}, rules: rules, cp: cp, checkpoint: checkpoint, key: signer}, nil
 }
 
+// isAdmin reports whether the caller is in the admin group: its grant's
+// groups list it, as the catalog's rule tests /principal/groups (§B.11.3).
+// A group written "group:catalog-admins" is another group (groupSubjects).
 func (s *Service) isAdmin(v *grant.Verified) bool {
-	for _, g := range v.Principal.Groups {
-		if g == s.opt.AdminGroup || g == "group:"+s.opt.AdminGroup {
-			return true
-		}
-	}
-	return false
+	return contains(v.Principal.Groups, s.opt.AdminGroup)
 }
 
 // catalogKey is the catalog namespace's document at the head and the
