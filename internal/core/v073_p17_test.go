@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/pgtest"
 )
 
 // p17Keys are signing keys a test lists in a namespace it creates: the
@@ -111,5 +112,36 @@ func TestV073P17CatalogsAndMaxLagNeedStarKey(t *testing.T) {
 		map[string]any{"op": "add", "path": "/catalogs", "value": map[string]any{"cat": map[string]any{"place": []any{"group:editors"}}}},
 	}}); err != nil {
 		t.Fatalf("under a * key: %v", err)
+	}
+}
+
+// The first matching allowance whose until hasn't passed applies: one that
+// has ended doesn't hide a later match. With authentication disabled an
+// entry matches the author's sub alone, so two entries can match (§6.6
+// Allowances).
+func TestV073P17EndedAllowanceDoesNotHideLater(t *testing.T) {
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), AuthDisabled: true, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Limits: p17Fast(), Maximums: p17Fast(), TailInterval: tailEvery, Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	mkNS(t, e, "n", map[string]any{"allowances": []any{
+		map[string]any{"sub": "w", "kid": "k1", "bucket": map[string]any{"rate": 1000.0, "burst": 1000.0}, "until": "2020-01-01T00:00:00Z"},
+		map[string]any{"sub": "w", "kid": "k2", "bucket": map[string]any{"rate": 0.001, "burst": 1.0}},
+	}})
+	w := Credentials{Author: "w"}
+	if _, err := v073CreateIn(e, "n", w, "a"); err != nil {
+		t.Fatal(err)
+	}
+	_, err = v073CreateIn(e, "n", w, "b")
+	if ae, ok := err.(*Error); !ok || ae.Status != 429 || ae.Body["limit"] != "allowance" {
+		t.Fatalf("second write: want 429 on the later allowance, got %v", err)
+	}
+	// Another author has no allowance: the namespace's fast buckets.
+	for _, name := range []string{"c", "d"} {
+		if _, err := v073CreateIn(e, "n", Credentials{Author: "x"}, name); err != nil {
+			t.Fatal(err)
+		}
 	}
 }

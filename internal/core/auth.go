@@ -741,17 +741,17 @@ func (rl *rateLimiter) charge(now time.Time, d draw) {
 	b.tokens -= d.cost
 }
 
-// allowanceOf returns the actor's allowance in a configuration, if any.
+// allowanceOf returns the actor's allowance in a configuration, if any:
+// the first matching entry whose until hasn't passed, so one that has
+// ended doesn't hide a later one (§6.6 Allowances). Without a verified
+// grant (authentication disabled) there is no signing key, and an entry
+// matches on sub alone.
 func (t *tx) allowanceOf(cfg *Config, a *actor) *Allowance {
 	kid := ""
 	if a.verified != nil {
 		kid = a.verified.Key.Kid
 	}
-	al := cfg.allowance(a.principal.ID, kid, a.verified == nil)
-	if al != nil && !al.Until.IsZero() && !t.now.Before(al.Until) {
-		return nil // ended: ignored from `until` on (§6.6)
-	}
-	return al
+	return cfg.allowanceAt(t.now, a.principal.ID, kid)
 }
 
 // guardedPaths need a grant chained to a * key (§7.4, §C.2): a config
