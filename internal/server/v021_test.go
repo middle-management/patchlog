@@ -209,10 +209,10 @@ func TestBatchBodyLimit(t *testing.T) {
 	post := func(bearer string) *resp {
 		return e.do(req{method: "POST", path: "/ns/sec/batch", body: body, bearer: bearer})
 	}
-	// Authentication comes first: no grant is 401, not 413.
+	// Authentication comes first: no grant is 401, not a limit.
 	expect(t, post(""), 401)
-	// Over eve's batchSize: 413, without reading on.
-	expectLimit(t, post(eve), 413, "batchSize", int64(len(items))*int64(len(canonical(items[0].(map[string]any)["steps"].([]any)[0]))), 1024)
+	// Over eve's batchSize: 422 at step 4 (§7.5), the body being within the cut-off.
+	expectLimit(t, post(eve), 422, "batchSize", int64(len(items))*int64(len(canonical(items[0].(map[string]any)["steps"].([]any)[0]))), 1024)
 	// Within bob's allowance.
 	expect(t, post(f.issuerG), 201)
 }
@@ -239,8 +239,8 @@ func TestBatchItemCountAtStep4(t *testing.T) {
 	// Stale precondition: 412 before the count.
 	b := e.appendRev("sec", "a", a, ops(op("add", "/y", 1.0)), f.issuerG)
 	expectCode(t, post(f.issuerG, create("n1"), create("n2"), appendA(a)), 412, "batch")
-	// All good but too many: 413.
-	expectLimit(t, post(f.issuerG, create("n1"), create("n2"), appendA(b)), 413, "itemsPerBatch", 3, 2)
+	// All good but too many: 422 (§6.6).
+	expectLimit(t, post(f.issuerG, create("n1"), create("n2"), appendA(b)), 422, "itemsPerBatch", 3, 2)
 	expect(t, post(f.issuerG, create("n1"), appendA(b)), 201)
 }
 

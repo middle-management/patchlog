@@ -39,10 +39,10 @@ func TestAllowances(t *testing.T) {
 
 	// Without an allowance the namespace's limits apply… The item count is
 	// checked at step 4 (§7.5), after the rate limit of step 1 drew 3 tokens.
-	expectCode(t, batch(eve, batchOf("e", 3)), 413, "limit")
+	expectCode(t, batch(eve, batchOf("e", 3)), 422, "limit")
 	// …with one, the allowance's.
 	expect(t, batch(f.issuerG, batchOf("b", 20)), 201)
-	expectCode(t, batch(f.issuerG, batchOf("c", 21)), 413, "limit")
+	expectCode(t, batch(f.issuerG, batchOf("c", 21)), 422, "limit")
 
 	// Bob's 20 items drew on the allowance's bucket, not the namespace's
 	// or a principal's, so eve still has her own tokens.

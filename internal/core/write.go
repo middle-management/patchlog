@@ -718,7 +718,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	// batch's, not an item's.
 	if isBatch {
 		if len(items) > maxItems {
-			return nil, nil, limitErr(413, "itemsPerBatch", int64(len(items)), int64(maxItems), fmt.Sprintf("more than %d items", maxItems))
+			return nil, nil, limitErr(422, "itemsPerBatch", int64(len(items)), int64(maxItems), fmt.Sprintf("more than %d items", maxItems))
 		}
 		size := 0
 		for _, s := range all {
@@ -729,7 +729,7 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 			}
 		}
 		if size > maxSize {
-			return nil, nil, limitErr(413, "batchSize", int64(size), int64(maxSize), "batch too large")
+			return nil, nil, limitErr(422, "batchSize", int64(size), int64(maxSize), "batch too large")
 		}
 	}
 	for _, s := range st {
@@ -1369,7 +1369,7 @@ func checkLimits(l Limits, s *itemState) *Error {
 			maxPatch, key = l.DocumentSize, "documentSize"
 		}
 		if len(step.canon) > maxPatch {
-			return limitErr(413, key, int64(len(step.canon)), int64(maxPatch), "patch set too large")
+			return limitErr(422, key, int64(len(step.canon)), int64(maxPatch), "patch set too large")
 		}
 		if ops, ok := step.raw.([]any); ok && len(ops) > l.OpsPerSet {
 			return limitErr(422, "opsPerSet", int64(len(ops)), int64(l.OpsPerSet), "too many operations")
@@ -1378,7 +1378,7 @@ func checkLimits(l Limits, s *itemState) *Error {
 			step.docCanon = jsonv.Canonical(step.doc)
 		}
 		if len(step.docCanon) > l.DocumentSize {
-			return limitErr(413, "documentSize", int64(len(step.docCanon)), int64(l.DocumentSize), "document too large")
+			return limitErr(422, "documentSize", int64(len(step.docCanon)), int64(l.DocumentSize), "document too large")
 		}
 		sh := shapeOf(l, step.docCanon)
 		if sh.depth > l.NestingDepth {

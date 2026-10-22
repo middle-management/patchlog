@@ -35,7 +35,7 @@ func TestV055LimitResourceFields(t *testing.T) {
 			head = etagOf(r)
 			continue
 		}
-		expectLimit(t, r, 413, "documentSize", int64(len(canonical(doc))), 1000)
+		expectLimit(t, r, 422, "documentSize", int64(len(canonical(doc))), 1000)
 		break
 	}
 
@@ -85,11 +85,11 @@ func TestV055LimitConfigFields(t *testing.T) {
 	// Config patch sets and documents (§7.4 step 4).
 	e.mkNS("s", map[string]any{"limits": map[string]any{"patchSetSize": 400, "documentSize": 600}})
 	big := ops(op("add", "/x-a", strings.Repeat("a", 400)))
-	expectLimit(t, e.patchNS("s", big, ""), 413, "patchSetSize", int64(len(canonical(big))), 400)
+	expectLimit(t, e.patchNS("s", big, ""), 422, "patchSetSize", int64(len(canonical(big))), 400)
 	expect(t, e.patchNS("s", ops(op("add", "/x-a", strings.Repeat("a", 300))), ""), 201)
 	want := map[string]any{"limits": map[string]any{"patchSetSize": 400, "documentSize": 600},
 		"x-a": strings.Repeat("a", 300), "x-b": strings.Repeat("b", 300)}
-	expectLimit(t, e.patchNS("s", ops(op("add", "/x-b", strings.Repeat("b", 300))), ""), 413, "documentSize", int64(len(canonical(want))), 600)
+	expectLimit(t, e.patchNS("s", ops(op("add", "/x-b", strings.Repeat("b", 300))), ""), 422, "documentSize", int64(len(canonical(want))), 600)
 }
 
 // §6.6: rulesPerGrant is the namespace's, and grantSize the deployment's,

@@ -17,17 +17,17 @@ func TestValueAndPathSize(t *testing.T) {
 	mk := func(name string, doc any) *resp { return e.write("PATCH", "v", name, "", addRoot(doc)) }
 
 	expect(t, mk("ok", map[string]any{"s": strings.Repeat("x", 98)}), 201) // 100 with quotes
-	expectLimit(t, mk("long", map[string]any{"s": strings.Repeat("x", 99)}), 413, "valueSize", 101, 100)
+	expectLimit(t, mk("long", map[string]any{"s": strings.Repeat("x", 99)}), 422, "valueSize", 101, 100)
 	// Canonical JSON counts escapes: 60 quotes are 120 bytes.
-	expectLimit(t, mk("esc", map[string]any{"s": strings.Repeat(`"`, 60)}), 413, "valueSize", 122, 100)
-	expectLimit(t, mk("name", map[string]any{strings.Repeat("k", 99): 1}), 413, "valueSize", 101, 100)
-	expectLimit(t, mk("inarr", map[string]any{"a": []any{map[string]any{"b": strings.Repeat("x", 99)}}}), 413, "valueSize", 101, 100)
+	expectLimit(t, mk("esc", map[string]any{"s": strings.Repeat(`"`, 60)}), 422, "valueSize", 122, 100)
+	expectLimit(t, mk("name", map[string]any{strings.Repeat("k", 99): 1}), 422, "valueSize", 101, 100)
+	expectLimit(t, mk("inarr", map[string]any{"a": []any{map[string]any{"b": strings.Repeat("x", 99)}}}), 422, "valueSize", 101, 100)
 
 	// Pointer "/aaaa…/b": 38 + 2 quotes fits, one more doesn't. "/" and
 	// "~" in names are escaped in the pointer, so they count twice.
 	expect(t, mk("p1", map[string]any{strings.Repeat("a", 35): map[string]any{"b": 1}}), 201)
-	expectLimit(t, mk("p2", map[string]any{strings.Repeat("a", 37): map[string]any{"b": 1}}), 413, "pathSize", 42, 40)
-	expectLimit(t, mk("p3", map[string]any{strings.Repeat("/", 20): map[string]any{"b": 1}}), 413, "pathSize", 43, 40)
+	expectLimit(t, mk("p2", map[string]any{strings.Repeat("a", 37): map[string]any{"b": 1}}), 422, "pathSize", 42, 40)
+	expectLimit(t, mk("p3", map[string]any{strings.Repeat("/", 20): map[string]any{"b": 1}}), 422, "pathSize", 43, 40)
 
 	// Both are limits like the others: bounded by the deployment's.
 	cid := e.configID("v")
@@ -50,14 +50,14 @@ func TestCreatesFromScratch(t *testing.T) {
 		t.Fatal("no create")
 	}
 	huge := addRoot(map[string]any{"a": strings.Repeat(str, 17)[:16400]})
-	expectLimit(t, e.write("PATCH", "s", "huge", "", huge), 413, "documentSize", int64(len(canonical(huge))), 16384)
+	expectLimit(t, e.write("PATCH", "s", "huge", "", huge), 422, "documentSize", int64(len(canonical(huge))), 16384)
 	// An append stays within patchSetSize.
 	two := ops(op("replace", "/a", str), op("replace", "/b", str))
-	expectLimit(t, e.write("PATCH", "s", "r", head, two), 413, "patchSetSize", int64(len(canonical(two))), 1024)
+	expectLimit(t, e.write("PATCH", "s", "r", head, two), 422, "patchSetSize", int64(len(canonical(two))), 1024)
 	// A restore is large only from scratch.
 	tomb := e.del("s", "r", head)
 	two = ops(op("add", "/a", str), op("add", "/b", str))
-	expectLimit(t, e.write("PATCH", "s", "r", tomb, two), 413, "patchSetSize", int64(len(canonical(two))), 1024)
+	expectLimit(t, e.write("PATCH", "s", "r", tomb, two), 422, "patchSetSize", int64(len(canonical(two))), 1024)
 	expect(t, e.write("PATCH", "s", "r", tomb, ops(op("replace", "", big))), 201)
 }
 
@@ -172,7 +172,7 @@ func TestAllowanceUntil(t *testing.T) {
 	e.clock.Advance(19 * time.Minute)
 	expect(t, batch("b", 20), 201)
 	e.clock.Advance(time.Minute) // now == until: ignored
-	expectCode(t, batch("c", 20), 413, "limit")
+	expectCode(t, batch("c", 20), 422, "limit")
 	expect(t, batch("d", 2), 201)
 
 	// Malformed values are config errors.

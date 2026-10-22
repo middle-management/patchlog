@@ -526,7 +526,7 @@ func TestLimits(t *testing.T) {
 	id := e.create("docs", "a", map[string]any{"a": map[string]any{"b": 1.0}})
 	big := ops(op("add", "/big", strings.Repeat("x", 300)))
 	r := e.write("PATCH", "docs", "a", id, big)
-	expectLimit(t, r, 413, "patchSetSize", int64(len(canonical(big))), 200)
+	expectLimit(t, r, 422, "patchSetSize", int64(len(canonical(big))), 200)
 	r = e.write("PATCH", "docs", "a", id, ops(op("add", "/1", 1.0), op("add", "/2", 1.0), op("add", "/3", 1.0), op("add", "/4", 1.0)))
 	expectLimit(t, r, 422, "opsPerSet", 4, 3)
 	r = e.write("PATCH", "docs", "a", id, ops(op("add", "/a/b", map[string]any{"c": map[string]any{"d": 1.0}})))

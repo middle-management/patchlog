@@ -33,11 +33,11 @@ func TestWholeDocumentAppends(t *testing.T) {
 		ops(op("replace", "/a", strings.Repeat("y", 1100))),
 		ops(op("test", "", big), op("add", "/z", big)),
 	} {
-		expectCode(t, e.write("PATCH", "s", "r", head, set), 413, "limit")
+		expectCode(t, e.write("PATCH", "s", "r", head, set), 422, "limit")
 	}
 	// Still within documentSize.
 	huge := map[string]any{"a": strings.Repeat(str, 17)}
-	expectCode(t, e.write("PATCH", "s", "r", head, ops(op("replace", "", huge))), 413, "limit")
+	expectCode(t, e.write("PATCH", "s", "r", head, ops(op("replace", "", huge))), 422, "limit")
 	// A restore, after a test too.
 	tomb := e.del("s", "r", head)
 	head = e.appendRev("s", "r", tomb, ops(op("test", "/a", str), op("add", "", big)))
@@ -51,13 +51,13 @@ func TestWholeDocumentAppends(t *testing.T) {
 	expect(t, e.batchReq("s", map[string]any{"items": []any{item("r", head, ops(op("replace", "", big))), item("q", q, ops(op("add", "/k", 1.0)))}}, "alice"), 201)
 	head = e.head("s", "r")
 	r := e.batchReq("s", map[string]any{"items": []any{item("r", head, ops(op("add", "/k", str), op("add", "/l", str)))}}, "alice")
-	expectCode(t, r, 413, "batch")
+	expectCode(t, r, 422, "batch")
 	if it := r.Obj()["items"].([]any)[0].(map[string]any); it["code"] != "limit" || it["index"] != 0.0 {
 		t.Fatalf("item %v", it)
 	}
 	q = e.head("s", "q")
 	r = e.batchReq("s", map[string]any{"items": []any{item("r", head, ops(op("replace", "", big))), item("q", q, ops(op("replace", "", big)))}}, "alice")
-	expectCode(t, r, 413, "limit") // two of 4 KiB and more: over batchSize
+	expectCode(t, r, 422, "limit") // two of 4 KiB and more: over batchSize
 	// A multi-step item: a whole-document step after a small one.
 	r = e.batchReq("s", map[string]any{"items": []any{map[string]any{"resource": "r", "ifMatch": head,
 		"steps": []any{ops(op("add", "/m", 1.0)), ops(op("replace", "", big))}}}}, "alice")
@@ -86,7 +86,7 @@ func TestWholeDocumentE3(t *testing.T) {
 	c := f.writeRaw("lim", "p", "", sealed(t, k, "lim#1", "lim", "p", "", addRoot(doc)), g)
 	expect(t, c, 201)
 	head := etagOf(c)
-	expectCode(t, f.writeRaw("lim", "p", head, sealed(t, k, "lim#1", "lim", "p", head, ops(op("replace", "", doc))), g), 413, "limit")
+	expectCode(t, f.writeRaw("lim", "p", head, sealed(t, k, "lim#1", "lim", "p", head, ops(op("replace", "", doc))), g), 422, "limit")
 	small := etagOf(f.writeRaw("lim", "p", head, sealed(t, k, "lim#1", "lim", "p", head, ops(op("add", "/s", 1.0))), g))
 	tomb := f.del("lim", "p", small, g)
 	expect(t, f.writeRaw("lim", "p", tomb, sealed(t, k, "lim#1", "lim", "p", tomb, ops(op("replace", "", doc))), g), 201)

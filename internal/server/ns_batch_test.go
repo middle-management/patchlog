@@ -267,7 +267,7 @@ func TestBatch(t *testing.T) {
 	r = e.do(req{method: "POST", path: "/ns/m/batch", author: "alice", body: map[string]any{"items": []any{
 		map[string]any{"resource": "y1", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}},
 		map[string]any{"resource": "y2", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}})
-	expectLimit(t, r, 413, "itemsPerBatch", 2, 1)
+	expectLimit(t, r, 422, "itemsPerBatch", 2, 1)
 }
 
 // §7.5: config change in a batch, items against the new configuration,

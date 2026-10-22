@@ -125,10 +125,10 @@ func (t *tx) planConfig(n *nsRow, cur *Config, a *actor, cc *ConfigChange, inBat
 	p.id = ids.Revision(&curID, p.canon)
 	// Step 4.
 	if len(p.canon) > cur.Limits.PatchSetSize {
-		return nil, limitErr(413, "patchSetSize", int64(len(p.canon)), int64(cur.Limits.PatchSetSize), "patch set too large")
+		return nil, limitErr(422, "patchSetSize", int64(len(p.canon)), int64(cur.Limits.PatchSetSize), "patch set too large")
 	}
 	if n := len(jsonv.Canonical(newDoc)); n > cur.Limits.DocumentSize {
-		return nil, limitErr(413, "documentSize", int64(n), int64(cur.Limits.DocumentSize), "document too large")
+		return nil, limitErr(422, "documentSize", int64(n), int64(cur.Limits.DocumentSize), "document too large")
 	}
 	// Step 5: the built-in namespace-document schema and branch fields.
 	cfg, verr := t.validateConfig(n, cur, newDoc, writes, a)
