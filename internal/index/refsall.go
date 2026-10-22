@@ -150,6 +150,11 @@ type refsReader struct {
 	public bool                         // reads no private namespace: the answer is public
 	nss    []string                     // the namespaces asked, sorted
 	allow  map[string]func(string) bool // namespaces it reads only in part
+	// unverified: the request carries no grant the service verified in a
+	// private namespace it names (§B.11.5): none, one that doesn't decode,
+	// or one refused 401 wherever it was checked (malformed, badly signed,
+	// revoked, expired or not yet valid, §C.2, §12.1).
+	unverified bool
 }
 
 // refsNamespaces lists the namespaces the index serves (known), sorted.
@@ -176,12 +181,14 @@ func (ix *Index) refsNamespaces() []string {
 // ones out) and not skipped: a namespace the reader may not read is left
 // out, and if that leaves none, the answer is a refusal that names none of
 // them (one the reader can't see is like one the service doesn't follow):
-// 401 if any refusal is, else 403.
+// 401 if any refusal is, else 403. Otherwise it notes whether the grant
+// verified (unverified), which decides the refusal at another gs's URL.
 func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[string]string) (*refsReader, error) {
 	rd := &refsReader{public: true, allow: map[string]func(string) bool{}}
 	var (
-		markers []string
-		refused int
+		markers  []string
+		refused  int
+		verified bool
 	)
 	refuse := func(status int) {
 		if refused != 401 {
@@ -199,15 +206,19 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 			// its document is 410 (§8.5), and it is left out as above.
 			continue
 		}
+		// A private namespace the grant names verifies it (access): a
+		// refusal there is 401 if it doesn't verify, 403 once it does.
 		var ae *grant.AuthError
 		if errors.As(err, &ae) {
 			refuse(ae.Status)
+			verified = verified || (ae.Status != 401 && g != nil && g.NamesNS(ns))
 			continue
 		}
 		if err != nil {
 			return nil, err
 		}
 		if !a.public {
+			verified = true
 			// access marks it (§A.4), and refuses a namespace whose
 			// read rules refer to /now.
 			if !a.all {
@@ -225,6 +236,7 @@ func (ix *Index) refsReader(ctx context.Context, r *http.Request, reached map[st
 		return nil, &grant.AuthError{Status: 403, Msg: "the grant reads no namespace the service follows"}
 	}
 	rd.gs = grantcheck.SubjectSetID(markers)
+	rd.unverified = !verified
 	return rd, nil
 }
 
@@ -380,11 +392,12 @@ func (ix *Index) serveRefs(w http.ResponseWriter, r *http.Request, segs []string
 	}
 	// Another subject set's URL space: a grant reads only at its own gs
 	// (§A.4, §B.11.5), so it is 403 there, with or without min, never
-	// redirected; a request without one, which needs one for that gs, is
-	// 401. Only the pointer redirects into the reader's.
+	// redirected; a request without one the service verifies, which needs
+	// one for that gs, is 401, as a query of one namespace answers it
+	// (§B.11.5, §12.1). Only the pointer redirects into the reader's.
 	if at != "" && gs != rd.gs {
 		w.Header().Set("Cache-Control", "no-store")
-		if bearer(r) == "" {
+		if rd.unverified {
 			w.Header().Set("WWW-Authenticate", "Bearer")
 			writeErr(w, http.StatusUnauthorized, "unauthenticated", "missing or unverifiable grant")
 			return

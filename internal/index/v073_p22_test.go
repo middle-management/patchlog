@@ -652,3 +652,32 @@ func TestV073PublicSealedStoredBefore(t *testing.T) {
 		t.Errorf("counts over a public sealed namespace: %d %v", r.status, r.body)
 	}
 }
+
+// TestV073RefsUnverifiedForeignGs (IX-16, §B.11.5, §12.1): on /_refs, a
+// request at another subject set's URL that carries no grant the service
+// verifies is 401, as a query of one namespace answers it: no grant, a
+// bearer that isn't one, and a grant that no longer verifies (expired)
+// alike. Only a grant that verified gets 403 there.
+func TestV073RefsUnverifiedForeignGs(t *testing.T) {
+	t.Parallel()
+	w := v073P22Setup(t)
+	x, s := w.x, w.s
+	q := "?to=" + url.QueryEscape("/r/target/x")
+	_, _, amyLoc := x.refsPointer(q, w.amy)
+	_, _, bobLoc := x.refsPointer(q, w.bob)
+	paLoc := x.raw("/pa?limit=5", w.amy).header.Get("Location")
+	expired := w.issuer.Grant(t, s.Now(), "user:amy", []string{"pa"}, []string{"read"},
+		map[string]any{"exp": s.Now().Add(-time.Minute).Format(time.RFC3339)})
+	if r := x.raw(paLoc, expired); r.status != 401 {
+		t.Fatalf("a query of pa with an expired grant: %d %v", r.status, r.body)
+	}
+	for name, tok := range map[string]string{"expired": expired, "not a grant": "not-a-grant", "none": ""} {
+		r := x.raw(amyLoc, tok)
+		if r.status != 401 || r.body["code"] != "unauthenticated" || r.header.Get("WWW-Authenticate") != "Bearer" || r.header.Get("Cache-Control") != "no-store" {
+			t.Errorf("/_refs at amy's gs, %s: %d %v %v", name, r.status, r.body, r.header)
+		}
+	}
+	if r := x.raw(bobLoc, w.amy); r.status != 403 || r.body["code"] != "forbidden" {
+		t.Errorf("/_refs at bob's gs with amy's grant: %d %v", r.status, r.body)
+	}
+}
