@@ -1386,6 +1386,12 @@ patchlog rebase -branch release-7 -new release-7-b -switch
 patchlog janitor -ns matches                     # purge merged/superseded/abandoned branches after `cleanup`
 ```
 
+- `rebase -onto` may name a namespace further up the branch's base chain (§7.4, §F.5), but with
+  `-switch` only the same base works for now: the core still answers `422` ("successor must be
+  an existing namespace with the same base") to a successor up the chain, after the successor
+  has been created and replayed into, and the old branch stays unfrozen. The core's half comes
+  in wave 2; until then rebase up the chain without `-switch`.
+
 - Resources are classified by ancestry, using ids only (§F.3). A fast-forward reproduces the
   branch's ids exactly. A replay reports overlapping `writes` under the array rule, and the
   delete-versus-change cases always go to a person.
@@ -1432,7 +1438,9 @@ patchlog janitor -ns matches                     # purge merged/superseded/aband
   must have an entry in a counting batch since its last change, or a head there that equals or
   descends from the branch's revision (the closing rule); the decision names the first one
   that hasn't. The successor may be a branch of any namespace up the old branch's local base
-  chain; one purged after the freeze is verified from its log. An entry with `"grant": null`
+  chain (§F.5), though until the core takes such a successor (wave 2) it refuses one that isn't
+  a branch of the same base (`422`), so only those are set today; one purged after the freeze
+  is verified from its log. An entry with `"grant": null`
   counts, on its author alone for `merged` and `superseded` and as a `*`-key write for
   `abandoned`, only while `GET /` says `"auth": "disabled"` (asked on each check, so a janitor
   notices a restart with grants); entries without `grant` count for no one. Cleanup is opt-in:
@@ -1829,7 +1837,8 @@ curl -X PATCH $B/ns/matches -H "$P" -H 'If-Match: "{config_id}"' -H "Authorizati
 patchlog serve -master-key /etc/patchlog/master.key [-rotate-epochs 24h] [-rotate-on-revoke]
 curl -X PATCH $B/ns/matches -H "$P" -H 'If-Match: "{config_id}"' -H "Authorization: Bearer $STAR" \
   -d '[{"op":"add","path":"/encryption","value":{"level":"sealed"}}]'
-curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -d '{"epochs":[1]}'
+curl -X POST $B/ns/matches/keys -H "Authorization: Bearer $READER" -H 'Content-Type: application/json' \
+  -d '{"epochs":[1]}'
 ```
 
 - **What it is.** A sealed namespace keeps encryption at rest (E1) and serves every response
@@ -3362,15 +3371,16 @@ The last row is the root: paste its path into a document's `$schema` (or another
 
 ```sh
 B=http://localhost:8080; P='Content-Type: application/json-patch+json'
+A='X-Author: me'   # dev mode: every write names its author (§7.2), else 400
 
 # Create a namespace (its document is the genesis patch set).
-curl -X PATCH $B/ns/matches -H "$P" -H 'If-None-Match: *' \
+curl -X PATCH $B/ns/matches -H "$P" -H "$A" -H 'If-None-Match: *' \
   -d '[{"op":"add","path":"","value":{"read":"public"}}]'
 
 # Create a resource, then append to it with the id from ETag.
-curl -i -X PATCH $B/r/matches/derby -H "$P" -H 'If-None-Match: *' \
+curl -i -X PATCH $B/r/matches/derby -H "$P" -H "$A" -H 'If-None-Match: *' \
   -d '[{"op":"add","path":"","value":{"score":"0-0"}}]'
-curl -i -X PATCH $B/r/matches/derby -H "$P" -H 'If-Match: "1…"' \
+curl -i -X PATCH $B/r/matches/derby -H "$P" -H "$A" -H 'If-Match: "1…"' \
   -d '[{"op":"replace","path":"/score","value":"1-0"}]'
 
 curl -i $B/r/matches/derby                  # 302 to /r/matches/derby/rev/{head}

@@ -19,7 +19,8 @@ the reference implements the default the plan states.
 **Changes to check before upgrading:**
 - **Development tools need `-author`** (§7.2). With authentication disabled, a write without
   `X-Author` is `400 bad_input`; reads are unaffected. `patchlog janitor`, `merge`, `rebase`,
-  `import` and `schema` against a `-dev` server must pass `-author`; `compose.yaml` and
+  `import` and `schema` against a `-dev` server must pass `-author`, and so must `patchlog dav`
+  in local mode, which starts without it but has every save refused; `compose.yaml` and
   `compose.host.yaml` now start the janitor with `-author=janitor`, whose namespace purges had
   been failing. A remote registration sent without a bearer names this deployment's origin as
   its author. The playground sends `X-Author` only once its author box is filled.
@@ -175,7 +176,13 @@ the reference implements the default the plan states.
 - **Merge, rebase and releases** (§F.3, §F.5, §F.9):
   - Rebase creates the successor with the old branch's `read`, or `"grant"` where that would
     rank it lower (public < private = sealed < e2e; sealed and public ranks public), refuses to
-    replay into a successor that ranks lower, and allows `-switch` up the base chain.
+    replay into a successor that ranks lower, and allows `-switch` up the base chain (§7.4,
+    §F.5), refusing only a successor outside it. **Pending the core (wave 2):** the core still
+    refuses a successor that isn't a branch of the same base (`422 invalid`, "successor must be
+    an existing namespace with the same base"), so `rebase -onto <a namespace further up>
+    -switch` creates and replays into the successor, then fails at the switch and leaves the
+    old branch unfrozen (exit 1). Until then, rebase up the chain without `-switch`, or switch
+    only to a successor of the same base.
   - A merger without unrestricted `read` on the branch copies the blobs its items reference
     into the target first, or uploads them where the copy is `404`, release steps included. At
     E3 a resource kept at a base head that references a blob a `sealed` op can't declare stays
@@ -199,8 +206,9 @@ the reference implements the default the plan states.
   current `merge.authors` or that are signed by a current `*` key of the old branch (verified
   against the stored grant), and every resource the branch changed must be merged or replayed
   (the closing rule). `abandoned` counts only if set under the branch's current `*` key, not
-  merely its kid, from local bases only. A successor may sit anywhere up the base chain; one
-  purged after the freeze is verified from its log. `Decision.FrozenAt` is the start of the
+  merely its kid, from local bases only. A successor may sit anywhere up the base chain (one
+  the core can't record yet, pending wave 2: see rebase above); one purged after the freeze is
+  verified from its log. `Decision.FrozenAt` is the start of the
   cleanup period.
 - **Catalog access** (§B.11.2–§B.11.5, §B.11.7): only a `user:` sub is a subject, groups are
   always `group:{g}`, and only the exact admin group counts as `catalog-admins`. A role counts
