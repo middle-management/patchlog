@@ -104,13 +104,15 @@ func epochAAD(ns int64, epoch int) []byte {
 }
 
 // cachePublic reports whether a namespace's responses use the public cache
-// classes of §9: public namespaces, and sealed and e2e ones whatever their
-// read mode (§E.2.5): they only ever serve ciphertext.
+// classes of §9. Sealed and e2e namespaces are cached by their read mode
+// like any other (§E.2.5): a public one publicly, its ciphertext opening
+// only to key holders; one with read "grant" privately, with edge
+// lifetimes only on a read its verifying edge verified.
 func (t *tx) cachePublic(n *nsRow) bool { return t.config(n.configSeq).cachePublic() }
 
 // cachePublic reports whether a namespace with this document uses the
 // public cache classes (see tx.cachePublic).
-func (c *Config) cachePublic() bool { return c.Read == "public" || c.level >= levelSealed }
+func (c *Config) cachePublic() bool { return c.Read == "public" }
 
 // isSealedNS reports whether n serves sealed content.
 func (t *tx) isSealedNS(n *nsRow) bool { return t.config(n.configSeq).level == levelSealed }
@@ -366,13 +368,16 @@ func (t *tx) configJob(n *nsRow, seq int64, nsID string, doc []byte) *sealJob {
 }
 
 // rangeJob prepares the sealing of n's namespace log range (since, to],
-// where to is ns_log seq toSeq with id toID.
+// where to is ns_log seq toSeq with id toID: a range, long-poll answer or
+// namespace event is sealed under K_e of the current epoch (§E.2.2), not
+// that of its last entry. A stored range keeps its bytes; one evicted is
+// sealed again under the epoch current then.
 func (t *tx) rangeJob(n *nsRow, since string, toSeq int64, toID string, plain func() []byte) *sealJob {
 	j := &sealJob{kind: sealRange, key: since + ":" + toID}
 	if t.stored(n, j) {
 		return j
 	}
-	e := t.entryEpoch(n, toSeq)
+	e := t.config(n.configSeq).Epoch
 	j.kid, j.k, j.pl, j.plain = seal.Kid(n.name, e), t.epochKey(n.id, e), seal.RangePL(n.name, since, toID), plain()
 	j.pad = t.config(n.configSeq).Pad
 	return j

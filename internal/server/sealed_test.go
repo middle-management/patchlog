@@ -312,8 +312,9 @@ func TestSealedOutputs(t *testing.T) {
 	}
 }
 
-// read: "grant" still decides who may fetch ciphertext, while caching uses
-// the public classes (§E.2.5).
+// read: "grant" decides who may fetch ciphertext, and caching follows it
+// as for any namespace: private, with no edge lifetimes without a
+// verifying edge (v0.63 §E.2.5).
 func TestSealedReadGrant(t *testing.T) {
 	t.Parallel()
 	e := newSealedAuthEnv(t)
@@ -327,7 +328,7 @@ func TestSealedReadGrant(t *testing.T) {
 	expect(t, e.get("/ns/s/rev/"+e.nsHead("s", w)+"/log", nr), 404)
 	r := e.get("/r/s/a/rev/"+id, w)
 	expect(t, r, 200)
-	if !isJOSE(r) || r.H.Get("Cache-Control") != ccImmutable || r.H.Get("CDN-Cache-Control") != "" {
+	if !isJOSE(r) || r.H.Get("Cache-Control") != "private, max-age=300" || r.H.Get("CDN-Cache-Control") != "no-store" {
 		t.Fatalf("headers %v", r.H)
 	}
 	// Keys need a verified read grant.

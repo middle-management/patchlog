@@ -10,8 +10,10 @@ package core
 //     protected header binds kid "{ns}#{e}" and pl {ns, name, parent}. The
 //     gate (§6.2) doesn't apply it and skips schema validation; it checks the
 //     header without a key: pl must be exactly this write's {ns, name,
-//     parent} and kid an epoch of the namespace that has begun and isn't
-//     after the current one. That is a consistency check that catches client
+//     parent}, kid the namespace's epoch in force (for a batch's items, the
+//     configuration its config change produces), and no zip (§E.3.1).
+//     A declared blob must be a sealed blob without a nonce. That is a
+//     consistency check that catches client
 //     bugs and replays under another name early, not a security boundary: a
 //     writer can always seal garbage, and readers verify pl when they
 //     decrypt. The envelope has writes [] and no doc, so any namespace,
@@ -97,10 +99,16 @@ func (t *tx) e2eConfigWritten(n *nsRow, old, cfg *Config) {
 	t.must(err)
 }
 
-// e2eEpochOK reports whether epoch e of n may seal a write under cfg: it
-// began (at or after n's first epoch) and isn't after cfg's current one.
-// cfg may be a batch's new configuration, whose epoch isn't recorded yet.
-func (t *tx) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
+// e2eEpochOK reports whether epoch e of n may seal what is checked under
+// cfg. A sealed op of a write names the epoch in force (§E.3.1, invariant
+// 6): cfg's, which for a batch's items is the configuration its config
+// change produces (§7.5). Any other (a prune's snapshot, whose kid follows
+// its revision's chain, §8.6) names an epoch that began, at or after n's
+// first, and isn't after cfg's current one.
+func (t *tx) e2eEpochOK(n *nsRow, cfg *Config, e int, inForce bool) bool {
+	if inForce {
+		return e == cfg.Epoch
+	}
 	var first sql.NullInt64
 	t.must(t.QueryRow(`SELECT MIN(epoch) FROM e2e_epochs WHERE ns = ?`, n.id).Scan(&first))
 	lo := cfg.Epoch
@@ -110,18 +118,26 @@ func (t *tx) e2eEpochOK(n *nsRow, cfg *Config, e int) bool {
 	return e >= lo && e <= cfg.Epoch
 }
 
-// checkSealedHeader checks a JWE's protected header without a key: kid
-// "{ns}#{e}" for a usable epoch of n, and pl exactly want.
-func (t *tx) checkSealedHeader(n *nsRow, cfg *Config, jwe string, want seal.PL, what string) *Error {
+// checkSealedHeader checks a JWE's protected header without a key (§E.3.1,
+// step 3): no zip (§E.2.2), kid "{ns}#{e}" for the epoch in force with
+// inForce (a write's sealed op) or else a usable epoch of n
+// (e2eEpochOK), and pl exactly want.
+func (t *tx) checkSealedHeader(n *nsRow, cfg *Config, jwe string, want seal.PL, what string, inForce bool) *Error {
 	h, err := seal.ParseHeader(jwe)
 	if err != nil || strings.Split(jwe, ".")[1] != "" {
 		return invalid(fmt.Sprintf("the %s is not a compact JWE with alg dir and enc A256GCM", what))
+	}
+	if h.Zip != "" {
+		return invalid(fmt.Sprintf("the %s's protected header has zip: sealed payloads are never compressed (§E.2.2)", what))
 	}
 	kns, e, err := seal.ParseKid(h.Kid)
 	if err != nil || kns != n.name {
 		return invalid(fmt.Sprintf("the %s's kid must be %q#{epoch}", what, n.name))
 	}
-	if !t.e2eEpochOK(n, cfg, e) {
+	if !t.e2eEpochOK(n, cfg, e, inForce) {
+		if inForce {
+			return invalid(fmt.Sprintf("the %s is sealed under epoch %d, not namespace %s's epoch in force, %d (§E.3.1)", what, e, n.name, cfg.Epoch))
+		}
 		return invalid(fmt.Sprintf("the %s is sealed under epoch %d, which namespace %s doesn't have (current: %d)", what, e, n.name, cfg.Epoch))
 	}
 	if !jsonv.Equal(map[string]any(h.PL), jsonv.FromGo(map[string]any(want))) {
@@ -176,7 +192,7 @@ func (t *tx) applyStepsE2E(n *nsRow, cfg *Config, s *itemState) *Error {
 				if parentID != nil {
 					parent = parentID.String()
 				}
-				if err := t.checkSealedHeader(n, cfg, jwe, seal.PatchSetPL(n.name, s.Resource, parent), "sealed patch set"); err != nil {
+				if err := t.checkSealedHeader(n, cfg, jwe, seal.PatchSetPL(n.name, s.Resource, parent), "sealed patch set", true); err != nil {
 					return err
 				}
 				var err *Error
@@ -228,6 +244,11 @@ func (t *tx) checkDeclared(n *nsRow, s *itemState, step *stepState, list []ids.I
 		}
 		if src.typ != SealedBlobType {
 			return blobErr(ptr, "the declared blob is not a sealed blob (§E.3.1)")
+		}
+		if src.nonce != "" {
+			// A client-encrypted blob's id is over ciphertext and needs
+			// no nonce; one with a nonce isn't such a blob (§E.3.1).
+			return blobErr(ptr, "the declared blob has a nonce; an end-to-end blob has none (§E.3.1)")
 		}
 		step.blobs[bid] = src
 	}
@@ -487,7 +508,7 @@ func (t *tx) pruneToE2E(n *nsRow, cfg *Config, name string, own *resRow, h *revR
 	if h.id != requested {
 		return nil, apiErr(422, "invalid", "message", "the horizon moves down to a protected revision (§8.6); seal the snapshot for that one", "horizon", h.id.String())
 	}
-	if err := t.checkSealedHeader(n, cfg, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot"); err != nil {
+	if err := t.checkSealedHeader(n, cfg, snapshot, seal.SnapshotPL(n.name, name, h.id.String()), "snapshot", false); err != nil {
 		return nil, err
 	}
 	// The snapshot needs no list (§8.6, §E.3.1): the server keeps the

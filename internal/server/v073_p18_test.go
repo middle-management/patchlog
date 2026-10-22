@@ -2,13 +2,20 @@ package server
 
 import (
 	"crypto/ecdh"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"net/http"
 	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	plclient "github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/core"
+	"github.com/middle-management/patchlog/internal/edge"
 	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
 	"github.com/middle-management/patchlog/internal/seal"
 )
 
@@ -447,5 +454,176 @@ func TestV073KeysBranchBases(t *testing.T) {
 	}
 	if got := kids(nil, reader(at(-time.Hour))); got != "eb#2,e#1,e#2" {
 		t.Errorf("after the base's rotation: %s", got)
+	}
+}
+
+// withZip returns jwe with "zip":"DEF" added to its protected header: the
+// server checks the header without a key, so the rest needn't open.
+func withZip(t *testing.T, jwe string) string {
+	t.Helper()
+	parts := strings.Split(jwe, ".")
+	raw, err := base64.RawURLEncoding.DecodeString(parts[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var h map[string]any
+	if err := json.Unmarshal(raw, &h); err != nil {
+		t.Fatal(err)
+	}
+	h["zip"] = "DEF"
+	parts[0] = base64.RawURLEncoding.EncodeToString(jsonv.Canonical(jsonv.FromGo(h)))
+	return strings.Join(parts, ".")
+}
+
+// zipOp returns the sealed patch set raw with its op's JWE given a zip
+// header.
+func zipOp(t *testing.T, raw string) string {
+	t.Helper()
+	ps := jsonv.MustParse([]byte(raw)).([]any)
+	op := ps[0].(map[string]any)
+	op["value"] = withZip(t, op["value"].(string))
+	return string(jsonv.Canonical(ps))
+}
+
+// P18, ENC-3, ENC-20 and ENC-24 (§E.3.1, step 3 and 4): an E3 sealed op,
+// or a prune's snapshot, whose protected header has zip is 422 invalid; a
+// sealed op's kid must name the epoch in force, for a batch's items the
+// one its config change produces (422 invalid); and a declared blob that
+// has a nonce is 422 blob.
+func TestV073E2ESealedOpChecks(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, withKeyStore(newKeyStore(t)), withEncTuning, withArchive(t, t.TempDir()), withoutRetentionLoop, withoutBlobSweep)
+	e.mkNS("e", e2eDoc(map[string]any{}))
+	k := seal.NewKey()
+	sealedUnder := func(epoch int, name, parent string, patches []any) string {
+		return sealed(t, k, seal.Kid("e", epoch), "e", name, parent, patches)
+	}
+
+	// ENC-3: no zip, in a write or a snapshot.
+	expectCode(t, e.writeAs("e", "z", "", zipOp(t, sealedUnder(1, "z", "", addRoot(map[string]any{"n": 0.0}))), "alice"), 422, "invalid")
+	p0 := etagOf(e.writeAs("e", "p", "", sealedUnder(1, "p", "", addRoot(map[string]any{"n": 0.0})), "alice"))
+	p1 := etagOf(e.writeAs("e", "p", p0, sealedUnder(1, "p", p0, ops(op("replace", "/n", 1.0))), "alice"))
+	e.clock.Advance(10 * time.Minute)
+	snap, err := seal.SealSnapshot(k, "e#1", "e", "p", p1, map[string]any{"n": 1.0})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectCode(t, e.prune("e", "p", map[string]any{"horizon": p1, "snapshot": withZip(t, snap)}, "admin"), 422, "invalid")
+	expect(t, e.prune("e", "p", map[string]any{"horizon": p1, "snapshot": snap}, "admin"), 200)
+
+	// ENC-20: the epoch in force only, once the namespace is at epoch 2.
+	expect(t, e.patchNS("e", ops(op("add", "/encryption/epoch", 2.0)), ""), 201)
+	expectCode(t, e.writeAs("e", "p", p1, sealedUnder(1, "p", p1, ops(op("replace", "/n", 2.0))), "alice"), 422, "invalid")
+	p2 := etagOf(e.writeAs("e", "p", p1, sealedUnder(2, "p", p1, ops(op("replace", "/n", 2.0))), "alice"))
+	// A batch that moves to epoch 3: its items seal under 3, not 2.
+	batch := func(epoch int) *resp {
+		return e.do(req{method: "POST", path: "/ns/e/batch", author: "admin", body: map[string]any{
+			"config": map[string]any{"ifMatch": e.configID("e", ""), "patches": ops(op("add", "/encryption/epoch", 3.0))},
+			"items":  []any{map[string]any{"resource": "p", "ifMatch": p2, "steps": []any{jsonv.MustParse([]byte(sealedUnder(epoch, "p", p2, ops(op("replace", "/n", 3.0)))))}}}}})
+	}
+	if r := batch(2); r.Code != 422 || !strings.Contains(string(r.Body), "invalid") {
+		t.Fatalf("batch item under the epoch before its config change: %d %s", r.Code, r.Body)
+	}
+	expect(t, batch(3), 201)
+
+	// ENC-24: a declared blob with a nonce.
+	data, _, err := plclient.EncryptBlob("image/png", []byte("nonced "+encMarker), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	nonce := seal.NewNonce()
+	bid := blobID(core.SealedBlobType, nonce, data)
+	expect(t, e.putBlobAs("e", "b", bid, core.SealedBlobType, nonce, data, "alice"), 201)
+	ps, err := seal.WithBlobs([]byte(sealedUnder(3, "b", "", addRoot(map[string]any{"pic": bid}))), []string{bid})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := e.writeAs("e", "b", "", string(ps), "alice")
+	expectCode(t, r, 422, "blob")
+	if !strings.Contains(r.Str("message"), "nonce") {
+		t.Fatalf("blob refusal %s", r.Body)
+	}
+}
+
+// P18, ENC-4 (§E.2.2): a namespace log range is sealed under K_e of the
+// current epoch, not that of its last entry; a stored range keeps its
+// bytes.
+func TestV073RangeCurrentEpoch(t *testing.T) {
+	t.Parallel()
+	e := newSealedEnv(t)
+	e.mkNS("s", sealedDoc(map[string]any{"read": "public"}))
+	a0 := e.wr("s", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	h1 := e.nsHead("s")
+	e.wr("s", "a", a0, withNonce(ops(op("replace", "/v", 2.0))))
+	h2 := e.nsHead("s")
+	kidOf := func(path string) string {
+		t.Helper()
+		r := e.get(path)
+		expect(t, r, 200)
+		h, err := seal.ParseHeader(string(r.Body))
+		if err != nil {
+			t.Fatalf("%s: %v", path, err)
+		}
+		return h.Kid
+	}
+	stored := "/ns/s/rev/" + h2 + "/log?since=" + h1
+	before := string(e.get(stored).Body)
+	if k := kidOf(stored); k != "s#1" {
+		t.Fatalf("before the rotation: %s", k)
+	}
+	expect(t, e.patchNS("s", ops(op("add", "/encryption/epoch", 2.0)), ""), 201)
+	// A range ending before the rotation, not stored yet: the current epoch.
+	if k := kidOf("/ns/s/rev/" + h1 + "/log"); k != "s#2" {
+		t.Fatalf("an unstored range of epoch 1's entries is sealed under %s, want s#2", k)
+	}
+	if after := string(e.get(stored).Body); after != before {
+		t.Fatal("a stored range was sealed again")
+	}
+}
+
+// P18, RH-44 (ENC-30, §E.2.5, §9): sealed and e2e namespaces are cached by
+// read mode: a public one publicly; one with read "grant" privately, with
+// edge lifetimes only on a read the verifying edge verified.
+func TestV073SealedCacheByReadMode(t *testing.T) {
+	t.Parallel()
+	e := newEdgeEnv(t, withKeyStore(newKeyStore(t)), withEncTuning)
+	e.mkNS("pub", sealedDoc(map[string]any{"read": "public"}))
+	e.mkNS("priv", sealedDoc(map[string]any{"read": "grant"}))
+	e.mkNS("e2", e2eDoc(map[string]any{"read": "grant"}))
+	pid := e.wr("pub", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	qid := e.wr("priv", "a", "", withNonce(addRoot(map[string]any{"v": 1.0})))
+	k := seal.NewKey()
+	eid := etagOf(e.writeAs("e2", "a", "", sealed(t, k, "e2#1", "e2", "a", "", addRoot(map[string]any{"v": 1.0})), "alice"))
+	get := func(path string, verified bool) *resp {
+		t.Helper()
+		hr, err := http.NewRequest("GET", e.srv.URL+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		hr.Header.Set("X-Author", "reader")
+		if verified {
+			hr.Header.Set(edge.DefaultHeader, edgeSecret)
+			hr.Header.Set(edge.DefaultPrefixHeader, path[:strings.Index(path, "/rev/")])
+		}
+		res, err := http.DefaultClient.Do(hr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer res.Body.Close()
+		b, _ := io.ReadAll(res.Body)
+		return &resp{Code: res.StatusCode, H: res.Header, Body: b}
+	}
+	if r := get("/r/pub/a/rev/"+pid, false); r.Code != 200 || r.H.Get("Cache-Control") != ccImmutable {
+		t.Fatalf("public sealed: %d %v", r.Code, r.H)
+	}
+	for _, path := range []string{"/r/priv/a/rev/" + qid, "/r/e2/a/rev/" + eid} {
+		r := get(path, false)
+		if r.Code >= 400 || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") || r.H.Get("CDN-Cache-Control") != "no-store" {
+			t.Errorf("%s unverified: %d %v", path, r.Code, r.H)
+		}
+		r = get(path, true)
+		if r.Code >= 400 || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") || r.H.Get("CDN-Cache-Control") == "" || r.H.Get("CDN-Cache-Control") == "no-store" {
+			t.Errorf("%s verified: %d %v", path, r.Code, r.H)
+		}
 	}
 }

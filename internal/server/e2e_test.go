@@ -83,7 +83,9 @@ func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer st
 		return f.snapshotAt(ns, name, id, keys, r)
 	}
 	expect(t, r, 302)
-	if r.H.Get("X-E2E") != "fold" || !strings.HasPrefix(r.H.Get("Cache-Control"), "public") {
+	// The fixture's namespaces are read "grant", so cached privately
+	// (v0.63 §E.2.5: by read mode, at E3 as at any level).
+	if r.H.Get("X-E2E") != "fold" || !strings.HasPrefix(r.H.Get("Cache-Control"), "private") {
 		t.Fatalf("fold headers %v", r.H)
 	}
 	loc := r.H.Get("Location")
@@ -150,11 +152,14 @@ func (f *e2eFixture) fold(ns, name, id string, keys map[string][]byte, bearer st
 
 // snapshotAt opens the prune snapshot that r, the answer of
 // /r/{ns}/{name}/rev/{h}, serves: 200 application/jose, or a tombstone
-// horizon's 410 carrying it, both immutable with X-E2E: snapshot.
+// horizon's 410 carrying it, both of the immutable class with X-E2E:
+// snapshot.
 func (f *e2eFixture) snapshotAt(ns, name, h string, keys map[string][]byte, r *resp) any {
 	t := f.t
 	t.Helper()
-	if r.H.Get("X-E2E") != "snapshot" || r.H.Get("ETag") != `"`+h+`"` || !strings.Contains(r.H.Get("Cache-Control"), "immutable") {
+	// The immutable class, private for the fixture's read "grant"
+	// namespaces (v0.63 §E.2.5).
+	if r.H.Get("X-E2E") != "snapshot" || r.H.Get("ETag") != `"`+h+`"` || r.H.Get("Cache-Control") != "private, max-age=300" {
 		t.Fatalf("/rev/%s: %d %v", h, r.Code, r.H)
 	}
 	var jwe string
