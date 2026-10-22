@@ -907,13 +907,10 @@ func (t *tx) checkItems(req Request, items []Item, cc *ConfigChange, source any,
 	}
 	for _, check := range []func(s *itemState, step *stepState) *Error{
 		func(s *itemState, step *stepState) *Error {
-			return t.checkGrantRules(a, envOf(s, step), step.sealed)
+			return t.checkGrantRules(a, envOf(s, step), stepUnknown(cfg, s, step))
 		},
 		func(s *itemState, step *stepState) *Error {
-			if step.sealed {
-				return checkNSRulesE2E(cfg, envOf(s, step))
-			}
-			return checkNSRules(cfg, a, envOf(s, step), false)
+			return checkNSRules(cfg, a, envOf(s, step), false, stepUnknown(cfg, s, step))
 		},
 	} {
 		for _, s := range st {

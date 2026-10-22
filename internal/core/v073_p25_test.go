@@ -2,7 +2,15 @@ package core
 
 import (
 	"context"
+	"crypto/ed25519"
 	"testing"
+	"time"
+
+	"github.com/middle-management/patchlog/internal/grant"
+	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/keystore"
+	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/seal"
 )
 
 // P25 GATE-RULE-ORDER: step 6 of §6.2 runs the *-key guard, a config
@@ -173,5 +181,186 @@ func TestV073P25BatchRuleSubSteps(t *testing.T) {
 		if r.Status != want.status || (want.code != "" && r.Err["code"] != want.code) {
 			t.Errorf("dry run item %d: %d %v, want %d %s", i, r.Status, r.Err, want.status, want.code)
 		}
+	}
+}
+
+// p25E2E is an engine with authentication on and a key store, in which
+// create makes an e2e namespace listing ks's keys, and sealed seals a
+// patch set for it under epoch 1's key k.
+type p25E2E struct {
+	*Engine
+	ks     *p17Keys
+	k      []byte
+	create func(ns string, doc map[string]any)
+}
+
+func p25E2EEngine(t *testing.T, ks *p17Keys) *p25E2E {
+	t.Helper()
+	opPub, opPriv := grant.GenerateKey()
+	ops, err := grant.ParseKeys(jsonv.FromGo([]any{map[string]any{"kid": "operator", "alg": "ed25519", "pub": opPub, "can": []any{"*"}}}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := keystore.New(keystore.Generate())
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := Open(Options{Path: pgtest.DB(t), BlobDir: t.TempDir(), OperatorKeys: ops, KeyStore: store, RetentionInterval: -1, Remote: RemoteOptions{FollowInterval: -1},
+		Limits: p17Fast(), Maximums: p17Fast(), TailInterval: authTailEvery, Purger: discardPurger{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { e.Close() })
+	op := func(ns string) Credentials {
+		g, err := grant.Mint(map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{ns}, "can": []any{"config"},
+			"exp": time.Now().Add(time.Hour).UTC().Format(time.RFC3339)}, ed25519.PrivateKey(opPriv))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return Credentials{Bearer: g.Encode()}
+	}
+	env := &p25E2E{Engine: e, ks: ks, k: seal.NewKey()}
+	env.create = func(ns string, doc map[string]any) {
+		t.Helper()
+		d := map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}, "keys": ks.entries}
+		for k, v := range doc {
+			d[k] = v
+		}
+		if _, err := e.WriteConfig(context.Background(), Request{NS: ns, Cred: op(ns)}, ConfigChange{IfNoneMatch: true, Patches: p25Root(d)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return env
+}
+
+// sealedCreate writes a sealed create of name in ns under cred.
+func (e *p25E2E) sealedCreate(t *testing.T, ns, name string, cred Credentials) (*WriteResult, error) {
+	t.Helper()
+	ps, err := seal.SealPatchSet(e.k, seal.Kid(ns, 1), ns, name, "", jsonv.FromGo(p25Root(map[string]any{"x": 1.0})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return e.WriteResource(context.Background(), Request{NS: ns, Cred: cred}, Item{Resource: name, IfNoneMatch: true, Steps: []Step{{Patches: jsonv.MustParse(ps)}}})
+}
+
+func p25Test(path string, v any) map[string]any {
+	return map[string]any{"op": "test", "path": path, "value": v}
+}
+
+// p25IfDelete is the brief's rule: {if: [action == delete], then: [test
+// /doc/x]}.
+var p25IfDelete = map[string]any{"if": []any{p25Test("/action", "delete")}, "then": []any{map[string]any{"op": "test", "path": "/doc/x", "exists": true}}}
+
+// GB-15 (GR-26), GB-9: for a sealed create, append or restore at E3, a
+// namespace rule fails as a whole, 422 rule at /rules/{i}, only when its
+// outcome depends on a writes predicate or a /writes or /doc path; one
+// that passes, or fails, whatever those give is decided as usual (§6.2
+// End-to-end namespaces, §6.4.3).
+func TestV073P25E3NamespaceRuleOutcome(t *testing.T) {
+	var ks p17Keys
+	ks.add("admin", map[string]any{"can": []any{"*"}})
+	ks.add("w", map[string]any{"can": []any{"read", "create", "append", "delete", "restore"}})
+	e := p25E2EEngine(t, &ks)
+	writes := map[string]any{"op": "writes", "within": []any{"/a"}}
+	for i, c := range []struct {
+		name  string
+		rules []any
+		rule  int
+		path  string // "" for a create that passes
+	}{
+		{"a rule on /doc for deletes only", []any{p25IfDelete}, 0, ""},
+		{"any with a branch that passes", []any{map[string]any{"any": []any{p25Test("/action", "create"), writes}}}, 0, ""},
+		{"a rule on /doc", []any{p25IfDelete, map[string]any{"op": "test", "path": "/doc/x", "exists": true}}, 1, "/rules/1"},
+		{"a writes predicate", []any{map[string]any{"all": []any{p25Test("/action", "create"), writes}}}, 0, "/rules/0"},
+		{"the whole envelope", []any{map[string]any{"op": "test", "path": "", "schema": map[string]any{"type": "object"}}}, 0, "/rules/0"},
+		{"decided without them", []any{map[string]any{"all": []any{p25Test("/action", "create"), p25Test("/principal/id", "user:z")}}}, 0, "/rules/0/all/1"},
+		{"decided false whatever writes give", []any{map[string]any{"all": []any{p25Test("/action", "append"), writes}}}, 0, "/rules/0/all/0"},
+	} {
+		ns := "e" + string(rune('a'+i))
+		e.create(ns, map[string]any{"rules": c.rules})
+		cred := ks.mint(t, map[string]any{"kid": "w", "sub": "user:w", "ns": []any{ns}, "can": []any{"read", "create"}})
+		_, err := e.sealedCreate(t, ns, "d", cred)
+		if c.path == "" {
+			if err != nil {
+				t.Errorf("%s: sealed create refused: %v", c.name, err)
+			}
+			continue
+		}
+		p25Rule(t, c.name, err, c.rule, c.path)
+	}
+}
+
+// GB-15 (GR-26): a grant, key or role rule fails a sealed write at E3 as a
+// whole (403; a role with one doesn't allow) only when its outcome depends
+// on what the server can't see (§6.2, §C.2 item 4).
+func TestV073P25E3GrantRuleOutcome(t *testing.T) {
+	var ks p17Keys
+	writes := map[string]any{"op": "writes", "within": []any{"/a"}}
+	passes := map[string]any{"any": []any{p25Test("/action", "create"), writes}}
+	blind := map[string]any{"all": []any{p25Test("/action", "create"), writes}}
+	verbs := []any{"read", "create"}
+	ks.add("w", map[string]any{"can": verbs})
+	ks.add("kp", map[string]any{"can": verbs, "rules": []any{p25IfDelete}})
+	ks.add("kb", map[string]any{"can": verbs, "rules": []any{blind}})
+	e := p25E2EEngine(t, &ks)
+	e.create("e", map[string]any{"roles": map[string]any{
+		"blind":   map[string]any{"can": []any{"create"}, "rules": []any{blind}},
+		"creator": map[string]any{"can": []any{"create"}, "rules": []any{p25IfDelete}},
+	}})
+	n := 0
+	for _, c := range []struct {
+		name string
+		root map[string]any
+		want int
+	}{
+		{"block rule decided by its first branch", map[string]any{"kid": "w", "rules": []any{passes}}, 0},
+		{"block rule depending on writes", map[string]any{"kid": "w", "rules": []any{blind}}, 403},
+		{"block rule on /doc for deletes only", map[string]any{"kid": "w", "rules": []any{p25IfDelete}}, 0},
+		{"key rule on /doc for deletes only", map[string]any{"kid": "kp"}, 0},
+		{"key rule depending on writes", map[string]any{"kid": "kb"}, 403},
+		{"a role depending on writes", map[string]any{"kid": "w", "roles": []any{"blind"}}, 403},
+		{"a role decided without them", map[string]any{"kid": "w", "roles": []any{"creator"}}, 0},
+		{"one role of two allows", map[string]any{"kid": "w", "roles": []any{"blind", "creator"}}, 0},
+	} {
+		c.root["sub"], c.root["ns"], c.root["can"] = "user:w", []any{"e"}, verbs
+		n++
+		_, err := e.sealedCreate(t, "e", "d"+string(rune('a'+n)), ks.mint(t, c.root))
+		if got := v073Status(err); got != c.want {
+			t.Errorf("%s: got %d (%v), want %d", c.name, got, err, c.want)
+		}
+	}
+}
+
+// §6.2 End-to-end namespaces: a delete at E3 is checked as usual, except
+// that its doc is null, so a rule whose outcome depends on a /doc path
+// fails as a whole for it too; its writes, [], are known.
+func TestV073P25E3DeleteDocUnknown(t *testing.T) {
+	var ks p17Keys
+	ks.add("w", map[string]any{"can": []any{"read", "create", "delete"}})
+	e := p25E2EEngine(t, &ks)
+	unlocked := map[string]any{"if": []any{p25Test("/action", "delete")}, "then": []any{map[string]any{"not": p25Test("/doc/locked", true)}}}
+	within := map[string]any{"if": []any{p25Test("/action", "delete")}, "then": []any{map[string]any{"op": "writes", "within": []any{"/a"}}}}
+	for _, c := range []struct {
+		ns   string
+		rule any
+		path string // "" for a delete that passes
+	}{
+		{"locked", unlocked, "/rules/0"},
+		{"within", within, ""},
+	} {
+		e.create(c.ns, map[string]any{"rules": []any{c.rule}})
+		cred := ks.mint(t, map[string]any{"kid": "w", "sub": "user:w", "ns": []any{c.ns}, "can": []any{"read", "create", "delete"}})
+		w, err := e.sealedCreate(t, c.ns, "d", cred)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = e.WriteResource(context.Background(), Request{NS: c.ns, Cred: cred}, Item{Resource: "d", IfMatch: w.Items[0].IDs[0], Steps: []Step{{Delete: true}}})
+		if c.path == "" {
+			if err != nil {
+				t.Errorf("%s: delete refused: %v", c.ns, err)
+			}
+			continue
+		}
+		p25Rule(t, c.ns, err, 0, c.path)
 	}
 }
