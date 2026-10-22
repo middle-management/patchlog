@@ -38,9 +38,23 @@ func (e *SyntaxError) Error() string {
 
 // Parse parses exactly one I-JSON value. It rejects duplicate object keys,
 // lone surrogates, invalid UTF-8, non-finite numbers and integer literals
-// outside ±(2^53−1).
+// outside ±(2^53−1). It accepts Unicode noncharacters, so stored rows,
+// remote bases and bundles written before §3.1 refused them still parse;
+// request bodies use ParseInput.
 func Parse(data []byte) (any, error) {
-	p := &parser{b: data}
+	return parse(data, false)
+}
+
+// ParseInput parses a request body (§3.1): Parse, also refusing Unicode
+// noncharacters, U+FDD0–U+FDEF and every code point ending in FFFE or FFFF
+// (66 in all), whether written raw in UTF-8 or as a \u escape, a
+// surrogate pair included.
+func ParseInput(data []byte) (any, error) {
+	return parse(data, true)
+}
+
+func parse(data []byte, input bool) (any, error) {
+	p := &parser{b: data, input: input}
 	p.ws()
 	v, err := p.value(0)
 	if err != nil {
@@ -56,6 +70,14 @@ func Parse(data []byte) (any, error) {
 type parser struct {
 	b []byte
 	i int
+	// input refuses noncharacters (ParseInput).
+	input bool
+}
+
+// Noncharacter reports whether r is a Unicode noncharacter: U+FDD0–U+FDEF,
+// or a code point whose low 16 bits are FFFE or FFFF, in any plane.
+func Noncharacter(r rune) bool {
+	return r >= 0xFDD0 && r <= 0xFDEF || r&0xFFFE == 0xFFFE && r >= 0 && r <= utf8.MaxRune
 }
 
 func (p *parser) err(msg string) error { return &SyntaxError{Offset: p.i, Msg: msg} }
@@ -278,6 +300,9 @@ func (p *parser) str() (string, error) {
 					}
 					r = utf16.DecodeRune(r, r2)
 				}
+				if p.input && Noncharacter(r) {
+					return "", p.err(fmt.Sprintf("noncharacter U+%04X (§3.1)", r))
+				}
 				sb = utf8.AppendRune(sb, r)
 			default:
 				return "", p.err("invalid escape")
@@ -291,6 +316,9 @@ func (p *parser) str() (string, error) {
 			r, size := utf8.DecodeRune(p.b[p.i:])
 			if r == utf8.RuneError && size <= 1 {
 				return "", p.err("invalid UTF-8")
+			}
+			if p.input && Noncharacter(r) {
+				return "", p.err(fmt.Sprintf("noncharacter U+%04X (§3.1)", r))
 			}
 			sb = append(sb, p.b[p.i:p.i+size]...)
 			p.i += size

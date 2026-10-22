@@ -54,8 +54,9 @@ type bodyLimit struct {
 var noLimit = bodyLimit{}
 
 // readJSON reads and strictly parses an I-JSON body (§3.1) of at most
-// bound bytes. A longer one is 413 limit, naming lim, with measured the
-// bytes read, a lower bound (§6.6), or, for a body no limit covers, 400.
+// bound bytes, noncharacters refused (jsonv.ParseInput). A longer one is
+// 413 limit, naming lim, with measured the bytes read, a lower bound
+// (§6.6), or, for a body no limit covers, 400.
 func readJSON(r *http.Request, bound int, lim bodyLimit) (any, error) {
 	body, err := io.ReadAll(io.LimitReader(r.Body, int64(bound)+1))
 	if err != nil {
@@ -64,7 +65,7 @@ func readJSON(r *http.Request, bound int, lim bodyLimit) (any, error) {
 	if len(body) > bound {
 		return nil, tooLarge(len(body), lim)
 	}
-	v, err := jsonv.Parse(body)
+	v, err := jsonv.ParseInput(body)
 	if err != nil {
 		return nil, badInput(err.Error())
 	}
