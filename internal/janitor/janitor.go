@@ -43,6 +43,10 @@
 //     the branch (as for abandoned, below), with nothing after it in the
 //     branch. The rebase tool counts any such batch (§F.5); the janitor
 //     only these, so a successor's writers can't get unmerged work purged.
+//     A purged successor serves no grants (§8.5): the grant is then read
+//     from the successor's base, whose branch entry records its creator's,
+//     or from the branch, and if neither has it the branch is kept for a
+//     manual purge.
 //   - in both checks, every resource with a head, tombstone or batch entry
 //     of the branch's own up to that source.at has an entry in a batch
 //     that counts there whose source.at is at or after its last such
@@ -56,8 +60,12 @@
 //     branch, inherited or its own (§F.6): the root kid of the entry's
 //     grant (§7.4) names a key whose can lists "*" among the keys the
 //     branch accepts now (§C.4: its bases' current keys, then its own,
-//     less its copies of base keys the base has since dropped), and the
-//     grant isn't revoked there now. Keys are inherited from local bases
+//     less its copies of base keys the base has since dropped), the grant
+//     isn't revoked there now, and that key signed it: the stored grant
+//     (GET /ns/{ns}/grants/{gid}, §C.3.1) verifies under its pub. A kid is
+//     only a name, so a key removed, or replaced under the same kid as when
+//     a compromised key is rotated, withdraws what it set, as the grant
+//     itself stops working (§C.4). Keys are inherited from local bases
 //     only: the walk stops at a base in another deployment (base.origin),
 //     so a namespace here that shares its name lends none. An entry
 //     written while authentication was disabled records "grant": null
@@ -79,6 +87,9 @@ package janitor
 
 import (
 	"context"
+	"crypto/ed25519"
+	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"maps"
@@ -90,9 +101,11 @@ import (
 
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/follow"
+	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/release"
 	"github.com/middle-management/patchlog/internal/schema"
+	"github.com/middle-management/patchlog/internal/sig"
 )
 
 // Options configure a Janitor.
@@ -487,6 +500,8 @@ type branch struct {
 	docs map[string]nsAt
 	// keyCache holds keys by namespace.
 	keyCache map[string]map[string]nsKey
+	// grants holds stored grants by id (signedBy).
+	grants map[string]*grant.Grant
 }
 
 // nsAt is a namespace's head and its document there.
@@ -629,11 +644,11 @@ type coverage struct {
 // coveredBy finds the batches of entries that count for branch: those
 // without origin whose source.ns is branch, whose source.at is in the
 // branch's chain (blog), and that trusted accepts, as written by trustedBy
-// (for the reason). It checks that the branch changed no document after
-// the latest one's source.at. disabled says the deployment runs with
-// authentication disabled (§1), for the reason too. A nil coverage comes
-// with why.
-func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, trusted func(client.NSEntry) (bool, error), trustedBy string, e2e, disabled bool) (*coverage, string, error) {
+// (for the reason; trusted may say why it refused one). It checks that the
+// branch changed no document after the latest one's source.at. disabled
+// says the deployment runs with authentication disabled (§1), for the
+// reason too. A nil coverage comes with why.
+func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, trusted func(client.NSEntry) (bool, string, error), trustedBy string, e2e, disabled bool) (*coverage, string, error) {
 	pos := map[string]int{}
 	for i, e := range blog {
 		pos[e.ID] = i
@@ -644,7 +659,7 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, t
 		if !merge.IsMergeOf(e, branch) {
 			continue
 		}
-		ok, err := trusted(e)
+		ok, why, err := trusted(e)
 		if err != nil {
 			return nil, "", err
 		}
@@ -657,6 +672,9 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, t
 				who += " (written without authentication, which counts for no one under grants)"
 			case !e.GrantNull:
 				who += " (no grant recorded)"
+			}
+			if why != "" {
+				who += ": " + why
 			}
 			untrusted = append(untrusted, e.ID+" by "+who)
 			continue
@@ -774,7 +792,7 @@ func (b *branch) descends(ctx context.Context, target, name, rev string) (bool, 
 }
 
 // covered runs coveredBy and closing against target.
-func (b *branch) covered(ctx context.Context, target string, entries []client.NSEntry, trusted func(client.NSEntry) (bool, error), trustedBy string, disabled bool) (bool, string, error) {
+func (b *branch) covered(ctx context.Context, target string, entries []client.NSEntry, trusted func(client.NSEntry) (bool, string, error), trustedBy string, disabled bool) (bool, string, error) {
 	cov, why, err := coveredBy(entries, b.ns, b.log, trusted, trustedBy, b.e2e, disabled)
 	if cov == nil || err != nil {
 		return false, why, err
@@ -804,7 +822,7 @@ func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
 	if err != nil {
 		return false, "", err
 	}
-	listed := func(e client.NSEntry) (bool, error) { return merge.EntryListed(authors, e, disabled), nil }
+	listed := func(e client.NSEntry) (bool, string, error) { return merge.EntryListed(authors, e, disabled), "", nil }
 	return b.covered(ctx, b.base, entries, listed, "a principal in the base's merge.authors", disabled)
 }
 
@@ -846,9 +864,11 @@ func (b *branch) baseChain(ctx context.Context) ([]string, error) {
 //   - its log has a batch without origin whose source.ns is the branch,
 //     whose source.at is in the branch's chain, and whose recorded grant
 //     has a root sub and kid in the base's current merge.authors or
-//     chains to a current * key of the branch (starKey), with nothing
-//     after that source.at in the branch. One recording "grant": null
-//     counts while the deployment runs with authentication disabled (§1).
+//     chains to a current * key of the branch (starKey, which reads the
+//     grant from the successor, or once it is purged from its base or the
+//     branch), with nothing after that source.at in the branch. One
+//     recording "grant": null counts while the deployment runs with
+//     authentication disabled (§1).
 //     The rebase tool counts any such batch as an earlier merge (§F.5),
 //     the janitor only these.
 func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time.Time) (bool, string, error) {
@@ -921,16 +941,20 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 	if err != nil {
 		return false, "", err
 	}
-	trusted := func(e client.NSEntry) (bool, error) {
+	trusted := func(e client.NSEntry) (bool, string, error) {
 		switch {
 		case merge.EntryListed(authors, e, disabled):
-			return true, nil
+			return true, "", nil
 		case e.GrantNull:
 			// Written while every request counted as holding a * key (§1).
-			return disabled, nil
+			return disabled, "", nil
+		case e.Grant == nil:
+			return false, "", nil
 		}
-		ok, _, err := b.starKey(ctx, e, succ)
-		return ok, err
+		// The successor's base records its creator's grant, the rebase
+		// tool's, and the branch the grant of a switch (§F.5), should the
+		// successor be purged since.
+		return b.starKey(ctx, e, succ, sbase, b.ns)
 	}
 	return b.covered(ctx, succ, entries, trusted, "a principal in the base's merge.authors or under a current * key of the branch", disabled)
 }
@@ -938,9 +962,9 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time
 // verifyAbandoned checks an abandoned claim (§F.6): the config write that
 // set "abandoned": true was made under a grant chained to a current * key
 // of the branch, inherited from a local base or its own (starKey): a key
-// removed or replaced since, or one of a base in another deployment,
-// doesn't count. Only its administrators can give up everyone's unmerged
-// work.
+// removed since, one replaced under the same kid, whose new pub the grant
+// doesn't verify under, or one of a base in another deployment, doesn't
+// count. Only its administrators can give up everyone's unmerged work.
 func (b *branch) verifyAbandoned(ctx context.Context) (bool, string, error) {
 	var setter *configEntry
 	was := false
@@ -1117,16 +1141,19 @@ func (b *branch) revoked(ctx context.Context, ns string) (map[string]bool, error
 }
 
 // starKey reports whether a namespace entry's recorded grant chains to a
-// current * key of the branch (§F.6), as far as a janitor can tell from
-// what the entry records, the grant's id and its root sub and kid (§7.4):
-// the kid names a key whose can lists "*" among the keys the branch
-// accepts now (keys: its own or a local base's), and the grant isn't
-// revoked there now. A kid is a name within a namespace, so for an entry
-// written in another namespace, in (a successor), the kid must also name
-// the same key, alg and pub, among those in accepts now. why says what
-// failed. An entry without a grant, such as one written while
+// current * key of the branch (§F.6): the root kid the entry records
+// (§7.4) names a key whose can lists "*" among the keys the branch accepts
+// now (keys: its own or a local base's), the grant isn't revoked there
+// now, and that key signed it (signedBy). A kid is only a name, so a key
+// replaced under the same kid since the write, as when a compromised key
+// is rotated, no longer counts: the grant doesn't verify under it, just
+// as it no longer works anywhere (§C.4). For an entry written in another
+// namespace, in (a successor), the kid must also name the same key, alg
+// and pub, among those in accepts now; alt are other namespaces whose
+// entries may record the same grant, read if in no longer serves it. why
+// says what failed. An entry without a grant, such as one written while
 // authentication was disabled, is the caller's to judge.
-func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string) (ok bool, why string, err error) {
+func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string, alt ...string) (ok bool, why string, err error) {
 	if e.Grant == nil || e.Grant.Kid == "" {
 		return false, "it records no key", nil
 	}
@@ -1149,17 +1176,98 @@ func (b *branch) starKey(ctx context.Context, e client.NSEntry, in string) (ok b
 	if e.Grant.ID != "" && rv[e.Grant.ID] {
 		return false, fmt.Sprintf("its grant %s is revoked in the branch (§C.4)", e.Grant.ID), nil
 	}
-	if in == b.ns {
-		return true, "", nil
+	if in != b.ns {
+		ks, err := b.keys(ctx, in)
+		if err != nil {
+			return false, "", err
+		}
+		if k2, found := ks[kid]; !found || !strings.EqualFold(k2.alg, k.alg) || k2.pub != k.pub {
+			return false, fmt.Sprintf("key %q of %s isn't the branch's * key of that name", kid, in), nil
+		}
 	}
-	ks, err := b.keys(ctx, in)
-	if err != nil {
-		return false, "", err
+	return b.signedBy(ctx, e, kid, k, append([]string{in}, alt...))
+}
+
+// signedBy reports whether the grant an entry records was signed by k,
+// the key kid names now (§C.3.1): the stored grant, as GET
+// /ns/{ns}/grants/{gid} serves it, has the entry's grant id and root kid,
+// and its signature chain verifies under k's pub. It is read from the
+// first namespace of from, the one the entry was written in, that serves
+// it. Where that one is a successor purged since, which answers 410 for
+// its grants (§8.5), the others may serve the same grant, as the id and
+// signature are checked whoever serves it; if none does, it can't be
+// checked, and the branch is kept for a manual purge.
+func (b *branch) signedBy(ctx context.Context, e client.NSEntry, kid string, k nsKey, from []string) (ok bool, why string, err error) {
+	gid := e.Grant.ID
+	g, ok := b.grants[gid]
+	if !ok {
+		var doc *client.GrantDoc
+		src, purged := "", false
+		for i, ns := range from {
+			doc, err = b.j.c.Grant(ctx, ns, gid)
+			if i == 0 {
+				purged = client.IsPurged(err)
+			}
+			if src = ns; !client.IsNotFound(err) && !client.IsPurged(err) {
+				break
+			}
+		}
+		switch {
+		case purged && (client.IsNotFound(err) || client.IsPurged(err)):
+			return false, fmt.Sprintf("its grant %s can't be read since %s was purged (§8.5), so its key can't be checked: verify by hand", gid, from[0]), nil
+		case client.IsNotFound(err) || client.IsPurged(err):
+			return false, fmt.Sprintf("its grant %s isn't served by %s (§C.3.1), so its key can't be checked", gid, from[0]), nil
+		case err != nil:
+			return false, "", fmt.Errorf("janitor: grant %s of %s: %w", gid, src, err)
+		}
+		if g, err = parseGrantDoc(doc); err != nil {
+			return false, fmt.Sprintf("its grant %s as %s serves it is malformed: %v", gid, src, err), nil
+		}
+		if b.grants == nil {
+			b.grants = map[string]*grant.Grant{}
+		}
+		b.grants[gid] = g
 	}
-	if k2, found := ks[kid]; !found || !strings.EqualFold(k2.alg, k.alg) || k2.pub != k.pub {
-		return false, fmt.Sprintf("key %q of %s isn't the branch's * key of that name", kid, in), nil
+	pub, err := base64.RawURLEncoding.Strict().DecodeString(k.pub)
+	switch {
+	case g.ID().String() != gid:
+		return false, fmt.Sprintf("the grant served as %s has id %s", gid, g.ID()), nil
+	case g.Blocks[0].Kid != kid:
+		return false, fmt.Sprintf("its grant %s names key %q, not %q", gid, g.Blocks[0].Kid, kid), nil
+	case err != nil || !strings.EqualFold(k.alg, sig.Alg) || !g.SignedBy(ed25519.PublicKey(pub)):
+		return false, fmt.Sprintf("its grant %s isn't signed by the key %q the branch accepts now: replaced since (§C.4)", gid, kid), nil
 	}
 	return true, "", nil
+}
+
+// parseGrantDoc parses a stored grant as GET /ns/{ns}/grants/{gid} serves
+// it (§C.3.1): its SignedBlocks, authority first, rebuilt into the
+// non-bearer Biscuit container (§C.8) with the authority block as field 2
+// and the others as field 3. The chain past the authority block is checked
+// here, the authority block's signature by SignedBy.
+func parseGrantDoc(doc *client.GrantDoc) (*grant.Grant, error) {
+	blocks, err := doc.Blocks()
+	if err != nil {
+		return nil, err
+	}
+	var data []byte
+	for i, raw := range blocks {
+		field := byte(3)
+		if i == 0 {
+			field = 2
+		}
+		data = append(data, field<<3|2)
+		data = binary.AppendUvarint(data, uint64(len(raw)))
+		data = append(data, raw...)
+	}
+	g, err := grant.ParseStored(data)
+	if err != nil {
+		return nil, err
+	}
+	if len(g.Blocks) == 0 {
+		return nil, errors.New("no blocks")
+	}
+	return g, nil
 }
 
 // configEntry is one of the branch's config writes, a config entry or a

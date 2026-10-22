@@ -443,3 +443,79 @@ func TestV073RemovedAuthorWithdrawsMerges(t *testing.T) {
 	patchConfig(t, a.admin, "matches", op("replace", "/merge/authors", []any{map[string]any{"sub": "svc:merge", "kid": "ops"}}))
 	wantKeep(t, a.check(t, "matches", "r7", 2*day), "merged claim not verified: no batch of the branch is by a principal in the base's merge.authors (")
 }
+
+// §F.6, §C.4: a kid is only a name. The base's * key tmp sets abandoned
+// on r2, and ops on r3; then the base replaces tmp with a new key pair
+// under the same kid, still *, as when a compromised key is rotated. The
+// grant that set r2's flag was signed by the old tmp, which no longer
+// verifies anything here, so the flag doesn't count; r3's still does.
+func TestV073AbandonedKeyReplacedUnderSameKid(t *testing.T) {
+	t.Parallel()
+	a := newAuthEnv(t, []string{"r2", "r3"}, nil)
+	a.branch(t, "matches", "r2", map[string]any{"abandoned": "P1D"})
+	a.branch(t, "matches", "r3", map[string]any{"abandoned": "P1D"})
+	old := a.as(a.tmp, "user:tmp")
+	patchConfig(t, old, "r2", op("add", "/frozen", true), op("add", "/abandoned", true))
+	patchConfig(t, a.admin, "r3", op("add", "/frozen", true), op("add", "/abandoned", true))
+	patchConfig(t, a.admin, "matches", op("replace", "/keys/1", clienttest.NewKey("tmp").Entry("*")))
+	if _, err := old.NSHead(ctx, "r2"); err == nil {
+		t.Fatal("the old tmp key still verifies")
+	}
+	d := a.check(t, "matches", "r2", 2*day)
+	wantKeep(t, d, `abandoned claim not verified: the config write `)
+	wantKeep(t, d, `isn't signed by the key "tmp" the branch accepts now: replaced since (§C.4)`)
+	if d.Claim != "" {
+		t.Fatalf("r2: %+v", d)
+	}
+	if d := a.check(t, "matches", "r3", 2*day); d.Action != janitor.ActionPurged || d.Claim != "abandoned" {
+		t.Fatalf("r3: %+v", d)
+	}
+}
+
+// §F.6 superseded, §C.4: a replay into the successor counts under a * key
+// only while that key, not just its kid, is a current * key of the branch.
+// tmp replays r7 into r7-b and ops r8 into r8-b; then the base rotates tmp
+// under the same kid, which both successors inherit.
+func TestV073SupersededKeyReplacedUnderSameKid(t *testing.T) {
+	t.Parallel()
+	a := newAuthEnv(t, []string{"r7", "r7-b", "r8", "r8-b"}, nil)
+	a.branch(t, "matches", "r7", map[string]any{"superseded": "P1D"})
+	a.branch(t, "matches", "r8", map[string]any{"superseded": "P1D"})
+	must(merge.Rebase(ctx, a.as(a.tmp, "user:tmp"), merge.RebaseOptions{Branch: "r7", New: "r7-b", Switch: true}))
+	must(merge.Rebase(ctx, a.admin, merge.RebaseOptions{Branch: "r8", New: "r8-b", Switch: true}))
+	patchConfig(t, a.admin, "matches", op("replace", "/keys/1", clienttest.NewKey("tmp").Entry("*")))
+	d := a.check(t, "matches", "r7", 2*day)
+	wantKeep(t, d, "superseded claim not verified: no batch of the branch is by a principal in the base's merge.authors or under a current * key of the branch (")
+	wantKeep(t, d, `isn't signed by the key "tmp" the branch accepts now: replaced since (§C.4)`)
+	if d := a.check(t, "matches", "r8", 2*day); d.Action != janitor.ActionPurged || d.Claim != "superseded" {
+		t.Fatalf("r8: %+v", d)
+	}
+}
+
+// §F.6 superseded, §8.5: a successor purged after the freeze answers 410
+// for its grants, so a replay under a * key is checked against its grant
+// as another namespace serves it: the successor's base, whose branch
+// entry records the rebase tool's grant (r7). A replay under a grant only
+// the purged successor recorded can't be checked against the key, and the
+// branch is kept for a manual purge (r9).
+func TestV073PurgedSuccessorStarKeyGrant(t *testing.T) {
+	t.Parallel()
+	a := newAuthEnv(t, []string{"r7", "r7-b", "r9", "r9-b"}, nil)
+	a.branch(t, "matches", "r7", map[string]any{"superseded": "P1D"})
+	a.branch(t, "matches", "r9", map[string]any{"superseded": "P1D"})
+	must(merge.Rebase(ctx, a.as(a.tmp, "user:tmp"), merge.RebaseOptions{Branch: "r7", New: "r7-b", Switch: true}))
+	// r9-b is created by ops; tmp, under a grant of its own, replays r9
+	// into it.
+	must(a.admin.CreateBranch(ctx, "matches", client.BranchRequest{Name: "r9-b"}))
+	must(must(merge.NewPlan(ctx, a.as(a.tmp, "user:tmp-2"), "r9-b", "r9", merge.Options{})).Apply(ctx))
+	patchConfig(t, a.admin, "r9", op("add", "/successor", "r9-b"), op("add", "/frozen", true))
+	a.s.Clock.Advance(time.Minute)
+	for _, ns := range []string{"r7-b", "r9-b"} {
+		patchConfig(t, a.admin, ns, op("add", "/frozen", true))
+		must(a.admin.PurgeNamespace(ctx, ns, must(a.admin.NSHead(ctx, ns)).ID))
+	}
+	if d := a.check(t, "matches", "r7", 2*day); d.Action != janitor.ActionPurged || d.Claim != "superseded" {
+		t.Fatalf("r7: %+v", d)
+	}
+	wantKeep(t, a.check(t, "matches", "r9", 2*day), "can't be read since r9-b was purged (§8.5), so its key can't be checked: verify by hand")
+}
