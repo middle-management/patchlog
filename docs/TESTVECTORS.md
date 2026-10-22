@@ -22,5 +22,5 @@ retired. The draft listed two inputs as rejected that the spec accepts: the inte
 whose canonical form is `1e+21` (§3.1), and the "trailing-bit" id
 `1l2gi2hhm3vt72ls2oufqpkqpsh6uvmlm`, a valid id since 160 bits fill 32 base32 characters exactly and
 leave no padding bits (§3.2). `vectorgen` recomputed the grant id, the signing input, the cookie MAC
-and `K_r` with code of its own instead of calling the reference's. The vectors I.11 lists as still
-to come are computed through production code too.
+and `K_r` with code of its own instead of calling the reference's. When the vectors I.11 lists as
+still to come are added, they will be computed through production code too.
