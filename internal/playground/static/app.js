@@ -3411,7 +3411,9 @@ function srParams(ns) {
   // One sort, keys comma-separated: the canonical form sorts repeated values (§A.5).
   const sorts = $('srSort').value.split(',').map((x) => x.trim()).filter(Boolean);
   if (sorts.length) p.set('sort', sorts.join(','));
-  for (const c of $('srCounts').value.split(',').map((x) => x.trim()).filter(Boolean)) p.append('counts', c);
+  // counts is one value too, paths comma-separated: a repeated counts is 400 (§A.4).
+  const counts = $('srCounts').value.split(',').map((x) => x.trim()).filter(Boolean);
+  if (counts.length) p.set('counts', counts.join(','));
   if ($('srLimit').value.trim()) p.set('limit', $('srLimit').value.trim());
   const w = WRITES.get(ns);
   if ($('srRyw').checked && w) p.set('min', w.id);
@@ -3461,10 +3463,10 @@ function canonQuery(params) {
   return ps.length ? '?' + ps.map(([k, v]) => esc(k) + '=' + esc(v)).join('&') : '';
 }
 
-/* srNextPath is the URL of the page after a result at view: next itself, or for a ref query without q or sort, which
- * pages by name (§A.4), view with next as its after, in the canonical form. */
+/* srNextPath is the URL of the page after a result at view: view with next as its after, in the canonical form. Every
+ * query pages as /_refs does (§A.4): next is the following page's after, a resource name without q or sort, else an
+ * opaque position. */
 function srNextPath(view, next) {
-  if (next.startsWith('/')) return INDEX + next;
   const [p, qs] = view.split('?');
   const u = new URLSearchParams(qs || '');
   u.set('after', next);
@@ -3571,9 +3573,11 @@ function renderSearch() {
     res.replaceChildren(h('div', { class: 'scroll' }, h('table', {}, h('thead', {}, h('tr', {}, ['resource', 'schema', 'score', 'facets', 'revision', ''].map((c) => h('th', {}, c)))), h('tbody', {}, rows))));
   }
   $('srMore').hidden = !SR.next;
+  // counts: { path: { value: hits } }, each value its string form (§A.2, §A.4); most hits first.
   const counts = SR.counts && typeof SR.counts === 'object' ? Object.keys(SR.counts).sort() : [];
+  const byHits = (m) => Object.entries(m && typeof m === 'object' ? m : {}).sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   $('srCountsOut').replaceChildren(...counts.map((p) => h('div', { class: 'chips' }, h('span', {}, 'counts ' + p + ':'),
-    ...(SR.counts[p] || []).map((c) => h('button', { class: 'badge info chip', title: `filter on ${p} = ${c.value}`, onclick: () => srAddFilter(p, c.value) }, `${c.value} × ${c.count}`)))));
+    ...byHits(SR.counts[p]).map(([v, n]) => h('button', { class: 'badge info chip', title: `filter on ${p} = ${v}`, onclick: () => srAddFilter(p, v) }, `${v} × ${n}`)))));
 }
 
 function initSearch() {
