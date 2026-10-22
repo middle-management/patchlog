@@ -479,12 +479,13 @@ func TestAtomicAndBackfill(t *testing.T) {
 		}
 	}
 
-	// Atomic without an allowance: 413, explained, nothing written.
+	// Atomic without an allowance: a limit refusal (413, or 422 limit at
+	// step 4, §6.6), explained, nothing written.
 	dst := bulkTarget(t)
 	bob := dst.c.With(client.WithAuthor("bob"))
 	rep, err := bundle.Import(ctx, bob, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic})
 	var tl *bundle.TooLargeError
-	if !errors.As(err, &tl) || !strings.Contains(err.Error(), "allowance") || !strings.Contains(err.Error(), "413") {
+	if !errors.As(err, &tl) || !strings.Contains(err.Error(), "allowance") || !client.IsLimit(err) {
 		t.Fatalf("atomic import without an allowance: %v", err)
 	}
 	if len(rep.Batches) != 1 || rep.Batches[0].DryRun != "failed" {

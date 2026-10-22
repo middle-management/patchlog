@@ -12,6 +12,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -412,5 +414,68 @@ func TestV073GrantLineWriterString(t *testing.T) {
 	}
 	if s := must(bundle.Verify(bytes.NewReader(b))); s.Signatures.Counts[bundle.SigAttested] != 1 {
 		t.Fatalf("signatures %+v", s.Signatures)
+	}
+}
+
+// limitProxy fronts a deployment as a v0.73 core answers limits: a batch
+// over itemsPerBatch or batchSize is 422 limit at step 4, where this core
+// answers 413 (§6.6, §7.5); and with blobPending, every blob upload is 422
+// limit blobPending.
+func limitProxy(t *testing.T, target string, blobPending bool) string {
+	t.Helper()
+	u := must(url.Parse(target))
+	rp := httputil.NewSingleHostReverseProxy(u)
+	rp.ModifyResponse = func(res *http.Response) error {
+		if res.StatusCode == 413 && res.Request.Method == "POST" && strings.HasSuffix(res.Request.URL.Path, "/batch") {
+			res.StatusCode, res.Status = 422, "422 Unprocessable Entity"
+		}
+		return nil
+	}
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if blobPending && r.Method == "PUT" && strings.Contains(r.URL.Path, "/blob/") {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(422)
+			io.WriteString(w, `{"code":"limit","limit":"blobPending","measured":4096,"max":1024,"message":"the uploader's pending blobs would exceed blobPending"}`)
+			return
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	t.Cleanup(hs.Close)
+	return hs.URL
+}
+
+// A limit refusal is 413 for a body cut off and 422 limit at step 4
+// (§6.6): the importer recognises both with client.IsLimit, for an atomic
+// batch over the namespace's batch limits and for a blob upload over
+// blobPending (GB-16).
+func TestV073ImportLimitEitherStatus(t *testing.T) {
+	t.Parallel()
+	b := bulkSource(t)
+	dst := bulkTarget(t)
+	bob := must(client.New(limitProxy(t, dst.url, false), client.WithAuthor("bob")))
+	rep, err := bundle.Import(ctx, bob, bundle.BytesOpener(b), bundle.ImportOptions{Mode: bundle.Atomic})
+	var tl *bundle.TooLargeError
+	if !errors.As(err, &tl) || !strings.Contains(err.Error(), "allowance") || !strings.Contains(err.Error(), "422 limit") {
+		t.Fatalf("atomic import refused with 422 limit: %v", err)
+	}
+	if len(rep.Batches) != 1 || rep.Batches[0].DryRun != "failed" {
+		t.Fatalf("report %+v", rep.Batches)
+	}
+	if h := dst.head("bulk", "doc-0"); h.State != client.NotFound {
+		t.Fatal("a failed atomic import wrote")
+	}
+
+	src := newDeployment(t, stagingOrigin)
+	src.ns("m", nil)
+	src.create("m", "a", map[string]any{"img": src.upload("m", "a", "image/png", "", []byte("blob x"))})
+	var buf bytes.Buffer
+	_, _, err = bundle.Export(ctx, src.c, &buf, bundle.ExportOptions{Select: []string{"m/a"}})
+	noErr(t, err)
+	dst2 := newDeployment(t, cmsOrigin)
+	dst2.ns("m", nil)
+	c := must(client.New(limitProxy(t, dst2.url, true), client.WithAuthor("alice")))
+	_, err = bundle.Import(ctx, c, bundle.BytesOpener(buf.Bytes()), bundle.ImportOptions{Mode: bundle.Atomic})
+	if err == nil || !strings.Contains(err.Error(), "allowance that raises the importer's blobPending") {
+		t.Fatalf("blob upload refused with 422 limit: %v", err)
 	}
 }

@@ -414,7 +414,9 @@ func (im *importer) dryRun(ctx context.Context, b *batch, deferOK bool) error {
 	if err != nil {
 		b.rep.DryRun = "failed"
 		b.rep.Error = err.Error()
-		if ae, ok := client.AsAPIError(err); ok && ae.Status == 413 && im.opt.Mode == Atomic {
+		// A limit refusal is 413 for a body cut off, 422 limit at step 4
+		// (§6.6); client.IsLimit takes both.
+		if client.IsLimit(err) && im.opt.Mode == Atomic {
 			return &TooLargeError{NS: b.n.ns, Items: len(req.Items), Size: b.size, Err: err}
 		}
 		return fmt.Errorf("import: dry run of the batch into %s: %w", b.n.ns, err)
@@ -714,7 +716,7 @@ func (im *importer) submitBatch(ctx context.Context, n *node, i int, l limits) e
 		var failures []string
 		if ae, ok := client.AsAPIError(err); ok {
 			switch {
-			case ae.Status == 413 && im.opt.Mode == Atomic:
+			case client.IsLimit(err) && im.opt.Mode == Atomic:
 				return &TooLargeError{NS: n.ns, Items: len(b.parts), Size: b.size, Err: err}
 			case ae.Status == 412:
 				return fmt.Errorf("import: the target moved while importing into %s (%w); import again: classification by ancestry picks up what is left", n.ns, err)
