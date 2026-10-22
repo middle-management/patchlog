@@ -1,7 +1,13 @@
 package dav_test
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -500,4 +506,207 @@ func TestV073FolderCopyThroughTreeService(t *testing.T) {
 	if node, _ := e.childOf("cat", copied, "derby.json"); node == "matches.derby" {
 		t.Fatal("the copy placed the source's item")
 	}
+}
+
+// goneCreates makes the core answer a create (If-None-Match: *) of a
+// tombstoned name 410 gone, with the tombstone as head, as cores do from
+// v0.73 (§7.2), where clienttest's answers 412 stale: on its own and as a
+// batch item. It wraps what the options f install.
+func goneCreates(f ...func(*clienttest.Options, *dav.Options)) func(*clienttest.Options, *dav.Options) {
+	return func(o *clienttest.Options, d *dav.Options) {
+		for _, g := range f {
+			g(o, d)
+		}
+		inner := o.Wrap
+		o.Wrap = func(next http.Handler) http.Handler {
+			if inner != nil {
+				next = inner(next)
+			}
+			return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				create := r.Method == "PATCH" && r.Header.Get("If-None-Match") == "*"
+				creates := map[float64]bool{}
+				if r.Method == "POST" && strings.HasSuffix(r.URL.Path, "/batch") {
+					b, _ := io.ReadAll(r.Body)
+					r.Body = io.NopCloser(bytes.NewReader(b))
+					var req struct{ Items []map[string]any }
+					json.Unmarshal(b, &req)
+					for i, it := range req.Items {
+						if it["ifNoneMatch"] == "*" {
+							creates[float64(i)] = true
+						}
+					}
+				}
+				if !create && len(creates) == 0 {
+					next.ServeHTTP(w, r)
+					return
+				}
+				rec := httptest.NewRecorder()
+				next.ServeHTTP(rec, r)
+				status, body := rec.Code, rec.Body.Bytes()
+				gone := func(m map[string]any) {
+					m["code"], m["message"] = "gone", "the resource is tombstoned (§8.1)"
+				}
+				var m map[string]any
+				if status == http.StatusPreconditionFailed && json.Unmarshal(body, &m) == nil {
+					switch items, _ := m["items"].([]any); {
+					case create && m["code"] == "stale":
+						gone(m)
+						status = http.StatusGone
+					case m["code"] == "batch":
+						for i, x := range items {
+							it, _ := x.(map[string]any)
+							if creates[it["index"].(float64)] && it["code"] == "stale" {
+								gone(it)
+								it["status"] = float64(http.StatusGone)
+							}
+							if i == 0 {
+								status = int(it["status"].(float64))
+							}
+						}
+					}
+					body, _ = json.Marshal(m)
+				}
+				for k, v := range rec.Header() {
+					w.Header()[k] = v
+				}
+				w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+				w.WriteHeader(status)
+				w.Write(body)
+			})
+		}
+	}
+}
+
+// A create the core refuses because the name was tombstoned since its
+// head was read is 410 gone from v0.73 (§7.2), 412 before: the gateway
+// takes either. A move in the flat view (one batch creating the new name)
+// is tried again over the tombstone, and restores it; a new file's create
+// that meets a 410 is written over the tombstone, a new file over a
+// tombstone restoring it (§H.2 "Flat view"), while a 412, which may be
+// a file someone else made, is a 409 (P15's 410 on creates).
+func TestV073CreateOnTombstoneGone(t *testing.T) {
+	t.Parallel()
+	for _, v073 := range []bool{true, false} {
+		h := &hook{}
+		with := withHook(h)
+		if v073 {
+			with = goneCreates(withHook(h))
+		}
+		e := newEnv(t, []string{"docs"}, nil, nil, with)
+		tombstone := func(name string) func() {
+			return func() {
+				rev := e.create("docs", name, map[string]any{"theirs": true})
+				must(e.c.Delete(e.ctx, "docs", name, rev))
+			}
+		}
+		e.create("docs", "a", map[string]any{"a": "1"})
+		h.set(at("POST", "/ns/docs/batch"), tombstone("b"))
+		e.expect(e.do("MOVE", "/docs/a.json", "", "Destination", "/docs/b.json"), 201, "MOVE onto a name tombstoned meanwhile")
+		if !h.fired.Load() {
+			t.Fatal("the hook didn't fire")
+		}
+		_, doc := e.load("docs", "b")
+		sameJSON(t, doc, map[string]any{"a": "1"})
+		if ha, _ := e.load("docs", "a"); ha.State != client.Tombstoned || ha.Successor != "b" {
+			t.Fatalf("v0.73 %v: the moved file %+v", v073, ha)
+		}
+
+		h.set(at("PATCH", "/r/docs/new"), tombstone("new"))
+		h.fired.Store(false)
+		r := e.do("PUT", "/docs/new.json", `{"mine": 1}`)
+		h2, doc := e.load("docs", "new")
+		switch {
+		case !h.fired.Load():
+			t.Fatal("the hook didn't fire")
+		case v073 && (r.status != 201 || h2.State != client.Live):
+			t.Fatalf("PUT of a new file tombstoned meanwhile, 410: %d %s, %v", r.status, r.body, h2.State)
+		case v073:
+			sameJSON(t, doc, map[string]any{"mine": 1.0})
+		case r.status != 409 || h2.State != client.Tombstoned:
+			t.Fatalf("PUT of a new file tombstoned meanwhile, 412: %d %s, %v", r.status, r.body, h2.State)
+		}
+
+		h.set(at("PATCH", "/r/docs/new.txt"), tombstone("new.txt"))
+		r = e.do("PUT", "/docs/new.txt", "mine")
+		h3, _ := e.load("docs", "new.txt")
+		switch {
+		case v073 && (r.status != 201 || h3.State != client.Live):
+			t.Fatalf("PUT of a new raw file tombstoned meanwhile, 410: %d %s, %v", r.status, r.body, h3.State)
+		case v073:
+			if _, data := e.rawOf("docs", "new.txt"); string(data) != "mine" {
+				t.Fatalf("new.txt %q", data)
+			}
+		case r.status != 409 || h3.State != client.Tombstoned:
+			t.Fatalf("PUT of a new raw file tombstoned meanwhile, 412: %d %s, %v", r.status, r.body, h3.State)
+		}
+	}
+}
+
+// Done before v0.73, pinned here: a MOVE onto an existing folder, or of
+// a folder onto a file, is 403, 412 with Overwrite: F, and an absent
+// Overwrite means T (§H.5, GW-10); a COPY onto an existing file is a save
+// of the source's content into it, an append to the target's own chain,
+// never a new item, in the flat view and in a tree, raw files included
+// (GW-11).
+func TestV073OntoExisting(t *testing.T) {
+	t.Parallel()
+	e := treeDocsEnv(t)
+	e.create("cat", "inner", map[string]any{"title": "Inner", "parents": parents("cat", "empty")})
+	e.create("matches", "t", map[string]any{"t": 1})
+	e.create("cat", "matches.t", map[string]any{"title": "t.json", "parents": parents("cat", "empty")})
+	e.rawDoc("matches", "r", "text/plain", []byte("target"), nil)
+	e.create("cat", "matches.r", map[string]any{"title": "r.txt", "parents": parents("cat", "empty")})
+	e.create("docs", "target", map[string]any{"t": 1})
+	e.create("docs", "src", map[string]any{"s": 2})
+	e.rawDoc("docs", "r.txt", "text/plain", []byte("target"), nil)
+	e.rawDoc("docs", "s.txt", "text/plain", []byte("source"), nil)
+
+	hs, _ := e.load("cat", "season")
+	he, _ := e.load("cat", "empty")
+	for _, c := range []struct{ src, dst string }{
+		{"/cat/Empty", "/cat/Season"},
+		{"/cat/Empty/Inner", "/cat/Season"},
+		{"/cat/Empty", "/cat/Season/derby.json"},
+		{"/cat/Season/derby.json", "/cat/Empty"},
+	} {
+		e.expect(e.do("MOVE", c.src, "", "Destination", c.dst), 403, "MOVE "+c.src+" onto "+c.dst+", no Overwrite")
+		e.expect(e.do("MOVE", c.src, "", "Destination", c.dst, "Overwrite", "T"), 403, "MOVE "+c.src+" onto "+c.dst+", Overwrite: T")
+		e.expect(e.do("MOVE", c.src, "", "Destination", c.dst, "Overwrite", "F"), 412, "MOVE "+c.src+" onto "+c.dst+", Overwrite: F")
+	}
+	e.expectLive("cat", "season", hs, "Season")
+	e.expectLive("cat", "empty", he, "Empty")
+
+	chain := func(ns, name string) int {
+		t.Helper()
+		return len(must(e.c.Log(e.ctx, ns, name, "", "")))
+	}
+	matches := e.liveNames("matches")
+	for _, c := range []struct{ src, dst, ns, name string }{
+		{"/docs/src.json", "/docs/target.json", "docs", "target"},
+		{"/docs/s.txt", "/docs/r.txt", "docs", "r.txt"},
+		{"/cat/Season/derby.json", "/cat/Empty/t.json", "matches", "t"},
+		{"/docs/s.txt", "/cat/Empty/r.txt", "matches", "r"},
+	} {
+		before, _ := e.load(c.ns, c.name)
+		n := chain(c.ns, c.name)
+		e.expect(e.do("COPY", c.src, "", "Destination", c.dst), 204, "COPY "+c.src+" onto "+c.dst)
+		if got := chain(c.ns, c.name); got != n+1 {
+			t.Fatalf("COPY onto %s: %d revisions, want %d", c.dst, got, n+1)
+		}
+		if en := e.lastEntry(c.ns, c.name); en.Parent != before.ID {
+			t.Fatalf("COPY onto %s: the revision's parent %s, want the head %s", c.dst, en.Parent, before.ID)
+		}
+	}
+	_, doc := e.load("docs", "target")
+	sameJSON(t, doc, map[string]any{"s": 2})
+	_, doc = e.load("matches", "t")
+	sameJSON(t, doc, map[string]any{"title": "Derby"})
+	for _, c := range [][2]string{{"docs", "r.txt"}, {"matches", "r"}} {
+		if _, data := e.rawOf(c[0], c[1]); string(data) != "source" {
+			t.Fatalf("%s/%s %q", c[0], c[1], data)
+		}
+	}
+	sameStrings(t, "matches", e.liveNames("matches"), matches)
+	e.nodeDoc("cat", "matches.t")
+	e.nodeDoc("cat", "matches.r")
 }

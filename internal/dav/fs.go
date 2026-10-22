@@ -1460,7 +1460,10 @@ func (st *reqState) batchMove(ctx context.Context, src, dst target) error {
 		res, err := st.tk.c.Batch(ctx, ns, client.BatchRequest{Items: []client.BatchItem{item, {Resource: src.docName, IfMatch: sh.ID,
 			Steps: []client.Step{client.PatchStep(succ), client.DeleteStep()}}}}, false)
 		err = batchErr(err)
-		if client.IsStale(err) {
+		if client.IsStale(err) || goneSince(err) {
+			// A head moved since it was read: the new name made (412),
+			// or tombstoned (412, or 410 gone from v0.73, §7.2), or the
+			// source deleted (410). Read again.
 			return true, nil
 		}
 		if err != nil {

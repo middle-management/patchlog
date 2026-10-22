@@ -959,8 +959,15 @@ func (st *reqState) probeNode(ctx context.Context, cat, name string, doc map[str
 		return upstream(batchErr(err))
 	}
 	for _, r := range res.Items {
-		if status, _ := r.Raw["status"].(float64); status >= 300 {
-			return upstream(itemError(r.Raw))
+		status, _ := r.Raw["status"].(float64)
+		switch ie := itemError(r.Raw); {
+		case status < 300:
+		case ie.Status == http.StatusPreconditionFailed, goneSince(ie):
+			// Made, or deleted, since its head was read: 412 or, a
+			// tombstone from v0.73, 410 gone (§7.2).
+			return fail(http.StatusConflict, "%s was made or deleted in catalog %s meanwhile; try again", name, cat)
+		default:
+			return upstream(ie)
 		}
 	}
 	return nil
@@ -1027,7 +1034,12 @@ func (st *reqState) createNode(ctx context.Context, cat, name string, doc map[st
 		default:
 			_, err = st.tk.c.Create(ctx, cat, name, withNonce(in, doc, client.GenesisPatches(doc)))
 		}
-		if client.IsStale(err) || client.IsGone(err) {
+		switch {
+		case goneSince(err):
+			// Tombstoned since its head was read (410 from v0.73, §7.2):
+			// restored, read again.
+			return true, nil
+		case client.IsStale(err):
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile", cat, name)
 		}
 		st.committed = st.committed || err == nil

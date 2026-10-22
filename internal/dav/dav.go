@@ -9,7 +9,9 @@
 // document (its root a blob reference, §7.8) as its resource name, any
 // other as {name}.json; a catalog (Addendum B) with catalog.files is a
 // file tree (§H.2), its folder nodes as directories and its placements as
-// files holding their items, each named by its node's title.
+// files holding their items, each named by its node's title. The tree
+// owns the items of its catalog.files.ns: served flat too, that
+// namespace is read-only there (readOnly).
 //
 // A raw file reads as its blob's bytes, typed by its name (§H.1); a JSON
 // file as its rendering, the document's canonical JSON (§3.1) laid out,

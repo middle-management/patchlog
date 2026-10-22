@@ -286,10 +286,14 @@ func (st *reqState) commitRaw(ctx context.Context, ns, name string, body []byte,
 				st.s.markOwn(st.p, ns, name, res.ID)
 			}
 		}
-		if client.IsStale(err) || client.IsGone(err) && !client.IsPurged(err) {
+		switch {
+		case goneSince(err):
+			// Tombstoned since its head was read: written over the
+			// tombstone, read again (the blob sent stays sent).
+			return true, nil
+		case client.IsStale(err):
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile; reload it", ns, name)
-		}
-		if err != nil {
+		case err != nil:
 			return false, err
 		}
 		rev = res.ID

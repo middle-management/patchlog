@@ -179,10 +179,14 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 		} else {
 			return false, err
 		}
-		if client.IsStale(err) || client.IsGone(err) && !client.IsPurged(err) {
+		switch {
+		case goneSince(err):
+			// Tombstoned since its head was read: written over the
+			// tombstone, read again.
+			return true, nil
+		case client.IsStale(err):
 			return false, fail(http.StatusConflict, "%s/%s was created or restored by someone else meanwhile; reload it", ns, name)
-		}
-		if err != nil {
+		case err != nil:
 			return false, err
 		}
 		rev, exact = res.ID, st.wrote(ns, name, parent, ps, writesOf(parent, ps), res, v, body, rendersAs(v))
@@ -190,6 +194,14 @@ func (st *reqState) commitDoc(ctx context.Context, ns, name string, v any, body 
 	})
 	return rev, exact, err
 }
+
+// goneSince reports a write the core refused with 410 gone, not purged
+// (§7.2): a create (If-None-Match: *) of a name tombstoned since its head
+// was read, as cores answer it from v0.73 (412 before, which a write
+// takes as made live meanwhile), or a restore over a tombstone that
+// another one has replaced since. The write is tried again over the head
+// as it is now.
+func goneSince(err error) bool { return client.IsGone(err) && !client.IsPurged(err) }
 
 // noRevision is a save's 412 for an If-Match naming no revision of
 // ns/name, which never existed (§H.4 "Answers").
