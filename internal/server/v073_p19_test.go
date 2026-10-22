@@ -3,15 +3,20 @@ package server
 import (
 	"crypto/ed25519"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/base64"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/pgtest"
 	"github.com/middle-management/patchlog/internal/seal"
+	"github.com/middle-management/patchlog/internal/sqlitedsn"
 )
 
 // delegated narrows a root grant twice, by svc:a and then svc:b: its
@@ -611,4 +616,123 @@ func TestV073RawOfPurgedSealedResource(t *testing.T) {
 		}
 	}
 	expectCode(t, e.get("/r/s/q/raw"), 404, "not_offered")
+}
+
+// checkStored checks a /grants/{gid} answer's stored (§C.3.1): one
+// base64url string, the authority SignedBlock of the token, which verifies
+// under the root key, whose grant_block is the root block, whose id is
+// gid, and which holds no narrowing block.
+func checkStored(t *testing.T, m map[string]any, gid string, pub ed25519.PublicKey) {
+	t.Helper()
+	s, ok := m["stored"].(string)
+	if !ok {
+		t.Fatalf("stored %v: not one string", m["stored"])
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g, err := grant.ParseStoredBlock(raw)
+	if err != nil || len(g.Blocks) != 1 || g.ID().String() != gid || !g.SignedBy(pub) {
+		t.Fatalf("stored block: %v", err)
+	}
+	if string(jsonv.Canonical(g.Blocks[0].Raw)) != string(jsonv.Canonical(m["root"])) {
+		t.Fatalf("grant_block %v, root %v", g.Blocks[0].Raw, m["root"])
+	}
+	if strings.Contains(string(raw), "svc:a") {
+		t.Fatal("stored holds a narrowing block")
+	}
+}
+
+// §C.3.1, §E.2.2 (GR-30): /ns/{ns}/grants/{gid} serves stored as one
+// string, the authority block, for a narrowed token too, in the clear and
+// sealed.
+func TestV073GrantStoredOneString(t *testing.T) {
+	t.Parallel()
+	f := newAuthFixture(t, nil)
+	e := f.tenv
+	dg := delegated(t, e, f.issuer, "user:bob", []string{"sec"}, []string{"read", "create"})
+	e.create("sec", "a", map[string]any{}, dg)
+	gid := grantIDOf(t, dg)
+	r := e.get("/ns/sec/grants/"+gid, f.adminG)
+	expect(t, r, 200)
+	checkStored(t, r.Obj(), gid, f.issuer.priv.Public().(ed25519.PublicKey))
+
+	s := newSealedAuthEnv(t)
+	k := newKey("issuer")
+	expect(t, s.do(req{method: "PATCH", path: "/ns/s", ifNoneMatch: "*", bearer: s.operatorGrant("s"),
+		body: addRoot(sealedDoc(map[string]any{"read": "public", "keys": []any{k.entry("read", "create")}}))}), 201)
+	sg := delegated(t, s, k, "user:bob", []string{"s"}, []string{"read", "create"})
+	s.wr("s", "x", "", withNonce(addRoot(map[string]any{})), sg)
+	sgid := grantIDOf(t, sg)
+	keys, kr := s.keysOf("s", nil, sg)
+	expect(t, kr, 200)
+	r = s.get("/ns/s/grants/"+sgid, sg)
+	expect(t, r, 200)
+	pt := open(t, string(r.Body), keys["s#1"], "s#1", seal.GrantPL("s", sgid))
+	checkStored(t, jsonv.MustParse(pt).(map[string]any), sgid, k.priv.Public().(ed25519.PublicKey))
+}
+
+// §C.3.1, §E.2.2 (GR-30): a grant answer sealed before v0.73, with stored
+// an array of every SignedBlock, is no longer served: the answer in
+// today's shape is sealed in the same epoch, stored, and served from then
+// on, the same bytes on every read.
+func TestV073LegacySealedGrantConverted(t *testing.T) {
+	t.Parallel()
+	path, driver := filepath.Join(t.TempDir(), "legacy.db"), "sqlite"
+	if pgtest.Enabled() {
+		path, driver = pgtest.NewDB(t), "pgx"
+	}
+	s := newSealedAuthEnv(t, withPath(path))
+	k := newKey("issuer")
+	expect(t, s.do(req{method: "PATCH", path: "/ns/s", ifNoneMatch: "*", bearer: s.operatorGrant("s"),
+		body: addRoot(sealedDoc(map[string]any{"read": "public", "keys": []any{k.entry("read", "create")}}))}), 201)
+	sg := delegated(t, s, k, "user:bob", []string{"s"}, []string{"read", "create"})
+	s.wr("s", "x", "", withNonce(addRoot(map[string]any{})), sg)
+	sgid := grantIDOf(t, sg)
+	keys, kr := s.keysOf("s", nil, sg)
+	expect(t, kr, 200)
+	// What a server before v0.73 stored: every SignedBlock, sealed under
+	// the epoch of the first entry recording the grant.
+	dec, err := grant.Decode(sg, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var blocks []any
+	for _, b := range dec.SignedBlocks() {
+		blocks = append(blocks, base64.RawURLEncoding.EncodeToString(b))
+	}
+	legacy, err := seal.SealUncompressed(keys["s#1"], "s#1", seal.GrantPL("s", sgid),
+		jsonv.Canonical(map[string]any{"id": sgid, "root": dec.Blocks[0].Raw, "stored": blocks}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dsn := path
+	if driver == "sqlite" {
+		dsn = sqlitedsn.DSN(path, "_pragma=busy_timeout(10000)")
+	}
+	db, err := sql.Open(driver, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ph := func(i int) string {
+		if driver == "pgx" {
+			return "$" + strconv.Itoa(i)
+		}
+		return "?"
+	}
+	if _, err := db.Exec(`INSERT INTO sealed (ns, kind, key, jwe, created) SELECT ns, 'grant', `+ph(1)+`, `+ph(2)+`, 0 FROM namespaces WHERE name = 's'`, sgid, legacy); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	r := s.get("/ns/s/grants/"+sgid, sg)
+	expect(t, r, 200)
+	if string(r.Body) == legacy {
+		t.Fatal("the legacy sealed answer is served")
+	}
+	pt := open(t, string(r.Body), keys["s#1"], "s#1", seal.GrantPL("s", sgid))
+	checkStored(t, jsonv.MustParse(pt).(map[string]any), sgid, k.priv.Public().(ed25519.PublicKey))
+	if again := s.get("/ns/s/grants/"+sgid, sg); string(again.Body) != string(r.Body) {
+		t.Fatal("the converted answer's bytes differ between reads")
+	}
 }
