@@ -769,12 +769,20 @@ func (st *reqState) open(ctx context.Context, name string, flag int) (webdav.Fil
 	}
 	if flag&os.O_TRUNC != 0 {
 		// A write (PUT, the destination of a COPY, a LOCK of a new name):
-		// buffered, and committed on close.
+		// buffered, and committed on close. A COPY's file refused sets a
+		// guard, as a PUT's does (saveTo, §H.6).
+		if st.method == "COPY" && t.path == st.dst && t.isDoc() {
+			st.saveTo = t.path
+		}
 		switch {
 		case t.kind == kMissing:
 			return nil, errNotExist
 		case t.kind == kBadName:
 			return nil, st.badName(t)
+		case t.isDir() && (st.method == "COPY" || st.method == "MOVE"):
+			// A file copied or moved onto a folder (§H.5): 403, not the
+			// 405 of a PUT to one; Overwrite: F is x/net/webdav's 412.
+			return nil, fail(http.StatusForbidden, "%s is a folder: a file copied or moved there doesn't replace it (§H.5)", t.path)
 		case t.isDir():
 			return nil, fail(http.StatusMethodNotAllowed, "%s is a directory", t.path)
 		case t.kind == kPlacement && t.otherCase && !st.spelledSo(t):

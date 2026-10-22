@@ -350,26 +350,22 @@ func (st *reqState) treeDir(ctx context.Context, cat, folder string) (*treeDir, 
 // nodeDir lists folder's children in catalog cat from its node documents
 // (graph): folders, and placements whose items are live, offered (§H.7)
 // and readable with the principal's grant (§B.11.5: nothing hidden from
-// it shows). Where the catalog has a tree service, a placement of a
-// namespace the catalog doesn't trust is left out too, as dangling
-// (§B.5), as the tree service leaves it out: either lists a folder alike.
+// it shows). A placement of a namespace the catalog doesn't trust is
+// left out too, as dangling (§B.5, §H.2 "Untrusted namespaces"), whether
+// or not a tree service lists the catalog, as one leaves it out: either
+// lists a folder alike.
 func (st *reqState) nodeDir(ctx context.Context, cat, folder string) (*treeDir, error) {
 	cg, _, err := st.tree(ctx, cat)
 	if err != nil {
 		return nil, err
 	}
-	var trust []string
-	viaTree := st.s.treeURL(cat) != ""
-	if viaTree {
-		c, err := st.treeConf(ctx, cat)
-		if err != nil {
-			return nil, err
-		}
-		trust = c.trust
+	c, err := st.treeConf(ctx, cat)
+	if err != nil {
+		return nil, err
 	}
 	var kids []*tree.Node
 	for _, n := range cg.children(folder) {
-		if n.Kind == kindFolder || !viaTree || slices.Contains(trust, n.ItemNS) {
+		if n.Kind == kindFolder || slices.Contains(c.trust, n.ItemNS) {
 			kids = append(kids, n)
 		}
 	}
@@ -710,14 +706,14 @@ func (st *reqState) agrees(cg *catGraph, steps []pathStep) bool {
 // compare equal to seg (nameKey), which a folder of thousands needs: the
 // one such child shown to the token (a folder, or a placement whose item
 // is live, offered and readable with its grant, in a namespace the
-// catalog trusts). With several such, or none where seg may be a
+// catalog trusts, §H.2). With several such, or none where seg may be a
 // duplicate's numbered name, the folder is listed whole (nodeDir).
 func (st *reqState) nodeChild(ctx context.Context, cg *catGraph, cat, folder, seg string) (*treeEntry, bool, error) {
 	c, err := st.treeConf(ctx, cat)
 	if err != nil {
 		return nil, false, err
 	}
-	key, viaTree := st.s.nameKey(seg), st.s.treeURL(cat) != ""
+	key := st.s.nameKey(seg)
 	var found []treeEntry
 	for _, n := range cg.children(folder) {
 		if st.s.nameKey(nodeName(n)) != key {
@@ -727,7 +723,7 @@ func (st *reqState) nodeChild(ctx context.Context, cg *catGraph, cat, folder, se
 			found = append(found, newTreeEntry(n, nil))
 			continue
 		}
-		if viaTree && !slices.Contains(c.trust, n.ItemNS) || st.s.nsInfo(ctx, st.tk, n.ItemNS).sealed {
+		if !slices.Contains(c.trust, n.ItemNS) || st.s.nsInfo(ctx, st.tk, n.ItemNS).sealed {
 			continue
 		}
 		h, err := cg.itemHead(st.tk)(ctx, n.ItemNS, n.ItemName)
@@ -1277,8 +1273,12 @@ func (st *reqState) stillNamed(src target, doc any) bool {
 
 // dangling reports whether placement n's item is gone (§B.3): tombstoned
 // or purged, or missing from a namespace whose document the token reads
-// (elsewhere a 404 may be the core hiding it, §7).
+// (elsewhere a 404 may be the core hiding it, §7); or in a namespace the
+// catalog doesn't trust, which no listing shows (§B.5, §H.2).
 func (st *reqState) dangling(ctx context.Context, cg *catGraph, n *tree.Node) bool {
+	if c, err := st.treeConf(ctx, cg.cat); err == nil && !slices.Contains(c.trust, n.ItemNS) {
+		return true
+	}
 	if st.s.nsInfo(ctx, st.tk, n.ItemNS).sealed {
 		return false
 	}

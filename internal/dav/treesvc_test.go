@@ -427,7 +427,8 @@ func TestTreeServiceSealedEntries(t *testing.T) {
 // listed by the tree service. While the tree service lags further than
 // TreeWait, the writer's folder is listed from the node documents, as the
 // tree service lists it (a placement of a namespace the catalog doesn't
-// trust is dangling there, §B.5); other users' listings don't wait.
+// trust is dangling there, §B.5, and is left out with or without a tree
+// service, §H.2 "Untrusted namespaces"); other users' listings don't wait.
 func TestTreeServiceOwnWrites(t *testing.T) {
 	t.Parallel()
 	var log coreLog
@@ -435,7 +436,7 @@ func TestTreeServiceOwnWrites(t *testing.T) {
 	must(e.c.CreateNamespace(e.ctx, "secret", map[string]any{"read": "public"}))
 	e.create("secret", "plans", map[string]any{"launch": "monday"})
 	e.create("cat", "secret.plans", map[string]any{"title": "plans.json", "parents": parents("cat", "season")})
-	sameStrings(t, "Season without a tree service", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json", "plans.json"})
+	sameStrings(t, "Season without a tree service", names(e.propfind("/cat/Season/"), "/cat/Season/"), []string{"derby.json"})
 	tr := startTree(t, e.s, "cat")
 	tr.caughtUp("cat", "matches")
 	ts := treeDav(e, tr.http.URL, options(func(o *dav.Options) { o.TreeWait = 3 * time.Second }))

@@ -524,9 +524,10 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 const allowed = "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK"
 
 // answered keeps what the request's answer, status, says of the
-// principal's saves for a DELETE that follows (refusedSaveFor): a PUT of
-// a file, or a MOVE onto an existing one (onto), refused without writing
-// to the core sets a guard, but for one that put back the principal's own
+// principal's saves for a DELETE that follows (refusedSaveFor): a PUT or
+// a COPY of a file (saveTo), or a MOVE onto an existing one (onto),
+// refused without writing to the core sets a guard, but for one that put
+// back the principal's own
 // DELETE (undoOwnDelete), which a DELETE after it leaves deleted as the
 // principal chose, and one a frozen namespace refused, which takes no
 // DELETE either (§8.4); a DELETE that found nothing (a refused create's
@@ -537,7 +538,7 @@ func (st *reqState) answered(status int) {
 	now := st.s.opt.Now()
 	guardOn := ""
 	switch {
-	case st.method == "PUT":
+	case st.method == "PUT", st.method == "COPY":
 		guardOn = st.saveTo
 	case st.method == "MOVE":
 		guardOn = st.onto
@@ -1907,8 +1908,9 @@ func (p *principal) forgetTreeDelete(path string) {
 	delete(p.trees, path)
 }
 
-// A refused save of a file (a PUT, or a MOVE onto an existing file,
-// answered 4xx or 5xx without writing to the core) sets a guard (§H.6):
+// A refused save of a file (a PUT, a COPY of a file, or a MOVE onto an
+// existing file, answered 4xx or 5xx without writing to the core; a case
+// variant refused, §H.2, among them) sets a guard (§H.6):
 // the principal's DELETE of the same path within refusedSaveFor is a 409,
 // once per refusal, and two refusals never share one. rclone deletes a
 // file whose upload failed, a second after the failure
@@ -1921,7 +1923,7 @@ func (p *principal) forgetTreeDelete(path string) {
 // deliberate and passes, the guards left as they are, as does one in a
 // frozen namespace, which the core refuses anyway (§8.4); one that finds
 // nothing (a refused create's cleanup) uses one up. A refused plain MOVE
-// (to a new name) or COPY sets none, nor does a write whose refusal undid
+// (to a new name) sets none, nor does a write whose refusal undid
 // the principal's own DELETE (undoOwnDelete), whose cleanup DELETE then
 // leaves the file deleted as the principal chose, nor a refusal of a
 // frozen namespace's.
@@ -2064,8 +2066,9 @@ type reqState struct {
 	noETag      bool     // the PUT's document isn't stored as sent: no validator (RFC 9110 §9.3.4)
 	serve       *stagedServe
 	// saveTo is the document path a PUT writes, once resolved (or one in
-	// a tree that couldn't be read), and saveDoc whether it is a flat
-	// namespace's document; committed: the request wrote to the core (a
+	// a tree that couldn't be read), or a COPY's file (open), and saveDoc
+	// whether a PUT's is a flat namespace's document; committed: the
+	// request wrote to the core (a
 	// revision, a catalog node), not counting a restore of the
 	// principal's own DELETE as it was (undoOwnDelete), which undeleted
 	// says it did.

@@ -835,22 +835,32 @@ func TestPagedFlows(t *testing.T) {
 }
 
 // Writes through a placement go only where the server would write: items
-// in a namespace the catalog trusts (§B.3) or that is served (-ns), never
-// a catalog's own nodes.
+// in a namespace the catalog trusts (§B.3), never a catalog's own nodes,
+// even in a catalog that trusts itself. A placement of an item in a
+// namespace the catalog doesn't trust isn't shown at all (§H.2
+// "Untrusted namespaces"; it showed without a tree service before
+// v0.56): its name is a new file's, and its item isn't written.
 func TestTreePlacementWrites(t *testing.T) {
 	t.Parallel()
 	e := treeEnv(t)
 	must(e.c.CreateNamespace(e.ctx, "secret", map[string]any{"read": "public"}))
 	e.create("secret", "plans", map[string]any{"launch": "monday"})
 	e.create("cat", "secret.plans", map[string]any{"title": "plans.json", "parents": parents("cat", "season")})
-	e.create("cat", "cat.empty", map[string]any{"title": "node.json", "parents": parents("cat", "season")})
-	e.expect(e.do("GET", "/cat/Season/plans.json", ""), 200, "GET a placement of an untrusted item")
-	e.expect(e.do("PUT", "/cat/Season/plans.json", `{"launch": "never"}`), 403, "PUT over an item not trusted nor served")
+	e.expect(e.do("GET", "/cat/Season/plans.json", ""), 404, "GET a placement of an untrusted item")
+	e.expect(e.do("PUT", "/cat/Season/.goutputstream-tmp", `{"planted": true}`), 201, "temporary file")
+	e.expect(e.do("MOVE", "/cat/Season/.goutputstream-tmp", "", "Destination", "/cat/Season/plans.json"), 201, "MOVE onto the name of an untrusted placement: a new file")
 	_, doc := e.load("secret", "plans")
 	sameJSON(t, doc, map[string]any{"launch": "monday"})
-	e.expect(e.do("PUT", "/cat/Season/node.json", `{"x": 1}`), 403, "PUT through a placement of a catalog node")
-	e.expect(e.do("PUT", "/matches/.goutputstream-tmp", `{"planted": true}`), 201, "temporary file")
-	e.expect(e.do("MOVE", "/matches/.goutputstream-tmp", "", "Destination", "/cat/Season/plans.json"), 403, "MOVE onto an untrusted placement")
+	if got := e.liveNames("matches"); len(got) != 2 {
+		t.Fatalf("matches holds %q, want derby and the new file", got)
+	}
+
+	self := newEnv(t, nil, []string{"cat"}, map[string]map[string]any{"cat": {"catalog": treeCatalog("matches", "cat")}})
+	must(self.c.CreateNamespace(self.ctx, "matches", map[string]any{"read": "public"}))
+	self.create("cat", "root", map[string]any{"title": "Root", "parents": []any{}})
+	self.create("cat", "empty", map[string]any{"title": "Empty", "parents": parents("cat", "root")})
+	self.create("cat", "cat.empty", map[string]any{"title": "node.json", "parents": parents("cat", "root")})
+	self.expect(self.do("PUT", "/cat/node.json", `{"x": 1}`), 403, "PUT through a placement of a catalog node")
 }
 
 // counted is a tree whose core counts the requests the WebDAV server

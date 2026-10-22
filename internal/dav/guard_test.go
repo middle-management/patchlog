@@ -293,8 +293,9 @@ func TestDeleteAfterSuccessfulSave(t *testing.T) {
 
 // A refused MOVE onto an existing file (an atomic save whose temporary
 // file isn't JSON, or a file moved over another, §H.5) sets a guard, as a
-// refused PUT does (§H.6; it set none before Addendum H); a refused plain
-// MOVE, to a new name, sets none, nor does a refused COPY. rclone's mount
+// refused PUT does (§H.6; it set none before Addendum H), and so does a
+// refused COPY (since v0.56); a refused plain MOVE, to a new name, sets
+// none. rclone's mount
 // without a cache saves over a file as a DELETE, then a MOVE (Overwrite:
 // F) onto the name: that MOVE refused undoes the DELETE, so it sets none
 // either, and the next save's DELETE isn't refused. The temporary files
@@ -318,8 +319,11 @@ func TestDeleteAfterRefusedMove(t *testing.T) {
 	e.create("docs", "copy", map[string]any{"a": "1"})
 	e.expect(e.do("PUT", "/docs/.goutputstream-copy", `{"a": "2"`), 201, "PUT scratch")
 	e.expect(e.do("COPY", "/docs/.goutputstream-copy", "", "Destination", "/docs/copy.json", "Overwrite", "T"), 400, "COPY that isn't JSON onto the document")
-	e.expect(e.do("DELETE", "/docs/copy.json", ""), 204, "DELETE after a refused COPY")
-	e.expectTombstoned("docs", "copy", "DELETE after a refused COPY")
+	h0, _ := e.load("docs", "copy")
+	e.expectGuarded("/docs/copy.json", "DELETE after a refused COPY")
+	e.expectLive("docs", "copy", h0, "after the guarded DELETE")
+	e.expect(e.do("DELETE", "/docs/copy.json", ""), 204, "DELETE again")
+	e.expectTombstoned("docs", "copy", "DELETE again")
 
 	// Onto a live file, without a DELETE before: guarded.
 	e.create("docs", "onto", map[string]any{"a": "1"})
