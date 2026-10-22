@@ -676,20 +676,22 @@ func TestV073P15DryRunConfigReport(t *testing.T) {
 }
 
 // §7.5, §8.4, §8.5 (GB-31): a dry run in a purged or a frozen namespace is
-// answered as a submit would be, without items.
+// answered as a submit would be, without items. The frozen namespace's
+// successor is live: a write may not name a purged one (§7.4).
 func TestV073P15DryRunPurgedFrozen(t *testing.T) {
 	t.Parallel()
 	e := newEnv(t)
 	e.mkNS("p", map[string]any{"read": "public"})
 	e.mkNS("f", map[string]any{"read": "public"})
+	e.mkNS("s", map[string]any{"read": "public"})
 	item := map[string]any{"items": []any{map[string]any{"resource": "a", "ifNoneMatch": "*", "steps": []any{addRoot(map[string]any{})}}}}
 	head := e.nsPurge("p")
 	r := e.do(req{method: "POST", path: "/ns/p/batch?dry-run=1", body: item, author: "alice"})
 	expectPurged(t, r, head)
-	expect(t, e.patchNS("f", ops(op("add", "/frozen", true), op("add", "/successor", "p")), ""), 201)
+	expect(t, e.patchNS("f", ops(op("add", "/frozen", true), op("add", "/successor", "s")), ""), 201)
 	r = e.do(req{method: "POST", path: "/ns/f/batch?dry-run=1", body: item, author: "alice"})
 	expectCode(t, r, 409, "frozen")
-	if r.Str("successor") != "p" {
+	if r.Str("successor") != "s" {
 		t.Fatalf("frozen: %s", r.Body)
 	}
 	for _, r := range []*resp{r, e.do(req{method: "POST", path: "/ns/p/batch?dry-run=1", body: item, author: "alice"})} {
