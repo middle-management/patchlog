@@ -17,9 +17,10 @@ import (
 // TestVisibilityRulesV038: a role with rules counts for an item's
 // visibility if its rules pass as a read of the item evaluates them (no
 // writes, doc or patches), unless they refer to /now or to /principal
-// other than /principal/groups; roles count only through subjects the
-// catalog's key may assert (§B.11.5); grants are issued only through them
-// too (§B.11.4 Resolve).
+// other than /principal/groups and /principal/roles, and for a folder's
+// if moreover they don't refer to /resource (v0.67); roles count only
+// through subjects the catalog's key may assert (§B.11.5); grants are
+// issued only through them too (§B.11.4 Resolve).
 func TestVisibilityRulesV038(t *testing.T) {
 	t.Parallel()
 	w := setup(t)
@@ -81,9 +82,11 @@ func TestVisibilityRulesV038(t *testing.T) {
 		if got := placed(tok, "/r/matches/x3"); got != c.want {
 			t.Errorf("group %s sees x3: %v, want %v", c.group, got, c.want)
 		}
-		// A folder is visible only through a role without rules.
-		if r, _ := w.follow("/cat/children?of=rx", tok); r.status != 404 {
-			t.Errorf("group %s lists rx: %d", c.group, r.status)
+		// None of these rules refers to /resource but the whole
+		// envelope's, so the folder is visible exactly when the item is
+		// (§B.11.5 v0.67).
+		if r, _ := w.follow("/cat/children?of=rx", tok); (r.status == 200) != c.want {
+			t.Errorf("group %s lists rx: %d, want visible %v", c.group, r.status, c.want)
 		}
 	}
 	// The spec's translator (writes within /i18n) sees what it may read.

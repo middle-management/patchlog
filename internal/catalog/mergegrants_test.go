@@ -132,9 +132,9 @@ func testMergeGrants(t *testing.T) {
 		t.Fatalf("stale: %d %v", r.status, r.body)
 	}
 
-	// §B.11.4 Create a folder: move on every folder it goes into. Powers
-	// on it come only from its own $access: an item placed into a new
-	// folder without $access is refused, unless the approver is an admin.
+	// §B.11.4 Create a folder: move on every folder it goes into. A new
+	// folder without $access takes, per subject, the powers held at all
+	// its parents (§B.11.2 v0.66), judged in the batch's result.
 	folder := client.GenesisPatches(map[string]any{"title": "Highlights", "parents": parents("season")})
 	if r = ask(desk, batch(map[string]any{"resource": "highlights", "ifNoneMatch": "*", "steps": []any{folder}})); r.status != 200 {
 		t.Fatalf("folder by desk: %d %v", r.status, r.body)
@@ -146,8 +146,11 @@ func testMergeGrants(t *testing.T) {
 		map[string]any{"resource": "highlights", "ifNoneMatch": "*", "steps": []any{folder}},
 		map[string]any{"resource": "matches.newx", "ifMatch": head("matches.newx"),
 			"steps": []any{[]any{map[string]any{"op": "replace", "path": "/parents", "value": parents("highlights")}}}})
-	if r = ask(desk, intoNew); r.status != 403 {
-		t.Fatalf("a move into a new folder nobody holds powers on: %d %v", r.status, r.body)
+	if r = ask(desk, intoNew); r.status != 200 {
+		t.Fatalf("a move into a new folder under season by desk: %d %v", r.status, r.body)
+	}
+	if r = ask(w.caller("user:bo", "fan-club"), intoNew); r.status != 403 {
+		t.Fatalf("a move into a new folder by a reader: %d %v", r.status, r.body)
 	}
 }
 
@@ -194,9 +197,11 @@ func TestCreateFolderGrant(t *testing.T) {
 	w.issue(w.caller("user:li"), map[string]any{"node": "more", "want": toAny("create"), "to": toAny("season")}, 403)
 	w.issue(desk, map[string]any{"node": "highlights", "want": toAny("create"), "to": toAny("season")}, 409)
 	w.issue(desk, map[string]any{"node": "matches.x", "want": toAny("create"), "to": toAny("season")}, 400)
-	// Nobody holds tree powers on the new folder: only admins may move or
-	// place into it until an admin gives some.
+	// Until an admin gives the new folder $access, each subject's role
+	// has the powers there that it has at all its parents (§B.11.2,
+	// §B.11.4 v0.66): desk's move at season. li, a reader, has none.
 	w.caughtUp()
-	w.issue(desk, map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("highlights")}, 403)
+	w.issue(desk, map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("highlights")}, 200)
+	w.issue(w.caller("user:li"), map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("highlights")}, 403)
 	w.issue(w.caller("user:chief", "catalog-admins", "match-desk"), map[string]any{"node": "matches.derby", "want": toAny("move"), "to": toAny("highlights")}, 200)
 }

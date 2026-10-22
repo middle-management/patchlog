@@ -153,6 +153,10 @@ type Graph struct {
 	// Aliases maps a namespace to the branch followed in its place in a
 	// release preview (§B.5, §F.9); nil otherwise.
 	Aliases map[string]string
+	// Purged, while a Hook's Update runs, reports whether the apply purged
+	// a name of the catalog (every name once the catalog itself is purged),
+	// so the hook drops what it keeps of it (§8.3); nil otherwise.
+	Purged func(name string) bool
 
 	nodes    map[string]*Node // merged: explicit, else implicit
 	explicit map[string]*Node

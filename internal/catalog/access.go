@@ -13,10 +13,10 @@ type AccessDelta struct {
 	Role    string `json:"role"`
 }
 
-// AccessDiff is how a change alters effective roles (§B.11.2), judged by
+// AccessDiff is how a change alters roles at nodes (§B.11.2), judged by
 // the test of §B.11.4: a role counts as present if it, or a role that
-// includes it (in the node's item's content namespace, or for a folder in
-// every trusted content namespace), is present.
+// includes it in the node's item's content namespace, is present; a
+// folder's roles compare by name.
 type AccessDiff struct {
 	// Widens lists roles present after that weren't before.
 	Widens []AccessDelta `json:"widens,omitempty"`
@@ -60,18 +60,14 @@ func DiffAccess(before, after *tree.Graph, incs map[string]Includes) AccessDiff 
 	for _, name := range sorted {
 		b := Effective(before, name, nil)
 		a := Effective(after, name, nil)
-		g := after
-		if after.Node(name) == nil {
-			g = before
-		}
 		for _, subj := range subjectsOf(a, b) {
 			for _, r := range a[subj] {
-				if !present(g, name, r, b[subj], incs) {
+				if !present(name, r, b[subj], incs) {
 					d.Widens = append(d.Widens, AccessDelta{Node: name, Subject: subj, Role: r})
 				}
 			}
 			for _, r := range b[subj] {
-				if !present(g, name, r, a[subj], incs) {
+				if !present(name, r, a[subj], incs) {
 					d.Narrows = append(d.Narrows, AccessDelta{Node: name, Subject: subj, Role: r})
 				}
 			}
