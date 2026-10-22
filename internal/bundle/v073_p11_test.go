@@ -2,6 +2,7 @@ package bundle_test
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -17,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/middle-management/patchlog/internal/bundle"
 	"github.com/middle-management/patchlog/internal/client"
@@ -807,5 +809,188 @@ func TestV073E2ELinesAtStep1(t *testing.T) {
 	importB(t, dst, e2eChain(t, "e", "d", []*seal.Keyring{kr}, s1, s2, nil, []any{}), bundle.ImportOptions{})
 	if h := dst.head("e", "d"); h.ID != restore || h.State != client.Live {
 		t.Fatalf("sealed lines, a tombstone and a restore: %+v", h)
+	}
+}
+
+// epochInForce fronts an e2e deployment as a core that accepts a sealed
+// patch set only under the epoch in force (§E.3.1) does: a batch with a
+// step sealed under another epoch of its namespace is 422.
+func epochInForce(t *testing.T, d *deployment) *client.Client {
+	t.Helper()
+	u := must(url.Parse(d.url))
+	rp := httputil.NewSingleHostReverseProxy(u)
+	hs := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ns, isBatch := strings.CutPrefix(r.URL.Path, "/ns/")
+		ns, isBatch = strings.CutSuffix(ns, "/batch")
+		if r.Method != "POST" || !isBatch || strings.Contains(ns, "/") {
+			rp.ServeHTTP(w, r)
+			return
+		}
+		body := must(io.ReadAll(r.Body))
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		r.ContentLength = int64(len(body))
+		epoch := 0
+		if h, err := d.c.NSHead(ctx, ns); err == nil {
+			enc, _ := must(d.c.NSDoc(ctx, ns, h.ID)).Value["encryption"].(map[string]any)
+			f, _ := enc["epoch"].(float64)
+			epoch = int(f)
+		}
+		req, _ := jsonv.MustParse(body).(map[string]any)
+		items, _ := req["items"].([]any)
+		for _, x := range items {
+			it, _ := x.(map[string]any)
+			steps, _ := it["steps"].([]any)
+			for _, st := range steps {
+				ps := st
+				if m, ok := st.(map[string]any); ok {
+					ps = m["patches"]
+				}
+				jwe, ok := seal.SealedJWE(ps)
+				if !ok {
+					continue
+				}
+				h := must(seal.ParseHeader(jwe))
+				if _, e, _ := seal.ParseKid(h.Kid); e != epoch {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(422)
+					fmt.Fprintf(w, `{"code":"invalid","message":"sealed under epoch %d, and the epoch in force is %d"}`, e, epoch)
+					return
+				}
+			}
+		}
+		rp.ServeHTTP(w, r)
+	}))
+	t.Cleanup(hs.Close)
+	return must(client.New(hs.URL, client.WithAuthor("alice"), client.WithKeys(client.NewKeys(nil))))
+}
+
+// e2eSource is an e2e namespace e of two epochs: the keyring at epoch 1,
+// d sealed under e#1, a rotation to epoch 2 (keyring and epoch in one
+// batch), and d's next revision under e#2. before is the bundle exported
+// before the rotation, after the one after it.
+type e2eSource struct {
+	src            *deployment
+	k1, k2         []byte
+	kr1            *seal.Keyring
+	d0, d1         string
+	before, after  []byte
+	krGenesis, kr2 string
+}
+
+func newE2ESource(t *testing.T) *e2eSource {
+	t.Helper()
+	s := &e2eSource{src: newEncDeployment(t, stagingOrigin), k1: seal.NewKey(), k2: seal.NewKey()}
+	s.src.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
+	reader := identity(t)
+	kr := must(seal.BuildKeyring("e", 1, s.k1, []*ecdh.PublicKey{reader.PublicKey()}))
+	s.krGenesis = s.src.create("e", "keyring", kr.Value())
+	s.d0 = e2eWrite(t, s.src, s.k1, "e#1", "e", "d", "", client.GenesisPatches(map[string]any{"v": 1.0}))
+	export := func() []byte {
+		var buf bytes.Buffer
+		_, _, err := bundle.Export(ctx, s.src.c, &buf, bundle.ExportOptions{Select: []string{"e/d"}})
+		noErr(t, err)
+		return buf.Bytes()
+	}
+	s.before = export()
+	must(kr.Rotate(s.k2, []*ecdh.PublicKey{reader.PublicKey()}))
+	h := must(s.src.c.NSHead(ctx, "e"))
+	res := must(s.src.c.Batch(ctx, "e", client.BatchRequest{Config: &client.BatchConfig{IfMatch: h.Config, Patches: ops(op("add", "/encryption/epoch", 2.0))},
+		Items: []client.BatchItem{{Resource: "keyring", IfMatch: s.krGenesis, Steps: []client.Step{client.PatchStep(ops(op("replace", "", kr.Value())))}}}}, false))
+	s.kr2 = res.Items[0].IDs[0]
+	s.d1 = e2eWrite(t, s.src, s.k2, "e#2", "e", "d", s.d0, ops(op("add", "/w", 1.0)))
+	s.after = export()
+	return s
+}
+
+// targetEpoch is encryption.epoch of a target namespace.
+func targetEpoch(t *testing.T, d *deployment, ns string) float64 {
+	t.Helper()
+	h := must(d.c.NSHead(ctx, ns))
+	return must(d.c.NSDoc(ctx, ns, h.ID)).Value["encryption"].(map[string]any)["epoch"].(float64)
+}
+
+// An e2e import moves the target up one epoch at a time as its keyring
+// lines arrive, created and existing targets alike, so each line goes in
+// while its epoch is the one in force (§E.3.1); an existing target is
+// refused only below the bundle's lowest epoch or past that of a line it
+// lacks (§G.5.1, MF-55).
+func TestV073E2EEpochsInterleaved(t *testing.T) {
+	t.Parallel()
+	s := newE2ESource(t)
+
+	// A created target, through a core that accepts only the epoch in
+	// force, in both modes.
+	for _, mode := range []bundle.ImportMode{bundle.Atomic, bundle.Backfill} {
+		dst := newEncDeployment(t, cmsOrigin)
+		rep, err := bundle.Import(ctx, epochInForce(t, dst), bundle.BytesOpener(s.after), bundle.ImportOptions{Mode: mode, CreateNamespaces: true, Sleep: func(context.Context, time.Duration) error { return nil }})
+		if err != nil {
+			t.Fatalf("%s: %v", mode, err)
+		}
+		if dst.head("e", "d").ID != s.d1 || dst.head("e", "keyring").ID != s.kr2 || targetEpoch(t, dst, "e") != 2 {
+			t.Fatalf("%s: d %s, keyring %s, epoch %v", mode, dst.head("e", "d").ID, dst.head("e", "keyring").ID, targetEpoch(t, dst, "e"))
+		}
+		if len(rep.Batches) < 2 || !strings.Contains(strings.Join(rep.Notes, " "), "epochs 1 to 2") {
+			t.Fatalf("%s: %d batches, notes %v", mode, len(rep.Batches), rep.Notes)
+		}
+	}
+
+	// An existing target at epoch 1 that has the first epoch's lines: moved
+	// up, not refused.
+	dst := newEncDeployment(t, cmsOrigin)
+	importB(t, dst, s.before, bundle.ImportOptions{})
+	if targetEpoch(t, dst, "e") != 1 {
+		t.Fatal("the first import's epoch")
+	}
+	c := epochInForce(t, dst)
+	_, err := bundle.Import(ctx, c, bundle.BytesOpener(s.after), bundle.ImportOptions{Mode: bundle.Atomic})
+	noErr(t, err)
+	if dst.head("e", "d").ID != s.d1 || targetEpoch(t, dst, "e") != 2 {
+		t.Fatal("the existing target wasn't moved up")
+	}
+
+	// An existing target past the epoch of a line it lacks: refused at
+	// step 1.
+	dst2 := newEncDeployment(t, cmsOrigin)
+	importB(t, dst2, s.before, bundle.ImportOptions{})
+	for _, e := range []float64{2, 3} {
+		h := must(dst2.c.NSHead(ctx, "e"))
+		must(dst2.c.PatchConfig(ctx, "e", h.Config, ops(op("replace", "/encryption/epoch", e))))
+	}
+	importErr(t, dst2, s.after, bundle.ImportOptions{}, "encryption.epoch is 3, past epoch 2 of a line it lacks")
+	if dst2.head("e", "d").ID != s.d0 {
+		t.Fatal("the refused import wrote")
+	}
+	// One past the epoch of every line it lacks (it lacks none) isn't.
+	importB(t, dst2, s.before, bundle.ImportOptions{})
+
+	// An existing target below the bundle's lowest epoch: refused.
+	src3 := newEncDeployment(t, stagingOrigin)
+	src3.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": 2.0}})
+	kr := must(seal.BuildKeyring("e", 2, s.k2, []*ecdh.PublicKey{identity(t).PublicKey()}))
+	src3.create("e", "keyring", kr.Value())
+	e2eWrite(t, src3, s.k2, "e#2", "e", "x", "", client.GenesisPatches(map[string]any{"v": 3.0}))
+	var b3 bytes.Buffer
+	_, _, err = bundle.Export(ctx, src3.c, &b3, bundle.ExportOptions{Select: []string{"e/x"}})
+	noErr(t, err)
+	dst3 := newEncDeployment(t, cmsOrigin)
+	dst3.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e"}})
+	importErr(t, dst3, b3.Bytes(), bundle.ImportOptions{}, "encryption.epoch is 1, below the bundle's lowest epoch 2")
+}
+
+// An existing e2e target whose keyring has a different history from the
+// bundle's is refused at step 1, since a kid would then name two keys
+// (§G.5.1, MF-54); one with an earlier revision of the bundle's keyring
+// isn't (TestV073E2EEpochsInterleaved).
+func TestV073E2EKeyringConflict(t *testing.T) {
+	t.Parallel()
+	s := newE2ESource(t)
+	dst := newEncDeployment(t, cmsOrigin)
+	dst.ns("e", map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": 2.0}})
+	other := must(seal.BuildKeyring("e", 2, seal.NewKey(), []*ecdh.PublicKey{identity(t).PublicKey()}))
+	own := dst.create("e", "keyring", other.Value())
+	importErr(t, dst, s.after, bundle.ImportOptions{Resolutions: map[string]bundle.Resolution{"e/keyring": bundle.ResolveSkip}},
+		"the target's keyring has a different history from the bundle's")
+	if dst.head("e", "keyring").ID != own || dst.head("e", "d").State != client.NotFound {
+		t.Fatal("the refused import wrote")
 	}
 }

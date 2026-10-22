@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"regexp"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -182,6 +183,10 @@ func (im *importer) namespaceDoc(ctx context.Context, ns string) (map[string]any
 // in Backfill mode as many as the namespace's itemsPerBatch and batchSize
 // require (splitParts).
 func (im *importer) split(n *node, l limits) {
+	if start, ok := im.e2eAt[n.ns]; ok {
+		im.splitEpochs(n, l, start)
+		return
+	}
 	if im.opt.Mode == Atomic {
 		b := &batch{n: n}
 		for _, it := range n.items {
@@ -200,6 +205,60 @@ func (im *importer) split(n *node, l limits) {
 	n.batches = splitParts(n, parts, l)
 }
 
+// splitEpochs sizes an e2e target's items into batches by epoch (§G.5.1,
+// §E.3.1): each step goes in a batch of the epoch its line is sealed
+// under, a keyring line in one of the keyring's current epoch after it,
+// and a tombstone or a restore's [] in one of the step before it; none
+// below start, the target's epoch when the import begins, which it lacks
+// no line of (checkAccess). The batches go in epoch order, and the target
+// is moved up one epoch at a time before the first of each epoch
+// (moveEpoch), so every line is submitted while its epoch is in force,
+// the only one step 3 accepts. Within an epoch, batches are sized as any
+// node's: one in Atomic mode, so an import spanning epochs is atomic per
+// epoch only.
+func (im *importer) splitEpochs(n *node, l limits, start int) {
+	byEpoch := map[int][]part{}
+	for _, it := range n.items {
+		p, from := start, 0
+		for j := range it.steps {
+			e := p
+			if k := it.line0 + j; it.d != nil && k < len(it.d.epochs) && it.d.epochs[k] > p {
+				e = it.d.epochs[k]
+			}
+			if e != p && j > from {
+				byEpoch[p] = append(byEpoch[p], part{it: it, from: from, to: j, epoch: p})
+				from = j
+			}
+			p = e
+		}
+		byEpoch[p] = append(byEpoch[p], part{it: it, from: from, to: len(it.steps), epoch: p})
+	}
+	epochs := make([]int, 0, len(byEpoch))
+	for e := range byEpoch {
+		epochs = append(epochs, e)
+	}
+	sort.Ints(epochs)
+	n.batches = nil
+	for _, e := range epochs {
+		if im.opt.Mode != Atomic {
+			n.batches = append(n.batches, splitParts(n, byEpoch[e], l)...)
+			continue
+		}
+		b := &batch{n: n, parts: byEpoch[e], epoch: e}
+		for _, p := range b.parts {
+			for _, sz := range p.it.stepSizes()[p.from:p.to] {
+				b.size += sz
+			}
+		}
+		n.batches = append(n.batches, b)
+	}
+	if len(epochs) > 1 {
+		im.rep.Notes = append(im.rep.Notes, fmt.Sprintf("the lines of e2e namespace %s are sealed under epochs %d to %d: they go in batches per epoch, in epoch order, "+
+			"the target moved up one epoch at a time between them, as only the epoch in force is accepted (§E.3.1, §G.5.1); the import isn't atomic across epochs",
+			n.ns, epochs[0], epochs[len(epochs)-1]))
+	}
+}
+
 // resplit splits a node's batches from i on again by l, when the importer's
 // allowance ends part-way through its batches and the namespace's own
 // limits apply to the rest (§6.6). A chain cut between two of them is
@@ -208,7 +267,7 @@ func (im *importer) resplit(n *node, i int, l limits) {
 	var rest []part
 	for _, b := range n.batches[i:] {
 		for _, p := range b.parts {
-			if k := len(rest) - 1; k >= 0 && rest[k].it == p.it && rest[k].to == p.from {
+			if k := len(rest) - 1; k >= 0 && rest[k].it == p.it && rest[k].to == p.from && rest[k].epoch == p.epoch {
 				rest[k].to = p.to
 			} else {
 				rest = append(rest, p)
@@ -231,7 +290,8 @@ func (im *importer) resplit(n *node, i int, l limits) {
 }
 
 // splitParts sizes parts of a node's items into batches by l's itemsPerBatch
-// and batchSize, cutting a long chain into consecutive parts if needed.
+// and batchSize, cutting a long chain into consecutive parts if needed. A
+// batch holds parts of one epoch (splitEpochs).
 func splitParts(n *node, parts []part, l limits) []*batch {
 	var out []*batch
 	cur := &batch{n: n}
@@ -239,9 +299,13 @@ func splitParts(n *node, parts []part, l limits) []*batch {
 		if len(cur.parts) > 0 {
 			out = append(out, cur)
 		}
-		cur = &batch{n: n}
+		cur = &batch{n: n, epoch: cur.epoch}
 	}
 	for _, p := range parts {
+		if p.epoch != cur.epoch {
+			flush()
+			cur.epoch = p.epoch
+		}
 		it, start := p.it, p.from
 		for start < p.to {
 			if len(cur.parts) >= l.items {
@@ -260,7 +324,7 @@ func splitParts(n *node, parts []part, l limits) []*batch {
 				flush()
 				continue
 			}
-			cur.parts = append(cur.parts, part{it: it, from: start, to: end})
+			cur.parts = append(cur.parts, part{it: it, from: start, to: end, epoch: p.epoch})
 			cur.size += sz
 			start = end
 		}
@@ -551,6 +615,11 @@ func (im *importer) execute(ctx context.Context) error {
 		if n.missing {
 			b.rep.DryRun = "deferred"
 			b.rep.Failures = []string{"the namespace doesn't exist yet"}
+		} else if b.epoch > im.e2eAt[n.ns] {
+			// Sealed under an epoch the target moves to first (moveEpoch),
+			// which is a write: dry-run once it has moved.
+			b.rep.DryRun = "deferred"
+			b.rep.Failures = []string{fmt.Sprintf("the target moves to epoch %d before this batch (§E.3.1)", b.epoch)}
 		} else {
 			deferOK := false
 			for dep := range n.deps {
@@ -584,6 +653,13 @@ func (im *importer) execute(ctx context.Context) error {
 		for _, n := range im.order {
 			for _, b := range n.batches[1:] {
 				if !b.updates() || b.parts[0].from > 0 {
+					continue
+				}
+				if b.epoch > im.e2eAt[n.ns] {
+					// Its lines are sealed under an epoch the target is
+					// moved to only once the batches before it are written.
+					b.rep.DryRun = "deferred"
+					b.rep.Failures = []string{fmt.Sprintf("the target moves to epoch %d before this batch, once the batches before it are written (§E.3.1)", b.epoch)}
 					continue
 				}
 				if err := im.dryRun(ctx, b, true); err != nil {
@@ -622,17 +698,11 @@ func (im *importer) submitAll(ctx context.Context, run *runner, lims map[*node]l
 			}
 		}
 		if n.missing {
-			var cr *client.ConfigResult
 			var err error
 			doc := im.nsDoc(ctx, n)
-			im.io(func() { cr, err = im.c.CreateNamespace(ctx, n.ns, doc) })
+			im.io(func() { _, err = im.c.CreateNamespace(ctx, n.ns, doc) })
 			if err != nil && !client.IsStale(err) {
 				return fmt.Errorf("import: creating namespace %s: %w", n.ns, err)
-			}
-			if err == nil && im.bump[n.ns] > 0 {
-				if err := im.bumpEpochs(ctx, n.ns, cr.Config); err != nil {
-					return err
-				}
 			}
 			n.missing = false
 			if err := im.probe(ctx, n, lims[n]); err != nil {
@@ -650,6 +720,11 @@ func (im *importer) submitAll(ctx context.Context, run *runner, lims map[*node]l
 			max := 1
 			if im.gates[n.ns] != nil {
 				max = conc
+			}
+			// An e2e target goes up to the epoch of the batch's lines
+			// once the batches before it have committed (splitEpochs).
+			if err := im.moveEpoch(ctx, run, n, b.epoch); err != nil {
+				return err
 			}
 			if err := run.waitFor(func(f *flight) bool { return f.n == n && im.after(b, f.b) }); err != nil {
 				return err
@@ -771,7 +846,10 @@ func (im *importer) submitBatch(ctx context.Context, n *node, i int, l limits) e
 // takes the submit all the same: source.ids only records them (§3.5).
 func (im *importer) probe(ctx context.Context, n *node, l limits) error {
 	b := n.batches[0]
-	p := &batch{n: n, parts: b.parts[:1], rep: b.rep}
+	if b.epoch > im.e2eAt[n.ns] {
+		return nil // dry-run once the target has moved to its epoch
+	}
+	p := &batch{n: n, parts: b.parts[:1], rep: b.rep, epoch: b.epoch}
 	for _, sz := range p.parts[0].it.stepSizes()[p.parts[0].from:p.parts[0].to] {
 		p.size += sz
 	}

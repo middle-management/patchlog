@@ -78,11 +78,17 @@
 //     isn't, so it refuses. Nothing is folded, so an e2e document brings
 //     no dependencies.
 //   - The importer enforces what the source can't: a private or sealed
-//     source goes only into a private or sealed target, an e2e source only
-//     into an e2e target of the same name (sealed patch sets bind pl.ns,
+//     source goes only into a private or sealed target, a sealed target
+//     whose read is public ranking public (§2.1), an e2e source only into
+//     an e2e target of the same name (sealed patch sets bind pl.ns,
 //     §E.3.1; importing under another name is a merge by a client holding
 //     both sets of keys, §F.8), unless ImportOptions.AllowLessProtected.
-//     Missing targets are created as protected as their source.
+//     A bundle of a namespace back into itself isn't ranked. Missing
+//     targets are created as protected as their source.
+//   - An e2e source's lines go in batches per epoch, in epoch order, the
+//     target moved up one epoch at a time between them as its keyring
+//     lines arrive, created or existing, so each line is submitted while
+//     its epoch is in force (§E.3.1, §G.5.1; access.go, splitEpochs).
 package bundle
 
 import (

@@ -373,6 +373,9 @@ type bdoc struct {
 	// changes strings that pin, never a blob reference); nil otherwise.
 	snapGone  bool
 	snapBlobs []string
+	// epochs are, for an e2e source's document, the epoch of each line
+	// (e2eEpochs); nil otherwise.
+	epochs []int
 }
 
 type item struct {
@@ -382,6 +385,7 @@ type item struct {
 	ifMatch  string
 	ifNone   bool
 	steps    []client.Step
+	line0    int // the bundle line of steps[0], for a document's own lines (epochs)
 	expected []string
 	sizes    []int      // per step, its patch set's canonical size (stepSizes)
 	sameIDs  bool       // the ids are the source's (fast-forward): source.ids follows them
@@ -432,11 +436,15 @@ type batch struct {
 	size  int
 	rep   *BatchReport
 	keys  map[string]bool // its items' source documents (keysOf)
+	// epoch is, for an e2e target, the epoch it must be at when the batch
+	// goes (splitEpochs); 0 otherwise.
+	epoch int
 }
 
 type part struct {
 	it       *item
 	from, to int
+	epoch    int // the batch's epoch it goes in (splitEpochs), 0 if none
 }
 
 type importer struct {
@@ -484,7 +492,7 @@ type importer struct {
 	create  map[string]any  // target ns → the document it is created with
 	sealedT map[string]bool // target ns is (or is created) sealed
 	nonces  map[string]bool // target ns requires nonces (nonce.go)
-	bump    map[string]int  // new e2e target → the epoch to move it to
+	e2eAt   map[string]int  // e2e target ns → its epoch, as the import moves it (moveEpoch)
 
 	// Target heads (heads.go): the resources looked up per namespace, and
 	// the namespaces' listings (nil: looked up one by one).
@@ -1374,7 +1382,7 @@ func (im *importer) planFull(ctx context.Context, d *bdoc) (*item, error) {
 	mk := func(class string, after int, parent string) *item {
 		r.Class = class
 		it := &item{d: d, ns: d.tns, name: d.name, ifMatch: parent, ifNone: parent == "", sameIDs: d.rw == nil,
-			steps: d.stepsFrom(after + 1)}
+			steps: d.stepsFrom(after + 1), line0: after + 1}
 		if rw := d.rw; rw != nil {
 			// New ids, computed by rename; source.ids records the source's.
 			it.expected, it.sizes, it.srcIDs = rw.ids[after+1:], rw.sizes[after+1:], lineIDs(d.lines[after+1:])

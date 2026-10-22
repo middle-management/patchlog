@@ -59,6 +59,9 @@ func docAccess(doc any) string {
 
 // e2eEpochs lists the epochs the lines of an e2e namespace are sealed
 // under: the kids of sealed patch sets, and the keyring's current epochs.
+// Each document keeps its lines' epochs (bdoc.epochs) for the batches
+// (splitEpochs): a sealed line's kid's, a keyring line's current epoch
+// after it, 0 for a tombstone or a restore.
 // It checks those lines as §G.5.1 has the importer do at step 1: every
 // rev line but the keyring's is one sealed op whose pl.ns and kid name the
 // namespace, or a restore's []. Anything else (plaintext history from
@@ -80,20 +83,22 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, problems []string, err err
 		if d.ns != ns {
 			continue
 		}
+		d.epochs = make([]int, len(d.lines))
 		if d.name == keyringName {
 			var doc any
 			live := false
-			for _, l := range d.lines {
+			for i, l := range d.lines {
 				if doc, live, err = verify.Replay(doc, live, []client.LogEntry{l.LogEntry()}); err != nil {
 					return 0, 0, nil, fmt.Errorf("%s: %w", k, err)
 				}
 				if kr, err := seal.ParseKeyring(doc); live && err == nil {
 					note(kr.Current)
+					d.epochs[i] = kr.Current
 				}
 			}
 			continue
 		}
-		for _, l := range d.lines {
+		for i, l := range d.lines {
 			if l.Kind != "rev" {
 				continue
 			}
@@ -119,12 +124,75 @@ func (im *importer) e2eEpochs(ns string) (lo, hi int, problems []string, err err
 				continue
 			}
 			note(e)
+			d.epochs[i] = e
 		}
 	}
 	if lo == 0 {
 		lo, hi = 1, 1
 	}
 	return lo, hi, problems, nil
+}
+
+// e2eKeyringConflict reports an existing e2e target whose keyring has a
+// different history from the bundle's, classified by ancestry as step 2
+// classifies it (§G.4.4): a kid would then name two keys, so the import is
+// refused at step 1 (§G.5.1). A target without the keyring, one that has
+// an earlier revision of the bundle's or has gone on from its head isn't.
+func (im *importer) e2eKeyringConflict(ctx context.Context, ns string) (string, error) {
+	d := im.docs[Key(ns, keyringName)]
+	if d == nil || !im.brought(d) {
+		return "", nil
+	}
+	th, err := im.head(ctx, d.tns, keyringName)
+	if err != nil {
+		return "", err
+	}
+	if _, in := d.idx[th.ID]; in || th.State == client.NotFound || th.State == client.Purged || (d.requires != "" && th.ID == d.requires) {
+		return "", nil
+	}
+	behind, err := im.inChain(ctx, d.tns, keyringName, th.ID, d.info.Head)
+	if err != nil || behind {
+		return "", err
+	}
+	return fmt.Sprintf("e2e namespace %s: the target's keyring has a different history from the bundle's (target head %s), so a kid would name two keys: "+
+		"refused before anything is written (§G.5.1); its key holders reconcile the keyrings first", ns, th.ID), nil
+}
+
+// e2eLacking is the lowest epoch of a sealed line of e2e namespace ns that
+// the target lacks, 0 if it lacks none: the lines after a document's
+// target head where the bundle has that head, or all of its lines where
+// the target has none or holds its requires. A document whose target is
+// purged, ahead or diverged is classified later, and writes none of them.
+func (im *importer) e2eLacking(ctx context.Context, ns string) (int, error) {
+	low := 0
+	for _, k := range im.keys {
+		d := im.docs[k]
+		if d.ns != ns || d.name == keyringName || d.epochs == nil {
+			continue
+		}
+		th, err := im.head(ctx, d.tns, d.name)
+		if err != nil {
+			return 0, err
+		}
+		from := -1
+		switch i, in := d.idx[th.ID]; {
+		case th.State == client.NotFound:
+			from = 0
+		case in:
+			from = i + 1
+		case d.requires != "" && th.ID == d.requires:
+			from = 0
+		}
+		if from < 0 {
+			continue
+		}
+		for _, e := range d.epochs[from:] {
+			if e > 0 && (low == 0 || e < low) {
+				low = e
+			}
+		}
+	}
+	return low, nil
 }
 
 // targetInfo is what checkAccess reads of an existing namespace.
@@ -169,7 +237,7 @@ func (im *importer) existing(ctx context.Context, ns string) (ti targetInfo, ok 
 // checkAccess checks every target against its source's access level
 // (§G.5.1) and decides how missing targets are created.
 func (im *importer) checkAccess(ctx context.Context) error {
-	im.create, im.sealedT, im.bump = map[string]any{}, map[string]bool{}, map[string]int{}
+	im.create, im.sealedT, im.e2eAt = map[string]any{}, map[string]bool{}, map[string]int{}
 	type target struct {
 		src      string
 		upstream bool
@@ -226,7 +294,7 @@ func (im *importer) checkAccess(ctx context.Context) error {
 		if src == AccessE2E {
 			// Ciphertext, verbatim (§G.5.1): only an e2e target of the
 			// same name can take it. No override: it can't work otherwise.
-			lo, hi, probs, err := im.e2eEpochs(tg.src)
+			lo, _, probs, err := im.e2eEpochs(tg.src)
 			problems = append(problems, probs...)
 			switch {
 			case err != nil:
@@ -238,14 +306,36 @@ func (im *importer) checkAccess(ctx context.Context) error {
 					"importing it under another name is a merge that re-encrypts, by a client holding both sets of keys (§F.8, §G.5.1)", tg.src, tns))
 			case ok && have != AccessE2E:
 				problems = append(problems, fmt.Sprintf("e2e namespace %s can only go into an e2e target, and %s is %s (§G.5.1)", tg.src, tns, have))
-			case ok && hi > epoch:
-				problems = append(problems, fmt.Sprintf("e2e namespace %s: the bundle is sealed under epochs up to %d, and the target's encryption.epoch is %d; "+
-					"its key holders rotate it first (§E.3.2)", tg.src, hi, epoch))
-			case !ok:
-				im.create[tns] = map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": float64(lo)}}
-				if hi > lo {
-					im.bump[tns] = hi
+			case ok:
+				// An existing target is moved up one epoch at a time as
+				// the lines arrive, as a created one is (splitEpochs), so
+				// its keyring mustn't conflict with the bundle's, and it
+				// can't be below the bundle's lowest epoch or past that of
+				// a line it lacks: step 3 accepts only the epoch in force
+				// (§E.3.1, §G.5.1).
+				p, err := im.e2eKeyringConflict(ctx, tg.src)
+				if err != nil {
+					return fmt.Errorf("import: target namespace %s: %w", tns, err)
 				}
+				if p != "" {
+					problems = append(problems, p)
+				}
+				lack, err := im.e2eLacking(ctx, tg.src)
+				if err != nil {
+					return fmt.Errorf("import: target namespace %s: %w", tns, err)
+				}
+				switch {
+				case epoch < lo:
+					problems = append(problems, fmt.Sprintf("e2e namespace %s: the target's encryption.epoch is %d, below the bundle's lowest epoch %d (§G.5.1)", tg.src, epoch, lo))
+				case lack > 0 && epoch > lack:
+					problems = append(problems, fmt.Sprintf("e2e namespace %s: the target's encryption.epoch is %d, past epoch %d of a line it lacks, which it no longer accepts (§E.3.1, §G.5.1)", tg.src, epoch, lack))
+				}
+				im.e2eAt[tns] = epoch
+			default:
+				// Created at the bundle's lowest epoch, and moved up as the
+				// lines arrive (splitEpochs).
+				im.create[tns] = map[string]any{"read": "grant", "encryption": map[string]any{"level": "e2e", "epoch": float64(lo)}}
+				im.e2eAt[tns] = lo
 			}
 			continue
 		}
@@ -335,18 +425,30 @@ func (im *importer) nsDoc(ctx context.Context, n *node) any {
 	return im.defaultNSDoc(ctx, n)
 }
 
-// bumpEpochs moves a new e2e target's epoch up one at a time to the
-// highest its lines are sealed under (§E.2.1: an epoch only moves by one),
-// so every epoch of the bundle is one the target has (§E.3.1).
-func (im *importer) bumpEpochs(ctx context.Context, ns, config string) error {
-	doc := im.create[ns].(map[string]any)
-	lo := int(doc["encryption"].(map[string]any)["epoch"].(float64))
-	for e := lo + 1; e <= im.bump[ns]; e++ {
-		r, err := im.c.PatchConfig(ctx, ns, config, []any{map[string]any{"op": "replace", "path": "/encryption/epoch", "value": float64(e)}})
+// moveEpoch moves an e2e target up one epoch at a time to e, with
+// encryption.epoch config writes (§E.2.1: an epoch only moves by one),
+// once every batch of its node in flight has committed: those are sealed
+// under the epoch before, which step 3 accepts only while it is in force
+// (§E.3.1, §G.5.1). It needs config on the target, with a * key (§7.4).
+func (im *importer) moveEpoch(ctx context.Context, run *runner, n *node, e int) error {
+	if e <= im.e2eAt[n.ns] {
+		return nil
+	}
+	if err := run.waitFor(func(f *flight) bool { return f.n == n }); err != nil {
+		return err
+	}
+	for next := im.e2eAt[n.ns] + 1; next <= e; next++ {
+		var err error
+		im.io(func() {
+			var h *client.NSHead
+			if h, err = im.c.NSHead(ctx, n.ns); err == nil {
+				_, err = im.c.PatchConfig(ctx, n.ns, h.Config, []any{map[string]any{"op": "replace", "path": "/encryption/epoch", "value": float64(next)}})
+			}
+		})
 		if err != nil {
-			return fmt.Errorf("import: moving %s to epoch %d: %w", ns, e, err)
+			return fmt.Errorf("import: moving %s to epoch %d: %w", n.ns, next, err)
 		}
-		config = r.Config
+		im.e2eAt[n.ns] = next
 	}
 	return nil
 }
