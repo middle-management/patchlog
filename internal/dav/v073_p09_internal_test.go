@@ -82,3 +82,44 @@ func TestV073RetiredRecordsBounded(t *testing.T) {
 		t.Fatalf("path record after the sweep: %q %q %v", ns, name, ok)
 	}
 }
+
+// Retired, a user's records keep, of the entries the user wrote, the one
+// used last of each document kept as a lost mark (GW-24, §H.4
+// "Records"): where the head is the user's own DELETE that is it,
+// however many entries of other documents the user wrote after it; the
+// rest go, and so do those of documents with no mark.
+func TestV073RetiredKeepsOwnDelete(t *testing.T) {
+	t.Parallel()
+	now := time.Now()
+	s := &Server{opt: Options{Now: func() time.Time { return now }, RecordIdle: time.Hour, RecordBytes: 1 << 20}, recRoots: map[string]*recStore{}}
+	p := s.newPrincipal("u")
+	s.remember(p, "docs", "x", record{rev: "x1", wrote: true}, false)
+	s.markOwn(p, "docs", "x", "x1")
+	s.markOwn(p, "docs", "x", "xt") // the user's DELETE
+	for i := 0; i < maxRetiredMarks+10; i++ {
+		rev := fmt.Sprintf("y%d", i)
+		s.remember(p, "docs", "y", record{rev: rev, wrote: true}, false)
+		s.markOwn(p, "docs", "y", rev)
+	}
+	s.markOwn(p, "docs", "unmarked", "u1")
+	now = now.Add(2 * time.Hour)
+	s.recMu.Lock()
+	s.sweepRecordsLocked(now)
+	n := s.recRoots["u"].own.Len()
+	s.recMu.Unlock()
+	last := fmt.Sprintf("y%d", maxRetiredMarks+9)
+	for _, c := range []struct {
+		name, id string
+		want     bool
+	}{{"x", "xt", true}, {"x", "x1", false}, {"y", last, true}, {"y", "y0", false}, {"unmarked", "u1", false}} {
+		if got := s.ownEntry(p, "docs", c.name, c.id); got != c.want {
+			t.Errorf("own entry %s@%s after the sweep: %v, want %v", c.name, c.id, got, c.want)
+		}
+	}
+	if n != 2 {
+		t.Errorf("%d own entries kept, want 2", n)
+	}
+	if d := s.recordsOf(p, "docs", "x"); !d.lost {
+		t.Errorf("x after the sweep: %+v", d)
+	}
+}

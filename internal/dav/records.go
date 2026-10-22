@@ -3,6 +3,7 @@ package dav
 import (
 	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/middle-management/patchlog/internal/lru"
@@ -397,8 +398,12 @@ func (s *Server) sweepRecordsLocked(now time.Time) {
 // of one without a tag is refused until a reload rather than rebased on
 // the head, as if never recorded, and its path records, which refuse a
 // save of a path that now names another document (replaced); at most
-// maxRetiredMarks of each, the most recently used. The tombstones and
-// restores the user wrote (own) go.
+// maxRetiredMarks of each, the most recently used. Of the entries the
+// user wrote (own), each marked document keeps the one used last: where
+// the head is the user's own DELETE, that is it, as nothing was written
+// after it, so a new file there is no save over someone else's delete
+// (tombLast), the path forgotten by that DELETE (§H.4 "Records"); the
+// rest go.
 func (rs *recStore) retireLocked() {
 	keys := rs.docs.Keys() // most recently used first
 	for i := len(keys) - 1; i >= 0; i-- {
@@ -411,7 +416,22 @@ func (rs *recStore) retireLocked() {
 	for rs.paths.Len() > maxRetiredMarks {
 		rs.paths.RemoveOldest()
 	}
+	marked := map[string]bool{}
+	for _, k := range rs.forgotten.Keys() {
+		marked[k] = true
+	}
+	var own []string // most recently used first
+	for _, k := range rs.own.Keys() {
+		doc := k[:max(strings.LastIndexByte(k, '@'), 0)]
+		if marked[doc] {
+			own = append(own, k)
+			delete(marked, doc)
+		}
+	}
 	rs.own.Flush()
+	for i := len(own) - 1; i >= 0; i-- {
+		rs.own.Put(own[i], true, 1)
+	}
 	rs.retired = true
 }
 
@@ -567,18 +587,38 @@ func (s *Server) reloaded(p *principal, ns, name, by string) {
 	s.recMu.Lock()
 	defer s.recMu.Unlock()
 	st := s.storeLocked(p)
+	if d, ok := st.docs.Get(k); ok && d.reload > 0 {
+		s.dropLocked(st, k)
+	}
+}
+
+// forgetDoc forgets p's records of ns/name, kept or lost: the head is a
+// DELETE of p's own, written before ownDeleteUndo, which forgot the path
+// (§H.4 "Records"), and a save makes the file anew, its write then the
+// only record, not one of a document whose records were lost (expired,
+// or retired with the user's, retireLocked), which would refuse the
+// next save.
+func (s *Server) forgetDoc(p *principal, ns, name string) {
+	s.recMu.Lock()
+	defer s.recMu.Unlock()
+	s.dropLocked(s.storeLocked(p), recKey(ns, name))
+}
+
+// dropLocked drops st's records of document k and its lost mark, but for
+// the tokens that must read it themselves (refusedSave): refused, they
+// haven't read it since.
+func (s *Server) dropLocked(st *recStore, k string) {
+	st.forgotten.Remove(k)
 	d, ok := st.docs.Get(k)
-	if !ok || d.reload == 0 {
+	if !ok {
 		return
 	}
 	before := st.docs.Bytes()
 	if len(d.unread) > 0 {
-		// Other tokens refused, which haven't found it gone.
 		st.docs.Put(k, docRecs{unread: d.unread}, docRecs{unread: d.unread}.cost())
 	} else {
 		st.docs.Remove(k)
 	}
-	st.forgotten.Remove(k)
 	s.recBytes += st.docs.Bytes() - before
 }
 

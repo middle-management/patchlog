@@ -519,3 +519,54 @@ func TestV073WriterBytesWeakETag(t *testing.T) {
 	_, doc := e.load("docs", "w")
 	sameJSON(t, doc, map[string]any{"a": 5, "b": 1, "c": 3})
 }
+
+// The user's own DELETE forgets the path (§H.4 "Records"), also once
+// its records expired (GW-24), and once the idle user's records are
+// retired past the sweep: a new file over that delete, JSON or raw, is
+// made anew a day later, and saved again after that, where the lost
+// marks would have refused it as a save over someone else's delete (and
+// refused every save after it from a mount, which never reads a name its
+// listing lacks), or refused the save after it. A file someone else
+// deleted after the user read it is still refused.
+func TestV073OwnDeleteAfterRetire(t *testing.T) {
+	t.Parallel()
+	c := newClock()
+	e := newEnv(t, []string{"docs"}, nil, nil, func(_ *clienttest.Options, o *dav.Options) { o.Now = c.now })
+	o := e.another()
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "1"}`), 201, "PUT x.json")
+	e.expect(e.do("DELETE", "/docs/x.json", ""), 204, "the user's own DELETE of x.json")
+	e.expect(e.do("PUT", "/docs/r.txt", "one"), 201, "PUT r.txt")
+	e.expect(e.do("DELETE", "/docs/r.txt", ""), 204, "the user's own DELETE of r.txt")
+	e.expect(e.do("PUT", "/docs/w.json", `{"a": "1"}`), 201, "PUT w.json")
+	e.expect(e.do("DELETE", "/docs/w.json", ""), 204, "the user's own DELETE of w.json")
+	e.create("docs", "z", map[string]any{"a": "1"})
+	e.expect(e.do("GET", "/docs/z.json", ""), 200, "GET z.json")
+	o.expect(o.do("DELETE", "/docs/z.json", ""), 204, "someone else's DELETE of z.json")
+
+	// Expired, the user still active: not swept.
+	c.add(20 * time.Hour)
+	e.create("docs", "a", map[string]any{"a": "1"})
+	e.expect(e.do("GET", "/docs/a.json", ""), 200, "the user reads another file")
+	c.add(5 * time.Hour)
+	e.expect(e.do("PUT", "/docs/w.json", `{"a": "new"}`), 201, "PUT a new w.json over the user's own delete, a day later")
+	e.expect(e.do("PUT", "/docs/w.json", `{"a": "newer"}`), 201, "PUT w.json again")
+	_, doc := e.load("docs", "w")
+	sameJSON(t, doc, map[string]any{"a": "newer"})
+
+	// Retired.
+	c.add(25 * time.Hour)
+	e.expect(e.do("PROPFIND", "/", "", "Depth", "0"), 207, "a request after a day (sweeps)")
+	c.add(2 * time.Minute)
+	e.expectTombstoned("docs", "x", "x before the new file")
+	e.expect(e.do("PUT", "/docs/x.json", `{"a": "new"}`), 201, "PUT a new x.json over the user's own delete, after the sweep")
+	_, doc = e.load("docs", "x")
+	sameJSON(t, doc, map[string]any{"a": "new"})
+	e.expect(e.do("PUT", "/docs/r.txt", "new"), 201, "PUT a new r.txt over the user's own delete, after the sweep")
+	c.add(time.Minute)
+	e.expect(e.do("PUT", "/docs/r.txt", "newer"), 201, "PUT r.txt again, without a GET")
+	if _, data := e.rawOf("docs", "r.txt"); string(data) != "newer" {
+		t.Fatalf("r.txt reads %q", data)
+	}
+	e.expect(e.do("PUT", "/docs/z.json", `{"a": "mine"}`), 409, "PUT z.json over someone else's delete, after the sweep")
+	e.expectTombstoned("docs", "z", "z after the refusal")
+}

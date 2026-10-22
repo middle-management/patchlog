@@ -251,7 +251,8 @@ func (st *reqState) tombBase(ctx context.Context, ns, name string, h *client.Hea
 // tombLast is tombBase but for refusedSave.
 func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Head) (*docEntry, error) {
 	own := st.p.deletedOwn(ns, name, h.ID, st.s.opt.Now())
-	if !own && !st.s.ownEntry(st.p, ns, name, h.ID) && st.hasBase(ns, name) {
+	mine := own || st.s.ownEntry(st.p, ns, name, h.ID)
+	if !mine && st.hasBase(ns, name) {
 		st.refuse(ns, name)
 		return nil, fail(http.StatusConflict, "%s/%s was deleted by someone else since you opened it (§11.3, §H.4): your save isn't written over the delete; reload it (it reads as gone), and save it again to make it anew", ns, name)
 	}
@@ -274,6 +275,12 @@ func (st *reqState) tombLast(ctx context.Context, ns, name string, h *client.Hea
 		if err := movedAway(ns, name, h, last); err != nil {
 			return nil, err
 		}
+	}
+	if !own && mine {
+		// The user's own DELETE, written before ownDeleteUndo, forgot
+		// the path (§H.4 "Records"): the file is made anew, from no
+		// records.
+		st.s.forgetDoc(st.p, ns, name)
 	}
 	if !own || last == nil {
 		return nil, nil
