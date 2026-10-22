@@ -60,6 +60,10 @@ func TestVisibilityRulesV038(t *testing.T) {
 	placed := func(token, item string) bool {
 		t.Helper()
 		r, _ := w.follow("/cat/where?item="+item, token)
+		if r.status == 404 {
+			// Hidden, or not in the catalog (§B.5, §B.11.5).
+			return false
+		}
 		if r.status != 200 {
 			t.Fatalf("where %s: %d %v", item, r.status, r.body)
 		}

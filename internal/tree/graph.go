@@ -79,6 +79,16 @@ type Node struct {
 	ItemTitle        string    // the string at the catalog's title pointer in that head (§B.5), "" if none
 	ItemFile         *FileMeta // the head's file metadata in a file tree (§H.3), nil if none
 
+	// Born is the created of the first revision of the node's document
+	// (§B.5): the catalog resource's, or for an implicit placement the
+	// content document's; "" where the service doesn't know it.
+	Born string
+	// BornUnknown records that Born can't be known for the node's chain
+	// (a prune cut it, so its log from genesis is 410), or isn't read for
+	// it (an implicit placement whose item is in a sealed or e2e
+	// namespace, §B.9): it isn't asked for again until the chain changes.
+	BornUnknown bool
+
 	// Derived by analyze.
 	State      int    // StateLive or StateDangling
 	Dangling   string // why a placement is dangling: missing, tombstoned, purged, untrusted, invalid
@@ -145,7 +155,10 @@ type Graph struct {
 	HasTitle bool
 	// Files is set when catalog.files makes the catalog a file tree
 	// (§H.2): placements then carry their item's file metadata (§H.3).
-	Files bool
+	// FilesRoot is then catalog.files.root, the folder whose children are
+	// the tree's top level, which lookup starts from (§B.5).
+	Files     bool
+	FilesRoot string
 	// Content is each followed content namespace's document as of the
 	// checkpoint the service reflects for it, so what depends on roles and
 	// keys is pinned to the combined checkpoint (§B.11.5).
@@ -161,9 +174,13 @@ type Graph struct {
 	nodes    map[string]*Node // merged: explicit, else implicit
 	explicit map[string]*Node
 	self     map[string]*Node
-	children map[string]map[string]bool // parent name -> child names (every declared edge)
-	sccs     [][]string                 // cycles found by the last analysis
-	saved    map[string]*savedRow       // derived state the nodes/edges tables hold
+	// explicitGone are the placement names whose explicit placement was
+	// deleted or purged: it still wins over $parents (§B.9), so their
+	// implicit placements stay out of the merged nodes.
+	explicitGone map[string]bool
+	children     map[string]map[string]bool // parent name -> child names (every declared edge)
+	sccs         [][]string                 // cycles found by the last analysis
+	saved        map[string]*savedRow       // derived state the nodes/edges tables hold
 }
 
 // NSConfig is a content namespace's document as of the checkpoint the
@@ -177,7 +194,7 @@ type NSConfig struct {
 
 func newGraph(catalog string) *Graph {
 	return &Graph{Catalog: catalog, Trust: map[string]bool{}, Content: map[string]*NSConfig{}, nodes: map[string]*Node{},
-		explicit: map[string]*Node{}, self: map[string]*Node{}, children: map[string]map[string]bool{},
+		explicit: map[string]*Node{}, self: map[string]*Node{}, explicitGone: map[string]bool{}, children: map[string]map[string]bool{},
 		saved: map[string]*savedRow{}}
 }
 
@@ -246,9 +263,9 @@ type Child struct {
 }
 
 // Children returns the walkable children of a folder (edges in state
-// EdgeValid), sorted: ordered siblings by order (code unit order), then
-// unordered ones, then by name (§B.2). Dangling placements are included;
-// callers filter with Live.
+// EdgeValid), sorted: ordered siblings by order (compared by UTF-8 bytes),
+// then unordered ones, then by name (§B.2). Dangling placements are
+// included; callers filter with Live.
 func (g *Graph) Children(parent string) []Child {
 	var out []Child
 	for c := range g.children[parent] {
@@ -267,35 +284,33 @@ func (g *Graph) Children(parent string) []Child {
 	return out
 }
 
+// childLess orders siblings (§B.2): ordered ones first, by order compared
+// by UTF-8 bytes (Go's string order), then by node name.
 func childLess(a, b Child) bool {
 	if a.HasOrder != b.HasOrder {
 		return a.HasOrder
 	}
 	if a.HasOrder && a.Order != b.Order {
-		return lessUTF16(a.Order, b.Order)
+		return a.Order < b.Order
 	}
 	return a.Node.Name < b.Node.Name
 }
 
-// lessUTF16 compares by UTF-16 code units (§B.2 "compared by code unit").
-func lessUTF16(a, b string) bool {
-	ar, br := []rune(a), []rune(b)
-	for i := 0; i < len(ar) && i < len(br); i++ {
-		if ar[i] == br[i] {
-			continue
-		}
-		return utf16Key(ar[i]) < utf16Key(br[i])
+// DeclaredChildren returns the names of the nodes whose parents (or
+// accepted $parents, §B.9) declare an edge to parent, valid or not,
+// sorted; nil if none. Hidden nodes' edges count too: a name some parents
+// entry names is taken (§B.11.4).
+func (g *Graph) DeclaredChildren(parent string) []string {
+	m := g.children[parent]
+	if len(m) == 0 {
+		return nil
 	}
-	return len(ar) < len(br)
-}
-
-// utf16Key maps a rune to a key ordering like its first UTF-16 code unit
-// (surrogates, 0xD800–0xDFFF, sort before 0xE000–0xFFFF).
-func utf16Key(r rune) int {
-	if r >= 0x10000 {
-		return 0xD800 + int((r-0x10000)>>10)
+	out := make([]string, 0, len(m))
+	for c := range m {
+		out = append(out, c)
 	}
-	return int(r)
+	sort.Strings(out)
+	return out
 }
 
 // Descendants returns names reachable downward from names over every
@@ -350,11 +365,12 @@ func (g *Graph) unlink(n *Node) {
 }
 
 // refresh recomputes the merged node for name after explicit or self
-// changed, keeping item state.
+// changed, keeping item state. An explicit placement wins over $parents
+// whether live, deleted or purged (§B.9).
 func (g *Graph) refresh(name string) {
 	old := g.nodes[name]
 	nw := g.explicit[name]
-	if nw == nil {
+	if nw == nil && !g.explicitGone[name] {
 		nw = g.self[name]
 	}
 	if old == nw {
@@ -383,12 +399,26 @@ func (g *Graph) setExplicit(n *Node) {
 		n.copyItem(s)
 	}
 	g.explicit[n.Name] = n
+	delete(g.explicitGone, n.Name)
 	g.refresh(n.Name)
 }
 
 func (g *Graph) removeExplicit(name string) {
 	delete(g.explicit, name)
 	g.refresh(name)
+}
+
+// retireExplicit removes the explicit node name, deleted or purged, and
+// records a placement's as gone: it keeps winning over $parents (§B.9).
+// It reports whether name was recorded.
+func (g *Graph) retireExplicit(name string) bool {
+	delete(g.explicit, name)
+	gone := strings.Contains(name, ".")
+	if gone {
+		g.explicitGone[name] = true
+	}
+	g.refresh(name)
+	return gone
 }
 
 func (g *Graph) setSelf(n *Node) {

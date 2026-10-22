@@ -1,6 +1,9 @@
 package tree
 
-import "sort"
+import (
+	"sort"
+	"strings"
+)
 
 // Hypothetical graphs, for tools that judge a change before it is made: the
 // merge service classifying a catalog branch's changes as narrowing or
@@ -38,18 +41,29 @@ func BuildGraph(catalog string, config map[string]any, docs map[string]any) *Gra
 
 // With returns a copy of g in which changes (node name -> document, or nil
 // to remove the node) replace explicit nodes. Implicit placements and
-// item states are kept; a new placement's item counts as live. g itself is
-// not changed, so With may be called under the service's read lock.
+// item states are kept; a new placement's item counts as live, and a
+// removed explicit placement still wins over $parents, as a deleted one
+// does (§B.9). g itself is not changed, so With may be called under the
+// service's read lock.
 func (g *Graph) With(changes map[string]any) *Graph {
 	h := newGraph(g.Catalog)
 	h.Config, h.Trust = g.Config, map[string]bool{}
 	h.TitlePtr, h.HasTitle = g.TitlePtr, g.HasTitle
+	h.Files, h.FilesRoot = g.Files, g.FilesRoot
 	for ns := range g.Trust {
 		h.Trust[ns] = true
 	}
 	h.Aliases = g.Aliases
 	for ns, c := range g.Content {
 		h.Content[ns] = c
+	}
+	for name := range g.explicitGone {
+		h.explicitGone[name] = true
+	}
+	for name, doc := range changes {
+		if doc == nil && g.explicit[name] != nil && strings.Contains(name, ".") {
+			h.explicitGone[name] = true
+		}
 	}
 	for name, n := range g.self {
 		c := *n

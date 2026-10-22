@@ -26,7 +26,9 @@ import (
 // request. Items of every trusted namespace get it, not only files.ns,
 // including implicit placements (§B.9). In sealed (E2) namespaces it is
 // read with keys and sealed per entry under the item's K_r when listed
-// (§E.2.6); at E3 it is left out. When catalog.files appears, every live
+// (§E.2.6); at E3 it is absent, and the listing says so ({ "absent":
+// "e2e" }), as it says a head not read for it is ({ "absent": "pending"
+// }, query.file). When catalog.files appears, every live
 // item's head is read for it, and when it goes, the metadata does
 // (refile).
 
@@ -95,8 +97,19 @@ func isFileTree(doc map[string]any) bool {
 	cat, _ := doc["catalog"].(map[string]any)
 	f, _ := cat["files"].(map[string]any)
 	ns, _ := f["ns"].(string)
+	return client.ValidNSName(ns) && filesRoot(doc) != ""
+}
+
+// filesRoot is catalog.files.root (§H.2), the node name of the folder
+// whose children are a file tree's top level; "" if it isn't one.
+func filesRoot(doc map[string]any) string {
+	cat, _ := doc["catalog"].(map[string]any)
+	f, _ := cat["files"].(map[string]any)
 	root, _ := f["root"].(string)
-	return client.ValidNSName(ns) && client.ValidResourceName(root) && !strings.Contains(root, ".")
+	if !client.ValidResourceName(root) || strings.Contains(root, ".") {
+		return ""
+	}
+	return root
 }
 
 // refiling is what a change of catalog.files does to the items (refile):
@@ -266,10 +279,10 @@ func (s *Service) backfillFiles(ctx context.Context) error {
 	return nil
 }
 
-// retryBackfill runs backfillFiles until it succeeds or ctx is done, with
-// the pauses a follower makes between attempts: the core may not be up
-// yet when the service starts.
-func (s *Service) retryBackfill(ctx context.Context) {
+// retryBackfill runs fill (backfillFiles, backfillNodes) until it
+// succeeds or ctx is done, with the pauses a follower makes between
+// attempts: the core may not be up yet when the service starts.
+func (s *Service) retryBackfill(ctx context.Context, what string, fill func(context.Context) error) {
 	pause := time.Second
 	for {
 		t := time.NewTimer(pause)
@@ -279,11 +292,11 @@ func (s *Service) retryBackfill(ctx context.Context) {
 			return
 		case <-t.C:
 		}
-		err := s.backfillFiles(ctx)
+		err := fill(ctx)
 		if err == nil || ctx.Err() != nil {
 			return
 		}
-		s.opt.Logf("tree: file metadata: %v; retrying", err)
+		s.opt.Logf("tree: %s: %v; retrying", what, err)
 		if pause < 30*time.Second {
 			pause *= 2
 		}
@@ -301,6 +314,7 @@ type fileSealing struct {
 	on   bool
 	keys map[string]derived.Key // by the namespace read (Graph.Actual)
 	omit map[string]bool
+	e2e  map[string]bool // omitted as end-to-end (§H.3 absent: e2e)
 }
 
 // seals reports whether listings seal file metadata.
@@ -326,7 +340,7 @@ func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 		}
 	}
 	s.mu.RUnlock()
-	fs := &fileSealing{on: on, keys: map[string]derived.Key{}, omit: map[string]bool{}}
+	fs := &fileSealing{on: on, keys: map[string]derived.Key{}, omit: map[string]bool{}, e2e: map[string]bool{}}
 	if !on {
 		return fs, nil
 	}
@@ -343,7 +357,7 @@ func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 		case err != nil:
 			return nil, fmt.Errorf("%w of %s: %w", errFileKeys, ns, err)
 		case in.Level == derived.LevelE2E:
-			fs.omit[ns] = true
+			fs.omit[ns], fs.e2e[ns] = true, true
 		case in.Level == derived.LevelSealed:
 			fs.keys[ns] = key
 		}
@@ -351,15 +365,23 @@ func (s *Service) fileSealing(ctx context.Context) (*fileSealing, error) {
 	return fs, nil
 }
 
-// file is n's file metadata as a listing gives it (fileSealing), or nil.
+// file is the file member of n, a placement whose head a listing shows,
+// in a file tree (§H.3): its file metadata (fileSealing), or why the
+// service can't give it, { "absent": "e2e" } for an item of an e2e
+// namespace and { "absent": "pending" } for a head it hasn't read for
+// it, or can't (keys it can't have), which a tool reads from the core;
+// nil outside a file tree.
 func (q *query) file(n *Node) any {
 	fs := q.files
-	if fs == nil || !fs.on || n.ItemFile == nil {
+	if fs == nil || !fs.on {
 		return nil
 	}
 	ns := q.g.Actual(n.ItemNS)
-	if fs.omit[ns] {
-		return nil
+	switch {
+	case fs.e2e[ns]:
+		return map[string]any{"absent": "e2e"}
+	case n.ItemFile == nil || fs.omit[ns]:
+		return map[string]any{"absent": "pending"}
 	}
 	k, sealed := fs.keys[ns]
 	if !sealed {

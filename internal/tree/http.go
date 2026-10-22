@@ -15,6 +15,7 @@ import (
 	"github.com/middle-management/patchlog/internal/client"
 	"github.com/middle-management/patchlog/internal/derived"
 	"github.com/middle-management/patchlog/internal/edge"
+	"github.com/middle-management/patchlog/internal/files"
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/grantcheck"
 	"github.com/middle-management/patchlog/internal/ids"
@@ -54,6 +55,9 @@ const (
 	maxSubtreeNodes = 5000
 	maxManifest     = 10000
 	maxTags         = 200
+	// keptChildren bounds the children of the pages a children listing
+	// computes and keeps after the one asked for (query.children).
+	keptChildren = 10 * maxLimit
 	// keepBytes bounds the listings kept past their at (package kept).
 	keepBytes = 64 << 20
 )
@@ -402,7 +406,7 @@ func ScopeDigest(v *grant.Verified) string {
 }
 
 var ops = map[string]bool{
-	"children": true, "ancestors": true, "subtree": true, "roots": true,
+	"children": true, "lookup": true, "ancestors": true, "subtree": true, "roots": true,
 	"orphans": true, "problems": true, "where": true, "manifest": true,
 }
 
@@ -417,11 +421,11 @@ var ops = map[string]bool{
 // checkpoint (§B.11.5); the form before v0.51,
 // /{catalog}/at/{at}/g/{gs}/{op}?…, is moved permanently (301) to it. op
 // is one of
-// children?of=&after=&limit=, ancestors?of=, subtree?of=&depth=, roots,
-// orphans, problems, where?item=, manifest?of=.
+// children?of=&after=&limit=, lookup?path=, ancestors?of=,
+// subtree?of=&depth=, roots, orphans, problems, where?item=, manifest?of=.
 //
-// children, ancestors, subtree, roots and where show the nodes the reader
-// may see, and only paths through visible folders, with no trace of hidden
+// children, lookup, ancestors, subtree, roots and where show the nodes the
+// reader may see, and only paths through visible folders, with no trace of hidden
 // nodes (no counts); limits, cut markers and pagination count visible
 // nodes only (§B.11.5). orphans, problems and manifest aren't filtered:
 // they answer 403 unless the reader reads the catalog and the content
@@ -434,7 +438,9 @@ var ops = map[string]bool{
 // (viewer.shape), and answered 200 at its at however far the checkpoint
 // moves meanwhile, so one redirect suffices (§A.4 "Bounded redirects",
 // §B.5 "only if it is current or that exact result was stored"); any other
-// at is redirected to the current one. A purge drops the kept listings
+// at is redirected to the current one. A children page is kept with the
+// pages after it, so a tool following next pages through the folder as
+// it is at that at (query.children). A purge drops the kept listings
 // that carry a tag it purges. Listings whose answer depends on more than
 // the reader's URL space (perReader) aren't kept.
 //
@@ -458,7 +464,8 @@ var ops = map[string]bool{
 // it is "file": { "sealed": JWE of { file } } under the item's own K_r,
 // kid its namespace's current epoch, pl { ns, name, view } of the item, so
 // readers given K_r by /read-grants open it, whatever the catalog's level;
-// for an e2e item it is left out. A listing holding any sealed file is
+// for an e2e item it is { "absent": "e2e" }, and { "absent": "pending" }
+// for a head not read for it yet (§H.3). A listing holding any sealed file is
 // stored and served unchanged like a sealed catalog's. While a sealed
 // namespace's key can't be had for the moment, listings are 503, no-store
 // (fileSealing). The "file": { "sealed" } form, and its nesting inside a
@@ -466,9 +473,10 @@ var ops = map[string]bool{
 // per-entry "sealed" member for values of one source (the catalog's
 // titles), and no form yet for values another namespace's resource gives.
 //
-// A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles are
-// the only values a listing takes from the catalog's content (names,
-// heads, hrefs, structure, order and cursors stay in the clear, and
+// A sealed or e2e catalog (§E.2.5, §E.2.6; package derived). Titles and
+// born are the only values a listing takes from the catalog's content
+// (names, heads, hrefs, structure, order and cursors, which are positions,
+// stay in the clear, and
 // content namespaces contribute nothing else but file metadata, sealed on
 // its own), so the catalog is the one source of what a listing seals
 // whole. A reader of the whole catalog gets the listing sealed as
@@ -476,9 +484,9 @@ var ops = map[string]bool{
 // application/jose, pl { ns, view } where view is the listing's request
 // target (/{catalog}[/g/{gs}]/at/{at}/{op}?{query}, the canonical form). A
 // reader whose grant restricts catalog resources (or who sees nodes only
-// through roles) gets JSON in which every node with a title carries
-// "sealed": JWE of { title } under that catalog resource's K_r, pl { ns,
-// name, view }, instead of "title". Sealed listings are produced once per
+// through roles) gets JSON in which every node with a title or born
+// carries "sealed": JWE of { title?, born? } under that catalog
+// resource's K_r, pl { ns, name, view }, in their place. Sealed listings are produced once per
 // view (a rotation moves at), stored in the database with their cache
 // tags, and served unchanged, across restarts, until a purge with one of
 // those tags or a new at retires them (derived.Cache).
@@ -652,12 +660,8 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 			w.Header().Add("Vary", "Authorization")
 		}
 	}
-	if status, code, msg := s.awaitMins(ctx, vals["min"], Bearer(r)); status != 0 {
-		w.Header().Set("Cache-Control", "no-store")
-		if status == http.StatusServiceUnavailable {
-			w.Header().Set("Retry-After", "1")
-		}
-		WriteError(w, status, code, msg)
+	if a := s.awaitMins(ctx, vals["min"], Bearer(r)); a.status != 0 {
+		a.write(w)
 		return
 	}
 	if ns := s.behind(); ns != "" {
@@ -676,7 +680,7 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 	// listing is bound to (§E.2.6). Only it is answered 200: another form
 	// of it, or one with min, is redirected.
 	canon := func(at string) string { return target(at) + derived.CanonicalQuery(vals, "min") }
-	keyOf := func(at string) string { return canon(at) + "\n" + v.shape() }
+	keyOf := func(at string) string { return listingKey(canon(at), v) }
 	keep := !perReader(op, v)
 	var cur string
 	s.View(func(g *Graph, curMap map[string]string) { cur, _ = CombinedAt(g, curMap) })
@@ -742,7 +746,9 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		s.opt.Logf("tree: keys of %s: %v", cat, err)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals listings of the catalog")
+		// Keys it can't fetch yet are a view it hasn't caught up with
+		// (§12.1 behind, §E.2.6).
+		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key that seals listings of the catalog yet")
 		return
 	}
 	l, err := s.listing(ctx, v, op, vals, canon, keyOf, info, key)
@@ -751,12 +757,16 @@ func (s *Service) serve(w http.ResponseWriter, r *http.Request, op, at, gs strin
 		s.opt.Logf("tree: %v", err)
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Retry-After", "5")
-		WriteError(w, http.StatusServiceUnavailable, "keys", "the service cannot obtain the key that seals the file metadata of a trusted namespace")
+		WriteError(w, http.StatusServiceUnavailable, "behind", "the service cannot obtain the key that seals the file metadata of a trusted namespace yet")
 	case err != nil:
 		s.opt.Logf("tree: sealing a listing: %v", err)
 		WriteError(w, http.StatusInternalServerError, "internal", "sealing failed")
 	case l.status != http.StatusOK:
-		WriteError(w, l.status, codeFor(l.status), l.msg)
+		code := l.code
+		if code == "" {
+			code = codeFor(l.status)
+		}
+		WriteError(w, l.status, code, l.msg)
 	case l.at != at:
 		// The checkpoint moved since the check: the listing is kept at
 		// the new one.
@@ -793,11 +803,12 @@ func (s *Service) purgedHead(err error) string {
 }
 
 // computed is a listing computed at an at, or why there is none (status,
-// msg).
+// msg, and code where it isn't the status's, codeFor).
 type computed struct {
 	st     derived.Stored
 	at     string
 	status int
+	code   string
 	msg    string
 }
 
@@ -814,6 +825,12 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	fs, err := s.fileSealing(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if op == "lookup" && (!fs.on || info.Protected()) {
+		// Titles to look up by are a file tree's, and in the clear only
+		// outside sealed and e2e catalogs (§B.5, §H.3).
+		return &computed{at: s.At(), status: http.StatusNotFound, code: "not_offered",
+			msg: "lookup is offered only in a file tree (catalog.files) that is neither sealed nor end-to-end"}, nil
 	}
 	// A listing that seals values, the catalog's or an item's file
 	// metadata, is sealed once and then served unchanged (§E.2.6).
@@ -835,19 +852,27 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	)
 	perEntry := info.Protected() && !v.catAll
 	var cps map[string]string
+	var more []keptPage
 	s.View(func(g *Graph, curMap map[string]string) {
 		l.at, nss = CombinedAt(g, curMap)
 		cps = checkpointsOf(g, curMap)
 		view = derived.View{NS: cat, Target: canon(l.at)}
 		q := &query{s: s, g: g, v: v, vals: vals, tags: tagSet{}, at: l.at, files: fs, view: view, serr: &serr}
 		if perEntry {
-			q.sealTitle = func(name, title string) string {
-				jwe, err := derived.SealItem(key, view, name, map[string]any{"title": title})
+			q.sealValues = func(name string, vals map[string]any) string {
+				jwe, err := derived.SealItem(key, q.view, name, vals)
 				if err != nil && serr == nil {
 					serr = err
 				}
 				return jwe
 			}
+		}
+		if op == "children" && keep {
+			// The following pages are kept with this one, each at its own
+			// URL: the same at with the query their next gives.
+			path, _, _ := strings.Cut(view.Target, "?")
+			q.pages = &more
+			q.pageView = func(query string) derived.View { return derived.View{NS: cat, Target: path + query} }
 		}
 		body, l.status, l.msg = q.run(op)
 		tags = q.tags
@@ -855,15 +880,23 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 	if l.status != http.StatusOK {
 		return l, nil
 	}
-	l.st = derived.Stored{JSON: true, Tags: tags.header(cat, nss)}
-	if serr == nil && info.Protected() && !perEntry {
-		var jwe string
-		jwe, serr = derived.SealView(key, view, body)
-		l.st.Body, l.st.JSON = []byte(jwe), false
-	} else if serr == nil {
-		l.st.Body, serr = derived.Marshal(body)
+	// stored is a computed page as it is served: sealed whole, or JSON.
+	stored := func(view derived.View, body any, tags tagSet) (derived.Stored, error) {
+		st := derived.Stored{JSON: true, Tags: tags.header(cat, nss)}
+		var err error
+		if info.Protected() && !perEntry {
+			var jwe string
+			jwe, err = derived.SealView(key, view, body)
+			st.Body, st.JSON = []byte(jwe), false
+		} else {
+			st.Body, err = derived.Marshal(body)
+		}
+		return st, err
 	}
 	if serr != nil {
+		return nil, serr
+	}
+	if l.st, serr = stored(view, body, tags); serr != nil {
 		return nil, serr
 	}
 	if !keep {
@@ -871,10 +904,26 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 		// the reader.
 		return l, nil
 	}
+	type page struct {
+		key string
+		st  derived.Stored
+	}
+	pages := []page{{keyOf(l.at), l.st}}
+	for _, p := range more {
+		st, err := stored(p.view, p.body, p.tags)
+		if err != nil {
+			// Computed when asked for, as without it.
+			s.opt.Logf("tree: sealing a following page: %v", err)
+			break
+		}
+		pages = append(pages, page{listingKey(p.view.Target, v), st})
+	}
 	if sealed {
-		var err error
-		if l.st, err = s.sealed.Put(ctx, keyOf(l.at), cat, l.at, l.st); err != nil {
-			s.opt.Logf("tree: storing a sealed listing: %v", err)
+		for i := range pages {
+			var err error
+			if pages[i].st, err = s.sealed.Put(ctx, pages[i].key, cat, l.at, pages[i].st); err != nil {
+				s.opt.Logf("tree: storing a sealed listing: %v", err)
+			}
 		}
 		if cur := s.At(); cur != l.at {
 			// An apply (maybe a purge) committed meanwhile: don't keep a
@@ -884,10 +933,18 @@ func (s *Service) listing(ctx context.Context, v *viewer, op string, vals url.Va
 			}
 		}
 	}
-	l.st, _ = s.kept.Put(keyOf(l.at), cat, gen, sealed, l.st)
+	for i := range pages {
+		pages[i].st, _ = s.kept.Put(pages[i].key, cat, gen, sealed, pages[i].st)
+	}
+	l.st = pages[0].st
 	s.recordAt(l.at, cps)
 	return l, nil
 }
+
+// listingKey is what a listing at url is stored and kept under for reader
+// v: the URL and the reader's shape, since a namespace that turns private
+// moves no URL (viewer.shape).
+func listingKey(url string, v *viewer) string { return url + "\n" + v.shape() }
 
 // atRecord is what a combined at is over: each namespace's checkpoint, by
 // the name listings and min use (in a release preview, the base's).
@@ -1151,9 +1208,18 @@ type minRef struct{ ns, id string }
 // the service has reached every one (waiting up to MinWait), else the
 // status and error to answer with: 400 for a malformed min or one naming a
 // namespace the service doesn't follow, 503 (with Retry-After) while it is
-// behind. Services of the addenda use it for the endpoints that take min.
+// behind. A min naming a namespace the service holds as purged counts as
+// reached. Services of the addenda use it for the endpoints that take min.
 func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, code, msg string) {
-	return s.awaitMins(ctx, vals, "")
+	a := s.awaitMins(ctx, vals, "")
+	return a.status, a.code, a.msg
+}
+
+// AwaitMinsRefused is AwaitMins with, for a 400, the mins it refuses as
+// given, which the body of the 400 lists as min (§A.5).
+func (s *Service) AwaitMinsRefused(ctx context.Context, vals []string) (status int, code, msg string, refused []string) {
+	a := s.awaitMins(ctx, vals, "")
+	return a.status, a.code, a.msg, a.refused
 }
 
 // minElsewhere is the 400 for a min naming a namespace that neither the
@@ -1162,49 +1228,120 @@ func (s *Service) AwaitMins(ctx context.Context, vals []string) (status int, cod
 // exist.
 const minElsewhere = "min names a namespace the service does not follow or the reader can't see"
 
+// minAnswer is the answer to a request whose mins can't all be waited for
+// (§A.5): status 0 once every one is reached; else the status, code and
+// message, and, for a 400, refused, every min refused as given, which the
+// body lists as min, so a tool drops those.
+type minAnswer struct {
+	status    int
+	code, msg string
+	refused   []string
+}
+
+// write writes a: no-store, Retry-After on a 503.
+func (a minAnswer) write(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	if a.status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "1")
+	}
+	body := map[string]any{"code": a.code, "message": a.msg}
+	if len(a.refused) > 0 {
+		body["min"] = a.refused
+	}
+	WriteJSON(w, a.status, body)
+}
+
 // awaitMins is AwaitMins for a reader presenting token ("" for none).
 // Behind Multi, a min naming a namespace that another catalog's service
 // follows, and that the reader may see (public, or its grant reads it),
 // is waited for there: this catalog's at doesn't cover it, so the
-// listing then redirects to the current at in one hop (§A.5, §B.5).
-func (s *Service) awaitMins(ctx context.Context, vals []string, token string) (status int, code, msg string) {
-	mins, err := parseMins(vals)
-	if err != nil {
-		return http.StatusBadRequest, "bad_input", err.Error()
-	}
+// listing then redirects to the current at in one hop (§A.5, §B.5). A min
+// naming a namespace this service or a sibling holds as purged counts as
+// reached, without a read check: a purge is no secret (§A.5, §E.4).
+func (s *Service) awaitMins(ctx context.Context, vals []string, token string) minAnswer {
 	var own []minRef
 	other := map[*Service][]minRef{}
-	for _, m := range mins {
+	var refused []string
+	malformed := ""
+	for _, raw := range vals {
+		m, err := parseMin(raw)
+		if err != nil {
+			refused = append(refused, raw)
+			if malformed == "" {
+				malformed = err.Error()
+			}
+			continue
+		}
 		// A preview's readers write to the branches, so min names them.
 		m.ns = s.logical(m.ns)
-		if m.ns == "" || s.follows(m.ns) {
+		if m.ns == "" {
 			own = append(own, m)
+			continue
+		}
+		if s.holdsPurged(m.ns) {
+			continue
+		}
+		if s.follows(m.ns) {
+			own = append(own, m)
+			continue
+		}
+		if s.siblingPurged(m.ns) {
 			continue
 		}
 		o := s.sibling(m.ns)
 		if o == nil {
-			return http.StatusBadRequest, "bad_input", minElsewhere
+			refused = append(refused, raw)
+			continue
 		}
 		switch ok, err := o.sees(ctx, m.ns, token); {
 		case err != nil:
 			s.opt.Logf("tree: access check for %s: %v", m.ns, err)
-			return http.StatusBadGateway, "upstream", "cannot read a namespace configuration"
+			return minAnswer{status: http.StatusBadGateway, code: "upstream", msg: "cannot read a namespace configuration"}
 		case !ok:
-			return http.StatusBadRequest, "bad_input", minElsewhere
+			refused = append(refused, raw)
+			continue
 		}
 		other[o] = append(other[o], m)
 	}
+	if len(refused) > 0 {
+		msg := minElsewhere
+		if malformed != "" {
+			msg = malformed
+		}
+		return minAnswer{status: http.StatusBadRequest, code: "bad_input", msg: msg, refused: refused}
+	}
 	ctx, cancel := context.WithTimeout(ctx, s.opt.MinWait)
 	defer cancel()
+	behind := minAnswer{status: http.StatusServiceUnavailable, code: "behind", msg: "the tree service has not reached min yet"}
 	if !s.waitMins(ctx, own) {
-		return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
+		return behind
 	}
 	for o, ms := range other {
 		if !o.waitMins(ctx, ms) {
-			return http.StatusServiceUnavailable, "behind", "the tree service has not reached min yet"
+			return behind
 		}
 	}
-	return 0, "", ""
+	return minAnswer{}
+}
+
+// holdsPurged reports whether the service holds ns as purged (meta
+// "purged:{ns}"), trusted still or not.
+func (s *Service) holdsPurged(ns string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.purged[ns]
+	return ok
+}
+
+// siblingPurged reports whether the service of another catalog behind the
+// same Multi holds ns as purged.
+func (s *Service) siblingPurged(ns string) bool {
+	for _, o := range s.siblings {
+		if o.holdsPurged(ns) {
+			return true
+		}
+	}
+	return false
 }
 
 // sibling is the service of another catalog behind the same Multi that
@@ -1268,20 +1405,29 @@ func (s *Service) sees(ctx context.Context, ns, token string) (bool, error) {
 func parseMins(vals []string) ([]minRef, error) {
 	var out []minRef
 	for _, v := range vals {
-		var m minRef
-		if i := strings.LastIndexByte(v, ':'); i >= 0 {
-			m.ns, v = v[:i], v[i+1:]
-			if !client.ValidNSName(m.ns) {
-				return nil, errors.New("min: malformed namespace name")
-			}
+		m, err := parseMin(v)
+		if err != nil {
+			return nil, err
 		}
-		if _, err := ids.Parse(v); err != nil {
-			return nil, errors.New("min must be {ns}:{ns_id} or an ns_id")
-		}
-		m.id = v
 		out = append(out, m)
 	}
 	return out, nil
+}
+
+// parseMin parses one ?min= value: {ns}:{ns_id} or a bare {ns_id}.
+func parseMin(v string) (minRef, error) {
+	var m minRef
+	if i := strings.LastIndexByte(v, ':'); i >= 0 {
+		m.ns, v = v[:i], v[i+1:]
+		if !client.ValidNSName(m.ns) {
+			return minRef{}, errors.New("min: malformed namespace name")
+		}
+	}
+	if _, err := ids.Parse(v); err != nil {
+		return minRef{}, errors.New("min must be {ns}:{ns_id} or an ns_id")
+	}
+	m.id = v
+	return m, nil
 }
 
 // waitMins waits up to MinWait until every min is reached: the namespace's
@@ -1402,24 +1548,41 @@ type query struct {
 	vals url.Values
 	tags tagSet
 	at   string
-	// sealTitle, if set, seals a catalog node's title for per-entry
-	// sealing (§E.2.6): the entry carries "sealed" instead of "title".
-	sealTitle func(name, title string) string
+	// sealValues, if set, seals the values an entry takes from the
+	// catalog's content (title, born) for per-entry sealing (§E.2.6): the
+	// entry carries "sealed" in their place.
+	sealValues func(name string, vals map[string]any) string
 	// files says how placements carry file metadata in a file tree
 	// (§H.3), sealed under view; serr records a sealing failure.
 	files *fileSealing
 	view  derived.View
 	serr  *error
+	// pages, where set, collects the pages of a children listing after
+	// the one asked for (children), each sealed under the view pageView
+	// gives for its query, for listing to keep with it.
+	pages    *[]keptPage
+	pageView func(query string) derived.View
+}
+
+// values sets the values an entry of node name takes from the catalog's
+// content (title, born), in the clear or, for per-entry sealing, as one
+// "sealed" JWE of them (§E.2.6).
+func (q *query) values(m map[string]any, name string, vals map[string]any) {
+	switch {
+	case len(vals) == 0:
+	case q.sealValues != nil:
+		m["sealed"] = q.sealValues(name, vals)
+	default:
+		for k, v := range vals {
+			m[k] = v
+		}
+	}
 }
 
 // title sets a node's title on an entry, in the clear or sealed.
 func (q *query) title(m map[string]any, n *Node) {
-	switch {
-	case n.Title == "":
-	case q.sealTitle != nil:
-		m["sealed"] = q.sealTitle(n.Name, n.Title)
-	default:
-		m["title"] = n.Title
+	if n.Title != "" {
+		q.values(m, n.Name, map[string]any{"title": n.Title})
 	}
 }
 
@@ -1427,6 +1590,8 @@ func (q *query) run(op string) (any, int, string) {
 	switch op {
 	case "children":
 		return q.children()
+	case "lookup":
+		return q.lookup()
 	case "ancestors":
 		return q.ancestors()
 	case "subtree":
@@ -1473,15 +1638,34 @@ func (q *query) node(param string) (*Node, int, string) {
 	q.tags.node(q.g, name)
 	n := q.g.Node(name)
 	if n == nil || !q.v.node(q.g, n) {
-		return nil, http.StatusNotFound, "no such node"
+		return nil, http.StatusNotFound, noSuchNode
 	}
 	return n, http.StatusOK, ""
 }
 
+// noSuchNode is the 404 of a parameter naming a node or item not in the
+// catalog, or hidden from the reader: one message, so it doesn't tell
+// them apart (§B.5, §B.11.5).
+const noSuchNode = "no such node"
+
+// entry is a node as listings show it. Its title and born (§B.5) are the
+// values it takes from the catalog's content, sealed per entry where the
+// listing is (values). An implicit placement's born is its item's, the
+// created of the content document's first revision (§B.9): like the
+// item's head and title, it is shown only to readers of the item, and
+// only for items of namespaces that are neither sealed nor e2e, which the
+// service doesn't hold it for (Apply), since §E.2.2 keeps the exact
+// created of their revisions in their logs.
 func (q *query) entry(n *Node) map[string]any {
 	q.tags.node(q.g, n.Name)
 	m := map[string]any{"href": q.g.Href(n.Name), "name": n.Name, "kind": "folder"}
-	q.title(m, n)
+	vals := map[string]any{}
+	if n.Title != "" {
+		vals["title"] = n.Title
+	}
+	if n.Born != "" && !n.Self {
+		vals["born"] = n.Born
+	}
 	if n.Kind == KindPlacement {
 		m["kind"] = "item"
 		if it := n.Item(); it != "" {
@@ -1493,7 +1677,10 @@ func (q *query) entry(n *Node) map[string]any {
 		if q.v.item(q.g, n) && n.ItemHead != "" {
 			if n.Title == "" && n.ItemTitle != "" {
 				// The head's title (§B.5), unless the placement has its own.
-				q.title(m, &Node{Name: n.Name, Title: n.ItemTitle})
+				vals["title"] = n.ItemTitle
+			}
+			if n.Self && n.Born != "" {
+				vals["born"] = n.Born
 			}
 			m["head"] = n.ItemHead
 			// In a release preview the head is the branch's: url reads it
@@ -1510,6 +1697,7 @@ func (q *query) entry(n *Node) map[string]any {
 			m["dangling"] = n.Dangling
 		}
 	}
+	q.values(m, n.Name, vals)
 	return m
 }
 
@@ -1523,21 +1711,39 @@ func (q *query) visibleChildren(parent string) []Child {
 	return out
 }
 
+// limitParam is a children page's limit (§A.4, as /_refs pages): the
+// default without one, 400 for one that isn't a positive integer or is
+// above maxLimit.
 func limitParam(vals url.Values) (int, bool) {
 	l := defaultLimit
 	if s := vals.Get("limit"); s != "" {
 		n, err := strconv.Atoi(s)
-		if err != nil || n < 1 {
+		if err != nil || n < 1 || n > maxLimit {
 			return 0, false
 		}
-		l = min(n, maxLimit)
+		l = n
 	}
 	return l, true
 }
 
-// children lists a folder's direct children, ordered (§B.2), paginated
-// with ?after={order}; next links add &name= (and &unordered=1 past the
-// ordered siblings) to break ties exactly.
+// children lists a folder's direct children, ordered (§B.2), with total,
+// the number of visible children, and each node's born (entry), paginated
+// as /_refs is (§A.4): at most limit, strictly after after, next the query
+// of the following page, absent on the last. after is an opaque position
+// in the listing (childCursor), never an order key, which in a sealed
+// catalog is a value of its content (§E.2.6). A next sent as after, as
+// §A.4 has next be the following page's after, continues where it says
+// (pagingParams). The cursor of earlier releases, after={order} alone or
+// with name= or unordered=1, is still accepted for one release
+// (cursorBefore).
+//
+// The pages after the one asked for are computed with it, at the same
+// at, up to keptChildren children, when q.pages is set (listing keeps
+// them): a tool that follows next at that at is answered there however
+// far the checkpoint moves meanwhile, as long as the pages are kept, so
+// the folder it pages through is one folder (§H.3). A position given at
+// another at, which a redirect leads to once its own at isn't kept,
+// starts the folder again (childCursor.start).
 func (q *query) children() (any, int, string) {
 	n, st, msg := q.node("of")
 	if n == nil {
@@ -1548,71 +1754,258 @@ func (q *query) children() (any, int, string) {
 	}
 	limit, ok := limitParam(q.vals)
 	if !ok {
-		return nil, http.StatusBadRequest, "malformed limit"
+		return nil, http.StatusBadRequest, "limit must be an integer from 1 to " + strconv.Itoa(maxLimit)
 	}
 	kids := q.visibleChildren(n.Name)
-	after, hasAfter := q.vals["after"]
-	cur := Child{Node: &Node{Name: q.vals.Get("name")}}
-	hasName := q.vals.Has("name")
-	if hasAfter {
-		cur.Order, cur.HasOrder = after[0], true
+	start := 0
+	pv := pagingParams(q.vals)
+	after, hasAfter := pv["after"]
+	hasName, legacy := pv.Has("name"), pv.Has("name") || pv.Has("unordered")
+	if hasAfter && !legacy {
+		c, ok := parseCursor(after[0])
+		switch {
+		case ok:
+			start = c.start(kids, q.at)
+		case looksLikeCursor(after[0]):
+			return nil, http.StatusBadRequest, "malformed after: a children listing continues at the query its next gives"
+		default:
+			legacy = true
+		}
 	}
-	if q.vals.Get("unordered") == "1" {
-		cur.HasOrder, hasAfter = false, true
-	}
-	var page []any
-	var last *Child
-	more := false
-	for i := range kids {
-		c := kids[i]
-		if hasAfter || hasName {
-			if !cursorBefore(cur, hasName, c) {
-				continue
+	if legacy {
+		cur := Child{Node: &Node{Name: pv.Get("name")}}
+		if hasAfter {
+			cur.Order, cur.HasOrder = after[0], true
+		}
+		if pv.Get("unordered") == "1" {
+			cur.HasOrder = false
+		}
+		start = len(kids)
+		for i, c := range kids {
+			if cursorBefore(cur, hasName, c) {
+				start = i
+				break
 			}
 		}
-		if len(page) == limit {
-			more = true
-			break
+	}
+	body, end, next := q.childPage(n, kids, start, limit, q.vals)
+	if q.pages != nil {
+		view, tags := q.view, q.tags
+		for from := end; next != nil && end-from < keptChildren; {
+			q.view, q.tags = q.pageView(derived.CanonicalQuery(next)), tagSet{}
+			q.tags.node(q.g, n.Name)
+			var b map[string]any
+			b, end, next = q.childPage(n, kids, end, limit, next)
+			*q.pages = append(*q.pages, keptPage{view: q.view, body: b, tags: q.tags})
 		}
+		q.view, q.tags = view, tags
+	}
+	return body, http.StatusOK, ""
+}
+
+// pagingParams are the parameters of vals that say where a children page
+// starts: after, name and unordered, or, where after is itself a next
+// (a query, "?after=…"), which a client reading §A.4's "next is the after
+// of the following page" sends, the ones in it.
+func pagingParams(vals url.Values) url.Values {
+	if a := vals.Get("after"); strings.HasPrefix(a, "?") {
+		if inner, err := url.ParseQuery(a[1:]); err == nil && len(inner["after"]) == 1 {
+			return inner
+		}
+	}
+	return vals
+}
+
+// keptPage is a page of a children listing computed with the one asked
+// for (query.children), with the view of its own URL and its tags.
+type keptPage struct {
+	view derived.View
+	body any
+	tags tagSet
+}
+
+// childPage is the page of folder n's visible children kids from start,
+// with vals its query, the end of the page in kids, and the query of the
+// following page (nil on the last).
+func (q *query) childPage(n *Node, kids []Child, start, limit int, vals url.Values) (map[string]any, int, url.Values) {
+	page := []any{}
+	end := min(start+limit, len(kids))
+	for _, c := range kids[start:end] {
 		e := q.entry(c.Node)
 		if c.HasOrder {
 			e["order"] = c.Order
 		}
 		page = append(page, e)
-		last = &kids[i]
 	}
-	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "children": nonNil(page)}
-	if more && last != nil {
-		nv := url.Values{}
-		for k, v := range q.vals {
-			nv[k] = v
-		}
-		nv.Del("after")
-		nv.Del("unordered")
-		nv.Del("min")
-		if last.HasOrder {
-			nv.Set("after", last.Order)
-		} else {
-			nv.Set("unordered", "1")
-		}
-		nv.Set("name", last.Node.Name)
-		body["next"] = derived.CanonicalQuery(nv)
+	body := map[string]any{"at": q.at, "of": q.g.Href(n.Name), "children": page, "total": len(kids)}
+	if end == len(kids) {
+		return body, end, nil
 	}
-	return body, http.StatusOK, ""
+	nv := url.Values{}
+	for k, v := range vals {
+		nv[k] = v
+	}
+	for _, k := range []string{"after", "name", "unordered", "min"} {
+		nv.Del(k)
+	}
+	nv.Set("after", childCursor{pos: end, at: q.at, last: kids[end-1].Node.Name}.String())
+	body["next"] = derived.CanonicalQuery(nv)
+	return body, end, nv
 }
 
-// cursorBefore reports whether the cursor sorts before c.
+// childCursor is the position after a page of children (§A.4, §E.2.6):
+// pos, the number of visible children up to the page's end, at, the at of
+// the listing, and last, the node name of the page's last child, all in
+// the clear like the listing's structure, never an order key.
+type childCursor struct {
+	pos      int
+	at, last string
+}
+
+func (c childCursor) String() string { return strconv.Itoa(c.pos) + "~" + c.at + "~" + c.last }
+
+// parseCursor parses a childCursor; ok is false for anything else, such as
+// the order key of an earlier release's cursor.
+func parseCursor(s string) (c childCursor, ok bool) {
+	p, rest, _ := strings.Cut(s, "~")
+	at, last, found := strings.Cut(rest, "~")
+	if !found || p == "" || len(p) > 9 || p[0] == '0' || !client.ValidResourceName(last) {
+		return c, false
+	}
+	for i := 0; i < len(p); i++ {
+		if p[i] < '0' || p[i] > '9' {
+			return c, false
+		}
+	}
+	if _, err := ids.Parse(at); err != nil {
+		return c, false
+	}
+	c.pos, _ = strconv.Atoi(p)
+	c.at, c.last = at, last
+	return c, true
+}
+
+// looksLikeCursor reports whether s has a childCursor's shape, digits, at
+// and a name joined by "~", without being one (a malformed or truncated
+// position, 400) rather than an order key of the earlier releases' cursor.
+func looksLikeCursor(s string) bool {
+	p, rest, found := strings.Cut(s, "~")
+	if !found || p == "" || strings.Trim(p, "0123456789") != "" {
+		return false
+	}
+	_, _, found = strings.Cut(rest, "~")
+	return found
+}
+
+// start is where the page after c starts in kids, the visible children at
+// at: at c.pos, where c was given at this at and its last child is there.
+// A position given at another at (the redirect from an at whose pages are
+// no longer kept) or for another reader says nothing of where that page
+// would start now: children moved, deleted or reordered meanwhile, before
+// it or after, would be skipped. So the folder starts again, and a tool
+// paging it sees some children twice, which is harmless, rather than miss
+// one, which a sync tool takes for a delete (§H.3).
+func (c childCursor) start(kids []Child, at string) int {
+	if c.at == at && c.pos <= len(kids) && kids[c.pos-1].Node.Name == c.last {
+		return c.pos
+	}
+	return 0
+}
+
+// cursorBefore reports whether the cursor of an earlier release (an order
+// key with a node name, §B.2 order by UTF-8 bytes) sorts before c.
 func cursorBefore(cur Child, hasName bool, c Child) bool {
 	if cur.HasOrder != c.HasOrder {
 		return cur.HasOrder // ordered siblings come first
 	}
 	if cur.HasOrder && cur.Order != c.Order {
-		return lessUTF16(cur.Order, c.Order)
+		return cur.Order < c.Order
 	}
 	if !hasName {
 		return false
 	}
 	return cur.Node.Name < c.Node.Name
+}
+
+// lookup answers the node a path of titles, joined with /, names (§B.5):
+// from the folder catalog.files.root of a file tree, or, where it is
+// hidden from the reader, from the reader's roots (§B.11.5), through
+// visible nodes only, as children lists them. Titles compare after NFC and
+// Unicode simple case folding (§H.2, files.TitleKey). Only a node's own
+// title counts: a name a tool shows in its place, numbered as a duplicate
+// or escaped, doesn't resolve, and the tool lists the folder. Where
+// siblings share a title the earliest born answers, then the node name. A
+// path that doesn't resolve to a visible node is 404, with one message
+// whether a node is hidden or missing. It isn't offered outside file
+// trees, nor in sealed or e2e catalogs (listing: 404 not_offered).
+func (q *query) lookup() (any, int, string) {
+	path := q.vals.Get("path")
+	if path == "" {
+		return nil, http.StatusBadRequest, "path is required"
+	}
+	var level []*Node
+	if root := q.g.Node(q.g.FilesRoot); root != nil && root.Live() && root.Kind == KindFolder && q.v.node(q.g, root) {
+		q.tags.node(q.g, root.Name)
+		level = q.childNodes(root.Name)
+	} else {
+		level = q.rootNodes()
+	}
+	segs := strings.Split(path, "/")
+	var n *Node
+	for i, seg := range segs {
+		if n = titled(level, seg); n == nil {
+			return nil, http.StatusNotFound, "no node at that path"
+		}
+		q.tags.node(q.g, n.Name)
+		if i < len(segs)-1 {
+			if n.Kind != KindFolder {
+				return nil, http.StatusNotFound, "no node at that path"
+			}
+			level = q.childNodes(n.Name)
+		}
+	}
+	return map[string]any{"at": q.at, "path": path, "node": q.entry(n)}, http.StatusOK, ""
+}
+
+// childNodes are the nodes of visibleChildren.
+func (q *query) childNodes(parent string) []*Node {
+	kids := q.visibleChildren(parent)
+	out := make([]*Node, len(kids))
+	for i, c := range kids {
+		out[i] = c.Node
+	}
+	return out
+}
+
+// titled is the node of nodes whose own title is title, compared as
+// siblings' are (§H.2, files.TitleKey): of several, the earliest born,
+// then the least node name (§B.5); nil if none.
+func titled(nodes []*Node, title string) *Node {
+	key := files.TitleKey(title, false)
+	var best *Node
+	for _, n := range nodes {
+		if n.Title == "" || files.TitleKey(n.Title, false) != key {
+			continue
+		}
+		if best == nil || bornBefore(n, best) {
+			best = n
+		}
+	}
+	return best
+}
+
+// bornBefore orders siblings that share a title (§B.5, §H.2): by born,
+// those whose born the service doesn't know last, then by node name.
+func bornBefore(a, b *Node) bool {
+	ta, ea := time.Parse(time.RFC3339Nano, a.Born)
+	tb, eb := time.Parse(time.RFC3339Nano, b.Born)
+	switch {
+	case (ea == nil) != (eb == nil):
+		return ea == nil
+	case ea == nil && !ta.Equal(tb):
+		return ta.Before(tb)
+	}
+	return a.Name < b.Name
 }
 
 func nonNil(a []any) []any {
@@ -1622,28 +2015,33 @@ func nonNil(a []any) []any {
 	return a
 }
 
-// paths returns every walkable path from n up to a root through nodes the
-// viewer may see, root first, without n itself, bounded at MaxDepth and
-// maxPaths. incomplete counts paths that end below a root (at a node whose
-// parents are all gone, dangling or cyclic), deep those cut at MaxDepth. A
-// path through a node the viewer may not see is left out without a trace:
-// listings show only paths through visible folders, and nothing about a
-// hidden node, not even a count (§B.11.5), so limits apply to visible
-// paths only.
+// paths returns every walkable path from n up to a root for the viewer
+// through nodes it may see, root first, without n itself, bounded at
+// MaxDepth and maxPaths. A root for the viewer is a node without parents,
+// or a visible one whose parents are all hidden from it, where its paths
+// end (§B.11.5). incomplete counts paths that end below a root (at a node
+// whose parents are all gone, dangling or cyclic), deep those cut at
+// MaxDepth. A path through a node the viewer may not see is left out
+// without a trace: listings show only paths through visible folders, and
+// nothing about a hidden node, not even a count (§B.11.5), so limits apply
+// to visible paths only.
 func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated bool) {
 	var stack []*Node
 	var walk func(x *Node, depth int)
+	end := func() {
+		p := make([]*Node, len(stack))
+		for i := range stack {
+			p[i] = stack[len(stack)-1-i]
+		}
+		paths = append(paths, p)
+	}
 	walk = func(x *Node, depth int) {
 		if len(paths) >= maxPaths {
 			truncated = true
 			return
 		}
 		if len(x.Parents) == 0 && !x.Cyclic {
-			p := make([]*Node, len(stack))
-			for i := range stack {
-				p[i] = stack[len(stack)-1-i]
-			}
-			paths = append(paths, p)
+			end()
 			return
 		}
 		ps := q.g.WalkableParents(x)
@@ -1651,15 +2049,22 @@ func (q *query) paths(n *Node) (paths [][]*Node, incomplete, deep int, truncated
 			incomplete++
 			return
 		}
+		var visible []*Node
+		for _, pn := range ps {
+			if parent := q.g.Node(pn); q.v.node(q.g, parent) {
+				visible = append(visible, parent)
+			}
+		}
+		if len(visible) == 0 {
+			// Every parent is hidden: x is a root for the viewer.
+			end()
+			return
+		}
 		if depth >= MaxDepth {
 			deep++
 			return
 		}
-		for _, pn := range ps {
-			parent := q.g.Node(pn)
-			if !q.v.node(q.g, parent) {
-				continue
-			}
+		for _, parent := range visible {
 			onPath := false
 			for _, s := range stack {
 				if s == parent {
@@ -1782,16 +2187,43 @@ func (q *query) subtree() (any, int, string) {
 	return body, http.StatusOK, ""
 }
 
-// roots lists nodes without parents.
+// roots lists the roots for the reader's subject set (§B.5, §B.11.5):
+// visible nodes without parents, and visible nodes whose parents are all
+// hidden from it.
 func (q *query) roots() (any, int, string) {
 	out := []any{}
-	for _, name := range q.g.Names() {
-		n := q.g.Node(name)
-		if len(n.Parents) == 0 && n.Live() && q.v.node(q.g, n) {
-			out = append(out, q.entry(n))
-		}
+	for _, n := range q.rootNodes() {
+		out = append(out, q.entry(n))
 	}
 	return map[string]any{"at": q.at, "roots": out}, http.StatusOK, ""
+}
+
+// rootNodes are the live nodes that are roots for the viewer, by name.
+func (q *query) rootNodes() []*Node {
+	var out []*Node
+	for _, name := range q.g.Names() {
+		if n := q.g.Node(name); n.Live() && q.v.node(q.g, n) && q.rootFor(n) {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// rootFor reports whether n, visible to the viewer, is a root for it: it
+// has no parents, or every parent a walk may go up to is hidden from it
+// (§B.11.5). A node whose parents are all gone, dangling or cyclic is an
+// orphan (§B.5), not a root.
+func (q *query) rootFor(n *Node) bool {
+	if len(n.Parents) == 0 {
+		return true
+	}
+	ps := q.g.WalkableParents(n)
+	for _, p := range ps {
+		if q.v.node(q.g, q.g.Node(p)) {
+			return false
+		}
+	}
+	return len(ps) > 0
 }
 
 func (q *query) parentsJSON(n *Node) []any {
@@ -1918,7 +2350,9 @@ func (q *query) problems() (any, int, string) {
 }
 
 // where answers "is this item in the catalog, and where?" with its
-// placement and every path to a root.
+// placement and every path to a root. An item not in the catalog, or
+// whose placement is hidden from the reader, is 404 with one message, as
+// a parameter naming a node not in the catalog is (§B.5, §B.11.5).
 func (q *query) where() (any, int, string) {
 	ref := q.vals.Get("item")
 	ns, name, ok := ParseHref(ref)
@@ -1927,12 +2361,11 @@ func (q *query) where() (any, int, string) {
 	}
 	pl := ns + "." + name
 	q.tags.node(q.g, pl)
-	body := map[string]any{"at": q.at, "item": ref, "placement": nil}
 	n := q.g.Node(pl)
 	if n == nil || !q.v.node(q.g, n) {
-		return body, http.StatusOK, ""
+		return nil, http.StatusNotFound, noSuchNode
 	}
-	body["placement"] = q.entry(n)
+	body := map[string]any{"at": q.at, "item": ref, "placement": q.entry(n)}
 	ps, incomplete, deep, trunc := q.paths(n)
 	body["paths"] = q.pathJSON(ps)
 	if incomplete > 0 {
