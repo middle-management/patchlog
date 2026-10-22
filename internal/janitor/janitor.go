@@ -30,11 +30,19 @@
 //     branch's log has no head, tombstone or batch entry after that
 //     source.at. Config, prune and propagated purge entries are allowed. A
 //     base without merge.authors never verifies a merged claim this way.
-//   - superseded: the successor exists, isn't purged, has the same base
-//     namespace, and its log has a batch without origin whose source.ns is
-//     the branch and whose source.at is in the branch's chain, with nothing
-//     after it in the branch. §F.6 asks for no merge.authors check here:
-//     the successor is a branch too, and its batches are the rebase.
+//   - superseded: the successor is still one §7.4 allows: it exists,
+//     isn't purged, and is a branch of the branch's base or of a namespace
+//     further up its base chain in this deployment, listed in that
+//     namespace's branches. One purged after the branch was frozen still
+//     counts, checked from its log, which the purge leaves readable, but
+//     not a sealed one, whose log the purge makes 410: that branch is
+//     kept for a manual purge. The successor's log has a batch without
+//     origin whose source.ns is the branch, whose source.at is in the
+//     branch's chain, and whose recorded grant has a root sub and kid in
+//     the base's current merge.authors or chains to a current * key of
+//     the branch (as for abandoned, below), with nothing after it in the
+//     branch. The rebase tool counts any such batch (§F.5); the janitor
+//     only these, so a successor's writers can't get unmerged work purged.
 //   - abandoned: the branch's document has "abandoned": true, set by a
 //     config write whose recorded grant chains to a current * key of the
 //     branch, inherited or its own (§F.6): the root kid of the entry's
@@ -520,7 +528,7 @@ func (b *branch) verify(ctx context.Context, claim string, frozeAt time.Time) (p
 		if s == "" {
 			return false, false, "", nil
 		}
-		ok, reason, err = b.verifySuperseded(ctx, s)
+		ok, reason, err = b.verifySuperseded(ctx, s, frozeAt)
 	case "abandoned":
 		if ab, _ := b.doc["abandoned"].(bool); !ab {
 			return false, false, "", nil
@@ -602,13 +610,13 @@ func hasDocEntries(log []client.NSEntry, i int, e2e bool) bool {
 	return false
 }
 
-// coveredBy finds the latest merge batch of branch in entries whose
-// source.at is in the branch's chain, and checks that the branch changed no
-// document after it. If authors is non-nil, only batches whose recorded
-// grant has a root sub and kid listed in *authors count (merge.EntryListed),
-// and those with "grant": null on their author alone while disabled: the
-// deployment says, at GET /, it runs with authentication disabled (§1).
-func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, authors *[]merge.Author, e2e, disabled bool) (bool, string) {
+// coveredBy finds the latest batch of entries that counts for branch: one
+// without origin whose source.ns is branch, whose source.at is in the
+// branch's chain (blog), and that trusted accepts, as written by trustedBy
+// (for the reason). It checks that the branch changed no document after
+// that source.at. disabled says the deployment runs with authentication
+// disabled (§1), for the reason too.
+func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, trusted func(client.NSEntry) (bool, error), trustedBy string, e2e, disabled bool) (bool, string, error) {
 	pos := map[string]int{}
 	for i, e := range blog {
 		pos[e.ID] = i
@@ -619,7 +627,11 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, a
 		if !merge.IsMergeOf(e, branch) {
 			continue
 		}
-		if authors != nil && !merge.EntryListed(*authors, e, disabled) {
+		ok, err := trusted(e)
+		if err != nil {
+			return false, "", err
+		}
+		if !ok {
 			who := e.Author
 			switch {
 			case e.Grant != nil:
@@ -645,17 +657,17 @@ func coveredBy(entries []client.NSEntry, branch string, blog []client.NSEntry, a
 	}
 	if !found {
 		if len(untrusted) > 0 {
-			return false, "no merge batch is by a principal in the base's merge.authors (" + strings.Join(untrusted, ", ") + ")"
+			return false, "no batch of the branch is by " + trustedBy + " (" + strings.Join(untrusted, ", ") + ")", nil
 		}
 		if forged > 0 {
-			return false, "its batches' source.at is not in the branch's chain"
+			return false, "its batches' source.at is not in the branch's chain", nil
 		}
-		return false, "no batch without origin has source.ns = " + branch
+		return false, "no batch without origin has source.ns = " + branch, nil
 	}
 	if hasDocEntries(blog, best, e2e) {
-		return false, "the branch changed documents after " + blog[best].ID
+		return false, "the branch changed documents after " + blog[best].ID, nil
 	}
-	return true, ""
+	return true, "", nil
 }
 
 func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
@@ -680,12 +692,57 @@ func (b *branch) verifyMerged(ctx context.Context) (bool, string, error) {
 	if err != nil {
 		return false, "", err
 	}
-	ok, why := coveredBy(entries, b.ns, b.log, &authors, b.e2e, disabled)
-	return ok, why, nil
+	listed := func(e client.NSEntry) (bool, error) { return merge.EntryListed(authors, e, disabled), nil }
+	return coveredBy(entries, b.ns, b.log, listed, "a principal in the base's merge.authors", b.e2e, disabled)
 }
 
-func (b *branch) verifySuperseded(ctx context.Context, succ string) (bool, string, error) {
-	base, ns := b.base, b.ns
+// sealedPurged is the reason a branch whose successor is a purged sealed
+// namespace is kept: the purge made the successor's log 410 (§8.5), so its
+// batches can't be checked, and the branch needs a manual purge.
+func sealedPurged(succ string) string {
+	return "successor " + succ + " is purged and sealed, so its log answers 410 (§8.5): sealed successor purged: verify by hand"
+}
+
+// baseChain returns the branch's bases in this deployment, its base first
+// (§7.4, §7.6); it stops at a base in another deployment.
+func (b *branch) baseChain(ctx context.Context) ([]string, error) {
+	var out []string
+	doc := b.doc
+	for i := 0; i <= maxDepth; i++ {
+		bns, _, ok := localBase(doc)
+		if !ok {
+			break
+		}
+		out = append(out, bns)
+		var err error
+		if doc, err = b.current(ctx, bns); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// verifySuperseded checks a superseded claim (§F.6):
+//
+//   - the successor is still one §7.4 allows: another namespace that
+//     exists, isn't purged, and is a branch of the branch's base or of a
+//     namespace further up its base chain in this deployment, listed as
+//     such in that namespace's branches. A successor purged after the
+//     branch was frozen (frozeAt) still counts, checked from its log,
+//     which the purge leaves readable, except a sealed one, whose log the
+//     purge makes 410: the branch is then kept for a manual purge;
+//   - its log has a batch without origin whose source.ns is the branch,
+//     whose source.at is in the branch's chain, and whose recorded grant
+//     has a root sub and kid in the base's current merge.authors or
+//     chains to a current * key of the branch (starKey), with nothing
+//     after that source.at in the branch. One recording "grant": null
+//     counts while the deployment runs with authentication disabled (§1).
+//     The rebase tool counts any such batch as an earlier merge (§F.5),
+//     the janitor only these.
+func (b *branch) verifySuperseded(ctx context.Context, succ string, frozeAt time.Time) (bool, string, error) {
+	if succ == b.ns {
+		return false, "the successor is the branch itself", nil
+	}
 	sh, err := b.j.c.NSHead(ctx, succ)
 	if client.IsNotFound(err) {
 		return false, "successor " + succ + " doesn't exist", nil
@@ -696,38 +753,74 @@ func (b *branch) verifySuperseded(ctx context.Context, succ string) (bool, strin
 	sdoc, err := b.j.c.NSDoc(ctx, succ, sh.ID)
 	if client.IsPurged(err) {
 		// A sealed successor's document, once it is purged (§8.5).
-		return false, "successor " + succ + " is purged", nil
+		return false, sealedPurged(succ), nil
 	}
 	if err != nil {
 		return false, "", err
 	}
-	sb, _ := sdoc.Value["base"].(map[string]any)
-	if sns, _ := sb["ns"].(string); sns != base {
-		return false, "successor " + succ + " has another base", nil
+	b.docs[succ] = nsAt{sh.ID, sdoc.Value}
+	sref, _ := sdoc.Value["base"].(map[string]any)
+	sbase, _ := sref["ns"].(string)
+	if _, remote := sref["origin"]; remote || sbase == "" {
+		return false, "successor " + succ + " is not a branch in this deployment (§7.4)", nil
 	}
-	brs, err := b.j.c.Branches(ctx, base)
+	chain, err := b.baseChain(ctx)
 	if err != nil {
 		return false, "", err
 	}
-	listed := false
-	for _, br := range brs {
-		if br.Name == succ {
-			listed = true
-			if br.Purged {
-				return false, "successor " + succ + " is purged", nil
-			}
-		}
+	if !slices.Contains(chain, sbase) {
+		return false, fmt.Sprintf("successor %s is a branch of %s, not of a namespace in the branch's base chain (%s, §7.4)", succ, sbase, strings.Join(chain, ", ")), nil
 	}
-	if !listed {
-		return false, "successor " + succ + " is not a branch of " + base, nil
+	brs, err := b.j.c.Branches(ctx, sbase)
+	if err != nil {
+		return false, "", err
+	}
+	i := slices.IndexFunc(brs, func(br client.Branch) bool { return br.Name == succ })
+	if i < 0 {
+		return false, "successor " + succ + " is not a branch of " + sbase, nil
 	}
 	entries, err := b.j.c.NSLog(ctx, succ, sh.ID, "")
+	if client.IsPurged(err) {
+		return false, sealedPurged(succ), nil
+	}
 	if err != nil {
 		return false, "", err
 	}
-	// §F.6 names no merge.authors check for the successor's batch.
-	ok, why := coveredBy(entries, ns, b.log, nil, b.e2e, false)
-	return ok, why, nil
+	if brs[i].Purged {
+		// Its log stays readable, the purge-ns entry its last (§8.5).
+		var purgedAt time.Time
+		if n := len(entries); n > 0 && entries[n-1].Kind == "purge-ns" {
+			purgedAt, _ = time.Parse(time.RFC3339Nano, entries[n-1].Created)
+		}
+		if purgedAt.IsZero() {
+			return false, "successor " + succ + " is purged, but its log has no purge-ns entry to date the purge by", nil
+		}
+		if !purgedAt.After(frozeAt) {
+			return false, fmt.Sprintf("successor %s was purged at %s, before the branch was frozen at %s", succ,
+				purgedAt.UTC().Format(time.RFC3339Nano), frozeAt.UTC().Format(time.RFC3339Nano)), nil
+		}
+	}
+	_, bdoc, err := b.head(ctx, b.base)
+	if err != nil {
+		return false, "", err
+	}
+	authors, _ := merge.MergeAuthors(bdoc)
+	disabled, err := b.j.c.AuthDisabled(ctx)
+	if err != nil {
+		return false, "", err
+	}
+	trusted := func(e client.NSEntry) (bool, error) {
+		switch {
+		case merge.EntryListed(authors, e, disabled):
+			return true, nil
+		case e.GrantNull:
+			// Written while every request counted as holding a * key (§1).
+			return disabled, nil
+		}
+		ok, _, err := b.starKey(ctx, e, succ)
+		return ok, err
+	}
+	return coveredBy(entries, b.ns, b.log, trusted, "a principal in the base's merge.authors or under a current * key of the branch", b.e2e, disabled)
 }
 
 // verifyAbandoned checks an abandoned claim (§F.6): the config write that

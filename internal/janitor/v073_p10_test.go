@@ -14,8 +14,10 @@ import (
 	"github.com/middle-management/patchlog/internal/grant"
 	"github.com/middle-management/patchlog/internal/janitor"
 	"github.com/middle-management/patchlog/internal/jsonv"
+	"github.com/middle-management/patchlog/internal/keystore"
 	"github.com/middle-management/patchlog/internal/merge"
 	"github.com/middle-management/patchlog/internal/pgtest"
+	"github.com/middle-management/patchlog/internal/seal"
 	"github.com/middle-management/patchlog/internal/server"
 	"github.com/middle-management/patchlog/internal/testenv"
 )
@@ -275,4 +277,96 @@ func TestV073InheritedKeysOnlyFromLocalBases(t *testing.T) {
 	later := func() time.Time { return time.Now().Add(2 * day) }
 	d := must(janitor.New(ed, janitor.Options{Now: later}).Check(ctx, "rel", "loc"))
 	wantKeep(t, d, `key "ops" isn't a * key of the branch`)
+}
+
+// §F.6 superseded, §F.5 Resuming (v0.63; CONFORMANCE Grant-scope scenario
+// 37): a successor's batch counts only if its grant has a root sub and kid
+// in the base's current merge.authors, or chains to a current * key of the
+// old branch. The rebase tool counts any such batch; the janitor doesn't.
+func TestV073SupersededNeedsTrustedBatch(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name  string
+		key   func(a *authEnv) clienttest.Key
+		sub   string
+		purge bool
+	}{
+		{"an author without a * key", func(a *authEnv) clienttest.Key { return a.editor }, "user:ed", false},
+		{"merge.authors", func(a *authEnv) clienttest.Key { return a.editor }, "svc:merge", true},
+		{"a * key of the branch", func(a *authEnv) clienttest.Key { return a.tmp }, "user:tmp", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a := newAuthEnv(t, []string{"r7", "r7-b"},
+				map[string]any{"merge": map[string]any{"authors": []any{map[string]any{"sub": "svc:merge", "kid": "editor"}}}})
+			a.branch(t, "matches", "r7", map[string]any{"superseded": "P1D"})
+			must(merge.Rebase(ctx, a.as(tc.key(a), tc.sub), merge.RebaseOptions{Branch: "r7", New: "r7-b", Switch: true}))
+			d := a.check(t, "matches", "r7", 2*day)
+			if !tc.purge {
+				wantKeep(t, d, "superseded claim not verified: no batch of the branch is by a principal in the base's merge.authors or under a current * key of the branch")
+				return
+			}
+			if d.Action != janitor.ActionPurged || d.Claim != "superseded" {
+				t.Fatalf("decision %+v", d)
+			}
+		})
+	}
+}
+
+// §F.6 superseded (v0.65): a successor purged after the branch was frozen
+// still verifies, from its log, which the purge leaves readable (§8.5). One
+// purged before the freeze doesn't.
+func TestV073SupersededBySuccessorPurgedLater(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, nil)
+	e.branch("matches", "r7", map[string]any{"superseded": "P1D"})
+	e.edit("r7", "derby", "1-0")
+	e.branch("matches", "r8", map[string]any{"superseded": "P1D"})
+	must(e.c.CreateDoc(ctx, "r8", "cup", map[string]any{"score": "2-0"}))
+	purge := func(ns string) {
+		t.Helper()
+		e.config(ns, op("add", "/frozen", true))
+		must(e.c.PurgeNamespace(ctx, ns, must(e.c.NSHead(ctx, ns)).ID))
+	}
+
+	// r7: switched to r7-b, which is purged a minute later.
+	must(merge.Rebase(ctx, e.c, merge.RebaseOptions{Branch: "r7", New: "r7-b", Switch: true}))
+	e.s.Clock.Advance(time.Minute)
+	purge("r7-b")
+	// r8: replayed into r8-b and named its successor, which is purged a
+	// minute before r8 is frozen.
+	must(merge.Rebase(ctx, e.c, merge.RebaseOptions{Branch: "r8", New: "r8-b"}))
+	e.config("r8", op("add", "/successor", "r8-b"))
+	purge("r8-b")
+	e.s.Clock.Advance(time.Minute)
+	e.config("r8", op("add", "/frozen", true))
+
+	e.s.Clock.Advance(2 * day)
+	ds := e.sweep(false)
+	if d := ds["r7"]; d.Action != janitor.ActionPurged || d.Claim != "superseded" {
+		t.Fatalf("r7 %+v", d)
+	}
+	wantKeep(t, ds["r8"], "superseded claim not verified: successor r8-b was purged at ")
+	wantKeep(t, ds["r8"], "before the branch was frozen")
+}
+
+// §F.6 superseded, §8.5: a sealed successor's purge makes its log 410, so
+// the branch can't be verified as superseded and is left for a manual purge.
+func TestV073SealedSuccessorPurgedVerifiedByHand(t *testing.T) {
+	t.Parallel()
+	ks := must(keystore.New(keystore.Generate()))
+	s := clienttest.New(t, clienttest.Options{KeyStore: ks})
+	c := s.Client(t, client.WithAuthor("alice"), client.WithKeys(client.NewKeys(nil)))
+	e := &env{t: t, s: s, c: c}
+	must(c.CreateNamespace(ctx, "matches", map[string]any{"read": "public", "merge": devAuthors, "encryption": map[string]any{"level": "sealed"}}))
+	must(c.Create(ctx, "matches", "derby", append(client.GenesisPatches(map[string]any{"score": "0-0"}), op("add", "/$nonce", seal.NewNonce()))))
+	e.branch("matches", "r7", map[string]any{"superseded": "P1D"})
+	h := must(c.Head(ctx, "r7", "derby"))
+	must(c.Append(ctx, "r7", "derby", h.ID, []any{op("replace", "/score", "1-0"), op("replace", "/$nonce", seal.NewNonce())}))
+	must(merge.Rebase(ctx, c, merge.RebaseOptions{Branch: "r7", New: "r7-b", Switch: true}))
+	s.Clock.Advance(time.Minute)
+	e.config("r7-b", op("add", "/frozen", true))
+	must(c.PurgeNamespace(ctx, "r7-b", must(c.NSHead(ctx, "r7-b")).ID))
+	s.Clock.Advance(2 * day)
+	wantKeep(t, e.sweep(false)["r7"], "sealed successor purged: verify by hand")
 }
