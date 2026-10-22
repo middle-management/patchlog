@@ -67,8 +67,14 @@ func (e *Engine) Principal(ctx context.Context, ns string, cred Credentials) (*P
 		body := t.principalBody(v, cfg)
 		// A catalog namespace's catalog member (§7.4, §B.6, §H.2), whole
 		// to a grant with unrestricted read, a public namespace's or one
-		// while authentication is disabled included (readsNS).
-		if c := principalCatalog(cfg.Doc, t.readsNS(n, cfg, a, false)); c != nil {
+		// while authentication is disabled included (readsNS). An
+		// operator grant reads nothing but what needs no grant: any other
+		// read under one is 401, whatever its blocks allow (§C.4).
+		whole := t.readsNS(n, cfg, a, false)
+		if v != nil && v.Operator && cfg.Read != "public" {
+			whole = false
+		}
+		if c := principalCatalog(cfg.Doc, whole); c != nil {
 			body["catalog"] = c
 		}
 		ans = &PrincipalAnswer{Body: body, Config: t.configID(n.configSeq).String()}

@@ -862,3 +862,68 @@ func TestV073BranchPurgeOfReadThroughStaysPurged(t *testing.T) {
 	want("d0", d0h, "x", x1)
 	want("d0", d0h, "z", z1)
 }
+
+// §7.8 Reading (BBD-20): with WithInlinePDF only a 200 or 206 of an
+// application/pdf blob goes without Content-Security-Policy: sandbox; its
+// 304 and 416 keep it, as every other answer to a blob URL does.
+func TestV073InlinePDFSandboxOnlyOff200And206(t *testing.T) {
+	t.Parallel()
+	e := newEnvWith(t, []Option{WithInlinePDF()})
+	e.mkNS("m", map[string]any{"read": "public"})
+	pdf := []byte("%PDF-1.7\n" + strings.Repeat("0", 64))
+	bid := e.upload("m", "a", "application/pdf", pdf)
+	e.create("m", "a", map[string]any{"f": ref(bid, "application/pdf", len(pdf), "")})
+	for _, c := range []struct {
+		hdr  map[string]string
+		code int
+		csp  string
+	}{
+		{nil, 200, ""},
+		{map[string]string{"Range": "bytes=0-3"}, 206, ""},
+		{map[string]string{"Range": "bytes=9999-"}, 416, "sandbox"},
+		{map[string]string{"If-None-Match": `"` + bid + `"`}, 304, "sandbox"},
+	} {
+		r := e.do(req{method: "GET", path: blobPath("m", "a", bid), hdr: c.hdr})
+		expect(t, r, c.code)
+		if got := r.H.Get("Content-Security-Policy"); got != c.csp {
+			t.Errorf("inline PDF %d: Content-Security-Policy %q, want %q", c.code, got, c.csp)
+		}
+		if r.H.Get("Content-Disposition") != "" || r.H.Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("inline PDF %d: %v", c.code, r.H)
+		}
+	}
+}
+
+// §7.4, §C.4 (RH-24): an operator grant reads nothing that needs a grant
+// (any such read under one is 401, whatever its blocks allow), so outside
+// a public namespace /principal gives it the restricted catalog member:
+// files without x- members, and trusted in place of trust. A public
+// namespace's catalog is everyone's to read, so there it gets all of it.
+func TestV073OperatorGrantRestrictedCatalog(t *testing.T) {
+	t.Parallel()
+	files := map[string]any{"ns": "docs", "root": "root", "x-note": "internal"}
+	for _, read := range []string{"grant", "public"} {
+		f := newAuthFixture(t, map[string]any{"read": read, "catalog": map[string]any{"trust": []any{"docs", "media"}, "mode": "tree", "files": files}})
+		e := f.tenv
+		op := mint(t, e.opPriv, map[string]any{"kid": "operator", "sub": "op:root", "ns": []any{"sec"}, "can": []any{"read", "config"},
+			"exp": e.clock.Now().Add(time.Hour).Format(time.RFC3339)})
+		if read == "grant" {
+			expect(t, e.get("/r/sec/anything", op), 401) // it can't read
+		}
+		r := e.principalOf("sec", op)
+		expect(t, r, 200)
+		if r.Obj()["operator"] != true {
+			t.Fatalf("not an operator grant: %s", r.Body)
+		}
+		c, _ := r.Obj()["catalog"].(map[string]any)
+		fl, _ := c["files"].(map[string]any)
+		_, trust := c["trust"]
+		_, note := fl["x-note"]
+		switch {
+		case read == "grant" && (trust || note || c["trusted"] != true || fl["ns"] != "docs"):
+			t.Errorf("operator grant, which can't read sec: catalog %v, want files without x- members and trusted", c)
+		case read == "public" && (!trust || !note || c["trusted"] != nil):
+			t.Errorf("operator grant in a public namespace: catalog %v, want trust and files whole", c)
+		}
+	}
+}

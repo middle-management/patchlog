@@ -146,9 +146,10 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, eta
 		if b.Type == "application/pdf" {
 			// A PDF is an attachment, still sandboxed, unless the
 			// deployment opts into inline display, which drops the
-			// sandbox that blanks Chromium's viewer (§7.8).
+			// sandbox that blanks Chromium's viewer from a 200 or 206,
+			// and only from those (§7.8).
 			if s.inlinePDF {
-				w.Header().Del("Content-Security-Policy")
+				w = &inlinePDF{ResponseWriter: w}
 			} else {
 				w.Header().Set("Content-Disposition", "attachment")
 			}
@@ -170,3 +171,30 @@ func (s *Server) serveBlob(w http.ResponseWriter, r *http.Request, ns, name, eta
 		writeJSON(w, 410, map[string]any{"code": "gone"})
 	}
 }
+
+// inlinePDF writes an application/pdf blob's answer with WithInlinePDF:
+// it drops Content-Security-Policy: sandbox from a 200 or 206 only, as
+// http.ServeContent picks the status, so a 304 or 416 keeps it (§7.8).
+type inlinePDF struct {
+	http.ResponseWriter
+	wrote bool
+}
+
+func (w *inlinePDF) WriteHeader(code int) {
+	if !w.wrote {
+		w.wrote = true
+		if code == http.StatusOK || code == http.StatusPartialContent {
+			w.Header().Del("Content-Security-Policy")
+		}
+	}
+	w.ResponseWriter.WriteHeader(code)
+}
+
+func (w *inlinePDF) Write(p []byte) (int, error) {
+	if !w.wrote {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(p)
+}
+
+func (w *inlinePDF) Unwrap() http.ResponseWriter { return w.ResponseWriter }
